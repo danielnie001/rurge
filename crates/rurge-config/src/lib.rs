@@ -6,9 +6,12 @@
 //! `diagnostic::Diagnostic` values.
 
 pub mod diagnostic;
+pub mod requirement;
 pub mod span;
+pub mod text;
 
 pub use diagnostic::{Diagnostic, Diagnostics, Severity, codes};
 pub use span::Span;
+pub use text::{Entry, Origin, Profile, Section, SectionKind};
 
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
