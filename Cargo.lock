@@ -416,6 +416,7 @@ dependencies = [
  "clap",
  "predicates",
  "rurge-config",
+ "serde",
  "serde_json",
  "tempfile",
 ]
