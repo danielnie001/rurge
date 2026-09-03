@@ -4508,7 +4508,7 @@ Expected: 4 个测试通过。若 `manual_examples_parse_with_expected_types` �
 
 ```bash
 git add crates/rurge-config
-git commit -m "feat(config): [Rule] 解析：30 种规则类型、10 个参数、逻辑规则与子规则"
+git commit -m "feat(config): [Rule] 解析：29 种规则类型、10 个参数、逻辑规则与子规则"
 ```
 
 ---
