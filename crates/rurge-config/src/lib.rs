@@ -5,10 +5,14 @@
 //! consumed by the engine. Parsing never panics; problems are reported as
 //! `diagnostic::Diagnostic` values.
 
+pub mod deferred;
 pub mod diagnostic;
 pub mod general;
 pub mod glob;
+pub mod host;
 pub mod hostlist;
+pub mod keystore;
+pub mod managed;
 pub mod policy;
 pub mod requirement;
 pub mod rule;
@@ -17,10 +21,14 @@ pub mod text;
 pub mod types;
 pub mod value;
 
+pub use deferred::DeferredSections;
 pub use diagnostic::{Diagnostic, Diagnostics, ParseError, Severity, codes};
 pub use general::General;
 pub use glob::{Glob, GlobOptions};
+pub use host::{HostEntry, HostKey, HostValue};
 pub use hostlist::HostList;
+pub use keystore::KeystoreItem;
+pub use managed::ManagedConfig;
 pub use policy::{Builtin, GroupKind, PolicyGroup, PolicyKind, ProxyPolicy, SubnetExpr};
 pub use requirement::Environment;
 pub use rule::{ParseCtx, PolicyRef, ResourceRef, Rule, RuleKind, RuleParams, SubRule};
