@@ -8,7 +8,7 @@ rurge 是用 Rust 复刻 Surge（macOS / iOS 网络代理工具）全部功能�
 
 ## 当前状态（2026-09）
 
-阶段 0：仓库只有文档，没有 Cargo 项目、没有源码、没有测试。不要假设存在 `Cargo.toml`、`src/` 或 CI。
+阶段 1 进行中。M1 已完成：Cargo workspace、`rurge-config`（解析全部 Surge 语法为强类型 `Config` + 诊断）、`rurge check`。M2（规则引擎与 DNS）、M3（连接流水线）、M4（控制面与平台）未开始，`rurge run` 尚不存在。
 
 ## 先读这些文档
 
@@ -32,15 +32,13 @@ rurge 是用 Rust 复刻 Surge（macOS / iOS 网络代理工具）全部功能�
 - 连接处理流水线（PRD 3.3）：入站 → 协议嗅探（SNI / Host / QUIC / STUN）→ 预匹配 → 出站模式判断 → 规则匹配（域名规则不触发 DNS，IP 规则按需解析）→ 策略解析（组 / 链式 / 别名）→ 出站建立 → HTTP 引擎（MITM → Header Rewrite → URL Rewrite → Body Rewrite → 脚本 → Map Local 短路）→ 观测。
 - 配置对象不可变，重载时原子切换（AR-04）；每个连接是独立 tokio 任务（AR-03）。
 
-## 计划中的命令（README 约定，代码尚未存在）
+## 常用命令
 
 ```bash
-cargo build --release
-cargo test                      # 单个 crate / 用例：cargo test -p rurge-config <test_name>
-cargo clippy --all-targets      # 目标：零警告
-cargo fmt
-rurge check -c config.conf      # 校验 Surge 格式配置
-rurge run -c config.conf        # 运行守护进程
+cargo test --workspace                          # 全部测试
+cargo test -p rurge-config <name>               # 单个 crate / 用例
+cargo insta test -p rurge-config --review       # 语料库快照有变化时审阅
+cargo clippy --all-targets -- -D warnings       # 零警告
+cargo fmt --all
+cargo run -p rurge -- check -c config.conf      # 校验 Surge 配置（--json / --strict / --platform）
 ```
-
-`Cargo.lock` 需要提交（`.gitignore` 已注明）。

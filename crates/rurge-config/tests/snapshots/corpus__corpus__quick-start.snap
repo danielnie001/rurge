@@ -1,0 +1,20 @@
+---
+source: crates/rurge-config/tests/corpus.rs
+expression: "(loaded.config.summary(), diags)"
+---
+- listeners: []
+  policies:
+    - ProxyA (https)
+  groups:
+    - "Proxy (select) -> [ProxyA, DIRECT]"
+  rules:
+    - "DOMAIN-SUFFIX,example.com,Proxy"
+    - "GEOIP,CN,DIRECT"
+    - "FINAL,Proxy"
+  rulesets: []
+  hosts: []
+  keystore: []
+  deferred: []
+  unknown_sections: []
+  managed: ~
+- []

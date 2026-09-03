@@ -1,0 +1,24 @@
+---
+source: crates/rurge-config/tests/corpus.rs
+expression: "(loaded.config.summary(), diags)"
+---
+- listeners: []
+  policies:
+    - A (direct)
+    - B (direct)
+  groups:
+    - "Group (url-test) -> [A, B]"
+    - "Group2 (select) -> [A, B]"
+  rules:
+    - "DOMAIN,reject.com,REJECT"
+    - "FINAL,Group"
+  rulesets: []
+  hosts: []
+  keystore: []
+  deferred: []
+  unknown_sections: []
+  managed: ~
+- - "info[I0002] valid/requirement.conf:6: line disabled: requirement `CORE_VERSION>=22` not met"
+  - "info[I0002] valid/requirement.conf:8: line disabled: requirement `CORE_VERSION>=22 AND SYSTEM=='iOS'` not met"
+  - "info[I0002] valid/requirement.conf:13: line disabled: requirement `SYSTEM == 'iOS'` not met"
+  - "info[I0002] valid/requirement.conf:14: line disabled: requirement `SYSTEM=='Linux'` not met"

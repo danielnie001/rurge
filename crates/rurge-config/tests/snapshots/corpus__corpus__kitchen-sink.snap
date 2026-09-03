@@ -1,0 +1,119 @@
+---
+source: crates/rurge-config/tests/corpus.rs
+expression: "(loaded.config.summary(), diags)"
+---
+- listeners:
+    - "http 0.0.0.0:6152"
+    - "socks5 0.0.0.0:6153"
+  policies:
+    - Direct-Alias (direct)
+    - HTTP-Proxy (http)
+    - HTTPS-Proxy (https)
+    - H2-Proxy (h2-connect)
+    - SOCKS (socks5)
+    - SOCKS-TLS (socks5-tls)
+    - SS (ss)
+    - SS-2022 (ss)
+    - Snell (snell)
+    - VMess (vmess)
+    - Trojan (trojan)
+    - TUIC (tuic)
+    - TUIC5 (tuic-v5)
+    - Hysteria (hysteria2)
+    - MASQUE (masque)
+    - AnyTLS (anytls)
+    - Trust (trust-tunnel)
+    - SSH (ssh)
+    - WG (wireguard)
+    - TS (tailscale)
+    - External (external)
+  groups:
+    - "Select (select) -> [Auto, Fallback, Balance, Smart, Subnet, SS, Trojan, DIRECT]"
+    - "Auto (url-test) -> [SS, Trojan, Hysteria]"
+    - "Fallback (fallback) -> [SS, Trojan]"
+    - "Balance (load-balance) -> [SS, Trojan, TUIC5]"
+    - "Smart (smart) -> [SS, Trojan]"
+    - "Subnet (subnet) -> []"
+    - "External-Group (select) -> []"
+  rules:
+    - "DOMAIN,ad.example.com,REJECT,pre-matching"
+    - "DOMAIN,www.apple.com,Select"
+    - "DOMAIN-SUFFIX,apple.com,DIRECT,extended-matching"
+    - "DOMAIN-KEYWORD,google,Select"
+    - "DOMAIN-WILDCARD,api-*.example.com,Select"
+    - "DOMAIN-SET,https://example.com/adblock.txt,REJECT,update-interval=43200"
+    - "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve"
+    - "IP-CIDR,8.8.8.8,Select"
+    - "IP-CIDR6,2001:db8:abcd:8000::/50,DIRECT"
+    - "GEOIP,US,DIRECT,no-resolve"
+    - "IP-ASN,AS13335,Select"
+    - "USER-AGENT,Instagram*,Select"
+    - "URL-REGEX,^https://example\\.com,Select,extended-matching"
+    - "PROCESS-NAME,Telegram,Select"
+    - "PROCESS-NAME,/Applications/ChatGPT.app/,Select"
+    - "DEST-PORT,10000-20000,DIRECT"
+    - "SRC-PORT,>=50000,DIRECT"
+    - "IN-PORT,6153,DIRECT"
+    - "SRC-IP,192.168.20.0/24,DIRECT"
+    - "DEVICE-NAME,Kids-iPad,REJECT"
+    - "MAC-ADDRESS,A4:83:E7:11:22:33,Select"
+    - "PROTOCOL,STUN,REJECT"
+    - "PROTOCOL,MTProto,Select"
+    - "HOSTNAME-TYPE,IPv6,REJECT"
+    - "SUBNET,SSID:MyHome,DIRECT"
+    - "SUBNET,TYPE:CELLULAR,DIRECT"
+    - "CELLULAR-RADIO,LTE,DIRECT"
+    - "CELLULAR-CARRIER,310260,Select"
+    - "AND,((SRC-IP,192.168.1.110),(DOMAIN-SUFFIX,example.com)),DIRECT"
+    - "AND,((NOT,((SRC-IP,192.168.1.110))),(DOMAIN-SUFFIX,example.com)),DIRECT"
+    - "OR,((DOMAIN,a.example),(DOMAIN,b.example)),Select"
+    - "AND,((PROTOCOL,UDP),(RULE-SET,Streaming)),REJECT"
+    - "AND,((DOMAIN-SUFFIX,tracker.example.com),(DEST-PORT,443)),REJECT,pre-matching"
+    - "SCRIPT,ssid-rule,DIRECT,requires-resolve"
+    - "RULE-SET,Media,Select"
+    - "RULE-SET,https://example.com/social.list,Select,no-resolve,extended-matching,update-interval=43200"
+    - "RULE-SET,SYSTEM,DIRECT"
+    - "RULE-SET,LAN,DIRECT"
+    - "DOMAIN-SUFFIX,notify.example,Select,notification-text=Example matched,notification-interval=600"
+    - "DOMAIN,capture.example,Select,always-capture=debug"
+    - "FINAL,Select,dns-failed"
+  rulesets:
+    - "Streaming: 5 rules"
+    - "Media: 2 rules"
+  hosts:
+    - abc.com
+    - "*.dev"
+    - foo.com
+    - bar.com
+    - secure.example
+    - Macbook
+    - printer.local
+    - dyn.example.com
+    - "DOMAIN-SET:https://example.com/domains.txt"
+    - "RULE-SET:https://example.com/rules.txt"
+  keystore:
+    - cert1
+    - key1
+  deferred:
+    - MITM
+    - URL Rewrite
+    - Header Rewrite
+    - Body Rewrite
+    - Map Local
+    - Script
+    - Panel
+    - SSID Setting
+    - Port Forwarding
+    - WireGuard home
+    - Tailscale tailnet
+    - DHCP
+    - Snell Server
+    - MTProto
+    - Testing
+  unknown_sections: []
+  managed: "https://example.com/kitchen-sink.conf"
+- - "warning[W0016]: sections parsed but inactive in this version: [MITM], [URL Rewrite], [Header Rewrite], [Body Rewrite], [Map Local], [Script], [Panel], [SSID Setting], [Port Forwarding], [WireGuard home], [Tailscale tailnet], [DHCP], [Snell Server], [MTProto], [Testing]"
+  - "warning[W0004] valid/kitchen-sink.conf:40: `compatibility-mode` is iOS-only and has no effect on desktop platforms"
+  - "warning[W0004] valid/kitchen-sink.conf:41: `allow-wifi-access` is iOS-only and has no effect on desktop platforms"
+  - "warning[W0004] valid/kitchen-sink.conf:42: `wifi-access-http-port` is iOS-only and has no effect on desktop platforms"
+  - "warning[W0004] valid/kitchen-sink.conf:43: `wifi-access-socks5-port` is iOS-only and has no effect on desktop platforms"

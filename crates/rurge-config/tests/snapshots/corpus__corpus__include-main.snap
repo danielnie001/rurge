@@ -1,0 +1,22 @@
+---
+source: crates/rurge-config/tests/corpus.rs
+expression: "(loaded.config.summary(), diags)"
+---
+- listeners: []
+  policies:
+    - IncludedProxy (direct)
+  groups: []
+  rules:
+    - "DOMAIN,included.example,IncludedProxy"
+    - "DEST-PORT,123,DIRECT"
+    - "RULE-SET,Streaming,IncludedProxy"
+    - "FINAL,IncludedProxy"
+  rulesets:
+    - "Streaming: 1 rules"
+    - "Music: 1 rules"
+  hosts: []
+  keystore: []
+  deferred: []
+  unknown_sections: []
+  managed: ~
+- []

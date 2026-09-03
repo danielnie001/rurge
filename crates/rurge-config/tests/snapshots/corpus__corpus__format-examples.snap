@@ -1,0 +1,19 @@
+---
+source: crates/rurge-config/tests/corpus.rs
+expression: "(loaded.config.summary(), diags)"
+---
+- listeners: []
+  policies:
+    - ProxyA (http)
+  groups: []
+  rules:
+    - "DOMAIN-SUFFIX,example.com,ProxyA"
+    - "URL-REGEX,\"^http://example\\.com/(a|b),?c\",ProxyA"
+    - "FINAL,DIRECT"
+  rulesets: []
+  hosts: []
+  keystore: []
+  deferred: []
+  unknown_sections: []
+  managed: ~
+- - "warning[W0001] valid/format-examples.conf:9: unknown [General] key `example-quoted` ignored"

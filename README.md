@@ -15,7 +15,7 @@ rurge（**Ru**st + Su**rge**）是一个用 Rust 编写的跨平台网络代理�
 
 ### 当前状态
 
-> **阶段 0：需求与规划。** 仓库目前只有需求文档，尚无可运行代码。
+> **阶段 1 进行中。** 里程碑 M1（配置解析器）已完成：`rurge check` 可以校验任意 Surge 配置并给出带行号的诊断；代理功能尚未实现。
 
 完整的需求、模块划分、平台差异和分阶段路线图见 [docs/requirements.md](docs/requirements.md)；
 Surge 配置项 / 规则 / 参数 / API 的逐项兼容清单见 [docs/surge-compatibility-matrix.md](docs/surge-compatibility-matrix.md)。
@@ -53,7 +53,7 @@ Surge 配置项 / 规则 / 参数 / API 的逐项兼容清单见 [docs/surge-com
 
 ### 快速开始（计划中的形态）
 
-> 以下命令描述的是设计目标，代码尚未实现。
+> `rurge check` 已可用；`rurge run` 将在 M3 提供。
 
 ```bash
 # 构建
@@ -133,7 +133,7 @@ rurge (**Ru**st + Su**rge**) is a cross-platform network proxy written in Rust. 
 
 ### Status
 
-> **Phase 0: requirements and planning.** The repository currently contains documentation only; there is no runnable code yet.
+> **Phase 1 in progress.** Milestone M1 (profile parser) is done: `rurge check` validates any Surge profile with line-numbered diagnostics; proxying is not implemented yet.
 
 See [docs/requirements.md](docs/requirements.md) (Chinese) for the full requirements, module breakdown, platform matrix and phased roadmap, and [docs/surge-compatibility-matrix.md](docs/surge-compatibility-matrix.md) for the item-by-item Surge compatibility checklist.
 
@@ -170,7 +170,7 @@ Near-term non-goals: iOS / tvOS builds, Surge Ponte (depends on iCloud), Apple-o
 
 ### Quick start (planned)
 
-> The commands below describe the intended design; the code is not implemented yet.
+> `rurge check` works today; `rurge run` arrives with milestone M3.
 
 ```bash
 # Build

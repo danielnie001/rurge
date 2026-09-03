@@ -1,0 +1,28 @@
+---
+source: crates/rurge-config/tests/corpus.rs
+expression: "(loaded.config.summary(), diags)"
+---
+- listeners:
+    - "http 0.0.0.0:6152"
+    - "socks5 0.0.0.0:6153"
+  policies: []
+  groups:
+    - "Old (subnet) -> []"
+  rules:
+    - "SUBNET,MyWifi,DIRECT"
+    - "FINAL,DIRECT"
+  rulesets: []
+  hosts: []
+  keystore: []
+  deferred: []
+  unknown_sections: []
+  managed: ~
+- - "info[I0001] valid/legacy-keys.conf:2: legacy key `doh-server` migrated to `encrypted-dns-server`"
+  - "info[I0001] valid/legacy-keys.conf:3: legacy key `doh-follow-outbound-mode` migrated to `encrypted-dns-follow-outbound-mode`"
+  - "info[I0001] valid/legacy-keys.conf:4: legacy key `doh-skip-cert-verification` migrated to `encrypted-dns-skip-cert-verification`"
+  - "info[I0001] valid/legacy-keys.conf:6: legacy key `interface/port` migrated to `http-listen`"
+  - "info[I0001] valid/legacy-keys.conf:8: legacy key `socks-interface/socks-port` migrated to `socks5-listen`"
+  - "info[I0001] valid/legacy-keys.conf:9: legacy key `ipv6-vif = off` migrated to `ipv6-vif = disabled`"
+  - "info[I0001] valid/legacy-keys.conf:10: legacy key `use-default-policy-if-wifi-not-primary` migrated to `subnet-exp-wifi-always-match (inverted)`"
+  - "warning[W0006] valid/legacy-keys.conf:11: `vif-mode` is no longer supported by Surge and is ignored"
+  - "warning[W0006] valid/legacy-keys.conf:12: `enhanced-mode-by-rule` is no longer supported by Surge and is ignored"
