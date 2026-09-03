@@ -1,5 +1,4 @@
 use crate::capabilities;
-use anyhow::Context;
 use clap::Args;
 use rurge_config::config::{LoadOptions, Platform, load};
 use rurge_config::diagnostic::Severity;
@@ -51,8 +50,7 @@ pub fn run(args: CheckArgs) -> anyhow::Result<ExitCode> {
         platform,
         capabilities: capabilities::current(),
     };
-    let loaded = load(&args.config, &opts)
-        .with_context(|| format!("cannot read `{}`", args.config.display()))?;
+    let loaded = load(&args.config, &opts)?;
     let diags = loaded.diagnostics.sorted();
     let count = |s: Severity| diags.iter().filter(|d| d.severity == s).count();
     let (errors, warnings, infos) = (

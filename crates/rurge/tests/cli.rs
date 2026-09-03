@@ -62,7 +62,9 @@ fn check_exit_codes() {
         .args(["check", "-c", "/no/such/file.conf"])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("cannot read"));
+        .stderr(predicate::function(|s: &str| {
+            s.matches("cannot read").count() == 1
+        }));
 }
 
 #[test]

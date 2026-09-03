@@ -39,7 +39,7 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            eprintln!("error: {e}");
             ExitCode::from(2)
         }
     }
