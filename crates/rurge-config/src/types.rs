@@ -20,7 +20,7 @@ impl HostName {
         if let Ok(ip) = bare.parse::<IpAddr>() {
             return HostName::Ip(ip);
         }
-        HostName::Domain(s.trim_end_matches('.').to_ascii_lowercase())
+        HostName::Domain(bare.trim_end_matches('.').to_ascii_lowercase())
     }
     /// A hostname without a dot, such as `localhost` or `nas`.
     pub fn is_simple(&self) -> bool {
@@ -40,5 +40,21 @@ impl fmt::Display for HostName {
             HostName::Domain(d) => f.write_str(d),
             HostName::Ip(ip) => write!(f, "{ip}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bracketed_non_ip_falls_back_to_bare_domain() {
+        // The brackets are an IPv6-literal marker (as in `[::1]:port`), not
+        // part of the domain; the fallback must parse from `bare`, not `s`,
+        // or the brackets survive into the domain string.
+        assert_eq!(
+            HostName::parse("[example.com]"),
+            HostName::Domain("example.com".into())
+        );
     }
 }

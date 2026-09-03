@@ -443,8 +443,19 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
 
     // Inline rule sets.
     let mut rulesets = Vec::new();
+    let mut ruleset_names: HashSet<String> = HashSet::new();
     for sec in profile.sections_with_prefix("Ruleset ") {
         let name = sec.name["Ruleset ".len()..].trim().to_string();
+        if !ruleset_names.insert(name.clone()) {
+            diags.push(
+                Diagnostic::warning(
+                    codes::W_DUPLICATE_RULESET,
+                    format!("duplicate [Ruleset {name}] ignored; the first definition is used"),
+                )
+                .at(sec.span.clone()),
+            );
+            continue;
+        }
         let mut rules = Vec::new();
         for e in sec.active_entries() {
             match parse_subrule(&e.raw, &ctx) {
@@ -941,6 +952,28 @@ mod tests {
         assert!(c.contains(&codes::W_DEVICE_POLICY_AS_REJECT));
         assert_eq!(l.config.unknown_sections, ["Weird"]);
         assert_eq!(l.config.deferred.sections.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_inline_ruleset_name_warns_and_keeps_first() {
+        let l = load_text(
+            "[Ruleset A]\nDOMAIN,a\n[Ruleset A]\nDOMAIN,b\n[Rule]\nRULE-SET,A,DIRECT\nFINAL,DIRECT\n",
+        );
+        assert!(
+            !l.diagnostics.has_errors(),
+            "{:?}",
+            l.diagnostics.into_vec()
+        );
+        let c = codes_of(&l);
+        assert_eq!(
+            c.iter()
+                .filter(|x| **x == codes::W_DUPLICATE_RULESET)
+                .count(),
+            1
+        );
+        assert_eq!(l.config.rulesets.len(), 1);
+        assert_eq!(l.config.rulesets[0].rules.len(), 1);
+        assert_eq!(l.config.rulesets[0].rules[0].raw, "DOMAIN,a");
     }
 
     #[test]
