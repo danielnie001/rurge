@@ -4,7 +4,7 @@ use crate::diagnostic::{ParseError, codes};
 use crate::glob::{Glob, GlobOptions};
 use crate::span::Span;
 use crate::types::HostName;
-use crate::value::{ParamMap, parse_key_value, split_list};
+use crate::value::{ParamMap, parse_key_value, split_list, strip_prefix_ci};
 use std::net::IpAddr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -267,13 +267,6 @@ pub enum SubnetExpr {
     Type(NetType),
     Mccmnc(String),
     Bare(String),
-}
-
-fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    match s.get(..prefix.len()) {
-        Some(head) if head.eq_ignore_ascii_case(prefix) => Some(&s[prefix.len()..]),
-        _ => None,
-    }
 }
 
 impl SubnetExpr {

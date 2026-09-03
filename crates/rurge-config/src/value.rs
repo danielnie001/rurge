@@ -90,6 +90,23 @@ fn unquote_field(f: &str) -> String {
     }
 }
 
+/// Case-insensitive, boundary-safe prefix test: `s.get(..prefix.len())` fails
+/// closed (returns `false`) instead of panicking when `prefix.len()` falls
+/// inside a multi-byte character rather than on a char boundary.
+pub(crate) fn starts_with_ci(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// Case-insensitive, boundary-safe prefix strip. `None` both when `s` doesn't
+/// start with `prefix` and when `prefix.len()` isn't a char boundary of `s`.
+pub(crate) fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    match s.get(..prefix.len()) {
+        Some(head) if head.eq_ignore_ascii_case(prefix) => Some(&s[prefix.len()..]),
+        _ => None,
+    }
+}
+
 /// Split `Name = rest` at the first `=`.
 pub fn split_definition(raw: &str) -> Option<(&str, &str)> {
     let (name, rest) = raw.split_once('=')?;

@@ -3,7 +3,7 @@
 
 use super::{Entry, Origin, Profile, Section, parse_str};
 use crate::diagnostic::{Diagnostic, Diagnostics, codes};
-use crate::value::split_list;
+use crate::value::{split_list, starts_with_ci};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,11 +38,6 @@ fn wildcard_prefix(section_name: &str) -> Option<&str> {
     let trimmed = section_name.trim_end();
     let prefix = trimmed.strip_suffix('*')?;
     (prefix.ends_with(' ')).then_some(prefix)
-}
-
-fn starts_with_ci(s: &str, prefix: &str) -> bool {
-    s.get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 pub fn expand(profile: &mut Profile, opts: &IncludeOptions, diags: &mut Diagnostics) {

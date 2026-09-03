@@ -3,6 +3,7 @@ pub mod include;
 use crate::diagnostic::{Diagnostic, Diagnostics, codes};
 use crate::requirement;
 use crate::span::Span;
+use crate::value::starts_with_ci;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -80,11 +81,6 @@ impl Profile {
             .iter()
             .filter(move |s| starts_with_ci(&s.name, prefix))
     }
-}
-
-fn starts_with_ci(s: &str, prefix: &str) -> bool {
-    s.get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 const KEY_VALUE_SECTIONS: &[&str] = &[

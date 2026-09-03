@@ -1,6 +1,7 @@
 //! Sections that are parsed and kept but have no behaviour in this version.
 
 use crate::text::{Entry, Profile};
+use crate::value::starts_with_ci;
 
 const DEFERRED: &[&str] = &[
     "MITM",
@@ -21,12 +22,8 @@ const DEFERRED: &[&str] = &[
 
 pub fn is_deferred(name: &str) -> bool {
     DEFERRED.iter().any(|d| d.eq_ignore_ascii_case(name))
-        || name
-            .get(..10)
-            .is_some_and(|head| head.eq_ignore_ascii_case("WireGuard "))
-        || name
-            .get(..10)
-            .is_some_and(|head| head.eq_ignore_ascii_case("Tailscale "))
+        || starts_with_ci(name, "WireGuard ")
+        || starts_with_ci(name, "Tailscale ")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

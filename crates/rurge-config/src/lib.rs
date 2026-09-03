@@ -22,18 +22,27 @@ pub mod text;
 pub mod types;
 pub mod value;
 
-pub use config::{Capabilities, Config, LoadError, LoadOptions, Loaded, Platform, load};
+pub use config::{
+    Capabilities, Config, ConfigSummary, InlineRuleset, LoadError, LoadOptions, Loaded, Platform,
+    PolicyTarget, SourceInfo, load,
+};
 pub use deferred::DeferredSections;
 pub use diagnostic::{Diagnostic, Diagnostics, ParseError, Severity, codes};
-pub use general::General;
+pub use general::{
+    BlockQuicGlobal, ControllerAccess, DnsServer, EncryptedDns, EncryptedDnsScheme, General,
+    HijackTarget, Ipv6Vif, Listener, LogLevel, UdpFallback, UdpTest, UnknownKey,
+};
 pub use glob::{Glob, GlobOptions};
-pub use host::{HostEntry, HostKey, HostValue};
-pub use hostlist::HostList;
-pub use keystore::KeystoreItem;
+pub use host::{DnsUpstream, HostEntry, HostKey, HostValue, SystemMode};
+pub use hostlist::{HostList, HostListEntry, HostPattern, PortSpec};
+pub use keystore::{KeystoreItem, KeystoreType};
 pub use managed::ManagedConfig;
-pub use policy::{Builtin, GroupKind, PolicyGroup, PolicyKind, ProxyPolicy, SubnetExpr};
+pub use policy::{Builtin, GroupKind, NetType, PolicyGroup, PolicyKind, ProxyPolicy, SubnetExpr};
 pub use requirement::Environment;
-pub use rule::{ParseCtx, PolicyRef, ResourceRef, Rule, RuleKind, RuleParams, SubRule};
+pub use rule::{
+    HostnameType, InternalSet, ParseCtx, Pattern, PolicyRef, PortExpr, ProcessPattern,
+    ProtocolKind, ResourceRef, Rule, RuleKind, RuleParams, SubRule,
+};
 pub use span::Span;
 pub use text::include::IncludeOptions;
 pub use text::{Entry, Origin, Profile, Section, SectionKind};

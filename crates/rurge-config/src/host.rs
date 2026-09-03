@@ -5,7 +5,7 @@ use crate::general::EncryptedDns;
 use crate::glob::{Glob, GlobOptions};
 use crate::rule::{ParseCtx, ResourceRef};
 use crate::span::Span;
-use crate::value::{split_definition, split_list};
+use crate::value::{split_definition, split_list, strip_prefix_ci};
 use std::net::{IpAddr, SocketAddr};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,13 +42,6 @@ pub struct HostEntry {
     pub raw_key: String,
     pub value: HostValue,
     pub span: Span,
-}
-
-fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    match s.get(..prefix.len()) {
-        Some(head) if head.eq_ignore_ascii_case(prefix) => Some(&s[prefix.len()..]),
-        _ => None,
-    }
 }
 
 fn parse_upstream(item: &str) -> Option<DnsUpstream> {
