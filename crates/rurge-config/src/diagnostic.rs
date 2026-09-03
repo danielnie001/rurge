@@ -170,6 +170,8 @@ pub mod codes {
     pub const W_LINE_OUTSIDE_SECTION: &str = "W0015";
     pub const W_DEFERRED_SECTION: &str = "W0016";
     pub const W_INCLUDE_SECTION_MISSING: &str = "W0017";
+    pub const W_RULESET_LINE_SKIPPED: &str = "W0018";
+    pub const W_RULES_AFTER_FINAL: &str = "W0019";
     pub const I_LEGACY_MIGRATED: &str = "I0001";
     pub const I_LINE_DISABLED: &str = "I0002";
 }

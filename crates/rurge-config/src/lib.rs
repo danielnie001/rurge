@@ -5,6 +5,7 @@
 //! consumed by the engine. Parsing never panics; problems are reported as
 //! `diagnostic::Diagnostic` values.
 
+pub mod config;
 pub mod deferred;
 pub mod diagnostic;
 pub mod general;
@@ -21,6 +22,7 @@ pub mod text;
 pub mod types;
 pub mod value;
 
+pub use config::{Capabilities, Config, LoadError, LoadOptions, Loaded, Platform, load};
 pub use deferred::DeferredSections;
 pub use diagnostic::{Diagnostic, Diagnostics, ParseError, Severity, codes};
 pub use general::General;
