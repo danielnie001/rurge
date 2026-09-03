@@ -21,8 +21,12 @@ const DEFERRED: &[&str] = &[
 
 pub fn is_deferred(name: &str) -> bool {
     DEFERRED.iter().any(|d| d.eq_ignore_ascii_case(name))
-        || (name.len() >= 10 && name[..10].eq_ignore_ascii_case("WireGuard "))
-        || (name.len() >= 10 && name[..10].eq_ignore_ascii_case("Tailscale "))
+        || name
+            .get(..10)
+            .is_some_and(|head| head.eq_ignore_ascii_case("WireGuard "))
+        || name
+            .get(..10)
+            .is_some_and(|head| head.eq_ignore_ascii_case("Tailscale "))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,5 +94,11 @@ mod tests {
         let mitm = deferred.get("mitm").unwrap();
         assert_eq!(mitm.entries.len(), 1);
         assert_eq!(mitm.entries[0].raw, "hostname = *.example.com");
+    }
+
+    #[test]
+    fn non_ascii_names_do_not_panic() {
+        assert!(!is_deferred("中文中文中文"));
+        assert!(is_deferred("WireGuard 家里"));
     }
 }

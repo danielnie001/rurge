@@ -270,8 +270,10 @@ pub enum SubnetExpr {
 }
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    (s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix))
-        .then(|| &s[prefix.len()..])
+    match s.get(..prefix.len()) {
+        Some(head) if head.eq_ignore_ascii_case(prefix) => Some(&s[prefix.len()..]),
+        _ => None,
+    }
 }
 
 impl SubnetExpr {
@@ -549,6 +551,14 @@ mod tests {
                 .unwrap_err()
                 .code,
             codes::E_INVALID_RULE_VALUE
+        );
+    }
+
+    #[test]
+    fn subnet_expr_non_ascii_bare_does_not_panic() {
+        assert_eq!(
+            SubnetExpr::parse("中文中文中文").unwrap(),
+            SubnetExpr::Bare("中文中文中文".into())
         );
     }
 }

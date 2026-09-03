@@ -45,8 +45,10 @@ pub struct HostEntry {
 }
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    (s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix))
-        .then(|| &s[prefix.len()..])
+    match s.get(..prefix.len()) {
+        Some(head) if head.eq_ignore_ascii_case(prefix) => Some(&s[prefix.len()..]),
+        _ => None,
+    }
 }
 
 fn parse_upstream(item: &str) -> Option<DnsUpstream> {
@@ -225,5 +227,11 @@ mod tests {
             parse("a.com = 1.2.3.4, not-ip").unwrap_err().code,
             codes::E_SYNTAX
         );
+    }
+
+    #[test]
+    fn non_ascii_host_key_does_not_panic() {
+        let e = parse("中文中文中文 = 1.2.3.4").unwrap();
+        assert!(matches!(e.key, HostKey::Pattern(_)));
     }
 }

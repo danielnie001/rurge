@@ -83,7 +83,8 @@ impl Profile {
 }
 
 fn starts_with_ci(s: &str, prefix: &str) -> bool {
-    s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+    s.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 const KEY_VALUE_SECTIONS: &[&str] = &[
@@ -396,5 +397,16 @@ whatever = 1
         let (p, d) = parse("stray = 1\r\n[General]\r\nipv6 = true\r\n");
         assert_eq!(d.iter().next().unwrap().code, codes::W_LINE_OUTSIDE_SECTION);
         assert_eq!(p.section("General").unwrap().entries[0].raw, "ipv6 = true");
+    }
+
+    #[test]
+    fn non_ascii_section_names_do_not_panic() {
+        assert_eq!(section_kind("中文中文中文"), SectionKind::Unknown);
+        assert_eq!(section_kind("Ruleset 流媒体"), SectionKind::Ordered);
+        let (p, d) = parse("[中文中文中文]\nkey = value\n");
+        assert!(d.is_empty(), "{:?}", d.into_vec());
+        assert_eq!(p.sections.len(), 1);
+        assert_eq!(p.sections[0].kind, SectionKind::Unknown);
+        assert_eq!(p.sections[0].entries.len(), 1);
     }
 }

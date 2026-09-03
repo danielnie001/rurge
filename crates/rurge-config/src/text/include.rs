@@ -35,7 +35,8 @@ fn wildcard_prefix(section_name: &str) -> Option<&str> {
 }
 
 fn starts_with_ci(s: &str, prefix: &str) -> bool {
-    s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+    s.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 pub fn expand(profile: &mut Profile, opts: &IncludeOptions, diags: &mut Diagnostics) {
@@ -260,5 +261,11 @@ mod tests {
             p.section("Rule").unwrap().entries.last().unwrap().raw,
             "FINAL,DIRECT"
         );
+    }
+
+    #[test]
+    fn starts_with_ci_handles_non_ascii_without_panicking() {
+        assert!(!starts_with_ci("中文中文中文", "WireGuard "));
+        assert!(starts_with_ci("Ruleset 流媒体", "Ruleset "));
     }
 }
