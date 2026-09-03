@@ -84,11 +84,16 @@ impl ResourceRef {
             "LAN" => return ResourceRef::Internal(InternalSet::Lan),
             _ => {}
         }
-        if let Some(name) = ctx
+        if ctx.inline_rulesets.contains(raw) {
+            return ResourceRef::Inline(raw.to_string());
+        }
+        let mut ci_matches: Vec<&String> = ctx
             .inline_rulesets
             .iter()
-            .find(|n| n.as_str() == raw || n.eq_ignore_ascii_case(raw))
-        {
+            .filter(|n| n.eq_ignore_ascii_case(raw))
+            .collect();
+        ci_matches.sort();
+        if let Some(name) = ci_matches.into_iter().next() {
             return ResourceRef::Inline(name.clone());
         }
         let lower = raw.to_ascii_lowercase();
@@ -259,6 +264,44 @@ impl RuleKind {
             RuleKind::IpCidr(_) | RuleKind::IpCidr6(_) | RuleKind::GeoIp(_) | RuleKind::IpAsn(_)
         )
     }
+    /// Whether this rule kind may carry `pre-matching`, per the Surge manual's
+    /// rules/overview and rules/logical allow-list. Logical rules recurse into
+    /// their sub-rules: `AND`/`OR` require every sub-rule to support it, `NOT`
+    /// requires its single sub-rule to support it.
+    pub fn supports_pre_matching(&self) -> bool {
+        match self {
+            RuleKind::Domain(_)
+            | RuleKind::DomainSuffix(_)
+            | RuleKind::DomainKeyword(_)
+            | RuleKind::DomainWildcard(_)
+            | RuleKind::DomainSet(_)
+            | RuleKind::IpCidr(_)
+            | RuleKind::IpCidr6(_)
+            | RuleKind::GeoIp(_)
+            | RuleKind::IpAsn(_)
+            | RuleKind::SrcIp(_)
+            | RuleKind::DestPort(_)
+            | RuleKind::SrcPort(_)
+            | RuleKind::Subnet(_)
+            | RuleKind::CellularRadio(_)
+            | RuleKind::CellularCarrier(_)
+            | RuleKind::RuleSet(_) => true,
+            RuleKind::And(subs) | RuleKind::Or(subs) => {
+                subs.iter().all(|s| s.kind.supports_pre_matching())
+            }
+            RuleKind::Not(sub) => sub.kind.supports_pre_matching(),
+            RuleKind::UserAgent(_)
+            | RuleKind::UrlRegex(_)
+            | RuleKind::ProcessName(_)
+            | RuleKind::InPort(_)
+            | RuleKind::DeviceName(_)
+            | RuleKind::MacAddress(_)
+            | RuleKind::Protocol(_)
+            | RuleKind::HostnameType(_)
+            | RuleKind::Script(_)
+            | RuleKind::Final => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -266,6 +309,7 @@ pub struct SubRule {
     pub kind: RuleKind,
     pub no_resolve: bool,
     pub extended_matching: bool,
+    pub unknown: Vec<String>,
     pub raw: String,
 }
 
@@ -591,6 +635,7 @@ fn parse_subrule_depth(raw: &str, ctx: &ParseCtx, depth: usize) -> Result<SubRul
         kind,
         no_resolve: false,
         extended_matching: false,
+        unknown: Vec::new(),
         raw: raw.trim().to_string(),
     };
     for flag in &fields[2..] {
@@ -603,7 +648,7 @@ fn parse_subrule_depth(raw: &str, ctx: &ParseCtx, depth: usize) -> Result<SubRul
                     "pre-matching is only allowed on top-level rules",
                 ));
             }
-            _ => {} // unknown flags are ignored, as Surge does
+            _ => sub.unknown.push(flag.clone()),
         }
     }
     Ok(sub)
@@ -642,13 +687,7 @@ pub fn parse_rule(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<Rule, ParseE
                 "pre-matching requires a REJECT-family policy",
             ));
         }
-        if matches!(
-            kind,
-            RuleKind::Protocol(_)
-                | RuleKind::ProcessName(_)
-                | RuleKind::Script(_)
-                | RuleKind::Final
-        ) {
+        if !kind.supports_pre_matching() {
             return Err(ParseError::new(
                 codes::E_NOT_ALLOWED_HERE,
                 format!("{ty} does not support pre-matching"),
@@ -889,5 +928,62 @@ mod tests {
         let r = parse("IP-CIDR6,2001:db8::/50,DIRECT,no-resolve,extra").unwrap();
         assert!(r.params.no_resolve);
         assert_eq!(r.params.unknown, ["extra"]);
+    }
+
+    fn parse_with_inline(raw: &str, inline: &HashSet<String>) -> Result<Rule, ParseError> {
+        let span = Span::new(Arc::from(Path::new("r.conf")), 1);
+        let ctx = ParseCtx {
+            inline_rulesets: inline,
+            base_dir: Path::new("/profiles"),
+        };
+        parse_rule(raw, &ctx, &span)
+    }
+
+    #[test]
+    fn inline_ruleset_lookup_is_deterministic() {
+        let inline = HashSet::from(["Streaming".to_string(), "STREAMING".to_string()]);
+        let r = parse_with_inline("RULE-SET,Streaming,P", &inline).unwrap();
+        assert_eq!(
+            r.kind,
+            RuleKind::RuleSet(ResourceRef::Inline("Streaming".into()))
+        );
+        for _ in 0..20 {
+            // Rebuild the set each iteration so its hash-map iteration order is
+            // re-randomised; the case-insensitive fallback must still pick the
+            // same (lexicographically smallest) candidate every time.
+            let inline = HashSet::from(["Streaming".to_string(), "STREAMING".to_string()]);
+            let r = parse_with_inline("RULE-SET,streaming,P", &inline).unwrap();
+            assert_eq!(
+                r.kind,
+                RuleKind::RuleSet(ResourceRef::Inline("STREAMING".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn subrule_unknown_flags_are_collected() {
+        let r = parse("AND,((DOMAIN,a,bogus,no-resolve),(DOMAIN,b)),P").unwrap();
+        let RuleKind::And(subs) = &r.kind else {
+            panic!()
+        };
+        assert_eq!(subs[0].unknown, ["bogus"]);
+        assert!(subs[0].no_resolve);
+        assert!(subs[1].unknown.is_empty());
+    }
+
+    #[test]
+    fn pre_matching_respects_recursive_support() {
+        assert_eq!(
+            parse("AND,((PROTOCOL,UDP)),REJECT,pre-matching")
+                .unwrap_err()
+                .code,
+            codes::E_NOT_ALLOWED_HERE
+        );
+        assert_eq!(
+            parse("USER-AGENT,x,REJECT,pre-matching").unwrap_err().code,
+            codes::E_NOT_ALLOWED_HERE
+        );
+        assert!(parse("NOT,((DOMAIN,a)),REJECT,pre-matching").is_ok());
+        assert!(parse("OR,((DOMAIN,a),(IP-CIDR,10.0.0.0/8)),REJECT-DROP,pre-matching").is_ok());
     }
 }
