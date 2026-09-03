@@ -428,6 +428,7 @@ dependencies = [
  "insta",
  "ipnet",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]
