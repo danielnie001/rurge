@@ -194,6 +194,7 @@ fn is_requirement_prefix(line: &str) -> bool {
 
 /// Parse profile text. Never fails; problems are reported as diagnostics.
 pub fn parse_str(text: &str, file: Arc<Path>, origin: Origin) -> (Profile, Diagnostics) {
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let mut profile = Profile {
         main: Some(file.clone()),
         header: Vec::new(),
@@ -397,6 +398,18 @@ whatever = 1
         let (p, d) = parse("stray = 1\r\n[General]\r\nipv6 = true\r\n");
         assert_eq!(d.iter().next().unwrap().code, codes::W_LINE_OUTSIDE_SECTION);
         assert_eq!(p.section("General").unwrap().entries[0].raw, "ipv6 = true");
+    }
+
+    #[test]
+    fn utf8_bom_is_stripped_before_parsing() {
+        let (p, d) =
+            parse("\u{FEFF}[General]\r\nloglevel = notify\r\n\r\n[Rule]\r\nFINAL,DIRECT\r\n");
+        assert!(d.is_empty(), "{:?}", d.into_vec());
+        assert_eq!(p.sections.len(), 2);
+        assert_eq!(p.sections[0].name, "General");
+        assert_eq!(p.sections[0].entries.len(), 1);
+        assert_eq!(p.sections[0].entries[0].raw, "loglevel = notify");
+        assert_eq!(p.sections[1].name, "Rule");
     }
 
     #[test]

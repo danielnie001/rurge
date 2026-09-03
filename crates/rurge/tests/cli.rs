@@ -68,6 +68,24 @@ fn check_exit_codes() {
 }
 
 #[test]
+fn bom_prefixed_config_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("bom.conf");
+    fs::write(
+        &p,
+        b"\xEF\xBB\xBF[General]\r\nloglevel = notify\r\n[Rule]\r\nFINAL,DIRECT\r\n",
+    )
+    .unwrap();
+    Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(&p)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 error(s), 0 warning(s)"));
+}
+
+#[test]
 fn check_json_and_platform() {
     let dir = tempfile::tempdir().unwrap();
     let conf = write(

@@ -303,6 +303,7 @@ pub fn from_text(text: &str, path: &Path, opts: &LoadOptions) -> Loaded {
         &IncludeOptions {
             base_dir: base_dir.clone(),
             max_depth: 8,
+            max_files: 200,
         },
         &mut diags,
     );

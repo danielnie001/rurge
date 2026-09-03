@@ -12,6 +12,11 @@ use std::sync::Arc;
 pub struct IncludeOptions {
     pub base_dir: PathBuf,
     pub max_depth: usize,
+    /// Total number of `#!include` targets that may be expanded across the
+    /// whole call to `expand()`, bounding breadth (not just depth): a
+    /// non-cyclic target included many times per level would otherwise
+    /// expand as `branching^depth`.
+    pub max_files: usize,
 }
 
 impl Default for IncludeOptions {
@@ -19,6 +24,7 @@ impl Default for IncludeOptions {
         Self {
             base_dir: PathBuf::from("."),
             max_depth: 8,
+            max_files: 200,
         }
     }
 }
@@ -44,7 +50,8 @@ pub fn expand(profile: &mut Profile, opts: &IncludeOptions, diags: &mut Diagnost
     if let Some(main) = &profile.main {
         stack.push(canonical(main));
     }
-    expand_inner(profile, opts, diags, &mut stack, 0);
+    let mut count = 0usize;
+    expand_inner(profile, opts, diags, &mut stack, &mut count, 0);
 }
 
 fn canonical(p: &Path) -> PathBuf {
@@ -56,6 +63,7 @@ fn expand_inner(
     opts: &IncludeOptions,
     diags: &mut Diagnostics,
     stack: &mut Vec<PathBuf>,
+    count: &mut usize,
     depth: usize,
 ) {
     let mut appended: Vec<Section> = Vec::new();
@@ -110,6 +118,26 @@ fn expand_inner(
                     );
                     continue;
                 }
+                if *count >= opts.max_files {
+                    // Only the expansion that first crosses the limit reports
+                    // it; every further skip in this or any later section
+                    // just keeps incrementing past `max_files + 1` in silence.
+                    *count += 1;
+                    if *count == opts.max_files + 1 {
+                        diags.push(
+                            Diagnostic::error(
+                                codes::E_INCLUDE_CYCLE,
+                                format!(
+                                    "include expansion limit of {} files exceeded",
+                                    opts.max_files
+                                ),
+                            )
+                            .at(entry.span.clone()),
+                        );
+                    }
+                    continue;
+                }
+                *count += 1;
                 let text = match fs::read_to_string(&path) {
                     Ok(t) => t,
                     Err(e) => {
@@ -128,7 +156,7 @@ fn expand_inner(
                     parse_str(&text, file.clone(), Origin::Include(file.clone()));
                 diags.extend(sub_diags);
                 stack.push(canon);
-                expand_inner(&mut sub, opts, diags, stack, depth + 1);
+                expand_inner(&mut sub, opts, diags, stack, count, depth + 1);
                 stack.pop();
 
                 if let Some(prefix) = &wildcard {
@@ -178,6 +206,7 @@ mod tests {
             &IncludeOptions {
                 base_dir: dir.to_path_buf(),
                 max_depth: 8,
+                max_files: 200,
             },
             &mut d,
         );
@@ -261,6 +290,50 @@ mod tests {
             p.section("Rule").unwrap().entries.last().unwrap().raw,
             "FINAL,DIRECT"
         );
+    }
+
+    #[test]
+    fn breadth_expansion_is_bounded_by_max_files() {
+        // l0 includes l1 six times, l1 includes l2 six times, l2 includes l3
+        // six times; none of this is cyclic and none of it exceeds max_depth,
+        // so without a total-expansion limit this would expand as 6^depth.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("l3.conf"), "[Rule]\nDOMAIN,leaf,DIRECT\n").unwrap();
+        let includes_l3: String = "#!include l3.conf\n".repeat(6);
+        fs::write(dir.path().join("l2.conf"), format!("[Rule]\n{includes_l3}")).unwrap();
+        let includes_l2: String = "#!include l2.conf\n".repeat(6);
+        fs::write(dir.path().join("l1.conf"), format!("[Rule]\n{includes_l2}")).unwrap();
+        let includes_l1: String = "#!include l1.conf\n".repeat(6);
+        fs::write(
+            dir.path().join("l0.conf"),
+            format!("[Rule]\n{includes_l1}FINAL,DIRECT\n"),
+        )
+        .unwrap();
+
+        let path = dir.path().join("l0.conf");
+        let text = fs::read_to_string(&path).unwrap();
+        let (mut p, mut d) = parse_str(&text, Arc::from(path.as_path()), Origin::Main);
+        expand(
+            &mut p,
+            &IncludeOptions {
+                base_dir: dir.path().to_path_buf(),
+                max_depth: 8,
+                max_files: 50,
+            },
+            &mut d,
+        );
+        let limit_diags: Vec<_> = d
+            .iter()
+            .filter(|x| x.code == codes::E_INCLUDE_CYCLE)
+            .collect();
+        assert_eq!(limit_diags.len(), 1, "{:?}", d.clone().into_vec());
+        assert!(
+            limit_diags[0]
+                .message
+                .contains("include expansion limit of 50 files exceeded")
+        );
+        let rule_count = p.section("Rule").unwrap().entries.len();
+        assert!(rule_count <= 50 * 6 + 1, "entries: {rule_count}");
     }
 
     #[test]
