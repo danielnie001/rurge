@@ -711,11 +711,14 @@ fn validate(config: &mut Config, opts: &LoadOptions, diags: &mut Diagnostics) {
         }
     }
 
-    // FINAL.
+    // FINAL: matching stops at the *first* enabled FINAL, so dead-rule reporting
+    // must anchor there (not the last FINAL). An extra FINAL line after the first
+    // one is not itself a dead rule — it only re-declares the default policy — so
+    // only non-FINAL rules following the first FINAL are counted as dead.
     match config
         .rules
         .iter()
-        .rposition(|r| matches!(r.kind, RuleKind::Final))
+        .position(|r| matches!(r.kind, RuleKind::Final))
     {
         None => {
             let span = config.rules.last().map(|r| r.span.clone());
@@ -729,19 +732,27 @@ fn validate(config: &mut Config, opts: &LoadOptions, diags: &mut Diagnostics) {
                 None => d,
             });
         }
-        Some(pos) if pos + 1 < config.rules.len() => {
-            diags.push(
-                Diagnostic::warning(
-                    codes::W_RULES_AFTER_FINAL,
-                    format!(
-                        "{} rule(s) after FINAL never take effect",
-                        config.rules.len() - pos - 1
-                    ),
-                )
-                .at(config.rules[pos + 1].span.clone()),
-            );
+        Some(pos) => {
+            let mut dead_count = 0usize;
+            let mut dead_span = None;
+            for r in &config.rules[pos + 1..] {
+                if !matches!(r.kind, RuleKind::Final) {
+                    dead_count += 1;
+                    if dead_span.is_none() {
+                        dead_span = Some(r.span.clone());
+                    }
+                }
+            }
+            if let Some(span) = dead_span {
+                diags.push(
+                    Diagnostic::warning(
+                        codes::W_RULES_AFTER_FINAL,
+                        format!("{dead_count} rule(s) after FINAL never take effect"),
+                    )
+                    .at(span),
+                );
+            }
         }
-        _ => {}
     }
 
     // Capabilities.
@@ -846,6 +857,34 @@ mod tests {
         assert!(codes_of(&l).contains(&codes::W_RULES_AFTER_FINAL));
         let l = load_text("[Rule]\nFINAL,DIRECT #!IOS-ONLY\n");
         assert!(codes_of(&l).contains(&codes::E_MISSING_FINAL));
+    }
+
+    #[test]
+    fn dead_rules_after_first_final_are_counted() {
+        // Fix round 1: matching stops at the FIRST enabled FINAL, so a rule
+        // between two FINALs is dead and must be warned about; an extra FINAL
+        // line is not itself a dead rule (it only re-declares the default).
+        let l = load_text("[Rule]\nFINAL,DIRECT\nDOMAIN,a,DIRECT\nFINAL,REJECT\n");
+        assert!(
+            !l.diagnostics.has_errors(),
+            "{:?}",
+            l.diagnostics.into_vec()
+        );
+        let warnings: Vec<_> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::W_RULES_AFTER_FINAL)
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.starts_with("1 rule(s)"));
+
+        let l = load_text("[Rule]\nFINAL,DIRECT\nFINAL,REJECT\n");
+        assert!(
+            !l.diagnostics.has_errors(),
+            "{:?}",
+            l.diagnostics.into_vec()
+        );
+        assert!(!codes_of(&l).contains(&codes::W_RULES_AFTER_FINAL));
     }
 
     #[test]
