@@ -16,6 +16,7 @@ pub use diagnostic::{Diagnostic, Diagnostics, Severity, codes};
 pub use glob::{Glob, GlobOptions};
 pub use requirement::Environment;
 pub use span::Span;
+pub use text::include::IncludeOptions;
 pub use text::{Entry, Origin, Profile, Section, SectionKind};
 pub use value::ParamMap;
 
