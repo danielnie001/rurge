@@ -21,8 +21,8 @@ const DEFERRED: &[&str] = &[
 
 pub fn is_deferred(name: &str) -> bool {
     DEFERRED.iter().any(|d| d.eq_ignore_ascii_case(name))
-        || (name.len() > 10 && name[..10].eq_ignore_ascii_case("WireGuard "))
-        || (name.len() > 10 && name[..10].eq_ignore_ascii_case("Tailscale "))
+        || (name.len() >= 10 && name[..10].eq_ignore_ascii_case("WireGuard "))
+        || (name.len() >= 10 && name[..10].eq_ignore_ascii_case("Tailscale "))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,5 +54,41 @@ impl DeferredSections {
                 })
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::text::{Origin, parse_str};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    #[test]
+    fn prefix_and_membership_matching() {
+        assert!(is_deferred("MITM"));
+        assert!(is_deferred("mitm"));
+        assert!(is_deferred("WireGuard home"));
+        assert!(is_deferred("WireGuard "));
+        assert!(!is_deferred("WireGuard"));
+        assert!(!is_deferred("Rule"));
+        assert!(!is_deferred("General"));
+        assert!(!is_deferred("Proxy"));
+    }
+
+    #[test]
+    fn collect_keeps_only_active_entries_and_get_is_case_insensitive() {
+        let (mut profile, d) = parse_str(
+            "[MITM]\nhostname = *.example.com\nskip-server-cert-verify = true\n",
+            Arc::from(Path::new("d.conf")),
+            Origin::Main,
+        );
+        assert!(d.is_empty(), "{:?}", d.into_vec());
+        profile.section_mut("MITM").unwrap().entries[1].disabled = true;
+        let deferred = DeferredSections::collect(&profile);
+        assert_eq!(deferred.sections.len(), 1);
+        let mitm = deferred.get("mitm").unwrap();
+        assert_eq!(mitm.entries.len(), 1);
+        assert_eq!(mitm.entries[0].raw, "hostname = *.example.com");
     }
 }

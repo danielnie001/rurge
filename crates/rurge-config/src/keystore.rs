@@ -2,7 +2,7 @@
 
 use crate::diagnostic::{ParseError, codes};
 use crate::span::Span;
-use crate::value::{ParamMap, split_list};
+use crate::value::{ParamMap, parse_key_value, split_list};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeystoreType {
@@ -16,6 +16,7 @@ pub struct KeystoreItem {
     pub kind: KeystoreType,
     pub base64: String,
     pub password: Option<String>,
+    pub unknown: Vec<String>,
     pub span: Span,
 }
 
@@ -24,7 +25,8 @@ pub fn parse_keystore_item(
     definition: &str,
     span: &Span,
 ) -> Result<KeystoreItem, ParseError> {
-    let (params, _) = ParamMap::from_fields(&split_list(definition));
+    let fields = split_list(definition);
+    let (params, _) = ParamMap::from_fields(&fields);
     let base64 = params
         .get("base64")
         .ok_or_else(|| {
@@ -47,11 +49,23 @@ pub fn parse_keystore_item(
         None if password.is_some() => KeystoreType::P12,
         None => KeystoreType::OpensshPrivateKey,
     };
+    let unknown = fields
+        .iter()
+        .filter(|f| match parse_key_value(f) {
+            Some((k, _)) => !matches!(
+                k.to_ascii_lowercase().as_str(),
+                "type" | "base64" | "password"
+            ),
+            None => true,
+        })
+        .cloned()
+        .collect();
     Ok(KeystoreItem {
         name: name.to_string(),
         kind,
         base64,
         password,
+        unknown,
         span: span.clone(),
     })
 }
@@ -72,13 +86,24 @@ mod tests {
             .unwrap();
         assert_eq!(i.kind, KeystoreType::P12);
         assert_eq!(i.password.as_deref(), Some("123456"));
+        assert!(i.unknown.is_empty());
         let i =
             parse_keystore_item("key1", "type=openssh-private-key, base64=BBBB", &span()).unwrap();
         assert_eq!(i.kind, KeystoreType::OpensshPrivateKey);
+        assert!(i.unknown.is_empty());
         let i = parse_keystore_item("cert2", "base64=CCCC, password=x", &span()).unwrap();
         assert_eq!(i.kind, KeystoreType::P12);
+        assert!(i.unknown.is_empty());
         let i = parse_keystore_item("key2", "base64=DDDD", &span()).unwrap();
         assert_eq!(i.kind, KeystoreType::OpensshPrivateKey);
+        assert!(i.unknown.is_empty());
+        let i = parse_keystore_item(
+            "k",
+            "type=p12, base64=AAAA, password=x, foo=bar, stray",
+            &span(),
+        )
+        .unwrap();
+        assert_eq!(i.unknown, ["foo=bar", "stray"]);
         assert_eq!(
             parse_keystore_item("bad", "type=p12, password=x", &span())
                 .unwrap_err()
