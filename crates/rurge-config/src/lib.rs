@@ -6,12 +6,15 @@
 //! `diagnostic::Diagnostic` values.
 
 pub mod diagnostic;
+pub mod glob;
 pub mod requirement;
 pub mod span;
 pub mod text;
 pub mod value;
 
 pub use diagnostic::{Diagnostic, Diagnostics, Severity, codes};
+pub use glob::{Glob, GlobOptions};
+pub use requirement::Environment;
 pub use span::Span;
 pub use text::{Entry, Origin, Profile, Section, SectionKind};
 pub use value::ParamMap;
