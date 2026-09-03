@@ -308,6 +308,16 @@ fn u16_or(diags: &mut Diagnostics, span: &Span, key: &str, value: &str, current:
     }
 }
 
+fn u8_or(diags: &mut Diagnostics, span: &Span, key: &str, value: &str, current: u8) -> u8 {
+    match value.trim().parse() {
+        Ok(v) => v,
+        Err(_) => {
+            invalid(diags, span, key, value);
+            current
+        }
+    }
+}
+
 /// Parse `[password@]address[:port]`; the address must be an IP literal.
 fn parse_listener(s: &str, default_port: u16) -> Result<Listener, &'static str> {
     let (password, rest) = match s.rsplit_once('@') {
@@ -605,8 +615,7 @@ pub fn parse_general(section: Option<&Section>, diags: &mut Diagnostics) -> Gene
             "show-error-page" => set_bool!(show_error_page),
             "show-error-page-for-reject" => set_bool!(show_error_page_for_reject),
             "compatibility-mode" => {
-                g.compatibility_mode =
-                    u16_or(diags, span, key, value, u16::from(g.compatibility_mode)) as u8
+                g.compatibility_mode = u8_or(diags, span, key, value, g.compatibility_mode)
             }
             "auto-suspend" => set_bool!(auto_suspend),
             "allow-wifi-access" => set_bool!(allow_wifi_access),
@@ -845,5 +854,14 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn compatibility_mode_out_of_range_warns_and_keeps_default() {
+        let (g, d) = parse("[General]\ncompatibility-mode = 300\n");
+        assert_eq!(g.compatibility_mode, 0);
+        let c = codes_of(&d);
+        assert!(c.contains(&codes::W_INVALID_VALUE));
+        assert!(c.contains(&codes::W_PLATFORM_IGNORED));
     }
 }
