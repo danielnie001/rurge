@@ -6,6 +6,7 @@
 //! `diagnostic::Diagnostic` values.
 
 pub mod diagnostic;
+pub mod general;
 pub mod glob;
 pub mod hostlist;
 pub mod requirement;
@@ -15,6 +16,7 @@ pub mod types;
 pub mod value;
 
 pub use diagnostic::{Diagnostic, Diagnostics, Severity, codes};
+pub use general::General;
 pub use glob::{Glob, GlobOptions};
 pub use hostlist::HostList;
 pub use requirement::Environment;
