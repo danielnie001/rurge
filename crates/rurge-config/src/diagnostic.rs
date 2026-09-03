@@ -112,6 +112,28 @@ impl Diagnostics {
     }
 }
 
+/// Error from a section-level parser; the caller attaches the span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParseError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl ParseError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl Diagnostic {
+    pub fn from_parse(err: ParseError, span: Span) -> Diagnostic {
+        Diagnostic::error(err.code, err.message).at(span)
+    }
+}
+
 /// Stable diagnostic codes. Never renumber.
 pub mod codes {
     pub const E_SYNTAX: &str = "E0001";
