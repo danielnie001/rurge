@@ -6277,7 +6277,7 @@ fn invalid_corpus_reports_expected_codes() {
 - [ ] **Step 3: 生成快照并审阅**
 
 Run: `cargo install cargo-insta`（一次性），然后 `cargo insta test -p rurge-config --accept`
-Expected: 生成 `crates/rurge-config/tests/snapshots/corpus__*.snap`。逐个打开审阅：`kitchen-sink` 的规则数应为 41，策略 21 个，组 7 个，延迟节列表包含 `MITM` 到 `Testing` 共 15 个；`requirement` 在 Linux 环境下 `Group` 与 `Group2` 各只剩一条启用定义，`DOMAIN,linux.example` 启用，`reject.com` / `ios.example` 被禁用（I0002）；`legacy-keys` 有 7 条 I0001 与 2 条 W0006；`include-main` 的规则顺序为 included → DEST-PORT → RULE-SET → FINAL。若数字不符，先修实现再接受快照。
+Expected: 生成 `crates/rurge-config/tests/snapshots/corpus__*.snap`。逐个打开审阅：`kitchen-sink` 的规则数应为 41，策略 21 个，组 7 个，延迟节列表包含 `MITM` 到 `Testing` 共 15 个；`requirement` 在 `Environment::fixed()`（SYSTEM = macOS）下 `Group` 与 `Group2` 各只剩一条启用定义，`DOMAIN,reject.com`（`#!MACOS-ONLY`）启用，`ios.example` / `linux.example` 被禁用（I0002）；`legacy-keys` 有 7 条 I0001 与 2 条 W0006；`include-main` 的规则顺序为 included → DEST-PORT → RULE-SET → FINAL。若数字不符，先修实现再接受快照。
 
 Run: `cargo test --workspace`
 Expected: 全部通过。
@@ -6334,3 +6334,20 @@ git commit -m "test(config): 兼容性语料库与快照测试；文档更新到
 - **设计覆盖**：设计文档 4.1 ～ 4.3（Task 2、3、12）、5.1（Task 3 ～ 11）、5.2（Task 13）、14 的 M1 测试项（Task 3 ～ 14）、15 的验收标准 1 与 7（Task 13、14、1）。远程 `#!include`、托管配置的下载与更新（5.1 末段）按设计推迟到 M2，本计划只解析 `#!MANAGED-CONFIG` 并对远程 include 报 W0011。
 - **类型一致性**：`ParseError` 在 Task 9 引入，Task 10、11 复用；`ParseCtx` 在 Task 10 定义，Task 11、12 复用；`HostList::parse` 签名在 Task 7、8 一致；`Environment::fixed()` 在 Task 5 定义，Task 12 的 `LoadOptions::for_tests()` 使用；`Capabilities::ALL_RULE_TYPES` 在 Task 12 定义，Task 13 使用。
 - **诊断代码**：Task 2 定义 E0001 ～ E0017、W0001 ～ W0016、I0001 ～ I0002；Task 6 追加 W0017；Task 12 追加 W0018、W0019。
+
+---
+
+## 执行期修正记录（2026-09-03 执行本计划时的裁定，代码以仓库为准）
+
+以下条目是任务审查中发现的、计划参考代码自身的缺陷，已在实现中修正；本文档的代码块未逐一回改，照抄时请以 `crates/` 中的实现为准：
+
+| 任务 | 修正 |
+| --- | --- |
+| Task 5 | `requirement::find_suffix_marker` 只在双引号之外识别行尾 `#!REQUIREMENT` / `//!REQUIREMENT`（与 `strip_inline_comment` 的引号语义一致） |
+| Task 8 | `compatibility-mode` 直接解析 `u8`（新增 `u8_or`），越界值报 W0012 并保留默认，不再 `as u8` 回绕 |
+| Task 10 | `ResourceRef::parse` 内联集名精确匹配优先、大小写不敏感回退取字典序最小者；`SubRule` 增加 `unknown` 字段；`RuleKind::supports_pre_matching()` 按手册允许列表递归校验 |
+| Task 11 | `KeystoreItem` 增加 `unknown` 字段；`is_deferred` 前缀判断为 `>= 10` 并补测试 |
+| Task 11b | 五处 ASCII 前缀比较改用 `str::get`，非 ASCII 节名不再 panic |
+| Task 12 | W0019 以第一条启用的 FINAL 为界统计其后的非 FINAL 规则；对子规则未知参数发 W0003、Keystore 未知字段发 W0001 |
+| Task 13 | 去掉 `with_context`，`main` 打印 `{e}`，缺文件错误信息不再重复 |
+| Task 14 | `requirement.conf` 检查点按 `Environment::fixed()`（SYSTEM = macOS）修正；快照文件名为 `corpus__corpus__<名>.snap` |

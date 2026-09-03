@@ -42,3 +42,5 @@ cargo clippy --all-targets -- -D warnings       # 零警告
 cargo fmt --all
 cargo run -p rurge -- check -c config.conf      # 校验 Surge 配置（--json / --strict / --platform）
 ```
+
+`Cargo.lock` 需要提交（`.gitignore` 已注明）。
