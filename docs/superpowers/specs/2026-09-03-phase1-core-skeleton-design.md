@@ -189,7 +189,7 @@ pub struct Diagnostic { severity: Error | Warning | Info, code: &'static str, me
 
 ### 5.2 `rurge check`
 
-`rurge check -c <path> [--json] [--platform windows|linux|macos]`：加载并输出诊断（人类可读或 JSON），退出码 0 通过 / 1 仅警告（可用 `--strict` 变为失败）/ 2 错误。`--platform` 允许在一个平台上按另一个平台的语义校验。
+`rurge check -c <path> [--json] [--platform windows|linux|macos]`：加载并输出诊断（人类可读或 JSON），退出码：0 = 无错误（有警告也为 0）；1 = 有警告且指定了 `--strict`；2 = 有错误或文件无法读取。`--platform` 允许在一个平台上按另一个平台的语义校验。
 
 ## 6. 规则引擎（M2，`rurge-rules`）
 
