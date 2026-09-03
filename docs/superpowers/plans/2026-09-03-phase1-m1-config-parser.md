@@ -6351,3 +6351,17 @@ git commit -m "test(config): 兼容性语料库与快照测试；文档更新到
 | Task 12 | W0019 以第一条启用的 FINAL 为界统计其后的非 FINAL 规则；对子规则未知参数发 W0003、Keystore 未知字段发 W0001 |
 | Task 13 | 去掉 `with_context`，`main` 打印 `{e}`，缺文件错误信息不再重复 |
 | Task 14 | `requirement.conf` 检查点按 `Environment::fixed()`（SYSTEM = macOS）修正；快照文件名为 `corpus__corpus__<名>.snap` |
+
+## 延后事项（最终审查分诊：均可等到 M2+，不阻塞合并）
+
+| 位置 | 事项 |
+| --- | --- |
+| `types.rs` / `hostlist.rs` | 多冒号非 IPv6 项（如 `a:b:c`）成为永不匹配的 Glob 而非进入 `invalid` |
+| `general.rs` | `dns-server` / `encrypted-dns-server` / `hijack-dns` 重复键累加，其他列表键 last-wins（需定 Surge 语义）；`UnknownKey.key` 为小写化后的键；legacy `interface`/`port` 用字符串拼接，IPv6 值会被误读；legacy 路径的 E0013 报合成键名；`parse_listener` 接受空密码 |
+| `rule.rs` | `split_list` 丢弃空字段导致位置参数错位（Task 4 继承）；URL-REGEX 未加引号的逗号被截断，E0011 消息可提示加引号；PROCESS-NAME 前缀模式优先于含通配符的路径；`SYSTEM`/`LAN` 大小写敏感而内联名不敏感、IP-ASN 只接受 `AS`/`as`；已知参数值非法时报 W0003 而非更精确的代码；`DOMAIN-SET` 不应解析为内联 Ruleset；trim 后空域名值（`DOMAIN,.,P`）应报 E0011 |
+| `host.rs` / `managed.rs` | `[Host]` 别名目标要求含 `.`（待与手册核对）；重复 `#!MANAGED-CONFIG` 静默 last-wins |
+| `config.rs` | `DIRECT = direct, interface=en0` 整行静默丢弃（手册语义），可加 Info 提示 |
+| `glob.rs` / `requirement.rs` / `text/` | glob 反向区间 `[z-a]` 静默匹配空集；`find_suffix_marker` 前导空白为 ASCII 级；通配 include 无匹配节时静默；简写标签字符串在 `text/mod.rs` 与 `requirement.rs` 重复 |
+| `crates/rurge` | `--json` 与不可读文件组合时无 JSON 输出；`--core-version` 无自动化测试 |
+| 测试 | `Diagnostics::sorted` 同 span 并列分支、include 深度边界 / 绝对路径 / `http://` 等无覆盖；快照文件名双重 `corpus__` 前缀 |
+| M2 待办 | 生效 FINAL 取最后一条启用的 FINAL（手册）；`ResourceRef::Inline` 与 DOMAIN-SET 的内联歧义；include 的 `max_files` 上限是否并入 `rurge-net` 资源管理器 |
