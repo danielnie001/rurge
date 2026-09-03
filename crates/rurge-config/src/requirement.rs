@@ -363,11 +363,39 @@ fn take_expr(rest: &str) -> Result<(String, &str), ReqError> {
     Ok((rest[..end].to_string(), &rest[end..]))
 }
 
-/// Find ` <marker>` (preceded by whitespace) searching from the end.
+/// Find the last ` <marker>` (preceded by whitespace) that lies outside double-quoted spans.
+/// Quote tracking mirrors `text::strip_inline_comment`: `\` inside quotes escapes the next byte.
 fn find_suffix_marker(line: &str, marker: &str) -> Option<usize> {
-    let pos = line.rfind(marker)?;
-    let before = &line[..pos];
-    (before.ends_with(char::is_whitespace)).then_some(pos)
+    let bytes = line.as_bytes();
+    let marker_bytes = marker.as_bytes();
+    let mut in_quotes = false;
+    let mut found = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_quotes {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_quotes = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' {
+            in_quotes = true;
+            i += 1;
+            continue;
+        }
+        let prev_is_space = i > 0 && bytes[i - 1].is_ascii_whitespace();
+        if prev_is_space && bytes[i..].starts_with(marker_bytes) {
+            found = Some(i);
+        }
+        i += 1;
+    }
+    found
 }
 
 /// Split a profile line into (requirement expression source, content).
@@ -550,6 +578,35 @@ mod tests {
         );
         assert_eq!(ok("plain line"), (None, "plain line".into()));
         assert!(split_line("x #!REQUIREMENT").is_err());
+    }
+
+    #[test]
+    fn split_line_suffix_marker_is_quote_aware() {
+        let ok = |l: &str| split_line(l).unwrap();
+        // A marker-like substring inside a quoted value is not a directive.
+        assert_eq!(
+            ok("USER-AGENT,\"my browser #!REQUIREMENT-ish agent\",REJECT"),
+            (
+                None,
+                "USER-AGENT,\"my browser #!REQUIREMENT-ish agent\",REJECT".into()
+            )
+        );
+        // A real marker after a quoted value is still recognised.
+        assert_eq!(
+            ok("URL-REGEX,\"^http://a b\",Proxy #!REQUIREMENT SYSTEM=='macOS'"),
+            (
+                Some("SYSTEM=='macOS'".into()),
+                "URL-REGEX,\"^http://a b\",Proxy".into()
+            )
+        );
+        // A quoted expression after the marker still works.
+        assert_eq!(
+            ok("DOMAIN,a,DIRECT //!REQUIREMENT \"CORE_VERSION>=22 AND SYSTEM=='iOS'\""),
+            (
+                Some("CORE_VERSION>=22 AND SYSTEM=='iOS'".into()),
+                "DOMAIN,a,DIRECT".into()
+            )
+        );
     }
 
     #[test]
