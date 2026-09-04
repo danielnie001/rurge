@@ -237,8 +237,14 @@ mod tests {
         );
         assert_eq!(b.upstream_names(), vec![format!("udp://{}", s.addr())]);
         // The answer's own TTL was 5s; BOOTSTRAP_MIN_TTL (60s) floors the cached
-        // entry well past that, so a lookup after 10s is still a cache hit.
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // entry well past that, so a lookup after 10s is still a cache hit. Pause
+        // only for the jump itself; resume before touching the network again so
+        // the mock's sockets keep working on real time (`DnsCache` and `Bootstrap`
+        // use `tokio::time::Instant`, so the entry expires under the advanced
+        // clock either way).
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::time::resume();
         assert_eq!(
             b.resolve("dns.example").await.unwrap(),
             vec!["127.0.0.1".parse::<IpAddr>().unwrap()]
@@ -284,8 +290,12 @@ mod tests {
         );
         assert_eq!(s.query_count("stale.example", Qtype::A), 1);
 
-        // Past the 60s floor: the cache entry is now stale.
-        tokio::time::sleep(Duration::from_secs(61)).await;
+        // Past the 60s floor: the cache entry is now stale. Pause only for the
+        // jump itself; resume before touching the network again so the mock's
+        // sockets keep working on real time.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::resume();
 
         let started = std::time::Instant::now();
         let addrs = b.resolve("stale.example").await.unwrap();
