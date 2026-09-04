@@ -9,6 +9,9 @@ repository.workspace = true
 
 [dependencies]
 tracing.workspace = true
+resolv-conf.workspace = true
+ipconfig.workspace = true
+if-addrs.workspace = true
 
 [lints]
 workspace = true

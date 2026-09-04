@@ -258,6 +258,12 @@ pub(crate) fn build_tls_config(skip_verify: bool) -> Result<rustls::ClientConfig
     Ok(config)
 }
 
+/// Shared TLS client configuration (native roots with webpki fallback, ALPN
+/// h2 + http/1.1, optional verification bypass) for other transports (DoT).
+pub fn tls_client_config(skip_verify: bool) -> Result<Arc<rustls::ClientConfig>, HttpError> {
+    build_tls_config(skip_verify).map(Arc::new)
+}
+
 pub struct HttpClient {
     client: Client<HyperConnector, Full<Bytes>>,
     user_agent: HeaderValue,
@@ -268,7 +274,7 @@ impl HttpClient {
         connector: Arc<dyn Connector>,
         cfg: HttpClientConfig,
     ) -> Result<HttpClient, HttpError> {
-        let tls = Arc::new(build_tls_config(cfg.skip_cert_verification)?);
+        let tls = tls_client_config(cfg.skip_cert_verification)?;
         let hc = HyperConnector {
             connector,
             tls,
@@ -559,5 +565,15 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status, StatusCode::OK);
         assert_eq!(server.requests()[0].method, "POST");
+    }
+
+    #[test]
+    fn tls_client_config_advertises_h2_and_http1() {
+        let cfg = tls_client_config(false).unwrap();
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        assert!(tls_client_config(true).is_ok());
     }
 }

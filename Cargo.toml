@@ -49,6 +49,12 @@ proptest = "1"
 rcgen = "0.14"
 criterion = "0.8"
 toml = "0.8"
+rurge-dns = { path = "crates/rurge-dns" }
+hickory-proto = "0.26"
+lru = "0.18"
+resolv-conf = "0.7"
+ipconfig = "0.3"
+if-addrs = "0.15"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

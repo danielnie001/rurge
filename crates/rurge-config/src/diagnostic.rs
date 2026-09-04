@@ -183,6 +183,10 @@ pub mod codes {
     pub const W_SET_TRUNCATED: &str = "W0024";
     /// Nested set reference forms a cycle or exceeds the nesting limit.
     pub const W_SET_NESTING: &str = "W0025";
+    /// A DNS upstream the current version cannot use (h3:// / quic://, or unparsable).
+    pub const W_DNS_UPSTREAM_UNSUPPORTED: &str = "W0026";
+    /// A `[Host]` entry with a `script:` value was skipped (scripts arrive in phase 5).
+    pub const W_HOST_SCRIPT_SKIPPED: &str = "W0027";
     pub const I_LEGACY_MIGRATED: &str = "I0001";
     pub const I_LINE_DISABLED: &str = "I0002";
     /// GeoIP / ASN database file not present yet.
