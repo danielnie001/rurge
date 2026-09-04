@@ -1,3 +1,5 @@
 //! Surge-compatible DNS client (M2 design §7): upstream transports, the
 //! concurrent query engine, cache, `[Host]` mapping chain and the resolver
 //! that every other crate resolves through.
+
+pub mod message;
