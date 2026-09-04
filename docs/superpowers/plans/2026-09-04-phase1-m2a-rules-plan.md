@@ -7820,3 +7820,14 @@ EOF
 | 最终审查 | F9（次要）：缺少语料库级别的引擎冒烟测试，无法保证 corpus 里每份配置都能实际建出 `RuleEngine` 并评估 | 新增 `crates/rurge-rules/tests/corpus_engine.rs`：遍历仓库根 `tests/corpus/valid/*.conf`，逐个 `load` → 离线（`offline: true`）`SetRegistry` → `RuleEngine::build` → 对 `www.example.com` 用 `NoResolve` 评估，断言不 panic 且产出带命中规则下标的决策 |
 | 最终审查 | F10（次要）：`RuleEngine::evaluate` 返回的 `Future` 的 `Send` 性没有被固定，之后的改动可能悄悄破坏 `tokio::spawn` 场景而不被测试发现 | `engine.rs` 测试新增 `assert_send` 辅助函数与 `evaluate_future_is_send` 用例：构造 `evaluate` 的 `Future` 后直接对其类型做 `assert_send`，不需要真正 `poll`/`await` |
 | 最终审查 | F11（文档）：设计文档多处与实现出现偏差——HTTP 客户端的 `stream` 实为 `send`、`ResourceStatus.state_kind` 实为 `state`、`RuleEngine::build` 签名与 `pre_match_*`/`build_with_registry` 未写全、`geoip/` 目录下不存在的 `meta.json`、`evaluate` 基准数字未回填、缺 D9/D10 | 按审查逐项修正设计文档 §5.2、§5.3（含新增第 8 点生命周期约定）、§6.5、§9、§14 验收标准 3、§16 已决事项表（新增 D9 `ResourceManager` 退休策略、D10 `RuleEngine` 保活构造器） |
+
+## 延后事项（各任务审查与最终审查分诊：均可等到后续里程碑，不阻塞合并）
+
+| 位置 | 事项 |
+| --- | --- |
+| `registry.rs` | 相互引用的两个集合各自热重载后形成 Arc 环（评估期已由深度上限兜底，但内存不释放）；`walk_kind` 必须覆盖 `Matcher::compile` 的全部集合引用（隐式耦合，宜加注释）；循环检测按 `Key` 不按 `(Key, SetKind)`（同资源两种集嵌套会被保守判为循环）；`SetStatus.state` 注释与实际状态集不符；STACK 无 RAII 前已改；cycle 测试断言 `>= 2` 可收紧；`Key::File` 未规范化路径（`..`、大小写）可能产生重复条目 |
+| `matcher.rs` / `set.rs` | `Matcher::Unsupported` 每次评估都 `format!` 一条 note；集合内域名索引先于序号更小的线性 / IP 条目命中（只影响 `sub_rule` 日志）；`CompiledSet.needs_dns` 计算后未在运行时使用；集合内 DOMAIN-SET 条目文本为归一化后的名字 |
+| `engine.rs` / `pre_matching.rs` | `pre_match_*` 用合成的 `SessionInfo`（src 127.0.0.1:0、in_port 0），含 SRC-IP / IN-PORT 的 pre-matching 逻辑规则永不命中，M3 需带真实来源；`run()` 循环后的兜底尾巴不可达；两处 collect_notes + TraceStep 形状重复；`evaluate` 基准 75.5 µs > 50 µs（顶层线性扫描，D4 后续建索引） |
+| `rurge-net` | `DirectConnector` 无总体截止时间（每地址 2 s 下限），M2b 直接用连接器时需加；`HttpClient::send` 不附 User-Agent / 不校验 scheme / 无体积上限（DoH 调用方自理）；`HttpError::Status` 从未构造；括号 IPv6 目标分支无测试；`TestServer` 的 set_status 等在 set 之前调用静默无效；`spawn` 无运行时时只 `debug!`；304 路径 `store_meta` 失败无日志；Failed 构造重复 3 行 |
+| `geoip.rs` / `geoip_update.rs` | `open()` 的 rename 失败被吞且消息仍称已改名；`load()` 双重解析；`install` 的同步文件 IO 在 tokio 任务中（真实库约 10 MB，宜 spawn_blocking）；rename 成功但 load 失败时磁盘已替换；`.mmdb.tmp` 残留；超限错误信息用整数 MiB；`invalid_download_is_rejected` 用 sleep 断言不存在 |
+| CLI / 测试 / 文档 | `rule match` 的 `sub_rule.set` 显示解析后的绝对路径；在线路径（settle / wait_initial / GeoUpdater）无 CLI 测试；文本模式 `stack.diagnostics` 未排序；计划文件结构中的 `reference.rs` 与 `tests/corpus/rulesets/*.list` 未创建（设计 §13 的引擎 vs 参考实现属性测试缺失；proptest 500 轮而非 1,000）；设计 Q3（100 万条内存实测）未回填；criterion 0.8 MSRV 1.86 > 1.85；矩阵中 DEVICE-NAME / MAC-ADDRESS / SCRIPT 保持 ✅ 与 CELLULAR-* 的 🔁 不一致；M1 遗留：`PROCESS-NAME` 值只有以 `/` 开头才按路径处理，Windows 绝对路径被当作文件名 glob |
