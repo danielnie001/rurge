@@ -176,6 +176,11 @@ impl ResourceHandle {
     }
 }
 
+/// One `ResourceManager` per configuration generation: there is no API to
+/// retire individual entries. On reload, build a new manager and drop the
+/// old one — cached files are re-read from disk, and the dropped manager's
+/// background tasks (see the periodic liveness checks in `url_task` /
+/// `file_task`) notice within 60 s and exit.
 pub struct ResourceManager {
     root: PathBuf,
     client: Arc<HttpClient>,

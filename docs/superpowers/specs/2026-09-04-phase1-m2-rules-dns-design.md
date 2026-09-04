@@ -164,13 +164,14 @@ impl HttpClient {
     pub fn new(connector: Arc<dyn Connector>, cfg: HttpClientConfig) -> Result<HttpClient, HttpError>;
     pub async fn get(&self, url: &Url, opts: &RequestOpts) -> Result<Response, HttpError>;
     pub async fn post(&self, url: &Url, body: Bytes, opts: &RequestOpts) -> Result<Response, HttpError>;
-    pub async fn stream(&self, req: http::Request<Full<Bytes>>, opts: &RequestOpts) -> Result<http::Response<Incoming>, HttpError>;  // DoH 与大文件用
+    pub async fn send(&self, req: http::Request<Full<Bytes>>, timeout: Duration) -> Result<http::Response<Incoming>, HttpError>;  // DoH 与大文件用
 }
 pub enum HttpError { InvalidUrl, Connect(io::Error), Tls(String), Timeout, TooLarge, Status(StatusCode), Protocol(String) }
 ```
 
 - HTTP/1.1 与 HTTP/2 通过 ALPN 协商；每个 (scheme, host, port) 一个连接池（hyper-util 内置）。
-- 只支持 `http` / `https`；重定向只跟随 GET，最多 5 次，跨 scheme 降级（https→http）拒绝。
+- `get` / `post` 只支持 `http` / `https`；重定向只跟随 GET，最多 5 次，跨 scheme 降级（https→http）拒绝。
+- `send`（原设计为 `stream`）接收调用方已构造好的 `Request`，只按 `timeout` 发送并返回未读取的流式响应；不经过 `get` / `post` 内部的 `build()`（不设 scheme 校验、不设 User-Agent、不设 `max_body`、不跟随重定向），调用方（DoH 等）自行提供 User-Agent 与响应体大小上限。
 - 根证书：`rustls-native-certs` 加载失败时回退 `webpki-roots` 并告警一次。
 - 没有代理支持：M3 起通过连接器实现「走策略」，客户端本身不感知。
 
@@ -197,7 +198,7 @@ pub enum ResourceState {
     Available { data: Arc<Bytes>, version: u64, fetched_at: SystemTime, stale: bool },
     Failed { last_error: String, since: SystemTime, cached: Option<Arc<Bytes>> },
 }
-pub struct ResourceStatus { pub source: ResourceSource, pub state_kind: &'static str, pub version: u64, pub fetched_at: Option<SystemTime>, pub next_refresh: Option<SystemTime>, pub last_error: Option<String> }
+pub struct ResourceStatus { pub source: ResourceSource, pub state: &'static str, pub version: u64, pub fetched_at: Option<SystemTime>, pub next_refresh: Option<SystemTime>, pub last_error: Option<String> }
 ```
 
 行为：
@@ -209,6 +210,7 @@ pub struct ResourceStatus { pub source: ResourceSource, pub state_kind: &'static
 5. **本地文件**：相对路径以主配置所在目录为基准（与 M1 `ParseCtx.base_dir` 一致）；读取失败进入 `Failed`；用 `notify` 监视父目录，500 ms 防抖后重读并广播。文件被删除进入 `Failed { cached: 上次内容 }`。
 6. **强制更新**：`force_update` 取消当前等待、立即抓取一次；M4 的 API 调用它。
 7. **上限**：单资源 64 MiB；管理器内条目数无上限（由配置决定）。
+8. **生命周期**：`ResourceManager` 不提供单条目退休（retire）接口；约定为「一个配置代数一个 `ResourceManager`」——重载时构建新管理器并丢弃旧的，缓存文件从磁盘重新读取，旧管理器的后台任务在 60 秒内感知到自身被丢弃后退出。
 
 `GeoDb` 的两个数据库也通过 `ResourceManager` 抓取（`update_interval = 7 天`），见 6.4。
 
@@ -309,13 +311,18 @@ pub trait LazyResolver: Send + Sync {
 pub struct ResolvedAddrs { pub v4: Vec<Ipv4Addr>, pub v6: Vec<Ipv6Addr> }
 pub enum OutboundMode { Direct, Proxy(PolicyRef), Rule }
 
-pub struct RuleEngine { rules: Vec<CompiledRule>, final_index: usize, pre: PreMatchingSet, sets: Arc<SetRegistry>, geo: Arc<GeoDb> }
+pub struct RuleEngine { rules: Vec<CompiledRule>, final_pos: usize, geo: Arc<dyn GeoLookup>, pre: PreMatchingSet, registry: Option<Arc<SetRegistry>> }
 impl RuleEngine {
-    pub fn build(cfg: &Config, sets: Arc<SetRegistry>, geo: Arc<GeoDb>) -> (RuleEngine, Diagnostics);
+    pub fn build(cfg: &Config, sets: &dyn SetLookup, geo: Arc<dyn GeoLookup>) -> Result<RuleEngine, BuildError>;
+    // 持有 registry 存活直到引擎被丢弃，重载不因调用方忘记单独保留 Arc 而在 60 s 内停止（F5）：
+    pub fn build_with_registry(cfg: &Config, registry: Arc<SetRegistry>, geo: Arc<dyn GeoLookup>) -> Result<RuleEngine, BuildError>;
     pub async fn evaluate(&self, s: &SessionInfo, mode: OutboundMode, r: &dyn LazyResolver) -> Decision;
     pub async fn evaluate_traced(&self, s: &SessionInfo, mode: OutboundMode, r: &dyn LazyResolver) -> (Decision, Vec<TraceStep>);
     pub fn pre_matching(&self) -> &PreMatchingSet;
+    pub fn pre_match_domain(&self, host: &str, port: u16) -> Option<PreMatch>;
+    pub fn pre_match_ip(&self, ip: IpAddr, port: u16) -> Option<PreMatch>;
     pub fn rules(&self) -> &[CompiledRule];
+    pub fn registry(&self) -> Option<&Arc<SetRegistry>>;
 }
 pub struct Decision {
     pub outcome: Outcome,                 // Policy(PolicyRef) | DnsFailed
@@ -483,7 +490,7 @@ pub mod dns {                          // M2b
 ```
 <data>/                      # --data-dir / RURGE_DATA_DIR，缺省 rurge-platform::dirs::data_dir()
 ├── resources/<sha256>/      # 外部资源缓存：data + meta.json
-├── geoip/                   # GeoLite2-Country.mmdb、GeoLite2-ASN.mmdb、meta.json（来源 URL 与时间）
+├── geoip/                   # GeoLite2-Country.mmdb、GeoLite2-ASN.mmdb；两个库都经 ResourceManager 下载，来源 URL 与抓取时间记录在对应的 resources/<sha256>/meta.json 里，geoip/ 目录本身不写 meta.json
 └── (M4) state.json, logs/
 ```
 
@@ -566,7 +573,7 @@ M2a：
 
 1. `cargo test --workspace` 全绿，clippy 零警告，三平台 CI 绿。
 2. 语料库配置全部能构建 `RuleEngine`；黄金用例全部通过；属性测试 1,000 轮无反例。
-3. 基准：100,000 条域名集单次查询 p99 < 5 µs，`evaluate`（1,000 条顶层规则 + 3 个 10 万条集）p99 < 50 µs（本机数字写入计划的执行记录）。
+3. 基准：100,000 条域名集单次查询 p99 < 5 µs，`evaluate`（1,000 条顶层规则 + 3 个 10 万条集）p99 < 50 µs（本机数字写入计划的执行记录）。**实测**（本机 Windows，1,000 条顶层 DOMAIN-SUFFIX 规则 + 3 × 10 万条集，全部 miss 落到 FINAL）：`evaluate` 中位数 75.5 µs，超过本条 50 µs 目标；根因是顶层规则按 6.1 的既定取舍（D4）线性逐条比较、不建跨规则索引，miss 场景需扫完全部 1,000 条才落到 FINAL。D4 保持「顶层不建索引」的决定不变，把「必要时给顶层规则加一个索引」列为后续里程碑的待办，本阶段不优化。
 4. `rurge rule match` 对 URL 规则集在无网络时使用缓存，有网络时首次抓取并落盘；修改本地规则集文件后 1 s 内再次匹配得到新结果。
 5. GeoIP：测试库查询正确；tar.gz 与 mmdb 两种来源都能落盘并热加载。
 
@@ -608,6 +615,8 @@ M2b：
 | D6 | HTTP 客户端 | hyper + 自定义连接器，不用 reqwest |
 | D7 | 依赖方向 | `rurge-dns → rurge-rules` |
 | D8 | 系统 DNS 发现 | `ipconfig` / `resolv-conf` / `if-addrs`，只在 `rurge-platform` |
+| D9 | `ResourceManager` 条目退休 | 不提供单条目退休接口；一个配置代数一个 `ResourceManager`，重载时整体新建并丢弃旧实例（5.3） |
+| D10 | `RuleEngine` 与 `SetRegistry` 的生命周期 | `build` 不持有 registry（调用方须自行保活）；新增 `build_with_registry` 持有 `Arc<SetRegistry>` 供常规调用方使用（6.5，F5） |
 | Q1 | 空应答是否也触发 `dns-failed` | 暂按「是」（`EmptyAnswer` 视为解析失败）；M3 联调后复核 |
 | Q2 | 内联集与外部集共享条目上限时的截断优先级 | 暂按文件顺序截断 |
 | Q3 | 排序数组在 100 万条时的实际内存 | M2a 基准后回填本文 |
