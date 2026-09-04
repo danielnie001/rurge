@@ -16,6 +16,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 use url::Url;
 
 pub const MAX_NESTING: usize = 8;
@@ -401,8 +402,19 @@ impl SetRegistry {
         rt.spawn(async move {
             let mut rx = resource.subscribe();
             loop {
-                if rx.changed().await.is_err() {
-                    return;
+                // Wake periodically too: the registry may be dropped while the resource never changes again.
+                tokio::select! {
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                        if weak.upgrade().is_none() {
+                            return;
+                        }
+                        continue;
+                    }
                 }
                 let Some(reg) = weak.upgrade() else { return };
                 let (data, version) = match resource.current() {
