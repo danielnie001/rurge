@@ -1,7 +1,7 @@
 //! Text formats of RULE-SET / DOMAIN-SET files (M2 design §6.2) and the
 //! built-in `SYSTEM` / `LAN` sets (manual `rules/ruleset.html`, Internal Rule Sets).
 
-use rurge_config::rule::{InternalSet, ParseCtx, RuleKind, SubRule, parse_subrule};
+use rurge_config::rule::{InternalSet, ParseCtx, SubRule, parse_subrule};
 
 /// Manual: "A set may contain at most 1,000,000 entries." rurge truncates and warns.
 pub const MAX_ENTRIES: usize = 1_000_000;
@@ -72,17 +72,9 @@ fn is_comment(kind: SetKind, line: &str) -> bool {
 }
 
 fn parse_rule_line(line: &str, ctx: &ParseCtx) -> Result<SetLine, String> {
+    // parse_subrule rejects FINAL and pre-matching before constructing a SubRule;
+    // their errors surface as skipped lines in parse_set_with_limit.
     let sub = parse_subrule(line, ctx).map_err(|e| e.message)?;
-    if matches!(sub.kind, RuleKind::Final) {
-        return Err("FINAL is not allowed inside a rule set".to_string());
-    }
-    if sub
-        .unknown
-        .iter()
-        .any(|p| p.eq_ignore_ascii_case("pre-matching"))
-    {
-        return Err("pre-matching is not allowed inside a rule set".to_string());
-    }
     Ok(SetLine::Rule(sub))
 }
 
