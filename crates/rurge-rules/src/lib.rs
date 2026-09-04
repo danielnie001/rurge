@@ -2,4 +2,5 @@
 
 pub mod domain_index;
 pub mod ip_index;
+pub mod matcher;
 pub mod set_format;
