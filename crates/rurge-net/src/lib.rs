@@ -6,3 +6,8 @@ use std::pin::Pin;
 
 /// Boxed `Send` future used by object-safe async traits.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+pub mod connector;
+pub mod http;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
