@@ -2,6 +2,7 @@
 //! concurrent query engine, cache, `[Host]` mapping chain and the resolver
 //! that every other crate resolves through.
 
+pub mod bootstrap;
 pub mod cache;
 pub mod fanout;
 pub mod message;
