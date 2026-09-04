@@ -175,8 +175,12 @@ pub mod codes {
     pub const W_DUPLICATE_RULESET: &str = "W0020";
     /// An earlier FINAL that is shadowed by the last FINAL.
     pub const W_DUPLICATE_FINAL: &str = "W0021";
+    /// External set resource has no data yet (never downloaded, or failed without cache).
+    pub const W_RESOURCE_UNAVAILABLE: &str = "W0022";
     pub const I_LEGACY_MIGRATED: &str = "I0001";
     pub const I_LINE_DISABLED: &str = "I0002";
+    /// GeoIP / ASN database file not present yet.
+    pub const I_GEOIP_DB_MISSING: &str = "I0003";
 }
 
 #[cfg(test)]
