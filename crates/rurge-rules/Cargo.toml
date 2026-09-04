@@ -1,0 +1,38 @@
+[package]
+name = "rurge-rules"
+description = "Rule engine, rule sets and GeoIP for rurge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rurge-config.workspace = true
+rurge-net.workspace = true
+tokio.workspace = true
+ipnet.workspace = true
+fancy-regex.workspace = true
+prefix-trie.workspace = true
+maxminddb.workspace = true
+arc-swap.workspace = true
+url.workspace = true
+bytes.workspace = true
+flate2.workspace = true
+tar.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rurge-net = { workspace = true, features = ["testing"] }
+proptest.workspace = true
+criterion.workspace = true
+tempfile.workspace = true
+toml.workspace = true
+serde.workspace = true
+
+[[bench]]
+name = "rules"
+harness = false
+
+[lints]
+workspace = true

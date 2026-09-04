@@ -1,0 +1,41 @@
+[package]
+name = "rurge-net"
+description = "Connectors, internal HTTP client and external resource manager for rurge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rurge-config.workspace = true
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+tower-service.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-native-certs.workspace = true
+webpki-roots.workspace = true
+url.workspace = true
+sha2.workspace = true
+notify.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rcgen = { workspace = true, optional = true }
+
+[features]
+# In-process HTTP(S) test server (`rurge_net::testing`); enabled by dependants' dev-dependencies.
+testing = ["dep:rcgen"]
+
+[dev-dependencies]
+tempfile.workspace = true
+rcgen.workspace = true
+
+[lints]
+workspace = true

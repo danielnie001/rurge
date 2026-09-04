@@ -1,0 +1,14 @@
+[package]
+name = "rurge-platform"
+description = "Platform-specific helpers for rurge (directories, system DNS)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tracing.workspace = true
+
+[lints]
+workspace = true
