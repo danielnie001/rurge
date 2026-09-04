@@ -354,9 +354,10 @@ DEST-PORT,8443
             v4: vec!["192.168.9.9".parse().unwrap()],
             v6: vec![],
         });
+        // Already resolved by an earlier rule: a no-resolve entry is evaluated against the address.
         assert_eq!(
-            set.eval(&s, &mut ctx, false, false).verdict,
-            Verdict::NoMatch
+            set.eval(&s, &mut ctx, false, false).entry.as_deref(),
+            Some("IP-CIDR,192.168.0.0/16,no-resolve")
         );
         ctx.resolved = Some(ResolvedAddrs {
             v4: vec![],
