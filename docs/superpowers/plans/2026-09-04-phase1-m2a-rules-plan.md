@@ -7796,4 +7796,16 @@ EOF
 
 | 任务 | 事项 | 决定 |
 | --- | --- | --- |
-| （执行时填写） | | |
+| 预检 | Task 13 测试的 ResourceOptions 缺 max_size | 补 `..ResourceOptions::default()` |
+| Task 2 | 计划假设 `Loaded.config` 为 `Option<Config>` | 实际为 `Config`，各任务测试直接使用 |
+| Task 6 | `parse_rule_line` 的 FINAL / pre-matching 守卫不可达（`parse_subrule` 已拒绝） | 删除守卫，保留端到端测试 |
+| Task 7 | PROCESS-NAME 路径 glob 未与运行时路径对称归一化（Windows 失败） | `Matcher::compile` 用归一化后的模式源文本重建 glob，Windows 不区分大小写 |
+| Task 8 | 测试断言 no-resolve 条目在地址已解析时不命中 | 按手册改为命中；设计文档 §6.3 措辞明确 |
+| Task 11 | 文件监视器在 `file_task` 内启动，首次写入被漏掉 | 在 `start()` 内同步启动监视器 |
+| Task 11 | 负间隔资源的后台任务无界等待；`get()` 先查后插竞态 | 60 s 周期唤醒复查 Weak；查找与插入同锁 |
+| Task 12 | 内联集命中测试夹具用会 panic 的解析器 | 改用返回 1.2.3.4 的解析器 |
+| Task 13 | `spawn_reloader` 无界等待 | 60 s 周期唤醒复查 Weak |
+| Task 14 | `invalid_download_is_rejected` 用 sleep 断言不存在 | 记为延后项（断言只会空洞不会误报） |
+| Task 16 | 手册示例 `PROTOCOL,HTTPS,P` 用例的 `protocol` 字段写成小写 `"https"` | `ProtocolKind::parse` 按手册区分大小写，只认 `"HTTPS"`；判定为用例笔误，改为 `"HTTPS"` |
+| Task 16 | `cargo bench -p rurge-rules -- --warm-up-time 1 --measurement-time 3` 报 `Unrecognized option`（作用到 lib 单元测试的默认 harness 上） | 改用 `cargo bench -p rurge-rules --bench rules -- --warm-up-time 1 --measurement-time 3` 只对 criterion 基准目标传参 |
+| Task 16 | 基准数字（`--warm-up-time 1 --measurement-time 3`，本机 Windows） | `domain_index_100k_hit` 中位数 699.68 ns；`ip_index_100k_hit` 中位数 62.733 ns；`evaluate_1000_rules_3x100k_sets_miss` 中位数 75.523 µs——超过设计验收标准 3 的 `evaluate` p99 < 50 µs 目标；根因是顶层 1,000 条 DOMAIN-SUFFIX 规则按设计线性逐条比较（M2 设计文档 §12 的既定取舍：顶层规则不建跨规则索引），miss 场景需扫完全部 1,000 条才落到 FINAL；按任务指示如实记录，不在本任务内优化 |

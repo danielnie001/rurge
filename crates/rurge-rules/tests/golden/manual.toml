@@ -1,0 +1,177 @@
+# Golden cases for the rule engine, drawn from the manual's per-rule-type
+# examples (manual.nssurge.com, rule pages) and this project's own semantic
+# conventions (M2 design doc §6.3 / §6.5). Each case builds a minimal profile
+# from `rules` (+ optional `final`, `rulesets`), evaluates one session and
+# checks `policy` plus any of the optional fields present.
+
+[[case]]
+name = "DOMAIN matches the exact name only"
+rules = ["DOMAIN,www.apple.com,P"]
+host = "www.apple.com"
+policy = "P"
+reason = "rule"
+
+[[case]]
+name = "DOMAIN does not match subdomains"
+rules = ["DOMAIN,apple.com,P"]
+host = "www.apple.com"
+policy = "DIRECT"
+reason = "final"
+
+[[case]]
+name = "DOMAIN-SUFFIX matches the name and subdomains"
+rules = ["DOMAIN-SUFFIX,apple.com,P"]
+host = "a.b.apple.com"
+policy = "P"
+
+[[case]]
+name = "DOMAIN-SUFFIX respects label boundaries"
+rules = ["DOMAIN-SUFFIX,apple.com,P"]
+host = "notapple.com"
+policy = "DIRECT"
+
+[[case]]
+name = "DOMAIN-KEYWORD substring"
+rules = ["DOMAIN-KEYWORD,google,P"]
+host = "www.google.co.jp"
+policy = "P"
+
+[[case]]
+name = "DOMAIN-WILDCARD *.example.com does not match the bare name"
+rules = ["DOMAIN-WILDCARD,*.example.com,P"]
+host = "example.com"
+policy = "DIRECT"
+
+[[case]]
+name = "DOMAIN-WILDCARD matches one level"
+rules = ["DOMAIN-WILDCARD,*.example.com,P"]
+host = "api.example.com"
+policy = "P"
+
+[[case]]
+name = "IP-CIDR on an IP target"
+rules = ["IP-CIDR,192.168.0.0/16,P"]
+host = "192.168.1.1"
+policy = "P"
+
+[[case]]
+name = "IP-CIDR resolves a domain and tests the first IPv4"
+rules = ["IP-CIDR,10.0.0.0/8,P"]
+host = "internal.example"
+resolve = ["10.2.3.4"]
+policy = "P"
+resolved = true
+
+[[case]]
+name = "IP-CIDR with no-resolve skips unresolved domains"
+rules = ["IP-CIDR,10.0.0.0/8,P,no-resolve"]
+host = "internal.example"
+resolve = ["10.2.3.4"]
+policy = "DIRECT"
+resolved = false
+
+[[case]]
+name = "GEOIP without a database never matches"
+rules = ["GEOIP,US,P"]
+host = "8.8.8.8"
+policy = "DIRECT"
+
+[[case]]
+name = "RULE-SET,LAN matches private addresses"
+rules = ["RULE-SET,LAN,P"]
+host = "192.168.1.10"
+policy = "P"
+
+[[case]]
+name = "RULE-SET,LAN,no-resolve does not resolve domains"
+rules = ["RULE-SET,LAN,P,no-resolve"]
+host = "printer.example"
+resolve = ["192.168.1.20"]
+policy = "DIRECT"
+resolved = false
+
+[[case]]
+name = "RULE-SET,SYSTEM matches captive.apple.com"
+rules = ["RULE-SET,SYSTEM,P"]
+host = "captive.apple.com"
+policy = "P"
+
+[[case]]
+name = "AND combines sub-rules"
+rules = ["AND,((DOMAIN-SUFFIX,example.com),(DEST-PORT,8443)),P"]
+host = "a.example.com"
+port = 8443
+policy = "P"
+
+[[case]]
+name = "AND fails when one sub-rule fails"
+rules = ["AND,((DOMAIN-SUFFIX,example.com),(DEST-PORT,8443)),P"]
+host = "a.example.com"
+port = 443
+policy = "DIRECT"
+
+[[case]]
+name = "NOT inverts"
+rules = ["NOT,((DOMAIN-SUFFIX,example.com)),P"]
+host = "other.org"
+policy = "P"
+
+[[case]]
+name = "DEST-PORT range"
+rules = ["DEST-PORT,8000-9000,P"]
+host = "x.org"
+port = 8080
+policy = "P"
+
+[[case]]
+name = "USER-AGENT glob is case-sensitive"
+rules = ["USER-AGENT,Mozilla*,P"]
+host = "x.org"
+user_agent = "Mozilla/5.0"
+policy = "P"
+
+[[case]]
+name = "PROTOCOL matches the sniffed protocol"
+rules = ["PROTOCOL,HTTPS,P"]
+host = "x.org"
+protocol = "HTTPS"
+policy = "P"
+
+[[case]]
+name = "extended-matching uses the SNI"
+rules = ["DOMAIN-SUFFIX,example.com,P,extended-matching"]
+host = "1.2.3.4"
+sni = "api.example.com"
+policy = "P"
+
+[[case]]
+name = "without extended-matching the SNI is ignored"
+rules = ["DOMAIN-SUFFIX,example.com,P"]
+host = "1.2.3.4"
+sni = "api.example.com"
+policy = "DIRECT"
+
+[[case]]
+name = "FINAL dns-failed fallback"
+rules = ["IP-CIDR,10.0.0.0/8,P"]
+final = "FINAL,P,dns-failed"
+host = "unresolvable.example"
+no_dns = true
+policy = "P"
+reason = "dns-failed-fallback"
+
+[[case]]
+name = "the last FINAL takes effect"
+rules = ["FINAL,DIRECT", "DOMAIN,a.com,P"]
+final = "FINAL,P"
+host = "b.com"
+policy = "P"
+reason = "final"
+
+[[case]]
+name = "inline rule set with nested inline set"
+rules = ["RULE-SET,Outer,P"]
+rulesets = ["[Ruleset Outer]\nRULE-SET,Inner", "[Ruleset Inner]\nDOMAIN-SUFFIX,nested.example"]
+host = "a.nested.example"
+policy = "P"
+sub_rule = "RULE-SET,Inner"

@@ -15,7 +15,7 @@ rurge（**Ru**st + Su**rge**）是一个用 Rust 编写的跨平台网络代理�
 
 ### 当前状态
 
-> **阶段 1 进行中。** 里程碑 M1（配置解析器）已完成：`rurge check` 可以校验任意 Surge 配置并给出带行号的诊断；代理功能尚未实现。
+> **阶段 1 进行中：M1、M2a 完成**（配置解析、规则引擎、规则集、GeoIP、外部资源管理、`rurge rule match`）；M2b（DNS）、M3、M4 未开始。`rurge check` 可以校验任意 Surge 配置并给出带行号的诊断；`rurge rule match` 可以离线测试一次会话会命中哪条规则；代理功能尚未实现。
 
 完整的需求、模块划分、平台差异和分阶段路线图见 [docs/requirements.md](docs/requirements.md)；
 Surge 配置项 / 规则 / 参数 / API 的逐项兼容清单见 [docs/surge-compatibility-matrix.md](docs/surge-compatibility-matrix.md)。
@@ -26,7 +26,7 @@ Surge 配置项 / 规则 / 参数 / API 的逐项兼容清单见 [docs/surge-com
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
 | 配置与 Profile | Surge`.conf` 解析、`[General]` 全部选项、托管配置自动更新、`.sgmodule` 模块、Requirement 表达式、Keystore                                               | 1 / 5 |
 | 入站           | HTTP / HTTPS 代理、SOCKS5、局域网共享与认证、系统代理设置                                                                                                     | 1     |
-| 规则系统       | 域名 / IP / GEOIP / IP-ASN / HTTP / 进程 / 源与端口 / 协议与网络 / 逻辑 / 脚本 / 规则集 / FINAL                                                               | 1     |
+| 规则系统       | 域名 / IP / GEOIP / IP-ASN / HTTP / 进程 / 源与端口 / 协议与网络 / 逻辑 / 脚本 / 规则集 / FINAL（规则引擎 / 规则集 / GeoIP 已实现，M2a）                                                               | 1     |
 | DNS            | 普通 DNS、DoH / DoT / DoQ / DoH3、本地映射、劫持、fake-ip、always-real-ip                                                                                     | 1 / 3 |
 | 出站协议       | DIRECT / REJECT 系列 / HTTP / SOCKS5 / Shadowsocks / Snell / VMess / Trojan / TUIC / Hysteria 2 / MASQUE / AnyTLS / Trust Tunnel / SSH / WireGuard / 外部程序 | 2     |
 | 策略组         | select / url-test / fallback / load-balance / smart / subnet、策略引入与订阅、延迟测试                                                                        | 2     |
@@ -53,7 +53,7 @@ Surge 配置项 / 规则 / 参数 / API 的逐项兼容清单见 [docs/surge-com
 
 ### 快速开始（计划中的形态）
 
-> `rurge check` 已可用；`rurge run` 将在 M3 提供。
+> `rurge check` 与 `rurge rule match`（离线规则测试）已可用；`rurge run` 将在 M3 提供。
 
 ```bash
 # 构建
@@ -61,6 +61,9 @@ cargo build --release
 
 # 校验配置
 rurge check -c config.conf
+
+# 离线测试某个请求会命中哪条规则、落到哪个策略（无需启动守护进程）
+rurge rule match -c surge.conf www.example.com --explain
 
 # 运行
 rurge run -c config.conf
@@ -113,6 +116,7 @@ FINAL,Select,dns-failed
 - rurge 是独立的开源项目，与 Surge 的开发者 NSSurge 没有任何关系；「Surge」是其所有者的商标，本项目仅用于描述兼容性。
 - 本项目不提供任何代理服务器或网络服务，请遵守所在地区的法律法规使用。
 - MITM（HTTPS 解密）等功能只应用于自己拥有或获得授权的设备与流量。
+- GEOIP / IP-ASN 规则默认使用 MaxMind 的 GeoLite2 数据库：This product includes GeoLite2 data created by MaxMind, available from <https://www.maxmind.com>。
 
 ### 许可证
 
@@ -133,7 +137,7 @@ rurge (**Ru**st + Su**rge**) is a cross-platform network proxy written in Rust. 
 
 ### Status
 
-> **Phase 1 in progress.** Milestone M1 (profile parser) is done: `rurge check` validates any Surge profile with line-numbered diagnostics; proxying is not implemented yet.
+> **Phase 1 in progress: M1 and M2a are done** (profile parsing, rule engine, rule sets, GeoIP, external resource management, `rurge rule match`); M2b (DNS), M3 and M4 have not started. `rurge check` validates any Surge profile with line-numbered diagnostics; `rurge rule match` tests offline which rule a session would hit; proxying is not implemented yet.
 
 See [docs/requirements.md](docs/requirements.md) (Chinese) for the full requirements, module breakdown, platform matrix and phased roadmap, and [docs/surge-compatibility-matrix.md](docs/surge-compatibility-matrix.md) for the item-by-item Surge compatibility checklist.
 
@@ -143,7 +147,7 @@ See [docs/requirements.md](docs/requirements.md) (Chinese) for the full requirem
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
 | Profile             | Surge`.conf` parser, every `[General]` option, managed profiles, `.sgmodule` modules, requirement expressions, keystore                                           | 1 / 5 |
 | Inbound             | HTTP / HTTPS proxy, SOCKS5, LAN sharing with authentication, system proxy                                                                                               | 1     |
-| Rules               | Domain / IP / GEOIP / IP-ASN / HTTP / process / source & port / protocol & network / logical / script / rule sets / FINAL                                               | 1     |
+| Rules               | Domain / IP / GEOIP / IP-ASN / HTTP / process / source & port / protocol & network / logical / script / rule sets / FINAL (rule engine / rule sets / GeoIP implemented, M2a)                                               | 1     |
 | DNS                 | Plain DNS, DoH / DoT / DoQ / DoH3, local mapping, hijacking, fake IP, always-real-ip                                                                                    | 1 / 3 |
 | Outbound            | DIRECT / REJECT family / HTTP / SOCKS5 / Shadowsocks / Snell / VMess / Trojan / TUIC / Hysteria 2 / MASQUE / AnyTLS / Trust Tunnel / SSH / WireGuard / external program | 2     |
 | Policy groups       | select / url-test / fallback / load-balance / smart / subnet, policy including and subscriptions, latency tests                                                         | 2     |
@@ -170,7 +174,7 @@ Near-term non-goals: iOS / tvOS builds, Surge Ponte (depends on iCloud), Apple-o
 
 ### Quick start (planned)
 
-> `rurge check` works today; `rurge run` arrives with milestone M3.
+> `rurge check` and `rurge rule match` (offline rule testing) work today; `rurge run` arrives with milestone M3.
 
 ```bash
 # Build
@@ -178,6 +182,9 @@ cargo build --release
 
 # Validate a profile
 rurge check -c config.conf
+
+# Test offline which rule a request would hit and which policy it resolves to (no daemon needed)
+rurge rule match -c surge.conf www.example.com --explain
 
 # Run
 rurge run -c config.conf
@@ -202,6 +209,7 @@ Profiles use the Surge format directly; see the example in the Chinese section a
 - rurge is an independent open-source project and is not affiliated with NSSurge, the developer of Surge. "Surge" is a trademark of its owner and is used here only to describe compatibility.
 - This project provides no proxy servers or network services. Use it in accordance with the laws of your jurisdiction.
 - MITM (HTTPS decryption) and similar features must only be used on devices and traffic you own or are authorised to inspect.
+- GEOIP / IP-ASN rules default to MaxMind's GeoLite2 database: This product includes GeoLite2 data created by MaxMind, available from <https://www.maxmind.com>.
 
 ### License
 

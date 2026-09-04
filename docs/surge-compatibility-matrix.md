@@ -137,8 +137,8 @@
 | `use-local-host-item-for-proxy` | 布尔；默认 false | 全部 | ✅ | 2 | |
 | `hijack-dns` | `ip[:port]` 或 `*[:port]` 列表；默认端口 53 | 全部 | ✅ | 3 | |
 | `always-real-ip` | Host List | 全部 | ✅ | 3 | |
-| `geoip-maxmind-url` | URL；默认 `https://nssurge.com/resource/geoip-database.tar.gz` | 全部 | ✅ | 1 | 接受 `.tar.gz`（含 `GeoLite2-Country.mmdb`）或裸 `.mmdb`；rurge 默认指向公开的 GeoLite2 Country mmdb 镜像，具体 URL 在阶段 1 设计文档确定 |
-| `disable-geoip-db-auto-update` | 布尔；默认 false | 全部 | ✅ | 1 | |
+| `geoip-maxmind-url` | URL；默认 `https://nssurge.com/resource/geoip-database.tar.gz` | 全部 | 🟡 | 1 | 接受 `.tar.gz`（含 `GeoLite2-Country.mmdb`）或裸 `.mmdb`；rurge 默认镜像为 `https://github.com/P3TERX/GeoLite.mmdb` 发布件（`GeoLite2-Country.mmdb` / `GeoLite2-ASN.mmdb`），而非 `nssurge.com`；可用 `--geoip-url` / `RURGE_GEOIP_URL` 覆盖 |
+| `disable-geoip-db-auto-update` | 布尔；默认 false | 全部 | 🟡 | 1 | rurge 默认每 7 天检查一次更新（Surge 未说明周期） |
 | `ipv6` | 布尔；默认 false | 全部 | ✅ | 1 | |
 | `ipv6-vif` | `disabled` `auto` `always`；默认 `disabled`；旧值 `off` | 全部 | ✅ | 3 | |
 | `tun-excluded-routes` | CIDR 列表 | 全部 | ✅ | 3 | |
@@ -214,11 +214,11 @@
 | `DOMAIN-SUFFIX` | 域名及其子域 | 全部 | ✅ | 1 | |
 | `DOMAIN-KEYWORD` | 主机名包含子串（字面量） | 全部 | ✅ | 1 | |
 | `DOMAIN-WILDCARD` | `*` `?` `[...]` 通配，`*` 可跨点 | 全部 | ✅ | 1 | |
-| `DOMAIN-SET` | 外部域名列表（URL / 本地文件） | 全部 | ✅ | 1 | 上限 1,000,000 条；本地文件监视自动重载 |
+| `DOMAIN-SET` | 外部域名列表（URL / 本地文件） | 全部 | 🟡 | 1 | 上限 1,000,000 条，超出部分截断并告警（Surge 未说明超限行为）；本地文件监视自动重载 |
 | `IP-CIDR` | IPv4 段；单地址视为 `/32`（Mac 6.0+） | 全部 | ✅ | 1 | |
 | `IP-CIDR6` | IPv6 段；单地址视为 `/128` | 全部 | ✅ | 1 | |
 | `GEOIP` | 目标 IP 所属国家（ISO 码，不区分大小写） | 全部 | ✅ | 1 | MaxMind GeoLite2 Country |
-| `IP-ASN` | 目标 IP 所属 ASN；接受 `AS` 前缀 | 全部 | ✅ | 1 | 内置 GeoLite2 ASN 库，随版本更新 |
+| `IP-ASN` | 目标 IP 所属 ASN；接受 `AS` 前缀 | 全部 | 🟡 | 1 | GeoLite2 ASN 库经外部资源管理器下载并热更新（而非随 rurge 版本发布捆绑），来源与更新周期见 `geoip-maxmind-url` / `disable-geoip-db-auto-update` |
 | `USER-AGENT` | HTTP User-Agent，`*` `?` 通配，区分大小写 | 全部 | ✅ | 1 / 4 | 阶段 1 对显式 HTTP 代理请求可用；HTTPS 需 MITM（阶段 4） |
 | `URL-REGEX` | 完整 URL 正则，区分大小写 | 全部 | ✅ | 1 / 4 | 同上 |
 | `PROCESS-NAME` | 发起进程：文件名模式 / 以 `/` 开头的全路径模式 / 以 `/` 结尾的前缀模式（Mac 6.0+）；区分大小写 | Mac only | 🟡 | 3 | rurge 在 Win/Lin/mac 三平台都实现进程识别；Windows 路径分隔符为 `\`，规则中的 `/` 前缀模式按路径归一化处理 |
@@ -226,11 +226,11 @@
 | `SRC-PORT` | 客户端源端口，同上语法 | iOS 5.8.4 / Mac 5.4.4+ | ✅ | 1 | |
 | `IN-PORT` | 接受请求的 rurge 监听端口 | 全部 | ✅ | 1 | |
 | `SRC-IP` | 客户端 IP（单地址或 CIDR，v4/v6） | 全部 | ✅ | 1 | |
-| `DEVICE-NAME` | 客户端设备名，`*` `?` 通配，区分大小写 | 全部 | ✅ | 7 | 设备名来自 DHCP / 网关模式设备表 |
-| `MAC-ADDRESS` | 同一局域网客户端 MAC | Mac 6.1+ | ✅ | 7 | 经网关转发的流量无法取得 MAC，与 Surge 一致 |
+| `DEVICE-NAME` | 客户端设备名，`*` `?` 通配，区分大小写 | 全部 | ✅ | 7 | 设备名来自 DHCP / 网关模式设备表；M2a 起解析通过，匹配前始终不匹配（并记一次告警），等待阶段 7 网关模式实现 |
+| `MAC-ADDRESS` | 同一局域网客户端 MAC | Mac 6.1+ | ✅ | 7 | 经网关转发的流量无法取得 MAC，与 Surge 一致；M2a 起解析通过，匹配前始终不匹配（并记一次告警），等待阶段 7 网关模式实现 |
 | `PROTOCOL` | `HTTP` `HTTPS` `TCP` `UDP` `QUIC` `STUN` `MTProto` `DOH` `DOH3` `DOQ` `DOT` `DNS`；区分大小写；`TCP` 覆盖 HTTP/HTTPS/MTProto，`UDP` 覆盖 QUIC/STUN | 全部 | ✅ | 1 / 3 | `DOH*` `DOQ` `DOT` `DNS` 只匹配 rurge 自身发出的 DNS 请求且需 `encrypted-dns-follow-outbound-mode=true`；`MTProto` 依赖阶段 7 |
 | `HOSTNAME-TYPE` | `IPv4` `IPv6` `DOMAIN` `SIMPLE`；关键字区分大小写，未知值使规则无效 | Mac 5.7.3+ | ✅ | 1 | |
-| `SUBNET` | 子网表达式（见 3.4） | 全部 | 🟡 | 3 | `TYPE:CELLULAR` `MCCMNC:` 在桌面平台永不匹配 |
+| `SUBNET` | 子网表达式（见 3.4） | 全部 | 🟡 | 3 | `TYPE:CELLULAR` `MCCMNC:` 在桌面平台永不匹配；M2a 起解析通过，匹配前始终不匹配（并记一次告警），等待阶段 3 增强模式实现 |
 | `CELLULAR-RADIO` | 蜂窝网络制式 | iOS only | 🔁 | 1 | 解析通过，永不匹配 |
 | `CELLULAR-CARRIER` | 运营商 MCC+MNC | iOS only | 🔁 | 1 | 同上 |
 | `AND` / `OR` / `NOT` | 逻辑组合，子规则加括号且不带策略；最多嵌套 10 层；`NOT` 只接受一个子规则；`FINAL` 不能作子规则 | 全部 | ✅ | 1 | |
@@ -284,12 +284,12 @@
 | --- | --- | --- | --- |
 | RULE-SET 值解析顺序：内部名 → 内联节名 → URL / 文件路径 | | ✅ | 1 |
 | 内部集 `SYSTEM`（Apple 系统域名 + `PROCESS-NAME,trustd` `netbiosd`）与 `LAN`（私有与特殊地址段 + `.local`） | 内容随版本变化 | 🟡 | 1 | rurge 内置内容与手册当前清单一致；`SYSTEM` 在非 Apple 平台可能匹配不到任何流量 |
-| 外部规则集文件格式：每行一条不带策略的规则；允许 `no-resolve` `extended-matching`；不允许 FINAL 与 `pre-matching`；注释 `#` `//` `;`；非法行跳过并告警；上限 1,000,000 | | ✅ | 1 |
+| 外部规则集文件格式：每行一条不带策略的规则；允许 `no-resolve` `extended-matching`；不允许 FINAL 与 `pre-matching`；注释 `#` `//` `;`；非法行跳过并告警；上限 1,000,000 | | 🟡 | 1 | 超出上限的行截断并告警（Surge 未说明超限行为） |
 | DOMAIN-SET 文件格式：每行一个域名；`.` 前缀表示后缀匹配；注释与空行忽略 | | ✅ | 1 |
 | 同一 URL / 文件不能同时作为 RULE-SET 与 DOMAIN-SET | | ✅ | 1 |
-| 外部资源下载缓存；本地文件监视自动重载 | | ✅ | 1 |
-| 内联规则集可嵌套引用 RULE-SET / DOMAIN-SET（iOS 5.22 / Mac 6.9+）；循环引用在加载时拒绝；最多 8 层，超出视为不匹配 | | ✅ | 1 |
-| 预处理：域名索引（>1000 条用磁盘库）、>50 条 IP-CIDR 编译为二进制 IP 库、IP-ASN 常数时间、其余线性 | 性能特性 | 🟡 | 1 | 目标是同等复杂度，具体数据结构由设计文档决定 |
+| 外部资源下载缓存；本地文件监视自动重载 | | 🟡 | 1 | 下载使用 HTTP 条件请求（`If-None-Match` / ETag）避免重复传输，属 rurge 内部优化，Surge 未说明其下载策略细节 |
+| 内联规则集可嵌套引用 RULE-SET / DOMAIN-SET（iOS 5.22 / Mac 6.9+）；循环引用在加载时拒绝；最多 8 层，超出视为不匹配 | | 🟡 | 1 | 手册只对内联 `[Ruleset <name>]` 说明嵌套；rurge 对外部规则集 / 域名集文件内的嵌套引用同样支持，深度限制同为 8 层 |
+| 预处理：域名反转标签排序数组（后缀 / 精确二分查找）+ IP 前缀树（最长前缀匹配）+ 其余线性 | 性能特性 | 🟡 | 1 | rurge 全内存实现（不用磁盘库）；100,000 条域名集单次查询、`evaluate`（1,000 条顶层规则 + 3 个 10 万条集）基准数字见 `docs/superpowers/plans/2026-09-04-phase1-m2a-rules-plan.md` 执行期修正记录 |
 | RULE-SET 行上的 `no-resolve` / `extended-matching` / `update-interval` / `pre-matching` 作用于整集 | | ✅ | 1 |
 
 ---
@@ -803,6 +803,7 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | `environment` `set` `set-log-level` | 环境 | 同名 | 6 | |
 | Agent Skill（Mac 6.5+） | 面向 AI 代理的技能文档 | 🟡 | 6 | rurge 仓库可提供等价 skill 文档 |
 | rurge 专有 | 守护进程 | `rurge run -c <path> [--tun] [--system-proxy]`、`rurge service install/uninstall`、`rurge mitm ca generate/export` | 1 / 3 / 4 | |
+| rurge 专有开发命令 | 离线（不启动守护进程）在当前进程内构建配置并评估一次会话，用于调试规则与规则集 | `rurge rule match -c <conf> <host[:port]> [--explain] [--json] [--resolve <ip,...>\|--no-dns] ...` | 1 | 见 M2 设计文档 §10.1；阶段 6 的 `rule match`/`rule explain` 经 HTTP API 查询运行中的守护进程，语义一致但走线上实例 |
 
 ### 10.4 HTTP API
 
@@ -872,8 +873,8 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | 章节 | 条目 | ✅ | 🟡 | 🔁 | ⛔ | ❓ |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1. 配置文件格式与指令 | 66 | 55 | 7 | 1 | 2 | 1 |
-| 2. `[General]` 选项 | 60 | 45 | 6 | 9 | 0 | 0 |
-| 3. 规则系统 | 61 | 52 | 5 | 3 | 1 | 0 |
+| 2. `[General]` 选项 | 60 | 43 | 8 | 9 | 0 | 0 |
+| 3. 规则系统 | 61 | 47 | 10 | 3 | 1 | 0 |
 | 4. 出站策略 | 85 | 75 | 6 | 1 | 0 | 3 |
 | 5. 策略组 | 29 | 26 | 2 | 1 | 0 | 0 |
 | 6. DNS 与 `[Host]` | 41 | 40 | 1 | 0 | 0 | 0 |
@@ -881,4 +882,4 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | 8. 脚本 | 47 | 35 | 7 | 4 | 1 | 0 |
 | 9. 高级网络功能 | 43 | 28 | 7 | 3 | 2 | 3 |
 | 10. 工具与可观测性 | 50 | 36 | 6 | 4 | 3 | 1 |
-| **合计** | **527** | **433** | **49** | **27** | **10** | **8** |
+| **合计** | **527** | **426** | **56** | **27** | **10** | **8** |
