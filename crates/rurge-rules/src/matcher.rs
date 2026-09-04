@@ -4,11 +4,11 @@
 
 use crate::set_format::SetKind;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use rurge_config::Glob;
 use rurge_config::rule::{
     HostnameType, Pattern, PortExpr, ProcessPattern, ProtocolKind, ResourceRef, RuleKind, SubRule,
 };
 use rurge_config::session::{ProcessInfo, SessionInfo};
+use rurge_config::{Glob, GlobOptions};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
@@ -206,7 +206,21 @@ impl Matcher {
             RuleKind::IpAsn(n) => Matcher::IpAsn(*n),
             RuleKind::UserAgent(g) => Matcher::UserAgent(g.clone()),
             RuleKind::UrlRegex(p) => Matcher::UrlRegex(p.clone()),
-            RuleKind::ProcessName(p) => Matcher::ProcessName(p.clone()),
+            RuleKind::ProcessName(p) => Matcher::ProcessName(match p {
+                // The rule text's Glob is compiled once here from the raw
+                // (un-normalized) value; rebuild it from normalized source so
+                // it compares symmetrically with the normalized runtime path
+                // `process_matches` matches against (FR-RULE-01).
+                ProcessPattern::Path(g) => {
+                    let normalized = normalize_process_path(g.source());
+                    let opts = GlobOptions {
+                        case_insensitive: cfg!(windows),
+                        classes: false,
+                    };
+                    ProcessPattern::Path(Glob::new(&normalized, opts).unwrap_or_else(|_| g.clone()))
+                }
+                other => other.clone(),
+            }),
             RuleKind::DestPort(p) => Matcher::DestPort(*p),
             RuleKind::SrcPort(p) => Matcher::SrcPort(*p),
             RuleKind::InPort(p) => Matcher::InPort(*p),
