@@ -6,8 +6,10 @@ pub mod geoip;
 pub mod ip_index;
 pub mod matcher;
 pub mod pre_matching;
+pub mod registry;
 pub mod set;
 pub mod set_format;
 
 pub use engine::{Decision, LazyResolver, OutboundMode, Outcome, Reason, RuleEngine};
 pub use geoip::{DbKind, GeoDb, GeoDbInfo};
+pub use registry::{SetRegistry, SetStatus};

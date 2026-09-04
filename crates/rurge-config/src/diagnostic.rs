@@ -177,6 +177,12 @@ pub mod codes {
     pub const W_DUPLICATE_FINAL: &str = "W0021";
     /// External set resource has no data yet (never downloaded, or failed without cache).
     pub const W_RESOURCE_UNAVAILABLE: &str = "W0022";
+    /// A set file contained lines that were skipped.
+    pub const W_SET_LINES_SKIPPED: &str = "W0023";
+    /// A set file exceeded MAX_ENTRIES and was truncated.
+    pub const W_SET_TRUNCATED: &str = "W0024";
+    /// Nested set reference forms a cycle or exceeds the nesting limit.
+    pub const W_SET_NESTING: &str = "W0025";
     pub const I_LEGACY_MIGRATED: &str = "I0001";
     pub const I_LINE_DISABLED: &str = "I0002";
     /// GeoIP / ASN database file not present yet.
