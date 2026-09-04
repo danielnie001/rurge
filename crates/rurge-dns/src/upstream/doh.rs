@@ -7,9 +7,9 @@ use super::{Upstream, UpstreamError};
 use bytes::Bytes;
 use http::Request;
 use http::header::{ACCEPT, CONTENT_TYPE};
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use rurge_net::BoxFuture;
-use rurge_net::http::HttpClient;
+use rurge_net::http::{HttpClient, HttpError};
 use std::sync::Arc;
 use tokio::time::Instant;
 use url::Url;
@@ -59,11 +59,10 @@ impl Upstream for DohUpstream {
                 .body(Full::new(Bytes::from(body)))
                 .map_err(|e| UpstreamError::Http(e.to_string()))?;
             let timeout = deadline.saturating_duration_since(Instant::now());
-            let resp = self
-                .http
-                .send(req, timeout)
-                .await
-                .map_err(|e| UpstreamError::Http(e.to_string()))?;
+            let resp = self.http.send(req, timeout).await.map_err(|e| match e {
+                HttpError::Timeout => UpstreamError::Timeout,
+                other => UpstreamError::Http(other.to_string()),
+            })?;
             let status = resp.status();
             if status != http::StatusCode::OK {
                 return Err(UpstreamError::Http(format!("status {status}")));
@@ -86,7 +85,13 @@ impl Upstream for DohUpstream {
             .await
             {
                 Ok(Ok(c)) => c,
-                Ok(Err(e)) => return Err(UpstreamError::Http(e.to_string())),
+                Ok(Err(e)) => {
+                    return Err(if e.downcast_ref::<LengthLimitError>().is_some() {
+                        UpstreamError::BadResponse("response larger than 65535 bytes".to_string())
+                    } else {
+                        UpstreamError::Http(e.to_string())
+                    });
+                }
                 Err(_) => return Err(UpstreamError::Timeout),
             };
             let mut bytes = collected.to_bytes().to_vec();
@@ -199,9 +204,21 @@ mod tests {
         server.set_header("/slow", "content-type", "application/dns-message");
         server.set_delay("/slow", Duration::from_secs(3));
         let up = DohUpstream::new(server.url("/slow"), client(false));
-        assert!(matches!(
+        assert_eq!(
             up.query(&header_with_id(5), deadline(200)).await,
-            Err(UpstreamError::Http(_) | UpstreamError::Timeout)
+            Err(UpstreamError::Timeout)
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_bad_response() {
+        let server = TestServer::spawn().await;
+        server.set("/big", vec![0u8; 70_000]);
+        server.set_header("/big", "content-type", "application/dns-message");
+        let up = DohUpstream::new(server.url("/big"), client(false));
+        assert!(matches!(
+            up.query(&header_with_id(6), deadline(2000)).await,
+            Err(UpstreamError::BadResponse(_))
         ));
     }
 }
