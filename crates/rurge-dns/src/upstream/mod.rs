@@ -2,6 +2,7 @@
 //! DNS messages; message encoding lives in `crate::message`.
 
 pub mod tcp;
+pub mod udp;
 
 use rurge_config::general::{DnsServer, EncryptedDns, EncryptedDnsScheme};
 use rurge_config::host::DnsUpstream;
