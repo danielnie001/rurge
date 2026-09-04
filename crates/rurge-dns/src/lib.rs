@@ -3,3 +3,5 @@
 //! that every other crate resolves through.
 
 pub mod message;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
