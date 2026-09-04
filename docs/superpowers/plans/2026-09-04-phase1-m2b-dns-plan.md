@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- 工具链：`rust-toolchain.toml` 固定 `channel = "stable"`；workspace `edition = "2024"`，`rust-version = "1.85"`（不得使用 let-chains 等 1.85 之后才稳定的语法）；lints `unsafe_code = "forbid"`，clippy `all = warn`。
+- 工具链：`rust-toolchain.toml` 固定 `channel = "stable"`；workspace `edition = "2024"`，`rust-version = "1.88"`（执行期修正：hickory-proto 0.26 要求 MSRV 1.88，Task 1 起由 1.85 提升；1.88 已稳定的语法可用）；lints `unsafe_code = "forbid"`，clippy `all = warn`。
 - 质量门：每个任务结束时 `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace` 三者必须通过。本机 msvc 工具链缺 rustfmt 时用 `RUSTFMT="C:\Users\SZV01065\.rustup\toolchains\stable-x86_64-pc-windows-gnu\bin\rustfmt.exe" cargo fmt --all --check`。
 - crate 与依赖方向固定：`rurge (bin) → rurge-dns → rurge-rules → rurge-net → rurge-config`；`rurge-platform` 不依赖任何内部 crate，只被 bin 依赖；平台特定代码只出现在 `rurge-platform`（AR-02），`rurge-dns` 通过 `SystemDns` trait 取系统 DNS 信息。
 - 手册语义（设计 §7，binding）：向全部选定上游并发发送；1 s 无应答重发；5 次后失败；首个有效应答获胜；只有全部上游明确空应答（或部分空应答其余超时）才报 `EmptyAnswer`；`ipv6 = true` 且本机有 IPv6 时 A / AAAA 并行，重发定时器触发时只有一种到达则以部分结果完成；连续 5 次「A 有应答而 AAAA 超时」抑制 AAAA 直到 flush / 网络变化；缓存按最小 TTL、LRU 默认 2000、过期条目立即返回并后台刷新、负缓存 30 s；配置了任意 `tcp://` / `encrypted-dns-server` 时 UDP 上游只用于引导；URL 型上游的主机名只由传统上游解析（`[Host]` 的 `server:` URL 同样）；`ipv6 = false` 丢弃 IPv6 地址的服务器；`[Host]` 按配置顺序首个命中，代理服务器主机名永不匹配 `[Host]`，别名最多 8 跳；hosts 文件追加在 `[Host]` 之后；`.local` 与单标签名交系统解析；尾点剥离并禁用搜索域；`localhost` / `*.localhost` 直接回环。
