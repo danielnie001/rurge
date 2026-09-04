@@ -6210,11 +6210,11 @@ mod tests {
             root.to_path_buf(),
             client,
             ResourceOptions {
-                offline: false,
                 fetch_timeout: Duration::from_secs(5),
                 min_backoff: Duration::from_millis(50),
                 max_backoff: Duration::from_millis(200),
                 debounce: Duration::from_millis(50),
+                ..ResourceOptions::default()
             },
         )
     }
