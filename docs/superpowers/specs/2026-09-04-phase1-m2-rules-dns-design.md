@@ -266,7 +266,7 @@ impl SetRegistry {
 | --- | --- |
 | DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / DOMAIN-WILDCARD | 对 `dst_host` 的域名形式（IP 目标 → NoMatch）；`extended-matching` 时再对 `sni`、`http_host` 各试一次。大小写不敏感 |
 | DOMAIN-SET / RULE-SET | 先查域名索引与不需要 DNS 的线性条目（不触发 DNS）；无命中且 `needs_dns` 且目标为域名且无 `no-resolve` → NeedsResolve；有地址后查 IP 索引 |
-| IP-CIDR / IP-CIDR6 / GEOIP / IP-ASN | 目标为 IP 直接判定；目标为域名：`no-resolve` → NoMatch，否则 NeedsResolve。记录选取：IP-CIDR 取首个 IPv4；IP-CIDR6 取首个 IPv6；GEOIP / IP-ASN 取首个 IPv4，无则首个 IPv6。GEOIP 国家码不区分大小写；库缺失 → NoMatch + 告警一次 |
+| IP-CIDR / IP-CIDR6 / GEOIP / IP-ASN | 目标为 IP 直接判定；目标为域名且本次评估尚未解析：`no-resolve` → NoMatch（跳过），否则 NeedsResolve；若地址已由更早的规则解析出来，`no-resolve` 规则照常按该地址判定（手册：只跳过「尚未解析」的域名目标）。记录选取：IP-CIDR 取首个 IPv4；IP-CIDR6 取首个 IPv6；GEOIP / IP-ASN 取首个 IPv4，无则首个 IPv6。GEOIP 国家码不区分大小写；库缺失 → NoMatch + 告警一次 |
 | URL-REGEX | 对 `url` 匹配；`extended-matching` 时把 URL 主机部分替换为 SNI / Host 再各匹配一次；`url` 为 None → NoMatch |
 | USER-AGENT | glob（大小写敏感）对 `user_agent`；None → NoMatch |
 | DEST-PORT / SRC-PORT / IN-PORT | `PortExpr::matches` |
