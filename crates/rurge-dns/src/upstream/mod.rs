@@ -1,6 +1,7 @@
 //! Upstream transports (design §7.2). Every transport exchanges wire-format
 //! DNS messages; message encoding lives in `crate::message`.
 
+pub mod doh;
 pub mod tcp;
 pub mod udp;
 
