@@ -629,13 +629,14 @@ DOMAIN,inline.example.com
     #[tokio::test]
     async fn inline_set_hit_reports_the_sub_rule() {
         let e = engine(CONF);
+        // Rule 1 (`IP-CIDR,10.0.0.0/8,P`) has no `no-resolve`, so it resolves
+        // "inline.example.com" first; answer outside 10.0.0.0/8 so it falls
+        // through to rule 2's RULE-SET match.
+        let r = Counting::v4("1.2.3.4");
         let d = e
-            .evaluate(
-                &session("inline.example.com"),
-                OutboundMode::Rule,
-                &Panicking,
-            )
+            .evaluate(&session("inline.example.com"), OutboundMode::Rule, &r)
             .await;
+        assert_eq!(r.calls.load(Ordering::SeqCst), 1);
         assert_eq!(d.matched, Some(2));
         assert_eq!(d.policy().map(named).as_deref(), Some("REJECT"));
         let hit = d.sub_rule.expect("sub rule");
