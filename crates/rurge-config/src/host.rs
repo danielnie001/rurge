@@ -33,7 +33,10 @@ pub enum HostValue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostKey {
     Pattern(Glob),
-    Set(ResourceRef),
+    /// `DOMAIN-SET:<url-or-path>` — file in DOMAIN-SET format.
+    DomainSet(ResourceRef),
+    /// `RULE-SET:<url-or-path>` — file in RULE-SET format; only domain entries match.
+    RuleSet(ResourceRef),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,10 +76,10 @@ pub fn parse_host_entry(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<HostEn
             format!("`{key}`: empty value"),
         ));
     }
-    let host_key = if let Some(r) =
-        strip_prefix_ci(key, "DOMAIN-SET:").or_else(|| strip_prefix_ci(key, "RULE-SET:"))
-    {
-        HostKey::Set(ResourceRef::parse(r, ctx))
+    let host_key = if let Some(r) = strip_prefix_ci(key, "DOMAIN-SET:") {
+        HostKey::DomainSet(ResourceRef::parse_external(r, ctx))
+    } else if let Some(r) = strip_prefix_ci(key, "RULE-SET:") {
+        HostKey::RuleSet(ResourceRef::parse(r, ctx))
     } else {
         HostKey::Pattern(
             Glob::new(
@@ -198,9 +201,9 @@ mod tests {
             "DOMAIN-SET:https://example.com/domains.txt = server:https://doh.example.com/dns-query",
         )
         .unwrap();
-        assert!(matches!(e.key, HostKey::Set(ResourceRef::Url(_))));
+        assert!(matches!(e.key, HostKey::DomainSet(ResourceRef::Url(_))));
         let e = parse("RULE-SET:https://example.com/rules.txt = 10.0.0.10").unwrap();
-        assert!(matches!(e.key, HostKey::Set(ResourceRef::Url(_))));
+        assert!(matches!(e.key, HostKey::RuleSet(ResourceRef::Url(_))));
         assert_eq!(e.value, HostValue::Ips(vec!["10.0.0.10".parse().unwrap()]));
     }
 

@@ -96,6 +96,14 @@ impl ResourceRef {
         if let Some(name) = ci_matches.into_iter().next() {
             return ResourceRef::Inline(name.clone());
         }
+        Self::parse_external(raw, ctx)
+    }
+
+    /// A `DOMAIN-SET` value: only URLs and files, never an inline `[Ruleset]`
+    /// (the manual lets only `RULE-SET` reference inline sets) and never
+    /// `SYSTEM` / `LAN`.
+    pub fn parse_external(raw: &str, ctx: &ParseCtx) -> ResourceRef {
+        let raw = raw.trim();
         let lower = raw.to_ascii_lowercase();
         if lower.starts_with("http://") || lower.starts_with("https://") {
             return ResourceRef::Url(raw.to_string());
@@ -448,7 +456,7 @@ fn parse_kind(ty: &str, value: &str, ctx: &ParseCtx, depth: usize) -> Result<Rul
         "DOMAIN-WILDCARD" => {
             RuleKind::DomainWildcard(glob(value, true, true).map_err(|e| invalid(ty, value, &e))?)
         }
-        "DOMAIN-SET" => RuleKind::DomainSet(ResourceRef::parse(value, ctx)),
+        "DOMAIN-SET" => RuleKind::DomainSet(ResourceRef::parse_external(value, ctx)),
         "IP-CIDR" => RuleKind::IpCidr(
             value
                 .parse::<Ipv4Net>()
@@ -985,5 +993,33 @@ mod tests {
         );
         assert!(parse("NOT,((DOMAIN,a)),REJECT,pre-matching").is_ok());
         assert!(parse("OR,((DOMAIN,a),(IP-CIDR,10.0.0.0/8)),REJECT-DROP,pre-matching").is_ok());
+    }
+
+    #[test]
+    fn domain_set_never_resolves_to_inline_ruleset() {
+        let names: HashSet<String> = ["Foo".to_string()].into_iter().collect();
+        let ctx = ParseCtx {
+            inline_rulesets: &names,
+            base_dir: Path::new("/base"),
+        };
+        let r = parse_rule(
+            "DOMAIN-SET,Foo,DIRECT",
+            &ctx,
+            &Span::new(Arc::from(Path::new("t.conf")), 1),
+        )
+        .unwrap();
+        match r.kind {
+            RuleKind::DomainSet(ResourceRef::File(p)) => {
+                assert_eq!(p, Path::new("/base").join("Foo"))
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let r = parse_rule(
+            "RULE-SET,Foo,DIRECT",
+            &ctx,
+            &Span::new(Arc::from(Path::new("t.conf")), 2),
+        )
+        .unwrap();
+        assert!(matches!(r.kind, RuleKind::RuleSet(ResourceRef::Inline(ref n)) if n == "Foo"));
     }
 }

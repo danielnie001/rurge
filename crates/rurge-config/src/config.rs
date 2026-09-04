@@ -264,6 +264,22 @@ impl Config {
             managed: self.managed.as_ref().map(|m| m.url.clone()),
         }
     }
+
+    /// Index of the FINAL rule that takes effect: the last one (manual: "if there
+    /// are multiple FINAL rules, the last one is used").
+    pub fn effective_final(&self) -> Option<usize> {
+        self.rules
+            .iter()
+            .rposition(|r| matches!(r.kind, RuleKind::Final))
+    }
+
+    /// Lowercase hostnames of every proxy server; `[Host]` never applies to them.
+    pub fn proxy_hostnames(&self) -> HashSet<String> {
+        self.policies
+            .iter()
+            .filter_map(|p| p.server.as_ref()?.as_domain().map(str::to_string))
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -723,15 +739,9 @@ fn validate(config: &mut Config, opts: &LoadOptions, diags: &mut Diagnostics) {
         }
     }
 
-    // FINAL: matching stops at the *first* enabled FINAL, so dead-rule reporting
-    // must anchor there (not the last FINAL). An extra FINAL line after the first
-    // one is not itself a dead rule — it only re-declares the default policy — so
-    // only non-FINAL rules following the first FINAL are counted as dead.
-    match config
-        .rules
-        .iter()
-        .position(|r| matches!(r.kind, RuleKind::Final))
-    {
+    // FINAL: the last FINAL takes effect. Earlier FINAL lines are shadowed
+    // (W0021); non-FINAL rules after the last FINAL never run (W0019).
+    match config.effective_final() {
         None => {
             let span = config.rules.last().map(|r| r.span.clone());
             let d = Diagnostic::error(
@@ -744,24 +754,26 @@ fn validate(config: &mut Config, opts: &LoadOptions, diags: &mut Diagnostics) {
                 None => d,
             });
         }
-        Some(pos) => {
-            let mut dead_count = 0usize;
-            let mut dead_span = None;
-            for r in &config.rules[pos + 1..] {
-                if !matches!(r.kind, RuleKind::Final) {
-                    dead_count += 1;
-                    if dead_span.is_none() {
-                        dead_span = Some(r.span.clone());
-                    }
+        Some(last) => {
+            for r in &config.rules[..last] {
+                if matches!(r.kind, RuleKind::Final) {
+                    diags.push(
+                        Diagnostic::warning(
+                            codes::W_DUPLICATE_FINAL,
+                            "this FINAL is shadowed; the last FINAL rule takes effect",
+                        )
+                        .at(r.span.clone()),
+                    );
                 }
             }
-            if let Some(span) = dead_span {
+            let dead = &config.rules[last + 1..];
+            if let Some(first) = dead.first() {
                 diags.push(
                     Diagnostic::warning(
                         codes::W_RULES_AFTER_FINAL,
-                        format!("{dead_count} rule(s) after FINAL never take effect"),
+                        format!("{} rule(s) after FINAL never take effect", dead.len()),
                     )
-                    .at(span),
+                    .at(first.span.clone()),
                 );
             }
         }
@@ -872,23 +884,19 @@ mod tests {
     }
 
     #[test]
-    fn dead_rules_after_first_final_are_counted() {
-        // Fix round 1: matching stops at the FIRST enabled FINAL, so a rule
-        // between two FINALs is dead and must be warned about; an extra FINAL
-        // line is not itself a dead rule (it only re-declares the default).
+    fn dead_rules_after_last_final_are_counted() {
+        // The last FINAL takes effect (manual: "if there are multiple FINAL
+        // rules, the last one is used"), so a rule between two FINALs is not
+        // dead — the earlier FINAL is shadowed instead (W0021).
         let l = load_text("[Rule]\nFINAL,DIRECT\nDOMAIN,a,DIRECT\nFINAL,REJECT\n");
         assert!(
             !l.diagnostics.has_errors(),
             "{:?}",
             l.diagnostics.into_vec()
         );
-        let warnings: Vec<_> = l
-            .diagnostics
-            .iter()
-            .filter(|d| d.code == codes::W_RULES_AFTER_FINAL)
-            .collect();
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].message.starts_with("1 rule(s)"));
+        let codes = codes_of(&l);
+        assert!(codes.contains(&codes::W_DUPLICATE_FINAL));
+        assert!(!codes.contains(&codes::W_RULES_AFTER_FINAL));
 
         let l = load_text("[Rule]\nFINAL,DIRECT\nFINAL,REJECT\n");
         assert!(
@@ -896,7 +904,40 @@ mod tests {
             "{:?}",
             l.diagnostics.into_vec()
         );
-        assert!(!codes_of(&l).contains(&codes::W_RULES_AFTER_FINAL));
+        let codes = codes_of(&l);
+        assert!(codes.contains(&codes::W_DUPLICATE_FINAL));
+        assert!(!codes.contains(&codes::W_RULES_AFTER_FINAL));
+    }
+
+    #[test]
+    fn last_final_takes_effect_and_earlier_final_is_shadowed() {
+        let l = load_text("[Proxy]\nA = direct\n[Rule]\nFINAL,DIRECT\nDOMAIN,a.com,A\nFINAL,A\n");
+        assert_eq!(l.config.effective_final(), Some(2));
+        let codes = codes_of(&l);
+        assert!(codes.contains(&codes::W_DUPLICATE_FINAL));
+        assert!(!codes.contains(&codes::W_RULES_AFTER_FINAL));
+    }
+
+    #[test]
+    fn rules_after_last_final_are_dead() {
+        let l = load_text("[Rule]\nFINAL,DIRECT\nDOMAIN,a.com,DIRECT\n");
+        let d: Vec<_> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::W_RULES_AFTER_FINAL)
+            .collect();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].span.as_ref().map(|s| s.line), Some(3));
+    }
+
+    #[test]
+    fn proxy_hostnames_collects_domains_only() {
+        let l = load_text(
+            "[Proxy]\nA = http, proxy.example.com, 8080\nB = socks5, 10.0.0.1, 1080\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let names = l.config.proxy_hostnames();
+        assert!(names.contains("proxy.example.com"));
+        assert_eq!(names.len(), 1);
     }
 
     #[test]

@@ -17,6 +17,7 @@ pub mod managed;
 pub mod policy;
 pub mod requirement;
 pub mod rule;
+pub mod session;
 pub mod span;
 pub mod text;
 pub mod types;
@@ -43,6 +44,7 @@ pub use rule::{
     HostnameType, InternalSet, ParseCtx, Pattern, PolicyRef, PortExpr, ProcessPattern,
     ProtocolKind, ResourceRef, Rule, RuleKind, RuleParams, SubRule,
 };
+pub use session::{DeviceInfo, ListenerKind, ProcessInfo, SessionInfo, Transport};
 pub use span::Span;
 pub use text::include::IncludeOptions;
 pub use text::{Entry, Origin, Profile, Section, SectionKind};

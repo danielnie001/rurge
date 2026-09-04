@@ -32,6 +32,12 @@ impl HostName {
             HostName::Ip(_) => None,
         }
     }
+    pub fn as_ip(&self) -> Option<IpAddr> {
+        match self {
+            HostName::Ip(ip) => Some(*ip),
+            HostName::Domain(_) => None,
+        }
+    }
 }
 
 impl fmt::Display for HostName {
