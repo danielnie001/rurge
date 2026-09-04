@@ -4,6 +4,7 @@
 
 use crate::matcher::{EvalCtx, GeoLookup, Matcher, ResolvedAddrs, SetLookup, SubRuleHit, Verdict};
 use crate::pre_matching::{PreMatch, PreMatchingSet};
+use crate::registry::SetRegistry;
 use rurge_config::policy::Builtin;
 use rurge_config::rule::{PolicyRef, RuleKind, RuleParams};
 use rurge_config::session::SessionInfo;
@@ -163,6 +164,13 @@ pub struct RuleEngine {
     final_pos: usize,
     geo: Arc<dyn GeoLookup>,
     pre: PreMatchingSet,
+    /// Keep-alive only (design §6.5): a `SetRegistry`'s hot-reload tasks hold
+    /// only a `Weak` back-reference, so if nothing else keeps the `Arc` the
+    /// registry passed to `build` alive, reload stops within 60 s even
+    /// though the engine still holds compiled `SetHandle`s that would
+    /// otherwise be fine. `None` when built via `build` from a bare
+    /// `&dyn SetLookup`; set when built via `build_with_registry`.
+    registry: Option<Arc<SetRegistry>>,
 }
 
 fn verdict_name(v: Verdict) -> &'static str {
@@ -176,6 +184,14 @@ fn verdict_name(v: Verdict) -> &'static str {
 impl RuleEngine {
     /// Compiles `[Rule]` up to the effective (last) FINAL; shadowed FINAL lines
     /// and rules after the last FINAL are dropped (the config already warned).
+    ///
+    /// `sets` is consulted only while compiling. If it wraps a `SetRegistry`
+    /// whose external sets hot-reload (URL / local-file resources), the
+    /// caller must keep that registry's `Arc` alive itself — the engine
+    /// holds only the compiled `SetHandle`s, not the registry, so a dropped
+    /// registry's background reload tasks notice within 60 s and exit, and
+    /// those sets stop updating. Use `build_with_registry` to have the
+    /// engine hold the `Arc` for you instead.
     pub fn build(
         cfg: &Config,
         sets: &dyn SetLookup,
@@ -207,7 +223,28 @@ impl RuleEngine {
             final_pos,
             geo,
             pre,
+            registry: None,
         })
+    }
+
+    /// Like `build`, but keeps `registry` alive for as long as the engine is
+    /// (see `build`'s doc comment) — use this whenever the caller already
+    /// owns the `SetRegistry` it is building against, which is the common
+    /// case.
+    pub fn build_with_registry(
+        cfg: &Config,
+        registry: Arc<SetRegistry>,
+        geo: Arc<dyn GeoLookup>,
+    ) -> Result<RuleEngine, BuildError> {
+        let mut engine = Self::build(cfg, registry.as_ref(), geo)?;
+        engine.registry = Some(registry);
+        Ok(engine)
+    }
+
+    /// The registry kept alive by `build_with_registry`; `None` if the
+    /// engine was built via `build` instead.
+    pub fn registry(&self) -> Option<&Arc<SetRegistry>> {
+        self.registry.as_ref()
     }
 
     pub fn rules(&self) -> &[CompiledRule] {
@@ -747,5 +784,19 @@ DOMAIN,inline.example.com
             &LoadOptions::for_tests(),
         );
         assert!(RuleEngine::build(&l.config, &NoNested, Arc::new(NoGeo)).is_err());
+    }
+
+    fn assert_send<T: Send>(_: &T) {}
+
+    /// `evaluate`'s returned future must stay `Send` (e.g. so a caller can
+    /// `tokio::spawn` it on a multi-thread runtime); this pins that down
+    /// without needing to actually poll it.
+    #[test]
+    fn evaluate_future_is_send() {
+        let e = engine(CONF);
+        let s = session("foo.org");
+        let resolver = NoResolve;
+        let fut = e.evaluate(&s, OutboundMode::Rule, &resolver);
+        assert_send(&fut);
     }
 }

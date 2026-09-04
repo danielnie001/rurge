@@ -202,6 +202,7 @@ fn run_match(args: MatchArgs) -> anyhow::Result<ExitCode> {
         print_diagnostics(&loaded.diagnostics.sorted());
         return Ok(ExitCode::from(2));
     }
+    let config_diagnostics = loaded.diagnostics;
     let cfg = loaded.config;
     let rt = args.runtime.resolve(&cfg)?;
     let session = build_session(&args)?;
@@ -210,7 +211,8 @@ fn run_match(args: MatchArgs) -> anyhow::Result<ExitCode> {
         .build()?;
     runtime.block_on(async move {
         let stack = build_stack(&cfg, &rt, Duration::from_secs(args.wait)).await?;
-        let engine = RuleEngine::build(&cfg, stack.registry.as_ref(), stack.geo.clone())?;
+        let engine =
+            RuleEngine::build_with_registry(&cfg, stack.registry.clone(), stack.geo.clone())?;
         let resolver: Box<dyn LazyResolver> = if args.no_dns {
             Box::new(NoResolve)
         } else if !args.resolve.is_empty() {
@@ -244,10 +246,12 @@ fn run_match(args: MatchArgs) -> anyhow::Result<ExitCode> {
                     &engine,
                     &decision,
                     &trace,
+                    &config_diagnostics,
                     &stack.diagnostics
                 ))?
             );
         } else {
+            print_diagnostics(&config_diagnostics.sorted());
             print_diagnostics(&stack.diagnostics);
             print_text(&engine, &decision, &trace);
         }
@@ -305,8 +309,14 @@ fn to_json(
     engine: &RuleEngine,
     d: &Decision,
     trace: &[TraceStep],
-    diags: &Diagnostics,
+    config_diags: &Diagnostics,
+    stack_diags: &Diagnostics,
 ) -> serde_json::Value {
+    let warnings: Vec<_> = config_diags
+        .iter()
+        .chain(stack_diags.iter())
+        .map(|x| json!({ "code": x.code, "message": x.message }))
+        .collect();
     json!({
         "policy": d.policy().map(|p| p.to_string()),
         "reason": d.reason.as_str(),
@@ -317,7 +327,7 @@ fn to_json(
             "v6": r.v6.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
         })),
         "notes": d.notes,
-        "warnings": diags.iter().map(|x| json!({ "code": x.code, "message": x.message })).collect::<Vec<_>>(),
+        "warnings": warnings,
         "trace": trace.iter().map(|t| json!({
             "rule": t.rule,
             "verdict": t.verdict,

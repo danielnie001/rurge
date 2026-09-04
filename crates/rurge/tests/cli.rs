@@ -255,4 +255,28 @@ FINAL,DIRECT,dns-failed
             .assert()
             .code(2);
     }
+
+    /// F8 regression: config-load warnings (no errors, so `load` did not
+    /// exit early) used to be dropped silently — only `stack.diagnostics`
+    /// was ever printed or included in `--json`.
+    #[test]
+    fn config_load_warnings_are_surfaced_in_text_and_json() {
+        let dir = workspace();
+        std::fs::write(
+            dir.path().join("t.conf"),
+            format!("[General]\nsome-made-up-key = 1\n{CONF}"),
+        )
+        .unwrap();
+        rule_match(dir.path(), &["listed.com"])
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("W0001"));
+        let (v, code) = json(dir.path(), &["listed.com"]);
+        assert_eq!(code, 0);
+        let warnings = v["warnings"].as_array().expect("warnings array");
+        assert!(
+            warnings.iter().any(|w| w["code"] == "W0001"),
+            "{warnings:?}"
+        );
+    }
 }
