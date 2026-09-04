@@ -5,9 +5,12 @@
 pub mod bootstrap;
 pub mod cache;
 pub mod fanout;
+pub mod hosts;
 pub mod message;
+pub mod system;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod upstream;
 
+pub use system::{NoSystemDns, StaticSystemDns, SystemDns};
 pub use upstream::{Upstream, UpstreamError, UpstreamRef, UpstreamSpec};
