@@ -254,26 +254,33 @@ impl ResourceManager {
 
     pub fn get(&self, spec: &ResourceSpec) -> ResourceHandle {
         let key = spec.source.key();
-        let existing = self.entries.lock().expect("entries").get(&key).cloned();
-        if let Some(entry) = existing {
-            merge_interval(&entry, spec.update_interval);
-            return ResourceHandle { entry };
+        // Look up and (if absent) insert inside one critical section: releasing the lock
+        // between a "not found" lookup and the insert let two concurrent first calls for the
+        // same source each create their own `Entry` and background task. `start` itself is
+        // called after the lock is released, and only for an entry this call actually created.
+        let (entry, is_new) = {
+            let mut entries = self.entries.lock().expect("entries");
+            if let Some(existing) = entries.get(&key) {
+                merge_interval(existing, spec.update_interval);
+                (existing.clone(), false)
+            } else {
+                let (tx, _rx) = watch::channel(0u64);
+                let entry = Arc::new(Entry {
+                    source: spec.source.clone(),
+                    state: Mutex::new(ResourceState::Missing),
+                    meta: Mutex::new(None),
+                    interval: Mutex::new(spec.update_interval),
+                    next_refresh: Mutex::new(None),
+                    tx,
+                    kick: Notify::new(),
+                });
+                entries.insert(key, entry.clone());
+                (entry, true)
+            }
+        };
+        if is_new {
+            self.start(entry.clone());
         }
-        let (tx, _rx) = watch::channel(0u64);
-        let entry = Arc::new(Entry {
-            source: spec.source.clone(),
-            state: Mutex::new(ResourceState::Missing),
-            meta: Mutex::new(None),
-            interval: Mutex::new(spec.update_interval),
-            next_refresh: Mutex::new(None),
-            tx,
-            kick: Notify::new(),
-        });
-        self.entries
-            .lock()
-            .expect("entries")
-            .insert(key, entry.clone());
-        self.start(entry.clone());
         ResourceHandle { entry }
     }
 
@@ -424,17 +431,20 @@ async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>) {
         drop(mgr);
         let due = next_due(&entry, backoff);
         *entry.next_refresh.lock().expect("next") = due.map(|d| SystemTime::now() + d);
-        match due {
-            Some(d) => {
-                tokio::select! {
-                    _ = tokio::time::sleep(d) => {}
-                    _ = entry.kick.notified() => {}
-                }
-            }
-            None => entry.kick.notified().await,
-        }
+        // `due` is `None` only when auto-refresh is disabled (negative interval); bound that
+        // wait too, so an orphaned task (manager dropped, nobody left to `force_update`) still
+        // wakes periodically to notice `weak.upgrade()` failing instead of parking forever.
+        let wait = due.unwrap_or(Duration::from_secs(60));
+        let kicked = tokio::select! {
+            _ = tokio::time::sleep(wait) => false,
+            _ = entry.kick.notified() => true,
+        };
         if weak.upgrade().is_none() {
             return;
+        }
+        if due.is_none() && !kicked {
+            // Periodic liveness tick only; no refresh is actually due.
+            continue;
         }
         let meta = entry.meta.lock().expect("meta").clone();
         match fetch::fetch(
@@ -573,11 +583,29 @@ async fn file_task(
         tokio::select! {
             r = rx.recv() => {
                 if r.is_none() {
-                    // No watcher: only explicit force_update wakes us.
-                    entry.kick.notified().await;
+                    // No watcher: only explicit force_update wakes us. Still bound the wait so
+                    // an orphaned task (manager dropped, nobody left to `force_update`) notices
+                    // `weak.upgrade()` failing instead of parking forever.
+                    tokio::select! {
+                        _ = entry.kick.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                            if weak.upgrade().is_none() {
+                                return;
+                            }
+                            continue;
+                        }
+                    }
                 }
             }
             _ = entry.kick.notified() => {}
+            // Same liveness tick for the common (working-watcher) path: a resource that never
+            // changes and is never kicked must not keep this task alive forever.
+            _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                if weak.upgrade().is_none() {
+                    return;
+                }
+                continue;
+            }
         }
         tokio::time::sleep(debounce).await;
         while rx.try_recv().is_ok() {}
@@ -844,6 +872,38 @@ mod tests {
         assert_eq!(a.entry.effective_interval(), 600);
         let c = mgr.get(&url_spec(server.url("/i"), Some(-1)));
         assert_eq!(c.entry.effective_interval(), 600);
+        assert_eq!(mgr.statuses().len(), 1);
+    }
+
+    /// Regression test for a `get()` check-then-act race: two concurrent first calls for the
+    /// same brand-new source used to each observe the entry missing (lock released between the
+    /// lookup and the insert) and create their own `Entry` + background task. `get()` is
+    /// synchronous, so this uses real OS threads and a `std::sync::Barrier` to force genuine
+    /// concurrent entry into it — spawning two `tokio::spawn` tasks instead was tried first and
+    /// found unreliable (tokio's scheduler sometimes runs both on the same worker thread,
+    /// serializing them and hiding the race).
+    #[tokio::test]
+    async fn concurrent_get_for_a_new_source_creates_only_one_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/j", "juliett");
+        let mgr = manager(root.path(), fast());
+        let url = server.url("/j");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let (m1, b1, u1) = (mgr.clone(), barrier.clone(), url.clone());
+        let t1 = std::thread::spawn(move || {
+            b1.wait();
+            m1.get(&url_spec(u1, None))
+        });
+        let (m2, b2, u2) = (mgr.clone(), barrier.clone(), url.clone());
+        let t2 = std::thread::spawn(move || {
+            b2.wait();
+            m2.get(&url_spec(u2, None))
+        });
+        let h1 = t1.join().unwrap();
+        let h2 = t2.join().unwrap();
+        assert!(Arc::ptr_eq(&h1.entry, &h2.entry));
         assert_eq!(mgr.statuses().len(), 1);
     }
 
