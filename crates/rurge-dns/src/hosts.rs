@@ -9,6 +9,7 @@ use rurge_rules::matcher::{EvalCtx, NoGeo, Verdict};
 use rurge_rules::registry::SetRegistry;
 use rurge_rules::set::SetHandle;
 use rurge_rules::set_format::SetKind;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -18,6 +19,9 @@ pub enum HostAction {
     Ips(Vec<IpAddr>),
     Alias(String),
     Servers(Vec<UpstreamSpec>),
+    /// `server:system` / `server:syslib` / `server:force-syslib`. In M2 the
+    /// resolver treats every mode identically: all three go to the system's
+    /// configured upstream servers. The distinction is preserved for M3.
     System(SystemMode),
 }
 
@@ -124,8 +128,12 @@ impl HostMap {
         self.etc_hosts.store(Arc::new(map));
     }
 
-    /// `[Host]` rules in order, then the hosts file. `name` must be lowercase.
+    /// `[Host]` rules in order, then the hosts file. `name` is normalised
+    /// (lowercased, trailing dot stripped) before matching, so callers may
+    /// pass it in any case or with a trailing dot.
     pub fn lookup(&self, name: &str) -> Option<HostLookup> {
+        let name = normalize_name(name);
+        let name = name.as_ref();
         for rule in &self.rules {
             let hit = match &rule.matcher {
                 HostMatcher::Glob(g) => g.matches(name),
@@ -144,6 +152,16 @@ impl HostMap {
             raw: name.to_string(),
             etc_hosts: true,
         })
+    }
+}
+
+/// Lowercases and strips a trailing dot; borrows `name` unchanged when it is
+/// already normalised, so an already-lowercase, dot-free name does not allocate.
+fn normalize_name(name: &str) -> Cow<'_, str> {
+    if name.ends_with('.') || name.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(name.trim_end_matches('.').to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
     }
 }
 
@@ -256,14 +274,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (map, diags) = build(
             dir.path(),
-            "a.com = server:1.1.1.1, tls://dns.example.com\nb.com = server:system\nc.com = server:syslib\nd.com = script:my-script\ne.com = server:h3://dns.example.com/dns-query\n",
+            "a.com = server:1.1.1.1, tls://dns.example.com\nb.com = server:system\nc.com = server:syslib\nd.com = script:my-script\ne.com = server:h3://dns.example.com/dns-query\nf.com = server:force-syslib\n",
         );
         let codes: Vec<&str> = diags.iter().map(|d| d.code).collect();
         assert!(codes.contains(&codes::W_HOST_SCRIPT_SKIPPED));
         assert!(codes.contains(&codes::W_DNS_UPSTREAM_UNSUPPORTED));
         assert_eq!(
             map.rules_len(),
-            3,
+            4,
             "script entry and all-unsupported entry are skipped"
         );
         match map.lookup("a.com").unwrap().action {
@@ -284,6 +302,10 @@ mod tests {
         );
         assert!(map.lookup("d.com").is_none());
         assert!(map.lookup("e.com").is_none());
+        assert_eq!(
+            map.lookup("f.com").unwrap().action,
+            HostAction::System(SystemMode::ForceSyslib)
+        );
     }
 
     #[tokio::test]
@@ -350,5 +372,64 @@ mod tests {
             "[Host] wins over hosts file"
         );
         assert!(map.lookup("gone.example").is_none());
+        assert!(
+            map.lookup("localhost").is_none(),
+            "the second set_etc_hosts call must replace the table, not merge into it"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_order_decides_between_a_domain_set_and_a_pattern_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shared.txt"), "shared.example\n").unwrap();
+
+        let (set_first, diags) = build(
+            dir.path(),
+            "DOMAIN-SET:shared.txt = 1.1.1.1\nshared.example = 2.2.2.2\n",
+        );
+        assert!(
+            diags.is_empty(),
+            "{:?}",
+            diags.iter().map(|d| d.code).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            set_first.lookup("shared.example").unwrap().action,
+            HostAction::Ips(vec![ip("1.1.1.1")]),
+            "the DOMAIN-SET key listed first must win"
+        );
+
+        let (pattern_first, diags) = build(
+            dir.path(),
+            "shared.example = 2.2.2.2\nDOMAIN-SET:shared.txt = 1.1.1.1\n",
+        );
+        assert!(
+            diags.is_empty(),
+            "{:?}",
+            diags.iter().map(|d| d.code).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            pattern_first.lookup("shared.example").unwrap().action,
+            HostAction::Ips(vec![ip("2.2.2.2")]),
+            "the pattern key listed first must win"
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_normalises_the_queried_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (map, diags) = build(dir.path(), "exact.example = 1.2.3.4\n");
+        assert!(diags.is_empty());
+        map.set_etc_hosts(parse_hosts_file("127.0.0.1 localhost\n"));
+        assert_eq!(
+            map.lookup("EXACT.Example.").unwrap().action,
+            HostAction::Ips(vec![ip("1.2.3.4")]),
+            "an uppercase, trailing-dot query must still hit a literal [Host] pattern"
+        );
+        let hit = map.lookup("Localhost.").unwrap();
+        assert!(
+            hit.etc_hosts,
+            "an uppercase, trailing-dot query must still hit the hosts file"
+        );
+        assert_eq!(hit.action, HostAction::Ips(vec![ip("127.0.0.1")]));
     }
 }
