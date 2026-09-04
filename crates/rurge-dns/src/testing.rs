@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
 #[derive(Clone, Debug)]
@@ -37,7 +37,18 @@ struct State {
 pub struct MockDns {
     addr: SocketAddr,
     state: Arc<Mutex<State>>,
-    _shutdown: oneshot::Sender<()>,
+    udp_task: JoinHandle<()>,
+    tcp_task: JoinHandle<()>,
+}
+
+impl Drop for MockDns {
+    /// Stop both listening loops immediately so a dropped mock answers
+    /// nothing: without this the UDP task (which has no shutdown signal to
+    /// race) would keep serving after the test that owned it ended.
+    fn drop(&mut self) {
+        self.udp_task.abort();
+        self.tcp_task.abort();
+    }
 }
 
 fn norm(name: &str) -> String {
@@ -94,15 +105,23 @@ impl MockDns {
         );
         let state = Arc::new(Mutex::new(State::default()));
         let acceptor = if tls { Some(tls_acceptor()) } else { None };
-        let (tx, mut rx) = oneshot::channel::<()>();
 
         let udp_state = state.clone();
         let udp_socket = udp.clone();
-        tokio::spawn(async move {
+        let udp_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             loop {
-                let Ok((n, peer)) = udp_socket.recv_from(&mut buf).await else {
-                    return;
+                // A prior reply to a peer that's already gone can surface as
+                // a receive error (e.g. WSAECONNRESET on Windows); that's
+                // noise, not the end of the transport, so log and keep
+                // serving. Cancellation happens from the outside via abort
+                // (see `Drop for MockDns`), never by returning here.
+                let (n, peer) = match udp_socket.recv_from(&mut buf).await {
+                    Ok(x) => x,
+                    Err(e) => {
+                        tracing::debug!("mock dns udp recv error: {e}");
+                        continue;
+                    }
                 };
                 if let Some((delay, reply)) = respond(&udp_state, &buf[..n], "udp") {
                     let sock = udp_socket.clone();
@@ -115,32 +134,34 @@ impl MockDns {
         });
 
         let tcp_state = state.clone();
-        tokio::spawn(async move {
+        let tcp_task = tokio::spawn(async move {
             loop {
-                tokio::select! {
-                    _ = &mut rx => return,
-                    accepted = listener.accept() => {
-                        let Ok((stream, _)) = accepted else { return };
-                        let st = tcp_state.clone();
-                        let acceptor = acceptor.clone();
-                        tokio::spawn(async move {
-                            match acceptor {
-                                Some(a) => {
-                                    if let Ok(tls) = a.accept(stream).await {
-                                        serve_framed(tls, st, "tcp").await;
-                                    }
-                                }
-                                None => serve_framed(stream, st, "tcp").await,
-                            }
-                        });
+                let (stream, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(e) => {
+                        tracing::debug!("mock dns tcp accept error: {e}");
+                        continue;
                     }
-                }
+                };
+                let st = tcp_state.clone();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    match acceptor {
+                        Some(a) => {
+                            if let Ok(tls) = a.accept(stream).await {
+                                serve_framed(tls, st, "tcp").await;
+                            }
+                        }
+                        None => serve_framed(stream, st, "tcp").await,
+                    }
+                });
             }
         });
         MockDns {
             addr,
             state,
-            _shutdown: tx,
+            udp_task,
+            tcp_task,
         }
     }
 
@@ -399,5 +420,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(u.id, 9);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_mock_stops_both_transports() {
+        let m = MockDns::spawn().await;
+        m.set("a.test", &["10.0.0.1"], &[], 1);
+        let addr = m.addr();
+        let wire = build_query(1, &q("a.test", Qtype::A)).unwrap();
+        // Sanity: the mock answers before it's dropped.
+        assert!(udp_ask(addr, &wire).await.is_some());
+        drop(m);
+
+        // UDP: no task is left to answer. Depending on the OS, "nobody is
+        // listening" surfaces either as a timeout or (e.g. Windows turning
+        // an ICMP port-unreachable into WSAECONNRESET on the next recv) as
+        // a receive error; either way no reply payload should arrive.
+        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        s.send_to(&wire, addr).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let udp_reply =
+            tokio::time::timeout(Duration::from_millis(200), s.recv_from(&mut buf)).await;
+        assert!(
+            !matches!(udp_reply, Ok(Ok(_))),
+            "expected no UDP reply after drop, got {udp_reply:?}"
+        );
+
+        // TCP: the listener is gone, so connecting fails outright, or (if a
+        // connect attempt races the socket's close) nothing is left to serve
+        // the framed request and the read never completes.
+        let tcp_outcome = tokio::time::timeout(Duration::from_millis(200), async {
+            let mut stream = TcpStream::connect(addr).await?;
+            let mut out = (wire.len() as u16).to_be_bytes().to_vec();
+            out.extend_from_slice(&wire);
+            stream.write_all(&out).await?;
+            let mut len = [0u8; 2];
+            stream.read_exact(&mut len).await?;
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+        assert!(
+            !matches!(tcp_outcome, Ok(Ok(()))),
+            "expected tcp connect/request to fail or time out after drop, got {tcp_outcome:?}"
+        );
     }
 }
