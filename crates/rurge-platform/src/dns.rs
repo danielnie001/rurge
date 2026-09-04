@@ -106,9 +106,17 @@ mod platform {
     }
 
     pub fn search_domains() -> Vec<String> {
-        let mut out = ipconfig::computer::get_search_list().unwrap_or_default();
-        if let Ok(Some(domain)) = ipconfig::computer::get_domain() {
-            out.push(domain);
+        let mut out = match ipconfig::computer::get_search_list() {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::debug!(error = %e, "cannot read search list");
+                Vec::new()
+            }
+        };
+        match ipconfig::computer::get_domain() {
+            Ok(Some(domain)) => out.push(domain),
+            Ok(None) => {}
+            Err(e) => tracing::debug!(error = %e, "cannot read domain"),
         }
         out
     }
