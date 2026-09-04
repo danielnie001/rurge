@@ -5,3 +5,6 @@
 pub mod message;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+pub mod upstream;
+
+pub use upstream::{Upstream, UpstreamError, UpstreamRef, UpstreamSpec};
