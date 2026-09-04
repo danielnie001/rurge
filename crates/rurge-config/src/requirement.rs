@@ -407,10 +407,10 @@ pub fn split_line(line: &str) -> Result<(Option<String>, String), ReqError> {
     }
     for (tag, expr) in SIMPLIFIED {
         let prefix = format!("#!{tag}");
-        if let Some(rest) = line.strip_prefix(&prefix) {
-            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-                return Ok((Some(expr.to_string()), rest.trim().to_string()));
-            }
+        if let Some(rest) = line.strip_prefix(&prefix)
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            return Ok((Some(expr.to_string()), rest.trim().to_string()));
         }
     }
     for marker in ["#!REQUIREMENT", "//!REQUIREMENT"] {
@@ -429,10 +429,10 @@ pub fn split_line(line: &str) -> Result<(Option<String>, String), ReqError> {
     for (tag, expr) in SIMPLIFIED {
         for prefix in ["#!", "//!"] {
             let marker = format!("{prefix}{tag}");
-            if let Some(body) = line.strip_suffix(&marker) {
-                if body.ends_with(char::is_whitespace) {
-                    return Ok((Some(expr.to_string()), body.trim().to_string()));
-                }
+            if let Some(body) = line.strip_suffix(&marker)
+                && body.ends_with(char::is_whitespace)
+            {
+                return Ok((Some(expr.to_string()), body.trim().to_string()));
             }
         }
     }

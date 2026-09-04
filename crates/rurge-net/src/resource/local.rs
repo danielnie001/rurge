@@ -22,14 +22,13 @@ pub fn watch_file(path: &Path, tx: UnboundedSender<()>) -> Result<AnyWatcher, no
         .to_path_buf();
     let name: Option<OsString> = path.file_name().map(OsString::from);
     let handler = move |res: notify::Result<Event>| {
-        if let Ok(ev) = res {
-            if ev
+        if let Ok(ev) = res
+            && ev
                 .paths
                 .iter()
                 .any(|p| p.file_name().map(OsString::from) == name)
-            {
-                let _ = tx.send(());
-            }
+        {
+            let _ = tx.send(());
         }
     };
     match notify::recommended_watcher(handler.clone()) {

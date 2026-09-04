@@ -80,21 +80,21 @@ async fn install_loop(geo: Arc<GeoDb>, kind: DbKind, handle: ResourceHandle) {
     let mut rx = handle.subscribe();
     let mut installed: Option<u64> = None;
     loop {
-        if let ResourceState::Available { data, version, .. } = handle.current() {
-            if installed != Some(version) {
-                installed = Some(version);
-                match install(&geo, kind, &data) {
-                    Ok(epoch) => tracing::info!(
-                        file = kind.file_name(),
-                        build_epoch = epoch,
-                        "GeoIP database installed"
-                    ),
-                    Err(e) => tracing::warn!(
-                        file = kind.file_name(),
-                        error = %e,
-                        "GeoIP download rejected"
-                    ),
-                }
+        if let ResourceState::Available { data, version, .. } = handle.current()
+            && installed != Some(version)
+        {
+            installed = Some(version);
+            match install(&geo, kind, &data) {
+                Ok(epoch) => tracing::info!(
+                    file = kind.file_name(),
+                    build_epoch = epoch,
+                    "GeoIP database installed"
+                ),
+                Err(e) => tracing::warn!(
+                    file = kind.file_name(),
+                    error = %e,
+                    "GeoIP download rejected"
+                ),
             }
         }
         if rx.changed().await.is_err() {

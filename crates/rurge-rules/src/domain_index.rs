@@ -128,10 +128,10 @@ impl DomainIndex {
             }
         };
         for (i, b) in full.bytes().enumerate() {
-            if b == b'.' {
-                if let Some(s) = self.slot(&full[..i]) {
-                    consider(self.suffix[s], DomainMatchKind::Suffix);
-                }
+            if b == b'.'
+                && let Some(s) = self.slot(&full[..i])
+            {
+                consider(self.suffix[s], DomainMatchKind::Suffix);
             }
         }
         if let Some(s) = self.slot(&full) {

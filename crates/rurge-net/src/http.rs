@@ -328,23 +328,24 @@ impl HttpClient {
                 .map_err(|_| HttpError::Timeout)?
                 .map_err(map_client_error)?;
             let status = resp.status();
-            if status.is_redirection() && method == Method::GET {
-                if let Some(loc) = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok()) {
-                    if redirects >= opts.follow_redirects {
-                        return Err(HttpError::TooManyRedirects);
-                    }
-                    let next = url
-                        .join(loc)
-                        .map_err(|e| HttpError::InvalidUrl(e.to_string()))?;
-                    if url.scheme() == "https" && next.scheme() != "https" {
-                        return Err(HttpError::Protocol(
-                            "refusing to redirect from https to http".to_string(),
-                        ));
-                    }
-                    redirects += 1;
-                    url = next;
-                    continue;
+            if status.is_redirection()
+                && method == Method::GET
+                && let Some(loc) = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok())
+            {
+                if redirects >= opts.follow_redirects {
+                    return Err(HttpError::TooManyRedirects);
                 }
+                let next = url
+                    .join(loc)
+                    .map_err(|e| HttpError::InvalidUrl(e.to_string()))?;
+                if url.scheme() == "https" && next.scheme() != "https" {
+                    return Err(HttpError::Protocol(
+                        "refusing to redirect from https to http".to_string(),
+                    ));
+                }
+                redirects += 1;
+                url = next;
+                continue;
             }
             let headers = resp.headers().clone();
             let limit = usize::try_from(opts.max_body).unwrap_or(usize::MAX);

@@ -431,15 +431,14 @@ impl RuleEngine {
                 .matcher
                 .eval(&s, &mut ctx, true, rule.params.extended_matching);
             ctx.notes.clear();
-            if v == Verdict::Match {
-                if let PolicyRef::Builtin(b) = &rule.policy {
-                    if b.is_reject() {
-                        return Some(PreMatch {
-                            rule: rule.index,
-                            policy: rule.policy.clone(),
-                        });
-                    }
-                }
+            if v == Verdict::Match
+                && let PolicyRef::Builtin(b) = &rule.policy
+                && b.is_reject()
+            {
+                return Some(PreMatch {
+                    rule: rule.index,
+                    policy: rule.policy.clone(),
+                });
             }
         }
         None

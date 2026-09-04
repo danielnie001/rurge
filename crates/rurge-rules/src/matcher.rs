@@ -89,10 +89,10 @@ impl<'a> EvalCtx<'a> {
     }
 
     pub fn country(&mut self, ip: IpAddr) -> Option<[u8; 2]> {
-        if let Some((cached_ip, code)) = self.country_cache {
-            if cached_ip == ip {
-                return code;
-            }
+        if let Some((cached_ip, code)) = self.country_cache
+            && cached_ip == ip
+        {
+            return code;
         }
         let code = self.geo.country(ip);
         self.country_cache = Some((ip, code));
@@ -100,10 +100,10 @@ impl<'a> EvalCtx<'a> {
     }
 
     pub fn asn(&mut self, ip: IpAddr) -> Option<u32> {
-        if let Some((cached_ip, asn)) = self.asn_cache {
-            if cached_ip == ip {
-                return asn;
-            }
+        if let Some((cached_ip, asn)) = self.asn_cache
+            && cached_ip == ip
+        {
+            return asn;
         }
         let asn = self.geo.asn(ip);
         self.asn_cache = Some((ip, asn));
@@ -302,10 +302,10 @@ impl Matcher {
                         .into_iter()
                         .flatten()
                     {
-                        if let Some(u) = replace_url_host(url, host) {
-                            if p.regex.is_match(&u).unwrap_or(false) {
-                                return Verdict::Match;
-                            }
+                        if let Some(u) = replace_url_host(url, host)
+                            && p.regex.is_match(&u).unwrap_or(false)
+                        {
+                            return Verdict::Match;
                         }
                     }
                 }
