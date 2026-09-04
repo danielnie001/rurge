@@ -25,7 +25,7 @@ pub struct CheckArgs {
     pub core_version: Option<u64>,
 }
 
-fn parse_platform(s: &str) -> Result<Platform, String> {
+pub(crate) fn parse_platform(s: &str) -> Result<Platform, String> {
     Platform::parse(s)
         .ok_or_else(|| format!("unknown platform `{s}` (expected windows, linux or macos)"))
 }

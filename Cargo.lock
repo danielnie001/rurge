@@ -1518,9 +1518,14 @@ dependencies = [
  "clap",
  "predicates",
  "rurge-config",
+ "rurge-net",
+ "rurge-platform",
+ "rurge-rules",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "url",
 ]
 
 [[package]]

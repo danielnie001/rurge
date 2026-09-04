@@ -1,4 +1,6 @@
 pub mod check;
+pub mod rule;
+pub mod runtime;
 
 use rurge_config::config::Platform;
 use rurge_config::requirement::Environment;

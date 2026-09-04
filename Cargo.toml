@@ -15,7 +15,7 @@ thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 fancy-regex = "0.14"
 ipnet = "2"
 tempfile = "3"

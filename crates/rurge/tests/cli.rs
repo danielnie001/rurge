@@ -130,3 +130,129 @@ fn check_json_and_platform() {
             .any(|d| d["code"] == "I0002")
     );
 }
+
+mod rule_match {
+    use assert_cmd::Command;
+    use predicates::prelude::*;
+    use std::path::Path;
+
+    const CONF: &str = "\
+[Proxy]
+P = direct
+[Rule]
+RULE-SET,sets/a.list,P
+IP-CIDR,10.0.0.0/8,P
+DOMAIN-SUFFIX,ext.com,P,extended-matching
+FINAL,DIRECT,dns-failed
+";
+
+    fn workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sets")).unwrap();
+        std::fs::write(
+            dir.path().join("sets").join("a.list"),
+            "DOMAIN,listed.com\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("t.conf"), CONF).unwrap();
+        dir
+    }
+
+    fn rule_match(dir: &Path, extra: &[&str]) -> Command {
+        let mut cmd = Command::cargo_bin("rurge").unwrap();
+        cmd.arg("rule")
+            .arg("match")
+            .arg("-c")
+            .arg(dir.join("t.conf"))
+            .arg("--no-network")
+            .arg("--data-dir")
+            .arg(dir.join("data"))
+            .args(extra);
+        cmd
+    }
+
+    fn json(dir: &Path, extra: &[&str]) -> (serde_json::Value, i32) {
+        let out = rule_match(dir, extra).arg("--json").output().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("bad json: {e}\n{}", String::from_utf8_lossy(&out.stdout)));
+        (v, out.status.code().unwrap())
+    }
+
+    #[test]
+    fn local_rule_set_matches_without_network() {
+        let dir = workspace();
+        let (v, code) = json(dir.path(), &["listed.com"]);
+        assert_eq!(code, 0);
+        assert_eq!(v["policy"], "P");
+        assert_eq!(v["reason"], "rule");
+        assert_eq!(v["matched"]["index"], 0);
+        assert_eq!(v["sub_rule"]["entry"], "DOMAIN,listed.com");
+    }
+
+    #[test]
+    fn no_dns_falls_back_to_final_with_dns_failed() {
+        let dir = workspace();
+        let (v, code) = json(dir.path(), &["other.org", "--no-dns"]);
+        assert_eq!(code, 0);
+        assert_eq!(v["reason"], "dns-failed-fallback");
+        assert_eq!(v["policy"], "DIRECT");
+    }
+
+    #[test]
+    fn no_dns_without_dns_failed_exits_one() {
+        let dir = workspace();
+        std::fs::write(
+            dir.path().join("t.conf"),
+            CONF.replace("FINAL,DIRECT,dns-failed", "FINAL,DIRECT"),
+        )
+        .unwrap();
+        let (v, code) = json(dir.path(), &["other.org", "--no-dns"]);
+        assert_eq!(code, 1);
+        assert!(v["policy"].is_null());
+        assert_eq!(v["reason"], "dns-failed");
+    }
+
+    #[test]
+    fn resolve_override_hits_ip_rules() {
+        let dir = workspace();
+        let (v, code) = json(dir.path(), &["other.org", "--resolve", "10.1.2.3"]);
+        assert_eq!(code, 0);
+        assert_eq!(v["matched"]["index"], 1);
+        assert_eq!(v["resolved"]["v4"][0], "10.1.2.3");
+    }
+
+    #[test]
+    fn explain_prints_a_trace_and_extended_matching_uses_sni() {
+        let dir = workspace();
+        rule_match(
+            dir.path(),
+            &["1.2.3.4", "--sni", "API.ext.com", "--explain"],
+        )
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("policy: P"))
+        .stdout(predicate::str::contains("rule #2:"))
+        .stdout(predicate::str::contains("trace:"))
+        .stdout(predicate::str::contains("#0 no-match"));
+    }
+
+    #[test]
+    fn outbound_mode_bypasses_rules() {
+        let dir = workspace();
+        let (v, _) = json(dir.path(), &["listed.com", "--mode", "direct"]);
+        assert_eq!(v["reason"], "outbound-mode-direct");
+        let (v, _) = json(dir.path(), &["listed.com", "--mode", "proxy=P"]);
+        assert_eq!(v["reason"], "outbound-mode-proxy");
+        assert_eq!(v["policy"], "P");
+    }
+
+    #[test]
+    fn missing_profile_exits_two() {
+        let dir = workspace();
+        rule_match(dir.path(), &["a.com"])
+            .arg("-c")
+            .arg(dir.path().join("nope.conf"))
+            .assert()
+            .code(2);
+    }
+}

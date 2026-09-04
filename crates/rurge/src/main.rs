@@ -21,6 +21,8 @@ enum Command {
     Version,
     /// Validate a Surge-format profile and print diagnostics
     Check(cli::check::CheckArgs),
+    /// Rule engine tools (offline)
+    Rule(Box<cli::rule::RuleArgs>),
 }
 
 fn main() -> ExitCode {
@@ -35,6 +37,7 @@ fn main() -> ExitCode {
             Ok(ExitCode::SUCCESS)
         }
         Command::Check(args) => cli::check::run(args),
+        Command::Rule(args) => cli::rule::run(*args),
     };
     match result {
         Ok(code) => code,
