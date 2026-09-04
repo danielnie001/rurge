@@ -9,5 +9,6 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub mod connector;
 pub mod http;
+pub mod resource;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
