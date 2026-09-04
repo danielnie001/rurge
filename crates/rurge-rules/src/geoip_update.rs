@@ -18,6 +18,9 @@ pub const DEFAULT_COUNTRY_URL: &str =
 pub const DEFAULT_ASN_URL: &str =
     "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb";
 pub const UPDATE_INTERVAL_SECS: i64 = 7 * 86_400;
+/// Bound on a `.tar.gz` member's decompressed size, so a small malicious or
+/// corrupt archive cannot exhaust memory (a "decompression bomb").
+pub const MAX_MMDB_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct GeoUrls {
@@ -117,21 +120,36 @@ pub fn install(geo: &GeoDb, kind: DbKind, data: &[u8]) -> Result<u64, String> {
 
 /// A raw `.mmdb`, or the first `.mmdb` member of a `.tar.gz`.
 pub fn extract_mmdb(data: &[u8]) -> Result<Vec<u8>, String> {
+    extract_mmdb_with_limit(data, MAX_MMDB_BYTES)
+}
+
+fn extract_mmdb_with_limit(data: &[u8], limit: u64) -> Result<Vec<u8>, String> {
     if !data.starts_with(&[0x1f, 0x8b]) {
         return Ok(data.to_vec());
     }
     let mut archive = Archive::new(GzDecoder::new(data));
     for entry in archive.entries().map_err(|e| format!("tar: {e}"))? {
-        let mut entry = entry.map_err(|e| format!("tar: {e}"))?;
+        let entry = entry.map_err(|e| format!("tar: {e}"))?;
         let is_mmdb = entry
             .path()
             .map(|p| p.extension().is_some_and(|x| x == "mmdb"))
             .unwrap_or(false);
         if is_mmdb {
             let mut buf = Vec::new();
+            // Read at most `limit + 1` bytes: reading exactly `limit` would
+            // silently accept a member of precisely that size as "under the
+            // limit" while giving no way to tell it apart from a truncated
+            // larger one, so read one extra byte to detect the overflow.
             entry
+                .take(limit + 1)
                 .read_to_end(&mut buf)
                 .map_err(|e| format!("tar: {e}"))?;
+            if buf.len() as u64 > limit {
+                return Err(format!(
+                    "decompressed database exceeds {} MiB",
+                    limit / (1024 * 1024)
+                ));
+            }
             return Ok(buf);
         }
     }
@@ -203,6 +221,18 @@ mod tests {
         assert_eq!(extract_mmdb(&archived).unwrap(), raw);
         let no_mmdb = tar_gz("README.txt", b"hello");
         assert!(extract_mmdb(&no_mmdb).is_err());
+    }
+
+    #[test]
+    fn extract_mmdb_with_limit_rejects_a_decompression_bomb() {
+        let huge = vec![b'x'; 1000];
+        let archived = tar_gz("GeoLite2-ASN.mmdb", &huge);
+        let err = extract_mmdb_with_limit(&archived, 100).unwrap_err();
+        assert!(err.contains("exceeds"), "{err}");
+        // A member at exactly the limit still extracts in full.
+        let at_limit = vec![b'y'; 100];
+        let ok_archive = tar_gz("GeoLite2-ASN.mmdb", &at_limit);
+        assert_eq!(extract_mmdb_with_limit(&ok_archive, 100).unwrap(), at_limit);
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@
 //! rules ask for resolution via `Verdict::NeedsResolve` unless the target is
 //! already an IP or the rule carries `no-resolve`.
 
+use crate::registry::MAX_NESTING;
 use crate::set_format::SetKind;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use rurge_config::rule::{
@@ -65,6 +66,13 @@ pub struct EvalCtx<'a> {
     geo: &'a dyn GeoLookup,
     country_cache: Option<(IpAddr, Option<[u8; 2]>)>,
     asn_cache: Option<(IpAddr, Option<u32>)>,
+    /// How many `Matcher::Set` evaluations are currently nested. `SetRegistry`
+    /// rejects cycles at compile time, but two rule-sets that independently
+    /// hot-reload to reference each other can still form a live cycle in the
+    /// handle graph (each reload only re-checks its own file against
+    /// itself). This is the runtime backstop that guarantees evaluation
+    /// still terminates if that ever happens.
+    set_depth: usize,
 }
 
 impl<'a> EvalCtx<'a> {
@@ -76,6 +84,7 @@ impl<'a> EvalCtx<'a> {
             geo,
             country_cache: None,
             asn_cache: None,
+            set_depth: 0,
         }
     }
 
@@ -349,7 +358,17 @@ impl Matcher {
                 Verdict::NeedsResolve => Verdict::NeedsResolve,
             },
             Matcher::Set(set) => {
+                if ctx.set_depth >= MAX_NESTING {
+                    // Should be unreachable for any graph `SetRegistry` built
+                    // (it rejects cycles and depth beyond `MAX_NESTING` at
+                    // compile time) — this only guards against a runtime
+                    // cycle formed by independent hot reloads (see
+                    // `EvalCtx::set_depth`).
+                    return Verdict::NoMatch;
+                }
+                ctx.set_depth += 1;
                 let v = set.eval(s, ctx, no_resolve, extended);
+                ctx.set_depth -= 1;
                 if v.verdict == Verdict::Match {
                     ctx.sub_hit = Some(SubRuleHit {
                         set: set.name(),

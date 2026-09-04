@@ -32,11 +32,20 @@ pub enum SetLine {
     },
 }
 
+/// Cap on how many `(line, reason)` pairs `ParsedSet::skipped` keeps. Set
+/// files are untrusted (downloaded / user-supplied); without a cap a file
+/// that is mostly garbage would grow `skipped` without bound. Beyond the
+/// cap, lines are still counted in `skipped_total` but their reasons are
+/// dropped.
+pub const MAX_SKIPPED_REASONS: usize = 20;
+
 #[derive(Debug, Default)]
 pub struct ParsedSet {
     pub lines: Vec<SetLine>,
-    /// `(1-based line number, reason)` for every skipped line.
+    /// `(1-based line number, reason)` for the first `MAX_SKIPPED_REASONS` skipped lines.
     pub skipped: Vec<(usize, String)>,
+    /// Total number of skipped lines, including any beyond `MAX_SKIPPED_REASONS`.
+    pub skipped_total: usize,
     /// Number of valid lines dropped because `limit` was reached.
     pub truncated: usize,
 }
@@ -59,7 +68,12 @@ pub fn parse_set_with_limit(kind: SetKind, text: &str, ctx: &ParseCtx, limit: us
         match parsed {
             Ok(l) if out.lines.len() < limit => out.lines.push(l),
             Ok(_) => out.truncated += 1,
-            Err(reason) => out.skipped.push((i + 1, reason)),
+            Err(reason) => {
+                out.skipped_total += 1;
+                if out.skipped.len() < MAX_SKIPPED_REASONS {
+                    out.skipped.push((i + 1, reason));
+                }
+            }
         }
     }
     out
@@ -212,6 +226,16 @@ mod tests {
         let p = parse_set_with_limit(SetKind::DomainSet, text, &ctx_with(&names), 2);
         assert_eq!(p.lines.len(), 2);
         assert_eq!(p.truncated, 1);
+    }
+
+    #[test]
+    fn skipped_reasons_are_capped_but_the_total_keeps_counting() {
+        let names = HashSet::new();
+        let text = "NOT-A-RULE\n".repeat(25);
+        let p = parse_set(SetKind::RuleSet, &text, &ctx_with(&names));
+        assert_eq!(p.lines.len(), 0);
+        assert_eq!(p.skipped.len(), MAX_SKIPPED_REASONS);
+        assert_eq!(p.skipped_total, 25);
     }
 
     #[test]

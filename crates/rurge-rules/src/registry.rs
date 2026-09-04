@@ -15,8 +15,10 @@ use rurge_net::resource::{
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
+use tokio::sync::watch;
 use url::Url;
 
 pub const MAX_NESTING: usize = 8;
@@ -77,6 +79,11 @@ pub struct SetRegistry {
     inline_names: HashSet<String>,
     entries: Mutex<HashMap<(Key, SetKind), Entry>>,
     diags: Mutex<Diagnostics>,
+    /// `true` only while `build` is running; `push_diag` is a no-op outside
+    /// that window so reloads (which already log through `tracing`) don't
+    /// keep accumulating diagnostics that `build`'s caller already took and
+    /// nobody reads again (F4).
+    building: AtomicBool,
     self_weak: Mutex<Weak<SetRegistry>>,
 }
 
@@ -84,6 +91,28 @@ thread_local! {
     /// Compile stack of the current thread: nested `lookup` calls during one
     /// compile push here, so cycles and depth are detected per compile.
     static STACK: RefCell<Vec<Key>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Pops one entry off `STACK` on drop. `ensure` and the hot-reload path both
+/// go through `push_key` instead of matching manual push/pop calls by hand:
+/// a reload that cleared the stack and recompiled without pushing the key
+/// being recompiled is exactly how a self-referencing set used to capture
+/// its own handle inside itself instead of being caught as a cycle.
+struct StackGuard;
+
+impl Drop for StackGuard {
+    fn drop(&mut self) {
+        STACK.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+/// Pushes `key` onto the current thread's compile stack; the returned guard
+/// pops it back off when dropped (including on an early return or panic).
+fn push_key(key: Key) -> StackGuard {
+    STACK.with(|s| s.borrow_mut().push(key));
+    StackGuard
 }
 
 impl SetRegistry {
@@ -105,6 +134,7 @@ impl SetRegistry {
             inline_names,
             entries: Mutex::new(HashMap::new()),
             diags: Mutex::new(Diagnostics::default()),
+            building: AtomicBool::new(true),
             self_weak: Mutex::new(Weak::new()),
         });
         *reg.self_weak.lock().expect("registry lock") = Arc::downgrade(&reg);
@@ -125,6 +155,7 @@ impl SetRegistry {
             }
         }
         let diags = std::mem::take(&mut *reg.diags.lock().expect("registry lock"));
+        reg.building.store(false, Ordering::Relaxed);
         (reg, diags)
     }
 
@@ -172,7 +203,15 @@ impl SetRegistry {
     }
 
     fn push_diag(&self, d: Diagnostic) {
+        if !self.building.load(Ordering::Relaxed) {
+            return;
+        }
         self.diags.lock().expect("registry lock").push(d);
+    }
+
+    #[cfg(test)]
+    fn diag_count(&self) -> usize {
+        self.diags.lock().expect("registry lock").len()
     }
 
     /// Returns the (possibly still compiling) handle for a reference, creating
@@ -212,7 +251,7 @@ impl SetRegistry {
             );
         }
         let handle = self.handle_of(&key, kind);
-        STACK.with(|s| s.borrow_mut().push(key.clone()));
+        let _guard = push_key(key.clone());
         let outcome = match &key {
             Key::Internal(i) => {
                 let parsed = self.parse_text(kind, internal_set_text(*i), &self.base_dir);
@@ -228,7 +267,6 @@ impl SetRegistry {
             }
             Key::Url(_) | Key::File(_) => self.compile_external(&key, kind, &name, update_interval),
         };
-        STACK.with(|s| s.borrow_mut().pop());
         if let Some(set) = outcome {
             handle.store(set);
         }
@@ -268,7 +306,7 @@ impl SetRegistry {
                 codes::W_SET_LINES_SKIPPED,
                 format!(
                     "set `{name}`: {} line(s) skipped (first: line {line}: {reason})",
-                    parsed.skipped.len()
+                    parsed.skipped_total
                 ),
             ));
         }
@@ -284,7 +322,7 @@ impl SetRegistry {
         let set = CompiledSet::compile(name, kind, &parsed, self, version);
         let mut entries = self.entries.lock().expect("registry lock");
         if let Some(e) = entries.get_mut(&(key.clone(), kind)) {
-            e.skipped = parsed.skipped.len();
+            e.skipped = parsed.skipped_total;
             e.truncated = parsed.truncated;
             e.state = state.to_string();
         }
@@ -323,6 +361,12 @@ impl SetRegistry {
             source,
             update_interval,
         });
+        // Subscribe before the first `resource.current()` read below: a
+        // `watch` receiver only observes changes published *after* it
+        // subscribes, so subscribing later (e.g. inside the spawned reload
+        // task) could miss a version published in between and leave the
+        // reloader stuck on stale content until some later change.
+        let rx = resource.subscribe();
         let base_dir = match key {
             Key::File(p) => p
                 .parent()
@@ -381,7 +425,7 @@ impl SetRegistry {
                 e.resource = Some(resource.clone());
             }
         }
-        self.spawn_reloader(key.clone(), kind, base_dir, resource);
+        self.spawn_reloader(key.clone(), kind, base_dir, resource, rx);
         compiled
     }
 
@@ -393,14 +437,22 @@ impl SetRegistry {
     }
 
     /// Recompile and swap whenever the resource publishes a new version.
-    fn spawn_reloader(&self, key: Key, kind: SetKind, base_dir: PathBuf, resource: ResourceHandle) {
+    /// `rx` must already be subscribed to `resource` (see `compile_external`)
+    /// so a version published before this task starts is never missed.
+    fn spawn_reloader(
+        &self,
+        key: Key,
+        kind: SetKind,
+        base_dir: PathBuf,
+        resource: ResourceHandle,
+        mut rx: watch::Receiver<u64>,
+    ) {
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             tracing::debug!(set = %key.display(), "no tokio runtime: set auto-reload disabled");
             return;
         };
         let weak = self.self_weak.lock().expect("registry lock").clone();
         rt.spawn(async move {
-            let mut rx = resource.subscribe();
             loop {
                 // Wake periodically too: the registry may be dropped while the resource never changes again.
                 tokio::select! {
@@ -427,8 +479,13 @@ impl SetRegistry {
                     continue;
                 }
                 let text = String::from_utf8_lossy(&data);
-                // A fresh compile on this thread starts with an empty stack.
+                // A fresh compile on this thread starts with an empty stack;
+                // push the key being recompiled first so new content that
+                // references itself (directly, or through a nested set) is
+                // caught as a cycle instead of capturing this same handle
+                // inside the set it is about to replace (F1).
                 STACK.with(|s| s.borrow_mut().clear());
+                let _guard = push_key(key.clone());
                 let parsed = reg.parse_text(kind, &text, &base_dir);
                 let entries = parsed.lines.len();
                 if let Some(set) = reg.finish(&key, kind, &name, parsed, version, "ok") {
@@ -641,5 +698,105 @@ mod tests {
         assert_eq!(st.len(), 1);
         assert_eq!(st[0].kind, SetKind::DomainSet);
         assert_eq!(st[0].entries, 1);
+    }
+
+    /// F1 regression: a hot reload used to clear the compile stack and
+    /// recompile without pushing the key being recompiled, so a set whose
+    /// new content references itself captured its own (still empty, about
+    /// to be overwritten) handle instead of being caught as a cycle —
+    /// `handle.store(set)` then made the set contain a live `Arc` cycle back
+    /// to itself, and evaluating through it recursed forever.
+    #[tokio::test]
+    async fn hot_reload_self_reference_is_a_cycle_not_infinite_recursion() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.list");
+        std::fs::write(&file, "DOMAIN,a.com\n").unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,a.list,P\nFINAL,DIRECT\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        assert!(diags.is_empty(), "{:?}", codes_of(&diags));
+        let handle = reg.get(&ResourceRef::File(file.clone()), SetKind::RuleSet);
+        let v1 = handle.version();
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "a.com").await.0, "P");
+        std::fs::write(&file, "RULE-SET,a.list\nDOMAIN,b.com\n").unwrap();
+        wait_version(&handle, v1 + 1).await;
+        // The self-reference in the reloaded content is caught as a cycle
+        // (an empty stub, not a live handle back to itself): the sibling
+        // DOMAIN line still matches, and a miss falls all the way through
+        // to FINAL instead of recursing.
+        assert_eq!(decide(&engine, "b.com").await.0, "P");
+        assert_eq!(decide(&engine, "zzz.com").await.0, "DIRECT");
+    }
+
+    /// F1 regression, cross-file case: neither `a.list` nor `b.list` is
+    /// self-referential (so each reload's own compile stack — scoped to
+    /// just that file — never sees a cycle), but rewriting both to
+    /// reference each other and letting both reload independently still
+    /// closes a live cycle across the two handles. The per-reload cycle
+    /// check cannot see this (it only knows about the file it is currently
+    /// recompiling); `EvalCtx::set_depth` (matcher.rs) is the runtime
+    /// backstop that keeps `evaluate` from recursing forever regardless.
+    #[tokio::test]
+    async fn mutual_hot_reload_cycle_terminates() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_file = dir.path().join("a.list");
+        let b_file = dir.path().join("b.list");
+        std::fs::write(&a_file, "DOMAIN,a.com\n").unwrap();
+        std::fs::write(&b_file, "DOMAIN,b.com\n").unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,a.list,P\nFINAL,DIRECT\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        assert!(diags.is_empty(), "{:?}", codes_of(&diags));
+        let a_handle = reg.get(&ResourceRef::File(a_file.clone()), SetKind::RuleSet);
+        let b_handle = reg.get(&ResourceRef::File(b_file.clone()), SetKind::RuleSet);
+        let (a_v1, b_v1) = (a_handle.version(), b_handle.version());
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        std::fs::write(&a_file, "RULE-SET,b.list\n").unwrap();
+        std::fs::write(&b_file, "RULE-SET,a.list\n").unwrap();
+        wait_version(&a_handle, a_v1 + 1).await;
+        wait_version(&b_handle, b_v1 + 1).await;
+        // Neither set has a direct domain/IP entry left, so a miss must
+        // bounce between the two handles; it should terminate (bounded by
+        // `MAX_NESTING`) and fall through to FINAL rather than hang or
+        // stack-overflow.
+        let d = tokio::time::timeout(Duration::from_secs(5), decide(&engine, "zzz.com"))
+            .await
+            .expect("evaluate must terminate, not hang");
+        assert_eq!(d.0, "DIRECT");
+    }
+
+    /// F4 regression: `push_diag` used to keep accumulating into the
+    /// registry's own `diags` after `build` had already taken them, so every
+    /// later reload that skipped a line leaked a diagnostic nobody ever read.
+    #[tokio::test]
+    async fn diagnostics_do_not_leak_into_the_registry_after_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.list");
+        std::fs::write(&file, "DOMAIN,a.com\n").unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,a.list,P\nFINAL,DIRECT\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        assert!(diags.is_empty(), "{:?}", codes_of(&diags));
+        assert_eq!(reg.diag_count(), 0);
+        let handle = reg.get(&ResourceRef::File(file.clone()), SetKind::RuleSet);
+        let v1 = handle.version();
+        std::fs::write(&file, "DOMAIN,b.com\nnot a rule\n").unwrap();
+        wait_version(&handle, v1 + 1).await;
+        // `statuses()` still reports the skip; the registry's internal
+        // (build-only) diagnostics stay empty.
+        assert_eq!(reg.diag_count(), 0);
+        let st = reg
+            .statuses()
+            .into_iter()
+            .find(|s| s.name.ends_with("a.list"))
+            .unwrap();
+        assert_eq!(st.skipped, 1);
     }
 }
