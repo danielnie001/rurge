@@ -109,6 +109,11 @@ impl Track {
             Ok(answer) => self
                 .failures
                 .push((upstream.to_string(), format!("rcode {}", answer.rcode))),
+            // Every query shares the fanout-wide deadline, so at t == deadline a dropped
+            // upstream's per-query timeout and the loop's own deadline fire together; treating
+            // a timeout as a failure (rather than "no answer") would make `AllFailed` race
+            // `Timeout`, and would block `settle_empty` (which requires `failures.is_empty()`).
+            Err(UpstreamError::Timeout) => {}
             Err(e) => self.failures.push((upstream.to_string(), e.to_string())),
         }
     }
@@ -187,7 +192,7 @@ pub async fn resolve_name(
     let mut next_send = start;
     let mut partial = false;
     loop {
-        if round < attempts && Instant::now() >= next_send {
+        if round < attempts && Instant::now() >= next_send && Instant::now() < deadline {
             for up in upstreams {
                 for t in tracks.iter().filter(|t| !t.decided()) {
                     tracing::debug!(target: "rurge_dns::fanout", upstream = %up.name(), qtype = t.question.qtype.as_str(), round, "send");
@@ -349,7 +354,7 @@ mod tests {
         assert_eq!(s.query_count("a.test", Qtype::A), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn all_dropped_is_a_timeout_after_every_attempt() {
         let s = MockDns::spawn().await;
         s.set("a.test", &["10.0.0.1"], &[], 60);
@@ -397,6 +402,22 @@ mod tests {
         );
     }
 
+    /// On a multi-thread runtime, a dropped upstream's per-query `Timeout` and the loop's own
+    /// deadline sleep can be observed in either order (design note: both target the identical
+    /// `Instant`). This must still resolve to `EmptyAnswer`, not `AllFailed`, since the other
+    /// upstream did answer empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_plus_silent_upstream_is_empty_answer_on_multi_thread() {
+        let e = MockDns::spawn().await;
+        e.set_empty("nx.test");
+        let d = MockDns::spawn().await;
+        d.set_drop_all(true);
+        assert_eq!(
+            resolve_name(&[up(&e), up(&d)], "nx.test", false, &fast()).await,
+            Err(FanoutError::EmptyAnswer)
+        );
+    }
+
     #[tokio::test]
     async fn server_failures_are_reported() {
         let s = MockDns::spawn().await;
@@ -404,7 +425,7 @@ mod tests {
         match resolve_name(&[up(&s)], "bad.test", false, &fast()).await {
             Err(FanoutError::AllFailed(list)) => {
                 assert_eq!(list.len(), 1);
-                assert!(list[0].1.contains("SERVFAIL") || list[0].1.contains("rcode"));
+                assert!(list[0].1.contains("SERVFAIL"));
             }
             other => panic!("unexpected {other:?}"),
         }
