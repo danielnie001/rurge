@@ -224,11 +224,15 @@ pub struct Resolver {
     bootstrap: Arc<Bootstrap>,
     http: Arc<HttpClient>,
     tls: Option<Arc<rustls::ClientConfig>>,
-    /// The profile's traditional (plain UDP) servers. Bootstrap runs on these
-    /// even when the encrypted subsystem owns `primary_specs`, so a network
-    /// change must not silently fall back to the system's servers.
-    traditional_specs: Vec<UpstreamSpec>,
-    primary_specs: Vec<UpstreamSpec>,
+    /// The `dns-server` UDP entries that survived the IPv6 filter.
+    configured_udp: Vec<UpstreamSpec>,
+    /// The profile wants the platform's servers: it wrote `dns-server = system`,
+    /// or it configured no traditional server at all. The system list is
+    /// re-expanded on every network change rather than snapshotted here.
+    wants_system: bool,
+    /// The encrypted subsystem (`https://` / `tls://` / `tcp://`). It owns the
+    /// primary set whenever it is non-empty and never depends on the network.
+    encrypted_specs: Vec<UpstreamSpec>,
     primary: ArcSwap<Vec<UpstreamRef>>,
     system_upstreams: ArcSwap<Vec<UpstreamRef>>,
     host_upstreams: Mutex<HashMap<Vec<UpstreamSpec>, Arc<Vec<UpstreamRef>>>>,
@@ -247,27 +251,27 @@ impl Resolver {
         let mut diags = Diagnostics::default();
         let has_ipv6 = deps.system.has_ipv6();
 
-        // Traditional (plain UDP) servers; `system` expands to the platform's list.
-        let mut traditional: Vec<UpstreamSpec> = Vec::new();
+        // Traditional (plain UDP) servers; `system` expands to the platform's
+        // list, which `on_network_change` re-expands.
+        let mut configured_udp: Vec<UpstreamSpec> = Vec::new();
         let mut wants_system = false;
         for s in &cfg.servers {
             match UpstreamSpec::from_dns_server(s) {
                 Some(UpstreamSpec::Udp(addr)) if addr.is_ipv6() && !cfg.ipv6 => {
                     tracing::info!(server = %addr, "IPv6 DNS server ignored because ipv6 is off");
                 }
-                Some(spec) => traditional.push(spec),
+                Some(spec) => configured_udp.push(spec),
                 None => wants_system = true,
             }
         }
+        // No usable traditional server of its own: fall back to the platform's.
+        wants_system |= configured_udp.is_empty();
         let system_specs: Vec<UpstreamSpec> = deps
             .system
             .servers()
             .into_iter()
             .map(UpstreamSpec::Udp)
             .collect();
-        if wants_system {
-            traditional.extend(system_specs.iter().cloned());
-        }
 
         // Encrypted subsystem: https:// tls:// tcp://
         let mut encrypted: Vec<UpstreamSpec> = Vec::new();
@@ -283,11 +287,9 @@ impl Resolver {
             );
         }
 
-        let bootstrap = Bootstrap::new(
-            bootstrap_set(&traditional, &system_specs),
-            cfg.ipv6 && has_ipv6,
-            cfg.fanout.clone(),
-        );
+        // Populated below by `apply_system_servers`, the single place that
+        // derives every network-dependent upstream set.
+        let bootstrap = Bootstrap::new(Vec::new(), cfg.ipv6 && has_ipv6, cfg.fanout.clone());
         let bootstrap_connector: Arc<dyn Connector> = Arc::new(BootstrapConnector::new(
             deps.connector.clone(),
             bootstrap.clone(),
@@ -323,14 +325,6 @@ impl Resolver {
             }
         };
 
-        let primary_specs = if !encrypted.is_empty() {
-            encrypted
-        } else if !traditional.is_empty() {
-            traditional.clone()
-        } else {
-            system_specs.clone()
-        };
-
         let hosts = HostMap::build(&cfg.hosts, deps.sets.as_ref(), &mut diags);
 
         let resolver = Arc::new(Resolver {
@@ -340,9 +334,7 @@ impl Resolver {
             http,
             tls,
             primary: ArcSwap::from_pointee(Vec::new()),
-            system_upstreams: ArcSwap::from_pointee(
-                system_specs.iter().map(build_plain_udp).collect(),
-            ),
+            system_upstreams: ArcSwap::from_pointee(Vec::new()),
             host_upstreams: Mutex::new(HashMap::new()),
             cache: DnsCache::new(cfg.cache_capacity),
             hosts,
@@ -351,12 +343,13 @@ impl Resolver {
             aaaa_suppressed: AtomicBool::new(false),
             has_ipv6: AtomicBool::new(has_ipv6),
             self_weak: Mutex::new(Weak::new()),
-            traditional_specs: traditional,
-            primary_specs,
+            configured_udp,
+            wants_system,
+            encrypted_specs: encrypted,
             cfg,
         });
         *resolver.self_weak.lock().expect("weak") = Arc::downgrade(&resolver);
-        resolver.rebuild_primary();
+        resolver.apply_system_servers(&system_specs);
         if resolver.cfg.read_etc_hosts
             && let Some(path) = deps.system.hosts_path()
         {
@@ -387,13 +380,27 @@ impl Resolver {
         }
     }
 
-    fn rebuild_primary(&self) {
-        let list: Vec<UpstreamRef> = self
-            .primary_specs
-            .iter()
-            .filter_map(|s| self.build_upstream(s))
-            .collect();
-        self.primary.store(Arc::new(list));
+    /// Rebuilds every upstream set that depends on the platform's server list,
+    /// from the list as it reads right now. The single derivation path, shared
+    /// by `new` and `on_network_change`, so the two can never disagree.
+    fn apply_system_servers(&self, system_specs: &[UpstreamSpec]) {
+        let traditional = traditional_specs(&self.configured_udp, self.wants_system, system_specs);
+        // Encrypted upstreams own the primary set and do not follow the network.
+        let primary_specs = if self.encrypted_specs.is_empty() {
+            &traditional
+        } else {
+            &self.encrypted_specs
+        };
+        self.primary.store(Arc::new(
+            primary_specs
+                .iter()
+                .filter_map(|s| self.build_upstream(s))
+                .collect(),
+        ));
+        self.system_upstreams
+            .store(Arc::new(system_specs.iter().map(build_plain_udp).collect()));
+        self.bootstrap
+            .set_upstreams(bootstrap_set(&traditional, system_specs));
     }
 
     pub fn primary_upstreams(&self) -> Vec<String> {
@@ -436,11 +443,7 @@ impl Resolver {
             .into_iter()
             .map(UpstreamSpec::Udp)
             .collect();
-        self.system_upstreams
-            .store(Arc::new(system_specs.iter().map(build_plain_udp).collect()));
-        self.bootstrap
-            .set_upstreams(bootstrap_set(&self.traditional_specs, &system_specs));
-        self.rebuild_primary();
+        self.apply_system_servers(&system_specs);
         self.host_upstreams.lock().expect("host upstreams").clear();
     }
 
@@ -762,6 +765,21 @@ impl Resolver {
             }
         });
     }
+}
+
+/// The traditional (plain UDP) upstreams for the system list as it reads now:
+/// the profile's own `dns-server` entries, plus the platform's when the profile
+/// asked for them (`dns-server = system`, or no traditional server at all).
+fn traditional_specs(
+    configured_udp: &[UpstreamSpec],
+    wants_system: bool,
+    system: &[UpstreamSpec],
+) -> Vec<UpstreamSpec> {
+    let mut specs = configured_udp.to_vec();
+    if wants_system {
+        specs.extend(system.iter().cloned());
+    }
+    specs
 }
 
 /// Bootstrap runs on the traditional (plain UDP) upstreams: the ones the
@@ -1319,6 +1337,61 @@ mod tests {
             r2.bootstrap_upstreams(),
             vec![format!("udp://{}", new_system.addr())]
         );
+        assert_eq!(
+            r2.primary_upstreams(),
+            vec![format!("udp://{}", new_system.addr())]
+        );
+    }
+
+    #[tokio::test]
+    async fn network_change_re_expands_the_system_keyword() {
+        let udp = MockDns::spawn().await;
+        let old_system = MockDns::spawn().await;
+        let new_system = MockDns::spawn().await;
+
+        // `dns-server = system`: both sets follow the platform's list.
+        let e = env(&profile("dns-server = system", ""));
+        let sys = Arc::new(SwapSystemDns::new(old_system.addr()));
+        let (r, _) = resolver_with(&e, sys.clone());
+        assert_eq!(
+            r.primary_upstreams(),
+            vec![format!("udp://{}", old_system.addr())]
+        );
+        sys.set(new_system.addr());
+        r.on_network_change();
+        assert_eq!(
+            r.primary_upstreams(),
+            vec![format!("udp://{}", new_system.addr())],
+            "`system` is re-expanded, not snapshotted at construction"
+        );
+        assert_eq!(
+            r.bootstrap_upstreams(),
+            vec![format!("udp://{}", new_system.addr())]
+        );
+
+        // `dns-server = <udp>, system`: the configured entry stays, the system
+        // half swaps.
+        let e2 = env(&profile(
+            &format!("dns-server = {}, system", udp.addr()),
+            "",
+        ));
+        let sys2 = Arc::new(SwapSystemDns::new(old_system.addr()));
+        let (r2, _) = resolver_with(&e2, sys2.clone());
+        assert_eq!(
+            r2.primary_upstreams(),
+            vec![
+                format!("udp://{}", udp.addr()),
+                format!("udp://{}", old_system.addr())
+            ]
+        );
+        sys2.set(new_system.addr());
+        r2.on_network_change();
+        let expected = vec![
+            format!("udp://{}", udp.addr()),
+            format!("udp://{}", new_system.addr()),
+        ];
+        assert_eq!(r2.primary_upstreams(), expected);
+        assert_eq!(r2.bootstrap_upstreams(), expected);
     }
 
     #[tokio::test]
