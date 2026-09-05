@@ -36,10 +36,14 @@ pub struct Stack {
     pub diagnostics: Diagnostics,
 }
 
+/// Builds resources → set registry → GeoIP → resolver, then waits up to
+/// `opts.wait` for the first fetch of every resource (skipped in `--no-network` mode).
 pub async fn build_stack(cfg: &Config, opts: &StackOptions) -> anyhow::Result<Stack> {
     build_stack_with(cfg, opts, |_| {}).await
 }
 
+/// `build_stack` with a hook that edits the resolver configuration before
+/// the resolver is built (`dns lookup --server`).
 pub async fn build_stack_with(
     cfg: &Config,
     opts: &StackOptions,

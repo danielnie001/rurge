@@ -108,7 +108,7 @@ mod tests {
             profile_key(Path::new("/etc/rurge/surge.conf")),
             "surge.conf"
         );
-        assert_eq!(profile_key(Path::new("C:\\p\\my.conf")), "my.conf");
+        assert_eq!(profile_key(&Path::new("p").join("my.conf")), "my.conf");
         let round = serde_json::to_string(&state).unwrap();
         assert_eq!(serde_json::from_str::<State>(&round).unwrap(), state);
     }
