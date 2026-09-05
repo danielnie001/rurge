@@ -17,6 +17,7 @@ rurge-rules.workspace = true
 rurge-net.workspace = true
 rurge-dns.workspace = true
 rurge-platform.workspace = true
+rurge-engine.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true

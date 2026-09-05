@@ -17,6 +17,7 @@ rurge-policy.workspace = true
 rurge-inbound.workspace = true
 tokio.workspace = true
 arc-swap.workspace = true
+anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 url.workspace = true

@@ -1715,6 +1715,7 @@ dependencies = [
  "predicates",
  "rurge-config",
  "rurge-dns",
+ "rurge-engine",
  "rurge-net",
  "rurge-platform",
  "rurge-rules",
@@ -1767,6 +1768,7 @@ dependencies = [
 name = "rurge-engine"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arc-swap",
  "rurge-config",
  "rurge-dns",
