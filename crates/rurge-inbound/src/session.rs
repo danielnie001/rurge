@@ -28,6 +28,7 @@ pub struct SessionHandle {
     session: SessionInfo,
     rule: Mutex<Option<String>>,
     policy_chain: Mutex<Vec<String>>,
+    error: Mutex<Option<String>>,
     up: AtomicU64,
     down: AtomicU64,
     finished: AtomicBool,
@@ -43,6 +44,7 @@ impl SessionHandle {
             session,
             rule: Mutex::new(None),
             policy_chain: Mutex::new(Vec::new()),
+            error: Mutex::new(None),
             up: AtomicU64::new(0),
             down: AtomicU64::new(0),
             finished: AtomicBool::new(false),
@@ -77,6 +79,16 @@ impl SessionHandle {
 
     pub fn policy_chain(&self) -> Vec<String> {
         self.policy_chain.lock().expect("policy chain").clone()
+    }
+
+    /// Why the session could not run as asked, when the outcome alone does not
+    /// say (a policy naming a protocol rurge has not implemented, say).
+    pub fn set_error(&self, msg: impl Into<String>) {
+        *self.error.lock().expect("session error") = Some(msg.into());
+    }
+
+    pub fn error(&self) -> Option<String> {
+        self.error.lock().expect("session error").clone()
     }
 
     pub fn add_up(&self, n: u64) {

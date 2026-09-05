@@ -8,7 +8,7 @@ use rurge_config::general::General;
 use rurge_config::rule::PolicyRef;
 use rurge_config::session::{ListenerKind, SessionInfo};
 use rurge_inbound::{
-    DialError, Dialed, Dialer, FailKind, HttpAuth, HttpListener, ListenerOpts, Running,
+    Counting, DialError, Dialed, Dialer, FailKind, HttpAuth, HttpListener, ListenerOpts, Running,
     SessionHandle, SessionOutcome, Socks5Listener,
 };
 use rurge_net::BoxFuture;
@@ -23,6 +23,8 @@ use std::time::Duration;
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DROP_HOLD: Duration = Duration::from_secs(30);
+/// Upper bound on an inbound handshake (HTTP request head / SOCKS5 negotiation).
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_HTTP_PORT: u16 = 6152;
 pub const DEFAULT_SOCKS5_PORT: u16 = 6153;
 
@@ -109,11 +111,14 @@ impl Engine {
             show_error_page: general.show_error_page,
             show_error_page_for_reject: general.show_error_page_for_reject,
             drop_hold: DROP_HOLD,
+            handshake_timeout: HANDSHAKE_TIMEOUT,
         }
     }
 
     /// Binds every listener in `listener_specs` order; the first failure aborts.
-    pub async fn bind_listeners(self: &Arc<Self>) -> io::Result<Vec<Running>> {
+    /// Each spec is paired with the listener it produced, so callers never have
+    /// to line the two lists up themselves.
+    pub async fn bind_listeners(self: &Arc<Self>) -> io::Result<Vec<(ListenerSpec, Running)>> {
         let rt = self.runtime();
         let mut out = Vec::new();
         for spec in Self::listener_specs(&rt.config.general) {
@@ -122,10 +127,11 @@ impl Engine {
             let running = match spec.kind {
                 ListenerKind::Http => HttpListener::bind(spec.addr, dialer, opts).await?,
                 ListenerKind::Socks5 => Socks5Listener::bind(spec.addr, dialer, opts).await?,
-                _ => continue,
+                // never produced by `listener_specs`; listed so a new kind breaks the build
+                ListenerKind::Tun | ListenerKind::Forward | ListenerKind::Internal => continue,
             };
             tracing::info!(kind = ?spec.kind, addr = %running.local_addr, "listening");
-            out.push(running);
+            out.push((spec, running));
         }
         Ok(out)
     }
@@ -152,7 +158,7 @@ fn log_session(h: &SessionHandle, outcome: &SessionOutcome) {
         ),
         SessionOutcome::Rejected(kind) => tracing::info!(
             session = h.id(), listener = ?s.listener, src = %s.src, dst = %dst, rule = %rule, policy = %policy,
-            elapsed_ms, "session rejected by {}", kind.name()
+            elapsed_ms, error = ?h.error(), "session rejected by {}", kind.name()
         ),
         SessionOutcome::Failed(error) => tracing::info!(
             session = h.id(), listener = ?s.listener, src = %s.src, dst = %dst, rule = %rule, policy = %policy,
@@ -219,6 +225,11 @@ impl Dialer for Engine {
             };
             let resolution = rt.policies.resolve(&policy);
             handle.set_policy_chain(resolution.chain.clone());
+            if let Some(kind) = &resolution.unsupported {
+                // The policy is sound but rurge cannot speak it yet, so the
+                // outbound below is REJECT; say so in the session log (§7.2).
+                handle.set_error(format!("policy protocol not implemented: {kind}"));
+            }
             let target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
             let opts = ConnectOpts {
                 timeout: CONNECT_TIMEOUT,
@@ -240,16 +251,16 @@ impl Dialer for Engine {
     fn relay<'a>(
         &'a self,
         mut client: BoxedStream,
-        mut upstream: BoxedStream,
+        upstream: BoxedStream,
         handle: Arc<SessionHandle>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            // Counting the upstream side gives the right directions (writes to
+            // upstream are `up`, reads from it are `down`) and keeps the tally
+            // as the bytes move, so a copy that dies half-way still reports it.
+            let mut upstream = Counting::new(upstream, handle.clone());
             match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
-                Ok((up, down)) => {
-                    handle.add_up(up);
-                    handle.add_down(down);
-                    handle.finish(SessionOutcome::Completed);
-                }
+                Ok(_) => handle.finish(SessionOutcome::Completed),
                 Err(e) => handle.finish(SessionOutcome::Failed(e.to_string())),
             }
         })

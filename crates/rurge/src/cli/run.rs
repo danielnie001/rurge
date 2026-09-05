@@ -102,7 +102,6 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let general = cfg.general.clone();
         let engine_rt = Runtime::build(
             cfg,
             RuntimeOptions {
@@ -126,7 +125,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 return Ok(ExitCode::from(1));
             }
         };
-        for (spec, running) in Engine::listener_specs(&general).iter().zip(&listeners) {
+        for (spec, running) in &listeners {
             let scheme = match spec.kind {
                 ListenerKind::Socks5 => "socks5",
                 _ => "http",

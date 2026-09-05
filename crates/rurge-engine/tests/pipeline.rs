@@ -2,11 +2,12 @@
 //! `TestServer` targets through the HTTP and SOCKS5 proxies (M3 design §10).
 
 use rurge_config::config::{LoadOptions, from_text};
+use rurge_config::session::{ListenerKind, SessionInfo};
 use rurge_dns::system::StaticSystemDns;
 use rurge_dns::testing::MockDns;
 use rurge_engine::stack::StackOptions;
-use rurge_engine::{Engine, Runtime, RuntimeOptions};
-use rurge_inbound::Running;
+use rurge_engine::{Engine, ListenerSpec, Runtime, RuntimeOptions};
+use rurge_inbound::{DialError, Dialer, Running, SessionHandle, SessionOutcome};
 use rurge_net::testing::TestServer;
 use rurge_policy::GroupSelections;
 use rurge_rules::{GeoUrls, OutboundMode};
@@ -18,19 +19,26 @@ use tokio::net::TcpStream;
 
 struct Harness {
     _dir: tempfile::TempDir,
-    _engine: Arc<Engine>,
-    listeners: Vec<Running>,
+    engine: Arc<Engine>,
+    listeners: Vec<(ListenerSpec, Running)>,
     target: TestServer,
     dns: MockDns,
     diagnostics: Vec<&'static str>,
 }
 
 impl Harness {
+    fn addr_of(&self, kind: ListenerKind) -> SocketAddr {
+        self.listeners
+            .iter()
+            .find(|(spec, _)| spec.kind == kind)
+            .map(|(_, running)| running.local_addr)
+            .unwrap_or_else(|| panic!("no {kind:?} listener"))
+    }
     fn http(&self) -> SocketAddr {
-        self.listeners[0].local_addr
+        self.addr_of(ListenerKind::Http)
     }
     fn socks(&self) -> SocketAddr {
-        self.listeners[1].local_addr
+        self.addr_of(ListenerKind::Socks5)
     }
     fn target_port(&self) -> u16 {
         self.target.url("/").port().unwrap()
@@ -98,7 +106,7 @@ async fn harness(general_extra: &str, rules: &str, mode: OutboundMode) -> Harnes
     assert_eq!(listeners.len(), 2);
     Harness {
         _dir: dir,
-        _engine: engine,
+        engine,
         listeners,
         target,
         dns,
@@ -325,24 +333,133 @@ async fn outbound_modes_bypass_the_rules() {
         "direct mode ignores rules: {head}"
     );
     assert_eq!(body, b"hi there");
+    // `Block` is reject-tinygif: an answer the rules (plain REJECT) cannot produce,
+    // so a 43-byte GIF proves the mode decided and the rule never ran.
     let h = harness_with_final_reject(OutboundMode::Proxy(rurge_config::rule::PolicyRef::parse(
-        "REJECT",
+        "Block",
     )))
     .await;
-    let (head, _) = get_via_proxy(
+    let (head, body) = get_via_proxy(
         h.http(),
         &format!("http://target.test:{}/hello", h.target_port()),
     )
     .await;
     assert!(
-        head.is_empty(),
-        "proxy=REJECT mode rejects everything: {head}"
+        head.starts_with("HTTP/1.1 200") && head.to_ascii_lowercase().contains("image/gif"),
+        "proxy=Block mode answers with the policy's own reject: {head}"
     );
+    assert_eq!(body.len(), 43);
+    assert_eq!(h.target.requests().len(), 0, "the target is never reached");
 }
 
 async fn harness_with_final_reject(mode: OutboundMode) -> Harness {
-    // every rule rejects; only the outbound mode can let traffic through
+    // every rule rejects (plain REJECT: close, no body); only the outbound mode
+    // can let traffic through or answer differently
     harness("", "DOMAIN-SUFFIX,test,REJECT", mode).await
+}
+
+/// `relay` must count as the bytes move, so a copy that dies half-way still
+/// reports what it carried (M3 design §7.3).
+#[tokio::test]
+async fn relay_counts_bytes_as_they_move_and_keeps_them_on_failure() {
+    let h = harness("", "", OutboundMode::Rule).await;
+    let engine: Arc<Engine> = h.engine.clone();
+
+    // (a) a clean close in both directions
+    let (client_far, client_near) = tokio::io::duplex(4096);
+    let (upstream_far, upstream_near) = tokio::io::duplex(4096);
+    let handle = SessionHandle::new(
+        1,
+        SessionInfo::tcp(rurge_config::HostName::parse("a.test"), 80),
+    );
+    let relayed = tokio::spawn({
+        let engine = engine.clone();
+        let handle = handle.clone();
+        async move {
+            engine
+                .relay(Box::new(client_near), Box::new(upstream_near), handle)
+                .await
+        }
+    });
+    let peers = tokio::spawn(async move {
+        let (mut client, mut upstream) = (client_far, upstream_far);
+        client.write_all(b"0123456789").await.unwrap(); // 10 bytes up
+        let mut buf = [0u8; 10];
+        upstream.read_exact(&mut buf).await.unwrap();
+        upstream.write_all(b"abcd").await.unwrap(); // 4 bytes down
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).await.unwrap();
+        drop(upstream);
+        drop(client);
+    });
+    tokio::time::timeout(Duration::from_secs(5), relayed)
+        .await
+        .expect("relay finished")
+        .unwrap();
+    peers.await.unwrap();
+    assert_eq!(handle.bytes(), (10, 4));
+    assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+
+    // (b) the upstream vanishes mid-copy: the bytes already carried stay counted
+    let (mut client_far, client_near) = tokio::io::duplex(4096);
+    let (upstream_far, upstream_near) = tokio::io::duplex(4096);
+    let handle = SessionHandle::new(
+        2,
+        SessionInfo::tcp(rurge_config::HostName::parse("b.test"), 80),
+    );
+    let relayed = tokio::spawn({
+        let engine = engine.clone();
+        let handle = handle.clone();
+        async move {
+            engine
+                .relay(Box::new(client_near), Box::new(upstream_near), handle)
+                .await
+        }
+    });
+    let mut upstream = upstream_far;
+    client_far.write_all(b"12345").await.unwrap();
+    let mut buf = [0u8; 5];
+    upstream.read_exact(&mut buf).await.unwrap();
+    upstream.write_all(b"xyz").await.unwrap();
+    let mut back = [0u8; 3];
+    client_far.read_exact(&mut back).await.unwrap();
+    // The upstream vanishes; `copy_bidirectional` only returns once *both*
+    // directions are done, so the client keeps writing into the dead half.
+    drop(upstream);
+    let _ = client_far.write_all(b"never delivered").await;
+    tokio::time::timeout(Duration::from_secs(5), relayed)
+        .await
+        .expect("relay finished")
+        .unwrap();
+    assert_eq!(
+        handle.bytes(),
+        (5, 3),
+        "the bytes already carried stay counted; the failed write does not"
+    );
+    assert!(
+        matches!(handle.outcome(), Some(SessionOutcome::Failed(_))),
+        "{:?}",
+        handle.outcome()
+    );
+}
+
+/// A policy naming a protocol rurge has not implemented rejects, and says so
+/// on the handle so the session log can name it (M3 design §7.2 step 4).
+#[tokio::test]
+async fn an_unimplemented_policy_rejects_with_an_explanation() {
+    let h = harness("", "DOMAIN,hk.test,HK", OutboundMode::Rule).await;
+    let session = SessionInfo::tcp(rurge_config::HostName::parse("hk.test"), 443);
+    match h.engine.dial(session).await {
+        Err(DialError::Reject { kind, handle, .. }) => {
+            assert_eq!(kind, rurge_proto::RejectKind::Reject);
+            assert_eq!(
+                handle.error().as_deref(),
+                Some("policy protocol not implemented: ss")
+            );
+        }
+        Err(DialError::Failed { message, .. }) => panic!("expected a reject, failed: {message}"),
+        Ok(_) => panic!("expected a reject, got a stream"),
+    }
 }
 
 #[tokio::test]
@@ -390,6 +507,6 @@ async fn http_listener_password_from_the_profile() {
     .unwrap();
     let engine = Engine::new(runtime);
     let listeners = engine.bind_listeners().await.unwrap();
-    let (head, _) = get_via_proxy(listeners[0].local_addr, "http://127.0.0.1:1/").await;
+    let (head, _) = get_via_proxy(listeners[0].1.local_addr, "http://127.0.0.1:1/").await;
     assert!(head.starts_with("HTTP/1.1 407"), "{head}");
 }
