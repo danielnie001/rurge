@@ -26,3 +26,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo bench -p rurge-rules --no-run
+      - run: cargo bench -p rurge-dns --no-run

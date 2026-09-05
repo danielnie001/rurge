@@ -287,8 +287,7 @@ mod dns {
     use rurge_dns::testing::MockDns;
     use std::path::Path;
 
-    const CONF: &str =
-        "[General]\nipv6 = false\n[Proxy]\n[Host]\nfixed.test = 1.2.3.4\n[Rule]\nFINAL,DIRECT\n";
+    const CONF: &str = "[General]\nipv6 = false\n[Proxy]\n[Host]\nfixed.test = 1.2.3.4\ndual.test = 1.2.3.4, fd00::9\n[Rule]\nFINAL,DIRECT\n";
 
     fn workspace() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -428,6 +427,45 @@ mod dns {
             "{stderr}"
         );
         assert_eq!(mock.queries()[0].1, "tcp");
+
+        // A `[Host]` entry answers with both families whatever `--type` says,
+        // so `--type a` has to drop the v6 address the same way `--type aaaa`
+        // drops the v4 one.
+        let both = output(dns_cmd(
+            dir.path(),
+            "lookup",
+            &server,
+            &["dual.test", "--json"],
+        ))
+        .await;
+        assert_eq!(
+            json_of(&both)["addresses"],
+            serde_json::json!(["1.2.3.4", "fd00::9"])
+        );
+        let v4_only = output(dns_cmd(
+            dir.path(),
+            "lookup",
+            &server,
+            &["dual.test", "--type", "a", "--json"],
+        ))
+        .await;
+        assert_eq!(v4_only.status.code(), Some(0));
+        assert_eq!(
+            json_of(&v4_only)["addresses"],
+            serde_json::json!(["1.2.3.4"]),
+            "--type a must not print a v6 address"
+        );
+        let v6_only = output(dns_cmd(
+            dir.path(),
+            "lookup",
+            &server,
+            &["dual.test", "--type", "aaaa", "--json"],
+        ))
+        .await;
+        assert_eq!(
+            json_of(&v6_only)["addresses"],
+            serde_json::json!(["fd00::9"])
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

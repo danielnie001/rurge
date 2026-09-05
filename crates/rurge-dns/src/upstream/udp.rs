@@ -9,12 +9,21 @@ use rurge_net::BoxFuture;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{OnceCell, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 pub const UDP_BUFFER: usize = 4096;
+
+/// Pause between receive attempts once `recv` keeps failing, so a socket that
+/// is permanently broken (the interface went down) cannot spin the receive
+/// loop. The first failure is not delayed: on Windows a connected UDP socket
+/// reports an ICMP port-unreachable from an earlier datagram as
+/// `WSAECONNRESET`, which is a normal one-off and must not hold up an answer
+/// already sitting in the socket buffer.
+const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
 struct Shared {
     socket: UdpSocket,
@@ -56,12 +65,24 @@ impl UdpUpstream {
                     pending: Mutex::new(HashMap::new()),
                 });
                 let receiver = Arc::clone(&shared);
+                let upstream = self.name.clone();
                 let task = tokio::spawn(async move {
                     let mut buf = vec![0u8; UDP_BUFFER];
+                    let mut consecutive_errors = 0u32;
                     loop {
                         let n = match receiver.socket.recv(&mut buf).await {
-                            Ok(n) => n,
-                            Err(_) => continue,
+                            Ok(n) => {
+                                consecutive_errors = 0;
+                                n
+                            }
+                            Err(e) => {
+                                tracing::debug!(upstream = %upstream, error = %e, "recv failed");
+                                consecutive_errors += 1;
+                                if consecutive_errors > 1 {
+                                    tokio::time::sleep(RECV_ERROR_BACKOFF).await;
+                                }
+                                continue;
+                            }
                         };
                         let Some(id) = wire_id(&buf[..n]) else {
                             continue;
@@ -118,7 +139,9 @@ impl Upstream for UdpUpstream {
             }
             let resp = match tokio::time::timeout_at(deadline, rx).await {
                 Ok(Ok(bytes)) => bytes,
-                Ok(Err(_)) => return Err(UpstreamError::Io("receiver dropped".to_string())),
+                Ok(Err(_)) => {
+                    return Err(UpstreamError::Io("waiter replaced or dropped".to_string()));
+                }
                 Err(_) => {
                     shared.pending.lock().expect("udp pending lock").remove(&id);
                     return Err(UpstreamError::Timeout);
@@ -142,7 +165,6 @@ impl Upstream for UdpUpstream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -213,14 +235,13 @@ mod tests {
 
     #[tokio::test]
     async fn ignores_answers_with_a_foreign_id() {
+        // The only reply the server ever sends carries a flipped id.
         let addr = raw_udp(|req| {
             let mut wrong = req.to_vec();
             wrong[0] ^= 0xff;
-            // First a wrong-id reply, then the real one 20 ms later.
             Some((Duration::ZERO, wrong))
         })
         .await;
-        // The behaviour closure can only send one reply; send the real one from a second server task.
         let up = UdpUpstream::new(addr);
         let err = up.query(&msg(7, 0, b"x"), deadline(200)).await;
         assert_eq!(

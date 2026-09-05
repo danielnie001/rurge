@@ -150,17 +150,20 @@ impl Upstream for TcpUpstream {
             let mut guard = tokio::time::timeout_at(deadline, self.conn.lock())
                 .await
                 .map_err(|_| UpstreamError::Timeout)?;
-            if guard.is_none() {
-                *guard = Some(self.connect(deadline).await?);
+            // The connection is taken out of the slot for the exchange and only
+            // put back when it completes successfully. A caller cancelled
+            // mid-exchange (the fanout's `abort_all` does this to losing
+            // queries) therefore drops a stream left with a half-written or
+            // half-read frame instead of handing it to the next query.
+            let mut stream = match guard.take() {
+                Some(stream) => stream,
+                None => self.connect(deadline).await?,
+            };
+            let result = exchange_framed(&mut stream, wire, deadline).await;
+            if result.is_ok() {
+                *guard = Some(stream);
             }
-            let stream = guard.as_mut().expect("connection present");
-            match exchange_framed(stream, wire, deadline).await {
-                Ok(resp) => Ok(resp),
-                Err(e) => {
-                    *guard = None;
-                    Err(e)
-                }
-            }
+            result
         })
     }
 }
@@ -315,6 +318,65 @@ mod tests {
         assert!(matches!(bad, Err(UpstreamError::BadResponse(_))));
         let good = fake_wire(0x2222, b"ok");
         assert_eq!(up.query(&good, deadline(1000)).await.unwrap(), good);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_query_does_not_poison_the_connection() {
+        // The server reads one frame per connection and holds the reply until
+        // `release` flips. The first query is cancelled while it is held, so a
+        // connection left in the slot would hand the second query the first
+        // one's answer (an id mismatch) instead of its own.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut release = release_rx.clone();
+                tokio::spawn(async move {
+                    let mut len = [0u8; 2];
+                    if s.read_exact(&mut len).await.is_err() {
+                        return;
+                    }
+                    let n = usize::from(u16::from_be_bytes(len));
+                    let mut msg = vec![0u8; n];
+                    if s.read_exact(&mut msg).await.is_err() {
+                        return;
+                    }
+                    while !*release.borrow_and_update() {
+                        if release.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                    let mut out = len.to_vec();
+                    out.extend_from_slice(&msg);
+                    let _ = s.write_all(&out).await;
+                    // Hold the connection open (and answer nothing more) so a
+                    // reused one fails with the id mismatch rather than with a
+                    // reset from the closing socket.
+                    let mut sink = Vec::new();
+                    let _ = s.read_to_end(&mut sink).await;
+                });
+            }
+        });
+        let up = TcpUpstream::plain("127.0.0.1", addr.port(), connector());
+        let first = fake_wire(0xaaaa, b"first");
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(100),
+            up.query(&first, deadline(5_000)),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the first query must still be in flight when it is cancelled"
+        );
+        release_tx.send(true).unwrap();
+        let second = fake_wire(0xbbbb, b"second");
+        assert_eq!(
+            up.query(&second, deadline(2_000)).await.unwrap(),
+            second,
+            "the next query must not inherit the cancelled query's connection"
+        );
     }
 
     #[tokio::test]

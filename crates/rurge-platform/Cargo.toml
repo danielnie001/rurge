@@ -10,8 +10,12 @@ repository.workspace = true
 [dependencies]
 tracing.workspace = true
 resolv-conf.workspace = true
-ipconfig.workspace = true
 if-addrs.workspace = true
+
+# `ipconfig`'s build script emits `cargo:rustc-link-lib=iphlpapi` unconditionally,
+# which breaks linking on Linux / macOS, so it is a Windows-only dependency.
+[target.'cfg(windows)'.dependencies]
+ipconfig.workspace = true
 
 [lints]
 workspace = true

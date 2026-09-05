@@ -187,16 +187,23 @@ fn run_lookup(args: LookupArgs) -> anyhow::Result<ExitCode> {
             },
         };
         let mut result = stack.resolver.lookup(&args.name, opts).await;
-        if args.qtype == QueryType::Aaaa {
-            result = match result {
-                Ok(r) if r.v6.is_empty() => Err(DnsError::EmptyAnswer),
-                Ok(mut r) => {
-                    r.v4.clear();
-                    Ok(r)
-                }
-                Err(e) => Err(e),
-            };
-        }
+        // `want_v6` steers the upstream query, but the paths that answer
+        // without one (`[Host]` addresses, the hosts file, the `lookup_host`
+        // fallback) return both families regardless, so the family the caller
+        // did not ask for is dropped here.
+        result = match (args.qtype, result) {
+            (QueryType::A, Ok(r)) if r.v4.is_empty() => Err(DnsError::EmptyAnswer),
+            (QueryType::A, Ok(mut r)) => {
+                r.v6.clear();
+                Ok(r)
+            }
+            (QueryType::Aaaa, Ok(r)) if r.v6.is_empty() => Err(DnsError::EmptyAnswer),
+            (QueryType::Aaaa, Ok(mut r)) => {
+                r.v4.clear();
+                Ok(r)
+            }
+            (_, other) => other,
+        };
         let code = match &result {
             Ok(_) => ExitCode::SUCCESS,
             Err(DnsError::EmptyAnswer) => ExitCode::from(1),

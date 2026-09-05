@@ -592,6 +592,19 @@ impl Resolver {
             .query_coalesced(&primary, &current, want_v6, &opts)
             .await;
         self.record(&current, &result, want_v6);
+        // Design §7.3: when the resend tick completed the query with A in hand
+        // and AAAA still pending, the late AAAA answer must still reach the
+        // cache. The fanout has already aborted that query, so the completion
+        // runs as a background refresh instead; `DnsCache::begin_refresh` caps
+        // it at one per refresh window, and its `record` replaces the partial
+        // entry as soon as AAAA arrives.
+        if want_v6
+            && let Ok(a) = &result
+            && a.partial
+            && a.aaaa_timed_out
+        {
+            self.spawn_refresh(current.clone(), want_v6);
+        }
         let answers = result?;
         Ok(from_answers(
             &answers,
@@ -1269,6 +1282,54 @@ mod tests {
             fourth.source,
             Source::Cache { stale: false },
             "a v6-aware entry still serves a caller that only wants v4"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_result_completes_aaaa_in_the_background() {
+        let mock = MockDns::spawn().await;
+        mock.set("late.test", &["10.0.0.1"], &["fd00::1"], 60);
+        // AAAA never answers, so the first lookup finishes at the resend tick
+        // with only A in hand.
+        mock.set_drop_qtype(Qtype::Aaaa, true);
+        let e = env(&profile(
+            &format!("dns-server = {}\nipv6 = true", mock.addr()),
+            "",
+        ));
+        let sys = StaticSystemDns {
+            has_ipv6: true,
+            ..StaticSystemDns::default()
+        };
+        let (r, _) = resolver(&e, sys);
+
+        let first = r.lookup("late.test", LookupOpts::default()).await.unwrap();
+        assert_eq!(first.v4, vec![v4("10.0.0.1")]);
+        assert!(first.v6.is_empty(), "AAAA had not arrived yet");
+        assert!(matches!(first.source, Source::Upstream(_)));
+        // The completion query was spawned but, on this single-threaded
+        // runtime, cannot have run before the next await point.
+        mock.set_drop_qtype(Qtype::Aaaa, false);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let second = r.lookup("late.test", LookupOpts::default()).await.unwrap();
+        assert_eq!(
+            second.source,
+            Source::Cache { stale: false },
+            "the completed answer is served from the cache"
+        );
+        assert_eq!(second.v6, vec!["fd00::1".parse::<Ipv6Addr>().unwrap()]);
+        assert!(
+            second.elapsed < Duration::from_millis(50),
+            "a cache hit must not wait on the network, took {:?}",
+            second.elapsed
+        );
+        assert_eq!(
+            (
+                mock.query_count("late.test", Qtype::A),
+                mock.query_count("late.test", Qtype::Aaaa)
+            ),
+            (2, 2),
+            "exactly one background completion query followed the partial result"
         );
     }
 
