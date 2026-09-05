@@ -1,7 +1,7 @@
 //! `rurge rule match`: evaluate the rule engine for a hypothetical session
 //! without running the daemon (M2 design §10.1).
 
-use super::runtime::{RuntimeArgs, SystemLazyResolver, build_stack};
+use super::runtime::{RuntimeArgs, build_stack};
 use crate::capabilities;
 use anyhow::Context;
 use clap::{Args, Subcommand};
@@ -18,6 +18,7 @@ use serde_json::json;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Args)]
@@ -173,7 +174,7 @@ fn build_session(args: &MatchArgs) -> anyhow::Result<SessionInfo> {
     Ok(s)
 }
 
-fn print_diagnostics(diags: &Diagnostics) {
+pub(crate) fn print_diagnostics(diags: &Diagnostics) {
     for d in diags.iter() {
         let level = match d.severity {
             Severity::Error => "error",
@@ -213,8 +214,8 @@ fn run_match(args: MatchArgs) -> anyhow::Result<ExitCode> {
         let stack = build_stack(&cfg, &rt, Duration::from_secs(args.wait)).await?;
         let engine =
             RuleEngine::build_with_registry(&cfg, stack.registry.clone(), stack.geo.clone())?;
-        let resolver: Box<dyn LazyResolver> = if args.no_dns {
-            Box::new(NoResolve)
+        let resolver: Arc<dyn LazyResolver> = if args.no_dns {
+            Arc::new(NoResolve)
         } else if !args.resolve.is_empty() {
             let mut fixed = ResolvedAddrs::default();
             for ip in &args.resolve {
@@ -223,9 +224,9 @@ fn run_match(args: MatchArgs) -> anyhow::Result<ExitCode> {
                     IpAddr::V6(v) => fixed.v6.push(*v),
                 }
             }
-            Box::new(FixedResolve(fixed))
+            Arc::new(FixedResolve(fixed))
         } else {
-            Box::new(SystemLazyResolver)
+            stack.resolver.clone()
         };
         let (decision, trace) = if args.explain {
             engine

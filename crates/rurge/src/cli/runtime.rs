@@ -1,17 +1,19 @@
 //! rurge-specific runtime options (FR-CFG-17): command-line flags and
 //! environment variables only, never profile keys. Also assembles the shared
-//! objects (resource manager, set registry, GeoIP) the offline commands need.
+//! objects (resource manager, set registry, GeoIP, resolver) the offline
+//! commands need.
 
 use anyhow::Context;
 use clap::Args;
 use rurge_config::{Config, Diagnostics};
-use rurge_net::BoxFuture;
+use rurge_dns::cache::DEFAULT_CAPACITY;
+use rurge_dns::system::SystemDns;
+use rurge_dns::{Resolver, ResolverConfig, ResolverDeps};
 use rurge_net::connector::{DirectConnector, SystemResolve};
 use rurge_net::http::{HttpClient, HttpClientConfig};
 use rurge_net::resource::{ResourceManager, ResourceOptions};
-use rurge_rules::engine::{LazyResolver, ResolveError};
-use rurge_rules::matcher::ResolvedAddrs;
 use rurge_rules::{GeoDb, GeoUpdater, GeoUrls, SetRegistry};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +33,9 @@ pub struct RuntimeArgs {
     /// Never touch the network: use cached resources only
     #[arg(long, env = "RURGE_NO_NETWORK")]
     pub no_network: bool,
+    /// DNS cache capacity in entries (default 2000)
+    #[arg(long, env = "RURGE_DNS_CACHE_SIZE", value_name = "N")]
+    pub dns_cache_size: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -38,6 +43,7 @@ pub struct Runtime {
     pub data_dir: PathBuf,
     pub geo_urls: GeoUrls,
     pub no_network: bool,
+    pub dns_cache_size: usize,
 }
 
 impl RuntimeArgs {
@@ -65,6 +71,7 @@ impl RuntimeArgs {
             data_dir,
             geo_urls,
             no_network: self.no_network,
+            dns_cache_size: self.dns_cache_size.unwrap_or(DEFAULT_CAPACITY).max(1),
         })
     }
 }
@@ -79,14 +86,29 @@ pub struct Stack {
     /// Kept alive so its install tasks are not aborted by `Drop`.
     #[allow(dead_code)]
     pub geo_updater: Option<GeoUpdater>,
+    pub resolver: Arc<Resolver>,
     pub diagnostics: Diagnostics,
 }
 
-/// Builds resources → set registry → GeoIP, then waits up to `wait` for the
-/// first fetch of every resource (skipped in `--no-network` mode).
+/// Builds resources → set registry → GeoIP → resolver, then waits up to
+/// `wait` for the first fetch of every resource (skipped in `--no-network` mode).
 pub async fn build_stack(cfg: &Config, rt: &Runtime, wait: Duration) -> anyhow::Result<Stack> {
+    build_stack_with(cfg, rt, wait, |_| {}).await
+}
+
+/// `build_stack` with a hook that edits the resolver configuration before
+/// the resolver is built (`dns lookup --server`).
+pub async fn build_stack_with(
+    cfg: &Config,
+    rt: &Runtime,
+    wait: Duration,
+    customize: impl FnOnce(&mut ResolverConfig),
+) -> anyhow::Result<Stack> {
     let connector = Arc::new(DirectConnector::new(Arc::new(SystemResolve)));
-    let client = Arc::new(HttpClient::new(connector, HttpClientConfig::default())?);
+    let client = Arc::new(HttpClient::new(
+        connector.clone(),
+        HttpClientConfig::default(),
+    )?);
     let resources = ResourceManager::with_options(
         rt.data_dir.clone(),
         client,
@@ -114,6 +136,19 @@ pub async fn build_stack(cfg: &Config, rt: &Runtime, wait: Duration) -> anyhow::
             !cfg.general.disable_geoip_db_auto_update,
         )
     });
+    let mut resolver_cfg = ResolverConfig::from_config(cfg);
+    resolver_cfg.cache_capacity = rt.dns_cache_size;
+    customize(&mut resolver_cfg);
+    let (resolver, dns_diags) = Resolver::new(
+        resolver_cfg,
+        ResolverDeps {
+            connector,
+            sets: registry.clone(),
+            system: Arc::new(PlatformSystemDns),
+            resources: resources.clone(),
+        },
+    );
+    diagnostics.extend(dns_diags);
     if !rt.no_network && !wait.is_zero() {
         resources.wait_initial(wait).await;
         settle(&registry, &geo, &resources).await;
@@ -123,6 +158,7 @@ pub async fn build_stack(cfg: &Config, rt: &Runtime, wait: Duration) -> anyhow::
         registry,
         geo,
         geo_updater,
+        resolver,
         diagnostics,
     })
 }
@@ -154,26 +190,25 @@ async fn settle(registry: &SetRegistry, geo: &GeoDb, resources: &ResourceManager
     }
 }
 
-/// System resolver adapter used until M2b delivers `rurge-dns`.
-pub struct SystemLazyResolver;
+/// `rurge-platform::dns` behind the `SystemDns` trait (AR-02: platform code
+/// stays in rurge-platform; rurge-dns only sees the trait).
+pub struct PlatformSystemDns;
 
-impl LazyResolver for SystemLazyResolver {
-    fn resolve<'a>(&'a self, host: &'a str) -> BoxFuture<'a, Result<ResolvedAddrs, ResolveError>> {
-        Box::pin(async move {
-            let addrs = tokio::net::lookup_host((host, 0))
-                .await
-                .map_err(|e| ResolveError::Failed(e.to_string()))?;
-            let mut out = ResolvedAddrs::default();
-            for sa in addrs {
-                match sa.ip() {
-                    std::net::IpAddr::V4(v4) => out.v4.push(v4),
-                    std::net::IpAddr::V6(v6) => out.v6.push(v6),
-                }
-            }
-            if out.v4.is_empty() && out.v6.is_empty() {
-                return Err(ResolveError::EmptyAnswer);
-            }
-            Ok(out)
-        })
+impl SystemDns for PlatformSystemDns {
+    fn servers(&self) -> Vec<SocketAddr> {
+        rurge_platform::dns::servers()
+    }
+
+    fn search_domains(&self) -> Vec<String> {
+        rurge_platform::dns::search_domains()
+    }
+
+    fn hosts_path(&self) -> Option<PathBuf> {
+        let path = rurge_platform::dns::hosts_path();
+        path.is_file().then_some(path)
+    }
+
+    fn has_ipv6(&self) -> bool {
+        rurge_platform::dns::has_ipv6()
     }
 }

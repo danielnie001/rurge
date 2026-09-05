@@ -280,3 +280,287 @@ FINAL,DIRECT,dns-failed
         );
     }
 }
+
+mod dns {
+    use assert_cmd::Command;
+    use rurge_dns::message::Qtype;
+    use rurge_dns::testing::MockDns;
+    use std::path::Path;
+
+    const CONF: &str =
+        "[General]\nipv6 = false\n[Proxy]\n[Host]\nfixed.test = 1.2.3.4\n[Rule]\nFINAL,DIRECT\n";
+
+    fn workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.conf"), CONF).unwrap();
+        dir
+    }
+
+    fn dns_cmd(dir: &Path, sub: &str, server: &str, extra: &[&str]) -> Command {
+        let mut cmd = Command::cargo_bin("rurge").unwrap();
+        cmd.arg("dns")
+            .arg(sub)
+            .arg("-c")
+            .arg(dir.join("t.conf"))
+            .arg("--server")
+            .arg(server)
+            .arg("--no-network")
+            .arg("--data-dir")
+            .arg(dir.join("data"))
+            .args(extra);
+        cmd
+    }
+
+    /// Runs the binary off the runtime thread so the mock upstream keeps serving.
+    async fn output(mut cmd: Command) -> std::process::Output {
+        tokio::task::spawn_blocking(move || cmd.output().unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn json_of(out: &std::process::Output) -> serde_json::Value {
+        serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("bad json: {e}\n{}", String::from_utf8_lossy(&out.stdout)))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lookup_over_udp_prints_addresses_source_and_ttl() {
+        let mock = MockDns::spawn().await;
+        mock.set("a.test", &["10.0.0.1", "10.0.0.2"], &[], 120);
+        let dir = workspace();
+        let server = mock.addr().to_string();
+        let out = output(dns_cmd(
+            dir.path(),
+            "lookup",
+            &server,
+            &["a.test", "--json"],
+        ))
+        .await;
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v = json_of(&out);
+        assert_eq!(v["addresses"], serde_json::json!(["10.0.0.1", "10.0.0.2"]));
+        assert_eq!(v["source"], format!("upstream(udp://{server})"));
+        assert_eq!(v["ttl_secs"], 120);
+        assert!(v["error"].is_null());
+        assert_eq!(v["upstreams"][0], format!("udp://{server}"));
+        let text = output(dns_cmd(dir.path(), "lookup", &server, &["a.test"])).await;
+        let stdout = String::from_utf8_lossy(&text.stdout);
+        assert!(stdout.contains("addresses: 10.0.0.1, 10.0.0.2"), "{stdout}");
+        assert!(stdout.contains("ttl: 120s"), "{stdout}");
+        assert_eq!(
+            mock.query_count("a.test", Qtype::Aaaa),
+            0,
+            "ipv6 = false asks A only"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_answer_exits_one() {
+        let mock = MockDns::spawn().await;
+        mock.set_empty("nx.test");
+        let dir = workspace();
+        let server = mock.addr().to_string();
+        let out = output(dns_cmd(
+            dir.path(),
+            "lookup",
+            &server,
+            &["nx.test", "--json"],
+        ))
+        .await;
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(json_of(&out)["error"], "empty answer");
+        let text = output(dns_cmd(dir.path(), "lookup", &server, &["nx.test"])).await;
+        assert_eq!(text.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&text.stdout).contains("error: empty answer"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_entries_short_circuit_the_upstream() {
+        let mock = MockDns::spawn().await;
+        let dir = workspace();
+        let out = output(dns_cmd(
+            dir.path(),
+            "lookup",
+            &mock.addr().to_string(),
+            &["fixed.test", "--json"],
+        ))
+        .await;
+        let v = json_of(&out);
+        assert_eq!(v["addresses"], serde_json::json!(["1.2.3.4"]));
+        assert_eq!(v["source"], "host(ip)");
+        assert!(mock.queries().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tcp_upstream_with_trace_shows_attempts() {
+        let mock = MockDns::spawn().await;
+        mock.set("t.test", &["10.0.0.7"], &[], 60);
+        let dir = workspace();
+        let server = format!("tcp://{}", mock.addr());
+        let out = output(dns_cmd(
+            dir.path(),
+            "lookup",
+            &server,
+            &["t.test", "--type", "a", "--trace"],
+        ))
+        .await;
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(&format!("source: upstream({server})")),
+            "{stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("rurge_dns::fanout")
+                && stderr.contains("send")
+                && stderr.contains("answer"),
+            "{stderr}"
+        );
+        assert_eq!(mock.queries()[0].1, "tcp");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dot_and_doh_upstreams_via_server_override() {
+        use rurge_dns::message::{Question, Rcode, build_response};
+        use rurge_net::testing::TestServer;
+        let dir = workspace();
+        std::fs::write(
+            dir.path().join("t.conf"),
+            CONF.replace(
+                "ipv6 = false",
+                "ipv6 = false
+encrypted-dns-skip-cert-verification = true",
+            ),
+        )
+        .unwrap();
+        let dot = MockDns::spawn_tls().await;
+        dot.set("s.test", &["10.0.0.5"], &[], 60);
+        let out = output(dns_cmd(
+            dir.path(),
+            "lookup",
+            &format!("tls://{}", dot.addr()),
+            &["s.test", "--json"],
+        ))
+        .await;
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(json_of(&out)["addresses"][0], "10.0.0.5");
+        let doh = TestServer::spawn_tls().await;
+        let q = Question {
+            name: "s.test".to_string(),
+            qtype: Qtype::A,
+        };
+        doh.set(
+            "/dns-query",
+            build_response(
+                0,
+                &q,
+                Rcode::NoError,
+                &[("10.0.0.6".parse().unwrap(), 60)],
+                false,
+            )
+            .unwrap(),
+        );
+        doh.set_header("/dns-query", "content-type", "application/dns-message");
+        let out = output(dns_cmd(
+            dir.path(),
+            "lookup",
+            doh.url("/dns-query").as_str(),
+            &["s.test", "--json"],
+        ))
+        .await;
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v = json_of(&out);
+        assert_eq!(v["addresses"][0], "10.0.0.6");
+        assert_eq!(v["source"], format!("upstream({})", doh.url("/dns-query")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dns_cache_lists_warmed_entries() {
+        let mock = MockDns::spawn().await;
+        mock.set("c.test", &["10.0.0.3"], &[], 60);
+        mock.set_empty("nx.test");
+        let dir = workspace();
+        let server = mock.addr().to_string();
+        let out = output(dns_cmd(
+            dir.path(),
+            "cache",
+            &server,
+            &["c.test", "nx.test", "--json"],
+        ))
+        .await;
+        assert_eq!(out.status.code(), Some(0));
+        let v = json_of(&out);
+        let entries = v["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        let c = entries.iter().find(|e| e["name"] == "c.test").unwrap();
+        assert_eq!(c["v4"][0], "10.0.0.3");
+        assert_eq!(c["negative"], false);
+        let nx = entries.iter().find(|e| e["name"] == "nx.test").unwrap();
+        assert_eq!(nx["negative"], true);
+        let text = output(dns_cmd(dir.path(), "cache", &server, &["c.test"])).await;
+        let stdout = String::from_utf8_lossy(&text.stdout);
+        assert!(
+            stdout.contains("entries: 1") && stdout.contains("c.test"),
+            "{stdout}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_server_spec_exits_two() {
+        let dir = workspace();
+        let out = output(dns_cmd(dir.path(), "lookup", "nonsense", &["a.test"])).await;
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("invalid --server"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rule_match_resolves_through_the_profile_resolver() {
+        let mock = MockDns::spawn().await;
+        mock.set("ip-rule.test", &["10.1.2.3"], &[], 60);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("t.conf"),
+            format!(
+                "[General]\ndns-server = {}\nipv6 = false\n[Proxy]\nP = direct\n[Rule]\nIP-CIDR,10.0.0.0/8,P\nFINAL,DIRECT\n",
+                mock.addr()
+            ),
+        )
+        .unwrap();
+        let mut cmd = Command::cargo_bin("rurge").unwrap();
+        cmd.arg("rule")
+            .arg("match")
+            .arg("-c")
+            .arg(dir.path().join("t.conf"))
+            .arg("--no-network")
+            .arg("--data-dir")
+            .arg(dir.path().join("data"))
+            .arg("ip-rule.test")
+            .arg("--json");
+        let out = output(cmd).await;
+        let v = json_of(&out);
+        assert_eq!(v["policy"], "P");
+        assert_eq!(v["resolved"]["v4"][0], "10.1.2.3");
+        assert_eq!(mock.query_count("ip-rule.test", Qtype::A), 1);
+    }
+}

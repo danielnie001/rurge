@@ -55,6 +55,7 @@ lru = "0.18"
 resolv-conf = "0.7"
 ipconfig = "0.3"
 if-addrs = "0.15"
+tracing-subscriber = "0.3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

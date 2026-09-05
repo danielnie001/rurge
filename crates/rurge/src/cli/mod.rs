@@ -1,4 +1,5 @@
 pub mod check;
+pub mod dns;
 pub mod rule;
 pub mod runtime;
 

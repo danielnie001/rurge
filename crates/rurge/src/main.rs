@@ -23,6 +23,8 @@ enum Command {
     Check(cli::check::CheckArgs),
     /// Rule engine tools (offline)
     Rule(Box<cli::rule::RuleArgs>),
+    /// DNS tools (offline)
+    Dns(Box<cli::dns::DnsArgs>),
 }
 
 fn main() -> ExitCode {
@@ -38,6 +40,7 @@ fn main() -> ExitCode {
         }
         Command::Check(args) => cli::check::run(args),
         Command::Rule(args) => cli::rule::run(*args),
+        Command::Dns(args) => cli::dns::run(*args),
     };
     match result {
         Ok(code) => code,
