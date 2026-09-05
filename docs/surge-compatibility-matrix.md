@@ -162,8 +162,8 @@
 | `udp-policy-not-supported-behaviour` | `REJECT` `DIRECT`；默认 `REJECT`（Mac 6.0 起） | 全部 | ✅ | 2 | |
 | `udp-priority` | 布尔；默认 true | 全部 | 🟡 | 3 | 高负载下优先处理 UDP，尽力而为 |
 | `block-quic` | `per-policy` `all-proxy` `all` `always-allow`；默认 `per-policy` | 全部 | ✅ | 2 | |
-| `show-error-page` | 布尔；默认 true | Mac 5.8+ | ✅ | 1 | 错误页为 rurge 自己的 HTML（写明规则、策略链、会话 id）；对连接失败的 502 页在 M3a 只覆盖明文请求，CONNECT 的 502 在 M3b |
-| `show-error-page-for-reject` | 布尔；默认 false | 全部 | ✅ | 1 | 错误页为 rurge 自己的 HTML（写明规则、策略链、会话 id） |
+| `show-error-page` | 布尔；默认 true | Mac 5.8+ | 🟡 | 1 | 错误页为 rurge 自己的 HTML（写明规则、策略链、会话 id）；对连接失败的 502 页在 M3a 只覆盖明文请求，CONNECT 的 502 在 M3b |
+| `show-error-page-for-reject` | 布尔；默认 false | 全部 | 🟡 | 1 | 错误页为 rurge 自己的 HTML（写明规则、策略链、会话 id） |
 
 ### 2.2 iOS 专属参数
 
@@ -183,8 +183,8 @@
 
 | 键 | 取值 / 默认 | rurge | 阶段 | 备注 |
 | --- | --- | --- | --- | --- |
-| `http-listen` | `[password@]address[:port]` 列表；默认端口 6152；多监听器 | 🟡 | 1 | 全平台可用；地址必须是 IP 字面量，IPv6 用 `[...]`；Basic 认证只比较密码，用户名任意（手册只给出 `[password@]address[:port]`） |
-| `socks5-listen` | `address[:port]` 列表；默认端口 6153；不支持密码 | ✅ | 1 | 全平台可用；REJECT 时回 `0x02`（手册未说明） |
+| `http-listen` | `[password@]address[:port]` 列表；默认端口 6152；多监听器 | 🟡 | 1 | 全平台可用；地址必须是 IP 字面量，IPv6 用 `[...]`；Basic 认证只比较密码，用户名任意（手册只给出 `[password@]address[:port]`）；两者都缺省时 rurge 仍在 `127.0.0.1:6152` / `6153` 监听，手册则是 `http-listen` 与 `socks5-listen` 都缺省则代理服务关闭；只配其一时与 Surge 一致：只开那一种 |
+| `socks5-listen` | `address[:port]` 列表；默认端口 6153；不支持密码 | 🟡 | 1 | 全平台可用；REJECT 时回 `0x02`（手册未说明） |
 | `set-system-socks-proxy` | 布尔；默认 true | ✅ | 1 | 随"设为系统代理"功能生效 |
 | `read-etc-hosts` | 布尔；默认 true | 🟡 | 1 | 手册标注 Mac only；rurge 三平台生效（Win: `System32\drivers\etc\hosts`） |
 | `subnet-exp-wifi-always-match` | 布尔；默认 true | ✅ | 3 | |
@@ -303,7 +303,7 @@
 | `DIRECT` | 直连 | 全部 | ✅ | 1 | |
 | `REJECT` | 拒绝；HTTP 请求返回错误页（受 `show-error-page-for-reject` 控制）；同一主机 30 秒内触发 50 次自动升级为 `REJECT-DROP` | 全部 | ✅ | 1 | |
 | `REJECT-TINYGIF` | 拒绝；HTTP 请求返回 1px 透明 GIF | 全部 | ✅ | 1 | |
-| `REJECT-DROP` | 静默丢弃连接 | 全部 | 🟡 | 1 | rurge 最多保持 30 s（M3b 可调）；Surge 直到客户端超时 |
+| `REJECT-DROP` | 静默丢弃连接 | 全部 | 🟡 | 1 | rurge 最多保持 30 s（M3b 可调）；Surge 直到客户端超时；SOCKS5 侧客户端先关闭则提前结束，HTTP 侧固定保持到超时（hyper 服务内观察不到客户端关闭，阶段 4 自有 HTTP 引擎后统一） |
 | `REJECT-NO-DROP` | 拒绝且永不升级为 DROP | 全部 | ✅ | 1 | |
 | `CELLULAR` `CELLULAR-ONLY` `HYBRID` `NO-HYBRID` | 蜂窝/混合网络策略 | iOS only | 🟡 | 1 | 桌面平台视为 `DIRECT` 并告警一次 |
 | 别名类型 `direct` `reject` `reject-drop` `reject-no-drop` `reject-tinygif` | `[Proxy]` 中定义别名，可带通用参数（如 `interface`） | 全部 | ✅ | 1 / 2 | 参数生效依赖阶段 2 |
@@ -334,6 +334,7 @@
 | `wireguard` | WireGuard L3 隧道作为策略 | 全部 | ✅ | 2 | |
 | `tailscale` | Tailscale 节点作为策略 | iOS 5.20 / Mac 6.7+ | ❓ | 远期 | 需嵌入 Tailscale 客户端（控制面协议、DERP、MagicDNS）；单独评估 |
 | `external` | 外部代理程序（本地 SOCKS5） | Mac only（iOS 视为 REJECT） | ✅ | 2 | rurge 在 Win/Lin/mac 均支持 |
+| 策略指向 rurge 尚未实现的协议类型 | Surge 原生支持全部协议 | 全部 | 🟡 | 1 / 2 | 加载时告警 `W0007`；运行时该策略按 `REJECT` 处理，会话日志 `error = policy protocol not implemented: <type>`；阶段 2 逐协议实现后移除 |
 
 ### 4.3 通用策略参数（14 个）
 
@@ -539,7 +540,7 @@
 | 每个请求 / 响应最多一个脚本；重写规则可串联 | | ✅ | 4 / 5 | |
 | Map Local 命中则直接返回本地响应，不发上游 | | ✅ | 4 | |
 | 引擎处理的请求在抓包视图中逐条展示，含重写与脚本备注 | | ✅ | 4 / 6 | |
-| 明文 HTTP 代理转发 | | 🟡 | 1 | 每个请求独立分流；出站连接每请求一条（阶段 4 引入连接池） |
+| 明文 HTTP 代理转发 | | 🟡 | 1 | 每个请求独立分流；出站连接每请求一条（阶段 4 引入连接池）；按 RFC 7230 剥离逐跳头并以请求目标覆盖 `Host`；不转发 `Upgrade`（WebSocket 经明文代理属阶段 4）；只接受 `http://` 绝对 URI |
 
 ### 7.2 `[MITM]`（9 个键）
 

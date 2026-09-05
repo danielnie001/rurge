@@ -4108,6 +4108,7 @@ EOF
 | 8 | `profile_key` 测试用 `C:\p\my.conf` 断言 | 改用 `Path::new("p").join("my.conf")` | 反斜杠在 Unix 不是分隔符，Linux / macOS CI 会失败 |
 | 8 | 迁移的代码块丢了文档注释 | 补回 `build_stack` / `build_stack_with` 及 bin 包装函数的注释 | 公开 API 需要说明 |
 | 9 | 集成测试用 `LoadOptions::for_tests()` 并断言 W0007 | 测试用去掉 `Shadowsocks` 能力的 `LoadOptions` | `for_tests()` 含全部能力，加载器不会对 `ss` 发 W0007；运行时「未实现 → REJECT」由注册表决定，不受能力集影响 |
+| 最终审查 | 分支整体审查（1 Critical / 9 Important / 13 Minor）后的修复波 | A1 监听器新增 `handshake_timeout`（30 s），HTTP 侧显式装 `TokioTimer` 才能启用 `header_read_timeout`，SOCKS5 侧整段握手加超时；A2 明文转发按 RFC 7230 覆盖 `Host`、双向剥离逐跳头、只接受 `http://` 绝对 URI、CONNECT 缺端口回 400、`session.url` 去 userinfo；A3 `relay` 把 `Counting` 包在 upstream 侧边传边计数，失败时计数保留；A4 `SessionHandle` 新增 `error`，未实现协议写入 `policy protocol not implemented: <type>` 并进 `Rejected` 日志；A5 SOCKS5 空域名回 `0x01`、Basic scheme 大小写不敏感 + 常量时间比密码、告警表加 1024 条上限；A6 `bind_listeners` 返回 `Vec<(ListenerSpec, Running)>` 且显式列出跳过的 `ListenerKind`；A7 CLI 测试先建 kill-on-Drop 守卫再等 `listening on`；A8 删 `rurge-engine` 的 `url` 与 `rurge-proto` 的 `tracing`；A9 `Running` 文档注释改为事实（drop 会中止已派生的会话，CONNECT 隧道不受管）；A10 出站模式测试的 `proxy=` 半段改用 `Block` 以区分模式与规则 | 控制器裁决的最终修复清单（`final-fix-brief.md`）；I6 判定为与 Surge 一致不改代码，只登记 |
 
 ## 延后事项（M3b）
 
@@ -4116,5 +4117,12 @@ EOF
 - 优雅退出（等会话 ≤ 5 s）；热重载（SIGHUP、`--watch`）；`--log-file` 滚动；`encrypted-dns-follow-outbound-mode`。
 - `state.json` 写入与 `outbound_mode` 持久化（M4）；`rurge reload` / `stop`（M4）。
 - `Engine::dial` 按 `index` 线性查找规则原文（`rules()` 已按 index 升序，可改二分）。
-- `bind_listeners` 的 `_ => continue` 应显式列出跳过的 `ListenerKind`，避免将来新增种类时监听顺序与 `listener_specs` 错位。
-- 测试加强：`http_exchange` 把超时与关闭混为一谈；出站模式测试的 `proxy=REJECT` 半段不具区分度（应用 `Block`）；wifi-access 的 `listener_specs` 用例断言不足；`Runtime::diagnostics()` 无测试；SOCKS5 IPv6 ATYP、`FailKind::Other` 无用例；`authorized` 只匹配 `Basic ` / `basic ` 前缀；`listener::serve` 的告警去重表不淘汰。
+- 测试加强：`http_exchange` 把超时与关闭混为一谈；wifi-access 的 `listener_specs` 用例断言不足；`Runtime::diagnostics()` 无测试；`FailKind::Other` 无用例。
+- 会话生命周期统一：`Running::drop` 会中止 accept 循环派生的全部会话，而 CONNECT 隧道由 hyper 的 upgrade 路径 `tokio::spawn`、不在 `JoinSet` 里，两者语义不一；M3b 做优雅退出时用 `CancellationToken` + `TaskTracker` 重做。
+- HTTP 侧的 REJECT-DROP 不随客户端关闭提前结束（hyper 服务内观察不到），只能固定保持到超时；阶段 4 自有 HTTP 引擎后统一。
+- `restrict_to_lan` 缺监听器级用例（现有测试只覆盖 `source_allowed` 本身）。
+- 会话日志的字段（`rule` / `policy` / `up` / `down` / `error`）没有断言，需要一个抓 `tracing` 输出的用例。
+- 策略组 `select` 的持久选择缺端到端用例（`state.json` → `GroupSelections` → `resolve`）。
+- SOCKS5 缺 IPv6 ATYP 用例；未知 ATYP 目前直接断开，应答码 `0x07` / `0x08` 未实现；`BND.ADDR` 恒为 `0.0.0.0:0`，未回出站流的本地地址。
+- `OutboundError::{Dns, Unsupported}` 目前没有任何构造点（阶段 2 出站协议落地后才会出现）。
+- `State::load` 为同步读取（在 tokio 运行时之外调用，M4 引入写入与 HTTP API 时改异步）。

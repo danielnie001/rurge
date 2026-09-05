@@ -149,11 +149,13 @@ pub enum DialError {
 - 绝对 URI 明文请求：`SessionInfo { protocol: Some(Http), url, http_host, user_agent, dst 来自 URI 的 host:port（默认 80）}` → 每请求 `dial` → 在出站流上 `hyper::client::conn::http1::handshake` → 请求改写：URI 改 origin-form、删除 `Proxy-Authorization` / `Proxy-Connection`、保留 `Host`；响应原样回写；`Connection: close` 由 hyper 处理；一个客户端连接上的多个请求分别 dial（可能命中不同规则），出站连接随响应结束关闭。
 - 非绝对 URI 且非 CONNECT 的请求（浏览器直接访问代理端口）：`400`。
 - 请求 / 响应体大小经 `SessionHandle` 计数；`Content-Length` 与 chunked 由 hyper 处理。
+- 实施订正（M3a）：明文转发的头处理按 RFC 7230 而非原文的「保留 `Host` / 只删 `Proxy-*`」——`Host` 无条件用请求目标的 authority 覆盖（§5.4，且丢弃 userinfo），请求与响应两个方向都剥离逐跳头（`Connection` 列出的 token 及 `Connection` / `Keep-Alive` / `Proxy-Connection` / `TE` / `Trailer` / `Transfer-Encoding` / `Upgrade` / `Proxy-Authenticate` / `Proxy-Authorization`，§6.1；帧头由 hyper 按 body 自行补齐）；只转发 `http` scheme 的绝对 URI，其余回 400；CONNECT 目标缺端口回 400（不再默认 443）；`session.url` 重建时丢弃 `user:pass@`。另：连接的 `header_read_timeout` 设为握手超时 30 s（`ListenerOpts::handshake_timeout`），且必须显式 `.timer(hyper_util::rt::TokioTimer::new())`——不装 `Timer` 时 hyper 会静默丢弃默认的 30 s 头部超时。
 
 ### 6.3 `Socks5Listener`
 
 - RFC 1928：方法协商只接受 `0x00`（无认证），否则回 `0xFF` 断开；请求 `CONNECT`（`0x01`）支持 IPv4 / 域名 / IPv6 三种地址类型；`BIND` / `UDP ASSOCIATE` 回 `0x07`（命令不支持）。
 - `dial` 成功回 `0x00` + 本地绑定地址（出站流的本地地址，取不到时 `0.0.0.0:0`）→ `relay`；失败按第 8 节回 `0x02` / `0x04` / `0x05`。
+- 实施订正（M3a）：「方法协商 + 读 CONNECT 请求」整段包在 `handshake_timeout`（30 s）里，超时按 `io::ErrorKind::TimedOut` 结束且不回应答；拨号与 relay 不在超时范围内。`ATYP=0x03` 且域名长度为 0 时回 `0x01`（general failure）并且不拨号。
 
 ### 6.4 来源限制与监听生命周期
 
@@ -196,6 +198,7 @@ impl Dialer for Engine { .. }
 ### 7.3 relay 与会话日志
 
 - `relay`：`copy_bidirectional` 的变体，每方向一个 8 KB 缓冲，字节数写入 handle 的原子计数；一方向 EOF 时对另一方向 `shutdown`；M3b 加空闲超时（两个方向都无数据超过阈值则关闭）。
+- 实施订正（M3a）：所谓「变体」的实现是把 `Counting` 包在 upstream 一侧后交给 `tokio::io::copy_bidirectional`——写 upstream 计 `up`、读 upstream 计 `down`，计数随字节移动而累加，因此复制中途失败时已传字节仍保留在 handle 上。另：`SessionHandle` 新增 `error` 字段，`Rejected` 日志带上它（未实现协议的文案见第 8 节）。
 - `SessionHandle::finish` 只触发一次：写一条日志 —— `Completed` 为 DEBUG（`loglevel = info` 可见），`Failed` / `Rejected` 为 INFO；字段 `session`、`listener`、`src`、`dst`、`rule`、`policy`（chain 用 ` > ` 连接）、`up`、`down`、`elapsed_ms`、`error`。
 - M3b：`RequestLog`（环形缓冲，默认 1000，`--request-log-size`；活动索引支持 `kill`）与 `TrafficStats`（总计、按策略、按监听器的原子计数；每秒采样速率）从同一份 handle 数据填充；M4 的 `GET /v1/requests/*`、`/v1/traffic` 只读它们。
 
@@ -223,6 +226,7 @@ impl Dialer for Engine { .. }
 - 错误页：内嵌 HTML 模板（英文，含 `rurge`、规则原文、策略链、会话 id），`Content-Type: text/html; charset=utf-8`，不引用外部资源。
 - 配置错误：`run` 启动时打印诊断（与 `check` 同格式）并退出 2；告警只在启动时打印一次。
 - 会话层错误转成 handle 的 `error` 与一条 INFO 日志；panic 由 `JoinSet` 边界隔离并记 ERROR。
+- 实施订正（M3a）：REJECT-DROP 的「直到客户端关闭或 30 s」在 SOCKS5 侧两句都成立，HTTP 侧只实现了后半句——hyper 的服务内观察不到客户端关闭，只能固定保持到超时；阶段 4 换成 rurge 自有 HTTP 引擎后统一（已登记进兼容性清单 4.1 表）。
 
 ## 9. 运行时状态、日志与 `rurge run`
 
