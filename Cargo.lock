@@ -1784,7 +1784,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "url",
 ]
 
 [[package]]
@@ -1858,7 +1857,6 @@ dependencies = [
  "rurge-config",
  "rurge-net",
  "tokio",
- "tracing",
 ]
 
 [[package]]

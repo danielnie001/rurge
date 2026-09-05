@@ -660,25 +660,35 @@ mod run {
                 }
             }
         });
-        let (mut http, mut socks) = (None, None);
+        // Own the child before anything can panic, so no path leaks the process.
+        let mut daemon = Daemon {
+            child,
+            http: 0,
+            socks: 0,
+            lines: rx,
+        };
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while http.is_none() || socks.is_none() {
+        while daemon.http == 0 || daemon.socks == 0 {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let line = rx
+            let line = daemon
+                .lines
                 .recv_timeout(remaining)
                 .expect("rurge run printed its listening lines");
             if let Some(rest) = line.strip_prefix("listening on http://") {
-                http = rest.rsplit(':').next().and_then(|p| p.parse().ok());
+                daemon.http = rest
+                    .rsplit(':')
+                    .next()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(0);
             } else if let Some(rest) = line.strip_prefix("listening on socks5://") {
-                socks = rest.rsplit(':').next().and_then(|p| p.parse().ok());
+                daemon.socks = rest
+                    .rsplit(':')
+                    .next()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(0);
             }
         }
-        Daemon {
-            child,
-            http: http.unwrap(),
-            socks: socks.unwrap(),
-            lines: rx,
-        }
+        daemon
     }
 
     fn http_get(port: u16, url: &str) -> String {

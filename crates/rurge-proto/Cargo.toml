@@ -11,7 +11,6 @@ repository.workspace = true
 rurge-config.workspace = true
 rurge-net.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 
 [lints]
 workspace = true
