@@ -25,6 +25,8 @@ enum Command {
     Rule(Box<cli::rule::RuleArgs>),
     /// DNS tools (offline)
     Dns(Box<cli::dns::DnsArgs>),
+    /// Run the proxy in the foreground
+    Run(Box<cli::run::RunArgs>),
 }
 
 fn main() -> ExitCode {
@@ -41,6 +43,7 @@ fn main() -> ExitCode {
         Command::Check(args) => cli::check::run(args),
         Command::Rule(args) => cli::rule::run(*args),
         Command::Dns(args) => cli::dns::run(*args),
+        Command::Run(args) => cli::run::run(*args),
     };
     match result {
         Ok(code) => code,

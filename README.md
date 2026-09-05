@@ -15,7 +15,7 @@ rurge（**Ru**st + Su**rge**）是一个用 Rust 编写的跨平台网络代理�
 
 ### 当前状态
 
-> **阶段 1 进行中：M1、M2a、M2b 完成**（配置解析、规则引擎、规则集、GeoIP、外部资源管理、DNS 客户端、`rurge rule match`、`rurge dns lookup`）；M3、M4 未开始。`rurge check` 可以校验任意 Surge 配置并给出带行号的诊断；`rurge rule match` 可以离线测试一次会话会命中哪条规则；`rurge dns lookup` 可以按配置的 DNS 设置离线解析域名；代理功能尚未实现。
+> **阶段 1 进行中：M1、M2a、M2b、M3a 完成**（配置解析、规则引擎、规则集、GeoIP、外部资源管理、DNS 客户端、HTTP / SOCKS5 代理与 DIRECT / REJECT 分流，`rurge check` / `rule match` / `dns lookup` / `run`）；M3b（请求记录、热重载）、M4 未开始。`rurge run -c <conf>` 已能作为 HTTP / SOCKS5 代理按规则把连接送到 DIRECT 或 REJECT；代理协议与策略组算法在阶段 2。
 
 完整的需求、模块划分、平台差异和分阶段路线图见 [docs/requirements.md](docs/requirements.md)；
 Surge 配置项 / 规则 / 参数 / API 的逐项兼容清单见 [docs/surge-compatibility-matrix.md](docs/surge-compatibility-matrix.md)。
@@ -25,10 +25,10 @@ Surge 配置项 / 规则 / 参数 / API 的逐项兼容清单见 [docs/surge-com
 | 模块           | 内容                                                                                                                                                          | 阶段  |
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
 | 配置与 Profile | Surge`.conf` 解析、`[General]` 全部选项、托管配置自动更新、`.sgmodule` 模块、Requirement 表达式、Keystore                                               | 1 / 5 |
-| 入站           | HTTP / HTTPS 代理、SOCKS5、局域网共享与认证、系统代理设置                                                                                                     | 1     |
+| 入站           | HTTP / HTTPS 代理、SOCKS5、局域网共享与认证、系统代理设置（HTTP / SOCKS5 监听、Basic 认证、`proxy-restricted-to-lan` 已实现，M3a）                                                                                                     | 1     |
 | 规则系统       | 域名 / IP / GEOIP / IP-ASN / HTTP / 进程 / 源与端口 / 协议与网络 / 逻辑 / 脚本 / 规则集 / FINAL（规则引擎 / 规则集 / GeoIP 已实现，M2a）                                                               | 1     |
 | DNS            | 普通 DNS、DoH / DoT / DoQ / DoH3、本地映射、劫持、fake-ip、always-real-ip（普通 DNS / DoH / DoT / `tcp://` / `[Host]` / 系统 hosts 已实现，M2b）                | 1 / 3 |
-| 出站协议       | DIRECT / REJECT 系列 / HTTP / SOCKS5 / Shadowsocks / Snell / VMess / Trojan / TUIC / Hysteria 2 / MASQUE / AnyTLS / Trust Tunnel / SSH / WireGuard / 外部程序 | 2     |
+| 出站协议       | DIRECT / REJECT 系列 / HTTP / SOCKS5 / Shadowsocks / Snell / VMess / Trojan / TUIC / Hysteria 2 / MASQUE / AnyTLS / Trust Tunnel / SSH / WireGuard / 外部程序（DIRECT 与 REJECT 系四种已实现，M3a） | 2     |
 | 策略组         | select / url-test / fallback / load-balance / smart / subnet、策略引入与订阅、延迟测试                                                                        | 2     |
 | 增强模式       | 虚拟网卡（Wintun / tun / utun）、UDP、路由包含与排除、进程识别、子网设置                                                                                      | 3     |
 | HTTP 处理      | MITM（HTTPS 解密）、URL / Header / Body 重写、Map Local、请求查看与抓包                                                                                       | 4     |
@@ -53,7 +53,7 @@ Surge 配置项 / 规则 / 参数 / API 的逐项兼容清单见 [docs/surge-com
 
 ### 快速开始（计划中的形态）
 
-> `rurge check`、`rurge rule match`（离线规则测试）与 `rurge dns lookup`（离线 DNS 测试）已可用；`rurge run` 将在 M3 提供。
+> `rurge check`、`rurge rule match`、`rurge dns lookup` 与 `rurge run`（HTTP / SOCKS5 代理，DIRECT / REJECT）已可用；代理协议在阶段 2，系统代理与 API 在 M4。
 
 ```bash
 # 构建
@@ -140,7 +140,7 @@ rurge (**Ru**st + Su**rge**) is a cross-platform network proxy written in Rust. 
 
 ### Status
 
-> **Phase 1 in progress: M1, M2a and M2b are done** (profile parsing, rule engine, rule sets, GeoIP, external resource management, DNS client, `rurge rule match`, `rurge dns lookup`); M3 and M4 have not started. `rurge check` validates any Surge profile with line-numbered diagnostics; `rurge rule match` tests offline which rule a session would hit; `rurge dns lookup` resolves a name offline through the profile's DNS settings; proxying is not implemented yet.
+> **Phase 1 in progress: M1, M2a, M2b and M3a are done** (profile parsing, rule engine, rule sets, GeoIP, external resource management, DNS client, HTTP / SOCKS5 proxy with DIRECT / REJECT routing, `rurge check` / `rule match` / `dns lookup` / `run`); M3b (request log, reload) and M4 have not started. `rurge run -c <conf>` already serves as an HTTP / SOCKS5 proxy routing connections to DIRECT or REJECT by rule; proxy protocols and group algorithms come in phase 2.
 
 See [docs/requirements.md](docs/requirements.md) (Chinese) for the full requirements, module breakdown, platform matrix and phased roadmap, and [docs/surge-compatibility-matrix.md](docs/surge-compatibility-matrix.md) for the item-by-item Surge compatibility checklist.
 
@@ -149,10 +149,10 @@ See [docs/requirements.md](docs/requirements.md) (Chinese) for the full requirem
 | Module              | Scope                                                                                                                                                                   | Phase |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
 | Profile             | Surge`.conf` parser, every `[General]` option, managed profiles, `.sgmodule` modules, requirement expressions, keystore                                           | 1 / 5 |
-| Inbound             | HTTP / HTTPS proxy, SOCKS5, LAN sharing with authentication, system proxy                                                                                               | 1     |
+| Inbound             | HTTP / HTTPS proxy, SOCKS5, LAN sharing with authentication, system proxy (HTTP / SOCKS5 listeners, Basic auth, `proxy-restricted-to-lan` implemented, M3a)                                                                                               | 1     |
 | Rules               | Domain / IP / GEOIP / IP-ASN / HTTP / process / source & port / protocol & network / logical / script / rule sets / FINAL (rule engine / rule sets / GeoIP implemented, M2a)                                               | 1     |
 | DNS                 | Plain DNS, DoH / DoT / DoQ / DoH3, local mapping, hijacking, fake IP, always-real-ip (plain DNS / DoH / DoT / `tcp://` / `[Host]` / system hosts implemented, M2b)     | 1 / 3 |
-| Outbound            | DIRECT / REJECT family / HTTP / SOCKS5 / Shadowsocks / Snell / VMess / Trojan / TUIC / Hysteria 2 / MASQUE / AnyTLS / Trust Tunnel / SSH / WireGuard / external program | 2     |
+| Outbound            | DIRECT / REJECT family / HTTP / SOCKS5 / Shadowsocks / Snell / VMess / Trojan / TUIC / Hysteria 2 / MASQUE / AnyTLS / Trust Tunnel / SSH / WireGuard / external program (DIRECT and the four REJECT flavours implemented, M3a) | 2     |
 | Policy groups       | select / url-test / fallback / load-balance / smart / subnet, policy including and subscriptions, latency tests                                                         | 2     |
 | Enhanced mode       | Virtual interface (Wintun / tun / utun), UDP, included and excluded routes, process identification, subnet settings                                                     | 3     |
 | HTTP processing     | MITM (HTTPS decryption), URL / header / body rewrite, Map Local, request viewer and capture                                                                             | 4     |
@@ -177,7 +177,7 @@ Near-term non-goals: iOS / tvOS builds, Surge Ponte (depends on iCloud), Apple-o
 
 ### Quick start (planned)
 
-> `rurge check`, `rurge rule match` (offline rule testing) and `rurge dns lookup` (offline DNS testing) work today; `rurge run` arrives with milestone M3.
+> `rurge check`, `rurge rule match`, `rurge dns lookup` and `rurge run` (HTTP / SOCKS5 proxy, DIRECT / REJECT) work today; proxy protocols arrive in phase 2, system proxy and the API in M4.
 
 ```bash
 # Build

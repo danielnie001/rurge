@@ -146,7 +146,7 @@
 | `icmp-forwarding` | 布尔；默认 true | 全部 | ✅ | 3 | |
 | `skip-proxy` | Host List | 全部（平台语义不同） | ✅ | 1 | 采用 macOS 语义：写入系统代理的绕过列表（Win: `ProxyOverride`；Lin: `no_proxy` / GNOME ignore-hosts） |
 | `exclude-simple-hostnames` | 布尔；默认 false | 全部 | ✅ | 1 | Windows 对应 `<local>` |
-| `proxy-restricted-to-lan` | 布尔；默认 true | 全部 | ✅ | 1 | |
+| `proxy-restricted-to-lan` | 布尔；默认 true | 全部 | 🟡 | 1 | rurge 按回环 / 私有 / 链路本地 / ULA 判定来源；手册为『当前子网』 |
 | `gateway-restricted-to-lan` | 布尔；默认 true | 全部 | ✅ | 7 | |
 | `external-controller-access` | `key@ip:port` | 全部 | 🔁 | 1 | Surge Dashboard 原生协议为专有协议；远程控制统一走 `http-api` |
 | `http-api` | `key@ip:port` | 全部 | ✅ | 1 | |
@@ -162,8 +162,8 @@
 | `udp-policy-not-supported-behaviour` | `REJECT` `DIRECT`；默认 `REJECT`（Mac 6.0 起） | 全部 | ✅ | 2 | |
 | `udp-priority` | 布尔；默认 true | 全部 | 🟡 | 3 | 高负载下优先处理 UDP，尽力而为 |
 | `block-quic` | `per-policy` `all-proxy` `all` `always-allow`；默认 `per-policy` | 全部 | ✅ | 2 | |
-| `show-error-page` | 布尔；默认 true | Mac 5.8+ | ✅ | 1 | |
-| `show-error-page-for-reject` | 布尔；默认 false | 全部 | ✅ | 1 | |
+| `show-error-page` | 布尔；默认 true | Mac 5.8+ | ✅ | 1 | 错误页为 rurge 自己的 HTML（写明规则、策略链、会话 id）；对连接失败的 502 页在 M3a 只覆盖明文请求，CONNECT 的 502 在 M3b |
+| `show-error-page-for-reject` | 布尔；默认 false | 全部 | ✅ | 1 | 错误页为 rurge 自己的 HTML（写明规则、策略链、会话 id） |
 
 ### 2.2 iOS 专属参数
 
@@ -183,8 +183,8 @@
 
 | 键 | 取值 / 默认 | rurge | 阶段 | 备注 |
 | --- | --- | --- | --- | --- |
-| `http-listen` | `[password@]address[:port]` 列表；默认端口 6152；多监听器 | ✅ | 1 | 全平台可用；地址必须是 IP 字面量，IPv6 用 `[...]` |
-| `socks5-listen` | `address[:port]` 列表；默认端口 6153；不支持密码 | ✅ | 1 | 全平台可用 |
+| `http-listen` | `[password@]address[:port]` 列表；默认端口 6152；多监听器 | 🟡 | 1 | 全平台可用；地址必须是 IP 字面量，IPv6 用 `[...]`；Basic 认证只比较密码，用户名任意（手册只给出 `[password@]address[:port]`） |
+| `socks5-listen` | `address[:port]` 列表；默认端口 6153；不支持密码 | ✅ | 1 | 全平台可用；REJECT 时回 `0x02`（手册未说明） |
 | `set-system-socks-proxy` | 布尔；默认 true | ✅ | 1 | 随"设为系统代理"功能生效 |
 | `read-etc-hosts` | 布尔；默认 true | 🟡 | 1 | 手册标注 Mac only；rurge 三平台生效（Win: `System32\drivers\etc\hosts`） |
 | `subnet-exp-wifi-always-match` | 布尔；默认 true | ✅ | 3 | |
@@ -303,7 +303,7 @@
 | `DIRECT` | 直连 | 全部 | ✅ | 1 | |
 | `REJECT` | 拒绝；HTTP 请求返回错误页（受 `show-error-page-for-reject` 控制）；同一主机 30 秒内触发 50 次自动升级为 `REJECT-DROP` | 全部 | ✅ | 1 | |
 | `REJECT-TINYGIF` | 拒绝；HTTP 请求返回 1px 透明 GIF | 全部 | ✅ | 1 | |
-| `REJECT-DROP` | 静默丢弃连接 | 全部 | ✅ | 1 | |
+| `REJECT-DROP` | 静默丢弃连接 | 全部 | 🟡 | 1 | rurge 最多保持 30 s（M3b 可调）；Surge 直到客户端超时 |
 | `REJECT-NO-DROP` | 拒绝且永不升级为 DROP | 全部 | ✅ | 1 | |
 | `CELLULAR` `CELLULAR-ONLY` `HYBRID` `NO-HYBRID` | 蜂窝/混合网络策略 | iOS only | 🟡 | 1 | 桌面平台视为 `DIRECT` 并告警一次 |
 | 别名类型 `direct` `reject` `reject-drop` `reject-no-drop` `reject-tinygif` | `[Proxy]` 中定义别名，可带通用参数（如 `interface`） | 全部 | ✅ | 1 / 2 | 参数生效依赖阶段 2 |
@@ -539,6 +539,7 @@
 | 每个请求 / 响应最多一个脚本；重写规则可串联 | | ✅ | 4 / 5 | |
 | Map Local 命中则直接返回本地响应，不发上游 | | ✅ | 4 | |
 | 引擎处理的请求在抓包视图中逐条展示，含重写与脚本备注 | | ✅ | 4 / 6 | |
+| 明文 HTTP 代理转发 | | 🟡 | 1 | 每个请求独立分流；出站连接每请求一条（阶段 4 引入连接池） |
 
 ### 7.2 `[MITM]`（9 个键）
 
@@ -807,6 +808,7 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | rurge 专有 | 守护进程 | `rurge run -c <path> [--tun] [--system-proxy]`、`rurge service install/uninstall`、`rurge mitm ca generate/export` | 1 / 3 / 4 | |
 | rurge 专有开发命令 | 离线（不启动守护进程）在当前进程内构建配置并评估一次会话，用于调试规则与规则集 | `rurge rule match -c <conf> <host[:port]> [--explain] [--json] [--resolve <ip,...>\|--no-dns] ...` | 1 | 见 M2 设计文档 §10.1；阶段 6 的 `rule match`/`rule explain` 经 HTTP API 查询运行中的守护进程，语义一致但走线上实例 |
 | rurge 专有开发命令 | 离线按配置的 DNS 设置解析域名，`--server` 覆盖上游，`--trace` 打印每次尝试；`dns cache` 打印本进程缓存快照 | `rurge dns lookup -c <conf> <name> [--type a\|aaaa\|both] [--server <spec>...] [--no-cache] [--trace] [--json]`；`rurge dns cache -c <conf> [name...]` | 1 | 见 M2 设计文档 §10.2；阶段 6 的 `dns lookup` 经 HTTP API 查询守护进程 |
+| rurge 专有命令 | 前台运行 HTTP / SOCKS5 代理；出站模式初值来自 `--outbound-mode`（M4 起 `state.json` 优先）；`--log-level` 覆盖 `loglevel` | `rurge run -c <conf> [--outbound-mode direct\|proxy=<p>\|rule] [--log-level <l>]` | 1 | 见 M3 设计文档 §9.3；`reload` / `stop` 依赖 M4 的控制通道 |
 
 ### 10.4 HTTP API
 

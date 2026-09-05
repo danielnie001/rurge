@@ -4092,3 +4092,29 @@ EOF
 预期：`run` 模块 3 个 CLI 测试 + 1 个单元测试通过；既有测试全部通过。
 
 ---
+
+## 执行期修正记录
+
+| 任务 | 计划内容 | 实际处理 | 原因 |
+| --- | --- | --- | --- |
+| 2 | 设计 §4 单独定义 `ConnectOpts` | 复用 `rurge_net::connector::ConnectOpts` | 同形结构，避免重复 |
+| 3 | 设计 §5 `PolicyRegistry::build -> (Registry, Diagnostics)` | 返回 `PolicyRegistry`，不产生诊断 | W0007 / W0008 / W0009 / W0010 已由 M1 加载器发出 |
+| 6 | 设计 §6.2 `bind(&Listener, ..)` | `bind(addr, dialer, opts)`，认证经 `ListenerOpts.auth`（支持 `wifi-access-http-auth` 的用户名 + 密码） | 监听地址与认证来源不止 `http-listen` |
+| 8 | 设计 §7.1 `Runtime` 直接持有资源栈 | `Stack` 构建自 bin 迁入 `rurge_engine::stack`，`rule match` / `dns lookup` 委托 | 避免三处重复的构建逻辑 |
+| 9 | 设计 §8 CONNECT 连接失败回 502 | M3a 直接关闭，M3b 补 502 | 设计已注明 |
+| 2 | 测试直接对 `Result<BoxedStream, _>` 调 `unwrap_err()` | 先 `.map(|_| ())` 再 `unwrap_err()` | `BoxedStream` 未实现 `Debug` |
+| 3 | 样例代码导入 `PolicyTarget`、`Entry::Group` 带 `kind` 字段 | 删除未用导入与从未读取的字段 | clippy `-D warnings` |
+| 4 | 测试用 `FakeDialer` 连接失败时直接返回 `DialError::Failed` | 先 `handle.finish(Failed)` 再返回，并补用例 | `DialError::Failed` 的契约是「句柄已结束」 |
+| 8 | `profile_key` 测试用 `C:\p\my.conf` 断言 | 改用 `Path::new("p").join("my.conf")` | 反斜杠在 Unix 不是分隔符，Linux / macOS CI 会失败 |
+| 8 | 迁移的代码块丢了文档注释 | 补回 `build_stack` / `build_stack_with` 及 bin 包装函数的注释 | 公开 API 需要说明 |
+| 9 | 集成测试用 `LoadOptions::for_tests()` 并断言 W0007 | 测试用去掉 `Shadowsocks` 能力的 `LoadOptions` | `for_tests()` 含全部能力，加载器不会对 `ss` 发 W0007；运行时「未实现 → REJECT」由注册表决定，不受能力集影响 |
+
+## 延后事项（M3b）
+
+- 请求记录环形缓冲与活动索引、按策略 / 监听器的流量统计与实时速率（`RequestLog` / `TrafficStats`）。
+- CONNECT / SOCKS5 首包 SNI 嗅探；空闲超时；REJECT 自动升级（30 s / 50 次）；CONNECT 连接失败的 502。
+- 优雅退出（等会话 ≤ 5 s）；热重载（SIGHUP、`--watch`）；`--log-file` 滚动；`encrypted-dns-follow-outbound-mode`。
+- `state.json` 写入与 `outbound_mode` 持久化（M4）；`rurge reload` / `stop`（M4）。
+- `Engine::dial` 按 `index` 线性查找规则原文（`rules()` 已按 index 升序，可改二分）。
+- `bind_listeners` 的 `_ => continue` 应显式列出跳过的 `ListenerKind`，避免将来新增种类时监听顺序与 `listener_specs` 错位。
+- 测试加强：`http_exchange` 把超时与关闭混为一谈；出站模式测试的 `proxy=REJECT` 半段不具区分度（应用 `Block`）；wifi-access 的 `listener_specs` 用例断言不足；`Runtime::diagnostics()` 无测试；SOCKS5 IPv6 ATYP、`FailKind::Other` 无用例；`authorized` 只匹配 `Basic ` / `basic ` 前缀；`listener::serve` 的告警去重表不淘汰。

@@ -1,6 +1,7 @@
 pub mod check;
 pub mod dns;
 pub mod rule;
+pub mod run;
 pub mod runtime;
 
 use rurge_config::config::Platform;

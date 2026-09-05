@@ -111,7 +111,7 @@ fn parse_listener(s: &str) -> Result<ListenerKind, String> {
     }
 }
 
-fn parse_mode(s: &str) -> Result<OutboundMode, String> {
+pub(crate) fn parse_mode(s: &str) -> Result<OutboundMode, String> {
     match s.to_ascii_lowercase().as_str() {
         "direct" => Ok(OutboundMode::Direct),
         "rule" => Ok(OutboundMode::Rule),

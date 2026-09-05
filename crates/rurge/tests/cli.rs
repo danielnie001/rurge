@@ -602,3 +602,186 @@ encrypted-dns-skip-cert-verification = true",
         assert_eq!(mock.query_count("ip-rule.test", Qtype::A), 1);
     }
 }
+
+mod run {
+    use rurge_net::testing::TestServer;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct Daemon {
+        child: Child,
+        http: u16,
+        socks: u16,
+        lines: mpsc::Receiver<String>,
+    }
+
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn write_conf(dir: &Path, general: &str) -> std::path::PathBuf {
+        let conf = dir.join("t.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "[General]\n{general}\n[Proxy]\n[Rule]\nDOMAIN,ads.test,REJECT\nFINAL,DIRECT\n"
+            ),
+        )
+        .unwrap();
+        conf
+    }
+
+    /// Spawns `rurge run` and waits for both `listening on` lines.
+    fn spawn_daemon(conf: &Path, data: &Path) -> Daemon {
+        let mut child = Command::new(assert_cmd::cargo::cargo_bin("rurge"))
+            .arg("run")
+            .arg("-c")
+            .arg(conf)
+            .arg("--no-network")
+            .arg("--data-dir")
+            .arg(data)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let (mut http, mut socks) = (None, None);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while http.is_none() || socks.is_none() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let line = rx
+                .recv_timeout(remaining)
+                .expect("rurge run printed its listening lines");
+            if let Some(rest) = line.strip_prefix("listening on http://") {
+                http = rest.rsplit(':').next().and_then(|p| p.parse().ok());
+            } else if let Some(rest) = line.strip_prefix("listening on socks5://") {
+                socks = rest.rsplit(':').next().and_then(|p| p.parse().ok());
+            }
+        }
+        Daemon {
+            child,
+            http: http.unwrap(),
+            socks: socks.unwrap(),
+            lines: rx,
+        }
+    }
+
+    fn http_get(port: u16, url: &str) -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let host = url.trim_start_matches("http://").split('/').next().unwrap();
+        write!(
+            s,
+            "GET {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_proxies_http_and_rejects_by_rule() {
+        let target = TestServer::spawn().await;
+        target.set("/hello", "hi from target");
+        let port = target.url("/").port().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(
+            dir.path(),
+            "http-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nloglevel = warning",
+        );
+        let daemon = tokio::task::spawn_blocking({
+            let conf = conf.clone();
+            let data = dir.path().join("data");
+            move || spawn_daemon(&conf, &data)
+        })
+        .await
+        .unwrap();
+        let http_port = daemon.http;
+        assert!(daemon.socks > 0);
+        let ok = tokio::task::spawn_blocking(move || {
+            http_get(http_port, &format!("http://127.0.0.1:{port}/hello"))
+        })
+        .await
+        .unwrap();
+        assert!(
+            ok.starts_with("HTTP/1.1 200") && ok.ends_with("hi from target"),
+            "{ok}"
+        );
+        let rejected = tokio::task::spawn_blocking(move || http_get(http_port, "http://ads.test/"))
+            .await
+            .unwrap();
+        assert!(
+            rejected.is_empty(),
+            "REJECT closes the connection: {rejected}"
+        );
+        assert_eq!(target.requests().len(), 1);
+        let summary = daemon.lines.try_iter().find(|l| l.contains("running:"));
+        assert!(
+            summary
+                .as_deref()
+                .is_some_and(|l| l.contains("outbound mode rule")),
+            "{summary:?}"
+        );
+    }
+
+    #[test]
+    fn run_exits_2_on_a_broken_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("t.conf"),
+            "[General]\n[Proxy]\n[Rule]\nDOMAIN,a.test,DIRECT\n",
+        )
+        .unwrap(); // no FINAL
+        let status = Command::new(assert_cmd::cargo::cargo_bin("rurge"))
+            .args(["run", "-c"])
+            .arg(dir.path().join("t.conf"))
+            .arg("--no-network")
+            .arg("--data-dir")
+            .arg(dir.path().join("data"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(2));
+    }
+
+    #[test]
+    fn run_exits_1_when_the_port_is_taken() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(
+            dir.path(),
+            &format!("http-listen = 127.0.0.1:{port}\nsocks5-listen = 127.0.0.1:0"),
+        );
+        let output = Command::new(assert_cmd::cargo::cargo_bin("rurge"))
+            .args(["run", "-c"])
+            .arg(&conf)
+            .arg("--no-network")
+            .arg("--data-dir")
+            .arg(dir.path().join("data"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("cannot bind listener"));
+        drop(taken);
+    }
+}

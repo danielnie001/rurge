@@ -77,7 +77,7 @@ rurge (bin: run)
 ## 4. `rurge-proto`
 
 ```rust
-pub struct ConnectOpts { pub timeout: Duration /* 10 s */, pub prefer_v6: bool }
+pub struct ConnectOpts { pub timeout: Duration /* 10 s */, pub prefer_v6: bool }  // 实现：直接复用 rurge_net::connector::ConnectOpts
 pub trait Outbound: Send + Sync {
     fn name(&self) -> &str;                                   // "DIRECT" / "REJECT-TINYGIF" / 策略名
     fn connect_tcp<'a>(&'a self, target: &'a Target, opts: &'a ConnectOpts)
@@ -100,7 +100,7 @@ pub struct GroupSelections(HashMap<String /* group */, String /* member */>);   
 pub struct Resolution { pub chain: Vec<String>, pub outbound: Arc<dyn Outbound> }
 pub struct PolicyRegistry { .. }
 impl PolicyRegistry {
-    pub fn build(cfg: &Config, selections: &GroupSelections, resolver: Arc<Resolver>) -> (PolicyRegistry, Diagnostics);
+    pub fn build(cfg: &Config, selections: &GroupSelections, resolver: Arc<Resolver>) -> PolicyRegistry;  // W0007 / W0008 / W0009 / W0010 已由 M1 加载器发出，注册表不再返回诊断
     pub fn resolve(&self, policy: &PolicyRef) -> Resolution;
     pub fn names(&self) -> Vec<String>;            // M4 的 /v1/policies
 }
@@ -142,7 +142,7 @@ pub enum DialError {
 
 ### 6.2 `HttpListener`
 
-- `bind(listener: &rurge_config::general::Listener, dialer: Arc<dyn Dialer>, opts: ListenerOpts) -> io::Result<Running>`；`Running { local_addr, task: JoinHandle }`，`Drop` 停止 accept。
+- `bind(addr: SocketAddr, dialer: Arc<dyn Dialer>, opts: ListenerOpts) -> io::Result<Running>`；`Running { local_addr, task: JoinHandle }`，`Drop` 停止 accept。
 - 每个连接：来源限制检查 → `hyper::server::conn::http1::Builder::serve_connection(io, service).with_upgrades()`。
 - 认证：`Listener.password` 为 `Some` 时要求 `Proxy-Authorization: Basic base64(user:pass)`，只比较密码部分（用户名任意；见第 12 节 Q1），失败回 `407` + `Proxy-Authenticate: Basic realm="rurge"`。
 - `CONNECT host:port`：组 `SessionInfo`（`dst` 来自 authority，`protocol = None`）→ `dial` → 成功回 `200 Connection Established`，`hyper::upgrade::on(req)` 拿到裸流 → `dialer.relay(client, upstream, handle)`；`DialError` 按第 8 节响应。
@@ -182,6 +182,8 @@ impl Engine {
 }
 impl Dialer for Engine { .. }
 ```
+
+- `Stack` 及其构建自 bin 迁入 `rurge_engine::stack`，平台 DNS 由 `StackOptions.system` 注入。
 
 ### 7.2 dial 流水线
 
