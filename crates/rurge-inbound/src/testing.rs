@@ -11,12 +11,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::net::TcpStream;
 
 /// Hosts: `echo.test` → `echo`, `target.test` → `target`, `reject.test`
 /// (port 443 REJECT, 444 DROP, 445 NO-DROP, 446 TINYGIF), `fail.test`
 /// (connect failure), `dns.test` (dns failure), `slow.test` (timeout).
-#[allow(dead_code)] // no caller until Task 5 wires a listener test onto this
 pub(crate) struct FakeDialer {
     pub echo: SocketAddr,
     pub target: Option<SocketAddr>,
@@ -24,7 +24,6 @@ pub(crate) struct FakeDialer {
     pub handles: Mutex<Vec<Arc<SessionHandle>>>,
 }
 
-#[allow(dead_code)] // no caller until Task 5 wires a listener test onto this
 impl FakeDialer {
     pub(crate) fn new(echo: SocketAddr, target: Option<SocketAddr>) -> Arc<FakeDialer> {
         Arc::new(FakeDialer {
@@ -35,6 +34,7 @@ impl FakeDialer {
         })
     }
 
+    #[allow(dead_code)] // no caller until Task 5 wires a listener test onto this
     pub(crate) fn sessions(&self) -> Vec<Arc<SessionHandle>> {
         self.handles.lock().unwrap().clone()
     }
@@ -63,14 +63,18 @@ impl Dialer for FakeDialer {
             };
             if let Some(addr) = connect_to {
                 handle.set_policy_chain(vec!["DIRECT".to_string()]);
-                let stream = TcpStream::connect(addr)
-                    .await
-                    .map_err(|e| DialError::Failed {
-                        kind: FailKind::Connect,
-                        message: e.to_string(),
-                        rule: handle.rule(),
-                        handle: handle.clone(),
-                    })?;
+                let stream = match TcpStream::connect(addr).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        handle.finish(SessionOutcome::Failed(e.to_string()));
+                        return Err(DialError::Failed {
+                            kind: FailKind::Connect,
+                            message: e.to_string(),
+                            rule: handle.rule(),
+                            handle,
+                        });
+                    }
+                };
                 return Ok(Dialed {
                     stream: Box::new(stream),
                     handle,
@@ -163,4 +167,29 @@ pub(crate) async fn echo_server() -> SocketAddr {
         }
     });
     addr
+}
+
+#[tokio::test]
+async fn dial_finishes_the_handle_on_connect_failure() {
+    // A closed loopback port: nothing answers, so `connect` fails outright.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed = listener.local_addr().unwrap();
+    drop(listener);
+
+    let dialer = FakeDialer::new(closed, None);
+    let session = SessionInfo::tcp(HostName::parse("echo.test"), 80);
+    // Connection refusal can take a couple of seconds on this machine.
+    let result = tokio::time::timeout(Duration::from_secs(5), dialer.dial(session))
+        .await
+        .expect("dial did not time out");
+
+    match result {
+        Err(DialError::Failed { kind, handle, .. }) => {
+            assert_eq!(kind, FailKind::Connect);
+            assert!(handle.is_finished());
+            assert!(matches!(handle.outcome(), Some(SessionOutcome::Failed(_))));
+        }
+        Ok(_) => panic!("expected a connect failure, got a successful dial"),
+        Err(DialError::Reject { .. }) => panic!("expected a connect failure, got a reject"),
+    }
 }
