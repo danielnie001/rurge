@@ -8,7 +8,7 @@ rurge 是用 Rust 复刻 Surge（macOS / iOS 网络代理工具）全部功能�
 
 ## 当前状态（2026-09）
 
-阶段 1 进行中。M1、M2a 已完成：Cargo workspace、`rurge-config`（解析全部 Surge 语法为强类型 `Config` + 诊断）、`rurge check`、`rurge-net`（连接器 / 内部 HTTP 客户端 / 外部资源管理器）、`rurge-rules`（域名 / IP 索引、规则集、GeoIP / ASN、规则引擎）、`rurge rule match`（离线规则匹配开发命令）。M2b（DNS）未开始；M3（连接流水线）、M4（控制面与平台）未开始，`rurge run` 尚不存在。
+阶段 1 进行中。M1、M2a、M2b 已完成：Cargo workspace、`rurge-config`（解析全部 Surge 语法为强类型 `Config` + 诊断）、`rurge check`、`rurge-net`（连接器 / 内部 HTTP 客户端 / 外部资源管理器）、`rurge-rules`（域名 / IP 索引、规则集、GeoIP / ASN、规则引擎）、`rurge rule match`（离线规则匹配开发命令）、`rurge-dns`（UDP / TCP / DoT / DoH 上游、并发查询与重试、缓存、`[Host]` 链、系统 hosts）、`rurge-platform::dns`、`rurge dns lookup`。M3（连接流水线）、M4（控制面与平台）未开始，`rurge run` 尚不存在。
 
 ## 先读这些文档
 
@@ -18,6 +18,7 @@ rurge 是用 Rust 复刻 Surge（macOS / iOS 网络代理工具）全部功能�
 - `docs/superpowers/specs/2026-09-04-phase1-m2-rules-dns-design.md`：M2 设计文档。`rurge-net`（连接器 / HTTP 客户端 / 外部资源管理器）、`rurge-rules`（索引结构、规则集、匹配器、GeoIP / ASN、规则引擎）、`rurge-dns`（M2b）的接口与语义；第 15 节列出需登记进兼容性清单的行为差异。
 - `docs/superpowers/plans/2026-09-03-phase1-m1-config-parser.md`：M1 实施计划（14 个任务，含完整代码与测试）。执行时按任务顺序推进，每个任务结束跑 `cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo test --workspace`。
 - `docs/superpowers/plans/2026-09-04-phase1-m2a-rules-plan.md`：M2a 实施计划（16 个任务）。末尾「执行期修正记录」表记录了与计划的偏差及基准数字。
+- `docs/superpowers/plans/2026-09-04-phase1-m2b-dns-plan.md`：M2b 实施计划（14 个任务）。末尾「执行期修正记录」与「延后事项」同 M2a。
 - `README.md`：中英双语，对外的状态、特性表与路线图，必须与 PRD 保持一致。
 
 ## 工作流约定
@@ -31,7 +32,7 @@ rurge 是用 Rust 复刻 Surge（macOS / iOS 网络代理工具）全部功能�
 ## 计划中的架构（阶段 1 建立后生效）
 
 - Rust stable，Cargo workspace，按职责拆 crate：`rurge-config`（解析 / 校验 / include / 模块叠加 / 托管配置）、`rurge-rules`、`rurge-dns`（客户端 / 加密 DNS / `[Host]` / fake-IP）、`rurge-policy`（策略组 / 测试 / 订阅）、`rurge-proto`（出站协议）、`rurge-net`（内部 HTTP 客户端 / 外部资源管理）、`rurge-inbound`、`rurge-engine`（会话流水线 / 请求记录 / 运行时状态）、`rurge-tun`（虚拟网卡 / 协议栈 / 网关 / DHCP）、`rurge-http`（HTTP 引擎 / MITM / 重写 / 抓包）、`rurge-script`、`rurge-api`、`rurge-platform`、`rurge`（bin）。职责与依赖见 PRD 3.2；平台特定代码只允许出现在 `rurge-platform` 与 `rurge-tun`（AR-02）。
-- 依赖方向（M2 设计文档确认，`rurge-dns` 尚未实现）：`rurge-dns → rurge-rules → rurge-net → rurge-config`；`[Host]` 集合键与 `LazyResolver` 都由 `rurge-dns` 依赖 `rurge-rules` 提供，而非并列关系。
+- 依赖方向（M2 设计文档确认）：`rurge-dns → rurge-rules → rurge-net → rurge-config`；`[Host]` 集合键与 `LazyResolver` 都由 `rurge-dns` 依赖 `rurge-rules` 提供，而非并列关系。
 - 连接处理流水线（PRD 3.3）：入站 → 协议嗅探（SNI / Host / QUIC / STUN）→ 预匹配 → 出站模式判断 → 规则匹配（域名规则不触发 DNS，IP 规则按需解析）→ 策略解析（组 / 链式 / 别名）→ 出站建立 → HTTP 引擎（MITM → Header Rewrite → URL Rewrite → Body Rewrite → 脚本 → Map Local 短路）→ 观测。
 - 配置对象不可变，重载时原子切换（AR-04）；每个连接是独立 tokio 任务（AR-03）。
 
@@ -46,6 +47,8 @@ cargo fmt --all
 cargo run -p rurge -- check -c config.conf      # 校验 Surge 配置（--json / --strict / --platform）
 cargo run -p rurge -- rule match -c config.conf example.com --explain   # 离线测试规则匹配
 cargo bench -p rurge-rules                      # criterion 基准（域名 / IP 索引、规则引擎）
+cargo run -p rurge -- dns lookup -c config.conf example.com --trace    # 离线 DNS 解析（--server 覆盖上游）
+cargo bench -p rurge-dns                        # criterion 基准（DNS 缓存命中）
 ```
 
 `Cargo.lock` 需要提交（`.gitignore` 已注明）。

@@ -383,7 +383,7 @@ pub enum DnsError { Timeout, EmptyAnswer, AllFailed(Vec<(String, String)>), Boot
 pub struct CacheEntry { pub name: String, pub v4: Vec<Ipv4Addr>, pub v6: Vec<Ipv6Addr>, pub expires_in: Option<Duration>, pub stale: bool, pub source: String }
 ```
 
-`Resolver` 实现 `rurge_rules::LazyResolver`（`resolve` = `lookup` 取地址）与 `rurge_net::Resolve`（供 `DirectConnector` 使用，避免 tokio 系统解析）。
+`Resolver` 实现 `rurge_rules::LazyResolver`（`resolve` = `lookup` 取地址）与 `rurge_net::Resolve`（供 `DirectConnector` 使用，避免 tokio 系统解析）。实现时 DoH 的 `HttpClient` 由 `Resolver` 内部用 `BootstrapConnector` 构建（保证 URL 主机名只经传统上游解析），`ResolverDeps` 只注入 `connector` / `sets` / `system` / `resources`。
 
 ### 7.2 上游
 
@@ -518,12 +518,13 @@ rurge rule match -c <conf> <host[:port]> [--url <url>] [--src <ip:port>] [--in-p
 
 ```
 rurge dns lookup -c <conf> <name> [--type a|aaaa|both] [--server <spec>...] [--no-cache] [--trace] [--json]
-rurge dns cache -c <conf>            # 打印本进程内（仅演示）缓存快照，M4 后改为查询守护进程
+rurge dns cache -c <conf> [name...]  # 先解析给定名字再打印快照（演示用），M4 后改为查询守护进程
 ```
 
 - `--server` 覆盖配置的上游（同 `dns-server` / `encrypted-dns-server` 语法）。
 - 输出：地址列表、`source`、`ttl`、`elapsed`、应答的上游名；`--trace` 打印每次尝试（上游、发送时间、结果）。
 - 退出码：0 成功；1 `EmptyAnswer`；2 其他错误。
+- `dns cache` 先解析给定名字再打印快照（演示用）；`--trace` 通过 `rurge_dns::fanout` 的 `tracing` debug 事件实现。
 
 ## 11. 错误处理与日志
 

@@ -6193,3 +6193,44 @@ EOF
 ```
 
 ---
+
+## 执行期修正记录
+
+| 任务 | 计划内容 | 实际处理 | 原因 |
+| --- | --- | --- | --- |
+| 1 | 全局约束 `rust-version = "1.85"`，不用 let-chains | workspace `rust-version` 提升到 1.88；clippy 随之要求把 11 处嵌套 `if let` 合并为 let-chains（c25907b） | hickory-proto 0.26 声明 MSRV 1.88，且编解码代码只对 0.26 的公开字段 API 核对过 |
+| 2 | Windows `search_domains()` 样例代码吞掉错误 | 两处 ipconfig 错误路径补 `tracing::debug!` | 接口约定「出错返回空值并 debug 日志」 |
+| 4 | `MockDns` 只有 TCP 监听随 oneshot 退出 | `Drop` 中 abort UDP / TCP 两个监听任务；recv/accept 错误记录并继续 | UDP 监听不随丢弃停止；Windows 上回复已关闭端口后 `recv_from` 会报 WSAECONNRESET |
+| 5 | 设计 §7.2「TCP / DoT 按 ID 多路复用」 | 每个 `TcpUpstream` 一条串行化持久连接，`exchange_framed` 校验应答 ID；锁等待与建连纳入 `timeout_at(deadline)`；DoT 派生 TLS 配置并只提供 ALPN `dot` | 阶段 1 不做多路复用；共享 HTTP 客户端的 ALPN（h2 / http/1.1）会被严格的 DoT 服务器拒绝 |
+| 7 | DoH 所有 `HttpError` 映射为 `Http` | `HttpError::Timeout` → `Timeout`；`LengthLimitError` → `BadResponse` | 接口约定 |
+| 8 | 单次查询超时计入 `failures` | 超时视为「无应答」，不计入失败；发送门槛加 `now < deadline`；补多线程运行时用例 | 共享截止时间下多线程运行时会随机把 `EmptyAnswer` / `Timeout` 变成 `AllFailed` |
+| 9 / 10 | 计划顺序 Task 9 → Task 10 | Task 10（缓存）先于 Task 9 实现（b05402e） | `Bootstrap` 依赖 `DnsCache`，预检漏掉 T9 ↔ T10 |
+| 9 | 引导缓存过期后重新查询 | 过期先返回旧地址，经 `begin_refresh` / `end_refresh` 后台刷新一次（Weak 自引用） | 60 s 后每次拨号都要付一次完整 fanout |
+| 9 | 引导测试真实等待 61 s | 用 `tokio::time::pause` / `advance` / `resume` | 全量测试时长 |
+| 11 | `HostMap::lookup` 要求调用方归一化 | `lookup` 内部归一化（小写、去尾点，`Cow`） | 大写 / 尾点查询会漏掉 hosts 条目与字面量模式 |
+| 11 | `force-syslib` 等同 `syslib` | 保留解析出的 `SystemMode`，解析器对三种模式一视同仁（M3 再区分） | M3 需要该区分 |
+| 12 | 设计 §7.1：`ResolverDeps` 注入 `HttpClient` | `Resolver` 内部用 `BootstrapConnector` 构建 DoH 客户端（不可用时为 `None` 并告警 W0026） | 引导豁免必须覆盖 DoH URL |
+| 12 | `on_network_change` 从 `primary_specs` 推导引导上游 | 保留 `configured_udp` + `wants_system`，`apply_system_servers` 由 `new` 与 `on_network_change` 共用；`dns-server = system` 在网络变化后重新展开；新增 `bootstrap_upstreams()` | 配置了加密上游时引导集合会错降级为系统 DNS；`system` 关键字在构造时被快照 |
+| 12 | 缓存只按名字为键 | `CachedAddrs.v6_queried`：`want_v6` 的查询不命中未查过 AAAA 的条目 | v4-only 条目会被当作 v6 调用者的命中 |
+| 12 | 在途查询无取消保护 | `Inflight` 守卫：首个调用者被取消时移除未发布的在途项 | 后续等待者会永久挂起 |
+| 12 | hosts 文件先读后订阅；DoH 客户端构建失败 `expect` | 先 `subscribe` 再读；`http: Option<Arc<HttpClient>>`；`system_lookup` 透传 `bypass_cache` | 变更丢失窗口；守护进程启动 panic |
+| 13 | 设计 §10.2：`rurge dns cache -c <conf>` | 追加位置参数 `[name...]`，先解析再打印快照 | 进程刚启动时快照恒为空 |
+| 13 | 设计 §10.2：`--trace` 打印每次尝试 | `rurge_dns::fanout` 的 `tracing` debug 事件 + `tracing-subscriber` | 不改 `resolve_name` 签名 |
+| 14 | NFR-01 缓存命中 < 1 ms | `cache_get` 中位数 229.24 ns；`resolver_cache_hit` 中位数 778.17 ns（`cargo bench -p rurge-dns --bench dns -- --warm-up-time 1 --measurement-time 3`） | 均远低于 1 ms 目标 |
+| 14 | `cargo bench -p rurge-dns -- --warm-up-time 1 --measurement-time 3` | 改用 `cargo bench -p rurge-dns --bench dns -- --warm-up-time 1 --measurement-time 3` | 与 M2a Task 16 同一根因：`-p rurge-dns` 还会跑 lib 单元测试的默认 harness，不认识 criterion 的 CLI 参数 |
+
+## 延后事项
+
+- `h3://` / `quic://` 上游（阶段 2，依赖 QUIC 栈）；`encrypted-dns-follow-outbound-mode`（M3，DNS 连接走规则）。
+- `server:force-syslib` 与 `syslib` 的区分、`[SSID Setting]` 的 DNS 覆盖（M3）。
+- `[Host]` 的 `script:` 值（阶段 5）。
+- `dns cache` 查询运行中的守护进程、`GET /v1/dns` / `POST /v1/dns/flush` / 延迟测试端点（M4）。
+- 系统 DNS 变化（网络切换）的自动 `on_network_change` 触发（M4 平台事件）。
+- `UdpUpstream`：被外部取消的查询会在 `pending` 中留下等待者直到迟到应答或 ID 复用（fanout 的 `abort_all` 会常规触发）；应加带令牌的 RAII 移除。
+- `TcpUpstream`：同一连接上的 ID 多路复用（设计 §7.2）。
+- `Bootstrap`：`want_v6` 在构造时固定，IPv6 上线后引导查询仍只问 A；冷未命中无 singleflight；刷新任务 panic 会滞留刷新槽。
+- 负缓存条目不携带家族信息（30 s 内 `want_v6 = false` 的空应答会返回给 `want_v6 = true` 的调用者）。
+- `ipv6 = false` 只过滤配置中的 IPv6 服务器，不过滤系统展开出来的服务器（待登记）。
+- `fanout`：`empties` 按上游名去重（重复配置同一服务器时只能在截止时判空）；问题段不匹配的应答报为 `rcode NOERROR`；`AllFailed` 排序未测；JoinError 静默丢弃。
+- `message.rs` 测试 `response_round_trip_with_records_and_ttls` 有一条恒真断言；`udp.rs` 错误文案 "receiver dropped" 应为 "sender dropped"、一处过期注释；`hosts.rs` 非 Windows `read()` 会解析两次 resolv.conf；`cache.rs` 容量 0 静默夹到 1。
+- `resolver.rs`（约 1500 行）可拆出 `resolver/types.rs`。

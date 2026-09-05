@@ -130,7 +130,7 @@
 | `debug-cpu-usage` | 布尔；默认 false | 全部 | 🔁 | 1 | rurge 用自己的 profiling 开关 |
 | `debug-memory-usage` | 布尔；默认 false | 全部 | 🔁 | 1 | |
 | `dns-server` | IP[:port] 列表或 `system`；含加密 URL 时自动迁移到 `encrypted-dns-server` | 全部 | ✅ | 1 | |
-| `encrypted-dns-server` | URL 列表：`https://` `h3://` `quic://` `tls://` `tcp://` | 全部 | 🟡 | 1 / 2 | `https` `tls` `tcp` 阶段 1；`h3` `quic` 依赖 QUIC 栈，阶段 2 |
+| `encrypted-dns-server` | URL 列表：`https://` `h3://` `quic://` `tls://` `tcp://` | 全部 | 🟡 | 1 / 2 | `https` `tls` `tcp` 阶段 1；`h3` `quic` 依赖 QUIC 栈，阶段 2；阶段 1 对 `h3` / `quic` 条目告警 W0026 并忽略 |
 | `encrypted-dns-follow-outbound-mode` | 布尔；默认 false | 全部 | ✅ | 1 | 含"代理服务器为域名时回退 DIRECT 并告警"的防环逻辑 |
 | `encrypted-dns-skip-cert-verification` | 布尔；默认 false | 全部 | ✅ | 1 | |
 | `allow-dns-svcb` | 布尔；默认 false | 全部 | ✅ | 3 | fake-IP 应答器拒绝 type 65 查询 |
@@ -186,7 +186,7 @@
 | `http-listen` | `[password@]address[:port]` 列表；默认端口 6152；多监听器 | ✅ | 1 | 全平台可用；地址必须是 IP 字面量，IPv6 用 `[...]` |
 | `socks5-listen` | `address[:port]` 列表；默认端口 6153；不支持密码 | ✅ | 1 | 全平台可用 |
 | `set-system-socks-proxy` | 布尔；默认 true | ✅ | 1 | 随"设为系统代理"功能生效 |
-| `read-etc-hosts` | 布尔；默认 true | ✅ | 1 | Windows 读取 `System32\drivers\etc\hosts` |
+| `read-etc-hosts` | 布尔；默认 true | 🟡 | 1 | 手册标注 Mac only；rurge 三平台生效（Win: `System32\drivers\etc\hosts`） |
 | `subnet-exp-wifi-always-match` | 布尔；默认 true | ✅ | 3 | |
 
 ### 2.4 旧键自动迁移
@@ -477,6 +477,8 @@
 | `dns-server` 条目：IPv4/IPv6[:port]（默认 53）、`system`；不允许主机名；`ipv6=false` 时丢弃 IPv6 服务器；未设置则用系统 DNS | | ✅ | 1 | |
 | `tcp://host[:port]`：持久 TCP 连接的明文 DNS；配置后同列的 UDP 服务器只用于解析该主机名 | iOS 5.21 / Mac 6.8+ | ✅ | 1 | |
 | `[SSID Setting]` 中的 `dns-server` / `encrypted-dns-server` 按网络覆盖 | | ✅ | 3 | |
+| `localhost` / `*.localhost` 直接返回回环地址，不查询上游 | | 🟡 | 1 | 手册未说明 |
+| 空应答（NOERROR 无记录 / NXDOMAIN）负缓存 30 s；错误不缓存 | | 🟡 | 1 | 手册未说明 |
 
 ### 6.2 加密 DNS
 
@@ -501,10 +503,10 @@
 | `<host> = <other host>`（别名，CNAME 语义） | 以新名字重新查找 | ✅ | 1 | |
 | `<host> = server:<ip[:port] \| 加密 URL>[, ...]` | 指定上游 | ✅ | 1 | |
 | `server:system` / `server:syslib` | 普通模式交系统解析库；增强模式在 rurge 内转发到系统当前配置的 DNS 服务器 | ✅ | 1 / 3 | |
-| `server:force-syslib` | 始终用系统解析库（mDNS 等特殊域名） | ✅ | 3 | Mac 6.4.3+ |
-| `<host> = script:<name>` | 由 `type=dns` 脚本解析 | ✅ | 5 | |
+| `server:force-syslib` | 始终用系统解析库（mDNS 等特殊域名） | 🟡 | 3 | 阶段 1 等同 `syslib`；M3 起区分 |
+| `<host> = script:<name>` | 由 `type=dns` 脚本解析 | ✅ | 5 | 阶段 1 构建时告警 W0027 并跳过该条目 |
 | `DOMAIN-SET:<url\|path> = ...` / `RULE-SET:<url\|path> = ...` | 整集绑定映射；规则集中只有域名类条目生效 | ✅ | 1 | Mac 5.10+ |
-| `read-etc-hosts`（macOS，默认 true） | 追加系统 hosts 项于 `[Host]` 之后并监视变化 | ✅ | 1 | Win: `System32\drivers\etc\hosts`；Lin / mac: `/etc/hosts` |
+| `read-etc-hosts`（macOS，默认 true） | 追加系统 hosts 项于 `[Host]` 之后并监视变化 | 🟡 | 1 | 手册标注 Mac only；rurge 三平台生效（Win: `System32\drivers\etc\hosts`） |
 | `use-local-host-item-for-proxy` | 有本地 IP 映射时用 IP 发起代理请求；多地址随机取一；不影响 `server:` / `script:` | ✅ | 2 | |
 
 ### 6.4 VIF（增强模式）下的 DNS 应答器与 fake-IP
@@ -804,6 +806,7 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | Agent Skill（Mac 6.5+） | 面向 AI 代理的技能文档 | 🟡 | 6 | rurge 仓库可提供等价 skill 文档 |
 | rurge 专有 | 守护进程 | `rurge run -c <path> [--tun] [--system-proxy]`、`rurge service install/uninstall`、`rurge mitm ca generate/export` | 1 / 3 / 4 | |
 | rurge 专有开发命令 | 离线（不启动守护进程）在当前进程内构建配置并评估一次会话，用于调试规则与规则集 | `rurge rule match -c <conf> <host[:port]> [--explain] [--json] [--resolve <ip,...>\|--no-dns] ...` | 1 | 见 M2 设计文档 §10.1；阶段 6 的 `rule match`/`rule explain` 经 HTTP API 查询运行中的守护进程，语义一致但走线上实例 |
+| rurge 专有开发命令 | 离线按配置的 DNS 设置解析域名，`--server` 覆盖上游，`--trace` 打印每次尝试；`dns cache` 打印本进程缓存快照 | `rurge dns lookup -c <conf> <name> [--type a\|aaaa\|both] [--server <spec>...] [--no-cache] [--trace] [--json]`；`rurge dns cache -c <conf> [name...]` | 1 | 见 M2 设计文档 §10.2；阶段 6 的 `dns lookup` 经 HTTP API 查询守护进程 |
 
 ### 10.4 HTTP API
 
