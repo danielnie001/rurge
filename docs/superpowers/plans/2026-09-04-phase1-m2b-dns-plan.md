@@ -6199,9 +6199,11 @@ EOF
 | 任务 | 计划内容 | 实际处理 | 原因 |
 | --- | --- | --- | --- |
 | 1 | 全局约束 `rust-version = "1.85"`，不用 let-chains | workspace `rust-version` 提升到 1.88；clippy 随之要求把 11 处嵌套 `if let` 合并为 let-chains（c25907b） | hickory-proto 0.26 声明 MSRV 1.88，且编解码代码只对 0.26 的公开字段 API 核对过 |
+| 1 | `ipconfig` 作为 `rurge-platform` 的无条件依赖 | 移入 `[target.'cfg(windows)'.dependencies]`（`resolv-conf` / `if-addrs` 保持无条件） | 其 build.rs 在任何平台都发 `cargo:rustc-link-lib=iphlpapi`，Linux / macOS 链接失败 |
 | 2 | Windows `search_domains()` 样例代码吞掉错误 | 两处 ipconfig 错误路径补 `tracing::debug!` | 接口约定「出错返回空值并 debug 日志」 |
 | 4 | `MockDns` 只有 TCP 监听随 oneshot 退出 | `Drop` 中 abort UDP / TCP 两个监听任务；recv/accept 错误记录并继续 | UDP 监听不随丢弃停止；Windows 上回复已关闭端口后 `recv_from` 会报 WSAECONNRESET |
 | 5 | 设计 §7.2「TCP / DoT 按 ID 多路复用」 | 每个 `TcpUpstream` 一条串行化持久连接，`exchange_framed` 校验应答 ID；锁等待与建连纳入 `timeout_at(deadline)`；DoT 派生 TLS 配置并只提供 ALPN `dot` | 阶段 1 不做多路复用；共享 HTTP 客户端的 ALPN（h2 / http/1.1）会被严格的 DoT 服务器拒绝 |
+| 5 | `TcpUpstream` 的连接一直留在 `Mutex<Option<_>>` 槽里，只在 `Err` 时清空 | 交换期间把连接借出槽位，成功才放回 | 被 fanout 的 `abort_all` 中途取消时，半读半写的连接会留给下一次查询（读到上一条应答 → ID 不匹配，或挂到截止时间） |
 | 7 | DoH 所有 `HttpError` 映射为 `Http` | `HttpError::Timeout` → `Timeout`；`LengthLimitError` → `BadResponse` | 接口约定 |
 | 8 | 单次查询超时计入 `failures` | 超时视为「无应答」，不计入失败；发送门槛加 `now < deadline`；补多线程运行时用例 | 共享截止时间下多线程运行时会随机把 `EmptyAnswer` / `Timeout` 变成 `AllFailed` |
 | 9 / 10 | 计划顺序 Task 9 → Task 10 | Task 10（缓存）先于 Task 9 实现（b05402e） | `Bootstrap` 依赖 `DnsCache`，预检漏掉 T9 ↔ T10 |
@@ -6214,6 +6216,8 @@ EOF
 | 12 | 缓存只按名字为键 | `CachedAddrs.v6_queried`：`want_v6` 的查询不命中未查过 AAAA 的条目 | v4-only 条目会被当作 v6 调用者的命中 |
 | 12 | 在途查询无取消保护 | `Inflight` 守卫：首个调用者被取消时移除未发布的在途项 | 后续等待者会永久挂起 |
 | 12 | hosts 文件先读后订阅；DoH 客户端构建失败 `expect` | 先 `subscribe` 再读；`http: Option<Arc<HttpClient>>`；`system_lookup` 透传 `bypass_cache` | 变更丢失窗口；守护进程启动 panic |
+| 12 | 设计 §7.1：`measure_delay(&self)` | 本计划 Interfaces 块改为 `measure_delay(&self, name: &str)`：逐上游串行探测指定域名 | 固定域名不可配；串行足够支撑 `dns lookup`，M4 的延迟测试端点再改并发 |
+| 12 | 设计 §7.3：迟到的 AAAA 应答只更新缓存（保留在途查询） | 部分结果落库后按 `partial && aaaa_timed_out` 触发一次后台补查（复用 `spawn_refresh`，经 `DnsCache::begin_refresh` 限流） | fanout 的 `abort_all` 已经取消了在途 AAAA；否则部分结果会在整个 TTL 内把该名字锁成 v4-only |
 | 13 | 设计 §10.2：`rurge dns cache -c <conf>` | 追加位置参数 `[name...]`，先解析再打印快照 | 进程刚启动时快照恒为空 |
 | 13 | 设计 §10.2：`--trace` 打印每次尝试 | `rurge_dns::fanout` 的 `tracing` debug 事件 + `tracing-subscriber` | 不改 `resolve_name` 签名 |
 | 14 | NFR-01 缓存命中 < 1 ms | `cache_get` 中位数 229.24 ns；`resolver_cache_hit` 中位数 778.17 ns（`cargo bench -p rurge-dns --bench dns -- --warm-up-time 1 --measurement-time 3`） | 均远低于 1 ms 目标 |
@@ -6230,7 +6234,10 @@ EOF
 - `TcpUpstream`：同一连接上的 ID 多路复用（设计 §7.2）。
 - `Bootstrap`：`want_v6` 在构造时固定，IPv6 上线后引导查询仍只问 A；冷未命中无 singleflight；刷新任务 panic 会滞留刷新槽。
 - 负缓存条目不携带家族信息（30 s 内 `want_v6 = false` 的空应答会返回给 `want_v6 = true` 的调用者）。
-- `ipv6 = false` 只过滤配置中的 IPv6 服务器，不过滤系统展开出来的服务器（待登记）。
+- `ipv6 = false` 只过滤配置中的 IPv6 服务器，不过滤系统展开出来的服务器（已登记于兼容性清单 6.1，M3 统一）。
 - `fanout`：`empties` 按上游名去重（重复配置同一服务器时只能在截止时判空）；问题段不匹配的应答报为 `rcode NOERROR`；`AllFailed` 排序未测；JoinError 静默丢弃。
-- `message.rs` 测试 `response_round_trip_with_records_and_ttls` 有一条恒真断言；`udp.rs` 错误文案 "receiver dropped" 应为 "sender dropped"、一处过期注释；`hosts.rs` 非 Windows `read()` 会解析两次 resolv.conf；`cache.rs` 容量 0 静默夹到 1。
+- `message.rs` 测试 `response_round_trip_with_records_and_ttls` 有一条恒真断言；`crates/rurge-platform/src/dns.rs` 非 Windows `read()` 会解析两次 resolv.conf（`servers()` 与 `search_domains()` 各读一次）；`cache.rs` 容量 0 静默夹到 1。
+- `[Host]` `server:` 的应答不进缓存（每次查询都走网络）——M3 需要带上游集合的缓存键。
+- `on_network_change` 不取消在途查询，旧网络的应答会写入刚清空的缓存（窗口 ≤ 一个 fanout 周期）。
+- Windows `servers()` 不过滤链路本地 / `fec0::/10` 占位 DNS 地址。
 - `resolver.rs`（约 1500 行）可拆出 `resolver/types.rs`。

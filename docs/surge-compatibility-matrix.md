@@ -474,7 +474,7 @@
 | 简单主机名（无点）：追加系统首个搜索域后交系统 DNS | | ✅ | 1 | Windows 使用连接专用 DNS 后缀 |
 | `.local` 默认走系统解析库（mDNS / Bonjour） | | 🟡 | 1 | Linux 依赖 nss-mdns / systemd-resolved；Windows 10+ 系统自带 mDNS |
 | 尾部 `.` 剥离并禁止搜索域改写；IP 字面量原样返回 | | ✅ | 1 | |
-| `dns-server` 条目：IPv4/IPv6[:port]（默认 53）、`system`；不允许主机名；`ipv6=false` 时丢弃 IPv6 服务器；未设置则用系统 DNS | | ✅ | 1 | |
+| `dns-server` 条目：IPv4/IPv6[:port]（默认 53）、`system`；不允许主机名；`ipv6=false` 时丢弃配置中的 IPv6 服务器（系统展开出的服务器不过滤，M3 统一）；未设置则用系统 DNS | | 🟡 | 1 | |
 | `tcp://host[:port]`：持久 TCP 连接的明文 DNS；配置后同列的 UDP 服务器只用于解析该主机名 | iOS 5.21 / Mac 6.8+ | ✅ | 1 | |
 | `[SSID Setting]` 中的 `dns-server` / `encrypted-dns-server` 按网络覆盖 | | ✅ | 3 | |
 | `localhost` / `*.localhost` 直接返回回环地址，不查询上游 | | 🟡 | 1 | 手册未说明 |
@@ -503,7 +503,7 @@
 | `<host> = <other host>`（别名，CNAME 语义） | 以新名字重新查找 | ✅ | 1 | |
 | `<host> = server:<ip[:port] \| 加密 URL>[, ...]` | 指定上游 | ✅ | 1 | |
 | `server:system` / `server:syslib` | 普通模式交系统解析库；增强模式在 rurge 内转发到系统当前配置的 DNS 服务器 | ✅ | 1 / 3 | |
-| `server:force-syslib` | 始终用系统解析库（mDNS 等特殊域名） | 🟡 | 3 | 阶段 1 等同 `syslib`；M3 起区分 |
+| `server:force-syslib` | 始终用系统解析库（mDNS 等特殊域名） | 🟡 | 3 | 阶段 1 等同 `syslib`；M3 起区分（Mac 6.4.3+） |
 | `<host> = script:<name>` | 由 `type=dns` 脚本解析 | ✅ | 5 | 阶段 1 构建时告警 W0027 并跳过该条目 |
 | `DOMAIN-SET:<url\|path> = ...` / `RULE-SET:<url\|path> = ...` | 整集绑定映射；规则集中只有域名类条目生效 | ✅ | 1 | Mac 5.10+ |
 | `read-etc-hosts`（macOS，默认 true） | 追加系统 hosts 项于 `[Host]` 之后并监视变化 | 🟡 | 1 | 手册标注 Mac only；rurge 三平台生效（Win: `System32\drivers\etc\hosts`） |

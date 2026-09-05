@@ -375,6 +375,7 @@ impl Resolver {
     pub fn on_network_change(&self);           // flush + 重置 AAAA 抑制 + 重建 UDP socket + 重读系统 DNS
     pub fn cache_snapshot(&self) -> Vec<CacheEntry>;
     pub async fn measure_delay(&self) -> Vec<UpstreamDelay>;   // 对每个上游解析固定域名一次，记录耗时或错误
+                                                               // 实现为 `measure_delay(&self, name)`，串行探测；M4 改并发
 }
 pub struct LookupOpts { pub bypass_cache: bool, pub want_v6: Option<bool> /* None = 按配置 */ }
 pub struct DnsResult { pub v4: Vec<Ipv4Addr>, pub v6: Vec<Ipv6Addr>, pub ttl: Duration, pub source: Source, pub elapsed: Duration }
@@ -424,7 +425,7 @@ loop:
     attempt += 1；attempt == 5 → 失败：若有上游返回过 Empty 且其余超时 → EmptyAnswer，否则 Timeout/AllFailed
 ```
 
-- **A / AAAA 并行**：等待两者都到达；若重发定时器触发时只有一种到达，以部分结果完成查询；另一种迟到的应答只更新缓存。
+- **A / AAAA 并行**：等待两者都到达；若重发定时器触发时只有一种到达，以部分结果完成查询；另一种迟到的应答只更新缓存。实现（M2b）：以后台补查代替保留在途查询；补查经缓存的刷新门限限流。
 - **AAAA 抑制**：连续 5 次「A 有应答而 AAAA 超时」→ 停发 AAAA，`tracing::warn!` 一次；`flush` 或 `on_network_change` 恢复。
 - **首个有效应答获胜**：不同上游的不一致应答不做合并。
 - 单个 `Question` 在同一时间只有一个在途查询（in-flight 合并，`HashMap<name, Shared future>`）。
