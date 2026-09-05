@@ -222,7 +222,9 @@ pub struct Resolver {
     connector: Arc<dyn Connector>,
     system: Arc<dyn SystemDns>,
     bootstrap: Arc<Bootstrap>,
-    http: Arc<HttpClient>,
+    /// `None` when the internal HTTP client could not be built (W0026 was
+    /// recorded); DoH upstreams are then skipped, like DoT without `tls`.
+    http: Option<Arc<HttpClient>>,
     tls: Option<Arc<rustls::ClientConfig>>,
     /// The `dns-server` UDP entries that survived the IPv6 filter.
     configured_udp: Vec<UpstreamSpec>,
@@ -260,7 +262,13 @@ impl Resolver {
                 Some(UpstreamSpec::Udp(addr)) if addr.is_ipv6() && !cfg.ipv6 => {
                     tracing::info!(server = %addr, "IPv6 DNS server ignored because ipv6 is off");
                 }
-                Some(spec) => configured_udp.push(spec),
+                Some(UpstreamSpec::Udp(addr)) => configured_udp.push(UpstreamSpec::Udp(addr)),
+                // `from_dns_server` only ever yields a plain UDP server or
+                // `None`; the arm keeps the invariant `build_plain_udp` relies
+                // on enforced by the match rather than by convention.
+                Some(other) => {
+                    tracing::warn!(server = ?other, "ignoring non-UDP dns-server entry")
+                }
                 None => wants_system = true,
             }
         }
@@ -301,17 +309,13 @@ impl Resolver {
                 ..HttpClientConfig::default()
             },
         ) {
-            Ok(c) => Arc::new(c),
+            Ok(c) => Some(Arc::new(c)),
             Err(e) => {
                 diags.push(Diagnostic::warning(
                     codes::W_DNS_UPSTREAM_UNSUPPORTED,
                     format!("DoH client unavailable: {e}"),
                 ));
-                // A client that can never connect; DoH upstreams will fail per query.
-                Arc::new(
-                    HttpClient::new(bootstrap_connector.clone(), HttpClientConfig::default())
-                        .expect("default http client"),
-                )
+                None
             }
         };
         let tls = match tls_client_config(cfg.skip_cert_verification) {
@@ -374,9 +378,10 @@ impl Resolver {
                     tls.clone(),
                 )) as UpstreamRef
             }),
-            UpstreamSpec::Https(url) => {
-                Some(Arc::new(DohUpstream::new(url.clone(), self.http.clone())))
-            }
+            UpstreamSpec::Https(url) => self
+                .http
+                .as_ref()
+                .map(|http| Arc::new(DohUpstream::new(url.clone(), http.clone())) as UpstreamRef),
         }
     }
 
@@ -532,7 +537,13 @@ impl Resolver {
                 }
                 HostAction::System(_) => {
                     return self
-                        .system_lookup(&current, want_v6, Source::Host(HostKind::System), started)
+                        .system_lookup(
+                            &current,
+                            want_v6,
+                            Source::Host(HostKind::System),
+                            started,
+                            &opts,
+                        )
                         .await;
                 }
             }
@@ -541,7 +552,7 @@ impl Resolver {
         // Special names.
         if current.ends_with(".local") {
             return self
-                .system_lookup(&current, want_v6, Source::System, started)
+                .system_lookup(&current, want_v6, Source::System, started, &opts)
                 .await;
         }
         if !current.contains('.') && !no_search {
@@ -550,29 +561,31 @@ impl Resolver {
                 None => current.clone(),
             };
             return self
-                .system_lookup(&candidate, want_v6, Source::System, started)
+                .system_lookup(&candidate, want_v6, Source::System, started, &opts)
                 .await;
         }
 
-        // Cache.
+        // Cache. An entry recorded without asking for AAAA cannot answer a
+        // caller that wants it, so such a hit falls through to the query below,
+        // whose `record` then replaces the entry with a v6-aware one.
         if !opts.bypass_cache {
             match self.cache.get(&current) {
-                Some(CacheHit::Fresh(a)) => {
+                Some(CacheHit::Fresh(a)) if a.v6_queried || !want_v6 => {
                     return Ok(from_cached(&a, Source::Cache { stale: false }, started));
                 }
-                Some(CacheHit::Stale(a)) => {
+                Some(CacheHit::Stale(a)) if a.v6_queried || !want_v6 => {
                     self.spawn_refresh(current.clone(), want_v6);
                     return Ok(from_cached(&a, Source::Cache { stale: true }, started));
                 }
                 Some(CacheHit::Negative) => return Err(DnsError::EmptyAnswer),
-                None => {}
+                _ => {}
             }
         }
 
         let primary = self.primary.load_full();
         if primary.is_empty() {
             return self
-                .system_lookup(&current, want_v6, Source::System, started)
+                .system_lookup(&current, want_v6, Source::System, started, &opts)
                 .await;
         }
         let result = self
@@ -591,7 +604,7 @@ impl Resolver {
     fn record(&self, name: &str, result: &Result<Answers, DnsError>, want_v6: bool) {
         match result {
             Ok(a) => {
-                self.cache.put(name, cached_from(a));
+                self.cache.put(name, cached_from(a, want_v6));
                 if want_v6 {
                     if a.aaaa_timed_out {
                         let n = self.aaaa_failures.fetch_add(1, Ordering::Relaxed) + 1;
@@ -690,12 +703,11 @@ impl Resolver {
         want_v6: bool,
         source: Source,
         started: Instant,
+        opts: &LookupOpts,
     ) -> Result<DnsResult, DnsError> {
         let system = self.system_upstreams.load_full();
         if !system.is_empty() {
-            let answers = self
-                .query_coalesced(&system, name, want_v6, &LookupOpts::default())
-                .await?;
+            let answers = self.query_coalesced(&system, name, want_v6, opts).await?;
             return Ok(from_answers(&answers, source, started));
         }
         let addrs = tokio::net::lookup_host((name, 0))
@@ -734,13 +746,16 @@ impl Resolver {
             source: ResourceSource::File(path.clone()),
             update_interval: None,
         });
+        // Subscribe before the first read: `watch::Sender::subscribe` marks the
+        // current version as seen, so subscribing afterwards would swallow a
+        // change that landed between the read and the subscription.
+        let mut rx = handle.subscribe();
         if let Some((data, _)) = handle.current().data() {
             self.hosts
                 .set_etc_hosts(parse_hosts_file(&String::from_utf8_lossy(&data)));
         }
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
-            let mut rx = handle.subscribe();
             loop {
                 let changed = tokio::select! {
                     r = rx.changed() => r.is_ok(),
@@ -832,11 +847,12 @@ fn min_ttl(a: &Answers) -> Duration {
     Duration::from_secs(u64::from(ttl))
 }
 
-fn cached_from(a: &Answers) -> CachedAddrs {
+fn cached_from(a: &Answers, want_v6: bool) -> CachedAddrs {
     CachedAddrs {
         v4: a.v4.iter().map(|(ip, _)| *ip).collect(),
         v6: a.v6.iter().map(|(ip, _)| *ip).collect(),
         ttl: min_ttl(a),
+        v6_queried: want_v6,
         source: a.upstream.clone(),
     }
 }
@@ -949,13 +965,7 @@ mod tests {
         }
     }
 
-    fn resolver(
-        e: &Env,
-        servers: &str,
-        extra: &str,
-        system: StaticSystemDns,
-    ) -> (Arc<Resolver>, Diagnostics) {
-        let _ = (servers, extra);
+    fn resolver(e: &Env, system: StaticSystemDns) -> (Arc<Resolver>, Diagnostics) {
         resolver_with(e, Arc::new(system))
     }
 
@@ -1019,7 +1029,7 @@ mod tests {
     async fn literals_loopback_and_trailing_dot() {
         let mock = MockDns::spawn().await;
         let e = env(&profile(&format!("dns-server = {}", mock.addr()), ""));
-        let (r, diags) = resolver(&e, "", "", StaticSystemDns::default());
+        let (r, diags) = resolver(&e, StaticSystemDns::default());
         assert!(
             diags.is_empty(),
             "{:?}",
@@ -1062,7 +1072,7 @@ mod tests {
             &format!("dns-server = {}", mock.addr()),
             "fixed.test = 1.2.3.4, ::2\nalias.test = fixed.test\nloop-a.test = loop-b.test\nloop-b.test = loop-a.test\nproxy.example = 127.0.0.1\nip-alias.test = 9.9.9.9\n",
         ));
-        let (r, _) = resolver(&e, "", "", StaticSystemDns::default());
+        let (r, _) = resolver(&e, StaticSystemDns::default());
         let f = r.lookup("fixed.test", LookupOpts::default()).await.unwrap();
         assert_eq!(
             (f.v4.clone(), f.v6.clone(), f.source.clone()),
@@ -1116,7 +1126,7 @@ mod tests {
             search_domains: vec!["home.lan".into()],
             ..StaticSystemDns::default()
         };
-        let (r, _) = resolver(&e, "", "", sys);
+        let (r, _) = resolver(&e, sys);
         let c = r.lookup("corp.test", LookupOpts::default()).await.unwrap();
         assert_eq!(
             (c.v4, c.source),
@@ -1149,12 +1159,15 @@ mod tests {
         mock.set("c.test", &["10.0.0.1"], &[], 1);
         mock.set_empty("nx.test");
         let e = env(&profile(&format!("dns-server = {}", mock.addr()), ""));
-        let (r, _) = resolver(&e, "", "", StaticSystemDns::default());
+        let (r, _) = resolver(&e, StaticSystemDns::default());
         let first = r.lookup("c.test", LookupOpts::default()).await.unwrap();
         assert!(matches!(first.source, Source::Upstream(_)));
         let second = r.lookup("c.test", LookupOpts::default()).await.unwrap();
         assert_eq!(second.source, Source::Cache { stale: false });
         assert_eq!(mock.query_count("c.test", Qtype::A), 1);
+        // The background refresh below re-caches with a long TTL, so the
+        // freshness assertion after it cannot race the original 1 s entry.
+        mock.set("c.test", &["10.0.0.1"], &[], 60);
         tokio::time::sleep(Duration::from_millis(1100)).await;
         let stale = r.lookup("c.test", LookupOpts::default()).await.unwrap();
         assert_eq!(stale.source, Source::Cache { stale: true });
@@ -1192,7 +1205,7 @@ mod tests {
         );
         // coalescing: two concurrent lookups of a new name → one upstream query
         mock.set("co.test", &["10.0.0.2"], &[], 60);
-        mock.set_delay(Duration::from_millis(80));
+        mock.set_delay(Duration::from_millis(40));
         let r2 = r.clone();
         let (a, b) = tokio::join!(
             r.lookup("co.test", LookupOpts::default()),
@@ -1217,6 +1230,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_v4_only_cache_entry_does_not_answer_a_caller_that_wants_aaaa() {
+        let mock = MockDns::spawn().await;
+        mock.set("dual.test", &["10.0.0.1"], &["fd00::1"], 60);
+        let e = env(&profile(&format!("dns-server = {}", mock.addr()), ""));
+        let (r, _) = resolver(&e, StaticSystemDns::default());
+        let v4_only = |bypass| LookupOpts {
+            bypass_cache: bypass,
+            want_v6: Some(false),
+        };
+        let dual = || LookupOpts {
+            bypass_cache: false,
+            want_v6: Some(true),
+        };
+
+        let first = r.lookup("dual.test", v4_only(false)).await.unwrap();
+        assert!(first.v6.is_empty());
+        assert_eq!(mock.query_count("dual.test", Qtype::A), 1);
+        assert_eq!(mock.query_count("dual.test", Qtype::Aaaa), 0);
+
+        // The v4-only entry cannot serve a caller that wants AAAA.
+        let second = r.lookup("dual.test", dual()).await.unwrap();
+        assert_eq!(second.v6, vec!["fd00::1".parse::<Ipv6Addr>().unwrap()]);
+        assert!(matches!(second.source, Source::Upstream(_)));
+        assert_eq!(
+            mock.query_count("dual.test", Qtype::Aaaa),
+            1,
+            "exactly one AAAA query was sent"
+        );
+
+        // The replacement entry is v6-aware, so it serves both kinds of caller.
+        let third = r.lookup("dual.test", dual()).await.unwrap();
+        assert_eq!(third.source, Source::Cache { stale: false });
+        assert_eq!(third.v6.len(), 1);
+        assert_eq!(mock.query_count("dual.test", Qtype::Aaaa), 1);
+        let fourth = r.lookup("dual.test", v4_only(false)).await.unwrap();
+        assert_eq!(
+            fourth.source,
+            Source::Cache { stale: false },
+            "a v6-aware entry still serves a caller that only wants v4"
+        );
+    }
+
+    #[tokio::test]
     async fn aaaa_suppression_after_five_timeouts_and_flush_resumes() {
         let mock = MockDns::spawn().await;
         for i in 0..7 {
@@ -1231,7 +1287,7 @@ mod tests {
             has_ipv6: true,
             ..StaticSystemDns::default()
         };
-        let (r, _) = resolver(&e, "", "", sys);
+        let (r, _) = resolver(&e, sys);
         for i in 0..5 {
             let res = r
                 .lookup(&format!("h{i}.test"), LookupOpts::default())
@@ -1270,7 +1326,7 @@ mod tests {
             ),
             "",
         ));
-        let (r, diags) = resolver(&e, "", "", StaticSystemDns::default());
+        let (r, diags) = resolver(&e, StaticSystemDns::default());
         assert!(diags.is_empty());
         assert_eq!(
             r.primary_upstreams(),
@@ -1404,7 +1460,7 @@ mod tests {
             ),
             "",
         ));
-        let (r, diags) = resolver(&e, "", "", StaticSystemDns::default());
+        let (r, diags) = resolver(&e, StaticSystemDns::default());
         assert!(
             diags
                 .iter()
@@ -1423,8 +1479,6 @@ mod tests {
         let e = env(&profile("", ""));
         let (r, _) = resolver(
             &e,
-            "",
-            "",
             StaticSystemDns {
                 servers: vec![system.addr()],
                 ..StaticSystemDns::default()
@@ -1436,7 +1490,7 @@ mod tests {
         );
         let s = r.lookup("s.test", LookupOpts::default()).await.unwrap();
         assert_eq!(s.v4, vec![v4("10.30.0.1")]);
-        let (r2, _) = resolver(&e, "", "", StaticSystemDns::default());
+        let (r2, _) = resolver(&e, StaticSystemDns::default());
         assert!(r2.primary_upstreams().is_empty());
         let lo = r2.lookup("localhost", LookupOpts::default()).await.unwrap();
         assert_eq!(lo.source, Source::Loopback);
@@ -1453,7 +1507,7 @@ mod tests {
             hosts_path: Some(hosts_path.clone()),
             ..StaticSystemDns::default()
         };
-        let (r, _) = resolver(&e, "", "", sys);
+        let (r, _) = resolver(&e, sys);
         let n = r.lookup("nas.lan", LookupOpts::default()).await.unwrap();
         assert_eq!(
             (n.v4, n.source),
@@ -1477,7 +1531,7 @@ mod tests {
         mock.set("t.test", &["10.0.0.1"], &[], 60);
         mock.set_empty("nx.test");
         let e = env(&profile(&format!("dns-server = {}", mock.addr()), ""));
-        let (r, _) = resolver(&e, "", "", StaticSystemDns::default());
+        let (r, _) = resolver(&e, StaticSystemDns::default());
         let lazy: &dyn LazyResolver = r.as_ref();
         assert_eq!(
             lazy.resolve("t.test").await.unwrap().v4,

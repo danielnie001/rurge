@@ -19,6 +19,10 @@ pub struct CachedAddrs {
     pub v6: Vec<Ipv6Addr>,
     /// TTL the answer carried (smallest record TTL).
     pub ttl: Duration,
+    /// The AAAA family was asked when this entry was recorded. A `false` entry
+    /// holds no v6 answer *because none was requested*, so it must not be
+    /// served to a caller that wants AAAA.
+    pub v6_queried: bool,
     /// Upstream name that answered, for `cache_snapshot`.
     pub source: String,
 }
@@ -203,6 +207,7 @@ mod tests {
             v4: vec!["10.0.0.1".parse().unwrap()],
             v6: vec![],
             ttl: Duration::from_secs(ttl_secs),
+            v6_queried: false,
             source: "udp://1.1.1.1:53".to_string(),
         }
     }

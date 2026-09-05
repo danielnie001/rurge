@@ -140,6 +140,7 @@ impl Bootstrap {
                 v4: v4.clone(),
                 v6: v6.clone(),
                 ttl,
+                v6_queried: self.want_v6,
                 source: answers.upstream,
             },
         );
