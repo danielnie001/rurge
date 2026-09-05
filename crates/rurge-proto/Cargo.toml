@@ -1,0 +1,17 @@
+[package]
+name = "rurge-proto"
+description = "Outbound abstraction and the built-in DIRECT / REJECT outbounds for rurge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rurge-config.workspace = true
+rurge-net.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

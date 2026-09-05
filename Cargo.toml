@@ -25,7 +25,7 @@ predicates = "3"
 rurge-net = { path = "crates/rurge-net" }
 rurge-rules = { path = "crates/rurge-rules" }
 rurge-platform = { path = "crates/rurge-platform" }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "fs", "sync", "macros", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "fs", "sync", "macros", "io-util", "signal"] }
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio", "server", "server-auto"] }
 http = "1"
@@ -56,6 +56,11 @@ resolv-conf = "0.7"
 ipconfig = "0.3"
 if-addrs = "0.15"
 tracing-subscriber = "0.3"
+rurge-proto = { path = "crates/rurge-proto" }
+rurge-policy = { path = "crates/rurge-policy" }
+rurge-inbound = { path = "crates/rurge-inbound" }
+rurge-engine = { path = "crates/rurge-engine" }
+base64 = "0.22"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

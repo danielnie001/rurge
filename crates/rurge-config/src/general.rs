@@ -6,6 +6,7 @@ use crate::span::Span;
 use crate::text::Section;
 use crate::value::{parse_bool, split_definition, split_list};
 use ipnet::IpNet;
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -106,10 +107,19 @@ pub enum BlockQuicGlobal {
     AlwaysAllow,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Listener {
     pub password: Option<String>,
     pub addr: SocketAddr,
+}
+
+impl fmt::Debug for Listener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Listener")
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("addr", &self.addr)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -863,5 +873,19 @@ mod tests {
         let c = codes_of(&d);
         assert!(c.contains(&codes::W_INVALID_VALUE));
         assert!(c.contains(&codes::W_PLATFORM_IGNORED));
+    }
+
+    #[test]
+    fn listener_debug_redacts_the_password() {
+        let l = Listener {
+            password: Some("s3cret".to_string()),
+            addr: "127.0.0.1:6152".parse().unwrap(),
+        };
+        let shown = format!("{l:?}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(
+            shown.contains("<redacted>") && shown.contains("6152"),
+            "{shown}"
+        );
     }
 }

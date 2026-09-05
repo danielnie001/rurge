@@ -1,0 +1,33 @@
+[package]
+name = "rurge-engine"
+description = "Session pipeline: runtime, dialer, relay and session log for rurge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rurge-config.workspace = true
+rurge-net.workspace = true
+rurge-rules.workspace = true
+rurge-dns.workspace = true
+rurge-proto.workspace = true
+rurge-policy.workspace = true
+rurge-inbound.workspace = true
+tokio.workspace = true
+arc-swap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rurge-net = { workspace = true, features = ["testing"] }
+rurge-dns = { workspace = true, features = ["testing"] }
+rustls.workspace = true
+tokio-rustls.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
