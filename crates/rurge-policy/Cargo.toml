@@ -12,5 +12,8 @@ rurge-config.workspace = true
 rurge-proto.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+rurge-net.workspace = true
+
 [lints]
 workspace = true
