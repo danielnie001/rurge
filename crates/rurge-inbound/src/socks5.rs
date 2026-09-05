@@ -20,6 +20,7 @@ const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_V6: u8 = 0x04;
 
 pub const REP_SUCCESS: u8 = 0x00;
+pub const REP_GENERAL_FAILURE: u8 = 0x01;
 pub const REP_NOT_ALLOWED: u8 = 0x02;
 pub const REP_HOST_UNREACHABLE: u8 = 0x04;
 pub const REP_CONNECTION_REFUSED: u8 = 0x05;
@@ -74,6 +75,12 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Result<(HostName, u1
         }
         ATYP_DOMAIN => {
             let len = stream.read_u8().await? as usize;
+            if len == 0 {
+                // Nothing to dial; drain the port and answer instead of
+                // resolving the empty name.
+                stream.read_u16().await?;
+                return Ok(Err(REP_GENERAL_FAILURE));
+            }
             let mut b = vec![0u8; len];
             stream.read_exact(&mut b).await?;
             let s = String::from_utf8(b)
@@ -99,14 +106,9 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Result<(HostName, u1
     Ok(Ok((host, port)))
 }
 
-async fn handle(
-    mut stream: TcpStream,
-    peer: SocketAddr,
-    local: SocketAddr,
-    dialer: Arc<dyn Dialer>,
-    opts: Arc<ListenerOpts>,
-) -> io::Result<()> {
-    // method negotiation
+/// Method negotiation plus the CONNECT request. `Ok(None)` means the client
+/// was already answered (unacceptable method) and the session is over.
+async fn handshake(stream: &mut TcpStream) -> io::Result<Option<Result<(HostName, u16), u8>>> {
     let mut hello = [0u8; 2];
     stream.read_exact(&mut hello).await?;
     if hello[0] != VERSION {
@@ -119,16 +121,31 @@ async fn handle(
     stream.read_exact(&mut methods).await?;
     if !methods.contains(&METHOD_NONE) {
         stream.write_all(&[VERSION, METHOD_UNACCEPTABLE]).await?;
-        return Ok(());
+        return Ok(None);
     }
     stream.write_all(&[VERSION, METHOD_NONE]).await?;
+    read_request(stream).await.map(Some)
+}
 
-    let (host, port) = match read_request(&mut stream).await? {
-        Ok(target) => target,
-        Err(code) => {
+async fn handle(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    local: SocketAddr,
+    dialer: Arc<dyn Dialer>,
+    opts: Arc<ListenerOpts>,
+) -> io::Result<()> {
+    // A client that stalls mid-handshake must not hold the task forever;
+    // dialing and relaying are deliberately outside the bound.
+    let negotiated = tokio::time::timeout(opts.handshake_timeout, handshake(&mut stream))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socks5 handshake timed out"))??;
+    let (host, port) = match negotiated {
+        Some(Ok(target)) => target,
+        Some(Err(code)) => {
             stream.write_all(&reply(code)).await?;
             return Ok(());
         }
+        None => return Ok(()),
     };
     let mut session = SessionInfo::tcp(host, port);
     session.src = peer;
@@ -173,11 +190,19 @@ mod tests {
     use std::time::Duration;
 
     async fn listener(drop_hold: Duration) -> (Running, Arc<FakeDialer>) {
+        listener_with(drop_hold, Duration::from_secs(30)).await
+    }
+
+    async fn listener_with(
+        drop_hold: Duration,
+        handshake_timeout: Duration,
+    ) -> (Running, Arc<FakeDialer>) {
         let echo = echo_server().await;
         let dialer = FakeDialer::new(echo, None);
         let opts = ListenerOpts {
             kind: ListenerKind::Socks5,
             drop_hold,
+            handshake_timeout,
             ..ListenerOpts::default()
         };
         let running = Socks5Listener::bind("127.0.0.1:0".parse().unwrap(), dialer.clone(), opts)
@@ -286,6 +311,36 @@ mod tests {
         req.extend_from_slice(&7u16.to_be_bytes());
         s.write_all(&req).await.unwrap();
         assert_eq!(read_reply(&mut s).await[1], REP_COMMAND_NOT_SUPPORTED);
+    }
+
+    /// An empty ATYP=0x03 name has nothing to dial: answer 0x01 and stop.
+    #[tokio::test]
+    async fn an_empty_domain_name_is_answered_without_dialing() {
+        let (running, dialer) = listener(Duration::from_secs(30)).await;
+        let mut s = negotiate(running.local_addr).await;
+        let mut req = vec![VERSION, CMD_CONNECT, 0, ATYP_DOMAIN, 0];
+        req.extend_from_slice(&80u16.to_be_bytes());
+        s.write_all(&req).await.unwrap();
+        assert_eq!(read_reply(&mut s).await[1], REP_GENERAL_FAILURE);
+        assert!(dialer.sessions().is_empty(), "no dial for an empty name");
+    }
+
+    /// A client that connects and then stalls must be cut loose by
+    /// `handshake_timeout`, not held until it disconnects.
+    #[tokio::test]
+    async fn stalled_handshakes_time_out() {
+        let (running, _dialer) =
+            listener_with(Duration::from_secs(30), Duration::from_millis(200)).await;
+        for partial in [&[][..], &[VERSION][..]] {
+            let mut s = TcpStream::connect(running.local_addr).await.unwrap();
+            s.write_all(partial).await.unwrap();
+            let mut buf = [0u8; 16];
+            let n = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("{partial:?} was not timed out by the listener"))
+                .unwrap();
+            assert_eq!(n, 0, "a timed-out handshake gets no reply");
+        }
     }
 
     #[tokio::test]

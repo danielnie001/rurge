@@ -6,11 +6,13 @@ use crate::responses::{self, ResponseBody};
 use crate::session::{Counting, DialError, Dialer, FailKind, SessionHandle, SessionOutcome};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, header};
+use http::{
+    HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, header,
+};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use rurge_config::HostName;
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::{ListenerKind, SessionInfo, Transport};
@@ -72,12 +74,16 @@ impl HttpListener {
 }
 
 async fn serve_connection(stream: TcpStream, ctx: Arc<Ctx>) {
+    let handshake_timeout = ctx.opts.handshake_timeout;
     let service = service_fn(move |req: Request<Incoming>| {
         let ctx = ctx.clone();
         async move { handle(req, ctx).await }
     });
     let conn = hyper::server::conn::http1::Builder::new()
         .preserve_header_case(true)
+        // hyper only enforces `header_read_timeout` when a timer is installed.
+        .timer(TokioTimer::new())
+        .header_read_timeout(handshake_timeout)
         .serve_connection(TokioIo::new(stream), service)
         .with_upgrades();
     if let Err(e) = conn.await {
@@ -85,16 +91,23 @@ async fn serve_connection(stream: TcpStream, ctx: Arc<Ctx>) {
     }
 }
 
+/// Length-independent equality that does not stop at the first difference, so
+/// a wrong password cannot be recovered from the time the comparison takes.
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 pub(crate) fn authorized(auth: &HttpAuth, header: Option<&HeaderValue>) -> bool {
     let Some(value) = header.and_then(|h| h.to_str().ok()) else {
         return false;
     };
-    let Some(encoded) = value
-        .strip_prefix("Basic ")
-        .or_else(|| value.strip_prefix("basic "))
-    else {
+    // RFC 7235 §2.1: the auth scheme is case-insensitive.
+    let Some((scheme, encoded)) = value.split_once(' ') else {
         return false;
     };
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return false;
+    }
     let Ok(decoded) = BASE64.decode(encoded.trim()) else {
         return false;
     };
@@ -103,11 +116,11 @@ pub(crate) fn authorized(auth: &HttpAuth, header: Option<&HeaderValue>) -> bool 
     };
     let (user, password) = text.split_once(':').unwrap_or(("", text));
     match auth {
-        HttpAuth::Password(p) => password == p,
+        HttpAuth::Password(p) => ct_eq(password.as_bytes(), p.as_bytes()),
         HttpAuth::UserPass {
             user: u,
             password: p,
-        } => user == u && password == p,
+        } => ct_eq(user.as_bytes(), u.as_bytes()) & ct_eq(password.as_bytes(), p.as_bytes()),
     }
 }
 
@@ -148,7 +161,10 @@ async fn connect(
         return Ok(responses::bad_request("CONNECT needs host:port"));
     };
     let host = HostName::parse(authority.host());
-    let port = authority.port_u16().unwrap_or(443);
+    // RFC 7231 §4.3.6: the CONNECT target is always host:port, never a bare host.
+    let Some(port) = authority.port_u16() else {
+        return Ok(responses::bad_request("CONNECT needs host:port"));
+    };
     let session = session_for(&ctx, host, port);
     match ctx.dialer.dial(session).await {
         Ok(dialed) => {
@@ -178,24 +194,64 @@ async fn connect(
     }
 }
 
+/// Connection-specific headers a proxy must not pass on (RFC 7230 §6.1),
+/// plus the two `Proxy-*` headers that belong to this hop only.
+const HOP_BY_HOP: [HeaderName; 9] = [
+    header::CONNECTION,
+    HeaderName::from_static("keep-alive"),
+    HeaderName::from_static("proxy-connection"),
+    header::TE,
+    header::TRAILER,
+    header::TRANSFER_ENCODING,
+    header::UPGRADE,
+    header::PROXY_AUTHENTICATE,
+    header::PROXY_AUTHORIZATION,
+];
+
+/// The authority without any `user:password@` prefix (RFC 7230 §5.4 forbids
+/// userinfo in `Host`, and it must never reach a log or the session record).
+pub(crate) fn host_port(authority: &http::uri::Authority) -> String {
+    match authority.port_u16() {
+        Some(p) => format!("{}:{p}", authority.host()),
+        None => authority.host().to_string(),
+    }
+}
+
+/// Removes every hop-by-hop header, including the ones `Connection` names.
+/// hyper re-frames the body itself, so dropping `Transfer-Encoding` is safe.
+pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) {
+    let listed: Vec<HeaderName> = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|t| HeaderName::try_from(t.trim()).ok())
+        .collect();
+    for name in listed {
+        headers.remove(name);
+    }
+    for name in HOP_BY_HOP {
+        headers.remove(name);
+    }
+}
+
 /// Rewrites a proxy request into the form the origin expects: origin-form
-/// URI, a `Host` header, and no proxy-only headers.
+/// URI, a `Host` header matching the request target, and no hop-by-hop headers.
 pub(crate) fn origin_form(req: &mut Request<Incoming>) -> Result<(), http::Error> {
-    let authority = req.uri().authority().map(|a| a.to_string());
+    let authority = req.uri().authority().map(host_port);
     let path = req
         .uri()
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
     *req.uri_mut() = path.parse::<Uri>()?;
-    if !req.headers().contains_key(header::HOST)
-        && let Some(a) = authority
+    strip_hop_by_hop(req.headers_mut());
+    // RFC 7230 §5.4: the request target wins over whatever `Host` the client sent.
+    if let Some(a) = authority
         && let Ok(v) = HeaderValue::from_str(&a)
     {
         req.headers_mut().insert(header::HOST, v);
     }
-    req.headers_mut().remove(header::PROXY_AUTHORIZATION);
-    req.headers_mut().remove("proxy-connection");
     Ok(())
 }
 
@@ -228,11 +284,24 @@ async fn forward(
     let Some(authority) = req.uri().authority().cloned() else {
         return Ok(responses::bad_request("absolute URI without a host"));
     };
+    // TLS is tunnelled with CONNECT; anything else is not ours to forward (M5).
+    if req.uri().scheme() != Some(&http::uri::Scheme::HTTP) {
+        return Ok(responses::bad_request(
+            "only http:// absolute URIs can be forwarded",
+        ));
+    }
     let host = HostName::parse(authority.host());
     let port = authority.port_u16().unwrap_or(80);
     let mut session = session_for(&ctx, host, port);
     session.protocol = Some(ProtocolKind::Http);
-    session.url = Some(req.uri().to_string());
+    session.url = Some(format!(
+        "http://{}{}",
+        host_port(&authority),
+        req.uri()
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/")
+    ));
     session.http_host = Some(authority.host().to_ascii_lowercase());
     session.user_agent = req
         .headers()
@@ -311,7 +380,10 @@ async fn forward(
         return Ok(responses::bad_request("malformed request URI"));
     }
     match sender.send_request(req).await {
-        Ok(resp) => Ok(resp.map(|body| body.boxed())),
+        Ok(mut resp) => {
+            strip_hop_by_hop(resp.headers_mut());
+            Ok(resp.map(|body| body.boxed()))
+        }
         Err(e) => {
             handle.finish(SessionOutcome::Failed(format!(
                 "upstream request failed: {e}"
@@ -511,28 +583,106 @@ mod tests {
             Some(&HeaderValue::from_str(&format!("Basic {}", BASE64.encode("x:p"))).unwrap())
         ));
         assert!(!authorized(&auth, None));
+        // RFC 7235 §2.1: the scheme token is case-insensitive
+        for scheme in ["Basic", "basic", "BASIC", "bAsIc"] {
+            assert!(
+                authorized(
+                    &auth,
+                    Some(
+                        &HeaderValue::from_str(&format!("{scheme} {}", BASE64.encode("u:p")))
+                            .unwrap()
+                    )
+                ),
+                "{scheme}"
+            );
+        }
+        assert!(!authorized(
+            &auth,
+            Some(&HeaderValue::from_str(&format!("Bearer {}", BASE64.encode("u:p"))).unwrap())
+        ));
+    }
+
+    #[test]
+    fn constant_time_compare_matches_plain_equality() {
+        assert!(ct_eq(b"s3cret", b"s3cret"));
+        assert!(!ct_eq(b"s3cret", b"s3crey"));
+        assert!(!ct_eq(b"s3cret", b"s3cre"));
+        assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn hop_by_hop_headers_and_the_tokens_connection_names_are_dropped() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("connection", HeaderValue::from_static("keep-alive, X-Hop"));
+        headers.insert("x-hop", HeaderValue::from_static("leaked"));
+        headers.insert("keep-alive", HeaderValue::from_static("timeout=5"));
+        headers.insert("te", HeaderValue::from_static("trailers"));
+        headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        headers.insert("upgrade", HeaderValue::from_static("websocket"));
+        headers.insert("proxy-connection", HeaderValue::from_static("keep-alive"));
+        headers.insert("x-keep", HeaderValue::from_static("kept"));
+        strip_hop_by_hop(&mut headers);
+        assert_eq!(
+            headers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+            vec!["x-keep"]
+        );
     }
 
     #[tokio::test]
     async fn non_proxy_requests_get_400() {
         let (running, _dialer) = listener(ListenerOpts::default()).await;
-        let (_s, head) = raw(
-            running.local_addr,
+        for request in [
+            // origin-form: not a proxy request at all
             "GET /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        )
+            // a scheme this listener cannot forward in the clear (M5)
+            "GET https://target.test/x HTTP/1.1\r\nHost: target.test\r\n\r\n",
+            "GET ftp://target.test/x HTTP/1.1\r\nHost: target.test\r\n\r\n",
+            // CONNECT without a port (M6)
+            "CONNECT echo.test HTTP/1.1\r\nHost: echo.test\r\n\r\n",
+        ] {
+            let (_s, head) = raw(running.local_addr, request).await;
+            assert!(head.starts_with("HTTP/1.1 400"), "{request:?} → {head}");
+        }
+    }
+
+    /// A client that connects and then stalls must be cut loose by
+    /// `handshake_timeout`, not held until it disconnects.
+    #[tokio::test]
+    async fn stalled_http_handshakes_time_out() {
+        let (running, _dialer) = listener(ListenerOpts {
+            handshake_timeout: Duration::from_millis(200),
+            ..ListenerOpts::default()
+        })
         .await;
-        assert!(head.starts_with("HTTP/1.1 400"), "{head}");
+        for partial in ["", "GET http://a.test/ HTTP/1.1\r\nHost: a"] {
+            let mut s = TcpStream::connect(running.local_addr).await.unwrap();
+            s.write_all(partial.as_bytes()).await.unwrap();
+            let mut buf = [0u8; 256];
+            // hyper may answer 408 before closing; either way the socket ends.
+            loop {
+                let read = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf))
+                    .await
+                    .unwrap_or_else(|_| panic!("{partial:?} was not timed out by the listener"));
+                if !matches!(read, Ok(n) if n > 0) {
+                    break;
+                }
+            }
+        }
     }
 
     #[tokio::test]
     async fn plain_requests_are_forwarded_per_request_with_rewritten_headers() {
         let (running, dialer, target) = listener_with_target(ListenerOpts::default()).await;
         target.set("/hello", "hi there");
+        // a hop-by-hop header the origin puts on the response must not come back out
+        target.set_header("/hello", "connection", "X-Down");
+        target.set_header("/hello", "x-down", "leaked");
         let port = target.url("/").port().unwrap();
         let mut s = TcpStream::connect(running.local_addr).await.unwrap();
+        // userinfo in the request target, a lying Host, and a pile of hop-by-hop headers
         s.write_all(
             format!(
-                "GET http://target.test:{port}/hello HTTP/1.1\r\nHost: target.test:{port}\r\nUser-Agent: t/1\r\nProxy-Authorization: Basic eDp5\r\nProxy-Connection: keep-alive\r\n\r\n"
+                "GET http://u:p@target.test:{port}/hello HTTP/1.1\r\nHost: evil.internal\r\nUser-Agent: t/1\r\nProxy-Authorization: Basic eDp5\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive, X-Hop\r\nX-Hop: leaked\r\nKeep-Alive: timeout=5\r\nTE: trailers\r\n\r\n"
             )
             .as_bytes(),
         )
@@ -541,13 +691,29 @@ mod tests {
         let (head, body) = read_response(&mut s).await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         assert_eq!(body, b"hi there");
+        let lower = head.to_ascii_lowercase();
+        assert!(
+            !lower.contains("x-down") && !lower.contains("\r\nconnection:"),
+            "response hop-by-hop headers survived: {head}"
+        );
         let reqs = target.requests();
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].path, "/hello");
-        assert!(
-            reqs[0].header("proxy-authorization").is_none()
-                && reqs[0].header("proxy-connection").is_none()
+        // RFC 7230 §5.4: Host comes from the request target, userinfo stripped
+        assert_eq!(
+            reqs[0].header("host"),
+            Some(format!("target.test:{port}").as_str())
         );
+        for gone in [
+            "proxy-authorization",
+            "proxy-connection",
+            "connection",
+            "x-hop",
+            "keep-alive",
+            "te",
+        ] {
+            assert!(reqs[0].header(gone).is_none(), "{gone} was forwarded");
+        }
         assert_eq!(reqs[0].header("user-agent"), Some("t/1"));
         // second request on the same client connection hits a different rule (tinygif)
         s.write_all(b"GET http://reject.test:446/ad.gif HTTP/1.1\r\nHost: reject.test\r\n\r\n")
@@ -571,6 +737,7 @@ mod tests {
             (first.protocol, first.dst_port),
             (Some(ProtocolKind::Http), port)
         );
+        // the recorded URL is rebuilt without the `u:p@` the client sent (M11)
         assert_eq!(
             first.url.as_deref(),
             Some(format!("http://target.test:{port}/hello").as_str())

@@ -30,6 +30,9 @@ pub struct ListenerOpts {
     pub show_error_page_for_reject: bool,
     /// How long REJECT-DROP keeps a connection open without answering.
     pub drop_hold: Duration,
+    /// Upper bound on reading the HTTP request head / completing the SOCKS5
+    /// handshake. Dialing and relaying are not covered by it.
+    pub handshake_timeout: Duration,
 }
 
 impl Default for ListenerOpts {
@@ -41,11 +44,14 @@ impl Default for ListenerOpts {
             show_error_page: true,
             show_error_page_for_reject: false,
             drop_hold: Duration::from_secs(30),
+            handshake_timeout: Duration::from_secs(30),
         }
     }
 }
 
-/// A bound listener; dropping it stops accepting (live sessions finish on their own).
+/// A bound listener; dropping it aborts the accept loop and every session it
+/// spawned. CONNECT tunnels (spawned by hyper's upgrade path) are not tracked
+/// and finish on their own — unified in M3b's graceful shutdown.
 pub struct Running {
     pub local_addr: SocketAddr,
     task: JoinHandle<()>,
@@ -59,6 +65,29 @@ impl Drop for Running {
 
 const REJECTED_SOURCE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+/// Upper bound on the rejected-source table so a spoofed-source flood cannot
+/// grow it without limit.
+const MAX_WARNED_SOURCES: usize = 1024;
+
+/// Records that `source` was warned about at `now` and answers whether the
+/// warning is due. Full tables are swept of stale entries first; if that frees
+/// nothing the source is not remembered but is still warned about once.
+fn warn_due(map: &mut HashMap<IpAddr, Instant>, source: IpAddr, now: Instant) -> bool {
+    let due = map
+        .get(&source)
+        .is_none_or(|t| now.duration_since(*t) >= REJECTED_SOURCE_LOG_INTERVAL);
+    if !due {
+        return false;
+    }
+    if map.len() >= MAX_WARNED_SOURCES && !map.contains_key(&source) {
+        map.retain(|_, t| now.duration_since(*t) < REJECTED_SOURCE_LOG_INTERVAL);
+        if map.len() >= MAX_WARNED_SOURCES {
+            return true;
+        }
+    }
+    map.insert(source, now);
+    true
+}
 
 pub(crate) fn serve<F, Fut>(
     listener: TcpListener,
@@ -83,10 +112,7 @@ where
                     Ok((stream, peer)) => {
                         if restrict_to_lan && !source_allowed(local_addr, peer.ip()) {
                             let mut map = warned.lock().expect("warned sources");
-                            let now = Instant::now();
-                            let due = map.get(&peer.ip()).is_none_or(|t| now.duration_since(*t) >= REJECTED_SOURCE_LOG_INTERVAL);
-                            if due {
-                                map.insert(peer.ip(), now);
+                            if warn_due(&mut map, peer.ip(), Instant::now()) {
                                 tracing::warn!(listener = name, source = %peer.ip(), "connection refused: source is not on the LAN (proxy-restricted-to-lan)");
                             }
                             drop(stream);
@@ -116,4 +142,33 @@ where
 
 pub(crate) async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
     TcpListener::bind(addr).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn ip(n: u32) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::from(n))
+    }
+
+    #[test]
+    fn warned_sources_are_rate_limited_and_bounded() {
+        let mut map = HashMap::new();
+        let t0 = Instant::now();
+        assert!(warn_due(&mut map, ip(1), t0), "first warning is due");
+        assert!(!warn_due(&mut map, ip(1), t0), "repeat within the interval");
+        assert!(warn_due(&mut map, ip(1), t0 + REJECTED_SOURCE_LOG_INTERVAL));
+        // a flood of fresh sources warns every time but never grows past the cap
+        let t1 = t0 + REJECTED_SOURCE_LOG_INTERVAL;
+        for n in 0..(MAX_WARNED_SOURCES as u32 + 50) {
+            assert!(warn_due(&mut map, ip(1000 + n), t1));
+        }
+        assert!(map.len() <= MAX_WARNED_SOURCES, "{}", map.len());
+        // once the flood ages out the table is swept instead of staying full
+        let t2 = t1 + REJECTED_SOURCE_LOG_INTERVAL;
+        assert!(warn_due(&mut map, ip(7), t2));
+        assert_eq!(map.len(), 1);
+    }
 }
