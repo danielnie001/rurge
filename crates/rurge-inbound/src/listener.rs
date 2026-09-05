@@ -60,7 +60,6 @@ impl Drop for Running {
 const REJECTED_SOURCE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
-#[allow(dead_code)] // no caller until Task 5 wires an HTTP/SOCKS5 listener onto this
 pub(crate) fn serve<F, Fut>(
     listener: TcpListener,
     name: &'static str,
@@ -115,7 +114,6 @@ where
     Running { local_addr, task }
 }
 
-#[allow(dead_code)] // no caller until Task 5 wires an HTTP/SOCKS5 listener onto this
 pub(crate) async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
     TcpListener::bind(addr).await
 }

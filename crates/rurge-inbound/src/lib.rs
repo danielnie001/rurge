@@ -7,8 +7,10 @@ pub mod listener;
 pub mod responses;
 pub mod restrict;
 pub mod session;
+pub mod socks5;
 #[cfg(test)]
 pub(crate) mod testing;
 
 pub use listener::{HttpAuth, ListenerOpts, Running};
 pub use session::{Counting, DialError, Dialed, Dialer, FailKind, SessionHandle, SessionOutcome};
+pub use socks5::Socks5Listener;

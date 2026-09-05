@@ -34,7 +34,6 @@ impl FakeDialer {
         })
     }
 
-    #[allow(dead_code)] // no caller until Task 5 wires a listener test onto this
     pub(crate) fn sessions(&self) -> Vec<Arc<SessionHandle>> {
         self.handles.lock().unwrap().clone()
     }
@@ -144,7 +143,6 @@ impl Dialer for FakeDialer {
 }
 
 /// A TCP echo server on the loopback.
-#[allow(dead_code)] // no caller until Task 5 wires a listener test onto this
 pub(crate) async fn echo_server() -> SocketAddr {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
