@@ -181,8 +181,10 @@ impl Engine {
         handle.on_finish(move |h, outcome| {
             log_session(h, outcome);
             if let Some(o) = observe.upgrade() {
-                o.log.record_finished(h, outcome);
+                // Traffic first: a reader that sees the finished record in
+                // `log` next must already find its bytes in `traffic.totals()`.
                 o.traffic.record(h);
+                o.log.record_finished(h, outcome);
             }
         });
         self.observe.log.mark_active(&handle);

@@ -1,7 +1,7 @@
 //! SOCKS5 (RFC 1928) listener: no authentication, CONNECT only (M3 design §6.3).
 
 use crate::listener::{ListenerOpts, Running, bind, serve};
-use crate::session::{DialError, Dialer, FailKind};
+use crate::session::{DialError, Dialer, FailKind, SessionOutcome};
 use rurge_config::HostName;
 use rurge_config::session::{ListenerKind, SessionInfo, Transport};
 use rurge_proto::RejectKind;
@@ -158,7 +158,15 @@ async fn handle(
 
     match dialer.dial(session).await {
         Ok(dialed) => {
-            stream.write_all(&reply(REP_SUCCESS)).await?;
+            if let Err(e) = stream.write_all(&reply(REP_SUCCESS)).await {
+                // The client is gone before `relay` ever starts, so nothing
+                // else will finish this handle; do it here or it stays
+                // listed as active (and killable-but-dead) forever.
+                dialed.handle.finish(SessionOutcome::Failed(format!(
+                    "client went away before the reply: {e}"
+                )));
+                return Err(e);
+            }
             dialer
                 .relay(Box::new(stream), dialed.stream, dialed.handle)
                 .await;

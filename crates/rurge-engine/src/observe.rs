@@ -8,7 +8,7 @@ use rurge_inbound::{SessionHandle, SessionOutcome};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// How a request stands: still running, or how it ended.
@@ -85,7 +85,11 @@ fn record_of(h: &SessionHandle, outcome: Option<&SessionOutcome>) -> RequestReco
 /// A bounded ring of finished requests plus an index of the in-flight ones.
 pub struct RequestLog {
     capacity: usize,
-    active: Mutex<BTreeMap<u64, Arc<SessionHandle>>>,
+    /// `Weak`, not `Arc`: a session whose handle gets dropped without ever
+    /// calling `finish` (a bug elsewhere, e.g. a listener returning early past
+    /// a successful dial) must not stay listed here forever. Every read
+    /// prunes entries whose `Weak` no longer upgrades (see `prune_and_lock`).
+    active: Mutex<BTreeMap<u64, Weak<SessionHandle>>>,
     finished: Mutex<VecDeque<RequestRecord>>,
 }
 
@@ -104,7 +108,15 @@ impl RequestLog {
         self.active
             .lock()
             .expect("active index")
-            .insert(handle.id(), handle.clone());
+            .insert(handle.id(), Arc::downgrade(handle));
+    }
+
+    /// Locks the active index and drops entries whose handle was already
+    /// dropped without going through `record_finished` — see the field doc.
+    fn prune_and_lock(&self) -> MutexGuard<'_, BTreeMap<u64, Weak<SessionHandle>>> {
+        let mut map = self.active.lock().expect("active index");
+        map.retain(|_, w| w.upgrade().is_some());
+        map
     }
 
     /// Moves a session from the active index into the finished ring.
@@ -135,21 +147,19 @@ impl RequestLog {
 
     /// In-flight requests (bytes are live), newest first.
     pub fn active(&self) -> Vec<RequestRecord> {
-        self.active
-            .lock()
-            .expect("active index")
+        self.prune_and_lock()
             .values()
             .rev()
-            .map(|h| record_of(h, None))
+            .filter_map(Weak::upgrade)
+            .map(|h| record_of(&h, None))
             .collect()
     }
 
     /// Total bytes moved by the in-flight requests so far.
     pub fn active_bytes(&self) -> (u64, u64) {
-        self.active
-            .lock()
-            .expect("active index")
+        self.prune_and_lock()
             .values()
+            .filter_map(Weak::upgrade)
             .fold((0, 0), |(u, d), h| {
                 let (hu, hd) = h.bytes();
                 (u + hu, d + hd)
@@ -158,7 +168,7 @@ impl RequestLog {
 
     /// Kills an in-flight session by id; false if it is not active.
     pub fn kill(&self, id: u64) -> bool {
-        match self.active.lock().expect("active index").get(&id) {
+        match self.prune_and_lock().get(&id).and_then(Weak::upgrade) {
             Some(h) => {
                 h.kill();
                 true
@@ -371,6 +381,22 @@ mod tests {
         assert!(log.kill(7));
         assert!(a.token().is_cancelled());
         assert!(!log.kill(999));
+    }
+
+    /// A handle dropped without ever calling `finish` (a bug elsewhere, e.g.
+    /// an early return past a successful dial) must not stay listed forever:
+    /// the active index holds it `Weak`, so once the last `Arc` is gone the
+    /// entry is pruned on the next read.
+    #[test]
+    fn dropped_handles_leave_the_active_index() {
+        let log = RequestLog::new(4);
+        let a = handle(1, "drop.test");
+        log.mark_active(&a);
+        assert_eq!(log.active().len(), 1);
+        drop(a);
+        assert!(log.active().is_empty());
+        assert_eq!(log.active_bytes(), (0, 0));
+        assert!(!log.kill(1));
     }
 
     #[test]
