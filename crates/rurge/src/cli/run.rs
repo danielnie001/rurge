@@ -24,8 +24,6 @@ use tracing_subscriber::util::SubscriberInitExt;
 const GRACE: Duration = Duration::from_secs(5);
 /// A burst of `--watch` file events inside this window collapses into one reload.
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
-/// How long a reload waits for an old listener's socket to close before rebinding.
-const REBIND_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Args)]
 pub struct RunArgs {
@@ -203,28 +201,24 @@ async fn reload(
         }
     };
     print_diagnostics(next.diagnostics());
-    if engine.swap_runtime(next) {
-        // The listen addresses changed. Stop the old accept loops, wait until
-        // their sockets are closed (so the addresses can be bound again;
-        // Windows sets no `SO_REUSEADDR`), then let their in-flight sessions
-        // drain in the background — dropping the old `Running`s would abort them.
-        let olds: Vec<Running> = listeners.drain(..).map(|(_, r)| r).collect();
-        for old in &olds {
-            old.stop();
-        }
-        for old in &olds {
-            let _ = tokio::time::timeout(REBIND_WAIT, old.wait_closed()).await;
-        }
-        for old in olds {
-            tokio::spawn(old.join());
-        }
-        match engine.bind_listeners().await {
+    let surface_changed = engine.swap_runtime(next);
+    // An empty list is the degraded state a failed rebind leaves behind: try
+    // again even when the listener surface is unchanged, so freeing the
+    // conflicting port and reloading the same profile brings the daemon back.
+    if surface_changed || listeners.is_empty() {
+        match engine.rebind_listeners(std::mem::take(listeners)).await {
             Ok(next_listeners) => {
                 *listeners = next_listeners;
                 print_listening(listeners);
             }
             Err(e) => {
-                eprintln!("error: reload could not rebind listeners: {e}");
+                tracing::error!(
+                    error = %e,
+                    "reload could not rebind listeners; the daemon has no listeners until the next successful reload"
+                );
+                eprintln!(
+                    "error: reload could not rebind listeners: {e}; the daemon has no listeners until the next successful reload"
+                );
                 return;
             }
         }
@@ -320,6 +314,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             }
         };
         print_listening(&listeners);
+        // The one startup line that also reaches `--log-file` (the per-listener
+        // "listening" records are DEBUG; stdout gets the lines above).
+        tracing::info!(policies, rules, mode = %mode_name(&outbound_mode), "rurge running");
         println!(
             "rurge {} running: {policies} policies, {rules} rules, outbound mode {}",
             env!("CARGO_PKG_VERSION"),
@@ -397,6 +394,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             }
         }
 
+        #[cfg(unix)]
+        println!("shutting down (Ctrl-C or SIGTERM again to exit now)");
+        #[cfg(not(unix))]
         println!("shutting down (Ctrl-C again to exit now)");
         engine.stop_accepting();
         engine.tracker().close();
@@ -408,9 +408,26 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             engine.tracker().wait().await;
         };
         tokio::pin!(drain);
+        // The same long-lived streams the main loop used: a fresh
+        // `signal::ctrl_c()` here would miss a signal delivered before its
+        // first poll, and under systemd SIGTERM must be able to force the exit
+        // it started.
+        let force_exit = async {
+            #[cfg(unix)]
+            {
+                tokio::select! {
+                    _ = interrupt.recv() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = interrupt.recv().await;
+            }
+        };
         tokio::select! {
             _ = &mut drain => {}
-            _ = tokio::signal::ctrl_c() => {
+            _ = force_exit => {
                 println!("forced shutdown");
                 return Ok(ExitCode::SUCCESS);
             }

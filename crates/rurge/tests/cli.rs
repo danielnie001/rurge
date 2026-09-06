@@ -890,19 +890,22 @@ mod run {
         })
         .await
         .unwrap();
-        // give the non-blocking appender a moment, then check the dir has a file.
-        // Windows note: `DirEntry::metadata()` reuses the `FindNextFileW` snapshot
-        // taken when the directory was enumerated, so its cached size never grows
-        // while `rurge run` still holds the file open for writing; a fresh
-        // `std::fs::metadata(path)` by-path stat does reflect the live size.
+        // Poll the rotated file for the one INFO line the daemon writes at
+        // startup: `loglevel = notify` maps to INFO, and the per-listener
+        // "listening" records are DEBUG, so this is what proves the file layer
+        // is wired up rather than merely created.
+        // Windows note: `DirEntry::metadata()` reuses the `FindNextFileW`
+        // snapshot taken when the directory was enumerated, so its cached size
+        // never grows while `rurge run` still holds the file open for writing;
+        // reading by path does see the live content.
         let ok = tokio::task::spawn_blocking(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
                 if let Ok(rd) = std::fs::read_dir(&logdir)
                     && rd.filter_map(|e| e.ok()).any(|e| {
                         e.file_name().to_string_lossy().starts_with("rurge.log")
-                            && std::fs::metadata(e.path())
-                                .map(|m| m.len() > 0)
+                            && std::fs::read_to_string(e.path())
+                                .map(|t| t.contains("rurge running"))
                                 .unwrap_or(false)
                     })
                 {
@@ -917,7 +920,7 @@ mod run {
         .await
         .unwrap();
         drop(daemon);
-        assert!(ok, "no non-empty rurge.log* file was written");
+        assert!(ok, "no rurge.log* file carried the startup INFO line");
     }
 
     #[test]

@@ -178,14 +178,24 @@ async fn connect(
             let upgrade = hyper::upgrade::on(&mut req);
             let dialer = ctx.dialer.clone();
             ctx.tracker.spawn(async move {
-                match upgrade.await {
-                    Ok(upgraded) => {
-                        let client: BoxedStream = Box::new(TokioIo::new(upgraded));
-                        dialer.relay(client, dialed.stream, dialed.handle).await;
+                // The tunnel runs on the engine's tracker, outside the accept
+                // loop's `JoinSet` and therefore outside its panic handler
+                // (design §6.4); an inner task restores the ERROR log.
+                let inner = tokio::spawn(async move {
+                    match upgrade.await {
+                        Ok(upgraded) => {
+                            let client: BoxedStream = Box::new(TokioIo::new(upgraded));
+                            dialer.relay(client, dialed.stream, dialed.handle).await;
+                        }
+                        Err(e) => dialed
+                            .handle
+                            .finish(SessionOutcome::Failed(format!("upgrade failed: {e}"))),
                     }
-                    Err(e) => dialed
-                        .handle
-                        .finish(SessionOutcome::Failed(format!("upgrade failed: {e}"))),
+                });
+                if let Err(e) = inner.await
+                    && e.is_panic()
+                {
+                    tracing::error!(listener = "http", "tunnel task panicked: {e}");
                 }
             });
             Ok(responses::connect_established())
@@ -387,19 +397,44 @@ async fn forward(
     };
     let conn_handle = handle.clone();
     ctx.tracker.spawn(async move {
-        if let Err(e) = conn.await {
-            conn_handle.finish(SessionOutcome::Failed(format!(
-                "upstream connection error: {e}"
-            )));
-        } else {
-            conn_handle.finish(SessionOutcome::Completed);
+        // Inner task: this driver is tracked by the engine, not by the accept
+        // loop's `JoinSet`, so its panics would otherwise go unreported.
+        let inner = tokio::spawn(async move {
+            // Race the session token: `kill` and the graceful shutdown's
+            // `cancel_sessions` end the exchange by dropping the connection,
+            // which is what makes a streaming `http://` response killable.
+            let outcome = tokio::select! {
+                biased;
+                _ = conn_handle.token().cancelled() => cancelled_outcome(&conn_handle),
+                res = conn => match res {
+                    Ok(()) => SessionOutcome::Completed,
+                    Err(e) => SessionOutcome::Failed(format!("upstream connection error: {e}")),
+                },
+            };
+            conn_handle.finish(outcome);
+        });
+        if let Err(e) = inner.await
+            && e.is_panic()
+        {
+            tracing::error!(listener = "http", "upstream connection task panicked: {e}");
         }
     });
     if let Err(e) = origin_form(&mut req) {
         handle.finish(SessionOutcome::Failed(format!("bad request uri: {e}")));
         return Ok(responses::bad_request("malformed request URI"));
     }
-    match sender.send_request(req).await {
+    // `biased`: once the token is cancelled the answer is always "closed by
+    // policy", never the error page the dropped upstream connection would
+    // otherwise produce.
+    let sent = tokio::select! {
+        biased;
+        _ = handle.token().cancelled() => {
+            handle.finish(cancelled_outcome(&handle));
+            return Err(HandlerError::Close);
+        }
+        res = sender.send_request(req) => res,
+    };
+    match sent {
         Ok(mut resp) => {
             strip_hop_by_hop(resp.headers_mut());
             Ok(resp.map(|body| body.boxed()))
@@ -410,6 +445,16 @@ async fn forward(
             )));
             failure_response(&ctx, &handle, &format!("Upstream request failed: {e}"))
         }
+    }
+}
+
+/// How a session the cancellation token ended is recorded: an operator `kill`
+/// is a failure, the graceful shutdown's `cancel_sessions` is not.
+fn cancelled_outcome(handle: &SessionHandle) -> SessionOutcome {
+    if handle.was_killed() {
+        SessionOutcome::Failed("killed".to_string())
+    } else {
+        SessionOutcome::Completed
     }
 }
 
@@ -851,6 +896,65 @@ mod tests {
         assert!(
             head.is_empty(),
             "failure must close when pages are off: {head}"
+        );
+    }
+
+    /// A plain `http://` exchange is a session like any other: `kill` has to
+    /// end it, not report success and leave it running. The target here reads
+    /// the request and never answers, which is the shape of the session an
+    /// operator actually wants to kill (an endless download or SSE stream).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plain_forward_session_is_killable() {
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+        let (got_tx, got_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut got_tx = Some(got_tx);
+            // Hold every accepted connection open and never write back.
+            let mut held = Vec::new();
+            while let Ok((mut s, _)) = silent.accept().await {
+                if let Some(tx) = got_tx.take() {
+                    let mut buf = [0u8; 1024];
+                    let _ = s.read(&mut buf).await;
+                    let _ = tx.send(());
+                }
+                held.push(s);
+            }
+        });
+        let echo = echo_server().await;
+        let dialer = FakeDialer::new(echo, Some(silent_addr));
+        let running = HttpListener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            dialer.clone(),
+            ListenerOpts::default(),
+            CancellationToken::new(),
+            TaskTracker::new(),
+        )
+        .await
+        .unwrap();
+
+        let mut s = TcpStream::connect(running.local_addr).await.unwrap();
+        s.write_all(b"GET http://target.test/hang HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        // the request reached the target, so `send_request` is in flight
+        tokio::time::timeout(Duration::from_secs(3), got_rx)
+            .await
+            .expect("the target never saw the forwarded request")
+            .unwrap();
+        let handle = dialer.sessions().pop().expect("a forwarded session");
+        handle.kill();
+
+        // the client connection ends rather than hanging or getting a 502
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf))
+            .await
+            .expect("the killed session did not close the client connection")
+            .unwrap();
+        assert_eq!(n, 0, "{:?}", String::from_utf8_lossy(&buf[..n]));
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed("killed".into()))
         );
     }
 }
