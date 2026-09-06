@@ -746,6 +746,232 @@ async fn reload_swaps_rules_without_changing_listeners() {
     assert!(h.engine.swap_runtime(next), "listen addr set changed");
 }
 
+/// A loopback port nothing listens on right now: bind `:0`, read the port,
+/// drop. Inherently a probe — another process can take it before the caller
+/// binds — so every caller retries once.
+async fn free_port() -> u16 {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    port
+}
+
+fn http_addr(listeners: &[(ListenerSpec, Running)]) -> SocketAddr {
+    listeners
+        .iter()
+        .find(|(spec, _)| spec.kind == ListenerKind::Http)
+        .map(|(_, running)| running.local_addr)
+        .expect("an HTTP listener")
+}
+
+/// One `CONNECT target.test:<target_port>` through `proxy`; returns the status
+/// code (or `""` if the proxy closed without answering). `credential` is the
+/// already-encoded `Basic` payload.
+async fn connect_status(proxy: SocketAddr, target_port: u16, credential: Option<&str>) -> String {
+    let mut s = TcpStream::connect(proxy).await.unwrap();
+    let auth = match credential {
+        Some(c) => format!("Proxy-Authorization: Basic {c}\r\n"),
+        None => String::new(),
+    };
+    let (head, _) = http_exchange(
+        &mut s,
+        &format!(
+            "CONNECT target.test:{target_port} HTTP/1.1\r\nHost: target.test:{target_port}\r\n{auth}\r\n"
+        ),
+    )
+    .await;
+    head.lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `Basic` payloads for `rurge:old` / `rurge:new`; the HTTP listener's
+/// `password@` form compares the password half only, so the user is free.
+const CRED_OLD: &str = "cnVyZ2U6b2xk";
+const CRED_NEW: &str = "cnVyZ2U6bmV3";
+
+/// A reload that only rotates the proxy password has to take effect. Comparing
+/// listen *addresses* would report "profile reloaded" while the old credential
+/// kept working and the new one did not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_with_changed_password_rebinds_and_applies_it() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let target = TestServer::spawn().await;
+    let target_port = target.url("/").port().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    // Pin both generations to the same port so the *only* difference is the
+    // password. Probing races other processes, hence the retry.
+    let mut bound = None;
+    for _ in 0..2 {
+        let port = free_port().await;
+        let runtime = build_runtime(
+            dir.path(),
+            &dns,
+            &format!("http-listen = old@127.0.0.1:{port}"),
+            "",
+            OutboundMode::Rule,
+            Duration::from_secs(600),
+        )
+        .await;
+        let engine = Engine::new(runtime);
+        if let Ok(listeners) = engine.bind_listeners().await {
+            bound = Some((engine, listeners, port));
+            break;
+        }
+    }
+    let (engine, listeners, port) = bound.expect("could not bind a probed free port twice");
+    let http = http_addr(&listeners);
+    assert_eq!(http.port(), port);
+    assert_eq!(
+        connect_status(http, target_port, Some(CRED_OLD)).await,
+        "200"
+    );
+
+    let next = build_runtime(
+        dir.path(),
+        &dns,
+        &format!("http-listen = new@127.0.0.1:{port}"),
+        "",
+        OutboundMode::Rule,
+        Duration::from_secs(600),
+    )
+    .await;
+    assert!(
+        engine.swap_runtime(next),
+        "a rotated proxy password is a listener change"
+    );
+    let listeners = engine
+        .rebind_listeners(listeners)
+        .await
+        .expect("rebind onto the same address");
+    assert_eq!(http_addr(&listeners), http);
+    assert_eq!(
+        connect_status(http, target_port, Some(CRED_OLD)).await,
+        "407"
+    );
+    assert_eq!(
+        connect_status(http, target_port, Some(CRED_NEW)).await,
+        "200"
+    );
+}
+
+/// The stop → `wait_closed` → detached `join` → bind sequence `run.rs::reload`
+/// drives: the old address must stop accepting and the new one must serve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebind_moves_the_listener_to_the_new_address() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let target = TestServer::spawn().await;
+    let target_port = target.url("/").port().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = build_runtime(
+        dir.path(),
+        &dns,
+        "",
+        "",
+        OutboundMode::Rule,
+        Duration::from_secs(600),
+    )
+    .await;
+    let engine = Engine::new(runtime);
+    let mut listeners = engine.bind_listeners().await.unwrap();
+    let old_http = http_addr(&listeners);
+    assert_eq!(connect_status(old_http, target_port, None).await, "200");
+
+    // Move the HTTP listener to a probed free port. A failed rebind leaves no
+    // listeners behind, which is exactly what the retry starts from.
+    let mut moved = None;
+    for _ in 0..2 {
+        let port = free_port().await;
+        let next = build_runtime(
+            dir.path(),
+            &dns,
+            &format!("http-listen = 127.0.0.1:{port}"),
+            "",
+            OutboundMode::Rule,
+            Duration::from_secs(600),
+        )
+        .await;
+        assert!(engine.swap_runtime(next), "the listen address changed");
+        match engine.rebind_listeners(listeners).await {
+            Ok(l) => {
+                moved = Some((l, port));
+                break;
+            }
+            Err(_) => listeners = Vec::new(),
+        }
+    }
+    let (listeners, port) = moved.expect("could not rebind onto a probed free port twice");
+
+    let refused = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(old_http)).await;
+    assert!(
+        matches!(refused, Ok(Err(_)) | Err(_)),
+        "the old address still accepts connections"
+    );
+    let http = http_addr(&listeners);
+    assert_eq!(http.port(), port);
+    assert_eq!(connect_status(http, target_port, None).await, "200");
+}
+
+/// A rebind onto a taken port fails after the old listeners are already gone,
+/// so the engine is left serving nothing — and a later rebind from that empty
+/// state (what `run.rs` forces when `listeners.is_empty()`) recovers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebind_failure_leaves_no_listeners_and_a_later_rebind_recovers() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let target = TestServer::spawn().await;
+    let target_port = target.url("/").port().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = build_runtime(
+        dir.path(),
+        &dns,
+        "",
+        "",
+        OutboundMode::Rule,
+        Duration::from_secs(600),
+    )
+    .await;
+    let engine = Engine::new(runtime);
+    let listeners = engine.bind_listeners().await.unwrap();
+
+    // The next generation wants a port this test holds itself.
+    let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let taken = squatter.local_addr().unwrap().port();
+    let next = build_runtime(
+        dir.path(),
+        &dns,
+        &format!("http-listen = 127.0.0.1:{taken}"),
+        "",
+        OutboundMode::Rule,
+        Duration::from_secs(600),
+    )
+    .await;
+    assert!(engine.swap_runtime(next), "the listen address changed");
+    // (`Running` has no `Debug`, so `expect_err` is not available here.)
+    let err = match engine.rebind_listeners(listeners).await {
+        Ok(_) => panic!("rebinding onto a port this test holds must fail"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+
+    // Degraded: nothing is listening. Free the port and rebind from empty.
+    drop(squatter);
+    let listeners = engine
+        .rebind_listeners(Vec::new())
+        .await
+        .expect("a later rebind recovers the daemon");
+    let http = http_addr(&listeners);
+    assert_eq!(http.port(), taken);
+    assert_eq!(connect_status(http, target_port, None).await, "200");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dns_upstream_follows_the_pipeline_as_an_internal_session() {
     let dns = MockDns::spawn().await;
