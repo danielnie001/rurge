@@ -1724,6 +1724,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "clap",
+ "notify",
  "predicates",
  "rurge-config",
  "rurge-dns",
@@ -1735,6 +1736,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "url",
 ]

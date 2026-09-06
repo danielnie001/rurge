@@ -640,13 +640,26 @@ mod run {
 
     /// Spawns `rurge run` and waits for both `listening on` lines.
     fn spawn_daemon(conf: &Path, data: &Path) -> Daemon {
-        let mut child = Command::new(assert_cmd::cargo::cargo_bin("rurge"))
-            .arg("run")
+        spawn_daemon_with(conf, data, false)
+    }
+
+    /// `spawn_daemon` with `--watch`, so edits to `conf` are reloaded.
+    fn spawn_daemon_watching(conf: &Path, data: &Path) -> Daemon {
+        spawn_daemon_with(conf, data, true)
+    }
+
+    fn spawn_daemon_with(conf: &Path, data: &Path, watch: bool) -> Daemon {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("rurge"));
+        cmd.arg("run")
             .arg("-c")
             .arg(conf)
             .arg("--no-network")
             .arg("--data-dir")
-            .arg(data)
+            .arg(data);
+        if watch {
+            cmd.arg("--watch");
+        }
+        let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -794,6 +807,61 @@ mod run {
             lines.iter().any(|l| l.contains("shutting down")),
             "{lines:?}"
         );
+    }
+
+    /// Both profiles listen on `127.0.0.1:0`, so the listen addresses do not
+    /// change and the ports read at startup stay valid across the reload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watch_reloads_rules_on_change() {
+        let target = TestServer::spawn().await;
+        target.set("/hello", "reloaded");
+        let tport = target.url("/").port().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("t.conf");
+        std::fs::write(
+            &conf,
+            "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nloglevel = warning\n[Rule]\nIP-CIDR,127.0.0.0/8,REJECT\nFINAL,DIRECT\n",
+        )
+        .unwrap();
+        let daemon = tokio::task::spawn_blocking({
+            let conf = conf.clone();
+            let data = dir.path().join("data");
+            move || spawn_daemon_watching(&conf, &data)
+        })
+        .await
+        .unwrap();
+        let http = daemon.http;
+        let before = tokio::task::spawn_blocking(move || {
+            http_get(http, &format!("http://127.0.0.1:{tport}/hello"))
+        })
+        .await
+        .unwrap();
+        assert!(
+            !before.contains("reloaded"),
+            "rejected before reload: {before}"
+        );
+        // allow everything; same listen addresses, so no rebind and the same port
+        std::fs::write(
+            &conf,
+            "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nloglevel = warning\n[Rule]\nFINAL,DIRECT\n",
+        )
+        .unwrap();
+        let ok = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            loop {
+                if http_get(http, &format!("http://127.0.0.1:{tport}/hello")).contains("reloaded") {
+                    return true;
+                }
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        })
+        .await
+        .unwrap();
+        drop(daemon);
+        assert!(ok, "reload did not take effect");
     }
 
     #[test]

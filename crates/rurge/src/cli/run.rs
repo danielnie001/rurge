@@ -9,16 +9,21 @@ use rurge_config::config::{LoadOptions, Platform, load};
 use rurge_config::general::LogLevel;
 use rurge_config::session::ListenerKind;
 use rurge_engine::state::{STATE_FILE, State, profile_key};
-use rurge_engine::{Engine, Runtime, RuntimeOptions};
+use rurge_engine::{Engine, ListenerSpec, Running, Runtime, RuntimeOptions};
 use rurge_rules::OutboundMode;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::filter::LevelFilter;
 
 /// How long a graceful shutdown waits for active sessions before force-cancelling them.
 const GRACE: Duration = Duration::from_secs(5);
+/// A burst of `--watch` file events inside this window collapses into one reload.
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
+/// How long a reload waits for an old listener's socket to close before rebinding.
+const REBIND_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Args)]
 pub struct RunArgs {
@@ -40,6 +45,9 @@ pub struct RunArgs {
     /// Keep this many finished requests in the in-memory log (default 1000)
     #[arg(long, env = "RURGE_REQUEST_LOG_SIZE", value_name = "N")]
     pub request_log_size: Option<usize>,
+    /// Reload the profile when it or its included files change on disk
+    #[arg(long, env = "RURGE_WATCH")]
+    pub watch: bool,
     #[command(flatten)]
     pub runtime: RuntimeArgs,
 }
@@ -85,6 +93,144 @@ fn mode_name(mode: &OutboundMode) -> String {
     }
 }
 
+/// The run-only knobs (from `RunArgs`) a reload has to carry over unchanged.
+struct RunOptions {
+    idle_timeout: Duration,
+    request_log_size: usize,
+}
+
+/// Builds one config generation. Used both at startup and on every reload.
+async fn build_engine_runtime(
+    cfg: rurge_config::Config,
+    rt: &super::runtime::Runtime,
+    run_opts: &RunOptions,
+    outbound_mode: OutboundMode,
+) -> anyhow::Result<Runtime> {
+    let state = State::load(&rt.data_dir.join(STATE_FILE));
+    let selections = state.selections_for(&profile_key(&cfg.source.main));
+    Runtime::build(
+        cfg,
+        RuntimeOptions {
+            stack: rt.stack_options(Duration::ZERO),
+            outbound_mode,
+            selections,
+            idle_timeout: run_opts.idle_timeout,
+            request_log_size: run_opts.request_log_size,
+        },
+    )
+    .await
+    .context("cannot build the runtime")
+}
+
+fn print_listening(listeners: &[(ListenerSpec, Running)]) {
+    for (spec, running) in listeners {
+        let scheme = match spec.kind {
+            ListenerKind::Socks5 => "socks5",
+            _ => "http",
+        };
+        println!("listening on {scheme}://{}", running.local_addr);
+    }
+}
+
+/// Reloads the profile from disk and swaps it in (M3b design §7.4). Every
+/// failure path keeps the running config, so a bad edit never takes the
+/// daemon down.
+async fn reload(
+    engine: &Arc<Engine>,
+    config: &Path,
+    load_opts: &LoadOptions,
+    rt: &super::runtime::Runtime,
+    run_opts: &RunOptions,
+    outbound_mode: &OutboundMode,
+    listeners: &mut Vec<(ListenerSpec, Running)>,
+) {
+    let loaded = match load(config, load_opts) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: reload failed, keeping current config: {e}");
+            return;
+        }
+    };
+    if loaded.diagnostics.has_errors() {
+        eprintln!("reload failed, keeping current config:");
+        print_diagnostics(&loaded.diagnostics.sorted());
+        return;
+    }
+    print_diagnostics(&loaded.diagnostics.sorted());
+    let next = match build_engine_runtime(loaded.config, rt, run_opts, outbound_mode.clone()).await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("error: reload failed, keeping current config: {e}");
+            return;
+        }
+    };
+    print_diagnostics(next.diagnostics());
+    if engine.swap_runtime(next) {
+        // The listen addresses changed. Stop the old accept loops, wait until
+        // their sockets are closed (so the addresses can be bound again;
+        // Windows sets no `SO_REUSEADDR`), then let their in-flight sessions
+        // drain in the background — dropping the old `Running`s would abort them.
+        let olds: Vec<Running> = listeners.drain(..).map(|(_, r)| r).collect();
+        for old in &olds {
+            old.stop();
+        }
+        for old in &olds {
+            let _ = tokio::time::timeout(REBIND_WAIT, old.wait_closed()).await;
+        }
+        for old in olds {
+            tokio::spawn(old.join());
+        }
+        match engine.bind_listeners().await {
+            Ok(next_listeners) => {
+                *listeners = next_listeners;
+                print_listening(listeners);
+            }
+            Err(e) => eprintln!("error: reload could not rebind listeners: {e}"),
+        }
+    }
+    tracing::info!("profile reloaded");
+}
+
+/// Watches the profile and its includes, reporting each debounced burst of
+/// changes as one `()` on `tx`. The returned watcher must be kept alive:
+/// dropping it stops the watch.
+fn spawn_watcher(
+    paths: &[PathBuf],
+    tx: tokio::sync::mpsc::Sender<()>,
+) -> anyhow::Result<notify::RecommendedWatcher> {
+    use notify::{RecursiveMode, Watcher};
+    let (raw_tx, raw_rx) = std::sync::mpsc::channel::<()>();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if res.is_ok() {
+            let _ = raw_tx.send(());
+        }
+    })?;
+    for p in paths {
+        // Watch the parent directory: editors replace files rather than modify
+        // them. Canonicalize first, a relative `-c t.conf` has an empty parent.
+        let full = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+        let dir = full
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
+            eprintln!("warning: cannot watch {}: {e}", dir.display());
+        }
+    }
+    std::thread::spawn(move || {
+        while raw_rx.recv().is_ok() {
+            // collapse the rest of the burst into this one reload
+            while raw_rx.recv_timeout(WATCH_DEBOUNCE).is_ok() {}
+            if tx.blocking_send(()).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(watcher)
+}
+
 pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let platform = args.platform.unwrap_or_else(Platform::current);
     let opts = LoadOptions {
@@ -104,27 +250,20 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             .unwrap_or_else(|| level_for(&cfg.general.loglevel)),
     );
     let rt = args.runtime.resolve(&cfg)?;
-    let state = State::load(&rt.data_dir.join(STATE_FILE));
-    let selections = state.selections_for(&profile_key(&cfg.source.main));
     let outbound_mode = args.outbound_mode.clone();
-    let idle_timeout = Duration::from_secs(args.idle_timeout.unwrap_or(600).max(1));
-    let request_log_size = args.request_log_size.unwrap_or(1000).max(1);
+    let run_opts = RunOptions {
+        idle_timeout: Duration::from_secs(args.idle_timeout.unwrap_or(600).max(1)),
+        request_log_size: args.request_log_size.unwrap_or(1000).max(1),
+    };
+    // `cfg` is moved into the runtime below, so collect the watch list first.
+    let cfg_paths: Vec<PathBuf> = std::iter::once(cfg.source.main.clone())
+        .chain(cfg.source.includes.iter().cloned())
+        .collect();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let engine_rt = Runtime::build(
-            cfg,
-            RuntimeOptions {
-                stack: rt.stack_options(Duration::ZERO),
-                outbound_mode: outbound_mode.clone(),
-                idle_timeout,
-                selections,
-                request_log_size,
-            },
-        )
-        .await
-        .context("cannot build the runtime")?;
+        let engine_rt = build_engine_runtime(cfg, &rt, &run_opts, outbound_mode.clone()).await?;
         print_diagnostics(engine_rt.diagnostics());
         let (policies, rules) = (
             engine_rt.policies.names().len(),
@@ -132,28 +271,81 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         );
         let engine = Engine::new(engine_rt);
         engine.start_sampler();
-        let listeners = match engine.bind_listeners().await {
+        let mut listeners = match engine.bind_listeners().await {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("error: cannot bind listener: {e}");
                 return Ok(ExitCode::from(1));
             }
         };
-        for (spec, running) in &listeners {
-            let scheme = match spec.kind {
-                ListenerKind::Socks5 => "socks5",
-                _ => "http",
-            };
-            println!("listening on {scheme}://{}", running.local_addr);
-        }
+        print_listening(&listeners);
         println!(
             "rurge {} running: {policies} policies, {rules} rules, outbound mode {}",
             env!("CARGO_PKG_VERSION"),
             mode_name(&outbound_mode)
         );
-        tokio::signal::ctrl_c()
-            .await
-            .context("cannot listen for Ctrl-C")?;
+
+        // Reload triggers. `reload_tx` stays alive here on purpose: were every
+        // sender dropped, `recv()` would return `None` at once and the loop
+        // below would spin reloading.
+        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let _watcher = if args.watch {
+            Some(spawn_watcher(&cfg_paths, reload_tx.clone())?)
+        } else {
+            None
+        };
+        #[cfg(unix)]
+        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .context("cannot listen for SIGHUP")?;
+        #[cfg(unix)]
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("cannot listen for SIGTERM")?;
+
+        loop {
+            // Ctrl-C everywhere, SIGTERM as well on Unix (M3b design §7.4).
+            let shutdown_signal = async {
+                #[cfg(unix)]
+                {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = sigterm.recv() => {}
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            };
+            let reload_signal = async {
+                #[cfg(unix)]
+                {
+                    tokio::select! {
+                        _ = sighup.recv() => {}
+                        _ = reload_rx.recv() => {}
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    reload_rx.recv().await;
+                }
+            };
+            tokio::select! {
+                _ = shutdown_signal => break,
+                _ = reload_signal => {
+                    reload(
+                        &engine,
+                        &args.config,
+                        &opts,
+                        &rt,
+                        &run_opts,
+                        &outbound_mode,
+                        &mut listeners,
+                    )
+                    .await;
+                }
+            }
+        }
+
         println!("shutting down (Ctrl-C again to exit now)");
         engine.stop_accepting();
         engine.tracker().close();
