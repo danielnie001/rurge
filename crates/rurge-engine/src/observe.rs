@@ -5,8 +5,9 @@
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::ListenerKind;
 use rurge_inbound::{SessionHandle, SessionOutcome};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -176,6 +177,140 @@ impl RequestLog {
     }
 }
 
+/// A snapshot of cumulative up/down bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrafficTotals {
+    pub up: u64,
+    pub down: u64,
+}
+
+/// Cumulative up/down byte counters (global, per listener kind, per policy)
+/// plus a per-second rate derived from successive [`TrafficStats::sample`] calls.
+pub struct TrafficStats {
+    up: AtomicU64,
+    down: AtomicU64,
+    http_up: AtomicU64,
+    http_down: AtomicU64,
+    socks_up: AtomicU64,
+    socks_down: AtomicU64,
+    per_policy: Mutex<HashMap<String, (u64, u64)>>,
+    // rate sampling: last cumulative-plus-active reading and the last delta
+    last_sample: Mutex<(u64, u64)>,
+    rate_up: AtomicU64,
+    rate_down: AtomicU64,
+}
+
+impl Default for TrafficStats {
+    fn default() -> Self {
+        TrafficStats::new()
+    }
+}
+
+impl TrafficStats {
+    /// A fresh set of counters, all zero.
+    pub fn new() -> TrafficStats {
+        TrafficStats {
+            up: AtomicU64::new(0),
+            down: AtomicU64::new(0),
+            http_up: AtomicU64::new(0),
+            http_down: AtomicU64::new(0),
+            socks_up: AtomicU64::new(0),
+            socks_down: AtomicU64::new(0),
+            per_policy: Mutex::new(HashMap::new()),
+            last_sample: Mutex::new((0, 0)),
+            rate_up: AtomicU64::new(0),
+            rate_down: AtomicU64::new(0),
+        }
+    }
+
+    /// Adds a finished session's bytes to the cumulative counters.
+    pub fn record(&self, h: &SessionHandle) {
+        let (up, down) = h.bytes();
+        self.up.fetch_add(up, Ordering::Relaxed);
+        self.down.fetch_add(down, Ordering::Relaxed);
+        match h.session().listener {
+            ListenerKind::Socks5 => {
+                self.socks_up.fetch_add(up, Ordering::Relaxed);
+                self.socks_down.fetch_add(down, Ordering::Relaxed);
+            }
+            _ => {
+                self.http_up.fetch_add(up, Ordering::Relaxed);
+                self.http_down.fetch_add(down, Ordering::Relaxed);
+            }
+        }
+        if let Some(policy) = h
+            .policy_chain()
+            .into_iter()
+            .rev()
+            .find(|p| !p.starts_with('!'))
+        {
+            let mut m = self.per_policy.lock().expect("per-policy traffic");
+            let e = m.entry(policy).or_insert((0, 0));
+            e.0 += up;
+            e.1 += down;
+        }
+    }
+
+    /// Cumulative bytes across all finished sessions.
+    pub fn totals(&self) -> TrafficTotals {
+        TrafficTotals {
+            up: self.up.load(Ordering::Relaxed),
+            down: self.down.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Cumulative bytes broken down by listener kind (`Http`, `Socks5`).
+    pub fn by_listener(&self) -> [(ListenerKind, u64, u64); 2] {
+        [
+            (
+                ListenerKind::Http,
+                self.http_up.load(Ordering::Relaxed),
+                self.http_down.load(Ordering::Relaxed),
+            ),
+            (
+                ListenerKind::Socks5,
+                self.socks_up.load(Ordering::Relaxed),
+                self.socks_down.load(Ordering::Relaxed),
+            ),
+        ]
+    }
+
+    /// Cumulative bytes broken down by policy name, sorted by name.
+    pub fn by_policy(&self) -> Vec<(String, u64, u64)> {
+        let mut v: Vec<_> = self
+            .per_policy
+            .lock()
+            .expect("per-policy traffic")
+            .iter()
+            .map(|(k, (u, d))| (k.clone(), *u, *d))
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    /// Records one rate sample: `active` is the live byte total of in-flight
+    /// sessions; the total tracked is finished-cumulative + active. Rate is the
+    /// non-negative delta from the previous sample (call once per second).
+    pub fn sample(&self, active: (u64, u64)) {
+        let total_up = self.up.load(Ordering::Relaxed) + active.0;
+        let total_down = self.down.load(Ordering::Relaxed) + active.1;
+        let mut last = self.last_sample.lock().expect("rate sample");
+        self.rate_up
+            .store(total_up.saturating_sub(last.0), Ordering::Relaxed);
+        self.rate_down
+            .store(total_down.saturating_sub(last.1), Ordering::Relaxed);
+        *last = (total_up, total_down);
+    }
+
+    /// Bytes per second from the last two samples.
+    pub fn rate(&self) -> (u64, u64) {
+        (
+            self.rate_up.load(Ordering::Relaxed),
+            self.rate_down.load(Ordering::Relaxed),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +394,37 @@ mod tests {
             recent[1].error.as_deref(),
             Some("policy protocol not implemented: ss")
         );
+    }
+
+    #[test]
+    fn traffic_accumulates_globally_and_per_dimension() {
+        let t = TrafficStats::new();
+        let a = handle(1, "a.test"); // Http listener, policy DIRECT
+        a.add_up(100);
+        a.add_down(200);
+        t.record(&a);
+        assert_eq!(t.totals().up, 100);
+        assert_eq!(t.totals().down, 200);
+        let by_l = t.by_listener();
+        let http = by_l
+            .iter()
+            .find(|(k, _, _)| *k == ListenerKind::Http)
+            .unwrap();
+        assert_eq!((http.1, http.2), (100, 200));
+        let by_p = t.by_policy();
+        assert_eq!(by_p, vec![("DIRECT".to_string(), 100, 200)]);
+    }
+
+    #[test]
+    fn rate_is_the_delta_between_samples() {
+        let t = TrafficStats::new();
+        // cumulative finished = 0; first sample sees 1000 active bytes up
+        t.sample((1000, 0));
+        assert_eq!(t.rate(), (1000, 0));
+        t.sample((1500, 300));
+        assert_eq!(t.rate(), (500, 300));
+        // a sample that goes backwards (a session ended, active dropped) clamps to 0
+        t.sample((1400, 300));
+        assert_eq!(t.rate(), (0, 0));
     }
 }
