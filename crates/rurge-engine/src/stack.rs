@@ -5,7 +5,7 @@
 use rurge_config::{Config, Diagnostics};
 use rurge_dns::system::SystemDns;
 use rurge_dns::{Resolver, ResolverConfig, ResolverDeps};
-use rurge_net::connector::{DirectConnector, SystemResolve};
+use rurge_net::connector::{Connector, DirectConnector, SystemResolve};
 use rurge_net::http::{HttpClient, HttpClientConfig};
 use rurge_net::resource::{ResourceManager, ResourceOptions};
 use rurge_rules::{GeoDb, GeoUpdater, GeoUrls, SetRegistry};
@@ -22,6 +22,10 @@ pub struct StackOptions {
     pub system: Arc<dyn SystemDns>,
     /// Wait this long for the first fetch of every external resource (zero = don't wait).
     pub wait: Duration,
+    /// Connector for the resolver's TCP / DoT / DoH upstreams; `None` = plain
+    /// direct. `Runtime::build` injects the pipeline connector here when
+    /// `encrypted-dns-follow-outbound-mode` is on.
+    pub dns_connector: Option<Arc<dyn Connector>>,
 }
 
 pub struct Stack {
@@ -84,10 +88,15 @@ pub async fn build_stack_with(
     let mut resolver_cfg = ResolverConfig::from_config(cfg);
     resolver_cfg.cache_capacity = opts.dns_cache_size;
     customize(&mut resolver_cfg);
+    // `connector` is `Arc<DirectConnector>`; coerce explicitly so both arms unify.
+    let resolver_connector: Arc<dyn Connector> = match &opts.dns_connector {
+        Some(c) => c.clone(),
+        None => connector.clone() as Arc<dyn Connector>,
+    };
     let (resolver, dns_diags) = Resolver::new(
         resolver_cfg,
         ResolverDeps {
-            connector,
+            connector: resolver_connector,
             sets: registry.clone(),
             system: opts.system.clone(),
             resources: resources.clone(),

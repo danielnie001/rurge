@@ -32,9 +32,14 @@ impl Engine {
     /// Atomically swaps in the next config generation. In-flight sessions keep
     /// their snapshot; new sessions use the new one. Returns whether the set of
     /// listen addresses changed, so the caller can rebind listeners.
-    pub fn swap_runtime(&self, next: Runtime) -> bool {
+    pub fn swap_runtime(self: &std::sync::Arc<Self>, next: Runtime) -> bool {
         let before = listen_addrs(&self.runtime().config.general);
         let after = listen_addrs(&next.config.general);
+        // The new generation has its own DNS pipeline connector; bind it before
+        // the swap so the first DNS query of the new generation already sees it.
+        if let Some(pc) = next.dns_pipeline() {
+            pc.attach(std::sync::Arc::downgrade(self));
+        }
         self.store_runtime(next);
         before != after
     }

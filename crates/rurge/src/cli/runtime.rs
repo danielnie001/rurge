@@ -85,6 +85,10 @@ impl Runtime {
             dns_cache_size: self.dns_cache_size,
             system: Arc::new(PlatformSystemDns),
             wait,
+            // `Runtime::build` fills this in when the profile asks DNS to
+            // follow the outbound mode; `check` / `rule match` / `dns lookup`
+            // build the stack without an engine, so they stay direct.
+            dns_connector: None,
         }
     }
 }

@@ -2,6 +2,7 @@
 //! generation, the `Engine` that dials and relays sessions for the inbound
 //! listeners, and the session log.
 
+pub mod dns_pipeline;
 pub mod engine;
 pub mod observe;
 pub mod relay;

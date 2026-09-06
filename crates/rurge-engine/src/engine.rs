@@ -13,7 +13,7 @@ use rurge_inbound::{
     SessionHandle, SessionOutcome, Socks5Listener,
 };
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Target};
+use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
 use rurge_proto::OutboundError;
 use rurge_rules::{OutboundMode, Outcome};
 use std::collections::HashMap;
@@ -122,7 +122,7 @@ impl Engine {
             log: RequestLog::new(runtime.request_log_size),
             traffic: TrafficStats::new(),
         });
-        Arc::new(Engine {
+        let engine = Arc::new(Engine {
             runtime: ArcSwap::from_pointee(runtime),
             next_session: AtomicU64::new(0),
             sessions_root: CancellationToken::new(),
@@ -130,7 +130,11 @@ impl Engine {
             tracker: TaskTracker::new(),
             observe,
             escalation: Escalation::new(),
-        })
+        });
+        if let Some(pc) = engine.runtime().dns_pipeline() {
+            pc.attach(Arc::downgrade(&engine));
+        }
+        engine
     }
 
     /// The current config generation (sessions snapshot it once at dial time).
@@ -254,6 +258,88 @@ impl Engine {
         });
         self.observe.log.mark_active(&handle);
         handle
+    }
+}
+
+impl Engine {
+    /// Dials a DNS upstream connection through the pipeline (Internal session).
+    /// Never lets a REJECT break DNS: on reject it warns and connects directly.
+    pub async fn dial_internal(
+        &self,
+        session: SessionInfo,
+        fallback: &Arc<dyn Connector>,
+    ) -> io::Result<BoxedStream> {
+        let rt = self.runtime();
+        let handle = self.new_handle(session);
+        let policy = match &rt.outbound_mode {
+            OutboundMode::Direct => PolicyRef::Builtin(Builtin::Direct),
+            OutboundMode::Proxy(p) => p.clone(),
+            OutboundMode::Rule => {
+                let decision = rt
+                    .rules
+                    .evaluate(
+                        handle.session(),
+                        OutboundMode::Rule,
+                        rt.stack.resolver.as_ref(),
+                    )
+                    .await;
+                if let Some(i) = decision.matched {
+                    handle.set_rule(
+                        rt.rules
+                            .rules()
+                            .iter()
+                            .find(|r| r.index == i)
+                            .map(|r| r.raw.clone()),
+                    );
+                }
+                match decision.outcome {
+                    Outcome::Policy(p) => p,
+                    // An IP-literal DNS session never needs resolution; a DnsFailed
+                    // here would only come from a misconfigured rule → direct.
+                    Outcome::DnsFailed => PolicyRef::Builtin(Builtin::Direct),
+                }
+            }
+        };
+        let resolution = rt.policies.resolve(&policy);
+        handle.set_policy_chain(resolution.chain.clone());
+        let target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
+        let opts = ConnectOpts {
+            timeout: CONNECT_TIMEOUT,
+            prefer_v6: rt.config.general.ipv6,
+        };
+        match resolution.outbound.connect_tcp(&target, &opts).await {
+            Ok(stream) => Ok(crate::dns_pipeline::wrap_internal(stream, handle)),
+            Err(OutboundError::Reject(_)) | Err(OutboundError::Unsupported(_)) => {
+                tracing::warn!(
+                    dst = %target.host,
+                    "DNS session routed to a reject/unsupported policy; connecting directly to keep DNS working"
+                );
+                handle.set_error("dns-follow: reject bypassed to keep DNS working");
+                // Finish explicitly on failure, like every other arm: the
+                // handle would otherwise be dropped without a finished record.
+                let stream = match fallback.connect(&target, &opts).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        handle.finish(SessionOutcome::Failed(e.to_string()));
+                        return Err(e);
+                    }
+                };
+                Ok(crate::dns_pipeline::wrap_internal(stream, handle))
+            }
+            Err(OutboundError::Dns(m)) => {
+                handle.finish(SessionOutcome::Failed(m.clone()));
+                Err(io::Error::other(m))
+            }
+            Err(OutboundError::Io(e)) => {
+                let msg = e.to_string();
+                handle.finish(SessionOutcome::Failed(msg));
+                Err(e)
+            }
+            Err(OutboundError::Timeout) => {
+                handle.finish(SessionOutcome::Failed("connect timed out".into()));
+                Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))
+            }
+        }
     }
 }
 

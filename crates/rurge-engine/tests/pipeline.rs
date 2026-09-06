@@ -94,6 +94,7 @@ async fn harness(general_extra: &str, rules: &str, mode: OutboundMode) -> Harnes
                 dns_cache_size: 2000,
                 system: Arc::new(StaticSystemDns::default()),
                 wait: Duration::ZERO,
+                dns_connector: None,
             },
             outbound_mode: mode,
             idle_timeout: Duration::from_secs(600),
@@ -437,6 +438,7 @@ async fn build_runtime(
                 dns_cache_size: 2000,
                 system: Arc::new(StaticSystemDns::default()),
                 wait: Duration::ZERO,
+                dns_connector: None,
             },
             outbound_mode: mode,
             idle_timeout,
@@ -638,6 +640,7 @@ async fn http_listener_password_from_the_profile() {
                 dns_cache_size: 100,
                 system: Arc::new(StaticSystemDns::default()),
                 wait: Duration::ZERO,
+                dns_connector: None,
             },
             outbound_mode: OutboundMode::Rule,
             idle_timeout: Duration::from_secs(600),
@@ -740,4 +743,67 @@ async fn reload_swaps_rules_without_changing_listeners() {
     )
     .await;
     assert!(h.engine.swap_runtime(next), "listen addr set changed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dns_upstream_follows_the_pipeline_as_an_internal_session() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let dir = tempfile::tempdir().unwrap();
+    let profile = format!(
+        "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\n\
+encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.1:{}\nipv6 = false\n\
+[Proxy]\n[Proxy Group]\n[Rule]\nPROTOCOL,DNS,DIRECT\nFINAL,DIRECT\n",
+        dns.addr().port()
+    );
+    let loaded = from_text(
+        &profile,
+        &dir.path().join("t.conf"),
+        &LoadOptions::for_tests(),
+    );
+    assert!(!loaded.diagnostics.has_errors());
+    let runtime = Runtime::build(
+        loaded.config,
+        RuntimeOptions {
+            stack: StackOptions {
+                data_dir: dir.path().to_path_buf(),
+                no_network: true,
+                geo_urls: GeoUrls::default(),
+                dns_cache_size: 2000,
+                system: Arc::new(StaticSystemDns::default()),
+                wait: Duration::ZERO,
+                dns_connector: None,
+            },
+            outbound_mode: OutboundMode::Rule,
+            idle_timeout: Duration::from_secs(600),
+            request_log_size: 1000,
+            selections: GroupSelections::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let engine = Engine::new(runtime);
+    let _listeners = engine.bind_listeners().await.unwrap();
+    // resolving a name forces a TCP DNS query, which must go through the pipeline
+    let res = engine
+        .runtime()
+        .stack
+        .resolver
+        .lookup("target.test", rurge_dns::resolver::LookupOpts::default())
+        .await;
+    assert!(res.is_ok(), "resolution through the pipeline: {res:?}");
+    // the DNS server connection was recorded as an Internal session with DNS protocol
+    let seen = engine.request_log().recent(50);
+    let active = engine.request_log().active();
+    assert!(
+        seen.iter()
+            .chain(active.iter())
+            .any(|r| r.listener == ListenerKind::Internal
+                && r.protocol == Some(rurge_config::rule::ProtocolKind::Dns)),
+        "internal DNS session recorded: recent={seen:?} active={active:?}"
+    );
+    assert!(
+        !dns.queries().is_empty(),
+        "the mock DNS server was actually queried"
+    );
 }
