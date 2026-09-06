@@ -1,5 +1,6 @@
 //! The seam between listeners and the engine (M3 design §6.1).
 
+use rurge_config::rule::ProtocolKind;
 use rurge_config::session::SessionInfo;
 use rurge_net::BoxFuture;
 use rurge_net::connector::BoxedStream;
@@ -30,6 +31,8 @@ pub struct SessionHandle {
     rule: Mutex<Option<String>>,
     policy_chain: Mutex<Vec<String>>,
     error: Mutex<Option<String>>,
+    sni: Mutex<Option<String>>,
+    protocol: Mutex<Option<ProtocolKind>>,
     up: AtomicU64,
     down: AtomicU64,
     finished: AtomicBool,
@@ -56,6 +59,8 @@ impl SessionHandle {
             rule: Mutex::new(None),
             policy_chain: Mutex::new(Vec::new()),
             error: Mutex::new(None),
+            sni: Mutex::new(None),
+            protocol: Mutex::new(None),
             up: AtomicU64::new(0),
             down: AtomicU64::new(0),
             finished: AtomicBool::new(false),
@@ -117,6 +122,21 @@ impl SessionHandle {
 
     pub fn error(&self) -> Option<String> {
         self.error.lock().expect("session error").clone()
+    }
+
+    /// The sniffed TLS SNI, filled by the engine's relay path (M3b).
+    pub fn set_sni(&self, sni: String) {
+        *self.sni.lock().expect("session sni") = Some(sni);
+    }
+    pub fn sni(&self) -> Option<String> {
+        self.sni.lock().expect("session sni").clone()
+    }
+    /// The sniffed application protocol; overrides the (immutable) session's.
+    pub fn set_protocol(&self, protocol: ProtocolKind) {
+        *self.protocol.lock().expect("session protocol") = Some(protocol);
+    }
+    pub fn protocol(&self) -> Option<ProtocolKind> {
+        *self.protocol.lock().expect("session protocol")
     }
 
     pub fn add_up(&self, n: u64) {
@@ -311,5 +331,16 @@ mod tests {
         // cancelling the parent also cancels a plain handle's token
         let h2 = SessionHandle::new(1, SessionInfo::tcp(HostName::parse("b.test"), 80));
         assert!(!h2.token().is_cancelled());
+    }
+
+    #[test]
+    fn sni_and_protocol_overrides_default_to_none() {
+        let h = SessionHandle::new(1, SessionInfo::tcp(HostName::parse("a.test"), 443));
+        assert_eq!(h.sni(), None);
+        assert_eq!(h.protocol(), None);
+        h.set_sni("api.test".into());
+        h.set_protocol(rurge_config::rule::ProtocolKind::Https);
+        assert_eq!(h.sni().as_deref(), Some("api.test"));
+        assert_eq!(h.protocol(), Some(rurge_config::rule::ProtocolKind::Https));
     }
 }

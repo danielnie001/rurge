@@ -3,6 +3,7 @@
 //! listeners, and the session log.
 
 pub mod engine;
+pub mod observe;
 pub mod relay;
 pub mod runtime;
 pub mod stack;
