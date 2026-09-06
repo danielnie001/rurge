@@ -138,6 +138,11 @@ impl Engine {
         self.runtime.load_full()
     }
 
+    /// Stores `next` as the current config generation (M3b §7.4 hot reload).
+    pub(crate) fn store_runtime(&self, next: Runtime) {
+        self.runtime.store(std::sync::Arc::new(next));
+    }
+
     /// Listeners `[General]` asks for (M3 design §1.2 / matrix `allow-wifi-access`).
     pub fn listener_specs(general: &General) -> Vec<ListenerSpec> {
         let mut specs = Vec::new();

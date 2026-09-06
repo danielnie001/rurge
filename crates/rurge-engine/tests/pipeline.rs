@@ -705,3 +705,39 @@ async fn repeated_rejects_escalate_to_drop() {
         _ => panic!("expected a drop after escalation"),
     }
 }
+
+#[tokio::test]
+async fn reload_swaps_rules_without_changing_listeners() {
+    let h = harness("", "DOMAIN,ads.test,REJECT", OutboundMode::Rule).await;
+    // ads.test currently rejects (closes)
+    let (head, _) = get_via_proxy(h.http(), "http://ads.test/").await;
+    assert!(head.is_empty());
+    // reload with a config that instead serves a tinygif for ads.test, same listen addrs
+    let next = build_runtime(
+        h._dir.path(),
+        &h.dns,
+        "",
+        "DOMAIN,ads.test,Block",
+        OutboundMode::Rule,
+        Duration::from_secs(600),
+    )
+    .await;
+    let changed = h.engine.swap_runtime(next);
+    assert!(!changed, "listen addrs unchanged");
+    let (head, body) = get_via_proxy(h.http(), "http://ads.test/ad.gif").await;
+    assert!(
+        head.starts_with("HTTP/1.1 200") && body.len() == 43,
+        "{head}"
+    );
+    // reload with a different http-listen address set → changed = true
+    let next = build_runtime(
+        h._dir.path(),
+        &h.dns,
+        "http-listen = 127.0.0.1:1\nsocks5-listen = 127.0.0.1:0",
+        "",
+        OutboundMode::Rule,
+        Duration::from_secs(600),
+    )
+    .await;
+    assert!(h.engine.swap_runtime(next), "listen addr set changed");
+}
