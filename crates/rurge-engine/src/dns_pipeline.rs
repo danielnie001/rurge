@@ -1,8 +1,11 @@
 //! `encrypted-dns-follow-outbound-mode` (M3 design §7.4): a connector that
-//! routes DNS upstream connections through the dial pipeline. Only IP-literal
-//! DNS servers take the pipeline — a domain DNS server would need resolving,
-//! which is exactly the loop we must not create, so those fall back to the
-//! bootstrap-direct connector. UDP upstreams never use a connector.
+//! routes the resolver's TCP / DoT / DoH upstream connections through the dial
+//! pipeline as `Internal` sessions. The resolver wraps it in its
+//! `BootstrapConnector`, which resolves a domain-configured upstream name via
+//! plain-UDP bootstrap first and hands this connector an IP target — so the
+//! pipeline never needs to resolve anything itself and cannot re-enter the
+//! resolver. The `Domain` arm below is only a defensive fallback. UDP
+//! upstreams never use a connector.
 
 use crate::engine::Engine;
 use rurge_config::HostName;
@@ -35,10 +38,6 @@ impl PipelineConnector {
     /// Binds the engine after it is built (idempotent; first wins).
     pub fn attach(&self, engine: Weak<Engine>) {
         let _ = self.engine.set(engine);
-    }
-
-    pub fn fallback(&self) -> &Arc<dyn Connector> {
-        &self.fallback
     }
 }
 

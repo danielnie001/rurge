@@ -96,13 +96,23 @@ impl MockDns {
     }
 
     async fn start(tls: bool) -> MockDns {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind tcp");
-        let addr = listener.local_addr().expect("addr");
-        let udp = Arc::new(
-            UdpSocket::bind(addr)
-                .await
-                .expect("bind udp on the same port"),
-        );
+        // The ephemeral TCP port the OS hands out may already be held by an
+        // unrelated UDP socket, so retry the whole pair instead of failing.
+        let (listener, addr, udp) = {
+            let mut found = None;
+            for _ in 0..16 {
+                let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind tcp");
+                let addr = listener.local_addr().expect("addr");
+                match UdpSocket::bind(addr).await {
+                    Ok(udp) => {
+                        found = Some((listener, addr, Arc::new(udp)));
+                        break;
+                    }
+                    Err(_) => drop(listener),
+                }
+            }
+            found.unwrap_or_else(|| panic!("could not find a port free for both TCP and UDP"))
+        };
         let state = Arc::new(Mutex::new(State::default()));
         let acceptor = if tls { Some(tls_acceptor()) } else { None };
 
