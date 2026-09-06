@@ -679,3 +679,23 @@ async fn stop_accepting_then_cancel_sessions_drains() {
         .await
         .expect("tracker drains after cancel");
 }
+
+#[tokio::test]
+async fn repeated_rejects_escalate_to_drop() {
+    let h = harness("", "DOMAIN,ads.test,REJECT", OutboundMode::Rule).await;
+    let host = rurge_config::HostName::parse("ads.test");
+    // the first ESCALATE_COUNT-1 rejects stay REJECT
+    for _ in 0..(rurge_engine::engine::ESCALATE_COUNT - 1) {
+        match h.engine.dial(SessionInfo::tcp(host.clone(), 80)).await {
+            Err(DialError::Reject { kind, .. }) => {
+                assert_eq!(kind, rurge_proto::RejectKind::Reject)
+            }
+            _ => panic!("expected a reject before the threshold"),
+        }
+    }
+    // the next one crosses the threshold → DROP
+    match h.engine.dial(SessionInfo::tcp(host.clone(), 80)).await {
+        Err(DialError::Reject { kind, .. }) => assert_eq!(kind, rurge_proto::RejectKind::Drop),
+        _ => panic!("expected a drop after escalation"),
+    }
+}

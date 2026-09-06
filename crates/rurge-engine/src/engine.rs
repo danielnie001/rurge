@@ -16,11 +16,14 @@ use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Target};
 use rurge_proto::OutboundError;
 use rurge_rules::{OutboundMode, Outcome};
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -30,6 +33,12 @@ pub const DROP_HOLD: Duration = Duration::from_secs(30);
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_HTTP_PORT: u16 = 6152;
 pub const DEFAULT_SOCKS5_PORT: u16 = 6153;
+/// Sliding window for REJECT auto-escalation (M3b §7.4).
+pub const ESCALATE_WINDOW: Duration = Duration::from_secs(30);
+/// Escalating rejects for one host inside `ESCALATE_WINDOW` before REJECT-DROP kicks in.
+pub const ESCALATE_COUNT: usize = 50;
+/// Upper bound on tracked hosts before a sweep evicts idle entries.
+const ESCALATE_MAX_HOSTS: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListenerSpec {
@@ -45,6 +54,55 @@ struct Observe {
     traffic: TrafficStats,
 }
 
+/// Per-destination sliding-window counter for REJECT auto-escalation (§7.4).
+struct Escalation {
+    hosts: std::sync::Mutex<HashMap<String, VecDeque<Instant>>>,
+}
+
+impl Escalation {
+    fn new() -> Escalation {
+        Escalation {
+            hosts: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Records one escalating reject for `host` at `now`.
+    fn record(&self, host: &str, now: Instant) {
+        let mut map = self.hosts.lock().expect("escalation");
+        if map.len() >= ESCALATE_MAX_HOSTS && !map.contains_key(host) {
+            map.retain(|_, times| {
+                prune(times, now);
+                !times.is_empty()
+            });
+        }
+        let times = map.entry(host.to_string()).or_default();
+        times.push_back(now);
+        prune(times, now);
+    }
+
+    /// Whether `host` has reached the threshold within the window.
+    fn should_drop(&self, host: &str, now: Instant) -> bool {
+        let mut map = self.hosts.lock().expect("escalation");
+        match map.get_mut(host) {
+            Some(times) => {
+                prune(times, now);
+                times.len() >= ESCALATE_COUNT
+            }
+            None => false,
+        }
+    }
+}
+
+fn prune(times: &mut VecDeque<Instant>, now: Instant) {
+    while let Some(front) = times.front() {
+        if now.duration_since(*front) >= ESCALATE_WINDOW {
+            times.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
 pub struct Engine {
     runtime: ArcSwap<Runtime>,
     next_session: AtomicU64,
@@ -55,6 +113,7 @@ pub struct Engine {
     /// shutdown can wait for them to drain.
     tracker: TaskTracker,
     observe: Arc<Observe>,
+    escalation: Escalation,
 }
 
 impl Engine {
@@ -70,6 +129,7 @@ impl Engine {
             accept: CancellationToken::new(),
             tracker: TaskTracker::new(),
             observe,
+            escalation: Escalation::new(),
         })
     }
 
@@ -331,7 +391,21 @@ impl Dialer for Engine {
             };
             match resolution.outbound.connect_tcp(&target, &opts).await {
                 Ok(stream) => Ok(Dialed { stream, handle }),
-                Err(OutboundError::Reject(kind)) => reject(handle, kind),
+                Err(OutboundError::Reject(kind)) => {
+                    let effective = if kind.escalates() {
+                        let host = handle.session().dst_host.to_string();
+                        let now = Instant::now();
+                        self.escalation.record(&host, now);
+                        if self.escalation.should_drop(&host, now) {
+                            rurge_proto::RejectKind::Drop
+                        } else {
+                            kind
+                        }
+                    } else {
+                        kind
+                    };
+                    reject(handle, effective)
+                }
                 Err(OutboundError::Unsupported(_)) => {
                     reject(handle, rurge_proto::RejectKind::Reject)
                 }
@@ -403,5 +477,21 @@ mod tests {
             })
         );
         assert_eq!(specs[1].addr.to_string(), "0.0.0.0:8081");
+    }
+
+    #[test]
+    fn escalation_after_threshold_within_window() {
+        let esc = Escalation::new();
+        let t0 = std::time::Instant::now();
+        for i in 0..(ESCALATE_COUNT - 1) {
+            esc.record("ads.test", t0 + Duration::from_millis(i as u64));
+        }
+        assert!(!esc.should_drop("ads.test", t0 + Duration::from_secs(1)));
+        esc.record("ads.test", t0 + Duration::from_secs(1));
+        assert!(esc.should_drop("ads.test", t0 + Duration::from_secs(1)));
+        // a different host is unaffected
+        assert!(!esc.should_drop("other.test", t0 + Duration::from_secs(1)));
+        // once the window slides past, the count decays
+        assert!(!esc.should_drop("ads.test", t0 + ESCALATE_WINDOW + Duration::from_secs(1)));
     }
 }
