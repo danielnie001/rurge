@@ -186,7 +186,10 @@ async fn reload(
                 *listeners = next_listeners;
                 print_listening(listeners);
             }
-            Err(e) => eprintln!("error: reload could not rebind listeners: {e}"),
+            Err(e) => {
+                eprintln!("error: reload could not rebind listeners: {e}");
+                return;
+            }
         }
     }
     tracing::info!("profile reloaded");
@@ -294,6 +297,16 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         } else {
             None
         };
+        // One long-lived stream per signal, built once outside the loop: a
+        // stream buffers a signal that arrives while nobody is awaiting it,
+        // whereas a fresh `signal::ctrl_c()` future per iteration would drop
+        // every Ctrl-C delivered during a `reload`.
+        #[cfg(unix)]
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .context("cannot listen for SIGINT")?;
+        #[cfg(windows)]
+        let mut interrupt = tokio::signal::windows::ctrl_c().context("cannot listen for Ctrl-C")?;
         #[cfg(unix)]
         let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
             .context("cannot listen for SIGHUP")?;
@@ -307,13 +320,13 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 #[cfg(unix)]
                 {
                     tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {}
+                        _ = interrupt.recv() => {}
                         _ = sigterm.recv() => {}
                     }
                 }
                 #[cfg(not(unix))]
                 {
-                    let _ = tokio::signal::ctrl_c().await;
+                    let _ = interrupt.recv().await;
                 }
             };
             let reload_signal = async {
