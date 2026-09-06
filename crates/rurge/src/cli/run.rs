@@ -158,8 +158,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             }
             engine.tracker().wait().await;
         };
+        tokio::pin!(drain);
         tokio::select! {
-            _ = drain => {}
+            _ = &mut drain => {}
             _ = tokio::signal::ctrl_c() => {
                 println!("forced shutdown");
                 return Ok(ExitCode::SUCCESS);
@@ -167,10 +168,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             _ = tokio::time::sleep(GRACE) => {
                 println!("grace period elapsed; closing active sessions");
                 engine.cancel_sessions();
-                // brief wait for the relays to unwind, then exit regardless
-                let _ = tokio::time::timeout(Duration::from_secs(1), async {
-                    engine.tracker().wait().await;
-                }).await;
+                // relays race the session token, so this completes quickly;
+                // bound it anyway and exit regardless
+                let _ = tokio::time::timeout(Duration::from_secs(1), &mut drain).await;
             }
         }
         Ok(ExitCode::SUCCESS)

@@ -363,4 +363,39 @@ mod tests {
         let mut eof = [0u8; 1];
         assert_eq!(s.read(&mut eof).await.unwrap(), 0);
     }
+
+    #[tokio::test]
+    async fn stop_drains_in_flight_sessions_and_frees_the_address() {
+        let (running, _dialer) = listener(Duration::from_secs(30)).await;
+        let addr = running.local_addr;
+        // an in-flight tunnel to the echo target
+        let mut s = negotiate(addr).await;
+        let mut req = vec![5, 1, 0, 3, 9];
+        req.extend_from_slice(b"echo.test");
+        req.extend_from_slice(&443u16.to_be_bytes());
+        s.write_all(&req).await.unwrap();
+        assert_eq!(read_reply(&mut s).await[1], REP_SUCCESS);
+        s.write_all(b"before").await.unwrap();
+        let mut buf = [0u8; 6];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"before");
+        // stop accepting: the address frees up while the tunnel keeps relaying
+        running.stop();
+        tokio::time::timeout(Duration::from_secs(2), running.wait_closed())
+            .await
+            .expect("socket closed within 2 s");
+        assert!(
+            TcpStream::connect(addr).await.is_err(),
+            "no new connections after stop"
+        );
+        s.write_all(b"after").await.unwrap();
+        let mut buf = [0u8; 5];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"after", "in-flight session still relays after stop");
+        // the session ends when the client closes; join then completes
+        drop(s);
+        tokio::time::timeout(Duration::from_secs(5), running.join())
+            .await
+            .expect("accept loop drained and exited within 5 s");
+    }
 }

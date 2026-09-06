@@ -602,12 +602,24 @@ async fn stop_accepting_then_cancel_sessions_drains() {
     s.write_all(format!("CONNECT target.test:{} HTTP/1.1\r\n\r\n", h.target_port()).as_bytes())
         .await
         .unwrap();
-    let mut buf = [0u8; 12];
-    let n = s.read(&mut buf).await.unwrap();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(3), s.read(&mut buf))
+        .await
+        .expect("CONNECT reply within 3 s")
+        .unwrap();
     assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
     // stop accepting; a new connection must be refused (listener closed)
     h.engine.stop_accepting();
     h.engine.tracker().close();
+    // negative control: the idle tunnel is still tracked and relaying, so the
+    // tracker must not drain yet (this would pass even if `ctx.tracker.spawn`
+    // were reverted to a bare `tokio::spawn` without the assertion below).
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), h.engine.tracker().wait())
+            .await
+            .is_err(),
+        "tracker must not drain while the tunnel is still relaying"
+    );
     // force the idle tunnel to end and wait for the tracker to drain
     h.engine.cancel_sessions();
     tokio::time::timeout(Duration::from_secs(5), h.engine.tracker().wait())
