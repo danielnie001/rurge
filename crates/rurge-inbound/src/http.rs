@@ -197,7 +197,20 @@ async fn connect(
             tokio::time::sleep(ctx.opts.drop_hold).await;
             Err(HandlerError::Close)
         }
-        Err(DialError::Reject { .. }) | Err(DialError::Failed { .. }) => Err(HandlerError::Close),
+        Err(DialError::Reject { .. }) => Err(HandlerError::Close),
+        Err(DialError::Failed {
+            kind,
+            message,
+            handle,
+            ..
+        }) => {
+            let what = match kind {
+                FailKind::Dns => "DNS lookup failed",
+                FailKind::Timeout => "Connection timed out",
+                FailKind::Connect | FailKind::Other => "Connection failed",
+            };
+            failure_response(&ctx, &handle, &format!("{what}: {message}"))
+        }
     }
 }
 
@@ -543,7 +556,7 @@ mod tests {
             assert!(head.is_empty(), "port {port}: {head}");
         }
         let (_s, head) = raw(running.local_addr, "CONNECT fail.test:443 HTTP/1.1\r\n\r\n").await;
-        assert!(head.is_empty(), "{head}");
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
         // DROP holds the connection for drop_hold before closing
         let started = std::time::Instant::now();
         let mut s = TcpStream::connect(running.local_addr).await.unwrap();

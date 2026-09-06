@@ -607,6 +607,12 @@ async fn dns_failure_and_ip_rules() {
     let (head, body) = get_via_proxy(h.http(), "http://nx.test/").await;
     assert!(head.starts_with("HTTP/1.1 502"), "{head}");
     assert!(String::from_utf8_lossy(&body).contains("DNS lookup failed"));
+
+    // CONNECT to a name that fails DNS → 502 error page (M3b)
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    let (head, body) = http_exchange(&mut s, "CONNECT nx.test:443 HTTP/1.1\r\n\r\n").await;
+    assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+    assert!(String::from_utf8_lossy(&body).contains("DNS lookup failed"));
 }
 
 #[tokio::test]
