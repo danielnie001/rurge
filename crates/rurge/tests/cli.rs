@@ -640,15 +640,20 @@ mod run {
 
     /// Spawns `rurge run` and waits for both `listening on` lines.
     fn spawn_daemon(conf: &Path, data: &Path) -> Daemon {
-        spawn_daemon_with(conf, data, false)
+        spawn_daemon_with(conf, data, false, None)
     }
 
     /// `spawn_daemon` with `--watch`, so edits to `conf` are reloaded.
     fn spawn_daemon_watching(conf: &Path, data: &Path) -> Daemon {
-        spawn_daemon_with(conf, data, true)
+        spawn_daemon_with(conf, data, true, None)
     }
 
-    fn spawn_daemon_with(conf: &Path, data: &Path, watch: bool) -> Daemon {
+    /// `spawn_daemon` with `--log-file <log>`.
+    fn spawn_daemon_with_log(conf: &Path, data: &Path, log: &Path) -> Daemon {
+        spawn_daemon_with(conf, data, false, Some(log))
+    }
+
+    fn spawn_daemon_with(conf: &Path, data: &Path, watch: bool, log_file: Option<&Path>) -> Daemon {
         let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("rurge"));
         cmd.arg("run")
             .arg("-c")
@@ -658,6 +663,9 @@ mod run {
             .arg(data);
         if watch {
             cmd.arg("--watch");
+        }
+        if let Some(log) = log_file {
+            cmd.arg("--log-file").arg(log);
         }
         let mut child = cmd
             .stdout(Stdio::piped())
@@ -862,6 +870,54 @@ mod run {
         .unwrap();
         drop(daemon);
         assert!(ok, "reload did not take effect");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn log_file_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(
+            dir.path(),
+            "http-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nloglevel = notify",
+        );
+        let logdir = dir.path().join("logs");
+        std::fs::create_dir_all(&logdir).unwrap();
+        let log = logdir.join("rurge.log");
+        let daemon = tokio::task::spawn_blocking({
+            let conf = conf.clone();
+            let data = dir.path().join("data");
+            let log = log.clone();
+            move || spawn_daemon_with_log(&conf, &data, &log)
+        })
+        .await
+        .unwrap();
+        // give the non-blocking appender a moment, then check the dir has a file.
+        // Windows note: `DirEntry::metadata()` reuses the `FindNextFileW` snapshot
+        // taken when the directory was enumerated, so its cached size never grows
+        // while `rurge run` still holds the file open for writing; a fresh
+        // `std::fs::metadata(path)` by-path stat does reflect the live size.
+        let ok = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(rd) = std::fs::read_dir(&logdir)
+                    && rd.filter_map(|e| e.ok()).any(|e| {
+                        e.file_name().to_string_lossy().starts_with("rurge.log")
+                            && std::fs::metadata(e.path())
+                                .map(|m| m.len() > 0)
+                                .unwrap_or(false)
+                    })
+                {
+                    return true;
+                }
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        })
+        .await
+        .unwrap();
+        drop(daemon);
+        assert!(ok, "no non-empty rurge.log* file was written");
     }
 
     #[test]

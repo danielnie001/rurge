@@ -17,6 +17,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// How long a graceful shutdown waits for active sessions before force-cancelling them.
 const GRACE: Duration = Duration::from_secs(5);
@@ -36,6 +38,9 @@ pub struct RunArgs {
     /// Log level override: verbose|info|notify|warning (also debug|error)
     #[arg(long, env = "RURGE_LOG_LEVEL", value_parser = parse_log_level, value_name = "LEVEL")]
     pub log_level: Option<LevelFilter>,
+    /// Also write logs to this file, rotated daily (7 kept)
+    #[arg(long, env = "RURGE_LOG_FILE", value_name = "PATH")]
+    pub log_file: Option<PathBuf>,
     /// Evaluate the profile as if running on this platform
     #[arg(long, value_parser = super::check::parse_platform)]
     pub platform: Option<Platform>,
@@ -77,12 +82,44 @@ pub(crate) fn level_for(level: &LogLevel) -> LevelFilter {
     }
 }
 
-fn init_logging(level: LevelFilter) {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(level)
+fn init_logging(
+    level: LevelFilter,
+    log_file: Option<&std::path::Path>,
+) -> anyhow::Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
+    let stdout_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
-        .with_ansi(std::io::stdout().is_terminal())
-        .try_init();
+        .with_ansi(std::io::stdout().is_terminal());
+    let registry = tracing_subscriber::registry()
+        .with(level)
+        .with(stdout_layer);
+    match log_file {
+        Some(path) => {
+            let dir = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let prefix = path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "rurge.log".to_string());
+            let appender = tracing_appender::rolling::Builder::new()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix(prefix)
+                .max_log_files(7)
+                .build(dir)
+                .with_context(|| format!("cannot open log file {}", path.display()))?;
+            let (nb, guard) = tracing_appender::non_blocking(appender);
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(nb);
+            let _ = registry.with(file_layer).try_init();
+            Ok(Some(guard))
+        }
+        None => {
+            let _ = registry.try_init();
+            Ok(None)
+        }
+    }
 }
 
 fn mode_name(mode: &OutboundMode) -> String {
@@ -248,10 +285,11 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     }
     print_diagnostics(&loaded.diagnostics.sorted());
     let cfg = loaded.config;
-    init_logging(
+    let _log_guard = init_logging(
         args.log_level
             .unwrap_or_else(|| level_for(&cfg.general.loglevel)),
-    );
+        args.log_file.as_deref(),
+    )?;
     let rt = args.runtime.resolve(&cfg)?;
     let outbound_mode = args.outbound_mode.clone();
     let run_opts = RunOptions {

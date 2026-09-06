@@ -62,6 +62,7 @@ rurge-inbound = { path = "crates/rurge-inbound" }
 rurge-engine = { path = "crates/rurge-engine" }
 base64 = "0.22"
 tokio-util = { version = "0.7", features = ["rt"] }
+tracing-appender = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
