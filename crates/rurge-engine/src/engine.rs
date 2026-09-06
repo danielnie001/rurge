@@ -8,7 +8,7 @@ use rurge_config::general::General;
 use rurge_config::rule::PolicyRef;
 use rurge_config::session::{ListenerKind, SessionInfo};
 use rurge_inbound::{
-    Counting, DialError, Dialed, Dialer, FailKind, HttpAuth, HttpListener, ListenerOpts, Running,
+    DialError, Dialed, Dialer, FailKind, HttpAuth, HttpListener, ListenerOpts, Running,
     SessionHandle, SessionOutcome, Socks5Listener,
 };
 use rurge_net::BoxFuture;
@@ -20,6 +20,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DROP_HOLD: Duration = Duration::from_secs(30);
@@ -38,6 +39,7 @@ pub struct ListenerSpec {
 pub struct Engine {
     runtime: ArcSwap<Runtime>,
     next_session: AtomicU64,
+    sessions_root: CancellationToken,
 }
 
 impl Engine {
@@ -45,6 +47,7 @@ impl Engine {
         Arc::new(Engine {
             runtime: ArcSwap::from_pointee(runtime),
             next_session: AtomicU64::new(0),
+            sessions_root: CancellationToken::new(),
         })
     }
 
@@ -138,7 +141,7 @@ impl Engine {
 
     fn new_handle(&self, session: SessionInfo) -> Arc<SessionHandle> {
         let id = self.next_session.fetch_add(1, Ordering::Relaxed) + 1;
-        let handle = SessionHandle::new(id, session);
+        let handle = SessionHandle::new_with_token(id, session, self.sessions_root.child_token());
         handle.on_finish(log_session);
         handle
     }
@@ -250,20 +253,12 @@ impl Dialer for Engine {
 
     fn relay<'a>(
         &'a self,
-        mut client: BoxedStream,
+        client: BoxedStream,
         upstream: BoxedStream,
         handle: Arc<SessionHandle>,
     ) -> BoxFuture<'a, ()> {
-        Box::pin(async move {
-            // Counting the upstream side gives the right directions (writes to
-            // upstream are `up`, reads from it are `down`) and keeps the tally
-            // as the bytes move, so a copy that dies half-way still reports it.
-            let mut upstream = Counting::new(upstream, handle.clone());
-            match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
-                Ok(_) => handle.finish(SessionOutcome::Completed),
-                Err(e) => handle.finish(SessionOutcome::Failed(e.to_string())),
-            }
-        })
+        let idle = self.runtime().idle_timeout;
+        Box::pin(crate::relay::pump(client, upstream, handle, idle))
     }
 }
 

@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionOutcome {
@@ -34,10 +35,20 @@ pub struct SessionHandle {
     finished: AtomicBool,
     outcome: Mutex<Option<SessionOutcome>>,
     on_finish: Mutex<Option<FinishHook>>,
+    token: CancellationToken,
+    killed: AtomicBool,
 }
 
 impl SessionHandle {
     pub fn new(id: u64, session: SessionInfo) -> Arc<SessionHandle> {
+        SessionHandle::new_with_token(id, session, CancellationToken::new())
+    }
+
+    pub fn new_with_token(
+        id: u64,
+        session: SessionInfo,
+        token: CancellationToken,
+    ) -> Arc<SessionHandle> {
         Arc::new(SessionHandle {
             id,
             started: Instant::now(),
@@ -50,7 +61,24 @@ impl SessionHandle {
             finished: AtomicBool::new(false),
             outcome: Mutex::new(None),
             on_finish: Mutex::new(None),
+            token,
+            killed: AtomicBool::new(false),
         })
+    }
+
+    /// The session's cancellation token; `relay` stops when it fires.
+    pub fn token(&self) -> &CancellationToken {
+        &self.token
+    }
+
+    /// Cancels the session (a `kill` request); `relay` will close and finish.
+    pub fn kill(&self) {
+        self.killed.store(true, Ordering::Relaxed);
+        self.token.cancel();
+    }
+
+    pub fn was_killed(&self) -> bool {
+        self.killed.load(Ordering::Relaxed)
     }
 
     pub fn id(&self) -> u64 {
@@ -265,5 +293,23 @@ mod tests {
         let mut buf2 = [0u8; 2];
         counted.read_exact(&mut buf2).await.unwrap();
         assert_eq!(h.bytes(), (5, 2));
+    }
+
+    #[test]
+    fn kill_cancels_the_token_and_marks_the_handle() {
+        let tok = tokio_util::sync::CancellationToken::new();
+        let h = SessionHandle::new_with_token(
+            9,
+            SessionInfo::tcp(HostName::parse("a.test"), 443),
+            tok.child_token(),
+        );
+        assert!(!h.token().is_cancelled());
+        assert!(!h.was_killed());
+        h.kill();
+        assert!(h.token().is_cancelled());
+        assert!(h.was_killed());
+        // cancelling the parent also cancels a plain handle's token
+        let h2 = SessionHandle::new(1, SessionInfo::tcp(HostName::parse("b.test"), 80));
+        assert!(!h2.token().is_cancelled());
     }
 }

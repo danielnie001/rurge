@@ -31,6 +31,9 @@ pub struct RunArgs {
     /// Evaluate the profile as if running on this platform
     #[arg(long, value_parser = super::check::parse_platform)]
     pub platform: Option<Platform>,
+    /// Close a session after this many seconds with no traffic either way (default 600)
+    #[arg(long, env = "RURGE_IDLE_TIMEOUT", value_name = "SECS")]
+    pub idle_timeout: Option<u64>,
     #[command(flatten)]
     pub runtime: RuntimeArgs,
 }
@@ -98,6 +101,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let state = State::load(&rt.data_dir.join(STATE_FILE));
     let selections = state.selections_for(&profile_key(&cfg.source.main));
     let outbound_mode = args.outbound_mode.clone();
+    let idle_timeout = Duration::from_secs(args.idle_timeout.unwrap_or(600).max(1));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -107,6 +111,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             RuntimeOptions {
                 stack: rt.stack_options(Duration::ZERO),
                 outbound_mode: outbound_mode.clone(),
+                idle_timeout,
                 selections,
             },
         )

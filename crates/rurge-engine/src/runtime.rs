@@ -6,10 +6,12 @@ use rurge_policy::{GroupSelections, PolicyRegistry};
 use rurge_proto::{Direct, OutboundRef};
 use rurge_rules::{OutboundMode, RuleEngine};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub struct RuntimeOptions {
     pub stack: StackOptions,
     pub outbound_mode: OutboundMode,
+    pub idle_timeout: Duration,
     pub selections: GroupSelections,
 }
 
@@ -19,6 +21,7 @@ pub struct Runtime {
     pub rules: RuleEngine,
     pub policies: PolicyRegistry,
     pub outbound_mode: OutboundMode,
+    pub idle_timeout: Duration,
 }
 
 impl Runtime {
@@ -36,6 +39,7 @@ impl Runtime {
             rules,
             policies,
             outbound_mode: opts.outbound_mode,
+            idle_timeout: opts.idle_timeout,
         })
     }
 

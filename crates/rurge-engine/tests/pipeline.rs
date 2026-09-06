@@ -96,6 +96,7 @@ async fn harness(general_extra: &str, rules: &str, mode: OutboundMode) -> Harnes
                 wait: Duration::ZERO,
             },
             outbound_mode: mode,
+            idle_timeout: Duration::from_secs(600),
             selections: GroupSelections::new(),
         },
     )
@@ -358,6 +359,86 @@ async fn harness_with_final_reject(mode: OutboundMode) -> Harness {
     harness("", "DOMAIN-SUFFIX,test,REJECT", mode).await
 }
 
+/// Builds a Runtime for a profile whose listeners are 127.0.0.1:0; `general_extra`
+/// lands in [General], `rules` before FINAL,DIRECT. Reused by later tests.
+async fn build_runtime(
+    dir: &std::path::Path,
+    dns: &MockDns,
+    general_extra: &str,
+    rules: &str,
+    mode: OutboundMode,
+    idle_timeout: Duration,
+) -> Runtime {
+    let profile = format!(
+        "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\ndns-server = {}\nipv6 = false\n{general_extra}\n\
+[Proxy]\nBlock = reject-tinygif\n[Proxy Group]\n[Rule]\n{rules}\nFINAL,DIRECT\n",
+        dns.addr()
+    );
+    let loaded = from_text(&profile, &dir.join("t.conf"), &LoadOptions::for_tests());
+    assert!(!loaded.diagnostics.has_errors());
+    Runtime::build(
+        loaded.config,
+        RuntimeOptions {
+            stack: StackOptions {
+                data_dir: dir.to_path_buf(),
+                no_network: true,
+                geo_urls: GeoUrls::default(),
+                dns_cache_size: 2000,
+                system: Arc::new(StaticSystemDns::default()),
+                wait: Duration::ZERO,
+            },
+            outbound_mode: mode,
+            idle_timeout,
+            selections: GroupSelections::new(),
+        },
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_sessions_are_closed() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let target = TestServer::spawn().await; // an HTTP server: it never speaks first
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = build_runtime(
+        dir.path(),
+        &dns,
+        "",
+        "", // the template already ends with FINAL,DIRECT
+        OutboundMode::Rule,
+        Duration::from_millis(300),
+    )
+    .await;
+    let engine = Engine::new(runtime);
+    let listeners = engine.bind_listeners().await.unwrap();
+    let socks = listeners
+        .iter()
+        .find(|(s, _)| s.kind == ListenerKind::Socks5)
+        .unwrap()
+        .1
+        .local_addr;
+    let mut s = TcpStream::connect(socks).await.unwrap();
+    s.write_all(&[5, 1, 0]).await.unwrap();
+    let mut r = [0u8; 2];
+    s.read_exact(&mut r).await.unwrap();
+    let mut req = vec![5, 1, 0, 3, 11];
+    req.extend_from_slice(b"target.test");
+    req.extend_from_slice(&target.url("/").port().unwrap().to_be_bytes());
+    s.write_all(&req).await.unwrap();
+    let mut reply = [0u8; 10];
+    s.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[1], 0, "tunnel established");
+    // no traffic either way → the relay closes the tunnel after the idle timeout
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(3), s.read(&mut buf))
+        .await
+        .expect("closed well before 3 s")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "client side closed by the idle timeout");
+}
+
 /// `relay` must count as the bytes move, so a copy that dies half-way still
 /// reports what it carried (M3 design §7.3).
 #[tokio::test]
@@ -423,8 +504,9 @@ async fn relay_counts_bytes_as_they_move_and_keeps_them_on_failure() {
     upstream.write_all(b"xyz").await.unwrap();
     let mut back = [0u8; 3];
     client_far.read_exact(&mut back).await.unwrap();
-    // The upstream vanishes; `copy_bidirectional` only returns once *both*
-    // directions are done, so the client keeps writing into the dead half.
+    // The upstream vanishes; `pump` sees the EOF and marks that side closed,
+    // but the client → upstream loop stays live, so the next client write
+    // hits the now-dead half and fails.
     drop(upstream);
     let _ = client_far.write_all(b"never delivered").await;
     tokio::time::timeout(Duration::from_secs(5), relayed)
@@ -500,6 +582,7 @@ async fn http_listener_password_from_the_profile() {
                 wait: Duration::ZERO,
             },
             outbound_mode: OutboundMode::Rule,
+            idle_timeout: Duration::from_secs(600),
             selections: GroupSelections::new(),
         },
     )
