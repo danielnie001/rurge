@@ -3364,6 +3364,15 @@ EOF
 | 12 | 模块文档「只有 IP 字面量 DNS 服务器走流水线」 | 订正为「Bootstrap 先解析域名再把 IP 目标交给流水线，域名配置的上游同样走流水线」 | 计划早期措辞错误（提交 5fbfa59 的说明无法修改，修复提交 28d20d6 的说明已订正） |
 | 12 | — | `MockDns::start` 改为 TCP+UDP 端口对最多重试 16 次 | 先绑 TCP 临时端口再硬要同号 UDP 端口且不重试，是本阶段测试抖动（`keep_alive_requests_are_dialed_one_by_one` 等）的根因 |
 | 12 | `PipelineConnector::fallback()` 访问器 | 删除 | 无调用者 |
+| 14 | 兼容性清单 3.2 表补备注 | 该表无备注列，`extended-matching` 的 M3b 说明写进「效果」列 | 表结构固定，加列会波及整表 |
+| 修复波 A1 | `Escalation` 表满时清理空闲条目后插入 | 清理后仍满则直接返回、不记录该主机（因而不会升级）；已有主机走 `get_mut` 不再分配 `String`；补 `escalation_map_is_bounded` | 原写法在窗口内全是新主机时无界增长，且每次插入都在锁内付一次 O(n) 清扫（与 `listener::warn_due` 已有的正确模式不一致） |
+| 修复波 A2 | `listen_addrs` 比较 `(kind, addr)` 集合 | 改为 `listener_surface`：`Vec<ListenerSpec>`（含 `auth`）+ `proxy-restricted-to-lan` + 两个错误页开关；设计文档 §7.4 与兼容性清单同步订正 | `ListenerOpts` 在 `bind` 时定型、之后不刷新，只比地址会让密码轮换与来源限制在重载后静默不生效而日志仍报成功 |
+| 修复波 A3 | `run.rs::reload` 手写 `stop` / `wait_closed` / `join` / `bind` 序列 | 收进 `Engine::rebind_listeners`（`REBIND_WAIT` 一并迁入 engine.rs）；`listeners.is_empty()` 时无条件重试绑定；重绑失败改记 `tracing::error!` 并说明「下次成功重载前没有任何监听器」 | 重绑失败留下「零监听器」退化态，而地址集合未变时后续重载不会再尝试绑定，守护进程只能重启 |
+| 修复波 A4 | 明文 HTTP 转发不监听会话令牌 | 上游驱动任务与 `sender.send_request` 都与令牌 `biased` 竞速（令牌优先），令牌先到则关闭客户端连接并 `Failed("killed")` / `Completed`；空闲超时对该路径不适用，登记进兼容性清单与设计文档 §7.3 | `RequestLog::kill` 对这类会话返回 `true` 却什么也没做（M4 的 `POST /v1/requests/{id}/kill` 会照抄这个谎报） |
+| 修复波 A5 | `TrafficStats::record` 的 `_ =>` 归入 HTTP 桶 | `Http` / `Socks5` 各自成桶，`Internal` / `Tun` / `Forward` 只计全局与按策略 | `Internal`（DNS 流水线会话）不是监听器，`encrypted-dns-follow-outbound-mode` 打开时会虚增 `by_listener()[Http]` |
+| 修复波 A6 | 关停 `select!` 的强制退出分支新建 `tokio::signal::ctrl_c()` | 复用长驻 `interrupt`（Unix 并上 `sigterm`），提示文案按平台区分 | 与主循环在提交 37d3fd5 修掉的是同一个 per-iteration 注册缺陷；且 systemd 下 SIGTERM 触发优雅退出后无法再强制退出 |
+| 修复波 A7 | CONNECT 隧道与上游驱动任务直接跑在 `TaskTracker` 上 | 外层任务 `await` 一个内层 `tokio::spawn`，`JoinError::is_panic` 记 ERROR | 从监听器 `JoinSet` 迁到 tracker 也迁出了它的 panic 处理（设计 §6.4 要求记 ERROR） |
+| 修复波 A8 | `bind_listeners` 记 INFO `listening` | 降为 DEBUG；`rurge run` 启动成功后补一条 INFO `rurge running`（与 stdout 摘要同源）；`--log-file` 用例改为断言文件含该行 | 每个监听器在 `loglevel = notify` 下被宣告两次；降级后文件层需要保留一条 INFO 落点，用例也从「文件非空」加强为「含启动 INFO 行」 |
 
 ## 延后事项
 
@@ -3393,4 +3402,11 @@ EOF
 - `FinishOnDrop` 一律记 `Completed`（DNS 连接中途死亡或 REJECT 保底路径也如此）；`dial_internal` 忽略调用方的 `ConnectOpts`（上游自身仍有截止时间）；`dial` 与 `dial_internal` 约 45 行近似重复。
 - 内部 DNS 会话沿用 `SessionInfo::tcp` 默认 `src = 127.0.0.1:0`、`in_port = 0`，`SRC-IP,127.0.0.1/32` / `IN-PORT,0` 可能匹配到它们；`RequestLog::kill` 对 DNS 会话是空操作（DNS 路径不监听令牌）。已登记进兼容性清单（`encrypted-dns-follow-outbound-mode` 行）。
 - 测试基础设施：全工作区并行跑测试时 `rurge-inbound` 测试二进制两次出现瞬时 `STATUS_HEAP_CORRUPTION` 退出（单独重跑均通过，无法复现）；怀疑 `TestServer` TLS 路径的原生依赖在并行压力下出问题，需要复现与排查。
+
+以下四项由 M3b 最终整支审查分诊，控制器裁决为「只登记、本波不改」：
+
+- **m2 速率采样重复计一次**：`start_sampler` 先读 `RequestLog::active_bytes()` 再调 `TrafficStats::sample`（内部读累计 `up` / `down`），两次读之间结束的会话会被同时计入活动与累计，产生一秒的速率尖峰、随后一秒被 `saturating_sub` 夹到 0。`rate_is_the_delta_between_samples` 已断言夹取行为。修法是先快照累计再读活动并扣掉期间结束的句柄，M4 暴露 `GET /v1/traffic` 时一并处理。
+- **m6 `relay` 的空闲阈值取自当前代**：`Engine::relay` 读 `self.runtime().idle_timeout` 而不是会话 dial 时的快照，与 AR-04「会话只看自己那一代」有出入。今天无害，因为该值来自 CLI 参数、重载时原样带过；要么把 `idle` 挂到 `SessionHandle` 上，要么在文档注释里写明意图。
+- **m10 / m11 重复代码（裁决：合并前不必改）**：`FailKind` → 文案映射在 `connect` / `forward` 各一份（5 行、两份完全相同，阶段 4 会整体替换 `forward`）；`dial` / `dial_internal` 约 45 行近似重复（两者在每个错误分支与 `DnsFailed` 结局上都不同，现在抽公共函数只会得到分支比重复更多的辅助函数）。后者在 M4 的 `set_outbound_mode` 落地时重新评估。
+- **I5 Unix 信号代码只经阅读审查**：`run.rs` 的 `#[cfg(unix)]` 块（含本波 A6 改动）与 `tests/cli.rs` 的 SIGINT 用例在本机（Windows）无法编译验证——`cargo check --target x86_64-unknown-linux-gnu` 因 aws-lc / ring 的构建脚本需要 `x86_64-linux-gnu-gcc` 而失败，本机没有交叉 C 工具链。唯一有效覆盖是计划 §10 验收标准里的三平台 CI，需在合并前后尽快落地；本机那个 rustup 目标只会造成「已验证」的错觉，应当移除。
 

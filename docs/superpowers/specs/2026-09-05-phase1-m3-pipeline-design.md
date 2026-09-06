@@ -203,6 +203,7 @@ impl Dialer for Engine { .. }
 - `SessionHandle::finish` 只触发一次：写一条日志 —— `Completed` 为 DEBUG（`loglevel = info` 可见），`Failed` / `Rejected` 为 INFO；字段 `session`、`listener`、`src`、`dst`、`rule`、`policy`（chain 用 ` > ` 连接）、`up`、`down`、`elapsed_ms`、`error`。
 - M3b：`RequestLog`（环形缓冲，默认 1000，`--request-log-size`；活动索引支持 `kill`）与 `TrafficStats`（总计、按策略、按监听器的原子计数；每秒采样速率）从同一份 handle 数据填充；M4 的 `GET /v1/requests/*`、`/v1/traffic` 只读它们。
 - 实施订正（M3b）：relay 换成手写可中断双向泵（`relay.rs::pump`），不是 `copy_bidirectional` 的变体——`tokio::io::split` 拆成两个方向，各自跑一个独立的 `copy_half`（`tokio::join!`），每次 `read` 与 `write_all` 都与会话令牌的子令牌竞速，因此一个方向卡在 `write_all` 上不会挡住另一方向（无队头阻塞）；另起一个 `idle_watchdog` 任务，两个方向都无字节移动超过 `idle`（默认 600 s，`--idle-timeout` 覆盖）时取消该子令牌。结束原因三选一并分别记录：`kill` → `Failed("killed")`；父令牌取消（优雅退出）→ `Completed`；空闲计时器触发 → `Completed`。
+- 实施订正（M3b 修复波）：空闲超时只覆盖经 `pump` 的会话（CONNECT / SOCKS5）。明文 HTTP 转发不经过 `pump`，因此 `--idle-timeout` 对它不适用——保活等待由 hyper 自身的 `header_read_timeout` 覆盖，单次交换的寿命由上游连接自身约束（阶段 4 自有 HTTP 引擎后统一）。该路径仍然监听会话令牌：驱动上游连接的任务与 `send_request` 都与令牌竞速（令牌优先），因此 `kill` → `Failed("killed")`、优雅退出的 `cancel_sessions` → `Completed`，与 `pump` 的结束原因阶梯一致；已登记进兼容性清单的 `idle-timeout` 行。
 
 ### 7.4 M3b 的引擎扩展
 
@@ -212,6 +213,7 @@ impl Dialer for Engine { .. }
 - **优雅退出**：Ctrl-C / SIGTERM → 停止 accept → 等活动会话最多 5 s → 退出；第二次 Ctrl-C 立即退出。
 - **`encrypted-dns-follow-outbound-mode`**：为 `Resolver` 注入「走流水线的连接器」——DNS 上游连接组成 `SessionInfo { protocol: Some(Doh / Dot / Dns) }` 经 dial 分流；防环：DNS 会话内部的解析用 `Bootstrap`（不再进入规则引擎），命中的策略若是域名配置的代理则告警并回退 DIRECT（阶段 2 有代理后才可能触发）。
 - 实施订正（M3b）：SNI 嗅探不是「dial 前 peek」，而是 `pump` 里客户端→上游方向 `copy_half` 的首个非空 chunk 钩子（≤ 8 KiB，即 relay 的读缓冲大小）——HTTP 明文转发不经过 `pump`，因此不嗅探；只解析单个 ClientHello，跨 TCP 段的分片本段解析不到就放弃、不做拼接；结果只填 `session.sni` / `protocol` 供请求记录与日志观测，路由仍按 CONNECT / SOCKS5 的目标主机，基于 SNI 的路由留给阶段 4。REJECT 自动升级按 `count >= 50` 判定，即第 50 次拒绝本身就已按 DROP 处理（不是第 51 次才升级）；计数以目标主机字符串为键的滑动窗口（30 s），超过 4096 个不同主机时清理空闲条目。热重载没有做「DNS 相关键未变则复用旧 Resolver」的优化——`Runtime::build` 每代都完整重跑 `build_stack`（资源 → 规则集 → GeoIP → Resolver），因此每次重载都清空 DNS 缓存。`encrypted-dns-follow-outbound-mode` 的连接器挂在 `Resolver` 自带的 `BootstrapConnector` 内层：上游主机名由 Bootstrap 用明文 UDP 先解析，流水线侧的连接器只会看到 IP 目标（域名分支只是防御性兜底，正常路径不会走到），因此域名规则不会匹配上游服务器的主机名，且这类内部会话的 `SRC-IP` / `IN-PORT` 是 `SessionInfo::tcp` 的占位默认值（`127.0.0.1:0` / `0`），`kill` 对其无效（DNS 路径不监听取消令牌）；被规则 REJECT 时回退到直连以保证 DNS 不因规则配置整体失效；UDP 上游不经过 `Connector`，不受影响。
+- 实施订正（M3b 修复波）：重建监听器的判据是**监听器配置面**（`Engine::listener_specs` 的地址集合、`password@` / `allow-wifi-access` 认证、`proxy-restricted-to-lan`、`show-error-page` 与 `show-error-page-for-reject`）任一变化，而不只是「监听地址集合变化」。`ListenerOpts` 在 `bind` 时定型、之后不再刷新，只比地址会让密码轮换与来源限制在重载后静默不生效，而日志仍记 `profile reloaded`。整条重绑序列（`stop` → `wait_closed`（上界 `REBIND_WAIT` = 2 s）→ 后台 `join` 排空 → `bind_listeners`）收进 `Engine::rebind_listeners`；重绑失败会留下「零监听器」的退化态，因此 `rurge run` 在监听器列表为空时无条件重试绑定，并把失败记为 ERROR。REJECT 自动升级的 4096 主机上限是硬上限：表满且清理不出空位时，新主机不被记录（因而不会升级），与 `listener::warn_due` 同一模式。
 
 ## 8. REJECT 语义与错误处理
 

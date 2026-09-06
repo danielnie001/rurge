@@ -164,8 +164,8 @@
 | `block-quic` | `per-policy` `all-proxy` `all` `always-allow`；默认 `per-policy` | 全部 | ✅ | 2 | |
 | `show-error-page` | 布尔；默认 true | Mac 5.8+ | 🟡 | 1 | 错误页为 rurge 自己的 HTML（写明规则、策略链、会话 id）；对连接失败的 502 页在 M3a 只覆盖明文请求，CONNECT 连接失败的 502 已实现（M3b） |
 | `show-error-page-for-reject` | 布尔；默认 false | 全部 | 🟡 | 1 | 错误页为 rurge 自己的 HTML（写明规则、策略链、会话 id） |
-| 空闲超时（`--idle-timeout`） | Surge 未公开默认值 | 全部 | 🟡 | 1 | rurge 默认 600 s，`--idle-timeout` 覆盖（M3b，专有运行时选项，不是 Surge 配置键） |
-| 请求记录（RequestLog） | rurge 专有能力，无对应 Surge 配置键 | 全部 | ✅ | 1（基础） | 内存环形缓冲（`--request-log-size`，默认 1000）+ 活动索引 + `kill`（M3b）；完整 HTTP API 在 M4 / 阶段 6 |
+| 空闲超时（`--idle-timeout`） | Surge 未公开默认值 | 全部 | 🟡 | 1 | rurge 默认 600 s，`--idle-timeout` 覆盖（M3b，专有运行时选项，不是 Surge 配置键）；只作用于 CONNECT / SOCKS5 的中继会话，**明文 HTTP 转发不受其约束**（该路径不经中继泵，保活等待由 hyper 的 `header_read_timeout` 覆盖，单次交换由上游连接寿命约束；阶段 4 自有 HTTP 引擎后统一） |
+| 请求记录（RequestLog） | rurge 专有能力，无对应 Surge 配置键 | 全部 | ✅ | 1（基础） | 内存环形缓冲（`--request-log-size`，默认 1000）+ 活动索引 + `kill`（M3b）；`kill` 对 CONNECT / SOCKS5 与明文 HTTP 转发会话均有效（明文转发在 M3b 修复波补齐），对内部 DNS 会话仍是空操作；完整 HTTP API 在 M4 / 阶段 6 |
 | 流量统计（TrafficStats） | rurge 专有能力，无对应 Surge 配置键 | 全部 | ✅ | 1（基础） | 总计 / 按策略 / 按监听器原子计数 + 每秒采样速率（M3b）；完整 HTTP API 在 M4 / 阶段 6 |
 
 ### 2.2 iOS 专属参数
@@ -304,7 +304,7 @@
 | 项 | Surge 行为 | Surge 平台 | rurge | 阶段 | 备注 |
 | --- | --- | --- | --- | --- | --- |
 | `DIRECT` | 直连 | 全部 | ✅ | 1 | |
-| `REJECT` | 拒绝；HTTP 请求返回错误页（受 `show-error-page-for-reject` 控制）；同一主机 30 秒内触发 50 次自动升级为 `REJECT-DROP` | 全部 | ✅ | 1 | 同主机 30 s 内 50 次可升级拒绝后自动升级 REJECT-DROP（M3b） |
+| `REJECT` | 拒绝；HTTP 请求返回错误页（受 `show-error-page-for-reject` 控制）；同一主机 30 秒内触发 50 次自动升级为 `REJECT-DROP` | 全部 | ✅ | 1 | 同主机 30 s 内 50 次可升级拒绝后自动升级 REJECT-DROP（M3b）；按 `count >= 50` 判定，即**第 50 次拒绝本身就已按 DROP 处理**（不是第 51 次才升级）；计数表上限 4096 个主机，表满且无空闲条目可清时新主机不被记录、因而不会升级 |
 | `REJECT-TINYGIF` | 拒绝；HTTP 请求返回 1px 透明 GIF | 全部 | ✅ | 1 | |
 | `REJECT-DROP` | 静默丢弃连接 | 全部 | 🟡 | 1 | rurge 最多保持 30 s（M3b 可调）；Surge 直到客户端超时；SOCKS5 侧客户端先关闭则提前结束，HTTP 侧固定保持到超时（hyper 服务内观察不到客户端关闭，阶段 4 自有 HTTP 引擎后统一） |
 | `REJECT-NO-DROP` | 拒绝且永不升级为 DROP | 全部 | ✅ | 1 | |
@@ -806,7 +806,7 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | `dump summary/performance/rule-usage/virtual-ip` `watch speed` `log` `log watch` `logbook` `proxy-runtime-status` | 检视 | 同名 | 6 | |
 | `script list/run` `script-log` `benchmark encryption/rule-matching` `test-policy-bandwidth` | 自动化与基准 | 同名 | 6 | |
 | `device` `reconnect-device` `vmnet` `security ban` | 网关 | `device` `security ban` 同名；`reconnect-device` 🔁；`vmnet` 🟡 按平台 | 7 | |
-| `reload` `switch-profile` `kill` `stop` `unattended-upgrade` | 控制 | `reload` `switch-profile` `kill` `stop` 同名；`unattended-upgrade` 🔁 | 1 / 6 | rurge 自身更新由包管理器负责；SIGHUP / `--watch` 的配置热重载已实现（M3b，重建整个 Stack 并按监听地址差异重建监听器，DNS 缓存随之清空）；`--watch` 的监视列表在启动时固定，重载新增的 `#!include` 需重启才会被监视；`rurge reload` 命令与 API 触发仍在 M4 |
+| `reload` `switch-profile` `kill` `stop` `unattended-upgrade` | 控制 | `reload` `switch-profile` `kill` `stop` 同名；`unattended-upgrade` 🔁 | 1 / 6 | rurge 自身更新由包管理器负责；SIGHUP / `--watch` 的配置热重载已实现（M3b，重建整个 Stack，DNS 缓存随之清空）；重建监听器的判据是**监听器配置面**（监听地址集合、`password@` / wifi 认证、`proxy-restricted-to-lan`、两个错误页开关）任一变化——只比地址会让密码轮换与来源限制静默不生效（M3b 修复波订正）；重绑失败会留下「零监听器」的退化态，此时下一次重载无条件重试绑定；`--watch` 的监视列表在启动时固定，重载新增的 `#!include` 需重启才会被监视；`rurge reload` 命令与 API 触发仍在 M4 |
 | `environment` `set` `set-log-level` | 环境 | 同名 | 6 | |
 | Agent Skill（Mac 6.5+） | 面向 AI 代理的技能文档 | 🟡 | 6 | rurge 仓库可提供等价 skill 文档 |
 | rurge 专有 | 守护进程 | `rurge run -c <path> [--tun] [--system-proxy]`、`rurge service install/uninstall`、`rurge mitm ca generate/export` | 1 / 3 / 4 | |
