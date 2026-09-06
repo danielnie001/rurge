@@ -37,8 +37,13 @@ pub const DEFAULT_SOCKS5_PORT: u16 = 6153;
 pub const ESCALATE_WINDOW: Duration = Duration::from_secs(30);
 /// Escalating rejects for one host inside `ESCALATE_WINDOW` before REJECT-DROP kicks in.
 pub const ESCALATE_COUNT: usize = 50;
-/// Upper bound on tracked hosts before a sweep evicts idle entries.
+/// Hard upper bound on tracked hosts. A full table is first swept of hosts
+/// whose window has emptied; a new host that still does not fit is not
+/// tracked at all, so it never escalates (same bound as `listener::warn_due`).
 const ESCALATE_MAX_HOSTS: usize = 4096;
+/// How long a rebind waits for an old listener's socket to close before
+/// binding the new one (Windows sets no `SO_REUSEADDR`).
+pub const REBIND_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListenerSpec {
@@ -66,18 +71,28 @@ impl Escalation {
         }
     }
 
-    /// Records one escalating reject for `host` at `now`.
+    /// Records one escalating reject for `host` at `now`. A full table is
+    /// swept of hosts whose window has emptied; if that frees nothing, `host`
+    /// is not remembered (and so never escalates) rather than growing the
+    /// table — a reject flood to fresh hosts must not cost unbounded memory
+    /// nor an O(n) sweep per reject under this lock.
     fn record(&self, host: &str, now: Instant) {
         let mut map = self.hosts.lock().expect("escalation");
-        if map.len() >= ESCALATE_MAX_HOSTS && !map.contains_key(host) {
+        if let Some(times) = map.get_mut(host) {
+            times.push_back(now);
+            prune(times, now);
+            return;
+        }
+        if map.len() >= ESCALATE_MAX_HOSTS {
             map.retain(|_, times| {
                 prune(times, now);
                 !times.is_empty()
             });
+            if map.len() >= ESCALATE_MAX_HOSTS {
+                return;
+            }
         }
-        let times = map.entry(host.to_string()).or_default();
-        times.push_back(now);
-        prune(times, now);
+        map.insert(host.to_string(), VecDeque::from([now]));
     }
 
     /// Whether `host` has reached the threshold within the window.
@@ -90,6 +105,11 @@ impl Escalation {
             }
             None => false,
         }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.hosts.lock().expect("escalation").len()
     }
 }
 
@@ -235,10 +255,39 @@ impl Engine {
                 // never produced by `listener_specs`; listed so a new kind breaks the build
                 ListenerKind::Tun | ListenerKind::Forward | ListenerKind::Internal => continue,
             };
-            tracing::info!(kind = ?spec.kind, addr = %running.local_addr, "listening");
+            // DEBUG, not INFO: `rurge run` prints the authoritative
+            // `listening on …` line on stdout, and announcing every listener
+            // twice at `loglevel = notify` helps nobody.
+            tracing::debug!(kind = ?spec.kind, addr = %running.local_addr, "listening");
             out.push((spec, running));
         }
         Ok(out)
+    }
+
+    /// Replaces `old` with listeners bound from the current generation: stop
+    /// the old accept loops, wait until their sockets are closed (so the
+    /// addresses can be bound again; Windows sets no `SO_REUSEADDR`), then let
+    /// their in-flight sessions drain in the background — dropping the old
+    /// `Running`s would abort them instead.
+    ///
+    /// The old listeners are gone before the new ones are attempted, so a
+    /// failure leaves the caller with none; call again (with an empty `old`)
+    /// once the addresses are free to recover.
+    pub async fn rebind_listeners(
+        self: &Arc<Self>,
+        old: Vec<(ListenerSpec, Running)>,
+    ) -> io::Result<Vec<(ListenerSpec, Running)>> {
+        let olds: Vec<Running> = old.into_iter().map(|(_, r)| r).collect();
+        for o in &olds {
+            o.stop();
+        }
+        for o in &olds {
+            let _ = tokio::time::timeout(REBIND_WAIT, o.wait_closed()).await;
+        }
+        for o in olds {
+            tokio::spawn(o.join());
+        }
+        self.bind_listeners().await
     }
 
     fn new_handle(&self, session: SessionInfo) -> Arc<SessionHandle> {
@@ -582,5 +631,31 @@ mod tests {
         assert!(!esc.should_drop("other.test", t0 + Duration::from_secs(1)));
         // once the window slides past, the count decays
         assert!(!esc.should_drop("ads.test", t0 + ESCALATE_WINDOW + Duration::from_secs(1)));
+    }
+
+    /// A reject flood to distinct hosts (a retry storm against random
+    /// subdomains) must not grow the table without limit: nothing is
+    /// reclaimable inside the window, so the hosts past the cap are simply
+    /// not tracked.
+    #[test]
+    fn escalation_map_is_bounded() {
+        let esc = Escalation::new();
+        let t0 = std::time::Instant::now();
+        for i in 0..(ESCALATE_MAX_HOSTS + 100) {
+            esc.record(&format!("h{i}.test"), t0);
+        }
+        assert!(esc.len() <= ESCALATE_MAX_HOSTS, "{} tracked", esc.len());
+        // the first host past the cap is untracked, so it can never escalate
+        let overflow = format!("h{ESCALATE_MAX_HOSTS}.test");
+        for _ in 0..ESCALATE_COUNT {
+            esc.record(&overflow, t0);
+        }
+        assert!(!esc.should_drop(&overflow, t0));
+        assert!(esc.len() <= ESCALATE_MAX_HOSTS);
+        // a host recorded before the cap was reached still escalates
+        for _ in 1..ESCALATE_COUNT {
+            esc.record("h0.test", t0);
+        }
+        assert!(esc.should_drop("h0.test", t0));
     }
 }

@@ -239,14 +239,18 @@ impl TrafficStats {
         self.up.fetch_add(up, Ordering::Relaxed);
         self.down.fetch_add(down, Ordering::Relaxed);
         match h.session().listener {
+            ListenerKind::Http => {
+                self.http_up.fetch_add(up, Ordering::Relaxed);
+                self.http_down.fetch_add(down, Ordering::Relaxed);
+            }
             ListenerKind::Socks5 => {
                 self.socks_up.fetch_add(up, Ordering::Relaxed);
                 self.socks_down.fetch_add(down, Ordering::Relaxed);
             }
-            _ => {
-                self.http_up.fetch_add(up, Ordering::Relaxed);
-                self.http_down.fetch_add(down, Ordering::Relaxed);
-            }
+            // Not listeners: `Internal` is the DNS pipeline's own sessions,
+            // `Tun` / `Forward` arrive later. They count towards the global
+            // and per-policy totals only, never into a listener bucket.
+            ListenerKind::Internal | ListenerKind::Tun | ListenerKind::Forward => {}
         }
         if let Some(policy) = h
             .policy_chain()
@@ -493,6 +497,26 @@ mod tests {
                 ("REJECT".to_string(), 7, 11),
             ]
         );
+    }
+
+    /// `Internal` (the DNS pipeline's own sessions) is not a listener: its
+    /// bytes must not inflate `by_listener()[Http]`, which M4 serves from
+    /// `GET /v1/traffic`.
+    #[test]
+    fn internal_sessions_stay_out_of_the_listener_buckets() {
+        let t = TrafficStats::new();
+        let mut s = SessionInfo::tcp(HostName::parse("1.1.1.1"), 853);
+        s.listener = ListenerKind::Internal;
+        let h = SessionHandle::new(1, s);
+        h.set_policy_chain(vec!["DIRECT".into()]);
+        h.add_up(40);
+        h.add_down(90);
+        t.record(&h);
+        assert_eq!((t.totals().up, t.totals().down), (40, 90));
+        for (kind, up, down) in t.by_listener() {
+            assert_eq!((up, down), (0, 0), "{kind:?} bucket moved");
+        }
+        assert_eq!(t.by_policy(), vec![("DIRECT".to_string(), 40, 90)]);
     }
 
     #[test]
