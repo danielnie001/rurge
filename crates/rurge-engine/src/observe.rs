@@ -413,6 +413,60 @@ mod tests {
         assert_eq!((http.1, http.2), (100, 200));
         let by_p = t.by_policy();
         assert_eq!(by_p, vec![("DIRECT".to_string(), 100, 200)]);
+
+        // a SOCKS5 session routed through a group whose member is unsupported:
+        // the per-policy key is the last entry that is not a `!` marker
+        let mut s = SessionInfo::tcp(HostName::parse("s.test"), 443);
+        s.listener = ListenerKind::Socks5;
+        let b = SessionHandle::new(2, s);
+        b.set_policy_chain(vec![
+            "Pick".into(),
+            "HK".into(),
+            "!unsupported:ss".into(),
+            "REJECT".into(),
+        ]);
+        b.add_up(7);
+        b.add_down(11);
+        t.record(&b);
+        assert_eq!((t.totals().up, t.totals().down), (107, 211));
+        let by_l = t.by_listener();
+        let socks = by_l
+            .iter()
+            .find(|(k, _, _)| *k == ListenerKind::Socks5)
+            .unwrap();
+        assert_eq!((socks.1, socks.2), (7, 11));
+        let http = by_l
+            .iter()
+            .find(|(k, _, _)| *k == ListenerKind::Http)
+            .unwrap();
+        assert_eq!(
+            (http.1, http.2),
+            (100, 200),
+            "unchanged by the SOCKS5 session"
+        );
+        assert_eq!(
+            t.by_policy(),
+            vec![
+                ("DIRECT".to_string(), 100, 200),
+                ("REJECT".to_string(), 7, 11)
+            ]
+        );
+
+        // a chain ending in a `!` marker: distinguishes "last entry that is
+        // not a marker" from a naive `.last()`, which would wrongly key this
+        // session under "!unsupported:vmess" instead of "Block"
+        let c = handle(3, "c.test");
+        c.set_policy_chain(vec!["Block".into(), "!unsupported:vmess".into()]);
+        c.add_up(1);
+        t.record(&c);
+        assert_eq!(
+            t.by_policy(),
+            vec![
+                ("Block".to_string(), 1, 0),
+                ("DIRECT".to_string(), 100, 200),
+                ("REJECT".to_string(), 7, 11),
+            ]
+        );
     }
 
     #[test]
