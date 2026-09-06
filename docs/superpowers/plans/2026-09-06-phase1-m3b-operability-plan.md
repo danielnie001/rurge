@@ -3344,7 +3344,26 @@ EOF
 
 | 任务 | 计划内容 | 实际处理 | 原因 |
 | --- | --- | --- | --- |
-| （执行时填写） | | | |
+| 1 | `pump` 为单循环 `select!`，写入在分支内 | 改为 `tokio::io::split` 双半 + `copy_half`（每次读写都与停止令牌竞速）+ 空闲看门狗；写入失败记 `Failed(e)` | 分支内的 `write_all` 不可中断，kill / 空闲超时救不了被对端堵住的会话；单循环两个方向互相队头阻塞 |
+| 1 | 无 | `rurge-engine` dev-dependencies 的 `tokio` 加 `test-util` | `start_paused` 空闲测试需要（沿用 rurge-dns 先例） |
+| 2 | 简报 Interfaces 列了 `Engine::close_tracker` | 未实现（各处直接 `tracker().close()`） | 简报摘要的陈旧条目，无任何步骤定义或调用它 |
+| 2 | `Running { task, stop }` | 增 `closed` 门闩与 `wait_closed()`；`serve` 在 `drop(listener)` 后触发 | 重载重绑前必须确认旧 socket 已关（Windows 无 `SO_REUSEADDR`） |
+| 2 | 宽限期分支直接 `cancel_sessions()` | `drain` 先 `tokio::pin!` 再按引用轮询，宽限到期先取消再继续等同一个 drain（≤1 s） | `select!` 会先丢弃分支 future，原写法在取消前就 abort 了监听器及其 JoinSet 里的会话 |
+| 2 | 排空测试只等 `tracker.wait()` | 加 200 ms 反证（取消前必须超时）；CONNECT 应答读取加 3 s 上界；新增 SOCKS5 `stop → wait_closed → 在飞会话仍转发 → join` 用例 | 原用例在 tracker 已关且为空时立即通过，无法失败 |
+| 2 | — | Unix 专属 `run_shuts_down_gracefully_on_sigint` 未在本机（Windows）编译运行，只做了独立编译核对 | 本机无法向子进程发 SIGINT |
+| 4 | 两条测试只用 HTTP 会话 + `["DIRECT"]` 链 | 追加 SOCKS5 会话（链 `["Pick","HK","!unsupported:ss","REJECT"]`）与 `["Block","!unsupported:vmess"]`，变异验证通过 | 原测试无法区分 Socks5 分支与「最后一个非 `!` 项」取键规则 |
+| 5 | 活动索引持 `Arc<SessionHandle>` | 改持 `Weak`，快照 / `kill` 时清理死条目；SOCKS5 成功应答写失败的早退路径补 `finish` | 早退未 finish 的句柄会在强引用索引里永久滞留 |
+| 5 | 钩子先写记录再记流量 | 先 `traffic.record` 再 `record_finished` | 读者不会看到有记录无字节的瞬间 |
+| 6 | `pump` 单循环客户端分支内嗅探 | 作为 `copy_half` 的 `first: Option<FirstChunkHook>` 首段钩子，只挂客户端→上游半边 | relay 已在 Task 1 修复轮改为分半结构 |
+| 10 | 循环内每轮 `tokio::signal::ctrl_c()` | 循环外建一次长驻中断流（Unix `SignalKind::interrupt()` / Windows `signal::windows::ctrl_c()`）并 `recv()` | 重载期间（可达数秒）到达的 Ctrl-C 会被新注册的监听丢掉 |
+| 10 | 重绑失败仍记 `profile reloaded` | 重绑失败 `eprintln!` 后直接返回 | 避免误报成功 |
+| 10 | — | 实施者为交叉核对 Unix 分支安装了 rustup 目标 `x86_64-unknown-linux-gnu` | 本机环境副作用，可 `rustup target remove x86_64-unknown-linux-gnu` |
+| 11 | 测试用 `DirEntry::metadata()` 判断文件非空 | 改用 `std::fs::metadata(path)` | Windows 下 `DirEntry::metadata()` 复用目录枚举缓存，写入进程持有句柄时大小不更新 |
+| 12 | 单测连 `127.0.0.1:9` 期望失败 | 改为绑定回环监听并断言 fallback 连接成功；`BoxedStream` 无 `Debug` | 本机 9 端口开放；`{res:?}` 不编译 |
+| 12 | REJECT 保底分支 `fallback.connect(..)?` | 保底连接也失败时先 `finish(Failed)` 再上抛 | 否则句柄不 finish、不进记录 |
+| 12 | 模块文档「只有 IP 字面量 DNS 服务器走流水线」 | 订正为「Bootstrap 先解析域名再把 IP 目标交给流水线，域名配置的上游同样走流水线」 | 计划早期措辞错误（提交 5fbfa59 的说明无法修改，修复提交 28d20d6 的说明已订正） |
+| 12 | — | `MockDns::start` 改为 TCP+UDP 端口对最多重试 16 次 | 先绑 TCP 临时端口再硬要同号 UDP 端口且不重试，是本阶段测试抖动（`keep_alive_requests_are_dialed_one_by_one` 等）的根因 |
+| 12 | `PipelineConnector::fallback()` 访问器 | 删除 | 无调用者 |
 
 ## 延后事项
 
@@ -3359,4 +3378,19 @@ EOF
 - `State::load` 为同步读取（M4 引入写入与 HTTP API 时改异步）。
 - SNI 嗅探只看 relay 的第一段客户端数据；ClientHello 若跨多个 TCP 段（大 ClientHello / 分片），本段解析不到 SNI 就放弃，不做拼接。
 - `rurge reload` / `stop` 命令与 HTTP API 触发（M4）；`state.json` 写入与 `outbound_mode` 持久化（M4）。
+- `copy_half` 里 `writer.shutdown()` 是唯一不与停止令牌竞速的 await（TCP FIN 不阻塞；阶段 2 TLS 出站的 close_notify 会成为潜在卡点）。
+- 被取消时正在进行的 `write_all` 已写出的部分字节不计数（≤ 8 KiB）。
+- `Engine::stop_accepting` 不可逆（之后绑定的监听器拿到的是已取消的子令牌）；`serve` 的 `stop` 分支未 `biased`（停止后可能再多接受 1–2 个连接）；`tracker()` 缺文档注释；Unix CLI 关停测试在进程退出后才读 stdout 行。
+- 排空测试里 `TcpStream::connect(addr)` 的「拒绝」检查没有超时包裹。
+- `RequestLog::active_bytes()` 无专用用例；`kill` 的假路径只用未注册 id 测过。
+- `TrafficStats::sample` 分两个原子写 `rate_up` / `rate_down`（仅多采样器并发时可能读到撕裂值）。
+- 速率采样任务在 `bind_listeners` 失败的早退路径上只在运行时销毁时回收；`Engine::kill` 无引擎级用例。
+- SNI：解析器测试只覆盖单扩展 ClientHello；SNI 字符串未校验 / 未小写化（仅进记录与日志）；pipeline 的轮询与 `wait_for_record` 重复（后者只看 `recent`）。
+- `FailKind` → 文案映射在 `connect` 与 `forward` 各一份。
+- `store_runtime` 里全限定 `std::sync::Arc::new`（外观）；旧会话排空期间新旧两代 `GeoUpdater` 可能同时指向 `data_dir/geoip`。
+- `--watch` 的监视列表在启动时冻结（重载新增的 `#!include` 直到重启才被监视）；同目录多个 include 会重复 `watch` 并重复告警；去抖没有最长等待上限；CLI 用例的重载前检查只证明「未放行」而非「被规则拒绝」。
+- `--log-file` 的文件层未 `with_target(false)`，与 stdout 格式略有不同。
+- `FinishOnDrop` 一律记 `Completed`（DNS 连接中途死亡或 REJECT 保底路径也如此）；`dial_internal` 忽略调用方的 `ConnectOpts`（上游自身仍有截止时间）；`dial` 与 `dial_internal` 约 45 行近似重复。
+- 内部 DNS 会话沿用 `SessionInfo::tcp` 默认 `src = 127.0.0.1:0`、`in_port = 0`，`SRC-IP,127.0.0.1/32` / `IN-PORT,0` 可能匹配到它们；`RequestLog::kill` 对 DNS 会话是空操作（DNS 路径不监听令牌）。已登记进兼容性清单（`encrypted-dns-follow-outbound-mode` 行）。
+- 测试基础设施：全工作区并行跑测试时 `rurge-inbound` 测试二进制两次出现瞬时 `STATUS_HEAP_CORRUPTION` 退出（单独重跑均通过，无法复现）；怀疑 `TestServer` TLS 路径的原生依赖在并行压力下出问题，需要复现与排查。
 

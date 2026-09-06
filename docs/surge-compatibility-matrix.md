@@ -126,12 +126,12 @@
 
 | 键 | 取值 / 默认 | Surge 平台 | rurge | 阶段 | 备注 |
 | --- | --- | --- | --- | --- | --- |
-| `loglevel` | `verbose` `info` `notify` `warning`；默认 `notify` | 全部 | ✅ | 1 | |
+| `loglevel` | `verbose` `info` `notify` `warning`；默认 `notify` | 全部 | ✅ | 1 | `--log-file <path>` 按天滚动保留 7 个（rurge 专有运行时选项，M3b，经 `tracing-appender`） |
 | `debug-cpu-usage` | 布尔；默认 false | 全部 | 🔁 | 1 | rurge 用自己的 profiling 开关 |
 | `debug-memory-usage` | 布尔；默认 false | 全部 | 🔁 | 1 | |
 | `dns-server` | IP[:port] 列表或 `system`；含加密 URL 时自动迁移到 `encrypted-dns-server` | 全部 | ✅ | 1 | |
 | `encrypted-dns-server` | URL 列表：`https://` `h3://` `quic://` `tls://` `tcp://` | 全部 | 🟡 | 1 / 2 | `https` `tls` `tcp` 阶段 1；`h3` `quic` 依赖 QUIC 栈，阶段 2；阶段 1 对 `h3` / `quic` 条目告警 W0026 并忽略 |
-| `encrypted-dns-follow-outbound-mode` | 布尔；默认 false | 全部 | ✅ | 1 | 含"代理服务器为域名时回退 DIRECT 并告警"的防环逻辑 |
+| `encrypted-dns-follow-outbound-mode` | 布尔；默认 false | 全部 | 🟡 | 1 | 含"代理服务器为域名时回退 DIRECT 并告警"的防环逻辑；M3b：TCP/DoT/DoH 上游连接走流水线（成 Internal 会话，`PROTOCOL,DOH/DOT/DNS` 可匹配）；上游主机名由 Bootstrap 解析，流水线只见 IP 目标，故域名规则不匹配上游主机名；协议标签按端口启发（853→DoT，443→DoH，其余→DNS）；被规则 REJECT 时告警并直连以保 DNS；UDP 上游不经连接器；这类内部会话的 `SRC-IP` 恒为 `127.0.0.1`、`IN-PORT` 恒为 `0`，`SRC-IP,127.0.0.1/32` / `IN-PORT,0` 规则可能意外匹配到它们，且它们的 `kill` 是空操作（DNS 路径不监听取消令牌） |
 | `encrypted-dns-skip-cert-verification` | 布尔；默认 false | 全部 | ✅ | 1 | |
 | `allow-dns-svcb` | 布尔；默认 false | 全部 | ✅ | 3 | fake-IP 应答器拒绝 type 65 查询 |
 | `use-local-host-item-for-proxy` | 布尔；默认 false | 全部 | ✅ | 2 | |
@@ -162,8 +162,11 @@
 | `udp-policy-not-supported-behaviour` | `REJECT` `DIRECT`；默认 `REJECT`（Mac 6.0 起） | 全部 | ✅ | 2 | |
 | `udp-priority` | 布尔；默认 true | 全部 | 🟡 | 3 | 高负载下优先处理 UDP，尽力而为 |
 | `block-quic` | `per-policy` `all-proxy` `all` `always-allow`；默认 `per-policy` | 全部 | ✅ | 2 | |
-| `show-error-page` | 布尔；默认 true | Mac 5.8+ | 🟡 | 1 | 错误页为 rurge 自己的 HTML（写明规则、策略链、会话 id）；对连接失败的 502 页在 M3a 只覆盖明文请求，CONNECT 的 502 在 M3b |
+| `show-error-page` | 布尔；默认 true | Mac 5.8+ | 🟡 | 1 | 错误页为 rurge 自己的 HTML（写明规则、策略链、会话 id）；对连接失败的 502 页在 M3a 只覆盖明文请求，CONNECT 连接失败的 502 已实现（M3b） |
 | `show-error-page-for-reject` | 布尔；默认 false | 全部 | 🟡 | 1 | 错误页为 rurge 自己的 HTML（写明规则、策略链、会话 id） |
+| 空闲超时（`--idle-timeout`） | Surge 未公开默认值 | 全部 | 🟡 | 1 | rurge 默认 600 s，`--idle-timeout` 覆盖（M3b，专有运行时选项，不是 Surge 配置键） |
+| 请求记录（RequestLog） | rurge 专有能力，无对应 Surge 配置键 | 全部 | ✅ | 1（基础） | 内存环形缓冲（`--request-log-size`，默认 1000）+ 活动索引 + `kill`（M3b）；完整 HTTP API 在 M4 / 阶段 6 |
+| 流量统计（TrafficStats） | rurge 专有能力，无对应 Surge 配置键 | 全部 | ✅ | 1（基础） | 总计 / 按策略 / 按监听器原子计数 + 每秒采样速率（M3b）；完整 HTTP API 在 M4 / 阶段 6 |
 
 ### 2.2 iOS 专属参数
 
@@ -228,7 +231,7 @@
 | `SRC-IP` | 客户端 IP（单地址或 CIDR，v4/v6） | 全部 | ✅ | 1 | |
 | `DEVICE-NAME` | 客户端设备名，`*` `?` 通配，区分大小写 | 全部 | ✅ | 7 | 设备名来自 DHCP / 网关模式设备表；M2a 起解析通过，匹配前始终不匹配（并记一次告警），等待阶段 7 网关模式实现 |
 | `MAC-ADDRESS` | 同一局域网客户端 MAC | Mac 6.1+ | ✅ | 7 | 经网关转发的流量无法取得 MAC，与 Surge 一致；M2a 起解析通过，匹配前始终不匹配（并记一次告警），等待阶段 7 网关模式实现 |
-| `PROTOCOL` | `HTTP` `HTTPS` `TCP` `UDP` `QUIC` `STUN` `MTProto` `DOH` `DOH3` `DOQ` `DOT` `DNS`；区分大小写；`TCP` 覆盖 HTTP/HTTPS/MTProto，`UDP` 覆盖 QUIC/STUN | 全部 | ✅ | 1 / 3 | `DOH*` `DOQ` `DOT` `DNS` 只匹配 rurge 自身发出的 DNS 请求且需 `encrypted-dns-follow-outbound-mode=true`；`MTProto` 依赖阶段 7 |
+| `PROTOCOL` | `HTTP` `HTTPS` `TCP` `UDP` `QUIC` `STUN` `MTProto` `DOH` `DOH3` `DOQ` `DOT` `DNS`；区分大小写；`TCP` 覆盖 HTTP/HTTPS/MTProto，`UDP` 覆盖 QUIC/STUN | 全部 | ✅ | 1 / 3 | `DOH*` `DOQ` `DOT` `DNS` 只匹配 rurge 自身发出的 DNS 请求且需 `encrypted-dns-follow-outbound-mode=true`；`MTProto` 依赖阶段 7；M3b：DoT/DoH/DNS 标签按上游端口启发（853/443/其余）；基于 SNI 的路由与 `PROTOCOL,HTTPS` 的 dial 前匹配随阶段 4 |
 | `HOSTNAME-TYPE` | `IPv4` `IPv6` `DOMAIN` `SIMPLE`；关键字区分大小写，未知值使规则无效 | Mac 5.7.3+ | ✅ | 1 | |
 | `SUBNET` | 子网表达式（见 3.4） | 全部 | 🟡 | 3 | `TYPE:CELLULAR` `MCCMNC:` 在桌面平台永不匹配；M2a 起解析通过，匹配前始终不匹配（并记一次告警），等待阶段 3 增强模式实现 |
 | `CELLULAR-RADIO` | 蜂窝网络制式 | iOS only | 🔁 | 1 | 解析通过，永不匹配 |
@@ -244,7 +247,7 @@
 | --- | --- | --- | --- | --- |
 | `no-resolve` | IP-CIDR, IP-CIDR6, GEOIP, IP-ASN, RULE-SET, DOMAIN-SET | 未解析的域名请求跳过该规则，不触发 DNS；RULE-SET 上作用于全部子规则 | ✅ | 1 |
 | `dns-failed` | FINAL | 规则评估中 DNS 失败时使用 FINAL 策略而非报错 | ✅ | 1 |
-| `extended-matching` | DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD, DOMAIN-WILDCARD, URL-REGEX, RULE-SET, DOMAIN-SET | 同时匹配 TLS SNI 与 HTTP Host / `:authority` | ✅ | 1 |
+| `extended-matching` | DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD, DOMAIN-WILDCARD, URL-REGEX, RULE-SET, DOMAIN-SET | 同时匹配 TLS SNI 与 HTTP Host / `:authority`；M3b：SNI 记录进请求记录用于观测（只解析首个客户端 chunk，≤8 KiB，ClientHello 跨段不拼接）；基于 SNI 的匹配随阶段 4 的 HTTP 引擎生效 | ✅ | 1 |
 | `pre-matching` | 域名类、IP 类、SRC-IP、DEST-PORT、SRC-PORT、SUBNET、CELLULAR-*、逻辑规则、RULE-SET、DOMAIN-SET；仅顶层规则；策略必须是 REJECT 系 | 在 DNS 查询与 TCP 握手阶段提前拒绝 | ✅ | 1 / 3 | 阶段 1 实现"优先匹配"语义；DNS/SYN 层拦截依赖阶段 3 |
 | `notification-text=<text>` | 任意规则含 FINAL | 命中时发系统通知 | ✅ | 6 |
 | `notification-interval=<秒>` | 任意规则含 FINAL | 同一规则通知最小间隔；默认 300 | ✅ | 6 |
@@ -301,7 +304,7 @@
 | 项 | Surge 行为 | Surge 平台 | rurge | 阶段 | 备注 |
 | --- | --- | --- | --- | --- | --- |
 | `DIRECT` | 直连 | 全部 | ✅ | 1 | |
-| `REJECT` | 拒绝；HTTP 请求返回错误页（受 `show-error-page-for-reject` 控制）；同一主机 30 秒内触发 50 次自动升级为 `REJECT-DROP` | 全部 | ✅ | 1 | |
+| `REJECT` | 拒绝；HTTP 请求返回错误页（受 `show-error-page-for-reject` 控制）；同一主机 30 秒内触发 50 次自动升级为 `REJECT-DROP` | 全部 | ✅ | 1 | 同主机 30 s 内 50 次可升级拒绝后自动升级 REJECT-DROP（M3b） |
 | `REJECT-TINYGIF` | 拒绝；HTTP 请求返回 1px 透明 GIF | 全部 | ✅ | 1 | |
 | `REJECT-DROP` | 静默丢弃连接 | 全部 | 🟡 | 1 | rurge 最多保持 30 s（M3b 可调）；Surge 直到客户端超时；SOCKS5 侧客户端先关闭则提前结束，HTTP 侧固定保持到超时（hyper 服务内观察不到客户端关闭，阶段 4 自有 HTTP 引擎后统一） |
 | `REJECT-NO-DROP` | 拒绝且永不升级为 DROP | 全部 | ✅ | 1 | |
@@ -491,7 +494,7 @@
 | 引导豁免：配置加密 DNS 后，传统 DNS 只用于连通性测试与解析加密 DNS URL 中的主机名（含 `[Host]` `server:` 项中的 URL） | | ✅ | 1 | |
 | 特殊值 `off`（主要用于 `[SSID Setting]` 覆盖） | | ✅ | 1 / 3 | |
 | `encrypted-dns-skip-cert-verification` | 默认 false | ✅ | 1 | |
-| `encrypted-dns-follow-outbound-mode`：DNS 连接走规则；`PROTOCOL,DOH/DOH3/DOQ/DOT/DNS` 可匹配；命中的代理若以域名配置则告警并回退 DIRECT | 默认 false | ✅ | 1 | |
+| `encrypted-dns-follow-outbound-mode`：DNS 连接走规则；`PROTOCOL,DOH/DOH3/DOQ/DOT/DNS` 可匹配；命中的代理若以域名配置则告警并回退 DIRECT | 默认 false | 🟡 | 1 | M3b：TCP/DoT/DoH 上游走流水线（Internal 会话，`PROTOCOL` 可匹配）；上游主机名先由 Bootstrap 解析，流水线只见 IP 目标，域名规则不匹配上游主机名；协议标签按端口启发（853→DoT，443→DoH，其余→DNS）；被 REJECT 时告警并直连保底；UDP 上游不经连接器；这类会话的 `SRC-IP`/`IN-PORT` 为占位值（`127.0.0.1:0`/`0`），`kill` 对其无效 |
 | `[Host]` 中 `server:<加密 URL>` 按域名指定加密 DNS | iOS 5.21 / Mac 6.8+ | ✅ | 1 | |
 
 ### 6.3 `[Host]` 本地 DNS 映射
@@ -803,13 +806,13 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | `dump summary/performance/rule-usage/virtual-ip` `watch speed` `log` `log watch` `logbook` `proxy-runtime-status` | 检视 | 同名 | 6 | |
 | `script list/run` `script-log` `benchmark encryption/rule-matching` `test-policy-bandwidth` | 自动化与基准 | 同名 | 6 | |
 | `device` `reconnect-device` `vmnet` `security ban` | 网关 | `device` `security ban` 同名；`reconnect-device` 🔁；`vmnet` 🟡 按平台 | 7 | |
-| `reload` `switch-profile` `kill` `stop` `unattended-upgrade` | 控制 | `reload` `switch-profile` `kill` `stop` 同名；`unattended-upgrade` 🔁 | 1 / 6 | rurge 自身更新由包管理器负责 |
+| `reload` `switch-profile` `kill` `stop` `unattended-upgrade` | 控制 | `reload` `switch-profile` `kill` `stop` 同名；`unattended-upgrade` 🔁 | 1 / 6 | rurge 自身更新由包管理器负责；SIGHUP / `--watch` 的配置热重载已实现（M3b，重建整个 Stack 并按监听地址差异重建监听器，DNS 缓存随之清空）；`--watch` 的监视列表在启动时固定，重载新增的 `#!include` 需重启才会被监视；`rurge reload` 命令与 API 触发仍在 M4 |
 | `environment` `set` `set-log-level` | 环境 | 同名 | 6 | |
 | Agent Skill（Mac 6.5+） | 面向 AI 代理的技能文档 | 🟡 | 6 | rurge 仓库可提供等价 skill 文档 |
 | rurge 专有 | 守护进程 | `rurge run -c <path> [--tun] [--system-proxy]`、`rurge service install/uninstall`、`rurge mitm ca generate/export` | 1 / 3 / 4 | |
 | rurge 专有开发命令 | 离线（不启动守护进程）在当前进程内构建配置并评估一次会话，用于调试规则与规则集 | `rurge rule match -c <conf> <host[:port]> [--explain] [--json] [--resolve <ip,...>\|--no-dns] ...` | 1 | 见 M2 设计文档 §10.1；阶段 6 的 `rule match`/`rule explain` 经 HTTP API 查询运行中的守护进程，语义一致但走线上实例 |
 | rurge 专有开发命令 | 离线按配置的 DNS 设置解析域名，`--server` 覆盖上游，`--trace` 打印每次尝试；`dns cache` 打印本进程缓存快照 | `rurge dns lookup -c <conf> <name> [--type a\|aaaa\|both] [--server <spec>...] [--no-cache] [--trace] [--json]`；`rurge dns cache -c <conf> [name...]` | 1 | 见 M2 设计文档 §10.2；阶段 6 的 `dns lookup` 经 HTTP API 查询守护进程 |
-| rurge 专有命令 | 前台运行 HTTP / SOCKS5 代理；出站模式初值来自 `--outbound-mode`（M4 起 `state.json` 优先）；`--log-level` 覆盖 `loglevel` | `rurge run -c <conf> [--outbound-mode direct\|proxy=<p>\|rule] [--log-level <l>]` | 1 | 见 M3 设计文档 §9.3；`reload` / `stop` 依赖 M4 的控制通道 |
+| rurge 专有命令 | 前台运行 HTTP / SOCKS5 代理；出站模式初值来自 `--outbound-mode`（M4 起 `state.json` 优先）；`--log-level` 覆盖 `loglevel` | `rurge run -c <conf> [--outbound-mode direct\|proxy=<p>\|rule] [--log-level <l>] [--idle-timeout <secs>] [--request-log-size <n>] [--watch] [--log-file <path>]` | 1 | 见 M3 设计文档 §9.3；`--idle-timeout` / `--request-log-size` / `--watch` / `--log-file` 为 rurge 专有运行时选项（M3b，只经 CLI 参数 / 环境变量提供，不写入 Surge 配置）；`reload` / `stop` 命令仍依赖 M4 的控制通道，但 SIGHUP / `--watch` 的热重载已可用 |
 
 ### 10.4 HTTP API
 
@@ -831,7 +834,7 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | `POST /v1/policy_groups/test` | 立即测试 → `{"available":[...]}` | 全部 | ✅ | 2 | |
 | `GET /v1/requests/recent` `GET /v1/requests/active` `POST /v1/requests/kill` | 请求列表与终止 | 全部 | 🟡 | 1 / 4 | 响应结构手册未定义，以 Surge 实际输出为准做兼容测试 |
 | `GET /v1/profiles/current?sensitive=0` | 当前配置文本（可脱敏） | 全部 | ✅ | 1 | |
-| `POST /v1/profiles/reload` | 重载 | 全部 | ✅ | 1 | |
+| `POST /v1/profiles/reload` | 重载 | 全部 | ✅ | 1 | 底层热重载能力（SIGHUP / `--watch`）已在 M3b 就位，API 触发在 M4 暴露 |
 | `POST /v1/profiles/switch` `GET /v1/profiles` `POST /v1/profiles/check` | 多配置管理 | Mac only | ✅ | 1 / 6 | rurge 以配置目录管理多个 Profile |
 | `POST /v1/dns/flush` `GET /v1/dns` `POST /v1/test/dns_delay` | DNS | 全部 | ✅ | 1 | |
 | `GET/POST /v1/modules` | 模块列表与开关 | 全部 | ✅ | 5 | |
@@ -840,7 +843,7 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | `POST /v1/stop` | 关闭引擎 | 全部 | 🟡 | 1 | rurge：停止引擎并退出进程；由服务管理器决定是否重启 |
 | `GET /v1/events` | 事件中心 | 全部 | ✅ | 6 | 与 Logbook 共用存储 |
 | `GET /v1/rules` | 规则列表 | 全部 | ✅ | 1 | |
-| `GET /v1/traffic` | 流量信息 | 全部 | ✅ | 1 | |
+| `GET /v1/traffic` | 流量信息 | 全部 | ✅ | 1 | 底层按策略 / 监听器的流量统计能力已在 M3b 就位（`TrafficStats`），API 读取在 M4 暴露 |
 | `POST /v1/log/level` | `{"level":"verbose"\|"debug"\|"info"\|"warning"\|"error"}` | 全部 | ✅ | 1 | |
 | `GET /v1/mitm/ca` | DER 格式 CA 证书 | 全部 | ✅ | 4 | |
 | `GET /v1/metrics?x-key=` | Prometheus 文本格式（iOS 5.22 / Mac 6.9+） | 全部 | ✅ | 6 | 指标名保持 `surge_*` 前缀以兼容现有 Grafana 面板：`surge_build_info` `surge_uptime_seconds` `surge_memory_bytes` `surge_active_requests` `surge_dns_cache_entries` `surge_active_bans` `surge_interface_in/out_bytes_total{interface}` `surge_policy_in/out_bytes_total{policy}` |

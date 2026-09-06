@@ -162,6 +162,7 @@ pub enum DialError {
 - `proxy-restricted-to-lan = true`（默认）且监听地址非回环时：来源必须是回环、私有（RFC 1918）、链路本地、ULA 之一，否则关闭连接并按来源 IP 限频（每分钟一条）记 WARN。监听回环地址时不检查。
 - 每个监听器一个 accept 循环 + `JoinSet`：会话 panic 由 `join_next` 捕获记 ERROR；accept 错误记 WARN 并退避 50 ms 后继续。
 - 监听地址解析：`Listener.addr` 按字面绑定（IPv6 写 `[::1]:6152`）；端口 0 合法，`Running.local_addr` 给出实际端口。
+- 实施订正（M3b）：`serve` 增一个停止令牌；收到后先 `drop` 监听 socket 并触发一个 `closed` 门闩（`Running::wait_closed()` 可等它——重载重绑前必须确认旧 socket 已关，Windows 无 `SO_REUSEADDR`），再排空 `JoinSet` 里的在飞会话。`Running::stop()` 只停这一个监听器的 accept（不影响其他监听器），`join()` 等 accept 循环退出且会话排空完毕。
 
 ## 7. `rurge-engine`
 
@@ -201,6 +202,7 @@ impl Dialer for Engine { .. }
 - 实施订正（M3a）：所谓「变体」的实现是把 `Counting` 包在 upstream 一侧后交给 `tokio::io::copy_bidirectional`——写 upstream 计 `up`、读 upstream 计 `down`，计数随字节移动而累加，因此复制中途失败时已传字节仍保留在 handle 上。另：`SessionHandle` 新增 `error` 字段，`Rejected` 日志带上它（未实现协议的文案见第 8 节）。
 - `SessionHandle::finish` 只触发一次：写一条日志 —— `Completed` 为 DEBUG（`loglevel = info` 可见），`Failed` / `Rejected` 为 INFO；字段 `session`、`listener`、`src`、`dst`、`rule`、`policy`（chain 用 ` > ` 连接）、`up`、`down`、`elapsed_ms`、`error`。
 - M3b：`RequestLog`（环形缓冲，默认 1000，`--request-log-size`；活动索引支持 `kill`）与 `TrafficStats`（总计、按策略、按监听器的原子计数；每秒采样速率）从同一份 handle 数据填充；M4 的 `GET /v1/requests/*`、`/v1/traffic` 只读它们。
+- 实施订正（M3b）：relay 换成手写可中断双向泵（`relay.rs::pump`），不是 `copy_bidirectional` 的变体——`tokio::io::split` 拆成两个方向，各自跑一个独立的 `copy_half`（`tokio::join!`），每次 `read` 与 `write_all` 都与会话令牌的子令牌竞速，因此一个方向卡在 `write_all` 上不会挡住另一方向（无队头阻塞）；另起一个 `idle_watchdog` 任务，两个方向都无字节移动超过 `idle`（默认 600 s，`--idle-timeout` 覆盖）时取消该子令牌。结束原因三选一并分别记录：`kill` → `Failed("killed")`；父令牌取消（优雅退出）→ `Completed`；空闲计时器触发 → `Completed`。
 
 ### 7.4 M3b 的引擎扩展
 
@@ -209,6 +211,7 @@ impl Dialer for Engine { .. }
 - **热重载**：`Engine::reload(config) -> Result<Diagnostics, LoadError>`：加载失败保留旧 Runtime 并返回诊断；成功则构建新 Runtime（DNS 相关键与 `[Host]` 未变时复用旧 `Resolver`，否则新建并 `flush` 旧的；`Stack` 每代新建，规则集与 GeoIP 依赖磁盘缓存）→ `ArcSwap::store` → 监听地址集合变化时重建监听器 → 记一条 INFO。触发：Unix SIGHUP；`--watch` 监视主配置与 `#!include` 文件（去抖 500 ms）。
 - **优雅退出**：Ctrl-C / SIGTERM → 停止 accept → 等活动会话最多 5 s → 退出；第二次 Ctrl-C 立即退出。
 - **`encrypted-dns-follow-outbound-mode`**：为 `Resolver` 注入「走流水线的连接器」——DNS 上游连接组成 `SessionInfo { protocol: Some(Doh / Dot / Dns) }` 经 dial 分流；防环：DNS 会话内部的解析用 `Bootstrap`（不再进入规则引擎），命中的策略若是域名配置的代理则告警并回退 DIRECT（阶段 2 有代理后才可能触发）。
+- 实施订正（M3b）：SNI 嗅探不是「dial 前 peek」，而是 `pump` 里客户端→上游方向 `copy_half` 的首个非空 chunk 钩子（≤ 8 KiB，即 relay 的读缓冲大小）——HTTP 明文转发不经过 `pump`，因此不嗅探；只解析单个 ClientHello，跨 TCP 段的分片本段解析不到就放弃、不做拼接；结果只填 `session.sni` / `protocol` 供请求记录与日志观测，路由仍按 CONNECT / SOCKS5 的目标主机，基于 SNI 的路由留给阶段 4。REJECT 自动升级按 `count >= 50` 判定，即第 50 次拒绝本身就已按 DROP 处理（不是第 51 次才升级）；计数以目标主机字符串为键的滑动窗口（30 s），超过 4096 个不同主机时清理空闲条目。热重载没有做「DNS 相关键未变则复用旧 Resolver」的优化——`Runtime::build` 每代都完整重跑 `build_stack`（资源 → 规则集 → GeoIP → Resolver），因此每次重载都清空 DNS 缓存。`encrypted-dns-follow-outbound-mode` 的连接器挂在 `Resolver` 自带的 `BootstrapConnector` 内层：上游主机名由 Bootstrap 用明文 UDP 先解析，流水线侧的连接器只会看到 IP 目标（域名分支只是防御性兜底，正常路径不会走到），因此域名规则不会匹配上游服务器的主机名，且这类内部会话的 `SRC-IP` / `IN-PORT` 是 `SessionInfo::tcp` 的占位默认值（`127.0.0.1:0` / `0`），`kill` 对其无效（DNS 路径不监听取消令牌）；被规则 REJECT 时回退到直连以保证 DNS 不因规则配置整体失效；UDP 上游不经过 `Connector`，不受影响。
 
 ## 8. REJECT 语义与错误处理
 
@@ -227,6 +230,7 @@ impl Dialer for Engine { .. }
 - 配置错误：`run` 启动时打印诊断（与 `check` 同格式）并退出 2；告警只在启动时打印一次。
 - 会话层错误转成 handle 的 `error` 与一条 INFO 日志；panic 由 `JoinSet` 边界隔离并记 ERROR。
 - 实施订正（M3a）：REJECT-DROP 的「直到客户端关闭或 30 s」在 SOCKS5 侧两句都成立，HTTP 侧只实现了后半句——hyper 的服务内观察不到客户端关闭，只能固定保持到超时；阶段 4 换成 rurge 自有 HTTP 引擎后统一（已登记进兼容性清单 4.1 表）。
+- 实施订正（M3b）：CONNECT 隧道 dial 失败（DNS / 连接 / 超时）现在也回 `502 Bad Gateway` + 错误页（受 `show-error-page` 控制），补齐了上表中「CONNECT：M3a 关闭；M3b 502」的差距；REJECT 自动升级的判定细节见 §7.4 的实施订正。
 
 ## 9. 运行时状态、日志与 `rurge run`
 
@@ -253,6 +257,7 @@ M3a 读取 `group_selections[<当前 profile 文件名>]`（缺失或解析失�
 - `loglevel`：`verbose` → TRACE、`info` → DEBUG、`notify` → INFO（默认）、`warning` → WARN；`--log-level` / `RURGE_LOG_LEVEL` 覆盖，额外接受 `debug`、`error`。
 - 输出 stdout，TTY 时着色；每条会话日志带第 7.3 节字段；`password@`、策略密码、API key 不进入日志（`Listener` 的 `Debug` 实现脱敏）。
 - M3b：`--log-file <path>` 按天滚动，保留 7 个。
+- 实施订正（M3b）：`--log-file` 用 `tracing-appender` 的 `rolling::Builder`（`Rotation::DAILY` + `max_log_files(7)`）配 `tracing_appender::non_blocking`；文件层与 stdout 层同时挂载（不是二选一），`WorkerGuard` 随进程存活以保证退出前的日志不丢；文件层未加 `with_target(false)`，格式与 stdout 略有差异。
 
 ### 9.3 `rurge run`
 
@@ -265,6 +270,8 @@ rurge run -c <conf> [--outbound-mode direct|proxy=<policy>|rule] [--log-level <l
 启动顺序：加载配置（错误 → 诊断 + 退出 2）→ `build_stack`（`wait = 0`，外部资源后台加载，规则集就位后由注册表热切换）→ 读 `state.json` → 构建 `Runtime` / `Engine` → 绑定监听（失败 → 退出 1；每个监听打印 `listening on http://127.0.0.1:6152` / `socks5://...`）→ 打印摘要（策略数、规则数、出站模式）→ 等 Ctrl-C → 退出 0（M3a 立即；M3b 优雅退出）。
 
 超时常量（M3a）：连接 10 s；REJECT-DROP 保持 30 s；M3b 空闲超时默认 10 分钟（Q2）。
+
+实施订正（M3b）：命令行实际还有 `--idle-timeout <secs>`（默认 600，即 Q2 的 10 分钟；未在上面的示意中列出）。主循环用一次 `select!` 在两个分支间选择——一个等 Ctrl-C（Windows）或 Ctrl-C/SIGTERM（Unix）触发退出，一个等 SIGHUP（Unix）或 `--watch` 的文件事件触发 `reload`；两个信号流都在循环外只构造一次（`tokio::signal::unix::signal` / `windows::ctrl_c()`），而不是每轮循环重新 `await` 一次性的 `ctrl_c()`，否则重载耗时的几秒内到达的信号会被新注册的监听丢弃。退出序列：`stop_accepting` → `tracker().close()` → 等待所有监听器 `join()` 与 `tracker().wait()`；期间再收到一次 Ctrl-C 立即强制退出，否则最多等 `GRACE`（5 s）后 `cancel_sessions()` 强制结束在飞会话。
 
 ## 10. 测试策略
 

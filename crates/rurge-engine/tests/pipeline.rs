@@ -558,9 +558,10 @@ async fn relay_counts_bytes_as_they_move_and_keeps_them_on_failure() {
     upstream.write_all(b"xyz").await.unwrap();
     let mut back = [0u8; 3];
     client_far.read_exact(&mut back).await.unwrap();
-    // The upstream vanishes; `pump` sees the EOF and marks that side closed,
-    // but the client → upstream loop stays live, so the next client write
-    // hits the now-dead half and fails.
+    // The upstream vanishes; the upstream → client `copy_half` sees the EOF
+    // and returns, but the client → upstream `copy_half` is a separate task
+    // that keeps running, so the next client write hits the now-dead
+    // upstream half and fails.
     drop(upstream);
     let _ = client_far.write_all(b"never delivered").await;
     tokio::time::timeout(Duration::from_secs(5), relayed)

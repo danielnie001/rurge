@@ -8,7 +8,7 @@ rurge 是用 Rust 复刻 Surge（macOS / iOS 网络代理工具）全部功能�
 
 ## 当前状态（2026-09）
 
-阶段 1 进行中。M1、M2a、M2b、M3a 已完成：Cargo workspace、`rurge-config`（解析全部 Surge 语法为强类型 `Config` + 诊断）、`rurge check`、`rurge-net`（连接器 / 内部 HTTP 客户端 / 外部资源管理器）、`rurge-rules`（域名 / IP 索引、规则集、GeoIP / ASN、规则引擎）、`rurge rule match`（离线规则匹配开发命令）、`rurge-dns`（UDP / TCP / DoT / DoH 上游、并发查询与重试、缓存、`[Host]` 链、系统 hosts）、`rurge-platform::dns`、`rurge dns lookup`、`rurge-proto`（`Outbound` 抽象、DIRECT / REJECT）、`rurge-policy`（策略注册表）、`rurge-inbound`（HTTP / SOCKS5 监听）、`rurge-engine`（会话流水线）、`rurge run`（前台代理，DIRECT / REJECT 分流）。M3b（请求记录、流量统计、热重载、SNI 嗅探）、M4（控制面与平台）未开始。
+阶段 1 进行中。M1、M2a、M2b、M3a、M3b 已完成：Cargo workspace、`rurge-config`（解析全部 Surge 语法为强类型 `Config` + 诊断）、`rurge check`、`rurge-net`（连接器 / 内部 HTTP 客户端 / 外部资源管理器）、`rurge-rules`（域名 / IP 索引、规则集、GeoIP / ASN、规则引擎）、`rurge rule match`（离线规则匹配开发命令）、`rurge-dns`（UDP / TCP / DoT / DoH 上游、并发查询与重试、缓存、`[Host]` 链、系统 hosts）、`rurge-platform::dns`、`rurge dns lookup`、`rurge-proto`（`Outbound` 抽象、DIRECT / REJECT）、`rurge-policy`（策略注册表）、`rurge-inbound`（HTTP / SOCKS5 监听）、`rurge-engine`（会话流水线）、`rurge run`（前台代理，DIRECT / REJECT 分流）；M3b 新增可中断带空闲超时的 relay（`--idle-timeout`）、优雅退出、请求记录与流量统计（`--request-log-size`）、SNI 记录（观测用）、REJECT 30 s/50 次自动升级 REJECT-DROP、CONNECT 连接失败 502、热重载（SIGHUP / `--watch`）、`--log-file` 按天滚动、`encrypted-dns-follow-outbound-mode`。M4（控制面与平台）未开始。
 
 ## 先读这些文档
 
@@ -21,6 +21,7 @@ rurge 是用 Rust 复刻 Surge（macOS / iOS 网络代理工具）全部功能�
 - `docs/superpowers/plans/2026-09-04-phase1-m2b-dns-plan.md`：M2b 实施计划（14 个任务）。末尾「执行期修正记录」与「延后事项」同 M2a。
 - `docs/superpowers/specs/2026-09-05-phase1-m3-pipeline-design.md`：M3 设计文档。四个 crate（`rurge-proto` / `rurge-policy` / `rurge-inbound` / `rurge-engine`）的接口、dial 流水线、REJECT 语义、`state.json`、`rurge run`。
 - `docs/superpowers/plans/2026-09-05-phase1-m3a-pipeline-plan.md`：M3a 实施计划。末尾「执行期修正记录」与「延后事项」同 M2a。
+- `docs/superpowers/plans/2026-09-06-phase1-m3b-operability-plan.md`：M3b 实施计划。末尾「执行期修正记录」与「延后事项」同 M2a。
 - `README.md`：中英双语，对外的状态、特性表与路线图，必须与 PRD 保持一致。
 
 ## 工作流约定
@@ -52,6 +53,7 @@ cargo bench -p rurge-rules                      # criterion 基准（域名 / IP
 cargo run -p rurge -- dns lookup -c config.conf example.com --trace    # 离线 DNS 解析（--server 覆盖上游）
 cargo bench -p rurge-dns                        # criterion 基准（DNS 缓存命中）
 cargo run -p rurge -- run -c config.conf --log-level info   # 前台运行 HTTP / SOCKS5 代理（Ctrl-C 退出）
+cargo run -p rurge -- run -c config.conf --watch --log-file rurge.log   # 加配置热重载（SIGHUP / --watch）与滚动日志文件
 ```
 
 `Cargo.lock` 需要提交（`.gitignore` 已注明）。
