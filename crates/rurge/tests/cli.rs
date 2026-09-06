@@ -750,6 +750,52 @@ mod run {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_shuts_down_gracefully_on_sigint() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(
+            dir.path(),
+            "http-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nloglevel = warning",
+        );
+        let daemon = tokio::task::spawn_blocking({
+            let conf = conf.clone();
+            let data = dir.path().join("data");
+            move || spawn_daemon(&conf, &data)
+        })
+        .await
+        .unwrap();
+        let pid = daemon.child.id().to_string();
+        let sent = std::process::Command::new("kill")
+            .args(["-INT", &pid])
+            .status()
+            .unwrap();
+        assert!(sent.success(), "kill -INT");
+        // exit 0 within 10 s, and the shutdown line was printed
+        let finished = tokio::task::spawn_blocking(move || {
+            let mut daemon = daemon;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(Some(status)) = daemon.child.try_wait() {
+                    let lines: Vec<String> = daemon.lines.try_iter().collect();
+                    return Some((status, lines));
+                }
+                if std::time::Instant::now() > deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })
+        .await
+        .unwrap();
+        let (status, lines) = finished.expect("daemon exited within 10 s of SIGINT");
+        assert!(status.success(), "exit code 0: {status:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("shutting down")),
+            "{lines:?}"
+        );
+    }
+
     #[test]
     fn run_exits_2_on_a_broken_profile() {
         let dir = tempfile::tempdir().unwrap();

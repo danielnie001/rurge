@@ -23,6 +23,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 pub struct HttpListener;
 
@@ -31,6 +33,7 @@ struct Ctx {
     opts: Arc<ListenerOpts>,
     local: SocketAddr,
     peer: SocketAddr,
+    tracker: TaskTracker,
 }
 
 /// Returned from the service to make hyper close the connection without a response.
@@ -52,6 +55,8 @@ impl HttpListener {
         addr: SocketAddr,
         dialer: Arc<dyn Dialer>,
         opts: ListenerOpts,
+        stop: CancellationToken,
+        tracker: TaskTracker,
     ) -> io::Result<Running> {
         let listener = bind(addr).await?;
         let local = listener.local_addr()?;
@@ -60,12 +65,14 @@ impl HttpListener {
             listener,
             "http",
             opts.restrict_to_lan,
+            stop,
             move |stream, peer| {
                 let ctx = Arc::new(Ctx {
                     dialer: dialer.clone(),
                     opts: opts.clone(),
                     local,
                     peer,
+                    tracker: tracker.clone(),
                 });
                 async move { serve_connection(stream, ctx).await }
             },
@@ -170,7 +177,7 @@ async fn connect(
         Ok(dialed) => {
             let upgrade = hyper::upgrade::on(&mut req);
             let dialer = ctx.dialer.clone();
-            tokio::spawn(async move {
+            ctx.tracker.spawn(async move {
                 match upgrade.await {
                     Ok(upgraded) => {
                         let client: BoxedStream = Box::new(TokioIo::new(upgraded));
@@ -366,7 +373,7 @@ async fn forward(
         }
     };
     let conn_handle = handle.clone();
-    tokio::spawn(async move {
+    ctx.tracker.spawn(async move {
         if let Err(e) = conn.await {
             conn_handle.finish(SessionOutcome::Failed(format!(
                 "upstream connection error: {e}"
@@ -400,13 +407,21 @@ mod tests {
     use rurge_net::testing::TestServer;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::sync::CancellationToken;
+    use tokio_util::task::TaskTracker;
 
     pub(crate) async fn listener(opts: ListenerOpts) -> (Running, Arc<FakeDialer>) {
         let echo = echo_server().await;
         let dialer = FakeDialer::new(echo, None);
-        let running = HttpListener::bind("127.0.0.1:0".parse().unwrap(), dialer.clone(), opts)
-            .await
-            .unwrap();
+        let running = HttpListener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            dialer.clone(),
+            opts,
+            CancellationToken::new(),
+            TaskTracker::new(),
+        )
+        .await
+        .unwrap();
         (running, dialer)
     }
 
@@ -417,9 +432,15 @@ mod tests {
             .unwrap();
         let echo = echo_server().await;
         let dialer = FakeDialer::new(echo, Some(target_addr));
-        let running = HttpListener::bind("127.0.0.1:0".parse().unwrap(), dialer.clone(), opts)
-            .await
-            .unwrap();
+        let running = HttpListener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            dialer.clone(),
+            opts,
+            CancellationToken::new(),
+            TaskTracker::new(),
+        )
+        .await
+        .unwrap();
         (running, dialer, target)
     }
 

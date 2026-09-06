@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_util::sync::CancellationToken;
 
 const VERSION: u8 = 0x05;
 const METHOD_NONE: u8 = 0x00;
@@ -33,6 +34,7 @@ impl Socks5Listener {
         addr: SocketAddr,
         dialer: Arc<dyn Dialer>,
         opts: ListenerOpts,
+        stop: CancellationToken,
     ) -> io::Result<Running> {
         let listener = bind(addr).await?;
         let local = listener.local_addr()?;
@@ -41,6 +43,7 @@ impl Socks5Listener {
             listener,
             "socks5",
             opts.restrict_to_lan,
+            stop,
             move |stream, peer| {
                 let dialer = dialer.clone();
                 let opts = opts.clone();
@@ -188,6 +191,7 @@ mod tests {
     use super::*;
     use crate::testing::{FakeDialer, echo_server};
     use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     async fn listener(drop_hold: Duration) -> (Running, Arc<FakeDialer>) {
         listener_with(drop_hold, Duration::from_secs(30)).await
@@ -205,9 +209,14 @@ mod tests {
             handshake_timeout,
             ..ListenerOpts::default()
         };
-        let running = Socks5Listener::bind("127.0.0.1:0".parse().unwrap(), dialer.clone(), opts)
-            .await
-            .unwrap();
+        let running = Socks5Listener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            dialer.clone(),
+            opts,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         (running, dialer)
     }
 

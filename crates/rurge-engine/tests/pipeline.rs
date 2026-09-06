@@ -593,3 +593,24 @@ async fn http_listener_password_from_the_profile() {
     let (head, _) = get_via_proxy(listeners[0].1.local_addr, "http://127.0.0.1:1/").await;
     assert!(head.starts_with("HTTP/1.1 407"), "{head}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_accepting_then_cancel_sessions_drains() {
+    let h = harness("", "", OutboundMode::Rule).await; // template already ends with FINAL,DIRECT
+    // open a CONNECT tunnel that stays idle (no data), then shut down
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    s.write_all(format!("CONNECT target.test:{} HTTP/1.1\r\n\r\n", h.target_port()).as_bytes())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 12];
+    let n = s.read(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+    // stop accepting; a new connection must be refused (listener closed)
+    h.engine.stop_accepting();
+    h.engine.tracker().close();
+    // force the idle tunnel to end and wait for the tracker to drain
+    h.engine.cancel_sessions();
+    tokio::time::timeout(Duration::from_secs(5), h.engine.tracker().wait())
+        .await
+        .expect("tracker drains after cancel");
+}

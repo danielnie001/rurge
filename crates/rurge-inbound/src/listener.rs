@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio_util::sync::CancellationToken;
 
 /// Basic credentials accepted by an HTTP listener.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,17 +50,48 @@ impl Default for ListenerOpts {
     }
 }
 
-/// A bound listener; dropping it aborts the accept loop and every session it
-/// spawned. CONNECT tunnels (spawned by hyper's upgrade path) are not tracked
-/// and finish on their own — unified in M3b's graceful shutdown.
+/// A bound listener. Dropping it aborts the accept loop and every session its
+/// own `JoinSet` is still tracking (CONNECT tunnels and upstream-connection
+/// drivers are spawned onto the engine's `TaskTracker` instead, so they are
+/// not covered by that abort). For a graceful shutdown, call `stop` then
+/// `join`: the accept loop stops taking new connections, closes the socket,
+/// and drains its in-flight sessions instead of aborting them.
 pub struct Running {
     pub local_addr: SocketAddr,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
+    stop: CancellationToken,
+    /// Latched once the accept loop has closed its socket.
+    closed: CancellationToken,
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(t) = &self.task {
+            t.abort();
+        }
+    }
+}
+
+impl Running {
+    /// Stop accepting on this listener only; its in-flight sessions finish on
+    /// their own (awaited by `join`).
+    pub fn stop(&self) {
+        self.stop.cancel();
+    }
+
+    /// Resolves once the accept loop has closed its socket, i.e. the address
+    /// can be bound again (Windows sets no `SO_REUSEADDR`). Sessions may still
+    /// be draining; see `join`.
+    pub async fn wait_closed(&self) {
+        self.closed.cancelled().await
+    }
+
+    /// Waits for the accept loop to stop and its in-flight sessions to drain.
+    /// Consumes `self` so the `Drop` abort only fires on an already-finished task.
+    pub async fn join(mut self) {
+        if let Some(t) = self.task.take() {
+            let _ = t.await;
+        }
     }
 }
 
@@ -93,6 +125,7 @@ pub(crate) fn serve<F, Fut>(
     listener: TcpListener,
     name: &'static str,
     restrict_to_lan: bool,
+    stop: CancellationToken,
     handler: F,
 ) -> Running
 where
@@ -103,11 +136,15 @@ where
         .local_addr()
         .expect("bound listener has an address");
     let handler = Arc::new(handler);
+    let stop_for_running = stop.clone();
+    let closed = CancellationToken::new();
+    let closed_signal = closed.clone();
     let task = tokio::spawn(async move {
         let mut sessions: JoinSet<()> = JoinSet::new();
         let warned: Mutex<HashMap<IpAddr, Instant>> = Mutex::new(HashMap::new());
         loop {
             tokio::select! {
+                _ = stop.cancelled() => break,
                 accepted = listener.accept() => match accepted {
                     Ok((stream, peer)) => {
                         if restrict_to_lan && !source_allowed(local_addr, peer.ip()) {
@@ -136,8 +173,26 @@ where
                 }
             }
         }
+        // Stopped accepting: close the socket so nothing queues in the backlog,
+        // then drain the in-flight sessions. A relay only returns once its own
+        // token is cancelled (graceful) or its peers close; the daemon cancels
+        // the session root after the grace period.
+        drop(listener);
+        closed_signal.cancel();
+        while let Some(joined) = sessions.join_next().await {
+            if let Err(e) = joined
+                && e.is_panic()
+            {
+                tracing::error!(listener = name, "session task panicked: {e}");
+            }
+        }
     });
-    Running { local_addr, task }
+    Running {
+        local_addr,
+        task: Some(task),
+        stop: stop_for_running,
+        closed,
+    }
 }
 
 pub(crate) async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {

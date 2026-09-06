@@ -17,6 +17,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 use tracing_subscriber::filter::LevelFilter;
 
+/// How long a graceful shutdown waits for active sessions before force-cancelling them.
+const GRACE: Duration = Duration::from_secs(5);
+
 #[derive(Args)]
 pub struct RunArgs {
     /// Profile to load
@@ -145,8 +148,31 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         tokio::signal::ctrl_c()
             .await
             .context("cannot listen for Ctrl-C")?;
-        println!("shutting down");
-        drop(listeners);
+        println!("shutting down (Ctrl-C again to exit now)");
+        engine.stop_accepting();
+        engine.tracker().close();
+        let running: Vec<_> = listeners.into_iter().map(|(_, r)| r).collect();
+        let drain = async {
+            for r in running {
+                r.join().await;
+            }
+            engine.tracker().wait().await;
+        };
+        tokio::select! {
+            _ = drain => {}
+            _ = tokio::signal::ctrl_c() => {
+                println!("forced shutdown");
+                return Ok(ExitCode::SUCCESS);
+            }
+            _ = tokio::time::sleep(GRACE) => {
+                println!("grace period elapsed; closing active sessions");
+                engine.cancel_sessions();
+                // brief wait for the relays to unwind, then exit regardless
+                let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                    engine.tracker().wait().await;
+                }).await;
+            }
+        }
         Ok(ExitCode::SUCCESS)
     })
 }

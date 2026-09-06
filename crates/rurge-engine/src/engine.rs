@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DROP_HOLD: Duration = Duration::from_secs(30);
@@ -40,6 +41,11 @@ pub struct Engine {
     runtime: ArcSwap<Runtime>,
     next_session: AtomicU64,
     sessions_root: CancellationToken,
+    /// Cancelled to stop every listener from accepting new connections.
+    accept: CancellationToken,
+    /// Tracks CONNECT tunnels and upstream-connection drivers so a graceful
+    /// shutdown can wait for them to drain.
+    tracker: TaskTracker,
 }
 
 impl Engine {
@@ -48,6 +54,8 @@ impl Engine {
             runtime: ArcSwap::from_pointee(runtime),
             next_session: AtomicU64::new(0),
             sessions_root: CancellationToken::new(),
+            accept: CancellationToken::new(),
+            tracker: TaskTracker::new(),
         })
     }
 
@@ -128,8 +136,19 @@ impl Engine {
             let opts = Self::listener_opts(&rt.config.general, &spec);
             let dialer: Arc<dyn Dialer> = self.clone();
             let running = match spec.kind {
-                ListenerKind::Http => HttpListener::bind(spec.addr, dialer, opts).await?,
-                ListenerKind::Socks5 => Socks5Listener::bind(spec.addr, dialer, opts).await?,
+                ListenerKind::Http => {
+                    HttpListener::bind(
+                        spec.addr,
+                        dialer,
+                        opts,
+                        self.accept.child_token(),
+                        self.tracker.clone(),
+                    )
+                    .await?
+                }
+                ListenerKind::Socks5 => {
+                    Socks5Listener::bind(spec.addr, dialer, opts, self.accept.child_token()).await?
+                }
                 // never produced by `listener_specs`; listed so a new kind breaks the build
                 ListenerKind::Tun | ListenerKind::Forward | ListenerKind::Internal => continue,
             };
@@ -144,6 +163,20 @@ impl Engine {
         let handle = SessionHandle::new_with_token(id, session, self.sessions_root.child_token());
         handle.on_finish(log_session);
         handle
+    }
+}
+
+impl Engine {
+    /// Stop accepting new connections (in-flight sessions keep running).
+    pub fn stop_accepting(&self) {
+        self.accept.cancel();
+    }
+    /// Force every in-flight relay to end now.
+    pub fn cancel_sessions(&self) {
+        self.sessions_root.cancel();
+    }
+    pub fn tracker(&self) -> &TaskTracker {
+        &self.tracker
     }
 }
 
