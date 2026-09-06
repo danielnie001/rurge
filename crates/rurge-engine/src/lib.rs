@@ -6,6 +6,7 @@ pub mod engine;
 pub mod observe;
 pub mod relay;
 pub mod runtime;
+pub mod sniff;
 pub mod stack;
 pub mod state;
 

@@ -248,6 +248,24 @@ async fn connect_tunnel_carries_tls_to_the_target() {
         text.starts_with("HTTP/1.1 200") && text.ends_with("very secret"),
         "{text}"
     );
+    // the SNI the client sent through the tunnel was recorded (poll: the record
+    // may be active or just finished)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let sni_seen = loop {
+        let recent = h.engine.request_log().recent(20);
+        let active = h.engine.request_log().active();
+        if recent.iter().chain(active.iter()).any(|r| {
+            r.sni.as_deref() == Some("tls.test")
+                && r.protocol == Some(rurge_config::rule::ProtocolKind::Https)
+        }) {
+            break true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(sni_seen, "SNI recorded");
 }
 
 #[tokio::test]

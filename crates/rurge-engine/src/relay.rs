@@ -5,6 +5,7 @@
 //! shutdown and the idle timeout all end a stuck session promptly. Replaces
 //! M3a's `copy_bidirectional`.
 
+use rurge_config::rule::ProtocolKind;
 use rurge_inbound::{SessionHandle, SessionOutcome};
 use rurge_net::connector::BoxedStream;
 use std::io;
@@ -16,6 +17,10 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 const BUF: usize = 8 * 1024;
+
+/// Runs once on the first non-empty read of a `copy_half` direction (M3b SNI
+/// sniffing; see `pump`).
+type FirstChunkHook = Box<dyn FnOnce(&[u8]) + Send>;
 
 /// Copies bytes both ways until either side closes, the idle timer fires, or
 /// the handle's token is cancelled; then finishes the handle. Each direction is
@@ -41,13 +46,39 @@ pub async fn pump(
         let stop = stop.clone();
         let h_up = handle.clone();
         let h_down = handle.clone();
+        let h_sniff = handle.clone();
         let a_up = activity.clone();
         let a_down = activity.clone();
+        // Client → upstream only: sniffs the first chunk for a TLS ClientHello
+        // SNI (M3b, observability only; routing still uses the CONNECT/SOCKS
+        // target). Plain-HTTP forwarding does not go through `pump`, so it is
+        // unaffected.
+        let sniff_first: Option<FirstChunkHook> = Some(Box::new(move |chunk: &[u8]| {
+            if let Some(sni) = crate::sniff::parse_sni(chunk) {
+                h_sniff.set_sni(sni);
+                h_sniff.set_protocol(ProtocolKind::Https);
+            }
+        }));
         async move {
             let r = tokio::join!(
-                copy_half(cr, uw, stop.clone(), a_up, started, move |n| h_up.add_up(n)),
-                copy_half(ur, cw, stop.clone(), a_down, started, move |n| h_down
-                    .add_down(n)),
+                copy_half(
+                    cr,
+                    uw,
+                    stop.clone(),
+                    a_up,
+                    started,
+                    move |n| h_up.add_up(n),
+                    sniff_first,
+                ),
+                copy_half(
+                    ur,
+                    cw,
+                    stop.clone(),
+                    a_down,
+                    started,
+                    move |n| h_down.add_down(n),
+                    None,
+                ),
             );
             stop.cancel(); // both directions done: release the watchdog
             r
@@ -93,7 +124,9 @@ async fn idle_watchdog(
 }
 
 /// One direction: read → write until EOF (then half-close the writer), an
-/// error, or `stop`. Both the read and the write race against `stop`.
+/// error, or `stop`. Both the read and the write race against `stop`. `first`,
+/// when given, runs once on the first non-empty read (before it is written
+/// onward) and is then consumed.
 async fn copy_half<R, W>(
     mut reader: R,
     mut writer: W,
@@ -101,6 +134,7 @@ async fn copy_half<R, W>(
     activity: Arc<AtomicU64>,
     started: Instant,
     count: impl Fn(u64),
+    mut first: Option<FirstChunkHook>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -118,6 +152,9 @@ where
         if n == 0 {
             let _ = writer.shutdown().await; // TCP FIN: does not wait on the peer
             return Ok(());
+        }
+        if let Some(f) = first.take() {
+            f(&buf[..n]);
         }
         tokio::select! {
             biased;
