@@ -284,13 +284,7 @@ impl Engine {
                     )
                     .await;
                 if let Some(i) = decision.matched {
-                    handle.set_rule(
-                        rt.rules
-                            .rules()
-                            .iter()
-                            .find(|r| r.index == i)
-                            .map(|r| r.raw.clone()),
-                    );
+                    handle.set_rule(rule_raw(&rt.rules, i));
                 }
                 match decision.outcome {
                     Outcome::Policy(p) => p,
@@ -434,6 +428,16 @@ fn reject(handle: Arc<SessionHandle>, kind: rurge_proto::RejectKind) -> Result<D
     Err(DialError::Reject { kind, rule, handle })
 }
 
+/// Looks up the raw text of the rule at `index` (M2a `CompiledRule.index` is
+/// the rule's position in `Config.rules`, and `RuleEngine::rules()` returns
+/// them in that ascending order), so a binary search finds it.
+fn rule_raw(rules: &rurge_rules::RuleEngine, index: usize) -> Option<String> {
+    let all = rules.rules();
+    all.binary_search_by_key(&index, |r| r.index)
+        .ok()
+        .map(|pos| all[pos].raw.clone())
+}
+
 impl Dialer for Engine {
     fn dial<'a>(&'a self, session: SessionInfo) -> BoxFuture<'a, Result<Dialed, DialError>> {
         Box::pin(async move {
@@ -452,13 +456,7 @@ impl Dialer for Engine {
                         )
                         .await;
                     if let Some(i) = decision.matched {
-                        handle.set_rule(
-                            rt.rules
-                                .rules()
-                                .iter()
-                                .find(|r| r.index == i)
-                                .map(|r| r.raw.clone()),
-                        );
+                        handle.set_rule(rule_raw(&rt.rules, i));
                     }
                     match decision.outcome {
                         Outcome::Policy(p) => p,

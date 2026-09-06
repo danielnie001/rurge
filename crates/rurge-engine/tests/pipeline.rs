@@ -807,3 +807,72 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
         "the mock DNS server was actually queried"
     );
 }
+
+#[tokio::test]
+async fn persisted_group_selection_is_honored() {
+    // Pick = select, HK, DIRECT; a state selecting DIRECT must resolve to DIRECT
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let target = TestServer::spawn().await;
+    target.set("/hello", "hi there");
+    let dir = tempfile::tempdir().unwrap();
+    let profile = format!(
+        "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\ndns-server = {}\nipv6 = false\n\
+[Proxy]\nHK = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Proxy Group]\nPick = select, HK, DIRECT\n\
+[Rule]\nDOMAIN,target.test,Pick\nFINAL,DIRECT\n",
+        dns.addr()
+    );
+    let loaded = from_text(&profile, &dir.path().join("t.conf"), &load_options());
+    assert!(!loaded.diagnostics.has_errors());
+    let mut selections = std::collections::HashMap::new();
+    selections.insert("Pick".to_string(), "DIRECT".to_string());
+    let runtime = Runtime::build(
+        loaded.config,
+        RuntimeOptions {
+            stack: StackOptions {
+                data_dir: dir.path().to_path_buf(),
+                no_network: true,
+                geo_urls: GeoUrls::default(),
+                dns_cache_size: 2000,
+                system: Arc::new(StaticSystemDns::default()),
+                wait: Duration::ZERO,
+                dns_connector: None,
+            },
+            outbound_mode: OutboundMode::Rule,
+            idle_timeout: Duration::from_secs(600),
+            request_log_size: 1000,
+            selections: GroupSelections::from_map(selections),
+        },
+    )
+    .await
+    .unwrap();
+    // diagnostics() is reachable and clean here
+    assert!(!runtime.diagnostics().has_errors());
+    let engine = Engine::new(runtime);
+    let listeners = engine.bind_listeners().await.unwrap();
+    let http = listeners
+        .iter()
+        .find(|(s, _)| s.kind == ListenerKind::Http)
+        .unwrap()
+        .1
+        .local_addr;
+    // Pick → DIRECT (persisted) → the target is reachable
+    let (head, body) = get_via_proxy(
+        http,
+        &format!(
+            "http://target.test:{}/hello",
+            target.url("/").port().unwrap()
+        ),
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"hi there");
+    let rec = wait_for_record(&engine, Duration::from_secs(3), |r| {
+        r.policy.iter().any(|p| p == "DIRECT")
+    })
+    .await;
+    assert!(
+        rec.is_some(),
+        "resolved through DIRECT (persisted selection)"
+    );
+}

@@ -26,6 +26,7 @@ pub const REP_NOT_ALLOWED: u8 = 0x02;
 pub const REP_HOST_UNREACHABLE: u8 = 0x04;
 pub const REP_CONNECTION_REFUSED: u8 = 0x05;
 pub const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
+pub const REP_ADDR_TYPE_NOT_SUPPORTED: u8 = 0x08;
 
 pub struct Socks5Listener;
 
@@ -95,12 +96,7 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Result<(HostName, u1
             stream.read_exact(&mut b).await?;
             HostName::Ip(IpAddr::V6(Ipv6Addr::from(b)))
         }
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unknown address type",
-            ));
-        }
+        _ => return Ok(Err(REP_ADDR_TYPE_NOT_SUPPORTED)),
     };
     let port = stream.read_u16().await?;
     if head[1] != CMD_CONNECT {
@@ -405,5 +401,43 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), running.join())
             .await
             .expect("accept loop drained and exited within 5 s");
+    }
+
+    #[tokio::test]
+    async fn ipv6_atyp_is_parsed_and_dialed() {
+        let (running, dialer) = listener(Duration::from_secs(30)).await;
+        let mut s = negotiate(running.local_addr).await;
+        // CONNECT ::1 :443 via ATYP=0x04
+        let mut req = vec![5, 1, 0, 4];
+        req.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+        req.extend_from_slice(&443u16.to_be_bytes());
+        s.write_all(&req).await.unwrap();
+        // ::1 is not one of FakeDialer's mapped hosts → it fails, but the request
+        // must have been parsed and a session recorded with that dst (poll)
+        let _ = read_reply(&mut s).await;
+        let want = rurge_config::HostName::Ip(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if dialer
+                .sessions()
+                .iter()
+                .any(|h| h.session().dst_host == want)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "IPv6 session recorded"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_atyp_is_answered_with_0x08() {
+        let (running, _dialer) = listener(Duration::from_secs(30)).await;
+        let mut s = negotiate(running.local_addr).await;
+        s.write_all(&[5, 1, 0, 0x09]).await.unwrap(); // 0x09 is not a valid ATYP
+        assert_eq!(read_reply(&mut s).await[1], REP_ADDR_TYPE_NOT_SUPPORTED);
     }
 }
