@@ -1,6 +1,7 @@
 //! The engine (M3 design §7.2 – 7.3): implements `Dialer` for the listeners,
 //! relays bytes, binds listeners from `[General]`, writes the session log.
 
+use crate::observe::{RequestLog, TrafficStats};
 use crate::runtime::Runtime;
 use arc_swap::ArcSwap;
 use rurge_config::Builtin;
@@ -37,6 +38,13 @@ pub struct ListenerSpec {
     pub auth: Option<HttpAuth>,
 }
 
+/// The request log and traffic counters an `Engine` accumulates across its
+/// lifetime (M3 design §7.3); survives config reloads (unlike `Runtime`).
+struct Observe {
+    log: RequestLog,
+    traffic: TrafficStats,
+}
+
 pub struct Engine {
     runtime: ArcSwap<Runtime>,
     next_session: AtomicU64,
@@ -46,16 +54,22 @@ pub struct Engine {
     /// Tracks CONNECT tunnels and upstream-connection drivers so a graceful
     /// shutdown can wait for them to drain.
     tracker: TaskTracker,
+    observe: Arc<Observe>,
 }
 
 impl Engine {
     pub fn new(runtime: Runtime) -> Arc<Engine> {
+        let observe = Arc::new(Observe {
+            log: RequestLog::new(runtime.request_log_size),
+            traffic: TrafficStats::new(),
+        });
         Arc::new(Engine {
             runtime: ArcSwap::from_pointee(runtime),
             next_session: AtomicU64::new(0),
             sessions_root: CancellationToken::new(),
             accept: CancellationToken::new(),
             tracker: TaskTracker::new(),
+            observe,
         })
     }
 
@@ -161,7 +175,17 @@ impl Engine {
     fn new_handle(&self, session: SessionInfo) -> Arc<SessionHandle> {
         let id = self.next_session.fetch_add(1, Ordering::Relaxed) + 1;
         let handle = SessionHandle::new_with_token(id, session, self.sessions_root.child_token());
-        handle.on_finish(log_session);
+        // Weak: the active index holds the handle and the handle holds this
+        // hook, so a strong `Arc<Observe>` here would be a reference cycle.
+        let observe = Arc::downgrade(&self.observe);
+        handle.on_finish(move |h, outcome| {
+            log_session(h, outcome);
+            if let Some(o) = observe.upgrade() {
+                o.log.record_finished(h, outcome);
+                o.traffic.record(h);
+            }
+        });
+        self.observe.log.mark_active(&handle);
         handle
     }
 }
@@ -177,6 +201,38 @@ impl Engine {
     }
     pub fn tracker(&self) -> &TaskTracker {
         &self.tracker
+    }
+}
+
+impl Engine {
+    /// Finished and in-flight requests (M4 `GET /v1/requests`, `GET /v1/active`).
+    pub fn request_log(&self) -> &RequestLog {
+        &self.observe.log
+    }
+    /// Cumulative and per-second traffic counters (M4 `GET /v1/traffic`).
+    pub fn traffic(&self) -> &TrafficStats {
+        &self.observe.traffic
+    }
+    /// Kills an in-flight session by id (M4 `POST /v1/requests/{id}/kill`).
+    pub fn kill(&self, id: u64) -> bool {
+        self.observe.log.kill(id)
+    }
+    /// Starts the 1 Hz traffic-rate sampler on the engine's tracker. Call once
+    /// after `new`, inside a tokio runtime.
+    pub fn start_sampler(self: &Arc<Self>) {
+        let engine = self.clone();
+        self.tracker.spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = engine.accept.cancelled() => break,
+                    _ = tick.tick() => {
+                        let active = engine.observe.log.active_bytes();
+                        engine.observe.traffic.sample(active);
+                    }
+                }
+            }
+        });
     }
 }
 

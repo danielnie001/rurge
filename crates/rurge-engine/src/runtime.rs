@@ -13,6 +13,7 @@ pub struct RuntimeOptions {
     pub outbound_mode: OutboundMode,
     pub idle_timeout: Duration,
     pub selections: GroupSelections,
+    pub request_log_size: usize,
 }
 
 pub struct Runtime {
@@ -22,6 +23,7 @@ pub struct Runtime {
     pub policies: PolicyRegistry,
     pub outbound_mode: OutboundMode,
     pub idle_timeout: Duration,
+    pub request_log_size: usize,
 }
 
 impl Runtime {
@@ -40,6 +42,7 @@ impl Runtime {
             policies,
             outbound_mode: opts.outbound_mode,
             idle_timeout: opts.idle_timeout,
+            request_log_size: opts.request_log_size.max(1),
         })
     }
 

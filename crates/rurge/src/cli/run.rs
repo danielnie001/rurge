@@ -37,6 +37,9 @@ pub struct RunArgs {
     /// Close a session after this many seconds with no traffic either way (default 600)
     #[arg(long, env = "RURGE_IDLE_TIMEOUT", value_name = "SECS")]
     pub idle_timeout: Option<u64>,
+    /// Keep this many finished requests in the in-memory log (default 1000)
+    #[arg(long, env = "RURGE_REQUEST_LOG_SIZE", value_name = "N")]
+    pub request_log_size: Option<usize>,
     #[command(flatten)]
     pub runtime: RuntimeArgs,
 }
@@ -105,6 +108,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let selections = state.selections_for(&profile_key(&cfg.source.main));
     let outbound_mode = args.outbound_mode.clone();
     let idle_timeout = Duration::from_secs(args.idle_timeout.unwrap_or(600).max(1));
+    let request_log_size = args.request_log_size.unwrap_or(1000).max(1);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -116,6 +120,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 outbound_mode: outbound_mode.clone(),
                 idle_timeout,
                 selections,
+                request_log_size,
             },
         )
         .await
@@ -126,6 +131,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             engine_rt.rules.rules().len(),
         );
         let engine = Engine::new(engine_rt);
+        engine.start_sampler();
         let listeners = match engine.bind_listeners().await {
             Ok(l) => l,
             Err(e) => {

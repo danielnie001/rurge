@@ -98,6 +98,7 @@ async fn harness(general_extra: &str, rules: &str, mode: OutboundMode) -> Harnes
             outbound_mode: mode,
             idle_timeout: Duration::from_secs(600),
             selections: GroupSelections::new(),
+            request_log_size: 1000,
         },
     )
     .await
@@ -167,6 +168,29 @@ async fn get_via_proxy(proxy: SocketAddr, url: &str) -> (String, Vec<u8>) {
     .await
 }
 
+/// Polls the request log until a finished record matches `pred` (≤ `timeout`).
+async fn wait_for_record(
+    engine: &Engine,
+    timeout: Duration,
+    pred: impl Fn(&rurge_engine::RequestRecord) -> bool,
+) -> Option<rurge_engine::RequestRecord> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(r) = engine
+            .request_log()
+            .recent(50)
+            .into_iter()
+            .find(|r| pred(r))
+        {
+            return Some(r);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn plain_http_is_forwarded_through_direct() {
     let h = harness("", "", OutboundMode::Rule).await;
@@ -184,6 +208,15 @@ async fn plain_http_is_forwarded_through_direct() {
         1,
         "resolved once through the profile resolver"
     );
+    // recorded once its upstream connection ended; bytes counted
+    let rec = wait_for_record(&h.engine, Duration::from_secs(3), |r| {
+        r.dst.starts_with("target.test:")
+            && matches!(r.status, rurge_engine::RecordStatus::Completed)
+    })
+    .await
+    .expect("completed record for target.test");
+    assert!(rec.up > 0 && rec.down > 0, "{rec:?}");
+    assert!(h.engine.traffic().totals().down > 0);
 }
 
 #[tokio::test]
@@ -390,6 +423,7 @@ async fn build_runtime(
             outbound_mode: mode,
             idle_timeout,
             selections: GroupSelections::new(),
+            request_log_size: 1000,
         },
     )
     .await
@@ -584,6 +618,7 @@ async fn http_listener_password_from_the_profile() {
             outbound_mode: OutboundMode::Rule,
             idle_timeout: Duration::from_secs(600),
             selections: GroupSelections::new(),
+            request_log_size: 1000,
         },
     )
     .await

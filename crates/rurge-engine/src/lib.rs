@@ -10,5 +10,6 @@ pub mod stack;
 pub mod state;
 
 pub use engine::{Engine, ListenerSpec};
+pub use observe::{RecordStatus, RequestLog, RequestRecord, TrafficStats, TrafficTotals};
 pub use runtime::{Runtime, RuntimeOptions};
 pub use rurge_inbound::Running;
