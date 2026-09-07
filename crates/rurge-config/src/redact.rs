@@ -2,7 +2,30 @@
 //! design §4.3): secrets become `***`, everything else (including line count)
 //! is preserved so line numbers in diagnostics still line up.
 
-const SECRET_KEYS: [&str; 3] = ["password", "ca-passphrase", "ca-p12"];
+/// Keys whose whole value is a secret when they stand alone on a line
+/// (`[WireGuard]` `private-key`, `[Snell Server]` `psk`, …).
+const SECRET_KEYS: [&str; 7] = [
+    "password",
+    "ca-passphrase",
+    "ca-p12",
+    "private-key",
+    "psk",
+    "pre-shared-key",
+    "token",
+];
+/// Inline `name=value` parameters redacted wherever they appear in a value.
+/// `username` also covers harmless SSH user names; over-redacting is the safe
+/// side for an endpoint whose purpose is safe output.
+const SECRET_PARAMS: [&str; 8] = [
+    "password",
+    "psk",
+    "private-key",
+    "pre-shared-key",
+    "base64",
+    "token",
+    "uuid",
+    "username",
+];
 const KEY_AT_KEYS: [&str; 4] = [
     "http-api",
     "external-controller-access",
@@ -24,7 +47,17 @@ pub fn redact_profile(text: &str) -> String {
     out
 }
 
+/// Redacts one line, keeping a CRLF file's `\r` where it was: the line is split
+/// on `\n` by the caller, so `\r` would otherwise be eaten by the branches that
+/// rebuild the line from its parts.
 fn redact_line(line: &str) -> String {
+    match line.strip_suffix('\r') {
+        Some(rest) => format!("{}\r", redact_body(rest)),
+        None => redact_body(line),
+    }
+}
+
+fn redact_body(line: &str) -> String {
     let Some((key, value)) = line.split_once('=') else {
         return line.to_string();
     };
@@ -58,16 +91,19 @@ fn redact_line(line: &str) -> String {
     // `name = http/https/socks5/socks5-tls, host, port, username, password`
     // (those types carry credentials positionally, not as `password=...`).
     let mut redacted = redact_positional_credentials(value);
-    for param in ["password", "psk", "private-key", "base64"] {
+    for param in SECRET_PARAMS {
         redacted = redact_param(&redacted, param);
     }
     format!("{key}={redacted}")
 }
 
 /// For `http` / `https` / `socks5` / `socks5-tls` policy lines, blanks every
-/// positional token (one with no `=`) from index 3 onward (0 = type, 1 =
-/// host, 2 = port) — that is where Surge puts `username, password`. Any other
-/// line is returned unchanged.
+/// positional token from index 3 onward (0 = type, 1 = host, 2 = port) — that
+/// is where Surge puts `username, password`. A token counts as a named
+/// parameter (and is kept) only when what follows its first `=` is non-empty
+/// and not made only of `=`, so base64 padding (`aHVudGVyMg==`) is redacted
+/// while `tfo=true` survives; `sni=` with an empty value is over-redacted.
+/// Any other line is returned unchanged.
 fn redact_positional_credentials(value: &str) -> String {
     let tokens: Vec<&str> = value.split(',').collect();
     let is_cred_type = tokens
@@ -82,7 +118,7 @@ fn redact_positional_credentials(value: &str) -> String {
         .map(|(i, tok)| {
             let t = tok.trim_start();
             let lead = &tok[..tok.len() - t.len()];
-            if i >= 3 && !t.contains('=') {
+            if i >= 3 && !is_named_param(t.trim_end()) {
                 format!("{lead}***")
             } else {
                 (*tok).to_string()
@@ -90,6 +126,13 @@ fn redact_positional_credentials(value: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// `name=value` with a value that is neither empty nor pure `=` padding.
+fn is_named_param(token: &str) -> bool {
+    token
+        .split_once('=')
+        .is_some_and(|(_, after)| !after.is_empty() && !after.chars().all(|c| c == '='))
 }
 
 /// Replaces the value of every `<param> = <value>` occurrence (up to the next
@@ -167,5 +210,43 @@ mod tests {
         );
         assert_eq!(out.lines().count(), text.lines().count());
         assert!(out.contains("FINAL,DIRECT"));
+    }
+
+    #[test]
+    fn redacts_wireguard_snell_vmess_tuic_and_padded_credentials() {
+        let text = "[WireGuard wg1]\nprivate-key = WGKEY\nself-ip = 10.0.0.2\n\
+peer = (public-key = PUB, pre-shared-key = PSK1, endpoint = 1.2.3.4:51820)\n\
+[Snell Server]\npsk = SNELLPSK\n\
+[Proxy]\nV = vmess, h, 443, username=11111111-2222-3333-4444-555555555555, tls=true\n\
+T = tuic, h, 443, token=TUICTOK, uuid=abcd-ef\n\
+P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
+        let out = redact_profile(text);
+        for secret in [
+            "WGKEY",
+            "PSK1",
+            "SNELLPSK",
+            "11111111-2222-3333-4444-555555555555",
+            "TUICTOK",
+            "abcd-ef",
+            "bob",
+            "aHVudGVyMg==",
+        ] {
+            assert!(!out.contains(secret), "{secret} leaked:\n{out}");
+        }
+        // non-secrets survive
+        assert!(out.contains("PUB"), "{out}");
+        assert!(out.contains("1.2.3.4:51820"), "{out}");
+        assert!(
+            out.contains("tls=true") && out.contains("tfo=true"),
+            "{out}"
+        );
+        assert!(out.contains("self-ip = 10.0.0.2"), "{out}");
+        assert_eq!(out.lines().count(), text.lines().count());
+    }
+
+    #[test]
+    fn crlf_line_endings_survive_redaction() {
+        let out = redact_profile("a = b\r\npassword = x\r\n");
+        assert_eq!(out, "a = b\r\npassword = ***\r\n");
     }
 }
