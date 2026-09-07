@@ -382,6 +382,17 @@ async fn features_collections_stop_and_unknown_paths() {
         (status, body),
         (404, json!({ "error": "no such endpoint" }))
     );
+    // a wrong method on a registered path is a JSON error too, not axum's
+    // default empty-bodied 405
+    let (status, body) = call(api.addr, "DELETE", "/v1/outbound", Some(KEY), None).await;
+    assert_eq!(
+        (status, body),
+        (405, json!({ "error": "method not allowed" }))
+    );
+    // the auth layer wraps the fallback: an unknown path without a key is 401,
+    // not 404 (no probing the endpoint list without the key)
+    let (status, body) = call(api.addr, "GET", "/v1/nope", None, None).await;
+    assert_eq!((status, body), (401, json!({ "error": "unauthorized" })));
     assert_eq!(post(&api, "/v1/stop", json!({})).await, (200, json!({})));
     wait_until(async || api.control.stops.load(Ordering::SeqCst) == 1).await;
 }
@@ -463,6 +474,11 @@ async fn recent_and_active_requests_and_kill() {
     let (status, body) = get(&api, "/v1/requests/recent?limit=abc").await;
     assert_eq!(status, 400, "{body}");
     assert!(body["error"].is_string());
+    // `limit=0` is a caller mistake, not "give me one record"
+    assert_eq!(
+        get(&api, "/v1/requests/recent?limit=0").await,
+        (400, json!({ "error": "limit must be at least 1" }))
+    );
     let (status, body) = post(&api, "/v1/requests/kill", json!({ "id": 999_999 })).await;
     assert_eq!(status, 404, "{body}");
     // a CONNECT tunnel stays active until killed
@@ -536,6 +552,52 @@ async fn traffic_reports_totals_by_policy_and_listener() {
     let http_out = body["listener"]["http"]["out"].as_u64().unwrap();
     assert!(http_in >= 4096 && http_in > http_out, "{body}");
     assert_eq!(body["listener"]["socks5"]["in"], 0);
+}
+
+/// `total` must include the bytes of sessions that are still running: the
+/// speeds already come from `snapshot_bytes` (finished + in-flight), so a
+/// `total` read from the finished-only counters shows `in 0 B (in 5 MiB/s)`
+/// during a long transfer.
+#[tokio::test]
+async fn traffic_total_includes_in_flight_bytes() {
+    let api = api().await;
+    let host = format!("target.test:{}", api.target_port());
+    let mut s = TcpStream::connect(api.http()).await.unwrap();
+    s.write_all(format!("CONNECT {host} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut buf = vec![0u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+        .await
+        .expect("connect reply in time")
+        .unwrap();
+    let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    // A request that never ends in `\r\n\r\n`: the target never answers and the
+    // tunnel stays open, so these bytes are only ever in-flight bytes.
+    let payload = format!(
+        "GET /hello HTTP/1.1\r\nHost: {host}\r\nX-Pad: {}\r\n",
+        "p".repeat(400)
+    );
+    s.write_all(payload.as_bytes()).await.unwrap();
+    s.flush().await.unwrap();
+    let want = payload.len() as u64;
+    let mut body = Value::Null;
+    wait_until(async || {
+        body = get(&api, "/v1/traffic").await.1;
+        body["total"]["out"].as_u64().unwrap_or(0) >= want
+    })
+    .await;
+    let active = get(&api, "/v1/requests/active").await.1;
+    assert!(
+        active["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["dst"] == json!(host)),
+        "the tunnel must still be in flight: {active}"
+    );
+    drop(s);
 }
 
 #[tokio::test]

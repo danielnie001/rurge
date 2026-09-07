@@ -42,6 +42,9 @@ pub(crate) type App = Arc<Shared>;
 
 pub type ServerFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
+/// The API's routes, guarded by the `X-Key` layer. Serve it with
+/// `into_make_service_with_connect_info::<SocketAddr>()` (as [`serve`] does):
+/// the auth layer needs the peer address to count failures and ban a source.
 pub fn router(key: String, ctx: ApiContext) -> Router {
     let app: App = Arc::new(Shared {
         engine: ctx.engine,
@@ -84,6 +87,7 @@ pub fn router(key: String, ctx: ApiContext) -> Router {
         .route("/v1/events", get(routes::misc::events))
         .route("/v1/stop", post(routes::misc::stop))
         .fallback(routes::misc::not_found)
+        .method_not_allowed_fallback(routes::misc::method_not_allowed)
         .layer(middleware::from_fn_with_state(
             app.clone(),
             auth::require_key,

@@ -35,7 +35,10 @@ pub struct TrafficJson {
 
 pub async fn traffic(State(app): State<App>) -> Json<TrafficJson> {
     let stats = app.engine.traffic();
-    let totals = stats.totals();
+    // `total` counts in-flight sessions too, so it stays consistent with the
+    // speeds (which the sampler derives from the same `snapshot_bytes`); the
+    // per-connector and per-listener maps are finished sessions only.
+    let (total_up, total_down) = app.engine.request_log().snapshot_bytes(stats);
     let (rate_up, rate_down) = stats.rate();
     let connector = stats
         .by_policy()
@@ -50,8 +53,8 @@ pub async fn traffic(State(app): State<App>) -> Json<TrafficJson> {
     Json(TrafficJson {
         start_time: app.started_secs,
         total: Total {
-            down: totals.down,
-            out: totals.up,
+            down: total_down,
+            out: total_up,
             in_current_speed: rate_down,
             out_current_speed: rate_up,
         },

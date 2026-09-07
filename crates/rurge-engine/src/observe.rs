@@ -163,28 +163,11 @@ impl RequestLog {
             .collect()
     }
 
-    /// Total bytes moved by the in-flight requests so far.
-    pub fn active_bytes(&self) -> (u64, u64) {
-        self.prune_and_lock()
-            .values()
-            .filter_map(Weak::upgrade)
-            .fold((0, 0), |(u, d), h| {
-                let (hu, hd) = h.bytes();
-                (u + hu, d + hd)
-            })
-    }
-
     /// Cumulative (finished) plus in-flight bytes, read under the active lock.
     pub fn snapshot_bytes(&self, traffic: &TrafficStats) -> (u64, u64) {
         let active = self.prune_and_lock();
         let totals = traffic.totals();
-        let (au, ad) = active
-            .values()
-            .filter_map(Weak::upgrade)
-            .fold((0, 0), |(u, d), h| {
-                let (hu, hd) = h.bytes();
-                (u + hu, d + hd)
-            });
+        let (au, ad) = sum_active_bytes(&active);
         (totals.up + au, totals.down + ad)
     }
 
@@ -207,6 +190,17 @@ impl RequestLog {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// Live up/down bytes of the sessions in an already-locked active index.
+fn sum_active_bytes(active: &BTreeMap<u64, Weak<SessionHandle>>) -> (u64, u64) {
+    active
+        .values()
+        .filter_map(Weak::upgrade)
+        .fold((0, 0), |(u, d), h| {
+            let (hu, hd) = h.bytes();
+            (u + hu, d + hd)
+        })
 }
 
 /// A snapshot of cumulative up/down bytes.
@@ -415,12 +409,15 @@ mod tests {
     #[test]
     fn dropped_handles_leave_the_active_index() {
         let log = RequestLog::new(4);
+        let traffic = TrafficStats::new();
         let a = handle(1, "drop.test");
+        a.add_up(10);
         log.mark_active(&a);
         assert_eq!(log.active().len(), 1);
+        assert_eq!(log.snapshot_bytes(&traffic), (10, 0));
         drop(a);
         assert!(log.active().is_empty());
-        assert_eq!(log.active_bytes(), (0, 0));
+        assert_eq!(log.snapshot_bytes(&traffic), (0, 0));
         assert!(!log.kill(1));
     }
 

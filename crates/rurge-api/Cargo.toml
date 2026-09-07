@@ -10,7 +10,6 @@ repository.workspace = true
 [dependencies]
 rurge-config.workspace = true
 rurge-engine.workspace = true
-rurge-dns.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true

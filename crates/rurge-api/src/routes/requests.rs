@@ -103,7 +103,11 @@ pub async fn recent(
     q: Result<Query<RecentQuery>, QueryRejection>,
 ) -> ApiResult<Json<RequestsJson>> {
     let q = query_params(q)?;
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).max(1);
+    let limit = match q.limit {
+        Some(0) => return Err(ApiError::bad_request("limit must be at least 1")),
+        Some(n) => n,
+        None => DEFAULT_LIMIT,
+    };
     let requests = app
         .engine
         .request_log()

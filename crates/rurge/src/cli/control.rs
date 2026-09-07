@@ -140,7 +140,17 @@ pub fn reload(args: ControlArgs) -> anyhow::Result<ExitCode> {
 pub fn stop(args: ControlArgs) -> anyhow::Result<ExitCode> {
     let client = client(&args)?;
     block_on(async {
-        match expect_2xx(&client, client.post("/v1/stop", json!({})).await) {
+        let result = client.post("/v1/stop", json!({})).await;
+        // §7: the daemon answers `{}` and then exits, so it may close the
+        // connection before the body is fully read. Behind a 2xx status that
+        // still means the stop was accepted.
+        if let Err(ClientError::BodyLost { status }) = &result
+            && (200..300).contains(status)
+        {
+            println!("stop requested");
+            return ExitCode::SUCCESS;
+        }
+        match expect_2xx(&client, result) {
             Ok(_) => {
                 println!("stop requested");
                 ExitCode::SUCCESS

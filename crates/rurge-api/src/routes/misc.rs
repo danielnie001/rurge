@@ -4,6 +4,7 @@ use crate::App;
 use crate::error::ApiError;
 use axum::Json;
 use axum::extract::State;
+use axum::http::StatusCode;
 use serde_json::{Value, json};
 
 pub async fn modules() -> Json<Value> {
@@ -29,4 +30,10 @@ pub async fn stop(State(app): State<App>) -> Json<Value> {
 
 pub async fn not_found() -> ApiError {
     ApiError::not_found("no such endpoint")
+}
+
+/// A registered path reached with the wrong method: axum's own 405 has an
+/// empty body, which would break "every error is `{"error":…}`".
+pub async fn method_not_allowed() -> ApiError {
+    ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
 }

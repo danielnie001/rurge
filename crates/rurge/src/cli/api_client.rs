@@ -25,6 +25,12 @@ pub enum ClientError {
     Unreachable(String),
     Timeout,
     BadBody(String),
+    /// The status line arrived but the body did not (the peer closed the
+    /// connection, or the deadline hit while reading it). `rurge stop` accepts
+    /// this behind a 2xx: the daemon may exit before its `{}` is fully flushed.
+    BodyLost {
+        status: u16,
+    },
 }
 
 impl fmt::Display for ClientError {
@@ -33,6 +39,12 @@ impl fmt::Display for ClientError {
             ClientError::Unreachable(e) => write!(f, "{e}"),
             ClientError::Timeout => write!(f, "timed out after {} s", TIMEOUT.as_secs()),
             ClientError::BadBody(e) => write!(f, "invalid response body: {e}"),
+            ClientError::BodyLost { status } => {
+                write!(
+                    f,
+                    "answered {status} but the connection closed before the body"
+                )
+            }
         }
     }
 }
@@ -80,23 +92,58 @@ impl ApiClient {
         let req = req
             .body(body)
             .map_err(|e| ClientError::Unreachable(e.to_string()))?;
-        let resp = tokio::time::timeout(TIMEOUT, self.client.request(req))
-            .await
-            .map_err(|_| ClientError::Timeout)?
-            .map_err(|e| ClientError::Unreachable(e.to_string()))?;
-        let status = resp.status().as_u16();
-        let bytes = tokio::time::timeout(TIMEOUT, resp.into_body().collect())
-            .await
-            .map_err(|_| ClientError::Timeout)?
-            .map_err(|e| ClientError::Unreachable(e.to_string()))?
-            .to_bytes();
-        let value = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).map_err(|e| {
-                ClientError::BadBody(format!("{e}: {}", String::from_utf8_lossy(&bytes)))
-            })?
+        // One deadline for the whole exchange, not one per phase. `seen_status`
+        // survives the timeout so a deadline hit *after* the status line is
+        // still reported as `BodyLost` rather than a bare `Timeout`.
+        let mut seen_status: Option<u16> = None;
+        let exchange = async {
+            let resp = self
+                .client
+                .request(req)
+                .await
+                .map_err(|e| ClientError::Unreachable(e.to_string()))?;
+            let status = resp.status().as_u16();
+            seen_status = Some(status);
+            let bytes = resp
+                .into_body()
+                .collect()
+                .await
+                .map_err(|_| ClientError::BodyLost { status })?
+                .to_bytes();
+            let value = if bytes.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    ClientError::BadBody(format!("{e}: {}", String::from_utf8_lossy(&bytes)))
+                })?
+            };
+            Ok((status, value))
         };
-        Ok((status, value))
+        let result = tokio::time::timeout(TIMEOUT, exchange).await;
+        match result {
+            Ok(r) => r,
+            Err(_) => match seen_status {
+                Some(status) => Err(ClientError::BodyLost { status }),
+                None => Err(ClientError::Timeout),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn errors_name_the_failed_phase() {
+        assert_eq!(
+            ClientError::BodyLost { status: 200 }.to_string(),
+            "answered 200 but the connection closed before the body"
+        );
+        assert_eq!(ClientError::Timeout.to_string(), "timed out after 5 s");
+        assert_eq!(
+            ClientError::BadBody("eof".into()).to_string(),
+            "invalid response body: eof"
+        );
     }
 }

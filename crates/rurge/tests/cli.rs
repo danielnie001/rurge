@@ -1142,7 +1142,15 @@ mod run {
             api_call(port, "POST", "/v1/stop", "k", Some("{}")),
             (200, "{}".to_string())
         );
-        assert_eq!(wait_for_exit(&mut daemon, 10), Some(0), "stop exits 0");
+        // 3 s, not 10: `POST /v1/stop` cancels the API token and drains at
+        // once, so a `stop` that fell back on the shutdown grace period would
+        // take much longer — and would print the line asserted against below.
+        assert_eq!(wait_for_exit(&mut daemon, 3), Some(0), "stop exits 0");
+        let lines: Vec<String> = daemon.lines.try_iter().collect();
+        assert!(
+            !lines.iter().any(|l| l.contains("grace period elapsed")),
+            "stop must not wait out the grace period: {lines:?}"
+        );
     }
 
     #[test]

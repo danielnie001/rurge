@@ -314,8 +314,9 @@ impl Engine {
         handle.on_finish(move |h, outcome| {
             log_session(h, outcome);
             if let Some(o) = observe.upgrade() {
-                // Traffic first: a reader that sees the finished record in
-                // `log` next must already find its bytes in `traffic.totals()`.
+                // `record_finished` owns the ordering guarantee (its doc): the
+                // bytes land in `traffic` under the active lock, so no reader
+                // ever counts this session twice or misses it.
                 o.log.record_finished(h, outcome, &o.traffic);
             }
         });

@@ -255,8 +255,8 @@ async fn initial_mode(
         Some(Mode::Proxy) => match &state.global_policy {
             Some(p) => OutboundMode::Proxy(PolicyRef::parse(p)),
             None => {
-                eprintln!(
-                    "warning: state.json says proxy mode but names no global policy; using rule mode"
+                tracing::warn!(
+                    "state.json says proxy mode but names no global policy; using rule mode"
                 );
                 OutboundMode::Rule
             }
@@ -317,9 +317,15 @@ async fn reload(d: &Daemon<'_>, listeners: &mut Vec<(ListenerSpec, Running)>) ->
     }
     print_diagnostics(&loaded.diagnostics.sorted());
     if &loaded.config.general.http_api != d.http_api {
-        tracing::warn!(
+        // `d.http_api` is the profile as it was at boot, and the daemon exits
+        // when a configured API cannot bind, so `is_some()` means an API is
+        // actually running; otherwise there is nothing to keep.
+        let message = if d.http_api.is_some() {
             "http-api changed in the profile; the API keeps its current address and key until rurge restarts"
-        );
+        } else {
+            "http-api was added to the profile; the API is not started until rurge restarts"
+        };
+        tracing::warn!("{message}");
     }
     let state = d.store.snapshot().await;
     let next = match build_engine_runtime(
