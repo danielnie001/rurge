@@ -316,8 +316,7 @@ impl Engine {
             if let Some(o) = observe.upgrade() {
                 // Traffic first: a reader that sees the finished record in
                 // `log` next must already find its bytes in `traffic.totals()`.
-                o.traffic.record(h);
-                o.log.record_finished(h, outcome);
+                o.log.record_finished(h, outcome, &o.traffic);
             }
         });
         self.observe.log.mark_active(&handle);
@@ -582,8 +581,8 @@ impl Engine {
                 tokio::select! {
                     _ = engine.accept.cancelled() => break,
                     _ = tick.tick() => {
-                        let active = engine.observe.log.active_bytes();
-                        engine.observe.traffic.sample(active);
+                        let total = engine.observe.log.snapshot_bytes(&engine.observe.traffic);
+                        engine.observe.traffic.sample(total);
                     }
                 }
             }

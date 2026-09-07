@@ -13,6 +13,7 @@ pub mod sniff;
 pub mod stack;
 pub mod state;
 
+pub use control::{Control, LogLevel, Mode, ReloadReport};
 pub use engine::{Engine, ListenerSpec, PoliciesView, RuleView, UnknownPolicy};
 pub use observe::{RecordStatus, RequestLog, RequestRecord, TrafficStats, TrafficTotals};
 pub use runtime::{Runtime, RuntimeOptions};

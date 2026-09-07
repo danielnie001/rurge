@@ -119,12 +119,20 @@ impl RequestLog {
         map
     }
 
-    /// Moves a session from the active index into the finished ring.
-    pub fn record_finished(&self, handle: &SessionHandle, outcome: &SessionOutcome) {
-        self.active
-            .lock()
-            .expect("active index")
-            .remove(&handle.id());
+    /// Moves the session out of the active index and into the ring, adding its
+    /// bytes to `traffic` under the same lock so `snapshot_bytes` never sees a
+    /// session in both places (M3b deferred item m2).
+    pub fn record_finished(
+        &self,
+        handle: &SessionHandle,
+        outcome: &SessionOutcome,
+        traffic: &TrafficStats,
+    ) {
+        {
+            let mut active = self.active.lock().expect("active index");
+            traffic.record(handle);
+            active.remove(&handle.id());
+        }
         let rec = record_of(handle, Some(outcome));
         let mut ring = self.finished.lock().expect("finished ring");
         if ring.len() == self.capacity {
@@ -164,6 +172,20 @@ impl RequestLog {
                 let (hu, hd) = h.bytes();
                 (u + hu, d + hd)
             })
+    }
+
+    /// Cumulative (finished) plus in-flight bytes, read under the active lock.
+    pub fn snapshot_bytes(&self, traffic: &TrafficStats) -> (u64, u64) {
+        let active = self.prune_and_lock();
+        let totals = traffic.totals();
+        let (au, ad) = active
+            .values()
+            .filter_map(Weak::upgrade)
+            .fold((0, 0), |(u, d), h| {
+                let (hu, hd) = h.bytes();
+                (u + hu, d + hd)
+            });
+        (totals.up + au, totals.down + ad)
     }
 
     /// Kills an in-flight session by id; false if it is not active.
@@ -302,18 +324,15 @@ impl TrafficStats {
         v
     }
 
-    /// Records one rate sample: `active` is the live byte total of in-flight
-    /// sessions; the total tracked is finished-cumulative + active. Rate is the
-    /// non-negative delta from the previous sample (call once per second).
-    pub fn sample(&self, active: (u64, u64)) {
-        let total_up = self.up.load(Ordering::Relaxed) + active.0;
-        let total_down = self.down.load(Ordering::Relaxed) + active.1;
+    /// Records one rate sample from a consistent total (finished + in-flight);
+    /// rate is the non-negative delta since the previous sample.
+    pub fn sample(&self, total: (u64, u64)) {
         let mut last = self.last_sample.lock().expect("rate sample");
         self.rate_up
-            .store(total_up.saturating_sub(last.0), Ordering::Relaxed);
+            .store(total.0.saturating_sub(last.0), Ordering::Relaxed);
         self.rate_down
-            .store(total_down.saturating_sub(last.1), Ordering::Relaxed);
-        *last = (total_up, total_down);
+            .store(total.1.saturating_sub(last.1), Ordering::Relaxed);
+        *last = total;
     }
 
     /// Bytes per second from the last two samples.
@@ -345,6 +364,7 @@ mod tests {
     #[test]
     fn active_then_finished_moves_into_the_ring() {
         let log = RequestLog::new(2);
+        let t = TrafficStats::new();
         let a = handle(1, "a.test");
         log.mark_active(&a);
         assert_eq!(log.active().len(), 1);
@@ -352,7 +372,7 @@ mod tests {
         a.add_up(10);
         a.add_down(20);
         a.finish(SessionOutcome::Completed);
-        log.record_finished(&a, &SessionOutcome::Completed);
+        log.record_finished(&a, &SessionOutcome::Completed, &t);
         assert_eq!(log.active().len(), 0);
         let recent = log.recent(10);
         assert_eq!(recent.len(), 1);
@@ -365,10 +385,11 @@ mod tests {
     #[test]
     fn ring_evicts_oldest_beyond_capacity() {
         let log = RequestLog::new(2);
+        let t = TrafficStats::new();
         for id in 1..=3 {
             let h = handle(id, "x.test");
             log.mark_active(&h);
-            log.record_finished(&h, &SessionOutcome::Completed);
+            log.record_finished(&h, &SessionOutcome::Completed, &t);
         }
         let recent = log.recent(10);
         assert_eq!(recent.len(), 2);
@@ -406,16 +427,18 @@ mod tests {
     #[test]
     fn rejected_and_failed_carry_their_status() {
         let log = RequestLog::new(4);
+        let t = TrafficStats::new();
         let r = handle(1, "r.test");
         r.set_error("policy protocol not implemented: ss");
         log.mark_active(&r);
         log.record_finished(
             &r,
             &SessionOutcome::Rejected(rurge_proto::RejectKind::Reject),
+            &t,
         );
         let f = handle(2, "f.test");
         log.mark_active(&f);
-        log.record_finished(&f, &SessionOutcome::Failed("dns lookup failed".into()));
+        log.record_finished(&f, &SessionOutcome::Failed("dns lookup failed".into()), &t);
         let recent = log.recent(10);
         assert_eq!(recent[0].status, RecordStatus::Failed);
         assert_eq!(recent[0].error.as_deref(), Some("dns lookup failed"));
@@ -522,7 +545,7 @@ mod tests {
     #[test]
     fn rate_is_the_delta_between_samples() {
         let t = TrafficStats::new();
-        // cumulative finished = 0; first sample sees 1000 active bytes up
+        // total (finished + active) = 1000 on the first sample
         t.sample((1000, 0));
         assert_eq!(t.rate(), (1000, 0));
         t.sample((1500, 300));
@@ -530,5 +553,24 @@ mod tests {
         // a sample that goes backwards (a session ended, active dropped) clamps to 0
         t.sample((1400, 300));
         assert_eq!(t.rate(), (0, 0));
+    }
+
+    #[test]
+    fn snapshot_bytes_never_double_counts_a_finishing_session() {
+        let log = RequestLog::new(8);
+        let t = TrafficStats::new();
+        let a = handle(1, "a.test");
+        log.mark_active(&a);
+        a.add_up(10);
+        a.add_down(20);
+        assert_eq!(log.snapshot_bytes(&t), (10, 20), "active bytes only");
+        a.finish(SessionOutcome::Completed);
+        log.record_finished(&a, &SessionOutcome::Completed, &t);
+        assert_eq!(
+            log.snapshot_bytes(&t),
+            (10, 20),
+            "moved to cumulative exactly once"
+        );
+        assert_eq!((t.totals().up, t.totals().down), (10, 20));
     }
 }
