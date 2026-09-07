@@ -36,8 +36,7 @@ pub(crate) struct Shared {
     #[allow(dead_code)]
     pub(crate) load_options: LoadOptions,
     pub(crate) auth: auth::AuthState,
-    /// Unix seconds when the API came up (`/v1/traffic` `startTime`, Task 5).
-    #[allow(dead_code)]
+    /// Unix seconds when the API came up (`/v1/traffic` `startTime`).
     pub(crate) started_secs: f64,
 }
 
@@ -69,6 +68,12 @@ pub fn router(key: String, ctx: ApiContext) -> Router {
             "/v1/features/{name}",
             get(routes::features::get_feature).post(routes::features::set_feature),
         )
+        .route("/v1/policies", get(routes::policies::policies))
+        .route("/v1/rules", get(routes::policies::rules))
+        .route("/v1/requests/recent", get(routes::requests::recent))
+        .route("/v1/requests/active", get(routes::requests::active))
+        .route("/v1/requests/kill", post(routes::requests::kill))
+        .route("/v1/traffic", get(routes::traffic::traffic))
         .route("/v1/modules", get(routes::misc::modules))
         .route("/v1/scripting", get(routes::misc::scripting))
         .route("/v1/events", get(routes::misc::events))

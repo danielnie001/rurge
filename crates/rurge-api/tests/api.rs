@@ -64,14 +64,19 @@ impl Control for FakeControl {
     }
 }
 
-#[allow(dead_code)]
 struct Api {
     _dir: tempfile::TempDir,
+    /// Read by Task 6's `POST /v1/profiles/*` tests; unread until then.
+    #[allow(dead_code)]
     conf: PathBuf,
     state_path: PathBuf,
+    /// Read directly by Task 6's `/v1/dns*` tests; unread until then.
+    #[allow(dead_code)]
     engine: Arc<Engine>,
     listeners: Vec<(ListenerSpec, Running)>,
     target: TestServer,
+    /// Read by Task 6's `/v1/dns*` tests; unread until then.
+    #[allow(dead_code)]
     dns: MockDns,
     control: Arc<FakeControl>,
     store: Arc<StateStore>,
@@ -79,7 +84,6 @@ struct Api {
     _token: CancellationToken,
 }
 
-#[allow(dead_code)]
 impl Api {
     fn http(&self) -> SocketAddr {
         self.listeners
@@ -246,7 +250,6 @@ async fn post(api: &Api, path: &str, body: Value) -> (u16, Value) {
 }
 
 /// Plain HTTP GET through the proxy listener; returns (status line, body).
-#[allow(dead_code)]
 async fn get_via_proxy(proxy: SocketAddr, url: &str) -> (String, Vec<u8>) {
     let mut s = TcpStream::connect(proxy).await.unwrap();
     let host = url
@@ -383,4 +386,129 @@ async fn features_collections_stop_and_unknown_paths() {
     );
     assert_eq!(post(&api, "/v1/stop", json!({})).await, (200, json!({})));
     wait_until(async || api.control.stops.load(Ordering::SeqCst) == 1).await;
+}
+
+#[tokio::test]
+async fn policies_and_rules_are_listed_with_hits() {
+    let api = api().await;
+    let (status, body) = get(&api, "/v1/policies").await;
+    assert_eq!(status, 200);
+    let proxies: Vec<&str> = body["proxies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        proxies.contains(&"DIRECT")
+            && proxies.contains(&"REJECT-TINYGIF")
+            && proxies.contains(&"HK")
+            && proxies.contains(&"Block"),
+        "{proxies:?}"
+    );
+    assert_eq!(body["policy-groups"], json!(["Pick"]));
+    let (head, _) = get_via_proxy(api.http(), &api.target_url()).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let (_, body) = get(&api, "/v1/rules").await;
+    let rules = body["rules"].as_array().unwrap();
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[0]["index"], 0);
+    assert_eq!(rules[0]["rule"], "DOMAIN,ads.test,REJECT");
+    assert_eq!(rules[0]["hits"], 0);
+    assert_eq!(rules[1]["rule"], "FINAL,DIRECT");
+    assert!(rules[1]["hits"].as_u64().unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn recent_and_active_requests_and_kill() {
+    let api = api().await;
+    let (head, _) = get_via_proxy(api.http(), &api.target_url()).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let mut recent = Vec::new();
+    wait_until(async || {
+        recent = get(&api, "/v1/requests/recent").await.1["requests"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        recent.iter().any(|r| r["status"] == "completed")
+    })
+    .await;
+    let r = recent.iter().find(|r| r["status"] == "completed").unwrap();
+    assert_eq!(r["listener"], "http");
+    assert_eq!(r["dst"], format!("target.test:{}", api.target_port()));
+    assert_eq!(r["policy"], json!(["DIRECT"]));
+    assert_eq!(r["rule"], "FINAL,DIRECT");
+    assert!(r["up"].as_u64().unwrap() > 0 && r["down"].as_u64().unwrap() > 0);
+    assert!(r["startedMs"].as_u64().unwrap() > 0);
+    assert!(r["rejectKind"].is_null() && r["error"].is_null());
+    assert_eq!(
+        get(&api, "/v1/requests/recent?limit=1").await.1["requests"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let (status, body) = post(&api, "/v1/requests/kill", json!({ "id": 999_999 })).await;
+    assert_eq!(status, 404, "{body}");
+    // a CONNECT tunnel stays active until killed
+    let mut tunnel = TcpStream::connect(api.http()).await.unwrap();
+    let dst = format!("target.test:{}", api.target_port());
+    tunnel
+        .write_all(format!("CONNECT {dst} HTTP/1.1\r\nHost: {dst}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 256];
+    let n = tunnel.read(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+    let mut active_id = 0;
+    wait_until(async || {
+        let body = get(&api, "/v1/requests/active").await.1;
+        let found = body["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["dst"] == dst && r["status"] == "active")
+            .cloned();
+        if let Some(r) = found {
+            active_id = r["id"].as_u64().unwrap();
+        }
+        active_id != 0
+    })
+    .await;
+    assert_eq!(
+        post(&api, "/v1/requests/kill", json!({ "id": active_id })).await,
+        (200, json!({}))
+    );
+    let closed = tokio::time::timeout(Duration::from_secs(3), tunnel.read(&mut buf)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+        "killed tunnel closes: {closed:?}"
+    );
+    wait_until(async || {
+        get(&api, "/v1/requests/active").await.1["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["id"] != active_id)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn traffic_reports_totals_by_policy_and_listener() {
+    let api = api().await;
+    let (head, _) = get_via_proxy(api.http(), &api.target_url()).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let mut body = Value::Null;
+    wait_until(async || {
+        body = get(&api, "/v1/traffic").await.1;
+        body["total"]["in"].as_u64().unwrap_or(0) > 0
+    })
+    .await;
+    assert!(body["startTime"].as_f64().unwrap() > 1.0e9);
+    assert!(body["total"]["out"].as_u64().unwrap() > 0);
+    assert!(body["total"]["inCurrentSpeed"].is_u64() && body["total"]["outCurrentSpeed"].is_u64());
+    assert!(body["connector"]["DIRECT"]["in"].as_u64().unwrap() > 0);
+    assert!(body["listener"]["http"]["out"].as_u64().unwrap() > 0);
+    assert_eq!(body["listener"]["socks5"]["in"], 0);
 }
