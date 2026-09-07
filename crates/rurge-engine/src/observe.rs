@@ -573,4 +573,66 @@ mod tests {
         );
         assert_eq!((t.totals().up, t.totals().down), (10, 20));
     }
+
+    /// The M3b bug was `traffic.record` outside the active lock: a reader
+    /// between the two steps saw a session's bytes twice. Every session here
+    /// carries the same byte counts from the start, so a consistent snapshot
+    /// must read exactly SESSIONS × BYTES at every instant, however the
+    /// finishes interleave with the reads.
+    #[test]
+    fn snapshot_bytes_is_consistent_while_sessions_finish_concurrently() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const SESSIONS: u64 = 64;
+        const BYTES: u64 = 1000;
+        let log = Arc::new(RequestLog::new(SESSIONS as usize));
+        let traffic = Arc::new(TrafficStats::new());
+        let handles: Vec<Arc<SessionHandle>> = (1..=SESSIONS)
+            .map(|i| {
+                let h = handle(i, "a.test");
+                h.add_up(BYTES);
+                h.add_down(BYTES);
+                log.mark_active(&h);
+                h
+            })
+            .collect();
+        let expected = (SESSIONS * BYTES, SESSIONS * BYTES);
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (log, traffic, stop) = (log.clone(), traffic.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut reads = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    assert_eq!(
+                        log.snapshot_bytes(&traffic),
+                        expected,
+                        "inconsistent snapshot"
+                    );
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        let finishers: Vec<_> = handles
+            .chunks(16)
+            .map(|chunk| {
+                let chunk = chunk.to_vec();
+                let (log, traffic) = (log.clone(), traffic.clone());
+                std::thread::spawn(move || {
+                    for h in chunk {
+                        h.finish(SessionOutcome::Completed);
+                        log.record_finished(&h, &SessionOutcome::Completed, &traffic);
+                    }
+                })
+            })
+            .collect();
+        for f in finishers {
+            f.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let reads = reader.join().expect("reader saw an inconsistent snapshot");
+        assert!(reads > 0);
+        assert_eq!(log.snapshot_bytes(&traffic), expected);
+        assert_eq!((traffic.totals().up, traffic.totals().down), expected);
+        assert!(log.active().is_empty());
+    }
 }
