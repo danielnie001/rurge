@@ -63,6 +63,8 @@ rurge-engine = { path = "crates/rurge-engine" }
 base64 = "0.22"
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing-appender = "0.2"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+rurge-api = { path = "crates/rurge-api" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

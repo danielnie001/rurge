@@ -1,0 +1,33 @@
+[package]
+name = "rurge-api"
+description = "Surge-compatible HTTP API for rurge (phase 1 endpoints)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rurge-config.workspace = true
+rurge-engine.workspace = true
+rurge-dns.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rurge-dns = { workspace = true, features = ["testing"] }
+rurge-net = { workspace = true, features = ["testing"] }
+rurge-rules.workspace = true
+rurge-policy.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
