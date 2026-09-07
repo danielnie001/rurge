@@ -5,19 +5,28 @@ use super::runtime::RuntimeArgs;
 use crate::capabilities;
 use anyhow::Context;
 use clap::Args;
+use rurge_api::ApiContext;
 use rurge_config::config::{LoadOptions, Platform, load};
+use rurge_config::general::ControllerAccess;
 use rurge_config::general::LogLevel;
+use rurge_config::rule::PolicyRef;
 use rurge_config::session::ListenerKind;
-use rurge_engine::state::{STATE_FILE, State, profile_key};
+use rurge_engine::control::{Control, LogLevel as ApiLogLevel, Mode, ReloadReport};
+use rurge_engine::state::{STATE_FILE, State, StateStore, profile_key};
 use rurge_engine::{Engine, ListenerSpec, Running, Runtime, RuntimeOptions};
+use rurge_net::BoxFuture;
 use rurge_rules::OutboundMode;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
+use tracing_subscriber::Registry;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 
 /// How long a graceful shutdown waits for active sessions before force-cancelling them.
@@ -30,9 +39,10 @@ pub struct RunArgs {
     /// Profile to load
     #[arg(short = 'c', long = "config", value_name = "FILE")]
     pub config: PathBuf,
-    /// Outbound mode: direct, proxy=<policy>, rule
-    #[arg(long, env = "RURGE_OUTBOUND_MODE", value_parser = parse_mode, default_value = "rule")]
-    pub outbound_mode: OutboundMode,
+    /// Outbound mode: direct, proxy=<policy>, rule (default: the last mode
+    /// saved in state.json, else rule)
+    #[arg(long, env = "RURGE_OUTBOUND_MODE", value_parser = parse_mode)]
+    pub outbound_mode: Option<OutboundMode>,
     /// Log level override: verbose|info|notify|warning (also debug|error)
     #[arg(long, env = "RURGE_LOG_LEVEL", value_parser = parse_log_level, value_name = "LEVEL")]
     pub log_level: Option<LevelFilter>,
@@ -80,15 +90,22 @@ pub(crate) fn level_for(level: &LogLevel) -> LevelFilter {
     }
 }
 
+type LevelHandle = reload::Handle<LevelFilter, Registry>;
+
 fn init_logging(
     level: LevelFilter,
     log_file: Option<&std::path::Path>,
-) -> anyhow::Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
+) -> anyhow::Result<(
+    Option<tracing_appender::non_blocking::WorkerGuard>,
+    LevelHandle,
+)> {
+    let (level_layer, handle): (reload::Layer<LevelFilter, Registry>, LevelHandle) =
+        reload::Layer::new(level);
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_ansi(std::io::stdout().is_terminal());
     let registry = tracing_subscriber::registry()
-        .with(level)
+        .with(level_layer)
         .with(stdout_layer);
     match log_file {
         Some(path) => {
@@ -111,11 +128,11 @@ fn init_logging(
                 .with_ansi(false)
                 .with_writer(nb);
             let _ = registry.with(file_layer).try_init();
-            Ok(Some(guard))
+            Ok((Some(guard), handle))
         }
         None => {
             let _ = registry.try_init();
-            Ok(None)
+            Ok((None, handle))
         }
     }
 }
@@ -134,14 +151,72 @@ struct RunOptions {
     request_log_size: usize,
 }
 
+/// What the API can ask the main loop to do (M4 design §6).
+enum Command {
+    Reload(oneshot::Sender<ReloadReport>),
+    Stop,
+}
+
+struct LoopControl {
+    tx: mpsc::Sender<Command>,
+    log_level: LevelHandle,
+}
+
+fn failed_report() -> ReloadReport {
+    ReloadReport {
+        ok: false,
+        errors: 1,
+        warnings: 0,
+        listeners_rebound: false,
+    }
+}
+
+impl Control for LoopControl {
+    fn reload(&self) -> BoxFuture<'_, ReloadReport> {
+        Box::pin(async move {
+            let (reply, rx) = oneshot::channel();
+            if self.tx.send(Command::Reload(reply)).await.is_err() {
+                return failed_report();
+            }
+            rx.await.unwrap_or_else(|_| failed_report())
+        })
+    }
+
+    fn stop(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            let _ = self.tx.send(Command::Stop).await;
+        })
+    }
+
+    fn set_log_level(&self, level: ApiLogLevel) -> Result<(), String> {
+        // the same mapping as `parse_log_level`
+        let filter = match level {
+            ApiLogLevel::Verbose => LevelFilter::TRACE,
+            ApiLogLevel::Debug | ApiLogLevel::Info => LevelFilter::DEBUG,
+            ApiLogLevel::Notify => LevelFilter::INFO,
+            ApiLogLevel::Warning => LevelFilter::WARN,
+            ApiLogLevel::Error => LevelFilter::ERROR,
+        };
+        self.log_level
+            .modify(|f| *f = filter)
+            .map_err(|e| e.to_string())?;
+        tracing::info!(level = level.as_str(), "log level changed");
+        Ok(())
+    }
+
+    fn set_system_proxy(&self, _enabled: bool) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async { Err("not implemented".to_string()) })
+    }
+}
+
 /// Builds one config generation. Used both at startup and on every reload.
 async fn build_engine_runtime(
     cfg: rurge_config::Config,
     rt: &super::runtime::Runtime,
     run_opts: &RunOptions,
     outbound_mode: OutboundMode,
+    state: &State,
 ) -> anyhow::Result<Runtime> {
-    let state = State::load(&rt.data_dir.join(STATE_FILE));
     let selections = state.selections_for(&profile_key(&cfg.source.main));
     Runtime::build(
         cfg,
@@ -157,6 +232,39 @@ async fn build_engine_runtime(
     .context("cannot build the runtime")
 }
 
+/// Explicit flag > state.json > rule. An explicit value is written back.
+async fn initial_mode(
+    explicit: Option<OutboundMode>,
+    store: &StateStore,
+    state: &State,
+) -> OutboundMode {
+    if let Some(mode) = explicit {
+        let (m, global) = Mode::from_outbound(&mode);
+        store
+            .update(|s| {
+                s.outbound_mode = Some(m.as_str().to_string());
+                if global.is_some() {
+                    s.global_policy = global;
+                }
+            })
+            .await;
+        return mode;
+    }
+    match state.outbound_mode.as_deref().and_then(Mode::parse) {
+        Some(Mode::Direct) => OutboundMode::Direct,
+        Some(Mode::Proxy) => match &state.global_policy {
+            Some(p) => OutboundMode::Proxy(PolicyRef::parse(p)),
+            None => {
+                eprintln!(
+                    "warning: state.json says proxy mode but names no global policy; using rule mode"
+                );
+                OutboundMode::Rule
+            }
+        },
+        Some(Mode::Rule) | None => OutboundMode::Rule,
+    }
+}
+
 fn print_listening(listeners: &[(ListenerSpec, Running)]) {
     for (spec, running) in listeners {
         let scheme = match spec.kind {
@@ -167,49 +275,85 @@ fn print_listening(listeners: &[(ListenerSpec, Running)]) {
     }
 }
 
+/// Everything a reload needs besides the listeners it swaps.
+struct Daemon<'a> {
+    engine: &'a Arc<Engine>,
+    config: &'a Path,
+    load_opts: &'a LoadOptions,
+    rt: &'a super::runtime::Runtime,
+    run_opts: &'a RunOptions,
+    outbound_mode: &'a OutboundMode,
+    store: &'a StateStore,
+    http_api: &'a Option<ControllerAccess>,
+}
+
+fn count(diags: &rurge_config::Diagnostics, severity: rurge_config::Severity) -> usize {
+    diags.iter().filter(|d| d.severity == severity).count()
+}
+
 /// Reloads the profile from disk and swaps it in (M3b design §7.4). Every
 /// failure path keeps the running config, so a bad edit never takes the
 /// daemon down.
-async fn reload(
-    engine: &Arc<Engine>,
-    config: &Path,
-    load_opts: &LoadOptions,
-    rt: &super::runtime::Runtime,
-    run_opts: &RunOptions,
-    outbound_mode: &OutboundMode,
-    listeners: &mut Vec<(ListenerSpec, Running)>,
-) {
-    let loaded = match load(config, load_opts) {
+async fn reload(d: &Daemon<'_>, listeners: &mut Vec<(ListenerSpec, Running)>) -> ReloadReport {
+    use rurge_config::Severity;
+    let loaded = match load(d.config, d.load_opts) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("error: reload failed, keeping current config: {e}");
-            return;
+            return failed_report();
         }
     };
-    if loaded.diagnostics.has_errors() {
+    let errors = count(&loaded.diagnostics, Severity::Error);
+    let warnings = count(&loaded.diagnostics, Severity::Warning);
+    if errors > 0 {
         eprintln!("reload failed, keeping current config:");
         print_diagnostics(&loaded.diagnostics.sorted());
-        return;
+        return ReloadReport {
+            ok: false,
+            errors,
+            warnings,
+            listeners_rebound: false,
+        };
     }
     print_diagnostics(&loaded.diagnostics.sorted());
-    let next = match build_engine_runtime(loaded.config, rt, run_opts, outbound_mode.clone()).await
+    if &loaded.config.general.http_api != d.http_api {
+        tracing::warn!(
+            "http-api changed in the profile; the API keeps its current address and key until rurge restarts"
+        );
+    }
+    let state = d.store.snapshot().await;
+    let next = match build_engine_runtime(
+        loaded.config,
+        d.rt,
+        d.run_opts,
+        d.outbound_mode.clone(),
+        &state,
+    )
+    .await
     {
         Ok(n) => n,
         Err(e) => {
             eprintln!("error: reload failed, keeping current config: {e}");
-            return;
+            return ReloadReport {
+                ok: false,
+                errors: 1,
+                warnings,
+                listeners_rebound: false,
+            };
         }
     };
     print_diagnostics(next.diagnostics());
-    let surface_changed = engine.swap_runtime(next);
+    let surface_changed = d.engine.swap_runtime(next);
+    let mut rebound = false;
     // An empty list is the degraded state a failed rebind leaves behind: try
     // again even when the listener surface is unchanged, so freeing the
     // conflicting port and reloading the same profile brings the daemon back.
     if surface_changed || listeners.is_empty() {
-        match engine.rebind_listeners(std::mem::take(listeners)).await {
+        match d.engine.rebind_listeners(std::mem::take(listeners)).await {
             Ok(next_listeners) => {
                 *listeners = next_listeners;
                 print_listening(listeners);
+                rebound = true;
             }
             Err(e) => {
                 tracing::error!(
@@ -219,11 +363,22 @@ async fn reload(
                 eprintln!(
                     "error: reload could not rebind listeners: {e}; the daemon has no listeners until the next successful reload"
                 );
-                return;
+                return ReloadReport {
+                    ok: false,
+                    errors: 1,
+                    warnings,
+                    listeners_rebound: false,
+                };
             }
         }
     }
     tracing::info!("profile reloaded");
+    ReloadReport {
+        ok: true,
+        errors: 0,
+        warnings,
+        listeners_rebound: rebound,
+    }
 }
 
 /// Watches the profile and its includes, reporting each debounced burst of
@@ -279,32 +434,44 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     }
     print_diagnostics(&loaded.diagnostics.sorted());
     let cfg = loaded.config;
-    let _log_guard = init_logging(
+    let (_log_guard, level_handle) = init_logging(
         args.log_level
             .unwrap_or_else(|| level_for(&cfg.general.loglevel)),
         args.log_file.as_deref(),
     )?;
     let rt = args.runtime.resolve(&cfg)?;
-    let outbound_mode = args.outbound_mode.clone();
     let run_opts = RunOptions {
         idle_timeout: Duration::from_secs(args.idle_timeout.unwrap_or(600).max(1)),
         request_log_size: args.request_log_size.unwrap_or(1000).max(1),
     };
+    let http_api = cfg.general.http_api.clone();
     // `cfg` is moved into the runtime below, so collect the watch list first.
     let cfg_paths: Vec<PathBuf> = std::iter::once(cfg.source.main.clone())
         .chain(cfg.source.includes.iter().cloned())
         .collect();
+    let explicit_mode = args.outbound_mode.clone();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let engine_rt = build_engine_runtime(cfg, &rt, &run_opts, outbound_mode.clone()).await?;
+        let (store, state) = StateStore::open(rt.data_dir.join(STATE_FILE)).await;
+        let outbound_mode = initial_mode(explicit_mode, &store, &state).await;
+        let engine_rt =
+            build_engine_runtime(cfg, &rt, &run_opts, outbound_mode.clone(), &state).await?;
         print_diagnostics(engine_rt.diagnostics());
         let (policies, rules) = (
             engine_rt.policies.names().len(),
             engine_rt.rules.rules().len(),
         );
         let engine = Engine::new(engine_rt);
+        engine.attach_state(store.clone());
+        // a global policy saved by an earlier run (mode may be rule today)
+        if engine.global_policy().is_none()
+            && let Some(saved) = state.global_policy.clone()
+            && let Err(e) = engine.set_global_policy(&saved).await
+        {
+            tracing::warn!(error = %e, "state.json names a global policy that is not in the profile; ignoring it");
+        }
         engine.start_sampler();
         let mut listeners = match engine.bind_listeners().await {
             Ok(l) => l,
@@ -314,6 +481,36 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             }
         };
         print_listening(&listeners);
+
+        // Command channel from the API (M4 design §6). `cmd_tx` stays alive
+        // here for the same reason as `reload_tx` below.
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(4);
+        let control: Arc<dyn Control> = Arc::new(LoopControl {
+            tx: cmd_tx.clone(),
+            log_level: level_handle,
+        });
+        // The API comes up right after the listeners and before the summary
+        // line, so `api on` is the third startup line (the CLI tests and
+        // `rurge status` users read it there).
+        let api_token = CancellationToken::new();
+        if let Some(api) = http_api.clone() {
+            let ctx = ApiContext {
+                engine: engine.clone(),
+                control: control.clone(),
+                load_options: opts.clone(),
+            };
+            match rurge_api::serve(api.addr, api.key.clone(), ctx, api_token.clone()).await {
+                Ok((addr, server)) => {
+                    engine.tracker().spawn(server);
+                    println!("api on http://{addr}");
+                    tracing::info!(%addr, "http-api listening");
+                }
+                Err(e) => {
+                    eprintln!("error: cannot bind http-api on {}: {e}", api.addr);
+                    return Ok(ExitCode::from(1));
+                }
+            }
+        }
         // The one startup line that also reaches `--log-file` (the per-listener
         // "listening" records are DEBUG; stdout gets the lines above).
         tracing::info!(policies, rules, mode = %mode_name(&outbound_mode), "rurge running");
@@ -322,6 +519,16 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             env!("CARGO_PKG_VERSION"),
             mode_name(&outbound_mode)
         );
+        let daemon = Daemon {
+            engine: &engine,
+            config: &args.config,
+            load_opts: &opts,
+            rt: &rt,
+            run_opts: &run_opts,
+            outbound_mode: &outbound_mode,
+            store: &store,
+            http_api: &http_api,
+        };
 
         // Reload triggers. `reload_tx` stays alive here on purpose: were every
         // sender dropped, `recv()` would return `None` at once and the loop
@@ -380,17 +587,19 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             tokio::select! {
                 _ = shutdown_signal => break,
                 _ = reload_signal => {
-                    reload(
-                        &engine,
-                        &args.config,
-                        &opts,
-                        &rt,
-                        &run_opts,
-                        &outbound_mode,
-                        &mut listeners,
-                    )
-                    .await;
+                    reload(&daemon, &mut listeners).await;
                 }
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(Command::Reload(reply)) => {
+                        let report = reload(&daemon, &mut listeners).await;
+                        let _ = reply.send(report);
+                    }
+                    Some(Command::Stop) => {
+                        println!("stop requested via http-api");
+                        break;
+                    }
+                    None => {}
+                },
             }
         }
 
@@ -398,6 +607,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         println!("shutting down (Ctrl-C or SIGTERM again to exit now)");
         #[cfg(not(unix))]
         println!("shutting down (Ctrl-C again to exit now)");
+        // shutdown: the API first, so its graceful stop runs inside the drain
+        api_token.cancel();
         engine.stop_accepting();
         engine.tracker().close();
         let running: Vec<_> = listeners.into_iter().map(|(_, r)| r).collect();

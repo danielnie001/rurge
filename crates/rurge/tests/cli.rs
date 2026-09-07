@@ -654,6 +654,16 @@ mod run {
     }
 
     fn spawn_daemon_with(conf: &Path, data: &Path, watch: bool, log_file: Option<&Path>) -> Daemon {
+        spawn_daemon_full(conf, data, watch, log_file, &[])
+    }
+
+    fn spawn_daemon_full(
+        conf: &Path,
+        data: &Path,
+        watch: bool,
+        log_file: Option<&Path>,
+        extra: &[&str],
+    ) -> Daemon {
         let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("rurge"));
         cmd.arg("run")
             .arg("-c")
@@ -667,6 +677,7 @@ mod run {
         if let Some(log) = log_file {
             cmd.arg("--log-file").arg(log);
         }
+        cmd.args(extra);
         let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -724,6 +735,73 @@ mod run {
         let mut out = String::new();
         let _ = s.read_to_string(&mut out);
         out
+    }
+
+    /// Next stdout line starting with `prefix`, without the prefix.
+    fn wait_for_line(daemon: &Daemon, prefix: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let line = daemon
+                .lines
+                .recv_timeout(remaining)
+                .unwrap_or_else(|_| panic!("rurge run never printed a `{prefix}` line"));
+            if let Some(rest) = line.strip_prefix(prefix) {
+                return rest.to_string();
+            }
+        }
+    }
+
+    fn api_port(daemon: &Daemon) -> u16 {
+        wait_for_line(daemon, "api on http://")
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("api port")
+    }
+
+    /// Minimal HTTP/1.1 call against the API: (status, body).
+    fn api_call(
+        port: u16,
+        method: &str,
+        path: &str,
+        key: &str,
+        body: Option<&str>,
+    ) -> (u16, String) {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let body = body.unwrap_or("");
+        write!(
+            s,
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        let status = out
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body = out
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    fn wait_for_exit(daemon: &mut Daemon, secs: u64) -> Option<i32> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Ok(Some(status)) = daemon.child.try_wait() {
+                return status.code();
+            }
+            if std::time::Instant::now() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -966,5 +1044,118 @@ mod run {
         assert_eq!(output.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&output.stderr).contains("cannot bind listener"));
         drop(taken);
+    }
+
+    const API_GENERAL: &str = "http-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nhttp-api = k@127.0.0.1:0\nloglevel = warning";
+
+    #[test]
+    fn run_serves_the_api_and_persists_the_outbound_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        // 1. fresh start: rule mode; change it through the API
+        let d1 = spawn_daemon(&conf, &data);
+        let port = api_port(&d1);
+        let (status, body) = api_call(port, "GET", "/v1/outbound", "k", None);
+        assert_eq!((status, body.as_str()), (200, r#"{"mode":"rule"}"#));
+        assert_eq!(api_call(port, "GET", "/v1/outbound", "wrong", None).0, 401);
+        assert_eq!(
+            api_call(
+                port,
+                "POST",
+                "/v1/outbound/global",
+                "k",
+                Some(r#"{"policy":"DIRECT"}"#)
+            )
+            .0,
+            200
+        );
+        assert_eq!(
+            api_call(
+                port,
+                "POST",
+                "/v1/outbound",
+                "k",
+                Some(r#"{"mode":"direct"}"#)
+            )
+            .0,
+            200
+        );
+        drop(d1);
+        let state = std::fs::read_to_string(data.join("state.json")).unwrap();
+        assert!(
+            state.contains("\"outbound_mode\": \"direct\"")
+                && state.contains("\"global_policy\": \"DIRECT\""),
+            "{state}"
+        );
+        // 2. restart without flags: state.json wins over the default
+        let d2 = spawn_daemon(&conf, &data);
+        let port = api_port(&d2);
+        assert_eq!(
+            api_call(port, "GET", "/v1/outbound", "k", None).1,
+            r#"{"mode":"direct"}"#
+        );
+        assert_eq!(
+            api_call(port, "GET", "/v1/outbound/global", "k", None).1,
+            r#"{"policy":"DIRECT"}"#
+        );
+        let summary = wait_for_line(&d2, "rurge ");
+        assert!(summary.contains("outbound mode direct"), "{summary}");
+        drop(d2);
+        // 3. an explicit flag wins over state.json and is written back
+        let d3 = spawn_daemon_full(&conf, &data, false, None, &["--outbound-mode", "rule"]);
+        let port = api_port(&d3);
+        assert_eq!(
+            api_call(port, "GET", "/v1/outbound", "k", None).1,
+            r#"{"mode":"rule"}"#
+        );
+        drop(d3);
+        let state = std::fs::read_to_string(data.join("state.json")).unwrap();
+        assert!(state.contains("\"outbound_mode\": \"rule\""), "{state}");
+    }
+
+    #[test]
+    fn run_reloads_and_stops_via_the_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let mut daemon = spawn_daemon(&conf, &dir.path().join("data"));
+        let port = api_port(&daemon);
+        let (status, body) = api_call(port, "POST", "/v1/profiles/reload", "k", Some("{}"));
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body.contains("\"ok\":true") && body.contains("\"listenersRebound\":false"),
+            "{body}"
+        );
+        assert_eq!(
+            api_call(
+                port,
+                "POST",
+                "/v1/log/level",
+                "k",
+                Some(r#"{"level":"verbose"}"#)
+            )
+            .0,
+            200
+        );
+        assert_eq!(
+            api_call(port, "POST", "/v1/stop", "k", Some("{}")),
+            (200, "{}".to_string())
+        );
+        assert_eq!(wait_for_exit(&mut daemon, 10), Some(0), "stop exits 0");
+    }
+
+    #[test]
+    fn run_exits_1_when_the_api_port_is_taken() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(
+            dir.path(),
+            &format!(
+                "http-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nhttp-api = k@127.0.0.1:{port}\nloglevel = warning"
+            ),
+        );
+        let mut daemon = spawn_daemon(&conf, &dir.path().join("data"));
+        assert_eq!(wait_for_exit(&mut daemon, 10), Some(1));
     }
 }
