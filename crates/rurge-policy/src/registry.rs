@@ -118,6 +118,13 @@ impl PolicyRegistry {
         self.order.clone()
     }
 
+    /// Non-allocating membership check: every configured policy / group name
+    /// (not builtins). Used on the per-connection dial path, where cloning
+    /// the whole table via `names()` would allocate for every session.
+    pub fn contains(&self, name: &str) -> bool {
+        self.order.iter().any(|n| n == name)
+    }
+
     pub fn resolve(&self, policy: &PolicyRef) -> Resolution {
         let mut chain = Vec::new();
         match policy {
@@ -308,6 +315,7 @@ mod tests {
             reg.names(),
             vec!["HK", "D", "Block", "Auto", "Pick", "Outer", "Emptyish"]
         );
+        assert!(reg.contains("HK") && !reg.contains("Nope"));
     }
 
     #[test]

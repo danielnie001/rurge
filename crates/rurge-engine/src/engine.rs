@@ -370,10 +370,10 @@ impl Engine {
         (**self.global_policy.load()).clone()
     }
 
-    /// `true` for the built-in policies and every configured policy / group.
+    /// `true` for the built-in policies and every configured policy / group,
+    /// against the *current* runtime generation (for API / CLI callers).
     pub fn policy_exists(&self, name: &str) -> bool {
-        matches!(PolicyRef::parse(name), PolicyRef::Builtin(_))
-            || self.runtime().policies.names().iter().any(|n| n == name)
+        policy_known(&self.runtime(), name)
     }
 
     /// Empty name clears the global policy.
@@ -440,7 +440,7 @@ impl Engine {
         match self.mode() {
             Mode::Direct => return Chosen::Policy(PolicyRef::Builtin(Builtin::Direct)),
             Mode::Proxy => match self.global_policy() {
-                Some(name) if self.policy_exists(&name) => {
+                Some(name) if policy_known(rt, &name) => {
                     return Chosen::Policy(PolicyRef::parse(&name));
                 }
                 other => {
@@ -475,6 +475,15 @@ impl Engine {
 enum Chosen {
     Policy(PolicyRef),
     DnsFailed,
+}
+
+/// `true` for the built-in policies and every policy / group configured in
+/// `rt` — checked against the *session's own* runtime snapshot, not whatever
+/// generation is current when this runs, so a reload racing a dial can never
+/// approve a name against one generation's registry and then resolve it
+/// (`PolicyRegistry::resolve`) against another's.
+fn policy_known(rt: &Runtime, name: &str) -> bool {
+    matches!(PolicyRef::parse(name), PolicyRef::Builtin(_)) || rt.policies.contains(name)
 }
 
 impl Engine {
