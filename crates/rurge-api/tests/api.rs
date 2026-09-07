@@ -66,17 +66,11 @@ impl Control for FakeControl {
 
 struct Api {
     _dir: tempfile::TempDir,
-    /// Read by Task 6's `POST /v1/profiles/*` tests; unread until then.
-    #[allow(dead_code)]
     conf: PathBuf,
     state_path: PathBuf,
-    /// Read directly by Task 6's `/v1/dns*` tests; unread until then.
-    #[allow(dead_code)]
     engine: Arc<Engine>,
     listeners: Vec<(ListenerSpec, Running)>,
     target: TestServer,
-    /// Read by Task 6's `/v1/dns*` tests; unread until then.
-    #[allow(dead_code)]
     dns: MockDns,
     control: Arc<FakeControl>,
     store: Arc<StateStore>,
@@ -542,4 +536,151 @@ async fn traffic_reports_totals_by_policy_and_listener() {
     let http_out = body["listener"]["http"]["out"].as_u64().unwrap();
     assert!(http_in >= 4096 && http_in > http_out, "{body}");
     assert_eq!(body["listener"]["socks5"]["in"], 0);
+}
+
+#[tokio::test]
+async fn dns_cache_flush_and_delay() {
+    let api = api().await;
+    let resolver = api.engine.runtime().stack.resolver.clone();
+    resolver
+        .lookup("cached.test", rurge_dns::LookupOpts::default())
+        .await
+        .unwrap();
+    let (status, body) = get(&api, "/v1/dns").await;
+    assert_eq!(status, 200);
+    let entry = body["dnsCache"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["domain"] == "cached.test")
+        .cloned()
+        .expect("cached entry");
+    assert_eq!(entry["data"], json!(["10.0.0.1"]));
+    assert!(entry["expiresTime"].as_f64().unwrap() > 1.0e9);
+    assert!(
+        entry["server"]
+            .as_str()
+            .unwrap()
+            .contains(&api.dns.addr().to_string()),
+        "{entry}"
+    );
+    assert_eq!(entry["stale"], false);
+    let upstreams = body["upstreams"].as_array().unwrap();
+    assert!(
+        upstreams
+            .iter()
+            .any(|u| u.as_str().unwrap().contains(&api.dns.addr().to_string())),
+        "{upstreams:?}"
+    );
+    assert!(body["bootstrap"].is_array());
+    assert_eq!(
+        post(&api, "/v1/dns/flush", json!({})).await,
+        (200, json!({}))
+    );
+    assert!(
+        get(&api, "/v1/dns").await.1["dnsCache"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let (status, body) = post(&api, "/v1/test/dns_delay", json!({ "name": "target.test" })).await;
+    assert_eq!(status, 200, "{body}");
+    let delays = body["delays"].as_array().unwrap();
+    assert_eq!(delays.len(), 1, "{delays:?}");
+    assert!(
+        delays[0]["upstream"]
+            .as_str()
+            .unwrap()
+            .contains(&api.dns.addr().to_string())
+    );
+    assert!(
+        delays[0]["ms"].is_number() && delays[0]["error"].is_null(),
+        "{delays:?}"
+    );
+    // no name → the host of internet-test-url (target.test)
+    let (status, body) = post(&api, "/v1/test/dns_delay", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["delays"][0]["ms"].is_number());
+    assert!(
+        api.dns
+            .query_count("target.test", rurge_dns::message::Qtype::A)
+            >= 2
+    );
+}
+
+#[tokio::test]
+async fn profiles_current_check_and_reload() {
+    let api = api().await;
+    let (status, content_type, bytes) =
+        call_raw(api.addr, "GET", "/v1/profiles/current", Some(KEY), None).await;
+    assert_eq!(status, 200);
+    assert!(content_type.starts_with("text/plain"), "{content_type}");
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        text.contains("password=***") && !text.contains("password=x"),
+        "{text}"
+    );
+    let (_, _, bytes) = call_raw(
+        api.addr,
+        "GET",
+        "/v1/profiles/current?sensitive=1",
+        Some(KEY),
+        None,
+    )
+    .await;
+    assert!(String::from_utf8_lossy(&bytes).contains("password=x"));
+    let (status, body) = post(&api, "/v1/profiles/check", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["errors"], 0);
+    assert!(
+        body["warnings"].as_u64().unwrap() >= 1,
+        "W0007 for the unsupported ss policy: {body}"
+    );
+    assert!(
+        body["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "W0007"),
+        "{body}"
+    );
+    // break the file on disk: check reports it, the running config is untouched
+    let broken = std::fs::read_to_string(&api.conf)
+        .unwrap()
+        .replace("FINAL,DIRECT", "FINAL,NoSuchPolicy");
+    std::fs::write(&api.conf, broken).unwrap();
+    let (status, body) = post(&api, "/v1/profiles/check", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ok"], false);
+    assert!(body["errors"].as_u64().unwrap() >= 1);
+    assert!(
+        body["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "E0007"),
+        "{body}"
+    );
+    let (head, _) = get_via_proxy(api.http(), &api.target_url()).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "still serving: {head}");
+    let (status, body) = post(&api, "/v1/profiles/reload", json!({})).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body,
+        json!({ "ok": true, "errors": 0, "warnings": 1, "listenersRebound": false })
+    );
+    assert_eq!(api.control.reloads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn log_level_is_forwarded_to_control() {
+    let api = api().await;
+    assert_eq!(
+        post(&api, "/v1/log/level", json!({ "level": "debug" })).await,
+        (200, json!({}))
+    );
+    assert_eq!(*api.control.levels.lock().unwrap(), vec![LogLevel::Debug]);
+    let (status, body) = post(&api, "/v1/log/level", json!({ "level": "loud" })).await;
+    assert_eq!(status, 400, "{body}");
 }

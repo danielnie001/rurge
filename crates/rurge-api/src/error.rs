@@ -34,8 +34,6 @@ impl ApiError {
     pub fn not_found(message: impl Into<String>) -> ApiError {
         ApiError::new(StatusCode::NOT_FOUND, message)
     }
-    /// Reserved for a later task (e.g. reload already in progress); unused until then.
-    #[allow(dead_code)]
     pub fn conflict(message: impl Into<String>) -> ApiError {
         ApiError::new(StatusCode::CONFLICT, message)
     }

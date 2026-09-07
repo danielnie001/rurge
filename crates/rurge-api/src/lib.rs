@@ -32,8 +32,6 @@ pub struct ApiContext {
 pub(crate) struct Shared {
     pub(crate) engine: Arc<Engine>,
     pub(crate) control: Arc<dyn Control>,
-    /// Read by Task 6's `POST /v1/profiles/check`; unread until then.
-    #[allow(dead_code)]
     pub(crate) load_options: LoadOptions,
     pub(crate) auth: auth::AuthState,
     /// Unix seconds when the API came up (`/v1/traffic` `startTime`).
@@ -74,6 +72,13 @@ pub fn router(key: String, ctx: ApiContext) -> Router {
         .route("/v1/requests/active", get(routes::requests::active))
         .route("/v1/requests/kill", post(routes::requests::kill))
         .route("/v1/traffic", get(routes::traffic::traffic))
+        .route("/v1/dns", get(routes::dns::dns))
+        .route("/v1/dns/flush", post(routes::dns::flush))
+        .route("/v1/test/dns_delay", post(routes::dns::dns_delay))
+        .route("/v1/profiles/current", get(routes::profiles::current))
+        .route("/v1/profiles/reload", post(routes::profiles::reload))
+        .route("/v1/profiles/check", post(routes::profiles::check))
+        .route("/v1/log/level", post(routes::log::set_level))
         .route("/v1/modules", get(routes::misc::modules))
         .route("/v1/scripting", get(routes::misc::scripting))
         .route("/v1/events", get(routes::misc::events))
