@@ -3989,10 +3989,17 @@ EOF
 | Task 7 | `api_token.cancel()` 移到打印 `shutting down …` 之后，而不是收到 `Command::Stop` 就立即取消 | 关闭顺序需要先让主循环打印退出提示，再让 API 的优雅关闭跟着后续排空一起进行；紧跟在命令通道消费之后取消会让日志顺序与实际关闭顺序不一致 |
 | Task 8 | 集成测试里判断 2xx 的本地断言 helper 命名为 `expect_2xx` | 与 `crates/rurge/src/cli/control.rs` 里同名的生产代码 helper 对应，测试与实现用同一个词汇，读测试时不用来回换名字 |
 | Task 9 | 兼容性清单里 CLI 表（§10.3，5 列）与 HTTP API 表（§10.4，6 列）列数不同；新增的 `rurge status` 行按 CLI 表自身的 5 列书写，没有逐字复制第 871 行「rurge 扩展」那一行本身多出一个单元格的排版 | 本文件「每行保持 6 列」的措辞是针对本任务改动最多的 HTTP API 表所写；逐字套用到 5 列的 CLI 表会破坏表格渲染，以「每张表保持它自己的列数」为准（与任务简报的表述一致） |
+| 最终评审 A（脱敏） | `redact_profile` 的独立密钥行扩到 7 个（加 `private-key` / `psk` / `pre-shared-key` / `token`）、内联参数扩到 8 个（加 `pre-shared-key` / `token` / `uuid` / `username`）；位置型凭据改判「首个 `=` 之后非空且不全是 `=` 才算具名参数」；`redact_line` 先摘掉行尾 `\r` 再处理 | 全分支评审发现 `[WireGuard]` 的 `private-key` / `pre-shared-key`、`[Snell Server]` 的 `psk`、vmess 的 `username`、tuic 的 `token` / `uuid` 与带填充的 base64 位置凭据都原样输出；CRLF 输入还会输出混用的换行符 |
+| 最终评审 B（`/v1/traffic`） | `total` 改用 `RequestLog::snapshot_bytes`（已结束 + 在途），`connector` / `listener` 保持只统计已结束会话；删除 `RequestLog::active_bytes`，求和折叠抽成私有 `sum_active_bytes`；`engine.rs` 结束钩子注释改为指向 `record_finished` | 计划文本让 `total` 取 `stats.totals()`，而速度来自 `snapshot_bytes`，长传输期间会出现「总量 0 但速度非 0」；忠实执行了计划的缺陷 |
+| 最终评审 C（405） | 路由挂 `method_not_allowed_fallback`，方法不匹配返回 `405 {"error":"method not allowed"}`；`pub fn router` 补 `ConnectInfo` 文档 | axum 默认 405 响应体为空，破坏「所有错误都是 JSON」的约定；axum 0.8.9 已提供这个钩子 |
+| 最终评审 D（`rurge stop`） | 新增 `ClientError::BodyLost { status }`，`stop` 在 2xx 下视为成功；`call` 改为一个 5 秒超时 | 设计文档 §7 要求 `stop` 容忍「已回 `{}` 后连接被对端关闭」，实现把响应体读取失败一律映射为 `Unreachable` → 退出 1；超时此前在请求头与响应体上各应用一次 |
+| 最终评审 E（延后小项分诊） | `?limit=0` → 400；`state.json` 警告改 `tracing::warn!`；重载时按「启动时是否真的起过 API」分别提示；删除 `rurge-api` 的 `rurge-dns` 与 `rurge` 的 `http` 直接依赖；补 405 / 未知路径 401 / `limit=0` / `BodyLost` Display 测试；`run_reloads_and_stops_via_the_api` 收紧到 3 秒并断言无 `grace period elapsed` | 全分支评审把这批「延后事项」判为合并前必修；`rurge-dns` 那条与原记录相反——字段访问经 `rurge-engine` 间接可达，不需要直接依赖边 |
 
 ## 延后事项
 
 （执行时填写：审查中发现但不在 M4a 范围内的问题，带去向——M4b / 阶段 2 / 阶段 6。）
+
+「本分支最终评审」已经做完，结论见下面各条的「已解决」标注与末尾的「最终评审（全分支）分诊」一节：标注为已解决的在最终修复波中改掉（提交 `fix(config)` / `fix(api,engine,cli)` / `docs`），其余条目按原文保留、去向不变，由最终评审判为不阻塞合并。
 
 **Task 1（`StateStore`）**
 
@@ -4000,34 +4007,34 @@ EOF
 
 **Task 2（引擎运行期覆盖、`choose_policy`、脱敏）**
 
-- `redact_line` 在 secret-key / wifi-auth 行上会丢弃行尾的 `\r`（CRLF 输入时 API 输出换行符混用）。去向：本分支最终评审。
+- `redact_line` 在 secret-key / wifi-auth 行上会丢弃行尾的 `\r`（CRLF 输入时 API 输出换行符混用）。去向：已解决（最终评审 A：`redact_line` 先摘掉行尾 `\r`，处理后补回）。
 - `ca-p12=X` 脱敏后的间距（`ca-p12= ***`）与其它字段不一致。去向：本分支最终评审。
 - `DEVICE:foo` 不再被接受为全局策略（`policy_exists` 收紧校验后的行为变化），尚未登记进兼容性清单。去向：本分支最终评审（建议登记进 `docs/surge-compatibility-matrix.md`）。
 - pipeline 集成测试缺少「未知策略名不改变全局策略」「组名不能被设为全局策略」的断言。去向：本分支最终评审。
 - `attach_state` 重复调用时静默忽略第二次（`OnceLock` 语义），没有日志或测试覆盖。去向：本分支最终评审。
 - `PoliciesView` / `RuleView` 没有派生 `Debug` / `Clone` 等常用 trait。去向：本分支最终评审。
 - `engine.rs` 已有 792 行、5 个 `impl Engine` 块；视图相关类型可以搬到 `control.rs`。去向：本分支最终评审。
-- 位置型凭据里若包含字面 `=`（例如带填充的 base64）在第 4 个位置起仍会被当成具名参数，因而不脱敏（`redact.rs` ~85；忠实遵循了裁定的字面表述）；候选后续方案是只把 `<已知参数名>=` 当具名参数。去向：本分支最终评审。
+- 位置型凭据里若包含字面 `=`（例如带填充的 base64）在第 4 个位置起仍会被当成具名参数，因而不脱敏（`redact.rs` ~85；忠实遵循了裁定的字面表述）；候选后续方案是只把 `<已知参数名>=` 当具名参数。去向：已解决（最终评审 A：改判为「首个 `=` 之后非空且不全是 `=` 才算具名参数」）。
 
 **Task 3（`Control` trait、`ReloadReport`、采样一致性）**
 
 - `TrafficStats::record` 仍是 `pub`，是绕开一致性快照约定的一道后门；应改 `pub(crate)` 并加文档说明。去向：本分支最终评审。
-- 活动字节的求和逻辑在 `active_bytes` 与 `snapshot_bytes` 里各写了一份。去向：本分支最终评审。
-- `active_bytes` 目前没有生产代码调用方。去向：本分支最终评审。
-- `engine.rs` ~316 处的结束钩子注释已经过时。去向：本分支最终评审。
+- 活动字节的求和逻辑在 `active_bytes` 与 `snapshot_bytes` 里各写了一份。去向：已解决（最终评审 B：抽成私有的 `sum_active_bytes`）。
+- `active_bytes` 目前没有生产代码调用方。去向：已解决（最终评审 B：已删除）。
+- `engine.rs` ~316 处的结束钩子注释已经过时。去向：已解决（最终评审 B：改为指向 `RequestLog::record_finished` 的文档）。
 - 活动锁的临界区扩大到包含 `record`（仅记录，未判定是否需要收窄）。去向：本分支最终评审。
 
 **Task 4（`rurge-api` 骨架、鉴权与封禁）**
 
 - `is_banned` 不刷新 `touched`，导致已被封禁的来源反而在表满时优先被淘汰（`auth.rs` ~43）。去向：本分支最终评审。
 - `?x-key=` 查询参数从未做百分号解码（`auth.rs` ~111）。去向：本分支最终评审。
-- HTTP 方法不匹配时的 405 响应体为空，不符合「所有错误都是 JSON」的约定（需要一个 `method_not_allowed_fallback`）。去向：本分支最终评审。
-- 若干测试覆盖缺口：清空全局策略、未设置全局策略时 `global` 为 `null`、未知路径不带 key 时仍是 401、`x-key` 不是查询字符串里第一个参数、关闭令牌、封禁表淘汰对象。去向：本分支最终评审。
+- HTTP 方法不匹配时的 405 响应体为空，不符合「所有错误都是 JSON」的约定（需要一个 `method_not_allowed_fallback`）。去向：已解决（最终评审 C：`method_not_allowed_fallback` + `routes::misc::method_not_allowed`，并有集成断言）。
+- 若干测试覆盖缺口：清空全局策略、未设置全局策略时 `global` 为 `null`、未知路径不带 key 时仍是 401、`x-key` 不是查询字符串里第一个参数、关闭令牌、封禁表淘汰对象。去向：其中「未知路径不带 key 时仍是 401」已解决（最终评审 E1），其余保留，去向阶段 6 的 API 兼容性测试。
 - `call_raw` 测试助手从未断言过响应的 `content-type`。去向：本分支最终评审。
 - `stop` 的文档注释夸大了顺序保证（真正的保证是优雅关闭本身，不是某个更强的时序）。去向：本分支最终评审。
 - 6 个 `dead_code` allow 留给 Task 5 / 6 收窄或删除。去向：已解决（`crates/rurge-api/src` 目前已没有 `dead_code` allow）。
-- `rurge-dns` 是 `[dependencies]`（非 dev-dependency）；`crates/rurge-api/src` 里没有任何代码显式 `use` 它或写出 `rurge_dns::` 路径，但 `routes/dns.rs` 确实读取了它定义的 `CacheEntry` / `UpstreamDelay` 的字段（经 `rurge-engine` 的 `Resolver` 间接拿到），所以这条依赖是真实需要的，只是没有被显式命名。去向：本分支最终评审（视情况补一个 `use rurge_dns::...` 让这层依赖在代码里也看得见，而不是判断能否删除）。
-- `pub fn router` 缺少「调用方需要提供 `ConnectInfo`」的文档，或应收紧为 `pub(crate)`。去向：本分支最终评审。
+- `rurge-dns` 是 `[dependencies]`（非 dev-dependency）；`crates/rurge-api/src` 里没有任何代码显式 `use` 它或写出 `rurge_dns::` 路径，但 `routes/dns.rs` 确实读取了它定义的 `CacheEntry` / `UpstreamDelay` 的字段（经 `rurge-engine` 的 `Resolver` 间接拿到）。去向：已解决（最终评审 E3：这条记录的判断有误——对间接可达类型做字段 / 方法访问不需要直接依赖边，`rurge-dns` 已从 `[dependencies]` 删除，带 `testing` feature 的 dev-dependency 保留）。
+- `pub fn router` 缺少「调用方需要提供 `ConnectInfo`」的文档，或应收紧为 `pub(crate)`。去向：已解决（最终评审 C：补了「需用 `into_make_service_with_connect_info::<SocketAddr>()` 提供」的文档）。
 - 集成测试没有先跑出一次失败（RED）再写通过态断言（计划把这一步安排在了任务顺序之外）。去向：本分支最终评审（流程记录，不需要代码改动）。
 - harness 文档在 Task 6 用上 `W0007` 之前就提到了它。去向：已解决（Task 6 / Task 8 的集成测试确已使用 `W0007`）。
 
@@ -4043,7 +4050,7 @@ EOF
 
 **Task 7（`rurge run` 集成）**
 
-- `stop` 的测试即使有人误删 `api_token.cancel()` 也不会失败（应把退出等待时间上限收紧到约 3 秒，或断言不出现 `grace period elapsed`）。去向：本分支最终评审。
+- `stop` 的测试即使有人误删 `api_token.cancel()` 也不会失败（应把退出等待时间上限收紧到约 3 秒，或断言不出现 `grace period elapsed`）。去向：已解决（最终评审 E2：两条都做了）。
 - 显式 `--outbound-mode proxy=Typo` 会把不存在的策略名落盘到 `state.json`（D5 的既有行为）。去向：已在 Task 9 记录（`docs/api/phase1.md` CLI 一节、兼容性清单 `/v1/outbound/global` 行、设计文档 §14 均已说明）。
 - `set_log_level` 的确认日志在切换*之后*才以 INFO 打出（应在切换前打出，或改用 WARN）。去向：本分支最终评审。
 - `state.rs` 的测试名 `loads_defaults_selections_and_tolerates_garbage` 已经过时（`StateStore` 早已取代 `State::load`）。去向：本分支最终评审。
@@ -4054,9 +4061,29 @@ EOF
 
 **Task 8（CLI 客户端）**
 
-- 5 秒超时在请求头与请求体上各应用一次，最坏情况下一次调用可能等到 10 秒。去向：本分支最终评审。
+- 5 秒超时在请求头与请求体上各应用一次，最坏情况下一次调用可能等到 10 秒。去向：已解决（最终评审 D：整个 `call` 一个 5 秒超时）。
 - `-c` 加载失败时的错误上下文掩盖了底层 IO 错误（`control.rs` ~71）。去向：本分支最终评审。
 - `reload` 失败分支没有测试覆盖。去向：本分支最终评审。
-- `http` 直接依赖没有被任何显式路径使用。去向：本分支最终评审。
+- `http` 直接依赖没有被任何显式路径使用。去向：已解决（最终评审 E3：已从 `crates/rurge/Cargo.toml` 删除）。
 - `LoadOptions` 的构造在 5 个 CLI 模块里重复（沿用既有约定，不是本任务引入的）。去向：本分支最终评审。
 
+
+**最终评审（全分支）分诊**
+
+最终修复波中已解决、但上面各任务小节里没有对应条目的：
+
+- 方法不匹配的 405 响应体为空 → 已解决（`method_not_allowed_fallback`，见最终评审 C）。
+- `GET /v1/requests/recent?limit=0` 静默返回一条记录 → 已解决（改为 400 `limit must be at least 1`）。
+- `initial_mode` 里「state.json 说 proxy 模式但没有全局策略」的警告走 `eprintln!`，到不了 `--log-file` → 已解决（改 `tracing::warn!`，文案不变）。
+- 重载时无条件提示「http-api 改动，API 保持当前地址与密钥」，启动时压根没起过 API 也这么说 → 已解决（按 `d.http_api.is_some()` 分两句）。
+- `/v1/traffic` 的 `total` 与速度口径不一致 → 已解决（见最终评审 B）。
+- `rurge stop` 未实现设计文档 §7 的「连接被关闭仍算成功」→ 已解决（见最终评审 D）。
+
+最终评审新发现、判为不阻塞合并的小项：
+
+- `POST /v1/outbound/global {"policy":""}` 在 proxy 模式下会被接受，把全局策略清空后模式仍是 proxy（`POST /v1/outbound {"mode":"proxy"}` 那一侧有守卫，这一侧没有）——落到的是设计文档开放问题 Q3 已定的那条语义（proxy 模式 + 全局策略不可用 → 仍报 proxy，但按 Rule 路由并 WARN），只是两侧守卫不对称，读起来像是漏判。去向：M4b（把两侧的守卫与 Q3 的措辞一起对齐）。
+- `rurge-api` 直接读 `engine.runtime().stack.resolver` / `config.general.internet_test_url` / `config.source.main`，没有走设计文档 §4.3 设想的专用只读视图。去向：M4b（顺带把 `Resolver` 与配置访问收进视图）。
+- 兼容性清单「附录：统计」的计数没有随 M4a 的行改动重新生成（脚本口径未跑）。去向：阶段 6 清单整体校对时统一重跑。
+- 阶段 6 的 `GET /v1/security/ban`（或等价的封禁列表视图）尚无对应端点，鉴权封禁表目前只在进程内可见。去向：阶段 6。
+
+已在上面各任务小节里记录、最终评审确认保留的（去向按原文）：`is_banned` 不刷新 `touched`、`?x-key=` 不做百分号解码（已在 `docs/api/phase1.md` 注明该查询形式只适用于 ASCII 密钥）、用同一个已生效的全局策略重复调用 `set_global_policy` 产生多余的 `state.json` 写入、`engine.rs` 体量与视图类型的归属。
