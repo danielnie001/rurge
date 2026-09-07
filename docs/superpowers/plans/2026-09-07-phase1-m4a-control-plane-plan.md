@@ -3977,11 +3977,86 @@ EOF
 
 | 任务 | 偏差 | 原因 |
 | --- | --- | --- |
-| | | |
+| 预检（Task 4 的测试） | 计划里 Task 4 的鉴权单元测试有两处会在计划自己的实现前失败：封禁到期边界（`t0+604s` 未按预期解除封禁）、集成测试把「不带 key 的失败请求」多计了一次 | 预检扫描发现计划的测试断言与计划自身的实现逻辑不一致；在 Task 1 开工前改好测试，成本仅是一次测试改写 |
+| Task 2 | `redact_profile` 追加两类计划文本未列出的脱敏面：`http` / `https` / `socks5` / `socks5-tls` 策略行第 4 个起、不含 `=` 的位置型凭据，以及 `[Keystore]` 的 `base64=` 参数 | 脱敏端点的目的是安全输出，计划列出的名单是下限而非上限 |
+| Task 2 | 新增非分配的 `PolicyRegistry::contains(&str)`（`rurge-policy`），`choose_policy` / `policy_exists` 改为对调用方持有的那个 `Runtime` 生成校验，而不是校验当前（可能已因重载而变化）的生成 | 原实现每次分配 `names()` 且校验当前而非会话快照的注册表；重载与拨号竞态时可能用一代的注册表批准、另一代的注册表解析 |
+| Task 3 | 追加一个计划之外的并发回归测试（多个会话在不同线程同时结束，一个读者循环断言总量不偏离 `SESSIONS×BYTES`） | 计划自带的测试是顺序执行的，无法在 M3b 遗留的完成顺序下失败；只有并发测试能真正守住「结束瞬间不重复计数」这条不变式 |
+| Task 4 | 6 个 `dead_code` allow 留给 Task 5 / 6 收窄或删除，没有在 Task 4 一次性去掉；集成测试没有先跑出一次失败（RED）再写通过态断言 | `Api` 的部分字段与 `ApiError::conflict` 要到后续任务才有调用方；计划把 Task 4 到 Task 6 之间的任务顺序安排成先骨架、后端点，RED 步骤因此被跳过，靠单元测试与后续任务的回归覆盖 |
+| Task 5 | `GET /v1/requests/recent` 改用 `Result<Query<RecentQuery>, QueryRejection>` 加一个 `query_params` helper，取代裸 `Query<RecentQuery>` | 裸 `Query<T>` 在 `?limit=abc` 时走 axum 默认的纯文本 400，破坏了「所有错误都是 JSON」的约定 |
+| Task 5 | `?limit=1` 与流量测试改成有区分度的断言：先插入一条会被拒绝的请求再断言 `limit`；新增 4 KiB 的 `/big` 响应体，断言 `in > out`（且 `in >= 4096`） | 计划原来的两个测试即使实现有错也会通过，起不到回归作用 |
+| Task 5 | `/v1/traffic` 的 `startTime` 按 Unix **秒**（`f64`）实现，不是设计文档 §5.2 / 开放问题 Q1 写的毫秒 | 设计文档把这个「暂定结构」交给实施期裁定；秒与 Surge 实际时间戳的量级更接近，且需要与 `/v1/dns` 的 `expiresTime` 统一单位 |
+| Task 6 | `GET /v1/profiles/current` 的 `?sensitive` 同样改用 `query_params`；清理 Task 4 遗留、到本任务已无调用方的 `dead_code` allow | 与 Task 5 的 `query_params` 保持同一套错误处理约定；相关字段 / 方法到本任务已经用上，allow 可以摘掉 |
+| Task 7 | `api_token.cancel()` 移到打印 `shutting down …` 之后，而不是收到 `Command::Stop` 就立即取消 | 关闭顺序需要先让主循环打印退出提示，再让 API 的优雅关闭跟着后续排空一起进行；紧跟在命令通道消费之后取消会让日志顺序与实际关闭顺序不一致 |
+| Task 8 | 集成测试里判断 2xx 的本地断言 helper 命名为 `expect_2xx` | 与 `crates/rurge/src/cli/control.rs` 里同名的生产代码 helper 对应，测试与实现用同一个词汇，读测试时不用来回换名字 |
+| Task 9 | 兼容性清单里 CLI 表（§10.3，5 列）与 HTTP API 表（§10.4，6 列）列数不同；新增的 `rurge status` 行按 CLI 表自身的 5 列书写，没有逐字复制第 871 行「rurge 扩展」那一行本身多出一个单元格的排版 | 本文件「每行保持 6 列」的措辞是针对本任务改动最多的 HTTP API 表所写；逐字套用到 5 列的 CLI 表会破坏表格渲染，以「每张表保持它自己的列数」为准（与任务简报的表述一致） |
 
 ## 延后事项
 
 （执行时填写：审查中发现但不在 M4a 范围内的问题，带去向——M4b / 阶段 2 / 阶段 6。）
 
-- （空）
+**Task 1（`StateStore`）**
+
+- `read_state` 的通用 I/O 错误分支（非 `NotFound`）没有测试覆盖（`state.rs` ~150）。去向：本分支最终评审。
+
+**Task 2（引擎运行期覆盖、`choose_policy`、脱敏）**
+
+- `redact_line` 在 secret-key / wifi-auth 行上会丢弃行尾的 `\r`（CRLF 输入时 API 输出换行符混用）。去向：本分支最终评审。
+- `ca-p12=X` 脱敏后的间距（`ca-p12= ***`）与其它字段不一致。去向：本分支最终评审。
+- `DEVICE:foo` 不再被接受为全局策略（`policy_exists` 收紧校验后的行为变化），尚未登记进兼容性清单。去向：本分支最终评审（建议登记进 `docs/surge-compatibility-matrix.md`）。
+- pipeline 集成测试缺少「未知策略名不改变全局策略」「组名不能被设为全局策略」的断言。去向：本分支最终评审。
+- `attach_state` 重复调用时静默忽略第二次（`OnceLock` 语义），没有日志或测试覆盖。去向：本分支最终评审。
+- `PoliciesView` / `RuleView` 没有派生 `Debug` / `Clone` 等常用 trait。去向：本分支最终评审。
+- `engine.rs` 已有 792 行、5 个 `impl Engine` 块；视图相关类型可以搬到 `control.rs`。去向：本分支最终评审。
+- 位置型凭据里若包含字面 `=`（例如带填充的 base64）在第 4 个位置起仍会被当成具名参数，因而不脱敏（`redact.rs` ~85；忠实遵循了裁定的字面表述）；候选后续方案是只把 `<已知参数名>=` 当具名参数。去向：本分支最终评审。
+
+**Task 3（`Control` trait、`ReloadReport`、采样一致性）**
+
+- `TrafficStats::record` 仍是 `pub`，是绕开一致性快照约定的一道后门；应改 `pub(crate)` 并加文档说明。去向：本分支最终评审。
+- 活动字节的求和逻辑在 `active_bytes` 与 `snapshot_bytes` 里各写了一份。去向：本分支最终评审。
+- `active_bytes` 目前没有生产代码调用方。去向：本分支最终评审。
+- `engine.rs` ~316 处的结束钩子注释已经过时。去向：本分支最终评审。
+- 活动锁的临界区扩大到包含 `record`（仅记录，未判定是否需要收窄）。去向：本分支最终评审。
+
+**Task 4（`rurge-api` 骨架、鉴权与封禁）**
+
+- `is_banned` 不刷新 `touched`，导致已被封禁的来源反而在表满时优先被淘汰（`auth.rs` ~43）。去向：本分支最终评审。
+- `?x-key=` 查询参数从未做百分号解码（`auth.rs` ~111）。去向：本分支最终评审。
+- HTTP 方法不匹配时的 405 响应体为空，不符合「所有错误都是 JSON」的约定（需要一个 `method_not_allowed_fallback`）。去向：本分支最终评审。
+- 若干测试覆盖缺口：清空全局策略、未设置全局策略时 `global` 为 `null`、未知路径不带 key 时仍是 401、`x-key` 不是查询字符串里第一个参数、关闭令牌、封禁表淘汰对象。去向：本分支最终评审。
+- `call_raw` 测试助手从未断言过响应的 `content-type`。去向：本分支最终评审。
+- `stop` 的文档注释夸大了顺序保证（真正的保证是优雅关闭本身，不是某个更强的时序）。去向：本分支最终评审。
+- 6 个 `dead_code` allow 留给 Task 5 / 6 收窄或删除。去向：已解决（`crates/rurge-api/src` 目前已没有 `dead_code` allow）。
+- `rurge-dns` 是 `[dependencies]`（非 dev-dependency），但 `crates/rurge-api/src` 里没有任何代码按名字引用它。去向：本分支最终评审（确认能否降级为 dev-dependency 或删除）。
+- `pub fn router` 缺少「调用方需要提供 `ConnectInfo`」的文档，或应收紧为 `pub(crate)`。去向：本分支最终评审。
+- 集成测试没有先跑出一次失败（RED）再写通过态断言（计划把这一步安排在了任务顺序之外）。去向：本分支最终评审（流程记录，不需要代码改动）。
+- harness 文档在 Task 6 用上 `W0007` 之前就提到了它。去向：已解决（Task 6 / Task 8 的集成测试确已使用 `W0007`）。
+
+**Task 5（`policies` / `rules` / `requests` / `traffic`）**
+
+- `ApiError::conflict` 的文档注释与 `dead_code` allow 已经过时（`error.rs` ~36）。去向：本分支最终评审。
+- `RecordStatus::Failed` 到 JSON 的映射没有测试覆盖。去向：本分支最终评审。
+
+**Task 6（DNS、`profiles`、日志级别）**
+
+- 没有测试覆盖 `?sensitive=abc` 这类非法查询字符串是否正确落到 JSON 400。去向：本分支最终评审。
+- `POST /v1/log/level` 的 500 路径没有被覆盖（测试替身 `FakeControl::set_log_level` 恒为 `Ok`）。去向：本分支最终评审。
+
+**Task 7（`rurge run` 集成）**
+
+- `stop` 的测试即使有人误删 `api_token.cancel()` 也不会失败（应把退出等待时间上限收紧到约 3 秒，或断言不出现 `grace period elapsed`）。去向：本分支最终评审。
+- 显式 `--outbound-mode proxy=Typo` 会把不存在的策略名落盘到 `state.json`（D5 的既有行为）。去向：已在 Task 9 记录（`docs/api/phase1.md` CLI 一节、兼容性清单 `/v1/outbound/global` 行、设计文档 §14 均已说明）。
+- `set_log_level` 的确认日志在切换*之后*才以 INFO 打出（应在切换前打出，或改用 WARN）。去向：本分支最终评审。
+- `state.rs` 的测试名 `loads_defaults_selections_and_tolerates_garbage` 已经过时（`StateStore` 早已取代 `State::load`）。去向：本分支最终评审。
+- `cmd_rx.recv()` 返回 `None` 时匹配到空操作分支（`None => {}`），未来若被重构可能导致主循环空转（应改成 `break`）。去向：本分支最终评审。
+- `api_call` 测试助手吞掉了读取错误。去向：本分支最终评审。
+- `count` 这个辅助函数名过于通用。去向：本分支最终评审。
+- 用一个已经生效的合法全局策略重新调用 `set_global_policy` 时，会产生一次多余的 `state.json` 写入。去向：本分支最终评审。
+
+**Task 8（CLI 客户端）**
+
+- 5 秒超时在请求头与请求体上各应用一次，最坏情况下一次调用可能等到 10 秒。去向：本分支最终评审。
+- `-c` 加载失败时的错误上下文掩盖了底层 IO 错误（`control.rs` ~71）。去向：本分支最终评审。
+- `reload` 失败分支没有测试覆盖。去向：本分支最终评审。
+- `http` 直接依赖没有被任何显式路径使用。去向：本分支最终评审。
+- `LoadOptions` 的构造在 5 个 CLI 模块里重复（沿用既有约定，不是本任务引入的）。去向：本分支最终评审。
 

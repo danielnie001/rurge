@@ -277,3 +277,21 @@ M4a 顺带处理：`State::load` 同步读取（→ `StateStore`）；`dial` / `
 - 阶段 2：`POST /v1/policy_groups/select` 写 `StateStore.group_selections` 并调用 `PolicyRegistry` 的运行期 `select`；`/v1/policies/detail`、`/v1/policies/test`、`/v1/policy_groups*` 补齐。
 - 阶段 4：`http-api-tls` 复用 MITM CA。
 - 阶段 6：Dashboard 静态文件挂在同一 axum 路由；`/v1/metrics`（`surge_*` 指标）读 `TrafficStats` / `RequestLog` / 封禁表；多 Profile 目录与 `switch`；`security ban`；`rurge shell` 与其余同名命令复用 bin 的 API 客户端模块；真正的 Windows 服务。
+
+## 14. M4a 实施备注
+
+M4a 已实现（分支 `m4a-control-plane`）；下面记录实施期与 §4–§7 文本出入的地方。不回填修改 §1–§13，一律以本节与代码为准。
+
+- **`Mode` 与 `OutboundMode` 解耦**（§4.1）：`Engine` 没有采用 `ArcSwap<OutboundMode>`，而是新引入一个无载荷的三态枚举 `rurge_engine::control::Mode { Direct, Proxy, Rule }`；`Engine::mode() -> Mode` / `set_mode(Mode)` 取代了 `outbound_mode()` / `set_outbound_mode`。全局策略仍是独立的 `global_policy: ArcSwap<Option<String>>`；`Mode::from_outbound(&OutboundMode) -> (Mode, Option<String>)` 负责从 CLI 的 `--outbound-mode proxy=<name>` 里拆出两者。`Mode`、`LogLevel`、`ReloadReport`、`Control` 都定义在 `rurge_engine::control` 模块，并在 crate 根重导出。
+- **策略校验改为按会话快照**：`Engine::policy_exists` 与内部的 `policy_known(rt, name)` 都针对*调用方持有的那个 `Runtime` 生成*校验，而不是当前最新的一份，避免重载与拨号竞态时用一代的注册表批准、另一代的注册表解析；新增非分配的 `PolicyRegistry::contains(&str)`（`rurge-policy`），取代逐次 `names().iter().any(..)` 的分配。
+- **`config_text` 的脱敏面比 §4.3 描述的更宽**：除 `password=`、`http-api` / `external-controller-access` 的 `key@` 前缀、`ca-passphrase`、`ca-p12` 外，`crates/rurge-config/src/redact.rs` 还处理 `http-listen` / `socks5-listen` 的 `key@` 前缀、`wifi-access-http-auth` 的口令、策略行的 `psk=` / `private-key=` / `base64=` 参数，以及 `http` / `https` / `socks5` / `socks5-tls` 策略行第 4 个起、不含 `=` 的位置型凭据（这四种类型把 `username, password` 按位置传递，不是 `password=`）。
+- **`ApiContext` 多一个字段**（§5.1）：`ApiContext { engine, control, load_options: LoadOptions }`；`load_options` 是守护进程自己的加载选项，供 `POST /v1/profiles/check` 用同一套环境 / 平台 / capabilities 重新校验磁盘上的配置。
+- **`serve` 的签名**（§5.1）：不是 `io::Result<JoinHandle<()>>`，而是 `io::Result<(SocketAddr, ServerFuture)>`（`ServerFuture = Pin<Box<dyn Future<Output = ()> + Send>>`）——`serve` 只绑定端口、构造 `Router` 并返回服务 future，由 `rurge run` 自己把 future 挂到引擎的 `TaskTracker` 上；返回绑定地址是因为测试与 `http-api = key@127.0.0.1:0` 都需要拿到操作系统实际分配的端口。
+- **`GET/POST /v1/outbound/global` 未设时是 `null` 不是空串**（§5.2）：`{"policy": Option<String>}` 走 serde 默认序列化，未设策略时是 `{"policy":null}`，不是文档草稿写的 `{"policy":""}`。
+- **`/v1/traffic` 的 `startTime`、`/v1/dns` 的 `expiresTime` 都是 Unix 秒（`f64`）**，不是 §5.2 与开放问题 Q1 写的毫秒；`docs/api/phase1.md` 以此为准，Q1 视为已回答（秒，而非"待阶段 6 校准"）。
+- **`/v1/modules`、`/v1/scripting`、`/v1/events` 的实际形状**（§5.2）：分别是 `{"enabled":[],"available":[]}`、`{"scripts":[]}`、`{"events":[]}`；`/v1/modules` 不是 §5.2 写的 `{"modules":[]}`。
+- **`Control::set_log_level` 不接 `tracing_subscriber::filter::LevelFilter`**（§6）：trait 方法签名是 `set_log_level(&self, level: LogLevel) -> Result<(), String>`，`LogLevel` 是 `rurge_engine::control` 自己的枚举（`Verbose` / `Debug` / `Info` / `Notify` / `Warning` / `Error`）；从 `LogLevel` 到 `LevelFilter` 的映射留在 `rurge run` 的 `LoopControl` 里（与 `parse_log_level` 用同一张表），这样 `rurge-engine` 定义这个 trait 不必依赖 `tracing-subscriber` 的 `reload` feature。
+- **`ReloadReport.ok` 在重绑监听器失败时也是 `false`**：解析失败、构建 `Runtime` 失败、重绑监听器失败三条路径都返回 `ok:false`（`errors` 至少为 1），运行中的配置保持不变；三者都成功才是 `ok:true`。
+- **`rurge status` 的 `policies` 计数含 5 个内置策略**：`GET /v1/policies` 的 `proxies` 数组固定以 `DIRECT`、`REJECT`、`REJECT-DROP`、`REJECT-NO-DROP`、`REJECT-TINYGIF` 开头，再接配置的策略；CLI 的 `policies: N` 直接取 `proxies.len() + policy-groups.len()`，哪怕配置文件一个策略都没写，`N` 也从 5 起。
+- **启动信息的固定顺序**（§6）：`listening on …`（每个监听器一行）→（配置了 `http-api` 才有）`api on http://<addr>` → `rurge <version> running: …`（汇总行）；CLI 集成测试与 `rurge status` 都从这个固定顺序里解析端口，顺序本身是约定的一部分。
+- **显式 `--outbound-mode proxy=<name>` 写回 `state.json` 时不校验策略是否存在**（D5 既有行为，明确记录）：`initial_mode` 直接把解析出的 `(mode, global)` 写回 `StateStore`；策略是否存在只在运行期的 `choose_policy` 里校验（缺失或未知 → 按规则模式处理并 WARN 一次）。也就是说 `--outbound-mode proxy=Typo` 会把 `Typo` 落盘，但实际路由走规则，直到有人把全局策略改成一个真实存在的名字。

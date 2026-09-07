@@ -15,7 +15,7 @@ rurge（**Ru**st + Su**rge**）是一个用 Rust 编写的跨平台网络代理�
 
 ### 当前状态
 
-> **阶段 1 进行中：M1 ～ M3b 完成**（配置解析、规则引擎、规则集、GeoIP、外部资源管理、DNS 客户端、HTTP / SOCKS5 代理与 DIRECT / REJECT 分流，`rurge check` / `rule match` / `dns lookup` / `run`；M3b 新增请求记录与流量统计、SNI 记录、空闲超时、REJECT 自动升级、CONNECT 502、优雅退出、热重载（SIGHUP / `--watch`）、`--log-file`、`encrypted-dns-follow-outbound-mode`）；M4（控制面 API、系统代理、Dashboard）未开始。`rurge run -c <conf>` 已能作为 HTTP / SOCKS5 代理按规则把连接送到 DIRECT 或 REJECT；代理协议与策略组算法在阶段 2。
+> **阶段 1 进行中：M1 ～ M4a 完成**（配置解析、规则引擎、规则集、GeoIP、外部资源管理、DNS 客户端、HTTP / SOCKS5 代理与 DIRECT / REJECT 分流，`rurge check` / `rule match` / `dns lookup` / `run`；M3b 新增请求记录与流量统计、SNI 记录、空闲超时、REJECT 自动升级、CONNECT 502、优雅退出、热重载（SIGHUP / `--watch`）、`--log-file`、`encrypted-dns-follow-outbound-mode`；M4a 新增 Surge 兼容 HTTP API（阶段 1 端点、`X-Key` 鉴权与封禁）、出站模式 / 全局策略持久化到 `state.json`、`rurge reload` / `stop` / `status`）；M4b（系统代理、服务安装）未开始，Dashboard 在阶段 6。`rurge run -c <conf>` 已能作为 HTTP / SOCKS5 代理按规则把连接送到 DIRECT 或 REJECT；代理协议与策略组算法在阶段 2。
 
 完整的需求、模块划分、平台差异和分阶段路线图见 [docs/requirements.md](docs/requirements.md)；
 Surge 配置项 / 规则 / 参数 / API 的逐项兼容清单见 [docs/surge-compatibility-matrix.md](docs/surge-compatibility-matrix.md)。
@@ -33,14 +33,14 @@ Surge 配置项 / 规则 / 参数 / API 的逐项兼容清单见 [docs/surge-com
 | 增强模式       | 虚拟网卡（Wintun / tun / utun）、UDP、路由包含与排除、进程识别、子网设置                                                                                      | 3     |
 | HTTP 处理      | MITM（HTTPS 解密）、URL / Header / Body 重写、Map Local、请求查看与抓包                                                                                       | 4     |
 | 脚本与模块     | JavaScript 引擎、完整 Surge 脚本 API、模块系统、信息面板                                                                                                      | 5     |
-| API 与工具     | Surge 兼容 HTTP API、Web Dashboard、Logbook、延迟 / 基准测试、CLI                                                                                             | 6     |
+| API 与工具     | Surge 兼容 HTTP API、Web Dashboard、Logbook、延迟 / 基准测试、CLI（阶段 1 端点与 `rurge reload/stop/status` 已实现，M4a）                                    | 6     |
 | 高级网络       | 网关模式、DHCP 服务器、端口转发、内置 Snell / MTProto 服务器                                                                                                  | 7     |
 | 桌面 GUI       | 跨平台桌面客户端、URL Scheme                                                                                                                                  | 8     |
 
 ### 路线图
 
 1. **阶段 0** 需求与文档（当前）
-2. **阶段 1** 核心骨架：配置解析、HTTP / SOCKS5 入站、DIRECT / REJECT、规则引擎、DNS、CLI、HTTP API 骨架
+2. **阶段 1** 核心骨架：配置解析、HTTP / SOCKS5 入站、DIRECT / REJECT、规则引擎、DNS、CLI、HTTP API 骨架（HTTP API 阶段 1 端点与 `rurge reload/stop/status` 已完成，M4a）
 3. **阶段 2** 出站协议全集、策略组、策略订阅
 4. **阶段 3** 增强模式（TUN）、fake-ip、进程识别
 5. **阶段 4** HTTP 引擎：MITM、重写、Map Local、抓包
@@ -53,7 +53,7 @@ Surge 配置项 / 规则 / 参数 / API 的逐项兼容清单见 [docs/surge-com
 
 ### 快速开始（计划中的形态）
 
-> `rurge check`、`rurge rule match`、`rurge dns lookup` 与 `rurge run`（HTTP / SOCKS5 代理，DIRECT / REJECT）已可用；代理协议在阶段 2，系统代理与 API 在 M4。`rurge run` 另支持 `--idle-timeout`、`--request-log-size`、`--watch`（配置热重载）、`--log-file`（按天滚动）等 rurge 专有运行时选项，只经命令行参数 / 环境变量提供，不写入 Surge 配置文件。
+> `rurge check`、`rurge rule match`、`rurge dns lookup` 与 `rurge run`（HTTP / SOCKS5 代理，DIRECT / REJECT）已可用；代理协议在阶段 2，HTTP API 与 `rurge reload` / `stop` / `status` 已可用（见 [docs/api/phase1.md](docs/api/phase1.md)），系统代理在 M4b。`rurge run` 另支持 `--idle-timeout`、`--request-log-size`、`--watch`（配置热重载）、`--log-file`（按天滚动）等 rurge 专有运行时选项，只经命令行参数 / 环境变量提供，不写入 Surge 配置文件。
 
 ```bash
 # 构建
@@ -140,7 +140,7 @@ rurge (**Ru**st + Su**rge**) is a cross-platform network proxy written in Rust. 
 
 ### Status
 
-> **Phase 1 in progress: M1 through M3b are done** (profile parsing, rule engine, rule sets, GeoIP, external resource management, DNS client, HTTP / SOCKS5 proxy with DIRECT / REJECT routing, `rurge check` / `rule match` / `dns lookup` / `run`; M3b added the request log and traffic stats, SNI recording, idle timeout, REJECT auto-escalation, a 502 for failed CONNECT dials, graceful shutdown, hot reload (SIGHUP / `--watch`), `--log-file`, and `encrypted-dns-follow-outbound-mode`); M4 (control-plane API, system proxy, dashboard) has not started. `rurge run -c <conf>` already serves as an HTTP / SOCKS5 proxy routing connections to DIRECT or REJECT by rule; proxy protocols and group algorithms come in phase 2.
+> **Phase 1 in progress: M1 through M4a are done** (profile parsing, rule engine, rule sets, GeoIP, external resource management, DNS client, HTTP / SOCKS5 proxy with DIRECT / REJECT routing, `rurge check` / `rule match` / `dns lookup` / `run`; M3b added the request log and traffic stats, SNI recording, idle timeout, REJECT auto-escalation, a 502 for failed CONNECT dials, graceful shutdown, hot reload (SIGHUP / `--watch`), `--log-file`, and `encrypted-dns-follow-outbound-mode`; M4a added a Surge-compatible HTTP API (phase-1 endpoints, `X-Key` auth with banning), outbound mode / global policy persisted to `state.json`, and `rurge reload` / `stop` / `status`); M4b (system proxy, service install) has not started, and the dashboard is phase 6. `rurge run -c <conf>` already serves as an HTTP / SOCKS5 proxy routing connections to DIRECT or REJECT by rule; proxy protocols and group algorithms come in phase 2.
 
 See [docs/requirements.md](docs/requirements.md) (Chinese) for the full requirements, module breakdown, platform matrix and phased roadmap, and [docs/surge-compatibility-matrix.md](docs/surge-compatibility-matrix.md) for the item-by-item Surge compatibility checklist.
 
@@ -157,14 +157,14 @@ See [docs/requirements.md](docs/requirements.md) (Chinese) for the full requirem
 | Enhanced mode       | Virtual interface (Wintun / tun / utun), UDP, included and excluded routes, process identification, subnet settings                                                     | 3     |
 | HTTP processing     | MITM (HTTPS decryption), URL / header / body rewrite, Map Local, request viewer and capture                                                                             | 4     |
 | Scripting & modules | JavaScript engine, full Surge scripting API, module system, information panels                                                                                          | 5     |
-| API & tools         | Surge-compatible HTTP API, web dashboard, logbook, latency / benchmark tests, CLI                                                                                       | 6     |
+| API & tools         | Surge-compatible HTTP API, web dashboard, logbook, latency / benchmark tests, CLI (phase-1 endpoints and `rurge reload/stop/status` implemented, M4a)                   | 6     |
 | Advanced networking | Gateway mode, DHCP server, port forwarding, built-in Snell / MTProto servers                                                                                            | 7     |
 | Desktop GUI         | Cross-platform desktop client, URL scheme                                                                                                                               | 8     |
 
 ### Roadmap
 
 1. **Phase 0** Requirements and documentation (current)
-2. **Phase 1** Core skeleton: config parser, HTTP / SOCKS5 inbound, DIRECT / REJECT, rule engine, DNS, CLI, HTTP API skeleton
+2. **Phase 1** Core skeleton: config parser, HTTP / SOCKS5 inbound, DIRECT / REJECT, rule engine, DNS, CLI, HTTP API skeleton (phase-1 HTTP API endpoints and `rurge reload/stop/status` are done, M4a)
 3. **Phase 2** All outbound protocols, policy groups, subscriptions
 4. **Phase 3** Enhanced mode (TUN), fake IP, process identification
 5. **Phase 4** HTTP engine: MITM, rewrites, Map Local, capture
@@ -177,7 +177,7 @@ Near-term non-goals: iOS / tvOS builds, Surge Ponte (depends on iCloud), Apple-o
 
 ### Quick start (planned)
 
-> `rurge check`, `rurge rule match`, `rurge dns lookup` and `rurge run` (HTTP / SOCKS5 proxy, DIRECT / REJECT) work today; proxy protocols arrive in phase 2, system proxy and the API in M4. `rurge run` also takes rurge-specific runtime options — `--idle-timeout`, `--request-log-size`, `--watch` (hot reload), `--log-file` (daily rotation) — as CLI flags / env vars only, never written into the Surge profile.
+> `rurge check`, `rurge rule match`, `rurge dns lookup` and `rurge run` (HTTP / SOCKS5 proxy, DIRECT / REJECT) work today; proxy protocols arrive in phase 2, the HTTP API and `rurge reload` / `stop` / `status` are available (see [docs/api/phase1.md](docs/api/phase1.md)), and system proxy comes in M4b. `rurge run` also takes rurge-specific runtime options — `--idle-timeout`, `--request-log-size`, `--watch` (hot reload), `--log-file` (daily rotation) — as CLI flags / env vars only, never written into the Surge profile.
 
 ```bash
 # Build

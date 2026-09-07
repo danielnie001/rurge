@@ -149,7 +149,7 @@
 | `proxy-restricted-to-lan` | 布尔；默认 true | 全部 | 🟡 | 1 | rurge 按回环 / 私有 / 链路本地 / ULA 判定来源；手册为『当前子网』 |
 | `gateway-restricted-to-lan` | 布尔；默认 true | 全部 | ✅ | 7 | |
 | `external-controller-access` | `key@ip:port` | 全部 | 🔁 | 1 | Surge Dashboard 原生协议为专有协议；远程控制统一走 `http-api` |
-| `http-api` | `key@ip:port` | 全部 | ✅ | 1 | |
+| `http-api` | `key@ip:port` | 全部 | ✅ | 1 | M4a 已实现：`X-Key` 头 / `?x-key=` 鉴权（常量时间比较）；同一来源 10 分钟内 5 次失败 → 封禁 10 分钟；绑定非环回地址启动时打 WARN；改动 `http-api` 需重启 rurge（重载只警告，继续用旧地址 / 密钥） |
 | `http-api-tls` | 布尔；默认 false；需先配置 MITM CA | 全部 | ✅ | 4 | |
 | `http-api-web-dashboard` | 布尔；默认 false | 全部 | ✅ | 6 | |
 | `internet-test-url` | URL；默认 `http://bing.com/` | 全部 | ✅ | 2 | |
@@ -806,7 +806,8 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | `dump summary/performance/rule-usage/virtual-ip` `watch speed` `log` `log watch` `logbook` `proxy-runtime-status` | 检视 | 同名 | 6 | |
 | `script list/run` `script-log` `benchmark encryption/rule-matching` `test-policy-bandwidth` | 自动化与基准 | 同名 | 6 | |
 | `device` `reconnect-device` `vmnet` `security ban` | 网关 | `device` `security ban` 同名；`reconnect-device` 🔁；`vmnet` 🟡 按平台 | 7 | |
-| `reload` `switch-profile` `kill` `stop` `unattended-upgrade` | 控制 | `reload` `switch-profile` `kill` `stop` 同名；`unattended-upgrade` 🔁 | 1 / 6 | rurge 自身更新由包管理器负责；SIGHUP / `--watch` 的配置热重载已实现（M3b，重建整个 Stack，DNS 缓存随之清空）；重建监听器的判据是**监听器配置面**（监听地址集合、`password@` / wifi 认证、`proxy-restricted-to-lan`、两个错误页开关）任一变化——只比地址会让密码轮换与来源限制静默不生效（M3b 修复波订正）；重绑失败会留下「零监听器」的退化态，此时下一次重载无条件重试绑定；`--watch` 的监视列表在启动时固定，重载新增的 `#!include` 需重启才会被监视；`rurge reload` 命令与 API 触发仍在 M4 |
+| `reload` `switch-profile` `kill` `stop` `unattended-upgrade` | 控制 | `reload` `switch-profile` `kill` `stop` 同名；`unattended-upgrade` 🔁 | 1 / 6 | rurge 自身更新由包管理器负责；SIGHUP / `--watch` 的配置热重载已实现（M3b，重建整个 Stack，DNS 缓存随之清空）；重建监听器的判据是**监听器配置面**（监听地址集合、`password@` / wifi 认证、`proxy-restricted-to-lan`、两个错误页开关）任一变化——只比地址会让密码轮换与来源限制静默不生效（M3b 修复波订正）；重绑失败会留下「零监听器」的退化态，此时下一次重载无条件重试绑定；`--watch` 的监视列表在启动时固定，重载新增的 `#!include` 需重启才会被监视；`rurge reload` / `rurge stop` 已实现（M4a，经 `http-api` 的 `POST /v1/profiles/reload` / `POST /v1/stop`；未配置 `http-api` 时命令退出 2 并提示改用 SIGHUP / `--watch`）；`kill` 走 `POST /v1/requests/kill`；`switch-profile` 的多配置目录管理仍在阶段 6 |
+| rurge 扩展 | 查看运行中实例的状态：出站模式、全局策略、策略与规则计数、活动请求数、流量 | `rurge status [-c <conf>] [--remote host:port] [--key <key>] [--json]` | 1 | Surge 无对应命令；M4a 已实现，聚合 `GET /v1/outbound`、`/v1/outbound/global`、`/v1/policies`、`/v1/rules`、`/v1/requests/active`、`/v1/traffic`；`policies` 计数含 5 个内置策略；见 `docs/api/phase1.md` |
 | `environment` `set` `set-log-level` | 环境 | 同名 | 6 | |
 | Agent Skill（Mac 6.5+） | 面向 AI 代理的技能文档 | 🟡 | 6 | rurge 仓库可提供等价 skill 文档 |
 | rurge 专有 | 守护进程 | `rurge run -c <path> [--tun] [--system-proxy]`、`rurge service install/uninstall`、`rurge mitm ca generate/export` | 1 / 3 / 4 | |
@@ -820,31 +821,31 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 
 | 端点 | 用途 | Surge 平台 | rurge | 阶段 | 备注 |
 | --- | --- | --- | --- | --- | --- |
-| `GET/POST /v1/features/mitm` `capture` `rewrite` `scripting` | 功能开关 `{"enabled":bool}` | 全部 | ✅ | 1 / 4 / 5 | 阶段 1 提供开关状态骨架 |
-| `GET/POST /v1/features/system_proxy` | 系统代理开关 | Mac only | ✅ | 1 | |
-| `GET/POST /v1/features/enhanced_mode` | 增强模式开关 | Mac only | ✅ | 3 | |
+| `GET/POST /v1/features/mitm` `capture` `rewrite` `scripting` | 功能开关 `{"enabled":bool}` | 全部 | ✅ | 1 / 4 / 5 | 阶段 1（M4a）已实现：`GET` 恒返回 `false`，`POST` 恒 501；随 MITM / Capture / Rewrite（阶段 4）与 Scripting（阶段 5）各自落地后才真正生效 |
+| `GET/POST /v1/features/system_proxy` | 系统代理开关 | Mac only | ✅ | 1 | 阶段 1（M4a）已实现：`GET` 恒返回 `false`，`POST` 恒 501；M4b 接入 `rurge_platform::sysproxy` 后生效 |
+| `GET/POST /v1/features/enhanced_mode` | 增强模式开关 | Mac only | ✅ | 3 | 阶段 1（M4a）已实现：`GET` 恒返回 `false`，`POST` 恒 501；阶段 3（TUN）落地后生效 |
 | `GET/POST /v1/outbound` | `{"mode":"direct"\|"proxy"\|"rule"}` | 全部 | ✅ | 1 | |
-| `GET/POST /v1/outbound/global` | 全局模式策略 | 全部 | ✅ | 1 | |
-| `GET /v1/policies` | 列出策略 | 全部 | ✅ | 1 | |
+| `GET/POST /v1/outbound/global` | 全局模式策略 | 全部 | 🟡 | 1 | M4a 已实现；出站模式与全局策略持久化到 `state.json`，显式 `--outbound-mode` 覆盖并写回（不校验策略是否存在）；`proxy` 模式下全局策略缺失或已不存在（如重载后）→ 按规则模式处理并 WARN 一次 |
+| `GET /v1/policies` | 列出策略 | 全部 | 🟡 | 1 | M4a 已实现；JSON 结构手册未定义，暂定结构见 `docs/api/phase1.md`，阶段 6 对齐真实 Surge |
 | `GET /v1/policies/detail?policy_name=` | 策略详情 | 全部 | ✅ | 2 | |
 | `POST /v1/policies/test` | `{"policy_names":[...],"url":...}` | 全部 | ✅ | 2 | |
 | `GET /v1/policy_groups` | 列出组与选项 | 全部 | ✅ | 2 | |
 | `GET /v1/policy_groups/test_results` | 自动组测试结果 | 全部 | ✅ | 2 | |
 | `GET/POST /v1/policy_groups/select` | 读 / 改 select 组选择 | 全部 | ✅ | 2 | |
 | `POST /v1/policy_groups/test` | 立即测试 → `{"available":[...]}` | 全部 | ✅ | 2 | |
-| `GET /v1/requests/recent` `GET /v1/requests/active` `POST /v1/requests/kill` | 请求列表与终止 | 全部 | 🟡 | 1 / 4 | 响应结构手册未定义，以 Surge 实际输出为准做兼容测试 |
-| `GET /v1/profiles/current?sensitive=0` | 当前配置文本（可脱敏） | 全部 | ✅ | 1 | |
-| `POST /v1/profiles/reload` | 重载 | 全部 | ✅ | 1 | 底层热重载能力（SIGHUP / `--watch`）已在 M3b 就位，API 触发在 M4 暴露 |
-| `POST /v1/profiles/switch` `GET /v1/profiles` `POST /v1/profiles/check` | 多配置管理 | Mac only | ✅ | 1 / 6 | rurge 以配置目录管理多个 Profile |
-| `POST /v1/dns/flush` `GET /v1/dns` `POST /v1/test/dns_delay` | DNS | 全部 | ✅ | 1 | |
+| `GET /v1/requests/recent` `GET /v1/requests/active` `POST /v1/requests/kill` | 请求列表与终止 | 全部 | 🟡 | 1 / 4 | 响应结构手册未定义，以 Surge 实际输出为准做兼容测试；M4a 暂定结构见 `docs/api/phase1.md`；`kill` 命中 rurge 自身的内部会话（如 DNS 查询）→ 409 |
+| `GET /v1/profiles/current?sensitive=0` | 当前配置文本（可脱敏） | 全部 | ✅ | 1 | M4a 已实现；`sensitive=0`（默认）脱敏 `password` / `psk` / `private-key` / `base64` 参数、`ca-passphrase`、`ca-p12`、`key@` 前缀、`wifi-access-http-auth` 口令与 `http` / `https` / `socks5` / `socks5-tls` 策略行里位置传递的凭据，其余内容与行号原样保留 |
+| `POST /v1/profiles/reload` | 重载 | 全部 | ✅ | 1 | 底层热重载能力（SIGHUP / `--watch`）已在 M3b 就位，API 触发已在 M4a 实现；解析 / 重建失败或重绑监听器失败时返回 `ok:false`，运行中的配置保持不变 |
+| `POST /v1/profiles/switch` `GET /v1/profiles` `POST /v1/profiles/check` | 多配置管理 | Mac only | ✅ | 1 / 6 | rurge 以配置目录管理多个 Profile；`check` 已实现（M4a，校验磁盘上的当前配置文件，不影响运行中的实例）；`switch` 与 `GET /v1/profiles` 的多配置目录管理仍在阶段 6 |
+| `POST /v1/dns/flush` `GET /v1/dns` `POST /v1/test/dns_delay` | DNS | 全部 | 🟡 | 1 | M4a 已实现；`GET /v1/dns` 的 JSON 结构手册未定义，暂定结构见 `docs/api/phase1.md`，阶段 6 对齐真实 Surge；`dns_delay` 返回按上游的时延列表而非单一数字 |
 | `GET/POST /v1/modules` | 模块列表与开关 | 全部 | ✅ | 5 | |
 | `GET /v1/scripting` `POST /v1/scripting/evaluate` `POST /v1/scripting/cron/evaluate` | 脚本列表 / mock 执行 / 运行 cron | 全部 | ✅ | 5 | |
 | `GET /v1/devices` `GET /v1/resources/devices-icon?id=` `POST /v1/devices` | 设备管理（`physicalAddress` 必填；`name` `address` `shouldHandledBySurge`） | Mac only | ✅ | 7 | |
-| `POST /v1/stop` | 关闭引擎 | 全部 | 🟡 | 1 | rurge：停止引擎并退出进程；由服务管理器决定是否重启 |
+| `POST /v1/stop` | 关闭引擎 | 全部 | 🟡 | 1 | M4a 已实现；rurge：停止引擎并退出进程；由服务管理器决定是否重启 |
 | `GET /v1/events` | 事件中心 | 全部 | ✅ | 6 | 与 Logbook 共用存储 |
-| `GET /v1/rules` | 规则列表 | 全部 | ✅ | 1 | |
-| `GET /v1/traffic` | 流量信息 | 全部 | ✅ | 1 | 底层按策略 / 监听器的流量统计能力已在 M3b 就位（`TrafficStats`），API 读取在 M4 暴露 |
-| `POST /v1/log/level` | `{"level":"verbose"\|"debug"\|"info"\|"warning"\|"error"}` | 全部 | ✅ | 1 | |
+| `GET /v1/rules` | 规则列表 | 全部 | 🟡 | 1 | M4a 已实现；JSON 结构手册未定义，暂定结构见 `docs/api/phase1.md`，阶段 6 对齐真实 Surge |
+| `GET /v1/traffic` | 流量信息 | 全部 | 🟡 | 1 | 底层按策略 / 监听器的流量统计能力已在 M3b 就位（`TrafficStats`），API 读取已在 M4a 暴露；JSON 结构手册未定义，暂定结构见 `docs/api/phase1.md`，阶段 6 对齐真实 Surge |
+| `POST /v1/log/level` | `{"level":"verbose"\|"debug"\|"info"\|"notify"\|"warning"\|"error"}` | 全部 | ✅ | 1 | M4a 已实现；`notify` 是 Surge 的日志级别之一，`debug` 是 rurge 额外接受的别名 |
 | `GET /v1/mitm/ca` | DER 格式 CA 证书 | 全部 | ✅ | 4 | |
 | `GET /v1/metrics?x-key=` | Prometheus 文本格式（iOS 5.22 / Mac 6.9+） | 全部 | ✅ | 6 | 指标名保持 `surge_*` 前缀以兼容现有 Grafana 面板：`surge_build_info` `surge_uptime_seconds` `surge_memory_bytes` `surge_active_requests` `surge_dns_cache_entries` `surge_active_bans` `surge_interface_in/out_bytes_total{interface}` `surge_policy_in/out_bytes_total{policy}` |
 | 未授权访问封禁（`security ban`、`surge_active_bans`） | 反复错误鉴权后封禁来源 | 全部 | ✅ | 6 | |
