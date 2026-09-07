@@ -27,6 +27,12 @@ enum Command {
     Dns(Box<cli::dns::DnsArgs>),
     /// Run the proxy in the foreground
     Run(Box<cli::run::RunArgs>),
+    /// Reload the running daemon's profile (needs http-api)
+    Reload(cli::control::ControlArgs),
+    /// Stop the running daemon (needs http-api)
+    Stop(cli::control::ControlArgs),
+    /// Show the running daemon's mode, counts and traffic (needs http-api)
+    Status(cli::control::StatusArgs),
 }
 
 fn main() -> ExitCode {
@@ -44,6 +50,9 @@ fn main() -> ExitCode {
         Command::Rule(args) => cli::rule::run(*args),
         Command::Dns(args) => cli::dns::run(*args),
         Command::Run(args) => cli::run::run(*args),
+        Command::Reload(args) => cli::control::reload(args),
+        Command::Stop(args) => cli::control::stop(args),
+        Command::Status(args) => cli::control::status(args),
     };
     match result {
         Ok(code) => code,

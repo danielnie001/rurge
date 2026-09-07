@@ -1,4 +1,6 @@
+pub mod api_client;
 pub mod check;
+pub mod control;
 pub mod dns;
 pub mod rule;
 pub mod run;

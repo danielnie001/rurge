@@ -604,6 +604,7 @@ encrypted-dns-skip-cert-verification = true",
 }
 
 mod run {
+    use predicates::prelude::*;
     use rurge_net::testing::TestServer;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;
@@ -1157,5 +1158,95 @@ mod run {
         );
         let mut daemon = spawn_daemon(&conf, &dir.path().join("data"));
         assert_eq!(wait_for_exit(&mut daemon, 10), Some(1));
+    }
+
+    fn rurge() -> assert_cmd::Command {
+        let mut cmd = assert_cmd::Command::cargo_bin("rurge").unwrap();
+        cmd.env_remove("RURGE_API_KEY");
+        cmd
+    }
+
+    #[test]
+    fn control_commands_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let mut daemon = spawn_daemon(&conf, &dir.path().join("data"));
+        let port = api_port(&daemon);
+        let remote = format!("127.0.0.1:{port}");
+        // status via flags
+        let out = rurge()
+            .args(["status", "--remote", &remote, "--key", "k"])
+            .assert()
+            .success();
+        let text = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+        assert!(
+            text.starts_with(&format!(
+                "rurge at http://{remote}\nmode: rule (global policy: none)\n"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("policies: 5   rules: 2   active requests: 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("traffic: in 0 B, out 0 B (in 0 B/s, out 0 B/s)"),
+            "{text}"
+        );
+        // --json and the env var
+        let out = rurge()
+            .args(["status", "--remote", &remote, "--json"])
+            .env("RURGE_API_KEY", "k")
+            .assert()
+            .success();
+        let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+        assert_eq!(v["outbound"]["mode"], "rule");
+        assert_eq!(v["policies"]["policy-groups"], serde_json::json!([]));
+        // wrong key → 2, missing --key → 2, not configured → 2
+        rurge()
+            .args(["status", "--remote", &remote, "--key", "nope"])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("unauthorized"));
+        rurge()
+            .args(["reload", "--remote", &remote])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("--key"));
+        let plain_dir = dir.path().join("plain");
+        std::fs::create_dir_all(&plain_dir).unwrap();
+        let plain = write_conf(&plain_dir, "http-listen = 127.0.0.1:0");
+        rurge()
+            .args(["reload", "-c"])
+            .arg(&plain)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("http-api is not configured"));
+        // resolution through a profile that names the live port
+        let pointing = dir.path().join("pointing.conf");
+        std::fs::write(
+            &pointing,
+            format!("[General]\nhttp-api = k@0.0.0.0:{port}\n[Rule]\nFINAL,DIRECT\n"),
+        )
+        .unwrap();
+        rurge()
+            .args(["reload", "-c"])
+            .arg(&pointing)
+            .assert()
+            .success()
+            .stdout(predicate::str::starts_with("reloaded: 0 error(s), "));
+        // stop: the daemon exits 0
+        rurge()
+            .args(["stop", "--remote", &remote, "--key", "k"])
+            .assert()
+            .success()
+            .stdout("stop requested\n");
+        assert_eq!(wait_for_exit(&mut daemon, 10), Some(0));
+        // gone → 1
+        rurge()
+            .args(["status", "--remote", &remote, "--key", "k"])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("cannot reach rurge"));
     }
 }
