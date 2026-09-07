@@ -1032,7 +1032,8 @@ mod tests {
         }
         assert!(auth.record_failure(ip(1), t0 + Duration::from_secs(4)), "fifth failure bans");
         assert!(auth.is_banned(ip(1), t0 + Duration::from_secs(5)));
-        assert!(auth.is_banned(ip(1), t0 + BAN_DURATION + Duration::from_secs(4)));
+        // banned from t0+4s for BAN_DURATION: still banned one second before it ends
+        assert!(auth.is_banned(ip(1), t0 + BAN_DURATION + Duration::from_secs(3)));
         assert!(!auth.is_banned(ip(1), t0 + BAN_DURATION + Duration::from_secs(5)), "ban expires");
         assert!(!auth.is_banned(ip(2), t0), "other sources are unaffected");
     }
@@ -1878,12 +1879,13 @@ async fn rejects_missing_or_wrong_key_and_bans_after_five_failures() {
     let (status, body) = call(api.addr, "GET", &format!("/v1/outbound?x-key={KEY}"), None, None).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["mode"], "rule");
-    for _ in 0..4 {
+    // the no-key attempt above was failure #1; three more make four
+    for _ in 0..3 {
         let (status, _) = call(api.addr, "GET", "/v1/outbound", Some("wrong"), None).await;
         assert_eq!(status, 401);
     }
     let (status, _) = call(api.addr, "GET", "/v1/outbound", Some("wrong"), None).await;
-    assert_eq!(status, 401, "the fifth failure still answers 401");
+    assert_eq!(status, 401, "the fifth failure still answers 401 (and starts the ban)");
     let (status, body) = get(&api, "/v1/outbound").await;
     assert_eq!((status, body), (403, json!({ "error": "banned" })), "even the right key is banned now");
 }
