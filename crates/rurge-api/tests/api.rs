@@ -98,6 +98,9 @@ impl Api {
     fn target_url(&self) -> String {
         format!("http://target.test:{}/hello", self.target_port())
     }
+    fn big_url(&self) -> String {
+        format!("http://target.test:{}/big", self.target_port())
+    }
 }
 
 /// The binary declares no proxy protocols, so drop shadowsocks from the test
@@ -121,6 +124,7 @@ async fn api_with(rules: &str) -> Api {
     dns.set("cached.test", &["10.0.0.1"], &[], 300);
     let target = TestServer::spawn().await;
     target.set("/hello", "hi there");
+    target.set("/big", "x".repeat(4096));
     let dir = tempfile::tempdir().unwrap();
     let conf = dir.path().join("t.conf");
     let profile = format!(
@@ -441,6 +445,20 @@ async fn recent_and_active_requests_and_kill() {
     assert!(r["up"].as_u64().unwrap() > 0 && r["down"].as_u64().unwrap() > 0);
     assert!(r["startedMs"].as_u64().unwrap() > 0);
     assert!(r["rejectKind"].is_null() && r["error"].is_null());
+    // a second, distinguishable request: ads.test is REJECTed by a domain
+    // rule (no DNS entry needed, since domain rules never resolve)
+    let _ = get_via_proxy(api.http(), "http://ads.test/").await;
+    wait_until(async || {
+        recent = get(&api, "/v1/requests/recent").await.1["requests"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        recent
+            .iter()
+            .any(|r| r["status"] == "rejected" && r["rejectKind"] == "REJECT")
+    })
+    .await;
+    assert!(recent.len() >= 2, "{recent:?}");
     assert_eq!(
         get(&api, "/v1/requests/recent?limit=1").await.1["requests"]
             .as_array()
@@ -448,6 +466,9 @@ async fn recent_and_active_requests_and_kill() {
             .len(),
         1
     );
+    let (status, body) = get(&api, "/v1/requests/recent?limit=abc").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body["error"].is_string());
     let (status, body) = post(&api, "/v1/requests/kill", json!({ "id": 999_999 })).await;
     assert_eq!(status, 404, "{body}");
     // a CONNECT tunnel stays active until killed
@@ -497,18 +518,28 @@ async fn recent_and_active_requests_and_kill() {
 #[tokio::test]
 async fn traffic_reports_totals_by_policy_and_listener() {
     let api = api().await;
-    let (head, _) = get_via_proxy(api.http(), &api.target_url()).await;
+    let (head, resp_body) = get_via_proxy(api.http(), &api.big_url()).await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(resp_body.len(), 4096);
     let mut body = Value::Null;
     wait_until(async || {
         body = get(&api, "/v1/traffic").await.1;
-        body["total"]["in"].as_u64().unwrap_or(0) > 0
+        body["total"]["in"].as_u64().unwrap_or(0) >= 4096
     })
     .await;
     assert!(body["startTime"].as_f64().unwrap() > 1.0e9);
-    assert!(body["total"]["out"].as_u64().unwrap() > 0);
     assert!(body["total"]["inCurrentSpeed"].is_u64() && body["total"]["outCurrentSpeed"].is_u64());
-    assert!(body["connector"]["DIRECT"]["in"].as_u64().unwrap() > 0);
-    assert!(body["listener"]["http"]["out"].as_u64().unwrap() > 0);
+    // `in` (down) must be at least the 4 KiB body, and strictly more than
+    // `out` (up, a bare GET request line + headers) — this would fail if the
+    // in/out mapping were ever swapped.
+    let total_in = body["total"]["in"].as_u64().unwrap();
+    let total_out = body["total"]["out"].as_u64().unwrap();
+    assert!(total_in >= 4096 && total_in > total_out, "{body}");
+    let direct_in = body["connector"]["DIRECT"]["in"].as_u64().unwrap();
+    let direct_out = body["connector"]["DIRECT"]["out"].as_u64().unwrap();
+    assert!(direct_in >= 4096 && direct_in > direct_out, "{body}");
+    let http_in = body["listener"]["http"]["in"].as_u64().unwrap();
+    let http_out = body["listener"]["http"]["out"].as_u64().unwrap();
+    assert!(http_in >= 4096 && http_in > http_out, "{body}");
     assert_eq!(body["listener"]["socks5"]["in"], 0);
 }

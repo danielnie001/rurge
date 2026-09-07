@@ -1,9 +1,9 @@
 //! `GET /v1/requests/recent|active` and `POST /v1/requests/kill`.
 
 use crate::App;
-use crate::error::{ApiError, ApiResult, json_body};
+use crate::error::{ApiError, ApiResult, json_body, query_params};
 use axum::Json;
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Query, State};
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::ListenerKind;
@@ -98,7 +98,11 @@ pub struct RecentQuery {
     pub limit: Option<usize>,
 }
 
-pub async fn recent(State(app): State<App>, Query(q): Query<RecentQuery>) -> Json<RequestsJson> {
+pub async fn recent(
+    State(app): State<App>,
+    q: Result<Query<RecentQuery>, QueryRejection>,
+) -> ApiResult<Json<RequestsJson>> {
+    let q = query_params(q)?;
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).max(1);
     let requests = app
         .engine
@@ -107,7 +111,7 @@ pub async fn recent(State(app): State<App>, Query(q): Query<RecentQuery>) -> Jso
         .iter()
         .map(RequestJson::from)
         .collect();
-    Json(RequestsJson { requests })
+    Ok(Json(RequestsJson { requests }))
 }
 
 pub async fn active(State(app): State<App>) -> Json<RequestsJson> {

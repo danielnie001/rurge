@@ -2,7 +2,8 @@
 //! `{"error": "<message>"}` with the matching status code.
 
 use axum::Json;
-use axum::extract::rejection::JsonRejection;
+use axum::extract::Query;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
@@ -57,6 +58,15 @@ impl IntoResponse for ApiError {
 pub fn json_body<T>(body: Result<Json<T>, JsonRejection>) -> ApiResult<T> {
     match body {
         Ok(Json(v)) => Ok(v),
+        Err(e) => Err(ApiError::bad_request(e.body_text())),
+    }
+}
+
+/// Unwraps query-string parameters, turning axum's rejection (e.g. `?limit=abc`
+/// for a numeric field) into our 400 body.
+pub fn query_params<T>(q: Result<Query<T>, QueryRejection>) -> ApiResult<T> {
+    match q {
+        Ok(Query(v)) => Ok(v),
         Err(e) => Err(ApiError::bad_request(e.body_text())),
     }
 }
