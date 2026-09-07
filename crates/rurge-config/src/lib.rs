@@ -15,6 +15,7 @@ pub mod hostlist;
 pub mod keystore;
 pub mod managed;
 pub mod policy;
+pub mod redact;
 pub mod requirement;
 pub mod rule;
 pub mod session;

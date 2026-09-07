@@ -1,8 +1,10 @@
 //! The engine (M3 design §7.2 – 7.3): implements `Dialer` for the listeners,
 //! relays bytes, binds listeners from `[General]`, writes the session log.
 
+use crate::control::Mode;
 use crate::observe::{RequestLog, TrafficStats};
 use crate::runtime::Runtime;
+use crate::state::StateStore;
 use arc_swap::ArcSwap;
 use rurge_config::Builtin;
 use rurge_config::general::General;
@@ -21,7 +23,8 @@ use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -134,6 +137,13 @@ pub struct Engine {
     tracker: TaskTracker,
     observe: Arc<Observe>,
     escalation: Escalation,
+    /// Runtime outbound mode and global policy (M4 design §4.1). Seeded from
+    /// the first `Runtime`, changed by the API / CLI, never touched by reload.
+    mode: ArcSwap<Mode>,
+    global_policy: ArcSwap<Option<String>>,
+    /// "proxy mode but no usable global policy" is warned once per change.
+    global_warned: AtomicBool,
+    state: OnceLock<Arc<StateStore>>,
 }
 
 impl Engine {
@@ -142,6 +152,7 @@ impl Engine {
             log: RequestLog::new(runtime.request_log_size),
             traffic: TrafficStats::new(),
         });
+        let (mode, global) = Mode::from_outbound(&runtime.outbound_mode);
         let engine = Arc::new(Engine {
             runtime: ArcSwap::from_pointee(runtime),
             next_session: AtomicU64::new(0),
@@ -150,6 +161,10 @@ impl Engine {
             tracker: TaskTracker::new(),
             observe,
             escalation: Escalation::new(),
+            mode: ArcSwap::from_pointee(mode),
+            global_policy: ArcSwap::from_pointee(global),
+            global_warned: AtomicBool::new(false),
+            state: OnceLock::new(),
         });
         if let Some(pc) = engine.runtime().dns_pipeline() {
             pc.attach(Arc::downgrade(&engine));
@@ -310,6 +325,158 @@ impl Engine {
     }
 }
 
+#[derive(Debug)]
+pub struct UnknownPolicy(pub String);
+
+impl std::fmt::Display for UnknownPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown policy `{}`", self.0)
+    }
+}
+impl std::error::Error for UnknownPolicy {}
+
+pub struct PoliciesView {
+    pub proxies: Vec<String>,
+    pub groups: Vec<String>,
+}
+
+pub struct RuleView {
+    pub index: usize,
+    pub rule: String,
+    pub hits: u64,
+}
+
+impl Engine {
+    /// Attaches the state store so mode / global-policy changes persist.
+    pub fn attach_state(&self, store: Arc<StateStore>) {
+        let _ = self.state.set(store);
+    }
+
+    pub fn mode(&self) -> Mode {
+        **self.mode.load()
+    }
+
+    pub async fn set_mode(&self, mode: Mode) {
+        self.mode.store(Arc::new(mode));
+        self.global_warned.store(false, Ordering::Relaxed);
+        if let Some(store) = self.state.get() {
+            store
+                .update(|s| s.outbound_mode = Some(mode.as_str().to_string()))
+                .await;
+        }
+    }
+
+    pub fn global_policy(&self) -> Option<String> {
+        (**self.global_policy.load()).clone()
+    }
+
+    /// `true` for the built-in policies and every configured policy / group.
+    pub fn policy_exists(&self, name: &str) -> bool {
+        matches!(PolicyRef::parse(name), PolicyRef::Builtin(_))
+            || self.runtime().policies.names().iter().any(|n| n == name)
+    }
+
+    /// Empty name clears the global policy.
+    pub async fn set_global_policy(&self, name: &str) -> Result<(), UnknownPolicy> {
+        let name = name.trim();
+        let value = if name.is_empty() {
+            None
+        } else if self.policy_exists(name) {
+            Some(name.to_string())
+        } else {
+            return Err(UnknownPolicy(name.to_string()));
+        };
+        self.global_policy.store(Arc::new(value.clone()));
+        self.global_warned.store(false, Ordering::Relaxed);
+        if let Some(store) = self.state.get() {
+            store.update(|s| s.global_policy = value).await;
+        }
+        Ok(())
+    }
+
+    pub fn policies_view(&self) -> PoliciesView {
+        let rt = self.runtime();
+        let mut proxies: Vec<String> = [
+            "DIRECT",
+            "REJECT",
+            "REJECT-DROP",
+            "REJECT-NO-DROP",
+            "REJECT-TINYGIF",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        proxies.extend(rt.config.policies.iter().map(|p| p.name.clone()));
+        let groups = rt.config.groups.iter().map(|g| g.name.clone()).collect();
+        PoliciesView { proxies, groups }
+    }
+
+    pub fn rules_view(&self) -> Vec<RuleView> {
+        self.runtime()
+            .rules
+            .rules()
+            .iter()
+            .map(|r| RuleView {
+                index: r.index,
+                rule: r.raw.clone(),
+                hits: r.hits(),
+            })
+            .collect()
+    }
+
+    /// The current main profile text; secrets redacted unless `sensitive`.
+    pub async fn config_text(&self, sensitive: bool) -> io::Result<String> {
+        let path = self.runtime().config.source.main.clone();
+        let text = tokio::fs::read_to_string(&path).await?;
+        Ok(if sensitive {
+            text
+        } else {
+            rurge_config::redact::redact_profile(&text)
+        })
+    }
+
+    /// Mode / rule → policy, shared by `dial` and `dial_internal` (M4 §4.1).
+    async fn choose_policy(&self, rt: &Runtime, handle: &SessionHandle) -> Chosen {
+        match self.mode() {
+            Mode::Direct => return Chosen::Policy(PolicyRef::Builtin(Builtin::Direct)),
+            Mode::Proxy => match self.global_policy() {
+                Some(name) if self.policy_exists(&name) => {
+                    return Chosen::Policy(PolicyRef::parse(&name));
+                }
+                other => {
+                    if !self.global_warned.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            policy = ?other,
+                            "outbound mode is proxy but the global policy is unset or unknown; routing by rules"
+                        );
+                    }
+                }
+            },
+            Mode::Rule => {}
+        }
+        let decision = rt
+            .rules
+            .evaluate(
+                handle.session(),
+                OutboundMode::Rule,
+                rt.stack.resolver.as_ref(),
+            )
+            .await;
+        if let Some(i) = decision.matched {
+            handle.set_rule(rule_raw(&rt.rules, i));
+        }
+        match decision.outcome {
+            Outcome::Policy(p) => Chosen::Policy(p),
+            Outcome::DnsFailed => Chosen::DnsFailed,
+        }
+    }
+}
+
+enum Chosen {
+    Policy(PolicyRef),
+    DnsFailed,
+}
+
 impl Engine {
     /// Dials a DNS upstream connection through the pipeline (Internal session).
     /// Never lets a REJECT break DNS: on reject it warns and connects directly.
@@ -320,28 +487,11 @@ impl Engine {
     ) -> io::Result<BoxedStream> {
         let rt = self.runtime();
         let handle = self.new_handle(session);
-        let policy = match &rt.outbound_mode {
-            OutboundMode::Direct => PolicyRef::Builtin(Builtin::Direct),
-            OutboundMode::Proxy(p) => p.clone(),
-            OutboundMode::Rule => {
-                let decision = rt
-                    .rules
-                    .evaluate(
-                        handle.session(),
-                        OutboundMode::Rule,
-                        rt.stack.resolver.as_ref(),
-                    )
-                    .await;
-                if let Some(i) = decision.matched {
-                    handle.set_rule(rule_raw(&rt.rules, i));
-                }
-                match decision.outcome {
-                    Outcome::Policy(p) => p,
-                    // An IP-literal DNS session never needs resolution; a DnsFailed
-                    // here would only come from a misconfigured rule → direct.
-                    Outcome::DnsFailed => PolicyRef::Builtin(Builtin::Direct),
-                }
-            }
+        let policy = match self.choose_policy(&rt, &handle).await {
+            Chosen::Policy(p) => p,
+            // An IP-literal DNS session never needs resolution; a DnsFailed here
+            // would only come from a misconfigured rule → direct.
+            Chosen::DnsFailed => PolicyRef::Builtin(Builtin::Direct),
         };
         let resolution = rt.policies.resolve(&policy);
         handle.set_policy_chain(resolution.chain.clone());
@@ -492,28 +642,9 @@ impl Dialer for Engine {
         Box::pin(async move {
             let rt = self.runtime();
             let handle = self.new_handle(session);
-            let policy = match &rt.outbound_mode {
-                OutboundMode::Direct => PolicyRef::Builtin(Builtin::Direct),
-                OutboundMode::Proxy(p) => p.clone(),
-                OutboundMode::Rule => {
-                    let decision = rt
-                        .rules
-                        .evaluate(
-                            handle.session(),
-                            OutboundMode::Rule,
-                            rt.stack.resolver.as_ref(),
-                        )
-                        .await;
-                    if let Some(i) = decision.matched {
-                        handle.set_rule(rule_raw(&rt.rules, i));
-                    }
-                    match decision.outcome {
-                        Outcome::Policy(p) => p,
-                        Outcome::DnsFailed => {
-                            return fail(handle, FailKind::Dns, "dns lookup failed");
-                        }
-                    }
-                }
+            let policy = match self.choose_policy(&rt, &handle).await {
+                Chosen::Policy(p) => p,
+                Chosen::DnsFailed => return fail(handle, FailKind::Dns, "dns lookup failed"),
             };
             let resolution = rt.policies.resolve(&policy);
             handle.set_policy_chain(resolution.chain.clone());

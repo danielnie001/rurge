@@ -2,6 +2,7 @@
 //! generation, the `Engine` that dials and relays sessions for the inbound
 //! listeners, and the session log.
 
+pub mod control;
 pub mod dns_pipeline;
 pub mod engine;
 pub mod observe;
@@ -12,7 +13,7 @@ pub mod sniff;
 pub mod stack;
 pub mod state;
 
-pub use engine::{Engine, ListenerSpec};
+pub use engine::{Engine, ListenerSpec, PoliciesView, RuleView, UnknownPolicy};
 pub use observe::{RecordStatus, RequestLog, RequestRecord, TrafficStats, TrafficTotals};
 pub use runtime::{Runtime, RuntimeOptions};
 pub use rurge_inbound::Running;

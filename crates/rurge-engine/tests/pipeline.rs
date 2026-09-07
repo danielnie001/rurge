@@ -73,6 +73,7 @@ async fn harness(general_extra: &str, rules: &str, mode: OutboundMode) -> Harnes
 [Rule]\n{rules}\nFINAL,DIRECT\n",
         dns.addr()
     );
+    std::fs::write(dir.path().join("t.conf"), &profile).unwrap();
     let loaded = from_text(&profile, &dir.path().join("t.conf"), &load_options());
     assert!(
         !loaded.diagnostics.has_errors(),
@@ -1102,4 +1103,61 @@ async fn persisted_group_selection_is_honored() {
         rec.is_some(),
         "resolved through DIRECT (persisted selection)"
     );
+}
+
+#[tokio::test]
+async fn runtime_mode_and_global_policy_override_routing() {
+    use rurge_engine::control::Mode;
+    // rules reject the target; the runtime mode can bypass them
+    let h = harness("", "DOMAIN,target.test,REJECT", OutboundMode::Rule).await;
+    let url = format!("http://target.test:{}/hello", h.target_port());
+    let (head, _) = get_via_proxy(h.http(), &url).await;
+    assert!(head.is_empty(), "rules reject: {head}");
+    assert_eq!(h.engine.mode(), Mode::Rule);
+    h.engine.set_mode(Mode::Direct).await;
+    let (head, body) = get_via_proxy(h.http(), &url).await;
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "direct mode bypasses rules: {head}"
+    );
+    assert_eq!(body, b"hi there");
+    // proxy mode routes through the global policy (Block = reject-tinygif)
+    h.engine.set_global_policy("Block").await.unwrap();
+    h.engine.set_mode(Mode::Proxy).await;
+    let (head, body) = get_via_proxy(h.http(), &url).await;
+    assert!(
+        head.starts_with("HTTP/1.1 200") && body.len() == 43,
+        "{head}"
+    );
+    // unknown policy is refused; a builtin is accepted
+    assert!(h.engine.set_global_policy("nope").await.is_err());
+    h.engine.set_global_policy("DIRECT").await.unwrap();
+    let (head, body) = get_via_proxy(h.http(), &url).await;
+    assert!(
+        head.starts_with("HTTP/1.1 200") && body == b"hi there",
+        "{head}"
+    );
+    // proxy mode with the global policy cleared falls back to the rules
+    h.engine.set_global_policy("").await.unwrap();
+    assert_eq!(h.engine.global_policy(), None);
+    let (head, _) = get_via_proxy(h.http(), &url).await;
+    assert!(head.is_empty(), "no global policy → rules → reject: {head}");
+    // views
+    let pv = h.engine.policies_view();
+    assert!(pv.proxies.iter().any(|p| p == "DIRECT") && pv.proxies.iter().any(|p| p == "HK"));
+    assert!(pv.groups.iter().any(|g| g == "Pick"));
+    let rules = h.engine.rules_view();
+    assert!(
+        rules
+            .iter()
+            .any(|r| r.rule == "DOMAIN,target.test,REJECT" && r.hits >= 1)
+    );
+    assert!(rules.last().unwrap().rule.starts_with("FINAL"));
+    let text = h.engine.config_text(false).await.unwrap();
+    assert!(
+        text.contains("password=***") && !text.contains("password=x"),
+        "{text}"
+    );
+    let full = h.engine.config_text(true).await.unwrap();
+    assert!(full.contains("password=x"));
 }
