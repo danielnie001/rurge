@@ -7,6 +7,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 - 每个请求带 `X-Key: <key>` 头或 `?x-key=<key>` 查询参数；比较为常量时间。
 - 失败：`401 {"error":"unauthorized"}`。同一来源 IP 10 分钟内 5 次失败 → 之后 10 分钟内一律 `403 {"error":"banned"}`；封禁表最多跟踪 1024 个来源。
 - 所有错误都是 `{"error":"<message>"}`：400（参数、JSON 请求体或查询字符串错误）、401、403、404（未知端点 / 未知请求 id / 未知功能名）、409（不可终止的内部会话）、500（内部错误）、501（本阶段未实现）。
+- 已知例外：请求方法与已注册路径不匹配（如对 `/v1/outbound` 发 `DELETE`）时，当前是 axum 默认的 405，响应体为空，不是 `{"error":...}`；待补统一的 405 处理，见 M4a 计划的「延后事项」。
 - 无内容的成功响应是 `{}`。字段名 camelCase；手册已定义的字段（如 `policy-groups`、`dnsCache`）照抄。
 - `http-api` 绑定到非环回地址时启动时打 WARN；改动 `http-api` 需重启 rurge（重载只警告，继续用旧地址 / 密钥）。
 
@@ -28,7 +29,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 | POST | `/v1/dns/flush` | | `{}` |
 | POST | `/v1/test/dns_delay` | `{"name":"<host>"}`，缺省为 `internet-test-url` 的主机 | `{"delays":[{"upstream":"udp://…","ms":12,"error":null}]}` |
 | GET | `/v1/profiles/current?sensitive=0\|1` | | `text/plain`；默认脱敏：`password`/`psk`/`private-key`/`base64` 参数、`ca-passphrase`、`ca-p12`、`key@` 前缀、`wifi-access-http-auth` 口令、`http`/`https`/`socks5`/`socks5-tls` 策略行里位置传递的凭据 → `***` |
-| POST | `/v1/profiles/reload` | | `{"ok":true,"errors":0,"warnings":1,"listenersRebound":false}`；解析 / 重建失败或重绑监听器失败时 `ok:false`（运行中的配置保持不变） |
+| POST | `/v1/profiles/reload` | | `{"ok":true,"errors":0,"warnings":1,"listenersRebound":false}`；解析失败或构建 `Runtime` 失败时 `ok:false`，运行中的配置不变；重绑监听器失败时也是 `ok:false`，但新配置这时已经生效，只是监听器归零，直到下一次重载成功为止（下一次重载会无条件重试绑定） |
 | POST | `/v1/profiles/check` | | `{"ok":…,"errors":N,"warnings":N,"diagnostics":[Diagnostic…]}`（校验磁盘上的当前配置，不影响运行；`Diagnostic` 与 `rurge check --json` 相同） |
 | POST | `/v1/log/level` | `{"level":"verbose"\|"debug"\|"info"\|"notify"\|"warning"\|"error"}` | `{}` |
 | GET | `/v1/features/{system_proxy\|enhanced_mode\|mitm\|capture\|rewrite\|scripting}` | | `{"enabled":false}` |

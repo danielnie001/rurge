@@ -4026,7 +4026,7 @@ EOF
 - `call_raw` 测试助手从未断言过响应的 `content-type`。去向：本分支最终评审。
 - `stop` 的文档注释夸大了顺序保证（真正的保证是优雅关闭本身，不是某个更强的时序）。去向：本分支最终评审。
 - 6 个 `dead_code` allow 留给 Task 5 / 6 收窄或删除。去向：已解决（`crates/rurge-api/src` 目前已没有 `dead_code` allow）。
-- `rurge-dns` 是 `[dependencies]`（非 dev-dependency），但 `crates/rurge-api/src` 里没有任何代码按名字引用它。去向：本分支最终评审（确认能否降级为 dev-dependency 或删除）。
+- `rurge-dns` 是 `[dependencies]`（非 dev-dependency）；`crates/rurge-api/src` 里没有任何代码显式 `use` 它或写出 `rurge_dns::` 路径，但 `routes/dns.rs` 确实读取了它定义的 `CacheEntry` / `UpstreamDelay` 的字段（经 `rurge-engine` 的 `Resolver` 间接拿到），所以这条依赖是真实需要的，只是没有被显式命名。去向：本分支最终评审（视情况补一个 `use rurge_dns::...` 让这层依赖在代码里也看得见，而不是判断能否删除）。
 - `pub fn router` 缺少「调用方需要提供 `ConnectInfo`」的文档，或应收紧为 `pub(crate)`。去向：本分支最终评审。
 - 集成测试没有先跑出一次失败（RED）再写通过态断言（计划把这一步安排在了任务顺序之外）。去向：本分支最终评审（流程记录，不需要代码改动）。
 - harness 文档在 Task 6 用上 `W0007` 之前就提到了它。去向：已解决（Task 6 / Task 8 的集成测试确已使用 `W0007`）。

@@ -835,7 +835,7 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | `POST /v1/policy_groups/test` | 立即测试 → `{"available":[...]}` | 全部 | ✅ | 2 | |
 | `GET /v1/requests/recent` `GET /v1/requests/active` `POST /v1/requests/kill` | 请求列表与终止 | 全部 | 🟡 | 1 / 4 | 响应结构手册未定义，以 Surge 实际输出为准做兼容测试；M4a 暂定结构见 `docs/api/phase1.md`；`kill` 命中 rurge 自身的内部会话（如 DNS 查询）→ 409 |
 | `GET /v1/profiles/current?sensitive=0` | 当前配置文本（可脱敏） | 全部 | ✅ | 1 | M4a 已实现；`sensitive=0`（默认）脱敏 `password` / `psk` / `private-key` / `base64` 参数、`ca-passphrase`、`ca-p12`、`key@` 前缀、`wifi-access-http-auth` 口令与 `http` / `https` / `socks5` / `socks5-tls` 策略行里位置传递的凭据，其余内容与行号原样保留 |
-| `POST /v1/profiles/reload` | 重载 | 全部 | ✅ | 1 | 底层热重载能力（SIGHUP / `--watch`）已在 M3b 就位，API 触发已在 M4a 实现；解析 / 重建失败或重绑监听器失败时返回 `ok:false`，运行中的配置保持不变 |
+| `POST /v1/profiles/reload` | 重载 | 全部 | ✅ | 1 | 底层热重载能力（SIGHUP / `--watch`）已在 M3b 就位，API 触发已在 M4a 实现；解析失败或构建 `Runtime` 失败时返回 `ok:false` 且运行中的配置不变；重绑监听器失败时同样 `ok:false`，但配置代已经切换，只是监听器归零，直到下一次重载成功为止（与本表第 809 行「零监听器」退化态一致） |
 | `POST /v1/profiles/switch` `GET /v1/profiles` `POST /v1/profiles/check` | 多配置管理 | Mac only | ✅ | 1 / 6 | rurge 以配置目录管理多个 Profile；`check` 已实现（M4a，校验磁盘上的当前配置文件，不影响运行中的实例）；`switch` 与 `GET /v1/profiles` 的多配置目录管理仍在阶段 6 |
 | `POST /v1/dns/flush` `GET /v1/dns` `POST /v1/test/dns_delay` | DNS | 全部 | 🟡 | 1 | M4a 已实现；`GET /v1/dns` 的 JSON 结构手册未定义，暂定结构见 `docs/api/phase1.md`，阶段 6 对齐真实 Surge；`dns_delay` 返回按上游的时延列表而非单一数字 |
 | `GET/POST /v1/modules` | 模块列表与开关 | 全部 | ✅ | 5 | |
