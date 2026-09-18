@@ -504,10 +504,24 @@ mod tests {
         );
     }
 
+    /// Removes the scratch key when the test ends, pass or fail.
+    #[cfg(windows)]
+    struct ScratchKey(String);
+
+    #[cfg(windows)]
+    impl Drop for ScratchKey {
+        fn drop(&mut self) {
+            let _ = windows_registry::CURRENT_USER.remove_tree(&self.0);
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn real_registry_round_trips_under_a_scratch_key() {
         let path = format!(r"Software\rurge-test-{}", std::process::id());
+        // a previous run of this test may have crashed before cleaning up
+        let _ = windows_registry::CURRENT_USER.remove_tree(&path);
+        let _cleanup = ScratchKey(path.clone());
         let reg = RealRegistry::at(path.clone());
         assert_eq!(
             reg.get_u32("ProxyEnable").unwrap(),
@@ -525,7 +539,6 @@ mod tests {
         reg.delete("ProxyServer").unwrap();
         reg.delete("ProxyServer").unwrap(); // deleting an absent value is fine
         assert_eq!(reg.get_string("ProxyServer").unwrap(), None);
-        windows_registry::CURRENT_USER.remove_tree(&path).unwrap();
     }
 
     #[cfg(windows)]
