@@ -144,8 +144,8 @@
 | `tun-excluded-routes` | CIDR 列表 | 全部 | ✅ | 3 | |
 | `tun-included-routes` | CIDR 列表 | 全部 | ✅ | 3 | |
 | `icmp-forwarding` | 布尔；默认 true | 全部 | ✅ | 3 | |
-| `skip-proxy` | Host List | 全部（平台语义不同） | ✅ | 1 | 采用 macOS 语义：写入系统代理的绕过列表（Win: `ProxyOverride`；Lin: `no_proxy` / GNOME ignore-hosts） |
-| `exclude-simple-hostnames` | 布尔；默认 false | 全部 | ✅ | 1 | Windows 对应 `<local>` |
+| `skip-proxy` | Host List | 全部（平台语义不同） | ✅ | 1 | 采用 macOS 语义：写入系统代理的绕过列表（Win: `ProxyOverride`；Mac: `-setproxybypassdomains`；Lin: GNOME `ignore-hosts` / KDE `NoProxyFor`）；M4b 已实现——转换时丢弃取反项（`-host`）、`<…>` 特殊记号与端口，CIDR 网段保留 `/前缀`、主机位清零（如 `192.168.1.5/16` → `192.168.0.0/16`），单地址网段写成裸地址；macOS / GNOME 原样传入这份列表，KDE 逗号拼接成 `NoProxyFor`；Windows 的 `ProxyOverride` 没有 CIDR 语法，把 IPv4 网段展开成通配符模式（`10.0.0.0/8` → `10.*`；单条 `/1`、`/9`、`/17`、`/25` 网段最多展开到 128 条，没有上限），丢弃 IPv6 网段，IPv6 字面量加中括号 |
+| `exclude-simple-hostnames` | 布尔；默认 false | 全部 | 🟡 | 1 | Windows 写入 `ProxyOverride` 的 `<local>`（✅）；macOS 经 `networksetup` 没有对应的命令行选项，无法设置，`true` 时打一条 WARN 并忽略这一项，其余系统代理设置照常应用（阶段 6 评估改用 SystemConfiguration 框架直写）；Linux GNOME / KDE 均无对应项，同样忽略 |
 | `proxy-restricted-to-lan` | 布尔；默认 true | 全部 | 🟡 | 1 | rurge 按回环 / 私有 / 链路本地 / ULA 判定来源；手册为『当前子网』 |
 | `gateway-restricted-to-lan` | 布尔；默认 true | 全部 | ✅ | 7 | |
 | `external-controller-access` | `key@ip:port` | 全部 | 🔁 | 1 | Surge Dashboard 原生协议为专有协议；远程控制统一走 `http-api` |
@@ -188,7 +188,7 @@
 | --- | --- | --- | --- | --- |
 | `http-listen` | `[password@]address[:port]` 列表；默认端口 6152；多监听器 | 🟡 | 1 | 全平台可用；地址必须是 IP 字面量，IPv6 用 `[...]`；Basic 认证只比较密码，用户名任意（手册只给出 `[password@]address[:port]`）；两者都缺省时 rurge 仍在 `127.0.0.1:6152` / `6153` 监听，手册则是 `http-listen` 与 `socks5-listen` 都缺省则代理服务关闭；只配其一时与 Surge 一致：只开那一种 |
 | `socks5-listen` | `address[:port]` 列表；默认端口 6153；不支持密码 | 🟡 | 1 | 全平台可用；REJECT 时回 `0x02`（手册未说明） |
-| `set-system-socks-proxy` | 布尔；默认 true | ✅ | 1 | 随"设为系统代理"功能生效 |
+| `set-system-socks-proxy` | 布尔；默认 true | ✅ | 1 | 随"设为系统代理"功能生效；M4b 已实现——为 false 时 `ProxySettings.socks` 为空，各平台随之显式关闭该项：Windows 的 `ProxyServer` 不写 `socks=` 段；macOS 执行 `-setsocksfirewallproxystate <服务> off`；GNOME 把 `org.gnome.system.proxy.socks` 的 host/port 写为空串 / 0；KDE 删除 `socksProxy` 键 |
 | `read-etc-hosts` | 布尔；默认 true | 🟡 | 1 | 手册标注 Mac only；rurge 三平台生效（Win: `System32\drivers\etc\hosts`） |
 | `subnet-exp-wifi-always-match` | 布尔；默认 true | ✅ | 3 | |
 
@@ -801,7 +801,7 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | `mode` `global-policy` `policy-group` | 出站模式 / 全局策略 / 组选择与清除覆盖 | 同名 | 6 | |
 | `rule match` `rule explain` `rule temp`（Mac 6.9+） | 规则测试 / 解释 / 临时规则 | 同名 | 6 | 临时规则位于全部规则之前，停止时丢弃 |
 | `profile`（inspect / validate / list / switch / diff） | 配置管理 | 同名 | 6 | `profile diff` 显示模块叠加后的有效配置 |
-| `module` `feature` `managed-profile update` `external-resource` | 模块 / 功能开关 / 托管配置更新 / 外部资源 | 同名 | 6 | `feature` 覆盖 MITM、Rewrite、Scripting、HTTP Capture、Packet Capture、System Proxy、Enhanced Mode；Cellular Mode 🔁 |
+| `module` `feature` `managed-profile update` `external-resource` | 模块 / 功能开关 / 托管配置更新 / 外部资源 | 同名 | 6 | `feature` 覆盖 MITM、Rewrite、Scripting、HTTP Capture、Packet Capture、System Proxy、Enhanced Mode；Cellular Mode 🔁；系统代理的运行期 CLI 开关随 `feature` 命令在阶段 6 提供，阶段 1 先用启动参数 `--system-proxy` 或 `POST /v1/features/system_proxy`（M4b）代替，FR-IN-04 的「CLI」一项到 `feature` 落地前由这两个入口覆盖 |
 | `dns lookup` `dns trace` `flush dns` `geoip` `http probe` `test` `diagnostics` | 网络诊断 | 同名 | 6 | |
 | `dump summary/performance/rule-usage/virtual-ip` `watch speed` `log` `log watch` `logbook` `proxy-runtime-status` | 检视 | 同名 | 6 | |
 | `script list/run` `script-log` `benchmark encryption/rule-matching` `test-policy-bandwidth` | 自动化与基准 | 同名 | 6 | |
@@ -810,7 +810,7 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | rurge 扩展 | 查看运行中实例的状态：出站模式、全局策略、策略与规则计数、活动请求数、流量 | `rurge status [-c <conf>] [--remote host:port] [--key <key>] [--json]` | 1 | Surge 无对应命令；M4a 已实现，聚合 `GET /v1/outbound`、`/v1/outbound/global`、`/v1/policies`、`/v1/rules`、`/v1/requests/active`、`/v1/traffic`；`policies` 计数含 5 个内置策略；见 `docs/api/phase1.md` |
 | `environment` `set` `set-log-level` | 环境 | 同名 | 6 | |
 | Agent Skill（Mac 6.5+） | 面向 AI 代理的技能文档 | 🟡 | 6 | rurge 仓库可提供等价 skill 文档 |
-| rurge 专有 | 守护进程 | `rurge run -c <path> [--tun] [--system-proxy]`、`rurge service install/uninstall`、`rurge mitm ca generate/export` | 1 / 3 / 4 | |
+| rurge 专有 | 守护进程 | `rurge run -c <path> [--tun] [--system-proxy]`、`rurge service install/uninstall`、`rurge mitm ca generate/export` | 1 / 3 / 4 | `--system-proxy`（环境变量 `RURGE_SYSTEM_PROXY`）与 `rurge service install \| uninstall [--user] [--system-proxy] [--dry-run]` 已实现（M4b）；Windows 除 Ctrl-C 外，控制台关闭、注销、系统关机也会先恢复系统代理再退出；Windows 开机自启用登录时触发的计划任务（`schtasks /sc onlogon /f`，🟡，真正的 Windows 服务留到阶段 6），`--user` 在 Windows 上无实际区别（`schtasks` 不分用户 / 系统范围） |
 | rurge 专有开发命令 | 离线（不启动守护进程）在当前进程内构建配置并评估一次会话，用于调试规则与规则集 | `rurge rule match -c <conf> <host[:port]> [--explain] [--json] [--resolve <ip,...>\|--no-dns] ...` | 1 | 见 M2 设计文档 §10.1；阶段 6 的 `rule match`/`rule explain` 经 HTTP API 查询运行中的守护进程，语义一致但走线上实例 |
 | rurge 专有开发命令 | 离线按配置的 DNS 设置解析域名，`--server` 覆盖上游，`--trace` 打印每次尝试；`dns cache` 打印本进程缓存快照 | `rurge dns lookup -c <conf> <name> [--type a\|aaaa\|both] [--server <spec>...] [--no-cache] [--trace] [--json]`；`rurge dns cache -c <conf> [name...]` | 1 | 见 M2 设计文档 §10.2；阶段 6 的 `dns lookup` 经 HTTP API 查询守护进程 |
 | rurge 专有命令 | 前台运行 HTTP / SOCKS5 代理；出站模式初值来自 `--outbound-mode`（M4 起 `state.json` 优先）；`--log-level` 覆盖 `loglevel` | `rurge run -c <conf> [--outbound-mode direct\|proxy=<p>\|rule] [--log-level <l>] [--idle-timeout <secs>] [--request-log-size <n>] [--watch] [--log-file <path>]` | 1 | 见 M3 设计文档 §9.3；`--idle-timeout` / `--request-log-size` / `--watch` / `--log-file` 为 rurge 专有运行时选项（M3b，只经 CLI 参数 / 环境变量提供，不写入 Surge 配置）；`reload` / `stop` 命令仍依赖 M4 的控制通道，但 SIGHUP / `--watch` 的热重载已可用 |
@@ -822,10 +822,10 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | 端点 | 用途 | Surge 平台 | rurge | 阶段 | 备注 |
 | --- | --- | --- | --- | --- | --- |
 | `GET/POST /v1/features/mitm` `capture` `rewrite` `scripting` | 功能开关 `{"enabled":bool}` | 全部 | ✅ | 1 / 4 / 5 | 阶段 1（M4a）已实现：`GET` 恒返回 `false`，`POST` 恒 501；随 MITM / Capture / Rewrite（阶段 4）与 Scripting（阶段 5）各自落地后才真正生效 |
-| `GET/POST /v1/features/system_proxy` | 系统代理开关 | Mac only | ✅ | 1 | 阶段 1（M4a）已实现：`GET` 恒返回 `false`，`POST` 恒 501；M4b 接入 `rurge_platform::sysproxy` 后生效 |
+| `GET/POST /v1/features/system_proxy` | 系统代理开关 | Mac only | ✅ | 1 | M4b 已生效：`GET` 返回真实状态（`Control::system_proxy_enabled`）；`POST` 走 `Control::set_system_proxy`，成功 `{}`，失败 500 `{"error":"<原因>"}`。已知限制：Windows 只写 / 备份 `ProxyEnable`、`ProxyServer`、`ProxyOverride` 三个值，不处理 `AutoConfigURL`（PAC）——系统同时配置了 PAC 时可能仍优先用 PAC；某个值类型不对（如 `ProxyEnable` 不是 DWORD）会让 `snapshot` 报错退出。macOS 经 `networksetup` 逐个启用的网络服务设置，是否需要管理员账户未在真机验证（设计文档 Q2），标准账户下的拒绝文案由 rurge 原样传递；见上一行 `exclude-simple-hostnames` 的限制。Linux 仅 GNOME（`gsettings`）与 KDE（`kwriteconfig6`/`5`）两种桌面下生效，其它桌面不改动任何设置，`apply` 失败并给出 `export http_proxy=… https_proxy=… no_proxy=…` 提示（对应 `rurge run --system-proxy` 退出 1、这个端点返回 500） |
 | `GET/POST /v1/features/enhanced_mode` | 增强模式开关 | Mac only | ✅ | 3 | 阶段 1（M4a）已实现：`GET` 恒返回 `false`，`POST` 恒 501；阶段 3（TUN）落地后生效 |
 | `GET/POST /v1/outbound` | `{"mode":"direct"\|"proxy"\|"rule"}` | 全部 | ✅ | 1 | |
-| `GET/POST /v1/outbound/global` | 全局模式策略 | 全部 | 🟡 | 1 | M4a 已实现；出站模式与全局策略持久化到 `state.json`，显式 `--outbound-mode` 覆盖并写回（不校验策略是否存在）；`proxy` 模式下全局策略缺失或已不存在（如重载后）→ 按规则模式处理并 WARN 一次 |
+| `GET/POST /v1/outbound/global` | 全局模式策略 | 全部 | 🟡 | 1 | M4a 已实现；出站模式与全局策略持久化到 `state.json`，显式 `--outbound-mode` 覆盖并写回（不校验策略是否存在）；`proxy` 模式下全局策略缺失或已不存在（如重载后）→ 按规则模式处理并 WARN 一次；`proxy` 模式下用空串清空全局策略 → 400（与 `POST /v1/outbound` 切换模式时的校验对称，M4b） |
 | `GET /v1/policies` | 列出策略 | 全部 | 🟡 | 1 | M4a 已实现；JSON 结构手册未定义，暂定结构见 `docs/api/phase1.md`，阶段 6 对齐真实 Surge |
 | `GET /v1/policies/detail?policy_name=` | 策略详情 | 全部 | ✅ | 2 | |
 | `POST /v1/policies/test` | `{"policy_names":[...],"url":...}` | 全部 | ✅ | 2 | |

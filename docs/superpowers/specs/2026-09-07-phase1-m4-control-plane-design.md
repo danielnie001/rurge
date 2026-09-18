@@ -300,3 +300,31 @@ M4a 已实现（分支 `m4a-control-plane`）；下面记录实施期与 §4–�
 - **§7 的 `status` 样例块是示意，不是逐字期望**：真实输出对小于 1024 的速度用 `B/s`（`out 614 B/s`），样例里的 `out 0.6 KiB/s` 不是实现会打印的形式；`policies` / `rules` / `active requests` 的数字同样只是示意。逐字断言以 `crates/rurge/src/cli/control.rs` 的 `status_text_matches_the_design` 测试为准。
 - **`rurge-api` 直接读 `Runtime` 的字段，没有专门的引擎视图**（§4.3）：`routes/dns.rs` 读 `engine.runtime().stack.resolver` 与 `config.general.internet_test_url`，`routes/profiles.rs` 读 `config.source.main`。§4.3 设想的是每个端点一个只读视图方法；实施期沿用了已有的 `runtime()`，把视图收敛留到 M4b（届时 `rurge-api` 也就不必知道 `Runtime` 的内部结构）。
 - **脱敏名单以 `crates/rurge-config/src/redact.rs` 为准**：独立密钥行 `password` / `ca-passphrase` / `ca-p12` / `private-key` / `psk` / `pre-shared-key` / `token`；内联参数 `password` / `psk` / `private-key` / `pre-shared-key` / `base64` / `token` / `uuid` / `username`；`http-api` / `external-controller-access` / `http-listen` / `socks5-listen` 的 `key@` 前缀与 `wifi-access-http-auth` 口令；`http` / `https` / `socks5` / `socks5-tls` 策略行第 4 个起、首个 `=` 之后为空或全是 `=` 的 token。名单以外不脱敏；本节上文那条「`config_text` 的脱敏面比 §4.3 描述的更宽」记的是 M4a 初版名单，以本条为准（`docs/api/phase1.md` 与兼容性清单同步）。
+
+## 15. M4b 实施备注
+
+M4b 已实现（分支 `m4b-platform`）；下面先列本计划「计划期决定」表（P1–P11，`docs/superpowers/plans/2026-09-18-phase1-m4b-platform-plan.md` 开头）与 §8 / §5.2 / §8.3 设计文字的出入，逐条一句话，再记执行期的其它裁定与已知限制。不回填修改 §1–§13，一律以本节、上述计划与代码为准。
+
+**P1–P11（计划期决定，对照 §8）**
+
+- **P1 `unsafe_code`**（§8.1 未提及如何与 workspace 的 `forbid` 共存）：`rurge-platform` 改用 crate 自己的 `[lints] unsafe_code = "deny"`，只有 `sysproxy::windows::notify_wininet`（调用 `InternetSetOptionW`）标 `#[allow(unsafe_code)]` 并附 SAFETY 注释；其余 crate 不变，仍是 workspace 的 `forbid`。
+- **P2 注册表 API**：用 `windows-registry` 0.6（安全 API，已经由 `ipconfig` 带进依赖图），不是 §8.1 表格写的 `winreg`；注册表部分因此不需要 `unsafe`。
+- **P3 通配地址换回环**：`0.0.0.0` → `127.0.0.1`、`::` → `::1`，按监听地址的**族**选回环（复用 `cli::control::connect_addr`），不是 §8.1「一律用 `127.0.0.1`」；Windows 上 `[::]` 默认只监听 v6，`127.0.0.1` 连不上。
+- **P4 KDE 探测**：要求 `XDG_CURRENT_DESKTOP` 含 `KDE` **且**同时有 `kwriteconfig6`/`kreadconfig6`（退而求其次 `5`），细化 §8.1「`kwriteconfig6` 可用」——只看工具是否存在会在其它桌面上误写 `kioslaverc` 却报告成功。
+- **P5 端到端测试用真实二进制 + 文件后端**：`RURGE_SYSTEM_PROXY_BACKEND=file:<path>` 让 `rurge run` 把「系统代理」读写到一个 JSON 文件，未知取值直接报错退出；CLI 测试给每一个启动的守护进程都设这个变量（`crates/rurge/tests/cli.rs` 的 `guard_system_proxy`，覆盖到全部 `rurge run` 调用点）。§9 原本设想的是纯 mock 单元测试，实际还加了一层文件后端的真实进程测试，专门覆盖崩溃恢复这类只有真实二进制才能验证的生命周期。
+- **P6 Windows 退出信号**：除 Ctrl-C 外，控制台关闭、注销、系统关机（`ctrl_close` / `ctrl_logoff` / `ctrl_shutdown`）也会先恢复系统代理再退出，§8.2 的生命周期文字未列出这三种；这三种事件下进程仍有几秒钟窗口。
+- **P7 `--dry-run`**：`rurge service install / uninstall` 多一个 `--dry-run`，只打印将写的文件与将执行的命令，不改变任何东西；§8.3 未提及，为了让 CLI 可端到端测试，也方便用户在需要权限的操作前先看清计划。
+- **P8 `schtasks /f`**：Windows 的 `schtasks /create` 追加 `/f`，细化 §8.3 的命令；任务已存在时 `schtasks` 会交互式询问是否覆盖，非交互环境（CLI 测试与大多数部署脚本）会直接挂住。
+- **P9 macOS 无法设置 Exclude simple hostnames**：`networksetup` 没有对应的命令行选项；`exclude-simple-hostnames = true` 时打一条 WARN 并忽略这一项，其余设置照常应用；§8.1 未提及，已登记进兼容性清单，SystemConfiguration 直写留到阶段 6 评估。
+- **P10 `POST /v1/features/system_proxy` 的失败一律 500**：M4a 靠字符串 `"not implemented"` 判断是否回 501 的临时分支已删除；M4b 起这个功能已实现，任何失败（不支持的 Linux 桌面、macOS 权限不足等）都属于「应用失败」，按 §5.2 / §8.2 的既有约定回 500 并带原因。
+- **P11 两条 M4a 延后事项顺带处理**：`POST /v1/outbound/global {"policy":""}` 在 `proxy` 模式下现在也回 400（此前只有 `POST /v1/outbound` 切换模式那一侧校验，两侧不对称）；`Engine` 新增 `resolver()` / `internet_test_url()` / `profile_path()` 三个只读视图，`rurge-api` 的 `routes/dns.rs` 与 `routes/profiles.rs` 不再直接读 `Runtime` 的内部字段——这是 §14「`rurge-api` 直接读 `Runtime` 的字段，没有专门的引擎视图」记录的临时状态，本节予以关闭。
+
+**执行期的其它裁定**
+
+- **重载后没有可用监听器时不关闭系统代理**（细化 §8.2「重载后监听地址变化…→ 重新 `apply`」，未覆盖「重载后完全没有监听器」这个情形）：如果系统代理开着、且当前一批监听器算不出任何可以指的地址（`current_settings` 返回 `None`，通常是重绑监听器失败清空了列表），rurge 不会顺带关掉系统代理——那等于替用户做了一次「改直连」的路由决定——而是打一条 WARN 说明系统仍指向旧地址，等下一次重载成功或者进程退出再恢复。重载失败但仍保留旧监听器的那几种情形（配置解析失败、构建 `Runtime` 失败——这两者都发生在换代之前）不属于这个情形，不会多打日志。
+
+**已知限制**
+
+- **Windows 不处理 `AutoConfigURL`（PAC）**：`snapshot` / `apply` / `restore` 只读写备份 `ProxyEnable`、`ProxyServer`、`ProxyOverride` 三个值；如果系统同时配置了自动代理脚本（`AutoConfigURL`），多数应用会优先用 PAC，rurge 写的手动代理可能形同虚设。已登记进 `docs/surge-compatibility-matrix.md`。某个值类型不对（例如 `ProxyEnable` 是字符串而不是 DWORD）会让 `snapshot()` 报错退出，属于同一类限制。
+- **`state.json` 的持久化是尽力而为**（§4.2 未展开）：`StateStore::update` 把内存态原子写盘（临时文件 + rename），写失败只记 ERROR 日志、不影响调用方，也不调用 `fsync`。「开启系统代理前先把备份落盘，这样崩溃后还能恢复」这条不变量在磁盘写入失败或掉电时并不成立，只是尽力而为。
+- **Q2（macOS `networksetup` 是否需要管理员权限）未在真机验证**：本分支的自动化测试全部经 `FakeRunner`，没有真的调用过 `networksetup`；是否需要 `sudo`、标准账户下的报错原文，都列进了 `docs/acceptance/phase1-manual.md` 手工验收清单的第 8 项，作为 M4b 收尾前需要真机确认的开放项，结果回填该清单而不是本节。

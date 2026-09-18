@@ -8,7 +8,7 @@ rurge 是用 Rust 复刻 Surge（macOS / iOS 网络代理工具）全部功能�
 
 ## 当前状态（2026-09）
 
-阶段 1 进行中。M1、M2a、M2b、M3a、M3b、M4a 已完成：Cargo workspace、`rurge-config`（解析全部 Surge 语法为强类型 `Config` + 诊断）、`rurge check`、`rurge-net`（连接器 / 内部 HTTP 客户端 / 外部资源管理器）、`rurge-rules`（域名 / IP 索引、规则集、GeoIP / ASN、规则引擎）、`rurge rule match`（离线规则匹配开发命令）、`rurge-dns`（UDP / TCP / DoT / DoH 上游、并发查询与重试、缓存、`[Host]` 链、系统 hosts）、`rurge-platform::dns`、`rurge dns lookup`、`rurge-proto`（`Outbound` 抽象、DIRECT / REJECT）、`rurge-policy`（策略注册表）、`rurge-inbound`（HTTP / SOCKS5 监听）、`rurge-engine`（会话流水线）、`rurge run`（前台代理，DIRECT / REJECT 分流）；M3b 新增可中断带空闲超时的 relay（`--idle-timeout`）、优雅退出、请求记录与流量统计（`--request-log-size`）、SNI 记录（观测用）、REJECT 30 s/50 次自动升级 REJECT-DROP、CONNECT 连接失败 502、热重载（SIGHUP / `--watch`）、`--log-file` 按天滚动、`encrypted-dns-follow-outbound-mode`；M4a 新增 `rurge-api`（axum 服务，Surge 兼容 HTTP API 阶段 1 端点，`X-Key` 鉴权与失败封禁）、`StateStore`（`state.json` 异步原子写入）、引擎运行期出站模式 / 全局策略覆盖（持久化）、`Control` 命令通道、`rurge reload` / `stop` / `status`。M4b（系统代理、服务安装）未开始。
+阶段 1 已完成（M1 ～ M4b）。M1、M2a、M2b、M3a、M3b、M4a：Cargo workspace、`rurge-config`（解析全部 Surge 语法为强类型 `Config` + 诊断）、`rurge check`、`rurge-net`（连接器 / 内部 HTTP 客户端 / 外部资源管理器）、`rurge-rules`（域名 / IP 索引、规则集、GeoIP / ASN、规则引擎）、`rurge rule match`（离线规则匹配开发命令）、`rurge-dns`（UDP / TCP / DoT / DoH 上游、并发查询与重试、缓存、`[Host]` 链、系统 hosts）、`rurge-platform::dns`、`rurge dns lookup`、`rurge-proto`（`Outbound` 抽象、DIRECT / REJECT）、`rurge-policy`（策略注册表）、`rurge-inbound`（HTTP / SOCKS5 监听）、`rurge-engine`（会话流水线）、`rurge run`（前台代理，DIRECT / REJECT 分流）；M3b 新增可中断带空闲超时的 relay（`--idle-timeout`）、优雅退出、请求记录与流量统计（`--request-log-size`）、SNI 记录（观测用）、REJECT 30 s/50 次自动升级 REJECT-DROP、CONNECT 连接失败 502、热重载（SIGHUP / `--watch`）、`--log-file` 按天滚动、`encrypted-dns-follow-outbound-mode`；M4a 新增 `rurge-api`（axum 服务，Surge 兼容 HTTP API 阶段 1 端点，`X-Key` 鉴权与失败封禁）、`StateStore`（`state.json` 异步原子写入）、引擎运行期出站模式 / 全局策略覆盖（持久化）、`Control` 命令通道、`rurge reload` / `stop` / `status`。M4b 新增 `rurge_platform::sysproxy`（`SystemProxy` trait；Windows 注册表 + WinINet 通知、macOS `networksetup`、Linux GNOME `gsettings` / KDE `kwriteconfig` + 其它桌面的环境变量提示三个后端）、`rurge_platform::service`（systemd / launchd / `schtasks` 的安装 / 卸载计划与执行器）、bin 侧 `SystemProxyManager`（快照 / 备份 / 应用 / 退出与崩溃恢复 / 重载跟随，经 `RURGE_SYSTEM_PROXY_BACKEND` 可切到测试用文件后端）、`Control::system_proxy_enabled` 与 `/v1/features/system_proxy`（读真实状态、失败 500）、`rurge run --system-proxy`、`rurge service install / uninstall [--dry-run]`。
 
 ## 先读这些文档
 
@@ -22,9 +22,11 @@ rurge 是用 Rust 复刻 Surge（macOS / iOS 网络代理工具）全部功能�
 - `docs/superpowers/specs/2026-09-05-phase1-m3-pipeline-design.md`：M3 设计文档。四个 crate（`rurge-proto` / `rurge-policy` / `rurge-inbound` / `rurge-engine`）的接口、dial 流水线、REJECT 语义、`state.json`、`rurge run`。
 - `docs/superpowers/plans/2026-09-05-phase1-m3a-pipeline-plan.md`：M3a 实施计划。末尾「执行期修正记录」与「延后事项」同 M2a。
 - `docs/superpowers/plans/2026-09-06-phase1-m3b-operability-plan.md`：M3b 实施计划。末尾「执行期修正记录」与「延后事项」同 M2a。
-- `docs/superpowers/specs/2026-09-07-phase1-m4-control-plane-design.md`：M4 设计文档。控制面（M4a：`rurge-api`、`StateStore`、`Control` trait、`rurge reload/stop/status`）与平台集成（M4b：系统代理、服务安装）的接口与语义；第 14 节记录 M4a 实施期与设计的偏差。
+- `docs/superpowers/specs/2026-09-07-phase1-m4-control-plane-design.md`：M4 设计文档。控制面（M4a：`rurge-api`、`StateStore`、`Control` trait、`rurge reload/stop/status`）与平台集成（M4b：系统代理、服务安装）的接口与语义；第 14 节记录 M4a、第 15 节记录 M4b 实施期与设计的偏差。
 - `docs/superpowers/plans/2026-09-07-phase1-m4a-control-plane-plan.md`：M4a 实施计划（9 个任务）。末尾「执行期修正记录」与「延后事项」同 M2a。
-- `docs/api/phase1.md`：阶段 1 HTTP API 参考——端点、JSON 形状、鉴权与封禁、`rurge reload/stop/status` 客户端。
+- `docs/superpowers/plans/2026-09-18-phase1-m4b-platform-plan.md`：M4b 实施计划（9 个任务）。开头「计划期决定」表（P1–P11）记录与设计文档文字的出入；末尾「执行期修正记录」与「延后事项」同 M2a。
+- `docs/acceptance/phase1-manual.md`：阶段 1 系统代理（三平台）与 `rurge service install/uninstall` 的手工验收清单，需要真实桌面环境，不能被自动化测试覆盖。
+- `docs/api/phase1.md`：阶段 1 HTTP API 参考——端点、JSON 形状、鉴权与封禁、系统代理的地址 / `skip-proxy` 转换 / 生命周期、`rurge reload/stop/status` 客户端。
 - `README.md`：中英双语，对外的状态、特性表与路线图，必须与 PRD 保持一致。
 
 ## 工作流约定
@@ -41,6 +43,7 @@ rurge 是用 Rust 复刻 Surge（macOS / iOS 网络代理工具）全部功能�
 - 依赖方向（M2 设计文档确认）：`rurge-dns → rurge-rules → rurge-net → rurge-config`；`[Host]` 集合键与 `LazyResolver` 都由 `rurge-dns` 依赖 `rurge-rules` 提供，而非并列关系；`rurge (bin) → rurge-engine → { rurge-inbound → rurge-proto, rurge-policy → rurge-proto, rurge-dns }`。M4 设计文档确认：`rurge (bin) → rurge-api → rurge-engine`；`rurge-api` 依赖 `rurge-engine` / `rurge-config`（`rurge-dns` 的类型经 `rurge-engine` 间接可达，不需要直接依赖），不依赖 `rurge-platform`，也不认识 bin。
 - 连接处理流水线（PRD 3.3）：入站 → 协议嗅探（SNI / Host / QUIC / STUN）→ 预匹配 → 出站模式判断 → 规则匹配（域名规则不触发 DNS，IP 规则按需解析）→ 策略解析（组 / 链式 / 别名）→ 出站建立 → HTTP 引擎（MITM → Header Rewrite → URL Rewrite → Body Rewrite → 脚本 → Map Local 短路）→ 观测。
 - 配置对象不可变，重载时原子切换（AR-04）；每个连接是独立 tokio 任务（AR-03）。
+- `unsafe_code`：全工作区 `forbid`；只有 `rurge-platform` 用 crate 自己的 `[lints] unsafe_code = "deny"` 放宽，且仅 `sysproxy::windows` 里调用 `InternetSetOptionW` 通知 WinINet 的那一个函数标 `#[allow(unsafe_code)]`（M4b）。
 
 ## 常用命令
 
@@ -58,7 +61,11 @@ cargo run -p rurge -- dns lookup -c config.conf example.com --trace    # 离线 
 cargo bench -p rurge-dns                        # criterion 基准（DNS 缓存命中）
 cargo run -p rurge -- run -c config.conf --log-level info   # 前台运行 HTTP / SOCKS5 代理（Ctrl-C 退出）
 cargo run -p rurge -- run -c config.conf --watch --log-file rurge.log   # 加配置热重载（SIGHUP / --watch）与滚动日志文件
+cargo run -p rurge -- run -c config.conf --system-proxy   # 前台运行并把系统代理指向 rurge，退出 / 崩溃后自动恢复
 cargo run -p rurge -- status -c config.conf     # 查看运行中实例的状态（reload / stop 同样支持 -c 或 --remote/--key）
+cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印开机自启的安装计划（去掉 --dry-run 才真正写入 / 执行）
 ```
+
+`RURGE_SYSTEM_PROXY_BACKEND=file:<path>` 把系统代理的读写重定向到一个 JSON 文件，是仅供自动化测试使用的后端（未知取值会报错退出），不要在正常使用中设置它。
 
 `Cargo.lock` 需要提交（`.gitignore` 已注明）。

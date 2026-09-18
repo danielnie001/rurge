@@ -3925,11 +3925,79 @@ EOF
 
 | 任务 | 偏差 | 原因 |
 | --- | --- | --- |
-| | | |
+| Task 1 | Windows 注册表临时键测试改为自清理：使用前先 `remove_tree`（容忍不存在）并加一个 `Drop` 守卫，不是计划原文那个只在断言全部通过时才清理的版本 | 评审（opus）标为 Important：原测试体在断言失败时会把 `HKCU\Software\rurge-test-<pid>` 留下来，PID 被系统回收复用后下一次跑会在第一条断言就失败，形成除非手工清理否则不会自愈的死循环；裁定改为自清理（test-only，无生产代码风险） |
+| Task 4 | 实现者子代理的提交按自己会话的 `Co-Authored-By` 具名（`Claude Sonnet 5`），未使用计划文本里的 `Claude Fable 5.1`；`Claude-Session` 行仍是本次 M4b 会话的 URL | 裁定：subagent 的归属信息以其自身会话的系统提醒为准，优先于计划文本里复制的归属行；不改写历史（本地提交，`Co-Authored-By` 具名不一致但无实质影响） |
+| Task 4 | `systemd_quote` 的测试补一条真实反斜杠与转义顺序的断言（`a\"b` → `"a\\\"b"`；Windows 风格路径的每个 `\` 各自翻倍）；`execute()` 在 `create_dir_all` 失败时也像同一函数里 write / remove 的错误那样把目录路径带进错误信息 | 评审（sonnet）标为 2 个 Important、判定为计划已隐含要求：计划原文给的 `systemd_quote` 样例没有反斜杠，顺序敏感的转义替换因此没有测试守住；`create_dir_all` 的错误缺少路径上下文，与同函数里其它错误路径不一致 |
+| 附带（非计划任务，Task 4 质量门期间发现） | M4a 遗留的测试 `rurge-engine` 的 `observe::tests::snapshot_bytes_is_consistent_while_sessions_finish_concurrently` 偶发失败（exit 101），提交 `ae9e2e2` 作为分支内的附带修复：读者线程首次读完成后再放行 4 个 finisher 线程开始结束会话，30/30 稳定 | 分析认定锁本身没问题，唯一对调度敏感的断言是 `assert!(reads > 0)`——机器负载高时 4 个 finisher 线程可能在读者线程跑第一次迭代前就把 64 次琐碎操作全部做完并让 `stop` 提前置位；这个 flaky 门禁会拖累后续每个任务的质量门，裁定在本分支内顺手修掉（test-only，仅 1 个文件，随分支一起接受最终评审） |
+| Task 5 → Task 8 | 生命周期新增一条设计文档 §8.2 未覆盖的规则：重载后如果没有任何可用监听器而系统代理仍是开启状态，rurge 不会自动关闭系统代理，只打一条 WARN；Task 8 实现与评审阶段把触发条件从「任意重载失败」收紧为「系统代理开着且当前监听器算不出任何可用地址」 | Task 5 裁定：静默关闭代理等于替用户做了一次路由决定，保留旧设置直到下一次成功重载或退出更安全。Task 8 评审（opus）指出原措辞在「重载失败但仍保留旧监听器」的三种情形（配置解析失败、构建 `Runtime` 失败，均发生在换代之前）里会误报——那些情形下地址并未失效；收紧条件更准确 |
+| Task 8 | P5（每个由 CLI 测试启动的 `rurge run` 都必须带 `RURGE_SYSTEM_PROXY_BACKEND` 文件后端）收进一个共用的 `guard_system_proxy` 辅助函数，并补齐到 `cli.rs` 里两处原先绕过它的直接调用 | 评审（opus）指出这两处调用虽然当时无害（在触达 `backend()` 之前就已退出），但仍是 Global Constraints 明确禁止的测试安全漏洞；一并补一个系统代理开启失败的端到端测试（不可写的 `file:` 路径 → 退出 1、stderr 有消息、状态回滚），并把等待逻辑改成先等 `system proxy restored` 这一行再等进程退出，避免读取线程滞后于 `try_wait` |
+| Task 7 | `/v1/test/dns_delay` 分两次快照分别读 `internet_test_url()` 与 `resolver()`（P11 落地时新增的两个引擎视图），评审指出重载恰好夹在两次读之间时可能用旧的默认域名去配一个新的 resolver | 裁定维持现状：两代之间不存在「域名必须与 resolver 同代」这种不变量（只是一个诊断端点，两次读之间没有 `await`，任何一代的默认域名对任何一代的 resolver 都是合法输入）；把两次读合并成一个视图会让 `rurge-api` 重新依赖 `Runtime` 的内部形状，这正是 P11 要解除的耦合 |
 
 ## 延后事项
 
 （执行时填写：审查中发现但不在 M4b 范围内的问题，带去向——阶段 2 / 阶段 6。）
 
-- （空）
+去向的四个桶：**本分支最终评审**（留给合并前的全分支评审判断是否要修）、**阶段 2**、**阶段 6**、**手工验收**（`docs/acceptance/phase1-manual.md`）。已经在 Task 10 里直接处理完（写进设计文档 §15 或兼容性清单）的项目单独标注，不再是待办。
+
+**Task 1（`rurge_platform::sysproxy` 核心类型与 Windows 后端）**
+
+- `FakeRegistry`（测试替身）把值类型不对的情形映射成"不存在"，而 `RealRegistry` 会返回一个错误（`ERROR_INVALID_DATA`）——例如 `ProxyEnable` 实际是 `REG_SZ` 时，`snapshot()` 会报错退出而不是当成缺失处理。去向：已在设计文档 §15「已知限制」与兼容性清单 `/v1/features/system_proxy` 行登记，不再是待办。
+- `restore()` 把任何反序列化失败都统一归类成"wrong platform"，掩盖了真正的错误原因（消息质量）。去向：本分支最终评审。
+- `delete()` 在键不存在时会先用 `create()` 打开（进而创建该键）再删值。去向：本分支最终评审。
+- 注册表相关的 `io::Error` 一律是 `ErrorKind::Uncategorized`（HRESULT 被当成原始 os error），调用方无法按 `kind()` 分支处理。去向：本分支最终评审。
+- CIDR 前缀展开表只测试了部分前缀长度（缺 `/1`–`/7`、`/17`–`/23` 与主机位非零的情形；人工验算结果正确，但没有落成用例）。去向：本分支最终评审。
+- 单条 `/1`、`/9`、`/17` 或 `/25` 的 `skip-proxy` 网段会展开成 128 条 `ProxyOverride` 通配模式，没有上限。去向：已在兼容性清单 `skip-proxy` 行与 `docs/api/phase1.md` 登记，不再是待办。
+- `<local>` 追加时未去重；条目内如果出现字面 `;` 会把 `ProxyOverride` 意外拆成多段。去向：本分支最终评审。
+- `NOT_FOUND` 常量的 `#[cfg(windows)]` 写在文档注释之前，与 `RealRegistry` 的顺序不一致（纯风格问题）。去向：本分支最终评审。
+- `apply()` 不清除也不备份 `AutoConfigURL`（PAC）。去向：已在兼容性清单与设计文档 §15 登记为已知限制，不再是待办。
+
+**Task 2（命令执行抽象与 macOS 后端）**
+
+- `restore()` 里显式的 `platform != "macos"` 检查只有在 `services` 字段存在时才可达，现有测试走的是反序列化失败（`map_err`）那条路径。去向：本分支最终评审。
+- `networksetup` 输出解析的测试缺少"内部/尾部空行"的用例。去向：本分支最终评审。
+- `apply_commands` 没有 IPv6 地址的用例。去向：本分支最终评审。
+- 没有测试验证 `exclude_simple = true` 时其余设置仍会正常应用（只是 WARN 并跳过这一项）。去向：本分支最终评审。
+- `SystemRunner` 在 stderr 为空、回退用 stdout 拼错误信息的分支未测（测试不跑真实工具）。去向：本分支最终评审。
+- macOS 真机上 `networksetup` 的真实输出与权限要求无法离线验证。去向：手工验收（`docs/acceptance/phase1-manual.md` 第 1、8 条）。
+
+**Task 3（Linux 系统代理后端与 `platform()`）**
+
+- GNOME 空数组 `@as []` 的断言只按整行拼接字符串比较，没有按参数下标断言（拆分 argv 的话测试仍会通过）。去向：本分支最终评审。
+- `tool_on_path` 只看 `PATH` 上是否有同名文件，不检查可执行位。去向：本分支最终评审。
+- `env_hint` 在 http/https/bypass 都为空时返回 `"export "`（尾部带空格但没有变量）。去向：本分支最终评审。
+- 损坏的 Linux 备份统一报"wrong platform"，其中显式的桌面平台检查分支未测。去向：本分支最终评审。
+- 测试 `kde_apply_writes_kioslaverc_and_tells_kio` 里对 dbus 调用的断言写在了函数末尾而不是紧邻处，命名与断言位置不完全对应（测试卫生）。去向：本分支最终评审。
+- 测试覆盖缺口：GNOME 下 IPv6 主机、KDE 在 restore 时找不到工具、`XDG_CURRENT_DESKTOP` 大小写变体。去向：本分支最终评审。
+- `platform()` 对非 windows / 非 unix 目标没有 `compile_error!`，会在不支持的目标上给出较难懂的编译错误而不是明确提示。去向：本分支最终评审。
+
+**Task 4（`rurge service` 安装 / 卸载计划与执行器）**
+
+- `--system-proxy` 被省略时的行为只在 systemd 分支断言，没有对 launchd / schtasks 分别断言。去向：本分支最终评审。
+- `execute()` 卸载测试里"文件本来就不存在"的分支没有单独区分（该测试的 `first_error` 已经被前面失败的命令占了），需要一个独立的、只测"文件缺失也算成功"的用例。去向：本分支最终评审。
+- `launchd_domain` 在 `Scope::System` 且传了 `Some(uid)` 的组合没有测试（虽然此时实现会忽略 `uid`）。去向：本分支最终评审。
+
+**Task 5（`SystemProxyManager` 生命周期、`proxy_settings` 与文件后端）**
+
+- `apply` 失败且回滚 `restore` 也失败的双重失败路径：内存态 `applied`/`flag` 变回 false，但 `state.json` 的 `features.system_proxy` 仍是 true（下次 `disable`/`recover` 会自愈）；这条分支没有测试，代码里也没写注释说明。去向：本分支最终评审。
+- `StateStore::update` 只记录写失败、不做 `fsync`，"开启前先把备份落盘"只是尽力而为，不保证掉电场景。去向：已写入设计文档 §15「已知限制」与 `docs/api/phase1.md` 系统代理一节，不再是待办。
+- 被丢弃的取反 / `<…>` 形式的 `skip-proxy` 条目没有留日志（哪怕是 debug 级别）。去向：本分支最终评审。
+- 从未开启过的 manager 调用一次 `disable()` 仍会写一次 `state.json`（无害但可以省掉）。去向：本分支最终评审。
+- `FileBackend` 的测试没有断言 `https` / `exclude_simple` 字段；`bypass_list` 没有 IPv6 CIDR 的用例；`describe()` 单一 kind（只 http 或只 socks）的形式没有测试。去向：本分支最终评审。
+
+**Task 6（`/v1/features/system_proxy` 接通 `Control`）**
+
+- `LoopControl` 里临时的 `system_proxy_enabled` / `set_system_proxy` 桩实现没有留"等 Task 8 替换"的注释。去向：已随 Task 8 替换为真实实现而失效，不再是待办。
+
+**Task 8（`rurge run --system-proxy` 集成）**
+
+- `applied().map(describe).unwrap_or_default()` 有一个实际不可达的空字符串分支。去向：本分支最终评审。
+- `cfg` 风格不统一：`ShutdownSignals` 用 `#[cfg(windows)]`，别处的打印用的是 `#[cfg(not(unix))]`。去向：本分支最终评审。
+- 恢复失败时打印到 stderr 的那条消息没有测试覆盖。去向：本分支最终评审。
+- 系统代理开启失败的端到端测试只在子进程退出之后才读取它的 stdout/stderr 管道（有 20 秒强杀兜底，输出量本来就只有几行，风险不大）。去向：本分支最终评审。
+
+**Task 9（`rurge service install / uninstall` CLI）**
+
+- dry-run 的安全性只靠一处 `if dry_run` 判断把关，没有"注入假 runner 后断言真实命令未被调用"的测试；如果这处判断回归，会在测试的 trailer 断言失败之前先真的执行一次系统命令。去向：本分支最终评审（建议优先修）。
+- 非 dry-run 的成功 / 执行失败提示文本（`installed: …`、`uninstalled`、失败时的 `error: …`）没有自动化测试，因为执行真实的 `systemctl` / `launchctl` / `schtasks` 违反测试规则。去向：手工验收（`docs/acceptance/phase1-manual.md` 第 7 条）。
+- 相对路径的 `-c` 没有自动化测试。去向：本分支最终评审。
 

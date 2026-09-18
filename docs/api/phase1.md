@@ -1,6 +1,6 @@
 # rurge HTTP API（阶段 1）
 
-rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surge 兼容的 HTTP API。本页记录阶段 1（M4a）实现的端点与 rurge 暂定的 JSON 结构；手册未定义的结构在阶段 6 与真实 Surge 对齐时可能调整（见 `docs/surge-compatibility-matrix.md` 第 10.4 节）。
+rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surge 兼容的 HTTP API。本页记录阶段 1（M4a / M4b）实现的端点与 rurge 暂定的 JSON 结构；手册未定义的结构在阶段 6 与真实 Surge 对齐时可能调整（见 `docs/surge-compatibility-matrix.md` 第 10.4 节）。
 
 ## 鉴权与错误
 
@@ -17,7 +17,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 | GET | `/v1/outbound` | | `{"mode":"direct"\|"proxy"\|"rule"}` |
 | POST | `/v1/outbound` | `{"mode":…}` | `{}`；`proxy` 且未设全局策略 → 400 |
 | GET | `/v1/outbound/global` | | `{"policy":"<name>"\|null}` |
-| POST | `/v1/outbound/global` | `{"policy":"<name>"}`（空串清除） | `{}`；未知策略 → 400 |
+| POST | `/v1/outbound/global` | `{"policy":"<name>"}`（空串清除） | `{}`；未知策略 → 400；出站模式为 `proxy` 时用空串清空 → 400（先切到 direct / rule） |
 | GET | `/v1/policies` | | `{"proxies":[…5 个内置策略 + 配置策略],"policy-groups":[…]}` |
 | GET | `/v1/rules` | | `{"rules":[{"index":0,"rule":"DOMAIN,…","hits":3}]}` |
 | GET | `/v1/requests/recent?limit=N` | 默认 100；上限是 `--request-log-size` 的环形缓冲容量；`limit=0` → 400 `limit must be at least 1` | `{"requests":[Request…]}`（最新在前） |
@@ -31,8 +31,8 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 | POST | `/v1/profiles/reload` | | `{"ok":true,"errors":0,"warnings":1,"listenersRebound":false}`；解析失败或构建 `Runtime` 失败时 `ok:false`，运行中的配置不变；重绑监听器失败时也是 `ok:false`，但新配置这时已经生效，只是监听器归零，直到下一次重载成功为止（下一次重载会无条件重试绑定） |
 | POST | `/v1/profiles/check` | | `{"ok":…,"errors":N,"warnings":N,"diagnostics":[Diagnostic…]}`（校验磁盘上的当前配置，不影响运行；`Diagnostic` 与 `rurge check --json` 相同） |
 | POST | `/v1/log/level` | `{"level":"verbose"\|"debug"\|"info"\|"notify"\|"warning"\|"error"}` | `{}` |
-| GET | `/v1/features/{system_proxy\|enhanced_mode\|mitm\|capture\|rewrite\|scripting}` | | `{"enabled":false}` |
-| POST | `/v1/features/{name}` | `{"enabled":bool}` | 501（`system_proxy` 在 M4b 生效） |
+| GET | `/v1/features/{system_proxy\|enhanced_mode\|mitm\|capture\|rewrite\|scripting}` | | `system_proxy` 返回真实状态 `{"enabled":bool}`；其余恒 `{"enabled":false}` |
+| POST | `/v1/features/{name}` | `{"enabled":bool}` | `system_proxy`：成功 `{}`；失败 500 `{"error":"<原因>"}`（例如不支持的 Linux 桌面会带 `export http_proxy=…` 提示）；其余功能 501 |
 | GET | `/v1/modules` | | `{"enabled":[],"available":[]}` |
 | GET | `/v1/scripting` | | `{"scripts":[]}` |
 | GET | `/v1/events` | | `{"events":[]}` |
@@ -63,6 +63,16 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 ```
 
 `expiresTime` 与 `startTime` 同单位（Unix 秒，`f64`）；条目没有剩余 TTL 信息时为 `null`。
+
+## 系统代理
+
+M4b 起 `system_proxy` 已生效（见上面「端点」表）；这里记录地址取值、`skip-proxy` 转换与生命周期。
+
+- **地址**：http / https 取第一个 `http-listen`；`set-system-socks-proxy = true`（默认）时 socks 取第一个 `socks5-listen`，为 false 时不设置 socks。监听地址是通配地址时换成**同族**回环：`0.0.0.0` → `127.0.0.1`，`::` → `::1`（`[::]` 在 Windows 上默认只监听 v6，`127.0.0.1` 连不上）。一个 http/socks5 监听器都没有时视为「未启用」，`POST` 打开会失败。
+- **`skip-proxy` → 系统绕过列表**：采用 macOS 语义。取反项（`-host`）与 `<…>` 特殊记号（`<ip-address>` 等）整条丢弃；端口一律丢弃（`host:port` 只留主机部分）；CIDR 网段保留 `/前缀`、主机位清零（如 `192.168.1.5/16` → `192.168.0.0/16`），单地址网段（`/32`、`/128`）写成裸地址。macOS 与 Linux（GNOME `ignore-hosts` / KDE 逗号拼接的 `NoProxyFor`）原样使用这份列表；Windows 的 `ProxyOverride` 没有 CIDR 语法，把 IPv4 网段展开成通配符模式（`10.0.0.0/8` → `10.*`；`172.16.0.0/12` 展开成 16 条 `172.16.*`…`172.31.*`；单条 `/1`、`/9`、`/17` 或 `/25` 网段最多展开到 128 条，没有上限），IPv6 字面量加中括号（`::1` → `[::1]`），IPv6 网段无法表示、丢弃。`exclude-simple-hostnames` 只在 Windows 生效（追加 `<local>`）；macOS 经 `networksetup` 无法设置，`true` 时 WARN 并忽略这一项，其余设置照常应用；Linux 无对应项。
+- **`state.json` 备份与崩溃恢复**：开启前先 `snapshot()` 当前系统设置，连同 `features.system_proxy = true` 一起写入 `state.json`（先于 `apply`，这样崩溃后仍能找回原始设置；已经存在的备份不会被覆盖——它就是最初的原值）；`apply` 失败会尽力 `restore` 并清空这两个字段。关闭或优雅退出 → `restore` 并清空。启动时若 `system_proxy_backup` 非空（上一次异常退出留下的）→ 先 `restore` 并打一条 WARN，再按本次是否带 `--system-proxy` 决定要不要重新开启；`state.json` 的写入是尽力而为（原子写但不 `fsync`），写失败只记日志，不影响调用方。
+- **重载跟随**：`POST /v1/profiles/reload`（或 SIGHUP / `--watch`）之后，如果系统代理开着，rurge 会用新配置重新计算地址并 `apply`（监听地址或 `skip-proxy` 变了就能看出来）。如果重载后没有任何可用的监听器，rurge **不会**顺带关闭系统代理——那等于替用户把流量静默改成直连——而是打一条 WARN，系统设置继续指向（已经失效的）旧地址，直到下一次重载成功或者进程退出。
+- **启动输出顺序**：`listening on …`（每个监听器一行）→ `api on http://<addr>`（配置了 `http-api` 时）→ `system proxy enabled: <地址描述>`（带 `--system-proxy` 启动且成功开启时；地址描述形如 `http 127.0.0.1:6152` 或 `http 127.0.0.1:6152, socks 127.0.0.1:6153`）→ 汇总行 `rurge <version> running: …`。开启失败会改为 stderr 打印 `error: cannot enable the system proxy: <原因>` 并以退出码 1 结束，不打印汇总行。
 
 ## CLI 客户端
 
