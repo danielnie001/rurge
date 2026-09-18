@@ -80,9 +80,12 @@ fn print_plan(plan: &Plan) {
 
 /// launchd's per-user domain is `gui/<uid>`, and `gui/0` is root's session
 /// rather than the user's: `--user` under `sudo` would register the agent
-/// where the desktop never starts it.
-fn check_user_scope(scope: Scope, uid: Option<u32>) -> anyhow::Result<()> {
-    if scope == Scope::User && uid == Some(0) {
+/// where the desktop never starts it. systemd's `--user` instance is the same
+/// story. `uid` is only probed on macOS, so `sudo` (from `SUDO_UID`) is what
+/// catches it elsewhere — the environment rather than the uid, because running
+/// as root without sudo is normal on Linux and must keep working.
+fn check_user_scope(scope: Scope, uid: Option<u32>, sudo: bool) -> anyhow::Result<()> {
+    if scope == Scope::User && (uid == Some(0) || sudo) {
         anyhow::bail!("--user under sudo would target root's session; run it without sudo");
     }
     Ok(())
@@ -110,6 +113,7 @@ fn carry_out(plan: &Plan, dry_run: bool, done: &str, runner: &dyn CommandRunner)
 pub fn run(args: ServiceArgs) -> anyhow::Result<ExitCode> {
     let os = Os::current();
     let env = |key: &str| std::env::var_os(key);
+    let sudo = env("SUDO_UID").is_some();
     match args.command {
         ServiceCommand::Install(install) => {
             if !install.config.is_file() {
@@ -117,7 +121,7 @@ pub fn run(args: ServiceArgs) -> anyhow::Result<ExitCode> {
             }
             let scope = scope(install.user);
             let uid = uid(os, scope);
-            check_user_scope(scope, uid)?;
+            check_user_scope(scope, uid, sudo)?;
             let spec = ServiceSpec {
                 exe: std::env::current_exe().context("cannot locate the rurge binary")?,
                 // `absolute`, not `canonicalize`: no `\\?\` prefix on Windows
@@ -135,7 +139,7 @@ pub fn run(args: ServiceArgs) -> anyhow::Result<ExitCode> {
         ServiceCommand::Uninstall(uninstall) => {
             let scope = scope(uninstall.user);
             let uid = uid(os, scope);
-            check_user_scope(scope, uid)?;
+            check_user_scope(scope, uid, sudo)?;
             let plan = uninstall_plan(os, scope, &env, uid)?;
             Ok(carry_out(
                 &plan,
@@ -236,15 +240,18 @@ mod tests {
 
     #[test]
     fn user_scope_under_sudo_is_refused() {
-        assert!(check_user_scope(Scope::User, Some(501)).is_ok());
-        assert!(check_user_scope(Scope::User, None).is_ok());
-        assert!(check_user_scope(Scope::System, Some(0)).is_ok());
-        let err = check_user_scope(Scope::User, Some(0))
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            err,
-            "--user under sudo would target root's session; run it without sudo"
-        );
+        assert!(check_user_scope(Scope::User, Some(501), false).is_ok());
+        assert!(check_user_scope(Scope::User, None, false).is_ok());
+        assert!(check_user_scope(Scope::System, Some(0), false).is_ok());
+        // root may install system-wide under sudo: that is what sudo is for
+        assert!(check_user_scope(Scope::System, None, true).is_ok());
+        // `Some(0)` is the macOS probe, `true` the Linux environment check
+        for (scope, uid, sudo) in [(Scope::User, Some(0), false), (Scope::User, None, true)] {
+            let err = check_user_scope(scope, uid, sudo).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                "--user under sudo would target root's session; run it without sudo"
+            );
+        }
     }
 }

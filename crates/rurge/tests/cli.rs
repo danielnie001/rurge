@@ -1593,8 +1593,12 @@ mod service {
     use assert_cmd::Command;
     use predicates::prelude::*;
 
+    /// `SUDO_UID` is removed: `service ... --user` refuses to run under sudo,
+    /// and these dry runs must not depend on how the suite was started.
     fn rurge() -> Command {
-        Command::cargo_bin("rurge").unwrap()
+        let mut cmd = Command::cargo_bin("rurge").unwrap();
+        cmd.env_remove("SUDO_UID");
+        cmd
     }
 
     #[test]
