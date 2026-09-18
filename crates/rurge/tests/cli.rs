@@ -678,6 +678,11 @@ mod run {
         if let Some(log) = log_file {
             cmd.arg("--log-file").arg(log);
         }
+        cmd.env(
+            "RURGE_SYSTEM_PROXY_BACKEND",
+            format!("file:{}", sysproxy_file(data).display()),
+        )
+        .env_remove("RURGE_SYSTEM_PROXY");
         cmd.args(extra);
         let mut child = cmd
             .stdout(Stdio::piped())
@@ -802,6 +807,27 @@ mod run {
                 return None;
             }
             std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Where the test backend keeps the "system proxy" of a daemon.
+    fn sysproxy_file(data: &Path) -> std::path::PathBuf {
+        data.join("sysproxy.json")
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// Polls until `check` passes or 10 s elapse.
+    fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !check() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -1256,5 +1282,140 @@ mod run {
             .assert()
             .code(1)
             .stderr(predicate::str::contains("cannot reach rurge"));
+    }
+
+    const ORIGINAL_PROXY: &str = "the user's own proxy settings";
+
+    #[test]
+    fn run_system_proxy_is_applied_switched_and_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let file = sysproxy_file(&data);
+        std::fs::write(&file, ORIGINAL_PROXY).unwrap();
+        let mut daemon = spawn_daemon_full(&conf, &data, false, None, &["--system-proxy"]);
+        let port = api_port(&daemon);
+        let enabled = wait_for_line(&daemon, "system proxy enabled: ");
+        assert_eq!(
+            enabled,
+            format!(
+                "http 127.0.0.1:{}, socks 127.0.0.1:{}",
+                daemon.http, daemon.socks
+            )
+        );
+        let applied = read_json(&file);
+        assert_eq!(applied["http"], format!("127.0.0.1:{}", daemon.http));
+        assert_eq!(applied["https"], applied["http"]);
+        assert_eq!(applied["socks"], format!("127.0.0.1:{}", daemon.socks));
+        let state = read_json(&data.join("state.json"));
+        assert_eq!(state["system_proxy_backup"]["previous"], ORIGINAL_PROXY);
+        assert_eq!(state["features"]["system_proxy"], true);
+        assert_eq!(
+            api_call(port, "GET", "/v1/features/system_proxy", "k", None).1,
+            r#"{"enabled":true}"#
+        );
+        // off and on again through the API
+        assert_eq!(
+            api_call(
+                port,
+                "POST",
+                "/v1/features/system_proxy",
+                "k",
+                Some(r#"{"enabled":false}"#)
+            ),
+            (200, "{}".to_string())
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+        assert!(read_json(&data.join("state.json"))["system_proxy_backup"].is_null());
+        assert_eq!(
+            api_call(port, "GET", "/v1/features/system_proxy", "k", None).1,
+            r#"{"enabled":false}"#
+        );
+        assert_eq!(
+            api_call(
+                port,
+                "POST",
+                "/v1/features/system_proxy",
+                "k",
+                Some(r#"{"enabled":true}"#)
+            )
+            .0,
+            200
+        );
+        assert_eq!(
+            read_json(&file)["http"],
+            format!("127.0.0.1:{}", daemon.http)
+        );
+        // a graceful stop puts the original back
+        assert_eq!(api_call(port, "POST", "/v1/stop", "k", Some("{}")).0, 200);
+        assert_eq!(wait_for_exit(&mut daemon, 5), Some(0));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+        let state = read_json(&data.join("state.json"));
+        assert!(state["system_proxy_backup"].is_null());
+        assert_eq!(state["features"]["system_proxy"], false);
+        let lines: Vec<String> = daemon.lines.try_iter().collect();
+        assert!(
+            lines.iter().any(|l| l == "system proxy restored"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn run_restores_the_system_proxy_a_crashed_run_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let file = sysproxy_file(&data);
+        std::fs::write(&file, ORIGINAL_PROXY).unwrap();
+        let crashed = spawn_daemon_full(&conf, &data, false, None, &["--system-proxy"]);
+        wait_for_line(&crashed, "system proxy enabled: ");
+        drop(crashed); // `Daemon::drop` kills the process: no cleanup runs
+        assert_ne!(
+            std::fs::read_to_string(&file).unwrap(),
+            ORIGINAL_PROXY,
+            "still pointing at the dead daemon"
+        );
+        assert!(!read_json(&data.join("state.json"))["system_proxy_backup"].is_null());
+        // the next start, without --system-proxy, cleans up
+        let next = spawn_daemon(&conf, &data);
+        wait_for_line(&next, "rurge ");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+        let state = read_json(&data.join("state.json"));
+        assert!(state["system_proxy_backup"].is_null());
+        assert_eq!(state["features"]["system_proxy"], false);
+    }
+
+    #[test]
+    fn run_reapplies_the_system_proxy_after_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        let daemon = spawn_daemon_full(&conf, &data, false, None, &["--system-proxy"]);
+        let port = api_port(&daemon);
+        wait_for_line(&daemon, "system proxy enabled: ");
+        let file = sysproxy_file(&data);
+        assert_eq!(read_json(&file)["bypass"], serde_json::json!([]));
+        write_conf(
+            dir.path(),
+            &format!("{API_GENERAL}\nskip-proxy = localhost, example.internal"),
+        );
+        let (status, body) = api_call(port, "POST", "/v1/profiles/reload", "k", Some("{}"));
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"ok\":true"), "{body}");
+        // tolerant read: the daemon may be rewriting the file at this instant
+        wait_until("the bypass list to follow the reload", || {
+            std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .is_some_and(|v| {
+                    v["bypass"] == serde_json::json!(["localhost", "example.internal"])
+                })
+        });
+        assert_eq!(
+            read_json(&file)["http"],
+            format!("127.0.0.1:{}", daemon.http)
+        );
     }
 }

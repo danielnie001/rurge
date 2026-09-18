@@ -2,6 +2,7 @@
 
 use super::rule::{parse_mode, print_diagnostics};
 use super::runtime::RuntimeArgs;
+use super::sysproxy::{SystemProxyManager, describe, proxy_settings};
 use crate::capabilities;
 use anyhow::Context;
 use clap::Args;
@@ -15,11 +16,13 @@ use rurge_engine::control::{Control, LogLevel as ApiLogLevel, Mode, ReloadReport
 use rurge_engine::state::{STATE_FILE, State, StateStore, profile_key};
 use rurge_engine::{Engine, ListenerSpec, Running, Runtime, RuntimeOptions};
 use rurge_net::BoxFuture;
+use rurge_platform::sysproxy::ProxySettings;
 use rurge_rules::OutboundMode;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -61,6 +64,9 @@ pub struct RunArgs {
     /// Reload the profile when it or its included files change on disk
     #[arg(long, env = "RURGE_WATCH")]
     pub watch: bool,
+    /// Point the operating system's proxy settings at rurge while it runs
+    #[arg(long, env = "RURGE_SYSTEM_PROXY")]
+    pub system_proxy: bool,
     #[command(flatten)]
     pub runtime: RuntimeArgs,
 }
@@ -155,11 +161,14 @@ struct RunOptions {
 enum Command {
     Reload(oneshot::Sender<ReloadReport>),
     Stop,
+    SystemProxy(bool, oneshot::Sender<Result<(), String>>),
 }
 
 struct LoopControl {
     tx: mpsc::Sender<Command>,
     log_level: LevelHandle,
+    /// Mirrors `SystemProxyManager::enabled`.
+    system_proxy: Arc<AtomicBool>,
 }
 
 fn failed_report() -> ReloadReport {
@@ -204,12 +213,20 @@ impl Control for LoopControl {
         Ok(())
     }
 
-    fn set_system_proxy(&self, _enabled: bool) -> BoxFuture<'_, Result<(), String>> {
-        Box::pin(async { Err("not implemented".to_string()) })
+    fn set_system_proxy(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            let (reply, rx) = oneshot::channel();
+            self.tx
+                .send(Command::SystemProxy(enabled, reply))
+                .await
+                .map_err(|_| "rurge is shutting down".to_string())?;
+            rx.await
+                .unwrap_or_else(|_| Err("rurge is shutting down".to_string()))
+        })
     }
 
     fn system_proxy_enabled(&self) -> bool {
-        false
+        self.system_proxy.load(Ordering::SeqCst)
     }
 }
 
@@ -391,6 +408,63 @@ async fn reload(d: &Daemon<'_>, listeners: &mut Vec<(ListenerSpec, Running)>) ->
     }
 }
 
+/// What the system proxy should point at, given what is bound right now.
+fn current_settings(
+    engine: &Engine,
+    listeners: &[(ListenerSpec, Running)],
+) -> Option<ProxySettings> {
+    let bound: Vec<_> = listeners
+        .iter()
+        .map(|(spec, running)| (spec.kind, running.local_addr))
+        .collect();
+    proxy_settings(&engine.runtime().config.general, &bound)
+}
+
+async fn switch_system_proxy(
+    manager: &mut SystemProxyManager,
+    engine: &Engine,
+    listeners: &[(ListenerSpec, Running)],
+    enabled: bool,
+) -> Result<(), String> {
+    if !enabled {
+        return manager.disable().await;
+    }
+    let settings = current_settings(engine, listeners).ok_or_else(|| {
+        "there is no http or socks5 listener to point the system proxy at".to_string()
+    })?;
+    manager.enable(settings).await
+}
+
+/// A reload may move the listeners or change `skip-proxy`: keep the system
+/// proxy in step.
+async fn reload_and_refresh(
+    d: &Daemon<'_>,
+    listeners: &mut Vec<(ListenerSpec, Running)>,
+    sysproxy: &mut SystemProxyManager,
+) -> ReloadReport {
+    let report = reload(d, listeners).await;
+    if report.ok
+        && let Err(e) = sysproxy
+            .refresh(current_settings(d.engine, listeners))
+            .await
+    {
+        tracing::error!(error = %e, "cannot re-apply the system proxy after the reload");
+    }
+    // A reload that leaves no usable listener must not silently switch the
+    // system proxy off: that would reroute the user's traffic direct without
+    // them asking for it. Say so instead and leave the OS alone; a later
+    // successful reload (or a stop) puts things right.
+    if (!report.ok || current_settings(d.engine, listeners).is_none())
+        && let Some(applied) = sysproxy.applied()
+    {
+        tracing::warn!(
+            "the system proxy still points at {} although rurge has no usable listener; reload again or stop rurge to restore it",
+            describe(applied)
+        );
+    }
+    report
+}
+
 /// Watches the profile and its includes, reporting each debounced burst of
 /// changes as one `()` on `tx`. The returned watcher must be kept alive:
 /// dropping it stops the watch.
@@ -428,6 +502,65 @@ fn spawn_watcher(
         }
     });
     Ok(watcher)
+}
+
+/// Everything that means "shut down": Ctrl-C and SIGTERM on Unix; Ctrl-C,
+/// the console closing, logoff and system shutdown on Windows (the last three
+/// leave the process a few seconds — enough to put the system proxy back).
+/// One long-lived stream per signal, built once: a stream buffers a signal
+/// that arrives while nobody is awaiting it, whereas a fresh future per loop
+/// iteration would drop every signal delivered during a reload.
+struct ShutdownSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    ctrl_c: tokio::signal::windows::CtrlC,
+    #[cfg(windows)]
+    close: tokio::signal::windows::CtrlClose,
+    #[cfg(windows)]
+    logoff: tokio::signal::windows::CtrlLogoff,
+    #[cfg(windows)]
+    shutdown: tokio::signal::windows::CtrlShutdown,
+}
+
+impl ShutdownSignals {
+    fn new() -> anyhow::Result<ShutdownSignals> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(ShutdownSignals {
+                interrupt: signal(SignalKind::interrupt()).context("cannot listen for SIGINT")?,
+                terminate: signal(SignalKind::terminate()).context("cannot listen for SIGTERM")?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            use tokio::signal::windows;
+            Ok(ShutdownSignals {
+                ctrl_c: windows::ctrl_c().context("cannot listen for Ctrl-C")?,
+                close: windows::ctrl_close().context("cannot listen for the console closing")?,
+                logoff: windows::ctrl_logoff().context("cannot listen for logoff")?,
+                shutdown: windows::ctrl_shutdown().context("cannot listen for system shutdown")?,
+            })
+        }
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+        #[cfg(windows)]
+        tokio::select! {
+            _ = self.ctrl_c.recv() => {}
+            _ = self.close.recv() => {}
+            _ = self.logoff.recv() => {}
+            _ = self.shutdown.recv() => {}
+        }
+    }
 }
 
 pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
@@ -491,6 +624,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             }
         };
         print_listening(&listeners);
+        let mut sysproxy = SystemProxyManager::new(super::sysproxy::backend()?, store.clone());
 
         // Command channel from the API (M4 design §6). `cmd_tx` stays alive
         // here for the same reason as `reload_tx` below.
@@ -498,6 +632,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         let control: Arc<dyn Control> = Arc::new(LoopControl {
             tx: cmd_tx.clone(),
             log_level: level_handle,
+            system_proxy: sysproxy.flag(),
         });
         // The API comes up right after the listeners and before the summary
         // line, so `api on` is the third startup line (the CLI tests and
@@ -521,6 +656,33 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 }
             }
         }
+        // Reload triggers. `reload_tx` stays alive here on purpose: were every
+        // sender dropped, `recv()` would return `None` at once and the loop
+        // below would spin reloading.
+        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let _watcher = if args.watch {
+            Some(spawn_watcher(&cfg_paths, reload_tx.clone())?)
+        } else {
+            None
+        };
+        let mut signals = ShutdownSignals::new()?;
+        #[cfg(unix)]
+        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .context("cannot listen for SIGHUP")?;
+
+        // Everything fallible is behind us: nothing below returns early while
+        // the operating system points at rurge, except the failure to enable.
+        sysproxy.recover().await;
+        if args.system_proxy {
+            if let Err(e) = switch_system_proxy(&mut sysproxy, &engine, &listeners, true).await {
+                eprintln!("error: cannot enable the system proxy: {e}");
+                return Ok(ExitCode::from(1));
+            }
+            let applied = sysproxy.applied().map(describe).unwrap_or_default();
+            println!("system proxy enabled: {applied}");
+            tracing::info!(%applied, "system proxy enabled");
+        }
+
         // The one startup line that also reaches `--log-file` (the per-listener
         // "listening" records are DEBUG; stdout gets the lines above).
         tracing::info!(policies, rules, mode = %mode_name(&outbound_mode), "rurge running");
@@ -540,47 +702,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             http_api: &http_api,
         };
 
-        // Reload triggers. `reload_tx` stays alive here on purpose: were every
-        // sender dropped, `recv()` would return `None` at once and the loop
-        // below would spin reloading.
-        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let _watcher = if args.watch {
-            Some(spawn_watcher(&cfg_paths, reload_tx.clone())?)
-        } else {
-            None
-        };
-        // One long-lived stream per signal, built once outside the loop: a
-        // stream buffers a signal that arrives while nobody is awaiting it,
-        // whereas a fresh `signal::ctrl_c()` future per iteration would drop
-        // every Ctrl-C delivered during a `reload`.
-        #[cfg(unix)]
-        let mut interrupt =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                .context("cannot listen for SIGINT")?;
-        #[cfg(windows)]
-        let mut interrupt = tokio::signal::windows::ctrl_c().context("cannot listen for Ctrl-C")?;
-        #[cfg(unix)]
-        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-            .context("cannot listen for SIGHUP")?;
-        #[cfg(unix)]
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .context("cannot listen for SIGTERM")?;
-
         loop {
-            // Ctrl-C everywhere, SIGTERM as well on Unix (M3b design §7.4).
-            let shutdown_signal = async {
-                #[cfg(unix)]
-                {
-                    tokio::select! {
-                        _ = interrupt.recv() => {}
-                        _ = sigterm.recv() => {}
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = interrupt.recv().await;
-                }
-            };
             let reload_signal = async {
                 #[cfg(unix)]
                 {
@@ -595,18 +717,27 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 }
             };
             tokio::select! {
-                _ = shutdown_signal => break,
+                _ = signals.recv() => break,
                 _ = reload_signal => {
-                    reload(&daemon, &mut listeners).await;
+                    reload_and_refresh(&daemon, &mut listeners, &mut sysproxy).await;
                 }
                 cmd = cmd_rx.recv() => match cmd {
                     Some(Command::Reload(reply)) => {
-                        let report = reload(&daemon, &mut listeners).await;
+                        let report =
+                            reload_and_refresh(&daemon, &mut listeners, &mut sysproxy).await;
                         let _ = reply.send(report);
                     }
                     Some(Command::Stop) => {
                         println!("stop requested via http-api");
                         break;
+                    }
+                    Some(Command::SystemProxy(enabled, reply)) => {
+                        let result =
+                            switch_system_proxy(&mut sysproxy, &engine, &listeners, enabled).await;
+                        if let Err(e) = &result {
+                            tracing::error!(error = %e, enabled, "cannot switch the system proxy");
+                        }
+                        let _ = reply.send(result);
                     }
                     None => {}
                 },
@@ -617,7 +748,16 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         println!("shutting down (Ctrl-C or SIGTERM again to exit now)");
         #[cfg(not(unix))]
         println!("shutting down (Ctrl-C again to exit now)");
-        // shutdown: the API first, so its graceful stop runs inside the drain
+        // The system proxy first: rurge is about to stop serving, and the
+        // forced exit below must not leave the OS pointing at a dead port.
+        if sysproxy.enabled() {
+            match sysproxy.disable().await {
+                Ok(()) => println!("system proxy restored"),
+                Err(e) => eprintln!(
+                    "error: cannot restore the system proxy: {e}; the saved settings stay in state.json and are restored on the next start"
+                ),
+            }
+        }
         api_token.cancel();
         engine.stop_accepting();
         engine.tracker().close();
@@ -629,23 +769,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             engine.tracker().wait().await;
         };
         tokio::pin!(drain);
-        // The same long-lived streams the main loop used: a fresh
-        // `signal::ctrl_c()` here would miss a signal delivered before its
-        // first poll, and under systemd SIGTERM must be able to force the exit
-        // it started.
-        let force_exit = async {
-            #[cfg(unix)]
-            {
-                tokio::select! {
-                    _ = interrupt.recv() => {}
-                    _ = sigterm.recv() => {}
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = interrupt.recv().await;
-            }
-        };
+        let force_exit = signals.recv();
         tokio::select! {
             _ = &mut drain => {}
             _ = force_exit => {
