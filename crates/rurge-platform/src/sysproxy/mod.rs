@@ -3,6 +3,7 @@
 //! injected — so each platform is unit-tested everywhere (the approach `dirs`
 //! takes with `Os`).
 
+pub mod macos;
 pub mod windows;
 
 use serde::{Deserialize, Serialize};
