@@ -639,6 +639,25 @@ mod run {
         conf
     }
 
+    /// The one way a CLI test starts `rurge run`. P5: no test may reach the
+    /// real system proxy, so the file backend is wired in here instead of
+    /// being remembered at every call site.
+    fn rurge_run(conf: &Path, data: &Path) -> Command {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("rurge"));
+        cmd.arg("run")
+            .arg("-c")
+            .arg(conf)
+            .arg("--no-network")
+            .arg("--data-dir")
+            .arg(data)
+            .env(
+                "RURGE_SYSTEM_PROXY_BACKEND",
+                format!("file:{}", sysproxy_file(data).display()),
+            )
+            .env_remove("RURGE_SYSTEM_PROXY");
+        cmd
+    }
+
     /// Spawns `rurge run` and waits for both `listening on` lines.
     fn spawn_daemon(conf: &Path, data: &Path) -> Daemon {
         spawn_daemon_with(conf, data, false, None)
@@ -665,20 +684,13 @@ mod run {
         log_file: Option<&Path>,
         extra: &[&str],
     ) -> Daemon {
-        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("rurge"));
-        cmd.arg("run")
-            .arg("-c")
-            .arg(conf)
-            .arg("--no-network")
-            .arg("--data-dir")
-            .arg(data);
+        let mut cmd = rurge_run(conf, data);
         if watch {
             cmd.arg("--watch");
         }
         if let Some(log) = log_file {
             cmd.arg("--log-file").arg(log);
         }
-        guard_system_proxy(&mut cmd, data);
         cmd.args(extra);
         let mut child = cmd
             .stdout(Stdio::piped())
@@ -809,15 +821,6 @@ mod run {
     /// Where the test backend keeps the "system proxy" of a daemon.
     fn sysproxy_file(data: &Path) -> std::path::PathBuf {
         data.join("sysproxy.json")
-    }
-
-    /// P5: no test may reach the real system proxy.
-    fn guard_system_proxy(cmd: &mut Command, data: &Path) {
-        cmd.env(
-            "RURGE_SYSTEM_PROXY_BACKEND",
-            format!("file:{}", sysproxy_file(data).display()),
-        )
-        .env_remove("RURGE_SYSTEM_PROXY");
     }
 
     fn read_json(path: &Path) -> serde_json::Value {
@@ -1042,16 +1045,11 @@ mod run {
         )
         .unwrap(); // no FINAL
         let data = dir.path().join("data");
-        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("rurge"));
-        cmd.args(["run", "-c"])
-            .arg(dir.path().join("t.conf"))
-            .arg("--no-network")
-            .arg("--data-dir")
-            .arg(&data)
+        let status = rurge_run(&dir.path().join("t.conf"), &data)
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        guard_system_proxy(&mut cmd, &data);
-        let status = cmd.status().unwrap();
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
         assert_eq!(status.code(), Some(2));
     }
 
@@ -1065,16 +1063,11 @@ mod run {
             &format!("http-listen = 127.0.0.1:{port}\nsocks5-listen = 127.0.0.1:0"),
         );
         let data = dir.path().join("data");
-        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("rurge"));
-        cmd.args(["run", "-c"])
-            .arg(&conf)
-            .arg("--no-network")
-            .arg("--data-dir")
-            .arg(&data)
+        let output = rurge_run(&conf, &data)
             .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        guard_system_proxy(&mut cmd, &data);
-        let output = cmd.output().unwrap();
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
         assert_eq!(output.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&output.stderr).contains("cannot bind listener"));
         drop(taken);
@@ -1390,6 +1383,62 @@ mod run {
         assert_eq!(state["features"]["system_proxy"], false);
     }
 
+    /// The port a crashed run held may well be why the restart cannot bind:
+    /// recovery must not wait behind anything that can exit.
+    #[test]
+    fn run_restores_a_crashed_system_proxy_even_when_it_cannot_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let file = sysproxy_file(&data);
+        std::fs::write(&file, ORIGINAL_PROXY).unwrap();
+        let crashed = spawn_daemon_full(&conf, &data, false, None, &["--system-proxy"]);
+        wait_for_line(&crashed, "system proxy enabled: ");
+        drop(crashed); // `Daemon::drop` kills the process: no cleanup runs
+        assert!(!read_json(&data.join("state.json"))["system_proxy_backup"].is_null());
+        // the restart cannot get its listener: something else holds the port
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let conf = write_conf(
+            dir.path(),
+            &format!("http-listen = 127.0.0.1:{port}\nsocks5-listen = 127.0.0.1:0"),
+        );
+        let mut child = rurge_run(&conf, &data)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("rurge run did not exit within 20 s of failing to bind");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert_eq!(status.code(), Some(1));
+        assert!(stderr.contains("cannot bind listener"), "{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            ORIGINAL_PROXY,
+            "the crashed run's settings are undone even though this run cannot start"
+        );
+        assert!(read_json(&data.join("state.json"))["system_proxy_backup"].is_null());
+        drop(taken);
+    }
+
     #[test]
     fn run_reapplies_the_system_proxy_after_a_reload() {
         let dir = tempfile::tempdir().unwrap();
@@ -1431,18 +1480,13 @@ mod run {
         // to read yet) and the rollback `restore` (nothing to remove) both
         // succeed, but `apply` fails trying to create the file.
         let backend = dir.path().join("no-such-dir").join("sysproxy.json");
-        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("rurge"));
-        cmd.args(["run", "-c"])
-            .arg(&conf)
-            .arg("--no-network")
-            .arg("--data-dir")
-            .arg(&data)
-            .arg("--system-proxy")
+        let mut cmd = rurge_run(&conf, &data);
+        // the guard's own backend path, replaced by one that cannot be written
+        cmd.arg("--system-proxy")
             .env(
                 "RURGE_SYSTEM_PROXY_BACKEND",
                 format!("file:{}", backend.display()),
             )
-            .env_remove("RURGE_SYSTEM_PROXY")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().unwrap();

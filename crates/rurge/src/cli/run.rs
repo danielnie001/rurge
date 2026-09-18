@@ -599,6 +599,12 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         .build()?;
     runtime.block_on(async move {
         let (store, state) = StateStore::open(rt.data_dir.join(STATE_FILE)).await;
+        // Crash recovery first, before anything that can exit: a previous run
+        // may have died with the operating system pointing at it, and the port
+        // it left behind may be exactly why this start fails to bind. Putting
+        // the pre-crash settings back is right whether or not this run starts.
+        let mut sysproxy = SystemProxyManager::new(super::sysproxy::backend()?, store.clone());
+        sysproxy.recover().await;
         let outbound_mode = initial_mode(explicit_mode, &store, &state).await;
         let engine_rt =
             build_engine_runtime(cfg, &rt, &run_opts, outbound_mode.clone(), &state).await?;
@@ -625,7 +631,6 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             }
         };
         print_listening(&listeners);
-        let mut sysproxy = SystemProxyManager::new(super::sysproxy::backend()?, store.clone());
 
         // Command channel from the API (M4 design §6). `cmd_tx` stays alive
         // here for the same reason as `reload_tx` below.
@@ -671,9 +676,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
             .context("cannot listen for SIGHUP")?;
 
-        // Everything fallible is behind us: nothing below returns early while
+        // Recovery already ran, above. The enable waits until here because
+        // everything fallible is behind us: nothing below returns early while
         // the operating system points at rurge, except the failure to enable.
-        sysproxy.recover().await;
         if args.system_proxy {
             if let Err(e) = switch_system_proxy(&mut sysproxy, &engine, &listeners, true).await {
                 eprintln!("error: cannot enable the system proxy: {e}");
