@@ -40,6 +40,7 @@
 | 7 | `rurge.exe service install -c <conf> --user --dry-run` 看计划；确认无误后去掉 `--dry-run` 正式安装；重新登录 Windows；最后 `rurge.exe service uninstall --user` | dry-run 打印一条 `schtasks /create /tn rurge /sc onlogon …` 命令且不改变任何东西；正式安装后「任务计划程序」里出现名为 `rurge` 的任务；重新登录后该任务已启动 rurge（任务管理器里能看到 `rurge.exe`）；卸载后任务消失 | | | |
 | 8 | **PAC 专项**：先在「设置 → 网络和 Internet → 代理」里打开「使用设置脚本」（即注册表的 `AutoConfigURL`，指向一个本机 `.pac` 文件即可），再执行 `rurge.exe run -c <conf> --system-proxy` | 记录浏览器实际走的是 PAC 还是 rurge。rurge 只读写 `ProxyEnable` / `ProxyServer` / `ProxyOverride`，既不清除也不备份 `AutoConfigURL`，因此预期是「看起来开着但不起作用」（PAC 优先）——确认这一行为并回填；退出后 `AutoConfigURL` 应原封未动 | | | |
 | 9 | **仅 SOCKS 专项**：用一份没有 `http-listen`、只有 `socks5-listen = 127.0.0.1:6153` 的 Profile 执行 `rurge.exe run -c <conf> --system-proxy` | 记录 `ProxyServer` 的取值（应当只有 `socks=127.0.0.1:6153` 一段），以及浏览器 / `curl.exe` 是否真的能经这一段连上 rurge——基于 WinINet 的客户端历史上把 `socks=` 当作 SOCKS4 解释，而 rurge 的入站只讲 SOCKS5，这一条尚未在真机验证，结论回填后同步到 `docs/surge-compatibility-matrix.md` | | | |
+| 10 | **实例锁**：带 `--system-proxy` 运行中，在另一个终端再执行一次 `rurge.exe run -c <conf>`（同一个数据目录——两次都不带 `--data-dir` 时就是默认数据目录）；随后 `taskkill /f /im rurge.exe` 强杀第一个实例，再执行一次 `rurge.exe run -c <conf>` | 第二个实例以退出码 1 结束，stderr 是 `error: another rurge instance is already running with the data directory <路径>`，且注册表仍指向 rurge（第一个实例完全不受影响，`GET /v1/features/system_proxy` 仍是 `true`）；强杀之后的那一次能正常启动，并先把注册表恢复原值（同第 5 条的 WARN） | | | |
 
 ---
 
@@ -55,6 +56,7 @@
 | 6 | 带 `--system-proxy` 运行中，编辑 `<conf>` 的 `skip-proxy`（加一条新域名），执行 `./rurge reload -c <conf>` | `networksetup -getproxybypassdomains <服务>` 随之更新，包含新加的域名 | | | |
 | 7 | `./rurge service install -c <conf> --user --dry-run` 看计划；确认无误后去掉 `--dry-run` 正式安装；重新登录（或重启）；最后 `./rurge service uninstall --user` | dry-run 打印一份 `io.rurge.daemon.plist` 内容和一条 `launchctl bootstrap gui/<uid> …` 命令且不改变任何东西；正式安装后 `launchctl list \| grep rurge` 能看到该 Label；重新登录后 rurge 已在运行；卸载后 `launchctl list` 里不再出现 | | | |
 | 8 | **专项（设计文档 Q2）**：分别用「管理员账户」与「标准（非管理员）账户」各执行一次第 1 步 | 记录两种账户下是否需要 `sudo` 才能成功、`networksetup` 的失败文案原文（若标准账户被拒绝，rurge 会把这段文案原样打到 `error: cannot enable the system proxy: …`） | | | |
+| 9 | **实例锁**：带 `--system-proxy` 运行中，在另一个终端再执行一次 `./rurge run -c <conf>`（同一个数据目录——两次都不带 `--data-dir` 时就是默认数据目录）；随后 `pkill -9 -f "rurge run"` 强杀第一个实例，再执行一次 `./rurge run -c <conf>` | 第二个实例以退出码 1 结束，stderr 是 `error: another rurge instance is already running with the data directory <路径>`，且 `networksetup -getwebproxy <服务>` 仍指向 rurge（第一个实例完全不受影响，`GET /v1/features/system_proxy` 仍是 `true`）；强杀之后的那一次能正常启动，并先把设置恢复原值（同第 5 条的 WARN） | | | |
 
 ---
 
@@ -70,6 +72,7 @@
 | 6 | 带 `--system-proxy` 运行中，编辑 `<conf>` 的 `skip-proxy`（加一条新域名），执行 `./rurge reload -c <conf>` | GNOME 的 `ignore-hosts` 或 KDE 的 `NoProxyFor` 随之更新，包含新加的域名 | | | |
 | 7 | `./rurge service install -c <conf> --user --system-proxy --dry-run` 看计划；确认无误后去掉 `--dry-run` 正式安装；重新登录（或重启）；最后 `./rurge service uninstall --user`。另外再执行一次 `./rurge service install -c <conf> --system-proxy --dry-run`（**不带** `--user`，即 system 范围） | dry-run 打印一份 systemd unit 内容（含 `ExecStart=… --system-proxy`、`PartOf=graphical-session.target`、`After=graphical-session.target`、`WantedBy=graphical-session.target`、`StartLimitIntervalSec=60`、`StartLimitBurst=5`）和一条 `systemctl --user enable --now rurge` 命令且不改变任何东西；正式安装后 `systemctl --user status rurge` 是 running；重新登录（或重启）后 rurge 已在运行，**并且桌面的代理设置已经由这个服务指向 rurge**（GNOME 下 `gsettings get org.gnome.system.proxy mode` 为 `'manual'`、`.http host` 为 `'127.0.0.1'`；KDE 下 `ProxyType` 为 `1`）；卸载后该 unit 消失。不带 `--user` 的那一次必须以退出码 2 结束，stderr 是 `error: --system-proxy needs a desktop session: on Linux install with --user`，且不写任何文件 | | | |
 | 8 | **额外检查**：在一个既不是 GNOME 也不是 KDE 的桌面（或没有安装 `gsettings`/`kwriteconfig6`/`5` 的环境）下执行 `./rurge run -c <conf> --system-proxy` | 命令以退出码 1 结束；stderr 有一行 `error: cannot enable the system proxy: no supported desktop proxy settings (GNOME or KDE) were found; set the proxy in your shell instead:` 并附一行 `export http_proxy=… https_proxy=… no_proxy=…` 提示；系统没有任何设置被改动 | | | |
+| 9 | **实例锁**：带 `--system-proxy` 运行中，在另一个终端再执行一次 `./rurge run -c <conf>`（同一个数据目录——两次都不带 `--data-dir` 时就是默认数据目录）；随后 `kill -9 $(pgrep -f "rurge run")` 强杀第一个实例，再执行一次 `./rurge run -c <conf>` | 第二个实例以退出码 1 结束，stderr 是 `error: another rurge instance is already running with the data directory <路径>`，且 GNOME/KDE 的代理设置仍指向 rurge（第一个实例完全不受影响，`GET /v1/features/system_proxy` 仍是 `true`）；强杀之后的那一次能正常启动，并先把设置恢复原值（同第 5 条的 WARN） | | | |
 
 ---
 

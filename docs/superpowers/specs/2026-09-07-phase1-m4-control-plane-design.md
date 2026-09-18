@@ -331,6 +331,12 @@ M4b 已实现（分支 `m4b-platform`）；下面先列本计划「计划期决�
 - **E. `--dry-run` 守卫可测 + `sudo` 下的 `--user`**：`carry_out` 改收 `&dyn CommandRunner`（两个调用点传 `&SystemRunner`），补上「dry-run 不调用 runner、不写文件」的单元测试——在此之前，唯一挡在测试与真实 `schtasks /create` / `systemctl enable` 之间的只有一处 `if dry_run`，没有任何断言守住它。另外 `rurge service … --user` 在 `sudo` 下（uid 0）指向 launchd 的 `gui/0`，即 root 的会话而不是用户的，现在由纯函数 `check_user_scope` 拒绝（退出 2）。
 - **F. Windows `ProxyOverride` 卫生**：条目里含字面 `;` 会把值意外拆成多条模式，改为丢弃并打 debug 日志（与 IPv6 网段一致）；`exclude-simple-hostnames` 追加 `<local>` 前先去重。
 
+**第二轮修复波（用户批准，2026-09-18）**
+
+- **H. 每个数据目录只允许一个 `rurge run`（实例锁）**：上面 A 的重排只区分了「上一次运行已经死了」，没有区分「第一个实例还活着」——服务在跑、有人又手敲了一次 `rurge run` 时，同一数据目录上的第二个进程会把第一个留在 `state.json` 里的备份恢复掉并清空，之后才因绑定失败退出 1；第一个实例继续报告系统代理为开启（`applied` / 标志位 / `GET /v1/features/system_proxy`），重载也不重新应用（`applied == settings`），流量静默走直连。现在 `run()` 在 `RuntimeArgs::resolve`（它负责建出数据目录）之后、打开 `state.json` 之前，用 `std::fs::File::try_lock` 对 `<data-dir>/rurge.lock` 取独占锁：只有 `TryLockError::WouldBlock` 拒绝启动（stderr `error: another rurge instance is already running with the data directory <路径>`，退出 1，与 `cannot bind listener` 同码）；其它失败（文件系统不支持加锁、目录不可写）记一条 WARN 后不带这项检查继续跑——不能因为文件系统的限制把守护进程整个丢掉。锁文件从不删除：删除会与另一个进程的打开竞争。锁由操作系统在进程死亡时释放，所以崩溃之后的下一次启动照常拿到锁并恢复备份；反过来说，握着锁时在 `state.json` 里看到的备份必定属于一个已经死掉的运行。只有 `run` 取锁，`check` / `rule match` / `dns lookup` / `reload` / `stop` / `status` / `service` 都不取，`StateStore` 也不取（它自己的测试会在一个进程里多次打开同一路径）。为此工作区 `rust-version` 由 1.88 提到 1.89（`File::try_lock` 的稳定版本，用户裁定），不引入新依赖。
+- **I. Linux 上 `sudo … --user` 同样拒绝**（订正 E）：E 的 `check_user_scope` 只看 `uid()`，而 `uid()` 只在 macOS 上探测，所以 `sudo rurge service install --user` 在 Linux 上仍会被接受，把 unit 写进 root 的（或者用户目录下 root 所有的）`~/.config/systemd/user`。改成 `check_user_scope(scope, uid, sudo)`，`sudo` 取自环境变量 `SUDO_UID` 是否存在（`run()` 里算一次，install 与 uninstall 两条路径都传），拒绝文案不变。不改为在 Linux 上探测 uid：容器里以 root 跑测试套件很常见，必须继续可用。
+- **订正 A**：A 里「把崩溃前的设置放回去与本次能否启动无关」只对死掉的上一次运行成立——把恢复提到绑定之前是**有代价**的，它让一个活着的第一个实例暴露在第二次启动的恢复之下（重排之前，这个双启动由先一步失败的绑定顺手挡住）；这个代价由 H 的实例锁补上，而不是由绑定顺序兜底。
+
 **已知限制**
 
 - **Windows 不处理 `AutoConfigURL`（PAC）**：`snapshot` / `apply` / `restore` 只读写备份 `ProxyEnable`、`ProxyServer`、`ProxyOverride` 三个值；如果系统同时配置了自动代理脚本（`AutoConfigURL`），多数应用会优先用 PAC，rurge 写的手动代理可能形同虚设。已登记进 `docs/surge-compatibility-matrix.md`。某个值类型不对（例如 `ProxyEnable` 是字符串而不是 DWORD）会让 `snapshot()` 报错退出，属于同一类限制。
