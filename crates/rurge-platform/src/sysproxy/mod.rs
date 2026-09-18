@@ -3,6 +3,7 @@
 //! injected — so each platform is unit-tested everywhere (the approach `dirs`
 //! takes with `Os`).
 
+pub mod linux;
 pub mod macos;
 pub mod windows;
 
@@ -38,4 +39,22 @@ pub(crate) fn wrong_platform(expected: &str) -> io::Error {
         io::ErrorKind::InvalidData,
         format!("the system proxy backup was not taken by the {expected} backend"),
     )
+}
+
+/// The backend for the operating system rurge was built for.
+pub fn platform() -> Box<dyn SystemProxy> {
+    #[cfg(windows)]
+    {
+        Box::new(windows::WindowsProxy::new(
+            windows::RealRegistry::internet_settings(),
+        ))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(macos::MacosProxy::new(crate::command::SystemRunner))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Box::new(linux::LinuxProxy::detect(crate::command::SystemRunner))
+    }
 }
