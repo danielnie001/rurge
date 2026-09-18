@@ -22,7 +22,7 @@ use rurge_rules::{GeoUrls, OutboundMode};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -36,6 +36,8 @@ struct FakeControl {
     reloads: AtomicUsize,
     stops: AtomicUsize,
     levels: Mutex<Vec<LogLevel>>,
+    system_proxy: AtomicBool,
+    fail_system_proxy: AtomicBool,
 }
 
 impl Control for FakeControl {
@@ -59,8 +61,17 @@ impl Control for FakeControl {
         self.levels.lock().unwrap().push(level);
         Ok(())
     }
-    fn set_system_proxy(&self, _enabled: bool) -> BoxFuture<'_, Result<(), String>> {
-        Box::pin(async { Err("not implemented".to_string()) })
+    fn set_system_proxy(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            if self.fail_system_proxy.load(Ordering::SeqCst) {
+                return Err("no supported desktop proxy settings were found".to_string());
+            }
+            self.system_proxy.store(enabled, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+    fn system_proxy_enabled(&self) -> bool {
+        self.system_proxy.load(Ordering::SeqCst)
     }
 }
 
@@ -363,13 +374,57 @@ async fn features_collections_stop_and_unknown_paths() {
     );
     let (status, _) = post(&api, "/v1/features/mitm", json!({ "enabled": true })).await;
     assert_eq!(status, 501);
-    let (status, _) = post(
+    assert_eq!(
+        get(&api, "/v1/features/system_proxy").await,
+        (200, json!({ "enabled": false }))
+    );
+    assert_eq!(
+        post(
+            &api,
+            "/v1/features/system_proxy",
+            json!({ "enabled": true })
+        )
+        .await,
+        (200, json!({}))
+    );
+    assert_eq!(
+        get(&api, "/v1/features/system_proxy").await,
+        (200, json!({ "enabled": true }))
+    );
+    assert_eq!(
+        get(&api, "/v1/features/mitm").await,
+        (200, json!({ "enabled": false })),
+        "only system_proxy is live"
+    );
+    assert_eq!(
+        post(
+            &api,
+            "/v1/features/system_proxy",
+            json!({ "enabled": false })
+        )
+        .await,
+        (200, json!({}))
+    );
+    assert!(!api.control.system_proxy.load(Ordering::SeqCst));
+    api.control.fail_system_proxy.store(true, Ordering::SeqCst);
+    let (status, body) = post(
         &api,
         "/v1/features/system_proxy",
         json!({ "enabled": true }),
     )
     .await;
-    assert_eq!(status, 501, "M4a: not implemented");
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(
+        body["error"],
+        "no supported desktop proxy settings were found"
+    );
+    let (status, _) = post(
+        &api,
+        "/v1/features/system_proxy",
+        json!({ "enabled": "yes" }),
+    )
+    .await;
+    assert_eq!(status, 400);
     assert_eq!(get(&api, "/v1/features/teleport").await.0, 404);
     assert_eq!(
         get(&api, "/v1/modules").await.1,

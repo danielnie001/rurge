@@ -92,8 +92,10 @@ pub trait Control: Send + Sync {
     fn reload(&self) -> BoxFuture<'_, ReloadReport>;
     fn stop(&self) -> BoxFuture<'_, ()>;
     fn set_log_level(&self, level: LogLevel) -> Result<(), String>;
-    /// M4b wires this to the platform; M4a implementations return `Err("not implemented")`.
+    /// Points the operating system's proxy settings at rurge, or puts them
+    /// back. The error text is shown to the API caller.
     fn set_system_proxy(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>>;
+    fn system_proxy_enabled(&self) -> bool;
 }
 
 #[cfg(test)]

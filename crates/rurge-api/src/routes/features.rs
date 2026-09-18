@@ -1,6 +1,5 @@
-//! `GET/POST /v1/features/{name}` (M4 design §5.2): every feature reads as
-//! off in phase 1; only `system_proxy` can be switched, and only once M4b
-//! implements `Control::set_system_proxy`.
+//! `GET/POST /v1/features/{name}` (M4 design §5.2): only `system_proxy` is
+//! live in phase 1; the others read as off and cannot be switched.
 
 use crate::App;
 use crate::error::{ApiError, ApiResult, json_body};
@@ -27,9 +26,13 @@ fn known(name: &str) -> ApiResult<()> {
     }
 }
 
-pub async fn get_feature(Path(name): Path<String>) -> ApiResult<Json<Value>> {
+pub async fn get_feature(
+    State(app): State<App>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
     known(&name)?;
-    Ok(Json(json!({ "enabled": false })))
+    let enabled = name == "system_proxy" && app.control.system_proxy_enabled();
+    Ok(Json(json!({ "enabled": enabled })))
 }
 
 #[derive(Deserialize)]
@@ -49,9 +52,10 @@ pub async fn set_feature(
             "feature `{name}` is not available in this phase"
         )));
     }
-    match app.control.set_system_proxy(body.enabled).await {
-        Ok(()) => Ok(Json(json!({}))),
-        Err(e) if e.contains("not implemented") => Err(ApiError::not_implemented(e)),
-        Err(e) => Err(ApiError::internal(e)),
-    }
+    app.control
+        .set_system_proxy(body.enabled)
+        .await
+        .map_err(ApiError::internal)?;
+    tracing::info!(enabled = body.enabled, "system proxy switched via http-api");
+    Ok(Json(json!({})))
 }

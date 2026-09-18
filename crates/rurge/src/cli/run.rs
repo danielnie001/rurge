@@ -207,6 +207,10 @@ impl Control for LoopControl {
     fn set_system_proxy(&self, _enabled: bool) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async { Err("not implemented".to_string()) })
     }
+
+    fn system_proxy_enabled(&self) -> bool {
+        false
+    }
 }
 
 /// Builds one config generation. Used both at startup and on every reload.
