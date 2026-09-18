@@ -70,6 +70,12 @@ rurge dns lookup -c surge.conf www.example.com --trace
 
 # 运行
 rurge run -c config.conf
+
+# 运行，并把系统代理指向 rurge（退出或崩溃后自动恢复）
+rurge run -c config.conf --system-proxy
+
+# 先看清注册开机自启会做什么（去掉 --dry-run 才真正安装）
+rurge service install -c config.conf --user --dry-run
 ```
 
 配置文件直接采用 Surge 格式：
@@ -194,6 +200,12 @@ rurge dns lookup -c surge.conf www.example.com --trace
 
 # Run
 rurge run -c config.conf
+
+# Run and point the system proxy at rurge (restored on exit or crash)
+rurge run -c config.conf --system-proxy
+
+# Preview what registering automatic startup would do (drop --dry-run to install)
+rurge service install -c config.conf --user --dry-run
 ```
 
 Profiles use the Surge format directly; see the example in the Chinese section above.

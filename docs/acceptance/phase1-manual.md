@@ -38,6 +38,8 @@
 | 5 | 带 `--system-proxy` 启动后，用「任务管理器」结束 `rurge.exe` 进程（或 `taskkill /f /im rurge.exe`）；确认代理仍指向 rurge；再执行一次 `rurge.exe run -c <conf>`（这次不带 `--system-proxy`） | 强杀后注册表仍指向 rurge；下一次启动的日志里有一条 WARN（"a previous run left the system proxy pointing at rurge; restoring the saved settings"），随后注册表恢复原值；`<data-dir>\state.json` 的 `system_proxy_backup` 为 `null` | | | |
 | 6 | 带 `--system-proxy` 运行中，编辑 `<conf>` 的 `skip-proxy`（加一条新域名），执行 `rurge.exe reload -c <conf>` | `ProxyOverride` 随之更新，包含新加域名对应的模式 | | | |
 | 7 | `rurge.exe service install -c <conf> --user --dry-run` 看计划；确认无误后去掉 `--dry-run` 正式安装；重新登录 Windows；最后 `rurge.exe service uninstall --user` | dry-run 打印一条 `schtasks /create /tn rurge /sc onlogon …` 命令且不改变任何东西；正式安装后「任务计划程序」里出现名为 `rurge` 的任务；重新登录后该任务已启动 rurge（任务管理器里能看到 `rurge.exe`）；卸载后任务消失 | | | |
+| 8 | **PAC 专项**：先在「设置 → 网络和 Internet → 代理」里打开「使用设置脚本」（即注册表的 `AutoConfigURL`，指向一个本机 `.pac` 文件即可），再执行 `rurge.exe run -c <conf> --system-proxy` | 记录浏览器实际走的是 PAC 还是 rurge。rurge 只读写 `ProxyEnable` / `ProxyServer` / `ProxyOverride`，既不清除也不备份 `AutoConfigURL`，因此预期是「看起来开着但不起作用」（PAC 优先）——确认这一行为并回填；退出后 `AutoConfigURL` 应原封未动 | | | |
+| 9 | **仅 SOCKS 专项**：用一份没有 `http-listen`、只有 `socks5-listen = 127.0.0.1:6153` 的 Profile 执行 `rurge.exe run -c <conf> --system-proxy` | 记录 `ProxyServer` 的取值（应当只有 `socks=127.0.0.1:6153` 一段），以及浏览器 / `curl.exe` 是否真的能经这一段连上 rurge——基于 WinINet 的客户端历史上把 `socks=` 当作 SOCKS4 解释，而 rurge 的入站只讲 SOCKS5，这一条尚未在真机验证，结论回填后同步到 `docs/surge-compatibility-matrix.md` | | | |
 
 ---
 
@@ -45,7 +47,7 @@
 
 | # | 操作 | 期望结果 | 结果 | 日期 | 系统版本 |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `networksetup -listallnetworkservices` 找到当前启用的服务名（如 `Wi-Fi`），再运行 `./rurge run -c <conf> --system-proxy` | 启动日志里出现 `system proxy enabled: http 127.0.0.1:6152, socks 127.0.0.1:6153`；`networksetup -getwebproxy Wi-Fi`（换成实际服务名）显示 `Enabled: Yes` / `Server: 127.0.0.1` / `Port: 6152` | | | |
+| 1 | `networksetup -listallnetworkservices` 找到当前启用的服务名（如 `Wi-Fi`），再运行 `./rurge run -c <conf> --system-proxy` | 启动日志里出现 `system proxy enabled: http 127.0.0.1:6152, socks 127.0.0.1:6153`；`networksetup -getwebproxy Wi-Fi`（换成实际服务名）显示 `Enabled: Yes` / `Server: 127.0.0.1` / `Port: 6152`。**可选**：把 `http-listen` 改成 `[::1]:6152` 再跑一次，记录 `networksetup -getwebproxy <服务>` 的 `Server` 是否是 `::1`——rurge 会把通配地址换成同族回环，但 `networksetup` 是否接受 IPv6 字面量没有在真机验证过 | | | |
 | 2 | 浏览器分别访问一个走 DIRECT 的站点与一个命中 Profile 里 REJECT 规则的站点（如 `example.com`） | `./rurge status -c <conf>` 的活动请求数随访问变化；`GET http://127.0.0.1:6171/v1/requests/recent`（带 `X-Key: testkey`）里能看到这两条记录，`rule` / `policy` 分别对应 DIRECT 与 REJECT | | | |
 | 3 | `curl -s -X POST -H 'X-Key: testkey' -d '{"enabled":false}' http://127.0.0.1:6171/v1/features/system_proxy`，确认后再用 `{"enabled":true}` 重新打开 | 关闭后 `networksetup -getwebproxy <服务>` 等回到原值；重新打开后再次指向 `127.0.0.1:6152` | | | |
 | 4 | Ctrl-C 终止 `rurge run` | 终端打印 `system proxy restored`；`networksetup -getwebproxy <服务>` 回到原值 | | | |
@@ -66,7 +68,7 @@
 | 4 | Ctrl-C 终止 `rurge run` | 终端打印 `system proxy restored`；GNOME/KDE 的代理设置回到原值 | | | |
 | 5 | 带 `--system-proxy` 运行中，`kill -9 $(pgrep -f "rurge run")`；确认代理仍指向 rurge；再执行一次 `./rurge run -c <conf>`（不带 `--system-proxy`） | 强杀后代理设置仍指向 rurge；下一次启动的日志里有一条 WARN（"a previous run left the system proxy pointing at rurge; restoring the saved settings"），随后设置回到原值；`<data-dir>/state.json` 的 `system_proxy_backup` 为 `null` | | | |
 | 6 | 带 `--system-proxy` 运行中，编辑 `<conf>` 的 `skip-proxy`（加一条新域名），执行 `./rurge reload -c <conf>` | GNOME 的 `ignore-hosts` 或 KDE 的 `NoProxyFor` 随之更新，包含新加的域名 | | | |
-| 7 | `./rurge service install -c <conf> --user --dry-run` 看计划；确认无误后去掉 `--dry-run` 正式安装；重新登录（或重启）；最后 `./rurge service uninstall --user` | dry-run 打印一份 systemd unit 内容（含 `ExecStart=`）和一条 `systemctl --user enable --now rurge` 命令且不改变任何东西；正式安装后 `systemctl --user status rurge` 是 running；重新登录（或重启）后 rurge 已在运行；卸载后该 unit 消失 | | | |
+| 7 | `./rurge service install -c <conf> --user --system-proxy --dry-run` 看计划；确认无误后去掉 `--dry-run` 正式安装；重新登录（或重启）；最后 `./rurge service uninstall --user`。另外再执行一次 `./rurge service install -c <conf> --system-proxy --dry-run`（**不带** `--user`，即 system 范围） | dry-run 打印一份 systemd unit 内容（含 `ExecStart=… --system-proxy`、`PartOf=graphical-session.target`、`After=graphical-session.target`、`WantedBy=graphical-session.target`、`StartLimitIntervalSec=60`、`StartLimitBurst=5`）和一条 `systemctl --user enable --now rurge` 命令且不改变任何东西；正式安装后 `systemctl --user status rurge` 是 running；重新登录（或重启）后 rurge 已在运行，**并且桌面的代理设置已经由这个服务指向 rurge**（GNOME 下 `gsettings get org.gnome.system.proxy mode` 为 `'manual'`、`.http host` 为 `'127.0.0.1'`；KDE 下 `ProxyType` 为 `1`）；卸载后该 unit 消失。不带 `--user` 的那一次必须以退出码 2 结束，stderr 是 `error: --system-proxy needs a desktop session: on Linux install with --user`，且不写任何文件 | | | |
 | 8 | **额外检查**：在一个既不是 GNOME 也不是 KDE 的桌面（或没有安装 `gsettings`/`kwriteconfig6`/`5` 的环境）下执行 `./rurge run -c <conf> --system-proxy` | 命令以退出码 1 结束；stderr 有一行 `error: cannot enable the system proxy: no supported desktop proxy settings (GNOME or KDE) were found; set the proxy in your shell instead:` 并附一行 `export http_proxy=… https_proxy=… no_proxy=…` 提示；系统没有任何设置被改动 | | | |
 
 ---

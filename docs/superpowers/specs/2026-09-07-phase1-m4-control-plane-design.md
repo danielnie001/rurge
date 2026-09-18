@@ -311,7 +311,7 @@ M4b 已实现（分支 `m4b-platform`）；下面先列本计划「计划期决�
 - **P2 注册表 API**：用 `windows-registry` 0.6（安全 API，已经由 `ipconfig` 带进依赖图），不是 §8.1 表格写的 `winreg`；注册表部分因此不需要 `unsafe`。
 - **P3 通配地址换回环**：`0.0.0.0` → `127.0.0.1`、`::` → `::1`，按监听地址的**族**选回环（复用 `cli::control::connect_addr`），不是 §8.1「一律用 `127.0.0.1`」；Windows 上 `[::]` 默认只监听 v6，`127.0.0.1` 连不上。
 - **P4 KDE 探测**：要求 `XDG_CURRENT_DESKTOP` 含 `KDE` **且**同时有 `kwriteconfig6`/`kreadconfig6`（退而求其次 `5`），细化 §8.1「`kwriteconfig6` 可用」——只看工具是否存在会在其它桌面上误写 `kioslaverc` 却报告成功。
-- **P5 端到端测试用真实二进制 + 文件后端**：`RURGE_SYSTEM_PROXY_BACKEND=file:<path>` 让 `rurge run` 把「系统代理」读写到一个 JSON 文件，未知取值直接报错退出；CLI 测试给每一个启动的守护进程都设这个变量（`crates/rurge/tests/cli.rs` 的 `guard_system_proxy`，覆盖到全部 `rurge run` 调用点）。§9 原本设想的是纯 mock 单元测试，实际还加了一层文件后端的真实进程测试，专门覆盖崩溃恢复这类只有真实二进制才能验证的生命周期。
+- **P5 端到端测试用真实二进制 + 文件后端**：`RURGE_SYSTEM_PROXY_BACKEND=file:<path>` 让 `rurge run` 把「系统代理」读写到一个 JSON 文件，未知取值直接报错退出；CLI 测试给每一个启动的守护进程都设这个变量（`crates/rurge/tests/cli.rs` 里构造 `rurge run` 的唯一入口 `rurge_run(conf, data)` 自带这个护栏；最终评审修复波之前它是需要每个调用点自己记得调用的 `guard_system_proxy`）。§9 原本设想的是纯 mock 单元测试，实际还加了一层文件后端的真实进程测试，专门覆盖崩溃恢复这类只有真实二进制才能验证的生命周期。
 - **P6 Windows 退出信号**：除 Ctrl-C 外，控制台关闭、注销、系统关机（`ctrl_close` / `ctrl_logoff` / `ctrl_shutdown`）也会先恢复系统代理再退出，§8.2 的生命周期文字未列出这三种；这三种事件下进程仍有几秒钟窗口。
 - **P7 `--dry-run`**：`rurge service install / uninstall` 多一个 `--dry-run`，只打印将写的文件与将执行的命令，不改变任何东西；§8.3 未提及，为了让 CLI 可端到端测试，也方便用户在需要权限的操作前先看清计划。
 - **P8 `schtasks /f`**：Windows 的 `schtasks /create` 追加 `/f`，细化 §8.3 的命令；任务已存在时 `schtasks` 会交互式询问是否覆盖，非交互环境（CLI 测试与大多数部署脚本）会直接挂住。
@@ -322,6 +322,14 @@ M4b 已实现（分支 `m4b-platform`）；下面先列本计划「计划期决�
 **执行期的其它裁定**
 
 - **重载后没有可用监听器时不关闭系统代理**（细化 §8.2「重载后监听地址变化…→ 重新 `apply`」，未覆盖「重载后完全没有监听器」这个情形）：如果系统代理开着、且当前一批监听器算不出任何可以指的地址（`current_settings` 返回 `None`，通常是重绑监听器失败清空了列表），rurge 不会顺带关掉系统代理——那等于替用户做了一次「改直连」的路由决定——而是打一条 WARN 说明系统仍指向旧地址，等下一次重载成功或者进程退出再恢复。重载失败但仍保留旧监听器的那几种情形（配置解析失败、构建 `Runtime` 失败——这两者都发生在换代之前）不属于这个情形，不会多打日志。
+
+**最终评审修复波（全分支评审后的一次性修复，2026-09-18）**
+
+- **A. 崩溃恢复提前到任何绑定之前**（订正 §8.2 的启动顺序）：`SystemProxyManager` 的创建与 `recover()` 移到 `StateStore::open` 之后、`bind_listeners` 与 `http-api` 绑定**之前**。原顺序下，上一次崩溃留下的端口被占用时本次启动会先以退出码 1 结束，备份永远得不到恢复，机器一直指着一个死端口，且每次重试都卡在同一处。把崩溃前的设置放回去与本次能否启动无关。`--system-proxy` 的开启仍留在原位（信号流建好之后）。
+- **B. Linux 的 `service install --system-proxy`**（订正 §8.3 的 systemd unit）：system 范围 + `--system-proxy` 被 `install_plan` 直接拒绝（`InvalidInput`，`--system-proxy needs a desktop session: on Linux install with --user`）——system unit 以 root 运行、没有桌面会话，Linux 后端每次都会 `Unsupported`，配合 `Restart=on-failure` 就成了每 3 秒一次的无限重启；`--user` + `--system-proxy` 的 unit 改挂图形会话（`PartOf=` / `After=` / `WantedBy=graphical-session.target`），不带 `--system-proxy` 时仍是 `default.target`；所有 systemd unit 加 `StartLimitIntervalSec=60` / `StartLimitBurst=5`。判断全部在 `rurge-platform` 内（AR-02）。
+- **C. KDE 恢复不依赖当前会话的 `PATH`**：`LinuxBackup` 增加 `#[serde(default)] kde_write`，快照时只在 KDE 下记录写工具名；恢复 `"kde"` 备份时按「当前探测到的 → 备份记录的 → `kwriteconfig6`」取用，不再提前返回 `NotFound`。原来从 TTY / 裁剪过的 `PATH` / 换过桌面的会话里恢复会直接失败，备份就永远留在 `state.json` 里，每次启动只多打一条 ERROR。命令仍走 `run_best_effort`，工具真的不存在时报的是逐条命令的错误并带上工具名。
+- **E. `--dry-run` 守卫可测 + `sudo` 下的 `--user`**：`carry_out` 改收 `&dyn CommandRunner`（两个调用点传 `&SystemRunner`），补上「dry-run 不调用 runner、不写文件」的单元测试——在此之前，唯一挡在测试与真实 `schtasks /create` / `systemctl enable` 之间的只有一处 `if dry_run`，没有任何断言守住它。另外 `rurge service … --user` 在 `sudo` 下（uid 0）指向 launchd 的 `gui/0`，即 root 的会话而不是用户的，现在由纯函数 `check_user_scope` 拒绝（退出 2）。
+- **F. Windows `ProxyOverride` 卫生**：条目里含字面 `;` 会把值意外拆成多条模式，改为丢弃并打 debug 日志（与 IPv6 网段一致）；`exclude-simple-hostnames` 追加 `<local>` 前先去重。
 
 **已知限制**
 

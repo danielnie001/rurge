@@ -3932,12 +3932,20 @@ EOF
 | Task 5 → Task 8 | 生命周期新增一条设计文档 §8.2 未覆盖的规则：重载后如果没有任何可用监听器而系统代理仍是开启状态，rurge 不会自动关闭系统代理，只打一条 WARN；Task 8 实现与评审阶段把触发条件从「任意重载失败」收紧为「系统代理开着且当前监听器算不出任何可用地址」 | Task 5 裁定：静默关闭代理等于替用户做了一次路由决定，保留旧设置直到下一次成功重载或退出更安全。Task 8 评审（opus）指出原措辞在「重载失败但仍保留旧监听器」的三种情形（配置解析失败、构建 `Runtime` 失败，均发生在换代之前）里会误报——那些情形下地址并未失效；收紧条件更准确 |
 | Task 8 | P5（每个由 CLI 测试启动的 `rurge run` 都必须带 `RURGE_SYSTEM_PROXY_BACKEND` 文件后端）收进一个共用的 `guard_system_proxy` 辅助函数，并补齐到 `cli.rs` 里两处原先绕过它的直接调用 | 评审（opus）指出这两处调用虽然当时无害（在触达 `backend()` 之前就已退出），但仍是 Global Constraints 明确禁止的测试安全漏洞；一并补一个系统代理开启失败的端到端测试（不可写的 `file:` 路径 → 退出 1、stderr 有消息、状态回滚），并把等待逻辑改成先等 `system proxy restored` 这一行再等进程退出，避免读取线程滞后于 `try_wait` |
 | Task 7 | `/v1/test/dns_delay` 分两次快照分别读 `internet_test_url()` 与 `resolver()`（P11 落地时新增的两个引擎视图），评审指出重载恰好夹在两次读之间时可能用旧的默认域名去配一个新的 resolver | 裁定维持现状：两代之间不存在「域名必须与 resolver 同代」这种不变量（只是一个诊断端点，两次读之间没有 `await`，任何一代的默认域名对任何一代的 resolver 都是合法输入）；把两次读合并成一个视图会让 `rurge-api` 重新依赖 `Runtime` 的内部形状，这正是 P11 要解除的耦合 |
+| 最终评审修复波 A | `SystemProxyManager` 的创建与 `recover()` 从「绑定监听器与 `http-api` 之后」移到「`StateStore::open` 之后、任何绑定之前」，并补一个端到端用例：崩溃后端口被占，`rurge run` 仍退出 1，但备份已还原、`state.json` 的 `system_proxy_backup` 为 `null` | 全分支评审（opus）标为 Important：上一次崩溃留下的端口往往正是本次绑不上的原因，原顺序下备份永远得不到恢复，机器一直指着一个死端口，且每次重试都卡在同一处。裁定：把崩溃前的设置放回去与本次能否启动无关，因此恢复必须排在一切会提前退出的步骤之前 |
+| 最终评审修复波 B | `install_plan(Os::Unix, Scope::System, …, system_proxy = true)` 直接拒绝；`--user` + `--system-proxy` 的 unit 改挂 `graphical-session.target`（`PartOf=` / `After=` / `WantedBy=`）；所有 systemd unit 加 `StartLimitIntervalSec=60` / `StartLimitBurst=5` | 全分支评审（opus）标为 Important：system unit 以 root 运行、没有桌面会话，Linux 后端每次都会 `Unsupported`，配合 `Restart=on-failure` 就是每 3 秒一次的无限重启；`--user` 单元原先挂 `default.target`，可能在图形会话导出 `XDG_CURRENT_DESKTOP` / D-Bus 地址之前就启动。全部判断留在 `rurge-platform` 内（AR-02） |
+| 最终评审修复波 C | `LinuxBackup` 增加 `#[serde(default)] kde_write`（只在 KDE 快照时填写）；恢复 `"kde"` 备份按「当前探测到的 → 备份记录的 → `kwriteconfig6`」取写工具，不再提前返回 `NotFound` | 全分支评审（opus）标为 Important：从 TTY、裁剪过的 `PATH` 或换过桌面的会话里恢复时 `self.kde()?` 会失败，备份就永远留在 `state.json` 里，每次启动只多打一条 ERROR。命令仍走 `run_best_effort`，工具真的缺失时报的是逐条命令的错误并带上工具名 |
+| 最终评审修复波 D | CLI 测试新增唯一的 `rurge_run(conf, data)` 构造函数（P5 护栏内置），`guard_system_proxy` 并入其中；`spawn_daemon_full` 与三个直接调用点全部改走它，`"run"` 字面量只剩构造函数一处 | 全分支评审（opus）标为 Important：P5 原先靠「每个调用点都记得调用 `guard_system_proxy`」，将来新增一个带 `--system-proxy` 却忘了护栏的用例会直接写开发机的真实注册表。裁定：改成构造即安全，不留第二种构造 `run` 命令的方式 |
+| 最终评审修复波 E | `carry_out` 改收 `&dyn CommandRunner`（两个调用点传 `&SystemRunner`），补 dry-run / 真实执行 / 命令失败三个单元测试；`rurge service … --user` 在 `sudo` 下（uid 0）由纯函数 `check_user_scope` 拒绝 | 全分支评审（opus）标为 Important 并在分诊里判为「合并前唯一必须修的延后项」：此前唯一挡在测试与真实 `schtasks /create` / `systemctl enable` 之间的只有一处 `if dry_run`，没有任何断言守住它（本波已用变异验证：把守卫改成恒假，dry-run 用例立即失败）。`--user` 的 sudo 拒绝是同一次评审的 minor（launchd 的 `gui/0` 是 root 的会话） |
+| 最终评审修复波 F | `proxy_override_value`：含字面 `;` 的条目丢弃并打 debug 日志；`<local>` 追加前先去重 | 全分支评审（opus）把 Task 1 延后的这条 minor 判为「现在顺手修掉」：一个含 `;` 的 `skip-proxy` 条目会被 Windows 拆成两条模式，语义与用户写的不一致 |
 
 ## 延后事项
 
 （执行时填写：审查中发现但不在 M4b 范围内的问题，带去向——阶段 2 / 阶段 6。）
 
 去向的四个桶：**本分支最终评审**（留给合并前的全分支评审判断是否要修）、**阶段 2**、**阶段 6**、**手工验收**（`docs/acceptance/phase1-manual.md`）。已经在 Task 10 里直接处理完（写进设计文档 §15 或兼容性清单）的项目单独标注，不再是待办。
+
+「本分支最终评审」这个桶已经关闭：全分支评审已经完成并对每一条做了分诊，结论与改写后的去向见本节末尾的「全分支最终评审（2026-09-18）的分诊结论」；仍写着「去向：本分支最终评审」而没有被单独标注的条目，一律按那一段改读为**阶段 6**。
 
 **Task 1（`rurge_platform::sysproxy` 核心类型与 Windows 后端）**
 
@@ -3947,7 +3955,7 @@ EOF
 - 注册表相关的 `io::Error` 一律是 `ErrorKind::Uncategorized`（HRESULT 被当成原始 os error），调用方无法按 `kind()` 分支处理。去向：本分支最终评审。
 - CIDR 前缀展开表只测试了部分前缀长度（缺 `/1`–`/7`、`/17`–`/23` 与主机位非零的情形；人工验算结果正确，但没有落成用例）。去向：本分支最终评审。
 - 单条 `/1`、`/9`、`/17` 或 `/25` 的 `skip-proxy` 网段会展开成 128 条 `ProxyOverride` 通配模式，没有上限。去向：已在兼容性清单 `skip-proxy` 行与 `docs/api/phase1.md` 登记，不再是待办。
-- `<local>` 追加时未去重；条目内如果出现字面 `;` 会把 `ProxyOverride` 意外拆成多段。去向：本分支最终评审。
+- `<local>` 追加时未去重；条目内如果出现字面 `;` 会把 `ProxyOverride` 意外拆成多段。去向：**已在最终评审修复波 F 修复**，不再是待办。
 - `NOT_FOUND` 常量的 `#[cfg(windows)]` 写在文档注释之前，与 `RealRegistry` 的顺序不一致（纯风格问题）。去向：本分支最终评审。
 - `apply()` 不清除也不备份 `AutoConfigURL`（PAC）。去向：已在兼容性清单与设计文档 §15 登记为已知限制，不再是待办。
 
@@ -3967,7 +3975,7 @@ EOF
 - `env_hint` 在 http/https/bypass 都为空时返回 `"export "`（尾部带空格但没有变量）。去向：本分支最终评审。
 - 损坏的 Linux 备份统一报"wrong platform"，其中显式的桌面平台检查分支未测。去向：本分支最终评审。
 - 测试 `kde_apply_writes_kioslaverc_and_tells_kio` 里对 dbus 调用的断言写在了函数末尾而不是紧邻处，命名与断言位置不完全对应（测试卫生）。去向：本分支最终评审。
-- 测试覆盖缺口：GNOME 下 IPv6 主机、KDE 在 restore 时找不到工具、`XDG_CURRENT_DESKTOP` 大小写变体。去向：本分支最终评审。
+- 测试覆盖缺口：GNOME 下 IPv6 主机、KDE 在 restore 时找不到工具、`XDG_CURRENT_DESKTOP` 大小写变体。去向：其中「KDE 在 restore 时找不到工具」**已在最终评审修复波 C 修复并补上用例**（连同行为本身）；另外两条去向阶段 6。
 - `platform()` 对非 windows / 非 unix 目标没有 `compile_error!`，会在不支持的目标上给出较难懂的编译错误而不是明确提示。去向：本分支最终评审。
 
 **Task 4（`rurge service` 安装 / 卸载计划与执行器）**
@@ -3997,7 +4005,24 @@ EOF
 
 **Task 9（`rurge service install / uninstall` CLI）**
 
-- dry-run 的安全性只靠一处 `if dry_run` 判断把关，没有"注入假 runner 后断言真实命令未被调用"的测试；如果这处判断回归，会在测试的 trailer 断言失败之前先真的执行一次系统命令。去向：本分支最终评审（建议优先修）。
-- 非 dry-run 的成功 / 执行失败提示文本（`installed: …`、`uninstalled`、失败时的 `error: …`）没有自动化测试，因为执行真实的 `systemctl` / `launchctl` / `schtasks` 违反测试规则。去向：手工验收（`docs/acceptance/phase1-manual.md` 第 7 条）。
-- 相对路径的 `-c` 没有自动化测试。去向：本分支最终评审。
+- dry-run 的安全性只靠一处 `if dry_run` 判断把关，没有"注入假 runner 后断言真实命令未被调用"的测试；如果这处判断回归，会在测试的 trailer 断言失败之前先真的执行一次系统命令。去向：**已在最终评审修复波 E 修复**（`carry_out` 收 `&dyn CommandRunner`，三个单元测试），不再是待办。
+- 非 dry-run 的成功 / 执行失败提示文本（`installed: …`、`uninstalled`、失败时的 `error: …`）没有自动化测试，因为执行真实的 `systemctl` / `launchctl` / `schtasks` 违反测试规则。去向：修复波 E 之后，这三条文本已能用注入的假 runner 覆盖成功 / 失败两条路径；真实工具的行为仍归手工验收（`docs/acceptance/phase1-manual.md` 第 7 条）。
+- 相对路径的 `-c` 没有自动化测试。去向：阶段 6。
+
+**全分支最终评审（2026-09-18）的分诊结论**
+
+最终评审对上面所有去向为「本分支最终评审」的条目做了一次分诊：**只有 Task 9 的 dry-run 守卫必须在合并前修**（连同评审自己发现的 5 个 Important 与 3 个「顺手修掉」的 minor，见「执行期修正记录」表里的修复波 A–F）；其余一律保持延后，去向按下表改写为**阶段 6**（代码质量与测试覆盖的集中整理）或**手工验收**。评审自己发现、修复波未处理的剩余 minor：
+
+- `restore()` 把任何反序列化失败都归类成"wrong platform"，掩盖真正的原因（Windows / macOS / Linux 三个后端都是）。去向：阶段 6。
+- Windows 的 `delete()` 在键不存在时会先 `create()` 打开（进而创建该键）再删值。去向：阶段 6。
+- GNOME 的 `restore` 跳过值为空串的键（`filter_map` + `!value.is_empty()`）：原本就是空的键不会被显式写回，依赖 `mode` 最后一条把整体拨回原状态。去向：阶段 6。
+- `env_hint` 在 http / https / bypass 全空时返回 `"export "`（尾部带空格、没有变量）。去向：阶段 6。
+- `tool_on_path` 只看 `PATH` 上是否有同名文件，不检查可执行位。去向：阶段 6。
+- `platform()` 对非 windows / 非 unix 目标没有 `compile_error!`；`cfg` 风格不统一（`ShutdownSignals` 用 `#[cfg(windows)]`，打印用 `#[cfg(not(unix))]`）。去向：阶段 6。
+- `service uninstall` 之后没有 `systemctl daemon-reload`，systemd 会留下一条"unit 文件已消失"的告警直到下次 reload。去向：阶段 6。
+- `execute()` 用 `plan.remove` 是否为空来区分"安装（首个命令失败就停）"与"卸载（继续做完再报第一个错）"，是隐式约定而不是显式参数。去向：阶段 6。
+- `StateStore` 读到损坏的 `state.json` 时会改名成 `state.json.broken`——这个文件里可能正好存着用户的原始系统代理设置，而新的 `state.json` 是空的，恢复就丢了线索（日志提到了该文件，但没有说明它可能含有待恢复的备份）。去向：阶段 6。
+- 双重失败（`apply` 失败且回滚的 `restore` 也失败）时 `state.json` 的 `features.system_proxy` 仍是 `true`，而内存里的 `applied` / `flag` 已是 `false`。补充事实：`features.system_proxy` 这个字段目前**没有任何读取方**（API 的 `GET /v1/features/system_proxy` 读的是 `Control::system_proxy_enabled`，即内存里的 flag；崩溃恢复看的是 `system_proxy_backup`），所以这条不一致目前不可观测，下一次 `disable()` / `recover()` 也会自愈。去向：阶段 6。
+- Windows 的 `ProxyServer` 里 `socks=<addr>` 一段是否会被基于 WinINet 的客户端当成 SOCKS4（rurge 的入站只讲 SOCKS5）。去向：手工验收（`docs/acceptance/phase1-manual.md` Windows 第 9 条）。
+- macOS 把 IPv6 字面量（如 `::1`）交给 `networksetup -setwebproxy` 是否被接受，没有真机验证过。去向：手工验收（`docs/acceptance/phase1-manual.md` macOS 第 1 条的可选检查）。
 
