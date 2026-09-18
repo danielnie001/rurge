@@ -234,7 +234,12 @@ pub fn uninstall_plan(
 pub fn execute(plan: &Plan, runner: &dyn CommandRunner) -> io::Result<()> {
     for (path, content) in &plan.files {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            std::fs::create_dir_all(dir).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("cannot create directory {}: {e}", dir.display()),
+                )
+            })?;
         }
         std::fs::write(path, content).map_err(|e| {
             io::Error::new(e.kind(), format!("cannot write {}: {e}", path.display()))
@@ -338,6 +343,15 @@ mod tests {
             systemd_quote(Path::new("/opt/100%/ru\"rge$")),
             "\"/opt/100%%/ru\\\"rge$$\""
         );
+        // real backslashes are each doubled
+        assert_eq!(
+            systemd_quote(Path::new(r"C:\dir\rurge")),
+            r#""C:\\dir\\rurge""#
+        );
+        // order-sensitive: a backslash immediately followed by a quote. Escaping
+        // the quote before doubling the backslash would instead double the
+        // backslash the quote-escape itself introduced, corrupting the output.
+        assert_eq!(systemd_quote(Path::new("a\\\"b")), "\"a\\\\\\\"b\"");
     }
 
     #[test]
@@ -463,5 +477,26 @@ mod tests {
             !unit.exists(),
             "the unit is gone although the command failed"
         );
+    }
+
+    #[test]
+    fn execute_reports_the_directory_it_could_not_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let install = Plan {
+            files: vec![(blocker.join("rurge.service"), "unit text".to_string())],
+            commands: vec![vec!["systemctl".to_string(), "enable".to_string()]],
+            remove: Vec::new(),
+        };
+        let runner = FakeRunner::default();
+        let err = execute(&install, &runner).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("cannot create directory"), "{message}");
+        assert!(
+            message.contains(&blocker.display().to_string()),
+            "{message}"
+        );
+        assert!(runner.calls().is_empty());
     }
 }
