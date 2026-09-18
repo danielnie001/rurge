@@ -366,6 +366,62 @@ async fn outbound_mode_and_global_policy_round_trip_and_persist() {
 }
 
 #[tokio::test]
+async fn the_global_policy_cannot_be_cleared_while_in_proxy_mode() {
+    let api = api().await;
+    assert_eq!(
+        get(&api, "/v1/outbound/global").await,
+        (200, json!({ "policy": null }))
+    );
+    assert_eq!(
+        post(&api, "/v1/outbound/global", json!({ "policy": "Pick" }))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        post(&api, "/v1/outbound", json!({ "mode": "proxy" }))
+            .await
+            .0,
+        200
+    );
+    let (status, body) = post(&api, "/v1/outbound/global", json!({ "policy": " " })).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("while the outbound mode is proxy"),
+        "{body}"
+    );
+    assert_eq!(
+        get(&api, "/v1/outbound/global").await.1,
+        json!({ "policy": "Pick" }),
+        "unchanged"
+    );
+    // replacing it is fine, and so is clearing it once the mode moved on
+    assert_eq!(
+        post(&api, "/v1/outbound/global", json!({ "policy": "DIRECT" }))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        post(&api, "/v1/outbound", json!({ "mode": "rule" }))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        post(&api, "/v1/outbound/global", json!({ "policy": "" })).await,
+        (200, json!({}))
+    );
+    assert_eq!(
+        get(&api, "/v1/outbound/global").await.1,
+        json!({ "policy": null })
+    );
+}
+
+#[tokio::test]
 async fn features_collections_stop_and_unknown_paths() {
     let api = api().await;
     assert_eq!(
@@ -658,7 +714,7 @@ async fn traffic_total_includes_in_flight_bytes() {
 #[tokio::test]
 async fn dns_cache_flush_and_delay() {
     let api = api().await;
-    let resolver = api.engine.runtime().stack.resolver.clone();
+    let resolver = api.engine.resolver();
     resolver
         .lookup("cached.test", rurge_dns::LookupOpts::default())
         .await

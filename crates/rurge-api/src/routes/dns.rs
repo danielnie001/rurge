@@ -36,7 +36,7 @@ fn now_secs() -> f64 {
 }
 
 pub async fn dns(State(app): State<App>) -> Json<DnsJson> {
-    let resolver = app.engine.runtime().stack.resolver.clone();
+    let resolver = app.engine.resolver();
     let now = now_secs();
     let dns_cache = resolver
         .cache_snapshot()
@@ -63,7 +63,7 @@ pub async fn dns(State(app): State<App>) -> Json<DnsJson> {
 }
 
 pub async fn flush(State(app): State<App>) -> Json<Value> {
-    app.engine.runtime().stack.resolver.flush();
+    app.engine.resolver().flush();
     tracing::info!("dns cache flushed via http-api");
     Json(json!({}))
 }
@@ -98,16 +98,15 @@ pub async fn dns_delay(
     body: Result<Json<DelayBody>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
     let body = json_body(body)?;
-    let rt = app.engine.runtime();
     let name = match body.name.filter(|n| !n.trim().is_empty()) {
         Some(n) => n,
-        None => host_of(&rt.config.general.internet_test_url).ok_or_else(|| {
+        None => host_of(&app.engine.internet_test_url()).ok_or_else(|| {
             ApiError::bad_request("no name given and internet-test-url has no host")
         })?,
     };
-    let delays: Vec<DelayJson> = rt
-        .stack
-        .resolver
+    let delays: Vec<DelayJson> = app
+        .engine
+        .resolver()
         .measure_delay(&name)
         .await
         .into_iter()

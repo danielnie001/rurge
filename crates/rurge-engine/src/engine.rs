@@ -424,9 +424,24 @@ impl Engine {
             .collect()
     }
 
+    /// The resolver of the current config generation.
+    pub fn resolver(&self) -> Arc<rurge_dns::Resolver> {
+        self.runtime().stack.resolver.clone()
+    }
+
+    /// `internet-test-url` of the current config generation.
+    pub fn internet_test_url(&self) -> String {
+        self.runtime().config.general.internet_test_url.clone()
+    }
+
+    /// The main profile file of the current config generation.
+    pub fn profile_path(&self) -> std::path::PathBuf {
+        self.runtime().config.source.main.clone()
+    }
+
     /// The current main profile text; secrets redacted unless `sensitive`.
     pub async fn config_text(&self, sensitive: bool) -> io::Result<String> {
-        let path = self.runtime().config.source.main.clone();
+        let path = self.profile_path();
         let text = tokio::fs::read_to_string(&path).await?;
         Ok(if sensitive {
             text

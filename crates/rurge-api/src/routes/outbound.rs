@@ -67,6 +67,11 @@ pub async fn set_global(
     body: Result<Json<SetGlobal>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
     let body = json_body(body)?;
+    if body.policy.trim().is_empty() && app.engine.mode() == Mode::Proxy {
+        return Err(ApiError::bad_request(
+            "cannot clear the global policy while the outbound mode is proxy; switch the mode first",
+        ));
+    }
     app.engine
         .set_global_policy(&body.policy)
         .await

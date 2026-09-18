@@ -61,7 +61,7 @@ pub struct CheckJson {
 /// Re-validates the profile on disk with the daemon's load options; never
 /// touches the running config.
 pub async fn check(State(app): State<App>) -> ApiResult<Json<CheckJson>> {
-    let path = app.engine.runtime().config.source.main.clone();
+    let path = app.engine.profile_path();
     let opts = app.load_options.clone();
     let loaded = tokio::task::spawn_blocking(move || load(&path, &opts))
         .await
