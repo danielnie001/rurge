@@ -443,18 +443,19 @@ async fn reload_and_refresh(
     sysproxy: &mut SystemProxyManager,
 ) -> ReloadReport {
     let report = reload(d, listeners).await;
+    let settings = current_settings(d.engine, listeners);
     if report.ok
-        && let Err(e) = sysproxy
-            .refresh(current_settings(d.engine, listeners))
-            .await
+        && let Err(e) = sysproxy.refresh(settings.clone()).await
     {
         tracing::error!(error = %e, "cannot re-apply the system proxy after the reload");
     }
     // A reload that leaves no usable listener must not silently switch the
     // system proxy off: that would reroute the user's traffic direct without
     // them asking for it. Say so instead and leave the OS alone; a later
-    // successful reload (or a stop) puts things right.
-    if (!report.ok || current_settings(d.engine, listeners).is_none())
+    // successful reload (or a stop) puts things right. A failed reload that
+    // keeps the old listeners (a config-load or build error, not a rebind
+    // failure) is not this case, so it logs nothing extra here.
+    if settings.is_none()
         && let Some(applied) = sysproxy.applied()
     {
         tracing::warn!(
@@ -758,6 +759,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 ),
             }
         }
+        // then the API, so its graceful stop runs inside the drain
         api_token.cancel();
         engine.stop_accepting();
         engine.tracker().close();
