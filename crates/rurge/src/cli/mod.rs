@@ -5,6 +5,9 @@ pub mod dns;
 pub mod rule;
 pub mod run;
 pub mod runtime;
+// wired into `rurge run` by the next tasks of the M4b plan
+#[allow(dead_code)]
+pub mod sysproxy;
 
 use rurge_config::config::Platform;
 use rurge_config::requirement::Environment;

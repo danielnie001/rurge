@@ -37,8 +37,8 @@ pub struct StatusArgs {
     pub json: bool,
 }
 
-/// A daemon bound to a wildcard address is reached on the loopback.
-fn connect_addr(addr: SocketAddr) -> SocketAddr {
+/// A wildcard bind is reached on the loopback of the same family.
+pub(crate) fn connect_addr(addr: SocketAddr) -> SocketAddr {
     match addr.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => {
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), addr.port())
