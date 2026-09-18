@@ -125,17 +125,26 @@ pub fn proxy_override_value(settings: &ProxySettings) -> String {
             }
         }
     }
-    if settings.exclude_simple {
-        out.push("<local>".to_string());
+    let local = "<local>".to_string();
+    if settings.exclude_simple && !out.contains(&local) {
+        out.push(local);
     }
     out.join(";")
 }
 
 /// `ProxyOverride` has no CIDR syntax: an IPv4 network becomes wildcard
 /// patterns, an IPv6 literal gets brackets, anything else passes through. An
-/// IPv6 network cannot be expressed and is dropped.
+/// IPv6 network cannot be expressed and is dropped, and so is an entry
+/// carrying the `;` that separates the patterns.
 fn override_patterns(entry: &str) -> Vec<String> {
     let entry = entry.trim();
+    if entry.contains(';') {
+        tracing::debug!(
+            entry,
+            "skip-proxy entry contains `;` and would split into several ProxyOverride patterns; dropped"
+        );
+        return Vec::new();
+    }
     if let Some((addr, prefix)) = entry.split_once('/') {
         return match (addr.parse::<Ipv4Addr>(), prefix.parse::<u8>()) {
             (Ok(ip), Ok(prefix)) if prefix <= 32 => v4_wildcards(ip, prefix),
@@ -502,6 +511,21 @@ mod tests {
             "10.*",
             "IPv6 networks are dropped, duplicates collapse"
         );
+        assert_eq!(
+            value(&["a;b", "localhost"]),
+            "localhost",
+            "an entry with a `;` would become two patterns; it is dropped"
+        );
+        // `<local>` is appended for exclude-simple-hostnames, but only once
+        let with_local = |entries: &[&str]| {
+            proxy_override_value(&ProxySettings {
+                bypass: entries.iter().map(|s| s.to_string()).collect(),
+                exclude_simple: true,
+                ..ProxySettings::default()
+            })
+        };
+        assert_eq!(with_local(&["localhost"]), "localhost;<local>");
+        assert_eq!(with_local(&["<local>", "localhost"]), "<local>;localhost");
     }
 
     /// Removes the scratch key when the test ends, pass or fail.

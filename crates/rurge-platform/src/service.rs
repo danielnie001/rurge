@@ -78,12 +78,25 @@ fn systemd_unit(spec: &ServiceSpec, scope: Scope) -> String {
     if spec.system_proxy {
         exec.push_str(" --system-proxy");
     }
-    let target = match scope {
-        Scope::User => "default.target",
-        Scope::System => "multi-user.target",
+    // `--system-proxy` needs a desktop session (GNOME / KDE settings, the
+    // session bus), so that unit is tied to the graphical session rather than
+    // to login: it starts once `XDG_CURRENT_DESKTOP` and the bus are there,
+    // and stops with the session.
+    let graphical = scope == Scope::User && spec.system_proxy;
+    let session = if graphical {
+        "PartOf=graphical-session.target\nAfter=graphical-session.target\n"
+    } else {
+        ""
     };
+    let target = match (graphical, scope) {
+        (true, _) => "graphical-session.target",
+        (false, Scope::User) => "default.target",
+        (false, Scope::System) => "multi-user.target",
+    };
+    // a start limit, so a unit that can never work stops restarting every 3 s
     format!(
-        "[Unit]\nDescription=rurge proxy\nAfter=network-online.target\nWants=network-online.target\n\n\
+        "[Unit]\nDescription=rurge proxy\nAfter=network-online.target\nWants=network-online.target\n\
+{session}StartLimitIntervalSec=60\nStartLimitBurst=5\n\n\
 [Service]\nExecStart={exec}\nRestart=on-failure\nRestartSec=3\n\n\
 [Install]\nWantedBy={target}\n"
     )
@@ -156,11 +169,21 @@ pub fn install_plan(
     uid: Option<u32>,
 ) -> io::Result<Plan> {
     Ok(match os {
-        Os::Unix => Plan {
-            files: vec![(systemd_unit_path(scope, env), systemd_unit(spec, scope))],
-            commands: vec![systemctl(scope, "enable")],
-            remove: Vec::new(),
-        },
+        Os::Unix => {
+            // A system unit runs as root with no desktop session, so the Linux
+            // backend would fail with `Unsupported` on every start.
+            if scope == Scope::System && spec.system_proxy {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--system-proxy needs a desktop session: on Linux install with --user",
+                ));
+            }
+            Plan {
+                files: vec![(systemd_unit_path(scope, env), systemd_unit(spec, scope))],
+                commands: vec![systemctl(scope, "enable")],
+                remove: Vec::new(),
+            }
+        }
         Os::MacOs => {
             let plist = launchd_plist_path(scope, env);
             let domain = launchd_domain(scope, uid)?;
@@ -306,8 +329,11 @@ mod tests {
             text.contains("ExecStart=\"/usr/local/bin/rurge\" run -c \"/home/me/my profiles/rurge.conf\" --system-proxy\n"),
             "{text}"
         );
+        // `spec(true)` carries `--system-proxy`, so this unit follows the
+        // graphical session; the plain user unit is covered further down.
         assert!(
-            text.contains("Restart=on-failure\n") && text.contains("WantedBy=default.target\n"),
+            text.contains("Restart=on-failure\n")
+                && text.contains("WantedBy=graphical-session.target\n"),
             "{text}"
         );
         assert_eq!(
@@ -335,6 +361,52 @@ mod tests {
         assert!(text.contains("WantedBy=multi-user.target\n"), "{text}");
         assert!(!text.contains("--system-proxy"));
         assert_eq!(lines(&plan.commands), ["systemctl enable --now rurge"]);
+    }
+
+    #[test]
+    fn a_linux_system_unit_cannot_carry_system_proxy() {
+        let err = install_plan(Os::Unix, Scope::System, &spec(true), &home_env, None).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "--system-proxy needs a desktop session: on Linux install with --user"
+        );
+        // the other two platforms have no such restriction
+        assert!(install_plan(Os::MacOs, Scope::System, &spec(true), &home_env, None).is_ok());
+        assert!(install_plan(Os::Windows, Scope::System, &spec(true), &home_env, None).is_ok());
+    }
+
+    #[test]
+    fn a_user_unit_with_system_proxy_follows_the_graphical_session() {
+        let with = install_plan(Os::Unix, Scope::User, &spec(true), &home_env, None).unwrap();
+        let text = &with.files[0].1;
+        assert!(
+            text.contains("PartOf=graphical-session.target\n")
+                && text.contains("After=graphical-session.target\n")
+                && text.contains("WantedBy=graphical-session.target\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("After=network-online.target\n")
+                && text.contains("Wants=network-online.target\n"),
+            "the network lines stay: {text}"
+        );
+        let without = install_plan(Os::Unix, Scope::User, &spec(false), &home_env, None).unwrap();
+        let text = &without.files[0].1;
+        assert!(!text.contains("graphical-session"), "{text}");
+        assert!(text.contains("WantedBy=default.target\n"), "{text}");
+    }
+
+    #[test]
+    fn every_systemd_unit_stops_retrying_after_five_failures() {
+        for scope in [Scope::User, Scope::System] {
+            let plan = install_plan(Os::Unix, scope, &spec(false), &home_env, None).unwrap();
+            let text = &plan.files[0].1;
+            assert!(
+                text.contains("StartLimitIntervalSec=60\n") && text.contains("StartLimitBurst=5\n"),
+                "{text}"
+            );
+        }
     }
 
     #[test]

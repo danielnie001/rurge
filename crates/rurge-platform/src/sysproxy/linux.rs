@@ -190,6 +190,10 @@ struct LinuxBackup {
     desktop: String,
     #[serde(default)]
     values: BTreeMap<String, String>,
+    /// The `kwriteconfig` the snapshot was taken with (KDE only): the session
+    /// that restores it may have no such tool on `PATH`.
+    #[serde(default)]
+    kde_write: Option<String>,
 }
 
 pub struct LinuxProxy<R: CommandRunner> {
@@ -236,6 +240,7 @@ impl<R: CommandRunner> LinuxProxy<R> {
 impl<R: CommandRunner> SystemProxy for LinuxProxy<R> {
     fn snapshot(&self) -> io::Result<Backup> {
         let mut values = BTreeMap::new();
+        let mut kde_write = None;
         let desktop = match self.desktop {
             Desktop::Gnome => {
                 for (schema, key) in GNOME_KEYS {
@@ -245,7 +250,8 @@ impl<R: CommandRunner> SystemProxy for LinuxProxy<R> {
                 "gnome"
             }
             Desktop::Kde => {
-                let (_, read) = self.kde()?;
+                let (write, read) = self.kde()?;
+                kde_write = Some(write.clone());
                 for key in KDE_KEYS {
                     let out = self.runner.run(&kread(read, key))?;
                     values.insert(key.to_string(), out.trim().to_string());
@@ -258,6 +264,7 @@ impl<R: CommandRunner> SystemProxy for LinuxProxy<R> {
             platform: "linux".to_string(),
             desktop: desktop.to_string(),
             values,
+            kde_write,
         };
         Ok(Backup(
             serde_json::to_value(backup).expect("backup serializes"),
@@ -307,7 +314,18 @@ impl<R: CommandRunner> SystemProxy for LinuxProxy<R> {
                 run_best_effort(&self.runner, &cmds)
             }
             "kde" => {
-                let (write, _) = self.kde()?;
+                // Never refuse up front over a missing tool: the session doing
+                // the recovering may be a TTY, a trimmed `PATH` or another
+                // desktop, and giving up would leave the backup in
+                // `state.json` forever. Whatever is detected here wins, then
+                // the name the snapshot recorded, then Plasma 6's; a tool that
+                // really is absent surfaces as a per-command error naming it.
+                let write = self
+                    .kde
+                    .as_ref()
+                    .map(|(write, _)| write.as_str())
+                    .or(saved.kde_write.as_deref())
+                    .unwrap_or("kwriteconfig6");
                 let cmds: Vec<Cmd> = KDE_KEYS
                     .iter()
                     .filter_map(|key| {
@@ -554,6 +572,44 @@ mod tests {
         );
         assert!(calls.contains(&"kwriteconfig6 --file kioslaverc --group Proxy Settings --key NoProxyFor localhost".to_string()));
         assert!(calls.last().unwrap().starts_with("dbus-send "));
+    }
+
+    #[test]
+    fn a_kde_restore_never_needs_a_tool_on_this_session_s_path() {
+        let tools = Some(("kwriteconfig5".to_string(), "kreadconfig5".to_string()));
+        let plasma5 = LinuxProxy::new(FakeRunner::default(), Desktop::Kde, tools);
+        let backup = plasma5.snapshot().unwrap();
+        assert_eq!(backup.0["kde_write"], "kwriteconfig5");
+        // a recovering session with no kwriteconfig at all: the recorded name
+        let bare = LinuxProxy::new(FakeRunner::default(), Desktop::Other, None);
+        bare.restore(&backup).unwrap();
+        let calls = bare.runner.calls();
+        assert_eq!(calls.len(), KDE_KEYS.len() + 1, "{calls:?}");
+        assert!(
+            calls[..KDE_KEYS.len()]
+                .iter()
+                .all(|c| c.starts_with("kwriteconfig5 ")),
+            "{calls:?}"
+        );
+        // what this session has wins over what the backup recorded
+        let plasma6 = Some(("kwriteconfig6".to_string(), "kreadconfig6".to_string()));
+        let now = LinuxProxy::new(FakeRunner::default(), Desktop::Kde, plasma6);
+        now.restore(&backup).unwrap();
+        assert!(
+            now.runner.calls()[0].starts_with("kwriteconfig6 "),
+            "{:?}",
+            now.runner.calls()
+        );
+        // a backup from before the field existed falls back on the Plasma 6 name
+        let mut old = backup.0.clone();
+        old.as_object_mut().unwrap().remove("kde_write");
+        let bare = LinuxProxy::new(FakeRunner::default(), Desktop::Other, None);
+        bare.restore(&Backup(old)).unwrap();
+        assert!(
+            bare.runner.calls()[0].starts_with("kwriteconfig6 "),
+            "{:?}",
+            bare.runner.calls()
+        );
     }
 
     #[test]
