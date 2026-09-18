@@ -575,7 +575,10 @@ mod tests {
     /// between the two steps saw a session's bytes twice. Every session here
     /// carries the same byte counts from the start, so a consistent snapshot
     /// must read exactly SESSIONS × BYTES at every instant, however the
-    /// finishes interleave with the reads.
+    /// finishes interleave with the reads. The finishers wait on a barrier
+    /// for the reader's first snapshot so the reader is provably running
+    /// before any session finishes, instead of racing to complete before the
+    /// reader gets to run at all.
     #[test]
     fn snapshot_bytes_is_consistent_while_sessions_finish_concurrently() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -594,10 +597,17 @@ mod tests {
             .collect();
         let expected = (SESSIONS * BYTES, SESSIONS * BYTES);
         let stop = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
         let reader = {
-            let (log, traffic, stop) = (log.clone(), traffic.clone(), stop.clone());
+            let (log, traffic, stop, barrier) =
+                (log.clone(), traffic.clone(), stop.clone(), barrier.clone());
             std::thread::spawn(move || {
-                let mut reads = 0u64;
+                // Take the first snapshot before waiting so the barrier is
+                // always reached, even if this assertion would fail.
+                let first = log.snapshot_bytes(&traffic);
+                barrier.wait();
+                assert_eq!(first, expected, "inconsistent snapshot");
+                let mut reads = 1u64;
                 while !stop.load(Ordering::Relaxed) {
                     assert_eq!(
                         log.snapshot_bytes(&traffic),
@@ -609,6 +619,7 @@ mod tests {
                 reads
             })
         };
+        barrier.wait();
         let finishers: Vec<_> = handles
             .chunks(16)
             .map(|chunk| {
