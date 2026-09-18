@@ -5,6 +5,7 @@ pub mod dns;
 pub mod rule;
 pub mod run;
 pub mod runtime;
+pub mod service;
 pub mod sysproxy;
 
 use rurge_config::config::Platform;

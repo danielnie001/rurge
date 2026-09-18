@@ -1483,3 +1483,78 @@ mod run {
         assert_eq!(state["features"]["system_proxy"], false);
     }
 }
+
+mod service {
+    use assert_cmd::Command;
+    use predicates::prelude::*;
+
+    fn rurge() -> Command {
+        Command::cargo_bin("rurge").unwrap()
+    }
+
+    #[test]
+    fn install_dry_run_prints_the_plan_for_this_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("my rurge.conf");
+        std::fs::write(&conf, "[General]\n[Rule]\nFINAL,DIRECT\n").unwrap();
+        let out = rurge()
+            .args([
+                "service",
+                "install",
+                "--user",
+                "--system-proxy",
+                "--dry-run",
+                "-c",
+            ])
+            .arg(&conf)
+            .assert()
+            .success();
+        let text = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+        assert!(text.contains("my rurge.conf"), "{text}");
+        assert!(text.contains("--system-proxy"), "{text}");
+        assert!(text.ends_with("dry run: nothing was changed\n"), "{text}");
+        if cfg!(windows) {
+            assert!(
+                text.contains("run: schtasks /create /tn rurge /sc onlogon /tr "),
+                "{text}"
+            );
+        } else if cfg!(target_os = "macos") {
+            assert!(
+                text.contains("io.rurge.daemon.plist:")
+                    && text.contains("run: launchctl bootstrap gui/"),
+                "{text}"
+            );
+        } else {
+            assert!(
+                text.contains("rurge.service:") && text.contains("ExecStart="),
+                "{text}"
+            );
+            assert!(
+                text.contains("run: systemctl --user enable --now rurge"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn uninstall_dry_run_and_a_missing_profile() {
+        let out = rurge()
+            .args(["service", "uninstall", "--user", "--dry-run"])
+            .assert()
+            .success();
+        let text = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+        assert!(text.contains("run: "), "{text}");
+        assert!(text.ends_with("dry run: nothing was changed\n"), "{text}");
+        rurge()
+            .args([
+                "service",
+                "install",
+                "--dry-run",
+                "-c",
+                "no-such-profile.conf",
+            ])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("cannot find the profile"));
+    }
+}

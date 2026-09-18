@@ -33,6 +33,8 @@ enum Command {
     Stop(cli::control::ControlArgs),
     /// Show the running daemon's mode, counts and traffic (needs http-api)
     Status(cli::control::StatusArgs),
+    /// Install or remove the automatic start of rurge
+    Service(cli::service::ServiceArgs),
 }
 
 fn main() -> ExitCode {
@@ -53,6 +55,7 @@ fn main() -> ExitCode {
         Command::Reload(args) => cli::control::reload(args),
         Command::Stop(args) => cli::control::stop(args),
         Command::Status(args) => cli::control::status(args),
+        Command::Service(args) => cli::service::run(args),
     };
     match result {
         Ok(code) => code,
