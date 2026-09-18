@@ -18,6 +18,7 @@ use rurge_engine::{Engine, ListenerSpec, Running, Runtime, RuntimeOptions};
 use rurge_net::BoxFuture;
 use rurge_platform::sysproxy::ProxySettings;
 use rurge_rules::OutboundMode;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -36,6 +37,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 const GRACE: Duration = Duration::from_secs(5);
 /// A burst of `--watch` file events inside this window collapses into one reload.
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
+/// The per-data-directory instance lock. Never deleted: removing it would race
+/// with another process opening it.
+const LOCK_FILE: &str = "rurge.lock";
 
 #[derive(Args)]
 pub struct RunArgs {
@@ -564,6 +568,40 @@ impl ShutdownSignals {
     }
 }
 
+/// One `rurge run` per data directory. The operating system drops the lock
+/// when the process dies, so a crashed run never blocks the next start — and
+/// a backup found in `state.json` while we hold it really is a dead run's.
+///
+/// Only a lock somebody else holds refuses the start: on a filesystem without
+/// lock support, or a directory we cannot write, rurge warns and runs unlocked
+/// rather than losing the daemon over it.
+fn lock_data_dir(dir: &Path) -> Result<Option<File>, String> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(LOCK_FILE))
+    {
+        Ok(file) => file,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot open the data directory lock; running without the single-instance check");
+            return Ok(None);
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Err(format!(
+            "another rurge instance is already running with the data directory {}",
+            dir.display()
+        )),
+        Err(TryLockError::Error(e)) => {
+            tracing::warn!(error = %e, "cannot lock the data directory; running without the single-instance check");
+            Ok(None)
+        }
+    }
+}
+
 pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let platform = args.platform.unwrap_or_else(Platform::current);
     let opts = LoadOptions {
@@ -584,6 +622,14 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         args.log_file.as_deref(),
     )?;
     let rt = args.runtime.resolve(&cfg)?;
+    // Named, so the lock lives until `run` returns — past the shutdown restore.
+    let _instance_lock = match lock_data_dir(&rt.data_dir) {
+        Ok(lock) => lock,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return Ok(ExitCode::from(1));
+        }
+    };
     let run_opts = RunOptions {
         idle_timeout: Duration::from_secs(args.idle_timeout.unwrap_or(600).max(1)),
         request_log_size: args.request_log_size.unwrap_or(1000).max(1),
@@ -603,6 +649,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         // may have died with the operating system pointing at it, and the port
         // it left behind may be exactly why this start fails to bind. Putting
         // the pre-crash settings back is right whether or not this run starts.
+        // We hold the data directory lock by now, so a backup left in
+        // `state.json` belongs to a dead run, never to a live instance.
         let mut sysproxy = SystemProxyManager::new(super::sysproxy::backend()?, store.clone());
         sysproxy.recover().await;
         let outbound_mode = initial_mode(explicit_mode, &store, &state).await;
@@ -809,5 +857,20 @@ mod tests {
         assert_eq!(parse_log_level("error").unwrap(), LevelFilter::ERROR);
         assert!(parse_log_level("loud").is_err());
         assert_eq!(mode_name(&OutboundMode::Rule), "rule");
+    }
+
+    #[test]
+    fn the_data_dir_lock_is_exclusive_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = lock_data_dir(dir.path()).expect("the first start takes the lock");
+        assert!(first.is_some(), "the lock file is lockable");
+        let err = lock_data_dir(dir.path()).unwrap_err();
+        assert!(err.contains("another rurge instance"), "{err}");
+        drop(first);
+        assert!(
+            lock_data_dir(dir.path())
+                .expect("the lock is free again")
+                .is_some()
+        );
     }
 }

@@ -1439,6 +1439,67 @@ mod run {
         drop(taken);
     }
 
+    /// The other side of recovery: a LIVE first instance is not a crashed one.
+    /// Without the data-directory lock the second start restored the first
+    /// one's backup and cleared it, so the first run went on reporting the
+    /// system proxy as enabled while the operating system no longer pointed at
+    /// it.
+    #[test]
+    fn run_refuses_a_second_instance_on_the_same_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let file = sysproxy_file(&data);
+        std::fs::write(&file, ORIGINAL_PROXY).unwrap();
+        let mut first = spawn_daemon_full(&conf, &data, false, None, &["--system-proxy"]);
+        let port = api_port(&first);
+        wait_for_line(&first, "system proxy enabled: ");
+        let applied = std::fs::read_to_string(&file).unwrap();
+        assert_ne!(applied, ORIGINAL_PROXY, "the first run owns the settings");
+        // a second start on the same data directory, while the first one runs
+        let mut second = rurge_run(&conf, &data)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Ok(Some(status)) = second.try_wait() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = second.kill();
+                let _ = second.wait();
+                panic!("the second rurge run did not exit within 20 s");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let mut stderr = String::new();
+        second
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert_eq!(status.code(), Some(1));
+        assert!(stderr.contains("another rurge instance"), "{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            applied,
+            "the second instance left the first one's system proxy alone"
+        );
+        assert!(
+            !read_json(&data.join("state.json"))["system_proxy_backup"].is_null(),
+            "the first run's backup is still there to restore"
+        );
+        // the first instance still owns the settings and puts them back
+        assert_eq!(api_call(port, "POST", "/v1/stop", "k", Some("{}")).0, 200);
+        wait_for_line(&first, "system proxy restored");
+        assert_eq!(wait_for_exit(&mut first, 5), Some(0));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+    }
+
     #[test]
     fn run_reapplies_the_system_proxy_after_a_reload() {
         let dir = tempfile::tempdir().unwrap();
