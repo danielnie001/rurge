@@ -21,6 +21,9 @@ ipconfig.workspace = true
 windows-registry.workspace = true
 windows-sys.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 # The workspace lints, except `unsafe_code`: notifying WinINet that the proxy
 # settings changed (`sysproxy::windows`) is an FFI call. The lint stays `deny`
 # here and only that one function opts out; every other crate keeps `forbid`.

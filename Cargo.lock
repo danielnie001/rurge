@@ -1957,6 +1957,7 @@ dependencies = [
  "resolv-conf",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
  "windows-registry",
  "windows-sys 0.61.2",

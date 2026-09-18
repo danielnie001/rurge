@@ -60,7 +60,7 @@ pub fn config_dir_for(os: Os, env: EnvLookup<'_>) -> PathBuf {
     }
 }
 
-fn home(env: EnvLookup<'_>) -> PathBuf {
+pub(crate) fn home(env: EnvLookup<'_>) -> PathBuf {
     env("HOME")
         .or_else(|| env("USERPROFILE"))
         .filter(|v| !v.is_empty())
