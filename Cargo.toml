@@ -65,6 +65,8 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing-appender = "0.2"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 rurge-api = { path = "crates/rurge-api" }
+windows-registry = "0.6"
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinInet"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

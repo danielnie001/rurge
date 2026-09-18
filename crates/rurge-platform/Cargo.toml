@@ -1,6 +1,6 @@
 [package]
 name = "rurge-platform"
-description = "Platform-specific helpers for rurge (directories, system DNS)"
+description = "Platform-specific helpers for rurge (directories, system DNS, system proxy, service install)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,11 +11,21 @@ repository.workspace = true
 tracing.workspace = true
 resolv-conf.workspace = true
 if-addrs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 # `ipconfig`'s build script emits `cargo:rustc-link-lib=iphlpapi` unconditionally,
 # which breaks linking on Linux / macOS, so it is a Windows-only dependency.
 [target.'cfg(windows)'.dependencies]
 ipconfig.workspace = true
+windows-registry.workspace = true
+windows-sys.workspace = true
 
-[lints]
-workspace = true
+# The workspace lints, except `unsafe_code`: notifying WinINet that the proxy
+# settings changed (`sysproxy::windows`) is an FFI call. The lint stays `deny`
+# here and only that one function opts out; every other crate keeps `forbid`.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

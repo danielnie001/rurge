@@ -1955,7 +1955,11 @@ dependencies = [
  "if-addrs",
  "ipconfig",
  "resolv-conf",
+ "serde",
+ "serde_json",
  "tracing",
+ "windows-registry",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
