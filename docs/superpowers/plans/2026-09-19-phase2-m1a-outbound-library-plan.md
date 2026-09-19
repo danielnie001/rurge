@@ -5712,10 +5712,15 @@ git commit -m "docs: M1a 配置与出站库：CLAUDE.md 状态与计划收尾"
 | 11 | 顺带补了三处测试：`build::tls_client` 的三个分支（无 TLS、Keystore 条目不存在、p12 解不开）与 `check_status` 的"响应格式错误"路径 | 评审的 Minor；修复轮里顺手补上（M1b 的干构建依赖 `tls_client` 的报错） | 3b0885f |
 | 12 | `Socks5Outbound::from_spec` 自己再校验一次用户名与密码各不超过 255 字节，超长返回 `BuildError`（文本只含策略名，不含凭据）；握手里的 `as u8` 保留，注释改为"长度已在 `from_spec` 校验"；新增测试 `credentials_longer_than_255_bytes_are_refused_at_build_time` | 派发前的控制者裁定（Task 11 的教训：出站不信任调用方）。计划代码只靠配置加载时的 255 字节上限，而 `PolicySpec` 的字段是 pub | b177aeb |
 | 12 | 测试里把 `spec()` 从 `outbound()` 拆出来 | 与 `http.rs` 的写法一致，并让上一行的测试能拿到 `PolicySpec` 来改 | b177aeb |
+| 终审 | **A（上游文本净化）**：`outbound.rs` 新增 `untrusted_text`（裁到有界字符数、剔除控制字符）与 `OutboundError::tls`；`check_status` 的原因短语与 http / socks5 两处 TLS 握手错误都改走它；原因短语为空时输出 `http proxy answered {code}`（无尾随空格） | 整分支终审的 Important 1：恶意上游能在应答原因短语里塞入约 16 KB 文本与裸控制字节（ESC、裸 CR），原样进入会话日志与请求日志 | 4a8872e |
+| 终审 | **B（转发模式契约）**：`http.rs` 的 `valid_target` 改为 `pub fn` 并补上规则与理由的文档注释；`HttpForward` trait 文档注释写明调用方（M1b 引擎）的两条义务——写请求行 / `Host` 头前必须先过 `rurge_proto::http::valid_target`，`request_headers()` 每条连接只能调用一次。无行为变化，未加新测试 | 整分支终审的 Important 2：`HttpForward::connect` 只交出裸 stream，契约原来只写在 CONNECT 路径自己的代码里，trait 上没有 | 4a8872e |
+| 终审 | **C（签名校验测试）**：`testing/tls.rs` 新增 `TlsFixture::impostor_acceptor` / `spawn_impostor`（呈递真实叶子证书、用不匹配的新密钥签名）；`transport/tls.rs` 新增行为测试 `a_server_without_the_private_key_is_refused_in_every_mode`，证明标准 / 指纹 / 免校验三种模式在 TLS 1.2 与 1.3 下都拒绝这台冒名服务器。测试是行为测试（冒名服务器），因为 `DigitallySignedStruct::new` 在 rustls 0.23.43 里是 `pub(crate)`，没法手搭结构体做单元测试 | 整分支终审的 Important 3：把 `verify_tls12_signature` / `verify_tls13_signature` 换成永远返回成功，此前没有任何测试会失败，等价于"持有证书公开部分的人就能冒充服务器" | 4a8872e |
+| 终审 | **D（http 出站不信任调用方）**：`rurge-config` 新增 `is_field_text` / `HeaderTemplate::is_valid`；`parse_list` 改用前者校验值——除 HTAB 外拒绝任何控制字符（原来只拒绝 CR / LF），错误文本从"holds a line break"改成"holds a control character"；`HttpOutbound::from_spec` 逐条调用 `is_valid()`，不合法时报 `` policy `{name}`: custom header #{n} is not valid ``（不回显名称或值）；`random_string` 首行加 `let max = max.max(min);` 防越界 slice / 减法溢出 | 整分支终审的 Important 4：`PolicySpec` 的字段是 pub，`Socks5Outbound::from_spec` 已经不信任调用方重新校验凭据长度，`HttpOutbound::from_spec` 却没有对 headers 做同样的事；`random_string(min, max)` 在 `min > max` 时会减法溢出 panic。解析器这处行为差异（拒绝的控制字符范围变宽）由 M1b 的文档任务登记进兼容性清单 | 4a8872e |
+| 终审 | **E（socks5 应答 method 分支）**：握手里挑选认证方式的 `match` 从 `match selected[1]` 改成 `match (selected[1], &self.credentials)`，去掉 `expect("offered only with credentials")`；行为与错误文本不变 | 整分支终审的 Minor（taken）：原来的 `expect` 不可达只是因为分支顺序，面向网络的解析器里不该留这种 panic 形状 | 4a8872e |
+| 终审 | **F（socks5 应答分支测试）**：`testing/socks5.rs` 的 `Socks5Script` 新增 `reply_bound: Option<Vec<u8>>` 字段，`reply()` 改用它；`socks5.rs` 新增测试 `the_bound_address_may_be_a_domain_or_ipv6_and_unknown_types_are_refused`，覆盖 ATYP 3（域名）、ATYP 4（IPv6）、未知 ATYP 9、以及声称 255 字节却只发 10 字节后断开四种应答 | 整分支终审的 Minor（taken）：`FakeSocks5` 原来恒定回 ATYP 1，应答里读域名长度与未知地址类型两个分支从未被任何测试执行到 | 4a8872e |
+| 终审 | **G（文档修正）**：五处纯注释修正——`rurge-net::connector::ConnectOpts::timeout`（区分 `DirectConnector` 与 `BootstrapConnector` 的语义）、`transport::tls::same`（去掉"constant time"的说法，改述实际行为）、`rurge-net::socket` 的 `Family` / `Family::of` / `SocketOpts::interface` / `SocketOpts::tos`、`outbound::OutboundError::Tls`、`build.rs` 的模块文档 | 整分支终审的 Minor（taken）：五处注释与代码实际行为不符或缺失 | 4a8872e |
 
 ## 延后事项
-
-标为"整分支终审时分诊"的条目，其最终去向由终审后的修复提交更新到本表。
 
 | 事项 | 去向 |
 | ---- | ---- |
@@ -5724,13 +5729,13 @@ git commit -m "docs: M1a 配置与出站库：CLAUDE.md 状态与计划收尾"
 | Linux / macOS 的 `bind_interface`、`set_tclass_v6` 分支本机无法编译 | 不变：首次推送后由 CI 证明；Task 6 的评审已逐个对照 `socket2` 0.6.5 / `if-addrs` 0.15.0 的源码核对了名字、签名与 cfg 条件。可选的本地检查：`rustup target add x86_64-unknown-linux-gnu` 后 `cargo check --target x86_64-unknown-linux-gnu -p rurge-platform`（会给本机装一个 target，由用户决定） |
 | 旧式（RC2-40 + 3DES）p12 若 `p12-keystore` 0.2 读不了（Task 10 Step 4 的分支） | **已结**：0.2.1 两种都能解码（Task 10），无需登记差异 |
 | 出站按指纹跨代复用、`RegistryCell`、工厂、引擎接线、能力表翻转、API、互操作夹具 | 不变：M1b |
-| **根因未修**：SOCKS5 入站只检查域名是合法 UTF-8，`HostName::parse` 只修剪两端，内部的控制字符会一路传到出站（M1a 只在 `http` 出站侧拦截） | M1b 计划的具名条目（M1b 本来就要改 `rurge-inbound`）：入站侧拒绝含控制字符 / 空白的主机名 |
-| `HttpOutbound::request_headers()` 每次调用都重新渲染 `<random-string>` 占位 | M1b：转发模式的调用方每条连接只调用一次（写进 M1b 对应任务的接口说明） |
+| **根因未修**：SOCKS5 入站只检查域名是合法 UTF-8，`HostName::parse` 只修剪两端，内部的控制字符会一路传到出站（M1a 只在 `http` 出站侧拦截） | M1b 计划的具名条目（M1b 本来就要改 `rurge-inbound`）：入站侧拒绝含控制字符 / 空白的主机名；M1b 的转发模式在写请求行与 Host 头之前必须调用 rurge_proto::http::valid_target（契约已写在 HttpForward 上） |
+| `HttpOutbound::request_headers()` 每次调用都重新渲染 `<random-string>` 占位 | M1b：转发模式的调用方每条连接只调用一次（写进 M1b 对应任务的接口说明）；契约已写到 HttpForward trait 的文档注释上（终审修复） |
 | 生产环境的 DIRECT 仍用 `NoopSocketHook`，`interface` / `tos` 在运行期不生效 | M1b：注入 bin 侧的 `PlatformSockets` 适配器（M1 设计 6.7） |
 | 未与真实 Surge 核对的两处语义：自定义 `sni` 同时成为证书校验名（除非给了 `server-cert-verify-name`）；`https` 上游握手不带 ALPN | M1b 文档任务在兼容性清单里标注"未核对" |
-| `race` 的 3 秒分支被 `queue.is_empty()` 挡住：首选族有 13 个以上地址时，另一族要等队列排空才加入，而不是准时在 3 秒加入（修法：`queue.extend(more)` 并去掉那半个条件） | 整分支终审时分诊 |
-| 没有测试钉住握手签名校验：把 `verify_tls12_signature` / `verify_tls13_signature` 的函数体换成断言，现有七个 TLS 测试仍全绿（便宜的补法：`Verifier { Insecure }` + 伪造的 `DigitallySignedStruct` 必须 `Err`） | 整分支终审时分诊 |
-| `server-cert-verify-name` 只在标准校验分支解析；与指纹 / `skip-cert-verify` 同时出现时，格式错误的值不会被报告 | 整分支终审时分诊；不处理则留到 M2（TLS 族） |
+| `race` 的 3 秒分支被 `queue.is_empty()` 挡住：首选族有 13 个以上地址时，另一族要等队列排空才加入，而不是准时在 3 秒加入（修法：`queue.extend(more)` 并去掉那半个条件） | 终审裁定：保持现状。需要首选族 13 个以上地址才出现，不会挂起（队列排空时 3 秒期限已过，分支立即触发），只是另一族在约 N×250 ms 而不是 3 s 加入；改动会影响已上线的 DIRECT 行为而用户无感 |
+| 没有测试钉住握手签名校验：把 `verify_tls12_signature` / `verify_tls13_signature` 的函数体换成断言，现有七个 TLS 测试仍全绿（便宜的补法：`Verifier { Insecure }` + 伪造的 `DigitallySignedStruct` 必须 `Err`） | 已修（终审修复，4a8872e）：冒名服务器的行为测试 |
+| `server-cert-verify-name` 只在标准校验分支解析；与指纹 / `skip-cert-verify` 同时出现时，格式错误的值不会被报告 | M2（TLS 族） |
 | DNS 应答为空时报 "no usable address … (ip-version)"（文本误导，错误种类同为 NotFound）；超时文本里 IPv6 字面量没有方括号（`connect to ::1:80 timed out`） | M1b（那里会再动连接器的报错文本） |
 | TLS / shadow-tls 参数写在 `reject*` 别名上（以及 shadow-tls 参数写在 `direct` 上）时落到通用的 `W0001`，而不是 `W0028` | 不处理：两者结果都是"忽略并告警" |
 | `[Keystore]` 里空的 `base64` 值算合法 Base64（不报 `E0021`） | M1b：干构建会在解码时报 `E0022` |
@@ -5739,8 +5744,14 @@ git commit -m "docs: M1a 配置与出站库：CLAUDE.md 状态与计划收尾"
 | `rurge_proto::testing` 的两个假上游各有一份 accept 循环（约 20 行重复） | 第三个假上游（M2）出现时抽公共循环（预检裁定） |
 | `echo_server` 与 `TlsFixture::spawn_echo` 只返回 `SocketAddr`，测试无法提前停掉它们（每个 `#[tokio::test]` 的运行时结束时会取消） | 不处理 |
 | 两个已有的时序测试各偶发失败过一次、重跑通过，均与改动无关：`rurge-dns` 的 `fanout::tests::empty_answer_rules`（100 ms 时序断言）、bin 的 `run::watch_reloads_rules_on_change`（文件监视时序） | 再出现一次就单独修（像 M4a 对 observe 测试那样） |
-| `socks5` 出站里 `expect("offered only with credentials")` 之所以不可达，只靠 match 的分支顺序（"未提供的方法"守卫分支排在 `USER_PASS` 分支之前），代码里没有说明——面向网络的解析器里不该留这种 panic 形状（修法：`match (selected[1], &self.credentials)`，或至少加注释） | 整分支终审时分诊 |
-| `socks5` 应答里 ATYP = 3（长度来自线路）与未知 ATYP 两个分支没有任何测试执行到：`FakeSocks5` 恒定回 ATYP = 1，需要给 `testing/socks5.rs` 加一个 `reply_atyp` 旋钮 | 整分支终审时分诊 |
-| `socks5` 的超长域名用例只断言了错误文本，没有证明"没有拨号"（结构上成立：`connect_request` 是拿不到 connector 的自由函数；用计数的 `Connector` 桩可以钉死） | 整分支终审时分诊 |
+| `socks5` 出站里 `expect("offered only with credentials")` 之所以不可达，只靠 match 的分支顺序（"未提供的方法"守卫分支排在 `USER_PASS` 分支之前），代码里没有说明——面向网络的解析器里不该留这种 panic 形状（修法：`match (selected[1], &self.credentials)`，或至少加注释） | 已修（终审修复，4a8872e） |
+| `socks5` 应答里 ATYP = 3（长度来自线路）与未知 ATYP 两个分支没有任何测试执行到：`FakeSocks5` 恒定回 ATYP = 1，需要给 `testing/socks5.rs` 加一个 `reply_atyp` 旋钮 | 已修（终审修复，4a8872e） |
+| `socks5` 的超长域名用例只断言了错误文本，没有证明"没有拨号"（结构上成立：`connect_request` 是拿不到 connector 的自由函数；用计数的 `Connector` 桩可以钉死） | 保持延后：结构上成立（connect_request 是拿不到 connector 的自由函数，且在 connect 之前调用） |
 | `socks5` 的三个版本字节（方法选择、认证应答、CONNECT 应答）不校验：上游不是 SOCKS5 服务器时报的是语义错位的方法 / 应答码错误，而不是"不是 SOCKS5 服务器"；空域名会按 ATYP 3 / LEN 0 发出（长度前缀格式，无害）；只有密码没有用户名时密码被静默丢弃（与 `http` 出站同一约定） | 不处理 / 诊断质量，出现实际问题时再改 |
 | `http` 出站的 CONNECT 写用的是裸 `?`，没有 `socks5` 出站那层 EOF / reset 归一；两个出站的测试辅助函数（`no_roots` `target` `roundtrip` `spec`，约 35 行）近乎相同 | 第三个出站（M2）到位时对齐，并把测试辅助函数挪进 `crate::testing` |
+| `bind_interface` 在 macOS / Windows 上每次连接都调用 `if_addrs::get_if_addrs()`（毫秒级） | M1b：bin 侧适配器加短 TTL 缓存 |
+| 策略设置 `skip-cert-verify=true` 时没有任何诊断或日志（内部 HTTP 客户端有 WARN） | M1b：构建出站时打一条 WARN |
+| `http` 出站拒绝非 ASCII 主机名（IDN 未转 A-label）：作为安全默认是对的 | M1b：转成 A-label 后再校验；兼容性清单登记 |
+| 三处配置兼容性观察：空的 `interface=` 是硬错误；iOS 专属参数 `hybrid` 的非法值在桌面端也是硬错误；`http` / `socks5` 策略上没有被任何 spec 读取的参数现在各得一条 `W0001`（只是告警变多） | M1b 文档任务：对照手册核对后决定是否放宽 |
+| `BootstrapConnector` 不再能表达 `prefer_v6`（现在写死 `false`；它的调用方本来也只传 `false`） | 需要时再加回 |
+| 全部失败时 `race` 报的是"最后完成的那次失败"，错误种类与时序有关 | 不处理 |
