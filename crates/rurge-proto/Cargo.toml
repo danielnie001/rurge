@@ -16,6 +16,7 @@ tokio-rustls.workspace = true
 sha2.workspace = true
 base64.workspace = true
 rcgen = { workspace = true, optional = true }
+p12-keystore.workspace = true
 
 [features]
 # Scriptable loopback peers (`rurge_proto::testing`); enabled by dependants' dev-dependencies.

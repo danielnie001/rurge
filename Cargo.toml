@@ -68,6 +68,7 @@ rurge-api = { path = "crates/rurge-api" }
 windows-registry = "0.6"
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinInet"] }
 socket2 = { version = "0.6", features = ["all"] }
+p12-keystore = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
