@@ -1,0 +1,279 @@
+//! A sing-box child process on the loopback, for interoperability tests
+//! (M1 design §8). Nothing here downloads, installs or configures anything
+//! outside a temporary directory: the rendered configuration listens on
+//! 127.0.0.1 only, its single outbound is `direct`, and it never holds a key
+//! that touches the machine (`set_system_proxy`, `tun`, `auto_route`).
+
+use serde_json::{Value, json};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+pub const BINARY_ENV: &str = "RURGE_TEST_SING_BOX";
+pub const REQUIRED_ENV: &str = "RURGE_INTEROP_REQUIRED";
+const READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `RURGE_TEST_SING_BOX`, else the first `sing-box` on `PATH`.
+pub fn locate() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(BINARY_ENV).filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    let name = if cfg!(windows) {
+        "sing-box.exe"
+    } else {
+        "sing-box"
+    };
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The binary — or `None` after saying why `test` is skipped. With
+/// `RURGE_INTEROP_REQUIRED=1` (CI) a missing binary is a failure instead.
+pub fn sing_box_or_skip(test: &str) -> Option<PathBuf> {
+    if let Some(path) = locate() {
+        return Some(path);
+    }
+    if std::env::var(REQUIRED_ENV).as_deref() == Ok("1") {
+        panic!("{REQUIRED_ENV}=1 but no sing-box was found ({BINARY_ENV} or PATH)");
+    }
+    eprintln!("skipping {test}: no sing-box ({BINARY_ENV} or PATH); see tests/interop/README.md");
+    None
+}
+
+/// A port that was free a moment ago.
+pub fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("a free loopback port")
+        .port()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InboundKind {
+    Http,
+    Socks,
+    Mixed,
+}
+
+pub struct TlsFiles {
+    /// PEM paths.
+    pub certificate: PathBuf,
+    pub key: PathBuf,
+    /// Require a client certificate signed by this CA (PEM path).
+    pub client_ca: Option<PathBuf>,
+}
+
+pub struct Inbound {
+    pub kind: InboundKind,
+    /// Empty = no authentication.
+    pub users: Vec<(String, String)>,
+    /// Only the `http` inbound of sing-box speaks TLS.
+    pub tls: Option<TlsFiles>,
+}
+
+/// The whole configuration for `inbounds`, each on its loopback port.
+pub fn render(inbounds: &[(Inbound, u16)]) -> Value {
+    let rendered: Vec<Value> = inbounds
+        .iter()
+        .enumerate()
+        .map(|(i, (inbound, port))| {
+            let mut v = json!({
+                "type": match inbound.kind {
+                    InboundKind::Http => "http",
+                    InboundKind::Socks => "socks",
+                    InboundKind::Mixed => "mixed",
+                },
+                "tag": format!("in-{i}"),
+                "listen": "127.0.0.1",
+                "listen_port": port,
+            });
+            if !inbound.users.is_empty() {
+                v["users"] = inbound
+                    .users
+                    .iter()
+                    .map(|(u, p)| json!({ "username": u, "password": p }))
+                    .collect();
+            }
+            if let Some(tls) = &inbound.tls {
+                assert_eq!(
+                    inbound.kind,
+                    InboundKind::Http,
+                    "only sing-box's http inbound has tls"
+                );
+                let mut t = json!({
+                    "enabled": true,
+                    "certificate_path": tls.certificate,
+                    "key_path": tls.key,
+                });
+                if let Some(ca) = &tls.client_ca {
+                    t["client_authentication"] = json!("require-and-verify");
+                    t["client_certificate_path"] = json!([ca]);
+                }
+                v["tls"] = t;
+            }
+            v
+        })
+        .collect();
+    json!({
+        "log": { "level": "warn", "timestamp": false },
+        "inbounds": rendered,
+        "outbounds": [{ "type": "direct", "tag": "direct" }],
+    })
+}
+
+/// A running sing-box; killed and reaped on drop.
+pub struct SingBox {
+    child: Child,
+    ports: Vec<u16>,
+    log: PathBuf,
+}
+
+impl SingBox {
+    /// Writes the configuration into `dir`, starts `binary` there and waits
+    /// until every inbound accepts connections.
+    pub fn spawn(binary: &Path, dir: &Path, inbounds: Vec<Inbound>) -> SingBox {
+        let with_ports: Vec<(Inbound, u16)> =
+            inbounds.into_iter().map(|i| (i, free_port())).collect();
+        let ports: Vec<u16> = with_ports.iter().map(|(_, p)| *p).collect();
+        let config = dir.join("sing-box.json");
+        std::fs::write(&config, render(&with_ports).to_string()).expect("write the config");
+        let log = dir.join("sing-box.log");
+        let out = std::fs::File::create(&log).expect("create the log");
+        let child = Command::new(binary)
+            .arg("run")
+            .arg("-c")
+            .arg(&config)
+            .arg("-D")
+            .arg(dir)
+            .stdin(Stdio::null())
+            .stdout(out.try_clone().expect("clone the log handle"))
+            .stderr(out)
+            .spawn()
+            .unwrap_or_else(|e| panic!("cannot start {}: {e}", binary.display()));
+        let mut running = SingBox { child, ports, log };
+        running.wait_ready();
+        running
+    }
+
+    fn wait_ready(&mut self) {
+        let deadline = Instant::now() + READY_TIMEOUT;
+        for port in self.ports.clone() {
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            loop {
+                if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+                    break;
+                }
+                if let Ok(Some(status)) = self.child.try_wait() {
+                    panic!("sing-box exited early ({status}):\n{}", self.log_text());
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "sing-box never listened on {addr}:\n{}",
+                    self.log_text()
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    /// The loopback port of the `index`-th inbound.
+    pub fn port(&self, index: usize) -> u16 {
+        self.ports[index]
+    }
+
+    pub fn log_text(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+impl Drop for SingBox {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn every_kind() -> Vec<(Inbound, u16)> {
+        vec![
+            (
+                Inbound {
+                    kind: InboundKind::Http,
+                    users: vec![("alice".into(), "s3cret".into())],
+                    tls: Some(TlsFiles {
+                        certificate: "leaf.pem".into(),
+                        key: "leaf.key".into(),
+                        client_ca: Some("ca.pem".into()),
+                    }),
+                },
+                1001,
+            ),
+            (
+                Inbound {
+                    kind: InboundKind::Socks,
+                    users: Vec::new(),
+                    tls: None,
+                },
+                1002,
+            ),
+            (
+                Inbound {
+                    kind: InboundKind::Mixed,
+                    users: Vec::new(),
+                    tls: None,
+                },
+                1003,
+            ),
+        ]
+    }
+
+    #[test]
+    fn the_configuration_never_touches_the_machine() {
+        let config = render(&every_kind());
+        let text = config.to_string();
+        for forbidden in ["set_system_proxy", "tun", "auto_route", "0.0.0.0", "::"] {
+            assert!(!text.contains(forbidden), "`{forbidden}` in {text}");
+        }
+        let top: Vec<&String> = config.as_object().unwrap().keys().collect();
+        assert_eq!(top, ["inbounds", "log", "outbounds"]);
+        for inbound in config["inbounds"].as_array().unwrap() {
+            assert_eq!(inbound["listen"], "127.0.0.1");
+        }
+        assert_eq!(
+            config["outbounds"],
+            json!([{ "type": "direct", "tag": "direct" }])
+        );
+    }
+
+    #[test]
+    fn inbounds_are_rendered_as_sing_box_spells_them() {
+        let config = render(&every_kind());
+        let http = &config["inbounds"][0];
+        assert_eq!(
+            (&http["type"], &http["listen_port"]),
+            (&json!("http"), &json!(1001))
+        );
+        assert_eq!(
+            http["users"],
+            json!([{ "username": "alice", "password": "s3cret" }])
+        );
+        assert_eq!(http["tls"]["enabled"], true);
+        assert_eq!(http["tls"]["client_authentication"], "require-and-verify");
+        assert_eq!(http["tls"]["client_certificate_path"], json!(["ca.pem"]));
+        assert_eq!(config["inbounds"][1]["type"], "socks");
+        assert!(config["inbounds"][1].get("users").is_none());
+        assert_eq!(config["inbounds"][2]["type"], "mixed");
+    }
+
+    #[test]
+    fn free_ports_are_usable() {
+        let port = free_port();
+        assert!(port > 0);
+        TcpListener::bind(("127.0.0.1", port)).expect("the port is free again");
+    }
+}

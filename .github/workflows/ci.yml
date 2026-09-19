@@ -18,6 +18,39 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
+      - name: Install sing-box for the interoperability tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=1.14.1
+          case "$RUNNER_OS" in
+            Linux)   asset="sing-box-$version-linux-amd64.tar.gz";  sha=12cb2816b52febb356f6a885b740cc8758c3f30b8ae0ca8edba80f0d2d35343f ;;
+            Windows) asset="sing-box-$version-windows-amd64.zip";   sha=5197f16d492d93202dc623622149a6ed040f8eca263128f91d603f2b901baa89 ;;
+            macOS)   asset="sing-box-$version-darwin-arm64.tar.gz"; sha=b9024642ef7b4848252df5469b7f60ef3c18bb5e217a16a0934f0174f8ad11b4 ;;
+            *) echo "unexpected runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o "$asset" "https://github.com/SagerNet/sing-box/releases/download/v$version/$asset"
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum "$asset" | cut -d' ' -f1)
+          else
+            actual=$(shasum -a 256 "$asset" | cut -d' ' -f1)
+          fi
+          if [ "$actual" != "$sha" ]; then
+            echo "sing-box checksum mismatch: expected $sha, got $actual"
+            exit 1
+          fi
+          mkdir -p sing-box
+          case "$asset" in
+            *.zip) unzip -q "$asset" -d sing-box ;;
+            *)     tar -xzf "$asset" -C sing-box ;;
+          esac
+          bin=$(find "$PWD/sing-box" -type f \( -name sing-box -o -name sing-box.exe \) | head -n 1)
+          [ -n "$bin" ] || { echo "no sing-box binary in $asset"; exit 1; }
+          chmod +x "$bin"
+          if [ "$RUNNER_OS" = "Windows" ]; then bin=$(cygpath -w "$bin"); fi
+          echo "RURGE_TEST_SING_BOX=$bin" >> "$GITHUB_ENV"
+          echo "RURGE_INTEROP_REQUIRED=1" >> "$GITHUB_ENV"
       - run: cargo test --workspace
   bench:
     runs-on: ubuntu-latest

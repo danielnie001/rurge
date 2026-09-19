@@ -97,6 +97,35 @@ impl TlsFixture {
         Sha256::digest(self.leaf.as_ref()).into()
     }
 
+    pub fn ca_pem(&self) -> String {
+        pem("CERTIFICATE", self.ca.as_ref())
+    }
+
+    pub fn leaf_pem(&self) -> String {
+        pem("CERTIFICATE", self.leaf.as_ref())
+    }
+
+    /// PKCS#8.
+    pub fn leaf_key_pem(&self) -> String {
+        pem("PRIVATE KEY", &self.leaf_key)
+    }
+
+    /// A client certificate signed by the fixture's CA as a Base64 PKCS#12
+    /// with the password `pw`: the value of a `[Keystore]` item.
+    pub fn client_p12_base64(&self, common_name: &str) -> String {
+        use p12_keystore::{Certificate, KeyStore, KeyStoreEntry, PrivateKeyChain};
+        let (cert, key) = self.issue_client(common_name);
+        let chain = PrivateKeyChain::new(
+            key,
+            [1u8, 2, 3, 4],
+            [Certificate::from_der(&cert).expect("our own certificate")],
+        );
+        let mut store = KeyStore::new();
+        store.add_entry("client", KeyStoreEntry::PrivateKeyChain(chain));
+        let der = store.writer("pw").write().expect("p12");
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, der)
+    }
+
     /// A client certificate signed by the fixture's CA: (certificate DER, PKCS#8 key DER).
     pub fn issue_client(&self, common_name: &str) -> (Vec<u8>, Vec<u8>) {
         let key = KeyPair::generate().expect("client key");
@@ -215,5 +244,51 @@ impl TlsFixture {
     ) -> SocketAddr {
         self.spawn_with_acceptor(self.impostor_acceptor(versions))
             .await
+    }
+}
+
+/// RFC 7468 text for a DER blob.
+fn pem(label: &str, der: &[u8]) -> String {
+    let body = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, der);
+    let mut out = format!("-----BEGIN {label}-----\n");
+    for line in body.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+        out.push('\n');
+    }
+    out.push_str(&format!("-----END {label}-----\n"));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pem_and_p12_exports_are_well_formed() {
+        let fixture = TlsFixture::new(&["localhost", "127.0.0.1"]);
+        for (pem, label) in [
+            (fixture.ca_pem(), "CERTIFICATE"),
+            (fixture.leaf_pem(), "CERTIFICATE"),
+            (fixture.leaf_key_pem(), "PRIVATE KEY"),
+        ] {
+            assert!(
+                pem.starts_with(&format!("-----BEGIN {label}-----\n")),
+                "{pem}"
+            );
+            assert!(pem.ends_with(&format!("-----END {label}-----\n")), "{pem}");
+            assert!(
+                pem.lines().all(|l| l.len() <= 64),
+                "lines are wrapped at 64"
+            );
+        }
+        let item = rurge_config::KeystoreItem {
+            name: "mtls".into(),
+            kind: rurge_config::KeystoreType::P12,
+            base64: fixture.client_p12_base64("interop client"),
+            password: Some("pw".into()),
+            unknown: Vec::new(),
+            span: rurge_config::Span::new(std::sync::Arc::from(std::path::Path::new("t.conf")), 1),
+        };
+        crate::keystore::decode_p12(&item).expect("our own p12 decodes");
     }
 }

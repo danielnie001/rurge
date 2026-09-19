@@ -2135,6 +2135,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rurge-interop"
+version = "0.1.0"
+dependencies = [
+ "rurge-config",
+ "rurge-engine",
+ "rurge-net",
+ "rurge-policy",
+ "rurge-proto",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rurge-net"
 version = "0.1.0"
 dependencies = [

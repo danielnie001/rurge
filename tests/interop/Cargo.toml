@@ -1,0 +1,23 @@
+[package]
+name = "rurge-interop"
+description = "Interoperability tests against reference proxy implementations (test-only, never published)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+
+[dev-dependencies]
+rurge-config.workspace = true
+rurge-engine.workspace = true
+rurge-net = { workspace = true, features = ["testing"] }
+rurge-policy.workspace = true
+rurge-proto = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
