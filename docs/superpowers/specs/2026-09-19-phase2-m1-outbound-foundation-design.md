@@ -325,7 +325,7 @@ impl Engine {
 
 ### 6.4 干构建与"构建失败即配置错误"
 
-`rurge_engine::outbounds::dry_build(cfg: &Config) -> Vec<Diagnostic>`：用 `NoopSocketHook` 与一个永不被调用的解析器构造 `EngineFactory`，对 `cfg.specs` 逐个 `build` 后丢弃，把 `BuildError` 转成 `E0022`（策略自己的行号）。三个调用点：`rurge check`、`POST /v1/profiles/check`、以及 `run` / `reload` 在 `load()` 之后——后者把结果当作加载诊断处理：有错误则 `run` 以退出码 2 拒绝启动、`reload` 保留旧一代。`Runtime::build` 里真正的构建失败因此只剩防御意义，直接返回错误。
+`rurge_engine::outbounds::dry_build(cfg: &Config) -> Diagnostics`：用 `NoopSocketHook` 与一个永不被调用的解析器构造 `EngineFactory`（该构造用真实根证书，见第 13 节），对 `cfg.specs` 逐个 `build` 后丢弃，把 `BuildError` 转成 `E0022`（策略自己的行号）。统一入口 `rurge_engine::outbounds::load_checked(path, opts)`（= `rurge_config::config::load` + 追加 `dry_build` 的诊断）供四个调用点使用：`rurge check`、`run`、`reload`、`POST /v1/profiles/check`——有错误则 `run` 以退出码 2 拒绝启动、`reload` 保留旧一代（第 13 节 P7）。`Runtime::build` 里真正的构建失败因此只剩防御意义，直接返回错误。
 
 ### 6.5 引擎拨号
 
@@ -340,7 +340,7 @@ impl Engine {
 | 端点 | 响应 | 来源 |
 | ---- | ---- | ---- |
 | `GET /v1/policies/detail?policy_name=X` | `{"X": "<脱敏后的定义行>"}`；内置策略的值是它自己的名字；未知 → 404 | 暂定 |
-| `GET /v1/policy_groups` | `{"<组名>": [{"name", "typeDescription", "isGroup", "enabled", "lineHash"}, …], …}`，成员顺序同配置；`enabled` 恒为 `true`；`lineHash` 是定义行 SHA-256 的前 16 个十六进制字符 | 暂定 |
+| `GET /v1/policy_groups` | `{"<组名>": [{"name", "typeDescription", "isGroup", "enabled", "lineHash"}, …], …}`，成员顺序同配置；`enabled` 恒为 `true`；`lineHash` 是脱敏后定义行 SHA-256 的前 16 个十六进制字符（第 13 节 P6 的修订） | 暂定 |
 | `GET /v1/policy_groups/select?group_name=G` | `{"policy": "<当前生效的成员>"}`；未知组 → 404 | 手册 |
 | `POST /v1/policy_groups/select` | 请求 `{"group_name", "policy"}` → `{}`；组或成员无效、不是 `select` 组 → 400 | 手册（请求体） |
 
@@ -423,5 +423,25 @@ impl Engine {
 | ---- | ---- | ---- |
 | O1 | `socket2` 对 macOS `IP_BOUND_IF`、Linux `TCP_FASTOPEN_CONNECT` 的安全封装在 0.6 里的确切名字与 cfg 条件 | **已结（写 M1a 计划时查了 0.6.5 源码）**：`bind_device`（Linux / Android / Fuchsia）、`bind_device_by_index_v4/v6`（Apple 各平台等）、`set_tos_v4`（含 Windows）、`set_tclass_v6`（不含 Windows）都在 `all` feature 下；**没有任何 TFO 封装** → 见 5.1 |
 | O2 | `/v1/policies/detail`、`/v1/policy_groups` 的真实响应 | 拿到 Surge 实例的样本后对齐；此前标"暂定" |
-| O3 | sing-box 的固定版本与三平台发布包的 SHA256 | M1b 互操作任务里选定并写进 CI |
-| O4 | hyper 的 HTTP/1 客户端是否原样发送绝对 URI 的请求行 | M1b 接线任务的第一步用一个回环测试确认；不成立则在入站里手写请求行 |
+| O3 | sing-box 的固定版本与三平台发布包的 SHA256 | **已结（P2）**：固定 sing-box **1.14.1**（2026-09-15 发布的稳定版）。三个包的 SHA256：`sing-box-1.14.1-linux-amd64.tar.gz` = `12cb2816b52febb356f6a885b740cc8758c3f30b8ae0ca8edba80f0d2d35343f`；`sing-box-1.14.1-windows-amd64.zip` = `5197f16d492d93202dc623622149a6ed040f8eca263128f91d603f2b901baa89`；`sing-box-1.14.1-darwin-arm64.tar.gz` = `b9024642ef7b4848252df5469b7f60ef3c18bb5e217a16a0934f0174f8ad11b4`（GitHub 发布 API `releases/tags/v1.14.1` 各资产的 `digest` 字段；`macos-latest` 是 arm64） |
+| O4 | hyper 的 HTTP/1 客户端是否原样发送绝对 URI 的请求行 | **已结（P1）**：不需要手写请求行。入站把请求 URI 重建成 `http://<host[:port]><path?query>`（去掉 userinfo）后原样交给 hyper；hyper 1.11.1 的 `client::conn::http1::SendRequest::send_request` 在 `proto/h1/role.rs` 里把请求 URI（`msg.head.subject.1`）原样写出，其文档写明发给 HTTP 代理时用 absolute-form |
+
+## 13. M1b 实施期的订正
+
+本节登记 M1b 计划的「计划期决定」（`global-constraints.md` P4–P12）里与本文件第 6 节文字不同的地方，以及第 6.1–6.5 节的代码草图与实现（`crates/rurge-policy/src/{registry,cell,selections,factory}.rs`、`crates/rurge-engine/src/{outbounds,shared,views}.rs`）核对后发现的出入。逐条对应实现的提交见 `docs/superpowers/plans/2026-09-19-phase2-m1b-assembly-control-plane-plan.md` 末尾「执行期修正记录」。
+
+| 编号 | 设计原文 | 订正 |
+| ---- | -------- | ---- |
+| P4 | 6.2 / 6.3 说 `RegistryCell` 与 `SelectionTable` "由引擎持有、跨代稳定"，未给出承载它们的具体类型，也未说明它们与 `Runtime` 的关系 | 新增 `rurge_engine::EngineShared { cell: Arc<RegistryCell>, selections: Arc<SelectionTable> }`（`crates/rurge-engine/src/shared.rs`），由调用方在第一次 `Runtime::build` 之前创建，经 `RuntimeOptions.shared` 传入；`Runtime.policies` 改为 `Arc<PolicyRegistry>`；引擎在 `Engine::new` / `swap_runtime` 里把注册表存进 `shared.cell`，`Drop` 时清空；重载时调用方用 `engine.shared()` 构建下一代，`swap_runtime` 断言两者是同一个 cell。原因：注册表在 `Runtime::build` 里构建、早于 `Engine::new`，必须先于引擎存在 |
+| P5 | 4.1："`ProxyPolicy` 不变" | `ProxyPolicy` 与 `PolicyGroup` 各加一个字段 `definition: String`（`名字 =` 右边的原文），供 `/v1/policies/detail` 与 `lineHash` 使用；"不变"指 spec 工作不重构它，语料库快照基于 `ConfigSummary`，不受影响 |
+| P6 | 6.6 把 `/v1/policies/detail`、`/v1/policy_groups` 的响应标"暂定"，`lineHash` 写作"定义行 SHA-256 的前 16 个十六进制字符"，未说明是否含 `名字 =` 前缀、是否脱敏 | 两个暂定细节定下来：`/v1/policies/detail` 的值是脱敏后的定义（不含 `名字 =` 前缀），脱敏规则同 `GET /v1/profiles/current`；`lineHash` 最初定为 `SHA-256("<名字> = <定义原文>")` 的前 16 个十六进制字符（内置策略对名字取哈希），登记进 `docs/api/phase2.md` |
+| P6（修订） | 同上（`lineHash` 建立在未脱敏的定义原文上） | Task 8 评审时修订：`lineHash` 改为对**脱敏后**的定义取哈希——`SHA-256("<名字> = <redact_definition(定义)>")` 的前 16 个十六进制字符，内置策略仍对名字取哈希（`crates/rurge-engine/src/views.rs::line_hash`）。原因：这个哈希经无需额外权限的 API 端点公开，若建立在未脱敏的定义上，持有 API key 的人就能拿它离线核对猜测的凭据，等于让凭据的验证能力离开了进程；名字唯一且参与哈希，脱敏不会让两个成员撞哈希；代价是只改动凭据时 `lineHash` 不变，`docs/api/phase2.md` 已注明这一点及原因 |
+| P7 | 6.4："三个调用点：`rurge check`、`POST /v1/profiles/check`、以及 `run` / `reload` 在 `load()` 之后——后者把结果当作加载诊断处理" | 统一成一个入口 `rurge_engine::outbounds::load_checked(path, opts)`（= `rurge_config::config::load` + 追加 `dry_build` 的诊断），`check`、`run`、`reload`、`POST /v1/profiles/check` 四个调用点都改用它。原因：一个入口免得漏掉哪个调用点 |
+| P8 | 未展开 `HostName::from_wire` 对含控制字符 / 空白名字的处理，也未说明 IDN 在哪一层转 A-label | 网络来的主机名经 `HostName::from_wire` 进入系统：含控制字符或空白的名字被拒绝，非 ASCII（IDN）原样通过（规则匹配的语义不变）；`http` / `socks5` 出站在写线之前把非 ASCII 域名转成 A-label（`rurge_proto::hostname::to_ascii`，内部用 `idna::domain_to_ascii`）。**执行期收紧**（Task 2 评审）：转换后的结果只允许 ASCII 字母、数字、`-`、`.`、`_`，其它字符一律拒绝——含被 UTS-46 从全角折叠成 `@` `/` `:` 的字符，以及本就放行的普通 ASCII `@`；原样放行 `@` 会让宽松的上游（如 Go 的 URL 解析器）把 `CONNECT a@b.test:443` 读成 userinfo + 主机 `b.test`，客户端就能经上游代理够到 rurge 域名规则从未见过的主机。`rurge_proto::http::wire_host` 随之公开，`valid_target` 定义为 `wire_host(..).is_some()`；`HttpForward` 的 trait 文档相应改写："自己写请求行 / `Host` 头的调用方必须写 `wire_host` 返回的文本，不得写 `target.host`；转发不是自己构造的 URI 的调用方用 `valid_target` 把关"（`crates/rurge-proto/src/http.rs`、`outbound.rs`） |
+| P9 | 6.5："FR-DNS-07：… 命中 `HostAction::Ips` 就把第一个 IP 而不是域名交给代理"，未明说命中后这次会话走 CONNECT 还是绝对 URI 转发 | `[Host]` 的 IP 替换命中时，这条会话不走绝对 URI 转发而走 CONNECT（`crates/rurge-engine/src/engine.rs::dial` 里 `pinned` 标记参与 `forward` 的判断）。原因：转发模式下目标由请求 URI 携带，引擎不把目标交给出站；要让代理连到本地指定的 IP 又保留 `Host:`，走隧道是语义正确且最简单的做法 |
+| P10 | M1a 设计范围（4.3）未说明 `hybrid` 取值非法时的行为，只说 iOS 专属参数用 `W0004` | `hybrid` 不再校验取值：桌面端一律只报 `W0004`；空的 `interface=` 仍是 `E0018`；`http` / `socks5` 策略上没有 spec 读取的参数照旧报 `W0001`。原因：手册对非法值 / 空值的行为没有任何说明，项目的兼容性原则是平台不适用的配置项解析并忽略，`hybrid` 属于这一类 |
+| P11 | 4.4（TLS 参数）与第 7 节（错误处理）未提到 `skip-cert-verify=true` 要不要给出提示 | 真正构建时（非干构建）每个策略打一条运行期 WARN（`crates/rurge-engine/src/outbounds.rs::skips_verification` + `EngineFactory::build`），不新增诊断码。原因：诊断码的新增需要设计评审，这里只是给运维的信号；干构建不打，因为干构建不代表这个策略真的会被拨号使用 |
+| P12 | 5.1（`rurge-platform::socket`）未提到网卡表要不要缓存 | 网卡表加 5 秒的进程内缓存（macOS / Windows 每次连接都要查表）。原因：`GetAdaptersAddresses` 是毫秒级调用，每条连接都查一次在高并发下是浪费；代价（登记进「延后事项」）：`Cached::get` 在持锁期间调用阻塞的 `get_if_addrs`，新出现的网卡最多晚 5 秒可见 |
+| 任务 4 / 10 | 6.4："用 `NoopSocketHook` 与一个永不被调用的解析器构造 `EngineFactory`"，未提根证书；返回类型写作 `Vec<Diagnostic>` | 干构建的 `EngineFactory` 改用真实根证书（`EngineFactory::dry` 调 `rurge_net::tls::root_store()`），不再用空的 `RootCertStore`；新增 `EngineFactory::with_roots(cfg, resolver, hook, roots)` 供测试注入私有 CA，`EngineFactory::new` 改为调用它并传入真实根证书。原因（Task 10 发现）：rustls 的 `WebPkiServerVerifier::builder` 在空证书库上直接建不起来，会让任何走标准校验的 `https` / `socks5-tls` 策略被干构建误判成 `E0022`，即使它构建后真的能用；Task 4 的用例只让坏 p12（更早失败）和明文 `http` 走过干构建工厂，没有暴露这个缺陷。`dry_build` 的返回类型实为 `rurge_config::Diagnostics`（既有的诊断收集类型），不是裸 `Vec<Diagnostic>`——`load_checked` 要把它并入同为 `Diagnostics` 类型的 `Loaded::diagnostics`，用同一个类型更顺 |
+| 6.2 | `enum Entry`、`struct Resolution`、`struct RegistryCell`、`struct ChainConnector` 只给出字段草图；`PolicyRegistry::build(cfg, factory, cell, selections)` 未给完整类型签名 | 与实现核对：字段与设计一致；最终签名为 `PolicyRegistry::build(cfg: &Config, factory: &dyn OutboundFactory, cell: &Arc<RegistryCell>, selections: Arc<SelectionTable>) -> Result<PolicyRegistry, BuildError>`（`crates/rurge-policy/src/registry.rs`）；`Entry`、`Terminal` 是 `registry` 模块内部类型，不对外 `pub`——`PolicyRegistry` 本身是唯一的公开入口 |
+| 6.5 | "`rurge_inbound::Dialed` 增加 `forward: Option<Vec<(String, String)>>`"；"调用新增的 `Resolver::host_lookup(name) -> Option<HostLookup>`（对现有 `HostMap::lookup` 的两行委托）" | 与实现一致：`pub struct Dialed { pub stream: BoxedStream, pub handle: Arc<SessionHandle>, pub forward: Option<Vec<(String, String)>> }`（`crates/rurge-inbound/src/session.rs`）；`Resolver::host_lookup(&self, name: &str) -> Option<crate::hosts::HostLookup>` 委托给 `self.hosts.lookup(name)`（一行，非"两行"，纯措辞）（`crates/rurge-dns/src/resolver.rs`） |

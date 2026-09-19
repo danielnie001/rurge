@@ -112,7 +112,7 @@
 
 | 项 | Surge 行为 | rurge | 阶段 | 备注 |
 | --- | --- | --- | --- | --- |
-| `[Keystore]` 条目 `name = type=, base64=, password=` | `type` 为 `p12` 或 `openssh-private-key`，可省略推断 | ✅ | 2 | |
+| `[Keystore]` 条目 `name = type=, base64=, password=` | `type` 为 `p12` 或 `openssh-private-key`，可省略推断 | ✅ | 2 | M1 已实现：加载期校验 Base64（`E0021`）与引用（`E0020`），干构建期解码（`E0022`）；OpenSSL 3 默认加密与 `-legacy`（RC2-40 + 3DES）两种都能读 |
 | 引用点：`client-cert` / `ca-keystore-name` / `private-key` | | ✅ | 2 / 4 | |
 | Host List：`-` 前缀排除、`*` `?` 通配、顺序优先 | | ✅ | 1 | |
 | Host List：`host:port` `host:0` 与各参数默认端口 | `force-http-engine-hosts` 默认 80，MITM `hostname` 默认 443 | ✅ | 1 | |
@@ -134,7 +134,7 @@
 | `encrypted-dns-follow-outbound-mode` | 布尔；默认 false | 全部 | 🟡 | 1 | 含"代理服务器为域名时回退 DIRECT 并告警"的防环逻辑；M3b：TCP/DoT/DoH 上游连接走流水线（成 Internal 会话，`PROTOCOL,DOH/DOT/DNS` 可匹配）；上游主机名由 Bootstrap 解析，流水线只见 IP 目标，故域名规则不匹配上游主机名；协议标签按端口启发（853→DoT，443→DoH，其余→DNS）；被规则 REJECT 时告警并直连以保 DNS；UDP 上游不经连接器；这类内部会话的 `SRC-IP` 恒为 `127.0.0.1`、`IN-PORT` 恒为 `0`，`SRC-IP,127.0.0.1/32` / `IN-PORT,0` 规则可能意外匹配到它们，且它们的 `kill` 是空操作（DNS 路径不监听取消令牌） |
 | `encrypted-dns-skip-cert-verification` | 布尔；默认 false | 全部 | ✅ | 1 | |
 | `allow-dns-svcb` | 布尔；默认 false | 全部 | ✅ | 3 | fake-IP 应答器拒绝 type 65 查询 |
-| `use-local-host-item-for-proxy` | 布尔；默认 false | 全部 | ✅ | 2 | |
+| `use-local-host-item-for-proxy` | 布尔；默认 false | 全部 | ✅ | 2 | M1 已实现（FR-DNS-07）：只对 `[Host]` 里指向 IP 的条目生效，取第一个 IP；命中时明文 HTTP 不走绝对 URI 转发而走 CONNECT；`[Host]` 给同一个名字列了多个地址时取第一个，不看策略的 `ip-version`（未与真实 Surge 核对） |
 | `hijack-dns` | `ip[:port]` 或 `*[:port]` 列表；默认端口 53 | 全部 | ✅ | 3 | |
 | `always-real-ip` | Host List | 全部 | ✅ | 3 | |
 | `geoip-maxmind-url` | URL；默认 `https://nssurge.com/resource/geoip-database.tar.gz` | 全部 | 🟡 | 1 | 接受 `.tar.gz`（含 `GeoLite2-Country.mmdb`）或裸 `.mmdb`；rurge 默认镜像为 `https://github.com/P3TERX/GeoLite.mmdb` 发布件（`GeoLite2-Country.mmdb` / `GeoLite2-ASN.mmdb`），而非 `nssurge.com`；可用 `--geoip-url` / `RURGE_GEOIP_URL` 覆盖 |
@@ -321,9 +321,9 @@
 
 | 类型关键字 | 协议 | Surge 版本 | rurge | 阶段 | 备注 |
 | --- | --- | --- | --- | --- | --- |
-| `http` / `https` | HTTP 代理 / HTTP over TLS | 全部 | ✅ | 2 | |
+| `http` / `https` | HTTP 代理 / HTTP over TLS | 全部 | ✅ | 2 | M1（阶段 2）已实现（TCP）：CONNECT 隧道；明文 HTTP 经 http / https 上游默认按绝对 URI 转发，always-use-connect=true 时走 CONNECT；headers 与 `<random-string>` 占位；目标主机名在写线之前转成 A-label，且只允许 ASCII 字母、数字、`-`、`.`、`_`（其它字符的名字被拒绝：防止宽松的上游把 `a@b.test` 读成 userinfo + 主机而绕过域名规则）；Surge 大概原样发送（未核对）；转发模式下上游对请求回 407 / 502 时，响应原样交还客户端（`Proxy-Authenticate` 已剥掉），会话记为 Completed；CONNECT 模式下同样的情形是 502 页面 + 会话日志里的 `http proxy answered 407 …` |
 | `h2-connect` | HTTP/2 CONNECT 多路复用 | Mac 6.6+ | ✅ | 2 | |
-| `socks5` / `socks5-tls` | SOCKS5 / SOCKS5 over TLS | 全部 | ✅ | 2 | |
+| `socks5` / `socks5-tls` | SOCKS5 / SOCKS5 over TLS | 全部 | ✅ | 2 | M1（阶段 2）已实现（TCP）；udp-relay 解析但未生效（M5）；目标主机名在写线之前转成 A-label，且只允许 ASCII 字母、数字、`-`、`.`、`_`（其它字符的名字被拒绝：防止宽松的上游把 `a@b.test` 读成 userinfo + 主机而绕过域名规则）；Surge 大概原样发送（未核对）；只有密码没有用户名时密码被忽略 |
 | `ss` | Shadowsocks | 全部 | ✅ | 2 | 加密方法见 4.6 |
 | `snell` | Snell v1–v6 | v6 需 iOS 5.20 / Mac 6.7+ | 🟡 | 2 | v1–v4 计划支持；v5（QUIC Proxy Mode）与 v6（PSK 派生协议画像、流量整形，beta）协议细节未公开，❓ 待评估 |
 | `vmess` | VMess（AEAD / 旧握手、TLS、WebSocket） | 全部 | ✅ | 2 | 旧式非 AEAD 握手 🟡 低优先级 |
@@ -337,26 +337,26 @@
 | `wireguard` | WireGuard L3 隧道作为策略 | 全部 | ✅ | 2 | |
 | `tailscale` | Tailscale 节点作为策略 | iOS 5.20 / Mac 6.7+ | ❓ | 远期 | 需嵌入 Tailscale 客户端（控制面协议、DERP、MagicDNS）；单独评估 |
 | `external` | 外部代理程序（本地 SOCKS5） | Mac only（iOS 视为 REJECT） | ✅ | 2 | rurge 在 Win/Lin/mac 均支持 |
-| 策略指向 rurge 尚未实现的协议类型 | Surge 原生支持全部协议 | 全部 | 🟡 | 1 / 2 | 加载时告警 `W0007`；运行时该策略按 `REJECT` 处理，会话日志 `error = policy protocol not implemented: <type>`；阶段 2 逐协议实现后移除 |
+| 策略指向 rurge 尚未实现的协议类型 | Surge 原生支持全部协议 | 全部 | 🟡 | 1 / 2 | 加载时告警 `W0007`；运行时该策略按 `REJECT` 处理，会话日志 `error = policy protocol not implemented: <type>`；随阶段 2 各里程碑逐协议移除：M1 已移除 `http` `https` `socks5` `socks5-tls` |
 
 ### 4.3 通用策略参数（14 个）
 
 | 参数 | 取值 / 默认 | rurge | 阶段 | 备注 |
 | --- | --- | --- | --- | --- |
-| `interface` | 出口网卡名；默认自动 | ✅ | 2 | Win 用 `IP_UNICAST_IF` / 绑定网卡地址；Lin 用 `SO_BINDTODEVICE`；mac 用 `IP_BOUND_IF`。WireGuard / Tailscale 不支持，与 Surge 一致 |
-| `allow-other-interface` | 布尔；默认 false | ✅ | 2 | |
-| `dns-follow-interface` | 布尔；默认 false | ✅ | 2 | |
+| `interface` | 出口网卡名；默认自动 | 🟡 | 2 | M1 已实现。Lin 用 `SO_BINDTODEVICE`；mac 用 `IP_BOUND_IF` / `IPV6_BOUND_IF`；Win 取网卡的友好名称（如 `Wi-Fi`），以绑定该网卡在对应地址族上的第一个非环回、非链路本地地址实现（不用 `IP_UNICAST_IF`：没有安全封装），该族没有地址则视为不可用，被改成弱主机模型的接口上可能不生效。网卡表缓存 5 秒。空值（`interface=`）是 `E0018`（未与真实 Surge 核对）。WireGuard / Tailscale 不支持，与 Surge 一致 |
+| `allow-other-interface` | 布尔；默认 false | ✅ | 2 | M1 已实现：网卡不可用时每个策略 WARN 一次并改用默认网卡 |
+| `dns-follow-interface` | 布尔；默认 false | 🟡 | 2（M5） | 解析，W0029；M5 生效 |
 | `no-error-alert` | 布尔；默认 false | ✅ | 6 | 抑制该策略的错误通知 |
-| `ip-version` | `dual` `v4-only` `v6-only` `prefer-v4` `prefer-v6`；默认 `dual`；prefer 模式 3 秒后尝试另一族 | ✅ | 2 | 有 `underlying-proxy` 时无效 |
-| `hybrid` | `auto` `on` `off` | 🔁 | 2 | iOS 专属 |
-| `tfo` | 布尔；默认 false | 🟡 | 2 | Lin / mac 支持；Windows 的 `TCP_FASTOPEN` 支持情况阶段 2 验证 |
-| `tos` | 0–255 或 `0x` 十六进制；默认 0 | ✅ | 2 | |
-| `ecn` | `auto` `on` `off`；QUIC 类协议默认开启，WireGuard/Tailscale 默认关闭 | 🟡 | 2 | 取决于所选 QUIC 库对 ECN 的支持 |
-| `block-quic` | `auto` `on` `off`；默认 `auto`（代理策略默认阻断，DIRECT 不阻断） | ✅ | 2 | 与 `[General] block-quic` 全局覆盖联动 |
-| `test-url` | HTTP(S) URL；默认全局设置 | ✅ | 2 | |
-| `test-timeout` | 秒；默认全局设置 | ✅ | 2 | |
-| `test-udp` | `hostname@ipv4` | ✅ | 2 | |
-| `underlying-proxy` | 另一策略或策略组名；仅代理策略；不能与 `port-hopping` 同用 | ✅ | 2 | 目标代理主机名在上游远程解析 |
+| `ip-version` | `dual` `v4-only` `v6-only` `prefer-v4` `prefer-v6`；默认 `dual`；prefer 模式 3 秒后尝试另一族 | ✅ | 2 | 有 `underlying-proxy` 时无效；M1 已实现：`dual` 按 250 ms 交错竞速，`prefer-*` 3 秒后加入另一族；用于 `direct` 别名时同样作用于对目标的解析与连接（手册只描述了到代理服务器的连接）；目标是 IP 字面量时不过滤 |
+| `hybrid` | `auto` `on` `off` | 🔁 | 2 | iOS 专属：出现即 `W0004`，取值不校验 |
+| `tfo` | 布尔；默认 false | 🟡 | 2 | 解析并校验，`W0029`，三平台都不生效：`socket2` 0.6 没有 TFO 的安全封装，不为此引入 unsafe；有安全封装后再评估 |
+| `tos` | 0–255 或 `0x` 十六进制；默认 0 | 🟡 | 2 | M1 已实现；Windows 上对 IPv6 不生效 |
+| `ecn` | `auto` `on` `off`；QUIC 类协议默认开启，WireGuard/Tailscale 默认关闭 | 🟡 | 2 | 取决于所选 QUIC 库对 ECN 的支持；M1 解析并校验取值，`W0029`；M5 生效 |
+| `block-quic` | `auto` `on` `off`；默认 `auto`（代理策略默认阻断，DIRECT 不阻断） | ✅ | 2 | 与 `[General] block-quic` 全局覆盖联动；M1 解析并校验取值，`W0029`；M7 生效 |
+| `test-url` | HTTP(S) URL；默认全局设置 | ✅ | 2 | M1 解析并校验取值，`W0029`；M3 生效 |
+| `test-timeout` | 秒；默认全局设置 | ✅ | 2 | M1 解析并校验取值，`W0029`；M3 生效 |
+| `test-udp` | `hostname@ipv4` | ✅ | 2 | M1 解析并校验取值，`W0029`；M3 生效 |
+| `underlying-proxy` | 另一策略或策略组名；仅代理策略；不能与 `port-hopping` 同用 | ✅ | 2 | 目标代理主机名在上游远程解析；M1 已实现（TCP）：底层可以是策略或组，按名字在拨号时解析，组的选择变了链的入口随之变；成环是 `E0019`；链上某一跳失败时错误文本带 `via <名字>:` 前缀 |
 
 ### 4.4 TLS 与 Shadow TLS 参数
 
@@ -364,12 +364,12 @@
 
 | 参数 | 取值 / 默认 | rurge | 阶段 | 备注 |
 | --- | --- | --- | --- | --- |
-| `skip-cert-verify` | 布尔；默认 false | ✅ | 2 | |
-| `sni` | 主机名或 `off`；默认代理主机名 | ✅ | 2 | |
-| `server-cert-verify-name` | 主机名（与 SNI 独立） | ✅ | 2 | |
-| `server-cert-fingerprint-sha256` | 64 位十六进制 | ✅ | 2 | |
-| `alpn` | 协议列表；TUIC / Hysteria 2 / MASQUE 默认 `h3` | ✅ | 2 | |
-| `client-cert` | `[Keystore]` 条目名（p12） | ✅ | 2 | 双向 TLS |
+| `skip-cert-verify` | 布尔；默认 false | ✅ | 2 | M1 已实现：构建出站时打一条 WARN |
+| `sni` | 主机名或 `off`；默认代理主机名 | ✅ | 2 | M1 已实现：自定义 `sni` 同时成为证书校验名，除非给了 `server-cert-verify-name`（未与真实 Surge 核对） |
+| `server-cert-verify-name` | 主机名（与 SNI 独立） | ✅ | 2 | M1 已实现 |
+| `server-cert-fingerprint-sha256` | 64 位十六进制 | ✅ | 2 | M1 已实现：与 `skip-cert-verify` 同时出现时指纹优先（`W0012`） |
+| `alpn` | 协议列表；TUIC / Hysteria 2 / MASQUE 默认 `h3` | ✅ | 2 | M1 已实现：`https` / `socks5-tls` 握手不带 ALPN，除非写了 `alpn`（未与真实 Surge 核对） |
+| `client-cert` | `[Keystore]` 条目名（p12） | ✅ | 2 | 双向 TLS；M1 已实现 |
 | `shadow-tls-password` | 字符串；设置即启用 Shadow TLS | ✅ | 2 | |
 | `shadow-tls-sni` | 主机名；v3 必填 | ✅ | 2 | |
 | `shadow-tls-version` | `2` / `3`；默认 2 | ✅ | 2 | |
@@ -392,7 +392,7 @@
 | --- | --- | --- | --- | --- |
 | `http` `https` `h2-connect` | `username` `password`（位置或命名） | ✅ | 2 | |
 | `http` `https` | `always-use-connect`（默认 false） | ✅ | 2 | |
-| `http` `https` `h2-connect` | `headers`（分号分隔；`<random-string(n)>` / `<random-string(min-max)>` 占位） | ✅ | 2 | |
+| `http` `https` `h2-connect` | `headers`（分号分隔；`<random-string(n)>` / `<random-string(min-max)>` 占位） | ✅ | 2 | 值里允许 HTAB，拒绝其它一切控制字符（`E0018`）；Surge 大概原样发送（未核对） |
 | `h2-connect` | `max-streams`（默认 3） | ✅ | 2 | |
 | `h2-connect` | `udp-relay`（CONNECT-UDP，RFC 9298） | ✅ | 2 | |
 | `socks5` `socks5-tls` | `username` `password` `udp-relay`（UDP ASSOCIATE） | ✅ | 2 | |
@@ -425,7 +425,7 @@
 
 | 类型 | Surge 行为 | rurge | 阶段 | 备注 |
 | --- | --- | --- | --- | --- |
-| `select` | 手动选择；选择按 Profile 持久化；无记录或成员消失时用第一个成员 | ✅ | 2 | 通过 API / CLI / Dashboard 切换 |
+| `select` | 手动选择；选择按 Profile 持久化；无记录或成员消失时用第一个成员 | ✅ | 2 | 通过 API / CLI / Dashboard 切换；M1：选择经 API 切换，对下一条连接生效，按 Profile 文件名持久化到 `state.json` |
 | `url-test` | 选延迟最低者；HEAD 两次（第二次计分）；用时且过期或网络变化才重测；变更时通知（除非 `no-alert`） | ✅ | 2 | |
 | `fallback` | 按声明顺序取第一个可用；全部不可用则用第一个 | ✅ | 2 | |
 | `load-balance` | 可用集合内随机；`persistent` 时按目标主机名哈希；从不通知；嵌套时分数取均值 | ✅ | 2 | |
@@ -795,7 +795,7 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | 无参数进入交互模式（补全、历史） | | `rurge shell` | 6 | |
 | `--raw` | 输出原始 JSON | `--json` | 6 | |
 | `--remote / -r <host:port>` `--password-stdin` `SURGE_CLI_PASSWORD` | 远程实例 | `--remote` `--password-stdin` `RURGE_CLI_PASSWORD` | 6 | 远程走 HTTP API |
-| `--check / -c <path>` | 校验配置 | `rurge check -c <path>` | 1 | |
+| `--check / -c <path>` | 校验配置 | `rurge check -c <path>` | 1 | 自阶段 2 / M1 起含干构建：构建不出来的策略（如 p12 解不开）是带行号的 `E0022` |
 | `--help` / `help <command>` | | 同 | 1 | |
 | `status` `summary` `version` | 状态 | 同名 | 6 | |
 | `mode` `global-policy` `policy-group` | 出站模式 / 全局策略 / 组选择与清除覆盖 | 同名 | 6 | |
@@ -827,16 +827,16 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | `GET/POST /v1/outbound` | `{"mode":"direct"\|"proxy"\|"rule"}` | 全部 | ✅ | 1 | |
 | `GET/POST /v1/outbound/global` | 全局模式策略 | 全部 | 🟡 | 1 | M4a 已实现；出站模式与全局策略持久化到 `state.json`，显式 `--outbound-mode` 覆盖并写回（不校验策略是否存在）；`proxy` 模式下全局策略缺失或已不存在（如重载后）→ 按规则模式处理并 WARN 一次；`proxy` 模式下用空串清空全局策略 → 400（与 `POST /v1/outbound` 切换模式时的校验对称，M4b） |
 | `GET /v1/policies` | 列出策略 | 全部 | 🟡 | 1 | M4a 已实现；JSON 结构手册未定义，暂定结构见 `docs/api/phase1.md`，阶段 6 对齐真实 Surge |
-| `GET /v1/policies/detail?policy_name=` | 策略详情 | 全部 | ✅ | 2 | |
+| `GET /v1/policies/detail?policy_name=` | 策略详情 | 全部 | 🟡 | 2 | M1 已实现；响应形状手册未给出，暂定结构见 `docs/api/phase2.md` |
 | `POST /v1/policies/test` | `{"policy_names":[...],"url":...}` | 全部 | ✅ | 2 | |
-| `GET /v1/policy_groups` | 列出组与选项 | 全部 | ✅ | 2 | |
+| `GET /v1/policy_groups` | 列出组与选项 | 全部 | 🟡 | 2 | M1 已实现；响应形状手册未给出，暂定结构见 `docs/api/phase2.md` |
 | `GET /v1/policy_groups/test_results` | 自动组测试结果 | 全部 | ✅ | 2 | |
-| `GET/POST /v1/policy_groups/select` | 读 / 改 select 组选择 | 全部 | ✅ | 2 | |
+| `GET/POST /v1/policy_groups/select` | 读 / 改 select 组选择 | 全部 | ✅ | 2 | M1 已实现 |
 | `POST /v1/policy_groups/test` | 立即测试 → `{"available":[...]}` | 全部 | ✅ | 2 | |
 | `GET /v1/requests/recent` `GET /v1/requests/active` `POST /v1/requests/kill` | 请求列表与终止 | 全部 | 🟡 | 1 / 4 | 响应结构手册未定义，以 Surge 实际输出为准做兼容测试；M4a 暂定结构见 `docs/api/phase1.md`；`kill` 命中 rurge 自身的内部会话（如 DNS 查询）→ 409 |
 | `GET /v1/profiles/current?sensitive=0` | 当前配置文本（可脱敏） | 全部 | ✅ | 1 | M4a 已实现；`sensitive=0`（默认）脱敏：独立密钥行 `password` / `ca-passphrase` / `ca-p12` / `private-key` / `psk` / `pre-shared-key` / `token`；内联参数 `password` / `psk` / `private-key` / `pre-shared-key` / `base64` / `token` / `uuid` / `username`；`http-api` / `external-controller-access` / `http-listen` / `socks5-listen` 的 `key@` 前缀与 `wifi-access-http-auth` 口令；`http` / `https` / `socks5` / `socks5-tls` 策略行第 4 个起、首个 `=` 之后为空或全是 `=` 的 token（位置传递的凭据，含带填充的 base64）。名单以外不脱敏；其余内容与行数、行尾 CRLF 原样保留 |
 | `POST /v1/profiles/reload` | 重载 | 全部 | ✅ | 1 | 底层热重载能力（SIGHUP / `--watch`）已在 M3b 就位，API 触发已在 M4a 实现；解析失败或构建 `Runtime` 失败时返回 `ok:false` 且运行中的配置不变；重绑监听器失败时同样 `ok:false`，但配置代已经切换，只是监听器归零，直到下一次重载成功为止（与本表第 809 行「零监听器」退化态一致） |
-| `POST /v1/profiles/switch` `GET /v1/profiles` `POST /v1/profiles/check` | 多配置管理 | Mac only | ✅ | 1 / 6 | rurge 以配置目录管理多个 Profile；`check` 已实现（M4a，校验磁盘上的当前配置文件，不影响运行中的实例）；`switch` 与 `GET /v1/profiles` 的多配置目录管理仍在阶段 6 |
+| `POST /v1/profiles/switch` `GET /v1/profiles` `POST /v1/profiles/check` | 多配置管理 | Mac only | ✅ | 1 / 6 | rurge 以配置目录管理多个 Profile；`check` 已实现（M4a，校验磁盘上的当前配置文件，不影响运行中的实例）；`switch` 与 `GET /v1/profiles` 的多配置目录管理仍在阶段 6；自 M1 起 `check` 含干构建（`E0022`） |
 | `POST /v1/dns/flush` `GET /v1/dns` `POST /v1/test/dns_delay` | DNS | 全部 | 🟡 | 1 | M4a 已实现；`GET /v1/dns` 的 JSON 结构手册未定义，暂定结构见 `docs/api/phase1.md`，阶段 6 对齐真实 Surge；`dns_delay` 返回按上游的时延列表而非单一数字 |
 | `GET/POST /v1/modules` | 模块列表与开关 | 全部 | ✅ | 5 | |
 | `GET /v1/scripting` `POST /v1/scripting/evaluate` `POST /v1/scripting/cron/evaluate` | 脚本列表 / mock 执行 / 运行 cron | 全部 | ✅ | 5 | |

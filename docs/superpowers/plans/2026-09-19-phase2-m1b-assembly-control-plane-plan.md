@@ -4910,9 +4910,31 @@ git commit -m "docs: 阶段 2 / M1b 装配与控制面：兼容性清单、API �
 
 | 任务 | 偏差 | 原因 | 提交 |
 | ---- | ---- | ---- | ---- |
-| （由 Task 12 按执行记录填写；没有偏差就写一行"无"） | | | |
+| 1 | 无 | — | d525787 |
+| 2 | `rurge_proto::http::wire_host` 公开；`valid_target` 定义为 `wire_host(..).is_some()`；`HttpForward` 的契约改写为"自己写请求行 / `Host` 头的调用方必须写 `wire_host` 返回的文本，不得写 `target.host`；转发不是自己构造的 URI 的调用方用 `valid_target` 把关" | 任务评审的 Important（由计划文字引起）：计划把 `valid_target` 的规则改成"转成 A-label 之后可写"，却没有同步 trait 上的契约，A-label 形式在 crate 外也拿不到 | c8d8698 |
+| 2 | 出站的主机名字母表收紧：转换之后只允许 ASCII 字母、数字、`-`、`.`、`_` | 控制者裁定（评审实测的观察）：UTS-46 会把全角 `＠` `／` `：` 映射成 `@` `/` `:`，普通 ASCII `@` 一直被放行；宽松的上游（Go 的 URL 解析器）把 `CONNECT a@b.test:443` 读成 userinfo + 主机 `b.test`，客户端就能经上游代理够到 rurge 的域名规则从未见过的主机 | c8d8698 |
+| 2 | `check_status` 用 `trim()` 而不是计划写的 `trim_end()`；`DirectConnector` 的空应答文本沿用两个生产解析器已有的措辞 `no addresses for <name>`（计划写的是 `no address found for <name>`），并注明该分支只为"返回空列表而不是错误"的 `Resolve` 实现兜底 | 评审的 Minor，修复轮里顺手处理：状态码后的双空格不该保留；同一情形不该有两种措辞（`SystemResolve` 与 `rurge_dns::Resolver` 自己就会把空应答变成 `NotFound`） | c8d8698 |
+| 3 | 无（代码与计划逐字一致，仅 rustfmt 换行） | — | 357b14b |
+| 4 | 无；`[Keystore]` 里空的 `base64=` 在加载期确实不报错，干构建在解码 p12 时报 `E0022`（计划预留的 `base64=AA==` 退路没有用上）——M1a 延后表里"空的 `base64` 不报 `E0021`"那一条就此关闭 | — | b20973d |
+| 5 | `tests/outbounds.rs` 的 CONNECT 用例在等请求记录之前先 `drop(tunnel)` | 会话记录要等中继的两个方向都关闭才产生；计划里的用例没有关闭客户端一侧，会一直等到超时 | bf84ed8 |
+| 5 | `tests/pipeline.rs` 的 `build_runtime` 辅助函数多了一个 `shared` 参数，重载类用例用 `engine.shared()` 构建下一代 | 新加的 `publish_registry` 断言在四个重载 / 重新绑定用例里触发：它们确实在用另一个 cell 构建下一代——修法与 bin 的 `reload()` 一致 | bf84ed8 |
+| 5 | `Daemon.store`（bin）与 `Harness::socks()`（测试夹具）各加了 `#[allow(dead_code)]` | 前者是计划要求保留的字段（评审指出它其实已是死代码，Task 10 删除）；后者到 Task 7 才被用到 | bf84ed8 |
+| 6 | 无（`Dialed { .. }` 的构造点实际只有两处：引擎的 `dial` 与 `FakeDialer`） | — | 4ea463b |
+| 7 | `rurge_talks_to_rurge` 里每条隧道用完即 `drop(tunnel)`；去掉 `Harness::socks()` 上的 `#[allow(dead_code)]` | 派发时的控制者订正：会话记录要等隧道两个方向都关闭才产生，重新绑定变量并不会关闭前一条隧道 | c62b631 |
+| 6、7 | 两个"CONNECT 失败"的端到端用例（`a_refusing_upstream_is_a_502_that_quotes_the_proxy`、`a_broken_hop_is_named_in_the_error`）的请求带 `Connection: close`，并把"读到 EOF"从可有可无改成必须（超时即失败） | 任务评审的 Important（出在计划自己的测试代码里）：失败的 CONNECT 得到的是保持连接的 502 页面，`read_to_end` 等不到 EOF，每次都白等满 15 秒 / 5 秒 | deb5c26 |
+| 8 | 测试里用 `policy_detail("DIRECT")` 而不是计划写的 `"direct"` | 内置策略名区分大小写（`Builtin::parse` 是精确匹配）；解析器未动 | f1cb39e |
+| 8 | **计划期决定 P6 被修订**：`lineHash` 对**脱敏后**的定义取哈希（`SHA-256("<名字> = <redact_definition(定义)>")` 的前 16 个十六进制字符；内置策略仍对名字取哈希） | 任务评审的 Important（出在计划文字里）：对未脱敏的定义行取哈希再经 API 暴露，等于给持有 API key 的人一个离线验证凭据的途径；项目规则是任何由凭据派生的东西都不出进程。名字唯一且参与哈希，脱敏不会让两个成员撞哈希；代价是只改了凭据时 `lineHash` 不变 | 9877025 |
+| 8 | `hidden` 按项目的布尔约定读取（`g.params.bool("hidden")`：true / 1 / yes），不是计划写的只认字面 `true` | 任务评审的 Important（出在计划文字里） | 9877025 |
+| 9 | 无（仅 rustfmt 重排；`GET /v1/policy_groups/select` 的处理函数多了一行注释：没有成员的组返回 `{"policy": ""}`） | 派发时的控制者说明 | d0eaa9a |
+| 10（修的是 Task 4 的计划代码） | **干构建的工厂改用真实根证书**（`rurge_net::tls::root_store()`，进程内缓存、只读本机证书库、永不为空），不再用空的 `RootCertStore` | 计划缺陷，Task 10 把干构建接进 `rurge check` 时由 CLI 用例暴露：rustls 的 WebPKI 校验器拒绝空的根证书库，于是任何走标准校验的 `https` / `socks5-tls` 策略都会被干构建判成 `E0022`。Task 4 的用例只让坏 p12（更早失败）和明文 `http` 走过干构建工厂，没有暴露 | bf2899e |
+| 10 | CLI 用例断言输出里含 `` `ss` `` 而不是策略名 `Old` | `W0007` 按协议类型去重，消息里没有策略名 | bf2899e |
+| 10 | 删除 bin 里的死字段 `Daemon.store` 及其 `#[allow(dead_code)]` | Task 5 评审指出、派发时路由到本任务：选择是经引擎挂载的状态库写入的，从不经过这个字段 | bf2899e |
+| 10 | 给干构建的根证书修复补了单元测试 `an_ordinary_tls_policy_passes_the_dry_build`（把空证书库改回去，它会对两条标准校验的策略报 `E0022` 而失败）；两个 CLI 用例补上"输出 / 响应里没有 Keystore 密码"的断言；订正 `api.rs` / `pipeline.rs` 里"bin 不声明任何代理协议"的注释 | 任务评审的 Important：修复在 `rurge-engine` 自己的测试里没有钉子——正是让缺陷漏过 Task 4 的那个缺口 | 1d9cc26 |
+| 11 | 无（代码与计划逐字一致，仅 rustfmt 重排）。本机未装 sing-box：四个互操作用例在本机只验证了"跳过"与"`RURGE_INTEROP_REQUIRED=1` 时失败"两条路径 | — | e68d1bd |
 
 ## 延后事项
+
+标为"整分支终审时分诊"的条目，其最终去向由终审后的修复提交更新到本表。
 
 | 事项 | 去向 |
 | ---- | ---- |
@@ -4925,3 +4947,20 @@ git commit -m "docs: 阶段 2 / M1b 装配与控制面：兼容性清单、API �
 | `race` 的 3 秒分支被 `queue.is_empty()` 挡住；`server-cert-verify-name` 只在标准分支解析 | 前者保持现状（M1a 终审裁定）；后者 M2 |
 | 两个出站的测试辅助函数近乎相同；两个假上游各有一份 accept 循环；`http` 出站的 CONNECT 写没有 EOF / reset 归一 | 第三个出站（M2）到位时一并处理 |
 | Linux / macOS 的平台分支（含本计划的网卡表缓存）本机无法编译 | 首次推送后的 CI |
+| `HostName::from_wire` 放行 Unicode 格式字符（零宽空格 / 连接符、BOM、双向控制符）：不是注入向量（出站转成 A-label 后只允许字母、数字与 `- . _`），是显示混淆向量；ZWJ / ZWNJ 在部分文字的合法 IDN 里会出现，不能一概拒绝 | 整分支终审时分诊（至多拒绝 BOM 与双向控制符） |
+| SOCKS5 入站拒绝一个名字时不打任何日志（与空名字分支一致）；非 UTF-8 的名字仍是直接断开连接而不是回 `0x01` | 不处理 / 需要运维信号时加一条净化过的 debug 日志 |
+| `socks5` 出站的"超过 255 字节"提示量的是 A-label 而不是用户输入的名字（措辞） | 不处理 |
+| 运行期跨多跳 `ChainConnector` 的递归不受 `MAX_DEPTH` 约束（每一跳都是深度 0 的一次新 `resolve`）；它的有界性完全依赖"注册表只从通过了 `E0019` 的配置构建"——M1 里成立（`run` / `reload` 拒绝带错误的配置，组成员是静态的，选择只能落在静态图已覆盖的边上） | M3：订阅引入动态成员时加运行期的深度兜底（M1 设计 6.2 已预告） |
+| `cell.rs` 里 `via <name>: ` 前缀出现四处（每处一行） | 不处理 |
+| 注册表单元测试重写时少带了三条旧断言（成员不受支持的组的完整策略链；选择之后 `outbound.name() == "DIRECT"`；`Emptyish` 没有 note）；`Direct::with_socket_opts` 在工作区里已无调用方；`has_socket_opts` 缺一句"为什么不含 `allow_other_interface`"的注释 | 整分支终审时分诊 |
+| 1 Hz 采样任务持有 `Arc<Engine>` 直到 `stop_accepting`，在那之前 `Drop for Engine`（清空 cell）不会运行 | 不处理：守护进程退出路径先 `stop_accepting`；测试夹具不启动采样器 |
+| 转发模式下上游的拒绝（对绝对 URI 请求回 407 / 502）原样交还客户端（`Proxy-Authenticate` 已剥掉），会话记为 Completed、没有 error；CONNECT 模式下同样的配置错误是 502 页面 + 会话日志里的 `http proxy answered 407 …`。没有用例覆盖 | 整分支终审时分诊（控制者建议处理：转发模式下把上游的 407 映射成失败会话 + 502 页面）；不处理则登记进兼容性清单 |
+| 拒绝文本 `the target host name is not valid for an HTTP proxy request` 在 `rurge-engine` 与 `rurge-proto` 各写了一遍；隧道类端到端用例里"origin 看到的是 origin-form"的注释没有被断言证明；入站丢弃上游头的 debug 行不说是哪个头 | 整分支终审时分诊 |
+| `dry_build` 的文档注释把"跳过 Direct"说成"没有自己的出站"（实际是 `Direct::new` 不会失败；只有 Reject 没有自己的出站） | 不处理（措辞） |
+| HTTP 入站的"tripwire"测试钉的是 `http::Uri::from_str`，不是 hyper 的请求行解析器（两者共用 `Uri::parse`，间接但有效） | 不处理 |
+| `[Host]` 给同一个名字列了多个地址时，交给代理的总是第一个，不看该策略的 `ip-version`（FR-DNS-07 没有规定） | 登记进兼容性清单（见下面的文档要点）；需要时再按 `ip-version` 挑选 |
+| 三条新路由没有各自的 401 用例（路由器只有一条 `.layer(require_key)` 链，既有的"兜底路由也在鉴权之后"用例在结构上已覆盖）；API 端到端用例里"切换前不是 200"可以收紧成"状态行为空" | 不处理 |
+| `Cached::get` 在持锁期间调用 `get_if_addrs`（tokio 工作线程上的阻塞系统调用）：不是回退——以前每条连接都内联调用一次，现在每 5 秒一次，并发的连接排在一次刷新后面；新出现的网卡最多晚 5 秒可见；`PlatformSockets` 的用例只测了 `Family::V4` | 不处理 |
+| **`rurge run` 遇到有加载错误的配置，会在系统代理的崩溃恢复之前就退出 2**（`sysproxy.recover()` 在 tokio 块里，加载错误的退出点在它前面）。阶段 1 就是如此；干构建让"能解析但构建不出来"的配置也走这条早退路径。后果：上一次崩溃留下系统代理指向 rurge，而这次启动的配置又是坏的，系统代理会一直指向一个没人监听的端口，直到配置被修好 | 整分支终审时分诊；不在本计划范围内处理的话，列为阶段 1 的遗留缺陷单独修（把崩溃恢复提前到加载错误的退出点之前，它只需要数据目录） |
+| 互操作层的防抖小项：TLS 反例的匹配不含 `OutboundError::Timeout`（runner 负载高时握手超时会把"正确地没通过"变成红）；`wait_ready` 先连接后查子进程是否已退出（端口被别的进程抢走且 sing-box 已死时会误判就绪）；转发用例丢弃了超时结果；守卫夹具没有渲染"不带客户端 CA 的 TLS 入站"；必需模式的探针用例会打印一段 panic 回溯；README 说本地单元测试覆盖"定位二进制"而 `locate()` 其实没有测试；CI 步骤的 `curl` 没有 `--retry` | 整分支终审时分诊（都便宜，且影响 CI 的首次运行） |
+| sing-box 1.14.1 是否接受夹具渲染的配置（`tls.client_authentication` / `client_certificate_path`、没有 `route` 节、`log.timestamp`）、三个 SHA-256 本身、CI 步骤在真实 runner 上的行为 | 首次推送后的 CI（失败方式是干净的：`spawn` 带着 sing-box 的日志 panic） |
