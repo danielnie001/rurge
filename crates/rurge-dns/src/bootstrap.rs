@@ -184,7 +184,7 @@ impl Connector for BootstrapConnector {
                 .map_err(|e| io::Error::other(e.to_string()))?;
             let mut last =
                 io::Error::new(io::ErrorKind::NotFound, format!("no addresses for {host}"));
-            for ip in interleave(ips, opts.prefer_v6) {
+            for ip in interleave(ips, false) {
                 let t = Target::new(HostName::Ip(ip), target.port);
                 match self.inner.connect(&t, opts).await {
                     Ok(stream) => return Ok(stream),
@@ -420,7 +420,6 @@ mod tests {
         );
         let quick = ConnectOpts {
             timeout: Duration::from_millis(500),
-            prefer_v6: false,
         };
 
         let mut stream = connector

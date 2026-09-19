@@ -159,10 +159,7 @@ impl tower_service::Service<Uri> for HyperConnector {
             let https = uri.scheme_str() == Some("https");
             let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
             let target = Target::new(HostName::parse(&host), port);
-            let opts = ConnectOpts {
-                timeout,
-                prefer_v6: false,
-            };
+            let opts = ConnectOpts { timeout };
             let stream = connector.connect(&target, &opts).await?;
             if !https {
                 return Ok(HyperStream {

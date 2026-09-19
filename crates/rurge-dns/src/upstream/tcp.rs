@@ -108,10 +108,7 @@ impl TcpUpstream {
     async fn connect(&self, deadline: Instant) -> Result<BoxedStream, UpstreamError> {
         let timeout = deadline.saturating_duration_since(Instant::now());
         let target = Target::new(HostName::parse(&self.host), self.port);
-        let opts = ConnectOpts {
-            timeout,
-            prefer_v6: false,
-        };
+        let opts = ConnectOpts { timeout };
         let connecting = self.connector.connect(&target, &opts);
         let stream = match tokio::time::timeout_at(deadline, connecting).await {
             Ok(Ok(stream)) => stream,

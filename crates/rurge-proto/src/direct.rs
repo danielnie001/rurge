@@ -3,6 +3,7 @@
 use crate::outbound::{Outbound, OutboundError};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, DirectConnector, Resolve, Target};
+use rurge_net::socket::{SocketHook, SocketOpts};
 use std::sync::Arc;
 
 pub struct Direct {
@@ -14,9 +15,19 @@ impl Direct {
         Direct { connector }
     }
 
-    /// Plain TCP with happy-eyeballs address ordering, resolving through `resolver`.
+    /// Plain TCP, racing the resolved addresses, resolving through `resolver`.
     pub fn with_resolver(resolver: Arc<dyn Resolve>) -> Direct {
         Direct::new(Arc::new(DirectConnector::new(resolver)))
+    }
+
+    /// DIRECT with a policy's socket options (`direct` aliases, and the
+    /// built-in DIRECT carrying `[General] ipv6` as `v6_first`).
+    pub fn with_socket_opts(
+        resolver: Arc<dyn Resolve>,
+        opts: SocketOpts,
+        hook: Arc<dyn SocketHook>,
+    ) -> Direct {
+        Direct::new(Arc::new(DirectConnector::with_opts(resolver, opts, hook)))
     }
 }
 
@@ -124,7 +135,6 @@ mod tests {
                 &Target::new(HostName::parse("127.0.0.1"), port),
                 &ConnectOpts {
                     timeout: Duration::from_secs(3),
-                    prefer_v6: false,
                 },
             )
             .await

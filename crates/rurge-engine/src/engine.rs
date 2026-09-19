@@ -522,7 +522,6 @@ impl Engine {
         let target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
         let opts = ConnectOpts {
             timeout: CONNECT_TIMEOUT,
-            prefer_v6: rt.config.general.ipv6,
         };
         match resolution.outbound.connect_tcp(&target, &opts).await {
             Ok(stream) => Ok(crate::dns_pipeline::wrap_internal(stream, handle)),
@@ -680,7 +679,6 @@ impl Dialer for Engine {
             let target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
             let opts = ConnectOpts {
                 timeout: CONNECT_TIMEOUT,
-                prefer_v6: rt.config.general.ipv6,
             };
             match resolution.outbound.connect_tcp(&target, &opts).await {
                 Ok(stream) => Ok(Dialed { stream, handle }),

@@ -47,7 +47,14 @@ impl Runtime {
         let stack = build_stack(&config, &opts.stack).await?;
         let rules =
             RuleEngine::build_with_registry(&config, stack.registry.clone(), stack.geo.clone())?;
-        let direct: OutboundRef = Arc::new(Direct::with_resolver(stack.resolver.clone()));
+        let direct: OutboundRef = Arc::new(Direct::with_socket_opts(
+            stack.resolver.clone(),
+            rurge_net::socket::SocketOpts {
+                v6_first: config.general.ipv6,
+                ..Default::default()
+            },
+            Arc::new(rurge_net::socket::NoopSocketHook),
+        ));
         let policies = PolicyRegistry::build(&config, &opts.selections, direct);
         Ok(Runtime {
             config: Arc::new(config),
