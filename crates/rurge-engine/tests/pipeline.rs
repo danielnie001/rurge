@@ -46,8 +46,8 @@ impl Harness {
 }
 
 /// `LoadOptions::for_tests` declares every policy kind implemented; the binary
-/// declares none of the proxy protocols (`crates/rurge/src/capabilities.rs`), so
-/// drop the one the profiles below use to get the load-time W0007 warning.
+/// does not declare Shadowsocks (`crates/rurge/src/capabilities.rs`), so
+/// dropping it here yields the load-time W0007 warning the profiles below rely on.
 fn load_options() -> LoadOptions {
     let mut opts = LoadOptions::for_tests();
     opts.capabilities

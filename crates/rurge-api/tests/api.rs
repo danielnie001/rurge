@@ -107,8 +107,8 @@ impl Api {
     }
 }
 
-/// The binary declares no proxy protocols, so drop shadowsocks from the test
-/// capabilities to get the load-time W0007 warning the tests look for.
+/// The binary does not declare Shadowsocks (yet), so dropping it from the
+/// test capabilities yields the load-time W0007 warning the tests look for.
 fn load_options() -> LoadOptions {
     let mut opts = LoadOptions::for_tests();
     opts.capabilities

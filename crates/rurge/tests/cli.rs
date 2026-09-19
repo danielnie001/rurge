@@ -1100,6 +1100,7 @@ mod run {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(text.contains("E0022"), "{text}");
+        assert!(!text.contains("hunter2"), "{text}");
     }
 
     /// M1 design 6.4: a reload whose profile holds a policy that cannot be
@@ -1120,6 +1121,7 @@ mod run {
         let (status, body) = api_call(port, "POST", "/v1/profiles/reload", "k", Some("{}"));
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("\"ok\":false"), "{body}");
+        assert!(!body.contains("hunter2"), "{body}");
         // the daemon is still up and takes the repaired profile
         std::fs::write(&conf, good).unwrap();
         let (_, body) = api_call(port, "POST", "/v1/profiles/reload", "k", Some("{}"));

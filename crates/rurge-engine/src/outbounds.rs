@@ -25,7 +25,8 @@ pub struct EngineFactory {
     roots: Arc<RootCertStore>,
     /// `[General] ipv6`: which family leads when a policy says `dual`.
     v6_first: bool,
-    /// A dry build only wants the errors: no warnings, no system roots.
+    /// A dry build only wants the errors: no warnings. It still loads the
+    /// real roots — an empty store cannot even set up standard verification.
     dry: bool,
 }
 
@@ -334,5 +335,20 @@ C = https, h.test, 443\nD = http, h.test, 80\n[Rule]\nFINAL,DIRECT\n",
             .map(|s| s.name.as_str())
             .collect();
         assert_eq!(flagged, ["A"]);
+    }
+
+    /// Regression coverage for `EngineFactory::dry`'s root store: standard
+    /// verification (`T`, `S`) needs at least one trust anchor just to set
+    /// itself up, so an empty `RootCertStore` fails these two even though
+    /// they would build fine for real. The pinned and insecure modes never
+    /// consult the root store at all, and are included here as a control.
+    #[test]
+    fn an_ordinary_tls_policy_passes_the_dry_build() {
+        let cfg = config(
+            "[Proxy]\nT = https, h.test, 443\nS = socks5-tls, h.test, 443\n\
+Pinned = https, h.test, 443, server-cert-fingerprint-sha256=0000000000000000000000000000000000000000000000000000000000000000\n\
+Loose = https, h.test, 443, skip-cert-verify=true\n[Rule]\nFINAL,DIRECT\n",
+        );
+        assert!(dry_build(&cfg).is_empty());
     }
 }
