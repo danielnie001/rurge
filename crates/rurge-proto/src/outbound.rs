@@ -50,6 +50,11 @@ pub enum OutboundError {
     Dns(String),
     Io(io::Error),
     Timeout,
+    /// The proxy refused or broke the handshake (`socks5: authentication failed`).
+    Proxy(String),
+    Tls(String),
+    /// The policy exists but cannot be used (M3: a broken subscription item).
+    Unavailable(String),
 }
 
 impl fmt::Display for OutboundError {
@@ -60,6 +65,9 @@ impl fmt::Display for OutboundError {
             OutboundError::Dns(m) => write!(f, "dns: {m}"),
             OutboundError::Io(e) => write!(f, "{e}"),
             OutboundError::Timeout => f.write_str("connect timed out"),
+            OutboundError::Proxy(m) => f.write_str(m),
+            OutboundError::Tls(m) => write!(f, "tls: {m}"),
+            OutboundError::Unavailable(m) => write!(f, "policy unavailable: {m}"),
         }
     }
 }
@@ -76,6 +84,18 @@ impl From<io::Error> for OutboundError {
     }
 }
 
+/// An HTTP proxy that takes plain requests in absolute form
+/// (`always-use-connect = false`, the manual's default).
+pub trait HttpForward: Send + Sync {
+    /// Connects to the proxy itself (TCP, then TLS for `https`): no CONNECT.
+    fn connect<'a>(
+        &'a self,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, Result<BoxedStream, OutboundError>>;
+    /// `Proxy-Authorization` and the configured `headers`, rendered for one request.
+    fn request_headers(&self) -> Vec<(String, String)>;
+}
+
 /// A way to reach a destination. Phase 1 ships `Direct` and `Reject`; every
 /// proxy protocol of phase 2 implements this trait too.
 pub trait Outbound: Send + Sync {
@@ -86,6 +106,41 @@ pub trait Outbound: Send + Sync {
         target: &'a Target,
         opts: &'a ConnectOpts,
     ) -> BoxFuture<'a, Result<BoxedStream, OutboundError>>;
+    /// `Some` when plain HTTP requests may be sent to this outbound in
+    /// absolute form instead of through a CONNECT tunnel.
+    fn http_forward(&self) -> Option<&dyn HttpForward> {
+        None
+    }
 }
 
 pub type OutboundRef = Arc<dyn Outbound>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Direct, Reject};
+    use rurge_net::connector::SystemResolve;
+
+    #[test]
+    fn the_new_error_variants_render_for_the_session_log() {
+        assert_eq!(
+            OutboundError::Proxy("socks5: authentication failed".into()).to_string(),
+            "socks5: authentication failed"
+        );
+        assert_eq!(
+            OutboundError::Tls("certificate fingerprint mismatch".into()).to_string(),
+            "tls: certificate fingerprint mismatch"
+        );
+        assert_eq!(
+            OutboundError::Unavailable("subscription item is broken".into()).to_string(),
+            "policy unavailable: subscription item is broken"
+        );
+    }
+
+    #[test]
+    fn only_http_proxies_forward_plain_requests() {
+        let direct = Direct::with_resolver(Arc::new(SystemResolve));
+        assert!(direct.http_forward().is_none());
+        assert!(Reject::new(RejectKind::Reject).http_forward().is_none());
+    }
+}

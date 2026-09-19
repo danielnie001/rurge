@@ -555,6 +555,15 @@ impl Engine {
                 handle.finish(SessionOutcome::Failed("connect timed out".into()));
                 Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))
             }
+            Err(
+                e @ (OutboundError::Proxy(_)
+                | OutboundError::Tls(_)
+                | OutboundError::Unavailable(_)),
+            ) => {
+                let message = e.to_string();
+                handle.finish(SessionOutcome::Failed(message.clone()));
+                Err(io::Error::other(message))
+            }
         }
     }
 }
@@ -703,6 +712,11 @@ impl Dialer for Engine {
                 Err(OutboundError::Dns(m)) => fail(handle, FailKind::Dns, m),
                 Err(OutboundError::Io(e)) => fail(handle, FailKind::Connect, e.to_string()),
                 Err(OutboundError::Timeout) => fail(handle, FailKind::Timeout, "connect timed out"),
+                Err(
+                    e @ (OutboundError::Proxy(_)
+                    | OutboundError::Tls(_)
+                    | OutboundError::Unavailable(_)),
+                ) => fail(handle, FailKind::Connect, e.to_string()),
             }
         })
     }
