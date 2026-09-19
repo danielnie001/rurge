@@ -16,7 +16,7 @@
 | 需求 | 本里程碑覆盖的部分 |
 | ---- | ------------------ |
 | FR-CFG-11 | `[Keystore]` 的 `p12`：引用校验、Base64 校验、构建期解码、用于 `client-cert` |
-| FR-OUT-03 | `interface` `allow-other-interface` `ip-version` `tfo` `tos` `underlying-proxy` 生效；其余通用参数解析并校验取值 |
+| FR-OUT-03 | `interface` `allow-other-interface` `ip-version` `tos` `underlying-proxy` 生效；其余通用参数（含 `tfo`，见 5.1）解析并校验取值 |
 | FR-OUT-04 | 六个 TLS 参数（Shadow TLS 属 M2） |
 | FR-OUT-05 | `http` `https` `socks5` `socks5-tls` 的 TCP |
 | FR-OUT-08 | TCP 的链式代理；底层可以是策略或组；代理主机名远程解析 |
@@ -54,7 +54,7 @@
 | T4 | `http` / `https` 上游对明文 HTTP 默认按**绝对 URI 转发**（手册：`always-use-connect` 默认 false），M1 就做，不降级成"只会 CONNECT" |
 | T5 | 主配置里策略的**构建失败是配置错误**：`check` 报错、`run` 拒绝启动、`reload` 保留旧一代 |
 | T6 | `capabilities::current()` 在 **M1b** 才加入四种协议，避免"`W0007` 消失但运行期仍 REJECT"的空窗 |
-| T7 | PKCS#12 用 `p12-keystore`（0.3，MIT / Apache-2.0；已核实支持旧式 3DES 与 PBES2-AES256）；socket 选项用 `socket2` 0.6（已在 `Cargo.lock`，不新增传递依赖）；随机串用 `getrandom`（已在 `Cargo.lock`） |
+| T7 | PKCS#12 用 `p12-keystore` **0.2**（MIT / Apache-2.0；源码核实：支持旧式 RC2-40 / 3DES 与 PBES2-AES256，自带 writer 可在测试里现场生成 p12）。不用 0.3：它换到了新一代 RustCrypto，会给 `Cargo.lock` 新增约 47 个 crate 版本，其中 `cms` 与 `pkcs12` 还是预发布版；0.2 建在工作区已在用的那一代（`sha2 0.10` 等）上，没有预发布依赖；socket 选项用 `socket2` 0.6（已在 `Cargo.lock`，不新增传递依赖）；随机串用 `getrandom`（已在 `Cargo.lock`） |
 | T8 | `Outbound` 在 M1 只增加 TCP 需要的方法；UDP 方法到 M5 以"带默认实现的新方法"加入，不破坏既有实现 |
 
 ## 3. crate 改动一览
@@ -65,7 +65,7 @@ rurge-net       + socket.rs（SocketOpts、SocketHook、竞速连接）、tls.rs
                   connector.rs：ConnectOpts 去掉 prefer_v6；DirectConnector 带 SocketOpts 与 SocketHook；+ socket2
 rurge-proto     + transport/tls.rs、keystore.rs、http.rs、socks5.rs、testing/（feature "testing"）
                   outbound.rs：http_forward()、OutboundError 三个新变体；Direct 改用新的 DirectConnector
-rurge-platform  + socket.rs（bind_interface / enable_tfo / set_tos 三个自由函数）；+ socket2
+rurge-platform  + socket.rs（bind_interface / set_tos 两个自由函数）；+ socket2
 rurge-dns       + Resolver::host_lookup
 rurge-policy    + factory.rs（OutboundFactory、BuildError）、cell.rs（RegistryCell、ChainConnector）、
                   selections.rs：SelectionTable；registry.rs：Entry 重构、Resolution.note / terminal
@@ -88,9 +88,16 @@ pub struct SpecEnv<'a> {
     /// 名字 → 是策略、组还是内置（校验 underlying-proxy 用）。
     pub lookup: &'a dyn Fn(&str) -> Option<NameKind>,
 }
-pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> (Option<PolicySpec>, Vec<Diagnostic>);
+pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome;
+pub struct SpecOutcome {
+    pub spec: Option<PolicySpec>,          // 有错误级诊断时为 None
+    pub diagnostics: Vec<Diagnostic>,
+    pub inert: Vec<&'static str>,          // 出现了的"已解析未生效"参数名 → 调用方按参数名去重后报 W0029
+    pub ios_only: Vec<&'static str>,       // 出现了的 iOS 专属参数名 → W0004
+}
 
-pub struct PolicySpec { pub name: String, pub common: CommonOpts, pub proto: ProtoSpec, pub span: Span }
+pub struct PolicySpec { pub name: String, pub kind: PolicyKind, pub server: Option<HostName>, pub port: Option<u16>,
+                        pub common: CommonOpts, pub proto: ProtoSpec, pub span: Span }
 pub enum ProtoSpec { Direct, Reject(Builtin), Http(HttpSpec), Socks5(Socks5Spec) }  // 随里程碑增长
 
 pub struct CommonOpts {
@@ -122,7 +129,7 @@ pub struct Socks5Spec { pub tls: Option<TlsOpts>, pub username: Option<String>, 
                         pub udp_relay: bool }
 ```
 
-- `to_spec` 对**没有 spec 定义的类型**返回 `(None, [])`，它们的参数原样不动，直到各自的里程碑。M1 覆盖：`direct` / `reject*` 别名（它们也接受通用参数，FR-OUT-02）、`http` `https` `socks5` `socks5-tls`。
+- `to_spec` 对**没有 spec 定义的类型**返回空的 `SpecOutcome`，它们的参数原样不动，直到各自的里程碑。M1 覆盖：`direct` / `reject*` 别名（它们也接受通用参数，FR-OUT-02）、`http` `https` `socks5` `socks5-tls`。
 - `validate()` 对每个策略调用 `to_spec`，结果存进新字段 `Config.specs: Vec<PolicySpec>`，并提供 `Config::spec(name) -> Option<&PolicySpec>`。`ConfigSummary` 不变（不引起语料库快照变动）。
 - `ProxyPolicy` 不变；API 的策略详情与 `redact_profile` 仍基于原始定义行。
 - `username` / `password` 位置写法与命名写法都接受；两者同时出现时命名的优先。重复的命名参数取第一个。
@@ -142,7 +149,7 @@ pub struct Socks5Spec { pub tls: Option<TlsOpts>, pub username: Option<String>, 
 | `E0021` | Keystore 条目的 `base64` 不是合法 Base64 | |
 | `E0022` | 策略无法构建（干构建，6.4） | p12 解不开、密码错误 |
 | `W0028` | 参数对该策略类型不适用，忽略 | `sni` 写在 `http` 上；`underlying-proxy` `ecn` `no-error-alert` 写在 `direct` 上 |
-| `W0029` | 参数已解析但本版本尚未生效 | `udp-relay` `test-url` `test-timeout` `test-udp` `block-quic` `ecn` `dns-follow-interface`；每个参数名每次加载只报一次 |
+| `W0029` | 参数已解析但本版本尚未生效 | `udp-relay` `tfo` `test-url` `test-timeout` `test-udp` `block-quic` `ecn` `dns-follow-interface` `shadow-tls-password` `shadow-tls-sni` `shadow-tls-version`；布尔参数只在取值为 `true` 时报；每个参数名每次加载只报一次 |
 
 沿用的码：不认识的参数 `W0001`；iOS 专属的 `hybrid` 用 `W0004`（每次加载一次）；`underlying-proxy` 指向不存在的名字用 `E0007`。`skip-cert-verify=true` 与指纹同时出现时指纹优先，并以 `W0012` 告警。`underlying-proxy = DIRECT` 合法，等同于没有写。
 
@@ -165,19 +172,16 @@ pub struct SocketOpts {
     pub ip_version: IpVersion,
     /// 交错排序时哪一族在前（来自 `[General] ipv6`）；`prefer-*` / `*-only` 时不看它。
     pub v6_first: bool,
-    pub tfo: bool,
     pub tos: u8,
 }
 pub enum Family { V4, V6 }
 
-/// 平台相关的三件事；实现经 bin 注入（AR-02）。
+/// 平台相关的两件事；实现经 bin 注入（AR-02）。
 pub trait SocketHook: Send + Sync {
     fn bind_interface(&self, socket: &socket2::Socket, interface: &str, family: Family) -> io::Result<()>;
-    /// Ok(false) = 本平台不支持，调用方记一条 debug 日志后照常连接。
-    fn enable_tfo(&self, socket: &socket2::Socket) -> io::Result<bool>;
     fn set_tos(&self, socket: &socket2::Socket, family: Family, tos: u8) -> io::Result<()>;
 }
-pub struct NoopSocketHook;   // 三个方法都不做事；check / rule match / dns lookup 与测试用
+pub struct NoopSocketHook;   // 两个方法都不做事；check / rule match / dns lookup 与测试用
 
 // connector.rs
 pub struct ConnectOpts { pub timeout: Duration }                       // 去掉 prefer_v6
@@ -187,7 +191,7 @@ impl DirectConnector {
 }
 ```
 
-- **建连**：`socket2::Socket` → 非阻塞 → `set_tos`（非 0 时）→ `enable_tfo`（`tfo=true` 时）→ `bind_interface`（有 `interface` 时）→ 交给 tokio 连接 → `TCP_NODELAY`。`bind_interface` 失败：`allow_other_interface=true` 则 WARN 一次并不绑定继续，否则这次连接以该错误失败。
+- **建连**：`socket2::Socket` → 非阻塞 → `set_tos`（非 0 时；失败只记 debug，不影响连接）→ `bind_interface`（有 `interface` 时）→ 交给 tokio 连接 → `TCP_NODELAY`。目标是 IP 字面量时不按 `ip-version` 过滤（手册：该参数只在主机名是域名时有意义）。`bind_interface` 失败：`allow_other_interface=true` 则 WARN 一次并不绑定继续，否则这次连接以该错误失败。
 - **竞速**（取代现有的顺序尝试）：
 
 | `ip-version` | 行为 |
@@ -202,13 +206,13 @@ impl DirectConnector {
 
 **平台实现**（`rurge-platform::socket`，自由函数）：
 
-| 平台 | `bind_interface` | `enable_tfo` | `set_tos` |
-| ---- | ---------------- | ------------ | --------- |
-| Linux | `SO_BINDTODEVICE`（`socket2::Socket::bind_device`） | `TCP_FASTOPEN_CONNECT` | `IP_TOS` / `IPV6_TCLASS` |
-| macOS | `IP_BOUND_IF` / `IPV6_BOUND_IF`（`bind_device_by_index_*`） | `Ok(false)` | `IP_TOS` / `IPV6_TCLASS` |
-| Windows | 用 `if-addrs` 找该网卡在对应地址族上的第一个非链路本地地址，绑定为源地址；找不到 → `AddrNotAvailable` | `Ok(false)` | `IP_TOS`；IPv6 不支持，`Ok(())` 并记 debug |
+| 平台 | `bind_interface` | `set_tos` |
+| ---- | ---------------- | --------- |
+| Linux | `SO_BINDTODEVICE`（`socket2::Socket::bind_device`） | `set_tos_v4` / `set_tclass_v6` |
+| macOS | `IP_BOUND_IF` / `IPV6_BOUND_IF`（`bind_device_by_index_v4/v6`；网卡名 → 索引取自 `if_addrs::Interface::index`，不调 unsafe 的 `if_nametoindex`） | `set_tos_v4` / `set_tclass_v6` |
+| Windows | 用 `if-addrs` 找该网卡（按友好名称，如 `Wi-Fi`）在对应地址族上的第一个非环回、非链路本地地址，绑定为源地址；找不到 → `AddrNotAvailable` | `set_tos_v4`；IPv6 无封装，`Ok(())` 并记 debug |
 
-细化实施时若 `socket2` 对某一项没有安全封装，该项在该平台按"不支持"处理并登记，不为此引入 unsafe。
+**TCP Fast Open**：`socket2` 0.6 对任何平台都没有 TFO 的安全封装（已查源码），按"缺封装即不支持、不为此引入 unsafe"的规则，`tfo` 在 M1 三平台都不生效：参数照常解析，`tfo=true` 归入 `W0029`，`SocketOpts` 与 `SocketHook` 里不出现 TFO。
 
 ### 5.2 `Outbound` 的变化
 
@@ -244,7 +248,7 @@ impl TlsClient {
 pub fn decode_p12(item: &KeystoreItem) -> Result<ClientIdentity, BuildError>;   // keystore.rs，经 p12-keystore
 ```
 
-- 构建期完成一切可以提前做的事（编出 `ClientConfig`、解码 p12），拨号期只做握手。
+- 构建期完成一切可以提前做的事（编出 `ClientConfig`、解码 p12），拨号期只做握手。`BuildError { message }` 定义在 `rurge-proto`（协议的构造函数在 M1a 就要用到它），`rurge-policy::factory` 在 M1b 直接复用这个类型。
 - 自定义校验器三种模式，**都照常校验握手签名**：标准（`verify_name` 存在时用它而不是 SNI 名做链校验）；指纹（对叶子证书 DER 取 SHA-256，常数时间比较，**取代**标准 X.509 校验——手册原文）；不校验。优先级：指纹 > `skip-cert-verify` > 标准。
 - `sni = off` 关闭 SNI 扩展；`sni = <name>` 改发该名字；都没写时发代理主机名，代理主机是 IP 字面量则不发 SNI。
 - `alpn` 未写时用协议给的默认值（`http` / `socks5` 系列为空）。
@@ -275,7 +279,7 @@ pub trait OutboundFactory: Send + Sync {
     /// 同步、不碰网络。
     fn build(&self, spec: &PolicySpec, connector: Arc<dyn Connector>) -> Result<OutboundRef, BuildError>;
 }
-pub struct BuildError { pub message: String }
+pub use rurge_proto::BuildError;       // { pub message: String }，定义在 rurge-proto（5.3）
 ```
 
 `EngineFactory` 持有：解析器、`Arc<dyn SocketHook>`、Keystore 条目、根证书、由 `[General] ipv6` 折算的默认地址族偏好。`rurge-policy` 的单元测试用假工厂与假出站。
@@ -391,8 +395,8 @@ impl Engine {
 
 | 项 | 内容 |
 | -- | ---- |
-| `interface`（Windows） | 以绑定该网卡的源地址实现；网卡在对应地址族上没有地址则视为不可用；被改成弱主机模型的接口上可能不生效 |
-| `tfo` | 仅 Linux 生效；macOS / Windows 解析并忽略（debug 日志） |
+| `interface`（Windows） | 取网卡的友好名称；以绑定该网卡的源地址实现；网卡在对应地址族上没有地址则视为不可用；被改成弱主机模型的接口上可能不生效 |
+| `tfo` | 解析并校验，`W0029`，三平台都不生效（`socket2` 没有 TFO 的安全封装，不为此引入 unsafe） |
 | `tos` | Windows 上对 IPv6 不生效 |
 | `dns-follow-interface` | 解析，`W0029`，M5 生效 |
 | `udp-relay` `test-url` `test-timeout` `test-udp` `block-quic` `ecn` | 解析并校验取值，`W0029`，随后续里程碑生效 |
@@ -417,7 +421,7 @@ impl Engine {
 
 | 编号 | 问题 | 处理 |
 | ---- | ---- | ---- |
-| O1 | `socket2` 对 macOS `IP_BOUND_IF`、Linux `TCP_FASTOPEN_CONNECT` 的安全封装在 0.6 里的确切名字与 cfg 条件 | M1a 计划的第一个相关任务里核对；缺封装的项按"该平台不支持"处理并登记，不引入 unsafe |
+| O1 | `socket2` 对 macOS `IP_BOUND_IF`、Linux `TCP_FASTOPEN_CONNECT` 的安全封装在 0.6 里的确切名字与 cfg 条件 | **已结（写 M1a 计划时查了 0.6.5 源码）**：`bind_device`（Linux / Android / Fuchsia）、`bind_device_by_index_v4/v6`（Apple 各平台等）、`set_tos_v4`（含 Windows）、`set_tclass_v6`（不含 Windows）都在 `all` feature 下；**没有任何 TFO 封装** → 见 5.1 |
 | O2 | `/v1/policies/detail`、`/v1/policy_groups` 的真实响应 | 拿到 Surge 实例的样本后对齐；此前标"暂定" |
 | O3 | sing-box 的固定版本与三平台发布包的 SHA256 | M1b 互操作任务里选定并写进 CI |
 | O4 | hyper 的 HTTP/1 客户端是否原样发送绝对 URI 的请求行 | M1b 接线任务的第一步用一个回环测试确认；不成立则在入站里手写请求行 |
