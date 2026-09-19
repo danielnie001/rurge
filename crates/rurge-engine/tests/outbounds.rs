@@ -37,9 +37,6 @@ impl Harness {
     fn http(&self) -> SocketAddr {
         self.addr_of(ListenerKind::Http)
     }
-    // Unused by this task's own tests; part of the harness for the SOCKS5
-    // outbound tests later tasks add to this file.
-    #[allow(dead_code)]
     fn socks(&self) -> SocketAddr {
         self.addr_of(ListenerKind::Socks5)
     }
@@ -378,4 +375,209 @@ async fn a_refusing_upstream_is_a_502_that_quotes_the_proxy() {
         !response.contains("wrong") && !error.contains("wrong"),
         "no credential leaks"
     );
+}
+
+#[tokio::test]
+async fn a_local_host_item_reaches_the_proxy_as_an_ip() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    for (flag, expected) in [("true", (1u8, "10.1.2.3")), ("false", (3u8, "pinned.test"))] {
+        let upstream = FakeSocks5::spawn(Socks5Script {
+            connect_to: Some(origin_addr(&origin)),
+            ..Socks5Script::default()
+        })
+        .await;
+        let h = harness(Profile {
+            general: &format!("use-local-host-item-for-proxy = {flag}"),
+            proxies: &format!("Up = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "pinned.test = 10.1.2.3\nalias.test = pinned.test",
+            rules: "DOMAIN-SUFFIX,test,Up",
+            ..Profile::default()
+        })
+        .await;
+        let mut tunnel = connect_via_http(h.http(), "pinned.test:80").await;
+        assert!(
+            get(&mut tunnel, "pinned.test", "/hello")
+                .await
+                .ends_with("hi there")
+        );
+        let seen = &upstream.requests()[0];
+        assert_eq!((seen.atyp, seen.host.as_str()), expected, "flag = {flag}");
+        // an alias item never changes what the proxy is asked for
+        let _ = connect_via_http(h.http(), "alias.test:80").await;
+        wait_until("the second request", || upstream.requests().len() == 2).await;
+        assert_eq!(upstream.requests()[1].host, "alias.test", "flag = {flag}");
+    }
+}
+
+/// With an IP substituted for the name, a plain request is tunnelled: the
+/// request inside keeps its `Host`, the proxy connects where `[Host]` says.
+#[tokio::test]
+async fn a_pinned_host_turns_forwarding_into_a_tunnel() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    let upstream = FakeHttpProxy::spawn(HttpProxyScript {
+        connect_to: Some(origin_addr(&origin)),
+        ..HttpProxyScript::default()
+    })
+    .await;
+    let h = harness(Profile {
+        general: "use-local-host-item-for-proxy = true",
+        proxies: &format!("Up = http, 127.0.0.1, {}", upstream.addr().port()),
+        hosts: "pinned.test = 10.1.2.3",
+        rules: "DOMAIN,pinned.test,Up",
+        ..Profile::default()
+    })
+    .await;
+    let response = plain_get(h.http(), "http://pinned.test/hello", "pinned.test").await;
+    assert!(response.ends_with("hi there"), "{response}");
+    assert_eq!(
+        upstream.heads()[0].request_line,
+        "CONNECT 10.1.2.3:80 HTTP/1.1"
+    );
+    assert_eq!(origin.requests()[0].header("host"), Some("pinned.test"));
+}
+
+/// M1 design §9.1: a two-level chain whose lower level is a `select` group.
+#[tokio::test]
+async fn a_chain_enters_through_the_groups_current_member() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    let exit = FakeHttpProxy::spawn(HttpProxyScript {
+        connect_to: Some(origin_addr(&origin)),
+        ..HttpProxyScript::default()
+    })
+    .await;
+    let entry = |to: SocketAddr| Socks5Script {
+        connect_to: Some(to),
+        ..Socks5Script::default()
+    };
+    let entry_a = FakeSocks5::spawn(entry(exit.addr())).await;
+    let entry_b = FakeSocks5::spawn(entry(exit.addr())).await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "EntryA = socks5, 127.0.0.1, {}\nEntryB = socks5, 127.0.0.1, {}\nExit = http, exit.example, 8080, underlying-proxy=Hop",
+            entry_a.addr().port(),
+            entry_b.addr().port()
+        ),
+        groups: "Hop = select, EntryA, EntryB",
+        rules: "DOMAIN,target.test,Exit",
+        ..Profile::default()
+    })
+    .await;
+    let mut tunnel = connect_via_http(h.http(), "target.test:8080").await;
+    assert!(
+        get(&mut tunnel, "target.test", "/hello")
+            .await
+            .ends_with("hi there")
+    );
+    // the entry is asked for the exit's server by name; the exit for the target by name
+    let first = &entry_a.requests()[0];
+    assert_eq!(
+        (first.atyp, first.host.as_str(), first.port),
+        (3, "exit.example", 8080)
+    );
+    assert_eq!(
+        exit.heads()[0].request_line,
+        "CONNECT target.test:8080 HTTP/1.1"
+    );
+    assert!(entry_b.requests().is_empty());
+
+    h.engine.shared().selections.set("Hop", "EntryB");
+    let mut tunnel = connect_via_http(h.http(), "target.test:8080").await;
+    assert!(
+        get(&mut tunnel, "target.test", "/hello")
+            .await
+            .ends_with("hi there")
+    );
+    assert_eq!(
+        entry_b.requests().len(),
+        1,
+        "the next connection follows the selection"
+    );
+    assert_eq!(entry_a.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn a_broken_hop_is_named_in_the_error() {
+    // a port nothing listens on: bind one, note it, let it go
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let h = harness(Profile {
+        proxies: &format!(
+            "Entry = socks5, 127.0.0.1, {closed}\nExit = http, exit.example, 8080, underlying-proxy=Entry"
+        ),
+        rules: "DOMAIN,target.test,Exit",
+        ..Profile::default()
+    })
+    .await;
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    s.write_all(b"CONNECT target.test:443 HTTP/1.1\r\nHost: target.test:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(15), s.read_to_end(&mut buf)).await;
+    let log = h.engine.request_log();
+    wait_until("the failed session", || !log.recent(10).is_empty()).await;
+    let error = log.recent(10)[0].error.clone().unwrap_or_default();
+    assert!(error.starts_with("via Entry: "), "{error}");
+}
+
+/// Two independent implementations check each other: engine A's upstreams
+/// are engine B's HTTP and SOCKS5 listeners.
+#[tokio::test]
+async fn rurge_talks_to_rurge() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    let port = origin.url("/").port().unwrap();
+    let b = harness(Profile::default()).await; // everything DIRECT, resolves *.test itself
+    let a = harness(Profile {
+        proxies: &format!(
+            "ViaHttp = http, 127.0.0.1, {}\nViaSocks = socks5, 127.0.0.1, {}",
+            b.http().port(),
+            b.socks().port()
+        ),
+        rules: "DOMAIN,target.test,ViaHttp\nDOMAIN,alt.test,ViaSocks",
+        ..Profile::default()
+    })
+    .await;
+    // CONNECT through A → CONNECT to B's HTTP listener → origin
+    let mut tunnel = connect_via_http(a.http(), &format!("target.test:{port}")).await;
+    assert!(
+        get(&mut tunnel, "target.test", "/hello")
+            .await
+            .ends_with("hi there")
+    );
+    // the relay only finishes (and gets logged) once both directions close
+    drop(tunnel);
+    // CONNECT through A → B's SOCKS5 listener → origin
+    let mut tunnel = connect_via_http(a.http(), &format!("alt.test:{port}")).await;
+    assert!(
+        get(&mut tunnel, "alt.test", "/hello")
+            .await
+            .ends_with("hi there")
+    );
+    drop(tunnel);
+    // a plain request: absolute form from A to B, origin form from B to the origin
+    let response = plain_get(
+        a.http(),
+        &format!("http://target.test:{port}/hello"),
+        &format!("target.test:{port}"),
+    )
+    .await;
+    assert!(response.ends_with("hi there"), "{response}");
+    assert_eq!(origin.hits("/hello"), 3);
+    let log = b.engine.request_log();
+    wait_until("B to record three sessions", || log.recent(10).len() == 3).await;
+    let via: Vec<ListenerKind> = log.recent(10).iter().map(|r| r.listener).collect();
+    assert_eq!(via.iter().filter(|k| **k == ListenerKind::Http).count(), 2);
+    assert_eq!(
+        via.iter().filter(|k| **k == ListenerKind::Socks5).count(),
+        1
+    );
+    // only B resolved anything: A handed the names over
+    assert!(a.dns.queries().is_empty());
+    assert!(!b.dns.queries().is_empty());
 }

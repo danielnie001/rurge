@@ -8,6 +8,7 @@ use crate::shared::EngineShared;
 use crate::state::StateStore;
 use arc_swap::ArcSwap;
 use rurge_config::Builtin;
+use rurge_config::HostName;
 use rurge_config::general::General;
 use rurge_config::rule::PolicyRef;
 use rurge_config::session::{ListenerKind, SessionInfo};
@@ -715,10 +716,33 @@ impl Dialer for Engine {
                 // outbound below is REJECT; say so in the session log (§7.2).
                 handle.set_error(format!("policy protocol not implemented: {kind}"));
             }
-            let target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
+            let mut target =
+                Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
             let opts = ConnectOpts {
                 timeout: CONNECT_TIMEOUT,
             };
+            // FR-DNS-07: a proxy normally gets the name and resolves it itself;
+            // with `use-local-host-item-for-proxy`, an address pinned in [Host]
+            // goes to the proxy instead. Alias / server items leave the name alone.
+            let pinned_ip = match &target.host {
+                HostName::Domain(name)
+                    if resolution.terminal == rurge_policy::TerminalKind::Proxy
+                        && rt.config.general.use_local_host_item_for_proxy =>
+                {
+                    rt.stack
+                        .resolver
+                        .host_lookup(name)
+                        .and_then(|hit| match hit.action {
+                            rurge_dns::hosts::HostAction::Ips(ips) => ips.first().copied(),
+                            _ => None,
+                        })
+                }
+                _ => None,
+            };
+            let pinned = pinned_ip.is_some();
+            if let Some(ip) = pinned_ip {
+                target = Target::new(HostName::Ip(ip), target.port);
+            }
             // A plain request of the HTTP listener can go to an HTTP proxy in
             // absolute form instead of through a tunnel (M1 design 6.5). The
             // inbound writes the request line, so the target is checked here
@@ -726,7 +750,9 @@ impl Dialer for Engine {
             // (the two obligations `HttpForward` puts on its caller).
             let plain_http =
                 handle.session().listener == ListenerKind::Http && handle.session().url.is_some();
-            let forward = if plain_http {
+            // a pinned address only reaches the proxy through a tunnel: in
+            // absolute form the request URI carries the name
+            let forward = if plain_http && !pinned {
                 resolution.outbound.http_forward()
             } else {
                 None

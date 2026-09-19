@@ -613,6 +613,12 @@ impl Resolver {
         ))
     }
 
+    /// What `[Host]` (or the hosts file) says about `name`, without sending a
+    /// query: the engine uses it for `use-local-host-item-for-proxy`.
+    pub fn host_lookup(&self, name: &str) -> Option<crate::hosts::HostLookup> {
+        self.hosts.lookup(name)
+    }
+
     /// Stores the outcome in the cache and feeds AAAA suppression.
     fn record(&self, name: &str, result: &Result<Answers, DnsError>, want_v6: bool) {
         match result {
@@ -1584,6 +1590,30 @@ mod tests {
             assert!(Instant::now() < deadline, "hosts file change not picked up");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn host_lookup_reads_the_host_section_without_any_query() {
+        let dns = MockDns::spawn().await;
+        let e = env(&profile(
+            &format!("dns-server = {}", dns.addr()),
+            "pinned.test = 10.1.2.3, 10.1.2.4\nalias.test = other.test\n",
+        ));
+        let (r, _) = resolver(&e, StaticSystemDns::default());
+        let hit = r.host_lookup("Pinned.Test.").expect("a [Host] item");
+        assert_eq!(
+            hit.action,
+            HostAction::Ips(vec![
+                "10.1.2.3".parse().unwrap(),
+                "10.1.2.4".parse().unwrap()
+            ])
+        );
+        assert!(matches!(
+            r.host_lookup("alias.test").map(|h| h.action),
+            Some(HostAction::Alias(_))
+        ));
+        assert!(r.host_lookup("unknown.test").is_none());
+        assert!(dns.queries().is_empty(), "no query leaves the process");
     }
 
     #[tokio::test]
