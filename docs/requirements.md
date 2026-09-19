@@ -193,7 +193,10 @@ flowchart LR
 | `rurge-rules` | 规则类型与匹配、规则集 / 域名集索引、逻辑规则、GeoIP / ASN 查询、临时规则、命中计数 | `rurge-config` |
 | `rurge-dns` | 内部 DNS 客户端、加密 DNS、`[Host]` 映射、缓存、fake-IP 池与应答器 | `rurge-config` |
 | `rurge-policy` | 策略模型、策略组算法、连通性测试、策略引入与订阅、选择持久化 | `rurge-config` `rurge-proto` |
-| `rurge-proto` | 各出站协议实现、TLS / Shadow TLS、UDP 中继、链式代理、网卡绑定 | `rurge-dns` |
+| `rurge-proto` | 出站抽象（`Outbound` / `Dialer` / `Datagram`）、DIRECT / REJECT、传输层（TLS / Shadow TLS / WebSocket / obfs / HTTP/2 连接池）、TCP 与 TLS 上的流式协议、UDP 中继、链式代理、网卡绑定 | `rurge-net` |
+| `rurge-proto-quic` | QUIC 族出站协议（TUIC、Hysteria 2、MASQUE、Trust Tunnel 的 HTTP/3 模式）（阶段 2 设计文档 D4） | `rurge-proto` |
+| `rurge-proto-ssh` | SSH 出站 | `rurge-proto` |
+| `rurge-proto-wireguard` | WireGuard 出站与其用户态协议栈 | `rurge-proto` |
 | `rurge-net` | 内部 HTTP 客户端、连接器抽象、外部资源管理器（下载 / 缓存 / 更新间隔 / 文件监视） | `rurge-config` |
 | `rurge-inbound` | HTTP / SOCKS5 监听、端口转发、内置 Snell / MTProto 服务器、局域网访问限制 | `rurge-config` |
 | `rurge-tun` | 虚拟网卡驱动适配、用户态 TCP/IP 栈、路由管理、UDP 会话表、ICMP、网关模式、DHCP 服务器 | `rurge-dns` |
@@ -506,7 +509,7 @@ flowchart LR
 
 - **目标**：全部出站协议与策略组可用，订阅可加载。
 - **范围**：FR-CFG-11；FR-IN-02（UDP）；FR-OUT-03 ～ 13、15；FR-GRP-01、03 ～ 07；FR-DNS-04（DoH3 / DoQ）、07、10。
-- **交付物**：每种协议的实现与集成测试环境（容器化参考服务器）、策略组算法、订阅解析、连通性测试。
+- **交付物**：每种协议的实现与集成测试环境（回环测试服务器 + 对参考实现的互操作测试）、策略组算法、订阅解析、连通性测试。
 - **验收标准**：每种协议对参考服务器的 TCP 与 UDP（若支持）转发通过；链式代理通过；策略组测试与切换 API 正确；订阅样本解析正确；Shadow TLS 与 TLS 参数各有测试；WireGuard 与 WARP 类端点（`client-id`）握手成功。
 
 ### 阶段 3：增强模式（TUN）
@@ -563,7 +566,7 @@ Tailscale 策略、Ponte 替代方案、Metered Network Mode、Snell v5 / v6、H
 | 单元测试 | 解析器、规则匹配、Host List、子网表达式、DNS 缓存、策略组算法、重写规则、脚本 API 绑定 | `cargo test` |
 | 快照测试 | 配置解析结果、模块叠加后的有效配置、`rurge check` 输出 | `insta` 或等价 |
 | 属性测试 | 规则引擎（随机规则集 + 随机请求的一致性）、Host List 匹配、IP 前缀树 | `proptest` |
-| 集成测试 | 每种出站协议对参考服务器（容器化：shadowsocks-rust、Xray（VMess / Trojan）、TUIC、Hysteria 2、sing-box（AnyTLS / MASQUE）、wireguard-go、OpenSSH、Trust Tunnel 服务器、Snell 官方二进制）；DoH / DoT / DoQ 服务器；MITM 对本地 HTTPS 服务器 | Docker Compose，CI 中在 Linux 运行，其他平台按需 |
+| 集成测试 | 每种出站协议分三层：封帧向量与单元测试、仓库内的回环测试服务器、对参考实现（shadowsocks-rust、Xray、sing-box、OpenSSH、Snell 官方二进制等）的互操作测试；DoH / DoT / DoQ 服务器；MITM 对本地 HTTPS 服务器 | 参考二进制作为回环子进程拉起，不使用 Docker；本机缺失时跳过，CI 三平台安装固定版本、缺失即失败（阶段 2 设计文档第 13 节） |
 | 兼容性语料库 | 收集公开的社区 Surge 配置、模块、脚本、规则集（脱敏），每次提交回归加载与快照 | 仓库内 `tests/corpus/` |
 | 黄金测试 | 手册中的每个代码示例转化为测试用例，覆盖规则、重写、脚本、DNS 映射 | 由兼容性清单逐条对应 |
 | 性能基准 | 转发吞吐、规则匹配、DNS、fake-IP、内存 | `criterion` + 专用基准程序 |
@@ -598,7 +601,7 @@ Tailscale 策略、Ponte 替代方案、Metered Network Mode、Snell v5 / v6、H
 | Q4 | Web Dashboard 技术栈：复用开源的 Surge 兼容面板还是自研 | 阶段 6 前调研现有面板的许可证与完成度 | 6 |
 | Q5 | Windows 网关模式的实现方式 | 阶段 7 评估 WinDivert 等方案 | 7 |
 | Q6 | 是否提供 Surge 没有的 API（如 `GET /v1/panels`） | 允许以 `/v1/rurge/...` 命名空间扩展，不占用 Surge 路径 | 6 |
-| Q7 | 用户态协议栈选型（smoltcp、自研或其他） | 阶段 3 设计文档基准对比 | 3 |
+| Q7 | 用户态协议栈选型（smoltcp、自研或其他） | 阶段 2 的 WireGuard 出站先用 smoltcp（阶段 2 设计文档 D9）；阶段 3 设计文档按基准复核 | 2（M4），阶段 3 复核 |
 | Q8 | 内置规则集 `SYSTEM` 在非 Apple 平台的取舍 | 保持与手册一致以便配置共享，但在文档中说明其在 Windows / Linux 上几乎不命中 | 1 |
 
 ---
