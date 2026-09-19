@@ -2,6 +2,7 @@
 //! forwarding of plain HTTP requests (manual: Policies › HTTP and HTTP/2).
 
 use crate::build::tls_client;
+use crate::outbound::untrusted_text;
 use crate::transport::head::read_head;
 use crate::transport::prefixed;
 use crate::transport::tls::TlsClient;
@@ -36,6 +37,9 @@ pub struct HttpOutbound {
 }
 
 fn random_string(min: usize, max: usize) -> String {
+    // defence in depth: no arithmetic underflow / out-of-range slice below,
+    // even if an invalid template ever got past `from_spec`
+    let max = max.max(min);
     let mut pick = [0u8; 4];
     let mut bytes = vec![0u8; max];
     if getrandom::fill(&mut pick).is_err() || getrandom::fill(&mut bytes).is_err() {
@@ -81,14 +85,17 @@ fn authority(target: &Target) -> String {
     }
 }
 
-/// `target` is written verbatim into the CONNECT request line and the `Host`
-/// header (`connect_request`). A domain name is caller-supplied (it can come
-/// from a client's SOCKS5 / HTTP CONNECT request) and must not be trusted:
-/// anything outside printable, non-space ASCII — a CR or LF above all —
-/// would let a client smuggle a second request into the proxy connection,
-/// carrying our `Proxy-Authorization`. An IP literal's `Display` can never
-/// contain such bytes, so it is always fine.
-fn valid_target(target: &Target) -> bool {
+/// Whether `target`'s host name is safe to write verbatim into an HTTP
+/// request line or a `Host` header: an IP literal, or a non-empty domain made
+/// only of bytes `0x21..=0x7e` (printable, non-space ASCII).
+///
+/// A domain name can be caller-supplied (it may come from a client's SOCKS5
+/// / HTTP CONNECT request) and must not be trusted: anything outside that
+/// range — a CR or LF above all — could break out of the request line or the
+/// `Host` header of a text protocol, smuggling a second request into the
+/// proxy connection and carrying our `Proxy-Authorization` with it. An IP
+/// literal's `Display` can never contain such bytes, so it is always fine.
+pub fn valid_target(target: &Target) -> bool {
     match &target.host {
         HostName::Ip(_) => true,
         HostName::Domain(name) => {
@@ -102,14 +109,18 @@ fn check_status(head: &[u8]) -> Result<(), OutboundError> {
     let line = text.lines().next().unwrap_or_default();
     let mut parts = line.splitn(3, ' ');
     let (version, code) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-    let reason = parts.next().unwrap_or("").trim();
+    // the proxy's own text, so bounded and stripped of control characters
+    // before it can reach the session log or the request log
+    let reason = untrusted_text(parts.next().unwrap_or("").trim(), 64);
     match code.parse::<u16>() {
         Ok(code) if version.starts_with("HTTP/1.") && (200..300).contains(&code) => Ok(()),
-        Ok(code) if version.starts_with("HTTP/1.") => Err(OutboundError::Proxy(
-            format!("http proxy answered {code} {reason}")
-                .trim_end()
-                .to_string(),
-        )),
+        Ok(code) if version.starts_with("HTTP/1.") => {
+            Err(OutboundError::Proxy(if reason.is_empty() {
+                format!("http proxy answered {code}")
+            } else {
+                format!("http proxy answered {code} {reason}")
+            }))
+        }
         _ => Err(OutboundError::Proxy(
             "http proxy sent a malformed response".to_string(),
         )),
@@ -131,6 +142,16 @@ impl HttpOutbound {
                 spec.name
             )));
         };
+        // `PolicySpec`'s fields are public, so a caller could hand us headers
+        // that never went through `rurge-config`'s own `parse_list`: never
+        // echo the name or value, both may carry sensitive or hostile text.
+        if let Some((n, _)) = http.headers.iter().enumerate().find(|(_, t)| !t.is_valid()) {
+            return Err(BuildError::new(format!(
+                "policy `{}`: custom header #{} is not valid",
+                spec.name,
+                n + 1
+            )));
+        }
         let tls = tls_client(http.tls.as_ref(), host, &[], keystore, roots)?;
         let authorization = http.username.as_ref().map(|user| {
             let password = http.password.as_deref().unwrap_or("");
@@ -151,10 +172,7 @@ impl HttpOutbound {
     async fn dial(&self, opts: &ConnectOpts) -> Result<BoxedStream, OutboundError> {
         let stream = self.connector.connect(&self.server, opts).await?;
         match &self.tls {
-            Some(tls) => tls
-                .wrap(stream)
-                .await
-                .map_err(|e| OutboundError::Tls(e.to_string())),
+            Some(tls) => tls.wrap(stream).await.map_err(OutboundError::tls),
             None => Ok(stream),
         }
     }
@@ -630,6 +648,48 @@ mod tests {
     }
 
     #[test]
+    fn invalid_header_templates_are_refused_at_build_time() {
+        // a valid spec built the normal way, then a second header hand-built
+        // past what `rurge-config` itself would ever let through:
+        // `from_spec` must not trust that `PolicySpec` came from there.
+        let base = spec("http, 127.0.0.1, 1080, headers=X-Client:rurge");
+        let keystore: Vec<KeystoreItem> = Vec::new();
+        let bad_templates = [
+            HeaderTemplate {
+                name: "X-Evil".to_string(),
+                value: vec![HeaderPart::Literal("a\r\nX-Evil: 1".to_string())],
+            },
+            HeaderTemplate {
+                name: "X-Bad".to_string(),
+                value: vec![HeaderPart::Random { min: 5, max: 2 }],
+            },
+        ];
+        for bad in bad_templates {
+            let mut modified = base.clone();
+            let ProtoSpec::Http(http) = &mut modified.proto else {
+                panic!("expected an http spec");
+            };
+            http.headers.push(bad);
+            let err = HttpOutbound::from_spec(
+                &modified,
+                &keystore,
+                no_roots(),
+                Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
+            )
+            .map(|_| ())
+            .unwrap_err();
+            assert_eq!(err.message, "policy `Up`: custom header #2 is not valid");
+            assert!(!err.message.contains("X-Evil"), "{}", err.message);
+            assert!(!err.message.contains("X-Bad"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn random_string_does_not_panic_when_min_exceeds_max() {
+        assert_eq!(random_string(5, 2).chars().count(), 5);
+    }
+
+    #[test]
     fn check_status_rejects_malformed_lines_and_accepts_any_1_x_success() {
         for head in [
             b"HTTP/2 200 OK\r\n\r\n".as_slice(),
@@ -644,5 +704,27 @@ mod tests {
         }
         check_status(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap();
         check_status(b"HTTP/1.0 200 OK\r\n\r\n").unwrap();
+    }
+
+    #[test]
+    fn check_status_sanitizes_and_bounds_the_reason_phrase() {
+        let mut head = b"HTTP/1.1 403 For\x1bbid\rden".to_vec();
+        head.extend(std::iter::repeat_n(b'A', 20_000));
+        head.extend_from_slice(b"\r\n\r\n");
+        let err = check_status(&head).map(|_| ()).unwrap_err();
+        let OutboundError::Proxy(m) = &err else {
+            panic!("{err}");
+        };
+        assert!(m.starts_with("http proxy answered 403 Forbidden"), "{m}");
+        assert!(!m.chars().any(|c| c.is_control()), "{m}");
+        assert!(m.len() <= "http proxy answered 403 ".len() + 64, "{m}");
+
+        let err = check_status(b"HTTP/1.1 407 \r\n\r\n")
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            matches!(&err, OutboundError::Proxy(m) if m == "http proxy answered 407"),
+            "{err}"
+        );
     }
 }

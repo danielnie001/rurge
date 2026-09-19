@@ -30,7 +30,9 @@ impl Target {
 
 #[derive(Clone, Debug)]
 pub struct ConnectOpts {
-    /// Covers name resolution and every connection attempt.
+    /// For `DirectConnector`: one budget covering name resolution and the
+    /// whole race across every address. `BootstrapConnector` (`rurge-dns`)
+    /// applies it again to each resolved address in turn instead.
     pub timeout: Duration,
 }
 

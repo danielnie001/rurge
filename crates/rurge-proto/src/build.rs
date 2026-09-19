@@ -1,4 +1,5 @@
-//! Why an outbound could not be built from its spec.
+//! `BuildError` (why an outbound could not be built from its spec) and the
+//! helpers shared by the outbounds' `from_spec` (currently `tls_client`).
 
 use crate::keystore::decode_p12;
 use crate::transport::tls::TlsClient;

@@ -39,7 +39,7 @@ struct Verifier {
 }
 
 fn same(a: &[u8], b: &[u8]) -> bool {
-    // constant time: no early exit on the first differing byte
+    // compares every byte, no early exit on the first difference
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
@@ -412,5 +412,45 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    /// `DigitallySignedStruct::new` is `pub(crate)` in rustls 0.23.43, so the
+    /// handshake-signature verifiers cannot be unit-tested with a hand-made
+    /// struct: this proves the behaviour instead, against a server that
+    /// presents a genuine, trusted leaf certificate but cannot prove it
+    /// holds the matching private key. Every mode must still refuse it,
+    /// because `verify_tls12_signature` / `verify_tls13_signature` are what
+    /// prove key possession; `verify_server_cert` (or its absence, in the
+    /// pinned / insecure modes) only ever validates the certificate itself.
+    #[tokio::test]
+    async fn a_server_without_the_private_key_is_refused_in_every_mode() {
+        let fixture = TlsFixture::new(&["localhost"]);
+        for versions in [
+            [&rustls::version::TLS13].as_slice(),
+            [&rustls::version::TLS12].as_slice(),
+        ] {
+            let addr = fixture.spawn_impostor(versions).await;
+            let standard = TlsOpts::default();
+            let pinned = TlsOpts {
+                fingerprint_sha256: Some(fixture.leaf_fingerprint()),
+                ..TlsOpts::default()
+            };
+            let insecure = TlsOpts {
+                skip_cert_verify: true,
+                ..TlsOpts::default()
+            };
+            for (opts, roots) in [
+                (&standard, fixture.roots()),
+                (&pinned, empty_roots()),
+                (&insecure, empty_roots()),
+            ] {
+                let err = talk(addr, opts, "localhost", roots).await.unwrap_err();
+                // rustls 0.23.43's `CertificateError::BadSignature` has no
+                // custom `Display` arm, so it falls back to `{:?}`, which for
+                // a unit variant is just its name: this substring is stable
+                // and appears nowhere else in rustls' error text.
+                assert!(err.to_string().contains("BadSignature"), "{err}");
+            }
+        }
     }
 }

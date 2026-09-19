@@ -4,8 +4,9 @@
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
 use rurge_net::connector::BoxedStream;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::server::WebPkiClientVerifier;
-use rustls::{RootCertStore, ServerConfig};
+use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
+use rustls::sign::{CertifiedKey, SigningKey};
+use rustls::{RootCertStore, ServerConfig, SupportedProtocolVersion};
 use sha2::{Digest, Sha256};
 use std::io;
 use std::net::SocketAddr;
@@ -13,6 +14,26 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
+
+/// Always resolves to the fixture's real leaf certificate, but signed with a
+/// key that does not match it: what `TlsFixture::impostor_acceptor` serves.
+#[derive(Debug)]
+struct ImpostorResolver {
+    leaf: CertificateDer<'static>,
+    key: Arc<dyn SigningKey>,
+}
+
+impl ResolvesServerCert for ImpostorResolver {
+    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        // `CertifiedKey::new` performs no key / certificate consistency
+        // check (unlike `with_single_cert`): exactly the mismatch this
+        // fixture exists to serve.
+        Some(Arc::new(CertifiedKey::new(
+            vec![self.leaf.clone()],
+            self.key.clone(),
+        )))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeenHandshake {
@@ -110,6 +131,31 @@ impl TlsFixture {
         TlsAcceptor::from(Arc::new(config))
     }
 
+    /// A server that presents the fixture's real leaf certificate but signs
+    /// the handshake with a DIFFERENT key: what an attacker holding a copy
+    /// of the (public) certificate can do. Every verification mode must
+    /// refuse it.
+    pub fn impostor_acceptor(&self, versions: &[&'static SupportedProtocolVersion]) -> TlsAcceptor {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        // a fresh key, unrelated to `self.leaf_key`; same algorithm as the
+        // leaf (rcgen's default, ECDSA P-256), so the handshake fails at the
+        // signature and not at scheme selection
+        let impostor_key = KeyPair::generate().expect("impostor key");
+        let der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(impostor_key.serialize_der()));
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&der)
+            .expect("signing key from a fresh keypair");
+        let resolver = ImpostorResolver {
+            leaf: self.leaf.clone(),
+            key: signing_key,
+        };
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(versions)
+            .expect("protocol versions")
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(resolver));
+        TlsAcceptor::from(Arc::new(config))
+    }
+
     /// Completes the server side of a handshake and records what the client sent.
     pub async fn accept(&self, acceptor: &TlsAcceptor, tcp: TcpStream) -> io::Result<BoxedStream> {
         let tls = acceptor.accept(tcp).await?;
@@ -128,14 +174,15 @@ impl TlsFixture {
         self.seen.lock().expect("seen").clone()
     }
 
-    /// A TLS echo server on a loopback port; failed handshakes are dropped silently.
-    pub async fn spawn_echo(self: &Arc<Self>, require_client_cert: bool) -> SocketAddr {
+    /// Runs the echo accept loop behind `acceptor`; failed handshakes are
+    /// dropped silently. Shared by `spawn_echo` and `spawn_impostor` so the
+    /// loop is not duplicated.
+    async fn spawn_with_acceptor(self: &Arc<Self>, acceptor: TlsAcceptor) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         let fixture = self.clone();
-        let acceptor = self.acceptor(require_client_cert);
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
                 let (fixture, acceptor) = (fixture.clone(), acceptor.clone());
@@ -153,5 +200,20 @@ impl TlsFixture {
             }
         });
         addr
+    }
+
+    /// A TLS echo server on a loopback port; failed handshakes are dropped silently.
+    pub async fn spawn_echo(self: &Arc<Self>, require_client_cert: bool) -> SocketAddr {
+        self.spawn_with_acceptor(self.acceptor(require_client_cert))
+            .await
+    }
+
+    /// The same echo server, but behind `impostor_acceptor(versions)`.
+    pub async fn spawn_impostor(
+        self: &Arc<Self>,
+        versions: &[&'static SupportedProtocolVersion],
+    ) -> SocketAddr {
+        self.spawn_with_acceptor(self.impostor_acceptor(versions))
+            .await
     }
 }

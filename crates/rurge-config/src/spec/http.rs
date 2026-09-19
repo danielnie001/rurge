@@ -37,6 +37,11 @@ fn is_token(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
+/// A header value may hold HTAB but no other control character.
+fn is_field_text(text: &str) -> bool {
+    text.chars().all(|c| c == '\t' || !c.is_control())
+}
+
 fn parse_value(text: &str) -> Result<Vec<HeaderPart>, String> {
     let mut parts = Vec::new();
     let mut rest = text;
@@ -84,8 +89,8 @@ impl HeaderTemplate {
                 return Err(format!("`{name}` is not a valid header name"));
             }
             let value = value.trim();
-            if value.contains(['\r', '\n']) {
-                return Err(format!("header `{name}` holds a line break"));
+            if !is_field_text(value) {
+                return Err(format!("header `{name}` holds a control character"));
             }
             out.push(HeaderTemplate {
                 name: name.to_string(),
@@ -93,6 +98,20 @@ impl HeaderTemplate {
             });
         }
         Ok(out)
+    }
+
+    /// Whether the template can be written into a request head as it is: a
+    /// token for a name, no control character (other than HTAB) in the
+    /// value, sane random lengths. `parse_list` only ever produces valid
+    /// templates; code that gets a template from anywhere else (a
+    /// caller-supplied `PolicySpec`, for instance) must check before writing
+    /// it to the wire.
+    pub fn is_valid(&self) -> bool {
+        is_token(&self.name)
+            && self.value.iter().all(|part| match part {
+                HeaderPart::Literal(text) => is_field_text(text),
+                HeaderPart::Random { min, max } => *min >= 1 && min <= max && *max <= MAX_RANDOM,
+            })
     }
 }
 
@@ -141,5 +160,64 @@ mod tests {
         ] {
             assert!(HeaderTemplate::parse_list(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn every_template_parse_list_accepts_is_valid() {
+        let list = HeaderTemplate::parse_list(
+            "X-Client:rurge; X-Pad: a<random-string(8)>b<random-string(2-5)>;Host:edge.example",
+        )
+        .unwrap();
+        assert!(list.iter().all(HeaderTemplate::is_valid));
+    }
+
+    #[test]
+    fn is_valid_rejects_what_parse_list_can_never_produce() {
+        let literal = |text: &str| vec![HeaderPart::Literal(text.to_string())];
+        let bad_name = HeaderTemplate {
+            name: "Bad Name".into(),
+            value: literal("v"),
+        };
+        assert!(!bad_name.is_valid());
+        let empty_name = HeaderTemplate {
+            name: "".into(),
+            value: literal("v"),
+        };
+        assert!(!empty_name.is_valid());
+        let injected = HeaderTemplate {
+            name: "X".into(),
+            value: literal("a\r\nX-Evil: 1"),
+        };
+        assert!(!injected.is_valid());
+        let escape = HeaderTemplate {
+            name: "X".into(),
+            value: literal("\u{1b}"),
+        };
+        assert!(!escape.is_valid());
+        let backwards = HeaderTemplate {
+            name: "X".into(),
+            value: vec![HeaderPart::Random { min: 5, max: 2 }],
+        };
+        assert!(!backwards.is_valid());
+        let zero = HeaderTemplate {
+            name: "X".into(),
+            value: vec![HeaderPart::Random { min: 0, max: 3 }],
+        };
+        assert!(!zero.is_valid());
+        let too_long = HeaderTemplate {
+            name: "X".into(),
+            value: vec![HeaderPart::Random { min: 1, max: 5000 }],
+        };
+        assert!(!too_long.is_valid());
+        let tab = HeaderTemplate {
+            name: "X".into(),
+            value: literal("a\tb"),
+        };
+        assert!(tab.is_valid());
+    }
+
+    #[test]
+    fn parse_list_rejects_other_control_characters_too() {
+        assert!(HeaderTemplate::parse_list("X: a\u{1b}b").is_err());
     }
 }

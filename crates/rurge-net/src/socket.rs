@@ -19,6 +19,8 @@ pub const OTHER_FAMILY_AFTER: Duration = Duration::from_secs(3);
 /// The socket-level part of a policy's common parameters.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SocketOpts {
+    /// The interface NAME as the platform spells it (e.g. `eth0`,
+    /// `Ethernet`); `None` leaves it to the system's routing.
     pub interface: Option<String>,
     /// Fall back to the default interface when `interface` cannot be used.
     pub allow_other_interface: bool,
@@ -26,9 +28,12 @@ pub struct SocketOpts {
     /// Which family leads the interleaving (`[General] ipv6`); ignored by the
     /// `prefer-*` and `*-only` modes.
     pub v6_first: bool,
+    /// `0` leaves the kernel default: `connect_one` does not call the hook
+    /// at all.
     pub tos: u8,
 }
 
+/// An IP address family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Family {
     V4,
@@ -36,6 +41,7 @@ pub enum Family {
 }
 
 impl Family {
+    /// The family `ip` belongs to.
     pub fn of(ip: &IpAddr) -> Family {
         if ip.is_ipv4() { Family::V4 } else { Family::V6 }
     }

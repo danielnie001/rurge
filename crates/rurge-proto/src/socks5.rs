@@ -141,10 +141,7 @@ impl Socks5Outbound {
         let request = connect_request(target)?;
         let mut stream = self.connector.connect(&self.server, opts).await?;
         if let Some(tls) = &self.tls {
-            stream = tls
-                .wrap(stream)
-                .await
-                .map_err(|e| OutboundError::Tls(e.to_string()))?;
+            stream = tls.wrap(stream).await.map_err(OutboundError::tls)?;
         }
         let offered: &[u8] = if self.credentials.is_some() {
             &[NO_AUTH, USER_PASS]
@@ -159,22 +156,18 @@ impl Socks5Outbound {
             .read_exact(&mut selected)
             .await
             .map_err(handshake_io)?;
-        match selected[1] {
-            NO_ACCEPTABLE => {
+        match (selected[1], &self.credentials) {
+            (NO_ACCEPTABLE, _) => {
                 return Err(proxy(
                     "the proxy accepts none of the offered authentication methods",
                 ));
             }
-            method if !offered.contains(&method) => {
+            (method, _) if !offered.contains(&method) => {
                 return Err(proxy(format!(
                     "the proxy selected authentication method {method}, which was not offered"
                 )));
             }
-            USER_PASS => {
-                let (user, password) = self
-                    .credentials
-                    .as_ref()
-                    .expect("offered only with credentials");
+            (USER_PASS, Some((user, password))) => {
                 // lengths were checked in from_spec (<= 255 bytes each)
                 let mut auth = vec![1, user.len() as u8];
                 auth.extend_from_slice(user.as_bytes());
@@ -243,6 +236,7 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn spec(definition: &str) -> PolicySpec {
         let span = Span::new(Arc::from(Path::new("p.conf")), 1);
@@ -511,5 +505,125 @@ mod tests {
             );
             assert!(!err.message.contains(&long), "{}", err.message);
         }
+    }
+
+    /// A raw SOCKS5 responder that claims a 255-byte ATYP=3 (domain) bound
+    /// address in its CONNECT reply, sends only the first 10 of those bytes,
+    /// then closes: proves the client reports a closed connection instead of
+    /// hanging while it waits for bytes that will never arrive.
+    async fn spawn_truncated_reply() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut greeting = [0u8; 2];
+            if stream.read_exact(&mut greeting).await.is_err() {
+                return;
+            }
+            let mut methods = vec![0u8; usize::from(greeting[1])];
+            if stream.read_exact(&mut methods).await.is_err() {
+                return;
+            }
+            if stream.write_all(&[5, 0]).await.is_err() {
+                return;
+            }
+            // the client's CONNECT request for an IPv4 target: 4 header
+            // bytes + 4 address bytes + 2 port bytes
+            let mut request = [0u8; 10];
+            if stream.read_exact(&mut request).await.is_err() {
+                return;
+            }
+            let _ = stream.write_all(&[5, 0, 0, 3, 255]).await;
+            let _ = stream.write_all(&[0u8; 10]).await;
+            let _ = stream.shutdown().await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn the_bound_address_may_be_a_domain_or_ipv6_and_unknown_types_are_refused() {
+        let echo = echo_server().await;
+
+        // ATYP 3: a domain name in the bound address
+        let mut domain_bound = vec![3u8, 11];
+        domain_bound.extend_from_slice(b"proxy.local");
+        domain_bound.extend_from_slice(&[0x1f, 0x90]);
+        let server = FakeSocks5::spawn(Socks5Script {
+            connect_to: Some(echo),
+            reply_bound: Some(domain_bound),
+            ..Socks5Script::default()
+        })
+        .await;
+        let out = outbound(
+            &format!("socks5, 127.0.0.1, {}", server.addr().port()),
+            no_roots(),
+        );
+        let mut stream = out
+            .connect_tcp(&target(echo), &ConnectOpts::default())
+            .await
+            .unwrap();
+        roundtrip(&mut stream, b"atyp 3").await;
+
+        // ATYP 4: an IPv6 bound address
+        let mut ipv6_bound = vec![4u8];
+        ipv6_bound.extend_from_slice(&[0u8; 16]);
+        ipv6_bound.extend_from_slice(&[0, 0]);
+        let server = FakeSocks5::spawn(Socks5Script {
+            connect_to: Some(echo),
+            reply_bound: Some(ipv6_bound),
+            ..Socks5Script::default()
+        })
+        .await;
+        let out = outbound(
+            &format!("socks5, 127.0.0.1, {}", server.addr().port()),
+            no_roots(),
+        );
+        let mut stream = out
+            .connect_tcp(&target(echo), &ConnectOpts::default())
+            .await
+            .unwrap();
+        roundtrip(&mut stream, b"atyp 4").await;
+
+        // an unknown ATYP is refused
+        let server = FakeSocks5::spawn(Socks5Script {
+            connect_to: Some(echo),
+            reply_bound: Some(vec![9]),
+            ..Socks5Script::default()
+        })
+        .await;
+        let out = outbound(
+            &format!("socks5, 127.0.0.1, {}", server.addr().port()),
+            no_roots(),
+        );
+        let err = out
+            .connect_tcp(&target(echo), &ConnectOpts::default())
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            matches!(&err, OutboundError::Proxy(m) if m == "socks5: unknown address type 9 in the reply"),
+            "{err}"
+        );
+
+        // a reply that claims a 255-byte domain but supplies only 10 bytes,
+        // then hangs up: no hang, a proper handshake error
+        let addr = spawn_truncated_reply().await;
+        let out = outbound(&format!("socks5, 127.0.0.1, {}", addr.port()), no_roots());
+        let err = out
+            .connect_tcp(
+                &target(echo),
+                &ConnectOpts {
+                    timeout: Duration::from_millis(200),
+                },
+            )
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            matches!(&err, OutboundError::Proxy(m) if m == "socks5: the proxy closed the connection during the handshake"),
+            "{err}"
+        );
     }
 }

@@ -52,6 +52,8 @@ pub enum OutboundError {
     Timeout,
     /// The proxy refused or broke the handshake (`socks5: authentication failed`).
     Proxy(String),
+    /// The TLS handshake with the proxy failed; the text is bounded (see
+    /// `OutboundError::tls`).
     Tls(String),
     /// The policy exists but cannot be used (M3: a broken subscription item).
     Unavailable(String),
@@ -84,8 +86,31 @@ impl From<io::Error> for OutboundError {
     }
 }
 
+/// Text that came from the other end of a connection, made safe for a log
+/// line and the request log: control characters dropped, at most `max`
+/// characters kept.
+pub(crate) fn untrusted_text(text: &str, max: usize) -> String {
+    text.chars().filter(|c| !c.is_control()).take(max).collect()
+}
+
+impl OutboundError {
+    /// A TLS failure. The text may quote names presented by the server, so
+    /// it is bounded like any other text from the far end.
+    pub fn tls(error: impl fmt::Display) -> OutboundError {
+        OutboundError::Tls(untrusted_text(&error.to_string(), 256))
+    }
+}
+
 /// An HTTP proxy that takes plain requests in absolute form
 /// (`always-use-connect = false`, the manual's default).
+///
+/// Two obligations fall on the caller (M1b's engine), since this trait only
+/// hands back a raw stream:
+/// - before writing a request line or a `Host` header for a target, check it
+///   with `rurge_proto::http::valid_target` and refuse the request
+///   otherwise (the CONNECT path already does this itself, internally);
+/// - `request_headers()` must be called exactly once per connection: every
+///   call renders the `<random-string(..)>` placeholders anew.
 pub trait HttpForward: Send + Sync {
     /// Connects to the proxy itself (TCP, then TLS for `https`): no CONNECT.
     fn connect<'a>(
@@ -142,5 +167,21 @@ mod tests {
         let direct = Direct::with_resolver(Arc::new(SystemResolve));
         assert!(direct.http_forward().is_none());
         assert!(Reject::new(RejectKind::Reject).http_forward().is_none());
+    }
+
+    #[test]
+    fn untrusted_text_drops_control_characters_and_is_bounded_in_characters() {
+        assert_eq!(untrusted_text("a\x1bb\rc\nd\0e", 64), "abcde");
+        // a multi-byte character: a byte-based cut would split it or miscount
+        let long = "é".repeat(1000);
+        let cut = untrusted_text(&long, 64);
+        assert_eq!(cut.chars().count(), 64);
+        assert_eq!(cut, "é".repeat(64));
+    }
+
+    #[test]
+    fn outbound_error_tls_bounds_the_text_it_wraps() {
+        let err = OutboundError::tls("x".repeat(1000));
+        assert_eq!(err.to_string(), format!("tls: {}", "x".repeat(256)));
     }
 }

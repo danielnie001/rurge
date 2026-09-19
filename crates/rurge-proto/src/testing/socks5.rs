@@ -15,6 +15,9 @@ pub struct Socks5Script {
     pub auth: Option<(String, String)>,
     /// Reply code for the CONNECT request (0 = succeeded).
     pub reply: u8,
+    /// The raw ATYP + BND.ADDR + BND.PORT bytes of the reply; `None` =
+    /// `[1, 0,0,0,0, 0,0]` (IPv4, all-zero).
+    pub reply_bound: Option<Vec<u8>>,
     /// Connect here whatever the client asked for (the fake never resolves names).
     pub connect_to: Option<SocketAddr>,
     /// Wait this long before replying to the request.
@@ -47,8 +50,13 @@ async fn read_vec(stream: &mut BoxedStream, len: usize) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-async fn reply(stream: &mut BoxedStream, code: u8) -> io::Result<()> {
-    stream.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]).await
+/// ATYP + BND.ADDR + BND.PORT of a default (IPv4, all-zero) reply.
+const DEFAULT_BOUND: [u8; 7] = [1, 0, 0, 0, 0, 0, 0];
+
+async fn reply(stream: &mut BoxedStream, code: u8, bound: &[u8]) -> io::Result<()> {
+    let mut out = vec![5, code, 0];
+    out.extend_from_slice(bound);
+    stream.write_all(&out).await
 }
 
 async fn serve(
@@ -115,8 +123,9 @@ async fn serve(
         port,
     });
     tokio::time::sleep(script.delay).await;
+    let bound: &[u8] = script.reply_bound.as_deref().unwrap_or(&DEFAULT_BOUND);
     if script.reply != 0 {
-        reply(&mut stream, script.reply).await?;
+        reply(&mut stream, script.reply, bound).await?;
         return stream.shutdown().await;
     }
     let target = script
@@ -124,14 +133,14 @@ async fn serve(
         .or_else(|| literal.map(|ip| SocketAddr::new(ip, port)));
     let Some(target) = target else {
         // a domain name and nowhere to send it: host unreachable
-        reply(&mut stream, 4).await?;
+        reply(&mut stream, 4, bound).await?;
         return stream.shutdown().await;
     };
     let Ok(mut upstream) = TcpStream::connect(target).await else {
-        reply(&mut stream, 5).await?;
+        reply(&mut stream, 5, bound).await?;
         return stream.shutdown().await;
     };
-    reply(&mut stream, 0).await?;
+    reply(&mut stream, 0, bound).await?;
     let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
     Ok(())
 }
