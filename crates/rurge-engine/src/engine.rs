@@ -4,6 +4,7 @@
 use crate::control::Mode;
 use crate::observe::{RequestLog, TrafficStats};
 use crate::runtime::Runtime;
+use crate::shared::EngineShared;
 use crate::state::StateStore;
 use arc_swap::ArcSwap;
 use rurge_config::Builtin;
@@ -144,6 +145,7 @@ pub struct Engine {
     /// "proxy mode but no usable global policy" is warned once per change.
     global_warned: AtomicBool,
     state: OnceLock<Arc<StateStore>>,
+    shared: EngineShared,
 }
 
 impl Engine {
@@ -153,6 +155,9 @@ impl Engine {
             traffic: TrafficStats::new(),
         });
         let (mode, global) = Mode::from_outbound(&runtime.outbound_mode);
+        // Publish the first generation before anything can dial through it.
+        let shared = runtime.shared.clone();
+        shared.cell.store(runtime.policies.clone());
         let engine = Arc::new(Engine {
             runtime: ArcSwap::from_pointee(runtime),
             next_session: AtomicU64::new(0),
@@ -165,6 +170,7 @@ impl Engine {
             global_policy: ArcSwap::from_pointee(global),
             global_warned: AtomicBool::new(false),
             state: OnceLock::new(),
+            shared,
         });
         if let Some(pc) = engine.runtime().dns_pipeline() {
             pc.attach(Arc::downgrade(&engine));
@@ -322,6 +328,30 @@ impl Engine {
         });
         self.observe.log.mark_active(&handle);
         handle
+    }
+}
+
+impl Engine {
+    /// The generation-independent objects; every `Runtime` swapped into this
+    /// engine must have been built with them.
+    pub fn shared(&self) -> EngineShared {
+        self.shared.clone()
+    }
+
+    /// Makes `next`'s registry the one chain connectors resolve against.
+    pub(crate) fn publish_registry(&self, next: &Runtime) {
+        assert!(
+            Arc::ptr_eq(&self.shared.cell, &next.shared.cell),
+            "the next generation must be built with `Engine::shared()`"
+        );
+        self.shared.cell.store(next.policies.clone());
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // registry → outbound → chain connector → cell → registry
+        self.shared.cell.clear();
     }
 }
 
@@ -680,7 +710,7 @@ impl Dialer for Engine {
             };
             let resolution = rt.policies.resolve(&policy);
             handle.set_policy_chain(resolution.chain.clone());
-            if let Some(kind) = &resolution.unsupported {
+            if let Some(rurge_policy::Note::Unsupported(kind)) = &resolution.note {
                 // The policy is sound but rurge cannot speak it yet, so the
                 // outbound below is REJECT; say so in the session log (§7.2).
                 handle.set_error(format!("policy protocol not implemented: {kind}"));

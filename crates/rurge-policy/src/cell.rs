@@ -98,11 +98,9 @@ impl Connector for ChainConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::selections::GroupSelections;
     use crate::testing::RecordingConnector;
     use rurge_config::HostName;
     use rurge_config::config::{LoadOptions, from_text};
-    use rurge_proto::Direct;
     use std::path::Path;
 
     const PROFILE: &str = "[General]\nloglevel = notify\n[Proxy]\nD = direct\nBlock = reject\n[Proxy Group]\nPick = select, D, DIRECT\n[Rule]\nFINAL,DIRECT\n";
@@ -110,11 +108,19 @@ mod tests {
     fn registry(connector: Arc<RecordingConnector>) -> Arc<PolicyRegistry> {
         let loaded = from_text(PROFILE, Path::new("t.conf"), &LoadOptions::for_tests());
         assert!(!loaded.diagnostics.has_errors());
-        Arc::new(PolicyRegistry::build(
-            &loaded.config,
-            &GroupSelections::new(),
-            Arc::new(Direct::new(connector)),
-        ))
+        let factory = crate::testing::FakeFactory {
+            connector,
+            broken: None,
+        };
+        Arc::new(
+            PolicyRegistry::build(
+                &loaded.config,
+                &factory,
+                &RegistryCell::new(),
+                Arc::new(crate::selections::SelectionTable::default()),
+            )
+            .expect("builds"),
+        )
     }
 
     fn server() -> Target {

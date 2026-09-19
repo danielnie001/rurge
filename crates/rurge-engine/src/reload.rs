@@ -46,6 +46,7 @@ impl Engine {
         if let Some(pc) = next.dns_pipeline() {
             pc.attach(std::sync::Arc::downgrade(self));
         }
+        self.publish_registry(&next);
         self.store_runtime(next);
         before != after
     }

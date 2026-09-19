@@ -6,7 +6,7 @@ use rurge_config::session::{ListenerKind, SessionInfo};
 use rurge_dns::system::StaticSystemDns;
 use rurge_dns::testing::MockDns;
 use rurge_engine::stack::StackOptions;
-use rurge_engine::{Engine, ListenerSpec, Runtime, RuntimeOptions};
+use rurge_engine::{Engine, EngineShared, ListenerSpec, Runtime, RuntimeOptions};
 use rurge_inbound::{DialError, Dialer, Running, SessionHandle, SessionOutcome};
 use rurge_net::testing::TestServer;
 use rurge_policy::GroupSelections;
@@ -96,10 +96,11 @@ async fn harness(general_extra: &str, rules: &str, mode: OutboundMode) -> Harnes
                 system: Arc::new(StaticSystemDns::default()),
                 wait: Duration::ZERO,
                 dns_connector: None,
+                socket_hook: Arc::new(rurge_net::socket::NoopSocketHook),
             },
             outbound_mode: mode,
             idle_timeout: Duration::from_secs(600),
-            selections: GroupSelections::new(),
+            shared: EngineShared::default(),
             request_log_size: 1000,
         },
     )
@@ -414,6 +415,8 @@ async fn harness_with_final_reject(mode: OutboundMode) -> Harness {
 
 /// Builds a Runtime for a profile whose listeners are 127.0.0.1:0; `general_extra`
 /// lands in [General], `rules` before FINAL,DIRECT. Reused by later tests.
+/// `shared` must be `EngineShared::default()` for a fresh engine, or the
+/// running engine's own `shared()` for a `swap_runtime` reload.
 async fn build_runtime(
     dir: &std::path::Path,
     dns: &MockDns,
@@ -421,6 +424,7 @@ async fn build_runtime(
     rules: &str,
     mode: OutboundMode,
     idle_timeout: Duration,
+    shared: EngineShared,
 ) -> Runtime {
     let profile = format!(
         "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\ndns-server = {}\nipv6 = false\n{general_extra}\n\
@@ -440,10 +444,11 @@ async fn build_runtime(
                 system: Arc::new(StaticSystemDns::default()),
                 wait: Duration::ZERO,
                 dns_connector: None,
+                socket_hook: Arc::new(rurge_net::socket::NoopSocketHook),
             },
             outbound_mode: mode,
             idle_timeout,
-            selections: GroupSelections::new(),
+            shared,
             request_log_size: 1000,
         },
     )
@@ -464,6 +469,7 @@ async fn idle_sessions_are_closed() {
         "", // the template already ends with FINAL,DIRECT
         OutboundMode::Rule,
         Duration::from_millis(300),
+        EngineShared::default(),
     )
     .await;
     let engine = Engine::new(runtime);
@@ -643,10 +649,11 @@ async fn http_listener_password_from_the_profile() {
                 system: Arc::new(StaticSystemDns::default()),
                 wait: Duration::ZERO,
                 dns_connector: None,
+                socket_hook: Arc::new(rurge_net::socket::NoopSocketHook),
             },
             outbound_mode: OutboundMode::Rule,
             idle_timeout: Duration::from_secs(600),
-            selections: GroupSelections::new(),
+            shared: EngineShared::default(),
             request_log_size: 1000,
         },
     )
@@ -725,6 +732,7 @@ async fn reload_swaps_rules_without_changing_listeners() {
         "DOMAIN,ads.test,Block",
         OutboundMode::Rule,
         Duration::from_secs(600),
+        h.engine.shared(),
     )
     .await;
     let changed = h.engine.swap_runtime(next);
@@ -742,6 +750,7 @@ async fn reload_swaps_rules_without_changing_listeners() {
         "",
         OutboundMode::Rule,
         Duration::from_secs(600),
+        h.engine.shared(),
     )
     .await;
     assert!(h.engine.swap_runtime(next), "listen addr set changed");
@@ -818,6 +827,7 @@ async fn reload_with_changed_password_rebinds_and_applies_it() {
             "",
             OutboundMode::Rule,
             Duration::from_secs(600),
+            EngineShared::default(),
         )
         .await;
         let engine = Engine::new(runtime);
@@ -841,6 +851,7 @@ async fn reload_with_changed_password_rebinds_and_applies_it() {
         "",
         OutboundMode::Rule,
         Duration::from_secs(600),
+        engine.shared(),
     )
     .await;
     assert!(
@@ -878,6 +889,7 @@ async fn rebind_moves_the_listener_to_the_new_address() {
         "",
         OutboundMode::Rule,
         Duration::from_secs(600),
+        EngineShared::default(),
     )
     .await;
     let engine = Engine::new(runtime);
@@ -897,6 +909,7 @@ async fn rebind_moves_the_listener_to_the_new_address() {
             "",
             OutboundMode::Rule,
             Duration::from_secs(600),
+            engine.shared(),
         )
         .await;
         assert!(engine.swap_runtime(next), "the listen address changed");
@@ -937,6 +950,7 @@ async fn rebind_failure_leaves_no_listeners_and_a_later_rebind_recovers() {
         "",
         OutboundMode::Rule,
         Duration::from_secs(600),
+        EngineShared::default(),
     )
     .await;
     let engine = Engine::new(runtime);
@@ -952,6 +966,7 @@ async fn rebind_failure_leaves_no_listeners_and_a_later_rebind_recovers() {
         "",
         OutboundMode::Rule,
         Duration::from_secs(600),
+        engine.shared(),
     )
     .await;
     assert!(engine.swap_runtime(next), "the listen address changed");
@@ -1001,11 +1016,12 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
                 system: Arc::new(StaticSystemDns::default()),
                 wait: Duration::ZERO,
                 dns_connector: None,
+                socket_hook: Arc::new(rurge_net::socket::NoopSocketHook),
             },
             outbound_mode: OutboundMode::Rule,
             idle_timeout: Duration::from_secs(600),
             request_log_size: 1000,
-            selections: GroupSelections::new(),
+            shared: EngineShared::default(),
         },
     )
     .await
@@ -1065,11 +1081,12 @@ async fn persisted_group_selection_is_honored() {
                 system: Arc::new(StaticSystemDns::default()),
                 wait: Duration::ZERO,
                 dns_connector: None,
+                socket_hook: Arc::new(rurge_net::socket::NoopSocketHook),
             },
             outbound_mode: OutboundMode::Rule,
             idle_timeout: Duration::from_secs(600),
             request_log_size: 1000,
-            selections: GroupSelections::from_map(selections),
+            shared: EngineShared::new(GroupSelections::from_map(selections)),
         },
     )
     .await

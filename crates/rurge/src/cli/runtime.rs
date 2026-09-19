@@ -89,6 +89,8 @@ impl Runtime {
             // follow the outbound mode; `check` / `rule match` / `dns lookup`
             // build the stack without an engine, so they stay direct.
             dns_connector: None,
+            // The `rurge-platform` adapter lands in a later milestone.
+            socket_hook: Arc::new(rurge_net::socket::NoopSocketHook),
         }
     }
 }

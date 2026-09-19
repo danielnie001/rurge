@@ -10,6 +10,7 @@ pub mod outbounds;
 pub mod relay;
 mod reload;
 pub mod runtime;
+pub mod shared;
 pub mod sniff;
 pub mod stack;
 pub mod state;
@@ -20,3 +21,4 @@ pub use observe::{RecordStatus, RequestLog, RequestRecord, TrafficStats, Traffic
 pub use outbounds::{EngineFactory, dry_build, load_checked};
 pub use runtime::{Runtime, RuntimeOptions};
 pub use rurge_inbound::Running;
+pub use shared::EngineShared;

@@ -14,7 +14,7 @@ use rurge_config::rule::PolicyRef;
 use rurge_config::session::ListenerKind;
 use rurge_engine::control::{Control, LogLevel as ApiLogLevel, Mode, ReloadReport};
 use rurge_engine::state::{STATE_FILE, State, StateStore, profile_key};
-use rurge_engine::{Engine, ListenerSpec, Running, Runtime, RuntimeOptions};
+use rurge_engine::{Engine, EngineShared, ListenerSpec, Running, Runtime, RuntimeOptions};
 use rurge_net::BoxFuture;
 use rurge_platform::sysproxy::ProxySettings;
 use rurge_rules::OutboundMode;
@@ -240,15 +240,14 @@ async fn build_engine_runtime(
     rt: &super::runtime::Runtime,
     run_opts: &RunOptions,
     outbound_mode: OutboundMode,
-    state: &State,
+    shared: &EngineShared,
 ) -> anyhow::Result<Runtime> {
-    let selections = state.selections_for(&profile_key(&cfg.source.main));
     Runtime::build(
         cfg,
         RuntimeOptions {
             stack: rt.stack_options(Duration::ZERO),
             outbound_mode,
-            selections,
+            shared: shared.clone(),
             idle_timeout: run_opts.idle_timeout,
             request_log_size: run_opts.request_log_size,
         },
@@ -308,6 +307,9 @@ struct Daemon<'a> {
     rt: &'a super::runtime::Runtime,
     run_opts: &'a RunOptions,
     outbound_mode: &'a OutboundMode,
+    /// Not read by this task's reload path (selections now come from
+    /// `engine.shared()`); kept for the state features Task 8 adds here.
+    #[allow(dead_code)]
     store: &'a StateStore,
     http_api: &'a Option<ControllerAccess>,
 }
@@ -352,13 +354,12 @@ async fn reload(d: &Daemon<'_>, listeners: &mut Vec<(ListenerSpec, Running)>) ->
         };
         tracing::warn!("{message}");
     }
-    let state = d.store.snapshot().await;
     let next = match build_engine_runtime(
         loaded.config,
         d.rt,
         d.run_opts,
         d.outbound_mode.clone(),
-        &state,
+        &d.engine.shared(),
     )
     .await
     {
@@ -654,8 +655,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         let mut sysproxy = SystemProxyManager::new(super::sysproxy::backend()?, store.clone());
         sysproxy.recover().await;
         let outbound_mode = initial_mode(explicit_mode, &store, &state).await;
+        // `cfg` is moved into `build_engine_runtime` next, so read its source path now.
+        let shared = EngineShared::new(state.selections_for(&profile_key(&cfg.source.main)));
         let engine_rt =
-            build_engine_runtime(cfg, &rt, &run_opts, outbound_mode.clone(), &state).await?;
+            build_engine_runtime(cfg, &rt, &run_opts, outbound_mode.clone(), &shared).await?;
         print_diagnostics(engine_rt.diagnostics());
         let (policies, rules) = (
             engine_rt.policies.names().len(),

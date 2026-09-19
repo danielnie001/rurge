@@ -14,10 +14,9 @@ use rurge_dns::testing::MockDns;
 use rurge_engine::control::{Control, LogLevel, ReloadReport};
 use rurge_engine::stack::StackOptions;
 use rurge_engine::state::{STATE_FILE, State, StateStore};
-use rurge_engine::{Engine, ListenerSpec, Running, Runtime, RuntimeOptions};
+use rurge_engine::{Engine, EngineShared, ListenerSpec, Running, Runtime, RuntimeOptions};
 use rurge_net::BoxFuture;
 use rurge_net::testing::TestServer;
-use rurge_policy::GroupSelections;
 use rurge_rules::{GeoUrls, OutboundMode};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -155,10 +154,11 @@ internet-test-url = http://target.test:{}/hello\n\
                 system: Arc::new(StaticSystemDns::default()),
                 wait: Duration::ZERO,
                 dns_connector: None,
+                socket_hook: Arc::new(rurge_net::socket::NoopSocketHook),
             },
             outbound_mode: OutboundMode::Rule,
             idle_timeout: Duration::from_secs(600),
-            selections: GroupSelections::new(),
+            shared: EngineShared::default(),
             request_log_size: 1000,
         },
     )

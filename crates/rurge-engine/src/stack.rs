@@ -26,6 +26,9 @@ pub struct StackOptions {
     /// direct. `Runtime::build` injects the pipeline connector here when
     /// `encrypted-dns-follow-outbound-mode` is on.
     pub dns_connector: Option<Arc<dyn Connector>>,
+    /// Interface binding and TOS for outbound sockets (the bin injects
+    /// `rurge-platform`; everything else uses `NoopSocketHook`).
+    pub socket_hook: Arc<dyn rurge_net::socket::SocketHook>,
 }
 
 pub struct Stack {

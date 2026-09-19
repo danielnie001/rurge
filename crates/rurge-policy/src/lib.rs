@@ -12,5 +12,5 @@ pub(crate) mod testing;
 
 pub use cell::{ChainConnector, RegistryCell};
 pub use factory::{BuildError, OutboundFactory};
-pub use registry::{PolicyRegistry, Resolution};
+pub use registry::{Note, PolicyRegistry, Resolution, TerminalKind};
 pub use selections::{GroupSelections, SelectionTable};
