@@ -81,6 +81,22 @@ fn authority(target: &Target) -> String {
     }
 }
 
+/// `target` is written verbatim into the CONNECT request line and the `Host`
+/// header (`connect_request`). A domain name is caller-supplied (it can come
+/// from a client's SOCKS5 / HTTP CONNECT request) and must not be trusted:
+/// anything outside printable, non-space ASCII — a CR or LF above all —
+/// would let a client smuggle a second request into the proxy connection,
+/// carrying our `Proxy-Authorization`. An IP literal's `Display` can never
+/// contain such bytes, so it is always fine.
+fn valid_target(target: &Target) -> bool {
+    match &target.host {
+        HostName::Ip(_) => true,
+        HostName::Domain(name) => {
+            !name.is_empty() && name.bytes().all(|b| (0x21..=0x7e).contains(&b))
+        }
+    }
+}
+
 fn check_status(head: &[u8]) -> Result<(), OutboundError> {
     let text = String::from_utf8_lossy(head);
     let line = text.lines().next().unwrap_or_default();
@@ -143,6 +159,8 @@ impl HttpOutbound {
         }
     }
 
+    /// The caller must have already checked `valid_target(target)`: this
+    /// never re-checks, and a rejected target must never reach it.
     fn connect_request(&self, target: &Target) -> Vec<u8> {
         let authority = authority(target);
         let mut headers = vec![("Host".to_string(), authority.clone())];
@@ -166,6 +184,12 @@ impl HttpOutbound {
         target: &Target,
         opts: &ConnectOpts,
     ) -> Result<BoxedStream, OutboundError> {
+        if !valid_target(target) {
+            // never dial or write a byte for a target we cannot safely quote
+            return Err(OutboundError::Proxy(
+                "the target host name is not valid for an HTTP proxy request".to_string(),
+            ));
+        }
         let mut stream = self.dial(opts).await?;
         stream.write_all(&self.connect_request(target)).await?;
         let (head, rest) = read_head(&mut stream, MAX_HEAD)
@@ -574,5 +598,51 @@ mod tests {
         .map(|_| ())
         .unwrap_err();
         assert_eq!(err.message, "policy `Up` is not an http / https policy");
+    }
+
+    #[tokio::test]
+    async fn a_target_with_control_characters_never_reaches_the_proxy() {
+        let proxy = FakeHttpProxy::spawn(HttpProxyScript::default()).await;
+        let out = outbound(
+            &format!("http, 127.0.0.1, {}", proxy.addr().port()),
+            no_roots(),
+        );
+        for name in [
+            "a.test\r\nX-Evil: 1\r\n\r\nCONNECT internal.test:22 HTTP/1.1\r\nHost: internal.test:22",
+            "a b.test",
+            "",
+        ] {
+            let err = out
+                .connect_tcp(
+                    &Target::new(HostName::Domain(name.to_string()), 443),
+                    &ConnectOpts::default(),
+                )
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert!(
+                matches!(&err, OutboundError::Proxy(m) if m == "the target host name is not valid for an HTTP proxy request"),
+                "{err}"
+            );
+            assert!(!err.to_string().contains("X-Evil"), "{err}");
+        }
+        assert!(proxy.heads().is_empty(), "{:?}", proxy.heads());
+    }
+
+    #[test]
+    fn check_status_rejects_malformed_lines_and_accepts_any_1_x_success() {
+        for head in [
+            b"HTTP/2 200 OK\r\n\r\n".as_slice(),
+            b"garbage\r\n\r\n".as_slice(),
+            b"".as_slice(),
+        ] {
+            let err = check_status(head).map(|_| ()).unwrap_err();
+            assert!(
+                matches!(&err, OutboundError::Proxy(m) if m == "http proxy sent a malformed response"),
+                "{err}"
+            );
+        }
+        check_status(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap();
+        check_status(b"HTTP/1.0 200 OK\r\n\r\n").unwrap();
     }
 }

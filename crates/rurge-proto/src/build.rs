@@ -58,6 +58,8 @@ pub fn tls_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rurge_config::{KeystoreType, Span};
+    use std::path::Path;
 
     #[test]
     fn build_errors_are_plain_messages() {
@@ -70,5 +72,64 @@ mod tests {
             }
         );
         let _: &dyn std::error::Error = &e;
+    }
+
+    fn no_roots() -> Arc<RootCertStore> {
+        Arc::new(RootCertStore::empty())
+    }
+
+    #[test]
+    fn no_tls_options_means_no_tls_client() {
+        let result = tls_client(None, &HostName::parse("proxy.test"), &[], &[], no_roots());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn client_cert_must_exist_in_the_keystore() {
+        let opts = TlsOpts {
+            client_cert: Some("missing".to_string()),
+            ..TlsOpts::default()
+        };
+        let err = tls_client(
+            Some(&opts),
+            &HostName::parse("proxy.test"),
+            &[],
+            &[],
+            no_roots(),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.message, "keystore item `missing` does not exist");
+    }
+
+    #[test]
+    fn a_broken_client_cert_surfaces_at_build_time() {
+        let item = KeystoreItem {
+            name: "cert1".into(),
+            kind: KeystoreType::P12,
+            base64: "AAAA".into(),
+            password: Some("x".into()),
+            unknown: Vec::new(),
+            span: Span::new(Arc::from(Path::new("p.conf")), 1),
+        };
+        let opts = TlsOpts {
+            client_cert: Some("cert1".to_string()),
+            ..TlsOpts::default()
+        };
+        let err = tls_client(
+            Some(&opts),
+            &HostName::parse("proxy.test"),
+            &[],
+            &[item],
+            no_roots(),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert!(
+            err.message
+                .starts_with("keystore item `cert1` cannot be decoded"),
+            "{}",
+            err.message
+        );
     }
 }
