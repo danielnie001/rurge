@@ -8,6 +8,8 @@
 | 兼容基线 | [Surge 兼容性清单](../../surge-compatibility-matrix.md) 第 4、5 节与 6.2、10.4 节，Surge Mac 6.9 / iOS 5.22 手册 |
 | 前置     | 阶段 1（M1 ～ M4b）已合并：配置解析、规则引擎、DNS、连接流水线、控制面、系统代理与服务安装             |
 
+> 2026-09-19 订正：M1 细化设计（`2026-09-19-phase2-m1-outbound-foundation-design.md` 第 11 节 C1–C8）对本文档做了八处订正，下文已按订正后的内容改写。
+
 本文档是阶段 2 的总设计：定目标与范围、技术选型、crate 边界、跨里程碑共用的抽象、里程碑拆分、测试策略与验收。每个里程碑开工前再各写一份细化设计与实施计划（同阶段 1 的 M2 / M3 / M4）；各协议的线上格式、`smart` 的评分公式、API 的 JSON 形状等细节在那里定稿，不在本文档展开。
 
 ## 1. 目标与范围
@@ -43,11 +45,11 @@
 
 | 里程碑 | 内容 | 需求 | 可验收的产出 |
 | ------ | ---- | ---- | ------------ |
-| **M1 出站地基与 HTTP / SOCKS5 上游** | `PolicySpec` 类型化（通用参数、TLS 参数）、`[Keystore]`、`Outbound` / `Dialer` / `Datagram` 抽象、`DirectDialer`（`interface` `allow-other-interface` `ip-version` `tfo` `tos`）、`ChainDialer`（`underlying-proxy`）、TLS 层、`http` `https` `socks5` `socks5-tls`（TCP）、`OutboundFactory` 与注册表接入真实出站、`select` 组语义补全、`rurge check` 干构建、策略 / 组只读与 select 的 API、三层测试的基础设施 | FR-CFG-11（p12）、FR-OUT-03（部分）/ 04（TLS）/ 05 / 08 / 09、FR-GRP-05（部分）/ 06、FR-DNS-07 / 10 | 真实配置经 HTTP(S) / SOCKS5 上游与两级链式代理转发；对 sing-box 的互操作测试通过 |
+| **M1 出站地基与 HTTP / SOCKS5 上游** | `PolicySpec` 类型化（通用参数、TLS 参数）、`[Keystore]`、`Outbound` 与演进后的 `Connector` 抽象、`DirectConnector`（`interface` `allow-other-interface` `ip-version` `tfo` `tos`）、`ChainConnector`（`underlying-proxy`）、TLS 层、`http` `https` `socks5` `socks5-tls`（TCP，含明文 HTTP 的绝对 URI 转发）、`OutboundFactory` 与注册表接入真实出站、`select` 组语义补全、`rurge check` 干构建、策略 / 组只读与 select 的 API、三层测试的基础设施 | FR-CFG-11（p12）、FR-OUT-03（部分）/ 04（TLS）/ 05 / 08 / 09、FR-GRP-05（部分）/ 06、FR-DNS-07 | 真实配置经 HTTP(S) / SOCKS5 上游与两级链式代理转发；对 sing-box 的互操作测试通过 |
 | **M2 TLS 族** | WebSocket 层、Shadow TLS v2 / v3、`trojan`、`vmess`（AEAD）、`anytls` | FR-OUT-04（Shadow TLS）/ 05 | 三种协议各自带 / 不带 WebSocket、Shadow TLS 对参考实现转发通过 |
 | **M3 策略组、订阅与连通性测试** | 连通性测试、`url-test` `fallback` `load-balance` `smart`、全部组参数、`policy-path` / `include-*` 装配、嵌套 / 环 / 兜底、临时覆盖、组级 `underlying-proxy`、订阅更新热重建、测试与切换 API | FR-OUT-03（`test-url` `test-timeout`）/ 10、FR-GRP-01 / 03 ～ 07 | 订阅样本解析正确；组算法单测与端到端测试；API 测试与切换正确 |
-| **M4 WireGuard / SSH / external** | `rurge-proto-wireguard`（多 peer 路由、定时器、分片重组、`client-id`、RTT 探测、ICMP echo、DSCP）、`DirectDialer` 的 UDP 载体、`rurge-proto-ssh`、`external` 进程监管、`[WireGuard <name>]` 类型化、Keystore 的 OpenSSH 私钥 | FR-CFG-11（openssh）、FR-OUT-05 / 12 / 13 | WireGuard 与带 `client-id` 的端点握手并转发 TCP；SSH 动态转发；`external` 进程退出自动重启 |
-| **M5 UDP 路径** | SOCKS5 UDP ASSOCIATE 入站、引擎 UDP 流水线、DIRECT UDP、已有协议的 UDP（`socks5` `trojan` `vmess` `anytls` `wireguard` `external`）、`udp-relay` `udp-port` `udp-policy-not-supported-behaviour`、UDP 测试（`test-udp` / `proxy-test-udp`）、`block-quic`、UDP 载体的链式拨号 | FR-IN-02（UDP）、FR-OUT-03（`test-udp` `block-quic`）/ 07 / 08（UDP）/ 11 | 各协议 UDP 对参考服务器转发通过；不支持 UDP 的策略按全局设置处理 |
+| **M4 WireGuard / SSH / external** | `rurge-proto-wireguard`（多 peer 路由、定时器、分片重组、`client-id`、RTT 探测、ICMP echo、DSCP）、`DirectConnector` 的 UDP 载体、`rurge-proto-ssh`、`external` 进程监管、`[WireGuard <name>]` 类型化、Keystore 的 OpenSSH 私钥 | FR-CFG-11（openssh）、FR-OUT-05 / 12 / 13 | WireGuard 与带 `client-id` 的端点握手并转发 TCP；SSH 动态转发；`external` 进程退出自动重启 |
+| **M5 UDP 路径** | SOCKS5 UDP ASSOCIATE 入站、引擎 UDP 流水线、DIRECT UDP、已有协议的 UDP（`socks5` `trojan` `vmess` `anytls` `wireguard` `external`）、`udp-relay` `udp-port` `udp-policy-not-supported-behaviour`、UDP 测试（`test-udp` / `proxy-test-udp`）、`block-quic`、UDP 载体的链式拨号、`dns-follow-interface` | FR-IN-02（UDP）、FR-OUT-03（`test-udp` `block-quic`）/ 07 / 08（UDP）/ 11、FR-DNS-10 | 各协议 UDP 对参考服务器转发通过；不支持 UDP 的策略按全局设置处理 |
 | **M6 Shadowsocks / Snell / HTTP/2 族** | `ss`（AEAD、2022、obfs，含 UDP）、`snell` v1 ～ v4（obfs、reuse，v3+ UDP）、`h2-connect`（`max-streams`、CONNECT-UDP）、`trust-tunnel`（h2） | FR-OUT-05 / 07 | 四种协议对参考实现转发通过 |
 | **M7 QUIC 族** | `rurge-net::quic` 公共件、`rurge-proto-quic`（`tuic` `tuic-v5` `hysteria2` `masque`、`trust-tunnel` 的 h3 模式）、`port-hopping`、`ecn`、DoH3 / DoQ 上游 | FR-OUT-03（`ecn`）/ 05、FR-DNS-04 | QUIC 族 TCP 与 UDP 转发通过；`h3://` `quic://` 上游解析正常 |
 | **M8 收尾与验收** | P2 项（Shadowsocks 流式旧方法、VMess 旧握手）、Snell v5 / v6 · Gecko · Tailscale 可行性报告、阶段验收清单、文档同步 | FR-OUT-06 / 15 | 第 14 节验收标准全部通过 |
@@ -80,7 +82,7 @@ M1 体量大，细化设计时可按阶段 1 的先例拆成 M1a（配置与抽�
 
 ```
 crates/
-├── rurge-proto/             # 核心 trait（Outbound / Dialer / Datagram）、DIRECT / REJECT、
+├── rurge-proto/             # 核心 trait（Outbound / Datagram）、DIRECT / REJECT、
 │                            # 传输层（tls、shadow-tls、ws、obfs、h2 连接池）、
 │                            # http(s) socks5(-tls) trojan vmess anytls ss snell
 │                            # h2-connect trust-tunnel(h2) external
@@ -159,7 +161,9 @@ M4 把它从 `deferred` 转为类型化节：`private-key`（Base64 或 64 位�
 
 ## 5. 出站抽象（`rurge-proto`）
 
-### 5.1 三个核心 trait
+### 5.1 三个核心抽象
+
+"出站怎样够到自己的服务器"这一抽象不新增 trait，而是**演进现有的 `rurge_net::Connector`**：它的签名本来就吻合，DoH / DoT / 内部 HTTP 客户端 / 资源下载已经都接受 `Arc<dyn Connector>`，而工作区里已有一个 `rurge_inbound::Dialer`（入站→引擎边界），再造同名 trait 只会混淆。
 
 ```rust
 /// 一条到固定目标的 UDP 流。引擎面向它转发；QUIC / WireGuard 也用它当载体。
@@ -168,52 +172,55 @@ pub trait Datagram: Send + Sync {
     fn recv<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<usize>>;
 }
 
-/// 出站怎样够到"自己的服务器"（对 DIRECT 而言就是目标本身）。
-pub trait Dialer: Send + Sync {
-    fn connect_tcp<'a>(&'a self, to: &'a Target, ctx: &'a DialCtx) -> BoxFuture<'a, io::Result<BoxedStream>>;
-    fn connect_udp<'a>(&'a self, to: &'a Target, ctx: &'a DialCtx) -> BoxFuture<'a, io::Result<BoxedDatagram>>;
+/// rurge-net 里现有的 trait：出站怎样够到"自己的服务器"（对 DIRECT 而言就是目标本身）。
+pub trait Connector: Send + Sync {
+    fn connect<'a>(&'a self, to: &'a Target, opts: &'a ConnectOpts) -> BoxFuture<'a, io::Result<BoxedStream>>;
+    // M4 / M5 起增加（带默认实现，返回 Unsupported）：
+    fn connect_udp<'a>(&'a self, to: &'a Target, opts: &'a ConnectOpts) -> BoxFuture<'a, io::Result<BoxedDatagram>>;
 }
 
 pub trait Outbound: Send + Sync {
     fn name(&self) -> &str;
     fn udp(&self) -> UdpSupport; // Native | OverTcp | Unsupported
-    fn connect_tcp<'a>(&'a self, target: &'a Target, ctx: &'a DialCtx)
+    fn connect_tcp<'a>(&'a self, target: &'a Target, opts: &'a ConnectOpts)
         -> BoxFuture<'a, Result<BoxedStream, OutboundError>>;
-    fn connect_udp<'a>(&'a self, target: &'a Target, ctx: &'a DialCtx)
+    fn connect_udp<'a>(&'a self, target: &'a Target, opts: &'a ConnectOpts)
         -> BoxFuture<'a, Result<BoxedDatagram, OutboundError>>;
 }
 ```
 
-`DialCtx` 取代阶段 1 的 `ConnectOpts` 出现在出站接口上，携带超时与会话 id（供日志关联）；地址族偏好改由策略的 `ip-version` 决定，不再由调用方传入。具体字段在 M1 细化设计里定稿。
+`ConnectOpts` 只保留超时；地址族偏好改由策略的 `ip-version` 决定，不再由调用方传入。`Outbound` 的 UDP 方法（`udp` / `connect_udp`）在 M5 以带默认实现的新方法加入；M1 另加一个 `http_forward()`，供 HTTP 代理按绝对 URI 转发明文请求（M1 细化设计 5.2）。
 
-UDP 一侧分三步落地：`DirectDialer::connect_udp`（带 socket 选项的裸 UDP socket）在 M4 随 WireGuard 的载体需求落地；`Outbound::connect_udp`（引擎面向的 UDP 流）与 `ChainDialer::connect_udp`（经底层代理的 UDP 载体）在 M5 落地，此前前者对所有出站返回 `Unsupported`。
+UDP 一侧分三步落地：`DirectConnector::connect_udp`（带 socket 选项的裸 UDP socket）在 M4 随 WireGuard 的载体需求落地；`Outbound::connect_udp`（引擎面向的 UDP 流）与 `ChainConnector::connect_udp`（经底层代理的 UDP 载体）在 M5 落地。
 
-### 5.2 `DirectDialer` 与 socket 选项（FR-OUT-03 / 09）
+### 5.2 `DirectConnector` 与 socket 选项（FR-OUT-03 / 09）
 
-真实 socket 加策略的 socket 选项：`interface` 与 `allow-other-interface`（指定网卡不可用时是否允许其它网卡）、`ip-version`（五种取值；`prefer-*` 模式先试偏好的地址族，3 秒后再试另一族；有 `underlying-proxy` 时无效）、`tfo`、`tos`。代理服务器主机名经 `rurge-dns` 解析；`dns-follow-interface = true` 时，这次解析的查询也从该策略的网卡发出（FR-DNS-10）。
+真实 socket 加策略的 socket 选项：`interface` 与 `allow-other-interface`（指定网卡不可用时是否允许其它网卡）、`ip-version`（五种取值；`prefer-*` 模式先试偏好的地址族，3 秒后再试另一族；有 `underlying-proxy` 时无效）、`tfo`、`tos`。代理服务器主机名经 `rurge-dns` 解析；`dns-follow-interface = true` 时，这次解析的查询也从该策略的网卡发出（FR-DNS-10，M5：DNS 的 UDP 上游是每个上游一个共享的已连接 socket，按策略换网卡需要另一组 socket 与按网卡分区的缓存）。连接由顺序尝试改为竞速：`dual` 按地址族交错、每 250 ms 发起下一个尝试、先成功者胜。
 
-网卡绑定是平台相关的，经注入的 trait 完成：
+网卡绑定、TFO 与 TOS 是平台相关的，经注入的 trait 完成（定义在 `rurge_net::socket`，`rurge-dns` 以后也用它）：
 
 ```rust
-pub trait InterfaceBinder: Send + Sync {
-    fn bind(&self, socket: &socket2::Socket, interface: &str, family: AddrFamily) -> io::Result<()>;
+pub trait SocketHook: Send + Sync {
+    fn bind_interface(&self, socket: &socket2::Socket, interface: &str, family: Family) -> io::Result<()>;
+    fn enable_tfo(&self, socket: &socket2::Socket) -> io::Result<bool>;
+    fn set_tos(&self, socket: &socket2::Socket, family: Family, tos: u8) -> io::Result<()>;
 }
 ```
 
-实现放在 `rurge-platform::socket`（Linux `SO_BINDTODEVICE`、macOS `IP_BOUND_IF`、Windows 绑定该网卡的源地址），由 bin 注入；测试用记录调用的假实现。WireGuard 不支持 `interface`（与 Surge 一致）。
+平台函数放在 `rurge-platform::socket`（Linux `SO_BINDTODEVICE`、macOS `IP_BOUND_IF`、Windows 绑定该网卡的源地址）；`rurge-platform` 不依赖内部 crate，所以实现该 trait 的适配器放在 bin 并由它注入；测试用记录调用的假实现。WireGuard 不支持 `interface`（与 Surge 一致）。
 
-`Datagram` 是"到固定目标"的流，而 QUIC 类协议的 `port-hopping` 要更换对端端口：直连时由 `DirectDialer` 另行提供带同样 socket 选项的未连接 UDP socket（M7）；链式载体换不了端口，这正是 `underlying-proxy` 与 `port-hopping` 互斥的原因。
+`Datagram` 是"到固定目标"的流，而 QUIC 类协议的 `port-hopping` 要更换对端端口：直连时由 `DirectConnector` 另行提供带同样 socket 选项的未连接 UDP socket（M7）；链式载体换不了端口，这正是 `underlying-proxy` 与 `port-hopping` 互斥的原因。
 
-### 5.3 `ChainDialer`（`underlying-proxy`，FR-OUT-08）
+### 5.3 `ChainConnector`（`underlying-proxy`，FR-OUT-08）
 
-持有"底层策略的名字 + 注册表句柄"，**每次拨号时**才解析：底层是策略组时跟随该组的当前选择。它把本策略的服务器主机名原样交给底层出站（远程解析）。环在构建期按静态引用图检测（底层是组时，组到每个成员都算一条边）并作为配置错误报告；订阅可能在运行期引入新的环，拨号时另有深度上限兜底（超限的连接以 `Unavailable` 失败）。`underlying-proxy` 只对代理策略有效，与 `port-hopping` 互斥。M1 只有 TCP 链；UDP 载体的链式拨号（QUIC 类、WireGuard 经底层代理）在 M5 随 `connect_udp` 落地。
+持有"底层策略的名字 + 跨代稳定的注册表单元（`RegistryCell`）"，**每次拨号时**从当前一代注册表解析：底层是策略组时跟随该组的当前选择。它把本策略的服务器主机名原样交给底层出站（远程解析）。环在构建期按静态引用图检测（底层是组时，组到每个成员都算一条边）并作为配置错误报告；订阅可能在运行期引入新的环，M3 起拨号时另有深度上限兜底（超限的连接以 `Unavailable` 失败）。`underlying-proxy` 只对代理策略有效，与 `port-hopping` 互斥。M1 只有 TCP 链；UDP 载体的链式拨号（QUIC 类、WireGuard 经底层代理）在 M5 随 `connect_udp` 落地。
 
 ### 5.4 传输层
 
 传输层是函数而不是对象：`transport::{tls, shadow_tls, ws, obfs}` 的形状都是 `async fn(BoxedStream, &Opts) -> io::Result<BoxedStream>`。每个协议按自己固定的顺序叠层：
 
 ```
-dialer.connect_tcp(server) → shadow-tls? → tls? → ws? → obfs? → 协议握手
+connector.connect(server) → shadow-tls? → tls? → ws? → obfs? → 协议握手
 ```
 
 TLS 层实现清单 4.4 的六个参数；`alpn` 的默认值由协议给出。多路复用型协议（`h2-connect`、`trust-tunnel`、`anytls`、Snell reuse）在传输层之上维护连接池，池属于出站对象。
@@ -222,18 +229,19 @@ TLS 层实现清单 4.4 的六个参数；`alpn` 的默认值由协议给出。�
 
 带连接池、隧道或子进程的出站（`h2-connect`、`trust-tunnel`、`anytls`、Snell reuse、QUIC 族、SSH、WireGuard、`external`）自己持有后台任务，最后一个 `Arc` 释放时中止；WireGuard 加载时只做准备，按需握手。
 
-注册表重建（配置重载、订阅更新）时按**指纹**复用上一代的出站：指纹 = 规范化的 `PolicySpec` + 拨号器的指纹（socket 选项，或底层策略的名字）+ 被引用的 Keystore 条目 / WireGuard 节的内容。指纹未变就沿用同一个对象——与某条策略无关的重载不打断它的隧道与连接池，也不丢它的测试结果。已有会话持有旧对象的 `Arc`，随会话结束自然释放（AR-04）。
+从 M2 起（M1 的四种协议没有长生命周期状态），注册表重建（配置重载、订阅更新）时按**指纹**复用上一代的出站：指纹 = 规范化的 `PolicySpec` + 连接器的指纹（socket 选项，或底层策略的名字）+ 被引用的 Keystore 条目 / WireGuard 节的内容。指纹未变就沿用同一个对象——与某条策略无关的重载不打断它的隧道与连接池，也不丢它的测试结果。已有会话持有旧对象的 `Arc`，随会话结束自然释放（AR-04）。
 
 ### 5.6 `OutboundFactory` 与干构建
 
 ```rust
 // 定义在 rurge-policy，由 rurge-engine 实现
 pub trait OutboundFactory: Send + Sync {
-    fn build(&self, spec: &PolicySpec, dialer: Arc<dyn Dialer>, env: &BuildEnv) -> Result<OutboundRef, BuildError>;
+    fn direct_connector(&self, common: &CommonOpts) -> Arc<dyn Connector>;
+    fn build(&self, spec: &PolicySpec, connector: Arc<dyn Connector>) -> Result<OutboundRef, BuildError>;
 }
 ```
 
-`build` 同步、不碰网络（解码 Keystore 材料、校验密钥长度、准备 TLS 配置）。构建失败的策略照常出现在注册表与 API 里，但解析为 REJECT，请求记录 `error = "policy unavailable: <原因>"`，加载时 WARN 一次。`rurge check` 用同一工厂做一次干构建后丢弃结果，把 `BuildError` 作为带行号的错误输出。
+`build` 同步、不碰网络（解码 Keystore 材料、校验密钥长度、准备 TLS 配置）。**主配置里的策略构建失败是配置错误**：`rurge check`、`POST /v1/profiles/check` 与 `run` / `reload` 共用同一工厂做一次干构建，把 `BuildError` 作为带行号的错误（`E0022`）处理——`run` 拒绝启动，`reload` 保留旧一代。"策略存在但不可用 → 解析为 REJECT，`error = "policy unavailable: <原因>"`，WARN 一次"这条路只用于 M3 的订阅导入项：一条坏的导入策略不应拖垮整份配置。
 
 ### 5.7 错误模型
 
@@ -303,7 +311,7 @@ pub trait OutboundFactory: Send + Sync {
 
 ### 7.6 组级 `underlying-proxy`（FR-GRP-07）
 
-为全部成员（含导入的）派生名为 `Name (via Relay)` 的策略：spec 相同，拨号器换成指向中继的 `ChainDialer`。派生策略出现在 API 的列表里。
+为全部成员（含导入的）派生名为 `Name (via Relay)` 的策略：spec 相同，连接器换成指向中继的 `ChainConnector`。派生策略出现在 API 的列表里。
 
 ### 7.7 选择持久化与临时覆盖（FR-GRP-06）
 
@@ -314,8 +322,9 @@ pub trait OutboundFactory: Send + Sync {
 ### 8.1 TCP 拨号的变化
 
 - 走代理时目标域名**不在本地解析**，原样交给代理（远程解析）；IP 类规则为匹配而触发的本地解析不改变这一点。`use-local-host-item-for-proxy = true` 且 `[Host]` 对该域名有本地映射时，把映射到的 IP 交给代理（FR-DNS-07）。
-- 拨号流程：`choose_policy` → `registry.resolve(policy, &SelectCtx)` → `outbound.connect_tcp(target, &DialCtx)`；失败写入请求记录与 `smart` 的反馈。
-- 请求记录新增：终端出站的协议、拨号路径（链式代理时形如 `Exit ← Entry`）、`connect_ms` / `handshake_ms` / `first_byte_ms`、`test` 标记。
+- 拨号流程：`choose_policy` → `registry.resolve(policy, &SelectCtx)` → `outbound.connect_tcp(target, &ConnectOpts)`；失败写入请求记录，M3 起还反馈给 `smart`。
+- 请求记录新增（M3，测试与 `smart` 才需要）：终端出站的协议、拨号路径（链式代理时形如 `Exit ← Entry`）、`connect_ms` / `handshake_ms` / `first_byte_ms`、`test` 标记。
+- HTTP 入站的明文请求遇到 `always-use-connect = false` 的 `http` / `https` 上游时按绝对 URI 转发（M1）。
 
 ### 8.2 UDP 流水线（M5）
 
@@ -332,11 +341,11 @@ pub trait OutboundFactory: Send + Sync {
 
 - **DoH3 / DoQ 上游**（FR-DNS-04，M7）：`h3://` 与 `quic://`（RFC 9250）。QUIC 端点的构造、TLS 配置与自定义 UDP 载体放在 `rurge-net::quic`，`rurge-dns` 与 `rurge-proto-quic` 共用。引导豁免、`encrypted-dns-skip-cert-verification`、`encrypted-dns-follow-outbound-mode` 的语义与阶段 1 的 DoH / DoT 一致。
 - **`use-local-host-item-for-proxy`**（FR-DNS-07，M1）：见 8.1。
-- **`dns-follow-interface`**（FR-DNS-10，M1）：见 5.2。
+- **`dns-follow-interface`**（FR-DNS-10，M5）：见 5.2。
 
 ## 10. 控制面（`rurge-api`）
 
-六个端点经 `Control` trait 的扩展提供，`rurge-api` 仍不认识协议 crate：
+六个端点经 `Engine` 的方法提供（与现有的 `set_global_policy` 一致；`Control` 只管 reload / stop / 日志级别 / 系统代理这类守护进程级命令），`rurge-api` 仍不认识协议 crate：
 
 | 端点 | 里程碑 |
 | ---- | ------ |
@@ -429,7 +438,7 @@ Surge 手册没有定义这些端点的响应结构（PRD R5）：以收集到�
 | D9 | 用户态协议栈（PRD Q7 原定阶段 3 决定） | 提前到 M4：`smoltcp`，先作为 `rurge-proto-wireguard` 的内部模块、接口收窄；阶段 3 做 TUN 时按基准复核，合适再抽成公共 crate |
 | D10 | Windows 的网卡绑定 | 先用"绑定该网卡的源地址"，不需要 unsafe |
 | D11 | 组的环 | `E0009` 在 M3 降级为告警 + 运行期 REJECT（FR-GRP-05） |
-| Q1 | Windows 上是否改用 `IP_UNICAST_IF` | 需要 unsafe FFI，涉及"unsafe 只在 `rurge-platform` 的一个函数放宽"的政策；M1 细化设计时由项目所有者决定 |
+| Q1 | Windows 上是否改用 `IP_UNICAST_IF` | 已决（2026-09-19）：不改，继续用"绑定该网卡的源地址"，不引入 unsafe；差异登记在兼容性清单 |
 | Q2 | Shadow TLS v3 的实现路径 | M2 的 spike 给出（风险 A） |
 | Q3 | 六个 API 端点的 JSON 形状 | M1 / M3 细化设计时按真实样本定（PRD R5） |
 | Q4 | sing-box 的用户态 WireGuard 端点能否充当带保留字节的对端 | M4 细化设计时验证；不行则用 boringtun 写回环对端 |
