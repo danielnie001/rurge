@@ -48,6 +48,7 @@ pub use rule::{
 };
 pub use session::{DeviceInfo, ListenerKind, ProcessInfo, SessionInfo, Transport};
 pub use span::Span;
+pub use spec::{PolicySpec, ProtoSpec};
 pub use text::include::IncludeOptions;
 pub use text::{Entry, Origin, Profile, Section, SectionKind};
 pub use types::HostName;
