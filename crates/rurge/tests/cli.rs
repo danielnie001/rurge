@@ -131,6 +131,39 @@ fn check_json_and_platform() {
     );
 }
 
+const PROXIES: &str = "[General]\n[Proxy]\nH = http, proxy.test, 8080\nS = socks5-tls, proxy.test, 443\nOld = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Rule]\nFINAL,DIRECT\n";
+const BROKEN_P12: &str = "[General]\n[Proxy]\nUp = https, proxy.test, 443, client-cert=cert1\n[Keystore]\ncert1 = type=p12, base64=QUJD, password=hunter2\n[Rule]\nFINAL,DIRECT\n";
+
+#[test]
+fn check_knows_the_m1_protocols_and_runs_the_dry_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "proxies.conf", PROXIES))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    // only the protocol of a later milestone is still "not implemented"
+    // (W0007 is deduped per protocol kind and names the kind, not the
+    // policy, matching `W_GROUP_NOT_IMPLEMENTED`'s established wording)
+    assert_eq!(out.matches("W0007").count(), 1, "{out}");
+    assert!(out.contains("`ss`"), "{out}");
+
+    Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "broken.conf", BROKEN_P12))
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("E0022"))
+        .stdout(predicate::str::contains("broken.conf:3"))
+        .stdout(predicate::str::contains("hunter2").not());
+}
+
 mod rule_match {
     use assert_cmd::Command;
     use predicates::prelude::*;
@@ -1051,6 +1084,83 @@ mod run {
             .status()
             .unwrap();
         assert_eq!(status.code(), Some(2));
+    }
+
+    #[test]
+    fn run_refuses_a_policy_that_cannot_be_built() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.conf"), super::BROKEN_P12).unwrap();
+        let output = rurge_run(&dir.path().join("t.conf"), &dir.path().join("data"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(text.contains("E0022"), "{text}");
+    }
+
+    /// M1 design 6.4: a reload whose profile holds a policy that cannot be
+    /// built keeps the running generation.
+    #[test]
+    fn a_reload_with_an_unbuildable_policy_keeps_the_current_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let daemon = spawn_daemon(&conf, &dir.path().join("data"));
+        let port = api_port(&daemon);
+        let good = std::fs::read_to_string(&conf).unwrap();
+        let broken = good.replace(
+            "[Proxy]\n",
+            "[Proxy]\nUp = https, proxy.test, 443, client-cert=cert1\n[Keystore]\ncert1 = type=p12, base64=QUJD, password=hunter2\n",
+        );
+        assert_ne!(good, broken);
+        std::fs::write(&conf, broken).unwrap();
+        let (status, body) = api_call(port, "POST", "/v1/profiles/reload", "k", Some("{}"));
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"ok\":false"), "{body}");
+        // the daemon is still up and takes the repaired profile
+        std::fs::write(&conf, good).unwrap();
+        let (_, body) = api_call(port, "POST", "/v1/profiles/reload", "k", Some("{}"));
+        assert!(body.contains("\"ok\":true"), "{body}");
+    }
+
+    /// The whole way: `rurge run` → HTTP listener → a real `http` policy in
+    /// forward mode → a scripted loopback upstream.
+    #[tokio::test]
+    async fn run_routes_through_an_http_upstream() {
+        use rurge_proto::testing::{FakeHttpProxy, HttpProxyScript};
+        let upstream = FakeHttpProxy::spawn(HttpProxyScript::default()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("t.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nloglevel = warning\n\
+[Proxy]\nUp = http, 127.0.0.1, {}\n[Rule]\nDOMAIN,via.test,Up\nFINAL,DIRECT\n",
+                upstream.addr().port()
+            ),
+        )
+        .unwrap();
+        let daemon = tokio::task::spawn_blocking({
+            let (conf, data) = (conf.clone(), dir.path().join("data"));
+            move || spawn_daemon(&conf, &data)
+        })
+        .await
+        .unwrap();
+        let port = daemon.http;
+        let answer = tokio::task::spawn_blocking(move || http_get(port, "http://via.test/hello"))
+            .await
+            .unwrap();
+        assert!(
+            answer.starts_with("HTTP/1.1 200") && answer.ends_with("forwarded"),
+            "{answer}"
+        );
+        assert_eq!(
+            upstream.heads()[0].request_line,
+            "GET http://via.test/hello HTTP/1.1"
+        );
     }
 
     #[test]

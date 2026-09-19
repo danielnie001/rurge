@@ -61,7 +61,11 @@ impl EngineFactory {
             resolver: Arc::new(NeverResolve),
             hook: Arc::new(NoopSocketHook),
             keystore: cfg.keystore.clone(),
-            roots: Arc::new(RootCertStore::empty()),
+            // Real roots, not empty: loading them is local and free (no
+            // network, no dial), and an empty store makes
+            // `WebPkiServerVerifier::builder` fail to set up standard
+            // verification even for a policy that would build fine for real.
+            roots: rurge_net::tls::root_store(),
             v6_first: cfg.general.ipv6,
             dry: true,
         }

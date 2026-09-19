@@ -1,5 +1,5 @@
-//! What this build of rurge actually implements. Milestone 1: parsing only,
-//! so only the built-in alias policies and `select` groups are "implemented".
+//! What this build of rurge actually implements: the built-in alias
+//! policies, the HTTP / SOCKS5 proxy family (phase 2 M1) and `select` groups.
 
 use rurge_config::config::Capabilities;
 use rurge_config::policy::{GroupKind, PolicyKind};
@@ -26,6 +26,10 @@ pub fn current() -> Capabilities {
             PolicyKind::RejectDrop,
             PolicyKind::RejectNoDrop,
             PolicyKind::RejectTinyGif,
+            PolicyKind::Http,
+            PolicyKind::Https,
+            PolicyKind::Socks5,
+            PolicyKind::Socks5Tls,
         ]),
         group_kinds: HashSet::from([GroupKind::Select]),
         rule_types: Capabilities::ALL_RULE_TYPES

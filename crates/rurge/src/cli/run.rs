@@ -7,7 +7,7 @@ use crate::capabilities;
 use anyhow::Context;
 use clap::Args;
 use rurge_api::ApiContext;
-use rurge_config::config::{LoadOptions, Platform, load};
+use rurge_config::config::{LoadOptions, Platform};
 use rurge_config::general::ControllerAccess;
 use rurge_config::general::LogLevel;
 use rurge_config::rule::PolicyRef;
@@ -307,10 +307,6 @@ struct Daemon<'a> {
     rt: &'a super::runtime::Runtime,
     run_opts: &'a RunOptions,
     outbound_mode: &'a OutboundMode,
-    /// Not read by this task's reload path (selections now come from
-    /// `engine.shared()`); kept for the state features Task 8 adds here.
-    #[allow(dead_code)]
-    store: &'a StateStore,
     http_api: &'a Option<ControllerAccess>,
 }
 
@@ -323,7 +319,7 @@ fn count(diags: &rurge_config::Diagnostics, severity: rurge_config::Severity) ->
 /// daemon down.
 async fn reload(d: &Daemon<'_>, listeners: &mut Vec<(ListenerSpec, Running)>) -> ReloadReport {
     use rurge_config::Severity;
-    let loaded = match load(d.config, d.load_opts) {
+    let loaded = match rurge_engine::load_checked(d.config, d.load_opts) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("error: reload failed, keeping current config: {e}");
@@ -610,7 +606,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         platform,
         capabilities: capabilities::current(),
     };
-    let loaded = load(&args.config, &opts)?;
+    let loaded = rurge_engine::load_checked(&args.config, &opts)?;
     if loaded.diagnostics.has_errors() {
         print_diagnostics(&loaded.diagnostics.sorted());
         return Ok(ExitCode::from(2));
@@ -755,7 +751,6 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             rt: &rt,
             run_opts: &run_opts,
             outbound_mode: &outbound_mode,
-            store: &store,
             http_api: &http_api,
         };
 

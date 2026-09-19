@@ -89,8 +89,7 @@ impl Runtime {
             // follow the outbound mode; `check` / `rule match` / `dns lookup`
             // build the stack without an engine, so they stay direct.
             dns_connector: None,
-            // The `rurge-platform` adapter lands in a later milestone.
-            socket_hook: Arc::new(rurge_net::socket::NoopSocketHook),
+            socket_hook: Arc::new(PlatformSockets),
         }
     }
 }
@@ -134,5 +133,56 @@ impl SystemDns for PlatformSystemDns {
 
     fn has_ipv6(&self) -> bool {
         rurge_platform::dns::has_ipv6()
+    }
+}
+
+/// `rurge-platform::socket` behind the `SocketHook` trait (AR-02: platform
+/// code stays in rurge-platform; rurge-net only sees the trait).
+pub struct PlatformSockets;
+
+fn platform_family(family: rurge_net::socket::Family) -> rurge_platform::socket::Family {
+    match family {
+        rurge_net::socket::Family::V4 => rurge_platform::socket::Family::V4,
+        rurge_net::socket::Family::V6 => rurge_platform::socket::Family::V6,
+    }
+}
+
+impl rurge_net::socket::SocketHook for PlatformSockets {
+    fn bind_interface(
+        &self,
+        socket: &socket2::Socket,
+        interface: &str,
+        family: rurge_net::socket::Family,
+    ) -> std::io::Result<()> {
+        rurge_platform::socket::bind_interface(socket, interface, platform_family(family))
+    }
+
+    fn set_tos(
+        &self,
+        socket: &socket2::Socket,
+        family: rurge_net::socket::Family,
+        tos: u8,
+    ) -> std::io::Result<()> {
+        rurge_platform::socket::set_tos(socket, platform_family(family), tos)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rurge_net::socket::{Family, SocketHook};
+
+    /// Socket-level only: nothing about this machine's network is changed.
+    #[test]
+    fn platform_sockets_delegates_to_rurge_platform() {
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        let hook = PlatformSockets;
+        assert!(
+            hook.bind_interface(&socket, "rurge-no-such-if0", Family::V4)
+                .is_err()
+        );
+        hook.set_tos(&socket, Family::V4, 0x28).unwrap();
+        assert_eq!(socket.tos_v4().unwrap(), 0x28);
     }
 }

@@ -34,10 +34,12 @@ hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
+socket2.workspace = true
 
 [dev-dependencies]
 rurge-dns = { workspace = true, features = ["testing"] }
 rurge-net = { workspace = true, features = ["testing"] }
+rurge-proto = { workspace = true, features = ["testing"] }
 assert_cmd.workspace = true
 predicates.workspace = true
 tempfile.workspace = true

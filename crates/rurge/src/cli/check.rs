@@ -1,6 +1,6 @@
 use crate::capabilities;
 use clap::Args;
-use rurge_config::config::{LoadOptions, Platform, load};
+use rurge_config::config::{LoadOptions, Platform};
 use rurge_config::diagnostic::Severity;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -50,7 +50,7 @@ pub fn run(args: CheckArgs) -> anyhow::Result<ExitCode> {
         platform,
         capabilities: capabilities::current(),
     };
-    let loaded = load(&args.config, &opts)?;
+    let loaded = rurge_engine::load_checked(&args.config, &opts)?;
     let diags = loaded.diagnostics.sorted();
     let count = |s: Severity| diags.iter().filter(|d| d.severity == s).count();
     let (errors, warnings, infos) = (

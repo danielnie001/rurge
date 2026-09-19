@@ -4,6 +4,53 @@
 use socket2::Socket;
 use std::io;
 use std::net::IpAddr;
+#[cfg(any(target_os = "macos", windows, test))]
+use std::sync::{Arc, Mutex};
+#[cfg(any(target_os = "macos", windows, test))]
+use std::time::{Duration, Instant};
+
+/// A value worth keeping for a short while: the interface table costs a
+/// system call in the millisecond range, and `bind_interface` runs once per
+/// connection attempt.
+#[cfg(any(target_os = "macos", windows, test))]
+struct Cached<T> {
+    ttl: Duration,
+    slot: Mutex<Option<(Instant, Arc<T>)>>,
+}
+
+#[cfg(any(target_os = "macos", windows, test))]
+impl<T> Cached<T> {
+    const fn new(ttl: Duration) -> Cached<T> {
+        Cached {
+            ttl,
+            slot: Mutex::new(None),
+        }
+    }
+
+    /// The cached value while it is fresh, else whatever `load` returns — a
+    /// failure is returned and not remembered.
+    fn get(&self, load: impl FnOnce() -> io::Result<T>) -> io::Result<Arc<T>> {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, value)) = slot.as_ref()
+            && at.elapsed() < self.ttl
+        {
+            return Ok(value.clone());
+        }
+        let value = Arc::new(load()?);
+        *slot = Some((Instant::now(), value.clone()));
+        Ok(value)
+    }
+}
+
+/// An interface that appears or changes its address is seen within this long.
+#[cfg(any(target_os = "macos", windows))]
+const INTERFACE_TABLE_TTL: Duration = Duration::from_secs(5);
+
+#[cfg(any(target_os = "macos", windows))]
+fn interfaces() -> io::Result<Arc<Vec<if_addrs::Interface>>> {
+    static TABLE: Cached<Vec<if_addrs::Interface>> = Cached::new(INTERFACE_TABLE_TTL);
+    TABLE.get(if_addrs::get_if_addrs)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Family {
@@ -44,8 +91,8 @@ pub fn bind_interface(socket: &Socket, interface: &str, _family: Family) -> io::
 #[cfg(target_os = "macos")]
 pub fn bind_interface(socket: &Socket, interface: &str, family: Family) -> io::Result<()> {
     // `Interface::index` spares us the unsafe `if_nametoindex`
-    let index = if_addrs::get_if_addrs()?
-        .into_iter()
+    let index = interfaces()?
+        .iter()
         .find(|i| i.name == interface)
         .and_then(|i| i.index)
         .and_then(std::num::NonZeroU32::new)
@@ -64,8 +111,8 @@ pub fn bind_interface(socket: &Socket, interface: &str, family: Family) -> io::R
 #[cfg(windows)]
 pub fn bind_interface(socket: &Socket, interface: &str, family: Family) -> io::Result<()> {
     // `Interface::name` is the adapter's friendly name on Windows ("Wi-Fi")
-    let addrs: Vec<(String, IpAddr)> = if_addrs::get_if_addrs()?
-        .into_iter()
+    let addrs: Vec<(String, IpAddr)> = interfaces()?
+        .iter()
         .map(|i| (i.name.clone(), i.ip()))
         .collect();
     let source = pick_source(&addrs, interface, family).ok_or_else(|| {
@@ -164,5 +211,28 @@ mod tests {
             socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
         set_tos(&socket, Family::V4, 0x28).unwrap();
         assert_eq!(socket.tos_v4().unwrap(), 0x28);
+    }
+
+    #[test]
+    fn the_interface_table_is_cached_for_a_while() {
+        use std::cell::Cell;
+        let loads = Cell::new(0u32);
+        let load = || -> io::Result<u32> {
+            loads.set(loads.get() + 1);
+            Ok(loads.get())
+        };
+        let cache = Cached::new(std::time::Duration::from_secs(60));
+        assert_eq!(*cache.get(load).unwrap(), 1);
+        assert_eq!(*cache.get(load).unwrap(), 1, "served from the cache");
+        assert_eq!(loads.get(), 1);
+
+        let never = Cached::new(std::time::Duration::ZERO);
+        assert_eq!(*never.get(load).unwrap(), 2);
+        assert_eq!(*never.get(load).unwrap(), 3, "a zero TTL always reloads");
+
+        // a failure is reported, not remembered
+        let failing: Cached<u32> = Cached::new(std::time::Duration::from_secs(60));
+        assert!(failing.get(|| Err(io::Error::other("no table"))).is_err());
+        assert_eq!(*failing.get(|| Ok(7)).unwrap(), 7);
     }
 }
