@@ -153,6 +153,16 @@ pub mod codes {
     pub const E_NESTING_TOO_DEEP: &str = "E0015";
     pub const E_INCLUDE_CYCLE: &str = "E0016";
     pub const E_INVALID_DEFINITION: &str = "E0017";
+    /// A known policy parameter has a value that cannot be used.
+    pub const E_INVALID_POLICY_PARAM: &str = "E0018";
+    /// An `underlying-proxy` chain that leads back to the policy itself.
+    pub const E_UNDERLYING_PROXY_CYCLE: &str = "E0019";
+    /// A `[Keystore]` reference that names a missing item or one of the wrong type.
+    pub const E_KEYSTORE_REF: &str = "E0020";
+    /// A `[Keystore]` item whose `base64` does not decode.
+    pub const E_KEYSTORE_BASE64: &str = "E0021";
+    /// A policy that cannot be built (reported by the engine's dry build, M1b).
+    pub const E_POLICY_BUILD: &str = "E0022";
     pub const W_UNKNOWN_KEY: &str = "W0001";
     pub const W_UNKNOWN_SECTION: &str = "W0002";
     pub const W_UNKNOWN_RULE_PARAM: &str = "W0003";
@@ -187,6 +197,10 @@ pub mod codes {
     pub const W_DNS_UPSTREAM_UNSUPPORTED: &str = "W0026";
     /// A `[Host]` entry with a `script:` value was skipped (scripts arrive in phase 5).
     pub const W_HOST_SCRIPT_SKIPPED: &str = "W0027";
+    /// A parameter that does not apply to this policy type; ignored.
+    pub const W_PARAM_NOT_APPLICABLE: &str = "W0028";
+    /// A parameter that is parsed but has no effect in this version.
+    pub const W_PARAM_NOT_EFFECTIVE: &str = "W0029";
     pub const I_LEGACY_MIGRATED: &str = "I0001";
     pub const I_LINE_DISABLED: &str = "I0002";
     /// GeoIP / ASN database file not present yet.

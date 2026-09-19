@@ -20,6 +20,7 @@ pub mod requirement;
 pub mod rule;
 pub mod session;
 pub mod span;
+pub mod spec;
 pub mod text;
 pub mod types;
 pub mod value;
