@@ -4940,6 +4940,7 @@ git commit -m "docs: 阶段 2 / M1b 装配与控制面：兼容性清单、API �
 | 终审（G） | 注册表测试加 `Mid` / `Deep` 两条策略与 `a_three_hop_chain_hands_each_server_to_the_hop_below`；补回重写时丢掉的三条旧断言（`Pick` / `Auto` 落到不受支持成员时的完整策略链、选择 `DIRECT` 之后的 `outbound.name()`、`Emptyish` 没有 note） | 终审：`underlying-proxy` 链此前只有两跳的覆盖，三跳（中间那跳自己也有 `underlying-proxy`）没有用例 | ae6bbf5 |
 | 终审（H） | 四处随手项：SOCKS5 拒绝主机名时一条只记长度的 debug 日志；入站丢弃上游头的 debug 行记出 header 名（Debug 转义，不记值）；`dry_build` 的文档注释订正；隧道用例里 origin 命中数的注释说清它证明了什么（与什么没证明） | 终审的 Minor，一并处理 | ae6bbf5 |
 | 终审（I） | 互操作与 CI 防抖：TLS 反例接受 `OutboundError::Timeout`；`wait_ready` 先查子进程是否已退出再连接；转发用例要求超时结果（`expect`）；README 订正"本地单元测试覆盖定位二进制"的说法；CI 的 `curl` 加 `--retry 3 --retry-all-errors` | 终审：都便宜，且影响 CI 的首次运行。**本机未装 sing-box，这些改动在本机跑不到**，只经 `cargo check` / `cargo clippy` 校验能编译、能过 lint | ae6bbf5 |
+| 终审（复审残留） | `socket_opener` 改为对 `TerminalKind` 逐项匹配：Proxy 继续往下走，**Direct 返回当前这一跳**，Reject 返回 `None`；加两个回归用例 | 终审简报给 A 项写的规则是"下一跳的终端不是 Proxy → None"，复审发现底下一跳解析到 DIRECT（`direct` 别名策略，或当前选中 DIRECT 的组）时 DIRECT 要在本机解析的正是上面那一跳的服务器名，同样成环 | 9a5bba2 |
 
 ## 延后事项
 
@@ -4975,3 +4976,6 @@ git commit -m "docs: 阶段 2 / M1b 装配与控制面：兼容性清单、API �
 | 没有"链式会话进行中重载"与"选择表里的成员在新一代消失"的用例 | M2 |
 | `interface` / `tos` 与 `underlying-proxy` 同时出现时静默失效（已登记进兼容性清单）；是否改成 `W0028` | M2 设计时决定 |
 | `SessionInfo::url` 作为"明文 HTTP 转发"信号的契约（已写进文档注释） | 阶段 4（MITM）动它之前重新审视 |
+| 防环回退对"服务器名能被 `[Host]` 直接回答"的代理偏保守（`use-local-host-item-for-proxy` 打开且该名字在 `[Host]` 里有条目时并不成环，DNS 会话仍被旁路成直连） | M2 设计时决定（是否在判断前先问 `Resolver::host_lookup`） |
+| 链底下的 REJECT 到不了 `dial_internal` 的 reject 旁路（`ChainConnector` 把它包成 `io::Error`，DNS 会话记为失败而不是直连保底） | M3（策略组） |
+| 链深超过 `MAX_DEPTH` 时 `socket_opener` 给 `None`（不旁路）而注册表给 REJECT，两处说法不一致 | M3，与 `ChainConnector` 的运行期深度守卫一并处理 |

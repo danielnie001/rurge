@@ -131,7 +131,7 @@
 | `debug-memory-usage` | 布尔；默认 false | 全部 | 🔁 | 1 | |
 | `dns-server` | IP[:port] 列表或 `system`；含加密 URL 时自动迁移到 `encrypted-dns-server` | 全部 | ✅ | 1 | |
 | `encrypted-dns-server` | URL 列表：`https://` `h3://` `quic://` `tls://` `tcp://` | 全部 | 🟡 | 1 / 2 | `https` `tls` `tcp` 阶段 1；`h3` `quic` 依赖 QUIC 栈，阶段 2；阶段 1 对 `h3` / `quic` 条目告警 W0026 并忽略 |
-| `encrypted-dns-follow-outbound-mode` | 布尔；默认 false | 全部 | 🟡 | 1 | 含"代理服务器为域名时回退 DIRECT 并告警"的防环逻辑；M3b：TCP/DoT/DoH 上游连接走流水线（成 Internal 会话，`PROTOCOL,DOH/DOT/DNS` 可匹配）；上游主机名由 Bootstrap 解析，流水线只见 IP 目标，故域名规则不匹配上游主机名；协议标签按端口启发（853→DoT，443→DoH，其余→DNS）；被规则 REJECT 时告警并直连以保 DNS；UDP 上游不经连接器；这类内部会话的 `SRC-IP` 恒为 `127.0.0.1`、`IN-PORT` 恒为 `0`，`SRC-IP,127.0.0.1/32` / `IN-PORT,0` 规则可能意外匹配到它们，且它们的 `kill` 是空操作（DNS 路径不监听取消令牌）；防环回退自阶段 2 / M1b 起实现：DNS 会话命中的代理（沿 underlying-proxy 找到真正打开 socket 的那一跳）若以域名配置，则告警并直连；以 IP 配置的代理照常承载 DNS 会话 |
+| `encrypted-dns-follow-outbound-mode` | 布尔；默认 false | 全部 | 🟡 | 1 | 含"代理服务器为域名时回退 DIRECT 并告警"的防环逻辑；M3b：TCP/DoT/DoH 上游连接走流水线（成 Internal 会话，`PROTOCOL,DOH/DOT/DNS` 可匹配）；上游主机名由 Bootstrap 解析，流水线只见 IP 目标，故域名规则不匹配上游主机名；协议标签按端口启发（853→DoT，443→DoH，其余→DNS）；被规则 REJECT 时告警并直连以保 DNS；UDP 上游不经连接器；这类内部会话的 `SRC-IP` 恒为 `127.0.0.1`、`IN-PORT` 恒为 `0`，`SRC-IP,127.0.0.1/32` / `IN-PORT,0` 规则可能意外匹配到它们，且它们的 `kill` 是空操作（DNS 路径不监听取消令牌）；防环回退自阶段 2 / M1b 起实现：DNS 会话命中的代理（沿 underlying-proxy 找到真正打开 socket 的那一跳；底下是 DIRECT——direct 别名策略或当前选中 DIRECT 的组——时取它上面那一跳，因为 DIRECT 要在本机解析的正是那一跳的服务器名）若以域名配置，则告警并直连；以 IP 配置的代理照常承载 DNS 会话 |
 | `encrypted-dns-skip-cert-verification` | 布尔；默认 false | 全部 | ✅ | 1 | |
 | `allow-dns-svcb` | 布尔；默认 false | 全部 | ✅ | 3 | fake-IP 应答器拒绝 type 65 查询 |
 | `use-local-host-item-for-proxy` | 布尔；默认 false | 全部 | ✅ | 2 | M1 已实现（FR-DNS-07）：只对 `[Host]` 里指向 IP 的条目生效，取第一个 IP；命中时明文 HTTP 不走绝对 URI 转发而走 CONNECT；`[Host]` 给同一个名字列了多个地址时取第一个，不看策略的 `ip-version`（未与真实 Surge 核对） |
@@ -494,7 +494,7 @@
 | 引导豁免：配置加密 DNS 后，传统 DNS 只用于连通性测试与解析加密 DNS URL 中的主机名（含 `[Host]` `server:` 项中的 URL） | | ✅ | 1 | |
 | 特殊值 `off`（主要用于 `[SSID Setting]` 覆盖） | | ✅ | 1 / 3 | |
 | `encrypted-dns-skip-cert-verification` | 默认 false | ✅ | 1 | |
-| `encrypted-dns-follow-outbound-mode`：DNS 连接走规则；`PROTOCOL,DOH/DOH3/DOQ/DOT/DNS` 可匹配；命中的代理若以域名配置则告警并回退 DIRECT | 默认 false | 🟡 | 1 | M3b：TCP/DoT/DoH 上游走流水线（Internal 会话，`PROTOCOL` 可匹配）；上游主机名先由 Bootstrap 解析，流水线只见 IP 目标，域名规则不匹配上游主机名；协议标签按端口启发（853→DoT，443→DoH，其余→DNS）；被 REJECT 时告警并直连保底；UDP 上游不经连接器；这类会话的 `SRC-IP`/`IN-PORT` 为占位值（`127.0.0.1:0`/`0`），`kill` 对其无效；防环回退自阶段 2 / M1b 起实现：DNS 会话命中的代理（沿 underlying-proxy 找到真正打开 socket 的那一跳）若以域名配置，则告警并直连；以 IP 配置的代理照常承载 DNS 会话 |
+| `encrypted-dns-follow-outbound-mode`：DNS 连接走规则；`PROTOCOL,DOH/DOH3/DOQ/DOT/DNS` 可匹配；命中的代理若以域名配置则告警并回退 DIRECT | 默认 false | 🟡 | 1 | M3b：TCP/DoT/DoH 上游走流水线（Internal 会话，`PROTOCOL` 可匹配）；上游主机名先由 Bootstrap 解析，流水线只见 IP 目标，域名规则不匹配上游主机名；协议标签按端口启发（853→DoT，443→DoH，其余→DNS）；被 REJECT 时告警并直连保底；UDP 上游不经连接器；这类会话的 `SRC-IP`/`IN-PORT` 为占位值（`127.0.0.1:0`/`0`），`kill` 对其无效；防环回退自阶段 2 / M1b 起实现：DNS 会话命中的代理（沿 underlying-proxy 找到真正打开 socket 的那一跳；底下是 DIRECT——direct 别名策略或当前选中 DIRECT 的组——时取它上面那一跳，因为 DIRECT 要在本机解析的正是那一跳的服务器名）若以域名配置，则告警并直连；以 IP 配置的代理照常承载 DNS 会话 |
 | `[Host]` 中 `server:<加密 URL>` 按域名指定加密 DNS | iOS 5.21 / Mac 6.8+ | ✅ | 1 | |
 
 ### 6.3 `[Host]` 本地 DNS 映射
