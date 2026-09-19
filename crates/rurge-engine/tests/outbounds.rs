@@ -357,11 +357,18 @@ async fn a_refusing_upstream_is_a_502_that_quotes_the_proxy() {
     })
     .await;
     let mut s = TcpStream::connect(h.http()).await.unwrap();
-    s.write_all(b"CONNECT target.test:443 HTTP/1.1\r\nHost: target.test:443\r\n\r\n")
-        .await
-        .unwrap();
+    s.write_all(
+        b"CONNECT target.test:443 HTTP/1.1\r\nHost: target.test:443\r\nConnection: close\r\n\r\n",
+    )
+    .await
+    .unwrap();
     let mut buf = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf)).await;
+    // rurge closes the connection after the 502 (the request asked for
+    // `Connection: close`), so this is a real bound, not a fixed sleep: a
+    // regression back to keep-alive here must fail the test, not just run slow.
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf))
+        .await
+        .expect("rurge closes the connection after the 502");
     let response = String::from_utf8_lossy(&buf).into_owned();
     assert!(response.starts_with("HTTP/1.1 502"), "{response}");
     let log = h.engine.request_log();
@@ -514,11 +521,20 @@ async fn a_broken_hop_is_named_in_the_error() {
     })
     .await;
     let mut s = TcpStream::connect(h.http()).await.unwrap();
-    s.write_all(b"CONNECT target.test:443 HTTP/1.1\r\nHost: target.test:443\r\n\r\n")
-        .await
-        .unwrap();
+    s.write_all(
+        b"CONNECT target.test:443 HTTP/1.1\r\nHost: target.test:443\r\nConnection: close\r\n\r\n",
+    )
+    .await
+    .unwrap();
     let mut buf = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(15), s.read_to_end(&mut buf)).await;
+    // rurge closes the connection after the 502 (the request asked for
+    // `Connection: close`), so this is a real bound, not a fixed sleep: a
+    // regression back to keep-alive here must fail the test, not just run slow.
+    let _ = tokio::time::timeout(Duration::from_secs(15), s.read_to_end(&mut buf))
+        .await
+        .expect("rurge closes the connection after the 502");
+    let response = String::from_utf8_lossy(&buf).into_owned();
+    assert!(response.starts_with("HTTP/1.1 502"), "{response}");
     let log = h.engine.request_log();
     wait_until("the failed session", || !log.recent(10).is_empty()).await;
     let error = log.recent(10)[0].error.clone().unwrap_or_default();
