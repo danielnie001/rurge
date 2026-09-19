@@ -12,9 +12,11 @@ use crate::policy::{
 use crate::requirement::{self, Environment};
 use crate::rule::{ParseCtx, PolicyRef, Rule, RuleKind, SubRule, parse_rule, parse_subrule};
 use crate::span::Span;
+use crate::spec::{NameKind, PolicySpec, SpecEnv, to_spec};
 use crate::text::include::{self, IncludeOptions};
 use crate::text::{Origin, Profile, SectionKind, parse_str};
 use crate::value::split_definition;
+use base64::Engine as _;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -172,6 +174,9 @@ pub struct SourceInfo {
 pub struct Config {
     pub general: General,
     pub policies: Vec<ProxyPolicy>,
+    /// Typed parameters of every policy whose type has a spec (same order as
+    /// `policies`; policies with errors are absent).
+    pub specs: Vec<PolicySpec>,
     pub groups: Vec<PolicyGroup>,
     pub rules: Vec<Rule>,
     pub rulesets: Vec<InlineRuleset>,
@@ -213,6 +218,10 @@ impl Config {
             return Some(PolicyTarget::Group(g));
         }
         Builtin::parse(name).map(PolicyTarget::Builtin)
+    }
+
+    pub fn spec(&self, name: &str) -> Option<&PolicySpec> {
+        self.specs.iter().find(|s| s.name == name)
     }
 
     pub fn summary(&self) -> ConfigSummary {
@@ -564,6 +573,15 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
                         .at(span.clone()),
                     );
                 }
+                if !is_base64(&k.base64) {
+                    diags.push(
+                        Diagnostic::error(
+                            codes::E_KEYSTORE_BASE64,
+                            format!("keystore item `{}`: `base64` is not valid Base64", k.name),
+                        )
+                        .at(span.clone()),
+                    );
+                }
                 keystore.push(k);
             }
             Err(err) => diags.push(Diagnostic::from_parse(err, span.clone())),
@@ -619,6 +637,7 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
     let mut config = Config {
         general,
         policies,
+        specs: Vec::new(),
         groups,
         rules,
         rulesets,
@@ -633,6 +652,66 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
     Loaded {
         config,
         diagnostics: diags,
+    }
+}
+
+/// Group members, subnet conditions and `default` all reference policies.
+fn group_refs(g: &PolicyGroup) -> Vec<String> {
+    g.members
+        .iter()
+        .cloned()
+        .chain(g.conditions.iter().map(|(_, p)| p.clone()))
+        .chain(g.params.get("default").map(str::to_string))
+        .collect()
+}
+
+fn is_base64(text: &str) -> bool {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+    STANDARD.decode(text).is_ok() || STANDARD_NO_PAD.decode(text).is_ok()
+}
+
+/// `E0019`: follows `underlying-proxy` edges and group membership from each
+/// chained policy; reaching the policy again is a cycle.
+fn underlying_cycles(config: &Config, specs: &[PolicySpec], diags: &mut Diagnostics) {
+    let mut edges: HashMap<&str, Vec<String>> = HashMap::new();
+    for s in specs {
+        if let Some(u) = &s.common.underlying_proxy {
+            edges.insert(s.name.as_str(), vec![u.clone()]);
+        }
+    }
+    for g in &config.groups {
+        edges.insert(g.name.as_str(), group_refs(g));
+    }
+    for s in specs {
+        let Some(first) = &s.common.underlying_proxy else {
+            continue;
+        };
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack = vec![first.clone()];
+        let mut cyclic = false;
+        while let Some(name) = stack.pop() {
+            if name == s.name {
+                cyclic = true;
+                break;
+            }
+            if seen.insert(name.clone())
+                && let Some(next) = edges.get(name.as_str())
+            {
+                stack.extend(next.iter().cloned());
+            }
+        }
+        if cyclic {
+            diags.push(
+                Diagnostic::error(
+                    codes::E_UNDERLYING_PROXY_CYCLE,
+                    format!(
+                        "policy `{}`: `underlying-proxy` leads back to the policy itself (via `{first}`)",
+                        s.name
+                    ),
+                )
+                .at(s.span.clone()),
+            );
+        }
     }
 }
 
@@ -674,15 +753,6 @@ fn validate(config: &mut Config, opts: &LoadOptions, diags: &mut Diagnostics) {
         }
     }
 
-    // Group members, subnet conditions and `default` all reference policies.
-    fn group_refs(g: &PolicyGroup) -> Vec<String> {
-        g.members
-            .iter()
-            .cloned()
-            .chain(g.conditions.iter().map(|(_, p)| p.clone()))
-            .chain(g.params.get("default").map(str::to_string))
-            .collect()
-    }
     for g in &config.groups {
         for m in group_refs(g) {
             if !exists(&m, config) {
@@ -778,6 +848,57 @@ fn validate(config: &mut Config, opts: &LoadOptions, diags: &mut Diagnostics) {
             }
         }
     }
+
+    // Typed policy parameters (phase 2 M1 design §4).
+    let specs = {
+        let cfg: &Config = config;
+        let lookup = |name: &str| -> Option<NameKind> {
+            Some(match cfg.resolve_policy(name)? {
+                PolicyTarget::Builtin(b) => NameKind::Builtin(b),
+                PolicyTarget::Proxy(p) => NameKind::Policy(p.kind),
+                PolicyTarget::Group(_) => NameKind::Group,
+            })
+        };
+        let env = SpecEnv {
+            keystore: &cfg.keystore,
+            lookup: &lookup,
+        };
+        let mut specs = Vec::new();
+        let mut inert_seen: HashSet<&'static str> = HashSet::new();
+        let mut ios_seen: HashSet<&'static str> = HashSet::new();
+        for p in &cfg.policies {
+            let outcome = to_spec(p, &env);
+            for d in outcome.diagnostics {
+                diags.push(d);
+            }
+            for name in outcome.inert {
+                if inert_seen.insert(name) {
+                    diags.push(
+                        Diagnostic::warning(
+                            codes::W_PARAM_NOT_EFFECTIVE,
+                            format!("policy parameter `{name}` is parsed but has no effect in this version"),
+                        )
+                        .at(p.span.clone()),
+                    );
+                }
+            }
+            for name in outcome.ios_only {
+                if ios_seen.insert(name) {
+                    diags.push(
+                        Diagnostic::warning(
+                            codes::W_PLATFORM_IGNORED,
+                            format!("policy parameter `{name}` is iOS-only; ignored"),
+                        )
+                        .at(p.span.clone()),
+                    );
+                }
+            }
+            specs.extend(outcome.spec);
+        }
+        underlying_cycles(cfg, &specs, diags);
+        specs
+    };
+    config.specs = specs;
 
     // Capabilities.
     let mut seen_kinds: HashSet<PolicyKind> = HashSet::new();
