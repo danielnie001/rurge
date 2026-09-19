@@ -4,4 +4,5 @@ pub mod command;
 pub mod dirs;
 pub mod dns;
 pub mod service;
+pub mod socket;
 pub mod sysproxy;

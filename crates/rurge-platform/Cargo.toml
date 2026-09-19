@@ -13,6 +13,7 @@ resolv-conf.workspace = true
 if-addrs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+socket2.workspace = true
 
 # `ipconfig`'s build script emits `cargo:rustc-link-lib=iphlpapi` unconditionally,
 # which breaks linking on Linux / macOS, so it is a Windows-only dependency.

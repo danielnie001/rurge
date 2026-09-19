@@ -1959,6 +1959,7 @@ dependencies = [
  "resolv-conf",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "tracing",
  "windows-registry",
