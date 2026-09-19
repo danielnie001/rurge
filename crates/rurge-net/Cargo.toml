@@ -28,6 +28,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 rcgen = { workspace = true, optional = true }
+socket2.workspace = true
 
 [features]
 # In-process HTTP(S) test server (`rurge_net::testing`); enabled by dependants' dev-dependencies.
@@ -36,6 +37,7 @@ testing = ["dep:rcgen"]
 [dev-dependencies]
 tempfile.workspace = true
 rcgen.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
