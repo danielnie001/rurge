@@ -7,6 +7,7 @@ pub mod http;
 pub mod keystore;
 pub mod outbound;
 pub mod reject;
+pub mod socks5;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod transport;
