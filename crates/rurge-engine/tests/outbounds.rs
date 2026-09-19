@@ -612,7 +612,7 @@ async fn two_entries(origin: &TestServer) -> (FakeSocks5, FakeSocks5, String) {
         FakeSocks5::spawn(script()).await,
     );
     let proxies = format!(
-        "A = socks5, 127.0.0.1, {}, alice, s3cret\nB = socks5, 127.0.0.1, {}",
+        "A = socks5, 127.0.0.1, {}, alice, s3cret\nB = socks5, 127.0.0.1, {}, username=bob, password=hunter2",
         a.addr().port(),
         b.addr().port()
     );
@@ -733,6 +733,9 @@ async fn only_a_member_of_a_select_group_can_be_selected() {
         .to_string(),
         "`M` is not a member of `G`"
     );
+    // no StateStore attached: the selection still applies, it just isn't persisted
+    assert_eq!(h.engine.select_group("Pick", "B").await, Ok(()));
+    assert_eq!(h.engine.group_selection("Pick").unwrap(), "B");
 }
 
 #[tokio::test]
@@ -741,14 +744,22 @@ async fn views_describe_groups_and_redact_policy_details() {
     let (_a, _b, proxies) = two_entries(&origin).await;
     let h = harness(Profile {
         proxies: &proxies,
-        groups: PICK,
+        groups: &format!(
+            "{PICK}\nHiddenByNumber = select, DIRECT, hidden=1\nHiddenByWord = select, DIRECT, hidden=yes\nNotHidden = select, DIRECT, hidden=false"
+        ),
         ..Profile::default()
     })
     .await;
     let groups = h.engine.groups_view();
     assert_eq!(
         groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
-        ["Pick", "Auto"]
+        [
+            "Pick",
+            "Auto",
+            "HiddenByNumber",
+            "HiddenByWord",
+            "NotHidden"
+        ]
     );
     let pick = &groups[0];
     assert_eq!(
@@ -756,6 +767,11 @@ async fn views_describe_groups_and_redact_policy_details() {
         ("select", false, Some("A"))
     );
     assert!(groups[1].hidden);
+    // the project's boolean convention (`ParamMap::bool`): "1" / "yes" count
+    // as true, case-insensitively — not just the literal string "true"
+    assert!(groups[2].hidden, "hidden=1");
+    assert!(groups[3].hidden, "hidden=yes");
+    assert!(!groups[4].hidden, "hidden=false");
     let described: Vec<(&str, bool, &str)> = pick
         .members
         .iter()
@@ -790,4 +806,13 @@ async fn views_describe_groups_and_redact_policy_details() {
         Some("select, A, B, DIRECT")
     );
     assert_eq!(h.engine.policy_detail("Nope"), None);
+
+    // named-parameter credentials (as opposed to A's positional ones) are
+    // redacted too
+    let detail_b = h.engine.policy_detail("B").expect("a configured policy");
+    assert!(
+        !detail_b.contains("bob") && !detail_b.contains("hunter2"),
+        "{detail_b}"
+    );
+    assert!(detail_b.contains("***"), "{detail_b}");
 }

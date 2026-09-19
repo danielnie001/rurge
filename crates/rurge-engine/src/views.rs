@@ -13,7 +13,9 @@ pub struct MemberView {
     pub is_group: bool,
     /// A policy's type keyword, a group's kind keyword, a built-in's name.
     pub type_description: String,
-    /// First 16 hex digits of the SHA-256 of the definition line.
+    /// First 16 hex digits of the SHA-256 of `<name> = <definition with its
+    /// secrets blanked>`: identifies a definition line without carrying
+    /// anything derived from a credential.
     pub line_hash: String,
 }
 
@@ -62,7 +64,11 @@ fn member_view(cfg: &Config, name: &str) -> MemberView {
             name: name.to_string(),
             is_group: false,
             type_description: p.kind.keyword().to_string(),
-            line_hash: line_hash(&format!("{} = {}", p.name, p.definition)),
+            line_hash: line_hash(&format!(
+                "{} = {}",
+                p.name,
+                rurge_config::redact::redact_definition(&p.definition)
+            )),
         };
     }
     if let Some(g) = cfg.groups.iter().find(|g| g.name == name) {
@@ -70,7 +76,11 @@ fn member_view(cfg: &Config, name: &str) -> MemberView {
             name: name.to_string(),
             is_group: true,
             type_description: g.kind.keyword().to_string(),
-            line_hash: line_hash(&format!("{} = {}", g.name, g.definition)),
+            line_hash: line_hash(&format!(
+                "{} = {}",
+                g.name,
+                rurge_config::redact::redact_definition(&g.definition)
+            )),
         };
     }
     // a built-in (or a DEVICE: reference): nothing but its name describes it
@@ -95,10 +105,7 @@ impl Engine {
             .map(|g| GroupView {
                 name: g.name.clone(),
                 kind: g.kind,
-                hidden: g
-                    .params
-                    .get("hidden")
-                    .is_some_and(|v| v.eq_ignore_ascii_case("true")),
+                hidden: g.params.bool("hidden").unwrap_or(false),
                 members: g
                     .members
                     .iter()
@@ -164,5 +171,68 @@ impl Engine {
                 .await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rurge_config::config::{LoadOptions, from_text};
+    use std::path::Path;
+
+    fn config(policy_line: &str) -> Config {
+        let text = format!("[General]\n[Proxy]\n{policy_line}\n[Rule]\nFINAL,DIRECT\n");
+        let loaded = from_text(&text, Path::new("t.conf"), &LoadOptions::for_tests());
+        assert!(
+            !loaded.diagnostics.has_errors(),
+            "{:?}",
+            loaded
+                .diagnostics
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+        );
+        loaded.config
+    }
+
+    /// A `lineHash` served over the HTTP API must never let a client confirm a
+    /// guessed credential offline: it has to be computed over the same
+    /// redacted text `policy_detail` shows, not the raw definition line.
+    #[test]
+    fn line_hash_hides_credentials_but_changes_with_everything_else() {
+        let a = config("A = socks5, h.test, 1080, alice, s3cret");
+        let same_but_password = config("A = socks5, h.test, 1080, alice, other");
+        assert_eq!(
+            member_view(&a, "A").line_hash,
+            member_view(&same_but_password, "A").line_hash,
+            "a password-only difference must not change the hash"
+        );
+
+        let different_port = config("A = socks5, h.test, 1081, alice, s3cret");
+        assert_ne!(
+            member_view(&a, "A").line_hash,
+            member_view(&different_port, "A").line_hash,
+            "a port change must change the hash"
+        );
+
+        let different_name = config("B = socks5, h.test, 1080, alice, s3cret");
+        assert_ne!(
+            member_view(&a, "A").line_hash,
+            member_view(&different_name, "B").line_hash,
+            "a name change must change the hash"
+        );
+
+        // the hash is over the literal redacted line — computed here
+        // independently rather than hard-coding `***` spacing
+        let p = a.policies.iter().find(|p| p.name == "A").unwrap();
+        let expected = format!(
+            "{} = {}",
+            p.name,
+            rurge_config::redact::redact_definition(&p.definition)
+        );
+        assert_eq!(member_view(&a, "A").line_hash, line_hash(&expected));
+
+        // a built-in hashes its own name
+        assert_eq!(member_view(&a, "DIRECT").line_hash, line_hash("DIRECT"));
     }
 }
