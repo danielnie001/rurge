@@ -6,10 +6,11 @@ use rurge_config::session::{ListenerKind, SessionInfo};
 use rurge_dns::system::StaticSystemDns;
 use rurge_dns::testing::MockDns;
 use rurge_engine::stack::StackOptions;
-use rurge_engine::{Engine, EngineShared, ListenerSpec, Runtime, RuntimeOptions};
+use rurge_engine::{Engine, EngineShared, ListenerSpec, RequestRecord, Runtime, RuntimeOptions};
 use rurge_inbound::{DialError, Dialer, Running, SessionHandle, SessionOutcome};
 use rurge_net::testing::TestServer;
 use rurge_policy::GroupSelections;
+use rurge_proto::testing::{FakeHttpProxy, HttpProxyScript};
 use rurge_rules::{GeoUrls, OutboundMode};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1049,6 +1050,147 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
     assert!(
         !dns.queries().is_empty(),
         "the mock DNS server was actually queried"
+    );
+}
+
+/// An engine built from a complete profile text. The follow-mode tests below
+/// need their own `[Proxy]` entries and `encrypted-dns-server`, which
+/// `build_runtime`'s fixed profile shape cannot express.
+async fn engine_from_profile(dir: &std::path::Path, profile: &str) -> Arc<Engine> {
+    let loaded = from_text(profile, &dir.join("t.conf"), &LoadOptions::for_tests());
+    assert!(
+        !loaded.diagnostics.has_errors(),
+        "{:?}",
+        loaded
+            .diagnostics
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+    );
+    let runtime = Runtime::build(
+        loaded.config,
+        RuntimeOptions {
+            stack: StackOptions {
+                data_dir: dir.to_path_buf(),
+                no_network: true,
+                geo_urls: GeoUrls::default(),
+                dns_cache_size: 2000,
+                system: Arc::new(StaticSystemDns::default()),
+                wait: Duration::ZERO,
+                dns_connector: None,
+                socket_hook: Arc::new(rurge_net::socket::NoopSocketHook),
+            },
+            outbound_mode: OutboundMode::Rule,
+            idle_timeout: Duration::from_secs(600),
+            request_log_size: 1000,
+            shared: EngineShared::default(),
+        },
+    )
+    .await
+    .unwrap();
+    Engine::new(runtime)
+}
+
+/// Every `Internal` session the engine has recorded so far.
+fn internal_sessions(engine: &Engine) -> Vec<RequestRecord> {
+    let mut all = engine.request_log().recent(50);
+    all.extend(engine.request_log().active());
+    all.retain(|r| r.listener == ListenerKind::Internal);
+    all
+}
+
+/// The anti-loop fallback of `encrypted-dns-follow-outbound-mode` (M3 design
+/// §7.4): reaching a proxy configured by HOST NAME would need the very lookup
+/// the DNS session is carrying, so the engine warns and connects directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dns_session_bypasses_a_proxy_configured_by_host_name() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    dns.set("proxy.test", &["127.0.0.1"], &[], 60);
+    let dir = tempfile::tempdir().unwrap();
+    let profile = format!(
+        "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\n\
+encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.1:{}\nipv6 = false\n\
+[Proxy]\nUp = http, proxy.test, 8080\n[Proxy Group]\n[Rule]\nPROTOCOL,DNS,Up\nFINAL,DIRECT\n",
+        dns.addr().port()
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        engine
+            .runtime()
+            .stack
+            .resolver
+            .lookup("target.test", rurge_dns::resolver::LookupOpts::default()),
+    )
+    .await
+    .expect("the lookup must not wait for the proxy's own name to be resolved");
+    assert!(res.is_ok(), "resolution through the pipeline: {res:?}");
+    let internal = internal_sessions(&engine);
+    assert!(
+        internal.iter().any(|r| {
+            r.error.as_deref()
+                == Some(
+                    "dns-follow: proxy configured by host name bypassed to avoid a resolution loop",
+                )
+                && r.policy.first().map(String::as_str) == Some("Up")
+        }),
+        "a bypassed internal DNS session: {internal:?}"
+    );
+    assert!(
+        !dns.queries().is_empty(),
+        "the mock DNS server was actually queried"
+    );
+}
+
+/// A proxy configured by IP LITERAL needs no lookup of its own, so it really
+/// carries the DNS session instead of being bypassed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dns_session_goes_through_a_proxy_configured_by_ip() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let upstream = FakeHttpProxy::spawn(HttpProxyScript {
+        connect_to: Some(dns.addr()),
+        ..HttpProxyScript::default()
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile = format!(
+        "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\n\
+encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.1:{}\nipv6 = false\n\
+[Proxy]\nUpIp = http, 127.0.0.1, {}\n[Proxy Group]\n[Rule]\nPROTOCOL,DNS,UpIp\nFINAL,DIRECT\n",
+        dns.addr().port(),
+        upstream.addr().port()
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        engine
+            .runtime()
+            .stack
+            .resolver
+            .lookup("target.test", rurge_dns::resolver::LookupOpts::default()),
+    )
+    .await
+    .expect("the lookup goes through the proxy inside the bound");
+    assert!(res.is_ok(), "resolution through the proxy: {res:?}");
+    let expected = format!("CONNECT 127.0.0.1:{} HTTP/1.1", dns.addr().port());
+    let heads = upstream.heads();
+    assert_eq!(
+        heads.first().map(|h| h.request_line.as_str()),
+        Some(expected.as_str()),
+        "the DNS session really went through the proxy"
+    );
+    let internal = internal_sessions(&engine);
+    assert!(
+        internal
+            .iter()
+            .any(|r| r.policy.first().map(String::as_str) == Some("UpIp")),
+        "{internal:?}"
+    );
+    assert!(
+        internal.iter().all(|r| r.error.is_none()),
+        "an IP-configured proxy is not bypassed: {internal:?}"
     );
 }
 

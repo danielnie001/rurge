@@ -9,7 +9,7 @@ use rurge_dns::testing::MockDns;
 use rurge_engine::SelectError;
 use rurge_engine::stack::StackOptions;
 use rurge_engine::state::{STATE_FILE, StateStore, profile_key};
-use rurge_engine::{Engine, EngineShared, ListenerSpec, Runtime, RuntimeOptions};
+use rurge_engine::{Engine, EngineShared, ListenerSpec, RecordStatus, Runtime, RuntimeOptions};
 use rurge_inbound::Running;
 use rurge_net::socket::NoopSocketHook;
 use rurge_net::testing::TestServer;
@@ -338,7 +338,9 @@ async fn always_use_connect_and_other_protocols_tunnel_plain_requests() {
         (seen.atyp, seen.host.as_str(), seen.port),
         (3, "alt.test", 8080)
     );
-    // inside a tunnel the origin sees an ordinary origin-form request
+    // both requests reached the origin; that they were tunnelled rather than
+    // forwarded is pinned by the CONNECT request line and the SOCKS5 ATYP
+    // assertions above, not by this count
     assert_eq!(origin.hits("/hello"), 2);
 }
 
@@ -383,6 +385,61 @@ async fn a_refusing_upstream_is_a_502_that_quotes_the_proxy() {
     assert!(
         !response.contains("wrong") && !error.contains("wrong"),
         "no credential leaks"
+    );
+}
+
+/// Forward mode: a 407 from the upstream is rurge's own credential problem.
+/// The client can do nothing about it and the challenge header is hop-by-hop,
+/// so the session fails and the client gets the ordinary 502 page instead of
+/// an invalid 407.
+#[tokio::test]
+async fn a_forward_mode_407_is_a_failed_session_and_a_502_page() {
+    let upstream = FakeHttpProxy::spawn(HttpProxyScript {
+        auth: Some(("alice".into(), "right".into())),
+        ..HttpProxyScript::default()
+    })
+    .await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "Up = http, 127.0.0.1, {}, alice, wrong",
+            upstream.addr().port()
+        ),
+        rules: "DOMAIN,target.test,Up",
+        ..Profile::default()
+    })
+    .await;
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    s.write_all(
+        b"GET http://target.test:8080/hello HTTP/1.1\r\nHost: target.test:8080\r\nConnection: close\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut buf = Vec::new();
+    // `Connection: close` makes EOF the real bound: a regression back to
+    // relaying the upstream's keep-alive 407 fails here instead of running slow.
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf))
+        .await
+        .expect("rurge closes the connection after the 502");
+    let response = String::from_utf8_lossy(&buf).into_owned();
+    assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+    let log = h.engine.request_log();
+    wait_until("the failed session", || !log.recent(10).is_empty()).await;
+    let record = log.recent(10).remove(0);
+    let error = record.error.clone().unwrap_or_default();
+    assert_eq!(
+        error,
+        "http proxy answered 407 Proxy Authentication Required"
+    );
+    assert_eq!(record.status, RecordStatus::Failed);
+    assert!(
+        !response.contains("wrong") && !error.contains("wrong"),
+        "no credential leaks"
+    );
+    let heads = upstream.heads();
+    assert_eq!(heads.len(), 1, "one absolute-form request, no retry");
+    assert_eq!(
+        heads[0].request_line,
+        "GET http://target.test:8080/hello HTTP/1.1"
     );
 }
 

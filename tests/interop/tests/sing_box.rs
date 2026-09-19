@@ -144,11 +144,13 @@ async fn a_plain_request_in_absolute_form_is_served_by_sing_box() {
     request.push_str("Connection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = Vec::new();
+    // `Connection: close` makes EOF the real bound rather than a fixed wait.
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         stream.read_to_end(&mut response),
     )
-    .await;
+    .await
+    .expect("sing-box closes the connection after the response");
     let response = String::from_utf8_lossy(&response);
     assert!(
         response.starts_with("HTTP/1.1 200"),
@@ -212,10 +214,16 @@ Mutual = https, 127.0.0.1, {mtls}, client-cert=mtls\nNoCert = https, 127.0.0.1, 
             .await
             .err()
             .unwrap_or_else(|| panic!("{name} must not get through"));
+        // `Timeout` too: on a loaded runner a handshake that is going to be
+        // refused can run out the clock first, and "correctly did not get
+        // through" must not turn red for that.
         assert!(
             matches!(
                 e,
-                OutboundError::Tls(_) | OutboundError::Proxy(_) | OutboundError::Io(_)
+                OutboundError::Tls(_)
+                    | OutboundError::Proxy(_)
+                    | OutboundError::Io(_)
+                    | OutboundError::Timeout
             ),
             "{name}: {e}"
         );

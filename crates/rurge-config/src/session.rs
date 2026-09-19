@@ -52,7 +52,11 @@ pub struct SessionInfo {
     pub sni: Option<String>,
     pub http_host: Option<String>,
     pub user_agent: Option<String>,
-    /// Full URL; only known for plain HTTP or after MITM.
+    /// Full URL; only known for plain HTTP or after MITM. The engine reads
+    /// `listener == Http` together with `url.is_some()` as "the HTTP listener
+    /// is forwarding a plain request" (absolute-form forwarding to an HTTP
+    /// proxy): whoever sets `url` on another kind of session (MITM, phase 4)
+    /// must revisit `Engine::dial`.
     pub url: Option<String>,
     pub process: Option<ProcessInfo>,
     pub device: Option<DeviceInfo>,

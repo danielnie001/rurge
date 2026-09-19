@@ -14,7 +14,7 @@
 
 ## 本地运行
 
-本地默认不安装 sing-box：`cargo test -p rurge-interop` 会正常通过，四个互操作用例各打印一行 `skipping …` 后直接返回（夹具自身的单元测试——配置渲染、取空闲端口、定位二进制——照常运行并断言）。要在本机真正跑互操作用例，二选一：
+本地默认不安装 sing-box：`cargo test -p rurge-interop` 会正常通过，四个互操作用例各打印一行 `skipping …` 后直接返回（夹具自身的单元测试——配置渲染、"配置绝不碰本机"的安全守卫、取空闲端口——照常运行并断言）。要在本机真正跑互操作用例，二选一：
 
 - 自行安装 sing-box 1.14.1，让 `sing-box` / `sing-box.exe` 出现在 `PATH` 上；或
 - 不安装到 `PATH`，改用 `RURGE_TEST_SING_BOX=<sing-box 可执行文件路径> cargo test -p rurge-interop`。

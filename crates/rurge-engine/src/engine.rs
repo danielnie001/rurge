@@ -12,12 +12,14 @@ use rurge_config::HostName;
 use rurge_config::general::General;
 use rurge_config::rule::PolicyRef;
 use rurge_config::session::{ListenerKind, SessionInfo};
+use rurge_config::spec::PolicySpec;
 use rurge_inbound::{
     DialError, Dialed, Dialer, FailKind, HttpAuth, HttpListener, ListenerOpts, Running,
     SessionHandle, SessionOutcome, Socks5Listener,
 };
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
+use rurge_policy::TerminalKind;
 use rurge_proto::OutboundError;
 use rurge_rules::{OutboundMode, Outcome};
 use std::collections::HashMap;
@@ -537,9 +539,51 @@ fn policy_known(rt: &Runtime, name: &str) -> bool {
     matches!(PolicyRef::parse(name), PolicyRef::Builtin(_)) || rt.policies.contains(name)
 }
 
+/// The policy that OPENS THE SOCKET when `name` is dialled: `name` itself, or
+/// — following `underlying-proxy`, through a group's current member — the hop
+/// at the bottom of its chain. `None` when the chain ends at DIRECT / REJECT
+/// or is deeper than the registry allows.
+fn socket_opener<'a>(rt: &'a Runtime, name: &str) -> Option<&'a PolicySpec> {
+    let mut current = name.to_string();
+    for _ in 0..rurge_policy::registry::MAX_DEPTH {
+        let spec = rt.config.spec(&current)?;
+        let Some(under) = spec.common.underlying_proxy.as_deref() else {
+            return Some(spec);
+        };
+        let below = rt.policies.resolve(&PolicyRef::Named(under.to_string()));
+        if below.terminal != TerminalKind::Proxy {
+            return None;
+        }
+        // a `Proxy` terminal is the entry the last chain element names
+        current = below.chain.last()?.clone();
+    }
+    None
+}
+
+/// The bypass both anti-loop arms of `dial_internal` take: note `why` on the
+/// session, connect with `fallback`, and finish the handle explicitly when
+/// even that fails — it would otherwise be dropped without a finished record.
+async fn bypass_to_direct(
+    handle: Arc<SessionHandle>,
+    fallback: &Arc<dyn Connector>,
+    target: &Target,
+    opts: &ConnectOpts,
+    why: &str,
+) -> io::Result<BoxedStream> {
+    handle.set_error(why);
+    match fallback.connect(target, opts).await {
+        Ok(stream) => Ok(crate::dns_pipeline::wrap_internal(stream, handle)),
+        Err(e) => {
+            handle.finish(SessionOutcome::Failed(e.to_string()));
+            Err(e)
+        }
+    }
+}
+
 impl Engine {
     /// Dials a DNS upstream connection through the pipeline (Internal session).
-    /// Never lets a REJECT break DNS: on reject it warns and connects directly.
+    /// Never lets the routing break DNS: a REJECT, and a proxy that would have
+    /// to be resolved first, each warn and connect directly instead.
     pub async fn dial_internal(
         &self,
         session: SessionInfo,
@@ -559,6 +603,27 @@ impl Engine {
         let opts = ConnectOpts {
             timeout: CONNECT_TIMEOUT,
         };
+        // Reaching a proxy that is configured by host name would need the very
+        // lookup this session is carrying (M3 design §7.4), so bypass it before
+        // dialling. A proxy configured by IP literal has no such loop.
+        if resolution.terminal == TerminalKind::Proxy
+            && let Some(terminal) = resolution.chain.last()
+            && let Some(spec) = socket_opener(&rt, terminal)
+            && matches!(spec.server, Some(HostName::Domain(_)))
+        {
+            tracing::warn!(
+                policy = %spec.name,
+                "DNS session routed to a proxy configured by host name; connecting directly to avoid a resolution loop"
+            );
+            return bypass_to_direct(
+                handle,
+                fallback,
+                &target,
+                &opts,
+                "dns-follow: proxy configured by host name bypassed to avoid a resolution loop",
+            )
+            .await;
+        }
         match resolution.outbound.connect_tcp(&target, &opts).await {
             Ok(stream) => Ok(crate::dns_pipeline::wrap_internal(stream, handle)),
             Err(OutboundError::Reject(_)) | Err(OutboundError::Unsupported(_)) => {
@@ -566,17 +631,14 @@ impl Engine {
                     dst = %target.host,
                     "DNS session routed to a reject/unsupported policy; connecting directly to keep DNS working"
                 );
-                handle.set_error("dns-follow: reject bypassed to keep DNS working");
-                // Finish explicitly on failure, like every other arm: the
-                // handle would otherwise be dropped without a finished record.
-                let stream = match fallback.connect(&target, &opts).await {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        handle.finish(SessionOutcome::Failed(e.to_string()));
-                        return Err(e);
-                    }
-                };
-                Ok(crate::dns_pipeline::wrap_internal(stream, handle))
+                bypass_to_direct(
+                    handle,
+                    fallback,
+                    &target,
+                    &opts,
+                    "dns-follow: reject bypassed to keep DNS working",
+                )
+                .await
             }
             Err(OutboundError::Dns(m)) => {
                 handle.finish(SessionOutcome::Failed(m.clone()));

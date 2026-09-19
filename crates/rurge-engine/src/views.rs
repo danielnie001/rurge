@@ -208,6 +208,15 @@ mod tests {
             "a password-only difference must not change the hash"
         );
 
+        // `headers=` values are credentials too, and are blanked whole
+        let with_header = config("A = http, h.test, 80, headers=X-Auth:tok3n");
+        let same_but_header = config("A = http, h.test, 80, headers=X-Auth:other");
+        assert_eq!(
+            member_view(&with_header, "A").line_hash,
+            member_view(&same_but_header, "A").line_hash,
+            "a `headers=` difference must not change the hash"
+        );
+
         let different_port = config("A = socks5, h.test, 1081, alice, s3cret");
         assert_ne!(
             member_view(&a, "A").line_hash,

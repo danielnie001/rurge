@@ -95,6 +95,12 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Result<(HostName, u1
             match HostName::from_wire(&s) {
                 Some(host) => host,
                 None => {
+                    // the length only: the name itself is unsanitized client text
+                    tracing::debug!(
+                        listener = "socks5",
+                        len = s.len(),
+                        "refused a host name with control characters or whitespace"
+                    );
                     stream.read_u16().await?;
                     return Ok(Err(REP_GENERAL_FAILURE));
                 }

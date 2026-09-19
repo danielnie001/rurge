@@ -162,11 +162,14 @@ impl SingBox {
         for port in self.ports.clone() {
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
             loop {
-                if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-                    break;
-                }
+                // Before the connect, not after: if sing-box is already dead
+                // and an unrelated process happens to hold `port`, a connect
+                // that comes first reads as "ready".
                 if let Ok(Some(status)) = self.child.try_wait() {
                     panic!("sing-box exited early ({status}):\n{}", self.log_text());
+                }
+                if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+                    break;
                 }
                 assert!(
                     Instant::now() < deadline,

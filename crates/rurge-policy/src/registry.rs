@@ -87,6 +87,8 @@ fn alias_terminal(kind: PolicyKind) -> Option<Terminal> {
 }
 
 /// Whether a `direct` alias needs a connector of its own.
+/// `allow_other_interface` is not part of the predicate: it only says what to
+/// do when `interface` is unavailable, so on its own it changes nothing.
 fn has_socket_opts(common: &CommonOpts) -> bool {
     common.interface.is_some() || common.tos != 0 || common.ip_version != IpVersion::default()
 }
@@ -97,6 +99,9 @@ fn build_one(
     cell: &Arc<RegistryCell>,
 ) -> Result<OutboundRef, BuildError> {
     let connector: Arc<dyn Connector> = match spec.common.underlying_proxy.as_deref() {
+        // This policy's own `interface` / `allow-other-interface` / `tos` /
+        // `ip-version` have no effect here: socket options belong to the hop
+        // that opens the socket, which is `name` or a hop below it.
         Some(name) => Arc::new(ChainConnector::new(cell.clone(), name)),
         None => factory.direct_connector(&spec.common),
     };
@@ -321,6 +326,8 @@ HK = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n\
 D = direct\nCorp = direct, interface=eth9\nBlock = reject-tinygif\n\
 EntryA = socks5, a.example, 1080\nEntryB = socks5, b.example, 1080\n\
 Exit = http, exit.example, 8080, underlying-proxy=Hop\n\
+Mid = socks5, m.example, 1080, underlying-proxy=EntryA\n\
+Deep = http, d.example, 80, underlying-proxy=Mid\n\
 [Proxy Group]\nAuto = url-test, HK, D\nPick = select, HK, D, DIRECT\nOuter = select, Pick, Auto\n\
 Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
 
@@ -404,8 +411,8 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
         assert_eq!(
             reg.names(),
             vec![
-                "HK", "D", "Corp", "Block", "EntryA", "EntryB", "Exit", "Auto", "Pick", "Outer",
-                "Emptyish", "Hop"
+                "HK", "D", "Corp", "Block", "EntryA", "EntryB", "Exit", "Mid", "Deep", "Auto",
+                "Pick", "Outer", "Emptyish", "Hop"
             ]
         );
         assert!(reg.contains("HK") && !reg.contains("Nope"));
@@ -447,6 +454,16 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
             (chain(&missing), missing.note.clone()),
             (vec!["Nope", "REJECT"], None)
         );
+        // a group falling through to an unsupported member keeps the whole
+        // chain, whichever kind of group it is
+        assert_eq!(
+            chain(&reg.resolve(&PolicyRef::parse("Pick"))),
+            vec!["Pick", "HK", "!unsupported:ss", "REJECT"]
+        );
+        assert_eq!(
+            chain(&reg.resolve(&PolicyRef::parse("Auto"))),
+            vec!["Auto", "HK", "!unsupported:ss", "REJECT"]
+        );
     }
 
     #[test]
@@ -458,18 +475,18 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
         saved.set("Emptyish", "Gone"); // not a member any more
         let b = built(saved);
         let reg = &b.registry;
-        assert_eq!(
-            chain(&reg.resolve(&PolicyRef::parse("Pick"))),
-            vec!["Pick", "DIRECT"]
-        );
+        let picked = reg.resolve(&PolicyRef::parse("Pick"));
+        assert_eq!(chain(&picked), vec!["Pick", "DIRECT"]);
+        assert_eq!(picked.outbound.name(), "DIRECT");
         assert_eq!(
             chain(&reg.resolve(&PolicyRef::parse("Outer"))),
             vec!["Outer", "Pick", "DIRECT"]
         );
         assert_eq!(chain(&reg.resolve(&PolicyRef::parse("Auto")))[1], "HK");
+        let emptyish = reg.resolve(&PolicyRef::parse("Emptyish"));
         assert_eq!(
-            chain(&reg.resolve(&PolicyRef::parse("Emptyish"))),
-            vec!["Emptyish", "Block", "REJECT-TINYGIF"]
+            (chain(&emptyish), emptyish.note.clone()),
+            (vec!["Emptyish", "Block", "REJECT-TINYGIF"], None)
         );
         assert_eq!(reg.current_member("Pick").as_deref(), Some("DIRECT"));
         assert_eq!(reg.current_member("Emptyish").as_deref(), Some("Block"));
@@ -514,6 +531,34 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
                 "Exit -> site.example:443",
                 "EntryB -> exit.example:8080",
                 "dial b.example:1080",
+            ]
+        );
+    }
+
+    /// Three hops: each one dials the hop below it, and only the bottom hop
+    /// reaches a real socket — with its own server as the target.
+    #[tokio::test]
+    async fn a_three_hop_chain_hands_each_server_to_the_hop_below() {
+        let b = built(GroupSelections::new());
+        let deep = b.registry.resolve(&PolicyRef::parse("Deep"));
+        assert_eq!(
+            (chain(&deep), deep.terminal),
+            (vec!["Deep"], TerminalKind::Proxy)
+        );
+        deep.outbound
+            .connect_tcp(
+                &Target::new(HostName::parse("site.example"), 443),
+                &ConnectOpts::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            b.factory.connector.seen(),
+            [
+                "Deep -> site.example:443",
+                "Mid -> d.example:80",
+                "EntryA -> m.example:1080",
+                "dial a.example:1080",
             ]
         );
     }

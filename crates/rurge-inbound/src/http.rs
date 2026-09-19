@@ -313,8 +313,13 @@ pub(crate) fn absolute_form<B>(
             HeaderValue::from_str(value),
         ) else {
             // the outbound validated its templates; whatever the http crate
-            // still refuses is dropped rather than sent malformed
-            tracing::debug!(listener = "http", "dropped an upstream proxy header");
+            // still refuses is dropped rather than sent malformed. The name
+            // only, Debug-escaped; the value is a credential.
+            tracing::debug!(
+                listener = "http",
+                name = ?name,
+                "dropped an upstream proxy header"
+            );
             continue;
         };
         req.headers_mut().insert(name, value);
@@ -437,6 +442,14 @@ async fn forward(
         }
     };
     let conn_handle = handle.clone();
+    // Cancelled when this handler returns, i.e. once the code below has had
+    // its say about the response head (an upstream 407 is a failed session).
+    // `SessionHandle::finish` is first-wins and the driver would otherwise get
+    // there first: the response head and the end of the upstream connection
+    // can arrive in one and the same poll of the driver task.
+    let handled = CancellationToken::new();
+    let driver_waits = handled.clone();
+    let _handled = handled.drop_guard();
     ctx.tracker.spawn(async move {
         // Inner task: this driver is tracked by the engine, not by the accept
         // loop's `JoinSet`, so its panics would otherwise go unreported.
@@ -452,6 +465,7 @@ async fn forward(
                     Err(e) => SessionOutcome::Failed(format!("upstream connection error: {e}")),
                 },
             };
+            driver_waits.cancelled().await;
             conn_handle.finish(outcome);
         });
         if let Err(e) = inner.await
@@ -483,6 +497,22 @@ async fn forward(
     };
     match sent {
         Ok(mut resp) => {
+            if upstream_headers.is_some()
+                && resp.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED
+            {
+                // the credentials in question are rurge's own, towards its
+                // upstream: the client can do nothing about them, and the
+                // challenge header is hop-by-hop. Both texts come from the
+                // status code, never from the upstream's reason phrase.
+                handle.finish(SessionOutcome::Failed(
+                    "http proxy answered 407 Proxy Authentication Required".to_string(),
+                ));
+                return failure_response(
+                    &ctx,
+                    &handle,
+                    "Upstream proxy rejected the request: 407 Proxy Authentication Required",
+                );
+            }
             strip_hop_by_hop(resp.headers_mut());
             Ok(resp.map(|body| body.boxed()))
         }

@@ -14,9 +14,10 @@ const SECRET_KEYS: [&str; 7] = [
     "token",
 ];
 /// Inline `name=value` parameters redacted wherever they appear in a value.
-/// `username` also covers harmless SSH user names; over-redacting is the safe
-/// side for an endpoint whose purpose is safe output.
-const SECRET_PARAMS: [&str; 8] = [
+/// `username` also covers harmless SSH user names, and `headers` is blanked
+/// whole (header names included); over-redacting is the safe side for an
+/// endpoint whose purpose is safe output.
+const SECRET_PARAMS: [&str; 9] = [
     "password",
     "psk",
     "private-key",
@@ -25,6 +26,7 @@ const SECRET_PARAMS: [&str; 8] = [
     "token",
     "uuid",
     "username",
+    "headers",
 ];
 const KEY_AT_KEYS: [&str; 4] = [
     "http-api",
@@ -264,6 +266,7 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
             "socks5, proxy.test, 1080, username=bob, password=hunter2",
             "ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x",
             "direct, interface=eth0",
+            "http, h.test, 80, headers=X-Auth:tok3n;X-B:1",
         ] {
             let alone = redact_definition(def);
             // one rule, two entry points: the profile endpoint must agree
@@ -272,10 +275,15 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
                 redact_profile(&format!("X = {def}")),
                 "{def}"
             );
-            for secret in ["s3cret", "hunter2", "alice", "bob"] {
+            for secret in ["s3cret", "hunter2", "alice", "bob", "tok3n"] {
                 assert!(!alone.contains(secret), "{def} -> {alone}");
             }
         }
+        // `headers=` carries credentials: the whole value goes, names included
+        assert_eq!(
+            redact_definition("http, h.test, 80, headers=X-Auth:tok3n;X-B:1"),
+            "http, h.test, 80, headers=***"
+        );
         assert!(redact_definition("http, h, 1, u, p").contains("***"));
         assert_eq!(
             redact_definition("direct, interface=eth0"),

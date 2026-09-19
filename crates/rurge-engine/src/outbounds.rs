@@ -150,9 +150,11 @@ impl OutboundFactory for EngineFactory {
     }
 }
 
-/// Builds every policy that has an outbound of its own and throws the result
-/// away: what cannot be built is a load error at the policy's own line.
-/// Offline and quick — no name is resolved, no socket opened.
+/// Builds every policy that could fail to build and throws the result away:
+/// what cannot be built is a load error at the policy's own line. Direct is
+/// skipped because `Direct::new` cannot fail; only a reject alias has no
+/// outbound of its own. Offline and quick — no name is resolved, no socket
+/// opened.
 pub fn dry_build(cfg: &Config) -> Diagnostics {
     let factory = EngineFactory::dry(cfg);
     let mut diagnostics = Diagnostics::default();

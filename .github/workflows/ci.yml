@@ -30,7 +30,7 @@ jobs:
             *) echo "unexpected runner OS: $RUNNER_OS"; exit 1 ;;
           esac
           cd "$RUNNER_TEMP"
-          curl -fsSL -o "$asset" "https://github.com/SagerNet/sing-box/releases/download/v$version/$asset"
+          curl -fsSL --retry 3 --retry-all-errors -o "$asset" "https://github.com/SagerNet/sing-box/releases/download/v$version/$asset"
           if command -v sha256sum >/dev/null 2>&1; then
             actual=$(sha256sum "$asset" | cut -d' ' -f1)
           else
