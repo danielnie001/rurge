@@ -857,3 +857,133 @@ async fn log_level_is_forwarded_to_control() {
     let (status, body) = post(&api, "/v1/log/level", json!({ "level": "loud" })).await;
     assert_eq!(status, 400, "{body}");
 }
+
+#[tokio::test]
+async fn policy_groups_are_listed_and_a_policy_detail_is_redacted() {
+    let api = api().await;
+    let (status, body) = get(&api, "/v1/policy_groups").await;
+    assert_eq!(status, 200);
+    let members = body["Pick"].as_array().expect("the group's members");
+    assert_eq!(members.len(), 2);
+    assert_eq!(members[0]["name"], "HK");
+    assert_eq!(members[0]["typeDescription"], "ss");
+    assert_eq!(members[0]["isGroup"], false);
+    assert_eq!(members[0]["enabled"], true);
+    let hash = members[0]["lineHash"].as_str().unwrap();
+    assert!(
+        hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{hash}"
+    );
+    assert_eq!(members[1]["name"], "DIRECT");
+    assert_eq!(members[1]["typeDescription"], "DIRECT");
+
+    let (status, body) = get(&api, "/v1/policies/detail?policy_name=HK").await;
+    assert_eq!(status, 200);
+    let detail = body["HK"].as_str().expect("the definition");
+    assert!(detail.starts_with("ss, 1.2.3.4, 8388"), "{detail}");
+    assert!(
+        detail.contains("***") && !detail.contains("password=x"),
+        "{detail}"
+    );
+    let (status, body) = get(&api, "/v1/policies/detail?policy_name=DIRECT").await;
+    assert_eq!((status, body), (200, json!({ "DIRECT": "DIRECT" })));
+    let (status, body) = get(&api, "/v1/policies/detail?policy_name=Nope").await;
+    assert_eq!(
+        (status, body),
+        (404, json!({ "error": "unknown policy `Nope`" }))
+    );
+    let (status, _) = get(&api, "/v1/policies/detail").await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn a_select_group_is_switched_for_the_next_request_and_persisted() {
+    let api = api_with("DOMAIN,target.test,Pick").await;
+    assert_eq!(
+        get(&api, "/v1/policy_groups/select?group_name=Pick").await,
+        (200, json!({ "policy": "HK" }))
+    );
+    // HK is a protocol rurge does not speak yet: the request is refused
+    let (head, _) = get_via_proxy(api.http(), &api.target_url()).await;
+    assert!(!head.starts_with("HTTP/1.1 200"), "{head}");
+
+    let (status, body) = post(
+        &api,
+        "/v1/policy_groups/select",
+        json!({ "group_name": "Pick", "policy": "DIRECT" }),
+    )
+    .await;
+    assert_eq!((status, body), (200, json!({})));
+    assert_eq!(
+        get(&api, "/v1/policy_groups/select?group_name=Pick").await,
+        (200, json!({ "policy": "DIRECT" }))
+    );
+    let (head, body) = get_via_proxy(api.http(), &api.target_url()).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"hi there");
+
+    let saved: Value =
+        serde_json::from_str(&std::fs::read_to_string(&api.state_path).unwrap()).unwrap();
+    assert_eq!(saved["group_selections"]["t.conf"]["Pick"], "DIRECT");
+}
+
+#[tokio::test]
+async fn select_refuses_what_is_not_a_member_of_a_select_group() {
+    let api = api().await;
+    for (body, message) in [
+        (
+            json!({ "group_name": "Nope", "policy": "DIRECT" }),
+            "unknown policy group `Nope`",
+        ),
+        (
+            json!({ "group_name": "HK", "policy": "DIRECT" }),
+            "unknown policy group `HK`",
+        ),
+        (
+            json!({ "group_name": "Pick", "policy": "Block" }),
+            "`Block` is not a member of `Pick`",
+        ),
+    ] {
+        let (status, answer) = post(&api, "/v1/policy_groups/select", body).await;
+        assert_eq!((status, answer), (400, json!({ "error": message })));
+    }
+    let (status, _) = post(
+        &api,
+        "/v1/policy_groups/select",
+        json!({ "group_name": "Pick" }),
+    )
+    .await;
+    assert_eq!(status, 400, "a body without `policy`");
+    assert_eq!(
+        get(&api, "/v1/policy_groups/select?group_name=Nope").await,
+        (404, json!({ "error": "unknown policy group `Nope`" }))
+    );
+    let (status, _) = get(&api, "/v1/policy_groups/select").await;
+    assert_eq!(status, 400);
+    assert_eq!(
+        get(&api, "/v1/policy_groups/select?group_name=Pick").await,
+        (200, json!({ "policy": "HK" })),
+        "nothing changed"
+    );
+}
+
+#[tokio::test]
+async fn profile_check_includes_the_dry_build() {
+    let api = api().await;
+    let text = std::fs::read_to_string(&api.conf).unwrap().replace(
+        "[Proxy Group]",
+        "Up = https, proxy.test, 443, client-cert=cert1\n[Keystore]\ncert1 = type=p12, base64=QUJD, password=hunter2\n[Proxy Group]",
+    );
+    std::fs::write(&api.conf, text).unwrap();
+    let (status, body) = post(&api, "/v1/profiles/check", json!({})).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["ok"], false);
+    let codes: Vec<&str> = body["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["code"].as_str())
+        .collect();
+    assert!(codes.contains(&"E0022"), "{codes:?}");
+    assert!(!body.to_string().contains("hunter2"));
+}

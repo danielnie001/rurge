@@ -70,6 +70,12 @@ pub fn router(key: String, ctx: ApiContext) -> Router {
             get(routes::features::get_feature).post(routes::features::set_feature),
         )
         .route("/v1/policies", get(routes::policies::policies))
+        .route("/v1/policies/detail", get(routes::policy_groups::detail))
+        .route("/v1/policy_groups", get(routes::policy_groups::groups))
+        .route(
+            "/v1/policy_groups/select",
+            get(routes::policy_groups::selection).post(routes::policy_groups::select),
+        )
         .route("/v1/rules", get(routes::policies::rules))
         .route("/v1/requests/recent", get(routes::requests::recent))
         .route("/v1/requests/active", get(routes::requests::active))

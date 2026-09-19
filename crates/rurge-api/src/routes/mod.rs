@@ -4,6 +4,7 @@ pub mod log;
 pub mod misc;
 pub mod outbound;
 pub mod policies;
+pub mod policy_groups;
 pub mod profiles;
 pub mod requests;
 pub mod traffic;
