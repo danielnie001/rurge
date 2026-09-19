@@ -539,10 +539,13 @@ fn policy_known(rt: &Runtime, name: &str) -> bool {
     matches!(PolicyRef::parse(name), PolicyRef::Builtin(_)) || rt.policies.contains(name)
 }
 
-/// The policy that OPENS THE SOCKET when `name` is dialled: `name` itself, or
-/// — following `underlying-proxy`, through a group's current member — the hop
-/// at the bottom of its chain. `None` when the chain ends at DIRECT / REJECT
-/// or is deeper than the registry allows.
+/// The policy whose SERVER this machine has to reach — and so, if that server
+/// is a host name, to resolve — when `name` is dialled: `name` itself, or,
+/// following `underlying-proxy` (through a group's current member), the last
+/// proxy hop of its chain. A hop whose `underlying-proxy` currently resolves
+/// to DIRECT is that last hop: DIRECT opens the socket, and the name it looks
+/// up is that hop's own server. `None` when the chain ends at REJECT (it fails
+/// fast, it does not loop) or is deeper than the registry allows.
 fn socket_opener<'a>(rt: &'a Runtime, name: &str) -> Option<&'a PolicySpec> {
     let mut current = name.to_string();
     for _ in 0..rurge_policy::registry::MAX_DEPTH {
@@ -551,11 +554,14 @@ fn socket_opener<'a>(rt: &'a Runtime, name: &str) -> Option<&'a PolicySpec> {
             return Some(spec);
         };
         let below = rt.policies.resolve(&PolicyRef::Named(under.to_string()));
-        if below.terminal != TerminalKind::Proxy {
-            return None;
+        match below.terminal {
+            // a `Proxy` terminal is the hop the last chain element names; this
+            // hop's server travels to it as a target and is never looked up here
+            TerminalKind::Proxy => current = below.chain.last()?.clone(),
+            // DIRECT opens the socket itself, with this hop's server as the target
+            TerminalKind::Direct => return Some(spec),
+            TerminalKind::Reject => return None,
         }
-        // a `Proxy` terminal is the entry the last chain element names
-        current = below.chain.last()?.clone();
     }
     None
 }

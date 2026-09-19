@@ -1194,6 +1194,128 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
     );
 }
 
+/// The hop below `Up` resolves to DIRECT, so DIRECT is what opens the socket —
+/// and the name it has to resolve locally is `Up`'s own server. That is the
+/// same loop as the one above, one hop further down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dns_session_bypasses_a_host_named_proxy_above_direct() {
+    for (what, proxies, groups) in [
+        (
+            "a direct alias",
+            "Up = http, proxy.test, 8080, underlying-proxy=D\nD = direct",
+            "",
+        ),
+        (
+            "a group whose current member is DIRECT",
+            "Up = http, proxy.test, 8080, underlying-proxy=Pick\nOther = http, 127.0.0.1, 9",
+            "Pick = select, DIRECT, Other",
+        ),
+    ] {
+        let dns = MockDns::spawn().await;
+        dns.set("target.test", &["127.0.0.1"], &[], 60);
+        dns.set("proxy.test", &["127.0.0.1"], &[], 60);
+        let dir = tempfile::tempdir().unwrap();
+        let profile = format!(
+            "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\n\
+encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.1:{}\nipv6 = false\n\
+[Proxy]\n{proxies}\n[Proxy Group]\n{groups}\n[Rule]\nPROTOCOL,DNS,Up\nFINAL,DIRECT\n",
+            dns.addr().port()
+        );
+        let engine = engine_from_profile(dir.path(), &profile).await;
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine
+                .runtime()
+                .stack
+                .resolver
+                .lookup("target.test", rurge_dns::resolver::LookupOpts::default()),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("{what}: the lookup must not wait for the proxy's own name to be resolved")
+        });
+        assert!(
+            res.is_ok(),
+            "{what}: resolution through the pipeline: {res:?}"
+        );
+        let internal = internal_sessions(&engine);
+        assert!(
+            internal.iter().any(|r| {
+                r.error.as_deref()
+                    == Some(
+                        "dns-follow: proxy configured by host name bypassed to avoid a resolution loop",
+                    )
+                    && r.policy.first().map(String::as_str) == Some("Up")
+            }),
+            "{what}: a bypassed internal DNS session: {internal:?}"
+        );
+    }
+}
+
+/// The other direction: `Up` is named by host name too, but its own server
+/// travels to `UpIp` as a CONNECT target and is never resolved on this
+/// machine, so there is no loop and nothing to bypass. A future widening of
+/// the guard to "any host-named hop in the chain" has to fail here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_named_hop_above_an_ip_proxy_is_not_bypassed() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    // second hop: whatever it is asked to reach, it lands on the DNS server
+    let far = FakeHttpProxy::spawn(HttpProxyScript {
+        connect_to: Some(dns.addr()),
+        ..HttpProxyScript::default()
+    })
+    .await;
+    // first hop: whatever it is asked to reach, it lands on `far`
+    let near = FakeHttpProxy::spawn(HttpProxyScript {
+        connect_to: Some(far.addr()),
+        ..HttpProxyScript::default()
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile = format!(
+        "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\n\
+encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.1:{}\nipv6 = false\n\
+[Proxy]\nUp = http, proxy.test, 8080, underlying-proxy=UpIp\nUpIp = http, 127.0.0.1, {}\n\
+[Proxy Group]\n[Rule]\nPROTOCOL,DNS,Up\nFINAL,DIRECT\n",
+        dns.addr().port(),
+        near.addr().port()
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        engine
+            .runtime()
+            .stack
+            .resolver
+            .lookup("target.test", rurge_dns::resolver::LookupOpts::default()),
+    )
+    .await
+    .expect("the lookup goes through the chain inside the bound");
+    assert!(res.is_ok(), "resolution through the chain: {res:?}");
+    // the host name left this machine as a CONNECT target, unresolved
+    assert_eq!(
+        near.heads().first().map(|h| h.request_line.as_str()),
+        Some("CONNECT proxy.test:8080 HTTP/1.1")
+    );
+    let expected = format!("CONNECT 127.0.0.1:{} HTTP/1.1", dns.addr().port());
+    assert_eq!(
+        far.heads().first().map(|h| h.request_line.as_str()),
+        Some(expected.as_str())
+    );
+    let internal = internal_sessions(&engine);
+    assert!(
+        internal
+            .iter()
+            .any(|r| r.policy.first().map(String::as_str) == Some("Up")),
+        "{internal:?}"
+    );
+    assert!(
+        internal.iter().all(|r| r.error.is_none()),
+        "nothing in this chain is resolved locally: {internal:?}"
+    );
+}
+
 #[tokio::test]
 async fn persisted_group_selection_is_honored() {
     // Pick = select, HK, DIRECT; a state selecting DIRECT must resolve to DIRECT
