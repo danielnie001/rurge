@@ -2190,6 +2190,7 @@ name = "rurge-proto"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "getrandom 0.3.4",
  "p12-keystore",
  "rcgen",
  "rurge-config",
@@ -2198,6 +2199,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]

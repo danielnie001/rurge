@@ -1,6 +1,12 @@
 //! Why an outbound could not be built from its spec.
 
+use crate::keystore::decode_p12;
+use crate::transport::tls::TlsClient;
+use rurge_config::spec::TlsOpts;
+use rurge_config::{HostName, KeystoreItem};
+use rustls::RootCertStore;
 use std::fmt;
+use std::sync::Arc;
 
 /// The text is shown to the user (`rurge check`): never put a secret in it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,6 +29,31 @@ impl fmt::Display for BuildError {
 }
 
 impl std::error::Error for BuildError {}
+
+/// The TLS layer of a policy, when it has one. `client-cert` is looked up in
+/// `keystore` and decoded here, so a broken p12 surfaces at build time.
+pub fn tls_client(
+    opts: Option<&TlsOpts>,
+    server: &HostName,
+    default_alpn: &[&str],
+    keystore: &[KeystoreItem],
+    roots: Arc<RootCertStore>,
+) -> Result<Option<TlsClient>, BuildError> {
+    let Some(opts) = opts else {
+        return Ok(None);
+    };
+    let identity = match &opts.client_cert {
+        None => None,
+        Some(name) => {
+            let item = keystore
+                .iter()
+                .find(|k| &k.name == name)
+                .ok_or_else(|| BuildError::new(format!("keystore item `{name}` does not exist")))?;
+            Some(decode_p12(item)?)
+        }
+    };
+    TlsClient::build(opts, server, default_alpn, identity, roots).map(Some)
+}
 
 #[cfg(test)]
 mod tests {
