@@ -158,6 +158,8 @@ pub struct ProxyPolicy {
     pub port: Option<u16>,
     pub positional: Vec<String>,
     pub params: ParamMap,
+    /// The text right of `name =` as written (API policy detail, `lineHash`).
+    pub definition: String,
     pub span: Span,
 }
 
@@ -212,6 +214,7 @@ pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPo
         port,
         positional,
         params,
+        definition: definition.trim().to_string(),
         span: span.clone(),
     })
 }
@@ -335,6 +338,8 @@ pub struct PolicyGroup {
     pub params: ParamMap,
     pub conditions: Vec<(SubnetExpr, String)>,
     pub legacy_keyword: bool,
+    /// The text right of `name =` as written (API `lineHash`).
+    pub definition: String,
     pub span: Span,
 }
 
@@ -378,6 +383,7 @@ pub fn parse_group(name: &str, definition: &str, span: &Span) -> Result<PolicyGr
         params,
         conditions,
         legacy_keyword,
+        definition: definition.trim().to_string(),
         span: span.clone(),
     })
 }
@@ -553,5 +559,21 @@ mod tests {
             SubnetExpr::parse("中文中文中文").unwrap(),
             SubnetExpr::Bare("中文中文中文".into())
         );
+    }
+
+    #[test]
+    fn the_definition_text_is_kept_as_written() {
+        let p = parse_policy(
+            "Up",
+            "  http, proxy.test, 8080, alice, s3cret, skip-cert-verify=true ",
+            &span(),
+        )
+        .unwrap();
+        assert_eq!(
+            p.definition,
+            "http, proxy.test, 8080, alice, s3cret, skip-cert-verify=true"
+        );
+        let g = parse_group("Pick", " select, Up, DIRECT, hidden=true", &span()).unwrap();
+        assert_eq!(g.definition, "select, Up, DIRECT, hidden=true");
     }
 }

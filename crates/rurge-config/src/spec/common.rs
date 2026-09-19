@@ -158,8 +158,9 @@ pub(crate) fn read_common(
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_string);
+    // iOS only: never applicable here, so the value is not ours to judge
     let hybrid_present = r.has("hybrid");
-    let _ = r.choice("hybrid", &TRISTATES);
+    r.touch("hybrid");
 
     if applies == Applies::Direct {
         for key in PROXY_ONLY {
@@ -298,7 +299,6 @@ mod tests {
             ("http, h, 1, test-udp=apple.com", "test-udp"),
             ("http, h, 1, test-udp=apple.com@::1", "test-udp"),
             ("http, h, 1, ecn=maybe", "ecn"),
-            ("http, h, 1, hybrid=sometimes", "hybrid"),
         ] {
             let (_, _, diags) = read(def, Applies::Proxy);
             assert_eq!(diags.len(), 1, "{def}: {diags:?}");
@@ -341,5 +341,23 @@ mod tests {
         assert!(notes.inert.is_empty() && notes.ios_only.is_empty());
         let (_, _, diags) = read("reject, tos=999", Applies::Reject);
         assert_eq!(diags[0].code, codes::E_INVALID_POLICY_PARAM);
+    }
+
+    #[test]
+    fn hybrid_is_ios_only_so_its_value_is_never_checked() {
+        for def in [
+            "http, h, 1, hybrid=sometimes",
+            "http, h, 1, hybrid=on",
+            "direct, hybrid=",
+        ] {
+            let applies = if def.starts_with("direct") {
+                Applies::Direct
+            } else {
+                Applies::Proxy
+            };
+            let (_, notes, diags) = read(def, applies);
+            assert!(diags.is_empty(), "{def}: {diags:?}");
+            assert_eq!(notes.ios_only, ["hybrid"], "{def}");
+        }
     }
 }

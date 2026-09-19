@@ -90,11 +90,18 @@ fn redact_body(line: &str) -> String {
     // policy lines: `name = type, host, port, password=..., psk=...`, or
     // `name = http/https/socks5/socks5-tls, host, port, username, password`
     // (those types carry credentials positionally, not as `password=...`).
-    let mut redacted = redact_positional_credentials(value);
+    format!("{key}={}", redact_definition(value))
+}
+
+/// A policy definition (the text right of `name =`) with its secrets blanked:
+/// positional credentials of `http` / `https` / `socks5` / `socks5-tls`, and
+/// every secret `name=value` parameter.
+pub fn redact_definition(definition: &str) -> String {
+    let mut redacted = redact_positional_credentials(definition);
     for param in SECRET_PARAMS {
         redacted = redact_param(&redacted, param);
     }
-    format!("{key}={redacted}")
+    redacted
 }
 
 /// For `http` / `https` / `socks5` / `socks5-tls` policy lines, blanks every
@@ -248,5 +255,31 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
     fn crlf_line_endings_survive_redaction() {
         let out = redact_profile("a = b\r\npassword = x\r\n");
         assert_eq!(out, "a = b\r\npassword = ***\r\n");
+    }
+
+    #[test]
+    fn a_definition_is_redacted_like_its_profile_line() {
+        for def in [
+            "http, proxy.test, 8080, alice, s3cret, skip-cert-verify=true",
+            "socks5, proxy.test, 1080, username=bob, password=hunter2",
+            "ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x",
+            "direct, interface=eth0",
+        ] {
+            let alone = redact_definition(def);
+            // one rule, two entry points: the profile endpoint must agree
+            assert_eq!(
+                format!("X = {alone}"),
+                redact_profile(&format!("X = {def}")),
+                "{def}"
+            );
+            for secret in ["s3cret", "hunter2", "alice", "bob"] {
+                assert!(!alone.contains(secret), "{def} -> {alone}");
+            }
+        }
+        assert!(redact_definition("http, h, 1, u, p").contains("***"));
+        assert_eq!(
+            redact_definition("direct, interface=eth0"),
+            "direct, interface=eth0"
+        );
     }
 }

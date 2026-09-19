@@ -38,6 +38,21 @@ impl HostName {
             HostName::Domain(_) => None,
         }
     }
+
+    /// A name that came off the network (a SOCKS5 request, a CONNECT
+    /// authority). `None` when it is empty or holds a control character or
+    /// whitespace: nothing a resolver, a rule or a proxy request line can
+    /// carry safely. Non-ASCII (IDN) names pass through unchanged, so rules
+    /// keep matching what the client sent; outbounds convert them to A-labels.
+    pub fn from_wire(s: &str) -> Option<HostName> {
+        if s.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return None;
+        }
+        match HostName::parse(s) {
+            HostName::Domain(d) if d.is_empty() => None,
+            host => Some(host),
+        }
+    }
 }
 
 impl fmt::Display for HostName {
@@ -61,6 +76,41 @@ mod tests {
         assert_eq!(
             HostName::parse("[example.com]"),
             HostName::Domain("example.com".into())
+        );
+    }
+
+    #[test]
+    fn names_from_the_wire_may_not_hold_control_characters_or_whitespace() {
+        for bad in [
+            "",
+            ".",
+            "a.test\r\nX-Evil: 1",
+            "a\0b.test",
+            "a b.test",
+            " a.test",
+            "a.test\t",
+            "a\u{7f}.test",
+            "a\u{85}.test",
+            "a\u{2028}.test",
+        ] {
+            assert_eq!(HostName::from_wire(bad), None, "{bad:?}");
+        }
+        assert_eq!(
+            HostName::from_wire("Example.TEST."),
+            Some(HostName::Domain("example.test".into()))
+        );
+        assert_eq!(
+            HostName::from_wire("[::1]"),
+            Some(HostName::Ip("::1".parse().unwrap()))
+        );
+        assert_eq!(
+            HostName::from_wire("192.0.2.7"),
+            Some(HostName::Ip("192.0.2.7".parse().unwrap()))
+        );
+        // IDN names pass through: rules keep matching what the client sent
+        assert_eq!(
+            HostName::from_wire("bücher.example"),
+            Some(HostName::Domain("bücher.example".into()))
         );
     }
 }
