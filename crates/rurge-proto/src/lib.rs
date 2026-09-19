@@ -3,6 +3,7 @@
 
 pub mod build;
 pub mod direct;
+mod hostname;
 pub mod http;
 pub mod keystore;
 pub mod outbound;

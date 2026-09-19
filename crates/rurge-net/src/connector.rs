@@ -166,6 +166,14 @@ async fn connect_one(
     Ok(stream)
 }
 
+/// `host:port` the way it is dialled: an IPv6 literal goes in brackets.
+fn display_target(target: &Target) -> String {
+    match &target.host {
+        HostName::Ip(IpAddr::V6(v6)) => format!("[{v6}]:{}", target.port),
+        host => format!("{host}:{}", target.port),
+    }
+}
+
 impl Connector for DirectConnector {
     fn connect<'a>(
         &'a self,
@@ -179,12 +187,20 @@ impl Connector for DirectConnector {
                     HostName::Ip(ip) => (vec![*ip], Vec::new()),
                     HostName::Domain(d) => {
                         let addrs = self.resolver.resolve(d).await?;
+                        if addrs.is_empty() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!("no address found for {d}"),
+                            ));
+                        }
                         let planned =
                             plan_addresses(addrs, self.opts.ip_version, self.opts.v6_first);
                         if planned.0.is_empty() {
                             return Err(io::Error::new(
                                 io::ErrorKind::NotFound,
-                                format!("no usable address for {d} (ip-version)"),
+                                format!(
+                                    "no usable address for {d}: every answer was filtered out by ip-version"
+                                ),
                             ));
                         }
                         planned
@@ -213,7 +229,7 @@ impl Connector for DirectConnector {
                 Ok(Err(e)) => Err(e),
                 Err(_) => Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("connect to {}:{} timed out", target.host, target.port),
+                    format!("connect to {} timed out", display_target(target)),
                 )),
             }
         })
@@ -501,7 +517,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert_eq!(
             err.to_string(),
-            "no usable address for both.test (ip-version)"
+            "no usable address for both.test: every answer was filtered out by ip-version"
         );
     }
 
@@ -526,5 +542,58 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert_eq!(err.to_string(), "connect to slow.test:80 timed out");
+    }
+
+    #[tokio::test]
+    async fn an_empty_answer_and_a_filtered_answer_read_differently() {
+        let empty = DirectConnector::new(Arc::new(Fixed(Vec::new())));
+        let e = empty
+            .connect(
+                &Target::new(HostName::parse("empty.test"), 80),
+                &ConnectOpts::default(),
+            )
+            .await
+            .err()
+            .expect("no address, no connection");
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        assert_eq!(e.to_string(), "no address found for empty.test");
+
+        let v6_only = DirectConnector::with_opts(
+            Arc::new(Fixed(vec![ip("127.0.0.1")])),
+            SocketOpts {
+                ip_version: IpVersion::V6Only,
+                ..SocketOpts::default()
+            },
+            Arc::new(NoopSocketHook),
+        );
+        let e = v6_only
+            .connect(
+                &Target::new(HostName::parse("v4.test"), 80),
+                &ConnectOpts::default(),
+            )
+            .await
+            .err()
+            .expect("the only answer is filtered out");
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            e.to_string(),
+            "no usable address for v4.test: every answer was filtered out by ip-version"
+        );
+    }
+
+    #[test]
+    fn targets_are_displayed_the_way_they_are_dialled() {
+        assert_eq!(
+            display_target(&Target::new(HostName::parse("::1"), 80)),
+            "[::1]:80"
+        );
+        assert_eq!(
+            display_target(&Target::new(HostName::parse("192.0.2.1"), 80)),
+            "192.0.2.1:80"
+        );
+        assert_eq!(
+            display_target(&Target::new(HostName::parse("a.test"), 443)),
+            "a.test:443"
+        );
     }
 }

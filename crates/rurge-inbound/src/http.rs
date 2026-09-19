@@ -957,4 +957,20 @@ mod tests {
             Some(SessionOutcome::Failed("killed".into()))
         );
     }
+
+    /// `connect` and `forward` hand `authority.host()` to `HostName::parse`
+    /// without further checks. That is sound only because `http::Uri` cannot
+    /// hold these bytes; this test pins the guarantee we rely on.
+    #[test]
+    fn an_http_authority_cannot_carry_control_characters_or_spaces() {
+        for bad in [
+            "a b.test:80",
+            "a.test\r\nX-Evil: 1:80",
+            "a\0.test:80",
+            "a\t.test:80",
+        ] {
+            assert!(bad.parse::<http::uri::Authority>().is_err(), "{bad:?}");
+            assert!(format!("http://{bad}/").parse::<Uri>().is_err(), "{bad:?}");
+        }
+    }
 }

@@ -72,8 +72,10 @@ fn connect_request(target: &Target) -> Result<Vec<u8>, OutboundError> {
             request.push(4);
             request.extend_from_slice(&v6.octets());
         }
-        // the proxy resolves the name (remote resolution)
+        // the proxy resolves the name (remote resolution); an IDN goes out as A-labels
         HostName::Domain(name) => {
+            let name = crate::hostname::to_ascii(name)
+                .ok_or_else(|| proxy("the host name cannot be sent to a SOCKS5 proxy"))?;
             let len = u8::try_from(name.len())
                 .map_err(|_| proxy("the host name is longer than 255 bytes"))?;
             request.push(3);
@@ -348,6 +350,24 @@ mod tests {
             (3, "remote.example", 443)
         );
         assert_eq!((seen[1].atyp, seen[1].host.as_str()), (4, "2001:db8::1"));
+    }
+
+    #[tokio::test]
+    async fn an_idn_target_is_sent_as_its_a_label() {
+        let echo = echo_server().await;
+        let server = FakeSocks5::spawn(Socks5Script {
+            connect_to: Some(echo),
+            ..Socks5Script::default()
+        })
+        .await;
+        let out = outbound(
+            &format!("socks5, 127.0.0.1, {}", server.addr().port()),
+            no_roots(),
+        );
+        let t = Target::new(HostName::Domain("bücher.example".into()), 443);
+        let mut stream = out.connect_tcp(&t, &ConnectOpts::default()).await.unwrap();
+        roundtrip(&mut stream, b"idn").await;
+        assert_eq!(server.requests()[0].host, "xn--bcher-kva.example");
     }
 
     #[tokio::test]

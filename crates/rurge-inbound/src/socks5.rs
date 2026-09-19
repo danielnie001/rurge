@@ -89,7 +89,16 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Result<(HostName, u1
             stream.read_exact(&mut b).await?;
             let s = String::from_utf8(b)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 domain"))?;
-            HostName::parse(&s)
+            // A name with a control character or whitespace is never a host
+            // name. Refuse it here, once, instead of trusting every outbound
+            // that writes names into a text protocol to catch it.
+            match HostName::from_wire(&s) {
+                Some(host) => host,
+                None => {
+                    stream.read_u16().await?;
+                    return Ok(Err(REP_GENERAL_FAILURE));
+                }
+            }
         }
         ATYP_V6 => {
             let mut b = [0u8; 16];
@@ -336,6 +345,19 @@ mod tests {
         s.write_all(&req).await.unwrap();
         assert_eq!(read_reply(&mut s).await[1], REP_GENERAL_FAILURE);
         assert!(dialer.sessions().is_empty(), "no dial for an empty name");
+    }
+
+    /// A name with a line break or a space is never a host name. Passing it on
+    /// would make every text-protocol outbound responsible for it.
+    #[tokio::test]
+    async fn a_domain_name_with_control_characters_is_answered_without_dialing() {
+        let (running, dialer) = listener(Duration::from_secs(30)).await;
+        for name in ["echo.test\r\nX-Evil: 1", "echo .test", "echo.test\0"] {
+            let mut s = negotiate(running.local_addr).await;
+            s.write_all(&domain_request(name, 7)).await.unwrap();
+            assert_eq!(read_reply(&mut s).await[1], REP_GENERAL_FAILURE, "{name:?}");
+        }
+        assert!(dialer.sessions().is_empty(), "nothing was dialled");
     }
 
     /// A client that connects and then stalls must be cut loose by

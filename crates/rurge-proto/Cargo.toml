@@ -19,6 +19,7 @@ rcgen = { workspace = true, optional = true }
 p12-keystore.workspace = true
 getrandom.workspace = true
 tracing.workspace = true
+idna.workspace = true
 
 [features]
 # Scriptable loopback peers (`rurge_proto::testing`); enabled by dependants' dev-dependencies.

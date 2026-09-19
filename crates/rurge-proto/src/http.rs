@@ -78,30 +78,24 @@ fn merge(base: &mut Vec<(String, String)>, custom: Vec<(String, String)>) {
     }
 }
 
-fn authority(target: &Target) -> String {
+/// The target's host as it goes into a request line: an IP literal (IPv6 in
+/// brackets), or the ASCII form of a domain. `None` = not safe to write.
+fn wire_host(target: &Target) -> Option<String> {
     match &target.host {
-        HostName::Ip(IpAddr::V6(v6)) => format!("[{v6}]:{}", target.port),
-        host => format!("{host}:{}", target.port),
+        HostName::Ip(IpAddr::V6(v6)) => Some(format!("[{v6}]")),
+        HostName::Ip(ip) => Some(ip.to_string()),
+        HostName::Domain(name) => crate::hostname::to_ascii(name),
     }
 }
 
-/// Whether `target`'s host name is safe to write verbatim into an HTTP
-/// request line or a `Host` header: an IP literal, or a non-empty domain made
-/// only of bytes `0x21..=0x7e` (printable, non-space ASCII).
-///
-/// A domain name can be caller-supplied (it may come from a client's SOCKS5
-/// / HTTP CONNECT request) and must not be trusted: anything outside that
-/// range — a CR or LF above all — could break out of the request line or the
-/// `Host` header of a text protocol, smuggling a second request into the
-/// proxy connection and carrying our `Proxy-Authorization` with it. An IP
-/// literal's `Display` can never contain such bytes, so it is always fine.
+/// Whether `target` can be written into a request line and a `Host` header:
+/// an IP literal, or a domain whose ASCII form (IDNs become A-labels) is not
+/// empty and made of bytes `0x21..=0x7e` only. Anything else could break out
+/// of the request line of a text protocol. The CONNECT path checks this
+/// itself; a caller that writes requests of its own (`HttpForward`) must
+/// check it first.
 pub fn valid_target(target: &Target) -> bool {
-    match &target.host {
-        HostName::Ip(_) => true,
-        HostName::Domain(name) => {
-            !name.is_empty() && name.bytes().all(|b| (0x21..=0x7e).contains(&b))
-        }
-    }
+    wire_host(target).is_some()
 }
 
 fn check_status(head: &[u8]) -> Result<(), OutboundError> {
@@ -111,7 +105,9 @@ fn check_status(head: &[u8]) -> Result<(), OutboundError> {
     let (version, code) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     // the proxy's own text, so bounded and stripped of control characters
     // before it can reach the session log or the request log
-    let reason = untrusted_text(parts.next().unwrap_or("").trim(), 64);
+    let reason = parts.next().unwrap_or("");
+    let reason = untrusted_text(reason, 64);
+    let reason = reason.trim_end();
     match code.parse::<u16>() {
         Ok(code) if version.starts_with("HTTP/1.") && (200..300).contains(&code) => Ok(()),
         Ok(code) if version.starts_with("HTTP/1.") => {
@@ -177,10 +173,11 @@ impl HttpOutbound {
         }
     }
 
-    /// The caller must have already checked `valid_target(target)`: this
-    /// never re-checks, and a rejected target must never reach it.
-    fn connect_request(&self, target: &Target) -> Vec<u8> {
-        let authority = authority(target);
+    /// The caller must have already checked `valid_target(target)` (via
+    /// `wire_host`): this never re-checks, and a rejected target must never
+    /// reach it.
+    fn connect_request(&self, host: &str, port: u16) -> Vec<u8> {
+        let authority = format!("{host}:{port}");
         let mut headers = vec![("Host".to_string(), authority.clone())];
         if let Some(value) = &self.authorization {
             headers.push(("Proxy-Authorization".to_string(), value.clone()));
@@ -202,14 +199,16 @@ impl HttpOutbound {
         target: &Target,
         opts: &ConnectOpts,
     ) -> Result<BoxedStream, OutboundError> {
-        if !valid_target(target) {
-            // never dial or write a byte for a target we cannot safely quote
+        // never dial or write a byte for a target we cannot safely quote
+        let Some(host) = wire_host(target) else {
             return Err(OutboundError::Proxy(
                 "the target host name is not valid for an HTTP proxy request".to_string(),
             ));
-        }
+        };
         let mut stream = self.dial(opts).await?;
-        stream.write_all(&self.connect_request(target)).await?;
+        stream
+            .write_all(&self.connect_request(&host, target.port))
+            .await?;
         let (head, rest) = read_head(&mut stream, MAX_HEAD)
             .await
             .map_err(|e| match e.kind() {
@@ -383,6 +382,30 @@ mod tests {
             assert_eq!(proxy.heads().last().unwrap().request_line, line);
         }
         assert!(proxy.heads()[0].header("Proxy-Authorization").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_idn_target_is_sent_as_its_a_label() {
+        let echo = echo_server().await;
+        let proxy = FakeHttpProxy::spawn(HttpProxyScript {
+            connect_to: Some(echo),
+            ..HttpProxyScript::default()
+        })
+        .await;
+        let out = outbound(
+            &format!("http, 127.0.0.1, {}", proxy.addr().port()),
+            no_roots(),
+        );
+        let t = Target::new(HostName::Domain("bücher.example".into()), 443);
+        let mut stream = out.connect_tcp(&t, &ConnectOpts::default()).await.unwrap();
+        roundtrip(&mut stream, b"idn").await;
+        let head = &proxy.heads()[0];
+        assert_eq!(
+            head.request_line,
+            "CONNECT xn--bcher-kva.example:443 HTTP/1.1"
+        );
+        assert_eq!(head.header("Host"), Some("xn--bcher-kva.example:443"));
+        assert!(valid_target(&t));
     }
 
     #[tokio::test]
@@ -726,5 +749,12 @@ mod tests {
             matches!(&err, OutboundError::Proxy(m) if m == "http proxy answered 407"),
             "{err}"
         );
+
+        // a control character at the very end must not leave a trailing space
+        let Err(OutboundError::Proxy(m)) = check_status(b"HTTP/1.1 403 Forbidden \x1b\r\n\r\n")
+        else {
+            panic!("expected a proxy error");
+        };
+        assert_eq!(m, "http proxy answered 403 Forbidden");
     }
 }
