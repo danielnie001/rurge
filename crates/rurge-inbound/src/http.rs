@@ -3,7 +3,9 @@
 
 use crate::listener::{HttpAuth, ListenerOpts, Running, bind, serve};
 use crate::responses::{self, ResponseBody};
-use crate::session::{Counting, DialError, Dialer, FailKind, SessionHandle, SessionOutcome};
+use crate::session::{
+    Counting, DialError, Dialed, Dialer, FailKind, SessionHandle, SessionOutcome,
+};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use http::{
@@ -285,6 +287,41 @@ pub(crate) fn origin_form(req: &mut Request<Incoming>) -> Result<(), http::Error
     Ok(())
 }
 
+/// Keeps a proxy request in absolute form for an upstream HTTP proxy
+/// (`always-use-connect = false`): the URI is rebuilt without userinfo, the
+/// hop-by-hop headers go, `Host` follows the request target, and `extra` —
+/// the upstream's `Proxy-Authorization` and configured headers — replaces
+/// same-name headers, `Host` included (manual: Policies › HTTP).
+pub(crate) fn absolute_form<B>(
+    req: &mut Request<B>,
+    extra: &[(String, String)],
+) -> Result<(), http::Error> {
+    let authority = req.uri().authority().map(host_port).unwrap_or_default();
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    *req.uri_mut() = format!("http://{authority}{path}").parse::<Uri>()?;
+    strip_hop_by_hop(req.headers_mut());
+    if let Ok(v) = HeaderValue::from_str(&authority) {
+        req.headers_mut().insert(header::HOST, v);
+    }
+    for (name, value) in extra {
+        let (Ok(name), Ok(value)) = (
+            HeaderName::try_from(name.as_str()),
+            HeaderValue::from_str(value),
+        ) else {
+            // the outbound validated its templates; whatever the http crate
+            // still refuses is dropped rather than sent malformed
+            tracing::debug!(listener = "http", "dropped an upstream proxy header");
+            continue;
+        };
+        req.headers_mut().insert(name, value);
+    }
+    Ok(())
+}
+
 fn failure_response(
     ctx: &Ctx,
     handle: &SessionHandle,
@@ -384,8 +421,12 @@ async fn forward(
         }
     };
 
-    let handle = dialed.handle.clone();
-    let io = TokioIo::new(Counting::new(dialed.stream, handle.clone()));
+    let Dialed {
+        stream: upstream,
+        handle,
+        forward: upstream_headers,
+    } = dialed;
+    let io = TokioIo::new(Counting::new(upstream, handle.clone()));
     let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
         Ok(pair) => pair,
         Err(e) => {
@@ -419,7 +460,13 @@ async fn forward(
             tracing::error!(listener = "http", "upstream connection task panicked: {e}");
         }
     });
-    if let Err(e) = origin_form(&mut req) {
+    // To an HTTP proxy the request stays in absolute form; to anything else
+    // (an origin, a tunnel) it goes in origin form.
+    let rewritten = match &upstream_headers {
+        Some(headers) => absolute_form(&mut req, headers),
+        None => origin_form(&mut req),
+    };
+    if let Err(e) = rewritten {
         handle.finish(SessionOutcome::Failed(format!("bad request uri: {e}")));
         return Ok(responses::bad_request("malformed request URI"));
     }
@@ -972,5 +1019,65 @@ mod tests {
             assert!(bad.parse::<http::uri::Authority>().is_err(), "{bad:?}");
             assert!(format!("http://{bad}/").parse::<Uri>().is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn absolute_form_keeps_the_uri_and_applies_the_upstream_headers() {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("http://user:pw@example.test:8080/a?b=1")
+            .header("Host", "lying.internal")
+            .header("Proxy-Authorization", "Basic Y2xpZW50")
+            .header("Proxy-Connection", "keep-alive")
+            .header("Connection", "X-Hop")
+            .header("X-Hop", "1")
+            .header("X-Keep", "1")
+            .body(())
+            .unwrap();
+        absolute_form(
+            &mut req,
+            &[
+                ("Proxy-Authorization".to_string(), "Basic dXA=".to_string()),
+                ("X-Pad".to_string(), "abc".to_string()),
+            ],
+        )
+        .unwrap();
+        // still absolute, without the userinfo
+        assert_eq!(req.uri().to_string(), "http://example.test:8080/a?b=1");
+        let h = req.headers();
+        assert_eq!(h.get("host").unwrap(), "example.test:8080");
+        // the client's credentials for this hop are gone, the upstream's are on
+        assert_eq!(h.get("proxy-authorization").unwrap(), "Basic dXA=");
+        assert_eq!(h.get("x-pad").unwrap(), "abc");
+        assert_eq!(h.get("x-keep").unwrap(), "1");
+        for gone in ["proxy-connection", "connection", "x-hop"] {
+            assert!(h.get(gone).is_none(), "{gone}");
+        }
+    }
+
+    #[test]
+    fn the_upstream_headers_replace_same_name_headers_including_host() {
+        let mut req = Request::builder()
+            .uri("http://example.test/")
+            .header("User-Agent", "client/1")
+            .body(())
+            .unwrap();
+        absolute_form(
+            &mut req,
+            &[
+                ("Host".to_string(), "edge.example".to_string()),
+                ("User-Agent".to_string(), "rurge".to_string()),
+                ("Bad Name".to_string(), "dropped".to_string()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(req.headers().get("host").unwrap(), "edge.example");
+        assert_eq!(req.headers().get_all("user-agent").iter().count(), 1);
+        assert_eq!(req.headers().get("user-agent").unwrap(), "rurge");
+        assert_eq!(
+            req.headers().len(),
+            2,
+            "the malformed header is dropped, not sent"
+        );
     }
 }

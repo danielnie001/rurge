@@ -243,6 +243,11 @@ pub enum FailKind {
 pub struct Dialed {
     pub stream: BoxedStream,
     pub handle: Arc<SessionHandle>,
+    /// `Some` when `stream` leads to an HTTP proxy that takes plain requests
+    /// in absolute form (no CONNECT was sent): the headers to put on the
+    /// request — they replace same-name headers — rendered once for this
+    /// connection. Only ever set for a plain request of the HTTP listener.
+    pub forward: Option<Vec<(String, String)>>,
 }
 
 pub enum DialError {

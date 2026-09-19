@@ -719,8 +719,38 @@ impl Dialer for Engine {
             let opts = ConnectOpts {
                 timeout: CONNECT_TIMEOUT,
             };
-            match resolution.outbound.connect_tcp(&target, &opts).await {
-                Ok(stream) => Ok(Dialed { stream, handle }),
+            // A plain request of the HTTP listener can go to an HTTP proxy in
+            // absolute form instead of through a tunnel (M1 design 6.5). The
+            // inbound writes the request line, so the target is checked here
+            // first, and the headers are rendered once for this connection
+            // (the two obligations `HttpForward` puts on its caller).
+            let plain_http =
+                handle.session().listener == ListenerKind::Http && handle.session().url.is_some();
+            let forward = if plain_http {
+                resolution.outbound.http_forward()
+            } else {
+                None
+            };
+            let connected = match forward {
+                Some(proxy) if rurge_proto::http::valid_target(&target) => proxy
+                    .connect(&opts)
+                    .await
+                    .map(|stream| (stream, Some(proxy.request_headers()))),
+                Some(_) => Err(OutboundError::Proxy(
+                    "the target host name is not valid for an HTTP proxy request".to_string(),
+                )),
+                None => resolution
+                    .outbound
+                    .connect_tcp(&target, &opts)
+                    .await
+                    .map(|stream| (stream, None)),
+            };
+            match connected {
+                Ok((stream, forward)) => Ok(Dialed {
+                    stream,
+                    handle,
+                    forward,
+                }),
                 Err(OutboundError::Reject(kind)) => {
                     let effective = if kind.escalates() {
                         let host = handle.session().dst_host.to_string();

@@ -11,7 +11,7 @@ use rurge_engine::{Engine, EngineShared, ListenerSpec, Runtime, RuntimeOptions};
 use rurge_inbound::Running;
 use rurge_net::socket::NoopSocketHook;
 use rurge_net::testing::TestServer;
-use rurge_proto::testing::{FakeHttpProxy, HttpProxyScript};
+use rurge_proto::testing::{FakeHttpProxy, FakeSocks5, HttpProxyScript, Socks5Script};
 use rurge_rules::{GeoUrls, OutboundMode};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -232,4 +232,150 @@ async fn dropping_the_engine_empties_the_cell() {
     // the accept loops hold the last references and are aborted asynchronously
     wait_until("the engine to go away", || shared.cell.load().is_none()).await;
     drop(dir); // the profile outlives the engine that read it
+}
+
+/// One request/response over a fresh connection to rurge's HTTP listener.
+async fn plain_get(proxy: SocketAddr, url: &str, host: &str) -> String {
+    let mut s = TcpStream::connect(proxy).await.unwrap();
+    s.write_all(
+        format!(
+            "GET {url} HTTP/1.1\r\nHost: {host}\r\nProxy-Connection: keep-alive\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf)).await;
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn origin_addr(origin: &TestServer) -> SocketAddr {
+    format!("127.0.0.1:{}", origin.url("/").port().unwrap())
+        .parse()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_plain_request_goes_to_an_http_upstream_in_absolute_form() {
+    let upstream = FakeHttpProxy::spawn(HttpProxyScript {
+        auth: Some(("alice".into(), "s3cret".into())),
+        ..HttpProxyScript::default()
+    })
+    .await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "Up = http, 127.0.0.1, {}, alice, s3cret, headers=X-Client:rurge",
+            upstream.addr().port()
+        ),
+        rules: "DOMAIN,target.test,Up",
+        ..Profile::default()
+    })
+    .await;
+    let response = plain_get(
+        h.http(),
+        "http://u:p@target.test:8080/hello?x=1",
+        "lying.internal",
+    )
+    .await;
+    // the fake answers absolute-form requests itself
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("forwarded"), "{response}");
+    let heads = upstream.heads();
+    assert_eq!(heads.len(), 1, "one connection, one request, no CONNECT");
+    assert_eq!(
+        heads[0].request_line,
+        "GET http://target.test:8080/hello?x=1 HTTP/1.1"
+    );
+    assert_eq!(heads[0].header("Host"), Some("target.test:8080"));
+    // base64("alice:s3cret")
+    assert_eq!(
+        heads[0].header("Proxy-Authorization"),
+        Some("Basic YWxpY2U6czNjcmV0")
+    );
+    assert_eq!(heads[0].header("X-Client"), Some("rurge"));
+    assert_eq!(heads[0].header("Proxy-Connection"), None);
+}
+
+#[tokio::test]
+async fn always_use_connect_and_other_protocols_tunnel_plain_requests() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    let http_up = FakeHttpProxy::spawn(HttpProxyScript {
+        connect_to: Some(origin_addr(&origin)),
+        ..HttpProxyScript::default()
+    })
+    .await;
+    let socks_up = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "Tunnel = http, 127.0.0.1, {}, always-use-connect=true\nSocks = socks5, 127.0.0.1, {}",
+            http_up.addr().port(),
+            socks_up.addr().port()
+        ),
+        rules: "DOMAIN,target.test,Tunnel\nDOMAIN,alt.test,Socks",
+        ..Profile::default()
+    })
+    .await;
+    let response = plain_get(
+        h.http(),
+        "http://target.test:8080/hello",
+        "target.test:8080",
+    )
+    .await;
+    assert!(response.ends_with("hi there"), "{response}");
+    assert_eq!(
+        http_up.heads()[0].request_line,
+        "CONNECT target.test:8080 HTTP/1.1"
+    );
+    let response = plain_get(h.http(), "http://alt.test:8080/hello", "alt.test:8080").await;
+    assert!(response.ends_with("hi there"), "{response}");
+    let seen = &socks_up.requests()[0];
+    assert_eq!(
+        (seen.atyp, seen.host.as_str(), seen.port),
+        (3, "alt.test", 8080)
+    );
+    // inside a tunnel the origin sees an ordinary origin-form request
+    assert_eq!(origin.hits("/hello"), 2);
+}
+
+#[tokio::test]
+async fn a_refusing_upstream_is_a_502_that_quotes_the_proxy() {
+    let upstream = FakeHttpProxy::spawn(HttpProxyScript {
+        auth: Some(("alice".into(), "right".into())),
+        ..HttpProxyScript::default()
+    })
+    .await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "Up = http, 127.0.0.1, {}, alice, wrong",
+            upstream.addr().port()
+        ),
+        rules: "DOMAIN,target.test,Up",
+        ..Profile::default()
+    })
+    .await;
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    s.write_all(b"CONNECT target.test:443 HTTP/1.1\r\nHost: target.test:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf)).await;
+    let response = String::from_utf8_lossy(&buf).into_owned();
+    assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+    let log = h.engine.request_log();
+    wait_until("the failed session", || !log.recent(10).is_empty()).await;
+    let error = log.recent(10)[0].error.clone().unwrap_or_default();
+    assert_eq!(
+        error,
+        "http proxy answered 407 Proxy Authentication Required"
+    );
+    assert!(
+        !response.contains("wrong") && !error.contains("wrong"),
+        "no credential leaks"
+    );
 }

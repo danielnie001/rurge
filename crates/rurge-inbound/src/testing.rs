@@ -77,6 +77,7 @@ impl Dialer for FakeDialer {
                 return Ok(Dialed {
                     stream: Box::new(stream),
                     handle,
+                    forward: None,
                 });
             }
             let rule = handle.rule();
