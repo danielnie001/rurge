@@ -237,19 +237,9 @@ pub(crate) fn build_tls_config(skip_verify: bool) -> Result<rustls::ClientConfig
             .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
             .with_no_client_auth()
     } else {
-        let mut roots = rustls::RootCertStore::empty();
-        let native = rustls_native_certs::load_native_certs();
-        let (added, _ignored) = roots.add_parsable_certificates(native.certs);
-        if added == 0 {
-            tracing::warn!(
-                errors = native.errors.len(),
-                "no native root certificates loaded; using webpki-roots"
-            );
-            roots
-                .roots
-                .extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        }
-        builder.with_root_certificates(roots).with_no_client_auth()
+        builder
+            .with_root_certificates(crate::tls::root_store())
+            .with_no_client_auth()
     };
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(config)

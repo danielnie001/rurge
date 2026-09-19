@@ -13,3 +13,4 @@ pub mod resource;
 pub mod socket;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+pub mod tls;
