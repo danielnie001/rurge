@@ -5,6 +5,9 @@ pub mod build;
 pub mod direct;
 pub mod outbound;
 pub mod reject;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+pub mod transport;
 
 pub use build::BuildError;
 pub use direct::Direct;

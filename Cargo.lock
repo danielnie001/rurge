@@ -1980,9 +1980,14 @@ dependencies = [
 name = "rurge-proto"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "rcgen",
  "rurge-config",
  "rurge-net",
+ "rustls",
+ "sha2",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
