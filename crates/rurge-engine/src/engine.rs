@@ -383,6 +383,11 @@ impl Engine {
         let _ = self.state.set(store);
     }
 
+    /// The attached state store, if any (`attach_state`).
+    pub(crate) fn state_store(&self) -> Option<&Arc<StateStore>> {
+        self.state.get()
+    }
+
     pub fn mode(&self) -> Mode {
         **self.mode.load()
     }

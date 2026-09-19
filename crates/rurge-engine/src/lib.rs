@@ -14,6 +14,7 @@ pub mod shared;
 pub mod sniff;
 pub mod stack;
 pub mod state;
+pub mod views;
 
 pub use control::{Control, LogLevel, Mode, ReloadReport};
 pub use engine::{Engine, ListenerSpec, PoliciesView, RuleView, UnknownPolicy};
@@ -22,3 +23,4 @@ pub use outbounds::{EngineFactory, dry_build, load_checked};
 pub use runtime::{Runtime, RuntimeOptions};
 pub use rurge_inbound::Running;
 pub use shared::EngineShared;
+pub use views::{GroupView, MemberView, SelectError};

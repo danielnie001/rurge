@@ -6,7 +6,9 @@ use rurge_config::config::{LoadOptions, from_text};
 use rurge_config::session::ListenerKind;
 use rurge_dns::system::StaticSystemDns;
 use rurge_dns::testing::MockDns;
+use rurge_engine::SelectError;
 use rurge_engine::stack::StackOptions;
+use rurge_engine::state::{STATE_FILE, StateStore, profile_key};
 use rurge_engine::{Engine, EngineShared, ListenerSpec, Runtime, RuntimeOptions};
 use rurge_inbound::Running;
 use rurge_net::socket::NoopSocketHook;
@@ -596,4 +598,196 @@ async fn rurge_talks_to_rurge() {
     // only B resolved anything: A handed the names over
     assert!(a.dns.queries().is_empty());
     assert!(!b.dns.queries().is_empty());
+}
+
+const PICK: &str = "Pick = select, A, B, DIRECT\nAuto = url-test, A, B, hidden=true";
+
+async fn two_entries(origin: &TestServer) -> (FakeSocks5, FakeSocks5, String) {
+    let script = || Socks5Script {
+        connect_to: Some(origin_addr(origin)),
+        ..Socks5Script::default()
+    };
+    let (a, b) = (
+        FakeSocks5::spawn(script()).await,
+        FakeSocks5::spawn(script()).await,
+    );
+    let proxies = format!(
+        "A = socks5, 127.0.0.1, {}, alice, s3cret\nB = socks5, 127.0.0.1, {}",
+        a.addr().port(),
+        b.addr().port()
+    );
+    (a, b, proxies)
+}
+
+#[tokio::test]
+async fn a_selection_applies_to_the_next_connection_and_survives_a_restart() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    let (a, b, proxies) = two_entries(&origin).await;
+    let h = harness(Profile {
+        proxies: &proxies,
+        groups: PICK,
+        rules: "DOMAIN,target.test,Pick",
+        ..Profile::default()
+    })
+    .await;
+    let state_path = h.dir.path().join(STATE_FILE);
+    let (store, _) = StateStore::open(state_path.clone()).await;
+    h.engine.attach_state(store);
+
+    assert_eq!(
+        h.engine.group_selection("Pick").unwrap(),
+        "A",
+        "the first member by default"
+    );
+    let mut t = connect_via_http(h.http(), "target.test:80").await;
+    assert!(
+        get(&mut t, "target.test", "/hello")
+            .await
+            .ends_with("hi there")
+    );
+    assert_eq!((a.requests().len(), b.requests().len()), (1, 0));
+
+    h.engine.select_group("Pick", "B").await.unwrap();
+    assert_eq!(h.engine.group_selection("Pick").unwrap(), "B");
+    let mut t = connect_via_http(h.http(), "target.test:80").await;
+    assert!(
+        get(&mut t, "target.test", "/hello")
+            .await
+            .ends_with("hi there")
+    );
+    assert_eq!((a.requests().len(), b.requests().len()), (1, 1));
+
+    // written under the profile's file name
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(saved["group_selections"]["t.conf"]["Pick"], "B");
+
+    // "restart": a fresh engine seeded from state.json, as `rurge run` does
+    let text = std::fs::read_to_string(h.dir.path().join("t.conf")).unwrap();
+    let (_, state) = StateStore::open(state_path).await;
+    let key = profile_key(&h.dir.path().join("t.conf"));
+    let shared = EngineShared::new(state.selections_for(&key));
+    let restarted = Engine::new(runtime(h.dir.path(), &text, shared).await);
+    assert_eq!(restarted.group_selection("Pick").unwrap(), "B");
+}
+
+#[tokio::test]
+async fn only_a_member_of_a_select_group_can_be_selected() {
+    let origin = TestServer::spawn().await;
+    let (_a, _b, proxies) = two_entries(&origin).await;
+    let h = harness(Profile {
+        proxies: &proxies,
+        groups: PICK,
+        ..Profile::default()
+    })
+    .await;
+    assert_eq!(
+        h.engine.select_group("Nope", "A").await,
+        Err(SelectError::UnknownGroup("Nope".into()))
+    );
+    assert_eq!(
+        h.engine.select_group("A", "B").await,
+        Err(SelectError::UnknownGroup("A".into())),
+        "a policy is not a group"
+    );
+    assert_eq!(
+        h.engine.select_group("Auto", "A").await,
+        Err(SelectError::NotSelectable("Auto".into()))
+    );
+    assert_eq!(
+        h.engine.select_group("Pick", "C").await,
+        Err(SelectError::NotAMember {
+            group: "Pick".into(),
+            member: "C".into()
+        })
+    );
+    assert_eq!(
+        h.engine.group_selection("Pick").unwrap(),
+        "A",
+        "nothing changed"
+    );
+    assert_eq!(
+        h.engine.group_selection("Nope"),
+        Err(SelectError::UnknownGroup("Nope".into()))
+    );
+    assert_eq!(
+        h.engine.group_selection("Auto").unwrap(),
+        "A",
+        "readable for every group kind"
+    );
+    // the messages are what the API will show
+    assert_eq!(
+        SelectError::UnknownGroup("G".into()).to_string(),
+        "unknown policy group `G`"
+    );
+    assert_eq!(
+        SelectError::NotSelectable("G".into()).to_string(),
+        "`G` is not a select group"
+    );
+    assert_eq!(
+        SelectError::NotAMember {
+            group: "G".into(),
+            member: "M".into()
+        }
+        .to_string(),
+        "`M` is not a member of `G`"
+    );
+}
+
+#[tokio::test]
+async fn views_describe_groups_and_redact_policy_details() {
+    let origin = TestServer::spawn().await;
+    let (_a, _b, proxies) = two_entries(&origin).await;
+    let h = harness(Profile {
+        proxies: &proxies,
+        groups: PICK,
+        ..Profile::default()
+    })
+    .await;
+    let groups = h.engine.groups_view();
+    assert_eq!(
+        groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+        ["Pick", "Auto"]
+    );
+    let pick = &groups[0];
+    assert_eq!(
+        (pick.kind.keyword(), pick.hidden, pick.selected.as_deref()),
+        ("select", false, Some("A"))
+    );
+    assert!(groups[1].hidden);
+    let described: Vec<(&str, bool, &str)> = pick
+        .members
+        .iter()
+        .map(|m| (m.name.as_str(), m.is_group, m.type_description.as_str()))
+        .collect();
+    assert_eq!(
+        described,
+        [
+            ("A", false, "socks5"),
+            ("B", false, "socks5"),
+            ("DIRECT", false, "DIRECT")
+        ]
+    );
+    for m in &pick.members {
+        assert_eq!(m.line_hash.len(), 16, "{}", m.name);
+        assert!(m.line_hash.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+    assert_ne!(pick.members[0].line_hash, pick.members[1].line_hash);
+
+    let detail = h.engine.policy_detail("A").expect("a configured policy");
+    assert!(detail.starts_with("socks5, 127.0.0.1, "), "{detail}");
+    assert!(
+        !detail.contains("s3cret") && !detail.contains("alice"),
+        "{detail}"
+    );
+    // Builtin::parse only accepts the exact upper-case name (verified against
+    // rurge-config/src/policy.rs); the brief's task-8-brief.md pre-authorizes
+    // using "DIRECT" here instead of "direct" for that reason.
+    assert_eq!(h.engine.policy_detail("DIRECT").as_deref(), Some("DIRECT"));
+    assert_eq!(
+        h.engine.policy_detail("Pick").as_deref(),
+        Some("select, A, B, DIRECT")
+    );
+    assert_eq!(h.engine.policy_detail("Nope"), None);
 }

@@ -23,6 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 rustls.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 rurge-net = { workspace = true, features = ["testing"] }
