@@ -187,10 +187,15 @@ impl Connector for DirectConnector {
                     HostName::Ip(ip) => (vec![*ip], Vec::new()),
                     HostName::Domain(d) => {
                         let addrs = self.resolver.resolve(d).await?;
+                        // Guards a `Resolve` implementation that answers with
+                        // an empty list instead of an error; the wording
+                        // matches what the two production resolvers
+                        // (`SystemResolve`, `rurge_dns::Resolver`) already
+                        // return as an `Err` themselves in that case.
                         if addrs.is_empty() {
                             return Err(io::Error::new(
                                 io::ErrorKind::NotFound,
-                                format!("no address found for {d}"),
+                                format!("no addresses for {d}"),
                             ));
                         }
                         let planned =
@@ -556,7 +561,7 @@ mod tests {
             .err()
             .expect("no address, no connection");
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
-        assert_eq!(e.to_string(), "no address found for empty.test");
+        assert_eq!(e.to_string(), "no addresses for empty.test");
 
         let v6_only = DirectConnector::with_opts(
             Arc::new(Fixed(vec![ip("127.0.0.1")])),

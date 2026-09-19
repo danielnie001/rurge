@@ -78,9 +78,13 @@ fn merge(base: &mut Vec<(String, String)>, custom: Vec<(String, String)>) {
     }
 }
 
-/// The target's host as it goes into a request line: an IP literal (IPv6 in
-/// brackets), or the ASCII form of a domain. `None` = not safe to write.
-fn wire_host(target: &Target) -> Option<String> {
+/// The host text a request line or a `Host` header may carry for `target`:
+/// an IP literal (IPv6 in brackets), or a domain in its ASCII form (an IDN
+/// becomes its A-labels). `None` means refuse the request: nothing safe to
+/// write exists for this target. A caller that builds a request line or a
+/// `Host` header of its own must write exactly this string, never
+/// `target.host` — see the `HttpForward` obligations.
+pub fn wire_host(target: &Target) -> Option<String> {
     match &target.host {
         HostName::Ip(IpAddr::V6(v6)) => Some(format!("[{v6}]")),
         HostName::Ip(ip) => Some(ip.to_string()),
@@ -88,12 +92,8 @@ fn wire_host(target: &Target) -> Option<String> {
     }
 }
 
-/// Whether `target` can be written into a request line and a `Host` header:
-/// an IP literal, or a domain whose ASCII form (IDNs become A-labels) is not
-/// empty and made of bytes `0x21..=0x7e` only. Anything else could break out
-/// of the request line of a text protocol. The CONNECT path checks this
-/// itself; a caller that writes requests of its own (`HttpForward`) must
-/// check it first.
+/// `wire_host(target).is_some()`: whether `target` has a host text safe to
+/// write into a request line and a `Host` header.
 pub fn valid_target(target: &Target) -> bool {
     wire_host(target).is_some()
 }
@@ -107,7 +107,7 @@ fn check_status(head: &[u8]) -> Result<(), OutboundError> {
     // before it can reach the session log or the request log
     let reason = parts.next().unwrap_or("");
     let reason = untrusted_text(reason, 64);
-    let reason = reason.trim_end();
+    let reason = reason.trim();
     match code.parse::<u16>() {
         Ok(code) if version.starts_with("HTTP/1.") && (200..300).contains(&code) => Ok(()),
         Ok(code) if version.starts_with("HTTP/1.") => {
@@ -641,6 +641,26 @@ mod tests {
         assert_eq!(err.message, "policy `Up` is not an http / https policy");
     }
 
+    #[test]
+    fn wire_host_renders_ip_literals_a_labels_and_refuses_the_unconvertible() {
+        assert_eq!(
+            wire_host(&Target::new(HostName::parse("192.0.2.1"), 443)).as_deref(),
+            Some("192.0.2.1")
+        );
+        assert_eq!(
+            wire_host(&Target::new(HostName::parse("::1"), 443)).as_deref(),
+            Some("[::1]")
+        );
+        assert_eq!(
+            wire_host(&Target::new(HostName::Domain("bücher.example".into()), 443)).as_deref(),
+            Some("xn--bcher-kva.example")
+        );
+        assert_eq!(
+            wire_host(&Target::new(HostName::Domain("x@blocked.test".into()), 443)),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn a_target_with_control_characters_never_reaches_the_proxy() {
         let proxy = FakeHttpProxy::spawn(HttpProxyScript::default()).await;
@@ -651,6 +671,8 @@ mod tests {
         for name in [
             "a.test\r\nX-Evil: 1\r\n\r\nCONNECT internal.test:22 HTTP/1.1\r\nHost: internal.test:22",
             "a b.test",
+            "bü\r\ncher.example",
+            "x@blocked.test",
             "",
         ] {
             let err = out
@@ -753,6 +775,12 @@ mod tests {
         // a control character at the very end must not leave a trailing space
         let Err(OutboundError::Proxy(m)) = check_status(b"HTTP/1.1 403 Forbidden \x1b\r\n\r\n")
         else {
+            panic!("expected a proxy error");
+        };
+        assert_eq!(m, "http proxy answered 403 Forbidden");
+
+        // a double space after the status code must not survive either
+        let Err(OutboundError::Proxy(m)) = check_status(b"HTTP/1.1 403  Forbidden\r\n\r\n") else {
             panic!("expected a proxy error");
         };
         assert_eq!(m, "http proxy answered 403 Forbidden");

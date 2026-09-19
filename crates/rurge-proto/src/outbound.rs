@@ -106,9 +106,13 @@ impl OutboundError {
 ///
 /// Two obligations fall on the caller (M1b's engine), since this trait only
 /// hands back a raw stream:
-/// - before writing a request line or a `Host` header for a target, check it
-///   with `rurge_proto::http::valid_target` and refuse the request
-///   otherwise (the CONNECT path already does this itself, internally);
+/// - a caller that writes a request line or a `Host` header of its own must
+///   write the host exactly as `rurge_proto::http::wire_host` returns it —
+///   never `target.host` — and refuse the request when it returns `None`.
+///   A caller that instead forwards a request whose URI it did not build
+///   (rurge's HTTP inbound forwards the client's own `http::Uri`, which
+///   cannot hold non-ASCII or control bytes) uses
+///   `rurge_proto::http::valid_target` as the gate instead;
 /// - `request_headers()` must be called exactly once per connection: every
 ///   call renders the `<random-string(..)>` placeholders anew.
 pub trait HttpForward: Send + Sync {

@@ -474,6 +474,24 @@ mod tests {
             matches!(&err, OutboundError::Proxy(m) if m == "socks5: the host name is longer than 255 bytes"),
             "{err}"
         );
+        // an unconvertible name (not valid ASCII/IDN authority syntax) is
+        // refused the same way, before any connection is attempted
+        let before = server.requests().len();
+        let unconvertible = Target::new(HostName::Domain("x@blocked.test".into()), 443);
+        let err = out
+            .connect_tcp(&unconvertible, &ConnectOpts::default())
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            matches!(&err, OutboundError::Proxy(m) if m == "socks5: the host name cannot be sent to a SOCKS5 proxy"),
+            "{err}"
+        );
+        assert_eq!(
+            server.requests().len(),
+            before,
+            "nothing was sent to the proxy"
+        );
     }
 
     #[tokio::test]
