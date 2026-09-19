@@ -2179,9 +2179,11 @@ dependencies = [
 name = "rurge-policy"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "rurge-config",
  "rurge-net",
  "rurge-proto",
+ "tokio",
  "tracing",
 ]
 

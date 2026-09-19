@@ -9,11 +9,13 @@ repository.workspace = true
 
 [dependencies]
 rurge-config.workspace = true
+rurge-net.workspace = true
 rurge-proto.workspace = true
+arc-swap.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-rurge-net.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true
