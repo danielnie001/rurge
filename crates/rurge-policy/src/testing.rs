@@ -84,6 +84,8 @@ pub(crate) struct FakeFactory {
     pub connector: Arc<RecordingConnector>,
     /// The policy whose build fails.
     pub broken: Option<&'static str>,
+    /// What `environment()` reports.
+    pub environment: &'static str,
 }
 
 impl FakeFactory {
@@ -91,6 +93,7 @@ impl FakeFactory {
         FakeFactory {
             connector: Arc::new(RecordingConnector::default()),
             broken: None,
+            environment: "env",
         }
     }
 }
@@ -98,6 +101,10 @@ impl FakeFactory {
 impl OutboundFactory for FakeFactory {
     fn direct_connector(&self, _common: &CommonOpts) -> Arc<dyn Connector> {
         self.connector.clone()
+    }
+
+    fn environment(&self) -> String {
+        self.environment.to_string()
     }
 
     fn build(

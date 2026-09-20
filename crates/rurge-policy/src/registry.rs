@@ -7,10 +7,11 @@ use crate::factory::{BuildError, OutboundFactory};
 use crate::selections::SelectionTable;
 use rurge_config::rule::PolicyRef;
 use rurge_config::spec::{CommonOpts, IpVersion, PolicySpec};
-use rurge_config::{Builtin, Config, GroupKind, PolicyKind};
+use rurge_config::{Builtin, Config, GroupKind, KeystoreType, PolicyKind, Span};
 use rurge_net::connector::Connector;
 use rurge_proto::{Direct, OutboundRef, Reject, RejectKind};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Deeper chains than this are treated as a defect (group cycles are load errors).
@@ -49,7 +50,13 @@ enum Entry {
     /// A `direct` / `reject*` alias without options of its own.
     Alias(Terminal),
     /// A built proxy, or a `direct` alias with socket options.
-    Outbound { outbound: OutboundRef, proxy: bool },
+    Outbound {
+        outbound: OutboundRef,
+        proxy: bool,
+        // Boxed: `Fingerprint` embeds a whole `PolicySpec`, which would
+        // otherwise make this variant much larger than the others.
+        fingerprint: Box<Fingerprint>,
+    },
     /// The protocol is not implemented yet: REJECT (W0007 at load).
     Unsupported { kind: PolicyKind },
     Group {
@@ -93,6 +100,34 @@ fn has_socket_opts(common: &CommonOpts) -> bool {
     common.interface.is_some() || common.tos != 0 || common.ip_version != IpVersion::default()
 }
 
+/// Everything an outbound was built from. Two generations that agree on it
+/// may share the outbound (M2 design 7.1). No `Debug`: it holds the policy's
+/// credentials and the keystore item's.
+#[derive(PartialEq)]
+struct Fingerprint {
+    /// Without its span: an unrelated edit above the line moves it.
+    spec: PolicySpec,
+    /// `client-cert`'s keystore item, by content.
+    keystore: Option<(KeystoreType, String, Option<String>)>,
+    environment: String,
+}
+
+fn fingerprint(spec: &PolicySpec, cfg: &Config, environment: &str) -> Fingerprint {
+    let mut spec = spec.clone();
+    spec.span = Span::new(Arc::from(Path::new("")), 0);
+    let keystore = spec
+        .proto
+        .tls()
+        .and_then(|tls| tls.client_cert.as_ref())
+        .and_then(|name| cfg.keystore.iter().find(|item| &item.name == name))
+        .map(|item| (item.kind, item.base64.clone(), item.password.clone()));
+    Fingerprint {
+        spec,
+        keystore,
+        environment: environment.to_string(),
+    }
+}
+
 fn build_one(
     spec: &PolicySpec,
     factory: &dyn OutboundFactory,
@@ -113,30 +148,49 @@ fn build_one(
 impl PolicyRegistry {
     /// `cell` is where the chain connectors built here will look the
     /// registry up at dial time; the caller stores the result into it.
+    /// `previous` is the generation being replaced: a policy whose
+    /// fingerprint did not change keeps the outbound it had there, pools and
+    /// all (M2 design 7.1).
     pub fn build(
         cfg: &Config,
         factory: &dyn OutboundFactory,
         cell: &Arc<RegistryCell>,
         selections: Arc<SelectionTable>,
+        previous: Option<&PolicyRegistry>,
     ) -> Result<PolicyRegistry, BuildError> {
         let direct: OutboundRef = Arc::new(Direct::new(
             factory.direct_connector(&CommonOpts::default()),
         ));
         let mut entries = HashMap::new();
         let mut order = Vec::new();
+        let environment = factory.environment();
+        let outbound_entry = |spec: &PolicySpec, proxy: bool| -> Result<Entry, BuildError> {
+            let fingerprint = fingerprint(spec, cfg, &environment);
+            let kept = match previous.and_then(|p| p.entries.get(&spec.name)) {
+                Some(Entry::Outbound {
+                    outbound,
+                    fingerprint: before,
+                    ..
+                }) if **before == fingerprint => Some(outbound.clone()),
+                _ => None,
+            };
+            let outbound = match kept {
+                Some(outbound) => outbound,
+                None => build_one(spec, factory, cell)?,
+            };
+            Ok(Entry::Outbound {
+                outbound,
+                proxy,
+                fingerprint: Box::new(fingerprint),
+            })
+        };
         for p in &cfg.policies {
             let entry = match (alias_terminal(p.kind), cfg.spec(&p.name)) {
                 (Some(Terminal::Direct), Some(spec)) if has_socket_opts(&spec.common) => {
-                    Entry::Outbound {
-                        outbound: build_one(spec, factory, cell)?,
-                        proxy: false,
-                    }
+                    outbound_entry(spec, false)?
                 }
                 (Some(terminal), _) => Entry::Alias(terminal),
-                (None, Some(spec)) => Entry::Outbound {
-                    outbound: build_one(spec, factory, cell)?,
-                    proxy: true,
-                },
+                (None, Some(spec)) => outbound_entry(spec, true)?,
                 // no spec: a protocol of a later milestone
                 (None, None) => Entry::Unsupported { kind: p.kind },
             };
@@ -256,10 +310,12 @@ impl PolicyRegistry {
             Some(Entry::Outbound {
                 outbound,
                 proxy: true,
+                ..
             }) => self.done(chain, outbound.clone(), TerminalKind::Proxy, None),
             Some(Entry::Outbound {
                 outbound,
                 proxy: false,
+                ..
             }) => {
                 chain.push("DIRECT".to_string());
                 self.done(chain, outbound.clone(), TerminalKind::Direct, None)
@@ -352,7 +408,8 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
         let cell = RegistryCell::new();
         let table = Arc::new(SelectionTable::new(selections));
         let registry = Arc::new(
-            PolicyRegistry::build(&loaded.config, &factory, &cell, table.clone()).expect("builds"),
+            PolicyRegistry::build(&loaded.config, &factory, &cell, table.clone(), None)
+                .expect("builds"),
         );
         cell.store(registry.clone());
         Built {
@@ -575,10 +632,111 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
             &factory,
             &RegistryCell::new(),
             Arc::new(SelectionTable::default()),
+            None,
         )
         .err()
         .expect("EntryB does not build");
         assert_eq!(e.message, "policy `EntryB`: boom");
+    }
+
+    fn generation(
+        text: &str,
+        factory: &FakeFactory,
+        previous: Option<&PolicyRegistry>,
+    ) -> PolicyRegistry {
+        let loaded = from_text(text, Path::new("t.conf"), &LoadOptions::for_tests());
+        assert!(
+            !loaded.diagnostics.has_errors(),
+            "{:?}",
+            loaded
+                .diagnostics
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+        );
+        PolicyRegistry::build(
+            &loaded.config,
+            factory,
+            &RegistryCell::new(),
+            Arc::new(SelectionTable::new(GroupSelections::new())),
+            previous,
+        )
+        .expect("builds")
+    }
+
+    fn outbound_of(registry: &PolicyRegistry, name: &str) -> OutboundRef {
+        registry.resolve(&PolicyRef::parse(name)).outbound
+    }
+
+    const REUSE: &str = "[Proxy]\nA = socks5, a.example, 1080, username=u, password=p\n\
+B = https, b.example, 443, client-cert=cert1\nCorp = direct, interface=eth9\n\
+[Keystore]\ncert1 = type=p12, base64=QUJD, password=x\n[Rule]\nFINAL,DIRECT\n";
+
+    #[test]
+    fn an_untouched_policy_keeps_its_outbound_across_a_reload() {
+        let factory = FakeFactory::new();
+        let first = generation(REUSE, &factory, None);
+        // an unrelated line is added above: every span moves, nothing else does
+        let moved = REUSE.replace("[Proxy]\n", "[Proxy]\nNew = http, n.example, 80\n");
+        let second = generation(&moved, &factory, Some(&first));
+        for name in ["A", "B", "Corp"] {
+            assert!(
+                Arc::ptr_eq(&outbound_of(&first, name), &outbound_of(&second, name)),
+                "{name} was rebuilt"
+            );
+        }
+        // without a previous generation everything is new
+        let alone = generation(&moved, &factory, None);
+        assert!(!Arc::ptr_eq(
+            &outbound_of(&first, "A"),
+            &outbound_of(&alone, "A")
+        ));
+    }
+
+    #[test]
+    fn a_changed_parameter_keystore_item_or_environment_rebuilds() {
+        let factory = FakeFactory::new();
+        let first = generation(REUSE, &factory, None);
+        // A's own parameter
+        let second = generation(
+            &REUSE.replace("password=p", "password=q"),
+            &factory,
+            Some(&first),
+        );
+        assert!(!Arc::ptr_eq(
+            &outbound_of(&first, "A"),
+            &outbound_of(&second, "A")
+        ));
+        assert!(Arc::ptr_eq(
+            &outbound_of(&first, "B"),
+            &outbound_of(&second, "B")
+        ));
+        // the content of the keystore item B refers to
+        let second = generation(
+            &REUSE.replace("base64=QUJD", "base64=QUJE"),
+            &factory,
+            Some(&first),
+        );
+        assert!(!Arc::ptr_eq(
+            &outbound_of(&first, "B"),
+            &outbound_of(&second, "B")
+        ));
+        assert!(Arc::ptr_eq(
+            &outbound_of(&first, "A"),
+            &outbound_of(&second, "A")
+        ));
+        // what the factory captured by value
+        let other = FakeFactory {
+            environment: "other",
+            ..FakeFactory::new()
+        };
+        let second = generation(REUSE, &other, Some(&first));
+        for name in ["A", "B", "Corp"] {
+            assert!(
+                !Arc::ptr_eq(&outbound_of(&first, name), &outbound_of(&second, name)),
+                "{name} survived a change of environment"
+            );
+        }
     }
 
     #[test]

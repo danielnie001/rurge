@@ -109,6 +109,13 @@ impl OutboundFactory for EngineFactory {
         ))
     }
 
+    fn environment(&self) -> String {
+        // the one `[General]` item captured by value: it goes into every
+        // direct connector's `SocketOpts`. The roots and the socket hook are
+        // per-process; the resolver is read through its cell.
+        format!("ipv6={}", self.v6_first)
+    }
+
     fn build(
         &self,
         spec: &PolicySpec,
@@ -218,6 +225,14 @@ mod tests {
 
     fn factory(cfg: &Config) -> EngineFactory {
         EngineFactory::new(cfg, Arc::new(SystemResolve), Arc::new(NoopSocketHook))
+    }
+
+    #[test]
+    fn the_environment_follows_what_the_factory_captures_by_value() {
+        let v4 = config("[General]\nipv6 = false\n[Rule]\nFINAL,DIRECT\n");
+        let v6 = config("[General]\nipv6 = true\n[Rule]\nFINAL,DIRECT\n");
+        assert_eq!(factory(&v4).environment(), "ipv6=false");
+        assert_eq!(factory(&v6).environment(), "ipv6=true");
     }
 
     #[test]

@@ -111,6 +111,7 @@ mod tests {
         let factory = crate::testing::FakeFactory {
             connector,
             broken: None,
+            environment: "env",
         };
         Arc::new(
             PolicyRegistry::build(
@@ -118,6 +119,7 @@ mod tests {
                 &factory,
                 &RegistryCell::new(),
                 Arc::new(crate::selections::SelectionTable::default()),
+                None,
             )
             .expect("builds"),
         )

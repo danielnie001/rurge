@@ -57,6 +57,9 @@ impl Runtime {
             opts.shared.resolver.clone(),
             opts.stack.socket_hook.clone(),
         );
+        // The generation being replaced (none on the first build): whatever
+        // it built from the same fingerprint is kept, connection pools and all.
+        let previous = opts.shared.cell.load();
         // The dry build has already turned every build failure into a load
         // error (`load_checked`), so this only fails for a caller that skipped it.
         let policies = Arc::new(
@@ -65,6 +68,7 @@ impl Runtime {
                 &factory,
                 &opts.shared.cell,
                 opts.shared.selections.clone(),
+                previous.as_deref(),
             )
             .map_err(|e| anyhow::anyhow!("cannot build the policies: {e}"))?,
         );
