@@ -1,6 +1,7 @@
 //! Outbound abstraction (M3 design §4): the `Outbound` trait every policy
 //! implements, plus the phase 1 built-ins `Direct` and `Reject`.
 
+mod addr;
 pub mod build;
 pub mod direct;
 mod hostname;
@@ -12,6 +13,7 @@ pub mod socks5;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod transport;
+pub mod trojan;
 
 pub use build::BuildError;
 pub use direct::Direct;

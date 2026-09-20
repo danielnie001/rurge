@@ -3,13 +3,12 @@
 use crate::build::tls_client;
 use crate::transport::tls::TlsClient;
 use crate::{BuildError, Outbound, OutboundError};
+use rurge_config::KeystoreItem;
 use rurge_config::spec::{PolicySpec, ProtoSpec};
-use rurge_config::{HostName, KeystoreItem};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
 use rustls::RootCertStore;
 use std::io;
-use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -63,27 +62,13 @@ fn reply_text(code: u8) -> String {
 
 fn connect_request(target: &Target) -> Result<Vec<u8>, OutboundError> {
     let mut request = vec![VERSION, 1, 0];
-    match &target.host {
-        HostName::Ip(IpAddr::V4(v4)) => {
-            request.push(1);
-            request.extend_from_slice(&v4.octets());
-        }
-        HostName::Ip(IpAddr::V6(v6)) => {
-            request.push(4);
-            request.extend_from_slice(&v6.octets());
-        }
+    request.extend(crate::addr::socks_addr(target).map_err(|e| match e {
         // the proxy resolves the name (remote resolution); an IDN goes out as A-labels
-        HostName::Domain(name) => {
-            let name = crate::hostname::to_ascii(name)
-                .ok_or_else(|| proxy("the host name cannot be sent to a SOCKS5 proxy"))?;
-            let len = u8::try_from(name.len())
-                .map_err(|_| proxy("the host name is longer than 255 bytes"))?;
-            request.push(3);
-            request.push(len);
-            request.extend_from_slice(name.as_bytes());
+        crate::addr::AddrError::Unsendable => {
+            proxy("the host name cannot be sent to a SOCKS5 proxy")
         }
-    }
-    request.extend_from_slice(&target.port.to_be_bytes());
+        crate::addr::AddrError::TooLong => proxy("the host name is longer than 255 bytes"),
+    })?);
     Ok(request)
 }
 
