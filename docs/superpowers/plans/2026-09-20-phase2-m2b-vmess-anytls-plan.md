@@ -7083,7 +7083,21 @@ git commit -m "docs: M2b——兼容性清单、API 参考、README、CLAUDE.md�
 
 | 任务 | 改了什么 | 原因 | 提交 |
 | ---- | -------- | ---- | ---- |
-| | | | |
+| 预检 | 计划自身的三处订正（P18）：`Pool::len` 标 `#[cfg(test)]`、`frame::SERVER_SETTINGS` 标 `#[cfg(any(test, feature = "testing"))]`；`FakeVmess` 拒绝连接时先关写端再把连接读到头；引擎端到端用例里等"anytls 会话回池"的信号从"服务端收到的 FIN 数"改为"会话记录出现" | 临时工程当初整体关了 dead-code 检查；带着未读字节关连接会变成 RST；`get()` 带 `Connection: close`，先结束流的是服务端，而对端的 FIN 不回 | f0a1292 |
+| 1 | 计划里的代码块未经 rustfmt，提交时被 `cargo fmt` 重排（仅空白） | 门禁含 `fmt --check` | e06a06b |
+| 2 | 步骤顺序：`vectors.rs` 引用 `header::Session`、`mod.rs` 声明了全部模块，所以 `header.rs` / `chunk.rs` 必须先于 KDF 的 RED 步骤存在——实现者按最终内容先建了这两个文件，再对 `kdf.rs` 单独走 RED / GREEN | 计划的步骤顺序没考虑模块间的编译依赖；内容无变化 | 528704c |
+| 3 | 无内容偏差（rustfmt 重排一处断言）；计划里从未编译过的出站、六条用例与假服务端的 TLS / WebSocket 接入一次编过 | — | 187e91e |
+| 4 | 无 | — | 2a83694 |
+| 5 | 无内容偏差；RED 取自"把 `poll_shutdown` 里的 FIN 注释掉 → `no FIN`" | 代码是先验证过再搬进计划的，常规 RED 不可得 | d4d3fd9 |
+| 6 | 提交标题用了半角标点（不改写已有提交）；吞吐的顺序测量（改动前 48 / 59 / 55，改动后 53 / 50 / 46 MiB/s，中位数 −9.1%）不足以下结论，补做了交替 A/B（两个预先编好的 release 二进制各 8 轮交替）：带 flush 中位数 54.5 MiB/s（均值 55.4），不带 flush 51.0（均值 51.0），16 轮的总跨度 45 – 64——flush 没有变慢，先前的差距是漂移 | 计划的三次顺序测量分不清漂移与改动 | b0f2d2f |
+| 7 | 无 | — | cd1d644 |
+| 8 | `Entry::Outbound` 的 `fingerprint` 字段包成 `Box<Fingerprint>`；`cell.rs` 测试里的 `FakeFactory` 字面量补了 `environment` 字段；`runtime.rs` 里两条注释换了位置 | clippy 的 `large_enum_variant`；结构体加了字段；可读性 | 09840e9 |
+| 8 | **行为变化（已裁定接受）**：复用之后，`skip-cert-verify is on` 的 WARN 不再每次重载都打一遍——被沿用的出站没有重建，就不再告警；首次构建与参数变更后的重建照常告警 | 这条 WARN 是 `EngineFactory::build` 的副作用，而复用的出站不经过 `build` | 09840e9 |
+| 9 | 按控制者的裁定在 `an_anytls_upstream_carries_two_requests_over_one_session` 末尾多加一条断言 `upstream.fins() == 0`（两条流都由服务端先结束，对端的 FIN 不回）；本机没装 `cargo insta`，快照检查经 `cargo test -p rurge-config` 完成（无 `.snap.new`） | Task 5 的评审指出"对端的 FIN 不回"没有用例；不在本机安装任何东西 | d209feb |
+| 10 | 无；守卫核对八行全部在代码里找到（`file:line` 见该任务报告）。其中"一个超时"一行按协议不对称：anytls 的鉴权写在超时之内，vmess 的请求头经 `LazyHead` 在转发阶段才发出（与 M2a 的 trojan 相同） | — | eeb85e5 |
+| 11 | `pub mod xray;` 比计划早半步加入（与 Step 2 一起过门禁）；rustfmt 重排四处；README 的章节划分是实现者对计划文字的理解（版本号、三个 SHA-256、环境变量与 P9 逐字一致，评审用程序逐位比对过 `ci.yml` 与 README） | 计划对 README 只给了要点没给成文 | ca62484 |
+| 11 | **互操作用例在本机一条都没有真正运行**：本机没有 sing-box 与 xray，也没有安装；九条 sing-box 用例与一条 xray 用例都打印跳过原因后通过。它们对真实二进制的表现要等首次推送后的 CI（`RURGE_INTEROP_REQUIRED=1`）证明 | 不在开发者的机器上下载或安装任何参考二进制 | ca62484 |
+| 12 | 本任务按控制者的裁定改了一行代码注释：`crates/rurge-proto/src/vmess/stream.rs` 文件头里"转发循环从不调用的 `flush`"一句，自 Task 6 起不再成立 | Task 6 的评审指出的过时措辞；不改行为 | Task 12 的提交 |
 
 ## 延后事项
 
@@ -7093,3 +7107,26 @@ git commit -m "docs: M2b——兼容性清单、API 参考、README、CLAUDE.md�
 | （计划期）以 Unicode 写的代理服务器主机名不可用：解析器的线上编码与应答校验都只认 ASCII，TLS 层是构建错误（P15） | M8：连同规则、`[Host]`、解析器一起做全面的 IDN 支持；清单已登记 |
 | （计划期）`Secret<T>` 只包了凭据类型的字段；`WsOpts.path` / `headers`、`HttpSpec.headers` 与 `KeystoreItem` 的 `base64` / `password` 仍会被 `Debug` 打印（生产代码从不格式化它们）（P14） | M8 |
 | （计划期）VMess 旧式（非 AEAD）握手 | M8（设计 M2-D4） |
+| `ChunkCipher::open_len` / `open` 必须每个分块各调一次、且按此顺序（各自推进掩码流 / nonce 计数），函数上没写这条约定 | 终审分拣 |
+| `VmessStream::poll_write` 把一个停着的分块算到下一次写所给的缓冲头上（`accepted.min(data.len())`）：对 `write_all` / 转发循环是对的，对"换一段字节重试"的调用方是一条没写下来的约定 | 终审分拣（与 M2a 的 `WsByteStream.queued` / `LazyHead.coalesced` 同类） |
+| `VmessStream` 的读错误不是粘性的：出错后再轮询会对同一个分块再调一次 `open_len` / `open`（工作区里没有出错后继续轮询的调用方） | 终审分拣 |
+| `FakeVmess` 按 `open_len` 分配缓冲前没有客户端那条 `len < TAG` 的检查（仅测试） | 保持现状 |
+| 会话恰好在 `Pool::take()` 的 `is_closed()` 检查与 `Session::open` 挂上新流之间死掉时，新流会一直挂到转发阶段的空闲超时（队列还有空位，发送成功） | 终审修复波（在发送之后再查一次 `closed`） |
+| `FakeAnyTls::kick()` 用 `Notify::notify_waiters()`，不留许可，落在两次 `select!` 之间的 kick 会丢——`a_session_the_server_closed_while_idle_is_not_reused` 的潜在抖动 | 终审修复波 |
+| "鉴权必须一次写出"没有回归守卫（假服务端读的是重组后的 TLS 流） | 保持现状：单次 `read()` 的假服务端会把参考服务端自身的时序依赖抄过来，把守卫变成抖动；由 sing-box 互操作兜底 |
+| AnyTLS 出站的九条用例里有四条各捆了两到四个场景 | 保持现状（共用代价高的 TLS 夹具与假服务端；每条断言带自己的说明） |
+| `vmess/stream.rs` 文件头注释里"转发循环从不调用的 `flush`"自 Task 6 起已过时；P7 的理由里同一句话亦然 | Task 12 改写这一句注释（不改行为），并在设计第 18 节里说明 |
+| 没有用例钉住"一个方向的正常 EOF 不得结束另一个方向"（现在出错会取消另一个方向，这条更该有） | 终审修复波（十行左右的 relay 用例） |
+| `relay_throughput` 的接收循环没有上界（`#[ignore]`，手动运行） | 保持现状 |
+| 吞吐测量走的是 TCP（`flush` 为空操作），没有测到 TLS / WebSocket / VMess 栈上每 8 KiB 一次 flush 的成本 | M8 收尾时若做性能工作一并测 |
+| `PolicyRegistry::build` 的文档注释没写明 `previous` 必须出自同一个 `cell`（公开 API、未校验；经引擎不可达） | 终审修复波（一句话） |
+| 每个出站整代持有一份 `PolicySpec` 克隆与其 Keystore 条目的 base64（N 条策略共用一个 client-cert 时持有 N + 1 份） | 保持现状（P10 的取舍） |
+| `environment()` 是人工维护的约定：给 `EngineFactory` 加一个按值捕获的字段不会让任何用例变红 | M3（策略组）动工厂时复核 |
+| 复用用例没覆盖 Keystore 条目的口令或类型变化（只测了 `base64`），也没覆盖"改一条无关的 Keystore 条目不影响它" | 终审分拣 |
+| `tests/outbounds.rs` 里证书指纹转十六进制的五行出现了两次（`trojan_upstream` 与新的 `pin_of`） | 下次改这个文件时合并 |
+| 没有"改 vmess / anytls 策略的 `client-cert` → 出站被重建"的端到端链路（注册表层对 https 有用例；`ProtoSpec::tls()` 的两个新分支有单元用例） | 终审分拣 |
+| `rurge-engine` 的 `outbounds` 测试二进制在本机偶发 `STATUS_ACCESS_VIOLATION` 异常退出而没有失败用例（Task 8 期间又遇到一次；重跑即过）。全工作区 `forbid(unsafe_code)`，根因仍未查明 | 保持跟踪（自 M4a 起的已知现象） |
+| Task 10 的守卫核对里，"anytls 的首包在超时之内"说得过满：超时约束的是 `cmdSettings ‖ cmdSYN ‖ cmdPSH` **入队**，物理写出由会话自己的任务完成（与 vmess 惰性发出的请求头同类，实际短得多） | 文档里写成"在超时内入队"（本任务落实到清单 / API 参考的相应句子） |
+| xray 夹具渲染的客户端只有 `id`、没有 `alterId`（xray v26.3.27 只认 AEAD，`alterId` 已是遗留字段；与计划一致）——真实 xray 是否接受这个写法本机无法确认 | 首次推送后的 CI |
+| 互操作用例 `anytls_reuses_its_session_and_can_be_told_not_to` 只断言每轮往返成功，分辨不出"确实复用了会话"与"没有复用"（黑盒夹具拿不到握手次数）；复用本身由回环假服务端的用例钉住 | 保持现状 |
+| `tests/interop/tests/sing_box.rs` 已到 518 行，后续里程碑还会往里加协议 | M2c 动它时考虑按协议拆文件 |

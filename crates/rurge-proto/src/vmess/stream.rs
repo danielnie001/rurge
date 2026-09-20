@@ -3,10 +3,10 @@
 //! then chunks.
 //!
 //! A write reports success only after its whole chunk has been handed to the
-//! layer below, so nothing of ours waits for a `flush` the relay never calls.
-//! A chunk that could not be written in one go stays parked (it is already
-//! sealed with its nonce) and is finished by the next write, flush or
-//! shutdown.
+//! layer below, so the stream's own correctness never depends on anyone
+//! calling `flush`. A chunk that could not be written in one go stays parked
+//! (it is already sealed with its nonce) and is finished by the next write,
+//! flush or shutdown.
 
 use super::chunk::{ChunkCipher, MAX_PAYLOAD};
 use super::header::{self, ResponseError, Security, Session, TAG};

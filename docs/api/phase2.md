@@ -35,20 +35,57 @@
 
 ## 会话日志里的出站错误文本
 
-trojan（± WebSocket）出站失败时，会话记录的 `error` 是下列固定文本之一；其余失败仍按连接失败的通用形式出现（拨号超时 `connect timed out`、TLS 握手失败 `tls: <原因>`、或底层 I/O 错误的原文——涵盖 TCP 连接失败、WebSocket 握手期间的 I/O 错误，以及已建立的 WebSocket 在转发期间的 I/O 错误：后者经转发循环的失败文本进入会话记录）。对端给的字节（HTTP 响应头、WebSocket 握手响应体等）永不原样出现在下列固定文本中。
+trojan、vmess（± WebSocket）与 anytls 出站失败时，会话记录的 `error` 是下面按协议分节列出的固定文本之一；其余失败仍按连接失败的通用形式出现（拨号超时 `connect timed out`、TLS 握手失败 `tls: <原因>`、或底层 I/O 错误的原文——涵盖 TCP 连接失败、WebSocket 握手期间的 I/O 错误，以及已建立的连接在转发期间的 I/O 错误：后者经转发循环的失败文本进入会话记录）。对端给的字节（HTTP 响应头、WebSocket 握手响应体、anytls 的错误帧等）永不原样出现在下列固定文本中。
+
+### trojan
 
 | 错误文本 | 何时出现 |
 | --- | --- |
 | `trojan: the host name cannot be sent to the server` | 目标主机名转不成可发送的 ASCII 形式（如含 `@` 这类可能被下游误读成 authority 分隔符的字符）；连接不会被拨出 |
 | `trojan: the host name is longer than 255 bytes` | 目标主机名（转换后）超出 trojan 地址编码一字节长度所能表示的范围；连接不会被拨出 |
+
+`trojan` 的密码错误没有对应的错误文本：协议没有应答，服务端把连接交给它的回落站点，连接建立成功、会话记录 `error` 为空，异常只在转发阶段表现为对端提前关闭或回一段与预期不符的数据（见 `docs/surge-compatibility-matrix.md` 4.2 `trojan` 行）。
+
+### vmess
+
+| 错误文本 | 何时出现 |
+| --- | --- |
+| `vmess: the server closed the connection without answering` | 对端在应答的长度头到达之前就关闭了连接：UUID 错，或本机时钟与服务端偏差超过协议容忍的约 120 秒；两者表现相同，分辨不出 |
+| `vmess: the response cannot be authenticated` | 应答的长度头或头本体未能通过 AEAD 认证——对端返回的字节不是针对这次请求密封的合法 VMess 应答（例如它根本不是 VMess 服务端） |
+| `vmess: the response head is longer than the protocol allows` | 应答头声明的长度超过协议上限（4 + 255 字节） |
+| `vmess: the response does not answer this request` | 应答头认证通过，但其中的校验字节 `V` 与这次请求送出的不一致 |
+| `vmess: the connection ended in the middle of a chunk` | 读应答头本体或某个分块时连接被对端关闭，且不是在两个分块之间的边界上 |
+| `vmess: a chunk shorter than its tag` | 分块声明的长度小于 AEAD tag（16 字节） |
+| `vmess: a chunk cannot be authenticated` | 分块未能通过 AEAD 认证 |
+| `vmess: the host name cannot be sent to the server` | 目标主机名转不成可发送的形式；连接不会被拨出 |
+| `vmess: the host name is longer than 255 bytes` | 目标主机名（转换后）超出 VMess 地址编码一字节长度所能表示的范围；连接不会被拨出 |
+| `vmess: no randomness available` | 本机操作系统的随机数源不可用（极少出现）；连接不会被拨出 |
+
+连接在两个分块之间（下一个分块的长度字段尚未开始读）被对端干净关闭是正常的流结束，不产生错误文本——服务端省去收尾的空分块时也是如此。
+
+### anytls
+
+| 错误文本 | 何时出现 |
+| --- | --- |
+| `anytls: the session is closed` | 会话所在的 TLS 连接已经失败（读或写出错），或会话所在的后台任务已经退出；之后任何对这条会话的读写（含开一个新流）都以这条文本失败 |
+| `anytls: the stream is closed` | 本地已经结束了这个流（如调用过 `shutdown`）之后又尝试写入；不是服务端结束的（那两种情形见下面两条） |
+| `anytls: <文本>` | 服务端用带错误文本的 `cmdSYNACK` 拒绝了这一个流（如目标连不上）；只有这一条流失败，会话本身仍可用于下一个流 |
+| `anytls: the server sent an alert: <文本>` | 服务端发送 `cmdAlert`；整条会话（及其正在使用的流）随之结束，不会被放回连接池 |
+| `anytls: the host name cannot be sent to the server` | 目标主机名转不成可发送的形式；连接不会被拨出 |
+| `anytls: the host name is longer than 255 bytes` | 目标主机名（转换后）超出 AnyTLS 地址编码一字节长度所能表示的范围；连接不会被拨出 |
+
+`anytls: <文本>` 与 `anytls: the server sent an alert: <文本>` 里的 `<文本>` 来自服务端，已去除控制字符且截到 256 个字符。`anytls` 的口令错误没有专门的错误文本：服务端把认证失败的连接当普通网站处理并直接关闭，这条连接因此按上表第一条 `anytls: the session is closed` 失败，与会话因其它原因整体关闭时表现相同（见 `docs/surge-compatibility-matrix.md` 4.2 `anytls` 行）。
+
+### WebSocket（trojan、vmess 共用）
+
+| 错误文本 | 何时出现 |
+| --- | --- |
 | `ws: handshake failed: HTTP <code>` | 对端把 WebSocket 升级请求回了非 101 的 HTTP 响应；`<code>` 是状态码，不带原因短语或响应体 |
 | `ws: handshake failed` | 握手失败，但不是上一条"回了非 101 响应"的情形（如响应格式不合法）；库自己的错误文本不会被引用 |
 | `ws: protocol error` | 握手成功之后遇到的、上面几条都对不上的协议错误（如对端发了不合法的帧）；tungstenite 自己的错误文本可能引用请求头的值，因此一律映射成这条固定文本 |
-| `ws: the server sent a text frame` | 对端发了一个文本帧；trojan over WebSocket 只承载二进制帧 |
+| `ws: the server sent a text frame` | 对端发了一个文本帧；trojan / vmess over WebSocket 只承载二进制帧 |
 | `ws: the server sent a frame larger than the limit` | 单帧或重组后的消息超过入站上限（1 MiB） |
 | `ws: the connection is closed` | 写入或刷出发生在连接已经关闭之后（对端主动关闭，或本端 `poll_shutdown` 已经发出自己的 Close）；读到对端的关闭本身是普通 EOF，不会产生这条文本 |
-
-`trojan` 的密码错误没有对应的错误文本：协议没有应答，服务端把连接交给它的回落站点，连接建立成功、会话记录 `error` 为空，异常只在转发阶段表现为对端提前关闭或回一段与预期不符的数据（见 `docs/surge-compatibility-matrix.md` 4.2 `trojan` 行）。
 
 ## `GET /v1/policy_groups`
 

@@ -164,7 +164,7 @@
 | `block-quic` | `per-policy` `all-proxy` `all` `always-allow`；默认 `per-policy` | 全部 | ✅ | 2 | |
 | `show-error-page` | 布尔；默认 true | Mac 5.8+ | 🟡 | 1 | 错误页为 rurge 自己的 HTML（写明规则、策略链、会话 id）；对连接失败的 502 页在 M3a 只覆盖明文请求，CONNECT 连接失败的 502 已实现（M3b） |
 | `show-error-page-for-reject` | 布尔；默认 false | 全部 | 🟡 | 1 | 错误页为 rurge 自己的 HTML（写明规则、策略链、会话 id） |
-| 空闲超时（`--idle-timeout`） | Surge 未公开默认值 | 全部 | 🟡 | 1 | rurge 默认 600 s，`--idle-timeout` 覆盖（M3b，专有运行时选项，不是 Surge 配置键）；只作用于 CONNECT / SOCKS5 的中继会话，**明文 HTTP 转发不受其约束**（该路径不经中继泵，保活等待由 hyper 的 `header_read_timeout` 覆盖，单次交换由上游连接寿命约束；阶段 4 自有 HTTP 引擎后统一） |
+| 空闲超时（`--idle-timeout`） | Surge 未公开默认值 | 全部 | 🟡 | 1 | rurge 默认 600 s，`--idle-timeout` 覆盖（M3b，专有运行时选项，不是 Surge 配置键）；只作用于 CONNECT / SOCKS5 的中继会话，**明文 HTTP 转发不受其约束**（该路径不经中继泵，保活等待由 hyper 的 `header_read_timeout` 覆盖，单次交换由上游连接寿命约束；阶段 4 自有 HTTP 引擎后统一）；中继泵写完即 `flush`（M2b：`tokio-rustls` 等写端在 socket 写满时可能把最后一段留在自己的缓冲里，不 flush 可能一直发不出去），且任一方向以错误结束时另一方向随之结束，不用各自等到超时才发现隧道已坏 |
 | 请求记录（RequestLog） | rurge 专有能力，无对应 Surge 配置键 | 全部 | ✅ | 1（基础） | 内存环形缓冲（`--request-log-size`，默认 1000）+ 活动索引 + `kill`（M3b）；`kill` 对 CONNECT / SOCKS5 与明文 HTTP 转发会话均有效（明文转发在 M3b 修复波补齐），对内部 DNS 会话仍是空操作；完整 HTTP API 在 M4 / 阶段 6 |
 | 流量统计（TrafficStats） | rurge 专有能力，无对应 Surge 配置键 | 全部 | ✅ | 1（基础） | 总计 / 按策略 / 按监听器原子计数 + 每秒采样速率（M3b）；完整 HTTP API 在 M4 / 阶段 6 |
 
@@ -326,18 +326,19 @@
 | `socks5` / `socks5-tls` | SOCKS5 / SOCKS5 over TLS | 全部 | ✅ | 2 | M1（阶段 2）已实现（TCP）；udp-relay 解析但未生效（M5）；目标主机名在写线之前转成 A-label，且只允许 ASCII 字母、数字、`-`、`.`、`_`（其它字符的名字被拒绝：防止宽松的上游把 `a@b.test` 读成 userinfo + 主机而绕过域名规则）；Surge 大概原样发送（未核对）；只有密码没有用户名时密码被忽略 |
 | `ss` | Shadowsocks | 全部 | ✅ | 2 | 加密方法见 4.6 |
 | `snell` | Snell v1–v6 | v6 需 iOS 5.20 / Mac 6.7+ | 🟡 | 2 | v1–v4 计划支持；v5（QUIC Proxy Mode）与 v6（PSK 派生协议画像、流量整形，beta）协议细节未公开，❓ 待评估 |
-| `vmess` | VMess（AEAD / 旧握手、TLS、WebSocket） | 全部 | ✅ | 2 | 旧式非 AEAD 握手 🟡 低优先级 |
+| `vmess` | VMess（AEAD / 旧握手、TLS、WebSocket） | 全部 | ✅ | 2 | M2b（阶段 2）已实现 AEAD 握手（TCP）：没写 `vmess-aead=true` 的行在 M8 之前按 `W0007`（每次加载一条）+ `REJECT` 处理，会话日志 `policy protocol not implemented: vmess (legacy handshake)`；只开 ChunkStream + ChunkMasking（Surge 的实际取值未公开）；UUID 错与本机时钟偏差超过约 120 秒都表现为 `vmess: the server closed the connection without answering`，两者分辨不出；`username` 只接受命名写法；`tls=false` 时写的 TLS 参数按 `W0028` 处理；默认不带 ALPN（未与真实 Surge 核对）；UDP 属 M5 |
 | `trojan` | Trojan（TLS、WebSocket） | 全部 | ✅ | 2 | M2a（阶段 2）已实现（TCP）：TLS 必有，可叠加 WebSocket；请求头与首段负载合并成一次写出，客户端 100 ms 内不发数据时（服务端先说话的协议）请求头单独发出、这类协议的首字节因此晚 100 ms；密码错误在连接期无法识别（协议没有应答，服务端把连接交给它的回落站点）；默认不带 ALPN（未与真实 Surge 核对）；口令只接受 password=（手册的写法），位置参数不读；UDP 属 M5；目标主机名的字母表规则同 http / socks5 |
 | `tuic` / `tuic-v5` | TUIC v4（token）/ v5（uuid + password） | 全部 | ✅ | 2 | |
 | `hysteria2` | Hysteria 2 | iOS 5.8 / Mac 5.4+ | ✅ | 2 | Salamander 混淆 ✅；Gecko 混淆 ❓ |
 | `masque` | MASQUE（HTTP/3 CONNECT + CONNECT-UDP，RFC 9298 / 9297） | iOS 5.22 / Mac 6.9+ | ✅ | 2 | |
-| `anytls` | AnyTLS v2 | iOS 5.17 / Mac 6.4.3+ | ✅ | 2 | |
+| `anytls` | AnyTLS v2 | iOS 5.17 / Mac 6.4.3+ | ✅ | 2 | M2b（阶段 2）已实现（TCP）：一条会话同一时刻只承载一个流（与参考实现一致）；空闲超过 60 秒的会话每 30 秒回收一次；不等 `cmdSYNACK` 就返回流，被拒的流在第一次读上以 `anytls: <服务端文本>` 失败；**没有半关闭**：客户端方向的 EOF 以 `cmdFIN` 结束整条流（与 sing-box 一致）；不实现参考客户端的 3 秒 SYNACK 看门狗；服务端推送的 padding 方案做有界校验（原文 ≤ 8192 字节、`stop` ≤ 256、每包 ≤ 64 项、每项 1 ..= 16384），不合法就保留旧方案；`password` 只接受命名写法；默认不带 ALPN（未与真实 Surge 核对）；UDP（udp-over-tcp v2）属 M5 |
 | `trust-tunnel` | Trust Tunnel（AdGuard，HTTP/2 或 HTTP/3） | Mac 6.4.4+ | ✅ | 2 | |
 | `ssh` | SSH 动态转发 | 全部 | ✅ | 2 | |
 | `wireguard` | WireGuard L3 隧道作为策略 | 全部 | ✅ | 2 | |
 | `tailscale` | Tailscale 节点作为策略 | iOS 5.20 / Mac 6.7+ | ❓ | 远期 | 需嵌入 Tailscale 客户端（控制面协议、DERP、MagicDNS）；单独评估 |
 | `external` | 外部代理程序（本地 SOCKS5） | Mac only（iOS 视为 REJECT） | ✅ | 2 | rurge 在 Win/Lin/mac 均支持 |
-| 策略指向 rurge 尚未实现的协议类型 | Surge 原生支持全部协议 | 全部 | 🟡 | 1 / 2 | 加载时告警 `W0007`；运行时该策略按 `REJECT` 处理，会话日志 `error = policy protocol not implemented: <type>`；随阶段 2 各里程碑逐协议移除：M1 已移除 `http` `https` `socks5` `socks5-tls`；M2a 已移除 `trojan` |
+| 策略指向 rurge 尚未实现的协议类型 | Surge 原生支持全部协议 | 全部 | 🟡 | 1 / 2 | 加载时告警 `W0007`；运行时该策略按 `REJECT` 处理，会话日志 `error = policy protocol not implemented: <type>`；随阶段 2 各里程碑逐协议移除：M1 已移除 `http` `https` `socks5` `socks5-tls`；M2a 已移除 `trojan`；M2b 已移除 `vmess`（写了 `vmess-aead=true` 的行）与 `anytls`。没写 `vmess-aead=true` 的 `vmess` 行是唯一例外：仍按 `W0007` 处理，但走专门的诊断文本 `` `vmess` without `vmess-aead=true` uses the legacy handshake, which is not implemented yet ``（每次加载一条，不是每行一条）与专门的会话日志文本 `policy protocol not implemented: vmess (legacy handshake)`，不是这里的通用 `<type>` 模板 |
+| 所有协议通用 | 策略行里的代理服务器主机名（`server` 字段） | 全部 | 🟡 | 2 | 须写成 ASCII（IDN 需预先转成 `xn--` punycode 形式）：以 Unicode 写的名字在 TLS 类协议（`https` `socks5-tls` `trojan` `vmess` + `tls` `anytls` 等）上是加载错误 `E0022`，在明文协议（`http` `socks5` 等）上是拨号期的解析失败；全面的 IDN 支持（规则、`[Host]`、解析器）留待 M8 |
 
 ### 4.3 通用策略参数（14 个）
 
@@ -400,13 +401,13 @@
 | `ss` | 流式旧方法 `rc4` `rc4-md5` `aes-128/192/256-cfb` `aes-128/192/256-ctr` `salsa20` `chacha20` `chacha20-ietf` | 🟡 | 2 | 低优先级，加载时告警"不推荐" |
 | `ss` | `password` `udp-relay` `udp-port` `obfs`（`http` / `tls`）`obfs-host` `obfs-uri` | ✅ | 2 | |
 | `snell` | `psk` `version`（1–6，默认 1）`reuse`（v4+）`obfs`（v1–3 `http`/`tls`；v4–5 `http`；v6 无）`obfs-host` `obfs-uri` `udp-port` `mode`（v6：`default` `unshaped` `unsafe-raw`） | 🟡 | 2 | 版本支持范围见 4.2；v3+ 自动 UDP |
-| `vmess` | `username`（UUID）`encrypt-method`（`aes-128-gcm` / `chacha20-ietf-poly1305`，默认前者）`vmess-aead`（默认 false）`tls` `ws` `ws-path`（默认 `/`）`ws-headers`（`\|` 分隔） | ✅ | 2 | 自动 UDP |
+| `vmess` | `username`（UUID）`encrypt-method`（`aes-128-gcm` / `chacha20-ietf-poly1305`，默认前者）`vmess-aead`（默认 false）`tls` `ws` `ws-path`（默认 `/`）`ws-headers`（`\|` 分隔） | ✅ | 2 | 自动 UDP（属 M5）；`username` 只接受命名写法，取常见的 8-4-4-4-12 或不带连字符的 32 位十六进制两种写法；`vmess-aead=false`（默认）即请求旧式握手，加载时 `W0007`、运行时 `REJECT`（见 4.2 与 `W0007` 行）；`tls=false` 时写的 TLS 参数按 `W0028` 处理；`ws-path` / `ws-headers` 与 trojan 同一套规则（见上一行） |
 | `trojan` | `password` `ws` `ws-path` `ws-headers` | ✅ | 2 | 自动 UDP；`ws-path` 必须是以 `/` 开头的 ASCII 路径（无空白与控制字符）；`ws-headers` 的名字必须是 HTTP token、值只允许 HTAB 一种控制字符；`Connection` / `Upgrade` / `Sec-WebSocket-*` 由握手自己写，出现时 `W0012` 并忽略；`Host` 缺省取服务器主机名（端口非 443 时带端口；未与真实 Surge 核对）；不支持 early data；入站帧上限 1 MiB；经 WebSocket 时，半关闭（客户端关闭写方向）发出的是 WebSocket Close 帧，多数服务端把它当作整条连接的结束——关闭写方向后还在等响应的客户端可能拿不到完整响应；不带 ws 的 trojan 保持真正的半关闭（close_notify + FIN） |
 | `tuic` / `tuic-v5` | `token`（v4）/ `uuid` + `password`（v5）`alpn`（默认 h3）`port-hopping`（`1234;5000-6000`）`port-hopping-interval`（默认 30） | ✅ | 2 | 自动 UDP；默认 ECN |
 | `hysteria2` | `password` `download-bandwidth`（Mbps）`port-hopping` `port-hopping-interval` `salamander-password` | ✅ | 2 | |
 | `hysteria2` | `gecko-password` | ❓ | 2 | 混淆算法细节待确认 |
 | `masque` | `username` `password`（HTTP Basic）`port-hopping` `port-hopping-interval` | ✅ | 2 | 服务器须声明 extended CONNECT 与 HTTP Datagram，连接时校验 |
-| `anytls` | `password` `reuse`（默认 true） | ✅ | 2 | |
+| `anytls` | `password` `reuse`（默认 true） | ✅ | 2 | 自动 UDP（udp-over-tcp v2，属 M5）；`password` 只接受命名写法；`reuse=false` 时每个流各自新建会话、用完即关，不进池 |
 | `trust-tunnel` | `username` `password` `headers` `max-streams`（默认 3）`h3`（默认 false） | ✅ | 2 | 无 UDP |
 | `ssh` | `username` `password` \| `private-key`（Keystore 名）`idle-timeout`（默认 180）`server-fingerprint`（多指纹逗号分隔） | ✅ | 2 | Surge 仅 `curve25519-sha256` + `aes128-gcm`；rurge 至少支持这两者（可为超集）；未配置指纹时一次性安全告警 |
 | `wireguard` 策略行 | `section-name`（必填）`underlying-proxy`（默认 DIRECT）`test-url`（仅 http）`test-timeout`（另加 10 秒 L3 初始化）`ecn` | ✅ | 2 | |
@@ -806,7 +807,7 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | `dump summary/performance/rule-usage/virtual-ip` `watch speed` `log` `log watch` `logbook` `proxy-runtime-status` | 检视 | 同名 | 6 | |
 | `script list/run` `script-log` `benchmark encryption/rule-matching` `test-policy-bandwidth` | 自动化与基准 | 同名 | 6 | |
 | `device` `reconnect-device` `vmnet` `security ban` | 网关 | `device` `security ban` 同名；`reconnect-device` 🔁；`vmnet` 🟡 按平台 | 7 | |
-| `reload` `switch-profile` `kill` `stop` `unattended-upgrade` | 控制 | `reload` `switch-profile` `kill` `stop` 同名；`unattended-upgrade` 🔁 | 1 / 6 | rurge 自身更新由包管理器负责；SIGHUP / `--watch` 的配置热重载已实现（M3b，重建整个 Stack，DNS 缓存随之清空）；重建监听器的判据是**监听器配置面**（监听地址集合、`password@` / wifi 认证、`proxy-restricted-to-lan`、两个错误页开关）任一变化——只比地址会让密码轮换与来源限制静默不生效（M3b 修复波订正）；重绑失败会留下「零监听器」的退化态，此时下一次重载无条件重试绑定；`--watch` 的监视列表在启动时固定，重载新增的 `#!include` 需重启才会被监视；`rurge reload` / `rurge stop` 已实现（M4a，经 `http-api` 的 `POST /v1/profiles/reload` / `POST /v1/stop`；未配置 `http-api` 时命令退出 2 并提示改用 SIGHUP / `--watch`）；`kill` 走 `POST /v1/requests/kill`；`switch-profile` 的多配置目录管理仍在阶段 6 |
+| `reload` `switch-profile` `kill` `stop` `unattended-upgrade` | 控制 | `reload` `switch-profile` `kill` `stop` 同名；`unattended-upgrade` 🔁 | 1 / 6 | rurge 自身更新由包管理器负责；SIGHUP / `--watch` 的配置热重载已实现（M3b，重建整个 Stack，DNS 缓存随之清空）；重建监听器的判据是**监听器配置面**（监听地址集合、`password@` / wifi 认证、`proxy-restricted-to-lan`、两个错误页开关）任一变化——只比地址会让密码轮换与来源限制静默不生效（M3b 修复波订正）；重绑失败会留下「零监听器」的退化态，此时下一次重载无条件重试绑定；`--watch` 的监视列表在启动时固定，重载新增的 `#!include` 需重启才会被监视；`rurge reload` / `rurge stop` 已实现（M4a，经 `http-api` 的 `POST /v1/profiles/reload` / `POST /v1/stop`；未配置 `http-api` 时命令退出 2 并提示改用 SIGHUP / `--watch`）；`kill` 走 `POST /v1/requests/kill`；`switch-profile` 的多配置目录管理仍在阶段 6；M2b 起，重载按出站指纹复用：名字相同且参数、引用的 Keystore 条目与 `[General] ipv6` 都未变的策略沿用上一代的出站（含连接池，如 anytls 的空闲会话），只有变了的策略才重建；被复用的出站跟随新一代的解析器 |
 | rurge 扩展 | 查看运行中实例的状态：出站模式、全局策略、策略与规则计数、活动请求数、流量 | `rurge status [-c <conf>] [--remote host:port] [--key <key>] [--json]` | 1 | Surge 无对应命令；M4a 已实现，聚合 `GET /v1/outbound`、`/v1/outbound/global`、`/v1/policies`、`/v1/rules`、`/v1/requests/active`、`/v1/traffic`；`policies` 计数含 5 个内置策略；见 `docs/api/phase1.md` |
 | `environment` `set` `set-log-level` | 环境 | 同名 | 6 | |
 | Agent Skill（Mac 6.5+） | 面向 AI 代理的技能文档 | 🟡 | 6 | rurge 仓库可提供等价 skill 文档 |

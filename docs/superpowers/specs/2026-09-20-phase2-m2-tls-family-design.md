@@ -74,8 +74,8 @@
 | 依赖 | 用途 | 计划 |
 | ---- | ---- | ---- |
 | `tokio-tungstenite`（带 `tungstenite`）、`futures-util`（若尚未直接依赖） | WebSocket 客户端握手与帧 | a |
-| `aes` `aes-gcm` `chacha20poly1305` `hmac` `md-5` `sha3` `crc32fast` | VMess AEAD | b |
-| `md-5`（同上） | AnyTLS 的 `padding-md5` | b |
+| `ring`（已有）`aes`（已有）`md-5` `sha3` `crc32fast`（已有） | VMess AEAD | b |
+| `md-5`（同上）`tokio-util`（已有） | AnyTLS 的 `padding-md5`；`tokio-util` 供 `PollSender` | b |
 | `hmac` `sha1` | Shadow TLS 的 HMAC-SHA1 | c |
 
 `sha2`（SHA224 / SHA256）已是依赖。写计划时核对每个 crate 在 `Cargo.lock` 里新增的条目数，超出预期的先停下来报告（M1a 的 `p12-keystore` 先例）。
@@ -224,7 +224,7 @@ impl Stack {
 - 开流：`cmdSYN`，接着第一个 `cmdPSH` 里是 SOCKS 风格的目标地址。**不等 `cmdSYNACK` 就返回流**：首段负载可以跟着 SYN 一起走，省一个往返，对 v1 / v2 服务端都成立；v2 的 SYNACK 带错误文本时，在该流的第一次读上以 `anytls: <untrusted_text>` 失败并关闭该流。
 - `cmdAlert`：记 WARN（文本经 `untrusted_text`）并关闭会话。`cmdHeartRequest`：回 `cmdHeartResponse`；客户端不主动发心跳。
 - **padding**：按方案处理每个会话的前 `stop` 个包（按方案给的长度切分 / 补足，`c` 标记处若已无用户数据则停止），填充用 `cmdWaste` 帧。默认方案取协议文档里的那份。方案属于出站对象、它的所有会话共享；`cmdUpdatePaddingScheme` 到达时解析并做有界校验（条目数与取值上限，写计划时定），通过则原子替换，不合法就保留旧方案并记一条 WARN。
-- **会话复用**：与参考实现一致，一条会话同一时刻只承载一个流（相当于 HTTP/1.1 的 keep-alive，不是并发多路），因此没有跨流的队头阻塞。流正常结束（双向 FIN、事件循环无错）→ 会话带时间戳回空闲池；取用时选 `Seq` 最大（最新）的那条；回收任务每 30 秒清一次空闲超过 60 秒的会话（协议文档给的下限）。`reuse=false`：流结束就关会话，不进池。
+- **会话复用**：与参考实现一致，一条会话同一时刻只承载一个流（相当于 HTTP/1.1 的 keep-alive，不是并发多路），因此没有跨流的队头阻塞。流正常结束（任一方的 `cmdFIN`、事件循环无错）→ 会话带时间戳回空闲池；**没有半关闭**：客户端或服务端任一侧发出 `cmdFIN` 就结束整条流的双向传输，不需要等对端回应。取用时选 `Seq` 最大（最新）的那条；回收任务每 30 秒清一次空闲超过 60 秒的会话（协议文档给的下限）。`reuse=false`：流结束就关会话，不进池。
 - 池与回收任务归出站对象所有；最后一个 `Arc` 释放时回收任务中止、空闲会话关闭（总设计 5.5）。
 
 ### 6.4 VMess（M2b）
@@ -310,7 +310,7 @@ pub trait OutboundFactory: Send + Sync {
 | 对端文本 | 一律经 `untrusted_text`（去控制字符、有界） |
 | 凭据 | 口令、SHA224 / SHA256 哈希、UUID、`cmdKey`、Shadow TLS 的 HMAC 与异或密钥——永不出现在错误、日志、诊断、API 与 `Debug` 输出里 |
 | 缓冲 | 长度先校验后分配：ws 帧 / 消息上限、anytls 帧 ≤ 65535（格式所限）与 padding 方案的上限、vmess 分块与 TLS 记录的规范上限 |
-| 等待 | 整条阶梯一个超时；anytls 回收任务定时；没有无界等待 |
+| 等待 | 整条阶梯一个超时；anytls 回收任务定时；没有无界等待；任一方向以错误结束时，另一方向随之结束（M2b：转发循环的 flush 与跨方向取消两处修正） |
 | 后台任务 | anytls 的回收任务与会话读循环：随所属对象释放而中止；panic 由任务边界隔离并记 ERROR |
 
 ## 11. 测试策略（总设计第 13 节的三层；全部安全约束不变）
@@ -376,10 +376,10 @@ pub trait OutboundFactory: Send + Sync {
 | ---- | ---- | ---- |
 | V1 | `tokio-tungstenite` / `tungstenite` 的确切版本、`client_async_with_config` 对自带 `http::Request` 要求调用方提供哪些头、`WebSocketConfig` 的上限字段名与取值（5.2 的帧 / 消息上限）、给 `Cargo.lock` 新增的条目数（已核对：M2a 计划 P1–P3、P7 / P10） | a |
 | V2 | sing-box 1.14.1 的 trojan 入站与 ws 传输的配置写法（发布版是否需要额外的构建标签）（已核对：M2a 计划 P1–P3、P7 / P10） | a |
-| V3 | VMess AEAD 的逐字节格式与 KDF 标签串（对照 v2fly / sing-vmess 源码）；向量的出处 | b |
-| V4 | AnyTLS v2 的逐字节格式、默认 padding 方案、`padding-md5` 的算法（对照 anytls-go 的协议文档与源码）；`cmdUpdatePaddingScheme` 的有界校验取值（6.3：条目数与单项长度的上限） | b |
-| V5 | xray 的固定版本、三个平台的包名与 SHA256、只含回环入站的最小配置 | b |
-| V6 | `EngineFactory` 按值捕获的字段清单 → `environment()` 的内容 | b |
+| V3 | VMess AEAD 的逐字节格式与 KDF 标签串（对照 v2fly / sing-vmess 源码）；向量的出处（已核对：M2b 计划 P1 / P5 / P9 / P10） | b |
+| V4 | AnyTLS v2 的逐字节格式、默认 padding 方案、`padding-md5` 的算法（对照 anytls-go 的协议文档与源码）；`cmdUpdatePaddingScheme` 的有界校验取值（6.3：条目数与单项长度的上限）（已核对：M2b 计划 P1 / P5 / P9 / P10） | b |
+| V5 | xray 的固定版本、三个平台的包名与 SHA256、只含回环入站的最小配置（已核对：M2b 计划 P1 / P5 / P9 / P10） | b |
+| V6 | `EngineFactory` 按值捕获的字段清单 → `environment()` 的内容（已核对：M2b 计划 P1 / P5 / P9 / P10） | b |
 | V7 | Shadow TLS v2 摘要覆盖的确切字节范围、v3 HMAC 链的起始值与帧格式、"体面收尾"的动作（对照 `ihciah/shadow-tls` 的文档与源码）；sing-box shadowtls 入站的配置写法 | c |
 | V8 | 附录 A 的两条假设在所用的 rustls 版本上仍成立（spike 的断言即检查项） | c |
 
@@ -407,6 +407,24 @@ pub trait OutboundFactory: Send + Sync {
 | 任务 8 | 5.2 错误文本一句写着 `ws: <untrusted_text(库的错误文本)>`，暗示握手 / 运行期错误会转发 tungstenite 自己的（经 `untrusted_text` 处理过的）文本 | 代码里没有这个机制：`transport/ws.rs` 从不调用 `untrusted_text`，每个 tungstenite 错误变体都映射成固定文本（`ws: handshake failed`，非 101 响应时带 `: HTTP <状态码>`；`ws: protocol error`；`ws: the server sent a text frame`；`ws: the server sent a frame larger than the limit`；`ws: the connection is closed`），唯一的例外是 `WsError::Io`，它原样作为普通 I/O 错误继续走 `OutboundError::Io` / `Timeout`，不带 `ws:` 前缀。Task 8 评审发现 |
 
 实施中发现的新出入由各任务追加。
+
+## 18. M2b 实施期的订正
+
+本节登记 M2b 计划的「计划期决定」（`global-constraints.md` P2、P3、P5、P6、P7、P13、P16、P17、P18）里与本文件文字不同的地方，以及实施期新发现的两处出入。逐条对应实现的提交见 `docs/superpowers/plans/2026-09-20-phase2-m2b-vmess-anytls-plan.md` 末尾「执行期修正记录」。
+
+| 编号 | 设计原文 | 订正 |
+| ---- | -------- | ---- |
+| P2 | 第 3 节新依赖表："`aes` `aes-gcm` `chacha20poly1305` `hmac` `md-5` `sha3` `crc32fast` \| VMess AEAD" | AEAD 改用 `ring`（rustls 已经把它带进 `Cargo.lock`，零新增条目，汇编实现）而非 `aes-gcm` + `chacha20poly1305`；AuthID 的单块加密用已有的 `aes = "0.8"`；不需要 `hmac`（`hmac` crate 表达不了"HMAC 套 HMAC"，嵌套 HMAC 手写，20 行，向量钉住）；新增的只有 `md-5` `sha3` 及其依赖 `keccak`（`Cargo.lock` 预计新增 3 个条目）；`tokio-util`（工作区已有）随 AnyTLS 一并引入，取 `PollSender` |
+| P3 | 6.4 只给出分块格式"长度(2，掩码) ‖ AEAD(负载)"，未定具体的大小上限与流结束语义 | 写：负载 ≤ 16368 字节（密封后 ≤ 2^14）；读：接受 16 ..= 65535 的任何长度；传输层在分块边界上的 EOF 视为流结束（对端没发空块），分块中间的 EOF 是 `UnexpectedEof`；应答头之前就 EOF 是 `vmess: the server closed the connection without answering`（UUID 错、时钟偏差超过约 120 秒都表现为这个，服务端从不说明原因）；选项固定 `0x05`（ChunkStream + ChunkMasking） |
+| P5 | 6.3："`cmdUpdatePaddingScheme` 到达时解析并做有界校验（条目数与取值上限，写计划时定）" | 原文 ≤ 8192 字节且是 UTF-8、`stop` ≤ 256、每个包 ≤ 64 项、每项是 `c` 或 `a-b`（1 ≤ 值 ≤ 16384，一条 TLS 记录的上限）；不是 `stop` 也不是包序号的键忽略；任何一条不满足 → 保留旧方案 + 一条 WARN |
+| P6 | 6.3 原文"双向 FIN" | AnyTLS 没有半关闭：`cmdFIN` 结束整条流，收到对端的 FIN 不需要回 FIN（协议文档 2025-09 的澄清）；`poll_shutdown` = 发 `cmdFIN` 并让本端的读立刻返回 EOF（sing-box 对没有 `CloseWrite` 的连接就是这么做的）。已直接改写 6.3 正文（本节） |
+| P7 | 6.3 未说明会话层的后台任务如何组织、也未提是否有 SYNACK 超时看门狗 | 一条会话一个任务，独占 TLS 流（`tokio::io::split`，读循环与写循环在同一个 `select!` 里）；流句柄经两条有界队列（各 8）与任务通信，写用 `tokio_util::sync::PollSender`；任务每批写完自己 `flush`；多个任务共享一个 `AsyncWrite` 会互相顶掉唤醒者，所以不这么做；空闲时任务照常读（心跳有人答、对端关连接能被发现）；**不实现参考客户端的 3 秒 SYNACK 看门狗**（复用到一条"半死"的空闲会话时由转发阶段的空闲超时兜底） |
+| P13 | 4.3 只说"加载时 W0007"，未说明重复出现时报几条、注册表的说明文本如何得来 | 像 `inert` 那样每次加载只报一条（`to_spec` 给 `SpecOutcome` 加 `legacy_vmess: bool`）；运行期文本：成功加载的配置里，没有 spec 的 `vmess` 策略只可能是没写 `vmess-aead=true` 的一种（有错误的配置根本加载不了），所以注册表对这种条目的说明文本直接取 4.3 给出的 `vmess (legacy handshake)` |
+| P16 | （承接自 M1b / M2a：转发循环在 `write_all` 之后不 flush，此前的设计文本未处理） | 真缺陷而不只是风格问题：`tokio-rustls` 的 `poll_write` 在 socket 写不动时会在"明文已收下、密文还留在自己缓冲里"的状态下返回成功，若没有下一次写这段尾巴就一直留着；`copy_half` 改为 `write_all` 之后 `flush`（同样与 `stop` 竞争）；同一个任务里顺带修一个相邻的缺口：一个方向以错误结束时，另一个方向不会跟着结束（改为 `tokio::join!` 等两边）——vmess 的"没应答就关"与 anytls 的被拒 / 会话死亡都以读错误的形式出现，没有这一条它们只会表现为卡住 |
+| P17 | 4.2 表："`vmess` 的 `tls=false` 却写了 TLS 参数 \| `W0028`（复用 `refuse_tls`）" | 仍是 `W0028`，但不复用 `refuse_tls` 的文本（"does not apply to `vmess` policies" 会误导，因为 `vmess` 本来就可以用 TLS，只是这次没开）：改用 `` `<key>` has no effect without `tls=true`; ignored `` |
+| P18 | （无对应设计文字：预检阶段的三处实现细节订正） | ① 只被单元用例用到的 `Pool::len` 标 `#[cfg(test)]`、只有假服务端会发的 `frame::SERVER_SETTINGS` 标 `#[cfg(any(test, feature = "testing"))]`；② `FakeVmess` 拒绝连接时先关写端、再把连接读到头（带着未读字节关连接会变成 RST，客户端拿到的就是 I/O 错误而不是"没应答就关"）；③ 引擎端到端用例里等"anytls 会话回池"的信号改为"会话记录出现"（`get` 带 `Connection: close`，先结束流的是服务端，对端的 FIN 不回，服务端的 FIN 计数在那两条用例里永远是 0） |
+| 6（执行期） | 第 10 节"等待"一行原文："整条阶梯一个超时；anytls 回收任务定时；没有无界等待" | 转发循环的两处修正（`flush`、跨方向取消）属于 M2b 的交付；已在第 10 节"等待"一行补一句"任一方向以错误结束时，另一方向随之结束" |
+| 8（执行期） | （无对应设计文字：出站复用机制的副作用） | 复用之后，`skip-cert-verify` 的 WARN 不再随每次重载重复：这条 WARN 是 `EngineFactory::build` 的副作用，被复用的出站不再经过 `build`，因此不再告警；首次构建与参数变更后的重建仍照常告警（已裁定接受） |
 
 ## 附录 A　Shadow TLS v3：在 stock rustls 上签名 ClientHello
 
