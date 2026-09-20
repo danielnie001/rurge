@@ -7098,6 +7098,8 @@ git commit -m "docs: M2b——兼容性清单、API 参考、README、CLAUDE.md�
 | 11 | `pub mod xray;` 比计划早半步加入（与 Step 2 一起过门禁）；rustfmt 重排四处；README 的章节划分是实现者对计划文字的理解（版本号、三个 SHA-256、环境变量与 P9 逐字一致，评审用程序逐位比对过 `ci.yml` 与 README） | 计划对 README 只给了要点没给成文 | ca62484 |
 | 11 | **互操作用例在本机一条都没有真正运行**：本机没有 sing-box 与 xray，也没有安装；九条 sing-box 用例与一条 xray 用例都打印跳过原因后通过。它们对真实二进制的表现要等首次推送后的 CI（`RURGE_INTEROP_REQUIRED=1`）证明 | 不在开发者的机器上下载或安装任何参考二进制 | ca62484 |
 | 12 | 本任务按控制者的裁定改了一行代码注释：`crates/rurge-proto/src/vmess/stream.rs` 文件头里"转发循环从不调用的 `flush`"一句，自 Task 6 起不再成立 | Task 6 的评审指出的过时措辞；不改行为 | e287ae0 |
+| 12 | 评审后补一轮：清单的 anytls 行与 API 参考各补一句"连接超时只约束到首包入队" | 素材里指派给该任务的句子只进了本表，没进那两份文档 | fca17f6 |
+| 终审 | 代码：`Session::open` 在发送之后再查一次 `closed`（会话恰好在池的 `is_closed()` 检查与挂上新流之间死掉时，新流会挂到空闲超时）；补"一个方向的正常 EOF 不得结束另一个方向"的 relay 用例；`FakeAnyTls::kick()` 改用 `watch` 代际计数（`notify_waiters` 不留许可，会丢通知）；`VmessScript` / `AnyTlsScript` 不再派生 `Debug`；三处只活在评审脑子里的约定写进注释；`with_roots` 与 `PolicyRegistry::build` 的文档各补一句。文档：API 参考里 `anytls: the stream is closed` 一行的成因写错了；设计第 18 节补 P4；清单补 vmess 的 100 ms 宽限、两种新协议的目标主机名字母表规则、心跳应答在写队列满时丢弃、复用使 `skip-cert-verify` 的 WARN 不随重载重复 | 终审（opus）：无 Critical，两条 Important，其余 Minor | `5c5a785`（代码）；终审修复波的文档提交 |
 
 ## 延后事项
 
@@ -7107,26 +7109,31 @@ git commit -m "docs: M2b——兼容性清单、API 参考、README、CLAUDE.md�
 | （计划期）以 Unicode 写的代理服务器主机名不可用：解析器的线上编码与应答校验都只认 ASCII，TLS 层是构建错误（P15） | M8：连同规则、`[Host]`、解析器一起做全面的 IDN 支持；清单已登记 |
 | （计划期）`Secret<T>` 只包了凭据类型的字段；`WsOpts.path` / `headers`、`HttpSpec.headers` 与 `KeystoreItem` 的 `base64` / `password` 仍会被 `Debug` 打印（生产代码从不格式化它们）（P14） | M8 |
 | （计划期）VMess 旧式（非 AEAD）握手 | M8（设计 M2-D4） |
-| `ChunkCipher::open_len` / `open` 必须每个分块各调一次、且按此顺序（各自推进掩码流 / nonce 计数），函数上没写这条约定 | 终审分拣 |
-| `VmessStream::poll_write` 把一个停着的分块算到下一次写所给的缓冲头上（`accepted.min(data.len())`）：对 `write_all` / 转发循环是对的，对"换一段字节重试"的调用方是一条没写下来的约定 | 终审分拣（与 M2a 的 `WsByteStream.queued` / `LazyHead.coalesced` 同类） |
-| `VmessStream` 的读错误不是粘性的：出错后再轮询会对同一个分块再调一次 `open_len` / `open`（工作区里没有出错后继续轮询的调用方） | 终审分拣 |
+| `ChunkCipher::open_len` / `open` 必须每个分块各调一次、且按此顺序（各自推进掩码流 / nonce 计数），函数上没写这条约定 | 终审修复波已写进注释（`open_len` / `open` 各自的文档注释新增这条约定） |
+| `VmessStream::poll_write` 把一个停着的分块算到下一次写所给的缓冲头上（`accepted.min(data.len())`）：对 `write_all` / 转发循环是对的，对"换一段字节重试"的调用方是一条没写下来的约定 | 终审修复波已写进 `stream.rs` 模块注释（与 M2a 的 `WsByteStream.queued` / `LazyHead.coalesced` 同类地写明） |
+| `VmessStream` 的读错误不是粘性的：出错后再轮询会对同一个分块再调一次 `open_len` / `open`（工作区里没有出错后继续轮询的调用方） | 终审修复波已写进 `stream.rs` 模块注释（读错误之后不得再读） |
 | `FakeVmess` 按 `open_len` 分配缓冲前没有客户端那条 `len < TAG` 的检查（仅测试） | 保持现状 |
-| 会话恰好在 `Pool::take()` 的 `is_closed()` 检查与 `Session::open` 挂上新流之间死掉时，新流会一直挂到转发阶段的空闲超时（队列还有空位，发送成功） | 终审修复波（在发送之后再查一次 `closed`） |
-| `FakeAnyTls::kick()` 用 `Notify::notify_waiters()`，不留许可，落在两次 `select!` 之间的 kick 会丢——`a_session_the_server_closed_while_idle_is_not_reused` 的潜在抖动 | 终审修复波 |
+| 会话恰好在 `Pool::take()` 的 `is_closed()` 检查与 `Session::open` 挂上新流之间死掉时，新流会一直挂到转发阶段的空闲超时（队列还有空位，发送成功） | 终审修复波已修复：`Session::open` 在发送之后再查一次 `closed` |
+| `FakeAnyTls::kick()` 用 `Notify::notify_waiters()`，不留许可，落在两次 `select!` 之间的 kick 会丢——`a_session_the_server_closed_while_idle_is_not_reused` 的潜在抖动 | 终审修复波已修复：`kick()` 改用 `watch` 代际计数，`serve` 只在循环之前订阅一次 |
 | "鉴权必须一次写出"没有回归守卫（假服务端读的是重组后的 TLS 流） | 保持现状：单次 `read()` 的假服务端会把参考服务端自身的时序依赖抄过来，把守卫变成抖动；由 sing-box 互操作兜底 |
 | AnyTLS 出站的九条用例里有四条各捆了两到四个场景 | 保持现状（共用代价高的 TLS 夹具与假服务端；每条断言带自己的说明） |
 | `vmess/stream.rs` 文件头注释里"转发循环从不调用的 `flush`"自 Task 6 起已过时；P7 的理由里同一句话亦然 | Task 12 改写这一句注释（不改行为），并在设计第 18 节里说明 |
-| 没有用例钉住"一个方向的正常 EOF 不得结束另一个方向"（现在出错会取消另一个方向，这条更该有） | 终审修复波（十行左右的 relay 用例） |
+| 没有用例钉住"一个方向的正常 EOF 不得结束另一个方向"（现在出错会取消另一个方向，这条更该有） | 终审修复波已补上：`a_clean_eof_in_one_direction_leaves_the_other_running` |
 | `relay_throughput` 的接收循环没有上界（`#[ignore]`，手动运行） | 保持现状 |
 | 吞吐测量走的是 TCP（`flush` 为空操作），没有测到 TLS / WebSocket / VMess 栈上每 8 KiB 一次 flush 的成本 | M8 收尾时若做性能工作一并测 |
-| `PolicyRegistry::build` 的文档注释没写明 `previous` 必须出自同一个 `cell`（公开 API、未校验；经引擎不可达） | 终审修复波（一句话） |
+| `PolicyRegistry::build` 的文档注释没写明 `previous` 必须出自同一个 `cell`（公开 API、未校验；经引擎不可达） | 终审修复波已补上这一句 |
 | 每个出站整代持有一份 `PolicySpec` 克隆与其 Keystore 条目的 base64（N 条策略共用一个 client-cert 时持有 N + 1 份） | 保持现状（P10 的取舍） |
 | `environment()` 是人工维护的约定：给 `EngineFactory` 加一个按值捕获的字段不会让任何用例变红 | M3（策略组）动工厂时复核 |
-| 复用用例没覆盖 Keystore 条目的口令或类型变化（只测了 `base64`），也没覆盖"改一条无关的 Keystore 条目不影响它" | 终审分拣 |
+| 复用用例没覆盖 Keystore 条目的口令或类型变化（只测了 `base64`），也没覆盖"改一条无关的 Keystore 条目不影响它" | 终审评审后仍按现状搁置（覆盖面缺口，非缺陷） |
 | `tests/outbounds.rs` 里证书指纹转十六进制的五行出现了两次（`trojan_upstream` 与新的 `pin_of`） | 下次改这个文件时合并 |
-| 没有"改 vmess / anytls 策略的 `client-cert` → 出站被重建"的端到端链路（注册表层对 https 有用例；`ProtoSpec::tls()` 的两个新分支有单元用例） | 终审分拣 |
+| 没有"改 vmess / anytls 策略的 `client-cert` → 出站被重建"的端到端链路（注册表层对 https 有用例；`ProtoSpec::tls()` 的两个新分支有单元用例） | 终审评审后仍按现状搁置（两个新分支的单元用例已覆盖；端到端链路留待后续里程碑） |
 | `rurge-engine` 的 `outbounds` 测试二进制在本机偶发 `STATUS_ACCESS_VIOLATION` 异常退出而没有失败用例（Task 8 期间又遇到一次；重跑即过）。全工作区 `forbid(unsafe_code)`，根因仍未查明 | 保持跟踪（自 M4a 起的已知现象） |
 | Task 10 的守卫核对里，"anytls 的首包在超时之内"说得过满：超时约束的是 `cmdSettings ‖ cmdSYN ‖ cmdPSH` **入队**，物理写出由会话自己的任务完成（与 vmess 惰性发出的请求头同类，实际短得多） | 文档里写成"在超时内入队"（本任务落实到清单 / API 参考的相应句子） |
 | xray 夹具渲染的客户端只有 `id`、没有 `alterId`（xray v26.3.27 只认 AEAD，`alterId` 已是遗留字段；与计划一致）——真实 xray 是否接受这个写法本机无法确认 | 首次推送后的 CI |
 | 互操作用例 `anytls_reuses_its_session_and_can_be_told_not_to` 只断言每轮往返成功，分辨不出"确实复用了会话"与"没有复用"（黑盒夹具拿不到握手次数）；复用本身由回环假服务端的用例钉住 | 保持现状 |
 | `tests/interop/tests/sing_box.rs` 已到 518 行，后续里程碑还会往里加协议 | M2c 动它时考虑按协议拆文件 |
+| `vmess: the connection ended in the middle of a chunk` 这条文本同样用于"应答头读到一半连接就断了"（API 参考如实写了，文本本身不够准确） | 保持延后（罕见路径；改文本要动已验证的流代码） |
+| `crates/rurge-engine/tests/outbounds.rs` 已到 1500 多行 | M2c 动它时按协议拆分（与 `tests/interop/tests/sing_box.rs` 一起） |
+| 每 8 KiB 一次 `flush` 在 TLS / WebSocket / VMess 栈上的成本没有测过（只测了 TCP，那里是空操作）——终审认为这不是可有可无的项 | M8 的性能工作里必须测 |
+| "anytls 的鉴权必须一次写出"的唯一守卫是一次还没发生过的 CI 运行 | 首次推送后盯住互操作 job：sing-box 的 anytls 鉴权、xray 不带 `alterId` 的客户端条目、四种 vmess 组合的大负载往返 |
+| `environment()` 是人工维护的约定的第二个实例：`EngineFactory::with_roots` 是公开的，而根证书库不在指纹里（生产中是进程级 `OnceLock`）——本波只在文档注释里写明了前提 | M2c 把 http / socks5 迁到 `Stack` 时一并复核，考虑改成派生值 |

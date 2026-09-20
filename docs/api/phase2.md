@@ -68,7 +68,7 @@ trojan、vmess（± WebSocket）与 anytls 出站失败时，会话记录的 `er
 | 错误文本 | 何时出现 |
 | --- | --- |
 | `anytls: the session is closed` | 会话所在的 TLS 连接已经失败（读或写出错），或会话所在的后台任务已经退出；之后任何对这条会话的读写（含开一个新流）都以这条文本失败 |
-| `anytls: the stream is closed` | 本地已经结束了这个流（如调用过 `shutdown`）之后又尝试写入；不是服务端结束的（那两种情形见下面两条） |
+| `anytls: the stream is closed` | 这个流已经结束——本地结束（如调用过 `shutdown`），或服务端发来不带文本的 `cmdFIN`——之后又尝试写入 |
 | `anytls: <文本>` | 服务端用带错误文本的 `cmdSYNACK` 拒绝了这一个流（如目标连不上）；只有这一条流失败，会话本身仍可用于下一个流 |
 | `anytls: the server sent an alert: <文本>` | 服务端发送 `cmdAlert`；整条会话（及其正在使用的流）随之结束，不会被放回连接池 |
 | `anytls: the host name cannot be sent to the server` | 目标主机名转不成可发送的形式；连接不会被拨出 |

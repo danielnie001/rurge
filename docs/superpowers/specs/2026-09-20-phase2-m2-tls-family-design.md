@@ -410,12 +410,13 @@ pub trait OutboundFactory: Send + Sync {
 
 ## 18. M2b 实施期的订正
 
-本节登记 M2b 计划的「计划期决定」（`global-constraints.md` P2、P3、P5、P6、P7、P13、P16、P17、P18）里与本文件文字不同的地方，以及实施期新发现的两处出入。逐条对应实现的提交见 `docs/superpowers/plans/2026-09-20-phase2-m2b-vmess-anytls-plan.md` 末尾「执行期修正记录」。
+本节登记 M2b 计划的「计划期决定」（`global-constraints.md` P2、P3、P4、P5、P6、P7、P13、P16、P17、P18）里与本文件文字不同的地方，以及实施期新发现的两处出入。逐条对应实现的提交见 `docs/superpowers/plans/2026-09-20-phase2-m2b-vmess-anytls-plan.md` 末尾「执行期修正记录」。
 
 | 编号 | 设计原文 | 订正 |
 | ---- | -------- | ---- |
 | P2 | 第 3 节新依赖表："`aes` `aes-gcm` `chacha20poly1305` `hmac` `md-5` `sha3` `crc32fast` \| VMess AEAD" | AEAD 改用 `ring`（rustls 已经把它带进 `Cargo.lock`，零新增条目，汇编实现）而非 `aes-gcm` + `chacha20poly1305`；AuthID 的单块加密用已有的 `aes = "0.8"`；不需要 `hmac`（`hmac` crate 表达不了"HMAC 套 HMAC"，嵌套 HMAC 手写，20 行，向量钉住）；新增的只有 `md-5` `sha3` 及其依赖 `keccak`（`Cargo.lock` 预计新增 3 个条目）；`tokio-util`（工作区已有）随 AnyTLS 一并引入，取 `PollSender` |
 | P3 | 6.4 只给出分块格式"长度(2，掩码) ‖ AEAD(负载)"，未定具体的大小上限与流结束语义 | 写：负载 ≤ 16368 字节（密封后 ≤ 2^14）；读：接受 16 ..= 65535 的任何长度；传输层在分块边界上的 EOF 视为流结束（对端没发空块），分块中间的 EOF 是 `UnexpectedEof`；应答头之前就 EOF 是 `vmess: the server closed the connection without answering`（UUID 错、时钟偏差超过约 120 秒都表现为这个，服务端从不说明原因）；选项固定 `0x05`（ChunkStream + ChunkMasking） |
+| P4 | 4.2 校验表一行："`vmess` 的 `username` 不是合法 UUID；`encrypt-method` 不是手册列的两个值 \| `E0018`（文本不回显取值）" | 两个字段不是同一回事：`encrypt-method` 的诊断用现成的 `ParamReader::choice`，文本回显取值——`` invalid value `rc4` for `encrypt-method` (expected aes-128-gcm / chacha20-ietf-poly1305) ``（密码算法名不是凭据）；`username` 的诊断（`` `username` is not a valid UUID ``）仍不回显取值，因为它本身就是凭据 |
 | P5 | 6.3："`cmdUpdatePaddingScheme` 到达时解析并做有界校验（条目数与取值上限，写计划时定）" | 原文 ≤ 8192 字节且是 UTF-8、`stop` ≤ 256、每个包 ≤ 64 项、每项是 `c` 或 `a-b`（1 ≤ 值 ≤ 16384，一条 TLS 记录的上限）；不是 `stop` 也不是包序号的键忽略；任何一条不满足 → 保留旧方案 + 一条 WARN |
 | P6 | 6.3 原文"双向 FIN" | AnyTLS 没有半关闭：`cmdFIN` 结束整条流，收到对端的 FIN 不需要回 FIN（协议文档 2025-09 的澄清）；`poll_shutdown` = 发 `cmdFIN` 并让本端的读立刻返回 EOF（sing-box 对没有 `CloseWrite` 的连接就是这么做的）。已直接改写 6.3 正文（本节） |
 | P7 | 6.3 未说明会话层的后台任务如何组织、也未提是否有 SYNACK 超时看门狗 | 一条会话一个任务，独占 TLS 流（`tokio::io::split`，读循环与写循环在同一个 `select!` 里）；流句柄经两条有界队列（各 8）与任务通信，写用 `tokio_util::sync::PollSender`；任务每批写完自己 `flush`；多个任务共享一个 `AsyncWrite` 会互相顶掉唤醒者，所以不这么做；空闲时任务照常读（心跳有人答、对端关连接能被发现）；**不实现参考客户端的 3 秒 SYNACK 看门狗**（复用到一条"半死"的空闲会话时由转发阶段的空闲超时兜底） |
