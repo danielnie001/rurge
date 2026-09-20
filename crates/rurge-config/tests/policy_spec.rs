@@ -143,3 +143,12 @@ fn keystore_base64_is_checked_at_load() {
         )]
     );
 }
+
+#[test]
+fn a_trojan_policy_has_no_spec_until_the_outbound_is_wired_in() {
+    // M2a plan P6: the readers exist, `to_spec` does not use them yet, so
+    // the registry keeps treating the policy as "not implemented"
+    let loaded = load("T = trojan, t.example, 443, password=p, ws=true", "");
+    assert!(!loaded.diagnostics.has_errors(), "{:?}", loaded.diagnostics);
+    assert!(loaded.config.spec("T").is_none());
+}

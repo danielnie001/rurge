@@ -30,7 +30,7 @@ pub struct HttpSpec {
 const MAX_RANDOM: usize = 1024;
 const PLACEHOLDER: &str = "<random-string(";
 
-fn is_token(name: &str) -> bool {
+pub(crate) fn is_token(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
@@ -38,7 +38,7 @@ fn is_token(name: &str) -> bool {
 }
 
 /// A header value may hold HTAB but no other control character.
-fn is_field_text(text: &str) -> bool {
+pub(crate) fn is_field_text(text: &str) -> bool {
     text.chars().all(|c| c == '\t' || !c.is_control())
 }
 

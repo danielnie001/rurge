@@ -56,6 +56,32 @@ fn parse_fingerprint(value: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// What `rustls` accepts as a server name: an IP literal, or a DNS name of
+/// at most 253 bytes whose labels are 1-63 of `[A-Za-z0-9_-]`, do not start
+/// or end with `-`, and whose last label is not all digits. One trailing dot
+/// is fine. An IDN must be written in its `xn--` form.
+fn is_server_name(name: &str) -> bool {
+    if name.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    let name = name.strip_suffix('.').unwrap_or(name);
+    if name.is_empty() || name.len() > 253 {
+        return false;
+    }
+    let labels: Vec<&str> = name.split('.').collect();
+    let label_ok = |l: &&str| {
+        (1..=63).contains(&l.len())
+            && l.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    };
+    labels.iter().all(label_ok)
+        && labels
+            .last()
+            .is_some_and(|l| !l.bytes().all(|b| b.is_ascii_digit()))
+}
+
 pub(crate) fn read_tls(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> TlsOpts {
     let skip_cert_verify = r.bool("skip-cert-verify").unwrap_or(false);
     let mut sni = Sni::Default;
@@ -71,10 +97,15 @@ pub(crate) fn read_tls(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> Tl
     }
     let mut verify_name = None;
     if let Some(v) = r.str("server-cert-verify-name") {
-        if v.trim().is_empty() {
-            r.invalid("server-cert-verify-name", v, "a host name");
+        let v = v.trim();
+        if is_server_name(v) {
+            verify_name = Some(v.to_string());
         } else {
-            verify_name = Some(v.trim().to_string());
+            r.invalid(
+                "server-cert-verify-name",
+                v,
+                "a host name (an IDN in its xn-- form) or an IP address",
+            );
         }
     }
     let mut fingerprint_sha256 = None;
@@ -117,6 +148,13 @@ pub(crate) fn read_tls(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> Tl
         r.warn(
             codes::W_INVALID_VALUE,
             "`skip-cert-verify` is ignored because `server-cert-fingerprint-sha256` is set"
+                .to_string(),
+        );
+    }
+    if verify_name.is_some() && (fingerprint_sha256.is_some() || skip_cert_verify) {
+        r.warn(
+            codes::W_INVALID_VALUE,
+            "`server-cert-verify-name` is ignored because the certificate chain is not validated (`server-cert-fingerprint-sha256` / `skip-cert-verify`)"
                 .to_string(),
         );
     }
@@ -197,7 +235,10 @@ mod tests {
             "https, h, 443, sni=cdn.example.com, server-cert-verify-name=real.example.com, \
              server-cert-fingerprint-sha256={fp}, alpn=\"h2, http/1.1\", client-cert=cert1"
         ));
-        assert!(diags.is_empty(), "{diags:?}");
+        // `server-cert-verify-name` together with a fingerprint is a warning
+        // (task 1, carried item 1), not an error: all six still parse below.
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code, codes::W_INVALID_VALUE);
         assert_eq!(tls.sni, Sni::Name("cdn.example.com".into()));
         assert_eq!(tls.verify_name.as_deref(), Some("real.example.com"));
         assert_eq!(tls.fingerprint_sha256, Some([0xab; 32]));
@@ -254,6 +295,56 @@ mod tests {
             diags[0].message,
             "policy `P`: `client-cert` needs a `p12` keystore item, but `key1` is `openssh-private-key`"
         );
+    }
+
+    #[test]
+    fn verify_name_is_checked_at_load_time() {
+        for good in [
+            "real.example.com",
+            "_srv.example.",
+            "192.0.2.7",
+            "2001:db8::1",
+            "a-b.c",
+        ] {
+            let (tls, diags) = read(&format!("https, h, 443, server-cert-verify-name={good}"));
+            assert!(diags.is_empty(), "{good}: {diags:?}");
+            assert_eq!(tls.verify_name.as_deref(), Some(good));
+        }
+        for bad in [
+            "bücher.example",
+            "a b",
+            "-a.example",
+            "a-.example",
+            "a..b",
+            "example.123",
+            "x".repeat(64).as_str(),
+        ] {
+            let (tls, diags) = read(&format!("https, h, 443, server-cert-verify-name={bad}"));
+            assert_eq!(tls.verify_name, None, "{bad}");
+            assert_eq!(diags.len(), 1, "{bad}: {diags:?}");
+            assert_eq!(diags[0].code, codes::E_INVALID_POLICY_PARAM);
+        }
+    }
+
+    #[test]
+    fn verify_name_without_chain_validation_is_ignored_with_a_warning() {
+        let fp = "ab".repeat(32);
+        for extra in [
+            format!("server-cert-fingerprint-sha256={fp}"),
+            "skip-cert-verify=true".to_string(),
+        ] {
+            let (_, diags) = read(&format!(
+                "https, h, 443, server-cert-verify-name=real.example.com, {extra}"
+            ));
+            assert_eq!(diags.len(), 1, "{extra}: {diags:?}");
+            assert_eq!(
+                (diags[0].code, diags[0].message.as_str()),
+                (
+                    codes::W_INVALID_VALUE,
+                    "policy `P`: `server-cert-verify-name` is ignored because the certificate chain is not validated (`server-cert-fingerprint-sha256` / `skip-cert-verify`)"
+                )
+            );
+        }
     }
 
     #[test]

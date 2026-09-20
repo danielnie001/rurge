@@ -14,10 +14,11 @@ const SECRET_KEYS: [&str; 7] = [
     "token",
 ];
 /// Inline `name=value` parameters redacted wherever they appear in a value.
-/// `username` also covers harmless SSH user names, and `headers` is blanked
-/// whole (header names included); over-redacting is the safe side for an
-/// endpoint whose purpose is safe output.
-const SECRET_PARAMS: [&str; 9] = [
+/// `username` also covers harmless SSH user names; `headers` and `ws-headers`
+/// are blanked whole (header names included), and so is `ws-path`, which
+/// nodes behind a CDN routinely use as a shared secret. Over-redacting is the
+/// safe side for an endpoint whose purpose is safe output.
+const SECRET_PARAMS: [&str; 11] = [
     "password",
     "psk",
     "private-key",
@@ -27,6 +28,8 @@ const SECRET_PARAMS: [&str; 9] = [
     "uuid",
     "username",
     "headers",
+    "ws-headers",
+    "ws-path",
 ];
 const KEY_AT_KEYS: [&str; 4] = [
     "http-api",
@@ -267,6 +270,7 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
             "ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x",
             "direct, interface=eth0",
             "http, h.test, 80, headers=X-Auth:tok3n;X-B:1",
+            "trojan, t.test, 443, password=pw0rd, ws=true, ws-path=/s3cretpath, ws-headers=Host:edge.test|X-Key:k3y",
         ] {
             let alone = redact_definition(def);
             // one rule, two entry points: the profile endpoint must agree
@@ -275,7 +279,17 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
                 redact_profile(&format!("X = {def}")),
                 "{def}"
             );
-            for secret in ["s3cret", "hunter2", "alice", "bob", "tok3n"] {
+            for secret in [
+                "s3cret",
+                "hunter2",
+                "alice",
+                "bob",
+                "tok3n",
+                "pw0rd",
+                "s3cretpath",
+                "k3y",
+                "edge.test",
+            ] {
                 assert!(!alone.contains(secret), "{def} -> {alone}");
             }
         }
@@ -288,6 +302,12 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
         assert_eq!(
             redact_definition("direct, interface=eth0"),
             "direct, interface=eth0"
+        );
+        assert_eq!(
+            redact_definition(
+                "trojan, t.test, 443, password=pw0rd, ws=true, ws-path=/s3cretpath, ws-headers=Host:edge.test|X-Key:k3y"
+            ),
+            "trojan, t.test, 443, password=***, ws=true, ws-path=***, ws-headers=***"
         );
     }
 }

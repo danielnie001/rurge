@@ -5,12 +5,16 @@ pub mod http;
 pub mod reader;
 pub mod socks5;
 pub mod tls;
+pub mod trojan;
+pub mod ws;
 
 pub use common::{Applies, CommonOpts, IpVersion, Tristate};
 pub use http::{HeaderPart, HeaderTemplate, HttpSpec};
 pub use reader::ParamReader;
 pub use socks5::Socks5Spec;
 pub use tls::{Sni, TlsOpts};
+pub use trojan::TrojanSpec;
+pub use ws::WsOpts;
 
 use crate::diagnostic::{Diagnostic, codes};
 use crate::keystore::KeystoreItem;
@@ -188,6 +192,17 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     };
     if matches!(proto, ProtoSpec::Http(_) | ProtoSpec::Socks5(_)) {
         check_underlying(&mut r, &mut common, env);
+    }
+    // socket options belong to the hop that opens the socket (matrix 4.3)
+    if common.underlying_proxy.is_some() {
+        for key in ["interface", "allow-other-interface", "tos", "ip-version"] {
+            if r.has(key) {
+                r.warn(
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    format!("`{key}` has no effect on a policy with `underlying-proxy`; ignored"),
+                );
+            }
+        }
     }
     let failed = r.has_errors();
     let diagnostics = r.finish();
@@ -377,5 +392,45 @@ mod tests {
 
         let o = outcome("P", "http, h, 80, headers=Broken");
         assert_eq!(o.diagnostics[0].code, codes::E_INVALID_POLICY_PARAM);
+    }
+
+    #[test]
+    fn socket_options_under_a_chain_are_reported() {
+        let o = outcome(
+            "P",
+            "http, h, 80, underlying-proxy=Entry, interface=eth0, allow-other-interface=true, tos=16, ip-version=v4-only",
+        );
+        assert!(o.spec.is_some(), "a warning, not an error");
+        let messages: Vec<(&str, &str)> = o
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `P`: `interface` has no effect on a policy with `underlying-proxy`; ignored"
+                ),
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `P`: `allow-other-interface` has no effect on a policy with `underlying-proxy`; ignored"
+                ),
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `P`: `tos` has no effect on a policy with `underlying-proxy`; ignored"
+                ),
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `P`: `ip-version` has no effect on a policy with `underlying-proxy`; ignored"
+                ),
+            ]
+        );
+        // `underlying-proxy=DIRECT` is no chain: nothing to report
+        let o = outcome("P", "http, h, 80, underlying-proxy=DIRECT, interface=eth0");
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let o = outcome("P", "http, h, 80, interface=eth0, tos=16");
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
     }
 }

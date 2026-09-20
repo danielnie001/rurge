@@ -139,12 +139,13 @@ impl TlsClient {
             // rustls sends no SNI for an IP address
             (_, HostName::Ip(ip)) => ServerName::IpAddress((*ip).into()),
         };
+        // parsed whatever the mode: a name that is not one is a build error
+        let verify_name = opts.verify_name.as_deref().map(dns_name).transpose()?;
         let mode = if let Some(fingerprint) = opts.fingerprint_sha256 {
             Mode::Pinned(fingerprint)
         } else if opts.skip_cert_verify {
             Mode::Insecure
         } else {
-            let verify_name = opts.verify_name.as_deref().map(dns_name).transpose()?;
             let inner = WebPkiServerVerifier::builder_with_provider(roots, provider.clone())
                 .build()
                 .map_err(|e| {
@@ -412,6 +413,29 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    #[test]
+    fn a_bad_verify_name_is_a_build_error_in_every_mode() {
+        for (skip, fingerprint) in [(false, None), (true, None), (false, Some([7u8; 32]))] {
+            let opts = TlsOpts {
+                skip_cert_verify: skip,
+                fingerprint_sha256: fingerprint,
+                verify_name: Some("not a name".into()),
+                ..TlsOpts::default()
+            };
+            let err = TlsClient::build(
+                &opts,
+                &HostName::parse("proxy.example"),
+                &[],
+                None,
+                // standard verification cannot even be set up without a root
+                TlsFixture::new(&["proxy.example"]).roots(),
+            )
+            .err()
+            .expect("the name is refused");
+            assert_eq!(err.message, "`not a name` is not a valid TLS server name");
+        }
     }
 
     /// `DigitallySignedStruct::new` is `pub(crate)` in rustls 0.23.43, so the
