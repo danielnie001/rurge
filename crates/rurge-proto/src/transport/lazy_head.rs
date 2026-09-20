@@ -269,14 +269,29 @@ mod tests {
     use std::task::Waker;
     use tokio::io::DuplexStream;
 
-    /// Passes through to a duplex pipe, except that the first `pending`
-    /// calls of `poll_write` return `Pending` without taking anything.
-    struct PendingWrites {
-        pipe: DuplexStream,
-        pending: usize,
+    /// A duplex pipe whose `poll_write` follows a script: `Take(n)` accepts at
+    /// most `n` bytes, `Park` returns `Pending` without taking anything; once
+    /// the script is used up everything passes through.
+    enum Step {
+        Take(usize),
+        Park,
     }
 
-    impl AsyncRead for PendingWrites {
+    struct Scripted {
+        pipe: DuplexStream,
+        script: std::collections::VecDeque<Step>,
+    }
+
+    impl Scripted {
+        fn boxed(pipe: DuplexStream, script: impl IntoIterator<Item = Step>) -> BoxedStream {
+            Box::new(Scripted {
+                pipe,
+                script: script.into_iter().collect(),
+            })
+        }
+    }
+
+    impl AsyncRead for Scripted {
         fn poll_read(
             mut self: Pin<&mut Self>,
             cx: &mut Context<'_>,
@@ -286,18 +301,23 @@ mod tests {
         }
     }
 
-    impl AsyncWrite for PendingWrites {
+    impl AsyncWrite for Scripted {
         fn poll_write(
             mut self: Pin<&mut Self>,
             cx: &mut Context<'_>,
             data: &[u8],
         ) -> Poll<io::Result<usize>> {
-            if self.pending > 0 {
-                self.pending -= 1;
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
+            match self.script.pop_front() {
+                Some(Step::Park) => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Some(Step::Take(n)) => {
+                    let n = n.min(data.len());
+                    Pin::new(&mut self.pipe).poll_write(cx, &data[..n])
+                }
+                None => Pin::new(&mut self.pipe).poll_write(cx, data),
             }
-            Pin::new(&mut self.pipe).poll_write(cx, data)
         }
         fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Pin::new(&mut self.pipe).poll_flush(cx)
@@ -319,13 +339,12 @@ mod tests {
         // with its payload already behind the head, the read drives both out
         let mut cx = Context::from_waker(Waker::noop());
         let (near, far) = tokio::io::duplex(4096);
+        // two bytes of the head get out, then the inner write parks once;
+        // the grace plays no part: the head is under way
         let mut lazy = LazyHead::with_grace(
-            Box::new(PendingWrites {
-                pipe: near,
-                pending: 1,
-            }),
+            Scripted::boxed(near, [Step::Take(2), Step::Park]),
             b"HEAD|".to_vec(),
-            Duration::ZERO,
+            Duration::from_secs(30),
         );
         assert!(
             Pin::new(&mut lazy)
@@ -334,7 +353,7 @@ mod tests {
         );
         let mut space = [0u8; 8];
         let mut buf = ReadBuf::new(&mut space);
-        // the head has started, so the read does not wait for the grace
+        // finishes the head, payload included; nothing to read yet
         assert!(
             Pin::new(&mut lazy)
                 .poll_read(&mut cx, &mut buf)
@@ -358,12 +377,9 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
         let (near, far) = tokio::io::duplex(4096);
         let mut lazy = LazyHead::with_grace(
-            Box::new(PendingWrites {
-                pipe: near,
-                pending: 1,
-            }),
+            Scripted::boxed(near, [Step::Park]),
             b"HEAD|".to_vec(),
-            Duration::ZERO,
+            Duration::from_secs(30),
         );
         // a flush starts the head on its own; the inner write parks with those 5 bytes
         assert!(Pin::new(&mut lazy).poll_flush(&mut cx).is_pending());
