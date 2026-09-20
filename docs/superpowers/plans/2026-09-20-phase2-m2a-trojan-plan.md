@@ -3463,19 +3463,27 @@ trojan 作链的**入口**（别的策略以 trojan 为 `underlying-proxy`）不
 | 6 | 提交标题在计划给的基础上多了一句 | Task 4 评审的两条 Minor（三个 trojan 用例里的下标改 `first().expect(..)`、DNS 断言补失败信息并把 `HEAD_GRACE` 注释挪到位）按控制者的指示随同一提交落地 | ea609bd |
 | 6 | 两个用例没有 RED | 开工前裁定：它们钉的是 M1b 已交付的行为（M1b 终审留给 M2 的用例），一上来就应当通过；任何一个变红都是真实缺陷，要停下来报告 | ea609bd |
 | 7 | rustfmt 把一处单行 `assert!` 拆成多行 | 门禁驱动的机械修正 | 0da035f |
+| 终审 | A：`relay.rs` 的 `copy_half` 在 EOF 之后的半关闭改成与停止令牌竞速的 `select!`（`biased`），模块头注释把半关闭一并写进"每个等待都竞速"的契约 | 那是唯一不竞速的等待：TLS 的 close_notify、WebSocket 的 Close 帧、还欠着请求头的 `LazyHead` 都可能在对端不读时一直挂起，kill / 优雅退出 / 空闲看门狗于是都收不走这个方向，会话永不结束 | b4f1ee8 |
+| 终审 | B：`redact_param` 的"值到哪里结束"认引号（双引号含 `\` 转义、单引号、未闭合则吃到行尾），位置脱敏改用只在顶层逗号切分的状态机，并扩到所有写作 `type, server, port` 的代理类型（16 种，常量改名 `SERVER_PROXY_TYPES`） | 含逗号的口令必须加引号，是常规写法：旧实现在第一个逗号处截断，`profiles/current` / `policies/detail` 漏出尾巴、`lineHash` 也被扰动；`trojan` 的位置口令（P4 起只是 `W0001`）此前整段明文送出 | b4f1ee8 |
+| 终审 | C：`tests/outbounds.rs` 增 `a_socks5_exit_is_reached_through_a_trojan_entry`（验收项 4：trojan 作链的入口） | 计划原本写"不另加用例，若评审认为需要则加在 Task 4"；终审认为需要——这是上层握手第一次跑在 `LazyHead` 之上 | b4f1ee8 |
+| 终审 | D：`WsClient::new` 复查 `ws-path` 以 `/` 开头；`poll_write` 的重试分支上报 `min(queued, data.len())` | `WsOpts` 字段是公开的，不以 `/` 开头的路径会被并进 authority（纵深防御，与 `is_managed` 同理）；上报多于调用方传入的字节数会让 `write_all` panic | b4f1ee8 |
+| 终审 | E：互操作 `roundtrip()` 的连接、写、读回显三步各加 10 秒上界，`expect` 文本指明卡在哪一步 | 本机没有 sing-box，跑不了这些用例；CI 上没有上界的读会把回归变成挂住的任务而不是失败的用例 | b4f1ee8 |
+| 终审 | F：`lazy_head.rs` 里那个 20 ms sleep 的注释改为说明它只是让交错偏向"读先挂起"，并非同步手段 | 原注释读起来像在拿 sleep 做同步 | b4f1ee8 |
 
 ## 延后事项
 
 | 事项 | 去向 |
 | ---- | ---- |
-| `WsByteStream.queued` 与 `LazyHead.coalesced` 都假设"挂起的写会用同一段缓冲重试"；调用方**放弃**一次挂起的写、再写一段不同的缓冲时，会被告知一个不属于它的字节数（`queued` 的情形下 `n > len` 还会让 `write_all` panic）。工作区里没有这样的调用方（`write_all` 与转发循环都用同一段缓冲重试，取消之后不再复用写端） | 整分支终审时分诊（候选加固：`min(queued, data.len())`，`poll_shutdown` 里清零） |
-| `a_write_reaches_the_peer_without_an_explicit_flush` 只给读加了上界；写穿之后，回归会卡在没有上界的 `write_all` 上 | 整分支终审时分诊 |
+| `WsByteStream.queued` 与 `LazyHead.coalesced` 都假设"挂起的写会用同一段缓冲重试"；调用方**放弃**一次挂起的写、再写一段不同的缓冲时，会被告知一个不属于它的字节数（`queued` 的情形下 `n > len` 还会让 `write_all` panic）。工作区里没有这样的调用方（`write_all` 与转发循环都用同一段缓冲重试，取消之后不再复用写端） | 终审：保持延后（工作区里不可达）；已顺手把 `queued` 的上报改成 `min(queued, data.len())`，去掉一类 panic（b4f1ee8） |
+| `a_write_reaches_the_peer_without_an_explicit_flush` 只给读加了上界；写穿之后，回归会卡在没有上界的 `write_all` 上 | 保持延后（整体带 30 秒上界的往返用例会把同类回归表现为失败） |
 | `ws_io` 的 `Capacity` 文本说的是"frame"，该变体也覆盖超大的重组消息与 `TooManyHeaders` | 保持现状（文本已登记进 API 文档） |
 | `is_managed` 在 `rurge-config` 与 `rurge-proto` 各有一份 | 保持现状（开工前裁定：出站不信任调用方，四行） |
-| `the_head_does_not_grow_under_an_inner_write_that_is_pending` 在旧实现上也通过（不变式靠构造保证）；`lazy_head.rs` 测试模块里的 `use` 位置与重复导入 | 整分支终审时分诊（外观） |
-| `LazyHead` 的 `WriteZero` 错误不是粘性的（之后的轮询会再试内层写） | 整分支终审时分诊 |
-| `TrojanSpec` 派生 `Debug`、口令是明文字段（P5：spec 类型沿用 M1 的约定；生产代码里没有任何地方格式化 spec） | 整分支终审时分诊；M2b 加 vmess / anytls 的 spec 时一并考虑给凭据字段包一层不打印的类型 |
+| `the_head_does_not_grow_under_an_inner_write_that_is_pending` 在旧实现上也通过（不变式靠构造保证）；`lazy_head.rs` 测试模块里的 `use` 位置与重复导入 | 保持延后（不变式靠构造保证；留作文档） |
+| `LazyHead` 的 `WriteZero` 错误不是粘性的（之后的轮询会再试内层写） | 保持延后（没有调用方在 I/O 错误之后继续轮询） |
+| `TrojanSpec` 派生 `Debug`、口令是明文字段（P5：spec 类型沿用 M1 的约定；生产代码里没有任何地方格式化 spec） | 保持延后：生产代码里没有任何地方格式化 spec（终审已 grep）；M2b 给凭据字段包一层不打印的类型 |
 | "需要 server 与 port"的前置检查：trojan 的在引擎工厂里，http / socks5 的在各自的 `from_spec` 里 | M2b（下一个协议落地时收进 proto 或抽公共函数） |
-| Task 4 新增的 pipeline 用例没有像相邻用例那样断言 mock DNS 确实被查询过 | 整分支终审时分诊 |
-| 互操作用例共用的 `roundtrip()` 读回显没有上界（握手本身受 `ConnectOpts` 约束；M1b 的三个用例同样如此） | 整分支终审时分诊（要修就修在辅助函数里） |
+| Task 4 新增的 pipeline 用例没有像相邻用例那样断言 mock DNS 确实被查询过 | 保持延后 |
+| 互操作用例共用的 `roundtrip()` 读回显没有上界（握手本身受 `ConnectOpts` 约束；M1b 的三个用例同样如此） | 已修（终审修复，b4f1ee8） |
 | sing-box 的 trojan 互操作（真实握手、WebSocket 升级、密码错误时的表现）本机无法运行 | 首次推送后的 CI 证明（`RURGE_INTEROP_REQUIRED=1`）；本机不安装 sing-box |
+| 转发循环在 `write_all` 之后不 flush：tokio-rustls 在 socket 写不动时可能把一段尾巴留在自己的缓冲里，直到下一次写（M1a 起就存在；WebSocket 路径因写穿而免疫） | M2b 计划（要有自己的用例并看一眼吞吐） |
+| 以 IDN 写的代理服务器主机名在 TLS 层是构建错误（`dns_name` 之前没有 `to_ascii`），而 WebSocket 的 `Host` 已经转成 A-label | M2b 计划时连同解析器对 IDN 的处理一起核对 |

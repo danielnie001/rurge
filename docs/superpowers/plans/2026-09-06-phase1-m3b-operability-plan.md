@@ -3387,7 +3387,7 @@ EOF
 - `State::load` 为同步读取（M4 引入写入与 HTTP API 时改异步）。
 - SNI 嗅探只看 relay 的第一段客户端数据；ClientHello 若跨多个 TCP 段（大 ClientHello / 分片），本段解析不到 SNI 就放弃，不做拼接。
 - `rurge reload` / `stop` 命令与 HTTP API 触发（M4）；`state.json` 写入与 `outbound_mode` 持久化（M4）。
-- `copy_half` 里 `writer.shutdown()` 是唯一不与停止令牌竞速的 await（TCP FIN 不阻塞；阶段 2 TLS 出站的 close_notify 会成为潜在卡点）。
+- `copy_half` 里 `writer.shutdown()` 是唯一不与停止令牌竞速的 await（TCP FIN 不阻塞；阶段 2 TLS 出站的 close_notify 会成为潜在卡点）。→ 已修：阶段 2 / M2a 终审把半关闭也放进 `select!`（b4f1ee8）。
 - 被取消时正在进行的 `write_all` 已写出的部分字节不计数（≤ 8 KiB）。
 - `Engine::stop_accepting` 不可逆（之后绑定的监听器拿到的是已取消的子令牌）；`serve` 的 `stop` 分支未 `biased`（停止后可能再多接受 1–2 个连接）；`tracker()` 缺文档注释；Unix CLI 关停测试在进程退出后才读 stdout 行。
 - 排空测试里 `TcpStream::connect(addr)` 的「拒绝」检查没有超时包裹。

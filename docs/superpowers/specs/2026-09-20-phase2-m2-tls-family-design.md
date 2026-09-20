@@ -114,7 +114,7 @@ spec 类型沿用 M1 的约定派生 `Debug`（测试断言要用；日志与诊
 
 | 情况 | 处理 |
 | ---- | ---- |
-| `trojan` / `anytls` 缺 `password`；`vmess` 缺 `username` | `E0018`。trojan 的 `password` 只接受命名写法（手册如此）；位置值不读，按多余的位置参数报 `W0001`——`redact_profile` 只对 `http` / `socks5` 系抹位置凭据，接受位置口令会留下脱敏漏洞。anytls 的同一句留给 M2b 的计划核对 |
+| `trojan` / `anytls` 缺 `password`；`vmess` 缺 `username` | `E0018`。trojan 的 `password` 只接受命名写法（手册如此）；位置值不读，按多余的位置参数报 `W0001`。当初的另一半理由"`redact_profile` 只对 `http` / `socks5` 系抹位置凭据，接受位置口令会留下脱敏漏洞"在终审修复后不再成立（脱敏已覆盖所有写作 `type, server, port` 的类型），按手册的那一半不变。anytls 的同一句留给 M2b 的计划核对 |
 | `vmess` 的 `username` 不是合法 UUID；`encrypt-method` 不是手册列的两个值 | `E0018`（文本不回显取值） |
 | `ws-path` 不以 `/` 开头，或含控制字符 / 空白 | `E0018` |
 | `ws-headers`：按 `\|` 切分、每项按第一个 `:` 切名值；名字不是 HTTP token，或值含 HTAB 以外的控制字符 | `E0018`（与 M1 的 `headers=` 同一规则、同一套函数）；`Connection` / `Upgrade` / `Sec-WebSocket-*` 由握手自己写，出现时 `W0012` 并忽略 |
@@ -398,7 +398,7 @@ pub trait OutboundFactory: Send + Sync {
 | 编号 | 设计原文 | 订正 |
 | ---- | -------- | ---- |
 | P5 | 4.1："凭据字段的 `Debug` 输出一律抹掉（与 `HttpSpec` 的做法一致）" | spec 类型沿用 M1 的约定派生 `Debug`（测试断言要用；日志与诊断从不打印 spec）；持有凭据派生物的出站对象不实现 `Debug` |
-| P4 | 4.2 第一行："`password` 接受位置参数（沿用 `read_credentials` 的"命名优先于位置"）" | trojan 的 `password` 只接受命名写法（手册如此）；位置值不读，按多余的位置参数报 `W0001`——`redact_profile` 只对 `http` / `socks5` 系抹位置凭据，接受位置口令会留下脱敏漏洞。anytls 的同一句留给 M2b 的计划核对 |
+| P4 | 4.2 第一行："`password` 接受位置参数（沿用 `read_credentials` 的"命名优先于位置"）" | trojan 的 `password` 只接受命名写法（手册如此）；位置值不读，按多余的位置参数报 `W0001`。计划期的另一半理由（`redact_profile` 只对 `http` / `socks5` 系抹位置凭据）在终审修复后不再成立：脱敏已覆盖所有写作 `type, server, port` 的类型；决定按手册不变。anytls 的同一句留给 M2b 的计划核对 |
 | P2 | 4.2 `ws-headers` 一行只写 `E0018`（与 M1 的 `headers=` 同一规则、同一套函数） | 追加：`Connection` / `Upgrade` / `Sec-WebSocket-*` 由握手自己写，出现时 `W0012` 并忽略 |
 | P14 | 6.1："若应用先读（SSH、SMTP、FTP 这类服务端先说话的协议）：第一次 `poll_read` 之前先把请求头单独刷出，否则死锁" | 读在请求头未发出时先等 `HEAD_GRACE`（100 ms）；期间有写 → 头与首段负载一起发出并唤醒挂起的读；一直没有写 → 头单独发出。原因：转发循环从隧道建立起就在轮询读，远早于客户端第一段字节到达，按设计原文请求头会几乎总是单独发出，合并的意图落空 |
 | P7 | 5.2："帧与消息的大小上限取有界值（写计划时定具体数字；量级为 1 MiB）" | 入站帧与消息 ≤ 1 MiB，出站每帧 ≤ 64 KiB；并补一句（P2 / P3）：tungstenite 要求请求 URI 带 `ws://` scheme、五个握手头各恰好一个；它的错误文本会引用头的值，所以一律按变体映射成固定文本 |
