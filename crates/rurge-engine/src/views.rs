@@ -243,5 +243,23 @@ mod tests {
 
         // a built-in hashes its own name
         assert_eq!(member_view(&a, "DIRECT").line_hash, line_hash("DIRECT"));
+
+        // trojan: the password, the WebSocket path and its headers are all secrets
+        let trojan = config(
+            "A = trojan, t.test, 443, password=pw0rd, ws=true, ws-path=/s3cretpath, ws-headers=X-Key:k3y",
+        );
+        let same_but_secrets = config(
+            "A = trojan, t.test, 443, password=other, ws=true, ws-path=/elsewhere, ws-headers=X-Key:zzz",
+        );
+        assert_eq!(
+            member_view(&trojan, "A").line_hash,
+            member_view(&same_but_secrets, "A").line_hash,
+            "secret-only differences must not change the hash"
+        );
+        let without_ws = config("A = trojan, t.test, 443, password=pw0rd");
+        assert_ne!(
+            member_view(&trojan, "A").line_hash,
+            member_view(&without_ws, "A").line_hash
+        );
     }
 }

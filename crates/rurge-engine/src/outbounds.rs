@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn every_m1_protocol_builds() {
+    fn every_implemented_protocol_builds() {
         let cfg = config(
             "[Proxy]\nH = http, proxy.test, 8080, alice, s3cret\nHS = https, proxy.test, 443, sni=edge.test\n\
 S = socks5, proxy.test, 1080\nST = socks5-tls, proxy.test, 1443, skip-cert-verify=true\n\
@@ -371,6 +371,14 @@ C = https, h.test, 443\nD = http, h.test, 80\n[Rule]\nFINAL,DIRECT\n",
             .map(|s| s.name.as_str())
             .collect();
         assert_eq!(flagged, ["A"]);
+    }
+
+    #[test]
+    fn a_trojan_policy_that_skips_verification_is_noticed() {
+        let cfg = config(
+            "[Proxy]\nT = trojan, proxy.test, 443, password=pw, skip-cert-verify=true\n[Rule]\nFINAL,DIRECT\n",
+        );
+        assert!(skips_verification(cfg.spec("T").unwrap()));
     }
 
     /// Regression coverage for `EngineFactory::dry`'s root store: standard

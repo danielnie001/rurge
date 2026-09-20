@@ -164,6 +164,38 @@ fn check_knows_the_m1_protocols_and_runs_the_dry_build() {
         .stdout(predicate::str::contains("hunter2").not());
 }
 
+const TROJAN: &str = "[General]\n[Proxy]\nT = trojan, proxy.test, 443, password=s3same, ws=true, ws-path=/w\nOld = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Rule]\nFINAL,DIRECT\n";
+const TROJAN_BAD_PATH: &str = "[General]\n[Proxy]\nT = trojan, proxy.test, 443, password=s3same, ws=true, ws-path=s3cretpath\n[Rule]\nFINAL,DIRECT\n";
+
+#[test]
+fn check_knows_trojan() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "trojan.conf", TROJAN))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    // `ss` is still a later milestone; `trojan` is not
+    assert_eq!(out.matches("W0007").count(), 1, "{out}");
+    assert!(out.contains("`ss`") && !out.contains("`trojan`"), "{out}");
+
+    Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "bad.conf", TROJAN_BAD_PATH))
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("E0018"))
+        .stdout(predicate::str::contains("bad.conf:3"))
+        .stdout(predicate::str::contains("s3cretpath").not())
+        .stdout(predicate::str::contains("s3same").not());
+}
+
 mod rule_match {
     use assert_cmd::Command;
     use predicates::prelude::*;
