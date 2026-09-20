@@ -7,6 +7,13 @@
 //! calling `flush`. A chunk that could not be written in one go stays parked
 //! (it is already sealed with its nonce) and is finished by the next write,
 //! flush or shutdown.
+//!
+//! Two contracts on the caller: a write that returned `Pending` must be
+//! retried with the same bytes — the parked chunk was sealed from them and is
+//! what goes out (the rule `write_all` and the relay follow; the same
+//! contract as `WsByteStream` and `LazyHead`). And a read error is final: the
+//! stream must not be polled for reading again after one (the cipher state
+//! has moved on).
 
 use super::chunk::{ChunkCipher, MAX_PAYLOAD};
 use super::header::{self, ResponseError, Security, Session, TAG};

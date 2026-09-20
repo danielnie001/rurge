@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct VmessScript {
     pub uuid: [u8; 16],
     /// Expect a WebSocket handshake before the request head.

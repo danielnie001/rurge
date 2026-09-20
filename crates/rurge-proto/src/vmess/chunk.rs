@@ -81,12 +81,16 @@ impl ChunkCipher {
         out.extend_from_slice(tag.as_ref());
     }
 
-    /// How many sealed bytes follow these two length bytes.
+    /// How many sealed bytes follow these two length bytes. Must be called
+    /// exactly once per chunk, before `open`: it advances the mask stream
+    /// that the peer's sealing advances in step.
     pub(crate) fn open_len(&mut self, masked: [u8; 2]) -> usize {
         usize::from(self.next_mask() ^ u16::from_be_bytes(masked))
     }
 
-    /// Opens a sealed chunk in place; the payload is `sealed[..n]`.
+    /// Opens a sealed chunk in place; the payload is `sealed[..n]`. Must be
+    /// called exactly once per chunk, after `open_len`: it advances the
+    /// nonce counter that the peer's sealing advances in step.
     pub(crate) fn open(&mut self, sealed: &mut [u8]) -> Option<usize> {
         let nonce = self.next_nonce();
         self.key

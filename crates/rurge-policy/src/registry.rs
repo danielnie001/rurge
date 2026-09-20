@@ -160,7 +160,9 @@ impl PolicyRegistry {
     /// registry up at dial time; the caller stores the result into it.
     /// `previous` is the generation being replaced: a policy whose
     /// fingerprint did not change keeps the outbound it had there, pools and
-    /// all (M2 design 7.1).
+    /// all (M2 design 7.1). `previous` must have been built against this same
+    /// `cell`: a reused outbound keeps the chain connectors it was built
+    /// with, and they resolve through that cell.
     pub fn build(
         cfg: &Config,
         factory: &dyn OutboundFactory,

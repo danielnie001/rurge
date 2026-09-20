@@ -44,7 +44,10 @@ impl EngineFactory {
         EngineFactory::with_roots(cfg, resolver, hook, rurge_net::tls::root_store())
     }
 
-    /// Trusts `roots` instead (tests bring their own CA).
+    /// Trusts `roots` instead (tests bring their own CA). `roots` must stay
+    /// the same for the engine's lifetime: outbounds are reused across
+    /// reloads by fingerprint (M2 design 7.1), and the roots are not part of
+    /// it.
     pub fn with_roots(
         cfg: &Config,
         resolver: Arc<dyn Resolve>,

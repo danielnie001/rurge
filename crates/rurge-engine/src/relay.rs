@@ -569,4 +569,41 @@ mod tests {
         .expect("the healthy direction kept the broken session open");
         assert_eq!(h.outcome(), Some(SessionOutcome::Failed("boom".into())));
     }
+
+    #[tokio::test]
+    async fn a_clean_eof_in_one_direction_leaves_the_other_running() {
+        let (mut app, client) = tokio::io::duplex(1024);
+        let (upstream, mut origin) = tokio::io::duplex(1024);
+        let h = handle();
+        let relay = tokio::spawn(pump(
+            Box::new(client),
+            Box::new(upstream),
+            h.clone(),
+            Duration::from_secs(600),
+        ));
+        let bound = Duration::from_secs(5);
+        // the client sends its request and half-closes
+        app.write_all(b"request").await.unwrap();
+        app.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(bound, origin.read_to_end(&mut got))
+            .await
+            .expect("the half-close reaches the upstream")
+            .unwrap();
+        assert_eq!(got, b"request");
+        // the upstream still answers, and the answer still arrives
+        origin.write_all(b"response").await.unwrap();
+        origin.shutdown().await.unwrap();
+        let mut back = Vec::new();
+        tokio::time::timeout(bound, app.read_to_end(&mut back))
+            .await
+            .expect("the other direction was ended by the first one's EOF")
+            .unwrap();
+        assert_eq!(back, b"response");
+        tokio::time::timeout(bound, relay)
+            .await
+            .expect("both directions done")
+            .unwrap();
+        assert_eq!(h.outcome(), Some(SessionOutcome::Completed));
+    }
 }

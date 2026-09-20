@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct AnyTlsScript {
     pub password: String,
     /// Relay here whatever the client asked for (needed for a domain target).
@@ -43,7 +43,6 @@ pub struct RecordedStream {
     pub port: u16,
 }
 
-#[derive(Default)]
 struct Seen {
     sessions: AtomicUsize,
     rejected: AtomicUsize,
@@ -52,8 +51,25 @@ struct Seen {
     waste: AtomicUsize,
     streams: Mutex<Vec<RecordedStream>>,
     settings: Mutex<Vec<String>>,
-    /// `kick`: every connection parked on its next frame is closed.
-    kick: tokio::sync::Notify,
+    /// `kick`: bumped to close every connection parked on its next frame; a
+    /// generation counter rather than `Notify` so a bump landing between two
+    /// of a connection's loop iterations is not lost.
+    kick: watch::Sender<u64>,
+}
+
+impl Default for Seen {
+    fn default() -> Seen {
+        Seen {
+            sessions: AtomicUsize::default(),
+            rejected: AtomicUsize::default(),
+            heart_responses: AtomicUsize::default(),
+            fins: AtomicUsize::default(),
+            waste: AtomicUsize::default(),
+            streams: Mutex::default(),
+            settings: Mutex::default(),
+            kick: watch::channel(0u64).0,
+        }
+    }
 }
 
 pub struct FakeAnyTls {
@@ -140,10 +156,13 @@ async fn serve(
     });
     let mut settled = false;
     let mut live: HashMap<u32, Option<Live>> = HashMap::new();
+    // subscribed once, before the loop: a receiver remembers a bump it missed
+    // between two iterations, where a fresh `notified()` each time would not
+    let mut kicked = seen.kick.subscribe();
     loop {
         let mut header = [0u8; HEADER];
         tokio::select! {
-            _ = seen.kick.notified() => return Ok(()),
+            _ = kicked.changed() => return Ok(()),
             read = reader.read_exact(&mut header) => {
                 if read.is_err() {
                     return Ok(());
@@ -312,9 +331,10 @@ impl FakeAnyTls {
     }
 
     /// Closes every connection that is waiting for its next frame (an idle
-    /// session, as a server's own clean-up would).
+    /// session, as a server's own clean-up would). A connection accepted
+    /// after this call subscribes to the bumped value and is unaffected.
     pub fn kick(&self) {
-        self.seen.kick.notify_waiters();
+        self.seen.kick.send_modify(|g| *g += 1);
     }
 
     /// Connections that authenticated.

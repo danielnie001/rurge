@@ -7,9 +7,10 @@
 //! connection is noticed before anyone tries to reuse it.
 //!
 //! The task flushes after every batch of writes, so a stream's write is on
-//! its way once it is queued: nothing here waits for a `flush` the relay
-//! never calls. AnyTLS has no half-close: `shutdown` sends `cmdFIN`, which
-//! ends the stream in both directions (sing-box does the same).
+//! its way once it is queued: the session's task is what flushes what it
+//! writes, and the stream's own `poll_flush` has nothing to do. AnyTLS has no
+//! half-close: `shutdown` sends `cmdFIN`, which ends the stream in both
+//! directions (sing-box does the same).
 
 use super::frame::{self, HEADER, MAX_DATA};
 use super::padding::{Scheme, shape};
@@ -286,6 +287,14 @@ impl Session {
         frame::push(&mut packet, frame::SYN, sid, &[]);
         frame::push(&mut packet, frame::PSH, sid, address);
         self.commands.send(packet).await.map_err(|_| closed())?;
+        // The task may have ended between the pool's `is_closed()` look and
+        // the slot assignment above: its `close()` has then already taken the
+        // old slot, this send still found room, and nobody would ever end the
+        // slot installed here. Checked after the send: had `close()` run later
+        // than this look, it would find our slot and end it itself.
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Err(closed());
+        }
         Ok(AnyTlsStream {
             sid,
             commands: PollSender::new(self.commands.clone()),
@@ -439,5 +448,28 @@ impl Drop for AnyTlsStream {
             pool.put(session);
         }
         // otherwise the session is dropped here: its task is aborted and the connection closes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::anytls::padding::Scheme;
+
+    /// The state the race leaves behind: the task has run `close()`, its
+    /// queue still has room. `open` must not return a stream nobody will end.
+    #[tokio::test]
+    async fn a_session_that_closed_a_moment_ago_does_not_open_a_stream() {
+        let (near, _far) = tokio::io::duplex(4096);
+        let scheme: SchemeCell = Arc::new(Mutex::new(Arc::new(Scheme::default_scheme())));
+        let session = Session::start(1, Box::new(near), scheme);
+        session.shared.closed.store(true, Ordering::SeqCst);
+        let err = session
+            .open(&[1, 127, 0, 0, 1, 0, 80], Weak::new())
+            .await
+            .err()
+            .expect("a dead session must not hand out a stream");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(err.to_string(), CLOSED);
     }
 }

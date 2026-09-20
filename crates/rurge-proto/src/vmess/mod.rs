@@ -374,7 +374,9 @@ mod tests {
 
     /// The engine's relay, reduced to what matters to a stream under test:
     /// `read` → `write_all` with no flush, `shutdown` at EOF, both directions
-    /// polled from one task through `tokio::io::split`.
+    /// polled from one task through `tokio::io::split`. Stays the un-flushed
+    /// loop on purpose even though the engine's relay now flushes: it is the
+    /// stricter caller here, so do not "fix" it to match.
     async fn copy_half<R, W>(mut reader: R, mut writer: W) -> std::io::Result<u64>
     where
         R: tokio::io::AsyncRead + Unpin,
