@@ -14,6 +14,7 @@ pub mod socks5;
 pub mod testing;
 pub mod transport;
 pub mod trojan;
+pub mod vmess;
 
 pub use build::BuildError;
 pub use direct::Direct;
