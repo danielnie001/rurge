@@ -272,5 +272,14 @@ mod tests {
             member_view(&same_but_quoted_password, "A").line_hash,
             "a quoted password must not change the hash either"
         );
+
+        // the quote may open in the middle of the value, too
+        let mid = config("A = trojan, t.test, 443, password=ab\"c,d\", ws=true");
+        let same_but_mid = config("A = trojan, t.test, 443, password=ab\"c,e\", ws=true");
+        assert_eq!(
+            member_view(&mid, "A").line_hash,
+            member_view(&same_but_mid, "A").line_hash,
+            "a quote opening mid-value must not leave a tail in the hash"
+        );
     }
 }

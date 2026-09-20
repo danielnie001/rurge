@@ -161,16 +161,19 @@ fn redact_positional_credentials(value: &str) -> String {
         .join(",")
 }
 
-/// Splits at top-level commas only, with the same state machine as
-/// `value::split_list` (double quotes with `\` escapes, single quotes without,
-/// and parenthesis depth), but returning the raw slices so that quoting and
-/// spacing survive.
-fn split_top_level(value: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0usize;
+/// The first comma that is inside no quote and no parenthesised group, by the
+/// parser's own state machine (`value::split_list`): a `"` or a `'` opens a
+/// quote **wherever** it appears, inside `"` a backslash escapes the next
+/// character, inside `'` nothing escapes, and `(` / `)` nest outside quotes.
+/// `None` when there is none — an unterminated quote or group therefore runs
+/// to the end of the line, which is the safe side for redaction.
+///
+/// Everything that has to agree with the parser about where a value ends is
+/// built on this one function, so the two cannot drift apart.
+fn next_top_level_comma(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
     let mut depth = 0usize;
     let mut quote: Option<u8> = None;
-    let bytes = value.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
         let c = bytes[i];
@@ -186,16 +189,26 @@ fn split_top_level(value: &str) -> Vec<&str> {
                 b'"' | b'\'' => quote = Some(c),
                 b'(' => depth += 1,
                 b')' => depth = depth.saturating_sub(1),
-                b',' if depth == 0 => {
-                    out.push(&value[start..i]);
-                    start = i + 1;
-                }
+                b',' if depth == 0 => return Some(i),
                 _ => {}
             },
         }
         i += 1;
     }
-    out.push(&value[start..]);
+    None
+}
+
+/// Splits at top-level commas only, returning the raw slices so that quoting
+/// and spacing survive. A top-level comma leaves the scanner with no open
+/// quote and depth 0, so each item is scanned afresh.
+fn split_top_level(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = value;
+    while let Some(i) = next_top_level_comma(rest) {
+        out.push(&rest[..i]);
+        rest = &rest[i + 1..];
+    }
+    out.push(rest);
     out
 }
 
@@ -210,29 +223,13 @@ fn is_named_param(token: &str) -> bool {
         .is_some_and(|(_, after)| !after.is_empty() && !after.chars().all(|c| c == '='))
 }
 
-/// How long a parameter's value is: a double-quoted one runs to its matching
-/// quote (a backslash escapes the next character), a single-quoted one to the
-/// next quote — both inclusive; anything else ends at the next comma. An
-/// unterminated quote takes the rest of the line, which is the safe side.
+/// How long a parameter's value is: up to the first comma the parser would
+/// split on — quotes may open anywhere inside the value and parentheses group,
+/// so `ab"c,d"` and `a(b,c)d` are each one value. When the scan starts inside
+/// a group (a secret nested in a `peer = (…)`), depth starts at 0 there, so the
+/// value ends at the group's own next comma.
 fn param_value_len(value: &str) -> usize {
-    let bytes = value.as_bytes();
-    match bytes.first() {
-        Some(&q) if q == b'"' || q == b'\'' => {
-            let mut i = 1usize;
-            while i < bytes.len() {
-                if q == b'"' && bytes[i] == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if bytes[i] == q {
-                    return i + 1;
-                }
-                i += 1;
-            }
-            value.len()
-        }
-        _ => value.find(',').unwrap_or(value.len()),
-    }
+    next_top_level_comma(value).unwrap_or(value.len())
 }
 
 /// Replaces the value of every `<param> = <value>` occurrence with `***`
@@ -247,8 +244,10 @@ fn redact_param(value: &str, param: &str) -> String {
     let mut search = 0usize;
     while let Some(pos) = lower[search..].find(param) {
         let start = search + pos;
-        // must be at a token boundary followed by optional spaces and '='
-        let before_ok = start == 0 || matches!(lower.as_bytes()[start - 1], b',' | b' ' | b'\t');
+        // must be at a token boundary followed by optional spaces and '=';
+        // `(` is one too: a group's first item has nothing but it in front
+        let before_ok =
+            start == 0 || matches!(lower.as_bytes()[start - 1], b',' | b' ' | b'\t' | b'(');
         let after = &value[start + param.len()..];
         let eq = after.trim_start().strip_prefix('=');
         match (before_ok, eq) {
@@ -355,6 +354,7 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
         for def in [
             "http, proxy.test, 8080, alice, s3cret, skip-cert-verify=true",
             "trojan, t.test, 443, password=\"pw0rd,x\", ws-path=\"/s3cretpath\"",
+            "trojan, h, 443, password=ab\"c,d\", ws=true",
             "socks5, proxy.test, 1080, username=bob, password=hunter2",
             "ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x",
             "direct, interface=eth0",
@@ -462,5 +462,38 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
         // nor is a [General] list of values
         let dns = "dns-server = 1.1.1.1, 8.8.8.8, 9.9.9.9, 4.4.4.4";
         assert_eq!(redact_profile(dns), dns);
+    }
+
+    /// The parser opens a quote wherever one appears in a value and groups by
+    /// parentheses, so the value's first byte says nothing about where it
+    /// ends: only a scan by the parser's own rules does.
+    #[test]
+    fn a_value_ends_at_the_first_top_level_comma_wherever_its_quotes_open() {
+        for (def, expected) in [
+            (
+                "trojan, h, 443, password=ab\"c,d\", ws=true",
+                "trojan, h, 443, password=***, ws=true",
+            ),
+            (
+                "trojan, h, 443, password=ab'c,d', ws=true",
+                "trojan, h, 443, password=***, ws=true",
+            ),
+            (
+                "trojan, h, 443, password=a(b,c)d, ws=true",
+                "trojan, h, 443, password=***, ws=true",
+            ),
+        ] {
+            assert_eq!(redact_definition(def), expected, "{def}");
+        }
+    }
+
+    /// A secret nested in a parenthesised group is found whether or not a
+    /// space follows the `(`.
+    #[test]
+    fn a_secret_right_after_an_opening_parenthesis_is_found() {
+        assert_eq!(
+            redact_profile("peer = (pre-shared-key = PSK1, endpoint = 1.2.3.4:51820)"),
+            "peer = (pre-shared-key = ***, endpoint = 1.2.3.4:51820)"
+        );
     }
 }
