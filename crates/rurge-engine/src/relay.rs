@@ -3,7 +3,10 @@
 //! on one side never blocks the other (no head-of-line blocking), and every
 //! wait — the read, the write and the half-close that follows EOF — races
 //! against a stop token so `kill`, graceful shutdown and the idle timeout all
-//! end a stuck session promptly. Replaces M3a's `copy_bidirectional`.
+//! end a stuck session promptly. Replaces M3a's `copy_bidirectional`. Every
+//! write is followed by a flush (a TLS writer can hold the last record back
+//! until then), and a direction that ends in error cancels the other so the
+//! session ends instead of leaving a healthy direction waiting on a broken one.
 
 use rurge_config::rule::ProtocolKind;
 use rurge_inbound::{SessionHandle, SessionOutcome};
@@ -60,8 +63,11 @@ pub async fn pump(
             }
         }));
         async move {
-            let r = tokio::join!(
-                copy_half(
+            // A direction that fails ends the other one too: the tunnel is
+            // broken, and the side still waiting for bytes would otherwise sit
+            // there until its own peer gives up or the idle timer fires.
+            let up = async {
+                let r = copy_half(
                     cr,
                     uw,
                     stop.clone(),
@@ -69,8 +75,15 @@ pub async fn pump(
                     started,
                     move |n| h_up.add_up(n),
                     sniff_first,
-                ),
-                copy_half(
+                )
+                .await;
+                if r.is_err() {
+                    stop.cancel();
+                }
+                r
+            };
+            let down = async {
+                let r = copy_half(
                     ur,
                     cw,
                     stop.clone(),
@@ -78,8 +91,14 @@ pub async fn pump(
                     started,
                     move |n| h_down.add_down(n),
                     None,
-                ),
-            );
+                )
+                .await;
+                if r.is_err() {
+                    stop.cancel();
+                }
+                r
+            };
+            let r = tokio::join!(up, down);
             stop.cancel(); // both directions done: release the watchdog
             r
         }
@@ -168,7 +187,14 @@ where
         tokio::select! {
             biased;
             _ = &mut cancelled => return Ok(()),
-            w = writer.write_all(&buf[..n]) => w?,
+            w = async {
+                writer.write_all(&buf[..n]).await?;
+                // `write_all` only says the writer took the bytes. A TLS
+                // writer whose socket is full keeps its last record to itself
+                // until the next write or flush — and after the final bytes of
+                // a request there is no next write.
+                writer.flush().await
+            } => w?,
         }
         count(n as u64);
         activity.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -180,6 +206,9 @@ mod tests {
     use super::*;
     use rurge_config::HostName;
     use rurge_config::session::SessionInfo;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, ready};
+    use tokio::io::ReadBuf;
 
     fn handle() -> Arc<SessionHandle> {
         SessionHandle::new(1, SessionInfo::tcp(HostName::parse("a.test"), 80))
@@ -372,5 +401,172 @@ mod tests {
             .expect("a cancelled stop token ends the half-close")
             .unwrap()
             .unwrap();
+    }
+
+    /// Not a test of anything: prints how fast `pump` moves bytes over
+    /// loopback TCP. Run before and after a change to the copy loop:
+    /// `cargo test -p rurge-engine --release relay_throughput -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn relay_throughput() {
+        use tokio::net::{TcpListener, TcpStream};
+        const TOTAL: usize = 512 * 1024 * 1024;
+        async fn pair() -> (TcpStream, TcpStream) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (a, b) = tokio::join!(TcpStream::connect(addr), listener.accept());
+            (a.unwrap(), b.unwrap().0)
+        }
+        let (mut app, client) = pair().await;
+        let (upstream, mut origin) = pair().await;
+        let relay = tokio::spawn(pump(
+            Box::new(client),
+            Box::new(upstream),
+            handle(),
+            Duration::from_secs(600),
+        ));
+        let started = std::time::Instant::now();
+        let send = tokio::spawn(async move {
+            let block = vec![7u8; 64 * 1024];
+            for _ in 0..TOTAL / block.len() {
+                app.write_all(&block).await.unwrap();
+            }
+            app.shutdown().await.unwrap();
+            app
+        });
+        let mut got = 0;
+        let mut buf = vec![0u8; 64 * 1024];
+        while got < TOTAL {
+            let n = origin.read(&mut buf).await.unwrap();
+            assert!(n > 0, "the relay stopped at {got} bytes");
+            got += n;
+        }
+        let secs = started.elapsed().as_secs_f64();
+        println!(
+            "relay: {:.0} MiB/s",
+            (TOTAL as f64 / (1024.0 * 1024.0)) / secs
+        );
+        drop(origin);
+        drop(send.await.unwrap());
+        relay.await.unwrap();
+    }
+
+    /// Accepts every write at once but only passes it on when flushed: what
+    /// `AsyncWrite` allows, and what tokio-rustls does with its last record
+    /// once the socket below it is full.
+    struct HoldsUntilFlushed {
+        inner: tokio::io::DuplexStream,
+        held: Vec<u8>,
+    }
+
+    impl AsyncRead for HoldsUntilFlushed {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for HoldsUntilFlushed {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.held.extend_from_slice(data);
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = &mut *self;
+            while !this.held.is_empty() {
+                let n = ready!(Pin::new(&mut this.inner).poll_write(cx, &this.held))?;
+                this.held.drain(..n);
+            }
+            Pin::new(&mut this.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            ready!(self.as_mut().poll_flush(cx))?;
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn what_was_written_is_flushed_without_waiting_for_more() {
+        let (mut app, client) = tokio::io::duplex(4096);
+        let (near, mut far) = tokio::io::duplex(4096);
+        let upstream = HoldsUntilFlushed {
+            inner: near,
+            held: Vec::new(),
+        };
+        let relay = tokio::spawn(pump(
+            Box::new(client),
+            Box::new(upstream),
+            handle(),
+            Duration::from_secs(600),
+        ));
+        // the last bytes of a request: nothing follows them, and the answer
+        // only comes once they have arrived
+        app.write_all(b"the last bytes of a request").await.unwrap();
+        let mut got = [0u8; 27];
+        tokio::time::timeout(Duration::from_secs(5), far.read_exact(&mut got))
+            .await
+            .expect("the tail stayed behind in the writer")
+            .unwrap();
+        assert_eq!(&got, b"the last bytes of a request");
+        relay.abort();
+    }
+
+    /// Reads fail at once; writes vanish.
+    struct FailsOnRead;
+
+    impl AsyncRead for FailsOnRead {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("boom")))
+        }
+    }
+
+    impl AsyncWrite for FailsOnRead {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_error_in_one_direction_ends_the_other() {
+        // the client stays connected and silent: only the upstream is broken
+        let (_app, client) = tokio::io::duplex(1024);
+        let h = handle();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            pump(
+                Box::new(client),
+                Box::new(FailsOnRead),
+                h.clone(),
+                Duration::from_secs(600),
+            ),
+        )
+        .await
+        .expect("the healthy direction kept the broken session open");
+        assert_eq!(h.outcome(), Some(SessionOutcome::Failed("boom".into())));
     }
 }
