@@ -1,5 +1,5 @@
-//! `ATYP ADDR PORT` as SOCKS5 writes it (RFC 1928 §5). Trojan uses the same
-//! encoding.
+//! `ATYP ADDR PORT` as SOCKS5 writes it (RFC 1928 §5; Trojan and AnyTLS use
+//! the same encoding), and VMess's own order and type numbers.
 
 use rurge_config::HostName;
 use rurge_net::connector::Target;
@@ -37,9 +37,57 @@ pub(crate) fn socks_addr(target: &Target) -> Result<Vec<u8>, AddrError> {
     Ok(out)
 }
 
+/// `PORT TYPE ADDR` as VMess writes it: the port first, and the types are
+/// 1 = IPv4, 2 = domain, 3 = IPv6 (not SOCKS5's 1 / 3 / 4).
+pub(crate) fn vmess_addr(target: &Target) -> Result<Vec<u8>, AddrError> {
+    let mut out = target.port.to_be_bytes().to_vec();
+    match &target.host {
+        HostName::Ip(IpAddr::V4(v4)) => {
+            out.push(1);
+            out.extend_from_slice(&v4.octets());
+        }
+        HostName::Ip(IpAddr::V6(v6)) => {
+            out.push(3);
+            out.extend_from_slice(&v6.octets());
+        }
+        HostName::Domain(name) => {
+            let name = crate::hostname::to_ascii(name).ok_or(AddrError::Unsendable)?;
+            let len = u8::try_from(name.len()).map_err(|_| AddrError::TooLong)?;
+            out.push(2);
+            out.push(len);
+            out.extend_from_slice(name.as_bytes());
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vmess_puts_the_port_first_and_numbers_the_types_its_own_way() {
+        let t = |host: &str| Target::new(HostName::parse(host), 0x01bb);
+        assert_eq!(
+            vmess_addr(&t("10.1.2.3")).unwrap(),
+            [0x01, 0xbb, 1, 10, 1, 2, 3]
+        );
+        let v6 = vmess_addr(&t("2001:db8::1")).unwrap();
+        assert_eq!((&v6[..3], v6.len()), (&[0x01, 0xbb, 3][..], 2 + 1 + 16));
+        let mut expected = vec![0x01, 0xbb, 2, 11];
+        expected.extend_from_slice(b"example.com");
+        assert_eq!(vmess_addr(&t("example.com")).unwrap(), expected);
+        // the same bytes the reference vectors were made with
+        assert_eq!(expected, crate::vmess::vectors::address());
+        assert_eq!(
+            vmess_addr(&Target::new(HostName::Domain("a@b.test".into()), 1)),
+            Err(AddrError::Unsendable)
+        );
+        assert_eq!(
+            vmess_addr(&Target::new(HostName::Domain("a".repeat(256)), 1)),
+            Err(AddrError::TooLong)
+        );
+    }
 
     #[test]
     fn the_three_address_types() {

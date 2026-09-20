@@ -5,12 +5,14 @@ mod http_proxy;
 mod socks5;
 mod tls;
 mod trojan;
+mod vmess;
 pub mod ws;
 
 pub use http_proxy::{FakeHttpProxy, HttpProxyScript, RecordedHead};
 pub use socks5::{FakeSocks5, RecordedSocks5, Socks5Script};
 pub use tls::{SeenHandshake, TlsFixture};
 pub use trojan::{FakeTrojan, RecordedTrojan, TrojanScript};
+pub use vmess::{FakeVmess, RecordedVmess, VmessScript};
 pub use ws::{FakeWs, RecordedWs, WsScript};
 
 use std::net::SocketAddr;
