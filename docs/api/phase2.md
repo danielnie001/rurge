@@ -17,7 +17,7 @@
 
 参数 `policy_name`（必填，查询参数）。
 
-响应是 `{"<policy_name>": "<value>"}`：`value` 是该策略或组**脱敏后的定义**（不含 `名字 =` 前缀），脱敏规则与 `GET /v1/profiles/current` 相同（`docs/api/phase1.md`：独立密钥行、内联的 `password` / `psk` / `base64` / `headers` / `ws-headers` / `ws-path` 等参数、所有写作 `type, server, port` 的代理类型第 4 个起的位置值——`trojan` `vmess` `ss` `anytls` 等都在内）；脱敏认引号，`password="p,w"` 整个值变成 `***`（引号内的逗号属于值）；`headers=` 与 `ws-headers=` 的值整体变成 `***`（连 header 名也不保留），`ws-path=` 同样整体变成 `***`；内置策略（`DIRECT` `REJECT` 等）的值是它自己的名字。
+响应是 `{"<policy_name>": "<value>"}`：`value` 是该策略或组**脱敏后的定义**（不含 `名字 =` 前缀），脱敏规则与 `GET /v1/profiles/current` 相同（`docs/api/phase1.md`：独立密钥行、内联的 `password` / `psk` / `base64` / `headers` / `ws-headers` / `ws-path` 等参数、所有写作 `type, server, port` 的代理类型第 4 个起的位置值——`trojan` `vmess` `ss` `anytls` 等都在内）；取值的结尾按解析器自己的规则找第一个顶层逗号——引号可以在值里任何位置打开、括号会分组，所以 `password="p,w"`、`password=ab"c,d"`、`password=a(b,c)d` 都是整个值变成 `***`；`headers=` 与 `ws-headers=` 的值整体变成 `***`（连 header 名也不保留），`ws-path=` 同样整体变成 `***`；内置策略（`DIRECT` `REJECT` 等）的值是它自己的名字。
 
 ```json
 {"HK": "http, proxy.example.com, 8080, ***, ***"}
@@ -77,7 +77,7 @@ trojan（± WebSocket）出站失败时，会话记录的 `error` 是下列固�
 
 `lineHash` 是 `SHA-256("<名字> = <脱敏后的定义>")` 的前 16 个十六进制字符；内置策略（没有自己的定义行）对**它自己的名字**取哈希。它只用来**识别**一条定义（同一份配置里两次请求看到同样的哈希，就是同一条定义），不是这条定义原文的指纹：
 
-- 哈希对象是脱敏之后的文本，不是配置文件里的原始行。**只改动凭据（密码、`base64`、`psk`、`headers=`、`ws-headers=`、`ws-path=` 等被脱敏的字段）不会改变 `lineHash`**（含写成 `password="p,w"` 这种带引号的值：引号内的内容整体被抹掉，不会有尾巴漏进哈希）——因为脱敏后两行文本相同——这是有意的：`lineHash` 经这个公开的、无需鉴权之外任何权限的端点暴露，如果它是对原始定义取哈希，持有 API key 的人就能对着猜测的凭据反复计算哈希、离线核对是否猜中，等于把凭据的验证能力带出了进程。任何由凭据派生的东西都不允许离开 rurge 进程（`global-constraints.md`），`lineHash` 因此必须建立在脱敏后的文本上。
+- 哈希对象是脱敏之后的文本，不是配置文件里的原始行。**只改动凭据（密码、`base64`、`psk`、`headers=`、`ws-headers=`、`ws-path=` 等被脱敏的字段）不会改变 `lineHash`**（含 `password="p,w"`、`password=ab"c,d"`、`password=a(b,c)d` 这些带引号或带括号的值：取值按解析器的顶层逗号规则整体被抹掉，不会有尾巴漏进哈希）——因为脱敏后两行文本相同——这是有意的：`lineHash` 经这个公开的、无需鉴权之外任何权限的端点暴露，如果它是对原始定义取哈希，持有 API key 的人就能对着猜测的凭据反复计算哈希、离线核对是否猜中，等于把凭据的验证能力带出了进程。任何由凭据派生的东西都不允许离开 rurge 进程（`global-constraints.md`），`lineHash` 因此必须建立在脱敏后的文本上。
 - 名字参与哈希且在一份配置里唯一，所以两个不同成员不会撞哈希；端口、服务器地址、TLS 参数等任何非凭据字段的改动都会改变 `lineHash`。
 
 ## `GET /v1/policy_groups/select`

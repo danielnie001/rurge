@@ -3469,6 +3469,7 @@ trojan 作链的**入口**（别的策略以 trojan 为 `underlying-proxy`）不
 | 终审 | D：`WsClient::new` 复查 `ws-path` 以 `/` 开头；`poll_write` 的重试分支上报 `min(queued, data.len())` | `WsOpts` 字段是公开的，不以 `/` 开头的路径会被并进 authority（纵深防御，与 `is_managed` 同理）；上报多于调用方传入的字节数会让 `write_all` panic | b4f1ee8 |
 | 终审 | E：互操作 `roundtrip()` 的连接、写、读回显三步各加 10 秒上界，`expect` 文本指明卡在哪一步 | 本机没有 sing-box，跑不了这些用例；CI 上没有上界的读会把回归变成挂住的任务而不是失败的用例 | b4f1ee8 |
 | 终审 | F：`lazy_head.rs` 里那个 20 ms sleep 的注释改为说明它只是让交错偏向"读先挂起"，并非同步手段 | 原注释读起来像在拿 sleep 做同步 | b4f1ee8 |
+| 终审（复审残留） | 脱敏的取值结尾改用与解析器同一套顶层逗号扫描（抽出 `next_top_level_comma`，`split_top_level` 与 `param_value_len` 都建在它上面）；`redact_param` 的边界判断也接受 `(` | 终审 brief 给 item B 定的规则是"值**以**引号开头"，而解析器在值的**任何位置**遇到引号都会开启引号状态、并且按括号深度分组：`password=ab"c,d"` 仍漏出 `,d"`、`password=a(b,c)d` 仍漏出 `,c)d`（复审发现）。同时修掉一处既有漏洞：`(` 后不带空格写的 `pre-shared-key=` 此前认不出来，密钥明文送出 | df3cd85 |
 
 ## 延后事项
 
@@ -3487,3 +3488,4 @@ trojan 作链的**入口**（别的策略以 trojan 为 `underlying-proxy`）不
 | sing-box 的 trojan 互操作（真实握手、WebSocket 升级、密码错误时的表现）本机无法运行 | 首次推送后的 CI 证明（`RURGE_INTEROP_REQUIRED=1`）；本机不安装 sing-box |
 | 转发循环在 `write_all` 之后不 flush：tokio-rustls 在 socket 写不动时可能把一段尾巴留在自己的缓冲里，直到下一次写（M1a 起就存在；WebSocket 路径因写穿而免疫） | M2b 计划（要有自己的用例并看一眼吞吐） |
 | 以 IDN 写的代理服务器主机名在 TLS 层是构建错误（`dns_name` 之前没有 `to_ascii`），而 WebSocket 的 `Host` 已经转成 A-label | M2b 计划时连同解析器对 IDN 的处理一起核对 |
+| 引号感知的位置切分之后，`http, "h, 443", user, pass` 这样的行里 `user` 不再被抹（token 序号改为与解析器一致） | 保持现状：这样的行端口不是数字、加载不了，不会成为 `profiles/current` 提供的运行中配置 |
