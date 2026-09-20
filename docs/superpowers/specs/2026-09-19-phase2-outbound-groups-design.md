@@ -46,7 +46,7 @@
 | 里程碑 | 内容 | 需求 | 可验收的产出 |
 | ------ | ---- | ---- | ------------ |
 | **M1 出站地基与 HTTP / SOCKS5 上游** | `PolicySpec` 类型化（通用参数、TLS 参数）、`[Keystore]`、`Outbound` 与演进后的 `Connector` 抽象、`DirectConnector`（`interface` `allow-other-interface` `ip-version` `tfo` `tos`）、`ChainConnector`（`underlying-proxy`）、TLS 层、`http` `https` `socks5` `socks5-tls`（TCP，含明文 HTTP 的绝对 URI 转发）、`OutboundFactory` 与注册表接入真实出站、`select` 组语义补全、`rurge check` 干构建、策略 / 组只读与 select 的 API、三层测试的基础设施 | FR-CFG-11（p12）、FR-OUT-03（部分）/ 04（TLS）/ 05 / 08 / 09、FR-GRP-05（部分）/ 06、FR-DNS-07 | 真实配置经 HTTP(S) / SOCKS5 上游与两级链式代理转发；对 sing-box 的互操作测试通过 |
-| **M2 TLS 族** | WebSocket 层、Shadow TLS v2 / v3、`trojan`、`vmess`（AEAD）、`anytls` | FR-OUT-04（Shadow TLS）/ 05 | 三种协议各自带 / 不带 WebSocket、Shadow TLS 对参考实现转发通过 |
+| **M2 TLS 族** | WebSocket 层、Shadow TLS v2 / v3、`trojan`、`vmess`（AEAD）、`anytls`；细化设计（`2026-09-20-phase2-m2-tls-family-design.md`）把它拆成三份计划：M2a（Trojan 优先，含 WebSocket 层）→ M2b（VMess / AnyTLS，含按指纹复用出站）→ M2c（Shadow TLS） | FR-OUT-04（Shadow TLS）/ 05 | 三种协议各自带 / 不带 WebSocket、Shadow TLS 对参考实现转发通过 |
 | **M3 策略组、订阅与连通性测试** | 连通性测试、`url-test` `fallback` `load-balance` `smart`、全部组参数、`policy-path` / `include-*` 装配、嵌套 / 环 / 兜底、临时覆盖、组级 `underlying-proxy`、订阅更新热重建、测试与切换 API | FR-OUT-03（`test-url` `test-timeout`）/ 10、FR-GRP-01 / 03 ～ 07 | 订阅样本解析正确；组算法单测与端到端测试；API 测试与切换正确 |
 | **M4 WireGuard / SSH / external** | `rurge-proto-wireguard`（多 peer 路由、定时器、分片重组、`client-id`、RTT 探测、ICMP echo、DSCP）、`DirectConnector` 的 UDP 载体、`rurge-proto-ssh`、`external` 进程监管、`[WireGuard <name>]` 类型化、Keystore 的 OpenSSH 私钥 | FR-CFG-11（openssh）、FR-OUT-05 / 12 / 13 | WireGuard 与带 `client-id` 的端点握手并转发 TCP；SSH 动态转发；`external` 进程退出自动重启 |
 | **M5 UDP 路径** | SOCKS5 UDP ASSOCIATE 入站、引擎 UDP 流水线、DIRECT UDP、已有协议的 UDP（`socks5` `trojan` `vmess` `anytls` `wireguard` `external`）、`udp-relay` `udp-port` `udp-policy-not-supported-behaviour`、UDP 测试（`test-udp` / `proxy-test-udp`）、`block-quic`、UDP 载体的链式拨号、`dns-follow-interface` | FR-IN-02（UDP）、FR-OUT-03（`test-udp` `block-quic`）/ 07 / 08（UDP）/ 11、FR-DNS-10 | 各协议 UDP 对参考服务器转发通过；不支持 UDP 的策略按全局设置处理 |
@@ -66,7 +66,7 @@ M1 体量大，细化设计时可按阶段 1 的先例拆成 M1a（配置与抽�
 | PKCS#12 | 纯 Rust 解析库（候选 `p12-keystore`） | M1 | 旧式 3DES-SHA1 与 PBES2-AES 两类 p12 都能解；许可证 |
 | socket 选项 | `socket2`：Linux `SO_BINDTODEVICE`、macOS `IP_BOUND_IF`、TOS、TFO；Windows 的网卡绑定先用"绑定该网卡的源地址"（`if-addrs` 已在依赖里） | M1 | Windows 的 `TCP_FASTOPEN` 可用性；`IP_UNICAST_IF` 需要 unsafe FFI（见 Q1） |
 | WebSocket | `tokio-tungstenite`，在任意 `BoxedStream` 上做客户端握手 | M2 | — |
-| Shadow TLS | v2 在 stock rustls 上实现（旁路哈希服务端握手字节） | M2 | 风险 A：v3 需要自定 ClientHello 的 SessionID（见第 15 节） |
+| Shadow TLS | v2 与 v3 都在 stock rustls 上实现：v2 旁路哈希服务端握手字节；v3 用"两遍构造 ClientHello"签名 SessionID（只用公开的 `CryptoProvider` 扩展点，不 fork、不用 unsafe；M2 细化设计附录 A） | M2 | 已验证（2026-09-20 的 spike，见风险 A） |
 | 加密原语 | RustCrypto：`aes-gcm` `chacha20poly1305` `hkdf` `hmac` `sha1` `sha2` `md-5` `blake3` | M2 / M6 | — |
 | HTTP/2 | `h2`（extended CONNECT、多路复用、`max-streams`）；CONNECT-UDP（RFC 9298）的 capsule 编码自研 | M6 | — |
 | QUIC / HTTP/3 | `quinn`（自定义 UDP 载体供链式拨号、自定义拥塞控制供 Hysteria 2、datagram 供 TUIC / MASQUE）+ `h3` | M7 | 风险 B：`h3` 的 extended CONNECT 与 HTTP Datagram 的成熟度；`ecn` 的支持程度 |
@@ -389,7 +389,7 @@ Surge 手册没有定义这些端点的响应结构（PRD R5）：以收集到�
 | 里程碑 | 第 3 层的参考实现 |
 | ------ | ----------------- |
 | M1 | sing-box（http / socks 入站，含 TLS 与用户名密码） |
-| M2 | sing-box（trojan / vmess / anytls / shadowtls）、xray（vmess / trojan + ws） |
+| M2 | sing-box（trojan / vmess / anytls / shadowtls，含 ws 传输）；xray 只用于 vmess（M2 细化设计 M2-D5） |
 | M4 | sing-box 的用户态 WireGuard 端点（含保留字节，对应 `client-id`）；系统 `sshd`（没有则跳过） |
 | M5 | 同上各服务端的 UDP |
 | M6 | shadowsocks-rust（含 2022）、sing-box；Snell 官方二进制只有 Linux，互操作只在 Linux CI 跑 |
@@ -415,7 +415,7 @@ Surge 手册没有定义这些端点的响应结构（PRD R5）：以收集到�
 
 | 编号 | 风险 | 影响 | 应对 |
 | ---- | ---- | ---- | ---- |
-| A | Shadow TLS v3 要求自定 ClientHello 的 SessionID，stock rustls 没有这个钩子 | v3 可能做不了或需要维护补丁 | M2 先做 spike，在三条路里选：给 rustls 打补丁 / fork、最小自研外层握手、v3 标 🟡 延后；v2 不受影响 |
+| A | Shadow TLS v3 要求自定 ClientHello 的 SessionID，stock rustls 没有这个钩子 | v3 可能做不了或需要维护补丁 | **已解除（2026-09-20）**：spike 证实可以只用 rustls 的公开扩展点（可替换的随机源与密钥交换组）两遍构造 ClientHello，不需要补丁；残余风险是 rustls 升级改变 ClientHello 的生成方式——实现带运行期自检与单元测试绊线（M2 细化设计附录 A） |
 | B | `h3` 的 extended CONNECT 与 HTTP Datagram 仍属实验特性 | MASQUE 与 trust-tunnel 的 h3 模式 | M7 细化设计先验证；不成熟则该两项延后并登记，不阻塞 TUIC / Hysteria 2 |
 | C | boringtun 维护节奏慢 | WireGuard 的长期维护 | 经 trait 隔离；备选同源 fork（NepTUN） |
 | D | Snell 与 `smart` 的细节非公开（PRD R1） | 行为无法完全一致 | 近似实现，差异登记在清单；Snell v5 / v6 只出可行性报告 |
@@ -439,7 +439,7 @@ Surge 手册没有定义这些端点的响应结构（PRD R5）：以收集到�
 | D10 | Windows 的网卡绑定 | 先用"绑定该网卡的源地址"，不需要 unsafe |
 | D11 | 组的环 | `E0009` 在 M3 降级为告警 + 运行期 REJECT（FR-GRP-05） |
 | Q1 | Windows 上是否改用 `IP_UNICAST_IF` | 已决（2026-09-19）：不改，继续用"绑定该网卡的源地址"，不引入 unsafe；差异登记在兼容性清单 |
-| Q2 | Shadow TLS v3 的实现路径 | M2 的 spike 给出（风险 A） |
+| Q2 | Shadow TLS v3 的实现路径 | 已决（2026-09-20，M2-D3）：stock rustls，两遍构造 ClientHello |
 | Q3 | 六个 API 端点的 JSON 形状 | M1 / M3 细化设计时按真实样本定（PRD R5） |
 | Q4 | sing-box 的用户态 WireGuard 端点能否充当带保留字节的对端 | M4 细化设计时验证；不行则用 boringtun 写回环对端 |
 | Q5 | `russh` 的算法覆盖 | M4 细化设计时验证 |
@@ -454,4 +454,4 @@ Surge 手册没有定义这些端点的响应结构（PRD R5）：以收集到�
 | `CLAUDE.md` | 「先读这些文档」加入本文档 | 随本文档 |
 | `docs/surge-compatibility-matrix.md` | 各行状态随里程碑更新；行为差异（`smart` 近似、Windows 网卡绑定方式、Shadow TLS v3 的结论等）逐条登记 | 各里程碑收尾 |
 | `README.md`（中英） | 状态、特性表与路线图 | 各里程碑收尾 |
-| `docs/api/phase2.md`、`docs/acceptance/phase2-manual.md` | 新建 | M1 / M3；M8 |
+| `docs/api/phase2.md`、`docs/acceptance/phase2-manual.md` | 新建 | M1 / M3；M2a（原定 M8，提前：Trojan 合并后项目所有者即可用真实节点手工验收） |
