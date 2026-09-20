@@ -58,41 +58,47 @@ mod tests {
 
     #[tokio::test]
     async fn tls_then_websocket_and_no_alpn_unless_asked_for() {
-        let fixture = TlsFixture::new(&["127.0.0.1"]);
-        let fake = FakeWs::spawn_tls(WsScript::default(), fixture.clone()).await;
-        let server = Target::new(HostName::Ip(fake.addr().ip()), fake.addr().port());
-        let tls = TlsClient::build(
-            &TlsOpts::default(),
-            &server.host,
-            &[],
-            None,
-            fixture.roots(),
-        )
-        .unwrap();
-        let ws = WsClient::new(
-            &WsOpts {
-                path: "/tunnel".into(),
-                headers: Vec::new(),
-            },
-            &server,
-            true,
-        )
-        .unwrap();
-        let stack = Stack::new(
-            Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
-            server,
-            Some(tls),
-            Some(ws),
-        );
-        let mut stream = stack.open(&ConnectOpts::default()).await.unwrap();
-        stream.write_all(b"through both layers").await.unwrap();
-        stream.flush().await.unwrap();
-        let mut buf = [0u8; 19];
-        stream.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"through both layers");
-        assert_eq!(fake.seen()[0].path, "/tunnel");
-        // the fixture offers h2 first: an ALPN of ours would have picked it
-        assert_eq!(fixture.seen()[0].alpn, None);
+        // bounded so a stall (e.g. a write-through regression) fails the
+        // test instead of hanging it
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let fixture = TlsFixture::new(&["127.0.0.1"]);
+            let fake = FakeWs::spawn_tls(WsScript::default(), fixture.clone()).await;
+            let server = Target::new(HostName::Ip(fake.addr().ip()), fake.addr().port());
+            let tls = TlsClient::build(
+                &TlsOpts::default(),
+                &server.host,
+                &[],
+                None,
+                fixture.roots(),
+            )
+            .unwrap();
+            let ws = WsClient::new(
+                &WsOpts {
+                    path: "/tunnel".into(),
+                    headers: Vec::new(),
+                },
+                &server,
+                true,
+            )
+            .unwrap();
+            let stack = Stack::new(
+                Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
+                server,
+                Some(tls),
+                Some(ws),
+            );
+            let mut stream = stack.open(&ConnectOpts::default()).await.unwrap();
+            // no explicit `flush()`: `write_all` alone must deliver
+            stream.write_all(b"through both layers").await.unwrap();
+            let mut buf = [0u8; 19];
+            stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"through both layers");
+            assert_eq!(fake.seen()[0].path, "/tunnel");
+            // the fixture offers h2 first: an ALPN of ours would have picked it
+            assert_eq!(fixture.seen()[0].alpn, None);
+        })
+        .await
+        .expect("the round trip finished within the bound");
     }
 
     #[tokio::test]

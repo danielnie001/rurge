@@ -12,12 +12,13 @@ use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 /// Largest frame and largest message accepted from the peer.
-pub const MAX_INCOMING: usize = 1 << 20;
+const MAX_INCOMING: usize = 1 << 20;
 /// Largest payload put into one outgoing frame.
 const MAX_OUTGOING: usize = 64 * 1024;
 
@@ -26,7 +27,11 @@ const MAX_OUTGOING: usize = 64 * 1024;
 fn ws_io(e: WsError) -> io::Error {
     match e {
         WsError::Io(e) => e,
-        WsError::ConnectionClosed | WsError::AlreadyClosed => {
+        // `SendAfterClosing`: a write lands after `poll_shutdown` sent our
+        // own Close; same as the connection already being gone.
+        WsError::ConnectionClosed
+        | WsError::AlreadyClosed
+        | WsError::Protocol(ProtocolError::SendAfterClosing) => {
             io::Error::new(io::ErrorKind::BrokenPipe, "ws: the connection is closed")
         }
         WsError::Capacity(_) => io::Error::new(
@@ -43,6 +48,9 @@ pub struct WsByteStream {
     /// What is left of the binary message being read.
     pending: Bytes,
     eof: bool,
+    /// Bytes already handed to the sink by a `poll_write` whose flush has
+    /// not completed yet (see `poll_write`).
+    queued: usize,
 }
 
 impl WsByteStream {
@@ -51,6 +59,7 @@ impl WsByteStream {
             inner,
             pending: Bytes::new(),
             eof: false,
+            queued: 0,
         }
     }
 }
@@ -82,6 +91,9 @@ impl AsyncRead for WsByteStream {
                     )));
                 }
                 Some(Ok(Message::Close(_))) | None => self.eof = true,
+                // belt-and-braces: tokio-tungstenite's `Stream` impl already
+                // turns both of these into `None` (`poll_next`) before they
+                // would reach here.
                 Some(Err(WsError::ConnectionClosed | WsError::AlreadyClosed)) => self.eof = true,
                 Some(Err(e)) => return Poll::Ready(Err(ws_io(e))),
             }
@@ -90,6 +102,12 @@ impl AsyncRead for WsByteStream {
 }
 
 impl AsyncWrite for WsByteStream {
+    /// A successful write must mean what it means for every other stream in
+    /// this codebase: the bytes reached the layer below. `start_send` alone
+    /// only queues the frame in tungstenite's own write buffer, which is
+    /// pushed to the socket only once it exceeds `write_buffer_size` (128
+    /// KiB by default) — so every write also drives the sink's flush (which
+    /// in turn pushes an inner TLS layer, if any) before reporting success.
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -98,15 +116,37 @@ impl AsyncWrite for WsByteStream {
         if data.is_empty() {
             return Poll::Ready(Ok(0));
         }
+        if self.queued > 0 {
+            // a previous call already handed `queued` bytes to the sink and
+            // returned `Pending` while flushing them; every caller here
+            // (`write_all`, the engine's relay) retries with the very same
+            // buffer on the next call, so `data` is that same unwritten
+            // slice again — finish the flush and report it, not a new send.
+            ready!(Pin::new(&mut self.inner).poll_flush(cx)).map_err(ws_io)?;
+            let n = self.queued;
+            self.queued = 0;
+            return Poll::Ready(Ok(n));
+        }
         ready!(Pin::new(&mut self.inner).poll_ready(cx)).map_err(ws_io)?;
         let n = data.len().min(MAX_OUTGOING);
         Pin::new(&mut self.inner)
             .start_send(Message::Binary(Bytes::copy_from_slice(&data[..n])))
             .map_err(ws_io)?;
-        Poll::Ready(Ok(n))
+        self.queued = n;
+        match Pin::new(&mut self.inner).poll_flush(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                self.queued = 0;
+                Poll::Ready(Ok(n))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(ws_io(e))),
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // the sink reports `ConnectionClosed` as a successful flush, so any
+        // bytes still queued when the peer completes the close handshake
+        // are lost silently rather than surfaced as an error here.
         Pin::new(&mut self.inner).poll_flush(cx).map_err(ws_io)
     }
 
@@ -249,42 +289,48 @@ mod tests {
 
     #[tokio::test]
     async fn bytes_cross_in_both_directions_whatever_the_slicing() {
-        let fake = FakeWs::spawn(WsScript::default()).await;
-        let client = WsClient::new(&opts("/", &[]), &server(fake.addr()), false).unwrap();
-        // (payload length, bytes per write, bytes per read): one-byte frames,
-        // odd sizes, and writes larger than one outgoing frame; the echo
-        // comes back in frames of at most 1 KiB
-        for (len, write_chunk, read_chunk) in [
-            (4_000usize, 1usize, 3usize),
-            (50_000, 1_000, 777),
-            (200_000, 70_000, 4_096),
-        ] {
-            let stream = open(&fake, &client).await.unwrap();
-            let payload: Vec<u8> = (0..len as u32).map(|i| (i % 251) as u8).collect();
-            let (mut rd, mut wr) = tokio::io::split(stream);
-            let to_send = payload.clone();
-            let writer = tokio::spawn(async move {
-                for chunk in to_send.chunks(write_chunk) {
-                    wr.write_all(chunk).await.unwrap();
+        // bounded so a stall (e.g. a write-through regression) fails the
+        // test instead of hanging it
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let fake = FakeWs::spawn(WsScript::default()).await;
+            let client = WsClient::new(&opts("/", &[]), &server(fake.addr()), false).unwrap();
+            // (payload length, bytes per write, bytes per read): one-byte
+            // frames, odd sizes, and writes larger than one outgoing frame;
+            // the echo comes back in frames of at most 1 KiB. No explicit
+            // `flush()`: `write_all` alone must deliver.
+            for (len, write_chunk, read_chunk) in [
+                (4_000usize, 1usize, 3usize),
+                (50_000, 1_000, 777),
+                (200_000, 70_000, 4_096),
+            ] {
+                let stream = open(&fake, &client).await.unwrap();
+                let payload: Vec<u8> = (0..len as u32).map(|i| (i % 251) as u8).collect();
+                let (mut rd, mut wr) = tokio::io::split(stream);
+                let to_send = payload.clone();
+                let writer = tokio::spawn(async move {
+                    for chunk in to_send.chunks(write_chunk) {
+                        wr.write_all(chunk).await.unwrap();
+                    }
+                    wr
+                });
+                let mut back = vec![0u8; payload.len()];
+                let mut got = 0;
+                while got < back.len() {
+                    let end = (got + read_chunk).min(back.len());
+                    let n = rd.read(&mut back[got..end]).await.unwrap();
+                    assert!(n > 0, "EOF after {got} of {len} bytes");
+                    got += n;
                 }
-                wr.flush().await.unwrap();
-                wr
-            });
-            let mut back = vec![0u8; payload.len()];
-            let mut got = 0;
-            while got < back.len() {
-                let end = (got + read_chunk).min(back.len());
-                let n = rd.read(&mut back[got..end]).await.unwrap();
-                assert!(n > 0, "EOF after {got} of {len} bytes");
-                got += n;
+                assert_eq!(back, payload, "{len} / {write_chunk} / {read_chunk}");
+                let mut stream = rd.unsplit(writer.await.unwrap());
+                stream.shutdown().await.unwrap();
+                let mut rest = Vec::new();
+                stream.read_to_end(&mut rest).await.unwrap();
+                assert!(rest.is_empty(), "the peer's Close is an EOF");
             }
-            assert_eq!(back, payload, "{len} / {write_chunk} / {read_chunk}");
-            let mut stream = rd.unsplit(writer.await.unwrap());
-            stream.shutdown().await.unwrap();
-            let mut rest = Vec::new();
-            stream.read_to_end(&mut rest).await.unwrap();
-            assert!(rest.is_empty(), "the peer's Close is an EOF");
-        }
+        })
+        .await
+        .expect("the round trip finished within the bound");
     }
 
     #[tokio::test]
@@ -408,5 +454,37 @@ mod tests {
                     .expect_err("an error, not data");
             assert_eq!(err.to_string(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn a_write_reaches_the_peer_without_an_explicit_flush() {
+        let fake = FakeWs::spawn(WsScript::default()).await;
+        let client = WsClient::new(&opts("/", &[]), &server(fake.addr()), false).unwrap();
+        let mut stream = open(&fake, &client).await.unwrap();
+        stream.write_all(b"no flush").await.unwrap();
+        let mut buf = [0u8; 8];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_exact(&mut buf),
+        )
+        .await
+        .expect("the echo arrives without an explicit flush")
+        .unwrap();
+        assert_eq!(&buf, b"no flush");
+    }
+
+    #[tokio::test]
+    async fn one_write_queues_at_most_one_outgoing_frame() {
+        let fake = FakeWs::spawn(WsScript::default()).await;
+        let client = WsClient::new(&opts("/", &[]), &server(fake.addr()), false).unwrap();
+        let mut stream = open(&fake, &client).await.unwrap();
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.write(&vec![0u8; 200_000]),
+        )
+        .await
+        .expect("the write completes")
+        .unwrap();
+        assert_eq!(n, MAX_OUTGOING);
     }
 }

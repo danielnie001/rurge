@@ -77,7 +77,9 @@ async fn accept_socket(
     };
     tokio_tungstenite::accept_hdr_async(stream, callback)
         .await
-        .map_err(|e| io::Error::other(e.to_string()))
+        // tungstenite's Display can quote header values (P3): a fixed text,
+        // never `e.to_string()`.
+        .map_err(|_| io::Error::other("the WebSocket handshake failed"))
 }
 
 /// The server side of a WebSocket handshake on `stream`, as a byte stream.
@@ -112,8 +114,8 @@ async fn serve(
         if n == 0 {
             return bytes.shutdown().await;
         }
+        // no explicit flush: `write_all` alone must deliver
         bytes.write_all(&buf[..n]).await?;
-        bytes.flush().await?;
     }
 }
 
