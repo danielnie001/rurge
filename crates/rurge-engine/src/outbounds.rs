@@ -6,11 +6,12 @@ use rurge_config::diagnostic::codes;
 use rurge_config::spec::{CommonOpts, PolicySpec, ProtoSpec, TlsOpts};
 use rurge_config::{Config, Diagnostic, Diagnostics, KeystoreItem};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{Connector, DirectConnector, Resolve};
+use rurge_net::connector::{Connector, DirectConnector, Resolve, Target};
 use rurge_net::socket::{NoopSocketHook, SocketHook, SocketOpts};
 use rurge_policy::{BuildError, OutboundFactory};
 use rurge_proto::http::HttpOutbound;
 use rurge_proto::socks5::Socks5Outbound;
+use rurge_proto::trojan::TrojanOutbound;
 use rurge_proto::{Direct, OutboundRef};
 use rustls::RootCertStore;
 use std::io;
@@ -89,6 +90,7 @@ fn tls_of(spec: &PolicySpec) -> Option<&TlsOpts> {
     match &spec.proto {
         ProtoSpec::Http(http) => http.tls.as_ref(),
         ProtoSpec::Socks5(socks) => socks.tls.as_ref(),
+        ProtoSpec::Trojan(trojan) => Some(&trojan.tls),
         _ => None,
     }
 }
@@ -139,6 +141,19 @@ impl OutboundFactory for EngineFactory {
                 self.roots.clone(),
                 connector,
             )?),
+            ProtoSpec::Trojan(trojan) => {
+                let (Some(host), Some(port)) = (&spec.server, spec.port) else {
+                    return Err(BuildError::new("a trojan policy needs a server and a port"));
+                };
+                Arc::new(TrojanOutbound::new(
+                    &spec.name,
+                    Target::new(host.clone(), port),
+                    trojan,
+                    &self.keystore,
+                    self.roots.clone(),
+                    connector,
+                )?)
+            }
         };
         if !self.dry && skips_verification(spec) {
             tracing::warn!(
@@ -217,6 +232,7 @@ mod tests {
         let cfg = config(
             "[Proxy]\nH = http, proxy.test, 8080, alice, s3cret\nHS = https, proxy.test, 443, sni=edge.test\n\
 S = socks5, proxy.test, 1080\nST = socks5-tls, proxy.test, 1443, skip-cert-verify=true\n\
+T = trojan, proxy.test, 443, password=pw, ws=true, ws-path=/x\n\
 Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule]\nFINAL,DIRECT\n",
         );
         let f = factory(&cfg);
@@ -225,6 +241,7 @@ Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule
             ("HS", "HS"),
             ("S", "S"),
             ("ST", "ST"),
+            ("T", "T"),
             ("Corp", "DIRECT"),
         ] {
             let spec = cfg
@@ -244,6 +261,23 @@ Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule
             e.message,
             "policy `Block` is a reject alias and has no outbound of its own"
         );
+    }
+
+    #[test]
+    fn a_trojan_policy_that_cannot_be_built_is_a_load_error() {
+        let cfg = config(
+            "[Proxy]\nT = trojan, proxy.test, 443, password=s3same0pen, client-cert=cert1\n\
+[Keystore]\ncert1 = type=p12, base64=QUJD, password=hunter2\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let diags = dry_build(&cfg).sorted();
+        let messages: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].starts_with("policy `T` cannot be built: keystore item `cert1`"),
+            "{}",
+            messages[0]
+        );
+        assert!(!messages[0].contains("hunter2") && !messages[0].contains("s3same0pen"));
     }
 
     #[tokio::test]

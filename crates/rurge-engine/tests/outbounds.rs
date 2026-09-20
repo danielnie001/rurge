@@ -13,7 +13,9 @@ use rurge_engine::{Engine, EngineShared, ListenerSpec, RecordStatus, Runtime, Ru
 use rurge_inbound::Running;
 use rurge_net::socket::NoopSocketHook;
 use rurge_net::testing::TestServer;
-use rurge_proto::testing::{FakeHttpProxy, FakeSocks5, HttpProxyScript, Socks5Script};
+use rurge_proto::testing::{
+    FakeHttpProxy, FakeSocks5, FakeTrojan, HttpProxyScript, Socks5Script, TlsFixture, TrojanScript,
+};
 use rurge_rules::{GeoUrls, OutboundMode};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -872,4 +874,138 @@ async fn views_describe_groups_and_redact_policy_details() {
         "{detail_b}"
     );
     assert!(detail_b.contains("***"), "{detail_b}");
+}
+
+/// A loopback Trojan server relaying to `to`, and the policy parameters that
+/// make rurge trust it: the harness cannot inject a test CA (the runtime
+/// builds its factory with the system roots), so the leaf is pinned.
+async fn trojan_upstream(ws: bool, to: SocketAddr) -> (FakeTrojan, String) {
+    let fixture = TlsFixture::new(&["127.0.0.1"]);
+    let pin: String = fixture
+        .leaf_fingerprint()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let fake = FakeTrojan::spawn(
+        TrojanScript {
+            password: "s3same".into(),
+            ws,
+            connect_to: Some(to),
+        },
+        fixture,
+    )
+    .await;
+    (
+        fake,
+        format!("password=s3same, server-cert-fingerprint-sha256={pin}"),
+    )
+}
+
+#[tokio::test]
+async fn a_connect_leaves_through_a_trojan_upstream_with_the_name_unresolved() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    let (upstream, params) = trojan_upstream(false, origin_addr(&origin)).await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "T = trojan, 127.0.0.1, {}, {params}",
+            upstream.addr().port()
+        ),
+        rules: "DOMAIN,target.test,T",
+        ..Profile::default()
+    })
+    .await;
+    let mut tunnel = connect_via_http(h.http(), "target.test:8080").await;
+    let response = get(&mut tunnel, "target.test", "/hello").await;
+    assert!(response.ends_with("hi there"), "{response}");
+    let seen = upstream.requests();
+    assert_eq!(
+        (
+            seen[0].command,
+            seen[0].atyp,
+            seen[0].host.as_str(),
+            seen[0].port
+        ),
+        (1, 3, "target.test", 8080),
+        "the server resolves the name: rurge never looked it up"
+    );
+    // whether the head rode with the first payload depends on timing here
+    // (`HEAD_GRACE`); `LazyHead`'s own tests pin that deterministically
+    assert!(h.dns.queries().is_empty());
+    drop(tunnel);
+    let log = h.engine.request_log();
+    wait_until("the session to finish", || !log.recent(10).is_empty()).await;
+    let record = &log.recent(10)[0];
+    assert_eq!(record.policy, ["T"]);
+    assert!(record.error.is_none(), "{:?}", record.error);
+}
+
+#[tokio::test]
+async fn a_plain_request_is_tunnelled_through_trojan_over_websocket() {
+    // only an HTTP proxy takes a plain request in absolute form; everything
+    // else gets a tunnel
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    let (upstream, params) = trojan_upstream(true, origin_addr(&origin)).await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "T = trojan, 127.0.0.1, {}, {params}, ws=true, ws-path=/tunnel, ws-headers=Host:edge.test",
+            upstream.addr().port()
+        ),
+        rules: "DOMAIN,target.test,T",
+        ..Profile::default()
+    })
+    .await;
+    let response = plain_get(
+        h.http(),
+        "http://target.test:8080/hello",
+        "target.test:8080",
+    )
+    .await;
+    assert!(response.ends_with("hi there"), "{response}");
+    let ws = upstream.ws_seen();
+    assert_eq!(
+        (ws[0].path.as_str(), ws[0].header("host")),
+        ("/tunnel", Some("edge.test"))
+    );
+    assert_eq!(upstream.requests()[0].host, "target.test");
+    assert_eq!(origin.hits("/hello"), 1);
+}
+
+#[tokio::test]
+async fn a_trojan_exit_is_reached_through_a_socks5_entry_by_name() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    let (exit, params) = trojan_upstream(false, origin_addr(&origin)).await;
+    let entry = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(exit.addr()),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "Entry = socks5, 127.0.0.1, {}\nExit = trojan, exit.example, 443, {params}, underlying-proxy=Entry",
+            entry.addr().port()
+        ),
+        rules: "DOMAIN,target.test,Exit",
+        ..Profile::default()
+    })
+    .await;
+    let mut tunnel = connect_via_http(h.http(), "target.test:8080").await;
+    assert!(
+        get(&mut tunnel, "target.test", "/hello")
+            .await
+            .ends_with("hi there")
+    );
+    // the entry is asked for the exit's server by name; the exit for the target by name
+    let first = &entry.requests()[0];
+    assert_eq!(
+        (first.atyp, first.host.as_str(), first.port),
+        (3, "exit.example", 443)
+    );
+    assert_eq!(exit.requests()[0].host, "target.test");
+    assert!(
+        h.dns.queries().is_empty(),
+        "nothing on this path is resolved locally"
+    );
 }

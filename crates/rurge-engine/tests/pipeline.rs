@@ -1143,6 +1143,45 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
     );
 }
 
+/// The anti-loop guard is about where the socket is opened, not about the
+/// protocol: a host-named trojan server is bypassed exactly like an http one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dns_session_bypasses_a_trojan_proxy_configured_by_host_name() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    dns.set("proxy.test", &["127.0.0.1"], &[], 60);
+    let dir = tempfile::tempdir().unwrap();
+    let profile = format!(
+        "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\n\
+encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.1:{}\nipv6 = false\n\
+[Proxy]\nUp = trojan, proxy.test, 443, password=pw\n[Proxy Group]\n[Rule]\nPROTOCOL,DNS,Up\nFINAL,DIRECT\n",
+        dns.addr().port()
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        engine
+            .runtime()
+            .stack
+            .resolver
+            .lookup("target.test", rurge_dns::resolver::LookupOpts::default()),
+    )
+    .await
+    .expect("the lookup must not wait for the proxy's own name to be resolved");
+    assert!(res.is_ok(), "resolution through the pipeline: {res:?}");
+    let internal = internal_sessions(&engine);
+    assert!(
+        internal.iter().any(|r| {
+            r.error.as_deref()
+                == Some(
+                    "dns-follow: proxy configured by host name bypassed to avoid a resolution loop",
+                )
+                && r.policy.first().map(String::as_str) == Some("Up")
+        }),
+        "{internal:?}"
+    );
+}
+
 /// A proxy configured by IP LITERAL needs no lookup of its own, so it really
 /// carries the DNS session instead of being bypassed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

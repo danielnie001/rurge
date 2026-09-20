@@ -42,6 +42,7 @@ pub enum ProtoSpec {
     Reject(Builtin),
     Http(HttpSpec),
     Socks5(Socks5Spec),
+    Trojan(TrojanSpec),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,19 +189,27 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
                 }),
             )
         }
+        PolicyKind::Trojan => {
+            let common = read_common(&mut r, Applies::Proxy, &mut notes);
+            tls::note_shadow_tls(&mut r, &mut notes);
+            let trojan = trojan::read_trojan(&mut r, env.keystore);
+            (common, ProtoSpec::Trojan(trojan))
+        }
         _ => return SpecOutcome::default(),
     };
-    if matches!(proto, ProtoSpec::Http(_) | ProtoSpec::Socks5(_)) {
+    if !matches!(proto, ProtoSpec::Direct | ProtoSpec::Reject(_)) {
         check_underlying(&mut r, &mut common, env);
-    }
-    // socket options belong to the hop that opens the socket (matrix 4.3)
-    if common.underlying_proxy.is_some() {
-        for key in ["interface", "allow-other-interface", "tos", "ip-version"] {
-            if r.has(key) {
-                r.warn(
-                    codes::W_PARAM_NOT_APPLICABLE,
-                    format!("`{key}` has no effect on a policy with `underlying-proxy`; ignored"),
-                );
+        // socket options belong to the hop that opens the socket (matrix 4.3)
+        if common.underlying_proxy.is_some() {
+            for key in ["interface", "allow-other-interface", "tos", "ip-version"] {
+                if r.has(key) {
+                    r.warn(
+                        codes::W_PARAM_NOT_APPLICABLE,
+                        format!(
+                            "`{key}` has no effect on a policy with `underlying-proxy`; ignored"
+                        ),
+                    );
+                }
             }
         }
     }
@@ -432,5 +441,16 @@ mod tests {
         assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
         let o = outcome("P", "http, h, 80, interface=eth0, tos=16");
         assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        // carried from Task 1's review: a `reject*` alias has no real chain
+        // (`read_common` does not clear `underlying-proxy` for `Applies::Reject`),
+        // so it must not get this warning either
+        let o = outcome("P", "reject, underlying-proxy=Entry, interface=eth0");
+        assert!(
+            !o.diagnostics
+                .iter()
+                .any(|d| d.code == codes::W_PARAM_NOT_APPLICABLE),
+            "{:?}",
+            o.diagnostics
+        );
     }
 }

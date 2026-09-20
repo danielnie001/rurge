@@ -145,10 +145,44 @@ fn keystore_base64_is_checked_at_load() {
 }
 
 #[test]
-fn a_trojan_policy_has_no_spec_until_the_outbound_is_wired_in() {
-    // M2a plan P6: the readers exist, `to_spec` does not use them yet, so
-    // the registry keeps treating the policy as "not implemented"
-    let loaded = load("T = trojan, t.example, 443, password=p, ws=true", "");
-    assert!(!loaded.diagnostics.has_errors(), "{:?}", loaded.diagnostics);
-    assert!(loaded.config.spec("T").is_none());
+fn a_trojan_policy_is_typed() {
+    let loaded = load(
+        "T = trojan, t.example, 443, password=p, ws=true, ws-path=/w, sni=front.example, underlying-proxy=E\nE = socks5, e.example, 1080\nBad = trojan, b.example, 443",
+        "",
+    );
+    let errors: Vec<String> = loaded
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| d.message.clone())
+        .collect();
+    assert_eq!(errors, ["policy `Bad`: `password` is required"]);
+    let spec = loaded.config.spec("T").expect("typed");
+    let ProtoSpec::Trojan(trojan) = &spec.proto else {
+        panic!("{:?}", spec.proto)
+    };
+    assert_eq!(trojan.password, "p");
+    assert_eq!(trojan.ws.as_ref().unwrap().path, "/w");
+    assert_eq!(spec.common.underlying_proxy.as_deref(), Some("E"));
+    assert!(
+        loaded.config.spec("Bad").is_none(),
+        "an error drops the spec"
+    );
+}
+
+#[test]
+fn a_trojan_policy_takes_part_in_the_chain_checks() {
+    let loaded = load(
+        "A = trojan, a.example, 443, password=p, underlying-proxy=B\nB = trojan, b.example, 443, password=p, underlying-proxy=A",
+        "",
+    );
+    assert!(codes_of(&loaded, Severity::Error).contains(&codes::E_UNDERLYING_PROXY_CYCLE));
+    let loaded = load(
+        "A = trojan, a.example, 443, password=p, underlying-proxy=Ghost",
+        "",
+    );
+    assert_eq!(
+        codes_of(&loaded, Severity::Error),
+        [codes::E_UNKNOWN_POLICY_REF]
+    );
 }
