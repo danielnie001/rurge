@@ -35,7 +35,7 @@
 
 ## 会话日志里的出站错误文本
 
-trojan（± WebSocket）出站失败时，会话记录的 `error` 是下列固定文本之一；对端给的字节（HTTP 响应头、WebSocket 握手响应体等）永不原样出现在其中。
+trojan（± WebSocket）出站失败时，会话记录的 `error` 是下列固定文本之一；其余失败仍按连接失败的通用形式出现（拨号超时 `connect timed out`、TLS 握手失败 `tls: <原因>`、或底层 I/O 错误的原文——涵盖 TCP 连接失败与 WebSocket 握手期间的 I/O 错误）。对端给的字节（HTTP 响应头、WebSocket 握手响应体等）永不原样出现在下列固定文本中。
 
 | 错误文本 | 何时出现 |
 | --- | --- |

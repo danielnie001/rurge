@@ -171,7 +171,7 @@ impl Stack {
   - 读：Binary 帧的负载按序拼接；Text 帧视为协议错误；Ping 由库应答，适配器负责把应答刷出去；Close 视为 EOF。
   - 写：每次 `poll_write` 发一个 Binary 帧；`poll_shutdown` 发 Close 并刷出。
 - 入站帧与消息的大小上限 ≤ 1 MiB，出站每帧 ≤ 64 KiB，超限视为协议错误；tungstenite 要求请求 URI 带 `ws://` scheme、且 `Host` `Connection` `Upgrade` `Sec-WebSocket-Version` `Sec-WebSocket-Key` 五个握手头各恰好一个，它的错误文本会引用头的值，所以一律按变体映射成固定文本。
-- 错误文本：`ws: handshake failed: HTTP <状态码>`（只有状态码）；`ws: <untrusted_text(库的错误文本)>`。服务端给的任何字节都不原样进文本。
+- 错误文本：`ws: handshake failed: HTTP <状态码>`（只有状态码，对端把握手请求回了非 101 响应）；握手期间的其它错误统一为 `ws: handshake failed`；建立之后，协议错误统一为 `ws: protocol error`，对端发文本帧是 `ws: the server sent a text frame`，单帧或重组后的消息超过入站上限是 `ws: the server sent a frame larger than the limit`，写入或刷出发生在连接已经关闭之后是 `ws: the connection is closed`。tungstenite 自己的 `Display` 文本可能引用头的值，因此从不转发，一律按错误变体（或消息种类）映射成上面的固定文本；唯一的例外是 `WsError::Io`，它本来就是一个 I/O 错误，原样作为 `OutboundError::Io`（或超时时的 `OutboundError::Timeout`）继续走标准出站错误路径，不带 `ws:` 前缀。
 
 ### 5.3 Shadow TLS（`transport::shadow_tls`，M2c）
 
@@ -404,6 +404,7 @@ pub trait OutboundFactory: Send + Sync {
 | P7 | 5.2："帧与消息的大小上限取有界值（写计划时定具体数字；量级为 1 MiB）" | 入站帧与消息 ≤ 1 MiB，出站每帧 ≤ 64 KiB；并补一句（P2 / P3）：tungstenite 要求请求 URI 带 `ws://` scheme、五个握手头各恰好一个；它的错误文本会引用头的值，所以一律按变体映射成固定文本 |
 | 任务 2 | 5.2 只说"写：每次 `poll_write` 发一个 Binary 帧"，未说明成功返回是否意味着字节已到达下一层 | `WsByteStream` 是写穿的：`poll_write` 在报告成功之前会驱动 tungstenite 自己的写缓冲一并刷出（进而推动下层，如内层 TLS），调用方不需要、工作区里也没有任何调用方会再显式 `flush` |
 | 任务 3 | 6.1 只说"第一次 `poll_write`：请求头与首段负载合成一次写出"，未说明请求头一旦开始发送之后能否继续并入后续的写 | `LazyHead` 一旦开始发送请求头（第一次内层 `poll_write`）就不再增长：`coalesced` 是"这些字节已随请求头发出"的唯一依据，之后任何一次读或写都不会让同一段负载被再发送一次 |
+| 任务 8 | 5.2 错误文本一句写着 `ws: <untrusted_text(库的错误文本)>`，暗示握手 / 运行期错误会转发 tungstenite 自己的（经 `untrusted_text` 处理过的）文本 | 代码里没有这个机制：`transport/ws.rs` 从不调用 `untrusted_text`，每个 tungstenite 错误变体都映射成固定文本（`ws: handshake failed`，非 101 响应时带 `: HTTP <状态码>`；`ws: protocol error`；`ws: the server sent a text frame`；`ws: the server sent a frame larger than the limit`；`ws: the connection is closed`），唯一的例外是 `WsError::Io`，它原样作为普通 I/O 错误继续走 `OutboundError::Io` / `Timeout`，不带 `ws:` 前缀。Task 8 评审发现 |
 
 实施中发现的新出入由各任务追加。
 
