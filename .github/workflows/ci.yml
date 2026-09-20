@@ -51,6 +51,35 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then bin=$(cygpath -w "$bin"); fi
           echo "RURGE_TEST_SING_BOX=$bin" >> "$GITHUB_ENV"
           echo "RURGE_INTEROP_REQUIRED=1" >> "$GITHUB_ENV"
+      - name: Install xray for the VMess interoperability tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=26.3.27
+          case "$RUNNER_OS" in
+            Linux)   asset="Xray-linux-64.zip";        sha=23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae ;;
+            Windows) asset="Xray-windows-64.zip";      sha=d004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad ;;
+            macOS)   asset="Xray-macos-arm64-v8a.zip"; sha=2e93a67e8aa1936ecefb307e120830fcbd4c643ab9b1c46a2d0838d5f8409eaf ;;
+            *) echo "unexpected runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 --retry-all-errors -o "$asset" "https://github.com/XTLS/Xray-core/releases/download/v$version/$asset"
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum "$asset" | cut -d' ' -f1)
+          else
+            actual=$(shasum -a 256 "$asset" | cut -d' ' -f1)
+          fi
+          if [ "$actual" != "$sha" ]; then
+            echo "xray checksum mismatch: expected $sha, got $actual"
+            exit 1
+          fi
+          mkdir -p xray
+          unzip -q "$asset" -d xray
+          bin=$(find "$PWD/xray" -type f \( -name xray -o -name xray.exe \) | head -n 1)
+          [ -n "$bin" ] || { echo "no xray binary in $asset"; exit 1; }
+          chmod +x "$bin"
+          if [ "$RUNNER_OS" = "Windows" ]; then bin=$(cygpath -w "$bin"); fi
+          echo "RURGE_TEST_XRAY=$bin" >> "$GITHUB_ENV"
       - run: cargo test --workspace
   bench:
     runs-on: ubuntu-latest

@@ -4,6 +4,8 @@
 //! 127.0.0.1 only, its single outbound is `direct`, and it never holds a key
 //! that touches the machine (`set_system_proxy`, `tun`, `auto_route`).
 
+pub mod xray;
+
 use serde_json::{Value, json};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -56,6 +58,8 @@ pub enum InboundKind {
     Socks,
     Mixed,
     Trojan,
+    Vmess,
+    AnyTls,
 }
 
 pub struct TlsFiles {
@@ -70,10 +74,10 @@ pub struct Inbound {
     pub kind: InboundKind,
     /// Empty = no authentication.
     pub users: Vec<(String, String)>,
-    /// sing-box's `http` and `trojan` inbounds speak TLS; `socks` and `mixed`
-    /// do not.
+    /// sing-box's `http`, `trojan`, `vmess` and `anytls` inbounds speak TLS;
+    /// `socks` and `mixed` do not.
     pub tls: Option<TlsFiles>,
-    /// A V2Ray WebSocket transport on this path (trojan only).
+    /// A V2Ray WebSocket transport on this path (`trojan` and `vmess` only).
     pub ws_path: Option<String>,
 }
 
@@ -89,6 +93,8 @@ pub fn render(inbounds: &[(Inbound, u16)]) -> Value {
                     InboundKind::Socks => "socks",
                     InboundKind::Mixed => "mixed",
                     InboundKind::Trojan => "trojan",
+                    InboundKind::Vmess => "vmess",
+                    InboundKind::AnyTls => "anytls",
                 },
                 "tag": format!("in-{i}"),
                 "listen": "127.0.0.1",
@@ -99,16 +105,26 @@ pub fn render(inbounds: &[(Inbound, u16)]) -> Value {
                     .users
                     .iter()
                     .map(|(u, p)| match inbound.kind {
-                        // sing-box's trojan users are `name` + `password`
-                        InboundKind::Trojan => json!({ "name": u, "password": p }),
+                        // sing-box's trojan and anytls users are `name` + `password`
+                        InboundKind::Trojan | InboundKind::AnyTls => {
+                            json!({ "name": u, "password": p })
+                        }
+                        // the second half is the id; `alterId: 0` selects the AEAD handshake
+                        InboundKind::Vmess => json!({ "name": u, "uuid": p, "alterId": 0 }),
                         _ => json!({ "username": u, "password": p }),
                     })
                     .collect();
             }
             if let Some(tls) = &inbound.tls {
                 assert!(
-                    matches!(inbound.kind, InboundKind::Http | InboundKind::Trojan),
-                    "only sing-box's http and trojan inbounds are given tls here"
+                    matches!(
+                        inbound.kind,
+                        InboundKind::Http
+                            | InboundKind::Trojan
+                            | InboundKind::Vmess
+                            | InboundKind::AnyTls
+                    ),
+                    "only sing-box's http, trojan, vmess and anytls inbounds are given tls here"
                 );
                 let mut t = json!({
                     "enabled": true,
@@ -122,10 +138,9 @@ pub fn render(inbounds: &[(Inbound, u16)]) -> Value {
                 v["tls"] = t;
             }
             if let Some(path) = &inbound.ws_path {
-                assert_eq!(
-                    inbound.kind,
-                    InboundKind::Trojan,
-                    "ws is rendered for trojan only"
+                assert!(
+                    matches!(inbound.kind, InboundKind::Trojan | InboundKind::Vmess),
+                    "ws is rendered for trojan and vmess only"
                 );
                 v["transport"] = json!({ "type": "ws", "path": path });
             }
@@ -139,12 +154,88 @@ pub fn render(inbounds: &[(Inbound, u16)]) -> Value {
     })
 }
 
-/// A running sing-box; killed and reaped on drop.
-pub struct SingBox {
+/// A reference implementation running as a child on the loopback; killed and
+/// reaped on drop.
+pub(crate) struct Reference {
+    what: &'static str,
     child: Child,
     ports: Vec<u16>,
     log: PathBuf,
 }
+
+impl Reference {
+    /// Starts `command` with its output in `log` and waits until every port
+    /// accepts connections.
+    pub(crate) fn start(
+        what: &'static str,
+        mut command: Command,
+        ports: Vec<u16>,
+        log: PathBuf,
+    ) -> Reference {
+        let out = std::fs::File::create(&log).expect("create the log");
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(out.try_clone().expect("clone the log handle"))
+            .stderr(out)
+            .spawn()
+            .unwrap_or_else(|e| panic!("cannot start {what}: {e}"));
+        let mut running = Reference {
+            what,
+            child,
+            ports,
+            log,
+        };
+        running.wait_ready();
+        running
+    }
+
+    fn wait_ready(&mut self) {
+        let deadline = Instant::now() + READY_TIMEOUT;
+        for port in self.ports.clone() {
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            loop {
+                // Before the connect, not after: if the child is already dead
+                // and an unrelated process happens to hold `port`, a connect
+                // that comes first reads as "ready".
+                if let Ok(Some(status)) = self.child.try_wait() {
+                    panic!(
+                        "{} exited early ({status}):\n{}",
+                        self.what,
+                        self.log_text()
+                    );
+                }
+                if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{} never listened on {addr}:\n{}",
+                    self.what,
+                    self.log_text()
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    pub(crate) fn port(&self, index: usize) -> u16 {
+        self.ports[index]
+    }
+
+    pub(crate) fn log_text(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+impl Drop for Reference {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A running sing-box; killed and reaped on drop.
+pub struct SingBox(Reference);
 
 impl SingBox {
     /// Writes the configuration into `dir`, starts `binary` there and waits
@@ -155,62 +246,23 @@ impl SingBox {
         let ports: Vec<u16> = with_ports.iter().map(|(_, p)| *p).collect();
         let config = dir.join("sing-box.json");
         std::fs::write(&config, render(&with_ports).to_string()).expect("write the config");
-        let log = dir.join("sing-box.log");
-        let out = std::fs::File::create(&log).expect("create the log");
-        let child = Command::new(binary)
-            .arg("run")
-            .arg("-c")
-            .arg(&config)
-            .arg("-D")
-            .arg(dir)
-            .stdin(Stdio::null())
-            .stdout(out.try_clone().expect("clone the log handle"))
-            .stderr(out)
-            .spawn()
-            .unwrap_or_else(|e| panic!("cannot start {}: {e}", binary.display()));
-        let mut running = SingBox { child, ports, log };
-        running.wait_ready();
-        running
-    }
-
-    fn wait_ready(&mut self) {
-        let deadline = Instant::now() + READY_TIMEOUT;
-        for port in self.ports.clone() {
-            let addr = SocketAddr::from(([127, 0, 0, 1], port));
-            loop {
-                // Before the connect, not after: if sing-box is already dead
-                // and an unrelated process happens to hold `port`, a connect
-                // that comes first reads as "ready".
-                if let Ok(Some(status)) = self.child.try_wait() {
-                    panic!("sing-box exited early ({status}):\n{}", self.log_text());
-                }
-                if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "sing-box never listened on {addr}:\n{}",
-                    self.log_text()
-                );
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
+        let mut command = Command::new(binary);
+        command.arg("run").arg("-c").arg(&config).arg("-D").arg(dir);
+        SingBox(Reference::start(
+            "sing-box",
+            command,
+            ports,
+            dir.join("sing-box.log"),
+        ))
     }
 
     /// The loopback port of the `index`-th inbound.
     pub fn port(&self, index: usize) -> u16 {
-        self.ports[index]
+        self.0.port(index)
     }
 
     pub fn log_text(&self) -> String {
-        std::fs::read_to_string(&self.log).unwrap_or_default()
-    }
-}
-
-impl Drop for SingBox {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.0.log_text()
     }
 }
 
@@ -264,6 +316,32 @@ mod tests {
                 },
                 1004,
             ),
+            (
+                Inbound {
+                    kind: InboundKind::Vmess,
+                    users: vec![("u".into(), "0233d11c-15a4-47d3-ade3-48ffca0ce119".into())],
+                    tls: Some(TlsFiles {
+                        certificate: "leaf.pem".into(),
+                        key: "leaf.key".into(),
+                        client_ca: None,
+                    }),
+                    ws_path: Some("/v".into()),
+                },
+                1005,
+            ),
+            (
+                Inbound {
+                    kind: InboundKind::AnyTls,
+                    users: vec![("u".into(), "pw".into())],
+                    tls: Some(TlsFiles {
+                        certificate: "leaf.pem".into(),
+                        key: "leaf.key".into(),
+                        client_ca: None,
+                    }),
+                    ws_path: None,
+                },
+                1006,
+            ),
         ]
     }
 
@@ -310,6 +388,18 @@ mod tests {
         assert_eq!(trojan["tls"]["enabled"], true);
         assert_eq!(trojan["transport"], json!({ "type": "ws", "path": "/ws" }));
         assert!(config["inbounds"][0].get("transport").is_none());
+        let vmess = &config["inbounds"][4];
+        assert_eq!(vmess["type"], "vmess");
+        // `alterId: 0` is what makes sing-box expect the AEAD handshake
+        assert_eq!(
+            vmess["users"],
+            json!([{ "name": "u", "uuid": "0233d11c-15a4-47d3-ade3-48ffca0ce119", "alterId": 0 }])
+        );
+        assert_eq!(vmess["transport"], json!({ "type": "ws", "path": "/v" }));
+        let anytls = &config["inbounds"][5];
+        assert_eq!(anytls["type"], "anytls");
+        assert_eq!(anytls["users"], json!([{ "name": "u", "password": "pw" }]));
+        assert_eq!(anytls["tls"]["enabled"], true);
     }
 
     #[test]
