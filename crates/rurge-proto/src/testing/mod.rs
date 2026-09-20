@@ -1,6 +1,7 @@
 //! Scriptable loopback peers for tests (phase 2 M1 design §5.6). Never used
 //! by production code. None of them ever resolves a host name.
 
+mod anytls;
 mod http_proxy;
 mod socks5;
 mod tls;
@@ -8,6 +9,7 @@ mod trojan;
 mod vmess;
 pub mod ws;
 
+pub use anytls::{AnyTlsScript, FakeAnyTls, RecordedStream};
 pub use http_proxy::{FakeHttpProxy, HttpProxyScript, RecordedHead};
 pub use socks5::{FakeSocks5, RecordedSocks5, Socks5Script};
 pub use tls::{SeenHandshake, TlsFixture};
@@ -19,14 +21,7 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-/// Aborts the task it holds when dropped.
-pub(crate) struct AbortOnDrop(pub(crate) tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
+pub(crate) use crate::task::AbortOnDrop;
 
 /// Echoes every byte back until the peer closes.
 pub async fn echo_server() -> SocketAddr {
