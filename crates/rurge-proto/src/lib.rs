@@ -2,6 +2,7 @@
 //! implements, plus the phase 1 built-ins `Direct` and `Reject`.
 
 mod addr;
+pub mod anytls;
 pub mod build;
 pub mod direct;
 mod hostname;
