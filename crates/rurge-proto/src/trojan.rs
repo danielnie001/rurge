@@ -116,6 +116,7 @@ mod tests {
     use crate::testing::{FakeTrojan, SeenHandshake, TlsFixture, TrojanScript, echo_server};
     use rurge_config::policy::parse_policy;
     use rurge_config::spec::ParamReader;
+    use rurge_config::spec::TlsOpts;
     use rurge_config::spec::trojan::read_trojan;
     use rurge_config::{HostName, Span};
     use rurge_net::connector::{DirectConnector, SystemResolve};
@@ -173,6 +174,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_empty_password_is_a_build_error() {
+        let fixture = TlsFixture::new(&["127.0.0.1"]);
+        let spec = TrojanSpec {
+            tls: TlsOpts::default(),
+            password: String::new(),
+            ws: None,
+        };
+        let err = TrojanOutbound::new(
+            "T",
+            Target::new(HostName::parse("127.0.0.1"), 443),
+            &spec,
+            &[],
+            fixture.roots(),
+            Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.message, "`password` is empty");
+    }
+
     #[tokio::test]
     async fn the_head_rides_with_the_first_payload() {
         let echo = echo_server().await;
@@ -188,7 +210,10 @@ mod tests {
             .unwrap();
         stream.write_all(b"first payload").await.unwrap();
         let mut buf = [0u8; 13];
-        stream.read_exact(&mut buf).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("the echoed payload arrives")
+            .unwrap();
         assert_eq!(&buf, b"first payload");
         let seen = fake.requests();
         assert_eq!(
@@ -257,7 +282,10 @@ mod tests {
             .unwrap();
         stream.write_all(b"x").await.unwrap();
         let mut one = [0u8; 1];
-        stream.read_exact(&mut one).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut one))
+            .await
+            .expect("the echoed byte arrives")
+            .unwrap();
         let seen = fake.requests();
         assert_eq!(
             (seen[0].atyp, seen[0].host.as_str(), seen[0].port),
@@ -335,7 +363,10 @@ mod tests {
             .unwrap();
         stream.write_all(b"inside a frame").await.unwrap();
         let mut buf = [0u8; 14];
-        stream.read_exact(&mut buf).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("the echoed frame arrives")
+            .unwrap();
         assert_eq!(&buf, b"inside a frame");
         let ws = fake.ws_seen();
         assert_eq!(ws[0].path, "/t");
@@ -379,7 +410,10 @@ mod tests {
                 .unwrap();
             stream.write_all(b"x").await.unwrap();
             let mut one = [0u8; 1];
-            stream.read_exact(&mut one).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut one))
+                .await
+                .expect("the echoed byte arrives")
+                .unwrap();
             assert_eq!(fixture.seen().last(), Some(&expected), "{extra}");
         }
     }
@@ -412,6 +446,7 @@ mod tests {
             .err()
             .expect("times out");
         assert!(matches!(err, OutboundError::Timeout), "{err}");
+        assert!(started.elapsed() >= Duration::from_millis(300));
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

@@ -54,11 +54,13 @@ fn parse_request(buf: &[u8]) -> Option<(RecordedTrojan, usize)> {
             let b: [u8; 16] = buf.get(2..18)?.try_into().ok()?;
             (IpAddr::V6(Ipv6Addr::from(b)).to_string(), 18)
         }
-        _ => {
+        3 => {
             let len = usize::from(*buf.get(2)?);
             let name = buf.get(3..3 + len)?;
             (String::from_utf8_lossy(name).into_owned(), 3 + len)
         }
+        // a client bug (or a hostile peer): not a plausible request
+        _ => return None,
     };
     let port = u16::from_be_bytes(buf.get(used..used + 2)?.try_into().ok()?);
     // the closing CRLF

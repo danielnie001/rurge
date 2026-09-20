@@ -23,13 +23,20 @@ pub const HEAD_GRACE: Duration = Duration::from_millis(100);
 
 pub struct LazyHead {
     inner: BoxedStream,
+    /// `Some` until the head (and whatever payload rides with it) is on the wire.
     head: Option<Vec<u8>>,
+    /// How much of `head` has been written.
     written: usize,
+    /// Set by the first `inner.poll_write` of the head: from then on `head`
+    /// must not grow — an inner write that returned `Pending` is retried
+    /// with the same bytes (`WsByteStream` relies on that).
+    started: bool,
+    /// Payload bytes appended to `head` that the writer has not been told about yet.
     coalesced: usize,
     grace: Duration,
     /// Armed by the first read that finds the head unsent.
     timer: Option<Pin<Box<Sleep>>>,
-    /// A reader parked on the timer; woken as soon as a write sends the head.
+    /// The reader waiting for the head to go out; woken by whoever finishes it.
     reader: Option<Waker>,
 }
 
@@ -43,6 +50,7 @@ impl LazyHead {
             inner,
             head: Some(head),
             written: 0,
+            started: false,
             coalesced: 0,
             grace,
             timer: None,
@@ -50,6 +58,7 @@ impl LazyHead {
         }
     }
 
+    /// Drives the pending head (and whatever payload rides with it) out.
     fn poll_head(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while let Some(head) = &self.head {
             if self.written == head.len() {
@@ -60,6 +69,7 @@ impl LazyHead {
                 }
                 break;
             }
+            self.started = true;
             let n = ready!(Pin::new(&mut self.inner).poll_write(cx, &head[self.written..]))?;
             if n == 0 {
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
@@ -77,7 +87,7 @@ impl AsyncRead for LazyHead {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         if self.head.is_some() {
-            if self.written == 0 {
+            if !self.started {
                 // nothing sent yet: give the first payload a moment to arrive
                 let grace = self.grace;
                 let timer = self
@@ -88,7 +98,11 @@ impl AsyncRead for LazyHead {
                     return Poll::Pending;
                 }
             }
-            ready!(self.poll_head(cx))?;
+            if self.poll_head(cx)?.is_pending() {
+                // whoever finishes the head wakes us, even from another task
+                self.reader = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
             ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
         }
         Pin::new(&mut self.inner).poll_read(cx, buf)
@@ -101,35 +115,34 @@ impl AsyncWrite for LazyHead {
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.head.is_none() {
+        if self.head.is_none() && self.coalesced == 0 {
             return Pin::new(&mut self.inner).poll_write(cx, data);
         }
-        if self.written == 0 && self.coalesced == 0 {
+        if !self.started && self.coalesced == 0 {
+            // the first write, and the head has not started: the payload rides with it
             if let Some(head) = &mut self.head {
                 head.extend_from_slice(data);
+                self.coalesced = data.len();
             }
-            self.coalesced = data.len();
         }
+        // a no-op once the head is out — possibly finished by a concurrent read
         ready!(self.poll_head(cx))?;
-        let n = self.coalesced.min(data.len());
-        self.coalesced = 0;
-        if n == 0 {
-            return Pin::new(&mut self.inner).poll_write(cx, data);
+        if self.coalesced > 0 {
+            // these bytes left with the head, whoever drove it: never again
+            let n = self.coalesced.min(data.len());
+            self.coalesced = 0;
+            return Poll::Ready(Ok(n));
         }
-        Poll::Ready(Ok(n))
+        Pin::new(&mut self.inner).poll_write(cx, data)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.head.is_some() {
-            ready!(self.poll_head(cx))?;
-        }
+        ready!(self.poll_head(cx))?;
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.head.is_some() {
-            ready!(self.poll_head(cx))?;
-        }
+        ready!(self.poll_head(cx))?;
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -251,5 +264,115 @@ mod tests {
         lazy.shutdown().await.unwrap();
         drop(lazy);
         assert_eq!(server.await.unwrap(), b"HEAD|");
+    }
+
+    use std::task::Waker;
+    use tokio::io::DuplexStream;
+
+    /// Passes through to a duplex pipe, except that the first `pending`
+    /// calls of `poll_write` return `Pending` without taking anything.
+    struct PendingWrites {
+        pipe: DuplexStream,
+        pending: usize,
+    }
+
+    impl AsyncRead for PendingWrites {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.pipe).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for PendingWrites {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.pending > 0 {
+                self.pending -= 1;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.pipe).poll_write(cx, data)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.pipe).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.pipe).poll_shutdown(cx)
+        }
+    }
+
+    async fn drain(mut far: DuplexStream) -> Vec<u8> {
+        let mut all = Vec::new();
+        far.read_to_end(&mut all).await.unwrap();
+        all
+    }
+
+    #[tokio::test]
+    async fn a_read_that_finishes_the_head_does_not_make_the_write_send_its_payload_again() {
+        // the relay polls both halves of a split in one task: the write parks
+        // with its payload already behind the head, the read drives both out
+        let mut cx = Context::from_waker(Waker::noop());
+        let (near, far) = tokio::io::duplex(4096);
+        let mut lazy = LazyHead::with_grace(
+            Box::new(PendingWrites {
+                pipe: near,
+                pending: 1,
+            }),
+            b"HEAD|".to_vec(),
+            Duration::ZERO,
+        );
+        assert!(
+            Pin::new(&mut lazy)
+                .poll_write(&mut cx, b"payload")
+                .is_pending()
+        );
+        let mut space = [0u8; 8];
+        let mut buf = ReadBuf::new(&mut space);
+        // the head has started, so the read does not wait for the grace
+        assert!(
+            Pin::new(&mut lazy)
+                .poll_read(&mut cx, &mut buf)
+                .is_pending()
+        );
+        assert!(matches!(
+            Pin::new(&mut lazy).poll_write(&mut cx, b"payload"),
+            Poll::Ready(Ok(7))
+        ));
+        assert!(matches!(
+            Pin::new(&mut lazy).poll_write(&mut cx, b"+more"),
+            Poll::Ready(Ok(5))
+        ));
+        assert!(Pin::new(&mut lazy).poll_shutdown(&mut cx).is_ready());
+        drop(lazy);
+        assert_eq!(drain(far).await, b"HEAD|payload+more", "exactly once");
+    }
+
+    #[tokio::test]
+    async fn the_head_does_not_grow_under_an_inner_write_that_is_pending() {
+        let mut cx = Context::from_waker(Waker::noop());
+        let (near, far) = tokio::io::duplex(4096);
+        let mut lazy = LazyHead::with_grace(
+            Box::new(PendingWrites {
+                pipe: near,
+                pending: 1,
+            }),
+            b"HEAD|".to_vec(),
+            Duration::ZERO,
+        );
+        // a flush starts the head on its own; the inner write parks with those 5 bytes
+        assert!(Pin::new(&mut lazy).poll_flush(&mut cx).is_pending());
+        assert!(matches!(
+            Pin::new(&mut lazy).poll_write(&mut cx, b"payload"),
+            Poll::Ready(Ok(7))
+        ));
+        assert!(Pin::new(&mut lazy).poll_shutdown(&mut cx).is_ready());
+        drop(lazy);
+        assert_eq!(drain(far).await, b"HEAD|payload");
     }
 }
