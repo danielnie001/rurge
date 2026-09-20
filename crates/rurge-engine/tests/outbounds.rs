@@ -14,7 +14,8 @@ use rurge_inbound::Running;
 use rurge_net::socket::NoopSocketHook;
 use rurge_net::testing::TestServer;
 use rurge_proto::testing::{
-    FakeHttpProxy, FakeSocks5, FakeTrojan, HttpProxyScript, Socks5Script, TlsFixture, TrojanScript,
+    AnyTlsScript, FakeAnyTls, FakeHttpProxy, FakeSocks5, FakeTrojan, FakeVmess, HttpProxyScript,
+    Socks5Script, TlsFixture, TrojanScript, VmessScript,
 };
 use rurge_rules::{GeoUrls, OutboundMode};
 use std::net::SocketAddr;
@@ -901,6 +902,215 @@ async fn trojan_upstream(ws: bool, to: SocketAddr) -> (FakeTrojan, String) {
     )
 }
 
+const VMESS_ID: &str = "0233d11c-15a4-47d3-ade3-48ffca0ce119";
+
+fn pin_of(fixture: &TlsFixture) -> String {
+    fixture
+        .leaf_fingerprint()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A fake VMess server relaying to `to`, and the parameters that reach it.
+/// The harness trusts the OS roots, so the fixture's leaf is pinned.
+async fn vmess_upstream(tls: bool, ws: bool, to: SocketAddr) -> (FakeVmess, String) {
+    let fixture = TlsFixture::new(&["127.0.0.1"]);
+    let mut params = format!("username={VMESS_ID}, vmess-aead=true");
+    if tls {
+        params += &format!(
+            ", tls=true, server-cert-fingerprint-sha256={}",
+            pin_of(&fixture)
+        );
+    }
+    if ws {
+        params += ", ws=true, ws-path=/v";
+    }
+    let script = VmessScript {
+        ws,
+        connect_to: Some(to),
+        ..VmessScript::new(VMESS_ID)
+    };
+    (
+        FakeVmess::spawn(script, tls.then_some(fixture)).await,
+        params,
+    )
+}
+
+async fn anytls_upstream(to: SocketAddr) -> (FakeAnyTls, String) {
+    let fixture = TlsFixture::new(&["127.0.0.1"]);
+    let params = format!(
+        "password=s3same, server-cert-fingerprint-sha256={}",
+        pin_of(&fixture)
+    );
+    let script = AnyTlsScript {
+        password: "s3same".into(),
+        connect_to: Some(to),
+        ..AnyTlsScript::default()
+    };
+    (FakeAnyTls::spawn(script, fixture).await, params)
+}
+
+#[tokio::test]
+async fn a_connect_leaves_through_a_vmess_upstream_with_the_name_unresolved() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    for (tls, ws) in [(false, false), (true, true)] {
+        let (upstream, params) = vmess_upstream(tls, ws, origin_addr(&origin)).await;
+        let h = harness(Profile {
+            proxies: &format!("V = vmess, 127.0.0.1, {}, {params}", upstream.addr().port()),
+            rules: "DOMAIN,target.test,V",
+            ..Profile::default()
+        })
+        .await;
+        let mut tunnel = connect_via_http(h.http(), "target.test:8080").await;
+        let response = get(&mut tunnel, "target.test", "/hello").await;
+        assert!(
+            response.ends_with("hi there"),
+            "tls={tls} ws={ws}: {response}"
+        );
+        let seen = upstream.requests();
+        let first = seen.first().expect("the upstream never saw a request");
+        assert_eq!(
+            (first.command, first.atyp, first.host.as_str(), first.port),
+            (1, 2, "target.test", 8080),
+            "the server resolves the name: rurge never looked it up"
+        );
+        assert!(h.dns.queries().is_empty(), "rurge never looked the name up");
+        drop(tunnel);
+        let log = h.engine.request_log();
+        wait_until("the session to finish", || !log.recent(10).is_empty()).await;
+        let record = &log.recent(10)[0];
+        assert_eq!(record.policy, ["V"]);
+        assert!(record.error.is_none(), "{:?}", record.error);
+    }
+}
+
+#[tokio::test]
+async fn a_wrong_vmess_id_ends_the_session_with_a_text_that_says_so() {
+    let origin = TestServer::spawn().await;
+    let (upstream, _) = vmess_upstream(false, false, origin_addr(&origin)).await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "V = vmess, 127.0.0.1, {}, username=0233d11c-15a4-47d3-ade3-48ffca0ce118, vmess-aead=true",
+            upstream.addr().port()
+        ),
+        rules: "DOMAIN,target.test,V",
+        ..Profile::default()
+    })
+    .await;
+    // the tunnel comes up: the server only answers a request it accepts
+    let mut tunnel = connect_via_http(h.http(), "target.test:8080").await;
+    tunnel
+        .write_all(b"GET / HTTP/1.1\r\nHost: target.test\r\n\r\n")
+        .await
+        .unwrap();
+    let mut rest = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(10), tunnel.read_to_end(&mut rest))
+        .await
+        .expect("the tunnel closes within the bound");
+    assert_eq!(upstream.rejected(), 1);
+    let log = h.engine.request_log();
+    wait_until("the session to finish", || !log.recent(10).is_empty()).await;
+    let error = log.recent(10)[0].error.clone().unwrap_or_default();
+    assert_eq!(
+        error,
+        "vmess: the server closed the connection without answering"
+    );
+    assert!(!error.contains("0233"));
+}
+
+#[tokio::test]
+async fn an_anytls_upstream_carries_two_requests_over_one_session() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    let (upstream, params) = anytls_upstream(origin_addr(&origin)).await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "A = anytls, 127.0.0.1, {}, {params}",
+            upstream.addr().port()
+        ),
+        rules: "DOMAIN,target.test,A",
+        ..Profile::default()
+    })
+    .await;
+    let log = h.engine.request_log();
+    for round in 1..=2 {
+        let mut tunnel = connect_via_http(h.http(), "target.test:8080").await;
+        let response = get(&mut tunnel, "target.test", "/hello").await;
+        assert!(response.ends_with("hi there"), "{response}");
+        drop(tunnel);
+        // The session's record appears once the relay has let go of the
+        // stream, and by then the AnyTLS session is back in the pool. (Not
+        // the server's FIN count: `get` asks the origin to close, so it is
+        // the server that ends these streams, and a FIN is not answered.)
+        wait_until("the session to finish", || log.recent(10).len() == round).await;
+    }
+    assert_eq!(
+        upstream.sessions(),
+        1,
+        "the second request reused the session"
+    );
+    assert_eq!(
+        upstream.fins(),
+        0,
+        "both streams were ended by the server (the origin was asked to close, so the \
+         server closes first); a peer's cmdFIN is not answered"
+    );
+    let streams = upstream.streams();
+    assert_eq!(
+        streams
+            .iter()
+            .map(|s| (s.sid, s.host.as_str(), s.port))
+            .collect::<Vec<_>>(),
+        [(1, "target.test", 8080), (2, "target.test", 8080)]
+    );
+    assert!(h.dns.queries().is_empty(), "rurge never looked the name up");
+}
+
+#[tokio::test]
+async fn the_new_protocols_work_at_either_end_of_a_chain() {
+    let echo = rurge_proto::testing::echo_server().await;
+    // entry: vmess; exit: anytls, reached by name through the entry
+    let (exit, exit_params) = anytls_upstream(echo).await;
+    let (entry, entry_params) = vmess_upstream(false, false, exit.addr()).await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "Entry = vmess, 127.0.0.1, {}, {entry_params}\nExit = anytls, exit.example, 443, {exit_params}, underlying-proxy=Entry",
+            entry.addr().port()
+        ),
+        rules: "DOMAIN,target.test,Exit",
+        ..Profile::default()
+    })
+    .await;
+    let mut tunnel = connect_via_http(h.http(), "target.test:7").await;
+    echo_through(&mut tunnel, b"vmess then anytls").await;
+    let asked = &entry.requests()[0];
+    assert_eq!(
+        (asked.host.as_str(), asked.port),
+        ("exit.example", 443),
+        "the entry is asked for the exit by name"
+    );
+    assert_eq!(exit.streams()[0].host, "target.test");
+
+    // and the other way round
+    let (exit, exit_params) = vmess_upstream(false, false, echo).await;
+    let (entry, entry_params) = anytls_upstream(exit.addr()).await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "Entry = anytls, 127.0.0.1, {}, {entry_params}\nExit = vmess, exit.example, 443, {exit_params}, underlying-proxy=Entry",
+            entry.addr().port()
+        ),
+        rules: "DOMAIN,target.test,Exit",
+        ..Profile::default()
+    })
+    .await;
+    let mut tunnel = connect_via_http(h.http(), "target.test:7").await;
+    echo_through(&mut tunnel, b"anytls then vmess").await;
+    assert_eq!(entry.streams()[0].host, "exit.example");
+    assert_eq!(exit.requests()[0].host, "target.test");
+}
+
 #[tokio::test]
 async fn a_connect_leaves_through_a_trojan_upstream_with_the_name_unresolved() {
     let origin = TestServer::spawn().await;
@@ -1226,4 +1436,119 @@ async fn a_connector_built_before_a_reload_resolves_through_the_new_generation()
     let asked = |dns: &MockDns| dns.queries().iter().any(|(q, _)| q.name == "proxy.test");
     assert!(asked(&other), "the new generation's resolver was asked");
     assert!(!asked(&h.dns), "the old generation's resolver was not");
+}
+
+fn outbound_now(h: &Harness, name: &str) -> rurge_proto::OutboundRef {
+    h.engine
+        .runtime()
+        .policies
+        .resolve(&rurge_config::rule::PolicyRef::parse(name))
+        .outbound
+}
+
+#[tokio::test]
+async fn an_unrelated_reload_keeps_an_anytls_pool_and_a_change_of_its_own_drops_it() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    let (upstream, params) = anytls_upstream(origin_addr(&origin)).await;
+    let port = upstream.addr().port();
+    let profile = |extra: &str, a_extra: &str| {
+        format!("A = anytls, 127.0.0.1, {port}, {params}{a_extra}\n{extra}")
+    };
+    let h = harness(Profile {
+        proxies: &profile("", ""),
+        rules: "DOMAIN,target.test,A",
+        ..Profile::default()
+    })
+    .await;
+    let request = |h: &Harness| {
+        let http = h.http();
+        async move {
+            let mut tunnel = connect_via_http(http, "target.test:8080").await;
+            let response = get(&mut tunnel, "target.test", "/hello").await;
+            assert!(response.ends_with("hi there"), "{response}");
+        }
+    };
+    let log = h.engine.request_log();
+    request(&h).await;
+    // the record appears once the relay has dropped the stream: the session is pooled
+    wait_until("the first session to finish", || log.recent(10).len() == 1).await;
+    let before = outbound_now(&h, "A");
+
+    // a reload that has nothing to do with A
+    let next = Profile {
+        proxies: &profile("Other = http, other.example, 8080", ""),
+        rules: "DOMAIN,target.test,A",
+        ..Profile::default()
+    }
+    .text(h.dns.addr());
+    h.engine
+        .swap_runtime(runtime(h.dir.path(), &next, h.engine.shared()).await);
+    assert!(
+        Arc::ptr_eq(&before, &outbound_now(&h, "A")),
+        "A was rebuilt"
+    );
+    request(&h).await;
+    wait_until("the second session to finish", || log.recent(10).len() == 2).await;
+    assert_eq!(
+        upstream.sessions(),
+        1,
+        "the idle session survived the reload"
+    );
+
+    // a reload that changes A itself
+    let next = Profile {
+        proxies: &profile("Other = http, other.example, 8080", ", reuse=false"),
+        rules: "DOMAIN,target.test,A",
+        ..Profile::default()
+    }
+    .text(h.dns.addr());
+    h.engine
+        .swap_runtime(runtime(h.dir.path(), &next, h.engine.shared()).await);
+    assert!(!Arc::ptr_eq(&before, &outbound_now(&h, "A")), "A was kept");
+    request(&h).await;
+    assert_eq!(
+        upstream.sessions(),
+        2,
+        "the new outbound dialled for itself"
+    );
+}
+
+#[tokio::test]
+async fn a_reused_outbound_resolves_through_the_new_generation() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(echo),
+        ..Socks5Script::default()
+    })
+    .await;
+    let proxies = format!("S = socks5, proxy.test, {}", upstream.addr().port());
+    let h = harness(Profile {
+        proxies: &proxies,
+        rules: "DOMAIN,target.test,S",
+        ..Profile::default()
+    })
+    .await;
+    h.dns.set("proxy.test", &["127.0.0.1"], &[], 60);
+    let before = outbound_now(&h, "S");
+    let other = MockDns::spawn().await;
+    for name in ["proxy.test", "target.test"] {
+        other.set(name, &["127.0.0.1"], &[], 60);
+    }
+    let next = Profile {
+        proxies: &proxies,
+        rules: "DOMAIN,target.test,S",
+        ..Profile::default()
+    }
+    .text(other.addr());
+    h.engine
+        .swap_runtime(runtime(h.dir.path(), &next, h.engine.shared()).await);
+    assert!(
+        Arc::ptr_eq(&before, &outbound_now(&h, "S")),
+        "only `dns-server` changed"
+    );
+    let mut tunnel = connect_via_http(h.http(), "target.test:7").await;
+    echo_through(&mut tunnel, b"through the reused outbound").await;
+    let asked = |dns: &MockDns| dns.queries().iter().any(|(q, _)| q.name == "proxy.test");
+    assert!(asked(&other) && !asked(&h.dns));
 }

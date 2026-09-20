@@ -3,8 +3,9 @@
 
 use crate::keystore::decode_p12;
 use crate::transport::tls::TlsClient;
-use rurge_config::spec::TlsOpts;
+use rurge_config::spec::{PolicySpec, TlsOpts};
 use rurge_config::{HostName, KeystoreItem};
+use rurge_net::connector::Target;
 use rustls::RootCertStore;
 use std::fmt;
 use std::sync::Arc;
@@ -30,6 +31,18 @@ impl fmt::Display for BuildError {
 }
 
 impl std::error::Error for BuildError {}
+
+/// The proxy server `spec` names. Every protocol that dials a server needs
+/// both halves; a spec without them never came out of `rurge-config`.
+pub fn server_of(spec: &PolicySpec) -> Result<Target, BuildError> {
+    match (&spec.server, spec.port) {
+        (Some(host), Some(port)) => Ok(Target::new(host.clone(), port)),
+        _ => Err(BuildError::new(format!(
+            "a {} policy needs a server and a port",
+            spec.kind.keyword()
+        ))),
+    }
+}
 
 /// The TLS layer of a policy, when it has one. `client-cert` is looked up in
 /// `keystore` and decoded here, so a broken p12 surfaces at build time.
@@ -61,6 +74,24 @@ mod tests {
     use super::*;
     use rurge_config::{KeystoreType, Span};
     use std::path::Path;
+
+    #[test]
+    fn a_spec_without_a_server_is_refused_by_name_of_its_protocol() {
+        use rurge_config::config::{LoadOptions, from_text};
+        let text = "[Proxy]\nT = trojan, proxy.test, 443, password=pw\n[Rule]\nFINAL,DIRECT\n";
+        let loaded = from_text(text, Path::new("t.conf"), &LoadOptions::for_tests());
+        let mut spec = loaded.config.spec("T").expect("a spec").clone();
+        let server = server_of(&spec).unwrap();
+        assert_eq!(
+            (server.host.to_string(), server.port),
+            ("proxy.test".to_string(), 443)
+        );
+        spec.port = None;
+        assert_eq!(
+            server_of(&spec).unwrap_err().message,
+            "a trojan policy needs a server and a port"
+        );
+    }
 
     #[test]
     fn build_errors_are_plain_messages() {

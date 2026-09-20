@@ -82,6 +82,16 @@ fn reject_slot(kind: RejectKind) -> usize {
     }
 }
 
+/// What the session log says about a policy that has no spec. Since M2b a
+/// `vmess` policy of a profile that loaded is only ever without one for a
+/// single reason: the line lacks `vmess-aead=true` (M2 design 4.3).
+fn unsupported_text(kind: PolicyKind) -> String {
+    match kind {
+        PolicyKind::Vmess => "vmess (legacy handshake)".to_string(),
+        other => other.keyword().to_string(),
+    }
+}
+
 fn alias_terminal(kind: PolicyKind) -> Option<Terminal> {
     match kind {
         PolicyKind::Direct => Some(Terminal::Direct),
@@ -322,7 +332,7 @@ impl PolicyRegistry {
             }
             Some(Entry::Unsupported { kind }) => {
                 chain.push(format!("!unsupported:{}", kind.keyword()));
-                self.rejected(chain, Some(Note::Unsupported(kind.keyword().to_string())))
+                self.rejected(chain, Some(Note::Unsupported(unsupported_text(*kind))))
             }
             Some(Entry::Group { .. }) => match self.current_member(name) {
                 Some(member) => match PolicyRef::parse(&member) {
@@ -521,6 +531,22 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
             chain(&reg.resolve(&PolicyRef::parse("Auto"))),
             vec!["Auto", "HK", "!unsupported:ss", "REJECT"]
         );
+    }
+
+    #[test]
+    fn a_legacy_vmess_policy_says_why_it_rejects() {
+        let text = "[Proxy]\nOld = vmess, a.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\n\
+SS = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Rule]\nFINAL,DIRECT\n";
+        let registry = generation(text, &FakeFactory::new(), None);
+        let old = registry.resolve(&PolicyRef::parse("Old"));
+        assert_eq!(old.terminal, TerminalKind::Reject);
+        assert_eq!(
+            old.note,
+            Some(Note::Unsupported("vmess (legacy handshake)".into()))
+        );
+        assert_eq!(chain(&old), ["Old", "!unsupported:vmess", "REJECT"]);
+        let ss = registry.resolve(&PolicyRef::parse("SS"));
+        assert_eq!(ss.note, Some(Note::Unsupported("ss".into())));
     }
 
     #[test]

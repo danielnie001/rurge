@@ -866,6 +866,7 @@ fn validate(config: &mut Config, opts: &LoadOptions, diags: &mut Diagnostics) {
         let mut specs = Vec::new();
         let mut inert_seen: HashSet<&'static str> = HashSet::new();
         let mut ios_seen: HashSet<&'static str> = HashSet::new();
+        let mut legacy_seen = false;
         for p in &cfg.policies {
             let outcome = to_spec(p, &env);
             for d in outcome.diagnostics {
@@ -892,6 +893,16 @@ fn validate(config: &mut Config, opts: &LoadOptions, diags: &mut Diagnostics) {
                         .at(p.span.clone()),
                     );
                 }
+            }
+            if outcome.legacy_vmess && !legacy_seen {
+                legacy_seen = true;
+                diags.push(
+                    Diagnostic::warning(
+                        codes::W_PROTOCOL_NOT_IMPLEMENTED,
+                        "`vmess` without `vmess-aead=true` uses the legacy handshake, which is not implemented yet".to_string(),
+                    )
+                    .at(p.span.clone()),
+                );
             }
             specs.extend(outcome.spec);
         }
@@ -1213,6 +1224,29 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn legacy_vmess_lines_are_reported_once_per_load() {
+        let id = "0233d11c-15a4-47d3-ade3-48ffca0ce119";
+        let text = format!(
+            "[Proxy]\nOld1 = vmess, a.test, 443, username={id}\nOld2 = vmess, b.test, 443, username={id}\n\
+New = vmess, c.test, 443, username={id}, vmess-aead=true\n[Rule]\nFINAL,DIRECT\n"
+        );
+        let loaded = from_text(&text, Path::new("t.conf"), &LoadOptions::for_tests());
+        let legacy: Vec<&Diagnostic> = loaded
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::W_PROTOCOL_NOT_IMPLEMENTED)
+            .collect();
+        assert_eq!(legacy.len(), 1, "{legacy:?}");
+        assert_eq!(
+            legacy[0].message,
+            "`vmess` without `vmess-aead=true` uses the legacy handshake, which is not implemented yet"
+        );
+        assert_eq!(legacy[0].span.as_ref().map(|s| s.line), Some(2));
+        assert!(loaded.config.spec("New").is_some());
+        assert!(loaded.config.spec("Old1").is_none() && loaded.config.spec("Old2").is_none());
     }
 
     #[test]

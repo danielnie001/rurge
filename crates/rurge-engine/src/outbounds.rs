@@ -6,12 +6,15 @@ use rurge_config::diagnostic::codes;
 use rurge_config::spec::{CommonOpts, PolicySpec, ProtoSpec};
 use rurge_config::{Config, Diagnostic, Diagnostics, KeystoreItem};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{Connector, DirectConnector, Resolve, Target};
+use rurge_net::connector::{Connector, DirectConnector, Resolve};
 use rurge_net::socket::{NoopSocketHook, SocketHook, SocketOpts};
 use rurge_policy::{BuildError, OutboundFactory};
+use rurge_proto::anytls::AnyTlsOutbound;
+use rurge_proto::build::server_of;
 use rurge_proto::http::HttpOutbound;
 use rurge_proto::socks5::Socks5Outbound;
 use rurge_proto::trojan::TrojanOutbound;
+use rurge_proto::vmess::VmessOutbound;
 use rurge_proto::{Direct, OutboundRef};
 use rustls::RootCertStore;
 use std::io;
@@ -141,19 +144,30 @@ impl OutboundFactory for EngineFactory {
                 self.roots.clone(),
                 connector,
             )?),
-            ProtoSpec::Trojan(trojan) => {
-                let (Some(host), Some(port)) = (&spec.server, spec.port) else {
-                    return Err(BuildError::new("a trojan policy needs a server and a port"));
-                };
-                Arc::new(TrojanOutbound::new(
-                    &spec.name,
-                    Target::new(host.clone(), port),
-                    trojan,
-                    &self.keystore,
-                    self.roots.clone(),
-                    connector,
-                )?)
-            }
+            ProtoSpec::Trojan(trojan) => Arc::new(TrojanOutbound::new(
+                &spec.name,
+                server_of(spec)?,
+                trojan,
+                &self.keystore,
+                self.roots.clone(),
+                connector,
+            )?),
+            ProtoSpec::Vmess(vmess) => Arc::new(VmessOutbound::new(
+                &spec.name,
+                server_of(spec)?,
+                vmess,
+                &self.keystore,
+                self.roots.clone(),
+                connector,
+            )?),
+            ProtoSpec::AnyTls(anytls) => Arc::new(AnyTlsOutbound::new(
+                &spec.name,
+                server_of(spec)?,
+                anytls,
+                &self.keystore,
+                self.roots.clone(),
+                connector,
+            )?),
         };
         if !self.dry && skips_verification(spec) {
             tracing::warn!(
@@ -241,6 +255,8 @@ mod tests {
             "[Proxy]\nH = http, proxy.test, 8080, alice, s3cret\nHS = https, proxy.test, 443, sni=edge.test\n\
 S = socks5, proxy.test, 1080\nST = socks5-tls, proxy.test, 1443, skip-cert-verify=true\n\
 T = trojan, proxy.test, 443, password=pw, ws=true, ws-path=/x\n\
+V = vmess, proxy.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119, vmess-aead=true, tls=true, ws=true\n\
+A = anytls, proxy.test, 443, password=pw\n\
 Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule]\nFINAL,DIRECT\n",
         );
         let f = factory(&cfg);
@@ -250,6 +266,8 @@ Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule
             ("S", "S"),
             ("ST", "ST"),
             ("T", "T"),
+            ("V", "V"),
+            ("A", "A"),
             ("Corp", "DIRECT"),
         ] {
             let spec = cfg
@@ -269,6 +287,50 @@ Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule
             e.message,
             "policy `Block` is a reject alias and has no outbound of its own"
         );
+    }
+
+    #[test]
+    fn a_vmess_or_anytls_policy_that_cannot_be_built_is_a_load_error() {
+        let cfg = config(
+            "[Proxy]\nV = vmess, proxy.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119, vmess-aead=true, tls=true, client-cert=cert1\n\
+A = anytls, proxy.test, 443, password=s3same0pen, client-cert=cert1\n\
+[Keystore]\ncert1 = type=p12, base64=QUJD, password=hunter2\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let diags = dry_build(&cfg).sorted();
+        let messages: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(messages[0].starts_with("policy `V` cannot be built: keystore item `cert1`"));
+        assert!(messages[1].starts_with("policy `A` cannot be built: keystore item `cert1`"));
+        for m in &messages {
+            assert!(
+                !m.contains("hunter2") && !m.contains("s3same0pen") && !m.contains("0233d11c"),
+                "{m}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dry_build_of_an_anytls_policy_leaves_no_task_behind() {
+        // no tokio runtime here: spawning anything at build time would panic
+        let cfg =
+            config("[Proxy]\nA = anytls, proxy.test, 443, password=pw\n[Rule]\nFINAL,DIRECT\n");
+        assert!(dry_build(&cfg).is_empty());
+    }
+
+    #[test]
+    fn skip_cert_verify_is_noticed_on_the_new_protocols_too() {
+        let cfg = config(
+            "[Proxy]\nA = anytls, proxy.test, 443, password=pw, skip-cert-verify=true\n\
+V = vmess, proxy.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119, vmess-aead=true, tls=true, skip-cert-verify=true\n\
+Plain = vmess, proxy.test, 80, username=0233d11c-15a4-47d3-ade3-48ffca0ce119, vmess-aead=true\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let flagged: Vec<&str> = cfg
+            .specs
+            .iter()
+            .filter(|s| skips_verification(s))
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(flagged, ["A", "V"]);
     }
 
     #[test]

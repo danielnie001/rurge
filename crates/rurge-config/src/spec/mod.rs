@@ -49,6 +49,8 @@ pub enum ProtoSpec {
     Http(HttpSpec),
     Socks5(Socks5Spec),
     Trojan(TrojanSpec),
+    Vmess(VmessSpec),
+    AnyTls(AnyTlsSpec),
 }
 
 impl ProtoSpec {
@@ -58,6 +60,8 @@ impl ProtoSpec {
             ProtoSpec::Http(http) => http.tls.as_ref(),
             ProtoSpec::Socks5(socks) => socks.tls.as_ref(),
             ProtoSpec::Trojan(trojan) => Some(&trojan.tls),
+            ProtoSpec::Vmess(vmess) => vmess.tls.as_ref(),
+            ProtoSpec::AnyTls(anytls) => Some(&anytls.tls),
             ProtoSpec::Direct | ProtoSpec::Reject(_) => None,
         }
     }
@@ -84,6 +88,10 @@ pub struct SpecOutcome {
     pub inert: Vec<&'static str>,
     /// iOS-only parameters present on the line (`W0004`, once per load).
     pub ios_only: Vec<&'static str>,
+    /// A `vmess` line without `vmess-aead=true`: valid, but it asks for the
+    /// legacy handshake, so it has no spec. The caller reports it once per
+    /// load (`W0007`, M2 design 4.3).
+    pub legacy_vmess: bool,
 }
 
 /// Named `username=` / `password=` win over the positional pair.
@@ -117,6 +125,7 @@ fn check_underlying(r: &mut ParamReader<'_>, common: &mut CommonOpts, env: &Spec
 pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     let mut r = ParamReader::new(policy);
     let mut notes = Notes::default();
+    let mut legacy_vmess = false;
     let (mut common, proto) = match policy.kind {
         PolicyKind::Direct => {
             let common = read_common(&mut r, Applies::Direct, &mut notes);
@@ -213,6 +222,20 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             let trojan = trojan::read_trojan(&mut r, env.keystore);
             (common, ProtoSpec::Trojan(trojan))
         }
+        PolicyKind::Vmess => {
+            let common = read_common(&mut r, Applies::Proxy, &mut notes);
+            tls::note_shadow_tls(&mut r, &mut notes);
+            let read = vmess::read_vmess(&mut r, env.keystore);
+            // the rest of the line is still checked; it just has no spec
+            legacy_vmess = !read.aead;
+            (common, ProtoSpec::Vmess(read.spec))
+        }
+        PolicyKind::AnyTls => {
+            let common = read_common(&mut r, Applies::Proxy, &mut notes);
+            tls::note_shadow_tls(&mut r, &mut notes);
+            let anytls = anytls::read_anytls(&mut r, env.keystore);
+            (common, ProtoSpec::AnyTls(anytls))
+        }
         _ => return SpecOutcome::default(),
     };
     if !matches!(proto, ProtoSpec::Direct | ProtoSpec::Reject(_)) {
@@ -233,7 +256,7 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     }
     let failed = r.has_errors();
     let diagnostics = r.finish();
-    let spec = (!failed).then(|| PolicySpec {
+    let spec = (!failed && !legacy_vmess).then(|| PolicySpec {
         name: policy.name.clone(),
         kind: policy.kind,
         server: policy.server.clone(),
@@ -247,6 +270,7 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
         diagnostics,
         inert: notes.inert,
         ios_only: notes.ios_only,
+        legacy_vmess: legacy_vmess && !failed,
     }
 }
 
@@ -479,5 +503,44 @@ mod tests {
             "{:?}",
             o.diagnostics
         );
+    }
+
+    #[test]
+    fn vmess_and_anytls_lines_become_specs() {
+        let id = "0233d11c-15a4-47d3-ade3-48ffca0ce119";
+        let o = outcome(
+            "V",
+            &format!("vmess, h.test, 443, username={id}, vmess-aead=true, tls=true"),
+        );
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert!(!o.legacy_vmess);
+        let spec = o.spec.expect("a spec");
+        let ProtoSpec::Vmess(vmess) = &spec.proto else {
+            panic!("not vmess: {:?}", spec.proto);
+        };
+        assert!(vmess.tls.is_some() && spec.proto.tls().is_some());
+        let o = outcome("A", "anytls, h.test, 443, password=pw, reuse=false");
+        let spec = o.spec.expect("a spec");
+        let ProtoSpec::AnyTls(anytls) = &spec.proto else {
+            panic!("not anytls: {:?}", spec.proto);
+        };
+        assert!(!anytls.reuse && spec.proto.tls().is_some());
+    }
+
+    #[test]
+    fn a_vmess_line_without_the_aead_handshake_has_no_spec() {
+        let id = "0233d11c-15a4-47d3-ade3-48ffca0ce119";
+        let o = outcome("V", &format!("vmess, h.test, 443, username={id}, ws=true"));
+        assert!(o.spec.is_none());
+        assert!(o.legacy_vmess);
+        assert!(
+            o.diagnostics.is_empty(),
+            "the loader reports it, once: {:?}",
+            o.diagnostics
+        );
+        // a broken legacy line is an error like any other, and not "legacy"
+        let o = outcome("V", "vmess, h.test, 443, username=nope");
+        assert!(o.spec.is_none() && !o.legacy_vmess);
+        assert_eq!(o.diagnostics.len(), 1);
     }
 }
