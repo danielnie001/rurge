@@ -918,20 +918,16 @@ async fn a_connect_leaves_through_a_trojan_upstream_with_the_name_unresolved() {
     let mut tunnel = connect_via_http(h.http(), "target.test:8080").await;
     let response = get(&mut tunnel, "target.test", "/hello").await;
     assert!(response.ends_with("hi there"), "{response}");
+    // whether the head rode with the first payload depends on timing here
+    // (`HEAD_GRACE`); `LazyHead`'s own tests pin that deterministically
     let seen = upstream.requests();
+    let first = seen.first().expect("the upstream never saw a request");
     assert_eq!(
-        (
-            seen[0].command,
-            seen[0].atyp,
-            seen[0].host.as_str(),
-            seen[0].port
-        ),
+        (first.command, first.atyp, first.host.as_str(), first.port),
         (1, 3, "target.test", 8080),
         "the server resolves the name: rurge never looked it up"
     );
-    // whether the head rode with the first payload depends on timing here
-    // (`HEAD_GRACE`); `LazyHead`'s own tests pin that deterministically
-    assert!(h.dns.queries().is_empty());
+    assert!(h.dns.queries().is_empty(), "rurge never looked the name up");
     drop(tunnel);
     let log = h.engine.request_log();
     wait_until("the session to finish", || !log.recent(10).is_empty()).await;
@@ -964,8 +960,11 @@ async fn a_plain_request_is_tunnelled_through_trojan_over_websocket() {
     .await;
     assert!(response.ends_with("hi there"), "{response}");
     let ws = upstream.ws_seen();
+    let first = ws
+        .first()
+        .expect("the upstream never saw a websocket handshake");
     assert_eq!(
-        (ws[0].path.as_str(), ws[0].header("host")),
+        (first.path.as_str(), first.header("host")),
         ("/tunnel", Some("edge.test"))
     );
     assert_eq!(upstream.requests()[0].host, "target.test");
@@ -998,14 +997,136 @@ async fn a_trojan_exit_is_reached_through_a_socks5_entry_by_name() {
             .ends_with("hi there")
     );
     // the entry is asked for the exit's server by name; the exit for the target by name
-    let first = &entry.requests()[0];
+    let entry_seen = entry.requests();
+    let first = entry_seen.first().expect("the entry never saw a request");
     assert_eq!(
         (first.atyp, first.host.as_str(), first.port),
         (3, "exit.example", 443)
     );
-    assert_eq!(exit.requests()[0].host, "target.test");
+    let exit_seen = exit.requests();
+    let exit_first = exit_seen.first().expect("the exit never saw a request");
+    assert_eq!(exit_first.host, "target.test");
     assert!(
         h.dns.queries().is_empty(),
         "nothing on this path is resolved locally"
+    );
+}
+
+/// Sends `payload` through `tunnel` and expects it back (the far end echoes).
+async fn echo_through(tunnel: &mut TcpStream, payload: &[u8]) {
+    tunnel.write_all(payload).await.unwrap();
+    let mut back = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(5), tunnel.read_exact(&mut back))
+        .await
+        .expect("the echo comes back")
+        .unwrap();
+    assert_eq!(back, payload);
+}
+
+#[tokio::test]
+async fn a_reload_leaves_a_chained_session_alone_and_moves_the_next_one() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let exit = FakeHttpProxy::spawn(HttpProxyScript {
+        connect_to: Some(echo),
+        ..HttpProxyScript::default()
+    })
+    .await;
+    let entry = |to: SocketAddr| Socks5Script {
+        connect_to: Some(to),
+        ..Socks5Script::default()
+    };
+    let entry_a = FakeSocks5::spawn(entry(exit.addr())).await;
+    let entry_b = FakeSocks5::spawn(entry(exit.addr())).await;
+    let proxies = |under: &str| {
+        format!(
+            "EntryA = socks5, 127.0.0.1, {}\nEntryB = socks5, 127.0.0.1, {}\nExit = http, exit.example, 8080, underlying-proxy={under}",
+            entry_a.addr().port(),
+            entry_b.addr().port()
+        )
+    };
+    let h = harness(Profile {
+        proxies: &proxies("EntryA"),
+        rules: "DOMAIN,target.test,Exit",
+        ..Profile::default()
+    })
+    .await;
+    let mut first = connect_via_http(h.http(), "target.test:7").await;
+    echo_through(&mut first, b"before the reload").await;
+
+    // the next generation enters the chain somewhere else
+    let next = Profile {
+        proxies: &proxies("EntryB"),
+        rules: "DOMAIN,target.test,Exit",
+        ..Profile::default()
+    }
+    .text(h.dns.addr());
+    let next = runtime(h.dir.path(), &next, h.engine.shared()).await;
+    h.engine.swap_runtime(next);
+
+    // the session in flight keeps the outbound — and the chain — it was dialled with
+    echo_through(&mut first, b"after the reload").await;
+    let mut second = connect_via_http(h.http(), "target.test:7").await;
+    echo_through(&mut second, b"a new session").await;
+    assert_eq!(
+        (entry_a.requests().len(), entry_b.requests().len()),
+        (1, 1),
+        "the old session stayed on EntryA; the new one went through EntryB"
+    );
+}
+
+#[tokio::test]
+async fn a_selection_whose_member_is_gone_falls_back_to_the_first_member() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let upstream = |to: SocketAddr| Socks5Script {
+        connect_to: Some(to),
+        ..Socks5Script::default()
+    };
+    let a = FakeSocks5::spawn(upstream(echo)).await;
+    let b = FakeSocks5::spawn(upstream(echo)).await;
+    let c = FakeSocks5::spawn(upstream(echo)).await;
+    let line = |name: &str, fake: &FakeSocks5| {
+        format!("{name} = socks5, 127.0.0.1, {}", fake.addr().port())
+    };
+    let h = harness(Profile {
+        proxies: &format!("{}\n{}", line("A", &a), line("B", &b)),
+        groups: "Pick = select, A, B",
+        rules: "DOMAIN,target.test,Pick",
+        ..Profile::default()
+    })
+    .await;
+    h.engine.shared().selections.set("Pick", "B");
+    let mut t = connect_via_http(h.http(), "target.test:7").await;
+    echo_through(&mut t, b"via B").await;
+    assert_eq!((a.requests().len(), b.requests().len()), (0, 1));
+
+    // B leaves the profile; the saved selection now names nobody
+    let next = Profile {
+        proxies: &format!("{}\n{}", line("A", &a), line("C", &c)),
+        groups: "Pick = select, A, C",
+        rules: "DOMAIN,target.test,Pick",
+        ..Profile::default()
+    }
+    .text(h.dns.addr());
+    let next = runtime(h.dir.path(), &next, h.engine.shared()).await;
+    h.engine.swap_runtime(next);
+    let mut t = connect_via_http(h.http(), "target.test:7").await;
+    echo_through(&mut t, b"via the first member").await;
+    assert_eq!(
+        (a.requests().len(), c.requests().len()),
+        (1, 0),
+        "a stale selection means the first member"
+    );
+    // the table is not rewritten behind the user's back: if B comes back, so does the choice
+    assert_eq!(
+        h.engine.shared().selections.get("Pick").as_deref(),
+        Some("B")
+    );
+    assert_eq!(
+        h.engine
+            .runtime()
+            .policies
+            .current_member("Pick")
+            .as_deref(),
+        Some("A")
     );
 }
