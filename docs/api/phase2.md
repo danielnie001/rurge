@@ -74,7 +74,7 @@ trojan、vmess（± WebSocket）与 anytls 出站失败时，会话记录的 `er
 | `anytls: the host name cannot be sent to the server` | 目标主机名转不成可发送的形式；连接不会被拨出 |
 | `anytls: the host name is longer than 255 bytes` | 目标主机名（转换后）超出 AnyTLS 地址编码一字节长度所能表示的范围；连接不会被拨出 |
 
-`anytls: <文本>` 与 `anytls: the server sent an alert: <文本>` 里的 `<文本>` 来自服务端，已去除控制字符且截到 256 个字符。`anytls` 的口令错误没有专门的错误文本：服务端把认证失败的连接当普通网站处理并直接关闭，这条连接因此按上表第一条 `anytls: the session is closed` 失败，与会话因其它原因整体关闭时表现相同（见 `docs/surge-compatibility-matrix.md` 4.2 `anytls` 行）。
+`anytls: <文本>` 与 `anytls: the server sent an alert: <文本>` 里的 `<文本>` 来自服务端，已去除控制字符且截到 256 个字符。`anytls` 的口令错误没有专门的错误文本：服务端把认证失败的连接当普通网站处理并直接关闭，这条连接因此按上表第一条 `anytls: the session is closed` 失败，与会话因其它原因整体关闭时表现相同（见 `docs/surge-compatibility-matrix.md` 4.2 `anytls` 行）。连接超时覆盖 TCP 连接、TLS 握手、鉴权写出与首个会话层包（`cmdSettings ‖ cmdSYN ‖ cmdPSH`）的**入队**；该包由会话自己的后台任务物理写出，服务端的 `cmdSYNACK` 不被等待，这之后的卡顿由转发阶段的空闲超时兜底。
 
 ### WebSocket（trojan、vmess 共用）
 

@@ -331,7 +331,7 @@
 | `tuic` / `tuic-v5` | TUIC v4（token）/ v5（uuid + password） | 全部 | ✅ | 2 | |
 | `hysteria2` | Hysteria 2 | iOS 5.8 / Mac 5.4+ | ✅ | 2 | Salamander 混淆 ✅；Gecko 混淆 ❓ |
 | `masque` | MASQUE（HTTP/3 CONNECT + CONNECT-UDP，RFC 9298 / 9297） | iOS 5.22 / Mac 6.9+ | ✅ | 2 | |
-| `anytls` | AnyTLS v2 | iOS 5.17 / Mac 6.4.3+ | ✅ | 2 | M2b（阶段 2）已实现（TCP）：一条会话同一时刻只承载一个流（与参考实现一致）；空闲超过 60 秒的会话每 30 秒回收一次；不等 `cmdSYNACK` 就返回流，被拒的流在第一次读上以 `anytls: <服务端文本>` 失败；**没有半关闭**：客户端方向的 EOF 以 `cmdFIN` 结束整条流（与 sing-box 一致）；不实现参考客户端的 3 秒 SYNACK 看门狗；服务端推送的 padding 方案做有界校验（原文 ≤ 8192 字节、`stop` ≤ 256、每包 ≤ 64 项、每项 1 ..= 16384），不合法就保留旧方案；`password` 只接受命名写法；默认不带 ALPN（未与真实 Surge 核对）；UDP（udp-over-tcp v2）属 M5 |
+| `anytls` | AnyTLS v2 | iOS 5.17 / Mac 6.4.3+ | ✅ | 2 | M2b（阶段 2）已实现（TCP）：一条会话同一时刻只承载一个流（与参考实现一致）；空闲超过 60 秒的会话每 30 秒回收一次；不等 `cmdSYNACK` 就返回流，被拒的流在第一次读上以 `anytls: <服务端文本>` 失败；连接超时只约束到 TCP 连接、TLS 握手、鉴权写出与首个会话层包（`cmdSettings ‖ cmdSYN ‖ cmdPSH`）**入队**为止，该包的物理写出由会话自己的任务完成，此后的卡顿由转发阶段的空闲超时兜底；**没有半关闭**：客户端方向的 EOF 以 `cmdFIN` 结束整条流（与 sing-box 一致）；不实现参考客户端的 3 秒 SYNACK 看门狗；服务端推送的 padding 方案做有界校验（原文 ≤ 8192 字节、`stop` ≤ 256、每包 ≤ 64 项、每项 1 ..= 16384），不合法就保留旧方案；`password` 只接受命名写法；默认不带 ALPN（未与真实 Surge 核对）；UDP（udp-over-tcp v2）属 M5 |
 | `trust-tunnel` | Trust Tunnel（AdGuard，HTTP/2 或 HTTP/3） | Mac 6.4.4+ | ✅ | 2 | |
 | `ssh` | SSH 动态转发 | 全部 | ✅ | 2 | |
 | `wireguard` | WireGuard L3 隧道作为策略 | 全部 | ✅ | 2 | |
