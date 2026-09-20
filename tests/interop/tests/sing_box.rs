@@ -54,14 +54,26 @@ fn target(addr: SocketAddr) -> Target {
     Target::new(rurge_config::HostName::Ip(addr.ip()), addr.port())
 }
 
+/// Every step is bounded: nobody runs these locally, and on CI an unbounded
+/// read turns a regression into a hung job instead of a failed one.
 async fn roundtrip(out: &OutboundRef, echo: SocketAddr) {
-    let mut stream = out
-        .connect_tcp(&target(echo), &ConnectOpts::default())
+    let bound = std::time::Duration::from_secs(10);
+    let mut stream = tokio::time::timeout(
+        bound,
+        out.connect_tcp(&target(echo), &ConnectOpts::default()),
+    )
+    .await
+    .expect("the tunnel is established within the bound")
+    .expect("the tunnel is established");
+    tokio::time::timeout(bound, stream.write_all(b"interop"))
         .await
-        .expect("the tunnel is established");
-    stream.write_all(b"interop").await.unwrap();
+        .expect("the write reaches sing-box within the bound")
+        .unwrap();
     let mut buf = [0u8; 7];
-    stream.read_exact(&mut buf).await.unwrap();
+    tokio::time::timeout(bound, stream.read_exact(&mut buf))
+        .await
+        .expect("the echo comes back within the bound")
+        .unwrap();
     assert_eq!(&buf, b"interop");
 }
 

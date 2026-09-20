@@ -1,9 +1,9 @@
 //! The relay: a cancellable, idle-timed, byte-counting bidirectional copy
 //! (M3 design §7.3). Each direction runs as its own future so a stalled write
 //! on one side never blocks the other (no head-of-line blocking), and every
-//! read and every write races against a stop token so `kill`, graceful
-//! shutdown and the idle timeout all end a stuck session promptly. Replaces
-//! M3a's `copy_bidirectional`.
+//! wait — the read, the write and the half-close that follows EOF — races
+//! against a stop token so `kill`, graceful shutdown and the idle timeout all
+//! end a stuck session promptly. Replaces M3a's `copy_bidirectional`.
 
 use rurge_config::rule::ProtocolKind;
 use rurge_inbound::{SessionHandle, SessionOutcome};
@@ -150,7 +150,16 @@ where
             r = reader.read(&mut buf) => r?,
         };
         if n == 0 {
-            let _ = writer.shutdown().await; // TCP FIN: does not wait on the peer
+            // Half-close. A TCP writer sends a FIN and cannot block, but a TLS /
+            // WebSocket writer has to push a close_notify / Close frame (and a
+            // `LazyHead` may still owe its head) through a socket the peer may
+            // have stopped reading: this wait races `stop` like every other one
+            // here.
+            tokio::select! {
+                biased;
+                _ = &mut cancelled => {}
+                _ = writer.shutdown() => {}
+            }
             return Ok(());
         }
         if let Some(f) = first.take() {
@@ -295,5 +304,73 @@ mod tests {
             .expect("pump did not stop after kill")
             .unwrap();
         assert_eq!(h.outcome(), Some(SessionOutcome::Failed("killed".into())));
+    }
+
+    /// A writer that takes everything but never finishes its shutdown: the
+    /// shape of a TLS / WebSocket writer that owes the peer a close_notify /
+    /// Close frame the peer never reads. `entered` fires on the first
+    /// `poll_shutdown`, so the test needs no sleep to know it is parked.
+    struct ShutdownParks {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    impl AsyncWrite for ShutdownParks {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            data: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Ok(data.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            self.entered.notify_one();
+            std::task::Poll::Pending // and never wakes
+        }
+    }
+
+    /// Regression test: the half-close after EOF used to be the one wait that
+    /// raced nothing, so a writer whose shutdown blocks (TLS close_notify, a
+    /// WebSocket Close frame, a `LazyHead` that still owes its head) parked
+    /// the direction forever — kill, graceful shutdown and the idle watchdog
+    /// all cancel `stop`, but nobody was listening.
+    #[tokio::test]
+    async fn cancelling_stop_interrupts_a_half_close_that_never_completes() {
+        let stop = CancellationToken::new();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let writer = ShutdownParks {
+            entered: entered.clone(),
+        };
+        let reader: &[u8] = &[]; // EOF on the first read
+        let half = tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                copy_half(
+                    reader,
+                    writer,
+                    stop,
+                    Arc::new(AtomicU64::new(0)),
+                    Instant::now(),
+                    |_| {},
+                    None,
+                )
+                .await
+            }
+        });
+        entered.notified().await; // the shutdown is parked
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(5), half)
+            .await
+            .expect("a cancelled stop token ends the half-close")
+            .unwrap()
+            .unwrap();
     }
 }

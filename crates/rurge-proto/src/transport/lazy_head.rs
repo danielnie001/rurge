@@ -204,8 +204,9 @@ mod tests {
             rd.read_exact(&mut banner).await.unwrap();
             (rd, banner)
         });
-        // lets the reader park itself first; whichever half runs first, the
-        // result below must be the same
+        // not a synchronisation: this only biases the interleaving towards
+        // "the reader parked first", the case worth exercising. Whichever
+        // half runs first, every assertion below holds.
         tokio::time::sleep(Duration::from_millis(20)).await;
         wr.write_all(b"payload").await.unwrap();
         let (rd, banner) = tokio::time::timeout(Duration::from_secs(5), reader)

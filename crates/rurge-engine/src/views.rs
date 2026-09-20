@@ -261,5 +261,16 @@ mod tests {
             member_view(&trojan, "A").line_hash,
             member_view(&without_ws, "A").line_hash
         );
+
+        // a password containing a comma has to be quoted: nothing of it may
+        // reach the hash, tail included
+        let quoted = config("A = trojan, t.test, 443, password=\"pw0rd,x\", ws=true");
+        let same_but_quoted_password =
+            config("A = trojan, t.test, 443, password=\"other,y\", ws=true");
+        assert_eq!(
+            member_view(&quoted, "A").line_hash,
+            member_view(&same_but_quoted_password, "A").line_hash,
+            "a quoted password must not change the hash either"
+        );
     }
 }

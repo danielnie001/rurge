@@ -1012,6 +1012,52 @@ async fn a_trojan_exit_is_reached_through_a_socks5_entry_by_name() {
     );
 }
 
+/// The mirror image: trojan is the ENTRY, and the hop above it runs its own
+/// handshake on top of the entry's `LazyHead` (M2a acceptance item 4).
+#[tokio::test]
+async fn a_socks5_exit_is_reached_through_a_trojan_entry() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    let exit = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let (entry, params) = trojan_upstream(false, exit.addr()).await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "Entry = trojan, 127.0.0.1, {}, {params}\nExit = socks5, exit.example, 1080, underlying-proxy=Entry",
+            entry.addr().port()
+        ),
+        rules: "DOMAIN,target.test,Exit",
+        ..Profile::default()
+    })
+    .await;
+    let mut tunnel = connect_via_http(h.http(), "target.test:8080").await;
+    assert!(
+        get(&mut tunnel, "target.test", "/hello")
+            .await
+            .ends_with("hi there")
+    );
+    // the entry is asked for the exit's server by name; the exit for the target by name
+    let entry_seen = entry.requests();
+    let first = entry_seen.first().expect("the entry never saw a request");
+    assert_eq!(
+        (first.atyp, first.host.as_str(), first.port),
+        (3, "exit.example", 1080)
+    );
+    let exit_seen = exit.requests();
+    let exit_first = exit_seen.first().expect("the exit never saw a request");
+    assert_eq!(
+        (exit_first.atyp, exit_first.host.as_str(), exit_first.port),
+        (3, "target.test", 8080)
+    );
+    assert!(
+        h.dns.queries().is_empty(),
+        "nothing on this path is resolved locally"
+    );
+}
+
 /// Sends `payload` through `tunnel` and expects it back (the far end echoes).
 async fn echo_through(tunnel: &mut TcpStream, payload: &[u8]) {
     tunnel.write_all(payload).await.unwrap();

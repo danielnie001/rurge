@@ -37,9 +37,29 @@ const KEY_AT_KEYS: [&str; 4] = [
     "http-listen",
     "socks5-listen",
 ];
-/// Policy types where Surge passes credentials positionally (`type, host,
-/// port, username, password`) instead of as `password=...`.
-const POSITIONAL_CRED_TYPES: [&str; 4] = ["http", "https", "socks5", "socks5-tls"];
+/// Policy types written `type, server, port, ...`. Surge documents positional
+/// credentials (`username, password`) for the four classic ones; for the rest
+/// a positional value from index 3 on is never meaningful — it is a stray
+/// token (`W0001`), often a password written the way another type takes it —
+/// and over-redacting is this module's stated bias.
+const SERVER_PROXY_TYPES: [&str; 16] = [
+    "http",
+    "https",
+    "h2-connect",
+    "socks5",
+    "socks5-tls",
+    "ss",
+    "snell",
+    "vmess",
+    "trojan",
+    "tuic",
+    "tuic-v5",
+    "hysteria2",
+    "masque",
+    "anytls",
+    "trust-tunnel",
+    "ssh",
+];
 
 pub fn redact_profile(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -94,12 +114,13 @@ fn redact_body(line: &str) -> String {
     }
     // policy lines: `name = type, host, port, password=..., psk=...`, or
     // `name = http/https/socks5/socks5-tls, host, port, username, password`
-    // (those types carry credentials positionally, not as `password=...`).
+    // (those types carry credentials positionally; on every other type that
+    // takes a server and a port a positional value is blanked all the same).
     format!("{key}={}", redact_definition(value))
 }
 
 /// A policy definition (the text right of `name =`) with its secrets blanked:
-/// positional credentials of `http` / `https` / `socks5` / `socks5-tls`, and
+/// the positional values of every type that takes a server and a port, and
 /// every secret `name=value` parameter.
 pub fn redact_definition(definition: &str) -> String {
     let mut redacted = redact_positional_credentials(definition);
@@ -109,19 +130,19 @@ pub fn redact_definition(definition: &str) -> String {
     redacted
 }
 
-/// For `http` / `https` / `socks5` / `socks5-tls` policy lines, blanks every
-/// positional token from index 3 onward (0 = type, 1 = host, 2 = port) — that
-/// is where Surge puts `username, password`. A token counts as a named
-/// parameter (and is kept) only when what follows its first `=` is non-empty
-/// and not made only of `=`, so base64 padding (`aHVudGVyMg==`) is redacted
-/// while `tfo=true` survives; `sni=` with an empty value is over-redacted.
-/// Any other line is returned unchanged.
+/// For a `SERVER_PROXY_TYPES` policy line, blanks every positional token from
+/// index 3 onward (0 = type, 1 = host, 2 = port) — that is where Surge puts
+/// `username, password`. A token counts as a named parameter (and is kept)
+/// only when what follows its first `=` is non-empty and not made only of `=`,
+/// so base64 padding (`aHVudGVyMg==`) is redacted while `tfo=true` survives;
+/// `sni=` with an empty value is over-redacted. Any other line is returned
+/// unchanged.
 fn redact_positional_credentials(value: &str) -> String {
-    let tokens: Vec<&str> = value.split(',').collect();
-    let is_cred_type = tokens
+    let tokens = split_top_level(value);
+    let is_server_type = tokens
         .first()
-        .is_some_and(|t| POSITIONAL_CRED_TYPES.contains(&t.trim().to_ascii_lowercase().as_str()));
-    if !is_cred_type {
+        .is_some_and(|t| SERVER_PROXY_TYPES.contains(&t.trim().to_ascii_lowercase().as_str()));
+    if !is_server_type {
         return value.to_string();
     }
     tokens
@@ -140,15 +161,85 @@ fn redact_positional_credentials(value: &str) -> String {
         .join(",")
 }
 
-/// `name=value` with a value that is neither empty nor pure `=` padding.
+/// Splits at top-level commas only, with the same state machine as
+/// `value::split_list` (double quotes with `\` escapes, single quotes without,
+/// and parenthesis depth), but returning the raw slices so that quoting and
+/// spacing survive.
+fn split_top_level(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let bytes = value.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' && q == b'"' {
+                    i += 1; // whatever follows is escaped, quote included
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'"' | b'\'' => quote = Some(c),
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => {
+                    out.push(&value[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    out.push(&value[start..]);
+    out
+}
+
+/// `name=value` with a value that is neither empty nor pure `=` padding. A
+/// token that opens with a quote is one quoted value, `=` and all.
 fn is_named_param(token: &str) -> bool {
+    if token.starts_with('"') || token.starts_with('\'') {
+        return false;
+    }
     token
         .split_once('=')
         .is_some_and(|(_, after)| !after.is_empty() && !after.chars().all(|c| c == '='))
 }
 
-/// Replaces the value of every `<param> = <value>` occurrence (up to the next
-/// comma or end of line) with `***`, keeping the surrounding spacing.
+/// How long a parameter's value is: a double-quoted one runs to its matching
+/// quote (a backslash escapes the next character), a single-quoted one to the
+/// next quote — both inclusive; anything else ends at the next comma. An
+/// unterminated quote takes the rest of the line, which is the safe side.
+fn param_value_len(value: &str) -> usize {
+    let bytes = value.as_bytes();
+    match bytes.first() {
+        Some(&q) if q == b'"' || q == b'\'' => {
+            let mut i = 1usize;
+            while i < bytes.len() {
+                if q == b'"' && bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == q {
+                    return i + 1;
+                }
+                i += 1;
+            }
+            value.len()
+        }
+        _ => value.find(',').unwrap_or(value.len()),
+    }
+}
+
+/// Replaces the value of every `<param> = <value>` occurrence with `***`
+/// (`param_value_len` says where the value ends), keeping the surrounding
+/// spacing. Substring-based on purpose: a secret also has to be found nested
+/// inside a parenthesised group (a `[WireGuard]` `peer = (…, pre-shared-key =
+/// …)`), where no top-level split would reach it.
 fn redact_param(value: &str, param: &str) -> String {
     let lower = value.to_ascii_lowercase();
     let mut out = String::with_capacity(value.len());
@@ -164,10 +255,7 @@ fn redact_param(value: &str, param: &str) -> String {
             (true, Some(tail)) => {
                 let tail_start = value.len() - tail.len();
                 let tail_lead = &tail[..tail.len() - tail.trim_start().len()];
-                let val_len = tail
-                    .trim_start()
-                    .find(',')
-                    .unwrap_or(tail.trim_start().len());
+                let val_len = param_value_len(tail.trim_start());
                 out.push_str(&value[rest..tail_start]);
                 out.push_str(tail_lead);
                 out.push_str("***");
@@ -266,6 +354,7 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
     fn a_definition_is_redacted_like_its_profile_line() {
         for def in [
             "http, proxy.test, 8080, alice, s3cret, skip-cert-verify=true",
+            "trojan, t.test, 443, password=\"pw0rd,x\", ws-path=\"/s3cretpath\"",
             "socks5, proxy.test, 1080, username=bob, password=hunter2",
             "ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x",
             "direct, interface=eth0",
@@ -309,5 +398,69 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
             ),
             "trojan, t.test, 443, password=***, ws=true, ws-path=***, ws-headers=***"
         );
+    }
+
+    /// A value that contains a comma has to be quoted (`value::split_list`
+    /// honours quotes), so redaction must end a value where the parser does —
+    /// otherwise the tail of a password is served in the clear.
+    #[test]
+    fn a_quoted_value_is_blanked_whole_however_it_is_quoted() {
+        for (def, expected) in [
+            (
+                "trojan, t.test, 443, password=\"p,w\", ws=true",
+                "trojan, t.test, 443, password=***, ws=true",
+            ),
+            (
+                "trojan, t.test, 443, password='p,w', ws=true",
+                "trojan, t.test, 443, password=***, ws=true",
+            ),
+            // a `\"` inside a double-quoted value does not end it
+            (
+                "trojan, t.test, 443, password=\"a\\\",b\", ws=true",
+                "trojan, t.test, 443, password=***, ws=true",
+            ),
+            // an unterminated quote takes the rest of the line: the safe side
+            (
+                "trojan, t.test, 443, password=\"p,w",
+                "trojan, t.test, 443, password=***",
+            ),
+            (
+                "trojan, t.test, 443, password=pw, ws-path=\"/a,b\", ws-headers=\"X-K:v,1|X-B:2\"",
+                "trojan, t.test, 443, password=***, ws-path=***, ws-headers=***",
+            ),
+        ] {
+            assert_eq!(redact_definition(def), expected, "{def}");
+        }
+    }
+
+    /// Positional values belong to no type beyond the four Surge documents,
+    /// but a stray one (`W0001`) on any other type that takes `server, port`
+    /// is a credential often enough that this module's bias applies.
+    #[test]
+    fn a_positional_value_is_blanked_on_every_type_that_takes_a_server_and_a_port() {
+        for (def, expected) in [
+            // one quoted value, its comma and its `=` included
+            ("http, h, 80, user, \"a,b=c\"", "http, h, 80, ***, ***"),
+            (
+                "trojan, h, 443, hunter2, password=real",
+                "trojan, h, 443, ***, password=***",
+            ),
+            (
+                "vmess, h, 443, hunter2, username=u",
+                "vmess, h, 443, ***, username=***",
+            ),
+            (
+                "anytls, h, 443, hunter2, password=real",
+                "anytls, h, 443, ***, password=***",
+            ),
+            // not a policy line with a server and a port: untouched
+            ("select, A, B, C, D", "select, A, B, C, D"),
+            ("direct, interface=eth0", "direct, interface=eth0"),
+        ] {
+            assert_eq!(redact_definition(def), expected, "{def}");
+        }
+        // nor is a [General] list of values
+        let dns = "dns-server = 1.1.1.1, 8.8.8.8, 9.9.9.9, 4.4.4.4";
+        assert_eq!(redact_profile(dns), dns);
     }
 }

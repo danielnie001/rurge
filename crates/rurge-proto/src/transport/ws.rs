@@ -123,7 +123,9 @@ impl AsyncWrite for WsByteStream {
             // buffer on the next call, so `data` is that same unwritten
             // slice again — finish the flush and report it, not a new send.
             ready!(Pin::new(&mut self.inner).poll_flush(cx)).map_err(ws_io)?;
-            let n = self.queued;
+            // a retry with a shorter buffer must never be told about more
+            // bytes than it passed: `write_all` would panic
+            let n = self.queued.min(data.len());
             self.queued = 0;
             return Poll::Ready(Ok(n));
         }
@@ -180,6 +182,12 @@ impl WsClient {
     /// the layer below has (443 with TLS, 80 without). No error text quotes a
     /// path, a header value or a host: all three are used as shared secrets.
     pub fn new(opts: &WsOpts, server: &Target, tls: bool) -> Result<WsClient, BuildError> {
+        // the configuration layer checks this too, but `WsOpts` has public
+        // fields and an unrooted path would silently join the authority in
+        // `ws://{host}{path}` — a request to somewhere else entirely
+        if !opts.path.starts_with('/') {
+            return Err(BuildError::new("`ws-path` does not start with `/`"));
+        }
         let mut host = None;
         let mut headers = Vec::new();
         for (n, (name, value)) in opts.headers.iter().enumerate() {
@@ -381,6 +389,9 @@ mod tests {
     fn what_cannot_be_sent_is_a_build_error_that_quotes_nothing() {
         let target = Target::new(HostName::parse("edge.example"), 443);
         for (o, expected) in [
+            // the fields are public: a path that is not rooted would become
+            // part of the authority instead
+            (opts("no-slash", &[]), "`ws-path` does not start with `/`"),
             (
                 opts("/ok", &[("Host", "bad host")]),
                 "`ws-path` and the `Host` header do not form a valid request URI",
