@@ -57,6 +57,7 @@
 | P15 | 承接：IDN 的代理服务器名 | 核对结论：解析器的线上编码只接受 ASCII（`hickory_proto::rr::Name::from_ascii`），应答校验又按原名比较——以 Unicode 写的服务器名在**任何**协议上都不可用，TLS 层的构建错误（`E0022`，加载期）反而是最早、最清楚的信号。M2b 不改行为：清单 4.2 登记"代理服务器主机名须写成 ASCII（punycode）"，全面的 IDN 支持（规则、`[Host]`、解析器、TLS）进「延后事项」 |
 | P16 | 承接：转发循环不 flush | 这是真缺陷而不只是风格问题：`tokio-rustls` 的 `poll_write` 在 socket 写不动时会在"明文已收下、密文还留在自己缓冲里"的状态下返回成功，之后若没有下一次写，这段尾巴就一直留着（大请求体的最后一段）。修法：`copy_half` 在 `write_all` 之后 `flush`，同样与 `stop` 竞争。**回归用例的 RED 已在旧循环上真的跑过**：一个"收下即成功、flush 才发出"的写端，旧循环下尾巴 500 ms 内到不了，加 `flush` 后立刻到。同一个任务里顺带修一个相邻的缺口：**一个方向以错误结束时，另一个方向不会跟着结束**（`tokio::join!` 等两边），客户端要等到自己超时或空闲超时才知道隧道坏了——vmess 的"没应答就关"与 anytls 的被拒 / 会话死亡都以读错误的形式出现，没有这一条它们只会表现为卡住 |
 | P17 | `vmess` 没开 `tls` 却写了 TLS 参数 | 仍是 `W0028`，但不复用 `refuse_tls` 的文本（"does not apply to `vmess` policies"会误导）：`` `<key>` has no effect without `tls=true`; ignored `` |
+| P18 | 预检时的三处订正（派发 Task 1 之前，2026-09-20） | ① 只被单元用例用到的 `Pool::len` 标 `#[cfg(test)]`、只有假服务端会发的 `frame::SERVER_SETTINGS` 标 `#[cfg(any(test, feature = "testing"))]`——临时工程当初整体关了 dead-code 检查，重新打开后在"门禁的构建形态"与"普通构建"两种形态下各核对了一遍，别无其它；② `FakeVmess` 拒绝连接时先关写端、再把连接读到头（`refuse`）：带着未读字节关连接会变成 RST，客户端拿到的就是 I/O 错误而不是"没应答就关"；③ 引擎端到端用例里等"anytls 会话回池"的信号改为"会话记录出现"（转发循环放手之后才记）：`get` 带 `Connection: close`，先结束流的是服务端，而对端的 FIN 不回，服务端的 FIN 计数在那两条用例里永远是 0 |
 
 ## 承接事项
 
@@ -2067,6 +2068,17 @@ fn parse_head(plain: &[u8]) -> Option<Parsed> {
     })
 }
 
+/// Refuses the way a real server does: nothing is ever answered. The write
+/// side is closed first and the rest is read to its end, so the client sees a
+/// clean end of stream — closing over unread bytes would reset the connection
+/// and hand the client an I/O error instead.
+async fn refuse(mut stream: BoxedStream) -> io::Result<()> {
+    let _ = stream.shutdown().await;
+    let mut sink = [0u8; 1024];
+    while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
+    Ok(())
+}
+
 async fn serve(mut stream: BoxedStream, shared: Arc<Shared>) -> io::Result<()> {
     if shared.script.ws {
         stream = accept_bytes(stream, &shared.ws_seen).await?;
@@ -2091,9 +2103,8 @@ async fn serve(mut stream: BoxedStream, shared: Arc<Shared>) -> io::Result<()> {
             .map_or(0, |d| d.as_secs() as i64);
         let reject = |shared: &Shared| shared.rejected.fetch_add(1, Ordering::SeqCst);
         let Some(time) = open_auth_id(&cmd_key, &auth_id).filter(|t| (t - now).abs() <= 120) else {
-            // a real server drains and closes: nothing is ever answered
             reject(&shared);
-            return Ok(());
+            return refuse(stream).await;
         };
         let nonce: [u8; 8] = buf[34..42].try_into().expect("8 bytes");
         let path = |label: &'static [u8]| [label, &auth_id[..], &nonce[..]];
@@ -2109,7 +2120,7 @@ async fn serve(mut stream: BoxedStream, shared: Arc<Shared>) -> io::Result<()> {
                 );
                 if opened != Some(2) {
                     reject(&shared);
-                    return Ok(());
+                    return refuse(stream).await;
                 }
                 let len = usize::from(u16::from_be_bytes([sealed[0], sealed[1]]));
                 head_len = Some(len);
@@ -2131,7 +2142,7 @@ async fn serve(mut stream: BoxedStream, shared: Arc<Shared>) -> io::Result<()> {
             Some(parsed) => break (parsed, time - now),
             None => {
                 reject(&shared);
-                return Ok(());
+                return refuse(stream).await;
             }
         }
     };
@@ -2940,6 +2951,9 @@ pub(crate) const UPDATE_PADDING_SCHEME: u8 = 6;
 pub(crate) const SYNACK: u8 = 7;
 pub(crate) const HEART_REQUEST: u8 = 8;
 pub(crate) const HEART_RESPONSE: u8 = 9;
+/// Only a server sends it (here: the fake one); a client reads it like any
+/// other frame it has no use for.
+#[cfg(any(test, feature = "testing"))]
 pub(crate) const SERVER_SETTINGS: u8 = 10;
 
 pub(crate) const HEADER: usize = 7;
@@ -3356,6 +3370,7 @@ impl Pool {
             .retain(|(s, since)| !s.is_closed() && now.duration_since(*since) < IDLE_TIMEOUT);
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.idle.lock().expect("pool").len()
     }
@@ -6062,14 +6077,17 @@ async fn an_anytls_upstream_carries_two_requests_over_one_session() {
         ..Profile::default()
     })
     .await;
+    let log = h.engine.request_log();
     for round in 1..=2 {
         let mut tunnel = connect_via_http(h.http(), "target.test:8080").await;
         let response = get(&mut tunnel, "target.test", "/hello").await;
         assert!(response.ends_with("hi there"), "{response}");
         drop(tunnel);
-        // the stream is over when the server has seen its FIN: only then is
-        // the session back in the pool for the next request
-        wait_until("the stream to close", || upstream.fins() == round).await;
+        // The session's record appears once the relay has let go of the
+        // stream, and by then the AnyTLS session is back in the pool. (Not
+        // the server's FIN count: `get` asks the origin to close, so it is
+        // the server that ends these streams, and a FIN is not answered.)
+        wait_until("the session to finish", || log.recent(10).len() == round).await;
     }
     assert_eq!(upstream.sessions(), 1, "the second request reused the session");
     let streams = upstream.streams();
@@ -6158,8 +6176,10 @@ async fn an_unrelated_reload_keeps_an_anytls_pool_and_a_change_of_its_own_drops_
             assert!(response.ends_with("hi there"), "{response}");
         }
     };
+    let log = h.engine.request_log();
     request(&h).await;
-    wait_until("the first stream to close", || upstream.fins() == 1).await;
+    // the record appears once the relay has dropped the stream: the session is pooled
+    wait_until("the first session to finish", || log.recent(10).len() == 1).await;
     let before = outbound_now(&h, "A");
 
     // a reload that has nothing to do with A
@@ -6173,7 +6193,7 @@ async fn an_unrelated_reload_keeps_an_anytls_pool_and_a_change_of_its_own_drops_
         .swap_runtime(runtime(h.dir.path(), &next, h.engine.shared()).await);
     assert!(Arc::ptr_eq(&before, &outbound_now(&h, "A")), "A was rebuilt");
     request(&h).await;
-    wait_until("the second stream to close", || upstream.fins() == 2).await;
+    wait_until("the second session to finish", || log.recent(10).len() == 2).await;
     assert_eq!(upstream.sessions(), 1, "the idle session survived the reload");
 
     // a reload that changes A itself
