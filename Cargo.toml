@@ -71,6 +71,8 @@ socket2 = { version = "0.6", features = ["all"] }
 p12-keystore = "0.2"
 getrandom = "0.3"
 idna = "1"
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

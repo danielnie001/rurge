@@ -4,10 +4,12 @@
 mod http_proxy;
 mod socks5;
 mod tls;
+pub mod ws;
 
 pub use http_proxy::{FakeHttpProxy, HttpProxyScript, RecordedHead};
 pub use socks5::{FakeSocks5, RecordedSocks5, Socks5Script};
 pub use tls::{SeenHandshake, TlsFixture};
+pub use ws::{FakeWs, RecordedWs, WsScript};
 
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

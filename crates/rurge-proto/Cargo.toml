@@ -20,6 +20,10 @@ p12-keystore.workspace = true
 getrandom.workspace = true
 tracing.workspace = true
 idna.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+http.workspace = true
+bytes.workspace = true
 
 [features]
 # Scriptable loopback peers (`rurge_proto::testing`); enabled by dependants' dev-dependencies.
