@@ -94,11 +94,11 @@ impl Socks5Outbound {
         if socks
             .username
             .as_ref()
-            .is_some_and(|u| u.len() > MAX_CREDENTIAL)
+            .is_some_and(|u| u.expose().len() > MAX_CREDENTIAL)
             || socks
                 .password
                 .as_ref()
-                .is_some_and(|p| p.len() > MAX_CREDENTIAL)
+                .is_some_and(|p| p.expose().len() > MAX_CREDENTIAL)
         {
             return Err(BuildError::new(format!(
                 "policy `{}`: the socks5 user name and password must be at most 255 bytes each",
@@ -106,10 +106,10 @@ impl Socks5Outbound {
             )));
         }
         let tls = tls_client(socks.tls.as_ref(), host, &[], keystore, roots)?;
-        let credentials = socks
-            .username
-            .clone()
-            .map(|user| (user, socks.password.clone().unwrap_or_default()));
+        let credentials = socks.username.as_ref().map(|user| {
+            let password = socks.password.as_ref().map(|p| p.expose().clone());
+            (user.expose().clone(), password.unwrap_or_default())
+        });
         Ok(Socks5Outbound {
             name: spec.name.clone(),
             server: Target::new(host.clone(), port),
@@ -510,9 +510,9 @@ mod tests {
                 panic!("expected a socks5 spec");
             };
             if set_username {
-                socks.username = Some(long.clone());
+                socks.username = Some(long.clone().into());
             } else {
-                socks.password = Some(long.clone());
+                socks.password = Some(long.clone().into());
             }
             let err = Socks5Outbound::from_spec(
                 &modified,

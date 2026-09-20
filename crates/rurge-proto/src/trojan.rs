@@ -49,7 +49,7 @@ impl TrojanOutbound {
     ) -> Result<TrojanOutbound, BuildError> {
         // error texts carry no policy name: the registry's `build_one` and the
         // dry build both prefix it
-        if spec.password.is_empty() {
+        if spec.password.expose().is_empty() {
             return Err(BuildError::new("`password` is empty"));
         }
         // no ALPN unless the policy asks for one: a WebSocket below must not
@@ -63,7 +63,7 @@ impl TrojanOutbound {
         Ok(TrojanOutbound {
             name: name.to_string(),
             stack: Stack::new(connector, server, tls, ws),
-            hash: wire_hash(&spec.password),
+            hash: wire_hash(spec.password.expose()),
         })
     }
 
@@ -116,6 +116,7 @@ mod tests {
     use crate::testing::{FakeTrojan, SeenHandshake, TlsFixture, TrojanScript, echo_server};
     use rurge_config::policy::parse_policy;
     use rurge_config::spec::ParamReader;
+    use rurge_config::spec::Secret;
     use rurge_config::spec::TlsOpts;
     use rurge_config::spec::trojan::read_trojan;
     use rurge_config::{HostName, Span};
@@ -179,7 +180,7 @@ mod tests {
         let fixture = TlsFixture::new(&["127.0.0.1"]);
         let spec = TrojanSpec {
             tls: TlsOpts::default(),
-            password: String::new(),
+            password: Secret::default(),
             ws: None,
         };
         let err = TrojanOutbound::new(

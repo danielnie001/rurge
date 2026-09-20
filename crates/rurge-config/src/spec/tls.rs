@@ -168,18 +168,28 @@ pub(crate) fn read_tls(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> Tl
     }
 }
 
-/// For protocols that do not run over TLS: every TLS parameter present is `W0028`.
-pub(crate) fn refuse_tls(r: &mut ParamReader<'_>) {
-    let kind = r.policy().kind.keyword();
+fn warn_tls_keys(r: &mut ParamReader<'_>, text: impl Fn(&str) -> String) {
     let mut present: Vec<&str> = TLS_KEYS.iter().copied().filter(|k| r.has(k)).collect();
     present.sort_unstable();
     for key in present {
         r.touch(key);
-        r.warn(
-            codes::W_PARAM_NOT_APPLICABLE,
-            format!("`{key}` does not apply to `{kind}` policies; ignored"),
-        );
+        r.warn(codes::W_PARAM_NOT_APPLICABLE, text(key));
     }
+}
+
+/// For protocols that do not run over TLS: every TLS parameter present is `W0028`.
+pub(crate) fn refuse_tls(r: &mut ParamReader<'_>) {
+    let kind = r.policy().kind.keyword();
+    warn_tls_keys(r, |key| {
+        format!("`{key}` does not apply to `{kind}` policies; ignored")
+    });
+}
+
+/// For `vmess` without `tls=true`: the TLS parameters are there but idle (`W0028`).
+pub(crate) fn idle_tls(r: &mut ParamReader<'_>) {
+    warn_tls_keys(r, |key| {
+        format!("`{key}` has no effect without `tls=true`; ignored")
+    });
 }
 
 pub(crate) fn note_shadow_tls(r: &mut ParamReader<'_>, notes: &mut Notes) {

@@ -150,8 +150,9 @@ impl HttpOutbound {
         }
         let tls = tls_client(http.tls.as_ref(), host, &[], keystore, roots)?;
         let authorization = http.username.as_ref().map(|user| {
-            let password = http.password.as_deref().unwrap_or("");
-            format!("Basic {}", STANDARD.encode(format!("{user}:{password}")))
+            let password = http.password.as_ref().map_or("", |p| p.expose().as_str());
+            let pair = format!("{}:{password}", user.expose());
+            format!("Basic {}", STANDARD.encode(pair))
         });
         Ok(HttpOutbound {
             name: spec.name.clone(),

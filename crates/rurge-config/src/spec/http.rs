@@ -1,5 +1,6 @@
 //! `http` / `https` policy parameters (manual: Policies › HTTP and HTTP/2).
 
+use super::secret::Secret;
 use super::tls::TlsOpts;
 
 /// One piece of a header value: literal text or a random URL-safe string
@@ -20,8 +21,8 @@ pub struct HeaderTemplate {
 pub struct HttpSpec {
     /// `Some` for `https`.
     pub tls: Option<TlsOpts>,
-    pub username: Option<String>,
-    pub password: Option<String>,
+    pub username: Option<Secret<String>>,
+    pub password: Option<Secret<String>>,
     pub always_use_connect: bool,
     pub headers: Vec<HeaderTemplate>,
 }

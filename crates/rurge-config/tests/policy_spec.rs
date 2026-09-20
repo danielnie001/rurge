@@ -161,7 +161,7 @@ fn a_trojan_policy_is_typed() {
     let ProtoSpec::Trojan(trojan) = &spec.proto else {
         panic!("{:?}", spec.proto)
     };
-    assert_eq!(trojan.password, "p");
+    assert_eq!(trojan.password.expose(), "p");
     assert_eq!(trojan.ws.as_ref().unwrap().path, "/w");
     assert_eq!(spec.common.underlying_proxy.as_deref(), Some("E"));
     assert!(

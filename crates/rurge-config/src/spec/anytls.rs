@@ -1,27 +1,27 @@
-//! `trojan` policy parameters (manual: Policies › Trojan).
+//! `anytls` policy parameters (manual: Policies › AnyTLS).
 
 use super::reader::ParamReader;
 use super::secret::Secret;
 use super::tls::{TlsOpts, read_tls};
-use super::ws::{WsOpts, read_ws};
 use crate::diagnostic::codes;
 use crate::keystore::KeystoreItem;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TrojanSpec {
-    /// Trojan always runs over TLS.
+pub struct AnyTlsSpec {
+    /// AnyTLS always runs over TLS.
     pub tls: TlsOpts,
     pub password: Secret<String>,
-    pub ws: Option<WsOpts>,
+    /// `reuse`: keep a session for the next stream (the protocol's default).
+    pub reuse: bool,
 }
 
-/// Everything `trojan`-specific on the line. After an error was reported the
+/// Everything `anytls`-specific on the line. After an error was reported the
 /// returned value is meaningless: the caller checks `r.has_errors()`.
 ///
 /// The password is named-only (`password=`), as the manual writes it: a
 /// positional value stays unread and is reported as an extra positional
 /// value, never quoted.
-pub fn read_trojan(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> TrojanSpec {
+pub fn read_anytls(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> AnyTlsSpec {
     let tls = read_tls(r, keystore);
     let password = r.str("password").unwrap_or_default();
     if password.is_empty() {
@@ -30,11 +30,11 @@ pub fn read_trojan(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> Trojan
             "`password` is required".to_string(),
         );
     }
-    let ws = read_ws(r);
-    TrojanSpec {
+    let reuse = r.bool("reuse").unwrap_or(true);
+    AnyTlsSpec {
         tls,
         password: password.into(),
-        ws,
+        reuse,
     }
 }
 
@@ -48,29 +48,29 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    fn read(def: &str) -> (TrojanSpec, bool, Vec<Diagnostic>) {
+    fn read(def: &str) -> (AnyTlsSpec, bool, Vec<Diagnostic>) {
         let p = parse_policy("P", def, &Span::new(Arc::from(Path::new("p.conf")), 1)).unwrap();
         let mut r = ParamReader::new(&p);
-        let spec = read_trojan(&mut r, &[]);
+        let spec = read_anytls(&mut r, &[]);
         let failed = r.has_errors();
         (spec, failed, r.finish())
     }
 
     #[test]
-    fn the_manuals_example_and_the_tls_parameters() {
-        let (spec, failed, diags) = read("trojan, 192.0.2.15, 443, password=pwd, sni=example.com");
+    fn the_manuals_example_and_reuse() {
+        let (spec, failed, diags) = read("anytls, 192.168.20.6, 443, password=pwd");
         assert!(!failed && diags.is_empty(), "{diags:?}");
         assert_eq!(spec.password.expose(), "pwd");
-        assert_eq!(spec.tls.sni, Sni::Name("example.com".into()));
-        assert!(spec.ws.is_none());
-        let (spec, failed, _) = read("trojan, h.test, 443, password=p, ws=true, ws-path=/t");
+        assert!(spec.reuse, "reuse is on unless turned off");
+        let (spec, failed, _) = read("anytls, h.test, 443, password=p, reuse=false, sni=edge.test");
         assert!(!failed);
-        assert_eq!(spec.ws.unwrap().path, "/t");
+        assert!(!spec.reuse);
+        assert_eq!(spec.tls.sni, Sni::Name("edge.test".into()));
     }
 
     #[test]
     fn a_missing_password_is_an_error_and_a_positional_one_is_not_read() {
-        let (_, failed, diags) = read("trojan, h.test, 443");
+        let (_, failed, diags) = read("anytls, h.test, 443");
         assert!(failed);
         assert_eq!(
             (diags[0].code, diags[0].message.as_str()),
@@ -79,7 +79,7 @@ mod tests {
                 "policy `P`: `password` is required"
             )
         );
-        let (_, failed, diags) = read("trojan, h.test, 443, hunter2");
+        let (_, failed, diags) = read("anytls, h.test, 443, hunter2");
         assert!(failed);
         let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
         assert_eq!(
@@ -90,5 +90,17 @@ mod tests {
             ]
         );
         assert!(messages.iter().all(|m| !m.contains("hunter2")));
+    }
+
+    #[test]
+    fn a_bad_boolean_is_an_error_and_the_spec_does_not_print_the_password() {
+        let (_, failed, _) = read("anytls, h.test, 443, password=p, reuse=maybe");
+        assert!(failed);
+        let (spec, _, _) = read("anytls, h.test, 443, password=hunter2");
+        let printed = format!("{spec:?}");
+        assert!(
+            printed.contains("Secret(***)") && !printed.contains("hunter2"),
+            "{printed}"
+        );
     }
 }

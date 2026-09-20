@@ -3,7 +3,7 @@
 
 use rurge_config::config::{LoadError, LoadOptions, Loaded, load};
 use rurge_config::diagnostic::codes;
-use rurge_config::spec::{CommonOpts, PolicySpec, ProtoSpec, TlsOpts};
+use rurge_config::spec::{CommonOpts, PolicySpec, ProtoSpec};
 use rurge_config::{Config, Diagnostic, Diagnostics, KeystoreItem};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{Connector, DirectConnector, Resolve, Target};
@@ -86,19 +86,12 @@ impl Resolve for NeverResolve {
     }
 }
 
-fn tls_of(spec: &PolicySpec) -> Option<&TlsOpts> {
-    match &spec.proto {
-        ProtoSpec::Http(http) => http.tls.as_ref(),
-        ProtoSpec::Socks5(socks) => socks.tls.as_ref(),
-        ProtoSpec::Trojan(trojan) => Some(&trojan.tls),
-        _ => None,
-    }
-}
-
 /// `skip-cert-verify` without a pinned fingerprint: the proxy is not
 /// authenticated at all (with a fingerprint, the pin takes over — W0012).
 fn skips_verification(spec: &PolicySpec) -> bool {
-    tls_of(spec).is_some_and(|tls| tls.skip_cert_verify && tls.fingerprint_sha256.is_none())
+    spec.proto
+        .tls()
+        .is_some_and(|tls| tls.skip_cert_verify && tls.fingerprint_sha256.is_none())
 }
 
 impl OutboundFactory for EngineFactory {

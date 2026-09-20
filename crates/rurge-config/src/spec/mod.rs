@@ -1,19 +1,25 @@
 //! Typed view of `[Proxy]` policy parameters (phase 2 M1 design §4).
 
+pub mod anytls;
 pub mod common;
 pub mod http;
 pub mod reader;
+pub mod secret;
 pub mod socks5;
 pub mod tls;
 pub mod trojan;
+pub mod vmess;
 pub mod ws;
 
+pub use anytls::AnyTlsSpec;
 pub use common::{Applies, CommonOpts, IpVersion, Tristate};
 pub use http::{HeaderPart, HeaderTemplate, HttpSpec};
 pub use reader::ParamReader;
+pub use secret::Secret;
 pub use socks5::Socks5Spec;
 pub use tls::{Sni, TlsOpts};
 pub use trojan::TrojanSpec;
+pub use vmess::{VmessCipher, VmessSpec};
 pub use ws::WsOpts;
 
 use crate::diagnostic::{Diagnostic, codes};
@@ -45,6 +51,18 @@ pub enum ProtoSpec {
     Trojan(TrojanSpec),
 }
 
+impl ProtoSpec {
+    /// The TLS options of the protocol, when it runs over TLS.
+    pub fn tls(&self) -> Option<&TlsOpts> {
+        match self {
+            ProtoSpec::Http(http) => http.tls.as_ref(),
+            ProtoSpec::Socks5(socks) => socks.tls.as_ref(),
+            ProtoSpec::Trojan(trojan) => Some(&trojan.tls),
+            ProtoSpec::Direct | ProtoSpec::Reject(_) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicySpec {
     pub name: String,
@@ -69,10 +87,10 @@ pub struct SpecOutcome {
 }
 
 /// Named `username=` / `password=` win over the positional pair.
-fn read_credentials(r: &mut ParamReader<'_>) -> (Option<String>, Option<String>) {
+fn read_credentials(r: &mut ParamReader<'_>) -> (Option<Secret<String>>, Option<Secret<String>>) {
     let positional = (r.positional(0), r.positional(1));
-    let username = r.str("username").or(positional.0).map(str::to_string);
-    let password = r.str("password").or(positional.1).map(str::to_string);
+    let username = r.str("username").or(positional.0).map(Secret::from);
+    let password = r.str("password").or(positional.1).map(Secret::from);
     (username, password)
 }
 
@@ -163,7 +181,7 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             for (what, value) in [("username", &username), ("password", &password)] {
                 if value
                     .as_ref()
-                    .is_some_and(|v| v.len() > socks5::MAX_CREDENTIAL)
+                    .is_some_and(|v| v.expose().len() > socks5::MAX_CREDENTIAL)
                 {
                     // never echo the value
                     r.error(
@@ -285,8 +303,14 @@ mod tests {
         let ProtoSpec::Http(http) = &spec.proto else {
             panic!("{:?}", spec.proto)
         };
-        assert_eq!(http.username.as_deref(), Some("username"));
-        assert_eq!(http.password.as_deref(), Some("password"));
+        assert_eq!(
+            http.username.as_ref().map(|u| u.expose().as_str()),
+            Some("username")
+        );
+        assert_eq!(
+            http.password.as_ref().map(|p| p.expose().as_str()),
+            Some("password")
+        );
         assert_eq!(http.tls, Some(TlsOpts::default()));
         assert!(!http.always_use_connect);
 
@@ -320,7 +344,10 @@ mod tests {
             panic!()
         };
         assert_eq!(
-            (s.username.as_deref(), s.password.as_deref()),
+            (
+                s.username.as_ref().map(|u| u.expose().as_str()),
+                s.password.as_ref().map(|p| p.expose().as_str())
+            ),
             (Some("named"), Some("secret"))
         );
     }
