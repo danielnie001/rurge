@@ -196,6 +196,47 @@ fn check_knows_trojan() {
         .stdout(predicate::str::contains("s3same").not());
 }
 
+const VMESS_ANYTLS: &str = "[General]\n[Proxy]\n\
+V = vmess, proxy.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119, vmess-aead=true, tls=true, ws=true, ws-path=/w\n\
+A = anytls, proxy.test, 443, password=s3same\n\
+Legacy1 = vmess, proxy.test, 80, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\n\
+Legacy2 = vmess, proxy.test, 80, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\n\
+[Rule]\nFINAL,DIRECT\n";
+const VMESS_BAD_ID: &str = "[General]\n[Proxy]\nV = vmess, proxy.test, 443, username=s3cretnotauuid, vmess-aead=true\n[Rule]\nFINAL,DIRECT\n";
+
+#[test]
+fn check_knows_vmess_and_anytls() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "m2b.conf", VMESS_ANYTLS))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    // one W0007, and it is the one about the legacy handshake — once, not per line
+    assert_eq!(out.matches("W0007").count(), 1, "{out}");
+    assert!(out.contains("uses the legacy handshake"), "{out}");
+    assert!(out.contains("m2b.conf:5"), "{out}");
+    assert!(
+        !out.contains("`anytls`") && !out.contains("0233d11c"),
+        "{out}"
+    );
+
+    Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "bad.conf", VMESS_BAD_ID))
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("E0018"))
+        .stdout(predicate::str::contains("bad.conf:3"))
+        .stdout(predicate::str::contains("s3cretnotauuid").not());
+}
+
 mod rule_match {
     use assert_cmd::Command;
     use predicates::prelude::*;
