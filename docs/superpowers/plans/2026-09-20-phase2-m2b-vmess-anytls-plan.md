@@ -7097,7 +7097,7 @@ git commit -m "docs: M2b——兼容性清单、API 参考、README、CLAUDE.md�
 | 10 | 无；守卫核对八行全部在代码里找到（`file:line` 见该任务报告）。其中"一个超时"一行按协议不对称：anytls 的鉴权写在超时之内，vmess 的请求头经 `LazyHead` 在转发阶段才发出（与 M2a 的 trojan 相同） | — | eeb85e5 |
 | 11 | `pub mod xray;` 比计划早半步加入（与 Step 2 一起过门禁）；rustfmt 重排四处；README 的章节划分是实现者对计划文字的理解（版本号、三个 SHA-256、环境变量与 P9 逐字一致，评审用程序逐位比对过 `ci.yml` 与 README） | 计划对 README 只给了要点没给成文 | ca62484 |
 | 11 | **互操作用例在本机一条都没有真正运行**：本机没有 sing-box 与 xray，也没有安装；九条 sing-box 用例与一条 xray 用例都打印跳过原因后通过。它们对真实二进制的表现要等首次推送后的 CI（`RURGE_INTEROP_REQUIRED=1`）证明 | 不在开发者的机器上下载或安装任何参考二进制 | ca62484 |
-| 12 | 本任务按控制者的裁定改了一行代码注释：`crates/rurge-proto/src/vmess/stream.rs` 文件头里"转发循环从不调用的 `flush`"一句，自 Task 6 起不再成立 | Task 6 的评审指出的过时措辞；不改行为 | Task 12 的提交 |
+| 12 | 本任务按控制者的裁定改了一行代码注释：`crates/rurge-proto/src/vmess/stream.rs` 文件头里"转发循环从不调用的 `flush`"一句，自 Task 6 起不再成立 | Task 6 的评审指出的过时措辞；不改行为 | e287ae0 |
 
 ## 延后事项
 
