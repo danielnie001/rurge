@@ -73,6 +73,7 @@ fn plain(kind: InboundKind, users: &[(&str, &str)]) -> Inbound {
             .map(|(u, p)| (u.to_string(), p.to_string()))
             .collect(),
         tls: None,
+        ws_path: None,
     }
 }
 
@@ -188,6 +189,7 @@ async fn https_with_a_private_ca_a_pinned_fingerprint_and_a_client_certificate()
             key: key.clone(),
             client_ca,
         }),
+        ws_path: None,
     };
     let sb = SingBox::spawn(&bin, dir.path(), vec![tls(None), tls(Some(ca))]);
     let echo = echo_server().await;
@@ -280,4 +282,88 @@ fn a_missing_binary_is_a_skip_unless_interop_is_required() {
     } else {
         assert!(sing_box_or_skip("probe").is_none());
     }
+}
+
+/// The fixture's leaf certificate and key as PEM files in `dir`.
+fn leaf_files(fixture: &TlsFixture, dir: &Path) -> TlsFiles {
+    let write = |name: &str, text: String| {
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        path
+    };
+    TlsFiles {
+        certificate: write("leaf.pem", fixture.leaf_pem()),
+        key: write("leaf.key", fixture.leaf_key_pem()),
+        client_ca: None,
+    }
+}
+
+fn trojan_inbound(tls: TlsFiles, ws_path: Option<&str>) -> Inbound {
+    Inbound {
+        kind: InboundKind::Trojan,
+        users: vec![("u".into(), "s3same".into())],
+        tls: Some(tls),
+        ws_path: ws_path.map(str::to_string),
+    }
+}
+
+#[tokio::test]
+async fn trojan_with_and_without_websocket() {
+    let Some(bin) = sing_box_or_skip("trojan_with_and_without_websocket") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = TlsFixture::new(&["127.0.0.1"]);
+    let sb = SingBox::spawn(
+        &bin,
+        dir.path(),
+        vec![
+            trojan_inbound(leaf_files(&fixture, dir.path()), None),
+            trojan_inbound(leaf_files(&fixture, dir.path()), Some("/ws")),
+        ],
+    );
+    let echo = echo_server().await;
+    let profile = format!(
+        "[Proxy]\nPlain = trojan, 127.0.0.1, {}, password=s3same\nWs = trojan, 127.0.0.1, {}, password=s3same, ws=true, ws-path=/ws\n[Rule]\nFINAL,DIRECT\n",
+        sb.port(0),
+        sb.port(1)
+    );
+    roundtrip(&outbound(&profile, "Plain", Some(&fixture)), echo).await;
+    roundtrip(&outbound(&profile, "Ws", Some(&fixture)), echo).await;
+}
+
+#[tokio::test]
+async fn a_wrong_trojan_password_is_not_relayed() {
+    let Some(bin) = sing_box_or_skip("a_wrong_trojan_password_is_not_relayed") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = TlsFixture::new(&["127.0.0.1"]);
+    let sb = SingBox::spawn(
+        &bin,
+        dir.path(),
+        vec![trojan_inbound(leaf_files(&fixture, dir.path()), None)],
+    );
+    let echo = echo_server().await;
+    let profile = format!(
+        "[Proxy]\nWrong = trojan, 127.0.0.1, {}, password=nope\n[Rule]\nFINAL,DIRECT\n",
+        sb.port(0)
+    );
+    // the protocol has no reply, so connecting succeeds; nothing comes back
+    let mut stream = outbound(&profile, "Wrong", Some(&fixture))
+        .connect_tcp(&target(echo), &ConnectOpts::default())
+        .await
+        .expect("connecting succeeds");
+    stream.write_all(b"interop").await.unwrap();
+    let mut buf = [0u8; 7];
+    let got = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_exact(&mut buf),
+    )
+    .await
+    .expect("sing-box closes the connection (it has no fallback configured)");
+    assert!(
+        got.is_err() || &buf != b"interop",
+        "the payload must not be echoed"
+    );
 }

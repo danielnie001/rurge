@@ -55,6 +55,7 @@ pub enum InboundKind {
     Http,
     Socks,
     Mixed,
+    Trojan,
 }
 
 pub struct TlsFiles {
@@ -69,8 +70,11 @@ pub struct Inbound {
     pub kind: InboundKind,
     /// Empty = no authentication.
     pub users: Vec<(String, String)>,
-    /// Only the `http` inbound of sing-box speaks TLS.
+    /// sing-box's `http` and `trojan` inbounds speak TLS; `socks` and `mixed`
+    /// do not.
     pub tls: Option<TlsFiles>,
+    /// A V2Ray WebSocket transport on this path (trojan only).
+    pub ws_path: Option<String>,
 }
 
 /// The whole configuration for `inbounds`, each on its loopback port.
@@ -84,6 +88,7 @@ pub fn render(inbounds: &[(Inbound, u16)]) -> Value {
                     InboundKind::Http => "http",
                     InboundKind::Socks => "socks",
                     InboundKind::Mixed => "mixed",
+                    InboundKind::Trojan => "trojan",
                 },
                 "tag": format!("in-{i}"),
                 "listen": "127.0.0.1",
@@ -93,14 +98,17 @@ pub fn render(inbounds: &[(Inbound, u16)]) -> Value {
                 v["users"] = inbound
                     .users
                     .iter()
-                    .map(|(u, p)| json!({ "username": u, "password": p }))
+                    .map(|(u, p)| match inbound.kind {
+                        // sing-box's trojan users are `name` + `password`
+                        InboundKind::Trojan => json!({ "name": u, "password": p }),
+                        _ => json!({ "username": u, "password": p }),
+                    })
                     .collect();
             }
             if let Some(tls) = &inbound.tls {
-                assert_eq!(
-                    inbound.kind,
-                    InboundKind::Http,
-                    "only sing-box's http inbound has tls"
+                assert!(
+                    matches!(inbound.kind, InboundKind::Http | InboundKind::Trojan),
+                    "only sing-box's http and trojan inbounds are given tls here"
                 );
                 let mut t = json!({
                     "enabled": true,
@@ -112,6 +120,14 @@ pub fn render(inbounds: &[(Inbound, u16)]) -> Value {
                     t["client_certificate_path"] = json!([ca]);
                 }
                 v["tls"] = t;
+            }
+            if let Some(path) = &inbound.ws_path {
+                assert_eq!(
+                    inbound.kind,
+                    InboundKind::Trojan,
+                    "ws is rendered for trojan only"
+                );
+                v["transport"] = json!({ "type": "ws", "path": path });
             }
             v
         })
@@ -213,6 +229,7 @@ mod tests {
                         key: "leaf.key".into(),
                         client_ca: Some("ca.pem".into()),
                     }),
+                    ws_path: None,
                 },
                 1001,
             ),
@@ -221,6 +238,7 @@ mod tests {
                     kind: InboundKind::Socks,
                     users: Vec::new(),
                     tls: None,
+                    ws_path: None,
                 },
                 1002,
             ),
@@ -229,8 +247,22 @@ mod tests {
                     kind: InboundKind::Mixed,
                     users: Vec::new(),
                     tls: None,
+                    ws_path: None,
                 },
                 1003,
+            ),
+            (
+                Inbound {
+                    kind: InboundKind::Trojan,
+                    users: vec![("u".into(), "pw".into())],
+                    tls: Some(TlsFiles {
+                        certificate: "leaf.pem".into(),
+                        key: "leaf.key".into(),
+                        client_ca: None,
+                    }),
+                    ws_path: Some("/ws".into()),
+                },
+                1004,
             ),
         ]
     }
@@ -271,6 +303,13 @@ mod tests {
         assert_eq!(config["inbounds"][1]["type"], "socks");
         assert!(config["inbounds"][1].get("users").is_none());
         assert_eq!(config["inbounds"][2]["type"], "mixed");
+        let trojan = &config["inbounds"][3];
+        assert_eq!(trojan["type"], "trojan");
+        // trojan users are `name` + `password`, not `username`
+        assert_eq!(trojan["users"], json!([{ "name": "u", "password": "pw" }]));
+        assert_eq!(trojan["tls"]["enabled"], true);
+        assert_eq!(trojan["transport"], json!({ "type": "ws", "path": "/ws" }));
+        assert!(config["inbounds"][0].get("transport").is_none());
     }
 
     #[test]
