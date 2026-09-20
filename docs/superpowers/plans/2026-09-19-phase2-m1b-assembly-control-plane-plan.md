@@ -4976,6 +4976,6 @@ git commit -m "docs: 阶段 2 / M1b 装配与控制面：兼容性清单、API �
 | 没有"链式会话进行中重载"与"选择表里的成员在新一代消失"的用例 | M2 |
 | `interface` / `tos` 与 `underlying-proxy` 同时出现时静默失效（已登记进兼容性清单）；是否改成 `W0028` | M2 设计时决定 |
 | `SessionInfo::url` 作为"明文 HTTP 转发"信号的契约（已写进文档注释） | 阶段 4（MITM）动它之前重新审视 |
-| 防环回退对"服务器名能被 `[Host]` 直接回答"的代理偏保守（`use-local-host-item-for-proxy` 打开且该名字在 `[Host]` 里有条目时并不成环，DNS 会话仍被旁路成直连） | M2 设计时决定（是否在判断前先问 `Resolver::host_lookup`） |
+| 防环回退对"服务器名能被 `[Host]` 直接回答"的代理偏保守（`use-local-host-item-for-proxy` 打开且该名字在 `[Host]` 里有条目时并不成环，DNS 会话仍被旁路成直连） | 关闭（M2 设计第 9 节第 4 条）：前提不成立——解析器把代理服务器主机名排除在 `[Host]` 之外（rurge-dns 的 `proxy_hostnames`，清单 6.3，有用例钉着），`use-local-host-item-for-proxy` 管的是目标主机名；以域名配置的代理永远需要一次真实查询，旁路是精确的 |
 | 链底下的 REJECT 到不了 `dial_internal` 的 reject 旁路（`ChainConnector` 把它包成 `io::Error`，DNS 会话记为失败而不是直连保底） | M3（策略组） |
 | 链深超过 `MAX_DEPTH` 时 `socket_opener` 给 `None`（不旁路）而注册表给 REJECT，两处说法不一致 | M3，与 `ChainConnector` 的运行期深度守卫一并处理 |

@@ -3449,8 +3449,33 @@ trojan 作链的**入口**（别的策略以 trojan 为 `underlying-proxy`）不
 
 | 任务 | 改动 | 原因 | 提交 |
 | ---- | ---- | ---- | ---- |
+| 1 | 既有用例 `spec::tls::tests::all_six_parameters` 的诊断断言改为"恰好一条 `W0012`" | 该用例同时写了 `server-cert-verify-name` 与指纹，承接事项 1 新增的"verify-name 在不校验证书链时无效"告警正好命中它；字段断言未动 | bdfc38c |
+| 2 | `WsByteStream::poll_write` 改为**写穿**：新增 `queued` 字段，`start_send` 之后立刻 flush，flush 挂起则本次写返回 `Pending`、重试时补报字节数 | 计划给的实现只把帧放进 tungstenite 的 128 KiB 写缓冲，而引擎的转发循环（read → write_all）与 http / socks5 出站都从不 flush——ws 隧道一接入就会卡死。写计划时的验证程序自己调了 flush，所以没暴露。评审（opus）对照库源码发现 | 72d3ec6 |
+| 2 | 随修复轮带上：两个往返用例加有界等待并去掉显式 flush、假服务端回显循环去掉 flush、出站 64 KiB 上限用例、`testing/ws.rs` 的握手错误改固定文本、写在关闭之后映射为 `BrokenPipe`、`MAX_INCOMING` 改私有、两处解释性注释 | 评审的 Minor 与 ⚠️（P7 的出站上限原本没有任何用例观察得到） | 72d3ec6 |
+| 2 | clippy `err_expect`：`.err().expect(…)` → `.expect_err(…)`；rustfmt 重排 | 门禁驱动的机械修正 | 5302465 |
+| 3 | `LazyHead` 的状态机重写：新增 `started`（请求头一旦开始发送就不再增长）；`coalesced` 成为"这些字节已随请求头发出"的唯一依据；`poll_read` 在请求头未发出期间的每一次 `Pending` 都保存 waker | 计划给的 `poll_write` 只看 `head` 不看 `coalesced`：写方把负载并进请求头后得到 `Pending`，同一任务里的读方把请求头（连同负载）发完，写方重试时再写一遍——负载被静默重复发送（trojan + WebSocket 时可达，因为写穿的 `WsByteStream` 会返回 `Pending`）。评审（opus）发现；修正版由控制者先在临时工程里对新旧两版实现各跑一遍交错场景后再交给实现者 | 28e42d0 |
+| 3 | 交错回归用例改用可编排的内层流（`Take(n)` / `Park`） | 控制者第一次给的回归用例在旧实现上并不变红（无操作 waker 下 `sleep(ZERO)` 首次轮询是 `Pending`，旧的读在 `written == 0` 时走定时器分支）——实现者核对时发现；新用例让请求头先发出 2 字节再挂起，旧实现线上读到 `HEAD|payloadpayload+more` | afef3b4 |
+| 3 | 随修复轮带上：trojan 用例里四处 `read_exact` 加 5 秒上界、假服务端的 ATYP 解析 `_ =>` 改 `3 =>`、空口令构建错误的用例、超时用例补下界断言 | 评审的 Minor（实现者自己的 RED 运行就表现为挂起而不是失败） | 28e42d0 |
+| 3 | Step 5 的 RED 预期不成立：桩实现下异步用例是挂起而不是"假服务端回 400" | 桩不发请求头，负载不足 58 字节，双方都在等读；RED 运行改用超时界定 | 075ed3d |
+| 4 | `W0028`（socket 选项 × `underlying-proxy`）的判断块挪进 `if !matches!(proto, Direct \| Reject(_))` 里，并补断言 | Task 1 评审的 Minor：`reject*` 别名带 `underlying-proxy` 时（`read_common` 对 `Applies::Reject` 不清该字段）会得到一条措辞有误导的 `W0028` | c99388e |
+| 4 | 计划 Step 6 的前提"CLI 会对语料库跑 `check`"不成立 | 仓库里没有这样的用例；trojan 的干构建由工厂的正反两个单元用例与 Task 5 的 CLI 用例覆盖 | — |
+| 5 | 用例 `every_m1_protocol_builds` 改名 `every_implemented_protocol_builds` | Task 4 评审的 Minor：它现在也构建 M2 的协议 | a65ea44 |
+| 6 | 提交标题在计划给的基础上多了一句 | Task 4 评审的两条 Minor（三个 trojan 用例里的下标改 `first().expect(..)`、DNS 断言补失败信息并把 `HEAD_GRACE` 注释挪到位）按控制者的指示随同一提交落地 | ea609bd |
+| 6 | 两个用例没有 RED | 开工前裁定：它们钉的是 M1b 已交付的行为（M1b 终审留给 M2 的用例），一上来就应当通过；任何一个变红都是真实缺陷，要停下来报告 | ea609bd |
+| 7 | rustfmt 把一处单行 `assert!` 拆成多行 | 门禁驱动的机械修正 | 0da035f |
 
 ## 延后事项
 
 | 事项 | 去向 |
 | ---- | ---- |
+| `WsByteStream.queued` 与 `LazyHead.coalesced` 都假设"挂起的写会用同一段缓冲重试"；调用方**放弃**一次挂起的写、再写一段不同的缓冲时，会被告知一个不属于它的字节数（`queued` 的情形下 `n > len` 还会让 `write_all` panic）。工作区里没有这样的调用方（`write_all` 与转发循环都用同一段缓冲重试，取消之后不再复用写端） | 整分支终审时分诊（候选加固：`min(queued, data.len())`，`poll_shutdown` 里清零） |
+| `a_write_reaches_the_peer_without_an_explicit_flush` 只给读加了上界；写穿之后，回归会卡在没有上界的 `write_all` 上 | 整分支终审时分诊 |
+| `ws_io` 的 `Capacity` 文本说的是"frame"，该变体也覆盖超大的重组消息与 `TooManyHeaders` | 保持现状（文本已登记进 API 文档） |
+| `is_managed` 在 `rurge-config` 与 `rurge-proto` 各有一份 | 保持现状（开工前裁定：出站不信任调用方，四行） |
+| `the_head_does_not_grow_under_an_inner_write_that_is_pending` 在旧实现上也通过（不变式靠构造保证）；`lazy_head.rs` 测试模块里的 `use` 位置与重复导入 | 整分支终审时分诊（外观） |
+| `LazyHead` 的 `WriteZero` 错误不是粘性的（之后的轮询会再试内层写） | 整分支终审时分诊 |
+| `TrojanSpec` 派生 `Debug`、口令是明文字段（P5：spec 类型沿用 M1 的约定；生产代码里没有任何地方格式化 spec） | 整分支终审时分诊；M2b 加 vmess / anytls 的 spec 时一并考虑给凭据字段包一层不打印的类型 |
+| "需要 server 与 port"的前置检查：trojan 的在引擎工厂里，http / socks5 的在各自的 `from_spec` 里 | M2b（下一个协议落地时收进 proto 或抽公共函数） |
+| Task 4 新增的 pipeline 用例没有像相邻用例那样断言 mock DNS 确实被查询过 | 整分支终审时分诊 |
+| 互操作用例共用的 `roundtrip()` 读回显没有上界（握手本身受 `ConnectOpts` 约束；M1b 的三个用例同样如此） | 整分支终审时分诊（要修就修在辅助函数里） |
+| sing-box 的 trojan 互操作（真实握手、WebSocket 升级、密码错误时的表现）本机无法运行 | 首次推送后的 CI 证明（`RURGE_INTEROP_REQUIRED=1`）；本机不安装 sing-box |

@@ -108,16 +108,16 @@ pub struct ShadowTlsOpts { pub password: String, pub sni: Option<String>, pub ve
 pub struct PolicySpec { /* 现有字段 */ pub shadow_tls: Option<ShadowTlsOpts> }
 ```
 
-凭据字段的 `Debug` 输出一律抹掉（与 `HttpSpec` 的做法一致）。
+spec 类型沿用 M1 的约定派生 `Debug`（测试断言要用；日志与诊断从不打印 spec）；持有凭据派生物的出站对象不实现 `Debug`。
 
 ### 4.2 校验（沿用现有诊断码，不新增）
 
 | 情况 | 处理 |
 | ---- | ---- |
-| `trojan` / `anytls` 缺 `password`；`vmess` 缺 `username` | `E0018`。`password` 接受位置参数（沿用 `read_credentials` 的"命名优先于位置"） |
+| `trojan` / `anytls` 缺 `password`；`vmess` 缺 `username` | `E0018`。trojan 的 `password` 只接受命名写法（手册如此）；位置值不读，按多余的位置参数报 `W0001`——`redact_profile` 只对 `http` / `socks5` 系抹位置凭据，接受位置口令会留下脱敏漏洞。anytls 的同一句留给 M2b 的计划核对 |
 | `vmess` 的 `username` 不是合法 UUID；`encrypt-method` 不是手册列的两个值 | `E0018`（文本不回显取值） |
 | `ws-path` 不以 `/` 开头，或含控制字符 / 空白 | `E0018` |
-| `ws-headers`：按 `\|` 切分、每项按第一个 `:` 切名值；名字不是 HTTP token，或值含 HTAB 以外的控制字符 | `E0018`（与 M1 的 `headers=` 同一规则、同一套函数） |
+| `ws-headers`：按 `\|` 切分、每项按第一个 `:` 切名值；名字不是 HTTP token，或值含 HTAB 以外的控制字符 | `E0018`（与 M1 的 `headers=` 同一规则、同一套函数）；`Connection` / `Upgrade` / `Sec-WebSocket-*` 由握手自己写，出现时 `W0012` 并忽略 |
 | `ws=false`（或没写）却写了 `ws-path` / `ws-headers` | `W0028` |
 | `vmess` 的 `tls=false` 却写了 TLS 参数 | `W0028`（复用 `refuse_tls`） |
 | `shadow-tls-version` 不是 `2` / `3`；`version=3` 缺 `shadow-tls-sni`；`shadow-tls-sni` 不是主机名 | `E0018`（M2c） |
@@ -170,7 +170,7 @@ impl Stack {
 - 适配器 `WsByteStream`（消息流 → 字节流，实现 `AsyncRead + AsyncWrite`）：
   - 读：Binary 帧的负载按序拼接；Text 帧视为协议错误；Ping 由库应答，适配器负责把应答刷出去；Close 视为 EOF。
   - 写：每次 `poll_write` 发一个 Binary 帧；`poll_shutdown` 发 Close 并刷出。
-- 帧与消息的大小上限取有界值（写计划时定具体数字；量级为 1 MiB），超限视为协议错误。
+- 入站帧与消息的大小上限 ≤ 1 MiB，出站每帧 ≤ 64 KiB，超限视为协议错误；tungstenite 要求请求 URI 带 `ws://` scheme、且 `Host` `Connection` `Upgrade` `Sec-WebSocket-Version` `Sec-WebSocket-Key` 五个握手头各恰好一个，它的错误文本会引用头的值，所以一律按变体映射成固定文本。
 - 错误文本：`ws: handshake failed: HTTP <状态码>`（只有状态码）；`ws: <untrusted_text(库的错误文本)>`。服务端给的任何字节都不原样进文本。
 
 ### 5.3 Shadow TLS（`transport::shadow_tls`，M2c）
@@ -204,7 +204,7 @@ impl Stack {
 `connect_tcp` 返回时还不知道第一段负载。返回的流先存着请求头：
 
 - 第一次 `poll_write`：请求头与首段负载合成一次写出——避免"单独一个几十字节的首记录"这一已知的流量特征。
-- **若应用先读**（SSH、SMTP、FTP 这类服务端先说话的协议）：第一次 `poll_read` 之前先把请求头单独刷出，否则死锁。
+- 读在请求头未发出时先等一个宽限期 `HEAD_GRACE`（100 ms）：期间若有一次写，请求头与首段负载一起发出，并唤醒挂在计时器上的读；宽限期内一直没有写（SSH、SMTP、FTP 这类服务端先说话的协议）才把请求头单独刷出。原因：转发循环从隧道建立的那一刻起就在轮询"读"，早于客户端的第一段字节到达；按"应用先读就立刻单独发出"的原始设计，请求头会几乎总是单独发出，合并的意图落空。
 - `poll_shutdown` 之前若请求头仍未发出，同样先刷出。
 
 ### 6.2 Trojan（M2a）
@@ -374,8 +374,8 @@ pub trait OutboundFactory: Send + Sync {
 
 | 编号 | 事项 | 计划 |
 | ---- | ---- | ---- |
-| V1 | `tokio-tungstenite` / `tungstenite` 的确切版本、`client_async_with_config` 对自带 `http::Request` 要求调用方提供哪些头、`WebSocketConfig` 的上限字段名与取值（5.2 的帧 / 消息上限）、给 `Cargo.lock` 新增的条目数 | a |
-| V2 | sing-box 1.14.1 的 trojan 入站与 ws 传输的配置写法（发布版是否需要额外的构建标签） | a |
+| V1 | `tokio-tungstenite` / `tungstenite` 的确切版本、`client_async_with_config` 对自带 `http::Request` 要求调用方提供哪些头、`WebSocketConfig` 的上限字段名与取值（5.2 的帧 / 消息上限）、给 `Cargo.lock` 新增的条目数（已核对：M2a 计划 P1–P3、P7 / P10） | a |
+| V2 | sing-box 1.14.1 的 trojan 入站与 ws 传输的配置写法（发布版是否需要额外的构建标签）（已核对：M2a 计划 P1–P3、P7 / P10） | a |
 | V3 | VMess AEAD 的逐字节格式与 KDF 标签串（对照 v2fly / sing-vmess 源码）；向量的出处 | b |
 | V4 | AnyTLS v2 的逐字节格式、默认 padding 方案、`padding-md5` 的算法（对照 anytls-go 的协议文档与源码）；`cmdUpdatePaddingScheme` 的有界校验取值（6.3：条目数与单项长度的上限） | b |
 | V5 | xray 的固定版本、三个平台的包名与 SHA256、只含回环入站的最小配置 | b |
@@ -390,6 +390,22 @@ pub trait OutboundFactory: Send + Sync {
 **M2b（约 11 个任务）**：① vmess 配置（含 4.3）→ ② vmess 编解码与向量 → ③ vmess 出站与假服务端 → ④ anytls 配置 → ⑤ anytls 会话层与 padding → ⑥ anytls 的池、出站与假服务端 → ⑦ `ResolverCell` 与 `publish_generation` → ⑧ 按指纹复用 → ⑨ 引擎装配、端到端、能力表翻转 → ⑩ 互操作（sing-box + xray，CI）→ ⑪ 文档。
 
 **M2c（约 7 个任务）**：① 配置与约束 → ② TLS 记录编解码与帧化流 → ③ v2 → ④ v3（附录 A）→ ⑤ 假服务端、接入 `Stack`、迁移 http / socks5 出站 → ⑥ 互操作 → ⑦ 文档。
+
+## 17. M2a 实施期的订正
+
+本节登记 M2a 计划的「计划期决定」（`global-constraints.md` P1–P14）里与本文件文字不同的地方，以及实施期核对源码（`crates/rurge-proto/src/{trojan,transport/ws,transport/lazy_head}.rs`、`crates/rurge-config/src/spec/{tls,ws,trojan}.rs`）后发现的出入。逐条对应实现的提交见 `docs/superpowers/plans/2026-09-20-phase2-m2a-trojan-plan.md` 末尾「执行期修正记录」。
+
+| 编号 | 设计原文 | 订正 |
+| ---- | -------- | ---- |
+| P5 | 4.1："凭据字段的 `Debug` 输出一律抹掉（与 `HttpSpec` 的做法一致）" | spec 类型沿用 M1 的约定派生 `Debug`（测试断言要用；日志与诊断从不打印 spec）；持有凭据派生物的出站对象不实现 `Debug` |
+| P4 | 4.2 第一行："`password` 接受位置参数（沿用 `read_credentials` 的"命名优先于位置"）" | trojan 的 `password` 只接受命名写法（手册如此）；位置值不读，按多余的位置参数报 `W0001`——`redact_profile` 只对 `http` / `socks5` 系抹位置凭据，接受位置口令会留下脱敏漏洞。anytls 的同一句留给 M2b 的计划核对 |
+| P2 | 4.2 `ws-headers` 一行只写 `E0018`（与 M1 的 `headers=` 同一规则、同一套函数） | 追加：`Connection` / `Upgrade` / `Sec-WebSocket-*` 由握手自己写，出现时 `W0012` 并忽略 |
+| P14 | 6.1："若应用先读（SSH、SMTP、FTP 这类服务端先说话的协议）：第一次 `poll_read` 之前先把请求头单独刷出，否则死锁" | 读在请求头未发出时先等 `HEAD_GRACE`（100 ms）；期间有写 → 头与首段负载一起发出并唤醒挂起的读；一直没有写 → 头单独发出。原因：转发循环从隧道建立起就在轮询读，远早于客户端第一段字节到达，按设计原文请求头会几乎总是单独发出，合并的意图落空 |
+| P7 | 5.2："帧与消息的大小上限取有界值（写计划时定具体数字；量级为 1 MiB）" | 入站帧与消息 ≤ 1 MiB，出站每帧 ≤ 64 KiB；并补一句（P2 / P3）：tungstenite 要求请求 URI 带 `ws://` scheme、五个握手头各恰好一个；它的错误文本会引用头的值，所以一律按变体映射成固定文本 |
+| 任务 2 | 5.2 只说"写：每次 `poll_write` 发一个 Binary 帧"，未说明成功返回是否意味着字节已到达下一层 | `WsByteStream` 是写穿的：`poll_write` 在报告成功之前会驱动 tungstenite 自己的写缓冲一并刷出（进而推动下层，如内层 TLS），调用方不需要、工作区里也没有任何调用方会再显式 `flush` |
+| 任务 3 | 6.1 只说"第一次 `poll_write`：请求头与首段负载合成一次写出"，未说明请求头一旦开始发送之后能否继续并入后续的写 | `LazyHead` 一旦开始发送请求头（第一次内层 `poll_write`）就不再增长：`coalesced` 是"这些字节已随请求头发出"的唯一依据，之后任何一次读或写都不会让同一段负载被再发送一次 |
+
+实施中发现的新出入由各任务追加。
 
 ## 附录 A　Shadow TLS v3：在 stock rustls 上签名 ClientHello
 
