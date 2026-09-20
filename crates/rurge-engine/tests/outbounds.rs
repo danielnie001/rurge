@@ -1176,3 +1176,54 @@ async fn a_selection_whose_member_is_gone_falls_back_to_the_first_member() {
         Some("A")
     );
 }
+
+#[tokio::test]
+async fn a_connector_built_before_a_reload_resolves_through_the_new_generation() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(echo),
+        ..Socks5Script::default()
+    })
+    .await;
+    let proxies = format!("S = socks5, proxy.test, {}", upstream.addr().port());
+    let h = harness(Profile {
+        proxies: &proxies,
+        rules: "DOMAIN,target.test,S",
+        ..Profile::default()
+    })
+    .await;
+    h.dns.set("proxy.test", &["127.0.0.1"], &[], 60);
+    // the outbound of the first generation, connectors and all
+    let old = h
+        .engine
+        .runtime()
+        .policies
+        .resolve(&rurge_config::rule::PolicyRef::parse("S"))
+        .outbound;
+
+    // the next generation asks another server
+    let other = MockDns::spawn().await;
+    other.set("proxy.test", &["127.0.0.1"], &[], 60);
+    let next = Profile {
+        proxies: &proxies,
+        rules: "DOMAIN,target.test,S",
+        ..Profile::default()
+    }
+    .text(other.addr());
+    let next = runtime(h.dir.path(), &next, h.engine.shared()).await;
+    h.engine.swap_runtime(next);
+
+    let target =
+        rurge_net::connector::Target::new(rurge_config::HostName::Ip(echo.ip()), echo.port());
+    let mut stream = old
+        .connect_tcp(&target, &rurge_net::connector::ConnectOpts::default())
+        .await
+        .expect("the old outbound still dials");
+    stream.write_all(b"ping").await.unwrap();
+    let mut buf = [0u8; 4];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"ping");
+    let asked = |dns: &MockDns| dns.queries().iter().any(|(q, _)| q.name == "proxy.test");
+    assert!(asked(&other), "the new generation's resolver was asked");
+    assert!(!asked(&h.dns), "the old generation's resolver was not");
+}

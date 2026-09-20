@@ -161,6 +161,7 @@ impl Engine {
         // Publish the first generation before anything can dial through it.
         let shared = runtime.shared.clone();
         shared.cell.store(runtime.policies.clone());
+        shared.resolver.store(runtime.stack.resolver.clone());
         let engine = Arc::new(Engine {
             runtime: ArcSwap::from_pointee(runtime),
             next_session: AtomicU64::new(0),
@@ -341,13 +342,17 @@ impl Engine {
         self.shared.clone()
     }
 
-    /// Makes `next`'s registry the one chain connectors resolve against.
-    pub(crate) fn publish_registry(&self, next: &Runtime) {
+    /// Makes `next` the generation that outlives-a-reload objects see: chain
+    /// connectors resolve against its registry, direct connectors through
+    /// its resolver.
+    pub(crate) fn publish_generation(&self, next: &Runtime) {
         assert!(
-            Arc::ptr_eq(&self.shared.cell, &next.shared.cell),
+            Arc::ptr_eq(&self.shared.cell, &next.shared.cell)
+                && Arc::ptr_eq(&self.shared.resolver, &next.shared.resolver),
             "the next generation must be built with `Engine::shared()`"
         );
         self.shared.cell.store(next.policies.clone());
+        self.shared.resolver.store(next.stack.resolver.clone());
     }
 }
 

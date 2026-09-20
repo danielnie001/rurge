@@ -50,9 +50,11 @@ impl Runtime {
         let stack = build_stack(&config, &opts.stack).await?;
         let rules =
             RuleEngine::build_with_registry(&config, stack.registry.clone(), stack.geo.clone())?;
+        // The cell, not this generation's resolver: an outbound may outlive
+        // the generation it was built in (M2 design 7.2).
         let factory = crate::outbounds::EngineFactory::new(
             &config,
-            stack.resolver.clone(),
+            opts.shared.resolver.clone(),
             opts.stack.socket_hook.clone(),
         );
         // The dry build has already turned every build failure into a load
