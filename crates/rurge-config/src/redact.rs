@@ -16,9 +16,10 @@ const SECRET_KEYS: [&str; 7] = [
 /// Inline `name=value` parameters redacted wherever they appear in a value.
 /// `username` also covers harmless SSH user names; `headers` and `ws-headers`
 /// are blanked whole (header names included), and so is `ws-path`, which
-/// nodes behind a CDN routinely use as a shared secret. Over-redacting is the
-/// safe side for an endpoint whose purpose is safe output.
-const SECRET_PARAMS: [&str; 11] = [
+/// nodes behind a CDN routinely use as a shared secret. `shadow-tls-password`
+/// needs its own entry: `password` only matches at a token boundary.
+/// Over-redacting is the safe side for an endpoint whose purpose is safe output.
+const SECRET_PARAMS: [&str; 12] = [
     "password",
     "psk",
     "private-key",
@@ -30,6 +31,7 @@ const SECRET_PARAMS: [&str; 11] = [
     "headers",
     "ws-headers",
     "ws-path",
+    "shadow-tls-password",
 ];
 const KEY_AT_KEYS: [&str; 4] = [
     "http-api",
@@ -397,6 +399,13 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
                 "trojan, t.test, 443, password=pw0rd, ws=true, ws-path=/s3cretpath, ws-headers=Host:edge.test|X-Key:k3y"
             ),
             "trojan, t.test, 443, password=***, ws=true, ws-path=***, ws-headers=***"
+        );
+        // not covered by `password`: that one only matches at a token boundary
+        assert_eq!(
+            redact_definition(
+                "snell, 1.2.3.4, 443, psk=pwd1, shadow-tls-password=pwd2, shadow-tls-sni=example.com"
+            ),
+            "snell, 1.2.3.4, 443, psk=***, shadow-tls-password=***, shadow-tls-sni=example.com"
         );
     }
 

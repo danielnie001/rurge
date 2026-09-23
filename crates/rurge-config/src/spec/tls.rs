@@ -60,7 +60,7 @@ fn parse_fingerprint(value: &str) -> Option<[u8; 32]> {
 /// at most 253 bytes whose labels are 1-63 of `[A-Za-z0-9_-]`, do not start
 /// or end with `-`, and whose last label is not all digits. One trailing dot
 /// is fine. An IDN must be written in its `xn--` form.
-fn is_server_name(name: &str) -> bool {
+pub(crate) fn is_server_name(name: &str) -> bool {
     if name.parse::<std::net::IpAddr>().is_ok() {
         return true;
     }
