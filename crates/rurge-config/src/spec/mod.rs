@@ -2,6 +2,7 @@
 
 pub mod anytls;
 pub mod common;
+pub mod group;
 pub mod http;
 pub mod reader;
 pub mod secret;
@@ -14,6 +15,9 @@ pub mod ws;
 
 pub use anytls::AnyTlsSpec;
 pub use common::{Applies, CommonOpts, IpVersion, Tristate};
+pub use group::{
+    GroupOutcome, GroupSpec, ImportOpts, PolicyPath, Priority, TestOpts, to_group_spec,
+};
 pub use http::{HeaderPart, HeaderTemplate, HttpSpec};
 pub use reader::ParamReader;
 pub use secret::Secret;

@@ -144,6 +144,7 @@ pub mod codes {
     pub const E_DUPLICATE_NAME: &str = "E0006";
     pub const E_UNKNOWN_POLICY_REF: &str = "E0007";
     pub const E_UNKNOWN_GROUP_MEMBER: &str = "E0008";
+    /// Retired in phase 2 M3: a group cycle is `W0030` and no longer stops a load.
     pub const E_GROUP_CYCLE: &str = "E0009";
     pub const E_MISSING_FINAL: &str = "E0010";
     pub const E_INVALID_RULE_VALUE: &str = "E0011";
@@ -201,6 +202,8 @@ pub mod codes {
     pub const W_PARAM_NOT_APPLICABLE: &str = "W0028";
     /// A parameter that is parsed but has no effect in this version.
     pub const W_PARAM_NOT_EFFECTIVE: &str = "W0029";
+    /// Policy groups that reference each other; they behave as REJECT.
+    pub const W_GROUP_CYCLE: &str = "W0030";
     pub const I_LEGACY_MIGRATED: &str = "I0001";
     pub const I_LINE_DISABLED: &str = "I0002";
     /// GeoIP / ASN database file not present yet.

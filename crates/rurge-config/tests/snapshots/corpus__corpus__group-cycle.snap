@@ -1,0 +1,18 @@
+---
+source: crates/rurge-config/tests/corpus.rs
+expression: "(loaded.config.summary(), diags)"
+---
+- listeners: []
+  policies: []
+  groups:
+    - "A (select) -> [B]"
+    - "B (select) -> [A]"
+  rules:
+    - "FINAL,A"
+  rulesets: []
+  hosts: []
+  keystore: []
+  deferred: []
+  unknown_sections: []
+  managed: ~
+- - "warning[W0030] valid/group-cycle.conf:3: policy groups `B` and `A` form a cycle; they behave as REJECT"

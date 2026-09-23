@@ -12,10 +12,10 @@ use crate::policy::{
 use crate::requirement::{self, Environment};
 use crate::rule::{ParseCtx, PolicyRef, Rule, RuleKind, SubRule, parse_rule, parse_subrule};
 use crate::span::Span;
-use crate::spec::{NameKind, PolicySpec, SpecEnv, to_spec};
+use crate::spec::{GroupSpec, NameKind, PolicySpec, SpecEnv, to_group_spec, to_spec};
 use crate::text::include::{self, IncludeOptions};
 use crate::text::{Origin, Profile, SectionKind, parse_str};
-use crate::value::split_definition;
+use crate::value::{split_definition, split_list};
 use base64::Engine as _;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -178,6 +178,9 @@ pub struct Config {
     /// `policies`; policies with errors are absent).
     pub specs: Vec<PolicySpec>,
     pub groups: Vec<PolicyGroup>,
+    /// Typed parameters of every group (same order as `groups`; groups
+    /// with errors are absent).
+    pub group_specs: Vec<GroupSpec>,
     pub rules: Vec<Rule>,
     pub rulesets: Vec<InlineRuleset>,
     pub hosts: Vec<HostEntry>,
@@ -222,6 +225,15 @@ impl Config {
 
     pub fn spec(&self, name: &str) -> Option<&PolicySpec> {
         self.specs.iter().find(|s| s.name == name)
+    }
+
+    /// What `name` refers to, as a policy or group line sees it.
+    pub fn name_kind(&self, name: &str) -> Option<NameKind> {
+        Some(match self.resolve_policy(name)? {
+            PolicyTarget::Builtin(b) => NameKind::Builtin(b),
+            PolicyTarget::Proxy(p) => NameKind::Policy(p.kind),
+            PolicyTarget::Group(_) => NameKind::Group,
+        })
     }
 
     pub fn summary(&self) -> ConfigSummary {
@@ -639,6 +651,7 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
         policies,
         specs: Vec::new(),
         groups,
+        group_specs: Vec::new(),
         rules,
         rulesets,
         hosts,
@@ -648,7 +661,7 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
         unknown_sections,
         source: SourceInfo { main, includes },
     };
-    validate(&mut config, opts, &mut diags);
+    validate(&mut config, base_dir, opts, &mut diags);
     Loaded {
         config,
         diagnostics: diags,
@@ -665,14 +678,30 @@ fn group_refs(g: &PolicyGroup) -> Vec<String> {
         .collect()
 }
 
+/// `group_refs` plus the groups whose members `include-other-group` takes:
+/// every edge a group cycle can run along.
+fn group_edges(g: &PolicyGroup) -> Vec<String> {
+    let mut edges = group_refs(g);
+    if let Some(v) = g.params.get("include-other-group") {
+        edges.extend(split_list(v));
+    }
+    edges
+}
+
 fn is_base64(text: &str) -> bool {
     use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
     STANDARD.decode(text).is_ok() || STANDARD_NO_PAD.decode(text).is_ok()
 }
 
-/// `E0019`: follows `underlying-proxy` edges and group membership from each
-/// chained policy; reaching the policy again is a cycle.
-fn underlying_cycles(config: &Config, specs: &[PolicySpec], diags: &mut Diagnostics) {
+/// `E0019`: follows `underlying-proxy` edges, group membership and
+/// `include-other-group` from each chained policy and from each group with a
+/// relay of its own; reaching the start again is a cycle.
+fn underlying_cycles(
+    config: &Config,
+    specs: &[PolicySpec],
+    groups: &[GroupSpec],
+    diags: &mut Diagnostics,
+) {
     let mut edges: HashMap<&str, Vec<String>> = HashMap::new();
     for s in specs {
         if let Some(u) = &s.common.underlying_proxy {
@@ -680,19 +709,23 @@ fn underlying_cycles(config: &Config, specs: &[PolicySpec], diags: &mut Diagnost
         }
     }
     for g in &config.groups {
-        edges.insert(g.name.as_str(), group_refs(g));
+        let mut next = group_edges(g);
+        // every proxy member of a group with a relay is dialled through it
+        if let Some(relay) = groups
+            .iter()
+            .find(|s| s.name == g.name)
+            .and_then(|s| s.underlying_proxy.clone())
+        {
+            next.push(relay);
+        }
+        edges.insert(g.name.as_str(), next);
     }
-    for s in specs {
-        let Some(first) = &s.common.underlying_proxy else {
-            continue;
-        };
+    let leads_back = |start: &str, first: &str| {
         let mut seen: HashSet<String> = HashSet::new();
-        let mut stack = vec![first.clone()];
-        let mut cyclic = false;
+        let mut stack = vec![first.to_string()];
         while let Some(name) = stack.pop() {
-            if name == s.name {
-                cyclic = true;
-                break;
+            if name == start {
+                return true;
             }
             if seen.insert(name.clone())
                 && let Some(next) = edges.get(name.as_str())
@@ -700,7 +733,12 @@ fn underlying_cycles(config: &Config, specs: &[PolicySpec], diags: &mut Diagnost
                 stack.extend(next.iter().cloned());
             }
         }
-        if cyclic {
+        false
+    };
+    for s in specs {
+        if let Some(first) = &s.common.underlying_proxy
+            && leads_back(&s.name, first)
+        {
             diags.push(
                 Diagnostic::error(
                     codes::E_UNDERLYING_PROXY_CYCLE,
@@ -713,9 +751,25 @@ fn underlying_cycles(config: &Config, specs: &[PolicySpec], diags: &mut Diagnost
             );
         }
     }
+    for g in groups {
+        if let Some(first) = &g.underlying_proxy
+            && leads_back(&g.name, first)
+        {
+            diags.push(
+                Diagnostic::error(
+                    codes::E_UNDERLYING_PROXY_CYCLE,
+                    format!(
+                        "policy group `{}`: `underlying-proxy` leads back to the group itself (via `{first}`)",
+                        g.name
+                    ),
+                )
+                .at(g.span.clone()),
+            );
+        }
+    }
 }
 
-fn validate(config: &mut Config, opts: &LoadOptions, diags: &mut Diagnostics) {
+fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mut Diagnostics) {
     let exists = |name: &str, config: &Config| config.resolve_policy(name).is_some();
 
     // Rule policy references.
@@ -767,7 +821,8 @@ fn validate(config: &mut Config, opts: &LoadOptions, diags: &mut Diagnostics) {
         }
     }
 
-    // Group cycles (DFS with colours) over every reference kind.
+    // Group cycles (DFS with colours) over every reference kind: a warning,
+    // the groups on one behave as REJECT (phase 2 M3 design 5.6).
     let index: HashMap<&str, usize> = config
         .groups
         .iter()
@@ -783,14 +838,14 @@ fn validate(config: &mut Config, opts: &LoadOptions, diags: &mut Diagnostics) {
         diags: &mut Diagnostics,
     ) {
         colour[i] = 1;
-        for m in group_refs(&groups[i]) {
+        for m in group_edges(&groups[i]) {
             if let Some(&j) = index.get(m.as_str()) {
                 if colour[j] == 1 {
                     diags.push(
-                        Diagnostic::error(
-                            codes::E_GROUP_CYCLE,
+                        Diagnostic::warning(
+                            codes::W_GROUP_CYCLE,
                             format!(
-                                "policy group `{}` and `{}` reference each other",
+                                "policy groups `{}` and `{}` form a cycle; they behave as REJECT",
                                 groups[i].name, groups[j].name
                             ),
                         )
@@ -849,16 +904,10 @@ fn validate(config: &mut Config, opts: &LoadOptions, diags: &mut Diagnostics) {
         }
     }
 
-    // Typed policy parameters (phase 2 M1 design §4).
-    let specs = {
+    // Typed policy and group parameters (phase 2 M1 design §4, M3 design §4).
+    let (specs, group_specs) = {
         let cfg: &Config = config;
-        let lookup = |name: &str| -> Option<NameKind> {
-            Some(match cfg.resolve_policy(name)? {
-                PolicyTarget::Builtin(b) => NameKind::Builtin(b),
-                PolicyTarget::Proxy(p) => NameKind::Policy(p.kind),
-                PolicyTarget::Group(_) => NameKind::Group,
-            })
-        };
+        let lookup = |name: &str| cfg.name_kind(name);
         let env = SpecEnv {
             keystore: &cfg.keystore,
             lookup: &lookup,
@@ -906,10 +955,19 @@ fn validate(config: &mut Config, opts: &LoadOptions, diags: &mut Diagnostics) {
             }
             specs.extend(outcome.spec);
         }
-        underlying_cycles(cfg, &specs, diags);
-        specs
+        let mut group_specs = Vec::new();
+        for g in &cfg.groups {
+            let outcome = to_group_spec(g, base_dir, &lookup);
+            for d in outcome.diagnostics {
+                diags.push(d);
+            }
+            group_specs.extend(outcome.spec);
+        }
+        underlying_cycles(cfg, &specs, &group_specs, diags);
+        (specs, group_specs)
     };
     config.specs = specs;
+    config.group_specs = group_specs;
 
     // Capabilities.
     let mut seen_kinds: HashSet<PolicyKind> = HashSet::new();
@@ -1000,8 +1058,80 @@ mod tests {
         let c = codes_of(&l);
         assert!(c.contains(&codes::E_UNKNOWN_POLICY_REF));
         assert!(c.contains(&codes::E_UNKNOWN_GROUP_MEMBER));
-        assert!(c.contains(&codes::E_GROUP_CYCLE));
+        assert!(c.contains(&codes::W_GROUP_CYCLE));
         assert!(l.diagnostics.has_errors());
+    }
+
+    /// Through members and through `include-other-group` alike; no longer
+    /// an error (M3 design 5.6).
+    #[test]
+    fn a_group_cycle_is_a_warning() {
+        let l = load_text(
+            "[Proxy]\nA = direct\n[Proxy Group]\nG1 = select, G2, A\nG2 = select, G1\n\
+G3 = select, A, include-other-group=G4\nG4 = select, A, include-other-group=G3\n[Rule]\nFINAL,G1\n",
+        );
+        assert!(
+            !l.diagnostics.has_errors(),
+            "{:?}",
+            l.diagnostics.into_vec()
+        );
+        let found: Vec<&str> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::W_GROUP_CYCLE)
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "policy groups `G2` and `G1` form a cycle; they behave as REJECT",
+                "policy groups `G4` and `G3` form a cycle; they behave as REJECT"
+            ]
+        );
+        let names: Vec<&str> = l
+            .config
+            .group_specs
+            .iter()
+            .map(|g| g.name.as_str())
+            .collect();
+        assert_eq!(names, ["G1", "G2", "G3", "G4"]);
+    }
+
+    #[test]
+    fn a_group_relay_that_leads_back_to_the_group_is_an_error() {
+        let l = load_text(
+            "[Proxy]\nA = http, a.test, 80\n[Proxy Group]\nG = select, A, underlying-proxy=Pick\n\
+Pick = select, G, DIRECT\n[Rule]\nFINAL,G\n",
+        );
+        let errors: Vec<String> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == crate::Severity::Error)
+            .map(|d| format!("{} {}", d.code, d.message))
+            .collect();
+        assert_eq!(
+            errors,
+            [
+                "E0019 policy group `G`: `underlying-proxy` leads back to the group itself (via `Pick`)"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_relative_policy_path_is_resolved_against_the_main_profile() {
+        let l =
+            load_text("[Proxy Group]\nG = select, policy-path=sub/nodes.txt\n[Rule]\nFINAL,G\n");
+        assert!(
+            !l.diagnostics.has_errors(),
+            "{:?}",
+            l.diagnostics.into_vec()
+        );
+        assert_eq!(
+            l.config.group_specs[0].import.policy_path,
+            Some(crate::spec::PolicyPath::File(
+                Path::new("/profiles").join("sub/nodes.txt")
+            ))
+        );
     }
 
     #[test]

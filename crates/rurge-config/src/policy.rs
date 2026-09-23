@@ -343,7 +343,31 @@ pub struct PolicyGroup {
     pub span: Span,
 }
 
-const SUBNET_GROUP_PARAMS: &[&str] = &["default", "cellular", "hidden", "icon-url"];
+/// Every parameter a group line can carry. On a `subnet` group these stay
+/// parameters; any other `key = value` item there is a network condition.
+const GROUP_PARAMS: &[&str] = &[
+    "default",
+    "cellular",
+    "hidden",
+    "icon-url",
+    "category",
+    "no-alert",
+    "url",
+    "underlying-proxy",
+    "policy-path",
+    "update-interval",
+    "policy-regex-filter",
+    "external-policy-name-prefix",
+    "external-policy-modifier",
+    "include-all-proxies",
+    "include-other-group",
+    "interval",
+    "tolerance",
+    "timeout",
+    "evaluate-before-use",
+    "persistent",
+    "policy-priority",
+];
 
 pub fn parse_group(name: &str, definition: &str, span: &Span) -> Result<PolicyGroup, ParseError> {
     let fields = split_list(definition);
@@ -366,7 +390,7 @@ pub fn parse_group(name: &str, definition: &str, span: &Span) -> Result<PolicyGr
         match parse_key_value(field) {
             Some((k, v)) => {
                 if kind == GroupKind::Subnet
-                    && !SUBNET_GROUP_PARAMS.contains(&k.to_ascii_lowercase().as_str())
+                    && !GROUP_PARAMS.contains(&k.to_ascii_lowercase().as_str())
                 {
                     conditions.push((SubnetExpr::parse(k)?, v.to_string()));
                 } else {

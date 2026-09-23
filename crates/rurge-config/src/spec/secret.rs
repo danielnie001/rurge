@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct Secret<T>(T);
 
 impl<T> Secret<T> {

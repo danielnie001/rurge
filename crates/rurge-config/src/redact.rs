@@ -17,9 +17,11 @@ const SECRET_KEYS: [&str; 7] = [
 /// `username` also covers harmless SSH user names; `headers` and `ws-headers`
 /// are blanked whole (header names included), and so is `ws-path`, which
 /// nodes behind a CDN routinely use as a shared secret. `shadow-tls-password`
-/// needs its own entry: `password` only matches at a token boundary.
+/// needs its own entry: `password` only matches at a token boundary. A
+/// group's `policy-path` usually carries a subscription token, and its
+/// `external-policy-modifier` can set any parameter, a password included.
 /// Over-redacting is the safe side for an endpoint whose purpose is safe output.
-const SECRET_PARAMS: [&str; 12] = [
+const SECRET_PARAMS: [&str; 14] = [
     "password",
     "psk",
     "private-key",
@@ -32,6 +34,8 @@ const SECRET_PARAMS: [&str; 12] = [
     "ws-headers",
     "ws-path",
     "shadow-tls-password",
+    "policy-path",
+    "external-policy-modifier",
 ];
 const KEY_AT_KEYS: [&str; 4] = [
     "http-api",
@@ -503,6 +507,23 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
         assert_eq!(
             redact_profile("peer = (pre-shared-key = PSK1, endpoint = 1.2.3.4:51820)"),
             "peer = (pre-shared-key = ***, endpoint = 1.2.3.4:51820)"
+        );
+    }
+
+    /// A subscription URL usually carries a token, and a modifier can set any
+    /// parameter of the imported lines, a password included (M3-D7).
+    #[test]
+    fn a_group_line_loses_its_subscription_and_its_modifier() {
+        assert_eq!(
+            redact_definition(
+                "select, A, policy-path=https://sub.test/nodes?token=t0k3n, update-interval=3600, external-policy-modifier=\"password=hunter2,tfo=true\", policy-regex-filter=^HK"
+            ),
+            "select, A, policy-path=***, update-interval=3600, external-policy-modifier=***, policy-regex-filter=^HK"
+        );
+        // a local file goes all the same: the safe side
+        assert_eq!(
+            redact_profile("G = select, policy-path=nodes.txt"),
+            "G = select, policy-path=***"
         );
     }
 }
