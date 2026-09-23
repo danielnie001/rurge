@@ -111,13 +111,26 @@ impl Profile<'_> {
 }
 
 pub async fn harness(p: Profile<'_>) -> Harness {
+    harness_with(p, EngineShared::default()).await
+}
+
+/// An engine whose outbounds trust `roots` instead of the operating system's.
+pub async fn harness_trusting(p: Profile<'_>, roots: Arc<rustls::RootCertStore>) -> Harness {
+    let shared = EngineShared {
+        roots: Some(roots),
+        ..EngineShared::default()
+    };
+    harness_with(p, shared).await
+}
+
+async fn harness_with(p: Profile<'_>, shared: EngineShared) -> Harness {
     let dns = MockDns::spawn().await;
     for name in ["target.test", "alt.test"] {
         dns.set(name, &["127.0.0.1"], &[], 60);
     }
     let dir = tempfile::tempdir().unwrap();
     let text = p.text(dns.addr());
-    let engine = Engine::new(runtime(dir.path(), &text, EngineShared::default()).await);
+    let engine = Engine::new(runtime(dir.path(), &text, shared).await);
     let listeners = engine.bind_listeners().await.unwrap();
     Harness {
         dir,

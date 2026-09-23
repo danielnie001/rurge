@@ -52,11 +52,19 @@ impl Runtime {
             RuleEngine::build_with_registry(&config, stack.registry.clone(), stack.geo.clone())?;
         // The cell, not this generation's resolver: an outbound may outlive
         // the generation it was built in (M2 design 7.2).
-        let factory = crate::outbounds::EngineFactory::new(
-            &config,
-            opts.shared.resolver.clone(),
-            opts.stack.socket_hook.clone(),
-        );
+        let factory = match &opts.shared.roots {
+            Some(roots) => crate::outbounds::EngineFactory::with_roots(
+                &config,
+                opts.shared.resolver.clone(),
+                opts.stack.socket_hook.clone(),
+                roots.clone(),
+            ),
+            None => crate::outbounds::EngineFactory::new(
+                &config,
+                opts.shared.resolver.clone(),
+                opts.stack.socket_hook.clone(),
+            ),
+        };
         // The generation being replaced (none on the first build): whatever
         // it built from the same fingerprint is kept, connection pools and all.
         let previous = opts.shared.cell.load();

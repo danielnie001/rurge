@@ -4,6 +4,7 @@ use arc_swap::ArcSwapOption;
 use rurge_net::BoxFuture;
 use rurge_net::connector::Resolve;
 use rurge_policy::{GroupSelections, RegistryCell, SelectionTable};
+use rustls::RootCertStore;
 use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -40,7 +41,7 @@ impl Resolve for ResolverCell {
 }
 
 /// Created once per engine — before the first `Runtime::build`, because the
-/// registry built there already needs all three — and handed to every later
+/// registry built there already needs them — and handed to every later
 /// `Runtime::build` of the same engine (`Engine::shared`).
 #[derive(Clone)]
 pub struct EngineShared {
@@ -50,6 +51,11 @@ pub struct EngineShared {
     pub selections: Arc<SelectionTable>,
     /// Where direct connectors find the current generation's resolver.
     pub resolver: Arc<ResolverCell>,
+    /// The trust anchors of every outbound's TLS. `None`: the operating
+    /// system's. They belong here because they must not change while the
+    /// engine lives: a reload reuses outbounds by a fingerprint the roots are
+    /// not part of. Tests bring their own CA this way.
+    pub roots: Option<Arc<RootCertStore>>,
 }
 
 impl EngineShared {
@@ -58,6 +64,7 @@ impl EngineShared {
             cell: RegistryCell::new(),
             selections: Arc::new(SelectionTable::new(initial)),
             resolver: ResolverCell::new(),
+            roots: None,
         }
     }
 }
