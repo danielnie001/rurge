@@ -47,7 +47,7 @@
 | ------ | ---- | ---- | ------------ |
 | **M1 出站地基与 HTTP / SOCKS5 上游** | `PolicySpec` 类型化（通用参数、TLS 参数）、`[Keystore]`、`Outbound` 与演进后的 `Connector` 抽象、`DirectConnector`（`interface` `allow-other-interface` `ip-version` `tfo` `tos`）、`ChainConnector`（`underlying-proxy`）、TLS 层、`http` `https` `socks5` `socks5-tls`（TCP，含明文 HTTP 的绝对 URI 转发）、`OutboundFactory` 与注册表接入真实出站、`select` 组语义补全、`rurge check` 干构建、策略 / 组只读与 select 的 API、三层测试的基础设施 | FR-CFG-11（p12）、FR-OUT-03（部分）/ 04（TLS）/ 05 / 08 / 09、FR-GRP-05（部分）/ 06、FR-DNS-07 | 真实配置经 HTTP(S) / SOCKS5 上游与两级链式代理转发；对 sing-box 的互操作测试通过 |
 | **M2 TLS 族** | WebSocket 层、Shadow TLS v2 / v3、`trojan`、`vmess`（AEAD）、`anytls`；细化设计（`2026-09-20-phase2-m2-tls-family-design.md`）把它拆成三份计划：M2a（Trojan 优先，含 WebSocket 层）→ M2b（VMess / AnyTLS，含按指纹复用出站）→ M2c（Shadow TLS） | FR-OUT-04（Shadow TLS）/ 05 | 三种协议各自带 / 不带 WebSocket、Shadow TLS 对参考实现转发通过 |
-| **M3 策略组、订阅与连通性测试** | 连通性测试、`url-test` `fallback` `load-balance` `smart`、全部组参数、`policy-path` / `include-*` 装配、嵌套 / 环 / 兜底、临时覆盖、组级 `underlying-proxy`、订阅更新热重建、测试与切换 API | FR-OUT-03（`test-url` `test-timeout`）/ 10、FR-GRP-01 / 03 ～ 07 | 订阅样本解析正确；组算法单测与端到端测试；API 测试与切换正确 |
+| **M3 策略组、订阅与连通性测试** | 连通性测试、`url-test` `fallback` `load-balance` `smart`、全部组参数、`policy-path` / `include-*` 装配、嵌套 / 环 / 兜底、临时覆盖、组级 `underlying-proxy`、订阅更新热重建、测试与切换 API | FR-OUT-03（`test-url` `test-timeout`）/ 10、FR-GRP-01 / 03 ～ 07 | 订阅样本解析正确；组算法单测与端到端测试；API 测试与切换正确。M3 细化设计 `2026-09-23-phase2-m3-groups-subscriptions-design.md`把它拆成三份计划：M3a（成员装配与订阅，订阅优先）→ M3b（测速与 `url-test` / `fallback` / `load-balance`）→ M3c（`smart`） |
 | **M4 WireGuard / SSH / external** | `rurge-proto-wireguard`（多 peer 路由、定时器、分片重组、`client-id`、RTT 探测、ICMP echo、DSCP）、`DirectConnector` 的 UDP 载体、`rurge-proto-ssh`、`external` 进程监管、`[WireGuard <name>]` 类型化、Keystore 的 OpenSSH 私钥 | FR-CFG-11（openssh）、FR-OUT-05 / 12 / 13 | WireGuard 与带 `client-id` 的端点握手并转发 TCP；SSH 动态转发；`external` 进程退出自动重启 |
 | **M5 UDP 路径** | SOCKS5 UDP ASSOCIATE 入站、引擎 UDP 流水线、DIRECT UDP、已有协议的 UDP（`socks5` `trojan` `vmess` `anytls` `wireguard` `external`）、`udp-relay` `udp-port` `udp-policy-not-supported-behaviour`、UDP 测试（`test-udp` / `proxy-test-udp`）、`block-quic`、UDP 载体的链式拨号、`dns-follow-interface` | FR-IN-02（UDP）、FR-OUT-03（`test-udp` `block-quic`）/ 07 / 08（UDP）/ 11、FR-DNS-10 | 各协议 UDP 对参考服务器转发通过；不支持 UDP 的策略按全局设置处理 |
 | **M6 Shadowsocks / Snell / HTTP/2 族** | `ss`（AEAD、2022、obfs，含 UDP）、`snell` v1 ～ v4（obfs、reuse，v3+ UDP）、`h2-connect`（`max-streams`、CONNECT-UDP）、`trust-tunnel`（h2） | FR-OUT-05 / 07 | 四种协议对参考实现转发通过 |
@@ -282,13 +282,13 @@ pub trait OutboundFactory: Send + Sync {
 
 装配顺序：显式成员 → `include-other-group`（递归展开）→ `include-all-proxies`（`[Proxy]` 的全部代理策略，不含内置与组）→ `policy-path`；重名保留首个。导入项依次经过 `policy-regex-filter` → `external-policy-name-prefix` → `external-policy-modifier`，过滤不作用于显式成员。
 
-`policy-path` 走 `rurge-net` 现有的外部资源管理器（与规则集同一套：数据目录缓存、`update-interval`、后台刷新、本地文件监视）。内容既可以是策略行列表，也可以是含 `[Proxy]` 的完整配置（只取该节）。每一行经 `parse_policy` 与 `PolicySpec` 校验。启动先用缓存，首次下载不阻塞启动（NFR-02）；资源更新后去抖重建一代注册表。
+`policy-path` 走 `rurge-net` 现有的外部资源管理器（与规则集同一套：数据目录缓存、`update-interval`、后台刷新、本地文件监视）。内容既可以是策略行列表，也可以是含 `[Proxy]` 的完整配置（只取该节）。每一行经 `parse_policy` 与 `PolicySpec` 校验。启动先用缓存，首次下载不阻塞启动（NFR-02）；资源更新后去抖重建一代注册表。（M3 细化设计 `2026-09-23-phase2-m3-groups-subscriptions-design.md`的订正：已有缓存时每一代构建注册表前先同步载入，避免空组窗口；订阅内容的问题只告警、逐条跳过，绝不让加载或重建失败；`policy-path` 的值加入脱敏名单，日志只写组名、不写 URL，订阅行永不进日志。见该文件 M3-D5 ～ M3-D7。）
 
 ### 7.3 连通性测试（FR-OUT-10）
 
 - 同一连接上发两次 HEAD，取第二次的耗时（第一次摊掉 TCP / TLS / 代理握手）。
 - 测试 URL：策略的 `test-url` → 全局 `proxy-test-url`（直连类用 `internet-test-url`）；超时：策略的 `test-timeout` → 全局 `test-timeout`（默认 5 秒，直连类 10 秒；WireGuard 另加 10 秒 L3 初始化）。
-- 实现：`rurge-net` 的内部 HTTP 客户端 + "经该策略出站拨号"的连接器（阶段 1 做成可插拔正是为此）。
+- 实现：`rurge-net` 的内部 HTTP 客户端 + "经该策略出站拨号"的连接器（阶段 1 做成可插拔正是为此）。（M3 细化设计 `2026-09-23-phase2-m3-groups-subscriptions-design.md`订正，M3-D8：不用池化的 `HttpClient`，连接池会让"第一次建连、第二次复用"失去控制；探针经 `Outbound::connect_tcp` 拿流，自己套 TLS，再用 `hyper` 的 HTTP/1 连接层发两次 HEAD。）
 - 结果按策略缓存，各组按自己的 `interval` 判断是否过期；**用到且已过期才重测**；`evaluate-before-use` 时首次使用前先测完；并发有上限；"网络已变化"入口使全部结果失效。
 - UDP 测试（M5）：经中继向 `hostname@ipv4` 做一次 DNS 查询。
 - 测试会话经注入的观察者 trait 写入请求记录并带 `test` 标记（`rurge-policy` 不依赖 `rurge-engine`）。
@@ -307,7 +307,7 @@ pub trait OutboundFactory: Send + Sync {
 
 ### 7.5 嵌套、环与兜底（FR-GRP-05）
 
-组可以嵌套。环只有在运行期才能完全确定（`include-other-group` 与订阅都可能引入），因此阶段 1 的加载期错误 `E0009` 在 M3 降级为告警，成环的组在运行期表现为 REJECT。组内没有可用成员时回退 DIRECT 并 WARN（Surge 的行为）。阶段 1 的占位告警 `W0008`（自动组取第一个成员）在 M3 移除。
+组可以嵌套。环只有在运行期才能完全确定（`include-other-group` 与订阅都可能引入），因此阶段 1 的加载期错误 `E0009` 在 M3 降级为告警，成环的组在运行期表现为 REJECT。组内没有可用成员时回退 DIRECT 并 WARN（Surge 的行为）。阶段 1 的占位告警 `W0008`（自动组取第一个成员）在 M3 移除。（M3 细化设计 `2026-09-23-phase2-m3-groups-subscriptions-design.md`订正：`E0009` 退役，加载期的组环改报新告警 `W0030`（M3-D9）；"没有成员"指装配后成员表为空，命令行 `--empty-group-reject` / 环境变量 `RURGE_EMPTY_GROUP_REJECT=1` 把兜底从 DIRECT 改为 REJECT（M3-D3）；`W0008` 在 M3 之后只因 `subnet` 出现，阶段 3 移除。）
 
 ### 7.6 组级 `underlying-proxy`（FR-GRP-07）
 
@@ -315,7 +315,7 @@ pub trait OutboundFactory: Send + Sync {
 
 ### 7.7 选择持久化与临时覆盖（FR-GRP-06）
 
-`select` 的选择按 Profile 写入 `state.json`（阶段 1 已有）。自动类型的组可经 API 临时指定成员，期间停止该组的自动测试；覆盖可经 API 清除。覆盖保存在 `GroupState` 里，不写入 `state.json`：组定义未变的重载会保留它，组定义变了则随 `GroupState` 一起丢弃，进程重启后不保留。
+`select` 的选择按 Profile 写入 `state.json`（阶段 1 已有）。自动类型的组可经 API 临时指定成员，期间停止该组的自动测试；覆盖可经 API 清除。覆盖保存在 `GroupState` 里，不写入 `state.json`：组定义未变的重载会保留它，组定义变了则随 `GroupState` 一起丢弃，进程重启后不保留。（M3 细化设计 `2026-09-23-phase2-m3-groups-subscriptions-design.md`订正，M3-D10：设置与清除都经 `POST /v1/policy_groups/select`——对自动组调用即临时覆盖，`policy` 为空字符串即清除，不新增端点。）
 
 ## 8. 引擎集成（`rurge-engine`、`rurge-inbound`）
 

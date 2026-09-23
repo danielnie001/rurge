@@ -34,6 +34,7 @@ rurge 是用 Rust 复刻 Surge（macOS / iOS 网络代理工具）全部功能�
 - `docs/superpowers/plans/2026-09-20-phase2-m2a-trojan-plan.md`：阶段 2 / M2a（Trojan 优先）实施计划（8 个任务）。开头「计划期决定」表（P1–P14）；末尾「执行期修正记录」与「延后事项」两张表。
 - `docs/superpowers/plans/2026-09-20-phase2-m2b-vmess-anytls-plan.md`：阶段 2 / M2b（VMess / AnyTLS）实施计划（12 个任务）。开头「计划期决定」表（P1–P18）与「承接事项」（接手 M2a 计划「延后事项」里标给 M2b 的四条）；末尾「执行期修正记录」与「延后事项」两张表。
 - `docs/superpowers/plans/2026-09-21-phase2-m2c-shadow-tls-plan.md`：阶段 2 / M2c（Shadow TLS v2 / v3）实施计划（9 个任务）。开头「计划期决定」表（P1–P20）记录对照参考实现与手册核对出的逐字节细节，以及与设计文字不同的决定（不写 `shadow-tls-sni` 时不发 SNI、alert 记录跳过、读取不设 16 KiB 上限、v2 握手后仍在转发的记录先交给伪装会话等）；末尾「执行期修正记录」与「延后事项」两张表。
+- `docs/superpowers/specs/2026-09-23-phase2-m3-groups-subscriptions-design.md`：阶段 2 / M3 设计文档（策略组、订阅与连通性测试）。三份计划的拆分（M3a 成员装配与订阅 → M3b 测速与 `url-test` / `fallback` / `load-balance` → M3c `smart`）、`GroupSpec`、订阅解析与装配（顺序、过滤 / 前缀 / 修饰、全局重名）、组级 `underlying-proxy` 派生、运行期环（`W0030` 取代 `E0009`）与空组兜底（`--empty-group-reject`）、订阅更新只重建注册表、两次 HEAD 的探针与 `TestBook`、三种算法与临时覆盖、`smart` 的打分 / 站点记忆 / 拨号重试与常数、三个测试 API；已决事项 M3-D1 ～ D13，第 14 节列出写各份计划时必须核对的事项。
 - `docs/acceptance/phase2-manual.md`：阶段 2 手工验收清单（M2a 起新建），需要真实公网节点的项目，自动化测试（只用回环）覆盖不了，由项目所有者用自己的节点验收。
 - `docs/api/phase1.md`：阶段 1 HTTP API 参考——端点、JSON 形状、鉴权与封禁、系统代理的地址 / `skip-proxy` 转换 / 生命周期、`rurge reload/stop/status` 客户端。
 - `docs/api/phase2.md`：阶段 2 HTTP API 参考——M1 新增的四个策略 / 策略组端点（`policies/detail`、`policy_groups`、`policy_groups/select`）的响应形状、`lineHash` 的定义、选择的生效时机与持久化位置。
