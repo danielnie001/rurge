@@ -17,7 +17,7 @@
 
 参数 `policy_name`（必填，查询参数）。
 
-响应是 `{"<policy_name>": "<value>"}`：`value` 是该策略或组**脱敏后的定义**（不含 `名字 =` 前缀），脱敏规则与 `GET /v1/profiles/current` 相同（`docs/api/phase1.md`：独立密钥行、内联的 `password` / `psk` / `base64` / `headers` / `ws-headers` / `ws-path` 等参数、所有写作 `type, server, port` 的代理类型第 4 个起的位置值——`trojan` `vmess` `ss` `anytls` 等都在内）；取值的结尾按解析器自己的规则找第一个顶层逗号——引号可以在值里任何位置打开、括号会分组，所以 `password="p,w"`、`password=ab"c,d"`、`password=a(b,c)d` 都是整个值变成 `***`；`headers=` 与 `ws-headers=` 的值整体变成 `***`（连 header 名也不保留），`ws-path=` 同样整体变成 `***`；内置策略（`DIRECT` `REJECT` 等）的值是它自己的名字。
+响应是 `{"<policy_name>": "<value>"}`：`value` 是该策略或组**脱敏后的定义**（不含 `名字 =` 前缀），脱敏规则与 `GET /v1/profiles/current` 相同（`docs/api/phase1.md`：独立密钥行、内联的 `password` / `psk` / `base64` / `headers` / `ws-headers` / `ws-path` / `shadow-tls-password` 等参数、所有写作 `type, server, port` 的代理类型第 4 个起的位置值——`trojan` `vmess` `ss` `anytls` 等都在内）；取值的结尾按解析器自己的规则找第一个顶层逗号——引号可以在值里任何位置打开、括号会分组，所以 `password="p,w"`、`password=ab"c,d"`、`password=a(b,c)d` 都是整个值变成 `***`；`headers=` 与 `ws-headers=` 的值整体变成 `***`（连 header 名也不保留），`ws-path=` 同样整体变成 `***`；内置策略（`DIRECT` `REJECT` 等）的值是它自己的名字。
 
 ```json
 {"HK": "http, proxy.example.com, 8080, ***, ***"}
@@ -35,7 +35,7 @@
 
 ## 会话日志里的出站错误文本
 
-trojan、vmess（± WebSocket）与 anytls 出站失败时，会话记录的 `error` 是下面按协议分节列出的固定文本之一；其余失败仍按连接失败的通用形式出现（拨号超时 `connect timed out`、TLS 握手失败 `tls: <原因>`、或底层 I/O 错误的原文——涵盖 TCP 连接失败、WebSocket 握手期间的 I/O 错误，以及已建立的连接在转发期间的 I/O 错误：后者经转发循环的失败文本进入会话记录）。对端给的字节（HTTP 响应头、WebSocket 握手响应体、anytls 的错误帧等）永不原样出现在下列固定文本中。
+trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS 的出站失败时，会话记录的 `error` 是下面按协议分节列出的固定文本之一；其余失败仍按连接失败的通用形式出现（拨号超时 `connect timed out`、TLS 握手失败 `tls: <原因>`、或底层 I/O 错误的原文——涵盖 TCP 连接失败、WebSocket 握手期间的 I/O 错误，以及已建立的连接在转发期间的 I/O 错误：后者经转发循环的失败文本进入会话记录）。对端给的字节（HTTP 响应头、WebSocket 握手响应体、anytls 的错误帧等）永不原样出现在下列固定文本中。
 
 ### trojan
 
@@ -87,6 +87,24 @@ trojan、vmess（± WebSocket）与 anytls 出站失败时，会话记录的 `er
 | `ws: the server sent a frame larger than the limit` | 单帧或重组后的消息超过入站上限（1 MiB） |
 | `ws: the connection is closed` | 写入或刷出发生在连接已经关闭之后（对端主动关闭，或本端 `poll_shutdown` 已经发出自己的 Close）；读到对端的关闭本身是普通 EOF，不会产生这条文本 |
 
+### Shadow TLS（所有 TCP 类出站共用）
+
+写了 `shadow-tls-password` 的策略，连接先经过 Shadow TLS 一层；这一层的失败带 `shadow-tls:` 前缀。它发生在策略自己的 TLS 之下，所以转发期间才出现的那几条，在带 TLS 的协议上会被里层再包一次（例如 `tls: shadow-tls: the handshake server closed the session`）。
+
+| 错误文本 | 何时出现 |
+| --- | --- |
+| `shadow-tls: the camouflage handshake failed: <原因>` | 与伪装站点的 TLS 握手失败：证书不被信任、证书与用来校验的名字对不上（没写 `shadow-tls-sni` 而服务器写的是 IP 时最常见）、对端根本不说 TLS 等。`<原因>` 是 rustls 的错误文本，已去除控制字符且截到 200 个字符 |
+| `shadow-tls: the server closed the connection during the handshake` | 伪装握手还没完成，对端就关闭了连接 |
+| `shadow-tls: the handshake server does not support TLS 1.3` | 仅 v3：伪装站点选了 TLS 1.2。握手照常完成、向站点发一个 HTTP 请求之后才以这条文本失败 |
+| `shadow-tls: the server did not authenticate itself` | 仅 v3：握手期的记录没有带上正确的 HMAC——口令不对，或对端不是 Shadow TLS v3 服务端（连接被转给了伪装站点本身）。同样先像普通访客那样离开，再失败 |
+| `shadow-tls: cannot sign the ClientHello` | 仅 v3：两遍构造 ClientHello 的某条自检不满足（只可能出现在 rustls 升级之后）；加载配置时就会以 `E0022` 报出，连接期不会带着错误的 HMAC 发出任何字节 |
+| `shadow-tls: the handshake server closed the session` | 仅 v2，出现在第一次读取时：服务端一直没有切到数据阶段，伪装站点结束了会话。**v2 的口令错误就是这一条**——握手本身分辨不出口令对错 |
+| `shadow-tls: a record cannot be authenticated` | 仅 v3，转发期间：一条数据记录的 HMAC 不对 |
+| `shadow-tls: unexpected record type` | 转发期间：收到既不是数据也不是 alert 的记录 |
+| `shadow-tls: the connection ended in the middle of a record` | 转发期间：连接在一条记录中间断开（在两条记录之间断开是正常的流结束） |
+
+口令、由它派生的 HMAC 与异或密钥不会出现在任何一条文本里。
+
 ## `GET /v1/policy_groups`
 
 无参数。响应是 `{"<组名>": [Member…], …}`，键是每个策略组的名字（配置顺序），值是该组成员的列表（配置顺序）。永不失败（没有策略组时返回 `{}`）。
@@ -114,7 +132,7 @@ trojan、vmess（± WebSocket）与 anytls 出站失败时，会话记录的 `er
 
 `lineHash` 是 `SHA-256("<名字> = <脱敏后的定义>")` 的前 16 个十六进制字符；内置策略（没有自己的定义行）对**它自己的名字**取哈希。它只用来**识别**一条定义（同一份配置里两次请求看到同样的哈希，就是同一条定义），不是这条定义原文的指纹：
 
-- 哈希对象是脱敏之后的文本，不是配置文件里的原始行。**只改动凭据（密码、`base64`、`psk`、`headers=`、`ws-headers=`、`ws-path=` 等被脱敏的字段）不会改变 `lineHash`**（含 `password="p,w"`、`password=ab"c,d"`、`password=a(b,c)d` 这些带引号或带括号的值：取值按解析器的顶层逗号规则整体被抹掉，不会有尾巴漏进哈希）——因为脱敏后两行文本相同——这是有意的：`lineHash` 经这个公开的、无需鉴权之外任何权限的端点暴露，如果它是对原始定义取哈希，持有 API key 的人就能对着猜测的凭据反复计算哈希、离线核对是否猜中，等于把凭据的验证能力带出了进程。任何由凭据派生的东西都不允许离开 rurge 进程（`global-constraints.md`），`lineHash` 因此必须建立在脱敏后的文本上。
+- 哈希对象是脱敏之后的文本，不是配置文件里的原始行。**只改动凭据（密码、`base64`、`psk`、`headers=`、`ws-headers=`、`ws-path=`、`shadow-tls-password=` 等被脱敏的字段）不会改变 `lineHash`**（含 `password="p,w"`、`password=ab"c,d"`、`password=a(b,c)d` 这些带引号或带括号的值：取值按解析器的顶层逗号规则整体被抹掉，不会有尾巴漏进哈希）——因为脱敏后两行文本相同——这是有意的：`lineHash` 经这个公开的、无需鉴权之外任何权限的端点暴露，如果它是对原始定义取哈希，持有 API key 的人就能对着猜测的凭据反复计算哈希、离线核对是否猜中，等于把凭据的验证能力带出了进程。任何由凭据派生的东西都不允许离开 rurge 进程（`global-constraints.md`），`lineHash` 因此必须建立在脱敏后的文本上。
 - 名字参与哈希且在一份配置里唯一，所以两个不同成员不会撞哈希；端口、服务器地址、TLS 参数等任何非凭据字段的改动都会改变 `lineHash`。
 
 ## `GET /v1/policy_groups/select`

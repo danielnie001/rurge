@@ -6213,7 +6213,8 @@ git commit -m "docs: M2c——兼容性清单、API 参考、README、CLAUDE.md�
 
 | 任务 | 计划原文 | 实际做法 | 原因 | 提交 |
 | ---- | -------- | -------- | ---- | ---- |
-| | | | | |
+| 4 | `wrap_v3` 里 `stream.write_all(&hello).await?;` 写出签名过的 ClientHello，后面没有 `flush` | 加一行 `stream.flush().await?;`；新增回归用例 `the_handshake_does_not_hang_on_a_stream_that_only_forwards_bytes_on_flush`（测试专用类型 `FlushGated`，只在 `poll_flush` 时才把已写字节转发到底层） | 评审发现（Important，计划强制）：`sign::signed_hello` 已经把 rustls 内部缓冲榨干，紧随其后的 `Handshake::step` 第一次调用 `Handshake::send` 时 `conn.wants_write()` 是 `false`，不会再发送或顺带 flush 这笔 hello；对一个把"写"缓冲到自己内部、只在显式 `flush` 时才真正转发字节的流（如 `underlying-proxy` 一跳的 `tokio-rustls`，或 vmess 的 `LazyHead`），ClientHello 会一直卡在上一层缓冲区里，握手挂起直到调用方自己的超时——违反项目"写完即 flush"的规矩（M2b P16 / 本计划 P17） | 2934ea5 / 123bb78 |
+| 5 | dispatch 预期"`rurge-proto` lib 160 passed（Task 4 之后的 156 + 4 条新用例）" | 实际 161 passed（157 + 4） | Task 4 的修复轮在 `wrap_v3` 里新增了一条回归用例 `the_handshake_does_not_hang_on_a_stream_that_only_forwards_bytes_on_flush`，把 Task 4 之后的基数从 156 提到 157；dispatch 给 Task 5 的数字已按 157 + 4 = 161 调整过，与本计划文字里仍写着的 160 不一致 | 67a0a2e |
 
 ## 延后事项
 
@@ -6225,3 +6226,11 @@ git commit -m "docs: M2c——兼容性清单、API 参考、README、CLAUDE.md�
 | 4 | HelloRetryRequest：伪装握手只提供 X25519，站点要求别的组时握手失败（设计附录 A 的已知限制）；两遍构造不覆盖第二个 ClientHello | 有用户报告再说 |
 | 5 | M2b 计划「延后事项」里不属于 M2c 的条目（`environment()` 仍是人工维护的约定、`ws-path` / `headers` 不是 `Secret`、偶发的 `STATUS_ACCESS_VIOLATION` 未查明根因等）原样继续有效 | 见 M2b 计划 |
 | 6 | 崩溃恢复顺序缺陷（`rurge run` 在坏配置上先退出、后 `sysproxy.recover()`）：与 M2c 无关，等项目所有者点头后单独做一份小设计 | 单独跟进 |
+| 7 | 调用方若在一次 `Pending` 写与它的重试之间插入一次 `flush`，会让被搁置的帧被发送两次（约定与 `VmessStream` 一致：调用方不该这么做；`tokio` / `tokio-rustls` 自己不会） | 补一句文档；有用户报告再说 |
+| 8 | 没有测试覆盖零长度的 v3 ApplicationData 记录（`[23,3,3,0,0]` → "cannot be authenticated"） | 有用户报告再说 |
+| 9 | `hello_tag` 在固定偏移处切片，没有写明前提条件（调用方：`signed_hello` 在 `well_formed` 之后调用；Task 4 的假服务端先检查长度 ≥ 76） | 补一句文档；有用户报告再说 |
+| 10 | 自检 3 与自检 4 没有失败路径的测试（只有 rustls 升级才能触发） | rustls 升级时一并覆盖 |
+| 11 | 一个"握手期部分验证通过、随后被当作伪装流量"的 v3 握手直接在 rustls 里失败（`the camouflage handshake failed`），不会走"体面收尾" | 有用户报告再说 |
+| 12 | 假服务端的 `upwards` 循环经 `?` 提前返回时会跳过 `stop.notify_one()`，导致夹具里的 `downwards` 任务泄漏 | 测试夹具专用缺陷，不影响生产代码；下次改动这个夹具时顺带修 |
+| 13 | Task 4 报告写"去掉三个 `#[allow(dead_code)]`"，实际去掉了四个（brief 原文写的是三个） | 已在此更正；无需后续动作 |
+| 14 | 测试专用类型 `FlushGated::poll_shutdown` 不会先把挂起的缓冲写出（目前这条路径未被使用） | 有用户报告或复用该类型时再说 |

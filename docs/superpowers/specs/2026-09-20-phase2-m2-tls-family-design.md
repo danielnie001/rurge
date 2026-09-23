@@ -104,7 +104,7 @@ pub struct AnyTlsSpec { pub tls: TlsOpts, pub password: String, pub reuse: bool 
 
 // M2c：挂在 PolicySpec 上，对所有 TCP 类协议有效
 pub enum ShadowTlsVersion { V2 /* 默认 */, V3 }
-pub struct ShadowTlsOpts { pub password: String, pub sni: Option<String>, pub version: ShadowTlsVersion }
+pub struct ShadowTlsOpts { pub password: Secret<String>, pub sni: Option<String>, pub version: ShadowTlsVersion }
 pub struct PolicySpec { /* 现有字段 */ pub shadow_tls: Option<ShadowTlsOpts> }
 ```
 
@@ -181,7 +181,7 @@ impl Stack {
 2. **自己驱动的伪装握手**：直接驱动 `rustls::ClientConnection` 的 `read_tls` / `write_tls` / `process_new_packets`，不经 tokio-rustls——Shadow TLS 本来就要在记录层拦截、校验、改写服务端的字节之后才能交给 TLS 栈。
 3. **握手后的帧化字节流**：应用数据装进 ApplicationData 记录（`0x17 0x03 0x03 <len>`），实现 `AsyncRead + AsyncWrite`。里层的真实 TLS（例如 trojan 自己的 TLS）就跑在这条字节流上。
 
-**v2**：与伪装站点做一次真实的 TLS 握手，SNI 取 `shadow-tls-sni`（没写则用策略的有效 SNI 名；未核对，登记）；握手期间对收到的全部服务端字节做 HMAC-SHA1（密钥为 `shadow-tls-password`）；握手后客户端的第一帧带 8 字节摘要前缀，之后是普通帧。
+**v2**：与伪装站点做一次真实的 TLS 握手，SNI 取 `shadow-tls-sni`；没写则**不发 SNI**（手册），证书按策略自己的 TLS 会用的名字校验（`sni` 写了名字用它，否则用服务器主机名）；握手期间对收到的全部服务端字节做 HMAC-SHA1（密钥为 `shadow-tls-password`）；握手后客户端的第一帧带 8 字节摘要前缀，之后是普通帧；服务端切到数据阶段之前仍在转发的记录（session ticket）先交给伪装会话，它解不开的第一条记录起才是数据。
 
 **v3**：
 
@@ -350,7 +350,7 @@ pub trait OutboundFactory: Send + Sync {
 | 4.2 `trojan` | M2a 已实现（TCP）；密码错误在连接期无法识别（协议性质）；默认不带 ALPN（未核对）；UDP 属 M5 |
 | 4.2 `vmess` | M2b 已实现 AEAD 握手；没写 `vmess-aead=true` 的行在 M8 之前按 `W0007` + REJECT 处理；只开 ChunkStream + ChunkMasking（Surge 的取值未公开）；时钟偏差导致的断开无法识别 |
 | 4.2 `anytls` | M2b 已实现；一条会话同一时刻一个流（与参考实现一致）；空闲 60 秒回收；不等 SYNACK |
-| 4.4 Shadow TLS 三行 | M2c 已实现；v3 用 stock rustls 两遍构造 ClientHello，伪装握手只提供 X25519、要求 TLS 1.3；伪装握手照常校验证书、不受六个 TLS 参数影响；`shadow-tls-sni` 缺省取策略的有效 SNI（v2，未核对） |
+| 4.4 Shadow TLS 三行 | M2c 已实现；v3 用 stock rustls 两遍构造 ClientHello，伪装握手只提供 X25519、要求 TLS 1.3；伪装握手照常校验证书、不受六个 TLS 参数影响；v2 不写 `shadow-tls-sni` 时不发 SNI（手册）；alert 记录跳过；读取不设 16 KiB 上限 |
 | 4.6 `ws` `ws-path` `ws-headers` | `Host` 缺省取服务器主机名（未核对）；`ws-path` / `ws-headers` 的字符限制；不支持 early data |
 | 4.3 `interface` `allow-other-interface` `tos` `ip-version` | 与 `underlying-proxy` 同时出现时 `W0028` |
 | 4.4 `server-cert-verify-name` | 配置期校验；与指纹 / `skip-cert-verify` 同时出现时 `W0012` |
@@ -380,8 +380,8 @@ pub trait OutboundFactory: Send + Sync {
 | V4 | AnyTLS v2 的逐字节格式、默认 padding 方案、`padding-md5` 的算法（对照 anytls-go 的协议文档与源码）；`cmdUpdatePaddingScheme` 的有界校验取值（6.3：条目数与单项长度的上限）（已核对：M2b 计划 P1 / P5 / P9 / P10） | b |
 | V5 | xray 的固定版本、三个平台的包名与 SHA256、只含回环入站的最小配置（已核对：M2b 计划 P1 / P5 / P9 / P10） | b |
 | V6 | `EngineFactory` 按值捕获的字段清单 → `environment()` 的内容（已核对：M2b 计划 P1 / P5 / P9 / P10） | b |
-| V7 | Shadow TLS v2 摘要覆盖的确切字节范围、v3 HMAC 链的起始值与帧格式、"体面收尾"的动作（对照 `ihciah/shadow-tls` 的文档与源码）；sing-box shadowtls 入站的配置写法 | c |
-| V8 | 附录 A 的两条假设在所用的 rustls 版本上仍成立（spike 的断言即检查项） | c |
+| V7 | Shadow TLS v2 摘要覆盖的确切字节范围、v3 HMAC 链的起始值与帧格式、"体面收尾"的动作（对照 `ihciah/shadow-tls` 的文档与源码）；sing-box shadowtls 入站的配置写法（已核对：M2c 计划 P1 – P7、P9） | c |
+| V8 | 附录 A 的两条假设在所用的 rustls 版本上仍成立（spike 的断言即检查项）（已核对：M2c 计划 P1 – P7、P9） | c |
 
 ## 16. 任务草图
 
@@ -426,6 +426,28 @@ pub trait OutboundFactory: Send + Sync {
 | P18 | （无对应设计文字：预检阶段的三处实现细节订正） | ① 只被单元用例用到的 `Pool::len` 标 `#[cfg(test)]`、只有假服务端会发的 `frame::SERVER_SETTINGS` 标 `#[cfg(any(test, feature = "testing"))]`；② `FakeVmess` 拒绝连接时先关写端、再把连接读到头（带着未读字节关连接会变成 RST，客户端拿到的就是 I/O 错误而不是"没应答就关"）；③ 引擎端到端用例里等"anytls 会话回池"的信号改为"会话记录出现"（`get` 带 `Connection: close`，先结束流的是服务端，对端的 FIN 不回，服务端的 FIN 计数在那两条用例里永远是 0） |
 | 6（执行期） | 第 10 节"等待"一行原文："整条阶梯一个超时；anytls 回收任务定时；没有无界等待" | 转发循环的两处修正（`flush`、跨方向取消）属于 M2b 的交付；已在第 10 节"等待"一行补一句"任一方向以错误结束时，另一方向随之结束" |
 | 8（执行期） | （无对应设计文字：出站复用机制的副作用） | 复用之后，`skip-cert-verify` 的 WARN 不再随每次重载重复：这条 WARN 是 `EngineFactory::build` 的副作用，被复用的出站不再经过 `build`，因此不再告警；首次构建与参数变更后的重建仍照常告警（已裁定接受） |
+
+## 19. M2c 实施期的订正
+
+本节登记 M2c 计划的「计划期决定」里与本文件文字不同的地方。逐条对应实现的提交见 `docs/superpowers/plans/2026-09-21-phase2-m2c-shadow-tls-plan.md` 末尾「执行期修正记录」。
+
+| 编号 | 设计原文 | 订正 |
+| ---- | -------- | ---- |
+| P2 | 5.3："握手后客户端的第一帧带 8 字节摘要前缀，之后是普通帧" | 补一段：服务端在看到首帧之前一直在转发伪装站点，TLS 1.3 的 session ticket 就落在这段时间里。客户端把收到的记录先交给伪装会话，它解不开的第一条起才是数据；伪装会话自己结束（alert / `close_notify`）→ `shadow-tls: the handshake server closed the session`，v2 的口令错误就表现为这一条 |
+| P4 | 5.3："按参考实现的做法体面收尾" | 具体动作：握手照常完成 → 经真实会话发一个格式正确、长度随机的 `GET / HTTP/1.1`（参考实现用的是裸 LF 且头部没有结尾空行，不照抄）→ `close_notify` → 读到对端关闭，整段以 2 秒为限。两种拒绝原因（不是 TLS 1.3、没通过验证）共用。sing-box 的客户端不做这一步。伪装握手失败时先把 rustls 排队的 alert 发出去 |
+| P5 | （无对应文字） | 收到的 alert 记录跳过，流的结束以 TCP 连接结束为准；rurge 从不发 alert 记录。与两个参考客户端不同：sing-box 服务端对客户端的 FIN 回 alert 之后另一方向可能还在发数据 |
+| P6 | 5.3："单条记录的上限按 TLS 规范（16 KiB + 扩展余量）" | 只对握手期成立（由 rustls 执行）。数据阶段写 ≤ 16384 字节负载 / 帧，读接受 16 位长度字段能表示的任何长度：sing-box 的 `WriteBuffer` 不切分 |
+| P7 | 5.3："SNI 取 `shadow-tls-sni`（没写则用策略的有效 SNI 名；未核对，登记）" | 手册："If not set, no SNI is sent." 不写就不发 SNI；证书照常校验，名字取策略自己的 TLS 会用的那个。`shadow-tls-sni` 只接受 DNS 名。`server-cert-verify-name` 刻意不参与这次校验——它命名的是代理自己的证书，不是伪装站点的证书。已直接改写 5.3 正文 |
+| P8 | 第 3 节新依赖表：`hmac` `sha1` | 不引入：`ring::hmac`（`HMAC_SHA1_FOR_LEGACY_USE_ONLY`）与已有的 `sha2`，零新增条目 |
+| P9 | 附录 A：spike 只开 TLS 1.3、用 `Box::leak` | 伪装握手的配置是 TLS 1.2 + 1.3（TLS 1.2 的站点能把握手走完以便体面收尾）；脚本化的两件是 `static` 单元结构体；线程局部状态由 `Drop` 守卫复位；`ShadowTlsClient::build` 对 v3 先演一遍 |
+| P11 | 4.1：`password: String` | `Secret<String>`（M2b 的约定）。已直接改写 4.1 |
+| P12 | 4.2 末句："M2c 起生效，`W0029` 对它们退役" | 配置层分两步交付：类型与公开的读取函数先到，`to_spec` 的调用、`PolicySpec.shadow_tls` 与 `W0029` 的退役同"出站真的会用这一层"在一个提交里，避免出现"配置不再警告、连接却不带 Shadow TLS"的中间状态 |
+| P16 | 5.3："测试与互操作经已有的 `EngineFactory::with_roots` 注入自己的根" | 互操作如此；引擎的端到端夹具经 `Runtime::build` 构建，拿不到工厂。`EngineShared` 增加 `roots`（`None` = 系统根），`Runtime::build` 据此选 `with_roots`——根证书库本来就必须随引擎存续而不随代际变化 |
+| P17 | （无对应文字：夹具） | `TlsFixture` 的 TLS echo 写完即 `flush`（否则大负载偶发卡死，与 M2b P16 同一类）；假服务端的数据阶段是两个互不等待的循环 |
+| P19 | （无对应文字） | v2 的固有局限：首帧越晚，服务端越可能已经转发了 ticket 而比对失败。rurge 的首帧在握手完成后立即发出，只有不带 TLS 的 `vmess` 会等 `LazyHead` 的 100 ms |
+| 任务 4（执行期） | （无对应文字） | v3 写出签名过的 ClientHello 之后要 `flush`：底层可能是链上一跳的缓冲流（`tokio-rustls`、`vmess` 的 `LazyHead`），不 `flush` 这笔 hello 会一直卡在上一层缓冲区里，握手挂起直到调用方自己的超时 |
+
+实施中发现的新出入由各任务追加。
 
 ## 附录 A　Shadow TLS v3：在 stock rustls 上签名 ClientHello
 

@@ -44,3 +44,17 @@
 | 6 | `GET /v1/policies/detail?policy_name=<策略名>` | 输出里 `password` 是 `***` |
 
 不要在验收时使用 `--system-proxy`，除非你确实想让本机的系统代理指向 rurge（退出时会恢复）。
+
+## M2c　Shadow TLS
+
+需要一台真实的 Shadow TLS 服务端（官方 `shadow-tls` 或 sing-box 的 `shadowtls` 入站）与一个真实的伪装站点，自动化测试（只用回环）覆盖不了。
+
+- [ ] v3：`<协议>, <服务器>, <端口>, …, shadow-tls-password=…, shadow-tls-version=3, shadow-tls-sni=<伪装站点>`，经它打开几个 HTTPS 网站、下载一个 100 MB 以上的文件、保持一条长连接 10 分钟以上，均正常。
+- [ ] v3：服务端分别是官方 `shadow-tls`（`--v3 --strict`）与 sing-box（`strict_mode: true`）时都成立。
+- [ ] v3：口令写错——会话记录的错误是 `shadow-tls: the server did not authenticate itself`；在服务端一侧抓包可见客户端与伪装站点完成了握手并发了一个 HTTP 请求。
+- [ ] v3：`shadow-tls-sni` 指向一个只支持 TLS 1.2 的站点——错误是 `shadow-tls: the handshake server does not support TLS 1.3`。
+- [ ] v2：同样的三项（浏览、大文件、长连接）；服务器以 IP 配置而不写 `shadow-tls-sni` 时，错误文本明确指向证书与名字对不上。
+- [ ] v2：伪装站点是自己的域名（服务端把握手转给同一个域名的真实站点）且不写 `shadow-tls-sni`：连接成功，服务端一侧抓包可见 ClientHello 里没有 SNI。
+- [ ] 半关闭：`curl --http1.0` 之类"发完请求就关闭写方向"的客户端经 sing-box 服务端下载一个大文件，内容完整（对应清单 4.4 里"alert 记录跳过"那一条）。
+- [ ] `underlying-proxy`：带 Shadow TLS 的策略作为链的出口。
+- [ ] `GET /v1/policies/detail` 与 `GET /v1/profiles/current` 里 `shadow-tls-password` 的值是 `***`。
