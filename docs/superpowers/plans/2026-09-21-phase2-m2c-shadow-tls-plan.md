@@ -6216,6 +6216,7 @@ git commit -m "docs: M2c——兼容性清单、API 参考、README、CLAUDE.md�
 | 4 | `wrap_v3` 里 `stream.write_all(&hello).await?;` 写出签名过的 ClientHello，后面没有 `flush` | 加一行 `stream.flush().await?;`；新增回归用例 `the_handshake_does_not_hang_on_a_stream_that_only_forwards_bytes_on_flush`（测试专用类型 `FlushGated`，只在 `poll_flush` 时才把已写字节转发到底层） | 评审发现（Important，计划强制）：`sign::signed_hello` 已经把 rustls 内部缓冲榨干，紧随其后的 `Handshake::step` 第一次调用 `Handshake::send` 时 `conn.wants_write()` 是 `false`，不会再发送或顺带 flush 这笔 hello；对一个把"写"缓冲到自己内部、只在显式 `flush` 时才真正转发字节的流（如 `underlying-proxy` 一跳的 `tokio-rustls`，或 vmess 的 `LazyHead`），ClientHello 会一直卡在上一层缓冲区里，握手挂起直到调用方自己的超时——违反项目"写完即 flush"的规矩（M2b P16 / 本计划 P17） | 2934ea5 / 123bb78 |
 | 5 | dispatch 预期"`rurge-proto` lib 160 passed（Task 4 之后的 156 + 4 条新用例）" | 实际 161 passed（157 + 4） | Task 4 的修复轮在 `wrap_v3` 里新增了一条回归用例 `the_handshake_does_not_hang_on_a_stream_that_only_forwards_bytes_on_flush`，把 Task 4 之后的基数从 156 提到 157；dispatch 给 Task 5 的数字已按 157 + 4 = 161 调整过，与本计划文字里仍写着的 160 不一致 | 67a0a2e |
 | 9 | 无（纯文档任务；逐字落地本文件 Task 9 的 Step 1 – 8 与 dispatch 补充的三处：Task 4 的 flush 修正、Task 5 的 `server-cert-verify-name` 规则、其余任务报告里的真实偏差） | 同左 | 记录 Task 9 自己的交付提交 | a2f5a6a |
+| 终审修复 | 无（终审复查后的修复，不在原 9 个任务之列） | 补一条 v2 用例（伪装会话仍在时收到 alert 记录被跳过，`framed.rs` 的 `offer`）；`framed.rs` 模块文档里"写重试"的约定补一句（重试之间不能插入 flush / shutdown）；README 快速开始的中英文两句改为逐项列出已实现出站协议（`http` / `https` / `socks5` / `socks5-tls` / `trojan` / `vmess` / `anytls`，均可叠加 Shadow TLS）；本文件「延后事项」与本表各加一行 | 全篇终审遗留的 Minor 1 / Minor 3 / Minor 4 | 见 git log |
 
 ## 延后事项
 
@@ -6235,3 +6236,4 @@ git commit -m "docs: M2c——兼容性清单、API 参考、README、CLAUDE.md�
 | 12 | 假服务端的 `upwards` 循环经 `?` 提前返回时会跳过 `stop.notify_one()`，导致夹具里的 `downwards` 任务泄漏 | 测试夹具专用缺陷，不影响生产代码；下次改动这个夹具时顺带修 |
 | 13 | Task 4 报告写"去掉三个 `#[allow(dead_code)]`"，实际去掉了四个（brief 原文写的是三个） | 已在此更正；无需后续动作 |
 | 14 | 测试专用类型 `FlushGated::poll_shutdown` 不会先把挂起的缓冲写出（目前这条路径未被使用） | 有用户报告或复用该类型时再说 |
+| 15 | http / socks5 出站握手里的写（CONNECT 请求、SOCKS5 问候 / 认证 / 请求）在读应答之前不显式 flush——M1 起如此、M2c 未改；下层是会缓冲的链式一跳时可能要等下一次写才发出（终审 Minor 2） | 有用户报告或 M8 统一核对时再说 |

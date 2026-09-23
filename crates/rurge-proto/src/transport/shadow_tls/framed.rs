@@ -12,8 +12,10 @@
 //!   began verify under the handshake's chain and are skipped.
 //!
 //! The same two contracts as `VmessStream`: a write that returned `Pending`
-//! must be retried with the same bytes (the parked frame was built from them,
-//! and in v3 its tag has already moved the chain on), and a read error is final.
+//! must be retried with the same bytes and without a flush or shutdown in
+//! between (the parked frame was built from them, and in v3 its tag has
+//! already moved the chain on; a flush would finish the parked frame, and the
+//! retry would then seal the same bytes again), and a read error is final.
 
 use super::auth::{Chain, TAG, V2_TAG, same};
 use super::record::{ALERT, APPLICATION_DATA, HEADER, MAX_DATA, RecordReader, data_header};

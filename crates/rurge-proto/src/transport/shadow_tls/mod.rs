@@ -900,6 +900,35 @@ mod tests {
         .expect("bounded");
     }
 
+    #[tokio::test]
+    async fn a_v2_alert_seen_while_the_camouflage_session_is_still_live_is_skipped() {
+        tokio::time::timeout(BOUND, async {
+            let fixture = TlsFixture::new(&[SITE]);
+            let camouflage = Camouflage::spawn(&fixture, &[&TLS13], 0).await;
+            let mut script = ShadowTlsScript::new(
+                ShadowTlsVersion::V2,
+                "right",
+                camouflage.addr(),
+                answers_after_the_fin().await,
+            );
+            script.alert_on_fin = true;
+            script.empty_record = false;
+            let fake = FakeShadowTls::spawn(script).await;
+            let client = client(ShadowTlsVersion::V2, "right", &fixture);
+            let mut stream = open(&client, fake.addr()).await.unwrap();
+            stream.write_all(b"abcdef").await.unwrap();
+            // sing-box answers this FIN with an alert record while the
+            // client's own camouflage session is still live: it is the
+            // first record `framed.rs`'s `offer` sees
+            stream.shutdown().await.unwrap();
+            let mut answer = Vec::new();
+            stream.read_to_end(&mut answer).await.unwrap();
+            assert_eq!(answer, b"fedcba");
+        })
+        .await
+        .expect("bounded");
+    }
+
     #[test]
     fn a_name_rustls_cannot_use_is_a_build_error_and_v3_checks_itself_at_build_time() {
         let roots = Arc::new(RootCertStore::empty());
