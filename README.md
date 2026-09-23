@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/rurge-icon.svg" width="128" height="128" alt="rurge 图标">
+
 # rurge
 
 **中文** | [English](README_en.md)

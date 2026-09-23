@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">rurge</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F2784B"/>
+      <stop offset="1" stop-color="#A63A12"/>
+    </linearGradient>
+  </defs>
+  <!-- tile: rust orange -->
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)"/>
+  <!-- the gear (Rust) -->
+  <path d="M128.0 50.0 L133.8 36.2 L148.1 38.2 L149.8 53.1 L167.0 60.5 L178.9 51.4 L190.3 60.3 L184.3 74.0 L195.5 89.0 L210.4 87.1 L215.8 100.5 L203.7 109.4 L206.0 128.0 L219.8 133.8 L217.8 148.1 L202.9 149.8 L195.5 167.0 L204.6 178.9 L195.7 190.3 L182.0 184.3 L167.0 195.5 L168.9 210.4 L155.5 215.8 L146.6 203.7 L128.0 206.0 L122.2 219.8 L107.9 217.8 L106.2 202.9 L89.0 195.5 L77.1 204.6 L65.7 195.7 L71.7 182.0 L60.5 167.0 L45.6 168.9 L40.2 155.5 L52.3 146.6 L50.0 128.0 L36.2 122.2 L38.2 107.9 L53.1 106.2 L60.5 89.0 L51.4 77.1 L60.3 65.7 L74.0 71.7 L89.0 60.5 L87.1 45.6 L100.5 40.2 L109.4 52.3 Z M190 128 A62 62 0 1 0 66 128 A62 62 0 1 0 190 128 Z" fill="#FFF7F0" fill-rule="evenodd"/>
+  <!-- the surge: two waves of traffic through the core; the front one is routed onward -->
+  <g fill="none" stroke="#FFF7F0" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M80 152 C 96 134, 112 134, 128 152 S 160 170, 176 152" stroke-opacity="0.45" stroke-width="11"/>
+    <path d="M76 124 C 92 104, 110 104, 126 124 S 156 144, 172 120" stroke-width="14"/>
+    <path d="M154.2 120.5 L175.5 115.1 L177.1 137.1" stroke-width="14"/>
+  </g>
+</svg>
