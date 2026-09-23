@@ -1,7 +1,7 @@
 //! `socks5` / `socks5-tls` proxy outbound (RFC 1928, RFC 1929), CONNECT only.
 
-use crate::build::tls_client;
-use crate::transport::tls::TlsClient;
+use crate::build::{shadow_tls_client, tls_client};
+use crate::transport::Stack;
 use crate::{BuildError, Outbound, OutboundError};
 use rurge_config::KeystoreItem;
 use rurge_config::spec::{PolicySpec, ProtoSpec};
@@ -21,9 +21,7 @@ const MAX_CREDENTIAL: usize = 255;
 
 pub struct Socks5Outbound {
     name: String,
-    server: Target,
-    connector: Arc<dyn Connector>,
-    tls: Option<TlsClient>,
+    stack: Stack,
     credentials: Option<(String, String)>,
 }
 
@@ -105,6 +103,12 @@ impl Socks5Outbound {
                 spec.name
             )));
         }
+        let shadow_tls = shadow_tls_client(
+            spec.shadow_tls.as_ref(),
+            socks.tls.as_ref(),
+            host,
+            roots.clone(),
+        )?;
         let tls = tls_client(socks.tls.as_ref(), host, &[], keystore, roots)?;
         let credentials = socks.username.as_ref().map(|user| {
             let password = socks.password.as_ref().map(|p| p.expose().clone());
@@ -112,9 +116,13 @@ impl Socks5Outbound {
         });
         Ok(Socks5Outbound {
             name: spec.name.clone(),
-            server: Target::new(host.clone(), port),
-            connector,
-            tls,
+            stack: Stack::new(
+                connector,
+                Target::new(host.clone(), port),
+                shadow_tls,
+                tls,
+                None,
+            ),
             credentials,
         })
     }
@@ -126,10 +134,7 @@ impl Socks5Outbound {
     ) -> Result<BoxedStream, OutboundError> {
         // checked first: no connection is opened for a request we cannot send
         let request = connect_request(target)?;
-        let mut stream = self.connector.connect(&self.server, opts).await?;
-        if let Some(tls) = &self.tls {
-            stream = tls.wrap(stream).await.map_err(OutboundError::tls)?;
-        }
+        let mut stream = self.stack.open(opts).await?;
         let offered: &[u8] = if self.credentials.is_some() {
             &[NO_AUTH, USER_PASS]
         } else {
@@ -214,7 +219,10 @@ impl Outbound for Socks5Outbound {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{FakeSocks5, Socks5Script, TlsFixture, echo_server};
+    use crate::testing::{
+        Camouflage, FakeShadowTls, FakeSocks5, ShadowTlsScript, Socks5Script, TlsFixture,
+        echo_server,
+    };
     use rurge_config::policy::parse_policy;
     use rurge_config::spec::{NameKind, SpecEnv, to_spec};
     use rurge_config::{HostName, Span};
@@ -265,6 +273,39 @@ mod tests {
         let mut buf = vec![0u8; payload.len()];
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, payload);
+    }
+
+    #[tokio::test]
+    async fn socks5_tls_runs_inside_shadow_tls() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let echo = echo_server().await;
+            let fixture = TlsFixture::new(&["127.0.0.1", "site.test"]);
+            let site = Camouflage::spawn(&fixture, &[&rustls::version::TLS13], 2).await;
+            let proxy = FakeSocks5::spawn_tls(Socks5Script::default(), fixture.clone(), false).await;
+            let front = FakeShadowTls::spawn(ShadowTlsScript::new(
+                rurge_config::spec::ShadowTlsVersion::V3,
+                "pw",
+                site.addr(),
+                proxy.addr(),
+            ))
+            .await;
+            let out = outbound(
+                &format!(
+                    "socks5-tls, 127.0.0.1, {}, shadow-tls-password=pw, shadow-tls-version=3, shadow-tls-sni=site.test",
+                    front.addr().port()
+                ),
+                fixture.roots(),
+            );
+            let mut stream = out
+                .connect_tcp(&target(echo), &ConnectOpts::default())
+                .await
+                .unwrap();
+            roundtrip(&mut stream, b"three handshakes deep").await;
+            assert_eq!(proxy.requests().len(), 1);
+            assert!(front.sessions()[0].authenticated);
+        })
+        .await
+        .expect("bounded");
     }
 
     #[tokio::test]

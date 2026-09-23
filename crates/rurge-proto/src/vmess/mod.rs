@@ -14,14 +14,14 @@ mod stream;
 pub(crate) mod vectors;
 
 use crate::addr::{AddrError, vmess_addr};
-use crate::build::tls_client;
+use crate::build::{shadow_tls_client, tls_client};
 use crate::transport::Stack;
 use crate::transport::lazy_head::LazyHead;
 use crate::transport::ws::WsClient;
 use crate::{BuildError, Outbound, OutboundError};
 use header::{Security, Session};
 use rurge_config::KeystoreItem;
-use rurge_config::spec::{VmessCipher, VmessSpec};
+use rurge_config::spec::{ShadowTlsOpts, VmessCipher, VmessSpec};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
 use rustls::RootCertStore;
@@ -50,6 +50,7 @@ impl VmessOutbound {
         name: &str,
         server: Target,
         spec: &VmessSpec,
+        shadow_tls: Option<&ShadowTlsOpts>,
         keystore: &[KeystoreItem],
         roots: Arc<RootCertStore>,
         connector: Arc<dyn Connector>,
@@ -57,6 +58,8 @@ impl VmessOutbound {
         // error texts carry no policy name (the registry's `build_one` and
         // the dry build both prefix it). No ALPN unless the policy asks for
         // one: a WebSocket below must not be negotiated into h2 (M2 design 4.5)
+        let shadow_tls =
+            shadow_tls_client(shadow_tls, spec.tls.as_ref(), &server.host, roots.clone())?;
         let tls = tls_client(spec.tls.as_ref(), &server.host, &[], keystore, roots)?;
         let ws = spec
             .ws
@@ -65,7 +68,7 @@ impl VmessOutbound {
             .transpose()?;
         Ok(VmessOutbound {
             name: name.to_string(),
-            stack: Stack::new(connector, server, tls, ws),
+            stack: Stack::new(connector, server, shadow_tls, tls, ws),
             cmd_key: header::cmd_key(spec.uuid.expose()),
             security: match spec.cipher {
                 VmessCipher::Aes128Gcm => Security::Aes128Gcm,
@@ -136,6 +139,7 @@ mod tests {
     use crate::testing::{FakeVmess, TlsFixture, VmessScript, echo_server};
     use rurge_config::policy::parse_policy;
     use rurge_config::spec::ParamReader;
+    use rurge_config::spec::shadow_tls::read_shadow_tls;
     use rurge_config::spec::vmess::read_vmess;
     use rurge_config::{HostName, Span};
     use rurge_net::connector::{DirectConnector, SystemResolve};
@@ -154,11 +158,13 @@ mod tests {
         let mut r = ParamReader::new(&policy);
         let read = read_vmess(&mut r, &[]);
         assert!(read.aead, "the line asks for the legacy handshake");
+        let shadow_tls = read_shadow_tls(&mut r);
         assert!(!r.has_errors(), "{:?}", r.finish());
         VmessOutbound::new(
             "V",
             Target::new(policy.server.clone().unwrap(), policy.port.unwrap()),
             &read.spec,
+            shadow_tls.as_ref(),
             &[],
             roots,
             Arc::new(DirectConnector::new(Arc::new(SystemResolve))),

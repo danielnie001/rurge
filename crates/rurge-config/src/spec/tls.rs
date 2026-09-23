@@ -1,6 +1,5 @@
 //! TLS parameters shared by every TLS-carried protocol (matrix §4.4).
 
-use super::common::Notes;
 use super::reader::ParamReader;
 use crate::diagnostic::codes;
 use crate::keystore::{KeystoreItem, KeystoreType};
@@ -35,13 +34,6 @@ pub(crate) const TLS_KEYS: [&str; 6] = [
     "server-cert-fingerprint-sha256",
     "alpn",
     "client-cert",
-];
-
-/// Shadow TLS arrives in M2; until then the parameters are known but inert.
-pub(crate) const SHADOW_TLS_KEYS: [&str; 3] = [
-    "shadow-tls-password",
-    "shadow-tls-sni",
-    "shadow-tls-version",
 ];
 
 fn parse_fingerprint(value: &str) -> Option<[u8; 32]> {
@@ -190,15 +182,6 @@ pub(crate) fn idle_tls(r: &mut ParamReader<'_>) {
     warn_tls_keys(r, |key| {
         format!("`{key}` has no effect without `tls=true`; ignored")
     });
-}
-
-pub(crate) fn note_shadow_tls(r: &mut ParamReader<'_>, notes: &mut Notes) {
-    for key in SHADOW_TLS_KEYS {
-        if r.has(key) {
-            r.touch(key);
-            notes.inert.push(key);
-        }
-    }
 }
 
 #[cfg(test)]

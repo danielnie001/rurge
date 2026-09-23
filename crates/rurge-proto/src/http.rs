@@ -1,11 +1,11 @@
 //! `http` / `https` proxy outbound: CONNECT tunnels, and absolute-form
 //! forwarding of plain HTTP requests (manual: Policies › HTTP and HTTP/2).
 
-use crate::build::tls_client;
+use crate::build::{shadow_tls_client, tls_client};
 use crate::outbound::untrusted_text;
+use crate::transport::Stack;
 use crate::transport::head::read_head;
 use crate::transport::prefixed;
-use crate::transport::tls::TlsClient;
 use crate::{BuildError, HttpForward, Outbound, OutboundError};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -27,9 +27,7 @@ const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 
 pub struct HttpOutbound {
     name: String,
-    server: Target,
-    connector: Arc<dyn Connector>,
-    tls: Option<TlsClient>,
+    stack: Stack,
     /// The `Proxy-Authorization` value, ready to send.
     authorization: Option<String>,
     headers: Vec<HeaderTemplate>,
@@ -148,6 +146,12 @@ impl HttpOutbound {
                 n + 1
             )));
         }
+        let shadow_tls = shadow_tls_client(
+            spec.shadow_tls.as_ref(),
+            http.tls.as_ref(),
+            host,
+            roots.clone(),
+        )?;
         let tls = tls_client(http.tls.as_ref(), host, &[], keystore, roots)?;
         let authorization = http.username.as_ref().map(|user| {
             let password = http.password.as_ref().map_or("", |p| p.expose().as_str());
@@ -156,22 +160,22 @@ impl HttpOutbound {
         });
         Ok(HttpOutbound {
             name: spec.name.clone(),
-            server: Target::new(host.clone(), port),
-            connector,
-            tls,
+            stack: Stack::new(
+                connector,
+                Target::new(host.clone(), port),
+                shadow_tls,
+                tls,
+                None,
+            ),
             authorization,
             headers: http.headers.clone(),
             forward: !http.always_use_connect,
         })
     }
 
-    /// TCP to the proxy, then TLS for `https`.
+    /// TCP to the proxy, then Shadow TLS when the policy has it, then TLS for `https`.
     async fn dial(&self, opts: &ConnectOpts) -> Result<BoxedStream, OutboundError> {
-        let stream = self.connector.connect(&self.server, opts).await?;
-        match &self.tls {
-            Some(tls) => tls.wrap(stream).await.map_err(OutboundError::tls),
-            None => Ok(stream),
-        }
+        self.stack.open(opts).await
     }
 
     /// The caller must have already checked `valid_target(target)` (via
@@ -276,7 +280,10 @@ impl HttpForward for HttpOutbound {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{FakeHttpProxy, HttpProxyScript, TlsFixture, echo_server};
+    use crate::testing::{
+        Camouflage, FakeHttpProxy, FakeShadowTls, HttpProxyScript, ShadowTlsScript, TlsFixture,
+        echo_server,
+    };
     use rurge_config::policy::parse_policy;
     use rurge_config::spec::{NameKind, SpecEnv, to_spec};
     use rurge_config::{KeystoreItem, Span};
@@ -354,6 +361,53 @@ mod tests {
             head.header("Proxy-Authorization"),
             Some("Basic dXNlcjpwYTpzcw==")
         );
+    }
+
+    #[tokio::test]
+    async fn connect_tunnels_through_shadow_tls() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let echo = echo_server().await;
+            let proxy = FakeHttpProxy::spawn(HttpProxyScript::default()).await;
+            let fixture = TlsFixture::new(&["site.test"]);
+            let site = Camouflage::spawn(&fixture, &[&rustls::version::TLS13], 2).await;
+            let front = FakeShadowTls::spawn(ShadowTlsScript::new(
+                rurge_config::spec::ShadowTlsVersion::V2,
+                "pw",
+                site.addr(),
+                proxy.addr(),
+            ))
+            .await;
+            let out = outbound(
+                &format!(
+                    "http, 127.0.0.1, {}, shadow-tls-password=pw, shadow-tls-sni=site.test",
+                    front.addr().port()
+                ),
+                fixture.roots(),
+            );
+            let mut stream = out
+                .connect_tcp(&target(echo), &ConnectOpts::default())
+                .await
+                .unwrap();
+            roundtrip(&mut stream, b"through the frames").await;
+            assert_eq!(
+                proxy.heads()[0].request_line,
+                format!("CONNECT {echo} HTTP/1.1")
+            );
+            assert!(front.sessions()[0].authenticated);
+            // plain requests in absolute form take the same road
+            let forward = out.http_forward().expect("an http proxy forwards");
+            let mut stream = forward.connect(&ConnectOpts::default()).await.unwrap();
+            stream
+                .write_all(b"GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+                .await
+                .unwrap();
+            let mut answer = [0u8; 12];
+            stream.read_exact(&mut answer).await.unwrap();
+            assert!(answer.starts_with(b"HTTP/1.1 "), "{answer:?}");
+            assert!(front.sessions()[1].authenticated);
+        })
+        .await
+        .expect("bounded");
     }
 
     #[tokio::test]

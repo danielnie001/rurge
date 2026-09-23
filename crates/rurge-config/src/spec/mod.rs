@@ -77,6 +77,8 @@ pub struct PolicySpec {
     pub port: Option<u16>,
     pub common: CommonOpts,
     pub proto: ProtoSpec,
+    /// Shadow TLS below the protocol (and below its TLS, when it has one).
+    pub shadow_tls: Option<ShadowTlsOpts>,
     pub span: Span,
 }
 
@@ -155,7 +157,6 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
                 tls::refuse_tls(&mut r);
                 None
             };
-            tls::note_shadow_tls(&mut r, &mut notes);
             let (username, password) = read_credentials(&mut r);
             let always_use_connect = r.bool("always-use-connect").unwrap_or(false);
             let mut headers = Vec::new();
@@ -187,7 +188,6 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
                 tls::refuse_tls(&mut r);
                 None
             };
-            tls::note_shadow_tls(&mut r, &mut notes);
             let (username, password) = read_credentials(&mut r);
             for (what, value) in [("username", &username), ("password", &password)] {
                 if value
@@ -220,13 +220,11 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
         }
         PolicyKind::Trojan => {
             let common = read_common(&mut r, Applies::Proxy, &mut notes);
-            tls::note_shadow_tls(&mut r, &mut notes);
             let trojan = trojan::read_trojan(&mut r, env.keystore);
             (common, ProtoSpec::Trojan(trojan))
         }
         PolicyKind::Vmess => {
             let common = read_common(&mut r, Applies::Proxy, &mut notes);
-            tls::note_shadow_tls(&mut r, &mut notes);
             let read = vmess::read_vmess(&mut r, env.keystore);
             // the rest of the line is still checked; it just has no spec
             legacy_vmess = !read.aead;
@@ -234,13 +232,14 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
         }
         PolicyKind::AnyTls => {
             let common = read_common(&mut r, Applies::Proxy, &mut notes);
-            tls::note_shadow_tls(&mut r, &mut notes);
             let anytls = anytls::read_anytls(&mut r, env.keystore);
             (common, ProtoSpec::AnyTls(anytls))
         }
         _ => return SpecOutcome::default(),
     };
+    let mut shadow_tls = None;
     if !matches!(proto, ProtoSpec::Direct | ProtoSpec::Reject(_)) {
+        shadow_tls = shadow_tls::read_shadow_tls(&mut r);
         check_underlying(&mut r, &mut common, env);
         // socket options belong to the hop that opens the socket (matrix 4.3)
         if common.underlying_proxy.is_some() {
@@ -265,6 +264,7 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
         port: policy.port,
         common,
         proto,
+        shadow_tls,
         span: policy.span.clone(),
     });
     SpecOutcome {
@@ -438,7 +438,8 @@ mod tests {
             "P",
             "socks5, h, 1080, udp-relay=true, shadow-tls-password=pw, mystery=1",
         );
-        assert_eq!(o.inert, ["udp-relay", "shadow-tls-password"]);
+        // Shadow TLS took effect in M2c: no longer on the list
+        assert_eq!(o.inert, ["udp-relay"]);
         let warnings: Vec<&str> = o.diagnostics.iter().map(|d| d.code).collect();
         assert_eq!(warnings, [codes::W_UNKNOWN_KEY]);
         assert!(o.spec.is_some(), "warnings do not drop the spec");
@@ -454,6 +455,49 @@ mod tests {
 
         let o = outcome("P", "http, h, 80, headers=Broken");
         assert_eq!(o.diagnostics[0].code, codes::E_INVALID_POLICY_PARAM);
+    }
+
+    #[test]
+    fn shadow_tls_is_part_of_the_spec_of_every_tcp_protocol() {
+        for def in [
+            "http, h.test, 80",
+            "https, h.test, 443",
+            "socks5, h.test, 1080",
+            "socks5-tls, h.test, 1080",
+            "trojan, h.test, 443, password=p",
+            "vmess, h.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119, vmess-aead=true",
+            "anytls, h.test, 443, password=p",
+        ] {
+            let o = outcome(
+                "P",
+                &format!(
+                    "{def}, shadow-tls-password=s3cret, shadow-tls-version=3, shadow-tls-sni=site.test"
+                ),
+            );
+            assert!(o.diagnostics.is_empty(), "{def}: {:?}", o.diagnostics);
+            assert!(o.inert.is_empty(), "{def}: {:?}", o.inert);
+            let layer = o.spec.unwrap().shadow_tls.expect(def);
+            assert_eq!(layer.password.expose(), "s3cret");
+            assert_eq!(layer.sni.as_deref(), Some("site.test"));
+            assert_eq!(layer.version, ShadowTlsVersion::V3);
+            // without the parameters there is no layer
+            assert!(
+                outcome("P", def).spec.unwrap().shadow_tls.is_none(),
+                "{def}"
+            );
+        }
+        // an error in the layer drops the spec like any other
+        let o = outcome(
+            "P",
+            "http, h.test, 80, shadow-tls-password=s3cret, shadow-tls-version=3",
+        );
+        assert!(o.spec.is_none());
+        assert_eq!(o.diagnostics[0].code, codes::E_INVALID_POLICY_PARAM);
+        // a policy that opens no connection to a server has no use for it
+        let o = outcome("P", "direct, shadow-tls-password=s3cret");
+        assert!(o.spec.unwrap().shadow_tls.is_none());
+        assert_eq!(o.diagnostics[0].code, codes::W_UNKNOWN_KEY);
+        assert!(!o.diagnostics[0].message.contains("s3cret"));
     }
 
     #[test]

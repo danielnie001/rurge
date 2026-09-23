@@ -1,9 +1,10 @@
 //! `BuildError` (why an outbound could not be built from its spec) and the
-//! helpers shared by the outbounds' `from_spec` (currently `tls_client`).
+//! helpers shared by the outbounds' constructors.
 
 use crate::keystore::decode_p12;
+use crate::transport::shadow_tls::ShadowTlsClient;
 use crate::transport::tls::TlsClient;
-use rurge_config::spec::{PolicySpec, TlsOpts};
+use rurge_config::spec::{PolicySpec, ShadowTlsOpts, Sni, TlsOpts};
 use rurge_config::{HostName, KeystoreItem};
 use rurge_net::connector::Target;
 use rustls::RootCertStore;
@@ -69,6 +70,25 @@ pub fn tls_client(
     TlsClient::build(opts, server, default_alpn, identity, roots).map(Some)
 }
 
+/// The Shadow TLS layer of a policy, when it has one. Without a
+/// `shadow-tls-sni` the camouflage certificate is checked against the name
+/// the policy's own TLS would use: its `sni`, else the server.
+pub fn shadow_tls_client(
+    opts: Option<&ShadowTlsOpts>,
+    tls: Option<&TlsOpts>,
+    server: &HostName,
+    roots: Arc<RootCertStore>,
+) -> Result<Option<ShadowTlsClient>, BuildError> {
+    let Some(opts) = opts else {
+        return Ok(None);
+    };
+    let fallback = match tls.map(|tls| &tls.sni) {
+        Some(Sni::Name(name)) => HostName::parse(name),
+        _ => server.clone(),
+    };
+    ShadowTlsClient::build(opts, &fallback, roots).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +128,66 @@ mod tests {
 
     fn no_roots() -> Arc<RootCertStore> {
         Arc::new(RootCertStore::empty())
+    }
+
+    #[tokio::test]
+    async fn without_shadow_tls_sni_the_camouflage_certificate_is_checked_against_the_policy_s_name()
+     {
+        use crate::testing::{Camouflage, FakeShadowTls, ShadowTlsScript, TlsFixture, echo_server};
+        use rurge_config::spec::{Secret, ShadowTlsVersion};
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let fixture = TlsFixture::new(&["site.test"]);
+            let site = Camouflage::spawn(&fixture, &[&rustls::version::TLS13], 0).await;
+            let front = FakeShadowTls::spawn(ShadowTlsScript::new(
+                ShadowTlsVersion::V2,
+                "pw",
+                site.addr(),
+                echo_server().await,
+            ))
+            .await;
+            let opts = ShadowTlsOpts {
+                password: Secret::from("pw"),
+                sni: None,
+                version: ShadowTlsVersion::V2,
+            };
+            let server = HostName::Ip(front.addr().ip());
+            let addr = front.addr();
+            let open = |client: ShadowTlsClient| async move {
+                let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+                client.wrap(Box::new(tcp)).await.map(|_| ())
+            };
+            // the policy's own `sni` names the certificate
+            let tls = TlsOpts {
+                sni: Sni::Name("site.test".into()),
+                ..TlsOpts::default()
+            };
+            let client = shadow_tls_client(Some(&opts), Some(&tls), &server, fixture.roots())
+                .unwrap()
+                .expect("a layer");
+            open(client).await.expect("verified against `sni`");
+            let seen = fixture.seen_at_least(1).await;
+            assert_eq!(seen[0].sni, None, "and no SNI was sent (manual)");
+            // no name of its own: the server's, which this certificate does not cover
+            let client = shadow_tls_client(Some(&opts), None, &server, fixture.roots())
+                .unwrap()
+                .expect("a layer");
+            let err = open(client)
+                .await
+                .expect_err("127.0.0.1 is not in the certificate");
+            assert!(
+                err.to_string()
+                    .starts_with("shadow-tls: the camouflage handshake failed: "),
+                "{err}"
+            );
+            // and no options, no layer
+            assert!(
+                shadow_tls_client(None, Some(&tls), &server, no_roots())
+                    .unwrap()
+                    .is_none()
+            );
+        })
+        .await
+        .expect("bounded");
     }
 
     #[test]

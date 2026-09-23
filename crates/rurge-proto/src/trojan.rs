@@ -4,13 +4,13 @@
 //! shows once the relay starts, as whatever the server's fallback site says.
 
 use crate::addr::{AddrError, socks_addr};
-use crate::build::tls_client;
+use crate::build::{shadow_tls_client, tls_client};
 use crate::transport::Stack;
 use crate::transport::lazy_head::LazyHead;
 use crate::transport::ws::WsClient;
 use crate::{BuildError, Outbound, OutboundError};
 use rurge_config::KeystoreItem;
-use rurge_config::spec::TrojanSpec;
+use rurge_config::spec::{ShadowTlsOpts, TrojanSpec};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
 use rustls::RootCertStore;
@@ -43,6 +43,7 @@ impl TrojanOutbound {
         name: &str,
         server: Target,
         spec: &TrojanSpec,
+        shadow_tls: Option<&ShadowTlsOpts>,
         keystore: &[KeystoreItem],
         roots: Arc<RootCertStore>,
         connector: Arc<dyn Connector>,
@@ -54,6 +55,8 @@ impl TrojanOutbound {
         }
         // no ALPN unless the policy asks for one: a WebSocket below must not
         // be negotiated into h2 (M2 design 4.5)
+        let shadow_tls =
+            shadow_tls_client(shadow_tls, Some(&spec.tls), &server.host, roots.clone())?;
         let tls = tls_client(Some(&spec.tls), &server.host, &[], keystore, roots)?;
         let ws = spec
             .ws
@@ -62,7 +65,7 @@ impl TrojanOutbound {
             .transpose()?;
         Ok(TrojanOutbound {
             name: name.to_string(),
-            stack: Stack::new(connector, server, tls, ws),
+            stack: Stack::new(connector, server, shadow_tls, tls, ws),
             hash: wire_hash(spec.password.expose()),
         })
     }
@@ -118,6 +121,7 @@ mod tests {
     use rurge_config::spec::ParamReader;
     use rurge_config::spec::Secret;
     use rurge_config::spec::TlsOpts;
+    use rurge_config::spec::shadow_tls::read_shadow_tls;
     use rurge_config::spec::trojan::read_trojan;
     use rurge_config::{HostName, Span};
     use rurge_net::connector::{DirectConnector, SystemResolve};
@@ -133,11 +137,13 @@ mod tests {
         let policy = parse_policy("T", definition, &span).unwrap();
         let mut r = ParamReader::new(&policy);
         let spec = read_trojan(&mut r, &[]);
+        let shadow_tls = read_shadow_tls(&mut r);
         assert!(!r.has_errors(), "{:?}", r.finish());
         TrojanOutbound::new(
             "T",
             Target::new(policy.server.clone().unwrap(), policy.port.unwrap()),
             &spec,
+            shadow_tls.as_ref(),
             &[],
             fixture.roots(),
             Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
@@ -187,6 +193,7 @@ mod tests {
             "T",
             Target::new(HostName::parse("127.0.0.1"), 443),
             &spec,
+            None,
             &[],
             fixture.roots(),
             Arc::new(DirectConnector::new(Arc::new(SystemResolve))),

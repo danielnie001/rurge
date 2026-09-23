@@ -14,14 +14,14 @@ mod pool;
 mod session;
 
 use crate::addr::{AddrError, socks_addr};
-use crate::build::tls_client;
+use crate::build::{shadow_tls_client, tls_client};
 use crate::task::AbortOnDrop;
 use crate::transport::Stack;
 use crate::{BuildError, Outbound, OutboundError};
 use padding::Scheme;
 use pool::Pool;
 use rurge_config::KeystoreItem;
-use rurge_config::spec::AnyTlsSpec;
+use rurge_config::spec::{AnyTlsSpec, ShadowTlsOpts};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
 use rustls::RootCertStore;
@@ -52,6 +52,7 @@ impl AnyTlsOutbound {
         name: &str,
         server: Target,
         spec: &AnyTlsSpec,
+        shadow_tls: Option<&ShadowTlsOpts>,
         keystore: &[KeystoreItem],
         roots: Arc<RootCertStore>,
         connector: Arc<dyn Connector>,
@@ -62,10 +63,12 @@ impl AnyTlsOutbound {
             return Err(BuildError::new("`password` is empty"));
         }
         // no ALPN unless the policy asks for one (M2 design 4.5)
+        let shadow_tls =
+            shadow_tls_client(shadow_tls, Some(&spec.tls), &server.host, roots.clone())?;
         let tls = tls_client(Some(&spec.tls), &server.host, &[], keystore, roots)?;
         Ok(AnyTlsOutbound {
             name: name.to_string(),
-            stack: Stack::new(connector, server, tls, None),
+            stack: Stack::new(connector, server, shadow_tls, tls, None),
             hash: Sha256::digest(spec.password.expose().as_bytes()).into(),
             scheme: Arc::new(Mutex::new(Arc::new(Scheme::default_scheme()))),
             pool: spec.reuse.then(Arc::<Pool>::default),
@@ -152,6 +155,7 @@ mod tests {
     use rurge_config::policy::parse_policy;
     use rurge_config::spec::ParamReader;
     use rurge_config::spec::anytls::read_anytls;
+    use rurge_config::spec::shadow_tls::read_shadow_tls;
     use rurge_config::{HostName, Span};
     use rurge_net::connector::{DirectConnector, SystemResolve};
     use std::net::SocketAddr;
@@ -165,11 +169,13 @@ mod tests {
         let policy = parse_policy("A", definition, &span).unwrap();
         let mut r = ParamReader::new(&policy);
         let spec = read_anytls(&mut r, &[]);
+        let shadow_tls = read_shadow_tls(&mut r);
         assert!(!r.has_errors(), "{:?}", r.finish());
         AnyTlsOutbound::new(
             "A",
             Target::new(policy.server.clone().unwrap(), policy.port.unwrap()),
             &spec,
+            shadow_tls.as_ref(),
             &[],
             fixture.roots(),
             Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
@@ -541,6 +547,7 @@ mod tests {
             "A",
             Target::new(HostName::parse("127.0.0.1"), 443),
             &spec,
+            None,
             &[],
             fixture.roots(),
             Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
