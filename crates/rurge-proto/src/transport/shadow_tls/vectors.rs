@@ -10,6 +10,7 @@
 //! Inputs: the password `vector-password`; the ServerRandom `20 21 .. 3f`.
 
 use super::auth::{Chain, V2_TAG, xor_key};
+use super::sign::hello_tag;
 
 const PASSWORD: &[u8] = b"vector-password";
 
@@ -60,4 +61,17 @@ fn the_v2_digest_is_eight_bytes_over_everything_fed() {
         digest.digest::<V2_TAG>()[..],
         unhex(&["6ded756644915408"])[..]
     );
+}
+
+const HELLO: &[&str] = &[
+    "160301006f0100006b0303000102030405060708090a0b0c0d0e0f1011121314",
+    "15161718191a1b1c1d1e1f20808182838485868788898a8b8c8d8e8f90919293",
+    "9495969798999a9b9c9d9e9fc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3",
+    "d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7",
+];
+
+#[test]
+fn the_client_hello_tag_covers_the_hello_without_its_record_header() {
+    // HMAC-SHA1(password, hello[5..72] || 00 00 00 00 || hello[76..]), 4 bytes
+    assert_eq!(hello_tag(PASSWORD, &unhex(HELLO)), unhex(&["a7640deb"])[..]);
 }
