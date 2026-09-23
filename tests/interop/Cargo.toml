@@ -16,6 +16,7 @@ rurge-engine.workspace = true
 rurge-net = { workspace = true, features = ["testing"] }
 rurge-policy.workspace = true
 rurge-proto = { workspace = true, features = ["testing"] }
+rustls.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 

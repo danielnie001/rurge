@@ -2163,6 +2163,7 @@ dependencies = [
  "rurge-net",
  "rurge-policy",
  "rurge-proto",
+ "rustls",
  "serde_json",
  "tempfile",
  "tokio",

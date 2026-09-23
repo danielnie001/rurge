@@ -60,6 +60,14 @@ pub enum InboundKind {
     Trojan,
     Vmess,
     AnyTls,
+    /// Relays the TLS handshake to `127.0.0.1:handshake_port` and hands what
+    /// it unwraps to the inbound at index `detour`. `users[0]` holds the
+    /// password (version 2 has no user names; the name is ignored).
+    ShadowTls {
+        version: u8,
+        handshake_port: u16,
+        detour: usize,
+    },
 }
 
 pub struct TlsFiles {
@@ -95,12 +103,30 @@ pub fn render(inbounds: &[(Inbound, u16)]) -> Value {
                     InboundKind::Trojan => "trojan",
                     InboundKind::Vmess => "vmess",
                     InboundKind::AnyTls => "anytls",
+                    InboundKind::ShadowTls { .. } => "shadowtls",
                 },
                 "tag": format!("in-{i}"),
                 "listen": "127.0.0.1",
                 "listen_port": port,
             });
-            if !inbound.users.is_empty() {
+            if let InboundKind::ShadowTls {
+                version,
+                handshake_port,
+                detour,
+            } = inbound.kind
+            {
+                let (name, password) = inbound.users.first().expect("a Shadow TLS password");
+                v["version"] = json!(version);
+                if version == 3 {
+                    v["users"] = json!([{ "name": name, "password": password }]);
+                    v["strict_mode"] = json!(true);
+                } else {
+                    v["password"] = json!(password);
+                }
+                // a loopback IP literal: sing-box resolves nothing
+                v["handshake"] = json!({ "server": "127.0.0.1", "server_port": handshake_port });
+                v["detour"] = json!(format!("in-{detour}"));
+            } else if !inbound.users.is_empty() {
                 v["users"] = inbound
                     .users
                     .iter()
@@ -342,6 +368,32 @@ mod tests {
                 },
                 1006,
             ),
+            (
+                Inbound {
+                    kind: InboundKind::ShadowTls {
+                        version: 3,
+                        handshake_port: 1100,
+                        detour: 3,
+                    },
+                    users: vec![("u".into(), "st-pw".into())],
+                    tls: None,
+                    ws_path: None,
+                },
+                1007,
+            ),
+            (
+                Inbound {
+                    kind: InboundKind::ShadowTls {
+                        version: 2,
+                        handshake_port: 1100,
+                        detour: 3,
+                    },
+                    users: vec![("ignored".into(), "st-pw".into())],
+                    tls: None,
+                    ws_path: None,
+                },
+                1008,
+            ),
         ]
     }
 
@@ -400,6 +452,27 @@ mod tests {
         assert_eq!(anytls["type"], "anytls");
         assert_eq!(anytls["users"], json!([{ "name": "u", "password": "pw" }]));
         assert_eq!(anytls["tls"]["enabled"], true);
+        // version 3 has users and a strict mode, version 2 one password
+        let v3 = &config["inbounds"][6];
+        assert_eq!(
+            (&v3["type"], &v3["version"]),
+            (&json!("shadowtls"), &json!(3))
+        );
+        assert_eq!(v3["users"], json!([{ "name": "u", "password": "st-pw" }]));
+        assert_eq!(v3["strict_mode"], true);
+        assert_eq!(
+            v3["handshake"],
+            json!({ "server": "127.0.0.1", "server_port": 1100 })
+        );
+        assert_eq!(v3["detour"], "in-3");
+        assert!(v3.get("password").is_none() && v3.get("tls").is_none());
+        let v2 = &config["inbounds"][7];
+        assert_eq!(
+            (&v2["version"], &v2["password"]),
+            (&json!(2), &json!("st-pw"))
+        );
+        assert!(v2.get("users").is_none() && v2.get("strict_mode").is_none());
+        assert_eq!(v2["detour"], "in-3");
     }
 
     #[test]
