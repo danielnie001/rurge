@@ -37,14 +37,14 @@ rurge 是用 Rust 复刻 Surge（macOS / iOS 网络代理工具）全部功能�
 - `docs/acceptance/phase2-manual.md`：阶段 2 手工验收清单（M2a 起新建），需要真实公网节点的项目，自动化测试（只用回环）覆盖不了，由项目所有者用自己的节点验收。
 - `docs/api/phase1.md`：阶段 1 HTTP API 参考——端点、JSON 形状、鉴权与封禁、系统代理的地址 / `skip-proxy` 转换 / 生命周期、`rurge reload/stop/status` 客户端。
 - `docs/api/phase2.md`：阶段 2 HTTP API 参考——M1 新增的四个策略 / 策略组端点（`policies/detail`、`policy_groups`、`policy_groups/select`）的响应形状、`lineHash` 的定义、选择的生效时机与持久化位置。
-- `README.md`：中英双语，对外的状态、特性表与路线图，必须与 PRD 保持一致。
+- `README.md`（中文）与 `README_en.md`（英文）：对外的状态、特性表与路线图，两份内容保持一致，并与 PRD 保持一致；文件顶部互相链接。
 
 ## 工作流约定
 
 - 每个阶段：先写设计文档（`docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md`），再写实施计划（`docs/superpowers/plans/`），再实现。新工作必须能对应到 PRD 第 7 节的某个阶段和第 4 节的 FR 编号。
 - 兼容性原则：Surge 语法就是 rurge 语法。不认识或平台不适用的配置项要"解析并忽略 + 记录日志"，不能报错；rurge 不改写用户的配置文件；rurge 专有的运行时选项只通过命令行参数和环境变量提供，不扩展 Surge 配置格式（FR-CFG-17）。
 - 事实来源：Surge 官方手册 <https://manual.nssurge.com/>（本项目基于 2026-09 版本，对应 Surge Mac 6.9 / iOS 5.22）。手册改版频繁，有疑问查手册，不凭记忆。已知的常见误区：`doh-server` 已改名 `encrypted-dns-server`；URL Rewrite 只有 `header` / `302` / `307` / `reject` 四种模式；`[MITM]` 没有 `tcp-connection` 键；url-test 组的测试 URL来自策略的 `test-url` 或全局 `proxy-test-url`。
-- 语言：文档与对话用中文；README 中英双语；日志与 CLI 输出以英文为主（NFR-10）。
+- 语言：文档与对话用中文；README 分中文（`README.md`）与英文（`README_en.md`）两份；日志与 CLI 输出以英文为主（NFR-10）。
 - 提交：用户自行决定何时 commit；未被要求时不要提交。
 
 ## 计划中的架构（阶段 1 建立后生效）
