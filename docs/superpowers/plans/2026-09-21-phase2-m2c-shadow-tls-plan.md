@@ -6215,6 +6215,7 @@ git commit -m "docs: M2c——兼容性清单、API 参考、README、CLAUDE.md�
 | ---- | -------- | -------- | ---- | ---- |
 | 4 | `wrap_v3` 里 `stream.write_all(&hello).await?;` 写出签名过的 ClientHello，后面没有 `flush` | 加一行 `stream.flush().await?;`；新增回归用例 `the_handshake_does_not_hang_on_a_stream_that_only_forwards_bytes_on_flush`（测试专用类型 `FlushGated`，只在 `poll_flush` 时才把已写字节转发到底层） | 评审发现（Important，计划强制）：`sign::signed_hello` 已经把 rustls 内部缓冲榨干，紧随其后的 `Handshake::step` 第一次调用 `Handshake::send` 时 `conn.wants_write()` 是 `false`，不会再发送或顺带 flush 这笔 hello；对一个把"写"缓冲到自己内部、只在显式 `flush` 时才真正转发字节的流（如 `underlying-proxy` 一跳的 `tokio-rustls`，或 vmess 的 `LazyHead`），ClientHello 会一直卡在上一层缓冲区里，握手挂起直到调用方自己的超时——违反项目"写完即 flush"的规矩（M2b P16 / 本计划 P17） | 2934ea5 / 123bb78 |
 | 5 | dispatch 预期"`rurge-proto` lib 160 passed（Task 4 之后的 156 + 4 条新用例）" | 实际 161 passed（157 + 4） | Task 4 的修复轮在 `wrap_v3` 里新增了一条回归用例 `the_handshake_does_not_hang_on_a_stream_that_only_forwards_bytes_on_flush`，把 Task 4 之后的基数从 156 提到 157；dispatch 给 Task 5 的数字已按 157 + 4 = 161 调整过，与本计划文字里仍写着的 160 不一致 | 67a0a2e |
+| 9 | 无（纯文档任务；逐字落地本文件 Task 9 的 Step 1 – 8 与 dispatch 补充的三处：Task 4 的 flush 修正、Task 5 的 `server-cert-verify-name` 规则、其余任务报告里的真实偏差） | 同左 | 记录 Task 9 自己的交付提交 | a2f5a6a |
 
 ## 延后事项
 
