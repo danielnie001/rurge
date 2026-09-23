@@ -160,6 +160,26 @@ impl TlsFixture {
         TlsAcceptor::from(Arc::new(config))
     }
 
+    /// What a Shadow TLS server relays a handshake to: the given protocol
+    /// versions, no ALPN, and `tickets` session tickets after every TLS 1.3
+    /// handshake (rustls' own default is 2).
+    pub fn camouflage_acceptor(
+        &self,
+        versions: &[&'static SupportedProtocolVersion],
+        tickets: usize,
+    ) -> TlsAcceptor {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.leaf_key.clone()));
+        let mut config = ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(versions)
+            .expect("protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![self.leaf.clone()], key)
+            .expect("server certificate");
+        config.send_tls13_tickets = tickets;
+        TlsAcceptor::from(Arc::new(config))
+    }
+
     /// A server that presents the fixture's real leaf certificate but signs
     /// the handshake with a DIFFERENT key: what an attacker holding a copy
     /// of the (public) certificate can do. Every verification mode must
@@ -203,6 +223,25 @@ impl TlsFixture {
         self.seen.lock().expect("seen").clone()
     }
 
+    /// `seen()`, once it holds at least `count` handshakes: the server side
+    /// writes one down after the client already has its stream. Panics when
+    /// they do not show up within five seconds.
+    pub async fn seen_at_least(&self, count: usize) -> Vec<SeenHandshake> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let seen = self.seen();
+            if seen.len() >= count {
+                return seen;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} of {count} handshakes were recorded",
+                seen.len()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// Runs the echo accept loop behind `acceptor`; failed handshakes are
     /// dropped silently. Shared by `spawn_echo` and `spawn_impostor` so the
     /// loop is not duplicated.
@@ -221,7 +260,13 @@ impl TlsFixture {
                     };
                     let mut buf = [0u8; 1024];
                     while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 || stream.write_all(&buf[..n]).await.is_err() {
+                        // `flush`: tokio-rustls reports a write as done while
+                        // ciphertext may still sit in its own buffer, and
+                        // with nothing more to echo that tail would stay there
+                        if n == 0
+                            || stream.write_all(&buf[..n]).await.is_err()
+                            || stream.flush().await.is_err()
+                        {
                             break;
                         }
                     }

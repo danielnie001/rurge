@@ -9,6 +9,7 @@
 //!
 //! Inputs: the password `vector-password`; the ServerRandom `20 21 .. 3f`.
 
+use super::ServerSide;
 use super::auth::{Chain, V2_TAG, xor_key};
 use super::sign::hello_tag;
 
@@ -74,4 +75,66 @@ const HELLO: &[&str] = &[
 fn the_client_hello_tag_covers_the_hello_without_its_record_header() {
     // HMAC-SHA1(password, hello[5..72] || 00 00 00 00 || hello[76..]), 4 bytes
     assert_eq!(hello_tag(PASSWORD, &unhex(HELLO)), unhex(&["a7640deb"])[..]);
+}
+
+const HANDSHAKE_PLAIN_0: &[&str] = &[
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+    "60616263",
+];
+const HANDSHAKE_WIRE_0: &[&str] = &[
+    "1703030068312db371e2edcffde73f7bb76ead37d20555a1f3a13d0ed21feb5d",
+    "7916f533f2b78e72b6c2cdefddc71f5b974e8d17f2257581d3811d2ef23fcb7d",
+    "5936d513d297ae5296a2ad8fbda77f3bf72eed77924515e1b3e17d4e925fab1d",
+    "3956b573b2f7ce32f6828daf9d",
+];
+const HANDSHAKE_PLAIN_1: &[&str] = &[
+    "c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7",
+    "e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9c8c9cacbcccdcecfd0d1d2d3d4d5",
+    "d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5",
+    "f6f7f8f9",
+];
+const HANDSHAKE_WIRE_1: &[&str] = &[
+    "1703030068e517c5622a2507352ff7b37fb675ef0add8d792b69f5c61ad72395",
+    "b1ee0dcb0a4f768a4e0a0527150fd7935f9655cf2afdad590b49d5d408c13587",
+    "a3c023f9387940b87c343b152739e1a16db87bdd38ebbb4b1957cbf428e115a7",
+    "83e003d9185960985c141b3507",
+];
+
+#[test]
+fn handshake_records_verify_in_order_and_come_back_as_the_site_wrote_them() {
+    let mut side = ServerSide::new(PASSWORD, &server_random());
+    for (wire, plain) in [
+        (HANDSHAKE_WIRE_0, HANDSHAKE_PLAIN_0),
+        (HANDSHAKE_WIRE_1, HANDSHAKE_PLAIN_1),
+    ] {
+        let mut record = unhex(wire);
+        assert!(side.restore(&mut record));
+        let plain = unhex(plain);
+        assert_eq!(record[..3], [23, 3, 3]);
+        assert_eq!(
+            usize::from(u16::from_be_bytes([record[3], record[4]])),
+            plain.len()
+        );
+        assert_eq!(record[5..], plain[..]);
+    }
+    // the chain ran on: the first record does not verify a second time
+    let mut again = unhex(HANDSHAKE_WIRE_0);
+    let before = again.clone();
+    assert!(!side.restore(&mut again));
+    assert_eq!(
+        again, before,
+        "a record that is not ours is left as it came"
+    );
+}
+
+#[test]
+fn a_flipped_bit_anywhere_in_a_handshake_record_is_noticed() {
+    for at in [5usize, 8, 9, 60, 108] {
+        let mut side = ServerSide::new(PASSWORD, &server_random());
+        let mut record = unhex(HANDSHAKE_WIRE_0);
+        record[at] ^= 0x10;
+        assert!(!side.restore(&mut record), "byte {at}");
+    }
 }
