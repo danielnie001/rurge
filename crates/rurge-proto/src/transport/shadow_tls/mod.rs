@@ -131,6 +131,7 @@ impl ShadowTlsClient {
             return Err(proxy("shadow-tls: cannot sign the ClientHello"));
         };
         stream.write_all(&hello).await?;
+        stream.flush().await?;
         let mut shake = Handshake::new(conn);
         let mut server: Option<ServerSide> = None;
         let mut tls13 = false;
@@ -384,7 +385,9 @@ mod tests {
     use rurge_config::spec::Secret;
     use rustls::version::{TLS12, TLS13};
     use std::net::SocketAddr;
-    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+    use std::pin::Pin;
+    use std::task::{Context, Poll, ready};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
     use tokio::net::{TcpListener, TcpStream};
 
     const SITE: &str = "camouflage.test";
@@ -414,6 +417,66 @@ mod tests {
     ) -> Result<BoxedStream, OutboundError> {
         let tcp = TcpStream::connect(server).await?;
         client.wrap(Box::new(tcp)).await
+    }
+
+    /// A stream that queues every written byte and only forwards it to
+    /// `inner` when `poll_flush` runs: what a `write_all` without an
+    /// explicit `flush` looks like to the code writing to it. Catches a
+    /// write that relies on some other call flushing for it.
+    struct FlushGated {
+        inner: TcpStream,
+        pending: Vec<u8>,
+    }
+
+    impl FlushGated {
+        fn new(inner: TcpStream) -> FlushGated {
+            FlushGated {
+                inner,
+                pending: Vec::new(),
+            }
+        }
+    }
+
+    impl AsyncRead for FlushGated {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for FlushGated {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.get_mut().pending.extend_from_slice(data);
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            while !this.pending.is_empty() {
+                let n = ready!(Pin::new(&mut this.inner).poll_write(cx, &this.pending))?;
+                this.pending.drain(..n);
+            }
+            Pin::new(&mut this.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    async fn open_over_wrapper(
+        client: &ShadowTlsClient,
+        server: SocketAddr,
+    ) -> Result<BoxedStream, OutboundError> {
+        let tcp = TcpStream::connect(server).await?;
+        client.wrap(Box::new(FlushGated::new(tcp))).await
     }
 
     /// One direction of the engine's relay: read, `write_all`, `flush`, and
@@ -504,6 +567,22 @@ mod tests {
             fixture,
             camouflage,
             fake,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_handshake_does_not_hang_on_a_stream_that_only_forwards_bytes_on_flush() {
+        for version in [ShadowTlsVersion::V2, ShadowTlsVersion::V3] {
+            let w = world(version, &[&TLS13], 0, |_| {}).await;
+            let client = client(version, "right", &w.fixture);
+            let stream = tokio::time::timeout(
+                Duration::from_secs(5),
+                open_over_wrapper(&client, w.fake.addr()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{version:?}: the handshake hung without an explicit flush"))
+            .unwrap_or_else(|e| panic!("{version:?}: {e}"));
+            echo_round_trip(behind_a_relay(stream).await, 1000).await;
         }
     }
 
