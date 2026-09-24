@@ -794,7 +794,8 @@ mod run {
                 "RURGE_SYSTEM_PROXY_BACKEND",
                 format!("file:{}", sysproxy_file(data).display()),
             )
-            .env_remove("RURGE_SYSTEM_PROXY");
+            .env_remove("RURGE_SYSTEM_PROXY")
+            .env_remove("RURGE_EMPTY_GROUP_REJECT");
         cmd
     }
 
@@ -832,6 +833,12 @@ mod run {
             cmd.arg("--log-file").arg(log);
         }
         cmd.args(extra);
+        spawn_command(cmd)
+    }
+
+    /// Spawns a prepared `rurge_run` command and waits for both `listening
+    /// on` lines.
+    fn spawn_command(mut cmd: Command) -> Daemon {
         let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -1022,6 +1029,51 @@ mod run {
                 .is_some_and(|l| l.contains("outbound mode rule")),
             "{summary:?}"
         );
+    }
+
+    /// A group without members goes DIRECT, as in Surge; the switch, and its
+    /// environment variable, make it reject instead (M3-D3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_empty_group_goes_direct_unless_told_to_reject() {
+        let target = TestServer::spawn().await;
+        target.set("/hello", "hi from target");
+        let url = format!("http://127.0.0.1:{}/hello", target.url("/").port().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("t.conf");
+        std::fs::write(
+            &conf,
+            "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nloglevel = warning\n\
+[Proxy Group]\nSub = select, policy-path=missing.txt\n[Rule]\nFINAL,Sub\n",
+        )
+        .unwrap();
+        for (switch, env, rejects) in [
+            (None, None, false),
+            (Some("--empty-group-reject"), None, true),
+            (None, Some("true"), true),
+        ] {
+            let (conf, url) = (conf.clone(), url.clone());
+            let data = dir.path().join(format!("data-{rejects}-{}", env.is_some()));
+            let answer = tokio::task::spawn_blocking(move || {
+                let mut cmd = rurge_run(&conf, &data);
+                cmd.args(switch);
+                if let Some(value) = env {
+                    cmd.env("RURGE_EMPTY_GROUP_REJECT", value);
+                }
+                let daemon = spawn_command(cmd);
+                http_get(daemon.http, &url)
+            })
+            .await
+            .unwrap();
+            if rejects {
+                assert!(answer.is_empty(), "REJECT closes the connection: {answer}");
+            } else {
+                assert!(
+                    answer.starts_with("HTTP/1.1 200") && answer.ends_with("hi from target"),
+                    "{answer}"
+                );
+            }
+        }
+        assert_eq!(target.requests().len(), 1);
     }
 
     #[cfg(unix)]

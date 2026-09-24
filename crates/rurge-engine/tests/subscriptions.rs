@@ -21,6 +21,26 @@ async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
     }
 }
 
+/// An engine with its listeners, whose profile directory holds `files`
+/// before the first generation is built.
+async fn harness_in(files: &[(&str, &str)], p: Profile<'_>) -> Harness {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let dir = tempfile::tempdir().unwrap();
+    for (name, text) in files {
+        std::fs::write(dir.path().join(name), text).unwrap();
+    }
+    let text = p.text(dns.addr());
+    let engine = Engine::new(runtime(dir.path(), &text, EngineShared::default()).await);
+    let listeners = engine.bind_listeners().await.unwrap();
+    Harness {
+        dir,
+        engine,
+        listeners,
+        dns,
+    }
+}
+
 fn members(engine: &Engine, group: &str) -> Vec<String> {
     engine
         .registry()
@@ -103,6 +123,90 @@ async fn an_edited_subscription_file_rebuilds_the_registry() {
     assert!(
         Arc::ptr_eq(&generation, &engine.runtime()),
         "the generation stays"
+    );
+}
+
+/// A session leaves through a policy that exists only in the subscription;
+/// the proxy gets the target's name, as from any other proxy policy.
+#[tokio::test]
+async fn a_session_leaves_through_an_imported_policy() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi from the origin");
+    let node = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let nodes = format!("Node = socks5, 127.0.0.1, {}\n", node.addr().port());
+    let h = harness_in(
+        &[("nodes.txt", &nodes)],
+        Profile {
+            groups: "Sub = select, policy-path=nodes.txt",
+            rules: "DOMAIN,target.test,Sub",
+            ..Profile::default()
+        },
+    )
+    .await;
+    let mut tunnel = connect_via_http(h.http(), "target.test:8080").await;
+    assert!(
+        get(&mut tunnel, "target.test", "/hello")
+            .await
+            .ends_with("hi from the origin")
+    );
+    let seen = node.requests();
+    assert_eq!(seen.len(), 1);
+    assert_eq!((seen[0].host.as_str(), seen[0].port), ("target.test", 8080));
+}
+
+/// The relay of a group carries every member it took from its
+/// subscription: the relay is asked for the member's server by name, the
+/// member for the target by name, and nothing is resolved here (FR-GRP-07).
+#[tokio::test]
+async fn a_derived_member_is_reached_through_the_group_relay() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi through the relay");
+    let exit = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let relay = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(exit.addr()),
+        ..Socks5Script::default()
+    })
+    .await;
+    let proxies = format!("Relay = socks5, 127.0.0.1, {}", relay.addr().port());
+    let h = harness_in(
+        &[("nodes.txt", "Exit = socks5, exit.example, 1080\n")],
+        Profile {
+            proxies: &proxies,
+            groups: "Pool = select, policy-path=nodes.txt, underlying-proxy=Relay",
+            rules: "DOMAIN,target.test,Pool",
+            ..Profile::default()
+        },
+    )
+    .await;
+    assert_eq!(members(&h.engine, "Pool"), ["Exit (via Relay)"]);
+    let mut tunnel = connect_via_http(h.http(), "target.test:8080").await;
+    assert!(
+        get(&mut tunnel, "target.test", "/hello")
+            .await
+            .ends_with("hi through the relay")
+    );
+    let relay_seen = relay.requests();
+    let first = relay_seen.first().expect("the relay never saw a request");
+    assert_eq!(
+        (first.atyp, first.host.as_str(), first.port),
+        (3, "exit.example", 1080)
+    );
+    let exit_seen = exit.requests();
+    assert_eq!(
+        exit_seen.first().map(|r| r.host.as_str()),
+        Some("target.test")
+    );
+    assert!(
+        h.dns.queries().is_empty(),
+        "nothing on this path is resolved locally"
     );
 }
 
