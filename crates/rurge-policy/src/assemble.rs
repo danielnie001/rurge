@@ -7,7 +7,9 @@ use crate::subscription::{MAX_POLICIES, Subscription};
 use rurge_config::Config;
 use rurge_config::diagnostic::{Diagnostic, Diagnostics, Severity, codes};
 use rurge_config::policy::{PolicyKind, ProxyPolicy, parse_policy, with_params};
-use rurge_config::spec::{GroupSpec, NameKind, PolicyPath, PolicySpec, SpecEnv, to_spec};
+use rurge_config::spec::{
+    GroupSpec, NameKind, PolicyPath, PolicySpec, ProtoSpec, SpecEnv, to_spec,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -25,6 +27,15 @@ pub struct Imported {
     pub spec: Option<PolicySpec>,
 }
 
+/// `M (via R)`: a member M of a group with `underlying-proxy = R` (5.4).
+#[derive(Clone)]
+pub struct Derived {
+    /// M's, named `M (via R)` and chained through R.
+    pub spec: PolicySpec,
+    /// M's definition with `underlying-proxy` set to R.
+    pub definition: String,
+}
+
 /// No `Debug`: imported policies carry credentials.
 #[derive(Clone, Default)]
 pub struct Assembly {
@@ -32,6 +43,8 @@ pub struct Assembly {
     pub members: HashMap<String, Vec<String>>,
     /// Names unique, none of them a name of the profile.
     pub imported: Vec<Imported>,
+    /// Each derived name once, however many groups share it.
+    pub derived: Vec<Derived>,
     /// For every group on a cycle (through members as assembled or
     /// `include-other-group`), a shortest cycle through it: the groups
     /// along it, the first one repeated at the end; each cycle once.
@@ -53,10 +66,12 @@ pub fn assemble(cfg: &Config, snapshots: &Snapshots) -> Assembly {
     imports.read_specs(cfg, &mut diagnostics);
     let mut members = members(cfg, &imports);
     imports.drop_chain_cycles(cfg, &mut members, &mut diagnostics);
+    let derived = derive(cfg, &imports, &mut members, &mut diagnostics);
     let cycles = group_cycles(cfg, &members);
     Assembly {
         members,
         imported: imports.list.into_iter().map(|(i, _)| i).collect(),
+        derived,
         cycles,
         diagnostics,
     }
@@ -515,6 +530,74 @@ impl Expand<'_> {
         done.insert(g.name.clone(), out.list.clone());
         out.list
     }
+}
+
+/// Every proxy member M of a group with `underlying-proxy = R` becomes the
+/// derived policy `M (via R)`: M's parameters on R's chain, whatever relay M
+/// has of its own overridden. Groups, built-ins, `direct` / `reject` aliases
+/// and protocols without a spec stay as they are (5.4). A group that takes
+/// another's members through `include-other-group` takes them as written,
+/// since members are all assembled first. A derived name that is taken
+/// leaves the member out: a relay is never bypassed.
+fn derive(
+    cfg: &Config,
+    imports: &Imports<'_>,
+    members: &mut HashMap<String, Vec<String>>,
+    diags: &mut Diagnostics,
+) -> Vec<Derived> {
+    let imported: HashMap<&str, &Imported> = imports
+        .list
+        .iter()
+        .map(|(i, _)| (i.policy.name.as_str(), i))
+        .collect();
+    let mut derived: Vec<Derived> = Vec::new();
+    let mut made: HashSet<String> = HashSet::new();
+    for g in &cfg.group_specs {
+        let Some(relay) = &g.underlying_proxy else {
+            continue;
+        };
+        let Some(list) = members.get_mut(&g.name) else {
+            continue;
+        };
+        let mut chained = Vec::with_capacity(list.len());
+        for m in list.drain(..) {
+            let source = match imported.get(m.as_str()) {
+                Some(i) => i.spec.as_ref().map(|s| (s, i.policy.definition.as_str())),
+                None => cfg.spec(&m).and_then(|s| {
+                    let p = cfg.policies.iter().find(|p| p.name == m)?;
+                    Some((s, p.definition.as_str()))
+                }),
+            };
+            let Some((spec, definition)) = source
+                .filter(|(s, _)| !matches!(s.proto, ProtoSpec::Direct | ProtoSpec::Reject(_)))
+            else {
+                chained.push(m);
+                continue;
+            };
+            let name = format!("{m} (via {relay})");
+            if cfg.name_kind(&name).is_some() || imported.contains_key(name.as_str()) {
+                diags.push(warn(
+                    g,
+                    codes::W_SET_LINES_SKIPPED,
+                    format!("`{name}` is already the name of a policy; `{m}` is left out"),
+                ));
+                continue;
+            }
+            if made.insert(name.clone()) {
+                let mut spec = spec.clone();
+                spec.name = name.clone();
+                spec.common.underlying_proxy = Some(relay.clone());
+                let relay = [("underlying-proxy".to_string(), relay.clone())];
+                derived.push(Derived {
+                    spec,
+                    definition: with_params(definition, &relay),
+                });
+            }
+            chained.push(name);
+        }
+        *list = chained;
+    }
+    derived
 }
 
 /// Group cycles through members (as assembled) and `include-other-group`.
@@ -1139,6 +1222,108 @@ Fine = http, f.test, 80",
                     "policy group `Pool`: `policy-path` line 1: the `underlying-proxy` of `K1` names a policy that was left out; skipped".to_string()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn every_proxy_member_is_chained_through_the_group_relay() {
+        let cfg = profile(
+            "Relay = http, r.test, 80\nHop = http, h.test, 80\nA = http, a.test, 80, underlying-proxy=Hop\n\
+Corp = direct, interface=eth9\nBlock = reject\nSS = ss, s.test, 8388, encrypt-method=aes-128-gcm, password=pw",
+            "Inner = select, A\n\
+G = select, A, Corp, Block, DIRECT, Inner, SS, policy-path=https://sub.test/g, underlying-proxy=Relay",
+        );
+        let a = assemble(&cfg, &snapshots(&cfg, &[("G", "N = http, n.test, 80")]));
+        assert_eq!(
+            members(&a, "G"),
+            [
+                "A (via Relay)",
+                "Corp",
+                "Block",
+                "DIRECT",
+                "Inner",
+                "SS",
+                "N (via Relay)"
+            ]
+        );
+        assert_eq!(members(&a, "Inner"), ["A"]);
+        let names: Vec<&str> = a.derived.iter().map(|d| d.spec.name.as_str()).collect();
+        assert_eq!(names, ["A (via Relay)", "N (via Relay)"]);
+        let d = &a.derived[0];
+        // the group's relay overrides the member's own
+        assert_eq!(d.spec.common.underlying_proxy.as_deref(), Some("Relay"));
+        assert_eq!(d.spec.server, cfg.spec("A").unwrap().server);
+        assert_eq!(d.definition, "http, a.test, 80, underlying-proxy=Relay");
+        assert_eq!(
+            a.derived[1].definition,
+            "http, n.test, 80, underlying-proxy=Relay"
+        );
+        assert!(a.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn groups_with_the_same_relay_share_a_derived_policy() {
+        let cfg = profile(
+            "Relay = http, r.test, 80\nA = http, a.test, 80",
+            "G1 = select, A, underlying-proxy=Relay\nG2 = select, A, underlying-proxy=Relay\n\
+G3 = select, include-other-group=G1",
+        );
+        let a = assemble(&cfg, &Snapshots::new());
+        assert_eq!(members(&a, "G1"), ["A (via Relay)"]);
+        assert_eq!(members(&a, "G2"), ["A (via Relay)"]);
+        // members are all assembled before any is chained
+        assert_eq!(members(&a, "G3"), ["A"]);
+        assert_eq!(a.derived.len(), 1);
+    }
+
+    /// Leaving the member out is the safe side: a relay is never bypassed.
+    #[test]
+    fn a_derived_name_that_is_taken_leaves_the_member_out() {
+        let cfg = profile(
+            "Relay = http, r.test, 80\nA = http, a.test, 80\nA (via Relay) = http, x.test, 80",
+            "G = select, A, DIRECT, underlying-proxy=Relay",
+        );
+        let a = assemble(&cfg, &Snapshots::new());
+        assert_eq!(members(&a, "G"), ["DIRECT"]);
+        assert!(a.derived.is_empty());
+        assert_eq!(
+            warnings(&a),
+            [(
+                codes::W_SET_LINES_SKIPPED,
+                "policy group `G`: `A (via Relay)` is already the name of a policy; `A` is left out"
+                    .to_string()
+            )]
+        );
+    }
+
+    /// The relay of a group is an edge too: an imported line that goes back
+    /// through the group whose relay imported it would never finish
+    /// dialling, so it is left out and the group's own members keep theirs.
+    #[test]
+    fn an_imported_chain_through_a_group_relay_is_dropped() {
+        let cfg = profile(
+            "A = http, a.test, 80",
+            "G = select, A, underlying-proxy=R\nR = select, policy-path=https://sub.test/r",
+        );
+        let a = assemble(
+            &cfg,
+            &snapshots(
+                &cfg,
+                &[(
+                    "R",
+                    "X = http, x.test, 80, underlying-proxy=G\nY = http, y.test, 80",
+                )],
+            ),
+        );
+        assert_eq!(members(&a, "R"), ["Y"]);
+        assert_eq!(members(&a, "G"), ["A (via R)"]);
+        assert_eq!(
+            warnings(&a),
+            [(
+                codes::W_SET_LINES_SKIPPED,
+                "policy group `R`: `policy-path` line 1: the `underlying-proxy` of `X` leads back to the policy itself; skipped"
+                    .to_string()
+            )]
         );
     }
 

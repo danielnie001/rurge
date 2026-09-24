@@ -188,7 +188,8 @@ pub mod codes {
     pub const W_DUPLICATE_FINAL: &str = "W0021";
     /// External set resource has no data yet (never downloaded, or failed without cache).
     pub const W_RESOURCE_UNAVAILABLE: &str = "W0022";
-    /// A set file or a `policy-path` subscription contained lines that were skipped.
+    /// A set file or a `policy-path` subscription contained lines that were
+    /// skipped, or a group had to leave a member out.
     pub const W_SET_LINES_SKIPPED: &str = "W0023";
     /// A set file or a `policy-path` subscription exceeded its limit and was truncated.
     pub const W_SET_TRUNCATED: &str = "W0024";
