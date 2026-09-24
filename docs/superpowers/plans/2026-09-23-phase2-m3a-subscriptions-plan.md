@@ -7960,6 +7960,19 @@ git commit -m "docs: M3a——兼容性清单、API 参考、手工验收、M3 �
 
 | 任务 | 计划原文 | 实际做法 | 原因 | 提交 |
 | ---- | -------- | -------- | ---- | ---- |
+| 1 | `underlying_cycles`（`E0019`）的图：写出的成员、`subnet` 条件、`default`、`include-other-group`、组自己的中继 | 另加 `include-all-proxies` 收进来的代理（非别名、经 `policy-regex-filter` 放行的 `[Proxy]` 策略）；新增 `ImportOpts::admits`（P1 过滤规则的唯一实现，装配也用它）；`subnet` 组的 `include-other-group` 不再成边；补三条用例 | 评审发现：`Exit = …, underlying-proxy=Hop` + `Hop = select, include-all-proxies=true` 能加载，到装配后拨号 Exit 会无界递归（C3 靠 `E0019` 兜住主配置里的环）；`subnet` 组忽略的参数产生了误报的 `W0030` / `E0019` | ba407d8 |
+| 1 | 脱敏用例插在 `snell` 用例之后 | 放在测试模块末尾 | 只是位置 | 5326d77 |
+| 3 | 私有函数 `passes(group, name)` | 调 `ImportOpts::admits` | 与加载期的 `E0019` 检查共用一处 P1 规则 | 775023e |
+| 3 | 组环：深度优先、只在遇到栈上的组时记环 | 迭代版 Tarjan 求强连通分量：环上的组一个不漏（与成员顺序无关）；每个环上的组各取一条最短环、从先声明的组写起、去重后列出；`include-other-group` 的"成环的组不展开给别人"与导入行的中继成环检查（改为线性）用同一个函数 | 评审发现：经横叉边回到环上的组会漏列，环上的组 REJECT 的集合随成员书写顺序变化 | 5e5478f |
+| 3 | 导入行 `to_spec` 出错时，`W0023` 的原因是 `to_spec` 的消息 | 原因只写固定说法加诊断码：`policy `N` has a parameter whose value cannot be used (E0018)`、`… has an `underlying-proxy` that names no policy (E0007)`、`… names a `[Keystore]` item that is missing or of another kind (E0020)`，其余 `… cannot be used (<码>)` | M3-D7：`to_spec` 的消息会引用取值（如 `invalid value `999` for `tos``、整条请求头），修饰值因此会进日志 | 5e5478f |
+| 3 | （计划未写） | 中继指向一个已被略去的导入行的导入行一并略去（`W0023` "names a policy that was left out"），沿反向中继边一次遍历 | 否则它留在成员表里、每次拨号都失败；逐轮剔除在长链上是平方复杂度（1 万行 4–10 秒） | 5e5478f、434dee7 |
+| 3 | `with_params`：需要时加一层引号 | 值首尾带引号或带首尾空白时加两层引号，读回的值与设下的完全相同 | 解析器对 `key="value"` 去两次引号（先按列表字段、再按参数值并先 trim） | 5e5478f |
+| 3 | （计划未涉及，M1a 起的代码） | `headers` 解析错误按序号报：`header #N has no `:``、`header #N has an invalid name` | 原文引用整条请求头，`Authorization Bearer …` 就是凭据 | 5e5478f |
+| 5 | 导入 / 派生策略构建失败：`WARN policy=… error=<工厂错误文本>` | 只记策略名 | M3-D7：工厂的错误文本会引用导入行的取值（如不合法的 `sni`） | 66eb655 |
+| 5 | `Line` 派生 `Debug` | 手写 `Debug`，不打印定义行 | P18：定义行带导入行的口令与组行的订阅链接 | 66eb655 |
+| 5 | 会话说明一律写进请求记录的 `error` | 空组代以 DIRECT 而拨号失败时，请求记录写"说明; 失败原因" | 否则失败原因被说明盖住 | 66eb655 |
+| 5 | `PolicyRegistry::contains` 线性扫描 | 查表 | 每次拨号、每一跳链式连接都调用，而条目可达上万 | 66eb655 |
+| 8 | Step 1 列出了 `a_rebuild_of_a_replaced_generation_publishes_nothing`，但计划正文漏了这条用例的代码（拼装计划时漏选了该补丁的最后一处修改） | 用副本上验证过的版本（新一代换了配置，并核对当前一代的重建照常发布） | 计划缺陷 | 61b2a4b |
 
 ## 延后事项
 
@@ -7974,3 +7987,15 @@ git commit -m "docs: M3a——兼容性清单、API 参考、手工验收、M3 �
 | 7 | 每次重建重新解析全部订阅，不按来源缓存解析结果 | 需要时（M8） |
 | 8 | 兼容性清单附录的统计：本计划只按第 5 节的增减改了数字；按"每行第一个状态标记"重数时，另外几节与表里的数字对不上，原因未核对 | 单独核对 |
 | 9 | 崩溃恢复顺序缺陷（`rurge run` 在坏配置上先退出、后 `sysproxy.recover()`），与 M3a 无关 | 单独跟进（等项目所有者点头） |
+| 10 | 两个组导入同名策略时，命名空间在校验之前就裁决：先声明的组那份若有错被跳过，后一个组那份好的也已被跳过 | 有用户报告再说 |
+| 11 | 订阅行能按名字用到主配置的私有材料（`client-cert=<Keystore 条目>`、`underlying-proxy=<主配置策略>`），即订阅作者能让 rurge 向他指定的主机出示用户的客户端证书、或经用户自己的代理连过去；M3b 的自动测速之后无需用户选中该节点也会发生 | 等项目所有者决定（M3b 之前） |
+| 12 | 空组被当作中继（策略的 `underlying-proxy` 或组级中继指向一个还没有内容的订阅组）时解析到 DIRECT 兜底，依赖它的策略直连自己的服务器、绕过了使用者设的中继（M3-D3 的直接结果，与 P11 的理由相悖；`--empty-group-reject` 可全局改为拒绝） | 等项目所有者决定 |
+| 13 | 导入策略 X 在注册表构建时失败被略去，中继指向 X 的另一条导入策略仍留在成员表里，每次拨号失败（`via X: the policy no longer exists`） | 有用户报告再说；最迟 M8 |
+| 14 | 一个会话先取当前代、后取注册表，而重载先发布注册表、后换代：恰好跨过重载的会话可能用旧一代的规则选名、到新一代的注册表里解析，重载删掉或改名的策略会让这一条连接 REJECT 并打一条 ERROR | M3b（拨号入口会改，与 C4 一起） |
+| 15 | 订阅重建（解析、装配、构建出站）在 tokio 工作线程上同步执行，大订阅会占住一个工作线程；与重载时 `Runtime::build` 的既有做法相同 | 需要时（M8，与 #7 一起） |
+| 16 | 加载期的 `W0030` 只点名每条回边的两端；经横叉边在环上的组不在告警里点名（运行期每个环都 WARN、会话记录写出整个环） | 有用户报告再说 |
+| 17 | 坏的 `external-policy-modifier` 值让每条导入行各报一条 `W0023` | 与 #6 一起 |
+| 18 | `derive` 按名字线性查主配置的定义行；两个不同的（成员，中继）组合只有在名字里本身含 ` (via ` 时才可能拼出同一个派生名，此时后者静默共用前者的 spec | 有用户报告再说 |
+| 19 | `spec/http.rs` 的 `<random-string(…)>` 长度错误会引用括号里的文字（只影响主配置；导入行已由固定说法兜住） | 单独小改动 |
+| 20 | 测试偶发失败（计时类，与本分支无关）：`rurge-dns` 的 `bootstrap::set_upstreams_takes_effect_for_the_next_resolve` 与 `resolver::tests::a_partial_result_completes_aaaa_in_the_background`，全工作区运行中各见一两次，单独重跑通过 | 单独排查 |
+| 21 | 1 秒内的多次订阅更新只触发一次重建，没有用例钉住（去抖由代码与常数保证） | 有用户报告再说 |

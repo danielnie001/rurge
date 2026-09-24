@@ -137,7 +137,7 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 
 ## `GET /v1/policy_groups/select`
 
-参数 `group_name`（必填，查询参数）。响应 `{"policy": "<当前生效的成员>"}`：`select` 组是它当前的选择（没有选择时是第一个成员）；非 `select` 组（`url-test` / `fallback` / `subnet` 等）是它当前解析到的成员，同样按"没有选择用第一个成员"的规则；**一个配置合法但没有成员的组**（例如 `subnet` 组——它的目标写在 `conditions` / `default` 里，不写在成员列表）返回 `{"policy": ""}`，这不是错误。
+参数 `group_name`（必填，查询参数）。响应 `{"policy": "<当前生效的成员>"}`：`select` 组是它当前的选择（没有选择时是第一个成员）；非 `select` 组（`url-test` / `fallback` / `subnet` 等）是它当前解析到的成员，同样按"没有选择用第一个成员"的规则；**一个没有成员的组**（订阅还没下载到，或过滤把成员滤光了）返回 `{"policy": ""}`，这不是错误；`subnet` 组在阶段 3 之前代表它的 `default`（M3a）。
 
 ```json
 {"policy": "HK"}
@@ -169,4 +169,14 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 
 ## `POST /v1/profiles/check`
 
-自阶段 2 / M1 起，`POST /v1/profiles/check`（阶段 1 端点，见 `docs/api/phase1.md`）除原有的加载诊断外，还包含干构建：磁盘上的配置能解析、但其中某个策略构建不出来（例如 `client-cert` 指向的 p12 解不开、密码错误）时，`ok` 为 `false`，`errors` 计入这条 `E0022`，`diagnostics` 里带上该策略定义所在的行号。`rurge check`、`run`、`reload` 的行为相同（见 `docs/surge-compatibility-matrix.md` 10.3 / 10.4 节）。
+自阶段 2 / M1 起，`POST /v1/profiles/check`（阶段 1 端点，见 `docs/api/phase1.md`）除原有的加载诊断外，还包含干构建（自 M3a 起还有订阅装配，见下一节）：磁盘上的配置能解析、但其中某个策略构建不出来（例如 `client-cert` 指向的 p12 解不开、密码错误）时，`ok` 为 `false`，`errors` 计入这条 `E0022`，`diagnostics` 里带上该策略定义所在的行号。`rurge check`、`run`、`reload` 的行为相同（见 `docs/surge-compatibility-matrix.md` 10.3 / 10.4 节）。
+
+## 订阅导入与派生的策略（M3a）
+
+自阶段 2 / M3a 起（`docs/superpowers/specs/2026-09-23-phase2-m3-groups-subscriptions-design.md` 第 5、8 节），上面几个端点读的都是运行中的策略表，而策略表会随订阅更新重建：
+
+- `GET /v1/policies` 的 `proxies` 依次是 5 个内置策略、配置里的策略、订阅导入的策略、组级 `underlying-proxy` 派生的 `Name (via Relay)`；`policy-groups` 不变。
+- `GET /v1/policies/detail` 能查导入与派生的策略：导入的是订阅里那一行（前缀与 `external-policy-modifier` 已应用），派生的是其来源策略的定义加上 `underlying-proxy=<中继>`；脱敏规则同上，`policy-path` 与 `external-policy-modifier` 也在脱敏名单里。
+- `GET /v1/policy_groups` 的成员表是装配后的：写在组行上的、`include-other-group` 与 `include-all-proxies` 取来的、订阅导入的，经过滤与去重，有中继的组里代理成员换成派生名。`lineHash` 对导入与派生的成员同样建立在脱敏后的文本上。
+- `GET` / `POST /v1/policy_groups/select` 按装配后的成员表读与校验；选择按名字保存，订阅更新后名字不在了就回落到第一个成员。
+- `POST /v1/profiles/check`：配置本身无错时，连同守护进程数据目录里已缓存的订阅一起装配检查，不联网；没有内容的订阅报 `W0022`，订阅里跳过的行报 `W0023`，订阅的 URL 不出现在输出里。

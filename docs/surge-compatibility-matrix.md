@@ -354,9 +354,9 @@
 | `tos` | 0–255 或 `0x` 十六进制；默认 0 | 🟡 | 2 | M1 已实现；Windows 上对 IPv6 不生效；有 underlying-proxy 时无效（socket 选项属于真正打开 socket 的那一跳）；M2a 起加载时报 W0028 |
 | `ecn` | `auto` `on` `off`；QUIC 类协议默认开启，WireGuard/Tailscale 默认关闭 | 🟡 | 2 | 取决于所选 QUIC 库对 ECN 的支持；M1 解析并校验取值，`W0029`；M5 生效 |
 | `block-quic` | `auto` `on` `off`；默认 `auto`（代理策略默认阻断，DIRECT 不阻断） | ✅ | 2 | 与 `[General] block-quic` 全局覆盖联动；M1 解析并校验取值，`W0029`；M7 生效 |
-| `test-url` | HTTP(S) URL；默认全局设置 | ✅ | 2 | M1 解析并校验取值，`W0029`；M3 生效 |
-| `test-timeout` | 秒；默认全局设置 | ✅ | 2 | M1 解析并校验取值，`W0029`；M3 生效 |
-| `test-udp` | `hostname@ipv4` | ✅ | 2 | M1 解析并校验取值，`W0029`；M3 生效 |
+| `test-url` | HTTP(S) URL；默认全局设置 | ✅ | 2 | M1 解析并校验取值，`W0029`；M3b 生效 |
+| `test-timeout` | 秒；默认全局设置 | ✅ | 2 | M1 解析并校验取值，`W0029`；M3b 生效 |
+| `test-udp` | `hostname@ipv4` | ✅ | 2 | M1 解析并校验取值，`W0029`；M5 生效（M3 细化设计订正了原来的"M3 生效"） |
 | `underlying-proxy` | 另一策略或策略组名；仅代理策略；不能与 `port-hopping` 同用 | ✅ | 2 | 目标代理主机名在上游远程解析；M1 已实现（TCP）：底层可以是策略或组，按名字在拨号时解析，组的选择变了链的入口随之变；成环是 `E0019`；链上某一跳失败时错误文本带 `via <名字>:` 前缀 |
 
 ### 4.4 TLS 与 Shadow TLS 参数
@@ -431,8 +431,8 @@
 | `fallback` | 按声明顺序取第一个可用；全部不可用则用第一个 | ✅ | 2 | |
 | `load-balance` | 可用集合内随机；`persistent` 时按目标主机名哈希；从不通知；嵌套时分数取均值 | ✅ | 2 | |
 | `smart` | 按真实连接质量动态选择：首响应延迟时间加权均值 + 重传惩罚（约每 1% 丢包 50 ms）× `policy-priority`；接近最优者构成优选集，其余为重试列表；按站点记忆约 1 小时；固定 5 分钟重测，`interval` 无效；>12 成员只测子集；忽略嵌套组与内置策略 | 🟡 | 2 | 算法细节非公开，rurge 按手册描述近似实现 |
-| `subnet`（旧名 `ssid`） | 按当前网络选择；条件按声明顺序首个命中；网络变化重算；无命中用 `default` | 🟡 | 3 | `TYPE:CELLULAR` / `MCCMNC:` 永不匹配 |
-| 嵌套与循环 | 组可嵌套；循环引用告警且该组临时表现为 REJECT；无可用成员回退 DIRECT | ✅ | 2 | |
+| `subnet`（旧名 `ssid`） | 按当前网络选择；条件按声明顺序首个命中；网络变化重算；无命中用 `default` | 🟡 | 3 | `TYPE:CELLULAR` / `MCCMNC:` 永不匹配；阶段 3 之前整组代表它的 `default`（M3a；没写 `default` 时按空组兜底，见下一行）；`category` 等界面参数不再被当成网络条件 |
+| 嵌套与循环 | 组可嵌套；循环引用告警且该组临时表现为 REJECT；无可用成员回退 DIRECT | ✅ | 2 | M3a 已实现：循环在加载期报 `W0030`（取代 `E0009`，不再阻止加载），装配后按成员与 `include-other-group` 再检测一次，环上的组解析为 REJECT，会话记录 `policy group cycle: A → B → A`；不在环上、但选到成环成员的组只在那一次 REJECT。没有成员的组（订阅还没下载到、过滤滤光了）回退 DIRECT，会话记录 `policy group has no members; DIRECT substituted`（回退的 DIRECT 本身拨号也失败时，后面再接失败原因）；rurge 专有的 `--empty-group-reject`（环境变量 `RURGE_EMPTY_GROUP_REJECT=true`）改为 REJECT。每构建一次策略表，每个环、每个空组各告警一次 |
 | 临时覆盖 | 自动类型组可手动指定成员，期间停止自动测试 | ✅ | 2 | API / CLI 提供 |
 
 ### 5.2 组参数
@@ -450,15 +450,17 @@
 | `no-alert` | url-test / fallback | 布尔；默认 false | ✅ | 6 |
 | `hidden` | 全部 | 布尔；默认 false | ✅ | 2 |
 | `icon-url` | 全部（Mac 6.5+） | URL | ✅ | 6 |
-| `underlying-proxy` | 全部（iOS 5.22 / Mac 6.9+） | 策略名；整组链式代理，派生策略名 `Name (via Relay)` | ✅ | 2 |
-| `policy-path` | 除 subnet 外 | 文件路径或 URL；内容为策略行列表或含 `[Proxy]` 的完整配置；远程缓存并定期更新 | ✅ | 2 |
-| `update-interval` | 同上 | 秒；默认 86400 | ✅ | 2 |
-| `policy-regex-filter` | 同上 | 正则；作用于导入成员，不作用于显式成员 | ✅ | 2 |
-| `external-policy-modifier` | 同上 | 引号包裹的 `key=value` 列表；覆盖导入策略参数 | ✅ | 2 |
-| `external-policy-name-prefix` | 同上 | 前缀（不能含 `=`） | ✅ | 2 |
-| `include-all-proxies` | 同上（iOS 4.12 / Mac 4.5+） | 布尔；含 `[Proxy]` 全部代理策略，不含内置与组 | ✅ | 2 |
-| `include-other-group` | 同上 | `"g1,g2"`；递归展开 | ✅ | 2 |
-| 成员装配顺序 | 显式成员 → `include-other-group` → `include-all-proxies` → `policy-path`；重名保留首个；导入项按 过滤 → 前缀 → 修饰 处理 | | ✅ | 2 |
+| `category` | 全部（iOS 5.23 / Mac 6.10+） | 界面分类；不影响路由。M3a 起接受，不报诊断 | 🔁 | 2 |
+| `url`（旧参数） | 自动类型组 | 当前版本无效；M3a 起报 `W0006`，提示改用策略的 `test-url` 或 `proxy-test-url` | 🔁 | 2 |
+| `underlying-proxy` | 全部（iOS 5.22 / Mac 6.9+） | 策略名；整组链式代理，派生策略名 `Name (via Relay)`。M3a 已实现：组上的中继覆盖成员自己的；组、内置策略与 `direct` / `reject` 别名成员原样保留；经 `include-other-group` 取到的是未派生的成员；派生名已被占用时略去该成员并告警（不绕过中继）；经它绕回本组是 `E0019` | ✅ | 2 |
+| `policy-path` | 除 subnet 外 | 文件路径或 URL；内容为策略行列表或含 `[Proxy]` 的完整配置；远程缓存并定期更新。M3a 已实现，差异：只接受 Surge 格式（Clash / base64 解析不出策略时告警）；下载经 rurge 自己的直连，不经代理（未与 Surge 核对）；值在 `profiles/current` 与 `policies/detail` 里脱敏，日志只写组名、不写 URL；单个订阅最多 10 000 条策略；首次下载不阻塞启动（组先按空组兜底），已有缓存时启动与重载同步载入；订阅更新只重建策略表（没变的成员沿用原出站），不打断无关的连接；坏行、重名、与配置同名的行跳过并告警（只报行号与原因） | 🟡 | 2 |
+| `update-interval` | 同上 | 秒；默认 86400；M3a 已实现（几个组共用一个来源时取最短的） | ✅ | 2 |
+| `policy-regex-filter` | 同上 | 正则；作用于导入成员，不作用于显式成员；M3a 已实现（`fancy-regex` 语法，与 URL-REGEX 相同；订阅成员按加前缀之前的原名过滤） | ✅ | 2 |
+| `external-policy-modifier` | 同上 | 引号包裹的 `key=value` 列表；覆盖导入策略参数；M3a 已实现（在文本层改写导入行：同名参数原地替换、没有的追加）；值可能含凭据，在 `profiles/current` 与 `policies/detail` 里整体脱敏 | ✅ | 2 |
+| `external-policy-name-prefix` | 同上 | 前缀（不能含 `=`）；M3a 已实现 | ✅ | 2 |
+| `include-all-proxies` | 同上（iOS 4.12 / Mac 4.5+） | 布尔；含 `[Proxy]` 全部代理策略，不含内置与组；M3a 已实现（也不含 `direct` / `reject` 别名） | ✅ | 2 |
+| `include-other-group` | 同上 | `"g1,g2"`；递归展开；M3a 已实现（引用未知的组是 `E0008`；成环的组不展开给别人） | ✅ | 2 |
+| 成员装配顺序 | 显式成员 → `include-other-group` → `include-all-proxies` → `policy-path`；重名保留首个；导入项按 过滤 → 前缀 → 修饰 处理 | M3a 已实现；两个组导入了同名策略：定义相同视为同一个，不同则先声明的组那份生效；规则不能直接引用导入的策略名（`E0007`，未与 Surge 核对） | ✅ | 2 |
 | 测试 URL / 超时解析顺序 | 策略自身 `test-url` → 全局 `proxy-test-url` / `internet-test-url`；策略 `test-timeout` → 全局 `test-timeout`（默认 5，直连类 10） | | ✅ | 2 |
 
 ---
@@ -796,7 +798,7 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | 无参数进入交互模式（补全、历史） | | `rurge shell` | 6 | |
 | `--raw` | 输出原始 JSON | `--json` | 6 | |
 | `--remote / -r <host:port>` `--password-stdin` `SURGE_CLI_PASSWORD` | 远程实例 | `--remote` `--password-stdin` `RURGE_CLI_PASSWORD` | 6 | 远程走 HTTP API |
-| `--check / -c <path>` | 校验配置 | `rurge check -c <path>` | 1 | 自阶段 2 / M1 起含干构建：构建不出来的策略（如 p12 解不开）是带行号的 `E0022` |
+| `--check / -c <path>` | 校验配置 | `rurge check -c <path> [--data-dir <dir>]` | 1 | 自阶段 2 / M1 起含干构建：构建不出来的策略（如 p12 解不开）是带行号的 `E0022`；自 M3a 起配置本身无错时，连同数据目录（`--data-dir`，环境变量 `RURGE_DATA_DIR`，默认平台数据目录）里已缓存的 `policy-path` 订阅一起装配检查，不联网：没有内容的订阅报 `W0022`，订阅里跳过的行报 `W0023`，订阅的 URL 不出现在输出里 |
 | `--help` / `help <command>` | | 同 | 1 | |
 | `status` `summary` `version` | 状态 | 同名 | 6 | |
 | `mode` `global-policy` `policy-group` | 出站模式 / 全局策略 / 组选择与清除覆盖 | 同名 | 6 | |
@@ -814,7 +816,7 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | rurge 专有 | 守护进程 | `rurge run -c <path> [--tun] [--system-proxy]`、`rurge service install/uninstall`、`rurge mitm ca generate/export` | 1 / 3 / 4 | `--system-proxy`（环境变量 `RURGE_SYSTEM_PROXY`）与 `rurge service install -c <conf> [--user] [--system-proxy] [--dry-run]` / `rurge service uninstall [--user] [--dry-run]` 已实现（M4b；`uninstall` 没有 `-c` 也没有 `--system-proxy`）；Windows 除 Ctrl-C 外，控制台关闭、注销、系统关机也会先恢复系统代理再退出；Windows 开机自启用登录时触发的计划任务（`schtasks /sc onlogon /f`，🟡，真正的 Windows 服务留到阶段 6），`--user` 在 Windows 上无实际区别（`schtasks` 不分用户 / 系统范围）；Linux 上 `service install --system-proxy` 只允许 `--user`——system 范围直接被拒绝（stderr `error: --system-proxy needs a desktop session: on Linux install with --user`，退出 2），因为 system unit 以 root 运行、看不到桌面会话，每次启动都会 `Unsupported` 失败；`--user` + `--system-proxy` 的 unit 改挂图形会话（`[Unit]` 的 `PartOf=` / `After=graphical-session.target`、`[Install]` 的 `WantedBy=graphical-session.target`），不带 `--system-proxy` 时仍是 `default.target`；所有 systemd unit 都带启动限制 `StartLimitIntervalSec=60` / `StartLimitBurst=5`（60 秒内最多 5 次），持续失败会停下来而不是每 3 秒重启一次；macOS 与 Linux 上 `--user` 如果在 `sudo` 下执行都会被拒绝（`--user under sudo would target root's session; run it without sudo`，退出 2，`install` / `uninstall` 两条路径都检查）：macOS 看 `id -u` 是否为 0（launchd 的 `gui/0` 是 root 的会话而不是用户的），Linux 与其余平台改看环境变量 `SUDO_UID` 是否存在，而不是探测 uid——容器里直接以 root 运行是正常用法，不该一并拒绝 |
 | rurge 专有开发命令 | 离线（不启动守护进程）在当前进程内构建配置并评估一次会话，用于调试规则与规则集 | `rurge rule match -c <conf> <host[:port]> [--explain] [--json] [--resolve <ip,...>\|--no-dns] ...` | 1 | 见 M2 设计文档 §10.1；阶段 6 的 `rule match`/`rule explain` 经 HTTP API 查询运行中的守护进程，语义一致但走线上实例 |
 | rurge 专有开发命令 | 离线按配置的 DNS 设置解析域名，`--server` 覆盖上游，`--trace` 打印每次尝试；`dns cache` 打印本进程缓存快照 | `rurge dns lookup -c <conf> <name> [--type a\|aaaa\|both] [--server <spec>...] [--no-cache] [--trace] [--json]`；`rurge dns cache -c <conf> [name...]` | 1 | 见 M2 设计文档 §10.2；阶段 6 的 `dns lookup` 经 HTTP API 查询守护进程 |
-| rurge 专有命令 | 前台运行 HTTP / SOCKS5 代理；出站模式初值来自 `--outbound-mode`（M4 起 `state.json` 优先）；`--log-level` 覆盖 `loglevel` | `rurge run -c <conf> [--outbound-mode direct\|proxy=<p>\|rule] [--log-level <l>] [--idle-timeout <secs>] [--request-log-size <n>] [--watch] [--log-file <path>]` | 1 | 见 M3 设计文档 §9.3；`--idle-timeout` / `--request-log-size` / `--watch` / `--log-file` 为 rurge 专有运行时选项（M3b，只经 CLI 参数 / 环境变量提供，不写入 Surge 配置）；`reload` / `stop` 命令仍依赖 M4 的控制通道，但 SIGHUP / `--watch` 的热重载已可用；每个数据目录只允许一个 `rurge run`：启动时先对 `<data-dir>/rurge.lock` 取独占锁（`std::fs::File::try_lock`），同一数据目录上的第二个实例打印 `error: another rurge instance is already running with the data directory <路径>` 并退出 1，锁由操作系统在进程死亡时释放；文件系统不支持加锁时只记一条 WARN 后照常启动（M4b） |
+| rurge 专有命令 | 前台运行 HTTP / SOCKS5 代理；出站模式初值来自 `--outbound-mode`（M4 起 `state.json` 优先）；`--log-level` 覆盖 `loglevel` | `rurge run -c <conf> [--outbound-mode direct\|proxy=<p>\|rule] [--log-level <l>] [--idle-timeout <secs>] [--request-log-size <n>] [--watch] [--log-file <path>] [--empty-group-reject]` | 1 | 见 M3 设计文档 §9.3；`--empty-group-reject`（环境变量 `RURGE_EMPTY_GROUP_REJECT`，与其它 rurge 开关一样只接受 `true` / `false`）让没有成员的组解析为 REJECT 而不是 DIRECT（阶段 2 / M3a）；`--idle-timeout` / `--request-log-size` / `--watch` / `--log-file` 为 rurge 专有运行时选项（M3b，只经 CLI 参数 / 环境变量提供，不写入 Surge 配置）；`reload` / `stop` 命令仍依赖 M4 的控制通道，但 SIGHUP / `--watch` 的热重载已可用；每个数据目录只允许一个 `rurge run`：启动时先对 `<data-dir>/rurge.lock` 取独占锁（`std::fs::File::try_lock`），同一数据目录上的第二个实例打印 `error: another rurge instance is already running with the data directory <路径>` 并退出 1，锁由操作系统在进程死亡时释放；文件系统不支持加锁时只记一条 WARN 后照常启动（M4b） |
 
 ### 10.4 HTTP API
 
@@ -827,17 +829,17 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | `GET/POST /v1/features/enhanced_mode` | 增强模式开关 | Mac only | ✅ | 3 | 阶段 1（M4a）已实现：`GET` 恒返回 `false`，`POST` 恒 501；阶段 3（TUN）落地后生效 |
 | `GET/POST /v1/outbound` | `{"mode":"direct"\|"proxy"\|"rule"}` | 全部 | ✅ | 1 | |
 | `GET/POST /v1/outbound/global` | 全局模式策略 | 全部 | 🟡 | 1 | M4a 已实现；出站模式与全局策略持久化到 `state.json`，显式 `--outbound-mode` 覆盖并写回（不校验策略是否存在）；`proxy` 模式下全局策略缺失或已不存在（如重载后）→ 按规则模式处理并 WARN 一次；`proxy` 模式下用空串清空全局策略 → 400（与 `POST /v1/outbound` 切换模式时的校验对称，M4b） |
-| `GET /v1/policies` | 列出策略 | 全部 | 🟡 | 1 | M4a 已实现；JSON 结构手册未定义，暂定结构见 `docs/api/phase1.md`，阶段 6 对齐真实 Surge |
-| `GET /v1/policies/detail?policy_name=` | 策略详情 | 全部 | 🟡 | 2 | M1 已实现；响应形状手册未给出，暂定结构见 `docs/api/phase2.md` |
+| `GET /v1/policies` | 列出策略 | 全部 | 🟡 | 1 | M4a 已实现；JSON 结构手册未定义，暂定结构见 `docs/api/phase1.md`，阶段 6 对齐真实 Surge；阶段 2 / M3a 起 `proxies` 含订阅导入的策略与组级中继派生的 `Name (via Relay)` |
+| `GET /v1/policies/detail?policy_name=` | 策略详情 | 全部 | 🟡 | 2 | M1 已实现；响应形状手册未给出，暂定结构见 `docs/api/phase2.md`；M3a 起也能查导入与派生的策略（同样脱敏） |
 | `POST /v1/policies/test` | `{"policy_names":[...],"url":...}` | 全部 | ✅ | 2 | |
-| `GET /v1/policy_groups` | 列出组与选项 | 全部 | 🟡 | 2 | M1 已实现；响应形状手册未给出，暂定结构见 `docs/api/phase2.md` |
+| `GET /v1/policy_groups` | 列出组与选项 | 全部 | 🟡 | 2 | M1 已实现；响应形状手册未给出，暂定结构见 `docs/api/phase2.md`；M3a 起成员是装配后的成员表（含订阅导入与派生成员），订阅更新后随之变化 |
 | `GET /v1/policy_groups/test_results` | 自动组测试结果 | 全部 | ✅ | 2 | |
-| `GET/POST /v1/policy_groups/select` | 读 / 改 select 组选择 | 全部 | ✅ | 2 | M1 已实现 |
+| `GET/POST /v1/policy_groups/select` | 读 / 改 select 组选择 | 全部 | ✅ | 2 | M1 已实现；M3a 起按装配后的成员表校验，选择按名字保存，订阅更新后名字不在了就回落到第一个成员 |
 | `POST /v1/policy_groups/test` | 立即测试 → `{"available":[...]}` | 全部 | ✅ | 2 | |
 | `GET /v1/requests/recent` `GET /v1/requests/active` `POST /v1/requests/kill` | 请求列表与终止 | 全部 | 🟡 | 1 / 4 | 响应结构手册未定义，以 Surge 实际输出为准做兼容测试；M4a 暂定结构见 `docs/api/phase1.md`；`kill` 命中 rurge 自身的内部会话（如 DNS 查询）→ 409 |
-| `GET /v1/profiles/current?sensitive=0` | 当前配置文本（可脱敏） | 全部 | ✅ | 1 | M4a 已实现；`sensitive=0`（默认）脱敏：独立密钥行 `password` / `ca-passphrase` / `ca-p12` / `private-key` / `psk` / `pre-shared-key` / `token`；内联参数 `password` / `psk` / `private-key` / `pre-shared-key` / `base64` / `token` / `uuid` / `username` / `headers` / `ws-headers` / `ws-path` / `shadow-tls-password`；`http-api` / `external-controller-access` / `http-listen` / `socks5-listen` 的 `key@` 前缀与 `wifi-access-http-auth` 口令；所有写作 `type, server, port` 的代理类型（`http` `https` `h2-connect` `socks5` `socks5-tls` `ss` `snell` `vmess` `trojan` `tuic` `tuic-v5` `hysteria2` `masque` `anytls` `trust-tunnel` `ssh`）策略行第 4 个起、凡不是 `name=value` 具名参数的 token（最常见的是根本不含 `=` 的裸 token，即位置传递的凭据；含 `=` 但值为空或全是 `=` 的也算，例如带填充的 base64。除前四种外这个位置本就是多余参数 `W0001`，按偏安全一侧抹掉）。取值的结尾按解析器自己的规则找**第一个顶层逗号**：`"` 或 `'` 在值里任何位置都会开启一段引号（`"` 内 `\` 转义下一个字符），`(` / `)` 分组，引号内与括号内的逗号都属于值（`password="p,w"`、`password=ab"c,d"`、`password=a(b,c)d` 各是一整个值）；引号或括号未闭合时抹到行尾。名单以外不脱敏；其余内容与行数、行尾 CRLF 原样保留 |
+| `GET /v1/profiles/current?sensitive=0` | 当前配置文本（可脱敏） | 全部 | ✅ | 1 | M4a 已实现；`sensitive=0`（默认）脱敏：独立密钥行 `password` / `ca-passphrase` / `ca-p12` / `private-key` / `psk` / `pre-shared-key` / `token`；内联参数 `password` / `psk` / `private-key` / `pre-shared-key` / `base64` / `token` / `uuid` / `username` / `headers` / `ws-headers` / `ws-path` / `shadow-tls-password` / `policy-path` / `external-policy-modifier`（后两个自 M3a 起：订阅链接常带 token，修饰列表能设任何参数）；`http-api` / `external-controller-access` / `http-listen` / `socks5-listen` 的 `key@` 前缀与 `wifi-access-http-auth` 口令；所有写作 `type, server, port` 的代理类型（`http` `https` `h2-connect` `socks5` `socks5-tls` `ss` `snell` `vmess` `trojan` `tuic` `tuic-v5` `hysteria2` `masque` `anytls` `trust-tunnel` `ssh`）策略行第 4 个起、凡不是 `name=value` 具名参数的 token（最常见的是根本不含 `=` 的裸 token，即位置传递的凭据；含 `=` 但值为空或全是 `=` 的也算，例如带填充的 base64。除前四种外这个位置本就是多余参数 `W0001`，按偏安全一侧抹掉）。取值的结尾按解析器自己的规则找**第一个顶层逗号**：`"` 或 `'` 在值里任何位置都会开启一段引号（`"` 内 `\` 转义下一个字符），`(` / `)` 分组，引号内与括号内的逗号都属于值（`password="p,w"`、`password=ab"c,d"`、`password=a(b,c)d` 各是一整个值）；引号或括号未闭合时抹到行尾。名单以外不脱敏；其余内容与行数、行尾 CRLF 原样保留 |
 | `POST /v1/profiles/reload` | 重载 | 全部 | ✅ | 1 | 底层热重载能力（SIGHUP / `--watch`）已在 M3b 就位，API 触发已在 M4a 实现；解析失败或构建 `Runtime` 失败时返回 `ok:false` 且运行中的配置不变；重绑监听器失败时同样 `ok:false`，但配置代已经切换，只是监听器归零，直到下一次重载成功为止（与本表第 809 行「零监听器」退化态一致） |
-| `POST /v1/profiles/switch` `GET /v1/profiles` `POST /v1/profiles/check` | 多配置管理 | Mac only | ✅ | 1 / 6 | rurge 以配置目录管理多个 Profile；`check` 已实现（M4a，校验磁盘上的当前配置文件，不影响运行中的实例）；`switch` 与 `GET /v1/profiles` 的多配置目录管理仍在阶段 6；自 M1 起 `check` 含干构建（`E0022`） |
+| `POST /v1/profiles/switch` `GET /v1/profiles` `POST /v1/profiles/check` | 多配置管理 | Mac only | ✅ | 1 / 6 | rurge 以配置目录管理多个 Profile；`check` 已实现（M4a，校验磁盘上的当前配置文件，不影响运行中的实例）；`switch` 与 `GET /v1/profiles` 的多配置目录管理仍在阶段 6；自 M1 起 `check` 含干构建（`E0022`）；自 M3a 起连同守护进程数据目录里已缓存的订阅一起装配检查（同 10.3 `--check` 行） |
 | `POST /v1/dns/flush` `GET /v1/dns` `POST /v1/test/dns_delay` | DNS | 全部 | 🟡 | 1 | M4a 已实现；`GET /v1/dns` 的 JSON 结构手册未定义，暂定结构见 `docs/api/phase1.md`，阶段 6 对齐真实 Surge；`dns_delay` 返回按上游的时延列表而非单一数字 |
 | `GET/POST /v1/modules` | 模块列表与开关 | 全部 | ✅ | 5 | |
 | `GET /v1/scripting` `POST /v1/scripting/evaluate` `POST /v1/scripting/cron/evaluate` | 脚本列表 / mock 执行 / 运行 cron | 全部 | ✅ | 5 | |
@@ -887,10 +889,10 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | 2. `[General]` 选项 | 60 | 43 | 8 | 9 | 0 | 0 |
 | 3. 规则系统 | 61 | 47 | 10 | 3 | 1 | 0 |
 | 4. 出站策略 | 85 | 75 | 6 | 1 | 0 | 3 |
-| 5. 策略组 | 29 | 26 | 2 | 1 | 0 | 0 |
+| 5. 策略组 | 31 | 25 | 3 | 3 | 0 | 0 |
 | 6. DNS 与 `[Host]` | 41 | 40 | 1 | 0 | 0 | 0 |
 | 7. HTTP 处理 | 45 | 41 | 2 | 1 | 1 | 0 |
 | 8. 脚本 | 47 | 35 | 7 | 4 | 1 | 0 |
 | 9. 高级网络功能 | 43 | 28 | 7 | 3 | 2 | 3 |
 | 10. 工具与可观测性 | 50 | 36 | 6 | 4 | 3 | 1 |
-| **合计** | **527** | **426** | **56** | **27** | **10** | **8** |
+| **合计** | **529** | **425** | **57** | **29** | **10** | **8** |

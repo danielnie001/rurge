@@ -454,3 +454,31 @@ M3-D5：构建一代注册表时，每个订阅先取磁盘缓存作为初始快
 **M3b（约 8 个任务）**：① `[General] test-timeout` 与测速类参数生效 → ② 探针（两次 HEAD、HTTPS、不可复用时的退化）→ ③ `TestBook` 与触发（过期、并发上限、`evaluate-before-use`、测试会话进请求记录）→ ④ 三种算法与嵌套分数、`SelectCtx` → ⑤ `GroupState` 与临时覆盖 → ⑥ 三个 API 端点与 `select` 扩展 → ⑦ 能力表翻转与端到端 → ⑧ 文档（含 `docs/api/phase2.md`）。
 
 **M3c（约 6 个任务）**：① 请求记录两列与 `SessionReporter` → ② `SmartBook` 打分 → ③ 选择、站点记忆与重试列表 → ④ 引擎拨号重试 → ⑤ 5 分钟测速与抽样、能力表翻转、端到端 → ⑥ 文档。
+
+## 16. M3a 实施期的订正
+
+本节登记 M3a 计划的「计划期决定」里与本文件文字不同的地方。逐条对应实现的提交见 `docs/superpowers/plans/2026-09-23-phase2-m3a-subscriptions-plan.md` 末尾「执行期修正记录」。
+
+| 编号 | 设计原文 | 订正 |
+| ---- | -------- | ---- |
+| P2 | 3、V3："同步载入磁盘缓存"的入口位置待定；5.1 未提资源管理器的日志 | `ResourceManager::get` 本来就在返回前同步载入 URL 的磁盘缓存与本地文件，无需新入口；它的日志原先带资源 URL，改为 `get_labelled` 登记的标签（`policy-path of` 加上组名）。`rurge check` 用新增的 `rurge_net::resource::cached` 离线读缓存 |
+| P3 | 5.2："空行、`#` 与 `//` 开头的行跳过" | 没有 `[Proxy]` 节时，`;` 开头的行也跳过（与配置解析器的注释规则一致）；跳过的行只报行号与原因，原因不引用行内任何片段（`parse_policy` 自己的消息会引用类型与端口，在 `vmess://` 链接这种非策略行里那是凭据的一部分） |
+| P5 | 5.7：代际锁是 `tokio::sync::Mutex`，重建期间持有 | 锁是 `std::sync::Mutex`，只包住"核对当前代 + 发布"与重载的"发布 + 切换"两步；构建在锁外进行——构建期间读到的 `previous` 可能过时，代价只是少复用几个出站 |
+| P6 | 1.3：`subnet` 组在阶段 3 之前保持现状 | 空组兜底（M3-D3）会让原本 REJECT 的 `subnet` 组悄悄改走 DIRECT，所以阶段 3 之前 `subnet` 组代表它的 `default`；`category` 等界面参数在 `subnet` 组上不再被当成网络条件 |
+| P7 | 4.3 / M3-D7：脱敏名单加 `policy-path` | 同时加 `external-policy-modifier`：它能给导入行设任何参数，口令也在内，而 `password` 只在参数边界处匹配，找不到引号后面的那一个 |
+| P8 | 5.9："把 5.2 / 5.3 的告警一并列出"（未定诊断码） | 订阅与装配的告警沿用集合的两个码：跳过的行、重名、派生名被占用、导入行的错误与成环一律 `W0023`，超过 10 000 条 `W0024`；没有内容 `W0022`；导入了未实现的协议 `W0007`（每种一次） |
+| P9 | 5.9：`W0022` 文本 "has not been downloaded yet" | 改为 `` `policy-path` has no content yet (never downloaded, or the file cannot be read); its imported members are unknown ``——本地文件读不到时同一条告警也要说得对 |
+| P10 | 5.3 / 5.4：未写明 `include-other-group` 取派生前还是派生后的成员 | 取派生前的：全部组先装配，最后才对有中继的组派生，被引用组的中继不传给引用它的组 |
+| P11 | 5.4：未写派生名与已有名字冲突 | 派生名已被占用时略去该成员并 `W0023`，绝不改用不经中继的原成员 |
+| P14 | 5.9：`rurge check` 读数据目录里的缓存（未写怎样找到数据目录） | `rurge check` 新增 `--data-dir`（环境变量 `RURGE_DATA_DIR`，默认平台数据目录）；`POST /v1/profiles/check` 用守护进程自己的数据目录；两者都经 `rurge_engine::check_profile`，配置本身有错时不做订阅检查 |
+| P15 | M3-D3：环境变量 `RURGE_EMPTY_GROUP_REJECT=1` | `RURGE_EMPTY_GROUP_REJECT=true`：rurge 的布尔环境变量（`RURGE_WATCH`、`RURGE_NO_NETWORK` 等）都经 clap 的布尔解析器，只接受 `true` / `false`，`1` 会报 invalid value |
+| P16 | 15：M3a 约 9 个任务 | 10 个：原第 ⑦ 项拆成"拨号与视图改读注册表、`EmptyGroup`"与"订阅热重建与代际锁"两个任务 |
+| P17 | 5.3：导入行 `to_spec` 的诊断未细分 | 只有错误让该行被跳过（`W0023`）；导入行上的未知参数、无效参数等警告不输出——一个上万行的订阅会把日志淹没 |
+| P21 | （无对应文字） | 全局策略（`proxy` 模式）与拨号一样按运行中的策略表校验，导入的策略名也可以当全局策略 |
+| 任务 1（执行期） | 4.2 "组级 `underlying-proxy` 引用未知策略 \| `E0007`；指向内置 REJECT 族 → `E0018`；经它绕回本组 → `E0019`"；图的范围见 P13（组装配后的成员、`include-other-group`、组自己的中继） | 图另加 `include-all-proxies` 收进的代理（非别名、经 `policy-regex-filter` 放行的 `[Proxy]` 策略）为边；新增 `ImportOpts::admits` 作为过滤规则（P1）的唯一实现，装配也用它；`subnet` 组的 `include-other-group` 不再成边。原因：`Exit = …, underlying-proxy=Hop` + `Hop = select, include-all-proxies=true` 这样的配置能加载，到装配后拨号 Exit 会无界递归；`subnet` 组被忽略的参数曾产生误报的 `W0030` / `E0019` |
+| 任务 3（执行期） | 5.6："**环**：装配后，按'组 → 作为成员的组'的边再检测一次环"（未写具体算法） | 改用迭代版 Tarjan 求强连通分量，不是深度优先只在遇到栈上的组时记环：环上的组一个不漏（与成员声明顺序无关），每个环各取一条最短环、从先声明的组写起、去重后列出；`include-other-group` 的"成环的组不展开给别人"与导入行的中继成环检查也改用同一个函数（后者从递归改成线性）。原因：深度优先版本经横叉边回到环上的组会漏列，且环上被判 REJECT 的组集合会随成员书写顺序变化 |
+| 任务 3（执行期） | 5.3："导入策略的 `to_spec` 用的名字查找表是……`underlying-proxy` 引用不到、或经它成环……的行，跳过并 WARN"（未写 `W0023` 的原因文本来自哪里） | 原因只写固定说法加诊断码（如 `` policy `N` has a parameter whose value cannot be used (E0018) ``、`` … has an `underlying-proxy` that names no policy (E0007) ``、`` … names a `[Keystore]` item that is missing or of another kind (E0020) ``，其余 `` … cannot be used (<码>) ``），不引用 `to_spec` 自己的消息。原因：M3-D7——`to_spec` 的消息会引用取值本身（如 `` invalid value `999` for `tos` ``、整条请求头），修饰值会因此进日志 |
+| 任务 3（执行期） | 5.3 / M3-D6："订阅内容有问题时……逐条跳过并 WARN"（未写导入行的中继指向另一条已被跳过的导入行时怎么处理） | 这类导入行一并略去（`W0023`，"names a policy that was left out"），沿反向中继边一次遍历找出它们。原因：不这样处理它会留在成员表里、每次拨号都失败；逐轮剔除在长链上是平方复杂度（1 万行要 4–10 秒） |
+| 任务 5（执行期） | 5.6："空组……解析到 DIRECT，会话记录带说明 `policy group has no members; DIRECT substituted`" | 空组代以 DIRECT 而拨号本身失败时，请求记录的 `error` 写"说明; 失败原因"两部分，不是只写说明。原因：只写说明会把失败原因盖住 |
+
+实施中发现的新出入由各任务追加。

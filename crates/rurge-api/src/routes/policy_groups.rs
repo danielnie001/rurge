@@ -75,8 +75,8 @@ pub async fn selection(
         .engine
         .group_selection(&query.group_name)
         .map_err(|e| ApiError::not_found(e.to_string()))?;
-    // A validly configured group without members (e.g. `subnet`, which keeps
-    // its targets in `conditions` / `default`) yields "" here, not an error.
+    // A group without members (a subscription not downloaded yet, a filter
+    // that let nothing through) yields "" here, not an error.
     Ok(Json(json!({ "policy": policy })))
 }
 

@@ -58,3 +58,15 @@
 - [ ] 半关闭：`curl --http1.0` 之类"发完请求就关闭写方向"的客户端经 sing-box 服务端下载一个大文件，内容完整（对应清单 4.4 里"alert 记录跳过"那一条）。
 - [ ] `underlying-proxy`：带 Shadow TLS 的策略作为链的出口。
 - [ ] `GET /v1/policies/detail` 与 `GET /v1/profiles/current` 里 `shadow-tls-password` 的值是 `***`。
+
+## M3a　成员装配与订阅
+
+需要一个真实的机场订阅链接（Surge 格式）与其中至少两个可用节点，自动化测试（只用回环）覆盖不了。
+
+- [ ] `G = select, policy-path=<订阅 URL>, update-interval=3600`：数据目录里没有缓存时首次启动，`GET /v1/policy_groups` 里 `G` 先是空的，几秒内出现订阅里的节点；经 `POST /v1/policy_groups/select` 选一个节点后浏览正常。
+- [ ] 重启 rurge：`G` 的成员一启动就在（从缓存载入），没有空组阶段；`rurge reload` 同样。
+- [ ] 标准输出、`--log-file` 的日志（含 `--log-level verbose`）里搜不到订阅链接里的 token；`GET /v1/profiles/current` 与 `GET /v1/policies/detail?policy_name=G` 里 `policy-path` 的值是 `***`。
+- [ ] `policy-regex-filter` / `external-policy-name-prefix` / `external-policy-modifier="tfo=true"`：成员名与 `policies/detail` 里的定义符合预期。
+- [ ] 组级 `underlying-proxy=<中继>`：成员名显示为 `<节点> (via <中继>)`；经它浏览时，中继服务器一侧能看到到节点服务器的连接。
+- [ ] 把订阅换成一个 Clash YAML 链接：启动输出里有 `W0023`（内容可能不是 Surge 格式），经该组的请求直连（空组兜底）；加 `--empty-group-reject` 后同样的请求被拒绝。
+- [ ] 机场更新了订阅（或手动改一个本地订阅文件）：不重启、不重载，组成员随之变化，日志里有一条 `policy group members updated`（只有组名与增减数量）；一个正在进行的大文件下载不中断。
