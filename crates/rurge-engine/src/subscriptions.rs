@@ -315,60 +315,59 @@ Remote = select, DIRECT, policy-path=https://sub.test/nodes?token=t0k3n\n[Rule]\
         );
     }
 
-    /// A rebuild that finishes after its generation has already been
-    /// replaced by a reload must not publish: the registry in
-    /// `EngineShared.cell` stays the successor's, never the stale
-    /// generation's (M3 design 5.7).
+    /// A generation of a profile whose only section besides `[Rule]` is
+    /// `[Proxy Group]` with `groups`, offline.
+    async fn generation(dir: &Path, groups: &str, shared: EngineShared) -> Runtime {
+        let text = format!("[Proxy Group]\n{groups}\n[Rule]\nFINAL,DIRECT\n");
+        let path = dir.join("t.conf");
+        std::fs::write(&path, &text).unwrap();
+        let loaded = from_text(&text, &path, &LoadOptions::for_tests());
+        assert!(!loaded.diagnostics.has_errors());
+        let stack = StackOptions {
+            data_dir: dir.to_path_buf(),
+            no_network: true,
+            geo_urls: GeoUrls::default(),
+            dns_cache_size: 16,
+            system: Arc::new(StaticSystemDns::default()),
+            wait: Duration::ZERO,
+            dns_connector: None,
+            socket_hook: Arc::new(NoopSocketHook),
+        };
+        let opts = RuntimeOptions {
+            stack,
+            outbound_mode: OutboundMode::Rule,
+            idle_timeout: Duration::from_secs(60),
+            shared,
+            request_log_size: 16,
+        };
+        Runtime::build(loaded.config, opts).await.unwrap()
+    }
+
+    /// The rebuild of a generation a reload replaced would put the old
+    /// profile's groups back: it publishes nothing (M3 design 5.7).
     #[tokio::test]
     async fn a_rebuild_of_a_replaced_generation_publishes_nothing() {
-        async fn build_generation(
-            dir: &Path,
-            profile: &str,
-            shared: EngineShared,
-        ) -> crate::runtime::Runtime {
-            let loaded = from_text(profile, &dir.join("t.conf"), &LoadOptions::for_tests());
-            assert!(!loaded.diagnostics.has_errors());
-            crate::runtime::Runtime::build(
-                loaded.config,
-                RuntimeOptions {
-                    stack: StackOptions {
-                        data_dir: dir.to_path_buf(),
-                        no_network: true,
-                        geo_urls: GeoUrls::default(),
-                        dns_cache_size: 2000,
-                        system: Arc::new(StaticSystemDns::default()),
-                        wait: std::time::Duration::ZERO,
-                        dns_connector: None,
-                        socket_hook: Arc::new(NoopSocketHook),
-                    },
-                    outbound_mode: OutboundMode::Rule,
-                    idle_timeout: std::time::Duration::from_secs(600),
-                    shared,
-                    request_log_size: 1000,
-                },
-            )
-            .await
-            .unwrap()
-        }
-
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("nodes.txt"), "N1 = http, n1.test, 80\n").unwrap();
-        let profile = "[Proxy Group]\nSub = select, policy-path=nodes.txt\n[Rule]\nFINAL,DIRECT\n";
-        let engine = crate::engine::Engine::new(
-            build_generation(dir.path(), profile, EngineShared::default()).await,
-        );
-        let stale = engine.runtime();
-        engine.swap_runtime(build_generation(dir.path(), profile, engine.shared()).await);
-        assert!(!Arc::ptr_eq(&engine.runtime(), &stale));
-        let before = engine.registry();
-        // A change to the source after `stale` stopped being current must
-        // never surface, however `stale`'s belated rebuild reads it.
-        std::fs::write(
-            dir.path().join("nodes.txt"),
-            "N1 = http, n1.test, 80\nN2 = http, n2.test, 80\n",
+        let first = generation(
+            dir.path(),
+            "Sub = select, policy-path=nodes.txt",
+            EngineShared::default(),
         )
-        .unwrap();
-        assert!(!engine.rebuild_registry(&stale));
-        assert!(Arc::ptr_eq(&engine.registry(), &before));
+        .await;
+        let engine = Engine::new(first);
+        let first = engine.runtime();
+        assert_eq!(engine.registry().members("Sub").unwrap(), ["N1"]);
+        let next = generation(dir.path(), "Sub = select, DIRECT", engine.shared()).await;
+        engine.swap_runtime(next);
+
+        let before = engine.registry();
+        assert!(!engine.rebuild_registry(&first));
+        assert!(Arc::ptr_eq(&before, &engine.registry()));
+        assert_eq!(engine.registry().members("Sub").unwrap(), ["DIRECT"]);
+        // the current generation's own rebuild does publish
+        assert!(engine.rebuild_registry(&engine.runtime()));
+        assert!(!Arc::ptr_eq(&before, &engine.registry()));
+        assert_eq!(engine.registry().members("Sub").unwrap(), ["DIRECT"]);
     }
 }
