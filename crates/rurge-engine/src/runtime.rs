@@ -23,7 +23,6 @@ pub struct Runtime {
     pub config: Arc<Config>,
     pub stack: Stack,
     pub rules: RuleEngine,
-    pub policies: Arc<PolicyRegistry>,
     pub outbound_mode: OutboundMode,
     pub idle_timeout: Duration,
     pub request_log_size: usize,
@@ -31,6 +30,10 @@ pub struct Runtime {
     /// Present only when `encrypted-dns-follow-outbound-mode` is on; the engine
     /// attaches itself to it so DNS upstream connections take the dial pipeline.
     pub(crate) dns_pipeline: Option<Arc<crate::dns_pipeline::PipelineConnector>>,
+    /// The registry built with this generation, until the engine publishes
+    /// it: from then on the one in use is `EngineShared.cell`'s (M3 design
+    /// 5.8).
+    pub(crate) registry: Option<Arc<PolicyRegistry>>,
 }
 
 impl Runtime {
@@ -76,7 +79,7 @@ impl Runtime {
         let previous = opts.shared.cell.load();
         // The dry build has already turned every build failure into a load
         // error (`load_checked`), so this only fails for a caller that skipped it.
-        let policies = Arc::new(
+        let registry = Arc::new(
             PolicyRegistry::build(
                 &config,
                 &assembly,
@@ -84,7 +87,7 @@ impl Runtime {
                 &opts.shared.cell,
                 opts.shared.selections.clone(),
                 previous.as_deref(),
-                rurge_policy::EmptyGroup::Direct,
+                opts.shared.empty_group,
             )
             .map_err(|e| anyhow::anyhow!("cannot build the policies: {e}"))?,
         );
@@ -92,12 +95,12 @@ impl Runtime {
             config: Arc::new(config),
             stack,
             rules,
-            policies,
             outbound_mode: opts.outbound_mode,
             idle_timeout: opts.idle_timeout,
             request_log_size: opts.request_log_size.max(1),
             shared: opts.shared,
             dns_pipeline,
+            registry: Some(registry),
         })
     }
 

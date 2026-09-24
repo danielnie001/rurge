@@ -14,7 +14,9 @@ use rurge_config::rule::PolicyRef;
 use rurge_config::session::ListenerKind;
 use rurge_engine::control::{Control, LogLevel as ApiLogLevel, Mode, ReloadReport};
 use rurge_engine::state::{STATE_FILE, State, StateStore, profile_key};
-use rurge_engine::{Engine, EngineShared, ListenerSpec, Running, Runtime, RuntimeOptions};
+use rurge_engine::{
+    EmptyGroup, Engine, EngineShared, ListenerSpec, Running, Runtime, RuntimeOptions,
+};
 use rurge_net::BoxFuture;
 use rurge_platform::sysproxy::ProxySettings;
 use rurge_rules::OutboundMode;
@@ -71,6 +73,9 @@ pub struct RunArgs {
     /// Point the operating system's proxy settings at rurge while it runs
     #[arg(long, env = "RURGE_SYSTEM_PROXY")]
     pub system_proxy: bool,
+    /// A policy group without members rejects instead of going DIRECT
+    #[arg(long, env = "RURGE_EMPTY_GROUP_REJECT")]
+    pub empty_group_reject: bool,
     #[command(flatten)]
     pub runtime: RuntimeArgs,
 }
@@ -652,15 +657,18 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         sysproxy.recover().await;
         let outbound_mode = initial_mode(explicit_mode, &store, &state).await;
         // `cfg` is moved into `build_engine_runtime` next, so read its source path now.
-        let shared = EngineShared::new(state.selections_for(&profile_key(&cfg.source.main)));
+        let mut shared = EngineShared::new(state.selections_for(&profile_key(&cfg.source.main)));
+        if args.empty_group_reject {
+            shared.empty_group = EmptyGroup::Reject;
+        }
         let engine_rt =
             build_engine_runtime(cfg, &rt, &run_opts, outbound_mode.clone(), &shared).await?;
         print_diagnostics(engine_rt.diagnostics());
-        let (policies, rules) = (
-            engine_rt.policies.names().len(),
-            engine_rt.rules.rules().len(),
-        );
         let engine = Engine::new(engine_rt);
+        let (policies, rules) = (
+            engine.registry().names().len(),
+            engine.runtime().rules.rules().len(),
+        );
         engine.attach_state(store.clone());
         // a global policy saved by an earlier run (mode may be rule today)
         if engine.global_policy().is_none()

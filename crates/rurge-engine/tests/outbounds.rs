@@ -768,11 +768,7 @@ async fn a_selection_whose_member_is_gone_falls_back_to_the_first_member() {
         Some("B")
     );
     assert_eq!(
-        h.engine
-            .runtime()
-            .policies
-            .current_member("Pick")
-            .as_deref(),
+        h.engine.registry().current_member("Pick").as_deref(),
         Some("A")
     );
 }
@@ -796,8 +792,7 @@ async fn a_connector_built_before_a_reload_resolves_through_the_new_generation()
     // the outbound of the first generation, connectors and all
     let old = h
         .engine
-        .runtime()
-        .policies
+        .registry()
         .resolve(&rurge_config::rule::PolicyRef::parse("S"))
         .outbound;
 

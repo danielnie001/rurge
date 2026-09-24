@@ -3,7 +3,7 @@
 use arc_swap::ArcSwapOption;
 use rurge_net::BoxFuture;
 use rurge_net::connector::Resolve;
-use rurge_policy::{GroupSelections, RegistryCell, SelectionTable};
+use rurge_policy::{EmptyGroup, GroupSelections, RegistryCell, SelectionTable};
 use rustls::RootCertStore;
 use std::io;
 use std::net::IpAddr;
@@ -56,6 +56,9 @@ pub struct EngineShared {
     /// engine lives: a reload reuses outbounds by a fingerprint the roots are
     /// not part of. Tests bring their own CA this way.
     pub roots: Option<Arc<RootCertStore>>,
+    /// What a group without members resolves to (M3-D3):
+    /// `--empty-group-reject` sets it once, for the engine's lifetime.
+    pub empty_group: EmptyGroup,
 }
 
 impl EngineShared {
@@ -65,6 +68,7 @@ impl EngineShared {
             selections: Arc::new(SelectionTable::new(initial)),
             resolver: ResolverCell::new(),
             roots: None,
+            empty_group: EmptyGroup::Direct,
         }
     }
 }

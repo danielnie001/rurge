@@ -19,7 +19,7 @@ use rurge_inbound::{
 };
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
-use rurge_policy::TerminalKind;
+use rurge_policy::{PolicyRegistry, TerminalKind};
 use rurge_proto::OutboundError;
 use rurge_rules::{OutboundMode, Outcome};
 use std::collections::HashMap;
@@ -152,7 +152,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(runtime: Runtime) -> Arc<Engine> {
+    pub fn new(mut runtime: Runtime) -> Arc<Engine> {
         let observe = Arc::new(Observe {
             log: RequestLog::new(runtime.request_log_size),
             traffic: TrafficStats::new(),
@@ -160,7 +160,12 @@ impl Engine {
         let (mode, global) = Mode::from_outbound(&runtime.outbound_mode);
         // Publish the first generation before anything can dial through it.
         let shared = runtime.shared.clone();
-        shared.cell.store(runtime.policies.clone());
+        shared.cell.store(
+            runtime
+                .registry
+                .take()
+                .expect("a generation is published once"),
+        );
         shared.resolver.store(runtime.stack.resolver.clone());
         let engine = Arc::new(Engine {
             runtime: ArcSwap::from_pointee(runtime),
@@ -189,7 +194,7 @@ impl Engine {
 
     /// The registry the engine resolves against right now: the one in
     /// `EngineShared.cell`.
-    pub fn registry(&self) -> Arc<rurge_policy::PolicyRegistry> {
+    pub fn registry(&self) -> Arc<PolicyRegistry> {
         self.shared
             .cell
             .load()
@@ -352,15 +357,19 @@ impl Engine {
     }
 
     /// Makes `next` the generation that outlives-a-reload objects see: chain
-    /// connectors resolve against its registry, direct connectors through
-    /// its resolver.
-    pub(crate) fn publish_generation(&self, next: &Runtime) {
+    /// connectors and dials resolve against its registry, direct connectors
+    /// through its resolver.
+    pub(crate) fn publish_generation(&self, next: &mut Runtime) {
         assert!(
             Arc::ptr_eq(&self.shared.cell, &next.shared.cell)
                 && Arc::ptr_eq(&self.shared.resolver, &next.shared.resolver),
             "the next generation must be built with `Engine::shared()`"
         );
-        self.shared.cell.store(next.policies.clone());
+        self.shared.cell.store(
+            next.registry
+                .take()
+                .expect("a generation is published once"),
+        );
         self.shared.resolver.store(next.stack.resolver.clone());
     }
 }
@@ -422,10 +431,10 @@ impl Engine {
         (**self.global_policy.load()).clone()
     }
 
-    /// `true` for the built-in policies and every configured policy / group,
-    /// against the *current* runtime generation (for API / CLI callers).
+    /// `true` for the built-in policies and every policy / group of the
+    /// current registry (for API / CLI callers).
     pub fn policy_exists(&self, name: &str) -> bool {
-        policy_known(&self.runtime(), name)
+        policy_known(&self.registry(), name)
     }
 
     /// Empty name clears the global policy.
@@ -447,7 +456,7 @@ impl Engine {
     }
 
     pub fn policies_view(&self) -> PoliciesView {
-        let rt = self.runtime();
+        let registry = self.registry();
         let mut proxies: Vec<String> = [
             "DIRECT",
             "REJECT",
@@ -458,9 +467,12 @@ impl Engine {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        proxies.extend(rt.config.policies.iter().map(|p| p.name.clone()));
-        let groups = rt.config.groups.iter().map(|g| g.name.clone()).collect();
-        PoliciesView { proxies, groups }
+        // the profile's, the imported and the derived ones (M3 design §8)
+        proxies.extend(registry.policy_names());
+        PoliciesView {
+            proxies,
+            groups: registry.group_names(),
+        }
     }
 
     pub fn rules_view(&self) -> Vec<RuleView> {
@@ -508,11 +520,16 @@ impl Engine {
     }
 
     /// Mode / rule → policy, shared by `dial` and `dial_internal` (M4 §4.1).
-    async fn choose_policy(&self, rt: &Runtime, handle: &SessionHandle) -> Chosen {
+    async fn choose_policy(
+        &self,
+        rt: &Runtime,
+        registry: &PolicyRegistry,
+        handle: &SessionHandle,
+    ) -> Chosen {
         match self.mode() {
             Mode::Direct => return Chosen::Policy(PolicyRef::Builtin(Builtin::Direct)),
             Mode::Proxy => match self.global_policy() {
-                Some(name) if policy_known(rt, &name) => {
+                Some(name) if policy_known(registry, &name) => {
                     return Chosen::Policy(PolicyRef::parse(&name));
                 }
                 other => {
@@ -549,13 +566,13 @@ enum Chosen {
     DnsFailed,
 }
 
-/// `true` for the built-in policies and every policy / group configured in
-/// `rt` — checked against the *session's own* runtime snapshot, not whatever
-/// generation is current when this runs, so a reload racing a dial can never
-/// approve a name against one generation's registry and then resolve it
-/// (`PolicyRegistry::resolve`) against another's.
-fn policy_known(rt: &Runtime, name: &str) -> bool {
-    matches!(PolicyRef::parse(name), PolicyRef::Builtin(_)) || rt.policies.contains(name)
+/// `true` for the built-in policies and every policy / group of `registry` —
+/// the one the session loaded once, not whatever is current when this runs,
+/// so a reload or a subscription update racing a dial can never approve a
+/// name against one registry and then resolve it (`PolicyRegistry::resolve`)
+/// against another.
+fn policy_known(registry: &PolicyRegistry, name: &str) -> bool {
+    matches!(PolicyRef::parse(name), PolicyRef::Builtin(_)) || registry.contains(name)
 }
 
 /// The policy whose SERVER this machine has to reach — and so, if that server
@@ -565,14 +582,14 @@ fn policy_known(rt: &Runtime, name: &str) -> bool {
 /// to DIRECT is that last hop: DIRECT opens the socket, and the name it looks
 /// up is that hop's own server. `None` when the chain ends at REJECT (it fails
 /// fast, it does not loop) or is deeper than the registry allows.
-fn socket_opener<'a>(rt: &'a Runtime, name: &str) -> Option<&'a PolicySpec> {
+fn socket_opener<'a>(registry: &'a PolicyRegistry, name: &str) -> Option<&'a PolicySpec> {
     let mut current = name.to_string();
     for _ in 0..rurge_policy::registry::MAX_DEPTH {
-        let spec = rt.config.spec(&current)?;
+        let spec = registry.spec(&current)?;
         let Some(under) = spec.common.underlying_proxy.as_deref() else {
             return Some(spec);
         };
-        let below = rt.policies.resolve(&PolicyRef::Named(under.to_string()));
+        let below = registry.resolve(&PolicyRef::Named(under.to_string()));
         match below.terminal {
             // a `Proxy` terminal is the hop the last chain element names; this
             // hop's server travels to it as a target and is never looked up here
@@ -615,14 +632,15 @@ impl Engine {
         fallback: &Arc<dyn Connector>,
     ) -> io::Result<BoxedStream> {
         let rt = self.runtime();
+        let registry = self.registry();
         let handle = self.new_handle(session);
-        let policy = match self.choose_policy(&rt, &handle).await {
+        let policy = match self.choose_policy(&rt, &registry, &handle).await {
             Chosen::Policy(p) => p,
             // An IP-literal DNS session never needs resolution; a DnsFailed here
             // would only come from a misconfigured rule → direct.
             Chosen::DnsFailed => PolicyRef::Builtin(Builtin::Direct),
         };
-        let resolution = rt.policies.resolve(&policy);
+        let resolution = registry.resolve(&policy);
         handle.set_policy_chain(resolution.chain.clone());
         let target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
         let opts = ConnectOpts {
@@ -633,7 +651,7 @@ impl Engine {
         // dialling. A proxy configured by IP literal has no such loop.
         if resolution.terminal == TerminalKind::Proxy
             && let Some(terminal) = resolution.chain.last()
-            && let Some(spec) = socket_opener(&rt, terminal)
+            && let Some(spec) = socket_opener(&registry, terminal)
             && matches!(spec.server, Some(HostName::Domain(_)))
         {
             tracing::warn!(
@@ -804,12 +822,14 @@ impl Dialer for Engine {
     fn dial<'a>(&'a self, session: SessionInfo) -> BoxFuture<'a, Result<Dialed, DialError>> {
         Box::pin(async move {
             let rt = self.runtime();
+            // loaded once: the name is approved and resolved against the same one
+            let registry = self.registry();
             let handle = self.new_handle(session);
-            let policy = match self.choose_policy(&rt, &handle).await {
+            let policy = match self.choose_policy(&rt, &registry, &handle).await {
                 Chosen::Policy(p) => p,
                 Chosen::DnsFailed => return fail(handle, FailKind::Dns, "dns lookup failed"),
             };
-            let resolution = rt.policies.resolve(&policy);
+            let resolution = registry.resolve(&policy);
             handle.set_policy_chain(resolution.chain.clone());
             if let Some(note) = &resolution.note {
                 // A protocol rurge cannot speak yet, a group cycle, a group

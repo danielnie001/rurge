@@ -38,7 +38,7 @@ impl Engine {
     /// listener configuration surface (addresses, authentication, source
     /// restriction, error-page switches) changed, so the caller can rebind
     /// listeners and pick up the new `ListenerOpts` with them.
-    pub fn swap_runtime(self: &std::sync::Arc<Self>, next: Runtime) -> bool {
+    pub fn swap_runtime(self: &std::sync::Arc<Self>, mut next: Runtime) -> bool {
         let before = listener_surface(&self.runtime().config.general);
         let after = listener_surface(&next.config.general);
         // The new generation has its own DNS pipeline connector; bind it before
@@ -46,7 +46,7 @@ impl Engine {
         if let Some(pc) = next.dns_pipeline() {
             pc.attach(std::sync::Arc::downgrade(self));
         }
-        self.publish_generation(&next);
+        self.publish_generation(&mut next);
         self.store_runtime(next);
         before != after
     }
