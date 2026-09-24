@@ -609,8 +609,7 @@ async fn an_unimplemented_policy_rejects_with_an_explanation() {
 
 /// A DIRECT-substituted empty group (M3-D3) that then fails to dial keeps
 /// both why DIRECT stood in and why the dial itself failed: the request
-/// record must not lose the failure behind the substitution note (fix round
-/// 1, F3).
+/// record must not lose the failure behind the substitution note.
 #[tokio::test]
 async fn a_failed_dial_through_a_direct_substituted_empty_group_keeps_both_reasons() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1174,6 +1173,48 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
     assert!(
         !dns.queries().is_empty(),
         "the mock DNS server was actually queried"
+    );
+}
+
+/// The guard reads the policy from the registry, not the main profile: a
+/// proxy that reached the profile through a subscription (`socket_opener`
+/// via `PolicyRegistry::spec`) is bypassed exactly like one written in
+/// `[Proxy]`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dns_session_bypasses_a_proxy_imported_from_a_policy_path() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    dns.set("proxy.test", &["127.0.0.1"], &[], 60);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("up.txt"), "Up = http, proxy.test, 8080\n").unwrap();
+    let profile = format!(
+        "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\n\
+encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.1:{}\nipv6 = false\n\
+[Proxy]\n[Proxy Group]\nSub = select, policy-path=up.txt\n[Rule]\nPROTOCOL,DNS,Sub\nFINAL,DIRECT\n",
+        dns.addr().port()
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        engine
+            .runtime()
+            .stack
+            .resolver
+            .lookup("target.test", rurge_dns::resolver::LookupOpts::default()),
+    )
+    .await
+    .expect("the lookup must not wait for the proxy's own name to be resolved");
+    assert!(res.is_ok(), "resolution through the pipeline: {res:?}");
+    let internal = internal_sessions(&engine);
+    assert!(
+        internal.iter().any(|r| {
+            r.error.as_deref()
+                == Some(
+                    "dns-follow: proxy configured by host name bypassed to avoid a resolution loop",
+                )
+                && r.policy.first().map(String::as_str) == Some("Sub")
+        }),
+        "a bypassed internal DNS session: {internal:?}"
     );
 }
 

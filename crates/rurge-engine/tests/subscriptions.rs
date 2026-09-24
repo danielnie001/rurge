@@ -3,9 +3,10 @@
 
 mod common;
 use common::*;
+use rurge_config::codes;
 use rurge_config::rule::PolicyRef;
 use rurge_config::session::SessionInfo;
-use rurge_engine::EmptyGroup;
+use rurge_engine::{EmptyGroup, check_profile};
 use rurge_inbound::{DialError, Dialer};
 
 /// Like `common::wait_until`, with room for a file watcher's or a refresh
@@ -216,7 +217,10 @@ async fn a_derived_member_is_reached_through_the_group_relay() {
 #[tokio::test]
 async fn a_url_subscription_arrives_after_the_start_and_is_cached() {
     let server = TestServer::spawn().await;
-    server.set("/nodes", "N1 = http, n1.test, 80\nN2 = http, n2.test, 80\n");
+    server.set(
+        "/nodes",
+        "N1 = http, n1.test, 80\nnot a policy\nN2 = http, n2.test, 80\n",
+    );
     let dir = tempfile::tempdir().unwrap();
     let dns = MockDns::spawn().await;
     let groups = format!(
@@ -235,6 +239,27 @@ async fn a_url_subscription_arrives_after_the_start_and_is_cached() {
         members(&engine, "Sub") == ["N1", "N2"]
     })
     .await;
+
+    // Design 5.9's cached half: with the subscription cached in the data
+    // directory, an offline check assembles from it — no "not downloaded
+    // yet" warning for the group, and the one bad line is still reported.
+    let path = dir.path().join("t.conf");
+    let checked = check_profile(&path, &LoadOptions::for_tests(), dir.path()).unwrap();
+    let messages: Vec<String> = checked.diagnostics.iter().map(|d| d.to_string()).collect();
+    assert!(
+        checked
+            .diagnostics
+            .iter()
+            .all(|d| d.code != codes::W_RESOURCE_UNAVAILABLE),
+        "{messages:?}"
+    );
+    assert!(
+        checked.diagnostics.iter().any(
+            |d| d.code == codes::W_SET_LINES_SKIPPED && d.message.contains("not a policy line")
+        ),
+        "{messages:?}"
+    );
+
     let n1 = outbound_of(&engine, "N1");
     server.set("/nodes", "N1 = http, n1.test, 80\nN3 = http, n3.test, 80\n");
     eventually("the update", || members(&engine, "Sub") == ["N1", "N3"]).await;
@@ -344,6 +369,10 @@ Chained = select, include-other-group=Sub, underlying-proxy=R",
         engine.policy_detail("Sub").as_deref(),
         Some("select, DIRECT, policy-path=***")
     );
+    // an imported name and a derived name are both known policies (global
+    // policy / dial-time validation reads the same registry)
+    assert!(engine.policy_exists("N2"));
+    assert!(engine.policy_exists("N2 (via R)"));
 
     engine.select_group("Sub", "N2").await.unwrap();
     assert_eq!(engine.group_selection("Sub").unwrap(), "N2");
