@@ -44,6 +44,16 @@ pub struct ImportOpts {
     pub include_other_groups: Vec<String>,
 }
 
+impl ImportOpts {
+    /// Whether `policy-regex-filter` lets `name` in: every name when there
+    /// is no filter; none whose match errors (backtracking limit, P1).
+    pub fn admits(&self, name: &str) -> bool {
+        self.regex_filter
+            .as_ref()
+            .is_none_or(|p| p.regex.is_match(name).unwrap_or(false))
+    }
+}
+
 /// When and how the automatic groups test their members.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TestOpts {

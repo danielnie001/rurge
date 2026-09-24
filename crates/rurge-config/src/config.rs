@@ -679,10 +679,13 @@ fn group_refs(g: &PolicyGroup) -> Vec<String> {
 }
 
 /// `group_refs` plus the groups whose members `include-other-group` takes:
-/// every edge a group cycle can run along.
+/// every edge a group cycle can run along. A `subnet` group ignores
+/// `include-other-group` (`W0028`), so it is not an edge there either.
 fn group_edges(g: &PolicyGroup) -> Vec<String> {
     let mut edges = group_refs(g);
-    if let Some(v) = g.params.get("include-other-group") {
+    if g.kind != GroupKind::Subnet
+        && let Some(v) = g.params.get("include-other-group")
+    {
         edges.extend(split_list(v));
     }
     edges
@@ -693,9 +696,10 @@ fn is_base64(text: &str) -> bool {
     STANDARD.decode(text).is_ok() || STANDARD_NO_PAD.decode(text).is_ok()
 }
 
-/// `E0019`: follows `underlying-proxy` edges, group membership and
-/// `include-other-group` from each chained policy and from each group with a
-/// relay of its own; reaching the start again is a cycle.
+/// `E0019`: follows `underlying-proxy` edges, group membership,
+/// `include-other-group` and (for a group with `include-all-proxies`) the
+/// `[Proxy]` policies it takes in, from each chained policy and from each
+/// group with a relay of its own; reaching the start again is a cycle.
 fn underlying_cycles(
     config: &Config,
     specs: &[PolicySpec],
@@ -710,13 +714,23 @@ fn underlying_cycles(
     }
     for g in &config.groups {
         let mut next = group_edges(g);
-        // every proxy member of a group with a relay is dialled through it
-        if let Some(relay) = groups
-            .iter()
-            .find(|s| s.name == g.name)
-            .and_then(|s| s.underlying_proxy.clone())
-        {
-            next.push(relay);
+        if let Some(spec) = groups.iter().find(|s| s.name == g.name) {
+            // every proxy member of a group with a relay is dialled through it
+            if let Some(relay) = &spec.underlying_proxy {
+                next.push(relay.clone());
+            }
+            // `include-all-proxies` takes in every un-aliased proxy its
+            // filter admits (M3 design 5.3 step 3), dialled through the
+            // group exactly like a written member
+            if spec.import.include_all_proxies {
+                next.extend(
+                    config
+                        .policies
+                        .iter()
+                        .filter(|p| !p.kind.is_builtin_alias() && spec.import.admits(&p.name))
+                        .map(|p| p.name.clone()),
+                );
+            }
         }
         edges.insert(g.name.as_str(), next);
     }
@@ -1115,6 +1129,81 @@ Pick = select, G, DIRECT\n[Rule]\nFINAL,G\n",
                 "E0019 policy group `G`: `underlying-proxy` leads back to the group itself (via `Pick`)"
             ]
         );
+    }
+
+    /// `include-all-proxies` takes in every un-aliased `[Proxy]` policy the
+    /// group's filter admits (M3 design 5.3 step 3); those are edges too, or
+    /// a chain through such a group would recurse without the plan-mandated
+    /// runtime depth guard (carried item C3, plan P13).
+    #[test]
+    fn include_all_proxies_is_part_of_the_e0019_graph_filtered_by_the_regex() {
+        let l = load_text(
+            "[Proxy]\nExit = http, exit.test, 8080, underlying-proxy=Hop\n\
+[Proxy Group]\nHop = select, include-all-proxies=true\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let errors: Vec<String> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == crate::Severity::Error)
+            .map(|d| format!("{} {}", d.code, d.message))
+            .collect();
+        assert_eq!(
+            errors,
+            ["E0019 policy `Exit`: `underlying-proxy` leads back to the policy itself (via `Hop`)"]
+        );
+
+        // a filter that does not admit `Exit` keeps the profile sound
+        let l = load_text(
+            "[Proxy]\nExit = http, exit.test, 8080, underlying-proxy=Hop\nHK1 = http, hk1.test, 80\n\
+[Proxy Group]\nHop = select, include-all-proxies=true, policy-regex-filter=^HK\n[Rule]\nFINAL,DIRECT\n",
+        );
+        assert!(
+            !l.diagnostics.has_errors(),
+            "{:?}",
+            l.diagnostics.into_vec()
+        );
+    }
+
+    /// P13: a policy's relay is a group, and the group's relay is that same
+    /// policy — the graph must catch it from both ends.
+    #[test]
+    fn a_policy_and_its_group_relay_can_cycle_between_them() {
+        let l = load_text(
+            "[Proxy]\nA = direct\nP = http, p.test, 80, underlying-proxy=G\n\
+[Proxy Group]\nG = select, A, underlying-proxy=P\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let errors: Vec<String> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == crate::Severity::Error)
+            .map(|d| format!("{} {}", d.code, d.message))
+            .collect();
+        assert_eq!(
+            errors,
+            [
+                "E0019 policy `P`: `underlying-proxy` leads back to the policy itself (via `G`)",
+                "E0019 policy group `G`: `underlying-proxy` leads back to the group itself (via `P`)"
+            ]
+        );
+    }
+
+    /// A `subnet` group ignores `include-other-group` (W0028): it must not
+    /// become an edge either, or a `select` group that takes the subnet
+    /// group as a member sees a cycle that is not really there.
+    #[test]
+    fn a_subnets_include_other_group_is_ignored_and_is_not_an_edge() {
+        let l = load_text(
+            "[Proxy]\nA = direct\n[Proxy Group]\nS = subnet, default=DIRECT, include-other-group=G\n\
+G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
+        );
+        assert!(
+            !l.diagnostics.has_errors(),
+            "{:?}",
+            l.diagnostics.into_vec()
+        );
+        let found = codes_of(&l);
+        assert!(found.contains(&codes::W_PARAM_NOT_APPLICABLE), "{found:?}");
+        assert!(!found.contains(&codes::W_GROUP_CYCLE), "{found:?}");
     }
 
     #[test]
