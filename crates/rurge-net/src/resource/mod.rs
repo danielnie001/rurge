@@ -435,7 +435,7 @@ impl ResourceManager {
                 let watcher = match local::watch_file(&path, tx) {
                     Ok(w) => Some(w),
                     Err(e) => {
-                        tracing::warn!(resource = %entry.log_name(), error = %e, "cannot watch file; changes need a reload");
+                        tracing::warn!(resource = %entry.log_name(), error = ?e.kind, "cannot watch file; changes need a reload");
                         None
                     }
                 };
@@ -443,6 +443,15 @@ impl ResourceManager {
             }
         }
     }
+}
+
+/// `SystemTime::now() + due`, without panicking when the result cannot be
+/// represented: a huge `update-interval` (reachable from `policy-path` and
+/// RULE-SET, both accept any positive integer) is large enough to overflow
+/// `SystemTime` on Windows. `None` then, meaning simply that no next refresh
+/// is scheduled — the same as `due` itself being `None`.
+fn next_refresh_at(due: Option<Duration>) -> Option<SystemTime> {
+    due.and_then(|d| SystemTime::now().checked_add(d))
 }
 
 fn next_due(entry: &Entry, backoff: Option<Duration>) -> Option<Duration> {
@@ -477,7 +486,7 @@ async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>) {
         let cache = cache::CacheDir::for_url(&mgr.root, url.as_str());
         drop(mgr);
         let due = next_due(&entry, backoff);
-        *entry.next_refresh.lock().expect("next") = due.map(|d| SystemTime::now() + d);
+        *entry.next_refresh.lock().expect("next") = next_refresh_at(due);
         // `due` is `None` only when auto-refresh is disabled (negative interval); bound that
         // wait too, so an orphaned task (manager dropped, nobody left to `force_update`) still
         // wakes periodically to notice `weak.upgrade()` failing instead of parking forever.
@@ -692,6 +701,15 @@ mod tests {
             source: ResourceSource::Url(url),
             update_interval: interval,
         }
+    }
+
+    /// A huge `update-interval` must never panic the refresh task: past what
+    /// `SystemTime` can represent, there is simply no next refresh.
+    #[test]
+    fn next_refresh_at_never_panics_on_an_unrepresentable_duration() {
+        assert!(next_refresh_at(Some(Duration::from_secs(u64::MAX))).is_none());
+        assert!(next_refresh_at(None).is_none());
+        assert!(next_refresh_at(Some(Duration::from_secs(1))).is_some());
     }
 
     async fn wait_for(
