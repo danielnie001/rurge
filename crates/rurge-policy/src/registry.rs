@@ -66,7 +66,7 @@ pub enum EmptyGroup {
 
 /// How a policy or group is written, for the control plane. Secrets
 /// included: whoever shows it redacts it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Line {
     pub is_group: bool,
     /// A policy's type keyword or a group's kind keyword.
@@ -74,6 +74,17 @@ pub struct Line {
     /// Right of `name =`: as written, as imported, or — for `M (via R)` —
     /// M's with `underlying-proxy` set.
     pub definition: String,
+}
+
+/// `definition` never appears: it may hold a password or a subscription
+/// token (M3-D7, P18).
+impl fmt::Debug for Line {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Line")
+            .field("is_group", &self.is_group)
+            .field("keyword", &self.keyword)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Line {
@@ -314,9 +325,11 @@ impl PolicyRegistry {
             table.add(&p.name, entry, Line::policy(p.kind, &p.definition));
         }
         // What subscriptions brought in and the `M (via R)` of relayed groups:
-        // a failure leaves that policy out and nothing else (M3-D6).
-        let left_out = |name: &str, e: BuildError| {
-            tracing::warn!(policy = %name, error = %e.message, "policy cannot be built; it is left out");
+        // a failure leaves that policy out and nothing else (M3-D6). Only the
+        // name is logged: the factory's error text may quote a value of the
+        // imported line or of the modifier (M3-D7).
+        let left_out = |name: &str| {
+            tracing::warn!(policy = %name, "policy cannot be built; it is left out");
         };
         for i in &assembly.imported {
             match policy_entry(i.policy.kind, i.spec.as_ref()) {
@@ -325,7 +338,7 @@ impl PolicyRegistry {
                     entry,
                     Line::policy(i.policy.kind, &i.policy.definition),
                 ),
-                Err(e) => left_out(&i.policy.name, e),
+                Err(_) => left_out(&i.policy.name),
             }
         }
         for d in &assembly.derived {
@@ -335,7 +348,7 @@ impl PolicyRegistry {
                     entry,
                     Line::policy(d.spec.kind, &d.definition),
                 ),
-                Err(e) => left_out(&d.spec.name, e),
+                Err(_) => left_out(&d.spec.name),
             }
         }
         let on_cycle = on_cycle(assembly);
@@ -411,7 +424,7 @@ impl PolicyRegistry {
     /// (not builtins). Used on the per-connection dial path, where cloning
     /// the whole table via `names()` would allocate for every session.
     pub fn contains(&self, name: &str) -> bool {
-        self.order.iter().any(|n| n == name)
+        self.entries.contains_key(name)
     }
 
     /// Every policy that is not a group, in the order they were built: the
@@ -1184,6 +1197,27 @@ Plain = select, DIRECT, policy-path=https://sub.example/nodes\n[Rule]\nFINAL,Sub
         );
     }
 
+    /// A derived `M (via R)` that cannot be built is left out just like an
+    /// imported policy: the group keeps its other members (fix round 1, F5.1).
+    #[test]
+    fn a_derived_policy_that_cannot_be_built_is_left_out_of_its_group() {
+        let factory = FakeFactory {
+            broken: Some("A (via Relay)"),
+            ..FakeFactory::new()
+        };
+        let reg = subscribed(
+            "N1 = http, n1.example, 80",
+            &factory,
+            &RegistryCell::new(),
+            None,
+        );
+        assert!(!reg.contains("A (via Relay)"));
+        assert_eq!(
+            reg.members("Sub"),
+            Some(&["N1 (via Relay)".to_string()][..])
+        );
+    }
+
     #[test]
     fn a_group_on_a_cycle_rejects_and_names_the_cycle() {
         let text = "[Proxy]\nA = http, a.example, 80\n[Proxy Group]\nP = select, Q\nQ = select, P\n\
@@ -1205,6 +1239,34 @@ K = select, P, A\n[Rule]\nFINAL,K\n";
         let k = reg.resolve(&PolicyRef::parse("K"));
         assert_eq!(chain(&k), vec!["K", "P", "REJECT"]);
         assert_eq!(k.note, Some(Note::GroupCycle("P → Q → P".into())));
+    }
+
+    /// A group that merely contains a cyclic member is unaffected once it
+    /// picks another: only actually landing on the cycle rejects (fix round
+    /// 1, F5.2).
+    #[test]
+    fn a_group_that_picks_around_a_cyclic_member_is_unaffected() {
+        let text = "[Proxy]\nA = http, a.example, 80\n[Proxy Group]\nP = select, Q\nQ = select, P\n\
+K = select, P, A\n[Rule]\nFINAL,K\n";
+        let loaded = from_text(text, Path::new("t.conf"), &LoadOptions::for_tests());
+        assert!(!loaded.diagnostics.has_errors());
+        let mut selections = GroupSelections::new();
+        selections.set("K", "A");
+        let reg = PolicyRegistry::build(
+            &loaded.config,
+            &assemble(&loaded.config, &Snapshots::new()),
+            &FakeFactory::new(),
+            &RegistryCell::new(),
+            Arc::new(SelectionTable::new(selections)),
+            None,
+            EmptyGroup::Direct,
+        )
+        .expect("builds");
+        let k = reg.resolve(&PolicyRef::parse("K"));
+        assert_eq!(
+            (chain(&k), k.terminal, k.note.clone()),
+            (vec!["K", "A"], TerminalKind::Proxy, None)
+        );
     }
 
     #[test]
@@ -1243,6 +1305,45 @@ K = select, P, A\n[Rule]\nFINAL,K\n";
         assert_eq!(
             reject.note.unwrap().to_string(),
             "policy group has no members"
+        );
+    }
+
+    /// A group whose member is itself an empty group resolves through it to
+    /// the DIRECT stand-in; picking a different, ordinary member is
+    /// unaffected by that (fix round 1, F5.3).
+    #[test]
+    fn a_group_whose_member_is_an_empty_group_resolves_through_the_stand_in() {
+        let text = "[Proxy]\nA = http, a.example, 80\n\
+[Proxy Group]\nE = select, policy-path=https://sub.example/e\nH = select, E, A\n[Rule]\nFINAL,H\n";
+        let loaded = from_text(text, Path::new("t.conf"), &LoadOptions::for_tests());
+        assert!(!loaded.diagnostics.has_errors());
+        let build = |selections| {
+            PolicyRegistry::build(
+                &loaded.config,
+                &assemble(&loaded.config, &Snapshots::new()),
+                &FakeFactory::new(),
+                &RegistryCell::new(),
+                Arc::new(SelectionTable::new(selections)),
+                None,
+                EmptyGroup::Direct,
+            )
+            .expect("builds")
+        };
+        let h = build(GroupSelections::new()).resolve(&PolicyRef::parse("H"));
+        assert_eq!(
+            (chain(&h), h.terminal, h.note.clone()),
+            (
+                vec!["H", "E", "DIRECT"],
+                TerminalKind::Direct,
+                Some(Note::EmptyGroup { substituted: true })
+            )
+        );
+        let mut selections = GroupSelections::new();
+        selections.set("H", "A");
+        let picked = build(selections).resolve(&PolicyRef::parse("H"));
+        assert_eq!(
+            (chain(&picked), picked.terminal, picked.note.clone()),
+            (vec!["H", "A"], TerminalKind::Proxy, None)
         );
     }
 

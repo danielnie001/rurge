@@ -752,6 +752,14 @@ fn fail(
     message: impl Into<String>,
 ) -> Result<Dialed, DialError> {
     let message = message.into();
+    // A note already on the handle (a group cycle, an unsupported protocol,
+    // an empty group standing in for DIRECT) explains why the session was
+    // routed this way, not why the dial itself then failed: the record needs
+    // both, or it hides the failure behind the note (fix round 1, F3). The
+    // `DialError` below keeps the plain failure message.
+    if let Some(note) = handle.error() {
+        handle.set_error(format!("{note}; {message}"));
+    }
     handle.finish(SessionOutcome::Failed(message.clone()));
     let rule = handle.rule();
     Err(DialError::Failed {

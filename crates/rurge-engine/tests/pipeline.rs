@@ -607,6 +607,40 @@ async fn an_unimplemented_policy_rejects_with_an_explanation() {
     }
 }
 
+/// A DIRECT-substituted empty group (M3-D3) that then fails to dial keeps
+/// both why DIRECT stood in and why the dial itself failed: the request
+/// record must not lose the failure behind the substitution note (fix round
+/// 1, F3).
+#[tokio::test]
+async fn a_failed_dial_through_a_direct_substituted_empty_group_keeps_both_reasons() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let dir = tempfile::tempdir().unwrap();
+    let profile = "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nipv6 = false\n\
+[Proxy]\n[Proxy Group]\nG = select, policy-path=https://sub.test/g\n[Rule]\nFINAL,G\n";
+    let engine = engine_from_profile(dir.path(), profile).await;
+    let session = SessionInfo::tcp(rurge_config::HostName::parse("127.0.0.1"), port);
+    match engine.dial(session).await {
+        Err(DialError::Failed { .. }) => {}
+        Err(DialError::Reject { kind, .. }) => {
+            panic!("expected a connect failure through DIRECT, got a reject: {kind:?}")
+        }
+        Ok(_) => panic!("expected a connect failure through DIRECT, got a stream"),
+    }
+    let rec = wait_for_record(&engine, Duration::from_secs(3), |r| {
+        r.error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("policy group has no members; DIRECT substituted; "))
+    })
+    .await
+    .expect("a failed record naming both the substitution and the failure");
+    assert!(
+        matches!(rec.status, rurge_engine::RecordStatus::Failed),
+        "{rec:?}"
+    );
+}
+
 #[tokio::test]
 async fn dns_failure_and_ip_rules() {
     let h = harness("", "IP-CIDR,10.0.0.0/8,Block", OutboundMode::Rule).await;
