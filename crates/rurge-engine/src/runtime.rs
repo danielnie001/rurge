@@ -2,6 +2,7 @@
 
 use crate::shared::EngineShared;
 use crate::stack::{Stack, StackOptions, build_stack};
+use crate::subscriptions::Subscriptions;
 use rurge_config::{Config, Diagnostics};
 use rurge_policy::PolicyRegistry;
 use rurge_rules::{OutboundMode, RuleEngine};
@@ -47,7 +48,7 @@ impl Runtime {
         } else {
             None
         };
-        let stack = build_stack(&config, &opts.stack).await?;
+        let mut stack = build_stack(&config, &opts.stack).await?;
         let rules =
             RuleEngine::build_with_registry(&config, stack.registry.clone(), stack.geo.clone())?;
         // The cell, not this generation's resolver: an outbound may outlive
@@ -65,6 +66,11 @@ impl Runtime {
                 opts.stack.socket_hook.clone(),
             ),
         };
+        // What earlier runs cached is in the first assembly already: no group
+        // starts empty for want of a download (M3-D5).
+        let subscriptions = Subscriptions::register(&config, &stack.resources);
+        let assembly = rurge_policy::assemble(&config, &subscriptions.snapshots());
+        stack.diagnostics.extend(assembly.diagnostics.clone());
         // The generation being replaced (none on the first build): whatever
         // it built from the same fingerprint is kept, connection pools and all.
         let previous = opts.shared.cell.load();
@@ -73,7 +79,7 @@ impl Runtime {
         let policies = Arc::new(
             PolicyRegistry::build(
                 &config,
-                &rurge_policy::assemble(&config, &rurge_policy::Snapshots::new()),
+                &assembly,
                 &factory,
                 &opts.shared.cell,
                 opts.shared.selections.clone(),

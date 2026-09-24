@@ -119,6 +119,8 @@ pub struct ResourceStatus {
 
 struct Entry {
     source: ResourceSource,
+    /// What log lines call the resource instead of its URL (`get_labelled`).
+    label: Mutex<Option<String>>,
     state: Mutex<ResourceState>,
     meta: Mutex<Option<Meta>>,
     interval: Mutex<Option<i64>>,
@@ -128,6 +130,14 @@ struct Entry {
 }
 
 impl Entry {
+    /// What log lines call this resource: its label, else its source.
+    fn log_name(&self) -> String {
+        match &*self.label.lock().expect("label") {
+            Some(label) => label.clone(),
+            None => self.source.to_string(),
+        }
+    }
+
     fn version(&self) -> u64 {
         self.state
             .lock()
@@ -232,6 +242,18 @@ fn jitter(d: Duration) -> Duration {
     Duration::from_millis(u64::try_from(adjusted).unwrap_or(0))
 }
 
+/// What `get` would start a resource with, read without a manager and
+/// without the network: the disk cache of a URL under `root`, the content of
+/// a file. For offline checks.
+pub fn cached(root: &Path, source: &ResourceSource) -> Option<Bytes> {
+    match source {
+        ResourceSource::Url(url) => cache::CacheDir::for_url(root, url.as_str())
+            .load()
+            .map(|(data, _)| data),
+        ResourceSource::File(path) => std::fs::read(path).ok().map(Bytes::from),
+    }
+}
+
 impl ResourceManager {
     pub fn new(root: PathBuf, client: Arc<HttpClient>) -> Arc<ResourceManager> {
         Self::with_options(root, client, ResourceOptions::default())
@@ -258,6 +280,18 @@ impl ResourceManager {
     }
 
     pub fn get(&self, spec: &ResourceSpec) -> ResourceHandle {
+        self.register(spec, None)
+    }
+
+    /// `get` for a resource whose URL must not reach the logs — a
+    /// subscription URL usually carries a token (phase 2 M3-D7): log lines
+    /// call it `label` instead, also when another caller shares it. The first
+    /// label a resource gets is the one it keeps.
+    pub fn get_labelled(&self, spec: &ResourceSpec, label: &str) -> ResourceHandle {
+        self.register(spec, Some(label))
+    }
+
+    fn register(&self, spec: &ResourceSpec, label: Option<&str>) -> ResourceHandle {
         let key = spec.source.key();
         // Look up and (if absent) insert inside one critical section: releasing the lock
         // between a "not found" lookup and the insert let two concurrent first calls for the
@@ -267,11 +301,19 @@ impl ResourceManager {
             let mut entries = self.entries.lock().expect("entries");
             if let Some(existing) = entries.get(&key) {
                 merge_interval(existing, spec.update_interval);
+                if let Some(label) = label {
+                    existing
+                        .label
+                        .lock()
+                        .expect("label")
+                        .get_or_insert_with(|| label.to_string());
+                }
                 (existing.clone(), false)
             } else {
                 let (tx, _rx) = watch::channel(0u64);
                 let entry = Arc::new(Entry {
                     source: spec.source.clone(),
+                    label: Mutex::new(label.map(str::to_string)),
                     state: Mutex::new(ResourceState::Missing),
                     meta: Mutex::new(None),
                     interval: Mutex::new(spec.update_interval),
@@ -393,7 +435,7 @@ impl ResourceManager {
                 let watcher = match local::watch_file(&path, tx) {
                     Ok(w) => Some(w),
                     Err(e) => {
-                        tracing::warn!(path = %path.display(), error = %e, "cannot watch file; changes need a reload");
+                        tracing::warn!(resource = %entry.log_name(), error = %e, "cannot watch file; changes need a reload");
                         None
                     }
                 };
@@ -475,7 +517,7 @@ async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>) {
                     fetched_at: unix(now),
                 };
                 if let Err(e) = cache.store(&data, &new_meta) {
-                    tracing::warn!(url = %url, error = %e, "cannot write resource cache");
+                    tracing::warn!(resource = %entry.log_name(), error = %e, "cannot write resource cache");
                 }
                 *entry.meta.lock().expect("meta") = Some(new_meta);
                 entry.set_state(ResourceState::Available {
@@ -486,7 +528,7 @@ async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>) {
                 });
                 entry.publish(version);
                 backoff = None;
-                tracing::info!(url = %url, version, "resource updated");
+                tracing::info!(resource = %entry.log_name(), version, "resource updated");
             }
             Ok(fetch::Fetched::NotModified) => {
                 let now = SystemTime::now();
@@ -514,7 +556,7 @@ async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>) {
             }
             Err(e) => {
                 let cached = entry.state.lock().expect("state").data();
-                tracing::warn!(url = %url, error = %e, "resource fetch failed");
+                tracing::warn!(resource = %entry.log_name(), error = %e, "resource fetch failed");
                 entry.set_state(ResourceState::Failed {
                     last_error: e,
                     since: SystemTime::now(),
@@ -960,5 +1002,47 @@ mod tests {
         let st = mgr.wait_initial(Duration::from_secs(1)).await;
         assert_eq!(st[0].state, "failed");
         assert!(st[0].last_error.as_deref().unwrap().contains("cannot read"));
+    }
+
+    #[test]
+    fn cached_reads_what_a_manager_would_start_with() {
+        let root = tempfile::tempdir().unwrap();
+        let url = Url::parse("https://sub.test/nodes?token=t0k3n").unwrap();
+        let remote = ResourceSource::Url(url.clone());
+        assert!(cached(root.path(), &remote).is_none());
+        let meta = Meta {
+            url: url.to_string(),
+            ..Meta::default()
+        };
+        cache::CacheDir::for_url(root.path(), url.as_str())
+            .store(b"cached", &meta)
+            .unwrap();
+        assert_eq!(&cached(root.path(), &remote).unwrap()[..], b"cached");
+        let file = root.path().join("nodes.txt");
+        let local = ResourceSource::File(file.clone());
+        assert!(cached(root.path(), &local).is_none());
+        std::fs::write(&file, "local").unwrap();
+        assert_eq!(&cached(root.path(), &local).unwrap()[..], b"local");
+    }
+
+    /// A subscription URL usually carries a token: once somebody labels the
+    /// resource, no log line names it by its URL any more.
+    #[tokio::test]
+    async fn a_labelled_resource_is_logged_by_its_label() {
+        let root = tempfile::tempdir().unwrap();
+        let offline = ResourceOptions {
+            offline: true,
+            ..fast()
+        };
+        let mgr = manager(root.path(), offline);
+        let url = Url::parse("https://sub.test/nodes?token=t0k3n").unwrap();
+        let plain = mgr.get(&url_spec(url.clone(), None));
+        assert_eq!(plain.entry.log_name(), url.as_str());
+        let labelled = mgr.get_labelled(&url_spec(url.clone(), None), "policy-path of `G`");
+        assert!(Arc::ptr_eq(&plain.entry, &labelled.entry));
+        assert_eq!(plain.entry.log_name(), "policy-path of `G`");
+        // the first label stays
+        mgr.get_labelled(&url_spec(url, None), "policy-path of `H`");
+        assert_eq!(plain.entry.log_name(), "policy-path of `G`");
     }
 }

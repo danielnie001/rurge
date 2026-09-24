@@ -187,6 +187,15 @@ impl Engine {
         self.runtime.load_full()
     }
 
+    /// The registry the engine resolves against right now: the one in
+    /// `EngineShared.cell`.
+    pub fn registry(&self) -> Arc<rurge_policy::PolicyRegistry> {
+        self.shared
+            .cell
+            .load()
+            .expect("published before the engine is handed out")
+    }
+
     /// Stores `next` as the current config generation (M3b §7.4 hot reload).
     pub(crate) fn store_runtime(&self, next: Runtime) {
         self.runtime.store(std::sync::Arc::new(next));
@@ -480,6 +489,11 @@ impl Engine {
     /// The main profile file of the current config generation.
     pub fn profile_path(&self) -> std::path::PathBuf {
         self.runtime().config.source.main.clone()
+    }
+
+    /// Where this engine keeps its caches.
+    pub fn data_dir(&self) -> std::path::PathBuf {
+        self.runtime().stack.resources.root().to_path_buf()
     }
 
     /// The current main profile text; secrets redacted unless `sensitive`.

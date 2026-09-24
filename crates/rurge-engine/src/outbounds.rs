@@ -210,8 +210,9 @@ pub fn dry_build(cfg: &Config) -> Diagnostics {
     diagnostics
 }
 
-/// `rurge_config::config::load` plus the dry build: the one way `check`,
-/// `run`, a reload and `POST /v1/profiles/check` read a profile.
+/// `rurge_config::config::load` plus the dry build: the one way `run`, a
+/// reload and — under `check_profile` — `check` and `POST /v1/profiles/check`
+/// read a profile.
 pub fn load_checked(path: &Path, opts: &LoadOptions) -> Result<Loaded, LoadError> {
     let mut loaded = load(path, opts)?;
     loaded.diagnostics.extend(dry_build(&loaded.config));

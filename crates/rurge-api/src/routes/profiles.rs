@@ -8,7 +8,7 @@ use axum::extract::{Query, State};
 use axum::http::header;
 use axum::response::IntoResponse;
 use rurge_config::Severity;
-use rurge_engine::load_checked;
+use rurge_engine::check_profile;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -60,11 +60,13 @@ pub struct CheckJson {
 
 /// Re-validates the profile on disk with the daemon's load options; never
 /// touches the running config. The dry build runs too, so a policy that
-/// cannot be built is reported here exactly as a reload would report it.
+/// cannot be built is reported here exactly as a reload would report it, and
+/// so does an offline assembly from the cached subscriptions.
 pub async fn check(State(app): State<App>) -> ApiResult<Json<CheckJson>> {
     let path = app.engine.profile_path();
     let opts = app.load_options.clone();
-    let loaded = tokio::task::spawn_blocking(move || load_checked(&path, &opts))
+    let data_dir = app.engine.data_dir();
+    let loaded = tokio::task::spawn_blocking(move || check_profile(&path, &opts, &data_dir))
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
         .map_err(|e| ApiError::internal(format!("cannot load the profile: {e}")))?;

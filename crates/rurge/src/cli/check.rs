@@ -23,6 +23,10 @@ pub struct CheckArgs {
     /// Override the CORE_VERSION reported to requirement expressions
     #[arg(long)]
     pub core_version: Option<u64>,
+    /// Data directory whose cached subscriptions are checked too (default:
+    /// the platform data dir); nothing is downloaded
+    #[arg(long, env = "RURGE_DATA_DIR", value_name = "DIR")]
+    pub data_dir: Option<PathBuf>,
 }
 
 pub(crate) fn parse_platform(s: &str) -> Result<Platform, String> {
@@ -50,7 +54,11 @@ pub fn run(args: CheckArgs) -> anyhow::Result<ExitCode> {
         platform,
         capabilities: capabilities::current(),
     };
-    let loaded = rurge_engine::load_checked(&args.config, &opts)?;
+    let data_dir = args
+        .data_dir
+        .clone()
+        .unwrap_or_else(rurge_platform::dirs::data_dir);
+    let loaded = rurge_engine::check_profile(&args.config, &opts, &data_dir)?;
     let diags = loaded.diagnostics.sorted();
     let count = |s: Severity| diags.iter().filter(|d| d.severity == s).count();
     let (errors, warnings, infos) = (

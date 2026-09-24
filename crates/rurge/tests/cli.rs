@@ -237,6 +237,40 @@ fn check_knows_vmess_and_anytls() {
         .stdout(predicate::str::contains("s3cretnotauuid").not());
 }
 
+const SUBSCRIBED: &str = "[General]\n[Proxy Group]\nLocal = select, DIRECT, policy-path=nodes.txt\n\
+Remote = select, DIRECT, policy-path=https://sub.test/nodes?token=t0k3n\n[Rule]\nFINAL,Local\n";
+
+/// Offline: the local file is read and the URL looked for in the data
+/// directory's cache — and the URL is never printed (M3 design 5.9, M3-D7).
+#[test]
+fn check_assembles_the_subscriptions_it_has() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir, "nodes.txt", "N1 = http, n1.test, 80\nnot a policy\n");
+    let data = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "--data-dir"])
+        .arg(data.path())
+        .arg("-c")
+        .arg(write(&dir, "sub.conf", SUBSCRIBED))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    assert!(
+        out.contains("W0023") && out.contains("policy group `Local`: `policy-path` line 2 skipped"),
+        "{out}"
+    );
+    assert!(
+        out.contains("W0022")
+            && out.contains("policy group `Remote`: `policy-path` has no content yet"),
+        "{out}"
+    );
+    assert!(!out.contains("t0k3n"), "{out}");
+}
+
 mod rule_match {
     use assert_cmd::Command;
     use predicates::prelude::*;
