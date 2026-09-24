@@ -185,7 +185,7 @@ A = http, other.test, 80\nnot a policy\n";
     fn a_subscription_in_another_format_yields_nothing() {
         for text in [
             "proxies:\n  - name: \"hk\"\n    type: ss\n    server: hk.test\n",
-            "c3M6Ly9ZV1Z6TFRJMU5pMW5ZMjA6Y0hjPUBoay50ZXN0Ojg0NDM=\n",
+            "c3M6Ly9ZV1Z6TFRJMU5pMW5ZMjA2Y0hjPUBoay50ZXN0Ojg0NDM=\n",
         ] {
             let sub = parse(text);
             assert!(sub.policies.is_empty());
