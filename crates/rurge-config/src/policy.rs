@@ -164,6 +164,26 @@ pub struct ProxyPolicy {
     pub span: Span,
 }
 
+/// Whether `s` looks enough like a hand-written keyword to quote safely in a
+/// diagnostic: a stray value that ended up as the type keyword because a
+/// comma or an `=` was missing — a whole URL, a password, a `vmess://`
+/// link — never looks like this (M3-D7).
+fn looks_like_keyword(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 32
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// `unknown type` (`E0004`), the keyword quoted only when `looks_like_keyword`.
+fn unknown_type(type_kw: &str) -> String {
+    if looks_like_keyword(type_kw) {
+        format!("unknown type `{type_kw}`")
+    } else {
+        "unknown type".to_string()
+    }
+}
+
 pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPolicy, ParseError> {
     let fields = split_list(definition);
     let Some(type_kw) = fields.first() else {
@@ -175,7 +195,7 @@ pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPo
     let kind = PolicyKind::parse(type_kw).ok_or_else(|| {
         ParseError::new(
             codes::E_UNKNOWN_POLICY_TYPE,
-            format!("policy `{name}`: unknown type `{type_kw}`"),
+            format!("policy `{name}`: {}", unknown_type(type_kw)),
         )
     })?;
     let (server, port, rest) = if kind.takes_server() {
@@ -386,7 +406,7 @@ impl SubnetExpr {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PolicyGroup {
     pub name: String,
     pub kind: GroupKind,
@@ -397,6 +417,26 @@ pub struct PolicyGroup {
     /// The text right of `name =` as written (API `lineHash`).
     pub definition: String,
     pub span: Span,
+}
+
+/// `params` is left out and `definition` redacted (M3-D7): a group's
+/// `policy-path` usually carries a subscription token, and its
+/// `external-policy-modifier` can set any parameter, a password included.
+impl std::fmt::Debug for PolicyGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PolicyGroup")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("members", &self.members)
+            .field("conditions", &self.conditions)
+            .field("legacy_keyword", &self.legacy_keyword)
+            .field("span", &self.span)
+            .field(
+                "definition",
+                &crate::redact::redact_definition(&self.definition),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// Every parameter a group line can carry. On a `subnet` group these stay
@@ -436,7 +476,7 @@ pub fn parse_group(name: &str, definition: &str, span: &Span) -> Result<PolicyGr
     let (kind, legacy_keyword) = GroupKind::parse(type_kw).ok_or_else(|| {
         ParseError::new(
             codes::E_UNKNOWN_POLICY_TYPE,
-            format!("policy group `{name}`: unknown type `{type_kw}`"),
+            format!("policy group `{name}`: {}", unknown_type(type_kw)),
         )
     })?;
     let mut members = Vec::new();
@@ -630,6 +670,25 @@ mod tests {
                 .unwrap_err()
                 .code,
             codes::E_INVALID_RULE_VALUE
+        );
+    }
+
+    /// `Debug` must not leak a subscription token or a modifier's password
+    /// (M3-D7): `redact_definition` blanks them, `params` is left out
+    /// entirely.
+    #[test]
+    fn debug_of_a_policy_group_redacts_its_definition() {
+        let g = parse_group(
+            "G",
+            "select, policy-path=https://sub.test/n?token=t0k3n, \
+external-policy-modifier=\"password=hunter2\"",
+            &span(),
+        )
+        .unwrap();
+        let debug = format!("{g:?}");
+        assert!(
+            !debug.contains("t0k3n") && !debug.contains("hunter2"),
+            "{debug}"
         );
     }
 

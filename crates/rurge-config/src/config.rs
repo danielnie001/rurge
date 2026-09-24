@@ -1064,6 +1064,37 @@ mod tests {
         assert_eq!(s.policies, ["ProxyA (https)"]);
     }
 
+    /// A missing comma or `=` can leave a subscription token, or a
+    /// password, sitting where the type keyword is read from: `unknown
+    /// type` must never echo it (M3-D7). A genuine typo is still quoted.
+    #[test]
+    fn an_unknown_type_never_echoes_what_looks_like_a_secret() {
+        for text in [
+            "[Proxy]\nA = direct\n[Proxy Group]\n\
+G = select policy-path=https://sub.test/nodes?token=t0k3n\n[Rule]\nFINAL,DIRECT\n",
+            "[Proxy]\nA = direct\n[Proxy Group]\n\
+G select, policy-path=https://sub.test/nodes?token=t0k3n\n[Rule]\nFINAL,DIRECT\n",
+            "[Proxy]\nX = http host 80 alice s3cret\n[Proxy Group]\n\
+G = select, A\n[Rule]\nFINAL,DIRECT\n",
+        ] {
+            let l = load_text(text);
+            assert!(l.diagnostics.has_errors(), "{text}");
+            for d in l.diagnostics.iter() {
+                assert!(!d.message.contains("t0k3n"), "{text}: {}", d.message);
+                assert!(!d.message.contains("s3cret"), "{text}: {}", d.message);
+            }
+        }
+        let l =
+            load_text("[Proxy]\nA = direct\n[Proxy Group]\nG = selekt, A\n[Rule]\nFINAL,DIRECT\n");
+        let found: Vec<&str> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::E_UNKNOWN_POLICY_TYPE)
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(found, ["policy group `G`: unknown type `selekt`"]);
+    }
+
     #[test]
     fn reference_errors() {
         let l = load_text(
