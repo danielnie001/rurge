@@ -46,8 +46,13 @@ impl Engine {
         if let Some(pc) = next.dns_pipeline() {
             pc.attach(std::sync::Arc::downgrade(self));
         }
-        self.publish_generation(&mut next);
-        self.store_runtime(next);
+        let receivers = next.subscriptions.take_receivers();
+        {
+            let _generation = self.generation_lock();
+            self.publish_generation(&mut next);
+            self.store_runtime(next);
+        }
+        self.watch_subscriptions(receivers);
         before != after
     }
 }

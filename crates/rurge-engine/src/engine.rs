@@ -149,6 +149,8 @@ pub struct Engine {
     global_warned: AtomicBool,
     state: OnceLock<Arc<StateStore>>,
     shared: EngineShared,
+    /// Held while a registry or a whole generation is published.
+    generation: std::sync::Mutex<()>,
 }
 
 impl Engine {
@@ -167,6 +169,7 @@ impl Engine {
                 .expect("a generation is published once"),
         );
         shared.resolver.store(runtime.stack.resolver.clone());
+        let receivers = runtime.subscriptions.take_receivers();
         let engine = Arc::new(Engine {
             runtime: ArcSwap::from_pointee(runtime),
             next_session: AtomicU64::new(0),
@@ -180,11 +183,20 @@ impl Engine {
             global_warned: AtomicBool::new(false),
             state: OnceLock::new(),
             shared,
+            generation: std::sync::Mutex::new(()),
         });
         if let Some(pc) = engine.runtime().dns_pipeline() {
             pc.attach(Arc::downgrade(&engine));
         }
+        engine.watch_subscriptions(receivers);
         engine
+    }
+
+    /// Held while a registry or a whole generation is published, so a
+    /// subscription rebuild of a generation that is going out never publishes
+    /// after its successor (M3 design 5.7). Never held across I/O.
+    pub(crate) fn generation_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.generation.lock().expect("generation lock")
     }
 
     /// The current config generation (sessions snapshot it once at dial time).

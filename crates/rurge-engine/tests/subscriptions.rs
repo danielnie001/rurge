@@ -3,9 +3,62 @@
 
 mod common;
 use common::*;
+use rurge_config::rule::PolicyRef;
 use rurge_config::session::SessionInfo;
 use rurge_engine::EmptyGroup;
 use rurge_inbound::{DialError, Dialer};
+
+/// Like `common::wait_until`, with room for a file watcher's or a refresh
+/// interval's delay plus the rebuild's own pause.
+async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !check() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn members(engine: &Engine, group: &str) -> Vec<String> {
+    engine
+        .registry()
+        .members(group)
+        .unwrap_or_default()
+        .to_vec()
+}
+
+fn outbound_of(engine: &Engine, name: &str) -> rurge_proto::OutboundRef {
+    engine.registry().resolve(&PolicyRef::parse(name)).outbound
+}
+
+/// A generation that downloads: its GeoIP updater asks `server` (and gets a
+/// 404) instead of the public default URLs.
+async fn online_runtime(
+    dir: &std::path::Path,
+    profile: &str,
+    server: &TestServer,
+    shared: EngineShared,
+) -> Runtime {
+    std::fs::write(dir.join("t.conf"), profile).unwrap();
+    let loaded = from_text(profile, &dir.join("t.conf"), &LoadOptions::for_tests());
+    assert!(!loaded.diagnostics.has_errors());
+    let mut stack = stack_options(dir);
+    stack.no_network = false;
+    stack.geo_urls = GeoUrls {
+        country: server.url("/geo/country.mmdb"),
+        asn: server.url("/geo/asn.mmdb"),
+    };
+    let opts = RuntimeOptions {
+        stack,
+        outbound_mode: OutboundMode::Rule,
+        idle_timeout: Duration::from_secs(600),
+        shared,
+        request_log_size: 1000,
+    };
+    Runtime::build(loaded.config, opts).await.unwrap()
+}
 
 /// A local subscription is read while the generation is built: the group
 /// has its members from the first dial on (M3-D5).
@@ -25,6 +78,67 @@ async fn a_subscription_file_is_in_from_the_first_generation() {
     .text(dns.addr());
     let engine = Engine::new(runtime(dir.path(), &text, EngineShared::default()).await);
     assert_eq!(engine.registry().members("Sub").unwrap(), ["N1", "N2"]);
+}
+
+/// An edit of the file rebuilds the registry alone: the members follow, and
+/// a line that did not change keeps its outbound (M3 design 5.7).
+#[tokio::test]
+async fn an_edited_subscription_file_rebuilds_the_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    let nodes = dir.path().join("nodes.txt");
+    std::fs::write(&nodes, "N1 = http, n1.test, 80\nN2 = http, n2.test, 80\n").unwrap();
+    let dns = MockDns::spawn().await;
+    let text = Profile {
+        groups: "Sub = select, policy-path=nodes.txt",
+        ..Profile::default()
+    }
+    .text(dns.addr());
+    let engine = Engine::new(runtime(dir.path(), &text, EngineShared::default()).await);
+    let generation = engine.runtime();
+    let n1 = outbound_of(&engine, "N1");
+    std::fs::write(&nodes, "N1 = http, n1.test, 80\nN3 = http, n3.test, 80\n").unwrap();
+    eventually("the rebuild", || members(&engine, "Sub") == ["N1", "N3"]).await;
+    assert!(Arc::ptr_eq(&n1, &outbound_of(&engine, "N1")));
+    assert!(!engine.registry().contains("N2"));
+    assert!(
+        Arc::ptr_eq(&generation, &engine.runtime()),
+        "the generation stays"
+    );
+}
+
+/// Nothing cached on a first start: the group is empty until the download
+/// arrives, then follows the server; a reload finds the download in the
+/// cache, so it has the members at once, even offline (M3-D5).
+#[tokio::test]
+async fn a_url_subscription_arrives_after_the_start_and_is_cached() {
+    let server = TestServer::spawn().await;
+    server.set("/nodes", "N1 = http, n1.test, 80\nN2 = http, n2.test, 80\n");
+    let dir = tempfile::tempdir().unwrap();
+    let dns = MockDns::spawn().await;
+    let groups = format!(
+        "Sub = select, policy-path={}, update-interval=1",
+        server.url("/nodes")
+    );
+    let text = Profile {
+        groups: &groups,
+        ..Profile::default()
+    }
+    .text(dns.addr());
+    let engine =
+        Engine::new(online_runtime(dir.path(), &text, &server, EngineShared::default()).await);
+    assert!(members(&engine, "Sub").is_empty(), "nothing is cached yet");
+    eventually("the first download", || {
+        members(&engine, "Sub") == ["N1", "N2"]
+    })
+    .await;
+    let n1 = outbound_of(&engine, "N1");
+    server.set("/nodes", "N1 = http, n1.test, 80\nN3 = http, n3.test, 80\n");
+    eventually("the update", || members(&engine, "Sub") == ["N1", "N3"]).await;
+    assert!(Arc::ptr_eq(&n1, &outbound_of(&engine, "N1")));
+
+    // `runtime` builds offline: only the cache can give the members now
+    engine.swap_runtime(runtime(dir.path(), &text, engine.shared()).await);
+    assert_eq!(members(&engine, "Sub"), ["N1", "N3"]);
 }
 
 /// A dial through a group without members: DIRECT stands in by default,

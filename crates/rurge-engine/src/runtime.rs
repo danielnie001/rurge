@@ -1,13 +1,15 @@
 //! One immutable config generation (M3 design §7.1).
 
+use crate::outbounds::EngineFactory;
 use crate::shared::EngineShared;
 use crate::stack::{Stack, StackOptions, build_stack};
 use crate::subscriptions::Subscriptions;
 use rurge_config::{Config, Diagnostics};
 use rurge_policy::PolicyRegistry;
 use rurge_rules::{OutboundMode, RuleEngine};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio_util::task::AbortOnDropHandle;
 
 pub struct RuntimeOptions {
     pub stack: StackOptions,
@@ -34,6 +36,11 @@ pub struct Runtime {
     /// it: from then on the one in use is `EngineShared.cell`'s (M3 design
     /// 5.8).
     pub(crate) registry: Option<Arc<PolicyRegistry>>,
+    /// What rebuilds the registry when a subscription changes (5.7).
+    pub(crate) factory: Arc<EngineFactory>,
+    pub(crate) subscriptions: Subscriptions,
+    /// The task watching `subscriptions`; it goes with the generation.
+    pub(crate) watcher: OnceLock<AbortOnDropHandle<()>>,
 }
 
 impl Runtime {
@@ -56,19 +63,19 @@ impl Runtime {
             RuleEngine::build_with_registry(&config, stack.registry.clone(), stack.geo.clone())?;
         // The cell, not this generation's resolver: an outbound may outlive
         // the generation it was built in (M2 design 7.2).
-        let factory = match &opts.shared.roots {
-            Some(roots) => crate::outbounds::EngineFactory::with_roots(
+        let factory = Arc::new(match &opts.shared.roots {
+            Some(roots) => EngineFactory::with_roots(
                 &config,
                 opts.shared.resolver.clone(),
                 opts.stack.socket_hook.clone(),
                 roots.clone(),
             ),
-            None => crate::outbounds::EngineFactory::new(
+            None => EngineFactory::new(
                 &config,
                 opts.shared.resolver.clone(),
                 opts.stack.socket_hook.clone(),
             ),
-        };
+        });
         // What earlier runs cached is in the first assembly already: no group
         // starts empty for want of a download (M3-D5).
         let subscriptions = Subscriptions::register(&config, &stack.resources);
@@ -83,7 +90,7 @@ impl Runtime {
             PolicyRegistry::build(
                 &config,
                 &assembly,
-                &factory,
+                factory.as_ref(),
                 &opts.shared.cell,
                 opts.shared.selections.clone(),
                 previous.as_deref(),
@@ -101,6 +108,9 @@ impl Runtime {
             shared: opts.shared,
             dns_pipeline,
             registry: Some(registry),
+            factory,
+            subscriptions,
+            watcher: OnceLock::new(),
         })
     }
 
