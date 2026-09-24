@@ -154,6 +154,8 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Must be called inside a tokio runtime: a generation with subscriptions
+    /// starts a watcher task (`watch_subscriptions`).
     pub fn new(mut runtime: Runtime) -> Arc<Engine> {
         let observe = Arc::new(Observe {
             log: RequestLog::new(runtime.request_log_size),
@@ -185,10 +187,11 @@ impl Engine {
             shared,
             generation: std::sync::Mutex::new(()),
         });
-        if let Some(pc) = engine.runtime().dns_pipeline() {
+        let rt = engine.runtime();
+        if let Some(pc) = rt.dns_pipeline() {
             pc.attach(Arc::downgrade(&engine));
         }
-        engine.watch_subscriptions(receivers);
+        engine.watch_subscriptions(&rt, receivers);
         engine
     }
 
@@ -799,8 +802,8 @@ fn fail(
     // A note already on the handle (a group cycle, an unsupported protocol,
     // an empty group standing in for DIRECT) explains why the session was
     // routed this way, not why the dial itself then failed: the record needs
-    // both, or it hides the failure behind the note (fix round 1, F3). The
-    // `DialError` below keeps the plain failure message.
+    // both, or it hides the failure behind the note. The `DialError` below
+    // keeps the plain failure message.
     if let Some(note) = handle.error() {
         handle.set_error(format!("{note}; {message}"));
     }

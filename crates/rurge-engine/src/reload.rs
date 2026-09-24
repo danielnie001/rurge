@@ -37,7 +37,9 @@ impl Engine {
     /// their snapshot; new sessions use the new one. Returns whether the
     /// listener configuration surface (addresses, authentication, source
     /// restriction, error-page switches) changed, so the caller can rebind
-    /// listeners and pick up the new `ListenerOpts` with them.
+    /// listeners and pick up the new `ListenerOpts` with them. Must be
+    /// called inside a tokio runtime: a generation with subscriptions starts
+    /// a watcher task.
     pub fn swap_runtime(self: &std::sync::Arc<Self>, mut next: Runtime) -> bool {
         let before = listener_surface(&self.runtime().config.general);
         let after = listener_surface(&next.config.general);
@@ -47,12 +49,16 @@ impl Engine {
             pc.attach(std::sync::Arc::downgrade(self));
         }
         let receivers = next.subscriptions.take_receivers();
-        {
+        // `rt` is read inside the same lock that published it: another swap
+        // can never land in between and make this attach `receivers` (this
+        // generation's own) to a later generation's watcher.
+        let rt = {
             let _generation = self.generation_lock();
             self.publish_generation(&mut next);
             self.store_runtime(next);
-        }
-        self.watch_subscriptions(receivers);
+            self.runtime()
+        };
+        self.watch_subscriptions(&rt, receivers);
         before != after
     }
 }

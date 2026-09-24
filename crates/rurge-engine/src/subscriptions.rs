@@ -30,6 +30,17 @@ pub(crate) struct Subscriptions {
     receivers: Vec<watch::Receiver<u64>>,
 }
 
+/// One `policy-path` source, merged across every group that names it, before
+/// any of them registers with the resource manager.
+struct Source {
+    path: PolicyPath,
+    /// The first group that names it, for `get_labelled`.
+    label: String,
+    /// The smallest `update-interval` any group named it with; `None` when
+    /// every one of them left it unset.
+    interval: Option<i64>,
+}
+
 impl Subscriptions {
     /// Registers every `policy-path` with this generation's resource
     /// manager. What earlier runs cached is loaded right here, synchronously
@@ -37,27 +48,44 @@ impl Subscriptions {
     /// had (M3-D5). Log lines name a source after the first group that uses
     /// it, never by its URL (M3-D7).
     pub(crate) fn register(cfg: &Config, resources: &ResourceManager) -> Subscriptions {
-        let mut handles: Vec<(PolicyPath, ResourceHandle)> = Vec::new();
-        let mut receivers = Vec::new();
+        // Merged per source before anything registers: the resource
+        // manager's own `merge_interval` does not wake a refresh task that
+        // already computed its wait, so registering a shared source once per
+        // group — the first with its own, possibly longer, interval — could
+        // let the first refresh miss a later group's shorter one.
+        let mut sources: Vec<Source> = Vec::new();
         for g in &cfg.group_specs {
             let Some(path) = &g.import.policy_path else {
                 continue;
             };
-            let spec = ResourceSpec {
-                source: source_of(path),
-                update_interval: g
-                    .import
-                    .update_interval
-                    .map(|secs| i64::try_from(secs).unwrap_or(i64::MAX)),
-            };
-            // every group registers: a shared source refreshes at the
-            // shortest interval any of them asks for
-            let label = format!("policy-path of `{}`", g.name);
-            let handle = resources.get_labelled(&spec, &label);
-            if !handles.iter().any(|(p, _)| p == path) {
-                receivers.push(handle.subscribe());
-                handles.push((path.clone(), handle));
+            let interval = g
+                .import
+                .update_interval
+                .map(|secs| i64::try_from(secs).unwrap_or(i64::MAX));
+            match sources.iter_mut().find(|s| &s.path == path) {
+                Some(s) => {
+                    s.interval = match (s.interval, interval) {
+                        (Some(cur), Some(new)) => Some(cur.min(new)),
+                        (cur, new) => cur.or(new),
+                    }
+                }
+                None => sources.push(Source {
+                    path: path.clone(),
+                    label: format!("policy-path of `{}`", g.name),
+                    interval,
+                }),
             }
+        }
+        let mut handles = Vec::new();
+        let mut receivers = Vec::new();
+        for s in sources {
+            let spec = ResourceSpec {
+                source: source_of(&s.path),
+                update_interval: s.interval,
+            };
+            let handle = resources.get_labelled(&spec, &s.label);
+            receivers.push(handle.subscribe());
+            handles.push((s.path, handle));
         }
         Subscriptions { handles, receivers }
     }
@@ -92,14 +120,21 @@ impl Engine {
     /// Rebuilds the registry of the current generation after every burst of
     /// subscription updates (M3 design 5.7). The task goes with the
     /// generation: the runtime keeps its handle and aborts it when dropped.
-    pub(crate) fn watch_subscriptions(self: &Arc<Self>, receivers: Vec<watch::Receiver<u64>>) {
+    /// `rt` must be the very generation `receivers` came from — the caller
+    /// reads it under the same lock that published it, so two interleaved
+    /// swaps can never attach one generation's receivers to another. Must be
+    /// called inside a tokio runtime (spawns a task).
+    pub(crate) fn watch_subscriptions(
+        self: &Arc<Self>,
+        rt: &Arc<Runtime>,
+        receivers: Vec<watch::Receiver<u64>>,
+    ) {
         if receivers.is_empty() {
             return;
         }
-        let rt = self.runtime();
         let task = tokio::spawn(rebuild_on_change(
             Arc::downgrade(self),
-            Arc::downgrade(&rt),
+            Arc::downgrade(rt),
             receivers,
         ));
         let _ = rt.watcher.set(AbortOnDropHandle::new(task));
@@ -110,6 +145,13 @@ impl Engine {
     /// not change is kept (M2 design 7.1). `false` when `rt` is no longer the
     /// current generation: then nothing is published.
     pub(crate) fn rebuild_registry(&self, rt: &Arc<Runtime>) -> bool {
+        // Cheap, unlocked pre-check for a generation a swap has already
+        // replaced: skips the assembly, the build and their warnings for
+        // work nobody will use. The locked re-check below still catches a
+        // swap that lands while this call is running.
+        if !Arc::ptr_eq(&self.runtime(), rt) {
+            return false;
+        }
         let assembly = assemble(&rt.config, &rt.subscriptions.snapshots());
         for d in assembly.diagnostics.iter() {
             tracing::warn!("{d}");
@@ -134,13 +176,22 @@ impl Engine {
                 return true;
             }
         };
-        let _generation = self.generation_lock();
-        if !Arc::ptr_eq(&self.runtime(), rt) {
-            return false;
+        // Computed outside the generation lock, which never does I/O: the
+        // synchronous writer behind `tracing` would otherwise run under it.
+        let changes = member_changes(previous.as_deref(), &registry);
+        let published = {
+            let _generation = self.generation_lock();
+            if Arc::ptr_eq(&self.runtime(), rt) {
+                shared.cell.store(registry);
+                true
+            } else {
+                false
+            }
+        };
+        if published {
+            log_changes(&changes);
         }
-        log_member_changes(previous.as_deref(), &registry);
-        shared.cell.store(registry);
-        true
+        published
     }
 }
 
@@ -184,9 +235,14 @@ async fn any_changed(receivers: &mut [watch::Receiver<u64>]) -> bool {
     .await
 }
 
-/// One INFO line per group whose members changed: its name and how many came
-/// and went — never where they came from (M3-D7).
-fn log_member_changes(before: Option<&PolicyRegistry>, after: &PolicyRegistry) {
+/// Which groups' members changed, and by how much (added, removed): pure, so
+/// it can run before the generation lock is taken — the lock never does
+/// I/O, and a synchronous log writer is I/O.
+fn member_changes(
+    before: Option<&PolicyRegistry>,
+    after: &PolicyRegistry,
+) -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
     for group in after.group_names() {
         let now: HashSet<&String> = after.members(&group).unwrap_or_default().iter().collect();
         let was: HashSet<&String> = before
@@ -197,8 +253,18 @@ fn log_member_changes(before: Option<&PolicyRegistry>, after: &PolicyRegistry) {
         let added = now.difference(&was).count();
         let removed = was.difference(&now).count();
         if added + removed > 0 {
-            tracing::info!(group = %group, added, removed, "policy group members updated");
+            out.push((group, added, removed));
         }
+    }
+    out
+}
+
+/// One INFO line per group whose members changed: its name and how many came
+/// and went — never where they came from (M3-D7). Called after the
+/// generation lock is released, and only when the rebuild actually published.
+fn log_changes(changes: &[(String, usize, usize)]) {
+    for (group, added, removed) in changes {
+        tracing::info!(group = %group, added, removed, "policy group members updated");
     }
 }
 
@@ -369,5 +435,34 @@ Remote = select, DIRECT, policy-path=https://sub.test/nodes?token=t0k3n\n[Rule]\
         assert!(engine.rebuild_registry(&engine.runtime()));
         assert!(!Arc::ptr_eq(&before, &engine.registry()));
         assert_eq!(engine.registry().members("Sub").unwrap(), ["DIRECT"]);
+    }
+
+    /// After a swap, the generation it replaced is not kept alive anywhere:
+    /// no stray strong reference outlives the swap itself. A subscription on
+    /// both generations makes each one actually start its watcher task,
+    /// exercising the hand-over `watch_subscriptions` goes through.
+    #[tokio::test]
+    async fn a_swapped_out_generation_is_freed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nodes.txt"), "N1 = http, n1.test, 80\n").unwrap();
+        let first = generation(
+            dir.path(),
+            "Sub = select, policy-path=nodes.txt",
+            EngineShared::default(),
+        )
+        .await;
+        let engine = Engine::new(first);
+        let weak = Arc::downgrade(&engine.runtime());
+        let next = generation(
+            dir.path(),
+            "Sub = select, policy-path=nodes.txt",
+            engine.shared(),
+        )
+        .await;
+        engine.swap_runtime(next);
+        assert!(
+            weak.upgrade().is_none(),
+            "the replaced generation is still alive"
+        );
     }
 }

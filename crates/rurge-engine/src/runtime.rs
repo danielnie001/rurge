@@ -114,7 +114,9 @@ impl Runtime {
         })
     }
 
-    /// Diagnostics produced while building the stack (sets, GeoIP, resolver).
+    /// Diagnostics produced while building the stack (sets, GeoIP, resolver),
+    /// plus the subscription assembly's warnings (skipped lines, empty
+    /// groups, cycles, and the rest of M3 design 5.9).
     pub fn diagnostics(&self) -> &Diagnostics {
         &self.stack.diagnostics
     }
