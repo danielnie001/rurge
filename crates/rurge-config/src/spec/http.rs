@@ -81,13 +81,19 @@ impl HeaderTemplate {
     /// `<random-string(min-max)>` placeholders.
     pub fn parse_list(list: &str) -> Result<Vec<HeaderTemplate>, String> {
         let mut out = Vec::new();
-        for item in list.split(';').map(str::trim).filter(|i| !i.is_empty()) {
+        for (n, item) in list
+            .split(';')
+            .map(str::trim)
+            .filter(|i| !i.is_empty())
+            .enumerate()
+        {
+            let n = n + 1;
             let (name, value) = item
                 .split_once(':')
-                .ok_or_else(|| format!("header `{item}` has no `:`"))?;
+                .ok_or_else(|| format!("header #{n} has no `:`"))?;
             let name = name.trim();
             if !is_token(name) {
-                return Err(format!("`{name}` is not a valid header name"));
+                return Err(format!("header #{n} has an invalid name"));
             }
             let value = value.trim();
             if !is_field_text(value) {
@@ -220,5 +226,20 @@ mod tests {
     #[test]
     fn parse_list_rejects_other_control_characters_too() {
         assert!(HeaderTemplate::parse_list("X: a\u{1b}b").is_err());
+    }
+
+    /// The project rule against echoing credentials in a diagnostic (M3-D7)
+    /// applies to the main profile too: a malformed entry is named by its
+    /// position among the non-empty entries, never quoted whole.
+    #[test]
+    fn a_malformed_header_is_named_by_its_position() {
+        assert_eq!(
+            HeaderTemplate::parse_list("X-A: 1; Authorization Bearer s3cret"),
+            Err("header #2 has no `:`".to_string())
+        );
+        assert_eq!(
+            HeaderTemplate::parse_list("Bad Name: v"),
+            Err("header #1 has an invalid name".to_string())
+        );
     }
 }

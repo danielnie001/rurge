@@ -8,7 +8,7 @@ use rurge_config::Config;
 use rurge_config::diagnostic::{Diagnostic, Diagnostics, Severity, codes};
 use rurge_config::policy::{PolicyKind, ProxyPolicy, parse_policy, with_params};
 use rurge_config::spec::{GroupSpec, NameKind, PolicyPath, PolicySpec, SpecEnv, to_spec};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 /// The current content of every subscription; a source that is absent has
@@ -32,8 +32,9 @@ pub struct Assembly {
     pub members: HashMap<String, Vec<String>>,
     /// Names unique, none of them a name of the profile.
     pub imported: Vec<Imported>,
-    /// Every group cycle, through members or `include-other-group`: the
-    /// groups along it, the first one repeated at the end.
+    /// For every group on a cycle (through members as assembled or
+    /// `include-other-group`), a shortest cycle through it: the groups
+    /// along it, the first one repeated at the end; each cycle once.
     pub cycles: Vec<Vec<String>>,
     /// Warnings, each at the line of the group it concerns.
     pub diagnostics: Diagnostics,
@@ -65,6 +66,18 @@ pub fn assemble(cfg: &Config, snapshots: &Snapshots) -> Assembly {
 fn warn(group: &GroupSpec, code: &'static str, message: String) -> Diagnostic {
     Diagnostic::warning(code, format!("policy group `{}`: {message}", group.name))
         .at(group.span.clone())
+}
+
+/// Why an imported line cannot be used, in words that quote nothing from the
+/// line or from the modifier (M3-D7): the messages of `to_spec` quote the
+/// values they reject.
+fn unusable(code: &str) -> &'static str {
+    match code {
+        codes::E_UNKNOWN_POLICY_REF => "has an `underlying-proxy` that names no policy",
+        codes::E_KEYSTORE_REF => "names a `[Keystore]` item that is missing or of another kind",
+        codes::E_INVALID_POLICY_PARAM => "has a parameter whose value cannot be used",
+        _ => "cannot be used",
+    }
 }
 
 /// What parsing `sub` left out; said once per source, by the first group.
@@ -211,8 +224,11 @@ impl<'a> Imports<'a> {
                     group,
                     codes::W_SET_LINES_SKIPPED,
                     format!(
-                        "`policy-path` line {}: {}; skipped",
-                        imported.policy.span.line, e.message
+                        "`policy-path` line {}: policy `{}` {} ({}); skipped",
+                        imported.policy.span.line,
+                        imported.policy.name,
+                        unusable(e.code),
+                        e.code
                     ),
                 ));
                 failed.insert(imported.policy.name.clone());
@@ -241,38 +257,69 @@ impl<'a> Imports<'a> {
 
     /// An import whose `underlying-proxy` leads back to itself would never
     /// finish dialling: it is skipped, and so is every membership of it.
+    /// The graph is one name index over profile specs, imported specs and
+    /// groups (an import without a spec is not a node), so this is one
+    /// `on_cycles` pass rather than a walk per chained import.
     fn drop_chain_cycles(
         &mut self,
         cfg: &Config,
         members: &mut HashMap<String, Vec<String>>,
         diags: &mut Diagnostics,
     ) {
-        let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
-        let imported = self.list.iter().filter_map(|(i, _)| i.spec.as_ref());
-        for s in cfg.specs.iter().chain(imported) {
-            if let Some(under) = &s.common.underlying_proxy {
-                edges.insert(&s.name, vec![under]);
+        let mut index: HashMap<String, usize> = HashMap::new();
+        for s in &cfg.specs {
+            let i = index.len();
+            index.insert(s.name.clone(), i);
+        }
+        for (imported, _) in &self.list {
+            if imported.spec.is_some() {
+                let i = index.len();
+                index.insert(imported.policy.name.clone(), i);
             }
         }
         for g in &cfg.group_specs {
-            let mut next: Vec<&str> = members
-                .get(&g.name)
-                .map(|m| m.iter().map(String::as_str).collect())
-                .unwrap_or_default();
-            // every proxy member of a group with a relay is dialled through it
-            next.extend(g.underlying_proxy.as_deref());
-            edges.insert(&g.name, next);
+            let i = index.len();
+            index.insert(g.name.clone(), i);
         }
-        let mut cyclic: HashSet<String> = HashSet::new();
-        for (imported, group) in &self.list {
-            let Some(first) = imported
-                .spec
-                .as_ref()
-                .and_then(|s| s.common.underlying_proxy.as_deref())
-            else {
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); index.len()];
+        for s in &cfg.specs {
+            if let Some(under) = &s.common.underlying_proxy
+                && let Some(&j) = index.get(under)
+            {
+                adj[index[&s.name]].push(j);
+            }
+        }
+        for (imported, _) in &self.list {
+            let Some(spec) = imported.spec.as_ref() else {
                 continue;
             };
-            if leads_back(&edges, &imported.policy.name, first) {
+            if let Some(under) = &spec.common.underlying_proxy
+                && let Some(&j) = index.get(under)
+            {
+                adj[index[&imported.policy.name]].push(j);
+            }
+        }
+        for g in &cfg.group_specs {
+            let i = index[&g.name];
+            // every proxy member of a group with a relay is dialled through it
+            for m in members.get(&g.name).into_iter().flatten() {
+                if let Some(&j) = index.get(m) {
+                    adj[i].push(j);
+                }
+            }
+            if let Some(under) = &g.underlying_proxy
+                && let Some(&j) = index.get(under)
+            {
+                adj[i].push(j);
+            }
+        }
+        let cyclic = on_cycles(&adj);
+        let mut cyclic_names: HashSet<String> = HashSet::new();
+        for (imported, group) in &self.list {
+            let Some(&i) = index.get(&imported.policy.name) else {
+                continue;
+            };
+            if cyclic[i] {
                 diags.push(warn(
                     group,
                     codes::W_SET_LINES_SKIPPED,
@@ -281,12 +328,61 @@ impl<'a> Imports<'a> {
                         imported.policy.span.line, imported.policy.name
                     ),
                 ));
-                cyclic.insert(imported.policy.name.clone());
+                cyclic_names.insert(imported.policy.name.clone());
             }
         }
-        self.forget(&cyclic);
+        self.forget(&cyclic_names);
         for list in members.values_mut() {
-            list.retain(|name| !cyclic.contains(name));
+            list.retain(|name| !cyclic_names.contains(name));
+        }
+        self.drop_dangling(cfg, members, diags);
+    }
+
+    /// An import whose `underlying-proxy` no longer names anything — its
+    /// target was itself left out, by the cyclic check above or by an
+    /// earlier round of this one — would dial nowhere: it is left out too,
+    /// and so is every membership of it. Repeats until a round removes
+    /// nothing, so a chain of any length unravels.
+    fn drop_dangling(
+        &mut self,
+        cfg: &Config,
+        members: &mut HashMap<String, Vec<String>>,
+        diags: &mut Diagnostics,
+    ) {
+        loop {
+            let kept: HashSet<&str> = self
+                .list
+                .iter()
+                .map(|(i, _)| i.policy.name.as_str())
+                .collect();
+            let mut dangling: HashSet<String> = HashSet::new();
+            for (imported, group) in &self.list {
+                let Some(target) = imported
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.common.underlying_proxy.as_deref())
+                else {
+                    continue;
+                };
+                if cfg.name_kind(target).is_none() && !kept.contains(target) {
+                    diags.push(warn(
+                        group,
+                        codes::W_SET_LINES_SKIPPED,
+                        format!(
+                            "`policy-path` line {}: the `underlying-proxy` of `{}` names a policy that was left out; skipped",
+                            imported.policy.span.line, imported.policy.name
+                        ),
+                    ));
+                    dangling.insert(imported.policy.name.clone());
+                }
+            }
+            if dangling.is_empty() {
+                break;
+            }
+            self.forget(&dangling);
+            for list in members.values_mut() {
+                list.retain(|name| !dangling.contains(name));
+            }
         }
     }
 
@@ -299,23 +395,6 @@ impl<'a> Imports<'a> {
             list.retain(|name| !names.contains(name));
         }
     }
-}
-
-/// Whether following `edges` from `first` reaches `start`.
-fn leads_back(edges: &HashMap<&str, Vec<&str>>, start: &str, first: &str) -> bool {
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut stack = vec![first];
-    while let Some(name) = stack.pop() {
-        if name == start {
-            return true;
-        }
-        if seen.insert(name)
-            && let Some(next) = edges.get(name)
-        {
-            stack.extend(next.iter().copied());
-        }
-    }
-    false
 }
 
 /// A member list that keeps each name where it first appears.
@@ -336,6 +415,9 @@ impl Members {
 /// Every group's members in the manual's order — written, then
 /// `include-other-group`, then `include-all-proxies`, then `policy-path`.
 fn members(cfg: &Config, imports: &Imports<'_>) -> HashMap<String, Vec<String>> {
+    let include_cyclic = on_cycles(&group_graph(cfg, &|g| {
+        g.import.include_other_groups.clone()
+    }));
     let expand = Expand {
         cfg,
         imports,
@@ -346,9 +428,12 @@ fn members(cfg: &Config, imports: &Imports<'_>) -> HashMap<String, Vec<String>> 
             .collect(),
         // a group on an `include-other-group` cycle gives its members to
         // nobody: the cycle would have no end (5.3)
-        on_cycle: cycles(cfg, &|g| g.import.include_other_groups.clone())
-            .into_iter()
-            .flatten()
+        on_cycle: cfg
+            .group_specs
+            .iter()
+            .zip(include_cyclic)
+            .filter(|(_, cyclic)| *cyclic)
+            .map(|(g, _)| g.name.clone())
             .collect(),
     };
     let mut done: HashMap<String, Vec<String>> = HashMap::new();
@@ -411,83 +496,148 @@ impl Expand<'_> {
 
 /// Group cycles through members (as assembled) and `include-other-group`.
 fn group_cycles(cfg: &Config, members: &HashMap<String, Vec<String>>) -> Vec<Vec<String>> {
-    cycles(cfg, &|g| {
+    let adj = group_graph(cfg, &|g| {
         let mut next = members.get(&g.name).cloned().unwrap_or_default();
         next.extend(g.import.include_other_groups.iter().cloned());
         next
-    })
-}
-
-/// Every cycle a depth-first walk along `edges` meets, as the groups along
-/// it with the first repeated at the end. Every group on some cycle is on
-/// one of these.
-fn cycles(cfg: &Config, edges: &dyn Fn(&GroupSpec) -> Vec<String>) -> Vec<Vec<String>> {
-    let mut walk = Walk {
-        specs: &cfg.group_specs,
-        index: cfg
-            .group_specs
+    });
+    let cyclic = on_cycles(&adj);
+    let mut seen: HashSet<Vec<usize>> = HashSet::new();
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for (i, &is_cyclic) in cyclic.iter().enumerate() {
+        if !is_cyclic {
+            continue;
+        }
+        let path = shortest_cycle(&adj, i);
+        let min_pos = (0..path.len())
+            .min_by_key(|&p| path[p])
+            .expect("a cycle has at least one node");
+        let rotated: Vec<usize> = path[min_pos..]
             .iter()
-            .enumerate()
-            .map(|(i, g)| (g.name.as_str(), i))
-            .collect(),
-        edges,
-        colour: vec![Colour::New; cfg.group_specs.len()],
-        stack: Vec::new(),
-        found: Vec::new(),
-    };
-    for i in 0..cfg.group_specs.len() {
-        if walk.colour[i] == Colour::New {
-            walk.visit(i);
+            .chain(&path[..min_pos])
+            .copied()
+            .collect();
+        if seen.insert(rotated.clone()) {
+            let mut names: Vec<String> = rotated
+                .iter()
+                .map(|&n| cfg.group_specs[n].name.clone())
+                .collect();
+            names.push(names[0].clone());
+            out.push(names);
         }
     }
-    walk.found
+    out
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Colour {
-    New,
-    OnStack,
-    Done,
-}
-
-struct Walk<'a> {
-    specs: &'a [GroupSpec],
-    index: HashMap<&'a str, usize>,
-    edges: &'a dyn Fn(&GroupSpec) -> Vec<String>,
-    colour: Vec<Colour>,
-    stack: Vec<usize>,
-    found: Vec<Vec<String>>,
-}
-
-impl Walk<'_> {
-    fn visit(&mut self, i: usize) {
-        self.colour[i] = Colour::OnStack;
-        self.stack.push(i);
-        for next in (self.edges)(&self.specs[i]) {
-            let Some(&j) = self.index.get(next.as_str()) else {
-                continue;
-            };
-            match self.colour[j] {
-                Colour::New => self.visit(j),
-                Colour::OnStack => {
-                    let from = self
-                        .stack
-                        .iter()
-                        .position(|&k| k == j)
-                        .expect("a group on the stack");
-                    let mut cycle: Vec<String> = self.stack[from..]
-                        .iter()
-                        .map(|&k| self.specs[k].name.clone())
-                        .collect();
-                    cycle.push(self.specs[j].name.clone());
-                    self.found.push(cycle);
+/// Which of the nodes `0..adj.len()` lie on a cycle along `adj`: those whose
+/// strongly connected component holds another node too, or that have an
+/// edge to themselves. Tarjan's algorithm, iterative, so that a chain of
+/// 10 000 imports cannot overflow the stack.
+fn on_cycles(adj: &[Vec<usize>]) -> Vec<bool> {
+    const NEW: usize = usize::MAX;
+    let n = adj.len();
+    let mut index = vec![NEW; n];
+    let mut low = vec![0; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut cyclic = vec![false; n];
+    let mut next = 0;
+    for root in 0..n {
+        if index[root] != NEW {
+            continue;
+        }
+        // (node, how many of its edges have been followed)
+        let mut work = vec![(root, 0)];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(&(v, followed)) = work.last() {
+            if let Some(&w) = adj[v].get(followed) {
+                if let Some(top) = work.last_mut() {
+                    top.1 += 1;
                 }
-                Colour::Done => {}
+                if index[w] == NEW {
+                    index[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(u, _)) = work.last() {
+                low[u] = low[u].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let mut component = Vec::new();
+                loop {
+                    let w = stack.pop().expect("v is still on the stack");
+                    on_stack[w] = false;
+                    component.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                let round = component.len() > 1 || adj[v].contains(&v);
+                for w in component {
+                    cyclic[w] = round;
+                }
             }
         }
-        self.stack.pop();
-        self.colour[i] = Colour::Done;
     }
+    cyclic
+}
+
+/// The groups as nodes (in declaration order), each with its edges along
+/// `edges`; names that are not groups are left out.
+fn group_graph(cfg: &Config, edges: &dyn Fn(&GroupSpec) -> Vec<String>) -> Vec<Vec<usize>> {
+    let index: HashMap<&str, usize> = cfg
+        .group_specs
+        .iter()
+        .enumerate()
+        .map(|(i, g)| (g.name.as_str(), i))
+        .collect();
+    cfg.group_specs
+        .iter()
+        .map(|g| {
+            edges(g)
+                .iter()
+                .filter_map(|n| index.get(n.as_str()).copied())
+                .collect()
+        })
+        .collect()
+}
+
+/// A shortest way from `start` back to itself, as the nodes along it,
+/// `start` first and not repeated; `start` is known to be on a cycle.
+fn shortest_cycle(adj: &[Vec<usize>], start: usize) -> Vec<usize> {
+    let mut parent: Vec<Option<usize>> = vec![None; adj.len()];
+    let mut queue = VecDeque::from([start]);
+    while let Some(v) = queue.pop_front() {
+        for &w in &adj[v] {
+            if w == start {
+                let mut path = vec![v];
+                let mut at = v;
+                while at != start {
+                    at = parent[at].expect("every node queued has a parent");
+                    path.push(at);
+                }
+                path.reverse();
+                return path;
+            }
+            if parent[w].is_none() {
+                parent[w] = Some(v);
+                queue.push_back(w);
+            }
+        }
+    }
+    vec![start]
 }
 
 #[cfg(test)]
@@ -683,11 +833,11 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
             [
                 (
                     codes::W_SET_LINES_SKIPPED,
-                    "policy group `G`: `policy-path` line 1: policy `Bad`: invalid value `999` for `tos` (expected 0-255 or 0x00-0xff); skipped".to_string()
+                    "policy group `G`: `policy-path` line 1: policy `Bad` has a parameter whose value cannot be used (E0018); skipped".to_string()
                 ),
                 (
                     codes::W_SET_LINES_SKIPPED,
-                    "policy group `G`: `policy-path` line 2: policy `Up`: `underlying-proxy` references unknown policy `Nowhere`; skipped".to_string()
+                    "policy group `G`: `policy-path` line 2: policy `Up` has an `underlying-proxy` that names no policy (E0007); skipped".to_string()
                 ),
                 (
                     codes::W_PROTOCOL_NOT_IMPLEMENTED,
@@ -773,6 +923,160 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
                 ),
             ]
         );
+    }
+
+    /// Whichever member order a group's own line lists, the same cycles are
+    /// found: F1 fixed a strongly-connected-component hole where a group
+    /// reached only through a cross edge (like `B` here) went unlisted.
+    #[test]
+    fn every_group_on_a_cycle_is_listed_whatever_the_member_order() {
+        for r in ["R = select, A, B", "R = select, B, A"] {
+            let cfg = profile(
+                "X = http, x.test, 80",
+                &format!("{r}\nA = select, R\nB = select, A, X"),
+            );
+            let a = assemble(&cfg, &Snapshots::new());
+            assert_eq!(
+                a.cycles,
+                vec![vec!["R", "A", "R"], vec!["R", "B", "A", "R"]],
+                "{r}"
+            );
+        }
+    }
+
+    /// A group on an `include-other-group` cycle gives its members to
+    /// nobody — the cycle would have no end — and F1 also fixed the
+    /// cross-edge hole for this graph (`B` reaches the cycle only via `A`).
+    #[test]
+    fn a_group_on_an_include_cycle_gives_its_members_to_nobody() {
+        let cfg = profile(
+            "X1 = http, x1.test, 80\nX2 = http, x2.test, 80",
+            "R = select, DIRECT, include-other-group=\"A,B\"\n\
+A = select, X1, include-other-group=R\nB = select, X2, include-other-group=A",
+        );
+        let a = assemble(&cfg, &Snapshots::new());
+        assert_eq!(members(&a, "R"), ["DIRECT"]);
+        assert_eq!(members(&a, "A"), ["X1"]);
+        assert_eq!(members(&a, "B"), ["X2"]);
+        assert_eq!(
+            a.cycles,
+            vec![vec!["R", "A", "R"], vec!["R", "B", "A", "R"]]
+        );
+    }
+
+    /// A modifier value (here `headers=Authorization Bearer s3cr3tT0ken`)
+    /// never reaches a diagnostic, whatever `to_spec` rejected it for
+    /// (M3-D7): F2 replaced the quoted `to_spec` message with a fixed
+    /// phrase per diagnostic code.
+    #[test]
+    fn a_skipped_line_is_said_without_its_values() {
+        let cfg = profile(
+            "A = http, a.test, 80",
+            "G = select, A, policy-path=https://sub.test/g, \
+external-policy-modifier=\"headers=Authorization Bearer s3cr3tT0ken\"",
+        );
+        let a = assemble(
+            &cfg,
+            &snapshots(
+                &cfg,
+                &[("G", "N = http, n.test, 80\nM = http, m.test, 80, tos=0x1ff")],
+            ),
+        );
+        assert_eq!(members(&a, "G"), ["A"]);
+        assert_eq!(
+            warnings(&a),
+            [
+                (
+                    codes::W_SET_LINES_SKIPPED,
+                    "policy group `G`: `policy-path` line 1: policy `N` has a parameter whose value cannot be used (E0018); skipped".to_string()
+                ),
+                (
+                    codes::W_SET_LINES_SKIPPED,
+                    "policy group `G`: `policy-path` line 2: policy `M` has a parameter whose value cannot be used (E0018); skipped".to_string()
+                ),
+            ]
+        );
+        for (_, message) in warnings(&a) {
+            for secret in ["s3cr3t", "Bearer", "0x1ff"] {
+                assert!(!message.contains(secret), "{message}");
+            }
+        }
+    }
+
+    /// An import whose relay was itself left out — because it formed a
+    /// cycle, or because one of its own parameters was invalid — would dial
+    /// nowhere on its own: F3 leaves it out too, in as many rounds as a
+    /// chain needs.
+    #[test]
+    fn an_import_that_chains_through_one_left_out_is_left_out_too() {
+        let cfg = profile(
+            "A = http, a.test, 80",
+            "Pool = select, policy-path=https://sub.test/p\n\
+All = select, A, include-other-group=Pool",
+        );
+        let a = assemble(
+            &cfg,
+            &snapshots(
+                &cfg,
+                &[(
+                    "Pool",
+                    "I1 = http, i1.test, 80, underlying-proxy=I2\n\
+I2 = http, i2.test, 80, underlying-proxy=I3\n\
+I3 = http, i3.test, 80, underlying-proxy=I2\n\
+J1 = http, j1.test, 80, underlying-proxy=J2\n\
+J2 = http, j2.test, 80, tos=999\n\
+Me = http, me.test, 80, underlying-proxy=Me\n\
+Fine = http, f.test, 80",
+                )],
+            ),
+        );
+        assert_eq!(members(&a, "Pool"), ["Fine"]);
+        assert_eq!(members(&a, "All"), ["A", "Fine"]);
+        let imported: Vec<&str> = a.imported.iter().map(|i| i.policy.name.as_str()).collect();
+        assert_eq!(imported, ["Fine"]);
+        assert_eq!(
+            warnings(&a),
+            [
+                (
+                    codes::W_SET_LINES_SKIPPED,
+                    "policy group `Pool`: `policy-path` line 5: policy `J2` has a parameter whose value cannot be used (E0018); skipped".to_string()
+                ),
+                (
+                    codes::W_SET_LINES_SKIPPED,
+                    "policy group `Pool`: `policy-path` line 2: the `underlying-proxy` of `I2` leads back to the policy itself; skipped".to_string()
+                ),
+                (
+                    codes::W_SET_LINES_SKIPPED,
+                    "policy group `Pool`: `policy-path` line 3: the `underlying-proxy` of `I3` leads back to the policy itself; skipped".to_string()
+                ),
+                (
+                    codes::W_SET_LINES_SKIPPED,
+                    "policy group `Pool`: `policy-path` line 6: the `underlying-proxy` of `Me` leads back to the policy itself; skipped".to_string()
+                ),
+                (
+                    codes::W_SET_LINES_SKIPPED,
+                    "policy group `Pool`: `policy-path` line 1: the `underlying-proxy` of `I1` names a policy that was left out; skipped".to_string()
+                ),
+                (
+                    codes::W_SET_LINES_SKIPPED,
+                    "policy group `Pool`: `policy-path` line 4: the `underlying-proxy` of `J1` names a policy that was left out; skipped".to_string()
+                ),
+            ]
+        );
+    }
+
+    /// Existing behaviour, pinned: a member taken from another group by
+    /// `include-other-group` is still checked against this group's own
+    /// `policy-regex-filter`.
+    #[test]
+    fn members_taken_from_another_group_pass_the_filter() {
+        let cfg = profile(
+            "HK1 = http, hk1.test, 80\nUS1 = http, us1.test, 80",
+            "H = select, HK1, US1\n\
+G = select, DIRECT, include-other-group=H, policy-regex-filter=^HK",
+        );
+        let a = assemble(&cfg, &Snapshots::new());
+        assert_eq!(members(&a, "G"), ["DIRECT", "HK1"]);
     }
 
     #[test]

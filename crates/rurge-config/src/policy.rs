@@ -4,7 +4,7 @@ use crate::diagnostic::{ParseError, codes};
 use crate::glob::{Glob, GlobOptions};
 use crate::span::Span;
 use crate::types::HostName;
-use crate::value::{ParamMap, parse_key_value, split_list, strip_prefix_ci};
+use crate::value::{ParamMap, parse_key_value, split_list, strip_prefix_ci, unquote};
 use std::collections::HashSet;
 use std::net::IpAddr;
 
@@ -251,17 +251,28 @@ pub fn with_params(definition: &str, overrides: &[(String, String)]) -> String {
     out.join(",")
 }
 
-/// `value` as a line has to spell it to read it back the same: quoted when
-/// the list splitter would act on anything in it.
+/// `value` as a line has to spell it to read it back the same. The parser
+/// unquotes a `key="value"` item twice — as a list field, then as a
+/// parameter value after trimming it — so a value that the second pass
+/// would change (one wrapped in quotes, or with blanks at either end) is
+/// quoted twice.
 fn param_value(value: &str) -> String {
     let plain = !value.is_empty()
         && value.trim() == value
         && !value.contains([',', '"', '\'', '(', ')', '\\']);
     if plain {
-        value.to_string()
-    } else {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+        return value.to_string();
     }
+    let once = quoted(value);
+    if unquote(value.trim()) == value {
+        once
+    } else {
+        quoted(&once)
+    }
+}
+
+fn quoted(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -674,12 +685,18 @@ mod tests {
                 ("password", "a,b\"c\\d"),
                 ("headers", "X-A:1|X-B:(2)"),
                 ("sni", ""),
+                ("single", "'abc'"),
+                ("double", "\"abc\""),
+                ("spaced", " padded "),
             ]),
         );
         let p = parse_policy("P", &line, &span()).unwrap();
         assert_eq!(p.params.get("password"), Some("a,b\"c\\d"));
         assert_eq!(p.params.get("headers"), Some("X-A:1|X-B:(2)"));
         assert_eq!(p.params.get("sni"), Some(""));
+        assert_eq!(p.params.get("single"), Some("'abc'"));
+        assert_eq!(p.params.get("double"), Some("\"abc\""));
+        assert_eq!(p.params.get("spaced"), Some(" padded "));
         assert_eq!(p.positional, ["alice", "s3cret"]);
     }
 }
