@@ -17,5 +17,5 @@ pub(crate) mod testing;
 pub use assemble::{Assembly, Snapshots, assemble};
 pub use cell::{ChainConnector, RegistryCell};
 pub use factory::{BuildError, OutboundFactory};
-pub use registry::{Note, PolicyRegistry, Resolution, TerminalKind};
+pub use registry::{EmptyGroup, GroupInfo, Line, Note, PolicyRegistry, Resolution, TerminalKind};
 pub use selections::{GroupSelections, SelectionTable};

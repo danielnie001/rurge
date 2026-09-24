@@ -116,10 +116,12 @@ mod tests {
         Arc::new(
             PolicyRegistry::build(
                 &loaded.config,
+                &crate::assemble(&loaded.config, &crate::Snapshots::new()),
                 &factory,
                 &RegistryCell::new(),
                 Arc::new(crate::selections::SelectionTable::default()),
                 None,
+                crate::EmptyGroup::Direct,
             )
             .expect("builds"),
         )

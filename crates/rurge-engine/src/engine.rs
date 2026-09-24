@@ -789,10 +789,11 @@ impl Dialer for Engine {
             };
             let resolution = rt.policies.resolve(&policy);
             handle.set_policy_chain(resolution.chain.clone());
-            if let Some(rurge_policy::Note::Unsupported(kind)) = &resolution.note {
-                // The policy is sound but rurge cannot speak it yet, so the
-                // outbound below is REJECT; say so in the session log (§7.2).
-                handle.set_error(format!("policy protocol not implemented: {kind}"));
+            if let Some(note) = &resolution.note {
+                // A protocol rurge cannot speak yet, a group cycle, a group
+                // without members: say why in the session log (§7.2; phase 2
+                // M3 design 5.6).
+                handle.set_error(note.to_string());
             }
             let mut target =
                 Target::new(handle.session().dst_host.clone(), handle.session().dst_port);

@@ -73,10 +73,12 @@ impl Runtime {
         let policies = Arc::new(
             PolicyRegistry::build(
                 &config,
+                &rurge_policy::assemble(&config, &rurge_policy::Snapshots::new()),
                 &factory,
                 &opts.shared.cell,
                 opts.shared.selections.clone(),
                 previous.as_deref(),
+                rurge_policy::EmptyGroup::Direct,
             )
             .map_err(|e| anyhow::anyhow!("cannot build the policies: {e}"))?,
         );

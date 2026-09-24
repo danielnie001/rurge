@@ -1,7 +1,9 @@
-//! Name → outbound resolution (M3 design §5, M1 design 6.2). Built once per
-//! config generation; `resolve` is a table walk with no allocation beyond the
-//! chain and the group selections it reads.
+//! Name → outbound resolution (M3 design §5, M1 design 6.2; phase 2 M3
+//! design 5.5, 5.6). Built for every config generation and every
+//! subscription update; `resolve` is a table walk with no allocation beyond
+//! the chain and the group selections it reads.
 
+use crate::assemble::Assembly;
 use crate::cell::{ChainConnector, RegistryCell};
 use crate::factory::{BuildError, OutboundFactory};
 use crate::selections::SelectionTable;
@@ -10,11 +12,13 @@ use rurge_config::spec::{CommonOpts, IpVersion, PolicySpec};
 use rurge_config::{Builtin, Config, GroupKind, KeystoreType, PolicyKind, Span};
 use rurge_net::connector::Connector;
 use rurge_proto::{Direct, OutboundRef, Reject, RejectKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Deeper chains than this are treated as a defect (group cycles are load errors).
+/// Deeper chains than this are treated as a defect (a group cycle resolves
+/// to REJECT before it gets that deep).
 pub const MAX_DEPTH: usize = 16;
 
 /// What kind of outbound a resolution ended at.
@@ -31,6 +35,63 @@ pub enum Note {
     /// The terminal policy's protocol keyword (or `DEVICE`) is not
     /// implemented in this version: the outbound is REJECT.
     Unsupported(String),
+    /// A group on a cycle of groups, written out (`A → B → A`): REJECT.
+    GroupCycle(String),
+    /// A group without members; `substituted` when DIRECT stood in for it.
+    EmptyGroup { substituted: bool },
+}
+
+/// What the session log says (M3 design 5.6).
+impl fmt::Display for Note {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Note::Unsupported(kind) => write!(f, "policy protocol not implemented: {kind}"),
+            Note::GroupCycle(cycle) => write!(f, "policy group cycle: {cycle}"),
+            Note::EmptyGroup { substituted: true } => {
+                f.write_str("policy group has no members; DIRECT substituted")
+            }
+            Note::EmptyGroup { substituted: false } => f.write_str("policy group has no members"),
+        }
+    }
+}
+
+/// What a group without members resolves to (M3-D3): DIRECT, as in Surge,
+/// unless `--empty-group-reject` asks for REJECT.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EmptyGroup {
+    #[default]
+    Direct,
+    Reject,
+}
+
+/// How a policy or group is written, for the control plane. Secrets
+/// included: whoever shows it redacts it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Line {
+    pub is_group: bool,
+    /// A policy's type keyword or a group's kind keyword.
+    pub keyword: &'static str,
+    /// Right of `name =`: as written, as imported, or — for `M (via R)` —
+    /// M's with `underlying-proxy` set.
+    pub definition: String,
+}
+
+impl Line {
+    fn policy(kind: PolicyKind, definition: &str) -> Line {
+        Line {
+            is_group: false,
+            keyword: kind.keyword(),
+            definition: definition.to_string(),
+        }
+    }
+}
+
+/// A group as the control plane shows it.
+pub struct GroupInfo<'a> {
+    pub kind: GroupKind,
+    pub hidden: bool,
+    /// As assembled.
+    pub members: &'a [String],
 }
 
 #[derive(Clone)]
@@ -62,15 +123,36 @@ enum Entry {
     Group {
         kind: GroupKind,
         members: Vec<String>,
+        hidden: bool,
+        /// The cycle it is on, written out: it resolves to REJECT.
+        cycle: Option<String>,
     },
 }
 
 pub struct PolicyRegistry {
     entries: HashMap<String, Entry>,
     order: Vec<String>,
+    lines: HashMap<String, Line>,
     direct: OutboundRef,
     rejects: [OutboundRef; 4],
     selections: Arc<SelectionTable>,
+    empty_group: EmptyGroup,
+}
+
+/// What `build` fills in, name by name.
+#[derive(Default)]
+struct Table {
+    entries: HashMap<String, Entry>,
+    order: Vec<String>,
+    lines: HashMap<String, Line>,
+}
+
+impl Table {
+    fn add(&mut self, name: &str, entry: Entry, line: Line) {
+        self.entries.insert(name.to_string(), entry);
+        self.order.push(name.to_string());
+        self.lines.insert(name.to_string(), line);
+    }
 }
 
 fn reject_slot(kind: RejectKind) -> usize {
@@ -155,6 +237,21 @@ fn build_one(
         .map_err(|e| BuildError::new(format!("policy `{}`: {}", spec.name, e.message)))
 }
 
+/// Every group on a cycle, with the cycle written out; each cycle is said
+/// once per build.
+fn on_cycle(assembly: &Assembly) -> HashMap<&str, String> {
+    let mut out = HashMap::new();
+    for cycle in &assembly.cycles {
+        let text = cycle.join(" → ");
+        tracing::warn!(cycle = %text, "policy group cycle; the groups on it behave as REJECT");
+        // the last group is the first one again
+        for group in &cycle[..cycle.len().saturating_sub(1)] {
+            out.entry(group.as_str()).or_insert_with(|| text.clone());
+        }
+    }
+    out
+}
+
 impl PolicyRegistry {
     /// `cell` is where the chain connectors built here will look the
     /// registry up at dial time; the caller stores the result into it.
@@ -162,19 +259,21 @@ impl PolicyRegistry {
     /// fingerprint did not change keeps the outbound it had there, pools and
     /// all (M2 design 7.1). `previous` must have been built against this same
     /// `cell`: a reused outbound keeps the chain connectors it was built
-    /// with, and they resolve through that cell.
+    /// with, and they resolve through that cell. The groups take their
+    /// members from `assembly`, which also brings the imported and the
+    /// derived policies (M3 design 5.5).
     pub fn build(
         cfg: &Config,
+        assembly: &Assembly,
         factory: &dyn OutboundFactory,
         cell: &Arc<RegistryCell>,
         selections: Arc<SelectionTable>,
         previous: Option<&PolicyRegistry>,
+        empty_group: EmptyGroup,
     ) -> Result<PolicyRegistry, BuildError> {
         let direct: OutboundRef = Arc::new(Direct::new(
             factory.direct_connector(&CommonOpts::default()),
         ));
-        let mut entries = HashMap::new();
-        let mut order = Vec::new();
         let environment = factory.environment();
         let outbound_entry = |spec: &PolicySpec, proxy: bool| -> Result<Entry, BuildError> {
             let fingerprint = fingerprint(spec, cfg, &environment);
@@ -196,28 +295,88 @@ impl PolicyRegistry {
                 fingerprint: Box::new(fingerprint),
             })
         };
-        for p in &cfg.policies {
-            let entry = match (alias_terminal(p.kind), cfg.spec(&p.name)) {
+        let policy_entry = |kind: PolicyKind, spec: Option<&PolicySpec>| {
+            Ok::<Entry, BuildError>(match (alias_terminal(kind), spec) {
                 (Some(Terminal::Direct), Some(spec)) if has_socket_opts(&spec.common) => {
                     outbound_entry(spec, false)?
                 }
                 (Some(terminal), _) => Entry::Alias(terminal),
                 (None, Some(spec)) => outbound_entry(spec, true)?,
                 // no spec: a protocol of a later milestone
-                (None, None) => Entry::Unsupported { kind: p.kind },
-            };
-            entries.insert(p.name.clone(), entry);
-            order.push(p.name.clone());
+                (None, None) => Entry::Unsupported { kind },
+            })
+        };
+        let mut table = Table::default();
+        // The profile's own policies: the dry build has made a failure here a
+        // load error, so one fails the whole generation.
+        for p in &cfg.policies {
+            let entry = policy_entry(p.kind, cfg.spec(&p.name))?;
+            table.add(&p.name, entry, Line::policy(p.kind, &p.definition));
         }
-        for g in &cfg.groups {
-            entries.insert(
-                g.name.clone(),
-                Entry::Group {
-                    kind: g.kind,
-                    members: g.members.clone(),
-                },
-            );
-            order.push(g.name.clone());
+        // What subscriptions brought in and the `M (via R)` of relayed groups:
+        // a failure leaves that policy out and nothing else (M3-D6).
+        let left_out = |name: &str, e: BuildError| {
+            tracing::warn!(policy = %name, error = %e.message, "policy cannot be built; it is left out");
+        };
+        for i in &assembly.imported {
+            match policy_entry(i.policy.kind, i.spec.as_ref()) {
+                Ok(entry) => table.add(
+                    &i.policy.name,
+                    entry,
+                    Line::policy(i.policy.kind, &i.policy.definition),
+                ),
+                Err(e) => left_out(&i.policy.name, e),
+            }
+        }
+        for d in &assembly.derived {
+            match outbound_entry(&d.spec, true) {
+                Ok(entry) => table.add(
+                    &d.spec.name,
+                    entry,
+                    Line::policy(d.spec.kind, &d.definition),
+                ),
+                Err(e) => left_out(&d.spec.name, e),
+            }
+        }
+        let on_cycle = on_cycle(assembly);
+        let groups: HashSet<&str> = cfg.group_specs.iter().map(|g| g.name.as_str()).collect();
+        for g in &cfg.group_specs {
+            // a member whose policy was left out is left out too
+            let members: Vec<String> = assembly
+                .members_of(&g.name)
+                .iter()
+                .filter(|m| {
+                    groups.contains(m.as_str())
+                        || table.entries.contains_key(m.as_str())
+                        || !matches!(PolicyRef::parse(m), PolicyRef::Named(_))
+                })
+                .cloned()
+                .collect();
+            let cycle = on_cycle.get(g.name.as_str()).cloned();
+            if cycle.is_none() && members.is_empty() {
+                let note = Note::EmptyGroup {
+                    substituted: empty_group == EmptyGroup::Direct,
+                };
+                tracing::warn!(group = %g.name, "{note}");
+            }
+            let definition = cfg
+                .groups
+                .iter()
+                .find(|written| written.name == g.name)
+                .map(|written| written.definition.clone())
+                .unwrap_or_default();
+            let line = Line {
+                is_group: true,
+                keyword: g.kind.keyword(),
+                definition,
+            };
+            let entry = Entry::Group {
+                kind: g.kind,
+                members,
+                hidden: g.hidden,
+                cycle,
+            };
+            table.add(&g.name, entry, line);
         }
         let rejects = [
             Arc::new(Reject::new(RejectKind::Reject)) as OutboundRef,
@@ -226,11 +385,13 @@ impl PolicyRegistry {
             Arc::new(Reject::new(RejectKind::TinyGif)) as OutboundRef,
         ];
         Ok(PolicyRegistry {
-            entries,
-            order,
+            entries: table.entries,
+            order: table.order,
+            lines: table.lines,
             direct,
             rejects,
             selections,
+            empty_group,
         })
     }
 
@@ -253,11 +414,65 @@ impl PolicyRegistry {
         self.order.iter().any(|n| n == name)
     }
 
+    /// Every policy that is not a group, in the order they were built: the
+    /// profile's, the imported ones, then the derived ones.
+    pub fn policy_names(&self) -> Vec<String> {
+        self.order
+            .iter()
+            .filter(|n| !matches!(self.entries.get(n.as_str()), Some(Entry::Group { .. })))
+            .cloned()
+            .collect()
+    }
+
+    /// Every group, in profile order.
+    pub fn group_names(&self) -> Vec<String> {
+        self.order
+            .iter()
+            .filter(|n| matches!(self.entries.get(n.as_str()), Some(Entry::Group { .. })))
+            .cloned()
+            .collect()
+    }
+
+    pub fn group(&self, name: &str) -> Option<GroupInfo<'_>> {
+        match self.entries.get(name)? {
+            Entry::Group {
+                kind,
+                members,
+                hidden,
+                ..
+            } => Some(GroupInfo {
+                kind: *kind,
+                hidden: *hidden,
+                members,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The members of `group` as assembled; `None` when it is not a group.
+    pub fn members(&self, group: &str) -> Option<&[String]> {
+        self.group(group).map(|g| g.members)
+    }
+
+    /// How `name` is written; `None` for a built-in.
+    pub fn line(&self, name: &str) -> Option<&Line> {
+        self.lines.get(name)
+    }
+
+    /// What `name` was built from: a proxy, or a `direct` alias with socket
+    /// options of its own.
+    pub fn spec(&self, name: &str) -> Option<&PolicySpec> {
+        match self.entries.get(name)? {
+            Entry::Outbound { fingerprint, .. } => Some(&fingerprint.spec),
+            _ => None,
+        }
+    }
+
     /// The member `group` points at right now: the live selection of a
     /// `select` group when it still names a member, else the first member.
     /// `None` when `group` is not a group or has no members.
     pub fn current_member(&self, group: &str) -> Option<String> {
-        let Some(Entry::Group { kind, members }) = self.entries.get(group) else {
+        let Some(Entry::Group { kind, members, .. }) = self.entries.get(group) else {
             return None;
         };
         let selected = (*kind == GroupKind::Select)
@@ -336,20 +551,31 @@ impl PolicyRegistry {
                 chain.push(format!("!unsupported:{}", kind.keyword()));
                 self.rejected(chain, Some(Note::Unsupported(unsupported_text(*kind))))
             }
+            Some(Entry::Group {
+                cycle: Some(cycle), ..
+            }) => self.rejected(chain, Some(Note::GroupCycle(cycle.clone()))),
             Some(Entry::Group { .. }) => match self.current_member(name) {
                 Some(member) => match PolicyRef::parse(&member) {
                     PolicyRef::Builtin(b) => self.builtin(b, chain),
                     PolicyRef::Device(d) => self.device(&d, chain),
                     PolicyRef::Named(n) => self.named(&n, chain, depth + 1),
                 },
-                None => {
-                    tracing::error!(
-                        group = name,
-                        "policy group has no members; treating as REJECT"
-                    );
-                    self.rejected(chain, None)
-                }
+                None => self.empty(chain),
             },
+        }
+    }
+
+    /// A group without members: DIRECT stands in, or REJECT (M3-D3).
+    fn empty(&self, chain: &mut Vec<String>) -> Resolution {
+        match self.empty_group {
+            EmptyGroup::Direct => {
+                chain.push("DIRECT".to_string());
+                let note = Note::EmptyGroup { substituted: true };
+                self.done(chain, self.direct(), TerminalKind::Direct, Some(note))
+            }
+            EmptyGroup::Reject => {
+                self.rejected(chain, Some(Note::EmptyGroup { substituted: false }))
+            }
         }
     }
 
@@ -382,7 +608,9 @@ impl PolicyRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assemble::{Snapshots, assemble};
     use crate::selections::GroupSelections;
+    use crate::subscription;
     use crate::testing::FakeFactory;
     use rurge_config::HostName;
     use rurge_config::config::{LoadOptions, from_text};
@@ -420,8 +648,16 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
         let cell = RegistryCell::new();
         let table = Arc::new(SelectionTable::new(selections));
         let registry = Arc::new(
-            PolicyRegistry::build(&loaded.config, &factory, &cell, table.clone(), None)
-                .expect("builds"),
+            PolicyRegistry::build(
+                &loaded.config,
+                &assemble(&loaded.config, &Snapshots::new()),
+                &factory,
+                &cell,
+                table.clone(),
+                None,
+                EmptyGroup::Direct,
+            )
+            .expect("builds"),
         );
         cell.store(registry.clone());
         Built {
@@ -657,10 +893,12 @@ SS = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Rule]\nFINAL,DI
         };
         let e = PolicyRegistry::build(
             &loaded.config,
+            &assemble(&loaded.config, &Snapshots::new()),
             &factory,
             &RegistryCell::new(),
             Arc::new(SelectionTable::default()),
             None,
+            EmptyGroup::Direct,
         )
         .err()
         .expect("EntryB does not build");
@@ -684,10 +922,12 @@ SS = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Rule]\nFINAL,DI
         );
         PolicyRegistry::build(
             &loaded.config,
+            &assemble(&loaded.config, &Snapshots::new()),
             factory,
             &RegistryCell::new(),
             Arc::new(SelectionTable::new(GroupSelections::new())),
             previous,
+            EmptyGroup::Direct,
         )
         .expect("builds")
     }
@@ -765,6 +1005,245 @@ B = https, b.example, 443, client-cert=cert1\nCorp = direct, interface=eth9\n\
                 "{name} survived a change of environment"
             );
         }
+    }
+
+    const SUBSCRIBED: &str = "[Proxy]\nRelay = http, r.example, 80\nA = http, a.example, 80\n\
+[Proxy Group]\nSub = select, A, policy-path=https://sub.example/nodes, underlying-proxy=Relay, hidden=true\n\
+Plain = select, DIRECT, policy-path=https://sub.example/nodes\n[Rule]\nFINAL,Sub\n";
+
+    /// One generation of `SUBSCRIBED`, the subscription serving `nodes`,
+    /// built on `previous` into `cell`.
+    fn subscribed(
+        nodes: &str,
+        factory: &FakeFactory,
+        cell: &Arc<RegistryCell>,
+        previous: Option<&PolicyRegistry>,
+    ) -> PolicyRegistry {
+        let loaded = from_text(SUBSCRIBED, Path::new("t.conf"), &LoadOptions::for_tests());
+        assert!(!loaded.diagnostics.has_errors());
+        let cfg = loaded.config;
+        let path = cfg.group_specs[0].import.policy_path.clone().unwrap();
+        let snapshots = Snapshots::from([(path, Arc::new(subscription::parse(nodes)))]);
+        PolicyRegistry::build(
+            &cfg,
+            &assemble(&cfg, &snapshots),
+            factory,
+            cell,
+            Arc::new(SelectionTable::default()),
+            previous,
+            EmptyGroup::Direct,
+        )
+        .expect("builds")
+    }
+
+    #[test]
+    fn imported_and_derived_policies_are_entries_of_their_own() {
+        let factory = FakeFactory::new();
+        let reg = subscribed(
+            "N1 = http, n1.example, 80\nN2 = socks5, n2.example, 1080",
+            &factory,
+            &RegistryCell::new(),
+            None,
+        );
+        assert_eq!(
+            reg.policy_names(),
+            [
+                "Relay",
+                "A",
+                "N1",
+                "N2",
+                "A (via Relay)",
+                "N1 (via Relay)",
+                "N2 (via Relay)"
+            ]
+        );
+        assert_eq!(reg.group_names(), ["Sub", "Plain"]);
+        let sub = reg.group("Sub").unwrap();
+        assert_eq!(
+            (sub.kind, sub.hidden, sub.members),
+            (
+                GroupKind::Select,
+                true,
+                &[
+                    "A (via Relay)".to_string(),
+                    "N1 (via Relay)".to_string(),
+                    "N2 (via Relay)".to_string()
+                ][..]
+            )
+        );
+        assert_eq!(
+            reg.members("Plain"),
+            Some(&["DIRECT".to_string(), "N1".to_string(), "N2".to_string()][..])
+        );
+        let n2 = reg.line("N2").unwrap();
+        assert_eq!(
+            (n2.is_group, n2.keyword, n2.definition.as_str()),
+            (false, "socks5", "socks5, n2.example, 1080")
+        );
+        assert_eq!(
+            reg.line("N1 (via Relay)").unwrap().definition,
+            "http, n1.example, 80, underlying-proxy=Relay"
+        );
+        assert!(reg.line("Sub").unwrap().is_group);
+        assert_eq!(reg.line("DIRECT"), None);
+        assert_eq!(
+            reg.spec("N1 (via Relay)")
+                .unwrap()
+                .common
+                .underlying_proxy
+                .as_deref(),
+            Some("Relay")
+        );
+        assert!(reg.spec("Sub").is_none());
+    }
+
+    /// A subscription update keeps every outbound whose line did not change,
+    /// the derived ones included (M3 design 5.7).
+    #[test]
+    fn an_update_keeps_the_outbounds_of_lines_that_did_not_change() {
+        let factory = FakeFactory::new();
+        let cell = RegistryCell::new();
+        let first = subscribed(
+            "N1 = http, n1.example, 80\nN2 = http, n2.example, 80",
+            &factory,
+            &cell,
+            None,
+        );
+        let second = subscribed(
+            "N1 = http, n1.example, 80\nN2 = http, moved.example, 80\nN3 = http, n3.example, 80",
+            &factory,
+            &cell,
+            Some(&first),
+        );
+        for same in ["N1", "N1 (via Relay)", "A", "A (via Relay)", "Relay"] {
+            assert!(
+                Arc::ptr_eq(&outbound_of(&first, same), &outbound_of(&second, same)),
+                "{same} was rebuilt"
+            );
+        }
+        for changed in ["N2", "N2 (via Relay)"] {
+            assert!(!Arc::ptr_eq(
+                &outbound_of(&first, changed),
+                &outbound_of(&second, changed)
+            ));
+        }
+        assert!(second.contains("N3 (via Relay)"));
+    }
+
+    #[tokio::test]
+    async fn a_derived_policy_dials_through_the_group_relay() {
+        let factory = FakeFactory::new();
+        let cell = RegistryCell::new();
+        let reg = Arc::new(subscribed(
+            "N1 = http, n1.example, 80",
+            &factory,
+            &cell,
+            None,
+        ));
+        cell.store(reg.clone());
+        let n1 = reg.resolve(&PolicyRef::parse("Sub"));
+        assert_eq!(
+            (chain(&n1), n1.terminal),
+            (vec!["Sub", "A (via Relay)"], TerminalKind::Proxy)
+        );
+        reg.resolve(&PolicyRef::parse("N1 (via Relay)"))
+            .outbound
+            .connect_tcp(
+                &Target::new(HostName::parse("site.example"), 443),
+                &ConnectOpts::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            factory.connector.seen(),
+            [
+                "N1 (via Relay) -> site.example:443",
+                "Relay -> n1.example:80",
+                "dial r.example:80",
+            ]
+        );
+        cell.clear();
+    }
+
+    #[test]
+    fn an_imported_policy_that_cannot_be_built_is_left_out() {
+        let factory = FakeFactory {
+            broken: Some("N2"),
+            ..FakeFactory::new()
+        };
+        let reg = subscribed(
+            "N1 = http, n1.example, 80\nN2 = http, n2.example, 80",
+            &factory,
+            &RegistryCell::new(),
+            None,
+        );
+        assert!(!reg.contains("N2"));
+        assert_eq!(
+            reg.members("Plain"),
+            Some(&["DIRECT".to_string(), "N1".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn a_group_on_a_cycle_rejects_and_names_the_cycle() {
+        let text = "[Proxy]\nA = http, a.example, 80\n[Proxy Group]\nP = select, Q\nQ = select, P\n\
+K = select, P, A\n[Rule]\nFINAL,K\n";
+        let reg = generation(text, &FakeFactory::new(), None);
+        let p = reg.resolve(&PolicyRef::parse("P"));
+        assert_eq!(
+            (chain(&p), p.terminal, p.note.clone()),
+            (
+                vec!["P", "REJECT"],
+                TerminalKind::Reject,
+                Some(Note::GroupCycle("P → Q → P".into()))
+            )
+        );
+        assert_eq!(p.note.unwrap().to_string(), "policy group cycle: P → Q → P");
+        let q = reg.resolve(&PolicyRef::parse("Q"));
+        assert_eq!(q.note, Some(Note::GroupCycle("P → Q → P".into())));
+        // a group that is not on it rejects only when it picks the member that is
+        let k = reg.resolve(&PolicyRef::parse("K"));
+        assert_eq!(chain(&k), vec!["K", "P", "REJECT"]);
+        assert_eq!(k.note, Some(Note::GroupCycle("P → Q → P".into())));
+    }
+
+    #[test]
+    fn an_empty_group_stands_in_direct_or_rejects() {
+        let text =
+            "[Proxy Group]\nG = select, policy-path=https://sub.example/g\n[Rule]\nFINAL,G\n";
+        let loaded = from_text(text, Path::new("t.conf"), &LoadOptions::for_tests());
+        let cfg = loaded.config;
+        let assembly = assemble(&cfg, &Snapshots::new());
+        let build = |empty_group| {
+            PolicyRegistry::build(
+                &cfg,
+                &assembly,
+                &FakeFactory::new(),
+                &RegistryCell::new(),
+                Arc::new(SelectionTable::default()),
+                None,
+                empty_group,
+            )
+            .expect("builds")
+        };
+        let direct = build(EmptyGroup::Direct).resolve(&PolicyRef::parse("G"));
+        assert_eq!(
+            (chain(&direct), direct.terminal),
+            (vec!["G", "DIRECT"], TerminalKind::Direct)
+        );
+        assert_eq!(
+            direct.note.unwrap().to_string(),
+            "policy group has no members; DIRECT substituted"
+        );
+        let reject = build(EmptyGroup::Reject).resolve(&PolicyRef::parse("G"));
+        assert_eq!(
+            (chain(&reject), reject.terminal),
+            (vec!["G", "REJECT"], TerminalKind::Reject)
+        );
+        assert_eq!(
+            reject.note.unwrap().to_string(),
+            "policy group has no members"
+        );
     }
 
     #[test]
