@@ -1198,7 +1198,7 @@ Plain = select, DIRECT, policy-path=https://sub.example/nodes\n[Rule]\nFINAL,Sub
     }
 
     /// A derived `M (via R)` that cannot be built is left out just like an
-    /// imported policy: the group keeps its other members (fix round 1, F5.1).
+    /// imported policy: the group keeps its other members.
     #[test]
     fn a_derived_policy_that_cannot_be_built_is_left_out_of_its_group() {
         let factory = FakeFactory {
@@ -1242,8 +1242,7 @@ K = select, P, A\n[Rule]\nFINAL,K\n";
     }
 
     /// A group that merely contains a cyclic member is unaffected once it
-    /// picks another: only actually landing on the cycle rejects (fix round
-    /// 1, F5.2).
+    /// picks another: only actually landing on the cycle rejects.
     #[test]
     fn a_group_that_picks_around_a_cyclic_member_is_unaffected() {
         let text = "[Proxy]\nA = http, a.example, 80\n[Proxy Group]\nP = select, Q\nQ = select, P\n\
@@ -1310,7 +1309,7 @@ K = select, P, A\n[Rule]\nFINAL,K\n";
 
     /// A group whose member is itself an empty group resolves through it to
     /// the DIRECT stand-in; picking a different, ordinary member is
-    /// unaffected by that (fix round 1, F5.3).
+    /// unaffected by that.
     #[test]
     fn a_group_whose_member_is_an_empty_group_resolves_through_the_stand_in() {
         let text = "[Proxy]\nA = http, a.example, 80\n\

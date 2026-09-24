@@ -3,7 +3,7 @@
 //! names, the profile's proxies (`include-all-proxies`) and the policies of
 //! its `policy-path`. Pure: no network, no disk.
 
-use crate::subscription::{MAX_POLICIES, Subscription};
+use crate::subscription::{MAX_LINES, MAX_POLICIES, Subscription};
 use rurge_config::Config;
 use rurge_config::diagnostic::{Diagnostic, Diagnostics, Severity, codes};
 use rurge_config::policy::{PolicyKind, ProxyPolicy, parse_policy, with_params};
@@ -104,11 +104,20 @@ fn report(group: &GroupSpec, sub: &Subscription, diags: &mut Diagnostics) {
             format!("`policy-path` line {line} skipped: {reason}"),
         ));
     }
+    if sub.skipped_more > 0 {
+        diags.push(warn(
+            group,
+            codes::W_SET_LINES_SKIPPED,
+            format!("`policy-path`: {} more lines skipped", sub.skipped_more),
+        ));
+    }
     if sub.truncated {
         diags.push(warn(
             group,
             codes::W_SET_TRUNCATED,
-            format!("`policy-path` holds more than {MAX_POLICIES} policies; the rest are ignored"),
+            format!(
+                "`policy-path` holds more than {MAX_POLICIES} policies or {MAX_LINES} lines; the rest are ignored"
+            ),
         ));
     }
     if sub.policies.is_empty() {
@@ -1007,6 +1016,21 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
             )]
         );
         assert!(a.diagnostics.iter().all(|d| !d.message.contains("t0k3n")));
+    }
+
+    /// A subscription that is a flood of junk makes a bounded number of
+    /// diagnostics, however many lines it has.
+    #[test]
+    fn a_flood_of_bad_lines_makes_a_bounded_number_of_diagnostics() {
+        let cfg = profile("", "G = select, DIRECT, policy-path=https://sub.test/g");
+        let text = "x\n".repeat(150_000);
+        let a = assemble(&cfg, &snapshots(&cfg, &[("G", &text)]));
+        assert_eq!(members(&a, "G"), ["DIRECT"]);
+        assert!(
+            a.diagnostics.len() <= subscription::MAX_SKIPPED_LISTED + 3,
+            "{}",
+            a.diagnostics.len()
+        );
     }
 
     #[test]
