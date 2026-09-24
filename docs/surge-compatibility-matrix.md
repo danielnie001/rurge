@@ -453,14 +453,14 @@
 | `category` | 全部（iOS 5.23 / Mac 6.10+） | 界面分类；不影响路由。M3a 起接受，不报诊断 | 🔁 | 2 |
 | `url`（旧参数） | 自动类型组 | 当前版本无效；M3a 起报 `W0006`，提示改用策略的 `test-url` 或 `proxy-test-url` | 🔁 | 2 |
 | `underlying-proxy` | 全部（iOS 5.22 / Mac 6.9+） | 策略名；整组链式代理，派生策略名 `Name (via Relay)`。M3a 已实现：组上的中继覆盖成员自己的；组、内置策略与 `direct` / `reject` 别名成员原样保留；经 `include-other-group` 取到的是未派生的成员；派生名已被占用时略去该成员并告警（不绕过中继）；经它绕回本组是 `E0019` | ✅ | 2 |
-| `policy-path` | 除 subnet 外 | 文件路径或 URL；内容为策略行列表或含 `[Proxy]` 的完整配置；远程缓存并定期更新。M3a 已实现，差异：只接受 Surge 格式（Clash / base64 解析不出策略时告警）；下载经 rurge 自己的直连，不经代理（未与 Surge 核对）；值在 `profiles/current` 与 `policies/detail` 里脱敏，日志只写组名、不写 URL；单个订阅最多 10 000 条策略；首次下载不阻塞启动（组先按空组兜底），已有缓存时启动与重载同步载入；订阅更新只重建策略表（没变的成员沿用原出站），不打断无关的连接；坏行、重名、与配置同名的行跳过并告警（只报行号与原因） | 🟡 | 2 |
+| `policy-path` | 除 subnet 外 | 文件路径或 URL；内容为策略行列表或含 `[Proxy]` 的完整配置；远程缓存并定期更新。M3a 已实现，差异：只接受 Surge 格式（Clash / base64 解析不出策略时告警）；下载经 rurge 自己的直连，不经代理（未与 Surge 核对）；下载请求带 `User-Agent: rurge/<版本>`（不含 "Surge" 字样）——按 UA 选格式的机场面板（如 V2Board）可能因此返回非 Surge 格式的正文（组按空组兜底并提示"可能不是 Surge 格式"），订阅链接自带的格式参数（如 V2Board 的 `flag=surge`）能避开这个问题，这一点等项目所有者决定是否让 UA 带上 Surge 兼容标识；值在 `profiles/current` 与 `policies/detail` 里脱敏，日志只写组名、不写 URL；单个订阅最多 10 000 条策略、只读前 100 000 行；跳过的行只逐条报前 20 条，其余合计一条；首次下载不阻塞启动（组先按空组兜底），已有缓存时启动与重载同步载入；订阅更新只重建策略表（没变的成员沿用原出站），不打断无关的连接；坏行、重名、与配置同名的行跳过并告警（只报行号与原因） | 🟡 | 2 |
 | `update-interval` | 同上 | 秒；默认 86400；M3a 已实现（几个组共用一个来源时取最短的） | ✅ | 2 |
 | `policy-regex-filter` | 同上 | 正则；作用于导入成员，不作用于显式成员；M3a 已实现（`fancy-regex` 语法，与 URL-REGEX 相同；订阅成员按加前缀之前的原名过滤） | ✅ | 2 |
 | `external-policy-modifier` | 同上 | 引号包裹的 `key=value` 列表；覆盖导入策略参数；M3a 已实现（在文本层改写导入行：同名参数原地替换、没有的追加）；值可能含凭据，在 `profiles/current` 与 `policies/detail` 里整体脱敏 | ✅ | 2 |
 | `external-policy-name-prefix` | 同上 | 前缀（不能含 `=`）；M3a 已实现 | ✅ | 2 |
 | `include-all-proxies` | 同上（iOS 4.12 / Mac 4.5+） | 布尔；含 `[Proxy]` 全部代理策略，不含内置与组；M3a 已实现（也不含 `direct` / `reject` 别名） | ✅ | 2 |
 | `include-other-group` | 同上 | `"g1,g2"`；递归展开；M3a 已实现（引用未知的组是 `E0008`；成环的组不展开给别人） | ✅ | 2 |
-| 成员装配顺序 | 显式成员 → `include-other-group` → `include-all-proxies` → `policy-path`；重名保留首个；导入项按 过滤 → 前缀 → 修饰 处理 | M3a 已实现；两个组导入了同名策略：定义相同视为同一个，不同则先声明的组那份生效；规则不能直接引用导入的策略名（`E0007`，未与 Surge 核对） | ✅ | 2 |
+| 成员装配顺序 | 显式成员 → `include-other-group` → `include-all-proxies` → `policy-path`；重名保留首个；导入项按 过滤 → 前缀 → 修饰 处理 | M3a 已实现；两个组导入了同名策略：定义相同视为同一个，不同则先声明的组那份生效；导入的名字在主配置加载时还不存在，所以规则不能直接引用导入的策略名（`E0007`，未与 Surge 核对）、组成员行也不能直接写导入的策略名（`E0008`）、主配置里策略或组的 `underlying-proxy` 也不能写导入的策略名（`E0007`） | ✅ | 2 |
 | 测试 URL / 超时解析顺序 | 策略自身 `test-url` → 全局 `proxy-test-url` / `internet-test-url`；策略 `test-timeout` → 全局 `test-timeout`（默认 5，直连类 10） | | ✅ | 2 |
 
 ---

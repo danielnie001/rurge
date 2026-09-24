@@ -7973,6 +7973,14 @@ git commit -m "docs: M3a——兼容性清单、API 参考、手工验收、M3 �
 | 5 | 会话说明一律写进请求记录的 `error` | 空组代以 DIRECT 而拨号失败时，请求记录写"说明; 失败原因" | 否则失败原因被说明盖住 | 66eb655 |
 | 5 | `PolicyRegistry::contains` 线性扫描 | 查表 | 每次拨号、每一跳链式连接都调用，而条目可达上万 | 66eb655 |
 | 8 | Step 1 列出了 `a_rebuild_of_a_replaced_generation_publishes_nothing`，但计划正文漏了这条用例的代码（拼装计划时漏选了该补丁的最后一处修改） | 用副本上验证过的版本（新一代换了配置，并核对当前一代的重建照常发布） | 计划缺陷 | 61b2a4b |
+| 终审 | `parse_policy` / `parse_group` 的 unknown type 消息总是回显 `type_kw` | 只有 `type_kw` 看起来像关键字（非空、不超过 32 字符、只含 ASCII 字母数字与 `-` `_`）才回显；否则只说 `unknown type` | 终审发现：漏逗号或漏 `=` 的行会把订阅 URL（含 token）或明文口令读成 `type_kw`，原样出现在 `E0004` 里 | 39c866f |
+| 终审 | `PolicyGroup` 派生 `Debug` | 改成手写 `Debug`：`definition` 经 `redact_definition` 脱敏，`params` 整个不打印 | 终审发现：`Config` 派生 `Debug` 时会经过 `PolicyGroup`，把 `policy-path` 与 `external-policy-modifier` 的原文带出来（目前没有打印点，但违反 M3-D7） | 39c866f |
+| 终审 | 设计 5.2：跳过的订阅行逐条按行号报 `W0023`，没有上限；订阅文本本身也没有行数上限 | `Subscription.skipped` 只列前 `MAX_SKIPPED_LISTED`（20）条，其余合计一条 `` `policy-path`: N more lines skipped ``；订阅文本本身只读前 `MAX_LINES`（100 000）行，超出的部分连内容都不解析；`W0024` 的文本改为 "holds more than … policies or … lines" | 终审发现：一份百万行的本地文件让 `rurge check` 打印百万条告警、峰值内存约 150 倍、197 秒；外推到资源上限（64 MiB）约 10 GB | fad7ee0 |
+| 终审 | P5：代际锁只包住"核对当前代 + 发布" | `rebuild_registry` 把统计成员变化的两个 `HashSet`（多至一万个成员）与经同步 writer 的 INFO 日志拆成锁外的纯函数 `member_changes` 与解锁后、只在真发布时才调用的 `log_changes` | 终审发现：原先这两步都在 `std::sync::Mutex` 的临界区里，违反 P5"锁里从不做 I/O" | 48d3cba |
+| 终审 | `Subscriptions::register`：每个组各调一次 `get_labelled`，各带自己的 `update-interval` | 先按 `PolicyPath` 合并——取先出现的组的标签与全部组里最小的 `update-interval`（都没写才是 `None`）——再对每个来源只调一次 `get_labelled` | 终审发现：共享同一来源的多个组分别注册时，资源管理器的 `merge_interval` 不会唤醒已经算好等待时长的刷新任务；第一个组的间隔更长时，启动或重载后的首次刷新可能仍按它等，等第二个组更短的间隔生效已经晚了 | 48d3cba |
+| 终审 | "cannot watch file" 的 WARN 带 `error = %e`（`notify::Error` 本身） | 改成 `error = ?e.kind`，只打印 `notify::ErrorKind` | 终审发现：`notify::Error` 的 `Display` 会把监视路径也列进去 | 9581d2a |
+| 终审 | `url_task` 用 `SystemTime::now() + d` 算下次刷新时间 | 新增 `next_refresh_at` 辅助函数，改用 `SystemTime::now().checked_add(d)`，算不出来就是没有下次刷新（`None`），不再 panic | 终审发现：`policy-path` 与 RULE-SET 的 `update-interval` 都接受任意正整数，`interval` 很大时这一步在 Windows 上会 panic（`SystemTime` 的可表示范围比 `Duration` 小得多） | 9581d2a |
+| 终审 | `swap_runtime` 在代际锁外重新调 `self.runtime()` 再交给 `watch_subscriptions` | 在代际锁内、`store_runtime` 之后立刻取 `self.runtime()`，把这个 `Arc` 原样传给 `watch_subscriptions`（形参改为 `&Arc<Runtime>`）；`Engine::new` 走同样的路；`rebuild_registry` 顶部加一次不加锁的 `Arc::ptr_eq` 早退 | 终审发现：解锁后再读 `self.runtime()` 时，若另一次 `swap_runtime` 恰好插入，`watch_subscriptions` 可能把这一代的 `receivers` 接到另一代的 `watcher` 上 | 48d3cba |
 
 ## 延后事项
 
@@ -7999,3 +8007,7 @@ git commit -m "docs: M3a——兼容性清单、API 参考、手工验收、M3 �
 | 19 | `spec/http.rs` 的 `<random-string(…)>` 长度错误会引用括号里的文字（只影响主配置；导入行已由固定说法兜住） | 单独小改动 |
 | 20 | 测试偶发失败（计时类，与本分支无关）：`rurge-dns` 的 `bootstrap::set_upstreams_takes_effect_for_the_next_resolve` 与 `resolver::tests::a_partial_result_completes_aaaa_in_the_background`，全工作区运行中各见一两次，单独重跑通过 | 单独排查 |
 | 21 | 1 秒内的多次订阅更新只触发一次重建，没有用例钉住（去抖由代码与常数保证） | 有用户报告再说 |
+| 22 | 订阅下载的 User-Agent（是否带 Surge 兼容标识） | 等项目所有者决定 |
+| 23 | 资源管理器的 `Debug`（`cache::Meta` 含 URL、`ResourceState::Available` 含正文）与缓存目录 `meta.json` 里的完整 URL（含 token，只写不读）；目前没有打印或读取的地方 | 单独小改动 |
+| 24 | P10 与 P11 的理由相悖：`include-other-group` 取到的是被引用组未派生的成员，会绕过该组的中继 | 手工验收时对照 Surge 的实际行为再定；M3a 手工验收后 |
+| 25 | 从订阅导入的 `external` 类型策略：实现 `external`（M4）之前，装配里须先一律跳过（`W0023`，固定说法），否则订阅作者或 `http://` 链路上的中间人能让 rurge 以任意参数启动本机程序 | M4 设计必查 |

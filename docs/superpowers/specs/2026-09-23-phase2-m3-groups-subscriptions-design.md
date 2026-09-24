@@ -480,5 +480,6 @@ M3-D5：构建一代注册表时，每个订阅先取磁盘缓存作为初始快
 | 任务 3（执行期） | 5.3："导入策略的 `to_spec` 用的名字查找表是……`underlying-proxy` 引用不到、或经它成环……的行，跳过并 WARN"（未写 `W0023` 的原因文本来自哪里） | 原因只写固定说法加诊断码（如 `` policy `N` has a parameter whose value cannot be used (E0018) ``、`` … has an `underlying-proxy` that names no policy (E0007) ``、`` … names a `[Keystore]` item that is missing or of another kind (E0020) ``，其余 `` … cannot be used (<码>) ``），不引用 `to_spec` 自己的消息。原因：M3-D7——`to_spec` 的消息会引用取值本身（如 `` invalid value `999` for `tos` ``、整条请求头），修饰值会因此进日志 |
 | 任务 3（执行期） | 5.3 / M3-D6："订阅内容有问题时……逐条跳过并 WARN"（未写导入行的中继指向另一条已被跳过的导入行时怎么处理） | 这类导入行一并略去（`W0023`，"names a policy that was left out"），沿反向中继边一次遍历找出它们。原因：不这样处理它会留在成员表里、每次拨号都失败；逐轮剔除在长链上是平方复杂度（1 万行要 4–10 秒） |
 | 任务 5（执行期） | 5.6："空组……解析到 DIRECT，会话记录带说明 `policy group has no members; DIRECT substituted`" | 空组代以 DIRECT 而拨号本身失败时，请求记录的 `error` 写"说明; 失败原因"两部分，不是只写说明。原因：只写说明会把失败原因盖住 |
+| 任务（终审） | 5.2：跳过的订阅行逐条按行号报警，没有上限 | `Subscription.skipped` 只列前 20 条（`MAX_SKIPPED_LISTED`），其余合计一条 `W0023`；订阅文本本身只读前 100 000 行（`MAX_LINES`），超出的部分连内容都不解析。原因：一份百万行的本地文件会让 `rurge check` 打印百万条告警、峰值内存约 150 倍 |
 
 实施中发现的新出入由各任务追加。
