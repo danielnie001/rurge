@@ -339,50 +339,73 @@ impl<'a> Imports<'a> {
     }
 
     /// An import whose `underlying-proxy` no longer names anything — its
-    /// target was itself left out, by the cyclic check above or by an
-    /// earlier round of this one — would dial nowhere: it is left out too,
-    /// and so is every membership of it. Repeats until a round removes
-    /// nothing, so a chain of any length unravels.
+    /// target was itself left out, by the cyclic check above or
+    /// transitively through another left-out import — would dial nowhere:
+    /// it is left out too, whatever the length of the chain that leads to
+    /// it. One BFS over the reverse relay edges finds every one of them, so
+    /// a long chain costs no more than a short one.
     fn drop_dangling(
         &mut self,
         cfg: &Config,
         members: &mut HashMap<String, Vec<String>>,
         diags: &mut Diagnostics,
     ) {
-        loop {
-            let kept: HashSet<&str> = self
-                .list
-                .iter()
-                .map(|(i, _)| i.policy.name.as_str())
-                .collect();
-            let mut dangling: HashSet<String> = HashSet::new();
-            for (imported, group) in &self.list {
-                let Some(target) = imported
-                    .spec
-                    .as_ref()
-                    .and_then(|s| s.common.underlying_proxy.as_deref())
-                else {
-                    continue;
-                };
-                if cfg.name_kind(target).is_none() && !kept.contains(target) {
-                    diags.push(warn(
-                        group,
-                        codes::W_SET_LINES_SKIPPED,
-                        format!(
-                            "`policy-path` line {}: the `underlying-proxy` of `{}` names a policy that was left out; skipped",
-                            imported.policy.span.line, imported.policy.name
-                        ),
-                    ));
-                    dangling.insert(imported.policy.name.clone());
+        let positions: HashMap<&str, usize> = self
+            .list
+            .iter()
+            .enumerate()
+            .map(|(i, (imported, _))| (imported.policy.name.as_str(), i))
+            .collect();
+        let mut reverse: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut round: HashMap<usize, usize> = HashMap::new();
+        let mut queue: VecDeque<usize> = VecDeque::new();
+        for (i, (imported, _)) in self.list.iter().enumerate() {
+            let Some(target) = imported
+                .spec
+                .as_ref()
+                .and_then(|s| s.common.underlying_proxy.as_deref())
+            else {
+                continue;
+            };
+            match positions.get(target) {
+                Some(&j) => reverse.entry(j).or_default().push(i),
+                None if cfg.name_kind(target).is_none() => {
+                    round.insert(i, 1);
+                    queue.push_back(i);
+                }
+                None => {}
+            }
+        }
+        while let Some(i) = queue.pop_front() {
+            let next = round[&i] + 1;
+            for &j in reverse.get(&i).into_iter().flatten() {
+                if let std::collections::hash_map::Entry::Vacant(e) = round.entry(j) {
+                    e.insert(next);
+                    queue.push_back(j);
                 }
             }
-            if dangling.is_empty() {
-                break;
-            }
-            self.forget(&dangling);
-            for list in members.values_mut() {
-                list.retain(|name| !dangling.contains(name));
-            }
+        }
+        if round.is_empty() {
+            return;
+        }
+        let mut dangling: Vec<usize> = round.keys().copied().collect();
+        dangling.sort_by_key(|&i| (round[&i], i));
+        let mut names: HashSet<String> = HashSet::new();
+        for i in dangling {
+            let (imported, group) = &self.list[i];
+            diags.push(warn(
+                group,
+                codes::W_SET_LINES_SKIPPED,
+                format!(
+                    "`policy-path` line {}: the `underlying-proxy` of `{}` names a policy that was left out; skipped",
+                    imported.policy.span.line, imported.policy.name
+                ),
+            ));
+            names.insert(imported.policy.name.clone());
+        }
+        self.forget(&names);
+        for list in members.values_mut() {
+            list.retain(|name| !names.contains(name));
         }
     }
 
@@ -925,9 +948,9 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
         );
     }
 
-    /// Whichever member order a group's own line lists, the same cycles are
-    /// found: F1 fixed a strongly-connected-component hole where a group
-    /// reached only through a cross edge (like `B` here) went unlisted.
+    /// A group can come back to a cycle through a group already walked
+    /// (`B` here, reached only through `A`): every group on a cycle is on
+    /// a listed one, whatever the member order.
     #[test]
     fn every_group_on_a_cycle_is_listed_whatever_the_member_order() {
         for r in ["R = select, A, B", "R = select, B, A"] {
@@ -945,8 +968,8 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
     }
 
     /// A group on an `include-other-group` cycle gives its members to
-    /// nobody — the cycle would have no end — and F1 also fixed the
-    /// cross-edge hole for this graph (`B` reaches the cycle only via `A`).
+    /// nobody — the cycle would have no end — and that holds for a group
+    /// that reaches the cycle only through a cross edge (`B`, via `A`).
     #[test]
     fn a_group_on_an_include_cycle_gives_its_members_to_nobody() {
         let cfg = profile(
@@ -966,8 +989,8 @@ A = select, X1, include-other-group=R\nB = select, X2, include-other-group=A",
 
     /// A modifier value (here `headers=Authorization Bearer s3cr3tT0ken`)
     /// never reaches a diagnostic, whatever `to_spec` rejected it for
-    /// (M3-D7): F2 replaced the quoted `to_spec` message with a fixed
-    /// phrase per diagnostic code.
+    /// (M3-D7): the skip reason is a fixed phrase per diagnostic code,
+    /// never `to_spec`'s own message.
     #[test]
     fn a_skipped_line_is_said_without_its_values() {
         let cfg = profile(
@@ -1005,8 +1028,8 @@ external-policy-modifier=\"headers=Authorization Bearer s3cr3tT0ken\"",
 
     /// An import whose relay was itself left out — because it formed a
     /// cycle, or because one of its own parameters was invalid — would dial
-    /// nowhere on its own: F3 leaves it out too, in as many rounds as a
-    /// chain needs.
+    /// nowhere on its own: it is left out too, whatever the length of the
+    /// chain that leads to it.
     #[test]
     fn an_import_that_chains_through_one_left_out_is_left_out_too() {
         let cfg = profile(
@@ -1077,6 +1100,46 @@ G = select, DIRECT, include-other-group=H, policy-regex-filter=^HK",
         );
         let a = assemble(&cfg, &Snapshots::new());
         assert_eq!(members(&a, "G"), ["DIRECT", "HK1"]);
+    }
+
+    /// However long the chain, one pass finds every import whose relay was
+    /// left out, closest to the break first — the same order a
+    /// round-by-round removal would give, just in one pass instead of one
+    /// per link.
+    #[test]
+    fn a_chain_through_left_out_imports_is_left_out_whatever_its_length() {
+        let cfg = profile("", "Pool = select, policy-path=https://sub.test/p");
+        let a = assemble(
+            &cfg,
+            &snapshots(
+                &cfg,
+                &[(
+                    "Pool",
+                    "K1 = http, k1.test, 80, underlying-proxy=K2\n\
+K2 = http, k2.test, 80, underlying-proxy=K3\n\
+K3 = http, k3.test, 80, tos=999\n\
+Fine = http, f.test, 80",
+                )],
+            ),
+        );
+        assert_eq!(members(&a, "Pool"), ["Fine"]);
+        assert_eq!(
+            warnings(&a),
+            [
+                (
+                    codes::W_SET_LINES_SKIPPED,
+                    "policy group `Pool`: `policy-path` line 3: policy `K3` has a parameter whose value cannot be used (E0018); skipped".to_string()
+                ),
+                (
+                    codes::W_SET_LINES_SKIPPED,
+                    "policy group `Pool`: `policy-path` line 2: the `underlying-proxy` of `K2` names a policy that was left out; skipped".to_string()
+                ),
+                (
+                    codes::W_SET_LINES_SKIPPED,
+                    "policy group `Pool`: `policy-path` line 1: the `underlying-proxy` of `K1` names a policy that was left out; skipped".to_string()
+                ),
+            ]
+        );
     }
 
     #[test]
