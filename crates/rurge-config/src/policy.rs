@@ -5,6 +5,7 @@ use crate::glob::{Glob, GlobOptions};
 use crate::span::Span;
 use crate::types::HostName;
 use crate::value::{ParamMap, parse_key_value, split_list, strip_prefix_ci};
+use std::collections::HashSet;
 use std::net::IpAddr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -217,6 +218,50 @@ pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPo
         definition: definition.trim().to_string(),
         span: span.clone(),
     })
+}
+
+/// `definition` with the parameters of `overrides` in place (phase 2 M3
+/// design 5.3, `external-policy-modifier`): a key the line has is replaced
+/// where it first appears and dropped where it repeats, a key it lacks is
+/// appended. Keys compare case-insensitively; every other item keeps its
+/// text.
+pub fn with_params(definition: &str, overrides: &[(String, String)]) -> String {
+    let mut written: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for item in crate::redact::split_top_level(definition) {
+        let key = parse_key_value(item.trim()).map(|(k, _)| k.to_ascii_lowercase());
+        let found = key
+            .as_ref()
+            .and_then(|k| overrides.iter().find(|(o, _)| o.eq_ignore_ascii_case(k)));
+        match found {
+            Some((k, v)) => {
+                if written.insert(k.to_ascii_lowercase()) {
+                    let lead = &item[..item.len() - item.trim_start().len()];
+                    out.push(format!("{lead}{k}={}", param_value(v)));
+                }
+            }
+            None => out.push(item.to_string()),
+        }
+    }
+    for (k, v) in overrides {
+        if written.insert(k.to_ascii_lowercase()) {
+            out.push(format!(" {k}={}", param_value(v)));
+        }
+    }
+    out.join(",")
+}
+
+/// `value` as a line has to spell it to read it back the same: quoted when
+/// the list splitter would act on anything in it.
+fn param_value(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value.trim() == value
+        && !value.contains([',', '"', '\'', '(', ')', '\\']);
+    if plain {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -599,5 +644,42 @@ mod tests {
         );
         let g = parse_group("Pick", " select, Up, DIRECT, hidden=true", &span()).unwrap();
         assert_eq!(g.definition, "select, Up, DIRECT, hidden=true");
+    }
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn with_params_overrides_in_place_and_appends_the_rest() {
+        assert_eq!(
+            with_params(
+                "trojan, t.test, 443, password=pw, TFO=false, sni=a.test, tfo=false",
+                &pairs(&[("tfo", "true"), ("test-url", "http://apple.com/")])
+            ),
+            "trojan, t.test, 443, password=pw, tfo=true, sni=a.test, test-url=http://apple.com/"
+        );
+        assert_eq!(with_params("http, h.test, 80", &[]), "http, h.test, 80");
+    }
+
+    /// A value the list splitter would act on is quoted, and the line reads
+    /// back with exactly the values that were set.
+    #[test]
+    fn a_value_set_by_with_params_reads_back_unchanged() {
+        let line = with_params(
+            "http, h.test, 80, alice, s3cret",
+            &pairs(&[
+                ("password", "a,b\"c\\d"),
+                ("headers", "X-A:1|X-B:(2)"),
+                ("sni", ""),
+            ]),
+        );
+        let p = parse_policy("P", &line, &span()).unwrap();
+        assert_eq!(p.params.get("password"), Some("a,b\"c\\d"));
+        assert_eq!(p.params.get("headers"), Some("X-A:1|X-B:(2)"));
+        assert_eq!(p.params.get("sni"), Some(""));
+        assert_eq!(p.positional, ["alice", "s3cret"]);
     }
 }

@@ -207,7 +207,7 @@ fn next_top_level_comma(value: &str) -> Option<usize> {
 /// Splits at top-level commas only, returning the raw slices so that quoting
 /// and spacing survive. A top-level comma leaves the scanner with no open
 /// quote and depth 0, so each item is scanned afresh.
-fn split_top_level(value: &str) -> Vec<&str> {
+pub(crate) fn split_top_level(value: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut rest = value;
     while let Some(i) = next_top_level_comma(rest) {

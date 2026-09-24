@@ -188,9 +188,9 @@ pub mod codes {
     pub const W_DUPLICATE_FINAL: &str = "W0021";
     /// External set resource has no data yet (never downloaded, or failed without cache).
     pub const W_RESOURCE_UNAVAILABLE: &str = "W0022";
-    /// A set file contained lines that were skipped.
+    /// A set file or a `policy-path` subscription contained lines that were skipped.
     pub const W_SET_LINES_SKIPPED: &str = "W0023";
-    /// A set file exceeded MAX_ENTRIES and was truncated.
+    /// A set file or a `policy-path` subscription exceeded its limit and was truncated.
     pub const W_SET_TRUNCATED: &str = "W0024";
     /// Nested set reference forms a cycle or exceeds the nesting limit.
     pub const W_SET_NESTING: &str = "W0025";

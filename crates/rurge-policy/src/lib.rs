@@ -2,8 +2,10 @@
 //! through aliases and groups to a concrete `Outbound`, recording the chain
 //! it took; the factory trait real outbounds come from; the cell and the
 //! selection table that outlive a config generation; what a `policy-path`
-//! subscription holds (phase 2 M3 design 5.2).
+//! subscription holds and the members a group assembles from everything it
+//! takes in (phase 2 M3 design 5.2, 5.3).
 
+pub mod assemble;
 pub mod cell;
 pub mod factory;
 pub mod registry;
@@ -12,6 +14,7 @@ pub mod subscription;
 #[cfg(test)]
 pub(crate) mod testing;
 
+pub use assemble::{Assembly, Snapshots, assemble};
 pub use cell::{ChainConnector, RegistryCell};
 pub use factory::{BuildError, OutboundFactory};
 pub use registry::{Note, PolicyRegistry, Resolution, TerminalKind};
