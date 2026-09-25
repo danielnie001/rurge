@@ -1,6 +1,6 @@
-# rurge HTTP API（阶段 2 / M1）
+# rurge HTTP API（阶段 2）
 
-阶段 2 / M1（装配与控制面，见 `docs/superpowers/specs/2026-09-19-phase2-m1-outbound-foundation-design.md` 第 6.6 节）新增四个策略 / 策略组端点。鉴权（`X-Key` 头 / `?x-key=` 查询参数、常量时间比较、封禁）、错误体（`{"error":"<message>"}`）与无内容的成功响应（`{}`）沿用阶段 1 的约定，见 `docs/api/phase1.md`；本页只记录本页新增端点自己的形状。
+阶段 2 / M1（装配与控制面，见 `docs/superpowers/specs/2026-09-19-phase2-m1-outbound-foundation-design.md` 第 6.6 节）新增四个策略 / 策略组端点；阶段 2 / M3b（测速与自动组）又新增三个测试端点，并让 `POST /v1/policy_groups/select` 对自动组设临时覆盖（见末节「连通性测试与自动组（M3b）」）。鉴权（`X-Key` 头 / `?x-key=` 查询参数、常量时间比较、封禁）、错误体（`{"error":"<message>"}`）与无内容的成功响应（`{}`）沿用阶段 1 的约定，见 `docs/api/phase1.md`；本页只记录本页新增端点自己的形状。
 
 ## 端点
 
@@ -9,9 +9,12 @@
 | GET | `/v1/policies/detail?policy_name=<name>` | | `{"<name>": "<脱敏后的定义>"}`；未知策略 → 404 |
 | GET | `/v1/policy_groups` | | `{"<组名>": [Member…], …}` |
 | GET | `/v1/policy_groups/select?group_name=<name>` | | `{"policy": "<当前生效的成员>"}`；未知组 → 404 |
-| POST | `/v1/policy_groups/select` | `{"group_name":"<name>","policy":"<member>"}` | `{}`；组或成员无效、或不是 `select` 组 → 400 |
+| POST | `/v1/policy_groups/select` | `{"group_name":"<name>","policy":"<member>"}` | `{}`；组或成员无效，或是 `smart` / `subnet` 组 → 400；对自动组即临时覆盖（M3b） |
+| POST | `/v1/policies/test` | `{"policy_names":["<name>",…],"url":"<可省略>"}` | `{"<name>": Result…}`；未知策略、`url` 不是 URL → 400（M3b） |
+| GET | `/v1/policy_groups/test_results` | | `{"<组名>": {"<成员>": Result 或 null}}`（M3b） |
+| POST | `/v1/policy_groups/test` | `{"group_name":"<name>"}` | `{"available":["<成员>",…]}`；未知组 → 400（M3b） |
 
-**"暂定"标注**：手册没有给出 `/v1/policies/detail` 与 `/v1/policy_groups` 的响应示例（M1 设计 O2）；下面的形状按社区已知的 Surge 响应实现，拿到真实 Surge 实例的样本后再对齐，届时可能是破坏性变更。
+**"暂定"标注**：手册没有给出 `/v1/policies/detail`、`/v1/policy_groups`（M1 设计 O2）与 `POST /v1/policies/test`、`GET /v1/policy_groups/test_results`（M3 设计 6.6）的响应示例；下面的形状按社区已知的 Surge 响应实现，拿到真实 Surge 实例的样本后再对齐，届时可能是破坏性变更。
 
 ## `GET /v1/policies/detail`
 
@@ -137,7 +140,7 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 
 ## `GET /v1/policy_groups/select`
 
-参数 `group_name`（必填，查询参数）。响应 `{"policy": "<当前生效的成员>"}`：`select` 组是它当前的选择（没有选择时是第一个成员）；非 `select` 组（`url-test` / `fallback` / `subnet` 等）是它当前解析到的成员，同样按"没有选择用第一个成员"的规则；**一个没有成员的组**（订阅还没下载到，或过滤把成员滤光了）返回 `{"policy": ""}`，这不是错误；`subnet` 组在阶段 3 之前代表它的 `default`（M3a）。
+参数 `group_name`（必填，查询参数）。响应 `{"policy": "<当前生效的成员>"}`：`select` 组是它当前的选择（没有选择时是第一个成员）；自动组（`url-test` / `fallback` / `load-balance`）是当前生效的成员：临时覆盖优先，其次是按测试结果选出的（没有结果时是第一个成员；`load-balance` 显示第一个通过测试的成员，M3b）；`smart`（M3c 之前）是第一个成员；**一个没有成员的组**（订阅还没下载到，或过滤把成员滤光了）返回 `{"policy": ""}`，这不是错误；`subnet` 组在阶段 3 之前代表它的 `default`（M3a）。
 
 ```json
 {"policy": "HK"}
@@ -162,10 +165,10 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 | 情形 | `error` |
 | --- | --- |
 | `group_name` 不是任何已知策略组 | `` unknown policy group `Proxy-typo` `` |
-| `group_name` 存在但不是 `select` 组 | `` `Auto` is not a select group `` |
+| `group_name` 是 `smart`（M3c 之前）或 `subnet` 组 | `` `Smart` does not take a selection `` |
 | `policy` 不是该组的成员 | `` `Somewhere` is not a member of `Proxy` `` |
 
-选择立即生效：**下一条**使用该组（或途经该组的链）的连接就会解析到新成员，正在进行中的连接不受影响。选择按 Profile 持久化到 `state.json` 的 `group_selections[<Profile 文件名>][<组名>]`（文件名，不含目录，如 `surge.conf`）；rurge 重启后从 `state.json` 恢复，已消失的旧选择（成员被从配置里删除）按"没有选择"处理，回落到第一个成员。
+选择立即生效：**下一条**使用该组（或途经该组的链）的连接就会解析到新成员，正在进行中的连接不受影响。选择按 Profile 持久化到 `state.json` 的 `group_selections[<Profile 文件名>][<组名>]`（文件名，不含目录，如 `surge.conf`）；rurge 重启后从 `state.json` 恢复，已消失的旧选择（成员被从配置里删除）按"没有选择"处理，回落到第一个成员。对自动组的同一个请求是临时覆盖，见末节。
 
 ## `POST /v1/profiles/check`
 
@@ -180,3 +183,67 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 - `GET /v1/policy_groups` 的成员表是装配后的：写在组行上的、`include-other-group` 与 `include-all-proxies` 取来的、订阅导入的，经过滤与去重，有中继的组里代理成员换成派生名。`lineHash` 对导入与派生的成员同样建立在脱敏后的文本上。
 - `GET` / `POST /v1/policy_groups/select` 按装配后的成员表读与校验；选择按名字保存，订阅更新后名字不在了就回落到第一个成员。
 - `POST /v1/profiles/check`：配置本身无错时，连同守护进程数据目录里已缓存的订阅一起装配检查，不联网；没有内容的订阅报 `W0022`，订阅里跳过的行报 `W0023`，订阅的 URL 不出现在输出里。
+
+## 连通性测试与自动组（M3b）
+
+自阶段 2 / M3b 起（`docs/superpowers/specs/2026-09-23-phase2-m3-groups-subscriptions-design.md` 第 6 节），`url-test` / `fallback` / `load-balance` 组按连通性测试的结果选成员。下面三个端点里，手册只给了 `POST /v1/policy_groups/test` 的响应示例，另外两个的形状是"暂定"。
+
+### 测试结果（Result）
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `delay` | 整数 | 通过时：毫秒。同一条连接上第二次 `HEAD` 从发出到收到响应头的时间；服务端不保持连接时是第一次 `HEAD` 从开始拨号起的完整时间 |
+| `error` | string | 失败时：原因，如 `connect: <出站的错误>`、`tls: <原因>`、`http: <原因>`、`timed out`；不含测试 URL |
+| `time` | 数字 | 这次测试结束的时间，Unix 秒（带小数） |
+
+`delay` 与 `error` 二者有一。
+
+```json
+{"delay": 128, "time": 1758790000.25}
+```
+
+```json
+{"error": "timed out", "time": 1758790005.02}
+```
+
+### `POST /v1/policies/test`
+
+请求体 `{"policy_names": ["<名字>", …], "url": "<URL>"}`，`url` 可省略（或为空字符串）。
+
+- 省略 `url`：每个策略按它自己的测试 URL 与超时测（策略的 `test-url` / `test-timeout`，否则 `[General]` 的 `proxy-test-url`——直连类用 `internet-test-url`——与 `test-timeout`）；结果保存，自动组随即按它选择。
+- 给了 `url`：全部策略在这个 URL 上各测一次，超时仍用各自的；结果**不保存**，不影响任何组。
+- 各策略同时测（全进程最多 8 个测试同时进行，其余排队）；全部测完才返回。
+
+响应 `{"<名字>": Result 或 {"error": "not testable"}}`；不能测的是策略组、`REJECT` 族、尚未实现的协议，以及自己的测试 URL 解析不了的策略（即使请求里给了 `url`）。
+
+```json
+{"HK": {"delay": 128, "time": 1758790000.25}, "Pick": {"error": "not testable"}}
+```
+
+失败（均为 400）：某个名字不是任何已知策略、组或内置名 → `` unknown policy `HK-typo` ``；`url` 不是 URL → `` `url` is not a URL ``。
+
+### `GET /v1/policy_groups/test_results`
+
+无参数。响应 `{"<组名>": {"<成员>": Result 或 null}}`，只列 `url-test` / `fallback` / `load-balance` 组（`smart` 随 M3c），成员是装配后的成员表；`null` 表示没有结果：还没测过，或结果对应的定义、测试 URL、超时已经变了；嵌套组、`REJECT` 族、尚未实现的协议与测试 URL 解析不了的策略恒为 `null`（组在选择时把后三种当作失败）。
+
+```json
+{"Auto": {"HK": {"delay": 128, "time": 1758790000.25}, "JP": {"error": "timed out", "time": 1758790005.02}}}
+```
+
+### `POST /v1/policy_groups/test`
+
+请求体 `{"group_name": "<name>"}`。立即测该组全部成员（嵌套组的成员一并测），不看 `interval`；任何类型的组都能测。响应是本轮通过的成员（写了 `timeout` 时分数须低于它），按成员顺序：
+
+```json
+{"available": ["HK", "JP"]}
+```
+
+失败：`group_name` 不是任何已知策略组 → 400 `` unknown policy group `Proxy-typo` ``。
+
+### `POST /v1/policy_groups/select` 对自动组
+
+对 `url-test` / `fallback` / `load-balance` 组，同一个请求体设置**临时覆盖**：该组从下一条连接起固定用这个成员，期间不因使用而测试；`"policy": ""` 清除覆盖，恢复按测试结果选择。覆盖不写 `state.json`，进程重启后不在；组定义（不计行位置）不变的重载保留它，组消失或定义变了就清除；覆盖的成员从成员表里消失（订阅更新）时覆盖失效。
+
+### 测试会话
+
+每次测试是请求记录（`GET /v1/requests/recent`）里的一条内部会话：`listener` 为 `internal`、`rule` 为 `policy test`、`policy` 是被测的策略、目标是测试 URL 的主机与端口（不含路径与参数）；失败时 `error` 是上面 Result 里的原因。它们与 DNS 会话一样不能经 `POST /v1/requests/kill` 终止（409）。

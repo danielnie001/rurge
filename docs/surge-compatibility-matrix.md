@@ -131,7 +131,7 @@
 | `debug-memory-usage` | 布尔；默认 false | 全部 | 🔁 | 1 | |
 | `dns-server` | IP[:port] 列表或 `system`；含加密 URL 时自动迁移到 `encrypted-dns-server` | 全部 | ✅ | 1 | |
 | `encrypted-dns-server` | URL 列表：`https://` `h3://` `quic://` `tls://` `tcp://` | 全部 | 🟡 | 1 / 2 | `https` `tls` `tcp` 阶段 1；`h3` `quic` 依赖 QUIC 栈，阶段 2；阶段 1 对 `h3` / `quic` 条目告警 W0026 并忽略 |
-| `encrypted-dns-follow-outbound-mode` | 布尔；默认 false | 全部 | 🟡 | 1 | 含"代理服务器为域名时回退 DIRECT 并告警"的防环逻辑；M3b：TCP/DoT/DoH 上游连接走流水线（成 Internal 会话，`PROTOCOL,DOH/DOT/DNS` 可匹配）；上游主机名由 Bootstrap 解析，流水线只见 IP 目标，故域名规则不匹配上游主机名；协议标签按端口启发（853→DoT，443→DoH，其余→DNS）；被规则 REJECT 时告警并直连以保 DNS；UDP 上游不经连接器；这类内部会话的 `SRC-IP` 恒为 `127.0.0.1`、`IN-PORT` 恒为 `0`，`SRC-IP,127.0.0.1/32` / `IN-PORT,0` 规则可能意外匹配到它们，且它们的 `kill` 是空操作（DNS 路径不监听取消令牌）；防环回退自阶段 2 / M1b 起实现：DNS 会话命中的代理（沿 underlying-proxy 找到真正打开 socket 的那一跳；底下是 DIRECT——direct 别名策略或当前选中 DIRECT 的组——时取它上面那一跳，因为 DIRECT 要在本机解析的正是那一跳的服务器名）若以域名配置，则告警并直连；以 IP 配置的代理照常承载 DNS 会话 |
+| `encrypted-dns-follow-outbound-mode` | 布尔；默认 false | 全部 | 🟡 | 1 | 含"代理服务器为域名时回退 DIRECT 并告警"的防环逻辑；M3b：TCP/DoT/DoH 上游连接走流水线（成 Internal 会话，`PROTOCOL,DOH/DOT/DNS` 可匹配）；上游主机名由 Bootstrap 解析，流水线只见 IP 目标，故域名规则不匹配上游主机名；协议标签按端口启发（853→DoT，443→DoH，其余→DNS）；被规则 REJECT 时告警并直连以保 DNS；UDP 上游不经连接器；这类内部会话的 `SRC-IP` 恒为 `127.0.0.1`、`IN-PORT` 恒为 `0`，`SRC-IP,127.0.0.1/32` / `IN-PORT,0` 规则可能意外匹配到它们，且它们的 `kill` 是空操作（DNS 路径不监听取消令牌）；防环回退自阶段 2 / M1b 起实现：DNS 会话命中的代理（沿 underlying-proxy 找到真正打开 socket 的那一跳；底下是 DIRECT——direct 别名策略或当前选中 DIRECT 的组——时取它上面那一跳，因为 DIRECT 要在本机解析的正是那一跳的服务器名）若以域名配置，则告警并直连；以 IP 配置的代理照常承载 DNS 会话；阶段 2 / M3b 起，链底下是 REJECT 的代理（中继是当前选中 REJECT 的组等）同样告警并直连，不让 DNS 查询失败 |
 | `encrypted-dns-skip-cert-verification` | 布尔；默认 false | 全部 | ✅ | 1 | |
 | `allow-dns-svcb` | 布尔；默认 false | 全部 | ✅ | 3 | fake-IP 应答器拒绝 type 65 查询 |
 | `use-local-host-item-for-proxy` | 布尔；默认 false | 全部 | ✅ | 2 | M1 已实现（FR-DNS-07）：只对 `[Host]` 里指向 IP 的条目生效，取第一个 IP；命中时明文 HTTP 不走绝对 URI 转发而走 CONNECT；`[Host]` 给同一个名字列了多个地址时取第一个，不看策略的 `ip-version`（未与真实 Surge 核对） |
@@ -152,9 +152,9 @@
 | `http-api` | `key@ip:port` | 全部 | ✅ | 1 | M4a 已实现：`X-Key` 头 / `?x-key=` 鉴权（常量时间比较）；同一来源 10 分钟内 5 次失败 → 封禁 10 分钟；绑定非环回地址启动时打 WARN；改动 `http-api` 需重启 rurge（重载只警告，继续用旧地址 / 密钥） |
 | `http-api-tls` | 布尔；默认 false；需先配置 MITM CA | 全部 | ✅ | 4 | |
 | `http-api-web-dashboard` | 布尔；默认 false | 全部 | ✅ | 6 | |
-| `internet-test-url` | URL；默认 `http://bing.com/` | 全部 | ✅ | 2 | |
-| `proxy-test-url` | URL；默认 `http://bing.com/` | 全部 | ✅ | 2 | |
-| `test-timeout` | 秒；默认 5（DIRECT 为 10） | 全部 | ✅ | 2 | |
+| `internet-test-url` | URL；默认 `http://bing.com/` | 全部 | ✅ | 2 | M3b 起是直连类策略（`DIRECT` 与 `direct` 别名）连通性测试的默认 URL（策略自己的 `test-url` 优先） |
+| `proxy-test-url` | URL；默认 `http://bing.com/` | 全部 | ✅ | 2 | M3b 起是代理策略连通性测试的默认 URL（策略自己的 `test-url` 优先） |
+| `test-timeout` | 秒；默认 5（DIRECT 为 10） | 全部 | ✅ | 2 | M3b 生效：没写时代理类默认 5 秒、直连类 10 秒；写了就对两类都适用（策略自己的 `test-timeout` 优先） |
 | `proxy-test-udp` | `hostname@ipv4` | 全部 | ✅ | 2 | |
 | `force-http-engine-hosts` | Host List；默认端口 80 | 全部 | ✅ | 4 | |
 | `always-raw-tcp-hosts` | Host List | 全部 | ✅ | 4 | |
@@ -354,10 +354,10 @@
 | `tos` | 0–255 或 `0x` 十六进制；默认 0 | 🟡 | 2 | M1 已实现；Windows 上对 IPv6 不生效；有 underlying-proxy 时无效（socket 选项属于真正打开 socket 的那一跳）；M2a 起加载时报 W0028 |
 | `ecn` | `auto` `on` `off`；QUIC 类协议默认开启，WireGuard/Tailscale 默认关闭 | 🟡 | 2 | 取决于所选 QUIC 库对 ECN 的支持；M1 解析并校验取值，`W0029`；M5 生效 |
 | `block-quic` | `auto` `on` `off`；默认 `auto`（代理策略默认阻断，DIRECT 不阻断） | ✅ | 2 | 与 `[General] block-quic` 全局覆盖联动；M1 解析并校验取值，`W0029`；M7 生效 |
-| `test-url` | HTTP(S) URL；默认全局设置 | ✅ | 2 | M1 解析并校验取值，`W0029`；M3b 生效 |
-| `test-timeout` | 秒；默认全局设置 | ✅ | 2 | M1 解析并校验取值，`W0029`；M3b 生效 |
+| `test-url` | HTTP(S) URL；默认全局设置 | ✅ | 2 | M1 解析并校验取值；M3b 生效，不再报 `W0029`（取值顺序见 5.2 节「测试 URL / 超时解析顺序」） |
+| `test-timeout` | 秒；默认全局设置 | ✅ | 2 | M1 解析并校验取值；M3b 生效，不再报 `W0029`（取值顺序见 5.2 节「测试 URL / 超时解析顺序」） |
 | `test-udp` | `hostname@ipv4` | ✅ | 2 | M1 解析并校验取值，`W0029`；M5 生效（M3 细化设计订正了原来的"M3 生效"） |
-| `underlying-proxy` | 另一策略或策略组名；仅代理策略；不能与 `port-hopping` 同用 | ✅ | 2 | 目标代理主机名在上游远程解析；M1 已实现（TCP）：底层可以是策略或组，按名字在拨号时解析，组的选择变了链的入口随之变；成环是 `E0019`；链上某一跳失败时错误文本带 `via <名字>:` 前缀 |
+| `underlying-proxy` | 另一策略或策略组名；仅代理策略；不能与 `port-hopping` 同用 | ✅ | 2 | 目标代理主机名在上游远程解析；M1 已实现（TCP）：底层可以是策略或组，按名字在拨号时解析，组的选择变了链的入口随之变；成环是 `E0019`；链上某一跳失败时错误文本带 `via <名字>:` 前缀；中继是没有成员的组（订阅还没下载到、过滤滤光了）时，经它的连接一律失败（`via <组名>: policy group has no members`），不回退 DIRECT，也不看 `--empty-group-reject`（阶段 2 / M3b：设中继就是不让流量直出；Surge 未说明） |
 
 ### 4.4 TLS 与 Shadow TLS 参数
 
@@ -427,23 +427,23 @@
 | 类型 | Surge 行为 | rurge | 阶段 | 备注 |
 | --- | --- | --- | --- | --- |
 | `select` | 手动选择；选择按 Profile 持久化；无记录或成员消失时用第一个成员 | ✅ | 2 | 通过 API / CLI / Dashboard 切换；M1：选择经 API 切换，对下一条连接生效，按 Profile 文件名持久化到 `state.json` |
-| `url-test` | 选延迟最低者；HEAD 两次（第二次计分）；用时且过期或网络变化才重测；变更时通知（除非 `no-alert`） | ✅ | 2 | |
-| `fallback` | 按声明顺序取第一个可用；全部不可用则用第一个 | ✅ | 2 | |
-| `load-balance` | 可用集合内随机；`persistent` 时按目标主机名哈希；从不通知；嵌套时分数取均值 | ✅ | 2 | |
+| `url-test` | 选延迟最低者；HEAD 两次（第二次计分）；用时且过期或网络变化才重测；变更时通知（除非 `no-alert`） | ✅ | 2 | M3b 已实现：拨号经过它、且它上一轮测试比 `interval` 旧（或还没测过），或有成员（嵌套组除外）对当前定义还没有结果（新加入的、被重载或订阅更新改了的）时，后台测一轮全部成员（嵌套组的成员一并测），这一次先用现有结果（没有结果时用第一个成员）；只看不拨（API、Dashboard）不触发测试，也不让它换成员；迟滞按 `tolerance`（显式 0 时每次结果变化都换最快的）；写了 `timeout` 时分数不低于它的成员不算可用；没有可用成员时用第一个成员（手册未说明）；没有"网络变化"触发的重测（阶段 3）；变更通知随阶段 6 |
+| `fallback` | 按声明顺序取第一个可用；全部不可用则用第一个 | ✅ | 2 | M3b 已实现：按成员顺序取第一个测试通过的；测试的触发同 `url-test` |
+| `load-balance` | 可用集合内随机；`persistent` 时按目标主机名哈希；从不通知；嵌套时分数取均值 | ✅ | 2 | M3b 已实现：在测试通过的成员里均匀随机；`persistent=true` 时对目标主机名（IP 目标是 IP 的文本）哈希后取模——哈希函数是 rurge 自己的，同一主机在可用成员不变时固定落在同一成员，可用成员变了可能换；没有可用成员时全部成员都是候选；作为别的自动组的成员时分数取可用成员的均值，成员测过而没有一个可用时算失败；API 与 Dashboard 里显示的当前成员是第一个可用的 |
 | `smart` | 按真实连接质量动态选择：首响应延迟时间加权均值 + 重传惩罚（约每 1% 丢包 50 ms）× `policy-priority`；接近最优者构成优选集，其余为重试列表；按站点记忆约 1 小时；固定 5 分钟重测，`interval` 无效；>12 成员只测子集；忽略嵌套组与内置策略 | 🟡 | 2 | 算法细节非公开，rurge 按手册描述近似实现 |
 | `subnet`（旧名 `ssid`） | 按当前网络选择；条件按声明顺序首个命中；网络变化重算；无命中用 `default` | 🟡 | 3 | `TYPE:CELLULAR` / `MCCMNC:` 永不匹配；阶段 3 之前整组代表它的 `default`（M3a；没写 `default` 时按空组兜底，见下一行）；`category` 等界面参数不再被当成网络条件 |
-| 嵌套与循环 | 组可嵌套；循环引用告警且该组临时表现为 REJECT；无可用成员回退 DIRECT | ✅ | 2 | M3a 已实现：循环在加载期报 `W0030`（取代 `E0009`，不再阻止加载），装配后按成员与 `include-other-group` 再检测一次，环上的组解析为 REJECT，会话记录 `policy group cycle: A → B → A`；不在环上、但选到成环成员的组只在那一次 REJECT。没有成员的组（订阅还没下载到、过滤滤光了）回退 DIRECT，会话记录 `policy group has no members; DIRECT substituted`（回退的 DIRECT 本身拨号也失败时，后面再接失败原因）；rurge 专有的 `--empty-group-reject`（环境变量 `RURGE_EMPTY_GROUP_REJECT=true`）改为 REJECT。每构建一次策略表，每个环、每个空组各告警一次 |
-| 临时覆盖 | 自动类型组可手动指定成员，期间停止自动测试 | ✅ | 2 | API / CLI 提供 |
+| 嵌套与循环 | 组可嵌套；循环引用告警且该组临时表现为 REJECT；无可用成员回退 DIRECT | ✅ | 2 | M3a 已实现：循环在加载期报 `W0030`（取代 `E0009`，不再阻止加载），装配后按成员与 `include-other-group` 再检测一次，环上的组解析为 REJECT，会话记录 `policy group cycle: A → B → A`；不在环上、但选到成环成员的组只在那一次 REJECT。没有成员的组（订阅还没下载到、过滤滤光了）回退 DIRECT，会话记录 `policy group has no members; DIRECT substituted`（回退的 DIRECT 本身拨号也失败时，后面再接失败原因）；rurge 专有的 `--empty-group-reject`（环境变量 `RURGE_EMPTY_GROUP_REJECT=true`）改为 REJECT。每构建一次策略表，每个环、每个空组各告警一次；M3b：嵌套组作为自动组的成员时，`select` 组按它当前的选择计分，`url-test` / `fallback` 按它当前选中的成员计分，`load-balance` 见上面该行，成环的组算失败；被当作中继（策略或组的 `underlying-proxy`）的空组不回退 DIRECT，经它的连接一律失败（见 4.3 节 `underlying-proxy`） |
+| 临时覆盖 | 自动类型组可手动指定成员，期间停止自动测试 | ✅ | 2 | M3b 已实现：经 `POST /v1/policy_groups/select` 设置（Surge 未定义自动组上的这个端点，属 rurge 的扩展），`policy` 为空字符串清除；rurge CLI 暂无对应命令；覆盖期间该组不因使用而测试；组定义（不计行位置）不变的重载保留覆盖，组消失或定义变了就清除；进程重启不保留，不写 `state.json`；覆盖的成员从成员表里消失（订阅更新）时覆盖失效并告警一次 |
 
 ### 5.2 组参数
 
 | 参数 | 适用 | 取值 / 默认 | rurge | 阶段 |
 | --- | --- | --- | --- | --- |
-| `interval` | url-test / fallback / load-balance（smart 忽略） | 秒；默认 600 | ✅ | 2 |
-| `tolerance` | url-test | 毫秒；默认 100 | ✅ | 2 |
-| `timeout` | url-test / fallback / load-balance | 秒；无默认；延迟低于此值才算可用 | ✅ | 2 |
-| `evaluate-before-use` | 自动类型组 | 布尔；默认 false | ✅ | 2 |
-| `persistent` | load-balance | 布尔；默认 false | ✅ | 2 |
+| `interval` | url-test / fallback / load-balance（smart 忽略） | 秒；默认 600；M3b 已实现（按组上一轮测试结束的时间判断过期——有成员没有结果时也测——只由拨号触发，见 5.1 节 `url-test` 行） | ✅ | 2 |
+| `tolerance` | url-test | 毫秒；默认 100；M3b 已实现（显式 0 生效） | ✅ | 2 |
+| `timeout` | url-test / fallback / load-balance | 秒；无默认；延迟低于此值才算可用；M3b 已实现 | ✅ | 2 |
+| `evaluate-before-use` | 自动类型组 | 布尔；默认 false；M3b 已实现：组第一次被使用时等第一轮测完再选，最多等一轮测试可能用的时间（组里成员最长的测试超时 × 每 8 个一批的批数）；测完没有可用成员时这一次连接以 `policy group evaluation failed` 失败；DNS 会话（`encrypted-dns-follow-outbound-mode`）与经它作中继的连接都不等，用现有结果（DNS 会话若等，这一轮探针所需的名字解析又要经它，两者会互相卡住） | ✅ | 2 |
+| `persistent` | load-balance | 布尔；默认 false；M3b 已实现（见 5.1 节 `load-balance` 行） | ✅ | 2 |
 | `policy-priority` | smart | `"regex:factor;regex:factor"`；必须为正数 | ✅ | 2 |
 | `default` | subnet | 策略名；必填 | ✅ | 3 |
 | `cellular` | subnet | 策略名；已弃用（用 `TYPE:CELLULAR`） | 🔁 | 3 |
@@ -452,8 +452,8 @@
 | `icon-url` | 全部（Mac 6.5+） | URL | ✅ | 6 |
 | `category` | 全部（iOS 5.23 / Mac 6.10+） | 界面分类；不影响路由。M3a 起接受，不报诊断 | 🔁 | 2 |
 | `url`（旧参数） | 自动类型组 | 当前版本无效；M3a 起报 `W0006`，提示改用策略的 `test-url` 或 `proxy-test-url` | 🔁 | 2 |
-| `underlying-proxy` | 全部（iOS 5.22 / Mac 6.9+） | 策略名；整组链式代理，派生策略名 `Name (via Relay)`。M3a 已实现：组上的中继覆盖成员自己的；组、内置策略与 `direct` / `reject` 别名成员原样保留；经 `include-other-group` 取到的是未派生的成员；派生名已被占用时略去该成员并告警（不绕过中继）；经它绕回本组是 `E0019` | ✅ | 2 |
-| `policy-path` | 除 subnet 外 | 文件路径或 URL；内容为策略行列表或含 `[Proxy]` 的完整配置；远程缓存并定期更新。M3a 已实现，差异：只接受 Surge 格式（Clash / base64 解析不出策略时告警）；下载经 rurge 自己的直连，不经代理（未与 Surge 核对）；下载请求的 `User-Agent` 是 `rurge/<版本> (Surge-compatible)`：按 UA 里有没有 "surge" 选格式的机场面板（如 V2Board）因此返回 Surge 格式（未在真实面板上核对）；不认这个 UA 的面板可能返回非 Surge 格式的正文（组按空组兜底并提示"可能不是 Surge 格式"），订阅链接自带的格式参数（如 V2Board 的 `flag=surge`）能避开；值在 `profiles/current` 与 `policies/detail` 里脱敏，日志只写组名、不写 URL；单个订阅最多 10 000 条策略、只读前 100 000 行；跳过的行只逐条报前 20 条，其余合计一条；首次下载不阻塞启动（组先按空组兜底），已有缓存时启动与重载同步载入；订阅更新只重建策略表（没变的成员沿用原出站），不打断无关的连接；坏行、重名、与配置同名的行跳过并告警（只报行号与原因） | 🟡 | 2 |
+| `underlying-proxy` | 全部（iOS 5.22 / Mac 6.9+） | 策略名；整组链式代理，派生策略名 `Name (via Relay)`。M3a 已实现：组上的中继覆盖成员自己的；组、内置策略与 `direct` / `reject` 别名成员原样保留；经 `include-other-group` 取到的是未派生的成员；派生名已被占用时略去该成员并告警（不绕过中继）；经它绕回本组是 `E0019`；M3b 起派生成员经中继测速（测试与拨号走同一条链）；中继是没有成员的组时见 4.3 节 `underlying-proxy` | ✅ | 2 |
+| `policy-path` | 除 subnet 外 | 文件路径或 URL；内容为策略行列表或含 `[Proxy]` 的完整配置；远程缓存并定期更新。M3a 已实现，差异：只接受 Surge 格式（Clash / base64 解析不出策略时告警）；下载经 rurge 自己的直连，不经代理（未与 Surge 核对）；下载请求的 `User-Agent` 是 `rurge/<版本> (Surge-compatible)`：按 UA 里有没有 "surge" 选格式的机场面板（如 V2Board）因此返回 Surge 格式（未在真实面板上核对）；不认这个 UA 的面板可能返回非 Surge 格式的正文（组按空组兜底并提示"可能不是 Surge 格式"），订阅链接自带的格式参数（如 V2Board 的 `flag=surge`）能避开；值在 `profiles/current` 与 `policies/detail` 里脱敏，日志只写组名、不写 URL；单个订阅最多 10 000 条策略、只读前 100 000 行；跳过的行只逐条报前 20 条，其余合计一条；首次下载不阻塞启动（组先按空组兜底），已有缓存时启动与重载同步载入；订阅更新只重建策略表（没变的成员沿用原出站），不打断无关的连接；坏行、重名、与配置同名的行跳过并告警（只报行号与原因）；订阅行自己写的 `client-cert=` 与指向主配置策略或组的 `underlying-proxy=` 不生效，该行跳过并 `W0023`（M3b；只有 `external-policy-modifier` 能给导入行设这两项，订阅内部导入行之间的 `underlying-proxy` 照常可用；检查的是套用修饰之后的整行，行的写法（带引号的整项、未闭合的引号）让修饰设的值落空时同样跳过）——Surge 未这样限制，rurge 不让订阅作者动用主配置里的证书与代理 | 🟡 | 2 |
 | `update-interval` | 同上 | 秒；默认 86400；M3a 已实现（几个组共用一个来源时取最短的） | ✅ | 2 |
 | `policy-regex-filter` | 同上 | 正则；作用于导入成员，不作用于显式成员；M3a 已实现（`fancy-regex` 语法，与 URL-REGEX 相同；订阅成员按加前缀之前的原名过滤） | ✅ | 2 |
 | `external-policy-modifier` | 同上 | 引号包裹的 `key=value` 列表；覆盖导入策略参数；M3a 已实现（在文本层改写导入行：同名参数原地替换、没有的追加）；值可能含凭据，在 `profiles/current` 与 `policies/detail` 里整体脱敏 | ✅ | 2 |
@@ -461,7 +461,7 @@
 | `include-all-proxies` | 同上（iOS 4.12 / Mac 4.5+） | 布尔；含 `[Proxy]` 全部代理策略，不含内置与组；M3a 已实现（也不含 `direct` / `reject` 别名） | ✅ | 2 |
 | `include-other-group` | 同上 | `"g1,g2"`；递归展开；M3a 已实现（引用未知的组是 `E0008`；成环的组不展开给别人） | ✅ | 2 |
 | 成员装配顺序 | 显式成员 → `include-other-group` → `include-all-proxies` → `policy-path`；重名保留首个；导入项按 过滤 → 前缀 → 修饰 处理 | M3a 已实现；两个组导入了同名策略：定义相同视为同一个，不同则先声明的组那份生效；导入的名字在主配置加载时还不存在，所以规则不能直接引用导入的策略名（`E0007`，未与 Surge 核对）、组成员行也不能直接写导入的策略名（`E0008`）、主配置里策略或组的 `underlying-proxy` 也不能写导入的策略名（`E0007`） | ✅ | 2 |
-| 测试 URL / 超时解析顺序 | 策略自身 `test-url` → 全局 `proxy-test-url` / `internet-test-url`；策略 `test-timeout` → 全局 `test-timeout`（默认 5，直连类 10） | | ✅ | 2 |
+| 测试 URL / 超时解析顺序 | 策略自身 `test-url` → 全局 `proxy-test-url` / `internet-test-url`；策略 `test-timeout` → 全局 `test-timeout`（默认 5，直连类 10） | M3b 已实现：两次 HEAD 在同一条连接上，服务端不保持连接时以第一次的完整耗时（含拨号）计分，并对该 URL 告警一次（日志不写 URL）；HTTPS 测试 URL 在已建立的 TLS 连接上测第二次（手册 Mac 6.10 的行为），证书按系统根证书校验；收到任何状态码的完整响应头都算通过；测试请求的 `User-Agent` 是 `rurge/<版本>`；最多 8 个测试同时进行；每次测试是请求记录里的一条内部会话（规则 `policy test`，目标只有测试 URL 的主机与端口）；结果按策略保存，策略的定义、测试 URL 或超时变了就作废，跨重载保留、不写 `state.json` | ✅ | 2 |
 
 ---
 
@@ -497,7 +497,7 @@
 | 引导豁免：配置加密 DNS 后，传统 DNS 只用于连通性测试与解析加密 DNS URL 中的主机名（含 `[Host]` `server:` 项中的 URL） | | ✅ | 1 | |
 | 特殊值 `off`（主要用于 `[SSID Setting]` 覆盖） | | ✅ | 1 / 3 | |
 | `encrypted-dns-skip-cert-verification` | 默认 false | ✅ | 1 | |
-| `encrypted-dns-follow-outbound-mode`：DNS 连接走规则；`PROTOCOL,DOH/DOH3/DOQ/DOT/DNS` 可匹配；命中的代理若以域名配置则告警并回退 DIRECT | 默认 false | 🟡 | 1 | M3b：TCP/DoT/DoH 上游走流水线（Internal 会话，`PROTOCOL` 可匹配）；上游主机名先由 Bootstrap 解析，流水线只见 IP 目标，域名规则不匹配上游主机名；协议标签按端口启发（853→DoT，443→DoH，其余→DNS）；被 REJECT 时告警并直连保底；UDP 上游不经连接器；这类会话的 `SRC-IP`/`IN-PORT` 为占位值（`127.0.0.1:0`/`0`），`kill` 对其无效；防环回退自阶段 2 / M1b 起实现：DNS 会话命中的代理（沿 underlying-proxy 找到真正打开 socket 的那一跳；底下是 DIRECT——direct 别名策略或当前选中 DIRECT 的组——时取它上面那一跳，因为 DIRECT 要在本机解析的正是那一跳的服务器名）若以域名配置，则告警并直连；以 IP 配置的代理照常承载 DNS 会话 |
+| `encrypted-dns-follow-outbound-mode`：DNS 连接走规则；`PROTOCOL,DOH/DOH3/DOQ/DOT/DNS` 可匹配；命中的代理若以域名配置则告警并回退 DIRECT | 默认 false | 🟡 | 1 | M3b：TCP/DoT/DoH 上游走流水线（Internal 会话，`PROTOCOL` 可匹配）；上游主机名先由 Bootstrap 解析，流水线只见 IP 目标，域名规则不匹配上游主机名；协议标签按端口启发（853→DoT，443→DoH，其余→DNS）；被 REJECT 时告警并直连保底；UDP 上游不经连接器；这类会话的 `SRC-IP`/`IN-PORT` 为占位值（`127.0.0.1:0`/`0`），`kill` 对其无效；防环回退自阶段 2 / M1b 起实现：DNS 会话命中的代理（沿 underlying-proxy 找到真正打开 socket 的那一跳；底下是 DIRECT——direct 别名策略或当前选中 DIRECT 的组——时取它上面那一跳，因为 DIRECT 要在本机解析的正是那一跳的服务器名）若以域名配置，则告警并直连；以 IP 配置的代理照常承载 DNS 会话；阶段 2 / M3b 起，链底下是 REJECT 的代理（中继是当前选中 REJECT 的组等）同样告警并直连，不让 DNS 查询失败 |
 | `[Host]` 中 `server:<加密 URL>` 按域名指定加密 DNS | iOS 5.21 / Mac 6.8+ | ✅ | 1 | |
 
 ### 6.3 `[Host]` 本地 DNS 映射
@@ -831,12 +831,12 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | `GET/POST /v1/outbound/global` | 全局模式策略 | 全部 | 🟡 | 1 | M4a 已实现；出站模式与全局策略持久化到 `state.json`，显式 `--outbound-mode` 覆盖并写回（不校验策略是否存在）；`proxy` 模式下全局策略缺失或已不存在（如重载后）→ 按规则模式处理并 WARN 一次；`proxy` 模式下用空串清空全局策略 → 400（与 `POST /v1/outbound` 切换模式时的校验对称，M4b） |
 | `GET /v1/policies` | 列出策略 | 全部 | 🟡 | 1 | M4a 已实现；JSON 结构手册未定义，暂定结构见 `docs/api/phase1.md`，阶段 6 对齐真实 Surge；阶段 2 / M3a 起 `proxies` 含订阅导入的策略与组级中继派生的 `Name (via Relay)` |
 | `GET /v1/policies/detail?policy_name=` | 策略详情 | 全部 | 🟡 | 2 | M1 已实现；响应形状手册未给出，暂定结构见 `docs/api/phase2.md`；M3a 起也能查导入与派生的策略（同样脱敏） |
-| `POST /v1/policies/test` | `{"policy_names":[...],"url":...}` | 全部 | ✅ | 2 | |
+| `POST /v1/policies/test` | `{"policy_names":[...],"url":...}` | 全部 | 🟡 | 2 | M3b 已实现：省略 `url` 时各自按自己的测试 URL 测，结果保存、自动组据此选择；给了 `url` 时是一次性测试，结果不保存；策略组、REJECT 族、未实现的协议与自己的测试 URL 解析不了的策略回 `{"error":"not testable"}`；响应形状手册未给出，暂定结构见 `docs/api/phase2.md` |
 | `GET /v1/policy_groups` | 列出组与选项 | 全部 | 🟡 | 2 | M1 已实现；响应形状手册未给出，暂定结构见 `docs/api/phase2.md`；M3a 起成员是装配后的成员表（含订阅导入与派生成员），订阅更新后随之变化 |
-| `GET /v1/policy_groups/test_results` | 自动组测试结果 | 全部 | ✅ | 2 | |
-| `GET/POST /v1/policy_groups/select` | 读 / 改 select 组选择 | 全部 | ✅ | 2 | M1 已实现；M3a 起按装配后的成员表校验，选择按名字保存，订阅更新后名字不在了就回落到第一个成员 |
-| `POST /v1/policy_groups/test` | 立即测试 → `{"available":[...]}` | 全部 | ✅ | 2 | |
-| `GET /v1/requests/recent` `GET /v1/requests/active` `POST /v1/requests/kill` | 请求列表与终止 | 全部 | 🟡 | 1 / 4 | 响应结构手册未定义，以 Surge 实际输出为准做兼容测试；M4a 暂定结构见 `docs/api/phase1.md`；`kill` 命中 rurge 自身的内部会话（如 DNS 查询）→ 409 |
+| `GET /v1/policy_groups/test_results` | 自动组测试结果 | 全部 | 🟡 | 2 | M3b 已实现：列出每个 `url-test` / `fallback` / `load-balance` 组的成员与各自最近的结果（没有结果为 `null`；`smart` 随 M3c）；响应形状手册未给出，暂定结构见 `docs/api/phase2.md` |
+| `GET/POST /v1/policy_groups/select` | 读 / 改 select 组选择 | 全部 | ✅ | 2 | M1 已实现；M3a 起按装配后的成员表校验，选择按名字保存，订阅更新后名字不在了就回落到第一个成员；M3b 起对 `url-test` / `fallback` / `load-balance` 组即临时覆盖（见 5.1 节「临时覆盖」），`policy` 为空字符串清除，覆盖不写 `state.json`；`smart`（M3c 之前）与 `subnet` 组仍 400；`GET` 对自动组返回当前生效的成员（覆盖优先，其次是按测试结果选出的） |
+| `POST /v1/policy_groups/test` | 立即测试 → `{"available":[...]}` | 全部 | ✅ | 2 | M3b 已实现：立即测该组全部成员（嵌套组的成员一并测），不看 `interval`；任何类型的组都能测 |
+| `GET /v1/requests/recent` `GET /v1/requests/active` `POST /v1/requests/kill` | 请求列表与终止 | 全部 | 🟡 | 1 / 4 | 响应结构手册未定义，以 Surge 实际输出为准做兼容测试；M4a 暂定结构见 `docs/api/phase1.md`；`kill` 命中 rurge 自身的内部会话（如 DNS 查询）→ 409；阶段 2 / M3b 起连通性测试也在请求记录里（内部会话，`rule` 为 `policy test`，`policy` 是被测的策略，目标只有测试 URL 的主机与端口） |
 | `GET /v1/profiles/current?sensitive=0` | 当前配置文本（可脱敏） | 全部 | ✅ | 1 | M4a 已实现；`sensitive=0`（默认）脱敏：独立密钥行 `password` / `ca-passphrase` / `ca-p12` / `private-key` / `psk` / `pre-shared-key` / `token`；内联参数 `password` / `psk` / `private-key` / `pre-shared-key` / `base64` / `token` / `uuid` / `username` / `headers` / `ws-headers` / `ws-path` / `shadow-tls-password` / `policy-path` / `external-policy-modifier`（后两个自 M3a 起：订阅链接常带 token，修饰列表能设任何参数）；`http-api` / `external-controller-access` / `http-listen` / `socks5-listen` 的 `key@` 前缀与 `wifi-access-http-auth` 口令；所有写作 `type, server, port` 的代理类型（`http` `https` `h2-connect` `socks5` `socks5-tls` `ss` `snell` `vmess` `trojan` `tuic` `tuic-v5` `hysteria2` `masque` `anytls` `trust-tunnel` `ssh`）策略行第 4 个起、凡不是 `name=value` 具名参数的 token（最常见的是根本不含 `=` 的裸 token，即位置传递的凭据；含 `=` 但值为空或全是 `=` 的也算，例如带填充的 base64。除前四种外这个位置本就是多余参数 `W0001`，按偏安全一侧抹掉）。取值的结尾按解析器自己的规则找**第一个顶层逗号**：`"` 或 `'` 在值里任何位置都会开启一段引号（`"` 内 `\` 转义下一个字符），`(` / `)` 分组，引号内与括号内的逗号都属于值（`password="p,w"`、`password=ab"c,d"`、`password=a(b,c)d` 各是一整个值）；引号或括号未闭合时抹到行尾。名单以外不脱敏；其余内容与行数、行尾 CRLF 原样保留 |
 | `POST /v1/profiles/reload` | 重载 | 全部 | ✅ | 1 | 底层热重载能力（SIGHUP / `--watch`）已在 M3b 就位，API 触发已在 M4a 实现；解析失败或构建 `Runtime` 失败时返回 `ok:false` 且运行中的配置不变；重绑监听器失败时同样 `ok:false`，但配置代已经切换，只是监听器归零，直到下一次重载成功为止（与本表第 809 行「零监听器」退化态一致） |
 | `POST /v1/profiles/switch` `GET /v1/profiles` `POST /v1/profiles/check` | 多配置管理 | Mac only | ✅ | 1 / 6 | rurge 以配置目录管理多个 Profile；`check` 已实现（M4a，校验磁盘上的当前配置文件，不影响运行中的实例）；`switch` 与 `GET /v1/profiles` 的多配置目录管理仍在阶段 6；自 M1 起 `check` 含干构建（`E0022`）；自 M3a 起连同守护进程数据目录里已缓存的订阅一起装配检查（同 10.3 `--check` 行） |
@@ -894,5 +894,5 @@ Surge 的 `surge-cli` 是随 Mac 版附带的控制工具。rurge 的 `rurge` �
 | 7. HTTP 处理 | 45 | 41 | 2 | 1 | 1 | 0 |
 | 8. 脚本 | 47 | 35 | 7 | 4 | 1 | 0 |
 | 9. 高级网络功能 | 43 | 28 | 7 | 3 | 2 | 3 |
-| 10. 工具与可观测性 | 50 | 36 | 6 | 4 | 3 | 1 |
-| **合计** | **529** | **425** | **57** | **29** | **10** | **8** |
+| 10. 工具与可观测性 | 50 | 34 | 8 | 4 | 3 | 1 |
+| **合计** | **529** | **423** | **59** | **29** | **10** | **8** |

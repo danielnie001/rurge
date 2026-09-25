@@ -6294,6 +6294,13 @@ git commit -m "docs: M3b 测速与自动组——兼容性清单、API 参考、
 
 | 任务 | 计划原文 | 实际做法 | 原因 | 提交 |
 | ---- | -------- | -------- | ---- | ---- |
+| 全部任务（开工时） | （无对应文字） | 写计划用的副本与核对工作树曾把产物编进本仓库的 `target/`：清掉工作区自身 crate 的产物（`cargo clean -p`，依赖不动）之后，由控制者在干净构建上重跑 Task 1 的门禁核对 | cargo 的 dep-info 按包根相对路径记源文件，本任务没改动的 crate（如 `rurge-config`）复用了副本里更靠后的状态编出的测试二进制，Task 1 的门禁里跑出了 Task 3 的用例 | — |
+| 1 | P1：检查在 `Imports::collect` 里、加前缀与修饰之前做（看订阅作者写的原行），修饰设了同名参数就豁免 | 检查挪到套用修饰、`parse_policy` 之后，看真正用来建策略的那一行的每个取值：修饰设了该键时，行上只能是修饰的值，否则跳过（新原因 `` `external-policy-modifier` cannot set `<key>` on this line ``）；修饰没设时仍是原来的两条原因；新增用例 `a_modified_line_may_not_keep_its_own_value_by_its_spelling` | 修饰设了同名参数时，订阅行把整项加引号（`"underlying-proxy=Corp"`）就能绕过：`with_params` 按原文取键认不出它，修饰的值追加在后，解析器去掉引号后先读到订阅行自己的值；未闭合的引号还会吞掉追加的修饰，让该行直连 | b41574f |
+| 1 | 新用例放在 `group_cycles_through_members_are_listed` 之前 | 放在它之后 | 只是位置，内容逐字相同 | 990f627 |
+| 5 | 「要点」：`run` 先存结果、再从 `running` 表里摘掉自己（只摘 `key` 相同的那一项） | 只有 `running` 里登记的仍是本测试自己的通道（`same_channel`）时，才在持有 `running` 的同时存结果、摘登记；被取代的测试只把结果交给自己的等待者；新增用例 `a_superseded_test_leaves_the_current_result_alone` | 旧定义的测试若在新定义的测试之后才结束，会用过期结果覆盖当前结果，当前定义读作"未知"，直到组的 `interval` 过去都不会重测；只按 key 摘登记还会让 k1→k2→k1 摘掉别人的登记 | af5a4e5 |
+| 6 | P7："旧"按组上一轮测试结束的时间判断 | 拨号时，有直接成员（嵌套组除外）对当前定义没有结果也请求一轮；`a_dial_asks_for_a_round_and_the_views_do_not` 在标记一轮完成之前先给成员写入结果，新增用例 `a_member_without_a_result_asks_for_a_round` | 设计 6.3 写的是"成员结果比 interval 旧（或没有结果）"；只看组的时间时，重载改了成员的测试参数会让全部结果作废而组仍算刚测过，最长 `interval` 内都按"未知"选成员。嵌套组除外，免得一个空的成员组让每次拨号都请求一轮 | 60e334b |
+| 7 | P9 与「要点」："DNS 会话同样等待" | `dial_internal`（DNS 会话）不等，直接 `resolve_with`（仍会请求一轮）；会话拨号照旧等待；新增用例 `a_dns_session_does_not_wait_for_an_evaluate_before_use_group` | 开 `encrypted-dns-follow-outbound-mode` 时，这一轮的探针解析以主机名配置的成员又要经 DNS 会话，两者互相卡住直到查询超时：每次启动该组首轮全部失败，并一直维持到下一个 `interval` | 5e9eb11 |
+| 1 – 10 | 各任务门禁的预期总数（Task 1 起 881、884、885、890、896、908、916、921、922、923） | 实际依次是 882、885、886、891、898、911、920、925、926、927（各任务的修正做完之后）：Task 1、5、6、7 的修正各多一条用例；最后一次门禁 40 个测试二进制，927 通过 / 0 失败 / 1 忽略 | 见上面几行 | — |
 
 ## 延后事项
 
@@ -6307,3 +6314,8 @@ git commit -m "docs: M3b 测速与自动组——兼容性清单、API 参考、
 | 6 | `smart` 组：仍 `W0008`、取第一个成员、不在 `test_results` 里、`select` 不接受；请求记录的两列耗时（承接 C3 的另一半） | M3c |
 | 7 | 测试二进制偶发 `STATUS_HEAP_CORRUPTION`（P21）：主干上也有，M3b 的用例可能让它更常出现 | 单独排查（与 M3a「延后事项」#4 一起跟踪） |
 | 8 | `POST /v1/policies/test` 的 `policy_names` 没有数量上限（每个名字一个任务；测试本身受 8 个并发约束） | 有用户报告再说 |
+| 9 | 订阅行自己带引号的整项 `"k=v"` 碰上 `external-policy-modifier` 的同名参数：`with_params` 按原文取键认不出它，修饰的值追加在后，订阅行自己的值先被读到（`client-cert` / `underlying-proxy` 已按套用修饰后的整行检查兜住，其它键仍是订阅行的值生效）；订阅行以未闭合的引号结尾时，追加的修饰被吞掉 | 单独小改动 |
+| 10 | M4 的 `ssh`（`private-key=` 指向 `[Keystore]` 条目）与 WireGuard（`section-name=` 指向主配置里的段）同样是按名字用到主配置的材料，届时要加进 `reaches_into_profile` | M4 设计必查 |
+| 11 | `TestBook::invalidate_all` 管不到正在跑的测试：在旧网络上开始的测试，会在调用之后才写入结果 | 阶段 3（接上"网络已变化"时） |
+| 12 | `dial_internal` 被调用方取消（DNS 查询的截止时间）时，已进活动表的会话句柄不结束、也不进请求记录（慢的 `connect_tcp` 本来就有同样的缺口） | 有用户报告再说 |
+| 13 | "服务端不保持连接"只告警一次的分支没有用例（要断言得接 tracing 订阅者，本计划不新增 dev 依赖） | 有用户报告再说 |

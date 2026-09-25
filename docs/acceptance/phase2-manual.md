@@ -71,3 +71,16 @@
 - [ ] 把订阅换成一个 Clash YAML 链接：启动输出里有 `W0023`（内容可能不是 Surge 格式），经该组的请求直连（空组兜底）；加 `--empty-group-reject` 后同样的请求被拒绝。
 - [ ] 机场更新了订阅（或手动改一个本地订阅文件）：不重启、不重载，组成员随之变化，日志里有一条 `policy group members updated`（只有组名与增减数量）；一个正在进行的大文件下载不中断。
 - [ ] 用一个不带格式参数的通用订阅链接（机场面板可能按 `User-Agent` 选格式，rurge 发的是 `rurge/<版本> (Surge-compatible)`）：组是否照常填充；填不出时记下面板名称与实际返回的内容（`docs/surge-compatibility-matrix.md` 的 `policy-path` 行）。
+
+## M3b　测速与自动组
+
+需要至少两个延迟明显不同的真实节点（可以来自 M3a 的订阅），自动化测试（只用回环）覆盖不了。
+
+- [ ] `Auto = url-test, <节点 A>, <节点 B>`（不写 `test-url`，即默认的 `http://bing.com/`）：经 `Auto` 浏览几次后，`GET /v1/policy_groups/test_results` 里两个节点都有 `delay`，数值与 Surge（或节点面板）的延迟量级相当；`GET /v1/policy_groups/select?group_name=Auto` 是较快的那个。
+- [ ] `GET /v1/requests/recent` 里能看到测试会话（`rule` 为 `policy test`），它们经各自的节点出去（`policy` 是节点名），目标只有 `bing.com:80`，没有路径。
+- [ ] 给一个节点写 `test-url=https://www.gstatic.com/generate_204`：测试通过，`delay` 与 HTTP 测试 URL 的同量级（第二次 `HEAD` 复用已建立的 TLS 连接，不含握手）。
+- [ ] `Fallback = fallback, <节点 A>, <节点 B>, interval=60`：停掉节点 A（或把它的端口写错后 `rurge reload`），一分钟内经 `Fallback` 的请求改走节点 B；`POST /v1/policy_groups/test {"group_name":"Fallback"}` 立即返回只含 B 的 `available`。
+- [ ] `Balance = load-balance, <节点 A>, <节点 B>, persistent=true`：同一个网站的多次请求在请求记录里都经同一个节点，不同网站分散到两个节点。
+- [ ] `evaluate-before-use=true`：刚启动后第一次经该组的请求多等一会（测完一轮）再经可用的节点出去；两个节点都不可用时这次请求失败，请求记录的错误是 `policy group evaluation failed`。
+- [ ] `POST /v1/policy_groups/select {"group_name":"Auto","policy":"<较慢的节点>"}`：之后的请求经较慢的节点，且不再产生 `Auto` 的测试会话；`{"policy":""}` 清除后恢复自动选择；重启 rurge 后覆盖不在了。
+- [ ] 日志（含 `--log-level verbose`）里搜不到任何策略的 `test-url` 的路径与参数（订阅行可能把 token 放在测试 URL 里）。

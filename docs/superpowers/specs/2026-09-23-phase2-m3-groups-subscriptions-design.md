@@ -483,3 +483,21 @@ M3-D5：构建一代注册表时，每个订阅先取磁盘缓存作为初始快
 | 任务（终审） | 5.2：跳过的订阅行逐条按行号报警，没有上限 | `Subscription.skipped` 只列前 20 条（`MAX_SKIPPED_LISTED`），其余合计一条 `W0023`；订阅文本本身只读前 100 000 行（`MAX_LINES`），超出的部分连内容都不解析。原因：一份百万行的本地文件会让 `rurge check` 打印百万条告警、峰值内存约 150 倍 |
 
 实施中发现的新出入由各任务追加。
+
+## 17. M3b 实施期的订正
+
+本节登记 M3b 计划的「计划期决定」里与本文件文字不同的地方。逐条对应实现的提交见 `docs/superpowers/plans/2026-09-25-phase2-m3b-testing-auto-groups-plan.md` 末尾「执行期修正记录」。
+
+| 编号 | 设计原文 | 订正 |
+| ---- | -------- | ---- |
+| P1 | 5.3 / M3-D6：导入行经 `to_spec` 生效（未限制 `client-cert` 与 `underlying-proxy`） | 订阅行自己写的 `client-cert=` 与指向主配置策略或组的 `underlying-proxy=` 不生效，该行跳过并 `W0023`（固定说法，不带取值）；经 `external-policy-modifier` 设上的照常生效，订阅内部导入行之间的中继仍允许；检查的是套用修饰之后的整行（只看原行、修饰设了同名参数就豁免，会被带引号的整项绕过）。项目所有者 2026-09-25 决定（M3a 延后事项 #11） |
+| P2 | 5.6 / M3-D3：没有成员的组回退 DIRECT | 被当作中继（策略的 `underlying-proxy`、组级中继）时一律拒绝，不看 `--empty-group-reject`；作为规则或全局策略直接使用时仍按 M3-D3。项目所有者 2026-09-25 决定（M3a 延后事项 #12） |
+| P5 | 6.1：HTTPS 测试 URL 用系统根证书，测试注入 `EngineShared.roots` | 根证书取自构建注册表的出站工厂（新增 `OutboundFactory::roots`），与出站的 TLS 同源，`EngineShared.roots` 因此同样作用于测试 |
+| P6 | 6.2："测试会话经观察者 trait 写入请求记录，带 `test` 标记" | 请求记录没有标记字段：测试会话是内部会话，`rule` 为 `policy test`，`policy` 是被测的策略，目标只有测试 URL 的主机与端口。另：`POST /v1/policies/test` 给了 `url` 时是一次性测试，结果不保存（否则会挤掉该策略按自己 URL 测得的结果） |
+| P7 | 6.3："组被解析（`resolve`）到、且它的成员结果比组的 `interval` 旧" | 只有拨号（含 DNS 会话与链的中间跳）触发测试；控制面的读取不触发，也不让 `url-test` 换成员。"旧"按组上一轮测试结束的时间判断，另外有成员（嵌套组除外）对当前定义没有结果时也请求一轮——只看组的时间时，重载改了成员的测试参数会让全部结果作废而组仍算刚测过；一轮测试覆盖嵌套组的成员，并给每个被覆盖的组记一轮 |
+| P8 | 6.4："`load-balance` 取它通过者分数的平均值，没有通过者算失败" | 成员都还没测过时算"未知"而不是失败；控制面显示 `load-balance` 组的当前成员时取第一个通过的（随机选出的每次不同） |
+| P9 | 6.3 / 9："`evaluate-before-use` 的等待受同一超时约束" | 上限是一轮测试可能用的时间：组里（含嵌套组）成员最长的测试超时 × 每 8 个一批的批数（测试并发上限 8）；DNS 会话与链的中间跳都不等（V9）——DNS 会话若等，这一轮探针所需的名字解析又要经它，两者互相卡住直到查询超时 |
+| P13 | 6.6：`GET /v1/policy_groups/test_results` 列出 `url-test` / `fallback` / `load-balance` / `smart` 组；`POST /v1/policy_groups/select` 对非 `select` 组的 400 取消 | M3b 只列前三种（`smart` 随 M3c）；`smart`（M3c 之前）与 `subnet` 组上的 `select` 仍 400，文本改为 `` `G` does not take a selection `` |
+| P15、P16 | （无对应文字；M3a 延后事项 #14、#3） | 拨号时运行时与注册表在代际锁下成对读取（`Engine::snapshot`）；DNS 会话命中的代理链底下是 REJECT 时，同 REJECT 一样告警并直连 |
+| P17 | 1.4：M3b 行"能力表翻转（`W0008` 只剩 `subnet`）" | M3b 之后 `W0008` 还会因 `smart` 出现，M3c 翻转 `smart` 之后才只剩 `subnet`（与第 8 节一致） |
+| P19 | 15：M3b 约 8 个任务 | 11 个：两项承接决定（Task 1、2）与 M3a 延后事项 #3 / #14（Task 9）各成任务 |
