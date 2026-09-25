@@ -175,17 +175,20 @@ impl TestBook {
             at: Instant::now(),
             when: SystemTime::now(),
         };
-        self.results
-            .write()
-            .expect("test results")
-            .insert(case.policy.clone(), (case.key, result.clone()));
+        // A test superseded by a new definition (key changed) only hands its
+        // result to its own waiters; it must not undo the current definition's
+        // result, whichever ends last.
         {
             let mut running = self.running.lock().expect("running tests");
-            if running
-                .get(&case.policy)
-                .is_some_and(|(key, _)| *key == case.key)
-            {
-                running.remove(&case.policy);
+            if let Some((_, rx)) = running.get(&case.policy) {
+                let rx_from_tx = tx.subscribe();
+                if rx_from_tx.same_channel(rx) {
+                    running.remove(&case.policy);
+                    self.results
+                        .write()
+                        .expect("test results")
+                        .insert(case.policy.clone(), (case.key, result.clone()));
+                }
             }
         }
         let _ = tx.send(Some(result));
@@ -387,5 +390,44 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(gate.dials.load(Ordering::SeqCst), 1);
+    }
+
+    /// A test of a definition that has since changed does not undo the
+    /// current one's result, whichever ends last.
+    #[tokio::test]
+    async fn a_superseded_test_leaves_the_current_result_alone() {
+        let slow = Arc::new(Gate {
+            hold: Duration::from_millis(200),
+            ..Gate::default()
+        });
+        let fast = Arc::new(Gate::default());
+        let book = book();
+
+        let slow_task = {
+            let (book, case) = (book.clone(), case("P", slow.clone(), 1));
+            tokio::spawn(async move { book.test(case).await })
+        };
+
+        // Poll until slow test has started (dial count reaches 1)
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while slow.dials.load(Ordering::SeqCst) < 1 {
+            assert!(Instant::now() < deadline, "slow test never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Now test with a different key (simulating definition change)
+        let fast_result = book.test(case("P", fast.clone(), 2)).await;
+        assert!(fast_result.outcome.is_err());
+
+        // Wait for the slow test to finish
+        let _ = slow_task.await;
+
+        // The current key's result should persist, the old key's should not
+        assert!(book.result("P", 2).is_some(), "current result should exist");
+        assert_eq!(
+            book.result("P", 1),
+            None,
+            "superseded result should not exist"
+        );
     }
 }
