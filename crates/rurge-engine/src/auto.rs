@@ -4,13 +4,14 @@
 //! round of an `evaluate-before-use` group — a DNS session does not wait:
 //! the round it would wait for may itself need that very lookup.
 
-use crate::engine::Engine;
-use rurge_config::HostName;
+use crate::engine::{Engine, UnknownPolicy, policy_known};
+use crate::views::SelectError;
 use rurge_config::rule::PolicyRef;
 use rurge_config::session::{ListenerKind, SessionInfo};
+use rurge_config::{GroupKind, HostName};
 use rurge_inbound::{SessionHandle, SessionOutcome};
 use rurge_policy::auto::SelectCtx;
-use rurge_policy::testbook::{TestObserver, TestRecord};
+use rurge_policy::testbook::{TestObserver, TestRecord, TestResult};
 use rurge_policy::{PolicyRegistry, Resolution};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -22,6 +23,19 @@ pub(crate) const TEST_RULE: &str = "policy test";
 /// Why a session through an `evaluate-before-use` group fails when no
 /// member passes the group's first round of tests (M3 design 6.3).
 pub(crate) const EVALUATION_FAILED: &str = "policy group evaluation failed";
+
+/// Test results by policy (or member), in the order asked for (or
+/// listed); `None` where there is none.
+pub(crate) type Results = Vec<(String, Option<TestResult>)>;
+
+/// The groups that pick by the tests, and take an override for a
+/// selection: `url-test`, `fallback`, `load-balance`.
+pub(crate) fn automatic(kind: GroupKind) -> bool {
+    matches!(
+        kind,
+        GroupKind::UrlTest | GroupKind::Fallback | GroupKind::LoadBalance
+    )
+}
 
 /// Every connectivity test is a session of the request log (M3 design
 /// 6.2): `Internal`, the rule `policy test`, the tested policy for its
@@ -82,6 +96,78 @@ impl Engine {
                 });
             }
         });
+    }
+
+    /// Tests `names` now, side by side, whatever their groups' `interval`
+    /// (M3 design 6.3, 6.6): each at its own test URL — the groups then
+    /// pick by these results — or all at `url`, a one-off whose results
+    /// are not kept. `None` for what cannot be tested: a group, a REJECT, a
+    /// protocol not implemented yet, a test URL that does not parse.
+    pub async fn test_policies(
+        &self,
+        names: &[String],
+        url: Option<Url>,
+    ) -> Result<Results, UnknownPolicy> {
+        let registry = self.registry();
+        if let Some(name) = names.iter().find(|name| !policy_known(&registry, name)) {
+            return Err(UnknownPolicy(name.clone()));
+        }
+        let book = registry.auto().tests.clone();
+        let tests: Vec<_> = names
+            .iter()
+            .map(|name| {
+                let (case, book, url) = (registry.test_case(name), book.clone(), url.clone());
+                tokio::spawn(async move {
+                    let mut case = case?;
+                    Some(match url {
+                        None => book.test(case).await,
+                        Some(url) => {
+                            case.url = url;
+                            book.test_once(&case).await
+                        }
+                    })
+                })
+            })
+            .collect();
+        let mut out = Vec::with_capacity(names.len());
+        for (name, test) in names.iter().zip(tests) {
+            out.push((name.clone(), test.await.ok().flatten()));
+        }
+        Ok(out)
+    }
+
+    /// Tests every member of `group` now, whatever its `interval`, and the
+    /// members of the groups in it; the members of `group` that pass (M3
+    /// design 6.3, 6.6).
+    pub async fn test_group(&self, group: &str) -> Result<Vec<String>, SelectError> {
+        let registry = self.registry();
+        if registry.group(group).is_none() {
+            return Err(SelectError::UnknownGroup(group.to_string()));
+        }
+        Ok(registry.test_group(group).await)
+    }
+
+    /// The last test result of every member of every automatic group, the
+    /// groups in profile order; `None` for a member without one (not tested
+    /// yet, or never tested: a group, a REJECT).
+    pub fn test_results(&self) -> Vec<(String, Results)> {
+        let registry = self.registry();
+        registry
+            .group_names()
+            .into_iter()
+            .filter_map(|name| {
+                let group = registry.group(&name)?;
+                if !automatic(group.kind) {
+                    return None;
+                }
+                let members = group
+                    .members
+                    .iter()
+                    .map(|m| (m.clone(), registry.test_result(m)))
+                    .collect();
+                Some((name, members))
+            })
+            .collect()
     }
 }
 

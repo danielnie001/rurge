@@ -226,6 +226,29 @@ async fn a_derived_member_is_tested_through_its_relay() {
     assert_eq!(to_a, 2);
 }
 
+/// An override is what the group dials, and while it stands the group
+/// asks for no round of tests (M3 design 6.3, 6.5); clearing it gives the
+/// group back to its tests.
+#[tokio::test]
+async fn select_on_an_automatic_group_overrides_it_until_cleared() {
+    let origin = TestServer::spawn().await;
+    let (_a, _b, proxies) = upstreams(&origin).await;
+    let h = harness(Profile {
+        proxies: &proxies,
+        groups: "U = url-test, A, B",
+        rules: "DOMAIN,target.test,U",
+        ..Profile::default()
+    })
+    .await;
+    h.engine.select_group("U", "B").await.unwrap();
+    assert_eq!(chain_of(&h, "target.test").await, ["U", "B"]);
+    let auto = h.engine.registry().auto().clone();
+    assert!(auto.requested().is_empty() && auto.last_round("U").is_none());
+    h.engine.select_group("U", "").await.unwrap();
+    assert_eq!(chain_of(&h, "target.test").await, ["U", "A"]);
+    round_of(&h, "U").await;
+}
+
 /// An override stands while the group is defined the same way (M3 design
 /// 6.5): a reload of the same profile keeps it, one that changes the group
 /// drops it.

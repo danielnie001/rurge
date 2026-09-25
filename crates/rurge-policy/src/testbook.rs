@@ -150,40 +150,54 @@ impl TestBook {
         }
     }
 
-    async fn run(self: Arc<Self>, case: TestCase, tx: watch::Sender<Option<TestResult>>) {
-        let outcome = {
-            let _permit = self.permits.acquire().await.expect("never closed");
-            let record = self
-                .observer
-                .get()
-                .map(|observer| observer.begin(&case.policy, &case.url));
-            let outcome = match probe(&case.outbound, &case.url, case.timeout, case.roots.clone())
-                .await
-            {
-                Probed::Passed { score, reused } => {
-                    if !reused
-                        && self
-                            .warned
-                            .lock()
-                            .expect("warned")
-                            .insert(case.url.to_string())
-                    {
-                        // the URL stays out of the log: a subscription
-                        // line may have set it (M3-D7)
-                        tracing::warn!(
-                            policy = %case.policy,
-                            "the test server does not keep the connection: the score includes the dial"
-                        );
-                    }
-                    Ok(score)
+    /// Tests `case` once, beside whatever else runs: the result is not
+    /// kept and nobody else waits for it — the API's test at a URL of the
+    /// caller's choosing (M3 design 6.6).
+    pub async fn test_once(&self, case: &TestCase) -> TestResult {
+        let outcome = self.measure(case).await;
+        TestResult {
+            outcome,
+            at: Instant::now(),
+            when: SystemTime::now(),
+        }
+    }
+
+    /// One test, within the concurrency limit, seen by the observer.
+    async fn measure(&self, case: &TestCase) -> Result<Duration, String> {
+        let _permit = self.permits.acquire().await.expect("never closed");
+        let record = self
+            .observer
+            .get()
+            .map(|observer| observer.begin(&case.policy, &case.url));
+        let outcome = match probe(&case.outbound, &case.url, case.timeout, case.roots.clone()).await
+        {
+            Probed::Passed { score, reused } => {
+                if !reused
+                    && self
+                        .warned
+                        .lock()
+                        .expect("warned")
+                        .insert(case.url.to_string())
+                {
+                    // the URL stays out of the log: a subscription line may
+                    // have set it (M3-D7)
+                    tracing::warn!(
+                        policy = %case.policy,
+                        "the test server does not keep the connection: the score includes the dial"
+                    );
                 }
-                Probed::Failed(why) => Err(why),
-            };
-            if let Some(record) = record {
-                record.end(&outcome);
+                Ok(score)
             }
-            outcome
+            Probed::Failed(why) => Err(why),
         };
+        if let Some(record) = record {
+            record.end(&outcome);
+        }
+        outcome
+    }
+
+    async fn run(self: Arc<Self>, case: TestCase, tx: watch::Sender<Option<TestResult>>) {
+        let outcome = self.measure(&case).await;
         let result = TestResult {
             outcome,
             at: Instant::now(),
@@ -382,6 +396,20 @@ mod tests {
         book.test(case("P", gate.clone(), 1)).await;
         assert_eq!(gate.dials.load(Ordering::SeqCst), 1);
         assert!(book.result("P", 1).is_some());
+    }
+
+    /// A one-off test is seen like any other, and leaves nothing behind.
+    #[tokio::test]
+    async fn a_one_off_test_keeps_nothing() {
+        let seen = Arc::new(Seen::default());
+        let book = book();
+        book.observe(Arc::new(seen.clone()));
+        let once = book
+            .test_once(&case("P", Arc::new(Gate::default()), 1))
+            .await;
+        assert_eq!(once.outcome, Err("connect: closed by the gate".to_string()));
+        assert_eq!(book.result("P", 1), None);
+        assert_eq!(seen.0.lock().unwrap().len(), 2, "begin and end");
     }
 
     /// A test outlives whoever asked for it: its result is kept.

@@ -123,6 +123,12 @@ async fn api() -> Api {
 
 /// `rules` are inserted before `DOMAIN,ads.test,REJECT` / `FINAL,DIRECT`.
 async fn api_with(rules: &str) -> Api {
+    api_in(rules, "").await
+}
+
+/// `groups` go after `Pick`. A proxy is tested at a closed loopback port,
+/// never at the default `http://bing.com/`.
+async fn api_in(rules: &str, groups: &str) -> Api {
     let dns = MockDns::spawn().await;
     dns.set("target.test", &["127.0.0.1"], &[], 60);
     dns.set("cached.test", &["10.0.0.1"], &[], 300);
@@ -133,9 +139,9 @@ async fn api_with(rules: &str) -> Api {
     let conf = dir.path().join("t.conf");
     let profile = format!(
         "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\ndns-server = {}\nipv6 = false\n\
-internet-test-url = http://target.test:{}/hello\n\
+internet-test-url = http://target.test:{}/hello\nproxy-test-url = http://127.0.0.1:9/\n\
 [Proxy]\nHK = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\nBlock = reject-tinygif\n\
-[Proxy Group]\nPick = select, HK, DIRECT\n\
+[Proxy Group]\nPick = select, HK, DIRECT\n{groups}\n\
 [Rule]\n{rules}\nDOMAIN,ads.test,REJECT\nFINAL,DIRECT\n",
         dns.addr(),
         target.url("/").port().unwrap()
@@ -964,6 +970,131 @@ async fn select_refuses_what_is_not_a_member_of_a_select_group() {
         get(&api, "/v1/policy_groups/select?group_name=Pick").await,
         (200, json!({ "policy": "HK" })),
         "nothing changed"
+    );
+}
+
+/// Falls over from HK (a protocol rurge does not speak yet: it never
+/// passes) to DIRECT, tested at `internet-test-url` on the loopback server.
+const AUTO: &str = "Auto = fallback, HK, DIRECT";
+
+#[tokio::test]
+async fn policies_are_tested_on_request() {
+    let api = api_in("", AUTO).await;
+    // at a URL of the caller's: a one-off, nothing is kept
+    let (status, body) = post(
+        &api,
+        "/v1/policies/test",
+        json!({ "policy_names": ["DIRECT"], "url": api.target_url() }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["DIRECT"]["delay"].is_u64(), "{body}");
+    assert!(body["DIRECT"]["time"].is_f64(), "{body}");
+    let (_, results) = get(&api, "/v1/policy_groups/test_results").await;
+    assert_eq!(results["Auto"]["DIRECT"], Value::Null, "{results}");
+    // at each one's own test URL: kept, and the groups pick by it
+    let (status, body) = post(
+        &api,
+        "/v1/policies/test",
+        json!({ "policy_names": ["DIRECT", "Block", "HK", "Pick"] }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["DIRECT"]["delay"].is_u64(), "{body}");
+    for name in ["Block", "HK", "Pick"] {
+        assert_eq!(body[name], json!({ "error": "not testable" }), "{name}");
+    }
+    let (_, results) = get(&api, "/v1/policy_groups/test_results").await;
+    assert!(results["Auto"]["DIRECT"]["delay"].is_u64(), "{results}");
+    assert_eq!(
+        post(
+            &api,
+            "/v1/policies/test",
+            json!({ "policy_names": ["DIRECT", "Nope"] })
+        )
+        .await,
+        (400, json!({ "error": "unknown policy `Nope`" }))
+    );
+    assert_eq!(
+        post(
+            &api,
+            "/v1/policies/test",
+            json!({ "policy_names": ["DIRECT"], "url": "not a url" })
+        )
+        .await,
+        (400, json!({ "error": "`url` is not a URL" }))
+    );
+}
+
+#[tokio::test]
+async fn a_group_is_tested_on_request() {
+    let api = api_in("", AUTO).await;
+    assert_eq!(
+        get(&api, "/v1/policy_groups/test_results").await,
+        (200, json!({ "Auto": { "HK": null, "DIRECT": null } })),
+        "the automatic groups only, nothing tested yet"
+    );
+    assert_eq!(
+        post(
+            &api,
+            "/v1/policy_groups/test",
+            json!({ "group_name": "Auto" })
+        )
+        .await,
+        (200, json!({ "available": ["DIRECT"] }))
+    );
+    let (_, results) = get(&api, "/v1/policy_groups/test_results").await;
+    assert!(results["Auto"]["DIRECT"]["delay"].is_u64(), "{results}");
+    assert_eq!(results["Auto"]["HK"], Value::Null);
+    assert_eq!(
+        get(&api, "/v1/policy_groups/select?group_name=Auto").await,
+        (200, json!({ "policy": "DIRECT" })),
+        "HK fails: the group falls over to DIRECT"
+    );
+    assert_eq!(
+        post(
+            &api,
+            "/v1/policy_groups/test",
+            json!({ "group_name": "Nope" })
+        )
+        .await,
+        (400, json!({ "error": "unknown policy group `Nope`" }))
+    );
+}
+
+#[tokio::test]
+async fn select_on_an_automatic_group_overrides_it_until_cleared() {
+    let api = api_in("DOMAIN,target.test,Auto", AUTO).await;
+    let select = |policy: &str| json!({ "group_name": "Auto", "policy": policy });
+    assert_eq!(
+        post(&api, "/v1/policy_groups/select", select("DIRECT")).await,
+        (200, json!({}))
+    );
+    assert_eq!(
+        get(&api, "/v1/policy_groups/select?group_name=Auto").await,
+        (200, json!({ "policy": "DIRECT" }))
+    );
+    let (head, body) = get_via_proxy(api.http(), &api.target_url()).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"hi there");
+    // an override is not written to state.json
+    let saved: Value = std::fs::read_to_string(&api.state_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(Value::Null);
+    assert_eq!(saved["group_selections"]["t.conf"]["Auto"], Value::Null);
+    // an empty `policy` clears it: nothing tested yet, the first member
+    assert_eq!(
+        post(&api, "/v1/policy_groups/select", select("")).await,
+        (200, json!({}))
+    );
+    assert_eq!(
+        get(&api, "/v1/policy_groups/select?group_name=Auto").await,
+        (200, json!({ "policy": "HK" }))
+    );
+    assert_eq!(
+        post(&api, "/v1/policy_groups/select", select("Block")).await,
+        (400, json!({ "error": "`Block` is not a member of `Auto`" }))
     );
 }
 

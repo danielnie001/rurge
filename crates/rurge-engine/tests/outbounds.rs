@@ -525,12 +525,12 @@ async fn a_selection_applies_to_the_next_connection_and_survives_a_restart() {
 }
 
 #[tokio::test]
-async fn only_a_member_of_a_select_group_can_be_selected() {
+async fn only_a_member_can_be_selected() {
     let origin = TestServer::spawn().await;
     let (_a, _b, proxies) = two_entries(&origin).await;
     let h = harness(Profile {
         proxies: &proxies,
-        groups: PICK,
+        groups: &format!("{PICK}\nSmart = smart, A, B"),
         ..Profile::default()
     })
     .await;
@@ -544,8 +544,15 @@ async fn only_a_member_of_a_select_group_can_be_selected() {
         "a policy is not a group"
     );
     assert_eq!(
-        h.engine.select_group("Auto", "A").await,
-        Err(SelectError::NotSelectable("Auto".into()))
+        h.engine.select_group("Smart", "A").await,
+        Err(SelectError::NotSelectable("Smart".into()))
+    );
+    assert_eq!(
+        h.engine.select_group("Auto", "C").await,
+        Err(SelectError::NotAMember {
+            group: "Auto".into(),
+            member: "C".into()
+        })
     );
     assert_eq!(
         h.engine.select_group("Pick", "C").await,
@@ -575,7 +582,7 @@ async fn only_a_member_of_a_select_group_can_be_selected() {
     );
     assert_eq!(
         SelectError::NotSelectable("G".into()).to_string(),
-        "`G` is not a select group"
+        "`G` does not take a selection"
     );
     assert_eq!(
         SelectError::NotAMember {

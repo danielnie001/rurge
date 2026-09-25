@@ -1,8 +1,10 @@
 //! Policy groups as the control plane sees them, and the one thing it may
-//! change: the selection of a `select` group (M1 design 6.3). Everything is
-//! read from the registry in use, so imported and derived members show up
-//! as they come and go (phase 2 M3 design 5.5).
+//! change: the selection of a `select` group (M1 design 6.3), which for an
+//! automatic group is an override (phase 2 M3-D10). Everything is read from
+//! the registry in use, so imported and derived members show up as they
+//! come and go (phase 2 M3 design 5.5).
 
+use crate::auto::automatic;
 use crate::engine::Engine;
 use crate::state::profile_key;
 use rurge_config::GroupKind;
@@ -43,7 +45,7 @@ impl fmt::Display for SelectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SelectError::UnknownGroup(g) => write!(f, "unknown policy group `{g}`"),
-            SelectError::NotSelectable(g) => write!(f, "`{g}` is not a select group"),
+            SelectError::NotSelectable(g) => write!(f, "`{g}` does not take a selection"),
             SelectError::NotAMember { group, member } => {
                 write!(f, "`{member}` is not a member of `{group}`")
             }
@@ -131,22 +133,39 @@ impl Engine {
         Ok(registry.current_member(group).unwrap_or_default())
     }
 
-    /// Takes effect for the next connection and is written to `state.json`
-    /// under the profile's file name.
+    /// A `select` group: the selection, which takes effect for the next
+    /// connection and is written to `state.json` under the profile's file
+    /// name. An automatic group: an override, which stands until an empty
+    /// `member` clears it, a reload changes the group, or the process ends
+    /// (M3-D10, M3 design 6.5).
     pub async fn select_group(&self, group: &str, member: &str) -> Result<(), SelectError> {
         {
             let registry = self.registry();
-            let Some(g) = registry.group(group) else {
+            let Some(spec) = registry.group_spec(group) else {
                 return Err(SelectError::UnknownGroup(group.to_string()));
             };
-            if g.kind != GroupKind::Select {
+            let is_auto = automatic(spec.kind);
+            if !is_auto && spec.kind != GroupKind::Select {
                 return Err(SelectError::NotSelectable(group.to_string()));
             }
-            if !g.members.iter().any(|m| m == member) {
+            if is_auto && member.is_empty() {
+                registry.auto().clear_override(group);
+                return Ok(());
+            }
+            if !registry
+                .members(group)
+                .unwrap_or_default()
+                .iter()
+                .any(|m| m == member)
+            {
                 return Err(SelectError::NotAMember {
                     group: group.to_string(),
                     member: member.to_string(),
                 });
+            }
+            if is_auto {
+                registry.auto().set_override(spec, member);
+                return Ok(());
             }
         }
         self.shared().selections.set(group, member);

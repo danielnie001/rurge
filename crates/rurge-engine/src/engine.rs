@@ -591,7 +591,7 @@ enum Chosen {
 /// so a reload or a subscription update racing a dial can never approve a
 /// name against one registry and then resolve it (`PolicyRegistry::resolve`)
 /// against another.
-fn policy_known(registry: &PolicyRegistry, name: &str) -> bool {
+pub(crate) fn policy_known(registry: &PolicyRegistry, name: &str) -> bool {
     matches!(PolicyRef::parse(name), PolicyRef::Builtin(_)) || registry.contains(name)
 }
 
