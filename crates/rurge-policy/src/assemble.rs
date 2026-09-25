@@ -129,6 +129,38 @@ fn report(group: &GroupSpec, sub: &Subscription, diags: &mut Diagnostics) {
     }
 }
 
+/// Why subscription line `p` may not be taken in: it reaches by name for
+/// the profile's own material — a `[Keystore]` item, or a policy or group of
+/// the profile as its relay — which only the user may hand it, through the
+/// group's `external-policy-modifier`. A subscription is somebody else's
+/// content, and a relay or a client certificate would be used as soon as the
+/// line is tested, chosen or not. A relay to another imported line, or to
+/// `DIRECT`, is the subscription's own business.
+fn reaches_into_profile(
+    cfg: &Config,
+    p: &ProxyPolicy,
+    modifier: &[(String, String)],
+) -> Option<&'static str> {
+    let set_by_modifier = |key: &str| modifier.iter().any(|(k, _)| k.eq_ignore_ascii_case(key));
+    if p.params.get("client-cert").is_some() && !set_by_modifier("client-cert") {
+        return Some(
+            "a subscription line's own `client-cert` is not honoured (only `external-policy-modifier` may set it)",
+        );
+    }
+    if let Some(relay) = p.params.get("underlying-proxy")
+        && !set_by_modifier("underlying-proxy")
+        && matches!(
+            cfg.name_kind(relay.trim()),
+            Some(NameKind::Policy(_) | NameKind::Group)
+        )
+    {
+        return Some(
+            "a subscription line's own `underlying-proxy` may not name a policy or group of the profile (only `external-policy-modifier` may)",
+        );
+    }
+    None
+}
+
 /// The policies groups took in, each with the group that brought it.
 struct Imports<'a> {
     /// In import order.
@@ -171,6 +203,14 @@ impl<'a> Imports<'a> {
                     continue;
                 }
                 let line = p.span.line;
+                if let Some(why) = reaches_into_profile(cfg, p, modifier) {
+                    diags.push(warn(
+                        g,
+                        codes::W_SET_LINES_SKIPPED,
+                        format!("`policy-path` line {line}: {why}; skipped"),
+                    ));
+                    continue;
+                }
                 let name = format!("{prefix}{}", p.name);
                 let definition = if modifier.is_empty() {
                     p.definition.clone()
@@ -967,21 +1007,23 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
     }
 
     /// A chain that comes back to where it started would never finish
-    /// dialling: the import that closes it is left out.
+    /// dialling: the import that closes it is left out. (Only the user's own
+    /// modifier can point an imported line at the profile's policies.)
     #[test]
     fn an_imported_chain_that_leads_back_is_dropped() {
         let cfg = profile(
             "Entry = http, e.test, 80, underlying-proxy=Pool",
-            "Pool = select, policy-path=https://sub.test/p",
+            "Pool = select, policy-path=https://sub.test/p, include-other-group=Other, \
+external-policy-modifier=\"underlying-proxy=Entry\"\nOther = select, policy-path=https://sub.test/o",
         );
         let a = assemble(
             &cfg,
             &snapshots(
                 &cfg,
-                &[(
-                    "Pool",
-                    "Loop = http, l.test, 80, underlying-proxy=Entry\nFine = http, f.test, 80",
-                )],
+                &[
+                    ("Pool", "Loop = http, l.test, 80"),
+                    ("Other", "Fine = http, f.test, 80"),
+                ],
             ),
         );
         assert_eq!(members(&a, "Pool"), ["Fine"]);
@@ -1321,31 +1363,32 @@ G3 = select, include-other-group=G1",
     }
 
     /// The relay of a group is an edge too: an imported line that goes back
-    /// through the group whose relay imported it would never finish
-    /// dialling, so it is left out and the group's own members keep theirs.
+    /// through the group whose relay reaches it would never finish dialling,
+    /// so it is left out and the other members keep theirs. (Only the user's
+    /// own modifier can point an imported line at a group of the profile.)
     #[test]
     fn an_imported_chain_through_a_group_relay_is_dropped() {
         let cfg = profile(
             "A = http, a.test, 80",
-            "G = select, A, underlying-proxy=R\nR = select, policy-path=https://sub.test/r",
+            "G = select, A, underlying-proxy=R\n\
+R = select, policy-path=https://sub.test/r, include-other-group=M\n\
+M = select, policy-path=https://sub.test/m, external-policy-modifier=\"underlying-proxy=G\"",
         );
         let a = assemble(
             &cfg,
             &snapshots(
                 &cfg,
-                &[(
-                    "R",
-                    "X = http, x.test, 80, underlying-proxy=G\nY = http, y.test, 80",
-                )],
+                &[("R", "Y = http, y.test, 80"), ("M", "X = http, x.test, 80")],
             ),
         );
         assert_eq!(members(&a, "R"), ["Y"]);
+        assert!(members(&a, "M").is_empty());
         assert_eq!(members(&a, "G"), ["A (via R)"]);
         assert_eq!(
             warnings(&a),
             [(
                 codes::W_SET_LINES_SKIPPED,
-                "policy group `R`: `policy-path` line 1: the `underlying-proxy` of `X` leads back to the policy itself; skipped"
+                "policy group `M`: `policy-path` line 1: the `underlying-proxy` of `X` leads back to the policy itself; skipped"
                     .to_string()
             )]
         );
@@ -1356,5 +1399,62 @@ G3 = select, include-other-group=G1",
         let cfg = profile("A = http, a.test, 80", "P = select, Q, A\nQ = select, P");
         let a = assemble(&cfg, &Snapshots::new());
         assert_eq!(a.cycles, [["P", "Q", "P"]]);
+    }
+
+    /// A subscription is somebody else's content: its lines may not reach
+    /// for the profile's own material by name — a `[Keystore]` item, a
+    /// policy or group as a relay — unless the user's own modifier sets that
+    /// parameter. A relay to another imported line stays allowed.
+    #[test]
+    fn a_subscription_line_may_not_reach_into_the_profile() {
+        let cfg = profile(
+            "Corp = http, corp.test, 80",
+            "G = select, policy-path=https://sub.test/g\n\
+Pool = select, Corp\n\
+H = select, policy-path=https://sub.test/h, external-policy-modifier=\"underlying-proxy=Corp\"",
+        );
+        let a = assemble(
+            &cfg,
+            &snapshots(
+                &cfg,
+                &[
+                    (
+                        "G",
+                        "Cert = https, c.test, 443, client-cert=corp-cert\n\
+Relay = http, r.test, 80, underlying-proxy=Corp\nVia = http, v.test, 80, underlying-proxy=Pool\n\
+Inner = http, i.test, 80, underlying-proxy=Hop\nHop = http, h.test, 80",
+                    ),
+                    ("H", "Mod = http, m.test, 80, underlying-proxy=Elsewhere"),
+                ],
+            ),
+        );
+        assert_eq!(members(&a, "G"), ["Inner", "Hop"]);
+        assert_eq!(members(&a, "H"), ["Mod"]);
+        let relay = |name: &str| {
+            a.imported
+                .iter()
+                .find(|i| i.policy.name == name)
+                .and_then(|i| i.spec.as_ref())
+                .and_then(|s| s.common.underlying_proxy.clone())
+        };
+        assert_eq!(relay("Inner").as_deref(), Some("Hop"));
+        assert_eq!(relay("Mod").as_deref(), Some("Corp"));
+        assert_eq!(
+            warnings(&a),
+            [
+                (
+                    codes::W_SET_LINES_SKIPPED,
+                    "policy group `G`: `policy-path` line 1: a subscription line's own `client-cert` is not honoured (only `external-policy-modifier` may set it); skipped".to_string()
+                ),
+                (
+                    codes::W_SET_LINES_SKIPPED,
+                    "policy group `G`: `policy-path` line 2: a subscription line's own `underlying-proxy` may not name a policy or group of the profile (only `external-policy-modifier` may); skipped".to_string()
+                ),
+                (
+                    codes::W_SET_LINES_SKIPPED,
+                    "policy group `G`: `policy-path` line 3: a subscription line's own `underlying-proxy` may not name a policy or group of the profile (only `external-policy-modifier` may); skipped".to_string()
+                ),
+            ]
+        );
     }
 }
