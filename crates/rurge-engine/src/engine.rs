@@ -151,13 +151,16 @@ pub struct Engine {
     global_warned: AtomicBool,
     state: OnceLock<Arc<StateStore>>,
     shared: EngineShared,
-    /// Held while a registry or a whole generation is published.
+    /// Held while a registry or a whole generation is published, and while
+    /// every dial reads the runtime and the registry as one pair
+    /// (`snapshot`).
     generation: std::sync::Mutex<()>,
 }
 
 impl Engine {
-    /// Must be called inside a tokio runtime: a generation with subscriptions
-    /// starts a watcher task (`watch_subscriptions`).
+    /// Must be called inside a tokio runtime: it always starts the test
+    /// scheduler task (`start_tests`), and a generation with subscriptions
+    /// also a watcher task (`watch_subscriptions`).
     pub fn new(mut runtime: Runtime) -> Arc<Engine> {
         let observe = Arc::new(Observe {
             log: RequestLog::new(runtime.request_log_size),
@@ -200,7 +203,10 @@ impl Engine {
 
     /// Held while a registry or a whole generation is published, so a
     /// subscription rebuild of a generation that is going out never publishes
-    /// after its successor (M3 design 5.7). Never held across I/O.
+    /// after its successor (M3 design 5.7) — and by every dial's `snapshot`,
+    /// to read the runtime and the registry as one pair. Nothing inside it
+    /// may do I/O, a name resolution, a dial or a build: that would hold up
+    /// every dial.
     pub(crate) fn generation_lock(&self) -> std::sync::MutexGuard<'_, ()> {
         self.generation.lock().expect("generation lock")
     }
@@ -611,7 +617,11 @@ pub(crate) fn policy_known(registry: &PolicyRegistry, name: &str) -> bool {
 /// proxy hop of its chain. A hop whose `underlying-proxy` currently resolves
 /// to DIRECT is that last hop: DIRECT opens the socket, and the name it looks
 /// up is that hop's own server. `None` when the chain ends at REJECT (it fails
-/// fast, it does not loop) or is deeper than the registry allows.
+/// fast, it does not loop), or the walk runs past `MAX_DEPTH` hops — its own
+/// bound, not the registry's: the registry's `MAX_DEPTH` bounds group nesting
+/// within one resolution, and each hop here (like a real dial's
+/// `ChainConnector`) resolves fresh at depth 0; a chain that long is treated
+/// the same as one ending at REJECT.
 fn socket_opener<'a>(registry: &'a PolicyRegistry, name: &str) -> Option<&'a PolicySpec> {
     let mut current = name.to_string();
     for _ in 0..rurge_policy::registry::MAX_DEPTH {
@@ -634,9 +644,11 @@ fn socket_opener<'a>(registry: &'a PolicyRegistry, name: &str) -> Option<&'a Pol
     None
 }
 
-/// The bypass both anti-loop arms of `dial_internal` take: note `why` on the
-/// session, connect with `fallback`, and finish the handle explicitly when
-/// even that fails — it would otherwise be dropped without a finished record.
+/// The bypass every anti-loop arm of `dial_internal` takes (a REJECT, a
+/// proxy configured by host name, a chain that ends at REJECT): note `why`
+/// on the session, connect with `fallback`, and finish the handle explicitly
+/// when even that fails — it would otherwise be dropped without a finished
+/// record.
 async fn bypass_to_direct(
     handle: Arc<SessionHandle>,
     fallback: &Arc<dyn Connector>,

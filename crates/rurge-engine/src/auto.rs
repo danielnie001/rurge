@@ -14,7 +14,7 @@ use rurge_policy::auto::SelectCtx;
 use rurge_policy::testbook::{TestObserver, TestRecord, TestResult};
 use rurge_policy::{PolicyRegistry, Resolution};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 use url::Url;
 
 /// The rule a test session shows in the request log.
@@ -131,7 +131,19 @@ impl Engine {
             .collect();
         let mut out = Vec::with_capacity(names.len());
         for (name, test) in names.iter().zip(tests) {
-            out.push((name.clone(), test.await.ok().flatten()));
+            // `None` stays reserved for what cannot be tested (`test_case`
+            // returning `None`); a task that panicked or was cancelled still
+            // ends with a result, the same as `TestBook::test` gives a
+            // waiter of a test whose task died.
+            let result = match test.await {
+                Ok(result) => result,
+                Err(_) => Some(TestResult {
+                    outcome: Err("the test did not finish".to_string()),
+                    at: Instant::now(),
+                    when: SystemTime::now(),
+                }),
+            };
+            out.push((name.clone(), result));
         }
         Ok(out)
     }

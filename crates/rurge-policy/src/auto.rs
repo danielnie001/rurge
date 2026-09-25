@@ -172,18 +172,17 @@ impl AutoGroups {
     /// receives. Until then requests only pile up in `requested`.
     pub fn connect(&self) -> mpsc::UnboundedReceiver<String> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let requested: Vec<String> = self
-            .state
-            .lock()
-            .expect("auto groups")
-            .requested
-            .iter()
-            .cloned()
-            .collect();
-        for group in requested {
+        // `state` stays locked from copying `requested` until the sender is
+        // installed in `wake` (lock order state -> wake; `wake()` takes the
+        // two one after the other and never holds both, so there is no
+        // cycle). A `wake` that lands in between is then either already in
+        // this copy or finds the sender.
+        let state = self.state.lock().expect("auto groups");
+        for group in state.requested.iter().cloned() {
             let _ = tx.send(group);
         }
         *self.wake.lock().expect("wake") = Some(tx);
+        drop(state);
         rx
     }
 

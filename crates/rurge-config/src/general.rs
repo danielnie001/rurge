@@ -322,6 +322,32 @@ fn invalid(diags: &mut Diagnostics, span: &Span, key: &str, value: &str) {
     );
 }
 
+/// Keeps `current` unless `value` parses as an `http://` or `https://` URL —
+/// never echoed: `internet-test-url` / `proxy-test-url` may be set from the
+/// same profile a subscription line's `test-url=` came from, and the two
+/// share one diagnostic wording either way.
+fn test_url_or(
+    diags: &mut Diagnostics,
+    span: &Span,
+    key: &str,
+    value: &str,
+    current: &str,
+) -> String {
+    match url::Url::parse(value) {
+        Ok(u) if u.scheme() == "http" || u.scheme() == "https" => value.to_string(),
+        _ => {
+            diags.push(
+                Diagnostic::warning(
+                    codes::W_INVALID_VALUE,
+                    format!("`{key}` is not an http:// or https:// URL; using the default"),
+                )
+                .at(span.clone()),
+            );
+            current.to_string()
+        }
+    }
+}
+
 fn bool_or(diags: &mut Diagnostics, span: &Span, key: &str, value: &str, current: bool) -> bool {
     match parse_bool(value) {
         Some(b) => b,
@@ -599,8 +625,12 @@ pub fn parse_general(section: Option<&Section>, diags: &mut Diagnostics) -> Gene
             }
             "http-api-tls" => set_bool!(http_api_tls),
             "http-api-web-dashboard" => set_bool!(http_api_web_dashboard),
-            "internet-test-url" => g.internet_test_url = value.to_string(),
-            "proxy-test-url" => g.proxy_test_url = value.to_string(),
+            "internet-test-url" => {
+                g.internet_test_url = test_url_or(diags, span, key, value, &g.internet_test_url)
+            }
+            "proxy-test-url" => {
+                g.proxy_test_url = test_url_or(diags, span, key, value, &g.proxy_test_url)
+            }
             "test-timeout" => match value.trim().parse::<u64>() {
                 Ok(s) => g.test_timeout = Some(Duration::from_secs(s)),
                 Err(_) => invalid(diags, span, key, value),
@@ -881,6 +911,40 @@ test-timeout = 3
             g.test_target(None, None, true),
             ("http://bing.com/", Duration::from_secs(3))
         );
+    }
+
+    /// A value that does not parse as `http://` or `https://` warns without
+    /// repeating it, and the default is kept — an unparseable test URL must
+    /// not silently turn testing off for every policy.
+    #[test]
+    fn a_test_url_that_is_not_http_warns_without_echoing_it() {
+        let (g, d) = parse(
+            "[General]
+proxy-test-url = 127.0.0.1:9/generate_204?token=t0k3n
+internet-test-url = ftp://127.0.0.1:9/?token=t0k3n
+",
+        );
+        assert_eq!(g.proxy_test_url, "http://bing.com/");
+        assert_eq!(g.internet_test_url, "http://bing.com/");
+        let messages: Vec<&str> = d.iter().map(|x| x.message.as_str()).collect();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        for message in &messages {
+            assert!(!message.contains("t0k3n"), "{message}");
+        }
+        assert!(
+            messages.iter().any(|m| m.contains("`proxy-test-url`")),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("`internet-test-url`")),
+            "{messages:?}"
+        );
+        let codes: Vec<&str> = d.iter().map(|x| x.code).collect();
+        assert_eq!(codes, [codes::W_INVALID_VALUE, codes::W_INVALID_VALUE]);
+
+        let (g, d) = parse("[General]\nproxy-test-url = https://127.0.0.1:9/\n");
+        assert_eq!(g.proxy_test_url, "https://127.0.0.1:9/");
+        assert!(d.is_empty(), "{d:?}");
     }
 
     #[test]

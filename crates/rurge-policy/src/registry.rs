@@ -1,7 +1,8 @@
 //! Name → outbound resolution (M3 design §5, M1 design 6.2; phase 2 M3
 //! design 5.5, 5.6). Built for every config generation and every
-//! subscription update; `resolve` is a table walk with no allocation beyond
-//! the chain and the group selections it reads.
+//! subscription update; `resolve` is a table walk — through an automatic
+//! group it also works out every member's standing and builds a test case
+//! per member (phase 2 M3 design §6).
 
 use crate::assemble::Assembly;
 use crate::auto::{AutoGroups, SelectCtx, Standing, fallback, load_balance, url_test};

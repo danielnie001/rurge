@@ -19,9 +19,11 @@ const SECRET_KEYS: [&str; 7] = [
 /// nodes behind a CDN routinely use as a shared secret. `shadow-tls-password`
 /// needs its own entry: `password` only matches at a token boundary. A
 /// group's `policy-path` usually carries a subscription token, and its
-/// `external-policy-modifier` can set any parameter, a password included.
-/// Over-redacting is the safe side for an endpoint whose purpose is safe output.
-const SECRET_PARAMS: [&str; 14] = [
+/// `external-policy-modifier` can set any parameter, a password included. A
+/// policy's `test-url` can come from a subscription line and carry its
+/// token. Over-redacting is the safe side for an endpoint whose purpose is
+/// safe output.
+const SECRET_PARAMS: [&str; 15] = [
     "password",
     "psk",
     "private-key",
@@ -36,6 +38,7 @@ const SECRET_PARAMS: [&str; 14] = [
     "shadow-tls-password",
     "policy-path",
     "external-policy-modifier",
+    "test-url",
 ];
 const KEY_AT_KEYS: [&str; 4] = [
     "http-api",
@@ -524,6 +527,21 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
         assert_eq!(
             redact_profile("G = select, policy-path=nodes.txt"),
             "G = select, policy-path=***"
+        );
+    }
+
+    /// A policy's `test-url` can come from a subscription line and carry its
+    /// token; `[General]`'s own `proxy-test-url` / `internet-test-url` are
+    /// not inline parameters and are left alone.
+    #[test]
+    fn a_policy_line_loses_its_test_url() {
+        assert_eq!(
+            redact_definition("http, 127.0.0.1, 80, test-url=http://t.test/?token=t0k3n, tfo=true"),
+            "http, 127.0.0.1, 80, test-url=***, tfo=true"
+        );
+        assert_eq!(
+            redact_profile("[General]\nproxy-test-url = http://p.test/\n"),
+            "[General]\nproxy-test-url = http://p.test/\n"
         );
     }
 }

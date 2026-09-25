@@ -3,7 +3,9 @@
 //! it took; the factory trait real outbounds come from; the cell and the
 //! selection table that outlive a config generation; what a `policy-path`
 //! subscription holds and the members a group assembles from everything it
-//! takes in (phase 2 M3 design 5.2, 5.3).
+//! takes in (phase 2 M3 design 5.2, 5.3); and the connectivity tests and the
+//! automatic groups that pick by them (`probe`, `testbook`, `auto`; phase 2
+//! M3 design §6).
 
 pub mod assemble;
 pub mod auto;

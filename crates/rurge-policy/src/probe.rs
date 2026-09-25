@@ -4,8 +4,8 @@
 //! one connection, the second one timed.
 
 use bytes::Bytes;
-use http::Request;
 use http::header::{CONNECTION, HOST, USER_AGENT};
+use http::{HeaderValue, Method, Request};
 use http_body_util::Empty;
 use hyper_util::rt::TokioIo;
 use rurge_config::HostName;
@@ -76,6 +76,19 @@ async fn run(
     let port = url
         .port_or_known_default()
         .ok_or("the test URL has no port")?;
+    // Both HEAD requests are built from these parts, before dialling: a test
+    // URL that cannot fit a request line (a subscription line's `test-url=`
+    // or the API's `url` may set one this long) must fail without opening a
+    // connection and without a panic.
+    let authority = match url.port() {
+        Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
+        None => url.host_str().unwrap_or_default().to_string(),
+    };
+    let too_long = || "the test URL does not fit in a request line".to_string();
+    let target: http::Uri = url[url::Position::BeforePath..url::Position::AfterQuery]
+        .parse()
+        .map_err(|_| too_long())?;
+    let host_value = HeaderValue::from_str(&authority).map_err(|_| too_long())?;
     let started = Instant::now();
     let stream = outbound
         .connect_tcp(&Target::new(host, port), &ConnectOpts { timeout })
@@ -100,16 +113,18 @@ async fn run(
     let _driver = Driver(tokio::spawn(async move {
         let _ = connection.await;
     }));
-    let authority = match url.port() {
-        Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
-        None => url.host_str().unwrap_or_default().to_string(),
-    };
+    // Built from `target` / `host_value`, never from the URL directly: those
+    // two are already known to fit a request line, so this cannot fail.
     let head = || {
-        Request::head(url[url::Position::BeforePath..url::Position::AfterQuery].to_string())
-            .header(HOST, &authority)
-            .header(USER_AGENT, concat!("rurge/", env!("CARGO_PKG_VERSION")))
-            .body(Empty::<Bytes>::new())
-            .expect("a HEAD request")
+        let mut req = Request::new(Empty::<Bytes>::new());
+        *req.method_mut() = Method::HEAD;
+        *req.uri_mut() = target.clone();
+        req.headers_mut().insert(HOST, host_value.clone());
+        req.headers_mut().insert(
+            USER_AGENT,
+            HeaderValue::from_static(concat!("rurge/", env!("CARGO_PKG_VERSION"))),
+        );
+        req
     };
     let first = sender
         .send_request(head())
@@ -301,6 +316,25 @@ mod tests {
         assert_eq!(
             ftp,
             Probed::Failed("the test URL is neither http nor https".to_string())
+        );
+    }
+
+    /// Through a REJECT outbound this reason can only come from a check made
+    /// before connecting — a dial would fail first with `connect: …`.
+    #[tokio::test]
+    async fn a_test_url_too_long_for_a_request_line_fails_before_connecting() {
+        let reject: OutboundRef = Arc::new(Reject::new(RejectKind::Reject));
+        let url = Url::parse(&format!("http://127.0.0.1:9/{}", "a".repeat(70_000))).unwrap();
+        let probed = probe(
+            &reject,
+            &url,
+            Duration::from_secs(5),
+            rurge_net::tls::root_store(),
+        )
+        .await;
+        assert_eq!(
+            probed,
+            Probed::Failed("the test URL does not fit in a request line".to_string())
         );
     }
 }

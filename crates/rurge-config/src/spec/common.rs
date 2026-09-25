@@ -136,7 +136,11 @@ pub(crate) fn read_common(
         if lower.starts_with("http://") || lower.starts_with("https://") {
             test_url = Some(v.trim().to_string());
         } else {
-            r.invalid("test-url", v, "an http:// or https:// URL");
+            // never echoed: a subscription line may have set it (M3-D7)
+            r.error(
+                codes::E_INVALID_POLICY_PARAM,
+                "`test-url` is not an http:// or https:// URL".to_string(),
+            );
         }
     }
     let mut test_timeout = None;
@@ -305,6 +309,22 @@ mod tests {
                 diags[0].message
             );
         }
+    }
+
+    #[test]
+    fn a_bad_test_url_is_an_error_that_never_echoes_it() {
+        let (_, _, diags) = read(
+            "http, h, 1, test-url=ftp://t.test/?token=t0k3n",
+            Applies::Proxy,
+        );
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code, codes::E_INVALID_POLICY_PARAM);
+        assert!(
+            diags[0].message.contains("`test-url`"),
+            "{}",
+            diags[0].message
+        );
+        assert!(!diags[0].message.contains("t0k3n"), "{}", diags[0].message);
     }
 
     #[test]
