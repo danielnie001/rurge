@@ -12,6 +12,7 @@ pub mod probe;
 pub mod registry;
 pub mod selections;
 pub mod subscription;
+pub mod testbook;
 #[cfg(test)]
 pub(crate) mod testing;
 
