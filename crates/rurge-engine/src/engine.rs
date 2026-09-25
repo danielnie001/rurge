@@ -604,7 +604,9 @@ fn socket_opener<'a>(registry: &'a PolicyRegistry, name: &str) -> Option<&'a Pol
         let Some(under) = spec.common.underlying_proxy.as_deref() else {
             return Some(spec);
         };
-        let below = registry.resolve(&PolicyRef::Named(under.to_string()));
+        // as the hop's `ChainConnector` will: a relay group without members
+        // refuses there, so it is REJECT here too
+        let below = registry.resolve_relay(under);
         match below.terminal {
             // a `Proxy` terminal is the hop the last chain element names; this
             // hop's server travels to it as a target and is never looked up here

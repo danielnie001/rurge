@@ -500,8 +500,15 @@ impl PolicyRegistry {
         match policy {
             PolicyRef::Builtin(b) => self.builtin(*b, &mut chain),
             PolicyRef::Device(name) => self.device(name, &mut chain),
-            PolicyRef::Named(name) => self.named(name, &mut chain, 0),
+            PolicyRef::Named(name) => self.named(name, &mut chain, 0, self.empty_group),
         }
+    }
+
+    /// `name` as the `underlying-proxy` of another policy. A relay is set so
+    /// that traffic does not leave directly: a group without members refuses
+    /// here, whatever `EmptyGroup` says for a group dialled for itself.
+    pub fn resolve_relay(&self, name: &str) -> Resolution {
+        self.named(name, &mut Vec::new(), 0, EmptyGroup::Reject)
     }
 
     fn device(&self, name: &str, chain: &mut Vec<String>) -> Resolution {
@@ -522,7 +529,13 @@ impl PolicyRegistry {
         self.done(chain, self.direct(), TerminalKind::Direct, None)
     }
 
-    fn named(&self, name: &str, chain: &mut Vec<String>, depth: usize) -> Resolution {
+    fn named(
+        &self,
+        name: &str,
+        chain: &mut Vec<String>,
+        depth: usize,
+        empty: EmptyGroup,
+    ) -> Resolution {
         chain.push(name.to_string());
         if depth > MAX_DEPTH {
             tracing::error!(
@@ -571,16 +584,16 @@ impl PolicyRegistry {
                 Some(member) => match PolicyRef::parse(&member) {
                     PolicyRef::Builtin(b) => self.builtin(b, chain),
                     PolicyRef::Device(d) => self.device(&d, chain),
-                    PolicyRef::Named(n) => self.named(&n, chain, depth + 1),
+                    PolicyRef::Named(n) => self.named(&n, chain, depth + 1, empty),
                 },
-                None => self.empty(chain),
+                None => self.empty(chain, empty),
             },
         }
     }
 
     /// A group without members: DIRECT stands in, or REJECT (M3-D3).
-    fn empty(&self, chain: &mut Vec<String>) -> Resolution {
-        match self.empty_group {
+    fn empty(&self, chain: &mut Vec<String>, empty: EmptyGroup) -> Resolution {
+        match empty {
             EmptyGroup::Direct => {
                 chain.push("DIRECT".to_string());
                 let note = Note::EmptyGroup { substituted: true };
@@ -1344,6 +1357,40 @@ K = select, P, A\n[Rule]\nFINAL,K\n";
             (chain(&picked), picked.terminal, picked.note.clone()),
             (vec!["H", "A"], TerminalKind::Proxy, None)
         );
+    }
+
+    /// A relay is set so that traffic does not leave directly: an empty
+    /// group used as one refuses, whatever `EmptyGroup` says — also when it
+    /// is reached through a group that picks it. Dialled for itself, the
+    /// group still stands in DIRECT.
+    #[test]
+    fn an_empty_group_as_a_relay_rejects() {
+        let text = "[Proxy]\nA = http, a.example, 80\n\
+[Proxy Group]\nE = select, policy-path=https://sub.example/e\nH = select, E, A\n[Rule]\nFINAL,H\n";
+        let reg = generation(text, &FakeFactory::new(), None);
+        let top = reg.resolve(&PolicyRef::parse("E"));
+        assert_eq!(
+            (top.terminal, top.note),
+            (
+                TerminalKind::Direct,
+                Some(Note::EmptyGroup { substituted: true })
+            )
+        );
+        for (relay, expected) in [("E", vec!["E", "REJECT"]), ("H", vec!["H", "E", "REJECT"])] {
+            let r = reg.resolve_relay(relay);
+            assert_eq!(
+                (chain(&r), r.terminal, r.note.clone()),
+                (
+                    expected,
+                    TerminalKind::Reject,
+                    Some(Note::EmptyGroup { substituted: false })
+                ),
+                "{relay}"
+            );
+        }
+        // anything else resolves as a policy would
+        let a = reg.resolve_relay("A");
+        assert_eq!((chain(&a), a.terminal), (vec!["A"], TerminalKind::Proxy));
     }
 
     #[test]

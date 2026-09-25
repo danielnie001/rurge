@@ -1,9 +1,8 @@
 //! The registry as seen by things that outlive a config generation
 //! (M1 design 6.2).
 
-use crate::registry::PolicyRegistry;
+use crate::registry::{PolicyRegistry, TerminalKind};
 use arc_swap::ArcSwapOption;
-use rurge_config::rule::PolicyRef;
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
 use rurge_proto::OutboundError;
@@ -85,7 +84,12 @@ impl Connector for ChainConnector {
                     format!("via {}: the policy no longer exists", self.name),
                 ));
             }
-            let resolution = registry.resolve(&PolicyRef::Named(self.name.clone()));
+            let resolution = registry.resolve_relay(&self.name);
+            if let (TerminalKind::Reject, Some(note)) = (resolution.terminal, &resolution.note) {
+                // why the relay refuses says more than "rejected": a group
+                // without members, a group cycle, a protocol not implemented
+                return Err(io::Error::other(format!("via {}: {note}", self.name)));
+            }
             resolution
                 .outbound
                 .connect_tcp(target, opts)
@@ -103,7 +107,7 @@ mod tests {
     use rurge_config::config::{LoadOptions, from_text};
     use std::path::Path;
 
-    const PROFILE: &str = "[General]\nloglevel = notify\n[Proxy]\nD = direct\nBlock = reject\n[Proxy Group]\nPick = select, D, DIRECT\n[Rule]\nFINAL,DIRECT\n";
+    const PROFILE: &str = "[General]\nloglevel = notify\n[Proxy]\nD = direct\nBlock = reject\n[Proxy Group]\nPick = select, D, DIRECT\nEmpty = select, policy-path=https://sub.example/e\n[Rule]\nFINAL,DIRECT\n";
 
     fn registry(connector: Arc<RecordingConnector>) -> Arc<PolicyRegistry> {
         let loaded = from_text(PROFILE, Path::new("t.conf"), &LoadOptions::for_tests());
@@ -195,6 +199,22 @@ mod tests {
             .err()
             .expect("REJECT cannot carry a connection");
         assert_eq!(e.to_string(), "via Block: rejected by REJECT");
+    }
+
+    /// A relay group without members stands for nothing: the connection is
+    /// refused, never sent out directly behind the user's back.
+    #[tokio::test]
+    async fn an_empty_group_as_the_relay_refuses() {
+        let connector = Arc::new(RecordingConnector::default());
+        let cell = RegistryCell::new();
+        cell.store(registry(connector.clone()));
+        let e = ChainConnector::new(cell, "Empty")
+            .connect(&server(), &ConnectOpts::default())
+            .await
+            .err()
+            .expect("no member to relay through");
+        assert_eq!(e.to_string(), "via Empty: policy group has no members");
+        assert!(connector.seen().is_empty());
     }
 
     #[test]

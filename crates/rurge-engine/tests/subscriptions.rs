@@ -325,6 +325,43 @@ async fn an_empty_group_stands_in_direct_or_rejects() {
     }
 }
 
+/// A relay is set so that traffic does not leave directly: a policy relayed
+/// through a group without members fails and says why, and nothing goes out
+/// to its server — even though the same group, dialled for itself, would
+/// stand in DIRECT.
+#[tokio::test]
+async fn a_relay_group_without_members_refuses() {
+    let origin = TestServer::spawn().await;
+    let upstream = FakeHttpProxy::spawn(HttpProxyScript::default()).await;
+    let proxies = format!(
+        "Hop = http, 127.0.0.1, {}, underlying-proxy=Pool",
+        upstream.addr().port()
+    );
+    let h = harness(Profile {
+        proxies: &proxies,
+        groups: "Pool = select, policy-path=missing.txt",
+        rules: "DOMAIN,relay.test,Hop",
+        ..Profile::default()
+    })
+    .await;
+    h.dns.set("relay.test", &["127.0.0.1"], &[], 60);
+    let session = SessionInfo::tcp(
+        rurge_config::HostName::parse("relay.test"),
+        origin_addr(&origin).port(),
+    );
+    match h.engine.dial(session).await {
+        Err(DialError::Failed { message, .. }) => {
+            assert!(
+                message.contains("via Pool: policy group has no members"),
+                "{message}"
+            );
+        }
+        Err(DialError::Reject { .. }) => panic!("expected a failure, got a reject"),
+        Ok(_) => panic!("expected a failure, got a stream"),
+    }
+    assert!(upstream.heads().is_empty());
+}
+
 /// The control plane sees what the registry holds: imported and derived
 /// policies, with their secrets blanked (M3 design §8, M3-D7).
 #[tokio::test]
