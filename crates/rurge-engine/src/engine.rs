@@ -219,6 +219,16 @@ impl Engine {
             .expect("published before the engine is handed out")
     }
 
+    /// The current generation and the registry in use, as one pair. Both
+    /// are published under the generation lock — a reload publishes the
+    /// two together, a subscription rebuild a registry for the same
+    /// generation — so a session never picks a name by one generation's
+    /// rules and resolves it in another generation's registry.
+    fn snapshot(&self) -> (Arc<Runtime>, Arc<PolicyRegistry>) {
+        let _generation = self.generation_lock();
+        (self.runtime(), self.registry())
+    }
+
     /// Stores `next` as the current config generation (M3b §7.4 hot reload).
     pub(crate) fn store_runtime(&self, next: Runtime) {
         self.runtime.store(std::sync::Arc::new(next));
@@ -653,8 +663,7 @@ impl Engine {
         session: SessionInfo,
         fallback: &Arc<dyn Connector>,
     ) -> io::Result<BoxedStream> {
-        let rt = self.runtime();
-        let registry = self.registry();
+        let (rt, registry) = self.snapshot();
         let handle = self.new_handle(session);
         let policy = match self.choose_policy(&rt, &registry, &handle).await {
             Chosen::Policy(p) => p,
@@ -678,24 +687,43 @@ impl Engine {
         };
         // Reaching a proxy that is configured by host name would need the very
         // lookup this session is carrying (M3 design §7.4), so bypass it before
-        // dialling. A proxy configured by IP literal has no such loop.
+        // dialling. A proxy configured by IP literal has no such loop. A chain
+        // that ends at REJECT below the proxy is bypassed like a REJECT of the
+        // session itself.
         if resolution.terminal == TerminalKind::Proxy
             && let Some(terminal) = resolution.chain.last()
-            && let Some(spec) = socket_opener(&registry, terminal)
-            && matches!(spec.server, Some(HostName::Domain(_)))
         {
-            tracing::warn!(
-                policy = %spec.name,
-                "DNS session routed to a proxy configured by host name; connecting directly to avoid a resolution loop"
-            );
-            return bypass_to_direct(
-                handle,
-                fallback,
-                &target,
-                &opts,
-                "dns-follow: proxy configured by host name bypassed to avoid a resolution loop",
-            )
-            .await;
+            match socket_opener(&registry, terminal) {
+                Some(spec) if matches!(spec.server, Some(HostName::Domain(_))) => {
+                    tracing::warn!(
+                        policy = %spec.name,
+                        "DNS session routed to a proxy configured by host name; connecting directly to avoid a resolution loop"
+                    );
+                    return bypass_to_direct(
+                        handle,
+                        fallback,
+                        &target,
+                        &opts,
+                        "dns-follow: proxy configured by host name bypassed to avoid a resolution loop",
+                    )
+                    .await;
+                }
+                None => {
+                    tracing::warn!(
+                        policy = %terminal,
+                        "DNS session routed to a proxy chain that ends at a reject; connecting directly to keep DNS working"
+                    );
+                    return bypass_to_direct(
+                        handle,
+                        fallback,
+                        &target,
+                        &opts,
+                        "dns-follow: reject bypassed to keep DNS working",
+                    )
+                    .await;
+                }
+                Some(_) => {}
+            }
         }
         match resolution.outbound.connect_tcp(&target, &opts).await {
             Ok(stream) => Ok(crate::dns_pipeline::wrap_internal(stream, handle)),
@@ -851,9 +879,9 @@ fn rule_raw(rules: &rurge_rules::RuleEngine, index: usize) -> Option<String> {
 impl Dialer for Engine {
     fn dial<'a>(&'a self, session: SessionInfo) -> BoxFuture<'a, Result<Dialed, DialError>> {
         Box::pin(async move {
-            let rt = self.runtime();
-            // loaded once: the name is approved and resolved against the same one
-            let registry = self.registry();
+            // loaded once, together: the name is picked, approved and
+            // resolved against the same generation
+            let (rt, registry) = self.snapshot();
             let handle = self.new_handle(session);
             let policy = match self.choose_policy(&rt, &registry, &handle).await {
                 Chosen::Policy(p) => p,

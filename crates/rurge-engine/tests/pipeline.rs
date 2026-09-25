@@ -1414,6 +1414,43 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
     }
 }
 
+/// A chain whose hop below the proxy is REJECT can never carry the DNS
+/// session: it is bypassed like a REJECT of the session itself, instead of
+/// failing the lookup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dns_session_bypasses_a_proxy_chain_that_ends_at_a_reject() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let dir = tempfile::tempdir().unwrap();
+    let profile = format!(
+        "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\n\
+encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.1:{}\nipv6 = false\n\
+[Proxy]\nUpIp = http, 127.0.0.1, 9, underlying-proxy=Pick\n\
+[Proxy Group]\nPick = select, REJECT, DIRECT\n[Rule]\nPROTOCOL,DNS,UpIp\nFINAL,DIRECT\n",
+        dns.addr().port()
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        engine
+            .runtime()
+            .stack
+            .resolver
+            .lookup("target.test", rurge_dns::resolver::LookupOpts::default()),
+    )
+    .await
+    .expect("the lookup ends inside the bound");
+    assert!(res.is_ok(), "resolution around the chain: {res:?}");
+    let internal = internal_sessions(&engine);
+    assert!(
+        internal.iter().any(|r| {
+            r.error.as_deref() == Some("dns-follow: reject bypassed to keep DNS working")
+                && r.policy.first().map(String::as_str) == Some("UpIp")
+        }),
+        "a bypassed internal DNS session: {internal:?}"
+    );
+}
+
 /// The other direction: `Up` is named by host name too, but its own server
 /// travels to `UpIp` as a CONNECT target and is never resolved on this
 /// machine, so there is no loop and nothing to bypass. A future widening of
