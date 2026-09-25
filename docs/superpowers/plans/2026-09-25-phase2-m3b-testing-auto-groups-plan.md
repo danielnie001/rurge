@@ -6301,6 +6301,13 @@ git commit -m "docs: M3b 测速与自动组——兼容性清单、API 参考、
 | 6 | P7："旧"按组上一轮测试结束的时间判断 | 拨号时，有直接成员（嵌套组除外）对当前定义没有结果也请求一轮；`a_dial_asks_for_a_round_and_the_views_do_not` 在标记一轮完成之前先给成员写入结果，新增用例 `a_member_without_a_result_asks_for_a_round` | 设计 6.3 写的是"成员结果比 interval 旧（或没有结果）"；只看组的时间时，重载改了成员的测试参数会让全部结果作废而组仍算刚测过，最长 `interval` 内都按"未知"选成员。嵌套组除外，免得一个空的成员组让每次拨号都请求一轮 | 60e334b |
 | 7 | P9 与「要点」："DNS 会话同样等待" | `dial_internal`（DNS 会话）不等，直接 `resolve_with`（仍会请求一轮）；会话拨号照旧等待；新增用例 `a_dns_session_does_not_wait_for_an_evaluate_before_use_group` | 开 `encrypted-dns-follow-outbound-mode` 时，这一轮的探针解析以主机名配置的成员又要经 DNS 会话，两者互相卡住直到查询超时：每次启动该组首轮全部失败，并一直维持到下一个 `interval` | 5e9eb11 |
 | 1 – 10 | 各任务门禁的预期总数（Task 1 起 881、884、885、890、896、908、916、921、922、923） | 实际依次是 882、885、886、891、898、911、920、925、926、927（各任务的修正做完之后）：Task 1、5、6、7 的修正各多一条用例；最后一次门禁 40 个测试二进制，927 通过 / 0 失败 / 1 忽略 | 见上面几行 | — |
+| 终审 | Task 4：请求在拨号、握手之后才用 `.expect("a HEAD request")` 构造 | 请求的 URI 与 `Host` 在拨号之前构造，构造不了时以固定原因 `the test URL does not fit in a request line` 失败、不开连接；`Engine::test_policies` 把没有结果就结束的测试任务记作 `the test did not finish`，不再当作"不能测" | 路径加查询超过 65,534 字节的测试 URL（订阅行与 API 都能给出）会让测试任务在连上之后 panic：该成员永远没有结果，按 Task 6 的做法整组会一轮接一轮地重测，API 还误报 `not testable` | ac660fe |
+| 终审 | Task 3：`[General]` 的 `internet-test-url` / `proxy-test-url` 原样保存 | 加载时校验（能解析、scheme 为 http / https），不合法时 `W0012`（不引用取值）并沿用默认值 | 写错一个字符（如漏了 `http://`）没有任何诊断，却让所有策略都测不了：自动组一直停在第一个成员，`evaluate-before-use` 的组首次拨号以 `policy group evaluation failed` 失败 | ac660fe |
+| 终审 | （无对应文字；M4a 的脱敏名单） | `test-url` 进内联参数的脱敏名单：`GET /v1/policies/detail`、`lineHash`、`GET /v1/profiles/current` 与策略行的 `Debug` 里整体为 `***` | 订阅行设的 `test-url` 可能带 token，而 `policies/detail` 原样返回导入行；本计划要求测试 URL 不进 API 输出 | ac660fe |
+| 终审 | Task 6：`AutoGroups::connect` 先复制 `requested`，再装上发送端 | 持有状态锁直到装好发送端 | 两步之间来的唤醒会丢，之后同一组的唤醒又都被去重，该组在进程存续期间不再被测（`Engine::new` 里 DNS 管道先于调度任务接上，够得着这个窗口） | ac660fe |
+| 终审 | M1a：`test-url` 取值不合法时 `E0018` 引用取值 | 只说 `` `test-url` is not an http:// or https:// URL ``，不引用取值（同 `policy-path`） | 测试 URL 不进错误文本 | ac660fe |
+| 终审 | （注释） | 改正六处与代码不符的注释：注册表模块说明（经自动组的解析不再是不分配的查表）、代际锁的两处说明（每次拨号都要取它）、`Engine::new` 需要运行时的原因（测试调度任务总会启动）、`bypass_to_direct`（三种绕行，不是两种）、`socket_opener` 的深度上限（它自己的上限，不是注册表的）、`rurge-policy` 的 crate 说明（加上 `probe` / `testbook` / `auto`） | 注释描述的还是改动之前的行为 | ac660fe |
+| 终审 | 门禁 927 通过 | 最后一次门禁：40 个测试二进制，931 通过 / 0 失败 / 1 忽略（终审修正新增 4 条用例） | 见上面几行 | ac660fe |
 
 ## 延后事项
 
@@ -6319,3 +6326,13 @@ git commit -m "docs: M3b 测速与自动组——兼容性清单、API 参考、
 | 11 | `TestBook::invalidate_all` 管不到正在跑的测试：在旧网络上开始的测试，会在调用之后才写入结果 | 阶段 3（接上"网络已变化"时） |
 | 12 | `dial_internal` 被调用方取消（DNS 查询的截止时间）时，已进活动表的会话句柄不结束、也不进请求记录（慢的 `connect_tcp` 本来就有同样的缺口） | 有用户报告再说 |
 | 13 | "服务端不保持连接"只告警一次的分支没有用例（要断言得接 tracing 订阅者，本计划不新增 dev 依赖） | 有用户报告再说 |
+| 14 | 自动组每次拨号都重新算一遍成员（含嵌套组成员）的状态，并为每个成员构造一个 `TestCase`：成员多、嵌套深时开销随之增长 | M3c（`smart` 的打分放到同一路径之前一并处理） |
+| 15 | `TestBook` 不清理已消失策略的结果；只告警一次用的集合保存完整的测试 URL（只在内存里，从不输出） | 有用户报告再说 |
+| 16 | 已被移除的组，其一轮测试结束时仍记下测试时间：同名组在 `interval` 内被重新加入时，跳过 `evaluate-before-use` 的首轮等待 | 有用户报告再说 |
+| 17 | 嵌套的 `load-balance` 组在外层打分时不看它自己的临时覆盖，并按它自己的 `timeout` 判断 | 有用户报告再说 |
+| 18 | `override_of` 在持有状态锁时写告警日志 | 单独小改动 |
+| 19 | `[General] test-timeout` 取值大到荒谬时，`round_timeout` 的 `Duration * u32` 溢出 panic（策略级是 u32 秒，不会溢出） | 单独小改动 |
+| 20 | 代际锁只保护 `()`，`generation_lock()` 却在锁中毒时 `expect`：锁内一旦 panic，之后每次拨号都 panic（可改用 `PoisonError::into_inner`） | 单独小改动 |
+| 21 | `CommonOpts` 派生的 `Debug` 会打印 `test_url`（目前没有地方打印 `PolicySpec`，属潜在问题；改为 `Option<Secret<String>>`） | 单独小改动 |
+| 22 | 策略自己的 `test-url` 只按前缀校验：通过前缀检查却解析不了的 URL 让该策略测不了（API 回 `not testable`），加载时没有诊断 | 有用户报告再说 |
+| 23 | 测试缺口：探针——服务端不带 `Connection: close` 就断开连接的分支、请求形状（带端口的 `Host`、`User-Agent`）；选法——全部测过却无一通过、环、空组的状态，两个嵌套的 `evaluate-before-use` 组，超过 `interval` 之后的再次请求；引擎——`dial_internal` 带的 `SelectCtx`、`resolve_ready` 等满 `round_timeout` 后放弃；API——对非自动组的 `POST /v1/policy_groups/test`、失败的一次性测试、响应与请求记录里不出现路径；`auto.rs` 测试里无界的 `recv().await` / `changed().await` | 单独补测试 |
