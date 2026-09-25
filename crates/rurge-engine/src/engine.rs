@@ -665,14 +665,12 @@ impl Engine {
         let ctx = SelectCtx {
             host: Some(handle.session().dst_host.to_string()),
         };
-        let resolution = match resolve_ready(&registry, &policy, &ctx).await {
-            Ok(resolution) => resolution,
-            Err(chain) => {
-                handle.set_policy_chain(chain);
-                handle.finish(SessionOutcome::Failed(EVALUATION_FAILED.to_string()));
-                return Err(io::Error::other(EVALUATION_FAILED));
-            }
-        };
+        // Not `resolve_ready`: the round an `evaluate-before-use` group
+        // would wait for may itself need this very lookup to reach a
+        // host-named member's server (M3 design §7.4) — waiting here would
+        // wait on itself. The dial still asks for a round (`choose`); it
+        // just resolves with whatever the group already has.
+        let resolution = registry.resolve_with(&policy, &ctx);
         handle.set_policy_chain(resolution.chain.clone());
         let target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
         let opts = ConnectOpts {

@@ -1,7 +1,8 @@
 //! The engine's side of the automatic groups (phase 2 M3 design 6.2, 6.3):
 //! the task that runs the rounds of tests the registry asks for, every test
-//! a session of the request log, and the dial's wait for the first round of
-//! an `evaluate-before-use` group.
+//! a session of the request log, and a session dial's wait for the first
+//! round of an `evaluate-before-use` group — a DNS session does not wait:
+//! the round it would wait for may itself need that very lookup.
 
 use crate::engine::Engine;
 use rurge_config::HostName;

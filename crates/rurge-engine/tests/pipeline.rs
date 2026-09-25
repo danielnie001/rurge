@@ -1176,6 +1176,54 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
     );
 }
 
+/// A DNS session does not wait for an `evaluate-before-use` group's first
+/// round: the round's own probes may need this very session's resolver to
+/// reach a host-named member's server, so waiting here would wait on
+/// itself. The session resolves with whatever the group already has — its
+/// first member, `Up`, which the host-name bypass above then carries
+/// directly — while the round runs on its own in the background (`choose`
+/// still asks for it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dns_session_does_not_wait_for_an_evaluate_before_use_group() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    dns.set("proxy.test", &["127.0.0.1"], &[], 60);
+    let member = FakeHttpProxy::spawn(HttpProxyScript::default()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile = format!(
+        "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\n\
+encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.1:{}\nipv6 = false\n\
+proxy-test-url = http://127.0.0.1:9/\ninternet-test-url = http://127.0.0.1:9/\n\
+[Proxy]\nUp = http, proxy.test, {}\n[Proxy Group]\nE = fallback, Up, evaluate-before-use=true\n\
+[Rule]\nPROTOCOL,DNS,E\nFINAL,DIRECT\n",
+        dns.addr().port(),
+        member.addr().port()
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = tokio::time::timeout(
+        Duration::from_secs(3),
+        engine
+            .runtime()
+            .stack
+            .resolver
+            .lookup("target.test", rurge_dns::resolver::LookupOpts::default()),
+    )
+    .await
+    .expect("the lookup must not wait for the group's first round");
+    assert!(res.is_ok(), "resolution through the pipeline: {res:?}");
+    let internal = internal_sessions(&engine);
+    assert!(
+        internal.iter().any(|r| {
+            r.error.as_deref()
+                == Some(
+                    "dns-follow: proxy configured by host name bypassed to avoid a resolution loop",
+                )
+                && r.policy.first().map(String::as_str) == Some("E")
+        }),
+        "a bypassed internal DNS session through E: {internal:?}"
+    );
+}
+
 /// The guard reads the policy from the registry, not the main profile: a
 /// proxy that reached the profile through a subscription (`socket_opener`
 /// via `PolicyRegistry::spec`) is bypassed exactly like one written in
