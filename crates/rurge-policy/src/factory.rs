@@ -5,6 +5,7 @@
 use rurge_config::spec::{CommonOpts, PolicySpec};
 use rurge_net::connector::Connector;
 use rurge_proto::OutboundRef;
+use rustls::RootCertStore;
 use std::sync::Arc;
 
 pub use rurge_proto::BuildError;
@@ -28,4 +29,8 @@ pub trait OutboundFactory: Send + Sync {
     /// never reused. What is read through a cell at dial time (the resolver,
     /// the registry) does not belong here.
     fn environment(&self) -> String;
+
+    /// The trust anchors of the outbounds' TLS. A connectivity test of an
+    /// `https` URL verifies the server with them too (M3 design 6.1).
+    fn roots(&self) -> Arc<RootCertStore>;
 }

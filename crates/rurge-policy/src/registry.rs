@@ -4,18 +4,24 @@
 //! the chain and the group selections it reads.
 
 use crate::assemble::Assembly;
+use crate::auto::{AutoGroups, SelectCtx, Standing, fallback, load_balance, url_test};
 use crate::cell::{ChainConnector, RegistryCell};
 use crate::factory::{BuildError, OutboundFactory};
 use crate::selections::SelectionTable;
+use crate::testbook::{TestCase, TestResult};
 use rurge_config::rule::PolicyRef;
-use rurge_config::spec::{CommonOpts, IpVersion, PolicySpec};
+use rurge_config::spec::{CommonOpts, GroupSpec, IpVersion, PolicySpec};
 use rurge_config::{Builtin, Config, GroupKind, KeystoreType, PolicyKind, Span};
 use rurge_net::connector::Connector;
 use rurge_proto::{Direct, OutboundRef, Reject, RejectKind};
+use rustls::RootCertStore;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
+use url::Url;
 
 /// Deeper chains than this are treated as a defect (a group cycle resolves
 /// to REJECT before it gets that deep).
@@ -111,6 +117,10 @@ pub struct Resolution {
     pub outbound: OutboundRef,
     pub terminal: TerminalKind,
     pub note: Option<Note>,
+    /// An `evaluate-before-use` group on the way that has not had its first
+    /// round of tests: the dial waits for it and resolves again (M3 design
+    /// 6.3). The outermost such group when there are several.
+    pub pending: Option<String>,
 }
 
 enum Terminal {
@@ -132,12 +142,33 @@ enum Entry {
     /// The protocol is not implemented yet: REJECT (W0007 at load).
     Unsupported { kind: PolicyKind },
     Group {
-        kind: GroupKind,
+        spec: Arc<GroupSpec>,
         members: Vec<String>,
-        hidden: bool,
         /// The cycle it is on, written out: it resolves to REJECT.
         cycle: Option<String>,
     },
+}
+
+/// How a policy is tested (M3 design 6.1), worked out as the registry is
+/// built.
+struct TestSpec {
+    /// `None`: the test URL does not parse, and the policy never passes.
+    url: Option<Url>,
+    timeout: Duration,
+    /// What a result is good for (`TestCase::key`).
+    key: u64,
+}
+
+impl TestSpec {
+    fn new(definition: &str, url: &str, timeout: Duration) -> TestSpec {
+        let mut h = DefaultHasher::new();
+        (definition, url, timeout).hash(&mut h);
+        TestSpec {
+            url: Url::parse(url).ok(),
+            timeout,
+            key: h.finish(),
+        }
+    }
 }
 
 pub struct PolicyRegistry {
@@ -148,6 +179,11 @@ pub struct PolicyRegistry {
     rejects: [OutboundRef; 4],
     selections: Arc<SelectionTable>,
     empty_group: EmptyGroup,
+    auto: Arc<AutoGroups>,
+    /// By policy name; `DIRECT` for the built-in.
+    tests: HashMap<String, TestSpec>,
+    /// What verifies an `https` test URL (`OutboundFactory::roots`).
+    roots: Arc<RootCertStore>,
 }
 
 /// What `build` fills in, name by name.
@@ -156,6 +192,7 @@ struct Table {
     entries: HashMap<String, Entry>,
     order: Vec<String>,
     lines: HashMap<String, Line>,
+    tests: HashMap<String, TestSpec>,
 }
 
 impl Table {
@@ -272,7 +309,9 @@ impl PolicyRegistry {
     /// `cell`: a reused outbound keeps the chain connectors it was built
     /// with, and they resolve through that cell. The groups take their
     /// members from `assembly`, which also brings the imported and the
-    /// derived policies (M3 design 5.5).
+    /// derived policies (M3 design 5.5). The automatic groups pick by the
+    /// test results `auto` keeps (M3 design 6.4).
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         cfg: &Config,
         assembly: &Assembly,
@@ -281,6 +320,7 @@ impl PolicyRegistry {
         selections: Arc<SelectionTable>,
         previous: Option<&PolicyRegistry>,
         empty_group: EmptyGroup,
+        auto: &Arc<AutoGroups>,
     ) -> Result<PolicyRegistry, BuildError> {
         let direct: OutboundRef = Arc::new(Direct::new(
             factory.direct_connector(&CommonOpts::default()),
@@ -317,12 +357,37 @@ impl PolicyRegistry {
                 (None, None) => Entry::Unsupported { kind },
             })
         };
+        // How each policy is tested: its own `test-url` / `test-timeout`,
+        // else the profile's (M3 design 6.1). A REJECT and a protocol not
+        // implemented never pass, so they have none.
+        let test_spec = |kind: PolicyKind, spec: Option<&PolicySpec>, definition: &str| {
+            let direct = match (alias_terminal(kind), spec) {
+                (Some(Terminal::Direct), _) => true,
+                (Some(Terminal::Reject(_)), _) | (None, None) => return None,
+                (None, Some(_)) => false,
+            };
+            let common = spec.map(|s| &s.common);
+            let (url, timeout) = cfg.general.test_target(
+                common.and_then(|c| c.test_url.as_deref()),
+                common.and_then(|c| c.test_timeout),
+                direct,
+            );
+            Some(TestSpec::new(definition, url, timeout))
+        };
         let mut table = Table::default();
+        let (url, timeout) = cfg.general.test_target(None, None, true);
+        table
+            .tests
+            .insert("DIRECT".to_string(), TestSpec::new("DIRECT", url, timeout));
         // The profile's own policies: the dry build has made a failure here a
         // load error, so one fails the whole generation.
         for p in &cfg.policies {
-            let entry = policy_entry(p.kind, cfg.spec(&p.name))?;
+            let spec = cfg.spec(&p.name);
+            let entry = policy_entry(p.kind, spec)?;
             table.add(&p.name, entry, Line::policy(p.kind, &p.definition));
+            if let Some(t) = test_spec(p.kind, spec, &p.definition) {
+                table.tests.insert(p.name.clone(), t);
+            }
         }
         // What subscriptions brought in and the `M (via R)` of relayed groups:
         // a failure leaves that policy out and nothing else (M3-D6). Only the
@@ -333,21 +398,32 @@ impl PolicyRegistry {
         };
         for i in &assembly.imported {
             match policy_entry(i.policy.kind, i.spec.as_ref()) {
-                Ok(entry) => table.add(
-                    &i.policy.name,
-                    entry,
-                    Line::policy(i.policy.kind, &i.policy.definition),
-                ),
+                Ok(entry) => {
+                    table.add(
+                        &i.policy.name,
+                        entry,
+                        Line::policy(i.policy.kind, &i.policy.definition),
+                    );
+                    if let Some(t) = test_spec(i.policy.kind, i.spec.as_ref(), &i.policy.definition)
+                    {
+                        table.tests.insert(i.policy.name.clone(), t);
+                    }
+                }
                 Err(_) => left_out(&i.policy.name),
             }
         }
         for d in &assembly.derived {
             match outbound_entry(&d.spec, true) {
-                Ok(entry) => table.add(
-                    &d.spec.name,
-                    entry,
-                    Line::policy(d.spec.kind, &d.definition),
-                ),
+                Ok(entry) => {
+                    table.add(
+                        &d.spec.name,
+                        entry,
+                        Line::policy(d.spec.kind, &d.definition),
+                    );
+                    if let Some(t) = test_spec(d.spec.kind, Some(&d.spec), &d.definition) {
+                        table.tests.insert(d.spec.name.clone(), t);
+                    }
+                }
                 Err(_) => left_out(&d.spec.name),
             }
         }
@@ -384,9 +460,8 @@ impl PolicyRegistry {
                 definition,
             };
             let entry = Entry::Group {
-                kind: g.kind,
+                spec: Arc::new(g.clone()),
                 members,
-                hidden: g.hidden,
                 cycle,
             };
             table.add(&g.name, entry, line);
@@ -405,6 +480,9 @@ impl PolicyRegistry {
             rejects,
             selections,
             empty_group,
+            auto: auto.clone(),
+            tests: table.tests,
+            roots: factory.roots(),
         })
     }
 
@@ -448,18 +526,26 @@ impl PolicyRegistry {
 
     pub fn group(&self, name: &str) -> Option<GroupInfo<'_>> {
         match self.entries.get(name)? {
-            Entry::Group {
-                kind,
-                members,
-                hidden,
-                ..
-            } => Some(GroupInfo {
-                kind: *kind,
-                hidden: *hidden,
+            Entry::Group { spec, members, .. } => Some(GroupInfo {
+                kind: spec.kind,
+                hidden: spec.hidden,
                 members,
             }),
             _ => None,
         }
+    }
+
+    /// The group's definition, as the automatic groups' overrides keep it.
+    pub fn group_spec(&self, name: &str) -> Option<&GroupSpec> {
+        match self.entries.get(name)? {
+            Entry::Group { spec, .. } => Some(spec),
+            _ => None,
+        }
+    }
+
+    /// The automatic groups' state this registry picks by.
+    pub fn auto(&self) -> &Arc<AutoGroups> {
+        &self.auto
     }
 
     /// The members of `group` as assembled; `None` when it is not a group.
@@ -481,26 +567,250 @@ impl PolicyRegistry {
         }
     }
 
-    /// The member `group` points at right now: the live selection of a
-    /// `select` group when it still names a member, else the first member.
-    /// `None` when `group` is not a group or has no members.
+    /// The member `group` points at right now, as the control plane shows
+    /// it: nothing changes for asking (no test is started, `url-test` does
+    /// not move). `None` when `group` is not a group or has no members.
     pub fn current_member(&self, group: &str) -> Option<String> {
-        let Some(Entry::Group { kind, members, .. }) = self.entries.get(group) else {
+        self.choose(group, &SelectCtx::default(), false, 0)
+            .map(|(member, _)| member)
+    }
+
+    /// The member of `group`, as a dial picks it. `select`: the live
+    /// selection while it names a member, else the first member. The
+    /// automatic groups: an override while it names a member, else by the
+    /// test results (M3 design 6.4) — and when those are older than the
+    /// group's `interval`, or a member that is not a group has none, a round
+    /// is asked for. `live` is a dial: only then may `url-test` move the
+    /// member it holds and a round be asked for; the second value then says
+    /// whether the group wants its first round before it is used
+    /// (`evaluate-before-use`).
+    fn choose(
+        &self,
+        group: &str,
+        ctx: &SelectCtx,
+        live: bool,
+        depth: usize,
+    ) -> Option<(String, bool)> {
+        let Some(Entry::Group { spec, members, .. }) = self.entries.get(group) else {
             return None;
         };
-        let selected = (*kind == GroupKind::Select)
-            .then(|| self.selections.get(group))
-            .flatten()
-            .filter(|m| members.contains(m));
-        selected.or_else(|| members.first().cloned())
+        match spec.kind {
+            GroupKind::Select => {
+                let selected = self.selections.get(group).filter(|m| members.contains(m));
+                selected
+                    .or_else(|| members.first().cloned())
+                    .map(|m| (m, false))
+            }
+            GroupKind::UrlTest | GroupKind::Fallback | GroupKind::LoadBalance => {
+                // an override stands, and asks for no test (M3 design 6.3)
+                if let Some(member) = self.auto.override_of(group, members) {
+                    return Some((member, false));
+                }
+                let last = self.auto.last_round(group);
+                let pending = live && spec.test.evaluate_before_use && last.is_none();
+                let standings: Vec<(String, Standing)> = members
+                    .iter()
+                    .map(|m| (m.clone(), self.standing(m, depth + 1)))
+                    .collect();
+                // a member that is not a group and has no result for what it
+                // is now — a new one, or one a reload or a subscription
+                // update changed — asks for a round too (M3 design 6.3)
+                let untested = standings.iter().any(|(m, s)| {
+                    *s == Standing::Unknown
+                        && !matches!(self.entries.get(m.as_str()), Some(Entry::Group { .. }))
+                });
+                if live && (untested || last.is_none_or(|t| t.elapsed() >= spec.test.interval)) {
+                    self.auto.wake(group);
+                }
+                let member = match spec.kind {
+                    GroupKind::UrlTest => {
+                        let pick =
+                            url_test(&standings, self.auto.pick(group).as_deref(), &spec.test)?;
+                        if live {
+                            self.auto.set_pick(group, &pick);
+                        }
+                        pick
+                    }
+                    GroupKind::Fallback => fallback(&standings, &spec.test)?,
+                    _ if live => load_balance(&standings, &spec.test, ctx)?,
+                    // the views: the first that passes stands for the group
+                    _ => fallback(&standings, &spec.test)?,
+                };
+                Some((member, pending))
+            }
+            // `smart` (M3c) and `subnet` (phase 3): the first member
+            GroupKind::Smart | GroupKind::Subnet => members.first().map(|m| (m.clone(), false)),
+        }
+    }
+
+    /// What the tests say of `name`: its own last result, or — a group — its
+    /// pick's, the average of those that pass for `load-balance` (M3 design
+    /// 6.4). A REJECT, a protocol not implemented and a test URL that does
+    /// not parse never pass.
+    fn standing(&self, name: &str, depth: usize) -> Standing {
+        if depth > MAX_DEPTH {
+            return Standing::Failed;
+        }
+        if let PolicyRef::Named(n) = PolicyRef::parse(name)
+            && let Some(Entry::Group {
+                spec,
+                members,
+                cycle,
+            }) = self.entries.get(&n)
+        {
+            if cycle.is_some() {
+                return Standing::Failed;
+            }
+            if spec.kind == GroupKind::LoadBalance {
+                let all: Vec<Standing> = members
+                    .iter()
+                    .map(|m| self.standing(m, depth + 1))
+                    .collect();
+                let passing: Vec<Duration> =
+                    all.iter().filter_map(|s| s.passes(&spec.test)).collect();
+                if passing.is_empty() {
+                    return if all.iter().all(|s| *s == Standing::Unknown) {
+                        Standing::Unknown
+                    } else {
+                        Standing::Failed
+                    };
+                }
+                return Standing::Passed(passing.iter().sum::<Duration>() / passing.len() as u32);
+            }
+            return match self.choose(&n, &SelectCtx::default(), false, depth) {
+                Some((member, _)) => self.standing(&member, depth + 1),
+                None => Standing::Unknown,
+            };
+        }
+        match self.test_case(name) {
+            Some(case) => match self.auto.tests.result(&case.policy, case.key) {
+                Some(result) => match result.outcome {
+                    Ok(score) => Standing::Passed(score),
+                    Err(_) => Standing::Failed,
+                },
+                None => Standing::Unknown,
+            },
+            None => Standing::Failed,
+        }
+    }
+
+    /// How to test `name` now (M3 design 6.1): through its outbound, at its
+    /// test URL. `None` for what never passes — a REJECT, a protocol not
+    /// implemented, a test URL that does not parse — and for a group.
+    pub fn test_case(&self, name: &str) -> Option<TestCase> {
+        let (policy, outbound) = match PolicyRef::parse(name) {
+            // DIRECT, and on the desktop the iOS-only built-ins that stand
+            // in for it
+            PolicyRef::Builtin(b) if RejectKind::from_builtin(b).is_none() => {
+                ("DIRECT".to_string(), self.direct())
+            }
+            PolicyRef::Builtin(_) | PolicyRef::Device(_) => return None,
+            PolicyRef::Named(n) => match self.entries.get(&n)? {
+                Entry::Alias(Terminal::Direct) => (n, self.direct()),
+                Entry::Outbound { outbound, .. } => {
+                    let outbound = outbound.clone();
+                    (n, outbound)
+                }
+                _ => return None,
+            },
+        };
+        let test = self.tests.get(&policy)?;
+        Some(TestCase {
+            url: test.url.clone()?,
+            timeout: test.timeout,
+            key: test.key,
+            roots: self.roots.clone(),
+            policy,
+            outbound,
+        })
+    }
+
+    /// The last test result of `name` that still counts.
+    pub fn test_result(&self, name: &str) -> Option<TestResult> {
+        let case = self.test_case(name)?;
+        self.auto.tests.result(&case.policy, case.key)
+    }
+
+    /// The members of `group` that pass their tests now.
+    pub fn available(&self, group: &str) -> Vec<String> {
+        let Some(Entry::Group { spec, members, .. }) = self.entries.get(group) else {
+            return Vec::new();
+        };
+        members
+            .iter()
+            .filter(|m| self.standing(m, 1).passes(&spec.test).is_some())
+            .cloned()
+            .collect()
+    }
+
+    /// Tests every member of `group` now — the members of the groups in it
+    /// too — and records the round for each of those groups; the members of
+    /// `group` that pass (M3 design 6.3, 6.6). Every test runs on its own
+    /// task (`TestBook::test`).
+    pub async fn test_group(&self, group: &str) -> Vec<String> {
+        let mut groups = Vec::new();
+        let mut policies = Vec::new();
+        self.gather(group, 0, &mut groups, &mut policies);
+        if groups.is_empty() {
+            // a reload took the group away after the round was asked for:
+            // the request still ends, or it would stand in the way of the
+            // next one for a group of that name
+            groups.push(group.to_string());
+        }
+        let tests: Vec<_> = policies
+            .iter()
+            .filter_map(|p| self.test_case(p))
+            .map(|case| {
+                let book = self.auto.tests.clone();
+                tokio::spawn(async move { book.test(case).await })
+            })
+            .collect();
+        for test in tests {
+            let _ = test.await;
+        }
+        self.auto.round_done(&groups);
+        self.available(group)
+    }
+
+    /// The groups a round of `group` covers and the policies it tests.
+    fn gather(
+        &self,
+        group: &str,
+        depth: usize,
+        groups: &mut Vec<String>,
+        policies: &mut Vec<String>,
+    ) {
+        if depth > MAX_DEPTH || groups.iter().any(|g| g == group) {
+            return;
+        }
+        let Some(Entry::Group { members, cycle, .. }) = self.entries.get(group) else {
+            return;
+        };
+        groups.push(group.to_string());
+        if cycle.is_some() {
+            return;
+        }
+        for m in members {
+            if let Some(Entry::Group { .. }) = self.entries.get(m.as_str()) {
+                self.gather(m, depth + 1, groups, policies);
+            } else if !policies.contains(m) {
+                policies.push(m.clone());
+            }
+        }
     }
 
     pub fn resolve(&self, policy: &PolicyRef) -> Resolution {
+        self.resolve_with(policy, &SelectCtx::default())
+    }
+
+    /// `resolve`, for a dial that knows its target: `load-balance` with
+    /// `persistent=true` picks by the host (M3 design 6.4).
+    pub fn resolve_with(&self, policy: &PolicyRef, ctx: &SelectCtx) -> Resolution {
         let mut chain = Vec::new();
         match policy {
             PolicyRef::Builtin(b) => self.builtin(*b, &mut chain),
             PolicyRef::Device(name) => self.device(name, &mut chain),
-            PolicyRef::Named(name) => self.named(name, &mut chain, 0, self.empty_group),
+            PolicyRef::Named(name) => self.named(name, &mut chain, 0, self.empty_group, ctx),
         }
     }
 
@@ -508,7 +818,13 @@ impl PolicyRegistry {
     /// that traffic does not leave directly: a group without members refuses
     /// here, whatever `EmptyGroup` says for a group dialled for itself.
     pub fn resolve_relay(&self, name: &str) -> Resolution {
-        self.named(name, &mut Vec::new(), 0, EmptyGroup::Reject)
+        self.named(
+            name,
+            &mut Vec::new(),
+            0,
+            EmptyGroup::Reject,
+            &SelectCtx::default(),
+        )
     }
 
     fn device(&self, name: &str, chain: &mut Vec<String>) -> Resolution {
@@ -535,6 +851,7 @@ impl PolicyRegistry {
         chain: &mut Vec<String>,
         depth: usize,
         empty: EmptyGroup,
+        ctx: &SelectCtx,
     ) -> Resolution {
         chain.push(name.to_string());
         if depth > MAX_DEPTH {
@@ -580,12 +897,18 @@ impl PolicyRegistry {
             Some(Entry::Group {
                 cycle: Some(cycle), ..
             }) => self.rejected(chain, Some(Note::GroupCycle(cycle.clone()))),
-            Some(Entry::Group { .. }) => match self.current_member(name) {
-                Some(member) => match PolicyRef::parse(&member) {
-                    PolicyRef::Builtin(b) => self.builtin(b, chain),
-                    PolicyRef::Device(d) => self.device(&d, chain),
-                    PolicyRef::Named(n) => self.named(&n, chain, depth + 1, empty),
-                },
+            Some(Entry::Group { .. }) => match self.choose(name, ctx, true, depth) {
+                Some((member, pending)) => {
+                    let mut resolution = match PolicyRef::parse(&member) {
+                        PolicyRef::Builtin(b) => self.builtin(b, chain),
+                        PolicyRef::Device(d) => self.device(&d, chain),
+                        PolicyRef::Named(n) => self.named(&n, chain, depth + 1, empty, ctx),
+                    };
+                    if pending {
+                        resolution.pending = Some(name.to_string());
+                    }
+                    resolution
+                }
                 None => self.empty(chain, empty),
             },
         }
@@ -627,6 +950,7 @@ impl PolicyRegistry {
             outbound,
             terminal,
             note,
+            pending: None,
         }
     }
 }
@@ -682,6 +1006,7 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
                 table.clone(),
                 None,
                 EmptyGroup::Direct,
+                &crate::testing::auto_groups(),
             )
             .expect("builds"),
         );
@@ -925,6 +1250,7 @@ SS = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Rule]\nFINAL,DI
             Arc::new(SelectionTable::default()),
             None,
             EmptyGroup::Direct,
+            &crate::testing::auto_groups(),
         )
         .err()
         .expect("EntryB does not build");
@@ -954,6 +1280,7 @@ SS = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Rule]\nFINAL,DI
             Arc::new(SelectionTable::new(GroupSelections::new())),
             previous,
             EmptyGroup::Direct,
+            &crate::testing::auto_groups(),
         )
         .expect("builds")
     }
@@ -1058,6 +1385,7 @@ Plain = select, DIRECT, policy-path=https://sub.example/nodes\n[Rule]\nFINAL,Sub
             Arc::new(SelectionTable::default()),
             previous,
             EmptyGroup::Direct,
+            &crate::testing::auto_groups(),
         )
         .expect("builds")
     }
@@ -1272,6 +1600,7 @@ K = select, P, A\n[Rule]\nFINAL,K\n";
             Arc::new(SelectionTable::new(selections)),
             None,
             EmptyGroup::Direct,
+            &crate::testing::auto_groups(),
         )
         .expect("builds");
         let k = reg.resolve(&PolicyRef::parse("K"));
@@ -1297,6 +1626,7 @@ K = select, P, A\n[Rule]\nFINAL,K\n";
                 Arc::new(SelectionTable::default()),
                 None,
                 empty_group,
+                &crate::testing::auto_groups(),
             )
             .expect("builds")
         };
@@ -1338,6 +1668,7 @@ K = select, P, A\n[Rule]\nFINAL,K\n";
                 Arc::new(SelectionTable::new(selections)),
                 None,
                 EmptyGroup::Direct,
+                &crate::testing::auto_groups(),
             )
             .expect("builds")
         };
@@ -1391,6 +1722,181 @@ K = select, P, A\n[Rule]\nFINAL,K\n";
         // anything else resolves as a policy would
         let a = reg.resolve_relay("A");
         assert_eq!((chain(&a), a.terminal), (vec!["A"], TerminalKind::Proxy));
+    }
+
+    const AUTO: &str = "[Proxy]\nA = http, a.example, 80\nB = http, b.example, 80\nC = http, c.example, 80\n\
+[Proxy Group]\nU = url-test, A, B, C\nF = fallback, A, B, C\nL = load-balance, A, B, C, persistent=true\n\
+N = fallback, A, B\nOuter = url-test, N, C\nAvg = load-balance, B, C\n\
+E = url-test, A, B, evaluate-before-use=true\nS = select, E\n[Rule]\nFINAL,U\n";
+
+    /// As if `name`'s last test had passed in `ms`, or failed.
+    fn seed(reg: &PolicyRegistry, name: &str, ms: Option<u64>) {
+        let case = reg.test_case(name).expect("a policy that is tested");
+        let outcome = ms
+            .map(Duration::from_millis)
+            .ok_or_else(|| "refused".to_string());
+        reg.auto().tests.record(&case.policy, case.key, outcome);
+    }
+
+    fn picked(reg: &PolicyRegistry, group: &str) -> String {
+        reg.resolve(&PolicyRef::parse(group))
+            .chain
+            .get(1)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Phase 2 M3 design 6.4: the fastest that passes, the first that
+    /// passes, any that passes — the first member (`load-balance`: any) when
+    /// nothing passes or nothing was tested yet.
+    #[test]
+    fn the_automatic_groups_pick_by_the_tests() {
+        let reg = generation(AUTO, &FakeFactory::new(), None);
+        assert_eq!(picked(&reg, "U"), "A", "nothing tested: the first");
+        assert_eq!(picked(&reg, "F"), "A");
+        seed(&reg, "A", None);
+        seed(&reg, "B", Some(200));
+        seed(&reg, "C", Some(50));
+        assert_eq!(picked(&reg, "U"), "C");
+        assert_eq!(picked(&reg, "F"), "B");
+        let ctx = SelectCtx {
+            host: Some("example.com".into()),
+        };
+        let first = reg.resolve_with(&PolicyRef::parse("L"), &ctx).chain[1].clone();
+        assert!(first == "B" || first == "C", "{first}");
+        for _ in 0..10 {
+            assert_eq!(
+                reg.resolve_with(&PolicyRef::parse("L"), &ctx).chain[1],
+                first,
+                "persistent: one host, one member"
+            );
+        }
+        // the views answer the same, and move nothing
+        assert_eq!(reg.current_member("U").as_deref(), Some("C"));
+        assert_eq!(reg.current_member("L").as_deref(), Some("B"));
+        assert_eq!(reg.available("U"), ["B", "C"]);
+    }
+
+    /// A group scores as its pick; a `load-balance` group as the average of
+    /// the members that pass (M3 design 6.4).
+    #[test]
+    fn a_group_member_scores_by_its_pick() {
+        let reg = generation(AUTO, &FakeFactory::new(), None);
+        seed(&reg, "A", None);
+        seed(&reg, "B", Some(100));
+        seed(&reg, "C", Some(300));
+        assert_eq!(
+            reg.resolve(&PolicyRef::parse("Outer")).chain,
+            ["Outer", "N", "B"],
+            "N scores as B, 100 ms"
+        );
+        assert_eq!(
+            reg.standing("Avg", 0),
+            Standing::Passed(Duration::from_millis(200))
+        );
+    }
+
+    /// A dial asks for a round of the group whose results are older than its
+    /// `interval` (none yet: older than anything); the views ask for
+    /// nothing. Once the round is in — every member with a result — nothing
+    /// more is asked until the interval has passed.
+    #[test]
+    fn a_dial_asks_for_a_round_and_the_views_do_not() {
+        let reg = generation(AUTO, &FakeFactory::new(), None);
+        reg.current_member("U");
+        assert!(reg.auto().requested().is_empty());
+        reg.resolve(&PolicyRef::parse("U"));
+        assert_eq!(reg.auto().requested(), ["U"]);
+        for name in ["A", "B", "C"] {
+            seed(&reg, name, Some(10));
+        }
+        reg.auto().round_done(&["U".to_string()]);
+        reg.resolve(&PolicyRef::parse("U"));
+        assert!(reg.auto().requested().is_empty());
+    }
+
+    /// A member without a result for what it is now — a new one, or one a
+    /// reload or a subscription update changed — asks for a round even when
+    /// the group's last round is recent (M3 design 6.3).
+    #[test]
+    fn a_member_without_a_result_asks_for_a_round() {
+        let reg = generation(AUTO, &FakeFactory::new(), None);
+        for name in ["A", "B", "C"] {
+            seed(&reg, name, Some(10));
+        }
+        reg.auto().round_done(&["U".to_string()]);
+        let _ = reg.resolve(&PolicyRef::parse("U"));
+        assert!(
+            reg.auto().requested().is_empty(),
+            "every member tested, the round fresh"
+        );
+        // C's result is gone, as if its test URL had changed
+        reg.auto().tests.invalidate_all();
+        seed(&reg, "A", Some(10));
+        seed(&reg, "B", Some(10));
+        let _ = reg.resolve(&PolicyRef::parse("U"));
+        assert_eq!(reg.auto().requested(), ["U"]);
+    }
+
+    /// `evaluate-before-use`: until its first round is in, a dial that goes
+    /// through the group is told to wait for it (M3 design 6.3).
+    #[test]
+    fn evaluate_before_use_waits_for_the_first_round() {
+        let reg = generation(AUTO, &FakeFactory::new(), None);
+        assert_eq!(
+            reg.resolve(&PolicyRef::parse("S")).pending.as_deref(),
+            Some("E")
+        );
+        assert_eq!(reg.resolve(&PolicyRef::parse("U")).pending, None);
+        reg.auto().round_done(&["E".to_string()]);
+        assert_eq!(reg.resolve(&PolicyRef::parse("E")).pending, None);
+    }
+
+    /// An override stands while it names a member, and asks for no test.
+    #[test]
+    fn an_override_stands_and_asks_for_no_round() {
+        let reg = generation(AUTO, &FakeFactory::new(), None);
+        seed(&reg, "B", Some(10));
+        let spec = reg.group_spec("U").expect("a group").clone();
+        reg.auto().set_override(&spec, "A");
+        assert_eq!(picked(&reg, "U"), "A");
+        assert_eq!(reg.current_member("U").as_deref(), Some("A"));
+        assert!(reg.auto().requested().is_empty());
+        reg.auto().set_override(&spec, "Gone");
+        assert_eq!(picked(&reg, "U"), "B");
+    }
+
+    /// A round tests every member of the group and of the groups in it,
+    /// and is recorded for each of those groups.
+    #[tokio::test]
+    async fn a_round_tests_every_member_of_the_group_and_its_groups() {
+        let reg = generation(AUTO, &FakeFactory::new(), None);
+        let available = reg.test_group("Outer").await;
+        // the fake outbounds lead nowhere: every test fails
+        assert!(available.is_empty());
+        for name in ["A", "B", "C"] {
+            assert!(reg.test_result(name).is_some_and(|r| r.outcome.is_err()));
+        }
+        assert!(reg.auto().last_round("Outer").is_some());
+        assert!(reg.auto().last_round("N").is_some());
+        assert!(reg.auto().last_round("U").is_none());
+        // REJECT and DIRECT: never passes, and tested like the rest
+        assert!(reg.test_case("REJECT").is_none());
+        assert_eq!(
+            reg.test_case("DIRECT").map(|c| c.policy).as_deref(),
+            Some("DIRECT")
+        );
+    }
+
+    /// A round asked for a group that a reload then took away still ends
+    /// the request: a group of that name is tested again when asked.
+    #[tokio::test]
+    async fn a_round_of_a_group_that_is_gone_ends_the_request() {
+        let reg = generation(AUTO, &FakeFactory::new(), None);
+        reg.auto().wake("Gone");
+        assert_eq!(reg.auto().requested(), ["Gone"]);
+        assert!(reg.test_group("Gone").await.is_empty());
+        assert!(reg.auto().requested().is_empty());
     }
 
     #[test]

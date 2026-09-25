@@ -3,6 +3,8 @@
 use arc_swap::ArcSwapOption;
 use rurge_net::BoxFuture;
 use rurge_net::connector::Resolve;
+use rurge_policy::auto::AutoGroups;
+use rurge_policy::testbook::TestBook;
 use rurge_policy::{EmptyGroup, GroupSelections, RegistryCell, SelectionTable};
 use rustls::RootCertStore;
 use std::io;
@@ -59,6 +61,9 @@ pub struct EngineShared {
     /// What a group without members resolves to (M3-D3):
     /// `--empty-group-reject` sets it once, for the engine's lifetime.
     pub empty_group: EmptyGroup,
+    /// The automatic groups' test results and state (phase 2 M3 design 6.2,
+    /// 6.5): kept across generations, as the selections are.
+    pub auto: Arc<AutoGroups>,
 }
 
 impl EngineShared {
@@ -69,6 +74,7 @@ impl EngineShared {
             resolver: ResolverCell::new(),
             roots: None,
             empty_group: EmptyGroup::Direct,
+            auto: Arc::new(AutoGroups::new(Arc::new(TestBook::new()))),
         }
     }
 }

@@ -168,6 +168,7 @@ impl Engine {
             shared.selections.clone(),
             previous.as_deref(),
             shared.empty_group,
+            &shared.auto,
         );
         let registry = match built {
             Ok(registry) => Arc::new(registry),

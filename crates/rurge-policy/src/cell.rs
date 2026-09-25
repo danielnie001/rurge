@@ -126,6 +126,7 @@ mod tests {
                 Arc::new(crate::selections::SelectionTable::default()),
                 None,
                 crate::EmptyGroup::Direct,
+                &crate::testing::auto_groups(),
             )
             .expect("builds"),
         )

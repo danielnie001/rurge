@@ -199,6 +199,7 @@ mod tests {
             Arc::new(SelectionTable::default()),
             None,
             EmptyGroup::Direct,
+            &crate::shared::EngineShared::default().auto,
         )
         .expect("builds")
     }

@@ -6,6 +6,7 @@
 //! takes in (phase 2 M3 design 5.2, 5.3).
 
 pub mod assemble;
+pub mod auto;
 pub mod cell;
 pub mod factory;
 pub mod probe;

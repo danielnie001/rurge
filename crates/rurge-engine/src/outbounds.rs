@@ -122,6 +122,10 @@ impl OutboundFactory for EngineFactory {
         format!("ipv6={}", self.v6_first)
     }
 
+    fn roots(&self) -> Arc<RootCertStore> {
+        self.roots.clone()
+    }
+
     fn build(
         &self,
         spec: &PolicySpec,

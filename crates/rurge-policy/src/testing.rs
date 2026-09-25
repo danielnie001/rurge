@@ -1,12 +1,20 @@
 //! Test doubles shared by this crate's unit tests.
 
+use crate::auto::AutoGroups;
 use crate::factory::{BuildError, OutboundFactory};
+use crate::testbook::TestBook;
 use rurge_config::spec::{CommonOpts, PolicySpec};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
 use rurge_proto::{Outbound, OutboundError, OutboundRef};
+use rustls::RootCertStore;
 use std::io;
 use std::sync::{Arc, Mutex};
+
+/// Automatic groups with no test results.
+pub(crate) fn auto_groups() -> Arc<AutoGroups> {
+    Arc::new(AutoGroups::new(Arc::new(TestBook::new())))
+}
 
 /// Records every target it is asked to reach; hands out one end of an
 /// in-memory pipe, or refuses when `fail` is set.
@@ -105,6 +113,11 @@ impl OutboundFactory for FakeFactory {
 
     fn environment(&self) -> String {
         self.environment.to_string()
+    }
+
+    /// Trusts nobody: the unit tests test `http` URLs only.
+    fn roots(&self) -> Arc<RootCertStore> {
+        Arc::new(RootCertStore::empty())
     }
 
     fn build(

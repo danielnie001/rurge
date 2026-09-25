@@ -95,6 +95,7 @@ impl Runtime {
                 opts.shared.selections.clone(),
                 previous.as_deref(),
                 opts.shared.empty_group,
+                &opts.shared.auto,
             )
             .map_err(|e| anyhow::anyhow!("cannot build the policies: {e}"))?,
         );

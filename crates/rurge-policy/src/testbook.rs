@@ -97,6 +97,20 @@ impl TestBook {
             .map(|(_, r)| r.clone())
     }
 
+    /// Records a result as if a test had ended with `outcome`.
+    #[cfg(test)]
+    pub(crate) fn record(&self, policy: &str, key: u64, outcome: Result<Duration, String>) {
+        let result = TestResult {
+            outcome,
+            at: Instant::now(),
+            when: SystemTime::now(),
+        };
+        self.results
+            .write()
+            .expect("test results")
+            .insert(policy.to_string(), (key, result));
+    }
+
     /// Forgets every result: the network is not the one they were made on
     /// (the "network changed" entry of phase 3).
     pub fn invalidate_all(&self) {
