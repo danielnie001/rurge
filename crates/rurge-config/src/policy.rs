@@ -218,9 +218,19 @@ pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPo
             )
         })?;
         let port: u16 = port_str.parse().map_err(|_| {
+            // anything but digits is another field that slid into the port's
+            // place when a comma was missing — a password, say (M3-D7)
+            let shown = if !port_str.is_empty()
+                && port_str.len() <= 10
+                && port_str.bytes().all(|b| b.is_ascii_digit())
+            {
+                format!(" `{port_str}`")
+            } else {
+                String::new()
+            };
             ParseError::new(
                 codes::E_SYNTAX,
-                format!("policy `{name}`: invalid port `{port_str}`"),
+                format!("policy `{name}`: invalid port{shown}"),
             )
         })?;
         (Some(HostName::parse(server)), Some(port), &fields[3..])
@@ -516,6 +526,17 @@ mod tests {
 
     fn span() -> Span {
         Span::new(Arc::from(Path::new("p.conf")), 1)
+    }
+
+    /// A port slot holding anything but digits is some other field that
+    /// slid over when a comma was missing — a password, say (M3-D7): the
+    /// value is quoted only when it is a number.
+    #[test]
+    fn an_invalid_port_is_quoted_only_when_it_is_a_number() {
+        let e = parse_policy("T", "trojan, t.test 443, password=s3cretPw42", &span()).unwrap_err();
+        assert_eq!(e.message, "policy `T`: invalid port");
+        let e = parse_policy("P", "http, p.test, 99999", &span()).unwrap_err();
+        assert_eq!(e.message, "policy `P`: invalid port `99999`");
     }
 
     #[test]

@@ -451,12 +451,10 @@ pub fn parse_general(section: Option<&Section>, diags: &mut Diagnostics) -> Gene
     for e in section.active_entries() {
         let span = &e.span;
         let Some((key, value)) = split_definition(&e.raw) else {
+            // nothing of the line: it can carry a secret (`http-api`'s key)
             diags.push(
-                Diagnostic::error(
-                    codes::E_INVALID_DEFINITION,
-                    format!("expected `key = value`, found `{}`", e.raw),
-                )
-                .at(span.clone()),
+                Diagnostic::error(codes::E_INVALID_DEFINITION, "expected `key = value`")
+                    .at(span.clone()),
             );
             continue;
         };
@@ -747,6 +745,18 @@ mod tests {
 
     fn codes_of(d: &Diagnostics) -> Vec<&'static str> {
         d.iter().map(|x| x.code).collect()
+    }
+
+    /// A line without its `=` can carry a secret (`http-api`'s key): the
+    /// error names it by its line number only.
+    #[test]
+    fn a_line_without_equals_is_not_quoted() {
+        let (_, d) = parse("[General]\nhttp-api k3y@127.0.0.1:6171\n");
+        let found: Vec<(&str, &str)> = d.iter().map(|x| (x.code, x.message.as_str())).collect();
+        assert_eq!(
+            found,
+            [(codes::E_INVALID_DEFINITION, "expected `key = value`")]
+        );
     }
 
     #[test]

@@ -360,11 +360,16 @@ fn definition_entries<'a>(
     if let Some(sec) = profile.section(section) {
         for e in sec.active_entries() {
             match split_definition(&e.raw) {
-                Some((name, def)) => out.push((name, def, &e.span)),
-                None => diags.push(
+                // A name never holds a comma (member lists are
+                // comma-separated): one that does came from the parameters'
+                // first `=` standing in for a missing one after the name.
+                Some((name, def)) if !name.contains(',') => out.push((name, def, &e.span)),
+                _ => diags.push(
                     Diagnostic::error(
                         codes::E_INVALID_DEFINITION,
-                        format!("[{section}]: expected `Name = ...`, found `{}`", e.raw),
+                        // nothing of the line: once its `=` is missing, its
+                        // fields slide around, a password among them (M3-D7)
+                        format!("[{section}]: expected `Name = ...`"),
                     )
                     .at(e.span.clone()),
                 ),
@@ -1093,6 +1098,54 @@ G = select, A\n[Rule]\nFINAL,DIRECT\n",
             .map(|d| d.message.as_str())
             .collect();
         assert_eq!(found, ["policy group `G`: unknown type `selekt`"]);
+    }
+
+    /// Without the `=` right after the name, a line splits at the first `=`
+    /// inside its parameters: the "name" then holds positional parameters
+    /// (a user, a password) and the "type" is a value (a password, a
+    /// token). A name can never hold a comma — member lists are
+    /// comma-separated — so such a line is an `E0017` that quotes nothing
+    /// of it (M3-D7).
+    #[test]
+    fn a_missing_equals_after_the_name_quotes_nothing_of_the_line() {
+        let l = load_text(
+            "[Proxy]\nA = direct\nT trojan, t.test, 443, password=s3cretPw42\n\
+S snell, s.test, 443, psk=s3cretPw42, version=4\nX http, h.test, 80, alice, s3cretPw42, tfo=true\n\
+[Proxy Group]\nG select, policy-path https://sub.test/nodes?token=t0k3n\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let errors: Vec<(&str, &str)> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == crate::Severity::Error)
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            errors,
+            [
+                (
+                    codes::E_INVALID_DEFINITION,
+                    "[Proxy]: expected `Name = ...`"
+                ),
+                (
+                    codes::E_INVALID_DEFINITION,
+                    "[Proxy]: expected `Name = ...`"
+                ),
+                (
+                    codes::E_INVALID_DEFINITION,
+                    "[Proxy]: expected `Name = ...`"
+                ),
+                (
+                    codes::E_INVALID_DEFINITION,
+                    "[Proxy Group]: expected `Name = ...`"
+                ),
+            ]
+        );
+        for d in l.diagnostics.iter() {
+            let shown = d.to_string();
+            for secret in ["s3cretPw42", "alice", "t0k3n"] {
+                assert!(!shown.contains(secret), "{shown}");
+            }
+        }
     }
 
     #[test]

@@ -64,12 +64,14 @@ fn parse_upstream(item: &str) -> Option<DnsUpstream> {
 }
 
 pub fn parse_host_entry(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<HostEntry, ParseError> {
-    let (key, value) = split_definition(raw).ok_or_else(|| {
-        ParseError::new(
-            codes::E_INVALID_DEFINITION,
-            format!("expected `<host> = <value>`, found `{raw}`"),
-        )
-    })?;
+    // A host never holds whitespace: a key that does came from an `=` further
+    // on (a URL's query) standing in for the missing one after the host.
+    // Nothing of the line is quoted — it can carry a token (M3-D7).
+    let (key, value) = split_definition(raw)
+        .filter(|(key, _)| !key.contains(char::is_whitespace))
+        .ok_or_else(|| {
+            ParseError::new(codes::E_INVALID_DEFINITION, "expected `<host> = <value>`")
+        })?;
     if value.is_empty() {
         return Err(ParseError::new(
             codes::E_SYNTAX,
@@ -162,6 +164,25 @@ mod tests {
             base_dir: Path::new("/p"),
         };
         parse_host_entry(raw, &ctx, &Span::new(Arc::from(Path::new("h.conf")), 1))
+    }
+
+    /// A line without the `=` after its host can carry a token (a DoH
+    /// server's URL, a `DOMAIN-SET:` link), and it may still hold an `=`
+    /// further on, in a URL's query: either way the error names it by its
+    /// line number only.
+    #[test]
+    fn a_line_without_equals_is_not_quoted() {
+        for raw in [
+            "example.com server:https://doh.test/dns-query?id=t0k3n",
+            "example.com server:https://doh.test/t0k3n/dns-query",
+        ] {
+            let e = parse(raw).unwrap_err();
+            assert_eq!(
+                (e.code, e.message.as_str()),
+                (codes::E_INVALID_DEFINITION, "expected `<host> = <value>`"),
+                "{raw}"
+            );
+        }
     }
 
     #[test]

@@ -8005,17 +8005,17 @@ git commit -m "docs: M3a——兼容性清单、API 参考、手工验收、M3 �
 | 17 | 坏的 `external-policy-modifier` 值让每条导入行各报一条 `W0023` | 与 #6 一起 |
 | 18 | `derive` 按名字线性查主配置的定义行；两个不同的（成员，中继）组合只有在名字里本身含 ` (via ` 时才可能拼出同一个派生名，此时后者静默共用前者的 spec | 有用户报告再说 |
 | 19 | `spec/http.rs` 的 `<random-string(…)>` 长度错误会引用括号里的文字（只影响主配置；导入行已由固定说法兜住） | 单独小改动 |
-| 20 | 测试偶发失败（计时类，与本分支无关）：`rurge-dns` 的 `bootstrap::set_upstreams_takes_effect_for_the_next_resolve` 与 `resolver::tests::a_partial_result_completes_aaaa_in_the_background`，全工作区运行中各见一两次，单独重跑通过 | 单独排查 |
+| 20 | 测试偶发失败（计时类，与本分支无关）：`rurge-dns` 的 `bootstrap::set_upstreams_takes_effect_for_the_next_resolve` 与 `resolver::tests::a_partial_result_completes_aaaa_in_the_background`，全工作区运行中各见一两次，单独重跑通过；M3a 合并后的一次全量运行里，`resolver::tests::aaaa_suppression_after_five_timeouts_and_flush_resumes` 卡住、测试进程以 100% CPU 空转了数小时（同一轮 `cache_fresh_stale_negative_and_coalescing` 失败），单独重跑 3 次都在 2 秒内通过——空转说明解析器或 MockDns 在某种时序下可能有忙等循环，值得当作缺陷查 | 单独排查 |
 | 21 | 1 秒内的多次订阅更新只触发一次重建，没有用例钉住（去抖由代码与常数保证） | 有用户报告再说 |
-| 22 | 订阅下载的 User-Agent（是否带 Surge 兼容标识） | 等项目所有者决定 |
+| 22 | 订阅下载的 User-Agent（是否带 Surge 兼容标识） | 已修（M3a 合并后的小修正） |
 | 23 | 资源管理器的 `Debug`（`cache::Meta` 含 URL、`ResourceState::Available` 含正文）与缓存目录 `meta.json` 里的完整 URL（含 token，只写不读）；目前没有打印或读取的地方 | 单独小改动 |
 | 24 | P10 与 P11 的理由相悖：`include-other-group` 取到的是被引用组未派生的成员，会绕过该组的中继 | 手工验收时对照 Surge 的实际行为再定；M3a 手工验收后 |
 | 25 | 从订阅导入的 `external` 类型策略：实现 `external`（M4）之前，装配里须先一律跳过（`W0023`，固定说法），否则订阅作者或 `http://` 链路上的中间人能让 rurge 以任意参数启动本机程序 | M4 设计必查 |
-| 26 | 终审复审后的残留：名字后面漏写 `=` 的笔误（如 `T trojan, t.test, 443, password=…`、`G select, policy-path https://…?token=…`）让 `split_definition` 在参数的 `=` 处切开，名字里带上位置参数、关键字位置是取值，`E0004` 仍会把口令或订阅 token 打进诊断（`rurge check`、启动 / 重载错误、日志、`POST /v1/profiles/check`） | 尽快单独修（M3b 开工前） |
-| 27 | 终审修正带进的回归：恰好 100 000 行、以换行结尾的订阅被标成截断，误报 `W0024`（`bound_lines` 差一：后面还有内容才该置位） | 与 #26 一起 |
-| 28 | 终审修正带进的回归：写成 `[ Proxy ]`（方括号内有空格）的订阅不被识别为 `[Proxy]` 节头（`parse_str` 会先 trim 方括号里的名字），整份配置走逐行路径，其它节每行一条 `W0023` | 与 #26 一起 |
+| 26 | 终审复审后的残留：名字后面漏写 `=` 的笔误（如 `T trojan, t.test, 443, password=…`、`G select, policy-path https://…?token=…`）让 `split_definition` 在参数的 `=` 处切开，名字里带上位置参数、关键字位置是取值，`E0004` 仍会把口令或订阅 token 打进诊断（`rurge check`、启动 / 重载错误、日志、`POST /v1/profiles/check`） | 已修（M3a 合并后的小修正） |
+| 27 | 终审修正带进的回归：恰好 100 000 行、以换行结尾的订阅被标成截断，误报 `W0024`（`bound_lines` 差一：后面还有内容才该置位） | 已修（M3a 合并后的小修正） |
+| 28 | 终审修正带进的回归：写成 `[ Proxy ]`（方括号内有空格）的订阅不被识别为 `[Proxy]` 节头（`parse_str` 会先 trim 方括号里的名字），整份配置走逐行路径，其它节每行一条 `W0023` | 已修（M3a 合并后的小修正） |
 | 29 | Windows 上 "cannot watch file" 告警：notify 把内层错误的 `Debug`（含路径）放进 `ErrorKind::Generic`，`?e.kind` 仍会带出被监视的目录 | 单独小改动 |
-| 30 | 与 #26 同类的既有回显：行写错时 `E0017` 引用整行、`E0001` 引用端口字段（可能是口令） | 与 #26 一起 |
+| 30 | 与 #26 同类的既有回显：行写错时 `E0017` 引用整行、`E0001` 引用端口字段（可能是口令） | 已修（M3a 合并后的小修正） |
 | 31 | `ProxyPolicy` 派生 `Debug`，`positional` / `params` / `definition` 都是原文（含口令）；`Config` 经它派生 `Debug`。目前没有打印的地方 | 单独小改动 |
 | 32 | 单行长度与本地文件大小没有上限：单行可达资源上限（`split_list` 按逗号逐项分配），本地的 `policy-path` / RULE-SET 文件整个读入（`max_size` 只管 URL 下载） | M8 |
 | 33 | 重载后旧资源管理器的 `url_task` 要睡满剩余的刷新间隔才退出（期间持有条目与正文），与 M2 设计"60 秒内退出"不符；间隔巨大时会一直留到进程退出 | 单独排查 |

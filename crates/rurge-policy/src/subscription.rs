@@ -152,10 +152,16 @@ fn lines(text: &str, file: &Arc<Path>) -> (Vec<(u32, String)>, bool) {
     (entries, truncated)
 }
 
-/// Whether some line of `text`, trimmed, reads `[Proxy]` case-insensitively.
+/// Whether some line of `text` is a `[Proxy]` section header by the profile
+/// parser's own rule: the name inside the brackets trimmed, compared
+/// case-insensitively.
 fn has_proxy_header(text: &str) -> bool {
-    text.lines()
-        .any(|line| line.trim().eq_ignore_ascii_case("[Proxy]"))
+    text.lines().any(|line| {
+        line.trim()
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .is_some_and(|name| name.trim().eq_ignore_ascii_case("Proxy"))
+    })
 }
 
 /// The first `n` lines of `text` (no copy: line numbers in the slice are
@@ -165,7 +171,7 @@ fn bound_lines(text: &str, n: usize) -> (&str, bool) {
     for (i, _) in text.match_indices('\n') {
         seen += 1;
         if seen == n {
-            return (&text[..=i], true);
+            return (&text[..=i], i + 1 < text.len());
         }
     }
     (text, false)
@@ -289,5 +295,26 @@ A = http, other.test, 80\nnot a policy\n";
         assert_eq!(sub.skipped.len(), MAX_SKIPPED_LISTED);
         assert_eq!(sub.skipped_more, MAX_LINES - MAX_SKIPPED_LISTED);
         assert!(sub.truncated);
+    }
+
+    /// `MAX_LINES` lines, the last one ended by its newline, is not "more".
+    #[test]
+    fn exactly_the_line_limit_is_not_cut() {
+        let text = format!("{}A = http, a.test, 80\n", "# c\n".repeat(MAX_LINES - 1));
+        let sub = parse(&text);
+        assert_eq!(names(&sub), [("A", MAX_LINES as u32)]);
+        assert!(!sub.truncated);
+        assert!(parse(&format!("{text}B = http, b.test, 80\n")).truncated);
+    }
+
+    /// The profile parser trims the name inside the brackets: `[ Proxy ]`
+    /// is the `[Proxy]` section there, and so it is here.
+    #[test]
+    fn a_proxy_header_with_blanks_inside_is_the_proxy_section() {
+        let sub = parse(
+            "[General]\nloglevel = notify\n[ Proxy ]\nA = http, a.test, 80\n[Rule]\nFINAL,DIRECT\n",
+        );
+        assert_eq!(names(&sub), [("A", 4)]);
+        assert!(sub.skipped.is_empty() && sub.skipped_more == 0);
     }
 }

@@ -59,7 +59,12 @@ pub async fn build_stack_with(
     let connector = Arc::new(DirectConnector::new(Arc::new(SystemResolve)));
     let client = Arc::new(HttpClient::new(
         connector.clone(),
-        HttpClientConfig::default(),
+        HttpClientConfig {
+            // Subscription panels pick the format of what they send by
+            // User-Agent; "Surge" in it asks for Surge's.
+            user_agent: format!("rurge/{} (Surge-compatible)", env!("CARGO_PKG_VERSION")),
+            ..HttpClientConfig::default()
+        },
     )?);
     let resources = ResourceManager::with_options(
         opts.data_dir.clone(),

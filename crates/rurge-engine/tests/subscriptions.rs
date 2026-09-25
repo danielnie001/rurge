@@ -239,6 +239,15 @@ async fn a_url_subscription_arrives_after_the_start_and_is_cached() {
         members(&engine, "Sub") == ["N1", "N2"]
     })
     .await;
+    // subscription panels pick the format of what they send by User-Agent:
+    // rurge's asks for Surge's
+    let agent = server
+        .requests()
+        .into_iter()
+        .find(|r| r.path == "/nodes")
+        .and_then(|r| r.header("user-agent").map(str::to_string))
+        .expect("the download sent a User-Agent");
+    assert!(agent.contains("Surge"), "{agent}");
 
     // Design 5.9's cached half: with the subscription cached in the data
     // directory, an offline check assembles from it — no "not downloaded
