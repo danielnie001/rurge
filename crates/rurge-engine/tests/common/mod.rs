@@ -89,6 +89,9 @@ pub async fn runtime(dir: &std::path::Path, profile: &str, shared: EngineShared)
     .unwrap()
 }
 
+/// A test URL nothing answers at.
+pub const NO_TEST: &str = "http://127.0.0.1:9/";
+
 /// The variable parts of a test profile; everything else is fixed.
 #[derive(Default)]
 pub struct Profile<'a> {
@@ -101,9 +104,12 @@ pub struct Profile<'a> {
 }
 
 impl Profile<'_> {
+    /// Connectivity tests go to a closed loopback port unless `general`
+    /// says otherwise: never to the default `http://bing.com/`.
     pub fn text(&self, dns: SocketAddr) -> String {
         format!(
-            "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\ndns-server = {dns}\nipv6 = false\n{}\n\
+            "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\ndns-server = {dns}\nipv6 = false\n\
+proxy-test-url = {NO_TEST}\ninternet-test-url = {NO_TEST}\n{}\n\
 [Proxy]\n{}\n[Proxy Group]\n{}\n[Host]\n{}\n[Rule]\n{}\nFINAL,DIRECT\n",
             self.general, self.proxies, self.groups, self.hosts, self.rules
         )

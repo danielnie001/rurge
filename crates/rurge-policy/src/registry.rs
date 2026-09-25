@@ -8,7 +8,7 @@ use crate::auto::{AutoGroups, SelectCtx, Standing, fallback, load_balance, url_t
 use crate::cell::{ChainConnector, RegistryCell};
 use crate::factory::{BuildError, OutboundFactory};
 use crate::selections::SelectionTable;
-use crate::testbook::{TestCase, TestResult};
+use crate::testbook::{MAX_CONCURRENT_TESTS, TestCase, TestResult};
 use rurge_config::rule::PolicyRef;
 use rurge_config::spec::{CommonOpts, GroupSpec, IpVersion, PolicySpec};
 use rurge_config::{Builtin, Config, GroupKind, KeystoreType, PolicyKind, Span};
@@ -741,6 +741,21 @@ impl PolicyRegistry {
             .filter(|m| self.standing(m, 1).passes(&spec.test).is_some())
             .cloned()
             .collect()
+    }
+
+    /// How long a round of tests of `group` may take: its tests run
+    /// `MAX_CONCURRENT_TESTS` at a time, each within its own timeout.
+    pub fn round_timeout(&self, group: &str) -> Duration {
+        let mut groups = Vec::new();
+        let mut policies = Vec::new();
+        self.gather(group, 0, &mut groups, &mut policies);
+        let timeouts: Vec<Duration> = policies
+            .iter()
+            .filter_map(|p| self.test_case(p))
+            .map(|case| case.timeout)
+            .collect();
+        let longest = timeouts.iter().max().copied().unwrap_or_default();
+        longest * timeouts.len().div_ceil(MAX_CONCURRENT_TESTS) as u32
     }
 
     /// Tests every member of `group` now — the members of the groups in it
@@ -1886,6 +1901,27 @@ E = url-test, A, B, evaluate-before-use=true\nS = select, E\n[Rule]\nFINAL,U\n";
             reg.test_case("DIRECT").map(|c| c.policy).as_deref(),
             Some("DIRECT")
         );
+    }
+
+    /// A round's tests run eight at a time, each within its own timeout.
+    #[test]
+    fn a_round_may_take_a_timeout_per_eight_tests() {
+        let members: Vec<String> = (1..=9).map(|i| format!("P{i}")).collect();
+        let proxies: String = members
+            .iter()
+            .map(|m| format!("{m} = http, 127.0.0.1, 80\n"))
+            .collect();
+        let profile = format!(
+            "[Proxy]\n{proxies}Slow = http, 127.0.0.1, 80, test-timeout=7\n[Proxy Group]\n\
+             Two = url-test, P1, P2\nNine = url-test, {}\nWithSlow = fallback, P1, Slow, REJECT\n\
+             Nothing = fallback, REJECT\n[Rule]\nFINAL,DIRECT\n",
+            members.join(", ")
+        );
+        let reg = generation(&profile, &FakeFactory::new(), None);
+        assert_eq!(reg.round_timeout("Two"), Duration::from_secs(5));
+        assert_eq!(reg.round_timeout("Nine"), Duration::from_secs(10));
+        assert_eq!(reg.round_timeout("WithSlow"), Duration::from_secs(7));
+        assert_eq!(reg.round_timeout("Nothing"), Duration::ZERO);
     }
 
     /// A round asked for a group that a reload then took away still ends

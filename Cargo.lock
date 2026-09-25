@@ -2135,6 +2135,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tracing",
+ "url",
 ]
 
 [[package]]

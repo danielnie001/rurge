@@ -1,6 +1,7 @@
 //! The engine (M3 design §7.2 – 7.3): implements `Dialer` for the listeners,
 //! relays bytes, binds listeners from `[General]`, writes the session log.
 
+use crate::auto::{EVALUATION_FAILED, resolve_ready};
 use crate::control::Mode;
 use crate::observe::{RequestLog, TrafficStats};
 use crate::runtime::Runtime;
@@ -19,6 +20,7 @@ use rurge_inbound::{
 };
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
+use rurge_policy::auto::SelectCtx;
 use rurge_policy::{PolicyRegistry, TerminalKind};
 use rurge_proto::OutboundError;
 use rurge_rules::{OutboundMode, Outcome};
@@ -192,6 +194,7 @@ impl Engine {
             pc.attach(Arc::downgrade(&engine));
         }
         engine.watch_subscriptions(&rt, receivers);
+        engine.start_tests();
         engine
     }
 
@@ -344,7 +347,7 @@ impl Engine {
         self.bind_listeners().await
     }
 
-    fn new_handle(&self, session: SessionInfo) -> Arc<SessionHandle> {
+    pub(crate) fn new_handle(&self, session: SessionInfo) -> Arc<SessionHandle> {
         let id = self.next_session.fetch_add(1, Ordering::Relaxed) + 1;
         let handle = SessionHandle::new_with_token(id, session, self.sessions_root.child_token());
         // Weak: the active index holds the handle and the handle holds this
@@ -373,7 +376,8 @@ impl Engine {
 
     /// Makes `next` the generation that outlives-a-reload objects see: chain
     /// connectors and dials resolve against its registry, direct connectors
-    /// through its resolver.
+    /// through its resolver; the automatic groups keep what still applies
+    /// to its groups (M3 design 6.5).
     pub(crate) fn publish_generation(&self, next: &mut Runtime) {
         assert!(
             Arc::ptr_eq(&self.shared.cell, &next.shared.cell)
@@ -386,6 +390,7 @@ impl Engine {
                 .expect("a generation is published once"),
         );
         self.shared.resolver.store(next.stack.resolver.clone());
+        self.shared.auto.retain(&next.config.group_specs);
     }
 }
 
@@ -657,7 +662,17 @@ impl Engine {
             // would only come from a misconfigured rule → direct.
             Chosen::DnsFailed => PolicyRef::Builtin(Builtin::Direct),
         };
-        let resolution = registry.resolve(&policy);
+        let ctx = SelectCtx {
+            host: Some(handle.session().dst_host.to_string()),
+        };
+        let resolution = match resolve_ready(&registry, &policy, &ctx).await {
+            Ok(resolution) => resolution,
+            Err(chain) => {
+                handle.set_policy_chain(chain);
+                handle.finish(SessionOutcome::Failed(EVALUATION_FAILED.to_string()));
+                return Err(io::Error::other(EVALUATION_FAILED));
+            }
+        };
         handle.set_policy_chain(resolution.chain.clone());
         let target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
         let opts = ConnectOpts {
@@ -846,7 +861,17 @@ impl Dialer for Engine {
                 Chosen::Policy(p) => p,
                 Chosen::DnsFailed => return fail(handle, FailKind::Dns, "dns lookup failed"),
             };
-            let resolution = registry.resolve(&policy);
+            // `load-balance` with `persistent=true` picks by the host
+            let ctx = SelectCtx {
+                host: Some(handle.session().dst_host.to_string()),
+            };
+            let resolution = match resolve_ready(&registry, &policy, &ctx).await {
+                Ok(resolution) => resolution,
+                Err(chain) => {
+                    handle.set_policy_chain(chain);
+                    return fail(handle, FailKind::Connect, EVALUATION_FAILED);
+                }
+            };
             handle.set_policy_chain(resolution.chain.clone());
             if let Some(note) = &resolution.note {
                 // A protocol rurge cannot speak yet, a group cycle, a group
