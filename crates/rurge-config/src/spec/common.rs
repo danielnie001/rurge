@@ -179,8 +179,6 @@ pub(crate) fn read_common(
         let inert = [
             ("dns-follow-interface", dns_follow_interface),
             ("tfo", tfo),
-            ("test-url", test_url.is_some()),
-            ("test-timeout", test_timeout.is_some()),
             ("test-udp", test_udp.is_some()),
             ("block-quic", block_quic_present),
             ("ecn", ecn_present && applies == Applies::Proxy),
@@ -264,8 +262,6 @@ mod tests {
             [
                 "dns-follow-interface",
                 "tfo",
-                "test-url",
-                "test-timeout",
                 "test-udp",
                 "block-quic",
                 "ecn"

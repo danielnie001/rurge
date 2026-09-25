@@ -159,7 +159,9 @@ pub struct General {
     pub http_api_web_dashboard: bool,
     pub internet_test_url: String,
     pub proxy_test_url: String,
-    pub test_timeout: Duration,
+    /// `None` when the profile does not say: the default depends on the
+    /// policy (`test_target`).
+    pub test_timeout: Option<Duration>,
     pub proxy_test_udp: Option<UdpTest>,
     pub force_http_engine_hosts: HostList,
     pub always_raw_tcp_hosts: HostList,
@@ -193,6 +195,28 @@ pub struct General {
     pub unknown: Vec<UnknownKey>,
 }
 
+impl General {
+    /// Where a connectivity test of a policy goes and how long it may take
+    /// (phase 2 M3 design 6.1): the policy's own `test-url` / `test-timeout`,
+    /// else the profile's — `internet-test-url` for the direct kind (`DIRECT`
+    /// and `direct` policies), `proxy-test-url` for the rest — else 5
+    /// seconds, 10 for the direct kind.
+    pub fn test_target<'a>(
+        &'a self,
+        own_url: Option<&'a str>,
+        own_timeout: Option<Duration>,
+        direct: bool,
+    ) -> (&'a str, Duration) {
+        let url = own_url.unwrap_or(if direct {
+            &self.internet_test_url
+        } else {
+            &self.proxy_test_url
+        });
+        let fallback = Duration::from_secs(if direct { 10 } else { 5 });
+        (url, own_timeout.or(self.test_timeout).unwrap_or(fallback))
+    }
+}
+
 impl Default for General {
     fn default() -> Self {
         Self {
@@ -224,7 +248,7 @@ impl Default for General {
             http_api_web_dashboard: false,
             internet_test_url: "http://bing.com/".into(),
             proxy_test_url: "http://bing.com/".into(),
-            test_timeout: Duration::from_secs(5),
+            test_timeout: None,
             proxy_test_udp: None,
             force_http_engine_hosts: HostList {
                 default_port: Some(80),
@@ -578,7 +602,7 @@ pub fn parse_general(section: Option<&Section>, diags: &mut Diagnostics) -> Gene
             "internet-test-url" => g.internet_test_url = value.to_string(),
             "proxy-test-url" => g.proxy_test_url = value.to_string(),
             "test-timeout" => match value.trim().parse::<u64>() {
-                Ok(s) => g.test_timeout = Duration::from_secs(s),
+                Ok(s) => g.test_timeout = Some(Duration::from_secs(s)),
                 Err(_) => invalid(diags, span, key, value),
             },
             "proxy-test-udp" => match value.split_once('@').and_then(|(h, ip)| {
@@ -801,7 +825,7 @@ mod tests {
         assert_eq!(g.http_listen.len(), 3);
         assert_eq!(g.http_listen[1].password.as_deref(), Some("pw"));
         assert_eq!(g.http_listen[2].addr, "[::1]:6152".parse().unwrap());
-        assert_eq!(g.test_timeout, Duration::from_secs(8));
+        assert_eq!(g.test_timeout, Some(Duration::from_secs(8)));
         assert_eq!(g.proxy_test_udp.as_ref().unwrap().hostname, "apple.com");
         assert_eq!(g.block_quic, BlockQuicGlobal::AllProxy);
         assert_eq!(g.udp_policy_not_supported_behaviour, UdpFallback::Direct);
@@ -816,12 +840,47 @@ mod tests {
         let (g, d) = parse("[Rule]\nFINAL,DIRECT\n");
         assert!(d.is_empty());
         assert_eq!(g.loglevel, LogLevel::Notify);
-        assert_eq!(g.test_timeout, Duration::from_secs(5));
+        assert_eq!(g.test_timeout, None);
         assert_eq!(g.internet_test_url, "http://bing.com/");
         assert!(g.icmp_forwarding);
         assert!(g.proxy_restricted_to_lan);
         assert_eq!(g.udp_policy_not_supported_behaviour, UdpFallback::Reject);
         assert!(g.http_listen.is_empty());
+    }
+
+    /// A connectivity test's URL and timeout: the policy's own, else the
+    /// profile's — `internet-test-url` for the direct kind, `proxy-test-url`
+    /// for the rest — else 5 seconds, 10 for the direct kind (phase 2 M3
+    /// design 6.1).
+    #[test]
+    fn a_test_goes_where_the_policy_or_the_profile_says() {
+        let (g, _) = parse(
+            "[General]
+internet-test-url = http://i.test/
+proxy-test-url = http://p.test/
+",
+        );
+        assert_eq!(
+            g.test_target(None, None, false),
+            ("http://p.test/", Duration::from_secs(5))
+        );
+        assert_eq!(
+            g.test_target(None, None, true),
+            ("http://i.test/", Duration::from_secs(10))
+        );
+        assert_eq!(
+            g.test_target(Some("http://own.test/"), Some(Duration::from_secs(2)), true),
+            ("http://own.test/", Duration::from_secs(2))
+        );
+        let (g, _) = parse(
+            "[General]
+test-timeout = 3
+",
+        );
+        assert_eq!(
+            g.test_target(None, None, true),
+            ("http://bing.com/", Duration::from_secs(3))
+        );
     }
 
     #[test]
