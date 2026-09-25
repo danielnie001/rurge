@@ -129,35 +129,70 @@ fn report(group: &GroupSpec, sub: &Subscription, diags: &mut Diagnostics) {
     }
 }
 
-/// Why subscription line `p` may not be taken in: it reaches by name for
-/// the profile's own material — a `[Keystore]` item, or a policy or group of
-/// the profile as its relay — which only the user may hand it, through the
-/// group's `external-policy-modifier`. A subscription is somebody else's
-/// content, and a relay or a client certificate would be used as soon as the
-/// line is tested, chosen or not. A relay to another imported line, or to
-/// `DIRECT`, is the subscription's own business.
+/// Why subscription line `p` may not be taken in after the modifier is
+/// applied: it reaches by name for the profile's own material — a
+/// `[Keystore]` item, or a policy or group of the profile as its relay —
+/// which only the user may hand it through the group's
+/// `external-policy-modifier`. The check is done on the parsed, modified
+/// policy, so no spelling of the line (quoted items, unclosed quotes) can get
+/// around the rule. A subscription is somebody else's content, and a relay or
+/// a client certificate would be used as soon as the line is tested, chosen
+/// or not. A relay to another imported line, or to `DIRECT`, is the
+/// subscription's own business.
 fn reaches_into_profile(
     cfg: &Config,
-    p: &ProxyPolicy,
+    policy: &ProxyPolicy,
     modifier: &[(String, String)],
-) -> Option<&'static str> {
-    let set_by_modifier = |key: &str| modifier.iter().any(|(k, _)| k.eq_ignore_ascii_case(key));
-    if p.params.get("client-cert").is_some() && !set_by_modifier("client-cert") {
-        return Some(
-            "a subscription line's own `client-cert` is not honoured (only `external-policy-modifier` may set it)",
-        );
+) -> Option<String> {
+    // Find what the modifier sets each key to.
+    let modifier_values: HashMap<String, String> = modifier
+        .iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+        .collect();
+
+    // Check client-cert first.
+    if let Some(mod_value) = modifier_values.get("client-cert") {
+        // Modifier sets it: all values in the parsed policy must be the modifier's value exactly.
+        let values = policy.params.get_all("client-cert");
+        if values.is_empty() || !values.iter().all(|v| v == mod_value) {
+            return Some(
+                "`external-policy-modifier` cannot set `client-cert` on this line".to_string(),
+            );
+        }
+    } else {
+        // Modifier does not set it: no value allowed.
+        let values = policy.params.get_all("client-cert");
+        if !values.is_empty() {
+            return Some(
+                "a subscription line's own `client-cert` is not honoured (only `external-policy-modifier` may set it)".to_string(),
+            );
+        }
     }
-    if let Some(relay) = p.params.get("underlying-proxy")
-        && !set_by_modifier("underlying-proxy")
-        && matches!(
-            cfg.name_kind(relay.trim()),
-            Some(NameKind::Policy(_) | NameKind::Group)
-        )
-    {
-        return Some(
-            "a subscription line's own `underlying-proxy` may not name a policy or group of the profile (only `external-policy-modifier` may)",
-        );
+
+    // Check underlying-proxy.
+    if let Some(mod_value) = modifier_values.get("underlying-proxy") {
+        // Modifier sets it: all values in the parsed policy must be the modifier's value exactly.
+        let values = policy.params.get_all("underlying-proxy");
+        if values.is_empty() || !values.iter().all(|v| v == mod_value) {
+            return Some(
+                "`external-policy-modifier` cannot set `underlying-proxy` on this line".to_string(),
+            );
+        }
+    } else {
+        // Modifier does not set it: no profile-level name allowed.
+        let values = policy.params.get_all("underlying-proxy");
+        for value in values {
+            if matches!(
+                cfg.name_kind(value.trim()),
+                Some(NameKind::Policy(_) | NameKind::Group)
+            ) {
+                return Some(
+                    "a subscription line's own `underlying-proxy` may not name a policy or group of the profile (only `external-policy-modifier` may)".to_string(),
+                );
+            }
+        }
     }
+
     None
 }
 
@@ -203,14 +238,6 @@ impl<'a> Imports<'a> {
                     continue;
                 }
                 let line = p.span.line;
-                if let Some(why) = reaches_into_profile(cfg, p, modifier) {
-                    diags.push(warn(
-                        g,
-                        codes::W_SET_LINES_SKIPPED,
-                        format!("`policy-path` line {line}: {why}; skipped"),
-                    ));
-                    continue;
-                }
                 let name = format!("{prefix}{}", p.name);
                 let definition = if modifier.is_empty() {
                     p.definition.clone()
@@ -225,6 +252,14 @@ impl<'a> Imports<'a> {
                     ));
                     continue;
                 };
+                if let Some(why) = reaches_into_profile(cfg, &policy, modifier) {
+                    diags.push(warn(
+                        g,
+                        codes::W_SET_LINES_SKIPPED,
+                        format!("`policy-path` line {line}: {why}; skipped"),
+                    ));
+                    continue;
+                }
                 if cfg.name_kind(&name).is_some() {
                     diags.push(warn(
                         g,
@@ -1401,6 +1436,65 @@ M = select, policy-path=https://sub.test/m, external-policy-modifier=\"underlyin
         assert_eq!(a.cycles, [["P", "Q", "P"]]);
     }
 
+    /// Quoted items or unclosed quotes in a subscription line may not bypass
+    /// the check that the line's parameters match what the modifier sets. The
+    /// check is done on the parsed, modified policy, so every spelling of a
+    /// parameter that gets around `with_params` is still caught.
+    #[test]
+    fn a_modified_line_may_not_keep_its_own_value_by_its_spelling() {
+        let cfg = profile(
+            "Corp = http, corp.test, 80",
+            "Pool = select, Corp\n\
+R = select, policy-path=https://sub.test/r, external-policy-modifier=\"underlying-proxy=Corp\"\n\
+C = select, policy-path=https://sub.test/c, external-policy-modifier=\"client-cert=my-cert\"",
+        );
+        let a = assemble(
+            &cfg,
+            &snapshots(
+                &cfg,
+                &[
+                    (
+                        "R",
+                        "Quoted = http, q.test, 80, \"underlying-proxy=Pool\"\n\
+Swallow = http, s.test, 80, foo=\"bar\n\
+Plain = http, p.test, 80, underlying-proxy=Pool",
+                    ),
+                    (
+                        "C",
+                        "QuotedCert = https, c.test, 443, \"client-cert=corp-cert\"",
+                    ),
+                ],
+            ),
+        );
+        assert_eq!(members(&a, "R"), ["Plain"]);
+        assert_eq!(members(&a, "C"), &[] as &[&str]);
+        let relay = |name: &str| {
+            a.imported
+                .iter()
+                .find(|i| i.policy.name == name)
+                .and_then(|i| i.spec.as_ref())
+                .and_then(|s| s.common.underlying_proxy.clone())
+        };
+        assert_eq!(relay("Plain").as_deref(), Some("Corp"));
+        assert_eq!(
+            warnings(&a),
+            [
+                (
+                    codes::W_SET_LINES_SKIPPED,
+                    "policy group `R`: `policy-path` line 1: `external-policy-modifier` cannot set `underlying-proxy` on this line; skipped".to_string()
+                ),
+                (
+                    codes::W_SET_LINES_SKIPPED,
+                    "policy group `R`: `policy-path` line 2: `external-policy-modifier` cannot set `underlying-proxy` on this line; skipped".to_string()
+                ),
+                (
+                    codes::W_SET_LINES_SKIPPED,
+                    "policy group `C`: `policy-path` line 1: `external-policy-modifier` cannot set `client-cert` on this line; skipped".to_string()
+                ),
+            ]
+        );
+    }
+
     /// A subscription is somebody else's content: its lines may not reach
     /// for the profile's own material by name — a `[Keystore]` item, a
     /// policy or group as a relay — unless the user's own modifier sets that
@@ -1424,7 +1518,7 @@ H = select, policy-path=https://sub.test/h, external-policy-modifier=\"underlyin
 Relay = http, r.test, 80, underlying-proxy=Corp\nVia = http, v.test, 80, underlying-proxy=Pool\n\
 Inner = http, i.test, 80, underlying-proxy=Hop\nHop = http, h.test, 80",
                     ),
-                    ("H", "Mod = http, m.test, 80, underlying-proxy=Elsewhere"),
+                    ("H", "Mod = http, m.test, 80, underlying-proxy=Pool"),
                 ],
             ),
         );
