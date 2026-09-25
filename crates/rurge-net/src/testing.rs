@@ -59,17 +59,23 @@ pub struct TestServer {
 
 impl TestServer {
     pub async fn spawn() -> TestServer {
-        Self::start(false).await
+        Self::start(None).await
     }
 
     pub async fn spawn_tls() -> TestServer {
-        Self::start(true).await
+        Self::start(Some(tls_acceptor())).await
     }
 
-    async fn start(tls: bool) -> TestServer {
+    /// HTTPS with a certificate of the caller's making, so a client can be
+    /// given the roots that trust it.
+    pub async fn spawn_tls_with(acceptor: TlsAcceptor) -> TestServer {
+        Self::start(Some(acceptor)).await
+    }
+
+    async fn start(acceptor: Option<TlsAcceptor>) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let acceptor = if tls { Some(tls_acceptor()) } else { None };
+        let tls = acceptor.is_some();
         let state = Arc::new(Mutex::new(State::default()));
         let (tx, mut rx) = oneshot::channel::<()>();
         let st = state.clone();

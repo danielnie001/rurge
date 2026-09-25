@@ -8,6 +8,7 @@
 pub mod assemble;
 pub mod cell;
 pub mod factory;
+pub mod probe;
 pub mod registry;
 pub mod selections;
 pub mod subscription;

@@ -12,10 +12,20 @@ rurge-config.workspace = true
 rurge-net.workspace = true
 rurge-proto.workspace = true
 arc-swap.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
 tracing.workspace = true
+url.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+rurge-net = { workspace = true, features = ["testing"] }
+rurge-proto = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

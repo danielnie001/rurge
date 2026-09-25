@@ -2219,11 +2219,19 @@ name = "rurge-policy"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "rurge-config",
  "rurge-net",
  "rurge-proto",
+ "rustls",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "url",
 ]
 
 [[package]]
