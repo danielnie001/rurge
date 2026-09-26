@@ -9,6 +9,7 @@ use crate::auto::{AutoGroups, SelectCtx, Standing, fallback, load_balance, url_t
 use crate::cell::{ChainConnector, RegistryCell};
 use crate::factory::{BuildError, OutboundFactory};
 use crate::selections::SelectionTable;
+use crate::smart::{Candidate, Health, ROUND_INTERVAL, SiteMemory, rank};
 use crate::testbook::{MAX_CONCURRENT_TESTS, TestCase, TestResult};
 use rurge_config::rule::PolicyRef;
 use rurge_config::spec::{CommonOpts, GroupSpec, IpVersion, PolicySpec};
@@ -16,12 +17,13 @@ use rurge_config::{Builtin, Config, GroupKind, KeystoreType, PolicyKind, Span};
 use rurge_net::connector::Connector;
 use rurge_proto::{Direct, OutboundRef, Reject, RejectKind};
 use rustls::RootCertStore;
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{BuildHasher, DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use url::Url;
 
 /// Deeper chains than this are treated as a defect (a group cycle resolves
@@ -122,6 +124,44 @@ pub struct Resolution {
     /// round of tests: the dial waits for it and resolves again (M3 design
     /// 6.3). The outermost such group when there are several.
     pub pending: Option<String>,
+    /// The `smart` group on the way, when a dial went through one: what it
+    /// picked and whom to try next (phase 2 M3c design 6.4). There is one at
+    /// most: a `smart` group takes no groups.
+    pub smart: Option<SmartPick>,
+}
+
+/// A dial through a `smart` group (M3c design 6.4): the group, the member it
+/// picked, and the members to try, in order, when that one does not connect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SmartPick {
+    pub group: String,
+    pub member: String,
+    pub retry: Vec<String>,
+}
+
+/// What `choose` found for a group.
+struct Choice {
+    member: String,
+    /// The group wants its first round of tests before it is used
+    /// (`evaluate-before-use`).
+    pending: bool,
+    /// A `smart` group's dial: the members to try after `member`, in order.
+    retry: Option<Vec<String>>,
+}
+
+impl Choice {
+    fn plain(member: String) -> Choice {
+        Choice {
+            member,
+            pending: false,
+            retry: None,
+        }
+    }
+}
+
+/// A number below `n`, drawn the way `load-balance` draws.
+fn random_below(n: usize) -> usize {
+    RandomState::new().hash_one(Instant::now()) as usize % n.max(1)
 }
 
 enum Terminal {
@@ -147,6 +187,9 @@ enum Entry {
         members: Vec<String>,
         /// The cycle it is on, written out: it resolves to REJECT.
         cycle: Option<String>,
+        /// A `smart` group's `policy-priority` factor of each member, in
+        /// member order; empty for the other kinds.
+        factors: Vec<f64>,
     },
 }
 
@@ -284,6 +327,40 @@ fn build_one(
     factory
         .build(spec, connector)
         .map_err(|e| BuildError::new(format!("policy `{}`: {}", spec.name, e.message)))
+}
+
+/// A `smart` group's members: the proxies among `members` — the manual has
+/// it ignore a nested group, a built-in policy and a `direct` / `reject*`
+/// alias, which is said once per build — each with its `policy-priority`
+/// factor, the first pattern that matches deciding (M3c design 6.1).
+fn smart_members(
+    spec: &GroupSpec,
+    members: Vec<String>,
+    entries: &HashMap<String, Entry>,
+) -> (Vec<String>, Vec<f64>) {
+    let (kept, ignored): (Vec<String>, Vec<String>) = members.into_iter().partition(|m| {
+        matches!(
+            entries.get(m.as_str()),
+            Some(Entry::Outbound { proxy: true, .. } | Entry::Unsupported { .. })
+        )
+    });
+    if !ignored.is_empty() {
+        tracing::info!(
+            group = %spec.name,
+            ignored = %ignored.join(", "),
+            "a smart group takes proxy policies only; the others are ignored"
+        );
+    }
+    let factors = kept
+        .iter()
+        .map(|m| {
+            spec.priority
+                .iter()
+                .find(|p| p.pattern.regex.is_match(m).unwrap_or(false))
+                .map_or(1.0, |p| p.factor)
+        })
+        .collect();
+    (kept, factors)
 }
 
 /// Every group on a cycle, with the cycle written out; each cycle is said
@@ -442,6 +519,11 @@ impl PolicyRegistry {
                 })
                 .cloned()
                 .collect();
+            let (members, factors) = if g.kind == GroupKind::Smart {
+                smart_members(g, members, &table.entries)
+            } else {
+                (members, Vec::new())
+            };
             let cycle = on_cycle.get(g.name.as_str()).cloned();
             if cycle.is_none() && members.is_empty() {
                 let note = Note::EmptyGroup {
@@ -464,6 +546,7 @@ impl PolicyRegistry {
                 spec: Arc::new(g.clone()),
                 members,
                 cycle,
+                factors,
             };
             table.add(&g.name, entry, line);
         }
@@ -573,7 +656,7 @@ impl PolicyRegistry {
     /// not move). `None` when `group` is not a group or has no members.
     pub fn current_member(&self, group: &str) -> Option<String> {
         self.choose(group, &SelectCtx::default(), false, 0)
-            .map(|(member, _)| member)
+            .map(|choice| choice.member)
     }
 
     /// The member of `group`, as a dial picks it. `select`: the live
@@ -581,18 +664,19 @@ impl PolicyRegistry {
     /// automatic groups: an override while it names a member, else by the
     /// test results (M3 design 6.4) — and when those are older than the
     /// group's `interval`, or a member that is not a group has none, a round
-    /// is asked for. `live` is a dial: only then may `url-test` move the
-    /// member it holds and a round be asked for; the second value then says
-    /// whether the group wants its first round before it is used
+    /// is asked for. `smart`: by what its book knows (M3c design 6.2), with
+    /// the members to try next. `live` is a dial: only then may `url-test`
+    /// move the member it holds and a round be asked for, and only then is
+    /// it said whether the group wants its first round before it is used
     /// (`evaluate-before-use`).
-    fn choose(
-        &self,
-        group: &str,
-        ctx: &SelectCtx,
-        live: bool,
-        depth: usize,
-    ) -> Option<(String, bool)> {
-        let Some(Entry::Group { spec, members, .. }) = self.entries.get(group) else {
+    fn choose(&self, group: &str, ctx: &SelectCtx, live: bool, depth: usize) -> Option<Choice> {
+        let Some(Entry::Group {
+            spec,
+            members,
+            factors,
+            ..
+        }) = self.entries.get(group)
+        else {
             return None;
         };
         match spec.kind {
@@ -600,12 +684,12 @@ impl PolicyRegistry {
                 let selected = self.selections.get(group).filter(|m| members.contains(m));
                 selected
                     .or_else(|| members.first().cloned())
-                    .map(|m| (m, false))
+                    .map(Choice::plain)
             }
             GroupKind::UrlTest | GroupKind::Fallback | GroupKind::LoadBalance => {
                 // an override stands, and asks for no test (M3 design 6.3)
                 if let Some(member) = self.auto.override_of(group, members) {
-                    return Some((member, false));
+                    return Some(Choice::plain(member));
                 }
                 let last = self.auto.last_round(group);
                 let pending = live && spec.test.evaluate_before_use && last.is_none();
@@ -637,10 +721,71 @@ impl PolicyRegistry {
                     // the views: the first that passes stands for the group
                     _ => fallback(&standings, &spec.test)?,
                 };
-                Some((member, pending))
+                Some(Choice {
+                    member,
+                    pending,
+                    retry: None,
+                })
             }
-            // `smart` (M3c) and `subnet` (phase 3): the first member
-            GroupKind::Smart | GroupKind::Subnet => members.first().map(|m| (m.clone(), false)),
+            GroupKind::Smart => {
+                // an override stands, asks for no test and has nobody to try
+                // after it (M3c design 6.2)
+                if let Some(member) = self.auto.override_of(group, members) {
+                    return Some(Choice::plain(member));
+                }
+                let now = Instant::now();
+                let candidates: Vec<Candidate<'_>> = members
+                    .iter()
+                    .zip(factors)
+                    .map(|(m, &factor)| Candidate {
+                        name: m,
+                        health: self.smart_health(m, now),
+                        factor,
+                    })
+                    .collect();
+                if !live {
+                    // the control plane's view: the most used lately, else the
+                    // first in line (M3c design 8.3)
+                    let member = self
+                        .auto
+                        .smart
+                        .most_used(group, members, now)
+                        .into_iter()
+                        .next()
+                        .or_else(|| {
+                            rank(&candidates, &SiteMemory::default(), |_| 0).map(|r| r.pick)
+                        })?;
+                    return Some(Choice::plain(member));
+                }
+                let last = self.auto.last_round(group);
+                let unknown = candidates
+                    .iter()
+                    .any(|c| matches!(c.health, Health::Unknown { .. }));
+                if unknown || last.is_none_or(|t| t.elapsed() >= ROUND_INTERVAL) {
+                    self.auto.wake(group);
+                }
+                let site = ctx
+                    .host
+                    .as_deref()
+                    .map_or_else(SiteMemory::default, |host| self.auto.smart.site(host, now));
+                let ranking = rank(&candidates, &site, random_below)?;
+                Some(Choice {
+                    member: ranking.pick,
+                    pending: spec.test.evaluate_before_use && last.is_none(),
+                    retry: Some(ranking.retry),
+                })
+            }
+            // `subnet` (phase 3): the first member
+            GroupKind::Subnet => members.first().cloned().map(Choice::plain),
+        }
+    }
+
+    /// What the `smart` groups know of `member` now; a protocol not
+    /// implemented yet never works (M3c design 6.1).
+    fn smart_health(&self, member: &str, now: Instant) -> Health {
+        match self.entries.get(member) {
+            Some(Entry::Outbound { outbound, .. }) => self.auto.smart.health(member, outbound, now),
+            _ => Health::Failed(None),
         }
     }
 
@@ -657,6 +802,7 @@ impl PolicyRegistry {
                 spec,
                 members,
                 cycle,
+                ..
             }) = self.entries.get(&n)
         {
             if cycle.is_some() {
@@ -679,7 +825,7 @@ impl PolicyRegistry {
                 return Standing::Passed(passing.iter().sum::<Duration>() / passing.len() as u32);
             }
             return match self.choose(&n, &SelectCtx::default(), false, depth) {
-                Some((member, _)) => self.standing(&member, depth + 1),
+                Some(choice) => self.standing(&choice.member, depth + 1),
                 None => Standing::Unknown,
             };
         }
@@ -738,11 +884,20 @@ impl PolicyRegistry {
         self.auto.tests.result(policy, test.key)
     }
 
-    /// The members of `group` that pass their tests now.
+    /// The members of `group` that pass their tests now; of a `smart` group,
+    /// those that are healthy (M3c design 5.4).
     pub fn available(&self, group: &str) -> Vec<String> {
         let Some(Entry::Group { spec, members, .. }) = self.entries.get(group) else {
             return Vec::new();
         };
+        if spec.kind == GroupKind::Smart {
+            let now = Instant::now();
+            return members
+                .iter()
+                .filter(|m| matches!(self.smart_health(m, now), Health::Healthy(_)))
+                .cloned()
+                .collect();
+        }
         members
             .iter()
             .filter(|m| self.standing(m, 1).passes(&spec.test).is_some())
@@ -849,6 +1004,19 @@ impl PolicyRegistry {
         )
     }
 
+    /// A member of a `smart` group on its own: what a dial tries after the
+    /// member the group picked did not connect (M3c design §7). Its chain is
+    /// the member alone.
+    pub fn resolve_member(&self, member: &str) -> Resolution {
+        self.named(
+            member,
+            &mut Vec::new(),
+            0,
+            self.empty_group,
+            &SelectCtx::default(),
+        )
+    }
+
     fn device(&self, name: &str, chain: &mut Vec<String>) -> Resolution {
         chain.push(format!("DEVICE:{name}"));
         self.rejected(chain, Some(Note::Unsupported("DEVICE".to_string())))
@@ -920,14 +1088,21 @@ impl PolicyRegistry {
                 cycle: Some(cycle), ..
             }) => self.rejected(chain, Some(Note::GroupCycle(cycle.clone()))),
             Some(Entry::Group { .. }) => match self.choose(name, ctx, true, depth) {
-                Some((member, pending)) => {
-                    let mut resolution = match PolicyRef::parse(&member) {
+                Some(choice) => {
+                    let mut resolution = match PolicyRef::parse(&choice.member) {
                         PolicyRef::Builtin(b) => self.builtin(b, chain),
                         PolicyRef::Device(d) => self.device(&d, chain),
                         PolicyRef::Named(n) => self.named(&n, chain, depth + 1, empty, ctx),
                     };
-                    if pending {
+                    if choice.pending {
                         resolution.pending = Some(name.to_string());
+                    }
+                    if let Some(retry) = choice.retry {
+                        resolution.smart = Some(SmartPick {
+                            group: name.to_string(),
+                            member: choice.member,
+                            retry,
+                        });
                     }
                     resolution
                 }
@@ -973,6 +1148,7 @@ impl PolicyRegistry {
             terminal,
             note,
             pending: None,
+            smart: None,
         }
     }
 }
@@ -1940,6 +2116,139 @@ E = url-test, A, B, evaluate-before-use=true\nS = select, E\n[Rule]\nFINAL,U\n";
         assert_eq!(reg.auto().requested(), ["Gone"]);
         assert!(reg.test_group("Gone").await.is_empty());
         assert!(reg.auto().requested().is_empty());
+    }
+
+    const SMART: &str = "[General]\nproxy-test-url = http://127.0.0.1:9/\ninternet-test-url = http://127.0.0.1:9/\n\
+[Proxy]\nA = http, a.example, 80\nB = http, b.example, 80\nC = http, c.example, 80\nD = direct\n\
+[Proxy Group]\nSel = select, A, B\nS = smart, A, B, C, Sel, DIRECT, D, policy-priority=\"C:0.5\"\n\
+Only = smart, Sel, DIRECT, D\nE = smart, A, B, evaluate-before-use=true\nOuter = select, S\n\
+[Rule]\nFINAL,S\n";
+
+    /// As if a session through `name` had its first byte back in `ms`.
+    fn smart_seed(reg: &PolicyRegistry, name: &str, ms: u64) {
+        let outbound = outbound_of(reg, name);
+        reg.auto()
+            .smart
+            .sample(name, &outbound, Duration::from_millis(ms), Instant::now());
+    }
+
+    fn smart_fail(reg: &PolicyRegistry, name: &str) {
+        let outbound = outbound_of(reg, name);
+        for _ in 0..crate::smart::FAILED_IN_A_ROW {
+            reg.auto().smart.failure(name, &outbound, Instant::now());
+        }
+    }
+
+    fn strings(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A `smart` group takes proxies only: a nested group, a built-in and a
+    /// `direct` alias are left out; with none left it is an empty group
+    /// (M3c design 6.1).
+    #[test]
+    fn a_smart_group_takes_proxies_only() {
+        let reg = generation(SMART, &FakeFactory::new(), None);
+        assert_eq!(reg.members("S").unwrap(), strings(&["A", "B", "C"]));
+        assert!(reg.members("Only").unwrap().is_empty());
+        let empty = reg.resolve(&PolicyRef::parse("Only"));
+        assert_eq!(empty.chain, ["Only", "DIRECT"]);
+        assert_eq!(empty.smart, None);
+    }
+
+    /// A dial picks by what the book knows — `policy-priority` scales C's
+    /// 150 ms to 75 ms — and brings the members to try next along, through a
+    /// group that holds the `smart` one too (M3c design 6.2, 6.4).
+    #[test]
+    fn a_dial_picks_by_the_smart_book_and_brings_the_others_along() {
+        let reg = generation(SMART, &FakeFactory::new(), None);
+        smart_seed(&reg, "A", 300);
+        smart_seed(&reg, "B", 100);
+        smart_seed(&reg, "C", 150);
+        let r = reg.resolve(&PolicyRef::parse("S"));
+        assert_eq!(r.chain, ["S", "C"]);
+        assert_eq!(r.terminal, TerminalKind::Proxy);
+        assert_eq!(
+            r.smart,
+            Some(SmartPick {
+                group: "S".to_string(),
+                member: "C".to_string(),
+                retry: strings(&["B", "A"]),
+            })
+        );
+        let outer = reg.resolve(&PolicyRef::parse("Outer"));
+        assert_eq!(outer.chain, ["Outer", "S", "C"]);
+        assert_eq!(outer.smart.map(|p| p.group).as_deref(), Some("S"));
+    }
+
+    #[test]
+    fn a_member_on_its_own_resolves_to_itself() {
+        let reg = generation(SMART, &FakeFactory::new(), None);
+        let r = reg.resolve_member("B");
+        assert_eq!(r.chain, ["B"]);
+        assert_eq!(r.terminal, TerminalKind::Proxy);
+        assert_eq!(r.smart, None);
+    }
+
+    /// An override stands: no ranking, nobody to try next, no test asked for.
+    #[test]
+    fn an_override_of_a_smart_group_stands_alone() {
+        let reg = generation(SMART, &FakeFactory::new(), None);
+        reg.auto().set_override(reg.group_spec("S").unwrap(), "A");
+        let r = reg.resolve(&PolicyRef::parse("S"));
+        assert_eq!(r.chain, ["S", "A"]);
+        assert_eq!(r.smart, None);
+        assert!(reg.auto().requested().is_empty());
+    }
+
+    /// A dial asks for a round while a member is not known yet; the control
+    /// plane's view does not (M3c design 8.1).
+    #[test]
+    fn a_dial_asks_for_a_round_while_a_member_is_unknown() {
+        let reg = generation(SMART, &FakeFactory::new(), None);
+        let _ = reg.current_member("S");
+        assert!(reg.auto().requested().is_empty(), "the view asks nothing");
+        let _ = reg.resolve(&PolicyRef::parse("S"));
+        assert_eq!(reg.auto().requested(), ["S"]);
+        reg.auto().round_done(&["S".to_string()]);
+        for name in ["A", "B", "C"] {
+            smart_seed(&reg, name, 100);
+        }
+        let _ = reg.resolve(&PolicyRef::parse("S"));
+        assert!(
+            reg.auto().requested().is_empty(),
+            "all known, the round fresh"
+        );
+    }
+
+    /// The view shows the member used most lately, else the first in line
+    /// (M3c design 8.3).
+    #[test]
+    fn the_view_of_a_smart_group_is_its_most_used_member() {
+        let reg = generation(SMART, &FakeFactory::new(), None);
+        smart_seed(&reg, "A", 50);
+        smart_seed(&reg, "B", 100);
+        assert_eq!(reg.current_member("S").as_deref(), Some("A"));
+        let now = Instant::now();
+        reg.auto().smart.used("S", "B", now);
+        reg.auto().smart.used("S", "B", now);
+        reg.auto().smart.used("S", "A", now);
+        assert_eq!(reg.current_member("S").as_deref(), Some("B"));
+    }
+
+    /// Of a `smart` group, the healthy members are available; the first
+    /// dial of an `evaluate-before-use` one waits for a round (M3c design
+    /// 8.1).
+    #[test]
+    fn a_smart_group_is_available_by_its_health() {
+        let reg = generation(SMART, &FakeFactory::new(), None);
+        smart_seed(&reg, "A", 100);
+        smart_fail(&reg, "B");
+        assert_eq!(reg.available("S"), ["A"]);
+        let r = reg.resolve(&PolicyRef::parse("E"));
+        assert_eq!(r.pending.as_deref(), Some("E"));
+        reg.auto().round_done(&["E".to_string()]);
+        assert_eq!(reg.resolve(&PolicyRef::parse("E")).pending, None);
     }
 
     #[test]
