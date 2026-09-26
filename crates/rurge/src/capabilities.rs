@@ -42,6 +42,7 @@ pub fn current() -> Capabilities {
             GroupKind::UrlTest,
             GroupKind::Fallback,
             GroupKind::LoadBalance,
+            GroupKind::Smart,
         ]),
         rule_types: Capabilities::ALL_RULE_TYPES
             .iter()

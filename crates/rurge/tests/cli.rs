@@ -167,7 +167,8 @@ fn check_knows_the_m1_protocols_and_runs_the_dry_build() {
 const GROUPS: &str = "[General]\n[Proxy]\n\
 H = http, proxy.test, 8080, test-url=http://127.0.0.1:9/, test-timeout=3\n[Proxy Group]\n\
 U = url-test, H, DIRECT, tolerance=50\nF = fallback, H, DIRECT, evaluate-before-use=true\n\
-L = load-balance, H, DIRECT, persistent=true\nS = smart, H, DIRECT\n[Rule]\nFINAL,U\n";
+L = load-balance, H, DIRECT, persistent=true\nS = smart, H, DIRECT, policy-priority=\"H:0.8\"\n\
+N = subnet, default=H\n[Rule]\nFINAL,U\n";
 
 #[test]
 fn check_knows_the_automatic_groups() {
@@ -182,10 +183,11 @@ fn check_knows_the_automatic_groups() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `smart` is still a later milestone; the three automatic groups are
-    // not, and the testing options are in effect (no W0029)
+    // `subnet` is still a later phase; the four automatic groups are not,
+    // and the testing options are in effect (no W0029)
     assert_eq!(out.matches("W0008").count(), 1, "{out}");
-    assert!(out.contains("`smart`"), "{out}");
+    assert!(out.contains("`subnet`"), "{out}");
+    assert!(!out.contains("`smart`"), "{out}");
     assert!(!out.contains("W0029"), "{out}");
 }
 
