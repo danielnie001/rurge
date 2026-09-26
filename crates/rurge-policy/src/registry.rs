@@ -767,9 +767,11 @@ impl PolicyRegistry {
                     return Some(Choice::plain(member));
                 }
                 let last = self.auto.last_round(group);
-                let unknown = candidates
-                    .iter()
-                    .any(|c| matches!(c.health, Health::Unknown { .. }));
+                // a member no round can test (its test URL does not parse)
+                // becomes known through sessions only: it asks for no round
+                let unknown = candidates.iter().any(|c| {
+                    matches!(c.health, Health::Unknown { .. }) && self.test_slot(c.name).is_some()
+                });
                 if unknown || last.is_none_or(|t| t.elapsed() >= ROUND_INTERVAL) {
                     self.auto.wake(group);
                 }
@@ -954,16 +956,26 @@ impl PolicyRegistry {
     }
 
     /// The members a regular round of `group` tests when it is a `smart`
-    /// group with more than `ROUND_SAMPLE` of them.
+    /// group with more than `ROUND_SAMPLE` members a round can test.
     fn sample_of(&self, group: &str) -> Option<Vec<String>> {
         let Some(Entry::Group { spec, members, .. }) = self.entries.get(group) else {
             return None;
         };
-        if spec.kind != GroupKind::Smart || members.len() <= ROUND_SAMPLE {
+        if spec.kind != GroupKind::Smart {
             return None;
         }
-        let used = self.auto.smart.most_used(group, members, Instant::now());
-        Some(sample(members, &used, |m| self.tested_at(m)))
+        // a member no round can test (a protocol not implemented yet, a test
+        // URL that does not parse) takes no place in the sample
+        let testable: Vec<String> = members
+            .iter()
+            .filter(|m| self.test_slot(m).is_some())
+            .cloned()
+            .collect();
+        if testable.len() <= ROUND_SAMPLE {
+            return None;
+        }
+        let used = self.auto.smart.most_used(group, &testable, Instant::now());
+        Some(sample(&testable, &used, |m| self.tested_at(m)))
     }
 
     /// When `name` was last tested, for what it is now.
@@ -2340,7 +2352,7 @@ Only = smart, Sel, DIRECT, D\nE = smart, A, B, evaluate-before-use=true\nOuter =
         let mut profile = String::from(
             "[General]\nproxy-test-url = http://127.0.0.1:9/\ninternet-test-url = http://127.0.0.1:9/\n[Proxy]\n",
         );
-        let names: Vec<String> = (0..ROUND_SAMPLE + 2).map(|i| format!("P{i}")).collect();
+        let names: Vec<String> = (0..ROUND_SAMPLE + 5).map(|i| format!("P{i}")).collect();
         for name in &names {
             profile += &format!("{name} = http, {name}.example, 80\n");
         }
@@ -2362,10 +2374,63 @@ Only = smart, Sel, DIRECT, D\nE = smart, A, B, evaluate-before-use=true\nOuter =
         assert_eq!(
             reg.round_timeout("Big"),
             timeout * 2,
-            "12 tests, 8 at a time"
+            "12 tests, 8 at a time — all 17 would take three"
         );
         reg.test_group("Big").await;
         assert_eq!(tested(&reg), names.len());
+    }
+
+    /// Members a round cannot test — a protocol not implemented yet — take
+    /// no place in a big group's sample: two regular rounds test every
+    /// member that can be tested (M3c design 8.1).
+    #[tokio::test]
+    async fn members_no_round_can_test_take_no_place_in_the_sample() {
+        let mut profile = String::from(
+            "[General]\nproxy-test-url = http://127.0.0.1:9/\ninternet-test-url = http://127.0.0.1:9/\n[Proxy]\n",
+        );
+        let unsupported: Vec<String> = (0..ROUND_SAMPLE / 2 + 1).map(|i| format!("U{i}")).collect();
+        for name in &unsupported {
+            profile += &format!(
+                "{name} = ss, {name}.example, 8388, encrypt-method=aes-128-gcm, password=x\n"
+            );
+        }
+        let names: Vec<String> = (0..ROUND_SAMPLE + 5).map(|i| format!("P{i}")).collect();
+        for name in &names {
+            profile += &format!("{name} = http, {name}.example, 80\n");
+        }
+        profile += &format!(
+            "[Proxy Group]\nBig = smart, {}, {}\n[Rule]\nFINAL,Big\n",
+            unsupported.join(", "),
+            names.join(", ")
+        );
+        let reg = generation(&profile, &FakeFactory::new(), None);
+        let tested = |reg: &PolicyRegistry| {
+            names
+                .iter()
+                .filter(|n| reg.test_result(n).is_some())
+                .count()
+        };
+        reg.test_round("Big").await;
+        assert_eq!(tested(&reg), ROUND_SAMPLE);
+        reg.test_round("Big").await;
+        assert_eq!(tested(&reg), names.len());
+    }
+
+    /// A member whose test URL does not parse is known through sessions
+    /// only: while it is not known yet, a dial asks for no round for it
+    /// (M3c design 8.1).
+    #[test]
+    fn a_member_no_round_can_test_asks_for_no_round() {
+        let profile = "[General]\nproxy-test-url = http://127.0.0.1:9/\ninternet-test-url = http://127.0.0.1:9/\n\
+[Proxy]\nA = http, a.example, 80\nX = http, x.example, 80, test-url=http://[\n\
+[Proxy Group]\nS = smart, A, X\n[Rule]\nFINAL,S\n";
+        let reg = generation(profile, &FakeFactory::new(), None);
+        let _ = reg.resolve(&PolicyRef::parse("S"));
+        assert_eq!(reg.auto().requested(), ["S"], "the first round");
+        reg.auto().round_done(&["S".to_string()]);
+        smart_seed(&reg, "A", 100);
+        let _ = reg.resolve(&PolicyRef::parse("S"));
+        assert!(reg.auto().requested().is_empty());
     }
 
     #[test]
