@@ -99,9 +99,10 @@ impl Watch {
 }
 
 /// Hangs the report of `policy` on `handle` (M3c design 4.3): the first byte
-/// back is a sample; `NO_RESPONSE` without one, or upstream ending before it
-/// sent anything while the client was still there, is a failure — whichever
-/// comes first, once. A `kill` and a shutdown say nothing of the member.
+/// back is a sample; `NO_RESPONSE` without one while the client is still
+/// there, or upstream ending before it sent anything while the client was
+/// still there, is a failure — whichever comes first, once. A `kill` and a
+/// shutdown say nothing of the member.
 pub(crate) fn watch(
     handle: &Arc<SessionHandle>,
     book: Arc<SmartBook>,
@@ -134,6 +135,7 @@ pub(crate) fn watch(
         if let Some(h) = session.upgrade()
             && !h.first_byte_seen()
             && !h.is_finished()
+            && !h.client_gone()
         {
             watch.failure();
         }
@@ -184,6 +186,20 @@ mod tests {
         assert_eq!(book.health("A", &a, now), Health::Unknown { failures: 1 });
         assert_eq!(book.site("a.test", now).failed, ["A"]);
         assert!(!h.is_finished());
+    }
+
+    /// A client that left before the three seconds were up takes the
+    /// member's silence with it: no failure (M3c design 4.3).
+    #[tokio::test(start_paused = true)]
+    async fn silence_after_the_client_left_is_no_failure() {
+        let (book, a, h) = (Arc::new(SmartBook::new()), outbound(), session());
+        watch(&h, book.clone(), "A", &a, "a.test");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        h.mark_client_gone();
+        tokio::time::sleep(NO_RESPONSE).await;
+        let now = Instant::now();
+        assert_eq!(book.health("A", &a, now), Health::Unknown { failures: 0 });
+        assert!(book.site("a.test", now).failed.is_empty());
     }
 
     /// Upstream ending before it answered is a failure; a session that was

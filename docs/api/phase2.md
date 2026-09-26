@@ -1,6 +1,6 @@
 # rurge HTTP API（阶段 2）
 
-阶段 2 / M1（装配与控制面，见 `docs/superpowers/specs/2026-09-19-phase2-m1-outbound-foundation-design.md` 第 6.6 节）新增四个策略 / 策略组端点；阶段 2 / M3b（测速与自动组）又新增三个测试端点，并让 `POST /v1/policy_groups/select` 对自动组设临时覆盖（见末节「连通性测试与自动组（M3b）」）。鉴权（`X-Key` 头 / `?x-key=` 查询参数、常量时间比较、封禁）、错误体（`{"error":"<message>"}`）与无内容的成功响应（`{}`）沿用阶段 1 的约定，见 `docs/api/phase1.md`；本页只记录本页新增端点自己的形状。
+阶段 2 / M1（装配与控制面，见 `docs/superpowers/specs/2026-09-19-phase2-m1-outbound-foundation-design.md` 第 6.6 节）新增四个策略 / 策略组端点；阶段 2 / M3b（测速与自动组）又新增三个测试端点，并让 `POST /v1/policy_groups/select` 对自动组设临时覆盖（见「连通性测试与自动组（M3b）」一节）；阶段 2 / M3c 让这些端点也接纳 `smart` 组，并给请求记录加了两列耗时（见末节「`smart` 组（M3c）」）。鉴权（`X-Key` 头 / `?x-key=` 查询参数、常量时间比较、封禁）、错误体（`{"error":"<message>"}`）与无内容的成功响应（`{}`）沿用阶段 1 的约定，见 `docs/api/phase1.md`；本页只记录本页新增端点自己的形状。
 
 ## 端点
 
@@ -168,7 +168,7 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 | `group_name` 是 `subnet` 组 | `` `Office` does not take a selection `` |
 | `policy` 不是该组的成员 | `` `Somewhere` is not a member of `Proxy` `` |
 
-选择立即生效：**下一条**使用该组（或途经该组的链）的连接就会解析到新成员，正在进行中的连接不受影响。选择按 Profile 持久化到 `state.json` 的 `group_selections[<Profile 文件名>][<组名>]`（文件名，不含目录，如 `surge.conf`）；rurge 重启后从 `state.json` 恢复，已消失的旧选择（成员被从配置里删除）按"没有选择"处理，回落到第一个成员。对自动组的同一个请求是临时覆盖，见末节。
+选择立即生效：**下一条**使用该组（或途经该组的链）的连接就会解析到新成员，正在进行中的连接不受影响。选择按 Profile 持久化到 `state.json` 的 `group_selections[<Profile 文件名>][<组名>]`（文件名，不含目录，如 `surge.conf`）；rurge 重启后从 `state.json` 恢复，已消失的旧选择（成员被从配置里删除）按"没有选择"处理，回落到第一个成员。对自动组的同一个请求是临时覆盖，见「连通性测试与自动组（M3b）」一节。
 
 ## `POST /v1/profiles/check`
 
@@ -224,7 +224,7 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 
 ### `GET /v1/policy_groups/test_results`
 
-无参数。响应 `{"<组名>": {"<成员>": Result 或 null}}`，只列 `url-test` / `fallback` / `load-balance` / `smart` 组（`smart` 自 M3c 起），成员是装配后的成员表；`null` 表示没有结果：还没测过，或结果对应的定义、测试 URL、超时已经变了；嵌套组、`REJECT` 族、尚未实现的协议与测试 URL 解析不了的策略恒为 `null`（组在选择时把后三种当作失败）。
+无参数。响应 `{"<组名>": {"<成员>": Result 或 null}}`，只列 `url-test` / `fallback` / `load-balance` / `smart` 组（`smart` 自 M3c 起），成员是装配后的成员表；`null` 表示没有结果：还没测过，或结果对应的定义、测试 URL、超时已经变了；嵌套组、`REJECT` 族、尚未实现的协议与测试 URL 解析不了的策略恒为 `null`（`url-test` / `fallback` / `load-balance` 在选择时把后三种当作失败；`smart` 组不选尚未实现协议的成员，测试 URL 解析不了的成员只按真实会话的表现排序）。
 
 ```json
 {"Auto": {"HK": {"delay": 128, "time": 1758790000.25}, "JP": {"error": "timed out", "time": 1758790005.02}}}
@@ -251,6 +251,7 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 ## `smart` 组（M3c）
 
 - **选择**：按成员的分数——真实会话的首字节耗时与测速结果的时间加权平均，加上失败罚分，乘以 `policy-priority` 因子——排序；最优者 1.2 倍以内的成员里随机选一个；最近在同一目标主机上成功过、分数不超过最优者 2 倍的成员优先，最近在那里失败过的排到最后。细节见 `docs/superpowers/specs/2026-09-26-phase2-m3c-smart-design.md`。
+- **成员表**：`smart` 组只取代理策略；写在里面的嵌套组、内置策略与 `direct` / `reject` 别名被忽略（加载时记一行 INFO），`GET /v1/policy_groups`、`select` 与测试端点里的成员表也不含它们——对这样一个名字，`POST /v1/policy_groups/select` 回 400 `` `Sel` is not a member of `S` ``。协议尚未实现的成员留在成员表里，但不会被选中，也不进换成员的名单；组里一个能用的成员都没有时才用第一个成员（得到带说明的 REJECT）。
 - **换成员**：选中的成员连不上时，这次会话依次再试排在后面的两个成员，每次最多用"剩余时间 ÷ 剩余尝试次数"，总计 10 秒。请求记录的 `policy` 是实际用上的那条链；换过成员时 `error` 是 ``smart group `S`: `A` failed to connect, used `B` ``（会话本身成功）；都连不上时是 ``smart group `S`: tried `A`, `B`, `C`; <最后一次的错误>``。DNS 会话与链的中间跳（`underlying-proxy`）不换成员。
 - **请求记录**：`connectMs` / `firstByteMs` 两个字段见 `docs/api/phase1.md`（所有会话都有）。
 - **`GET /v1/policy_groups/select`**：最近 10 分钟用得最多的成员，最近没用过时是排在第一的成员；读取不触发测速。

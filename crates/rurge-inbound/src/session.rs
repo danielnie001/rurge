@@ -44,6 +44,8 @@ pub struct SessionHandle {
     /// Upstream ended, before sending anything, while the client was still
     /// there (`mark_upstream_failed`).
     upstream_failed: AtomicBool,
+    /// The client's end of the session closed or failed (`mark_client_gone`).
+    client_gone: AtomicBool,
     finished: AtomicBool,
     outcome: Mutex<Option<SessionOutcome>>,
     on_finish: Mutex<Vec<FinishHook>>,
@@ -76,6 +78,7 @@ impl SessionHandle {
             first_byte: OnceLock::new(),
             on_first_byte: Mutex::new(Vec::new()),
             upstream_failed: AtomicBool::new(false),
+            client_gone: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             outcome: Mutex::new(None),
             on_finish: Mutex::new(Vec::new()),
@@ -177,6 +180,9 @@ impl SessionHandle {
     /// goes on to the client. Only the first call counts; it runs the hooks
     /// of `on_first_byte`.
     pub fn mark_first_byte(&self) {
+        if self.first_byte_seen() {
+            return;
+        }
         if self.first_byte.set(self.started.elapsed()).is_ok() {
             let hooks = std::mem::take(&mut *self.on_first_byte.lock().expect("first byte hooks"));
             for hook in hooks {
@@ -210,6 +216,18 @@ impl SessionHandle {
 
     pub fn upstream_failed(&self) -> bool {
         self.upstream_failed.load(Ordering::Acquire)
+    }
+
+    /// The client's end of the session closed or failed: whatever upstream
+    /// does after that — ending, or staying silent — is no failure of the
+    /// member of a `smart` group that carried the session (phase 2 M3c
+    /// design 4.3).
+    pub fn mark_client_gone(&self) {
+        self.client_gone.store(true, Ordering::Release);
+    }
+
+    pub fn client_gone(&self) -> bool {
+        self.client_gone.load(Ordering::Acquire)
     }
 
     /// From the session's start until its outbound was ready (rule

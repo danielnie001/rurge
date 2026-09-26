@@ -84,6 +84,9 @@ struct Record {
     penalty: f64,
     penalized: Option<Instant>,
     failures: u32,
+    /// A session reported on the policy through a `smart` group, so a flip
+    /// of its state is said whatever caused it (M3c design §10).
+    reported: bool,
 }
 
 impl Record {
@@ -96,6 +99,7 @@ impl Record {
             penalty: 0.0,
             penalized: None,
             failures: 0,
+            reported: false,
         }
     }
 
@@ -395,15 +399,15 @@ impl SmartBook {
     /// `latency` after the outbound was ready, or a test passed with that
     /// score (M3c design 5.3).
     pub fn sample(&self, policy: &str, outbound: &OutboundRef, latency: Duration, now: Instant) {
-        let mut records = self.records.lock().expect("smart records");
-        record_of(&mut records, policy, outbound).sample(millis(latency), now);
+        self.change(policy, outbound, now, false, |r| {
+            r.sample(millis(latency), now)
+        });
     }
 
     /// A failure of `policy` through `outbound`: a dial, a session that got
     /// no answer, a test.
     pub fn failure(&self, policy: &str, outbound: &OutboundRef, now: Instant) {
-        let mut records = self.records.lock().expect("smart records");
-        record_of(&mut records, policy, outbound).failure(now);
+        self.change(policy, outbound, now, false, |r| r.failure(now));
     }
 
     /// What is known of `policy` through `outbound` at `now`.
@@ -427,7 +431,9 @@ impl SmartBook {
         latency: Duration,
         now: Instant,
     ) {
-        self.change(policy, outbound, now, |r| r.sample(millis(latency), now));
+        self.change(policy, outbound, now, true, |r| {
+            r.sample(millis(latency), now)
+        });
         if let Some(host) = host {
             self.sites
                 .lock()
@@ -445,7 +451,7 @@ impl SmartBook {
         host: Option<&str>,
         now: Instant,
     ) {
-        self.change(policy, outbound, now, |r| r.failure(now));
+        self.change(policy, outbound, now, true, |r| r.failure(now));
         if let Some(host) = host {
             self.sites
                 .lock()
@@ -454,29 +460,39 @@ impl SmartBook {
         }
     }
 
-    /// Applies `change` to the record of `policy`; says so when the member
-    /// comes to count as failed by it, or stops to (M3c design §10).
+    /// Applies `change` to the record of `policy`; says so — and returns
+    /// what it said, `Some(true)` for "counts as failed" and `Some(false)`
+    /// for "works again" — when the member flips and a session has ever
+    /// reported on it (`by_session`, remembered on the record); a policy
+    /// only the tests know flips silently (M3c design §10).
     fn change(
         &self,
         policy: &str,
         outbound: &OutboundRef,
         now: Instant,
+        by_session: bool,
         change: impl FnOnce(&mut Record),
-    ) {
-        let (was, is) = {
+    ) -> Option<bool> {
+        let (was, is, reported) = {
             let mut records = self.records.lock().expect("smart records");
             let record = record_of(&mut records, policy, outbound);
+            record.reported |= by_session;
             let was = matches!(record.health(now), Health::Failed(_));
             change(record);
-            (was, matches!(record.health(now), Health::Failed(_)))
+            (
+                was,
+                matches!(record.health(now), Health::Failed(_)),
+                record.reported,
+            )
         };
-        if was != is {
+        (was != is && reported).then(|| {
             if is {
                 tracing::info!(policy, "smart: the policy counts as failed");
             } else {
                 tracing::info!(policy, "smart: the policy works again");
             }
-        }
+            is
+        })
     }
 
     /// What happened at `host` lately (M3c design 6.3).
@@ -628,6 +644,36 @@ mod tests {
         assert_eq!(book.health("A", &a, t0), Health::Unknown { failures: 2 });
         book.failure("A", &a, t0);
         assert_eq!(book.health("A", &a, t0), Health::Failed(None));
+    }
+
+    /// A flip is said for a policy that sessions reported on, whatever
+    /// caused it — a session or a test; a policy that only the tests know
+    /// flips silently (M3c design §10).
+    #[test]
+    fn flips_are_said_for_the_policies_sessions_reported_on() {
+        let book = SmartBook::new();
+        let (a, b) = (outbound(), outbound());
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(20 * 60);
+        // only the tests know `B`: it comes to count as failed silently
+        for _ in 0..FAILED_IN_A_ROW {
+            assert_eq!(book.change("B", &b, t0, false, |r| r.failure(t0)), None);
+        }
+        assert!(matches!(book.health("B", &b, t0), Health::Failed(_)));
+        // a session reported on `A`; tests make it fail, then pass again
+        assert_eq!(
+            book.change("A", &a, t0, true, |r| r.sample(100.0, t0)),
+            None
+        );
+        let mut said = Vec::new();
+        for _ in 0..FAILED_IN_A_ROW {
+            said.push(book.change("A", &a, t0, false, |r| r.failure(t0)));
+        }
+        assert_eq!(said, [None, None, Some(true)]);
+        assert_eq!(
+            book.change("A", &a, later, false, |r| r.sample(100.0, later)),
+            Some(false)
+        );
     }
 
     /// A policy whose definition changed has another outbound: what was known

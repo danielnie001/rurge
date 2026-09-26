@@ -175,7 +175,7 @@ impl AutoGroups {
     }
 
     /// Where requests for a round of tests go from now on: the engine's
-    /// scheduler, which runs `PolicyRegistry::test_group` for each name it
+    /// scheduler, which runs `PolicyRegistry::test_round` for each name it
     /// receives. Until then requests only pile up in `requested`.
     pub fn connect(&self) -> mpsc::UnboundedReceiver<String> {
         let (tx, rx) = mpsc::unbounded_channel();

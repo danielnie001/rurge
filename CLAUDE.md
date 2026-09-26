@@ -41,7 +41,7 @@ rurge 是用 Rust 复刻 Surge（macOS / iOS 网络代理工具）全部功能�
 - `docs/superpowers/plans/2026-09-26-phase2-m3c-smart-plan.md`：阶段 2 / M3c（`smart` 组）实施计划（8 个任务）。开头「计划期决定」表（P1–P21）记录核对源码得出的结论与和设计文字不同的决定（不另设 `SessionReporter` trait、"同一定义"按出站对象判断、DNS 会话只回报三种、健康切换的日志只由会话回报触发、单次时限另由引擎计时、重试列表跳过不是代理的成员、大组抽样的 `test_round` 等）与「承接事项」；末尾「执行期修正记录」与「延后事项」两张表。
 - `docs/acceptance/phase2-manual.md`：阶段 2 手工验收清单（M2a 起新建），需要真实公网节点的项目，自动化测试（只用回环）覆盖不了，由项目所有者用自己的节点验收。
 - `docs/api/phase1.md`：阶段 1 HTTP API 参考——端点、JSON 形状、鉴权与封禁、系统代理的地址 / `skip-proxy` 转换 / 生命周期、`rurge reload/stop/status` 客户端。
-- `docs/api/phase2.md`：阶段 2 HTTP API 参考——M1 新增的四个策略 / 策略组端点（`policies/detail`、`policy_groups`、`policy_groups/select`）的响应形状、`lineHash` 的定义、选择的生效时机与持久化位置；M3b 新增的三个测试端点、测试结果的形状、`select` 对自动组的临时覆盖与测试会话。
+- `docs/api/phase2.md`：阶段 2 HTTP API 参考——M1 新增的四个策略 / 策略组端点（`policies/detail`、`policy_groups`、`policy_groups/select`）的响应形状、`lineHash` 的定义、选择的生效时机与持久化位置；M3b 新增的三个测试端点、测试结果的形状、`select` 对自动组的临时覆盖与测试会话；M3c 的 `smart` 组一节（选择、成员表、换成员与各端点上的行为）。
 - `README.md`（中文）与 `README_en.md`（英文）：对外的状态、特性表与路线图，两份内容保持一致，并与 PRD 保持一致；文件顶部互相链接。
 
 ## 工作流约定

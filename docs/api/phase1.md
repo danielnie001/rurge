@@ -46,7 +46,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 
 `listener` ∈ `http` `socks5` `tun` `forward` `internal`；`status` ∈ `active` `completed` `rejected` `failed`；`rejectKind` 在 `rejected` 时是 `REJECT` / `REJECT-DROP` / `REJECT-NO-DROP` / `REJECT-TINYGIF`；`protocol` 是嗅探到的协议小写名或 `null`。
 
-`connectMs` 是会话开始到出站就绪的毫秒数（规则匹配、DNS、`evaluate-before-use` 的等待与 `smart` 组换成员的重试都在内），`firstByteMs` 是出站就绪到收到第一个上游字节的毫秒数；还没有对应时刻（被拒绝、拨号失败、还没收到数据）时为 `null`（阶段 2 / M3c 起）。
+`connectMs` 是会话开始到出站就绪的毫秒数（规则匹配、DNS、`evaluate-before-use` 的等待与 `smart` 组换成员的重试都在内），`firstByteMs` 是出站就绪到收到第一个上游字节的毫秒数；还没有对应时刻（被拒绝、拨号失败、还没收到数据）时为 `null`，测试会话（`rule` 为 `policy test`）两者恒为 `null`（阶段 2 / M3c 起）。
 
 ### Traffic
 

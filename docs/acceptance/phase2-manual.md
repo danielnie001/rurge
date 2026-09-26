@@ -89,10 +89,10 @@
 
 需要至少三个真实节点，其中一个可以随时停掉（或把它的端口写错后 `rurge reload`），自动化测试（只用回环）覆盖不了。
 
-- [ ] `Smart = smart, <节点 A>, <节点 B>, <节点 C>`：经 `Smart` 正常浏览十几分钟，`GET /v1/requests/recent` 里的会话都有 `connectMs` 与 `firstByteMs`，数值与节点的实际延迟量级相当；`GET /v1/policy_groups/select?group_name=Smart` 是这段时间用得最多的节点。
-- [ ] 停掉节点 A：之后经 `Smart` 的请求仍然正常，个别会话的 `error` 是 ``smart group `Smart`: `A` failed to connect, used `B` ``；几分钟后新会话基本不再选 A。恢复 A 后，下一轮测速（5 分钟内）或经它成功的会话之后它又会被选到。
-- [ ] 一个能连上、但出口访问不了某个网站的节点：访问那个网站几次之后，经 `Smart` 访问它改走别的节点，访问其它网站仍可能用这个节点（站点记忆）。
+- [ ] `Smart = smart, <节点 A>, <节点 B>, <节点 C>`：经 `Smart` 正常浏览十几分钟，`GET /v1/requests/recent` 里经 `Smart` 的会话都有 `connectMs` 与 `firstByteMs`（规则为 `policy test` 的测试会话两者为 `null`），数值与节点的实际延迟量级相当；`GET /v1/policy_groups/select?group_name=Smart` 是这段时间用得最多的节点。
+- [ ] 停掉节点 A：之后经 `Smart` 的请求仍然正常，个别会话的 `error` 是 ``smart group `Smart`: `A` failed to connect, used `B` ``；A 第一次失败之后，新会话基本不再选 A。恢复 A 之后，它要等失败罚分（每次 800 ms，5 分钟减半）衰减到分数回到最好节点的 1.2 倍以内才会重新被选到，通常要十几到二十几分钟。
+- [ ] 一个能连上、但出口访问不了某个 HTTPS 网站的节点：访问那个网站几次之后，经 `Smart` 访问它改走别的节点，访问其它网站仍可能用这个节点（站点记忆）。明文 `http://` 网站经 HTTP 代理节点时不适用：代理回的错误页也算收到了回应。
 - [ ] `policy-priority="<节点 C>:0.5"`：C 明显更常被选中；改为 `"<节点 C>:3"` 后 C 很少被选中。
 - [ ] `POST /v1/policy_groups/select {"group_name":"Smart","policy":"<节点 B>"}`：之后固定走 B，停掉 B 时请求失败、不换成员；`{"policy":""}` 清除后恢复。
-- [ ] 日志（含 `--log-level verbose`）里 `smart` 相关的行只有节点名，没有 URL 与凭据；节点连续失败时有一条 `smart: the policy counts as failed`，恢复后有 `smart: the policy works again`。
-- [ ] 用一份混有尚未实现协议的节点（如 `ss`）、总数超过 12 个的订阅建 `smart` 组（`policy-path=<订阅>`）：请求照常，会话的 `policy` 链里从不出现 `ss` 节点；全部能测的节点都测过一遍之后，`GET /v1/requests/recent` 里规则为 `policy test` 的会话大约每 5 分钟一批，不会接连不断。
+- [ ] 日志（含 `--log-level verbose`）里 `smart` 相关的行只有节点名，没有 URL 与凭据；经 `Smart` 用过的节点停掉后，连续三次失败（会话或测速）时有一条 `smart: the policy counts as failed`，恢复后第一次成功时有一条 `smart: the policy works again`；从没经 `smart` 组用过的策略不记这两行。
+- [ ] 用一份混有尚未实现协议的节点（如 `ss`）、总数超过 12 个的订阅建 `smart` 组（`policy-path=<订阅>`）：请求照常，会话的 `policy` 链里从不出现 `ss` 节点；全部能测的节点都有了结论之后（连不上的节点要连续三次测试失败才算），`GET /v1/requests/recent` 里规则为 `policy test` 的会话大约每 5 分钟一批，不会接连不断。

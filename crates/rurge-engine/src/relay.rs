@@ -13,7 +13,7 @@ use rurge_inbound::{SessionHandle, SessionOutcome};
 use rurge_net::connector::BoxedStream;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::Instant;
@@ -70,9 +70,8 @@ pub async fn pump(
         }));
         // Upstream ending before it sent anything, while the client is still
         // there, is upstream's failure (M3c design 4.3); once the client's
-        // side has ended, it is not.
-        let client_done = Arc::new(AtomicBool::new(false));
-        let c_up = client_done.clone();
+        // side has ended, it is not — nor is upstream's silence after that.
+        let h_client_gone = handle.clone();
         let h_end = handle.clone();
         async move {
             // A direction that fails ends the other one too: the tunnel is
@@ -87,7 +86,7 @@ pub async fn pump(
                     started,
                     move |n| h_up.add_up(n),
                     sniff_first,
-                    move || c_up.store(true, Ordering::Release),
+                    move || h_client_gone.mark_client_gone(),
                 )
                 .await;
                 if r.is_err() {
@@ -105,7 +104,7 @@ pub async fn pump(
                     move |n| h_down.add_down(n),
                     first_byte,
                     move || {
-                        if !client_done.load(Ordering::Acquire) && !h_end.first_byte_seen() {
+                        if !h_end.client_gone() && !h_end.first_byte_seen() {
                             h_end.mark_upstream_failed();
                         }
                     },
@@ -686,6 +685,7 @@ mod tests {
             assert!(Instant::now() < deadline, "not marked");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        assert!(!h.client_gone());
         drop(ca);
         task.await.unwrap();
     }
@@ -712,6 +712,7 @@ mod tests {
         );
         drop(ua);
         task.await.unwrap();
+        assert!(h.client_gone());
         assert!(!h.upstream_failed());
 
         let (mut ca, client_b) = tokio::io::duplex(1024);

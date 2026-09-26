@@ -1,8 +1,8 @@
 //! What this build of rurge actually implements: the built-in alias
 //! policies, the HTTP / SOCKS5 proxy family (phase 2 M1), `trojan`
 //! (phase 2 M2a), `vmess` with the AEAD handshake and `anytls` (phase 2
-//! M2b), `select` groups, and `url-test` / `fallback` / `load-balance`
-//! groups (phase 2 M3b).
+//! M2b), `select` groups, `url-test` / `fallback` / `load-balance` groups
+//! (phase 2 M3b), and `smart` groups (phase 2 M3c).
 
 use rurge_config::config::Capabilities;
 use rurge_config::policy::{GroupKind, PolicyKind};
