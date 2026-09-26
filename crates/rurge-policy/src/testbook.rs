@@ -52,6 +52,12 @@ pub trait TestRecord: Send {
     fn end(self: Box<Self>, outcome: &Result<Duration, String>);
 }
 
+/// Told of every result a test keeps: the `smart` groups score by the tests
+/// too (phase 2 M3c design 5.3). Called with no lock of the book held.
+pub trait TestSink: Send + Sync {
+    fn tested(&self, case: &TestCase, result: &TestResult);
+}
+
 type Running = (u64, watch::Receiver<Option<TestResult>>);
 
 pub struct TestBook {
@@ -59,6 +65,7 @@ pub struct TestBook {
     running: Mutex<HashMap<String, Running>>,
     permits: Arc<Semaphore>,
     observer: OnceLock<Arc<dyn TestObserver>>,
+    sink: OnceLock<Arc<dyn TestSink>>,
     /// Test URLs already said to be imprecise (the server does not keep the
     /// connection): once each.
     warned: Mutex<HashSet<String>>,
@@ -77,6 +84,7 @@ impl TestBook {
             running: Mutex::default(),
             permits: Arc::new(Semaphore::new(MAX_CONCURRENT_TESTS)),
             observer: OnceLock::new(),
+            sink: OnceLock::new(),
             warned: Mutex::default(),
         }
     }
@@ -85,6 +93,13 @@ impl TestBook {
     /// ignored.
     pub fn observe(&self, observer: Arc<dyn TestObserver>) {
         let _ = self.observer.set(observer);
+    }
+
+    /// Where the results the book keeps go as well; set once, later calls
+    /// are ignored. The one-off tests of `test_once` are not kept, so they
+    /// do not go there either.
+    pub fn sink(&self, sink: Arc<dyn TestSink>) {
+        let _ = self.sink.set(sink);
     }
 
     /// The last result of `policy` for the definition `key` stands for.
@@ -217,6 +232,7 @@ impl TestBook {
         // A test superseded by a new definition (key changed) only hands its
         // result to its own waiters; it must not undo the current definition's
         // result, whichever ends last.
+        let mut kept = false;
         {
             let mut running = self.running.lock().expect("running tests");
             if let Some((_, rx)) = running.get(&case.policy) {
@@ -227,8 +243,12 @@ impl TestBook {
                         .write()
                         .expect("test results")
                         .insert(case.policy.clone(), (case.key, result.clone()));
+                    kept = true;
                 }
             }
+        }
+        if kept && let Some(sink) = self.sink.get() {
+            sink.tested(&case, &result);
         }
         let _ = tx.send(Some(result));
     }
@@ -495,5 +515,30 @@ mod tests {
         assert_eq!(book.outcome("P", 2), None, "another definition");
         book.record("P", 1, Err("timed out".to_string()));
         assert_eq!(book.outcome("P", 1), Some(Err(())));
+    }
+
+    #[derive(Default)]
+    struct Heard(Mutex<Vec<(String, bool)>>);
+
+    impl TestSink for Heard {
+        fn tested(&self, case: &TestCase, result: &TestResult) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((case.policy.clone(), result.outcome.is_ok()));
+        }
+    }
+
+    /// The results the book keeps go to its sink; a one-off test is kept
+    /// nowhere and goes nowhere (M3c-D7).
+    #[tokio::test]
+    async fn a_kept_result_goes_to_the_sink_and_a_one_off_does_not() {
+        let gate = Arc::new(Gate::default());
+        let heard = Arc::new(Heard::default());
+        let book = book();
+        book.sink(heard.clone());
+        book.test(case("P", gate.clone(), 1)).await;
+        book.test_once(&case("Q", gate.clone(), 1)).await;
+        assert_eq!(*heard.0.lock().unwrap(), [("P".to_string(), false)]);
     }
 }

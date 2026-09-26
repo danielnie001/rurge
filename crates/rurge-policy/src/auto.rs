@@ -4,6 +4,7 @@
 //! the member `url-test` holds on to, when each group was last tested — plus
 //! the way the registry asks the engine for a new round of tests.
 
+use crate::smart::SmartBook;
 use crate::testbook::TestBook;
 use rurge_config::Span;
 use rurge_config::spec::{GroupSpec, TestOpts};
@@ -145,6 +146,9 @@ struct State {
 /// generations, as the test results do.
 pub struct AutoGroups {
     pub tests: Arc<TestBook>,
+    /// What the `smart` groups know of their members; it hears of every
+    /// result `tests` keeps (phase 2 M3c design 5.3).
+    pub smart: Arc<SmartBook>,
     state: Mutex<State>,
     wake: Mutex<Option<mpsc::UnboundedSender<String>>>,
     rounds: watch::Sender<u64>,
@@ -159,8 +163,11 @@ fn without_span(spec: &GroupSpec) -> GroupSpec {
 
 impl AutoGroups {
     pub fn new(tests: Arc<TestBook>) -> AutoGroups {
+        let smart = Arc::new(SmartBook::new());
+        tests.sink(smart.clone());
         AutoGroups {
             tests,
+            smart,
             state: Mutex::default(),
             wake: Mutex::default(),
             rounds: watch::Sender::new(0),
@@ -500,5 +507,26 @@ mod tests {
         rounds.changed().await.unwrap();
         auto.wake("U");
         assert_eq!(rx.recv().await.as_deref(), Some("U"));
+    }
+
+    /// The `smart` groups hear of every result the tests keep (M3c-D7).
+    #[tokio::test]
+    async fn the_smart_book_hears_of_every_kept_test() {
+        let auto = auto();
+        let outbound: rurge_proto::OutboundRef =
+            Arc::new(rurge_proto::Reject::new(rurge_proto::RejectKind::Reject));
+        let case = crate::testbook::TestCase {
+            policy: "A".to_string(),
+            outbound: outbound.clone(),
+            url: url::Url::parse("http://127.0.0.1:9/").unwrap(),
+            timeout: Duration::from_secs(5),
+            key: 1,
+            roots: Arc::new(rustls::RootCertStore::empty()),
+        };
+        auto.tests.test(case).await;
+        assert_eq!(
+            auto.smart.health("A", &outbound, Instant::now()),
+            crate::smart::Health::Unknown { failures: 1 }
+        );
     }
 }

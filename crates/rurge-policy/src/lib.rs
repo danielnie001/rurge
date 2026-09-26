@@ -5,7 +5,8 @@
 //! subscription holds and the members a group assembles from everything it
 //! takes in (phase 2 M3 design 5.2, 5.3); and the connectivity tests and the
 //! automatic groups that pick by them (`probe`, `testbook`, `auto`; phase 2
-//! M3 design §6).
+//! M3 design §6), the `smart` groups by what real sessions show too
+//! (`smart`; phase 2 M3c design).
 
 pub mod assemble;
 pub mod auto;
@@ -14,6 +15,7 @@ pub mod factory;
 pub mod probe;
 pub mod registry;
 pub mod selections;
+pub mod smart;
 pub mod subscription;
 pub mod testbook;
 #[cfg(test)]
