@@ -734,15 +734,24 @@ impl PolicyRegistry {
                     return Some(Choice::plain(member));
                 }
                 let now = Instant::now();
+                // a member whose protocol is not implemented yet never works:
+                // it is no candidate, and stands in only when no member can
+                // work at all (M3c design 6.1)
                 let candidates: Vec<Candidate<'_>> = members
                     .iter()
                     .zip(factors)
-                    .map(|(m, &factor)| Candidate {
-                        name: m,
-                        health: self.smart_health(m, now),
-                        factor,
+                    .filter_map(|(m, &factor)| match self.entries.get(m.as_str()) {
+                        Some(Entry::Outbound { outbound, .. }) => Some(Candidate {
+                            name: m,
+                            health: self.auto.smart.health(m, outbound, now),
+                            factor,
+                        }),
+                        _ => None,
                     })
                     .collect();
+                if candidates.is_empty() {
+                    return members.first().cloned().map(Choice::plain);
+                }
                 if !live {
                     // the control plane's view: the most used lately, else the
                     // first in line (M3c design 8.3)
@@ -2249,6 +2258,36 @@ Only = smart, Sel, DIRECT, D\nE = smart, A, B, evaluate-before-use=true\nOuter =
         assert_eq!(r.pending.as_deref(), Some("E"));
         reg.auto().round_done(&["E".to_string()]);
         assert_eq!(reg.resolve(&PolicyRef::parse("E")).pending, None);
+    }
+
+    const SMART_UNSUPPORTED: &str = "[General]\nproxy-test-url = http://127.0.0.1:9/\ninternet-test-url = http://127.0.0.1:9/\n\
+[Proxy]\nU = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\nA = http, a.example, 80\nB = http, b.example, 80\n\
+[Proxy Group]\nS = smart, U, A, B\nOnlyU = smart, U\n[Rule]\nFINAL,S\n";
+
+    /// A member whose protocol is not implemented yet never works: it is no
+    /// candidate — not even when every working member failed at the site —
+    /// and stands in only when no member can work at all (M3c design 6.1).
+    #[test]
+    fn a_member_that_never_works_stands_in_only_when_nothing_else_can() {
+        let reg = generation(SMART_UNSUPPORTED, &FakeFactory::new(), None);
+        let now = Instant::now();
+        for name in ["A", "B"] {
+            let outbound = outbound_of(&reg, name);
+            let smart = &reg.auto().smart;
+            smart.sample(name, &outbound, Duration::from_millis(100), now);
+            smart.report_failure(name, &outbound, Some("x.test"), now);
+        }
+        let ctx = SelectCtx {
+            host: Some("x.test".into()),
+        };
+        let r = reg.resolve_with(&PolicyRef::parse("S"), &ctx);
+        assert_eq!(r.terminal, TerminalKind::Proxy, "{:?}", r.chain);
+        let pick = r.smart.expect("a smart pick");
+        assert!(pick.member == "A" || pick.member == "B", "{pick:?}");
+        assert!(!pick.retry.contains(&"U".to_string()), "{pick:?}");
+        let only = reg.resolve(&PolicyRef::parse("OnlyU"));
+        assert_eq!(only.chain, ["OnlyU", "U", "!unsupported:ss", "REJECT"]);
+        assert_eq!(only.smart, None);
     }
 
     #[test]
