@@ -84,3 +84,15 @@
 - [ ] `evaluate-before-use=true`：刚启动后第一次经该组的请求多等一会（测完一轮）再经可用的节点出去；两个节点都不可用时这次请求失败，请求记录的错误是 `policy group evaluation failed`。
 - [ ] `POST /v1/policy_groups/select {"group_name":"Auto","policy":"<较慢的节点>"}`：之后的请求经较慢的节点，且不再产生 `Auto` 的测试会话；`{"policy":""}` 清除后恢复自动选择；重启 rurge 后覆盖不在了。
 - [ ] 日志（含 `--log-level verbose`）里搜不到任何策略的 `test-url` 的路径与参数（订阅行可能把 token 放在测试 URL 里）。
+
+## M3c　smart
+
+需要至少三个真实节点，其中一个可以随时停掉（或把它的端口写错后 `rurge reload`），自动化测试（只用回环）覆盖不了。
+
+- [ ] `Smart = smart, <节点 A>, <节点 B>, <节点 C>`：经 `Smart` 正常浏览十几分钟，`GET /v1/requests/recent` 里的会话都有 `connectMs` 与 `firstByteMs`，数值与节点的实际延迟量级相当；`GET /v1/policy_groups/select?group_name=Smart` 是这段时间用得最多的节点。
+- [ ] 停掉节点 A：之后经 `Smart` 的请求仍然正常，个别会话的 `error` 是 ``smart group `Smart`: `A` failed to connect, used `B` ``；几分钟后新会话基本不再选 A。恢复 A 后，下一轮测速（5 分钟内）或经它成功的会话之后它又会被选到。
+- [ ] 一个能连上、但出口访问不了某个网站的节点：访问那个网站几次之后，经 `Smart` 访问它改走别的节点，访问其它网站仍可能用这个节点（站点记忆）。
+- [ ] `policy-priority="<节点 C>:0.5"`：C 明显更常被选中；改为 `"<节点 C>:3"` 后 C 很少被选中。
+- [ ] `POST /v1/policy_groups/select {"group_name":"Smart","policy":"<节点 B>"}`：之后固定走 B，停掉 B 时请求失败、不换成员；`{"policy":""}` 清除后恢复。
+- [ ] 日志（含 `--log-level verbose`）里 `smart` 相关的行只有节点名，没有 URL 与凭据；节点连续失败时有一条 `smart: the policy counts as failed`，恢复后有 `smart: the policy works again`。
+- [ ] 用一份混有尚未实现协议的节点（如 `ss`）、总数超过 12 个的订阅建 `smart` 组（`policy-path=<订阅>`）：请求照常，会话的 `policy` 链里从不出现 `ss` 节点；全部能测的节点都测过一遍之后，`GET /v1/requests/recent` 里规则为 `policy test` 的会话大约每 5 分钟一批，不会接连不断。

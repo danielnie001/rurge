@@ -9,7 +9,7 @@
 | GET | `/v1/policies/detail?policy_name=<name>` | | `{"<name>": "<脱敏后的定义>"}`；未知策略 → 404 |
 | GET | `/v1/policy_groups` | | `{"<组名>": [Member…], …}` |
 | GET | `/v1/policy_groups/select?group_name=<name>` | | `{"policy": "<当前生效的成员>"}`；未知组 → 404 |
-| POST | `/v1/policy_groups/select` | `{"group_name":"<name>","policy":"<member>"}` | `{}`；组或成员无效，或是 `smart` / `subnet` 组 → 400；对自动组即临时覆盖（M3b） |
+| POST | `/v1/policy_groups/select` | `{"group_name":"<name>","policy":"<member>"}` | `{}`；组或成员无效，或是 `subnet` 组 → 400；对自动组即临时覆盖（M3b；`smart` 组 M3c 起） |
 | POST | `/v1/policies/test` | `{"policy_names":["<name>",…],"url":"<可省略>"}` | `{"<name>": Result…}`；未知策略、`url` 不是 URL → 400（M3b） |
 | GET | `/v1/policy_groups/test_results` | | `{"<组名>": {"<成员>": Result 或 null}}`（M3b） |
 | POST | `/v1/policy_groups/test` | `{"group_name":"<name>"}` | `{"available":["<成员>",…]}`；未知组 → 400（M3b） |
@@ -140,7 +140,7 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 
 ## `GET /v1/policy_groups/select`
 
-参数 `group_name`（必填，查询参数）。响应 `{"policy": "<当前生效的成员>"}`：`select` 组是它当前的选择（没有选择时是第一个成员）；自动组（`url-test` / `fallback` / `load-balance`）是当前生效的成员：临时覆盖优先，其次是按测试结果选出的（没有结果时是第一个成员；`load-balance` 显示第一个通过测试的成员，M3b）；`smart`（M3c 之前）是第一个成员；**一个没有成员的组**（订阅还没下载到，或过滤把成员滤光了）返回 `{"policy": ""}`，这不是错误；`subnet` 组在阶段 3 之前代表它的 `default`（M3a）。
+参数 `group_name`（必填，查询参数）。响应 `{"policy": "<当前生效的成员>"}`：`select` 组是它当前的选择（没有选择时是第一个成员）；自动组（`url-test` / `fallback` / `load-balance`）是当前生效的成员：临时覆盖优先，其次是按测试结果选出的（没有结果时是第一个成员；`load-balance` 显示第一个通过测试的成员，M3b）；`smart`（M3c 起）是最近 10 分钟用得最多的成员，最近没用过时是排在第一的成员；**一个没有成员的组**（订阅还没下载到，或过滤把成员滤光了）返回 `{"policy": ""}`，这不是错误；`subnet` 组在阶段 3 之前代表它的 `default`（M3a）。
 
 ```json
 {"policy": "HK"}
@@ -165,7 +165,7 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 | 情形 | `error` |
 | --- | --- |
 | `group_name` 不是任何已知策略组 | `` unknown policy group `Proxy-typo` `` |
-| `group_name` 是 `smart`（M3c 之前）或 `subnet` 组 | `` `Smart` does not take a selection `` |
+| `group_name` 是 `subnet` 组 | `` `Office` does not take a selection `` |
 | `policy` 不是该组的成员 | `` `Somewhere` is not a member of `Proxy` `` |
 
 选择立即生效：**下一条**使用该组（或途经该组的链）的连接就会解析到新成员，正在进行中的连接不受影响。选择按 Profile 持久化到 `state.json` 的 `group_selections[<Profile 文件名>][<组名>]`（文件名，不含目录，如 `surge.conf`）；rurge 重启后从 `state.json` 恢复，已消失的旧选择（成员被从配置里删除）按"没有选择"处理，回落到第一个成员。对自动组的同一个请求是临时覆盖，见末节。
@@ -224,7 +224,7 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 
 ### `GET /v1/policy_groups/test_results`
 
-无参数。响应 `{"<组名>": {"<成员>": Result 或 null}}`，只列 `url-test` / `fallback` / `load-balance` 组（`smart` 随 M3c），成员是装配后的成员表；`null` 表示没有结果：还没测过，或结果对应的定义、测试 URL、超时已经变了；嵌套组、`REJECT` 族、尚未实现的协议与测试 URL 解析不了的策略恒为 `null`（组在选择时把后三种当作失败）。
+无参数。响应 `{"<组名>": {"<成员>": Result 或 null}}`，只列 `url-test` / `fallback` / `load-balance` / `smart` 组（`smart` 自 M3c 起），成员是装配后的成员表；`null` 表示没有结果：还没测过，或结果对应的定义、测试 URL、超时已经变了；嵌套组、`REJECT` 族、尚未实现的协议与测试 URL 解析不了的策略恒为 `null`（组在选择时把后三种当作失败）。
 
 ```json
 {"Auto": {"HK": {"delay": 128, "time": 1758790000.25}, "JP": {"error": "timed out", "time": 1758790005.02}}}
@@ -242,8 +242,18 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 
 ### `POST /v1/policy_groups/select` 对自动组
 
-对 `url-test` / `fallback` / `load-balance` 组，同一个请求体设置**临时覆盖**：该组从下一条连接起固定用这个成员，期间不因使用而测试；`"policy": ""` 清除覆盖，恢复按测试结果选择。覆盖不写 `state.json`，进程重启后不在；组定义（不计行位置）不变的重载保留它，组消失或定义变了就清除；覆盖的成员从成员表里消失（订阅更新）时覆盖失效。
+对 `url-test` / `fallback` / `load-balance` / `smart` 组，同一个请求体设置**临时覆盖**：该组从下一条连接起固定用这个成员，期间不因使用而测试；`"policy": ""` 清除覆盖，恢复按测试结果选择。覆盖不写 `state.json`，进程重启后不在；组定义（不计行位置）不变的重载保留它，组消失或定义变了就清除；覆盖的成员从成员表里消失（订阅更新）时覆盖失效。
 
 ### 测试会话
 
 每次测试是请求记录（`GET /v1/requests/recent`）里的一条内部会话：`listener` 为 `internal`、`rule` 为 `policy test`、`policy` 是被测的策略、目标是测试 URL 的主机与端口（不含路径与参数）；失败时 `error` 是上面 Result 里的原因。它们与 DNS 会话一样不能经 `POST /v1/requests/kill` 终止（409）。
+
+## `smart` 组（M3c）
+
+- **选择**：按成员的分数——真实会话的首字节耗时与测速结果的时间加权平均，加上失败罚分，乘以 `policy-priority` 因子——排序；最优者 1.2 倍以内的成员里随机选一个；最近在同一目标主机上成功过、分数不超过最优者 2 倍的成员优先，最近在那里失败过的排到最后。细节见 `docs/superpowers/specs/2026-09-26-phase2-m3c-smart-design.md`。
+- **换成员**：选中的成员连不上时，这次会话依次再试排在后面的两个成员，每次最多用"剩余时间 ÷ 剩余尝试次数"，总计 10 秒。请求记录的 `policy` 是实际用上的那条链；换过成员时 `error` 是 ``smart group `S`: `A` failed to connect, used `B` ``（会话本身成功）；都连不上时是 ``smart group `S`: tried `A`, `B`, `C`; <最后一次的错误>``。DNS 会话与链的中间跳（`underlying-proxy`）不换成员。
+- **请求记录**：`connectMs` / `firstByteMs` 两个字段见 `docs/api/phase1.md`（所有会话都有）。
+- **`GET /v1/policy_groups/select`**：最近 10 分钟用得最多的成员，最近没用过时是排在第一的成员；读取不触发测速。
+- **`POST /v1/policy_groups/select`**：临时覆盖，同其它自动组；覆盖期间不换成员重试。
+- **`GET /v1/policy_groups/test_results`**：列出 `smart` 组，内容与其它自动组相同（成员 → 最近测速结果）；分数不经 API 给出。
+- **`POST /v1/policy_groups/test`**：测全部成员（拨号触发的常规轮次在测得了的成员超过 12 个时只测其中 12 个），返回测完后健康的成员。
