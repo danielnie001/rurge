@@ -400,11 +400,17 @@ impl Engine {
                 && Arc::ptr_eq(&self.shared.resolver, &next.shared.resolver),
             "the next generation must be built with `Engine::shared()`"
         );
-        self.shared.cell.store(
-            next.registry
-                .take()
-                .expect("a generation is published once"),
-        );
+        let registry = next
+            .registry
+            .take()
+            .expect("a generation is published once");
+        // what the `smart` groups knew of what is gone goes with it (phase 2
+        // M3c design 5.1)
+        self.shared
+            .auto
+            .smart
+            .retain(|name| registry.contains(name));
+        self.shared.cell.store(registry);
         self.shared.resolver.store(next.stack.resolver.clone());
         self.shared.auto.retain(&next.config.group_specs);
     }

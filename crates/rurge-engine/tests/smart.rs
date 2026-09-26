@@ -253,3 +253,107 @@ async fn a_plain_request_whose_upstream_hangs_up_counts_against_the_member() {
     })
     .await;
 }
+
+/// A `smart` group is an automatic group to the control plane (M3c design
+/// 8.3): `select` sets and clears an override, and the test endpoints take
+/// it.
+#[tokio::test]
+async fn a_smart_group_takes_an_override_and_the_test_endpoints() {
+    let origin = TestServer::spawn().await;
+    let (a, b) = (upstream(&origin).await, upstream(&origin).await);
+    let proxies = format!(
+        "A = socks5, 127.0.0.1, {}\nB = socks5, 127.0.0.1, {}",
+        a.addr().port(),
+        b.addr().port()
+    );
+    let h = harness(Profile {
+        proxies: &proxies,
+        groups: "S = smart, A, B",
+        rules: "DOMAIN,target.test,S",
+        ..Profile::default()
+    })
+    .await;
+    h.engine.select_group("S", "B").await.unwrap();
+    assert_eq!(h.engine.group_selection("S").unwrap(), "B");
+    assert_eq!(chain_of(&h, "target.test").await, ["S", "B"]);
+    h.engine.select_group("S", "").await.unwrap();
+    // both upstreams reach the origin: both pass, and both are healthy
+    assert_eq!(h.engine.test_group("S").await.unwrap(), ["A", "B"]);
+    let results = h.engine.test_results();
+    let (_, members) = results
+        .iter()
+        .find(|(group, _)| group == "S")
+        .expect("a smart group has test results");
+    assert!(
+        members
+            .iter()
+            .all(|(_, r)| r.as_ref().is_some_and(|r| r.outcome.is_ok())),
+        "{members:?}"
+    );
+}
+
+/// A round a dial asks for tests twelve members of a big `smart` group
+/// (M3c design 8.1).
+#[tokio::test]
+async fn a_dial_asks_for_a_sampled_round_of_a_big_smart_group() {
+    let origin = TestServer::spawn().await;
+    let up = upstream(&origin).await;
+    let names: Vec<String> = (0..13).map(|i| format!("P{i}")).collect();
+    let proxies: String = names
+        .iter()
+        .map(|n| format!("{n} = socks5, 127.0.0.1, {}\n", up.addr().port()))
+        .collect();
+    let groups = format!("Big = smart, {}", names.join(", "));
+    let h = harness(Profile {
+        proxies: &proxies,
+        groups: &groups,
+        rules: "DOMAIN,target.test,Big",
+        ..Profile::default()
+    })
+    .await;
+    let _ = chain_of(&h, "target.test").await;
+    wait_until("a round of Big", || {
+        h.engine.registry().auto().last_round("Big").is_some()
+    })
+    .await;
+    let registry = h.engine.registry();
+    let tested = names
+        .iter()
+        .filter(|n| registry.test_result(n).is_some())
+        .count();
+    assert_eq!(tested, 12);
+}
+
+/// A reload that drops a policy drops what the book knew of it (M3c design
+/// 5.1).
+#[tokio::test]
+async fn a_reload_forgets_what_the_book_knew_of_the_policies_it_drops() {
+    let origin = TestServer::spawn().await;
+    let (a, b) = (upstream(&origin).await, upstream(&origin).await);
+    let proxies = format!(
+        "A = socks5, 127.0.0.1, {}\nB = socks5, 127.0.0.1, {}",
+        a.addr().port(),
+        b.addr().port()
+    );
+    let h = harness(Profile {
+        proxies: &proxies,
+        groups: "S = smart, A, B",
+        ..Profile::default()
+    })
+    .await;
+    let registry = h.engine.registry();
+    let smart = &registry.auto().smart;
+    let b_now = outbound_now(&h, "B");
+    let now = Instant::now();
+    smart.sample("B", &b_now, Duration::from_millis(50), now);
+    let text = std::fs::read_to_string(h.dir.path().join("t.conf")).unwrap();
+    let fewer = text
+        .replace(&format!("B = socks5, 127.0.0.1, {}\n", b.addr().port()), "")
+        .replace("S = smart, A, B", "S = smart, A");
+    h.engine
+        .swap_runtime(runtime(h.dir.path(), &fewer, h.engine.shared()).await);
+    assert_eq!(
+        smart.health("B", &b_now, now),
+        rurge_policy::smart::Health::Unknown { failures: 0 }
+    );
+}

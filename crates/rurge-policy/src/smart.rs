@@ -42,6 +42,9 @@ const USAGE_BUCKET: Duration = Duration::from_secs(60);
 /// A `smart` group's round of tests is due this long after its last one;
 /// `interval` has no effect on it (M3c design 8.1).
 pub const ROUND_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// A regular round of a `smart` group with more members than this tests
+/// this many of them (M3c design 8.1).
+pub const ROUND_SAMPLE: usize = 12;
 
 /// What is known of a member (M3c design 5.4).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -330,6 +333,35 @@ pub fn rank(
             .map(|&i| candidates[i].name.to_string())
             .collect(),
     })
+}
+
+/// The members a regular round of a big `smart` group tests (M3c design
+/// 8.1): half of `ROUND_SAMPLE` from `most_used` (most first), the rest from
+/// those tested longest ago — never tested first.
+pub fn sample(
+    members: &[String],
+    most_used: &[String],
+    tested_at: impl Fn(&str) -> Option<Instant>,
+) -> Vec<String> {
+    if members.len() <= ROUND_SAMPLE {
+        return members.to_vec();
+    }
+    let mut out: Vec<String> = most_used
+        .iter()
+        .filter(|m| members.contains(m))
+        .take(ROUND_SAMPLE / 2)
+        .cloned()
+        .collect();
+    let mut rest: Vec<(Option<Instant>, usize)> = members
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| !out.contains(m))
+        .map(|(i, m)| (tested_at(m), i))
+        .collect();
+    rest.sort();
+    let room = ROUND_SAMPLE - out.len();
+    out.extend(rest.into_iter().take(room).map(|(_, i)| members[i].clone()));
+    out
 }
 
 /// What the `smart` groups know of their members; one per engine, like the
@@ -791,6 +823,40 @@ mod tests {
             book.most_used("G", &members, later),
             names(&["A", "B", "C"])
         );
+    }
+
+    fn members(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("M{i}")).collect()
+    }
+
+    #[test]
+    fn a_round_of_a_small_group_tests_every_member() {
+        let all = members(ROUND_SAMPLE);
+        assert_eq!(sample(&all, &[], |_| None), all);
+    }
+
+    /// Six of the most used, then those tested longest ago — never tested
+    /// first — up to twelve (M3c design 8.1).
+    #[test]
+    fn a_round_of_a_big_group_tests_the_most_used_and_the_longest_untested() {
+        let all = members(20);
+        let t0 = Instant::now();
+        let tested_at = |m: &str| {
+            let i: u64 = m[1..].parse().unwrap();
+            (i > 0).then(|| t0 + Duration::from_secs(i))
+        };
+        let used = names(&["M5", "M6", "M7", "M8", "M9", "M10", "M11", "M12"]);
+        assert_eq!(
+            sample(&all, &used, tested_at),
+            names(&[
+                "M5", "M6", "M7", "M8", "M9", "M10", "M0", "M1", "M2", "M3", "M4", "M11"
+            ])
+        );
+        // fewer used ones: the untested fill the round
+        let used = names(&["M19"]);
+        let round = sample(&all, &used, tested_at);
+        assert_eq!(round.len(), ROUND_SAMPLE);
+        assert_eq!(round[..2], names(&["M19", "M0"]));
     }
 
     #[test]

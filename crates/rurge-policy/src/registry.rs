@@ -9,7 +9,7 @@ use crate::auto::{AutoGroups, SelectCtx, Standing, fallback, load_balance, url_t
 use crate::cell::{ChainConnector, RegistryCell};
 use crate::factory::{BuildError, OutboundFactory};
 use crate::selections::SelectionTable;
-use crate::smart::{Candidate, Health, ROUND_INTERVAL, SiteMemory, rank};
+use crate::smart::{Candidate, Health, ROUND_INTERVAL, ROUND_SAMPLE, SiteMemory, rank, sample};
 use crate::testbook::{MAX_CONCURRENT_TESTS, TestCase, TestResult};
 use rurge_config::rule::PolicyRef;
 use rurge_config::spec::{CommonOpts, GroupSpec, IpVersion, PolicySpec};
@@ -915,11 +915,15 @@ impl PolicyRegistry {
     }
 
     /// How long a round of tests of `group` may take: its tests run
-    /// `MAX_CONCURRENT_TESTS` at a time, each within its own timeout.
+    /// `MAX_CONCURRENT_TESTS` at a time, each within its own timeout; a big
+    /// `smart` group's round tests a sample.
     pub fn round_timeout(&self, group: &str) -> Duration {
-        let mut groups = Vec::new();
-        let mut policies = Vec::new();
-        self.gather(group, 0, &mut groups, &mut policies);
+        let policies = self.sample_of(group).unwrap_or_else(|| {
+            let mut groups = Vec::new();
+            let mut policies = Vec::new();
+            self.gather(group, 0, &mut groups, &mut policies);
+            policies
+        });
         let timeouts: Vec<Duration> = policies
             .iter()
             .filter_map(|p| self.test_slot(p))
@@ -937,6 +941,45 @@ impl PolicyRegistry {
         let mut groups = Vec::new();
         let mut policies = Vec::new();
         self.gather(group, 0, &mut groups, &mut policies);
+        self.round(group, groups, policies).await
+    }
+
+    /// The round a dial asked for: `test_group`, but of a `smart` group
+    /// with more than `ROUND_SAMPLE` members only a sample (M3c design 8.1).
+    pub async fn test_round(&self, group: &str) -> Vec<String> {
+        match self.sample_of(group) {
+            Some(policies) => self.round(group, vec![group.to_string()], policies).await,
+            None => self.test_group(group).await,
+        }
+    }
+
+    /// The members a regular round of `group` tests when it is a `smart`
+    /// group with more than `ROUND_SAMPLE` of them.
+    fn sample_of(&self, group: &str) -> Option<Vec<String>> {
+        let Some(Entry::Group { spec, members, .. }) = self.entries.get(group) else {
+            return None;
+        };
+        if spec.kind != GroupKind::Smart || members.len() <= ROUND_SAMPLE {
+            return None;
+        }
+        let used = self.auto.smart.most_used(group, members, Instant::now());
+        Some(sample(members, &used, |m| self.tested_at(m)))
+    }
+
+    /// When `name` was last tested, for what it is now.
+    fn tested_at(&self, name: &str) -> Option<Instant> {
+        let (policy, test) = self.test_slot(name)?;
+        self.auto.tests.result(policy, test.key).map(|r| r.at)
+    }
+
+    /// Tests `policies` and records the round for `groups`; the members of
+    /// `group` that pass.
+    async fn round(
+        &self,
+        group: &str,
+        mut groups: Vec<String>,
+        policies: Vec<String>,
+    ) -> Vec<String> {
         if groups.is_empty() {
             // a reload took the group away after the round was asked for:
             // the request still ends, or it would stand in the way of the
@@ -2288,6 +2331,41 @@ Only = smart, Sel, DIRECT, D\nE = smart, A, B, evaluate-before-use=true\nOuter =
         let only = reg.resolve(&PolicyRef::parse("OnlyU"));
         assert_eq!(only.chain, ["OnlyU", "U", "!unsupported:ss", "REJECT"]);
         assert_eq!(only.smart, None);
+    }
+
+    /// A round a dial asks for tests twelve members of a big `smart` group;
+    /// one asked for by hand, all of them (M3c design 8.1).
+    #[tokio::test]
+    async fn a_regular_round_of_a_big_smart_group_tests_a_sample() {
+        let mut profile = String::from(
+            "[General]\nproxy-test-url = http://127.0.0.1:9/\ninternet-test-url = http://127.0.0.1:9/\n[Proxy]\n",
+        );
+        let names: Vec<String> = (0..ROUND_SAMPLE + 2).map(|i| format!("P{i}")).collect();
+        for name in &names {
+            profile += &format!("{name} = http, {name}.example, 80\n");
+        }
+        profile += &format!(
+            "[Proxy Group]\nBig = smart, {}\n[Rule]\nFINAL,Big\n",
+            names.join(", ")
+        );
+        let reg = generation(&profile, &FakeFactory::new(), None);
+        let tested = |reg: &PolicyRegistry| {
+            names
+                .iter()
+                .filter(|n| reg.test_result(n).is_some())
+                .count()
+        };
+        reg.test_round("Big").await;
+        assert_eq!(tested(&reg), ROUND_SAMPLE);
+        assert!(reg.auto().last_round("Big").is_some());
+        let timeout = reg.test_case("P0").unwrap().timeout;
+        assert_eq!(
+            reg.round_timeout("Big"),
+            timeout * 2,
+            "12 tests, 8 at a time"
+        );
+        reg.test_group("Big").await;
+        assert_eq!(tested(&reg), names.len());
     }
 
     #[test]

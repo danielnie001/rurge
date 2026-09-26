@@ -530,7 +530,7 @@ async fn only_a_member_can_be_selected() {
     let (_a, _b, proxies) = two_entries(&origin).await;
     let h = harness(Profile {
         proxies: &proxies,
-        groups: &format!("{PICK}\nSmart = smart, A, B"),
+        groups: &format!("{PICK}\nSub = subnet, default=A"),
         ..Profile::default()
     })
     .await;
@@ -544,8 +544,8 @@ async fn only_a_member_can_be_selected() {
         "a policy is not a group"
     );
     assert_eq!(
-        h.engine.select_group("Smart", "A").await,
-        Err(SelectError::NotSelectable("Smart".into()))
+        h.engine.select_group("Sub", "A").await,
+        Err(SelectError::NotSelectable("Sub".into()))
     );
     assert_eq!(
         h.engine.select_group("Auto", "C").await,

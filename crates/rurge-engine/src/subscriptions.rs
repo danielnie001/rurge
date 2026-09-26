@@ -183,6 +183,7 @@ impl Engine {
         let published = {
             let _generation = self.generation_lock();
             if Arc::ptr_eq(&self.runtime(), rt) {
+                shared.auto.smart.retain(|name| registry.contains(name));
                 shared.cell.store(registry);
                 true
             } else {

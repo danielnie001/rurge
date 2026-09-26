@@ -29,11 +29,11 @@ pub(crate) const EVALUATION_FAILED: &str = "policy group evaluation failed";
 pub(crate) type Results = Vec<(String, Option<TestResult>)>;
 
 /// The groups that pick by the tests, and take an override for a
-/// selection: `url-test`, `fallback`, `load-balance`.
+/// selection: `url-test`, `fallback`, `load-balance`, `smart`.
 pub(crate) fn automatic(kind: GroupKind) -> bool {
     matches!(
         kind,
-        GroupKind::UrlTest | GroupKind::Fallback | GroupKind::LoadBalance
+        GroupKind::UrlTest | GroupKind::Fallback | GroupKind::LoadBalance | GroupKind::Smart
     )
 }
 
@@ -92,7 +92,7 @@ impl Engine {
                     break;
                 };
                 tokio::spawn(async move {
-                    registry.test_group(&group).await;
+                    registry.test_round(&group).await;
                 });
             }
         });
