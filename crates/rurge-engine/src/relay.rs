@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 const BUF: usize = 8 * 1024;
 
 /// Runs once on the first non-empty read of a `copy_half` direction (M3b SNI
-/// sniffing; see `pump`).
+/// sniffing, and the first byte from upstream; see `pump`).
 type FirstChunkHook = Box<dyn FnOnce(&[u8]) + Send>;
 
 /// Copies bytes both ways until either side closes, the idle timer fires, or
@@ -62,6 +62,12 @@ pub async fn pump(
                 h_sniff.set_protocol(ProtocolKind::Https);
             }
         }));
+        // Upstream → client: the first chunk marks the first byte as it is
+        // read, before it goes on to the client (phase 2 M3c design 4.1).
+        let h_first = handle.clone();
+        let first_byte: Option<FirstChunkHook> = Some(Box::new(move |_: &[u8]| {
+            h_first.mark_first_byte();
+        }));
         async move {
             // A direction that fails ends the other one too: the tunnel is
             // broken, and the side still waiting for bytes would otherwise sit
@@ -90,7 +96,7 @@ pub async fn pump(
                     a_down,
                     started,
                     move |n| h_down.add_down(n),
-                    None,
+                    first_byte,
                 )
                 .await;
                 if r.is_err() {
@@ -242,6 +248,37 @@ mod tests {
         task.await.unwrap();
         assert_eq!(h.bytes(), (4, 2));
         assert_eq!(h.outcome(), Some(SessionOutcome::Completed));
+    }
+
+    /// The first byte is what upstream sends, not what the client does (M3c
+    /// design 4.1).
+    #[tokio::test]
+    async fn the_first_byte_is_the_first_one_upstream_sends() {
+        let (mut ca, client_b) = tokio::io::duplex(1024);
+        let (mut ua, upstream_b) = tokio::io::duplex(1024);
+        let h = handle();
+        h.mark_connected();
+        let task = tokio::spawn(pump(
+            Box::new(client_b),
+            Box::new(upstream_b),
+            h.clone(),
+            Duration::from_secs(30),
+        ));
+        ca.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        ua.read_exact(&mut buf).await.unwrap();
+        assert_eq!(
+            h.first_byte_time(),
+            None,
+            "the client's bytes are no response"
+        );
+        ua.write_all(b"po").await.unwrap();
+        let mut buf2 = [0u8; 2];
+        ca.read_exact(&mut buf2).await.unwrap();
+        assert!(h.first_byte_time().is_some());
+        drop(ca);
+        drop(ua);
+        task.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

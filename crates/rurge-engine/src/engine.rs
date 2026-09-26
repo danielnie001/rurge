@@ -973,11 +973,14 @@ impl Dialer for Engine {
                     .map(|stream| (stream, None)),
             };
             match connected {
-                Ok((stream, forward)) => Ok(Dialed {
-                    stream,
-                    handle,
-                    forward,
-                }),
+                Ok((stream, forward)) => {
+                    handle.mark_connected();
+                    Ok(Dialed {
+                        stream,
+                        handle,
+                        forward,
+                    })
+                }
                 Err(OutboundError::Reject(kind)) => {
                     let effective = if kind.escalates() {
                         let host = handle.session().dst_host.to_string();

@@ -7,7 +7,7 @@ use rurge_net::connector::BoxedStream;
 use rurge_proto::RejectKind;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -35,6 +35,10 @@ pub struct SessionHandle {
     protocol: Mutex<Option<ProtocolKind>>,
     up: AtomicU64,
     down: AtomicU64,
+    /// Since `started`: when the outbound was ready (`mark_connected`).
+    connected: OnceLock<Duration>,
+    /// Since `started`: when the first byte came back from upstream.
+    first_byte: OnceLock<Duration>,
     finished: AtomicBool,
     outcome: Mutex<Option<SessionOutcome>>,
     on_finish: Mutex<Option<FinishHook>>,
@@ -63,6 +67,8 @@ impl SessionHandle {
             protocol: Mutex::new(None),
             up: AtomicU64::new(0),
             down: AtomicU64::new(0),
+            connected: OnceLock::new(),
+            first_byte: OnceLock::new(),
             finished: AtomicBool::new(false),
             outcome: Mutex::new(None),
             on_finish: Mutex::new(None),
@@ -155,6 +161,30 @@ impl SessionHandle {
         )
     }
 
+    /// The outbound connection is ready. Only the first call counts.
+    pub fn mark_connected(&self) {
+        let _ = self.connected.set(self.started.elapsed());
+    }
+
+    /// The first byte came back from upstream — as it is read, before it
+    /// goes on to the client. Only the first call counts.
+    pub fn mark_first_byte(&self) {
+        let _ = self.first_byte.set(self.started.elapsed());
+    }
+
+    /// From the session's start until its outbound was ready (rule
+    /// matching, name resolution and any wait included).
+    pub fn connect_time(&self) -> Option<Duration> {
+        self.connected.get().copied()
+    }
+
+    /// From the outbound being ready until the first byte came back.
+    pub fn first_byte_time(&self) -> Option<Duration> {
+        let connected = self.connected.get()?;
+        let first = self.first_byte.get()?;
+        Some(first.saturating_sub(*connected))
+    }
+
     /// Installs the hook `finish` runs once (the engine's session log).
     pub fn on_finish(&self, f: impl FnOnce(&SessionHandle, &SessionOutcome) + Send + 'static) {
         *self.on_finish.lock().expect("finish hook") = Some(Box::new(f));
@@ -204,6 +234,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for Counting<S> {
         if let Poll::Ready(Ok(())) = &res {
             let n = buf.filled().len() - before;
             self.handle.add_down(n as u64);
+            if n > 0 {
+                self.handle.mark_first_byte();
+            }
         }
         res
     }
@@ -318,6 +351,55 @@ mod tests {
         let mut buf2 = [0u8; 2];
         counted.read_exact(&mut buf2).await.unwrap();
         assert_eq!(h.bytes(), (5, 2));
+    }
+
+    /// The two moments of the request log (M3c design 4.1): each is set by
+    /// its first mark only, and the first byte is measured from the moment
+    /// the outbound was ready.
+    #[test]
+    fn the_outbound_and_its_first_byte_are_marked_once() {
+        let h = SessionHandle::new(3, SessionInfo::tcp(HostName::parse("a.test"), 443));
+        assert_eq!((h.connect_time(), h.first_byte_time()), (None, None));
+        h.mark_connected();
+        let connected = h.connect_time().expect("marked");
+        assert_eq!(h.first_byte_time(), None, "nothing came back yet");
+        h.mark_first_byte();
+        let first = h.first_byte_time().expect("marked");
+        std::thread::sleep(Duration::from_millis(5));
+        h.mark_connected();
+        h.mark_first_byte();
+        assert_eq!(h.connect_time(), Some(connected), "the first mark stands");
+        assert_eq!(h.first_byte_time(), Some(first), "the first mark stands");
+    }
+
+    /// Bytes read from upstream through `Counting` mark the first byte; bytes
+    /// written to it, and the end of the stream, do not.
+    #[tokio::test]
+    async fn counting_marks_the_first_byte_read_from_upstream() {
+        let (mut a, b) = tokio::io::duplex(64);
+        let h = SessionHandle::new(2, SessionInfo::tcp(HostName::parse("a.test"), 80));
+        h.mark_connected();
+        let mut counted = Counting::new(b, h.clone());
+        counted.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        a.read_exact(&mut buf).await.unwrap();
+        assert_eq!(h.first_byte_time(), None, "a write is not a response");
+        a.write_all(b"ok").await.unwrap();
+        let mut buf2 = [0u8; 2];
+        counted.read_exact(&mut buf2).await.unwrap();
+        assert!(h.first_byte_time().is_some());
+    }
+
+    #[tokio::test]
+    async fn the_end_of_the_stream_is_no_first_byte() {
+        let (a, b) = tokio::io::duplex(64);
+        let h = SessionHandle::new(4, SessionInfo::tcp(HostName::parse("a.test"), 80));
+        h.mark_connected();
+        let mut counted = Counting::new(b, h.clone());
+        drop(a);
+        let mut buf = Vec::new();
+        counted.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(h.first_byte_time(), None);
     }
 
     #[test]

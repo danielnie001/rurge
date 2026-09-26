@@ -123,9 +123,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FinishOnDrop<S> {
     }
 }
 
-/// Wraps a dialed stream so bytes are counted (`Counting`) and the handle is
-/// finished on drop (`FinishOnDrop`).
+/// Wraps a freshly dialed stream so bytes are counted (`Counting`) and the
+/// handle is finished on drop (`FinishOnDrop`); the outbound is ready as of
+/// now.
 pub(crate) fn wrap_internal(stream: BoxedStream, handle: Arc<SessionHandle>) -> BoxedStream {
+    handle.mark_connected();
     Box::new(FinishOnDrop::new(
         Counting::new(stream, handle.clone()),
         handle,

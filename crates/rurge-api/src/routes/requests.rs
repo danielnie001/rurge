@@ -55,6 +55,8 @@ pub struct RequestJson {
     pub down: u64,
     pub started_ms: u64,
     pub elapsed_ms: u64,
+    pub connect_ms: Option<u64>,
+    pub first_byte_ms: Option<u64>,
     pub status: &'static str,
     pub reject_kind: Option<String>,
     pub error: Option<String>,
@@ -81,6 +83,8 @@ impl From<&RequestRecord> for RequestJson {
             down: r.down,
             started_ms: r.started_ms,
             elapsed_ms: r.elapsed_ms,
+            connect_ms: r.connect_ms,
+            first_byte_ms: r.first_byte_ms,
             status,
             reject_kind,
             error: r.error.clone(),
@@ -182,6 +186,8 @@ mod tests {
             down: 0,
             started_ms: 0,
             elapsed_ms: 0,
+            connect_ms: None,
+            first_byte_ms: None,
             status: RecordStatus::Active,
             error: None,
         }
@@ -211,5 +217,20 @@ mod tests {
         assert_eq!(j.status, "rejected");
         assert_eq!(j.reject_kind.as_deref(), Some("REJECT-TINYGIF"));
         assert_eq!(j.protocol, Some("mtproto"));
+    }
+
+    /// The two timing fields (M3c design 4.1): `null` until the moment has
+    /// come, milliseconds after.
+    #[test]
+    fn the_timings_are_null_until_known() {
+        let mut r = record(1, ListenerKind::Http);
+        let v = serde_json::to_value(RequestJson::from(&r)).unwrap();
+        assert_eq!(v["connectMs"], Value::Null);
+        assert_eq!(v["firstByteMs"], Value::Null);
+        r.connect_ms = Some(12);
+        r.first_byte_ms = Some(34);
+        let v = serde_json::to_value(RequestJson::from(&r)).unwrap();
+        assert_eq!(v["connectMs"], 12);
+        assert_eq!(v["firstByteMs"], 34);
     }
 }

@@ -37,6 +37,12 @@ pub struct RequestRecord {
     pub down: u64,
     pub started_ms: u64,
     pub elapsed_ms: u64,
+    /// From the session's start until its outbound was ready; `None` when
+    /// it never was (rejected, failed, still dialling).
+    pub connect_ms: Option<u64>,
+    /// From the outbound being ready until the first byte came back from
+    /// upstream; `None` until one does.
+    pub first_byte_ms: Option<u64>,
     pub status: RecordStatus,
     pub error: Option<String>,
 }
@@ -77,6 +83,8 @@ fn record_of(h: &SessionHandle, outcome: Option<&SessionOutcome>) -> RequestReco
         down,
         started_ms: unix_millis().saturating_sub(elapsed_ms),
         elapsed_ms,
+        connect_ms: h.connect_time().map(|d| d.as_millis() as u64),
+        first_byte_ms: h.first_byte_time().map(|d| d.as_millis() as u64),
         status,
         error,
     }

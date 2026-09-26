@@ -223,6 +223,65 @@ async fn plain_http_is_forwarded_through_direct() {
     assert!(h.engine.traffic().totals().down > 0);
 }
 
+/// Both ways a session reaches its target carry the two timings (M3c design
+/// 4.1) — a plain request the HTTP listener forwards, and a CONNECT tunnel —
+/// and a rejected session has neither.
+#[tokio::test]
+async fn the_request_log_times_the_outbound_and_the_first_byte() {
+    let h = harness("", "DOMAIN,ads.test,REJECT", OutboundMode::Rule).await;
+    let port = h.target_port();
+    let (head, _) = get_via_proxy(h.http(), &format!("http://target.test:{port}/hello")).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let plain = wait_for_record(&h.engine, Duration::from_secs(3), |r| {
+        r.dst.starts_with("target.test:")
+            && matches!(r.status, rurge_engine::RecordStatus::Completed)
+    })
+    .await
+    .expect("the plain request's record");
+    assert!(
+        plain.connect_ms.is_some() && plain.first_byte_ms.is_some(),
+        "{plain:?}"
+    );
+
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    let (head, _) = http_exchange(
+        &mut s,
+        &format!("CONNECT target.test:{port} HTTP/1.1\r\nHost: target.test:{port}\r\n\r\n"),
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    s.write_all(b"GET /hello HTTP/1.1\r\nHost: target.test\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut out)).await;
+    drop(s);
+    let tunnel = wait_for_record(&h.engine, Duration::from_secs(3), |r| {
+        r.id != plain.id
+            && r.dst.starts_with("target.test:")
+            && matches!(r.status, rurge_engine::RecordStatus::Completed)
+    })
+    .await
+    .expect("the tunnel's record");
+    assert!(
+        tunnel.connect_ms.is_some() && tunnel.first_byte_ms.is_some(),
+        "{tunnel:?}"
+    );
+
+    let (head, _) = get_via_proxy(h.http(), "http://ads.test/").await;
+    assert!(head.is_empty(), "{head}");
+    let rejected = wait_for_record(&h.engine, Duration::from_secs(3), |r| {
+        r.dst.starts_with("ads.test:")
+    })
+    .await
+    .expect("the rejected session's record");
+    assert_eq!(
+        (rejected.connect_ms, rejected.first_byte_ms),
+        (None, None),
+        "{rejected:?}"
+    );
+}
+
 #[tokio::test]
 async fn connect_tunnel_carries_tls_to_the_target() {
     let h = harness("", "", OutboundMode::Rule).await;
