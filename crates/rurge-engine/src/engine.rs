@@ -22,7 +22,7 @@ use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
 use rurge_policy::auto::SelectCtx;
 use rurge_policy::{PolicyRegistry, TerminalKind};
-use rurge_proto::OutboundError;
+use rurge_proto::{OutboundError, OutboundRef};
 use rurge_rules::{OutboundMode, Outcome};
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -737,7 +737,25 @@ impl Engine {
                 Some(_) => {}
             }
         }
-        match resolution.outbound.connect_tcp(&target, &opts).await {
+        let connected = resolution.outbound.connect_tcp(&target, &opts).await;
+        // the member of a `smart` group reports how it went (M3c design 4.3);
+        // a DNS session tries no other member (M3c-D5)
+        if let Some(pick) = &resolution.smart {
+            let (book, now) = (&registry.auto().smart, Instant::now());
+            let host = handle.session().dst_host.to_string();
+            match &connected {
+                Ok(_) => {
+                    book.used(&pick.group, &pick.member, now);
+                    let outbound = &resolution.outbound;
+                    crate::smart::watch(&handle, book.clone(), &pick.member, outbound, &host);
+                }
+                Err(e) if crate::smart::retryable(e) => {
+                    book.report_failure(&pick.member, &resolution.outbound, Some(&host), now);
+                }
+                Err(_) => {}
+            }
+        }
+        match connected {
             Ok(stream) => Ok(crate::dns_pipeline::wrap_internal(stream, handle)),
             Err(OutboundError::Reject(_)) | Err(OutboundError::Unsupported(_)) => {
                 tracing::warn!(
@@ -872,6 +890,30 @@ fn fail(
     })
 }
 
+/// Connects `outbound` to `target`: a plain request goes in absolute form to
+/// an HTTP proxy when `may_forward` (M1 design 6.5), anything else through a
+/// tunnel.
+async fn connect_through(
+    outbound: &OutboundRef,
+    target: &Target,
+    may_forward: bool,
+    opts: &ConnectOpts,
+) -> Result<(BoxedStream, Option<Vec<(String, String)>>), OutboundError> {
+    match outbound.http_forward().filter(|_| may_forward) {
+        Some(proxy) if rurge_proto::http::valid_target(target) => proxy
+            .connect(opts)
+            .await
+            .map(|stream| (stream, Some(proxy.request_headers()))),
+        Some(_) => Err(OutboundError::Proxy(
+            "the target host name is not valid for an HTTP proxy request".to_string(),
+        )),
+        None => outbound
+            .connect_tcp(target, opts)
+            .await
+            .map(|stream| (stream, None)),
+    }
+}
+
 fn reject(handle: Arc<SessionHandle>, kind: rurge_proto::RejectKind) -> Result<Dialed, DialError> {
     handle.finish(SessionOutcome::Rejected(kind));
     let rule = handle.rule();
@@ -919,9 +961,6 @@ impl Dialer for Engine {
             }
             let mut target =
                 Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
-            let opts = ConnectOpts {
-                timeout: CONNECT_TIMEOUT,
-            };
             // FR-DNS-07: a proxy normally gets the name and resolves it itself;
             // with `use-local-host-item-for-proxy`, an address pinned in [Host]
             // goes to the proxy instead. Alias / server items leave the name alone.
@@ -953,35 +992,87 @@ impl Dialer for Engine {
                 handle.session().listener == ListenerKind::Http && handle.session().url.is_some();
             // a pinned address only reaches the proxy through a tunnel: in
             // absolute form the request URI carries the name
-            let forward = if plain_http && !pinned {
-                resolution.outbound.http_forward()
-            } else {
-                None
-            };
-            let connected = match forward {
-                Some(proxy) if rurge_proto::http::valid_target(&target) => proxy
-                    .connect(&opts)
-                    .await
-                    .map(|stream| (stream, Some(proxy.request_headers()))),
-                Some(_) => Err(OutboundError::Proxy(
-                    "the target host name is not valid for an HTTP proxy request".to_string(),
-                )),
-                None => resolution
-                    .outbound
-                    .connect_tcp(&target, &opts)
-                    .await
-                    .map(|stream| (stream, None)),
-            };
-            match connected {
-                Ok((stream, forward)) => {
-                    handle.mark_connected();
-                    Ok(Dialed {
-                        stream,
-                        handle,
-                        forward,
-                    })
+            let may_forward = plain_http && !pinned;
+            let host = handle.session().dst_host.to_string();
+            let book = registry.auto().smart.clone();
+            // the member a `smart` group picked, then the next ones in line
+            // while they do not connect (phase 2 M3c design §7)
+            let attempts = crate::smart::attempts(&registry, resolution);
+            let begun = Instant::now();
+            let mut tried: Vec<String> = Vec::new();
+            let mut failure = None;
+            for (k, attempt) in attempts.iter().enumerate() {
+                if k > 0 {
+                    handle.set_policy_chain(attempt.chain.clone());
                 }
-                Err(OutboundError::Reject(kind)) => {
+                // every try gets its share of the time that is left
+                let timeout = match attempts.len() {
+                    1 => CONNECT_TIMEOUT,
+                    n => CONNECT_TIMEOUT.saturating_sub(begun.elapsed()) / (n - k) as u32,
+                };
+                let opts = ConnectOpts { timeout };
+                let connecting = connect_through(&attempt.outbound, &target, may_forward, &opts);
+                let connected = if attempts.len() == 1 {
+                    connecting.await
+                } else {
+                    tokio::time::timeout(timeout, connecting)
+                        .await
+                        .unwrap_or(Err(OutboundError::Timeout))
+                };
+                let e = match connected {
+                    Ok((stream, forward)) => {
+                        handle.mark_connected();
+                        if let Some(pick) = &attempt.smart {
+                            book.used(&pick.group, &pick.member, Instant::now());
+                            let outbound = &attempt.outbound;
+                            crate::smart::watch(
+                                &handle,
+                                book.clone(),
+                                &pick.member,
+                                outbound,
+                                &host,
+                            );
+                            if !tried.is_empty() {
+                                handle.set_error(format!(
+                                    "smart group `{}`: {} failed to connect, used `{}`",
+                                    pick.group,
+                                    crate::smart::quoted(&tried),
+                                    pick.member
+                                ));
+                            }
+                        }
+                        return Ok(Dialed {
+                            stream,
+                            handle,
+                            forward,
+                        });
+                    }
+                    Err(e) => e,
+                };
+                let retry = crate::smart::retryable(&e);
+                if let Some(pick) = &attempt.smart
+                    && retry
+                {
+                    let (outbound, now) = (&attempt.outbound, Instant::now());
+                    book.report_failure(&pick.member, outbound, Some(&host), now);
+                    tried.push(pick.member.clone());
+                }
+                failure = Some(e);
+                if !retry {
+                    break;
+                }
+            }
+            if tried.len() > 1
+                && let Some(pick) = attempts.first().and_then(|a| a.smart.as_ref())
+            {
+                handle.set_error(format!(
+                    "smart group `{}`: tried {}",
+                    pick.group,
+                    crate::smart::quoted(&tried)
+                ));
+            }
+            match failure.expect("a dial was tried") {
+                OutboundError::Reject(kind) => {
                     let effective = if kind.escalates() {
                         let host = handle.session().dst_host.to_string();
                         let now = Instant::now();
@@ -996,17 +1087,13 @@ impl Dialer for Engine {
                     };
                     reject(handle, effective)
                 }
-                Err(OutboundError::Unsupported(_)) => {
-                    reject(handle, rurge_proto::RejectKind::Reject)
-                }
-                Err(OutboundError::Dns(m)) => fail(handle, FailKind::Dns, m),
-                Err(OutboundError::Io(e)) => fail(handle, FailKind::Connect, e.to_string()),
-                Err(OutboundError::Timeout) => fail(handle, FailKind::Timeout, "connect timed out"),
-                Err(
-                    e @ (OutboundError::Proxy(_)
-                    | OutboundError::Tls(_)
-                    | OutboundError::Unavailable(_)),
-                ) => fail(handle, FailKind::Connect, e.to_string()),
+                OutboundError::Unsupported(_) => reject(handle, rurge_proto::RejectKind::Reject),
+                OutboundError::Dns(m) => fail(handle, FailKind::Dns, m),
+                OutboundError::Io(e) => fail(handle, FailKind::Connect, e.to_string()),
+                OutboundError::Timeout => fail(handle, FailKind::Timeout, "connect timed out"),
+                e @ (OutboundError::Proxy(_)
+                | OutboundError::Tls(_)
+                | OutboundError::Unavailable(_)) => fail(handle, FailKind::Connect, e.to_string()),
             }
         })
     }

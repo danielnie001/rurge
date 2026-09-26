@@ -21,6 +21,7 @@ pub enum SessionOutcome {
 }
 
 type FinishHook = Box<dyn FnOnce(&SessionHandle, &SessionOutcome) + Send>;
+type FirstByteHook = Box<dyn FnOnce(&SessionHandle) + Send>;
 
 /// Per-session bookkeeping shared by the listener (bytes) and the engine
 /// (rule, policy chain, outcome). Finishing is idempotent.
@@ -39,9 +40,13 @@ pub struct SessionHandle {
     connected: OnceLock<Duration>,
     /// Since `started`: when the first byte came back from upstream.
     first_byte: OnceLock<Duration>,
+    on_first_byte: Mutex<Vec<FirstByteHook>>,
+    /// Upstream ended, before sending anything, while the client was still
+    /// there (`mark_upstream_failed`).
+    upstream_failed: AtomicBool,
     finished: AtomicBool,
     outcome: Mutex<Option<SessionOutcome>>,
-    on_finish: Mutex<Option<FinishHook>>,
+    on_finish: Mutex<Vec<FinishHook>>,
     token: CancellationToken,
     killed: AtomicBool,
 }
@@ -69,9 +74,11 @@ impl SessionHandle {
             down: AtomicU64::new(0),
             connected: OnceLock::new(),
             first_byte: OnceLock::new(),
+            on_first_byte: Mutex::new(Vec::new()),
+            upstream_failed: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             outcome: Mutex::new(None),
-            on_finish: Mutex::new(None),
+            on_finish: Mutex::new(Vec::new()),
             token,
             killed: AtomicBool::new(false),
         })
@@ -167,9 +174,42 @@ impl SessionHandle {
     }
 
     /// The first byte came back from upstream — as it is read, before it
-    /// goes on to the client. Only the first call counts.
+    /// goes on to the client. Only the first call counts; it runs the hooks
+    /// of `on_first_byte`.
     pub fn mark_first_byte(&self) {
-        let _ = self.first_byte.set(self.started.elapsed());
+        if self.first_byte.set(self.started.elapsed()).is_ok() {
+            let hooks = std::mem::take(&mut *self.on_first_byte.lock().expect("first byte hooks"));
+            for hook in hooks {
+                hook(self);
+            }
+        }
+    }
+
+    /// Whether a byte came back from upstream yet.
+    pub fn first_byte_seen(&self) -> bool {
+        self.first_byte.get().is_some()
+    }
+
+    /// Runs `f` once the first byte is back — right away when it is already.
+    pub fn on_first_byte(&self, f: impl FnOnce(&SessionHandle) + Send + 'static) {
+        let mut hooks = self.on_first_byte.lock().expect("first byte hooks");
+        if self.first_byte_seen() {
+            drop(hooks);
+            f(self);
+        } else {
+            hooks.push(Box::new(f));
+        }
+    }
+
+    /// Upstream closed or failed before sending anything back, while the
+    /// client was still there: the member of a `smart` group that carried
+    /// the session is to blame (phase 2 M3c design 4.3).
+    pub fn mark_upstream_failed(&self) {
+        self.upstream_failed.store(true, Ordering::Release);
+    }
+
+    pub fn upstream_failed(&self) -> bool {
+        self.upstream_failed.load(Ordering::Acquire)
     }
 
     /// From the session's start until its outbound was ready (rule
@@ -185,9 +225,13 @@ impl SessionHandle {
         Some(first.saturating_sub(*connected))
     }
 
-    /// Installs the hook `finish` runs once (the engine's session log).
+    /// Adds a hook `finish` runs, once, after the ones added before it (the
+    /// engine's session log first).
     pub fn on_finish(&self, f: impl FnOnce(&SessionHandle, &SessionOutcome) + Send + 'static) {
-        *self.on_finish.lock().expect("finish hook") = Some(Box::new(f));
+        self.on_finish
+            .lock()
+            .expect("finish hooks")
+            .push(Box::new(f));
     }
 
     pub fn finish(&self, outcome: SessionOutcome) {
@@ -195,8 +239,8 @@ impl SessionHandle {
             return;
         }
         *self.outcome.lock().expect("outcome") = Some(outcome.clone());
-        let hook = self.on_finish.lock().expect("finish hook").take();
-        if let Some(hook) = hook {
+        let hooks = std::mem::take(&mut *self.on_finish.lock().expect("finish hooks"));
+        for hook in hooks {
             hook(self, &outcome);
         }
     }
@@ -388,6 +432,52 @@ mod tests {
         let mut buf2 = [0u8; 2];
         counted.read_exact(&mut buf2).await.unwrap();
         assert!(h.first_byte_time().is_some());
+    }
+
+    /// Every hook runs, once, in the order they came (M3c design 4.3: the
+    /// engine hangs a `smart` group's report on the session after its log).
+    #[test]
+    fn every_finish_hook_runs_once_in_order() {
+        let h = SessionHandle::new(5, SessionInfo::tcp(HostName::parse("a.test"), 443));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        for n in 1..=2 {
+            let order = order.clone();
+            h.on_finish(move |_, _| order.lock().unwrap().push(n));
+        }
+        h.finish(SessionOutcome::Completed);
+        h.finish(SessionOutcome::Completed);
+        assert_eq!(*order.lock().unwrap(), [1, 2]);
+    }
+
+    /// A first-byte hook runs when the first byte comes back — right away
+    /// when it already has — and once.
+    #[test]
+    fn a_first_byte_hook_runs_once_when_the_byte_is_back() {
+        let h = SessionHandle::new(6, SessionInfo::tcp(HostName::parse("a.test"), 443));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let r = runs.clone();
+        h.on_first_byte(move |_| {
+            r.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(!h.first_byte_seen());
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        h.mark_first_byte();
+        h.mark_first_byte();
+        assert!(h.first_byte_seen());
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        let r = runs.clone();
+        h.on_first_byte(move |_| {
+            r.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "already back: runs at once");
+    }
+
+    #[test]
+    fn upstream_failing_is_marked() {
+        let h = SessionHandle::new(7, SessionInfo::tcp(HostName::parse("a.test"), 443));
+        assert!(!h.upstream_failed());
+        h.mark_upstream_failed();
+        assert!(h.upstream_failed());
     }
 
     #[tokio::test]

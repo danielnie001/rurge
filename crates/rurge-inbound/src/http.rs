@@ -517,6 +517,8 @@ async fn forward(
             Ok(resp.map(|body| body.boxed()))
         }
         Err(e) => {
+            // no response head: upstream gave up while the client waits
+            handle.mark_upstream_failed();
             handle.finish(SessionOutcome::Failed(format!(
                 "upstream request failed: {e}"
             )));

@@ -13,7 +13,7 @@ use rurge_inbound::{SessionHandle, SessionOutcome};
 use rurge_net::connector::BoxedStream;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::Instant;
@@ -68,6 +68,12 @@ pub async fn pump(
         let first_byte: Option<FirstChunkHook> = Some(Box::new(move |_: &[u8]| {
             h_first.mark_first_byte();
         }));
+        // Upstream ending before it sent anything, while the client is still
+        // there, is upstream's failure (M3c design 4.3); once the client's
+        // side has ended, it is not.
+        let client_done = Arc::new(AtomicBool::new(false));
+        let c_up = client_done.clone();
+        let h_end = handle.clone();
         async move {
             // A direction that fails ends the other one too: the tunnel is
             // broken, and the side still waiting for bytes would otherwise sit
@@ -81,6 +87,7 @@ pub async fn pump(
                     started,
                     move |n| h_up.add_up(n),
                     sniff_first,
+                    move || c_up.store(true, Ordering::Release),
                 )
                 .await;
                 if r.is_err() {
@@ -97,6 +104,11 @@ pub async fn pump(
                     started,
                     move |n| h_down.add_down(n),
                     first_byte,
+                    move || {
+                        if !client_done.load(Ordering::Acquire) && !h_end.first_byte_seen() {
+                            h_end.mark_upstream_failed();
+                        }
+                    },
                 )
                 .await;
                 if r.is_err() {
@@ -151,7 +163,9 @@ async fn idle_watchdog(
 /// One direction: read → write until EOF (then half-close the writer), an
 /// error, or `stop`. Both the read and the write race against `stop`. `first`,
 /// when given, runs once on the first non-empty read (before it is written
-/// onward) and is then consumed.
+/// onward) and is then consumed; `reader_done` runs when the reader ends —
+/// at EOF or on a read error, not when `stop` ends the direction.
+#[allow(clippy::too_many_arguments)]
 async fn copy_half<R, W>(
     mut reader: R,
     mut writer: W,
@@ -160,6 +174,7 @@ async fn copy_half<R, W>(
     started: Instant,
     count: impl Fn(u64),
     mut first: Option<FirstChunkHook>,
+    reader_done: impl Fn(),
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -172,9 +187,16 @@ where
         let n = tokio::select! {
             biased;
             _ = &mut cancelled => return Ok(()),
-            r = reader.read(&mut buf) => r?,
+            r = reader.read(&mut buf) => match r {
+                Ok(n) => n,
+                Err(e) => {
+                    reader_done();
+                    return Err(e);
+                }
+            },
         };
         if n == 0 {
+            reader_done();
             // Half-close. A TCP writer sends a FIN and cannot block, but a TLS /
             // WebSocket writer has to push a close_notify / Close frame (and a
             // `LazyHead` may still owe its head) through a socket the peer may
@@ -427,6 +449,7 @@ mod tests {
                     Instant::now(),
                     |_| {},
                     None,
+                    || {},
                 )
                 .await
             }
@@ -642,5 +665,70 @@ mod tests {
             .expect("both directions done")
             .unwrap();
         assert_eq!(h.outcome(), Some(SessionOutcome::Completed));
+    }
+
+    /// Upstream ending before it answered, while the client waits, is
+    /// upstream's failure (M3c design 4.3).
+    #[tokio::test]
+    async fn upstream_ending_silently_while_the_client_waits_is_marked() {
+        let (ca, client_b) = tokio::io::duplex(1024);
+        let (ua, upstream_b) = tokio::io::duplex(1024);
+        let h = handle();
+        let task = tokio::spawn(pump(
+            Box::new(client_b),
+            Box::new(upstream_b),
+            h.clone(),
+            Duration::from_secs(30),
+        ));
+        drop(ua);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !h.upstream_failed() {
+            assert!(Instant::now() < deadline, "not marked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        drop(ca);
+        task.await.unwrap();
+    }
+
+    /// The client leaving first is no failure of upstream's, and neither is
+    /// upstream ending after it answered.
+    #[tokio::test]
+    async fn the_client_leaving_first_or_an_answer_is_no_upstream_failure() {
+        let (ca, client_b) = tokio::io::duplex(1024);
+        let (mut ua, upstream_b) = tokio::io::duplex(1024);
+        let h = handle();
+        let task = tokio::spawn(pump(
+            Box::new(client_b),
+            Box::new(upstream_b),
+            h.clone(),
+            Duration::from_secs(30),
+        ));
+        drop(ca);
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            ua.read(&mut buf).await.unwrap(),
+            0,
+            "the half-close came through"
+        );
+        drop(ua);
+        task.await.unwrap();
+        assert!(!h.upstream_failed());
+
+        let (mut ca, client_b) = tokio::io::duplex(1024);
+        let (mut ua, upstream_b) = tokio::io::duplex(1024);
+        let h = handle();
+        let task = tokio::spawn(pump(
+            Box::new(client_b),
+            Box::new(upstream_b),
+            h.clone(),
+            Duration::from_secs(30),
+        ));
+        ua.write_all(b"hi").await.unwrap();
+        let mut buf = [0u8; 2];
+        ca.read_exact(&mut buf).await.unwrap();
+        drop(ua);
+        drop(ca);
+        task.await.unwrap();
+        assert!(!h.upstream_failed());
     }
 }

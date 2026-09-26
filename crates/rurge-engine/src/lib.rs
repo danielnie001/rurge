@@ -12,6 +12,7 @@ pub mod relay;
 mod reload;
 pub mod runtime;
 pub mod shared;
+mod smart;
 pub mod sniff;
 pub mod stack;
 pub mod state;
