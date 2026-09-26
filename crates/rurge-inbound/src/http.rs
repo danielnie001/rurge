@@ -517,8 +517,12 @@ async fn forward(
             Ok(resp.map(|body| body.boxed()))
         }
         Err(e) => {
-            // no response head: upstream gave up while the client waits
-            handle.mark_upstream_failed();
+            // no response head: upstream gave up while the client waits —
+            // unless the error is the request's own (a client that left in
+            // the middle of its upload), which is no failure of upstream's
+            if !e.is_user() {
+                handle.mark_upstream_failed();
+            }
             handle.finish(SessionOutcome::Failed(format!(
                 "upstream request failed: {e}"
             )));
@@ -1035,6 +1039,63 @@ mod tests {
             handle.outcome(),
             Some(SessionOutcome::Failed("killed".into()))
         );
+    }
+
+    /// A client that leaves in the middle of its upload is no failure of
+    /// upstream's: the error `send_request` then returns is the request
+    /// body's own (M3c design 4.3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_leaving_mid_upload_is_no_upstream_failure() {
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+        let (got_tx, got_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut got_tx = Some(got_tx);
+            // Hold every accepted connection open and never write back.
+            let mut held = Vec::new();
+            while let Ok((mut s, _)) = silent.accept().await {
+                if let Some(tx) = got_tx.take() {
+                    let mut buf = [0u8; 1024];
+                    let _ = s.read(&mut buf).await;
+                    let _ = tx.send(());
+                }
+                held.push(s);
+            }
+        });
+        let echo = echo_server().await;
+        let dialer = FakeDialer::new(echo, Some(silent_addr));
+        let running = HttpListener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            dialer.clone(),
+            ListenerOpts::default(),
+            CancellationToken::new(),
+            TaskTracker::new(),
+        )
+        .await
+        .unwrap();
+
+        let mut s = TcpStream::connect(running.local_addr).await.unwrap();
+        s.write_all(
+            b"POST http://target.test/up HTTP/1.1\r\nHost: target.test\r\nContent-Length: 10\r\n\r\nabc",
+        )
+        .await
+        .unwrap();
+        // the request reached the target, so `send_request` is in flight
+        tokio::time::timeout(Duration::from_secs(3), got_rx)
+            .await
+            .expect("the target never saw the forwarded request")
+            .unwrap();
+        let handle = dialer.sessions().pop().expect("a forwarded session");
+        drop(s);
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while handle.outcome().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the session did not end");
+        assert!(!handle.upstream_failed(), "{:?}", handle.outcome());
     }
 
     /// `connect` and `forward` hand `authority.host()` to `HostName::parse`
