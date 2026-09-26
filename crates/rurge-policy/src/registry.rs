@@ -683,53 +683,59 @@ impl PolicyRegistry {
                 None => Standing::Unknown,
             };
         }
-        match self.test_case(name) {
-            Some(case) => match self.auto.tests.result(&case.policy, case.key) {
-                Some(result) => match result.outcome {
-                    Ok(score) => Standing::Passed(score),
-                    Err(_) => Standing::Failed,
-                },
+        match self.test_slot(name) {
+            Some((policy, test)) => match self.auto.tests.outcome(policy, test.key) {
+                Some(Ok(score)) => Standing::Passed(score),
+                Some(Err(())) => Standing::Failed,
                 None => Standing::Unknown,
             },
             None => Standing::Failed,
         }
     }
 
+    /// Where `name`'s test results are kept — under the policy, `DIRECT` for
+    /// the built-in and its desktop stand-ins, and its definition's key —
+    /// when it can be tested at all. Nothing is built or cloned: a dial reads
+    /// every member's result through this (M3c design 6.5).
+    fn test_slot<'a>(&'a self, name: &'a str) -> Option<(&'a str, &'a TestSpec)> {
+        let policy = match self.entries.get(name) {
+            Some(Entry::Alias(Terminal::Direct) | Entry::Outbound { .. }) => name,
+            Some(_) => return None,
+            None => match PolicyRef::parse(name) {
+                PolicyRef::Builtin(b) if RejectKind::from_builtin(b).is_none() => "DIRECT",
+                _ => return None,
+            },
+        };
+        let test = self.tests.get(policy)?;
+        test.url.as_ref()?;
+        Some((policy, test))
+    }
+
     /// How to test `name` now (M3 design 6.1): through its outbound, at its
     /// test URL. `None` for what never passes — a REJECT, a protocol not
     /// implemented, a test URL that does not parse — and for a group.
     pub fn test_case(&self, name: &str) -> Option<TestCase> {
-        let (policy, outbound) = match PolicyRef::parse(name) {
-            // DIRECT, and on the desktop the iOS-only built-ins that stand
-            // in for it
-            PolicyRef::Builtin(b) if RejectKind::from_builtin(b).is_none() => {
-                ("DIRECT".to_string(), self.direct())
-            }
-            PolicyRef::Builtin(_) | PolicyRef::Device(_) => return None,
-            PolicyRef::Named(n) => match self.entries.get(&n)? {
-                Entry::Alias(Terminal::Direct) => (n, self.direct()),
-                Entry::Outbound { outbound, .. } => {
-                    let outbound = outbound.clone();
-                    (n, outbound)
-                }
-                _ => return None,
-            },
+        let (policy, test) = self.test_slot(name)?;
+        let outbound = match self.entries.get(policy) {
+            Some(Entry::Outbound { outbound, .. }) => outbound.clone(),
+            // DIRECT — on the desktop also the iOS-only built-ins that stand
+            // in for it — and a `direct` alias without options of its own
+            _ => self.direct(),
         };
-        let test = self.tests.get(&policy)?;
         Some(TestCase {
             url: test.url.clone()?,
             timeout: test.timeout,
             key: test.key,
             roots: self.roots.clone(),
-            policy,
+            policy: policy.to_string(),
             outbound,
         })
     }
 
     /// The last test result of `name` that still counts.
     pub fn test_result(&self, name: &str) -> Option<TestResult> {
-        let case = self.test_case(name)?;
-        self.auto.tests.result(&case.policy, case.key)
+        let (policy, test) = self.test_slot(name)?;
+        self.auto.tests.result(policy, test.key)
     }
 
     /// The members of `group` that pass their tests now.
@@ -752,8 +758,8 @@ impl PolicyRegistry {
         self.gather(group, 0, &mut groups, &mut policies);
         let timeouts: Vec<Duration> = policies
             .iter()
-            .filter_map(|p| self.test_case(p))
-            .map(|case| case.timeout)
+            .filter_map(|p| self.test_slot(p))
+            .map(|(_, test)| test.timeout)
             .collect();
         let longest = timeouts.iter().max().copied().unwrap_or_default();
         longest * timeouts.len().div_ceil(MAX_CONCURRENT_TESTS) as u32

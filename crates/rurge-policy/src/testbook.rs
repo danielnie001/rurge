@@ -97,6 +97,17 @@ impl TestBook {
             .map(|(_, r)| r.clone())
     }
 
+    /// `result`'s outcome without its reason: what a dial reads of every
+    /// member of a group, with nothing cloned (M3c design 6.5).
+    pub fn outcome(&self, policy: &str, key: u64) -> Option<Result<Duration, ()>> {
+        self.results
+            .read()
+            .expect("test results")
+            .get(policy)
+            .filter(|(k, _)| *k == key)
+            .map(|(_, r)| r.outcome.as_ref().copied().map_err(|_| ()))
+    }
+
     /// Records a result as if a test had ended with `outcome`.
     #[cfg(test)]
     pub(crate) fn record(&self, policy: &str, key: u64, outcome: Result<Duration, String>) {
@@ -471,5 +482,18 @@ mod tests {
             None,
             "superseded result should not exist"
         );
+    }
+
+    /// A dial reads the outcome of a member's result for the definition it
+    /// has now (M3c design 6.5).
+    #[test]
+    fn the_outcome_is_read_for_the_current_definition() {
+        let book = TestBook::new();
+        assert_eq!(book.outcome("P", 1), None);
+        book.record("P", 1, Ok(Duration::from_millis(40)));
+        assert_eq!(book.outcome("P", 1), Some(Ok(Duration::from_millis(40))));
+        assert_eq!(book.outcome("P", 2), None, "another definition");
+        book.record("P", 1, Err("timed out".to_string()));
+        assert_eq!(book.outcome("P", 1), Some(Err(())));
     }
 }
