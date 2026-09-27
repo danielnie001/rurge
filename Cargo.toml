@@ -78,6 +78,10 @@ aes = "0.8"
 md-5 = "0.10"
 sha3 = "0.10"
 crc32fast = "1"
+rurge-proto-ssh = { path = "crates/rurge-proto-ssh" }
+# ring, not the default aws-lc-rs (cmake and NASM on Windows); no des, no dsa
+russh = { version = "0.63.3", default-features = false, features = ["ring", "rsa"] }
+rand = "0.10"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

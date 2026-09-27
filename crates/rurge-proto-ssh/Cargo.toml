@@ -1,0 +1,29 @@
+[package]
+name = "rurge-proto-ssh"
+description = "The ssh outbound of rurge: SSH dynamic forwarding, one session per policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rurge-config.workspace = true
+rurge-net.workspace = true
+rurge-proto.workspace = true
+russh.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+base64.workspace = true
+rand = { workspace = true, optional = true }
+
+[features]
+# Loopback SSH server and test keys (`rurge_proto_ssh::testing`); enabled by dependants' dev-dependencies.
+testing = ["dep:rand"]
+
+[dev-dependencies]
+rand.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
