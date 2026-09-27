@@ -30,6 +30,8 @@ pub struct FakeSshOpts {
 struct State {
     opts: FakeSshOpts,
     logins: AtomicUsize,
+    /// Every `auth_password` or `auth_publickey` call, successful or not.
+    attempts: AtomicUsize,
     sessions: Mutex<Vec<server::Handle>>,
 }
 
@@ -69,6 +71,7 @@ impl FakeSsh {
         let state = Arc::new(State {
             opts,
             logins: AtomicUsize::new(0),
+            attempts: AtomicUsize::new(0),
             sessions: Mutex::new(Vec::new()),
         });
         let accepting = state.clone();
@@ -98,6 +101,13 @@ impl FakeSsh {
     /// Logins that succeeded so far: one per session.
     pub fn logins(&self) -> usize {
         self.state.logins.load(Ordering::SeqCst)
+    }
+
+    /// Authentication attempts so far (password or public key), successful
+    /// or not: one per login try, regardless of how many connections it
+    /// took.
+    pub fn attempts(&self) -> usize {
+        self.state.attempts.load(Ordering::SeqCst)
     }
 
     /// Ends every session, as a server restart would.
@@ -136,11 +146,13 @@ impl server::Handler for Peer {
     type Error = russh::Error;
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        self.state.attempts.fetch_add(1, Ordering::SeqCst);
         let opts = &self.state.opts;
         Ok(self.verdict(user == opts.user && opts.password.as_deref() == Some(password)))
     }
 
     async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
+        self.state.attempts.fetch_add(1, Ordering::SeqCst);
         let opts = &self.state.opts;
         let known = opts.keys.iter().any(|k| k.key_data() == key.key_data());
         Ok(self.verdict(user == opts.user && known))

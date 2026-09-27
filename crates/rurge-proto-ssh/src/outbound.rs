@@ -9,14 +9,16 @@ use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
 use rurge_proto::build::shadow_tls_client;
 use rurge_proto::transport::Stack;
-use rurge_proto::{BuildError, Outbound, OutboundError};
+use rurge_proto::{BuildError, Outbound, OutboundError, RejectKind};
 use russh::client::{self, Handle};
 use russh::keys::ssh_key::Algorithm;
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{ChannelOpenFailure, Error, Preferred, cipher};
 use rustls::RootCertStore;
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
 /// The session's side of the conversation: the server's host key is checked
@@ -88,6 +90,54 @@ impl ChannelError {
     }
 }
 
+/// A connection attempt's failure, kept only so dials that were already
+/// waiting for it can fail the same way instead of making their own attempt
+/// (design 5.1: concurrent dials share one handshake, including its
+/// outcome) — a server's fail2ban counts failed logins, so queued dials
+/// each retrying the same wrong credentials would just add to the count.
+/// `OutboundError` is not `Clone` (`Io` holds an `io::Error`), so only the
+/// variant and its fixed text are kept here; nothing else of what the
+/// server sent.
+#[derive(Clone)]
+enum AttemptFailure {
+    Reject(RejectKind),
+    Unsupported(String),
+    Dns(String),
+    Io(io::ErrorKind, String),
+    Timeout,
+    Proxy(String),
+    Tls(String),
+    Unavailable(String),
+}
+
+impl AttemptFailure {
+    fn capture(e: &OutboundError) -> AttemptFailure {
+        match e {
+            OutboundError::Reject(k) => AttemptFailure::Reject(*k),
+            OutboundError::Unsupported(s) => AttemptFailure::Unsupported(s.clone()),
+            OutboundError::Dns(s) => AttemptFailure::Dns(s.clone()),
+            OutboundError::Io(e) => AttemptFailure::Io(e.kind(), e.to_string()),
+            OutboundError::Timeout => AttemptFailure::Timeout,
+            OutboundError::Proxy(s) => AttemptFailure::Proxy(s.clone()),
+            OutboundError::Tls(s) => AttemptFailure::Tls(s.clone()),
+            OutboundError::Unavailable(s) => AttemptFailure::Unavailable(s.clone()),
+        }
+    }
+
+    fn into_outbound(self) -> OutboundError {
+        match self {
+            AttemptFailure::Reject(k) => OutboundError::Reject(k),
+            AttemptFailure::Unsupported(s) => OutboundError::Unsupported(s),
+            AttemptFailure::Dns(s) => OutboundError::Dns(s),
+            AttemptFailure::Io(kind, text) => OutboundError::Io(io::Error::new(kind, text)),
+            AttemptFailure::Timeout => OutboundError::Timeout,
+            AttemptFailure::Proxy(s) => OutboundError::Proxy(s),
+            AttemptFailure::Tls(s) => OutboundError::Tls(s),
+            AttemptFailure::Unavailable(s) => OutboundError::Unavailable(s),
+        }
+    }
+}
+
 pub struct SshOutbound {
     name: String,
     stack: Stack,
@@ -97,6 +147,13 @@ pub struct SshOutbound {
     pins: Arc<[HostKeyPin]>,
     /// One handshake at a time: dials that come in meanwhile wait for it.
     session: Mutex<Option<Arc<Session>>>,
+    /// Bumped after every attempt, success or failure: tells a dial that was
+    /// waiting for the lock whether one finished while it waited.
+    attempts: AtomicU64,
+    /// The most recent attempt's failure, kept while the slot is still empty
+    /// because of it; cleared on success. A dial that starts after it was
+    /// recorded makes its own attempt instead of replaying this one.
+    last_failure: StdMutex<Option<AttemptFailure>>,
 }
 
 impl SshOutbound {
@@ -129,6 +186,8 @@ impl SshOutbound {
             key,
             pins: ssh.host_keys.clone().into(),
             session: Mutex::new(None),
+            attempts: AtomicU64::new(0),
+            last_failure: StdMutex::new(None),
         })
     }
 
@@ -152,13 +211,34 @@ impl SshOutbound {
     }
 
     async fn session(&self, opts: &ConnectOpts) -> Result<Arc<Session>, OutboundError> {
+        // read before contending for the lock: tells us whether an attempt
+        // finished while we waited for it
+        let attempt = self.attempts.load(Ordering::SeqCst);
         let mut slot = self.session.lock().await;
         if let Some(session) = slot.as_ref().filter(|s| !s.handle.is_closed()) {
             return Ok(session.clone());
         }
-        let session = Arc::new(self.establish(opts).await?);
-        *slot = Some(session.clone());
-        Ok(session)
+        if self.attempts.load(Ordering::SeqCst) != attempt {
+            // an attempt finished while we waited and left no live session:
+            // share its failure instead of trying the same thing over again
+            if let Some(failure) = self.last_failure.lock().unwrap().clone() {
+                return Err(failure.into_outbound());
+            }
+        }
+        let result = self.establish(opts).await;
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        match result {
+            Ok(session) => {
+                let session = Arc::new(session);
+                *slot = Some(session.clone());
+                *self.last_failure.lock().unwrap() = None;
+                Ok(session)
+            }
+            Err(e) => {
+                *self.last_failure.lock().unwrap() = Some(AttemptFailure::capture(&e));
+                Err(e)
+            }
+        }
     }
 
     async fn forget(&self, dead: &Arc<Session>) {
@@ -488,6 +568,39 @@ mod tests {
         let failed = round_trip(&ssh, &echo().await).await.unwrap_err();
         assert_eq!(failed.to_string(), "ssh: authentication failed");
         assert_eq!(server.logins(), 0);
+    }
+
+    /// Dials that were waiting on the session lock while a wrong-password
+    /// handshake ran share that failed attempt instead of trying the same
+    /// password again themselves: a server's fail2ban counts failed logins,
+    /// so five queued dials each failing their own login would look like
+    /// five. A dial that starts afterwards makes a new attempt.
+    #[tokio::test]
+    async fn concurrent_dials_share_one_failed_attempt_and_a_later_dial_retries() {
+        let server = fake(FakeSshOpts {
+            password: Some("pw".into()),
+            ..Default::default()
+        })
+        .await;
+        let ssh = Arc::new(outbound_to(
+            server.addr,
+            &spec(Some("hunter2"), None, vec![]),
+            &[],
+        ));
+        let target = echo().await;
+        let mut dials = tokio::task::JoinSet::new();
+        for _ in 0..5 {
+            let (ssh, target) = (ssh.clone(), target.clone());
+            dials.spawn(async move { round_trip(&ssh, &target).await });
+        }
+        while let Some(dialed) = dials.join_next().await {
+            let failed = dialed.unwrap().unwrap_err();
+            assert_eq!(failed.to_string(), "ssh: authentication failed");
+        }
+        assert_eq!(server.attempts(), 1);
+        let failed = round_trip(&ssh, &target).await.unwrap_err();
+        assert_eq!(failed.to_string(), "ssh: authentication failed");
+        assert_eq!(server.attempts(), 2);
     }
 
     #[test]
