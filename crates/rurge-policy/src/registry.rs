@@ -291,7 +291,8 @@ fn has_socket_opts(common: &CommonOpts) -> bool {
 struct Fingerprint {
     /// Without its span: an unrelated edit above the line moves it.
     spec: PolicySpec,
-    /// `client-cert`'s keystore item, by content.
+    /// The keystore item the policy uses (`client-cert`, an `ssh`
+    /// `private-key`), by content.
     keystore: Option<(KeystoreType, String, Option<String>)>,
     environment: String,
 }
@@ -301,9 +302,8 @@ fn fingerprint(spec: &PolicySpec, cfg: &Config, environment: &str) -> Fingerprin
     spec.span = Span::new(Arc::from(Path::new("")), 0);
     let keystore = spec
         .proto
-        .tls()
-        .and_then(|tls| tls.client_cert.as_ref())
-        .and_then(|name| cfg.keystore.iter().find(|item| &item.name == name))
+        .keystore_item()
+        .and_then(|name| cfg.keystore.iter().find(|item| item.name == name))
         .map(|item| (item.kind, item.base64.clone(), item.password.clone()));
     Fingerprint {
         spec,
@@ -1620,6 +1620,30 @@ B = https, b.example, 443, client-cert=cert1\nCorp = direct, interface=eth9\n\
                 "{name} survived a change of environment"
             );
         }
+    }
+
+    /// A new key under the same keystore name rebuilds the `ssh` policy:
+    /// the old session would go on logging in with the old key.
+    #[test]
+    fn a_changed_ssh_private_key_rebuilds_the_policy() {
+        let text = "[Proxy]\nS = ssh, s.example, 22, username=u, private-key=key1\n\
+[Keystore]\nkey1 = type=openssh-private-key, base64=QUJD\n[Rule]\nFINAL,DIRECT\n";
+        let factory = FakeFactory::new();
+        let first = generation(text, &factory, None);
+        let same = generation(text, &factory, Some(&first));
+        assert!(Arc::ptr_eq(
+            &outbound_of(&first, "S"),
+            &outbound_of(&same, "S")
+        ));
+        let changed = generation(
+            &text.replace("base64=QUJD", "base64=QUJE"),
+            &factory,
+            Some(&first),
+        );
+        assert!(!Arc::ptr_eq(
+            &outbound_of(&first, "S"),
+            &outbound_of(&changed, "S")
+        ));
     }
 
     const SUBSCRIBED: &str = "[Proxy]\nRelay = http, r.example, 80\nA = http, a.example, 80\n\

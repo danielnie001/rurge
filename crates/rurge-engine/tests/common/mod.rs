@@ -20,6 +20,9 @@ pub use rurge_proto::testing::{
     AnyTlsScript, FakeAnyTls, FakeHttpProxy, FakeSocks5, FakeTrojan, FakeVmess, HttpProxyScript,
     Socks5Script, TlsFixture, TrojanScript, VmessScript,
 };
+pub use rurge_proto_ssh::testing::{
+    Algorithm, FakeSsh, FakeSshOpts, fingerprint_of, keystore_base64, random_key,
+};
 pub use rurge_rules::{GeoUrls, OutboundMode};
 pub use std::net::SocketAddr;
 pub use std::sync::Arc;
@@ -101,6 +104,7 @@ pub struct Profile<'a> {
     pub hosts: &'a str,
     /// Inserted before `FINAL,DIRECT`.
     pub rules: &'a str,
+    pub keystore: &'a str,
 }
 
 impl Profile<'_> {
@@ -110,8 +114,8 @@ impl Profile<'_> {
         format!(
             "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\ndns-server = {dns}\nipv6 = false\n\
 proxy-test-url = {NO_TEST}\ninternet-test-url = {NO_TEST}\n{}\n\
-[Proxy]\n{}\n[Proxy Group]\n{}\n[Host]\n{}\n[Rule]\n{}\nFINAL,DIRECT\n",
-            self.general, self.proxies, self.groups, self.hosts, self.rules
+[Proxy]\n{}\n[Proxy Group]\n{}\n[Host]\n{}\n[Keystore]\n{}\n[Rule]\n{}\nFINAL,DIRECT\n",
+            self.general, self.proxies, self.groups, self.hosts, self.keystore, self.rules
         )
     }
 }

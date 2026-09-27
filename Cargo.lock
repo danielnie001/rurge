@@ -2956,6 +2956,7 @@ dependencies = [
  "rurge-net",
  "rurge-policy",
  "rurge-proto",
+ "rurge-proto-ssh",
  "rurge-rules",
  "rustls",
  "serde",

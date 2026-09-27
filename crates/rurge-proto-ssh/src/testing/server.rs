@@ -25,6 +25,8 @@ pub struct FakeSshOpts {
     /// Offer only what Surge's manual requires: `curve25519-sha256` and
     /// `aes128-gcm@openssh.com`.
     pub surge_minimum: bool,
+    /// Connect every channel here instead of where it asks to go.
+    pub connect_to: Option<SocketAddr>,
 }
 
 struct State {
@@ -35,6 +37,8 @@ struct State {
     /// Every `auth_password` or `auth_publickey` call, successful or not.
     attempts: AtomicUsize,
     sessions: Mutex<Vec<server::Handle>>,
+    /// Where the channels asked to go, in order.
+    requested: Mutex<Vec<(String, u32)>>,
 }
 
 /// Serves SSH on a loopback port: password and public-key logins, and
@@ -76,6 +80,7 @@ impl FakeSsh {
             live: AtomicUsize::new(0),
             attempts: AtomicUsize::new(0),
             sessions: Mutex::new(Vec::new()),
+            requested: Mutex::new(Vec::new()),
         });
         let accepting = state.clone();
         let task = tokio::spawn(async move {
@@ -106,6 +111,11 @@ impl FakeSsh {
     /// Logins that succeeded so far: one per session.
     pub fn logins(&self) -> usize {
         self.state.logins.load(Ordering::SeqCst)
+    }
+
+    /// Where the channels asked to go: host and port, as sent.
+    pub fn requested(&self) -> Vec<(String, u32)> {
+        self.state.requested.lock().unwrap().clone()
     }
 
     /// Sessions that are up now.
@@ -178,12 +188,18 @@ impl server::Handler for Peer {
         reply: ChannelOpenHandle,
         _session: &mut server::Session,
     ) -> Result<(), Self::Error> {
+        self.state
+            .requested
+            .lock()
+            .unwrap()
+            .push((host_to_connect.to_string(), port_to_connect));
         let target = u16::try_from(port_to_connect)
             .ok()
             .filter(|_| !self.state.opts.refuse_channels);
-        let tcp = match target {
-            Some(port) => TcpStream::connect((host_to_connect, port)).await.ok(),
-            None => None,
+        let tcp = match (target, self.state.opts.connect_to) {
+            (None, _) => None,
+            (Some(_), Some(addr)) => TcpStream::connect(addr).await.ok(),
+            (Some(port), None) => TcpStream::connect((host_to_connect, port)).await.ok(),
         };
         match tcp {
             Some(mut tcp) => {

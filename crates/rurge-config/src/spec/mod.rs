@@ -59,6 +59,7 @@ pub enum ProtoSpec {
     Trojan(TrojanSpec),
     Vmess(VmessSpec),
     AnyTls(AnyTlsSpec),
+    Ssh(SshSpec),
 }
 
 impl ProtoSpec {
@@ -70,7 +71,16 @@ impl ProtoSpec {
             ProtoSpec::Trojan(trojan) => Some(&trojan.tls),
             ProtoSpec::Vmess(vmess) => vmess.tls.as_ref(),
             ProtoSpec::AnyTls(anytls) => Some(&anytls.tls),
-            ProtoSpec::Direct | ProtoSpec::Reject(_) => None,
+            ProtoSpec::Direct | ProtoSpec::Reject(_) | ProtoSpec::Ssh(_) => None,
+        }
+    }
+
+    /// The `[Keystore]` item the protocol uses: a TLS client certificate, or
+    /// an `ssh` private key.
+    pub fn keystore_item(&self) -> Option<&str> {
+        match self {
+            ProtoSpec::Ssh(ssh) => ssh.private_key.as_deref(),
+            _ => self.tls().and_then(|tls| tls.client_cert.as_deref()),
         }
     }
 }
@@ -241,6 +251,11 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             let anytls = anytls::read_anytls(&mut r, env.keystore);
             (common, ProtoSpec::AnyTls(anytls))
         }
+        PolicyKind::Ssh => {
+            let common = read_common(&mut r, Applies::Proxy, &mut notes);
+            let ssh = ssh::read_ssh(&mut r, env.keystore);
+            (common, ProtoSpec::Ssh(ssh))
+        }
         _ => return SpecOutcome::default(),
     };
     let mut shadow_tls = None;
@@ -405,6 +420,42 @@ mod tests {
             "ss, h, 8388, encrypt-method=aes-128-gcm, password=x, mystery=1",
         );
         assert!(o.spec.is_none() && o.diagnostics.is_empty() && o.inert.is_empty());
+    }
+
+    #[test]
+    fn an_ssh_line_gets_a_spec() {
+        let o = outcome(
+            "S",
+            "ssh, h.test, 22, username=u, password=pw, idle-timeout=60",
+        );
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let spec = o.spec.expect("an ssh spec");
+        assert_eq!(
+            (spec.server, spec.port),
+            (Some(HostName::Domain("h.test".into())), Some(22))
+        );
+        let ProtoSpec::Ssh(ssh) = &spec.proto else {
+            panic!("{:?}", spec.proto);
+        };
+        assert_eq!(ssh.idle_timeout, std::time::Duration::from_secs(60));
+    }
+
+    /// What a reload compares besides the line (M2 design 7.1): the keystore
+    /// item the policy uses, whatever the protocol.
+    #[test]
+    fn the_keystore_item_is_a_client_certificate_or_an_ssh_key() {
+        let https = outcome("H", "https, h.test, 443, client-cert=cert1");
+        assert_eq!(https.spec.unwrap().proto.keystore_item(), Some("cert1"));
+        let plain = outcome("P", "http, h.test, 80");
+        assert_eq!(plain.spec.unwrap().proto.keystore_item(), None);
+        let ssh = ProtoSpec::Ssh(SshSpec {
+            username: "u".into(),
+            password: None,
+            private_key: Some("key1".into()),
+            idle_timeout: ssh::DEFAULT_IDLE_TIMEOUT,
+            host_keys: Vec::new(),
+        });
+        assert_eq!(ssh.keystore_item(), Some("key1"));
     }
 
     #[test]

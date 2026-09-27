@@ -9,13 +9,14 @@ use base64::engine::general_purpose::STANDARD;
 use rurge_config::KeystoreItem;
 use rurge_config::keystore::KeystoreType;
 use rurge_config::span::Span;
-use russh::keys::PrivateKey;
-use russh::keys::ssh_key::Algorithm;
+use russh::keys::ssh_key::LineEnding;
 use std::path::Path;
 use std::sync::Arc;
 
 mod server;
 
+pub use russh::keys::ssh_key::Algorithm;
+pub use russh::keys::{PrivateKey, PublicKey};
 pub use server::{FakeSsh, FakeSshOpts};
 
 /// An RSA key (2048 bits): making one in a debug build takes too long.
@@ -94,6 +95,20 @@ pub fn keystore_item(name: &str, key_text: &str) -> KeystoreItem {
         unknown: Vec::new(),
         span: Span::new(Arc::from(Path::new("t.conf")), 1),
     }
+}
+
+/// `key` the way a `[Keystore]` item's `base64=` holds it.
+pub fn keystore_base64(key: &PrivateKey) -> String {
+    STANDARD.encode(key.to_openssh(LineEnding::LF).expect("an OpenSSH key file"))
+}
+
+/// `key` the way `server-fingerprint` takes it: `<algorithm> <base64>`.
+pub fn fingerprint_of(key: &PublicKey) -> String {
+    format!(
+        "{} {}",
+        key.algorithm(),
+        STANDARD.encode(key.to_bytes().expect("an encoded key"))
+    )
 }
 
 /// A fresh Ed25519 or ECDSA key (for RSA, `RSA_KEY`).

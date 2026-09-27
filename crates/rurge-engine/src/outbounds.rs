@@ -16,6 +16,7 @@ use rurge_proto::socks5::Socks5Outbound;
 use rurge_proto::trojan::TrojanOutbound;
 use rurge_proto::vmess::VmessOutbound;
 use rurge_proto::{Direct, OutboundRef};
+use rurge_proto_ssh::SshOutbound;
 use rustls::RootCertStore;
 use std::io;
 use std::net::IpAddr;
@@ -178,6 +179,15 @@ impl OutboundFactory for EngineFactory {
                 self.roots.clone(),
                 connector,
             )?),
+            ProtoSpec::Ssh(ssh) => Arc::new(SshOutbound::new(
+                &spec.name,
+                server_of(spec)?,
+                ssh,
+                spec.shadow_tls.as_ref(),
+                &self.keystore,
+                self.roots.clone(),
+                connector,
+            )?),
         };
         if !self.dry && skips_verification(spec) {
             tracing::warn!(
@@ -231,6 +241,7 @@ mod tests {
     use rurge_net::connector::{ConnectOpts, SystemResolve, Target};
     use rurge_net::socket::NoopSocketHook;
     use rurge_proto::testing::{FakeSocks5, Socks5Script, echo_server};
+    use rurge_proto_ssh::testing::ED25519_WITH_PASSPHRASE;
     use std::path::Path;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -268,6 +279,7 @@ S = socks5, proxy.test, 1080\nST = socks5-tls, proxy.test, 1443, skip-cert-verif
 T = trojan, proxy.test, 443, password=pw, ws=true, ws-path=/x\n\
 V = vmess, proxy.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119, vmess-aead=true, tls=true, ws=true\n\
 A = anytls, proxy.test, 443, password=pw\n\
+SSH = ssh, proxy.test, 22, username=u, password=pw\n\
 Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule]\nFINAL,DIRECT\n",
         );
         let f = factory(&cfg);
@@ -279,6 +291,7 @@ Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule
             ("T", "T"),
             ("V", "V"),
             ("A", "A"),
+            ("SSH", "SSH"),
             ("Corp", "DIRECT"),
         ] {
             let spec = cfg
@@ -318,6 +331,25 @@ A = anytls, proxy.test, 443, password=s3same0pen, client-cert=cert1\n\
                 "{m}"
             );
         }
+    }
+
+    /// `rurge check` names the item and what is wrong with it, never the
+    /// key (phase 2 M4 design 4.5).
+    #[test]
+    fn an_ssh_key_rurge_cannot_use_is_a_load_error() {
+        let cfg = config(&format!(
+            "[Proxy]\nS = ssh, proxy.test, 22, username=u, private-key=key1\n\
+[Keystore]\nkey1 = type=openssh-private-key, base64={}\n[Rule]\nFINAL,DIRECT\n",
+            rurge_proto_ssh::testing::keystore_item("key1", ED25519_WITH_PASSPHRASE).base64
+        ));
+        let diags = dry_build(&cfg);
+        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                "policy `S` cannot be built: keystore item `key1` is protected by a passphrase, which rurge cannot use; remove the passphrase"
+            ]
+        );
     }
 
     #[test]
