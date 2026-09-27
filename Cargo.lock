@@ -2997,6 +2997,7 @@ dependencies = [
  "rurge-net",
  "rurge-policy",
  "rurge-proto",
+ "rurge-proto-ssh",
  "rustls",
  "serde_json",
  "tempfile",

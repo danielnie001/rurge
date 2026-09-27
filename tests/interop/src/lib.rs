@@ -4,6 +4,7 @@
 //! 127.0.0.1 only, its single outbound is `direct`, and it never holds a key
 //! that touches the machine (`set_system_proxy`, `tun`, `auto_route`).
 
+pub mod sshd;
 pub mod xray;
 
 use serde_json::{Value, json};

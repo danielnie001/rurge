@@ -97,9 +97,16 @@ pub fn keystore_item(name: &str, key_text: &str) -> KeystoreItem {
     }
 }
 
+/// `key` as an OpenSSH private key file.
+pub fn openssh_text(key: &PrivateKey) -> String {
+    key.to_openssh(LineEnding::LF)
+        .expect("an OpenSSH key file")
+        .to_string()
+}
+
 /// `key` the way a `[Keystore]` item's `base64=` holds it.
 pub fn keystore_base64(key: &PrivateKey) -> String {
-    STANDARD.encode(key.to_openssh(LineEnding::LF).expect("an OpenSSH key file"))
+    STANDARD.encode(openssh_text(key))
 }
 
 /// `key` the way `server-fingerprint` takes it: `<algorithm> <base64>`.
