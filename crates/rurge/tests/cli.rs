@@ -264,6 +264,46 @@ fn check_knows_vmess_and_anytls() {
         .stdout(predicate::str::contains("s3cretnotauuid").not());
 }
 
+const SSH: &str = "[General]\n[Proxy]\n\
+S = ssh, proxy.test, 22, username=u, password=s3same, idle-timeout=60\n\
+Old = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Rule]\nFINAL,DIRECT\n";
+const SSH_BAD_KEY: &str = "[General]\n[Proxy]\nS = ssh, proxy.test, 22, username=u, private-key=key1\n\
+[Keystore]\nkey1 = type=openssh-private-key, base64=c2VjcmV0IGtleSBtYXRlcmlhbA==\n[Rule]\nFINAL,DIRECT\n";
+
+/// `rurge check` builds `ssh` policies: a key rurge cannot use is an error,
+/// named and not quoted (M4 design 4.5).
+#[test]
+fn check_knows_ssh() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "ssh.conf", SSH))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    // `ss` is still a later milestone; `ssh` is not
+    assert_eq!(out.matches("W0007").count(), 1, "{out}");
+    assert!(out.contains("`ss`") && !out.contains("`ssh`"), "{out}");
+    assert!(!out.contains("s3same"), "{out}");
+
+    Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "bad.conf", SSH_BAD_KEY))
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("E0022"))
+        .stdout(predicate::str::contains("bad.conf:3"))
+        .stdout(predicate::str::contains(
+            "keystore item `key1` is not an OpenSSH private key",
+        ))
+        .stdout(predicate::str::contains("c2VjcmV0").not());
+}
+
 const SUBSCRIBED: &str = "[General]\n[Proxy Group]\nLocal = select, DIRECT, policy-path=nodes.txt\n\
 Remote = select, DIRECT, policy-path=https://sub.test/nodes?token=t0k3n\n[Rule]\nFINAL,Local\n";
 
