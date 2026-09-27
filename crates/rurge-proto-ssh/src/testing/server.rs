@@ -30,6 +30,8 @@ pub struct FakeSshOpts {
 struct State {
     opts: FakeSshOpts,
     logins: AtomicUsize,
+    /// Sessions whose handshake finished and that have not ended.
+    live: AtomicUsize,
     /// Every `auth_password` or `auth_publickey` call, successful or not.
     attempts: AtomicUsize,
     sessions: Mutex<Vec<server::Handle>>,
@@ -71,6 +73,7 @@ impl FakeSsh {
         let state = Arc::new(State {
             opts,
             logins: AtomicUsize::new(0),
+            live: AtomicUsize::new(0),
             attempts: AtomicUsize::new(0),
             sessions: Mutex::new(Vec::new()),
         });
@@ -84,8 +87,10 @@ impl FakeSsh {
                 let state = accepting.clone();
                 tokio::spawn(async move {
                     if let Ok(running) = run_stream(config, stream, peer).await {
+                        state.live.fetch_add(1, Ordering::SeqCst);
                         state.sessions.lock().unwrap().push(running.handle());
                         let _ = running.await;
+                        state.live.fetch_sub(1, Ordering::SeqCst);
                     }
                 });
             }
@@ -101,6 +106,11 @@ impl FakeSsh {
     /// Logins that succeeded so far: one per session.
     pub fn logins(&self) -> usize {
         self.state.logins.load(Ordering::SeqCst)
+    }
+
+    /// Sessions that are up now.
+    pub fn live_sessions(&self) -> usize {
+        self.state.live.load(Ordering::SeqCst)
     }
 
     /// Authentication attempts so far (password or public key), successful

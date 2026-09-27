@@ -13,13 +13,22 @@ use rurge_proto::{BuildError, Outbound, OutboundError, RejectKind};
 use russh::client::{self, Handle};
 use russh::keys::ssh_key::Algorithm;
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
-use russh::{ChannelOpenFailure, Error, Preferred, cipher};
+use russh::{ChannelOpenFailure, ChannelStream, Disconnect, Error, Preferred, cipher};
 use rustls::RootCertStore;
 use std::borrow::Cow;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::Mutex;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{Mutex, Notify};
+
+/// A keepalive every 30 seconds while the session is up; three without an
+/// answer end it (M4-D10).
+const KEEPALIVE: Duration = Duration::from_secs(30);
+const KEEPALIVE_MAX: usize = 3;
 
 /// The session's side of the conversation: the server's host key is checked
 /// against `server-fingerprint`.
@@ -60,8 +69,115 @@ fn preferred() -> Preferred {
     }
 }
 
+fn session_config() -> client::Config {
+    client::Config {
+        preferred: preferred(),
+        keepalive_interval: Some(KEEPALIVE),
+        keepalive_max: KEEPALIVE_MAX,
+        ..Default::default()
+    }
+}
+
 struct Session {
     handle: Handle<Client>,
+    /// Channels handed out and not yet dropped.
+    open: Arc<AtomicUsize>,
+    /// Woken when a channel opens or closes.
+    activity: Arc<Notify>,
+}
+
+/// Counts a channel as open while it lives.
+struct OpenChannel {
+    open: Arc<AtomicUsize>,
+    activity: Arc<Notify>,
+}
+
+impl OpenChannel {
+    fn new(session: &Session) -> OpenChannel {
+        session.open.fetch_add(1, Ordering::SeqCst);
+        session.activity.notify_one();
+        OpenChannel {
+            open: session.open.clone(),
+            activity: session.activity.clone(),
+        }
+    }
+}
+
+impl Drop for OpenChannel {
+    fn drop(&mut self) {
+        self.open.fetch_sub(1, Ordering::SeqCst);
+        self.activity.notify_one();
+    }
+}
+
+/// A channel as the engine sees it.
+struct SshStream {
+    channel: ChannelStream<client::Msg>,
+    _open: OpenChannel,
+}
+
+impl AsyncRead for SshStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().channel).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for SshStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().channel).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().channel).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().channel).poll_shutdown(cx)
+    }
+}
+
+/// Ends the session once no channel has been open on it for `idle`
+/// (`idle-timeout`: idle means no channel, not no traffic, M4-D10). Holds
+/// the session weakly: a session replaced or dropped ends the watch.
+fn watch_idle(session: Weak<Session>, idle: Duration) {
+    tokio::spawn(async move {
+        loop {
+            let Some((open, activity)) = session
+                .upgrade()
+                .map(|s| (s.open.clone(), s.activity.clone()))
+            else {
+                return;
+            };
+            if open.load(Ordering::SeqCst) > 0 {
+                activity.notified().await;
+                continue;
+            }
+            if tokio::time::timeout(idle, activity.notified())
+                .await
+                .is_ok()
+            {
+                // a channel opened or closed meanwhile: look again
+                continue;
+            }
+            if open.load(Ordering::SeqCst) == 0 {
+                if let Some(session) = session.upgrade() {
+                    let _ = session
+                        .handle
+                        .disconnect(Disconnect::ByApplication, "", "")
+                        .await;
+                }
+                return;
+            }
+        }
+    });
 }
 
 enum ChannelError {
@@ -145,8 +261,10 @@ pub struct SshOutbound {
     password: Option<String>,
     key: Option<Arc<PrivateKey>>,
     pins: Arc<[HostKeyPin]>,
+    idle_timeout: Duration,
     /// One handshake at a time: dials that come in meanwhile wait for it.
     session: Mutex<Option<Arc<Session>>>,
+    unpinned_warned: AtomicBool,
     /// Bumped after every attempt, success or failure: tells a dial that was
     /// waiting for the lock whether one finished while it waited.
     attempts: AtomicU64,
@@ -185,7 +303,9 @@ impl SshOutbound {
             password: ssh.password.as_ref().map(|p| p.expose().clone()),
             key,
             pins: ssh.host_keys.clone().into(),
+            idle_timeout: ssh.idle_timeout,
             session: Mutex::new(None),
+            unpinned_warned: AtomicBool::new(false),
             attempts: AtomicU64::new(0),
             last_failure: StdMutex::new(None),
         })
@@ -230,6 +350,7 @@ impl SshOutbound {
         match result {
             Ok(session) => {
                 let session = Arc::new(session);
+                watch_idle(Arc::downgrade(&session), self.idle_timeout);
                 *slot = Some(session.clone());
                 *self.last_failure.lock().unwrap() = None;
                 Ok(session)
@@ -250,18 +371,31 @@ impl SshOutbound {
 
     async fn establish(&self, opts: &ConnectOpts) -> Result<Session, OutboundError> {
         let stream = self.stack.open(opts).await?;
-        let config = Arc::new(client::Config {
-            preferred: preferred(),
-            ..Default::default()
-        });
         let client = Client {
             pins: self.pins.clone(),
         };
-        let mut handle = client::connect_stream(config, stream, client)
+        let mut handle = client::connect_stream(Arc::new(session_config()), stream, client)
             .await
             .map_err(handshake_error)?;
         self.authenticate(&mut handle).await?;
-        Ok(Session { handle })
+        if self.first_unpinned() {
+            // the policy name only
+            tracing::warn!(
+                policy = %self.name,
+                "ssh: no server-fingerprint; the server's host key is not verified"
+            );
+        }
+        Ok(Session {
+            handle,
+            open: Arc::new(AtomicUsize::new(0)),
+            activity: Arc::new(Notify::new()),
+        })
+    }
+
+    /// True once, at the first session of a policy without
+    /// `server-fingerprint` (manual: a one-time security warning).
+    fn first_unpinned(&self) -> bool {
+        self.pins.is_empty() && !self.unpinned_warned.swap(true, Ordering::Relaxed)
     }
 
     /// The key first, then the password, as the OpenSSH client does.
@@ -311,7 +445,10 @@ async fn open_channel(session: &Session, target: &Target) -> Result<BoxedStream,
         )
         .await;
     match opened {
-        Ok(channel) => Ok(Box::new(channel.into_stream())),
+        Ok(channel) => Ok(Box::new(SshStream {
+            channel: channel.into_stream(),
+            _open: OpenChannel::new(session),
+        })),
         Err(Error::ChannelOpenFailure(reason)) => Err(ChannelError::Refused(reason)),
         Err(_) => Err(ChannelError::Gone),
     }
@@ -631,6 +768,91 @@ mod tests {
             );
         }
         assert_eq!(server.logins(), 1);
+    }
+
+    fn with_idle(mut ssh: SshSpec, secs: u64) -> SshSpec {
+        ssh.idle_timeout = Duration::from_secs(secs);
+        ssh
+    }
+
+    /// Polls `check` until it holds, for at most five seconds.
+    async fn eventually(check: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !check() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_without_channels_closes_after_the_idle_timeout() {
+        let server = fake(FakeSshOpts {
+            password: Some("pw".into()),
+            ..Default::default()
+        })
+        .await;
+        let ssh = outbound_to(
+            server.addr,
+            &with_idle(spec(Some("pw"), None, vec![]), 1),
+            &[],
+        );
+        let target = echo().await;
+        round_trip(&ssh, &target).await.unwrap();
+        eventually(|| server.live_sessions() == 0).await;
+        round_trip(&ssh, &target).await.unwrap();
+        assert_eq!(server.logins(), 2);
+    }
+
+    /// Idle means no open channel, not no traffic: a quiet connection keeps
+    /// its session.
+    #[tokio::test]
+    async fn an_open_channel_keeps_the_session_past_the_idle_timeout() {
+        let server = fake(FakeSshOpts {
+            password: Some("pw".into()),
+            ..Default::default()
+        })
+        .await;
+        let ssh = outbound_to(
+            server.addr,
+            &with_idle(spec(Some("pw"), None, vec![]), 1),
+            &[],
+        );
+        let mut held = ssh
+            .connect_tcp(&echo().await, &ConnectOpts::default())
+            .await
+            .unwrap();
+        // the window being observed: twice the idle timeout
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(server.live_sessions(), 1);
+        held.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        held.read_exact(&mut buf).await.unwrap();
+        drop(held);
+        eventually(|| server.live_sessions() == 0).await;
+    }
+
+    #[test]
+    fn the_session_is_kept_alive_every_thirty_seconds() {
+        let config = session_config();
+        assert_eq!(
+            (config.keepalive_interval, config.keepalive_max),
+            (Some(Duration::from_secs(30)), 3)
+        );
+    }
+
+    #[test]
+    fn a_policy_without_server_fingerprint_is_warned_about_once() {
+        let addr = "127.0.0.1:9".parse().unwrap();
+        let unpinned = outbound_to(addr, &spec(Some("pw"), None, vec![]), &[]);
+        assert!(unpinned.first_unpinned());
+        assert!(!unpinned.first_unpinned());
+        let key = random_key(Algorithm::Ed25519);
+        let pinned = outbound_to(
+            addr,
+            &spec(Some("pw"), None, vec![pin(key.public_key())]),
+            &[],
+        );
+        assert!(!pinned.first_unpinned());
     }
 
     #[tokio::test]
