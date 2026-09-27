@@ -14,6 +14,10 @@ use russh::keys::ssh_key::Algorithm;
 use std::path::Path;
 use std::sync::Arc;
 
+mod server;
+
+pub use server::{FakeSsh, FakeSshOpts};
+
 /// An RSA key (2048 bits): making one in a debug build takes too long.
 pub const RSA_KEY: &str = r"-----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn

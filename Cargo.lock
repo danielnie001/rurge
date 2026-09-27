@@ -3104,6 +3104,7 @@ dependencies = [
  "rurge-net",
  "rurge-proto",
  "russh",
+ "rustls",
  "tokio",
  "tracing",
 ]

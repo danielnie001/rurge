@@ -12,6 +12,7 @@ rurge-config.workspace = true
 rurge-net.workspace = true
 rurge-proto.workspace = true
 russh.workspace = true
+rustls.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 base64.workspace = true
