@@ -112,7 +112,7 @@
 
 | 项 | Surge 行为 | rurge | 阶段 | 备注 |
 | --- | --- | --- | --- | --- |
-| `[Keystore]` 条目 `name = type=, base64=, password=` | `type` 为 `p12` 或 `openssh-private-key`，可省略推断 | ✅ | 2 | M1 已实现：加载期校验 Base64（`E0021`）与引用（`E0020`），干构建期解码（`E0022`）；OpenSSL 3 默认加密与 `-legacy`（RC2-40 + 3DES）两种都能读；`openssh-private-key` 自 M4a 起由 `ssh` 的 `private-key` 使用：支持 Ed25519、ECDSA（P-256 / P-384 / P-521）与 RSA；带口令的私钥（手册的 `password` 只用于 p12）与 DSA 私钥不支持，干构建期 `E0022`（文本只点名条目，不引用内容）；除 OpenSSH 格式外，未加密的 PuTTY `.ppk`、PKCS#1、PKCS#8 与 SEC1 私钥文件也能用（解码时按内容识别格式；Surge 对这些格式的行为未核对），这几种格式加了密时报的是 `… is not an OpenSSH private key`；`ssh` 引用的条目不存在或是 p12 时 `E0020` |
+| `[Keystore]` 条目 `name = type=, base64=, password=` | `type` 为 `p12` 或 `openssh-private-key`，可省略推断 | ✅ | 2 | M1 已实现：加载期校验 Base64（`E0021`）与引用（`E0020`），干构建期解码（`E0022`）；OpenSSL 3 默认加密与 `-legacy`（RC2-40 + 3DES）两种都能读；`openssh-private-key` 自 M4a 起由 `ssh` 的 `private-key` 使用：支持 Ed25519、ECDSA（P-256 / P-384 / P-521）与 RSA；带口令的私钥（手册的 `password` 只用于 p12）与 DSA 私钥不支持，干构建期 `E0022`（文本只点名条目，不引用内容）；除 OpenSSH 格式外，未加密的 PuTTY `.ppk`、PKCS#1、PKCS#8 与 SEC1 私钥文件也能用（解码时按内容识别格式；Surge 对这些格式的行为未核对）；加了密的私钥里，OpenSSH 格式与用 AES-128-CBC 加密的传统 PEM（PKCS#1 / SEC1）报口令那条文本，加了密的 PKCS#8、用其它算法加密的传统 PEM 与加了密的 PuTTY 文件报的是 `… is not an OpenSSH private key`；`ssh` 引用的条目不存在或是 p12 时 `E0020` |
 | 引用点：`client-cert` / `ca-keystore-name` / `private-key` | | ✅ | 2 / 4 | `client-cert`（M1）与 `ssh` 的 `private-key`（M4a）已实现，`ca-keystore-name` 属阶段 4；条目内容变了（名字没变）的重载会重建引用它的策略 |
 | Host List：`-` 前缀排除、`*` `?` 通配、顺序优先 | | ✅ | 1 | |
 | Host List：`host:port` `host:0` 与各参数默认端口 | `force-http-engine-hosts` 默认 80，MITM `hostname` 默认 443 | ✅ | 1 | |
