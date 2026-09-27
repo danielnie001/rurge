@@ -27,7 +27,9 @@ async fn forward_through(algorithms: Algorithms, test: &str) {
         &fingerprint_of(client.public_key()),
         algorithms,
     );
-    let user = std::env::var("USER").expect("USER names the user sshd logs in");
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .expect("USER or LOGNAME names the user sshd logs in");
     let profile = format!(
         "[Proxy]\nS = ssh, 127.0.0.1, {}, username={user}, private-key=key1, server-fingerprint=\"{}\"\n\
 [Keystore]\nkey1 = type=openssh-private-key, base64={}\n[Rule]\nFINAL,DIRECT\n",

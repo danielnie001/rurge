@@ -13,7 +13,7 @@ use rurge_proto::{BuildError, Outbound, OutboundError, RejectKind};
 use russh::client::{self, Handle};
 use russh::keys::ssh_key::Algorithm;
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
-use russh::{ChannelOpenFailure, ChannelStream, Disconnect, Error, Preferred, cipher};
+use russh::{Channel, ChannelOpenFailure, ChannelStream, Disconnect, Error, Preferred, cipher};
 use rustls::RootCertStore;
 use std::borrow::Cow;
 use std::io;
@@ -24,14 +24,39 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, Notify};
+use tokio::time::Instant;
 
 /// A keepalive every 30 seconds while the session is up; three without an
 /// answer end it (M4-D10).
 const KEEPALIVE: Duration = Duration::from_secs(30);
 const KEEPALIVE_MAX: usize = 3;
+/// Nothing from the server for five minutes ends the connection (russh's
+/// `inactivity_timeout`), meant as a bound for a server that stalls before
+/// the session is up, when no keepalives go out yet. On a live session
+/// every keepalive answer resets it, so idle still means no open channel.
+const INACTIVITY: Duration = Duration::from_secs(300);
+
+/// The failures another attempt right away cannot fix: the credentials, the
+/// pinned host keys and the algorithms stay what they are until the profile
+/// or the server changes.
+const AUTHENTICATION_FAILED: &str = "ssh: authentication failed";
+const UNKNOWN_HOST_KEY: &str = "ssh: the server's host key is not one of server-fingerprint";
+const NO_COMMON_ALGORITHM: &str =
+    "ssh: the handshake failed (no algorithm in common with the server)";
+/// Any other failure of the handshake: russh does not tell its stages apart.
+const HANDSHAKE_FAILED: &str = "ssh: the handshake failed";
+
+/// After one of those failures, dials fail at once for a minute; each
+/// further one in a row doubles that, up to ten minutes. A server's
+/// fail2ban (and OpenSSH's own penalties) count failed logins, and every
+/// burst of connections would otherwise add one.
+const FIRST_BACKOFF: Duration = Duration::from_secs(60);
+const LONGEST_BACKOFF: Duration = Duration::from_secs(600);
 
 /// The session's side of the conversation: the server's host key is checked
-/// against `server-fingerprint`.
+/// against `server-fingerprint`, and every channel the server opens toward
+/// rurge is refused — rurge asks for no forwarding of any kind, as the
+/// OpenSSH client refuses what it did not ask for.
 struct Client {
     pins: Arc<[HostKeyPin]>,
 }
@@ -42,12 +67,95 @@ impl client::Handler for Client {
     async fn check_server_key(&mut self, key: &PublicKeyOrCertificate) -> Result<bool, Error> {
         Ok(host_key_allowed(&self.pins, key))
     }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _connected_address: &str,
+        _connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Error> {
+        refuse(reply).await
+    }
+
+    async fn server_channel_open_forwarded_streamlocal(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Error> {
+        refuse(reply).await
+    }
+
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Error> {
+        refuse(reply).await
+    }
+
+    async fn server_channel_open_session(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Error> {
+        refuse(reply).await
+    }
+
+    async fn server_channel_open_direct_tcpip(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Error> {
+        refuse(reply).await
+    }
+
+    async fn server_channel_open_direct_streamlocal(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Error> {
+        refuse(reply).await
+    }
+
+    async fn server_channel_open_x11(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Error> {
+        refuse(reply).await
+    }
+}
+
+async fn refuse(reply: client::ChannelOpenHandle) -> Result<(), Error> {
+    reply
+        .reject(ChannelOpenFailure::AdministrativelyProhibited)
+        .await;
+    Ok(())
 }
 
 /// russh's defaults, with the one cipher Surge's manual requires added
 /// (`aes128-gcm@openssh.com`, "Algorithm Requirements") and the SHA-1 host
-/// key signature (`ssh-rsa`) left out.
-fn preferred() -> Preferred {
+/// key signature (`ssh-rsa`) left out; the pinned host keys' algorithms
+/// first (`host_key_algorithms`).
+fn preferred(pins: &[HostKeyPin]) -> Preferred {
     Preferred {
         cipher: Cow::Owned(vec![
             cipher::CHACHA20_POLY1305,
@@ -57,21 +165,47 @@ fn preferred() -> Preferred {
             cipher::AES_192_CTR,
             cipher::AES_128_CTR,
         ]),
-        key: Cow::Owned(
-            Preferred::DEFAULT
-                .key
-                .iter()
-                .filter(|algorithm| !matches!(algorithm, Algorithm::Rsa { hash: None }))
-                .cloned()
-                .collect(),
-        ),
+        key: Cow::Owned(host_key_algorithms(pins)),
         ..Preferred::DEFAULT
     }
 }
 
-fn session_config() -> client::Config {
+/// A server with several host keys presents the one for the first algorithm
+/// on this list that it has a key for, so the algorithms of the pinned keys
+/// come first, in the order the pins are written; then the rest of russh's
+/// list, without `ssh-rsa`. An RSA pin (key type `ssh-rsa`) brings
+/// rsa-sha2-512 and rsa-sha2-256 forward; a pinned algorithm that is not on
+/// the list (`ssh-dss`, `sk-*`) adds nothing.
+fn host_key_algorithms(pins: &[HostKeyPin]) -> Vec<Algorithm> {
+    let pinned: Vec<Algorithm> = pins
+        .iter()
+        .filter_map(|pin| Algorithm::new(&pin.algorithm).ok())
+        .collect();
+    let mut offered: Vec<Algorithm> = Preferred::DEFAULT
+        .key
+        .iter()
+        .filter(|algorithm| !matches!(algorithm, Algorithm::Rsa { hash: None }))
+        .cloned()
+        .collect();
+    // a stable sort: russh's order among the algorithms of one pin, and
+    // among those no pin names
+    offered.sort_by_key(|algorithm| {
+        pinned
+            .iter()
+            .position(|pin| {
+                pin == algorithm
+                    || (matches!(pin, Algorithm::Rsa { .. })
+                        && matches!(algorithm, Algorithm::Rsa { .. }))
+            })
+            .unwrap_or(pinned.len())
+    });
+    offered
+}
+
+fn session_config(pins: &[HostKeyPin]) -> client::Config {
     client::Config {
-        preferred: preferred(),
+        preferred: preferred(pins),
+        inactivity_timeout: Some(INACTIVITY),
         keepalive_interval: Some(KEEPALIVE),
         keepalive_max: KEEPALIVE_MAX,
         ..Default::default()
@@ -80,10 +214,17 @@ fn session_config() -> client::Config {
 
 struct Session {
     handle: Handle<Client>,
-    /// Channels handed out and not yet dropped.
+    /// Channels being opened or handed out, and not yet dropped.
     open: Arc<AtomicUsize>,
-    /// Woken when a channel opens or closes.
+    /// Woken when a channel opens or closes, and when the session goes.
     activity: Arc<Notify>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // the idle watch ends with its session, not up to `idle-timeout` later
+        self.activity.notify_one();
+    }
 }
 
 /// Counts a channel as open while it lives.
@@ -206,14 +347,15 @@ impl ChannelError {
     }
 }
 
-/// A connection attempt's failure, kept only so dials that were already
-/// waiting for it can fail the same way instead of making their own attempt
-/// (design 5.1: concurrent dials share one handshake, including its
-/// outcome) — a server's fail2ban counts failed logins, so queued dials
-/// each retrying the same wrong credentials would just add to the count.
-/// `OutboundError` is not `Clone` (`Io` holds an `io::Error`), so only the
-/// variant and its fixed text are kept here; nothing else of what the
-/// server sent.
+/// A connection attempt's failure, kept only so that other dials fail the
+/// same way instead of making their own attempt: those that were already
+/// waiting for it (design 5.1: concurrent dials share one handshake,
+/// including its outcome) and, after a failure another attempt cannot fix,
+/// those of the back-off that follows — a server's fail2ban counts failed
+/// logins, so dials each retrying the same wrong credentials would just add
+/// to the count. `OutboundError` is not `Clone` (`Io` holds an
+/// `io::Error`), so only the variant and its fixed text are kept here;
+/// nothing else of what the server sent.
 #[derive(Clone)]
 enum AttemptFailure {
     Reject(RejectKind),
@@ -252,6 +394,68 @@ impl AttemptFailure {
             AttemptFailure::Unavailable(s) => OutboundError::Unavailable(s),
         }
     }
+
+    /// One of the failures another attempt right away cannot fix.
+    fn is_persistent(&self) -> bool {
+        matches!(self, AttemptFailure::Proxy(text)
+            if [AUTHENTICATION_FAILED, UNKNOWN_HOST_KEY, NO_COMMON_ALGORITHM]
+                .contains(&text.as_str()))
+    }
+}
+
+/// What failed attempts leave for the dials after them.
+struct Failures {
+    /// The most recent attempt's failure; cleared on success.
+    last: Option<AttemptFailure>,
+    /// Set by a persistent failure: until then every dial fails with `last`
+    /// at once, without connecting.
+    until: Option<Instant>,
+    /// The back-off the latest persistent failure started; the next one
+    /// doubles it. Only a success clears it: a transient failure in between
+    /// neither starts, extends nor resets a back-off.
+    period: Option<Duration>,
+    /// The first back-off: `FIRST_BACKOFF` (shorter in this module's tests).
+    first: Duration,
+}
+
+impl Failures {
+    fn new() -> Failures {
+        Failures {
+            last: None,
+            until: None,
+            period: None,
+            first: FIRST_BACKOFF,
+        }
+    }
+
+    /// The failure a dial fails with instead of making its own attempt: the
+    /// one of the attempt it waited for (`waited`), or the one a back-off
+    /// runs for.
+    fn shared(&self, waited: bool, now: Instant) -> Option<AttemptFailure> {
+        let backing_off = self.until.is_some_and(|until| now < until);
+        if waited || backing_off {
+            self.last.clone()
+        } else {
+            None
+        }
+    }
+
+    fn failed(&mut self, failure: AttemptFailure, now: Instant) {
+        if failure.is_persistent() {
+            let period = self
+                .period
+                .map_or(self.first, |period| (period * 2).min(LONGEST_BACKOFF));
+            self.period = Some(period);
+            self.until = Some(now + period);
+        }
+        self.last = Some(failure);
+    }
+
+    fn succeeded(&mut self) {
+        self.last = None;
+        self.until = None;
+        self.period = None;
+    }
 }
 
 pub struct SshOutbound {
@@ -268,10 +472,9 @@ pub struct SshOutbound {
     /// Bumped after every attempt, success or failure: tells a dial that was
     /// waiting for the lock whether one finished while it waited.
     attempts: AtomicU64,
-    /// The most recent attempt's failure, kept while the slot is still empty
-    /// because of it; cleared on success. A dial that starts after it was
-    /// recorded makes its own attempt instead of replaying this one.
-    last_failure: StdMutex<Option<AttemptFailure>>,
+    /// The latest failure and the back-off after persistent ones; read and
+    /// written with the session lock held, never across an `.await`.
+    failures: StdMutex<Failures>,
 }
 
 impl SshOutbound {
@@ -307,7 +510,7 @@ impl SshOutbound {
             session: Mutex::new(None),
             unpinned_warned: AtomicBool::new(false),
             attempts: AtomicU64::new(0),
-            last_failure: StdMutex::new(None),
+            failures: StdMutex::new(Failures::new()),
         })
     }
 
@@ -338,12 +541,13 @@ impl SshOutbound {
         if let Some(session) = slot.as_ref().filter(|s| !s.handle.is_closed()) {
             return Ok(session.clone());
         }
-        if self.attempts.load(Ordering::SeqCst) != attempt {
-            // an attempt finished while we waited and left no live session:
-            // share its failure instead of trying the same thing over again
-            if let Some(failure) = self.last_failure.lock().unwrap().clone() {
-                return Err(failure.into_outbound());
-            }
+        // no live session: an attempt that finished while we waited shares
+        // its failure instead of us trying the same thing over again, and so
+        // does the one a back-off runs for
+        let waited = self.attempts.load(Ordering::SeqCst) != attempt;
+        let shared = self.failures.lock().unwrap().shared(waited, Instant::now());
+        if let Some(failure) = shared {
+            return Err(failure.into_outbound());
         }
         let result = self.establish(opts).await;
         self.attempts.fetch_add(1, Ordering::SeqCst);
@@ -352,11 +556,15 @@ impl SshOutbound {
                 let session = Arc::new(session);
                 watch_idle(Arc::downgrade(&session), self.idle_timeout);
                 *slot = Some(session.clone());
-                *self.last_failure.lock().unwrap() = None;
+                self.failures.lock().unwrap().succeeded();
                 Ok(session)
             }
             Err(e) => {
-                *self.last_failure.lock().unwrap() = Some(AttemptFailure::capture(&e));
+                let failure = AttemptFailure::capture(&e);
+                self.failures
+                    .lock()
+                    .unwrap()
+                    .failed(failure, Instant::now());
                 Err(e)
             }
         }
@@ -374,7 +582,8 @@ impl SshOutbound {
         let client = Client {
             pins: self.pins.clone(),
         };
-        let mut handle = client::connect_stream(Arc::new(session_config()), stream, client)
+        let config = session_config(&self.pins);
+        let mut handle = client::connect_stream(Arc::new(config), stream, client)
             .await
             .map_err(handshake_error)?;
         self.authenticate(&mut handle).await?;
@@ -428,13 +637,21 @@ impl SshOutbound {
                 return Ok(());
             }
         }
-        Err(OutboundError::Proxy(
-            "ssh: authentication failed".to_string(),
-        ))
+        // russh reports a login as not accepted also when the session ended
+        // while it waited for the answer: that is the connection failing
+        let failed = if handle.is_closed() {
+            HANDSHAKE_FAILED
+        } else {
+            AUTHENTICATION_FAILED
+        };
+        Err(OutboundError::Proxy(failed.to_string()))
     }
 }
 
 async fn open_channel(session: &Session, target: &Target) -> Result<BoxedStream, ChannelError> {
+    // counted from the request on, so the idle watch never finds the session
+    // unused while a channel is being opened; a failed open drops it
+    let open = OpenChannel::new(session);
     let opened = session
         .handle
         .channel_open_direct_tcpip(
@@ -447,7 +664,7 @@ async fn open_channel(session: &Session, target: &Target) -> Result<BoxedStream,
     match opened {
         Ok(channel) => Ok(Box::new(SshStream {
             channel: channel.into_stream(),
-            _open: OpenChannel::new(session),
+            _open: open,
         })),
         Err(Error::ChannelOpenFailure(reason)) => Err(ChannelError::Refused(reason)),
         Err(_) => Err(ChannelError::Gone),
@@ -467,15 +684,14 @@ fn rsa_hash(listed: Option<Option<HashAlg>>) -> HashAlg {
 /// Fixed texts: what the server sent is not repeated. The connection is up
 /// by now, so an I/O error too is the handshake failing.
 fn handshake_error(e: Error) -> OutboundError {
-    match e {
-        Error::UnknownKey => OutboundError::Proxy(
-            "ssh: the server's host key is not one of server-fingerprint".to_string(),
-        ),
-        Error::NoCommonAlgo { .. } => OutboundError::Proxy(
-            "ssh: the handshake failed (no algorithm in common with the server)".to_string(),
-        ),
-        _ => OutboundError::Proxy("ssh: the handshake failed".to_string()),
-    }
+    OutboundError::Proxy(
+        match e {
+            Error::UnknownKey => UNKNOWN_HOST_KEY,
+            Error::NoCommonAlgo { .. } => NO_COMMON_ALGORITHM,
+            _ => HANDSHAKE_FAILED,
+        }
+        .to_string(),
+    )
 }
 
 impl Outbound for SshOutbound {
@@ -566,15 +782,22 @@ mod tests {
         .await
     }
 
+    /// Four bytes there and back through `outbound`; bounded, so that a
+    /// regression fails instead of hanging.
     async fn round_trip(outbound: &SshOutbound, target: &Target) -> Result<(), OutboundError> {
-        let mut stream = outbound
-            .connect_tcp(target, &ConnectOpts::default())
-            .await?;
-        stream.write_all(b"ping").await.unwrap();
-        let mut buf = [0u8; 4];
-        stream.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"ping");
-        Ok(())
+        let echoed = async {
+            let mut stream = outbound
+                .connect_tcp(target, &ConnectOpts::default())
+                .await?;
+            stream.write_all(b"ping").await.unwrap();
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+            Ok(())
+        };
+        tokio::time::timeout(Duration::from_secs(5), echoed)
+            .await
+            .expect("the round trip took over five seconds")
     }
 
     #[tokio::test]
@@ -694,6 +917,77 @@ mod tests {
         assert_eq!(server.logins(), 1);
     }
 
+    /// A server with several host keys presents the one whose algorithm the
+    /// client lists first: the pinned keys' algorithms come first, so any
+    /// one of its host keys may be pinned alone.
+    #[tokio::test]
+    async fn any_one_of_the_servers_host_keys_may_be_pinned_alone() {
+        let server = fake(FakeSshOpts {
+            password: Some("pw".into()),
+            extra_host_keys: vec![
+                random_key(Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP256,
+                }),
+                crate::decode_private_key(&keystore_item("rsa", RSA_KEY)).unwrap(),
+            ],
+            ..Default::default()
+        })
+        .await;
+        let target = echo().await;
+        for host_key in &server.host_keys {
+            let pinned = spec(Some("pw"), None, vec![pin(host_key)]);
+            round_trip(&outbound_to(server.addr, &pinned, &[]), &target)
+                .await
+                .unwrap_or_else(|e| panic!("pinned {}: {e}", host_key.algorithm()));
+        }
+        assert_eq!(server.logins(), 3);
+    }
+
+    /// The pinned keys' algorithms first, in the order they are written; an
+    /// RSA key (`ssh-rsa`) stands for rsa-sha2-512 then rsa-sha2-256, never
+    /// SHA-1; an algorithm rurge does not offer adds nothing.
+    #[test]
+    fn pinned_host_key_algorithms_are_offered_first() {
+        let offered = |algorithms: &[&str]| {
+            let pins: Vec<HostKeyPin> = algorithms
+                .iter()
+                .map(|algorithm| HostKeyPin {
+                    algorithm: algorithm.to_string(),
+                    blob: Vec::new(),
+                })
+                .collect();
+            preferred(&pins)
+                .key
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        let unpinned = [
+            "ssh-ed25519",
+            "ecdsa-sha2-nistp256",
+            "ecdsa-sha2-nistp384",
+            "ecdsa-sha2-nistp521",
+            "rsa-sha2-512",
+            "rsa-sha2-256",
+        ];
+        assert_eq!(offered(&[]), unpinned);
+        assert_eq!(
+            offered(&["ssh-rsa", "ecdsa-sha2-nistp384", "ssh-rsa"]),
+            [
+                "rsa-sha2-512",
+                "rsa-sha2-256",
+                "ecdsa-sha2-nistp384",
+                "ssh-ed25519",
+                "ecdsa-sha2-nistp256",
+                "ecdsa-sha2-nistp521",
+            ]
+        );
+        assert_eq!(
+            offered(&["ssh-dss", "sk-ssh-ed25519@openssh.com"]),
+            unpinned
+        );
+    }
+
     #[tokio::test]
     async fn a_wrong_password_fails_without_repeating_it() {
         let server = fake(FakeSshOpts {
@@ -707,23 +1001,32 @@ mod tests {
         assert_eq!(server.logins(), 0);
     }
 
+    /// The first back-off in these tests: a second instead of a minute.
+    const BACKOFF: Duration = Duration::from_secs(1);
+
+    fn backing_off(ssh: SshOutbound) -> SshOutbound {
+        ssh.failures.lock().unwrap().first = BACKOFF;
+        ssh
+    }
+
     /// Dials that were waiting on the session lock while a wrong-password
     /// handshake ran share that failed attempt instead of trying the same
-    /// password again themselves: a server's fail2ban counts failed logins,
-    /// so five queued dials each failing their own login would look like
-    /// five. A dial that starts afterwards makes a new attempt.
+    /// password again themselves, and so do the dials during the back-off
+    /// that follows: a server's fail2ban counts failed logins, so each dial
+    /// failing its own login would add to the count. The first dial after
+    /// the back-off tries again; a second failure in a row doubles it.
     #[tokio::test]
-    async fn concurrent_dials_share_one_failed_attempt_and_a_later_dial_retries() {
+    async fn concurrent_dials_share_a_failed_login_and_later_ones_back_off() {
         let server = fake(FakeSshOpts {
             password: Some("pw".into()),
             ..Default::default()
         })
         .await;
-        let ssh = Arc::new(outbound_to(
+        let ssh = Arc::new(backing_off(outbound_to(
             server.addr,
             &spec(Some("hunter2"), None, vec![]),
             &[],
-        ));
+        )));
         let target = echo().await;
         let mut dials = tokio::task::JoinSet::new();
         for _ in 0..5 {
@@ -735,9 +1038,144 @@ mod tests {
             assert_eq!(failed.to_string(), "ssh: authentication failed");
         }
         assert_eq!(server.attempts(), 1);
+        // during the back-off: the same failure at once, no login
+        let failed = round_trip(&ssh, &target).await.unwrap_err();
+        assert_eq!(failed.to_string(), "ssh: authentication failed");
+        assert_eq!(server.attempts(), 1);
+        // after it: a login again, whose failure doubles the back-off
+        tokio::time::sleep(BACKOFF).await;
         let failed = round_trip(&ssh, &target).await.unwrap_err();
         assert_eq!(failed.to_string(), "ssh: authentication failed");
         assert_eq!(server.attempts(), 2);
+        assert_eq!(ssh.failures.lock().unwrap().period, Some(2 * BACKOFF));
+    }
+
+    /// A login cut off by the server hanging up is the connection failing,
+    /// not the credentials: no back-off, the next dial tries again at once.
+    #[tokio::test]
+    async fn a_login_the_server_hangs_up_on_is_retried_at_once() {
+        let server = fake(FakeSshOpts {
+            password: Some("pw".into()),
+            hang_up_on_password: true,
+            ..Default::default()
+        })
+        .await;
+        let ssh = outbound_to(server.addr, &spec(Some("pw"), None, vec![]), &[]);
+        let target = echo().await;
+        for attempts in 1..=2 {
+            let failed = round_trip(&ssh, &target).await.unwrap_err();
+            assert_eq!(failed.to_string(), "ssh: the handshake failed");
+            assert_eq!(server.attempts(), attempts);
+        }
+    }
+
+    /// A login that succeeds ends the back-off: the next failure backs off
+    /// for the first period again, not for twice as long.
+    #[tokio::test]
+    async fn a_successful_login_resets_the_back_off() {
+        let server = fake(FakeSshOpts {
+            password: Some("old".into()),
+            ..Default::default()
+        })
+        .await;
+        let ssh = backing_off(outbound_to(
+            server.addr,
+            &spec(Some("pw"), None, vec![]),
+            &[],
+        ));
+        let target = echo().await;
+        let failed = round_trip(&ssh, &target).await.unwrap_err();
+        assert_eq!(failed.to_string(), "ssh: authentication failed");
+        // the server takes rurge's password now: in after the back-off
+        server.set_password("pw");
+        tokio::time::sleep(BACKOFF).await;
+        round_trip(&ssh, &target).await.unwrap();
+        assert_eq!(server.attempts(), 2);
+        // it changes again and the session ends: a new back-off ...
+        server.set_password("new");
+        server.end_sessions().await;
+        eventually(|| server.live_sessions() == 0).await;
+        let failed = round_trip(&ssh, &target).await.unwrap_err();
+        assert_eq!(failed.to_string(), "ssh: authentication failed");
+        round_trip(&ssh, &target).await.unwrap_err();
+        assert_eq!(server.attempts(), 3);
+        // ... over after the first period, well before a doubled one
+        tokio::time::sleep(BACKOFF * 3 / 2).await;
+        round_trip(&ssh, &target).await.unwrap_err();
+        assert_eq!(server.attempts(), 4);
+    }
+
+    /// The key is tried first; a server that does not take it still takes
+    /// the password.
+    #[tokio::test]
+    async fn a_key_the_server_does_not_take_is_followed_by_the_password() {
+        let key = random_key(Algorithm::Ed25519);
+        let server = fake(FakeSshOpts {
+            password: Some("pw".into()),
+            ..Default::default()
+        })
+        .await;
+        let keystore = [keystore_item("k", &key.to_openssh(LineEnding::LF).unwrap())];
+        let ssh = outbound_to(server.addr, &spec(Some("pw"), Some("k"), vec![]), &keystore);
+        round_trip(&ssh, &echo().await).await.unwrap();
+        // the key's login, then the password's
+        assert_eq!((server.attempts(), server.logins()), (2, 1));
+    }
+
+    /// Records `failure` at `at`; for how many seconds from then on dials
+    /// fail at once.
+    fn backoff_after(failures: &mut Failures, failure: AttemptFailure, at: Instant) -> u64 {
+        failures.failed(failure, at);
+        (0..=LONGEST_BACKOFF.as_secs())
+            .take_while(|s| {
+                failures
+                    .shared(false, at + Duration::from_secs(*s))
+                    .is_some()
+            })
+            .count() as u64
+    }
+
+    /// A minute after a failure another attempt cannot fix, doubled by each
+    /// further one up to ten minutes; only a success starts over. Any other
+    /// failure is shared only by the dials that waited for it.
+    #[test]
+    fn persistent_failures_back_off_a_minute_doubling_up_to_ten() {
+        let proxy = |text: &str| AttemptFailure::Proxy(text.to_string());
+        let start = Instant::now();
+        for text in [AUTHENTICATION_FAILED, UNKNOWN_HOST_KEY, NO_COMMON_ALGORITHM] {
+            assert_eq!(backoff_after(&mut Failures::new(), proxy(text), start), 60);
+        }
+        for transient in [
+            proxy(HANDSHAKE_FAILED),
+            proxy("ssh: the session closed"),
+            AttemptFailure::Timeout,
+        ] {
+            let mut failures = Failures::new();
+            assert_eq!(backoff_after(&mut failures, transient, start), 0);
+            assert!(failures.shared(true, start).is_some());
+        }
+        // each failure comes when the back-off before it has run out
+        let (mut failures, mut at, mut periods) = (Failures::new(), start, Vec::new());
+        for failure in [
+            proxy(AUTHENTICATION_FAILED),
+            proxy(HANDSHAKE_FAILED),
+            proxy(AUTHENTICATION_FAILED),
+            proxy(UNKNOWN_HOST_KEY),
+            proxy(AUTHENTICATION_FAILED),
+            proxy(AUTHENTICATION_FAILED),
+            proxy(AUTHENTICATION_FAILED),
+        ] {
+            let period = backoff_after(&mut failures, failure, at);
+            at += Duration::from_secs(period);
+            periods.push(period);
+        }
+        // the transient failure in between neither backs off nor resets
+        assert_eq!(periods, [60, 0, 120, 240, 480, 600, 600]);
+        failures.succeeded();
+        assert_eq!(
+            backoff_after(&mut failures, proxy(AUTHENTICATION_FAILED), at),
+            60
+        );
     }
 
     #[test]
@@ -768,6 +1206,26 @@ mod tests {
             );
         }
         assert_eq!(server.logins(), 1);
+    }
+
+    /// rurge asks for no forwarding: a channel the server opens toward it is
+    /// refused, whatever its kind.
+    #[tokio::test]
+    async fn channels_the_server_opens_are_refused() {
+        let server = fake(FakeSshOpts {
+            password: Some("pw".into()),
+            ..Default::default()
+        })
+        .await;
+        let ssh = outbound_to(server.addr, &spec(Some("pw"), None, vec![]), &[]);
+        let _held = ssh
+            .connect_tcp(&echo().await, &ConnectOpts::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            server.open_channels_toward_client().await,
+            vec![Some(ChannelOpenFailure::AdministrativelyProhibited); 7]
+        );
     }
 
     fn with_idle(mut ssh: SshSpec, secs: u64) -> SshSpec {
@@ -831,12 +1289,22 @@ mod tests {
         eventually(|| server.live_sessions() == 0).await;
     }
 
+    /// Also: russh drops a connection on which nothing arrived for five
+    /// minutes.
     #[test]
     fn the_session_is_kept_alive_every_thirty_seconds() {
-        let config = session_config();
+        let config = session_config(&[]);
         assert_eq!(
-            (config.keepalive_interval, config.keepalive_max),
-            (Some(Duration::from_secs(30)), 3)
+            (
+                config.keepalive_interval,
+                config.keepalive_max,
+                config.inactivity_timeout
+            ),
+            (
+                Some(Duration::from_secs(30)),
+                3,
+                Some(Duration::from_secs(300))
+            )
         );
     }
 
