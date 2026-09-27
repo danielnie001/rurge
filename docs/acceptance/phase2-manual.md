@@ -105,8 +105,9 @@
 - [ ] 密钥登录：`ssh-keygen -t ed25519 -N "" -f key` 生成一把不带口令的密钥，`key.pub` 加进服务器的 `authorized_keys`，把 `key` 文件整个 Base64 编码后写进 `[Keystore]`（`key1 = type=openssh-private-key, base64=<…>`），`S = ssh, <服务器>, 22, username=<用户>, private-key=key1`：经 `S` 正常。换成 RSA 密钥（`ssh-keygen -t rsa -b 3072 -N ""`）同样正常，服务器日志（`LogLevel VERBOSE`；`journalctl -u ssh` 或 `/var/log/auth.log`）里记下的签名算法是 `rsa-sha2-512` 或 `rsa-sha2-256`。
 - [ ] 带口令的私钥（`ssh-keygen -t ed25519 -N pw`）：`rurge check` 报 `E0022`，文本是 ``keystore item `key1` is protected by a passphrase, which rurge cannot use; remove the passphrase``，输出里没有私钥内容。
 - [ ] 主机密钥校验：`ssh-keyscan -t ed25519 <服务器>` 的输出去掉开头的主机名，写成 `server-fingerprint="ssh-ed25519 AAAA…"`：连接正常，也没有上面那条告警；换成另一台机器的公钥后 `rurge reload`，经 `S` 的会话失败，请求记录的错误是 `ssh: the server's host key is not one of server-fingerprint`。
+- [ ] 只钉 ECDSA（或 RSA）主机密钥：`ssh-keyscan -t ecdsa <服务器>`（或 `-t rsa`）的输出去掉开头的主机名，写成 `server-fingerprint="ecdsa-sha2-nistp256 AAAA…"`（或 `"ssh-rsa AAAA…"`）：连接正常——服务器同时有 Ed25519 主机密钥时，rurge 协商的是被钉住的那把的算法。
 - [ ] 会话复用：同时开几个经 `S` 的下载，服务器上（`ss -tnp | grep sshd` 或 `last`）只看到 rurge 的一次登录、一条连接。
 - [ ] 空闲断开：`idle-timeout=30`，最后一个经 `S` 的连接关掉 30 秒后，服务器上那条连接消失，再访问时重新登录；一个开着但没有流量的连接（如网页上的 WebSocket）不会因为 `idle-timeout` 被断开。
 - [ ] 断线重建：让服务器断开 rurge 的会话（在服务器上结束那次登录对应的 `sshd` 进程，或重启服务器）之后，下一个经 `S` 的连接正常（重新登录）；断网两分钟再恢复之后同样正常（旧会话在 3 次保活无回应后判定已断）。
-- [ ] 口令写错：会话失败，错误是 `ssh: authentication failed`；日志与 `GET /v1/requests/recent` 里没有用户名与口令；同时打开很多网页时，服务器日志（`journalctl -u ssh` 或 `/var/log/auth.log`）里每一批只有一次失败的登录（等着的连接共享这次失败）。
+- [ ] 口令写错：会话失败，错误是 `ssh: authentication failed`；日志与 `GET /v1/requests/recent` 里没有用户名与口令；第一次失败之后约一分钟内，新连接不连服务器、立即得到同一个错误；一直有请求（开着网页、rurge 做系统代理）时，服务器日志（`journalctl -u ssh` 或 `/var/log/auth.log`）里失败的登录前后相隔约 1、2、4、8 分钟，之后每 10 分钟一次，同时打开很多网页也不会多出来；把口令改对后 `rurge reload`，下一个连接立即登录成功（改了行的策略重建出站，退避从头开始）。
 - [ ] 日志（含 `--log-level verbose`）里搜不到口令与私钥内容。

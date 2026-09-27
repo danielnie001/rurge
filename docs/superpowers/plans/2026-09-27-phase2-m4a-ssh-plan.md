@@ -3979,6 +3979,14 @@ git commit -m "docs: M4a SSH——兼容性清单、README、CLAUDE.md、手工�
 | 4 | 导入块，与 `let session = Arc::new(self.establish(opts).await?);` 那一块 | 改写成适配 Task 3 修正后的代码：导入列表并入 `AtomicU64` 与 `Mutex as StdMutex`；`watch_idle` 在 `session()` 的 `Ok` 分支里、`let session = Arc::new(session);` 之后启动 | Task 3 的修正改掉了这两处锚点 | db81786 |
 | 5 ～ 7 | 各任务门禁的预期数字 | 实际：Task 1 41 个二进制 / 1001 通过；Task 2 43 / 1006；Task 3 43 / 1016（修正前 1015）；Task 4 43 / 1020；Task 5 44 / 1028；Task 6 45 / 1029；Task 7 45 / 1030（均 1 忽略） | Task 3 的修正多了一条用例 | — |
 | 7 | 兼容性清单 `[Keystore]` 行、4.2 节 `ssh` 行与手工验收"口令写错"一项的原文 | 各多一句：解码器也收未加密的 PuTTY / PKCS#1 / PKCS#8 / SEC1 私钥文件；握手失败时等着的连接一起得到这次失败；验收时看服务器日志里每批只有一次失败登录 | Task 2 评审发现解码器按内容识别格式；Task 3 的修正 | 本任务的文档提交 |
+| 7 | 兼容性清单 `[Keystore]` 行关于加密私钥报错的那句 | 更正为：OpenSSH 格式与用 AES-128-CBC 加密的传统 PEM（PKCS#1 / SEC1）报口令那条文本，加了密的 PKCS#8、用其它算法加密的传统 PEM 与加了密的 PuTTY 文件报 `… is not an OpenSSH private key` | 任务评审对照 russh 的解码路径 | aa99da5 |
+| 3 | `preferred()` 的主机密钥算法照 russh 的默认顺序、去掉 `ssh-rsa`（P2） | 配了 `server-fingerprint` 时，钉住的公钥的算法排在最前（按书写顺序；`ssh-rsa` 公钥对应 rsa-sha2-512、rsa-sha2-256），其余照旧；`FakeSshOpts::extra_host_keys` 与 `FakeSsh::host_keys`；用例 `any_one_of_the_servers_host_keys_may_be_pinned_alone`、`pinned_host_key_algorithms_are_offered_first` | 终审：russh 取自己列表里服务器也支持的第一个算法，同时有几把主机密钥的服务器总是出示 Ed25519 那把，只钉 ECDSA 或 RSA 公钥时每次握手都失败 | 67adb28 |
+| 3 | 失败的握手只由等在锁上的拨号共享，之后的拨号照常再试（d95a6e0） | 认证失败、主机密钥不在列表里、没有共同算法这三种失败之后退避 60 秒，接连再失败时翻倍、最长 10 分钟，只有握手成功才清零（中间夹着的其它失败既不退避也不清零）；其它失败照旧；认证得到"未接受"而会话已关时算握手失败；`FakeSsh::set_password` 与 `FakeSshOpts::hang_up_on_password`；原用例改名 `concurrent_dials_share_a_failed_login_and_later_ones_back_off` 并加上退避，新增 `a_login_the_server_hangs_up_on_is_retried_at_once`、`a_successful_login_resets_the_back_off`、`a_key_the_server_does_not_take_is_followed_by_the_password`、`persistent_failures_back_off_a_minute_doubling_up_to_ten` | 终审：做系统代理时口令写错，每批连接都多一次失败的登录，几批之内服务器就会封掉用户的 IP | 67adb28 |
+| 4 | 通道开好之后才计数（`OpenChannel::new` 在 `channel_open_direct_tcpip` 之后）；会话被丢弃后，看门任务要到下次醒来才结束 | 开通道之前就计数，开失败时随之释放；`Session` 被丢弃时唤醒看门任务，它随即结束 | 终审 | 67adb28 |
+| 4 | 不用 `inactivity_timeout`（P6） | 设为 5 分钟，`the_session_is_kept_alive_every_thirty_seconds` 一并断言；russh 0.63.3 里它管不住密钥交换中途停住的连接，见「延后事项」#15 | 终审 | 67adb28 |
+| 3 | `Client` 只实现 `check_server_key` | 服务器开向 rurge 的七种通道一律以 administratively prohibited 拒绝；`FakeSsh::open_channels_toward_client` 与用例 `channels_the_server_opens_are_refused` | 终审：russh 的客户端默认接受这些通道，不怀好意的服务器能让 rurge 为每个通道分配状态 | 67adb28 |
+| 3 | 用例辅助函数 `round_trip` 不设时限 | 整个往返限 5 秒 | 终审：出了回归时用例失败，而不是一直挂到门禁的 `timeout 1500` | 67adb28 |
+| 6 | 用户名取 `USER` | 没有 `USER` 时取 `LOGNAME` | 终审 | 67adb28 |
 
 ## 延后事项
 
@@ -3988,3 +3996,14 @@ git commit -m "docs: M4a SSH——兼容性清单、README、CLAUDE.md、手工�
 | 2 | 没配 `server-fingerprint` 的告警按出站对象计一次：重载时参数变了而重建的出站会再告警一次（P12） | 有用户报告再说 |
 | 3 | 只认 `ssh-rsa`（SHA-1）签名的老服务器用 RSA 私钥登录不了（P3）；DSA 私钥与带口令的私钥不支持（P7） | 有用户报告再说（登记为差异） |
 | 4 | 对 OpenSSH `sshd` 的互操作只在 CI（Linux / macOS）上真正运行，本机验证不了（P15） | 首次推送后看 CI |
+| 5 | 解码 Keystore 私钥时的 Base64 解码与报错和 `rurge-proto/src/keystore.rs` 的 p12 那段逐字重复（8 行） | 阶段收尾时抽成共用函数 |
+| 6 | 服务器每拒绝一次开通道，russh 的应答队列就多留一条，直到会话结束才释放（只有认证等待读它） | 向 russh 报告；有用户报告再说 |
+| 7 | 目标主机名是 IDN 或含不能发送的字符时原样发给服务器（其它出站经 `to_ascii`，它是 `pub(crate)`） | M8（IDN） |
+| 8 | 没有 RST 的断线（网络切换、睡眠唤醒）：旧会话要等保活判定（约 2 分钟）才换掉，其间的新连接各自超时失败；可在复用的会话上开通道迟迟没有回应时用 `Handle::send_ping` 探一次 | 有用户报告再说（已登记） |
+| 9 | 口令只用 `password` 方法，不走 `keyboard-interactive` | 有用户报告再说（已登记为差异） |
+| 10 | `server-fingerprint` 的一项后面带注释（从 `*.pub` 整行粘贴）是 `E0018` | 有用户报告再说 |
+| 11 | russh 的 `log` 记录经 `LogTracer` 进 rurge 的日志，info / verbose 级别里可能有服务器发来的文本（断开说明），不含凭据 | 日志策略由项目所有者决定（可加 `russh=warn`） |
+| 12 | `smart` 组给首个成员的时间是 10 秒 ÷ 尝试次数，而 SSH 成员的握手在这次拨号里完成 | 跨里程碑的设计问题，有用户报告再说 |
+| 13 | CI 里装 `openssh-server` 的 apt 没有重试 | 首次推送后看 CI；不稳就加 `-o Acquire::Retries=3` |
+| 14 | 测试覆盖：`parse_pin` 的过短公钥、`keys.rs` 的无填充 Base64 与非 UTF-8、RSA / ECDSA 主机证书、`preferred()` 加密算法列表的直接断言、"没有共同算法"的文本、整次拨号超时、一次性告警只测了标志；`FakeSsh` 的 `live` 与 `connect_to` 两处说明、`tests/interop/README.md` 里"只认一把公钥"的出处 | 以后顺手补 |
+| 15 | russh 0.63.3 的会话任务在登录之前，保活计时器到点后不再重置：服务器在密钥交换中途停住（例如握手时网络切换、没有 RST）而拨号已放弃时，这个任务从第 30 秒起不停空转（本机回环复现：约半个核），直到对端关闭连接或 TCP 判定连接已断——没有 TCP 保活，对端悄悄消失时可能一直不结束；5 分钟的 `inactivity_timeout` 每转一圈都被重置，不起作用 | 待项目所有者决定：拨号放弃时由 rurge 关掉会话底下的连接（给交给 russh 的流包一层可关闭的外壳），或向 russh 报告 |
