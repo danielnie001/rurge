@@ -150,22 +150,10 @@ fn reaches_into_profile(
         .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
         .collect();
 
-    // Check client-cert first.
-    if let Some(mod_value) = modifier_values.get("client-cert") {
-        // Modifier sets it: all values in the parsed policy must be the modifier's value exactly.
-        let values = policy.params.get_all("client-cert");
-        if values.is_empty() || !values.iter().all(|v| v == mod_value) {
-            return Some(
-                "`external-policy-modifier` cannot set `client-cert` on this line".to_string(),
-            );
-        }
-    } else {
-        // Modifier does not set it: no value allowed.
-        let values = policy.params.get_all("client-cert");
-        if !values.is_empty() {
-            return Some(
-                "a subscription line's own `client-cert` is not honoured (only `external-policy-modifier` may set it)".to_string(),
-            );
+    // Keystore items: a client certificate, an SSH private key.
+    for key in ["client-cert", "private-key"] {
+        if let Some(why) = only_the_modifier_sets(policy, &modifier_values, key) {
+            return Some(why);
         }
     }
 
@@ -194,6 +182,26 @@ fn reaches_into_profile(
     }
 
     None
+}
+
+/// A parameter that names material of the profile: the line may carry it
+/// only as the user's own modifier sets it.
+fn only_the_modifier_sets(
+    policy: &ProxyPolicy,
+    modifier_values: &HashMap<String, String>,
+    key: &str,
+) -> Option<String> {
+    let values = policy.params.get_all(key);
+    match modifier_values.get(key) {
+        // all values in the parsed policy must be the modifier's value exactly
+        Some(mod_value) => (values.is_empty() || !values.iter().all(|v| v == mod_value))
+            .then(|| format!("`external-policy-modifier` cannot set `{key}` on this line")),
+        None => (!values.is_empty()).then(|| {
+            format!(
+                "a subscription line's own `{key}` is not honoured (only `external-policy-modifier` may set it)"
+            )
+        }),
+    }
 }
 
 /// The policies groups took in, each with the group that brought it.
@@ -1549,6 +1557,46 @@ Inner = http, i.test, 80, underlying-proxy=Hop\nHop = http, h.test, 80",
                     "policy group `G`: `policy-path` line 3: a subscription line's own `underlying-proxy` may not name a policy or group of the profile (only `external-policy-modifier` may); skipped".to_string()
                 ),
             ]
+        );
+    }
+
+    /// An `ssh` line's `private-key` names an item of the profile's
+    /// `[Keystore]`: like `client-cert`, only the user's modifier may set it
+    /// (phase 2 M4 design 4.8).
+    #[test]
+    fn a_subscription_ssh_line_may_not_use_the_profiles_private_keys() {
+        let cfg = profile(
+            "Corp = http, corp.test, 80",
+            "G = select, policy-path=https://sub.test/g\n\
+H = select, policy-path=https://sub.test/h, external-policy-modifier=\"private-key=key1\"\n\
+[Keystore]\nkey1 = type=openssh-private-key, base64=QUJD",
+        );
+        let a = assemble(
+            &cfg,
+            &snapshots(
+                &cfg,
+                &[
+                    (
+                        "G",
+                        "Own = ssh, s.test, 22, username=u, private-key=key1\n\
+Plain = ssh, p.test, 22, username=u, password=pw",
+                    ),
+                    ("H", "Mod = ssh, m.test, 22, username=u"),
+                ],
+            ),
+        );
+        assert_eq!(members(&a, "G"), ["Plain"]);
+        assert_eq!(members(&a, "H"), ["Mod"]);
+        let skipped: Vec<_> = warnings(&a)
+            .into_iter()
+            .filter(|(code, _)| *code == codes::W_SET_LINES_SKIPPED)
+            .collect();
+        assert_eq!(
+            skipped,
+            [(
+                codes::W_SET_LINES_SKIPPED,
+                "policy group `G`: `policy-path` line 1: a subscription line's own `private-key` is not honoured (only `external-policy-modifier` may set it); skipped".to_string()
+            )]
         );
     }
 }
