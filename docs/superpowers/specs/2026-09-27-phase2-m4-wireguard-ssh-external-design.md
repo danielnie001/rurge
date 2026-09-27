@@ -397,3 +397,21 @@ M4-D7 ～ D13 是按 M4-D1 ～ D6 逐节细化时由项目所有者确认的（2
 3. `ExternalOutbound`：拉起、日志与轮转、环境变量、再拉起与限速、连接被拒的重试；进程控制 trait；测试辅助程序与用例。
 4. 引擎：工厂分支、数据目录、退出流程停掉外部进程、经引擎的端到端。
 5. 能力表翻转 `external` 与文档（含 `CLAUDE.md` 的 unsafe 规则）。
+
+## 17. 计划期的订正
+
+写 M4a 计划（`docs/superpowers/plans/2026-09-27-phase2-m4a-ssh-plan.md`）时核对 russh 0.63.3 与本仓库源码得出、与上文不同的地方；P 编号是该计划「计划期决定」表的编号。
+
+| 本文原文 | 计划 | 依据 |
+| -------- | ---- | ---- |
+| 4.5 带口令私钥的报错示例 `key1 is encrypted; rurge cannot use a passphrase-protected key` | ``keystore item `key1` is protected by a passphrase, which rurge cannot use; remove the passphrase``（P7） | 与既有 Keystore 报错同样以 "keystore item `名字`" 开头，并说明怎么办 |
+| 4.5 DSA 私钥不支持（russh 标为不安全） | 不开 `dsa` 特性时 DSA 私钥照样能解码（只是签不了名）：解码后按算法只收 Ed25519 / ECDSA / RSA，其余（DSA、要硬件的 `sk-*` 安全密钥）同为 `E0022`（P7） | russh / ssh-key 源码 |
+| 4.2 / V13 `private-key` 的 `E0020` | M1 的 Keystore 引用校验只针对 `client-cert`；`read_ssh` 自己查（条目不存在、条目是 p12）（P9） | `spec/tls.rs` |
+| — | M2b 重载指纹里"引用的 Keystore 条目"只取 TLS 的 `client-cert`；新增 `ProtoSpec::keystore_item`，`ssh` 取 `private-key`（P10） | 否则换了私钥（名字不变）的重载沿用旧出站、仍用旧私钥 |
+| 5.1 会话已断的判断"开通道失败且会话已关闭" | 开通道时除"服务器拒绝"（`ChannelOpenFailure`）以外的错误都当作会话已断（P5） | russh 在会话已关时给的是发送失败一类的错误，分不出更细 |
+| 5.2 告警文本 ``ssh: policy `P` has no server-fingerprint; …``，"每个策略每个进程只告警一次" | 结构化字段 `policy` 加固定消息 `ssh: no server-fingerprint; the server's host key is not verified`；按出站对象计一次：重载时参数没变的策略沿用原出站、不再告警，参数变了而重建的出站再告警一次（P12） | 与 `registry.rs` 里 `policy cannot be built` 的写法一致；按进程记要另设一张全局表 |
+| 5.3 RSA 按 `server-sig-algs` 选 rsa-sha2-256 / 512 | 服务器列了 rsa-sha2-512 用它，否则一律 rsa-sha2-256——服务器只列 `ssh-rsa` 或什么都没说时也是（P3） | russh 的 `best_supported_rsa_hash` 在服务器只列 `ssh-rsa` 时给出 SHA-1 |
+| 5.5 "用 russh 的默认列表（覆盖 … `aes128-gcm@openssh.com`）" | russh 0.63.3 的默认加密列表没有 `aes128-gcm@openssh.com`，补在 `aes256-gcm` 之后；主机密钥算法去掉 `ssh-rsa`；kex 与 MAC 的默认列表本来就没有 SHA-1（P2） | `negotiation.rs` |
+| 5.6 ``ssh: the handshake failed (<阶段>)`` | 只有"没有共同算法"带括号说明；其余握手失败（对端不是 SSH、握手中的 I/O 错误等）都是 `ssh: the handshake failed`；会话已断而重建后仍开不了通道时是 `ssh: the session closed`（P14） | russh 的错误分不出握手的阶段 |
+| §10 SSH 第 2 层"空闲断开（暂停的时钟）" | 空闲断开用真实时钟（`idle-timeout` 取 1 秒、有界等待）；保活只断言 `session_config()` 的取值（P16） | 回环上的真实连接与暂停的时钟不能共存：运行时空闲时自动拨快时钟，russh 自己的计时随之提前到期 |
+| §10 SSH 第 3 层"本机有 `sshd` 时起临时实例" | 只在 Unix 上编译与运行；非 root 的 `sshd` 只让运行它的用户登录，用例用现场生成的 Ed25519 密钥登录（P15） | Windows 上没有可用的 `sshd`；CI 在 Linux / macOS 上跑 |

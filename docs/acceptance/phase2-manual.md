@@ -96,3 +96,17 @@
 - [ ] `POST /v1/policy_groups/select {"group_name":"Smart","policy":"<节点 B>"}`：之后固定走 B，停掉 B 时请求失败、不换成员；`{"policy":""}` 清除后恢复。
 - [ ] 日志（含 `--log-level verbose`）里 `smart` 相关的行只有节点名，没有 URL 与凭据；经 `Smart` 用过的节点停掉后，连续三次失败（会话或测速）时有一条 `smart: the policy counts as failed`，恢复后第一次成功时有一条 `smart: the policy works again`；从没经 `smart` 组用过的策略不记这两行。
 - [ ] 用一份混有尚未实现协议的节点（如 `ss`）、总数超过 12 个的订阅建 `smart` 组（`policy-path=<订阅>`）：请求照常，会话的 `policy` 链里从不出现 `ss` 节点；全部能测的节点都有了结论之后（连不上的节点要连续三次测试失败才算），`GET /v1/requests/recent` 里规则为 `policy test` 的会话大约每 5 分钟一批，不会接连不断。
+
+## M4a　SSH
+
+需要一台自己的 SSH 服务器（OpenSSH `sshd`，允许 TCP 转发），自动化测试（只用回环与假服务端）覆盖不了。
+
+- [ ] 口令登录：`S = ssh, <服务器>, 22, username=<用户>, password=<口令>`，经 `S` 浏览几个网站正常；日志里有一条 `ssh: no server-fingerprint; the server's host key is not verified`（只带 `policy=S`），之后再用多少次都不再出现。
+- [ ] 密钥登录：`ssh-keygen -t ed25519 -N "" -f key` 生成一把不带口令的密钥，`key.pub` 加进服务器的 `authorized_keys`，把 `key` 文件整个 Base64 编码后写进 `[Keystore]`（`key1 = type=openssh-private-key, base64=<…>`），`S = ssh, <服务器>, 22, username=<用户>, private-key=key1`：经 `S` 正常。换成 RSA 密钥（`ssh-keygen -t rsa -b 3072 -N ""`）同样正常，服务器日志（`LogLevel VERBOSE`；`journalctl -u ssh` 或 `/var/log/auth.log`）里记下的签名算法是 `rsa-sha2-512` 或 `rsa-sha2-256`。
+- [ ] 带口令的私钥（`ssh-keygen -t ed25519 -N pw`）：`rurge check` 报 `E0022`，文本是 ``keystore item `key1` is protected by a passphrase, which rurge cannot use; remove the passphrase``，输出里没有私钥内容。
+- [ ] 主机密钥校验：`ssh-keyscan -t ed25519 <服务器>` 的输出去掉开头的主机名，写成 `server-fingerprint="ssh-ed25519 AAAA…"`：连接正常，也没有上面那条告警；换成另一台机器的公钥后 `rurge reload`，经 `S` 的会话失败，请求记录的错误是 `ssh: the server's host key is not one of server-fingerprint`。
+- [ ] 会话复用：同时开几个经 `S` 的下载，服务器上（`ss -tnp | grep sshd` 或 `last`）只看到 rurge 的一次登录、一条连接。
+- [ ] 空闲断开：`idle-timeout=30`，最后一个经 `S` 的连接关掉 30 秒后，服务器上那条连接消失，再访问时重新登录；一个开着但没有流量的连接（如网页上的 WebSocket）不会因为 `idle-timeout` 被断开。
+- [ ] 断线重建：让服务器断开 rurge 的会话（在服务器上结束那次登录对应的 `sshd` 进程，或重启服务器）之后，下一个经 `S` 的连接正常（重新登录）；断网两分钟再恢复之后同样正常（旧会话在 3 次保活无回应后判定已断）。
+- [ ] 口令写错：会话失败，错误是 `ssh: authentication failed`；日志与 `GET /v1/requests/recent` 里没有用户名与口令；同时打开很多网页时，服务器日志（`journalctl -u ssh` 或 `/var/log/auth.log`）里每一批只有一次失败的登录（等着的连接共享这次失败）。
+- [ ] 日志（含 `--log-level verbose`）里搜不到口令与私钥内容。

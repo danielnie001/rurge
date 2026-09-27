@@ -3974,6 +3974,11 @@ git commit -m "docs: M4a SSH——兼容性清单、README、CLAUDE.md、手工�
 
 | 任务 | 计划原文 | 实际做法 | 原因 | 提交 |
 | ---- | -------- | -------- | ---- | ---- |
+| 3 | Step 5 的提交命令 `git add crates/rurge-proto-ssh` | 连同 `Cargo.lock` 一起提交 | 给 `rurge-proto-ssh` 加上 `rustls` 依赖后，cargo 在锁文件里该 crate 的条目下多写一行 `"rustls",`，计划的提交命令漏了它 | ffbafea |
+| 3 | 会话槽的单飞只合并成功的握手（`session()` 里 `establish` 失败时直接返回） | 握手失败时，等在锁上的拨号共享这次失败（同一种错误、同一句固定文本），不各自重新登录；失败之后才来的拨号照常再试；新增 `FakeSsh::attempts()` 与用例 `concurrent_dials_share_one_failed_attempt_and_a_later_dial_retries` | 任务评审：口令写错时，浏览器一次开几十个连接会变成连续几十次失败登录，正好触发服务器的 fail2ban；设计 5.1"同时进来的拨号共用这一次握手"本就包括失败的结果 | d95a6e0 |
+| 4 | 导入块，与 `let session = Arc::new(self.establish(opts).await?);` 那一块 | 改写成适配 Task 3 修正后的代码：导入列表并入 `AtomicU64` 与 `Mutex as StdMutex`；`watch_idle` 在 `session()` 的 `Ok` 分支里、`let session = Arc::new(session);` 之后启动 | Task 3 的修正改掉了这两处锚点 | db81786 |
+| 5 ～ 7 | 各任务门禁的预期数字 | 实际：Task 1 41 个二进制 / 1001 通过；Task 2 43 / 1006；Task 3 43 / 1016（修正前 1015）；Task 4 43 / 1020；Task 5 44 / 1028；Task 6 45 / 1029；Task 7 45 / 1030（均 1 忽略） | Task 3 的修正多了一条用例 | — |
+| 7 | 兼容性清单 `[Keystore]` 行、4.2 节 `ssh` 行与手工验收"口令写错"一项的原文 | 各多一句：解码器也收未加密的 PuTTY / PKCS#1 / PKCS#8 / SEC1 私钥文件；握手失败时等着的连接一起得到这次失败；验收时看服务器日志里每批只有一次失败登录 | Task 2 评审发现解码器按内容识别格式；Task 3 的修正 | 本任务的文档提交 |
 
 ## 延后事项
 

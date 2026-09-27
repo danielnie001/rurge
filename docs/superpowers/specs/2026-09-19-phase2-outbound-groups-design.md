@@ -70,7 +70,7 @@ M1 体量大，细化设计时可按阶段 1 的先例拆成 M1a（配置与抽�
 | 加密原语 | RustCrypto：`aes-gcm` `chacha20poly1305` `hkdf` `hmac` `sha1` `sha2` `md-5` `blake3` | M2 / M6 | — |
 | HTTP/2 | `h2`（extended CONNECT、多路复用、`max-streams`）；CONNECT-UDP（RFC 9298）的 capsule 编码自研 | M6 | — |
 | QUIC / HTTP/3 | `quinn`（自定义 UDP 载体供链式拨号、自定义拥塞控制供 Hysteria 2、datagram 供 TUIC / MASQUE）+ `h3` | M7 | 风险 B：`h3` 的 extended CONNECT 与 HTTP Datagram 的成熟度；`ecn` 的支持程度 |
-| SSH | `russh` 客户端，动态转发用 direct-tcpip 通道；OpenSSH 私钥解析用 `ssh-key` | M4 | 是否覆盖 `curve25519-sha256` + `aes128-gcm`（清单 4.6 的下限） |
+| SSH | `russh` 客户端，动态转发用 direct-tcpip 通道；OpenSSH 私钥解析用 `ssh-key` | M4 | 已验证（M4a）：russh 0.63.3（`ring` 后端）两者都支持，`aes128-gcm@openssh.com` 不在它的默认列表里，由 rurge 显式加上（见 Q5） |
 | WireGuard | `boringtun` 的 sans-IO `Tunn`（Noise 握手与定时器）；`client-id` 在包头保留字节上处理；多 peer 的最长前缀路由复用现有 `prefix-trie` | M4 | 风险 C：boringtun 的维护节奏 |
 | 用户态协议栈 | `smoltcp`，作为 `rurge-proto-wireguard` 的内部模块（见 D9） | M4 | TCP 吞吐基准 |
 | Snell | 协议非公开（PRD R1 / R7）：只依据公开的第三方资料实现 v1 ～ v4 | M6 | 各版本可得的公开资料范围 |
@@ -442,7 +442,7 @@ Surge 手册没有定义这些端点的响应结构（PRD R5）：以收集到�
 | Q2 | Shadow TLS v3 的实现路径 | 已决（2026-09-20，M2-D3）：stock rustls，两遍构造 ClientHello |
 | Q3 | 六个 API 端点的 JSON 形状 | M1 / M3 细化设计时按真实样本定（PRD R5） |
 | Q4 | sing-box 的用户态 WireGuard 端点能否充当带保留字节的对端 | M4 细化设计时验证；不行则用 boringtun 写回环对端 |
-| Q5 | `russh` 的算法覆盖 | M4 细化设计时验证 |
+| Q5 | `russh` 的算法覆盖 | 已决（2026-09-27，M4-D2 与 M4 设计第 17 节）：russh 0.63.3 支持 `curve25519-sha256` 与 `aes128-gcm@openssh.com`；后者不在默认列表里，rurge 显式加上，并去掉 SHA-1 的 `ssh-rsa` 主机密钥签名 |
 | Q6 | MASQUE 与 trust-tunnel 的参考服务端 | M7 细化设计时选定 |
 | Q7 | Snell 各版本可依据的公开资料 | M6 细化设计时确认 |
 
