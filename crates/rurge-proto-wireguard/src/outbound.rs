@@ -2,7 +2,7 @@
 //! first dial and runs while the outbound, or a connection through it,
 //! lives.
 
-use crate::device::Device;
+use crate::device::{Device, REDIAL};
 use crate::dns::{self, Cache, Family};
 use crate::stack::Refusal;
 use rurge_config::HostName;
@@ -12,6 +12,7 @@ use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Resolve, Target};
 use rurge_proto::{Outbound, OutboundError};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -19,9 +20,16 @@ use tokio::sync::Mutex;
 /// How long one `dns-server` has to answer before the next is asked.
 const DNS_WAIT: Duration = Duration::from_secs(2);
 
+/// The generation of the next outbound: a reload builds its outbounds after
+/// the ones they replace.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
 pub struct WireGuardOutbound {
     name: String,
     section: WireGuardSection,
+    /// Later configurations have higher ones: a tunnel they start ends
+    /// this one's, never the other way round.
+    generation: u64,
     /// Destination names, without a `dns-server` (M4-D9).
     resolver: Arc<dyn Resolve>,
     /// What the carriers to the peers come from.
@@ -32,6 +40,8 @@ pub struct WireGuardOutbound {
     cache: StdMutex<Cache>,
     /// `DNS_WAIT` (shorter in the tests).
     dns_wait: Duration,
+    /// `REDIAL` (shorter in the tests).
+    redial: Duration,
 }
 
 impl WireGuardOutbound {
@@ -45,20 +55,43 @@ impl WireGuardOutbound {
         WireGuardOutbound {
             name: name.to_string(),
             section: spec.section.clone(),
+            generation: GENERATION.fetch_add(1, Ordering::Relaxed),
             resolver,
             connector,
             device: Mutex::new(None),
             cache: StdMutex::new(Cache::default()),
             dns_wait: DNS_WAIT,
+            redial: REDIAL,
+        }
+    }
+
+    /// The network changed: a running tunnel dials every carrier anew and
+    /// greets the peers again (M4 design 6.5). Nothing detects it before
+    /// phase 3; one that is starting uses the new network anyway.
+    pub fn network_changed(&self) {
+        if let Ok(slot) = self.device.try_lock()
+            && let Some(device) = slot.as_ref()
+        {
+            device.network_changed();
         }
     }
 
     pub(crate) async fn device(&self, opts: &ConnectOpts) -> Result<Arc<Device>, OutboundError> {
         let mut slot = self.device.lock().await;
-        if let Some(device) = slot.as_ref() {
+        if let Some(device) = slot.as_ref()
+            && !device.is_closed()
+        {
             return Ok(device.clone());
         }
-        let device = Device::start(&self.name, &self.section, &self.connector, opts).await?;
+        let device = Device::start(
+            &self.name,
+            &self.section,
+            self.generation,
+            &self.connector,
+            opts,
+            self.redial,
+        )
+        .await?;
         *slot = Some(device.clone());
         Ok(device)
     }
@@ -211,6 +244,7 @@ mod tests {
     use std::io;
     use std::net::Ipv4Addr;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
@@ -764,5 +798,271 @@ mod tests {
             assert_eq!(e.to_string(), "no such name");
         }
         assert!(wg.device.lock().await.is_none());
+    }
+
+    /// Two policies that name one section: one tunnel, one handshake.
+    #[tokio::test]
+    async fn policies_that_name_one_section_share_its_tunnel() {
+        let (peer, a) = tunnel(PeerOpts::default(), |_| {}).await;
+        let spec = WireGuardSpec {
+            section: a.section.clone(),
+        };
+        let b = WireGuardOutbound::new("Other", &spec, no_names(), direct());
+        for wg in [&a, &b] {
+            let mut stream = wg
+                .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+                .await
+                .expect("a connection");
+            assert_eq!(echo(&mut stream, b"ping").await, b"ping");
+        }
+        assert_eq!(peer.core().handshakes, 1);
+        assert_eq!(peer.clients().len(), 1);
+    }
+
+    /// A reload that edits the section: the new tunnel ends the old one and
+    /// its connections, and the old configuration does not take it back.
+    #[tokio::test]
+    async fn a_later_configuration_of_a_tunnel_takes_over() {
+        let (peer, old) = tunnel(PeerOpts::default(), |_| {}).await;
+        let mut stream = old
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        assert_eq!(echo(&mut stream, b"old").await, b"old");
+        let mut section = old.section.clone();
+        section.mtu = 1400;
+        let new = WireGuardOutbound::new("WG", &WireGuardSpec { section }, no_names(), direct());
+        let mut fresh = new
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection through the new tunnel");
+        assert_eq!(echo(&mut fresh, b"new").await, b"new");
+        assert_eq!(peer.core().handshakes, 2);
+        let mut buf = [0u8; 8];
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf))
+            .await
+            .expect("the old connection ends at once");
+        assert!(read.is_err(), "{read:?}");
+        let e = old
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "wireguard: a newer configuration of this tunnel is in use"
+        );
+        assert_eq!(echo(&mut fresh, b"still").await, b"still");
+    }
+
+    /// One key at two peers is two tunnels, side by side.
+    #[tokio::test]
+    async fn one_key_at_two_peers_is_two_tunnels() {
+        let (private, public) = keypair();
+        let at_peer = |peer: &FakeWgPeer| {
+            let mut s = section(
+                private,
+                Ipv4Addr::new(10, 9, 0, 2),
+                &[(peer.public_key(), &["10.0.0.0/8"])],
+            );
+            s.peers[0].endpoint = endpoint(peer.addr());
+            WireGuardOutbound::new("WG", &WireGuardSpec { section: s }, no_names(), direct())
+        };
+        let first = FakeWgPeer::start(public, PeerOpts::default()).await;
+        let second = FakeWgPeer::start(public, PeerOpts::default()).await;
+        let (a, b) = (at_peer(&first), at_peer(&second));
+        let mut x = a
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        let mut y = b
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        assert_eq!(echo(&mut y, b"y").await, b"y");
+        assert_eq!(echo(&mut x, b"x").await, b"x");
+    }
+
+    /// Waits until `done` holds, 5 seconds at most.
+    async fn until(done: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("in time");
+    }
+
+    /// Names to addresses that a test changes as it goes.
+    #[derive(Default)]
+    struct Table(StdMutex<Vec<(String, IpAddr)>>);
+
+    impl Table {
+        fn set(&self, name: &str, ip: IpAddr) {
+            self.0.lock().unwrap().push((name.to_string(), ip));
+        }
+    }
+
+    impl Resolve for Table {
+        fn resolve<'a>(&'a self, host: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+            let table = self.0.lock().unwrap();
+            let found: Vec<IpAddr> = table
+                .iter()
+                .filter(|(name, _)| name == host)
+                .map(|(_, ip)| *ip)
+                .collect();
+            Box::pin(std::future::ready(if found.is_empty() {
+                Err(io::Error::new(io::ErrorKind::NotFound, "no such name"))
+            } else {
+                Ok(found)
+            }))
+        }
+    }
+
+    /// Dials through `inner` and counts the dials; once `moved` is set, the
+    /// carriers say they go there, as if the endpoint's name had come to
+    /// point elsewhere.
+    struct Moving {
+        inner: Arc<dyn Connector>,
+        moved: Arc<StdMutex<Option<SocketAddr>>>,
+        dials: Arc<AtomicUsize>,
+    }
+
+    struct MovingDatagram {
+        inner: BoxedDatagram,
+        moved: Option<SocketAddr>,
+    }
+
+    impl Connector for Moving {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            self.inner.connect(target, opts)
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            Box::pin(async move {
+                self.dials.fetch_add(1, Ordering::SeqCst);
+                let inner = self.inner.connect_udp(target, opts).await?;
+                let moved = *self.moved.lock().unwrap();
+                Ok(Box::new(MovingDatagram { inner, moved }) as BoxedDatagram)
+            })
+        }
+    }
+
+    impl Datagram for MovingDatagram {
+        fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            self.inner.poll_send(cx, buf)
+        }
+
+        fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            self.inner.poll_recv(cx, buf)
+        }
+
+        fn peer_addr(&self) -> Option<SocketAddr> {
+            self.moved.or_else(|| self.inner.peer_addr())
+        }
+    }
+
+    /// An endpoint written as a name is dialled again every `redial`: the
+    /// same address keeps its carrier; another gets a new one, on which the
+    /// peer is greeted at once.
+    #[tokio::test]
+    async fn an_endpoint_written_as_a_name_is_followed() {
+        let names = Arc::new(Table::default());
+        names.set("wg.test", ip("127.0.0.1"));
+        let (moved, dials) = (Arc::new(StdMutex::new(None)), Arc::new(AtomicUsize::new(0)));
+        let moving: Arc<dyn Connector> = Arc::new(Moving {
+            inner: Arc::new(DirectConnector::new(names)),
+            moved: moved.clone(),
+            dials: dials.clone(),
+        });
+        let (peer, mut wg) = tunnel_with(
+            PeerOpts::default(),
+            |s| s.peers[0].endpoint.host = HostName::parse("wg.test"),
+            no_names(),
+            moving,
+        )
+        .await;
+        wg.redial = Duration::from_millis(100);
+        let mut stream = wg
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        until(|| dials.load(Ordering::SeqCst) >= 3).await;
+        assert_eq!(echo(&mut stream, b"same").await, b"same");
+        assert_eq!(
+            peer.clients().len(),
+            1,
+            "the same address keeps its carrier"
+        );
+
+        *moved.lock().unwrap() = Some("127.0.0.1:1".parse().unwrap());
+        until(|| peer.clients().len() == 2).await;
+        assert_eq!(echo(&mut stream, b"moved").await, b"moved");
+        assert_eq!(peer.core().handshakes, 2, "greeted on the new carrier");
+    }
+
+    /// A network change: every carrier is dialled anew and each peer
+    /// greeted again on its new one; the connections carry on.
+    #[tokio::test]
+    async fn a_network_change_gives_every_peer_a_new_carrier() {
+        let (peer, wg) = tunnel(PeerOpts::default(), |_| {}).await;
+        let mut stream = wg
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        assert_eq!(echo(&mut stream, b"before").await, b"before");
+        wg.network_changed();
+        until(|| peer.clients().len() == 2).await;
+        assert_eq!(echo(&mut stream, b"after").await, b"after");
+        assert_eq!(peer.core().handshakes, 2);
+    }
+
+    /// A peer that cannot be reached when the tunnel starts is dialled
+    /// again every `redial`; the others carry on meanwhile.
+    #[tokio::test]
+    async fn a_peer_unreachable_at_the_start_is_dialled_again() {
+        let (private, public) = keypair();
+        let a = FakeWgPeer::start(public, PeerOpts::default()).await;
+        let b = FakeWgPeer::start(public, PeerOpts::default()).await;
+        let mut section = section(
+            private,
+            Ipv4Addr::new(10, 9, 0, 2),
+            &[
+                (a.public_key(), &["10.1.0.0/16"]),
+                (b.public_key(), &["10.2.0.0/16"]),
+            ],
+        );
+        section.peers[0].endpoint = endpoint(a.addr());
+        section.peers[1].endpoint = PeerEndpoint {
+            host: HostName::parse("b.test"),
+            port: b.addr().port(),
+        };
+        let names = Arc::new(Table::default());
+        let connector: Arc<dyn Connector> = Arc::new(DirectConnector::new(names.clone()));
+        let mut wg =
+            WireGuardOutbound::new("WG", &WireGuardSpec { section }, no_names(), connector);
+        wg.redial = Duration::from_millis(100);
+        let mut stream = wg
+            .connect_tcp(&at("10.1.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("through the peer that can be reached");
+        assert_eq!(echo(&mut stream, b"a").await, b"a");
+
+        names.set("b.test", ip("127.0.0.1"));
+        let mut stream = wg
+            .connect_tcp(&at("10.2.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("through the other, once it can be reached");
+        assert_eq!(echo(&mut stream, b"b").await, b"b");
+        assert_eq!(b.core().accepted, 1);
     }
 }

@@ -19,6 +19,7 @@ pub struct FakeWgPeer {
     public_key: [u8; 32],
     core: Arc<Mutex<PeerCore>>,
     silent: Arc<AtomicBool>,
+    clients: Arc<Mutex<Vec<SocketAddr>>>,
     task: JoinHandle<()>,
 }
 
@@ -36,12 +37,14 @@ impl FakeWgPeer {
         let public_key = core.public_key();
         let core = Arc::new(Mutex::new(core));
         let silent = Arc::new(AtomicBool::new(false));
-        let task = tokio::spawn(serve(socket, core.clone(), silent.clone()));
+        let clients = Arc::new(Mutex::new(Vec::new()));
+        let task = tokio::spawn(serve(socket, core.clone(), silent.clone(), clients.clone()));
         FakeWgPeer {
             addr,
             public_key,
             core,
             silent,
+            clients,
             task,
         }
     }
@@ -60,6 +63,11 @@ impl FakeWgPeer {
         self.core.lock().expect("the peer")
     }
 
+    /// Every address the client's messages came from, in order.
+    pub fn clients(&self) -> Vec<SocketAddr> {
+        self.clients.lock().expect("the clients").clone()
+    }
+
     /// From now on it drops whatever arrives and sends nothing, as a peer
     /// that is down.
     pub fn go_silent(&self, silent: bool) {
@@ -73,7 +81,12 @@ impl Drop for FakeWgPeer {
     }
 }
 
-async fn serve(socket: UdpSocket, core: Arc<Mutex<PeerCore>>, silent: Arc<AtomicBool>) {
+async fn serve(
+    socket: UdpSocket,
+    core: Arc<Mutex<PeerCore>>,
+    silent: Arc<AtomicBool>,
+    clients: Arc<Mutex<Vec<SocketAddr>>>,
+) {
     let mut buf = vec![0u8; 65536];
     let mut client = None;
     let mut timer = tokio::time::interval(TICK);
@@ -97,7 +110,14 @@ async fn serve(socket: UdpSocket, core: Arc<Mutex<PeerCore>>, silent: Arc<Atomic
                 let mut core = core.lock().expect("the peer");
                 let mut arrived = Some((n, from));
                 while let Some((n, from)) = arrived {
-                    client = Some(from);
+                    // it answers where the client last wrote from (roaming)
+                    if client != Some(from) {
+                        client = Some(from);
+                        let mut clients = clients.lock().expect("the clients");
+                        if !clients.contains(&from) {
+                            clients.push(from);
+                        }
+                    }
                     core.receive(&mut buf[..n], &mut out);
                     // what else has arrived goes in before the stack runs
                     arrived = socket.try_recv_from(&mut buf).ok();

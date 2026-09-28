@@ -13,7 +13,8 @@ use std::future::{Future, poll_fn};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::pin;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 use tokio::io::ReadBuf;
@@ -25,11 +26,35 @@ use tokio_util::task::AbortOnDropHandle;
 const TICK: Duration = Duration::from_millis(250);
 /// How many datagrams the carriers may hand in before the stack runs.
 const BATCH: usize = 256;
+/// How often the endpoints written as names, and the peers that could not
+/// be reached, are dialled again (M4 design 6.5).
+pub(crate) const REDIAL: Duration = Duration::from_secs(300);
+
+/// The tunnels of this process and their sections. Two tunnels with one
+/// private key at one peer would take each other's packets — a peer answers
+/// wherever the key last wrote from — so the policies that name a section
+/// share its tunnel, and a tunnel that starts ends the one of an earlier
+/// configuration: its key with a peer in common.
+static TUNNELS: Mutex<Vec<(WireGuardSection, Weak<Device>)>> = Mutex::new(Vec::new());
+/// Tunnels start one at a time.
+static STARTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Whether a tunnel of `a` and one of `b` would take each other's packets.
+fn conflict(a: &WireGuardSection, b: &WireGuardSection) -> bool {
+    a.private_key == b.private_key
+        && a.peers
+            .iter()
+            .any(|p| b.peers.iter().any(|q| q.public_key == p.public_key))
+}
 
 pub(crate) struct Shared {
     pub(crate) stack: Mutex<Stack>,
     /// Wakes the task: a stream read, wrote or closed, a connection opened.
     kick: Notify,
+    /// Set by `Device::network_changed`, taken by the task.
+    network_changed: AtomicBool,
+    /// A tunnel of a later configuration took over.
+    closed: AtomicBool,
 }
 
 impl Shared {
@@ -38,11 +63,13 @@ impl Shared {
     }
 }
 
-/// The tunnel while it runs: as long as the outbound or a connection
+/// The tunnel while it runs: as long as an outbound or a connection
 /// through it holds it.
 pub struct Device {
     pub(crate) shared: Arc<Shared>,
-    _task: AbortOnDropHandle<()>,
+    task: AbortOnDropHandle<()>,
+    /// The `WireGuardOutbound::generation` that started it.
+    generation: u64,
 }
 
 struct Carrier {
@@ -62,19 +89,45 @@ fn unreachable(e: io::Error) -> OutboundError {
 }
 
 impl Device {
-    /// A carrier to every peer, then the task and a handshake with each
-    /// peer. Fails only when no peer can be reached at all: one that cannot
-    /// is left without a carrier.
+    /// The tunnel of `section`: the one running, when a policy naming the
+    /// section started it; else a carrier to every peer, then the task and a
+    /// handshake with each peer. Fails when no peer can be reached at all —
+    /// one that cannot is dialled again every `redial` — and when a tunnel
+    /// of a later configuration (`generation`) has taken over.
     pub(crate) async fn start(
         policy: &str,
         section: &WireGuardSection,
+        generation: u64,
         connector: &Arc<dyn Connector>,
         opts: &ConnectOpts,
+        redial: Duration,
     ) -> Result<Arc<Device>, OutboundError> {
+        let _one_at_a_time = STARTING.lock().await;
+        {
+            let mut tunnels = TUNNELS.lock().expect("the tunnels");
+            tunnels.retain(|(_, device)| device.upgrade().is_some_and(|d| !d.is_closed()));
+            for (other, device) in tunnels.iter() {
+                let Some(device) = device.upgrade() else {
+                    continue;
+                };
+                if other == section {
+                    return Ok(device);
+                }
+                if conflict(other, section) && device.generation > generation {
+                    return Err(OutboundError::Proxy(
+                        "wireguard: a newer configuration of this tunnel is in use".to_string(),
+                    ));
+                }
+            }
+        }
+        let endpoints: Vec<Target> = section
+            .peers
+            .iter()
+            .map(|p| Target::new(p.endpoint.host.clone(), p.endpoint.port))
+            .collect();
         let mut dials = JoinSet::new();
-        for (i, peer) in section.peers.iter().enumerate() {
-            let endpoint = Target::new(peer.endpoint.host.clone(), peer.endpoint.port);
-            let (connector, opts) = (connector.clone(), opts.clone());
+        for (i, endpoint) in endpoints.iter().enumerate() {
+            let (connector, endpoint, opts) = (connector.clone(), endpoint.clone(), opts.clone());
             dials.spawn(async move { (i, connector.connect_udp(&endpoint, &opts).await) });
         }
         let mut carriers: Vec<Option<Carrier>> = section.peers.iter().map(|_| None).collect();
@@ -101,17 +154,68 @@ impl Device {
                 io::Error::other("wireguard: the tunnel has no peer")
             })));
         }
+        // the tunnel it replaces goes quiet before a peer hears of this one
+        TUNNELS
+            .lock()
+            .expect("the tunnels")
+            .retain(|(other, device)| {
+                let replaced = conflict(other, section);
+                if replaced && let Some(device) = device.upgrade() {
+                    device.close();
+                }
+                !replaced
+            });
         let shared = Arc::new(Shared {
             stack: Mutex::new(Stack::new(section)),
             kick: Notify::new(),
+            network_changed: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
         });
         let mut out = Vec::new();
         shared.stack.lock().expect("the tunnel").initiate(&mut out);
-        let task = tokio::spawn(run(shared.clone(), carriers, out));
-        Ok(Arc::new(Device {
+        let peers = carriers.len();
+        let driver = Driver {
+            shared: shared.clone(),
+            policy: policy.to_string(),
+            carriers,
+            endpoints,
+            connector: connector.clone(),
+            redial,
+            waiting: vec![false; peers],
+            up: vec![false; peers],
+        };
+        let task = tokio::spawn(driver.run(out));
+        let device = Arc::new(Device {
             shared,
-            _task: AbortOnDropHandle::new(task),
-        }))
+            task: AbortOnDropHandle::new(task),
+            generation,
+        });
+        TUNNELS
+            .lock()
+            .expect("the tunnels")
+            .push((section.clone(), Arc::downgrade(&device)));
+        Ok(device)
+    }
+
+    /// A tunnel of a later configuration took over: nothing more goes out,
+    /// and every connection through this one fails.
+    fn close(&self) {
+        self.shared.closed.store(true, Ordering::SeqCst);
+        self.task.abort();
+        if let Ok(mut stack) = self.shared.stack.lock() {
+            stack.abort_all();
+        }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::SeqCst)
+    }
+
+    /// The network changed: every carrier is dialled anew and each peer
+    /// greeted again on its new one (M4 design 6.5).
+    pub(crate) fn network_changed(&self) {
+        self.shared.network_changed.store(true, Ordering::SeqCst);
+        self.shared.kick();
     }
 
     /// A TCP connection to `to` through the tunnel, once it is established.
@@ -227,11 +331,7 @@ fn ready(
     }
 }
 
-async fn send(carriers: &mut [Option<Carrier>], message: Outgoing) {
-    let Some(Some(carrier)) = carriers.get_mut(message.peer) else {
-        // a peer without a carrier: nothing reaches it
-        return;
-    };
+async fn send(carrier: &mut Carrier, message: &Outgoing) {
     let marked =
         carrier.marks && wire::message_type(&message.datagram) == Some(wire::HANDSHAKE_INITIATION);
     if marked && carrier.datagram.set_tos(wire::HANDSHAKE_TOS).is_err() {
@@ -246,52 +346,166 @@ async fn send(carriers: &mut [Option<Carrier>], message: Outgoing) {
     }
 }
 
-async fn run(shared: Arc<Shared>, mut carriers: Vec<Option<Carrier>>, mut out: Vec<Outgoing>) {
-    let mut buf = vec![0u8; 65536];
-    let mut next_tick = Instant::now() + TICK;
-    let mut first = 0;
-    loop {
-        let deadline = {
-            let mut stack = shared.stack.lock().expect("the tunnel");
-            let now = Instant::now();
-            if now >= next_tick {
-                stack.tick(&mut out);
-                next_tick = now + TICK;
-            }
-            let wait = stack.advance(now, &mut out);
-            wait.map_or(next_tick, |wait| (now + wait).min(next_tick))
-        };
-        for message in out.drain(..) {
-            send(&mut carriers, message).await;
+/// A dial of `peer`'s carrier: whether it replaces the one there in any
+/// case, and what came of it.
+type Dialled = (usize, bool, io::Result<BoxedDatagram>);
+
+/// What the task holds besides the stack.
+struct Driver {
+    shared: Arc<Shared>,
+    policy: String,
+    carriers: Vec<Option<Carrier>>,
+    endpoints: Vec<Target>,
+    connector: Arc<dyn Connector>,
+    redial: Duration,
+    /// A handshake initiation went to the peer and nothing answered yet.
+    waiting: Vec<bool>,
+    /// A handshake with the peer completed, and it has not failed to answer
+    /// one since.
+    up: Vec<bool>,
+}
+
+impl Driver {
+    /// Dials the carriers of `peers` side by side; `anew`: the new carriers
+    /// replace the old whatever they go to.
+    fn dial(&self, dials: &mut JoinSet<Dialled>, peers: Vec<usize>, anew: bool) {
+        for peer in peers {
+            let (connector, endpoint) = (self.connector.clone(), self.endpoints[peer].clone());
+            dials.spawn(async move {
+                let opts = ConnectOpts::default();
+                (peer, anew, connector.connect_udp(&endpoint, &opts).await)
+            });
         }
-        tokio::select! {
-            _ = shared.kick.notified() => {}
-            (peer, received) = recv_any(&carriers, &mut buf, &mut first) => {
-                let mut arrived = Some((peer, received));
-                let mut taken = 0;
-                while let Some((peer, received)) = arrived {
-                    match received {
-                        // the lock is for the stack alone: the carriers are
-                        // read outside it
-                        Ok(n) => shared.stack.lock().expect("the tunnel").receive(
-                            peer,
-                            &mut buf[..n],
-                            Instant::now(),
-                            &mut out,
-                        ),
-                        // an ICMP error the system reports on a connected socket
-                        Err(e) => tracing::trace!(peer, error = %e, "wireguard: a carrier failed to receive"),
-                    }
-                    taken += 1;
-                    // what else has arrived goes in before the stack runs
-                    arrived = if taken < BATCH {
-                        ready(&carriers, &mut buf, &mut first)
-                    } else {
-                        None
-                    };
-                }
+    }
+
+    /// A dialled carrier of `peer` takes the place of the one there when
+    /// there is none, when it goes to another address, or when `anew`
+    /// says so; the peer is greeted on it at once.
+    fn land(
+        &mut self,
+        peer: usize,
+        anew: bool,
+        dialled: io::Result<BoxedDatagram>,
+        out: &mut Vec<Outgoing>,
+    ) {
+        let datagram = match dialled {
+            Ok(datagram) => datagram,
+            Err(e) => {
+                tracing::debug!(policy = %self.policy, peer = peer + 1, error = %e, "wireguard: the peer cannot be reached");
+                return;
             }
-            _ = tokio::time::sleep_until(deadline.into()) => {}
+        };
+        if let Some(carrier) = &self.carriers[peer]
+            && !anew
+        {
+            if carrier.datagram.peer_addr() == datagram.peer_addr() {
+                return;
+            }
+            tracing::info!(policy = %self.policy, peer = peer + 1, "wireguard: the peer's endpoint moved");
+        }
+        self.carriers[peer] = Some(Carrier {
+            datagram,
+            marks: true,
+        });
+        self.shared
+            .stack
+            .lock()
+            .expect("the tunnel")
+            .initiate_peer(peer, out);
+    }
+
+    /// What goes out now, to the peers that have a carrier.
+    async fn send_all(&mut self, out: &mut Vec<Outgoing>) {
+        for message in out.drain(..) {
+            let Some(Some(carrier)) = self.carriers.get_mut(message.peer) else {
+                continue;
+            };
+            if wire::message_type(&message.datagram) == Some(wire::HANDSHAKE_INITIATION) {
+                self.waiting[message.peer] = true;
+            }
+            send(carrier, &message).await;
+        }
+    }
+
+    async fn run(mut self, mut out: Vec<Outgoing>) {
+        let mut buf = vec![0u8; 65536];
+        let mut next_tick = Instant::now() + TICK;
+        let mut next_redial = Instant::now() + self.redial;
+        let mut first = 0;
+        let mut dials = JoinSet::new();
+        loop {
+            let now = Instant::now();
+            if self.shared.network_changed.swap(false, Ordering::SeqCst) {
+                dials.abort_all();
+                self.dial(&mut dials, (0..self.endpoints.len()).collect(), true);
+                next_redial = now + self.redial;
+            } else if now >= next_redial {
+                let due = (0..self.endpoints.len())
+                    .filter(|&p| {
+                        self.carriers[p].is_none() || self.endpoints[p].host.as_domain().is_some()
+                    })
+                    .collect();
+                self.dial(&mut dials, due, false);
+                next_redial = now + self.redial;
+            }
+            let deadline = {
+                let mut stack = self.shared.stack.lock().expect("the tunnel");
+                if now >= next_tick {
+                    for peer in stack.tick(&mut out) {
+                        // once for each handshake that went unanswered
+                        if std::mem::take(&mut self.waiting[peer]) {
+                            self.up[peer] = false;
+                            tracing::warn!(policy = %self.policy, peer = peer + 1, "wireguard: the peer did not answer the handshake");
+                        }
+                    }
+                    next_tick = now + TICK;
+                }
+                let wait = stack.advance(now, &mut out);
+                let next = next_tick.min(next_redial);
+                wait.map_or(next, |wait| (now + wait).min(next))
+            };
+            self.send_all(&mut out).await;
+            tokio::select! {
+                _ = self.shared.kick.notified() => {}
+                (peer, received) = recv_any(&self.carriers, &mut buf, &mut first) => {
+                    let mut completed = Vec::new();
+                    let mut arrived = Some((peer, received));
+                    let mut taken = 0;
+                    while let Some((peer, received)) = arrived {
+                        match received {
+                            // the lock is for the stack alone: the carriers
+                            // are read outside it
+                            Ok(n) => {
+                                let mut stack = self.shared.stack.lock().expect("the tunnel");
+                                if stack.receive(peer, &mut buf[..n], Instant::now(), &mut out) {
+                                    completed.push(peer);
+                                }
+                            }
+                            // an ICMP error the system reports on a connected socket
+                            Err(e) => tracing::trace!(peer, error = %e, "wireguard: a carrier failed to receive"),
+                        }
+                        taken += 1;
+                        // what else has arrived goes in before the stack runs
+                        arrived = if taken < BATCH {
+                            ready(&self.carriers, &mut buf, &mut first)
+                        } else {
+                            None
+                        };
+                    }
+                    for peer in completed {
+                        self.waiting[peer] = false;
+                        if !std::mem::replace(&mut self.up[peer], true) {
+                            tracing::info!(policy = %self.policy, peer = peer + 1, "wireguard: handshake completed");
+                        }
+                    }
+                }
+                Some(joined) = dials.join_next(), if !dials.is_empty() => {
+                    if let Ok((peer, anew, dialled)) = joined {
+                        self.land(peer, anew, dialled, &mut out);
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline.into()) => {}
+            }
         }
     }
 }

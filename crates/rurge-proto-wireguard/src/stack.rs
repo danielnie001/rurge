@@ -168,28 +168,38 @@ impl Stack {
     }
 
     /// A handshake with every peer, whatever the state of its session: the
-    /// tunnel starts, a test asks, the network changed.
+    /// tunnel starts, a test asks.
     pub fn initiate(&mut self, out: &mut Vec<Outgoing>) {
-        for (i, peer) in self.peers.iter_mut().enumerate() {
-            if let TunnResult::WriteToNetwork(message) = peer
-                .tunnel
-                .format_handshake_initiation(&mut self.scratch, true)
-            {
-                out.push(outgoing(i, message, peer.client_id));
-            }
+        for peer in 0..self.peers.len() {
+            self.initiate_peer(peer, out);
+        }
+    }
+
+    /// A handshake with `peer`, whatever the state of its session: it has a
+    /// new carrier.
+    pub fn initiate_peer(&mut self, peer: usize, out: &mut Vec<Outgoing>) {
+        let Some(p) = self.peers.get_mut(peer) else {
+            return;
+        };
+        if let TunnResult::WriteToNetwork(message) = p
+            .tunnel
+            .format_handshake_initiation(&mut self.scratch, true)
+        {
+            out.push(outgoing(peer, message, p.client_id));
         }
     }
 
     /// What the carrier of `peer` received; the answers it needs go to `out`.
+    /// Whether it completed a handshake rurge started.
     pub fn receive(
         &mut self,
         peer: usize,
         datagram: &mut [u8],
         now: Instant,
         out: &mut Vec<Outgoing>,
-    ) {
+    ) -> bool {
         let Some(p) = self.peers.get_mut(peer) else {
-            return;
+            return false;
         };
         wire::unmark(datagram);
         let response = wire::message_type(datagram) == Some(wire::HANDSHAKE_RESPONSE);
@@ -205,14 +215,14 @@ impl Stack {
                 {
                     out.push(outgoing(peer, message, p.client_id));
                 }
-                return;
+                return response;
             }
             TunnResult::WriteToTunnelV4(packet, src) => (IpAddr::V4(src), packet.to_vec()),
             TunnResult::WriteToTunnelV6(packet, src) => (IpAddr::V6(src), packet.to_vec()),
-            TunnResult::Done => return,
+            TunnResult::Done => return false,
             TunnResult::Err(e) => {
                 tracing::trace!(peer, error = ?e, "wireguard: a message was dropped");
-                return;
+                return false;
             }
         };
         // a peer may send only from what routes to it (cryptokey routing)
@@ -221,6 +231,7 @@ impl Stack {
         } else {
             tracing::trace!(peer, %src, "wireguard: a packet from outside the peer's allowed-ips was dropped");
         }
+        false
     }
 
     /// Runs the IP stack at `now`: what the peers sent reaches the sockets,
@@ -259,19 +270,22 @@ impl Stack {
     }
 
     /// WireGuard's timers (retries, keepalives, expiry); every quarter of a
-    /// second or so.
-    pub fn tick(&mut self, out: &mut Vec<Outgoing>) {
+    /// second or so. The peers whose session has run out, or whose
+    /// handshake went unanswered for 90 seconds: the next packet to one
+    /// starts another.
+    pub fn tick(&mut self, out: &mut Vec<Outgoing>) -> Vec<usize> {
+        let mut expired = Vec::new();
         for (i, p) in self.peers.iter_mut().enumerate() {
             match p.tunnel.update_timers(&mut self.scratch) {
                 TunnResult::WriteToNetwork(message) => out.push(outgoing(i, message, p.client_id)),
-                // an idle session ran out: the next packet starts another
-                TunnResult::Err(WireGuardError::ConnectionExpired) => {}
+                TunnResult::Err(WireGuardError::ConnectionExpired) => expired.push(i),
                 TunnResult::Err(e) => {
                     tracing::trace!(peer = i, error = ?e, "wireguard: a timer failed");
                 }
                 _ => {}
             }
         }
+        expired
     }
 
     /// The tunnel's address of `to`'s family, when some peer takes `to`.
@@ -367,6 +381,16 @@ impl Stack {
             socket.close();
         }
         self.released.push((handle, now));
+    }
+
+    /// Resets every TCP connection at once, without a word to the far end:
+    /// the tunnel is ending. Whoever waits on one is woken.
+    pub fn abort_all(&mut self) {
+        for (_, socket) in self.sockets.iter_mut() {
+            if let Some(tcp) = tcp::Socket::downcast_mut(socket) {
+                tcp.abort();
+            }
+        }
     }
 
     fn reap(&mut self, now: Instant) {
@@ -476,6 +500,8 @@ mod tests {
         peers: Vec<PeerCore>,
         /// How many times the last `run` went round.
         rounds: usize,
+        /// Handshakes the client saw complete.
+        completed: usize,
     }
 
     impl Net {
@@ -499,6 +525,7 @@ mod tests {
                 client: Stack::new(&section),
                 peers: cores,
                 rounds: 0,
+                completed: 0,
             };
             let mut out = Vec::new();
             net.client.initiate(&mut out);
@@ -531,7 +558,9 @@ mod tests {
                     return;
                 }
                 for (peer, mut datagram) in to_client {
-                    self.client.receive(peer, &mut datagram, now, &mut to_peers);
+                    if self.client.receive(peer, &mut datagram, now, &mut to_peers) {
+                        self.completed += 1;
+                    }
                 }
             }
             panic!("the tunnel never went quiet");
@@ -562,9 +591,11 @@ mod tests {
     fn a_connection_through_the_tunnel_echoes() {
         let mut net = one_peer(PeerOpts::default());
         assert_eq!(net.peers[0].handshakes, 1);
+        assert_eq!(net.completed, 1);
         let handle = net.connect("10.0.0.1:7");
         assert_eq!(net.echo(handle, b"ping"), b"ping");
         assert!(net.client.peers[0].handshake.is_some());
+        assert_eq!(net.completed, 1, "data completes no handshake");
     }
 
     /// A poll sends one segment of each connection: an advance sends all a
