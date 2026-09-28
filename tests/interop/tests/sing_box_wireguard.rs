@@ -29,16 +29,20 @@ async fn a_connection_goes_through_a_sing_box_wireguard_endpoint() {
         },
     );
     let echo = echo_server().await;
+    // sing-box maps its own tunnel address to its loopback, where the echo
+    // listens; a loopback destination arriving through the tunnel may be
+    // dropped by its netstack
+    let through = SocketAddr::from(([10, 9, 0, 1], echo.port()));
     let profile = format!(
         "[Proxy]\nWG = wireguard, section-name=sb\n[Rule]\nFINAL,DIRECT\n\
 [WireGuard sb]\nprivate-key = {}\nself-ip = 10.9.0.2\n\
-peer = (public-key = {}, allowed-ips = 127.0.0.1/32, endpoint = 127.0.0.1:{port}, client-id = 1/2/3)\n",
+peer = (public-key = {}, allowed-ips = 10.9.0.1/32, endpoint = 127.0.0.1:{port}, client-id = 1/2/3)\n",
         hex(&ours),
         hex(&their_public)
     );
     let out = outbound(&profile, "WG", None);
-    roundtrip(&out, echo).await;
-    roundtrip_big(&out, echo).await;
+    roundtrip(&out, through).await;
+    roundtrip_big(&out, through).await;
     let test = out.native_test().expect("a wireguard policy tests itself");
     tokio::time::timeout(Duration::from_secs(10), test)
         .await
