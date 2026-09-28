@@ -341,6 +341,11 @@ pub fn parse_section(section: &Section, diags: &mut Diagnostics) -> Option<WireG
                 None => report.error(span, "`private-key` is not a 32-byte key in Base64 or hex"),
             },
             "self-ip" => match value.parse::<Ipv4Addr>() {
+                Ok(ip) if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() => report
+                    .error(
+                        span,
+                        format!("invalid `self-ip` `{value}` (expected a unicast IPv4 address)"),
+                    ),
                 Ok(ip) => self_ip = Some(ip),
                 Err(_) => report.error(
                     span,
@@ -348,6 +353,10 @@ pub fn parse_section(section: &Section, diags: &mut Diagnostics) -> Option<WireG
                 ),
             },
             "self-ip-v6" => match value.parse::<Ipv6Addr>() {
+                Ok(ip) if ip.is_unspecified() || ip.is_multicast() => report.error(
+                    span,
+                    format!("invalid `self-ip-v6` `{value}` (expected a unicast IPv6 address)"),
+                ),
                 Ok(ip) => self_ip_v6 = Some(ip),
                 Err(_) => report.error(
                     span,
@@ -642,6 +651,41 @@ peer = public-key = {PUBLIC}\n"
                 "[WireGuard v]: peer 2: expected `(public-key = …, allowed-ips = …, endpoint = …)`",
             ]
         );
+    }
+
+    #[test]
+    fn self_ips_are_unicast_addresses() {
+        for (line, message) in [
+            (
+                "self-ip = 224.0.0.1",
+                "invalid `self-ip` `224.0.0.1` (expected a unicast IPv4 address)",
+            ),
+            (
+                "self-ip = 255.255.255.255",
+                "invalid `self-ip` `255.255.255.255` (expected a unicast IPv4 address)",
+            ),
+            (
+                "self-ip = 0.0.0.0",
+                "invalid `self-ip` `0.0.0.0` (expected a unicast IPv4 address)",
+            ),
+            (
+                "self-ip-v6 = ff02::1",
+                "invalid `self-ip-v6` `ff02::1` (expected a unicast IPv6 address)",
+            ),
+            (
+                "self-ip-v6 = ::",
+                "invalid `self-ip-v6` `::` (expected a unicast IPv6 address)",
+            ),
+        ] {
+            assert_eq!(
+                errors(&format!(
+                    "[WireGuard s]\nprivate-key = {PRIVATE}\n{line}\n\
+peer = (public-key = {PUBLIC}, allowed-ips = 10.0.0.0/24, endpoint = 192.0.2.1:51820)\n"
+                )),
+                [format!("[WireGuard s]: {message}")],
+                "{line}"
+            );
+        }
     }
 
     /// A key that does not decode is named, never quoted; nor does a
