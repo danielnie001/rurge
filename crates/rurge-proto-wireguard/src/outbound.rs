@@ -1109,6 +1109,96 @@ mod tests {
         assert_eq!(peer.core().handshakes, 2);
     }
 
+    /// Dials through `inner` and counts the dials; once `broken` is set,
+    /// the first carrier fails every send, as a socket whose network went
+    /// away, while the carriers dialled after it work.
+    struct Breaking {
+        inner: Arc<dyn Connector>,
+        broken: Arc<AtomicBool>,
+        dials: Arc<AtomicUsize>,
+    }
+
+    struct BreakingDatagram {
+        inner: BoxedDatagram,
+        /// The switch, on the first carrier only.
+        broken: Option<Arc<AtomicBool>>,
+    }
+
+    impl Connector for Breaking {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            self.inner.connect(target, opts)
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            Box::pin(async move {
+                let first = self.dials.fetch_add(1, Ordering::SeqCst) == 0;
+                let inner = self.inner.connect_udp(target, opts).await?;
+                let broken = first.then(|| self.broken.clone());
+                Ok(Box::new(BreakingDatagram { inner, broken }) as BoxedDatagram)
+            })
+        }
+    }
+
+    impl Datagram for BreakingDatagram {
+        fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            if self
+                .broken
+                .as_ref()
+                .is_some_and(|b| b.load(Ordering::SeqCst))
+            {
+                return Poll::Ready(Err(io::ErrorKind::NetworkUnreachable.into()));
+            }
+            self.inner.poll_send(cx, buf)
+        }
+
+        fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            self.inner.poll_recv(cx, buf)
+        }
+
+        fn peer_addr(&self) -> Option<SocketAddr> {
+            self.inner.peer_addr()
+        }
+    }
+
+    /// A carrier that can no longer send (the network changed under it) is
+    /// replaced by a new one, even to the same address, and the peer is
+    /// greeted on it at once: the next connection goes through.
+    #[tokio::test]
+    async fn a_carrier_that_fails_to_send_is_replaced() {
+        let (broken, dials) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let breaking: Arc<dyn Connector> = Arc::new(Breaking {
+            inner: direct(),
+            broken: broken.clone(),
+            dials: dials.clone(),
+        });
+        let (peer, wg) = tunnel_with(PeerOpts::default(), |_| {}, no_names(), breaking).await;
+        let mut stream = wg
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        assert_eq!(echo(&mut stream, b"before").await, b"before");
+
+        broken.store(true, Ordering::SeqCst);
+        let mut fresh = wg
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection over a new carrier");
+        assert_eq!(echo(&mut fresh, b"after").await, b"after");
+        assert_eq!(dials.load(Ordering::SeqCst), 2, "a second carrier");
+        assert_eq!(peer.core().handshakes, 2, "the peer was greeted on it");
+    }
+
     /// A peer that cannot be reached when the tunnel starts is dialled
     /// again every `redial`; the others carry on meanwhile.
     #[tokio::test]

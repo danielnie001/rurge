@@ -29,6 +29,9 @@ const BATCH: usize = 256;
 /// How often the endpoints written as names, and the peers that could not
 /// be reached, are dialled again (M4 design 6.5).
 pub(crate) const REDIAL: Duration = Duration::from_secs(300);
+/// How often at most a peer's carrier is replaced because sending on it
+/// failed.
+const REPLACE: Duration = Duration::from_secs(10);
 
 /// The tunnels of this process, their sections and carrier keys. Two
 /// tunnels with one private key at one peer would take each other's
@@ -212,6 +215,7 @@ impl Device {
             redial,
             waiting: vec![false; peers],
             up: vec![false; peers],
+            replaced: vec![None; peers],
         };
         let task = tokio::spawn(driver.run(out));
         let device = Arc::new(Device {
@@ -383,19 +387,22 @@ fn ready(
     }
 }
 
-async fn send(carrier: &mut Carrier, message: &Outgoing) {
+/// Sends `message` on `carrier`: whether it went out.
+async fn send(carrier: &mut Carrier, message: &Outgoing) -> bool {
     let marked =
         carrier.marks && wire::message_type(&message.datagram) == Some(wire::HANDSHAKE_INITIATION);
     if marked && carrier.datagram.set_tos(wire::HANDSHAKE_TOS).is_err() {
         carrier.marks = false;
     }
     let datagram = &carrier.datagram;
-    if let Err(e) = poll_fn(|cx| datagram.poll_send(cx, &message.datagram)).await {
+    let sent = poll_fn(|cx| datagram.poll_send(cx, &message.datagram)).await;
+    if let Err(e) = &sent {
         tracing::trace!(peer = message.peer, error = %e, "wireguard: a message was not sent");
     }
     if marked && carrier.marks {
         let _ = carrier.datagram.set_tos(0);
     }
+    sent.is_ok()
 }
 
 /// A dial of `peer`'s carrier: whether it replaces the one there in any
@@ -415,6 +422,8 @@ struct Driver {
     /// A handshake with the peer completed, and it has not failed to answer
     /// one since.
     up: Vec<bool>,
+    /// When a failed send last had the peer's carrier replaced.
+    replaced: Vec<Option<Instant>>,
 }
 
 impl Driver {
@@ -428,6 +437,21 @@ impl Driver {
                 (peer, anew, connector.connect_udp(&endpoint, &opts).await)
             });
         }
+    }
+
+    /// The carriers of `peers` failed to send: the network may have changed
+    /// under them. Each is dialled anew, unless a failed send had it
+    /// replaced less than `REPLACE` ago.
+    fn replace_failed(&mut self, dials: &mut JoinSet<Dialled>, peers: Vec<usize>) {
+        let now = Instant::now();
+        let due: Vec<usize> = peers
+            .into_iter()
+            .filter(|&peer| self.replaced[peer].is_none_or(|at| now.duration_since(at) >= REPLACE))
+            .collect();
+        for &peer in &due {
+            self.replaced[peer] = Some(now);
+        }
+        self.dial(dials, due, true);
     }
 
     /// A dialled carrier of `peer` takes the place of the one there when
@@ -466,14 +490,16 @@ impl Driver {
             .initiate_peer(peer, out);
     }
 
-    /// What goes out now, to the peers that have a carrier. Nothing more
-    /// goes out once a newer tunnel has taken over: what is left in `out`
-    /// is dropped (P10 / B).
-    async fn send_all(&mut self, out: &mut Vec<Outgoing>) {
+    /// What goes out now, to the peers that have a carrier; the peers whose
+    /// carrier failed to send some of it. Nothing more goes out once a
+    /// newer tunnel has taken over: what is left in `out` is dropped (P10 /
+    /// B).
+    async fn send_all(&mut self, out: &mut Vec<Outgoing>) -> Vec<usize> {
+        let mut failed = Vec::new();
         for message in std::mem::take(out) {
             if self.shared.closed.load(Ordering::SeqCst) {
                 out.clear();
-                return;
+                return Vec::new();
             }
             let Some(Some(carrier)) = self.carriers.get_mut(message.peer) else {
                 continue;
@@ -481,8 +507,11 @@ impl Driver {
             if wire::message_type(&message.datagram) == Some(wire::HANDSHAKE_INITIATION) {
                 self.waiting[message.peer] = true;
             }
-            send(carrier, &message).await;
+            if !send(carrier, &message).await && !failed.contains(&message.peer) {
+                failed.push(message.peer);
+            }
         }
+        failed
     }
 
     async fn run(mut self, mut out: Vec<Outgoing>) {
@@ -517,23 +546,32 @@ impl Driver {
                     .expect("the tunnel")
                     .initiate(&mut out);
             }
-            let deadline = {
+            let (deadline, unanswered) = {
                 let mut stack = self.shared.stack.lock().expect("the tunnel");
+                let mut unanswered = Vec::new();
                 if now >= next_tick {
                     for peer in stack.tick(&mut out) {
                         // once for each handshake that went unanswered
                         if std::mem::take(&mut self.waiting[peer]) {
                             self.up[peer] = false;
-                            tracing::warn!(policy = %self.policy, peer = peer + 1, "wireguard: the peer did not answer the handshake");
+                            unanswered.push(peer);
                         }
                     }
                     next_tick = now + TICK;
                 }
                 let wait = stack.advance(now, &mut out);
                 let next = next_tick.min(next_redial);
-                wait.map_or(next, |wait| (now + wait).min(next))
+                (wait.map_or(next, |wait| (now + wait).min(next)), unanswered)
             };
-            self.send_all(&mut out).await;
+            // logged, and dialled for, with the lock released
+            for &peer in &unanswered {
+                tracing::warn!(policy = %self.policy, peer = peer + 1, "wireguard: the peer did not answer the handshake");
+            }
+            // its carrier may be what stopped working (the network changed):
+            // a new one, whatever it goes to, and a handshake on it
+            self.dial(&mut dials, unanswered, true);
+            let failed = self.send_all(&mut out).await;
+            self.replace_failed(&mut dials, failed);
             tokio::select! {
                 _ = self.shared.kick.notified() => {}
                 (peer, received) = recv_any(&self.carriers, &mut buf, &mut first) => {
