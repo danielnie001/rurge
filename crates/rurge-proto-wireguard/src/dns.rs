@@ -82,6 +82,19 @@ pub(crate) fn answer(
     )
 }
 
+/// What one server's answers to the families asked of it come to, each
+/// `None` when it went unanswered: every address they hold, once some
+/// family found addresses or every family answered — an empty answer then
+/// ends the search. `None` while a family went unanswered and the others
+/// found nothing: the server has not answered, and the next is asked.
+pub(crate) fn answered(families: Vec<Option<Vec<(IpAddr, u32)>>>) -> Option<Vec<(IpAddr, u32)>> {
+    let found = families.iter().flatten().any(|addrs| !addrs.is_empty());
+    if !found && families.iter().any(Option::is_none) {
+        return None;
+    }
+    Some(families.into_iter().flatten().flatten().collect())
+}
+
 /// Answers by name until their TTL runs out; only answers with addresses.
 #[derive(Default)]
 pub(crate) struct Cache {
@@ -163,6 +176,37 @@ mod tests {
             None,
             "no IDN before M8"
         );
+    }
+
+    /// A server has answered once a family asked of it found addresses, or
+    /// every family asked answered, empty or not. A family that went
+    /// unanswered while the others found nothing leaves it unanswered: the
+    /// next server is asked.
+    #[test]
+    fn a_server_has_answered_once_a_family_found_addresses_or_every_family_answered() {
+        let a = vec![(ip("10.0.0.1"), 60)];
+        let aaaa = vec![(ip("fd00::1"), 30)];
+        let none = Vec::new;
+        // one family asked
+        assert_eq!(answered(vec![Some(a.clone())]), Some(a.clone()));
+        assert_eq!(answered(vec![Some(none())]), Some(none()), "no such name");
+        assert_eq!(answered(vec![None]), None);
+        // both
+        assert_eq!(
+            answered(vec![Some(a.clone()), Some(aaaa.clone())]),
+            Some([a.clone(), aaaa.clone()].concat())
+        );
+        assert_eq!(answered(vec![Some(a.clone()), None]), Some(a.clone()));
+        assert_eq!(answered(vec![None, Some(aaaa.clone())]), Some(aaaa));
+        assert_eq!(answered(vec![Some(a.clone()), Some(none())]), Some(a));
+        assert_eq!(
+            answered(vec![Some(none()), Some(none())]),
+            Some(none()),
+            "no such name"
+        );
+        assert_eq!(answered(vec![Some(none()), None]), None, "AAAA was lost");
+        assert_eq!(answered(vec![None, Some(none())]), None, "A was lost");
+        assert_eq!(answered(vec![None, None]), None);
     }
 
     #[test]

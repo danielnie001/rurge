@@ -32,6 +32,9 @@ pub(crate) const REDIAL: Duration = Duration::from_secs(300);
 /// How often at most a peer's carrier is replaced because sending on it
 /// failed.
 const REPLACE: Duration = Duration::from_secs(10);
+/// How many times at most a question through the tunnel goes out within
+/// its wait (`Device::query`).
+const SENDS: u32 = 3;
 
 /// The tunnels of this process, their sections and carrier keys. Two
 /// tunnels with one private key at one peer would take each other's
@@ -274,6 +277,25 @@ impl Device {
         }
     }
 
+    /// Once a handshake the tunnel started has completed, with any peer: at
+    /// once when one has.
+    pub(crate) async fn established(&self) {
+        loop {
+            let mut completed = pin!(self.shared.handshaken.notified());
+            completed.as_mut().enable();
+            let last = self
+                .shared
+                .stack
+                .lock()
+                .expect("the tunnel")
+                .last_handshake();
+            if last.is_some() {
+                return;
+            }
+            completed.await;
+        }
+    }
+
     /// A TCP connection to `to` through the tunnel, once it is established.
     pub(crate) async fn connect(
         self: &Arc<Device>,
@@ -295,7 +317,10 @@ impl Device {
 
     /// One exchange with `server` over UDP through the tunnel: `message`
     /// out, then the first datagram from `server` that `accept` takes,
-    /// within `wait`. `None` when none came, or no peer takes `server`.
+    /// within `wait`. Until one comes, `message` goes out again every
+    /// third of `wait`, on the same socket: one lost packet, either way,
+    /// does not lose the exchange. `None` when none came, or no peer takes
+    /// `server`.
     pub(crate) async fn query<T>(
         self: &Arc<Device>,
         server: SocketAddr,
@@ -318,7 +343,8 @@ impl Device {
             }
         };
         self.shared.kick();
-        let answer = poll_fn(|cx| {
+        let first = tokio::time::Instant::now();
+        let mut answer = pin!(poll_fn(|cx| {
             let mut stack = self.shared.stack.lock().expect("the tunnel");
             let udp = stack.udp(socket.handle);
             while let Ok((datagram, meta)) = udp.recv() {
@@ -331,8 +357,25 @@ impl Device {
             }
             udp.register_recv_waker(cx.waker());
             Poll::Pending
-        });
-        tokio::time::timeout(wait, answer).await.ok()
+        }));
+        for round in 1..=SENDS {
+            if round > 1 {
+                // the same question again: its answer is what `accept` takes
+                let _ = self
+                    .shared
+                    .stack
+                    .lock()
+                    .expect("the tunnel")
+                    .udp(socket.handle)
+                    .send_slice(message, server);
+                self.shared.kick();
+            }
+            let until = first + wait * round / SENDS;
+            if let Ok(answer) = tokio::time::timeout_at(until, answer.as_mut()).await {
+                return Some(answer);
+            }
+        }
+        None
     }
 }
 

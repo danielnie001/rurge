@@ -157,6 +157,12 @@ pub struct PeerOpts {
     /// What its name server answers: names and their addresses; any other
     /// name does not exist.
     pub dns: Vec<(String, Vec<IpAddr>)>,
+    /// How many of the first questions its name server leaves unanswered,
+    /// as if they were lost on the way.
+    pub dns_ignore: usize,
+    /// How many of the first handshake initiations it ignores, as if they
+    /// were lost on the way.
+    pub handshake_ignore: usize,
 }
 
 impl Default for PeerOpts {
@@ -168,6 +174,8 @@ impl Default for PeerOpts {
             preshared_key: None,
             mtu: 1420,
             dns: Vec::new(),
+            dns_ignore: 0,
+            handshake_ignore: 0,
         }
     }
 }
@@ -191,9 +199,13 @@ pub struct PeerCore {
     requests: Vec<(SocketHandle, Vec<u8>)>,
     name_server: SocketHandle,
     names: Vec<(String, Vec<IpAddr>)>,
+    /// Questions its name server still leaves unanswered.
+    dns_ignore: usize,
     scratch: Vec<u8>,
     epoch: Instant,
     client_id: Option<[u8; 3]>,
+    /// Handshake initiations still to be ignored.
+    handshake_ignore: usize,
     /// Handshakes the client started.
     pub handshakes: usize,
     /// The reserved bytes of every message received.
@@ -270,9 +282,11 @@ impl PeerCore {
             requests: Vec::new(),
             name_server,
             names: opts.dns.clone(),
+            dns_ignore: opts.dns_ignore,
             scratch: vec![0; 65536 + 32],
             epoch: Instant::now(),
             client_id: opts.client_id,
+            handshake_ignore: opts.handshake_ignore,
             handshakes: 0,
             reserved: Vec::new(),
             pongs: Vec::new(),
@@ -305,6 +319,11 @@ impl PeerCore {
         }
         wire::unmark(message);
         let initiation = wire::message_type(message) == Some(wire::HANDSHAKE_INITIATION);
+        if initiation && self.handshake_ignore > 0 {
+            // lost on the way: the client tries again later
+            self.handshake_ignore -= 1;
+            return;
+        }
         let packet = match self.tunnel.decapsulate(None, message, &mut self.scratch) {
             TunnResult::WriteToNetwork(answer) => {
                 if initiation {
@@ -531,6 +550,11 @@ impl PeerCore {
                         .collect(),
                 )
             });
+            // asked, but the answer never comes
+            if self.dns_ignore > 0 {
+                self.dns_ignore -= 1;
+                continue;
+            }
             if let Some(reply) = reply {
                 let socket = self.sockets.get_mut::<udp::Socket>(self.name_server);
                 let _ = socket.send_slice(&reply, from);

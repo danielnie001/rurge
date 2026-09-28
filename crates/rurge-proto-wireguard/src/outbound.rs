@@ -150,6 +150,10 @@ impl WireGuardOutbound {
                 },
                 TunnelDns::Server(server) => *server,
             };
+            // a question sent before the tunnel's first handshake waits for
+            // it in boringtun, whose retry of a lost initiation comes after
+            // `dns_wait`: the handshake first, within the dial's own time
+            device.established().await;
             let Some(answer) = self.ask(device, server, name).await else {
                 continue;
             };
@@ -167,34 +171,36 @@ impl WireGuardOutbound {
     }
 
     /// `server`'s answer for `name`: A and AAAA at once, for the families
-    /// the tunnel has an address of. `None` when it gave none within
-    /// `dns_wait`, or no peer takes it.
+    /// the tunnel has an address of. `None` when it has not answered
+    /// (`dns::answered`) within `dns_wait`, or no peer takes it.
     async fn ask(
         &self,
         device: &Arc<Device>,
         server: SocketAddr,
         name: &str,
     ) -> Option<Vec<(IpAddr, u32)>> {
+        // `None` for a family not asked, else what came of its question
         let ask = |family: Family, wanted: bool| async move {
             if !wanted {
                 return None;
             }
             let id = getrandom::u32().unwrap_or(0) as u16;
-            let question = dns::question(id, name, family)?;
-            device
-                .query(server, &question, self.dns_wait, |reply| {
-                    dns::answer(reply, id, name, family)
-                })
-                .await
+            let Some(question) = dns::question(id, name, family) else {
+                return Some(None);
+            };
+            Some(
+                device
+                    .query(server, &question, self.dns_wait, |reply| {
+                        dns::answer(reply, id, name, family)
+                    })
+                    .await,
+            )
         };
         let (v4, v6) = tokio::join!(
             ask(Family::V4, self.section.self_ip.is_some()),
             ask(Family::V6, self.section.self_ip_v6.is_some())
         );
-        if v4.is_none() && v6.is_none() {
-            return None;
-        }
-        Some(v4.into_iter().chain(v6).flatten().collect())
+        dns::answered(v4.into_iter().chain(v6).collect())
     }
 
     async fn dial(
@@ -683,6 +689,58 @@ mod tests {
             assert_eq!(echo(&mut stream, b"ping").await, b"ping");
         }
         assert_eq!(peer.core().dns_questions, ["echo.test A"], "asked once");
+    }
+
+    /// A question that goes unanswered is sent again, the same one, every
+    /// third of `dns_wait`: one lost packet does not fail the lookup.
+    #[tokio::test]
+    async fn a_lost_question_is_answered_by_a_resend() {
+        let dns = vec![("echo.test".to_string(), vec![ip("10.0.0.1")])];
+        let (peer, mut wg) = tunnel(
+            PeerOpts {
+                dns,
+                dns_ignore: 1,
+                ..PeerOpts::default()
+            },
+            |s| s.dns_servers = vec![TunnelDns::Server(SocketAddr::new(DNS_ADDRESS.into(), 53))],
+        )
+        .await;
+        wg.dns_wait = Duration::from_millis(900);
+        let mut stream = wg
+            .connect_tcp(&at("echo.test", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        assert_eq!(echo(&mut stream, b"ping").await, b"ping");
+        let asked = peer.core().dns_questions.clone();
+        assert!(
+            asked.len() >= 2 && asked.iter().all(|q| q == "echo.test A"),
+            "{asked:?}"
+        );
+    }
+
+    /// Right after the start, the first handshake initiation lost: a
+    /// question sent now would wait in boringtun for its retry, 5 seconds
+    /// on, longer than `dns_wait`. The lookup waits for the tunnel's first
+    /// handshake instead, within the dial's own time.
+    #[tokio::test]
+    async fn the_first_lookup_waits_for_the_handshake() {
+        let dns = vec![("echo.test".to_string(), vec![ip("10.0.0.1")])];
+        let (peer, wg) = tunnel(
+            PeerOpts {
+                dns,
+                handshake_ignore: 1,
+                ..PeerOpts::default()
+            },
+            |s| s.dns_servers = vec![TunnelDns::Server(SocketAddr::new(DNS_ADDRESS.into(), 53))],
+        )
+        .await;
+        let mut stream = wg
+            .connect_tcp(&at("echo.test", ECHO_PORT), &within(10))
+            .await
+            .expect("a connection once the retried handshake completed");
+        assert_eq!(echo(&mut stream, b"ping").await, b"ping");
+        assert_eq!(peer.core().handshakes, 1);
+        assert_eq!(peer.core().dns_questions, ["echo.test A"]);
     }
 
     /// Both families asked at once when the tunnel has both addresses;
