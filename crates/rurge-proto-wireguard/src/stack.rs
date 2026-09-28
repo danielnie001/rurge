@@ -167,6 +167,11 @@ impl Stack {
         )
     }
 
+    /// When a handshake rurge started last completed, with whichever peer.
+    pub fn last_handshake(&self) -> Option<Instant> {
+        self.peers.iter().filter_map(|p| p.handshake).max()
+    }
+
     /// A handshake with every peer, whatever the state of its session: the
     /// tunnel starts, a test asks.
     pub fn initiate(&mut self, out: &mut Vec<Outgoing>) {

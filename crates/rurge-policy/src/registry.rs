@@ -10,11 +10,12 @@ use crate::cell::{ChainConnector, RegistryCell};
 use crate::factory::{BuildError, OutboundFactory};
 use crate::selections::SelectionTable;
 use crate::smart::{Candidate, Health, ROUND_INTERVAL, ROUND_SAMPLE, SiteMemory, rank, sample};
-use crate::testbook::{MAX_CONCURRENT_TESTS, TestCase, TestResult};
+use crate::testbook::{MAX_CONCURRENT_TESTS, TestCase, TestMode, TestResult};
 use rurge_config::rule::PolicyRef;
-use rurge_config::spec::{CommonOpts, GroupSpec, IpVersion, PolicySpec};
+use rurge_config::spec::{CommonOpts, GroupSpec, IpVersion, PolicySpec, ProtoSpec};
+use rurge_config::wireguard::WireGuardSection;
 use rurge_config::{Builtin, Config, GroupKind, KeystoreType, PolicyKind, Span};
-use rurge_net::connector::Connector;
+use rurge_net::connector::{Connector, Target};
 use rurge_proto::{Direct, OutboundRef, Reject, RejectKind};
 use rustls::RootCertStore;
 use std::collections::hash_map::RandomState;
@@ -193,25 +194,49 @@ enum Entry {
     },
 }
 
-/// How a policy is tested (M3 design 6.1), worked out as the registry is
-/// built.
+/// What a `wireguard` policy's test may take on top of its timeout: the
+/// test may be what starts the tunnel (manual).
+const WIREGUARD_START: Duration = Duration::from_secs(10);
+
+/// How a policy is tested (M3 design 6.1; phase 2 M4 design 6.7), worked
+/// out as the registry is built.
 struct TestSpec {
     /// `None`: the test URL does not parse, and the policy never passes.
-    url: Option<Url>,
+    mode: Option<TestMode>,
     timeout: Duration,
     /// What a result is good for (`TestCase::key`).
     key: u64,
 }
 
 impl TestSpec {
-    fn new(definition: &str, url: &str, timeout: Duration) -> TestSpec {
+    /// The key is what the policy is — its definition, and the section of
+    /// a `wireguard` policy — and how it is tested (`how`: the URL, or
+    /// `native`).
+    fn new(
+        definition: &str,
+        section: Option<&WireGuardSection>,
+        mode: Option<TestMode>,
+        how: &str,
+        timeout: Duration,
+    ) -> TestSpec {
         let mut h = DefaultHasher::new();
-        (definition, url, timeout).hash(&mut h);
+        (definition, section, how, timeout).hash(&mut h);
         TestSpec {
-            url: Url::parse(url).ok(),
+            mode,
             timeout,
             key: h.finish(),
         }
+    }
+
+    /// A test at `url`.
+    fn at(
+        definition: &str,
+        section: Option<&WireGuardSection>,
+        url: &str,
+        timeout: Duration,
+    ) -> TestSpec {
+        let mode = Url::parse(url).ok().map(TestMode::Url);
+        TestSpec::new(definition, section, mode, url, timeout)
     }
 }
 
@@ -445,18 +470,31 @@ impl PolicyRegistry {
                 (None, Some(_)) => false,
             };
             let common = spec.map(|s| &s.common);
-            let (url, timeout) = cfg.general.test_target(
-                common.and_then(|c| c.test_url.as_deref()),
-                common.and_then(|c| c.test_timeout),
-                direct,
-            );
-            Some(TestSpec::new(definition, url, timeout))
+            let own_url = common.and_then(|c| c.test_url.as_deref());
+            let (url, timeout) =
+                cfg.general
+                    .test_target(own_url, common.and_then(|c| c.test_timeout), direct);
+            let Some(ProtoSpec::WireGuard(wireguard)) = spec.map(|s| &s.proto) else {
+                return Some(TestSpec::at(definition, None, url, timeout));
+            };
+            let section = &wireguard.section;
+            let timeout = timeout + WIREGUARD_START;
+            // without a `dns-server` or a `test-url` of its own: a handshake
+            // with the peers (phase 2 M4 design 6.7)
+            Some(if section.dns_servers.is_empty() && own_url.is_none() {
+                let first = &section.peers[0].endpoint;
+                let mode = TestMode::Native(Target::new(first.host.clone(), first.port));
+                TestSpec::new(definition, Some(section), Some(mode), "native", timeout)
+            } else {
+                TestSpec::at(definition, Some(section), url, timeout)
+            })
         };
         let mut table = Table::default();
         let (url, timeout) = cfg.general.test_target(None, None, true);
-        table
-            .tests
-            .insert("DIRECT".to_string(), TestSpec::new("DIRECT", url, timeout));
+        table.tests.insert(
+            "DIRECT".to_string(),
+            TestSpec::at("DIRECT", None, url, timeout),
+        );
         // The profile's own policies: the dry build has made a failure here a
         // load error, so one fails the whole generation.
         for p in &cfg.policies {
@@ -864,13 +902,14 @@ impl PolicyRegistry {
             },
         };
         let test = self.tests.get(policy)?;
-        test.url.as_ref()?;
+        test.mode.as_ref()?;
         Some((policy, test))
     }
 
     /// How to test `name` now (M3 design 6.1): through its outbound, at its
-    /// test URL. `None` for what never passes — a REJECT, a protocol not
-    /// implemented, a test URL that does not parse — and for a group.
+    /// test URL or its own way (phase 2 M4 design 6.7). `None` for what never
+    /// passes — a REJECT, a protocol not implemented, a test URL that does
+    /// not parse — and for a group.
     pub fn test_case(&self, name: &str) -> Option<TestCase> {
         let (policy, test) = self.test_slot(name)?;
         let outbound = match self.entries.get(policy) {
@@ -880,7 +919,7 @@ impl PolicyRegistry {
             _ => self.direct(),
         };
         Some(TestCase {
-            url: test.url.clone()?,
+            mode: test.mode.clone()?,
             timeout: test.timeout,
             key: test.key,
             roots: self.roots.clone(),
@@ -2171,6 +2210,56 @@ E = url-test, A, B, evaluate-before-use=true\nS = select, E\n[Rule]\nFINAL,U\n";
         assert_eq!(
             reg.test_case("DIRECT").map(|c| c.policy).as_deref(),
             Some("DIRECT")
+        );
+    }
+
+    /// A section with the test keys, its peer at `wg.test:51820`.
+    fn wireguard_section(name: &str, mtu: u16, extra: &str) -> String {
+        format!(
+            "[WireGuard {name}]\nprivate-key = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=\n\
+self-ip = 10.9.0.2\nmtu = {mtu}\n{extra}\
+peer = (public-key = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=, allowed-ips = 0.0.0.0/0, endpoint = wg.test:51820)\n"
+        )
+    }
+
+    /// A `wireguard` policy without a `dns-server` or a `test-url` of its
+    /// own is tested by a handshake, which goes to its first peer; either
+    /// makes it a test at a URL. Both may take 10 seconds more, and an
+    /// edited section is another test (phase 2 M4 design 6.7).
+    #[test]
+    fn a_wireguard_policy_is_tested_by_a_handshake_unless_it_can_fetch_a_url() {
+        let text = |mtu: u16| {
+            format!(
+                "[General]\nproxy-test-url = http://127.0.0.1:9/\ntest-timeout = 3\n\
+[Proxy]\nN = wireguard, section-name=plain\nU = wireguard, section-name=plain, test-url=http://t.test/\n\
+D = wireguard, section-name=dns\n[Rule]\nFINAL,DIRECT\n{}{}",
+                wireguard_section("plain", mtu, ""),
+                wireguard_section("dns", 1280, "dns-server = 10.0.0.53\n")
+            )
+        };
+        let reg = generation(&text(1280), &FakeFactory::new(), None);
+        let case = |reg: &PolicyRegistry, name: &str| reg.test_case(name).expect("tested");
+        assert_eq!(
+            case(&reg, "N").mode,
+            TestMode::Native(Target::new(HostName::parse("wg.test"), 51820))
+        );
+        assert_eq!(
+            case(&reg, "U").mode,
+            TestMode::Url(Url::parse("http://t.test/").unwrap())
+        );
+        assert_eq!(
+            case(&reg, "D").mode,
+            TestMode::Url(Url::parse("http://127.0.0.1:9/").unwrap())
+        );
+        for name in ["N", "U", "D"] {
+            assert_eq!(case(&reg, name).timeout, Duration::from_secs(13), "{name}");
+        }
+        let edited = generation(&text(1400), &FakeFactory::new(), None);
+        assert_ne!(case(&edited, "N").key, case(&reg, "N").key);
+        assert_eq!(
+            case(&edited, "D").key,
+            case(&reg, "D").key,
+            "its own section is the same"
         );
     }
 

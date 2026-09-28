@@ -1,9 +1,9 @@
 //! A WireGuard peer for the tests of this crate and of its dependants
 //! (feature `testing`). `PeerCore` is the peer without I/O: boringtun
 //! answering the client's handshakes, and a smoltcp host of its own that
-//! answers on every address routed to it — a TCP echo service on port 7 and
-//! a name server at `DNS_ADDRESS`. `FakeWgPeer` puts one on a loopback UDP
-//! port.
+//! answers on every address routed to it — a TCP echo service on port 7, an
+//! HTTP service on port 80 and a name server at `DNS_ADDRESS`. `FakeWgPeer`
+//! puts one on a loopback UDP port.
 
 mod peer;
 
@@ -31,7 +31,10 @@ use std::time::{Duration, Instant};
 
 /// The TCP echo service of a peer.
 pub const ECHO_PORT: u16 = 7;
-/// Connections the echo service takes at once: SYNs that arrive together.
+/// The HTTP service of a peer: `204 No Content` to every request, on a
+/// connection that stays open.
+pub const HTTP_PORT: u16 = 80;
+/// Connections a service takes at once: SYNs that arrive together.
 const BACKLOG: usize = 8;
 /// Where a peer's name server listens, on port 53.
 pub const DNS_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 53);
@@ -183,6 +186,9 @@ pub struct PeerCore {
     queues: Queues,
     listeners: Vec<SocketHandle>,
     conns: Vec<Conn>,
+    web: Vec<SocketHandle>,
+    /// The HTTP connections and what arrived of the request being read.
+    requests: Vec<(SocketHandle, Vec<u8>)>,
     name_server: SocketHandle,
     names: Vec<(String, Vec<IpAddr>)>,
     scratch: Vec<u8>,
@@ -203,6 +209,8 @@ pub struct PeerCore {
     pub resets: usize,
     /// The questions its name server was asked: `<name> A` or `<name> AAAA`.
     pub dns_questions: Vec<String>,
+    /// HTTP requests answered.
+    pub http_requests: usize,
 }
 
 /// `message` with `client_id` in it.
@@ -241,6 +249,9 @@ impl PeerCore {
         let listeners = (0..BACKLOG)
             .map(|_| listen(&mut sockets, ECHO_PORT))
             .collect();
+        let web = (0..BACKLOG)
+            .map(|_| listen(&mut sockets, HTTP_PORT))
+            .collect();
         let buffer = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0; 8192]);
         let mut name_server = udp::Socket::new(buffer(), buffer());
         name_server
@@ -255,6 +266,8 @@ impl PeerCore {
             queues,
             listeners,
             conns: Vec::new(),
+            web,
+            requests: Vec::new(),
             name_server,
             names: opts.dns.clone(),
             scratch: vec![0; 65536 + 32],
@@ -267,6 +280,7 @@ impl PeerCore {
             connected_to: Vec::new(),
             resets: 0,
             dns_questions: Vec::new(),
+            http_requests: 0,
         }
     }
 
@@ -460,7 +474,41 @@ impl PeerCore {
             }
         });
         self.resets += resets;
+        self.answer_requests();
         self.answer_questions();
+    }
+
+    fn answer_requests(&mut self) {
+        for k in 0..self.web.len() {
+            let handle = self.web[k];
+            if self.sockets.get::<tcp::Socket>(handle).state() == tcp::State::Listen {
+                continue;
+            }
+            self.requests.push((handle, Vec::new()));
+            self.web[k] = listen(&mut self.sockets, HTTP_PORT);
+        }
+        let (sockets, answered) = (&mut self.sockets, &mut self.http_requests);
+        self.requests.retain_mut(|(handle, request)| {
+            let socket = sockets.get_mut::<tcp::Socket>(*handle);
+            let mut buf = [0u8; 2048];
+            while let Ok(n @ 1..) = socket.recv_slice(&mut buf) {
+                request.extend_from_slice(&buf[..n]);
+            }
+            while let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                request.drain(..end + 4);
+                *answered += 1;
+                let _ = socket.send_slice(b"HTTP/1.1 204 No Content\r\n\r\n");
+            }
+            // the client is done: done too
+            if !socket.may_recv() && socket.may_send() {
+                socket.close();
+            }
+            let over = matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait);
+            if over {
+                sockets.remove(*handle);
+            }
+            !over
+        });
     }
 
     fn answer_questions(&mut self) {

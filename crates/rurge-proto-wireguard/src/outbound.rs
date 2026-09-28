@@ -245,6 +245,15 @@ impl Outbound for WireGuardOutbound {
             }
         })
     }
+
+    /// A handshake with the peers (phase 2 M4 design 6.7); the tunnel starts
+    /// first when it has not.
+    fn native_test(&self) -> Option<BoxFuture<'_, Result<Duration, OutboundError>>> {
+        Some(Box::pin(async move {
+            let device = self.device(&ConnectOpts::default()).await?;
+            Ok(device.handshake().await)
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -850,6 +859,22 @@ mod tests {
             TOTAL >> 20,
             (TOTAL >> 20) as f64 / elapsed.as_secs_f64()
         );
+    }
+
+    /// The native test: a handshake with the peers, however fresh the
+    /// session; its time is the result. It starts the tunnel when need be.
+    #[tokio::test]
+    async fn the_native_test_is_a_handshake_with_the_peers() {
+        let (peer, wg) = tunnel(PeerOpts::default(), |_| {}).await;
+        let test = || wg.native_test().expect("wireguard has one");
+        let rtt = test().await.expect("a handshake");
+        assert!(rtt < Duration::from_secs(2), "{rtt:?}");
+        let before = peer.core().handshakes;
+        test().await.expect("a handshake");
+        assert!(peer.core().handshakes > before, "the session was fresh");
+        peer.go_silent(true);
+        let silent = tokio::time::timeout(Duration::from_millis(500), test()).await;
+        assert!(silent.is_err(), "no answer, no result");
     }
 
     /// Two policies that name one section: one tunnel, one handshake.

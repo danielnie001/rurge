@@ -4,6 +4,8 @@
 //! request log through `TestObserver`.
 
 use crate::probe::{Probed, probe};
+use rurge_config::HostName;
+use rurge_net::connector::Target;
 use rurge_proto::OutboundRef;
 use rustls::RootCertStore;
 use std::collections::{HashMap, HashSet};
@@ -26,12 +28,37 @@ pub struct TestResult {
     pub when: SystemTime,
 }
 
+/// What a test measures (phase 2 M4 design 6.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TestMode {
+    /// Two HEAD requests to the URL through the outbound (M3 design 6.1).
+    Url(Url),
+    /// The outbound's own test (`Outbound::native_test`): a `wireguard`
+    /// policy's handshake, which the session log shows going to the
+    /// target — its first peer.
+    Native(Target),
+}
+
+impl TestMode {
+    /// Where the test goes, for the session log: of a URL its host and
+    /// port, never the rest, which a subscription line may have set (M3-D7).
+    pub fn target(&self) -> Target {
+        match self {
+            TestMode::Url(url) => Target::new(
+                HostName::parse(url.host_str().unwrap_or_default()),
+                url.port_or_known_default().unwrap_or(0),
+            ),
+            TestMode::Native(target) => target.clone(),
+        }
+    }
+}
+
 /// What to test, as the registry in use has it.
 #[derive(Clone)]
 pub struct TestCase {
     pub policy: String,
     pub outbound: OutboundRef,
-    pub url: Url,
+    pub mode: TestMode,
     pub timeout: Duration,
     /// What a result is good for: a result of the policy under another
     /// definition, test URL or timeout is no result (M3 design 6.2).
@@ -44,7 +71,7 @@ pub struct TestCase {
 /// Where a test shows up while it runs: the engine writes a session into
 /// the request log (M3 design 6.2).
 pub trait TestObserver: Send + Sync {
-    fn begin(&self, policy: &str, url: &Url) -> Box<dyn TestRecord>;
+    fn begin(&self, policy: &str, target: &Target) -> Box<dyn TestRecord>;
 }
 
 /// The running test's record, told how the test ended.
@@ -194,27 +221,25 @@ impl TestBook {
         let record = self
             .observer
             .get()
-            .map(|observer| observer.begin(&case.policy, &case.url));
-        let outcome = match probe(&case.outbound, &case.url, case.timeout, case.roots.clone()).await
-        {
-            Probed::Passed { score, reused } => {
-                if !reused
-                    && self
-                        .warned
-                        .lock()
-                        .expect("warned")
-                        .insert(case.url.to_string())
-                {
-                    // the URL stays out of the log: a subscription line may
-                    // have set it (M3-D7)
-                    tracing::warn!(
-                        policy = %case.policy,
-                        "the test server does not keep the connection: the score includes the dial"
-                    );
+            .map(|observer| observer.begin(&case.policy, &case.mode.target()));
+        let outcome = match &case.mode {
+            TestMode::Url(url) => {
+                match probe(&case.outbound, url, case.timeout, case.roots.clone()).await {
+                    Probed::Passed { score, reused } => {
+                        if !reused && self.warned.lock().expect("warned").insert(url.to_string()) {
+                            // the URL stays out of the log: a subscription
+                            // line may have set it (M3-D7)
+                            tracing::warn!(
+                                policy = %case.policy,
+                                "the test server does not keep the connection: the score includes the dial"
+                            );
+                        }
+                        Ok(score)
+                    }
+                    Probed::Failed(why) => Err(why),
                 }
-                Ok(score)
             }
-            Probed::Failed(why) => Err(why),
+            TestMode::Native(_) => native(&case.outbound, case.timeout).await,
         };
         if let Some(record) = record {
             record.end(&outcome);
@@ -254,11 +279,22 @@ impl TestBook {
     }
 }
 
+/// The outbound's own test, within `timeout`.
+async fn native(outbound: &OutboundRef, timeout: Duration) -> Result<Duration, String> {
+    let test = outbound
+        .native_test()
+        .ok_or_else(|| "the policy has no test of its own".to_string())?;
+    match tokio::time::timeout(timeout, test).await {
+        Ok(result) => result.map_err(|e| e.to_string()),
+        Err(_) => Err("timed out".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rurge_net::BoxFuture;
-    use rurge_net::connector::{BoxedStream, ConnectOpts, Target};
+    use rurge_net::connector::{BoxedStream, ConnectOpts};
     use rurge_proto::{Outbound, OutboundError};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -300,7 +336,7 @@ mod tests {
         TestCase {
             policy: policy.to_string(),
             outbound,
-            url: Url::parse("http://127.0.0.1:9/").unwrap(),
+            mode: TestMode::Url(Url::parse("http://127.0.0.1:9/").unwrap()),
             timeout: Duration::from_secs(5),
             key,
             roots: Arc::new(RootCertStore::empty()),
@@ -364,8 +400,11 @@ mod tests {
     struct Record(Arc<Seen>, String);
 
     impl TestObserver for Arc<Seen> {
-        fn begin(&self, policy: &str, url: &Url) -> Box<dyn TestRecord> {
-            self.0.lock().unwrap().push(format!("begin {policy} {url}"));
+        fn begin(&self, policy: &str, target: &Target) -> Box<dyn TestRecord> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("begin {policy} {}:{}", target.host, target.port));
             Box::new(Record(self.clone(), policy.to_string()))
         }
     }
@@ -392,11 +431,61 @@ mod tests {
         book.test(case("P", Arc::new(Gate::default()), 1)).await;
         assert_eq!(
             *seen.0.lock().unwrap(),
-            [
-                "begin P http://127.0.0.1:9/",
-                "end P connect: closed by the gate"
-            ]
+            ["begin P 127.0.0.1:9", "end P connect: closed by the gate"]
         );
+    }
+
+    /// Tests itself its own way, in the time given, or not at all.
+    struct Own(Option<Duration>);
+
+    impl Outbound for Own {
+        fn name(&self) -> &str {
+            "Own"
+        }
+        fn connect_tcp<'a>(
+            &'a self,
+            _target: &'a Target,
+            _opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, Result<BoxedStream, OutboundError>> {
+            Box::pin(std::future::ready(Err(OutboundError::Proxy(
+                "never dialled".to_string(),
+            ))))
+        }
+        fn native_test(&self) -> Option<BoxFuture<'_, Result<Duration, OutboundError>>> {
+            let took = self.0?;
+            Some(Box::pin(async move {
+                tokio::time::sleep(took).await;
+                Ok(took)
+            }))
+        }
+    }
+
+    /// A policy tested without a URL: the outbound's own test is the score
+    /// (phase 2 M4 design 6.7), seen going to its target.
+    #[tokio::test]
+    async fn a_native_test_is_the_outbounds_own() {
+        let native = |outbound: OutboundRef| TestCase {
+            mode: TestMode::Native(Target::new(HostName::parse("wg.test"), 51820)),
+            timeout: Duration::from_millis(300),
+            ..case("W", outbound, 1)
+        };
+        let seen = Arc::new(Seen::default());
+        let book = book();
+        book.observe(Arc::new(seen.clone()));
+        let passed = book
+            .test(native(Arc::new(Own(Some(Duration::from_millis(7))))))
+            .await;
+        assert_eq!(passed.outcome, Ok(Duration::from_millis(7)));
+        assert_eq!(seen.0.lock().unwrap()[0], "begin W wg.test:51820");
+        let without = book.test_once(&native(Arc::new(Own(None)))).await;
+        assert_eq!(
+            without.outcome,
+            Err("the policy has no test of its own".to_string())
+        );
+        let slow = book
+            .test_once(&native(Arc::new(Own(Some(Duration::from_secs(60))))))
+            .await;
+        assert_eq!(slow.outcome, Err("timed out".to_string()));
     }
 
     /// Panics on every dial.

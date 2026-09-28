@@ -70,6 +70,11 @@ pub(crate) struct Shared {
     kick: Notify,
     /// Set by `Device::network_changed`, taken by the task.
     network_changed: AtomicBool,
+    /// Set by `Device::handshake`, taken by the task: a handshake with
+    /// every peer now.
+    greet: AtomicBool,
+    /// Told of every handshake that completes.
+    handshaken: Notify,
     /// A tunnel of a later configuration took over.
     closed: AtomicBool,
 }
@@ -191,6 +196,8 @@ impl Device {
             stack: Mutex::new(Stack::new(section)),
             kick: Notify::new(),
             network_changed: AtomicBool::new(false),
+            greet: AtomicBool::new(false),
+            handshaken: Notify::new(),
             closed: AtomicBool::new(false),
         });
         let mut out = Vec::new();
@@ -239,6 +246,28 @@ impl Device {
     pub(crate) fn network_changed(&self) {
         self.shared.network_changed.store(true, Ordering::SeqCst);
         self.shared.kick();
+    }
+
+    /// A handshake with every peer now, however fresh their sessions: how
+    /// long until the first completed (phase 2 M4 design 6.7).
+    pub(crate) async fn handshake(&self) -> Duration {
+        let asked = Instant::now();
+        self.shared.greet.store(true, Ordering::SeqCst);
+        self.shared.kick();
+        loop {
+            let mut completed = pin!(self.shared.handshaken.notified());
+            completed.as_mut().enable();
+            let last = self
+                .shared
+                .stack
+                .lock()
+                .expect("the tunnel")
+                .last_handshake();
+            if let Some(at) = last.filter(|at| *at > asked) {
+                return at - asked;
+            }
+            completed.await;
+        }
     }
 
     /// A TCP connection to `to` through the tunnel, once it is established.
@@ -481,6 +510,13 @@ impl Driver {
                 self.dial(&mut dials, due, false);
                 next_redial = now + self.redial;
             }
+            if self.shared.greet.swap(false, Ordering::SeqCst) {
+                self.shared
+                    .stack
+                    .lock()
+                    .expect("the tunnel")
+                    .initiate(&mut out);
+            }
             let deadline = {
                 let mut stack = self.shared.stack.lock().expect("the tunnel");
                 if now >= next_tick {
@@ -524,6 +560,9 @@ impl Driver {
                         } else {
                             None
                         };
+                    }
+                    if !completed.is_empty() {
+                        self.shared.handshaken.notify_waiters();
                     }
                     for peer in completed {
                         self.waiting[peer] = false;

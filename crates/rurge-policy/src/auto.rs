@@ -518,7 +518,7 @@ mod tests {
         let case = crate::testbook::TestCase {
             policy: "A".to_string(),
             outbound: outbound.clone(),
-            url: url::Url::parse("http://127.0.0.1:9/").unwrap(),
+            mode: crate::testbook::TestMode::Url(url::Url::parse("http://127.0.0.1:9/").unwrap()),
             timeout: Duration::from_secs(5),
             key: 1,
             roots: Arc::new(rustls::RootCertStore::empty()),

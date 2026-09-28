@@ -152,6 +152,56 @@ async fn a_reload_that_changes_the_carriers_takes_the_tunnel_over() {
     );
 }
 
+/// Without a `dns-server` or a `test-url`, a test of the policy is a
+/// handshake with its peers, which the session log shows going to the
+/// first peer (phase 2 M4 design 6.7).
+#[tokio::test]
+async fn a_policy_test_is_a_handshake_with_the_peers() {
+    let (peer, section) = peer().await;
+    let h = harness(Profile {
+        proxies: WG,
+        sections: &section,
+        ..Profile::default()
+    })
+    .await;
+    let results = h
+        .engine
+        .test_policies(&["WG".to_string()], None)
+        .await
+        .unwrap();
+    let result = results[0].1.as_ref().expect("a wireguard policy is tested");
+    assert!(result.outcome.is_ok(), "{:?}", result.outcome);
+    assert!(peer.core().handshakes >= 1);
+    let log = h.engine.request_log();
+    let test = || {
+        log.recent(10)
+            .into_iter()
+            .find(|r| r.rule.as_deref() == Some("policy test"))
+    };
+    wait_until("the test session", || test().is_some()).await;
+    assert_eq!(test().unwrap().dst, peer.addr().to_string());
+}
+
+/// With a `test-url`, the test fetches it through the tunnel.
+#[tokio::test]
+async fn a_test_url_is_fetched_through_the_tunnel() {
+    let (peer, section) = peer().await;
+    let h = harness(Profile {
+        proxies: "WG = wireguard, section-name=w, test-url=http://10.0.0.1/",
+        sections: &section,
+        ..Profile::default()
+    })
+    .await;
+    let results = h
+        .engine
+        .test_policies(&["WG".to_string()], None)
+        .await
+        .unwrap();
+    let result = results[0].1.as_ref().expect("a wireguard policy is tested");
+    assert!(result.outcome.is_ok(), "{:?}", result.outcome);
+    assert_eq!(peer.core().http_requests, 2, "two HEADs, one connection");
+}
+
 /// A reload that leaves the line and its section alone keeps the tunnel,
 /// handshake and all; an edited section builds the policy anew.
 #[tokio::test]

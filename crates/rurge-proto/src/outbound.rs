@@ -6,6 +6,7 @@ use rurge_net::connector::{BoxedStream, ConnectOpts, Target};
 use std::fmt;
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// The four REJECT flavours (M3 design §8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -138,6 +139,11 @@ pub trait Outbound: Send + Sync {
     /// `Some` when plain HTTP requests may be sent to this outbound in
     /// absolute form instead of through a CONNECT tunnel.
     fn http_forward(&self) -> Option<&dyn HttpForward> {
+        None
+    }
+    /// A test of its own, for a policy tested without a URL (phase 2 M4
+    /// design 6.7): how long it took. `None`: the outbound has none.
+    fn native_test(&self) -> Option<BoxFuture<'_, Result<Duration, OutboundError>>> {
         None
     }
 }

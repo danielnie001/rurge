@@ -3,7 +3,7 @@
 use crate::auto::AutoGroups;
 use crate::factory::{BuildError, OutboundFactory};
 use crate::testbook::TestBook;
-use rurge_config::spec::{CommonOpts, PolicySpec};
+use rurge_config::spec::{CommonOpts, PolicySpec, ProtoSpec};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
 use rurge_proto::{Outbound, OutboundError, OutboundRef};
@@ -128,13 +128,18 @@ impl OutboundFactory for FakeFactory {
         if self.broken == Some(spec.name.as_str()) {
             return Err(BuildError::new("boom"));
         }
-        if matches!(spec.proto, rurge_config::spec::ProtoSpec::Direct) {
-            return Ok(Arc::new(rurge_proto::Direct::new(connector)));
-        }
-        let server = Target::new(
-            spec.server.clone().expect("a proxy policy has a server"),
-            spec.port.expect("and a port"),
-        );
+        let server = match &spec.proto {
+            ProtoSpec::Direct => return Ok(Arc::new(rurge_proto::Direct::new(connector))),
+            // a tunnel's first stop is its first peer
+            ProtoSpec::WireGuard(wireguard) => {
+                let first = &wireguard.section.peers[0].endpoint;
+                Target::new(first.host.clone(), first.port)
+            }
+            _ => Target::new(
+                spec.server.clone().expect("a proxy policy has a server"),
+                spec.port.expect("and a port"),
+            ),
+        };
         Ok(Arc::new(FakeOutbound {
             name: spec.name.clone(),
             server,

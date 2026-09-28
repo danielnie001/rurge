@@ -6,12 +6,13 @@
 
 use crate::engine::{Engine, UnknownPolicy, policy_known};
 use crate::views::SelectError;
+use rurge_config::GroupKind;
 use rurge_config::rule::PolicyRef;
 use rurge_config::session::{ListenerKind, SessionInfo};
-use rurge_config::{GroupKind, HostName};
 use rurge_inbound::{SessionHandle, SessionOutcome};
+use rurge_net::connector::Target;
 use rurge_policy::auto::SelectCtx;
-use rurge_policy::testbook::{TestObserver, TestRecord, TestResult};
+use rurge_policy::testbook::{TestMode, TestObserver, TestRecord, TestResult};
 use rurge_policy::{PolicyRegistry, Resolution};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -39,8 +40,8 @@ pub(crate) fn automatic(kind: GroupKind) -> bool {
 
 /// Every connectivity test is a session of the request log (M3 design
 /// 6.2): `Internal`, the rule `policy test`, the tested policy for its
-/// chain, and for its target the test URL's host and port — never the rest
-/// of the URL, which a subscription line may have set (M3-D7).
+/// chain, and for its target `TestMode::target` — the test URL's host and
+/// port, or the first peer of a `wireguard` policy tested by a handshake.
 struct TestSessions(Weak<Engine>);
 
 struct TestSession(Arc<SessionHandle>);
@@ -49,12 +50,11 @@ struct TestSession(Arc<SessionHandle>);
 struct Unrecorded;
 
 impl TestObserver for TestSessions {
-    fn begin(&self, policy: &str, url: &Url) -> Box<dyn TestRecord> {
+    fn begin(&self, policy: &str, target: &Target) -> Box<dyn TestRecord> {
         let Some(engine) = self.0.upgrade() else {
             return Box::new(Unrecorded);
         };
-        let host = HostName::parse(url.host_str().unwrap_or_default());
-        let mut session = SessionInfo::tcp(host, url.port_or_known_default().unwrap_or(0));
+        let mut session = SessionInfo::tcp(target.host.clone(), target.port);
         session.listener = ListenerKind::Internal;
         let handle = engine.new_handle(session);
         handle.set_rule(Some(TEST_RULE.to_string()));
@@ -122,7 +122,7 @@ impl Engine {
                     Some(match url {
                         None => book.test(case).await,
                         Some(url) => {
-                            case.url = url;
+                            case.mode = TestMode::Url(url);
                             book.test_once(&case).await
                         }
                     })
