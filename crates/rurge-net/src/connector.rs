@@ -8,13 +8,41 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpStream, UdpSocket};
+
+/// What a UDP flow's socket asks for as its buffers each way: what
+/// wireguard-go asks for its tunnels.
+const UDP_BUFFER: usize = 7 << 20;
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
 pub type BoxedStream = Box<dyn AsyncStream>;
+
+/// One UDP flow to a fixed peer (phase 2 M4 design 6.6): a WireGuard
+/// tunnel's carrier to one of its peers. Polled rather than awaited, so that
+/// one task can wait on several carriers at once.
+pub trait Datagram: Send + Sync {
+    /// Sends `buf` as one datagram.
+    fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>>;
+    /// Receives one datagram into `buf`.
+    fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>>;
+    /// Where the datagrams go, when the carrier knows.
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+    /// The IP TOS (IPv6 traffic class) byte of the datagrams sent from now
+    /// on; `0` goes back to what the carrier started with. A carrier that
+    /// cannot mark its datagrams ignores it.
+    fn set_tos(&self, tos: u8) -> io::Result<()> {
+        let _ = tos;
+        Ok(())
+    }
+}
+
+pub type BoxedDatagram = Box<dyn Datagram>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -50,6 +78,20 @@ pub trait Connector: Send + Sync {
         target: &'a Target,
         opts: &'a ConnectOpts,
     ) -> BoxFuture<'a, io::Result<BoxedStream>>;
+
+    /// A UDP flow to `target` (phase 2 M4 design 6.6); `Unsupported` from a
+    /// connector that carries none.
+    fn connect_udp<'a>(
+        &'a self,
+        target: &'a Target,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+        let _ = (target, opts);
+        Box::pin(std::future::ready(Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this connection cannot carry UDP",
+        ))))
+    }
 }
 
 pub trait Resolve: Send + Sync {
@@ -99,7 +141,8 @@ pub fn interleave(addrs: Vec<IpAddr>, prefer_v6: bool) -> Vec<IpAddr> {
 }
 
 /// Plain TCP: resolves through `Resolve`, then races the addresses the
-/// policy's `ip-version` allows (`crate::socket::race`).
+/// policy's `ip-version` allows (`crate::socket::race`). Plain UDP too: the
+/// first of those addresses, nothing to race.
 pub struct DirectConnector {
     resolver: Arc<dyn Resolve>,
     opts: SocketOpts,
@@ -127,18 +170,26 @@ impl DirectConnector {
     }
 }
 
-async fn connect_one(
+/// A non-blocking socket of `addr`'s family with the policy's socket
+/// options on it.
+fn open_socket(
     addr: SocketAddr,
+    kind: socket2::Type,
     opts: &SocketOpts,
     hook: &dyn SocketHook,
     fallback_logged: &AtomicBool,
-) -> io::Result<TcpStream> {
+) -> io::Result<socket2::Socket> {
     let family = Family::of(&addr.ip());
     let domain = match family {
         Family::V4 => socket2::Domain::IPV4,
         Family::V6 => socket2::Domain::IPV6,
     };
-    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    let protocol = if kind == socket2::Type::DGRAM {
+        socket2::Protocol::UDP
+    } else {
+        socket2::Protocol::TCP
+    };
+    let socket = socket2::Socket::new(domain, kind, Some(protocol))?;
     socket.set_nonblocking(true)?;
     if opts.tos != 0
         && let Err(e) = hook.set_tos(&socket, family, opts.tos)
@@ -158,6 +209,16 @@ async fn connect_one(
             tracing::warn!(interface = %interface, error = %e, "interface unavailable; using the default one (allow-other-interface)");
         }
     }
+    Ok(socket)
+}
+
+async fn connect_one(
+    addr: SocketAddr,
+    opts: &SocketOpts,
+    hook: &dyn SocketHook,
+    fallback_logged: &AtomicBool,
+) -> io::Result<TcpStream> {
+    let socket = open_socket(addr, socket2::Type::STREAM, opts, hook, fallback_logged)?;
     let std_stream: std::net::TcpStream = socket.into();
     let stream = tokio::net::TcpSocket::from_std_stream(std_stream)
         .connect(addr)
@@ -174,70 +235,147 @@ fn display_target(target: &Target) -> String {
     }
 }
 
+impl DirectConnector {
+    /// The addresses to try first and the ones that join later
+    /// (`plan_addresses`); the first list is never empty.
+    async fn plan(&self, target: &Target) -> io::Result<(Vec<IpAddr>, Vec<IpAddr>)> {
+        match &target.host {
+            // `ip-version` only means something for a host name (manual)
+            HostName::Ip(ip) => Ok((vec![*ip], Vec::new())),
+            HostName::Domain(d) => {
+                let addrs = self.resolver.resolve(d).await?;
+                // Guards a `Resolve` implementation that answers with
+                // an empty list instead of an error; the wording
+                // matches what the two production resolvers
+                // (`SystemResolve`, `rurge_dns::Resolver`) already
+                // return as an `Err` themselves in that case.
+                if addrs.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("no addresses for {d}"),
+                    ));
+                }
+                let planned = plan_addresses(addrs, self.opts.ip_version, self.opts.v6_first);
+                if planned.0.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "no usable address for {d}: every answer was filtered out by ip-version"
+                        ),
+                    ));
+                }
+                Ok(planned)
+            }
+        }
+    }
+}
+
+/// `attempt`, with `timeout` covering name resolution and everything after.
+async fn within<T>(
+    target: &Target,
+    timeout: Duration,
+    attempt: impl std::future::Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    match tokio::time::timeout(timeout, attempt).await {
+        Ok(done) => done,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("connect to {} timed out", display_target(target)),
+        )),
+    }
+}
+
 impl Connector for DirectConnector {
     fn connect<'a>(
         &'a self,
         target: &'a Target,
         opts: &'a ConnectOpts,
     ) -> BoxFuture<'a, io::Result<BoxedStream>> {
-        Box::pin(async move {
-            let attempt = async {
-                let (primary, secondary) = match &target.host {
-                    // `ip-version` only means something for a host name (manual)
-                    HostName::Ip(ip) => (vec![*ip], Vec::new()),
-                    HostName::Domain(d) => {
-                        let addrs = self.resolver.resolve(d).await?;
-                        // Guards a `Resolve` implementation that answers with
-                        // an empty list instead of an error; the wording
-                        // matches what the two production resolvers
-                        // (`SystemResolve`, `rurge_dns::Resolver`) already
-                        // return as an `Err` themselves in that case.
-                        if addrs.is_empty() {
-                            return Err(io::Error::new(
-                                io::ErrorKind::NotFound,
-                                format!("no addresses for {d}"),
-                            ));
-                        }
-                        let planned =
-                            plan_addresses(addrs, self.opts.ip_version, self.opts.v6_first);
-                        if planned.0.is_empty() {
-                            return Err(io::Error::new(
-                                io::ErrorKind::NotFound,
-                                format!(
-                                    "no usable address for {d}: every answer was filtered out by ip-version"
-                                ),
-                            ));
-                        }
-                        planned
-                    }
-                };
-                let port = target.port;
-                let with_port = |ips: Vec<IpAddr>| -> Vec<SocketAddr> {
-                    ips.into_iter()
-                        .map(|ip| SocketAddr::new(ip, port))
-                        .collect()
-                };
-                let (socket_opts, hook, logged) = (
-                    self.opts.clone(),
-                    self.hook.clone(),
-                    self.fallback_logged.clone(),
-                );
-                race(with_port(primary), with_port(secondary), move |addr| {
-                    let (socket_opts, hook, logged) =
-                        (socket_opts.clone(), hook.clone(), logged.clone());
-                    async move { connect_one(addr, &socket_opts, hook.as_ref(), &logged).await }
-                })
-                .await
+        Box::pin(within(target, opts.timeout, async move {
+            let (primary, secondary) = self.plan(target).await?;
+            let port = target.port;
+            let with_port = |ips: Vec<IpAddr>| -> Vec<SocketAddr> {
+                ips.into_iter()
+                    .map(|ip| SocketAddr::new(ip, port))
+                    .collect()
             };
-            match tokio::time::timeout(opts.timeout, attempt).await {
-                Ok(Ok(stream)) => Ok(Box::new(stream) as BoxedStream),
-                Ok(Err(e)) => Err(e),
-                Err(_) => Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("connect to {} timed out", display_target(target)),
-                )),
-            }
-        })
+            let (socket_opts, hook, logged) = (
+                self.opts.clone(),
+                self.hook.clone(),
+                self.fallback_logged.clone(),
+            );
+            let stream = race(with_port(primary), with_port(secondary), move |addr| {
+                let (socket_opts, hook, logged) =
+                    (socket_opts.clone(), hook.clone(), logged.clone());
+                async move { connect_one(addr, &socket_opts, hook.as_ref(), &logged).await }
+            })
+            .await?;
+            Ok(Box::new(stream) as BoxedStream)
+        }))
+    }
+
+    fn connect_udp<'a>(
+        &'a self,
+        target: &'a Target,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+        Box::pin(within(target, opts.timeout, async move {
+            // nothing answers a UDP "connection": the first address it is
+            let (primary, _) = self.plan(target).await?;
+            let addr = SocketAddr::new(primary[0], target.port);
+            let socket = open_socket(
+                addr,
+                socket2::Type::DGRAM,
+                &self.opts,
+                self.hook.as_ref(),
+                &self.fallback_logged,
+            )?;
+            make_room(&socket);
+            socket.connect(&addr.into())?;
+            let socket = UdpSocket::from_std(socket.into())?;
+            Ok(Box::new(DirectDatagram {
+                socket,
+                family: Family::of(&addr.ip()),
+                hook: self.hook.clone(),
+                tos: self.opts.tos,
+            }) as BoxedDatagram)
+        }))
+    }
+}
+
+/// A UDP flow may carry a tunnel at full speed: its socket's buffers take a
+/// burst. Best effort: the system may cap them.
+fn make_room(socket: &socket2::Socket) {
+    let _ = socket.set_recv_buffer_size(UDP_BUFFER);
+    let _ = socket.set_send_buffer_size(UDP_BUFFER);
+}
+
+/// A connected UDP socket carrying the policy's socket options.
+struct DirectDatagram {
+    socket: UdpSocket,
+    family: Family,
+    hook: Arc<dyn SocketHook>,
+    /// The policy's own `tos`: what `set_tos(0)` goes back to.
+    tos: u8,
+}
+
+impl Datagram for DirectDatagram {
+    fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        self.socket.poll_send(cx, buf)
+    }
+
+    fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        self.socket.poll_recv(cx, buf)
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.socket.peer_addr().ok()
+    }
+
+    fn set_tos(&self, tos: u8) -> io::Result<()> {
+        let tos = if tos == 0 { self.tos } else { tos };
+        self.hook
+            .set_tos(&socket2::SockRef::from(&self.socket), self.family, tos)
     }
 }
 
@@ -547,6 +685,17 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert_eq!(err.to_string(), "connect to slow.test:80 timed out");
+        let err = connector
+            .connect_udp(
+                &Target::new(HostName::parse("slow.test"), 80),
+                &ConnectOpts {
+                    timeout: Duration::from_millis(50),
+                },
+            )
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.to_string(), "connect to slow.test:80 timed out");
     }
 
     #[tokio::test]
@@ -584,6 +733,153 @@ mod tests {
             e.to_string(),
             "no usable address for v4.test: every answer was filtered out by ip-version"
         );
+    }
+
+    async fn send(datagram: &BoxedDatagram, bytes: &[u8]) {
+        std::future::poll_fn(|cx| datagram.poll_send(cx, bytes))
+            .await
+            .unwrap();
+    }
+
+    async fn recv(datagram: &BoxedDatagram) -> Vec<u8> {
+        let mut buf = [0u8; 64];
+        let n = std::future::poll_fn(|cx| {
+            let mut read = ReadBuf::new(&mut buf);
+            datagram
+                .poll_recv(cx, &mut read)
+                .map_ok(|()| read.filled().len())
+        })
+        .await
+        .unwrap();
+        buf[..n].to_vec()
+    }
+
+    /// Answers every datagram with itself.
+    async fn udp_echo() -> SocketAddr {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                let _ = socket.send_to(&buf[..n], from).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_udp_flow_reaches_its_peer_by_address_and_by_name() {
+        let echo = udp_echo().await;
+        let c = DirectConnector::new(Arc::new(Fixed(vec![ip("127.0.0.1")])));
+        for host in ["127.0.0.1", "echo.test"] {
+            let datagram = c
+                .connect_udp(
+                    &Target::new(HostName::parse(host), echo.port()),
+                    &ConnectOpts::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(datagram.peer_addr(), Some(echo));
+            send(&datagram, b"ping").await;
+            assert_eq!(recv(&datagram).await, b"ping");
+        }
+    }
+
+    /// The policy's socket options go on a UDP socket too; `set_tos(0)`
+    /// goes back to the policy's own `tos`.
+    #[tokio::test]
+    async fn the_hook_sees_the_tos_and_the_interface_of_a_udp_flow() {
+        let echo = udp_echo().await;
+        let hook = Arc::new(RecordingHook::default());
+        let connector = DirectConnector::with_opts(
+            Arc::new(SystemResolve),
+            SocketOpts {
+                interface: Some("test0".into()),
+                tos: 0x10,
+                ..SocketOpts::default()
+            },
+            hook.clone(),
+        );
+        let datagram = connector
+            .connect_udp(
+                &Target::new(HostName::Ip(echo.ip()), echo.port()),
+                &ConnectOpts::default(),
+            )
+            .await
+            .unwrap();
+        datagram.set_tos(0x88).unwrap();
+        datagram.set_tos(0).unwrap();
+        assert_eq!(
+            *hook.calls.lock().unwrap(),
+            ["tos 0x10 V4", "bind test0 V4", "tos 0x88 V4", "tos 0x10 V4"]
+        );
+    }
+
+    /// Whatever the system allows of `UDP_BUFFER`: more than it gives a
+    /// socket of its own accord.
+    #[test]
+    fn a_udp_flow_has_room_for_a_burst() {
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
+        let before = socket.recv_buffer_size().unwrap();
+        make_room(&socket);
+        assert!(
+            socket.recv_buffer_size().unwrap() > before,
+            "{before} bytes before"
+        );
+    }
+
+    #[tokio::test]
+    async fn ip_version_picks_the_address_of_a_udp_flow() {
+        let with = |answer: Vec<IpAddr>| {
+            DirectConnector::with_opts(
+                Arc::new(Fixed(answer)),
+                SocketOpts {
+                    ip_version: IpVersion::V4Only,
+                    ..SocketOpts::default()
+                },
+                Arc::new(NoopSocketHook),
+            )
+        };
+        let name = Target::new(HostName::parse("both.test"), 9);
+        let datagram = with(vec![ip("::1"), ip("127.0.0.1")])
+            .connect_udp(&name, &ConnectOpts::default())
+            .await
+            .unwrap();
+        assert_eq!(datagram.peer_addr(), Some("127.0.0.1:9".parse().unwrap()));
+        let err = with(vec![ip("::1")])
+            .connect_udp(&name, &ConnectOpts::default())
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no usable address for both.test: every answer was filtered out by ip-version"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connector_without_udp_says_so() {
+        struct TcpOnly;
+        impl Connector for TcpOnly {
+            fn connect<'a>(
+                &'a self,
+                _target: &'a Target,
+                _opts: &'a ConnectOpts,
+            ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+                Box::pin(std::future::ready(Err(io::Error::other("unused"))))
+            }
+        }
+        let err = TcpOnly
+            .connect_udp(
+                &Target::new(HostName::parse("a.test"), 1),
+                &ConnectOpts::default(),
+            )
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(err.to_string(), "this connection cannot carry UDP");
     }
 
     #[test]
