@@ -83,7 +83,8 @@ rurge-proto-ssh = { path = "crates/rurge-proto-ssh" }
 russh = { version = "0.63.3", default-features = false, features = ["ring", "rsa"] }
 rand = "0.10"
 rurge-proto-wireguard = { path = "crates/rurge-proto-wireguard" }
-# only the sans-IO `noise::Tunn`: no default features (`device` is a whole TUN driver)
+# only the sans-IO `noise::Tunn`: 0.7.1 has no default features, and
+# `default-features = false` keeps it that way (`device` is a whole TUN driver)
 boringtun = { version = "0.7.1", default-features = false }
 # the tunnel's own IP stack: TCP with Reno congestion control, UDP for the tunnel's
 # DNS, fragments of up to 16 KiB reassembled; no phy, no log

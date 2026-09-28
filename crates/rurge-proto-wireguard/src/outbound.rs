@@ -34,7 +34,8 @@ pub struct WireGuardOutbound {
     /// share a section but must not share carriers (`with_carrier`). Empty
     /// until set.
     carrier: String,
-    /// Destination names, without a `dns-server` (M4-D9).
+    /// Destination names, without a `dns-server` (M4-D9) and for its
+    /// `system` entries.
     resolver: Arc<dyn Resolve>,
     /// What the carriers to the peers come from.
     connector: Arc<dyn Connector>,

@@ -61,7 +61,9 @@ pub struct TestCase {
     pub mode: TestMode,
     pub timeout: Duration,
     /// What a result is good for: a result of the policy under another
-    /// definition, test URL or timeout is no result (M3 design 6.2).
+    /// definition (and, of a `wireguard` policy, another section), another
+    /// test URL or the native mode instead, or another timeout is no result
+    /// (M3 design 6.2).
     pub key: u64,
     /// What verifies an `https` test URL: the outbounds' own trust anchors
     /// (`OutboundFactory::roots`).

@@ -226,7 +226,7 @@ impl Stack {
             TunnResult::WriteToTunnelV6(packet, src) => (IpAddr::V6(src), packet.to_vec()),
             TunnResult::Done => return false,
             TunnResult::Err(e) => {
-                tracing::trace!(peer, error = ?e, "wireguard: a message was dropped");
+                tracing::trace!(peer = peer + 1, error = ?e, "wireguard: a message was dropped");
                 return false;
             }
         };
@@ -234,7 +234,7 @@ impl Stack {
         if self.routes.lookup(src) == Some(peer) {
             self.queues.rx.push_back(packet);
         } else {
-            tracing::trace!(peer, %src, "wireguard: a packet from outside the peer's allowed-ips was dropped");
+            tracing::trace!(peer = peer + 1, %src, "wireguard: a packet from outside the peer's allowed-ips was dropped");
         }
         false
     }
@@ -267,7 +267,7 @@ impl Stack {
         match p.tunnel.encapsulate(packet, &mut self.scratch) {
             TunnResult::WriteToNetwork(message) => out.push(outgoing(peer, message, p.client_id)),
             TunnResult::Err(e) => {
-                tracing::trace!(peer, error = ?e, "wireguard: a packet was dropped");
+                tracing::trace!(peer = peer + 1, error = ?e, "wireguard: a packet was dropped");
             }
             // held until the handshake is done
             _ => {}
@@ -285,7 +285,7 @@ impl Stack {
                 TunnResult::WriteToNetwork(message) => out.push(outgoing(i, message, p.client_id)),
                 TunnResult::Err(WireGuardError::ConnectionExpired) => expired.push(i),
                 TunnResult::Err(e) => {
-                    tracing::trace!(peer = i, error = ?e, "wireguard: a timer failed");
+                    tracing::trace!(peer = i + 1, error = ?e, "wireguard: a timer failed");
                 }
                 _ => {}
             }
@@ -316,8 +316,11 @@ impl Stack {
         );
         // what the relay writes goes out as it is written, as on a real socket
         socket.set_nagle_enabled(false);
-        // smoltcp 0.12's Cubic counts its window in bytes where RFC 8312
-        // counts segments: it keeps the window at a segment or two
+        // smoltcp 0.12 never compares the congestion window with the bytes
+        // in flight, only with the room left in the peer's window, so neither
+        // controller limits sending; Reno is set explicitly so that a later
+        // smoltcp that does honour the window does not fall back to 0.12's
+        // Cubic
         socket.set_congestion_control(tcp::CongestionControl::Reno);
         socket
             .connect(self.iface.context(), to, SocketAddr::new(local, port))
@@ -604,8 +607,11 @@ mod tests {
     }
 
     /// A poll sends one segment of each connection: an advance sends all a
-    /// connection may, and the window grows past a segment or two (Reno:
-    /// smoltcp 0.12's Cubic keeps it there).
+    /// connection may. Reno is set explicitly: smoltcp 0.12 never compares
+    /// the congestion window with the bytes in flight (only with the room
+    /// left in the peer's window), so neither controller limits sending,
+    /// and a later smoltcp that does honour the window must not fall back
+    /// to 0.12's Cubic.
     #[test]
     fn a_window_of_data_leaves_at_once() {
         let mut net = one_peer(PeerOpts::default());

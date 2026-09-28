@@ -170,6 +170,18 @@ impl Device {
                 io::Error::other("wireguard: the tunnel has no peer")
             })));
         }
+        // built before the critical section: a panic while building it
+        // cannot poison the table for the rest of the process
+        let shared = Arc::new(Shared {
+            stack: Mutex::new(Stack::new(section)),
+            kick: Notify::new(),
+            network_changed: AtomicBool::new(false),
+            greet: AtomicBool::new(false),
+            handshaken: Notify::new(),
+            closed: AtomicBool::new(false),
+        });
+        let mut out = Vec::new();
+        shared.stack.lock().expect("the tunnel").initiate(&mut out);
         // one critical section: sharing (another dial may have got there
         // first), conflict and registration decided and acted on together,
         // with no `.await` inside it — so two conflicting tunnels can never
@@ -181,7 +193,8 @@ impl Device {
                 continue;
             };
             if other == section && key.as_str() == carrier {
-                // the carriers just dialled are dropped with this frame
+                // the carriers just dialled, and the stack just built, are
+                // dropped with this frame
                 return Ok(device);
             }
             if conflict(other, section) && device.generation > generation {
@@ -198,16 +211,6 @@ impl Device {
             }
             !replaced
         });
-        let shared = Arc::new(Shared {
-            stack: Mutex::new(Stack::new(section)),
-            kick: Notify::new(),
-            network_changed: AtomicBool::new(false),
-            greet: AtomicBool::new(false),
-            handshaken: Notify::new(),
-            closed: AtomicBool::new(false),
-        });
-        let mut out = Vec::new();
-        shared.stack.lock().expect("the tunnel").initiate(&mut out);
         let peers = carriers.len();
         let driver = Driver {
             shared: shared.clone(),
@@ -440,7 +443,7 @@ async fn send(carrier: &mut Carrier, message: &Outgoing) -> bool {
     let datagram = &carrier.datagram;
     let sent = poll_fn(|cx| datagram.poll_send(cx, &message.datagram)).await;
     if let Err(e) = &sent {
-        tracing::trace!(peer = message.peer, error = %e, "wireguard: a message was not sent");
+        tracing::trace!(peer = message.peer + 1, error = %e, "wireguard: a message was not sent");
     }
     if marked && carrier.marks {
         let _ = carrier.datagram.set_tos(0);
@@ -539,9 +542,9 @@ impl Driver {
     /// B).
     async fn send_all(&mut self, out: &mut Vec<Outgoing>) -> Vec<usize> {
         let mut failed = Vec::new();
-        for message in std::mem::take(out) {
+        for message in out.drain(..) {
+            // leaving the loop drops the rest of the drain
             if self.shared.closed.load(Ordering::SeqCst) {
-                out.clear();
                 return Vec::new();
             }
             let Some(Some(carrier)) = self.carriers.get_mut(message.peer) else {
@@ -632,7 +635,7 @@ impl Driver {
                                 }
                             }
                             // an ICMP error the system reports on a connected socket
-                            Err(e) => tracing::trace!(peer, error = %e, "wireguard: a carrier failed to receive"),
+                            Err(e) => tracing::trace!(peer = peer + 1, error = %e, "wireguard: a carrier failed to receive"),
                         }
                         taken += 1;
                         // what else has arrived goes in before the stack runs
