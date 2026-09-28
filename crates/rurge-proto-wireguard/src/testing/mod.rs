@@ -2,6 +2,11 @@
 //! (feature `testing`). `PeerCore` is the peer without I/O: boringtun
 //! answering the client's handshakes, and a smoltcp host of its own that
 //! answers on every address routed to it — a TCP echo service on port 7.
+//! `FakeWgPeer` puts one on a loopback UDP port.
+
+mod peer;
+
+pub use peer::FakeWgPeer;
 
 use crate::stack::Queues;
 use crate::wire;
@@ -16,7 +21,7 @@ use smoltcp::socket::tcp;
 use smoltcp::wire::{
     HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpProtocol, Ipv4Packet,
 };
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 /// The TCP echo service of a peer.
@@ -63,6 +68,14 @@ pub fn section(
                 client_id: None,
             })
             .collect(),
+    }
+}
+
+/// `addr` as a peer's `endpoint`.
+pub fn endpoint(addr: SocketAddr) -> PeerEndpoint {
+    PeerEndpoint {
+        host: HostName::Ip(addr.ip()),
+        port: addr.port(),
     }
 }
 
@@ -118,6 +131,9 @@ pub struct PeerCore {
     pub pongs: Vec<(u16, usize)>,
     /// TCP connections accepted.
     pub accepted: usize,
+    /// Where each accepted connection went: the address and port the
+    /// client connected to.
+    pub connected_to: Vec<SocketAddr>,
     /// TCP connections the client reset.
     pub resets: usize,
 }
@@ -173,6 +189,7 @@ impl PeerCore {
             reserved: Vec::new(),
             pongs: Vec::new(),
             accepted: 0,
+            connected_to: Vec::new(),
             resets: 0,
         }
     }
@@ -323,8 +340,13 @@ impl PeerCore {
     fn serve(&mut self) {
         for k in 0..self.listeners.len() {
             let handle = self.listeners[k];
-            if self.sockets.get::<tcp::Socket>(handle).state() == tcp::State::Listen {
+            let listener = self.sockets.get::<tcp::Socket>(handle);
+            if listener.state() == tcp::State::Listen {
                 continue;
+            }
+            if let Some(local) = listener.local_endpoint() {
+                self.connected_to
+                    .push(SocketAddr::new(local.addr.into(), local.port));
             }
             self.accepted += 1;
             self.conns.push(Conn { handle, fin: false });

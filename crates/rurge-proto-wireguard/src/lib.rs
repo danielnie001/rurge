@@ -2,12 +2,16 @@
 //! tunnel — boringtun's sans-IO `Tunn` for each peer and a smoltcp TCP/IP
 //! stack of its own — that TCP connections are dialled through.
 
+mod device;
+pub mod outbound;
 pub mod routes;
 pub mod stack;
+mod stream;
 pub mod wire;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
+pub use outbound::WireGuardOutbound;
 pub use routes::Routes;
 pub use stack::{Outgoing, Refusal, Stack};

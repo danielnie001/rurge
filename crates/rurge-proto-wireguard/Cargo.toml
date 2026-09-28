@@ -9,16 +9,24 @@ repository.workspace = true
 
 [dependencies]
 rurge-config.workspace = true
+rurge-net.workspace = true
+rurge-proto.workspace = true
 boringtun.workspace = true
 smoltcp.workspace = true
 prefix-trie.workspace = true
 ipnet.workspace = true
 getrandom.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
+socket2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+socket2.workspace = true
 
 [features]
 # Loopback WireGuard peer (`rurge_proto_wireguard::testing`); enabled by dependants' dev-dependencies.
-testing = []
+testing = ["dep:socket2"]
 
 [lints]
 workspace = true

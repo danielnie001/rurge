@@ -3371,7 +3371,12 @@ dependencies = [
  "ipnet",
  "prefix-trie",
  "rurge-config",
+ "rurge-net",
+ "rurge-proto",
  "smoltcp",
+ "socket2",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 
