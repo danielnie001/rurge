@@ -10393,6 +10393,12 @@ git commit -m "docs: M4b WireGuard——兼容性清单、README、CLAUDE.md、�
 | 8 | 原生测速用例的两次等待没有时限 | 两处都设 5 秒时限 | 违反"有界等待"（评审发现） | 45d54d3 |
 | — | P3 ① 的理由："0.12 的 Cubic 把窗口压在一两个报文段" | 理由改正：0.12 从不拿拥塞窗口与在途字节数比较（tcp.rs:2159，报文段大小也不看它，tcp.rs:2418-2420），两种算法都不限制发送；仍显式设 Reno | 评审对照 smoltcp 0.12.0 源码 | — |
 | 各任务 | 门禁通过数：1060 / 1065 / 1079 / 1090 / 1098 / 1104 / 1112 / 1117 / 1120 / 1121 | 实际：1060 / 1065 / 1080 / 1091 / 1101 / 1110 / 1120 / 1125 / 1128 / 1129（2 个忽略自 Task 7 起） | 修正轮与补充的用例 | — |
+| 终审 | P12：每 5 分钟只重拨写成域名的 endpoint 与没有载体的 peer，新拨的载体去的地址不变就丢掉；握手没有回应只记一条 warn（在持锁时记）；"网络已变化"的入口阶段 2 没有调用者 | boringtun 放弃重试握手（约 90 秒）时给该 peer 新拨一条载体（地址相同也换）并立即握手；载体发送失败时同样换，每个 peer 至多每 10 秒一次（`REPLACE`）；要记日志、要重拨的 peer 在持锁时收集，放锁后再记日志、再拨号；新增用例 `a_carrier_that_fails_to_send_is_replaced` | 载体是已连接的 UDP 套接字：本机换了网络之后发送失败或从消失的地址发出，经这条策略的连接一直超时，直到重启 rurge（重载沿用没变的出站与隧道，也不管用）（终审发现） | ba0d882 |
+| 终审 | P14：每个问题只发一次，等 `DNS_WAIT`（2 秒）；问了两族时，只要不是两族都没有回应就算作答（"A 超时、AAAA 为空"也结束查找） | `Device::query` 在等待里每过三分之一重发同一个问题（同一个套接字、同一个 id，最多三次）；作答改为某一族有地址或问的每一族都作答了（`dns::answered`），否则问下一个服务器、不缓存；经隧道问 `dns-server` 之前先等隧道第一次握手完成（受拨号时限约束）；`PeerOpts` 加 `dns_ignore`、`handshake_ignore`；新增用例 `a_lost_question_is_answered_by_a_resend`、`a_server_has_answered_once_a_family_found_addresses_or_every_family_answered`、`the_first_lookup_waits_for_the_handshake` | 丢一个报文就让查询失败：隧道刚启动时丢了第一个握手发起包（boringtun 5 秒后才重试），最初的查询都会失败；"A 超时、AAAA 为空"时另配的服务器也不会去问（终审发现） | cb250b0 |
+| 终审 | Task 9：经隧道连 `127.0.0.1:<echo 端口>`（`allowed-ips = 127.0.0.1/32`） | `allowed-ips = 10.9.0.1/32`，往返连 sing-box 自己的隧道地址 `10.9.0.1:<echo 端口>`：sing-box 把发往端点自身地址的连接改写到它的 `127.0.0.1`（1.14.1 `protocol/wireguard/endpoint.go` 的 `NewConnectionEx`）；`tests/interop/README.md` 随之更新 | sing-box 的 `system: false` 端点是 gVisor 用户态协议栈，经隧道进来、目标是回环地址的连接可能被丢弃（终审发现）；本机没有 sing-box，这个用例在本机只打印 `skipping …`，要到 CI 上才验证 | 372d2d3 |
+| 终审 | Task 1：不认识的键与 `peer` 字段报 `W0001`，引用第一个 `=` 之前的全部文字 | 键名转小写后是 1–32 个 a-z、0-9、`-` 字符时才引用，否则说 `an unknown line ignored` / `peer <n>: an unknown field ignored`（仍是 `W0001`）；新增用例 `key_material_is_never_quoted_as_an_unknown_name` | Base64 密钥以 `=` 结尾：单独成行的密钥、或把 `=` 误写成 `:` 的 `private-key: <密钥>`，会把密钥（转成小写）写进诊断（终审发现） | 6f20f60 |
+| 终审 | `Device::start` 在 `TUNNELS` 的临界区里建协议栈；`stack.rs` 设 Reno 的注释沿用 P3 ① 已被否定的理由；`stack.rs` / `device.rs` 的 trace 日志里 peer 从 0 计；`send_all` 遍历 `std::mem::take(out)`；`resolver` 字段、`TestCase.key` 与根 `Cargo.toml` 里 boringtun 的注释不全或不准 | 临界区之前建好新隧道的 `Shared` / `Stack` 并格式化第一个握手（共用或被拒时丢掉）；注释改为正确的理由（0.12 从不拿拥塞窗口与在途字节数比较，显式设 Reno 是为了将来尊重窗口的版本不回落到 0.12 的 Cubic；用例断言不变）；trace 日志的 peer 从 1 计；`send_all` 遍历 `out.drain(..)`、遇到 `closed` 即停；三处注释改正 | 临界区里的 panic 会让 `TUNNELS` 在余下的进程里一直中毒；其余是注释、日志与缓冲容量的小修（终审发现与延后事项） | 63760d9 |
+| 终审 | Task 10 的文档 | 兼容性清单 4.2 节 `wireguard` 行补上：载体发送失败或 peer 不再回应握手时换载体（网络变化后不必重启）、隧道内 DNS 的重发与等第一次握手及"作答"的含义、每条连接 256 KiB 缓冲（单条连接每个往返至多约 256 KiB）、DNS 会话防环（有 endpoint 写成域名时改走直连）、同一份配置里两个节的冲突、名字记录轮换时的换载体；`encrypted-dns-follow-outbound-mode` 两行补上防环一句；`WireGuard 生命周期` 行指向载体替换；`WireGuard 测试` 行与 `docs/api/phase2.md` 的原生测速说法改正；手工验收加"网络变化"与"WARP 启动后的第一次查询"两项；本表六行与「延后事项」#9 ～ #30 | 终审发现与终审保留的延后事项 | 本轮的文档提交 |
 
 ## 延后事项
 
@@ -10406,3 +10412,25 @@ git commit -m "docs: M4b WireGuard——兼容性清单、README、CLAUDE.md、�
 | 6 | （已取消）隧道逐个启动（`STARTING`）——Task 6 修正轮去掉了全局启动锁，见执行期修正记录 | — |
 | 7 | 改了节或载体设置的重载进行时，还在用旧配置的拨号或测试得到 `wireguard: a newer configuration of this tunnel is in use`（P10，有意为之：不来回争抢） | 不处理 |
 | 8 | 隧道内 DNS 不查非 ASCII 的名字（P4） | M8（IDN） |
+| 9 | 同名的 `[WireGuard <name>]`：名字在校验第一个节之前就占上了，第一个节有错时，后面正确的那个也被丢掉（`W0020` 说"用第一个"）；与 `[Ruleset]` 的处理顺序相同 | M8 |
+| 10 | smoltcp 的连接错误一律报成 `wireguard: <地址> cannot be connected to`，目标端口为 0 时也是这句 | M8 |
+| 11 | 出站已释放、最后一个连接被丢弃时，FIN / RST 排进了队列，但设备任务随即结束，远端收不到关闭 | M8 |
+| 12 | `FakeWgPeer` 沉默时若已有截止时间，会在测试运行时里空转（目前没有用例在开着连接时让它沉默） | 有用例这样用它时（最迟 M8） |
+| 13 | 启动要等每个 peer 的载体都拨完：一个解析得慢的 endpoint 名字拖慢启动，超过拨号时限时整个启动作废，而其它 peer 本来可用 | M8 |
+| 14 | 设备任务死了（协议栈的锁中毒）不会被替换：之后经这条策略的每个连接都 panic，直到重载 | M8 |
+| 15 | 链路不载 UDP（`underlying-proxy`）或 endpoint 解析不了时，每次拨号对每个 peer 都记一条 warn `wireguard: the peer cannot be reached`，不限频（前者另有 `W0029` 与请求记录的说明） | M5 |
+| 16 | 没有用例：`set_tos` 失败之后不再标记、几个载体在 `recv_any` 与批量收里的轮换 | M8 |
+| 17 | SERVFAIL / REFUSED 的回答不算作答，但要等满这一轮的等待（2 秒）才问下一个服务器 | M8 |
+| 18 | 没有用例：P4 的响应码规则、`system` 失败之后继续查找、IPv6 的 DNS 服务器 | M8 |
+| 19 | `network_changed()` 用 `try_lock`：正有拨号占着出站的槽或在等启动时，这次事件被丢掉，载体留在旧网络上 | 阶段 3，**必须与"网络已变化"的探测器一起修** |
+| 20 | `Device::connect` / `Device::query` 不看 `is_closed()`：拿到设备之后遇上接替的拨号，要等满拨号时限（查询要等满每个 `dns_wait`）才失败 | M8 |
+| 21 | P13 的日志规则（每次没有回应记一条；`handshake completed` 只在第一次与恢复时记）没有用例 | M8 |
+| 22 | 共用的隧道以启动它的策略名记日志，那条策略改名或删掉之后也是 | M8 |
+| 23 | 共用从不提升隧道的代次：重载 S → S' → S 而还有连接占着第一条隧道时，S' 残留的会话会接替一次、切断当前配置的连接，之后又被夺回（共用时取较大的代次即可） | M8 |
+| 24 | 拨号期的 `Unsupported` 分支用 `set_error` 覆盖已有的说明：`smart` 组前面的成员失败、下一个是带 `underlying-proxy` 的 `wireguard` 策略时，"smart group …: tried …"丢失 | M5 |
+| 25 | bin 的 `Targets` 过滤（默认 TRACE）把 tracing 的最大级别提示抬到 TRACE：不管 `--log-level`，`log::max_level()` 都是 TRACE，依赖（rustls、russh）被关掉的 `log` 记录也要经 `LogTracer` 与分发器（只影响性能） | M8 |
+| 26 | 忽略的吞吐基准没有截止时间：卡住时（P3 ③）手动运行会一直挂着 | M8 |
+| 27 | `outbounds_wireguard.rs` 两条用例里"REJECT 并写说明"的断言重复 | M8 |
+| 28 | `close()` 不唤醒 `handshake()` 的等待者，`handshake()` 也不看 `closed`：被更晚的配置接替时，正在跑的原生测速要等满 `test-timeout` + 10 秒（占着 `TestBook` 的一个名额）才失败 | M8 |
+| 29 | 没有引擎用例：对原生测速的 `wireguard` 策略 `POST /v1/policies/test` 带 `url` 时按那个 URL 测（P7） | M8 |
+| 30 | CI 观察：Linux 上 UDP 缓冲封顶在 `rmem_max`（约 416 KiB），低于假对端要的 8 MiB——首次在 Linux 上跑时留意 `a_large_transfer_goes_through_whole` | 首次推送后看 CI |

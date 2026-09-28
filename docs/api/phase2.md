@@ -246,7 +246,7 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 
 ### `wireguard` 的测速（M4b）
 
-- 节里没有 `dns-server`、策略也没写 `test-url` 时，测试是一次握手：向每个 peer 强制握手，`delay` 是从发起到第一个握手完成的毫秒数（多个 peer 时最快者）；它只证明 peer 可达，不证明路由与出口（照手册）。peer 不回应时 `error` 是 `timed out`；隧道起不来时是出站的错误（如 `policy protocol not implemented: wireguard over underlying-proxy`）。
+- 节里没有 `dns-server`、策略也没写 `test-url` 时，测试是一次握手：向每个 peer 强制握手，`delay` 是从强制发起到任一 peer 第一个握手完成的毫秒数——通常是一个往返，之前已有一次发起在途时（隧道刚启动、换密钥、另一条策略的测试）可能更短；它只证明 peer 可达，不证明路由与出口（照手册）。peer 不回应时 `error` 是 `timed out`；隧道起不来时是出站的错误（如 `policy protocol not implemented: wireguard over underlying-proxy`）。
 - 否则经隧道两次 `HEAD`，与其它策略相同。
 - 两种都在超时之外另加 10 秒（第一次测试可能要先启动隧道）；`POST /v1/policies/test` 给了 `url` 时一律按那个 URL 测。
 
