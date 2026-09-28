@@ -111,3 +111,18 @@
 - [ ] 断线重建：让服务器断开 rurge 的会话（在服务器上结束那次登录对应的 `sshd` 进程，或重启服务器）之后，下一个经 `S` 的连接正常（重新登录）；断网两分钟再恢复之后同样正常（旧会话在 3 次保活无回应后判定已断）。
 - [ ] 口令写错：会话失败，错误是 `ssh: authentication failed`；日志与 `GET /v1/requests/recent` 里没有用户名与口令；第一次失败之后约一分钟内，新连接不连服务器、立即得到同一个错误；一直有请求（开着网页、rurge 做系统代理）时，服务器日志（`journalctl -u ssh` 或 `/var/log/auth.log`）里失败的登录前后相隔约 1、2、4、8 分钟，之后每 10 分钟一次，同时打开很多网页也不会多出来；把口令改对后 `rurge reload`，下一个连接立即登录成功（改了行的策略重建出站，退避从头开始）。
 - [ ] 日志（含 `--log-level verbose`）里搜不到口令与私钥内容。
+
+## M4b　WireGuard
+
+需要一个自己的 WireGuard 服务端（`wg-quick`、路由器或云主机均可），WARP 一项另需一份 Cloudflare WARP 的配置（带 `client-id`）。自动化测试只用回环与假对端，对 sing-box 的互操作只在 CI 上跑，覆盖不了真实网络。
+
+- [ ] 基本连通：照服务端写 `[WireGuard home]`（`private-key`、`self-ip`、`peer = (public-key = …, allowed-ips = 0.0.0.0/0, endpoint = <服务器>:<端口>)`）与 `WG = wireguard, section-name=home`，经 `WG` 浏览几个网站正常；日志里有一条 `wireguard: handshake completed`（只带 `policy=WG peer=1`）；服务端 `wg show` 里 rurge 这个 peer 有 latest handshake 与收发字节。
+- [ ] 目标域名：不写 `dns-server` 时目标域名在本机解析（`[Host]` 里写的映射生效）；写上 `dns-server = <隧道那头的 DNS>` 后经隧道查询（服务端抓包或 DNS 日志能看到查询），查不到的名字请求失败，错误是 `dns: wireguard: dns lookup of <名字> failed`。
+- [ ] 路由：`allowed-ips` 只写服务端内网网段（如 `10.8.0.0/24`），规则把一个公网域名指到 `WG`：请求立即失败，错误是 `wireguard: no peer's allowed-ips covers <地址>`，没有改走直连。
+- [ ] 吞吐：经 `WG` 下载、上传一个几百 MiB 的文件，速度与官方客户端在同一量级、全程不卡住；记下实测数字（自动化基准只测回环，两端都是 smoltcp）。
+- [ ] WARP：用 WARP 的配置（`client-id = <三个数字>`，endpoint `engage.cloudflareclient.com:2408`），经 `WG` 访问 `https://www.cloudflare.com/cdn-cgi/trace`，输出里有 `warp=on`。
+- [ ] 测速：把 `WG` 放进 `url-test` 组。不写 `dns-server` 与 `test-url` 时测速结果是握手往返时间（`GET /v1/policy_groups/test_results`），请求记录里测试会话的目标是服务端的 endpoint；写上 `test-url=http://…` 后改为经隧道的 URL 测试。
+- [ ] 重载：只改无关的内容后 `rurge reload`，经 `WG` 的下载不中断、服务端没有新的握手；改了 `[WireGuard home]`（如 `mtu`）后 `rurge reload`，旧连接断开，新连接正常，服务端 `wg show` 里这个 peer 的 endpoint 稳定在一个地址上。
+- [ ] endpoint 写成域名：让它的解析结果换成同一服务端的另一个地址（或另一台同配置的服务端），5 分钟内日志出现 `wireguard: the peer's endpoint moved`，之后的新连接走新地址。
+- [ ] 服务端停掉：经 `WG` 的请求在拨号时限处失败；约 90 秒后日志有一条 `wireguard: the peer did not answer the handshake`；服务端恢复后下一个请求正常，日志再有一条 `wireguard: handshake completed`。
+- [ ] 日志（含 `--log-level verbose`）里搜不到私钥与 `preshared-key` 的内容；`GET /v1/profiles/current?sensitive=0` 里二者都是 `***`。

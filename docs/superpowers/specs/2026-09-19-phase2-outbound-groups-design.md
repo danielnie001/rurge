@@ -72,7 +72,7 @@ M1 体量大，细化设计时可按阶段 1 的先例拆成 M1a（配置与抽�
 | QUIC / HTTP/3 | `quinn`（自定义 UDP 载体供链式拨号、自定义拥塞控制供 Hysteria 2、datagram 供 TUIC / MASQUE）+ `h3` | M7 | 风险 B：`h3` 的 extended CONNECT 与 HTTP Datagram 的成熟度；`ecn` 的支持程度 |
 | SSH | `russh` 客户端，动态转发用 direct-tcpip 通道；OpenSSH 私钥解析用 `ssh-key` | M4 | 已验证（M4a）：russh 0.63.3（`ring` 后端）两者都支持，`aes128-gcm@openssh.com` 不在它的默认列表里，由 rurge 显式加上（见 Q5） |
 | WireGuard | `boringtun` 的 sans-IO `Tunn`（Noise 握手与定时器）；`client-id` 在包头保留字节上处理；多 peer 的最长前缀路由复用现有 `prefix-trie` | M4 | 风险 C：boringtun 的维护节奏 |
-| 用户态协议栈 | `smoltcp`，作为 `rurge-proto-wireguard` 的内部模块（见 D9） | M4 | TCP 吞吐基准 |
+| 用户态协议栈 | `smoltcp`，作为 `rurge-proto-wireguard` 的内部模块（见 D9）；M4b 用 0.12.0，拥塞控制 Reno | M4 | TCP 吞吐基准 |
 | Snell | 协议非公开（PRD R1 / R7）：只依据公开的第三方资料实现 v1 ～ v4 | M6 | 各版本可得的公开资料范围 |
 | 测试证书 | `rcgen`（已是 dev 依赖）现场生成自签链 | M1 | — |
 
@@ -421,7 +421,7 @@ Surge 手册没有定义这些端点的响应结构（PRD R5）：以收集到�
 | D | Snell 与 `smart` 的细节非公开（PRD R1） | 行为无法完全一致 | 近似实现，差异登记在清单；Snell v5 / v6 只出可行性报告 |
 | E | 范围过大（PRD R6） | 迟迟没有可用版本 | 按使用优先级排里程碑、TCP 优先、P2 放最后；M1 + M2 结束即可用手写的 `[Proxy]` 与 `select` 组日常使用，订阅与自动组随 M3 到位 |
 | F | 参考二进制的版本漂移与各平台可得性 | 互操作测试不稳定 | 固定版本 + SHA256；缺失时本机跳过、CI 失败 |
-| G | smoltcp 的 TCP 吞吐 | WireGuard 出站性能 | M4 做基准；接口收窄以便替换；阶段 3 复核 |
+| G | smoltcp 的 TCP 吞吐 | WireGuard 出站性能 | M4 做基准；接口收窄以便替换；阶段 3 复核。M4b 实测（Windows 11 回环、两端都是 smoltcp 的双向回显）约 6.5 MiB/s 每方向；0.12 另有回退 N 重传、没有零窗口探测等限制（M4 设计第 19 节、M4b 计划 P3） |
 
 ## 16. 已决事项与开放问题
 
@@ -441,7 +441,7 @@ Surge 手册没有定义这些端点的响应结构（PRD R5）：以收集到�
 | Q1 | Windows 上是否改用 `IP_UNICAST_IF` | 已决（2026-09-19）：不改，继续用"绑定该网卡的源地址"，不引入 unsafe；差异登记在兼容性清单 |
 | Q2 | Shadow TLS v3 的实现路径 | 已决（2026-09-20，M2-D3）：stock rustls，两遍构造 ClientHello |
 | Q3 | 六个 API 端点的 JSON 形状 | M1 / M3 细化设计时按真实样本定（PRD R5） |
-| Q4 | sing-box 的用户态 WireGuard 端点能否充当带保留字节的对端 | M4 细化设计时验证；不行则用 boringtun 写回环对端 |
+| Q4 | sing-box 的用户态 WireGuard 端点能否充当带保留字节的对端 | M4b 已决：sing-box 1.14.1 的 `endpoints`（`type: wireguard`，`system: false`）以 `peers[].reserved` 给发往 rurge 的报文写保留字节，可以充当；它的 UDP 端口开在所有地址上（端点没有监听地址这一项）。互操作用例只在 CI 上跑；回环对端另用 boringtun 写（`FakeWgPeer`） |
 | Q5 | `russh` 的算法覆盖 | 已决（2026-09-27，M4-D2 与 M4 设计第 17 节）：russh 0.63.3 支持 `curve25519-sha256` 与 `aes128-gcm@openssh.com`；后者不在默认列表里，rurge 显式加上，并去掉 SHA-1 的 `ssh-rsa` 主机密钥签名 |
 | Q6 | MASQUE 与 trust-tunnel 的参考服务端 | M7 细化设计时选定 |
 | Q7 | Snell 各版本可依据的公开资料 | M6 细化设计时确认 |

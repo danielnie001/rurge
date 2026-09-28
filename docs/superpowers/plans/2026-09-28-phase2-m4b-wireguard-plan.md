@@ -10384,16 +10384,25 @@ git commit -m "docs: M4b WireGuard——兼容性清单、README、CLAUDE.md、�
 
 | 任务 | 计划原文 | 实际做法 | 原因 | 提交 |
 | ---- | -------- | -------- | ---- | ---- |
+| 3 | `self-ip` / `self-ip-v6` 只检查能否解析成地址 | 只收单播地址，组播、广播、未指定地址是 `E0023`；新增用例 `self_ips_are_unicast_addresses` | smoltcp 对非单播的接口地址 panic：能通过 `rurge check` 的配置第一次拨号就 panic（评审发现） | d461af7 |
+| 4 | 批量收时持协议栈的锁读载体（P9 的代码） | 锁只包住 `Stack::receive`，载体在锁外读；Task 6、8 的 `device.rs` 块随之改写 | 收报文的系统调用进了锁，违反 M4-D5（评审发现） | f4818dc |
+| 5 | `Device::query` 先建 `UdpExchange` 再发送；`dns-server` 只挡 IPv4 组播 | 发送成功后才建；发送失败在持锁时关掉套接字、换下一个服务器；`dns-server` 不收两族组播、未指定地址与端口 0；新增用例 `a_dns_server_the_stack_cannot_send_to_is_passed_over`、`dns_servers_are_addresses_a_question_can_go_to` | 发送失败时 `UdpExchange` 的 `Drop` 在持锁时再次加锁，线程卡死并逐步拖住整个进程（评审发现）；P15 写的是组播一律不收 | 7373344 |
+| 6 | 按节共用隧道；全局启动锁 `STARTING`；`close()` 只中止任务 | 按节与载体键共用（`WireGuardOutbound::with_carrier`）；去掉全局启动锁：先在锁外拨载体，再在隧道表的一次临界区里决定共用、拒绝或接替；被接替的设备任务不再发送；新增三条用例 | 只按节共用会让带 `underlying-proxy` 的策略共用直连隧道、让只改策略行的重载不生效；全局锁让启动排队、两条隧道可能互等到超时；中止不抢占正在被轮询的任务（评审发现） | c1addb4 |
+| 7 | 工厂分支 `WireGuardOutbound::new(…)` | 另设载体键 `.with_carrier(…)`：`[General] ipv6`、`ip-version`、`underlying-proxy`；新增端到端用例 `a_policy_over_underlying_proxy_never_shares_the_tunnel`、`a_reload_that_changes_the_carriers_takes_the_tunnel_over`；Task 7、8 的 brief 按重放后的副本重新生成 | Task 6 修正轮的裁决 | 3744f9c |
+| 7 | 吞吐基准：写计划时约 9.8 秒（6.5 MiB/s 每方向） | 实测 64 MiB 双向 10.99 秒（5.8 MiB/s 每方向） | 同一量级 | 3744f9c |
+| 8 | 原生测速用例的两次等待没有时限 | 两处都设 5 秒时限 | 违反"有界等待"（评审发现） | 45d54d3 |
+| — | P3 ① 的理由："0.12 的 Cubic 把窗口压在一两个报文段" | 理由改正：0.12 从不拿拥塞窗口与在途字节数比较（tcp.rs:2159，报文段大小也不看它，tcp.rs:2418-2420），两种算法都不限制发送；仍显式设 Reno | 评审对照 smoltcp 0.12.0 源码 | — |
+| 各任务 | 门禁通过数：1060 / 1065 / 1079 / 1090 / 1098 / 1104 / 1112 / 1117 / 1120 / 1121 | 实际：1060 / 1065 / 1080 / 1091 / 1101 / 1110 / 1120 / 1125 / 1128 / 1129（2 个忽略自 Task 7 起） | 修正轮与补充的用例 | — |
 
 ## 延后事项
 
 | # | 事项 | 去向 |
 | - | ---- | ---- |
-| 1 | smoltcp 0.12 的 TCP 限制（P3 ② ～ ⑤）：丢包后整窗重发、发送方没有零窗口探测、对端关闭之后在途数据丢失不再重传、不开 keep-alive。极少数上传可能卡到空闲超时 | MSRV 升到 1.91 时改用 smoltcp 0.13 或更新版本，届时逐条核对（项目所有者决定）；已登记为差异 |
+| 1 | smoltcp 0.12 的 TCP 限制（P3 ② ～ ⑤）：丢包后整窗重发、发送方没有零窗口探测、对端关闭之后在途数据丢失不再重传、不开 keep-alive、拥塞窗口实际不限制发送（0.12 从不与在途字节数比较）。极少数上传可能卡到空闲超时 | MSRV 升到 1.91 时改用 smoltcp 0.13 或更新版本，届时逐条核对（项目所有者决定）；已登记为差异 |
 | 2 | 经 WireGuard 的 UDP、`underlying-proxy`、`ecn` | M5 |
 | 3 | "网络已变化"的探测器（入口已有，P12） | 阶段 3 |
 | 4 | 对 sing-box WireGuard 端点的互操作只在 CI 上真正运行，本机验证不了（P8） | 首次推送后看 CI |
 | 5 | 每个报文的开销以 Windows 的 UDP 系统调用为主（P19）；没做批量收发（`recvmmsg` / GSO / GRO） | 有用户报告吞吐问题、或阶段 3 做 TUN 时再看 |
-| 6 | 隧道逐个启动（`STARTING`，P10）：一个启动得慢的隧道（endpoint 的名字很久才解析出来）会让别的隧道的启动也等着 | 有用户报告再说 |
-| 7 | 改了节的重载进行时，还在用旧配置的拨号或测试得到 `wireguard: a newer configuration of this tunnel is in use`（P10，有意为之：不来回争抢） | 不处理 |
+| 6 | （已取消）隧道逐个启动（`STARTING`）——Task 6 修正轮去掉了全局启动锁，见执行期修正记录 | — |
+| 7 | 改了节或载体设置的重载进行时，还在用旧配置的拨号或测试得到 `wireguard: a newer configuration of this tunnel is in use`（P10，有意为之：不来回争抢） | 不处理 |
 | 8 | 隧道内 DNS 不查非 ASCII 的名字（P4） | M8（IDN） |

@@ -428,3 +428,25 @@ M4-D7 ～ D13 是按 M4-D1 ～ D6 逐节细化时由项目所有者确认的（2
 | 5.4 保活用 russh `Config` 的 `keepalive_interval` / `keepalive_max`；计划 P6 不用 `inactivity_timeout` | `inactivity_timeout` 设为 5 分钟（它给每次写出限时：服务器不再收数据的连接 5 分钟内结束）；登录（密钥交换加认证）最多 20 秒，拨号放弃或到时 rurge 立即关掉这条连接 | 终审与合并后的修正：russh 0.63.3 在登录之前到点的保活计时器不再重置，会话任务会反复空转；而密钥交换期间它不看 `Handle`，拨号放弃后也不会自己结束。现在交给 russh 的连接在密钥交换期间可被放弃（读取立即失败，任务随之结束），登录又在第一次保活（30 秒）之前结束，未登录的会话不会待到保活到点。已建立的会话上每次保活应答都会重置 `inactivity_timeout`，"空闲 = 没有打开的通道"不变 |
 | — | 服务器向 rurge 开的通道（`forwarded-tcpip`、`forwarded-streamlocal`、agent 转发、`session`、`direct-tcpip`、`direct-streamlocal`、`x11`）一律以 administratively prohibited 拒绝，与 OpenSSH 相同 | 终审：rurge 不请求任何转发，russh 的客户端却默认接受这些通道；不怀好意的服务器（比如第三方订阅里的）能让 rurge 为每个这样的通道分配状态 |
 | 5.3 "口令认证用 `password`" | 口令只经 SSH 的 `password` 方法发送，不走 `keyboard-interactive`：只经 `keyboard-interactive` 收口令的服务器（FreeBSD 的默认配置、部分 PAM 配置）登录失败（`ssh: authentication failed`）；已登记为差异 | 终审 |
+
+## 19. M4b 计划期的订正
+
+写 M4b 计划（`docs/superpowers/plans/2026-09-28-phase2-m4b-wireguard-plan.md`）时核对 boringtun 0.7.1、smoltcp 0.12.0、hickory-proto 与本仓库源码，并把全部任务在仓库副本上真实做过一遍之后，与上文不同的地方；P 编号是该计划「计划期决定」表的编号。
+
+| 本文原文 | 计划 | 依据 |
+| -------- | ---- | ---- |
+| 6.6 `Datagram` 有收、发与 `set_dscp` | 收发是 `poll_send` / `poll_recv`（一个任务同时等几个载体）；`set_tos` 取 TOS 字节（0x88 即 DSCP AF41），0 回到策略自己的 `tos`；另有 `peer_addr`；`DirectConnector::connect_udp` 取解析结果的第一个地址（UDP 没有"连上"可比），收发缓冲尽量设为 7 MiB（P5） | 回环基准：Windows 默认的 64 KiB 收缓冲装不下一个 TCP 窗口的突发，丢包后 smoltcp 整窗重发 |
+| 6.1 "设备任务：每个 WireGuard 出站一个" | 每个节与载体设置（`ip-version`、`underlying-proxy`、`[General] ipv6`）一条隧道，两者都相同的策略共用；一条隧道启动时结束同一私钥、有共同 peer、来自更早配置的那条，更早配置的策略不能再把它抢回去；启动不排队：先在锁外拨好载体，再在隧道表的一次临界区里决定共用、拒绝或接替，被接替的隧道不再发送任何报文（P10；载体设置与不排队是实施时的修正） | 同一私钥连着同一 peer 的两条隧道会互相抢 peer 记住的地址（peer 回应最后写来的地址）：重载改了节、两条策略指向同一个节时都会出现；只按节共用会让带 `underlying-proxy` 的策略共用直连隧道、绕过 REJECT，也让只改策略行的重载不生效；全局启动锁会让两条隧道的启动互等到超时 |
+| 6.5 "出站对象被释放 → 设备任务结束，载体关闭，进行中的流读写返回错误" | 隧道活到出站与经它的连接都释放为止；被更新的配置接替时才立即结束、连接随之失败（P11） | 重载不打断无关的连接（M3a）；隧道之间的冲突已由 P10 处理 |
+| 6.5 "地址变了就重连该载体，地址族变了就重建" | 两种一样：每 5 分钟为写成域名的 endpoint 新拨一条载体，它去的地址不同就换上并立即握手；启动时连不上的 peer 也每 5 分钟再拨（P12） | 新载体总是新 socket，两种情形没有区别 |
+| 6.1 "被流的读写唤醒时立即推进一次协议栈" | 推进时反复 `poll` 到没有东西可发；收到报文时先把载体上已到的全部收下（最多 256 个）再推进（P2、P9） | smoltcp 0.12 的一次 `poll` 每条连接最多发一个报文段 |
+| —（没写拥塞控制） | Reno（只开 `socket-tcp-reno`，每条连接显式设置）（P3） | smoltcp 0.12 从不拿拥塞窗口与在途字节数比较（只与对端窗口的余量比较），两种算法都不真正限制发送；显式设 Reno，免得以后按窗口限速的版本落到 0.12 的 Cubic（它把 RFC 8312 以报文段计的窗口按字节算） |
+| 6.4 "超过 MTU 的包不发（手册：丢弃）" | TCP 报文段按 MSS 切分，本来不会超出；更大的 IPv4 外发包由 smoltcp 分片后发出，只到 1500 字节的分片缓冲为止（P2） | 开了分片重组的特性，分片随之开启 |
+| 6.3 的细节 | 第一个作答的服务器为准（"没有这个名字"也算）；该族没有本端地址或没有 peer 覆盖的服务器直接跳过；每个服务器最多等 2 秒；缓存最多 256 个名字、最长 1 小时、只存有地址的结果（P14） | 设计只写了原则 |
+| 第 9 节"WireGuard 的握手成功 / 失败" | 成功只在第一次与失败之后恢复时记（`info`），失败在 boringtun 放弃重试时记一次（约 90 秒后，`warn`）；boringtun 自己的日志在 bin 里关掉（P13） | 流量不断时每两分钟换一次密钥，每次都记会刷屏；boringtun 的日志不带策略名 |
+| 4.3 "`underlying-proxy` → `W0029`" | `W0029` 用专门的说法：`` `underlying-proxy` does not work with `wireguard` policies in this version; the policy rejects every connection ``；拨号时的 `Unsupported` 由引擎写进请求记录（此前引擎只在解析期写这类说明）（P17） | 通用说法"没有效果"不对：策略会 REJECT |
+| 4.7 "`preshared-key` 已在名单里" | 不在，M4b 加上（P16） | `redact.rs` 的名单 |
+| 4.1 没写重名的节 | 同名的节只用第一个，`W0020`（P15）；peer 的 endpoint 主机名进"代理服务器主机名"集合，`[Host]` 不作用于它 | 与重名策略、代理服务器主机名一致 |
+| 第 16 节草图：7 测速、8 引擎 | 7 引擎、8 测速（P18） | 原生测速的端到端用例要经引擎 |
+| 4.1 `self-ip` / `self-ip-v6` "纯地址，不是前缀" | 还须是单播地址：组播、广播、未指定地址是 `E0023`（实施时加） | smoltcp 对非单播的接口地址直接 panic，能通过 `rurge check` 的配置会在第一次拨号时 panic |
+| 4.1 `dns-server` "IPv4 组播地址不接受" | 两族的组播地址、未指定地址与端口 0 都是 `E0023`（实施时加）；运行时发不出去的问题立即换下一个服务器 | P15 写的是组播一律不收；这些地址发不出问题，而旧代码在发送失败时会在持锁时再次加锁 |

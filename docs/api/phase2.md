@@ -210,7 +210,7 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 
 请求体 `{"policy_names": ["<名字>", …], "url": "<URL>"}`，`url` 可省略（或为空字符串）。
 
-- 省略 `url`：每个策略按它自己的测试 URL 与超时测（策略的 `test-url` / `test-timeout`，否则 `[General]` 的 `proxy-test-url`——直连类用 `internet-test-url`——与 `test-timeout`）；结果保存，自动组随即按它选择。
+- 省略 `url`：每个策略按它自己的测试 URL 与超时测（策略的 `test-url` / `test-timeout`，否则 `[General]` 的 `proxy-test-url`——直连类用 `internet-test-url`——与 `test-timeout`）；`wireguard` 策略没有 `dns-server` 也没写 `test-url` 时改为握手测速（见下面「`wireguard` 的测速」）；结果保存，自动组随即按它选择。
 - 给了 `url`：全部策略在这个 URL 上各测一次，超时仍用各自的；结果**不保存**，不影响任何组。
 - 各策略同时测（全进程最多 8 个测试同时进行，其余排队）；全部测完才返回。
 
@@ -244,9 +244,15 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 
 对 `url-test` / `fallback` / `load-balance` / `smart` 组，同一个请求体设置**临时覆盖**：该组从下一条连接起固定用这个成员，期间不因使用而测试；`"policy": ""` 清除覆盖，恢复按测试结果选择。覆盖不写 `state.json`，进程重启后不在；组定义（不计行位置）不变的重载保留它，组消失或定义变了就清除；覆盖的成员从成员表里消失（订阅更新）时覆盖失效。
 
+### `wireguard` 的测速（M4b）
+
+- 节里没有 `dns-server`、策略也没写 `test-url` 时，测试是一次握手：向每个 peer 强制握手，`delay` 是从发起到第一个握手完成的毫秒数（多个 peer 时最快者）；它只证明 peer 可达，不证明路由与出口（照手册）。peer 不回应时 `error` 是 `timed out`；隧道起不来时是出站的错误（如 `policy protocol not implemented: wireguard over underlying-proxy`）。
+- 否则经隧道两次 `HEAD`，与其它策略相同。
+- 两种都在超时之外另加 10 秒（第一次测试可能要先启动隧道）；`POST /v1/policies/test` 给了 `url` 时一律按那个 URL 测。
+
 ### 测试会话
 
-每次测试是请求记录（`GET /v1/requests/recent`）里的一条内部会话：`listener` 为 `internal`、`rule` 为 `policy test`、`policy` 是被测的策略、目标是测试 URL 的主机与端口（不含路径与参数）；失败时 `error` 是上面 Result 里的原因。它们与 DNS 会话一样不能经 `POST /v1/requests/kill` 终止（409）。
+每次测试是请求记录（`GET /v1/requests/recent`）里的一条内部会话：`listener` 为 `internal`、`rule` 为 `policy test`、`policy` 是被测的策略、目标是测试 URL 的主机与端口（不含路径与参数；`wireguard` 的握手测速是第一个 peer 的 endpoint）；失败时 `error` 是上面 Result 里的原因。它们与 DNS 会话一样不能经 `POST /v1/requests/kill` 终止（409）。
 
 ## `smart` 组（M3c）
 
