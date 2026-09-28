@@ -16,6 +16,7 @@ smoltcp.workspace = true
 prefix-trie.workspace = true
 ipnet.workspace = true
 getrandom.workspace = true
+hickory-proto.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true

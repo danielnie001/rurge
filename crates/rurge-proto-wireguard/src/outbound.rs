@@ -3,16 +3,21 @@
 //! lives.
 
 use crate::device::Device;
+use crate::dns::{self, Cache, Family};
 use crate::stack::Refusal;
 use rurge_config::HostName;
 use rurge_config::spec::WireGuardSpec;
-use rurge_config::wireguard::WireGuardSection;
+use rurge_config::wireguard::{TunnelDns, WireGuardSection};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Resolve, Target};
 use rurge_proto::{Outbound, OutboundError};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+
+/// How long one `dns-server` has to answer before the next is asked.
+const DNS_WAIT: Duration = Duration::from_secs(2);
 
 pub struct WireGuardOutbound {
     name: String,
@@ -23,6 +28,10 @@ pub struct WireGuardOutbound {
     connector: Arc<dyn Connector>,
     /// The running tunnel; the first dial starts it, the others wait.
     device: Mutex<Option<Arc<Device>>>,
+    /// What the tunnel's `dns-server`s answered, for their TTL.
+    cache: StdMutex<Cache>,
+    /// `DNS_WAIT` (shorter in the tests).
+    dns_wait: Duration,
 }
 
 impl WireGuardOutbound {
@@ -39,6 +48,8 @@ impl WireGuardOutbound {
             resolver,
             connector,
             device: Mutex::new(None),
+            cache: StdMutex::new(Cache::default()),
+            dns_wait: DNS_WAIT,
         }
     }
 
@@ -52,18 +63,91 @@ impl WireGuardOutbound {
         Ok(device)
     }
 
-    /// Where a connection to `target` goes: its address, or its name
-    /// resolved on this machine (M4-D9).
-    async fn address(&self, target: &Target) -> Result<IpAddr, OutboundError> {
+    /// Where a connection to `target` goes: its address, or its name's.
+    async fn address(
+        &self,
+        target: &Target,
+        device: &Arc<Device>,
+    ) -> Result<IpAddr, OutboundError> {
         let name = match &target.host {
             HostName::Ip(ip) => return Ok(*ip),
             HostName::Domain(name) => name,
         };
-        let addrs =
-            self.resolver.resolve(name).await.map_err(|_| {
-                OutboundError::Dns(format!("wireguard: dns lookup of {name} failed"))
-            })?;
+        let addrs = self
+            .lookup(name, device)
+            .await
+            .ok_or_else(|| OutboundError::Dns(format!("wireguard: dns lookup of {name} failed")))?;
         pick(&addrs, &self.section).map_err(|refusal| OutboundError::Proxy(refusal.to_string()))
+    }
+
+    /// `name`'s addresses: from the section's `dns-server`s in order through
+    /// the tunnel — the first that answers ends the search, `system` asks
+    /// this machine — or, without any, from this machine (M4-D9).
+    async fn lookup(&self, name: &str, device: &Arc<Device>) -> Option<Vec<IpAddr>> {
+        if self.section.dns_servers.is_empty() {
+            return self.resolver.resolve(name).await.ok();
+        }
+        if let Some(addrs) = self
+            .cache
+            .lock()
+            .expect("the cache")
+            .get(name, Instant::now())
+        {
+            return Some(addrs);
+        }
+        for server in &self.section.dns_servers {
+            let server = match server {
+                TunnelDns::System => match self.resolver.resolve(name).await {
+                    Ok(addrs) => return Some(addrs),
+                    Err(_) => continue,
+                },
+                TunnelDns::Server(server) => *server,
+            };
+            let Some(answer) = self.ask(device, server, name).await else {
+                continue;
+            };
+            let ttl = answer.iter().map(|(_, ttl)| *ttl).min().unwrap_or(0);
+            let addrs: Vec<IpAddr> = answer.into_iter().map(|(ip, _)| ip).collect();
+            self.cache.lock().expect("the cache").put(
+                name,
+                addrs.clone(),
+                Duration::from_secs(ttl.into()),
+                Instant::now(),
+            );
+            return (!addrs.is_empty()).then_some(addrs);
+        }
+        None
+    }
+
+    /// `server`'s answer for `name`: A and AAAA at once, for the families
+    /// the tunnel has an address of. `None` when it gave none within
+    /// `dns_wait`, or no peer takes it.
+    async fn ask(
+        &self,
+        device: &Arc<Device>,
+        server: SocketAddr,
+        name: &str,
+    ) -> Option<Vec<(IpAddr, u32)>> {
+        let ask = |family: Family, wanted: bool| async move {
+            if !wanted {
+                return None;
+            }
+            let id = getrandom::u32().unwrap_or(0) as u16;
+            let question = dns::question(id, name, family)?;
+            device
+                .query(server, &question, self.dns_wait, |reply| {
+                    dns::answer(reply, id, name, family)
+                })
+                .await
+        };
+        let (v4, v6) = tokio::join!(
+            ask(Family::V4, self.section.self_ip.is_some()),
+            ask(Family::V6, self.section.self_ip_v6.is_some())
+        );
+        if v4.is_none() && v6.is_none() {
+            return None;
+        }
+        Some(v4.into_iter().chain(v6).flatten().collect())
     }
 
     async fn dial(
@@ -72,7 +156,7 @@ impl WireGuardOutbound {
         opts: &ConnectOpts,
     ) -> Result<BoxedStream, OutboundError> {
         let device = self.device(opts).await?;
-        let ip = self.address(target).await?;
+        let ip = self.address(target, &device).await?;
         let stream = device.connect(SocketAddr::new(ip, target.port)).await?;
         Ok(Box::new(stream))
     }
@@ -119,7 +203,9 @@ impl Outbound for WireGuardOutbound {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{ECHO_PORT, FakeWgPeer, PeerOpts, endpoint, keypair, section};
+    use crate::testing::{
+        DNS_ADDRESS, ECHO_PORT, FakeWgPeer, PeerOpts, endpoint, keypair, section,
+    };
     use rurge_config::wireguard::PeerEndpoint;
     use rurge_net::connector::{BoxedDatagram, Datagram, DirectConnector, SystemResolve};
     use std::io;
@@ -492,6 +578,129 @@ mod tests {
             self.log.lock().unwrap().push(format!("tos {tos:#04x}"));
             Ok(())
         }
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// A peer that answers `echo.test` with `addrs`, and whose name server
+    /// comes after `before` in the section's `dns-server`.
+    async fn with_tunnel_dns(
+        addrs: &[&str],
+        before: &[TunnelDns],
+        edit: impl FnOnce(&mut WireGuardSection),
+    ) -> (FakeWgPeer, WireGuardOutbound) {
+        let names = Arc::new(Names(vec![("local.test", vec![ip("10.0.0.1")])]));
+        let dns = vec![(
+            "echo.test".to_string(),
+            addrs.iter().map(|a| ip(a)).collect(),
+        )];
+        let mut servers = before.to_vec();
+        servers.push(TunnelDns::Server(SocketAddr::new(DNS_ADDRESS.into(), 53)));
+        tunnel_with(
+            PeerOpts {
+                dns,
+                ..PeerOpts::default()
+            },
+            |s| {
+                s.dns_servers = servers;
+                edit(s);
+            },
+            names,
+            direct(),
+        )
+        .await
+    }
+
+    /// With a `dns-server`, a name is asked through the tunnel, and the
+    /// answer kept for its TTL.
+    #[tokio::test]
+    async fn a_name_is_resolved_through_the_tunnel() {
+        let (peer, wg) = with_tunnel_dns(&["10.0.0.1"], &[], |_| {}).await;
+        for _ in 0..2 {
+            let mut stream = wg
+                .connect_tcp(&at("echo.test", ECHO_PORT), &within(5))
+                .await
+                .expect("a connection");
+            assert_eq!(echo(&mut stream, b"ping").await, b"ping");
+        }
+        assert_eq!(peer.core().dns_questions, ["echo.test A"], "asked once");
+    }
+
+    /// Both families asked at once when the tunnel has both addresses;
+    /// `prefer-ipv6` picks among the answers.
+    #[tokio::test]
+    async fn prefer_ipv6_picks_among_what_the_tunnel_dns_answers() {
+        for (prefer_ipv6, expected) in [(false, "10.0.0.1:7"), (true, "[fd00::1]:7")] {
+            let (peer, wg) = with_tunnel_dns(&["10.0.0.1", "fd00::1"], &[], |s| {
+                s.self_ip_v6 = Some("fd00::2".parse().unwrap());
+                s.peers[0].allowed_ips.push("fd00::/64".parse().unwrap());
+                s.prefer_ipv6 = prefer_ipv6;
+            })
+            .await;
+            wg.connect_tcp(&at("echo.test", ECHO_PORT), &within(5))
+                .await
+                .expect("a connection");
+            let mut asked = peer.core().dns_questions.clone();
+            asked.sort();
+            assert_eq!(asked, ["echo.test A", "echo.test AAAA"]);
+            assert_eq!(
+                peer.core().connected_to,
+                [expected.parse::<SocketAddr>().unwrap()]
+            );
+        }
+    }
+
+    /// A server that says nothing gives way to the next after `dns_wait`;
+    /// one the tunnel cannot reach is passed over at once.
+    #[tokio::test]
+    async fn the_next_dns_server_is_asked_when_one_cannot_answer() {
+        let silent = TunnelDns::Server("10.0.0.54:53".parse().unwrap());
+        let (_peer, mut wg) = with_tunnel_dns(&["10.0.0.1"], &[silent], |_| {}).await;
+        wg.dns_wait = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        wg.connect_tcp(&at("echo.test", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        assert!(started.elapsed() >= Duration::from_millis(300));
+
+        let unreachable = [
+            // no IPv6 address in the tunnel
+            TunnelDns::Server("[fd00::53]:53".parse().unwrap()),
+            // no peer takes it
+            TunnelDns::Server("192.0.2.53:53".parse().unwrap()),
+        ];
+        let (_peer, mut wg) = with_tunnel_dns(&["10.0.0.1"], &unreachable, |_| {}).await;
+        wg.dns_wait = Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        wg.connect_tcp(&at("echo.test", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        assert!(started.elapsed() < Duration::from_secs(2), "no waiting");
+    }
+
+    /// `system` asks this machine where it stands in the list; an answer
+    /// without addresses ends the search all the same.
+    #[tokio::test]
+    async fn system_asks_this_machine_and_an_empty_answer_is_final() {
+        let (peer, wg) = with_tunnel_dns(&[], &[TunnelDns::System], |_| {}).await;
+        wg.connect_tcp(&at("local.test", ECHO_PORT), &within(5))
+            .await
+            .expect("resolved on this machine");
+        assert!(peer.core().dns_questions.is_empty());
+
+        let (peer, wg) = with_tunnel_dns(&[], &[], |s| s.dns_servers.push(TunnelDns::System)).await;
+        let e = wg
+            .connect_tcp(&at("local.test", ECHO_PORT), &within(5))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "dns: wireguard: dns lookup of local.test failed"
+        );
+        assert_eq!(peer.core().dns_questions, ["local.test A"]);
     }
 
     /// The endpoint of the only peer cannot be resolved: the dial fails, and

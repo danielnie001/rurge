@@ -8,6 +8,7 @@ use crate::wire;
 use rurge_config::wireguard::WireGuardSection;
 use rurge_net::connector::{BoxedDatagram, ConnectOpts, Connector, Target};
 use rurge_proto::OutboundError;
+use smoltcp::iface::SocketHandle;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::net::SocketAddr;
@@ -130,6 +131,58 @@ impl Device {
         let stream = TunnelStream::new(self.clone(), handle);
         poll_fn(|cx| stream.poll_established(cx)).await?;
         Ok(stream)
+    }
+
+    /// One exchange with `server` over UDP through the tunnel: `message`
+    /// out, then the first datagram from `server` that `accept` takes,
+    /// within `wait`. `None` when none came, or no peer takes `server`.
+    pub(crate) async fn query<T>(
+        self: &Arc<Device>,
+        server: SocketAddr,
+        message: &[u8],
+        wait: Duration,
+        accept: impl Fn(&[u8]) -> Option<T>,
+    ) -> Option<T> {
+        let socket = {
+            let mut stack = self.shared.stack.lock().expect("the tunnel");
+            let handle = stack.udp_open(server.ip()).ok()?;
+            let socket = UdpExchange {
+                device: self.clone(),
+                handle,
+            };
+            stack.udp(handle).send_slice(message, server).ok()?;
+            socket
+        };
+        self.shared.kick();
+        let answer = poll_fn(|cx| {
+            let mut stack = self.shared.stack.lock().expect("the tunnel");
+            let udp = stack.udp(socket.handle);
+            while let Ok((datagram, meta)) = udp.recv() {
+                let from = SocketAddr::new(meta.endpoint.addr.into(), meta.endpoint.port);
+                if from == server
+                    && let Some(answer) = accept(datagram)
+                {
+                    return Poll::Ready(answer);
+                }
+            }
+            udp.register_recv_waker(cx.waker());
+            Poll::Pending
+        });
+        tokio::time::timeout(wait, answer).await.ok()
+    }
+}
+
+/// The UDP socket of one exchange: gone with the exchange.
+struct UdpExchange {
+    device: Arc<Device>,
+    handle: SocketHandle,
+}
+
+impl Drop for UdpExchange {
+    fn drop(&mut self) {
+        if let Ok(mut stack) = self.device.shared.stack.lock() {
+            stack.udp_close(self.handle);
+        }
     }
 }
 

@@ -3,6 +3,7 @@
 //! stack of its own — that TCP connections are dialled through.
 
 mod device;
+mod dns;
 pub mod outbound;
 pub mod routes;
 pub mod stack;

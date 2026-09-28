@@ -12,7 +12,7 @@ use boringtun::x25519::{PublicKey, StaticSecret};
 use rurge_config::wireguard::WireGuardSection;
 use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
-use smoltcp::socket::{AnySocket, tcp};
+use smoltcp::socket::{AnySocket, tcp, udp};
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use std::collections::VecDeque;
 use std::fmt;
@@ -274,16 +274,22 @@ impl Stack {
         }
     }
 
-    /// A TCP connection to `to`, from the tunnel's address of its family.
-    pub fn connect(&mut self, to: SocketAddr) -> Result<SocketHandle, Refusal> {
-        let local = match to.ip() {
+    /// The tunnel's address of `to`'s family, when some peer takes `to`.
+    fn source_for(&self, to: IpAddr) -> Result<IpAddr, Refusal> {
+        let local = match to {
             IpAddr::V4(_) => self.v4.map(IpAddr::V4),
             IpAddr::V6(_) => self.v6.map(IpAddr::V6),
         }
-        .ok_or(Refusal::NoAddress(to.ip()))?;
-        if self.routes.lookup(to.ip()).is_none() {
-            return Err(Refusal::NoRoute(to.ip()));
+        .ok_or(Refusal::NoAddress(to))?;
+        if self.routes.lookup(to).is_none() {
+            return Err(Refusal::NoRoute(to));
         }
+        Ok(local)
+    }
+
+    /// A TCP connection to `to`, from the tunnel's address of its family.
+    pub fn connect(&mut self, to: SocketAddr) -> Result<SocketHandle, Refusal> {
+        let local = self.source_for(to.ip())?;
         let port = self.free_port().ok_or(Refusal::NoPort)?;
         let mut socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
@@ -309,15 +315,40 @@ impl Stack {
                 port + 1
             };
             let taken = self.sockets.iter().any(|(_, s)| {
-                tcp::Socket::downcast(s)
+                let tcp = tcp::Socket::downcast(s)
                     .and_then(tcp::Socket::local_endpoint)
-                    .is_some_and(|e| e.port == port)
+                    .map(|e| e.port);
+                let udp = udp::Socket::downcast(s).map(|u| u.endpoint().port);
+                tcp.or(udp) == Some(port)
             });
             if !taken {
                 return Some(port);
             }
         }
         None
+    }
+
+    /// A UDP socket on the tunnel's address of `to`'s family, for an
+    /// exchange with `to`.
+    pub fn udp_open(&mut self, to: IpAddr) -> Result<SocketHandle, Refusal> {
+        let local = self.source_for(to)?;
+        let port = self.free_port().ok_or(Refusal::NoPort)?;
+        let buffer = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4096]);
+        let mut socket = udp::Socket::new(buffer(), buffer());
+        socket
+            .bind(SocketAddr::new(local, port))
+            .map_err(|_| Refusal::Unaddressable(to))?;
+        Ok(self.sockets.add(socket))
+    }
+
+    /// The UDP socket of `handle`.
+    pub fn udp(&mut self, handle: SocketHandle) -> &mut udp::Socket<'static> {
+        self.sockets.get_mut(handle)
+    }
+
+    /// Forgets the UDP socket of `handle`.
+    pub fn udp_close(&mut self, handle: SocketHandle) {
+        self.sockets.remove(handle);
     }
 
     /// The TCP connection of `handle`.

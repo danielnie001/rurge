@@ -1,23 +1,28 @@
 //! A WireGuard peer for the tests of this crate and of its dependants
 //! (feature `testing`). `PeerCore` is the peer without I/O: boringtun
 //! answering the client's handshakes, and a smoltcp host of its own that
-//! answers on every address routed to it — a TCP echo service on port 7.
-//! `FakeWgPeer` puts one on a loopback UDP port.
+//! answers on every address routed to it — a TCP echo service on port 7 and
+//! a name server at `DNS_ADDRESS`. `FakeWgPeer` puts one on a loopback UDP
+//! port.
 
 mod peer;
 
 pub use peer::FakeWgPeer;
 
+use crate::dns::Family;
 use crate::stack::Queues;
 use crate::wire;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
+use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::rr::rdata::{A, AAAA};
+use hickory_proto::rr::{RData, Record, RecordType};
 use rurge_config::HostName;
 use rurge_config::spec::Secret;
 use rurge_config::wireguard::{DEFAULT_MTU, PeerEndpoint, WireGuardPeer, WireGuardSection};
 use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::ChecksumCapabilities;
-use smoltcp::socket::tcp;
+use smoltcp::socket::{tcp, udp};
 use smoltcp::wire::{
     HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpProtocol, Ipv4Packet,
 };
@@ -28,6 +33,43 @@ use std::time::{Duration, Instant};
 pub const ECHO_PORT: u16 = 7;
 /// Connections the echo service takes at once: SYNs that arrive together.
 const BACKLOG: usize = 8;
+/// Where a peer's name server listens, on port 53.
+pub const DNS_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 53);
+
+/// A name server's answer to `query`: what `lookup` gives for its name and
+/// family, with a TTL of 60 seconds, or no such name.
+pub(crate) fn dns_reply(
+    query: &[u8],
+    mut lookup: impl FnMut(&str, Family) -> Option<Vec<IpAddr>>,
+) -> Option<Vec<u8>> {
+    let asked = Message::from_vec(query).ok()?;
+    let question = asked.queries.first()?.clone();
+    let family = match question.query_type() {
+        RecordType::A => Family::V4,
+        RecordType::AAAA => Family::V6,
+        _ => return None,
+    };
+    let name = question.name().to_ascii();
+    let mut reply = Message::new(asked.id, MessageType::Response, OpCode::Query);
+    reply.metadata.recursion_desired = true;
+    reply.metadata.recursion_available = true;
+    match lookup(name.trim_end_matches('.'), family) {
+        Some(addrs) => {
+            for addr in addrs {
+                let data = match addr {
+                    IpAddr::V4(v4) => RData::A(A(v4)),
+                    IpAddr::V6(v6) => RData::AAAA(AAAA(v6)),
+                };
+                reply
+                    .answers
+                    .push(Record::from_rdata(question.name().clone(), 60, data));
+            }
+        }
+        None => reply.metadata.response_code = ResponseCode::NXDomain,
+    }
+    reply.add_query(question);
+    reply.to_vec().ok()
+}
 
 /// A fresh key pair: private, public.
 pub fn keypair() -> ([u8; 32], [u8; 32]) {
@@ -92,6 +134,9 @@ pub struct PeerOpts {
     pub preshared_key: Option<[u8; 32]>,
     /// The MTU of its own stack.
     pub mtu: usize,
+    /// What its name server answers: names and their addresses; any other
+    /// name does not exist.
+    pub dns: Vec<(String, Vec<IpAddr>)>,
 }
 
 impl Default for PeerOpts {
@@ -102,6 +147,7 @@ impl Default for PeerOpts {
             client_id: None,
             preshared_key: None,
             mtu: 1420,
+            dns: Vec::new(),
         }
     }
 }
@@ -120,6 +166,8 @@ pub struct PeerCore {
     queues: Queues,
     listeners: Vec<SocketHandle>,
     conns: Vec<Conn>,
+    name_server: SocketHandle,
+    names: Vec<(String, Vec<IpAddr>)>,
     scratch: Vec<u8>,
     epoch: Instant,
     client_id: Option<[u8; 3]>,
@@ -136,6 +184,8 @@ pub struct PeerCore {
     pub connected_to: Vec<SocketAddr>,
     /// TCP connections the client reset.
     pub resets: usize,
+    /// The questions its name server was asked: `<name> A` or `<name> AAAA`.
+    pub dns_questions: Vec<String>,
 }
 
 /// `message` with `client_id` in it.
@@ -174,6 +224,12 @@ impl PeerCore {
         let listeners = (0..BACKLOG)
             .map(|_| listen(&mut sockets, ECHO_PORT))
             .collect();
+        let buffer = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0; 8192]);
+        let mut name_server = udp::Socket::new(buffer(), buffer());
+        name_server
+            .bind((IpAddress::Ipv4(DNS_ADDRESS), 53))
+            .expect("the name server's port");
+        let name_server = sockets.add(name_server);
         PeerCore {
             tunnel,
             public_key,
@@ -182,6 +238,8 @@ impl PeerCore {
             queues,
             listeners,
             conns: Vec::new(),
+            name_server,
+            names: opts.dns.clone(),
             scratch: vec![0; 65536 + 32],
             epoch: Instant::now(),
             client_id: opts.client_id,
@@ -191,6 +249,7 @@ impl PeerCore {
             accepted: 0,
             connected_to: Vec::new(),
             resets: 0,
+            dns_questions: Vec::new(),
         }
     }
 
@@ -384,6 +443,34 @@ impl PeerCore {
             }
         });
         self.resets += resets;
+        self.answer_questions();
+    }
+
+    fn answer_questions(&mut self) {
+        let socket = self.sockets.get_mut::<udp::Socket>(self.name_server);
+        let mut queries = Vec::new();
+        while let Ok((query, meta)) = socket.recv() {
+            queries.push((query.to_vec(), meta.endpoint));
+        }
+        for (query, from) in queries {
+            let (names, asked) = (&self.names, &mut self.dns_questions);
+            let reply = dns_reply(&query, |name, family| {
+                let kind = if family == Family::V4 { "A" } else { "AAAA" };
+                asked.push(format!("{name} {kind}"));
+                let addrs = &names.iter().find(|(n, _)| n == name)?.1;
+                Some(
+                    addrs
+                        .iter()
+                        .filter(|a| a.is_ipv4() == (family == Family::V4))
+                        .copied()
+                        .collect(),
+                )
+            });
+            if let Some(reply) = reply {
+                let socket = self.sockets.get_mut::<udp::Socket>(self.name_server);
+                let _ = socket.send_slice(&reply, from);
+            }
+        }
     }
 }
 
