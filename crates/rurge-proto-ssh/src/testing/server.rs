@@ -31,6 +31,8 @@ pub struct FakeSshOpts {
     pub connect_to: Option<SocketAddr>,
     /// End the connection when a password arrives, without answering.
     pub hang_up_on_password: bool,
+    /// Answer a password only after this long.
+    pub stall_on_password: Option<Duration>,
 }
 
 struct State {
@@ -217,6 +219,9 @@ impl server::Handler for Peer {
         self.state.attempts.fetch_add(1, Ordering::SeqCst);
         if self.state.opts.hang_up_on_password {
             return Err(russh::Error::Disconnect);
+        }
+        if let Some(stall) = self.state.opts.stall_on_password {
+            tokio::time::sleep(stall).await;
         }
         let known = self.state.password.lock().unwrap().as_deref() == Some(password);
         Ok(self.verdict(user == self.state.opts.user && known))

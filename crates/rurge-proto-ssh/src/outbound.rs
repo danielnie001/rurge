@@ -18,9 +18,9 @@ use rustls::RootCertStore;
 use std::borrow::Cow;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, Notify};
@@ -30,11 +30,18 @@ use tokio::time::Instant;
 /// answer end it (M4-D10).
 const KEEPALIVE: Duration = Duration::from_secs(30);
 const KEEPALIVE_MAX: usize = 3;
-/// Nothing from the server for five minutes ends the connection (russh's
-/// `inactivity_timeout`), meant as a bound for a server that stalls before
-/// the session is up, when no keepalives go out yet. On a live session
-/// every keepalive answer resets it, so idle still means no open channel.
+/// russh's `inactivity_timeout`: it bounds each write, so a connection the
+/// server stops taking data from ends within five minutes. Everything the
+/// server sends resets it, keepalive answers included, so on a live
+/// session idle still means no open channel; a stalled login is bounded by
+/// `LOGIN_LIMIT` instead.
 const INACTIVITY: Duration = Duration::from_secs(300);
+/// The key exchange and the login together take no longer, whatever the
+/// dial's own budget. Before the login russh does nothing with a keepalive
+/// that falls due, and while the server stays silent it does not re-arm the
+/// timer either: its session task spins until data arrives. A login that
+/// ends well within `KEEPALIVE` never gets there.
+const LOGIN_LIMIT: Duration = Duration::from_secs(20);
 
 /// The failures another attempt right away cannot fix: the credentials, the
 /// pinned host keys and the algorithms stay what they are until the profile
@@ -285,6 +292,106 @@ impl AsyncWrite for SshStream {
     }
 }
 
+const SETTING_UP: u8 = 0;
+const ABANDONED: u8 = 1;
+const UP: u8 = 2;
+
+/// Where the connection under a session stands while `establish` sets the
+/// session up.
+struct Setup {
+    stage: AtomicU8,
+    /// The pending read to wake when the dial goes away.
+    reader: StdMutex<Option<Waker>>,
+}
+
+/// The connection handed to russh. russh's session task does not look at
+/// its `Handle` while a key exchange runs, so a dial that gives up then
+/// would leave it waiting on the server until the server hangs up — and
+/// spinning once a keepalive falls due (see `LOGIN_LIMIT`). Reads fail once
+/// the dial is gone, which ends the task; after the key exchange the
+/// connection is passed through untouched.
+struct Abandonable {
+    inner: BoxedStream,
+    setup: Arc<Setup>,
+}
+
+/// Held by `establish` while the key exchange runs: dropped, it abandons
+/// the connection; `key_exchange_done` hands the connection over for good.
+struct Armed(Option<Arc<Setup>>);
+
+fn abandonable(inner: BoxedStream) -> (Abandonable, Armed) {
+    let setup = Arc::new(Setup {
+        stage: AtomicU8::new(SETTING_UP),
+        reader: StdMutex::new(None),
+    });
+    (
+        Abandonable {
+            inner,
+            setup: setup.clone(),
+        },
+        Armed(Some(setup)),
+    )
+}
+
+impl Armed {
+    fn key_exchange_done(mut self) {
+        if let Some(setup) = self.0.take() {
+            setup.stage.store(UP, Ordering::SeqCst);
+            // nothing will need waking any more
+            setup.reader.lock().unwrap().take();
+        }
+    }
+}
+
+impl Drop for Armed {
+    fn drop(&mut self) {
+        if let Some(setup) = self.0.take() {
+            setup.stage.store(ABANDONED, Ordering::SeqCst);
+            let reader = setup.reader.lock().unwrap().take();
+            if let Some(reader) = reader {
+                reader.wake();
+            }
+        }
+    }
+}
+
+impl AsyncRead for Abandonable {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.setup.stage.load(Ordering::SeqCst) == SETTING_UP {
+            // the waker first, then the stage: a dial going away in between
+            // either is seen here or finds the waker
+            *this.setup.reader.lock().unwrap() = Some(cx.waker().clone());
+        }
+        if this.setup.stage.load(Ordering::SeqCst) == ABANDONED {
+            return Poll::Ready(Err(io::ErrorKind::ConnectionAborted.into()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Abandonable {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// Ends the session once no channel has been open on it for `idle`
 /// (`idle-timeout`: idle means no channel, not no traffic, M4-D10). Holds
 /// the session weakly: a session replaced or dropped ends the watch.
@@ -475,6 +582,8 @@ pub struct SshOutbound {
     /// The latest failure and the back-off after persistent ones; read and
     /// written with the session lock held, never across an `.await`.
     failures: StdMutex<Failures>,
+    /// `LOGIN_LIMIT` (shorter in the tests).
+    login_limit: Duration,
 }
 
 impl SshOutbound {
@@ -511,6 +620,7 @@ impl SshOutbound {
             unpinned_warned: AtomicBool::new(false),
             attempts: AtomicU64::new(0),
             failures: StdMutex::new(Failures::new()),
+            login_limit: LOGIN_LIMIT,
         })
     }
 
@@ -578,15 +688,24 @@ impl SshOutbound {
     }
 
     async fn establish(&self, opts: &ConnectOpts) -> Result<Session, OutboundError> {
-        let stream = self.stack.open(opts).await?;
+        let (stream, armed) = abandonable(self.stack.open(opts).await?);
         let client = Client {
             pins: self.pins.clone(),
         };
         let config = session_config(&self.pins);
-        let mut handle = client::connect_stream(Arc::new(config), stream, client)
+        let login = async move {
+            let handshake = client::connect_stream(Arc::new(config), stream, client).await;
+            armed.key_exchange_done();
+            let mut handle = handshake.map_err(handshake_error)?;
+            self.authenticate(&mut handle).await?;
+            Ok::<_, OutboundError>(handle)
+        };
+        // given up at the limit, the login takes the session with it: the
+        // connection is abandoned during the key exchange, the handle is
+        // dropped after it
+        let handle = tokio::time::timeout(self.login_limit, login)
             .await
-            .map_err(handshake_error)?;
-        self.authenticate(&mut handle).await?;
+            .map_err(|_| OutboundError::Timeout)??;
         if self.first_unpinned() {
             // the policy name only
             tracing::warn!(
@@ -1289,8 +1408,8 @@ mod tests {
         eventually(|| server.live_sessions() == 0).await;
     }
 
-    /// Also: russh drops a connection on which nothing arrived for five
-    /// minutes.
+    /// Also: russh's five-minute inactivity limit, which bounds a write the
+    /// server does not take.
     #[test]
     fn the_session_is_kept_alive_every_thirty_seconds() {
         let config = session_config(&[]);
@@ -1335,5 +1454,116 @@ mod tests {
         let ssh = outbound_to(addr, &spec(Some("pw"), None, vec![]), &[]);
         let failed = round_trip(&ssh, &echo().await).await.unwrap_err();
         assert_eq!(failed.to_string(), "ssh: the handshake failed");
+    }
+
+    /// A server that sends its identification and then says nothing more,
+    /// in the middle of the key exchange; the receiver fires once the
+    /// client closes the connection.
+    async fn stalling_server() -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (closed, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            s.write_all(b"SSH-2.0-OpenSSH_9.9\r\n").await.unwrap();
+            let mut buf = [0u8; 4096];
+            while let Ok(read) = s.read(&mut buf).await {
+                if read == 0 {
+                    break;
+                }
+            }
+            let _ = closed.send(());
+        });
+        (addr, closed_rx)
+    }
+
+    /// A dial that gives up during the key exchange takes the connection
+    /// with it: russh's session task does not look at its `Handle` while a
+    /// key exchange runs, and it would otherwise wait on — and spin once
+    /// its first keepalive falls due — until the server hangs up.
+    #[tokio::test]
+    async fn a_handshake_whose_dial_gave_up_does_not_live_on() {
+        let (addr, closed) = stalling_server().await;
+        let ssh = outbound_to(addr, &spec(Some("pw"), None, vec![]), &[]);
+        let opts = ConnectOpts {
+            timeout: Duration::from_millis(500),
+        };
+        match ssh.connect_tcp(&echo().await, &opts).await {
+            Err(OutboundError::Timeout) => {}
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("the server never finishes the handshake"),
+        }
+        tokio::time::timeout(Duration::from_secs(5), closed)
+            .await
+            .expect("the connection was left open")
+            .unwrap();
+    }
+
+    fn with_login_limit(mut ssh: SshOutbound, limit: Duration) -> SshOutbound {
+        ssh.login_limit = limit;
+        ssh
+    }
+
+    /// A dial may be allowed longer than the first keepalive (a
+    /// connectivity test's `test-timeout` may be), but a stalled login still
+    /// ends at the login limit, before that keepalive falls due while
+    /// nobody is logged in.
+    #[tokio::test]
+    async fn a_login_ends_at_its_limit_however_long_the_dial_may_take() {
+        let (addr, closed) = stalling_server().await;
+        let ssh = with_login_limit(
+            outbound_to(addr, &spec(Some("pw"), None, vec![]), &[]),
+            Duration::from_millis(300),
+        );
+        let opts = ConnectOpts {
+            timeout: Duration::from_secs(60),
+        };
+        let dialed = tokio::time::timeout(
+            Duration::from_secs(5),
+            ssh.connect_tcp(&echo().await, &opts),
+        )
+        .await
+        .expect("the login went on past its limit");
+        match dialed {
+            Err(OutboundError::Timeout) => {}
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("the server never finishes the handshake"),
+        }
+        tokio::time::timeout(Duration::from_secs(5), closed)
+            .await
+            .expect("the connection was left open")
+            .unwrap();
+    }
+
+    /// The limit covers the login too: once the key exchange is done, a
+    /// server that sits on a password is given up on at the limit as well.
+    #[tokio::test]
+    async fn a_login_the_server_sits_on_ends_at_the_limit_too() {
+        let server = fake(FakeSshOpts {
+            password: Some("pw".into()),
+            stall_on_password: Some(Duration::from_secs(10)),
+            ..Default::default()
+        })
+        .await;
+        let ssh = with_login_limit(
+            outbound_to(server.addr, &spec(Some("pw"), None, vec![]), &[]),
+            Duration::from_secs(2),
+        );
+        let opts = ConnectOpts {
+            timeout: Duration::from_secs(60),
+        };
+        let dialed = tokio::time::timeout(
+            Duration::from_secs(8),
+            ssh.connect_tcp(&echo().await, &opts),
+        )
+        .await
+        .expect("the login went on past its limit");
+        match dialed {
+            Err(OutboundError::Timeout) => {}
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("the server never answers the password in time"),
+        }
+        // the key exchange was done: the password had gone out
+        assert_eq!(server.attempts(), 1);
     }
 }

@@ -3984,6 +3984,7 @@ git commit -m "docs: M4a SSH——兼容性清单、README、CLAUDE.md、手工�
 | 3 | 失败的握手只由等在锁上的拨号共享，之后的拨号照常再试（d95a6e0） | 认证失败、主机密钥不在列表里、没有共同算法这三种失败之后退避 60 秒，接连再失败时翻倍、最长 10 分钟，只有握手成功才清零（中间夹着的其它失败既不退避也不清零）；其它失败照旧；认证得到"未接受"而会话已关时算握手失败；`FakeSsh::set_password` 与 `FakeSshOpts::hang_up_on_password`；原用例改名 `concurrent_dials_share_a_failed_login_and_later_ones_back_off` 并加上退避，新增 `a_login_the_server_hangs_up_on_is_retried_at_once`、`a_successful_login_resets_the_back_off`、`a_key_the_server_does_not_take_is_followed_by_the_password`、`persistent_failures_back_off_a_minute_doubling_up_to_ten` | 终审：做系统代理时口令写错，每批连接都多一次失败的登录，几批之内服务器就会封掉用户的 IP | 67adb28 |
 | 4 | 通道开好之后才计数（`OpenChannel::new` 在 `channel_open_direct_tcpip` 之后）；会话被丢弃后，看门任务要到下次醒来才结束 | 开通道之前就计数，开失败时随之释放；`Session` 被丢弃时唤醒看门任务，它随即结束 | 终审 | 67adb28 |
 | 4 | 不用 `inactivity_timeout`（P6） | 设为 5 分钟，`the_session_is_kept_alive_every_thirty_seconds` 一并断言；russh 0.63.3 里它管不住密钥交换中途停住的连接，见「延后事项」#15 | 终审 | 67adb28 |
+| 合并后 | 5 分钟的 `inactivity_timeout` 给密钥交换中途停住的连接兜底（上一行，实际无效） | 交给 russh 的连接包一层外壳：密钥交换期间拨号放弃时读取立即失败、会话任务随之结束（`a_handshake_whose_dial_gave_up_does_not_live_on`）；密钥交换与登录合计最多 20 秒（`LOGIN_LIMIT`，`a_login_ends_at_its_limit_however_long_the_dial_may_take`、`a_login_the_server_sits_on_ends_at_the_limit_too`）；`FakeSsh` 加 `stall_on_password` | 终审复审确认登录之前的保活计时会让被放弃的握手空转（「延后事项」#15） | 合并后的修正 |
 | 3 | `Client` 只实现 `check_server_key` | 服务器开向 rurge 的七种通道一律以 administratively prohibited 拒绝；`FakeSsh::open_channels_toward_client` 与用例 `channels_the_server_opens_are_refused` | 终审：russh 的客户端默认接受这些通道，不怀好意的服务器能让 rurge 为每个通道分配状态 | 67adb28 |
 | 3 | 用例辅助函数 `round_trip` 不设时限 | 整个往返限 5 秒 | 终审：出了回归时用例失败，而不是一直挂到门禁的 `timeout 1500` | 67adb28 |
 | 6 | 用户名取 `USER` | 没有 `USER` 时取 `LOGNAME` | 终审 | 67adb28 |
@@ -4006,4 +4007,4 @@ git commit -m "docs: M4a SSH——兼容性清单、README、CLAUDE.md、手工�
 | 12 | `smart` 组给首个成员的时间是 10 秒 ÷ 尝试次数，而 SSH 成员的握手在这次拨号里完成 | 跨里程碑的设计问题，有用户报告再说 |
 | 13 | CI 里装 `openssh-server` 的 apt 没有重试 | 首次推送后看 CI；不稳就加 `-o Acquire::Retries=3` |
 | 14 | 测试覆盖：`parse_pin` 的过短公钥、`keys.rs` 的无填充 Base64 与非 UTF-8、RSA / ECDSA 主机证书、`preferred()` 加密算法列表的直接断言、"没有共同算法"的文本、整次拨号超时、一次性告警只测了标志；`FakeSsh` 的 `live` 与 `connect_to` 两处说明、`tests/interop/README.md` 里"只认一把公钥"的出处 | 以后顺手补 |
-| 15 | russh 0.63.3 的会话任务在登录之前，保活计时器到点后不再重置：服务器在密钥交换中途停住（例如握手时网络切换、没有 RST）而拨号已放弃时，这个任务从第 30 秒起不停空转（本机回环复现：约半个核），直到对端关闭连接或 TCP 判定连接已断——没有 TCP 保活，对端悄悄消失时可能一直不结束；5 分钟的 `inactivity_timeout` 每转一圈都被重置，不起作用 | 待项目所有者决定：拨号放弃时由 rurge 关掉会话底下的连接（给交给 russh 的流包一层可关闭的外壳），或向 russh 报告 |
+| 15 | russh 0.63.3 的会话任务在登录之前，保活计时器到点后不再重置：服务器在密钥交换中途停住（例如握手时网络切换、没有 RST）而拨号已放弃时，这个任务从第 30 秒起不停空转（本机回环复现：约半个核），直到对端关闭连接或 TCP 判定连接已断——没有 TCP 保活，对端悄悄消失时可能一直不结束；5 分钟的 `inactivity_timeout` 每转一圈都被重置，不起作用 | 已修（合并后的修正）：交给 russh 的连接在密钥交换期间可被放弃，拨号放弃时读取立即失败、会话任务随之结束；密钥交换与登录合计最多 20 秒，在第一次保活之前结束 |
