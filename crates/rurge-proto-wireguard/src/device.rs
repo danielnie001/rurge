@@ -30,14 +30,18 @@ const BATCH: usize = 256;
 /// be reached, are dialled again (M4 design 6.5).
 pub(crate) const REDIAL: Duration = Duration::from_secs(300);
 
-/// The tunnels of this process and their sections. Two tunnels with one
-/// private key at one peer would take each other's packets — a peer answers
-/// wherever the key last wrote from — so the policies that name a section
-/// share its tunnel, and a tunnel that starts ends the one of an earlier
-/// configuration: its key with a peer in common.
-static TUNNELS: Mutex<Vec<(WireGuardSection, Weak<Device>)>> = Mutex::new(Vec::new());
-/// Tunnels start one at a time.
-static STARTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// The tunnels of this process, their sections and carrier keys. Two
+/// tunnels with one private key at one peer would take each other's
+/// packets — a peer answers wherever the key last wrote from — so only the
+/// policies that name a section *and* a carrier alike share a tunnel
+/// (`shared_tunnel`), and a tunnel that starts ends every other conflicting
+/// one that is older — its key with a peer in common (`conflict`), whatever
+/// its section or carrier. Every lookup, decision and registration that
+/// touches this table happens inside one critical section, with no
+/// `.await` while the lock is held, so two conflicting tunnels can never
+/// both be registered; a dial that only shares an already-running tunnel
+/// never waits on another tunnel's own dial (P10).
+static TUNNELS: Mutex<Vec<(WireGuardSection, String, Weak<Device>)>> = Mutex::new(Vec::new());
 
 /// Whether a tunnel of `a` and one of `b` would take each other's packets.
 fn conflict(a: &WireGuardSection, b: &WireGuardSection) -> bool {
@@ -45,6 +49,19 @@ fn conflict(a: &WireGuardSection, b: &WireGuardSection) -> bool {
         && a.peers
             .iter()
             .any(|p| b.peers.iter().any(|q| q.public_key == p.public_key))
+}
+
+/// A live tunnel already registered for `section` and `carrier`, if any;
+/// also drops the table's dead and closed entries. Brief on its own: a
+/// dial that only shares a running tunnel never dials anything, so it never
+/// waits behind another tunnel's start (P10).
+fn shared_tunnel(section: &WireGuardSection, carrier: &str) -> Option<Arc<Device>> {
+    let mut tunnels = TUNNELS.lock().expect("the tunnels");
+    tunnels.retain(|(_, _, device)| device.upgrade().is_some_and(|d| !d.is_closed()));
+    tunnels
+        .iter()
+        .find(|(other, key, _)| other == section && key.as_str() == carrier)
+        .and_then(|(_, _, device)| device.upgrade())
 }
 
 pub(crate) struct Shared {
@@ -89,36 +106,24 @@ fn unreachable(e: io::Error) -> OutboundError {
 }
 
 impl Device {
-    /// The tunnel of `section`: the one running, when a policy naming the
-    /// section started it; else a carrier to every peer, then the task and a
-    /// handshake with each peer. Fails when no peer can be reached at all —
-    /// one that cannot is dialled again every `redial` — and when a tunnel
-    /// of a later configuration (`generation`) has taken over.
+    /// The tunnel of `section` and `carrier`: the one running, when a
+    /// policy naming them both started it; else a carrier to every peer,
+    /// then the task and a handshake with each peer. Fails when no peer can
+    /// be reached at all — one that cannot is dialled again every `redial`
+    /// — and when a tunnel of a later configuration (`generation`) has
+    /// taken over. Never waits on another tunnel's own start: sharing is
+    /// decided from the table alone, before any dial (P10).
     pub(crate) async fn start(
         policy: &str,
         section: &WireGuardSection,
+        carrier: &str,
         generation: u64,
         connector: &Arc<dyn Connector>,
         opts: &ConnectOpts,
         redial: Duration,
     ) -> Result<Arc<Device>, OutboundError> {
-        let _one_at_a_time = STARTING.lock().await;
-        {
-            let mut tunnels = TUNNELS.lock().expect("the tunnels");
-            tunnels.retain(|(_, device)| device.upgrade().is_some_and(|d| !d.is_closed()));
-            for (other, device) in tunnels.iter() {
-                let Some(device) = device.upgrade() else {
-                    continue;
-                };
-                if other == section {
-                    return Ok(device);
-                }
-                if conflict(other, section) && device.generation > generation {
-                    return Err(OutboundError::Proxy(
-                        "wireguard: a newer configuration of this tunnel is in use".to_string(),
-                    ));
-                }
-            }
+        if let Some(device) = shared_tunnel(section, carrier) {
+            return Ok(device);
         }
         let endpoints: Vec<Target> = section
             .peers
@@ -154,17 +159,34 @@ impl Device {
                 io::Error::other("wireguard: the tunnel has no peer")
             })));
         }
+        // one critical section: sharing (another dial may have got there
+        // first), conflict and registration decided and acted on together,
+        // with no `.await` inside it — so two conflicting tunnels can never
+        // both be registered
+        let mut tunnels = TUNNELS.lock().expect("the tunnels");
+        tunnels.retain(|(_, _, device)| device.upgrade().is_some_and(|d| !d.is_closed()));
+        for (other, key, device) in tunnels.iter() {
+            let Some(device) = device.upgrade() else {
+                continue;
+            };
+            if other == section && key.as_str() == carrier {
+                // the carriers just dialled are dropped with this frame
+                return Ok(device);
+            }
+            if conflict(other, section) && device.generation > generation {
+                return Err(OutboundError::Proxy(
+                    "wireguard: a newer configuration of this tunnel is in use".to_string(),
+                ));
+            }
+        }
         // the tunnel it replaces goes quiet before a peer hears of this one
-        TUNNELS
-            .lock()
-            .expect("the tunnels")
-            .retain(|(other, device)| {
-                let replaced = conflict(other, section);
-                if replaced && let Some(device) = device.upgrade() {
-                    device.close();
-                }
-                !replaced
-            });
+        tunnels.retain(|(other, _, device)| {
+            let replaced = conflict(other, section);
+            if replaced && let Some(device) = device.upgrade() {
+                device.close();
+            }
+            !replaced
+        });
         let shared = Arc::new(Shared {
             stack: Mutex::new(Stack::new(section)),
             kick: Notify::new(),
@@ -190,10 +212,11 @@ impl Device {
             task: AbortOnDropHandle::new(task),
             generation,
         });
-        TUNNELS
-            .lock()
-            .expect("the tunnels")
-            .push((section.clone(), Arc::downgrade(&device)));
+        tunnels.push((
+            section.clone(),
+            carrier.to_string(),
+            Arc::downgrade(&device),
+        ));
         Ok(device)
     }
 
@@ -414,9 +437,15 @@ impl Driver {
             .initiate_peer(peer, out);
     }
 
-    /// What goes out now, to the peers that have a carrier.
+    /// What goes out now, to the peers that have a carrier. Nothing more
+    /// goes out once a newer tunnel has taken over: what is left in `out`
+    /// is dropped (P10 / B).
     async fn send_all(&mut self, out: &mut Vec<Outgoing>) {
-        for message in out.drain(..) {
+        for message in std::mem::take(out) {
+            if self.shared.closed.load(Ordering::SeqCst) {
+                out.clear();
+                return;
+            }
             let Some(Some(carrier)) = self.carriers.get_mut(message.peer) else {
                 continue;
             };
@@ -434,6 +463,10 @@ impl Driver {
         let mut first = 0;
         let mut dials = JoinSet::new();
         loop {
+            // a newer configuration took over: nothing more goes out (P10 / B)
+            if self.shared.closed.load(Ordering::SeqCst) {
+                return;
+            }
             let now = Instant::now();
             if self.shared.network_changed.swap(false, Ordering::SeqCst) {
                 dials.abort_all();

@@ -30,6 +30,10 @@ pub struct WireGuardOutbound {
     /// Later configurations have higher ones: a tunnel they start ends
     /// this one's, never the other way round.
     generation: u64,
+    /// What the policy dials carriers with: distinguishes tunnels that
+    /// share a section but must not share carriers (`with_carrier`). Empty
+    /// until set.
+    carrier: String,
     /// Destination names, without a `dns-server` (M4-D9).
     resolver: Arc<dyn Resolve>,
     /// What the carriers to the peers come from.
@@ -56,6 +60,7 @@ impl WireGuardOutbound {
             name: name.to_string(),
             section: spec.section.clone(),
             generation: GENERATION.fetch_add(1, Ordering::Relaxed),
+            carrier: String::new(),
             resolver,
             connector,
             device: Mutex::new(None),
@@ -63,6 +68,14 @@ impl WireGuardOutbound {
             dns_wait: DNS_WAIT,
             redial: REDIAL,
         }
+    }
+
+    /// A tunnel is shared only between policies whose carrier is alike: the
+    /// engine's factory gives the policy's socket options and its
+    /// `underlying-proxy` chain here (M4 design 6.5 / P10).
+    pub fn with_carrier(mut self, carrier: String) -> WireGuardOutbound {
+        self.carrier = carrier;
+        self
     }
 
     /// The network changed: a running tunnel dials every carrier anew and
@@ -86,6 +99,7 @@ impl WireGuardOutbound {
         let device = Device::start(
             &self.name,
             &self.section,
+            &self.carrier,
             self.generation,
             &self.connector,
             opts,
@@ -244,7 +258,7 @@ mod tests {
     use std::io;
     use std::net::Ipv4Addr;
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
@@ -1064,5 +1078,153 @@ mod tests {
             .expect("through the other, once it can be reached");
         assert_eq!(echo(&mut stream, b"b").await, b"b");
         assert_eq!(b.core().accepted, 1);
+    }
+
+    /// A connector with no UDP carrier, as if a chain stood in the way of
+    /// it (`Connector::connect_udp`'s default `Unsupported`, M4-D7 / P17).
+    struct NoUdp;
+
+    impl Connector for NoUdp {
+        fn connect<'a>(
+            &'a self,
+            _target: &'a Target,
+            _opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            Box::pin(std::future::ready(Err(io::Error::other("not used"))))
+        }
+    }
+
+    /// A policy over a chain never shares a direct policy's tunnel, even
+    /// naming the same section: sharing also requires an equal carrier
+    /// (P10 / A), so it dials its own carriers, which it cannot, and fails
+    /// with the chain's usual refusal — the other policy's tunnel keeps
+    /// running untouched.
+    #[tokio::test]
+    async fn a_policy_over_a_chain_never_shares_a_direct_tunnel() {
+        let (peer, a) = tunnel(PeerOpts::default(), |_| {}).await;
+        let mut stream = a
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        assert_eq!(echo(&mut stream, b"ping").await, b"ping");
+        let spec = WireGuardSpec {
+            section: a.section.clone(),
+        };
+        let b = WireGuardOutbound::new("Chained", &spec, no_names(), Arc::new(NoUdp))
+            .with_carrier("chain".to_string());
+        let e = b
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(matches!(e, OutboundError::Unsupported(_)), "{e}");
+        assert_eq!(
+            e.to_string(),
+            "policy protocol not implemented: wireguard over underlying-proxy"
+        );
+        assert_eq!(echo(&mut stream, b"still").await, b"still");
+        assert_eq!(peer.core().handshakes, 1);
+    }
+
+    /// A reload that only changes the policy's carrier (`ip-version`,
+    /// `underlying-proxy`, `[General] ipv6`) — the section itself is
+    /// unchanged — still takes the tunnel over, exactly as a changed
+    /// section does (P10 / A).
+    #[tokio::test]
+    async fn a_policy_whose_carriers_changed_takes_the_tunnel_over() {
+        let (peer, old) = tunnel(PeerOpts::default(), |_| {}).await;
+        let mut stream = old
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        assert_eq!(echo(&mut stream, b"old").await, b"old");
+        let spec = WireGuardSpec {
+            section: old.section.clone(),
+        };
+        let new =
+            WireGuardOutbound::new("WG", &spec, no_names(), direct()).with_carrier("v6".into());
+        let mut fresh = new
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection through the new tunnel");
+        assert_eq!(echo(&mut fresh, b"new").await, b"new");
+        assert_eq!(peer.core().handshakes, 2);
+        let mut buf = [0u8; 8];
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf))
+            .await
+            .expect("the old connection ends at once");
+        assert!(read.is_err(), "{read:?}");
+    }
+
+    /// A connector whose `connect_udp` records that it was asked, then
+    /// never completes — as if resolving or dialling an endpoint hung.
+    struct Stuck {
+        asked: Arc<AtomicBool>,
+    }
+
+    impl Connector for Stuck {
+        fn connect<'a>(
+            &'a self,
+            _target: &'a Target,
+            _opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            Box::pin(std::future::ready(Err(io::Error::other("not used"))))
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            _target: &'a Target,
+            _opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            self.asked.store(true, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// A tunnel that is only starting, its dial stuck, never blocks a dial
+    /// that only shares an already-running tunnel of another section: no
+    /// global start lock (P10 / C).
+    #[tokio::test]
+    async fn a_running_tunnel_is_shared_while_another_starts() {
+        let (peer, a1) = tunnel(PeerOpts::default(), |_| {}).await;
+        let mut x = a1
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        assert_eq!(echo(&mut x, b"a1").await, b"a1");
+
+        let (other_private, other_public) = keypair();
+        let other = section(
+            other_private,
+            Ipv4Addr::new(10, 9, 0, 3),
+            &[(other_public, &["10.3.0.0/16"])],
+        );
+        let asked = Arc::new(AtomicBool::new(false));
+        let stuck: Arc<dyn Connector> = Arc::new(Stuck {
+            asked: asked.clone(),
+        });
+        let b = WireGuardOutbound::new(
+            "Stuck",
+            &WireGuardSpec { section: other },
+            no_names(),
+            stuck,
+        );
+        let stuck_dial = tokio::spawn(async move {
+            let _ = b.connect_tcp(&at("10.3.0.1", ECHO_PORT), &within(30)).await;
+        });
+        until(|| asked.load(Ordering::SeqCst)).await;
+
+        let spec = WireGuardSpec {
+            section: a1.section.clone(),
+        };
+        let a2 = WireGuardOutbound::new("A2", &spec, no_names(), direct());
+        let mut y = a2
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(2))
+            .await
+            .expect("shares the running tunnel without waiting on the other's dial");
+        assert_eq!(echo(&mut y, b"a2").await, b"a2");
+        assert_eq!(peer.core().handshakes, 1);
+
+        stuck_dial.abort();
     }
 }
