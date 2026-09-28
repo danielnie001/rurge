@@ -1,0 +1,24 @@
+[package]
+name = "rurge-proto-wireguard"
+description = "The wireguard outbound of rurge: a userspace WireGuard tunnel with a TCP/IP stack of its own"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rurge-config.workspace = true
+boringtun.workspace = true
+smoltcp.workspace = true
+prefix-trie.workspace = true
+ipnet.workspace = true
+getrandom.workspace = true
+tracing.workspace = true
+
+[features]
+# Loopback WireGuard peer (`rurge_proto_wireguard::testing`); enabled by dependants' dev-dependencies.
+testing = []
+
+[lints]
+workspace = true
