@@ -7,13 +7,16 @@
 
 pub use rurge_config::config::{LoadOptions, from_text};
 pub use rurge_engine::EngineFactory;
-pub use rurge_interop::{Inbound, InboundKind, SingBox, TlsFiles, sing_box_or_skip};
+pub use rurge_interop::{
+    Inbound, InboundKind, SingBox, TlsFiles, WireGuardEndpoint, sing_box_or_skip,
+};
 pub use rurge_net::connector::{ConnectOpts, SystemResolve, Target};
 pub use rurge_net::socket::NoopSocketHook;
 pub use rurge_net::testing::TestServer;
 pub use rurge_policy::OutboundFactory;
 pub use rurge_proto::testing::{TlsFixture, echo_server};
 pub use rurge_proto::{OutboundError, OutboundRef};
+pub use rurge_proto_wireguard::testing::keypair;
 pub use std::net::SocketAddr;
 pub use std::path::Path;
 pub use std::sync::Arc;

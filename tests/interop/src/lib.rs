@@ -1,14 +1,17 @@
 //! A sing-box child process on the loopback, for interoperability tests
 //! (M1 design §8). Nothing here downloads, installs or configures anything
 //! outside a temporary directory: the rendered configuration listens on
-//! 127.0.0.1 only, its single outbound is `direct`, and it never holds a key
-//! that touches the machine (`set_system_proxy`, `tun`, `auto_route`).
+//! 127.0.0.1 only — but for the UDP port of a WireGuard endpoint, which
+//! sing-box opens on every address — its single outbound is `direct`, and it
+//! never holds a key that touches the machine (`set_system_proxy`, `tun`,
+//! `auto_route`; a WireGuard endpoint runs in user space).
 
 pub mod sshd;
 pub mod xray;
 
+use base64::Engine;
 use serde_json::{Value, json};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -49,6 +52,14 @@ pub fn sing_box_or_skip(test: &str) -> Option<PathBuf> {
 pub fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
+        .expect("a free loopback port")
+        .port()
+}
+
+/// A UDP port that was free a moment ago.
+pub fn free_udp_port() -> u16 {
+    UdpSocket::bind("127.0.0.1:0")
+        .and_then(|s| s.local_addr())
         .expect("a free loopback port")
         .port()
 }
@@ -181,6 +192,47 @@ pub fn render(inbounds: &[(Inbound, u16)]) -> Value {
     })
 }
 
+/// sing-box's WireGuard endpoint (sing-box 1.11 and later) with one peer:
+/// rurge, whose tunnel address must be in `peer_allowed_ips`, and to which
+/// every message carries `reserved` (its `client-id`).
+pub struct WireGuardEndpoint {
+    pub private_key: [u8; 32],
+    /// The endpoint's own tunnel address, as a prefix.
+    pub address: String,
+    pub peer_public_key: [u8; 32],
+    pub peer_allowed_ips: Vec<String>,
+    pub reserved: Option<[u8; 3]>,
+}
+
+/// The whole configuration for `endpoint` on UDP port `port`, in user space
+/// (`system: false`: no interface, no route), and a `mixed` inbound on
+/// `ready` that says when sing-box is up — a UDP port cannot be probed.
+/// What comes out of the tunnel goes `direct`.
+pub fn render_wireguard(endpoint: &WireGuardEndpoint, port: u16, ready: u16) -> Value {
+    let key = |k: &[u8; 32]| base64::engine::general_purpose::STANDARD.encode(k);
+    let mut peer = json!({
+        "public_key": key(&endpoint.peer_public_key),
+        "allowed_ips": endpoint.peer_allowed_ips,
+    });
+    if let Some(reserved) = endpoint.reserved {
+        peer["reserved"] = json!(reserved);
+    }
+    json!({
+        "log": { "level": "warn", "timestamp": false },
+        "endpoints": [{
+            "type": "wireguard",
+            "tag": "wg",
+            "system": false,
+            "address": [endpoint.address],
+            "private_key": key(&endpoint.private_key),
+            "listen_port": port,
+            "peers": [peer],
+        }],
+        "inbounds": [{ "type": "mixed", "tag": "ready", "listen": "127.0.0.1", "listen_port": ready }],
+        "outbounds": [{ "type": "direct", "tag": "direct" }],
+    })
+}
+
 /// A reference implementation running as a child on the loopback; killed and
 /// reaped on drop.
 pub(crate) struct Reference {
@@ -271,10 +323,26 @@ impl SingBox {
         let with_ports: Vec<(Inbound, u16)> =
             inbounds.into_iter().map(|i| (i, free_port())).collect();
         let ports: Vec<u16> = with_ports.iter().map(|(_, p)| *p).collect();
-        let config = dir.join("sing-box.json");
-        std::fs::write(&config, render(&with_ports).to_string()).expect("write the config");
+        SingBox::launch(binary, dir, &render(&with_ports), ports)
+    }
+
+    /// Starts `binary` with `endpoint` on a UDP port of its own; that port,
+    /// once sing-box is up.
+    pub fn spawn_wireguard(
+        binary: &Path,
+        dir: &Path,
+        endpoint: &WireGuardEndpoint,
+    ) -> (SingBox, u16) {
+        let (port, ready) = (free_udp_port(), free_port());
+        let config = render_wireguard(endpoint, port, ready);
+        (SingBox::launch(binary, dir, &config, vec![ready]), port)
+    }
+
+    fn launch(binary: &Path, dir: &Path, config: &Value, ports: Vec<u16>) -> SingBox {
+        let path = dir.join("sing-box.json");
+        std::fs::write(&path, config.to_string()).expect("write the config");
         let mut command = Command::new(binary);
-        command.arg("run").arg("-c").arg(&config).arg("-D").arg(dir);
+        command.arg("run").arg("-c").arg(&path).arg("-D").arg(dir);
         SingBox(Reference::start(
             "sing-box",
             command,
@@ -474,6 +542,59 @@ mod tests {
         );
         assert!(v2.get("users").is_none() && v2.get("strict_mode").is_none());
         assert_eq!(v2["detour"], "in-3");
+    }
+
+    fn endpoint() -> WireGuardEndpoint {
+        WireGuardEndpoint {
+            private_key: [1; 32],
+            address: "10.9.0.1/32".into(),
+            peer_public_key: [2; 32],
+            peer_allowed_ips: vec!["10.9.0.2/32".into()],
+            reserved: Some([1, 2, 3]),
+        }
+    }
+
+    /// In user space, nothing of the machine's; only the endpoint's UDP port
+    /// is on every address.
+    #[test]
+    fn the_wireguard_configuration_never_touches_the_machine() {
+        let config = render_wireguard(&endpoint(), 51820, 1001);
+        let text = config.to_string();
+        for forbidden in ["set_system_proxy", "tun", "auto_route", "0.0.0.0", "::"] {
+            assert!(!text.contains(forbidden), "`{forbidden}` in {text}");
+        }
+        let top: Vec<&String> = config.as_object().unwrap().keys().collect();
+        assert_eq!(top, ["endpoints", "inbounds", "log", "outbounds"]);
+        assert_eq!(config["endpoints"][0]["system"], false);
+        assert_eq!(config["inbounds"][0]["listen"], "127.0.0.1");
+        assert_eq!(
+            config["outbounds"],
+            json!([{ "type": "direct", "tag": "direct" }])
+        );
+    }
+
+    #[test]
+    fn the_wireguard_endpoint_is_rendered_as_sing_box_spells_it() {
+        let config = render_wireguard(&endpoint(), 51820, 1001);
+        let wg = &config["endpoints"][0];
+        assert_eq!(
+            (&wg["type"], &wg["listen_port"]),
+            (&json!("wireguard"), &json!(51820))
+        );
+        assert_eq!(wg["address"], json!(["10.9.0.1/32"]));
+        assert_eq!(
+            wg["private_key"],
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+        );
+        assert_eq!(
+            wg["peers"],
+            json!([{
+                "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+                "allowed_ips": ["10.9.0.2/32"],
+                "reserved": [1, 2, 3],
+            }])
+        );
+        assert_eq!(config["inbounds"][0]["listen_port"], 1001);
     }
 
     #[test]

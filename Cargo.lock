@@ -3244,12 +3244,14 @@ dependencies = [
 name = "rurge-interop"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "rurge-config",
  "rurge-engine",
  "rurge-net",
  "rurge-policy",
  "rurge-proto",
  "rurge-proto-ssh",
+ "rurge-proto-wireguard",
  "rustls",
  "serde_json",
  "tempfile",
