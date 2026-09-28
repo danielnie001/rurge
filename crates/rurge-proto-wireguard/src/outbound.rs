@@ -867,10 +867,16 @@ mod tests {
     async fn the_native_test_is_a_handshake_with_the_peers() {
         let (peer, wg) = tunnel(PeerOpts::default(), |_| {}).await;
         let test = || wg.native_test().expect("wireguard has one");
-        let rtt = test().await.expect("a handshake");
+        let rtt = tokio::time::timeout(Duration::from_secs(5), test())
+            .await
+            .expect("within 5 s")
+            .expect("a handshake");
         assert!(rtt < Duration::from_secs(2), "{rtt:?}");
         let before = peer.core().handshakes;
-        test().await.expect("a handshake");
+        tokio::time::timeout(Duration::from_secs(5), test())
+            .await
+            .expect("within 5 s")
+            .expect("a handshake");
         assert!(peer.core().handshakes > before, "the session was fresh");
         peer.go_silent(true);
         let silent = tokio::time::timeout(Duration::from_millis(500), test()).await;
