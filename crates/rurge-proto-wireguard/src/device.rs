@@ -210,12 +210,18 @@ async fn run(shared: Arc<Shared>, mut carriers: Vec<Option<Carrier>>, mut out: V
         tokio::select! {
             _ = shared.kick.notified() => {}
             (peer, received) = recv_any(&carriers, &mut buf, &mut first) => {
-                let mut stack = shared.stack.lock().expect("the tunnel");
                 let mut arrived = Some((peer, received));
                 let mut taken = 0;
                 while let Some((peer, received)) = arrived {
                     match received {
-                        Ok(n) => stack.receive(peer, &mut buf[..n], Instant::now(), &mut out),
+                        // the lock is for the stack alone: the carriers are
+                        // read outside it
+                        Ok(n) => shared.stack.lock().expect("the tunnel").receive(
+                            peer,
+                            &mut buf[..n],
+                            Instant::now(),
+                            &mut out,
+                        ),
                         // an ICMP error the system reports on a connected socket
                         Err(e) => tracing::trace!(peer, error = %e, "wireguard: a carrier failed to receive"),
                     }
