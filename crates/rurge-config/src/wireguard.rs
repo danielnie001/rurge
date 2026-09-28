@@ -107,6 +107,16 @@ impl Report<'_> {
     }
 }
 
+/// Whether an unknown key or field, lowercased, may be quoted: only what
+/// looks like a name. A Base64 key ends in `=`, so a key on a line of its
+/// own, or after a `:` typed for `=`, stands where a name would.
+fn quotable(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// A 32-byte key, the way WireGuard writes it (Base64) or as 64 hex digits.
 fn key32(value: &str) -> Option<[u8; 32]> {
     let value = value.trim();
@@ -293,7 +303,11 @@ fn peer(report: &mut Report<'_>, span: &Span, item: &str, n: usize) -> Option<Wi
                     ),
                 ),
             },
-            other => report.warn(span, format!("peer {n}: unknown field `{other}` ignored")),
+            other if quotable(other) => {
+                report.warn(span, format!("peer {n}: unknown field `{other}` ignored"))
+            }
+            // never quoted: it may be a key
+            _ => report.warn(span, format!("peer {n}: an unknown field ignored")),
         }
     }
     for field in ["public-key", "allowed-ips", "endpoint"] {
@@ -405,7 +419,9 @@ pub fn parse_section(section: &Section, diags: &mut Diagnostics) -> Option<WireG
                     peers.extend(peer(&mut report, span, &item, written));
                 }
             }
-            other => report.warn(span, format!("unknown key `{other}` ignored")),
+            other if quotable(other) => report.warn(span, format!("unknown key `{other}` ignored")),
+            // never quoted: it may be a key
+            _ => report.warn(span, "an unknown line ignored"),
         }
     }
     let given = |key: &str| given.iter().any(|g| g == key);
@@ -743,6 +759,42 @@ peer = (public-key = {PUBLIC}, allowed-ips = 10.0.0.0/8, endpoint = a.test:1, pr
         assert!(debug.contains("Secret(***)"), "{debug}");
         let private = format!("{:?}", s.private_key.expose());
         assert!(!debug.contains(&private[1..20]), "{debug}");
+    }
+
+    /// What stands before the first `=` of a line or field is quoted only
+    /// when it looks like a name: a Base64 key ends in `=`, so a key on a
+    /// line of its own, or after a `:` typed for `=`, splits there.
+    #[test]
+    fn key_material_is_never_quoted_as_an_unknown_name() {
+        const SHARED: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+        let (section, diags) = parse(&format!(
+            "[WireGuard k]\nprivate-key = {PRIVATE}\nself-ip = 10.0.0.2\n{PRIVATE}\nprivate-key: {PRIVATE}\n\
+peer = (public-key = {PUBLIC}, allowed-ips = 10.0.0.0/8, endpoint = a.test:1, preshared-key: {SHARED})\n"
+        ));
+        assert!(section.is_some());
+        let found: Vec<(&str, &str)> = diags.iter().map(|d| (d.code, d.message.as_str())).collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    codes::W_UNKNOWN_KEY,
+                    "[WireGuard k]: an unknown line ignored"
+                ),
+                (
+                    codes::W_UNKNOWN_KEY,
+                    "[WireGuard k]: an unknown line ignored"
+                ),
+                (
+                    codes::W_UNKNOWN_KEY,
+                    "[WireGuard k]: peer 1: an unknown field ignored"
+                ),
+            ]
+        );
+        for shown in diags.iter().map(|d| d.to_string().to_ascii_lowercase()) {
+            for key in [PRIVATE, SHARED] {
+                assert!(!shown.contains(&key[..20].to_ascii_lowercase()), "{shown}");
+            }
+        }
     }
 
     #[test]
