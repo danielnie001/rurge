@@ -304,6 +304,54 @@ fn check_knows_ssh() {
         .stdout(predicate::str::contains("c2VjcmV0").not());
 }
 
+const WIREGUARD: &str = "[General]\n[Proxy]\nW = wireguard, section-name=home\n\
+Old = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Rule]\nFINAL,DIRECT\n\
+[WireGuard home]\nprivate-key = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=\nself-ip = 10.9.0.2\n\
+peer = (public-key = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=, allowed-ips = 0.0.0.0/0, endpoint = vpn.test:51820)\n";
+const WIREGUARD_BAD_KEY: &str = "[General]\n[Proxy]\nW = wireguard, section-name=home\n[Rule]\nFINAL,DIRECT\n\
+[WireGuard home]\nprivate-key = c2VjcmV0IGtleSBtYXRlcmlhbA==\nself-ip = 10.9.0.2\n\
+peer = (public-key = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=, allowed-ips = 0.0.0.0/0, endpoint = vpn.test:51820)\n";
+
+/// `rurge check` knows `wireguard` policies and their sections: a key that
+/// is no key is an error at its line, named and not quoted (M4 design 4.1).
+#[test]
+fn check_knows_wireguard() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "wg.conf", WIREGUARD))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    // `ss` is still a later milestone; `wireguard` is not
+    assert_eq!(out.matches("W0007").count(), 1, "{out}");
+    assert!(
+        out.contains("`ss`") && !out.contains("`wireguard`"),
+        "{out}"
+    );
+    assert!(!out.contains("yAnz5TF"), "{out}");
+
+    Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "bad.conf", WIREGUARD_BAD_KEY))
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("E0023"))
+        .stdout(predicate::str::contains(
+            "bad.conf:7: [WireGuard home]: `private-key` is not a 32-byte key in Base64 or hex",
+        ))
+        // and the policy that names it
+        .stdout(predicate::str::contains(
+            "bad.conf:3: policy `W`: `section-name` names `[WireGuard home]`, which does not exist or has errors",
+        ))
+        .stdout(predicate::str::contains("c2VjcmV0").not());
+}
+
 const SUBSCRIBED: &str = "[General]\n[Proxy Group]\nLocal = select, DIRECT, policy-path=nodes.txt\n\
 Remote = select, DIRECT, policy-path=https://sub.test/nodes?token=t0k3n\n[Rule]\nFINAL,Local\n";
 

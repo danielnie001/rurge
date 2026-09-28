@@ -37,6 +37,7 @@ pub fn current() -> Capabilities {
             PolicyKind::Vmess,
             PolicyKind::AnyTls,
             PolicyKind::Ssh,
+            PolicyKind::WireGuard,
         ]),
         group_kinds: HashSet::from([
             GroupKind::Select,
