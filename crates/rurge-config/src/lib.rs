@@ -24,6 +24,7 @@ pub mod spec;
 pub mod text;
 pub mod types;
 pub mod value;
+pub mod wireguard;
 
 pub use config::{
     Capabilities, Config, ConfigSummary, InlineRuleset, LoadError, LoadOptions, Loaded, Platform,
@@ -53,5 +54,6 @@ pub use text::include::IncludeOptions;
 pub use text::{Entry, Origin, Profile, Section, SectionKind};
 pub use types::HostName;
 pub use value::ParamMap;
+pub use wireguard::{PeerEndpoint, TunnelDns, WireGuardPeer, WireGuardSection};
 
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");

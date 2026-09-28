@@ -21,13 +21,15 @@ const SECRET_KEYS: [&str; 7] = [
 /// group's `policy-path` usually carries a subscription token, and its
 /// `external-policy-modifier` can set any parameter, a password included. A
 /// policy's `test-url` can come from a subscription line and carry its
-/// token. Over-redacting is the safe side for an endpoint whose purpose is
-/// safe output.
-const SECRET_PARAMS: [&str; 15] = [
+/// token. A `[WireGuard]` peer's `preshared-key` is the manual's spelling;
+/// `pre-shared-key` stays for profiles written the other way. Over-redacting
+/// is the safe side for an endpoint whose purpose is safe output.
+const SECRET_PARAMS: [&str; 16] = [
     "password",
     "psk",
     "private-key",
     "pre-shared-key",
+    "preshared-key",
     "base64",
     "token",
     "uuid",
@@ -510,6 +512,17 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
         assert_eq!(
             redact_profile("peer = (pre-shared-key = PSK1, endpoint = 1.2.3.4:51820)"),
             "peer = (pre-shared-key = ***, endpoint = 1.2.3.4:51820)"
+        );
+    }
+
+    /// The manual spells a peer's key `preshared-key`.
+    #[test]
+    fn a_wireguard_peers_preshared_key_is_redacted() {
+        assert_eq!(
+            redact_profile(
+                "peer = (public-key = PUB, preshared-key = PSK1, endpoint = 1.2.3.4:51820)"
+            ),
+            "peer = (public-key = PUB, preshared-key = ***, endpoint = 1.2.3.4:51820)"
         );
     }
 

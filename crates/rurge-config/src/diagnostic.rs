@@ -164,6 +164,9 @@ pub mod codes {
     pub const E_KEYSTORE_BASE64: &str = "E0021";
     /// A policy that cannot be built (reported by the engine's dry build, M1b).
     pub const E_POLICY_BUILD: &str = "E0022";
+    /// A `[WireGuard <name>]` section that cannot be used, or a
+    /// `section-name` that names no usable section.
+    pub const E_WIREGUARD_SECTION: &str = "E0023";
     pub const W_UNKNOWN_KEY: &str = "W0001";
     pub const W_UNKNOWN_SECTION: &str = "W0002";
     pub const W_UNKNOWN_RULE_PARAM: &str = "W0003";
@@ -183,6 +186,8 @@ pub mod codes {
     pub const W_INCLUDE_SECTION_MISSING: &str = "W0017";
     pub const W_RULESET_LINE_SKIPPED: &str = "W0018";
     pub const W_RULES_AFTER_FINAL: &str = "W0019";
+    /// A named section defined twice (`[Ruleset X]`, `[WireGuard X]`): the
+    /// first one is used.
     pub const W_DUPLICATE_RULESET: &str = "W0020";
     /// An earlier FINAL that is shadowed by the last FINAL.
     pub const W_DUPLICATE_FINAL: &str = "W0021";

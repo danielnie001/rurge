@@ -12,6 +12,7 @@ pub mod ssh;
 pub mod tls;
 pub mod trojan;
 pub mod vmess;
+pub mod wireguard;
 pub mod ws;
 
 pub use anytls::AnyTlsSpec;
@@ -28,6 +29,7 @@ pub use ssh::{HostKeyPin, SshSpec};
 pub use tls::{Sni, TlsOpts};
 pub use trojan::TrojanSpec;
 pub use vmess::{VmessCipher, VmessSpec};
+pub use wireguard::WireGuardSpec;
 pub use ws::WsOpts;
 
 use crate::diagnostic::{Diagnostic, codes};

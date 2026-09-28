@@ -16,6 +16,7 @@ use crate::spec::{GroupSpec, NameKind, PolicySpec, SpecEnv, to_group_spec, to_sp
 use crate::text::include::{self, IncludeOptions};
 use crate::text::{Origin, Profile, SectionKind, parse_str};
 use crate::value::{split_definition, split_list};
+use crate::wireguard::{WireGuardSection, parse_section};
 use base64::Engine as _;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -185,6 +186,8 @@ pub struct Config {
     pub rulesets: Vec<InlineRuleset>,
     pub hosts: Vec<HostEntry>,
     pub keystore: Vec<KeystoreItem>,
+    /// Every `[WireGuard <name>]` section without errors, in profile order.
+    pub wireguard: Vec<WireGuardSection>,
     pub deferred: DeferredSections,
     pub managed: Option<ManagedConfig>,
     pub unknown_sections: Vec<String>,
@@ -294,11 +297,19 @@ impl Config {
             .rposition(|r| matches!(r.kind, RuleKind::Final))
     }
 
-    /// Lowercase hostnames of every proxy server; `[Host]` never applies to them.
+    /// Lowercase hostnames of every proxy server — WireGuard peers' endpoints
+    /// among them; `[Host]` never applies to them.
     pub fn proxy_hostnames(&self) -> HashSet<String> {
+        let endpoints = self
+            .wireguard
+            .iter()
+            .flat_map(|w| &w.peers)
+            .map(|p| &p.endpoint.host);
         self.policies
             .iter()
-            .filter_map(|p| p.server.as_ref()?.as_domain().map(str::to_string))
+            .filter_map(|p| p.server.as_ref())
+            .chain(endpoints)
+            .filter_map(|host| host.as_domain().map(str::to_string))
             .collect()
     }
 }
@@ -605,6 +616,24 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
         }
     }
 
+    // [WireGuard <name>] sections: every one is checked, used or not.
+    let mut wireguard = Vec::new();
+    let mut wireguard_names: HashSet<String> = HashSet::new();
+    for sec in profile.sections_with_prefix("WireGuard ") {
+        let name = sec.name["WireGuard ".len()..].trim();
+        if !wireguard_names.insert(name.to_string()) {
+            diags.push(
+                Diagnostic::warning(
+                    codes::W_DUPLICATE_RULESET,
+                    format!("duplicate [WireGuard {name}] ignored; the first definition is used"),
+                )
+                .at(sec.span.clone()),
+            );
+            continue;
+        }
+        wireguard.extend(parse_section(sec, &mut diags));
+    }
+
     // Deferred and unknown sections.
     let deferred = DeferredSections::collect(&profile);
     if !deferred.sections.is_empty() {
@@ -661,6 +690,7 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
         rulesets,
         hosts,
         keystore,
+        wireguard,
         deferred,
         managed,
         unknown_sections,
@@ -1550,6 +1580,96 @@ New = vmess, c.test, 443, username={id}, vmess-aead=true\n[Rule]\nFINAL,DIRECT\n
         assert_eq!(legacy[0].span.as_ref().map(|s| s.line), Some(2));
         assert!(loaded.config.spec("New").is_some());
         assert!(loaded.config.spec("Old1").is_none() && loaded.config.spec("Old2").is_none());
+    }
+
+    const WG_PRIVATE: &str = "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=";
+    const WG_PUBLIC: &str = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=";
+
+    fn wireguard_section(name: &str, endpoint: &str) -> String {
+        format!(
+            "[WireGuard {name}]
+private-key = {WG_PRIVATE}
+self-ip = 10.0.0.2
+peer = (public-key = {WG_PUBLIC}, allowed-ips = 10.0.0.0/24, endpoint = {endpoint})
+"
+        )
+    }
+
+    /// A `[WireGuard <name>]` section is typed, no longer a deferred one
+    /// (phase 2 M4 design 4.1).
+    #[test]
+    fn wireguard_sections_are_typed() {
+        let l = load_text(&format!(
+            "{}{}[Rule]
+FINAL,DIRECT
+",
+            wireguard_section("home", "vpn.example.com:51820"),
+            wireguard_section("office", "192.0.2.1:51820")
+        ));
+        assert!(l.diagnostics.is_empty(), "{:?}", l.diagnostics.into_vec());
+        let names: Vec<&str> = l.config.wireguard.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, ["home", "office"]);
+        assert!(l.config.deferred.sections.is_empty());
+    }
+
+    /// Checked whether a policy uses it or not; the first of two sections
+    /// of one name is used.
+    #[test]
+    fn every_wireguard_section_is_checked() {
+        let l = load_text(&format!(
+            "[WireGuard spare]
+self-ip = 10.0.0.2
+{}{}[Rule]
+FINAL,DIRECT
+",
+            wireguard_section("home", "a.test:51820"),
+            wireguard_section("home", "b.test:51820")
+        ));
+        let found: Vec<(&str, &str)> = l
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    codes::E_WIREGUARD_SECTION,
+                    "[WireGuard spare]: `private-key` is required"
+                ),
+                (
+                    codes::E_WIREGUARD_SECTION,
+                    "[WireGuard spare]: at least one `peer` is required"
+                ),
+                (
+                    codes::W_DUPLICATE_RULESET,
+                    "duplicate [WireGuard home] ignored; the first definition is used"
+                ),
+            ]
+        );
+        assert_eq!(l.config.wireguard.len(), 1);
+        assert_eq!(
+            l.config.wireguard[0].peers[0].endpoint.to_string(),
+            "a.test:51820"
+        );
+    }
+
+    /// A peer's endpoint is a proxy server like any other: `[Host]` does not
+    /// apply to its name (matrix 6.3).
+    #[test]
+    fn wireguard_endpoints_are_proxy_hostnames() {
+        let l = load_text(&format!(
+            "[Proxy]
+A = http, proxy.example.com, 8080
+{}{}[Rule]
+FINAL,DIRECT
+",
+            wireguard_section("home", "VPN.example.com:51820"),
+            wireguard_section("office", "192.0.2.1:51820")
+        ));
+        let mut names: Vec<String> = l.config.proxy_hostnames().into_iter().collect();
+        names.sort();
+        assert_eq!(names, ["proxy.example.com", "vpn.example.com"]);
     }
 
     #[test]

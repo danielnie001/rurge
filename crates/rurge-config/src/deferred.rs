@@ -21,9 +21,7 @@ const DEFERRED: &[&str] = &[
 ];
 
 pub fn is_deferred(name: &str) -> bool {
-    DEFERRED.iter().any(|d| d.eq_ignore_ascii_case(name))
-        || starts_with_ci(name, "WireGuard ")
-        || starts_with_ci(name, "Tailscale ")
+    DEFERRED.iter().any(|d| d.eq_ignore_ascii_case(name)) || starts_with_ci(name, "Tailscale ")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,9 +67,11 @@ mod tests {
     fn prefix_and_membership_matching() {
         assert!(is_deferred("MITM"));
         assert!(is_deferred("mitm"));
-        assert!(is_deferred("WireGuard home"));
-        assert!(is_deferred("WireGuard "));
-        assert!(!is_deferred("WireGuard"));
+        assert!(is_deferred("Tailscale home"));
+        assert!(is_deferred("Tailscale "));
+        assert!(!is_deferred("Tailscale"));
+        // typed since phase 2 M4
+        assert!(!is_deferred("WireGuard home"));
         assert!(!is_deferred("Rule"));
         assert!(!is_deferred("General"));
         assert!(!is_deferred("Proxy"));
@@ -96,6 +96,6 @@ mod tests {
     #[test]
     fn non_ascii_names_do_not_panic() {
         assert!(!is_deferred("中文中文中文"));
-        assert!(is_deferred("WireGuard 家里"));
+        assert!(is_deferred("Tailscale 家里"));
     }
 }

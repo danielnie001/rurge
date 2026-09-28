@@ -150,8 +150,9 @@ fn reaches_into_profile(
         .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
         .collect();
 
-    // Keystore items: a client certificate, an SSH private key.
-    for key in ["client-cert", "private-key"] {
+    // Keystore items (a client certificate, an SSH private key) and a
+    // `[WireGuard]` section.
+    for key in ["client-cert", "private-key", "section-name"] {
         if let Some(why) = only_the_modifier_sets(policy, &modifier_values, key) {
             return Some(why);
         }
@@ -1596,6 +1597,54 @@ Plain = ssh, p.test, 22, username=u, password=pw",
             [(
                 codes::W_SET_LINES_SKIPPED,
                 "policy group `G`: `policy-path` line 1: a subscription line's own `private-key` is not honoured (only `external-policy-modifier` may set it); skipped".to_string()
+            )]
+        );
+    }
+
+    /// A section of the profile, after its groups.
+    const HOME: &str = "[WireGuard home]
+private-key = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=
+self-ip = 10.20.0.2
+peer = (public-key = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=, allowed-ips = 0.0.0.0/0, endpoint = vpn.test:51820)";
+
+    /// A `wireguard` line's `section-name` names a section of the profile,
+    /// keys and all: like `private-key`, only the user's modifier may set it
+    /// (phase 2 M4 design 4.8).
+    #[test]
+    fn a_subscription_wireguard_line_may_not_use_the_profiles_sections() {
+        let cfg = profile(
+            "Corp = http, corp.test, 80",
+            &format!(
+                "G = select, policy-path=https://sub.test/g
+H = select, policy-path=https://sub.test/h, external-policy-modifier=\"section-name=home\"
+{HOME}"
+            ),
+        );
+        let a = assemble(
+            &cfg,
+            &snapshots(
+                &cfg,
+                &[
+                    (
+                        "G",
+                        "Own = wireguard, section-name=home
+Plain = http, p.test, 80",
+                    ),
+                    ("H", "Mod = wireguard, section-name=home"),
+                ],
+            ),
+        );
+        assert_eq!(members(&a, "G"), ["Plain"]);
+        assert_eq!(members(&a, "H"), ["Mod"]);
+        let skipped: Vec<_> = warnings(&a)
+            .into_iter()
+            .filter(|(code, _)| *code == codes::W_SET_LINES_SKIPPED)
+            .collect();
+        assert_eq!(
+            skipped,
+            [(
+                codes::W_SET_LINES_SKIPPED,
+                "policy group `G`: `policy-path` line 1: a subscription line's own `section-name` is not honoured (only `external-policy-modifier` may set it); skipped".to_string()
             )]
         );
     }
