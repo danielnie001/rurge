@@ -144,10 +144,18 @@ fn tunnel_dns(entry: &str) -> Result<TunnelDns, String> {
             }
         },
     };
-    if matches!(addr.ip(), IpAddr::V4(v4) if v4.is_multicast()) {
+    if addr.ip().is_multicast() {
         return Err(format!(
             "`dns-server` `{entry}`: a multicast address is not accepted"
         ));
+    }
+    if addr.ip().is_unspecified() {
+        return Err(format!(
+            "`dns-server` `{entry}`: an unspecified address is not accepted"
+        ));
+    }
+    if addr.port() == 0 {
+        return Err(format!("`dns-server` `{entry}`: port 0 is not accepted"));
     }
     Ok(TunnelDns::Server(addr))
 }
@@ -555,6 +563,25 @@ peer = (public-key = {PUBLIC}, allowed-ips = 10.20.0.0/16, endpoint = 192.0.2.1:
                 "[WireGuard d]: `dns-server` `224.0.0.251`: a multicast address is not accepted",
                 "[WireGuard d]: `dns-server` `https://dns.test/dns-query`: an encrypted-DNS URL is not accepted here",
                 "[WireGuard d]: invalid `dns-server` `nope` (expected an IP address, an address with a port, or `system`)",
+            ]
+        );
+    }
+
+    #[test]
+    fn dns_servers_are_addresses_a_question_can_go_to() {
+        let found = errors(&format!(
+            "[WireGuard d]\nprivate-key = {PRIVATE}\nself-ip = 10.0.0.2\n\
+dns-server = ff02::fb, [ff02::fb]:53, 0.0.0.0, ::, 10.20.0.1:0\n\
+peer = (public-key = {PUBLIC}, allowed-ips = 10.20.0.0/16, endpoint = 192.0.2.1:51820)\n"
+        ));
+        assert_eq!(
+            found,
+            [
+                "[WireGuard d]: `dns-server` `ff02::fb`: a multicast address is not accepted",
+                "[WireGuard d]: `dns-server` `[ff02::fb]:53`: a multicast address is not accepted",
+                "[WireGuard d]: `dns-server` `0.0.0.0`: an unspecified address is not accepted",
+                "[WireGuard d]: `dns-server` `::`: an unspecified address is not accepted",
+                "[WireGuard d]: `dns-server` `10.20.0.1:0`: port 0 is not accepted",
             ]
         );
     }

@@ -146,12 +146,16 @@ impl Device {
         let socket = {
             let mut stack = self.shared.stack.lock().expect("the tunnel");
             let handle = stack.udp_open(server.ip()).ok()?;
-            let socket = UdpExchange {
+            // the exchange takes the socket once the question is out: its
+            // drop takes this lock
+            if stack.udp(handle).send_slice(message, server).is_err() {
+                stack.udp_close(handle);
+                return None;
+            }
+            UdpExchange {
                 device: self.clone(),
                 handle,
-            };
-            stack.udp(handle).send_slice(message, server).ok()?;
-            socket
+            }
         };
         self.shared.kick();
         let answer = poll_fn(|cx| {

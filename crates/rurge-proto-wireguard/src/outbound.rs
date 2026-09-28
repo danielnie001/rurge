@@ -680,6 +680,42 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2), "no waiting");
     }
 
+    /// A server the stack cannot send to (an unspecified address, port 0)
+    /// is passed over at once. The dial runs on a thread of its own: should
+    /// it ever hang, the test fails instead of hanging with it.
+    #[test]
+    fn a_dns_server_the_stack_cannot_send_to_is_passed_over() {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            let elapsed = runtime.block_on(async {
+                let unusable = [
+                    TunnelDns::Server("0.0.0.0:53".parse().unwrap()),
+                    TunnelDns::Server("10.0.0.53:0".parse().unwrap()),
+                ];
+                let (_peer, mut wg) = with_tunnel_dns(&["10.0.0.1"], &unusable, |s| {
+                    // a route for every server, so that each gets a socket
+                    s.peers[0].allowed_ips = vec!["0.0.0.0/0".parse().unwrap()];
+                })
+                .await;
+                wg.dns_wait = Duration::from_secs(5);
+                let started = std::time::Instant::now();
+                wg.connect_tcp(&at("echo.test", ECHO_PORT), &within(5))
+                    .await
+                    .expect("a connection");
+                started.elapsed()
+            });
+            let _ = done.send(elapsed);
+        });
+        let elapsed = finished
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the dial ends");
+        assert!(elapsed < Duration::from_secs(2), "no waiting: {elapsed:?}");
+    }
+
     /// `system` asks this machine where it stands in the list; an answer
     /// without addresses ends the search all the same.
     #[tokio::test]
