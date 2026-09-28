@@ -316,6 +316,7 @@ impl<'a> Imports<'a> {
         };
         let env = SpecEnv {
             keystore: &cfg.keystore,
+            wireguard: &cfg.wireguard,
             lookup: &lookup,
         };
         let mut failed: HashSet<String> = HashSet::new();

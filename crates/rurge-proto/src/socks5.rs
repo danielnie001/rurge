@@ -241,6 +241,7 @@ mod tests {
             &policy,
             &SpecEnv {
                 keystore: &[],
+                wireguard: &[],
                 lookup: &lookup,
             },
         );

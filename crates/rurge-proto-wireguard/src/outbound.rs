@@ -814,6 +814,44 @@ mod tests {
         assert!(wg.device.lock().await.is_none());
     }
 
+    /// Not a gate (M4 design §10): how fast a bulk transfer goes through the
+    /// tunnel to a loopback peer, whose own smoltcp echoes it back. In
+    /// release: `cargo test -p rurge-proto-wireguard --release throughput --
+    /// --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn throughput() {
+        const TOTAL: usize = 64 * 1024 * 1024;
+        let (_peer, wg) = tunnel(PeerOpts::default(), |_| {}).await;
+        let stream = wg
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        let (mut read, mut write) = tokio::io::split(stream);
+        let started = std::time::Instant::now();
+        let writer = tokio::spawn(async move {
+            let chunk = vec![0x5a; 64 * 1024];
+            for _ in 0..TOTAL / chunk.len() {
+                write.write_all(&chunk).await.unwrap();
+            }
+            write
+        });
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut received = 0;
+        while received < TOTAL {
+            let n = read.read(&mut buf).await.unwrap();
+            assert!(n > 0, "the echo ended early");
+            received += n;
+        }
+        let elapsed = started.elapsed();
+        let _write = writer.await.unwrap();
+        println!(
+            "{} MiB through the tunnel and back in {elapsed:.2?}: {:.1} MiB/s each way",
+            TOTAL >> 20,
+            (TOTAL >> 20) as f64 / elapsed.as_secs_f64()
+        );
+    }
+
     /// Two policies that name one section: one tunnel, one handshake.
     #[tokio::test]
     async fn policies_that_name_one_section_share_its_tunnel() {

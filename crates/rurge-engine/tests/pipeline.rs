@@ -1235,6 +1235,50 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
     );
 }
 
+/// The same for a `wireguard` policy whose peer's endpoint is a host name:
+/// starting the tunnel would need the very lookup the session carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dns_session_bypasses_a_wireguard_policy_whose_endpoint_is_a_host_name() {
+    use rurge_proto_wireguard::testing::{hex, keypair};
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    dns.set("wg.test", &["127.0.0.1"], &[], 60);
+    let dir = tempfile::tempdir().unwrap();
+    let profile = format!(
+        "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\n\
+encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.1:{}\nipv6 = false\n\
+[Proxy]\nWG = wireguard, section-name=w\n[Proxy Group]\n[Rule]\nPROTOCOL,DNS,WG\nFINAL,DIRECT\n\
+[WireGuard w]\nprivate-key = {}\nself-ip = 10.9.0.2\n\
+peer = (public-key = {}, allowed-ips = 0.0.0.0/0, endpoint = wg.test:51820)\n",
+        dns.addr().port(),
+        hex(&keypair().0),
+        hex(&keypair().1)
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        engine
+            .runtime()
+            .stack
+            .resolver
+            .lookup("target.test", rurge_dns::resolver::LookupOpts::default()),
+    )
+    .await
+    .expect("the lookup must not wait for the endpoint's own name to be resolved");
+    assert!(res.is_ok(), "resolution through the pipeline: {res:?}");
+    let internal = internal_sessions(&engine);
+    assert!(
+        internal.iter().any(|r| {
+            r.error.as_deref()
+                == Some(
+                    "dns-follow: proxy configured by host name bypassed to avoid a resolution loop",
+                )
+                && r.policy.first().map(String::as_str) == Some("WG")
+        }),
+        "a bypassed internal DNS session: {internal:?}"
+    );
+}
+
 /// A DNS session does not wait for an `evaluate-before-use` group's first
 /// round: the round's own probes may need this very session's resolver to
 /// reach a host-named member's server, so waiting here would wait on

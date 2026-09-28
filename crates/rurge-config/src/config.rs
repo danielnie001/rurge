@@ -959,6 +959,7 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
         let lookup = |name: &str| cfg.name_kind(name);
         let env = SpecEnv {
             keystore: &cfg.keystore,
+            wireguard: &cfg.wireguard,
             lookup: &lookup,
         };
         let mut specs = Vec::new();

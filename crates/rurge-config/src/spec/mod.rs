@@ -37,6 +37,7 @@ use crate::keystore::KeystoreItem;
 use crate::policy::{Builtin, PolicyKind, ProxyPolicy};
 use crate::span::Span;
 use crate::types::HostName;
+use crate::wireguard::WireGuardSection;
 use common::{Notes, read_common};
 
 /// What a name on a policy line refers to.
@@ -49,6 +50,8 @@ pub enum NameKind {
 
 pub struct SpecEnv<'a> {
     pub keystore: &'a [KeystoreItem],
+    /// The `[WireGuard <name>]` sections `section-name` may name.
+    pub wireguard: &'a [WireGuardSection],
     pub lookup: &'a dyn Fn(&str) -> Option<NameKind>,
 }
 
@@ -62,6 +65,7 @@ pub enum ProtoSpec {
     Vmess(VmessSpec),
     AnyTls(AnyTlsSpec),
     Ssh(SshSpec),
+    WireGuard(WireGuardSpec),
 }
 
 impl ProtoSpec {
@@ -73,7 +77,10 @@ impl ProtoSpec {
             ProtoSpec::Trojan(trojan) => Some(&trojan.tls),
             ProtoSpec::Vmess(vmess) => vmess.tls.as_ref(),
             ProtoSpec::AnyTls(anytls) => Some(&anytls.tls),
-            ProtoSpec::Direct | ProtoSpec::Reject(_) | ProtoSpec::Ssh(_) => None,
+            ProtoSpec::Direct
+            | ProtoSpec::Reject(_)
+            | ProtoSpec::Ssh(_)
+            | ProtoSpec::WireGuard(_) => None,
         }
     }
 
@@ -258,12 +265,24 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             let ssh = ssh::read_ssh(&mut r, env.keystore);
             (common, ProtoSpec::Ssh(ssh))
         }
+        PolicyKind::WireGuard => {
+            let mut common = read_common(&mut r, Applies::Proxy, &mut notes);
+            let wireguard = wireguard::read_wireguard(&mut r, &mut common, env.wireguard);
+            (common, ProtoSpec::WireGuard(wireguard))
+        }
         _ => return SpecOutcome::default(),
     };
     let mut shadow_tls = None;
     if !matches!(proto, ProtoSpec::Direct | ProtoSpec::Reject(_)) {
         shadow_tls = shadow_tls::read_shadow_tls(&mut r);
         check_underlying(&mut r, &mut common, env);
+        // a chain carries no UDP before M5: the tunnel cannot start (M4-D7)
+        if matches!(proto, ProtoSpec::WireGuard(_)) && common.underlying_proxy.is_some() {
+            r.warn(
+                codes::W_PARAM_NOT_EFFECTIVE,
+                "`underlying-proxy` does not work with `wireguard` policies in this version; the policy rejects every connection".to_string(),
+            );
+        }
         // socket options belong to the hop that opens the socket (matrix 4.3)
         if common.underlying_proxy.is_some() {
             for key in ["interface", "allow-other-interface", "tos", "ip-version"] {
@@ -307,6 +326,7 @@ mod tests {
     use crate::policy::{Builtin, PolicyKind, parse_policy};
     use crate::span::Span;
     use crate::types::HostName;
+    use crate::wireguard::WireGuardSection;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -331,10 +351,16 @@ mod tests {
             "REJECT" => Some(NameKind::Builtin(Builtin::Reject)),
             _ => None,
         };
+        let wireguard = [WireGuardSection {
+            name: "home".into(),
+            mtu: 1280,
+            ..WireGuardSection::default()
+        }];
         to_spec(
             &p,
             &SpecEnv {
                 keystore: &keystore,
+                wireguard: &wireguard,
                 lookup: &lookup,
             },
         )
@@ -440,6 +466,48 @@ mod tests {
             panic!("{:?}", spec.proto);
         };
         assert_eq!(ssh.idle_timeout, std::time::Duration::from_secs(60));
+    }
+
+    /// The spec carries the section the line names: an edited section is
+    /// another spec, and a reload builds the policy anew (M4 design 4.3).
+    #[test]
+    fn a_wireguard_line_carries_its_section() {
+        let o = outcome("W", "wireguard, section-name=home, ecn=on");
+        let spec = o.spec.expect("a wireguard spec");
+        let ProtoSpec::WireGuard(wg) = &spec.proto else {
+            panic!("{:?}", spec.proto);
+        };
+        assert_eq!(wg.section.name, "home");
+        assert_eq!((spec.server, spec.port), (None, None));
+        assert_eq!(o.inert, ["ecn"]);
+        let o = outcome("W", "wireguard, section-name=home, shadow-tls-password=pw");
+        assert!(o.spec.is_none());
+        assert_eq!(
+            o.diagnostics[0].message,
+            "policy `W`: Shadow TLS cannot be combined with a `wireguard` policy"
+        );
+    }
+
+    /// No UDP through a chain before M5: the policy loads with a warning and
+    /// rejects (M4-D7). `DIRECT` is no chain.
+    #[test]
+    fn underlying_proxy_on_a_wireguard_policy_is_warned_about() {
+        let o = outcome("W", "wireguard, section-name=home, underlying-proxy=Entry");
+        assert!(o.spec.is_some());
+        let found: Vec<(&str, &str)> = o
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [(
+                codes::W_PARAM_NOT_EFFECTIVE,
+                "policy `W`: `underlying-proxy` does not work with `wireguard` policies in this version; the policy rejects every connection"
+            )]
+        );
+        let o = outcome("W", "wireguard, section-name=home, underlying-proxy=DIRECT");
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
     }
 
     /// What a reload compares besides the line (M2 design 7.1): the keystore

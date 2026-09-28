@@ -17,6 +17,7 @@ use rurge_proto::trojan::TrojanOutbound;
 use rurge_proto::vmess::VmessOutbound;
 use rurge_proto::{Direct, OutboundRef};
 use rurge_proto_ssh::SshOutbound;
+use rurge_proto_wireguard::WireGuardOutbound;
 use rustls::RootCertStore;
 use std::io;
 use std::net::IpAddr;
@@ -188,6 +189,18 @@ impl OutboundFactory for EngineFactory {
                 self.roots.clone(),
                 connector,
             )?),
+            // destination names without a `dns-server` are resolved here,
+            // with `[Host]` (M4-D9); two policies naming one section share
+            // its tunnel only when what their carriers go through is alike
+            ProtoSpec::WireGuard(wireguard) => Arc::new(
+                WireGuardOutbound::new(&spec.name, wireguard, self.resolver.clone(), connector)
+                    .with_carrier(format!(
+                        "{} ip-version={:?} via={:?}",
+                        self.environment(),
+                        spec.common.ip_version,
+                        spec.common.underlying_proxy
+                    )),
+            ),
         };
         if !self.dry && skips_verification(spec) {
             tracing::warn!(

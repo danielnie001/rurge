@@ -121,6 +121,23 @@ pub fn endpoint(addr: SocketAddr) -> PeerEndpoint {
     }
 }
 
+/// `key` as the 64 hexadecimal digits a profile takes for a key.
+pub fn hex(key: &[u8; 32]) -> String {
+    key.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The profile text of section `[WireGuard <name>]` for the client key
+/// `private`: tunnel address 10.9.0.2, and `peer` taking 10.0.0.0/8.
+pub fn section_text(name: &str, private: &[u8; 32], peer: &FakeWgPeer) -> String {
+    format!(
+        "[WireGuard {name}]\nprivate-key = {}\nself-ip = 10.9.0.2\n\
+peer = (public-key = {}, allowed-ips = 10.0.0.0/8, endpoint = {})\n",
+        hex(private),
+        hex(&peer.public_key()),
+        peer.addr()
+    )
+}
+
 /// How a test peer behaves.
 #[derive(Clone, Debug)]
 pub struct PeerOpts {

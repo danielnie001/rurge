@@ -30,7 +30,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::Registry;
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -107,6 +107,14 @@ pub(crate) fn level_for(level: &LogLevel) -> LevelFilter {
 
 type LevelHandle = reload::Handle<LevelFilter, Registry>;
 
+/// What rurge says better itself: boringtun's handshake and timer messages
+/// carry no policy name, and the `wireguard` outbound logs its handshakes.
+fn quiet_dependencies() -> Targets {
+    Targets::new()
+        .with_default(LevelFilter::TRACE)
+        .with_target("boringtun", LevelFilter::OFF)
+}
+
 fn init_logging(
     level: LevelFilter,
     log_file: Option<&std::path::Path>,
@@ -121,6 +129,7 @@ fn init_logging(
         .with_ansi(std::io::stdout().is_terminal());
     let registry = tracing_subscriber::registry()
         .with(level_layer)
+        .with(quiet_dependencies())
         .with(stdout_layer);
     match log_file {
         Some(path) => {
@@ -852,6 +861,14 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boringtun_says_nothing() {
+        let filter = quiet_dependencies();
+        let error = &tracing::Level::ERROR;
+        assert!(!filter.would_enable("boringtun::noise::timers", error));
+        assert!(filter.would_enable("rurge_proto_wireguard::device", &tracing::Level::TRACE));
+    }
 
     #[test]
     fn log_levels_map_like_surge() {

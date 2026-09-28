@@ -3208,6 +3208,7 @@ dependencies = [
  "rurge-policy",
  "rurge-proto",
  "rurge-proto-ssh",
+ "rurge-proto-wireguard",
  "rurge-rules",
  "rustls",
  "serde",

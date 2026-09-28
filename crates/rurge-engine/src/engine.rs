@@ -13,7 +13,7 @@ use rurge_config::HostName;
 use rurge_config::general::General;
 use rurge_config::rule::PolicyRef;
 use rurge_config::session::{ListenerKind, SessionInfo};
-use rurge_config::spec::PolicySpec;
+use rurge_config::spec::{PolicySpec, ProtoSpec};
 use rurge_inbound::{
     DialError, Dialed, Dialer, FailKind, HttpAuth, HttpListener, ListenerOpts, Running,
     SessionHandle, SessionOutcome, Socks5Listener,
@@ -21,7 +21,7 @@ use rurge_inbound::{
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
 use rurge_policy::auto::SelectCtx;
-use rurge_policy::{PolicyRegistry, TerminalKind};
+use rurge_policy::{Note, PolicyRegistry, TerminalKind};
 use rurge_proto::{OutboundError, OutboundRef};
 use rurge_rules::{OutboundMode, Outcome};
 use std::collections::HashMap;
@@ -650,6 +650,19 @@ fn socket_opener<'a>(registry: &'a PolicyRegistry, name: &str) -> Option<&'a Pol
     None
 }
 
+/// Whether reaching `spec`'s server takes a name lookup: the server, or the
+/// endpoint of one of a `wireguard` policy's peers, is a host name.
+fn named_server(spec: &PolicySpec) -> bool {
+    match &spec.proto {
+        ProtoSpec::WireGuard(wireguard) => wireguard
+            .section
+            .peers
+            .iter()
+            .any(|peer| peer.endpoint.host.as_domain().is_some()),
+        _ => matches!(spec.server, Some(HostName::Domain(_))),
+    }
+}
+
 /// The bypass every anti-loop arm of `dial_internal` takes (a REJECT, a
 /// proxy configured by host name, a chain that ends at REJECT): note `why`
 /// on the session, connect with `fallback`, and finish the handle explicitly
@@ -712,7 +725,7 @@ impl Engine {
             && let Some(terminal) = resolution.chain.last()
         {
             match socket_opener(&registry, terminal) {
-                Some(spec) if matches!(spec.server, Some(HostName::Domain(_))) => {
+                Some(spec) if named_server(spec) => {
                     tracing::warn!(
                         policy = %spec.name,
                         "DNS session routed to a proxy configured by host name; connecting directly to avoid a resolution loop"
@@ -1093,7 +1106,11 @@ impl Dialer for Engine {
                     };
                     reject(handle, effective)
                 }
-                OutboundError::Unsupported(_) => reject(handle, rurge_proto::RejectKind::Reject),
+                OutboundError::Unsupported(what) => {
+                    // what the outbound cannot do here (M4-D7): say so
+                    handle.set_error(Note::Unsupported(what).to_string());
+                    reject(handle, rurge_proto::RejectKind::Reject)
+                }
                 OutboundError::Dns(m) => fail(handle, FailKind::Dns, m),
                 OutboundError::Io(e) => fail(handle, FailKind::Connect, e.to_string()),
                 OutboundError::Timeout => fail(handle, FailKind::Timeout, "connect timed out"),
