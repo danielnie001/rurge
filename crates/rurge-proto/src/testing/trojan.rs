@@ -1,6 +1,8 @@
 //! A scriptable Trojan server: TLS, optionally a WebSocket below the
-//! protocol, the request head, then a relay. It never resolves a name.
+//! protocol, the request head, then a relay (UDP ASSOCIATE: `udp::relay`).
+//! It never resolves a name.
 
+use super::udp::{self, UdpSeen, Wire};
 use super::ws::{RecordedWs, accept_bytes};
 use super::{AbortOnDrop, TlsFixture};
 use rurge_net::connector::BoxedStream;
@@ -38,6 +40,7 @@ pub struct FakeTrojan {
     ws_seen: Arc<Mutex<Vec<RecordedWs>>>,
     connections: Arc<AtomicUsize>,
     rejected: Arc<AtomicUsize>,
+    udp: Arc<UdpSeen>,
     _task: AbortOnDrop,
 }
 
@@ -82,6 +85,7 @@ struct Shared {
     requests: Arc<Mutex<Vec<RecordedTrojan>>>,
     ws_seen: Arc<Mutex<Vec<RecordedWs>>>,
     rejected: Arc<AtomicUsize>,
+    udp: Arc<UdpSeen>,
 }
 
 async fn serve(mut stream: BoxedStream, shared: Arc<Shared>) -> io::Result<()> {
@@ -123,6 +127,16 @@ async fn serve(mut stream: BoxedStream, shared: Arc<Shared>) -> io::Result<()> {
         .lock()
         .expect("requests")
         .push(request.clone());
+    if request.command == 3 {
+        let stream = crate::transport::prefixed::boxed(request.early, stream);
+        return udp::relay(
+            stream,
+            Wire::Trojan,
+            shared.script.connect_to,
+            shared.udp.clone(),
+        )
+        .await;
+    }
     let upstream_addr = match shared.script.connect_to {
         Some(addr) => addr,
         None => match request.host.parse::<IpAddr>() {
@@ -147,11 +161,13 @@ impl FakeTrojan {
         let ws_seen: Arc<Mutex<Vec<RecordedWs>>> = Arc::default();
         let connections = Arc::new(AtomicUsize::new(0));
         let rejected = Arc::new(AtomicUsize::new(0));
+        let udp = Arc::new(UdpSeen::default());
         let shared = Arc::new(Shared {
             script,
             requests: requests.clone(),
             ws_seen: ws_seen.clone(),
             rejected: rejected.clone(),
+            udp: udp.clone(),
         });
         let acceptor = fixture.acceptor(false);
         let count = connections.clone();
@@ -174,8 +190,20 @@ impl FakeTrojan {
             ws_seen,
             connections,
             rejected,
+            udp,
             _task: AbortOnDrop(task),
         }
+    }
+
+    /// Every UDP datagram's target, `host:port`, in arrival order.
+    pub fn datagrams(&self) -> Vec<String> {
+        self.udp.targets.lock().expect("targets").clone()
+    }
+
+    /// Where each UDP ASSOCIATE sends from: a datagram to one of these goes
+    /// back to that association's client.
+    pub fn udp_outside(&self) -> Vec<SocketAddr> {
+        self.udp.outside.lock().expect("outside").clone()
     }
 
     pub fn addr(&self) -> SocketAddr {

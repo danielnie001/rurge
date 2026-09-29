@@ -7,6 +7,7 @@ mod shadow_tls;
 mod socks5;
 mod tls;
 mod trojan;
+mod udp;
 mod vmess;
 pub mod ws;
 
@@ -23,7 +24,7 @@ pub use ws::{FakeWs, RecordedWs, WsScript};
 
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 
 pub(crate) use crate::task::AbortOnDrop;
 
@@ -43,6 +44,26 @@ pub async fn echo_server() -> SocketAddr {
                     }
                 }
             });
+        }
+    });
+    addr
+}
+
+/// Answers every datagram with itself, to wherever it came from.
+pub async fn udp_echo_server() -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind loopback");
+    let addr = socket.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match socket.recv_from(&mut buf).await {
+                Ok((n, from)) => {
+                    let _ = socket.send_to(&buf[..n], from).await;
+                }
+                // an ICMP "unreachable" for an earlier answer (Windows)
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+                Err(_) => return,
+            }
         }
     });
     addr

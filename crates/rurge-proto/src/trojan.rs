@@ -2,22 +2,25 @@
 //! WebSocket), then `hex(SHA224(password)) CRLF CMD ATYP ADDR PORT CRLF` and
 //! the payload. The server never answers the head: a wrong password only
 //! shows once the relay starts, as whatever the server's fallback site says.
+//! UDP goes through one connection as UDP ASSOCIATE (`stream_udp`).
 
 use crate::addr::{AddrError, socks_addr};
 use crate::build::{shadow_tls_client, tls_client};
+use crate::stream_udp::{Framing, StreamUdp};
 use crate::transport::Stack;
 use crate::transport::lazy_head::LazyHead;
 use crate::transport::ws::WsClient;
-use crate::{BuildError, Outbound, OutboundError};
+use crate::{BuildError, Outbound, OutboundError, UdpSupport};
 use rurge_config::KeystoreItem;
 use rurge_config::spec::{ShadowTlsOpts, TrojanSpec};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
+use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target};
 use rustls::RootCertStore;
 use sha2::{Digest, Sha224};
 use std::sync::Arc;
 
 const CONNECT: u8 = 1;
+const UDP_ASSOCIATE: u8 = 3;
 
 /// No `Debug`: the hash is as good as the password.
 pub struct TrojanOutbound {
@@ -111,12 +114,36 @@ impl Outbound for TrojanOutbound {
             Ok(Box::new(LazyHead::new(stream, head)) as BoxedStream)
         })
     }
+
+    fn udp(&self) -> UdpSupport {
+        UdpSupport::Native
+    }
+
+    fn open_udp<'a>(
+        &'a self,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, Result<BoxedPacketSocket, OutboundError>> {
+        Box::pin(async move {
+            let stream = match tokio::time::timeout(opts.timeout, self.stack.open(opts)).await {
+                Ok(result) => result?,
+                Err(_) => return Err(OutboundError::Timeout),
+            };
+            // the target comes with the first datagram
+            let mut head = Vec::with_capacity(56 + 2 + 1);
+            head.extend_from_slice(&self.hash);
+            head.extend_from_slice(b"\r\n");
+            head.push(UDP_ASSOCIATE);
+            Ok(Box::new(StreamUdp::new(stream, Framing::Trojan, head)) as BoxedPacketSocket)
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{FakeTrojan, SeenHandshake, TlsFixture, TrojanScript, echo_server};
+    use crate::testing::{
+        FakeTrojan, SeenHandshake, TlsFixture, TrojanScript, echo_server, udp_echo_server,
+    };
     use rurge_config::policy::parse_policy;
     use rurge_config::spec::ParamReader;
     use rurge_config::spec::Secret;
@@ -124,7 +151,7 @@ mod tests {
     use rurge_config::spec::shadow_tls::read_shadow_tls;
     use rurge_config::spec::trojan::read_trojan;
     use rurge_config::{HostName, Span};
-    use rurge_net::connector::{DirectConnector, SystemResolve};
+    use rurge_net::connector::{DirectConnector, PacketSocket, SystemResolve};
     use std::net::SocketAddr;
     use std::path::Path;
     use std::time::Duration;
@@ -456,5 +483,89 @@ mod tests {
         assert!(matches!(err, OutboundError::Timeout), "{err}");
         assert!(started.elapsed() >= Duration::from_millis(300));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    async fn udp_answer(carrier: &dyn PacketSocket) -> (Vec<u8>, Target) {
+        let mut buf = [0u8; 1500];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(5), carrier.recv_from(&mut buf))
+            .await
+            .expect("an answer within the bound")
+            .unwrap();
+        (buf[..n].to_vec(), from)
+    }
+
+    async fn udp_roundtrip(carrier: &dyn PacketSocket, to: SocketAddr, payload: &[u8]) {
+        carrier.send_to(payload, &target(to)).await.unwrap();
+        assert_eq!(udp_answer(carrier).await, (payload.to_vec(), target(to)));
+    }
+
+    /// UDP ASSOCIATE: one connection whose head goes out with the first
+    /// datagram and names its target; every datagram carries its own.
+    #[tokio::test]
+    async fn udp_goes_through_one_connection() {
+        let (one, two) = (udp_echo_server().await, udp_echo_server().await);
+        let (fixture, fake) = fake("pw", false, None).await;
+        let out = outbound(
+            &format!("trojan, 127.0.0.1, {}, password=pw", fake.addr().port()),
+            &fixture,
+        );
+        assert_eq!(out.udp(), UdpSupport::Native);
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        udp_roundtrip(carrier.as_ref(), one, b"to one").await;
+        udp_roundtrip(carrier.as_ref(), two, b"to two").await;
+        let seen = fake.requests();
+        assert_eq!(seen.len(), 1, "one connection");
+        assert_eq!(
+            (seen[0].command, seen[0].host.as_str(), seen[0].port),
+            (3, "127.0.0.1", one.port())
+        );
+        assert_eq!(fake.datagrams(), [one.to_string(), two.to_string()]);
+    }
+
+    /// Full cone: whoever reaches the server's end of the association is
+    /// heard, under its own address.
+    #[tokio::test]
+    async fn anyone_may_answer_through_trojan() {
+        let echo = udp_echo_server().await;
+        let (fixture, fake) = fake("pw", false, None).await;
+        let out = outbound(
+            &format!("trojan, 127.0.0.1, {}, password=pw", fake.addr().port()),
+            &fixture,
+        );
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        udp_roundtrip(carrier.as_ref(), echo, b"hello").await;
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger
+            .send_to(b"unasked", fake.udp_outside()[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            udp_answer(carrier.as_ref()).await,
+            (b"unasked".to_vec(), target(stranger.local_addr().unwrap()))
+        );
+    }
+
+    /// Over a WebSocket too; a name goes to the server as its A-labels.
+    #[tokio::test]
+    async fn udp_over_a_websocket_with_a_name() {
+        let echo = udp_echo_server().await;
+        let (fixture, fake) = fake("pw", true, Some(echo)).await;
+        let out = outbound(
+            &format!(
+                "trojan, 127.0.0.1, {}, password=pw, ws=true, ws-path=/u",
+                fake.addr().port()
+            ),
+            &fixture,
+        );
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        let name = Target::new(HostName::Domain("bücher.example".into()), 53);
+        carrier.send_to(b"q", &name).await.unwrap();
+        assert_eq!(
+            udp_answer(carrier.as_ref()).await,
+            (b"q".to_vec(), target(echo))
+        );
+        assert_eq!(fake.requests()[0].host, "xn--bcher-kva.example");
+        assert_eq!(fake.datagrams(), ["xn--bcher-kva.example:53"]);
+        assert_eq!(fake.ws_seen()[0].path, "/u");
     }
 }

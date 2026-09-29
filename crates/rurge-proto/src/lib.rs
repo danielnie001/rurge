@@ -12,6 +12,7 @@ pub mod keystore;
 pub mod outbound;
 pub mod reject;
 pub mod socks5;
+mod stream_udp;
 mod task;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
