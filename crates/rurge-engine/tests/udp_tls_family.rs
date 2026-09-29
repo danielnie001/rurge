@@ -1,6 +1,6 @@
 //! UDP through the TLS family (phase 2 M5b): a SOCKS5 UDP association into
-//! rurge, out through `trojan` (UDP ASSOCIATE) and `anytls` (UDP over TCP)
-//! to loopback fakes.
+//! rurge, out through `trojan` (UDP ASSOCIATE), `anytls` (UDP over TCP) and
+//! `vmess` (command 2, one connection per target) to loopback fakes.
 
 mod common;
 use common::*;
@@ -132,4 +132,31 @@ async fn anyone_may_answer_through_anytls() {
     )
     .await;
     assert_eq!(from, stranger);
+}
+
+#[tokio::test]
+async fn udp_goes_through_vmess_one_connection_per_target() {
+    let origin = TestServer::spawn().await;
+    let (upstream, params) = vmess_upstream(true, true, origin_addr(&origin)).await;
+    two_echoes_through(&format!(
+        "P = vmess, 127.0.0.1, {}, {params}",
+        upstream.addr().port()
+    ))
+    .await;
+    let commands: Vec<u8> = upstream.requests().iter().map(|r| r.command).collect();
+    assert_eq!(commands, [2, 2], "one connection per target");
+}
+
+/// Symmetric through vmess: an answer can only come back on its target's
+/// connection, and counts as the target's.
+#[tokio::test]
+async fn through_vmess_every_answer_is_the_targets() {
+    let origin = TestServer::spawn().await;
+    let (upstream, params) = vmess_upstream(false, false, origin_addr(&origin)).await;
+    let (from, _, echo) = a_stranger_writes(
+        &format!("P = vmess, 127.0.0.1, {}, {params}", upstream.addr().port()),
+        || upstream.udp_outside()[0],
+    )
+    .await;
+    assert_eq!(from, echo);
 }

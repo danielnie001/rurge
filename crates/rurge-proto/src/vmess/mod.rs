@@ -1,7 +1,8 @@
 //! `vmess` outbound (manual: Policies › VMess): the AEAD handshake only,
 //! optionally under TLS and / or a WebSocket. The sealed request head waits
 //! in a `LazyHead` for the first payload; the body is chunked and sealed in
-//! both directions (`stream`).
+//! both directions (`stream`). UDP is command 2, one connection per target
+//! (`udp`).
 //!
 //! The server never says why it refuses: a wrong id, or a clock more than
 //! about two minutes off, both end as a connection closed without an answer.
@@ -10,6 +11,7 @@ pub(crate) mod chunk;
 pub(crate) mod header;
 pub(crate) mod kdf;
 mod stream;
+mod udp;
 #[cfg(test)]
 pub(crate) mod vectors;
 
@@ -18,20 +20,27 @@ use crate::build::{shadow_tls_client, tls_client};
 use crate::transport::Stack;
 use crate::transport::lazy_head::LazyHead;
 use crate::transport::ws::WsClient;
-use crate::{BuildError, Outbound, OutboundError};
+use crate::{BuildError, Outbound, OutboundError, UdpSupport};
 use header::{Security, Session};
 use rurge_config::KeystoreItem;
 use rurge_config::spec::{ShadowTlsOpts, VmessCipher, VmessSpec};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
+use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target};
 use rustls::RootCertStore;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use stream::VmessStream;
+use udp::VmessUdp;
 
 /// No `Debug`: the command key is as good as the id.
 pub struct VmessOutbound {
     name: String,
+    dialer: Arc<Dialer>,
+}
+
+/// What opening a VMess connection takes; shared with the UDP carrier,
+/// which opens one per target.
+struct Dialer {
     stack: Stack,
     /// `MD5(id ‖ magic)`; the id itself is not kept.
     cmd_key: [u8; 16],
@@ -68,17 +77,22 @@ impl VmessOutbound {
             .transpose()?;
         Ok(VmessOutbound {
             name: name.to_string(),
-            stack: Stack::new(connector, server, shadow_tls, tls, ws),
-            cmd_key: header::cmd_key(spec.uuid.expose()),
-            security: match spec.cipher {
-                VmessCipher::Aes128Gcm => Security::Aes128Gcm,
-                VmessCipher::ChaCha20Poly1305 => Security::ChaCha20Poly1305,
-            },
+            dialer: Arc::new(Dialer {
+                stack: Stack::new(connector, server, shadow_tls, tls, ws),
+                cmd_key: header::cmd_key(spec.uuid.expose()),
+                security: match spec.cipher {
+                    VmessCipher::Aes128Gcm => Security::Aes128Gcm,
+                    VmessCipher::ChaCha20Poly1305 => Security::ChaCha20Poly1305,
+                },
+            }),
         })
     }
+}
 
-    /// The sealed request head for `target`, and the secrets it announces.
-    fn head(&self, target: &Target) -> Result<(Vec<u8>, Session), OutboundError> {
+impl Dialer {
+    /// The sealed request head for `command` to `target`, and the secrets it
+    /// announces.
+    fn head(&self, command: u8, target: &Target) -> Result<(Vec<u8>, Session), OutboundError> {
         let address = vmess_addr(target).map_err(|e| {
             OutboundError::Proxy(
                 match e {
@@ -102,9 +116,29 @@ impl VmessOutbound {
         let auth_id = header::auth_id(&self.cmd_key, now + jitter, random()?);
         let padding: [u8; 16] = random()?;
         let padding = &padding[..usize::from(padding[15] % 16)];
-        let plain = header::request_plain(&session, self.security, &address, padding);
+        let plain = header::request_plain(&session, self.security, command, &address, padding);
         let head = header::seal_request(&self.cmd_key, &auth_id, &random()?, &plain);
         Ok((head, session))
+    }
+
+    /// A connection for `command` to `target`: the chunked stream, its head
+    /// queued for the first payload.
+    async fn connect(
+        &self,
+        command: u8,
+        target: &Target,
+        opts: &ConnectOpts,
+    ) -> Result<BoxedStream, OutboundError> {
+        // never dial for a target whose name cannot be sent
+        let (head, session) = self.head(command, target)?;
+        // one budget for the connection, TLS and the WebSocket handshake;
+        // the server's answer comes with its first payload, in the relay
+        let transport = match tokio::time::timeout(opts.timeout, self.stack.open(opts)).await {
+            Ok(result) => result?,
+            Err(_) => return Err(OutboundError::Timeout),
+        };
+        let lazy: BoxedStream = Box::new(LazyHead::new(transport, head));
+        Ok(Box::new(VmessStream::new(lazy, session, self.security)) as BoxedStream)
     }
 }
 
@@ -118,31 +152,34 @@ impl Outbound for VmessOutbound {
         target: &'a Target,
         opts: &'a ConnectOpts,
     ) -> BoxFuture<'a, Result<BoxedStream, OutboundError>> {
-        Box::pin(async move {
-            // never dial for a target whose name cannot be sent
-            let (head, session) = self.head(target)?;
-            // one budget for the connection, TLS and the WebSocket handshake;
-            // the server's answer comes with its first payload, in the relay
-            let transport = match tokio::time::timeout(opts.timeout, self.stack.open(opts)).await {
-                Ok(result) => result?,
-                Err(_) => return Err(OutboundError::Timeout),
-            };
-            let lazy: BoxedStream = Box::new(LazyHead::new(transport, head));
-            Ok(Box::new(VmessStream::new(lazy, session, self.security)) as BoxedStream)
-        })
+        Box::pin(self.dialer.connect(header::COMMAND_TCP, target, opts))
+    }
+
+    fn udp(&self) -> UdpSupport {
+        UdpSupport::Native
+    }
+
+    /// Nothing is dialled yet: each target gets its connection with its
+    /// first datagram.
+    fn open_udp<'a>(
+        &'a self,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, Result<BoxedPacketSocket, OutboundError>> {
+        let udp = VmessUdp::new(self.dialer.clone(), opts.clone());
+        Box::pin(std::future::ready(Ok(Box::new(udp) as BoxedPacketSocket)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{FakeVmess, TlsFixture, VmessScript, echo_server};
+    use crate::testing::{FakeVmess, TlsFixture, VmessScript, echo_server, udp_echo_server};
     use rurge_config::policy::parse_policy;
     use rurge_config::spec::ParamReader;
     use rurge_config::spec::shadow_tls::read_shadow_tls;
     use rurge_config::spec::vmess::read_vmess;
     use rurge_config::{HostName, Span};
-    use rurge_net::connector::{DirectConnector, SystemResolve};
+    use rurge_net::connector::{DirectConnector, PacketSocket, SystemResolve};
     use std::net::SocketAddr;
     use std::path::Path;
     use std::time::Duration;
@@ -584,5 +621,115 @@ mod tests {
             .expect("bounded")
             .unwrap();
         assert_eq!(got, b"world");
+    }
+
+    async fn udp_answer(carrier: &dyn PacketSocket) -> (Vec<u8>, Target) {
+        let mut buf = vec![0u8; 65536];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(10), carrier.recv_from(&mut buf))
+            .await
+            .expect("an answer within the bound")
+            .unwrap();
+        (buf[..n].to_vec(), from)
+    }
+
+    async fn udp_roundtrip(carrier: &dyn PacketSocket, to: &Target, payload: &[u8]) {
+        carrier.send_to(payload, to).await.unwrap();
+        assert_eq!(udp_answer(carrier).await, (payload.to_vec(), to.clone()));
+    }
+
+    /// Command 2: one connection per target, opened by its first datagram;
+    /// each datagram one chunk.
+    #[tokio::test]
+    async fn udp_opens_one_connection_per_target() {
+        let (one, two) = (udp_echo_server().await, udp_echo_server().await);
+        let fake = FakeVmess::spawn(VmessScript::new(ID), None).await;
+        let out = outbound(
+            &format!(
+                "vmess, 127.0.0.1, {}, username={ID}, vmess-aead=true",
+                fake.addr().port()
+            ),
+            no_roots(),
+        );
+        assert_eq!(out.udp(), UdpSupport::Native);
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        assert_eq!(
+            fake.connections(),
+            0,
+            "nothing is dialled before a datagram"
+        );
+        udp_roundtrip(carrier.as_ref(), &target(one), b"to one").await;
+        udp_roundtrip(carrier.as_ref(), &target(two), b"to two").await;
+        udp_roundtrip(carrier.as_ref(), &target(one), b"one again").await;
+        let seen: Vec<_> = fake
+            .requests()
+            .iter()
+            .map(|r| (r.command, r.options, r.port))
+            .collect();
+        assert_eq!(seen, [(2, 0x05, one.port()), (2, 0x05, two.port())]);
+    }
+
+    /// Symmetric: the server cannot say who answered, so whatever comes back
+    /// on a target's connection counts as that target's.
+    #[tokio::test]
+    async fn every_answer_counts_as_the_targets() {
+        let echo = udp_echo_server().await;
+        let fake = FakeVmess::spawn(VmessScript::new(ID), None).await;
+        let out = outbound(
+            &format!(
+                "vmess, 127.0.0.1, {}, username={ID}, vmess-aead=true",
+                fake.addr().port()
+            ),
+            no_roots(),
+        );
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        udp_roundtrip(carrier.as_ref(), &target(echo), b"hello").await;
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger
+            .send_to(b"unasked", fake.udp_outside()[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            udp_answer(carrier.as_ref()).await,
+            (b"unasked".to_vec(), target(echo))
+        );
+    }
+
+    /// Over TLS and a WebSocket, a name going to the server; a datagram too
+    /// long for one chunk is refused without a connection.
+    #[tokio::test]
+    async fn udp_over_tls_and_a_websocket_and_a_datagram_too_long() {
+        let echo = udp_echo_server().await;
+        let fixture = TlsFixture::new(&["127.0.0.1"]);
+        let fake = FakeVmess::spawn(
+            VmessScript {
+                ws: true,
+                connect_to: Some(echo),
+                ..VmessScript::new(ID)
+            },
+            Some(fixture.clone()),
+        )
+        .await;
+        let out = outbound(
+            &format!(
+                "vmess, 127.0.0.1, {}, username={ID}, vmess-aead=true, encrypt-method=chacha20-ietf-poly1305, tls=true, ws=true, ws-path=/v",
+                fake.addr().port()
+            ),
+            fixture.roots(),
+        );
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        let err = carrier
+            .send_to(&vec![0u8; 16369], &target(echo))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "vmess: a datagram longer than 16368 bytes");
+        assert_eq!(fake.connections(), 0);
+        let name = Target::new(HostName::Domain("bücher.example".into()), 53);
+        carrier.send_to(b"q", &name).await.unwrap();
+        assert_eq!(udp_answer(carrier.as_ref()).await, (b"q".to_vec(), name));
+        let seen = fake.requests();
+        assert_eq!(
+            (seen[0].command, seen[0].security, seen[0].host.as_str()),
+            (2, 4, "xn--bcher-kva.example")
+        );
     }
 }

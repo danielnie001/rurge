@@ -13,7 +13,10 @@ use md5::{Digest, Md5};
 use ring::aead::{AES_128_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 
 const VERSION: u8 = 1;
-const COMMAND_TCP: u8 = 1;
+/// The request's command: a TCP stream, or UDP to one target (each chunk
+/// one datagram).
+pub(crate) const COMMAND_TCP: u8 = 1;
+pub(crate) const COMMAND_UDP: u8 = 2;
 /// ChunkStream | ChunkMasking: what every server accepts.
 pub(crate) const OPTIONS: u8 = 0x01 | 0x04;
 pub(crate) const TAG: usize = 16;
@@ -62,11 +65,13 @@ fn fnv1a(data: &[u8]) -> u32 {
     })
 }
 
-/// The head before sealing. `address` is `port ‖ type ‖ address`
-/// (`addr::vmess_addr`); `padding` is 0 – 15 random bytes.
+/// The head before sealing. `command` is `COMMAND_TCP` or `COMMAND_UDP`;
+/// `address` is `port ‖ type ‖ address` (`addr::vmess_addr`); `padding` is
+/// 0 – 15 random bytes.
 pub(crate) fn request_plain(
     session: &Session,
     security: Security,
+    command: u8,
     address: &[u8],
     padding: &[u8],
 ) -> Vec<u8> {
@@ -79,7 +84,7 @@ pub(crate) fn request_plain(
     out.push(OPTIONS);
     out.push(((padding.len() as u8) << 4) | security as u8);
     out.push(0);
-    out.push(COMMAND_TCP);
+    out.push(command);
     out.extend_from_slice(address);
     out.extend_from_slice(padding);
     let check = fnv1a(&out);
@@ -238,6 +243,7 @@ mod tests {
         let plain = request_plain(
             &vectors::session(),
             Security::Aes128Gcm,
+            COMMAND_TCP,
             &vectors::address(),
             &[0xa1, 0xa2, 0xa3],
         );
@@ -254,15 +260,17 @@ mod tests {
     }
 
     #[test]
-    fn the_security_nibble_follows_the_cipher() {
+    fn the_security_nibble_follows_the_cipher_and_the_command_the_transport() {
         let plain = request_plain(
             &vectors::session(),
             Security::ChaCha20Poly1305,
+            COMMAND_UDP,
             &vectors::address(),
             &[],
         );
         assert_eq!(plain[35], 0x04, "no padding, chacha20-poly1305");
         assert_eq!(plain[34], OPTIONS);
+        assert_eq!(plain[37], 2, "UDP");
     }
 
     #[test]

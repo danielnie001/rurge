@@ -1,6 +1,7 @@
 //! A scriptable VMess AEAD server: optionally TLS, optionally a WebSocket
-//! below the protocol, the sealed request head, then a chunked relay. It never
-//! resolves a name.
+//! below the protocol, the sealed request head, then a chunked relay — of a
+//! TCP stream, or for command 2 of datagrams, one per chunk, through a UDP
+//! socket of the connection's own. It never resolves a name.
 
 use super::ws::{RecordedWs, accept_bytes};
 use super::{AbortOnDrop, TlsFixture};
@@ -18,7 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 #[derive(Clone, Default)]
 pub struct VmessScript {
@@ -67,6 +68,7 @@ pub struct FakeVmess {
     ws_seen: Arc<Mutex<Vec<RecordedWs>>>,
     connections: Arc<AtomicUsize>,
     rejected: Arc<AtomicUsize>,
+    udp_outside: Arc<Mutex<Vec<SocketAddr>>>,
     _task: AbortOnDrop,
 }
 
@@ -75,6 +77,7 @@ struct Shared {
     requests: Arc<Mutex<Vec<RecordedVmess>>>,
     ws_seen: Arc<Mutex<Vec<RecordedWs>>>,
     rejected: Arc<AtomicUsize>,
+    udp_outside: Arc<Mutex<Vec<SocketAddr>>>,
 }
 
 fn open_gcm(key: [u8; 16], iv: &[u8; 32], aad: &[u8], sealed: &mut [u8]) -> Option<usize> {
@@ -277,7 +280,6 @@ async fn serve(mut stream: BoxedStream, shared: Arc<Shared>) -> io::Result<()> {
             Err(_) => return stream.shutdown().await,
         },
     };
-    let upstream = TcpStream::connect(upstream_addr).await?;
     let session = parsed.session;
     let (key, iv) = header::response_secrets(&session);
     let mut answer = Vec::new();
@@ -296,9 +298,58 @@ async fn serve(mut stream: BoxedStream, shared: Arc<Shared>) -> io::Result<()> {
     );
     let stream = crate::transport::prefixed::boxed(buf[need..].to_vec(), stream);
     let (mut from_client, mut to_client) = tokio::io::split(stream);
-    let (mut from_upstream, mut to_upstream) = upstream.into_split();
     let mut up = ChunkCipher::new(security, &session.body_key, &session.body_iv);
     let mut down = ChunkCipher::new(security, &key, &iv);
+    if parsed.record.command == 2 {
+        // one datagram per chunk each way, to the target itself when it is
+        // an address (`connect_to` is for names); answers from anyone go back
+        let to = match parsed.record.host.parse::<IpAddr>() {
+            Ok(ip) => SocketAddr::new(ip, parsed.record.port),
+            Err(_) => upstream_addr,
+        };
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        shared
+            .udp_outside
+            .lock()
+            .expect("outside")
+            .push(socket.local_addr()?);
+        let upward = async {
+            loop {
+                let mut len = [0u8; 2];
+                from_client.read_exact(&mut len).await?;
+                let mut sealed = vec![0u8; up.open_len(len)];
+                from_client.read_exact(&mut sealed).await?;
+                match up.open(&mut sealed) {
+                    Some(0) | None => return Ok::<(), io::Error>(()),
+                    Some(n) => {
+                        socket.send_to(&sealed[..n], to).await?;
+                    }
+                }
+            }
+        };
+        let downward = async {
+            to_client.write_all(&answer).await?;
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let n = match socket.recv_from(&mut buf).await {
+                    Ok((n, _)) => n,
+                    // an ICMP "unreachable" for an earlier datagram (Windows)
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
+                    Err(e) => return Err::<(), io::Error>(e),
+                };
+                let mut out = Vec::new();
+                down.seal(&buf[..n], &mut out);
+                to_client.write_all(&out).await?;
+            }
+        };
+        tokio::select! {
+            _ = upward => {}
+            _ = downward => {}
+        }
+        return Ok(());
+    }
+    let upstream = TcpStream::connect(upstream_addr).await?;
+    let (mut from_upstream, mut to_upstream) = upstream.into_split();
     let upward = async {
         loop {
             let mut len = [0u8; 2];
@@ -344,11 +395,13 @@ impl FakeVmess {
         let ws_seen: Arc<Mutex<Vec<RecordedWs>>> = Arc::default();
         let connections = Arc::new(AtomicUsize::new(0));
         let rejected = Arc::new(AtomicUsize::new(0));
+        let udp_outside: Arc<Mutex<Vec<SocketAddr>>> = Arc::default();
         let shared = Arc::new(Shared {
             script,
             requests: requests.clone(),
             ws_seen: ws_seen.clone(),
             rejected: rejected.clone(),
+            udp_outside: udp_outside.clone(),
         });
         let acceptor = tls.as_ref().map(|fixture| fixture.acceptor(false));
         let count = connections.clone();
@@ -376,6 +429,7 @@ impl FakeVmess {
             ws_seen,
             connections,
             rejected,
+            udp_outside,
             _task: AbortOnDrop(task),
         }
     }
@@ -400,5 +454,11 @@ impl FakeVmess {
     /// Connections dropped without an answer (unknown id, stale timestamp, garbage).
     pub fn rejected(&self) -> usize {
         self.rejected.load(Ordering::SeqCst)
+    }
+
+    /// Where each UDP connection (command 2) sends from: a datagram to one
+    /// of these goes back to that connection's client.
+    pub fn udp_outside(&self) -> Vec<SocketAddr> {
+        self.udp_outside.lock().expect("outside").clone()
     }
 }
