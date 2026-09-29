@@ -165,3 +165,38 @@ async fn anytls_reuses_its_session_and_can_be_told_not_to() {
         roundtrip(&once, echo).await;
     }
 }
+
+/// UDP (phase 2 M5b): trojan's UDP ASSOCIATE, vmess command 2 and AnyTLS's
+/// UDP over TCP v2, each to a loopback UDP echo through sing-box.
+#[tokio::test]
+async fn udp_through_trojan_vmess_and_anytls() {
+    let Some(bin) = sing_box_or_skip("udp_through_trojan_vmess_and_anytls") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = TlsFixture::new(&["127.0.0.1"]);
+    let sb = SingBox::spawn(
+        &bin,
+        dir.path(),
+        vec![
+            trojan_inbound(leaf_files(&fixture, dir.path()), None),
+            vmess_inbound(None, None),
+            Inbound {
+                kind: InboundKind::AnyTls,
+                users: vec![("u".into(), "s3same".into())],
+                tls: Some(leaf_files(&fixture, dir.path())),
+                ws_path: None,
+            },
+        ],
+    );
+    let echo = udp_echo_server().await;
+    let profile = format!(
+        "[Proxy]\nT = trojan, 127.0.0.1, {}, password=s3same\nV = vmess, 127.0.0.1, {}, username={VMESS_ID}, vmess-aead=true\nA = anytls, 127.0.0.1, {}, password=s3same\n[Rule]\nFINAL,DIRECT\n",
+        sb.port(0),
+        sb.port(1),
+        sb.port(2)
+    );
+    for name in ["T", "V", "A"] {
+        udp_roundtrip(&outbound(&profile, name, Some(&fixture)), echo).await;
+    }
+}

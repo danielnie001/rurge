@@ -14,7 +14,7 @@ pub use rurge_net::connector::{ConnectOpts, SystemResolve, Target};
 pub use rurge_net::socket::NoopSocketHook;
 pub use rurge_net::testing::TestServer;
 pub use rurge_policy::OutboundFactory;
-pub use rurge_proto::testing::{TlsFixture, echo_server};
+pub use rurge_proto::testing::{TlsFixture, echo_server, udp_echo_server};
 pub use rurge_proto::{OutboundError, OutboundRef};
 pub use rurge_proto_wireguard::testing::keypair;
 pub use std::net::SocketAddr;
@@ -80,6 +80,25 @@ pub async fn roundtrip(out: &OutboundRef, echo: SocketAddr) {
         .expect("the echo comes back within the bound")
         .unwrap();
     assert_eq!(&buf, b"interop");
+}
+
+/// One datagram to `echo` through a fresh UDP carrier of `out`, and its
+/// answer. Bounded like `roundtrip`.
+pub async fn udp_roundtrip(out: &OutboundRef, echo: SocketAddr) {
+    let bound = std::time::Duration::from_secs(10);
+    let carrier = tokio::time::timeout(bound, out.open_udp(&ConnectOpts::default()))
+        .await
+        .expect("the carrier opens within the bound")
+        .expect("the carrier opens");
+    for payload in [&b"interop"[..], b"again"] {
+        carrier.send_to(payload, &target(echo)).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, from) = tokio::time::timeout(bound, carrier.recv_from(&mut buf))
+            .await
+            .expect("the echo comes back within the bound")
+            .unwrap();
+        assert_eq!((&buf[..n], from), (payload, target(echo)));
+    }
 }
 
 pub fn plain(kind: InboundKind, users: &[(&str, &str)]) -> Inbound {

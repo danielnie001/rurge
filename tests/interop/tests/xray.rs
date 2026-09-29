@@ -10,7 +10,7 @@ use rurge_net::connector::{ConnectOpts, SystemResolve, Target};
 use rurge_net::socket::NoopSocketHook;
 use rurge_policy::OutboundFactory;
 use rurge_proto::OutboundRef;
-use rurge_proto::testing::echo_server;
+use rurge_proto::testing::{echo_server, udp_echo_server};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -104,5 +104,48 @@ async fn vmess_with_either_cipher_with_and_without_websocket() {
         let out = outbound(&profile, name);
         roundtrip(&out, echo, b"interop").await;
         roundtrip(&out, echo, &big).await;
+    }
+}
+
+/// UDP (phase 2 M5b): command 2, one connection per target, each datagram
+/// one chunk; either cipher.
+#[tokio::test]
+async fn vmess_udp_with_either_cipher() {
+    let Some(bin) = xray_or_skip("vmess_udp_with_either_cipher") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let xray = Xray::spawn(
+        &bin,
+        dir.path(),
+        vec![XrayInbound {
+            uuid: VMESS_ID.into(),
+            ws_path: None,
+        }],
+    );
+    let (one, two) = (udp_echo_server().await, udp_echo_server().await);
+    let profile = format!(
+        "[Proxy]\nPlain = vmess, 127.0.0.1, {0}, username={VMESS_ID}, vmess-aead=true\nChacha = vmess, 127.0.0.1, {0}, username={VMESS_ID}, vmess-aead=true, encrypt-method=chacha20-ietf-poly1305\n[Rule]\nFINAL,DIRECT\n",
+        xray.port(0)
+    );
+    let bound = Duration::from_secs(10);
+    for name in ["Plain", "Chacha"] {
+        let carrier = tokio::time::timeout(
+            bound,
+            outbound(&profile, name).open_udp(&ConnectOpts::default()),
+        )
+        .await
+        .expect("the carrier opens within the bound")
+        .expect("the carrier opens");
+        for echo in [one, two, one] {
+            let to = Target::new(rurge_config::HostName::Ip(echo.ip()), echo.port());
+            carrier.send_to(b"interop", &to).await.unwrap();
+            let mut buf = [0u8; 64];
+            let (n, from) = tokio::time::timeout(bound, carrier.recv_from(&mut buf))
+                .await
+                .expect("the echo comes back within the bound")
+                .unwrap();
+            assert_eq!((&buf[..n], from), (&b"interop"[..], to));
+        }
     }
 }
