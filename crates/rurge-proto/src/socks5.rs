@@ -1,4 +1,4 @@
-//! `socks5` / `socks5-tls` proxy outbound (RFC 1928, RFC 1929), CONNECT only.
+//! `socks5` / `socks5-tls` proxy outbound (RFC 1928, RFC 1929): CONNECT and UDP ASSOCIATE.
 
 use crate::build::{shadow_tls_client, tls_client};
 use crate::task::AbortOnDrop;
@@ -12,6 +12,7 @@ use rurge_net::connector::{
 };
 use rustls::RootCertStore;
 use std::io;
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
@@ -211,6 +212,8 @@ fn parse_udp(datagram: &[u8]) -> Option<(Target, usize)> {
 /// control connection (RFC 1928 §7): this carrier then fails.
 pub(crate) struct Socks5Udp {
     relay: Target,
+    /// The relay as the carrier resolves it, looked up on first receive.
+    relay_ip: tokio::sync::OnceCell<Option<IpAddr>>,
     socket: BoxedPacketSocket,
     closed: CancellationToken,
     _control: AbortOnDrop,
@@ -233,10 +236,22 @@ impl Socks5Udp {
         });
         Socks5Udp {
             relay,
+            relay_ip: tokio::sync::OnceCell::new(),
             socket,
             closed,
             _control: AbortOnDrop(task),
         }
+    }
+}
+
+/// Whether a datagram from `sender` may be the relay's: when the relay is
+/// known by address its source must be that address (the port may differ);
+/// a relay still known by name (a chained carrier) is not filtered.
+fn from_relay(relay: Option<IpAddr>, sender: &Target) -> bool {
+    match (relay, &sender.host) {
+        (Some(relay), HostName::Ip(ip)) => relay == *ip,
+        (Some(_), HostName::Domain(_)) => false,
+        (None, _) => true,
     }
 }
 
@@ -262,10 +277,26 @@ impl PacketSocket for Socks5Udp {
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
         Box::pin(async move {
             loop {
-                let (n, _) = tokio::select! {
+                let (n, sender) = tokio::select! {
                     _ = self.closed.cancelled() => return Err(association_closed()),
                     got = self.socket.recv_from(buf) => got?,
                 };
+                let relay_ip = self
+                    .relay_ip
+                    .get_or_init(|| async {
+                        match self.socket.resolve(&self.relay).await {
+                            Ok(Target {
+                                host: HostName::Ip(ip),
+                                ..
+                            }) => Some(ip),
+                            _ => None,
+                        }
+                    })
+                    .await;
+                // only the relay speaks on this association
+                if !from_relay(*relay_ip, &sender) {
+                    continue;
+                }
                 // what the relay cannot have meant (a fragment, garbage) is dropped
                 if let Some((from, start)) = parse_udp(&buf[..n]) {
                     buf.copy_within(start..n, 0);
@@ -284,7 +315,8 @@ pub(crate) async fn negotiate(
     request: &[u8],
     credentials: Option<&(String, String)>,
 ) -> Result<BoxedStream, OutboundError> {
-    negotiate_bound(stream, request, credentials)
+    // BND.ADDR is of no use to a tunnel: read past it, whatever it says
+    exchange(stream, request, credentials)
         .await
         .map(|(stream, _)| stream)
 }
@@ -292,10 +324,22 @@ pub(crate) async fn negotiate(
 /// `negotiate`, and the address the proxy's reply named (BND.ADDR,
 /// BND.PORT): for `UDP ASSOCIATE`, where the datagrams go.
 pub(crate) async fn negotiate_bound(
-    mut stream: BoxedStream,
+    stream: BoxedStream,
     request: &[u8],
     credentials: Option<&(String, String)>,
 ) -> Result<(BoxedStream, Target), OutboundError> {
+    let (stream, bound) = exchange(stream, request, credentials).await?;
+    let (bound, _) = crate::addr::parse_socks_addr(&bound)
+        .ok_or_else(|| proxy("the reply names an address that is no host name"))?;
+    Ok((stream, bound))
+}
+
+/// The handshake itself; the reply's `ATYP ADDR PORT` comes back as read.
+async fn exchange(
+    mut stream: BoxedStream,
+    request: &[u8],
+    credentials: Option<&(String, String)>,
+) -> Result<(BoxedStream, Vec<u8>), OutboundError> {
     let offered: &[u8] = if credentials.is_some() {
         &[NO_AUTH, USER_PASS]
     } else {
@@ -359,8 +403,6 @@ pub(crate) async fn negotiate_bound(
         .read_exact(&mut bound[start..])
         .await
         .map_err(handshake_io)?;
-    let (bound, _) = crate::addr::parse_socks_addr(&bound)
-        .ok_or_else(|| proxy("the reply names an address that is no host name"))?;
     Ok((stream, bound))
 }
 
@@ -586,6 +628,45 @@ mod tests {
             "policy protocol not implemented: UDP without `udp-relay=true`"
         );
         assert!(proxy.requests().is_empty());
+    }
+
+    #[test]
+    fn only_the_relay_may_answer() {
+        let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+        let from = |s: &str, port| Target::new(HostName::parse(s), port);
+        assert!(from_relay(ip("10.0.0.1"), &from("10.0.0.1", 1)));
+        assert!(
+            from_relay(ip("10.0.0.1"), &from("10.0.0.1", 9999)),
+            "any port"
+        );
+        assert!(!from_relay(ip("10.0.0.1"), &from("10.0.0.2", 1)));
+        assert!(!from_relay(ip("10.0.0.1"), &from("relay.test", 1)));
+        assert!(
+            from_relay(None, &from("10.0.0.2", 1)),
+            "a named relay is not filtered"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_ignores_an_unreadable_bound_address() {
+        let echo = echo_server().await;
+        let mut bound = vec![3u8, 3, b'a', b' ', b'b'];
+        bound.extend_from_slice(&[0, 53]);
+        let server = FakeSocks5::spawn(Socks5Script {
+            connect_to: Some(echo),
+            reply_bound: Some(bound),
+            ..Socks5Script::default()
+        })
+        .await;
+        let out = outbound(
+            &format!("socks5, 127.0.0.1, {}", server.addr().port()),
+            no_roots(),
+        );
+        let mut stream = out
+            .connect_tcp(&target(echo), &ConnectOpts::default())
+            .await
+            .unwrap();
+        roundtrip(&mut stream, b"still a tunnel").await;
     }
 
     #[test]
