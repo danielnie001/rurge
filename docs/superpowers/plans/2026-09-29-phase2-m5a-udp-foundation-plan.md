@@ -5502,6 +5502,20 @@ git commit -m "docs: M5a UDP 地基——兼容性清单、API 文档的 transpo
 
 | # | 任务 | 与计划的出入 | 原因 |
 | - | ---- | ------------ | ---- |
+| 1 | Task 2 | `Socks5Udp::recv_from` 只收源 IP 是中继地址的包（不比端口；中继地址仍是主机名时不过滤） | 计划照收任何来源，别人能向载体的端口冒充中继发包（任务评审） |
+| 2 | Task 2 | `negotiate`（CONNECT）照 M5a 之前跳过 BND.ADDR，只有 `negotiate_bound`（UDP ASSOCIATE）解析它；新增用例 `connect_ignores_an_unreadable_bound_address`；模块文档不再写"只 CONNECT" | 计划让 CONNECT 在上游回了读不懂的地址时失败，是 M5a 之前没有的回归（任务评审） |
+| 3 | Task 4 | DNS 流的 10 秒回收在运行时生效：`Flow::idle` 由回答唤醒、重算期限；新增用例 `a_dns_flow_ends_soon_after_its_answer` | 计划的 `forward` 睡到回答之前算好的期限，`DNS_LINGER` 实际不起作用（任务评审） |
+| 4 | Task 4 | 载体持有它的 `OutboundRef`，取缓存时核对是同一个出站 | 缓存键是出站对象的地址：重载释放旧出站后，新出站可能落在同一地址上而拿到别人的载体（任务评审） |
+| 5 | Task 4 | UDP 流可经 `POST /v1/requests/kill` 结束（`run_flow` / `forward` / `drain` 都看会话令牌）；新增用例 `a_killed_flow_ends_and_the_next_datagram_starts_a_new_one` | 计划里 kill 对 UDP 流无效（任务评审） |
+| 6 | Task 4 | 收包任务已经结束的载体（`dead`）不再交给新流，下一条流开新载体；新增用例 `a_dead_carrier_is_not_used_again` | 上游关联断了之后载体成了黑洞（任务评审） |
+| 7 | Task 4 | 流结束前先关掉它的队列，之后到达的包开新流 | 否则落进已经没人读的队列里丢失（任务评审） |
+| 8 | Task 7 | 文档另写了三处评审修正的行为（中继的来源过滤、UDP 流可 kill、DNS 流 10 秒回收）；兼容性清单 4.5 表里 `udp-relay` 与不支持的协议两行的说明并回四列的状态格；手工验收的 `external` 一项改了措辞 | 文档要与交付的行为一致；计划的改法让这两行多出第 5 格，渲染时被丢掉（任务评审） |
+| 9 | 全分支评审 | 出站打开失败的流只在失败后 `RETRY_AFTER`（5 秒）内丢包，期间来包不顺延，之后流结束，下一个包开新流、重新走规则并重试；被拒绝的流（REJECT、QUIC 被阻断、策略不支持 UDP）仍照 P10 留到空闲为止；新增用例 `a_failed_flow_is_tried_again_while_datagrams_keep_coming`（改回旧做法时它在 15 秒截止处失败） | 覆盖 P10 对失败流的做法：短暂故障期间开始、一直在发包的语音 / 游戏客户端按"60 秒无包才回收"永远恢复不了 |
+| 10 | 全分支评审 | `socks5` / `external` 的中继在建立关联时（`Socks5Udp::open`）经载体解析一次，发送与来源过滤共用这个结果，解析失败则关联打开失败（`socks5: cannot look up the UDP relay: …`）；去掉惰性的 `OnceCell`；新增用例 `the_relay_is_looked_up_once` | 原来每个包都解析一次（DIRECT 每次查 DNS），过滤却只查一次且失败时记成"不过滤"：两者可能不一致，DNS 过期时包会卡住 |
+| 11 | 全分支评审 | 入站 UDP ASSOCIATE 的应答里 IPv4 映射的本机地址按 IPv4（ATYP 1）回；新增用例 `an_ipv4_mapped_bound_address_is_sent_as_ipv4` | 双栈监听上的 IPv4 客户端读不懂 `::ffff:a.b.c.d` 形式的 IPv6 地址 |
+| 12 | 全分支评审 | `serve` 用 drop guard 结束关联（future 被丢弃时流也结束）；关联数上限的告警改为 `the new association is refused`（`warn_udp_limit` 的调用方给出完整说明）；用例的 `udp_echo` 只在 `ConnectionReset` 时继续、其它错误退出 | 小修：原来只有正常返回才结束关联；告警把拒绝关联说成"新流丢弃"；出错时空转 |
+| 13 | 全分支评审 | 文档：兼容性清单 `PROTOCOL` 行改 🟡（UDP 流的 STUN / DNS 嗅探未做），`socks5-listen` 行补上 UDP 流的源端口是控制连接的（`SRC-PORT`）、失败流 5 秒后重试与 IPv4 映射地址，`socks5` 行补上"只替换未指定的中继地址，NAT 后面的中继回私网地址时到不了"与只解析一次；手工验收加 NAT 中继一项；`PacketSocket::recv_from` 与 `Socks5Udp` 收包写明缓冲给 64 KiB（Windows 放不下时报 `WSAEMSGSIZE`，SOCKS5 头要占位）；设计第 18 节 | 文档与交付的行为一致 |
+| 14 | 全分支评审 | 修正后的全工作区门禁：52 个测试二进制，1217 通过、0 失败、2 忽略（fmt、clippy 零警告） | — |
 
 ## 延后事项
 
@@ -5511,3 +5525,13 @@ git commit -m "docs: M5a UDP 地基——兼容性清单、API 文档的 transpo
 | 2 | 全锥时"收到其它来源的包"的标注：请求记录只有 `error` 能写说明（P9） | 请求记录有说明字段时 |
 | 3 | `ChainConnector::connect_udp`（把包载体包成到固定服务器的 `Datagram`）（P15） | M5c（`wireguard` 经 `underlying-proxy`） |
 | 4 | UDP 流不计入 REJECT 的自动升级（P13） | 需要时另议 |
+| 5 | `DirectPacket::recv_from` 先轮询 IPv4 再 IPv6：IPv4 持续满载时 IPv6 的回包可能饿死；IPv4 映射的 IPv6 目标发往只收 IPv6 的那个 socket | 有用户报告再说 |
+| 6 | 声明端口的严格程度：没声明端口（0）时由客户端 IP 的第一个包钉住端口，哪怕是垃圾包（回环上任何本机进程都能抢先）；没有声明端口 0、IPv4 映射客户端、先发后收的端到端用例；BND 里丢了 IPv6 的 scope id | 有用户报告再说 |
+| 7 | 发送遇到 `ConnectionReset`（Windows 把 ICMP 不可达报在同一 socket 上）时流按失败结束；收包任务因 `client.send` 失败结束时，流的说明写成 `the outbound's UDP socket has closed`（原因说错）；刚交出的载体随即死掉时新流失败（下一个包恢复） | 以后顺手改 |
+| 8 | 关联里的载体表（`Carriers`）条目在关联存续期间不删：每用过一个出站留一条（多次重载后积累） | 以后顺手改 |
+| 9 | `Routes::flow_for` 按 `Target` 精确比较：回包来源写成名字的出站（经链等）把全部回包记到最早的流上 | M5b（vmess 等协议的归流一起看） |
+| 10 | 持续使用的 DNS 流每 10 秒回收一次，下一个查询开新流（多一条请求记录） | 有用户报告再说 |
+| 11 | 入站关联端口的接收缓冲用系统默认值，没有调大 | 有吞吐问题时 |
+| 12 | `ChainConnector::open_udp` 与 `connect_tcp` 的前导（查注册表、已移除、REJECT 带说明）重复；这几个分支与 `external` 在 `udp-relay=false` 时的 `open_udp` 没有单元测试；`external` 关联的中继 socket 用 `ConnectOpts::default()` | M5c 动 `ChainConnector` 时 |
+| 13 | 用例的缺口：嗅探缺固定位清零与 v1 类型 1 的反例；`per_policy_block_quic_follows_the_terminal_policy` 的反向断言只查说明不是 `QUIC blocked`；`tests/udp.rs` 的 `routed` 在记录从进行中移到最近时可能重复计数；没有伪造来源的端到端用例；`SessionInfo::udp` 没有直接用例 | 以后顺手改 |
+| 14 | `tests/interop/README` 的条目顺序（UDP 一条夹在 https 与 socks5 之间）；`socks-helper` 头注释过长，`udp_goes_through_the_program` 的回显任务没有 abort | 以后顺手改 |

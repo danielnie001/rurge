@@ -155,3 +155,4 @@
 - [ ] `block-quic`：配置 `block-quic = all`，客户端发往 UDP 443 的 QUIC 被丢弃，请求记录为 REJECT 与 `QUIC blocked`，应用回落到 TCP 后照常可用；改为 `always-allow` 后 QUIC 照常经过。
 - [ ] 不支持 UDP 的策略：规则把 UDP 分到一条 `http` 策略，默认 REJECT（记录写 `policy does not support UDP`）；配置 `udp-policy-not-supported-behaviour = DIRECT` 后改经 DIRECT。
 - [ ] 关联结束：客户端断开（关闭软件），它的全部 UDP 记录随即结束。
+- [ ] NAT 后面的中继：上游 SOCKS5 节点放在带 NAT 的云主机上（本机私网地址、另有公网地址），看它对 UDP ASSOCIATE 回的中继地址：回未指定地址（`0.0.0.0`）或公网地址时 UDP 能往返；回私网地址时 UDP 不通（已知限制，见兼容性清单 `socks5` 一行），记下节点软件与它的设置。
