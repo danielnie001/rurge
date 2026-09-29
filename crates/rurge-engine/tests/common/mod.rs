@@ -307,8 +307,11 @@ pub async fn udp_echo() -> (SocketAddr, Arc<std::sync::Mutex<Vec<SocketAddr>>>) 
     tokio::spawn(async move {
         let mut buf = [0u8; 2048];
         loop {
-            let Ok((n, from)) = socket.recv_from(&mut buf).await else {
-                continue;
+            let (n, from) = match socket.recv_from(&mut buf).await {
+                Ok(got) => got,
+                // Windows reports an ICMP "unreachable" on the next receive
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
+                Err(_) => break,
             };
             log.lock().unwrap().push(from);
             let _ = socket.send_to(&buf[..n], from).await;

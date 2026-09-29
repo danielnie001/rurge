@@ -65,10 +65,11 @@ fn reply(code: u8) -> [u8; 10] {
     [VERSION, code, 0x00, ATYP_V4, 0, 0, 0, 0, 0, 0]
 }
 
-/// A success reply naming `bound`.
+/// A success reply naming `bound`; an IPv4-mapped address (a dual-stack
+/// listener's IPv4 client) goes out as the IPv4 address it is.
 fn reply_bound(bound: SocketAddr) -> Vec<u8> {
     let mut out = vec![VERSION, REP_SUCCESS, 0x00];
-    match bound.ip() {
+    match bound.ip().to_canonical() {
         IpAddr::V4(v4) => {
             out.push(ATYP_V4);
             out.extend_from_slice(&v4.octets());
@@ -305,6 +306,17 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn an_ipv4_mapped_bound_address_is_sent_as_ipv4() {
+        let mapped: SocketAddr = "[::ffff:10.0.0.1]:7".parse().unwrap();
+        assert_eq!(
+            reply_bound(mapped),
+            [VERSION, REP_SUCCESS, 0, ATYP_V4, 10, 0, 0, 1, 0, 7]
+        );
+        let v6: SocketAddr = "[::1]:7".parse().unwrap();
+        assert_eq!(reply_bound(v6)[3], ATYP_V6);
+    }
 
     async fn listener(drop_hold: Duration) -> (Running, Arc<FakeDialer>) {
         listener_with(drop_hold, Duration::from_secs(30)).await

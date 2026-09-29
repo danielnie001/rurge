@@ -32,6 +32,10 @@ pub const DNS_LINGER: Duration = Duration::from_secs(10);
 pub const FLOWS_PER_ASSOCIATION: usize = 1024;
 /// At most this many associations at once (M5-D11).
 pub const ASSOCIATIONS: usize = 4096;
+/// A flow whose outbound failed to open drops what comes for it this long
+/// after the failure — however much keeps coming — and then ends, so the
+/// next datagram starts a new flow that is routed and opened afresh.
+const RETRY_AFTER: Duration = Duration::from_secs(5);
 /// Datagrams waiting for their flow to get going; more are dropped.
 const QUEUE: usize = 64;
 /// Room for the largest datagram.
@@ -267,6 +271,8 @@ pub(crate) async fn serve(
         ended: engine.session_token(),
         done,
     });
+    // the flows end with the association, however this future ends
+    let _ended = association.ended.clone().drop_guard();
     let mut flows: HashMap<Target, (u64, mpsc::Sender<Vec<u8>>)> = HashMap::new();
     let mut next = 0u64;
     let mut buf = vec![0u8; DATAGRAM];
@@ -293,7 +299,7 @@ pub(crate) async fn serve(
                     }
                 }
                 if flows.len() >= FLOWS_PER_ASSOCIATION {
-                    engine.warn_udp_limit("udp: too many flows on this association");
+                    engine.warn_udp_limit("udp: too many flows on this association; new flows are dropped");
                     continue;
                 }
                 next += 1;
@@ -310,7 +316,6 @@ pub(crate) async fn serve(
             }
         }
     }
-    association.ended.cancel();
 }
 
 async fn run_flow(
@@ -345,9 +350,11 @@ async fn run_flow(
             handle.finish(outcome);
         }
         Err(outcome) => {
+            // a refused flow stays until it is idle; a failed one is tried
+            // again after `RETRY_AFTER`
+            let retry = matches!(outcome, SessionOutcome::Failed(_)).then(|| now() + RETRY_AFTER);
             handle.finish(outcome);
-            // the flow stays, dropping what comes for it, until it is idle
-            drain(&association, &handle, &mut waiting).await;
+            drain(&association, &handle, &mut waiting, retry).await;
             waiting.close();
         }
     }
@@ -479,14 +486,17 @@ async fn forward(
     }
 }
 
-/// Drops what comes for a flow that could not start, until it is idle.
+/// Drops what comes for a flow that could not start, until it is idle — or
+/// until `retry`, whatever comes in the meantime.
 async fn drain(
     association: &Association,
     handle: &SessionHandle,
     waiting: &mut mpsc::Receiver<Vec<u8>>,
+    retry: Option<Instant>,
 ) {
     let mut last = now();
     loop {
+        let end = retry.unwrap_or(last + FLOW_IDLE);
         tokio::select! {
             _ = association.ended.cancelled() => return,
             _ = handle.token().cancelled() => return,
@@ -494,7 +504,7 @@ async fn drain(
                 Some(_) => last = now(),
                 None => return,
             },
-            _ = tokio::time::sleep_until((last + FLOW_IDLE).into()) => return,
+            _ = tokio::time::sleep_until(end.into()) => return,
         }
     }
 }

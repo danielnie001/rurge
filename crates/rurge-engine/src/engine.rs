@@ -378,13 +378,13 @@ impl Engine {
     }
 
     /// Says, at most once a minute, that a UDP limit dropped something
-    /// (M5-D11).
+    /// (M5-D11); `what` names the limit and what was refused.
     pub(crate) fn warn_udp_limit(&self, what: &'static str) {
         let now = Instant::now();
         let mut last = self.udp_warned.lock().expect("udp warning");
         if last.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(60)) {
             *last = Some(now);
-            tracing::warn!("{what}; new flows are dropped");
+            tracing::warn!("{what}");
         }
     }
 
@@ -1168,7 +1168,7 @@ impl Dialer for Engine {
         if self.udp_associations.load(Ordering::Relaxed) < crate::udp::ASSOCIATIONS {
             UdpAdmission::Accepted
         } else {
-            self.warn_udp_limit("udp: too many associations");
+            self.warn_udp_limit("udp: too many associations; the new association is refused");
             UdpAdmission::Busy
         }
     }
@@ -1193,7 +1193,7 @@ impl Dialer for Engine {
             let before = self.udp_associations.fetch_add(1, Ordering::Relaxed);
             let _counted = Counted(&self.udp_associations);
             if before >= crate::udp::ASSOCIATIONS {
-                self.warn_udp_limit("udp: too many associations");
+                self.warn_udp_limit("udp: too many associations; the new association is refused");
                 return;
             }
             crate::udp::serve(engine, client, session, closed).await;

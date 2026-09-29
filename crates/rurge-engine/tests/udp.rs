@@ -517,3 +517,64 @@ async fn a_dead_carrier_is_not_used_again() {
     association.send("127.0.0.1", other.port(), b"two").await;
     assert_eq!(association.recv().await, (other, b"two".to_vec()));
 }
+
+/// A flow whose outbound fails to open drops what comes for it for a few
+/// seconds from the failure only — however much keeps coming — and then the
+/// next datagram starts a new flow: a client that keeps sending recovers
+/// once the outbound does.
+#[tokio::test]
+async fn a_failed_flow_is_tried_again_while_datagrams_keep_coming() {
+    let (echo, _) = udp_echo().await;
+    let upstream = FakeSocks5::spawn(Socks5Script::default()).await;
+    // the proxy hangs up on every connection until `open` is set
+    let gate = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = gate.local_addr().unwrap().port();
+    let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _gate = tokio::spawn({
+        let (open, to) = (open.clone(), upstream.addr());
+        async move {
+            loop {
+                let (mut stream, _) = gate.accept().await.unwrap();
+                if !open.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let mut up = TcpStream::connect(to).await.unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut up).await;
+                });
+            }
+        }
+    });
+    let h = harness(Profile {
+        proxies: &format!("Up = socks5, 127.0.0.1, {port}, udp-relay=true"),
+        rules: "IP-CIDR,127.0.0.1/32,Up,no-resolve",
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association.send("127.0.0.1", echo.port(), b"one").await;
+    let records = finished(&h, 1).await;
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    open.store(true, std::sync::atomic::Ordering::SeqCst);
+    // right after the failure the flow still drops what comes for it
+    association.send("127.0.0.1", echo.port(), b"dropped").await;
+    assert!(association.quiet_for(Duration::from_millis(500)).await);
+    // keep sending: a new flow gets through, well before the flow would be idle
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no new flow while datagrams kept coming"
+        );
+        association.send("127.0.0.1", echo.port(), b"again").await;
+        if !association.quiet_for(Duration::from_millis(250)).await {
+            break;
+        }
+    }
+    assert!(
+        udp_records(&h)
+            .iter()
+            .all(|r| r.status == RecordStatus::Failed),
+        "the new flow is still active"
+    );
+}
