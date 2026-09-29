@@ -980,23 +980,34 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
                 ..
             }) = &outcome.spec
             {
-                match local_ports.get(&external.local_port) {
-                    Some(first) => {
-                        diags.push(
-                            Diagnostic::error(
-                                codes::E_INVALID_POLICY_PARAM,
-                                format!(
-                                    "policy `{}`: `local-port` {} is also the `local-port` of policy `{first}`",
-                                    p.name, external.local_port
-                                ),
-                            )
-                            .at(p.span.clone()),
-                        );
-                        outcome.spec = None;
-                    }
-                    None => {
-                        local_ports.insert(external.local_port, p.name.as_str());
-                    }
+                let port = external.local_port;
+                if let Some(key) = own_listener(&cfg.general, port) {
+                    // rurge would dial itself, round and round
+                    diags.push(
+                        Diagnostic::error(
+                            codes::E_INVALID_POLICY_PARAM,
+                            format!(
+                                "policy `{}`: `local-port` {port} is the port of rurge's own `{key}`",
+                                p.name
+                            ),
+                        )
+                        .at(p.span.clone()),
+                    );
+                    outcome.spec = None;
+                } else if let Some(first) = local_ports.get(&port) {
+                    diags.push(
+                        Diagnostic::error(
+                            codes::E_INVALID_POLICY_PARAM,
+                            format!(
+                                "policy `{}`: `local-port` {} is also the `local-port` of policy `{first}`",
+                                p.name, port
+                            ),
+                        )
+                        .at(p.span.clone()),
+                    );
+                    outcome.spec = None;
+                } else {
+                    local_ports.insert(port, p.name.as_str());
                 }
             }
             for name in outcome.inert {
@@ -1076,6 +1087,25 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
             );
         }
     }
+}
+
+/// The listener of rurge's own (`http-listen` or `socks5-listen`) that
+/// an `external` program listening on `127.0.0.1:<port>` would be: one on
+/// that port bound to a loopback or unspecified address.
+fn own_listener(general: &General, port: u16) -> Option<&'static str> {
+    [
+        ("http-listen", &general.http_listen),
+        ("socks5-listen", &general.socks5_listen),
+    ]
+    .into_iter()
+    .find_map(|(key, listeners)| {
+        listeners
+            .iter()
+            .any(|l| {
+                l.addr.port() == port && (l.addr.ip().is_loopback() || l.addr.ip().is_unspecified())
+            })
+            .then_some(key)
+    })
 }
 
 #[cfg(test)]
@@ -1632,6 +1662,41 @@ C = external, exec=/bin/c, local-port=1080\n[Rule]\nFINAL,DIRECT\n",
         assert_eq!(errors[0].span.as_ref().map(|s| s.line), Some(4));
         assert!(loaded.config.spec("A").is_some() && loaded.config.spec("B").is_some());
         assert!(loaded.config.spec("C").is_none());
+    }
+
+    /// An `external` program on the port of rurge's own listener would make
+    /// rurge dial itself: an error at the policy's line, unless the
+    /// listener is on another address than loopback or any.
+    #[test]
+    fn an_external_policy_cannot_use_the_port_of_rurges_own_listener() {
+        let loaded = load_text(
+            "[General]\nhttp-listen = 0.0.0.0:6152\nsocks5-listen = 127.0.0.1:6153, 192.0.2.1:7000\n\
+[Proxy]\nA = external, exec=/bin/a, local-port=6153\nB = external, exec=/bin/b, local-port=6152\n\
+C = external, exec=/bin/c, local-port=7000\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let errors: Vec<(String, Option<u32>)> = loaded
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::E_INVALID_POLICY_PARAM)
+            .map(|d| (d.message.clone(), d.span.as_ref().map(|s| s.line)))
+            .collect();
+        assert_eq!(
+            errors,
+            [
+                (
+                    "policy `A`: `local-port` 6153 is the port of rurge's own `socks5-listen`"
+                        .to_string(),
+                    Some(5)
+                ),
+                (
+                    "policy `B`: `local-port` 6152 is the port of rurge's own `http-listen`"
+                        .to_string(),
+                    Some(6)
+                ),
+            ]
+        );
+        assert!(loaded.config.spec("A").is_none() && loaded.config.spec("B").is_none());
+        assert!(loaded.config.spec("C").is_some());
     }
 
     const WG_PRIVATE: &str = "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=";
