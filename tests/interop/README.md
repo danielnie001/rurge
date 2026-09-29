@@ -29,10 +29,11 @@ xray 的本机运行方式同理，见下面「xray」一节。
 
 ## 覆盖范围
 
-`tests/sing_box.rs` 驱动的四个用例（另一个是夹具自检）覆盖：
+`tests/sing_box.rs` 驱动的五个用例（另一个是夹具自检）覆盖：
 
 - `http`：CONNECT 隧道，含无认证 / 正确凭据 / 错误凭据三种；以及明文 HTTP 请求走绝对 URI 转发（不经 CONNECT）。
 - `https`：私有 CA 校验、`sni=` 覆盖、`server-cert-fingerprint-sha256` 指纹钉定（含钉错的情形）、`client-cert=`（p12 客户端证书）双向 TLS，以及服务端要求客户端证书但客户端未提供的情形。
+- `socks5` 的 UDP（阶段 2 / M5a）：`udp-relay=true` 时经 sing-box `socks` 入站的 UDP ASSOCIATE 往返一个回环 UDP 回显。
 - `socks5`：无认证 / 正确凭据 / 错误凭据，以及 sing-box 的 `mixed` 入站同时按 SOCKS5 和 HTTP 两种协议接受连接。
 
 `tests/sing_box_tls_family.rs` 驱动的五个用例覆盖：

@@ -195,6 +195,45 @@ MixedSocks = socks5, 127.0.0.1, {}\nMixedHttp = http, 127.0.0.1, {}\n[Rule]\nFIN
     assert!(matches!(&refused, OutboundError::Proxy(_)), "{refused}");
 }
 
+/// UDP through sing-box's SOCKS5 inbound (phase 2 M5): rurge's
+/// `udp-relay=true` association, to a loopback UDP echo.
+#[tokio::test]
+async fn socks5_udp_goes_through_sing_box() {
+    let Some(bin) = sing_box_or_skip("socks5_udp_goes_through_sing_box") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let sb = SingBox::spawn(&bin, dir.path(), vec![plain(InboundKind::Socks, &[])]);
+    let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        while let Ok((n, from)) = echo.recv_from(&mut buf).await {
+            let _ = echo.send_to(&buf[..n], from).await;
+        }
+    });
+    let profile = format!(
+        "[Proxy]\nUdp = socks5, 127.0.0.1, {}, udp-relay=true\n[Rule]\nFINAL,DIRECT\n",
+        sb.port(0)
+    );
+    let out = outbound(&profile, "Udp", None);
+    let bound = std::time::Duration::from_secs(10);
+    let carrier = tokio::time::timeout(bound, out.open_udp(&ConnectOpts::default()))
+        .await
+        .expect("the association is set up within the bound")
+        .expect("the association is set up");
+    carrier
+        .send_to(b"interop", &target(echo_addr))
+        .await
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let (n, from) = tokio::time::timeout(bound, carrier.recv_from(&mut buf))
+        .await
+        .expect("the echo comes back within the bound")
+        .unwrap();
+    assert_eq!((&buf[..n], from), (&b"interop"[..], target(echo_addr)));
+}
+
 /// What "skipped" means must itself be tested: without a binary the helper
 /// says so and returns `None`; this machine decides which branch runs.
 #[test]
