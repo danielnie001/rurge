@@ -165,7 +165,7 @@ impl Outbound for VmessOutbound {
         &'a self,
         opts: &'a ConnectOpts,
     ) -> BoxFuture<'a, Result<BoxedPacketSocket, OutboundError>> {
-        let udp = VmessUdp::new(self.dialer.clone(), opts.clone());
+        let udp = VmessUdp::new(self.dialer.clone(), opts.clone(), udp::IDLE);
         Box::pin(std::future::ready(Ok(Box::new(udp) as BoxedPacketSocket)))
     }
 }
@@ -666,6 +666,35 @@ mod tests {
             .map(|r| (r.command, r.options, r.port))
             .collect();
         assert_eq!(seen, [(2, 0x05, one.port()), (2, 0x05, two.port())]);
+    }
+
+    /// A connection idle past the bound closes and leaves the table; the
+    /// target's next datagram opens a new one.
+    #[tokio::test]
+    async fn an_idle_connection_closes_and_the_next_datagram_reopens() {
+        let echo = udp_echo_server().await;
+        let fake = FakeVmess::spawn(VmessScript::new(ID), None).await;
+        let out = outbound(
+            &format!(
+                "vmess, 127.0.0.1, {}, username={ID}, vmess-aead=true",
+                fake.addr().port()
+            ),
+            no_roots(),
+        );
+        let carrier = VmessUdp::new(
+            out.dialer.clone(),
+            ConnectOpts::default(),
+            Duration::from_millis(200),
+        );
+        udp_roundtrip(&carrier, &target(echo), b"first").await;
+        assert_eq!(carrier.tracked(), 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while carrier.tracked() != 0 {
+            assert!(std::time::Instant::now() < deadline, "never closed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        udp_roundtrip(&carrier, &target(echo), b"second").await;
+        assert_eq!(fake.requests().len(), 2);
     }
 
     /// Symmetric: the server cannot say who answered, so whatever comes back

@@ -12,16 +12,34 @@ use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, PacketSocket, Target};
 use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
 use tokio::sync::{Mutex, OnceCell, mpsc};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 /// Answers waiting for the engine; more are dropped, as a socket would.
 const INBOX: usize = 64;
 
+/// A target's connection closes after this long with neither a read nor a
+/// write: the engine's flow idle (M5-D7), so a long association that
+/// contacts many targets does not pile up connections.
+pub(super) const IDLE: Duration = Duration::from_secs(60);
+
+/// A server chunk of any legal size comes back whole in one read.
+const READ_BUF: usize = 65536;
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+type Conns = std::sync::Mutex<HashMap<Target, Slot>>;
+
 /// One target's connection.
 struct Conn {
+    id: u64,
+    /// The last read or write; the idle clock.
+    last: Arc<std::sync::Mutex<Instant>>,
     writer: Mutex<WriteHalf<BoxedStream>>,
     /// Fires when the connection's reading ends: it is dialled again.
     ended: CancellationToken,
@@ -33,18 +51,20 @@ type Slot = Arc<OnceCell<Arc<Conn>>>;
 pub(crate) struct VmessUdp {
     dialer: Arc<Dialer>,
     opts: ConnectOpts,
-    conns: std::sync::Mutex<HashMap<Target, Slot>>,
+    idle: Duration,
+    conns: Arc<Conns>,
     answers: mpsc::Sender<(Vec<u8>, Target)>,
     inbox: Mutex<mpsc::Receiver<(Vec<u8>, Target)>>,
 }
 
 impl VmessUdp {
-    pub(super) fn new(dialer: Arc<Dialer>, opts: ConnectOpts) -> VmessUdp {
+    pub(super) fn new(dialer: Arc<Dialer>, opts: ConnectOpts, idle: Duration) -> VmessUdp {
         let (answers, inbox) = mpsc::channel(INBOX);
         VmessUdp {
             dialer,
             opts,
-            conns: std::sync::Mutex::default(),
+            idle,
+            conns: Arc::default(),
             answers,
             inbox: Mutex::new(inbox),
         }
@@ -58,6 +78,11 @@ impl VmessUdp {
             *slot = Slot::default();
         }
         slot.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn tracked(&self) -> usize {
+        self.conns.lock().expect("conns").len()
     }
 
     /// Forgets `slot` for `to`, unless another has taken its place.
@@ -77,19 +102,46 @@ impl VmessUdp {
         let (mut reader, writer) = tokio::io::split(stream);
         let ended = CancellationToken::new();
         let (answers, from, done) = (self.answers.clone(), to.clone(), ended.clone());
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let last = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let (clock, idle, conns) = (last.clone(), self.idle, Arc::downgrade(&self.conns));
         let task = tokio::spawn(async move {
             // a read returns one chunk when the buffer holds a whole one
-            let mut buf = vec![0u8; MAX_PAYLOAD];
-            while let Ok(n) = reader.read(&mut buf).await {
-                if n == 0 {
-                    break;
+            let mut buf = vec![0u8; READ_BUF];
+            loop {
+                let deadline = *clock.lock().expect("clock") + idle;
+                tokio::select! {
+                    read = reader.read(&mut buf) => match read {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            *clock.lock().expect("clock") = Instant::now();
+                            // a full inbox drops the answer
+                            let _ = answers.try_send((buf[..n].to_vec(), from.clone()));
+                        }
+                    },
+                    // a write may have moved the deadline: look again
+                    _ = tokio::time::sleep_until(deadline) => {
+                        if *clock.lock().expect("clock") + idle <= Instant::now() {
+                            break;
+                        }
+                    }
                 }
-                // a full inbox drops the answer
-                let _ = answers.try_send((buf[..n].to_vec(), from.clone()));
             }
             done.cancel();
+            // leave the table, unless a newer connection has taken the place
+            if let Some(conns) = Weak::upgrade(&conns) {
+                let mut conns = conns.lock().expect("conns");
+                if conns
+                    .get(&from)
+                    .is_some_and(|s| s.get().is_some_and(|c| c.id == id))
+                {
+                    conns.remove(&from);
+                }
+            }
         });
         Ok(Arc::new(Conn {
+            id,
+            last,
             writer: Mutex::new(writer),
             ended,
             _reader: AbortOnDrop(task),
@@ -111,14 +163,30 @@ impl PacketSocket for VmessUdp {
                 // an empty chunk would end the connection
                 return Ok(());
             }
-            let slot = self.slot(to);
-            let conn = match slot.get_or_try_init(|| self.dial(to)).await {
-                Ok(conn) => conn.clone(),
-                Err(e) => {
-                    self.forget(to, &slot);
-                    return Err(e);
+            let (slot, conn) = loop {
+                let slot = self.slot(to);
+                let conn = match slot.get_or_try_init(|| self.dial(to)).await {
+                    Ok(conn) => conn.clone(),
+                    Err(e) => {
+                        self.forget(to, &slot);
+                        return Err(e);
+                    }
+                };
+                // A sender waiting on a cell whose dialler failed dials
+                // again, after that dialler forgot the slot: the connection
+                // must be reachable from the table or its answers are lost.
+                let mut conns = self.conns.lock().expect("conns");
+                match conns.get(to) {
+                    None => {
+                        conns.insert(to.clone(), slot.clone());
+                        break (slot, conn);
+                    }
+                    Some(s) if Arc::ptr_eq(s, &slot) => break (slot, conn),
+                    // another slot took its place: use that one
+                    Some(_) => {}
                 }
             };
+            *conn.last.lock().expect("clock") = Instant::now();
             let mut writer = conn.writer.lock().await;
             let written = async {
                 writer.write_all(buf).await?;
