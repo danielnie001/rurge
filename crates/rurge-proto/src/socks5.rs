@@ -58,7 +58,8 @@ fn reply_text(code: u8) -> String {
     }
 }
 
-fn connect_request(target: &Target) -> Result<Vec<u8>, OutboundError> {
+/// The CONNECT request for `target`, built before any connection is opened.
+pub(crate) fn connect_request(target: &Target) -> Result<Vec<u8>, OutboundError> {
     let mut request = vec![VERSION, 1, 0];
     request.extend(crate::addr::socks_addr(target).map_err(|e| match e {
         // the proxy resolves the name (remote resolution); an IDN goes out as A-labels
@@ -134,67 +135,78 @@ impl Socks5Outbound {
     ) -> Result<BoxedStream, OutboundError> {
         // checked first: no connection is opened for a request we cannot send
         let request = connect_request(target)?;
-        let mut stream = self.stack.open(opts).await?;
-        let offered: &[u8] = if self.credentials.is_some() {
-            &[NO_AUTH, USER_PASS]
-        } else {
-            &[NO_AUTH]
-        };
-        let mut greeting = vec![VERSION, offered.len() as u8];
-        greeting.extend_from_slice(offered);
-        stream.write_all(&greeting).await.map_err(handshake_io)?;
-        let mut selected = [0u8; 2];
-        stream
-            .read_exact(&mut selected)
-            .await
-            .map_err(handshake_io)?;
-        match (selected[1], &self.credentials) {
-            (NO_ACCEPTABLE, _) => {
-                return Err(proxy(
-                    "the proxy accepts none of the offered authentication methods",
-                ));
-            }
-            (method, _) if !offered.contains(&method) => {
-                return Err(proxy(format!(
-                    "the proxy selected authentication method {method}, which was not offered"
-                )));
-            }
-            (USER_PASS, Some((user, password))) => {
-                // lengths were checked in from_spec (<= 255 bytes each)
-                let mut auth = vec![1, user.len() as u8];
-                auth.extend_from_slice(user.as_bytes());
-                auth.push(password.len() as u8);
-                auth.extend_from_slice(password.as_bytes());
-                stream.write_all(&auth).await.map_err(handshake_io)?;
-                let mut status = [0u8; 2];
-                stream.read_exact(&mut status).await.map_err(handshake_io)?;
-                if status[1] != 0 {
-                    return Err(proxy("authentication failed"));
-                }
-            }
-            _ => {}
-        }
-        stream.write_all(&request).await.map_err(handshake_io)?;
-        let mut reply = [0u8; 4];
-        stream.read_exact(&mut reply).await.map_err(handshake_io)?;
-        if reply[1] != 0 {
-            return Err(proxy(reply_text(reply[1])));
-        }
-        // skip the bound address
-        let remaining = match reply[3] {
-            1 => 4 + 2,
-            4 => 16 + 2,
-            3 => {
-                let mut len = [0u8; 1];
-                stream.read_exact(&mut len).await.map_err(handshake_io)?;
-                usize::from(len[0]) + 2
-            }
-            other => return Err(proxy(format!("unknown address type {other} in the reply"))),
-        };
-        let mut bound = vec![0u8; remaining];
-        stream.read_exact(&mut bound).await.map_err(handshake_io)?;
-        Ok(stream)
+        let stream = self.stack.open(opts).await?;
+        negotiate(stream, &request, self.credentials.as_ref()).await
     }
+}
+
+/// The SOCKS5 handshake on `stream`, a connection to the proxy: method
+/// selection, the user name and password when there are any, then
+/// `request` (from `connect_request`). The stream carries the tunnel after.
+pub(crate) async fn negotiate(
+    mut stream: BoxedStream,
+    request: &[u8],
+    credentials: Option<&(String, String)>,
+) -> Result<BoxedStream, OutboundError> {
+    let offered: &[u8] = if credentials.is_some() {
+        &[NO_AUTH, USER_PASS]
+    } else {
+        &[NO_AUTH]
+    };
+    let mut greeting = vec![VERSION, offered.len() as u8];
+    greeting.extend_from_slice(offered);
+    stream.write_all(&greeting).await.map_err(handshake_io)?;
+    let mut selected = [0u8; 2];
+    stream
+        .read_exact(&mut selected)
+        .await
+        .map_err(handshake_io)?;
+    match (selected[1], credentials) {
+        (NO_ACCEPTABLE, _) => {
+            return Err(proxy(
+                "the proxy accepts none of the offered authentication methods",
+            ));
+        }
+        (method, _) if !offered.contains(&method) => {
+            return Err(proxy(format!(
+                "the proxy selected authentication method {method}, which was not offered"
+            )));
+        }
+        (USER_PASS, Some((user, password))) => {
+            // lengths were checked in from_spec (<= 255 bytes each)
+            let mut auth = vec![1, user.len() as u8];
+            auth.extend_from_slice(user.as_bytes());
+            auth.push(password.len() as u8);
+            auth.extend_from_slice(password.as_bytes());
+            stream.write_all(&auth).await.map_err(handshake_io)?;
+            let mut status = [0u8; 2];
+            stream.read_exact(&mut status).await.map_err(handshake_io)?;
+            if status[1] != 0 {
+                return Err(proxy("authentication failed"));
+            }
+        }
+        _ => {}
+    }
+    stream.write_all(request).await.map_err(handshake_io)?;
+    let mut reply = [0u8; 4];
+    stream.read_exact(&mut reply).await.map_err(handshake_io)?;
+    if reply[1] != 0 {
+        return Err(proxy(reply_text(reply[1])));
+    }
+    // skip the bound address
+    let remaining = match reply[3] {
+        1 => 4 + 2,
+        4 => 16 + 2,
+        3 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await.map_err(handshake_io)?;
+            usize::from(len[0]) + 2
+        }
+        other => return Err(proxy(format!("unknown address type {other} in the reply"))),
+    };
+    let mut bound = vec![0u8; remaining];
+    stream.read_exact(&mut bound).await.map_err(handshake_io)?;
+    Ok(stream)
 }
 
 impl Outbound for Socks5Outbound {

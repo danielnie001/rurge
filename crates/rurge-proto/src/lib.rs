@@ -5,6 +5,7 @@ mod addr;
 pub mod anytls;
 pub mod build;
 pub mod direct;
+pub mod external;
 mod hostname;
 pub mod http;
 pub mod keystore;

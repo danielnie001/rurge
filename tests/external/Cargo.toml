@@ -1,0 +1,24 @@
+[package]
+name = "rurge-external-tests"
+description = "The test program of rurge's `external` outbound and the tests that start it (test-only, never published)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "socks-helper"
+path = "src/bin/socks-helper.rs"
+test = false
+
+[dev-dependencies]
+rurge-config.workspace = true
+rurge-net.workspace = true
+rurge-platform.workspace = true
+rurge-proto.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

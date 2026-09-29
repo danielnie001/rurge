@@ -3223,6 +3223,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rurge-external-tests"
+version = "0.1.0"
+dependencies = [
+ "rurge-config",
+ "rurge-net",
+ "rurge-platform",
+ "rurge-proto",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rurge-inbound"
 version = "0.1.0"
 dependencies = [
@@ -3344,6 +3356,7 @@ dependencies = [
  "rustls",
  "sha2 0.10.9",
  "sha3 0.10.9",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
