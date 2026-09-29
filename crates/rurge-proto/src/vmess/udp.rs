@@ -108,11 +108,12 @@ impl VmessUdp {
         let task = tokio::spawn(async move {
             // a read returns one chunk when the buffer holds a whole one
             let mut buf = vec![0u8; READ_BUF];
-            loop {
+            let why = loop {
                 let deadline = *clock.lock().expect("clock") + idle;
                 tokio::select! {
                     read = reader.read(&mut buf) => match read {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => break "the server closed it".to_string(),
+                        Err(e) => break format!("read error: {:?}", e.kind()),
                         Ok(n) => {
                             *clock.lock().expect("clock") = Instant::now();
                             // a full inbox drops the answer
@@ -122,11 +123,12 @@ impl VmessUdp {
                     // a write may have moved the deadline: look again
                     _ = tokio::time::sleep_until(deadline) => {
                         if *clock.lock().expect("clock") + idle <= Instant::now() {
-                            break;
+                            break "idle".to_string();
                         }
                     }
                 }
-            }
+            };
+            tracing::debug!("vmess: a UDP connection ended: {why}");
             done.cancel();
             // leave the table, unless a newer connection has taken the place
             if let Some(conns) = Weak::upgrade(&conns) {
@@ -176,6 +178,10 @@ impl PacketSocket for VmessUdp {
                 // again, after that dialler forgot the slot: the connection
                 // must be reachable from the table or its answers are lost.
                 let mut conns = self.conns.lock().expect("conns");
+                // an ended connection is not revived: dial again
+                if conn.ended.is_cancelled() {
+                    continue;
+                }
                 match conns.get(to) {
                     None => {
                         conns.insert(to.clone(), slot.clone());

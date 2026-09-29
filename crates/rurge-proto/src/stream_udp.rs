@@ -203,6 +203,12 @@ impl PacketSocket for StreamUdp {
                 addr.extend_from_slice(&tail[..rest + 2]);
                 let len_at = rest + 2;
                 let len = usize::from(u16::from_be_bytes([tail[len_at], tail[len_at + 1]]));
+                if self.framing == Framing::Trojan && tail[len_at + 2..] != *b"\r\n" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "trojan: a datagram without its CRLF",
+                    ));
+                }
                 let from = parse_socks_addr(&addr).map(|(from, _)| from);
                 if len > buf.len() {
                     // read past what does not fit
@@ -244,6 +250,25 @@ mod tests {
         buf
     }
 
+    async fn received(udp: &StreamUdp, buf: &mut [u8]) -> io::Result<(usize, Target)> {
+        tokio::time::timeout(Duration::from_secs(5), udp.recv_from(buf))
+            .await
+            .expect("received within the bound")
+    }
+
+    #[tokio::test]
+    async fn a_trojan_datagram_without_its_crlf_ends_the_carrier() {
+        let (udp, mut server) = carrier();
+        server
+            .write_all(&[1, 1, 2, 3, 4, 0, 53, 0, 1, b'x', b'y', b'q'])
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let err = received(&udp, &mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "trojan: a datagram without its CRLF");
+    }
+
     #[tokio::test]
     async fn the_head_rides_with_the_first_datagram_and_names_its_target() {
         let (udp, mut server) = carrier();
@@ -276,12 +301,12 @@ mod tests {
         wire.extend_from_slice(&[0, 80, 0, 1, b'\r', b'\n', b'z']);
         server.write_all(&wire).await.unwrap();
         let mut buf = [0u8; 64];
-        let (n, from) = udp.recv_from(&mut buf).await.unwrap();
+        let (n, from) = received(&udp, &mut buf).await.unwrap();
         assert_eq!(
             (&buf[..n], from),
             (&b"abc"[..], Target::new(HostName::parse("::1"), 7))
         );
-        let (n, from) = udp.recv_from(&mut buf).await.unwrap();
+        let (n, from) = received(&udp, &mut buf).await.unwrap();
         assert_eq!(
             (&buf[..n], from),
             (&b"z"[..], Target::new(HostName::parse("s.test"), 80)),
@@ -294,7 +319,7 @@ mod tests {
         let (udp, server) = carrier();
         drop(server);
         let mut buf = [0u8; 64];
-        let err = udp.recv_from(&mut buf).await.unwrap_err();
+        let err = received(&udp, &mut buf).await.unwrap_err();
         assert_eq!(
             err.to_string(),
             "trojan: the server closed the UDP connection"
@@ -339,19 +364,19 @@ mod tests {
         wire.extend_from_slice(&[1, 0, 7, 0, 2, b'a', b'b']);
         server.write_all(&wire).await.unwrap();
         let mut buf = [0u8; 64];
-        let (n, from) = udp.recv_from(&mut buf).await.unwrap();
+        let (n, from) = received(&udp, &mut buf).await.unwrap();
         assert_eq!(
             (&buf[..n], from),
             (&b"z"[..], Target::new(HostName::parse("s.test"), 80))
         );
-        let (n, from) = udp.recv_from(&mut buf).await.unwrap();
+        let (n, from) = received(&udp, &mut buf).await.unwrap();
         assert_eq!(
             (&buf[..n], from),
             (&b"ab"[..], Target::new(HostName::parse("::1"), 7))
         );
         // SOCKS5's 3 is no type of its own
         server.write_all(&[3, 0]).await.unwrap();
-        let err = udp.recv_from(&mut buf).await.unwrap_err();
+        let err = received(&udp, &mut buf).await.unwrap_err();
         assert_eq!(
             err.to_string(),
             "anytls: a datagram of an unknown address type"
