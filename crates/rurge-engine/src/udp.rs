@@ -454,6 +454,21 @@ async fn drain(
 mod tests {
     use super::*;
 
+    /// A flow lives `FLOW_IDLE` past its last datagram; a DNS flow no longer
+    /// than `DNS_LINGER` past its first answer.
+    #[test]
+    fn when_a_flow_is_reclaimed() {
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(5);
+        assert_eq!(deadline(later, None, 443), later + FLOW_IDLE);
+        assert_eq!(deadline(later, Some(t0), 443), later + FLOW_IDLE);
+        assert_eq!(deadline(later, None, 53), later + FLOW_IDLE);
+        assert_eq!(deadline(later, Some(t0), 53), t0 + DNS_LINGER);
+        // a long-quiet DNS flow goes at its idle time, if that comes first
+        let answered = t0 + Duration::from_secs(100);
+        assert_eq!(deadline(t0, Some(answered), 53), t0 + FLOW_IDLE);
+    }
+
     /// An answer to a DNS query brings the flow's end forward to
     /// `DNS_LINGER` later, though it was already waiting for `FLOW_IDLE`.
     #[tokio::test(start_paused = true)]
@@ -476,21 +491,6 @@ mod tests {
         assert!(!waiting.is_finished());
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(waiting.is_finished(), "ended long before FLOW_IDLE");
-    }
-
-    /// A flow lives `FLOW_IDLE` past its last datagram; a DNS flow no longer
-    /// than `DNS_LINGER` past its first answer.
-    #[test]
-    fn when_a_flow_is_reclaimed() {
-        let t0 = Instant::now();
-        let later = t0 + Duration::from_secs(5);
-        assert_eq!(deadline(later, None, 443), later + FLOW_IDLE);
-        assert_eq!(deadline(later, Some(t0), 443), later + FLOW_IDLE);
-        assert_eq!(deadline(later, None, 53), later + FLOW_IDLE);
-        assert_eq!(deadline(later, Some(t0), 53), t0 + DNS_LINGER);
-        // a long-quiet DNS flow goes at its idle time, if that comes first
-        let answered = t0 + Duration::from_secs(100);
-        assert_eq!(deadline(t0, Some(answered), 53), t0 + FLOW_IDLE);
     }
 
     /// Answers count for the flow that wrote to their source, or else the
