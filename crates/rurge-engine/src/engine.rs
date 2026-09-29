@@ -390,6 +390,13 @@ impl Engine {
         self.shared.clone()
     }
 
+    /// Stops every `external` program still running, whatever generation
+    /// started it (phase 2 M4 design 8.2): the exit flow calls this before
+    /// the runtime ends, rather than trust what exiting would drop.
+    pub async fn stop_external_programs(&self) {
+        self.shared.externals.stop_all().await;
+    }
+
     /// Makes `next` the generation that outlives-a-reload objects see: chain
     /// connectors and dials resolve against its registry, direct connectors
     /// through its resolver; the automatic groups keep what still applies

@@ -3227,9 +3227,12 @@ name = "rurge-external-tests"
 version = "0.1.0"
 dependencies = [
  "rurge-config",
+ "rurge-dns",
+ "rurge-engine",
  "rurge-net",
  "rurge-platform",
  "rurge-proto",
+ "rurge-rules",
  "tempfile",
  "tokio",
 ]

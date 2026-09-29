@@ -63,7 +63,7 @@ impl Runtime {
             RuleEngine::build_with_registry(&config, stack.registry.clone(), stack.geo.clone())?;
         // The cell, not this generation's resolver: an outbound may outlive
         // the generation it was built in (M2 design 7.2).
-        let factory = Arc::new(match &opts.shared.roots {
+        let factory = match &opts.shared.roots {
             Some(roots) => EngineFactory::with_roots(
                 &config,
                 opts.shared.resolver.clone(),
@@ -75,7 +75,12 @@ impl Runtime {
                 opts.shared.resolver.clone(),
                 opts.stack.socket_hook.clone(),
             ),
-        });
+        };
+        let factory = Arc::new(factory.with_externals(
+            opts.shared.processes.clone(),
+            opts.stack.data_dir.join("external"),
+            opts.shared.externals.clone(),
+        ));
         // What earlier runs cached is in the first assembly already: no group
         // starts empty for want of a download (M3-D5).
         let subscriptions = Subscriptions::register(&config, &stack.resources);

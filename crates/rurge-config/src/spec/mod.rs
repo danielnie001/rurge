@@ -68,6 +68,7 @@ pub enum ProtoSpec {
     AnyTls(AnyTlsSpec),
     Ssh(SshSpec),
     WireGuard(WireGuardSpec),
+    External(ExternalSpec),
 }
 
 impl ProtoSpec {
@@ -82,7 +83,8 @@ impl ProtoSpec {
             ProtoSpec::Direct
             | ProtoSpec::Reject(_)
             | ProtoSpec::Ssh(_)
-            | ProtoSpec::WireGuard(_) => None,
+            | ProtoSpec::WireGuard(_)
+            | ProtoSpec::External(_) => None,
         }
     }
 
@@ -271,6 +273,19 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             let mut common = read_common(&mut r, Applies::Proxy, &mut notes);
             let wireguard = wireguard::read_wireguard(&mut r, &mut common, env.wireguard);
             (common, ProtoSpec::WireGuard(wireguard))
+        }
+        PolicyKind::External => {
+            let mut common = read_common(&mut r, Applies::Proxy, &mut notes);
+            let external = external::read_external(&mut r, &mut common);
+            // `tfo` does not apply at all (`W0028`): no second word on it
+            notes.inert.retain(|name| *name != "tfo");
+            if !external.addresses.is_empty() {
+                notes.inert.push("addresses");
+            }
+            if r.bool("udp-relay").unwrap_or(false) {
+                notes.inert.push("udp-relay");
+            }
+            (common, ProtoSpec::External(external))
         }
         _ => return SpecOutcome::default(),
     };
@@ -487,6 +502,33 @@ mod tests {
         assert_eq!(
             o.diagnostics[0].message,
             "policy `W`: Shadow TLS cannot be combined with a `wireguard` policy"
+        );
+    }
+
+    /// An `external` line: no server, no port; what does not work yet is said
+    /// once per load (`W0029`), and `tfo` only as not applicable (M4 design 4.4).
+    #[test]
+    fn an_external_line() {
+        let o = outcome(
+            "X",
+            "external, exec=/usr/bin/ssh, args=-D, args=1080, local-port=1080, addresses=10.0.0.1, udp-relay=true, tfo=true, ecn=on",
+        );
+        let spec = o.spec.expect("an external spec");
+        let ProtoSpec::External(external) = &spec.proto else {
+            panic!("{:?}", spec.proto);
+        };
+        assert_eq!(external.args.expose(), &["-D", "1080"]);
+        assert_eq!((spec.server, spec.port), (None, None));
+        assert_eq!(o.inert, ["ecn", "addresses", "udp-relay"]);
+        assert_eq!(spec.proto.keystore_item(), None);
+        let o = outcome(
+            "X",
+            "external, exec=/bin/p, local-port=1080, shadow-tls-password=pw",
+        );
+        assert!(o.spec.is_none());
+        assert_eq!(
+            o.diagnostics[0].message,
+            "policy `X`: Shadow TLS cannot be combined with a `external` policy"
         );
     }
 

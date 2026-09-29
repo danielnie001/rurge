@@ -14,9 +14,12 @@ test = false
 
 [dev-dependencies]
 rurge-config.workspace = true
+rurge-dns.workspace = true
+rurge-engine.workspace = true
 rurge-net.workspace = true
 rurge-platform.workspace = true
 rurge-proto.workspace = true
+rurge-rules.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 

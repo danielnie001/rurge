@@ -27,6 +27,6 @@ pub use runtime::{Runtime, RuntimeOptions};
 pub use rurge_inbound::Running;
 pub use rurge_policy::EmptyGroup;
 pub use rurge_policy::testbook::TestResult;
-pub use shared::{EngineShared, ResolverCell};
+pub use shared::{EngineShared, ExternalPrograms, ResolverCell};
 pub use subscriptions::check_profile;
 pub use views::{GroupView, MemberView, SelectError};

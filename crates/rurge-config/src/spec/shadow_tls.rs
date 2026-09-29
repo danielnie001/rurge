@@ -33,7 +33,8 @@ const KEYS: [&str; 3] = [
 
 /// Whether Shadow TLS can wrap a policy of this kind. It wraps a TCP
 /// connection, so the QUIC-based protocols and the two VPN-like ones are out
-/// (manual: a configuration error).
+/// (manual: a configuration error), and so is `external`, whose connection
+/// goes to a program on this machine.
 pub fn allowed_on(kind: PolicyKind) -> bool {
     !matches!(
         kind,
@@ -43,6 +44,7 @@ pub fn allowed_on(kind: PolicyKind) -> bool {
             | PolicyKind::Masque
             | PolicyKind::WireGuard
             | PolicyKind::Tailscale
+            | PolicyKind::External
     )
 }
 
@@ -228,7 +230,9 @@ mod tests {
     #[test]
     fn it_wraps_tcp_and_nothing_else() {
         use PolicyKind::*;
-        for kind in [Tuic, TuicV5, Hysteria2, Masque, WireGuard, Tailscale] {
+        for kind in [
+            Tuic, TuicV5, Hysteria2, Masque, WireGuard, Tailscale, External,
+        ] {
             assert!(!allowed_on(kind), "{kind:?}");
         }
         for kind in [

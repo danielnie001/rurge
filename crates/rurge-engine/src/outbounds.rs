@@ -1,6 +1,7 @@
 //! Real outbounds for the policy registry, and the dry build that turns a
 //! policy which cannot be built into a load error (M1 design 6.1, 6.4).
 
+use crate::shared::ExternalPrograms;
 use rurge_config::config::{LoadError, LoadOptions, Loaded, load};
 use rurge_config::diagnostic::codes;
 use rurge_config::spec::{CommonOpts, PolicySpec, ProtoSpec};
@@ -11,6 +12,7 @@ use rurge_net::socket::{NoopSocketHook, SocketHook, SocketOpts};
 use rurge_policy::{BuildError, OutboundFactory};
 use rurge_proto::anytls::AnyTlsOutbound;
 use rurge_proto::build::server_of;
+use rurge_proto::external::{ExternalOutbound, NoProcessGroups, ProcessHook};
 use rurge_proto::http::HttpOutbound;
 use rurge_proto::socks5::Socks5Outbound;
 use rurge_proto::trojan::TrojanOutbound;
@@ -21,7 +23,7 @@ use rurge_proto_wireguard::WireGuardOutbound;
 use rustls::RootCertStore;
 use std::io;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub struct EngineFactory {
@@ -34,6 +36,11 @@ pub struct EngineFactory {
     /// A dry build only wants the errors: no warnings. It still loads the
     /// real roots — an empty store cannot even set up standard verification.
     dry: bool,
+    /// How `external` programs are started, where they log, and the list
+    /// the exit flow stops them from (`with_externals`).
+    processes: Arc<dyn ProcessHook>,
+    external_logs: PathBuf,
+    externals: Arc<ExternalPrograms>,
 }
 
 impl EngineFactory {
@@ -63,7 +70,24 @@ impl EngineFactory {
             roots,
             v6_first: cfg.general.ipv6,
             dry: false,
+            processes: Arc::new(NoProcessGroups),
+            external_logs: PathBuf::from("external"),
+            externals: Arc::new(ExternalPrograms::default()),
         }
+    }
+
+    /// `external` programs start through `processes`, log into `logs` (the
+    /// data directory's `external`) and are listed in `externals`.
+    pub fn with_externals(
+        mut self,
+        processes: Arc<dyn ProcessHook>,
+        logs: PathBuf,
+        externals: Arc<ExternalPrograms>,
+    ) -> EngineFactory {
+        self.processes = processes;
+        self.external_logs = logs;
+        self.externals = externals;
+        self
     }
 
     fn dry(cfg: &Config) -> EngineFactory {
@@ -78,6 +102,10 @@ impl EngineFactory {
             roots: rurge_net::tls::root_store(),
             v6_first: cfg.general.ipv6,
             dry: true,
+            // a build starts nothing (M4 design 7.5)
+            processes: Arc::new(NoProcessGroups),
+            external_logs: PathBuf::from("external"),
+            externals: Arc::new(ExternalPrograms::default()),
         }
     }
 }
@@ -201,6 +229,19 @@ impl OutboundFactory for EngineFactory {
                         spec.common.underlying_proxy
                     )),
             ),
+            // nothing starts here: the program starts on the first dial
+            ProtoSpec::External(external) => {
+                let outbound = Arc::new(ExternalOutbound::new(
+                    &spec.name,
+                    external,
+                    &self.external_logs,
+                    self.processes.clone(),
+                ));
+                if !self.dry {
+                    self.externals.add(&outbound);
+                }
+                outbound
+            }
         };
         if !self.dry && skips_verification(spec) {
             tracing::warn!(

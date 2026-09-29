@@ -12,7 +12,7 @@ use crate::policy::{
 use crate::requirement::{self, Environment};
 use crate::rule::{ParseCtx, PolicyRef, Rule, RuleKind, SubRule, parse_rule, parse_subrule};
 use crate::span::Span;
-use crate::spec::{GroupSpec, NameKind, PolicySpec, SpecEnv, to_group_spec, to_spec};
+use crate::spec::{GroupSpec, NameKind, PolicySpec, ProtoSpec, SpecEnv, to_group_spec, to_spec};
 use crate::text::include::{self, IncludeOptions};
 use crate::text::{Origin, Profile, SectionKind, parse_str};
 use crate::value::{split_definition, split_list};
@@ -966,10 +966,38 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
         let mut inert_seen: HashSet<&'static str> = HashSet::new();
         let mut ios_seen: HashSet<&'static str> = HashSet::new();
         let mut legacy_seen = false;
+        // `local-port` → the `external` policy that has it
+        let mut local_ports: HashMap<u16, &str> = HashMap::new();
         for p in &cfg.policies {
-            let outcome = to_spec(p, &env);
+            let mut outcome = to_spec(p, &env);
             for d in outcome.diagnostics {
                 diags.push(d);
+            }
+            // two programs cannot listen on one port: one policy's
+            // connections would reach the other's program (M4 design 4.4)
+            if let Some(PolicySpec {
+                proto: ProtoSpec::External(external),
+                ..
+            }) = &outcome.spec
+            {
+                match local_ports.get(&external.local_port) {
+                    Some(first) => {
+                        diags.push(
+                            Diagnostic::error(
+                                codes::E_INVALID_POLICY_PARAM,
+                                format!(
+                                    "policy `{}`: `local-port` {} is also the `local-port` of policy `{first}`",
+                                    p.name, external.local_port
+                                ),
+                            )
+                            .at(p.span.clone()),
+                        );
+                        outcome.spec = None;
+                    }
+                    None => {
+                        local_ports.insert(external.local_port, p.name.as_str());
+                    }
+                }
             }
             for name in outcome.inert {
                 if inert_seen.insert(name) {
@@ -1581,6 +1609,29 @@ New = vmess, c.test, 443, username={id}, vmess-aead=true\n[Rule]\nFINAL,DIRECT\n
         assert_eq!(legacy[0].span.as_ref().map(|s| s.line), Some(2));
         assert!(loaded.config.spec("New").is_some());
         assert!(loaded.config.spec("Old1").is_none() && loaded.config.spec("Old2").is_none());
+    }
+
+    /// Two `external` policies on one `local-port`: the second is an error
+    /// at its own line (M4 design 4.4).
+    #[test]
+    fn two_external_policies_cannot_share_a_local_port() {
+        let loaded = load_text(
+            "[Proxy]\nA = external, exec=/bin/a, local-port=1080\nB = external, exec=/bin/b, local-port=1081\n\
+C = external, exec=/bin/c, local-port=1080\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let errors: Vec<&Diagnostic> = loaded
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::E_INVALID_POLICY_PARAM)
+            .collect();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(
+            errors[0].message,
+            "policy `C`: `local-port` 1080 is also the `local-port` of policy `A`"
+        );
+        assert_eq!(errors[0].span.as_ref().map(|s| s.line), Some(4));
+        assert!(loaded.config.spec("A").is_some() && loaded.config.spec("B").is_some());
+        assert!(loaded.config.spec("C").is_none());
     }
 
     const WG_PRIVATE: &str = "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=";
