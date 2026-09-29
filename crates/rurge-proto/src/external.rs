@@ -3,11 +3,16 @@
 //! `127.0.0.1:<local-port>`. A program that exited is started again on the
 //! next use; the program and whatever it started are stopped together.
 
-use crate::socks5::{connect_request, negotiate};
-use crate::{Outbound, OutboundError};
+use crate::socks5::{
+    Socks5Udp, UDP_ASSOCIATE, connect_request, negotiate, negotiate_bound, relay_of,
+};
+use crate::{Outbound, OutboundError, UdpSupport};
+use rurge_config::HostName;
 use rurge_config::spec::ExternalSpec;
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Target};
+use rurge_net::connector::{
+    BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, DirectConnector, SystemResolve, Target,
+};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write as _};
 use std::net::Ipv4Addr;
@@ -236,6 +241,7 @@ pub struct ExternalOutbound {
     exec: String,
     args: Vec<String>,
     port: u16,
+    udp_relay: bool,
     log: PathBuf,
     hook: Arc<dyn ProcessHook>,
     program: Arc<Program>,
@@ -265,6 +271,7 @@ impl ExternalOutbound {
             exec: spec.exec.clone(),
             args: spec.args.expose().clone(),
             port: spec.local_port,
+            udp_relay: spec.udp_relay,
             log: log_dir.join(log_file_name(name)),
             hook,
             program: Arc::new(Program {
@@ -368,6 +375,25 @@ impl ExternalOutbound {
     async fn dial(&self, target: &Target) -> Result<BoxedStream, OutboundError> {
         // checked first: no program is started for a request we cannot send
         let request = connect_request(target)?;
+        let stream = self.connect_local().await?;
+        negotiate(stream, &request, None).await
+    }
+
+    /// A UDP association with the program's SOCKS5 server; its datagrams
+    /// go to the relay it names on this machine.
+    async fn associate(&self) -> Result<BoxedPacketSocket, OutboundError> {
+        let control = self.connect_local().await?;
+        let (control, relay) = negotiate_bound(control, &UDP_ASSOCIATE, None).await?;
+        let relay = relay_of(relay, &HostName::Ip(Ipv4Addr::LOCALHOST.into()));
+        let socket = DirectConnector::new(Arc::new(SystemResolve))
+            .open_udp(&ConnectOpts::default())
+            .await?;
+        Ok(Box::new(Socks5Udp::new(control, relay, socket)))
+    }
+
+    /// A connection to the program's SOCKS5 port, starting the program
+    /// when it does not run.
+    async fn connect_local(&self) -> Result<BoxedStream, OutboundError> {
         for attempt in 1..=ATTEMPTS {
             self.ensure_started().await?;
             // Windows takes about two seconds to refuse a connection to a
@@ -381,7 +407,7 @@ impl ExternalOutbound {
             match connected {
                 Ok(Ok(stream)) => {
                     let _ = stream.set_nodelay(true);
-                    return negotiate(Box::new(stream), &request, None).await;
+                    return Ok(Box::new(stream));
                 }
                 Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => {}
                 Ok(Err(e)) => return Err(e.into()),
@@ -464,6 +490,31 @@ impl Outbound for ExternalOutbound {
     ) -> BoxFuture<'a, Result<BoxedStream, OutboundError>> {
         Box::pin(async move {
             match tokio::time::timeout(opts.timeout, self.dial(target)).await {
+                Ok(result) => result,
+                Err(_) => Err(OutboundError::Timeout),
+            }
+        })
+    }
+
+    fn udp(&self) -> UdpSupport {
+        if self.udp_relay {
+            UdpSupport::Native
+        } else {
+            UdpSupport::Unsupported
+        }
+    }
+
+    fn open_udp<'a>(
+        &'a self,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, Result<BoxedPacketSocket, OutboundError>> {
+        Box::pin(async move {
+            if !self.udp_relay {
+                return Err(OutboundError::Unsupported(
+                    "UDP without `udp-relay=true`".to_string(),
+                ));
+            }
+            match tokio::time::timeout(opts.timeout, self.associate()).await {
                 Ok(result) => result,
                 Err(_) => Err(OutboundError::Timeout),
             }
@@ -558,6 +609,7 @@ mod tests {
             args: rurge_config::spec::Secret::new(Vec::new()),
             local_port: port,
             addresses: Vec::new(),
+            udp_relay: false,
         };
         ExternalOutbound::new("P", &spec, dir, Arc::new(NoProcessGroups))
     }

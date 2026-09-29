@@ -26,7 +26,7 @@ const MAX_CREDENTIAL: usize = 255;
 
 /// `UDP ASSOCIATE` with no address of its own: the relay takes datagrams
 /// from wherever the association's first one comes from (RFC 1928 §7).
-const UDP_ASSOCIATE: [u8; 10] = [VERSION, 3, 0, 1, 0, 0, 0, 0, 0, 0];
+pub(crate) const UDP_ASSOCIATE: [u8; 10] = [VERSION, 3, 0, 1, 0, 0, 0, 0, 0, 0];
 
 pub struct Socks5Outbound {
     name: String,

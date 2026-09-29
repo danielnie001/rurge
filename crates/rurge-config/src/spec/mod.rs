@@ -279,9 +279,6 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             if !external.addresses.is_empty() {
                 notes.inert.push("addresses");
             }
-            if r.bool("udp-relay").unwrap_or(false) {
-                notes.inert.push("udp-relay");
-            }
             (common, ProtoSpec::External(external))
         }
         _ => return SpecOutcome::default(),
@@ -516,7 +513,8 @@ mod tests {
         };
         assert_eq!(external.args.expose(), &["-D", "1080"]);
         assert_eq!((spec.server, spec.port), (None, None));
-        assert_eq!(o.inert, ["ecn", "addresses", "udp-relay"]);
+        assert_eq!(o.inert, ["ecn", "addresses"]);
+        assert!(external.udp_relay);
         assert_eq!(spec.proto.keystore_item(), None);
         let o = outcome(
             "X",

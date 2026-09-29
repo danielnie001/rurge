@@ -30,6 +30,9 @@ pub struct ExternalSpec {
     pub local_port: u16,
     /// Addresses to keep out of the TUN routes (phase 3).
     pub addresses: Vec<IpAddr>,
+    /// `udp-relay`: the program's SOCKS5 server takes `UDP ASSOCIATE`
+    /// (the manual: it must, for this to be switched on).
+    pub udp_relay: bool,
 }
 
 /// Everything `external`-specific on the line, and the common parameters it
@@ -87,6 +90,7 @@ pub fn read_external(r: &mut ParamReader<'_>, common: &mut CommonOpts) -> Extern
         args: Secret::new(args),
         local_port,
         addresses,
+        udp_relay: r.bool("udp-relay").unwrap_or(false),
     }
 }
 

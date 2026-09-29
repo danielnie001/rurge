@@ -60,6 +60,7 @@ pub fn outbound(name: &str, args: &[String], port: u16, dir: &Path) -> ExternalO
         args: Secret::new(args.to_vec()),
         local_port: port,
         addresses: Vec::new(),
+        udp_relay: true,
     };
     ExternalOutbound::new(name, &spec, dir, Arc::new(Platform))
 }

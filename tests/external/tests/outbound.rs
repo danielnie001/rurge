@@ -114,6 +114,34 @@ async fn a_port_that_never_opens_fails_the_request() {
     wait_closed(elsewhere).await;
 }
 
+/// `udp-relay=true` (phase 2 M5): UDP goes through the program's own
+/// SOCKS5 server, started for it when it does not run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_goes_through_the_program() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let o = outbound("Ext", &args(port, &[]), port, dir.path());
+    let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 256];
+        while let Ok((n, from)) = echo.recv_from(&mut buf).await {
+            let _ = echo.send_to(&buf[..n], from).await;
+        }
+    });
+    let carrier = o.open_udp(&ConnectOpts::default()).await.unwrap();
+    carrier.send_to(b"ping", &target(echo_addr)).await.unwrap();
+    let mut buf = [0u8; 256];
+    let (n, from) = tokio::time::timeout(Duration::from_secs(5), carrier.recv_from(&mut buf))
+        .await
+        .expect("the echo comes back")
+        .unwrap();
+    assert_eq!((&buf[..n], from), (&b"ping"[..], target(echo_addr)));
+    drop(carrier);
+    o.stop().await;
+    wait_closed(port).await;
+}
+
 /// Stopping ends the program and what it started (M4-D6): the helper's
 /// own child keeps a port open until it is ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

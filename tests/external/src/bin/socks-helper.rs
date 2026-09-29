@@ -1,5 +1,5 @@
-//! A SOCKS5 server as small as a test needs (no authentication, CONNECT
-//! only) that rurge starts as an `external` policy's program. It listens on
+//! A SOCKS5 server as small as a test needs (no authentication, CONNECT and
+//! UDP ASSOCIATE) that rurge starts as an `external` policy's program. It listens on
 //! 127.0.0.1 only and connects nowhere but where its client asks.
 //!
 //! socks-helper --port <p> [--record <file>] [--delay-ms <n>] [--serve <n>]
@@ -18,8 +18,12 @@
 //! `ExitOnForwardFailure`.
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{
+    Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket,
+};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 fn value(args: &[String], flag: &str) -> Option<String> {
@@ -160,6 +164,10 @@ fn serve_one(mut client: TcpStream) -> std::io::Result<bool> {
                 .collect()
         }
     };
+    if request[1] == 3 {
+        relay_udp(client)?;
+        return Ok(true);
+    }
     let Ok(upstream) = TcpStream::connect(&host[..]) else {
         client.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0])?;
         return Ok(false);
@@ -175,6 +183,67 @@ fn serve_one(mut client: TcpStream) -> std::io::Result<bool> {
     let _ = client.shutdown(Shutdown::Write);
     let _ = up.join();
     Ok(true)
+}
+
+/// UDP ASSOCIATE: a relay port on 127.0.0.1; datagrams to IPv4 addresses
+/// go out, answers from anywhere come back to the client, until the control
+/// connection closes.
+fn relay_udp(mut control: TcpStream) -> std::io::Result<()> {
+    let relay = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let outside = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let mut reply = vec![5, 0, 0, 1, 127, 0, 0, 1];
+    reply.extend_from_slice(&relay.local_addr()?.port().to_be_bytes());
+    control.write_all(&reply)?;
+    for socket in [&relay, &outside] {
+        socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+    }
+    let client: Arc<Mutex<Option<SocketAddr>>> = Arc::default();
+    let done = Arc::new(AtomicBool::new(false));
+    let up = {
+        let (relay, outside) = (relay.try_clone()?, outside.try_clone()?);
+        let (client, done) = (client.clone(), done.clone());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while !done.load(Ordering::SeqCst) {
+                // errors include Windows' ICMP "unreachable": keep going
+                let Ok((n, from)) = relay.recv_from(&mut buf) else {
+                    continue;
+                };
+                *client.lock().unwrap() = Some(from);
+                if n >= 10 && buf[..4] == [0, 0, 0, 1] {
+                    let to = SocketAddr::from((
+                        Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]),
+                        u16::from_be_bytes([buf[8], buf[9]]),
+                    ));
+                    let _ = outside.send_to(&buf[10..n], to);
+                }
+            }
+        })
+    };
+    let down = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while !done.load(Ordering::SeqCst) {
+                let Ok((n, from)) = outside.recv_from(&mut buf[10..]) else {
+                    continue;
+                };
+                let (Some(to), SocketAddr::V4(from)) = (*client.lock().unwrap(), from) else {
+                    continue;
+                };
+                buf[..4].copy_from_slice(&[0, 0, 0, 1]);
+                buf[4..8].copy_from_slice(&from.ip().octets());
+                buf[8..10].copy_from_slice(&from.port().to_be_bytes());
+                let _ = relay.send_to(&buf[..10 + n], to);
+            }
+        })
+    };
+    let mut sink = [0u8; 64];
+    while matches!(control.read(&mut sink), Ok(n) if n > 0) {}
+    done.store(true, Ordering::SeqCst);
+    let _ = up.join();
+    let _ = down.join();
+    Ok(())
 }
 
 fn port(stream: &mut TcpStream) -> std::io::Result<u16> {

@@ -4,8 +4,10 @@
 
 mod common;
 use common::*;
+use rurge_config::HostName;
 use rurge_config::session::Transport;
 use rurge_engine::RequestRecord;
+use rurge_net::connector::Target;
 
 fn udp_records(h: &Harness) -> Vec<RequestRecord> {
     h.engine
@@ -284,6 +286,107 @@ async fn a_policy_without_udp_may_fall_back_to_direct() {
     assert_eq!(
         records[0].error.as_deref(),
         Some("policy does not support UDP; sent through DIRECT")
+    );
+}
+
+/// `socks5` with `udp-relay=true` carries UDP through the proxy's own
+/// association (M5 design §7).
+#[tokio::test]
+async fn udp_goes_through_a_socks5_proxy() {
+    let up = FakeSocks5::spawn(Socks5Script::default()).await;
+    let proxies = format!(
+        "Up = socks5, 127.0.0.1, {}, udp-relay=true",
+        up.addr().port()
+    );
+    let h = harness(Profile {
+        proxies: &proxies,
+        rules: "IP-CIDR,127.0.0.1/32,Up",
+        ..Profile::default()
+    })
+    .await;
+    let (echo, _) = udp_echo().await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("127.0.0.1", echo.port(), b"via socks5")
+        .await;
+    assert_eq!(association.recv().await, (echo, b"via socks5".to_vec()));
+    assert_eq!(
+        up.datagrams(),
+        [Target::new(HostName::Ip(echo.ip()), echo.port())]
+    );
+}
+
+/// `underlying-proxy` carries UDP (M5 design 4.3): the front proxy's
+/// association is set up through the back one, and its datagrams go
+/// through the back one's association.
+#[tokio::test]
+async fn udp_goes_through_a_chain() {
+    let (back, front) = (
+        FakeSocks5::spawn(Socks5Script::default()).await,
+        FakeSocks5::spawn(Socks5Script::default()).await,
+    );
+    let proxies = format!(
+        "Back = socks5, 127.0.0.1, {}, udp-relay=true\nFront = socks5, 127.0.0.1, {}, udp-relay=true, underlying-proxy=Back",
+        back.addr().port(),
+        front.addr().port()
+    );
+    let h = harness(Profile {
+        proxies: &proxies,
+        rules: "IP-CIDR,127.0.0.1/32,Front",
+        ..Profile::default()
+    })
+    .await;
+    let (echo, _) = udp_echo().await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("127.0.0.1", echo.port(), b"two hops")
+        .await;
+    assert_eq!(association.recv().await, (echo, b"two hops".to_vec()));
+    let commands: Vec<u8> = back.requests().iter().map(|r| r.command).collect();
+    assert_eq!(
+        commands,
+        [1, 3],
+        "the front's control connection, then the back's association"
+    );
+    assert_eq!(
+        front.datagrams(),
+        [Target::new(HostName::Ip(echo.ip()), echo.port())]
+    );
+    assert_eq!(
+        back.datagrams().len(),
+        1,
+        "the front's datagram, to the front's relay"
+    );
+}
+
+/// A chain whose underlying policy carries no UDP fails the flow and says
+/// why.
+#[tokio::test]
+async fn a_chain_without_udp_fails_the_flow() {
+    let front = FakeSocks5::spawn(Socks5Script::default()).await;
+    let back = FakeHttpProxy::spawn(HttpProxyScript {
+        connect_to: Some(front.addr()),
+        ..HttpProxyScript::default()
+    })
+    .await;
+    let proxies = format!(
+        "Back = http, 127.0.0.1, {}\nFront = socks5, 127.0.0.1, {}, udp-relay=true, underlying-proxy=Back",
+        back.addr().port(),
+        front.addr().port()
+    );
+    let h = harness(Profile {
+        proxies: &proxies,
+        rules: "IP-CIDR,127.0.0.1/32,Front",
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association.send("127.0.0.1", 9, b"x").await;
+    let records = finished(&h, 1).await;
+    assert_eq!(records[0].status, RecordStatus::Failed);
+    assert_eq!(
+        records[0].error.as_deref(),
+        Some("via Back: the underlying policy cannot carry UDP")
     );
 }
 

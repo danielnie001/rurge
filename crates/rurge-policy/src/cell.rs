@@ -4,8 +4,8 @@
 use crate::registry::{PolicyRegistry, TerminalKind};
 use arc_swap::ArcSwapOption;
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
-use rurge_proto::OutboundError;
+use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target};
+use rurge_proto::{OutboundError, UdpSupport};
 use std::io;
 use std::sync::Arc;
 
@@ -93,6 +93,43 @@ impl Connector for ChainConnector {
             resolution
                 .outbound
                 .connect_tcp(target, opts)
+                .await
+                .map_err(|e| self.via(e))
+        })
+    }
+
+    /// The underlying policy's own UDP carrier (phase 2 M5 design 4.3): what
+    /// this hop sends to its server goes through it.
+    fn open_udp<'a>(
+        &'a self,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, io::Result<BoxedPacketSocket>> {
+        Box::pin(async move {
+            let Some(registry) = self.cell.load() else {
+                return Err(io::Error::other(format!(
+                    "via {}: no policy registry is active",
+                    self.name
+                )));
+            };
+            if !registry.contains(&self.name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("via {}: the policy no longer exists", self.name),
+                ));
+            }
+            let resolution = registry.resolve_relay(&self.name);
+            if let (TerminalKind::Reject, Some(note)) = (resolution.terminal, &resolution.note) {
+                return Err(io::Error::other(format!("via {}: {note}", self.name)));
+            }
+            if resolution.outbound.udp() == UdpSupport::Unsupported {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("via {}: the underlying policy cannot carry UDP", self.name),
+                ));
+            }
+            resolution
+                .outbound
+                .open_udp(opts)
                 .await
                 .map_err(|e| self.via(e))
         })
