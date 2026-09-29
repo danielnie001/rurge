@@ -1,16 +1,20 @@
 //! `socks5` / `socks5-tls` proxy outbound (RFC 1928, RFC 1929), CONNECT only.
 
 use crate::build::{shadow_tls_client, tls_client};
+use crate::task::AbortOnDrop;
 use crate::transport::Stack;
-use crate::{BuildError, Outbound, OutboundError};
-use rurge_config::KeystoreItem;
+use crate::{BuildError, Outbound, OutboundError, UdpSupport};
 use rurge_config::spec::{PolicySpec, ProtoSpec};
+use rurge_config::{HostName, KeystoreItem};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
+use rurge_net::connector::{
+    BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, PacketSocket, Target,
+};
 use rustls::RootCertStore;
 use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 const VERSION: u8 = 5;
 const NO_AUTH: u8 = 0;
@@ -19,10 +23,23 @@ const NO_ACCEPTABLE: u8 = 0xff;
 /// RFC 1929: the user name and the password are each length-prefixed by one byte.
 const MAX_CREDENTIAL: usize = 255;
 
+/// `UDP ASSOCIATE` with no address of its own: the relay takes datagrams
+/// from wherever the association's first one comes from (RFC 1928 §7).
+const UDP_ASSOCIATE: [u8; 10] = [VERSION, 3, 0, 1, 0, 0, 0, 0, 0, 0];
+
 pub struct Socks5Outbound {
     name: String,
     stack: Stack,
     credentials: Option<(String, String)>,
+    /// `udp-relay`: the server takes `UDP ASSOCIATE` (the manual: it must
+    /// be switched on, many servers do not).
+    udp_relay: bool,
+    /// The server as written, for a relay that answers with the
+    /// unspecified address.
+    server: Target,
+    /// Where the relayed datagrams leave from: the same way the control
+    /// connection goes (DIRECT, or `underlying-proxy`).
+    connector: Arc<dyn Connector>,
 }
 
 fn proxy(message: impl Into<String>) -> OutboundError {
@@ -118,14 +135,29 @@ impl Socks5Outbound {
         Ok(Socks5Outbound {
             name: spec.name.clone(),
             stack: Stack::new(
-                connector,
+                connector.clone(),
                 Target::new(host.clone(), port),
                 shadow_tls,
                 tls,
                 None,
             ),
             credentials,
+            udp_relay: socks.udp_relay,
+            server: Target::new(host.clone(), port),
+            connector,
         })
+    }
+
+    async fn associate(&self, opts: &ConnectOpts) -> Result<BoxedPacketSocket, OutboundError> {
+        let control = self.stack.open(opts).await?;
+        let (control, relay) =
+            negotiate_bound(control, &UDP_ASSOCIATE, self.credentials.as_ref()).await?;
+        let socket = self.connector.open_udp(opts).await?;
+        Ok(Box::new(Socks5Udp::new(
+            control,
+            relay_of(relay, &self.server.host),
+            socket,
+        )))
     }
 
     async fn handshake(
@@ -140,14 +172,130 @@ impl Socks5Outbound {
     }
 }
 
+/// Where the relay said to send datagrams; a relay that answered with the
+/// unspecified address listens where the control connection went, which
+/// is `server` (the usual reading of RFC 1928 §6).
+pub(crate) fn relay_of(bound: Target, server: &HostName) -> Target {
+    match bound.host {
+        HostName::Ip(ip) if ip.is_unspecified() => Target::new(server.clone(), bound.port),
+        _ => bound,
+    }
+}
+
+/// The header of a datagram to or from `target` (RFC 1928 §7): RSV RSV
+/// FRAG, then the address.
+fn udp_header(target: &Target) -> Result<Vec<u8>, OutboundError> {
+    let mut out = vec![0, 0, 0];
+    out.extend(crate::addr::socks_addr(target).map_err(|e| match e {
+        crate::addr::AddrError::Unsendable => {
+            proxy("the host name cannot be sent to a SOCKS5 proxy")
+        }
+        crate::addr::AddrError::TooLong => proxy("the host name is longer than 255 bytes"),
+    })?);
+    Ok(out)
+}
+
+/// A datagram's source and where its payload starts; `None` for one that
+/// is fragmented (FRAG ≠ 0: never reassembled) or malformed.
+fn parse_udp(datagram: &[u8]) -> Option<(Target, usize)> {
+    if datagram.get(..3)? != [0, 0, 0] {
+        return None;
+    }
+    let (from, len) = crate::addr::parse_socks_addr(&datagram[3..])?;
+    Some((from, 3 + len))
+}
+
+/// A SOCKS5 UDP association (`socks5`, `socks5-tls`, `external`): the
+/// control connection, held open and watched, and the relay's datagrams
+/// through `socket`. The association ends when either side closes the
+/// control connection (RFC 1928 §7): this carrier then fails.
+pub(crate) struct Socks5Udp {
+    relay: Target,
+    socket: BoxedPacketSocket,
+    closed: CancellationToken,
+    _control: AbortOnDrop,
+}
+
+impl Socks5Udp {
+    pub(crate) fn new(
+        mut control: BoxedStream,
+        relay: Target,
+        socket: BoxedPacketSocket,
+    ) -> Socks5Udp {
+        let closed = CancellationToken::new();
+        let watch = closed.clone();
+        // nothing more comes on the control connection: its end is the
+        // association's end
+        let task = tokio::spawn(async move {
+            let mut sink = [0u8; 64];
+            while matches!(control.read(&mut sink).await, Ok(n) if n > 0) {}
+            watch.cancel();
+        });
+        Socks5Udp {
+            relay,
+            socket,
+            closed,
+            _control: AbortOnDrop(task),
+        }
+    }
+}
+
+fn association_closed() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "socks5: the proxy closed the UDP association",
+    )
+}
+
+impl PacketSocket for Socks5Udp {
+    fn send_to<'a>(&'a self, buf: &'a [u8], to: &'a Target) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            if self.closed.is_cancelled() {
+                return Err(association_closed());
+            }
+            let mut datagram = udp_header(to).map_err(|e| io::Error::other(e.to_string()))?;
+            datagram.extend_from_slice(buf);
+            self.socket.send_to(&datagram, &self.relay).await
+        })
+    }
+
+    fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
+        Box::pin(async move {
+            loop {
+                let (n, _) = tokio::select! {
+                    _ = self.closed.cancelled() => return Err(association_closed()),
+                    got = self.socket.recv_from(buf) => got?,
+                };
+                // what the relay cannot have meant (a fragment, garbage) is dropped
+                if let Some((from, start)) = parse_udp(&buf[..n]) {
+                    buf.copy_within(start..n, 0);
+                    return Ok((n - start, from));
+                }
+            }
+        })
+    }
+}
+
 /// The SOCKS5 handshake on `stream`, a connection to the proxy: method
 /// selection, the user name and password when there are any, then
 /// `request` (from `connect_request`). The stream carries the tunnel after.
 pub(crate) async fn negotiate(
-    mut stream: BoxedStream,
+    stream: BoxedStream,
     request: &[u8],
     credentials: Option<&(String, String)>,
 ) -> Result<BoxedStream, OutboundError> {
+    negotiate_bound(stream, request, credentials)
+        .await
+        .map(|(stream, _)| stream)
+}
+
+/// `negotiate`, and the address the proxy's reply named (BND.ADDR,
+/// BND.PORT): for `UDP ASSOCIATE`, where the datagrams go.
+pub(crate) async fn negotiate_bound(
+    mut stream: BoxedStream,
+    request: &[u8],
+    credentials: Option<&(String, String)>,
+) -> Result<(BoxedStream, Target), OutboundError> {
     let offered: &[u8] = if credentials.is_some() {
         &[NO_AUTH, USER_PASS]
     } else {
@@ -193,20 +341,27 @@ pub(crate) async fn negotiate(
     if reply[1] != 0 {
         return Err(proxy(reply_text(reply[1])));
     }
-    // skip the bound address
+    let mut bound = vec![reply[3]];
     let remaining = match reply[3] {
         1 => 4 + 2,
         4 => 16 + 2,
         3 => {
             let mut len = [0u8; 1];
             stream.read_exact(&mut len).await.map_err(handshake_io)?;
+            bound.push(len[0]);
             usize::from(len[0]) + 2
         }
         other => return Err(proxy(format!("unknown address type {other} in the reply"))),
     };
-    let mut bound = vec![0u8; remaining];
-    stream.read_exact(&mut bound).await.map_err(handshake_io)?;
-    Ok(stream)
+    let start = bound.len();
+    bound.resize(start + remaining, 0);
+    stream
+        .read_exact(&mut bound[start..])
+        .await
+        .map_err(handshake_io)?;
+    let (bound, _) = crate::addr::parse_socks_addr(&bound)
+        .ok_or_else(|| proxy("the reply names an address that is no host name"))?;
+    Ok((stream, bound))
 }
 
 impl Outbound for Socks5Outbound {
@@ -221,6 +376,31 @@ impl Outbound for Socks5Outbound {
     ) -> BoxFuture<'a, Result<BoxedStream, OutboundError>> {
         Box::pin(async move {
             match tokio::time::timeout(opts.timeout, self.handshake(target, opts)).await {
+                Ok(result) => result,
+                Err(_) => Err(OutboundError::Timeout),
+            }
+        })
+    }
+
+    fn udp(&self) -> UdpSupport {
+        if self.udp_relay {
+            UdpSupport::Native
+        } else {
+            UdpSupport::Unsupported
+        }
+    }
+
+    fn open_udp<'a>(
+        &'a self,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, Result<BoxedPacketSocket, OutboundError>> {
+        Box::pin(async move {
+            if !self.udp_relay {
+                return Err(OutboundError::Unsupported(
+                    "UDP without `udp-relay=true`".to_string(),
+                ));
+            }
+            match tokio::time::timeout(opts.timeout, self.associate(opts)).await {
                 Ok(result) => result,
                 Err(_) => Err(OutboundError::Timeout),
             }
@@ -286,6 +466,142 @@ mod tests {
         let mut buf = vec![0u8; payload.len()];
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, payload);
+    }
+
+    /// Answers every datagram with itself.
+    async fn udp_echo() -> SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                let _ = socket.send_to(&buf[..n], from).await;
+            }
+        });
+        addr
+    }
+
+    async fn udp_roundtrip(carrier: &dyn PacketSocket, to: SocketAddr, payload: &[u8]) {
+        carrier.send_to(payload, &target(to)).await.unwrap();
+        let mut buf = [0u8; 1500];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(5), carrier.recv_from(&mut buf))
+            .await
+            .expect("an answer")
+            .unwrap();
+        assert_eq!((&buf[..n], from), (payload, target(to)));
+    }
+
+    /// `udp-relay=true`: datagrams go through the relay the proxy names,
+    /// each with its address; the proxy's answers come back with theirs.
+    #[tokio::test]
+    async fn udp_goes_through_the_association() {
+        let (one, two) = (udp_echo().await, udp_echo().await);
+        let proxy = FakeSocks5::spawn(Socks5Script {
+            auth: Some(("u".into(), "p".into())),
+            ..Socks5Script::default()
+        })
+        .await;
+        let out = outbound(
+            &format!(
+                "socks5, 127.0.0.1, {}, u, p, udp-relay=true",
+                proxy.addr().port()
+            ),
+            no_roots(),
+        );
+        assert_eq!(out.udp(), UdpSupport::Native);
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        udp_roundtrip(carrier.as_ref(), one, b"to one").await;
+        udp_roundtrip(carrier.as_ref(), two, b"to two").await;
+        let seen = proxy.requests();
+        assert_eq!((seen.len(), seen[0].command), (1, 3), "one association");
+        assert_eq!(proxy.datagrams(), [target(one), target(two)]);
+    }
+
+    /// A relay that answers with the unspecified address listens where the
+    /// control connection went.
+    #[tokio::test]
+    async fn an_unspecified_relay_address_means_the_server() {
+        let echo = udp_echo().await;
+        let proxy = FakeSocks5::spawn(Socks5Script {
+            udp_unspecified: true,
+            ..Socks5Script::default()
+        })
+        .await;
+        let out = outbound(
+            &format!("socks5, 127.0.0.1, {}, udp-relay=true", proxy.addr().port()),
+            no_roots(),
+        );
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        udp_roundtrip(carrier.as_ref(), echo, b"here").await;
+        assert_eq!(
+            relay_of(
+                Target::new(HostName::parse("::"), 7),
+                &HostName::parse("s.test")
+            ),
+            Target::new(HostName::parse("s.test"), 7)
+        );
+    }
+
+    /// The association ends with its control connection.
+    #[tokio::test]
+    async fn a_closed_control_connection_ends_the_association() {
+        let echo = udp_echo().await;
+        let proxy = FakeSocks5::spawn(Socks5Script {
+            udp_close_after: Some(1),
+            ..Socks5Script::default()
+        })
+        .await;
+        let out = outbound(
+            &format!("socks5, 127.0.0.1, {}, udp-relay=true", proxy.addr().port()),
+            no_roots(),
+        );
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        udp_roundtrip(carrier.as_ref(), echo, b"once").await;
+        let mut buf = [0u8; 64];
+        let err = tokio::time::timeout(Duration::from_secs(5), carrier.recv_from(&mut buf))
+            .await
+            .expect("bounded")
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "socks5: the proxy closed the UDP association"
+        );
+        let err = carrier.send_to(b"late", &target(echo)).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    /// Without `udp-relay=true` the policy carries no UDP (the manual: it
+    /// must be switched on), and nothing is asked of the server.
+    #[tokio::test]
+    async fn no_udp_without_udp_relay() {
+        let proxy = FakeSocks5::spawn(Socks5Script::default()).await;
+        let out = outbound(
+            &format!("socks5, 127.0.0.1, {}", proxy.addr().port()),
+            no_roots(),
+        );
+        assert_eq!(out.udp(), UdpSupport::Unsupported);
+        let err = out.open_udp(&ConnectOpts::default()).await.err().unwrap();
+        assert_eq!(
+            err.to_string(),
+            "policy protocol not implemented: UDP without `udp-relay=true`"
+        );
+        assert!(proxy.requests().is_empty());
+    }
+
+    #[test]
+    fn fragments_and_garbage_are_not_datagrams() {
+        let mut datagram = udp_header(&Target::new(HostName::parse("10.0.0.1"), 53)).unwrap();
+        datagram.extend_from_slice(b"q");
+        assert_eq!(
+            parse_udp(&datagram),
+            Some((
+                Target::new(HostName::parse("10.0.0.1"), 53),
+                datagram.len() - 1
+            ))
+        );
+        datagram[2] = 1;
+        assert_eq!(parse_udp(&datagram), None, "a fragment");
+        assert_eq!(parse_udp(&[0, 0]), None);
     }
 
     #[tokio::test]

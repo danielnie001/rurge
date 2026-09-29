@@ -2,7 +2,7 @@
 
 use rurge_config::policy::Builtin;
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Target};
+use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Target};
 use std::fmt;
 use std::io;
 use std::sync::Arc;
@@ -126,6 +126,14 @@ pub trait HttpForward: Send + Sync {
     fn request_headers(&self) -> Vec<(String, String)>;
 }
 
+/// Whether an outbound carries UDP (phase 2 M5 design 4.2). UDP over TCP
+/// (`anytls`) is the protocol's own business: `Native` all the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UdpSupport {
+    Native,
+    Unsupported,
+}
+
 /// A way to reach a destination. Phase 1 ships `Direct` and `Reject`; every
 /// proxy protocol of phase 2 implements this trait too.
 pub trait Outbound: Send + Sync {
@@ -145,6 +153,21 @@ pub trait Outbound: Send + Sync {
     /// design 6.7): how long it took. `None`: the outbound has none.
     fn native_test(&self) -> Option<BoxFuture<'_, Result<Duration, OutboundError>>> {
         None
+    }
+    /// Whether `open_udp` can work, as the policy is written.
+    fn udp(&self) -> UdpSupport {
+        UdpSupport::Unsupported
+    }
+    /// A UDP carrier for one client association (phase 2 M5 design 4.2):
+    /// datagrams to and from any address. `opts.timeout` bounds opening it.
+    fn open_udp<'a>(
+        &'a self,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, Result<BoxedPacketSocket, OutboundError>> {
+        let _ = opts;
+        Box::pin(std::future::ready(Err(OutboundError::Unsupported(
+            "UDP".to_string(),
+        ))))
     }
 }
 
@@ -170,6 +193,18 @@ mod tests {
             OutboundError::Unavailable("subscription item is broken".into()).to_string(),
             "policy unavailable: subscription item is broken"
         );
+    }
+
+    #[tokio::test]
+    async fn an_outbound_carries_no_udp_unless_it_says_so() {
+        let reject = Reject::new(RejectKind::Reject);
+        assert_eq!(reject.udp(), UdpSupport::Unsupported);
+        let err = reject
+            .open_udp(&ConnectOpts::default())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.to_string(), "policy protocol not implemented: UDP");
     }
 
     #[test]

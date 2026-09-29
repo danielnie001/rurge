@@ -47,7 +47,7 @@ fn specs_are_stored_in_proxy_order() {
 #[test]
 fn inert_and_ios_only_parameters_are_reported_once_per_name() {
     let loaded = load(
-        "A = socks5, a.example, 1080, udp-relay=true, tfo=true\nB = socks5, b.example, 1080, udp-relay=true, hybrid=on\nC = http, c.example, 80, hybrid=off",
+        "A = socks5, a.example, 1080, test-udp=apple.com@8.8.8.8, tfo=true\nB = socks5, b.example, 1080, test-udp=apple.com@8.8.8.8, hybrid=on\nC = http, c.example, 80, hybrid=off",
         "",
     );
     let warnings: Vec<(&str, String, u32)> = loaded
@@ -61,13 +61,13 @@ fn inert_and_ios_only_parameters_are_reported_once_per_name() {
         [
             (
                 codes::W_PARAM_NOT_EFFECTIVE,
-                "policy parameter `udp-relay` is parsed but has no effect in this version"
-                    .to_string(),
+                "policy parameter `tfo` is parsed but has no effect in this version".to_string(),
                 2
             ),
             (
                 codes::W_PARAM_NOT_EFFECTIVE,
-                "policy parameter `tfo` is parsed but has no effect in this version".to_string(),
+                "policy parameter `test-udp` is parsed but has no effect in this version"
+                    .to_string(),
                 2
             ),
             (

@@ -234,9 +234,6 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
                 }
             }
             let udp_relay = r.bool("udp-relay").unwrap_or(false);
-            if udp_relay {
-                notes.inert.insert(0, "udp-relay");
-            }
             (
                 common,
                 ProtoSpec::Socks5(Socks5Spec {
@@ -609,8 +606,8 @@ mod tests {
             "P",
             "socks5, h, 1080, udp-relay=true, shadow-tls-password=pw, mystery=1",
         );
-        // Shadow TLS took effect in M2c: no longer on the list
-        assert_eq!(o.inert, ["udp-relay"]);
+        // Shadow TLS took effect in M2c, `udp-relay` in M5a: nothing on the list
+        assert!(o.inert.is_empty(), "{:?}", o.inert);
         let warnings: Vec<&str> = o.diagnostics.iter().map(|d| d.code).collect();
         assert_eq!(warnings, [codes::W_UNKNOWN_KEY]);
         assert!(o.spec.is_some(), "warnings do not drop the spec");

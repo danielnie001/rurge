@@ -1,8 +1,10 @@
 //! `DIRECT`: connect straight to the destination through a `Connector`.
 
-use crate::outbound::{Outbound, OutboundError};
+use crate::outbound::{Outbound, OutboundError, UdpSupport};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, DirectConnector, Resolve, Target};
+use rurge_net::connector::{
+    BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, DirectConnector, Resolve, Target,
+};
 use std::sync::Arc;
 
 pub struct Direct {
@@ -33,6 +35,23 @@ impl Outbound for Direct {
         Box::pin(async move {
             match tokio::time::timeout(opts.timeout, self.connector.connect(target, opts)).await {
                 Ok(Ok(stream)) => Ok(stream),
+                Ok(Err(e)) => Err(OutboundError::from(e)),
+                Err(_) => Err(OutboundError::Timeout),
+            }
+        })
+    }
+
+    fn udp(&self) -> UdpSupport {
+        UdpSupport::Native
+    }
+
+    fn open_udp<'a>(
+        &'a self,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, Result<BoxedPacketSocket, OutboundError>> {
+        Box::pin(async move {
+            match tokio::time::timeout(opts.timeout, self.connector.open_udp(opts)).await {
+                Ok(Ok(socket)) => Ok(socket),
                 Ok(Err(e)) => Err(OutboundError::from(e)),
                 Err(_) => Err(OutboundError::Timeout),
             }
@@ -101,6 +120,29 @@ mod tests {
             stream.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"ping");
         }
+    }
+
+    /// DIRECT carries UDP: to an address, and to a name looked up here.
+    #[tokio::test]
+    async fn direct_carries_udp() {
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            while let Ok((n, from)) = echo.recv_from(&mut buf).await {
+                let _ = echo.send_to(&buf[..n], from).await;
+            }
+        });
+        let direct = Direct::with_resolver(Arc::new(Loopback));
+        assert_eq!(direct.udp(), UdpSupport::Native);
+        let carrier = direct.open_udp(&ConnectOpts::default()).await.unwrap();
+        let by_name = Target::new(HostName::parse("echo.test"), port);
+        let to = carrier.resolve(&by_name).await.unwrap();
+        assert_eq!(to, Target::new(HostName::parse("127.0.0.1"), port));
+        carrier.send_to(b"ping", &to).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, from) = carrier.recv_from(&mut buf).await.unwrap();
+        assert_eq!((&buf[..n], from), (&b"ping"[..], to));
     }
 
     #[tokio::test]

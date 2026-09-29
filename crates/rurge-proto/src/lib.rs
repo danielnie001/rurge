@@ -21,5 +21,5 @@ pub mod vmess;
 
 pub use build::BuildError;
 pub use direct::Direct;
-pub use outbound::{HttpForward, Outbound, OutboundError, OutboundRef, RejectKind};
+pub use outbound::{HttpForward, Outbound, OutboundError, OutboundRef, RejectKind, UdpSupport};
 pub use reject::Reject;

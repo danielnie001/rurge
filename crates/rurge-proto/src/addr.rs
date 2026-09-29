@@ -37,6 +37,30 @@ pub(crate) fn socks_addr(target: &Target) -> Result<Vec<u8>, AddrError> {
     Ok(out)
 }
 
+/// `ATYP ADDR PORT` at the start of `bytes`, and how many bytes it took;
+/// `None` when it is cut short, of an unknown type, or a name that is no
+/// host name.
+pub(crate) fn parse_socks_addr(bytes: &[u8]) -> Option<(Target, usize)> {
+    let (host, rest) = match *bytes.first()? {
+        1 => {
+            let b: [u8; 4] = bytes.get(1..5)?.try_into().ok()?;
+            (HostName::Ip(IpAddr::from(b)), 5)
+        }
+        4 => {
+            let b: [u8; 16] = bytes.get(1..17)?.try_into().ok()?;
+            (HostName::Ip(IpAddr::from(b)), 17)
+        }
+        3 => {
+            let len = usize::from(*bytes.get(1)?);
+            let name = std::str::from_utf8(bytes.get(2..2 + len)?).ok()?;
+            (HostName::from_wire(name)?, 2 + len)
+        }
+        _ => return None,
+    };
+    let port = u16::from_be_bytes(bytes.get(rest..rest + 2)?.try_into().ok()?);
+    Some((Target::new(host, port), rest + 2))
+}
+
 /// `PORT TYPE ADDR` as VMess writes it: the port first, and the types are
 /// 1 = IPv4, 2 = domain, 3 = IPv6 (not SOCKS5's 1 / 3 / 4).
 pub(crate) fn vmess_addr(target: &Target) -> Result<Vec<u8>, AddrError> {
@@ -64,6 +88,24 @@ pub(crate) fn vmess_addr(target: &Target) -> Result<Vec<u8>, AddrError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_socks_address_reads_back_as_it_was_written() {
+        for host in ["10.1.2.3", "2001:db8::1", "example.com"] {
+            let target = Target::new(HostName::parse(host), 853);
+            let mut bytes = socks_addr(&target).unwrap();
+            let written = bytes.len();
+            bytes.extend_from_slice(b"payload");
+            assert_eq!(parse_socks_addr(&bytes), Some((target, written)));
+        }
+        assert_eq!(parse_socks_addr(&[1, 10, 1, 2, 3, 0]), None, "cut short");
+        assert_eq!(parse_socks_addr(&[9, 0, 0]), None, "unknown type");
+        assert_eq!(
+            parse_socks_addr(&[3, 3, b'a', b' ', b'b', 0, 53]),
+            None,
+            "no host name"
+        );
+    }
 
     #[test]
     fn vmess_puts_the_port_first_and_numbers_the_types_its_own_way() {
