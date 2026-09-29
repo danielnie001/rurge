@@ -128,3 +128,15 @@
 - [ ] 服务端停掉：经 `WG` 的请求在拨号时限处失败；约 90 秒后日志有一条 `wireguard: the peer did not answer the handshake`，服务端一直停着时此后约每 90 秒再有一条（每次换一条新载体重试）；服务端恢复后下一个请求正常，日志再有一条 `wireguard: handshake completed`。
 - [ ] 网络变化：经 `WG` 的连接在用时，把本机换到另一个网络（如从 Wi-Fi 换到手机热点，或拔掉网线改用 Wi-Fi），不重启 rurge：约两分钟内经 `WG` 的新连接恢复正常（若日志先记了一条 `wireguard: the peer did not answer the handshake`，恢复时会再记一条 `wireguard: handshake completed`）；服务端 `wg show` 里这个 peer 的 endpoint 变成新网络的出口地址。
 - [ ] 日志（含 `--log-level verbose`）里搜不到私钥与 `preshared-key` 的内容；`GET /v1/profiles/current?sensitive=0` 里二者都是 `***`。
+
+## M4c　external
+
+前置：本机能用 `ssh` 登录一台自己的服务器（密钥登录，不需要输入口令）。配置里写 `[Proxy]` 一条 `Ext = external, exec = "<ssh 的完整路径>", args = "-N", args = "-D", args = "127.0.0.1:1080", args = "<用户>@<服务器>", local-port = 1080`，`[Rule]` 里 `FINAL,Ext`；`rurge check -c <配置>` 零错误（没有 `W0007`）。三个平台各验一遍。
+
+- [ ] 第一次用到时拉起：`rurge run -c <配置> --log-level info` 启动后没有 `ssh` 进程；`curl -x http://127.0.0.1:<http-listen 端口> https://example.com/ -I` 返回 200，此时有了 `ssh` 进程，日志里有 `external: the program started`（策略名与 pid，没有参数）。
+- [ ] 日志文件：`<数据目录>/external/Ext.log` 里有一行 `--- rurge: starting the program …`，`ssh` 自己的输出（如有）在它后面。
+- [ ] 再拉起：手动结束这个 `ssh` 进程，日志里有 `external: the program exited`；再发一个请求，2 秒左右后返回 200，出现了新的 `ssh` 进程。
+- [ ] 停止：`rurge stop`（或 Ctrl-C）之后没有 `ssh` 进程残留（Windows：任务管理器；Unix：`ps`）；日志里有 `external: the program stopped`。
+- [ ] Windows 上结束 rurge 进程（任务管理器里"结束任务"）：`ssh` 进程随之消失。
+- [ ] 脱敏：`GET /v1/policies/detail?policy_name=Ext` 与 `GET /v1/profiles/current` 里每个 `args` 都是 `***`；日志（含 `--log-level verbose`）里搜不到服务器地址与用户名。
+- [ ] 订阅：把一行 `external` 放进自己的订阅文件，重载后该行被跳过，`rurge check` 报 `` `external` policies are not imported from subscriptions ``。
