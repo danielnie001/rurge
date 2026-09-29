@@ -271,7 +271,8 @@ impl Registry for RealRegistry {
     }
 }
 
-/// The one `unsafe` in the workspace (plan decision P1).
+/// One of the workspace's two `unsafe` exceptions (plan decision P1; the
+/// other is `process`).
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn notify_wininet() {

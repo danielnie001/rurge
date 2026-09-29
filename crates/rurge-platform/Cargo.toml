@@ -1,6 +1,6 @@
 [package]
 name = "rurge-platform"
-description = "Platform-specific helpers for rurge (directories, system DNS, system proxy, service install)"
+description = "Platform-specific helpers for rurge (directories, system DNS, system proxy, service install, external programs)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,14 +20,23 @@ socket2.workspace = true
 [target.'cfg(windows)'.dependencies]
 ipconfig.workspace = true
 windows-registry.workspace = true
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+# killpg for an external program's process group (`process`)
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
 tempfile.workspace = true
 
 # The workspace lints, except `unsafe_code`: notifying WinINet that the proxy
-# settings changed (`sysproxy::windows`) is an FFI call. The lint stays `deny`
-# here and only that one function opts out; every other crate keeps `forbid`.
+# settings changed (`sysproxy::windows`) and putting an external program in a
+# Job Object (`process`) are FFI calls. The lint stays `deny` here and only
+# those two functions opt out; every other crate keeps `forbid`.
 [lints.rust]
 unsafe_code = "deny"
 

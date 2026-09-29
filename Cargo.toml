@@ -67,6 +67,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 rurge-api = { path = "crates/rurge-api" }
 windows-registry = "0.6"
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinInet"] }
+nix = { version = "0.31", default-features = false }
 socket2 = { version = "0.6", features = ["all"] }
 p12-keystore = "0.2"
 getrandom = "0.3"

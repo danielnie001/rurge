@@ -3292,6 +3292,7 @@ version = "0.1.0"
 dependencies = [
  "if-addrs",
  "ipconfig",
+ "nix",
  "resolv-conf",
  "serde",
  "serde_json",
