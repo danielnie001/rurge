@@ -8,12 +8,17 @@ use std::io;
 use std::process::Command;
 
 /// Called on the command before it is spawned: on Unix the program becomes
-/// the leader of a new process group. Nothing on Windows.
+/// the leader of a new process group. On Windows it starts a new process
+/// group of its own, so the Ctrl-C typed at rurge's console does not reach
+/// it: rurge stops it in its own time, as it does on Unix.
 pub fn prepare(command: &mut Command) {
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(command, 0);
-    #[cfg(not(unix))]
-    let _ = command;
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(
+        command,
+        windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP,
+    );
 }
 
 /// The program and whatever it starts.
@@ -28,8 +33,15 @@ pub struct ProcessTree {
 impl ProcessTree {
     /// Takes in the program `pid`, spawned after `prepare` and not waited for
     /// yet (so the id is still its own). On Windows a process the program
-    /// started before this call is not taken in.
+    /// started before this call is not taken in. 0 and 1 are never a program
+    /// rurge started (on Unix, a group of 0 would be rurge's own).
     pub fn contain(pid: u32) -> io::Result<ProcessTree> {
+        if pid <= 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a process rurge started",
+            ));
+        }
         #[cfg(unix)]
         {
             let pid = i32::try_from(pid)
@@ -78,6 +90,10 @@ impl ProcessTree {
     fn signal(&self, signal: nix::sys::signal::Signal) -> io::Result<()> {
         match nix::sys::signal::killpg(self.group, signal) {
             Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            // Darwin answers EPERM, not ESRCH, for a group whose processes
+            // have all exited but are not reaped yet: it has ended too
+            #[cfg(target_os = "macos")]
+            Err(nix::errno::Errno::EPERM) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
@@ -224,10 +240,13 @@ mod tests {
         assert!(ended, "the program is still running");
     }
 
-    #[cfg(windows)]
+    /// 0 and 1 are never a program rurge started: on Unix, signalling a
+    /// group of 0 would reach rurge's own group.
     #[test]
-    fn a_process_that_does_not_exist_cannot_be_taken_in() {
-        // process ids are multiples of 4 on Windows: 3 is never one
-        assert!(ProcessTree::contain(3).is_err());
+    fn the_first_two_process_ids_cannot_be_taken_in() {
+        for pid in [0, 1] {
+            let err = ProcessTree::contain(pid).err().expect("refused");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{pid}");
+        }
     }
 }

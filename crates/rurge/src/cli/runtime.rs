@@ -218,8 +218,9 @@ mod tests {
         assert_eq!(socket.tos_v4().unwrap(), 0x28);
     }
 
-    /// Nothing but this test's own child: a process that is not ours (no
-    /// such process) cannot be taken in.
+    /// The adapter prepares the command, takes in the child it started and
+    /// ends it through `rurge-platform::process`; the test starts nothing but
+    /// its own child.
     #[test]
     fn platform_processes_delegates_to_rurge_platform() {
         let hook = PlatformProcesses;
