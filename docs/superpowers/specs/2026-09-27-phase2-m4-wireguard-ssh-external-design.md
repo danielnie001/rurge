@@ -479,3 +479,14 @@ M4-D7 ～ D13 是按 M4-D1 ～ D6 逐节细化时由项目所有者确认的（2
 | 第 9 节 "`external: could not start <策略名>`（原因只取 I/O 错误的种类）" | `external: could not start <策略名> (<io::ErrorKind 的显示>)`；日志 `external: the program started` / `exited` / `stopped` / `could not be started`（P11） | 固定说法，从不写 `exec` 与 `args` |
 | V14 "测试辅助程序……只用于测试的工作区成员里的二进制目标" | 新成员 `tests/external`（`rurge-external-tests`），真实拉起辅助程序的用例（`ExternalOutbound` 与经引擎的）都在这个包里；CLI 测试拿第二个 `rurge run` 当外部程序（P4） | `CARGO_BIN_EXE_<名字>` 只对同一个包的集成测试可见 |
 | 第 16 节 M4c 草图 1 "`ExternalSpec`、重复 `local-port` 的错误" | `read_external` 在 Task 1；`ProtoSpec::External`、`to_spec` 分支与重复 `local-port` 在 Task 4 随引擎工厂一起落地（P8） | 有了 spec 却没有工厂分支时，干构建会把每一条 `external` 行报成加载错误 |
+
+## 22. M4c 实施期的订正
+
+按计划实施时由终审发现、与上文不同的地方；计划「执行期修正记录」里有对应的行。
+
+| 本文原文 | 实际 | 依据 |
+| -------- | ---- | ---- |
+| 7.4 "变了的话，旧进程在旧出站释放时（进行中的会话结束后）停掉" | 会话拨号之后只持有流，旧出站通常在重载发布时就被释放、旧程序立即停掉（经它的连接随之断开）；旧出站仍被拿住时，新出站第一次拉起前让同一 `local-port` 上更早构建的出站退役（停掉程序、之后的拨号立即失败） | 终审：`ssh -D` 绑不上端口也不退出，新旧两个程序抢一个端口时策略会一直不可用 |
+| 7.3 "Windows：子进程加入一个 Job Object" | 另外以 `CREATE_NEW_PROCESS_GROUP` 拉起，Ctrl-C 不直接送到外部程序 | 终审：否则外部程序先于 rurge 的退出流程自己退出 |
+| 7.1 没写交互式提示 | 外部程序不能交互式提问（Unix 终端前台运行时会被挂起），推荐 `ssh -o BatchMode=yes -o ExitOnForwardFailure=yes` | 终审；代码修法要 unsafe |
+| 4.4 没写与 rurge 自己的监听同端口 | `local-port` 等于回环或全零地址上的 `http-listen` / `socks5-listen` 端口是 `E0018` | 终审：会连回自己 |

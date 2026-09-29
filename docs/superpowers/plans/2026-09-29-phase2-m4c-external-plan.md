@@ -3798,6 +3798,12 @@ git commit -m "docs: M4c external——兼容性清单、README、CLAUDE.md（�
 
 | 任务 | 计划原文 | 实际做法 | 原因 | 提交 |
 | ---- | -------- | -------- | ---- | ---- |
+| 4、5 | `git add` 行没列 `Cargo.lock` | Task 4 的提交带上 `Cargo.lock`（`tests/external` 多了开发依赖）；Task 5 的 `Cargo.lock` 没有变化（bin 早已把 `rurge-proto` 列为开发依赖） | 仓库要求提交 `Cargo.lock`（开工前的裁定） | 18207b0 |
+| 终审 | 设计 7.4 / 兼容性清单"变了的旧程序在旧策略释放（进行中的连接结束）后停掉" | 会话拨号之后只持有流，普通策略的旧出站在重载发布时就被释放、旧程序立即停掉；为了旧出站被拿住（`smart` 组的会话、进行中的拨号或测速）时新旧两个程序不抢同一个端口，新增 `LocalPorts`：重建的出站第一次拉起前，让同一 `local-port` 上更早构建的出站退役（停掉程序、之后拨号立即得到 `external: a newer configuration of this policy is in use`）；只退役更早构建的，免得旧一代先拨号时反把新的退役 | `ssh -D` 绑不上端口也不退出：新请求会落到旧程序上，旧程序停掉后策略一直 `refused`，直到重启 | cc02727、95168a8 |
+| 终审 | P1 `prepare` 在 Windows 上什么也不做 | 以 `CREATE_NEW_PROCESS_GROUP`（std 的 `creation_flags`，不新增 unsafe）拉起外部程序 | 否则第一次 Ctrl-C 同时送到外部程序，它先于 rurge 的退出流程自己退出 | 58e5aa3 |
+| 终审 | 设计与 P12 没写交互式提示 | 文档写明外部程序不能交互式提问（Unix 终端前台运行时会被 SIGTTIN 挂起），推荐 `ssh -o BatchMode=yes -o ExitOnForwardFailure=yes`，手工验收加"未知主机"一项 | 修代码要 `setsid`（`pre_exec`，unsafe） | 95168a8 |
+| 终审 | 设计 4.4 没写与 rurge 自己监听同端口 | `local-port` 等于回环或全零地址上的 `http-listen` / `socks5-listen` 端口时 `E0018` | rurge 会连回自己，形成连接递归 | fb3b4c9 |
+| 终审 | P2 `ESRCH` 以外的错误照报；P6 / Task 3 的 `child.id().unwrap_or(0)` | macOS 上 `killpg` 的 `EPERM` 视同组已结束；拿不到进程号是拉起失败；`ProcessTree::contain` 拒绝 0 与 1；新增"程序自己退出时带走它启动的进程"的用例；文档：CLAUDE.md 补第 21 节、日志名在不区分大小写的文件系统上可能共用 | Darwin 对只剩僵尸的组返回 `EPERM`；`killpg(0)` 会发给 rurge 自己的组 | 58e5aa3、cc02727、95168a8 |
 
 ## 延后事项
 
@@ -3809,3 +3815,6 @@ git commit -m "docs: M4c external——兼容性清单、README、CLAUDE.md（�
 | 4 | `rurge-platform::process` 与 `ExternalOutbound` 的 Unix 分支只在 CI（Linux / macOS）上编译与运行，本机验证不了（P2） | 首次推送后看 CI |
 | 5 | `external` 的 `udp-relay`（M5）与 `addresses`、"外部进程的流量走 DIRECT"（阶段 3，要有 TUN） | M5 / 阶段 3 |
 | 6 | 外部程序自己退出时，只在日志里记一条 `external: the program exited`；持续崩溃的程序每 2 秒被一个请求拉起一次，没有更长的退避 | 有用户报告再说 |
+| 7 | 端口登记的两个少见窗口：从没拉起过程序的旧一代出站在新出站拉起之后仍能登记同一端口并拉起旧程序（只退役更早构建的）；退役的条目在旧程序真正停掉之前就离开登记表，拨号被取消时旧程序可能没收到停止信号 | 有用户报告再说；修法：发现同端口有更晚构建的条目时让自己退役，停止放进单独的任务或停完才移出登记表 |
+| 8 | 最后的 `stop_external_programs()` 期间再按 Ctrl-C 不会立即退出（最多约 2 秒） | 有用户报告再说 |
+| 9 | 任务评审记下的其余 Minor：`local-port=+80` 被接受、拉起在 tokio 锁里做少量阻塞的文件操作、`stop()` 之后的拨号会再拉起、`stop_all` 忽略任务的 panic、Shadow TLS 报错里的 "a `external`" | 以后顺手改 |
