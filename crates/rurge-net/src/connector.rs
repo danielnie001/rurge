@@ -4,6 +4,7 @@
 use crate::BoxFuture;
 use crate::socket::{Family, NoopSocketHook, SocketHook, SocketOpts, plan_addresses, race};
 use rurge_config::HostName;
+use rurge_config::spec::IpVersion;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -43,6 +44,25 @@ pub trait Datagram: Send + Sync {
 }
 
 pub type BoxedDatagram = Box<dyn Datagram>;
+
+/// One client association's UDP carrier on one outbound (phase 2 M5 design
+/// 4.1): datagrams go to, and come back from, any address — the carrier of
+/// a full-cone association. `send_to` and `recv_from` may run at the same
+/// time, from two tasks.
+pub trait PacketSocket: Send + Sync {
+    /// Where the datagrams for `to` really go. A carrier that looks names up
+    /// itself (DIRECT) answers with an address; the others hand `to` back:
+    /// their server resolves it.
+    fn resolve<'a>(&'a self, to: &'a Target) -> BoxFuture<'a, io::Result<Target>> {
+        Box::pin(std::future::ready(Ok(to.clone())))
+    }
+    /// Sends `buf` as one datagram to `to`.
+    fn send_to<'a>(&'a self, buf: &'a [u8], to: &'a Target) -> BoxFuture<'a, io::Result<()>>;
+    /// Receives one datagram into `buf`: its length, and where it came from.
+    fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>>;
+}
+
+pub type BoxedPacketSocket = Box<dyn PacketSocket>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -87,11 +107,25 @@ pub trait Connector: Send + Sync {
         opts: &'a ConnectOpts,
     ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
         let _ = (target, opts);
-        Box::pin(std::future::ready(Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "this connection cannot carry UDP",
-        ))))
+        Box::pin(std::future::ready(Err(no_udp())))
     }
+
+    /// A UDP carrier that sends to any address (phase 2 M5 design 4.3);
+    /// `Unsupported` from a connector that carries none.
+    fn open_udp<'a>(
+        &'a self,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, io::Result<BoxedPacketSocket>> {
+        let _ = opts;
+        Box::pin(std::future::ready(Err(no_udp())))
+    }
+}
+
+fn no_udp() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this connection cannot carry UDP",
+    )
 }
 
 pub trait Resolve: Send + Sync {
@@ -339,6 +373,154 @@ impl Connector for DirectConnector {
                 hook: self.hook.clone(),
                 tos: self.opts.tos,
             }) as BoxedDatagram)
+        }))
+    }
+
+    fn open_udp<'a>(
+        &'a self,
+        _opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, io::Result<BoxedPacketSocket>> {
+        Box::pin(std::future::ready(
+            self.open_packet().map(|p| Box::new(p) as BoxedPacketSocket),
+        ))
+    }
+}
+
+impl DirectConnector {
+    /// One unconnected UDP socket per address family the policy's
+    /// `ip-version` allows, each bound to the unspecified address and
+    /// carrying the policy's socket options. A family this machine cannot
+    /// open a socket of is left out, unless it is the only one.
+    fn open_packet(&self) -> io::Result<DirectPacket> {
+        let families: &[Family] = match self.opts.ip_version {
+            IpVersion::V4Only => &[Family::V4],
+            IpVersion::V6Only => &[Family::V6],
+            _ => &[Family::V4, Family::V6],
+        };
+        let (mut v4, mut v6, mut failure) = (None, None, None);
+        for family in families {
+            let unspecified = match family {
+                Family::V4 => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                Family::V6 => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            };
+            let opened = open_socket(
+                SocketAddr::new(unspecified, 0),
+                socket2::Type::DGRAM,
+                &self.opts,
+                self.hook.as_ref(),
+                &self.fallback_logged,
+            )
+            .and_then(|socket| {
+                if *family == Family::V6 {
+                    socket.set_only_v6(true)?;
+                }
+                make_room(&socket);
+                socket.bind(&SocketAddr::new(unspecified, 0).into())?;
+                UdpSocket::from_std(socket.into())
+            });
+            match (opened, family) {
+                (Ok(socket), Family::V4) => v4 = Some(socket),
+                (Ok(socket), Family::V6) => v6 = Some(socket),
+                (Err(e), _) => failure = Some(e),
+            }
+        }
+        if v4.is_none() && v6.is_none() {
+            return Err(failure.unwrap_or_else(no_udp));
+        }
+        Ok(DirectPacket {
+            v4,
+            v6,
+            resolver: self.resolver.clone(),
+            opts: self.opts.clone(),
+        })
+    }
+}
+
+/// DIRECT's UDP carrier: unconnected sockets, one per address family.
+struct DirectPacket {
+    v4: Option<UdpSocket>,
+    v6: Option<UdpSocket>,
+    resolver: Arc<dyn Resolve>,
+    opts: SocketOpts,
+}
+
+impl DirectPacket {
+    fn socket_for(&self, ip: &IpAddr) -> Option<&UdpSocket> {
+        match Family::of(ip) {
+            Family::V4 => self.v4.as_ref(),
+            Family::V6 => self.v6.as_ref(),
+        }
+    }
+
+    /// The first address of `name` the policy's `ip-version` allows and
+    /// this carrier has a socket for.
+    async fn address_of(&self, name: &str) -> io::Result<IpAddr> {
+        let addrs = self.resolver.resolve(name).await?;
+        let (primary, secondary) = plan_addresses(addrs, self.opts.ip_version, self.opts.v6_first);
+        primary
+            .into_iter()
+            .chain(secondary)
+            .find(|ip| self.socket_for(ip).is_some())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no usable address for {name}"),
+                )
+            })
+    }
+}
+
+impl PacketSocket for DirectPacket {
+    fn resolve<'a>(&'a self, to: &'a Target) -> BoxFuture<'a, io::Result<Target>> {
+        Box::pin(async move {
+            match &to.host {
+                HostName::Ip(_) => Ok(to.clone()),
+                HostName::Domain(name) => Ok(Target::new(
+                    HostName::Ip(self.address_of(name).await?),
+                    to.port,
+                )),
+            }
+        })
+    }
+
+    fn send_to<'a>(&'a self, buf: &'a [u8], to: &'a Target) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            let ip = match &to.host {
+                HostName::Ip(ip) => *ip,
+                HostName::Domain(name) => self.address_of(name).await?,
+            };
+            let socket = self.socket_for(&ip).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    format!("this policy sends no UDP to {}", display_target(to)),
+                )
+            })?;
+            socket.send_to(buf, SocketAddr::new(ip, to.port)).await?;
+            Ok(())
+        })
+    }
+
+    fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
+        Box::pin(std::future::poll_fn(move |cx| {
+            let mut read = ReadBuf::new(buf);
+            for socket in [&self.v4, &self.v6].into_iter().flatten() {
+                loop {
+                    match socket.poll_recv_from(cx, &mut read) {
+                        // an ICMP "unreachable" for an earlier datagram, which
+                        // Windows reports on the next receive: nothing came
+                        Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => {}
+                        Poll::Ready(from) => {
+                            let from = from?;
+                            return Poll::Ready(Ok((
+                                read.filled().len(),
+                                Target::new(HostName::Ip(from.ip()), from.port()),
+                            )));
+                        }
+                        Poll::Pending => break,
+                    }
+                }
+            }
+            Poll::Pending
         }))
     }
 }
@@ -880,6 +1062,121 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         assert_eq!(err.to_string(), "this connection cannot carry UDP");
+        let err = TcpOnly
+            .open_udp(&ConnectOpts::default())
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// DIRECT's carrier sends to any address, by address and by name, and
+    /// hears from any address — not only from the one it sent to (full cone).
+    #[tokio::test]
+    async fn a_direct_carrier_talks_to_any_address() {
+        let echo = udp_echo().await;
+        let c = DirectConnector::new(Arc::new(Fixed(vec![ip("127.0.0.1")])));
+        let carrier = c.open_udp(&ConnectOpts::default()).await.unwrap();
+        let by_name = Target::new(HostName::parse("echo.test"), echo.port());
+        let resolved = carrier.resolve(&by_name).await.unwrap();
+        assert_eq!(resolved, Target::new(HostName::Ip(echo.ip()), echo.port()));
+        let mut buf = [0u8; 64];
+        for to in [&by_name, &resolved] {
+            carrier.send_to(b"ping", to).await.unwrap();
+            let (n, from) = carrier.recv_from(&mut buf).await.unwrap();
+            assert_eq!((&buf[..n], &from), (&b"ping"[..], &resolved));
+        }
+        // a stranger writes to the carrier's port, never having been written to
+        let seen = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let seen_addr = seen.local_addr().unwrap();
+        carrier
+            .send_to(
+                b"who",
+                &Target::new(HostName::Ip(seen_addr.ip()), seen_addr.port()),
+            )
+            .await
+            .unwrap();
+        let (n, carrier_addr) = seen.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"who");
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stranger_addr = stranger.local_addr().unwrap();
+        stranger.send_to(b"hello", carrier_addr).await.unwrap();
+        let (n, from) = carrier.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        assert_eq!(
+            from,
+            Target::new(HostName::Ip(stranger_addr.ip()), stranger_addr.port())
+        );
+    }
+
+    /// A datagram to a port nobody listens on does not stop the carrier:
+    /// Windows reports the ICMP "port unreachable" on the next receive.
+    #[tokio::test]
+    async fn a_closed_port_does_not_stop_a_direct_carrier() {
+        let echo = udp_echo().await;
+        let closed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let closed = closed.local_addr().unwrap();
+        let c = DirectConnector::new(Arc::new(SystemResolve));
+        let carrier = c.open_udp(&ConnectOpts::default()).await.unwrap();
+        let to = |addr: SocketAddr| Target::new(HostName::Ip(addr.ip()), addr.port());
+        carrier.send_to(b"lost", &to(closed)).await.unwrap();
+        // a window for the unreachable answer to arrive
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        carrier.send_to(b"ping", &to(echo)).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(5), carrier.recv_from(&mut buf))
+            .await
+            .expect("the echo comes back")
+            .unwrap();
+        assert_eq!((&buf[..n], from), (&b"ping"[..], to(echo)));
+    }
+
+    /// `ip-version` decides which families the carrier sends to.
+    #[tokio::test]
+    async fn ip_version_limits_a_direct_carrier() {
+        let c = DirectConnector::with_opts(
+            Arc::new(Fixed(vec![ip("::1"), ip("127.0.0.1")])),
+            SocketOpts {
+                ip_version: IpVersion::V4Only,
+                ..SocketOpts::default()
+            },
+            Arc::new(NoopSocketHook),
+        );
+        let carrier = c.open_udp(&ConnectOpts::default()).await.unwrap();
+        assert_eq!(
+            carrier
+                .resolve(&Target::new(HostName::parse("both.test"), 53))
+                .await
+                .unwrap(),
+            Target::new(HostName::parse("127.0.0.1"), 53)
+        );
+        let err = carrier
+            .send_to(b"x", &Target::new(HostName::parse("::1"), 53))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
+        assert_eq!(err.to_string(), "this policy sends no UDP to [::1]:53");
+    }
+
+    /// The policy's socket options go on each socket of the carrier.
+    #[tokio::test]
+    async fn the_hook_sees_every_socket_of_a_direct_carrier() {
+        let hook = Arc::new(RecordingHook::default());
+        let c = DirectConnector::with_opts(
+            Arc::new(SystemResolve),
+            SocketOpts {
+                interface: Some("test0".into()),
+                tos: 0x10,
+                ip_version: IpVersion::V4Only,
+                ..SocketOpts::default()
+            },
+            hook.clone(),
+        );
+        c.open_udp(&ConnectOpts::default()).await.unwrap();
+        assert_eq!(
+            *hook.calls.lock().unwrap(),
+            ["tos 0x10 V4", "bind test0 V4"]
+        );
     }
 
     #[test]

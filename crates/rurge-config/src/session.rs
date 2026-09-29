@@ -82,6 +82,14 @@ impl SessionInfo {
         }
     }
 
+    /// A UDP flow from the loopback with every optional field empty.
+    pub fn udp(dst_host: HostName, dst_port: u16) -> SessionInfo {
+        SessionInfo {
+            transport: Transport::Udp,
+            ..SessionInfo::tcp(dst_host, dst_port)
+        }
+    }
+
     /// The `HOSTNAME-TYPE` classification of the destination.
     pub fn hostname_type(&self) -> HostnameType {
         match &self.dst_host {
