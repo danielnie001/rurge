@@ -7,6 +7,8 @@
 //!
 //! A wrong password cannot be told from a server that closes: it answers
 //! like a web site, and the stream ends in the relay.
+//!
+//! UDP rides a stream of its own to `UOT_MAGIC` (`stream_udp`).
 
 pub(crate) mod frame;
 pub(crate) mod padding;
@@ -15,21 +17,26 @@ mod session;
 
 use crate::addr::{AddrError, socks_addr};
 use crate::build::{shadow_tls_client, tls_client};
+use crate::stream_udp::{Framing, StreamUdp};
 use crate::task::AbortOnDrop;
 use crate::transport::Stack;
-use crate::{BuildError, Outbound, OutboundError};
+use crate::{BuildError, Outbound, OutboundError, UdpSupport};
 use padding::Scheme;
 use pool::Pool;
 use rurge_config::KeystoreItem;
 use rurge_config::spec::{AnyTlsSpec, ShadowTlsOpts};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
+use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target};
 use rustls::RootCertStore;
 use session::{SchemeCell, Session, pick};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::io::AsyncWriteExt;
+
+/// The target that asks the server for UDP over TCP, version 2 (sing's
+/// `uot.MagicAddress`; port 0).
+const UOT_MAGIC: &str = "sp.v2.udp-over-tcp.arpa";
 
 /// No `Debug`: the hash is as good as the password.
 pub struct AnyTlsOutbound {
@@ -146,18 +153,41 @@ impl Outbound for AnyTlsOutbound {
             }
         })
     }
+
+    fn udp(&self) -> UdpSupport {
+        UdpSupport::Native
+    }
+
+    /// UDP over TCP, version 2 (sing's `uot`): a stream to the magic name,
+    /// not in connect mode, each datagram with its address.
+    fn open_udp<'a>(
+        &'a self,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, Result<BoxedPacketSocket, OutboundError>> {
+        Box::pin(async move {
+            let mut address = vec![3, UOT_MAGIC.len() as u8];
+            address.extend_from_slice(UOT_MAGIC.as_bytes());
+            address.extend_from_slice(&[0, 0]);
+            let stream = match tokio::time::timeout(opts.timeout, self.open(&address, opts)).await {
+                Ok(result) => result?,
+                Err(_) => return Err(OutboundError::Timeout),
+            };
+            // `isConnect` false; the target comes with the first datagram
+            Ok(Box::new(StreamUdp::new(stream, Framing::Uot, vec![0])) as BoxedPacketSocket)
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{AnyTlsScript, FakeAnyTls, TlsFixture, echo_server};
+    use crate::testing::{AnyTlsScript, FakeAnyTls, TlsFixture, echo_server, udp_echo_server};
     use rurge_config::policy::parse_policy;
     use rurge_config::spec::ParamReader;
     use rurge_config::spec::anytls::read_anytls;
     use rurge_config::spec::shadow_tls::read_shadow_tls;
     use rurge_config::{HostName, Span};
-    use rurge_net::connector::{DirectConnector, SystemResolve};
+    use rurge_net::connector::{DirectConnector, PacketSocket, SystemResolve};
     use std::net::SocketAddr;
     use std::path::Path;
     use std::time::Duration;
@@ -569,5 +599,61 @@ mod tests {
             "anytls: the host name cannot be sent to the server"
         );
         assert_eq!(fake.sessions(), 0);
+    }
+
+    async fn udp_answer(carrier: &dyn PacketSocket) -> (Vec<u8>, Target) {
+        let mut buf = [0u8; 1500];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(5), carrier.recv_from(&mut buf))
+            .await
+            .expect("an answer within the bound")
+            .unwrap();
+        (buf[..n].to_vec(), from)
+    }
+
+    async fn udp_roundtrip(carrier: &dyn PacketSocket, to: SocketAddr, payload: &[u8]) {
+        carrier.send_to(payload, &target(to)).await.unwrap();
+        assert_eq!(udp_answer(carrier).await, (payload.to_vec(), target(to)));
+    }
+
+    /// UDP over TCP v2: one stream to the magic name, not in connect mode,
+    /// whose request names the first datagram's target; every datagram
+    /// carries its own.
+    #[tokio::test]
+    async fn udp_goes_through_a_stream_of_its_own() {
+        let (one, two) = (udp_echo_server().await, udp_echo_server().await);
+        let (fixture, fake) = server(script("pw")).await;
+        let out = outbound(&line(&fake, ""), &fixture);
+        assert_eq!(out.udp(), UdpSupport::Native);
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        udp_roundtrip(carrier.as_ref(), one, b"to one").await;
+        udp_roundtrip(carrier.as_ref(), two, b"to two").await;
+        let streams = fake.streams();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(
+            (streams[0].atyp, streams[0].host.as_str(), streams[0].port),
+            (3, "sp.v2.udp-over-tcp.arpa", 0)
+        );
+        assert_eq!(fake.uot_requests(), [(0, one.to_string())]);
+        assert_eq!(fake.datagrams(), [one.to_string(), two.to_string()]);
+    }
+
+    /// Full cone: whoever reaches the server's end of the stream is heard,
+    /// under its own address.
+    #[tokio::test]
+    async fn anyone_may_answer_through_anytls() {
+        let echo = udp_echo_server().await;
+        let (fixture, fake) = server(script("pw")).await;
+        let out = outbound(&line(&fake, ""), &fixture);
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        udp_roundtrip(carrier.as_ref(), echo, b"hello").await;
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger
+            .send_to(b"unasked", fake.udp_outside()[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            udp_answer(carrier.as_ref()).await,
+            (b"unasked".to_vec(), target(stranger.local_addr().unwrap()))
+        );
     }
 }

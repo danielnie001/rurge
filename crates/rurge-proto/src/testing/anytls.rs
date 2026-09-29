@@ -1,6 +1,8 @@
 //! A scriptable AnyTLS server behind TLS (protocol version 2, or 1 on
-//! request). It never resolves a name.
+//! request); a stream to the UDP-over-TCP name relays datagrams
+//! (`udp::relay`). It never resolves a name.
 
+use super::udp::{self, UdpSeen, Wire};
 use super::{AbortOnDrop, TlsFixture};
 use crate::anytls::frame::{self, HEADER};
 use crate::anytls::padding::Scheme;
@@ -11,8 +13,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 
@@ -51,6 +52,7 @@ struct Seen {
     waste: AtomicUsize,
     streams: Mutex<Vec<RecordedStream>>,
     settings: Mutex<Vec<String>>,
+    udp: Arc<UdpSeen>,
     /// `kick`: bumped to close every connection parked on its next frame; a
     /// generation counter rather than `Notify` so a bump landing between two
     /// of a connection's loop iterations is not lost.
@@ -67,6 +69,7 @@ impl Default for Seen {
             waste: AtomicUsize::default(),
             streams: Mutex::default(),
             settings: Mutex::default(),
+            udp: Arc::default(),
             kick: watch::channel(0u64).0,
         }
     }
@@ -103,10 +106,16 @@ fn parse_addr(buf: &[u8]) -> Option<(u8, String, u16, usize)> {
     Some((atyp, host, port, used + 2))
 }
 
+type Reader = Box<dyn AsyncRead + Send + Unpin>;
+type Writer = Box<dyn AsyncWrite + Send + Unpin>;
+
 struct Live {
-    to_upstream: OwnedWriteHalf,
+    to_upstream: Writer,
     _reader: AbortOnDrop,
 }
+
+/// The UDP-over-TCP name (sing's `uot.MagicAddress`).
+const UOT_MAGIC: &str = "sp.v2.udp-over-tcp.arpa";
 
 /// After an alert: the frame is on the wire, and the connection is read to
 /// its end rather than closed over unread bytes, which would reset it and
@@ -235,15 +244,27 @@ async fn serve(
                         live.remove(&sid);
                         continue;
                     }
-                    let addr = match (script.connect_to, host.parse::<IpAddr>()) {
-                        (Some(addr), _) => Some(addr),
-                        (None, Ok(ip)) => Some(SocketAddr::new(ip, port)),
-                        // never resolves: a name without `connect_to` is a dead end
-                        (None, Err(_)) => None,
-                    };
-                    let upstream = match addr {
-                        Some(addr) => TcpStream::connect(addr).await.ok(),
-                        None => None,
+                    let upstream: Option<(Reader, Writer)> = if host == UOT_MAGIC {
+                        // datagrams through a pipe to the UDP relay
+                        let (ours, relay) = tokio::io::duplex(1 << 16);
+                        let (connect_to, seen) = (script.connect_to, seen.udp.clone());
+                        tokio::spawn(udp::relay(Box::new(relay), Wire::Uot, connect_to, seen));
+                        let (from, to) = tokio::io::split(ours);
+                        Some((Box::new(from), Box::new(to)))
+                    } else {
+                        let addr = match (script.connect_to, host.parse::<IpAddr>()) {
+                            (Some(addr), _) => Some(addr),
+                            (None, Ok(ip)) => Some(SocketAddr::new(ip, port)),
+                            // never resolves: a name without `connect_to` is a dead end
+                            (None, Err(_)) => None,
+                        };
+                        match addr {
+                            Some(addr) => TcpStream::connect(addr).await.ok().map(|tcp| {
+                                let (from, to) = tcp.into_split();
+                                (Box::new(from) as Reader, Box::new(to) as Writer)
+                            }),
+                            None => None,
+                        }
                     };
                     let Some(upstream) = upstream else {
                         if !script.v1 {
@@ -257,7 +278,7 @@ async fn serve(
                     if !script.v1 {
                         let _ = out.send(frame::frame(frame::SYNACK, sid, &[]));
                     }
-                    let (mut from_upstream, mut to_upstream) = upstream.into_split();
+                    let (mut from_upstream, mut to_upstream) = upstream;
                     to_upstream.write_all(&data[used..]).await?;
                     let out = out.clone();
                     let reader = tokio::spawn(async move {
@@ -367,5 +388,22 @@ impl FakeAnyTls {
     /// Padding bytes received: the authentication's and every `cmdWaste`.
     pub fn waste(&self) -> usize {
         self.seen.waste.load(Ordering::SeqCst)
+    }
+
+    /// Every UDP-over-TCP request: `(isConnect, target)`, the target as
+    /// `host:port`.
+    pub fn uot_requests(&self) -> Vec<(u8, String)> {
+        self.seen.udp.requests.lock().expect("requests").clone()
+    }
+
+    /// Every UDP datagram's target, `host:port`, in arrival order.
+    pub fn datagrams(&self) -> Vec<String> {
+        self.seen.udp.targets.lock().expect("targets").clone()
+    }
+
+    /// Where each UDP-over-TCP stream sends from: a datagram to one of these
+    /// goes back to that stream's client.
+    pub fn udp_outside(&self) -> Vec<SocketAddr> {
+        self.seen.udp.outside.lock().expect("outside").clone()
     }
 }

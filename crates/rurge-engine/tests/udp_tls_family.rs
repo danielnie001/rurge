@@ -1,5 +1,6 @@
 //! UDP through the TLS family (phase 2 M5b): a SOCKS5 UDP association into
-//! rurge, out through `trojan` (UDP ASSOCIATE) to a loopback fake.
+//! rurge, out through `trojan` (UDP ASSOCIATE) and `anytls` (UDP over TCP)
+//! to loopback fakes.
 
 mod common;
 use common::*;
@@ -93,6 +94,38 @@ async fn anyone_may_answer_through_trojan() {
     let (from, stranger, _) = a_stranger_writes(
         &format!(
             "P = trojan, 127.0.0.1, {}, {params}",
+            upstream.addr().port()
+        ),
+        || upstream.udp_outside()[0],
+    )
+    .await;
+    assert_eq!(from, stranger);
+}
+
+#[tokio::test]
+async fn udp_goes_through_anytls() {
+    let origin = TestServer::spawn().await;
+    let (upstream, params) = anytls_upstream(origin_addr(&origin)).await;
+    two_echoes_through(&format!(
+        "P = anytls, 127.0.0.1, {}, {params}",
+        upstream.addr().port()
+    ))
+    .await;
+    assert_eq!(
+        upstream.uot_requests().len(),
+        1,
+        "one stream carries both flows"
+    );
+    assert_eq!(upstream.datagrams().len(), 3);
+}
+
+#[tokio::test]
+async fn anyone_may_answer_through_anytls() {
+    let origin = TestServer::spawn().await;
+    let (upstream, params) = anytls_upstream(origin_addr(&origin)).await;
+    let (from, stranger, _) = a_stranger_writes(
+        &format!(
+            "P = anytls, 127.0.0.1, {}, {params}",
             upstream.addr().port()
         ),
         || upstream.udp_outside()[0],

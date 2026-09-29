@@ -1,5 +1,6 @@
-//! UDP over one byte stream (M5 design §7): `trojan`'s UDP ASSOCIATE
-//! carries every datagram, each way, as its address, its length and the
+//! UDP over one byte stream (M5 design §7): `trojan`'s UDP ASSOCIATE and
+//! AnyTLS's UDP over TCP (sing's `uot`, version 2, not in connect mode)
+//! carry every datagram, each way, as its address, its length and the
 //! payload. The request head goes out with the first datagram and names that
 //! datagram's target, as the reference clients do; the server answers
 //! nothing until then.
@@ -16,6 +17,10 @@ use tokio::sync::Mutex;
 pub(crate) enum Framing {
     /// `ATYP ADDR PORT LENGTH CRLF PAYLOAD` (trojan-gfw's protocol document).
     Trojan,
+    /// `TYPE ADDR PORT LENGTH PAYLOAD`, the types numbered 0 = IPv4,
+    /// 1 = IPv6, 2 = name (sing's `uot.AddrParser`); the head's own address
+    /// keeps SOCKS5's numbers.
+    Uot,
 }
 
 impl Framing {
@@ -23,6 +28,28 @@ impl Framing {
     fn label(self) -> &'static str {
         match self {
             Framing::Trojan => "trojan",
+            Framing::Uot => "anytls",
+        }
+    }
+
+    /// A datagram's address type on the wire, for SOCKS5's `atyp`.
+    fn wire_type(self, atyp: u8) -> u8 {
+        match (self, atyp) {
+            (Framing::Uot, 1) => 0,
+            (Framing::Uot, 4) => 1,
+            (Framing::Uot, 3) => 2,
+            _ => atyp,
+        }
+    }
+
+    /// SOCKS5's `atyp` for a datagram's address type on the wire.
+    fn socks_type(self, wire: u8) -> Option<u8> {
+        match (self, wire) {
+            (Framing::Trojan, 1 | 3 | 4) => Some(wire),
+            (Framing::Uot, 0) => Some(1),
+            (Framing::Uot, 1) => Some(4),
+            (Framing::Uot, 2) => Some(3),
+            _ => None,
         }
     }
 
@@ -42,6 +69,7 @@ impl Framing {
         out.extend(socks_addr(first).map_err(|e| self.unsendable(e))?);
         match self {
             Framing::Trojan => out.extend_from_slice(b"\r\n"),
+            Framing::Uot => {}
         }
         Ok(())
     }
@@ -54,10 +82,13 @@ impl Framing {
                 format!("{}: a datagram longer than 65535 bytes", self.label()),
             )
         })?;
-        out.extend(socks_addr(to).map_err(|e| self.unsendable(e))?);
+        let mut addr = socks_addr(to).map_err(|e| self.unsendable(e))?;
+        addr[0] = self.wire_type(addr[0]);
+        out.extend(addr);
         out.extend_from_slice(&len.to_be_bytes());
         match self {
             Framing::Trojan => out.extend_from_slice(b"\r\n"),
+            Framing::Uot => {}
         }
         out.extend_from_slice(payload);
         Ok(())
@@ -67,6 +98,7 @@ impl Framing {
     fn gap(self) -> usize {
         match self {
             Framing::Trojan => 2,
+            Framing::Uot => 0,
         }
     }
 }
@@ -150,19 +182,20 @@ impl PacketSocket for StreamUdp {
                 // ATYP, then as much of the address as it says
                 let mut addr = vec![0u8; 2];
                 fill(&mut reader, &mut addr, closed).await?;
-                let rest = match addr[0] {
+                let Some(atyp) = self.framing.socks_type(addr[0]) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{}: a datagram of an unknown address type",
+                            self.framing.label()
+                        ),
+                    ));
+                };
+                addr[0] = atyp;
+                let rest = match atyp {
                     1 => 4 - 1,
                     4 => 16 - 1,
-                    3 => usize::from(addr[1]),
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "{}: a datagram of an unknown address type",
-                                self.framing.label()
-                            ),
-                        ));
-                    }
+                    _ => usize::from(addr[1]),
                 };
                 // the rest of the address, the port, the length and the gap
                 let mut tail = vec![0u8; rest + 2 + 2 + self.framing.gap()];
@@ -283,5 +316,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&written(&mut server, 4).await, b"HEAD");
+    }
+
+    /// UDP over TCP numbers a datagram's address types its own way (0 / 1 /
+    /// 2) and has no CRLF; the head's address keeps SOCKS5's numbers.
+    #[tokio::test]
+    async fn udp_over_tcp_has_its_own_address_types() {
+        let (ours, mut server) = tokio::io::duplex(1 << 16);
+        let udp = StreamUdp::new(Box::new(ours), Framing::Uot, vec![0]);
+        udp.send_to(b"q", &Target::new(HostName::parse("1.2.3.4"), 53))
+            .await
+            .unwrap();
+        let expected: &[u8] = &[
+            0, 1, 1, 2, 3, 4, 0, 53, // not connect mode, the first target
+            0, 1, 2, 3, 4, 0, 53, 0, 1, b'q', // the datagram
+        ];
+        assert_eq!(written(&mut server, expected.len()).await, expected);
+        let mut wire = vec![2, 6];
+        wire.extend_from_slice(b"s.test");
+        wire.extend_from_slice(&[0, 80, 0, 1, b'z', 1]);
+        wire.extend_from_slice(&[0; 15]);
+        wire.extend_from_slice(&[1, 0, 7, 0, 2, b'a', b'b']);
+        server.write_all(&wire).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, from) = udp.recv_from(&mut buf).await.unwrap();
+        assert_eq!(
+            (&buf[..n], from),
+            (&b"z"[..], Target::new(HostName::parse("s.test"), 80))
+        );
+        let (n, from) = udp.recv_from(&mut buf).await.unwrap();
+        assert_eq!(
+            (&buf[..n], from),
+            (&b"ab"[..], Target::new(HostName::parse("::1"), 7))
+        );
+        // SOCKS5's 3 is no type of its own
+        server.write_all(&[3, 0]).await.unwrap();
+        let err = udp.recv_from(&mut buf).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "anytls: a datagram of an unknown address type"
+        );
     }
 }
