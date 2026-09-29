@@ -261,6 +261,16 @@ impl<'a> Imports<'a> {
                     ));
                     continue;
                 };
+                // a subscription must never start a program on this machine,
+                // whatever the modifier says (M4-D8)
+                if policy.kind == PolicyKind::External {
+                    diags.push(warn(
+                        g,
+                        codes::W_SET_LINES_SKIPPED,
+                        format!("`policy-path` line {line}: `external` policies are not imported from subscriptions; skipped"),
+                    ));
+                    continue;
+                }
                 if let Some(why) = reaches_into_profile(cfg, &policy, modifier) {
                     diags.push(warn(
                         g,
@@ -1646,6 +1656,40 @@ Plain = http, p.test, 80",
             [(
                 codes::W_SET_LINES_SKIPPED,
                 "policy group `G`: `policy-path` line 1: a subscription line's own `section-name` is not honoured (only `external-policy-modifier` may set it); skipped".to_string()
+            )]
+        );
+    }
+
+    /// An `external` line would have rurge start whatever program the
+    /// subscription names: never imported, whatever the modifier sets
+    /// (phase 2 M4 design 4.8, M3a deferred item #25).
+    #[test]
+    fn a_subscription_never_brings_an_external_policy() {
+        let cfg = profile(
+            "Corp = http, corp.test, 80",
+            "G = select, policy-path=https://sub.test/g, external-policy-modifier=\"exec=/bin/true\"",
+        );
+        let a = assemble(
+            &cfg,
+            &snapshots(
+                &cfg,
+                &[(
+                    "G",
+                    "Run = external, exec=/bin/sh, args=-c, args=evil, local-port=1080\n\
+Plain = http, p.test, 80",
+                )],
+            ),
+        );
+        assert_eq!(members(&a, "G"), ["Plain"]);
+        let skipped: Vec<_> = warnings(&a)
+            .into_iter()
+            .filter(|(code, _)| *code == codes::W_SET_LINES_SKIPPED)
+            .collect();
+        assert_eq!(
+            skipped,
+            [(
+                codes::W_SET_LINES_SKIPPED,
+                "policy group `G`: `policy-path` line 1: `external` policies are not imported from subscriptions; skipped".to_string()
             )]
         );
     }

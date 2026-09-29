@@ -45,6 +45,13 @@ impl<'a> ParamReader<'a> {
         policy.params.get(key)
     }
 
+    /// Every value of `key`, in the order written; marks it as read.
+    pub fn all(&mut self, key: &str) -> Vec<&'a str> {
+        self.touch(key);
+        let policy = self.policy;
+        policy.params.get_all(key)
+    }
+
     /// The positional value at `index` (after `type, server, port`).
     pub fn positional(&mut self, index: usize) -> Option<&'a str> {
         let policy = self.policy;
@@ -186,6 +193,17 @@ mod tests {
                 "policy `P`: unexpected positional value #3 ignored",
             ]
         );
+    }
+
+    #[test]
+    fn a_repeated_parameter_is_read_whole_and_in_order() {
+        let p = policy("external, exec=/bin/p, args=-D, args=1080, args=-N");
+        let mut r = ParamReader::new(&p);
+        assert_eq!(r.all("args"), ["-D", "1080", "-N"]);
+        assert!(r.all("absent").is_empty());
+        r.touch("exec");
+        // read once, not reported as unknown
+        assert!(r.finish().is_empty());
     }
 
     #[test]

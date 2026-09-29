@@ -22,9 +22,11 @@ const SECRET_KEYS: [&str; 7] = [
 /// `external-policy-modifier` can set any parameter, a password included. A
 /// policy's `test-url` can come from a subscription line and carry its
 /// token. A `[WireGuard]` peer's `preshared-key` is the manual's spelling;
-/// `pre-shared-key` stays for profiles written the other way. Over-redacting
-/// is the safe side for an endpoint whose purpose is safe output.
-const SECRET_PARAMS: [&str; 16] = [
+/// `pre-shared-key` stays for profiles written the other way. An `external`
+/// policy's `args` often carry a password (`sshpass -p …`, M4-D12).
+/// Over-redacting is the safe side for an endpoint whose purpose is safe
+/// output.
+const SECRET_PARAMS: [&str; 17] = [
     "password",
     "psk",
     "private-key",
@@ -41,6 +43,7 @@ const SECRET_PARAMS: [&str; 16] = [
     "policy-path",
     "external-policy-modifier",
     "test-url",
+    "args",
 ];
 const KEY_AT_KEYS: [&str; 4] = [
     "http-api",
@@ -555,6 +558,17 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
         assert_eq!(
             redact_profile("[General]\nproxy-test-url = http://p.test/\n"),
             "[General]\nproxy-test-url = http://p.test/\n"
+        );
+    }
+
+    /// Every `args` of an `external` line, quoted or not (M4-D12).
+    #[test]
+    fn an_external_line_loses_its_args() {
+        assert_eq!(
+            redact_definition(
+                "external, exec = \"/usr/bin/sshpass\", args = \"-p\", args = \"hunter2, really\", args=ssh, local-port = 1080"
+            ),
+            "external, exec = \"/usr/bin/sshpass\", args = ***, args = ***, args=***, local-port = 1080"
         );
     }
 }

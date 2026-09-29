@@ -2,6 +2,7 @@
 
 pub mod anytls;
 pub mod common;
+pub mod external;
 pub mod group;
 pub mod http;
 pub mod reader;
@@ -17,6 +18,7 @@ pub mod ws;
 
 pub use anytls::AnyTlsSpec;
 pub use common::{Applies, CommonOpts, IpVersion, Tristate};
+pub use external::ExternalSpec;
 pub use group::{
     GroupOutcome, GroupSpec, ImportOpts, PolicyPath, Priority, TestOpts, to_group_spec,
 };
