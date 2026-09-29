@@ -64,7 +64,7 @@ pub trait PacketSocket: Send + Sync {
 
 pub type BoxedPacketSocket = Box<dyn PacketSocket>;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Target {
     pub host: HostName,
     pub port: u16,

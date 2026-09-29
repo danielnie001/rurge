@@ -6,7 +6,7 @@ use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Query, State};
 use rurge_config::rule::ProtocolKind;
-use rurge_config::session::ListenerKind;
+use rurge_config::session::{ListenerKind, Transport};
 use rurge_engine::{RecordStatus, RequestRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -45,6 +45,7 @@ fn protocol_name(p: ProtocolKind) -> &'static str {
 pub struct RequestJson {
     pub id: u64,
     pub listener: &'static str,
+    pub transport: &'static str,
     pub src: String,
     pub dst: String,
     pub rule: Option<String>,
@@ -73,6 +74,10 @@ impl From<&RequestRecord> for RequestJson {
         RequestJson {
             id: r.id,
             listener: listener_name(r.listener),
+            transport: match r.transport {
+                Transport::Tcp => "tcp",
+                Transport::Udp => "udp",
+            },
             src: r.src.to_string(),
             dst: r.dst.clone(),
             rule: r.rule.clone(),
@@ -176,6 +181,7 @@ mod tests {
         RequestRecord {
             id,
             listener,
+            transport: Transport::Tcp,
             src: "127.0.0.1:1".parse().unwrap(),
             dst: "1.1.1.1:443".into(),
             rule: None,
@@ -214,6 +220,9 @@ mod tests {
         r.protocol = Some(rurge_config::rule::ProtocolKind::MtProto);
         let j = RequestJson::from(&r);
         assert_eq!(j.listener, "socks5");
+        assert_eq!(j.transport, "tcp");
+        r.transport = Transport::Udp;
+        assert_eq!(RequestJson::from(&r).transport, "udp");
         assert_eq!(j.status, "rejected");
         assert_eq!(j.reject_kind.as_deref(), Some("REJECT-TINYGIF"));
         assert_eq!(j.protocol, Some("mtproto"));

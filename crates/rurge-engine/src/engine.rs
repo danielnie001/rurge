@@ -16,7 +16,7 @@ use rurge_config::session::{ListenerKind, SessionInfo};
 use rurge_config::spec::{PolicySpec, ProtoSpec};
 use rurge_inbound::{
     DialError, Dialed, Dialer, FailKind, HttpAuth, HttpListener, ListenerOpts, Running,
-    SessionHandle, SessionOutcome, Socks5Listener,
+    SessionHandle, SessionOutcome, Socks5Listener, UdpAdmission, UdpClient,
 };
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
@@ -155,6 +155,12 @@ pub struct Engine {
     /// every dial reads the runtime and the registry as one pair
     /// (`snapshot`).
     generation: std::sync::Mutex<()>,
+    /// The engine itself, for the tasks a UDP association spawns.
+    me: std::sync::Weak<Engine>,
+    /// UDP associations being served (at most `udp::ASSOCIATIONS`).
+    udp_associations: std::sync::atomic::AtomicUsize,
+    /// When a UDP limit was last warned about.
+    udp_warned: std::sync::Mutex<Option<Instant>>,
 }
 
 impl Engine {
@@ -177,7 +183,7 @@ impl Engine {
         );
         shared.resolver.store(runtime.stack.resolver.clone());
         let receivers = runtime.subscriptions.take_receivers();
-        let engine = Arc::new(Engine {
+        let engine = Arc::new_cyclic(|me| Engine {
             runtime: ArcSwap::from_pointee(runtime),
             next_session: AtomicU64::new(0),
             sessions_root: CancellationToken::new(),
@@ -191,6 +197,9 @@ impl Engine {
             state: OnceLock::new(),
             shared,
             generation: std::sync::Mutex::new(()),
+            me: me.clone(),
+            udp_associations: std::sync::atomic::AtomicUsize::new(0),
+            udp_warned: std::sync::Mutex::new(None),
         });
         let rt = engine.runtime();
         if let Some(pc) = rt.dns_pipeline() {
@@ -230,7 +239,7 @@ impl Engine {
     /// two together, a subscription rebuild a registry for the same
     /// generation — so a session never picks a name by one generation's
     /// rules and resolves it in another generation's registry.
-    fn snapshot(&self) -> (Arc<Runtime>, Arc<PolicyRegistry>) {
+    pub(crate) fn snapshot(&self) -> (Arc<Runtime>, Arc<PolicyRegistry>) {
         let _generation = self.generation_lock();
         (self.runtime(), self.registry())
     }
@@ -361,6 +370,22 @@ impl Engine {
             tokio::spawn(o.join());
         }
         self.bind_listeners().await
+    }
+
+    /// A token every session's cancellation reaches (`cancel_sessions`).
+    pub(crate) fn session_token(&self) -> CancellationToken {
+        self.sessions_root.child_token()
+    }
+
+    /// Says, at most once a minute, that a UDP limit dropped something
+    /// (M5-D11).
+    pub(crate) fn warn_udp_limit(&self, what: &'static str) {
+        let now = Instant::now();
+        let mut last = self.udp_warned.lock().expect("udp warning");
+        if last.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(60)) {
+            *last = Some(now);
+            tracing::warn!("{what}; new flows are dropped");
+        }
     }
 
     pub(crate) fn new_handle(&self, session: SessionInfo) -> Arc<SessionHandle> {
@@ -568,8 +593,9 @@ impl Engine {
         })
     }
 
-    /// Mode / rule → policy, shared by `dial` and `dial_internal` (M4 §4.1).
-    async fn choose_policy(
+    /// Mode / rule → policy, shared by `dial`, `dial_internal` and the UDP
+    /// flows (M4 §4.1).
+    pub(crate) async fn choose_policy(
         &self,
         rt: &Runtime,
         registry: &PolicyRegistry,
@@ -610,7 +636,7 @@ impl Engine {
     }
 }
 
-enum Chosen {
+pub(crate) enum Chosen {
     Policy(PolicyRef),
     DnsFailed,
 }
@@ -1136,6 +1162,42 @@ impl Dialer for Engine {
     ) -> BoxFuture<'a, ()> {
         let idle = self.runtime().idle_timeout;
         Box::pin(crate::relay::pump(client, upstream, handle, idle))
+    }
+
+    fn admit_udp(&self) -> UdpAdmission {
+        if self.udp_associations.load(Ordering::Relaxed) < crate::udp::ASSOCIATIONS {
+            UdpAdmission::Accepted
+        } else {
+            self.warn_udp_limit("udp: too many associations");
+            UdpAdmission::Busy
+        }
+    }
+
+    fn associate<'a>(
+        &'a self,
+        client: Arc<dyn UdpClient>,
+        session: SessionInfo,
+        closed: CancellationToken,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let Some(engine) = self.me.upgrade() else {
+                return;
+            };
+            /// One association counted while it is served.
+            struct Counted<'e>(&'e std::sync::atomic::AtomicUsize);
+            impl Drop for Counted<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            let before = self.udp_associations.fetch_add(1, Ordering::Relaxed);
+            let _counted = Counted(&self.udp_associations);
+            if before >= crate::udp::ASSOCIATIONS {
+                self.warn_udp_limit("udp: too many associations");
+                return;
+            }
+            crate::udp::serve(engine, client, session, closed).await;
+        })
     }
 }
 

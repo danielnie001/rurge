@@ -3,7 +3,7 @@
 //! The M4 API reads these; nothing here reaches outside the process.
 
 use rurge_config::rule::ProtocolKind;
-use rurge_config::session::ListenerKind;
+use rurge_config::session::{ListenerKind, Transport};
 use rurge_inbound::{SessionHandle, SessionOutcome};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -27,6 +27,8 @@ pub enum RecordStatus {
 pub struct RequestRecord {
     pub id: u64,
     pub listener: ListenerKind,
+    /// TCP, or a UDP flow (phase 2 M5 design 5.2).
+    pub transport: Transport,
     pub src: SocketAddr,
     pub dst: String,
     pub rule: Option<String>,
@@ -73,6 +75,7 @@ fn record_of(h: &SessionHandle, outcome: Option<&SessionOutcome>) -> RequestReco
     RequestRecord {
         id: h.id(),
         listener: s.listener,
+        transport: s.transport,
         src: s.src,
         dst: format!("{}:{}", s.dst_host, s.dst_port),
         rule: h.rule(),

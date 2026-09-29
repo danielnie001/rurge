@@ -17,6 +17,7 @@ pub mod sniff;
 pub mod stack;
 pub mod state;
 mod subscriptions;
+mod udp;
 pub mod views;
 
 pub use control::{Control, LogLevel, Mode, ReloadReport};

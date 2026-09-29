@@ -208,6 +208,115 @@ pub async fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
     }
 }
 
+/// A SOCKS5 UDP association through rurge's listener (phase 2 M5): the
+/// control connection, the client's UDP socket, and the association's port.
+pub struct UdpAssociation {
+    pub control: TcpStream,
+    pub socket: tokio::net::UdpSocket,
+    pub relay: SocketAddr,
+}
+
+pub async fn udp_associate(socks: SocketAddr) -> UdpAssociation {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut control = TcpStream::connect(socks).await.unwrap();
+    control.write_all(&[5, 1, 0]).await.unwrap();
+    let mut method = [0u8; 2];
+    control.read_exact(&mut method).await.unwrap();
+    assert_eq!(method, [5, 0]);
+    let SocketAddr::V4(me) = socket.local_addr().unwrap() else {
+        panic!("loopback is v4")
+    };
+    let mut request = vec![5, 3, 0, 1];
+    request.extend_from_slice(&me.ip().octets());
+    request.extend_from_slice(&me.port().to_be_bytes());
+    control.write_all(&request).await.unwrap();
+    let mut reply = [0u8; 10];
+    control.read_exact(&mut reply).await.unwrap();
+    assert_eq!((reply[1], reply[3]), (0, 1), "{reply:?}");
+    let relay = SocketAddr::from((
+        [reply[4], reply[5], reply[6], reply[7]],
+        u16::from_be_bytes([reply[8], reply[9]]),
+    ));
+    UdpAssociation {
+        control,
+        socket,
+        relay,
+    }
+}
+
+impl UdpAssociation {
+    /// Sends `payload` to `host:port` (an IP literal or a name).
+    pub async fn send(&self, host: &str, port: u16, payload: &[u8]) {
+        let mut datagram = vec![0, 0, 0];
+        match host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(v4)) => {
+                datagram.push(1);
+                datagram.extend_from_slice(&v4.octets());
+            }
+            Ok(std::net::IpAddr::V6(v6)) => {
+                datagram.push(4);
+                datagram.extend_from_slice(&v6.octets());
+            }
+            Err(_) => {
+                datagram.push(3);
+                datagram.push(host.len() as u8);
+                datagram.extend_from_slice(host.as_bytes());
+            }
+        }
+        datagram.extend_from_slice(&port.to_be_bytes());
+        datagram.extend_from_slice(payload);
+        self.socket.send_to(&datagram, self.relay).await.unwrap();
+    }
+
+    /// The next datagram: where it says it came from (`ip:port`) and its payload.
+    pub async fn recv(&self) -> (SocketAddr, Vec<u8>) {
+        let mut buf = [0u8; 2048];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_secs(5), self.socket.recv_from(&mut buf))
+                .await
+                .expect("a datagram comes back")
+                .unwrap();
+        assert_eq!(from, self.relay);
+        assert_eq!(&buf[..3], [0, 0, 0]);
+        let (ip, rest): (std::net::IpAddr, usize) = match buf[3] {
+            1 => (<[u8; 4]>::try_from(&buf[4..8]).unwrap().into(), 8),
+            4 => (<[u8; 16]>::try_from(&buf[4..20]).unwrap().into(), 20),
+            other => panic!("address type {other}"),
+        };
+        let port = u16::from_be_bytes([buf[rest], buf[rest + 1]]);
+        (SocketAddr::new(ip, port), buf[rest + 2..n].to_vec())
+    }
+
+    /// Whether nothing comes back within `window` (only to observe that
+    /// nothing happens).
+    pub async fn quiet_for(&self, window: Duration) -> bool {
+        let mut buf = [0u8; 2048];
+        tokio::time::timeout(window, self.socket.recv_from(&mut buf))
+            .await
+            .is_err()
+    }
+}
+
+/// A loopback UDP server answering every datagram with itself; it notes
+/// who wrote to it.
+pub async fn udp_echo() -> (SocketAddr, Arc<std::sync::Mutex<Vec<SocketAddr>>>) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    let seen: Arc<std::sync::Mutex<Vec<SocketAddr>>> = Arc::default();
+    let log = seen.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            let Ok((n, from)) = socket.recv_from(&mut buf).await else {
+                continue;
+            };
+            log.lock().unwrap().push(from);
+            let _ = socket.send_to(&buf[..n], from).await;
+        }
+    });
+    (addr, seen)
+}
+
 /// One request/response over a fresh connection to rurge's HTTP listener.
 pub async fn plain_get(proxy: SocketAddr, url: &str, host: &str) -> String {
     let mut s = TcpStream::connect(proxy).await.unwrap();
