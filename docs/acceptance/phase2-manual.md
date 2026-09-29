@@ -142,7 +142,7 @@
 - [ ] 重载时改了这一行（如多加一个 `args = "-v"`）而 `local-port` 不变：重载后第一个请求返回 200，只剩一个 `ssh` 进程（新的那个），日志里旧程序有 `external: the program stopped`。
 - [ ] 未知主机：把服务器换成一台主机密钥不在 `known_hosts` 里的（或临时改名 `known_hosts`），带着 `BatchMode=yes`：请求失败（不挂住），`<数据目录>/external/Ext.log` 里有 `ssh` 给出的原因（如 `Host key verification failed.`）。
 - [ ] 脱敏：`GET /v1/policies/detail?policy_name=Ext` 与 `GET /v1/profiles/current` 里每个 `args` 都是 `***`；日志（含 `--log-level verbose`）里搜不到服务器地址与用户名。
-- [ ] UDP（M5a）：配置里写 `udp-relay=true`，让它的 `ssh -D` 换成一个支持 SOCKS5 UDP 的外部程序（`ssh -D` 不支持 UDP），经 rurge 的 SOCKS5 UDP 往返一次（见下面 M5a 一节的客户端）。
+- [ ] UDP（M5a）：配置里写 `udp-relay=true`，把 `ssh -D` 换成一个支持 SOCKS5 UDP 的外部程序（`ssh -D` 不支持 UDP），经 rurge 的 SOCKS5 UDP 往返一次（见下面 M5a 一节的客户端）。
 - [ ] 订阅：把一行 `external` 放进自己的订阅文件，重载后该行被跳过，`rurge check` 报 `` `external` policies are not imported from subscriptions ``。
 
 ## M5a　UDP 地基

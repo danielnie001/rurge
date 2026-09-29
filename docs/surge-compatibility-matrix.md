@@ -380,10 +380,10 @@
 
 | 项 | Surge 行为 | rurge | 阶段 |
 | --- | --- | --- | --- |
-| `udp-relay`（布尔；默认 false） | 适用 SOCKS5 / SOCKS5-TLS / Shadowsocks / External / HTTP/2 CONNECT（RFC 9298） | ✅ | 2 | M5a：`socks5` / `socks5-tls` / `external` 已生效；Shadowsocks 与 HTTP/2 CONNECT 随 M6 |
+| `udp-relay`（布尔；默认 false） | 适用 SOCKS5 / SOCKS5-TLS / Shadowsocks / External / HTTP/2 CONNECT（RFC 9298） | ✅ M5a：`socks5` / `socks5-tls` / `external` 已生效；Shadowsocks 与 HTTP/2 CONNECT 随 M6 | 2 |
 | `udp-port`（端口；默认主端口） | 适用 Shadowsocks / Snell | ✅ | 2 |
 | 自动支持 UDP 的协议：Snell v3+、VMess、Trojan、TUIC、Hysteria 2、MASQUE、AnyTLS（UDP over TCP）、WireGuard、Tailscale | | ✅ | 2 |
-| 不支持 UDP 的协议：HTTP / HTTPS、Trust Tunnel、SSH | 受 `udp-policy-not-supported-behaviour` 控制 | ✅ | 2 | M5a 已实现；`underlying-proxy` 的底层策略不支持 UDP 时，经它的 UDP 流失败并写 `via <底层策略>: the underlying policy cannot carry UDP` |
+| 不支持 UDP 的协议：HTTP / HTTPS、Trust Tunnel、SSH | 受 `udp-policy-not-supported-behaviour` 控制 | ✅ M5a 已实现；`underlying-proxy` 的底层策略不支持 UDP 时，经它的 UDP 流失败并写 `via <底层策略>: the underlying policy cannot carry UDP` | 2 |
 | DIRECT / REJECT 系始终处理 UDP | | ✅ | 1 |
 | UDP 测试：通过中继向 `hostname@ipv4` 做 DNS 查询 | `proxy-test-udp` / `test-udp` | ✅ | 2 |
 
