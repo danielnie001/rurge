@@ -154,11 +154,8 @@ impl Socks5Outbound {
         let (control, relay) =
             negotiate_bound(control, &UDP_ASSOCIATE, self.credentials.as_ref()).await?;
         let socket = self.connector.open_udp(opts).await?;
-        Ok(Box::new(Socks5Udp::new(
-            control,
-            relay_of(relay, &self.server.host),
-            socket,
-        )))
+        let udp = Socks5Udp::open(control, relay_of(relay, &self.server.host), socket).await?;
+        Ok(Box::new(udp))
     }
 
     async fn handshake(
@@ -211,20 +208,34 @@ fn parse_udp(datagram: &[u8]) -> Option<(Target, usize)> {
 /// through `socket`. The association ends when either side closes the
 /// control connection (RFC 1928 §7): this carrier then fails.
 pub(crate) struct Socks5Udp {
+    /// The relay as the carrier resolved it when the association opened:
+    /// every datagram goes there.
     relay: Target,
-    /// The relay as the carrier resolves it, looked up on first receive.
-    relay_ip: tokio::sync::OnceCell<Option<IpAddr>>,
+    /// Its address, when the carrier resolved it to one: only datagrams
+    /// from there are the relay's. A chained carrier keeps names.
+    relay_ip: Option<IpAddr>,
     socket: BoxedPacketSocket,
     closed: CancellationToken,
     _control: AbortOnDrop,
 }
 
 impl Socks5Udp {
-    pub(crate) fn new(
+    /// The association on `control`, whose datagrams go to `relay` through
+    /// `socket`. The relay is looked up once, here: sending and the source
+    /// filter both use that answer.
+    pub(crate) async fn open(
         mut control: BoxedStream,
         relay: Target,
         socket: BoxedPacketSocket,
-    ) -> Socks5Udp {
+    ) -> Result<Socks5Udp, OutboundError> {
+        let relay = socket
+            .resolve(&relay)
+            .await
+            .map_err(|e| proxy(format!("cannot look up the UDP relay: {e}")))?;
+        let relay_ip = match relay.host {
+            HostName::Ip(ip) => Some(ip),
+            HostName::Domain(_) => None,
+        };
         let closed = CancellationToken::new();
         let watch = closed.clone();
         // nothing more comes on the control connection: its end is the
@@ -234,13 +245,13 @@ impl Socks5Udp {
             while matches!(control.read(&mut sink).await, Ok(n) if n > 0) {}
             watch.cancel();
         });
-        Socks5Udp {
+        Ok(Socks5Udp {
             relay,
-            relay_ip: tokio::sync::OnceCell::new(),
+            relay_ip,
             socket,
             closed,
             _control: AbortOnDrop(task),
-        }
+        })
     }
 }
 
@@ -274,6 +285,8 @@ impl PacketSocket for Socks5Udp {
         })
     }
 
+    /// `buf` takes the datagram with its SOCKS5 header (up to 262 bytes
+    /// more than the payload): give it 64 KiB.
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
         Box::pin(async move {
             loop {
@@ -281,20 +294,8 @@ impl PacketSocket for Socks5Udp {
                     _ = self.closed.cancelled() => return Err(association_closed()),
                     got = self.socket.recv_from(buf) => got?,
                 };
-                let relay_ip = self
-                    .relay_ip
-                    .get_or_init(|| async {
-                        match self.socket.resolve(&self.relay).await {
-                            Ok(Target {
-                                host: HostName::Ip(ip),
-                                ..
-                            }) => Some(ip),
-                            _ => None,
-                        }
-                    })
-                    .await;
                 // only the relay speaks on this association
-                if !from_relay(*relay_ip, &sender) {
+                if !from_relay(self.relay_ip, &sender) {
                     continue;
                 }
                 // what the relay cannot have meant (a fragment, garbage) is dropped
@@ -644,6 +645,56 @@ mod tests {
         assert!(
             from_relay(None, &from("10.0.0.2", 1)),
             "a named relay is not filtered"
+        );
+    }
+
+    /// A carrier that counts its lookups; `None` = every lookup fails.
+    struct Lookups(Arc<std::sync::atomic::AtomicUsize>, Option<IpAddr>);
+
+    impl PacketSocket for Lookups {
+        fn resolve<'a>(&'a self, to: &'a Target) -> BoxFuture<'a, io::Result<Target>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let got = match self.1 {
+                Some(ip) => Ok(Target::new(HostName::Ip(ip), to.port)),
+                None => Err(io::Error::new(io::ErrorKind::NotFound, "no such name")),
+            };
+            Box::pin(std::future::ready(got))
+        }
+        fn send_to<'a>(&'a self, _: &'a [u8], to: &'a Target) -> BoxFuture<'a, io::Result<()>> {
+            assert_eq!(to.host, HostName::parse("10.0.0.7"), "the looked-up relay");
+            Box::pin(std::future::ready(Ok(())))
+        }
+        fn recv_from<'a>(&'a self, _: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// The relay is looked up once, when the association opens, and every
+    /// datagram goes to that answer; a failed lookup fails the open.
+    #[tokio::test]
+    async fn the_relay_is_looked_up_once() {
+        let relay = Target::new(HostName::parse("relay.test"), 7);
+        let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (control, _peer) = tokio::io::duplex(64);
+        let socket = Lookups(lookups.clone(), Some("10.0.0.7".parse().unwrap()));
+        let udp = Socks5Udp::open(Box::new(control), relay.clone(), Box::new(socket))
+            .await
+            .unwrap();
+        let to = Target::new(HostName::parse("10.0.0.1"), 53);
+        udp.send_to(b"one", &to).await.unwrap();
+        udp.send_to(b"two", &to).await.unwrap();
+        assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(udp.relay_ip, Some("10.0.0.7".parse().unwrap()));
+
+        let (control, _peer) = tokio::io::duplex(64);
+        let socket = Lookups(lookups.clone(), None);
+        let err = Socks5Udp::open(Box::new(control), relay, Box::new(socket))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "socks5: cannot look up the UDP relay: no such name"
         );
     }
 

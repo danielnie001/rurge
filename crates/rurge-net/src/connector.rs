@@ -59,6 +59,9 @@ pub trait PacketSocket: Send + Sync {
     /// Sends `buf` as one datagram to `to`.
     fn send_to<'a>(&'a self, buf: &'a [u8], to: &'a Target) -> BoxFuture<'a, io::Result<()>>;
     /// Receives one datagram into `buf`: its length, and where it came from.
+    /// `buf` should hold 64 KiB: Windows fails the receive (`WSAEMSGSIZE`)
+    /// when a datagram does not fit, and a carrier that strips a header
+    /// (SOCKS5) receives the header too.
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>>;
 }
 

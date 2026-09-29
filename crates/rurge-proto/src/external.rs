@@ -388,7 +388,7 @@ impl ExternalOutbound {
         let socket = DirectConnector::new(Arc::new(SystemResolve))
             .open_udp(&ConnectOpts::default())
             .await?;
-        Ok(Box::new(Socks5Udp::new(control, relay, socket)))
+        Ok(Box::new(Socks5Udp::open(control, relay, socket).await?))
     }
 
     /// A connection to the program's SOCKS5 port, starting the program
