@@ -3,8 +3,9 @@
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::SessionInfo;
 use rurge_net::BoxFuture;
-use rurge_net::connector::BoxedStream;
+use rurge_net::connector::{BoxedStream, Target};
 use rurge_proto::RejectKind;
+use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -361,6 +362,25 @@ pub enum DialError {
     },
 }
 
+/// The client's side of one UDP association (phase 2 M5 design 5.1), as the
+/// engine sees it. `recv` and `send` may run at the same time.
+pub trait UdpClient: Send + Sync {
+    /// The next datagram from the client: its length in `buf`, and where it goes.
+    fn recv<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>>;
+    /// Sends `payload` to the client as a datagram from `from`.
+    fn send<'a>(&'a self, payload: &'a [u8], from: &'a Target) -> BoxFuture<'a, io::Result<()>>;
+}
+
+/// Whether a UDP association may start (`Dialer::admit_udp`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UdpAdmission {
+    Accepted,
+    /// The dialer carries no UDP: "command not supported".
+    NotSupported,
+    /// Too many associations right now: "general failure".
+    Busy,
+}
+
 /// Implemented by the engine: rules → policy → outbound (`dial`), then the
 /// counted bidirectional copy (`relay`, which finishes the handle).
 pub trait Dialer: Send + Sync {
@@ -371,6 +391,24 @@ pub trait Dialer: Send + Sync {
         upstream: BoxedStream,
         handle: Arc<SessionHandle>,
     ) -> BoxFuture<'a, ()>;
+    /// Asked before a UDP association is set up.
+    fn admit_udp(&self) -> UdpAdmission {
+        UdpAdmission::NotSupported
+    }
+    /// Serves one UDP association until `closed` fires (the control
+    /// connection ended). `session` describes the client — its address, the
+    /// listener — and each flow of the association starts from a copy of it
+    /// with its own destination. Returning early ends the association: the
+    /// listener closes the control connection.
+    fn associate<'a>(
+        &'a self,
+        client: Arc<dyn UdpClient>,
+        session: SessionInfo,
+        closed: CancellationToken,
+    ) -> BoxFuture<'a, ()> {
+        let _ = (client, session, closed);
+        Box::pin(std::future::ready(()))
+    }
 }
 
 #[cfg(test)]

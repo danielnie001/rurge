@@ -11,8 +11,12 @@ pub mod session;
 pub mod socks5;
 #[cfg(test)]
 pub(crate) mod testing;
+mod udp;
 
 pub use http::HttpListener;
 pub use listener::{HttpAuth, ListenerOpts, Running};
-pub use session::{Counting, DialError, Dialed, Dialer, FailKind, SessionHandle, SessionOutcome};
+pub use session::{
+    Counting, DialError, Dialed, Dialer, FailKind, SessionHandle, SessionOutcome, UdpAdmission,
+    UdpClient,
+};
 pub use socks5::Socks5Listener;

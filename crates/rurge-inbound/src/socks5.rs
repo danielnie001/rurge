@@ -1,7 +1,9 @@
-//! SOCKS5 (RFC 1928) listener: no authentication, CONNECT only (M3 design §6.3).
+//! SOCKS5 (RFC 1928) listener: no authentication, CONNECT (M3 design §6.3)
+//! and UDP ASSOCIATE (phase 2 M5 design 5.1).
 
 use crate::listener::{ListenerOpts, Running, bind, serve};
-use crate::session::{DialError, Dialer, FailKind, SessionOutcome};
+use crate::session::{DialError, Dialer, FailKind, SessionOutcome, UdpAdmission};
+use crate::udp::Socks5UdpClient;
 use rurge_config::HostName;
 use rurge_config::session::{ListenerKind, SessionInfo, Transport};
 use rurge_proto::RejectKind;
@@ -9,13 +11,14 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio_util::sync::CancellationToken;
 
 const VERSION: u8 = 0x05;
 const METHOD_NONE: u8 = 0x00;
 const METHOD_UNACCEPTABLE: u8 = 0xff;
 const CMD_CONNECT: u8 = 0x01;
+const CMD_UDP_ASSOCIATE: u8 = 0x03;
 const ATYP_V4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_V6: u8 = 0x04;
@@ -62,7 +65,31 @@ fn reply(code: u8) -> [u8; 10] {
     [VERSION, code, 0x00, ATYP_V4, 0, 0, 0, 0, 0, 0]
 }
 
-async fn read_request(stream: &mut TcpStream) -> io::Result<Result<(HostName, u16), u8>> {
+/// A success reply naming `bound`.
+fn reply_bound(bound: SocketAddr) -> Vec<u8> {
+    let mut out = vec![VERSION, REP_SUCCESS, 0x00];
+    match bound.ip() {
+        IpAddr::V4(v4) => {
+            out.push(ATYP_V4);
+            out.extend_from_slice(&v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            out.push(ATYP_V6);
+            out.extend_from_slice(&v6.octets());
+        }
+    }
+    out.extend_from_slice(&bound.port().to_be_bytes());
+    out
+}
+
+/// A request the listener serves: the command and its address.
+struct Request {
+    command: u8,
+    host: HostName,
+    port: u16,
+}
+
+async fn read_request(stream: &mut TcpStream) -> io::Result<Result<Request, u8>> {
     let mut head = [0u8; 4];
     stream.read_exact(&mut head).await?;
     if head[0] != VERSION {
@@ -114,15 +141,19 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Result<(HostName, u1
         _ => return Ok(Err(REP_ADDR_TYPE_NOT_SUPPORTED)),
     };
     let port = stream.read_u16().await?;
-    if head[1] != CMD_CONNECT {
+    if head[1] != CMD_CONNECT && head[1] != CMD_UDP_ASSOCIATE {
         return Ok(Err(REP_COMMAND_NOT_SUPPORTED));
     }
-    Ok(Ok((host, port)))
+    Ok(Ok(Request {
+        command: head[1],
+        host,
+        port,
+    }))
 }
 
-/// Method negotiation plus the CONNECT request. `Ok(None)` means the client
-/// was already answered (unacceptable method) and the session is over.
-async fn handshake(stream: &mut TcpStream) -> io::Result<Option<Result<(HostName, u16), u8>>> {
+/// Method negotiation plus the request. `Ok(None)` means the client was
+/// already answered (unacceptable method) and the session is over.
+async fn handshake(stream: &mut TcpStream) -> io::Result<Option<Result<Request, u8>>> {
     let mut hello = [0u8; 2];
     stream.read_exact(&mut hello).await?;
     if hello[0] != VERSION {
@@ -153,14 +184,21 @@ async fn handle(
     let negotiated = tokio::time::timeout(opts.handshake_timeout, handshake(&mut stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socks5 handshake timed out"))??;
-    let (host, port) = match negotiated {
-        Some(Ok(target)) => target,
+    let Request {
+        command,
+        host,
+        port,
+    } = match negotiated {
+        Some(Ok(request)) => request,
         Some(Err(code)) => {
             stream.write_all(&reply(code)).await?;
             return Ok(());
         }
         None => return Ok(()),
     };
+    if command == CMD_UDP_ASSOCIATE {
+        return associate(stream, peer, dialer, port).await;
+    }
     let mut session = SessionInfo::tcp(host, port);
     session.src = peer;
     session.in_port = local.port();
@@ -205,10 +243,66 @@ async fn handle(
     }
 }
 
+/// UDP ASSOCIATE: a UDP port on the address the client reached this
+/// listener at, served by the dialer until the control connection ends
+/// (RFC 1928 §7). `declared_port` is the client's source port when it said
+/// (0: learnt from its first datagram).
+async fn associate(
+    mut control: TcpStream,
+    peer: SocketAddr,
+    dialer: Arc<dyn Dialer>,
+    declared_port: u16,
+) -> io::Result<()> {
+    match dialer.admit_udp() {
+        UdpAdmission::Accepted => {}
+        UdpAdmission::NotSupported => {
+            return control.write_all(&reply(REP_COMMAND_NOT_SUPPORTED)).await;
+        }
+        UdpAdmission::Busy => return control.write_all(&reply(REP_GENERAL_FAILURE)).await,
+    }
+    let here = control.local_addr()?;
+    let socket = match UdpSocket::bind(SocketAddr::new(here.ip(), 0)).await {
+        Ok(socket) => socket,
+        Err(e) => {
+            control.write_all(&reply(REP_GENERAL_FAILURE)).await?;
+            return Err(e);
+        }
+    };
+    control
+        .write_all(&reply_bound(socket.local_addr()?))
+        .await?;
+    let client = Arc::new(Socks5UdpClient::new(socket, peer.ip(), declared_port));
+    let mut session = SessionInfo::udp(HostName::Ip(here.ip()), 0);
+    session.src = peer;
+    session.in_port = here.port();
+    session.listener = ListenerKind::Socks5;
+    let closed = CancellationToken::new();
+    let serving = dialer.associate(client, session, closed.clone());
+    tokio::pin!(serving);
+    // whatever else the client writes on the control connection means nothing
+    let mut sink = [0u8; 256];
+    loop {
+        tokio::select! {
+            _ = &mut serving => return Ok(()),
+            read = control.read(&mut sink) => {
+                if !matches!(read, Ok(n) if n > 0) {
+                    closed.cancel();
+                    serving.await;
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::UdpClient;
     use crate::testing::{FakeDialer, echo_server};
+    use rurge_net::BoxFuture;
+    use rurge_net::connector::Target;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
@@ -339,6 +433,202 @@ mod tests {
         req.extend_from_slice(&7u16.to_be_bytes());
         s.write_all(&req).await.unwrap();
         assert_eq!(read_reply(&mut s).await[1], REP_COMMAND_NOT_SUPPORTED);
+    }
+
+    /// Echoes every datagram back as coming from where it went; records
+    /// the association's session and whether it saw `closed`.
+    struct UdpEcho {
+        admission: UdpAdmission,
+        session: std::sync::Mutex<Option<SessionInfo>>,
+        ended: AtomicBool,
+    }
+
+    impl UdpEcho {
+        fn new(admission: UdpAdmission) -> Arc<UdpEcho> {
+            Arc::new(UdpEcho {
+                admission,
+                session: std::sync::Mutex::new(None),
+                ended: AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl Dialer for UdpEcho {
+        fn dial<'a>(
+            &'a self,
+            _session: SessionInfo,
+        ) -> BoxFuture<'a, Result<crate::session::Dialed, DialError>> {
+            unreachable!("UDP only")
+        }
+
+        fn relay<'a>(
+            &'a self,
+            _client: rurge_net::connector::BoxedStream,
+            _upstream: rurge_net::connector::BoxedStream,
+            _handle: Arc<crate::session::SessionHandle>,
+        ) -> BoxFuture<'a, ()> {
+            unreachable!("UDP only")
+        }
+
+        fn admit_udp(&self) -> UdpAdmission {
+            self.admission
+        }
+
+        fn associate<'a>(
+            &'a self,
+            client: Arc<dyn UdpClient>,
+            session: SessionInfo,
+            closed: CancellationToken,
+        ) -> BoxFuture<'a, ()> {
+            *self.session.lock().unwrap() = Some(session);
+            Box::pin(async move {
+                let mut buf = [0u8; 2048];
+                loop {
+                    tokio::select! {
+                        _ = closed.cancelled() => break,
+                        got = client.recv(&mut buf) => {
+                            let Ok((n, to)) = got else { break };
+                            let _ = client.send(&buf[..n], &to).await;
+                        }
+                    }
+                }
+                self.ended.store(true, Ordering::SeqCst);
+            })
+        }
+    }
+
+    async fn udp_listener(dialer: Arc<UdpEcho>) -> Running {
+        Socks5Listener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            dialer,
+            ListenerOpts {
+                kind: ListenerKind::Socks5,
+                ..ListenerOpts::default()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// UDP ASSOCIATE with the client's source address; the reply names the
+    /// association's port.
+    async fn associate_from(addr: SocketAddr, source: SocketAddr) -> (TcpStream, SocketAddr) {
+        let mut s = negotiate(addr).await;
+        let SocketAddr::V4(v4) = source else {
+            panic!("loopback is v4")
+        };
+        let mut req = vec![VERSION, CMD_UDP_ASSOCIATE, 0, ATYP_V4];
+        req.extend_from_slice(&v4.ip().octets());
+        req.extend_from_slice(&v4.port().to_be_bytes());
+        s.write_all(&req).await.unwrap();
+        let r = read_reply(&mut s).await;
+        assert_eq!((r[1], r[3]), (REP_SUCCESS, ATYP_V4));
+        let bound = SocketAddr::from((
+            Ipv4Addr::new(r[4], r[5], r[6], r[7]),
+            u16::from_be_bytes([r[8], r[9]]),
+        ));
+        (s, bound)
+    }
+
+    fn datagram(to: &Target, payload: &[u8]) -> Vec<u8> {
+        let mut out = crate::udp::header(to).unwrap();
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[tokio::test]
+    async fn udp_associate_carries_datagrams_both_ways() {
+        let dialer = UdpEcho::new(UdpAdmission::Accepted);
+        let running = udp_listener(dialer.clone()).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_control, relay) =
+            associate_from(running.local_addr, client.local_addr().unwrap()).await;
+        assert_eq!(relay.ip(), running.local_addr.ip());
+        let to = Target::new(HostName::parse("game.test"), 27015);
+        client
+            .send_to(&datagram(&to, b"ping"), relay)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+            .await
+            .expect("an answer")
+            .unwrap();
+        assert_eq!(from, relay);
+        assert_eq!(&buf[..n], &datagram(&to, b"ping")[..]);
+        let session = dialer.session.lock().unwrap().clone().unwrap();
+        assert_eq!(session.transport, Transport::Udp);
+        assert_eq!(session.listener, ListenerKind::Socks5);
+        assert_eq!(session.src.ip(), client.local_addr().unwrap().ip());
+    }
+
+    /// Only the client's own address may use the association; fragments
+    /// are dropped.
+    #[tokio::test]
+    async fn strangers_and_fragments_are_ignored() {
+        let dialer = UdpEcho::new(UdpAdmission::Accepted);
+        let running = udp_listener(dialer).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_control, relay) =
+            associate_from(running.local_addr, client.local_addr().unwrap()).await;
+        let to = Target::new(HostName::parse("10.0.0.1"), 53);
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger.send_to(&datagram(&to, b"x"), relay).await.unwrap();
+        let mut fragment = datagram(&to, b"y");
+        fragment[2] = 1;
+        client.send_to(&fragment, relay).await.unwrap();
+        let mut buf = [0u8; 64];
+        // a window to observe that nothing comes back
+        for socket in [&stranger, &client] {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), socket.recv_from(&mut buf))
+                    .await
+                    .is_err()
+            );
+        }
+        client.send_to(&datagram(&to, b"z"), relay).await.unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+            .await
+            .expect("an answer")
+            .unwrap();
+        assert_eq!(&buf[..n], &datagram(&to, b"z")[..]);
+    }
+
+    /// The association ends with its control connection.
+    #[tokio::test]
+    async fn closing_the_control_connection_ends_the_association() {
+        let dialer = UdpEcho::new(UdpAdmission::Accepted);
+        let running = udp_listener(dialer.clone()).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (control, _relay) =
+            associate_from(running.local_addr, client.local_addr().unwrap()).await;
+        drop(control);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !dialer.ended.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the association lives on"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A dialer without UDP answers "command not supported"; one at its
+    /// limit "general failure".
+    #[tokio::test]
+    async fn udp_associate_can_be_refused() {
+        for (admission, code) in [
+            (UdpAdmission::NotSupported, REP_COMMAND_NOT_SUPPORTED),
+            (UdpAdmission::Busy, REP_GENERAL_FAILURE),
+        ] {
+            let running = udp_listener(UdpEcho::new(admission)).await;
+            let mut s = negotiate(running.local_addr).await;
+            s.write_all(&[VERSION, CMD_UDP_ASSOCIATE, 0, ATYP_V4, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            assert_eq!(read_reply(&mut s).await[1], code, "{admission:?}");
+        }
     }
 
     /// An empty ATYP=0x03 name has nothing to dial: answer 0x01 and stop.
