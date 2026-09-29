@@ -8,7 +8,7 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use rurge_config::rule::{
     HostnameType, Pattern, PortExpr, ProcessPattern, ProtocolKind, ResourceRef, RuleKind, SubRule,
 };
-use rurge_config::session::{ProcessInfo, SessionInfo};
+use rurge_config::session::{ProcessInfo, SessionInfo, Transport};
 use rurge_config::{Glob, GlobOptions};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -320,7 +320,14 @@ impl Matcher {
             Matcher::SrcPort(p) => p.matches(s.src.port()).into(),
             Matcher::InPort(p) => p.matches(s.in_port).into(),
             Matcher::SrcIp(net) => net.contains(&s.src.ip()).into(),
-            Matcher::Protocol(k) => (s.protocol == Some(*k)).into(),
+            // `PROTOCOL,UDP` also matches QUIC and STUN (manual), and
+            // `PROTOCOL,TCP` every TCP session: the transport decides
+            Matcher::Protocol(k) => (s.protocol == Some(*k)
+                || matches!(
+                    (k, s.transport),
+                    (ProtocolKind::Tcp, Transport::Tcp) | (ProtocolKind::Udp, Transport::Udp)
+                ))
+            .into(),
             Matcher::HostnameType(t) => (s.hostname_type() == *t).into(),
             Matcher::And(subs) => {
                 let mut needs = false;
@@ -683,6 +690,13 @@ mod tests {
         assert_eq!(eval("SRC-IP,192.168.1.9", &s), Verdict::Match);
         assert_eq!(eval("PROTOCOL,HTTPS", &s), Verdict::Match);
         assert_eq!(eval("PROTOCOL,HTTP", &s), Verdict::NoMatch);
+        assert_eq!(eval("PROTOCOL,TCP", &s), Verdict::Match);
+        assert_eq!(eval("PROTOCOL,UDP", &s), Verdict::NoMatch);
+        let mut quic = SessionInfo::udp(HostName::parse("example.com"), 443);
+        quic.protocol = Some(ProtocolKind::Quic);
+        assert_eq!(eval("PROTOCOL,QUIC", &quic), Verdict::Match);
+        assert_eq!(eval("PROTOCOL,UDP", &quic), Verdict::Match);
+        assert_eq!(eval("PROTOCOL,TCP", &quic), Verdict::NoMatch);
         assert_eq!(eval("HOSTNAME-TYPE,DOMAIN", &s), Verdict::Match);
         assert_eq!(
             eval("HOSTNAME-TYPE,IPv4", &session("1.1.1.1")),

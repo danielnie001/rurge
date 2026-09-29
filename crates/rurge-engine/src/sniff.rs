@@ -1,5 +1,31 @@
 //! TLS ClientHello SNI parsing (M3b, observability only). Best-effort: any
-//! malformed, truncated, or non-TLS input returns `None`.
+//! malformed, truncated, or non-TLS input returns `None`. And QUIC Initial
+//! recognition for UDP flows (phase 2 M5 design 6.1).
+
+/// QUIC v2's version number (RFC 9369), whose Initial packets carry type 1.
+const QUIC_V2: u32 = 0x6b33_43cf;
+
+/// Whether `datagram` is a QUIC Initial packet: a long header with the
+/// fixed bit, a version other than 0 (version negotiation), the Initial
+/// type — 0 in v1 and the drafts, 1 in v2 — and the 1200 bytes a client's
+/// Initial is padded to (RFC 9000 §14.1, §17.2.2; RFC 9369 §3.2).
+pub fn is_quic_initial(datagram: &[u8]) -> bool {
+    let Some(&first) = datagram.first() else {
+        return false;
+    };
+    let Some(version) = datagram.get(1..5) else {
+        return false;
+    };
+    let version = u32::from_be_bytes([version[0], version[1], version[2], version[3]]);
+    let kind = (first >> 4) & 0b11;
+    datagram.len() >= 1200
+        && first & 0xc0 == 0xc0
+        && match version {
+            0 => false,
+            QUIC_V2 => kind == 0b01,
+            _ => kind == 0b00,
+        }
+}
 
 /// Extracts the SNI host_name from a single TLS ClientHello record, if present.
 pub fn parse_sni(record: &[u8]) -> Option<String> {
@@ -54,6 +80,44 @@ pub fn parse_sni(record: &[u8]) -> Option<String> {
         q += 4 + elen;
     }
     None
+}
+
+#[cfg(test)]
+mod quic_tests {
+    use super::*;
+
+    fn initial(first: u8, version: u32, len: usize) -> Vec<u8> {
+        let mut out = vec![first];
+        out.extend_from_slice(&version.to_be_bytes());
+        out.resize(len, 0);
+        out
+    }
+
+    #[test]
+    fn a_quic_initial_is_recognised() {
+        assert!(is_quic_initial(&initial(0xc3, 1, 1200)), "v1");
+        assert!(is_quic_initial(&initial(0xd3, QUIC_V2, 1250)), "v2");
+        assert!(
+            is_quic_initial(&initial(0xc0, 0xff00_001d, 1200)),
+            "draft 29"
+        );
+        assert!(!is_quic_initial(&initial(0xc3, 1, 1199)), "unpadded");
+        assert!(
+            !is_quic_initial(&initial(0xe3, 1, 1200)),
+            "a handshake packet"
+        );
+        assert!(
+            !is_quic_initial(&initial(0xc3, QUIC_V2, 1200)),
+            "v2 type 0 is 0-RTT"
+        );
+        assert!(
+            !is_quic_initial(&initial(0xc3, 0, 1200)),
+            "version negotiation"
+        );
+        assert!(!is_quic_initial(&initial(0x43, 1, 1200)), "a short header");
+        assert!(!is_quic_initial(&[0xc3, 0, 0]));
+        assert!(!is_quic_initial(&[]));
+    }
 }
 
 #[cfg(test)]

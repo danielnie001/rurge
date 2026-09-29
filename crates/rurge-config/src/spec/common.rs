@@ -128,7 +128,6 @@ pub(crate) fn read_common(
     }
     let ecn_present = r.has("ecn");
     let mut ecn = r.choice("ecn", &TRISTATES).unwrap_or_default();
-    let block_quic_present = r.has("block-quic");
     let block_quic = r.choice("block-quic", &TRISTATES).unwrap_or_default();
     let mut test_url = None;
     if let Some(v) = r.str("test-url") {
@@ -184,7 +183,6 @@ pub(crate) fn read_common(
             ("dns-follow-interface", dns_follow_interface),
             ("tfo", tfo),
             ("test-udp", test_udp.is_some()),
-            ("block-quic", block_quic_present),
             ("ecn", ecn_present && applies == Applies::Proxy),
         ];
         notes
@@ -263,13 +261,7 @@ mod tests {
         );
         assert_eq!(
             notes.inert,
-            [
-                "dns-follow-interface",
-                "tfo",
-                "test-udp",
-                "block-quic",
-                "ecn"
-            ]
+            ["dns-follow-interface", "tfo", "test-udp", "ecn"]
         );
         assert_eq!(notes.ios_only, ["hybrid"]);
     }

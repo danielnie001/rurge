@@ -5,8 +5,11 @@
 
 use crate::auto::{EVALUATION_FAILED, resolve_ready};
 use crate::engine::{CONNECT_TIMEOUT, Chosen, Engine};
+use rurge_config::general::{BlockQuicGlobal, UdpFallback};
 use rurge_config::policy::Builtin;
+use rurge_config::rule::{PolicyRef, ProtocolKind};
 use rurge_config::session::SessionInfo;
+use rurge_config::spec::Tristate;
 use rurge_inbound::{SessionHandle, SessionOutcome, UdpClient};
 use rurge_net::connector::{ConnectOpts, PacketSocket, Target};
 use rurge_policy::TerminalKind;
@@ -33,6 +36,22 @@ pub const ASSOCIATIONS: usize = 4096;
 const QUEUE: usize = 64;
 /// Room for the largest datagram.
 const DATAGRAM: usize = 65536;
+
+/// Whether a QUIC flow is blocked (M5 design 6.2): the global setting
+/// overrides; `per-policy` asks the terminal policy's own `block-quic`,
+/// whose `auto` blocks proxies and lets DIRECT through.
+pub(crate) fn quic_blocked(global: BlockQuicGlobal, policy: Tristate, direct: bool) -> bool {
+    match global {
+        BlockQuicGlobal::AlwaysAllow => false,
+        BlockQuicGlobal::All => true,
+        BlockQuicGlobal::AllProxy => !direct,
+        BlockQuicGlobal::PerPolicy => match policy {
+            Tristate::On => true,
+            Tristate::Off => false,
+            Tristate::Auto => !direct,
+        },
+    }
+}
 
 /// When a flow is reclaimed: `FLOW_IDLE` after its last datagram either
 /// way, and a DNS flow `DNS_LINGER` after its first answer.
@@ -305,6 +324,12 @@ async fn run_flow(
     let mut session = association.template.clone();
     session.dst_host = to.host.clone();
     session.dst_port = to.port;
+    // the rules see what the first datagram is (`PROTOCOL,QUIC`)
+    session.protocol = Some(if to.port == 443 && crate::sniff::is_quic_initial(&first) {
+        ProtocolKind::Quic
+    } else {
+        ProtocolKind::Udp
+    });
     let handle = engine.new_handle(session);
     let opened = tokio::select! {
         _ = association.ended.cancelled() => Err(SessionOutcome::Completed),
@@ -367,10 +392,34 @@ async fn open(
     if resolution.terminal == TerminalKind::Reject {
         return Err(SessionOutcome::Rejected(reject_kind(&resolution.chain)));
     }
-    let outbound = resolution.outbound.clone();
-    if outbound.udp() == UdpSupport::Unsupported {
-        handle.set_error("policy does not support UDP");
+    let direct = resolution.terminal == TerminalKind::Direct;
+    let setting = resolution
+        .chain
+        .last()
+        .and_then(|name| registry.spec(name))
+        .map(|spec| spec.common.block_quic)
+        .unwrap_or_default();
+    if handle.session().protocol == Some(ProtocolKind::Quic)
+        && quic_blocked(rt.config.general.block_quic, setting, direct)
+    {
+        // the browser falls back to TCP
+        handle.set_error("QUIC blocked");
         return Err(SessionOutcome::Rejected(RejectKind::Reject));
+    }
+    let mut outbound = resolution.outbound.clone();
+    if outbound.udp() == UdpSupport::Unsupported {
+        match rt.config.general.udp_policy_not_supported_behaviour {
+            UdpFallback::Reject => {
+                handle.set_error("policy does not support UDP");
+                return Err(SessionOutcome::Rejected(RejectKind::Reject));
+            }
+            UdpFallback::Direct => {
+                handle.set_error("policy does not support UDP; sent through DIRECT");
+                outbound = registry
+                    .resolve_with(&PolicyRef::Builtin(Builtin::Direct), &ctx)
+                    .outbound;
+            }
+        }
     }
     let carrier = association
         .carriers
@@ -453,6 +502,29 @@ async fn drain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn which_quic_flows_are_blocked() {
+        use BlockQuicGlobal::*;
+        use Tristate::*;
+        // (global, policy's block-quic, terminal is DIRECT) → blocked
+        for (global, policy, direct, blocked) in [
+            (PerPolicy, Auto, false, true),
+            (PerPolicy, Auto, true, false),
+            (PerPolicy, On, true, true),
+            (PerPolicy, Off, false, false),
+            (AllProxy, Off, false, true),
+            (AllProxy, On, true, false),
+            (All, Off, true, true),
+            (AlwaysAllow, On, false, false),
+        ] {
+            assert_eq!(
+                quic_blocked(global, policy, direct),
+                blocked,
+                "{global:?} {policy:?} direct={direct}"
+            );
+        }
+    }
 
     /// A flow lives `FLOW_IDLE` past its last datagram; a DNS flow no longer
     /// than `DNS_LINGER` past its first answer.

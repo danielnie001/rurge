@@ -16,6 +16,22 @@ fn udp_records(h: &Harness) -> Vec<RequestRecord> {
         .collect()
 }
 
+/// Waits until `count` UDP flows have a policy: routed, or already
+/// finished. Ending the association earlier would end the flows still
+/// being routed.
+async fn routed(h: &Harness, count: usize) {
+    wait_until("the UDP flows to be routed", || {
+        let log = h.engine.request_log();
+        log.active()
+            .into_iter()
+            .chain(log.recent(4096))
+            .filter(|r| r.transport == Transport::Udp && !r.policy.is_empty())
+            .count()
+            >= count
+    })
+    .await;
+}
+
 /// Waits until `count` UDP records are finished, and returns them.
 async fn finished(h: &Harness, count: usize) -> Vec<RequestRecord> {
     wait_until("the UDP flows to finish", || udp_records(h).len() >= count).await;
@@ -138,6 +154,136 @@ async fn a_policy_without_udp_rejects() {
     assert_eq!(
         records[0].error.as_deref(),
         Some("policy does not support UDP")
+    );
+}
+
+/// A QUIC Initial-looking datagram (padded to 1200 bytes).
+fn quic_initial() -> Vec<u8> {
+    let mut out = vec![0xc3, 0, 0, 0, 1];
+    out.resize(1200, 0);
+    out
+}
+
+/// `block-quic` (M5 design 6.2): QUIC to UDP 443 is dropped with a note —
+/// the browser falls back to TCP — while other UDP to 443 goes through.
+#[tokio::test]
+async fn block_quic_drops_quic_and_nothing_else() {
+    let h = harness(Profile {
+        general: "block-quic = all",
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association.send("quic.test", 443, &quic_initial()).await;
+    association.send("alt.test", 443, b"not quic").await;
+    routed(&h, 2).await;
+    drop(association);
+    let records = finished(&h, 2).await;
+    let by_dst = |dst: &str| records.iter().find(|r| r.dst == dst).unwrap();
+    let quic = by_dst("quic.test:443");
+    assert_eq!(quic.status, RecordStatus::Rejected("REJECT".into()));
+    assert_eq!(quic.error.as_deref(), Some("QUIC blocked"));
+    assert_eq!(quic.protocol, Some(rurge_config::rule::ProtocolKind::Quic));
+    let plain = by_dst("alt.test:443");
+    assert_eq!(plain.status, RecordStatus::Completed, "{plain:?}");
+    assert_eq!(plain.protocol, Some(rurge_config::rule::ProtocolKind::Udp));
+}
+
+/// `per-policy`: a proxy's `auto` blocks, its `off` lets QUIC through;
+/// DIRECT's `auto` lets it through.
+#[tokio::test]
+async fn per_policy_block_quic_follows_the_terminal_policy() {
+    let up = FakeSocks5::spawn(Socks5Script::default()).await;
+    let proxies = format!(
+        "Auto = socks5, 127.0.0.1, {0}, udp-relay=true
+Off = socks5, 127.0.0.1, {0}, udp-relay=true, block-quic=off",
+        up.addr().port()
+    );
+    let h = harness(Profile {
+        proxies: &proxies,
+        rules: "DOMAIN,auto.test,Auto
+DOMAIN,off.test,Off",
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    for host in ["auto.test", "off.test", "direct.test"] {
+        association.send(host, 443, &quic_initial()).await;
+    }
+    routed(&h, 3).await;
+    drop(association);
+    let records = finished(&h, 3).await;
+    let blocked = |dst: &str| {
+        records
+            .iter()
+            .find(|r| r.dst == dst)
+            .unwrap()
+            .error
+            .as_deref()
+            == Some("QUIC blocked")
+    };
+    assert!(blocked("auto.test:443"));
+    assert!(!blocked("off.test:443"));
+    assert!(!blocked("direct.test:443"));
+}
+
+/// `PROTOCOL,UDP` matches every UDP flow; `PROTOCOL,QUIC` the QUIC ones.
+#[tokio::test]
+async fn protocol_rules_see_udp_and_quic() {
+    let h = harness(Profile {
+        rules: "PROTOCOL,QUIC,REJECT-DROP
+PROTOCOL,UDP,REJECT-NO-DROP",
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association.send("q.test", 443, &quic_initial()).await;
+    association.send("u.test", 53, b"dns?").await;
+    routed(&h, 2).await;
+    drop(association);
+    let records = finished(&h, 2).await;
+    let status = |dst: &str| {
+        records
+            .iter()
+            .find(|r| r.dst == dst)
+            .unwrap()
+            .status
+            .clone()
+    };
+    assert_eq!(
+        status("q.test:443"),
+        RecordStatus::Rejected("REJECT-DROP".into())
+    );
+    assert_eq!(
+        status("u.test:53"),
+        RecordStatus::Rejected("REJECT-NO-DROP".into())
+    );
+}
+
+/// `udp-policy-not-supported-behaviour = DIRECT`: a policy without UDP
+/// sends through DIRECT instead, and the record says so.
+#[tokio::test]
+async fn a_policy_without_udp_may_fall_back_to_direct() {
+    let h = harness(Profile {
+        general: "udp-policy-not-supported-behaviour = DIRECT",
+        proxies: "Web = http, 127.0.0.1, 9",
+        rules: "DOMAIN,web.test,Web",
+        ..Profile::default()
+    })
+    .await;
+    let (echo, _) = udp_echo().await;
+    h.dns.set("web.test", &["127.0.0.1"], &[], 60);
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("web.test", echo.port(), b"via direct")
+        .await;
+    assert_eq!(association.recv().await, (echo, b"via direct".to_vec()));
+    drop(association);
+    let records = finished(&h, 1).await;
+    assert_eq!(records[0].policy, ["Web"]);
+    assert_eq!(
+        records[0].error.as_deref(),
+        Some("policy does not support UDP; sent through DIRECT")
     );
 }
 
