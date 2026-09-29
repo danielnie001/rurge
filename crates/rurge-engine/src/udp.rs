@@ -44,6 +44,11 @@ pub(crate) fn deadline(last: Instant, answered: Option<Instant>, port: u16) -> I
     }
 }
 
+/// The clock the flows keep time by (tokio's, so tests can pause it).
+fn now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
+
 struct Times {
     last: Instant,
     answered: Option<Instant>,
@@ -54,6 +59,8 @@ struct Flow {
     handle: Arc<SessionHandle>,
     port: u16,
     times: Mutex<Times>,
+    /// Woken by an answer, which may bring the deadline forward.
+    wake: tokio::sync::Notify,
 }
 
 impl Flow {
@@ -62,21 +69,41 @@ impl Flow {
             handle,
             port,
             times: Mutex::new(Times {
-                last: Instant::now(),
+                last: now(),
                 answered: None,
             }),
+            wake: tokio::sync::Notify::new(),
         }
     }
 
     fn touch(&self) {
-        self.times.lock().expect("flow times").last = Instant::now();
+        self.times.lock().expect("flow times").last = now();
     }
 
     fn answered(&self) {
-        let now = Instant::now();
-        let mut times = self.times.lock().expect("flow times");
-        times.last = now;
-        times.answered.get_or_insert(now);
+        let now = now();
+        {
+            let mut times = self.times.lock().expect("flow times");
+            times.last = now;
+            times.answered.get_or_insert(now);
+        }
+        self.wake.notify_one();
+    }
+
+    /// Returns when the flow is due for reclaim, following the deadline as
+    /// answers move it.
+    async fn idle(&self) {
+        loop {
+            let wake = self.deadline();
+            tokio::select! {
+                _ = self.wake.notified() => {}
+                _ = tokio::time::sleep_until(wake.into()) => {
+                    if now() >= self.deadline() {
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     fn deadline(&self) -> Instant {
@@ -116,12 +143,23 @@ impl Routes {
 /// An outbound's carrier within one association, and the task handing its
 /// datagrams back to the client.
 struct Carrier {
+    /// Keeps the outbound this carrier belongs to alive, so the cache key
+    /// (its address) cannot be reused by another while the carrier is.
+    outbound: OutboundRef,
     socket: Arc<dyn PacketSocket>,
     routes: Arc<Routes>,
+    /// Fires when the receive task has ended: nothing comes back any more.
+    dead: CancellationToken,
     _receive: AbortOnDropHandle<()>,
 }
 
-async fn receive(socket: Arc<dyn PacketSocket>, routes: Arc<Routes>, client: Arc<dyn UdpClient>) {
+async fn receive(
+    socket: Arc<dyn PacketSocket>,
+    routes: Arc<Routes>,
+    client: Arc<dyn UdpClient>,
+    dead: CancellationToken,
+) {
+    let _dead = dead.drop_guard();
     let mut buf = vec![0u8; DATAGRAM];
     while let Ok((n, from)) = socket.recv_from(&mut buf).await {
         if let Some(flow) = routes.flow_for(&from) {
@@ -154,7 +192,10 @@ impl Carriers {
             .or_default()
             .clone();
         let mut held = slot.lock().await;
-        if let Some(carrier) = held.upgrade() {
+        if let Some(carrier) = held
+            .upgrade()
+            .filter(|c| Arc::ptr_eq(&c.outbound, outbound) && !c.dead.is_cancelled())
+        {
             return Ok(carrier);
         }
         let opts = ConnectOpts {
@@ -162,10 +203,18 @@ impl Carriers {
         };
         let socket: Arc<dyn PacketSocket> = Arc::from(outbound.open_udp(&opts).await?);
         let routes = Arc::new(Routes::default());
-        let task = tokio::spawn(receive(socket.clone(), routes.clone(), client.clone()));
+        let dead = CancellationToken::new();
+        let task = tokio::spawn(receive(
+            socket.clone(),
+            routes.clone(),
+            client.clone(),
+            dead.clone(),
+        ));
         let carrier = Arc::new(Carrier {
+            outbound: outbound.clone(),
             socket,
             routes,
+            dead,
             _receive: AbortOnDropHandle::new(task),
         });
         *held = Arc::downgrade(&carrier);
@@ -259,6 +308,7 @@ async fn run_flow(
     let handle = engine.new_handle(session);
     let opened = tokio::select! {
         _ = association.ended.cancelled() => Err(SessionOutcome::Completed),
+        _ = handle.token().cancelled() => Err(SessionOutcome::Completed),
         opened = open(&engine, &association, &handle, &to) => opened,
     };
     match opened {
@@ -266,12 +316,14 @@ async fn run_flow(
             let outcome =
                 forward(&association, &flow, &carrier, &send_to, first, &mut waiting).await;
             carrier.routes.remove(&flow);
+            waiting.close();
             handle.finish(outcome);
         }
         Err(outcome) => {
             handle.finish(outcome);
             // the flow stays, dropping what comes for it, until it is idle
-            drain(&association, &mut waiting).await;
+            drain(&association, &handle, &mut waiting).await;
+            waiting.close();
         }
     }
     let _ = association.done.send((to, id));
@@ -363,30 +415,34 @@ async fn forward(
             flow.handle.add_up(datagram.len() as u64);
             flow.touch();
         }
-        let wake = flow.deadline();
         tokio::select! {
             _ = association.ended.cancelled() => return SessionOutcome::Completed,
+            _ = flow.handle.token().cancelled() => return SessionOutcome::Completed,
+            _ = carrier.dead.cancelled() => {
+                return failed(&flow.handle, "the outbound's UDP socket has closed");
+            }
             got = waiting.recv() => match got {
                 Some(datagram) => next = Some(datagram),
                 None => return SessionOutcome::Completed,
             },
-            _ = tokio::time::sleep_until(wake.into()) => {
-                if Instant::now() >= flow.deadline() {
-                    return SessionOutcome::Completed;
-                }
-            }
+            _ = flow.idle() => return SessionOutcome::Completed,
         }
     }
 }
 
 /// Drops what comes for a flow that could not start, until it is idle.
-async fn drain(association: &Association, waiting: &mut mpsc::Receiver<Vec<u8>>) {
-    let mut last = Instant::now();
+async fn drain(
+    association: &Association,
+    handle: &SessionHandle,
+    waiting: &mut mpsc::Receiver<Vec<u8>>,
+) {
+    let mut last = now();
     loop {
         tokio::select! {
             _ = association.ended.cancelled() => return,
+            _ = handle.token().cancelled() => return,
             got = waiting.recv() => match got {
-                Some(_) => last = Instant::now(),
+                Some(_) => last = now(),
                 None => return,
             },
             _ = tokio::time::sleep_until((last + FLOW_IDLE).into()) => return,
@@ -397,6 +453,30 @@ async fn drain(association: &Association, waiting: &mut mpsc::Receiver<Vec<u8>>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An answer to a DNS query brings the flow's end forward to
+    /// `DNS_LINGER` later, though it was already waiting for `FLOW_IDLE`.
+    #[tokio::test(start_paused = true)]
+    async fn a_dns_flow_ends_soon_after_its_answer() {
+        let flow = Arc::new(Flow::new(
+            SessionHandle::new(
+                1,
+                SessionInfo::udp(rurge_config::HostName::parse("10.0.0.1"), 53),
+            ),
+            53,
+        ));
+        let waiting = tokio::spawn({
+            let flow = flow.clone();
+            async move { flow.idle().await }
+        });
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!waiting.is_finished());
+        flow.answered();
+        tokio::time::sleep(DNS_LINGER - Duration::from_secs(1)).await;
+        assert!(!waiting.is_finished());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(waiting.is_finished(), "ended long before FLOW_IDLE");
+    }
 
     /// A flow lives `FLOW_IDLE` past its last datagram; a DNS flow no longer
     /// than `DNS_LINGER` past its first answer.

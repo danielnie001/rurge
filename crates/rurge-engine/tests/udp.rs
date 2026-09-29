@@ -169,8 +169,7 @@ async fn closing_the_control_connection_ends_every_flow() {
 }
 
 /// At most `FLOWS_PER_ASSOCIATION` flows (M5-D11); the rest are dropped.
-/// Datagrams to closed ports also check that a port-unreachable answer
-/// does not break the carrier.
+/// The datagrams go to closed ports, so every flow stays active.
 #[tokio::test]
 async fn an_association_has_at_most_1024_flows() {
     let h = harness(Profile::default()).await;
@@ -211,4 +210,61 @@ async fn an_association_has_at_most_1024_flows() {
     // the log keeps the newest 1000 records: the late destination would be among them
     let late = format!("127.0.0.1:{}", echo.port());
     assert!(!udp_records(&h).iter().any(|r| r.dst == late));
+}
+
+/// Killing a flow through the API ends it and finishes its record; the next
+/// datagram to the same destination starts a new flow.
+#[tokio::test]
+async fn a_killed_flow_ends_and_the_next_datagram_starts_a_new_one() {
+    let h = harness(Profile::default()).await;
+    let (echo, _) = udp_echo().await;
+    let association = udp_associate(h.socks()).await;
+    association.send("127.0.0.1", echo.port(), b"one").await;
+    association.recv().await;
+    let id = h
+        .engine
+        .request_log()
+        .active()
+        .iter()
+        .find(|r| r.transport == Transport::Udp)
+        .expect("the flow is active")
+        .id;
+    assert!(h.engine.kill(id));
+    let records = finished(&h, 1).await;
+    assert_eq!(records[0].id, id);
+    association.send("127.0.0.1", echo.port(), b"two").await;
+    assert_eq!(association.recv().await, (echo, b"two".to_vec()));
+    let records = finished(&h, 1).await;
+    assert_eq!(records.len(), 1, "the second flow is still active");
+}
+
+/// A carrier whose upstream association has closed fails its flows, and the
+/// next flow opens a new one.
+#[tokio::test]
+async fn a_dead_carrier_is_not_used_again() {
+    let (echo, _) = udp_echo().await;
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        udp_close_after: Some(1),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "Up = socks5, 127.0.0.1, {}, udp-relay=true",
+            upstream.addr().port()
+        ),
+        rules: "IP-CIDR,127.0.0.1/32,Up,no-resolve",
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association.send("127.0.0.1", echo.port(), b"one").await;
+    assert_eq!(association.recv().await, (echo, b"one".to_vec()));
+    // the upstream hangs up after that answer: the flow fails
+    let records = finished(&h, 1).await;
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    // another destination: a new carrier, and it works
+    let (other, _) = udp_echo().await;
+    association.send("127.0.0.1", other.port(), b"two").await;
+    assert_eq!(association.recv().await, (other, b"two".to_vec()));
 }
