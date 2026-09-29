@@ -10399,6 +10399,8 @@ git commit -m "docs: M4b WireGuard——兼容性清单、README、CLAUDE.md、�
 | 终审 | Task 1：不认识的键与 `peer` 字段报 `W0001`，引用第一个 `=` 之前的全部文字 | 键名转小写后是 1–32 个 a-z、0-9、`-` 字符时才引用，否则说 `an unknown line ignored` / `peer <n>: an unknown field ignored`（仍是 `W0001`）；新增用例 `key_material_is_never_quoted_as_an_unknown_name` | Base64 密钥以 `=` 结尾：单独成行的密钥、或把 `=` 误写成 `:` 的 `private-key: <密钥>`，会把密钥（转成小写）写进诊断（终审发现） | 6f20f60 |
 | 终审 | `Device::start` 在 `TUNNELS` 的临界区里建协议栈；`stack.rs` 设 Reno 的注释沿用 P3 ① 已被否定的理由；`stack.rs` / `device.rs` 的 trace 日志里 peer 从 0 计；`send_all` 遍历 `std::mem::take(out)`；`resolver` 字段、`TestCase.key` 与根 `Cargo.toml` 里 boringtun 的注释不全或不准 | 临界区之前建好新隧道的 `Shared` / `Stack` 并格式化第一个握手（共用或被拒时丢掉）；注释改为正确的理由（0.12 从不拿拥塞窗口与在途字节数比较，显式设 Reno 是为了将来尊重窗口的版本不回落到 0.12 的 Cubic；用例断言不变）；trace 日志的 peer 从 1 计；`send_all` 遍历 `out.drain(..)`、遇到 `closed` 即停；三处注释改正 | 临界区里的 panic 会让 `TUNNELS` 在余下的进程里一直中毒；其余是注释、日志与缓冲容量的小修（终审发现与延后事项） | 63760d9 |
 | 终审 | Task 10 的文档 | 兼容性清单 4.2 节 `wireguard` 行补上：载体发送失败或 peer 不再回应握手时换载体（网络变化后不必重启）、隧道内 DNS 的重发与等第一次握手及"作答"的含义、每条连接 256 KiB 缓冲（单条连接每个往返至多约 256 KiB）、DNS 会话防环（有 endpoint 写成域名时改走直连）、同一份配置里两个节的冲突、名字记录轮换时的换载体；`encrypted-dns-follow-outbound-mode` 两行补上防环一句；`WireGuard 生命周期` 行指向载体替换；`WireGuard 测试` 行与 `docs/api/phase2.md` 的原生测速说法改正；手工验收加"网络变化"与"WARP 启动后的第一次查询"两项；本表六行与「延后事项」#9 ～ #30 | 终审发现与终审保留的延后事项 | 本轮的文档提交 |
+| 合并后 | 终审修正里的"载体发送失败就换新载体" | 只在发送时本机地址或路由已失效（`AddrNotAvailable`、`NetworkUnreachable`、`HostUnreachable`、`NetworkDown`）时换；别的发送错误只丢掉那一个报文；新增用例 `a_passing_send_error_keeps_the_carrier`；注释里的 `(P10 / A)` 等评审分段标签改为 `(P10)` | 终审修正的复审：macOS / BSD 上接口队列满时的 `ENOBUFS` 也会换载体（新套接字、强制握手、丢掉在途报文） | 合并后的修正 |
+| 合并后 | 文档 | M4 设计新增第 20 节「M4b 实施期的订正」（6.7 原生测速的结果、6.5 换载体、6.3 隧道内 DNS、sing-box 互操作的连法、未知键名）；兼容性清单写明只在本机地址或路由失效时换载体、peer 一直不回应时每约 90 秒重试并告警、一族有地址而另一族没有回应时只缓存有地址的一族；手工验收"网络变化"改为约两分钟内、"服务端停掉"写明每约 90 秒一条告警；`CLAUDE.md` 的 M4b 摘要补上换载体与 DNS 重发 | 终审修正的复审 | 合并后的修正 |
 
 ## 延后事项
 
@@ -10434,3 +10436,4 @@ git commit -m "docs: M4b WireGuard——兼容性清单、README、CLAUDE.md、�
 | 28 | `close()` 不唤醒 `handshake()` 的等待者，`handshake()` 也不看 `closed`：被更晚的配置接替时，正在跑的原生测速要等满 `test-timeout` + 10 秒（占着 `TestBook` 的一个名额）才失败 | M8 |
 | 29 | 没有引擎用例：对原生测速的 `wireguard` 策略 `POST /v1/policies/test` 带 `url` 时按那个 URL 测（P7） | M8 |
 | 30 | CI 观察：Linux 上 UDP 缓冲封顶在 `rmem_max`（约 416 KiB），低于假对端要的 8 MiB——首次在 Linux 上跑时留意 `a_large_transfer_goes_through_whole` | 首次推送后看 CI |
+| 31 | `established()`（问隧道内 DNS 之前等第一次握手）不看隧道是否已被接替，等的也是任一 peer 的握手：遇到接替时要等到拨号时限；多个 peer 时，DNS 服务器所在 peer 的发起包丢了而别的 peer 已握手，查询仍可能在 2 秒后失败 | 与 #20、#28 同类，有用户报告再说 |

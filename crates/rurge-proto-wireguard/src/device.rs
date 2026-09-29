@@ -29,8 +29,8 @@ const BATCH: usize = 256;
 /// How often the endpoints written as names, and the peers that could not
 /// be reached, are dialled again (M4 design 6.5).
 pub(crate) const REDIAL: Duration = Duration::from_secs(300);
-/// How often at most a peer's carrier is replaced because sending on it
-/// failed.
+/// How often at most a peer's carrier is replaced because it lost its
+/// local address or its route while sending.
 const REPLACE: Duration = Duration::from_secs(10);
 /// How many times at most a question through the tunnel goes out within
 /// its wait (`Device::query`).
@@ -433,8 +433,21 @@ fn ready(
     }
 }
 
-/// Sends `message` on `carrier`: whether it went out.
-async fn send(carrier: &mut Carrier, message: &Outgoing) -> bool {
+/// Whether a failed send says the carrier's local address or its route is
+/// gone — the network changed under it — rather than something passing
+/// (a full send buffer, say): only then is a new carrier worth dialling.
+fn gone(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkDown
+    )
+}
+
+/// Sends `message` on `carrier`; what went wrong when it did not go out.
+async fn send(carrier: &mut Carrier, message: &Outgoing) -> io::Result<()> {
     let marked =
         carrier.marks && wire::message_type(&message.datagram) == Some(wire::HANDSHAKE_INITIATION);
     if marked && carrier.datagram.set_tos(wire::HANDSHAKE_TOS).is_err() {
@@ -448,7 +461,7 @@ async fn send(carrier: &mut Carrier, message: &Outgoing) -> bool {
     if marked && carrier.marks {
         let _ = carrier.datagram.set_tos(0);
     }
-    sent.is_ok()
+    sent.map(|_| ())
 }
 
 /// A dial of `peer`'s carrier: whether it replaces the one there in any
@@ -485,9 +498,9 @@ impl Driver {
         }
     }
 
-    /// The carriers of `peers` failed to send: the network may have changed
-    /// under them. Each is dialled anew, unless a failed send had it
-    /// replaced less than `REPLACE` ago.
+    /// The carriers of `peers` lost their local address or their route
+    /// while sending: the network changed under them. Each is dialled anew,
+    /// unless such a send had it replaced less than `REPLACE` ago.
     fn replace_failed(&mut self, dials: &mut JoinSet<Dialled>, peers: Vec<usize>) {
         let now = Instant::now();
         let due: Vec<usize> = peers
@@ -537,9 +550,9 @@ impl Driver {
     }
 
     /// What goes out now, to the peers that have a carrier; the peers whose
-    /// carrier failed to send some of it. Nothing more goes out once a
-    /// newer tunnel has taken over: what is left in `out` is dropped (P10 /
-    /// B).
+    /// carrier lost its local address or its route sending some of it.
+    /// Nothing more goes out once a newer tunnel has taken over: what is
+    /// left in `out` is dropped (P10).
     async fn send_all(&mut self, out: &mut Vec<Outgoing>) -> Vec<usize> {
         let mut failed = Vec::new();
         for message in out.drain(..) {
@@ -553,7 +566,10 @@ impl Driver {
             if wire::message_type(&message.datagram) == Some(wire::HANDSHAKE_INITIATION) {
                 self.waiting[message.peer] = true;
             }
-            if !send(carrier, &message).await && !failed.contains(&message.peer) {
+            if let Err(e) = send(carrier, &message).await
+                && gone(&e)
+                && !failed.contains(&message.peer)
+            {
                 failed.push(message.peer);
             }
         }
@@ -567,7 +583,7 @@ impl Driver {
         let mut first = 0;
         let mut dials = JoinSet::new();
         loop {
-            // a newer configuration took over: nothing more goes out (P10 / B)
+            // a newer configuration took over: nothing more goes out (P10)
             if self.shared.closed.load(Ordering::SeqCst) {
                 return;
             }

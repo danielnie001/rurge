@@ -1175,12 +1175,18 @@ mod tests {
         inner: Arc<dyn Connector>,
         broken: Arc<AtomicBool>,
         dials: Arc<AtomicUsize>,
+        /// What a send on the broken carrier fails with.
+        kind: io::ErrorKind,
+        /// How many sends failed.
+        failures: Arc<AtomicUsize>,
     }
 
     struct BreakingDatagram {
         inner: BoxedDatagram,
         /// The switch, on the first carrier only.
         broken: Option<Arc<AtomicBool>>,
+        kind: io::ErrorKind,
+        failures: Arc<AtomicUsize>,
     }
 
     impl Connector for Breaking {
@@ -1201,7 +1207,12 @@ mod tests {
                 let first = self.dials.fetch_add(1, Ordering::SeqCst) == 0;
                 let inner = self.inner.connect_udp(target, opts).await?;
                 let broken = first.then(|| self.broken.clone());
-                Ok(Box::new(BreakingDatagram { inner, broken }) as BoxedDatagram)
+                Ok(Box::new(BreakingDatagram {
+                    inner,
+                    broken,
+                    kind: self.kind,
+                    failures: self.failures.clone(),
+                }) as BoxedDatagram)
             })
         }
     }
@@ -1213,7 +1224,8 @@ mod tests {
                 .as_ref()
                 .is_some_and(|b| b.load(Ordering::SeqCst))
             {
-                return Poll::Ready(Err(io::ErrorKind::NetworkUnreachable.into()));
+                self.failures.fetch_add(1, Ordering::SeqCst);
+                return Poll::Ready(Err(self.kind.into()));
             }
             self.inner.poll_send(cx, buf)
         }
@@ -1240,6 +1252,8 @@ mod tests {
             inner: direct(),
             broken: broken.clone(),
             dials: dials.clone(),
+            kind: io::ErrorKind::NetworkUnreachable,
+            failures: Arc::new(AtomicUsize::new(0)),
         });
         let (peer, wg) = tunnel_with(PeerOpts::default(), |_| {}, no_names(), breaking).await;
         let mut stream = wg
@@ -1256,6 +1270,44 @@ mod tests {
         assert_eq!(echo(&mut fresh, b"after").await, b"after");
         assert_eq!(dials.load(Ordering::SeqCst), 2, "a second carrier");
         assert_eq!(peer.core().handshakes, 2, "the peer was greeted on it");
+    }
+
+    /// A send that fails for a passing reason (a full send buffer, say)
+    /// keeps the carrier: the datagram is lost, TCP sends it again, and no
+    /// new carrier is dialled.
+    #[tokio::test]
+    async fn a_passing_send_error_keeps_the_carrier() {
+        let (broken, dials, failures) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let breaking: Arc<dyn Connector> = Arc::new(Breaking {
+            inner: direct(),
+            broken: broken.clone(),
+            dials: dials.clone(),
+            kind: io::ErrorKind::Other,
+            failures: failures.clone(),
+        });
+        let (peer, wg) = tunnel_with(PeerOpts::default(), |_| {}, no_names(), breaking).await;
+        let mut stream = wg
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        assert_eq!(echo(&mut stream, b"before").await, b"before");
+
+        broken.store(true, Ordering::SeqCst);
+        stream.write_all(b"after").await.unwrap();
+        until(|| failures.load(Ordering::SeqCst) > 0).await;
+        broken.store(false, Ordering::SeqCst);
+        let mut back = [0u8; 5];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut back))
+            .await
+            .expect("sent again in time")
+            .expect("the echo");
+        assert_eq!(&back, b"after");
+        assert_eq!(dials.load(Ordering::SeqCst), 1, "the same carrier");
+        assert_eq!(peer.core().handshakes, 1);
     }
 
     /// A peer that cannot be reached when the tunnel starts is dialled
@@ -1314,7 +1366,7 @@ mod tests {
 
     /// A policy over a chain never shares a direct policy's tunnel, even
     /// naming the same section: sharing also requires an equal carrier
-    /// (P10 / A), so it dials its own carriers, which it cannot, and fails
+    /// (P10), so it dials its own carriers, which it cannot, and fails
     /// with the chain's usual refusal — the other policy's tunnel keeps
     /// running untouched.
     #[tokio::test]
@@ -1347,7 +1399,7 @@ mod tests {
     /// A reload that only changes the policy's carrier (`ip-version`,
     /// `underlying-proxy`, `[General] ipv6`) — the section itself is
     /// unchanged — still takes the tunnel over, exactly as a changed
-    /// section does (P10 / A).
+    /// section does (P10).
     #[tokio::test]
     async fn a_policy_whose_carriers_changed_takes_the_tunnel_over() {
         let (peer, old) = tunnel(PeerOpts::default(), |_| {}).await;
@@ -1401,7 +1453,7 @@ mod tests {
 
     /// A tunnel that is only starting, its dial stuck, never blocks a dial
     /// that only shares an already-running tunnel of another section: no
-    /// global start lock (P10 / C).
+    /// global start lock (P10).
     #[tokio::test]
     async fn a_running_tunnel_is_shared_while_another_starts() {
         let (peer, a1) = tunnel(PeerOpts::default(), |_| {}).await;

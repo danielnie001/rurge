@@ -125,6 +125,6 @@
 - [ ] 测速：把 `WG` 放进 `url-test` 组。不写 `dns-server` 与 `test-url` 时测速结果是握手往返时间（`GET /v1/policy_groups/test_results`），请求记录里测试会话的目标是服务端的 endpoint；写上 `test-url=http://…` 后改为经隧道的 URL 测试。
 - [ ] 重载：只改无关的内容后 `rurge reload`，经 `WG` 的下载不中断、服务端没有新的握手；改了 `[WireGuard home]`（如 `mtu`）后 `rurge reload`，旧连接断开，新连接正常，服务端 `wg show` 里这个 peer 的 endpoint 稳定在一个地址上。
 - [ ] endpoint 写成域名：让它的解析结果换成同一服务端的另一个地址（或另一台同配置的服务端），5 分钟内日志出现 `wireguard: the peer's endpoint moved`，之后的新连接走新地址。
-- [ ] 服务端停掉：经 `WG` 的请求在拨号时限处失败；约 90 秒后日志有一条 `wireguard: the peer did not answer the handshake`；服务端恢复后下一个请求正常，日志再有一条 `wireguard: handshake completed`。
-- [ ] 网络变化：经 `WG` 的连接在用时，把本机换到另一个网络（如从 Wi-Fi 换到手机热点，或拔掉网线改用 Wi-Fi），不重启 rurge：约 90 秒内经 `WG` 的新连接恢复正常（若日志先记了一条 `wireguard: the peer did not answer the handshake`，恢复时会再记一条 `wireguard: handshake completed`）；服务端 `wg show` 里这个 peer 的 endpoint 变成新网络的出口地址。
+- [ ] 服务端停掉：经 `WG` 的请求在拨号时限处失败；约 90 秒后日志有一条 `wireguard: the peer did not answer the handshake`，服务端一直停着时此后约每 90 秒再有一条（每次换一条新载体重试）；服务端恢复后下一个请求正常，日志再有一条 `wireguard: handshake completed`。
+- [ ] 网络变化：经 `WG` 的连接在用时，把本机换到另一个网络（如从 Wi-Fi 换到手机热点，或拔掉网线改用 Wi-Fi），不重启 rurge：约两分钟内经 `WG` 的新连接恢复正常（若日志先记了一条 `wireguard: the peer did not answer the handshake`，恢复时会再记一条 `wireguard: handshake completed`）；服务端 `wg show` 里这个 peer 的 endpoint 变成新网络的出口地址。
 - [ ] 日志（含 `--log-level verbose`）里搜不到私钥与 `preshared-key` 的内容；`GET /v1/profiles/current?sensitive=0` 里二者都是 `***`。
