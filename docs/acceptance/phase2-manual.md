@@ -142,4 +142,16 @@
 - [ ] 重载时改了这一行（如多加一个 `args = "-v"`）而 `local-port` 不变：重载后第一个请求返回 200，只剩一个 `ssh` 进程（新的那个），日志里旧程序有 `external: the program stopped`。
 - [ ] 未知主机：把服务器换成一台主机密钥不在 `known_hosts` 里的（或临时改名 `known_hosts`），带着 `BatchMode=yes`：请求失败（不挂住），`<数据目录>/external/Ext.log` 里有 `ssh` 给出的原因（如 `Host key verification failed.`）。
 - [ ] 脱敏：`GET /v1/policies/detail?policy_name=Ext` 与 `GET /v1/profiles/current` 里每个 `args` 都是 `***`；日志（含 `--log-level verbose`）里搜不到服务器地址与用户名。
+- [ ] UDP（M5a）：配置里写 `udp-relay=true`，让它的 `ssh -D` 换成一个支持 SOCKS5 UDP 的外部程序（`ssh -D` 不支持 UDP），经 rurge 的 SOCKS5 UDP 往返一次（见下面 M5a 一节的客户端）。
 - [ ] 订阅：把一行 `external` 放进自己的订阅文件，重载后该行被跳过，`rurge check` 报 `` `external` policies are not imported from subscriptions ``。
+
+## M5a　UDP 地基
+
+前置：一个支持 SOCKS5 UDP 的客户端（如 Proxifier、SocksCap64，或设置了 SOCKS5 代理的游戏 / 语音软件、Telegram 桌面版的语音通话），指向 rurge 的 `socks5-listen`；一个开了 UDP 的上游 SOCKS5 节点（`udp-relay=true`）。
+
+- [ ] DNS：客户端经 SOCKS5 UDP 发 DNS 查询（如 Proxifier 代理 `nslookup example.com 8.8.8.8`），得到回答；`GET /v1/requests/recent` 里有一条 `transport` 为 `udp`、`dst` 为 `8.8.8.8:53` 的记录，回答后约 10 秒结束。
+- [ ] 游戏或语音：经 rurge 的 SOCKS5 进行一次语音通话或联机游戏，DIRECT 与经上游 SOCKS5 节点各一次，都能通话 / 联机；通话结束后约 60 秒，对应的记录都结束。
+- [ ] 全锥：用 NAT 类型检测工具（STUN）经 rurge 的 SOCKS5 检测，结果是 Full Cone（经 DIRECT 与经 SOCKS5 节点；节点本身须是全锥）。
+- [ ] `block-quic`：配置 `block-quic = all`，客户端发往 UDP 443 的 QUIC 被丢弃，请求记录为 REJECT 与 `QUIC blocked`，应用回落到 TCP 后照常可用；改为 `always-allow` 后 QUIC 照常经过。
+- [ ] 不支持 UDP 的策略：规则把 UDP 分到一条 `http` 策略，默认 REJECT（记录写 `policy does not support UDP`）；配置 `udp-policy-not-supported-behaviour = DIRECT` 后改经 DIRECT。
+- [ ] 关联结束：客户端断开（关闭软件），它的全部 UDP 记录随即结束。

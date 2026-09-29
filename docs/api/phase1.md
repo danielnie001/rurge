@@ -22,7 +22,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 | GET | `/v1/rules` | | `{"rules":[{"index":0,"rule":"DOMAIN,…","hits":3}]}` |
 | GET | `/v1/requests/recent?limit=N` | 默认 100；上限是 `--request-log-size` 的环形缓冲容量；`limit=0` → 400 `limit must be at least 1` | `{"requests":[Request…]}`（最新在前） |
 | GET | `/v1/requests/active` | | 同上 |
-| POST | `/v1/requests/kill` | `{"id":N}` | `{}`；404 不在进行中；409 `not killable: internal session` |
+| POST | `/v1/requests/kill` | `{"id":N}` | `{}`；404 不在进行中；409 `not killable: internal session`；UDP 流（`transport` 为 `udp`）同样可结束 |
 | GET | `/v1/traffic` | | 见下「Traffic」 |
 | GET | `/v1/dns` | | `{"dnsCache":[Cache…],"upstreams":[…],"bootstrap":[…]}` |
 | POST | `/v1/dns/flush` | | `{}` |
@@ -41,12 +41,12 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 ### Request
 
 ```json
-{"id":12,"listener":"http","src":"127.0.0.1:51234","dst":"example.com:443","rule":"DOMAIN-SUFFIX,example.com,Proxy","policy":["Proxy","HK"],"sni":"example.com","protocol":"https","up":1234,"down":56789,"startedMs":1757200000000,"elapsedMs":812,"connectMs":35,"firstByteMs":120,"status":"completed","rejectKind":null,"error":null}
+{"id":12,"listener":"http","transport":"tcp","src":"127.0.0.1:51234","dst":"example.com:443","rule":"DOMAIN-SUFFIX,example.com,Proxy","policy":["Proxy","HK"],"sni":"example.com","protocol":"https","up":1234,"down":56789,"startedMs":1757200000000,"elapsedMs":812,"connectMs":35,"firstByteMs":120,"status":"completed","rejectKind":null,"error":null}
 ```
 
 `listener` ∈ `http` `socks5` `tun` `forward` `internal`；`status` ∈ `active` `completed` `rejected` `failed`；`rejectKind` 在 `rejected` 时是 `REJECT` / `REJECT-DROP` / `REJECT-NO-DROP` / `REJECT-TINYGIF`；`protocol` 是嗅探到的协议小写名或 `null`。
 
-`connectMs` 是会话开始到出站就绪的毫秒数（规则匹配、DNS、`evaluate-before-use` 的等待与 `smart` 组换成员的重试都在内），`firstByteMs` 是出站就绪到收到第一个上游字节的毫秒数；还没有对应时刻（被拒绝、拨号失败、还没收到数据）时为 `null`，测试会话（`rule` 为 `policy test`）两者恒为 `null`（阶段 2 / M3c 起）。
+`transport` 是 `tcp` 或 `udp`（阶段 2 / M5a 起：经 SOCKS5 UDP ASSOCIATE 进来的每条 UDP 流各有一条记录，`dst` 是它的目标，`up` / `down` 是载荷字节数）。`connectMs` 是会话开始到出站就绪的毫秒数（规则匹配、DNS、`evaluate-before-use` 的等待与 `smart` 组换成员的重试都在内），`firstByteMs` 是出站就绪到收到第一个上游字节的毫秒数；还没有对应时刻（被拒绝、拨号失败、还没收到数据）时为 `null`，测试会话（`rule` 为 `policy test`）两者恒为 `null`（阶段 2 / M3c 起）。
 
 ### Traffic
 

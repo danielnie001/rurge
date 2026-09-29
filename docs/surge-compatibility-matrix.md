@@ -159,9 +159,9 @@
 | `force-http-engine-hosts` | Host List；默认端口 80 | 全部 | ✅ | 4 | |
 | `always-raw-tcp-hosts` | Host List | 全部 | ✅ | 4 | |
 | `always-raw-tcp-keywords` | 关键字列表 | Mac 5.5+ | ✅ | 4 | |
-| `udp-policy-not-supported-behaviour` | `REJECT` `DIRECT`；默认 `REJECT`（Mac 6.0 起） | 全部 | ✅ | 2 | |
+| `udp-policy-not-supported-behaviour` | `REJECT` `DIRECT`；默认 `REJECT`（Mac 6.0 起） | 全部 | ✅ | 2 | M5a 已实现：终端出站不支持 UDP 时，`REJECT` 丢包并在请求记录写 `policy does not support UDP`，`DIRECT` 改经 DIRECT 发出、请求记录写 `policy does not support UDP; sent through DIRECT` |
 | `udp-priority` | 布尔；默认 true | 全部 | 🟡 | 3 | 高负载下优先处理 UDP，尽力而为 |
-| `block-quic` | `per-policy` `all-proxy` `all` `always-allow`；默认 `per-policy` | 全部 | ✅ | 2 | |
+| `block-quic` | `per-policy` `all-proxy` `all` `always-allow`；默认 `per-policy` | 全部 | 🟡 | 2 | M5a 已实现，对经 SOCKS5 UDP 进来的流生效（TUN 在阶段 3）。四个值的含义按名字理解、未与 Surge 核对：`per-policy` 用终端策略自己的 `block-quic`，`all-proxy` 凡经代理一律阻断，`all` 连 DIRECT 也阻断，`always-allow` 一律不阻断。只在目标 UDP 443 上按 QUIC Initial 包（长首部、版本非 0、Initial 类型、至少 1200 字节）识别；被阻断的流丢包，请求记录为 REJECT 与 `QUIC blocked`，不计入 REJECT 的自动升级 |
 | `show-error-page` | 布尔；默认 true | Mac 5.8+ | 🟡 | 1 | 错误页为 rurge 自己的 HTML（写明规则、策略链、会话 id）；对连接失败的 502 页在 M3a 只覆盖明文请求，CONNECT 连接失败的 502 已实现（M3b） |
 | `show-error-page-for-reject` | 布尔；默认 false | 全部 | 🟡 | 1 | 错误页为 rurge 自己的 HTML（写明规则、策略链、会话 id） |
 | 空闲超时（`--idle-timeout`） | Surge 未公开默认值 | 全部 | 🟡 | 1 | rurge 默认 600 s，`--idle-timeout` 覆盖（M3b，专有运行时选项，不是 Surge 配置键）；只作用于 CONNECT / SOCKS5 的中继会话，**明文 HTTP 转发不受其约束**（该路径不经中继泵，保活等待由 hyper 的 `header_read_timeout` 覆盖，单次交换由上游连接寿命约束；阶段 4 自有 HTTP 引擎后统一）；中继泵写完即 `flush`（M2b：`tokio-rustls` 等写端在 socket 写满时可能把最后一段留在自己的缓冲里，不 flush 可能一直发不出去），且任一方向以错误结束时另一方向随之结束，不用各自等到超时才发现隧道已坏 |
@@ -187,7 +187,7 @@
 | 键 | 取值 / 默认 | rurge | 阶段 | 备注 |
 | --- | --- | --- | --- | --- |
 | `http-listen` | `[password@]address[:port]` 列表；默认端口 6152；多监听器 | 🟡 | 1 | 全平台可用；地址必须是 IP 字面量，IPv6 用 `[...]`；Basic 认证只比较密码，用户名任意（手册只给出 `[password@]address[:port]`）；两者都缺省时 rurge 仍在 `127.0.0.1:6152` / `6153` 监听，手册则是 `http-listen` 与 `socks5-listen` 都缺省则代理服务关闭；只配其一时与 Surge 一致：只开那一种 |
-| `socks5-listen` | `address[:port]` 列表；默认端口 6153；不支持密码 | 🟡 | 1 | 全平台可用；REJECT 时回 `0x02`（手册未说明） |
+| `socks5-listen` | `address[:port]` 列表；默认端口 6153；不支持密码 | 🟡 | 1 | 全平台可用；REJECT 时回 `0x02`（手册未说明）。UDP ASSOCIATE（阶段 2 / M5a）：在客户端连到的本机地址上开一个 UDP 端口；只收控制连接那个客户端 IP 的包（端口取请求里声明的，没声明时取第一个包的）；分片包（FRAG ≠ 0）丢弃；控制连接一断，关联的流全部结束；全锥（同一关联在同一出站上共用一个载体，任何来源的回包都送回客户端，`vmess` 除外）；一条流 = 关联 + 目标，各有一条请求记录（`transport` 为 `udp`，可像 TCP 会话一样用 `POST /v1/requests/kill` 结束），60 秒无收发回收，目标端口 53 的流收到回答后 10 秒回收（rurge 自定）；每个关联最多 1024 条流、全进程最多 4096 个关联，超出时新流丢弃、新关联回 0x01，每分钟至多告警一条；REJECT 系列对 UDP 一律丢包（SOCKS5 回不了 ICMP） |
 | `set-system-socks-proxy` | 布尔；默认 true | ✅ | 1 | 随"设为系统代理"功能生效；M4b 已实现——为 false 时 `ProxySettings.socks` 为空，各平台随之显式关闭该项：Windows 的 `ProxyServer` 不写 `socks=` 段；macOS 执行 `-setsocksfirewallproxystate <服务> off`；GNOME 把 `org.gnome.system.proxy.socks` 的 host/port 写为空串 / 0；KDE 删除 `socksProxy` 键 |
 | `read-etc-hosts` | 布尔；默认 true | 🟡 | 1 | 手册标注 Mac only；rurge 三平台生效（Win: `System32\drivers\etc\hosts`） |
 | `subnet-exp-wifi-always-match` | 布尔；默认 true | ✅ | 3 | |
@@ -231,7 +231,7 @@
 | `SRC-IP` | 客户端 IP（单地址或 CIDR，v4/v6） | 全部 | ✅ | 1 | |
 | `DEVICE-NAME` | 客户端设备名，`*` `?` 通配，区分大小写 | 全部 | ✅ | 7 | 设备名来自 DHCP / 网关模式设备表；M2a 起解析通过，匹配前始终不匹配（并记一次告警），等待阶段 7 网关模式实现 |
 | `MAC-ADDRESS` | 同一局域网客户端 MAC | Mac 6.1+ | ✅ | 7 | 经网关转发的流量无法取得 MAC，与 Surge 一致；M2a 起解析通过，匹配前始终不匹配（并记一次告警），等待阶段 7 网关模式实现 |
-| `PROTOCOL` | `HTTP` `HTTPS` `TCP` `UDP` `QUIC` `STUN` `MTProto` `DOH` `DOH3` `DOQ` `DOT` `DNS`；区分大小写；`TCP` 覆盖 HTTP/HTTPS/MTProto，`UDP` 覆盖 QUIC/STUN | 全部 | ✅ | 1 / 3 | `DOH*` `DOQ` `DOT` `DNS` 只匹配 rurge 自身发出的 DNS 请求且需 `encrypted-dns-follow-outbound-mode=true`；`MTProto` 依赖阶段 7；M3b：DoT/DoH/DNS 标签按上游端口启发（853/443/其余）；基于 SNI 的路由与 `PROTOCOL,HTTPS` 的 dial 前匹配随阶段 4 |
+| `PROTOCOL` | `HTTP` `HTTPS` `TCP` `UDP` `QUIC` `STUN` `MTProto` `DOH` `DOH3` `DOQ` `DOT` `DNS`；区分大小写；`TCP` 覆盖 HTTP/HTTPS/MTProto，`UDP` 覆盖 QUIC/STUN | 全部 | ✅ | 1 / 3 | M5a：`UDP` 匹配每条 UDP 流、`TCP` 匹配每个 TCP 会话（按传输层判断）；UDP 流只识别 QUIC（目标 UDP 443 上的 Initial 包），STUN 与 DNS 的嗅探未做；`DOH*` `DOQ` `DOT` `DNS` 只匹配 rurge 自身发出的 DNS 请求且需 `encrypted-dns-follow-outbound-mode=true`；`MTProto` 依赖阶段 7；M3b：DoT/DoH/DNS 标签按上游端口启发（853/443/其余）；基于 SNI 的路由与 `PROTOCOL,HTTPS` 的 dial 前匹配随阶段 4 |
 | `HOSTNAME-TYPE` | `IPv4` `IPv6` `DOMAIN` `SIMPLE`；关键字区分大小写，未知值使规则无效 | Mac 5.7.3+ | ✅ | 1 | |
 | `SUBNET` | 子网表达式（见 3.4） | 全部 | 🟡 | 3 | `TYPE:CELLULAR` `MCCMNC:` 在桌面平台永不匹配；M2a 起解析通过，匹配前始终不匹配（并记一次告警），等待阶段 3 增强模式实现 |
 | `CELLULAR-RADIO` | 蜂窝网络制式 | iOS only | 🔁 | 1 | 解析通过，永不匹配 |
@@ -314,7 +314,7 @@
 | 重定义其他内置名（`REJECT` `CELLULAR` 等） | 配置错误 | 全部 | ✅ | 1 | |
 | pre-matching 下的 REJECT 行为：DNS 阶段 `REJECT` 返回无记录（限频后不响应）、`REJECT-DROP` 不响应、`REJECT-NO-DROP` 返回 `198.18.0.244` 并对其所有 TCP 连接回 RST | | 全部 | ✅ | 3 | |
 | pre-matching 下的 TCP 行为：`REJECT` 回 RST（限频后丢 SYN）、`REJECT-DROP` 丢 SYN、`REJECT-NO-DROP` 回 RST；3 秒内 100 次 RST 后暂停回 RST 改为丢包 | | 全部 | ✅ | 3 | |
-| UDP 行为：`REJECT` / `REJECT-NO-DROP` 回 ICMP Administratively Prohibited（限频后丢包），`REJECT-DROP` 直接丢包 | UDP 无预匹配阶段 | 全部 | ✅ | 3 | |
+| UDP 行为：`REJECT` / `REJECT-NO-DROP` 回 ICMP Administratively Prohibited（限频后丢包），`REJECT-DROP` 直接丢包 | UDP 无预匹配阶段 | 全部 | 🟡 | 2 / 3 | M5a：经 SOCKS5 进来的 UDP 流按规则匹配（没有预匹配）；四种 REJECT 一律丢包并记录（SOCKS5 回不了 ICMP）；TUN 上的 ICMP 在阶段 3 |
 | 被 pre-matching 拒绝的规则 5 分钟内只在最近请求列表出现一次 | 防刷屏 | 全部 | ✅ | 4 | |
 
 ### 4.2 代理协议类型（16 种）
@@ -323,7 +323,7 @@
 | --- | --- | --- | --- | --- | --- |
 | `http` / `https` | HTTP 代理 / HTTP over TLS | 全部 | ✅ | 2 | M1（阶段 2）已实现（TCP）：CONNECT 隧道；明文 HTTP 经 http / https 上游默认按绝对 URI 转发，always-use-connect=true 时走 CONNECT；headers 与 `<random-string>` 占位；目标主机名在写线之前转成 A-label，且只允许 ASCII 字母、数字、`-`、`.`、`_`（其它字符的名字被拒绝：防止宽松的上游把 `a@b.test` 读成 userinfo + 主机而绕过域名规则）；Surge 大概原样发送（未核对）；转发模式下上游回 407 时（rurge 自己给上游的凭据不对）记为失败会话并回 502 页面，会话日志 http proxy answered 407 …；上游的其它响应（含 502）原样交还客户端 |
 | `h2-connect` | HTTP/2 CONNECT 多路复用 | Mac 6.6+ | ✅ | 2 | |
-| `socks5` / `socks5-tls` | SOCKS5 / SOCKS5 over TLS | 全部 | ✅ | 2 | M1（阶段 2）已实现（TCP）；udp-relay 解析但未生效（M5）；目标主机名在写线之前转成 A-label，且只允许 ASCII 字母、数字、`-`、`.`、`_`（其它字符的名字被拒绝：防止宽松的上游把 `a@b.test` 读成 userinfo + 主机而绕过域名规则）；Surge 大概原样发送（未核对）；只有密码没有用户名时密码被忽略 |
+| `socks5` / `socks5-tls` | SOCKS5 / SOCKS5 over TLS | 全部 | ✅ | 2 | M1（阶段 2）已实现（TCP）；M5a 起 `udp-relay=true` 时经 UDP ASSOCIATE 转发 UDP（每个客户端关联一条关联：控制连接加服务器给出的中继地址，中继地址是未指定地址时改用服务器地址；`socks5-tls` 的 UDP 是明文 UDP，只有控制连接是 TLS；控制连接断开即关联失效；只收源 IP 是中继地址的包（不比端口；中继地址仍是主机名时——如经链——不检查）；有 `underlying-proxy` 时中继那一段经底层策略的 UDP 载体）；目标主机名在写线之前转成 A-label，且只允许 ASCII 字母、数字、`-`、`.`、`_`（其它字符的名字被拒绝：防止宽松的上游把 `a@b.test` 读成 userinfo + 主机而绕过域名规则）；Surge 大概原样发送（未核对）；只有密码没有用户名时密码被忽略 |
 | `ss` | Shadowsocks | 全部 | ✅ | 2 | 加密方法见 4.6 |
 | `snell` | Snell v1–v6 | v6 需 iOS 5.20 / Mac 6.7+ | 🟡 | 2 | v1–v4 计划支持；v5（QUIC Proxy Mode）与 v6（PSK 派生协议画像、流量整形，beta）协议细节未公开，❓ 待评估 |
 | `vmess` | VMess（AEAD / 旧握手、TLS、WebSocket） | 全部 | ✅ | 2 | M2b（阶段 2）已实现 AEAD 握手（TCP）：没写 `vmess-aead=true` 的行在 M8 之前按 `W0007`（每次加载一条）+ `REJECT` 处理，会话日志 `policy protocol not implemented: vmess (legacy handshake)`；请求头与首段负载合并成一次写出，客户端 100 ms 内不发数据时（服务端先说话的协议）请求头单独发出、这类协议的首字节因此晚 100 ms；只开 ChunkStream + ChunkMasking（Surge 的实际取值未公开）；UUID 错与本机时钟偏差超过约 120 秒都表现为 `vmess: the server closed the connection without answering`，两者分辨不出；`username` 只接受命名写法；`tls=false` 时写的 TLS 参数按 `W0028` 处理；默认不带 ALPN（未与真实 Surge 核对）；UDP 属 M5；目标主机名的字母表规则同 http / socks5 |
@@ -353,7 +353,7 @@
 | `tfo` | 布尔；默认 false | 🟡 | 2 | 解析并校验，`W0029`，三平台都不生效：`socket2` 0.6 没有 TFO 的安全封装，不为此引入 unsafe；有安全封装后再评估 |
 | `tos` | 0–255 或 `0x` 十六进制；默认 0 | 🟡 | 2 | M1 已实现；Windows 上对 IPv6 不生效；有 underlying-proxy 时无效（socket 选项属于真正打开 socket 的那一跳）；M2a 起加载时报 W0028 |
 | `ecn` | `auto` `on` `off`；QUIC 类协议默认开启，WireGuard/Tailscale 默认关闭 | 🟡 | 2 | 取决于所选 QUIC 库对 ECN 的支持；M1 解析并校验取值，`W0029`；M5 生效 |
-| `block-quic` | `auto` `on` `off`；默认 `auto`（代理策略默认阻断，DIRECT 不阻断） | ✅ | 2 | 与 `[General] block-quic` 全局覆盖联动；M1 解析并校验取值，`W0029`；M7 生效 |
+| `block-quic` | `auto` `on` `off`；默认 `auto`（代理策略默认阻断，DIRECT 不阻断） | ✅ | 2 | 与 `[General] block-quic` 全局覆盖联动；M5a 生效（经 SOCKS5 进来的 UDP；组按解析出的终端策略判断） |
 | `test-url` | HTTP(S) URL；默认全局设置 | ✅ | 2 | M1 解析并校验取值；M3b 生效，不再报 `W0029`（取值顺序见 5.2 节「测试 URL / 超时解析顺序」）；值可能来自订阅行、带 token：在 `profiles/current` 与 `policies/detail` 里整体脱敏，取值不合法时的 `E0018` 也不引用它 |
 | `test-timeout` | 秒；默认全局设置 | ✅ | 2 | M1 解析并校验取值；M3b 生效，不再报 `W0029`（取值顺序见 5.2 节「测试 URL / 超时解析顺序」） |
 | `test-udp` | `hostname@ipv4` | ✅ | 2 | M1 解析并校验取值，`W0029`；M5 生效（M3 细化设计订正了原来的"M3 生效"） |
@@ -380,10 +380,10 @@
 
 | 项 | Surge 行为 | rurge | 阶段 |
 | --- | --- | --- | --- |
-| `udp-relay`（布尔；默认 false） | 适用 SOCKS5 / SOCKS5-TLS / Shadowsocks / External / HTTP/2 CONNECT（RFC 9298） | ✅ | 2 |
+| `udp-relay`（布尔；默认 false） | 适用 SOCKS5 / SOCKS5-TLS / Shadowsocks / External / HTTP/2 CONNECT（RFC 9298） | ✅ | 2 | M5a：`socks5` / `socks5-tls` / `external` 已生效；Shadowsocks 与 HTTP/2 CONNECT 随 M6 |
 | `udp-port`（端口；默认主端口） | 适用 Shadowsocks / Snell | ✅ | 2 |
 | 自动支持 UDP 的协议：Snell v3+、VMess、Trojan、TUIC、Hysteria 2、MASQUE、AnyTLS（UDP over TCP）、WireGuard、Tailscale | | ✅ | 2 |
-| 不支持 UDP 的协议：HTTP / HTTPS、Trust Tunnel、SSH | 受 `udp-policy-not-supported-behaviour` 控制 | ✅ | 2 |
+| 不支持 UDP 的协议：HTTP / HTTPS、Trust Tunnel、SSH | 受 `udp-policy-not-supported-behaviour` 控制 | ✅ | 2 | M5a 已实现；`underlying-proxy` 的底层策略不支持 UDP 时，经它的 UDP 流失败并写 `via <底层策略>: the underlying policy cannot carry UDP` |
 | DIRECT / REJECT 系始终处理 UDP | | ✅ | 1 |
 | UDP 测试：通过中继向 `hostname@ipv4` 做 DNS 查询 | `proxy-test-udp` / `test-udp` | ✅ | 2 |
 
@@ -416,7 +416,7 @@
 | WireGuard 生命周期 | 加载时准备、按需握手；网络变化或底层策略变化时重建；分片重组；仅回应发往本地隧道地址的 ICMP echo；握手包 DSCP 0x88 | 🟡 | 2 | M4b：构建（含 `rurge check` 的干构建）只解析配置，不开 socket、不解析域名；第一次用到时启动；隧道内 IP 分片重组（最多同时 4 个、每个 16 KiB）；超过 MTU 的 IPv4 外发包由协议栈分片后发出，但只到 smoltcp 的分片缓冲（1500 字节）为止，更大的丢弃（手册：丢弃；TCP 报文段按 MSS 切分，本来不会超出，只有 ICMP 回显应答可能更大）；只回应发往本端隧道地址的 ICMP echo；握手发起包的 TOS 字节标 0x88（DSCP AF41），其它包不标——Windows 通常忽略应用设置的 DSCP；载体的 UDP 收发缓冲尽量设为 7 MiB（系统可能封顶）；"网络已变化"的入口已有，阶段 2 没有触发它的探测器（阶段 3），在那之前靠载体发送时本机地址或路由失效、或 peer 不再回应握手时换新的载体恢复（见 4.2 节 `wireguard` 行）；底层策略（`underlying-proxy`）在 M5 生效 |
 | WireGuard 测试 | 无 `dns-server` 且无 `test-url` → 原生 RTT 探测；否则标准 URL 测试 | ✅ | 2 | M4b 已实现。原生测试向每个 peer 强制握手（会话再新也握），结果是从强制发起到任一 peer 第一个握手完成的时间——通常是一个往返，之前已有一次发起在途时（隧道刚启动、换密钥、另一条策略的测试）可能更短；它只证明 peer 可达、握手成功，不证明路由与出口（照手册）；测试会话的目标记为第一个 peer 的 endpoint。URL 测试经隧道两次 `HEAD`（目标域名按 4.2 节 `wireguard` 行的规则解析）。两种都在 `test-timeout` 之外另加 10 秒；`POST /v1/policies/test` 给了 `url` 时一律按那个 URL 测 |
 | `tailscale` 策略行与 `[Tailscale <name>]`（`auth-key` `interactive-login` `control-url` `hostname` `derp-only` `auto-add-magic-dns-rule` `exit-node` `idle-keepalive` `prefer-ipv6` `dns-server` `mtu`） | | ❓ | 远期 | 解析通过，策略视为不可用 |
-| `external` | `exec` `local-port` `args`（可重复）`addresses`（可重复）`udp-relay` | 🟡 | 2 | M4c 已实现（TCP）。第一次用到时拉起（`exec` 加按原顺序的 `args`，标准输入为空），经 SOCKS5 连 `127.0.0.1:<local-port>`；连不上时每 500 ms 一次、一个请求最多 6 次（每次连接限时 500 ms：Windows 上要约 2 秒才拒绝连接），仍不行是 `external: the local SOCKS5 port refused the connection`；程序退出后下次用到时再拉起（照手册）。差异：三平台都支持（Surge 仅 Mac）；输出追加写入 `<数据目录>/external/<策略名>.log`（名字里文件名不能用的字符换成 `_` 并加一段哈希；在不区分大小写的文件系统上（Windows、macOS）只差大小写的两个策略名共用一个日志文件），每次拉起先写一行分隔，超过 1 MiB 时在拉起前轮转、只留一个旧文件；同一策略两次拉起至少间隔 2 秒，拉起失败时间隔内的请求直接得到同一个 `external: could not start <策略名> (<错误种类>)`；子进程环境去掉 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`（大小写两种）并设 `NO_PROXY=*`；程序自己退出时它启动的进程一并结束；rurge 正常退出时最后停掉全部外部程序连同它们启动的进程（Unix：整个进程组先 SIGTERM、2 秒后 SIGKILL；Windows：Job Object 关闭即结束全部，rurge 崩溃时同样不留下进程；Unix 上 rurge 崩溃后留下的进程不处理）；程序在自己的进程组里（Unix 进程组、Windows `CREATE_NEW_PROCESS_GROUP`），在 rurge 的终端按 Ctrl-C 不会直接送到它，由 rurge 按上面的顺序停掉；程序不能交互式提问：Unix 上它与 rurge 同一会话、不同进程组，读终端（如 `ssh` 的主机密钥确认、口令提示）会被 SIGTTIN 挂起，rurge 仍当它在运行——用 `ssh` 时写上 `-o BatchMode=yes -o ExitOnForwardFailure=yes`（后者让端口绑定失败时 `ssh` 直接退出，而不是不监听地一直运行）；重载时 `exec` / `args` / `local-port` 都没变的策略沿用原程序，变了的，旧程序在新配置发布、旧出站随之释放时停掉（经它的连接随之断开）；旧出站仍被占用时（进行中的拨号或测速、`smart` 组会话的回报），最晚在新程序第一次在同一 `local-port` 上拉起之前停掉（连同它启动的进程，等它结束，至多约 2 秒），此后经旧出站的拨号立即得到 `external: a newer configuration of this policy is in use`，旧出站不再拉起程序；`args` 在 `profiles/current`、`policies/detail` 与 `lineHash` 里整体脱敏，日志只写策略名、pid 与退出码；两个策略写同一个 `local-port` 是错误（`E0018`），`local-port` 与 rurge 自己的 `http-listen` / `socks5-listen`（地址为回环或全零）同端口也是错误（`E0018`：`` policy `X`: `local-port` <p> is the port of rurge's own `socks5-listen` ``，否则 rurge 会连回自己）；`interface` `allow-other-interface` `tfo` `tos` `ip-version` `underlying-proxy` 不适用（`W0028`），不能叠 Shadow TLS（`E0018`）；`addresses`（阶段 3）与 `udp-relay`（M5）解析但暂不生效（`W0029`），`addresses` 只收 IP 地址；"外部进程的流量走 DIRECT"到阶段 3（有 TUN 才有意义）；订阅导入的 `external` 一律跳过（`W0023`）；干构建、`rurge check` 与 `POST /v1/profiles/check` 从不拉起程序 |
+| `external` | `exec` `local-port` `args`（可重复）`addresses`（可重复）`udp-relay` | 🟡 | 2 | M4c 已实现（TCP）。第一次用到时拉起（`exec` 加按原顺序的 `args`，标准输入为空），经 SOCKS5 连 `127.0.0.1:<local-port>`；连不上时每 500 ms 一次、一个请求最多 6 次（每次连接限时 500 ms：Windows 上要约 2 秒才拒绝连接），仍不行是 `external: the local SOCKS5 port refused the connection`；程序退出后下次用到时再拉起（照手册）。差异：三平台都支持（Surge 仅 Mac）；输出追加写入 `<数据目录>/external/<策略名>.log`（名字里文件名不能用的字符换成 `_` 并加一段哈希；在不区分大小写的文件系统上（Windows、macOS）只差大小写的两个策略名共用一个日志文件），每次拉起先写一行分隔，超过 1 MiB 时在拉起前轮转、只留一个旧文件；同一策略两次拉起至少间隔 2 秒，拉起失败时间隔内的请求直接得到同一个 `external: could not start <策略名> (<错误种类>)`；子进程环境去掉 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`（大小写两种）并设 `NO_PROXY=*`；程序自己退出时它启动的进程一并结束；rurge 正常退出时最后停掉全部外部程序连同它们启动的进程（Unix：整个进程组先 SIGTERM、2 秒后 SIGKILL；Windows：Job Object 关闭即结束全部，rurge 崩溃时同样不留下进程；Unix 上 rurge 崩溃后留下的进程不处理）；程序在自己的进程组里（Unix 进程组、Windows `CREATE_NEW_PROCESS_GROUP`），在 rurge 的终端按 Ctrl-C 不会直接送到它，由 rurge 按上面的顺序停掉；程序不能交互式提问：Unix 上它与 rurge 同一会话、不同进程组，读终端（如 `ssh` 的主机密钥确认、口令提示）会被 SIGTTIN 挂起，rurge 仍当它在运行——用 `ssh` 时写上 `-o BatchMode=yes -o ExitOnForwardFailure=yes`（后者让端口绑定失败时 `ssh` 直接退出，而不是不监听地一直运行）；重载时 `exec` / `args` / `local-port` 都没变的策略沿用原程序，变了的，旧程序在新配置发布、旧出站随之释放时停掉（经它的连接随之断开）；旧出站仍被占用时（进行中的拨号或测速、`smart` 组会话的回报），最晚在新程序第一次在同一 `local-port` 上拉起之前停掉（连同它启动的进程，等它结束，至多约 2 秒），此后经旧出站的拨号立即得到 `external: a newer configuration of this policy is in use`，旧出站不再拉起程序；`args` 在 `profiles/current`、`policies/detail` 与 `lineHash` 里整体脱敏，日志只写策略名、pid 与退出码；两个策略写同一个 `local-port` 是错误（`E0018`），`local-port` 与 rurge 自己的 `http-listen` / `socks5-listen`（地址为回环或全零）同端口也是错误（`E0018`：`` policy `X`: `local-port` <p> is the port of rurge's own `socks5-listen` ``，否则 rurge 会连回自己）；`interface` `allow-other-interface` `tfo` `tos` `ip-version` `underlying-proxy` 不适用（`W0028`），不能叠 Shadow TLS（`E0018`）；`addresses`（阶段 3）解析但暂不生效（`W0029`），只收 IP 地址；`udp-relay=true`（M5a）时 UDP 经程序自己的 SOCKS5 UDP ASSOCIATE 转发，程序没在运行时同样先拉起；"外部进程的流量走 DIRECT"到阶段 3（有 TUN 才有意义）；订阅导入的 `external` 一律跳过（`W0023`）；干构建、`rurge check` 与 `POST /v1/profiles/check` 从不拉起程序 |
 
 ---
 
