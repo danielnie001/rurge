@@ -167,10 +167,42 @@ impl rurge_net::socket::SocketHook for PlatformSockets {
     }
 }
 
+/// `rurge-platform::process` behind the `ProcessHook` trait (AR-02): an
+/// `external` program leads a process group of its own on Unix and runs in
+/// a Job Object on Windows, so it is stopped with whatever it started.
+pub struct PlatformProcesses;
+
+struct PlatformTree(rurge_platform::process::ProcessTree);
+
+impl rurge_proto::external::ProcessGroup for PlatformTree {
+    fn terminate(&mut self) -> std::io::Result<()> {
+        self.0.terminate()
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.0.kill()
+    }
+}
+
+impl rurge_proto::external::ProcessHook for PlatformProcesses {
+    fn prepare(&self, command: &mut std::process::Command) {
+        rurge_platform::process::prepare(command);
+    }
+
+    fn contain(
+        &self,
+        pid: u32,
+    ) -> std::io::Result<Option<Box<dyn rurge_proto::external::ProcessGroup>>> {
+        let tree = rurge_platform::process::ProcessTree::contain(pid)?;
+        Ok(Some(Box::new(PlatformTree(tree))))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rurge_net::socket::{Family, SocketHook};
+    use rurge_proto::external::ProcessHook;
 
     /// Socket-level only: nothing about this machine's network is changed.
     #[test]
@@ -184,5 +216,37 @@ mod tests {
         );
         hook.set_tos(&socket, Family::V4, 0x28).unwrap();
         assert_eq!(socket.tos_v4().unwrap(), 0x28);
+    }
+
+    /// Nothing but this test's own child: a process that is not ours (no
+    /// such process) cannot be taken in.
+    #[test]
+    fn platform_processes_delegates_to_rurge_platform() {
+        let hook = PlatformProcesses;
+        #[cfg(windows)]
+        let mut command = {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/c", "ping -n 30 127.0.0.1"]);
+            c
+        };
+        #[cfg(unix)]
+        let mut command = std::process::Command::new("sleep");
+        #[cfg(unix)]
+        command.arg("30");
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null());
+        hook.prepare(&mut command);
+        let mut child = command.spawn().unwrap();
+        let mut group = hook.contain(child.id()).unwrap().expect("a group");
+        group.kill().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("the program is still running");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }

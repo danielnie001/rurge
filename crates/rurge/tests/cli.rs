@@ -352,6 +352,44 @@ fn check_knows_wireguard() {
         .stdout(predicate::str::contains("c2VjcmV0").not());
 }
 
+const EXTERNAL: &str = "[General]\n[Proxy]\n\
+X = external, exec = \"/usr/bin/sshpass\", args = -p, args = hunter2, args = ssh, local-port = 1080\n\
+Old = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Rule]\nFINAL,DIRECT\n";
+const EXTERNAL_SAME_PORT: &str = "[General]\n[Proxy]\n\
+X = external, exec = /bin/x, local-port = 1080\nY = external, exec = /bin/y, local-port = 1080\n\
+[Rule]\nFINAL,DIRECT\n";
+
+/// `rurge check` knows `external` policies and starts nothing; two on one
+/// `local-port` are an error at the second (M4 design 4.4, 7.5).
+#[test]
+fn check_knows_external() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "x.conf", EXTERNAL))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    // `ss` is still a later milestone; `external` is not
+    assert_eq!(out.matches("W0007").count(), 1, "{out}");
+    assert!(out.contains("`ss`") && !out.contains("`external`"), "{out}");
+    assert!(!out.contains("hunter2"), "{out}");
+
+    Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "same.conf", EXTERNAL_SAME_PORT))
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains(
+            "same.conf:4: policy `Y`: `local-port` 1080 is also the `local-port` of policy `X`",
+        ));
+}
+
 const SUBSCRIBED: &str = "[General]\n[Proxy Group]\nLocal = select, DIRECT, policy-path=nodes.txt\n\
 Remote = select, DIRECT, policy-path=https://sub.test/nodes?token=t0k3n\n[Rule]\nFINAL,Local\n";
 
@@ -1563,6 +1601,75 @@ mod run {
             !lines.iter().any(|l| l.contains("grace period elapsed")),
             "stop must not wait out the grace period: {lines:?}"
         );
+    }
+
+    /// `rurge run` starts an `external` policy's program on first use and
+    /// stops it on the way out (phase 2 M4 design 7.3, 8.2). The program is
+    /// a second rurge: a SOCKS5 proxy on the policy's `local-port`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_starts_an_external_program_and_stops_it_on_exit() {
+        let target = TestServer::spawn().await;
+        target.set("/hello", "hi from target");
+        let port = target.url("/").port().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let inner_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let inner = dir.path().join("inner.conf");
+        std::fs::write(
+            &inner,
+            format!("[General]\nsocks5-listen = 127.0.0.1:{inner_port}\nloglevel = warning\n[Rule]\nFINAL,DIRECT\n"),
+        )
+        .unwrap();
+        let quoted = |p: &Path| format!("\"{}\"", p.to_string_lossy().replace('\\', "\\\\"));
+        let conf = dir.path().join("t.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "[General]\n{API_GENERAL}\n[Proxy]\n\
+Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-network, args = --data-dir, args = {}, local-port = {inner_port}\n\
+[Rule]\nFINAL,Inner\n",
+                quoted(&assert_cmd::cargo::cargo_bin("rurge")),
+                quoted(&inner),
+                quoted(&dir.path().join("inner-data")),
+            ),
+        )
+        .unwrap();
+        let data = dir.path().join("data");
+        let mut daemon = tokio::task::spawn_blocking({
+            let (conf, data) = (conf.clone(), data.clone());
+            move || spawn_daemon(&conf, &data)
+        })
+        .await
+        .unwrap();
+        let api = api_port(&daemon);
+        let http_port = daemon.http;
+        let ok = tokio::task::spawn_blocking(move || {
+            http_get(http_port, &format!("http://127.0.0.1:{port}/hello"))
+        })
+        .await
+        .unwrap();
+        assert!(
+            ok.starts_with("HTTP/1.1 200") && ok.ends_with("hi from target"),
+            "{ok}"
+        );
+        let log = std::fs::read_to_string(data.join("external").join("Inner.log")).unwrap();
+        assert!(
+            log.contains(&format!("listening on socks5://127.0.0.1:{inner_port}")),
+            "{log}"
+        );
+        assert_eq!(api_call(api, "POST", "/v1/stop", "k", Some("{}")).0, 200);
+        assert_eq!(wait_for_exit(&mut daemon, 10), Some(0), "stop exits 0");
+        // the program is gone with rurge: its port no longer answers
+        wait_until("the inner rurge to end", || {
+            TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], inner_port)),
+                Duration::from_millis(500),
+            )
+            .is_err()
+        });
     }
 
     #[test]

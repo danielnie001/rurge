@@ -1,7 +1,7 @@
 //! `rurge run`: the foreground proxy daemon (M3 design §9.3).
 
 use super::rule::{parse_mode, print_diagnostics};
-use super::runtime::RuntimeArgs;
+use super::runtime::{PlatformProcesses, RuntimeArgs};
 use super::sysproxy::{SystemProxyManager, describe, proxy_settings};
 use crate::capabilities;
 use anyhow::Context;
@@ -670,6 +670,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         if args.empty_group_reject {
             shared.empty_group = EmptyGroup::Reject;
         }
+        shared.processes = Arc::new(PlatformProcesses);
         let engine_rt =
             build_engine_runtime(cfg, &rt, &run_opts, outbound_mode.clone(), &shared).await?;
         print_diagnostics(engine_rt.diagnostics());
@@ -844,6 +845,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             _ = &mut drain => {}
             _ = force_exit => {
                 println!("forced shutdown");
+                // no grace for the external programs either: ending the
+                // runtime ends the tasks that hold them, which kill them
                 return Ok(ExitCode::SUCCESS);
             }
             _ = tokio::time::sleep(GRACE) => {
@@ -854,6 +857,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 let _ = tokio::time::timeout(Duration::from_secs(1), &mut drain).await;
             }
         }
+        // the sessions are over: the programs behind `external` policies go
+        // last, each with what it started (phase 2 M4 design 7.3)
+        engine.stop_external_programs().await;
         Ok(ExitCode::SUCCESS)
     })
 }
