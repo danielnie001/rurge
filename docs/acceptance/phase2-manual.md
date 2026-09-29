@@ -156,3 +156,12 @@
 - [ ] 不支持 UDP 的策略：规则把 UDP 分到一条 `http` 策略，默认 REJECT（记录写 `policy does not support UDP`）；配置 `udp-policy-not-supported-behaviour = DIRECT` 后改经 DIRECT。
 - [ ] 关联结束：客户端断开（关闭软件），它的全部 UDP 记录随即结束。
 - [ ] NAT 后面的中继：上游 SOCKS5 节点放在带 NAT 的云主机上（本机私网地址、另有公网地址），看它对 UDP ASSOCIATE 回的中继地址：回未指定地址（`0.0.0.0`）或公网地址时 UDP 能往返；回私网地址时 UDP 不通（已知限制，见兼容性清单 `socks5` 一行），记下节点软件与它的设置。
+
+## M5b　TLS 族的 UDP
+
+前置：同 M5a 一节的 SOCKS5 UDP 客户端；自己的 `trojan`、`vmess`（`vmess-aead=true`）、`anytls` 节点各一个（服务端是 sing-box、xray 或其它常见实现，记下是哪个与版本）。
+
+- [ ] DNS：规则把 UDP 分到每个节点各一次，经 SOCKS5 UDP 发 DNS 查询（如 Proxifier 代理 `nslookup example.com 8.8.8.8`），都得到回答；请求记录的策略一列是那个节点。
+- [ ] 游戏或语音：经每个节点各进行一次语音通话或联机游戏，都能通话 / 联机。
+- [ ] 全锥与对称：用 NAT 类型检测工具（STUN）经 rurge 的 SOCKS5 检测——经 `trojan` 与 `anytls` 节点是 Full Cone（节点本身的出口须是全锥）；经 `vmess` 节点是 Symmetric（M5-D5，已知差异）。
+- [ ] WebSocket 与 TLS：`trojan` 或 `vmess` 节点开 `ws=true` 时 UDP 照常往返。
