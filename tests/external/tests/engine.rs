@@ -186,3 +186,71 @@ async fn a_reload_keeps_an_unchanged_program_and_stops_a_replaced_one() {
     h.engine.stop_external_programs().await;
     wait_closed(other).await;
 }
+
+/// A reload that changes the line but keeps its `local-port`: while the old
+/// outbound is still held (an in-flight dial, a test, a session's hook), the
+/// new program's first start stops the old program and its tree, so the new
+/// one gets the port and serves; the old outbound never starts a program
+/// again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reload_that_keeps_the_port_hands_it_to_the_new_program() {
+    let port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| {
+        dir.path()
+            .join(name)
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+    };
+    let old_extra = format!(
+        ", args = --record, args = \"{}\", args = --child, args = \"{}\"",
+        path("record"),
+        path("child-port")
+    );
+    let h = harness(&profile(port, &old_extra)).await;
+    let echo = echo_server().await;
+    echo_via(h.http, echo).await;
+    let grandchild: u16 = wait_for_file(&dir.path().join("child-port"))
+        .await
+        .trim()
+        .parse()
+        .unwrap();
+    // held past the reload, as a session's hook would hold it
+    let old = h.engine.registry().resolve_member("Ext").outbound;
+
+    let new_extra = format!(
+        ", args = --record, args = \"{}\", args = --served, args = \"{}\"",
+        path("record"),
+        path("served")
+    );
+    h.engine
+        .swap_runtime(runtime(h.dir.path(), &profile(port, &new_extra), h.engine.shared()).await);
+    echo_via(h.http, echo).await;
+    // the old program's tree is gone
+    wait_closed(grandchild).await;
+    let recorded = std::fs::read_to_string(dir.path().join("record")).unwrap();
+    let lines: Vec<&str> = recorded.lines().collect();
+    assert_eq!(lines.len(), 2, "{recorded}");
+    assert!(lines[1].contains("--served"), "{recorded}");
+    let new_pid = lines[1]
+        .split(' ')
+        .next()
+        .unwrap()
+        .trim_start_matches("pid=");
+    // the session went through the new program
+    let served = wait_for_file(&dir.path().join("served")).await;
+    assert_eq!(served.lines().collect::<Vec<_>>(), [new_pid], "{served}");
+
+    let err = old
+        .connect_tcp(&target(echo), &ConnectOpts::default())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(
+        err.to_string(),
+        "external: a newer configuration of this policy is in use"
+    );
+    drop(old);
+    h.engine.stop_external_programs().await;
+    wait_closed(port).await;
+}

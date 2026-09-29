@@ -139,6 +139,30 @@ async fn stopping_ends_the_whole_tree() {
     o.stop().await;
 }
 
+/// A program that exits by itself takes what it started with it: a child
+/// left behind would hold the port the next start needs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_program_that_exits_ends_its_whole_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let child_port = dir.path().join("child-port");
+    let o = outbound(
+        "Ext",
+        &args(
+            port,
+            &["--serve", "1", "--child", &child_port.to_string_lossy()],
+        ),
+        port,
+        dir.path(),
+    );
+    round_trip(&o, echo_server().await).await.unwrap();
+    let grandchild: u16 = wait_for_file(&child_port).await.trim().parse().unwrap();
+    // one session served: the program exits, and its child goes with it
+    wait_closed(port).await;
+    wait_closed(grandchild).await;
+    o.stop().await;
+}
+
 /// A released outbound stops its program (M4 design 7.4: a reload that
 /// replaces the policy).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

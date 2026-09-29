@@ -3,7 +3,7 @@
 //! 127.0.0.1 only and connects nowhere but where its client asks.
 //!
 //! socks-helper --port <p> [--record <file>] [--delay-ms <n>] [--serve <n>]
-//!              [--child <file>]
+//!              [--child <file>] [--served <file>]
 //! socks-helper --hold <file>
 //!
 //! `--record` appends its process id, its arguments and the proxy variables
@@ -12,7 +12,10 @@
 //! connection given up before its request does not count); `--child` starts
 //! a copy of itself in
 //! `--hold` mode, which listens on a port of its own, writes the port to
-//! `<file>` and runs until ended.
+//! `<file>` and runs until ended; `--served` appends its process id to
+//! `<file>` for every relayed session. When its port is taken it keeps
+//! running without listening, as `ssh -D` does without
+//! `ExitOnForwardFailure`.
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -61,7 +64,16 @@ fn main() {
         std::thread::sleep(Duration::from_millis(ms));
     }
     let serve: Option<usize> = value(&args, "--serve").and_then(|v| v.parse().ok());
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let served = value(&args, "--served");
+    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+        Ok(listener) => listener,
+        Err(e) => {
+            println!("socks-helper could not listen on 127.0.0.1:{port}: {e}");
+            loop {
+                std::thread::park();
+            }
+        }
+    };
     println!("socks-helper listening on 127.0.0.1:{port}");
     // started once listening: by then rurge has long taken this process in
     // (a child started in the first instants of a program would escape a
@@ -74,6 +86,7 @@ fn main() {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             if serve_one(stream).unwrap_or(false) {
+                note(served.as_deref());
                 relayed += 1;
                 if relayed >= limit {
                     return;
@@ -83,9 +96,24 @@ fn main() {
     }
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        let served = served.clone();
         std::thread::spawn(move || {
-            let _ = serve_one(stream);
+            if serve_one(stream).unwrap_or(false) {
+                note(served.as_deref());
+            }
         });
+    }
+}
+
+/// One relayed session, for `--served`.
+fn note(file: Option<&str>) {
+    if let Some(file) = file {
+        let mut out = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file)
+            .unwrap();
+        writeln!(out, "{}", std::process::id()).unwrap();
     }
 }
 

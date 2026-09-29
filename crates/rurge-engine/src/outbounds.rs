@@ -231,16 +231,22 @@ impl OutboundFactory for EngineFactory {
             ),
             // nothing starts here: the program starts on the first dial
             ProtoSpec::External(external) => {
-                let outbound = Arc::new(ExternalOutbound::new(
+                let outbound = ExternalOutbound::new(
                     &spec.name,
                     external,
                     &self.external_logs,
                     self.processes.clone(),
-                ));
-                if !self.dry {
+                );
+                if self.dry {
+                    Arc::new(outbound)
+                } else {
+                    // a rebuilt policy takes its port from the older
+                    // generation's outbound when its program first starts
+                    let outbound =
+                        Arc::new(outbound.with_local_ports(self.externals.local_ports()));
                     self.externals.add(&outbound);
+                    outbound
                 }
-                outbound
             }
         };
         if !self.dry && skips_verification(spec) {

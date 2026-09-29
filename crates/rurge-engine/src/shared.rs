@@ -6,7 +6,7 @@ use rurge_net::connector::Resolve;
 use rurge_policy::auto::AutoGroups;
 use rurge_policy::testbook::TestBook;
 use rurge_policy::{EmptyGroup, GroupSelections, RegistryCell, SelectionTable};
-use rurge_proto::external::{ExternalOutbound, NoProcessGroups, ProcessHook};
+use rurge_proto::external::{ExternalOutbound, LocalPorts, NoProcessGroups, ProcessHook};
 use rustls::RootCertStore;
 use std::io;
 use std::net::IpAddr;
@@ -45,13 +45,22 @@ impl Resolve for ResolverCell {
 
 /// Every `external` outbound built for the engine that still exists, in
 /// whatever generation: the exit flow stops their programs (phase 2 M4
-/// design 8.2).
+/// design 8.2). Their local ports are kept track of across generations too:
+/// a rebuilt policy's program takes its port from the older one.
 #[derive(Default)]
-pub struct ExternalPrograms(Mutex<Vec<Weak<ExternalOutbound>>>);
+pub struct ExternalPrograms {
+    list: Mutex<Vec<Weak<ExternalOutbound>>>,
+    ports: Arc<LocalPorts>,
+}
 
 impl ExternalPrograms {
+    /// What every `external` outbound of the engine shares its ports through.
+    pub(crate) fn local_ports(&self) -> Arc<LocalPorts> {
+        self.ports.clone()
+    }
+
     pub(crate) fn add(&self, outbound: &Arc<ExternalOutbound>) {
-        let mut list = self.0.lock().expect("external program list");
+        let mut list = self.list.lock().expect("external program list");
         list.retain(|o| o.strong_count() > 0);
         list.push(Arc::downgrade(outbound));
     }
@@ -60,7 +69,7 @@ impl ExternalPrograms {
     /// are gone.
     pub async fn stop_all(&self) {
         let live: Vec<Arc<ExternalOutbound>> = self
-            .0
+            .list
             .lock()
             .expect("external program list")
             .iter()

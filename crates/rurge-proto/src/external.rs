@@ -13,7 +13,8 @@ use std::io::{self, Write as _};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, oneshot};
@@ -164,6 +165,72 @@ struct Slot {
     failed: Option<io::ErrorKind>,
 }
 
+/// Orders outbounds by construction: of two on one port, the later one
+/// belongs to the newer configuration.
+static NEXT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// One outbound's program, as `LocalPorts` sees it.
+struct Program {
+    seq: u64,
+    port: u16,
+    slot: Mutex<Slot>,
+    /// A newer outbound on the same port has taken it: this one never
+    /// starts a program again.
+    retired: AtomicBool,
+}
+
+impl Program {
+    /// Stops the program and whatever it started, when it runs; returns
+    /// when they are gone (at most about `STOP_GRACE` later).
+    async fn stop(&self) {
+        let running = self.slot.lock().await.running.take();
+        if let Some(Running { stop, task }) = running {
+            let _ = stop.send(());
+            let _ = task.await;
+        }
+    }
+}
+
+/// The local ports of the programs started so far, across generations: a
+/// reload that changes a policy but keeps its `local-port` builds a new
+/// outbound while the old one may still be held (an in-flight dial, a test,
+/// a session's hook). Before the new outbound starts its program, the older
+/// outbounds of that port are retired: their programs are stopped, so the
+/// new program can listen there, and they never start one again.
+#[derive(Default)]
+pub struct LocalPorts(std::sync::Mutex<Vec<Weak<Program>>>);
+
+impl LocalPorts {
+    /// `program` is about to start: returns the older programs of its port,
+    /// now retired, to be stopped. `None`: a newer outbound has retired
+    /// `program` itself.
+    fn claim(&self, program: &Arc<Program>) -> Option<Vec<Arc<Program>>> {
+        let mut list = self.0.lock().expect("local port list");
+        if program.retired.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut older = Vec::new();
+        let mut listed = false;
+        list.retain(|weak| {
+            let Some(other) = weak.upgrade() else {
+                return false;
+            };
+            if Arc::ptr_eq(&other, program) {
+                listed = true;
+            } else if other.port == program.port && other.seq < program.seq {
+                other.retired.store(true, Ordering::Release);
+                older.push(other);
+                return false;
+            }
+            true
+        });
+        if !listed {
+            list.push(Arc::downgrade(program));
+        }
+        Some(older)
+    }
+}
+
 pub struct ExternalOutbound {
     name: String,
     exec: String,
@@ -171,16 +238,22 @@ pub struct ExternalOutbound {
     port: u16,
     log: PathBuf,
     hook: Arc<dyn ProcessHook>,
-    slot: Mutex<Slot>,
+    program: Arc<Program>,
+    ports: Arc<LocalPorts>,
 }
 
 fn start_failed(policy: &str, kind: io::ErrorKind) -> OutboundError {
     OutboundError::Proxy(format!("external: could not start {policy} ({kind})"))
 }
 
+fn retired() -> OutboundError {
+    OutboundError::Proxy("external: a newer configuration of this policy is in use".to_string())
+}
+
 impl ExternalOutbound {
     /// Nothing starts here: a build only checks (M4 design 7.5). The log
-    /// goes to `log_dir`.
+    /// goes to `log_dir`. The outbound shares its port bookkeeping with no
+    /// other until `with_local_ports`.
     pub fn new(
         name: &str,
         spec: &ExternalSpec,
@@ -194,8 +267,22 @@ impl ExternalOutbound {
             port: spec.local_port,
             log: log_dir.join(log_file_name(name)),
             hook,
-            slot: Mutex::new(Slot::default()),
+            program: Arc::new(Program {
+                seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
+                port: spec.local_port,
+                slot: Mutex::new(Slot::default()),
+                retired: AtomicBool::new(false),
+            }),
+            ports: Arc::new(LocalPorts::default()),
         }
+    }
+
+    /// Takes the port from the older outbounds registered in `ports` when
+    /// the program first starts (an engine passes one `LocalPorts` for all
+    /// its generations).
+    pub fn with_local_ports(mut self, ports: Arc<LocalPorts>) -> ExternalOutbound {
+        self.ports = ports;
+        self
     }
 
     /// Where the program's output goes.
@@ -206,18 +293,18 @@ impl ExternalOutbound {
     /// Stops the program and whatever it started, when it runs; returns
     /// when they are gone (at most about `STOP_GRACE` later).
     pub async fn stop(&self) {
-        let running = self.slot.lock().await.running.take();
-        if let Some(Running { stop, task }) = running {
-            let _ = stop.send(());
-            let _ = task.await;
-        }
+        self.program.stop().await;
     }
 
     /// Starts the program unless it runs. Within `START_GAP` of the last
     /// start nothing is started: a failed start is failed again, and a
-    /// program that has exited since is left to the caller's retries.
+    /// program that has exited since is left to the caller's retries. An
+    /// outbound whose port a newer one has taken fails at once.
     async fn ensure_started(&self) -> Result<(), OutboundError> {
-        let mut slot = self.slot.lock().await;
+        let mut slot = self.program.slot.lock().await;
+        if self.program.retired.load(Ordering::Acquire) {
+            return Err(retired());
+        }
         if slot
             .running
             .as_ref()
@@ -233,6 +320,14 @@ impl ExternalOutbound {
                 Some(kind) => Err(start_failed(&self.name, kind)),
                 None => Ok(()),
             };
+        }
+        // the older programs of this port go first: the new one could not
+        // listen there while one of them runs
+        let Some(older) = self.ports.claim(&self.program) else {
+            return Err(retired());
+        };
+        for program in older {
+            program.stop().await;
         }
         slot.started = Some(Instant::now());
         match self.start() {
@@ -257,7 +352,11 @@ impl ExternalOutbound {
         // the last resort, should the watching task be dropped unfinished
         command.kill_on_drop(true);
         let child = command.spawn()?;
-        let pid = child.id().unwrap_or(0);
+        // no id: the program has already been reaped (and a group of 0 would
+        // be rurge's own)
+        let pid = child
+            .id()
+            .ok_or_else(|| io::Error::other("the program exited at once"))?;
         // an error drops `child`, which kills it
         let group = self.hook.contain(pid)?;
         tracing::info!(policy = %self.name, pid, "external: the program started");
@@ -479,7 +578,7 @@ mod tests {
             err.to_string(),
             format!("external: could not start P ({})", io::ErrorKind::NotFound)
         );
-        let at = o.slot.lock().await.started;
+        let at = o.program.slot.lock().await.started;
         let again = o
             .connect_tcp(&target, &ConnectOpts::default())
             .await
@@ -487,7 +586,7 @@ mod tests {
             .unwrap();
         assert_eq!(again.to_string(), err.to_string());
         assert_eq!(
-            o.slot.lock().await.started,
+            o.program.slot.lock().await.started,
             at,
             "no second start within the gap"
         );
@@ -509,7 +608,55 @@ mod tests {
             err.to_string(),
             "socks5: the host name is longer than 255 bytes"
         );
-        assert!(o.slot.lock().await.started.is_none());
+        assert!(o.program.slot.lock().await.started.is_none());
         assert!(!o.log_path().exists());
+    }
+
+    /// Of two outbounds on one port, the newer takes the port when it first
+    /// starts; the older then fails at once and never starts again. An older
+    /// outbound never takes the port from a newer one, and other ports are
+    /// left alone.
+    #[tokio::test]
+    async fn a_newer_outbound_on_the_same_port_retires_the_older() {
+        let dir = tempfile::tempdir().unwrap();
+        let ports = Arc::new(LocalPorts::default());
+        let missing = "./no-such-program-for-rurge";
+        let old = outbound(missing, 9, dir.path()).with_local_ports(ports.clone());
+        let elsewhere = outbound(missing, 10, dir.path()).with_local_ports(ports.clone());
+        let new = outbound(missing, 9, dir.path()).with_local_ports(ports.clone());
+        let target = Target::new(rurge_config::HostName::parse("t.test"), 80);
+        let could_not_start = format!("external: could not start P ({})", io::ErrorKind::NotFound);
+        // the older one starts first: the newer one is left alone
+        let err = old
+            .connect_tcp(&target, &ConnectOpts::default())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.to_string(), could_not_start);
+        assert!(!new.program.retired.load(Ordering::Acquire));
+        let err = elsewhere
+            .connect_tcp(&target, &ConnectOpts::default())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.to_string(), could_not_start);
+        // the newer one's first start retires the older
+        let err = new
+            .connect_tcp(&target, &ConnectOpts::default())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.to_string(), could_not_start);
+        let err = old
+            .connect_tcp(&target, &ConnectOpts::default())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "external: a newer configuration of this policy is in use"
+        );
+        assert!(!elsewhere.program.retired.load(Ordering::Acquire));
+        assert!(!new.program.retired.load(Ordering::Acquire));
     }
 }
