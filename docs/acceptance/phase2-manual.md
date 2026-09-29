@@ -131,12 +131,15 @@
 
 ## M4c　external
 
-前置：本机能用 `ssh` 登录一台自己的服务器（密钥登录，不需要输入口令）。配置里写 `[Proxy]` 一条 `Ext = external, exec = "<ssh 的完整路径>", args = "-N", args = "-D", args = "127.0.0.1:1080", args = "<用户>@<服务器>", local-port = 1080`，`[Rule]` 里 `FINAL,Ext`；`rurge check -c <配置>` 零错误（没有 `W0007`）。三个平台各验一遍。
+前置：本机能用 `ssh` 登录一台自己的服务器（密钥登录，不需要输入口令），服务器的主机密钥已在 `known_hosts` 里。外部程序不能交互式提问（Unix 上读终端会被挂起，rurge 仍当它在运行），所以 `ssh` 一律带 `-o BatchMode=yes -o ExitOnForwardFailure=yes`（后者让本机端口绑定失败时 `ssh` 直接退出）。配置里写 `[Proxy]` 一条 `Ext = external, exec = "<ssh 的完整路径>", args = "-N", args = "-o", args = "BatchMode=yes", args = "-o", args = "ExitOnForwardFailure=yes", args = "-D", args = "127.0.0.1:1080", args = "<用户>@<服务器>", local-port = 1080`，`[Rule]` 里 `FINAL,Ext`；`rurge check -c <配置>` 零错误（没有 `W0007`）。三个平台各验一遍。
 
 - [ ] 第一次用到时拉起：`rurge run -c <配置> --log-level info` 启动后没有 `ssh` 进程；`curl -x http://127.0.0.1:<http-listen 端口> https://example.com/ -I` 返回 200，此时有了 `ssh` 进程，日志里有 `external: the program started`（策略名与 pid，没有参数）。
 - [ ] 日志文件：`<数据目录>/external/Ext.log` 里有一行 `--- rurge: starting the program …`，`ssh` 自己的输出（如有）在它后面。
 - [ ] 再拉起：手动结束这个 `ssh` 进程，日志里有 `external: the program exited`；再发一个请求，2 秒左右后返回 200，出现了新的 `ssh` 进程。
 - [ ] 停止：`rurge stop`（或 Ctrl-C）之后没有 `ssh` 进程残留（Windows：任务管理器；Unix：`ps`）；日志里有 `external: the program stopped`。
 - [ ] Windows 上结束 rurge 进程（任务管理器里"结束任务"）：`ssh` 进程随之消失。
+- [ ] Windows 上在运行 rurge 的控制台里按一次 Ctrl-C：日志里是 `external: the program stopped`（不是 `exited`），之后没有 `ssh` 进程残留。
+- [ ] 重载时改了这一行（如多加一个 `args = "-v"`）而 `local-port` 不变：重载后第一个请求返回 200，只剩一个 `ssh` 进程（新的那个），日志里旧程序有 `external: the program stopped`。
+- [ ] 未知主机：把服务器换成一台主机密钥不在 `known_hosts` 里的（或临时改名 `known_hosts`），带着 `BatchMode=yes`：请求失败（不挂住），`<数据目录>/external/Ext.log` 里有 `ssh` 给出的原因（如 `Host key verification failed.`）。
 - [ ] 脱敏：`GET /v1/policies/detail?policy_name=Ext` 与 `GET /v1/profiles/current` 里每个 `args` 都是 `***`；日志（含 `--log-level verbose`）里搜不到服务器地址与用户名。
 - [ ] 订阅：把一行 `external` 放进自己的订阅文件，重载后该行被跳过，`rurge check` 报 `` `external` policies are not imported from subscriptions ``。
