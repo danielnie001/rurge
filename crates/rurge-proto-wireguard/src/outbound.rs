@@ -1355,6 +1355,104 @@ mod tests {
         assert_eq!(peer.core().handshakes, 1);
     }
 
+    /// Dials through `inner`; once `dead` is set, the first carrier fails
+    /// every receive with `BrokenPipe`, as a chain's closed association
+    /// does, and counts the polls.
+    struct Dying {
+        inner: Arc<dyn Connector>,
+        dead: Arc<AtomicBool>,
+        dials: Arc<AtomicUsize>,
+        polls: Arc<AtomicUsize>,
+    }
+
+    struct DyingDatagram {
+        inner: BoxedDatagram,
+        /// The switch and the poll counter, on the first carrier only.
+        first: Option<(Arc<AtomicBool>, Arc<AtomicUsize>)>,
+    }
+
+    impl Connector for Dying {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            self.inner.connect(target, opts)
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            Box::pin(async move {
+                let first = self.dials.fetch_add(1, Ordering::SeqCst) == 0;
+                let inner = self.inner.connect_udp(target, opts).await?;
+                let first = first.then(|| (self.dead.clone(), self.polls.clone()));
+                Ok(Box::new(DyingDatagram { inner, first }) as BoxedDatagram)
+            })
+        }
+    }
+
+    impl Datagram for DyingDatagram {
+        fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            self.inner.poll_send(cx, buf)
+        }
+
+        fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            if let Some((dead, polls)) = &self.first
+                && dead.load(Ordering::SeqCst)
+            {
+                polls.fetch_add(1, Ordering::SeqCst);
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
+            self.inner.poll_recv(cx, buf)
+        }
+
+        fn peer_addr(&self) -> Option<SocketAddr> {
+            self.inner.peer_addr()
+        }
+    }
+
+    /// A carrier whose receiving has ended for good is dropped, not polled
+    /// again and again, and dialled anew: the tunnel carries on over the
+    /// new one.
+    #[tokio::test]
+    async fn a_carrier_that_has_ended_is_replaced_and_not_spun_on() {
+        let (dead, dials, polls) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let dying: Arc<dyn Connector> = Arc::new(Dying {
+            inner: direct(),
+            dead: dead.clone(),
+            dials: dials.clone(),
+            polls: polls.clone(),
+        });
+        let (peer, wg) = tunnel_with(PeerOpts::default(), |_| {}, no_names(), dying).await;
+        let mut stream = wg
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        assert_eq!(echo(&mut stream, b"before").await, b"before");
+
+        dead.store(true, Ordering::SeqCst);
+        // traffic wakes the driver, which finds the carrier ended
+        let mut fresh = wg
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection over a new carrier");
+        assert_eq!(echo(&mut fresh, b"after").await, b"after");
+        assert_eq!(dials.load(Ordering::SeqCst), 2, "a second carrier");
+        assert_eq!(peer.core().handshakes, 2, "the peer was greeted on it");
+        assert!(
+            polls.load(Ordering::SeqCst) < 20,
+            "the ended carrier was polled {} times",
+            polls.load(Ordering::SeqCst)
+        );
+    }
+
     /// A peer that cannot be reached when the tunnel starts is dialled
     /// again every `redial`; the others carry on meanwhile.
     #[tokio::test]

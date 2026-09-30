@@ -463,6 +463,15 @@ fn gone(e: &io::Error) -> bool {
     )
 }
 
+/// Whether a failed receive says the carrier itself has ended, rather than
+/// an ICMP error passing on a connected socket.
+fn ended_for_good(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected
+    )
+}
+
 /// Sends `message` on `carrier`; what went wrong when it did not go out.
 async fn send(carrier: &mut Carrier, message: &Outgoing) -> io::Result<()> {
     let marked =
@@ -655,6 +664,7 @@ impl Driver {
                 _ = self.shared.kick.notified() => {}
                 (peer, received) = recv_any(&self.carriers, &mut buf, &mut first) => {
                     let mut completed = Vec::new();
+                    let mut ended = Vec::new();
                     let mut arrived = Some((peer, received));
                     let mut taken = 0;
                     while let Some((peer, received)) = arrived {
@@ -665,6 +675,15 @@ impl Driver {
                                 let mut stack = self.shared.stack.lock().expect("the tunnel");
                                 if stack.receive(peer, &mut buf[..n], Instant::now(), &mut out) {
                                     completed.push(peer);
+                                }
+                            }
+                            // the carrier has ended (a chain's association
+                            // closed): it would fail every poll from now on
+                            Err(e) if ended_for_good(&e) => {
+                                // dropped now, so the batch below skips it
+                                self.carriers[peer] = None;
+                                if !ended.contains(&peer) {
+                                    ended.push(peer);
                                 }
                             }
                             // an ICMP error the system reports on a connected socket
@@ -678,6 +697,13 @@ impl Driver {
                             None
                         };
                     }
+                    // dialled anew (at most once per `REPLACE` each, as for
+                    // a failed send)
+                    for &peer in &ended {
+                        self.up[peer] = false;
+                        tracing::warn!(policy = %self.policy, peer = peer + 1, "wireguard: the peer's carrier has ended");
+                    }
+                    self.replace_failed(&mut dials, ended);
                     if !completed.is_empty() {
                         self.shared.handshaken.notify_waiters();
                     }
