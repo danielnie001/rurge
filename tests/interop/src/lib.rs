@@ -6,6 +6,7 @@
 //! never holds a key that touches the machine (`set_system_proxy`, `tun`,
 //! `auto_route`; a WireGuard endpoint runs in user space).
 
+pub mod shadowsocks_rust;
 pub mod sshd;
 pub mod xray;
 
@@ -80,6 +81,12 @@ pub enum InboundKind {
         handshake_port: u16,
         detour: usize,
     },
+    /// `users[0]` holds the password (the name is ignored); the further
+    /// users are 2022 users, told apart by the identity header, and the
+    /// password is then the server's identity key.
+    Shadowsocks {
+        method: &'static str,
+    },
 }
 
 pub struct TlsFiles {
@@ -116,6 +123,7 @@ pub fn render(inbounds: &[(Inbound, u16)]) -> Value {
                     InboundKind::Vmess => "vmess",
                     InboundKind::AnyTls => "anytls",
                     InboundKind::ShadowTls { .. } => "shadowtls",
+                    InboundKind::Shadowsocks { .. } => "shadowsocks",
                 },
                 "tag": format!("in-{i}"),
                 "listen": "127.0.0.1",
@@ -138,6 +146,16 @@ pub fn render(inbounds: &[(Inbound, u16)]) -> Value {
                 // a loopback IP literal: sing-box resolves nothing
                 v["handshake"] = json!({ "server": "127.0.0.1", "server_port": handshake_port });
                 v["detour"] = json!(format!("in-{detour}"));
+            } else if let InboundKind::Shadowsocks { method } = inbound.kind {
+                let (_, password) = inbound.users.first().expect("a Shadowsocks password");
+                v["method"] = json!(method);
+                v["password"] = json!(password);
+                if inbound.users.len() > 1 {
+                    v["users"] = inbound.users[1..]
+                        .iter()
+                        .map(|(u, p)| json!({ "name": u, "password": p }))
+                        .collect();
+                }
             } else if !inbound.users.is_empty() {
                 v["users"] = inbound
                     .users
@@ -463,6 +481,31 @@ mod tests {
                 },
                 1008,
             ),
+            (
+                Inbound {
+                    kind: InboundKind::Shadowsocks {
+                        method: "aes-256-gcm",
+                    },
+                    users: vec![("ignored".into(), "s3same".into())],
+                    tls: None,
+                    ws_path: None,
+                },
+                1009,
+            ),
+            (
+                Inbound {
+                    kind: InboundKind::Shadowsocks {
+                        method: "2022-blake3-aes-128-gcm",
+                    },
+                    users: vec![
+                        ("ignored".into(), "MDEyMzQ1Njc4OWFiY2RlZg==".into()),
+                        ("u".into(), "ZmVkY2JhOTg3NjU0MzIxMA==".into()),
+                    ],
+                    tls: None,
+                    ws_path: None,
+                },
+                1010,
+            ),
         ]
     }
 
@@ -542,6 +585,23 @@ mod tests {
         );
         assert!(v2.get("users").is_none() && v2.get("strict_mode").is_none());
         assert_eq!(v2["detour"], "in-3");
+        // one password; the further users are 2022 users under the server's key
+        let ss = &config["inbounds"][8];
+        assert_eq!(
+            (&ss["type"], &ss["method"], &ss["password"]),
+            (
+                &json!("shadowsocks"),
+                &json!("aes-256-gcm"),
+                &json!("s3same")
+            )
+        );
+        assert!(ss.get("users").is_none() && ss.get("network").is_none());
+        let multi = &config["inbounds"][9];
+        assert_eq!(multi["password"], "MDEyMzQ1Njc4OWFiY2RlZg==");
+        assert_eq!(
+            multi["users"],
+            json!([{ "name": "u", "password": "ZmVkY2JhOTg3NjU0MzIxMA==" }])
+        );
     }
 
     fn endpoint() -> WireGuardEndpoint {

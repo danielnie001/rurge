@@ -175,3 +175,17 @@
 - [ ] UDP 测试：给一个节点写 `test-udp=apple.com@8.8.8.8`，`POST /v1/policies/test` 的结果里有 `udp` 键与延迟；不写 `test-udp`、写 `[General] proxy-test-udp` 时同样有；`http` 策略的结果里没有 `udp` 键。
 - [ ] `smart` 与 UDP：`smart` 组里放一个 UDP 通的节点与一个 UDP 不通的节点（服务端关掉 UDP），经这个组发一阵 DNS 查询后，UDP 不通的节点的站点记忆里记为失败（日志的健康切换），通的节点记为成功。
 - [ ] `dns-follow-interface`：`direct` 策略写 `interface=<第二块网卡>, dns-follow-interface=true`，`dns-server` 写一个只经第二块网卡可达的 DNS 服务器（或用抓包确认），规则把某个域名分到这条策略，访问它：抓包看到 DNS 查询从第二块网卡发出；配了 `encrypted-dns-server` 时查询照常走加密 DNS，日志有一条 `dns-follow-interface: the encrypted DNS servers are asked as usual` 的说明。
+
+## M6a　Shadowsocks
+
+前置：同 M5a 一节的 SOCKS5 UDP 客户端；自己的 Shadowsocks 节点（记下服务端实现与版本，如 shadowsocks-rust、shadowsocks-libev、sing-box、Xray），至少一个 AEAD 方法（如 `aes-256-gcm` 或 `chacha20-ietf-poly1305`）与一个 2022 方法（`2022-blake3-aes-128-gcm` 或 `2022-blake3-aes-256-gcm`），都开 UDP；一个配了多用户（SIP023 身份头）的 2022 节点；一个带 simple-obfs 的节点（服务端插件 `obfs-server`，`http` 与 `tls` 两种模式各一次）。每份配置 `[Rule]` 里 `FINAL,<策略名>`，`rurge check -c <配置>` 零错误（没有 `W0007`）。
+
+- [ ] AEAD 的 TCP：`ss` 策略写 `encrypt-method=<方法>, password=<口令>`，`curl -x http://127.0.0.1:<http-listen 端口> https://example.com/ -I` 与 `curl --socks5-hostname 127.0.0.1:<socks5-listen 端口> https://example.com/ -I` 都返回 200，请求记录里策略链是该策略、`error` 为空；服务端先说话的协议（经代理连一个 SMTP / SSH 主机）能看到对端的欢迎行。
+- [ ] 2022 的 TCP：`encrypt-method=2022-blake3-…, password=<Base64 密钥>`，同上；本机时钟准确。
+- [ ] UDP：两个节点都加 `udp-relay=true`，经 SOCKS5 UDP 发 DNS 查询（如 Proxifier 代理 `nslookup example.com 8.8.8.8`）得到回答；经它进行一次语音通话或联机游戏；用 NAT 类型检测工具（STUN）检测，结果是 Full Cone（节点的出口须是全锥）。去掉 `udp-relay=true` 后 UDP 按 `udp-policy-not-supported-behaviour` 处理（默认 REJECT，记录写 `policy does not support UDP`）。
+- [ ] 多用户：`password=<服务端密钥>:<用户密钥>` 连多用户节点，TCP 与 UDP 都能往返；服务端日志（若有）认出的是这个用户。把用户密钥换成节点不认识的一把，连接得不到应答（`ss: the server closed the connection without answering`）。
+- [ ] obfs：`obfs=http, obfs-host=<伪装域名>` 与 `obfs=tls, obfs-host=<伪装域名>` 各连一次带 `obfs-server` 的节点，TCP 都能往返；抓包看到 `http` 模式的首个包是带 `Host: <伪装域名>:<端口>`（端口为 80 时不带端口）与 `Upgrade: websocket` 的 `GET` 请求，`tls` 模式的首个包是 SNI 为伪装域名的 ClientHello；不写 `obfs-host` 时伪装域名是服务器主机名。
+- [ ] `udp-port`：服务端的 UDP 另开在一个端口上（或经端口转发把 UDP 转到另一个端口），策略写 `udp-port=<该端口>`，UDP 照常往返；抓包确认 UDP 发往 `udp-port`、TCP 仍发往主端口。
+- [ ] 口令错误：把 AEAD 节点的 `password` 改错一位，重载后访问 `https://example.com/`：请求失败，会话记录的 `error` 是 `ss: the server closed the connection without answering`（或转发阶段的错误；服务端一直不回时由空闲超时结束），与服务端的其它问题分辨不出（已知差异，见兼容性清单 `ss` 一行）；**错误文本与日志都不含口令**。2022 节点把密钥换成另一把合法长度的 Base64 密钥，表现相同；把密钥写成不合法的 Base64，`rurge check` 报 `E0018` 且不引用取值。
+- [ ] 时钟偏差：2022 节点，把本机时钟拨偏 2 分钟（超出 30 秒的窗口），重复 TCP 一项：服务端不应答，会话记录的 `error` 同上一项；改回时钟后恢复正常。
+- [ ] 脱敏：`GET /v1/policies/detail?policy_name=<策略名>` 与 `GET /v1/profiles/current` 里 `password` 与 `obfs-host` 都是 `***`。
