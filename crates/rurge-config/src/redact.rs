@@ -23,10 +23,11 @@ const SECRET_KEYS: [&str; 7] = [
 /// policy's `test-url` can come from a subscription line and carry its
 /// token. A `[WireGuard]` peer's `preshared-key` is the manual's spelling;
 /// `pre-shared-key` stays for profiles written the other way. An `external`
-/// policy's `args` often carry a password (`sshpass -p …`, M4-D12).
+/// policy's `args` often carry a password (`sshpass -p …`, M4-D12). The
+/// camouflage host of `obfs-host` can identify the user (phase 2 M6 design 6).
 /// Over-redacting is the safe side for an endpoint whose purpose is safe
 /// output.
-const SECRET_PARAMS: [&str; 17] = [
+const SECRET_PARAMS: [&str; 18] = [
     "password",
     "psk",
     "private-key",
@@ -44,6 +45,7 @@ const SECRET_PARAMS: [&str; 17] = [
     "external-policy-modifier",
     "test-url",
     "args",
+    "obfs-host",
 ];
 const KEY_AT_KEYS: [&str; 4] = [
     "http-api",
@@ -569,6 +571,18 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
                 "external, exec = \"/usr/bin/sshpass\", args = \"-p\", args = \"hunter2, really\", args=ssh, local-port = 1080"
             ),
             "external, exec = \"/usr/bin/sshpass\", args = ***, args = ***, args=***, local-port = 1080"
+        );
+    }
+
+    /// The camouflage host of an `ss` / `snell` line (phase 2 M6 design 6);
+    /// `obfs-uri` and the method stay.
+    #[test]
+    fn an_obfs_line_loses_its_host() {
+        assert_eq!(
+            redact_definition(
+                "ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=pw, obfs=http, obfs-host=my.cdn.test, obfs-uri=/x"
+            ),
+            "ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=***, obfs=http, obfs-host=***, obfs-uri=/x"
         );
     }
 }

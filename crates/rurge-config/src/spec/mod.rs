@@ -5,10 +5,12 @@ pub mod common;
 pub mod external;
 pub mod group;
 pub mod http;
+pub mod obfs;
 pub mod reader;
 pub mod secret;
 pub mod shadow_tls;
 pub mod socks5;
+pub mod ss;
 pub mod ssh;
 pub mod tls;
 pub mod trojan;
@@ -23,10 +25,12 @@ pub use group::{
     GroupOutcome, GroupSpec, ImportOpts, PolicyPath, Priority, TestOpts, to_group_spec,
 };
 pub use http::{HeaderPart, HeaderTemplate, HttpSpec};
+pub use obfs::{ObfsMode, ObfsOpts};
 pub use reader::ParamReader;
 pub use secret::Secret;
 pub use shadow_tls::{ShadowTlsOpts, ShadowTlsVersion};
 pub use socks5::Socks5Spec;
+pub use ss::{SsMethod, SsSpec};
 pub use ssh::{HostKeyPin, SshSpec};
 pub use tls::{Sni, TlsOpts};
 pub use trojan::TrojanSpec;
@@ -69,6 +73,7 @@ pub enum ProtoSpec {
     Ssh(SshSpec),
     WireGuard(WireGuardSpec),
     External(ExternalSpec),
+    Ss(SsSpec),
 }
 
 impl ProtoSpec {
@@ -84,7 +89,8 @@ impl ProtoSpec {
             | ProtoSpec::Reject(_)
             | ProtoSpec::Ssh(_)
             | ProtoSpec::WireGuard(_)
-            | ProtoSpec::External(_) => None,
+            | ProtoSpec::External(_)
+            | ProtoSpec::Ss(_) => None,
         }
     }
 
@@ -121,10 +127,51 @@ pub struct SpecOutcome {
     pub inert: Vec<&'static str>,
     /// iOS-only parameters present on the line (`W0004`, once per load).
     pub ios_only: Vec<&'static str>,
-    /// A `vmess` line without `vmess-aead=true`: valid, but it asks for the
-    /// legacy handshake, so it has no spec. The caller reports it once per
-    /// load (`W0007`, M2 design 4.3).
-    pub legacy_vmess: bool,
+    /// A valid line that asks for something not implemented yet, so it has
+    /// no spec. The caller reports each distinct one once per load (`W0007`).
+    pub not_implemented: Option<NotImplemented>,
+}
+
+/// What a valid line asks for that this version does not implement: the
+/// policy has no spec and behaves as REJECT.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum NotImplemented {
+    /// `vmess` without `vmess-aead=true`: the legacy handshake (M2 design 4.3).
+    LegacyVmess,
+    /// An `ss` stream cipher, by its name (phase 2 M6 design 3.1).
+    SsStreamCipher(&'static str),
+}
+
+impl NotImplemented {
+    /// The load warning (`W0007`).
+    pub fn warning(&self) -> String {
+        match self {
+            NotImplemented::LegacyVmess => "`vmess` without `vmess-aead=true` uses the legacy handshake, which is not implemented yet".to_string(),
+            NotImplemented::SsStreamCipher(method) => format!(
+                "`ss` stream cipher `{method}` is not implemented yet; such policies behave as REJECT"
+            ),
+        }
+    }
+
+    /// What the session log says after "policy protocol not implemented: ".
+    pub fn note(&self) -> String {
+        match self {
+            NotImplemented::LegacyVmess => "vmess (legacy handshake)".to_string(),
+            NotImplemented::SsStreamCipher(method) => format!("ss ({method})"),
+        }
+    }
+
+    /// How a warning about imported policies names the kind.
+    pub fn imported(&self) -> String {
+        match self {
+            NotImplemented::LegacyVmess => {
+                "`vmess` without `vmess-aead=true` (the legacy handshake)".to_string()
+            }
+            NotImplemented::SsStreamCipher(method) => {
+                format!("`ss` with the stream cipher `{method}`")
+            }
+        }
+    }
 }
 
 /// Named `username=` / `password=` win over the positional pair.
@@ -158,7 +205,7 @@ fn check_underlying(r: &mut ParamReader<'_>, common: &mut CommonOpts, env: &Spec
 pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     let mut r = ParamReader::new(policy);
     let mut notes = Notes::default();
-    let mut legacy_vmess = false;
+    let mut not_implemented = None;
     let (mut common, proto) = match policy.kind {
         PolicyKind::Direct => {
             let common = read_common(&mut r, Applies::Direct, &mut notes);
@@ -253,8 +300,17 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             let common = read_common(&mut r, Applies::Proxy, &mut notes);
             let read = vmess::read_vmess(&mut r, env.keystore);
             // the rest of the line is still checked; it just has no spec
-            legacy_vmess = !read.aead;
+            if !read.aead {
+                not_implemented = Some(NotImplemented::LegacyVmess);
+            }
             (common, ProtoSpec::Vmess(read.spec))
+        }
+        PolicyKind::Shadowsocks => {
+            let common = read_common(&mut r, Applies::Proxy, &mut notes);
+            tls::refuse_tls(&mut r);
+            let read = ss::read_ss(&mut r);
+            not_implemented = read.stream_cipher.map(NotImplemented::SsStreamCipher);
+            (common, ProtoSpec::Ss(read.spec))
         }
         PolicyKind::AnyTls => {
             let common = read_common(&mut r, Applies::Proxy, &mut notes);
@@ -303,7 +359,11 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     }
     let failed = r.has_errors();
     let diagnostics = r.finish();
-    let spec = (!failed && !legacy_vmess).then(|| PolicySpec {
+    // `ss` is read and checked in full, but the engine builds it only from
+    // M6a task 6 on: until then a valid line has no spec either (the
+    // capability table's `W0007`, REJECT at run time)
+    let built = policy.kind != PolicyKind::Shadowsocks;
+    let spec = (!failed && built && not_implemented.is_none()).then(|| PolicySpec {
         name: policy.name.clone(),
         kind: policy.kind,
         server: policy.server.clone(),
@@ -318,7 +378,7 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
         diagnostics,
         inert: notes.inert,
         ios_only: notes.ios_only,
-        legacy_vmess: legacy_vmess && !failed,
+        not_implemented: not_implemented.filter(|_| !failed),
     }
 }
 
@@ -447,10 +507,7 @@ mod tests {
 
     #[test]
     fn protocols_without_a_spec_are_left_alone() {
-        let o = outcome(
-            "SS",
-            "ss, h, 8388, encrypt-method=aes-128-gcm, password=x, mystery=1",
-        );
+        let o = outcome("H", "hysteria2, h, 443, password=x, mystery=1");
         assert!(o.spec.is_none() && o.diagnostics.is_empty() && o.inert.is_empty());
     }
 
@@ -711,7 +768,7 @@ mod tests {
             &format!("vmess, h.test, 443, username={id}, vmess-aead=true, tls=true"),
         );
         assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
-        assert!(!o.legacy_vmess);
+        assert_eq!(o.not_implemented, None);
         let spec = o.spec.expect("a spec");
         let ProtoSpec::Vmess(vmess) = &spec.proto else {
             panic!("not vmess: {:?}", spec.proto);
@@ -730,7 +787,7 @@ mod tests {
         let id = "0233d11c-15a4-47d3-ade3-48ffca0ce119";
         let o = outcome("V", &format!("vmess, h.test, 443, username={id}, ws=true"));
         assert!(o.spec.is_none());
-        assert!(o.legacy_vmess);
+        assert_eq!(o.not_implemented, Some(NotImplemented::LegacyVmess));
         assert!(
             o.diagnostics.is_empty(),
             "the loader reports it, once: {:?}",
@@ -738,7 +795,60 @@ mod tests {
         );
         // a broken legacy line is an error like any other, and not "legacy"
         let o = outcome("V", "vmess, h.test, 443, username=nope");
-        assert!(o.spec.is_none() && !o.legacy_vmess);
+        assert!(o.spec.is_none() && o.not_implemented.is_none());
         assert_eq!(o.diagnostics.len(), 1);
+    }
+
+    /// An `ss` line is read and checked in full; it has no spec until the
+    /// engine builds `ss` (M6a task 6), and a stream cipher says why.
+    #[test]
+    fn an_ss_line_is_checked_and_a_stream_cipher_is_not_implemented() {
+        let o = outcome(
+            "S",
+            "ss, h.test, 8388, encrypt-method=aes-128-gcm, password=pw, udp-relay=true, udp-port=8389, obfs=tls, obfs-host=cdn.test, shadow-tls-password=st",
+        );
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert!(o.inert.is_empty(), "{:?}", o.inert);
+        assert_eq!(o.not_implemented, None);
+        assert!(o.spec.is_none());
+
+        let o = outcome("S", "ss, h.test, 8388, encrypt-method=RC4-MD5, password=pw");
+        assert!(o.spec.is_none() && o.diagnostics.is_empty());
+        let why = o.not_implemented.expect("a stream cipher");
+        assert_eq!(why, NotImplemented::SsStreamCipher("rc4-md5"));
+        assert_eq!(
+            why.warning(),
+            "`ss` stream cipher `rc4-md5` is not implemented yet; such policies behave as REJECT"
+        );
+        assert_eq!(why.note(), "ss (rc4-md5)");
+        assert_eq!(why.imported(), "`ss` with the stream cipher `rc4-md5`");
+
+        // a broken line is an error like any other, and not "not implemented"
+        let o = outcome("S", "ss, h.test, 8388, encrypt-method=rc4-md5");
+        assert!(o.not_implemented.is_none());
+        assert_eq!(o.diagnostics[0].code, codes::E_INVALID_POLICY_PARAM);
+        // no TLS under `ss`; mystery parameters are unknown as anywhere
+        let o = outcome(
+            "S",
+            "ss, h.test, 8388, encrypt-method=none, sni=edge.test, mystery=1",
+        );
+        let found: Vec<(&str, &str)> = o
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `S`: `sni` does not apply to `ss` policies; ignored"
+                ),
+                (
+                    codes::W_UNKNOWN_KEY,
+                    "policy `S`: unknown parameter `mystery` ignored"
+                ),
+            ]
+        );
     }
 }

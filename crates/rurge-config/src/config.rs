@@ -12,7 +12,9 @@ use crate::policy::{
 use crate::requirement::{self, Environment};
 use crate::rule::{ParseCtx, PolicyRef, Rule, RuleKind, SubRule, parse_rule, parse_subrule};
 use crate::span::Span;
-use crate::spec::{GroupSpec, NameKind, PolicySpec, ProtoSpec, SpecEnv, to_group_spec, to_spec};
+use crate::spec::{
+    GroupSpec, NameKind, NotImplemented, PolicySpec, ProtoSpec, SpecEnv, to_group_spec, to_spec,
+};
 use crate::text::include::{self, IncludeOptions};
 use crate::text::{Origin, Profile, SectionKind, parse_str};
 use crate::value::{split_definition, split_list};
@@ -178,6 +180,9 @@ pub struct Config {
     /// Typed parameters of every policy whose type has a spec (same order as
     /// `policies`; policies with errors are absent).
     pub specs: Vec<PolicySpec>,
+    /// Why a policy without errors has no spec, when its line asks for
+    /// something not implemented yet (`W0007`); by policy name.
+    pub not_implemented: HashMap<String, NotImplemented>,
     pub groups: Vec<PolicyGroup>,
     /// Typed parameters of every group (same order as `groups`; groups
     /// with errors are absent).
@@ -684,6 +689,7 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
         general,
         policies,
         specs: Vec::new(),
+        not_implemented: HashMap::new(),
         groups,
         group_specs: Vec::new(),
         rules,
@@ -954,7 +960,7 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
     }
 
     // Typed policy and group parameters (phase 2 M1 design §4, M3 design §4).
-    let (specs, group_specs) = {
+    let (specs, not_implemented, group_specs) = {
         let cfg: &Config = config;
         let lookup = |name: &str| cfg.name_kind(name);
         let env = SpecEnv {
@@ -965,7 +971,8 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
         let mut specs = Vec::new();
         let mut inert_seen: HashSet<&'static str> = HashSet::new();
         let mut ios_seen: HashSet<&'static str> = HashSet::new();
-        let mut legacy_seen = false;
+        let mut not_implemented = HashMap::new();
+        let mut not_implemented_seen: HashSet<NotImplemented> = HashSet::new();
         // `local-port` → the `external` policy that has it
         let mut local_ports: HashMap<u16, &str> = HashMap::new();
         for p in &cfg.policies {
@@ -1032,15 +1039,14 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
                     );
                 }
             }
-            if outcome.legacy_vmess && !legacy_seen {
-                legacy_seen = true;
-                diags.push(
-                    Diagnostic::warning(
-                        codes::W_PROTOCOL_NOT_IMPLEMENTED,
-                        "`vmess` without `vmess-aead=true` uses the legacy handshake, which is not implemented yet".to_string(),
-                    )
-                    .at(p.span.clone()),
-                );
+            if let Some(why) = outcome.not_implemented {
+                if not_implemented_seen.insert(why.clone()) {
+                    diags.push(
+                        Diagnostic::warning(codes::W_PROTOCOL_NOT_IMPLEMENTED, why.warning())
+                            .at(p.span.clone()),
+                    );
+                }
+                not_implemented.insert(p.name.clone(), why);
             }
             specs.extend(outcome.spec);
         }
@@ -1053,9 +1059,10 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
             group_specs.extend(outcome.spec);
         }
         underlying_cycles(cfg, &specs, &group_specs, diags);
-        (specs, group_specs)
+        (specs, not_implemented, group_specs)
     };
     config.specs = specs;
+    config.not_implemented = not_implemented;
     config.group_specs = group_specs;
 
     // Capabilities.
@@ -1639,6 +1646,47 @@ New = vmess, c.test, 443, username={id}, vmess-aead=true\n[Rule]\nFINAL,DIRECT\n
         assert_eq!(legacy[0].span.as_ref().map(|s| s.line), Some(2));
         assert!(loaded.config.spec("New").is_some());
         assert!(loaded.config.spec("Old1").is_none() && loaded.config.spec("Old2").is_none());
+        assert_eq!(
+            loaded.config.not_implemented.get("Old2"),
+            Some(&NotImplemented::LegacyVmess)
+        );
+        assert_eq!(loaded.config.not_implemented.get("New"), None);
+    }
+
+    /// An `ss` stream cipher: `W0007` once per load and cipher, at the first
+    /// line that uses it (phase 2 M6 design 3.1).
+    #[test]
+    fn ss_stream_ciphers_are_reported_once_per_load_and_cipher() {
+        let loaded = load_text(
+            "[Proxy]\nA = ss, a.test, 8388, encrypt-method=rc4-md5, password=pw\n\
+B = ss, b.test, 8388, encrypt-method=aes-256-cfb, password=pw\n\
+C = ss, c.test, 8388, encrypt-method=rc4-md5, password=pw\n\
+D = ss, d.test, 8388, encrypt-method=aes-256-gcm, password=pw\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let found: Vec<(&str, Option<u32>)> = loaded
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::W_PROTOCOL_NOT_IMPLEMENTED)
+            .map(|d| (d.message.as_str(), d.span.as_ref().map(|s| s.line)))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    "`ss` stream cipher `rc4-md5` is not implemented yet; such policies behave as REJECT",
+                    Some(2)
+                ),
+                (
+                    "`ss` stream cipher `aes-256-cfb` is not implemented yet; such policies behave as REJECT",
+                    Some(3)
+                ),
+            ]
+        );
+        assert_eq!(
+            loaded.config.not_implemented.get("C"),
+            Some(&NotImplemented::SsStreamCipher("rc4-md5"))
+        );
+        assert_eq!(loaded.config.not_implemented.get("D"), None);
     }
 
     /// Two `external` policies on one `local-port`: the second is an error

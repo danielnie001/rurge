@@ -254,6 +254,13 @@ impl OutboundFactory for EngineFactory {
                         spec.common.underlying_proxy
                     )),
             ),
+            // the loader makes no spec of an `ss` line before M6a task 6
+            ProtoSpec::Ss(_) => {
+                return Err(BuildError::new(format!(
+                    "policy `{}`: `ss` is not implemented yet",
+                    spec.name
+                )));
+            }
             // nothing starts here: the program starts on the first dial
             ProtoSpec::External(external) => {
                 let outbound = ExternalOutbound::new(

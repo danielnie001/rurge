@@ -8,7 +8,7 @@ use rurge_config::Config;
 use rurge_config::diagnostic::{Diagnostic, Diagnostics, Severity, codes};
 use rurge_config::policy::{PolicyKind, ProxyPolicy, parse_policy, with_params};
 use rurge_config::spec::{
-    GroupSpec, NameKind, PolicyPath, PolicySpec, ProtoSpec, SpecEnv, to_spec,
+    GroupSpec, NameKind, NotImplemented, PolicyPath, PolicySpec, ProtoSpec, SpecEnv, to_spec,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -25,6 +25,9 @@ pub struct Imported {
     /// `None`: a protocol this version does not implement; it behaves as
     /// REJECT.
     pub spec: Option<PolicySpec>,
+    /// Why there is no spec, when the line asks for something not
+    /// implemented yet.
+    pub not_implemented: Option<NotImplemented>,
 }
 
 /// `M (via R)`: a member M of a group with `underlying-proxy = R` (5.4).
@@ -290,7 +293,14 @@ impl<'a> Imports<'a> {
                 match index.get(&name) {
                     None => {
                         index.insert(name.clone(), out.list.len());
-                        out.list.push((Imported { policy, spec: None }, g));
+                        out.list.push((
+                            Imported {
+                                policy,
+                                spec: None,
+                                not_implemented: None,
+                            },
+                            g,
+                        ));
                         names.push(name);
                     }
                     // the same line through another group: one policy
@@ -355,10 +365,9 @@ impl<'a> Imports<'a> {
             }
             imported.spec = outcome.spec;
             if imported.spec.is_none() {
-                let what = if outcome.legacy_vmess {
-                    "`vmess` without `vmess-aead=true` (the legacy handshake)".to_string()
-                } else {
-                    format!("`{}`", imported.policy.kind.keyword())
+                let what = match &outcome.not_implemented {
+                    Some(why) => why.imported(),
+                    None => format!("`{}`", imported.policy.kind.keyword()),
                 };
                 if said.insert(what.clone()) {
                     diags.push(warn(
@@ -370,6 +379,7 @@ impl<'a> Imports<'a> {
                     ));
                 }
             }
+            imported.not_implemented = outcome.not_implemented;
         }
         self.forget(&failed);
     }
@@ -1031,13 +1041,28 @@ G3 = select, policy-path=https://sub.test/b",
                     "G",
                     "Bad = http, b.test, 80, tos=999\nUp = http, u.test, 80, underlying-proxy=Nowhere\n\
 SS = ss, s.test, 8388, encrypt-method=aes-128-gcm, password=pw\n\
+Rc = ss, r.test, 8388, encrypt-method=rc4, password=pw\n\
 Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = http, g.test, 80",
                 )],
             ),
         );
-        assert_eq!(members(&a, "G"), ["SS", "Old", "Good"]);
+        assert_eq!(members(&a, "G"), ["SS", "Rc", "Old", "Good"]);
         let specs: Vec<bool> = a.imported.iter().map(|i| i.spec.is_some()).collect();
-        assert_eq!(specs, [false, false, true]);
+        assert_eq!(specs, [false, false, false, true]);
+        let why: Vec<Option<NotImplemented>> = a
+            .imported
+            .iter()
+            .map(|i| i.not_implemented.clone())
+            .collect();
+        assert_eq!(
+            why,
+            [
+                None,
+                Some(NotImplemented::SsStreamCipher("rc4")),
+                Some(NotImplemented::LegacyVmess),
+                None
+            ]
+        );
         assert_eq!(
             warnings(&a),
             [
@@ -1052,6 +1077,10 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
                 (
                     codes::W_PROTOCOL_NOT_IMPLEMENTED,
                     "policy group `G`: imported policies of type `ss` are not implemented in this version; they behave as REJECT".to_string()
+                ),
+                (
+                    codes::W_PROTOCOL_NOT_IMPLEMENTED,
+                    "policy group `G`: imported policies of type `ss` with the stream cipher `rc4` are not implemented in this version; they behave as REJECT".to_string()
                 ),
                 (
                     codes::W_PROTOCOL_NOT_IMPLEMENTED,

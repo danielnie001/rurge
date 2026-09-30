@@ -12,7 +12,7 @@ use crate::selections::SelectionTable;
 use crate::smart::{Candidate, Health, ROUND_INTERVAL, ROUND_SAMPLE, SiteMemory, rank, sample};
 use crate::testbook::{MAX_CONCURRENT_TESTS, TestCase, TestMode, TestResult};
 use rurge_config::rule::PolicyRef;
-use rurge_config::spec::{CommonOpts, GroupSpec, IpVersion, PolicySpec, ProtoSpec};
+use rurge_config::spec::{CommonOpts, GroupSpec, IpVersion, NotImplemented, PolicySpec, ProtoSpec};
 use rurge_config::wireguard::WireGuardSection;
 use rurge_config::{Builtin, Config, GroupKind, KeystoreType, PolicyKind, Span};
 use rurge_net::connector::{Connector, Target};
@@ -181,8 +181,9 @@ enum Entry {
         // otherwise make this variant much larger than the others.
         fingerprint: Box<Fingerprint>,
     },
-    /// The protocol is not implemented yet: REJECT (W0007 at load).
-    Unsupported { kind: PolicyKind },
+    /// The protocol is not implemented yet: REJECT (W0007 at load). `what`
+    /// is what the session log says about it.
+    Unsupported { kind: PolicyKind, what: String },
     Group {
         spec: Arc<GroupSpec>,
         members: Vec<String>,
@@ -281,14 +282,10 @@ fn reject_slot(kind: RejectKind) -> usize {
     }
 }
 
-/// What the session log says about a policy that has no spec. Since M2b a
-/// `vmess` policy of a profile that loaded is only ever without one for a
-/// single reason: the line lacks `vmess-aead=true` (M2 design 4.3).
-fn unsupported_text(kind: PolicyKind) -> String {
-    match kind {
-        PolicyKind::Vmess => "vmess (legacy handshake)".to_string(),
-        other => other.keyword().to_string(),
-    }
+/// What the session log says about a policy that has no spec: what its
+/// line asks for that is not implemented, else its protocol.
+fn unsupported_text(kind: PolicyKind, why: Option<&NotImplemented>) -> String {
+    why.map_or_else(|| kind.keyword().to_string(), NotImplemented::note)
 }
 
 fn alias_terminal(kind: PolicyKind) -> Option<Terminal> {
@@ -449,17 +446,21 @@ impl PolicyRegistry {
                 fingerprint: Box::new(fingerprint),
             })
         };
-        let policy_entry = |kind: PolicyKind, spec: Option<&PolicySpec>| {
-            Ok::<Entry, BuildError>(match (alias_terminal(kind), spec) {
-                (Some(Terminal::Direct), Some(spec)) if has_socket_opts(&spec.common) => {
-                    outbound_entry(spec, false)?
-                }
-                (Some(terminal), _) => Entry::Alias(terminal),
-                (None, Some(spec)) => outbound_entry(spec, true)?,
-                // no spec: a protocol of a later milestone
-                (None, None) => Entry::Unsupported { kind },
-            })
-        };
+        let policy_entry =
+            |kind: PolicyKind, spec: Option<&PolicySpec>, why: Option<&NotImplemented>| {
+                Ok::<Entry, BuildError>(match (alias_terminal(kind), spec) {
+                    (Some(Terminal::Direct), Some(spec)) if has_socket_opts(&spec.common) => {
+                        outbound_entry(spec, false)?
+                    }
+                    (Some(terminal), _) => Entry::Alias(terminal),
+                    (None, Some(spec)) => outbound_entry(spec, true)?,
+                    // no spec: a protocol of a later milestone
+                    (None, None) => Entry::Unsupported {
+                        kind,
+                        what: unsupported_text(kind, why),
+                    },
+                })
+            };
         // How each policy is tested: its own `test-url` / `test-timeout`,
         // else the profile's (M3 design 6.1). A REJECT and a protocol not
         // implemented never pass, so they have none.
@@ -499,7 +500,7 @@ impl PolicyRegistry {
         // load error, so one fails the whole generation.
         for p in &cfg.policies {
             let spec = cfg.spec(&p.name);
-            let entry = policy_entry(p.kind, spec)?;
+            let entry = policy_entry(p.kind, spec, cfg.not_implemented.get(&p.name))?;
             table.add(&p.name, entry, Line::policy(p.kind, &p.definition));
             if let Some(t) = test_spec(p.kind, spec, &p.definition) {
                 table.tests.insert(p.name.clone(), t);
@@ -513,7 +514,7 @@ impl PolicyRegistry {
             tracing::warn!(policy = %name, "policy cannot be built; it is left out");
         };
         for i in &assembly.imported {
-            match policy_entry(i.policy.kind, i.spec.as_ref()) {
+            match policy_entry(i.policy.kind, i.spec.as_ref(), i.not_implemented.as_ref()) {
                 Ok(entry) => {
                     table.add(
                         &i.policy.name,
@@ -1183,9 +1184,9 @@ impl PolicyRegistry {
                 chain.push("DIRECT".to_string());
                 self.done(chain, outbound.clone(), TerminalKind::Direct, None)
             }
-            Some(Entry::Unsupported { kind }) => {
+            Some(Entry::Unsupported { kind, what }) => {
                 chain.push(format!("!unsupported:{}", kind.keyword()));
-                self.rejected(chain, Some(Note::Unsupported(unsupported_text(*kind))))
+                self.rejected(chain, Some(Note::Unsupported(what.clone())))
             }
             Some(Entry::Group {
                 cycle: Some(cycle), ..
@@ -1426,7 +1427,8 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
     #[test]
     fn a_legacy_vmess_policy_says_why_it_rejects() {
         let text = "[Proxy]\nOld = vmess, a.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\n\
-SS = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Rule]\nFINAL,DIRECT\n";
+SS = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n\
+Stream = ss, 1.2.3.4, 8388, encrypt-method=rc4-md5, password=x\n[Rule]\nFINAL,DIRECT\n";
         let registry = generation(text, &FakeFactory::new(), None);
         let old = registry.resolve(&PolicyRef::parse("Old"));
         assert_eq!(old.terminal, TerminalKind::Reject);
@@ -1437,6 +1439,12 @@ SS = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Rule]\nFINAL,DI
         assert_eq!(chain(&old), ["Old", "!unsupported:vmess", "REJECT"]);
         let ss = registry.resolve(&PolicyRef::parse("SS"));
         assert_eq!(ss.note, Some(Note::Unsupported("ss".into())));
+        let stream = registry.resolve(&PolicyRef::parse("Stream"));
+        assert_eq!(stream.terminal, TerminalKind::Reject);
+        assert_eq!(
+            stream.note.clone().unwrap().to_string(),
+            "policy protocol not implemented: ss (rc4-md5)"
+        );
     }
 
     #[test]
