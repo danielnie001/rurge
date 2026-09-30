@@ -11545,6 +11545,14 @@ git commit -m "docs: M6a Shadowsocks——兼容性清单、手工验收、READM
 
 | # | 任务 | 与计划的出入 | 原因 |
 | - | ---- | ------------ | ---- |
+| 1 | Task 7 | 兼容性清单 4.2 的 `ss` 行多写了一句：格式不对的 `ss` 行（`encrypt-method` 缺失或不认识、缺 `password`、2022 密钥不合法）现在是加载错误 `E0018`，不再静默按 `REJECT` 处理 | 裁定：Task 1 起的用户可见变化（Task 1 评审的延后记录），清单必须记录 |
+| 2 | 终审 | （#2–#7 均在 ef5701b，文档在其后的文档提交）SS 2022 的 UDP 载体：`SsUdp` 的 `packets` + `Option<Session>` 换成每个载体自己的 `Sealing`（`Plain` / `Aead` / `S2022 { keys, session }`），`Packets::S2022` 改持 `Arc<Keys2022>`；"2022 策略却没有 session"的状态不再可表示，`seal` / `unseal` 没有了会按明文收发的兜底分支 | 终审 M1：按计划的兜底 `_` 分支也匹配 `(S2022, None)`，一旦出现这种状态就会以明文收发。无效状态已不可表示，没有单独的用例，由既有的 UDP 用例覆盖 |
+| 3 | 终审 | 兼容性清单 `ss` 行补上：`obfs=http` 只接受 `101` 或 2xx 的应答头（跨读取累积、至多 8 KiB），参考客户端什么都不检查、并假定应答头在第一次读到的数据里；`obfs=tls` 逐个解析服务端记录的头而不是跳过固定长度；4.6 的 `ss` 参数行补上 `obfs-host` 至多 255 字节 | 终审 M2：这两处与参考实现的差异此前没有登记 |
+| 4 | 终审 | `AeadStream` 的请求 salt 改为一直保留（`salt` + `salt_sent`）：2022 的首次写在封装任何东西之前先取填充长度的随机数，失败时本次写报错、salt 仍待发出；`Edition2022` 不再另存一份 salt | 终审 M3：按计划 salt 先被取走，取随机数失败后再写就不带 salt。随机数失败无法在测试里触发，没有单独的用例 |
+| 5 | 终审 | `obfs-host` 超过 255 字节在配置层是 `E0018`（`` invalid `obfs-host` (expected at most 255 bytes) ``，不引用取值）；出站层的 `BuildError` 保留为兜底（新用例 `a_host_longer_than_255_bytes_is_an_error_and_never_quoted`） | 终审 M4：此前只在构建出站时失败 |
+| 6 | 终审 | 旧式 AEAD 读到的服务端 salt 与自己的请求 salt 相同（流被反射）时以 `UNDECRYPTABLE` 失败；读侧用例的请求 salt 改用与应答不同的 `0xee…`（新用例 `a_reflected_stream_does_not_decrypt`，去掉这条检查时它失败） | 终审 M5：反射的流两个方向子密钥与 nonce 序列相同，照样能解开 |
+| 7 | 终审 | `outbounds_shadowsocks` 重载用例的断言文字改为 "an unrelated reload rebuilt S" | Task 6 评审的延后记录：原文字读反了 |
+| 8 | 门禁 | 最终门禁（终审修正 ef5701b 之后）：fmt、clippy 通过；第一轮 `cargo test --workspace --no-fail-fast` 因磁盘满编译失败（`os error 112`），删掉 `target/debug/incremental` 后以 `CARGO_INCREMENTAL=0` 重跑：55 个测试二进制 1369 通过 / 0 失败 / 2 忽略 | 终审修正加了 #5、#6 的两个用例 |
 
 ## 延后事项
 
@@ -11556,3 +11564,10 @@ git commit -m "docs: M6a Shadowsocks——兼容性清单、手工验收、READM
 | 4 | 假服务端的多用户只有一层身份密钥（两层只由已知答案覆盖）；它记住的请求 salt 不过期（规范是 60 秒） | 接受（测试设施） |
 | 5 | `2022-blake3-chacha20-poly1305`（SIP022 可选，手册不列） | 手册列出时 |
 | 6 | README 路线图一行停在 M4b；总设计第 1.4 节与第 2 节的 Snell 仍写 v1 ～ v4（M6 设计已取代） | M6b 的文档任务一并订正 |
+| 7 | 配置层：`udp-port` 没写 `udp-relay` 时静默接受（可以是 `W0028`）；`ObfsOpts` 的 `Debug` 打印 `obfs-host`（只要求 API 与 `rurge check` 脱敏） | 以后顺手改 |
+| 8 | 写路径的"同一缓冲重试"约定：obfs 层与 `AeadStream` 的 `poll_write` 在 `Pending` 之后依赖调用方以同一缓冲重试（与 `WsByteStream` / `VmessStream` 相同），其间插入 flush 可能重复数据 | 接受 |
+| 9 | `AeadStream` 的细节：`Payload` 分支对零长度的 `ReadBuf` 返回 `Ok(0)`（理论上）；`seal_first_2022` 截断 `addr_len` 而不是断言 `LazyHead` 的约定；AES 单块函数的 `_ => Aes256` 分支是隐含的 | 以后顺手改 |
+| 10 | 密钥材料（主密钥、子密钥、2022 的密钥）不清零 | 需要时另议 |
+| 11 | SS 2022 的 UDP：服务端 session 按先进先出淘汰而不是 LRU；未知的服务端 session 先做 BLAKE3 派生再验 tag（伪造的包也花一次派生）；来源过滤只比 IP（与 socks5 相同） | 有用户报告再说 |
+| 12 | 测试：`ss.rs` 用例的 `!printed.contains("97")` 脆弱；假 obfs `tls` 服务端把截断的记录头当作干净的 EOF（测试设施） | 以后顺手改 |
+| 13 | 手工验收：时钟偏差一项可以一并写出客户端侧的 `ss: the server's clock differs from ours by <n> seconds` 文本；`ssserver` 互操作的配置只在 CI 上验证过（发布包的 SHA-256 取自 GitHub API 的 digest 字段） | 以后顺手改；CI 首跑时核对 |

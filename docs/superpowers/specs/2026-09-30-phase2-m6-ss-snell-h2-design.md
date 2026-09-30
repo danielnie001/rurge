@@ -209,3 +209,11 @@ v4 / v5 的 TCP 线上格式由 missuo/opensnell（GPLv3，对官方 snell-serve
 8. **UDP 不经 Shadow TLS 与 obfs（P13）**：它们是 TCP 层；UDP 经策略的连接器走 DIRECT 或 `underlying-proxy` 的链。
 9. **互操作（P15，细化 M6-D5）**：`aes-192-gcm` 与 `xchacha20-ietf-poly1305` 不在 shadowsocks-rust 的发布版里，改由 sing-box 覆盖。
 
+## 13. M6a 实施期的订正
+
+执行 M6a 计划时，全分支评审改动了若干做法；与上文及第 12 节不一致处以本节为准（明细见计划的「执行期修正记录」）。
+
+1. **UDP 载体的封包方式在类型上与策略一致（细化第 12 节第 7 条）**：每个载体按策略的方法定下自己的封包方式（明文、AEAD、SS 2022），SS 2022 的载体必然带着它自己的客户端 session；不再有"2022 策略却没有 session"而按明文收发的状态。
+2. **SS 2022 首次写失败不丢 salt**：首次写在封装任何东西之前先取填充长度的随机数；这一步失败时本次写报错，而请求 salt 仍留着随下一次写发出，而不是被取走、之后的写不带 salt。
+3. **过长的 `obfs-host` 在配置层报错（细化 3.1）**：`obfs-host` 超过 255 字节是 `E0018`（`` invalid `obfs-host` (expected at most 255 bytes) ``，不引用取值），不再等到构建出站时才以 `BuildError` 失败（出站层的检查保留为兜底）。
+4. **旧式 AEAD 拒绝被反射的流（细化 3.3）**：客户端保留自己的请求 salt；服务端的 salt 与它相同（流被原样反射回来，两个方向的子密钥与 nonce 序列相同、能解开）时以 `ss: the server's data failed to decrypt (wrong password or method?)` 失败。SS 2022 的应答有类型字节与回显的 salt 校验，本来就不受影响。
