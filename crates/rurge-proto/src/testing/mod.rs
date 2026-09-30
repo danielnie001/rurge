@@ -3,6 +3,7 @@
 
 mod anytls;
 mod http_proxy;
+mod obfs;
 mod shadow_tls;
 mod socks5;
 mod tls;
@@ -13,6 +14,7 @@ pub mod ws;
 
 pub use anytls::{AnyTlsScript, FakeAnyTls, RecordedStream};
 pub use http_proxy::{FakeHttpProxy, HttpProxyScript, RecordedHead};
+pub use obfs::{ObfsHello, accept_obfs};
 pub use shadow_tls::{
     Camouflage, FakeShadowTls, RecordedShadowTls, ShadowTlsFault, ShadowTlsScript,
 };

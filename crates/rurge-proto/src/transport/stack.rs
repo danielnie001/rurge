@@ -1,7 +1,9 @@
 //! The fixed ladder between a connector and a protocol's own handshake
-//! (phase 2 design §5.4): connect → shadow-tls → tls → ws.
+//! (phase 2 design §5.4, phase 2 M6 design 3.2): connect → shadow-tls →
+//! obfs → tls → ws. No protocol combines obfs with tls or ws.
 
 use crate::OutboundError;
+use crate::transport::obfs::ObfsClient;
 use crate::transport::shadow_tls::ShadowTlsClient;
 use crate::transport::tls::TlsClient;
 use crate::transport::ws::WsClient;
@@ -12,6 +14,7 @@ pub struct Stack {
     connector: Arc<dyn Connector>,
     server: Target,
     shadow_tls: Option<ShadowTlsClient>,
+    obfs: Option<ObfsClient>,
     tls: Option<TlsClient>,
     ws: Option<WsClient>,
 }
@@ -29,9 +32,16 @@ impl Stack {
             connector,
             server,
             shadow_tls,
+            obfs: None,
             tls,
             ws,
         }
+    }
+
+    /// Adds the simple-obfs layer (right above Shadow TLS).
+    pub fn with_obfs(mut self, obfs: ObfsClient) -> Stack {
+        self.obfs = Some(obfs);
+        self
     }
 
     pub fn server(&self) -> &Target {
@@ -44,6 +54,9 @@ impl Stack {
         let mut stream = self.connector.connect(&self.server, opts).await?;
         if let Some(shadow_tls) = &self.shadow_tls {
             stream = shadow_tls.wrap(stream).await?;
+        }
+        if let Some(obfs) = &self.obfs {
+            stream = obfs.wrap(stream);
         }
         if let Some(tls) = &self.tls {
             stream = tls.wrap(stream).await.map_err(OutboundError::tls)?;
@@ -59,11 +72,13 @@ impl Stack {
 mod tests {
     use super::*;
     use crate::testing::{
-        Camouflage, FakeShadowTls, FakeWs, ShadowTlsScript, TlsFixture, WsScript,
+        Camouflage, FakeShadowTls, FakeWs, ShadowTlsScript, TlsFixture, WsScript, accept_obfs,
     };
     use crate::transport::shadow_tls::ShadowTlsClient;
     use rurge_config::HostName;
-    use rurge_config::spec::{Secret, ShadowTlsOpts, ShadowTlsVersion, TlsOpts, WsOpts};
+    use rurge_config::spec::{
+        ObfsMode, ObfsOpts, Secret, ShadowTlsOpts, ShadowTlsVersion, TlsOpts, WsOpts,
+    };
     use rurge_net::connector::{DirectConnector, SystemResolve};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -173,6 +188,52 @@ mod tests {
             assert_eq!(seen[1].sni, None, "an IP literal: no SNI");
             assert_eq!(ws.seen()[0].path, "/tunnel");
             assert!(front.sessions()[0].authenticated);
+        })
+        .await
+        .expect("the round trip finished within the bound");
+    }
+
+    #[tokio::test]
+    async fn obfs_sits_on_the_connection() {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let fake = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let (stream, hello) = accept_obfs(Box::new(tcp), ObfsMode::Tls).await.unwrap();
+                let (mut rd, mut wr) = tokio::io::split(stream);
+                tokio::io::copy(&mut rd, &mut wr).await.unwrap();
+                wr.shutdown().await.unwrap();
+                hello
+            });
+            let server = Target::new(HostName::Ip(addr.ip()), addr.port());
+            let obfs = ObfsClient::new(
+                &ObfsOpts {
+                    mode: ObfsMode::Tls,
+                    host: None,
+                    uri: "/".into(),
+                },
+                &server,
+            )
+            .unwrap();
+            let stack = Stack::new(
+                Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
+                server,
+                None,
+                None,
+                None,
+            )
+            .with_obfs(obfs);
+            let mut stream = stack.open(&ConnectOpts::default()).await.unwrap();
+            stream.write_all(b"through obfs").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut back = Vec::new();
+            stream.read_to_end(&mut back).await.unwrap();
+            assert_eq!(back, b"through obfs");
+            let hello = fake.await.unwrap();
+            // no `obfs-host`: the server's own name
+            assert_eq!(hello.host, "127.0.0.1");
+            assert_eq!(hello.first_payload, b"through obfs");
         })
         .await
         .expect("the round trip finished within the bound");
