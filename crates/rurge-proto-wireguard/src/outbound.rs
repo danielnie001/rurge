@@ -1618,6 +1618,39 @@ mod tests {
         );
     }
 
+    /// A carrier of a tunnel that a later configuration replaced fails to
+    /// receive and to send, at once, instead of going quiet.
+    #[tokio::test]
+    async fn a_carrier_of_a_replaced_tunnel_fails() {
+        let (_peer, old) = tunnel(PeerOpts::default(), |_| {}).await;
+        let carrier: Arc<dyn PacketSocket> =
+            Arc::from(old.open_udp(&within(5)).await.expect("a carrier"));
+        let to = at("10.0.0.1", ECHO_PORT);
+        carrier.send_to(b"hello", &to).await.unwrap();
+        udp_answer(carrier.as_ref()).await;
+        let waiting = tokio::spawn({
+            let carrier = carrier.clone();
+            async move { carrier.recv_from(&mut [0u8; 64]).await.map(|_| ()) }
+        });
+        let mut section = old.names.section.clone();
+        section.mtu = 1400;
+        let new = WireGuardOutbound::new("WG", &WireGuardSpec { section }, no_names(), direct());
+        new.connect_tcp(&to, &within(5))
+            .await
+            .expect("a connection");
+        let err = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the receive ends at once")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.to_string(), "wireguard: the tunnel has closed");
+        let err = tokio::time::timeout(Duration::from_secs(5), carrier.send_to(b"x", &to))
+            .await
+            .expect("the send ends at once")
+            .unwrap_err();
+        assert_eq!(err.to_string(), "wireguard: the tunnel has closed");
+    }
+
     /// A destination no peer takes, or of a family the tunnel has no address
     /// of, is refused at once, saying why.
     #[tokio::test]

@@ -424,12 +424,15 @@ impl Stack {
         self.released.push((handle, now));
     }
 
-    /// Resets every TCP connection at once, without a word to the far end:
-    /// the tunnel is ending. Whoever waits on one is woken.
+    /// Resets every TCP connection at once, without a word to the far end,
+    /// and closes every UDP socket: the tunnel is ending. Whoever waits on
+    /// one is woken.
     pub fn abort_all(&mut self) {
         for (_, socket) in self.sockets.iter_mut() {
             if let Some(tcp) = tcp::Socket::downcast_mut(socket) {
                 tcp.abort();
+            } else if let Some(udp) = udp::Socket::downcast_mut(socket) {
+                udp.close();
             }
         }
     }

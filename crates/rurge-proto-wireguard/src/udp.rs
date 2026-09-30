@@ -32,6 +32,15 @@ fn slot(ip: IpAddr) -> usize {
     }
 }
 
+/// What a carrier of a tunnel that ended says: the flow fails, as a TCP
+/// connection does, and the carrier is not used again.
+fn closed() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "wireguard: the tunnel has closed",
+    )
+}
+
 impl TunnelUdp {
     pub(crate) fn new(device: Arc<Device>, names: Arc<Names>) -> TunnelUdp {
         TunnelUdp {
@@ -65,6 +74,9 @@ impl PacketSocket for TunnelUdp {
 
     fn send_to<'a>(&'a self, buf: &'a [u8], to: &'a Target) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
+            if self.device.is_closed() {
+                return Err(closed());
+            }
             let ip = self.address(to).await?;
             {
                 let mut stack = self.device.shared.stack.lock().expect("the tunnel");
@@ -123,6 +135,10 @@ impl PacketSocket for TunnelUdp {
                     return Poll::Ready(Ok((n, from)));
                 }
                 socket.register_recv_waker(cx.waker());
+            }
+            // after the wakers are in: a close that races this poll wakes them
+            if self.device.is_closed() {
+                return Poll::Ready(Err(closed()));
             }
             Poll::Pending
         }))
