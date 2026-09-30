@@ -344,3 +344,17 @@ peer 的载体改用 `ChainConnector::connect_udp`；中继不支持 UDP 时照�
 2. **vmess 的读缓冲与回包归属**：读缓冲 64 KiB，服务端任何合法大小的分块一次读出、恰好是一个数据报；回包仍一律算作该目标的。拨号成功的连接一定能从表里找到（等在同一格上的发送者在拨号者失败摘格后重拨成功时，把自己的格放回表里）；发送循环不放回已结束的连接，而是重新拨号。连接结束时记一条 `debug!`（原因：对端关闭、读错误的种类、空闲），不含载荷、id 与目标。
 3. **trojan 的 CRLF 校验**：收包时长度之后的两个字节必须是 `\r\n`，否则以 `InvalidData`（`trojan: a datagram without its CRLF`）结束该载体，与未知地址类型的处理一致；此前对不齐的服务端帧会被当作数据报读下去。
 4. **零长度数据报**：vmess 上静默丢弃（空分块会结束连接），已登记进兼容性清单。
+
+## 21. M5c 计划期的订正
+
+写 M5c 实施计划（`docs/superpowers/plans/2026-09-30-phase2-m5c-udp-wireguard-rest-plan.md`）时核对 smoltcp 0.12、本仓库源码与手册后，与上文不一致或上文没写到的，以本节为准（括号里是计划「计划期决定」的编号）。
+
+1. **隧道里的 UDP socket（P1）**：每个载体按地址族各开一个 socket，第一次发往该族时绑定隧道那一族的本端地址与 `Stack::free_port` 给的端口；发送缓冲满时丢掉那个包、不报错；目标不在任何 peer 的 `allowed-ips` 里或隧道没有该族本端地址时，那条流失败（错误文本同 TCP）。目标名的解析与 TCP 共用（`Names`）。
+2. **链上的 UDP（P3）**：`ChainConnector::connect_udp` 由链式载体（`open_udp`）加新的 `rurge_net::packet_datagram` 组成；`wireguard` 的 peer 载体因此自然经 `underlying-proxy`。
+3. **底层策略不载 UDP（P4，覆盖 8.1 的"照旧 REJECT"）**：隧道拨号失败（`DialError::Failed`，说明 `via <底层策略>: the underlying policy cannot carry UDP`），不做成 REJECT——REJECT 有自动升级，而这是配置问题。
+4. **M4b #24（P6，覆盖 8.2 第二条）**：已无对象——TCP 拨号里产生 `Unsupported` 的只剩上一条去掉的那一处。
+5. **UDP 测试（P7、P8，细化 8.4）**：另走 `Engine::test_udp`，与 URL 测试并行；`POST /v1/policies/test` 的结果多一个可选的 `udp` 键（新增键，不破坏现有客户端）；结果不保存、不进 `GET /v1/policy_groups/test_results`、不进请求记录。DNS 报文手写，任何应答（不看应答码）都算通过。
+6. **`smart` 的 UDP（P9，细化 8.3）**：经 `udp-policy-not-supported-behaviour` 改走 DIRECT 的流不回报。
+7. **`dns-follow-interface` 的范围（P10、P11，覆盖 8.5）**：跟随的是策略自己的直连连接器做的全部解析——`direct` 的目标与代理的服务器名（手册："DNS requests that match the policy will use this interface for queries"）；`[Host]`、hosts 文件、`.local` 与经系统接口的解析照常；只替换问上游那一步，问的是 `dns-server` 里的普通服务器与 `system` 展开的系统服务器，按网卡名各存一组上游与缓存，网络变化时清掉；配了 `encrypted-dns-server` 时不跟随（照常问加密 DNS，记一条 info）。
+8. **`dns-follow-interface` 没写 `interface`（P12）**：`W0028` 并当作 `false`。
+
