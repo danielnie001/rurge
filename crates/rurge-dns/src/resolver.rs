@@ -258,6 +258,9 @@ pub struct Resolver {
     /// Said once: lookups through a `Via` do not follow it with encrypted
     /// DNS configured.
     via_unfollowed: AtomicBool,
+    /// Said once: lookups through a `Via` go as usual when there is no
+    /// plain server to ask through it.
+    via_serverless: AtomicBool,
 }
 
 impl Resolver {
@@ -362,6 +365,7 @@ impl Resolver {
             self_weak: Mutex::new(Weak::new()),
             vias: Mutex::new(HashMap::new()),
             via_unfollowed: AtomicBool::new(false),
+            via_serverless: AtomicBool::new(false),
             configured_udp,
             wants_system,
             encrypted_specs: encrypted,
@@ -498,7 +502,8 @@ impl Resolver {
     /// `lookup`, the questions to the plain servers leaving through `via`
     /// with answers kept apart (`dns-follow-interface`, phase 2 M5 design
     /// 8.5). `[Host]`, the hosts file and the system's own lookups go as
-    /// usual; with encrypted DNS configured, nothing follows `via`.
+    /// usual; with encrypted DNS configured, or no plain server to ask,
+    /// nothing follows `via`.
     pub async fn lookup_via(
         &self,
         host: &str,
@@ -539,17 +544,16 @@ impl Resolver {
         set
     }
 
-    /// The upstream step of a lookup through `via`: its own cache, then its
+    /// The upstream step of a lookup through a `Via`: its own cache, then its
     /// own servers.
     async fn lookup_on(
         &self,
         name: &str,
         want_v6: bool,
         opts: &LookupOpts,
-        via: &Via,
+        set: &ViaSet,
         started: Instant,
     ) -> Result<DnsResult, DnsError> {
-        let set = self.via_set(via);
         if !opts.bypass_cache {
             match set.cache.get(name) {
                 Some(CacheHit::Fresh(a)) if a.v6_queried || !want_v6 => {
@@ -673,9 +677,18 @@ impl Resolver {
 
         if let Some(via) = via {
             if self.encrypted_specs.is_empty() {
-                return self.lookup_on(&current, want_v6, &opts, via, started).await;
-            }
-            if !self.via_unfollowed.swap(true, Ordering::Relaxed) {
+                let set = self.via_set(via);
+                if !set.upstreams.is_empty() {
+                    return self
+                        .lookup_on(&current, want_v6, &opts, &set, started)
+                        .await;
+                }
+                if !self.via_serverless.swap(true, Ordering::Relaxed) {
+                    tracing::info!(
+                        "dns-follow-interface: no plain DNS server to ask through the interface; asked as usual"
+                    );
+                }
+            } else if !self.via_unfollowed.swap(true, Ordering::Relaxed) {
                 tracing::info!(
                     "dns-follow-interface: the encrypted DNS servers are asked as usual, not through the policy's interface"
                 );
@@ -1886,5 +1899,35 @@ mod tests {
         assert_eq!(a.v4, vec![v4("10.0.0.42")]);
         assert!(noting.udp().is_empty());
         assert_eq!(tcp.query_count("a.test", Qtype::A), 1);
+    }
+
+    /// With no plain server to ask through the interface (no `dns-server`
+    /// and no system server readable), a lookup through a `Via` goes the
+    /// usual way instead of asking nothing.
+    #[tokio::test]
+    async fn with_no_plain_server_lookups_via_an_interface_go_as_usual() {
+        let e = env(&profile("", ""));
+        let (r, _) = resolver(&e, StaticSystemDns::default());
+        assert!(r.primary_upstreams().is_empty());
+        r.cache.put(
+            "a.test",
+            CachedAddrs {
+                v4: vec![v4("10.0.0.7")],
+                v6: Vec::new(),
+                ttl: Duration::from_secs(60),
+                v6_queried: true,
+                source: "system".to_string(),
+            },
+        );
+        let (via, noting) = Noting::via("en1");
+        let a = r
+            .lookup_via("a.test", LookupOpts::default(), &via)
+            .await
+            .unwrap();
+        assert_eq!(
+            (a.v4, a.source),
+            (vec![v4("10.0.0.7")], Source::Cache { stale: false })
+        );
+        assert!(noting.udp().is_empty());
     }
 }

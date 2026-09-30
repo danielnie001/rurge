@@ -186,4 +186,49 @@ mod tests {
             ["192.0.2.2".parse::<IpAddr>().unwrap()]
         );
     }
+
+    /// Answers lookups through a `Via` apart from the others.
+    struct Marked;
+
+    impl Resolve for Marked {
+        fn resolve<'a>(&'a self, _host: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+            Box::pin(std::future::ready(Ok(vec!["192.0.2.1".parse().unwrap()])))
+        }
+
+        fn resolve_via<'a>(
+            &'a self,
+            _host: &'a str,
+            via: &'a Via,
+        ) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+            let ip = if via.key == "en1" {
+                "192.0.2.3"
+            } else {
+                "192.0.2.4"
+            };
+            Box::pin(std::future::ready(Ok(vec![ip.parse().unwrap()])))
+        }
+    }
+
+    /// A lookup through a `Via` reaches the current resolver's own
+    /// `resolve_via`, with the `Via` it was given (`dns-follow-interface`).
+    #[tokio::test]
+    async fn the_cell_hands_lookups_through_a_via_on() {
+        use rurge_net::connector::{DirectConnector, SystemResolve};
+        let via = Via {
+            key: "en1".to_string(),
+            connector: Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
+        };
+        let cell = ResolverCell::new();
+        let err = cell.resolve_via("a.test", &via).await.unwrap_err();
+        assert_eq!(err.to_string(), "no resolver is active");
+        cell.store(Arc::new(Marked));
+        assert_eq!(
+            cell.resolve_via("a.test", &via).await.unwrap(),
+            ["192.0.2.3".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            cell.resolve("a.test").await.unwrap(),
+            ["192.0.2.1".parse::<IpAddr>().unwrap()]
+        );
+    }
 }

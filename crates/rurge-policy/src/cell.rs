@@ -148,7 +148,10 @@ impl Connector for ChainConnector {
     ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
         Box::pin(async move {
             let socket = self.open_udp(opts).await?;
-            let to = socket.resolve(target).await?;
+            let to = socket
+                .resolve(target)
+                .await
+                .map_err(|e| self.via(OutboundError::Io(e)))?;
             Ok(packet_datagram(socket, to))
         })
     }

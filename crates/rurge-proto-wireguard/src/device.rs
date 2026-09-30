@@ -40,12 +40,28 @@ const SENDS: u32 = 3;
 /// often it only tells the debug log (M4b deferred item #15).
 const UNREACHABLE_EVERY: Duration = Duration::from_secs(300);
 
+/// When each policy last said something about each peer.
+type Said = Mutex<Option<HashMap<(String, usize), Instant>>>;
+
 /// When each policy last said that each peer cannot be reached.
-static UNREACHABLE_SAID: Mutex<Option<HashMap<(String, usize), Instant>>> = Mutex::new(None);
+static UNREACHABLE_SAID: Said = Mutex::new(None);
+/// When each policy last said that each peer's carrier has ended; a relay
+/// that keeps closing the association would otherwise say so every
+/// `REPLACE`.
+static ENDED_SAID: Said = Mutex::new(None);
 
 /// Whether a policy may say again that `peer` cannot be reached.
 fn may_say_unreachable(policy: &str, peer: usize, now: Instant) -> bool {
-    let mut said = UNREACHABLE_SAID.lock().expect("the unreachable warnings");
+    may_say(&UNREACHABLE_SAID, policy, peer, now)
+}
+
+/// Whether a policy may say again that `peer`'s carrier has ended.
+fn may_say_ended(policy: &str, peer: usize, now: Instant) -> bool {
+    may_say(&ENDED_SAID, policy, peer, now)
+}
+
+fn may_say(said: &Said, policy: &str, peer: usize, now: Instant) -> bool {
+    let mut said = said.lock().expect("the warnings said");
     let said = said.get_or_insert_with(HashMap::new);
     let key = (policy.to_string(), peer);
     if said
@@ -719,7 +735,11 @@ impl Driver {
                     // a failed send)
                     for &peer in &ended {
                         self.up[peer] = false;
-                        tracing::warn!(policy = %self.policy, peer = peer + 1, "wireguard: the peer's carrier has ended");
+                        if may_say_ended(&self.policy, peer, Instant::now()) {
+                            tracing::warn!(policy = %self.policy, peer = peer + 1, "wireguard: the peer's carrier has ended");
+                        } else {
+                            tracing::debug!(policy = %self.policy, peer = peer + 1, "wireguard: the peer's carrier has ended");
+                        }
                     }
                     self.replace_failed(&mut dials, ended);
                     if !completed.is_empty() {
@@ -765,5 +785,17 @@ mod tests {
             0,
             now + UNREACHABLE_EVERY
         ));
+    }
+
+    /// A carrier that keeps ending is said so as seldom, apart from the
+    /// peers that cannot be reached.
+    #[test]
+    fn a_carrier_that_keeps_ending_is_said_so_once_in_a_while() {
+        let now = Instant::now();
+        assert!(may_say_ended("ended-test", 0, now));
+        assert!(!may_say_ended("ended-test", 0, now + REPLACE));
+        assert!(may_say_unreachable("ended-test", 0, now));
+        assert!(may_say_ended("ended-test", 1, now));
+        assert!(may_say_ended("ended-test", 0, now + UNREACHABLE_EVERY));
     }
 }
