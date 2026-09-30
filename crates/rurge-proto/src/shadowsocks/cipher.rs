@@ -3,11 +3,14 @@
 //! stream. No associated data anywhere in the protocol.
 
 use super::kdf;
+use aes::cipher::{BlockDecrypt, BlockEncrypt};
+use aes::{Aes128, Aes256};
 use aes_gcm::aead::consts::U12;
 use aes_gcm::aes::Aes192;
 use aes_gcm::{AeadInOut, Aes128Gcm, Aes256Gcm, AesGcm, KeyInit};
 use chacha20poly1305::aead::generic_array::GenericArray;
-// the ChaCha ciphers are of the older `aead` generation, with traits of their own
+// the ChaCha ciphers (and the `aes` block ciphers) are of the older generation,
+// with traits of their own
 use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, KeyInit as _, XChaCha20Poly1305};
 use rurge_config::spec::SsMethod;
 
@@ -215,6 +218,8 @@ impl CountingAead {
 pub(crate) struct MasterKey {
     kind: AeadKind,
     key: Vec<u8>,
+    /// SS 2022: the key is a PSK and sessions derive with BLAKE3.
+    edition_2022: bool,
 }
 
 impl MasterKey {
@@ -223,6 +228,17 @@ impl MasterKey {
         MasterKey {
             kind,
             key: kdf::evp_bytes_to_key(password.as_bytes(), kind.key_len()),
+            edition_2022: false,
+        }
+    }
+
+    /// SS 2022's key: the (user) PSK itself, `kind.key_len()` bytes.
+    pub(crate) fn from_psk(kind: AeadKind, psk: &[u8]) -> MasterKey {
+        debug_assert_eq!(psk.len(), kind.key_len());
+        MasterKey {
+            kind,
+            key: psk.to_vec(),
+            edition_2022: true,
         }
     }
 
@@ -231,9 +247,43 @@ impl MasterKey {
     }
 
     /// One direction of a stream that starts with `salt`: the session key
-    /// is HKDF-SHA1 of the master key under that salt.
+    /// is HKDF-SHA1 of the master key under that salt, or with SS 2022
+    /// BLAKE3 `derive_key` of the PSK and the salt.
     pub(crate) fn session(&self, salt: &[u8]) -> CountingAead {
-        CountingAead::new(self.kind, &kdf::session_subkey(&self.key, salt))
+        let key = if self.edition_2022 {
+            kdf::session_subkey_2022(&self.key, salt)
+        } else {
+            kdf::session_subkey(&self.key, salt)
+        };
+        CountingAead::new(self.kind, &key)
+    }
+}
+
+/// One AES block encrypted in place with a 16- or 32-byte key (SS 2022's
+/// identity headers and separate headers: ECB of a single block).
+pub(crate) fn aes_encrypt_block(key: &[u8], block: &mut [u8; 16]) {
+    let block = GenericArray::from_mut_slice(block);
+    match key.len() {
+        16 => Aes128::new_from_slice(key)
+            .expect("16 bytes")
+            .encrypt_block(block),
+        _ => Aes256::new_from_slice(key)
+            .expect("a 32-byte key")
+            .encrypt_block(block),
+    }
+}
+
+/// The inverse of `aes_encrypt_block` (the fake server's side).
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn aes_decrypt_block(key: &[u8], block: &mut [u8; 16]) {
+    let block = GenericArray::from_mut_slice(block);
+    match key.len() {
+        16 => Aes128::new_from_slice(key)
+            .expect("16 bytes")
+            .decrypt_block(block),
+        _ => Aes256::new_from_slice(key)
+            .expect("a 32-byte key")
+            .decrypt_block(block),
     }
 }
 

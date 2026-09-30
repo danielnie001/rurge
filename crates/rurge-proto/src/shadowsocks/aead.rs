@@ -3,6 +3,13 @@
 //! `sealed(length, 2 bytes big-endian) ‖ sealed(payload)`, both sealed with
 //! the direction's session key and the next value of its counting nonce.
 //!
+//! SS 2022 (SIP022 3.1) is the same stream with larger chunks and headers:
+//! the request puts the identity headers behind its salt and turns its first
+//! write into a fixed-length header chunk and a variable-length one (the
+//! address, padding, the initial payload); the response opens with a
+//! fixed-length header chunk that names our salt and the length of its first
+//! payload chunk.
+//!
 //! A write reports success only after its whole chunk has been handed to the
 //! layer below, so the stream never depends on anyone calling `flush`. The
 //! salt leaves in front of the first chunk, in the same write. There is no
@@ -14,6 +21,7 @@
 //! nonce has moved on).
 
 use super::cipher::{CountingAead, MasterKey, TAG};
+use super::s2022;
 use rurge_net::connector::BoxedStream;
 use std::io;
 use std::pin::Pin;
@@ -44,6 +52,11 @@ enum Reading {
         buf: Vec<u8>,
         filled: usize,
     },
+    /// SS 2022: the response's fixed-length header.
+    Head {
+        buf: Vec<u8>,
+        filled: usize,
+    },
     Len {
         buf: [u8; 2 + TAG],
         filled: usize,
@@ -58,6 +71,24 @@ enum Reading {
         end: usize,
     },
     Eof,
+}
+
+/// What the 2022 edition adds to a request stream.
+pub(crate) struct Request2022 {
+    /// The identity headers, between the salt and the first chunk.
+    pub identity: Vec<u8>,
+    /// The length of the address the first write starts with (a
+    /// `LazyHead` above guarantees that it does).
+    pub addr_len: usize,
+    /// Seconds since the Unix epoch.
+    pub now: fn() -> u64,
+}
+
+/// A 2022 request stream's state: its setup and its salt, which the
+/// response must echo.
+struct Edition2022 {
+    request: Request2022,
+    salt: Vec<u8>,
 }
 
 /// No `Debug`: it holds the connection's keys.
@@ -76,6 +107,8 @@ pub(crate) struct AeadStream {
     out_pos: usize,
     accepted: usize,
     reading: Reading,
+    /// `None`: the AEAD edition.
+    edition_2022: Option<Edition2022>,
 }
 
 fn invalid(text: &'static str) -> io::Error {
@@ -84,6 +117,27 @@ fn invalid(text: &'static str) -> io::Error {
 
 fn cut_short() -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, CUT_SHORT)
+}
+
+/// Seals the first write of a 2022 request into its two header chunks: the
+/// address, padding when there is no payload, and as much of the payload as
+/// the variable-length header holds. The bytes of `data` it took.
+fn seal_first_2022(
+    up: &mut CountingAead,
+    request: &Request2022,
+    data: &[u8],
+    out: &mut Vec<u8>,
+) -> io::Result<usize> {
+    let addr_len = request.addr_len.min(data.len());
+    let room = s2022::MAX_VARIABLE_HEADER - addr_len - 2;
+    let payload = &data[addr_len..data.len().min(addr_len + room)];
+    let padding = s2022::padding_len(payload.len())
+        .map_err(|_| io::Error::other("ss: no randomness available"))?;
+    let variable = s2022::request_variable(&data[..addr_len], padding, payload);
+    out.extend_from_slice(&request.identity);
+    up.seal(&s2022::request_fixed((request.now)(), variable.len()), out);
+    up.seal(&variable, out);
+    Ok(addr_len + payload.len())
 }
 
 /// Fills `buf[*filled..]`. `Ok(false)`: the peer closed before the first byte.
@@ -133,6 +187,24 @@ impl AeadStream {
                 buf: vec![0; salt_len],
                 filled: 0,
             },
+            edition_2022: None,
+        }
+    }
+
+    /// An SS 2022 request stream: `key` is the user key's.
+    pub(crate) fn new_2022(
+        inner: BoxedStream,
+        key: Arc<MasterKey>,
+        salt: Vec<u8>,
+        request: Request2022,
+    ) -> AeadStream {
+        let edition = Edition2022 {
+            request,
+            salt: salt.clone(),
+        };
+        AeadStream {
+            edition_2022: Some(edition),
+            ..AeadStream::new(inner, key, salt, s2022::MAX_PAYLOAD)
         }
     }
 
@@ -165,8 +237,30 @@ impl AsyncRead for AeadStream {
                         )));
                     }
                     this.down = Some(this.key.session(buf));
-                    this.reading = Reading::Len {
-                        buf: [0; 2 + TAG],
+                    this.reading = match &this.edition_2022 {
+                        Some(edition) => Reading::Head {
+                            buf: vec![0; s2022::response_fixed_len(edition.salt.len()) + TAG],
+                            filled: 0,
+                        },
+                        None => Reading::Len {
+                            buf: [0; 2 + TAG],
+                            filled: 0,
+                        },
+                    };
+                }
+                Reading::Head { buf, filled } => {
+                    if !ready!(poll_fill(&mut this.inner, cx, buf, filled))? {
+                        return Poll::Ready(Err(cut_short()));
+                    }
+                    let down = this.down.as_mut().expect("the salt came first");
+                    let Some(n) = down.open(buf) else {
+                        return Poll::Ready(Err(invalid(UNDECRYPTABLE)));
+                    };
+                    let edition = this.edition_2022.as_ref().expect("a 2022 stream");
+                    let len =
+                        s2022::check_response(&buf[..n], &edition.salt, (edition.request.now)())?;
+                    this.reading = Reading::Body {
+                        buf: vec![0; len + TAG],
                         filled: 0,
                     };
                 }
@@ -239,14 +333,28 @@ impl AsyncWrite for AeadStream {
             return Poll::Ready(Ok(0));
         }
         if this.out_pos == this.out.len() {
-            let n = data.len().min(this.max_payload);
             this.out.clear();
             this.out_pos = 0;
-            if let Some(salt) = this.salt.take() {
-                this.out.extend_from_slice(&salt);
+            let first = this.salt.take();
+            if let Some(salt) = &first {
+                this.out.extend_from_slice(salt);
             }
-            seal_chunk(&mut this.up, &data[..n], &mut this.out);
-            this.accepted = n;
+            this.accepted = match (&first, &this.edition_2022) {
+                (Some(_), Some(edition)) => {
+                    match seal_first_2022(&mut this.up, &edition.request, data, &mut this.out) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            this.out.clear();
+                            return Poll::Ready(Err(e));
+                        }
+                    }
+                }
+                _ => {
+                    let n = data.len().min(this.max_payload);
+                    seal_chunk(&mut this.up, &data[..n], &mut this.out);
+                    n
+                }
+            };
         }
         ready!(this.poll_out(cx))?;
         Poll::Ready(Ok(this.accepted.min(data.len())))
@@ -461,5 +569,230 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, b"hello");
+    }
+
+    const TIME: u64 = 1_700_000_000;
+    /// 127.0.0.1:8080 as a SOCKS5 address.
+    const ADDR: [u8; 7] = [1, 127, 0, 0, 1, 0x1f, 0x90];
+
+    /// SS 2022 known answers, computed with a BLAKE3 written in Python from
+    /// its specification and `cryptography`'s AES-GCM / AES-ECB: the key
+    /// sets, the request after its salt `80 81 …` (identity headers, the
+    /// header chunks for `ADDR` ‖ "hello" at `TIME`, then a chunk "world"),
+    /// and a response (salt `90 91 …`, header at `TIME` naming the request
+    /// salt, first chunk "ok").
+    struct Vector2022 {
+        kind: AeadKind,
+        /// The identity keys, then the user key.
+        keys: Vec<Vec<u8>>,
+        request: &'static str,
+        response: &'static str,
+    }
+
+    fn vectors_2022() -> [Vector2022; 2] {
+        [
+            Vector2022 {
+                kind: AeadKind::Aes128Gcm,
+                keys: vec![(0u8..16).collect(), (0x20u8..0x30).collect()],
+                request: "efa5909821ac85519cb2bac2aebde4c208e3db4c9c568afe00f79400b7de08b99705e60672e49140157f36cb37ee7cdbb68b6f05e5b0781929dd6faa3f98821068d0dd702f5c25c7a6e3660c43fe09c778270316fdca0040824985d1e5c085edf95a3d34c77e0ea6434d2bb376e9afee",
+                response: "909192939495969798999a9b9c9d9e9f17be40f377e19922ad1161db151a79ab845e3736f8b62015b85aa6a7abae3321e93c787a398be13e55aa4697fc05eae3783a4f75ac3cf0252cb9df1daa",
+            },
+            Vector2022 {
+                kind: AeadKind::Aes256Gcm,
+                keys: vec![(0x20u8..0x40).collect()],
+                request: "a74482c100c255a6eb2bd1f55f1988d1c550161c7275ca6428763b418e260e6df7a2f7cc9b0ba2611e87e691d74fb7c14fc48011bddcc78f5767ccab920e6a74aefcdb72a6e91368c4eadf6185c04dfc07fddcc1fcd229291349b11478f41af7",
+                response: "909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf8d4a9fedac53d86bcfa93ab21983ac82b38c11611d5a54f53de08cc2b0f5d7aef4fd69c51150aab7a37b0feedb3351fc511674611d46d29627514852c2567450524bf016bf3e555405e12149ca",
+            },
+        ]
+    }
+
+    fn request_salt(kind: AeadKind) -> Vec<u8> {
+        (0x80..0x80 + kind.key_len() as u8).collect()
+    }
+
+    fn stream_2022(
+        inner: BoxedStream,
+        kind: AeadKind,
+        keys: &[Vec<u8>],
+        now: fn() -> u64,
+    ) -> AeadStream {
+        let salt = request_salt(kind);
+        let request = Request2022 {
+            identity: s2022::Identity::new(keys).headers(&salt),
+            addr_len: ADDR.len(),
+            now,
+        };
+        let key = Arc::new(MasterKey::from_psk(kind, keys.last().unwrap()));
+        AeadStream::new_2022(inner, key, salt, request)
+    }
+
+    /// What a 2022 stream reads from a server that sends `wire` through a
+    /// pipe of `capacity` bytes and then closes, its clock at `now`.
+    async fn read_2022(
+        kind: AeadKind,
+        keys: &[Vec<u8>],
+        wire: Vec<u8>,
+        capacity: usize,
+        now: fn() -> u64,
+    ) -> io::Result<Vec<u8>> {
+        let (near, mut far) = tokio::io::duplex(capacity);
+        tokio::spawn(async move {
+            let _ = far.write_all(&wire).await;
+        });
+        let mut stream = stream_2022(Box::new(near), kind, keys, now);
+        let mut got = Vec::new();
+        stream.read_to_end(&mut got).await.map(|_| got)
+    }
+
+    #[tokio::test]
+    async fn ss_2022_writes_the_known_answer() {
+        for vector in vectors_2022() {
+            let (near, mut far) = tokio::io::duplex(64 * 1024);
+            let mut stream = stream_2022(Box::new(near), vector.kind, &vector.keys, || TIME);
+            // the address and the first payload: one write, as a `LazyHead` does it
+            let first = [&ADDR[..], b"hello"].concat();
+            assert_eq!(stream.write(&first).await.unwrap(), first.len());
+            stream.write_all(b"world").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut wire = Vec::new();
+            far.read_to_end(&mut wire).await.unwrap();
+            let mut expected = request_salt(vector.kind);
+            expected.extend_from_slice(&hex(vector.request));
+            assert_eq!(wire, expected, "{:?}", vector.kind);
+        }
+    }
+
+    #[tokio::test]
+    async fn ss_2022_reads_the_known_answer_whatever_the_slicing() {
+        for vector in vectors_2022() {
+            for capacity in [1, 7, 4096] {
+                let got = read_2022(
+                    vector.kind,
+                    &vector.keys,
+                    hex(vector.response),
+                    capacity,
+                    || TIME + 30,
+                )
+                .await
+                .unwrap();
+                assert_eq!(got, b"ok", "{:?} through {capacity}", vector.kind);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_address_alone_is_padded_and_a_long_first_write_fills_one_header() {
+        let kind = AeadKind::Aes128Gcm;
+        let keys = vec![vec![3u8; 16]];
+        // the target speaks first: the address goes out alone, padded
+        let (near, mut far) = tokio::io::duplex(1 << 20);
+        let mut stream = stream_2022(Box::new(near), kind, &keys, || TIME);
+        stream.write_all(&ADDR).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut wire = Vec::new();
+        far.read_to_end(&mut wire).await.unwrap();
+        let bare = 16 + (s2022::REQUEST_FIXED + TAG) + (ADDR.len() + 2 + TAG);
+        assert!(
+            (bare + 1..=bare + 900).contains(&wire.len()),
+            "{} bytes",
+            wire.len()
+        );
+        // with a payload, as much as the variable header holds, unpadded
+        let (near, mut far) = tokio::io::duplex(1 << 20);
+        let mut stream = stream_2022(Box::new(near), kind, &keys, || TIME);
+        let first = [&ADDR[..], &vec![0x55; 100_000]].concat();
+        let taken = stream.write(&first).await.unwrap();
+        assert_eq!(taken, s2022::MAX_VARIABLE_HEADER - 2);
+        stream.write_all(&first[taken..]).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut wire = Vec::new();
+        far.read_to_end(&mut wire).await.unwrap();
+        let rest = first.len() - taken;
+        assert_eq!(
+            wire.len(),
+            16 + (s2022::REQUEST_FIXED + TAG) + (0xFFFF + TAG) + (2 + TAG + rest + TAG)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_2022_answer_that_is_not_ours_is_an_error_that_quotes_nothing() {
+        let kind = AeadKind::Aes128Gcm;
+        let keys = vec![(0x20u8..0x30).collect::<Vec<u8>>()];
+        let answer_salt = vec![0x90u8; 16];
+        // an answer sealed right, its header as given
+        let answer = |header: &[u8]| {
+            let key = MasterKey::from_psk(kind, &keys[0]);
+            let mut aead = key.session(&answer_salt);
+            let mut wire = answer_salt.clone();
+            aead.seal(header, &mut wire);
+            aead.seal(b"ok", &mut wire);
+            wire
+        };
+        let header = |kind_byte: u8, time: u64, salt: &[u8]| {
+            let mut out = vec![kind_byte];
+            out.extend_from_slice(&time.to_be_bytes());
+            out.extend_from_slice(salt);
+            out.extend_from_slice(&2u16.to_be_bytes());
+            out
+        };
+        let ours = request_salt(kind);
+        let mut other = ours.clone();
+        other[15] ^= 1;
+        let good = answer(&header(1, TIME, &ours));
+        let not_ours = "ss: the server's answer is not for this request";
+        let cases: [(&str, Vec<u8>, io::ErrorKind, &str); 6] = [
+            (
+                "silence",
+                Vec::new(),
+                io::ErrorKind::UnexpectedEof,
+                NO_ANSWER,
+            ),
+            (
+                "a salt alone",
+                answer_salt.clone(),
+                io::ErrorKind::UnexpectedEof,
+                CUT_SHORT,
+            ),
+            (
+                "our request played back",
+                answer(&header(0, TIME, &ours)),
+                io::ErrorKind::InvalidData,
+                not_ours,
+            ),
+            (
+                "another request's salt",
+                answer(&header(1, TIME, &other)),
+                io::ErrorKind::InvalidData,
+                not_ours,
+            ),
+            (
+                "a clock 31 seconds ahead",
+                answer(&header(1, TIME + 31, &ours)),
+                io::ErrorKind::InvalidData,
+                "ss: the server's clock differs from ours by 31 seconds (at most 30 are allowed)",
+            ),
+            (
+                "another key",
+                {
+                    let mut wire = good.clone();
+                    wire[16] ^= 1;
+                    wire
+                },
+                io::ErrorKind::InvalidData,
+                UNDECRYPTABLE,
+            ),
+        ];
+        for (case, wire, kind_of_error, text) in cases {
+            let err = read_2022(kind, &keys, wire, 4096, || TIME)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                (err.kind(), err.to_string().as_str()),
+                (kind_of_error, text),
+                "{case}"
+            );
+        }
+        let got = read_2022(kind, &keys, good, 4096, || TIME).await.unwrap();
+        assert_eq!(got, b"ok");
     }
 }

@@ -1,16 +1,20 @@
 //! `ss` outbound (manual: Policies › Shadowsocks; phase 2 M6 design 3.3):
 //! optionally behind Shadow TLS and / or simple-obfs, the AEAD stream
-//! (`aead`) — or, with `none`, the bytes as they are. The request header is
-//! the target as a SOCKS5 address; it waits in a `LazyHead` above the
-//! stream for the first payload, so both are sealed into the first chunk.
+//! (`aead`) — in its SS 2022 form for the `2022-blake3-*` methods, with the
+//! identity headers of a multi-user key (`s2022`) — or, with `none`, the
+//! bytes as they are. The request header is the target as a SOCKS5 address;
+//! it waits in a `LazyHead` above the stream for the first payload, so both
+//! are sealed into the first chunk (SS 2022: the two header chunks).
 //!
 //! The server never answers the header: a wrong password or method only
 //! shows once the relay reads, as a connection closed without an answer or
-//! as data that does not decrypt.
+//! as data that does not decrypt. SS 2022's answer names the request it
+//! belongs to and the server's time, which the stream checks.
 
 pub(crate) mod aead;
 pub(crate) mod cipher;
 pub(crate) mod kdf;
+pub(crate) mod s2022;
 
 use crate::addr::{AddrError, socks_addr};
 use crate::build::shadow_tls_client;
@@ -18,20 +22,25 @@ use crate::transport::Stack;
 use crate::transport::lazy_head::LazyHead;
 use crate::transport::obfs::ObfsClient;
 use crate::{BuildError, Outbound, OutboundError};
-use aead::AeadStream;
+use aead::{AeadStream, Request2022};
 use cipher::{AeadKind, MasterKey};
 use rurge_config::spec::{ShadowTlsOpts, SsSpec};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
 use rustls::RootCertStore;
+use s2022::Identity;
 use std::sync::Arc;
 
 /// No `Debug`: the master key is as good as the password.
 pub struct ShadowsocksOutbound {
     name: String,
     stack: Stack,
-    /// `None`: the method is `none`.
+    /// `None`: the method is `none`. SS 2022: the user key's.
     key: Option<Arc<MasterKey>>,
+    /// `Some` for SS 2022, with no layers for a single key.
+    identity: Option<Identity>,
+    /// Seconds since the Unix epoch, for SS 2022's timestamps.
+    now: fn() -> u64,
 }
 
 impl ShadowsocksOutbound {
@@ -45,21 +54,35 @@ impl ShadowsocksOutbound {
     ) -> Result<ShadowsocksOutbound, BuildError> {
         // error texts carry no policy name: the registry's `build_one` and the
         // dry build both prefix it
-        if spec.method.is_2022() {
-            return Err(BuildError::new(format!(
-                "ss: `{}` is not supported yet",
-                spec.method.name()
-            )));
-        }
-        let key = match AeadKind::of(spec.method) {
-            None => None,
+        let (key, identity) = match AeadKind::of(spec.method) {
+            None => (None, None),
+            Some(kind) if spec.method.is_2022() => {
+                // the configuration checked them; a spec made by hand may not be
+                let keys = spec.keys.expose();
+                let Some(user) = keys.last() else {
+                    return Err(BuildError::new("`password` is empty"));
+                };
+                if keys.iter().any(|key| key.len() != kind.key_len()) {
+                    return Err(BuildError::new(format!(
+                        "`password` is not Base64 keys of the length `{}` requires",
+                        spec.method.name()
+                    )));
+                }
+                (
+                    Some(Arc::new(MasterKey::from_psk(kind, user))),
+                    Some(Identity::new(keys)),
+                )
+            }
             Some(_) if spec.password.expose().is_empty() => {
                 return Err(BuildError::new("`password` is empty"));
             }
-            Some(kind) => Some(Arc::new(MasterKey::from_password(
-                kind,
-                spec.password.expose(),
-            ))),
+            Some(kind) => (
+                Some(Arc::new(MasterKey::from_password(
+                    kind,
+                    spec.password.expose(),
+                ))),
+                None,
+            ),
         };
         // `ss` has no TLS of its own: the camouflage certificate is checked
         // against the server's name
@@ -77,7 +100,15 @@ impl ShadowsocksOutbound {
             name: name.to_string(),
             stack,
             key,
+            identity,
+            now: s2022::unix_now,
         })
+    }
+
+    /// Runs SS 2022's timestamps off another clock.
+    #[cfg(test)]
+    fn with_clock(self, now: fn() -> u64) -> ShadowsocksOutbound {
+        ShadowsocksOutbound { now, ..self }
     }
 }
 
@@ -122,14 +153,22 @@ impl Outbound for ShadowsocksOutbound {
                 Ok(result) => result?,
                 Err(_) => return Err(OutboundError::Timeout),
             };
-            let stream: BoxedStream = match &self.key {
-                None => transport,
-                Some(key) => Box::new(AeadStream::new(
+            let stream: BoxedStream = match (&self.key, &self.identity) {
+                (None, _) => transport,
+                (Some(key), None) => Box::new(AeadStream::new(
                     transport,
                     key.clone(),
                     salt,
                     aead::MAX_PAYLOAD,
                 )),
+                (Some(key), Some(identity)) => {
+                    let request = Request2022 {
+                        identity: identity.headers(&salt),
+                        addr_len: head.len(),
+                        now: self.now,
+                    };
+                    Box::new(AeadStream::new_2022(transport, key.clone(), salt, request))
+                }
             };
             Ok(Box::new(LazyHead::new(stream, head)) as BoxedStream)
         })
@@ -140,7 +179,10 @@ impl Outbound for ShadowsocksOutbound {
 mod tests {
     use super::*;
     use crate::UdpSupport;
+    use crate::addr::socks_addr;
     use crate::testing::{FakeShadowsocks, ShadowsocksScript, echo_server};
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
     use rurge_config::policy::parse_policy;
     use rurge_config::spec::shadow_tls::read_shadow_tls;
     use rurge_config::spec::ss::read_ss;
@@ -432,16 +474,325 @@ mod tests {
         }
     }
 
+    const SS_2022: [SsMethod; 2] = [SsMethod::Blake3Aes128Gcm, SsMethod::Blake3Aes256Gcm];
+
+    /// A Base64 key of `method`'s length, every byte `byte`.
+    fn key_2022(method: SsMethod, byte: u8) -> String {
+        STANDARD.encode(vec![byte; method.key_len()])
+    }
+
+    /// An outbound of `method` whose `password` is `password`.
+    fn outbound_2022(
+        fake: &FakeShadowsocks,
+        method: SsMethod,
+        password: &str,
+    ) -> ShadowsocksOutbound {
+        outbound(&format!(
+            "ss, 127.0.0.1, {}, encrypt-method={}, password={password}",
+            fake.addr().port(),
+            method.name()
+        ))
+    }
+
+    #[tokio::test]
+    async fn ss_2022_round_trips_with_one_key_or_as_one_of_several_users() {
+        let echo = echo_server().await;
+        for method in SS_2022 {
+            let (server, user) = (key_2022(method, 1), key_2022(method, 2));
+            // a single key; the server's key and one of its users' behind it,
+            // also behind obfs
+            let setups = [
+                (
+                    ShadowsocksScript::new(method, &server),
+                    server.clone(),
+                    None,
+                ),
+                (
+                    ShadowsocksScript {
+                        users: vec![key_2022(method, 3), user.clone()],
+                        ..ShadowsocksScript::new(method, &server)
+                    },
+                    format!("{server}:{user}"),
+                    Some(1),
+                ),
+                (
+                    ShadowsocksScript {
+                        users: vec![user.clone()],
+                        obfs: Some(ObfsMode::Tls),
+                        ..ShadowsocksScript::new(method, &server)
+                    },
+                    format!("{server}:{user}, obfs=tls, obfs-host=cdn.example"),
+                    Some(0),
+                ),
+            ];
+            for (script, password, user) in setups {
+                let fake = FakeShadowsocks::spawn(script).await;
+                let out = outbound_2022(&fake, method, &password);
+                let mut stream = out
+                    .connect_tcp(&target(echo), &ConnectOpts::default())
+                    .await
+                    .unwrap();
+                roundtrip(&mut stream, b"hello through ss 2022").await;
+                roundtrip(&mut stream, b"and again").await;
+                let seen = fake.requests();
+                assert_eq!(seen.len(), 1, "{method:?} {password}");
+                assert_eq!(
+                    (seen[0].atyp, seen[0].host.as_str(), seen[0].port),
+                    (1, "127.0.0.1", echo.port())
+                );
+                assert_eq!(seen[0].early, b"hello through ss 2022", "one write");
+                assert_eq!((seen[0].padding, seen[0].user), (0, user));
+                assert_eq!(seen[0].salt.len(), method.key_len());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ss_2022_sends_names_and_crosses_chunks_of_0xffff() {
+        let echo = echo_server().await;
+        let method = SsMethod::Blake3Aes256Gcm;
+        let key = key_2022(method, 7);
+        let fake = FakeShadowsocks::spawn(ShadowsocksScript {
+            connect_to: Some(echo),
+            ..ShadowsocksScript::new(method, &key)
+        })
+        .await;
+        let out = outbound_2022(&fake, method, &key);
+        let stream = out
+            .connect_tcp(
+                &Target::new(HostName::Domain("bücher.example".into()), 443),
+                &ConnectOpts::default(),
+            )
+            .await
+            .unwrap();
+        let data: Vec<u8> = (0..1 << 20).map(|i: u32| (i % 251) as u8).collect();
+        let (mut read, mut write) = tokio::io::split(stream);
+        let sent = data.clone();
+        let writer = tokio::spawn(async move {
+            write.write_all(&sent).await.unwrap();
+        });
+        let mut back = vec![0u8; data.len()];
+        tokio::time::timeout(Duration::from_secs(30), read.read_exact(&mut back))
+            .await
+            .expect("the echo arrives within the bound")
+            .unwrap();
+        assert!(back == data, "the echo differs");
+        writer.await.unwrap();
+        let seen = fake.requests();
+        assert_eq!(
+            (seen[0].atyp, seen[0].host.as_str(), seen[0].port),
+            (3, "xn--bcher-kva.example", 443)
+        );
+        assert_eq!(fake.largest_chunk(), s2022::MAX_PAYLOAD, "full chunks");
+    }
+
+    #[tokio::test]
+    async fn a_silent_client_pads_its_request_and_hears_the_target_first() {
+        // a target that speaks first, then echoes
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let greeter = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    tcp.write_all(b"220 ready").await?;
+                    let (mut r, mut w) = tcp.split();
+                    tokio::io::copy(&mut r, &mut w).await
+                });
+            }
+        });
+        let method = SsMethod::Blake3Aes128Gcm;
+        let key = key_2022(method, 5);
+        let fake = FakeShadowsocks::spawn(ShadowsocksScript::new(method, &key)).await;
+        let out = outbound_2022(&fake, method, &key);
+        let mut stream = out
+            .connect_tcp(&target(greeter), &ConnectOpts::default())
+            .await
+            .unwrap();
+        let mut greeting = [0u8; 9];
+        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut greeting))
+            .await
+            .expect("the greeting arrives")
+            .unwrap();
+        assert_eq!(&greeting, b"220 ready");
+        roundtrip(&mut stream, b"HELO").await;
+        let seen = fake.requests();
+        assert!(seen[0].early.is_empty());
+        assert!((1..=900).contains(&seen[0].padding), "{}", seen[0].padding);
+    }
+
+    #[tokio::test]
+    async fn a_key_the_server_does_not_know_is_a_connection_closed_without_an_answer() {
+        let echo = echo_server().await;
+        let method = SsMethod::Blake3Aes128Gcm;
+        let (server, user) = (key_2022(method, 1), key_2022(method, 2));
+        let stranger = key_2022(method, 9);
+        for (script, password) in [
+            (ShadowsocksScript::new(method, &server), stranger.clone()),
+            (
+                ShadowsocksScript {
+                    users: vec![user.clone()],
+                    ..ShadowsocksScript::new(method, &server)
+                },
+                format!("{server}:{stranger}"),
+            ),
+            (
+                ShadowsocksScript {
+                    users: vec![user.clone()],
+                    ..ShadowsocksScript::new(method, &server)
+                },
+                // a user key without the identity header
+                user.clone(),
+            ),
+        ] {
+            let fake = FakeShadowsocks::spawn(script).await;
+            let out = outbound_2022(&fake, method, &password);
+            let mut stream = out
+                .connect_tcp(&target(echo), &ConnectOpts::default())
+                .await
+                .expect("connecting succeeds");
+            stream.write_all(b"hello").await.unwrap();
+            let mut answer = Vec::new();
+            let err = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut answer))
+                .await
+                .expect("the server closes")
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "ss: the server closed the connection without answering",
+                "{password}"
+            );
+            assert_eq!((fake.rejected(), fake.requests().len()), (1, 0));
+        }
+    }
+
+    fn an_hour_behind() -> u64 {
+        s2022::unix_now() - 3600
+    }
+
+    #[tokio::test]
+    async fn a_client_clock_an_hour_off_is_refused_without_an_answer() {
+        let echo = echo_server().await;
+        let method = SsMethod::Blake3Aes256Gcm;
+        let key = key_2022(method, 4);
+        let fake = FakeShadowsocks::spawn(ShadowsocksScript::new(method, &key)).await;
+        let out = outbound_2022(&fake, method, &key).with_clock(an_hour_behind);
+        let mut stream = out
+            .connect_tcp(&target(echo), &ConnectOpts::default())
+            .await
+            .unwrap();
+        stream.write_all(b"hello").await.unwrap();
+        let mut answer = Vec::new();
+        let err = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut answer))
+            .await
+            .expect("the server closes")
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ss: the server closed the connection without answering"
+        );
+        assert_eq!(fake.rejected(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_replayed_request_salt_is_refused_without_an_answer() {
+        let echo = echo_server().await;
+        let method = SsMethod::Blake3Aes128Gcm;
+        let key = vec![6u8; 16];
+        let fake =
+            FakeShadowsocks::spawn(ShadowsocksScript::new(method, &STANDARD.encode(&key))).await;
+        let head = socks_addr(&target(echo)).unwrap();
+        let salt = vec![0x42u8; 16];
+        let mut outcomes = Vec::new();
+        for _ in 0..2 {
+            let tcp = tokio::net::TcpStream::connect(fake.addr()).await.unwrap();
+            let request = Request2022 {
+                identity: Vec::new(),
+                addr_len: head.len(),
+                now: s2022::unix_now,
+            };
+            let mut stream = AeadStream::new_2022(
+                Box::new(tcp),
+                Arc::new(MasterKey::from_psk(AeadKind::Aes128Gcm, &key)),
+                salt.clone(),
+                request,
+            );
+            stream
+                .write_all(&[&head[..], b"once"].concat())
+                .await
+                .unwrap();
+            let mut answer = [0u8; 4];
+            let outcome =
+                tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut answer))
+                    .await
+                    .expect("an answer or the close")
+                    .map(|_| answer.to_vec())
+                    .map_err(|e| e.to_string());
+            outcomes.push(outcome);
+        }
+        assert_eq!(outcomes[0], Ok(b"once".to_vec()));
+        assert_eq!(
+            outcomes[1],
+            Err("ss: the server closed the connection without answering".to_string())
+        );
+        assert_eq!((fake.requests().len(), fake.rejected()), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn an_answer_off_the_clock_or_for_another_request_is_an_error() {
+        let echo = echo_server().await;
+        let method = SsMethod::Blake3Aes128Gcm;
+        let key = key_2022(method, 8);
+        for script in [
+            ShadowsocksScript {
+                answer_skew: 3600,
+                ..ShadowsocksScript::new(method, &key)
+            },
+            ShadowsocksScript {
+                wrong_request_salt: true,
+                ..ShadowsocksScript::new(method, &key)
+            },
+        ] {
+            let skewed = script.answer_skew != 0;
+            let fake = FakeShadowsocks::spawn(script).await;
+            let out = outbound_2022(&fake, method, &key);
+            let mut stream = out
+                .connect_tcp(&target(echo), &ConnectOpts::default())
+                .await
+                .unwrap();
+            stream.write_all(b"hello").await.unwrap();
+            let mut answer = [0u8; 5];
+            let err = tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut answer))
+                .await
+                .expect("the answer arrives")
+                .unwrap_err();
+            let text = err.to_string();
+            if skewed {
+                // a second may tick between the two clocks
+                let seconds = text
+                    .strip_prefix("ss: the server's clock differs from ours by ")
+                    .and_then(|rest| rest.strip_suffix(" seconds (at most 30 are allowed)"))
+                    .and_then(|n| n.parse::<u64>().ok());
+                assert!(
+                    seconds.is_some_and(|n| (3599..=3601).contains(&n)),
+                    "{text}"
+                );
+            } else {
+                assert_eq!(text, "ss: the server's answer is not for this request");
+            }
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
     #[test]
     fn what_cannot_be_built_is_a_build_error_that_quotes_nothing() {
-        let build = |method: SsMethod, password: &str| {
+        let build_keyed = |method: SsMethod, password: &str, keys: Vec<Vec<u8>>| {
             ShadowsocksOutbound::new(
                 "S",
                 Target::new(HostName::parse("127.0.0.1"), 8388),
                 &SsSpec {
                     method,
                     password: Secret::from(password),
-                    keys: Secret::default(),
+                    keys: Secret::new(keys),
                     udp_relay: false,
                     udp_port: None,
                     obfs: None,
@@ -454,10 +805,20 @@ mod tests {
             .unwrap_err()
             .message
         };
+        let build = |method: SsMethod, password: &str| build_keyed(method, password, Vec::new());
         assert_eq!(build(SsMethod::Aes128Gcm, ""), "`password` is empty");
+        // SS 2022 takes its keys, not the password (the spec has none here)
         assert_eq!(
             build(SsMethod::Blake3Aes128Gcm, "secret"),
-            "ss: `2022-blake3-aes-128-gcm` is not supported yet"
+            "`password` is empty"
+        );
+        assert_eq!(
+            build_keyed(
+                SsMethod::Blake3Aes256Gcm,
+                "x",
+                vec![vec![0; 32], vec![0; 16]]
+            ),
+            "`password` is not Base64 keys of the length `2022-blake3-aes-256-gcm` requires"
         );
         // `none` needs no password
         assert!(

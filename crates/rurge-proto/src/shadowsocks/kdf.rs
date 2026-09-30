@@ -1,5 +1,6 @@
 //! Key derivation of the AEAD methods (the Shadowsocks AEAD specification):
-//! the master key from the password, and one session key per salt.
+//! the master key from the password, and one session key per salt; and of
+//! SS 2022 (SIP022, SIP023): BLAKE3 `derive_key` of a key and a salt.
 
 use hkdf::Hkdf;
 use md5::{Digest, Md5};
@@ -38,6 +39,40 @@ fn hkdf_sha1(ikm: &[u8], salt: &[u8], info: &[u8], okm: &mut [u8]) {
 pub(crate) fn session_subkey(master: &[u8], salt: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; master.len()];
     hkdf_sha1(master, salt, b"ss-subkey", &mut out);
+    out
+}
+
+const SESSION_CONTEXT: &str = "shadowsocks 2022 session subkey";
+const IDENTITY_CONTEXT: &str = "shadowsocks 2022 identity subkey";
+
+/// `blake3::derive_key(context, key ‖ salt)`, as long as `key` (the first
+/// 16 bytes of the output for a 16-byte key: its extendable output).
+fn derive_2022(context: &str, key: &[u8], salt: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; key.len()];
+    blake3::Hasher::new_derive_key(context)
+        .update(key)
+        .update(salt)
+        .finalize_xof()
+        .fill(&mut out);
+    out
+}
+
+/// SS 2022: the session key of a stream that starts with `salt` (SIP022 2.2).
+pub(crate) fn session_subkey_2022(psk: &[u8], salt: &[u8]) -> Vec<u8> {
+    derive_2022(SESSION_CONTEXT, psk, salt)
+}
+
+/// SIP023: the key an identity header is encrypted with, from an identity
+/// key and the stream's salt.
+pub(crate) fn identity_subkey(ipsk: &[u8], salt: &[u8]) -> Vec<u8> {
+    derive_2022(IDENTITY_CONTEXT, ipsk, salt)
+}
+
+/// SIP023: what an identity header says, the first 16 bytes of the next
+/// layer's key's BLAKE3 hash.
+pub(crate) fn identity_hash(key: &[u8]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&blake3::hash(key).as_bytes()[..16]);
     out
 }
 
@@ -91,5 +126,34 @@ mod tests {
             session_subkey(&master, &salt),
             hex("ed2a618d9490d1701de885d82aa80616")
         );
+    }
+
+    /// Computed with a BLAKE3 written in Python from its specification
+    /// (checked against the specification's hashes of "" and "abc"): key
+    /// `00 01 …`, salt `80 81 …`, both as long as the method's key. 32 + 32
+    /// bytes of material are exactly one block.
+    #[test]
+    fn ss_2022_subkeys_and_the_identity_hash_are_blake3s() {
+        let cases = [
+            (
+                16,
+                "722b3033c5d021365a8521bfb41157a3",
+                "9b488f206a32316bf47ef417027b4242",
+                "a6a492965517a830cb75fdb713465aa4",
+            ),
+            (
+                32,
+                "11289b9d205255930f83932405c2b0a38ec32be703fe33f290ff25ffeff402f9",
+                "e3ba9438b4e97ed02d0c818020755598829161aaca5dc2b65fd46238ca2148ad",
+                "e528e95798037df410543d9f31e396ec",
+            ),
+        ];
+        for (len, session, identity, hash) in cases {
+            let key: Vec<u8> = (0..len).collect();
+            let salt: Vec<u8> = (0x80..0x80 + len).collect();
+            assert_eq!(session_subkey_2022(&key, &salt), hex(session), "{len}");
+            assert_eq!(identity_subkey(&key, &salt), hex(identity), "{len}");
+            assert_eq!(identity_hash(&key).to_vec(), hex(hash), "{len}");
+        }
     }
 }
