@@ -1412,8 +1412,8 @@ mod tests {
     /// A policy over a chain never shares a direct policy's tunnel, even
     /// naming the same section: sharing also requires an equal carrier
     /// (P10), so it dials its own carriers, which it cannot, and fails
-    /// with the chain's usual refusal — the other policy's tunnel keeps
-    /// running untouched.
+    /// with what the chain said — the other policy's tunnel keeps running
+    /// untouched.
     #[tokio::test]
     async fn a_policy_over_a_chain_never_shares_a_direct_tunnel() {
         let (peer, a) = tunnel(PeerOpts::default(), |_| {}).await;
@@ -1432,11 +1432,8 @@ mod tests {
             .await
             .map(|_| ())
             .unwrap_err();
-        assert!(matches!(e, OutboundError::Unsupported(_)), "{e}");
-        assert_eq!(
-            e.to_string(),
-            "policy protocol not implemented: wireguard over underlying-proxy"
-        );
+        assert!(matches!(e, OutboundError::Io(_)), "{e}");
+        assert_eq!(e.to_string(), "this connection cannot carry UDP");
         assert_eq!(echo(&mut stream, b"still").await, b"still");
         assert_eq!(peer.core().handshakes, 1);
     }

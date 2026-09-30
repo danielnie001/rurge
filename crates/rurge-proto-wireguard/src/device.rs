@@ -9,6 +9,7 @@ use rurge_config::wireguard::WireGuardSection;
 use rurge_net::connector::{BoxedDatagram, ConnectOpts, Connector, Target};
 use rurge_proto::OutboundError;
 use smoltcp::iface::SocketHandle;
+use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::net::SocketAddr;
@@ -35,6 +36,27 @@ const REPLACE: Duration = Duration::from_secs(10);
 /// How many times at most a question through the tunnel goes out within
 /// its wait (`Device::query`).
 const SENDS: u32 = 3;
+/// How often at most a policy says that a peer cannot be reached; more
+/// often it only tells the debug log (M4b deferred item #15).
+const UNREACHABLE_EVERY: Duration = Duration::from_secs(300);
+
+/// When each policy last said that each peer cannot be reached.
+static UNREACHABLE_SAID: Mutex<Option<HashMap<(String, usize), Instant>>> = Mutex::new(None);
+
+/// Whether a policy may say again that `peer` cannot be reached.
+fn may_say_unreachable(policy: &str, peer: usize, now: Instant) -> bool {
+    let mut said = UNREACHABLE_SAID.lock().expect("the unreachable warnings");
+    let said = said.get_or_insert_with(HashMap::new);
+    let key = (policy.to_string(), peer);
+    if said
+        .get(&key)
+        .is_some_and(|at| now.duration_since(*at) < UNREACHABLE_EVERY)
+    {
+        return false;
+    }
+    said.insert(key, now);
+    true
+}
 
 /// The tunnels of this process, their sections and carrier keys. Two
 /// tunnels with one private key at one peer would take each other's
@@ -106,16 +128,6 @@ struct Carrier {
     marks: bool,
 }
 
-/// What a peer's carrier failing to come up means for the dial.
-fn unreachable(e: io::Error) -> OutboundError {
-    if e.kind() == io::ErrorKind::Unsupported {
-        // a chain carries no UDP before M5 (M4-D7)
-        OutboundError::Unsupported("wireguard over underlying-proxy".to_string())
-    } else {
-        OutboundError::from(e)
-    }
-}
-
 impl Device {
     /// The tunnel of `section` and `carrier`: the one running, when a
     /// policy naming them both started it; else a carrier to every peer,
@@ -160,13 +172,18 @@ impl Device {
                     })
                 }
                 Err(e) => {
-                    tracing::warn!(policy, peer = i + 1, error = %e, "wireguard: the peer cannot be reached");
+                    if may_say_unreachable(policy, i, Instant::now()) {
+                        tracing::warn!(policy, peer = i + 1, error = %e, "wireguard: the peer cannot be reached");
+                    } else {
+                        tracing::debug!(policy, peer = i + 1, error = %e, "wireguard: the peer cannot be reached");
+                    }
                     failure = Some(e);
                 }
             }
         }
         if carriers.iter().all(Option::is_none) {
-            return Err(unreachable(failure.unwrap_or_else(|| {
+            // an `underlying-proxy` that carries no UDP says so itself
+            return Err(OutboundError::from(failure.unwrap_or_else(|| {
                 io::Error::other("wireguard: the tunnel has no peer")
             })));
         }
@@ -679,5 +696,30 @@ impl Driver {
                 _ = tokio::time::sleep_until(deadline.into()) => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A policy says a peer cannot be reached once every five minutes at
+    /// most; each policy and peer on its own (M4b deferred item #15).
+    #[test]
+    fn a_peer_that_cannot_be_reached_is_said_so_once_in_a_while() {
+        let now = Instant::now();
+        assert!(may_say_unreachable("throttle-test", 0, now));
+        assert!(!may_say_unreachable(
+            "throttle-test",
+            0,
+            now + Duration::from_secs(299)
+        ));
+        assert!(may_say_unreachable("throttle-test", 1, now));
+        assert!(may_say_unreachable("throttle-test-2", 0, now));
+        assert!(may_say_unreachable(
+            "throttle-test",
+            0,
+            now + UNREACHABLE_EVERY
+        ));
     }
 }

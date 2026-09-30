@@ -4,7 +4,10 @@
 use crate::registry::{PolicyRegistry, TerminalKind};
 use arc_swap::ArcSwapOption;
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target};
+use rurge_net::connector::{
+    BoxedDatagram, BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target,
+};
+use rurge_net::packet_datagram::packet_datagram;
 use rurge_proto::{OutboundError, UdpSupport};
 use std::io;
 use std::sync::Arc;
@@ -132,6 +135,21 @@ impl Connector for ChainConnector {
                 .open_udp(opts)
                 .await
                 .map_err(|e| self.via(e))
+        })
+    }
+
+    /// The underlying policy's UDP carrier as a datagram to `target` (phase
+    /// 2 M5 design 4.3, 8.1): a `wireguard` peer through this hop. `target`
+    /// is resolved the carrier's way, once.
+    fn connect_udp<'a>(
+        &'a self,
+        target: &'a Target,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+        Box::pin(async move {
+            let socket = self.open_udp(opts).await?;
+            let to = socket.resolve(target).await?;
+            Ok(packet_datagram(socket, to))
         })
     }
 }

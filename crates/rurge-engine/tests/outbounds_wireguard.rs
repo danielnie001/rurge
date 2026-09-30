@@ -63,13 +63,42 @@ async fn a_name_is_resolved_on_this_machine_with_host_items() {
     assert!(h.dns.queries().is_empty(), "[Host] answered");
 }
 
-/// No UDP through a chain before M5: the policy rejects and says why, and
+/// The peers are reached through the `underlying-proxy`: here a SOCKS5
+/// proxy's UDP ASSOCIATE (phase 2 M5 design 8.1).
+#[tokio::test]
+async fn a_tunnel_goes_over_an_underlying_socks5_proxy() {
+    let (peer, section) = peer().await;
+    let up = FakeSocks5::spawn(Socks5Script::default()).await;
+    let proxies = format!(
+        "WG = wireguard, section-name=w, underlying-proxy=Up\nUp = socks5, 127.0.0.1, {}, udp-relay=true",
+        up.addr().port()
+    );
+    let h = harness(Profile {
+        proxies: &proxies,
+        rules: TO_WG,
+        sections: &section,
+        ..Profile::default()
+    })
+    .await;
+    let mut tunnel = connect_via_http(h.http(), "10.0.0.1:7").await;
+    echo_through(&mut tunnel, b"over the chain").await;
+    assert_eq!(peer.core().connected_to, [echo_addr()]);
+    let peer_at =
+        rurge_net::connector::Target::new(HostName::parse("127.0.0.1"), peer.addr().port());
+    assert!(
+        up.datagrams().iter().all(|to| *to == peer_at),
+        "every datagram went to the peer through the proxy"
+    );
+    assert!(!up.datagrams().is_empty());
+}
+
+/// An `underlying-proxy` that carries no UDP fails the dial, saying so, and
 /// never goes around the chain (M4-D7).
 #[tokio::test]
-async fn a_tunnel_over_underlying_proxy_rejects_with_a_note() {
+async fn a_tunnel_over_an_underlying_proxy_without_udp_fails_saying_so() {
     let (peer, section) = peer().await;
     let h = harness(Profile {
-        proxies: "WG = wireguard, section-name=w, underlying-proxy=Up\nUp = socks5, 127.0.0.1, 9",
+        proxies: "WG = wireguard, section-name=w, underlying-proxy=Up\nUp = http, 127.0.0.1, 9",
         rules: TO_WG,
         sections: &section,
         ..Profile::default()
@@ -77,22 +106,18 @@ async fn a_tunnel_over_underlying_proxy_rejects_with_a_note() {
     .await;
     let session = SessionInfo::tcp(HostName::parse("10.0.0.1"), ECHO_PORT);
     match h.engine.dial(session).await {
-        Err(DialError::Reject { kind, handle, .. }) => {
-            assert_eq!(kind, rurge_proto::RejectKind::Reject);
-            assert_eq!(
-                handle.error().as_deref(),
-                Some("policy protocol not implemented: wireguard over underlying-proxy")
-            );
+        Err(DialError::Failed { message, .. }) => {
+            assert_eq!(message, "via Up: the underlying policy cannot carry UDP");
         }
-        Err(DialError::Failed { message, .. }) => panic!("expected a reject, failed: {message}"),
-        Ok(_) => panic!("expected a reject, got a stream"),
+        Err(DialError::Reject { .. }) => panic!("expected a failure, got a reject"),
+        Ok(_) => panic!("expected a failure, got a stream"),
     }
     assert!(peer.clients().is_empty(), "nothing went to the peer");
 }
 
 /// Two policies naming one section share its tunnel only when their
-/// carriers are alike: the one over `underlying-proxy` still rejects, and
-/// the tunnel the other one started goes on (M4-D7).
+/// carriers are alike: the one over an `underlying-proxy` without UDP
+/// fails, and the tunnel the other one started goes on (M4-D7).
 #[tokio::test]
 async fn a_policy_over_underlying_proxy_never_shares_the_tunnel() {
     let (peer, section) = peer().await;
@@ -109,12 +134,11 @@ async fn a_policy_over_underlying_proxy_never_shares_the_tunnel() {
     echo_through(&mut tunnel, b"direct").await;
     let session = SessionInfo::tcp(HostName::parse("10.0.0.2"), ECHO_PORT);
     match h.engine.dial(session).await {
-        Err(DialError::Reject { handle, .. }) => assert_eq!(
-            handle.error().as_deref(),
-            Some("policy protocol not implemented: wireguard over underlying-proxy")
-        ),
-        Err(DialError::Failed { message, .. }) => panic!("expected a reject, failed: {message}"),
-        Ok(_) => panic!("expected a reject, got a stream"),
+        Err(DialError::Failed { message, .. }) => {
+            assert_eq!(message, "via Up: the underlying policy cannot carry UDP")
+        }
+        Err(DialError::Reject { .. }) => panic!("expected a failure, got a reject"),
+        Ok(_) => panic!("expected a failure, got a stream"),
     }
     echo_through(&mut tunnel, b"still").await;
     assert_eq!(peer.core().handshakes, 1);

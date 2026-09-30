@@ -287,13 +287,6 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     if !matches!(proto, ProtoSpec::Direct | ProtoSpec::Reject(_)) {
         shadow_tls = shadow_tls::read_shadow_tls(&mut r);
         check_underlying(&mut r, &mut common, env);
-        // a chain carries no UDP before M5: the tunnel cannot start (M4-D7)
-        if matches!(proto, ProtoSpec::WireGuard(_)) && common.underlying_proxy.is_some() {
-            r.warn(
-                codes::W_PARAM_NOT_EFFECTIVE,
-                "`underlying-proxy` does not work with `wireguard` policies in this version; the policy rejects every connection".to_string(),
-            );
-        }
         // socket options belong to the hop that opens the socket (matrix 4.3)
         if common.underlying_proxy.is_some() {
             for key in ["interface", "allow-other-interface", "tos", "ip-version"] {
@@ -527,26 +520,19 @@ mod tests {
         );
     }
 
-    /// No UDP through a chain before M5: the policy loads with a warning and
-    /// rejects (M4-D7). `DIRECT` is no chain.
+    /// A chain carries UDP since M5: a `wireguard` policy over one loads
+    /// without a word, its peers reached through the chain (phase 2 M5
+    /// design 8.1). `DIRECT` is no chain.
     #[test]
-    fn underlying_proxy_on_a_wireguard_policy_is_warned_about() {
-        let o = outcome("W", "wireguard, section-name=home, underlying-proxy=Entry");
-        assert!(o.spec.is_some());
-        let found: Vec<(&str, &str)> = o
-            .diagnostics
-            .iter()
-            .map(|d| (d.code, d.message.as_str()))
-            .collect();
-        assert_eq!(
-            found,
-            [(
-                codes::W_PARAM_NOT_EFFECTIVE,
-                "policy `W`: `underlying-proxy` does not work with `wireguard` policies in this version; the policy rejects every connection"
-            )]
-        );
-        let o = outcome("W", "wireguard, section-name=home, underlying-proxy=DIRECT");
-        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+    fn underlying_proxy_on_a_wireguard_policy_is_accepted() {
+        for line in [
+            "wireguard, section-name=home, underlying-proxy=Entry",
+            "wireguard, section-name=home, underlying-proxy=DIRECT",
+        ] {
+            let o = outcome("W", line);
+            assert!(o.spec.is_some());
+            assert!(o.diagnostics.is_empty(), "{line}: {:?}", o.diagnostics);
+        }
     }
 
     /// What a reload compares besides the line (M2 design 7.1): the keystore
