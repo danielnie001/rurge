@@ -4366,12 +4366,24 @@ git commit -m "docs: M5c WireGuard 的 UDP 与其余——兼容性清单、API�
 | — | 设计 8.2（M4b #15 / #24） | Task 2：`a_peer_that_cannot_be_reached_is_said_so_once_in_a_while`；#24 已无对象（P6） |
 | — | 设计 8.3（`smart` 计入 UDP） | Task 4：`a_udp_answer_is_reported`、`a_member_whose_udp_carrier_does_not_open_counts_against_it`、`udp_silence_counts_only_where_answers_always_come`、`silence_that_tells_nothing_is_no_failure` |
 | — | 设计 8.4（UDP 测试） | Task 3：`a_udp_test_asks_through_the_tunnel`、`the_question_asks_for_a_records`、`an_answer_is_timed`、`silence_and_no_udp_fail` |
-| — | 设计 8.5（`dns-follow-interface`） | Task 5：`lookups_via_an_interface_go_through_it_with_answers_of_their_own`、`with_encrypted_dns_lookups_via_an_interface_go_as_usual`、`a_policy_that_follows_its_interface_looks_up_through_it` |
+| — | 设计 8.5（`dns-follow-interface`） | Task 5：`lookups_via_an_interface_go_through_it_with_answers_of_their_own`、`with_encrypted_dns_lookups_via_an_interface_go_as_usual`、`a_policy_that_follows_its_interface_looks_up_through_it`；终审：`with_no_plain_server_lookups_via_an_interface_go_as_usual` |
 
 ## 执行期修正记录
 
 | # | 任务 | 与计划的出入 | 原因 |
 | - | ---- | ------------ | ---- |
+| 1 | Task 1 | 隧道停止时 `abort_all` 一并关掉隧道里的 UDP socket；之后该载体的 `send_to` / `recv_from` 以 `wireguard: the tunnel has closed` 失败（d7161ca；新用例 `a_carrier_of_a_replaced_tunnel_fails`） | 评审：按计划被替换的隧道上的 UDP 载体成了黑洞——发送照样成功、接收永远等下去，流不会结束 |
+| 2 | Task 2 | 链式载体的收包任务结束后（收包报 `BrokenPipe` / `NotConnected`，`ended_for_good`），设备的收包循环把这个 peer 的载体立即置空、经 `replace_failed` 重拨（每个 peer 至多每 10 秒一次）；其它收包错误仍只记 `trace!`（76ff88c；新用例 `a_carrier_that_has_ended_is_replaced_and_not_spun_on`）。`packet_datagram` 照计划返回 `BrokenPipe` | 评审：按计划死载体每次轮询都立即报错，设备循环空转，空闲时也不会自愈；在设备侧修（裁定：代价只是重连路径与在 `packet_datagram` 侧修略有不同） |
+| 3 | Task 2 | 被 10 秒间隔挡下或重拨失败的已结束载体，在上次换载体后 10 秒再试（`retry_at`），不等 5 分钟的周期重拨（6f0dd78；新用例 `a_replacement_that_ends_at_once_is_retried_after_the_limit`） | 评审：#2 之后，这样的 peer 最长要等 300 秒才恢复 |
+| 4 | Task 2 | `rurge-config` 的 `spec` 用例没有观察到 RED：执行者把 `spec/mod.rs` 的实现改动与用例改动一起落盘后才运行 | 执行顺序；用例与实现与核对过的副本一致，GREEN 正常 |
+| 5 | Task 2 | `crates/rurge-proto-wireguard/src/outbound.rs` 与核对过的副本不逐字节一致：多了 Task 1 修正（#1）带来的用例 | #1 的修正先于 Task 2 落地 |
+| 6 | Task 4 | 源码改动先于 RED 运行落盘；RED 改为临时恢复 HEAD 的 `udp.rs` 后补跑（3 个新引擎用例失败，符合计划），库的编译 RED（E0061）未单独跑 | 执行顺序 |
+| 7 | Task 6 | 兼容性清单的 `wireguard` 行多写了两句：隧道停止后经它的 UDP 流失败（#1）；经底层策略的载体断了立即丢弃并重拨、每个 peer 至多每 10 秒一次、重拨失败 10 秒后再试（#2、#3） | 裁定：清单必须记录实际行为，计划文字里没有这两处评审修正 |
+| 8 | 终审 | （#8–#11 均在 9741d76）`dns-follow-interface`：经网卡可问的普通服务器一个也没有（没写 `dns-server`、也读不到系统服务器）时不跟随，照常解析（全局缓存、上游，都没有时经系统接口），记一条 info（不含查询名）；`lookup_on` 改为接收已取出的 `ViaSet`（新用例 `with_no_plain_server_lookups_via_an_interface_go_as_usual`） | 终审：按计划这时一个服务器也不问就失败（`NoUpstream`），而全局路径在 `primary` 为空时会退到系统接口 |
+| 9 | 终审 | `ChainConnector::connect_udp` 里载体解析目标的错误也带上 `via <策略>:` 前缀 | 终审：与 `open_udp` 的错误一致；回环假工厂不载 UDP，没有单独的用例 |
+| 10 | 终审 | `wireguard: the peer's carrier has ended` 按与"peer 连不上"相同的机制限频（每个策略的每个 peer 5 分钟至多一次 `warn!`，其余 `debug!`；另一张表 `ENDED_SAID`；新用例 `a_carrier_that_keeps_ending_is_said_so_once_in_a_while`） | 终审：底层中继反复关闭关联时每约 10 秒一条告警 |
+| 11 | 终审 | `ResolverCell::resolve_via` 加单元用例 `the_cell_hands_lookups_through_a_via_on`（转给当前解析器自己的 `resolve_via`，带着给它的 `Via`） | 终审：此前没有经 `ResolverCell` 的 `resolve_via` 的用例 |
+| 12 | 门禁 | 最终门禁（终审修正 9741d76 之后）：fmt、clippy 通过；`cargo test --workspace --no-fail-fast` 53 个测试二进制 1267 通过 / 0 失败 / 2 忽略，一次通过，没有重跑 | Task 6 末为 1264，终审修正加了 #8、#10、#11 的三个用例 |
 
 ## 延后事项
 
@@ -4380,7 +4392,15 @@ git commit -m "docs: M5c WireGuard 的 UDP 与其余——兼容性清单、API�
 | 1 | `dns-follow-interface` 不跟随加密 DNS：配了 `encrypted-dns-server` 时策略自己的解析照常问加密 DNS（P11） | 有用户要求时另建一套经网卡的加密上游 |
 | 2 | 规则匹配时的解析不跟随任何策略的网卡（选定策略之前发生；与手册一致） | 接受 |
 | 3 | UDP 测试的结果不保存、不在 `GET /v1/policy_groups/test_results` 里出现、不进请求记录（P7） | 有展示需求时另议 |
-| 4 | 隧道里 UDP socket 的缓冲固定为 64 个包 / 256 KiB（设计第 7 节）；发送缓冲满时静默丢包，没有计数 | 有吞吐问题时 |
+| 4 | 隧道里 UDP socket 的缓冲固定为 64 个包 / 256 KiB（设计第 7 节）；发送缓冲满时静默丢包，没有计数；每个载体每个地址族的 socket 各占 256 KiB 接收 + 256 KiB 发送缓冲，内存随关联数线性增长（终审 M1；以后可考虑缩小接收缓冲） | 有吞吐或内存问题时 |
 | 5 | `ecn` 仍只解析（M5-D6） | 随 QUIC 族 |
 | 6 | `udp::a_closed_port_does_not_break_the_carrier`（M5a）在并行负载下偶发失败：它释放的"关着的端口"可能被并行的用例绑上（P13） | 以后顺手改（例如用一个绑着却从不读的 socket 代替释放的端口——Windows 上它不会触发 ICMP 不可达，要另想办法） |
 | 7 | `packet_datagram` 发送失败只记 `trace!`，名字目标的回包不按来源过滤（P3） | 接受 |
+| 8 | 隧道里的 UDP 载体：`recv_from` 总是先看 IPv4 的 socket（负载大时 IPv6 可能饿着）；`TunnelUdp::address` 重复了 `Names::address` 里"本来就是地址"的捷径，并把 `OutboundError` 的种类压成 `Other`；`send_to` 恰与隧道关闭赛跑时可能报 `AddrNotAvailable` 而不是 `the tunnel has closed`（极小的窗口） | 以后顺手改 |
+| 9 | 按来源过滤回包时精确比较 `Target`（`packet_datagram` 与 UDP 测试的 `udp_probe`）：中继或服务器从 IPv4 映射的 IPv6 地址回包会被丢掉 | 有用户报告再说 |
+| 10 | 链式载体：`packet_datagram` 的收包任务遇到任何收包错误都结束（中继 socket 上一次短暂的 ICMP 错误也会拆掉载体——现在会被重拨，见执行期修正记录 #2）；`poll_send` 的 `BrokenPipe` 不算 `gone()` 的种类 | 以后顺手改 |
+| 11 | 换载体：`connect_udp` 超过 10 秒时同一个 peer 可能同时有两次拨号；换过一次载体、之后一直连不上的 peer 每 10 秒重拨一次、没有退避（从没换过的是 5 分钟一次） | 有用户报告再说 |
+| 12 | 告警限频表 `UNREACHABLE_SAID` / `ENDED_SAID` 从不清理（大小以"策略 × peer"为上限） | 以后顺手改 |
+| 13 | UDP 测试：要有 `registry.test_case`，没有 URL / 原生测速方式的策略就没有 UDP 结果；`test_policies` 因未知名字报错时 `test_udp` 照样跑（无害）；没有 API 层面对 `udp` 键 JSON 形状的用例（均按计划） | 需要时另议 |
+| 14 | `smart` 的 UDP：载体打不开的任何错误都算成员失败（TCP 只算可重试的那些，按计划）；载体打开之后目标解析失败不回报 | 有用户报告再说 |
+| 15 | `dns-follow-interface`：经网卡的上游与缓存只按网卡名区分（`allow-other-interface` 不参与）；经网卡问 DNS 的 socket 也用 7 MiB 收发缓冲 | 以后顺手改 |

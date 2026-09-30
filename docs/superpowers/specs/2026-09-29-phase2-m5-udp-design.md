@@ -358,3 +358,12 @@ peer 的载体改用 `ChainConnector::connect_udp`；中继不支持 UDP 时照�
 7. **`dns-follow-interface` 的范围（P10、P11，覆盖 8.5）**：跟随的是策略自己的直连连接器做的全部解析——`direct` 的目标与代理的服务器名（手册："DNS requests that match the policy will use this interface for queries"）；`[Host]`、hosts 文件、`.local` 与经系统接口的解析照常；只替换问上游那一步，问的是 `dns-server` 里的普通服务器与 `system` 展开的系统服务器，按网卡名各存一组上游与缓存，网络变化时清掉；配了 `encrypted-dns-server` 时不跟随（照常问加密 DNS，记一条 info）。
 8. **`dns-follow-interface` 没写 `interface`（P12）**：`W0028` 并当作 `false`。
 
+## 22. M5c 实施期的订正
+
+执行 M5c 计划时，任务评审与全分支评审改动了若干做法；与上文及第 21 节不一致处以本节为准（明细见计划的「执行期修正记录」）。
+
+1. **停止的隧道上的 UDP 载体报错**：隧道停止（重载替换了它）时一并关掉隧道里的 UDP socket；之后该载体的 `send_to` / `recv_from` 以 `wireguard: the tunnel has closed` 失败，经它的流随之结束，而不是发送照样成功、接收永远等下去。
+2. **经底层策略的载体断了就换（细化第 21 节第 2 条）**：链式载体的收包任务结束后（底层关联关闭，收包报 `BrokenPipe` / `NotConnected`），隧道的收包循环把这个 peer 的载体立即丢弃，经"发送失败换载体"的同一条路径（`replace_failed`）重拨，每个 peer 至多每 10 秒一次；因这个间隔或重拨失败没能换上的，在上次换载体后 10 秒再试（`retry_at`），不等 5 分钟一次的周期重拨，也不在死载体上空转。
+3. **没有可问的普通服务器时照常解析（细化第 21 节第 7 条）**：`dns-follow-interface` 要经网卡问的普通服务器一个也没有（没写 `dns-server`、也读不到系统服务器）时，与配了加密 DNS 一样不跟随，照常解析（全局缓存、上游，都没有时经系统接口），记一条 info（不含查询名），而不是一个服务器也不问就失败。
+4. **载体断了的告警限频**：`wireguard: the peer's carrier has ended` 与 `wireguard: the peer cannot be reached` 一样，每个策略的每个 peer 5 分钟至多一次 `warn!`，其余只记 `debug!`——底层中继反复关闭关联时，否则每 10 秒一条。
+
