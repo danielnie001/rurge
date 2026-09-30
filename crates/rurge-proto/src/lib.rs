@@ -11,6 +11,7 @@ pub mod http;
 pub mod keystore;
 pub mod outbound;
 pub mod reject;
+pub mod shadowsocks;
 pub mod socks5;
 mod stream_udp;
 mod task;

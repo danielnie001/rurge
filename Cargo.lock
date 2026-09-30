@@ -3343,11 +3343,14 @@ name = "rurge-proto"
 version = "0.1.0"
 dependencies = [
  "aes 0.8.4",
+ "aes-gcm",
  "base64",
  "bytes",
+ "chacha20poly1305",
  "crc32fast",
  "futures-util",
  "getrandom 0.3.4",
+ "hkdf",
  "http",
  "idna",
  "md-5",
@@ -3357,6 +3360,7 @@ dependencies = [
  "rurge-config",
  "rurge-net",
  "rustls",
+ "sha1 0.11.0",
  "sha2 0.10.9",
  "sha3 0.10.9",
  "tempfile",

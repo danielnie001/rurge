@@ -77,6 +77,13 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 ring = "0.17"
 aes = "0.8"
 md-5 = "0.10"
+# Shadowsocks AEAD: AES-GCM of all three key sizes (aes-192-gcm has no type
+# alias), ChaCha20- and XChaCha20-Poly1305 at the version already in the tree,
+# HKDF-SHA1 for the session subkey
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes"] }
+chacha20poly1305 = { version = "0.10.1", default-features = false }
+hkdf = "0.13"
+sha1 = { version = "0.11", default-features = false }
 sha3 = "0.10"
 crc32fast = "1"
 rurge-proto-ssh = { path = "crates/rurge-proto-ssh" }
