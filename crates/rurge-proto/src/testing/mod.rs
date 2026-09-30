@@ -19,7 +19,7 @@ pub use obfs::{ObfsHello, accept_obfs};
 pub use shadow_tls::{
     Camouflage, FakeShadowTls, RecordedShadowTls, ShadowTlsFault, ShadowTlsScript,
 };
-pub use shadowsocks::{FakeShadowsocks, RecordedShadowsocks, ShadowsocksScript};
+pub use shadowsocks::{FakeShadowsocks, RecordedDatagram, RecordedShadowsocks, ShadowsocksScript};
 pub use socks5::{FakeSocks5, RecordedSocks5, Socks5Script};
 pub use tls::{SeenHandshake, TlsFixture};
 pub use trojan::{FakeTrojan, RecordedTrojan, TrojanScript};

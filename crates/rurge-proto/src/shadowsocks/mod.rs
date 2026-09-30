@@ -10,26 +10,31 @@
 //! shows once the relay reads, as a connection closed without an answer or
 //! as data that does not decrypt. SS 2022's answer names the request it
 //! belongs to and the server's time, which the stream checks.
+//!
+//! With `udp-relay=true` datagrams go to the server by themselves (`udp`),
+//! past Shadow TLS and obfs, which are TCP's.
 
 pub(crate) mod aead;
 pub(crate) mod cipher;
 pub(crate) mod kdf;
 pub(crate) mod s2022;
+pub(crate) mod udp;
 
 use crate::addr::{AddrError, socks_addr};
 use crate::build::shadow_tls_client;
 use crate::transport::Stack;
 use crate::transport::lazy_head::LazyHead;
 use crate::transport::obfs::ObfsClient;
-use crate::{BuildError, Outbound, OutboundError};
+use crate::{BuildError, Outbound, OutboundError, UdpSupport};
 use aead::{AeadStream, Request2022};
 use cipher::{AeadKind, MasterKey};
 use rurge_config::spec::{ShadowTlsOpts, SsSpec};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
+use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target};
 use rustls::RootCertStore;
 use s2022::Identity;
 use std::sync::Arc;
+use udp::{Keys2022, Packets, SsUdp};
 
 /// No `Debug`: the master key is as good as the password.
 pub struct ShadowsocksOutbound {
@@ -41,6 +46,17 @@ pub struct ShadowsocksOutbound {
     identity: Option<Identity>,
     /// Seconds since the Unix epoch, for SS 2022's timestamps.
     now: fn() -> u64,
+    /// `udp-relay=true`: where the datagrams go and how they are sealed.
+    udp: Option<UdpRelay>,
+    /// Where the datagrams leave from: the way the TCP connections go
+    /// (DIRECT, or `underlying-proxy`).
+    connector: Arc<dyn Connector>,
+}
+
+struct UdpRelay {
+    /// `udp-port`, else the server's port.
+    server: Target,
+    packets: Arc<Packets>,
 }
 
 impl ShadowsocksOutbound {
@@ -92,7 +108,17 @@ impl ShadowsocksOutbound {
             .as_ref()
             .map(|obfs| ObfsClient::new(obfs, &server))
             .transpose()?;
-        let mut stack = Stack::new(connector, server, shadow_tls, None, None);
+        let udp = spec.udp_relay.then(|| UdpRelay {
+            server: Target::new(server.host.clone(), spec.udp_port.unwrap_or(server.port)),
+            packets: Arc::new(match (&key, AeadKind::of(spec.method)) {
+                (Some(_), Some(kind)) if spec.method.is_2022() => {
+                    Packets::S2022(Keys2022::new(kind, spec.keys.expose()))
+                }
+                (Some(key), _) => Packets::Aead(key.clone()),
+                (None, _) => Packets::Plain,
+            }),
+        });
+        let mut stack = Stack::new(connector.clone(), server, shadow_tls, None, None);
         if let Some(obfs) = obfs {
             stack = stack.with_obfs(obfs);
         }
@@ -102,6 +128,8 @@ impl ShadowsocksOutbound {
             key,
             identity,
             now: s2022::unix_now,
+            udp,
+            connector,
         })
     }
 
@@ -173,14 +201,43 @@ impl Outbound for ShadowsocksOutbound {
             Ok(Box::new(LazyHead::new(stream, head)) as BoxedStream)
         })
     }
+
+    fn udp(&self) -> UdpSupport {
+        if self.udp.is_some() {
+            UdpSupport::Native
+        } else {
+            UdpSupport::Unsupported
+        }
+    }
+
+    fn open_udp<'a>(
+        &'a self,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, Result<BoxedPacketSocket, OutboundError>> {
+        Box::pin(async move {
+            let Some(relay) = &self.udp else {
+                return Err(OutboundError::Unsupported(
+                    "UDP without `udp-relay=true`".to_string(),
+                ));
+            };
+            let open = async {
+                let socket = self.connector.open_udp(opts).await?;
+                let carrier = SsUdp::open(socket, &relay.server, relay.packets.clone(), self.now);
+                Ok(Box::new(carrier.await?) as BoxedPacketSocket)
+            };
+            match tokio::time::timeout(opts.timeout, open).await {
+                Ok(result) => result,
+                Err(_) => Err(OutboundError::Timeout),
+            }
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::UdpSupport;
     use crate::addr::socks_addr;
-    use crate::testing::{FakeShadowsocks, ShadowsocksScript, echo_server};
+    use crate::testing::{FakeShadowsocks, ShadowsocksScript, echo_server, udp_echo_server};
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
     use rurge_config::policy::parse_policy;
@@ -188,7 +245,7 @@ mod tests {
     use rurge_config::spec::ss::read_ss;
     use rurge_config::spec::{ObfsMode, ParamReader, Secret, SsMethod};
     use rurge_config::{HostName, Span};
-    use rurge_net::connector::{DirectConnector, SystemResolve};
+    use rurge_net::connector::{DirectConnector, PacketSocket, SystemResolve};
     use std::net::SocketAddr;
     use std::path::Path;
     use std::time::Duration;
@@ -781,6 +838,299 @@ mod tests {
             }
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         }
+    }
+
+    async fn udp_answer(carrier: &dyn PacketSocket) -> (Vec<u8>, Target) {
+        let mut buf = vec![0u8; 65536];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(5), carrier.recv_from(&mut buf))
+            .await
+            .expect("an answer within the bound")
+            .unwrap();
+        (buf[..n].to_vec(), from)
+    }
+
+    async fn udp_roundtrip(carrier: &dyn PacketSocket, to: SocketAddr, payload: &[u8]) {
+        carrier.send_to(payload, &target(to)).await.unwrap();
+        assert_eq!(udp_answer(carrier).await, (payload.to_vec(), target(to)));
+    }
+
+    /// Nothing comes back within a short while.
+    async fn no_udp_answer(carrier: &dyn PacketSocket) {
+        let mut buf = vec![0u8; 65536];
+        let got =
+            tokio::time::timeout(Duration::from_millis(300), carrier.recv_from(&mut buf)).await;
+        assert!(got.is_err(), "no answer: {got:?}");
+    }
+
+    /// Every method: the script, the line's `password` and the user the
+    /// fake should find.
+    fn udp_setups() -> Vec<(ShadowsocksScript, String, Option<usize>)> {
+        let mut setups: Vec<_> = AEAD
+            .into_iter()
+            .chain([SsMethod::None])
+            .map(|method| (ShadowsocksScript::new(method, "pw"), "pw".to_string(), None))
+            .collect();
+        for method in SS_2022 {
+            let (server, user) = (key_2022(method, 1), key_2022(method, 2));
+            setups.push((
+                ShadowsocksScript::new(method, &server),
+                server.clone(),
+                None,
+            ));
+            setups.push((
+                ShadowsocksScript {
+                    users: vec![key_2022(method, 3), user.clone()],
+                    ..ShadowsocksScript::new(method, &server)
+                },
+                format!("{server}:{user}"),
+                Some(1),
+            ));
+        }
+        setups
+    }
+
+    fn udp_outbound(
+        fake: &FakeShadowsocks,
+        method: SsMethod,
+        password: &str,
+    ) -> ShadowsocksOutbound {
+        outbound(&format!(
+            "ss, 127.0.0.1, {}, encrypt-method={}, password={password}, udp-relay=true",
+            fake.addr().port(),
+            method.name()
+        ))
+    }
+
+    /// A password for `method`: a key for SS 2022.
+    fn udp_password(method: SsMethod) -> String {
+        if method.is_2022() {
+            key_2022(method, 1)
+        } else {
+            "pw".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_round_trips_with_every_method() {
+        let (one, two) = (udp_echo_server().await, udp_echo_server().await);
+        for (script, password, user) in udp_setups() {
+            let method = script.method;
+            let fake = FakeShadowsocks::spawn(script).await;
+            let out = udp_outbound(&fake, method, &password);
+            assert_eq!(out.udp(), UdpSupport::Native);
+            let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+            udp_roundtrip(carrier.as_ref(), one, b"to one").await;
+            udp_roundtrip(carrier.as_ref(), two, b"to two").await;
+            // another carrier is another client session
+            let other = out.open_udp(&ConnectOpts::default()).await.unwrap();
+            udp_roundtrip(other.as_ref(), one, b"again").await;
+            let seen = fake.datagrams();
+            let targets: Vec<_> = seen.iter().map(|d| d.target.clone()).collect();
+            assert_eq!(
+                targets,
+                [one.to_string(), two.to_string(), one.to_string()],
+                "{method:?}"
+            );
+            assert_eq!(seen[1].payload, b"to two");
+            if method.is_2022() {
+                let ids: Vec<(u64, u64)> = seen.iter().map(|d| d.session.unwrap()).collect();
+                assert_eq!(ids[0].0, ids[1].0, "one session");
+                assert_eq!((ids[0].1, ids[1].1), (0, 1), "counting from 0");
+                assert_ne!(ids[2].0, ids[0].0, "{method:?}");
+                assert_eq!(ids[2].1, 0);
+                assert!(seen.iter().all(|d| d.user == user && d.padding == 0));
+            } else {
+                assert!(seen.iter().all(|d| d.session.is_none()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_goes_to_udp_port_when_it_is_written() {
+        let echo = udp_echo_server().await;
+        for method in [SsMethod::Aes128Gcm, SsMethod::Blake3Aes256Gcm] {
+            let password = udp_password(method);
+            let fake = FakeShadowsocks::spawn(ShadowsocksScript {
+                udp_apart: true,
+                ..ShadowsocksScript::new(method, &password)
+            })
+            .await;
+            assert_ne!(fake.udp_addr().port(), fake.addr().port());
+            let out = outbound(&format!(
+                "ss, 127.0.0.1, {}, encrypt-method={}, password={password}, udp-relay=true, udp-port={}",
+                fake.addr().port(),
+                method.name(),
+                fake.udp_addr().port()
+            ));
+            let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+            udp_roundtrip(carrier.as_ref(), echo, b"to the other port").await;
+            assert_eq!(fake.connections(), 0, "no TCP");
+        }
+    }
+
+    /// Whoever sends to the server's socket for this client reaches it, with
+    /// their own address.
+    #[tokio::test]
+    async fn udp_is_full_cone() {
+        let echo = udp_echo_server().await;
+        for method in [SsMethod::ChaCha20IetfPoly1305, SsMethod::Blake3Aes128Gcm] {
+            let password = udp_password(method);
+            let fake = FakeShadowsocks::spawn(ShadowsocksScript::new(method, &password)).await;
+            let out = udp_outbound(&fake, method, &password);
+            let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+            udp_roundtrip(carrier.as_ref(), echo, b"hello").await;
+            let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            stranger
+                .send_to(b"from a stranger", fake.udp_outside()[0])
+                .await
+                .unwrap();
+            assert_eq!(
+                udp_answer(carrier.as_ref()).await,
+                (
+                    b"from a stranger".to_vec(),
+                    target(stranger.local_addr().unwrap())
+                ),
+                "{method:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_sends_names_to_the_server() {
+        let echo = udp_echo_server().await;
+        let method = SsMethod::Blake3Aes256Gcm;
+        let key = key_2022(method, 1);
+        let fake = FakeShadowsocks::spawn(ShadowsocksScript {
+            connect_to: Some(echo),
+            ..ShadowsocksScript::new(method, &key)
+        })
+        .await;
+        let out = udp_outbound(&fake, method, &key);
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        let name = Target::new(HostName::Domain("bücher.example".into()), 53);
+        carrier.send_to(b"a query", &name).await.unwrap();
+        // the answer names where it really came from
+        assert_eq!(
+            udp_answer(carrier.as_ref()).await,
+            (b"a query".to_vec(), target(echo))
+        );
+        assert_eq!(fake.datagrams()[0].target, "xn--bcher-kva.example:53");
+        let err = carrier
+            .send_to(b"x", &Target::new(HostName::Domain("a@b.test".into()), 53))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ss: the host name cannot be sent to the server"
+        );
+        assert_eq!(fake.datagrams().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_garbled_or_replayed_answer_is_dropped_and_the_next_one_arrives() {
+        let echo = udp_echo_server().await;
+        let garbled = |method: SsMethod| ShadowsocksScript {
+            udp_garbled_first: true,
+            ..ShadowsocksScript::new(method, &udp_password(method))
+        };
+        let method = SsMethod::Blake3Aes128Gcm;
+        for script in [
+            garbled(SsMethod::Aes256Gcm),
+            garbled(method),
+            ShadowsocksScript {
+                udp_twice: true,
+                ..ShadowsocksScript::new(method, &udp_password(method))
+            },
+        ] {
+            let method = script.method;
+            let fake = FakeShadowsocks::spawn(script).await;
+            let out = udp_outbound(&fake, method, &udp_password(method));
+            let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+            for payload in [&b"one"[..], b"two", b"three"] {
+                udp_roundtrip(carrier.as_ref(), echo, payload).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_2022_answer_off_the_clock_or_for_another_session_is_dropped() {
+        let echo = udp_echo_server().await;
+        let method = SsMethod::Blake3Aes256Gcm;
+        let key = key_2022(method, 1);
+        for script in [
+            ShadowsocksScript {
+                answer_skew: 3600,
+                ..ShadowsocksScript::new(method, &key)
+            },
+            ShadowsocksScript {
+                wrong_request_salt: true,
+                ..ShadowsocksScript::new(method, &key)
+            },
+        ] {
+            let fake = FakeShadowsocks::spawn(script).await;
+            let out = udp_outbound(&fake, method, &key);
+            let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+            carrier.send_to(b"hello", &target(echo)).await.unwrap();
+            no_udp_answer(carrier.as_ref()).await;
+            assert_eq!(fake.datagrams().len(), 1, "the server relayed it");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_server_drops_a_wrong_key_or_a_clock_an_hour_off() {
+        let echo = udp_echo_server().await;
+        let method = SsMethod::Blake3Aes128Gcm;
+        let key = key_2022(method, 1);
+        let setups = [
+            (
+                ShadowsocksScript::new(method, &key),
+                key_2022(method, 9),
+                false,
+            ),
+            (ShadowsocksScript::new(method, &key), key.clone(), true),
+            (
+                ShadowsocksScript::new(SsMethod::Aes128Gcm, "right"),
+                "wrong".to_string(),
+                false,
+            ),
+        ];
+        for (script, password, behind) in setups {
+            let method = script.method;
+            let fake = FakeShadowsocks::spawn(script).await;
+            let mut out = udp_outbound(&fake, method, &password);
+            if behind {
+                out = out.with_clock(an_hour_behind);
+            }
+            let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+            carrier.send_to(b"hello", &target(echo)).await.unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while fake.udp_rejected() == 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the server drops it"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(fake.datagrams().is_empty());
+            no_udp_answer(carrier.as_ref()).await;
+        }
+    }
+
+    /// Without `udp-relay=true` the policy carries no UDP (the manual: the
+    /// server must allow it).
+    #[tokio::test]
+    async fn no_udp_without_udp_relay() {
+        let fake = FakeShadowsocks::spawn(ShadowsocksScript::new(SsMethod::Aes128Gcm, "pw")).await;
+        let out = outbound(&format!(
+            "ss, 127.0.0.1, {}, encrypt-method=aes-128-gcm, password=pw",
+            fake.addr().port()
+        ));
+        assert_eq!(out.udp(), UdpSupport::Unsupported);
+        let err = out.open_udp(&ConnectOpts::default()).await.err().unwrap();
+        assert_eq!(
+            err.to_string(),
+            "policy protocol not implemented: UDP without `udp-relay=true`"
+        );
     }
 
     #[test]

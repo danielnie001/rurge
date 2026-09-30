@@ -258,7 +258,7 @@ impl Socks5Udp {
 /// Whether a datagram from `sender` may be the relay's: when the relay is
 /// known by address its source must be that address (the port may differ);
 /// a relay still known by name (a chained carrier) is not filtered.
-fn from_relay(relay: Option<IpAddr>, sender: &Target) -> bool {
+pub(crate) fn from_relay(relay: Option<IpAddr>, sender: &Target) -> bool {
     match (relay, &sender.host) {
         (Some(relay), HostName::Ip(ip)) => relay == *ip,
         (Some(_), HostName::Domain(_)) => false,

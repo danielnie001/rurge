@@ -16,7 +16,7 @@ pub(crate) const MAX_VARIABLE_HEADER: usize = 0xFFFF;
 /// Padding of a request without an initial payload: 1 to 900 bytes.
 const MAX_PADDING: u16 = 900;
 /// Timestamps further apart than this are a replay.
-const TIME_WINDOW: u64 = 30;
+pub(crate) const TIME_WINDOW: u64 = 30;
 const CLIENT_STREAM: u8 = 0;
 const SERVER_STREAM: u8 = 1;
 /// The request's fixed-length header: type, timestamp, the next chunk's length.
@@ -59,6 +59,23 @@ impl Identity {
         for (key, next) in &self.layers {
             let mut block = *next;
             aes_encrypt_block(&kdf::identity_subkey(key, salt), &mut block);
+            out.extend_from_slice(&block);
+        }
+        out
+    }
+
+    /// The identity headers of a UDP packet whose separate header is
+    /// `separate` (in the clear): the next key's hash, masked with the
+    /// separate header so that it differs per packet, under one AES block
+    /// keyed with this layer's key itself.
+    pub(crate) fn packet_headers(&self, separate: &[u8; 16]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16 * self.layers.len());
+        for (key, next) in &self.layers {
+            let mut block = *next;
+            for (byte, mask) in block.iter_mut().zip(separate) {
+                *byte ^= mask;
+            }
+            aes_encrypt_block(key, &mut block);
             out.extend_from_slice(&block);
         }
         out

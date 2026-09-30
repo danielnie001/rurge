@@ -273,8 +273,8 @@ pub(crate) fn aes_encrypt_block(key: &[u8], block: &mut [u8; 16]) {
     }
 }
 
-/// The inverse of `aes_encrypt_block` (the fake server's side).
-#[cfg(any(test, feature = "testing"))]
+/// The inverse of `aes_encrypt_block`: the separate headers of the
+/// server's UDP packets (and the fake server's side).
 pub(crate) fn aes_decrypt_block(key: &[u8], block: &mut [u8; 16]) {
     let block = GenericArray::from_mut_slice(block);
     match key.len() {

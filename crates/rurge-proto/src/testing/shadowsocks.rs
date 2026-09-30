@@ -10,23 +10,30 @@
 //! As real servers do, it never tells a client with a wrong password (or
 //! key, or clock, or a replayed salt) so: it stops reading into the stream,
 //! closes its side and waits for the client to go away.
+//!
+//! UDP: a loopback socket on the TCP port's number (or, with `udp_apart`, a
+//! port of its own). Each client session (SS 2022: its session id; else the
+//! client's address) relays through a socket of its own, and whatever
+//! reaches that socket goes back with its source — full cone, as the
+//! reference servers do. Packets it cannot use are dropped and counted.
 
 use super::AbortOnDrop;
 use super::obfs::{ObfsHello, accept_obfs};
-use crate::shadowsocks::cipher::{AeadCipher, AeadKind, TAG, aes_decrypt_block};
+use crate::shadowsocks::cipher::{AeadCipher, AeadKind, TAG, aes_decrypt_block, aes_encrypt_block};
 use crate::shadowsocks::kdf;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use rurge_config::spec::{ObfsMode, SsMethod};
 use rurge_net::connector::BoxedStream;
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 /// The largest payload a client chunk may carry (AEAD, SS 2022).
 const MAX_CHUNK: usize = 0x3FFF;
@@ -47,8 +54,16 @@ pub struct ShadowsocksScript {
     pub connect_to: Option<SocketAddr>,
     /// SS 2022: seconds added to the timestamp of every answer.
     pub answer_skew: i64,
-    /// SS 2022: answer naming a salt that is not the request's.
+    /// SS 2022: answer naming a salt (UDP: a client session) that is not
+    /// the request's.
     pub wrong_request_salt: bool,
+    /// UDP on a port of its own rather than on the TCP port's number.
+    pub udp_apart: bool,
+    /// UDP: every answer goes out twice (SS 2022: the copy is a replay).
+    pub udp_twice: bool,
+    /// UDP: every answer goes after a copy of it with a bit flipped (with
+    /// `none`, a different answer).
+    pub udp_garbled_first: bool,
 }
 
 impl ShadowsocksScript {
@@ -61,6 +76,9 @@ impl ShadowsocksScript {
             connect_to: None,
             answer_skew: 0,
             wrong_request_salt: false,
+            udp_apart: false,
+            udp_twice: false,
+            udp_garbled_first: false,
         }
     }
 }
@@ -82,11 +100,27 @@ pub struct RecordedShadowsocks {
     pub user: Option<usize>,
 }
 
+/// A client datagram the fake relayed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedDatagram {
+    /// `host:port`, the name as it was on the wire.
+    pub target: String,
+    pub payload: Vec<u8>,
+    /// SS 2022: the client's session id and the packet's id.
+    pub session: Option<(u64, u64)>,
+    /// SS 2022: the packet's padding length.
+    pub padding: usize,
+    /// SS 2022 with users: which one's key the identity header named.
+    pub user: Option<usize>,
+}
+
 pub struct FakeShadowsocks {
     addr: SocketAddr,
+    udp_addr: SocketAddr,
     shared: Arc<Shared>,
     connections: Arc<AtomicUsize>,
     _task: AbortOnDrop,
+    _udp: AbortOnDrop,
 }
 
 #[derive(Default)]
@@ -98,6 +132,10 @@ struct Seen {
     largest_chunk: AtomicUsize,
     /// SS 2022: every request salt accepted so far, to refuse replays.
     salts: Mutex<HashSet<Vec<u8>>>,
+    datagrams: Mutex<Vec<RecordedDatagram>>,
+    /// Each UDP client session's own socket, in the order they opened.
+    outside: Mutex<Vec<SocketAddr>>,
+    udp_rejected: AtomicUsize,
 }
 
 struct Shared {
@@ -504,12 +542,350 @@ async fn serve_2022(mut stream: BoxedStream, kind: AeadKind, shared: &Shared) ->
     Ok(())
 }
 
-impl FakeShadowsocks {
-    pub async fn spawn(script: ShadowsocksScript) -> FakeShadowsocks {
+/// A TCP listener and a UDP socket on the same port number, or, `apart`, on
+/// different ones.
+async fn bind(apart: bool) -> (TcpListener, UdpSocket) {
+    for _ in 0..64 {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let udp = if apart {
+            UdpSocket::bind("127.0.0.1:0")
+                .await
+                .ok()
+                .filter(|udp| udp.local_addr().is_ok_and(|a| a.port() != port))
+        } else {
+            UdpSocket::bind(("127.0.0.1", port)).await.ok()
+        };
+        if let Some(udp) = udp {
+            return (listener, udp);
+        }
+    }
+    panic!("no loopback port for both TCP and UDP");
+}
+
+/// Which client session a datagram belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ClientKey {
+    Addr(SocketAddr),
+    Session(u64),
+}
+
+/// What it takes to answer one client session.
+#[derive(Clone)]
+enum Answering {
+    Plain,
+    Aead(AeadKind),
+    S2022 {
+        kind: AeadKind,
+        user: Vec<u8>,
+        client: [u8; 8],
+    },
+}
+
+/// A client datagram, opened.
+struct Opened {
+    key: ClientKey,
+    answering: Answering,
+    record: RecordedDatagram,
+    host: String,
+    port: u16,
+}
+
+/// `sealed` (its tag last) opened with `cipher` under `nonce`.
+fn open_sealed(cipher: &AeadCipher, nonce: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
+    let (data, tag) = sealed.split_at(sealed.len().checked_sub(TAG)?);
+    let mut data = data.to_vec();
+    let tag: [u8; TAG] = tag.try_into().ok()?;
+    cipher.open_in_place(nonce, &mut data, &tag).then_some(data)
+}
+
+/// `plain` sealed with `cipher` under `nonce`, its tag last.
+fn seal_plain(cipher: &AeadCipher, nonce: &[u8], plain: &[u8]) -> Vec<u8> {
+    let mut data = plain.to_vec();
+    let tag = cipher.seal_in_place(nonce, &mut data);
+    data.extend_from_slice(&tag);
+    data
+}
+
+/// The target and the payload of a datagram's plaintext.
+fn target_of(plain: &[u8]) -> Option<(String, u16, Vec<u8>)> {
+    let (request, _) = parse_address(plain)?;
+    Some((request.host, request.port, request.early))
+}
+
+/// A client datagram from `from`; `None` for one it cannot use.
+fn open_datagram(script: &ShadowsocksScript, packet: &[u8], from: SocketAddr) -> Option<Opened> {
+    let (plain, answering) = match AeadKind::of(script.method) {
+        None => (packet.to_vec(), Answering::Plain),
+        Some(kind) if script.method.is_2022() => return open_datagram_2022(script, kind, packet),
+        Some(kind) => {
+            let salt = packet.get(..kind.key_len())?;
+            let master = kdf::evp_bytes_to_key(script.password.as_bytes(), kind.key_len());
+            let cipher = AeadCipher::new(kind, &kdf::session_subkey(&master, salt));
+            let nonce = [0u8; 24];
+            let plain = open_sealed(&cipher, &nonce[..kind.nonce_len()], &packet[salt.len()..])?;
+            (plain, Answering::Aead(kind))
+        }
+    };
+    let (host, port, payload) = target_of(&plain)?;
+    Some(Opened {
+        key: ClientKey::Addr(from),
+        answering,
+        record: RecordedDatagram {
+            target: format!("{host}:{port}"),
+            payload,
+            session: None,
+            padding: 0,
+            user: None,
+        },
+        host,
+        port,
+    })
+}
+
+/// SS 2022 (SIP022 3.2, SIP023): the separate header under the server's
+/// key, an identity header when the script has users, the body.
+fn open_datagram_2022(script: &ShadowsocksScript, kind: AeadKind, packet: &[u8]) -> Option<Opened> {
+    let server_key = decode_key(&script.password);
+    let mut separate: [u8; 16] = packet.get(..16)?.try_into().ok()?;
+    aes_decrypt_block(&server_key, &mut separate);
+    let (psk, user, body_at) = if script.users.is_empty() {
+        (server_key, None, 16)
+    } else {
+        let mut block: [u8; 16] = packet.get(16..32)?.try_into().ok()?;
+        aes_decrypt_block(&server_key, &mut block);
+        for (byte, mask) in block.iter_mut().zip(separate) {
+            *byte ^= mask;
+        }
+        let users: Vec<Vec<u8>> = script.users.iter().map(|u| decode_key(u)).collect();
+        let i = users.iter().position(|u| kdf::identity_hash(u) == block)?;
+        (users[i].clone(), Some(i), 32)
+    };
+    let client: [u8; 8] = separate[..8].try_into().ok()?;
+    let cipher = AeadCipher::new(kind, &kdf::session_subkey_2022(&psk, &client));
+    let body = open_sealed(&cipher, &separate[4..], packet.get(body_at..)?)?;
+    let time = u64::from_be_bytes(body.get(1..9)?.try_into().ok()?);
+    if body[0] != 0 || time.abs_diff(unix_time()) > 30 {
+        return None;
+    }
+    let padding = usize::from(u16::from_be_bytes(body.get(9..11)?.try_into().ok()?));
+    let (host, port, payload) = target_of(body.get(11 + padding..)?)?;
+    let session = u64::from_be_bytes(client);
+    Some(Opened {
+        key: ClientKey::Session(session),
+        answering: Answering::S2022 {
+            kind,
+            user: psk,
+            client,
+        },
+        record: RecordedDatagram {
+            target: format!("{host}:{port}"),
+            payload,
+            session: Some((session, u64::from_be_bytes(separate[8..].try_into().ok()?))),
+            padding,
+            user,
+        },
+        host,
+        port,
+    })
+}
+
+/// `from` as `ATYP ADDR PORT`.
+fn socks_address(from: SocketAddr) -> Vec<u8> {
+    let mut out = Vec::with_capacity(19);
+    match from.ip() {
+        IpAddr::V4(ip) => {
+            out.push(1);
+            out.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            out.push(4);
+            out.extend_from_slice(&ip.octets());
+        }
+    }
+    out.extend_from_slice(&from.port().to_be_bytes());
+    out
+}
+
+/// The answer `payload` from `from`: packet `packet` of server session
+/// `server` (SS 2022).
+fn seal_answer(
+    script: &ShadowsocksScript,
+    answering: &Answering,
+    server: &[u8; 8],
+    packet: u64,
+    from: SocketAddr,
+    payload: &[u8],
+) -> Vec<u8> {
+    let addr = socks_address(from);
+    match answering {
+        Answering::Plain => [&addr[..], payload].concat(),
+        Answering::Aead(kind) => {
+            let mut salt = vec![0u8; kind.key_len()];
+            getrandom::fill(&mut salt).expect("randomness");
+            let master = kdf::evp_bytes_to_key(script.password.as_bytes(), kind.key_len());
+            let cipher = AeadCipher::new(*kind, &kdf::session_subkey(&master, &salt));
+            let nonce = [0u8; 24];
+            let sealed = seal_plain(
+                &cipher,
+                &nonce[..kind.nonce_len()],
+                &[&addr[..], payload].concat(),
+            );
+            [salt, sealed].concat()
+        }
+        Answering::S2022 { kind, user, client } => {
+            let mut separate = [0u8; 16];
+            separate[..8].copy_from_slice(server);
+            separate[8..].copy_from_slice(&packet.to_be_bytes());
+            let mut echoed = *client;
+            if script.wrong_request_salt {
+                echoed[0] ^= 1;
+            }
+            let time = unix_time().saturating_add_signed(script.answer_skew);
+            let mut body = vec![1];
+            body.extend_from_slice(&time.to_be_bytes());
+            body.extend_from_slice(&echoed);
+            body.extend_from_slice(&[0, 0]);
+            body.extend_from_slice(&addr);
+            body.extend_from_slice(payload);
+            let cipher = AeadCipher::new(*kind, &kdf::session_subkey_2022(user, server));
+            let sealed = seal_plain(&cipher, &separate[4..], &body);
+            // the answers' separate headers are under the user's key
+            aes_encrypt_block(user, &mut separate);
+            [&separate[..], &sealed].concat()
+        }
+    }
+}
+
+/// One client session's relay.
+struct UdpClient {
+    outside: Arc<UdpSocket>,
+    /// Where the client last sent from: the answers go there.
+    client: Arc<Mutex<SocketAddr>>,
+    /// SS 2022: the packet ids seen.
+    packets: HashSet<u64>,
+    _answers: AbortOnDrop,
+}
+
+impl UdpClient {
+    async fn open(
+        socket: &Arc<UdpSocket>,
+        shared: &Arc<Shared>,
+        answering: Answering,
+        from: SocketAddr,
+    ) -> io::Result<UdpClient> {
+        let outside = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        shared
+            .seen
+            .outside
+            .lock()
+            .expect("outside")
+            .push(outside.local_addr()?);
+        let client = Arc::new(Mutex::new(from));
+        let task = tokio::spawn(answer(
+            socket.clone(),
+            outside.clone(),
+            client.clone(),
+            shared.clone(),
+            answering,
+        ));
+        Ok(UdpClient {
+            outside,
+            client,
+            packets: HashSet::new(),
+            _answers: AbortOnDrop(task),
+        })
+    }
+}
+
+/// Sends whatever reaches `outside`, from anyone, to the client.
+async fn answer(
+    socket: Arc<UdpSocket>,
+    outside: Arc<UdpSocket>,
+    client: Arc<Mutex<SocketAddr>>,
+    shared: Arc<Shared>,
+    answering: Answering,
+) {
+    let script = &shared.script;
+    let mut server = [0u8; 8];
+    getrandom::fill(&mut server).expect("randomness");
+    let mut packet = 0u64;
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let (n, from) = match outside.recv_from(&mut buf).await {
+            Ok(got) => got,
+            // an ICMP "unreachable" for an earlier datagram (Windows)
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
+            Err(_) => return,
+        };
+        let sealed = seal_answer(script, &answering, &server, packet, from, &buf[..n]);
+        packet += 1;
+        let to = *client.lock().expect("client");
+        if script.udp_garbled_first {
+            let mut garbled = sealed.clone();
+            let last = garbled.len() - 1;
+            garbled[last] ^= 1;
+            let _ = socket.send_to(&garbled, to).await;
+        }
+        let _ = socket.send_to(&sealed, to).await;
+        if script.udp_twice {
+            let _ = socket.send_to(&sealed, to).await;
+        }
+    }
+}
+
+async fn serve_udp(socket: Arc<UdpSocket>, shared: Arc<Shared>) {
+    let mut clients: HashMap<ClientKey, UdpClient> = HashMap::new();
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let (n, from) = match socket.recv_from(&mut buf).await {
+            Ok(got) => got,
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
+            Err(_) => return,
+        };
+        let seen = &shared.seen;
+        let Some(opened) = open_datagram(&shared.script, &buf[..n], from) else {
+            seen.udp_rejected.fetch_add(1, Ordering::SeqCst);
+            continue;
+        };
+        let client = match clients.entry(opened.key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let open = UdpClient::open(&socket, &shared, opened.answering, from);
+                let Ok(client) = open.await else {
+                    continue;
+                };
+                entry.insert(client)
+            }
+        };
+        if let Some((_, packet)) = opened.record.session
+            && !client.packets.insert(packet)
+        {
+            seen.udp_rejected.fetch_add(1, Ordering::SeqCst);
+            continue;
+        }
+        *client.client.lock().expect("client") = from;
+        seen.datagrams
+            .lock()
+            .expect("datagrams")
+            .push(opened.record.clone());
+        let to = match (opened.host.parse::<IpAddr>(), shared.script.connect_to) {
+            (Ok(ip), _) => SocketAddr::new(ip, opened.port),
+            (Err(_), Some(addr)) => addr,
+            // never resolves: a name without `connect_to` is a dead end
+            (Err(_), None) => continue,
+        };
+        let _ = client.outside.send_to(&opened.record.payload, to).await;
+    }
+}
+
+impl FakeShadowsocks {
+    pub async fn spawn(script: ShadowsocksScript) -> FakeShadowsocks {
+        let (listener, udp) = bind(script.udp_apart).await;
         let addr = listener.local_addr().expect("local addr");
+        let udp_addr = udp.local_addr().expect("local addr");
         let shared = Arc::new(Shared {
             script,
             seen: Seen::default(),
@@ -522,16 +898,46 @@ impl FakeShadowsocks {
                 tokio::spawn(serve(tcp, serving.clone()));
             }
         });
+        let udp_task = tokio::spawn(serve_udp(Arc::new(udp), shared.clone()));
         FakeShadowsocks {
             addr,
+            udp_addr,
             shared,
             connections,
             _task: AbortOnDrop(task),
+            _udp: AbortOnDrop(udp_task),
         }
     }
 
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Where it takes UDP: the TCP port's number unless `udp_apart`.
+    pub fn udp_addr(&self) -> SocketAddr {
+        self.udp_addr
+    }
+
+    /// Every client datagram relayed so far.
+    pub fn datagrams(&self) -> Vec<RecordedDatagram> {
+        self.shared
+            .seen
+            .datagrams
+            .lock()
+            .expect("datagrams")
+            .clone()
+    }
+
+    /// Each UDP client session's own socket: whatever reaches it goes back
+    /// to that client.
+    pub fn udp_outside(&self) -> Vec<SocketAddr> {
+        self.shared.seen.outside.lock().expect("outside").clone()
+    }
+
+    /// Client datagrams dropped: not decrypted, malformed, off the clock or
+    /// replayed.
+    pub fn udp_rejected(&self) -> usize {
+        self.shared.seen.udp_rejected.load(Ordering::SeqCst)
     }
 
     pub fn requests(&self) -> Vec<RecordedShadowsocks> {
