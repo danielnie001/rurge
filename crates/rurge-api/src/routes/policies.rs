@@ -34,8 +34,10 @@ pub struct TestPolicies {
     pub url: Option<String>,
 }
 
-/// `POST /v1/policies/test` (phase 2 M3 design 6.6): `{"<name>": Result…}`.
-/// The manual gives no response sample: the shape is provisional.
+/// `POST /v1/policies/test` (phase 2 M3 design 6.6): `{"<name>": Result…}`,
+/// with `udp` in a result when the policy has a UDP test (phase 2 M5 design
+/// 8.4), run alongside. The manual gives no response sample: the shape is
+/// provisional.
 pub async fn test(
     State(app): State<App>,
     body: Result<Json<TestPolicies>, JsonRejection>,
@@ -47,17 +49,23 @@ pub async fn test(
             Some(Url::parse(text).map_err(|_| ApiError::bad_request("`url` is not a URL"))?)
         }
     };
-    let results = app
-        .engine
-        .test_policies(&body.policy_names, url)
-        .await
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let (results, udp) = tokio::join!(
+        app.engine.test_policies(&body.policy_names, url),
+        app.engine.test_udp(&body.policy_names)
+    );
+    let results = results.map_err(|e| ApiError::bad_request(e.to_string()))?;
     let mut out = Map::new();
-    for (name, result) in results {
-        let result = match result {
+    for ((name, result), (_, udp)) in results.into_iter().zip(udp) {
+        let mut result = match result {
             Some(result) => result_json(&result),
             None => json!({ "error": "not testable" }),
         };
+        if let Some(udp) = udp {
+            result["udp"] = match udp {
+                Ok(delay) => json!({ "delay": delay.as_millis() as u64 }),
+                Err(error) => json!({ "error": error }),
+            };
+        }
         out.insert(name, result);
     }
     Ok(Json(Value::Object(out)))

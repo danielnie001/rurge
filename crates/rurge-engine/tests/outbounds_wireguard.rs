@@ -309,3 +309,24 @@ async fn udp_leaves_through_the_tunnel() {
     wait_until("the flow to finish", || !log.recent(10).is_empty()).await;
     assert_eq!(log.recent(10)[0].policy, ["WG"]);
 }
+
+/// The UDP test (`test-udp`) asks its question through the tunnel; a policy
+/// without UDP, or without a UDP test, has none (phase 2 M5 design 8.4).
+#[tokio::test]
+async fn a_udp_test_asks_through_the_tunnel() {
+    let (peer, section) = peer().await;
+    let h = harness(Profile {
+        proxies: "WG = wireguard, section-name=w, test-udp=echo.test@10.0.0.53
+H = http, 127.0.0.1, 9",
+        sections: &section,
+        ..Profile::default()
+    })
+    .await;
+    let names = ["WG", "H", "DIRECT"].map(String::from);
+    let results = h.engine.test_udp(&names).await;
+    let outcome = |name: &str| results.iter().find(|(n, _)| n == name).unwrap().1.clone();
+    assert!(matches!(outcome("WG"), Some(Ok(_))), "{:?}", outcome("WG"));
+    assert_eq!(outcome("H"), None, "an http proxy carries no UDP");
+    assert_eq!(outcome("DIRECT"), None, "no proxy-test-udp");
+    assert_eq!(peer.core().dns_questions, ["echo.test A"]);
+}

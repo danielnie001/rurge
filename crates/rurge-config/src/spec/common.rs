@@ -182,7 +182,6 @@ pub(crate) fn read_common(
         let inert = [
             ("dns-follow-interface", dns_follow_interface),
             ("tfo", tfo),
-            ("test-udp", test_udp.is_some()),
             ("ecn", ecn_present && applies == Applies::Proxy),
         ];
         notes
@@ -259,10 +258,7 @@ mod tests {
                 underlying_proxy: Some("Entry".into()),
             }
         );
-        assert_eq!(
-            notes.inert,
-            ["dns-follow-interface", "tfo", "test-udp", "ecn"]
-        );
+        assert_eq!(notes.inert, ["dns-follow-interface", "tfo", "ecn"]);
         assert_eq!(notes.ios_only, ["hybrid"]);
     }
 

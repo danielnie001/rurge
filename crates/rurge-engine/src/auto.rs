@@ -13,7 +13,9 @@ use rurge_inbound::{SessionHandle, SessionOutcome};
 use rurge_net::connector::Target;
 use rurge_policy::auto::SelectCtx;
 use rurge_policy::testbook::{TestMode, TestObserver, TestRecord, TestResult};
+use rurge_policy::udp_probe::probe_udp;
 use rurge_policy::{PolicyRegistry, Resolution};
+use rurge_proto::UdpSupport;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use url::Url;
@@ -146,6 +148,44 @@ impl Engine {
             out.push((name.clone(), result));
         }
         Ok(out)
+    }
+
+    /// The UDP test of each of `names` now (phase 2 M5 design 8.4), side by
+    /// side, each within its policy's test timeout: `None` for a policy
+    /// without one — no `test-udp` and no `proxy-test-udp`, no UDP, or not
+    /// testable at all (a group, a REJECT). Nothing is kept, and no group
+    /// picks by it.
+    pub async fn test_udp(
+        &self,
+        names: &[String],
+    ) -> Vec<(String, Option<Result<Duration, String>>)> {
+        let (runtime, registry) = self.snapshot();
+        let fallback = runtime.config.general.proxy_test_udp.clone();
+        let tests: Vec<_> = names
+            .iter()
+            .map(|name| {
+                let case = registry.test_case(name);
+                let test = registry
+                    .spec(name)
+                    .and_then(|spec| spec.common.test_udp.clone())
+                    .or_else(|| fallback.clone());
+                tokio::spawn(async move {
+                    let (case, test) = (case?, test?);
+                    if case.outbound.udp() == UdpSupport::Unsupported {
+                        return None;
+                    }
+                    Some(probe_udp(&case.outbound, &test, case.timeout).await)
+                })
+            })
+            .collect();
+        let mut out = Vec::with_capacity(names.len());
+        for (name, test) in names.iter().zip(tests) {
+            let outcome = test
+                .await
+                .unwrap_or_else(|_| Some(Err("the test did not finish".to_string())));
+            out.push((name.clone(), outcome));
+        }
+        out
     }
 
     /// Tests every member of `group` now, whatever its `interval`, and the

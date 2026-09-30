@@ -20,6 +20,7 @@ pub mod subscription;
 pub mod testbook;
 #[cfg(test)]
 pub(crate) mod testing;
+pub mod udp_probe;
 
 pub use assemble::{Assembly, Snapshots, assemble};
 pub use cell::{ChainConnector, RegistryCell};
