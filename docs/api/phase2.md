@@ -216,6 +216,12 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 
 响应 `{"<名字>": Result 或 {"error": "not testable"}}`；不能测的是策略组、`REJECT` 族、尚未实现的协议，以及自己的测试 URL 解析不了的策略（即使请求里给了 `url`）。
 
+UDP 测试（M5c）：策略有 UDP 测试时——策略的 `test-udp`，否则 `[General]` 的 `proxy-test-udp`——它的 Result 多一个 `udp` 键，与 URL 测试同时进行：经策略的 UDP 向 `hostname@ipv4` 的 53 端口问一次 A 记录，`{"delay": <毫秒>}` 或 `{"error": "<原因>"}`（如 `udp test timed out`），时限同该策略的测试超时；没有 UDP 测试、策略不载 UDP、不能测时没有这个键。UDP 测试的结果不保存、不影响任何组，也不进请求记录；新增的键不改变已有的形状。
+
+```json
+{"HK": {"delay": 128, "time": 1758790000.25, "udp": {"delay": 41}}}
+```
+
 ```json
 {"HK": {"delay": 128, "time": 1758790000.25}, "Pick": {"error": "not testable"}}
 ```
@@ -246,7 +252,7 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 
 ### `wireguard` 的测速（M4b）
 
-- 节里没有 `dns-server`、策略也没写 `test-url` 时，测试是一次握手：向每个 peer 强制握手，`delay` 是从强制发起到任一 peer 第一个握手完成的毫秒数——通常是一个往返，之前已有一次发起在途时（隧道刚启动、换密钥、另一条策略的测试）可能更短；它只证明 peer 可达，不证明路由与出口（照手册）。peer 不回应时 `error` 是 `timed out`；隧道起不来时是出站的错误（如 `policy protocol not implemented: wireguard over underlying-proxy`）。
+- 节里没有 `dns-server`、策略也没写 `test-url` 时，测试是一次握手：向每个 peer 强制握手，`delay` 是从强制发起到任一 peer 第一个握手完成的毫秒数——通常是一个往返，之前已有一次发起在途时（隧道刚启动、换密钥、另一条策略的测试）可能更短；它只证明 peer 可达，不证明路由与出口（照手册）。peer 不回应时 `error` 是 `timed out`；隧道起不来时是出站的错误（如 `via Up: the underlying policy cannot carry UDP`）。
 - 否则经隧道两次 `HEAD`，与其它策略相同。
 - 两种都在超时之外另加 10 秒（第一次测试可能要先启动隧道）；`POST /v1/policies/test` 给了 `url` 时一律按那个 URL 测。
 

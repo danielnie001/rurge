@@ -1,7 +1,8 @@
 //! The `wireguard` outbound against sing-box's WireGuard endpoint (phase 2
 //! M4 design §10; total design Q4): the handshake, TCP through the tunnel,
 //! the reserved bytes sing-box writes into its messages to a peer with a
-//! `client-id`, and the handshake test.
+//! `client-id`, the handshake test, and UDP through the tunnel (phase 2
+//! M5c).
 
 mod common;
 
@@ -29,6 +30,7 @@ async fn a_connection_goes_through_a_sing_box_wireguard_endpoint() {
         },
     );
     let echo = echo_server().await;
+    let udp_echo = udp_echo_server().await;
     // sing-box maps its own tunnel address to its loopback, where the echo
     // listens; a loopback destination arriving through the tunnel may be
     // dropped by its netstack
@@ -43,6 +45,7 @@ peer = (public-key = {}, allowed-ips = 10.9.0.1/32, endpoint = 127.0.0.1:{port},
     let out = outbound(&profile, "WG", None);
     roundtrip(&out, through).await;
     roundtrip_big(&out, through).await;
+    udp_roundtrip(&out, SocketAddr::from(([10, 9, 0, 1], udp_echo.port()))).await;
     let test = out.native_test().expect("a wireguard policy tests itself");
     tokio::time::timeout(Duration::from_secs(10), test)
         .await

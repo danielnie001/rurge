@@ -165,3 +165,13 @@
 - [ ] 游戏或语音：经每个节点各进行一次语音通话或联机游戏，都能通话 / 联机。
 - [ ] 全锥与对称：用 NAT 类型检测工具（STUN）经 rurge 的 SOCKS5 检测——经 `trojan` 与 `anytls` 节点是 Full Cone（节点本身的出口须是全锥）；经 `vmess` 节点是 Symmetric（M5-D5，已知差异）。
 - [ ] WebSocket 与 TLS：`trojan` 或 `vmess` 节点开 `ws=true` 时 UDP 照常往返。
+
+## M5c　WireGuard 的 UDP 与其余
+
+前置：同 M5a 一节的 SOCKS5 UDP 客户端；自己的 WireGuard 服务端（记下是哪个实现与版本）；一个开了 UDP 的上游 SOCKS5 节点；一台有两个网卡的机器（做 `dns-follow-interface`）。
+
+- [ ] WireGuard 的 UDP：规则把 UDP 分到 `wireguard` 策略，经 SOCKS5 UDP 发 DNS 查询（如 Proxifier 代理 `nslookup example.com 1.1.1.1`）得到回答；经它进行一次语音通话或联机游戏；用 NAT 类型检测工具（STUN）检测，结果是 Full Cone（服务端的出口须是全锥）。
+- [ ] 经底层策略的隧道：`wireguard` 策略写 `underlying-proxy=<SOCKS5 节点>`（节点 `udp-relay=true`），TCP 与 UDP 都能经隧道往返；把底层策略换成一条 `http` 策略，拨号失败，请求记录写 `via <底层策略>: the underlying policy cannot carry UDP`。
+- [ ] UDP 测试：给一个节点写 `test-udp=apple.com@8.8.8.8`，`POST /v1/policies/test` 的结果里有 `udp` 键与延迟；不写 `test-udp`、写 `[General] proxy-test-udp` 时同样有；`http` 策略的结果里没有 `udp` 键。
+- [ ] `smart` 与 UDP：`smart` 组里放一个 UDP 通的节点与一个 UDP 不通的节点（服务端关掉 UDP），经这个组发一阵 DNS 查询后，UDP 不通的节点的站点记忆里记为失败（日志的健康切换），通的节点记为成功。
+- [ ] `dns-follow-interface`：`direct` 策略写 `interface=<第二块网卡>, dns-follow-interface=true`，`dns-server` 写一个只经第二块网卡可达的 DNS 服务器（或用抓包确认），规则把某个域名分到这条策略，访问它：抓包看到 DNS 查询从第二块网卡发出；配了 `encrypted-dns-server` 时查询照常走加密 DNS，日志有一条 `dns-follow-interface: the encrypted DNS servers are asked as usual` 的说明。
