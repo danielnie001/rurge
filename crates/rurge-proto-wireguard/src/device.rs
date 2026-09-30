@@ -539,6 +539,17 @@ impl Driver {
         self.dial(dials, due, true);
     }
 
+    /// When the earliest peer left without a carrier may be dialled again:
+    /// `REPLACE` after its last replacement. A replacement postponed by
+    /// that limit, or one that failed to connect, is retried then rather
+    /// than left to the periodic redial.
+    fn retry_at(&self) -> Option<Instant> {
+        (0..self.carriers.len())
+            .filter(|&p| self.carriers[p].is_none())
+            .filter_map(|p| self.replaced[p].map(|at| at + REPLACE))
+            .min()
+    }
+
     /// A dialled carrier of `peer` takes the place of the one there when
     /// there is none, when it goes to another address, or when `anew`
     /// says so; the peer is greeted on it at once.
@@ -627,6 +638,12 @@ impl Driver {
                 self.dial(&mut dials, due, false);
                 next_redial = now + self.redial;
             }
+            if self.retry_at().is_some_and(|at| at <= now) {
+                let lost = (0..self.carriers.len())
+                    .filter(|&p| self.carriers[p].is_none() && self.replaced[p].is_some())
+                    .collect();
+                self.replace_failed(&mut dials, lost);
+            }
             if self.shared.greet.swap(false, Ordering::SeqCst) {
                 self.shared
                     .stack
@@ -649,6 +666,7 @@ impl Driver {
                 }
                 let wait = stack.advance(now, &mut out);
                 let next = next_tick.min(next_redial);
+                let next = self.retry_at().map_or(next, |at| at.min(next));
                 (wait.map_or(next, |wait| (now + wait).min(next)), unanswered)
             };
             // logged, and dialled for, with the lock released

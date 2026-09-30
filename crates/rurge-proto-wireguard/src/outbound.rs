@@ -1363,6 +1363,8 @@ mod tests {
         dead: Arc<AtomicBool>,
         dials: Arc<AtomicUsize>,
         polls: Arc<AtomicUsize>,
+        /// How many of the first carriers die.
+        dying: usize,
     }
 
     struct DyingDatagram {
@@ -1386,7 +1388,7 @@ mod tests {
             opts: &'a ConnectOpts,
         ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
             Box::pin(async move {
-                let first = self.dials.fetch_add(1, Ordering::SeqCst) == 0;
+                let first = self.dials.fetch_add(1, Ordering::SeqCst) < self.dying;
                 let inner = self.inner.connect_udp(target, opts).await?;
                 let first = first.then(|| (self.dead.clone(), self.polls.clone()));
                 Ok(Box::new(DyingDatagram { inner, first }) as BoxedDatagram)
@@ -1429,6 +1431,7 @@ mod tests {
             dead: dead.clone(),
             dials: dials.clone(),
             polls: polls.clone(),
+            dying: 1,
         });
         let (peer, wg) = tunnel_with(PeerOpts::default(), |_| {}, no_names(), dying).await;
         let mut stream = wg
@@ -1451,6 +1454,47 @@ mod tests {
             "the ended carrier was polled {} times",
             polls.load(Ordering::SeqCst)
         );
+    }
+
+    /// A replacement that ends right away too is not dropped by the
+    /// ten-second limit: it is dialled again when the limit has run out,
+    /// long before the periodic redial.
+    #[tokio::test]
+    async fn a_replacement_that_ends_at_once_is_retried_after_the_limit() {
+        let (dead, dials) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let dying: Arc<dyn Connector> = Arc::new(Dying {
+            inner: direct(),
+            dead: dead.clone(),
+            dials: dials.clone(),
+            polls: Arc::new(AtomicUsize::new(0)),
+            dying: 2,
+        });
+        let (_peer, wg) = tunnel_with(PeerOpts::default(), |_| {}, no_names(), dying).await;
+        let mut stream = wg
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        assert_eq!(echo(&mut stream, b"before").await, b"before");
+
+        dead.store(true, Ordering::SeqCst);
+        // traffic wakes the driver: the first carrier ends, and so does
+        // its replacement
+        let _ = wg.connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(1)).await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while dials.load(Ordering::SeqCst) < 3 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("a third carrier long before the periodic redial");
+        let mut fresh = wg
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection over the third carrier");
+        assert_eq!(echo(&mut fresh, b"after").await, b"after");
     }
 
     /// A peer that cannot be reached when the tunnel starts is dialled
