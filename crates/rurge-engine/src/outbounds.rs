@@ -4,10 +4,10 @@
 use crate::shared::ExternalPrograms;
 use rurge_config::config::{LoadError, LoadOptions, Loaded, load};
 use rurge_config::diagnostic::codes;
-use rurge_config::spec::{CommonOpts, PolicySpec, ProtoSpec};
+use rurge_config::spec::{CommonOpts, IpVersion, PolicySpec, ProtoSpec};
 use rurge_config::{Config, Diagnostic, Diagnostics, KeystoreItem};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{Connector, DirectConnector, Resolve};
+use rurge_net::connector::{Connector, DirectConnector, Resolve, ResolveVia, SystemResolve, Via};
 use rurge_net::socket::{NoopSocketHook, SocketHook, SocketOpts};
 use rurge_policy::{BuildError, OutboundFactory};
 use rurge_proto::anytls::AnyTlsOutbound;
@@ -132,8 +132,33 @@ fn skips_verification(spec: &PolicySpec) -> bool {
 
 impl OutboundFactory for EngineFactory {
     fn direct_connector(&self, common: &CommonOpts) -> Arc<dyn Connector> {
+        // with `dns-follow-interface`, what the policy looks up — DIRECT's
+        // destinations, a proxy's server — is asked through its interface
+        // (phase 2 M5 design 8.5)
+        let resolver = match (&common.interface, common.dns_follow_interface) {
+            (Some(interface), true) => {
+                let questions = DirectConnector::with_opts(
+                    // the DNS servers are addresses: nothing to look up
+                    Arc::new(SystemResolve),
+                    SocketOpts {
+                        interface: Some(interface.clone()),
+                        allow_other_interface: common.allow_other_interface,
+                        ip_version: IpVersion::Dual,
+                        v6_first: self.v6_first,
+                        tos: 0,
+                    },
+                    self.hook.clone(),
+                );
+                let via = Via {
+                    key: interface.clone(),
+                    connector: Arc::new(questions),
+                };
+                Arc::new(ResolveVia::new(self.resolver.clone(), via)) as Arc<dyn Resolve>
+            }
+            _ => self.resolver.clone(),
+        };
         Arc::new(DirectConnector::with_opts(
-            self.resolver.clone(),
+            resolver,
             SocketOpts {
                 interface: common.interface.clone(),
                 allow_other_interface: common.allow_other_interface,
@@ -298,7 +323,7 @@ mod tests {
     use super::*;
     use rurge_config::config::{LoadOptions, from_text};
     use rurge_config::diagnostic::codes;
-    use rurge_net::connector::{ConnectOpts, SystemResolve, Target};
+    use rurge_net::connector::{ConnectOpts, Target};
     use rurge_net::socket::NoopSocketHook;
     use rurge_proto::testing::{FakeSocks5, Socks5Script, echo_server};
     use rurge_proto_ssh::testing::ED25519_WITH_PASSPHRASE;
@@ -567,5 +592,53 @@ Pinned = https, h.test, 443, server-cert-fingerprint-sha256=00000000000000000000
 Loose = https, h.test, 443, skip-cert-verify=true\n[Rule]\nFINAL,DIRECT\n",
         );
         assert!(dry_build(&cfg).is_empty());
+    }
+
+    /// A resolver that answers the loopback and notes how it was asked.
+    #[derive(Default)]
+    struct Noting(std::sync::Mutex<Vec<String>>);
+
+    impl Resolve for Noting {
+        fn resolve<'a>(&'a self, host: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+            self.0.lock().unwrap().push(host.to_string());
+            Box::pin(std::future::ready(Ok(vec![IpAddr::from([127, 0, 0, 1])])))
+        }
+
+        fn resolve_via<'a>(
+            &'a self,
+            host: &'a str,
+            via: &'a Via,
+        ) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{host} via {}", via.key));
+            Box::pin(std::future::ready(Ok(vec![IpAddr::from([127, 0, 0, 1])])))
+        }
+    }
+
+    /// With `dns-follow-interface`, what a policy looks up is asked through
+    /// its interface; without it, as usual (phase 2 M5 design 8.5).
+    #[tokio::test]
+    async fn a_policy_that_follows_its_interface_looks_up_through_it() {
+        let echo = echo_server().await;
+        let cfg = config(
+            "[Proxy]\nFollow = direct, interface=eth9, dns-follow-interface=true\n\
+Plain = direct, interface=eth9\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let noting = Arc::new(Noting::default());
+        let f = EngineFactory::new(&cfg, noting.clone(), Arc::new(NoopSocketHook));
+        let target = Target::new(rurge_config::HostName::parse("echo.test"), echo.port());
+        for name in ["Follow", "Plain"] {
+            let spec = cfg.spec(name).unwrap();
+            let out = f.build(spec, f.direct_connector(&spec.common)).unwrap();
+            out.connect_tcp(&target, &ConnectOpts::default())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            *noting.0.lock().unwrap(),
+            ["echo.test via eth9", "echo.test"]
+        );
     }
 }

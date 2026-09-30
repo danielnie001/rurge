@@ -17,7 +17,7 @@ use rurge_config::general::{DnsServer, EncryptedDns};
 use rurge_config::host::HostEntry;
 use rurge_config::{Config, Diagnostic, Diagnostics, codes};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{Connector, Resolve};
+use rurge_net::connector::{Connector, Resolve, Via};
 use rurge_net::http::{HttpClient, HttpClientConfig, tls_client_config};
 use rurge_net::resource::{ResourceManager, ResourceSource, ResourceSpec, ResourceState};
 use rurge_rules::engine::{LazyResolver, ResolveError};
@@ -217,6 +217,14 @@ impl Drop for Inflight<'_> {
     }
 }
 
+/// What the lookups through one `Via` ask (`dns-follow-interface`, phase 2
+/// M5 design 8.5): the plain servers, through its connector, with answers of
+/// their own.
+struct ViaSet {
+    upstreams: Arc<Vec<UpstreamRef>>,
+    cache: DnsCache,
+}
+
 pub struct Resolver {
     cfg: ResolverConfig,
     connector: Arc<dyn Connector>,
@@ -245,6 +253,11 @@ pub struct Resolver {
     aaaa_suppressed: AtomicBool,
     has_ipv6: AtomicBool,
     self_weak: Mutex<Weak<Resolver>>,
+    /// The upstream sets of the lookups through a `Via`, by its key.
+    vias: Mutex<HashMap<String, Arc<ViaSet>>>,
+    /// Said once: lookups through a `Via` do not follow it with encrypted
+    /// DNS configured.
+    via_unfollowed: AtomicBool,
 }
 
 impl Resolver {
@@ -347,6 +360,8 @@ impl Resolver {
             aaaa_suppressed: AtomicBool::new(false),
             has_ipv6: AtomicBool::new(has_ipv6),
             self_weak: Mutex::new(Weak::new()),
+            vias: Mutex::new(HashMap::new()),
+            via_unfollowed: AtomicBool::new(false),
             configured_udp,
             wants_system,
             encrypted_specs: encrypted,
@@ -432,6 +447,8 @@ impl Resolver {
 
     pub fn flush(&self) {
         self.cache.flush();
+        // rebuilt from the servers of the moment by the next lookup
+        self.vias.lock().expect("vias").clear();
         self.bootstrap.flush();
         self.aaaa_failures.store(0, Ordering::Relaxed);
         self.aaaa_suppressed.store(false, Ordering::Relaxed);
@@ -475,6 +492,95 @@ impl Resolver {
     }
 
     pub async fn lookup(&self, host: &str, opts: LookupOpts) -> Result<DnsResult, DnsError> {
+        self.lookup_inner(host, opts, None).await
+    }
+
+    /// `lookup`, the questions to the plain servers leaving through `via`
+    /// with answers kept apart (`dns-follow-interface`, phase 2 M5 design
+    /// 8.5). `[Host]`, the hosts file and the system's own lookups go as
+    /// usual; with encrypted DNS configured, nothing follows `via`.
+    pub async fn lookup_via(
+        &self,
+        host: &str,
+        opts: LookupOpts,
+        via: &Via,
+    ) -> Result<DnsResult, DnsError> {
+        self.lookup_inner(host, opts, Some(via)).await
+    }
+
+    /// The upstream set of `via`, built from the plain servers of the moment.
+    fn via_set(&self, via: &Via) -> Arc<ViaSet> {
+        let mut vias = self.vias.lock().expect("vias");
+        if let Some(set) = vias.get(&via.key) {
+            return set.clone();
+        }
+        let system: Vec<UpstreamSpec> = self
+            .system
+            .servers()
+            .into_iter()
+            .map(UpstreamSpec::Udp)
+            .collect();
+        let upstreams = traditional_specs(&self.configured_udp, self.wants_system, &system)
+            .iter()
+            .filter_map(|spec| match spec {
+                UpstreamSpec::Udp(addr) => Some(Arc::new(UdpUpstream::via(
+                    *addr,
+                    &via.key,
+                    via.connector.clone(),
+                )) as UpstreamRef),
+                _ => None,
+            })
+            .collect();
+        let set = Arc::new(ViaSet {
+            upstreams: Arc::new(upstreams),
+            cache: DnsCache::new(self.cfg.cache_capacity),
+        });
+        vias.insert(via.key.clone(), set.clone());
+        set
+    }
+
+    /// The upstream step of a lookup through `via`: its own cache, then its
+    /// own servers.
+    async fn lookup_on(
+        &self,
+        name: &str,
+        want_v6: bool,
+        opts: &LookupOpts,
+        via: &Via,
+        started: Instant,
+    ) -> Result<DnsResult, DnsError> {
+        let set = self.via_set(via);
+        if !opts.bypass_cache {
+            match set.cache.get(name) {
+                Some(CacheHit::Fresh(a)) if a.v6_queried || !want_v6 => {
+                    return Ok(from_cached(&a, Source::Cache { stale: false }, started));
+                }
+                Some(CacheHit::Negative) => return Err(DnsError::EmptyAnswer),
+                _ => {}
+            }
+        }
+        let result = self
+            .query_coalesced(&set.upstreams, name, want_v6, opts)
+            .await;
+        match &result {
+            Ok(a) => set.cache.put(name, cached_from(a, want_v6)),
+            Err(DnsError::EmptyAnswer) => set.cache.put_negative(name),
+            Err(_) => {}
+        }
+        let answers = result?;
+        Ok(from_answers(
+            &answers,
+            Source::Upstream(answers.upstream.clone()),
+            started,
+        ))
+    }
+
+    async fn lookup_inner(
+        &self,
+        host: &str,
+        opts: LookupOpts,
+        via: Option<&Via>,
+    ) -> Result<DnsResult, DnsError> {
         let started = Instant::now();
         let trimmed = host.trim();
         let bare = trimmed.trim_start_matches('[').trim_end_matches(']');
@@ -563,6 +669,17 @@ impl Resolver {
             return self
                 .system_lookup(&candidate, want_v6, Source::System, started, &opts)
                 .await;
+        }
+
+        if let Some(via) = via {
+            if self.encrypted_specs.is_empty() {
+                return self.lookup_on(&current, want_v6, &opts, via, started).await;
+            }
+            if !self.via_unfollowed.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    "dns-follow-interface: the encrypted DNS servers are asked as usual, not through the policy's interface"
+                );
+            }
         }
 
         // Cache. An entry recorded without asking for AAAA cannot answer a
@@ -909,21 +1026,33 @@ impl LazyResolver for Resolver {
     }
 }
 
+/// The addresses of a lookup of `host`, or the error a connector reports.
+fn addresses(host: &str, found: Result<DnsResult, DnsError>) -> io::Result<Vec<IpAddr>> {
+    let addrs = found.map_err(io::Error::other)?.addrs();
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no addresses for {host}"),
+        ));
+    }
+    Ok(addrs)
+}
+
 impl Resolve for Resolver {
     fn resolve<'a>(&'a self, host: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+        Box::pin(async move { addresses(host, self.lookup(host, LookupOpts::default()).await) })
+    }
+
+    fn resolve_via<'a>(
+        &'a self,
+        host: &'a str,
+        via: &'a Via,
+    ) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
         Box::pin(async move {
-            let r = self
-                .lookup(host, LookupOpts::default())
-                .await
-                .map_err(io::Error::other)?;
-            let addrs = r.addrs();
-            if addrs.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("no addresses for {host}"),
-                ));
-            }
-            Ok(addrs)
+            addresses(
+                host,
+                self.lookup_via(host, LookupOpts::default(), via).await,
+            )
         })
     }
 }
@@ -934,8 +1063,11 @@ mod tests {
     use crate::message::Qtype;
     use crate::system::StaticSystemDns;
     use crate::testing::MockDns;
+    use rurge_config::HostName;
     use rurge_config::config::{LoadOptions, from_text};
-    use rurge_net::connector::{DirectConnector, SystemResolve};
+    use rurge_net::connector::{
+        BoxedDatagram, BoxedStream, ConnectOpts, DirectConnector, SystemResolve, Target,
+    };
     use rurge_net::resource::ResourceOptions;
     use std::net::SocketAddr;
     use std::path::PathBuf;
@@ -1641,5 +1773,118 @@ mod tests {
         let delays = r.measure_delay("t.test").await;
         assert_eq!(delays.len(), 1);
         assert!(delays[0].result.is_ok());
+    }
+
+    /// A direct connector that notes where its UDP flows go: the interface
+    /// a `Via` stands for.
+    struct Noting {
+        inner: DirectConnector,
+        udp: Mutex<Vec<Target>>,
+    }
+
+    impl Noting {
+        fn via(key: &str) -> (Via, Arc<Noting>) {
+            let noting = Arc::new(Noting {
+                inner: DirectConnector::new(Arc::new(SystemResolve)),
+                udp: Mutex::new(Vec::new()),
+            });
+            let via = Via {
+                key: key.to_string(),
+                connector: noting.clone(),
+            };
+            (via, noting)
+        }
+
+        fn udp(&self) -> Vec<Target> {
+            self.udp.lock().expect("udp").clone()
+        }
+    }
+
+    impl Connector for Noting {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            self.inner.connect(target, opts)
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            self.udp.lock().expect("udp").push(target.clone());
+            self.inner.connect_udp(target, opts)
+        }
+    }
+
+    /// Lookups through a `Via` ask the plain servers through its connector
+    /// and keep their answers apart; `[Host]` answers them as usual (phase 2
+    /// M5 design 8.5).
+    #[tokio::test]
+    async fn lookups_via_an_interface_go_through_it_with_answers_of_their_own() {
+        let mock = MockDns::spawn().await;
+        mock.set("a.test", &["10.0.0.1"], &[], 60);
+        let e = env(&profile(
+            &format!("dns-server = {}", mock.addr()),
+            "b.test = 10.0.0.9",
+        ));
+        let (r, _) = resolver(&e, StaticSystemDns::default());
+        let (via, noting) = Noting::via("en1");
+
+        let a = r
+            .lookup_via("a.test", LookupOpts::default(), &via)
+            .await
+            .unwrap();
+        assert_eq!(a.v4, vec![v4("10.0.0.1")]);
+        let server = Target::new(HostName::Ip(mock.addr().ip()), mock.addr().port());
+        assert_eq!(noting.udp(), vec![server]);
+        assert_eq!(mock.query_count("a.test", Qtype::A), 1);
+
+        // the lookup through the interface filled no answer of the global one
+        r.lookup("a.test", LookupOpts::default()).await.unwrap();
+        assert_eq!(mock.query_count("a.test", Qtype::A), 2);
+        // and its own answer is kept
+        r.lookup_via("a.test", LookupOpts::default(), &via)
+            .await
+            .unwrap();
+        assert_eq!(mock.query_count("a.test", Qtype::A), 2);
+
+        let b = r
+            .lookup_via("b.test", LookupOpts::default(), &via)
+            .await
+            .unwrap();
+        assert_eq!(b.v4, vec![v4("10.0.0.9")]);
+        assert_eq!(mock.query_count("b.test", Qtype::A), 0);
+        assert_eq!(noting.udp().len(), 1, "one flow carries every question");
+    }
+
+    /// With encrypted DNS configured, a lookup through a `Via` asks the
+    /// encrypted servers as usual, not through its connector (phase 2 M5
+    /// design 8.5).
+    #[tokio::test]
+    async fn with_encrypted_dns_lookups_via_an_interface_go_as_usual() {
+        let udp = MockDns::spawn().await;
+        let tcp = MockDns::spawn().await;
+        udp.set("dns.example", &["127.0.0.1"], &[], 60);
+        tcp.set("a.test", &["10.0.0.42"], &[], 60);
+        let e = env(&profile(
+            &format!(
+                "dns-server = {}\nencrypted-dns-server = tcp://dns.example:{}",
+                udp.addr(),
+                tcp.addr().port()
+            ),
+            "",
+        ));
+        let (r, _) = resolver(&e, StaticSystemDns::default());
+        let (via, noting) = Noting::via("en1");
+        let a = r
+            .lookup_via("a.test", LookupOpts::default(), &via)
+            .await
+            .unwrap();
+        assert_eq!(a.v4, vec![v4("10.0.0.42")]);
+        assert!(noting.udp().is_empty());
+        assert_eq!(tcp.query_count("a.test", Qtype::A), 1);
     }
 }

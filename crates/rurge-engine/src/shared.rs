@@ -2,7 +2,7 @@
 
 use arc_swap::ArcSwapOption;
 use rurge_net::BoxFuture;
-use rurge_net::connector::Resolve;
+use rurge_net::connector::{Resolve, Via};
 use rurge_policy::auto::AutoGroups;
 use rurge_policy::testbook::TestBook;
 use rurge_policy::{EmptyGroup, GroupSelections, RegistryCell, SelectionTable};
@@ -39,6 +39,19 @@ impl Resolve for ResolverCell {
                 return Err(io::Error::other("no resolver is active"));
             };
             current.resolve(host).await
+        })
+    }
+
+    fn resolve_via<'a>(
+        &'a self,
+        host: &'a str,
+        via: &'a Via,
+    ) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+        Box::pin(async move {
+            let Some(current) = self.0.load_full() else {
+                return Err(io::Error::other("no resolver is active"));
+            };
+            current.resolve_via(host, via).await
         })
     }
 }

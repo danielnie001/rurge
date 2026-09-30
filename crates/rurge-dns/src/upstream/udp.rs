@@ -1,15 +1,21 @@
 //! DNS over UDP (design §7.2): one connected socket per upstream, a receive
 //! loop that routes answers to waiters by message ID (so several queries can
 //! be in flight at once), and one retry over TCP when the answer is truncated.
+//! An upstream `via` a connector sends its questions, and the retry, through
+//! it (`dns-follow-interface`, phase 2 M5 design 8.5).
 
 use super::tcp::exchange_framed;
 use super::{Upstream, UpstreamError};
 use crate::message::{wire_id, wire_truncated};
+use rurge_config::HostName;
 use rurge_net::BoxFuture;
+use rurge_net::connector::{BoxedDatagram, BoxedStream, ConnectOpts, Connector, Target};
 use std::collections::HashMap;
+use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::ReadBuf;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{OnceCell, oneshot};
 use tokio::task::JoinHandle;
@@ -25,14 +31,43 @@ pub const UDP_BUFFER: usize = 4096;
 /// already sitting in the socket buffer.
 const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
+/// What the questions go out on: a socket of its own, or a datagram from
+/// the connector the upstream goes `via`.
+enum Socket {
+    Own(UdpSocket),
+    Via(BoxedDatagram),
+}
+
+impl Socket {
+    async fn send(&self, wire: &[u8]) -> std::io::Result<()> {
+        match self {
+            Socket::Own(socket) => socket.send(wire).await.map(|_| ()),
+            Socket::Via(datagram) => poll_fn(|cx| datagram.poll_send(cx, wire)).await.map(|_| ()),
+        }
+    }
+
+    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Socket::Own(socket) => socket.recv(buf).await,
+            Socket::Via(datagram) => {
+                let mut read = ReadBuf::new(buf);
+                poll_fn(|cx| datagram.poll_recv(cx, &mut read)).await?;
+                Ok(read.filled().len())
+            }
+        }
+    }
+}
+
 struct Shared {
-    socket: UdpSocket,
+    socket: Socket,
     pending: Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>,
 }
 
 pub struct UdpUpstream {
     name: String,
     addr: SocketAddr,
+    /// What the questions go through, instead of a socket of its own.
+    via: Option<Arc<dyn Connector>>,
     state: OnceCell<(Arc<Shared>, JoinHandle<()>)>,
 }
 
@@ -45,8 +80,25 @@ impl UdpUpstream {
         UdpUpstream {
             name: format!("udp://{addr}"),
             addr,
+            via: None,
             state: OnceCell::new(),
         }
+    }
+
+    /// The server at `addr`, asked through `connector`; `key` (an
+    /// interface's name) sets its name apart from the upstream asked
+    /// directly.
+    pub fn via(addr: SocketAddr, key: &str, connector: Arc<dyn Connector>) -> UdpUpstream {
+        UdpUpstream {
+            name: format!("udp://{addr} via {key}"),
+            addr,
+            via: Some(connector),
+            state: OnceCell::new(),
+        }
+    }
+
+    fn target(&self) -> Target {
+        Target::new(HostName::Ip(self.addr.ip()), self.addr.port())
     }
 
     async fn shared(&self) -> Result<Arc<Shared>, UpstreamError> {
@@ -58,8 +110,19 @@ impl UdpUpstream {
                 } else {
                     "[::]:0".parse().expect("valid")
                 };
-                let socket = UdpSocket::bind(bind).await.map_err(io_err)?;
-                socket.connect(self.addr).await.map_err(io_err)?;
+                let socket = match &self.via {
+                    None => {
+                        let socket = UdpSocket::bind(bind).await.map_err(io_err)?;
+                        socket.connect(self.addr).await.map_err(io_err)?;
+                        Socket::Own(socket)
+                    }
+                    Some(connector) => Socket::Via(
+                        connector
+                            .connect_udp(&self.target(), &ConnectOpts::default())
+                            .await
+                            .map_err(io_err)?,
+                    ),
+                };
                 let shared = Arc::new(Shared {
                     socket,
                     pending: Mutex::new(HashMap::new()),
@@ -151,12 +214,24 @@ impl Upstream for UdpUpstream {
                 return Ok(resp);
             }
             // Truncated: repeat the same query once over TCP to the same server.
-            let mut tcp =
-                match tokio::time::timeout_at(deadline, TcpStream::connect(self.addr)).await {
-                    Ok(Ok(s)) => s,
-                    Ok(Err(e)) => return Err(io_err(e)),
-                    Err(_) => return Err(UpstreamError::Timeout),
-                };
+            let connecting = async {
+                match &self.via {
+                    None => TcpStream::connect(self.addr)
+                        .await
+                        .map(|s| Box::new(s) as BoxedStream),
+                    Some(connector) => {
+                        let timeout = deadline.saturating_duration_since(Instant::now());
+                        connector
+                            .connect(&self.target(), &ConnectOpts { timeout })
+                            .await
+                    }
+                }
+            };
+            let mut tcp = match tokio::time::timeout_at(deadline, connecting).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => return Err(io_err(e)),
+                Err(_) => return Err(UpstreamError::Timeout),
+            };
             exchange_framed(&mut tcp, wire, deadline).await
         })
     }

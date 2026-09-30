@@ -115,7 +115,16 @@ pub(crate) fn read_common(
         }
     }
     let allow_other_interface = r.bool("allow-other-interface").unwrap_or(false);
-    let dns_follow_interface = r.bool("dns-follow-interface").unwrap_or(false);
+    let mut dns_follow_interface = r.bool("dns-follow-interface").unwrap_or(false);
+    // it moves the policy's lookups onto its interface: without one there
+    // is nothing to move them to (phase 2 M5 design 8.5)
+    if dns_follow_interface && interface.is_none() {
+        r.warn(
+            codes::W_PARAM_NOT_APPLICABLE,
+            "`dns-follow-interface` has no effect without `interface`; ignored".to_string(),
+        );
+        dns_follow_interface = false;
+    }
     let mut no_error_alert = r.bool("no-error-alert").unwrap_or(false);
     let ip_version = r.choice("ip-version", &IP_VERSIONS).unwrap_or_default();
     let tfo = r.bool("tfo").unwrap_or(false);
@@ -180,7 +189,6 @@ pub(crate) fn read_common(
     }
     if applies != Applies::Reject {
         let inert = [
-            ("dns-follow-interface", dns_follow_interface),
             ("tfo", tfo),
             ("ecn", ecn_present && applies == Applies::Proxy),
         ];
@@ -258,8 +266,23 @@ mod tests {
                 underlying_proxy: Some("Entry".into()),
             }
         );
-        assert_eq!(notes.inert, ["dns-follow-interface", "tfo", "ecn"]);
+        assert_eq!(notes.inert, ["tfo", "ecn"]);
         assert_eq!(notes.ios_only, ["hybrid"]);
+    }
+
+    /// `dns-follow-interface` follows the policy's `interface`: written
+    /// without one, it says so and does nothing.
+    #[test]
+    fn dns_follow_interface_without_an_interface_is_ignored() {
+        let (c, notes, diags) = read("http, h, 1, dns-follow-interface=true", Applies::Proxy);
+        assert!(!c.dns_follow_interface);
+        assert!(notes.inert.is_empty());
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code, codes::W_PARAM_NOT_APPLICABLE);
+        assert_eq!(
+            diags[0].message,
+            "policy `P`: `dns-follow-interface` has no effect without `interface`; ignored"
+        );
     }
 
     #[test]

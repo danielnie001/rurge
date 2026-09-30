@@ -133,6 +133,45 @@ fn no_udp() -> io::Error {
 
 pub trait Resolve: Send + Sync {
     fn resolve<'a>(&'a self, host: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>>;
+
+    /// `host`'s addresses, the questions leaving the way `via` says (a
+    /// policy's `interface` with `dns-follow-interface`, phase 2 M5 design
+    /// 8.5). A resolver that sends no questions of its own resolves as
+    /// usual.
+    fn resolve_via<'a>(
+        &'a self,
+        host: &'a str,
+        via: &'a Via,
+    ) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+        let _ = via;
+        self.resolve(host)
+    }
+}
+
+/// How a lookup's DNS questions leave: through `connector`, their answers
+/// kept apart from the others' under `key` (an interface's name).
+#[derive(Clone)]
+pub struct Via {
+    pub key: String,
+    pub connector: Arc<dyn Connector>,
+}
+
+/// `inner`, every lookup of it through `via`.
+pub struct ResolveVia {
+    inner: Arc<dyn Resolve>,
+    via: Via,
+}
+
+impl ResolveVia {
+    pub fn new(inner: Arc<dyn Resolve>, via: Via) -> ResolveVia {
+        ResolveVia { inner, via }
+    }
+}
+
+impl Resolve for ResolveVia {
+    fn resolve<'a>(&'a self, host: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+        self.inner.resolve_via(host, &self.via)
+    }
 }
 
 /// The operating system resolver (`getaddrinfo` through tokio).
