@@ -483,7 +483,7 @@ mod tests {
         b.set_policy_chain(vec![
             "Pick".into(),
             "HK".into(),
-            "!unsupported:ss".into(),
+            "!unsupported:hysteria2".into(),
             "REJECT".into(),
         ]);
         b.add_up(7);

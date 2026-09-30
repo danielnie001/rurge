@@ -14,6 +14,7 @@ use rurge_proto::anytls::AnyTlsOutbound;
 use rurge_proto::build::server_of;
 use rurge_proto::external::{ExternalOutbound, NoProcessGroups, ProcessHook};
 use rurge_proto::http::HttpOutbound;
+use rurge_proto::shadowsocks::ShadowsocksOutbound;
 use rurge_proto::socks5::Socks5Outbound;
 use rurge_proto::trojan::TrojanOutbound;
 use rurge_proto::vmess::VmessOutbound;
@@ -254,13 +255,14 @@ impl OutboundFactory for EngineFactory {
                         spec.common.underlying_proxy
                     )),
             ),
-            // the loader makes no spec of an `ss` line before M6a task 6
-            ProtoSpec::Ss(_) => {
-                return Err(BuildError::new(format!(
-                    "policy `{}`: `ss` is not implemented yet",
-                    spec.name
-                )));
-            }
+            ProtoSpec::Ss(ss) => Arc::new(ShadowsocksOutbound::new(
+                &spec.name,
+                server_of(spec)?,
+                ss,
+                spec.shadow_tls.as_ref(),
+                self.roots.clone(),
+                connector,
+            )?),
             // nothing starts here: the program starts on the first dial
             ProtoSpec::External(external) => {
                 let outbound = ExternalOutbound::new(
@@ -329,7 +331,7 @@ pub fn load_checked(path: &Path, opts: &LoadOptions) -> Result<Loaded, LoadError
 mod tests {
     use super::*;
     use rurge_config::config::{LoadOptions, from_text};
-    use rurge_config::diagnostic::codes;
+    use rurge_config::diagnostic::{Severity, codes};
     use rurge_net::connector::{ConnectOpts, Target};
     use rurge_net::socket::NoopSocketHook;
     use rurge_proto::testing::{FakeSocks5, Socks5Script, echo_server};
@@ -372,6 +374,9 @@ T = trojan, proxy.test, 443, password=pw, ws=true, ws-path=/x\n\
 V = vmess, proxy.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119, vmess-aead=true, tls=true, ws=true\n\
 A = anytls, proxy.test, 443, password=pw\n\
 SSH = ssh, proxy.test, 22, username=u, password=pw\n\
+SS = ss, proxy.test, 8388, encrypt-method=aes-128-gcm, password=pw, obfs=http, udp-relay=true\n\
+SK = ss, proxy.test, 8388, encrypt-method=2022-blake3-aes-128-gcm, password=MDEyMzQ1Njc4OWFiY2RlZg==:MDEyMzQ1Njc4OWFiY2RlZg==, shadow-tls-password=st\n\
+SN = ss, proxy.test, 8388, encrypt-method=none\n\
 Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule]\nFINAL,DIRECT\n",
         );
         let f = factory(&cfg);
@@ -384,6 +389,9 @@ Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule
             ("V", "V"),
             ("A", "A"),
             ("SSH", "SSH"),
+            ("SS", "SS"),
+            ("SK", "SK"),
+            ("SN", "SN"),
             ("Corp", "DIRECT"),
         ] {
             let spec = cfg
@@ -442,6 +450,43 @@ A = anytls, proxy.test, 443, password=s3same0pen, client-cert=cert1\n\
                 "policy `S` cannot be built: keystore item `key1` is protected by a passphrase, which rurge cannot use; remove the passphrase"
             ]
         );
+    }
+
+    /// A sound `ss` line passes the dry build; an SS 2022 key of the wrong
+    /// length is already a load error at its line, never quoted (phase 2 M6
+    /// design 3.1).
+    #[test]
+    fn an_ss_policy_passes_the_dry_build_and_a_bad_2022_key_fails_the_load() {
+        let cfg = config(
+            "[Proxy]\nS = ss, proxy.test, 8388, encrypt-method=2022-blake3-aes-256-gcm, \
+password=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=, obfs=tls, udp-relay=true, udp-port=8389\n\
+[Rule]\nFINAL,DIRECT\n",
+        );
+        assert!(dry_build(&cfg).is_empty());
+        let loaded = from_text(
+            "[Proxy]\nS = ss, proxy.test, 8388, encrypt-method=2022-blake3-aes-256-gcm, \
+password=MDEyMzQ1Njc4OWFiY2RlZg==\n[Rule]\nFINAL,DIRECT\n",
+            Path::new("t.conf"),
+            &LoadOptions::for_tests(),
+        );
+        let errors: Vec<(&str, u32, &str)> = loaded
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| {
+                let line = d.span.as_ref().map(|s| s.line).unwrap_or(0);
+                (d.code, line, d.message.as_str())
+            })
+            .collect();
+        assert_eq!(
+            errors,
+            [(
+                codes::E_INVALID_POLICY_PARAM,
+                2,
+                "policy `S`: key #1 of `password` is not a Base64 key of 32 bytes, as `2022-blake3-aes-256-gcm` requires"
+            )]
+        );
+        assert!(loaded.config.spec("S").is_none());
     }
 
     #[test]

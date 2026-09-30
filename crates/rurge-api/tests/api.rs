@@ -107,13 +107,13 @@ impl Api {
     }
 }
 
-/// The binary does not declare Shadowsocks (yet), so dropping it from the
+/// The binary does not declare Hysteria 2 (yet), so dropping it from the
 /// test capabilities yields the load-time W0007 warning the tests look for.
 fn load_options() -> LoadOptions {
     let mut opts = LoadOptions::for_tests();
     opts.capabilities
         .policy_kinds
-        .remove(&rurge_config::PolicyKind::Shadowsocks);
+        .remove(&rurge_config::PolicyKind::Hysteria2);
     opts
 }
 
@@ -140,7 +140,7 @@ async fn api_in(rules: &str, groups: &str) -> Api {
     let profile = format!(
         "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\ndns-server = {}\nipv6 = false\n\
 internet-test-url = http://target.test:{}/hello\nproxy-test-url = http://127.0.0.1:9/\n\
-[Proxy]\nHK = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\nBlock = reject-tinygif\n\
+[Proxy]\nHK = hysteria2, 1.2.3.4, 443, password=x\nBlock = reject-tinygif\n\
 [Proxy Group]\nPick = select, HK, DIRECT\n{groups}\n\
 [Rule]\n{rules}\nDOMAIN,ads.test,REJECT\nFINAL,DIRECT\n",
         dns.addr(),
@@ -814,7 +814,7 @@ async fn profiles_current_check_and_reload() {
     assert_eq!(body["errors"], 0);
     assert!(
         body["warnings"].as_u64().unwrap() >= 1,
-        "W0007 for the unsupported ss policy: {body}"
+        "W0007 for the unsupported hysteria2 policy: {body}"
     );
     assert!(
         body["diagnostics"]
@@ -872,7 +872,7 @@ async fn policy_groups_are_listed_and_a_policy_detail_is_redacted() {
     let members = body["Pick"].as_array().expect("the group's members");
     assert_eq!(members.len(), 2);
     assert_eq!(members[0]["name"], "HK");
-    assert_eq!(members[0]["typeDescription"], "ss");
+    assert_eq!(members[0]["typeDescription"], "hysteria2");
     assert_eq!(members[0]["isGroup"], false);
     assert_eq!(members[0]["enabled"], true);
     let hash = members[0]["lineHash"].as_str().unwrap();
@@ -886,7 +886,7 @@ async fn policy_groups_are_listed_and_a_policy_detail_is_redacted() {
     let (status, body) = get(&api, "/v1/policies/detail?policy_name=HK").await;
     assert_eq!(status, 200);
     let detail = body["HK"].as_str().expect("the definition");
-    assert!(detail.starts_with("ss, 1.2.3.4, 8388"), "{detail}");
+    assert!(detail.starts_with("hysteria2, 1.2.3.4, 443"), "{detail}");
     assert!(
         detail.contains("***") && !detail.contains("password=x"),
         "{detail}"

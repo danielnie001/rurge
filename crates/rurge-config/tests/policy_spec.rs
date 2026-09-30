@@ -22,7 +22,7 @@ fn codes_of(loaded: &Loaded, severity: Severity) -> Vec<&'static str> {
 #[test]
 fn specs_are_stored_in_proxy_order() {
     let loaded = load(
-        "A = http, a.example, 80, ip-version=v6-only\nSS = ss, s.example, 8388, encrypt-method=aes-128-gcm, password=x\nB = socks5, b.example, 1080\nC = direct, interface=eth0",
+        "A = http, a.example, 80, ip-version=v6-only\nHy = hysteria2, h.example, 443, password=x\nB = socks5, b.example, 1080\nC = direct, interface=eth0",
         "",
     );
     assert!(!loaded.diagnostics.has_errors(), "{:?}", loaded.diagnostics);
@@ -32,7 +32,7 @@ fn specs_are_stored_in_proxy_order() {
         .iter()
         .map(|s| s.name.as_str())
         .collect();
-    assert_eq!(names, ["A", "B", "C"], "ss has no spec yet");
+    assert_eq!(names, ["A", "B", "C"], "hysteria2 has no spec yet");
     assert_eq!(
         loaded.config.spec("A").unwrap().common.ip_version,
         IpVersion::V6Only
@@ -41,7 +41,7 @@ fn specs_are_stored_in_proxy_order() {
         loaded.config.spec("B").unwrap().proto,
         ProtoSpec::Socks5(_)
     ));
-    assert!(loaded.config.spec("SS").is_none() && loaded.config.spec("nope").is_none());
+    assert!(loaded.config.spec("Hy").is_none() && loaded.config.spec("nope").is_none());
 }
 
 #[test]

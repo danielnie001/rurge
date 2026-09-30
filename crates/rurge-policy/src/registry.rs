@@ -1270,7 +1270,7 @@ mod tests {
     use std::path::Path;
 
     const PROFILE: &str = "[General]\nloglevel = notify\n[Proxy]\n\
-HK = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n\
+HK = hysteria2, 1.2.3.4, 443, password=x\n\
 D = direct\nCorp = direct, interface=eth9\nBlock = reject-tinygif\n\
 EntryA = socks5, a.example, 1080\nEntryB = socks5, b.example, 1080\n\
 Exit = http, exit.example, 8080, underlying-proxy=Hop\n\
@@ -1395,13 +1395,13 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
     fn unsupported_protocols_and_devices_reject_with_a_note() {
         let reg = built(GroupSelections::new()).registry;
         let hk = reg.resolve(&PolicyRef::parse("HK"));
-        assert_eq!(chain(&hk), vec!["HK", "!unsupported:ss", "REJECT"]);
+        assert_eq!(chain(&hk), vec!["HK", "!unsupported:hysteria2", "REJECT"]);
         assert_eq!(
             (hk.outbound.name(), hk.terminal, hk.note.clone()),
             (
                 "REJECT",
                 TerminalKind::Reject,
-                Some(Note::Unsupported("ss".into()))
+                Some(Note::Unsupported("hysteria2".into()))
             )
         );
         let dev = reg.resolve(&PolicyRef::parse("DEVICE:Living Room"));
@@ -1416,11 +1416,11 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
         // chain, whichever kind of group it is
         assert_eq!(
             chain(&reg.resolve(&PolicyRef::parse("Pick"))),
-            vec!["Pick", "HK", "!unsupported:ss", "REJECT"]
+            vec!["Pick", "HK", "!unsupported:hysteria2", "REJECT"]
         );
         assert_eq!(
             chain(&reg.resolve(&PolicyRef::parse("Auto"))),
-            vec!["Auto", "HK", "!unsupported:ss", "REJECT"]
+            vec!["Auto", "HK", "!unsupported:hysteria2", "REJECT"]
         );
     }
 
@@ -1437,8 +1437,9 @@ Stream = ss, 1.2.3.4, 8388, encrypt-method=rc4-md5, password=x\n[Rule]\nFINAL,DI
             Some(Note::Unsupported("vmess (legacy handshake)".into()))
         );
         assert_eq!(chain(&old), ["Old", "!unsupported:vmess", "REJECT"]);
+        // an AEAD `ss` is a proxy; only a stream cipher is not implemented
         let ss = registry.resolve(&PolicyRef::parse("SS"));
-        assert_eq!(ss.note, Some(Note::Unsupported("ss".into())));
+        assert_eq!((ss.terminal, ss.note), (TerminalKind::Proxy, None));
         let stream = registry.resolve(&PolicyRef::parse("Stream"));
         assert_eq!(stream.terminal, TerminalKind::Reject);
         assert_eq!(
@@ -2437,7 +2438,7 @@ Only = smart, Sel, DIRECT, D\nE = smart, A, B, evaluate-before-use=true\nOuter =
     }
 
     const SMART_UNSUPPORTED: &str = "[General]\nproxy-test-url = http://127.0.0.1:9/\ninternet-test-url = http://127.0.0.1:9/\n\
-[Proxy]\nU = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\nA = http, a.example, 80\nB = http, b.example, 80\n\
+[Proxy]\nU = hysteria2, 1.2.3.4, 443, password=x\nA = http, a.example, 80\nB = http, b.example, 80\n\
 [Proxy Group]\nS = smart, U, A, B\nOnlyU = smart, U\n[Rule]\nFINAL,S\n";
 
     /// A member whose protocol is not implemented yet never works: it is no
@@ -2462,7 +2463,10 @@ Only = smart, Sel, DIRECT, D\nE = smart, A, B, evaluate-before-use=true\nOuter =
         assert!(pick.member == "A" || pick.member == "B", "{pick:?}");
         assert!(!pick.retry.contains(&"U".to_string()), "{pick:?}");
         let only = reg.resolve(&PolicyRef::parse("OnlyU"));
-        assert_eq!(only.chain, ["OnlyU", "U", "!unsupported:ss", "REJECT"]);
+        assert_eq!(
+            only.chain,
+            ["OnlyU", "U", "!unsupported:hysteria2", "REJECT"]
+        );
         assert_eq!(only.smart, None);
     }
 
@@ -2511,9 +2515,7 @@ Only = smart, Sel, DIRECT, D\nE = smart, A, B, evaluate-before-use=true\nOuter =
         );
         let unsupported: Vec<String> = (0..ROUND_SAMPLE / 2 + 1).map(|i| format!("U{i}")).collect();
         for name in &unsupported {
-            profile += &format!(
-                "{name} = ss, {name}.example, 8388, encrypt-method=aes-128-gcm, password=x\n"
-            );
+            profile += &format!("{name} = hysteria2, {name}.example, 443, password=x\n");
         }
         let names: Vec<String> = (0..ROUND_SAMPLE + 5).map(|i| format!("P{i}")).collect();
         for name in &names {

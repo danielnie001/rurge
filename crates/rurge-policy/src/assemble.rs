@@ -1040,13 +1040,13 @@ G3 = select, policy-path=https://sub.test/b",
                 &[(
                     "G",
                     "Bad = http, b.test, 80, tos=999\nUp = http, u.test, 80, underlying-proxy=Nowhere\n\
-SS = ss, s.test, 8388, encrypt-method=aes-128-gcm, password=pw\n\
+Hy = hysteria2, h.test, 443, password=pw\n\
 Rc = ss, r.test, 8388, encrypt-method=rc4, password=pw\n\
 Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = http, g.test, 80",
                 )],
             ),
         );
-        assert_eq!(members(&a, "G"), ["SS", "Rc", "Old", "Good"]);
+        assert_eq!(members(&a, "G"), ["Hy", "Rc", "Old", "Good"]);
         let specs: Vec<bool> = a.imported.iter().map(|i| i.spec.is_some()).collect();
         assert_eq!(specs, [false, false, false, true]);
         let why: Vec<Option<NotImplemented>> = a
@@ -1076,7 +1076,7 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
                 ),
                 (
                     codes::W_PROTOCOL_NOT_IMPLEMENTED,
-                    "policy group `G`: imported policies of type `ss` are not implemented in this version; they behave as REJECT".to_string()
+                    "policy group `G`: imported policies of type `hysteria2` are not implemented in this version; they behave as REJECT".to_string()
                 ),
                 (
                     codes::W_PROTOCOL_NOT_IMPLEMENTED,
@@ -1379,9 +1379,9 @@ Fine = http, f.test, 80",
     fn every_proxy_member_is_chained_through_the_group_relay() {
         let cfg = profile(
             "Relay = http, r.test, 80\nHop = http, h.test, 80\nA = http, a.test, 80, underlying-proxy=Hop\n\
-Corp = direct, interface=eth9\nBlock = reject\nSS = ss, s.test, 8388, encrypt-method=aes-128-gcm, password=pw",
+Corp = direct, interface=eth9\nBlock = reject\nHy = hysteria2, h.test, 443, password=pw",
             "Inner = select, A\n\
-G = select, A, Corp, Block, DIRECT, Inner, SS, policy-path=https://sub.test/g, underlying-proxy=Relay",
+G = select, A, Corp, Block, DIRECT, Inner, Hy, policy-path=https://sub.test/g, underlying-proxy=Relay",
         );
         let a = assemble(&cfg, &snapshots(&cfg, &[("G", "N = http, n.test, 80")]));
         assert_eq!(
@@ -1392,7 +1392,7 @@ G = select, A, Corp, Block, DIRECT, Inner, SS, policy-path=https://sub.test/g, u
                 "Block",
                 "DIRECT",
                 "Inner",
-                "SS",
+                "Hy",
                 "N (via Relay)"
             ]
         );

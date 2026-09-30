@@ -2,7 +2,8 @@
 //! policies, the HTTP / SOCKS5 proxy family (phase 2 M1), `trojan`
 //! (phase 2 M2a), `vmess` with the AEAD handshake and `anytls` (phase 2
 //! M2b), `ssh` (phase 2 M4a), `wireguard` (phase 2 M4b), `external`
-//! (phase 2 M4c), `select` groups, `url-test` / `fallback` /
+//! (phase 2 M4c), `ss` with the AEAD, `none` and 2022 methods (phase 2
+//! M6a), `select` groups, `url-test` / `fallback` /
 //! `load-balance` groups (phase 2 M3b), and `smart` groups (phase 2 M3c).
 
 use rurge_config::config::Capabilities;
@@ -40,6 +41,7 @@ pub fn current() -> Capabilities {
             PolicyKind::Ssh,
             PolicyKind::WireGuard,
             PolicyKind::External,
+            PolicyKind::Shadowsocks,
         ]),
         group_kinds: HashSet::from([
             GroupKind::Select,

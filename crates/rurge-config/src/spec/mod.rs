@@ -359,11 +359,7 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     }
     let failed = r.has_errors();
     let diagnostics = r.finish();
-    // `ss` is read and checked in full, but the engine builds it only from
-    // M6a task 6 on: until then a valid line has no spec either (the
-    // capability table's `W0007`, REJECT at run time)
-    let built = policy.kind != PolicyKind::Shadowsocks;
-    let spec = (!failed && built && not_implemented.is_none()).then(|| PolicySpec {
+    let spec = (!failed && not_implemented.is_none()).then(|| PolicySpec {
         name: policy.name.clone(),
         kind: policy.kind,
         server: policy.server.clone(),
@@ -676,6 +672,7 @@ mod tests {
             "trojan, h.test, 443, password=p",
             "vmess, h.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119, vmess-aead=true",
             "anytls, h.test, 443, password=p",
+            "ss, h.test, 8388, encrypt-method=aes-128-gcm, password=p",
         ] {
             let o = outcome(
                 "P",
@@ -799,8 +796,8 @@ mod tests {
         assert_eq!(o.diagnostics.len(), 1);
     }
 
-    /// An `ss` line is read and checked in full; it has no spec until the
-    /// engine builds `ss` (M6a task 6), and a stream cipher says why.
+    /// An `ss` line is read and checked in full; a stream cipher has no
+    /// spec and says why.
     #[test]
     fn an_ss_line_is_checked_and_a_stream_cipher_is_not_implemented() {
         let o = outcome(
@@ -810,7 +807,16 @@ mod tests {
         assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
         assert!(o.inert.is_empty(), "{:?}", o.inert);
         assert_eq!(o.not_implemented, None);
-        assert!(o.spec.is_none());
+        let spec = o.spec.expect("an AEAD line has a spec");
+        let ProtoSpec::Ss(ss) = &spec.proto else {
+            panic!("{:?}", spec.proto)
+        };
+        assert_eq!(
+            (ss.method, ss.udp_relay, ss.udp_port),
+            (SsMethod::Aes128Gcm, true, Some(8389))
+        );
+        assert_eq!(ss.obfs.as_ref().map(|o| o.mode), Some(ObfsMode::Tls));
+        assert!(spec.shadow_tls.is_some());
 
         let o = outcome("S", "ss, h.test, 8388, encrypt-method=RC4-MD5, password=pw");
         assert!(o.spec.is_none() && o.diagnostics.is_empty());

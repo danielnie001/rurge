@@ -131,7 +131,7 @@ fn check_json_and_platform() {
     );
 }
 
-const PROXIES: &str = "[General]\n[Proxy]\nH = http, proxy.test, 8080\nS = socks5-tls, proxy.test, 443\nOld = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Rule]\nFINAL,DIRECT\n";
+const PROXIES: &str = "[General]\n[Proxy]\nH = http, proxy.test, 8080\nS = socks5-tls, proxy.test, 443\nOld = hysteria2, 1.2.3.4, 443, password=x\n[Rule]\nFINAL,DIRECT\n";
 const BROKEN_P12: &str = "[General]\n[Proxy]\nUp = https, proxy.test, 443, client-cert=cert1\n[Keystore]\ncert1 = type=p12, base64=QUJD, password=hunter2\n[Rule]\nFINAL,DIRECT\n";
 
 #[test]
@@ -151,7 +151,7 @@ fn check_knows_the_m1_protocols_and_runs_the_dry_build() {
     // (W0007 is deduped per protocol kind and names the kind, not the
     // policy, matching `W_GROUP_NOT_IMPLEMENTED`'s established wording)
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
-    assert!(out.contains("`ss`"), "{out}");
+    assert!(out.contains("`hysteria2`"), "{out}");
 
     Command::cargo_bin("rurge")
         .unwrap()
@@ -191,7 +191,7 @@ fn check_knows_the_automatic_groups() {
     assert!(!out.contains("W0029"), "{out}");
 }
 
-const TROJAN: &str = "[General]\n[Proxy]\nT = trojan, proxy.test, 443, password=s3same, ws=true, ws-path=/w\nOld = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Rule]\nFINAL,DIRECT\n";
+const TROJAN: &str = "[General]\n[Proxy]\nT = trojan, proxy.test, 443, password=s3same, ws=true, ws-path=/w\nOld = hysteria2, 1.2.3.4, 443, password=x\n[Rule]\nFINAL,DIRECT\n";
 const TROJAN_BAD_PATH: &str = "[General]\n[Proxy]\nT = trojan, proxy.test, 443, password=s3same, ws=true, ws-path=s3cretpath\n[Rule]\nFINAL,DIRECT\n";
 
 #[test]
@@ -207,9 +207,12 @@ fn check_knows_trojan() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `ss` is still a later milestone; `trojan` is not
+    // `hysteria2` is still a later milestone; `trojan` is not
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
-    assert!(out.contains("`ss`") && !out.contains("`trojan`"), "{out}");
+    assert!(
+        out.contains("`hysteria2`") && !out.contains("`trojan`"),
+        "{out}"
+    );
 
     Command::cargo_bin("rurge")
         .unwrap()
@@ -266,7 +269,7 @@ fn check_knows_vmess_and_anytls() {
 
 const SSH: &str = "[General]\n[Proxy]\n\
 S = ssh, proxy.test, 22, username=u, password=s3same, idle-timeout=60\n\
-Old = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Rule]\nFINAL,DIRECT\n";
+Old = hysteria2, 1.2.3.4, 443, password=x\n[Rule]\nFINAL,DIRECT\n";
 const SSH_BAD_KEY: &str = "[General]\n[Proxy]\nS = ssh, proxy.test, 22, username=u, private-key=key1\n\
 [Keystore]\nkey1 = type=openssh-private-key, base64=c2VjcmV0IGtleSBtYXRlcmlhbA==\n[Rule]\nFINAL,DIRECT\n";
 
@@ -285,9 +288,12 @@ fn check_knows_ssh() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `ss` is still a later milestone; `ssh` is not
+    // `hysteria2` is still a later milestone; `ssh` is not
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
-    assert!(out.contains("`ss`") && !out.contains("`ssh`"), "{out}");
+    assert!(
+        out.contains("`hysteria2`") && !out.contains("`ssh`"),
+        "{out}"
+    );
     assert!(!out.contains("s3same"), "{out}");
 
     Command::cargo_bin("rurge")
@@ -305,7 +311,7 @@ fn check_knows_ssh() {
 }
 
 const WIREGUARD: &str = "[General]\n[Proxy]\nW = wireguard, section-name=home\n\
-Old = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Rule]\nFINAL,DIRECT\n\
+Old = hysteria2, 1.2.3.4, 443, password=x\n[Rule]\nFINAL,DIRECT\n\
 [WireGuard home]\nprivate-key = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=\nself-ip = 10.9.0.2\n\
 peer = (public-key = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=, allowed-ips = 0.0.0.0/0, endpoint = vpn.test:51820)\n";
 const WIREGUARD_BAD_KEY: &str = "[General]\n[Proxy]\nW = wireguard, section-name=home\n[Rule]\nFINAL,DIRECT\n\
@@ -327,10 +333,10 @@ fn check_knows_wireguard() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `ss` is still a later milestone; `wireguard` is not
+    // `hysteria2` is still a later milestone; `wireguard` is not
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
     assert!(
-        out.contains("`ss`") && !out.contains("`wireguard`"),
+        out.contains("`hysteria2`") && !out.contains("`wireguard`"),
         "{out}"
     );
     assert!(!out.contains("yAnz5TF"), "{out}");
@@ -354,7 +360,7 @@ fn check_knows_wireguard() {
 
 const EXTERNAL: &str = "[General]\n[Proxy]\n\
 X = external, exec = \"/usr/bin/sshpass\", args = -p, args = hunter2, args = ssh, local-port = 1080\n\
-Old = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n[Rule]\nFINAL,DIRECT\n";
+Old = hysteria2, 1.2.3.4, 443, password=x\n[Rule]\nFINAL,DIRECT\n";
 const EXTERNAL_SAME_PORT: &str = "[General]\n[Proxy]\n\
 X = external, exec = /bin/x, local-port = 1080\nY = external, exec = /bin/y, local-port = 1080\n\
 [Rule]\nFINAL,DIRECT\n";
@@ -374,9 +380,12 @@ fn check_knows_external() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `ss` is still a later milestone; `external` is not
+    // `hysteria2` is still a later milestone; `external` is not
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
-    assert!(out.contains("`ss`") && !out.contains("`external`"), "{out}");
+    assert!(
+        out.contains("`hysteria2`") && !out.contains("`external`"),
+        "{out}"
+    );
     assert!(!out.contains("hunter2"), "{out}");
 
     Command::cargo_bin("rurge")
@@ -388,6 +397,52 @@ fn check_knows_external() {
         .stdout(predicate::str::contains(
             "same.conf:4: policy `Y`: `local-port` 1080 is also the `local-port` of policy `X`",
         ));
+}
+
+const SS: &str = "[General]\n[Proxy]\n\
+A = ss, proxy.test, 8388, encrypt-method=chacha20-ietf-poly1305, password=s3same, obfs=http\n\
+K = ss, proxy.test, 8388, encrypt-method=2022-blake3-aes-128-gcm, password=MDEyMzQ1Njc4OWFiY2RlZg==, udp-relay=true\n\
+Rc1 = ss, proxy.test, 8388, encrypt-method=rc4-md5, password=s3same\n\
+Rc2 = ss, proxy.test, 8388, encrypt-method=rc4-md5, password=s3same\n[Rule]\nFINAL,DIRECT\n";
+const SS_BAD_KEY: &str = "[General]\n[Proxy]\n\
+K = ss, proxy.test, 8388, encrypt-method=2022-blake3-aes-128-gcm, password=c2VjcmV0IGtleSBtYXRlcmlhbA==\n\
+[Rule]\nFINAL,DIRECT\n";
+
+/// `rurge check` knows `ss` (phase 2 M6 design 6): only a stream cipher is
+/// still "not implemented", once however many lines use it; an SS 2022 key
+/// of the wrong length is an error, named and not quoted (design 3.1).
+#[test]
+fn check_knows_ss() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "ss.conf", SS))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    assert_eq!(out.matches("W0007").count(), 1, "{out}");
+    assert!(
+        out.contains("ss.conf:5") && out.contains("`ss` stream cipher `rc4-md5`"),
+        "{out}"
+    );
+    assert!(!out.contains("policy type `ss`"), "{out}");
+    assert!(!out.contains("s3same") && !out.contains("MDEyMz"), "{out}");
+
+    Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "bad.conf", SS_BAD_KEY))
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("E0018"))
+        .stdout(predicate::str::contains(
+            "bad.conf:3: policy `K`: key #1 of `password` is not a Base64 key of 16 bytes, as `2022-blake3-aes-128-gcm` requires",
+        ))
+        .stdout(predicate::str::contains("c2VjcmV0").not());
 }
 
 const SUBSCRIBED: &str = "[General]\n[Proxy Group]\nLocal = select, DIRECT, policy-path=nodes.txt\n\
