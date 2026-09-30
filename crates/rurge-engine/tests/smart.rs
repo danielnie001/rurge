@@ -357,3 +357,99 @@ async fn a_reload_forgets_what_the_book_knew_of_the_policies_it_drops() {
         rurge_policy::smart::Health::Unknown { failures: 0 }
     );
 }
+
+/// A `smart` group over UDP members (`socks5` with `udp-relay`), for the
+/// flows to the loopback.
+async fn udp_smart(members: &str, proxies: &str) -> Harness {
+    harness(Profile {
+        proxies,
+        groups: &format!("S = smart, {members}"),
+        rules: "IP-CIDR,127.0.0.1/32,S,no-resolve",
+        ..Profile::default()
+    })
+    .await
+}
+
+/// A UDP flow's first answer is the member's sample, and the member worked
+/// at the site (phase 2 M5 design 8.3).
+#[tokio::test]
+async fn a_udp_answer_is_reported() {
+    let good = FakeSocks5::spawn(Socks5Script::default()).await;
+    let proxies = format!(
+        "Good = socks5, 127.0.0.1, {}, udp-relay=true",
+        good.addr().port()
+    );
+    let h = udp_smart("Good", &proxies).await;
+    let (echo, _) = udp_echo().await;
+    let association = udp_associate(h.socks()).await;
+    association.send("127.0.0.1", echo.port(), b"hi").await;
+    assert_eq!(association.recv().await, (echo, b"hi".to_vec()));
+    let registry = h.engine.registry();
+    let smart = &registry.auto().smart;
+    wait_until("the report of the answer", || {
+        smart.site("127.0.0.1", Instant::now()).worked == ["Good"]
+    })
+    .await;
+    let good = outbound_now(&h, "Good");
+    assert!(matches!(
+        smart.health("Good", &good, Instant::now()),
+        rurge_policy::smart::Health::Healthy(_)
+    ));
+}
+
+/// A member whose UDP carrier does not open counts against it; UDP tries
+/// no other member (phase 2 M5 design 8.3).
+#[tokio::test]
+async fn a_member_whose_udp_carrier_does_not_open_counts_against_it() {
+    let proxies = format!(
+        "Dead = socks5, 127.0.0.1, {}, udp-relay=true",
+        closed_port().await
+    );
+    let h = udp_smart("Dead", &proxies).await;
+    let (echo, _) = udp_echo().await;
+    let association = udp_associate(h.socks()).await;
+    association.send("127.0.0.1", echo.port(), b"hi").await;
+    let registry = h.engine.registry();
+    let smart = &registry.auto().smart;
+    wait_until("the failure of the member", || {
+        smart.site("127.0.0.1", Instant::now()).failed == ["Dead"]
+    })
+    .await;
+}
+
+/// Three seconds without an answer count against the member only where an
+/// answer always comes — here port 443 — never on another port, where a
+/// game may only send (phase 2 M5 design 8.3).
+#[tokio::test]
+async fn udp_silence_counts_only_where_answers_always_come() {
+    let quiet = FakeSocks5::spawn(Socks5Script::default()).await;
+    let proxies = format!(
+        "Quiet = socks5, 127.0.0.1, {}, udp-relay=true",
+        quiet.addr().port()
+    );
+    let h = udp_smart("Quiet", &proxies).await;
+    // a socket that takes datagrams and never answers
+    let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let association = udp_associate(h.socks()).await;
+    association
+        .send(
+            "127.0.0.1",
+            silent.local_addr().unwrap().port(),
+            b"only sends",
+        )
+        .await;
+    association.send("127.0.0.1", 443, b"not quic").await;
+    let registry = h.engine.registry();
+    let smart = &registry.auto().smart;
+    wait_until("the silence on port 443 counted", || {
+        smart.site("127.0.0.1", Instant::now()).failed == ["Quiet"]
+    })
+    .await;
+    // the other flow's three seconds are up too by now: it did not count
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let quiet = outbound_now(&h, "Quiet");
+    assert_eq!(
+        smart.health("Quiet", &quiet, Instant::now()),
+        rurge_policy::smart::Health::Unknown { failures: 1 }
+    );
+}

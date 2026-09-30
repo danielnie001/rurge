@@ -100,15 +100,17 @@ impl Watch {
 
 /// Hangs the report of `policy` on `handle` (M3c design 4.3): the first byte
 /// back is a sample; `NO_RESPONSE` without one while the client is still
-/// there, or upstream ending before it sent anything while the client was
-/// still there, is a failure — whichever comes first, once. A `kill` and a
-/// shutdown say nothing of the member.
+/// there — when `silence` says such silence tells anything — or upstream
+/// ending before it sent anything while the client was still there, is a
+/// failure — whichever comes first, once. A `kill` and a shutdown say
+/// nothing of the member.
 pub(crate) fn watch(
     handle: &Arc<SessionHandle>,
     book: Arc<SmartBook>,
     policy: &str,
     outbound: &OutboundRef,
     host: &str,
+    silence: bool,
 ) {
     let watch = Arc::new(Watch {
         book,
@@ -129,6 +131,9 @@ pub(crate) fn watch(
             on_end.failure();
         }
     });
+    if !silence {
+        return;
+    }
     let session = Arc::downgrade(handle);
     tokio::spawn(async move {
         tokio::time::sleep(NO_RESPONSE).await;
@@ -166,7 +171,7 @@ mod tests {
     #[tokio::test]
     async fn the_first_byte_is_the_one_report() {
         let (book, a, h) = (Arc::new(SmartBook::new()), outbound(), session());
-        watch(&h, book.clone(), "A", &a, "a.test");
+        watch(&h, book.clone(), "A", &a, "a.test", true);
         h.mark_first_byte();
         let now = Instant::now();
         assert!(matches!(book.health("A", &a, now), Health::Healthy(_)));
@@ -180,7 +185,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn three_silent_seconds_are_a_failure() {
         let (book, a, h) = (Arc::new(SmartBook::new()), outbound(), session());
-        watch(&h, book.clone(), "A", &a, "a.test");
+        watch(&h, book.clone(), "A", &a, "a.test", true);
         tokio::time::sleep(NO_RESPONSE + Duration::from_millis(10)).await;
         let now = Instant::now();
         assert_eq!(book.health("A", &a, now), Health::Unknown { failures: 1 });
@@ -188,12 +193,31 @@ mod tests {
         assert!(!h.is_finished());
     }
 
+    /// Where silence tells nothing (a UDP flow to a port that need not
+    /// answer, phase 2 M5 design 8.3), three silent seconds are no failure;
+    /// an answer still counts.
+    #[tokio::test(start_paused = true)]
+    async fn silence_that_tells_nothing_is_no_failure() {
+        let (book, a, h) = (Arc::new(SmartBook::new()), outbound(), session());
+        watch(&h, book.clone(), "A", &a, "a.test", false);
+        tokio::time::sleep(NO_RESPONSE + Duration::from_millis(10)).await;
+        assert_eq!(
+            book.health("A", &a, Instant::now()),
+            Health::Unknown { failures: 0 }
+        );
+        h.mark_first_byte();
+        assert!(matches!(
+            book.health("A", &a, Instant::now()),
+            Health::Healthy(_)
+        ));
+    }
+
     /// A client that left before the three seconds were up takes the
     /// member's silence with it: no failure (M3c design 4.3).
     #[tokio::test(start_paused = true)]
     async fn silence_after_the_client_left_is_no_failure() {
         let (book, a, h) = (Arc::new(SmartBook::new()), outbound(), session());
-        watch(&h, book.clone(), "A", &a, "a.test");
+        watch(&h, book.clone(), "A", &a, "a.test", true);
         tokio::time::sleep(Duration::from_secs(1)).await;
         h.mark_client_gone();
         tokio::time::sleep(NO_RESPONSE).await;
@@ -209,16 +233,16 @@ mod tests {
         let book = Arc::new(SmartBook::new());
         let (a, b, c) = (outbound(), outbound(), outbound());
         let failed = session();
-        watch(&failed, book.clone(), "A", &a, "a.test");
+        watch(&failed, book.clone(), "A", &a, "a.test", true);
         failed.mark_upstream_failed();
         failed.finish(SessionOutcome::Failed("upstream closed".into()));
         let killed = session();
-        watch(&killed, book.clone(), "B", &b, "a.test");
+        watch(&killed, book.clone(), "B", &b, "a.test", true);
         killed.kill();
         killed.mark_upstream_failed();
         killed.finish(SessionOutcome::Failed("killed".into()));
         let ended = session();
-        watch(&ended, book.clone(), "C", &c, "a.test");
+        watch(&ended, book.clone(), "C", &c, "a.test", true);
         ended.finish(SessionOutcome::Completed);
         let now = Instant::now();
         assert_eq!(book.health("A", &a, now), Health::Unknown { failures: 1 });

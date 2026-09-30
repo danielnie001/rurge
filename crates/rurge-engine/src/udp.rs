@@ -414,6 +414,9 @@ async fn open(
         return Err(SessionOutcome::Rejected(RejectKind::Reject));
     }
     let mut outbound = resolution.outbound.clone();
+    // a `smart` group's member tells the book how it did (phase 2 M5
+    // design 8.3); not when the flow goes through DIRECT in its place
+    let mut smart = resolution.smart.clone();
     if outbound.udp() == UdpSupport::Unsupported {
         match rt.config.general.udp_policy_not_supported_behaviour {
             UdpFallback::Reject => {
@@ -422,23 +425,48 @@ async fn open(
             }
             UdpFallback::Direct => {
                 handle.set_error("policy does not support UDP; sent through DIRECT");
+                smart = None;
                 outbound = registry
                     .resolve_with(&PolicyRef::Builtin(Builtin::Direct), &ctx)
                     .outbound;
             }
         }
     }
-    let carrier = association
+    let host = to.host.to_string();
+    let book = &registry.auto().smart;
+    let carrier = match association
         .carriers
         .get(&outbound, &association.client)
         .await
-        .map_err(|e| failed(handle, e.to_string()))?;
+    {
+        Ok(carrier) => carrier,
+        Err(e) => {
+            if let Some(pick) = &smart {
+                book.report_failure(&pick.member, &outbound, Some(&host), Instant::now());
+            }
+            return Err(failed(handle, e.to_string()));
+        }
+    };
     let send_to = carrier
         .socket
         .resolve(to)
         .await
         .map_err(|e| failed(handle, e.to_string()))?;
     handle.mark_connected();
+    if let Some(pick) = &smart {
+        book.used(&pick.group, &pick.member, Instant::now());
+        // three silent seconds tell only where an answer always comes: DNS,
+        // and the port QUIC answers on; a game may only send
+        let silence = matches!(to.port, 53 | 443);
+        crate::smart::watch(
+            handle,
+            book.clone(),
+            &pick.member,
+            &outbound,
+            &host,
+            silence,
+        );
+    }
     let flow = Arc::new(Flow::new(handle.clone(), to.port));
     carrier.routes.add(send_to.clone(), &flow);
     Ok((flow, carrier, send_to))

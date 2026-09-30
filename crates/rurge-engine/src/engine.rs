@@ -799,7 +799,7 @@ impl Engine {
                 Ok(_) => {
                     book.used(&pick.group, &pick.member, now);
                     let outbound = &resolution.outbound;
-                    crate::smart::watch(&handle, book.clone(), &pick.member, outbound, &host);
+                    crate::smart::watch(&handle, book.clone(), &pick.member, outbound, &host, true);
                 }
                 Err(e) if crate::smart::retryable(e) => {
                     book.report_failure(&pick.member, &resolution.outbound, Some(&host), now);
@@ -1083,6 +1083,7 @@ impl Dialer for Engine {
                                 &pick.member,
                                 outbound,
                                 &host,
+                                true,
                             );
                             if !tried.is_empty() {
                                 handle.set_error(format!(
