@@ -51,7 +51,7 @@ const SERVER_SESSIONS: usize = 8;
 pub(crate) enum Packets {
     Plain,
     Aead(Arc<MasterKey>),
-    S2022(Keys2022),
+    S2022(Arc<Keys2022>),
 }
 
 /// SS 2022's keys for UDP. No `Debug`.
@@ -288,10 +288,18 @@ pub(crate) struct SsUdp {
     /// there are the server's. A chained carrier keeps names.
     server_ip: Option<IpAddr>,
     socket: BoxedPacketSocket,
-    packets: Arc<Packets>,
-    /// SS 2022's client session.
-    session: Option<Session>,
+    sealing: Sealing,
     now: fn() -> u64,
+}
+
+/// How one carrier seals: SS 2022 always with a client session of its own.
+enum Sealing {
+    Plain,
+    Aead(Arc<MasterKey>),
+    S2022 {
+        keys: Arc<Keys2022>,
+        session: Box<Session>,
+    },
 }
 
 fn no_randomness() -> OutboundError {
@@ -314,38 +322,41 @@ impl SsUdp {
             HostName::Ip(ip) => Some(ip),
             HostName::Domain(_) => None,
         };
-        let session = match &*packets {
+        let sealing = match &*packets {
+            Packets::Plain => Sealing::Plain,
+            Packets::Aead(key) => Sealing::Aead(key.clone()),
             Packets::S2022(keys) => {
                 let mut id = [0u8; 8];
                 getrandom::fill(&mut id).map_err(|_| no_randomness())?;
-                Some(Session {
-                    id,
-                    cipher: keys.body_cipher(&id),
-                    next: AtomicU64::new(0),
-                    servers: Mutex::new(Vec::new()),
-                })
+                Sealing::S2022 {
+                    keys: keys.clone(),
+                    session: Box::new(Session {
+                        id,
+                        cipher: keys.body_cipher(&id),
+                        next: AtomicU64::new(0),
+                        servers: Mutex::new(Vec::new()),
+                    }),
+                }
             }
-            _ => None,
         };
         Ok(SsUdp {
             server,
             server_ip,
             socket,
-            packets,
-            session,
+            sealing,
             now,
         })
     }
 
     fn seal(&self, addr: &[u8], payload: &[u8]) -> io::Result<Vec<u8>> {
         let random = |_| io::Error::other("ss: no randomness available");
-        Ok(match (&*self.packets, &self.session) {
-            (Packets::Aead(key), _) => {
+        Ok(match &self.sealing {
+            Sealing::Aead(key) => {
                 let mut salt = vec![0u8; key.salt_len()];
                 getrandom::fill(&mut salt).map_err(random)?;
                 seal_aead(key, &salt, addr, payload)
             }
-            (Packets::S2022(keys), Some(session)) => {
+            Sealing::S2022 { keys, session } => {
                 let packet = session.next.fetch_add(1, Ordering::Relaxed);
                 let padding = s2022::padding_len(payload.len()).map_err(random)?;
                 keys.seal(
@@ -358,15 +369,15 @@ impl SsUdp {
                     payload,
                 )
             }
-            _ => [addr, payload].concat(),
+            Sealing::Plain => [addr, payload].concat(),
         })
     }
 
     fn unseal(&self, packet: &mut [u8]) -> Result<(Target, Range<usize>), &'static str> {
-        match (&*self.packets, &self.session) {
-            (Packets::Aead(key), _) => open_aead(key, packet),
-            (Packets::S2022(keys), Some(session)) => session.open(keys, packet, (self.now)()),
-            _ => source(packet, 0),
+        match &self.sealing {
+            Sealing::Aead(key) => open_aead(key, packet),
+            Sealing::S2022 { keys, session } => session.open(keys, packet, (self.now)()),
+            Sealing::Plain => source(packet, 0),
         }
     }
 }

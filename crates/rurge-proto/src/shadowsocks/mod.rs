@@ -112,7 +112,7 @@ impl ShadowsocksOutbound {
             server: Target::new(server.host.clone(), spec.udp_port.unwrap_or(server.port)),
             packets: Arc::new(match (&key, AeadKind::of(spec.method)) {
                 (Some(_), Some(kind)) if spec.method.is_2022() => {
-                    Packets::S2022(Keys2022::new(kind, spec.keys.expose()))
+                    Packets::S2022(Arc::new(Keys2022::new(kind, spec.keys.expose())))
                 }
                 (Some(key), _) => Packets::Aead(key.clone()),
                 (None, _) => Packets::Plain,

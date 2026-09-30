@@ -391,7 +391,7 @@ async fn a_reload_keeps_an_unchanged_ss_policy_and_rebuilds_a_changed_one() {
         .swap_runtime(reload(base, "Other = http, other.example, 8080").await);
     assert!(
         Arc::ptr_eq(&before, &outbound_now(&h, "S")),
-        "S was rebuilt"
+        "an unrelated reload rebuilt S"
     );
     let mut tunnel = connect_via_http(h.http(), "target.test:7").await;
     echo_through(&mut tunnel, b"after the reload").await;

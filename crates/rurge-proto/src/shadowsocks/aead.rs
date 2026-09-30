@@ -84,11 +84,10 @@ pub(crate) struct Request2022 {
     pub now: fn() -> u64,
 }
 
-/// A 2022 request stream's state: its setup and its salt, which the
-/// response must echo.
+/// A 2022 request stream's state: its setup (the response must echo the
+/// stream's salt).
 struct Edition2022 {
     request: Request2022,
-    salt: Vec<u8>,
 }
 
 /// No `Debug`: it holds the connection's keys.
@@ -96,8 +95,10 @@ pub(crate) struct AeadStream {
     inner: BoxedStream,
     key: Arc<MasterKey>,
     max_payload: usize,
-    /// Our salt until it is sealed into `out` in front of the first chunk.
-    salt: Option<Vec<u8>>,
+    /// Our salt, sealed into `out` in front of the first chunk; kept to
+    /// tell a reflected answer apart.
+    salt: Vec<u8>,
+    salt_sent: bool,
     up: CountingAead,
     /// Known once the server's salt has arrived.
     down: Option<CountingAead>,
@@ -179,7 +180,8 @@ impl AeadStream {
             inner,
             key,
             max_payload,
-            salt: Some(salt),
+            salt,
+            salt_sent: false,
             out: Vec::new(),
             out_pos: 0,
             accepted: 0,
@@ -198,10 +200,7 @@ impl AeadStream {
         salt: Vec<u8>,
         request: Request2022,
     ) -> AeadStream {
-        let edition = Edition2022 {
-            request,
-            salt: salt.clone(),
-        };
+        let edition = Edition2022 { request };
         AeadStream {
             edition_2022: Some(edition),
             ..AeadStream::new(inner, key, salt, s2022::MAX_PAYLOAD)
@@ -236,10 +235,15 @@ impl AsyncRead for AeadStream {
                             NO_ANSWER,
                         )));
                     }
+                    // our own salt back: a reflected stream, whose chunks
+                    // would open under our own key
+                    if this.edition_2022.is_none() && buf[..] == this.salt[..] {
+                        return Poll::Ready(Err(invalid(UNDECRYPTABLE)));
+                    }
                     this.down = Some(this.key.session(buf));
                     this.reading = match &this.edition_2022 {
-                        Some(edition) => Reading::Head {
-                            buf: vec![0; s2022::response_fixed_len(edition.salt.len()) + TAG],
+                        Some(_) => Reading::Head {
+                            buf: vec![0; s2022::response_fixed_len(this.salt.len()) + TAG],
                             filled: 0,
                         },
                         None => Reading::Len {
@@ -258,7 +262,7 @@ impl AsyncRead for AeadStream {
                     };
                     let edition = this.edition_2022.as_ref().expect("a 2022 stream");
                     let len =
-                        s2022::check_response(&buf[..n], &edition.salt, (edition.request.now)())?;
+                        s2022::check_response(&buf[..n], &this.salt, (edition.request.now)())?;
                     this.reading = Reading::Body {
                         buf: vec![0; len + TAG],
                         filled: 0,
@@ -335,12 +339,14 @@ impl AsyncWrite for AeadStream {
         if this.out_pos == this.out.len() {
             this.out.clear();
             this.out_pos = 0;
-            let first = this.salt.take();
-            if let Some(salt) = &first {
-                this.out.extend_from_slice(salt);
+            let first = !this.salt_sent;
+            if first {
+                this.out.extend_from_slice(&this.salt);
             }
-            this.accepted = match (&first, &this.edition_2022) {
-                (Some(_), Some(edition)) => {
+            this.accepted = match (first, &this.edition_2022) {
+                (true, Some(edition)) => {
+                    // it fails before it seals anything: the salt stays
+                    // unsent for the next write
                     match seal_first_2022(&mut this.up, &edition.request, data, &mut this.out) {
                         Ok(n) => n,
                         Err(e) => {
@@ -355,6 +361,7 @@ impl AsyncWrite for AeadStream {
                     n
                 }
             };
+            this.salt_sent = true;
         }
         ready!(this.poll_out(cx))?;
         Poll::Ready(Ok(this.accepted.min(data.len())))
@@ -433,10 +440,42 @@ mod tests {
             let _ = far.write_all(&wire).await;
             // dropping `far` is the close
         });
-        let mut stream =
-            AeadStream::new(Box::new(near), key(kind, password), salt(kind), MAX_PAYLOAD);
+        // a request salt of its own: the answer's salt equal to it would
+        // be a reflection
+        let ours = vec![0xee; kind.key_len()];
+        let mut stream = AeadStream::new(Box::new(near), key(kind, password), ours, MAX_PAYLOAD);
         let mut got = Vec::new();
         stream.read_to_end(&mut got).await.map(|_| got)
+    }
+
+    #[tokio::test]
+    async fn a_reflected_stream_does_not_decrypt() {
+        let kind = AeadKind::Aes256Gcm;
+        let (near, mut far) = tokio::io::duplex(4096);
+        // a "server" that sends the client's bytes back
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            while let Ok(n @ 1..) = far.read(&mut buf).await {
+                if far.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut stream = AeadStream::new(
+            Box::new(near),
+            key(kind, "password"),
+            salt(kind),
+            MAX_PAYLOAD,
+        );
+        stream.write_all(b"hello").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut got = [0u8; 5];
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut got))
+            .await
+            .expect("an answer in time")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), UNDECRYPTABLE);
     }
 
     #[tokio::test]

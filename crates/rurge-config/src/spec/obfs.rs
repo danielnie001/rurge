@@ -34,6 +34,9 @@ pub struct ObfsOpts {
 
 const KEYS: [&str; 2] = ["obfs-host", "obfs-uri"];
 
+/// The longest `obfs-host`: a TLS server name holds at most 255 bytes.
+const MAX_HOST: usize = 255;
+
 /// What goes into a request line or a header as is: printable ASCII, no
 /// space.
 fn printable(text: &str) -> bool {
@@ -69,8 +72,13 @@ pub fn read_obfs(r: &mut ParamReader<'_>, allowed: &[ObfsMode]) -> Option<ObfsOp
     let mut host = None;
     if let Some(v) = r.str("obfs-host") {
         let v = v.trim();
-        if printable(v) {
+        if printable(v) && v.len() <= MAX_HOST {
             host = Some(v.to_string());
+        } else if printable(v) {
+            r.error(
+                codes::E_INVALID_POLICY_PARAM,
+                format!("invalid `obfs-host` (expected at most {MAX_HOST} bytes)"),
+            );
         } else {
             r.error(
                 codes::E_INVALID_POLICY_PARAM,
@@ -238,5 +246,29 @@ mod tests {
             );
             assert!(!diags[0].message.contains("s3cret"), "{def}");
         }
+    }
+
+    #[test]
+    fn a_host_longer_than_255_bytes_is_an_error_and_never_quoted() {
+        let longest = format!("s3cret{}", "a".repeat(249));
+        let (opts, failed, diags) = read(
+            &format!("ss, h.test, 8388, obfs=tls, obfs-host={longest}"),
+            &BOTH,
+        );
+        assert!(!failed && diags.is_empty(), "{diags:?}");
+        assert_eq!(opts.unwrap().host, Some(longest.clone()));
+        let (_, failed, diags) = read(
+            &format!("ss, h.test, 8388, obfs=http, obfs-host={longest}a"),
+            &BOTH,
+        );
+        assert!(failed);
+        assert_eq!(
+            messages(&diags),
+            [(
+                codes::E_INVALID_POLICY_PARAM,
+                "policy `P`: invalid `obfs-host` (expected at most 255 bytes)"
+            )]
+        );
+        assert!(!diags[0].message.contains("s3cret"));
     }
 }
