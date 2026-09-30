@@ -1,16 +1,19 @@
 //! `WireGuardOutbound` (phase 2 M4 design §6): the tunnel starts with the
 //! first dial and runs while the outbound, or a connection through it,
-//! lives.
+//! lives. UDP goes through a socket of the tunnel's own stack (`udp`).
 
 use crate::device::{Device, REDIAL};
 use crate::dns::{self, Cache, Family};
 use crate::stack::Refusal;
+use crate::udp::TunnelUdp;
 use rurge_config::HostName;
 use rurge_config::spec::WireGuardSpec;
 use rurge_config::wireguard::{TunnelDns, WireGuardSection};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Resolve, Target};
-use rurge_proto::{Outbound, OutboundError};
+use rurge_net::connector::{
+    BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Resolve, Target,
+};
+use rurge_proto::{Outbound, OutboundError, UdpSupport};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -26,7 +29,6 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 pub struct WireGuardOutbound {
     name: String,
-    section: WireGuardSection,
     /// Later configurations have higher ones: a tunnel they start ends
     /// this one's, never the other way round.
     generation: u64,
@@ -34,19 +36,28 @@ pub struct WireGuardOutbound {
     /// share a section but must not share carriers (`with_carrier`). Empty
     /// until set.
     carrier: String,
-    /// Destination names, without a `dns-server` (M4-D9) and for its
-    /// `system` entries.
-    resolver: Arc<dyn Resolve>,
     /// What the carriers to the peers come from.
     connector: Arc<dyn Connector>,
     /// The running tunnel; the first dial starts it, the others wait.
     device: Mutex<Option<Arc<Device>>>,
+    /// The section, and how destination names are looked up: shared with
+    /// the UDP carriers.
+    names: Arc<Names>,
+    /// `REDIAL` (shorter in the tests).
+    redial: Duration,
+}
+
+/// Where destination names go (M4-D9): the section's `dns-server`s through
+/// the tunnel, or this machine.
+pub(crate) struct Names {
+    section: WireGuardSection,
+    /// Destination names, without a `dns-server` (M4-D9) and for its
+    /// `system` entries.
+    resolver: Arc<dyn Resolve>,
     /// What the tunnel's `dns-server`s answered, for their TTL.
     cache: StdMutex<Cache>,
     /// `DNS_WAIT` (shorter in the tests).
     dns_wait: Duration,
-    /// `REDIAL` (shorter in the tests).
-    redial: Duration,
 }
 
 impl WireGuardOutbound {
@@ -59,14 +70,16 @@ impl WireGuardOutbound {
     ) -> WireGuardOutbound {
         WireGuardOutbound {
             name: name.to_string(),
-            section: spec.section.clone(),
             generation: GENERATION.fetch_add(1, Ordering::Relaxed),
             carrier: String::new(),
-            resolver,
             connector,
             device: Mutex::new(None),
-            cache: StdMutex::new(Cache::default()),
-            dns_wait: DNS_WAIT,
+            names: Arc::new(Names {
+                section: spec.section.clone(),
+                resolver,
+                cache: StdMutex::new(Cache::default()),
+                dns_wait: DNS_WAIT,
+            }),
             redial: REDIAL,
         }
     }
@@ -99,7 +112,7 @@ impl WireGuardOutbound {
         }
         let device = Device::start(
             &self.name,
-            &self.section,
+            &self.names.section,
             &self.carrier,
             self.generation,
             &self.connector,
@@ -111,8 +124,30 @@ impl WireGuardOutbound {
         Ok(device)
     }
 
-    /// Where a connection to `target` goes: its address, or its name's.
-    async fn address(
+    async fn dial(
+        &self,
+        target: &Target,
+        opts: &ConnectOpts,
+    ) -> Result<BoxedStream, OutboundError> {
+        let device = self.device(opts).await?;
+        let ip = self.names.address(target, &device).await?;
+        let stream = device.connect(SocketAddr::new(ip, target.port)).await?;
+        Ok(Box::new(stream))
+    }
+
+    /// `DNS_WAIT`, before anything shares the names (a test's).
+    #[cfg(test)]
+    fn set_dns_wait(&mut self, wait: Duration) {
+        Arc::get_mut(&mut self.names)
+            .expect("nothing shares the names yet")
+            .dns_wait = wait;
+    }
+}
+
+impl Names {
+    /// Where a connection or a datagram to `target` goes: its address, or
+    /// its name's.
+    pub(crate) async fn address(
         &self,
         target: &Target,
         device: &Arc<Device>,
@@ -203,17 +238,6 @@ impl WireGuardOutbound {
         );
         dns::answered(v4.into_iter().chain(v6).collect())
     }
-
-    async fn dial(
-        &self,
-        target: &Target,
-        opts: &ConnectOpts,
-    ) -> Result<BoxedStream, OutboundError> {
-        let device = self.device(opts).await?;
-        let ip = self.address(target, &device).await?;
-        let stream = device.connect(SocketAddr::new(ip, target.port)).await?;
-        Ok(Box::new(stream))
-    }
 }
 
 /// The address to connect to among `addrs`: of a family the tunnel has an
@@ -261,6 +285,25 @@ impl Outbound for WireGuardOutbound {
             Ok(device.handshake().await)
         }))
     }
+
+    fn udp(&self) -> UdpSupport {
+        UdpSupport::Native
+    }
+
+    /// A socket of the tunnel's stack for every destination (full cone,
+    /// phase 2 M5 design §7); the tunnel starts first when it has not.
+    fn open_udp<'a>(
+        &'a self,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, Result<BoxedPacketSocket, OutboundError>> {
+        Box::pin(async move {
+            let device = match tokio::time::timeout(opts.timeout, self.device(opts)).await {
+                Ok(device) => device?,
+                Err(_) => return Err(OutboundError::Timeout),
+            };
+            Ok(Box::new(TunnelUdp::new(device, self.names.clone())) as BoxedPacketSocket)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -270,9 +313,11 @@ mod tests {
         DNS_ADDRESS, ECHO_PORT, FakeWgPeer, PeerOpts, endpoint, keypair, section,
     };
     use rurge_config::wireguard::PeerEndpoint;
-    use rurge_net::connector::{BoxedDatagram, Datagram, DirectConnector, SystemResolve};
+    use rurge_net::connector::{
+        BoxedDatagram, Datagram, DirectConnector, PacketSocket, SystemResolve,
+    };
     use std::io;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddrV4};
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
@@ -706,7 +751,7 @@ mod tests {
             |s| s.dns_servers = vec![TunnelDns::Server(SocketAddr::new(DNS_ADDRESS.into(), 53))],
         )
         .await;
-        wg.dns_wait = Duration::from_millis(900);
+        wg.set_dns_wait(Duration::from_millis(900));
         let mut stream = wg
             .connect_tcp(&at("echo.test", ECHO_PORT), &within(5))
             .await
@@ -774,7 +819,7 @@ mod tests {
     async fn the_next_dns_server_is_asked_when_one_cannot_answer() {
         let silent = TunnelDns::Server("10.0.0.54:53".parse().unwrap());
         let (_peer, mut wg) = with_tunnel_dns(&["10.0.0.1"], &[silent], |_| {}).await;
-        wg.dns_wait = Duration::from_millis(300);
+        wg.set_dns_wait(Duration::from_millis(300));
         let started = std::time::Instant::now();
         wg.connect_tcp(&at("echo.test", ECHO_PORT), &within(5))
             .await
@@ -788,7 +833,7 @@ mod tests {
             TunnelDns::Server("192.0.2.53:53".parse().unwrap()),
         ];
         let (_peer, mut wg) = with_tunnel_dns(&["10.0.0.1"], &unreachable, |_| {}).await;
-        wg.dns_wait = Duration::from_secs(5);
+        wg.set_dns_wait(Duration::from_secs(5));
         let started = std::time::Instant::now();
         wg.connect_tcp(&at("echo.test", ECHO_PORT), &within(5))
             .await
@@ -817,7 +862,7 @@ mod tests {
                     s.peers[0].allowed_ips = vec!["0.0.0.0/0".parse().unwrap()];
                 })
                 .await;
-                wg.dns_wait = Duration::from_secs(5);
+                wg.set_dns_wait(Duration::from_secs(5));
                 let started = std::time::Instant::now();
                 wg.connect_tcp(&at("echo.test", ECHO_PORT), &within(5))
                     .await
@@ -947,7 +992,7 @@ mod tests {
     async fn policies_that_name_one_section_share_its_tunnel() {
         let (peer, a) = tunnel(PeerOpts::default(), |_| {}).await;
         let spec = WireGuardSpec {
-            section: a.section.clone(),
+            section: a.names.section.clone(),
         };
         let b = WireGuardOutbound::new("Other", &spec, no_names(), direct());
         for wg in [&a, &b] {
@@ -971,7 +1016,7 @@ mod tests {
             .await
             .expect("a connection");
         assert_eq!(echo(&mut stream, b"old").await, b"old");
-        let mut section = old.section.clone();
+        let mut section = old.names.section.clone();
         section.mtu = 1400;
         let new = WireGuardOutbound::new("WG", &WireGuardSpec { section }, no_names(), direct());
         let mut fresh = new
@@ -1378,7 +1423,7 @@ mod tests {
             .expect("a connection");
         assert_eq!(echo(&mut stream, b"ping").await, b"ping");
         let spec = WireGuardSpec {
-            section: a.section.clone(),
+            section: a.names.section.clone(),
         };
         let b = WireGuardOutbound::new("Chained", &spec, no_names(), Arc::new(NoUdp))
             .with_carrier("chain".to_string());
@@ -1409,7 +1454,7 @@ mod tests {
             .expect("a connection");
         assert_eq!(echo(&mut stream, b"old").await, b"old");
         let spec = WireGuardSpec {
-            section: old.section.clone(),
+            section: old.names.section.clone(),
         };
         let new =
             WireGuardOutbound::new("WG", &spec, no_names(), direct()).with_carrier("v6".into());
@@ -1485,7 +1530,7 @@ mod tests {
         until(|| asked.load(Ordering::SeqCst)).await;
 
         let spec = WireGuardSpec {
-            section: a1.section.clone(),
+            section: a1.names.section.clone(),
         };
         let a2 = WireGuardOutbound::new("A2", &spec, no_names(), direct());
         let mut y = a2
@@ -1496,5 +1541,98 @@ mod tests {
         assert_eq!(peer.core().handshakes, 1);
 
         stuck_dial.abort();
+    }
+
+    async fn udp_answer(carrier: &dyn PacketSocket) -> (Vec<u8>, Target) {
+        let mut buf = vec![0u8; 65536];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(5), carrier.recv_from(&mut buf))
+            .await
+            .expect("an answer within the bound")
+            .unwrap();
+        (buf[..n].to_vec(), from)
+    }
+
+    /// Datagrams through the tunnel to the peer's UDP echo and back, from
+    /// the tunnel's address: one socket for every destination.
+    #[tokio::test]
+    async fn udp_goes_through_the_tunnel() {
+        let (peer, wg) = tunnel(PeerOpts::default(), |_| {}).await;
+        assert_eq!(wg.udp(), UdpSupport::Native);
+        let carrier = wg.open_udp(&within(5)).await.expect("a carrier");
+        for (host, payload) in [("10.0.0.1", &b"ping"[..]), ("10.0.0.2", b"pong")] {
+            let to = at(host, ECHO_PORT);
+            carrier.send_to(payload, &to).await.unwrap();
+            assert_eq!(udp_answer(carrier.as_ref()).await, (payload.to_vec(), to));
+        }
+        let echoed = peer.core().udp_echoed.clone();
+        assert_eq!(echoed.len(), 2);
+        assert_eq!(echoed[0].0.ip(), IpAddr::V4(Ipv4Addr::new(10, 9, 0, 2)));
+        assert_eq!(echoed[0].0, echoed[1].0, "one socket for both");
+        assert_eq!(
+            (echoed[0].1, echoed[1].1),
+            ("10.0.0.1:7".parse().unwrap(), "10.0.0.2:7".parse().unwrap())
+        );
+    }
+
+    /// Full cone: a host behind the peer that was never written to reaches
+    /// the carrier, under its own address.
+    #[tokio::test]
+    async fn anyone_in_the_tunnel_may_answer() {
+        let (peer, wg) = tunnel(PeerOpts::default(), |_| {}).await;
+        let carrier = wg.open_udp(&within(5)).await.expect("a carrier");
+        carrier
+            .send_to(b"hello", &at("10.0.0.1", ECHO_PORT))
+            .await
+            .unwrap();
+        udp_answer(carrier.as_ref()).await;
+        let SocketAddr::V4(ours) = peer.core().udp_echoed[0].0 else {
+            panic!("the tunnel is IPv4")
+        };
+        let stranger: SocketAddrV4 = "10.0.0.9:5000".parse().unwrap();
+        peer.send_udp(stranger, ours, b"unasked").await;
+        assert_eq!(
+            udp_answer(carrier.as_ref()).await,
+            (b"unasked".to_vec(), at("10.0.0.9", 5000))
+        );
+    }
+
+    /// A name is looked up as for a connection (here on this machine), and
+    /// the datagram goes to what it gave.
+    #[tokio::test]
+    async fn a_datagram_to_a_name_goes_where_the_name_says() {
+        let names = Arc::new(Names(vec![(
+            "echo.test",
+            vec!["10.0.0.1".parse().unwrap()],
+        )]));
+        let (_peer, wg) = tunnel_with(PeerOpts::default(), |_| {}, names, direct()).await;
+        let carrier = wg.open_udp(&within(5)).await.expect("a carrier");
+        let name = at("echo.test", ECHO_PORT);
+        assert_eq!(
+            carrier.resolve(&name).await.unwrap(),
+            at("10.0.0.1", ECHO_PORT)
+        );
+        carrier.send_to(b"q", &name).await.unwrap();
+        assert_eq!(
+            udp_answer(carrier.as_ref()).await,
+            (b"q".to_vec(), at("10.0.0.1", ECHO_PORT))
+        );
+    }
+
+    /// A destination no peer takes, or of a family the tunnel has no address
+    /// of, is refused at once, saying why.
+    #[tokio::test]
+    async fn udp_where_the_tunnel_cannot_go_is_refused() {
+        let (_peer, wg) = tunnel(PeerOpts::default(), |_| {}).await;
+        let carrier = wg.open_udp(&within(5)).await.expect("a carrier");
+        for (host, text) in [
+            (
+                "192.168.1.1",
+                "wireguard: no peer's allowed-ips covers 192.168.1.1",
+            ),
+            ("fd00::1", "wireguard: the tunnel has no IPv6 address"),
+        ] {
+            let err = carrier.send_to(b"x", &at(host, 53)).await.unwrap_err();
+            assert_eq!(err.to_string(), text);
+        }
     }
 }

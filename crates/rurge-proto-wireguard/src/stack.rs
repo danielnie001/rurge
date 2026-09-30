@@ -29,6 +29,10 @@ const LINGER: Duration = Duration::from_secs(30);
 const PORTS: RangeInclusive<u16> = 49152..=65535;
 /// Room for the largest UDP datagram and what boringtun adds to a message.
 const SCRATCH: usize = 65536 + 32;
+/// A UDP carrier's socket, each way (phase 2 M5 design §7): this many
+/// datagrams, in this much room, wait at most.
+const UDP_PACKETS: usize = 64;
+const UDP_BUFFER: usize = 256 * 1024;
 
 /// A message for the carrier of `peer`.
 #[derive(Debug)]
@@ -361,6 +365,35 @@ impl Stack {
             .bind(SocketAddr::new(local, port))
             .map_err(|_| Refusal::Unaddressable(to))?;
         Ok(self.sockets.add(socket))
+    }
+
+    /// A UDP carrier's socket (phase 2 M5 design §7): on the tunnel's
+    /// address of `family`'s family and a free port, for datagrams to and
+    /// from anywhere.
+    pub fn udp_bind(&mut self, family: IpAddr) -> Result<SocketHandle, Refusal> {
+        let local = match family {
+            IpAddr::V4(_) => self.v4.map(IpAddr::V4),
+            IpAddr::V6(_) => self.v6.map(IpAddr::V6),
+        }
+        .ok_or(Refusal::NoAddress(family))?;
+        let port = self.free_port().ok_or(Refusal::NoPort)?;
+        let buffer = || {
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; UDP_PACKETS],
+                vec![0; UDP_BUFFER],
+            )
+        };
+        let mut socket = udp::Socket::new(buffer(), buffer());
+        socket
+            .bind(SocketAddr::new(local, port))
+            .map_err(|_| Refusal::Unaddressable(family))?;
+        Ok(self.sockets.add(socket))
+    }
+
+    /// Why nothing can be sent to `to` through the tunnel, if something
+    /// stands in the way: no address of its family, no peer that takes it.
+    pub fn check(&self, to: IpAddr) -> Result<(), Refusal> {
+        self.source_for(to).map(|_| ())
     }
 
     /// The UDP socket of `handle`.

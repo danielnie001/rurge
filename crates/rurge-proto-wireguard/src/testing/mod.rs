@@ -1,9 +1,9 @@
 //! A WireGuard peer for the tests of this crate and of its dependants
 //! (feature `testing`). `PeerCore` is the peer without I/O: boringtun
 //! answering the client's handshakes, and a smoltcp host of its own that
-//! answers on every address routed to it — a TCP echo service on port 7, an
-//! HTTP service on port 80 and a name server at `DNS_ADDRESS`. `FakeWgPeer`
-//! puts one on a loopback UDP port.
+//! answers on every address routed to it — a TCP and a UDP echo service on
+//! port 7, an HTTP service on port 80 and a name server at `DNS_ADDRESS`.
+//! `FakeWgPeer` puts one on a loopback UDP port.
 
 mod peer;
 
@@ -24,12 +24,13 @@ use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::socket::{tcp, udp};
 use smoltcp::wire::{
-    HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpProtocol, Ipv4Packet,
+    HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpProtocol, Ipv4Packet, Ipv4Repr,
+    UdpPacket, UdpRepr,
 };
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};
 
-/// The TCP echo service of a peer.
+/// The TCP and the UDP echo service of a peer.
 pub const ECHO_PORT: u16 = 7;
 /// The HTTP service of a peer: `204 No Content` to every request, on a
 /// connection that stays open.
@@ -198,6 +199,7 @@ pub struct PeerCore {
     /// The HTTP connections and what arrived of the request being read.
     requests: Vec<(SocketHandle, Vec<u8>)>,
     name_server: SocketHandle,
+    udp_echo: SocketHandle,
     names: Vec<(String, Vec<IpAddr>)>,
     /// Questions its name server still leaves unanswered.
     dns_ignore: usize,
@@ -223,6 +225,9 @@ pub struct PeerCore {
     pub dns_questions: Vec<String>,
     /// HTTP requests answered.
     pub http_requests: usize,
+    /// Every datagram its UDP echo service answered: where it came from and
+    /// where it went.
+    pub udp_echoed: Vec<(SocketAddr, SocketAddr)>,
 }
 
 /// `message` with `client_id` in it.
@@ -270,6 +275,12 @@ impl PeerCore {
             .bind((IpAddress::Ipv4(DNS_ADDRESS), 53))
             .expect("the name server's port");
         let name_server = sockets.add(name_server);
+        let echo_buffer =
+            || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; 65536]);
+        let mut udp_echo = udp::Socket::new(echo_buffer(), echo_buffer());
+        // every address routed to it
+        udp_echo.bind(ECHO_PORT).expect("the echo port");
+        let udp_echo = sockets.add(udp_echo);
         PeerCore {
             tunnel,
             public_key,
@@ -281,6 +292,7 @@ impl PeerCore {
             web,
             requests: Vec::new(),
             name_server,
+            udp_echo,
             names: opts.dns.clone(),
             dns_ignore: opts.dns_ignore,
             scratch: vec![0; 65536 + 32],
@@ -295,6 +307,7 @@ impl PeerCore {
             resets: 0,
             dns_questions: Vec::new(),
             http_requests: 0,
+            udp_echoed: Vec::new(),
         }
     }
 
@@ -400,6 +413,40 @@ impl PeerCore {
         }
     }
 
+    /// A UDP datagram from `from` to `to` into the tunnel, as if a host
+    /// behind the peer sent it.
+    pub fn udp_from(
+        &mut self,
+        from: SocketAddrV4,
+        to: SocketAddrV4,
+        payload: &[u8],
+        out: &mut Vec<Vec<u8>>,
+    ) {
+        let udp = UdpRepr {
+            src_port: from.port(),
+            dst_port: to.port(),
+        };
+        let ip = Ipv4Repr {
+            src_addr: *from.ip(),
+            dst_addr: *to.ip(),
+            next_header: IpProtocol::Udp,
+            payload_len: udp.header_len() + payload.len(),
+            hop_limit: 64,
+        };
+        let caps = ChecksumCapabilities::default();
+        let mut packet = vec![0u8; ip.buffer_len() + ip.payload_len];
+        ip.emit(&mut Ipv4Packet::new_unchecked(&mut packet), &caps);
+        udp.emit(
+            &mut UdpPacket::new_unchecked(&mut packet[ip.buffer_len()..]),
+            &IpAddress::Ipv4(*from.ip()),
+            &IpAddress::Ipv4(*to.ip()),
+            payload.len(),
+            |room| room.copy_from_slice(payload),
+            &caps,
+        );
+        self.inject(&packet, out);
+    }
+
     /// An echo request with `size` bytes of data from `from` to `to`, in
     /// fragments of `fragment` bytes (a multiple of 8) when given.
     pub fn ping(
@@ -495,6 +542,28 @@ impl PeerCore {
         self.resets += resets;
         self.answer_requests();
         self.answer_questions();
+        self.echo_datagrams();
+    }
+
+    /// Sends every datagram to port 7 back where it came from, from where it
+    /// went.
+    fn echo_datagrams(&mut self) {
+        let socket = self.sockets.get_mut::<udp::Socket>(self.udp_echo);
+        let mut datagrams = Vec::new();
+        while let Ok((data, meta)) = socket.recv() {
+            datagrams.push((data.to_vec(), meta));
+        }
+        for (data, meta) in datagrams {
+            let from = SocketAddr::new(meta.endpoint.addr.into(), meta.endpoint.port);
+            let to = meta
+                .local_address
+                .map(|a| SocketAddr::new(a.into(), ECHO_PORT));
+            if let Some(to) = to {
+                self.udp_echoed.push((from, to));
+            }
+            let socket = self.sockets.get_mut::<udp::Socket>(self.udp_echo);
+            let _ = socket.send_slice(&data, meta);
+        }
     }
 
     fn answer_requests(&mut self) {

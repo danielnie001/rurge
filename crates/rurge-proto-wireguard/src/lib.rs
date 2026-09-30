@@ -1,6 +1,6 @@
 //! The `wireguard` outbound (phase 2 M4 design §6): a userspace WireGuard
 //! tunnel — boringtun's sans-IO `Tunn` for each peer and a smoltcp TCP/IP
-//! stack of its own — that TCP connections are dialled through.
+//! stack of its own — that TCP connections and UDP datagrams go through.
 
 mod device;
 mod dns;
@@ -8,6 +8,7 @@ pub mod outbound;
 pub mod routes;
 pub mod stack;
 mod stream;
+mod udp;
 pub mod wire;
 
 #[cfg(any(test, feature = "testing"))]

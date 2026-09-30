@@ -1,7 +1,7 @@
 //! `FakeWgPeer`: a `PeerCore` on a loopback UDP port.
 
 use super::{PeerCore, PeerOpts};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -20,6 +20,7 @@ pub struct FakeWgPeer {
     core: Arc<Mutex<PeerCore>>,
     silent: Arc<AtomicBool>,
     clients: Arc<Mutex<Vec<SocketAddr>>>,
+    socket: Arc<UdpSocket>,
     task: JoinHandle<()>,
 }
 
@@ -38,13 +39,20 @@ impl FakeWgPeer {
         let core = Arc::new(Mutex::new(core));
         let silent = Arc::new(AtomicBool::new(false));
         let clients = Arc::new(Mutex::new(Vec::new()));
-        let task = tokio::spawn(serve(socket, core.clone(), silent.clone(), clients.clone()));
+        let socket = Arc::new(socket);
+        let task = tokio::spawn(serve(
+            socket.clone(),
+            core.clone(),
+            silent.clone(),
+            clients.clone(),
+        ));
         FakeWgPeer {
             addr,
             public_key,
             core,
             silent,
             clients,
+            socket,
             task,
         }
     }
@@ -68,6 +76,17 @@ impl FakeWgPeer {
         self.clients.lock().expect("the clients").clone()
     }
 
+    /// A UDP datagram from `from` to `to` through the tunnel, as if a host
+    /// behind it sent it; to where the client last wrote from.
+    pub async fn send_udp(&self, from: SocketAddrV4, to: SocketAddrV4, payload: &[u8]) {
+        let mut out = Vec::new();
+        self.core().udp_from(from, to, payload, &mut out);
+        let client = *self.clients().last().expect("a client wrote");
+        for message in out {
+            let _ = self.socket.send_to(&message, client).await;
+        }
+    }
+
     /// From now on it drops whatever arrives and sends nothing, as a peer
     /// that is down.
     pub fn go_silent(&self, silent: bool) {
@@ -82,7 +101,7 @@ impl Drop for FakeWgPeer {
 }
 
 async fn serve(
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     core: Arc<Mutex<PeerCore>>,
     silent: Arc<AtomicBool>,
     clients: Arc<Mutex<Vec<SocketAddr>>>,

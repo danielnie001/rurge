@@ -254,3 +254,34 @@ async fn a_reload_keeps_the_tunnel_unless_its_section_changes() {
     echo_through(&mut third, b"three").await;
     assert_eq!(peer.core().handshakes, 2, "a tunnel of its own");
 }
+
+/// UDP from a SOCKS5 association through the tunnel to the peer's echo, and
+/// back; a host behind the peer that was never written to reaches the
+/// client too (full cone, phase 2 M5 design §7).
+#[tokio::test]
+async fn udp_leaves_through_the_tunnel() {
+    let (peer, section) = peer().await;
+    let h = harness(Profile {
+        proxies: WG,
+        rules: TO_WG,
+        sections: &section,
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association.send("10.0.0.1", ECHO_PORT, b"through").await;
+    assert_eq!(association.recv().await, (echo_addr(), b"through".to_vec()));
+    let SocketAddr::V4(ours) = peer.core().udp_echoed[0].0 else {
+        panic!("the tunnel is IPv4")
+    };
+    peer.send_udp("10.0.0.9:5000".parse().unwrap(), ours, b"unasked")
+        .await;
+    assert_eq!(
+        association.recv().await,
+        (SocketAddr::from(([10, 0, 0, 9], 5000)), b"unasked".to_vec())
+    );
+    drop(association);
+    let log = h.engine.request_log();
+    wait_until("the flow to finish", || !log.recent(10).is_empty()).await;
+    assert_eq!(log.recent(10)[0].policy, ["WG"]);
+}
