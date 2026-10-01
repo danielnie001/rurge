@@ -7084,6 +7084,14 @@ git commit -m "docs: M6b Snell——兼容性清单、手工验收、README 与 
 
 | # | 任务 | 与计划的出入 | 原因 |
 | - | ---- | ------------ | ---- |
+| 1 | Task 3 | （6b87f30）陈旧连接的重试只在连接离开池后 `STALE_WINDOW` = 1 秒之内的失败上发生，更晚的失败如实报错；应用关闭写端后再写直接返回 `BrokenPipe`，不再为此触发一次无谓的重拨；`Conn::Redial` 注明隧道假定两个方向由同一个任务轮询（重拨的 future 只记得最后一个轮询者的 waker）。新用例 `a_pooled_connection_that_breaks_after_the_window_is_not_retried` | Task 3 评审（计划规定的做法）：按计划，只要还没收到应答，几秒后才断开的池连接也会重发，旧服务端可能已把请求转给目标，非幂等的请求会到达两次。裁定收窄到 1 秒（陈旧的连接约一个往返内就失败），剩下的 1 秒内重复到达的可能登记进兼容性清单 |
+| 2 | Task 5 | （9cb33c3）`Outbound` 加只用于测试的 `idle_connections()`（`cfg(any(test, feature = "testing"))`，缺省 `None`，snell 给出池里的空闲连接数）；`outbounds_snell` 的复用与重载用例在发第二个会话之前轮询（有截止时间）到连接回到池里 | Task 5 评审：会话结束后连接经后台的 `finish` 异步回池，计划的断言没有与它同步，可能偶发失败 |
+| 3 | Task 6 | 兼容性清单 `snell` 行比计划多两句：陈旧连接的重试只在离开池后 1 秒内、更晚的失败如实报错、这 1 秒内同一个请求可能到达目标两次；服务端发来的长度不够放下自带地址的 UDP 记录丢弃（Surge 据报把短于 8 字节的记录当作错误，未核对） | 裁定：清单必须反映 #1 与 Task 4 的实际行为（Task 3、Task 4 评审的延后记录） |
+| 4 | 终审 | （#4–#6 均在 a380b3c）陈旧连接的重试只针对传输层的失败（`UnexpectedEof`、`ConnectionReset`、`ConnectionAborted`、`BrokenPipe`、`NotConnected`、`WriteZero`）；解不开的应答与协议错误立即报错、不重发。`FakeSnell` 加 `garble_after`（之后的请求以解不开的字节应答再关闭），新用例 `an_answer_on_a_pooled_connection_that_fails_to_decrypt_is_not_retried`（去掉这条限制时它失败）与 `only_a_transport_failure_may_be_a_stale_connection` | 终审：此前时间窗内任何错误都重拨，包括 `UNDECRYPTABLE` / `InvalidData` |
+| 5 | 终审 | 服务端的 `02` 拒绝读完之后，再读仍返回同一个 `snell: the server refused: …`（`ConnectionRefused`），不再变成 `snell: the server closed the connection without answering`；新用例 `every_read_after_a_refusal_is_the_refusal` | 终审：读完的拒绝再读时要读 0 字节，被当作没有应答 |
+| 6 | 终审 | `pool::is_quiet` 注明：非阻塞探测可能取到一条已收到半条记录的连接，那部分留给下一个请求——服务端随后关闭时是截断的记录（传输层失败，1 秒内照常重发），剩余部分到达而解不开时报错、不重发 | 终审：探测的这个边角没有说明；#4 之后两种结局不同，如实写出 |
+| 7 | 终审 | 兼容性清单 `snell` 行补上：重试只针对传输层的失败、解不开的应答如实报错；服务端在两帧之间关闭 TCP 连接读作这个方向干净结束，在帧边界上的截断无法察觉（截在帧中间的报错），这样的连接不回池。设计第 14 节第 4 条补上 1 秒的时间窗，新增第 15 节「M6b 实施期的订正」 | 终审：执行期的偏差没有进计划与设计；帧边界的关闭是 Task 2 评审的延后记录 |
+| 8 | 门禁 | 最终门禁（终审修正 a380b3c 之后）：fmt、clippy 通过；`cargo test --workspace --no-fail-fast` 一轮通过：57 个测试二进制 1456 通过 / 0 失败 / 2 忽略 | 终审修正加了 #4、#5 的三个用例 |
 
 ## 延后事项
 
@@ -7093,4 +7101,7 @@ git commit -m "docs: M6b Snell——兼容性清单、手工验收、README 与 
 | 2 | v5 的动态记录大小（P4） | 接受（只影响发送方） |
 | 3 | `obfs-host` 缺省、命令字、`udp-port` 的含义与 Surge 可能不同（P6、P9、P11） | 有真实 Surge 抓包或用户报告时对齐 |
 | 4 | 互操作数不了复用的连接数；snell-server 是否默认开 UDP 未确认（P12） | CI 首跑；手工验收 |
-| 5 | 陈旧连接的重试最多重发 64 KiB，超出就不重试（P8） | 接受 |
+| 5 | 陈旧连接的重试最多重发 64 KiB，超出就不重试（P8）；离开池后 1 秒内的传输层失败仍会重发，旧服务端若已把请求转给目标，同一个请求可能到达两次（已登记进兼容性清单） | 接受 |
+| 6 | 配置：`version` 写作 `04` 或带空格时也被接受；记录流：复用连接上第一个请求没写数据时填充标记不清除（经 `tunnel` 走不到）；池：过期的空闲连接在回收任务清掉之前最多再留约 90 秒（取用时已跳过，模块说明写得过满）；UDP：放不进缓冲的数据报丢弃时没有 `debug` 日志（同 `stream_udp`），`send_to` 写满一条记录只靠 `debug_assert`；测试：引擎参数循环的夹具与假服务端没有关闭、`requests().first()` 在 drop 之前读；兼容性清单 `[Snell Server]` 几行可注明客户端已支持 v4 / v5 | 以后顺手改 |
+| 7 | 每条记录分配一个 `Vec`（至多 128 KiB）；Snell 的 UDP 经 Shadow TLS 没有用例（假定叠起来的流的唤醒彼此独立，同 `tokio::io::split`） | 需要时另议 |
+| 8 | 隧道假定两个方向由同一个任务轮询（重拨的 future 只记得最后一个轮询者的 waker，已注释）；时间窗内重试的用例依赖失败在取出后 1 秒内到达（回环上余量充足）；池探测取到半条记录、剩余部分到达后恰是服务端的合法记录时，它被当作应答之前的数据读出（服务端违反协议才会出现） | 接受 |
