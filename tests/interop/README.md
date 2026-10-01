@@ -1,6 +1,6 @@
 # rurge-interop
 
-`rurge-interop` 是仅供测试使用的工作区成员（`publish = false`），不对外发布，也不是任何其它 crate 的依赖。它把 [sing-box](https://sing-box.sagernet.org/)、[xray](https://github.com/XTLS/Xray-core)、[shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust) 的 `ssserver` 与 Surge 官方的 `snell-server` 作为参照实现，以回环子进程的方式拉起来，驱动 rurge 的 `http` / `https` / `socks5` / `trojan` / `vmess` / `anytls` / `wireguard` / `ss` / `snell` 出站，以及包在 Shadow TLS 里的 `trojan`，去连它们，验证 rurge 与真实的第三方实现互通。xray 只用来跑 `vmess`：VMess 协议由 xray 所在的这一脉实现定义，sing-box 的实现是重写，手写的编解码需要两个独立参照互相印证（M2 设计 M2-D5）。
+`rurge-interop` 是仅供测试使用的工作区成员（`publish = false`），不对外发布，也不是任何其它 crate 的依赖。它把 [sing-box](https://sing-box.sagernet.org/)、[xray](https://github.com/XTLS/Xray-core)、[shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust) 的 `ssserver`、Surge 官方的 `snell-server` 与 [TrustTunnel](https://github.com/TrustTunnel/TrustTunnel) 的 `trusttunnel_endpoint` 作为参照实现，以回环子进程的方式拉起来，驱动 rurge 的 `http` / `https` / `socks5` / `trojan` / `vmess` / `anytls` / `wireguard` / `ss` / `snell` / `h2-connect` / `trust-tunnel` 出站，以及包在 Shadow TLS 里的 `trojan`，去连它们，验证 rurge 与真实的第三方实现互通。xray 只用来跑 `vmess`：VMess 协议由 xray 所在的这一脉实现定义，sing-box 的实现是重写，手写的编解码需要两个独立参照互相印证（M2 设计 M2-D5）。
 
 ## 固定版本
 
@@ -14,12 +14,12 @@
 
 ## 本地运行
 
-本地默认不安装 sing-box、xray、shadowsocks-rust 与 snell-server：`cargo test -p rurge-interop` 会正常通过，sing-box 的十九个互操作用例、xray 的两个、shadowsocks-rust 的两个与 snell-server 的四个互操作用例各打印一行 `skipping …` 后直接返回（各夹具自身的单元测试——配置渲染、"配置绝不碰本机"的安全守卫、取空闲端口——照常运行并断言）。要在本机真正跑 sing-box 的用例，二选一：
+本地默认不安装 sing-box、xray、shadowsocks-rust、snell-server 与 TrustTunnel endpoint：`cargo test -p rurge-interop` 会正常通过，sing-box 的十九个互操作用例、xray 的两个、shadowsocks-rust 的两个、snell-server 的四个与 TrustTunnel endpoint 的四个互操作用例各打印一行 `skipping …` 后直接返回（各夹具自身的单元测试——配置渲染、"配置绝不碰本机"的安全守卫、取空闲端口——照常运行并断言）。要在本机真正跑 sing-box 的用例，二选一：
 
 - 自行安装 sing-box 1.14.2，让 `sing-box` / `sing-box.exe` 出现在 `PATH` 上；或
 - 不安装到 `PATH`，改用 `RURGE_TEST_SING_BOX=<sing-box 可执行文件路径> cargo test -p rurge-interop`。
 
-xray、shadowsocks-rust 与 snell-server 的本机运行方式同理，见下面「xray」「shadowsocks-rust」「snell-server」三节。
+xray、shadowsocks-rust、snell-server 与 TrustTunnel endpoint 的本机运行方式同理，见下面「xray」「shadowsocks-rust」「snell-server」「TrustTunnel」四节。
 
 ## 环境变量
 
@@ -27,7 +27,8 @@ xray、shadowsocks-rust 与 snell-server 的本机运行方式同理，见下面
 - `RURGE_TEST_XRAY`：xray 可执行文件的路径，优先于 `PATH` 查找。
 - `RURGE_TEST_SSSERVER`：shadowsocks-rust 的 `ssserver` 可执行文件的路径，优先于 `PATH` 查找。
 - `RURGE_TEST_SNELL_SERVER`：Surge 官方 `snell-server` 可执行文件的路径，优先于 `PATH` 查找。
-- `RURGE_INTEROP_REQUIRED=1`：找不到二进制时让用例直接失败，而不是打印 `skipping …` 后跳过；对 sing-box、xray、shadowsocks-rust 与 sshd 各夹具都生效，对 snell-server 只在 Linux 上生效（它只有 Linux 版）。CI 会设置它，本机一般不需要。
+- `RURGE_TEST_TRUSTTUNNEL`：TrustTunnel `trusttunnel_endpoint` 可执行文件的路径，优先于 `PATH` 查找。
+- `RURGE_INTEROP_REQUIRED=1`：找不到二进制时让用例直接失败，而不是打印 `skipping …` 后跳过；对 sing-box、xray、shadowsocks-rust 与 sshd 各夹具都生效，对 snell-server 只在 Linux 上生效（它只有 Linux 版），对 TrustTunnel endpoint 只在 Linux 与 macOS 上生效（它没有 Windows 版）。CI 会设置它，本机一般不需要。
 
 ## 覆盖范围
 
@@ -52,6 +53,8 @@ xray、shadowsocks-rust 与 snell-server 的本机运行方式同理，见下面
 - Shadowsocks（`tests/shadowsocks.rs` 里的 `ss_against_sing_box_aead_2022_and_a_user`，阶段 2 / M6a）：sing-box 的 `shadowsocks` 入站，`aes-192-gcm` 与 `xchacha20-ietf-poly1305` 两种 AEAD 方法（shadowsocks-rust 的发布包不带这两种，见下面「shadowsocks-rust」一节）、单密钥的 `2022-blake3-aes-256-gcm`，以及 `2022-blake3-aes-128-gcm` 两个用户里的第二个（`password=服务端密钥:用户密钥`，一层身份头）；每种都做单块与跨多块（100 000 字节）的 TCP 往返，以及经 `udp-relay=true` 往返一个回环 UDP 回显两次。
 
 - Snell（`tests/snell.rs` 里 `…_against_sing_box` 的四个用例，阶段 2 / M6b）：sing-box 的 `snell` 入站（1.14.0 起），`version: 5`、一个 `psk`、不配 `users`（服务端不看 client id）。sing-box 没有"version 4"的入站；`version: 5` 走 v4 / v5 共用的线上格式，所以同时接受 v4 客户端。覆盖 `version=5` 与 `version=4` 两种客户端的单块与跨多块（100 000 字节）TCP 往返；`reuse=true` 时一连四个请求（每个都两个方向干净结束，连接回池给下一个请求用）再加一个大负载；`obfs=http`（入站的 `obfs_mode: http`；含 `reuse=true` 与 UDP）；以及 UDP over TCP（命令 `0x06`）经同一个载体往返一个回环 UDP 回显两次。
+
+**不覆盖 HTTP/2 的 `h2-connect`**：sing-box 1.14.2 的 `http` 入站只说 HTTP/1（TLS 握手之后按 HTTP/1.x 读请求，不设 ALPN、没有 h2 代码路径；HTTP/2 要到 1.15.0，目前仍是预发布），所以 `h2-connect` 的普通 CONNECT 改由 TrustTunnel endpoint 覆盖（见下面「TrustTunnel」一节）。
 
 **不覆盖 `socks5-tls`**：sing-box 的 `socks` 与 `mixed` 入站没有 `tls` 字段（参见 sing-box 文档 `configuration/inbound/{socks,mixed}`），无法用它搭建一个会说 TLS 的 SOCKS5 服务端。`socks5-tls` 的覆盖仍由 M1a 的回环假上游（`rurge_proto::testing::FakeSocks5`）承担。
 
@@ -114,6 +117,30 @@ CI 只在 Linux 上下载、校验并设置 `RURGE_TEST_SNELL_SERVER`；Windows 
 
 渲染出的配置（`rurge_interop::snell_server::render`）是一个 `[snell-server]` 节：`listen = 127.0.0.1:<端口>`、`psk`、`ipv6 = false`，按需加 `obfs = http`；没有 `dns`、`egress-interface` 这些键（夹具的单元用例 `the_configuration_stays_on_the_loopback` 断言只监听回环）。启动命令是 `snell-server -c <配置文件>`，就绪与否看 TCP 端口能否连上。
 
+## TrustTunnel
+
+[TrustTunnel](https://github.com/TrustTunnel/TrustTunnel) 的 endpoint 是 `trust-tunnel` 的参照实现；它的 TCP 模式就是标准的 HTTP/2 CONNECT（`:authority` 为 `host:port`，`proxy-authorization: Basic`，200 / 407 / 502），所以同时充当 `h2-connect` 普通 CONNECT 的参照服务端（sing-box 1.14.2 的 `http` 入站只说 HTTP/1，见上面「覆盖范围」末尾）。互操作测试固定 **v1.1.0**（2026-09-01 发布），只有 Linux 与 macOS 版。CI 下载并校验以下两个发布包（SHA-256 取自 GitHub 发布 API 每个资产的 `digest`）：
+
+| 平台 | 资产 | SHA-256 |
+| ---- | ---- | ------- |
+| Linux (x86_64) | `trusttunnel-v1.1.0-linux-x86_64.tar.gz` | `91c2ea3db7416a01b5258a4c047ec22890490bc55e1b194206031aa75144f0e7` |
+| macOS (universal) | `trusttunnel-v1.1.0-macos-universal.tar.gz` | `126a5688e922ce8f83d4de2d8a2659b3aab97820184d30f2edbecc0ec4a32ae5` |
+
+发布包里是一个以资产名命名的目录，内有 `trusttunnel_endpoint`（另有 `setup_wizard`、签名文件与 `LICENSE`，不用）。
+
+`tests/http2.rs` 驱动的四个用例覆盖：
+
+- `trust-tunnel`：单块与跨多块（100 000 字节）的 TCP 往返；口令错误时 endpoint 回 407，出站报 `trust-tunnel: authentication failed`。
+- `h2-connect`：凭据写在端口之后（位置参数）与写成 `username=` / `password=` 两种，各做单块与跨多块的 TCP 往返；`max-streams=3` 时同时打开七条隧道并全部保持（多于一条连接能承载的流，池要开新连接），每条各自回显自己的字节，之后再开一条新隧道。
+
+**不覆盖 CONNECT-UDP**：TrustTunnel 的 UDP 走它自己的 `_udp2` 复用格式，不是 RFC 9298 的 CONNECT-UDP；目前找不到可用的稳定版参照服务端（sing-box 要到 1.15.0 才在 `http` 入站上提供，且它的发布版是否通告 extended CONNECT 未经核实）。`h2-connect` 的 CONNECT-UDP 由回环假服务端（`rurge_proto::testing::FakeH2Proxy`，开 `enable_connect_protocol`）与手工验收（`docs/acceptance/phase2-manual.md` 的 M6c 一节）覆盖。
+
+endpoint 按 SNI 精确匹配它的主机（`main_hosts[].hostname`），所以夹具的证书签给 `tt.test`，rurge 的每一行都写 `sni=tt.test` 并信任夹具的 CA；ALPN 固定 `h2`（不发 ALPN 时 endpoint 按 HTTP/1 处理）。
+
+CI 只在 Linux 与 macOS 上下载、校验并设置 `RURGE_TEST_TRUSTTUNNEL`；Windows 上这四个用例照常编译，运行时打印 `skipping …` 后返回（`RURGE_INTEROP_REQUIRED=1` 对它只在 Linux 与 macOS 上生效）。本机不安装它：`RURGE_TEST_TRUSTTUNNEL`（优先于 `PATH` 查找）没有指向可执行文件、`PATH` 上也找不到 `trusttunnel_endpoint` 时同样跳过；这个 crate 不会下载或安装它。
+
+渲染出的配置（`rurge_interop::trusttunnel::render`）是三个 TOML 文件：`vpn.toml`（`listen_address = "127.0.0.1:<端口>"`、`ipv6_available = false`、只开 `[listen_protocols.http2]`、`[forward_protocol]` 为 `direct`，以及 `allow_private_network_connections = true`——默认值 `false` 会让 endpoint 拒绝连回环上的 echo）、`hosts.toml`（一个主机 `tt.test` 与证书、私钥的绝对路径）与 `credentials.toml`（一个用户）。夹具的单元用例 `the_configuration_stays_on_the_loopback` 断言只监听回环、只开 HTTP/2。启动命令是 `trusttunnel_endpoint vpn.toml hosts.toml`，就绪与否看 TCP 端口能否连上。
+
 ## sshd
 
 `tests/sshd.rs` 用 OpenSSH 的 `sshd` 验证 `ssh` 出站（阶段 2 M4 设计第 10 节）：OpenSSH 的默认算法，以及只开 Surge 手册要求的 `curve25519-sha256` 与 `aes128-gcm@openssh.com` 两种。不以 root 运行的 `sshd` 只能让运行它的用户登录，所以用例用密钥登录（用户名取环境变量 `USER`），并且只在 Unix 上编译。
@@ -124,6 +151,6 @@ CI 只在 Linux 上下载、校验并设置 `RURGE_TEST_SNELL_SERVER`；Windows 
 
 ## 安全约束
 
-- 夹具渲染出的 sing-box 配置只有 `log` / `inbounds` / `outbounds` 三个顶层键（WireGuard 的配置另有 `endpoints`）；每个入站只监听 `127.0.0.1`；唯一的出站是 `direct`。WireGuard 端点在用户态运行（`system: false`），它的 UDP 端口开在所有地址上（端点没有监听地址这一项；`rurge_interop::render_wireguard` 的单元测试 `the_wireguard_configuration_never_touches_the_machine` 断言其余各项）。xray 配置同样只有这三个顶层键，唯一的出站是 `freedom`。`ssserver` 的配置只有 `servers`，每个服务端只听 `127.0.0.1`（TCP 与同号的 UDP）。`snell-server` 的配置只有 `[snell-server]` 一节，只听 `127.0.0.1`。任何地方都不出现 `set_system_proxy`、`tun`、`auto_route` 这些键（`rurge_interop::render` 与 `rurge_interop::xray::render` 的单元测试 `the_configuration_never_touches_the_machine` 各自断言这一点）；`shadowtls` 入站的 `handshake.server` 恒为 `127.0.0.1`（夹具的单元用例断言）。
-- 每个用例的连接目标都是回环 IP 字面量（`127.0.0.1` 上的 echo / 测试服务器；WireGuard 用例在隧道里连的是 sing-box 自己的隧道地址 `10.9.0.1`，由 sing-box 映射到它的 `127.0.0.1`），sing-box、xray、`ssserver` 与 `snell-server` 因此既不解析域名也不会访问公网。
-- 这个 crate 本身不下载、不安装任何东西；本机是否装有 sing-box、xray、shadowsocks-rust 或 snell-server 由项目所有者决定，没装就跳过。
+- 夹具渲染出的 sing-box 配置只有 `log` / `inbounds` / `outbounds` 三个顶层键（WireGuard 的配置另有 `endpoints`）；每个入站只监听 `127.0.0.1`；唯一的出站是 `direct`。WireGuard 端点在用户态运行（`system: false`），它的 UDP 端口开在所有地址上（端点没有监听地址这一项；`rurge_interop::render_wireguard` 的单元测试 `the_wireguard_configuration_never_touches_the_machine` 断言其余各项）。xray 配置同样只有这三个顶层键，唯一的出站是 `freedom`。`ssserver` 的配置只有 `servers`，每个服务端只听 `127.0.0.1`（TCP 与同号的 UDP）。`snell-server` 的配置只有 `[snell-server]` 一节，只听 `127.0.0.1`。TrustTunnel endpoint 只听 `127.0.0.1`、只开 HTTP/2，转发只有 `direct`；`allow_private_network_connections = true` 只是为了让它连回环上的 echo。任何地方都不出现 `set_system_proxy`、`tun`、`auto_route` 这些键（`rurge_interop::render` 与 `rurge_interop::xray::render` 的单元测试 `the_configuration_never_touches_the_machine` 各自断言这一点）；`shadowtls` 入站的 `handshake.server` 恒为 `127.0.0.1`（夹具的单元用例断言）。
+- 每个用例的连接目标都是回环 IP 字面量（`127.0.0.1` 上的 echo / 测试服务器；WireGuard 用例在隧道里连的是 sing-box 自己的隧道地址 `10.9.0.1`，由 sing-box 映射到它的 `127.0.0.1`），sing-box、xray、`ssserver`、`snell-server` 与 TrustTunnel endpoint 因此既不解析域名也不会访问公网。
+- 这个 crate 本身不下载、不安装任何东西；本机是否装有 sing-box、xray、shadowsocks-rust、snell-server 或 TrustTunnel endpoint 由项目所有者决定，没装就跳过。

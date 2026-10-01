@@ -392,7 +392,7 @@ Surge 手册没有定义这些端点的响应结构（PRD R5）：以收集到�
 | M2 | sing-box（trojan / vmess / anytls / shadowtls，含 ws 传输）；xray 只用于 vmess（M2 细化设计 M2-D5） |
 | M4 | sing-box 的用户态 WireGuard 端点（含保留字节，对应 `client-id`）；系统 `sshd`（没有则跳过） |
 | M5 | 同上各服务端的 UDP |
-| M6 | 按 M6 细化设计 M6-D5：shadowsocks-rust v1.25.0（含 2022 与多用户，三平台）与 sing-box 的 `shadowsocks` 入站：`ss`；sing-box 的 `snell` 入站（1.14.0 起，只支持 v5 / v6；`version: 5` 同时接受 v4 客户端）：`snell`，三平台，CI 固定的 sing-box 为此从 1.14.1 升到 1.14.2（M6-D6）；官方 snell-server v5.0.1 只有 Linux 版，只在 Linux CI 跑；sing-box 的 `http` 入站（HTTP/2 over TLS）：`h2-connect` 的普通 CONNECT；TrustTunnel endpoint v1.1.0 只有 Linux / macOS 版，只在这两个平台的 CI 跑；CONNECT-UDP over HTTP/2 与 obfs 没有可用的预编译参考服务端，只有回环假服务端与手工验收 |
+| M6 | 按 M6 细化设计 M6-D5：shadowsocks-rust v1.25.0（含 2022 与多用户，三平台）与 sing-box 的 `shadowsocks` 入站：`ss`；sing-box 的 `snell` 入站（1.14.0 起，只支持 v5 / v6；`version: 5` 同时接受 v4 客户端）：`snell`，三平台，CI 固定的 sing-box 为此从 1.14.1 升到 1.14.2（M6-D6）；官方 snell-server v5.0.1 只有 Linux 版，只在 Linux CI 跑；TrustTunnel endpoint v1.1.0（只有 Linux / macOS 版，只在这两个平台的 CI 跑）：`trust-tunnel`（h2），它的 TCP 模式是标准的 HTTP/2 CONNECT + Basic 认证，同时充当 `h2-connect` 普通 CONNECT 的参照——sing-box 1.14.2 的 `http` 入站只说 HTTP/1（HTTP/2 要到 1.15.0，仍是预发布），不用于 HTTP/2 族；CONNECT-UDP over HTTP/2 与 obfs 没有可用的预编译参考服务端，只有回环假服务端与手工验收 |
 | M7 | sing-box（tuic / hysteria2）；MASQUE 与 trust-tunnel 的参考服务端在 M7 细化设计里选定 |
 
 **沿用的安全约束**：测试只用回环地址、不碰公网；不修改本机的系统代理，不注册真实服务；`external` 的测试只拉起测试自带的辅助程序。策略组算法用假出站与可控时钟做单元测试；订阅装配用本地文件与回环 HTTP 服务器。
@@ -443,7 +443,7 @@ Surge 手册没有定义这些端点的响应结构（PRD R5）：以收集到�
 | Q3 | 六个 API 端点的 JSON 形状 | M1 / M3 细化设计时按真实样本定（PRD R5） |
 | Q4 | sing-box 的用户态 WireGuard 端点能否充当带保留字节的对端 | M4b 已决：sing-box 1.14.1 的 `endpoints`（`type: wireguard`，`system: false`）以 `peers[].reserved` 给发往 rurge 的报文写保留字节，可以充当；它的 UDP 端口开在所有地址上（端点没有监听地址这一项）。互操作用例只在 CI 上跑；回环对端另用 boringtun 写（`FakeWgPeer`） |
 | Q5 | `russh` 的算法覆盖 | 已决（2026-09-27，M4-D2 与 M4 设计第 17 节）：russh 0.63.3 支持 `curve25519-sha256` 与 `aes128-gcm@openssh.com`；后者不在默认列表里，rurge 显式加上，并去掉 SHA-1 的 `ssh-rsa` 主机密钥签名 |
-| Q6 | MASQUE 与 trust-tunnel 的参考服务端 | M7 细化设计时选定 |
+| Q6 | MASQUE 与 trust-tunnel 的参考服务端 | 部分已决（2026-10-01，M6c）：`trust-tunnel` 的 h2 用 TrustTunnel endpoint v1.1.0（Linux / macOS），它也是 `h2-connect` 普通 CONNECT 的参照；MASQUE 与 `trust-tunnel` 的 h3 在 M7 细化设计时选定 |
 | Q7 | Snell 各版本可依据的公开资料 | 已决（2026-09-30，M6 细化设计第 4.1 节）：v4 / v5 的 TCP 线上格式依据 missuo/opensnell 与 SagerNet/sing-snell 的公开描述（均为 GPL，只取协议事实，M6-D3），sing-box 1.14.0 起的 `snell` 入站实现 v5 / v6；v1 ～ v3 另有 icpz/open-snell；v6 细节未公开，不做 |
 
 ## 17. 需同步的文档

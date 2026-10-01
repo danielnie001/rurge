@@ -9,6 +9,7 @@
 pub mod shadowsocks_rust;
 pub mod snell_server;
 pub mod sshd;
+pub mod trusttunnel;
 pub mod xray;
 
 use base64::Engine;
