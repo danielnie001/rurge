@@ -22,11 +22,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version=1.14.1
+          version=1.14.2
           case "$RUNNER_OS" in
-            Linux)   asset="sing-box-$version-linux-amd64.tar.gz";  sha=12cb2816b52febb356f6a885b740cc8758c3f30b8ae0ca8edba80f0d2d35343f ;;
-            Windows) asset="sing-box-$version-windows-amd64.zip";   sha=5197f16d492d93202dc623622149a6ed040f8eca263128f91d603f2b901baa89 ;;
-            macOS)   asset="sing-box-$version-darwin-arm64.tar.gz"; sha=b9024642ef7b4848252df5469b7f60ef3c18bb5e217a16a0934f0174f8ad11b4 ;;
+            Linux)   asset="sing-box-$version-linux-amd64.tar.gz";  sha=a684484d7477d1437282ee411f4d131d0340aaad60a7868841ebd5d87dd8a0c6 ;;
+            Windows) asset="sing-box-$version-windows-amd64.zip";   sha=c2d8bfff918755808781dfdeeb8581b6c91eb3a243d9a7b55483cfc0c0684d32 ;;
+            macOS)   asset="sing-box-$version-darwin-arm64.tar.gz"; sha=925c5382eca8492b0150f868a6db20b18290a38700e621724b3703fd453e032d ;;
             *) echo "unexpected runner OS: $RUNNER_OS"; exit 1 ;;
           esac
           cd "$RUNNER_TEMP"
@@ -112,6 +112,27 @@ jobs:
           chmod +x "$bin"
           if [ "$RUNNER_OS" = "Windows" ]; then bin=$(cygpath -w "$bin"); fi
           echo "RURGE_TEST_SSSERVER=$bin" >> "$GITHUB_ENV"
+      - name: Install snell-server for the Snell interoperability tests
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=5.0.1
+          asset="snell-server-v$version-linux-amd64.zip"
+          sha=9bea1c2b9e35b73b31634856c04d18c393072b9e5dcde6a32781d8b8f908c539
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 --retry-all-errors -o "$asset" "https://dl.nssurge.com/snell/$asset"
+          actual=$(sha256sum "$asset" | cut -d' ' -f1)
+          if [ "$actual" != "$sha" ]; then
+            echo "snell-server checksum mismatch: expected $sha, got $actual"
+            exit 1
+          fi
+          mkdir -p snell-server
+          unzip -q "$asset" -d snell-server
+          bin=$(find "$PWD/snell-server" -type f -name snell-server | head -n 1)
+          [ -n "$bin" ] || { echo "no snell-server binary in $asset"; exit 1; }
+          chmod +x "$bin"
+          echo "RURGE_TEST_SNELL_SERVER=$bin" >> "$GITHUB_ENV"
       - name: Point the SSH interoperability tests at OpenSSH's sshd
         if: runner.os != 'Windows'
         shell: bash

@@ -50,9 +50,9 @@
 | **M3 策略组、订阅与连通性测试** | 连通性测试、`url-test` `fallback` `load-balance` `smart`、全部组参数、`policy-path` / `include-*` 装配、嵌套 / 环 / 兜底、临时覆盖、组级 `underlying-proxy`、订阅更新热重建、测试与切换 API | FR-OUT-03（`test-url` `test-timeout`）/ 10、FR-GRP-01 / 03 ～ 07 | 订阅样本解析正确；组算法单测与端到端测试；API 测试与切换正确。M3 细化设计 `2026-09-23-phase2-m3-groups-subscriptions-design.md`把它拆成三份计划：M3a（成员装配与订阅，订阅优先）→ M3b（测速与 `url-test` / `fallback` / `load-balance`）→ M3c（`smart`） |
 | **M4 WireGuard / SSH / external** | `rurge-proto-wireguard`（多 peer 路由、定时器、分片重组、`client-id`、RTT 探测、ICMP echo、DSCP）、`DirectConnector` 的 UDP 载体、`rurge-proto-ssh`、`external` 进程监管、`[WireGuard <name>]` 类型化、Keystore 的 OpenSSH 私钥 | FR-CFG-11（openssh）、FR-OUT-05 / 12 / 13 | WireGuard 与带 `client-id` 的端点握手并转发 TCP；SSH 动态转发；`external` 进程退出自动重启。M4 细化设计 `2026-09-27-phase2-m4-wireguard-ssh-external-design.md` 把它拆成三份计划：M4a（SSH）→ M4b（WireGuard）→ M4c（external） |
 | **M5 UDP 路径** | SOCKS5 UDP ASSOCIATE 入站、引擎 UDP 流水线、DIRECT UDP、已有协议的 UDP（`socks5` `trojan` `vmess` `anytls` `wireguard` `external`）、`udp-relay` `udp-port` `udp-policy-not-supported-behaviour`、UDP 测试（`test-udp` / `proxy-test-udp`）、`block-quic`、UDP 载体的链式拨号、`dns-follow-interface` | FR-IN-02（UDP）、FR-OUT-03（`test-udp` `block-quic`）/ 07 / 08（UDP）/ 11、FR-DNS-10 | 各协议 UDP 对参考服务器转发通过；不支持 UDP 的策略按全局设置处理 |
-| **M6 Shadowsocks / Snell / HTTP/2 族** | `ss`（AEAD、2022、obfs，含 UDP）、`snell` v1 ～ v4（obfs、reuse，v3+ UDP）、`h2-connect`（`max-streams`、CONNECT-UDP）、`trust-tunnel`（h2） | FR-OUT-05 / 07 | 四种协议对参考实现转发通过 |
+| **M6 Shadowsocks / Snell / HTTP/2 族** | `ss`（AEAD、2022、obfs，含 UDP）、`snell` v4 / v5（obfs `http`、reuse，UDP over TCP；v1 ～ v3 与 v6 只解析、按 REJECT 处理，见 M6 细化设计 M6-D2）、`h2-connect`（`max-streams`、CONNECT-UDP）、`trust-tunnel`（h2） | FR-OUT-05 / 07 | 四种协议对参考实现转发通过 |
 | **M7 QUIC 族** | `rurge-net::quic` 公共件、`rurge-proto-quic`（`tuic` `tuic-v5` `hysteria2` `masque`、`trust-tunnel` 的 h3 模式）、`port-hopping`、`ecn`、DoH3 / DoQ 上游 | FR-OUT-03（`ecn`）/ 05、FR-DNS-04 | QUIC 族 TCP 与 UDP 转发通过；`h3://` `quic://` 上游解析正常 |
-| **M8 收尾与验收** | P2 项（Shadowsocks 流式旧方法、VMess 旧握手）、Snell v5 / v6 · Gecko · Tailscale 可行性报告、阶段验收清单、文档同步 | FR-OUT-06 / 15 | 第 14 节验收标准全部通过 |
+| **M8 收尾与验收** | P2 项（Shadowsocks 流式旧方法、VMess 旧握手）、Snell v1 ～ v3（需要时）、Snell v6 与 v5 QUIC Proxy Mode · Gecko · Tailscale 可行性报告、阶段验收清单、文档同步 | FR-OUT-06 / 15 | 第 14 节验收标准全部通过 |
 
 M1 体量大，细化设计时可按阶段 1 的先例拆成 M1a（配置与抽象）/ M1b（协议、注册表、API）。
 
@@ -73,7 +73,7 @@ M1 体量大，细化设计时可按阶段 1 的先例拆成 M1a（配置与抽�
 | SSH | `russh` 客户端，动态转发用 direct-tcpip 通道；OpenSSH 私钥解析用 `ssh-key` | M4 | 已验证（M4a）：russh 0.63.3（`ring` 后端）两者都支持，`aes128-gcm@openssh.com` 不在它的默认列表里，由 rurge 显式加上（见 Q5） |
 | WireGuard | `boringtun` 的 sans-IO `Tunn`（Noise 握手与定时器）；`client-id` 在包头保留字节上处理；多 peer 的最长前缀路由复用现有 `prefix-trie` | M4 | 风险 C：boringtun 的维护节奏 |
 | 用户态协议栈 | `smoltcp`，作为 `rurge-proto-wireguard` 的内部模块（见 D9）；M4b 用 0.12.0，拥塞控制 Reno | M4 | TCP 吞吐基准 |
-| Snell | 协议非公开（PRD R1 / R7）：只依据公开的第三方资料实现 v1 ～ v4 | M6 | 各版本可得的公开资料范围 |
+| Snell | 协议非公开（PRD R1 / R7）：只依据公开的第三方资料实现 v4 / v5 的 TCP 线上格式（v5 在 TCP 上与 v4 相同；M6 细化设计第 4.1 节、M6-D2） | M6 | 各版本可得的公开资料范围 |
 | 测试证书 | `rcgen`（已是 dev 依赖）现场生成自签链 | M1 | — |
 
 ## 3. Workspace 与 crate 边界
@@ -392,7 +392,7 @@ Surge 手册没有定义这些端点的响应结构（PRD R5）：以收集到�
 | M2 | sing-box（trojan / vmess / anytls / shadowtls，含 ws 传输）；xray 只用于 vmess（M2 细化设计 M2-D5） |
 | M4 | sing-box 的用户态 WireGuard 端点（含保留字节，对应 `client-id`）；系统 `sshd`（没有则跳过） |
 | M5 | 同上各服务端的 UDP |
-| M6 | 按 M6 细化设计 M6-D5：shadowsocks-rust v1.25.0（含 2022 与多用户，三平台）与 sing-box 的 `shadowsocks` 入站：`ss`；sing-box 的 `snell` 入站（1.14.0 起，只支持 v5 / v6）：`snell`，三平台；官方 snell-server v5.0.1 只有 Linux 版，只在 Linux CI 跑；sing-box 的 `http` 入站（HTTP/2 over TLS）：`h2-connect` 的普通 CONNECT；TrustTunnel endpoint v1.1.0 只有 Linux / macOS 版，只在这两个平台的 CI 跑；CONNECT-UDP over HTTP/2 与 obfs 没有可用的预编译参考服务端，只有回环假服务端与手工验收 |
+| M6 | 按 M6 细化设计 M6-D5：shadowsocks-rust v1.25.0（含 2022 与多用户，三平台）与 sing-box 的 `shadowsocks` 入站：`ss`；sing-box 的 `snell` 入站（1.14.0 起，只支持 v5 / v6；`version: 5` 同时接受 v4 客户端）：`snell`，三平台，CI 固定的 sing-box 为此从 1.14.1 升到 1.14.2（M6-D6）；官方 snell-server v5.0.1 只有 Linux 版，只在 Linux CI 跑；sing-box 的 `http` 入站（HTTP/2 over TLS）：`h2-connect` 的普通 CONNECT；TrustTunnel endpoint v1.1.0 只有 Linux / macOS 版，只在这两个平台的 CI 跑；CONNECT-UDP over HTTP/2 与 obfs 没有可用的预编译参考服务端，只有回环假服务端与手工验收 |
 | M7 | sing-box（tuic / hysteria2）；MASQUE 与 trust-tunnel 的参考服务端在 M7 细化设计里选定 |
 
 **沿用的安全约束**：测试只用回环地址、不碰公网；不修改本机的系统代理，不注册真实服务；`external` 的测试只拉起测试自带的辅助程序。策略组算法用假出站与可控时钟做单元测试；订阅装配用本地文件与回环 HTTP 服务器。
@@ -418,7 +418,7 @@ Surge 手册没有定义这些端点的响应结构（PRD R5）：以收集到�
 | A | Shadow TLS v3 要求自定 ClientHello 的 SessionID，stock rustls 没有这个钩子 | v3 可能做不了或需要维护补丁 | **已解除（2026-09-20）**：spike 证实可以只用 rustls 的公开扩展点（可替换的随机源与密钥交换组）两遍构造 ClientHello，不需要补丁；残余风险是 rustls 升级改变 ClientHello 的生成方式——实现带运行期自检与单元测试绊线（M2 细化设计附录 A） |
 | B | `h3` 的 extended CONNECT 与 HTTP Datagram 仍属实验特性 | MASQUE 与 trust-tunnel 的 h3 模式 | M7 细化设计先验证；不成熟则该两项延后并登记，不阻塞 TUIC / Hysteria 2 |
 | C | boringtun 维护节奏慢 | WireGuard 的长期维护 | 经 trait 隔离；备选同源 fork（NepTUN） |
-| D | Snell 与 `smart` 的细节非公开（PRD R1） | 行为无法完全一致 | 近似实现，差异登记在清单；Snell v5 / v6 只出可行性报告 |
+| D | Snell 与 `smart` 的细节非公开（PRD R1） | 行为无法完全一致 | 近似实现，差异登记在清单；Snell v6 只出可行性报告 |
 | E | 范围过大（PRD R6） | 迟迟没有可用版本 | 按使用优先级排里程碑、TCP 优先、P2 放最后；M1 + M2 结束即可用手写的 `[Proxy]` 与 `select` 组日常使用，订阅与自动组随 M3 到位 |
 | F | 参考二进制的版本漂移与各平台可得性 | 互操作测试不稳定 | 固定版本 + SHA256；缺失时本机跳过、CI 失败 |
 | G | smoltcp 的 TCP 吞吐 | WireGuard 出站性能 | M4 做基准；接口收窄以便替换；阶段 3 复核。M4b 实测（Windows 11 回环、两端都是 smoltcp 的双向回显）约 6 MiB/s 每方向；0.12 另有回退 N 重传、没有零窗口探测等限制（M4 设计第 19 节、M4b 计划 P3） |

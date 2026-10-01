@@ -7,6 +7,7 @@
 //! `auto_route`; a WireGuard endpoint runs in user space).
 
 pub mod shadowsocks_rust;
+pub mod snell_server;
 pub mod sshd;
 pub mod xray;
 
@@ -87,6 +88,12 @@ pub enum InboundKind {
     Shadowsocks {
         method: &'static str,
     },
+    /// Snell `version: 5`, which also accepts v4 clients (the wire format
+    /// is the same); `users[0]` holds the PSK (the name is ignored). With
+    /// `obfs_http`, simple-obfs `http` in front (`obfs_mode: http`).
+    Snell {
+        obfs_http: bool,
+    },
 }
 
 pub struct TlsFiles {
@@ -124,6 +131,7 @@ pub fn render(inbounds: &[(Inbound, u16)]) -> Value {
                     InboundKind::AnyTls => "anytls",
                     InboundKind::ShadowTls { .. } => "shadowtls",
                     InboundKind::Shadowsocks { .. } => "shadowsocks",
+                    InboundKind::Snell { .. } => "snell",
                 },
                 "tag": format!("in-{i}"),
                 "listen": "127.0.0.1",
@@ -155,6 +163,13 @@ pub fn render(inbounds: &[(Inbound, u16)]) -> Value {
                         .iter()
                         .map(|(u, p)| json!({ "name": u, "password": p }))
                         .collect();
+                }
+            } else if let InboundKind::Snell { obfs_http } = inbound.kind {
+                let (_, psk) = inbound.users.first().expect("a Snell PSK");
+                v["version"] = json!(5);
+                v["psk"] = json!(psk);
+                if obfs_http {
+                    v["obfs_mode"] = json!("http");
                 }
             } else if !inbound.users.is_empty() {
                 v["users"] = inbound
@@ -506,6 +521,24 @@ mod tests {
                 },
                 1010,
             ),
+            (
+                Inbound {
+                    kind: InboundKind::Snell { obfs_http: false },
+                    users: vec![("ignored".into(), "sn3ll".into())],
+                    tls: None,
+                    ws_path: None,
+                },
+                1011,
+            ),
+            (
+                Inbound {
+                    kind: InboundKind::Snell { obfs_http: true },
+                    users: vec![("ignored".into(), "sn3ll".into())],
+                    tls: None,
+                    ws_path: None,
+                },
+                1012,
+            ),
         ]
     }
 
@@ -602,6 +635,14 @@ mod tests {
             multi["users"],
             json!([{ "name": "u", "password": "ZmVkY2JhOTg3NjU0MzIxMA==" }])
         );
+        // version 5 (it takes v4 clients too), one PSK and no users
+        let snell = &config["inbounds"][10];
+        assert_eq!(
+            (&snell["type"], &snell["version"], &snell["psk"]),
+            (&json!("snell"), &json!(5), &json!("sn3ll"))
+        );
+        assert!(snell.get("users").is_none() && snell.get("obfs_mode").is_none());
+        assert_eq!(config["inbounds"][11]["obfs_mode"], "http");
     }
 
     fn endpoint() -> WireGuardEndpoint {

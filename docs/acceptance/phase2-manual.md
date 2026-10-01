@@ -189,3 +189,15 @@
 - [ ] 口令错误：把 AEAD 节点的 `password` 改错一位，重载后访问 `https://example.com/`：请求失败，会话记录的 `error` 是 `ss: the server closed the connection without answering`（或转发阶段的错误；服务端一直不回时由空闲超时结束），与服务端的其它问题分辨不出（已知差异，见兼容性清单 `ss` 一行）；**错误文本与日志都不含口令**。2022 节点把密钥换成另一把合法长度的 Base64 密钥，表现相同；把密钥写成不合法的 Base64，`rurge check` 报 `E0018` 且不引用取值。
 - [ ] 时钟偏差：2022 节点，把本机时钟拨偏 2 分钟（超出 30 秒的窗口），重复 TCP 一项：服务端不应答，会话记录的 `error` 同上一项；改回时钟后恢复正常。
 - [ ] 脱敏：`GET /v1/policies/detail?policy_name=<策略名>` 与 `GET /v1/profiles/current` 里 `password` 与 `obfs-host` 都是 `***`。
+
+## M6b　Snell
+
+前置：同 M5a 一节的 SOCKS5 UDP 客户端；自己的 Snell v5 节点（记下服务端实现与版本，如官方 snell-server v5.0.1 或 sing-box 的 `snell` 入站），另开一个同样的节点（或同一节点的第二个端口）配 `obfs = http`。每份配置 `[Rule]` 里 `FINAL,<策略名>`，`rurge check -c <配置>` 零错误（没有 `W0007`）。
+
+- [ ] TCP：`snell` 策略写 `psk=<psk>, version=5`，`curl -x http://127.0.0.1:<http-listen 端口> https://example.com/ -I` 与 `curl --socks5-hostname 127.0.0.1:<socks5-listen 端口> https://example.com/ -I` 都返回 200，请求记录里策略链是该策略、`error` 为空；服务端先说话的协议（经代理连一个 SMTP / SSH 主机）能看到对端的欢迎行。把 `version` 改成 4，重载后同样可用（v5 服务端接受 v4 客户端）。
+- [ ] `reuse`：`reuse=true` 时连续访问几个网站，抓包（或服务端日志）看到后面的请求走同一条 TCP 连接、没有新的握手；空闲 60 秒后这条连接被关掉。去掉 `reuse`（或 `reuse=false`）后每个请求各开一条连接。`reuse=true` 下服务端重启一次，之后的第一个请求照常成功（池里的旧连接失效时换新连接重试一次）。
+- [ ] obfs：`obfs=http, obfs-host=<伪装域名>` 连配了 `obfs = http` 的节点，TCP 与 UDP 都能往返；抓包看到首个包是带 `Host: <伪装域名>:<端口>`（端口为 80 时不带端口）与 `Upgrade: websocket` 的 `GET` 请求；不写 `obfs-host` 时伪装域名是服务器主机名（Surge 用 `bing.com`，已知差异，见兼容性清单 `snell` 一行）。
+- [ ] UDP：不需要参数（v4 / v5 自动支持 UDP），经 SOCKS5 UDP 发 DNS 查询（如 Proxifier 代理 `nslookup example.com 8.8.8.8`）得到回答；经它进行一次语音通话或联机游戏；用 NAT 类型检测工具（STUN）检测，结果是 Full Cone（节点的出口须是全锥）；抓包确认 UDP 是经一条 TCP 连接送到节点的（UDP over TCP），不写 `udp-port` 时连的是主端口。
+- [ ] psk 错误：把 `psk` 改错一位，重载后访问 `https://example.com/`：请求失败，会话记录的 `error` 是 `snell: the server closed the connection without answering`（或 `snell: the server's data failed to decrypt (wrong psk or version?)`；记下实际是哪一个）；**错误文本与日志都不含 psk**。
+- [ ] 版本不符：删掉 `version`（Surge 的缺省是 1），`rurge check` 报一条 `W0007`：`` `snell` version 1 (the default when `version` is not written) is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT ``；运行时这条策略 REJECT，会话记录写 `policy protocol not implemented: snell v1`。`version=6` 同样是 `W0007`，会话记录写 `snell v6`。
+- [ ] 脱敏：`GET /v1/policies/detail?policy_name=<策略名>` 与 `GET /v1/profiles/current` 里 `psk` 与 `obfs-host` 都是 `***`。
