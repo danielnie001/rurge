@@ -185,3 +185,28 @@ fn a_trojan_policy_takes_part_in_the_chain_checks() {
         [codes::E_UNKNOWN_POLICY_REF]
     );
 }
+
+/// `h3=true` on `trust-tunnel` is said once per load and the policy keeps
+/// HTTP/2 (phase 2 M6 design 5.1).
+#[test]
+fn trust_tunnel_h3_is_reported_once_per_load() {
+    let loaded = load(
+        "A = trust-tunnel, a.example, 443, username=u, password=p, h3=true
+B = trust-tunnel, b.example, 443, username=u, password=p, h3=true",
+        "",
+    );
+    assert!(!loaded.diagnostics.has_errors(), "{:?}", loaded.diagnostics);
+    let inert: Vec<(String, u32)> = loaded
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == codes::W_PARAM_NOT_EFFECTIVE)
+        .map(|d| (d.message.clone(), d.span.as_ref().unwrap().line))
+        .collect();
+    assert_eq!(
+        inert,
+        [(
+            "policy parameter `h3` is parsed but has no effect in this version".to_string(),
+            2
+        )]
+    );
+}

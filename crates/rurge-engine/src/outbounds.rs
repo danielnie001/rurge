@@ -272,6 +272,14 @@ impl OutboundFactory for EngineFactory {
                 self.roots.clone(),
                 connector,
             )?),
+            // the loader makes no spec of these lines before M6c task 6
+            ProtoSpec::H2Connect(_) | ProtoSpec::TrustTunnel(_) => {
+                return Err(BuildError::new(format!(
+                    "policy `{}`: `{}` is not implemented yet",
+                    spec.name,
+                    spec.kind.keyword()
+                )));
+            }
             // nothing starts here: the program starts on the first dial
             ProtoSpec::External(external) => {
                 let outbound = ExternalOutbound::new(

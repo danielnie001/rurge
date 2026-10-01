@@ -4,6 +4,7 @@ pub mod anytls;
 pub mod common;
 pub mod external;
 pub mod group;
+pub mod h2;
 pub mod http;
 pub mod obfs;
 pub mod reader;
@@ -25,6 +26,7 @@ pub use external::ExternalSpec;
 pub use group::{
     GroupOutcome, GroupSpec, ImportOpts, PolicyPath, Priority, TestOpts, to_group_spec,
 };
+pub use h2::{H2ConnectSpec, TrustTunnelSpec};
 pub use http::{HeaderPart, HeaderTemplate, HttpSpec};
 pub use obfs::{ObfsMode, ObfsOpts};
 pub use reader::ParamReader;
@@ -77,6 +79,8 @@ pub enum ProtoSpec {
     External(ExternalSpec),
     Ss(SsSpec),
     Snell(SnellSpec),
+    H2Connect(H2ConnectSpec),
+    TrustTunnel(TrustTunnelSpec),
 }
 
 impl ProtoSpec {
@@ -88,6 +92,8 @@ impl ProtoSpec {
             ProtoSpec::Trojan(trojan) => Some(&trojan.tls),
             ProtoSpec::Vmess(vmess) => vmess.tls.as_ref(),
             ProtoSpec::AnyTls(anytls) => Some(&anytls.tls),
+            ProtoSpec::H2Connect(h2) => Some(&h2.tls),
+            ProtoSpec::TrustTunnel(tt) => Some(&tt.tls),
             ProtoSpec::Direct
             | ProtoSpec::Reject(_)
             | ProtoSpec::Ssh(_)
@@ -201,6 +207,23 @@ fn read_credentials(r: &mut ParamReader<'_>) -> (Option<Secret<String>>, Option<
     (username, password)
 }
 
+/// `headers`: a malformed list is `E0018`, its entry named by position.
+fn read_headers(r: &mut ParamReader<'_>) -> Vec<HeaderTemplate> {
+    let Some(v) = r.str("headers") else {
+        return Vec::new();
+    };
+    match HeaderTemplate::parse_list(v) {
+        Ok(list) => list,
+        Err(why) => {
+            r.error(
+                codes::E_INVALID_POLICY_PARAM,
+                format!("invalid `headers`: {why}"),
+            );
+            Vec::new()
+        }
+    }
+}
+
 fn check_underlying(r: &mut ParamReader<'_>, common: &mut CommonOpts, env: &SpecEnv<'_>) {
     let Some(name) = common.underlying_proxy.clone() else {
         return;
@@ -254,16 +277,7 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             };
             let (username, password) = read_credentials(&mut r);
             let always_use_connect = r.bool("always-use-connect").unwrap_or(false);
-            let mut headers = Vec::new();
-            if let Some(v) = r.str("headers") {
-                match HeaderTemplate::parse_list(v) {
-                    Ok(list) => headers = list,
-                    Err(why) => r.error(
-                        codes::E_INVALID_POLICY_PARAM,
-                        format!("invalid `headers`: {why}"),
-                    ),
-                }
-            }
+            let headers = read_headers(&mut r);
             (
                 common,
                 ProtoSpec::Http(HttpSpec {
@@ -345,6 +359,20 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             let anytls = anytls::read_anytls(&mut r, env.keystore);
             (common, ProtoSpec::AnyTls(anytls))
         }
+        PolicyKind::H2Connect => {
+            let common = read_common(&mut r, Applies::Proxy, &mut notes);
+            let h2 = h2::read_h2_connect(&mut r, env.keystore);
+            (common, ProtoSpec::H2Connect(h2))
+        }
+        PolicyKind::TrustTunnel => {
+            let common = read_common(&mut r, Applies::Proxy, &mut notes);
+            let read = h2::read_trust_tunnel(&mut r, env.keystore);
+            // connects over HTTP/2 until the QUIC family (phase 2 M6 design 5.1)
+            if read.h3 {
+                notes.inert.push("h3");
+            }
+            (common, ProtoSpec::TrustTunnel(read.spec))
+        }
         PolicyKind::Ssh => {
             let common = read_common(&mut r, Applies::Proxy, &mut notes);
             let ssh = ssh::read_ssh(&mut r, env.keystore);
@@ -387,7 +415,10 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     }
     let failed = r.has_errors();
     let diagnostics = r.finish();
-    let spec = (!failed && not_implemented.is_none()).then(|| PolicySpec {
+    // the engine builds `h2-connect` and `trust-tunnel` from M6c task 6 on:
+    // until then a valid line is checked in full but has no spec
+    let built = !matches!(policy.kind, PolicyKind::H2Connect | PolicyKind::TrustTunnel);
+    let spec = (!failed && not_implemented.is_none() && built).then(|| PolicySpec {
         name: policy.name.clone(),
         kind: policy.kind,
         server: policy.server.clone(),
@@ -965,5 +996,74 @@ mod tests {
             .keystore_item(),
             None
         );
+    }
+
+    /// `h2-connect` and `trust-tunnel` lines are read and checked in full;
+    /// they have no spec until the engine builds them (M6c task 6).
+    #[test]
+    fn h2_connect_and_trust_tunnel_lines_are_checked_but_have_no_spec_yet() {
+        for def in [
+            "h2-connect, 1.2.3.4, 443, max-streams=5",
+            "h2-connect, h.test, 443, user, pass, udp-relay=true, client-cert=cert1, shadow-tls-password=st, underlying-proxy=Entry",
+            "trust-tunnel, 192.168.20.62, 443, username=test, password=test",
+            "trust-tunnel, h.test, 443, username=u, password=p, client-cert=cert1, shadow-tls-password=st, underlying-proxy=Pick",
+        ] {
+            let o = outcome("T", def);
+            assert!(o.diagnostics.is_empty(), "{def}: {:?}", o.diagnostics);
+            assert!(o.inert.is_empty(), "{def}: {:?}", o.inert);
+            assert!(o.spec.is_none() && o.not_implemented.is_none(), "{def}");
+        }
+        let o = outcome(
+            "T",
+            "trust-tunnel, h.test, 443, username=u, password=p, h3=true",
+        );
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert_eq!(o.inert, ["h3"]);
+        let o = outcome("T", "trust-tunnel, h.test, 443, max-streams=0");
+        let found: Vec<(&str, &str)> = o
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `T`: `username` is required"
+                ),
+                (
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `T`: `password` is required"
+                ),
+                (
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `T`: invalid value `0` for `max-streams` (expected an integer, at least 1)"
+                ),
+            ]
+        );
+        // both always run over TLS: the client certificate is theirs
+        let tls = TlsOpts {
+            client_cert: Some("cert1".into()),
+            ..TlsOpts::default()
+        };
+        let h2 = ProtoSpec::H2Connect(H2ConnectSpec {
+            tls: tls.clone(),
+            username: None,
+            password: None,
+            headers: Vec::new(),
+            max_streams: h2::DEFAULT_MAX_STREAMS,
+            udp_relay: false,
+        });
+        assert_eq!(h2.keystore_item(), Some("cert1"));
+        let tt = ProtoSpec::TrustTunnel(TrustTunnelSpec {
+            tls,
+            username: "u".into(),
+            password: "p".into(),
+            headers: Vec::new(),
+            max_streams: h2::DEFAULT_MAX_STREAMS,
+        });
+        assert_eq!(tt.keystore_item(), Some("cert1"));
+        assert!(tt.tls().is_some());
     }
 }

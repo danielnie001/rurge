@@ -591,4 +591,22 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
             "snell, 1.2.3.4, 8000, psk=***, version=5, obfs=http, obfs-host=***"
         );
     }
+
+    /// The HTTP/2 family (phase 2 M6 design 6): named and positional
+    /// credentials and the whole `headers` list; `max-streams` and `h3` stay.
+    #[test]
+    fn an_h2_line_loses_its_credentials_and_headers() {
+        assert_eq!(
+            redact_definition(
+                "h2-connect, example.com, 443, user, pass, headers=X-Token:abc, max-streams=5, udp-relay=true"
+            ),
+            "h2-connect, example.com, 443, ***, ***, headers=***, max-streams=5, udp-relay=true"
+        );
+        assert_eq!(
+            redact_definition(
+                "trust-tunnel, 192.168.20.62, 443, username=test, password=s3cret, headers=X-Padding:<random-string(16-32)>, h3=true"
+            ),
+            "trust-tunnel, 192.168.20.62, 443, username=***, password=***, headers=***, h3=true"
+        );
+    }
 }
