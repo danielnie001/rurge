@@ -387,10 +387,7 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     }
     let failed = r.has_errors();
     let diagnostics = r.finish();
-    // the engine builds `snell` from M6b task 5 on: until then a valid line
-    // is checked in full but has no spec
-    let built = policy.kind != PolicyKind::Snell;
-    let spec = (!failed && not_implemented.is_none() && built).then(|| PolicySpec {
+    let spec = (!failed && not_implemented.is_none()).then(|| PolicySpec {
         name: policy.name.clone(),
         kind: policy.kind,
         server: policy.server.clone(),
@@ -889,9 +886,8 @@ mod tests {
         );
     }
 
-    /// A `snell` line is read and checked in full; it has no spec until the
-    /// engine builds `snell` (M6b task 5), and a version other than 4 and 5
-    /// says why (M6-D2).
+    /// A `snell` line is read and checked in full; a version other than 4
+    /// and 5 has no spec and says why (M6-D2).
     #[test]
     fn a_snell_line_is_checked_and_other_versions_are_not_implemented() {
         let o = outcome(
@@ -901,7 +897,16 @@ mod tests {
         assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
         assert!(o.inert.is_empty(), "{:?}", o.inert);
         assert_eq!(o.not_implemented, None);
-        assert!(o.spec.is_none());
+        let spec = o.spec.expect("a version 5 line has a spec");
+        let ProtoSpec::Snell(snell) = &spec.proto else {
+            panic!("{:?}", spec.proto)
+        };
+        assert_eq!(
+            (snell.version, snell.reuse, snell.udp_port),
+            (SnellVersion::V5, true, Some(8443))
+        );
+        assert_eq!(snell.obfs.as_ref().map(|o| o.mode), Some(ObfsMode::Http));
+        assert!(spec.shadow_tls.is_some());
 
         // without `version`: Surge's default, 1
         let o = outcome("N", "snell, h.test, 443, psk=pw");

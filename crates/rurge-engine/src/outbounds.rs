@@ -15,6 +15,7 @@ use rurge_proto::build::server_of;
 use rurge_proto::external::{ExternalOutbound, NoProcessGroups, ProcessHook};
 use rurge_proto::http::HttpOutbound;
 use rurge_proto::shadowsocks::ShadowsocksOutbound;
+use rurge_proto::snell::SnellOutbound;
 use rurge_proto::socks5::Socks5Outbound;
 use rurge_proto::trojan::TrojanOutbound;
 use rurge_proto::vmess::VmessOutbound;
@@ -263,13 +264,14 @@ impl OutboundFactory for EngineFactory {
                 self.roots.clone(),
                 connector,
             )?),
-            // the loader makes no spec of a `snell` line before M6b task 5
-            ProtoSpec::Snell(_) => {
-                return Err(BuildError::new(format!(
-                    "policy `{}`: `snell` is not implemented yet",
-                    spec.name
-                )));
-            }
+            ProtoSpec::Snell(snell) => Arc::new(SnellOutbound::new(
+                &spec.name,
+                server_of(spec)?,
+                snell,
+                spec.shadow_tls.as_ref(),
+                self.roots.clone(),
+                connector,
+            )?),
             // nothing starts here: the program starts on the first dial
             ProtoSpec::External(external) => {
                 let outbound = ExternalOutbound::new(
@@ -384,6 +386,8 @@ SSH = ssh, proxy.test, 22, username=u, password=pw\n\
 SS = ss, proxy.test, 8388, encrypt-method=aes-128-gcm, password=pw, obfs=http, udp-relay=true\n\
 SK = ss, proxy.test, 8388, encrypt-method=2022-blake3-aes-128-gcm, password=MDEyMzQ1Njc4OWFiY2RlZg==:MDEyMzQ1Njc4OWFiY2RlZg==, shadow-tls-password=st\n\
 SN = ss, proxy.test, 8388, encrypt-method=none\n\
+N4 = snell, proxy.test, 443, psk=pw, version=4, reuse=true, obfs=http\n\
+N5 = snell, proxy.test, 443, psk=pw, version=5, udp-port=8443, shadow-tls-password=st\n\
 Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule]\nFINAL,DIRECT\n",
         );
         let f = factory(&cfg);
@@ -399,6 +403,8 @@ Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule
             ("SS", "SS"),
             ("SK", "SK"),
             ("SN", "SN"),
+            ("N4", "N4"),
+            ("N5", "N5"),
             ("Corp", "DIRECT"),
         ] {
             let spec = cfg
@@ -494,6 +500,18 @@ password=MDEyMzQ1Njc4OWFiY2RlZg==\n[Rule]\nFINAL,DIRECT\n",
             )]
         );
         assert!(loaded.config.spec("S").is_none());
+    }
+
+    /// Sound `snell` lines pass the dry build, and building one starts
+    /// nothing: there is no tokio runtime here (phase 2 M6 design 4.3).
+    #[test]
+    fn a_snell_policy_passes_the_dry_build() {
+        let cfg = config(
+            "[Proxy]\nN4 = snell, proxy.test, 443, psk=pw, version=4, reuse=true, obfs=http, obfs-host=cdn.test\n\
+N5 = snell, proxy.test, 443, psk=pw, version=5, udp-port=8443, shadow-tls-password=st, shadow-tls-version=3, shadow-tls-sni=site.test\n\
+[Rule]\nFINAL,DIRECT\n",
+        );
+        assert!(dry_build(&cfg).is_empty());
     }
 
     #[test]

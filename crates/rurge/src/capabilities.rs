@@ -3,8 +3,9 @@
 //! (phase 2 M2a), `vmess` with the AEAD handshake and `anytls` (phase 2
 //! M2b), `ssh` (phase 2 M4a), `wireguard` (phase 2 M4b), `external`
 //! (phase 2 M4c), `ss` with the AEAD, `none` and 2022 methods (phase 2
-//! M6a), `select` groups, `url-test` / `fallback` /
-//! `load-balance` groups (phase 2 M3b), and `smart` groups (phase 2 M3c).
+//! M6a), `snell` versions 4 and 5 (phase 2 M6b), `select` groups,
+//! `url-test` / `fallback` / `load-balance` groups (phase 2 M3b), and
+//! `smart` groups (phase 2 M3c).
 
 use rurge_config::config::Capabilities;
 use rurge_config::policy::{GroupKind, PolicyKind};
@@ -42,6 +43,7 @@ pub fn current() -> Capabilities {
             PolicyKind::WireGuard,
             PolicyKind::External,
             PolicyKind::Shadowsocks,
+            PolicyKind::Snell,
         ]),
         group_kinds: HashSet::from([
             GroupKind::Select,

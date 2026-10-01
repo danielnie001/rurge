@@ -445,6 +445,52 @@ fn check_knows_ss() {
         .stdout(predicate::str::contains("c2VjcmV0").not());
 }
 
+const SNELL: &str = "[General]\n[Proxy]\n\
+N = snell, proxy.test, 443, psk=s3cretPsk, version=4, reuse=true, obfs=http\n\
+Old1 = snell, proxy.test, 443, psk=s3cretPsk\n\
+Old2 = snell, proxy.test, 443, psk=s3cretPsk, version=1\n[Rule]\nFINAL,DIRECT\n";
+const SNELL_BAD_VERSION: &str = "[General]\n[Proxy]\n\
+N = snell, proxy.test, 443, psk=s3cretPsk, version=7\n[Rule]\nFINAL,DIRECT\n";
+
+/// `rurge check` knows `snell` versions 4 and 5 (phase 2 M6 design 4.2):
+/// version 1 — also the default — is still "not implemented", once however
+/// many lines use it; a version out of range is an error; the PSK is never
+/// printed.
+#[test]
+fn check_knows_snell() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "snell.conf", SNELL))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    assert_eq!(out.matches("W0007").count(), 1, "{out}");
+    assert!(
+        out.contains("snell.conf:4")
+            && out.contains("`snell` version 1 (the default when `version` is not written)"),
+        "{out}"
+    );
+    assert!(!out.contains("policy type `snell`"), "{out}");
+    assert!(!out.contains("s3cretPsk"), "{out}");
+
+    Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "bad.conf", SNELL_BAD_VERSION))
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("E0018"))
+        .stdout(predicate::str::contains(
+            "bad.conf:3: policy `N`: invalid value `7` for `version` (expected an integer from 1 to 6)",
+        ))
+        .stdout(predicate::str::contains("s3cretPsk").not());
+}
+
 const SUBSCRIBED: &str = "[General]\n[Proxy Group]\nLocal = select, DIRECT, policy-path=nodes.txt\n\
 Remote = select, DIRECT, policy-path=https://sub.test/nodes?token=t0k3n\n[Rule]\nFINAL,Local\n";
 

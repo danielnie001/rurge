@@ -17,8 +17,9 @@ pub use rurge_inbound::Running;
 pub use rurge_net::socket::NoopSocketHook;
 pub use rurge_net::testing::TestServer;
 pub use rurge_proto::testing::{
-    AnyTlsScript, FakeAnyTls, FakeHttpProxy, FakeShadowsocks, FakeSocks5, FakeTrojan, FakeVmess,
-    HttpProxyScript, ShadowsocksScript, Socks5Script, TlsFixture, TrojanScript, VmessScript,
+    AnyTlsScript, FakeAnyTls, FakeHttpProxy, FakeShadowsocks, FakeSnell, FakeSocks5, FakeTrojan,
+    FakeVmess, HttpProxyScript, ShadowsocksScript, SnellScript, Socks5Script, TlsFixture,
+    TrojanScript, VmessScript,
 };
 pub use rurge_proto_ssh::testing::{
     Algorithm, FakeSsh, FakeSshOpts, fingerprint_of, keystore_base64, random_key,
