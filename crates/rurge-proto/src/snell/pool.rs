@@ -66,6 +66,14 @@ impl Pool {
 /// Between two requests the server says nothing: a read that is not
 /// pending is its close, an error, or bytes out of turn. The read never
 /// waits: a pending one leaves a waker that does nothing.
+///
+/// A peer that has sent only part of a record looks quiet too, and the part
+/// stays read for the next request on the connection. When the server then
+/// closes, the record is cut short: a transport failure, so within
+/// `STALE_WINDOW` the request goes again on a fresh connection (`tunnel`).
+/// When the rest arrives, the record is read in front of the request's
+/// answer, and one that fails to decrypt fails the request, not retried.
+/// A server that keeps quiet between requests never gets there.
 fn is_quiet(stream: &mut SnellStream) -> bool {
     let mut byte = [0u8; 1];
     let mut buf = ReadBuf::new(&mut byte);

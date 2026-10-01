@@ -55,6 +55,9 @@ pub struct SnellScript {
     /// not answered: the connection closes (a server that retires reused
     /// connections).
     pub tunnels_per_connection: Option<usize>,
+    /// A request that arrives after this many tunnels on its connection is
+    /// answered with bytes that do not decrypt, then the connection closes.
+    pub garble_after: Option<usize>,
     /// Answer every request with this error code and message, then close.
     pub refuse: Option<(u8, Vec<u8>)>,
     /// In front of every UDP answer, two records that are no datagram: an
@@ -69,6 +72,7 @@ impl SnellScript {
             obfs_http: false,
             connect_to: None,
             tunnels_per_connection: None,
+            garble_after: None,
             refuse: None,
             udp_junk: false,
         }
@@ -559,6 +563,12 @@ async fn serve(tcp: TcpStream, shared: Arc<Shared>, connection: usize) -> io::Re
             shared.seen.unanswered.fetch_add(1, Ordering::SeqCst);
             return Ok(());
         }
+        if script.garble_after.is_some_and(|n| tunnel >= n) {
+            shared.seen.unanswered.fetch_add(1, Ordering::SeqCst);
+            writer.write_all(&[0x5a; HEADER]).await?;
+            close(&mut reader, &mut writer).await;
+            return Ok(());
+        }
         request.connection = connection;
         request.tunnel = tunnel;
         request.padding = padding;
@@ -638,7 +648,8 @@ impl FakeSnell {
         self.shared.seen.rejected.load(Ordering::SeqCst)
     }
 
-    /// Requests closed without an answer (`tunnels_per_connection`).
+    /// Requests closed without an answer (`tunnels_per_connection`,
+    /// `garble_after`).
     pub fn unanswered(&self) -> usize {
         self.shared.seen.unanswered.load(Ordering::SeqCst)
     }

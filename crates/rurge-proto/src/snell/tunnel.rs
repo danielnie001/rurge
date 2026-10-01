@@ -17,9 +17,11 @@
 //! discarded (at most `MAX_DISCARD` bytes, as Surge) up to its end.
 //!
 //! A pooled connection may have been closed by the server while it idled.
-//! A request on one that fails before any answer arrived — a write error, or
-//! a read that ends or fails — goes again, once, on a fresh connection,
-//! with the head and every byte written so far (at most `MAX_REPLAY`).
+//! A request on one whose transport fails before any answer arrived and
+//! within `STALE_WINDOW` of leaving the pool — a write error, or a read that
+//! ends or breaks; not data that fails to decrypt — goes again, once, on a
+//! fresh connection, with the head and every byte written so far (at most
+//! `MAX_REPLAY`).
 
 use super::Dialer;
 use super::pool::Pool;
@@ -77,6 +79,21 @@ pub(super) fn refused(answer: &[u8]) -> io::Error {
         format!("snell: the server refused: {message}")
     };
     io::Error::new(io::ErrorKind::ConnectionRefused, text)
+}
+
+/// A failure of the transport, as on a socket the server closed while it
+/// idled; data that fails to decrypt or a protocol error is not one.
+fn is_stale(error: &io::Error) -> bool {
+    use io::ErrorKind as Kind;
+    matches!(
+        error.kind(),
+        Kind::UnexpectedEof
+            | Kind::ConnectionReset
+            | Kind::ConnectionAborted
+            | Kind::BrokenPipe
+            | Kind::NotConnected
+            | Kind::WriteZero
+    )
 }
 
 enum Conn {
@@ -164,7 +181,7 @@ impl SnellTunnel {
         let retry = self
             .retry
             .take()
-            .filter(|retry| retry.taken.elapsed() < STALE_WINDOW);
+            .filter(|retry| retry.taken.elapsed() < STALE_WINDOW && is_stale(&error));
         let Some(retry) = retry else {
             self.broken = true;
             return Err(error);
@@ -237,6 +254,10 @@ impl SnellTunnel {
         loop {
             let need = match &self.reply {
                 Reply::Tunnel => return Poll::Ready(Ok(())),
+                // complete: every read from now on is the refusal
+                Reply::Refused(got) if got.len() >= 2 && got.len() == 2 + usize::from(got[1]) => {
+                    return Poll::Ready(Err(refused(got)));
+                }
                 Reply::Waiting => 1,
                 Reply::Refused(got) if got.len() < 2 => 2 - got.len(),
                 Reply::Refused(got) => 2 + usize::from(got[1]) - got.len(),
@@ -265,12 +286,7 @@ impl SnellTunnel {
                         )));
                     }
                 },
-                (Ok(()), Reply::Refused(answer)) => {
-                    answer.extend_from_slice(got);
-                    if answer.len() >= 2 && answer.len() == 2 + usize::from(answer[1]) {
-                        return Poll::Ready(Err(refused(answer)));
-                    }
-                }
+                (Ok(()), Reply::Refused(answer)) => answer.extend_from_slice(got),
                 (Ok(()), Reply::Tunnel) => unreachable!("returned above"),
             }
         }
@@ -469,6 +485,40 @@ mod tests {
             text(answered(&[&long]).await),
             format!("snell: the server refused: [31m{}", "x".repeat(196))
         );
+    }
+
+    #[tokio::test]
+    async fn every_read_after_a_refusal_is_the_refusal() {
+        let (mut tunnel, mut server) = pair(None).await;
+        tunnel.write_all(b"ping").await.unwrap();
+        server.write_all(b"\x02\x05\x04nope").await.unwrap();
+        server.shutdown().await.unwrap();
+        let mut buf = [0u8; 4];
+        for _ in 0..3 {
+            let err = tunnel.read(&mut buf).await.unwrap_err();
+            assert_eq!(err.to_string(), "snell: the server refused: nope");
+            assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        }
+    }
+
+    #[test]
+    fn only_a_transport_failure_may_be_a_stale_connection() {
+        for kind in [
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+        ] {
+            assert!(is_stale(&kind.into()), "{kind:?}");
+        }
+        assert!(is_stale(&no_answer()));
+        for kind in [
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::TimedOut,
+        ] {
+            assert!(!is_stale(&kind.into()), "{kind:?}");
+        }
     }
 
     #[tokio::test]
