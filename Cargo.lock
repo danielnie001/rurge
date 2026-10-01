@@ -3369,6 +3369,7 @@ version = "0.1.0"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
+ "argon2",
  "base64",
  "blake3",
  "bytes",

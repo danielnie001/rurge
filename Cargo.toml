@@ -88,6 +88,9 @@ sha1 = { version = "0.11", default-features = false }
 blake3 = "1.8"
 sha3 = "0.10"
 crc32fast = "1"
+# Snell v4 / v5: the per-direction key is Argon2id of the PSK (already in the
+# tree through ssh-key, with the same features)
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 rurge-proto-ssh = { path = "crates/rurge-proto-ssh" }
 # ring, not the default aws-lc-rs (cmake and NASM on Windows); no des, no dsa
 russh = { version = "0.63.3", default-features = false, features = ["ring", "rsa"] }

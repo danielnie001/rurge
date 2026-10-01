@@ -12,6 +12,9 @@ pub mod keystore;
 pub mod outbound;
 pub mod reject;
 pub mod shadowsocks;
+// the outbound (M6b task 3) is its first user
+#[allow(dead_code)]
+pub mod snell;
 pub mod socks5;
 mod stream_udp;
 mod task;
