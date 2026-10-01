@@ -9,6 +9,7 @@ pub mod obfs;
 pub mod reader;
 pub mod secret;
 pub mod shadow_tls;
+pub mod snell;
 pub mod socks5;
 pub mod ss;
 pub mod ssh;
@@ -29,6 +30,7 @@ pub use obfs::{ObfsMode, ObfsOpts};
 pub use reader::ParamReader;
 pub use secret::Secret;
 pub use shadow_tls::{ShadowTlsOpts, ShadowTlsVersion};
+pub use snell::{SnellSpec, SnellVersion};
 pub use socks5::Socks5Spec;
 pub use ss::{SsMethod, SsSpec};
 pub use ssh::{HostKeyPin, SshSpec};
@@ -74,6 +76,7 @@ pub enum ProtoSpec {
     WireGuard(WireGuardSpec),
     External(ExternalSpec),
     Ss(SsSpec),
+    Snell(SnellSpec),
 }
 
 impl ProtoSpec {
@@ -90,7 +93,8 @@ impl ProtoSpec {
             | ProtoSpec::Ssh(_)
             | ProtoSpec::WireGuard(_)
             | ProtoSpec::External(_)
-            | ProtoSpec::Ss(_) => None,
+            | ProtoSpec::Ss(_)
+            | ProtoSpec::Snell(_) => None,
         }
     }
 
@@ -140,6 +144,8 @@ pub enum NotImplemented {
     LegacyVmess,
     /// An `ss` stream cipher, by its name (phase 2 M6 design 3.1).
     SsStreamCipher(&'static str),
+    /// A `snell` version other than 4 and 5 (phase 2 M6 design 4.2).
+    SnellVersion(u8),
 }
 
 impl NotImplemented {
@@ -150,6 +156,17 @@ impl NotImplemented {
             NotImplemented::SsStreamCipher(method) => format!(
                 "`ss` stream cipher `{method}` is not implemented yet; such policies behave as REJECT"
             ),
+            NotImplemented::SnellVersion(n) => {
+                // Surge's default: many lines never say which version they are
+                let default = if *n == 1 {
+                    " (the default when `version` is not written)"
+                } else {
+                    ""
+                };
+                format!(
+                    "`snell` version {n}{default} is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT"
+                )
+            }
         }
     }
 
@@ -158,6 +175,7 @@ impl NotImplemented {
         match self {
             NotImplemented::LegacyVmess => "vmess (legacy handshake)".to_string(),
             NotImplemented::SsStreamCipher(method) => format!("ss ({method})"),
+            NotImplemented::SnellVersion(n) => format!("snell v{n}"),
         }
     }
 
@@ -170,6 +188,7 @@ impl NotImplemented {
             NotImplemented::SsStreamCipher(method) => {
                 format!("`ss` with the stream cipher `{method}`")
             }
+            NotImplemented::SnellVersion(n) => format!("`snell` version {n}"),
         }
     }
 }
@@ -312,6 +331,15 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             not_implemented = read.stream_cipher.map(NotImplemented::SsStreamCipher);
             (common, ProtoSpec::Ss(read.spec))
         }
+        PolicyKind::Snell => {
+            let common = read_common(&mut r, Applies::Proxy, &mut notes);
+            tls::refuse_tls(&mut r);
+            let read = snell::read_snell(&mut r);
+            not_implemented = read
+                .not_implemented_version
+                .map(NotImplemented::SnellVersion);
+            (common, ProtoSpec::Snell(read.spec))
+        }
         PolicyKind::AnyTls => {
             let common = read_common(&mut r, Applies::Proxy, &mut notes);
             let anytls = anytls::read_anytls(&mut r, env.keystore);
@@ -359,7 +387,10 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     }
     let failed = r.has_errors();
     let diagnostics = r.finish();
-    let spec = (!failed && not_implemented.is_none()).then(|| PolicySpec {
+    // the engine builds `snell` from M6b task 5 on: until then a valid line
+    // is checked in full but has no spec
+    let built = policy.kind != PolicyKind::Snell;
+    let spec = (!failed && not_implemented.is_none() && built).then(|| PolicySpec {
         name: policy.name.clone(),
         kind: policy.kind,
         server: policy.server.clone(),
@@ -855,6 +886,79 @@ mod tests {
                     "policy `S`: unknown parameter `mystery` ignored"
                 ),
             ]
+        );
+    }
+
+    /// A `snell` line is read and checked in full; it has no spec until the
+    /// engine builds `snell` (M6b task 5), and a version other than 4 and 5
+    /// says why (M6-D2).
+    #[test]
+    fn a_snell_line_is_checked_and_other_versions_are_not_implemented() {
+        let o = outcome(
+            "N",
+            "snell, h.test, 443, psk=pw, version=5, reuse=true, udp-port=8443, obfs=http, obfs-host=cdn.test, shadow-tls-password=st, shadow-tls-version=3, shadow-tls-sni=site.test",
+        );
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert!(o.inert.is_empty(), "{:?}", o.inert);
+        assert_eq!(o.not_implemented, None);
+        assert!(o.spec.is_none());
+
+        // without `version`: Surge's default, 1
+        let o = outcome("N", "snell, h.test, 443, psk=pw");
+        assert!(o.spec.is_none() && o.diagnostics.is_empty());
+        let why = o.not_implemented.expect("version 1");
+        assert_eq!(why, NotImplemented::SnellVersion(1));
+        assert_eq!(
+            why.warning(),
+            "`snell` version 1 (the default when `version` is not written) is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT"
+        );
+        assert_eq!(why.note(), "snell v1");
+        assert_eq!(why.imported(), "`snell` version 1");
+        let o = outcome("N", "snell, h.test, 443, psk=pw, version=6");
+        let why = o.not_implemented.expect("version 6");
+        assert_eq!(
+            why.warning(),
+            "`snell` version 6 is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT"
+        );
+        assert_eq!(why.note(), "snell v6");
+
+        // a broken line is an error like any other, and not "not implemented"
+        let o = outcome("N", "snell, h.test, 443, version=2");
+        assert!(o.not_implemented.is_none());
+        assert_eq!(o.diagnostics[0].code, codes::E_INVALID_POLICY_PARAM);
+        // no TLS under `snell`; the PSK is never quoted
+        let o = outcome(
+            "N",
+            "snell, h.test, 443, psk=s3cretPsk, version=4, sni=edge.test, mystery=1",
+        );
+        let found: Vec<(&str, &str)> = o
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `N`: `sni` does not apply to `snell` policies; ignored"
+                ),
+                (
+                    codes::W_UNKNOWN_KEY,
+                    "policy `N`: unknown parameter `mystery` ignored"
+                ),
+            ]
+        );
+        assert_eq!(
+            ProtoSpec::Snell(SnellSpec {
+                version: SnellVersion::V4,
+                psk: "pw".into(),
+                reuse: false,
+                udp_port: None,
+                obfs: None,
+            })
+            .keystore_item(),
+            None
         );
     }
 }

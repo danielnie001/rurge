@@ -584,5 +584,11 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
             ),
             "ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=***, obfs=http, obfs-host=***, obfs-uri=/x"
         );
+        assert_eq!(
+            redact_definition(
+                "snell, 1.2.3.4, 8000, psk=s3cretPsk, version=5, obfs=http, obfs-host=my.cdn.test"
+            ),
+            "snell, 1.2.3.4, 8000, psk=***, version=5, obfs=http, obfs-host=***"
+        );
     }
 }

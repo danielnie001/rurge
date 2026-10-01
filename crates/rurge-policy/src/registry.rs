@@ -1428,7 +1428,8 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
     fn a_legacy_vmess_policy_says_why_it_rejects() {
         let text = "[Proxy]\nOld = vmess, a.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\n\
 SS = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n\
-Stream = ss, 1.2.3.4, 8388, encrypt-method=rc4-md5, password=x\n[Rule]\nFINAL,DIRECT\n";
+Stream = ss, 1.2.3.4, 8388, encrypt-method=rc4-md5, password=x\n\
+Snell1 = snell, 1.2.3.4, 443, psk=x\n[Rule]\nFINAL,DIRECT\n";
         let registry = generation(text, &FakeFactory::new(), None);
         let old = registry.resolve(&PolicyRef::parse("Old"));
         assert_eq!(old.terminal, TerminalKind::Reject);
@@ -1445,6 +1446,14 @@ Stream = ss, 1.2.3.4, 8388, encrypt-method=rc4-md5, password=x\n[Rule]\nFINAL,DI
         assert_eq!(
             stream.note.clone().unwrap().to_string(),
             "policy protocol not implemented: ss (rc4-md5)"
+        );
+        // a `snell` line without `version` is version 1
+        let snell = registry.resolve(&PolicyRef::parse("Snell1"));
+        assert_eq!(snell.terminal, TerminalKind::Reject);
+        assert_eq!(chain(&snell), ["Snell1", "!unsupported:snell", "REJECT"]);
+        assert_eq!(
+            snell.note.clone().unwrap().to_string(),
+            "policy protocol not implemented: snell v1"
         );
     }
 

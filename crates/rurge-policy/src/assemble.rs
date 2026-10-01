@@ -1042,13 +1042,14 @@ G3 = select, policy-path=https://sub.test/b",
                     "Bad = http, b.test, 80, tos=999\nUp = http, u.test, 80, underlying-proxy=Nowhere\n\
 Hy = hysteria2, h.test, 443, password=pw\n\
 Rc = ss, r.test, 8388, encrypt-method=rc4, password=pw\n\
+Sn = snell, n.test, 443, psk=pw\n\
 Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = http, g.test, 80",
                 )],
             ),
         );
-        assert_eq!(members(&a, "G"), ["Hy", "Rc", "Old", "Good"]);
+        assert_eq!(members(&a, "G"), ["Hy", "Rc", "Sn", "Old", "Good"]);
         let specs: Vec<bool> = a.imported.iter().map(|i| i.spec.is_some()).collect();
-        assert_eq!(specs, [false, false, false, true]);
+        assert_eq!(specs, [false, false, false, false, true]);
         let why: Vec<Option<NotImplemented>> = a
             .imported
             .iter()
@@ -1059,6 +1060,7 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
             [
                 None,
                 Some(NotImplemented::SsStreamCipher("rc4")),
+                Some(NotImplemented::SnellVersion(1)),
                 Some(NotImplemented::LegacyVmess),
                 None
             ]
@@ -1081,6 +1083,10 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
                 (
                     codes::W_PROTOCOL_NOT_IMPLEMENTED,
                     "policy group `G`: imported policies of type `ss` with the stream cipher `rc4` are not implemented in this version; they behave as REJECT".to_string()
+                ),
+                (
+                    codes::W_PROTOCOL_NOT_IMPLEMENTED,
+                    "policy group `G`: imported policies of type `snell` version 1 are not implemented in this version; they behave as REJECT".to_string()
                 ),
                 (
                     codes::W_PROTOCOL_NOT_IMPLEMENTED,

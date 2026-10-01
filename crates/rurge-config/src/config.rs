@@ -1689,6 +1689,46 @@ D = ss, d.test, 8388, encrypt-method=aes-256-gcm, password=pw\n[Rule]\nFINAL,DIR
         assert_eq!(loaded.config.not_implemented.get("D"), None);
     }
 
+    /// A `snell` version other than 4 and 5: `W0007` once per load and
+    /// version, at the first line that uses it; a line without `version` is
+    /// version 1 (phase 2 M6 design 4.2).
+    #[test]
+    fn snell_versions_are_reported_once_per_load_and_version() {
+        let loaded = load_text(
+            "[Proxy]\nA = snell, a.test, 443, psk=pw\nB = snell, b.test, 443, psk=pw, version=6\n\
+C = snell, c.test, 443, psk=pw, version=1\nD = snell, d.test, 443, psk=pw, version=5\n\
+E = snell, e.test, 443, psk=pw, version=3\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let found: Vec<(&str, Option<u32>)> = loaded
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::W_PROTOCOL_NOT_IMPLEMENTED)
+            .map(|d| (d.message.as_str(), d.span.as_ref().map(|s| s.line)))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    "`snell` version 1 (the default when `version` is not written) is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT",
+                    Some(2)
+                ),
+                (
+                    "`snell` version 6 is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT",
+                    Some(3)
+                ),
+                (
+                    "`snell` version 3 is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT",
+                    Some(6)
+                ),
+            ]
+        );
+        assert_eq!(
+            loaded.config.not_implemented.get("C"),
+            Some(&NotImplemented::SnellVersion(1))
+        );
+        assert_eq!(loaded.config.not_implemented.get("D"), None);
+    }
+
     /// Two `external` policies on one `local-port`: the second is an error
     /// at its own line (M4 design 4.4).
     #[test]

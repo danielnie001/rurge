@@ -263,6 +263,13 @@ impl OutboundFactory for EngineFactory {
                 self.roots.clone(),
                 connector,
             )?),
+            // the loader makes no spec of a `snell` line before M6b task 5
+            ProtoSpec::Snell(_) => {
+                return Err(BuildError::new(format!(
+                    "policy `{}`: `snell` is not implemented yet",
+                    spec.name
+                )));
+            }
             // nothing starts here: the program starts on the first dial
             ProtoSpec::External(external) => {
                 let outbound = ExternalOutbound::new(
