@@ -22,6 +22,7 @@ mod task;
 pub mod testing;
 pub mod transport;
 pub mod trojan;
+pub mod trust_tunnel;
 pub mod vmess;
 
 pub use build::BuildError;

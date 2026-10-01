@@ -498,15 +498,15 @@ mod tests {
         })
         .await;
         let out = outbound(&fake, "", &fixture);
-        // one after the other: the first answer brought the server's SETTINGS
-        let mut first = out
-            .connect_tcp(&target(echo), &ConnectOpts::default())
-            .await
-            .unwrap();
-        let mut second = out
-            .connect_tcp(&target(echo), &ConnectOpts::default())
-            .await
-            .unwrap();
+        // all at once: none may queue behind the server's limit, unknown
+        // until its SETTINGS arrive
+        let (to, opts) = (target(echo), ConnectOpts::default());
+        let (a, b) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(out.connect_tcp(&to, &opts), out.connect_tcp(&to, &opts))
+        })
+        .await
+        .expect("a tunnel waited behind the server's limit");
+        let (mut first, mut second) = (a.unwrap(), b.unwrap());
         round_trip(&mut first, b"one").await;
         round_trip(&mut second, b"two").await;
         assert_eq!(fake.connections(), 2);

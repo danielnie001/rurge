@@ -7,6 +7,12 @@
 //!   not draining. `h2` would queue a stream past the server's limit and
 //!   send nothing until a slot frees, so the pool counts the open streams
 //!   itself; a stream's `Lease` holds its place.
+//! - Until a connection has the server's SETTINGS (a PING round trip after
+//!   the handshake), its limit is unknown and it carries one stream: the
+//!   first request goes out at once, the ones that would join it wait for
+//!   the SETTINGS and then look again (a second connection when the
+//!   server's limit is the lower one). The caller's own timeout bounds
+//!   the wait.
 //! - With no room, a new connection is dialed. One dial at a time: requests
 //!   that come in meanwhile wait for it and then look again, and when it
 //!   fails they share its failure instead of dialing the same thing again.
@@ -171,44 +177,67 @@ impl H2Pool {
 
     /// A place on a connection with room, dialing one when there is none.
     async fn lease(&self, opts: &ConnectOpts) -> Result<Lease, OutboundError> {
-        if let Some(lease) = self.take() {
-            return Ok(lease);
-        }
-        // read before contending for the lock: tells us whether a dial
-        // finished while we waited for it
-        let attempt = self.attempts.load(Ordering::SeqCst);
-        let _dialing = self.dialing.lock().await;
-        if let Some(lease) = self.take() {
-            return Ok(lease);
-        }
-        if self.attempts.load(Ordering::SeqCst) != attempt
-            && let Some(failure) = self.failure.lock().expect("failure").as_ref()
-        {
-            return Err(copy_error(failure));
-        }
-        let result = self.connect(opts).await;
-        self.attempts.fetch_add(1, Ordering::SeqCst);
-        let conn = match result {
-            Ok(conn) => Arc::new(conn),
-            Err(e) => {
-                *self.failure.lock().expect("failure") = Some(copy_error(&e));
-                return Err(e);
+        loop {
+            match self.take() {
+                Pick::Lease(lease) => return Ok(lease),
+                Pick::Unsettled(conn) => {
+                    conn.settled().await;
+                    continue;
+                }
+                Pick::Nothing => {}
             }
-        };
-        *self.failure.lock().expect("failure") = None;
-        let lease = conn.lease(self.max_streams);
-        self.conns.lock().expect("conns").push(conn);
-        lease.ok_or_else(|| {
-            OutboundError::Proxy(format!("{}: the server accepts no streams", self.label))
-        })
+            // read before contending for the lock: tells us whether a dial
+            // finished while we waited for it
+            let attempt = self.attempts.load(Ordering::SeqCst);
+            let dialing = self.dialing.lock().await;
+            match self.take() {
+                Pick::Lease(lease) => return Ok(lease),
+                Pick::Unsettled(conn) => {
+                    drop(dialing);
+                    conn.settled().await;
+                    continue;
+                }
+                Pick::Nothing => {}
+            }
+            if self.attempts.load(Ordering::SeqCst) != attempt
+                && let Some(failure) = self.failure.lock().expect("failure").as_ref()
+            {
+                return Err(copy_error(failure));
+            }
+            let result = self.connect(opts).await;
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let conn = match result {
+                Ok(conn) => Arc::new(conn),
+                Err(e) => {
+                    *self.failure.lock().expect("failure") = Some(copy_error(&e));
+                    return Err(e);
+                }
+            };
+            *self.failure.lock().expect("failure") = None;
+            let lease = conn.lease(self.max_streams);
+            self.conns.lock().expect("conns").push(conn);
+            return lease.ok_or_else(|| {
+                OutboundError::Proxy(format!("{}: the server accepts no streams", self.label))
+            });
+        }
     }
 
     /// The oldest connection with room; the ones that are draining or have
-    /// idled too long are let go on the way.
-    fn take(&self) -> Option<Lease> {
+    /// idled too long are let go on the way. Without one, a connection that
+    /// may turn out to have room once its SETTINGS are known.
+    fn take(&self) -> Pick {
         let mut conns = self.conns.lock().expect("conns");
         prune(&mut conns, Instant::now());
-        conns.iter().find_map(|c| c.lease(self.max_streams))
+        let mut unsettled = None;
+        for conn in conns.iter() {
+            if let Some(lease) = conn.lease(self.max_streams) {
+                return Pick::Lease(lease);
+            }
+            if unsettled.is_none() && !conn.is_settled() {
+                unsettled = Some(conn.clone());
+            }
+        }
+        unsettled.map_or(Pick::Nothing, Pick::Unsettled)
     }
 
     async fn connect(&self, opts: &ConnectOpts) -> Result<Conn, OutboundError> {
@@ -259,6 +288,14 @@ impl H2Pool {
     }
 }
 
+/// What `H2Pool::take` found.
+enum Pick {
+    Lease(Lease),
+    /// No room now, but this connection's limit is not known yet.
+    Unsettled(Arc<Conn>),
+    Nothing,
+}
+
 /// One pooled connection. Its streams' leases keep it alive after the pool
 /// let go of it; when the last one goes, so does the connection.
 struct Conn {
@@ -281,8 +318,14 @@ struct Usage {
 
 impl Conn {
     fn lease(self: &Arc<Self>, max_streams: usize) -> Option<Lease> {
-        // before the server's SETTINGS, its limit is unbounded
-        let limit = max_streams.min(self.send.current_max_send_streams());
+        // before the server's SETTINGS, `h2` takes its limit as unbounded
+        // and would queue the streams past the real one: one stream until
+        // they are known
+        let limit = if self.is_settled() {
+            max_streams.min(self.send.current_max_send_streams())
+        } else {
+            1
+        };
         let mut usage = self.usage.lock().expect("usage");
         if usage.open >= limit {
             return None;
@@ -302,6 +345,10 @@ impl Conn {
     fn is_expired(&self, now: Instant) -> bool {
         let usage = self.usage.lock().expect("usage");
         usage.open == 0 && now.duration_since(usage.idle_since) >= IDLE_TIMEOUT
+    }
+
+    fn is_settled(&self) -> bool {
+        *self.settled.borrow()
     }
 
     /// The server's SETTINGS are the first frame it sends (RFC 9113 3.4):
@@ -434,6 +481,8 @@ mod tests {
         /// SETTINGS_INITIAL_WINDOW_SIZE: what each of our streams may send
         /// before a WINDOW_UPDATE.
         window: Option<u32>,
+        /// SETTINGS_MAX_CONCURRENT_STREAMS.
+        streams: Option<u32>,
     }
 
     /// Dials an in-process `h2` server over a pipe. By the host of the
@@ -475,6 +524,9 @@ mod tests {
         let mut builder = h2::server::Builder::new();
         if let Some(window) = server.window {
             builder.initial_window_size(window);
+        }
+        if let Some(streams) = server.streams {
+            builder.max_concurrent_streams(streams);
         }
         if server.extended {
             builder.enable_connect_protocol();
@@ -624,6 +676,33 @@ mod tests {
         round_trip(&mut d, b"again").await;
         round_trip(&mut e, b"again").await;
         assert_eq!(dial.dials.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_connection_carries_one_stream_until_the_servers_limit_is_known() {
+        // the server takes one stream at a time, fewer than `max-streams`:
+        // requests that come with the first dial must not queue behind it
+        let dial = Arc::new(TestDial {
+            server: Server {
+                streams: Some(1),
+                ..Server::default()
+            },
+            ..TestDial::default()
+        });
+        let pool = pool(&dial, 3);
+        let (mut a, mut b, mut c) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                tunnel(&pool, "echo.test:1"),
+                tunnel(&pool, "echo.test:2"),
+                tunnel(&pool, "echo.test:3"),
+            )
+        })
+        .await
+        .expect("a stream waited behind the server's limit");
+        for stream in [&mut a, &mut b, &mut c] {
+            round_trip(stream, b"one each").await;
+        }
+        assert_eq!(dial.dials.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

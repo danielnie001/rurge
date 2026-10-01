@@ -21,6 +21,9 @@ use tokio::net::{TcpListener, TcpStream};
 pub struct H2ProxyScript {
     /// Require Basic proxy credentials: any of these (user, password).
     pub users: Vec<(String, String)>,
+    /// Answer a request without a `user-agent` 400, as a server that
+    /// follows the TrustTunnel document to the letter would.
+    pub require_user_agent: bool,
     /// Answer every request with this status instead of serving it.
     pub refuse: Option<u16>,
     /// Wait this long before answering a request.
@@ -136,6 +139,9 @@ async fn answer(
     if !authorized(&shared.script.users, &seen) {
         return refuse(respond, StatusCode::PROXY_AUTHENTICATION_REQUIRED);
     }
+    if shared.script.require_user_agent && seen.header("user-agent").is_none() {
+        return refuse(respond, StatusCode::BAD_REQUEST);
+    }
     if let Some(code) = shared.script.refuse {
         return refuse(respond, StatusCode::from_u16(code).expect("a status"));
     }
@@ -152,6 +158,7 @@ async fn answer(
         Some(addr) => TcpStream::connect(addr).await.ok(),
         None => None,
     };
+    // an unreachable target is 502, as the TrustTunnel endpoint answers
     let Some(mut upstream) = upstream else {
         return refuse(respond, StatusCode::BAD_GATEWAY);
     };
