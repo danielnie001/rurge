@@ -409,6 +409,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pooled_connection_that_breaks_after_the_window_is_not_retried() {
+        let echo = echo_server().await;
+        let fake = FakeSnell::spawn(SnellScript {
+            tunnels_per_connection: Some(1),
+            ..SnellScript::new("secret")
+        })
+        .await;
+        let out = outbound_to(&fake, ", reuse=true");
+        request(&out, echo, b"first").await;
+        let mut stream = out
+            .connect_tcp(&target(echo), &ConnectOpts::default())
+            .await
+            .unwrap();
+        tokio::time::sleep(tunnel::STALE_WINDOW + Duration::from_millis(200)).await;
+        stream.write_all(b"second").await.unwrap();
+        let mut buf = [0u8; 16];
+        let err = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("the failure arrives")
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "snell: the server closed the connection without answering"
+        );
+        assert_eq!((fake.connections(), fake.unanswered()), (1, 1));
+    }
+
+    #[tokio::test]
     async fn the_servers_refusal_is_the_error_and_the_connection_is_not_reused() {
         let echo = echo_server().await;
         let fake = FakeSnell::spawn(SnellScript {

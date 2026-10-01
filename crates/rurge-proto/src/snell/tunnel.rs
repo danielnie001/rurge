@@ -34,6 +34,7 @@ use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::time::Instant;
 
 const TUNNEL: u8 = 0x00;
 const ERROR: u8 = 0x02;
@@ -43,6 +44,11 @@ const MAX_MESSAGE: usize = 200;
 /// What a request may have written before its answer and still go again
 /// on a fresh connection.
 const MAX_REPLAY: usize = 64 * 1024;
+/// How long after leaving the pool a failure may still be a stale socket: one
+/// that the server closed while it idled fails within about a round trip of
+/// the first write. Later the server may already have forwarded the request,
+/// and sending it again could deliver it twice.
+pub(super) const STALE_WINDOW: Duration = Duration::from_secs(1);
 /// Surge's limit on the server's data discarded while waiting for its end.
 const MAX_DISCARD: usize = 0x80001;
 /// How long a dropped request's connection may take to finish cleanly.
@@ -78,6 +84,8 @@ enum Conn {
     Open(Box<LazyHead<SnellStream>>),
     /// The request going again on a fresh connection: the dial, and what
     /// the old one carried (the head and the payload written since).
+    /// The tunnel assumes both halves are polled from one task: the redial
+    /// future keeps only the last poller's waker.
     Redial(BoxFuture<'static, io::Result<SnellStream>>, Vec<u8>),
     /// The redial failed.
     Gone,
@@ -92,6 +100,8 @@ enum Reply {
 
 /// A pooled connection's request that may still go again.
 struct Retry {
+    /// When the connection left the pool.
+    taken: Instant,
     /// The head and every payload byte written since.
     sent: Vec<u8>,
     dialer: Arc<Dialer>,
@@ -138,6 +148,7 @@ impl SnellTunnel {
         opts: ConnectOpts,
     ) -> SnellTunnel {
         let retry = Retry {
+            taken: Instant::now(),
             sent: head.clone(),
             dialer,
             opts,
@@ -150,11 +161,17 @@ impl SnellTunnel {
     /// `error` ended the current connection's request: `Ok` when it goes
     /// again on a fresh connection, else the error, final.
     fn fail(&mut self, error: io::Error) -> io::Result<()> {
-        let Some(retry) = self.retry.take() else {
+        let retry = self
+            .retry
+            .take()
+            .filter(|retry| retry.taken.elapsed() < STALE_WINDOW);
+        let Some(retry) = retry else {
             self.broken = true;
             return Err(error);
         };
-        let Retry { sent, dialer, opts } = retry;
+        let Retry {
+            sent, dialer, opts, ..
+        } = retry;
         let dial = Box::pin(async move {
             match tokio::time::timeout(opts.timeout, dialer.fresh(&opts)).await {
                 Ok(Ok(stream)) => Ok(stream),
@@ -308,6 +325,9 @@ impl AsyncWrite for SnellTunnel {
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        if this.shut {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
         let n = ready!(this.drive(cx, |this, cx| Pin::new(this.lazy()).poll_write(cx, data)))?;
         if let Some(retry) = &mut this.retry {
             if retry.sent.len() + n > MAX_REPLAY {
