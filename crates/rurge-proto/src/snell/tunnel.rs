@@ -36,8 +36,8 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::time::Instant;
 
-const TUNNEL: u8 = 0x00;
-const ERROR: u8 = 0x02;
+pub(super) const TUNNEL: u8 = 0x00;
+pub(super) const ERROR: u8 = 0x02;
 
 /// The longest part of an error message that is quoted.
 const MAX_MESSAGE: usize = 200;
@@ -55,15 +55,15 @@ const MAX_DISCARD: usize = 0x80001;
 const FINISH_TIMEOUT: Duration = Duration::from_secs(10);
 
 const NO_ANSWER: &str = "snell: the server closed the connection without answering";
-const UNKNOWN_REPLY: &str = "snell: the server answered with an unknown reply";
+pub(super) const UNKNOWN_REPLY: &str = "snell: the server answered with an unknown reply";
 
-fn no_answer() -> io::Error {
+pub(super) fn no_answer() -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, NO_ANSWER)
 }
 
 /// `code length message`, complete: the error for the application. The
 /// message comes from the far end: printable ASCII only, and bounded.
-fn refused(answer: &[u8]) -> io::Error {
+pub(super) fn refused(answer: &[u8]) -> io::Error {
     let message: String = answer[2..]
         .iter()
         .filter(|b| b.is_ascii_graphic() || **b == b' ')

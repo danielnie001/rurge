@@ -9,27 +9,33 @@
 //! command is Connect (`01`), or ConnectV2 (`05`) with `reuse=true`: a
 //! request whose two sides both ended hands its connection back to the
 //! outbound's pool (`pool`), and the next request goes out on it.
+//!
+//! UDP needs no parameter on v4 / v5: a connection of its own, never
+//! pooled, to `udp-port` (else the policy's port) through the same layers,
+//! carries every datagram (`udp`).
 
 pub(crate) mod kdf;
 mod pool;
 pub(crate) mod record;
 mod tunnel;
+mod udp;
 
 use crate::build::shadow_tls_client;
 use crate::task::AbortOnDrop;
 use crate::transport::Stack;
 use crate::transport::obfs::ObfsClient;
-use crate::{BuildError, Outbound, OutboundError};
+use crate::{BuildError, Outbound, OutboundError, UdpSupport};
 use kdf::Psk;
 use pool::Pool;
 use record::SnellStream;
 use rurge_config::HostName;
 use rurge_config::spec::{ObfsMode, ShadowTlsOpts, SnellSpec};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
+use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target};
 use rustls::RootCertStore;
 use std::sync::{Arc, OnceLock};
 use tunnel::SnellTunnel;
+use udp::SnellUdp;
 
 /// The request's version byte.
 const REQUEST_VERSION: u8 = 0x01;
@@ -55,6 +61,8 @@ impl Dialer {
 pub struct SnellOutbound {
     name: String,
     dialer: Arc<Dialer>,
+    /// To `udp-port`; the same as `dialer` without one.
+    udp_dialer: Arc<Dialer>,
     /// `CONNECT`, or `CONNECT_V2` with `reuse=true`.
     command: u8,
     /// `Some` with `reuse=true`.
@@ -86,22 +94,31 @@ impl SnellOutbound {
         }
         // no TLS of its own: the camouflage certificate is checked against
         // the server's name
-        let shadow_tls = shadow_tls_client(shadow_tls, None, &server.host, roots)?;
-        let obfs = spec
-            .obfs
-            .as_ref()
-            .map(|obfs| ObfsClient::new(obfs, &server))
-            .transpose()?;
-        let mut stack = Stack::new(connector, server, shadow_tls, None, None);
-        if let Some(obfs) = obfs {
-            stack = stack.with_obfs(obfs);
-        }
+        let stack = |to: &Target| -> Result<Stack, BuildError> {
+            let shadow_tls = shadow_tls_client(shadow_tls, None, &to.host, roots.clone())?;
+            let mut stack = Stack::new(connector.clone(), to.clone(), shadow_tls, None, None);
+            if let Some(obfs) = &spec.obfs {
+                stack = stack.with_obfs(ObfsClient::new(obfs, to)?);
+            }
+            Ok(stack)
+        };
+        let psk = Psk::new(spec.psk.expose());
+        let dialer = Arc::new(Dialer {
+            stack: stack(&server)?,
+            psk: psk.clone(),
+        });
+        // UDP rides a TCP connection: `udp-port` is where that one goes
+        let udp_dialer = match spec.udp_port {
+            Some(port) if port != server.port => Arc::new(Dialer {
+                stack: stack(&Target::new(server.host.clone(), port))?,
+                psk,
+            }),
+            _ => dialer.clone(),
+        };
         Ok(SnellOutbound {
             name: name.to_string(),
-            dialer: Arc::new(Dialer {
-                stack,
-                psk: Psk::new(spec.psk.expose()),
-            }),
+            dialer,
+            udp_dialer,
             command: if spec.reuse { CONNECT_V2 } else { CONNECT },
             pool: spec.reuse.then(Arc::<Pool>::default),
             reaper: OnceLock::new(),
@@ -168,18 +185,42 @@ impl Outbound for SnellOutbound {
             }
         })
     }
+
+    /// v4 and v5 carry UDP whatever the policy says.
+    fn udp(&self) -> UdpSupport {
+        UdpSupport::Native
+    }
+
+    fn open_udp<'a>(
+        &'a self,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, Result<BoxedPacketSocket, OutboundError>> {
+        Box::pin(async move {
+            // one budget for the connection, its layers, the key and the
+            // server's answer, which comes at once
+            let open = async {
+                let stream = self.udp_dialer.fresh(opts).await?;
+                let udp = SnellUdp::open(stream).await?;
+                Ok(Box::new(udp) as BoxedPacketSocket)
+            };
+            match tokio::time::timeout(opts.timeout, open).await {
+                Ok(result) => result,
+                Err(_) => Err(OutboundError::Timeout),
+            }
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{FakeSnell, SnellScript, echo_server};
+    use crate::testing::{FakeSnell, SnellScript, echo_server, udp_echo_server};
     use rurge_config::Span;
     use rurge_config::policy::parse_policy;
     use rurge_config::spec::shadow_tls::read_shadow_tls;
     use rurge_config::spec::snell::read_snell;
     use rurge_config::spec::{ObfsOpts, ParamReader, Secret, SnellVersion};
-    use rurge_net::connector::{DirectConnector, SystemResolve};
+    use rurge_net::connector::{DirectConnector, PacketSocket, SystemResolve};
     use std::net::SocketAddr;
     use std::path::Path;
     use std::time::Duration;
@@ -282,7 +323,7 @@ mod tests {
                 fake.addr().port()
             ));
             assert_eq!(out.name(), "N");
-            assert_eq!(out.udp(), crate::UdpSupport::Unsupported);
+            assert_eq!(out.udp(), UdpSupport::Native);
             let mut stream = out
                 .connect_tcp(&target(echo), &ConnectOpts::default())
                 .await
@@ -713,5 +754,196 @@ mod tests {
             Err("`snell` versions 4 and 5 take only `obfs=http`".to_string())
         );
         assert_eq!(build("secret", None), Ok(()));
+    }
+
+    async fn udp_answer(carrier: &dyn PacketSocket) -> (Vec<u8>, Target) {
+        let mut buf = vec![0u8; 65536];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(10), carrier.recv_from(&mut buf))
+            .await
+            .expect("an answer within the bound")
+            .unwrap();
+        (buf[..n].to_vec(), from)
+    }
+
+    async fn udp_roundtrip(carrier: &dyn PacketSocket, to: SocketAddr, payload: &[u8]) {
+        carrier.send_to(payload, &target(to)).await.unwrap();
+        assert_eq!(udp_answer(carrier).await, (payload.to_vec(), target(to)));
+    }
+
+    /// v4 and v5 alike, without `udp-relay`: one connection asks for UDP,
+    /// and each datagram names its target.
+    #[tokio::test]
+    async fn udp_goes_through_one_connection_to_any_target() {
+        let (one, two) = (udp_echo_server().await, udp_echo_server().await);
+        for version in [4, 5] {
+            let fake = FakeSnell::spawn(SnellScript {
+                connect_to: Some(two),
+                ..SnellScript::new("secret")
+            })
+            .await;
+            let out = outbound(&format!(
+                "snell, 127.0.0.1, {}, psk=secret, version={version}",
+                fake.addr().port()
+            ));
+            assert_eq!(out.udp(), UdpSupport::Native);
+            let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+            udp_roundtrip(carrier.as_ref(), one, b"to one").await;
+            // a name goes to the server as its A-labels; the answer names
+            // its source by address
+            let name = Target::new(HostName::Domain("bücher.example".into()), 53);
+            carrier.send_to(b"by name", &name).await.unwrap();
+            assert_eq!(
+                udp_answer(carrier.as_ref()).await,
+                (b"by name".to_vec(), target(two))
+            );
+            let seen = fake.requests();
+            assert_eq!(seen.len(), 1, "v{version}");
+            assert_eq!(seen[0].command, udp::UDP);
+            assert!(seen[0].client_id.is_empty() && seen[0].early.is_empty());
+            assert!((256..512).contains(&seen[0].padding), "{}", seen[0].padding);
+            assert_eq!(
+                fake.datagrams(),
+                [one.to_string(), "xn--bcher-kva.example:53".to_string()]
+            );
+            assert_eq!(fake.connections(), 1);
+        }
+    }
+
+    /// Full cone: whoever reaches the server's socket is heard, under its
+    /// own address.
+    #[tokio::test]
+    async fn anyone_may_answer_through_snell() {
+        let echo = udp_echo_server().await;
+        let fake = FakeSnell::spawn(SnellScript::new("secret")).await;
+        let out = outbound_to(&fake, "");
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        udp_roundtrip(carrier.as_ref(), echo, b"hello").await;
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger
+            .send_to(b"unasked", fake.udp_outside()[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            udp_answer(carrier.as_ref()).await,
+            (b"unasked".to_vec(), target(stranger.local_addr().unwrap()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_servers_record_that_is_no_datagram_is_dropped() {
+        let echo = udp_echo_server().await;
+        let fake = FakeSnell::spawn(SnellScript {
+            udp_junk: true,
+            ..SnellScript::new("secret")
+        })
+        .await;
+        let out = outbound_to(&fake, "");
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        udp_roundtrip(carrier.as_ref(), echo, b"first").await;
+        udp_roundtrip(carrier.as_ref(), echo, b"second").await;
+    }
+
+    #[tokio::test]
+    async fn a_datagram_longer_than_a_record_is_refused_and_nothing_is_sent() {
+        let echo = udp_echo_server().await;
+        let fake = FakeSnell::spawn(SnellScript::new("secret")).await;
+        let out = outbound_to(&fake, "");
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        let err = carrier
+            .send_to(&vec![0u8; 16_375], &target(echo))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "snell: a datagram longer than 16374 bytes");
+        // the largest one fits a record exactly
+        let largest = vec![7u8; 16_374];
+        udp_roundtrip(carrier.as_ref(), echo, &largest).await;
+        assert_eq!(fake.datagrams(), [echo.to_string()]);
+        assert_eq!(fake.largest_record(), record::MAX_PAYLOAD);
+    }
+
+    /// `udp-port` is where the UDP session's connection goes, through the
+    /// same layers; TCP keeps the policy's port.
+    #[tokio::test]
+    async fn udp_goes_to_the_udp_port() {
+        // the policy's port accepts and says nothing
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((tcp, _)) = listener.accept().await {
+                held.push(tcp);
+            }
+        });
+        let echo = udp_echo_server().await;
+        let fake = FakeSnell::spawn(SnellScript {
+            obfs_http: true,
+            ..SnellScript::new("secret")
+        })
+        .await;
+        let out = outbound(&format!(
+            "snell, 127.0.0.1, {}, psk=secret, version=5, obfs=http, udp-port={}",
+            silent.port(),
+            fake.addr().port()
+        ));
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        udp_roundtrip(carrier.as_ref(), echo, b"via udp-port").await;
+        assert_eq!(fake.connections(), 1);
+        // the camouflage names the port the connection went to
+        let host = format!("127.0.0.1:{}", fake.addr().port());
+        assert_eq!(fake.obfs_seen()[0].host, host);
+    }
+
+    #[tokio::test]
+    async fn udp_has_a_connection_of_its_own_never_pooled() {
+        let (tcp_echo, echo) = (echo_server().await, udp_echo_server().await);
+        let fake = FakeSnell::spawn(SnellScript::new("secret")).await;
+        let out = outbound_to(&fake, ", reuse=true");
+        request(&out, tcp_echo, b"pooled").await;
+        let pool = out.pool.clone().unwrap();
+        assert_eq!(pool.len(), 1);
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        udp_roundtrip(carrier.as_ref(), echo, b"fresh").await;
+        drop(carrier);
+        assert_eq!(fake.connections(), 2);
+        assert_eq!(
+            pool.len(),
+            1,
+            "UDP took nothing from the pool, gave nothing back"
+        );
+        assert_eq!(places(&fake), [(0, 0), (1, 0)]);
+    }
+
+    #[tokio::test]
+    async fn the_servers_refusal_of_udp_fails_the_open() {
+        let fake = FakeSnell::spawn(SnellScript {
+            refuse: Some((0x07, b"udp disabled".to_vec())),
+            ..SnellScript::new("secret")
+        })
+        .await;
+        let out = outbound_to(&fake, "");
+        let err = out
+            .open_udp(&ConnectOpts::default())
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(err.to_string(), "snell: the server refused: udp disabled");
+        // a server that never answers is the open's time-out
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((tcp, _)) = listener.accept().await {
+                held.push(tcp);
+            }
+        });
+        let out = outbound(&format!(
+            "snell, 127.0.0.1, {}, psk=secret, version=4",
+            silent.port()
+        ));
+        let opts = ConnectOpts {
+            timeout: Duration::from_millis(300),
+        };
+        let err = out.open_udp(&opts).await.err().expect("times out");
+        assert!(matches!(err, OutboundError::Timeout), "{err}");
     }
 }

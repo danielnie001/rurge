@@ -263,6 +263,37 @@ impl SnellStream {
         Poll::Ready(self.check(flushed))
     }
 
+    /// The rest of the current record's payload, whole, or the next
+    /// record's when nothing of it is left: UDP carries one datagram per
+    /// record (`udp`). `None` once the server's side ended or the connection
+    /// closed between records.
+    pub(crate) fn poll_record(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Option<Vec<u8>>>> {
+        // no room: the reader stops at a payload without taking any of it
+        let read = ready!(self.poll_read_records(cx, &mut ReadBuf::new(&mut [])));
+        self.check(read)?;
+        let reading = std::mem::replace(
+            &mut self.reading,
+            Reading::Header {
+                buf: [0; HEADER + TAG],
+                filled: 0,
+            },
+        );
+        Poll::Ready(Ok(match reading {
+            Reading::Payload { mut buf, pos, end } => {
+                buf.truncate(end);
+                buf.drain(..pos);
+                Some(buf)
+            }
+            ended => {
+                self.reading = ended;
+                None
+            }
+        }))
+    }
+
     /// The salt goes in front of the first record.
     fn start_record(&mut self) {
         if !self.salt_sent {
@@ -615,6 +646,29 @@ mod tests {
         client.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"answer");
         assert!(!client.is_reusable() && !server.is_reusable());
+    }
+
+    #[tokio::test]
+    async fn a_record_is_read_whole_and_the_end_is_none() {
+        let (mut client, mut server) = pair(64 * 1024);
+        client.write_all(b"one").await.unwrap();
+        client.write_all(b"two, longer").await.unwrap();
+        client.write_all(b"three").await.unwrap();
+        poll_fn(|cx| client.poll_end(cx)).await.unwrap();
+        for expected in [&b"one"[..], b"two, longer"] {
+            let record = poll_fn(|cx| server.poll_record(cx)).await.unwrap();
+            assert_eq!(record.unwrap(), expected);
+        }
+        // what a byte read left of a record comes whole
+        let mut first = [0u8; 2];
+        server.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"th");
+        assert_eq!(
+            poll_fn(|cx| server.poll_record(cx)).await.unwrap().unwrap(),
+            b"ree"
+        );
+        assert_eq!(poll_fn(|cx| server.poll_record(cx)).await.unwrap(), None);
+        assert!(server.read_ended());
     }
 
     /// Moves exactly `len` bytes from one wire to the other: the records

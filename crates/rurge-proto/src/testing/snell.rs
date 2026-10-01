@@ -15,6 +15,12 @@
 //! is gone, discards) the client's records until the client's empty record,
 //! then reads the next request; a Connect tunnel closes instead.
 //!
+//! UDP (`06`) is answered `00` at once; then every record of the client's
+//! is one datagram, sent from a loopback socket of the connection's own,
+//! and whatever reaches that socket goes back as `04 IPv4 port payload`
+//! (full cone). Names are never resolved: a datagram for one goes to
+//! `connect_to`, or nowhere.
+//!
 //! A wrong PSK gets no word back, only the close.
 
 use super::AbortOnDrop;
@@ -24,11 +30,11 @@ use crate::snell::kdf;
 use rurge_config::spec::ObfsMode;
 use rurge_net::connector::BoxedStream;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 const SALT: usize = 16;
 const HEADER: usize = 7 + TAG;
@@ -36,6 +42,7 @@ const VERSION: u8 = 0x04;
 const MAX_PAYLOAD: usize = 0x3FFF;
 const CONNECT: u8 = 0x01;
 const CONNECT_V2: u8 = 0x05;
+const UDP: u8 = 0x06;
 
 #[derive(Clone, Debug)]
 pub struct SnellScript {
@@ -50,6 +57,9 @@ pub struct SnellScript {
     pub tunnels_per_connection: Option<usize>,
     /// Answer every request with this error code and message, then close.
     pub refuse: Option<(u8, Vec<u8>)>,
+    /// In front of every UDP answer, two records that are no datagram: an
+    /// unknown address family and an address cut short.
+    pub udp_junk: bool,
 }
 
 impl SnellScript {
@@ -60,19 +70,21 @@ impl SnellScript {
             connect_to: None,
             tunnels_per_connection: None,
             refuse: None,
+            udp_junk: false,
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordedSnell {
-    /// `01` Connect, `05` ConnectV2.
+    /// `01` Connect, `05` ConnectV2, `06` UDP.
     pub command: u8,
     pub client_id: Vec<u8>,
-    /// Exactly as it was on the wire (an IP literal is text too).
+    /// Exactly as it was on the wire (an IP literal is text too); UDP has
+    /// no target (empty, port 0).
     pub host: String,
     pub port: u16,
-    /// Payload after the request, in the same record.
+    /// Payload after the request, in the same record (UDP: after the id).
     pub early: Vec<u8>,
     /// The connection's number, from 0 in the order they were accepted.
     pub connection: usize,
@@ -96,6 +108,10 @@ struct Seen {
     rejected: AtomicUsize,
     unanswered: AtomicUsize,
     largest_record: AtomicUsize,
+    /// Every UDP datagram's target, `host:port`, the name as on the wire.
+    datagrams: Mutex<Vec<String>>,
+    /// Each UDP connection's own socket, in the order they opened.
+    udp_outside: Mutex<Vec<SocketAddr>>,
 }
 
 struct Shared {
@@ -256,18 +272,31 @@ impl Answers {
     }
 }
 
-/// `01 command id-length id host-length host port early`.
+/// `01 command id-length id host-length host port early`, UDP's
+/// `01 06 id-length id`.
 fn parse_request(p: &[u8]) -> Option<RecordedSnell> {
     if *p.first()? != 0x01 {
         return None;
     }
     let command = *p.get(1)?;
-    if command != CONNECT && command != CONNECT_V2 {
-        return None;
-    }
     let id_len = usize::from(*p.get(2)?);
     let client_id = p.get(3..3 + id_len)?.to_vec();
     let at = 3 + id_len;
+    if command == UDP {
+        return Some(RecordedSnell {
+            command,
+            client_id,
+            host: String::new(),
+            port: 0,
+            early: p[at..].to_vec(),
+            connection: 0,
+            tunnel: 0,
+            padding: 0,
+        });
+    }
+    if command != CONNECT && command != CONNECT_V2 {
+        return None;
+    }
     let host_len = usize::from(*p.get(at)?);
     let host = p.get(at + 1..at + 1 + host_len)?;
     let at = at + 1 + host_len;
@@ -282,6 +311,36 @@ fn parse_request(p: &[u8]) -> Option<RecordedSnell> {
         tunnel: 0,
         padding: 0,
     })
+}
+
+/// A client datagram, `01 host-length host port payload` or
+/// `01 00 04|06 address port payload`: `(host, port, payload)`.
+fn parse_datagram(p: &[u8]) -> Option<(String, u16, &[u8])> {
+    if *p.first()? != 0x01 {
+        return None;
+    }
+    let (host, at) = match *p.get(1)? {
+        0 => match *p.get(2)? {
+            4 => {
+                let b: [u8; 4] = p.get(3..7)?.try_into().ok()?;
+                (Ipv4Addr::from(b).to_string(), 7)
+            }
+            6 => {
+                let b: [u8; 16] = p.get(3..19)?.try_into().ok()?;
+                (Ipv6Addr::from(b).to_string(), 19)
+            }
+            _ => return None,
+        },
+        len => {
+            let len = usize::from(len);
+            (
+                String::from_utf8_lossy(p.get(2..2 + len)?).into_owned(),
+                2 + len,
+            )
+        }
+    };
+    let port = u16::from_be_bytes(p.get(at..at + 2)?.try_into().ok()?);
+    Some((host, port, &p[at + 2..]))
 }
 
 /// Shuts our side and reads until the client goes: closing with unread
@@ -396,6 +455,76 @@ impl Shared {
     }
 }
 
+impl Shared {
+    /// UDP on this connection until either side ends.
+    async fn udp(
+        &self,
+        reader: &mut Reader,
+        up: &mut Direction,
+        writer: &mut Writer,
+        answers: &mut Answers,
+    ) -> io::Result<()> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        self.seen
+            .udp_outside
+            .lock()
+            .expect("outside")
+            .push(socket.local_addr()?);
+        // the answer at once, in the direction's first (padded) record
+        writer.write_all(&answers.record(&[0x00])).await?;
+        let datagrams = async {
+            while let Some(Record::Data { payload, .. }) =
+                read_record(reader, up, &self.seen).await?
+            {
+                let (host, port, data) =
+                    parse_datagram(&payload).ok_or_else(|| bad("a record that is no datagram"))?;
+                self.seen
+                    .datagrams
+                    .lock()
+                    .expect("datagrams")
+                    .push(format!("{host}:{port}"));
+                let to = match (host.parse::<IpAddr>(), self.script.connect_to) {
+                    (Ok(ip), _) => SocketAddr::new(ip, port),
+                    (Err(_), Some(addr)) => addr,
+                    // never resolves: a name without `connect_to` is a dead end
+                    (Err(_), None) => continue,
+                };
+                socket.send_to(data, to).await?;
+            }
+            Ok::<(), io::Error>(())
+        };
+        let replies = async {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let (n, from) = match socket.recv_from(&mut buf).await {
+                    Ok(got) => got,
+                    // an ICMP "unreachable" for an earlier datagram (Windows)
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
+                    Err(e) => return Err(e),
+                };
+                if self.script.udp_junk {
+                    writer
+                        .write_all(&answers.record(&[5, 1, 2, 3, 4, 0, 53, b'x']))
+                        .await?;
+                    writer.write_all(&answers.record(&[4, 1, 2])).await?;
+                }
+                let mut datagram = match from.ip() {
+                    IpAddr::V4(ip) => [&[4][..], &ip.octets()].concat(),
+                    IpAddr::V6(ip) => [&[6][..], &ip.octets()].concat(),
+                };
+                datagram.extend_from_slice(&from.port().to_be_bytes());
+                let room = MAX_PAYLOAD - datagram.len();
+                datagram.extend_from_slice(&buf[..n.min(room)]);
+                writer.write_all(&answers.record(&datagram)).await?;
+            }
+        };
+        tokio::select! {
+            done = datagrams => done,
+            done = replies => done,
+        }
+    }
+}
+
 async fn serve(tcp: TcpStream, shared: Arc<Shared>, connection: usize) -> io::Result<()> {
     let script = &shared.script;
     let mut stream: BoxedStream = Box::new(tcp);
@@ -441,6 +570,13 @@ async fn serve(tcp: TcpStream, shared: Arc<Shared>, connection: usize) -> io::Re
             .push(request.clone());
         if let Some((code, message)) = &script.refuse {
             writer.write_all(&answers.error(*code, message)).await?;
+            close(&mut reader, &mut writer).await;
+            return Ok(());
+        }
+        if request.command == UDP {
+            let _ = shared
+                .udp(&mut reader, &mut up, &mut writer, &mut answers)
+                .await;
             close(&mut reader, &mut writer).await;
             return Ok(());
         }
@@ -505,6 +641,27 @@ impl FakeSnell {
     /// Requests closed without an answer (`tunnels_per_connection`).
     pub fn unanswered(&self) -> usize {
         self.shared.seen.unanswered.load(Ordering::SeqCst)
+    }
+
+    /// Every UDP datagram's target, `host:port`, in arrival order.
+    pub fn datagrams(&self) -> Vec<String> {
+        self.shared
+            .seen
+            .datagrams
+            .lock()
+            .expect("datagrams")
+            .clone()
+    }
+
+    /// Where each UDP connection sends from: a datagram to one of these goes
+    /// back to its client.
+    pub fn udp_outside(&self) -> Vec<SocketAddr> {
+        self.shared
+            .seen
+            .udp_outside
+            .lock()
+            .expect("outside")
+            .clone()
     }
 
     /// The longest payload of any client record so far.
