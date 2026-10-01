@@ -11,32 +11,46 @@
 //!   credentials. No `user-agent` unless `headers` adds one.
 //! - A 2xx answer turns the stream into the tunnel; any other status is
 //!   the proxy's refusal.
+//! - With `udp-relay=true`, UDP goes as CONNECT-UDP (RFC 9298) over
+//!   extended CONNECT (RFC 8441), one stream per target (`udp`).
+
+mod capsule;
+mod udp;
 
 use crate::build::{shadow_tls_client, tls_client};
-use crate::h2pool::{H2Pool, StackDial};
+use crate::h2pool::{H2Pool, H2Stream, StackDial};
 use crate::http::{merge, render, wire_host};
 use crate::transport::Stack;
-use crate::{BuildError, Outbound, OutboundError};
+use crate::{BuildError, Outbound, OutboundError, UdpSupport};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use h2::ext::Protocol;
 use http::header::{HeaderName, HeaderValue};
-use http::{Method, Request, StatusCode, Version};
+use http::{Method, Request, Response, StatusCode, Version};
 use rurge_config::KeystoreItem;
 use rurge_config::spec::{H2ConnectSpec, HeaderTemplate, ShadowTlsOpts};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
+use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target};
 use rustls::RootCertStore;
 use std::sync::Arc;
+use udp::H2Udp;
 
 const LABEL: &str = "h2-connect";
 
 /// No `Debug`: it holds the credentials.
 pub struct H2ConnectOutbound {
     name: String,
+    /// Shared with the UDP carriers.
+    inner: Arc<Inner>,
+}
+
+struct Inner {
     pool: H2Pool,
     /// The `proxy-authorization` value, ready to send.
     authorization: Option<String>,
     headers: Vec<HeaderTemplate>,
+    /// `udp-relay=true`: the server's own `:authority` for CONNECT-UDP.
+    udp_authority: Option<String>,
 }
 
 /// `Basic base64(user:password)` (RFC 9110 11.7.2, RFC 7617).
@@ -55,15 +69,30 @@ pub(crate) fn connect_request(
     templates: &[HeaderTemplate],
 ) -> Result<Request<()>, OutboundError> {
     let Some(host) = wire_host(target) else {
-        return Err(OutboundError::Proxy(format!(
-            "{label}: the host name cannot be sent to the server"
-        )));
+        return Err(unsendable(label));
     };
+    request(label, format!("{host}:{}", target.port), ours, templates)
+}
+
+fn unsendable(label: &str) -> OutboundError {
+    OutboundError::Proxy(format!(
+        "{label}: the host name cannot be sent to the server"
+    ))
+}
+
+/// A CONNECT request for `uri` carrying `ours`, replaced field by field by
+/// the rendered `templates`.
+fn request(
+    label: &str,
+    uri: String,
+    ours: Vec<(String, String)>,
+    templates: &[HeaderTemplate],
+) -> Result<Request<()>, OutboundError> {
     let mut fields = ours;
     merge(&mut fields, render(templates));
     let mut request = Request::builder()
         .method(Method::CONNECT)
-        .uri(format!("{host}:{}", target.port))
+        .uri(uri)
         .version(Version::HTTP_2);
     for (name, value) in fields {
         // `HeaderName` lowercases, as HTTP/2 wants; valid templates always
@@ -102,6 +131,18 @@ impl H2ConnectOutbound {
                 n + 1
             )));
         }
+        // CONNECT-UDP names the server itself (RFC 9298 3.4)
+        let udp_authority = match spec.udp_relay {
+            false => None,
+            true => match wire_host(&server) {
+                Some(host) => Some(format!("{host}:{}", server.port)),
+                None => {
+                    return Err(BuildError::new(
+                        "`udp-relay`: the server name cannot be sent in a request".to_string(),
+                    ));
+                }
+            },
+        };
         let shadow_tls =
             shadow_tls_client(shadow_tls, Some(&spec.tls), &server.host, roots.clone())?;
         // the spec pins `alpn` to `h2`; `h2` is also what an empty one offers
@@ -116,27 +157,29 @@ impl H2ConnectOutbound {
         };
         Ok(H2ConnectOutbound {
             name: name.to_string(),
-            pool: H2Pool::new(LABEL, spec.max_streams.max(1), Arc::new(dial)),
-            authorization,
-            headers: spec.headers.clone(),
+            inner: Arc::new(Inner {
+                pool: H2Pool::new(LABEL, spec.max_streams.max(1), Arc::new(dial)),
+                authorization,
+                headers: spec.headers.clone(),
+                udp_authority,
+            }),
         })
     }
+}
 
-    async fn tunnel(
-        &self,
-        target: &Target,
-        opts: &ConnectOpts,
-    ) -> Result<BoxedStream, OutboundError> {
-        let ours = self
-            .authorization
+impl Inner {
+    /// Our fields of every request: the credentials, if any.
+    fn ours(&self) -> Vec<(String, String)> {
+        self.authorization
             .iter()
             .map(|value| ("proxy-authorization".to_string(), value.clone()))
-            .collect();
-        // never dial for a target whose name cannot be sent
-        let request = connect_request(LABEL, target, ours, &self.headers)?;
-        let response = self.pool.open(request, opts).await?;
+            .collect()
+    }
+
+    /// The stream of a 2xx `response`; any other status is the refusal.
+    fn established(response: Response<H2Stream>) -> Result<H2Stream, OutboundError> {
         match response.status() {
-            status if status.is_success() => Ok(Box::new(response.into_body()) as BoxedStream),
+            status if status.is_success() => Ok(response.into_body()),
             StatusCode::PROXY_AUTHENTICATION_REQUIRED => Err(OutboundError::Proxy(format!(
                 "{LABEL}: proxy authentication required"
             ))),
@@ -145,6 +188,46 @@ impl H2ConnectOutbound {
                 status.as_u16()
             ))),
         }
+    }
+
+    async fn tunnel(
+        &self,
+        target: &Target,
+        opts: &ConnectOpts,
+    ) -> Result<BoxedStream, OutboundError> {
+        // never dial for a target whose name cannot be sent
+        let request = connect_request(LABEL, target, self.ours(), &self.headers)?;
+        let response = self.pool.open(request, opts).await?;
+        Ok(Box::new(Self::established(response)?) as BoxedStream)
+    }
+
+    /// A CONNECT-UDP stream to `target` (RFC 9298 3.4): `:protocol
+    /// connect-udp`, the server's `:authority`, the default template's
+    /// `:path` and `capsule-protocol: ?1` (RFC 9297 3.4), then the same
+    /// fields as a CONNECT. The pool refuses it on a connection whose server
+    /// did not enable extended CONNECT.
+    async fn udp_stream(
+        &self,
+        authority: &str,
+        target: &Target,
+        opts: &ConnectOpts,
+    ) -> Result<H2Stream, OutboundError> {
+        let Some(path) = udp::masque_path(target) else {
+            return Err(unsendable(LABEL));
+        };
+        let mut ours = self.ours();
+        ours.push(("capsule-protocol".to_string(), "?1".to_string()));
+        let mut request = request(
+            LABEL,
+            format!("https://{authority}{path}"),
+            ours,
+            &self.headers,
+        )?;
+        request
+            .extensions_mut()
+            .insert(Protocol::from_static("connect-udp"));
+        let response = self.pool.open(request, opts).await?;
+        Self::established(response)
     }
 }
 
@@ -161,24 +244,55 @@ impl Outbound for H2ConnectOutbound {
         Box::pin(async move {
             // one budget for the connection (when one is dialed), TLS, the
             // HTTP/2 handshake and the CONNECT exchange
-            match tokio::time::timeout(opts.timeout, self.tunnel(target, opts)).await {
+            match tokio::time::timeout(opts.timeout, self.inner.tunnel(target, opts)).await {
                 Ok(result) => result,
                 Err(_) => Err(OutboundError::Timeout),
             }
         })
+    }
+
+    fn udp(&self) -> UdpSupport {
+        if self.inner.udp_authority.is_some() {
+            UdpSupport::Native
+        } else {
+            UdpSupport::Unsupported
+        }
+    }
+
+    /// Nothing is opened yet: each target gets its stream with its first
+    /// datagram.
+    fn open_udp<'a>(
+        &'a self,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, Result<BoxedPacketSocket, OutboundError>> {
+        let carrier = match &self.inner.udp_authority {
+            Some(authority) => {
+                let udp = H2Udp::new(
+                    self.inner.clone(),
+                    authority.clone(),
+                    opts.clone(),
+                    udp::IDLE,
+                );
+                Ok(Box::new(udp) as BoxedPacketSocket)
+            }
+            None => Err(OutboundError::Unsupported(
+                "UDP without `udp-relay=true`".to_string(),
+            )),
+        };
+        Box::pin(std::future::ready(carrier))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{FakeH2Proxy, H2ProxyScript, TlsFixture, echo_server};
+    use crate::testing::{FakeH2Proxy, H2ProxyScript, TlsFixture, echo_server, udp_echo_server};
     use rurge_config::policy::parse_policy;
     use rurge_config::spec::h2::read_h2_connect;
     use rurge_config::spec::shadow_tls::read_shadow_tls;
     use rurge_config::spec::{HeaderPart, ParamReader};
     use rurge_config::{HostName, KeystoreType, Span};
-    use rurge_net::connector::{DirectConnector, SystemResolve};
+    use rurge_net::connector::{DirectConnector, PacketSocket, SystemResolve};
     use std::net::SocketAddr;
     use std::path::Path;
     use std::time::Duration;
@@ -525,7 +639,7 @@ mod tests {
             .connect_tcp(&target(echo), &ConnectOpts::default())
             .await
             .unwrap();
-        eventually(|| out.pool.connections() == 0).await;
+        eventually(|| out.inner.pool.connections() == 0).await;
         let mut second = out
             .connect_tcp(&target(echo), &ConnectOpts::default())
             .await
@@ -647,6 +761,244 @@ mod tests {
         assert_eq!(
             basic_authorization("Aladdin", "open sesame"),
             "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+        );
+    }
+
+    /// A fake that serves CONNECT-UDP.
+    async fn udp_fake(script: H2ProxyScript) -> (Arc<TlsFixture>, FakeH2Proxy) {
+        fake(H2ProxyScript {
+            extended_connect: true,
+            ..script
+        })
+        .await
+    }
+
+    async fn udp_answer(carrier: &dyn PacketSocket) -> (Vec<u8>, Target) {
+        let mut buf = vec![0u8; 65536];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(10), carrier.recv_from(&mut buf))
+            .await
+            .expect("an answer within the bound")
+            .unwrap();
+        (buf[..n].to_vec(), from)
+    }
+
+    async fn udp_roundtrip(carrier: &dyn PacketSocket, to: &Target, payload: &[u8]) {
+        carrier.send_to(payload, to).await.unwrap();
+        assert_eq!(udp_answer(carrier).await, (payload.to_vec(), to.clone()));
+    }
+
+    fn masque(addr: SocketAddr) -> String {
+        format!("/.well-known/masque/udp/{}/{}/", addr.ip(), addr.port())
+    }
+
+    /// RFC 9298 3.4: extended CONNECT to the server's own authority, the
+    /// target in the path, `capsule-protocol: ?1`, our fields as on TCP.
+    #[tokio::test]
+    async fn a_datagram_crosses_a_connect_udp_stream() {
+        let echo = udp_echo_server().await;
+        let (fixture, fake) = udp_fake(H2ProxyScript {
+            users: vec![("u".into(), "p".into())],
+            ..H2ProxyScript::default()
+        })
+        .await;
+        let out = outbound(&fake, ", u, p, udp-relay=true, headers=X-Pad:x", &fixture);
+        assert_eq!(out.udp(), UdpSupport::Native);
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        assert_eq!(fake.connections(), 0, "nothing is opened before a datagram");
+        udp_roundtrip(carrier.as_ref(), &target(echo), b"through a capsule").await;
+        udp_roundtrip(carrier.as_ref(), &target(echo), b"").await;
+        let seen = fake.requests();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "CONNECT");
+        assert_eq!(seen[0].protocol.as_deref(), Some("connect-udp"));
+        assert_eq!(seen[0].authority, fake.addr().to_string());
+        assert_eq!(seen[0].path, masque(echo));
+        assert_eq!(seen[0].header("capsule-protocol"), Some("?1"));
+        assert_eq!(seen[0].header("proxy-authorization"), Some("Basic dTpw"));
+        assert_eq!(seen[0].header("x-pad"), Some("x"));
+        // a refused CONNECT-UDP fails the datagram with the TCP texts
+        let out = outbound(&fake, ", udp-relay=true", &fixture);
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        let err = carrier.send_to(b"x", &target(echo)).await.unwrap_err();
+        assert_eq!(err.to_string(), "h2-connect: proxy authentication required");
+    }
+
+    /// One stream per target (M6-D8), the streams sharing the pooled
+    /// connection; each answer is its stream's target's.
+    #[tokio::test]
+    async fn every_target_has_its_own_stream() {
+        let (one, two) = (udp_echo_server().await, udp_echo_server().await);
+        let (fixture, fake) = udp_fake(H2ProxyScript::default()).await;
+        let out = outbound(&fake, ", udp-relay=true", &fixture);
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        udp_roundtrip(carrier.as_ref(), &target(one), b"to one").await;
+        udp_roundtrip(carrier.as_ref(), &target(two), b"to two").await;
+        udp_roundtrip(carrier.as_ref(), &target(one), b"one again").await;
+        let seen: Vec<(usize, String)> = fake
+            .requests()
+            .iter()
+            .map(|r| (r.connection, r.path.clone()))
+            .collect();
+        assert_eq!(seen, [(0, masque(one)), (0, masque(two))]);
+        assert_eq!(fake.connections(), 1);
+    }
+
+    /// Names as A-labels, IPv6 literals with `%3A` (RFC 9298 3).
+    #[tokio::test]
+    async fn names_and_ipv6_literals_go_in_the_path() {
+        let echo = udp_echo_server().await;
+        let (fixture, fake) = udp_fake(H2ProxyScript {
+            connect_to: Some(echo),
+            ..H2ProxyScript::default()
+        })
+        .await;
+        let out = outbound(&fake, ", udp-relay=true", &fixture);
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        for (host, path) in [
+            (
+                HostName::Domain("bücher.example".into()),
+                "/.well-known/masque/udp/xn--bcher-kva.example/53/",
+            ),
+            (
+                HostName::parse("2001:db8::42"),
+                "/.well-known/masque/udp/2001%3Adb8%3A%3A42/53/",
+            ),
+        ] {
+            udp_roundtrip(carrier.as_ref(), &Target::new(host, 53), b"q").await;
+            assert_eq!(fake.requests().last().unwrap().path, path);
+        }
+        let err = carrier
+            .send_to(
+                b"q",
+                &Target::new(HostName::Domain("x@blocked.test".into()), 53),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "h2-connect: the host name cannot be sent to the server"
+        );
+        assert_eq!(fake.requests().len(), 2);
+    }
+
+    /// RFC 8441 3: no extended CONNECT before the server allows it.
+    #[tokio::test]
+    async fn a_server_without_extended_connect_carries_no_udp() {
+        let echo = udp_echo_server().await;
+        let (fixture, fake) = fake(H2ProxyScript::default()).await;
+        let out = outbound(&fake, ", udp-relay=true", &fixture);
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        let err = carrier.send_to(b"x", &target(echo)).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "h2-connect: the server does not support extended CONNECT"
+        );
+        assert!(fake.requests().is_empty());
+        // the connection still carries TCP
+        let tcp = echo_server().await;
+        let mut stream = out
+            .connect_tcp(&target(tcp), &ConnectOpts::default())
+            .await
+            .unwrap();
+        round_trip(&mut stream, b"tcp is fine").await;
+    }
+
+    /// RFC 9297 3.2, RFC 9298 4: other capsule types and context ids are
+    /// skipped; nothing of them reaches the engine.
+    #[tokio::test]
+    async fn other_capsules_are_skipped() {
+        let echo = udp_echo_server().await;
+        let (fixture, fake) = udp_fake(H2ProxyScript {
+            udp_extra_capsules: true,
+            ..H2ProxyScript::default()
+        })
+        .await;
+        let out = outbound(&fake, ", udp-relay=true", &fixture);
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        udp_roundtrip(carrier.as_ref(), &target(echo), b"first").await;
+        udp_roundtrip(carrier.as_ref(), &target(echo), b"second").await;
+    }
+
+    /// RFC 9298 5: at most 65527 bytes with context id 0; a longer datagram
+    /// is refused and nothing is opened.
+    #[tokio::test]
+    async fn a_datagram_too_long_is_refused() {
+        let echo = udp_echo_server().await;
+        let (fixture, fake) = udp_fake(H2ProxyScript::default()).await;
+        let out = outbound(&fake, ", udp-relay=true", &fixture);
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        let err = carrier
+            .send_to(&vec![0u8; 65528], &target(echo))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "h2-connect: a datagram longer than 65527 bytes"
+        );
+        assert_eq!(fake.connections(), 0);
+    }
+
+    #[tokio::test]
+    async fn without_udp_relay_there_is_no_udp() {
+        let (fixture, fake) = udp_fake(H2ProxyScript::default()).await;
+        let out = outbound(&fake, "", &fixture);
+        assert_eq!(out.udp(), UdpSupport::Unsupported);
+        let Err(e) = out.open_udp(&ConnectOpts::default()).await else {
+            panic!("a carrier without udp-relay");
+        };
+        assert_eq!(
+            e.to_string(),
+            "policy protocol not implemented: UDP without `udp-relay=true`"
+        );
+    }
+
+    /// A stream idle past the bound closes and leaves the table; the
+    /// target's next datagram opens a new one on the pooled connection.
+    #[tokio::test]
+    async fn an_idle_stream_closes_and_the_next_datagram_reopens() {
+        let echo = udp_echo_server().await;
+        let (fixture, fake) = udp_fake(H2ProxyScript::default()).await;
+        let out = outbound(&fake, ", udp-relay=true", &fixture);
+        let carrier = H2Udp::new(
+            out.inner.clone(),
+            fake.addr().to_string(),
+            ConnectOpts::default(),
+            Duration::from_millis(200),
+        );
+        udp_roundtrip(&carrier, &target(echo), b"first").await;
+        assert_eq!(carrier.tracked(), 1);
+        eventually(|| carrier.tracked() == 0).await;
+        udp_roundtrip(&carrier, &target(echo), b"second").await;
+        let carried: Vec<usize> = fake.requests().iter().map(|r| r.connection).collect();
+        assert_eq!(carried, [0, 0]);
+    }
+
+    #[test]
+    fn udp_relay_needs_a_server_name_that_can_be_sent() {
+        let fixture = TlsFixture::new(&["127.0.0.1"]);
+        let spec = H2ConnectSpec {
+            tls: rurge_config::spec::TlsOpts::default(),
+            username: None,
+            password: None,
+            headers: Vec::new(),
+            max_streams: 3,
+            udp_relay: true,
+        };
+        let err = H2ConnectOutbound::new(
+            "H",
+            Target::new(HostName::Domain("a b.test".into()), 443),
+            &spec,
+            None,
+            &[],
+            fixture.roots(),
+            Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(
+            err.message,
+            "`udp-relay`: the server name cannot be sent in a request"
         );
     }
 }
