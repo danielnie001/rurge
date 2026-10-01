@@ -18,6 +18,12 @@
 //!   fails they share its failure instead of dialing the same thing again.
 //! - A connection that received GOAWAY, failed, or ended gets no new
 //!   streams; the ones it carries run to their end.
+//! - A request that got no response head (the caller gave up, or the
+//!   stream failed) has its connection checked with a PING: no answer in
+//!   `LIVENESS_TIMEOUT` and the connection gets no new streams. A silently
+//!   dead transport (sleep, a network switch) would otherwise take every
+//!   request until the system gives up on it. A slow target answers no
+//!   head either, but its connection answers the PING.
 //! - A connection without streams for `IDLE_TIMEOUT` is closed (looked at
 //!   on every request and by a reaper).
 //!
@@ -46,7 +52,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Notify, oneshot, watch};
 use tokio::time::Instant;
 
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -61,6 +67,9 @@ const CONNECTION_WINDOW: u32 = 4 << 20;
 /// How long a connection the pool let go of may take to close cleanly
 /// (GOAWAY, then the transport's shutdown).
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
+/// How long a connection whose request got no response head has to answer
+/// a PING before it takes no new streams.
+pub(crate) const LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Opens the transport of a new connection. No `Debug` for implementers
 /// that hold credentials.
@@ -152,6 +161,10 @@ impl H2Pool {
         let conn = lease.0.clone();
         if request.extensions().get::<Protocol>().is_some() {
             conn.settled().await;
+            // ended before its SETTINGS were known: nothing was learned
+            if conn.is_draining() {
+                return Err(conn.failure(self.label));
+            }
             if !conn.send.is_extended_connect_protocol_enabled() {
                 return Err(OutboundError::Proxy(format!(
                     "{}: the server does not support extended CONNECT",
@@ -159,6 +172,7 @@ impl H2Pool {
                 )));
             }
         }
+        let mut unanswered = Unanswered(Some(&conn));
         // a fresh handle: another request's queued stream cannot hold it up
         let (response, send) = conn
             .send
@@ -166,6 +180,8 @@ impl H2Pool {
             .send_request(request, false)
             .map_err(|e| self.error(&e))?;
         let response = response.await.map_err(|e| self.error(&e))?;
+        // any status shows the connection is alive
+        unanswered.0 = None;
         let (head, recv) = response.into_parts();
         let stream = H2Stream::new(self.label, send, recv).leased(lease);
         Ok(Response::from_parts(head, stream))
@@ -259,18 +275,24 @@ impl H2Pool {
         let (settled_tx, settled) = watch::channel(false);
         let (closing, closed) = oneshot::channel();
         let ended = Arc::new(AtomicBool::new(false));
+        let dead = Arc::new(AtomicBool::new(false));
+        let check = Arc::new(Notify::new());
         tokio::spawn(drive(
             self.label,
             connection,
             ping,
             settled_tx,
+            check.clone(),
             closed,
             ended.clone(),
+            dead.clone(),
         ));
         Ok(Conn {
             send,
             settled,
             ended,
+            dead,
+            check,
             usage: Mutex::new(Usage {
                 open: 0,
                 idle_since: Instant::now(),
@@ -305,6 +327,12 @@ struct Conn {
     settled: watch::Receiver<bool>,
     /// The connection's task has finished.
     ended: Arc<AtomicBool>,
+    /// A PING went unanswered (the one that learns the SETTINGS failed, or
+    /// a liveness check timed out): no new streams.
+    dead: Arc<AtomicBool>,
+    /// Asks the connection's task for a liveness check; flags that come
+    /// while one runs are merged into a single permit.
+    check: Arc<Notify>,
     usage: Mutex<Usage>,
     /// Dropped with the connection: tells its task to close it.
     _closing: oneshot::Sender<()>,
@@ -334,12 +362,24 @@ impl Conn {
         Some(Lease(self.clone()))
     }
 
-    /// GOAWAY received, an error, or the task ended: `h2` refuses new
-    /// streams. A fresh handle is never pending, so the look never waits.
+    /// GOAWAY received, an error, the task ended, or a PING went
+    /// unanswered: no new streams. A fresh handle is never pending, so the
+    /// look never waits.
     fn is_draining(&self) -> bool {
         let mut cx = Context::from_waker(Waker::noop());
         self.ended.load(Ordering::SeqCst)
+            || self.dead.load(Ordering::SeqCst)
             || matches!(self.send.clone().poll_ready(&mut cx), Poll::Ready(Err(_)))
+    }
+
+    /// Why a draining connection takes no new streams: `h2`'s error when
+    /// it has one.
+    fn failure(&self, label: &str) -> OutboundError {
+        let mut cx = Context::from_waker(Waker::noop());
+        match self.send.clone().poll_ready(&mut cx) {
+            Poll::Ready(Err(e)) => OutboundError::Proxy(format!("{label}: {}", describe(&e))),
+            _ => OutboundError::Proxy(format!("{label}: the HTTP/2 connection failed")),
+        }
     }
 
     fn is_expired(&self, now: Instant) -> bool {
@@ -362,6 +402,19 @@ impl Conn {
 /// A stream's place on its connection.
 struct Lease(Arc<Conn>);
 
+/// A request still waiting for its response head. Dropped so (the caller
+/// gave up, or the stream failed), it asks for a liveness check of its
+/// connection.
+struct Unanswered<'a>(Option<&'a Conn>);
+
+impl Drop for Unanswered<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0 {
+            conn.check.notify_one();
+        }
+    }
+}
+
 impl Drop for Lease {
     fn drop(&mut self) {
         let mut usage = self.0.usage.lock().expect("usage");
@@ -379,31 +432,54 @@ fn prune(conns: &mut Vec<Arc<Conn>>, now: Instant) {
 /// Runs a connection until it ends, or until the pool and its streams let
 /// go of it and it has had `CLOSE_GRACE` to close. Meanwhile it learns the
 /// server's SETTINGS with a PING round trip (`h2` has no way to wait for
-/// them).
+/// them), then answers the liveness checks its requests ask for with the
+/// same PING handle (`h2` hands it out once).
+#[allow(clippy::too_many_arguments)]
 async fn drive<T>(
     label: &'static str,
     connection: client::Connection<T, Bytes>,
     ping: Option<PingPong>,
     settled: watch::Sender<bool>,
+    check: Arc<Notify>,
     closed: oneshot::Receiver<()>,
     ended: Arc<AtomicBool>,
+    dead: Arc<AtomicBool>,
 ) where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let mut connection = pin!(connection);
-    let settle = async {
-        if let Some(mut ping) = ping {
-            // failing, the connection is failing too: nothing more to learn
-            let _ = ping.ping(Ping::opaque()).await;
+    let watch = async {
+        let Some(mut ping) = ping else {
+            settled.send_replace(true);
+            return std::future::pending::<()>().await;
+        };
+        if ping.ping(Ping::opaque()).await.is_err() {
+            // the connection is failing: the requests waiting for its
+            // SETTINGS learn that it is gone, not that it lacks a setting
+            dead.store(true, Ordering::SeqCst);
+            settled.send_replace(true);
+            return std::future::pending::<()>().await;
         }
         settled.send_replace(true);
-        std::future::pending::<()>().await
+        loop {
+            check.notified().await;
+            // a slow target leaves no head too: only a silent connection
+            // is let go of
+            if !matches!(
+                tokio::time::timeout(LIVENESS_TIMEOUT, ping.ping(Ping::opaque())).await,
+                Ok(Ok(_))
+            ) {
+                tracing::debug!("{label}: the HTTP/2 connection does not answer a PING");
+                dead.store(true, Ordering::SeqCst);
+                return std::future::pending::<()>().await;
+            }
+        }
     };
     let finished = tokio::select! {
         result = &mut connection => Some(result),
         // the sender is dropped, never used
         _ = closed => None,
-        () = settle => unreachable!("settling never ends"),
+        () = watch => unreachable!("watching never ends"),
     };
     let result = match finished {
         Some(result) => result,
@@ -483,11 +559,14 @@ mod tests {
         window: Option<u32>,
         /// SETTINGS_MAX_CONCURRENT_STREAMS.
         streams: Option<u32>,
+        /// Reads our preface and closes, before any SETTINGS.
+        hang_up: bool,
     }
 
     /// Dials an in-process `h2` server over a pipe. By the host of the
     /// CONNECT, it echoes (half-closing after us), refuses (`deny…`, 407),
-    /// or resets the stream after our first bytes (`reset…`).
+    /// resets the stream after our first bytes (`reset…`), or answers
+    /// after three seconds (`slow…`).
     #[derive(Default)]
     struct TestDial {
         server: Server,
@@ -496,6 +575,9 @@ mod tests {
         dials: AtomicUsize,
         /// One per dial: makes that connection's server send GOAWAY.
         goaway: Mutex<Vec<Arc<Notify>>>,
+        /// One per dial: set, that connection's server neither reads nor
+        /// writes any more, and does not close either.
+        freeze: Mutex<Vec<Arc<AtomicBool>>>,
         /// Server connections that have ended.
         ended: Arc<AtomicUsize>,
     }
@@ -514,13 +596,81 @@ mod tests {
                 let (near, far) = tokio::io::duplex(64 * 1024);
                 let goaway = Arc::new(Notify::new());
                 self.goaway.lock().unwrap().push(goaway.clone());
+                let frozen = Arc::new(AtomicBool::new(false));
+                self.freeze.lock().unwrap().push(frozen.clone());
+                let far = Freezable { io: far, frozen };
                 tokio::spawn(serve(far, self.server, goaway, self.ended.clone()));
                 Ok(Box::new(near) as BoxedStream)
             })
         }
     }
 
-    async fn serve(io: DuplexStream, server: Server, goaway: Arc<Notify>, ended: Arc<AtomicUsize>) {
+    /// The server's end of the pipe; frozen, every read and write stays
+    /// pending for good.
+    struct Freezable {
+        io: DuplexStream,
+        frozen: Arc<AtomicBool>,
+    }
+
+    impl AsyncRead for Freezable {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.frozen.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Freezable {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.frozen.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.io).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.frozen.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.frozen.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+
+    async fn serve(
+        mut io: Freezable,
+        server: Server,
+        goaway: Arc<Notify>,
+        ended: Arc<AtomicUsize>,
+    ) {
+        if server.hang_up {
+            // the client preface's magic (RFC 9113 3.4)
+            let mut magic = [0u8; 24];
+            let _ = io.read_exact(&mut magic).await;
+            ended.fetch_add(1, Ordering::SeqCst);
+            return;
+        }
         let mut builder = h2::server::Builder::new();
         if let Some(window) = server.window {
             builder.initial_window_size(window);
@@ -549,6 +699,9 @@ mod tests {
 
     async fn answer(request: Request<RecvStream>, mut respond: SendResponse<Bytes>) {
         let host = request.uri().host().unwrap_or_default().to_string();
+        if host.starts_with("slow") {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
         if host.starts_with("deny") {
             let refusal = Response::builder().status(407).body(()).unwrap();
             let _ = respond.send_response(refusal, true);
@@ -599,8 +752,13 @@ mod tests {
     }
 
     /// Polls `check` until it holds, for at most five seconds.
-    async fn eventually(mut check: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    async fn eventually(check: impl FnMut() -> bool) {
+        within(Duration::from_secs(5), check).await;
+    }
+
+    /// Polls `check` until it holds, for at most `limit`.
+    async fn within(limit: Duration, mut check: impl FnMut() -> bool) {
+        let deadline = Instant::now() + limit;
         while !check() {
             assert!(Instant::now() < deadline, "timed out");
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -757,21 +915,23 @@ mod tests {
         assert_eq!(dial.dials.load(Ordering::SeqCst), 2);
     }
 
+    /// A CONNECT-UDP request (extended CONNECT).
+    fn udp() -> Request<()> {
+        let mut request = Request::builder()
+            .method(Method::CONNECT)
+            .uri("https://proxy.test:443/.well-known/masque/udp/192.0.2.6/443/")
+            .version(Version::HTTP_2)
+            .header("capsule-protocol", "?1")
+            .body(())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(Protocol::from_static("connect-udp"));
+        request
+    }
+
     #[tokio::test]
     async fn extended_connect_follows_the_servers_settings() {
-        let udp = || {
-            let mut request = Request::builder()
-                .method(Method::CONNECT)
-                .uri("https://proxy.test:443/.well-known/masque/udp/192.0.2.6/443/")
-                .version(Version::HTTP_2)
-                .header("capsule-protocol", "?1")
-                .body(())
-                .unwrap();
-            request
-                .extensions_mut()
-                .insert(Protocol::from_static("connect-udp"));
-            request
-        };
         let dial = Arc::new(TestDial {
             server: Server {
                 extended: true,
@@ -798,6 +958,70 @@ mod tests {
         );
         // a plain CONNECT on the same connection is fine
         drop(tunnel(&pool, "echo.test:7").await);
+        assert_eq!(dial.dials.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_ends_before_its_settings_is_a_connection_failure() {
+        let dial = Arc::new(TestDial {
+            server: Server {
+                hang_up: true,
+                ..Server::default()
+            },
+            ..TestDial::default()
+        });
+        let Err(e) = pool(&dial, 3).open(udp(), &ConnectOpts::default()).await else {
+            panic!("a stream on a closed connection");
+        };
+        assert_ne!(
+            e.to_string(),
+            "test: the server does not support extended CONNECT"
+        );
+        assert!(e.to_string().starts_with("test: "), "{e}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_stops_answering_is_let_go_of() {
+        let dial = Arc::new(TestDial::default());
+        let pool = pool(&dial, 3);
+        let mut first = tunnel(&pool, "echo.test:1").await;
+        round_trip(&mut first, b"alive").await;
+        let frozen = dial.freeze.lock().unwrap()[0].clone();
+        frozen.store(true, Ordering::SeqCst);
+        // the caller gives up on a request the connection never answers
+        let opened = tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.open(connect("echo.test:2"), &ConnectOpts::default()),
+        )
+        .await;
+        assert!(opened.is_err(), "a frozen server answered");
+        // its PING goes unanswered too: no new streams on it
+        within(LIVENESS_TIMEOUT + Duration::from_secs(5), || {
+            pool.connections() == 0
+        })
+        .await;
+        let mut second = tunnel(&pool, "echo.test:3").await;
+        round_trip(&mut second, b"fresh").await;
+        assert_eq!(dial.dials.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_target_does_not_cost_its_connection() {
+        let dial = Arc::new(TestDial::default());
+        let pool = pool(&dial, 3);
+        drop(tunnel(&pool, "echo.test:1").await);
+        // the target answers after the caller gave up; the connection
+        // answers the PING at once
+        let opened = tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.open(connect("slow.test:2"), &ConnectOpts::default()),
+        )
+        .await;
+        assert!(opened.is_err(), "the slow target answered in time");
+        tokio::time::sleep(LIVENESS_TIMEOUT + Duration::from_secs(1)).await;
+        assert_eq!(pool.connections(), 1);
+        let mut stream = tunnel(&pool, "echo.test:3").await;
+        round_trip(&mut stream, b"same").await;
         assert_eq!(dial.dials.load(Ordering::SeqCst), 1);
     }
 

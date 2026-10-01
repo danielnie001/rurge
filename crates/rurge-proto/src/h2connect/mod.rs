@@ -97,7 +97,7 @@ fn request(
     for (name, value) in fields {
         // `HeaderName` lowercases, as HTTP/2 wants; valid templates always
         // convert (`HeaderTemplate::is_valid`, checked at build time)
-        let (Ok(name), Ok(value)) = (
+        let (Ok(name), Ok(mut value)) = (
             HeaderName::from_bytes(name.as_bytes()),
             HeaderValue::from_bytes(value.as_bytes()),
         ) else {
@@ -105,6 +105,15 @@ fn request(
                 "{label}: a custom header is not valid"
             )));
         };
+        // the credentials and whatever was configured may be secret: HPACK
+        // sends them never-indexed (RFC 7541 7.1.3)
+        if name == http::header::PROXY_AUTHORIZATION
+            || templates
+                .iter()
+                .any(|t| t.name.eq_ignore_ascii_case(name.as_str()))
+        {
+            value.set_sensitive(true);
+        }
         request = request.header(name, value);
     }
     request
@@ -714,7 +723,8 @@ mod tests {
             .connect_tcp(
                 &target(echo),
                 &ConnectOpts {
-                    timeout: Duration::from_millis(300),
+                    // room for TLS, the HTTP/2 handshake and the CONNECT
+                    timeout: Duration::from_secs(2),
                 },
             )
             .await
@@ -753,6 +763,27 @@ mod tests {
         .map(|_| ())
         .unwrap_err();
         assert_eq!(err.message, "custom header #1 is not valid");
+    }
+
+    #[test]
+    fn credentials_and_configured_headers_are_never_indexed() {
+        let request = connect_request(
+            LABEL,
+            &Target::new(HostName::parse("192.0.2.1"), 443),
+            vec![
+                ("proxy-authorization".into(), "Basic dTpw".into()),
+                ("user-agent".into(), "ours".into()),
+            ],
+            &[HeaderTemplate {
+                name: "X-Token".into(),
+                value: vec![HeaderPart::Literal("secret".into())],
+            }],
+        )
+        .unwrap();
+        let headers = request.headers();
+        assert!(headers["proxy-authorization"].is_sensitive());
+        assert!(headers["x-token"].is_sensitive());
+        assert!(!headers["user-agent"].is_sensitive());
     }
 
     #[test]
