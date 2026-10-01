@@ -7569,6 +7569,10 @@ git commit -m "docs: M6c HTTP/2 族——兼容性清单、手工验收、README
 
 | # | 任务 | 与计划的出入 | 原因 |
 | - | ---- | ------------ | ---- |
+| 1 | Task 1 | 新增的 `policy_spec` 用例先被追加在文件末尾，随后移到计划指定的位置 | 后面的任务以它为锚点插入代码 |
+| 2 | Task 4 | RED 一步里 `trust-tunnel` 的并发用例不是挂到超时，而是以 `REFUSED_STREAM` 失败 | 同一个根因：池发出的流超过了服务端的上限 |
+| 3 | Task 5（评审） | 代理对 CONNECT-UDP 答 2xx 后立刻结束每条流时，`send_to` 会无限次重开流；改为每个数据报至多重开一次，仍被结束时该数据报失败（`ConnectionAborted`，`h2-connect: the server ended the UDP stream`）；`H2ProxyScript.udp_end_at_once` 与用例 `streams_ended_at_once_are_reopened_only_once`；没有 extended CONNECT 的用例另外断言 TCP 隧道用的是同一条连接 | 评审发现的无界循环 |
+| 4 | 终审 | 请求没得到应答头（调用方超时放弃或流出错；服务端答了任何状态码都不算）时，连接的驱动任务用已有的 PING 句柄检查它是否还活着，5 秒（`LIVENESS_TIMEOUT`）没有回应就不再分配新流、下一个请求新建连接，慢目标不受影响（用例 `a_connection_that_stops_answering_is_let_go_of`、`a_slow_target_does_not_cost_its_connection`）；`proxy-authorization` 与 `headers` 配置的字段以 HPACK never-indexed 发送（用例 `credentials_and_configured_headers_are_never_indexed`）；收到 SETTINGS 之前就断掉的连接报连接失败，不再报 `the server does not support extended CONNECT`（用例 `a_connection_that_ends_before_its_settings_is_a_connection_failure`）；`a_silent_proxy_times_out` 的连接超时从 300 毫秒改为 2 秒 | 终审：静默死掉的连接（休眠唤醒、换网、NAT 重绑）会一直接下新请求；凭据不应进 HPACK 动态表；错误归因不对；用例在慢机器上偶发失败 |
 
 ## 延后事项
 
@@ -7580,3 +7584,4 @@ git commit -m "docs: M6c HTTP/2 族——兼容性清单、手工验收、README
 | 4 | 服务端有 ALPN 但与 `h2` 不重合时的报错是 rustls 的原文（P7） | 接受 |
 | 5 | 一个请求在挑中连接之后、发出之前连接死掉时不重试（P5） | 有用户报告再说 |
 | 6 | 互操作数不了 endpoint 那边的连接数（连接数由 `FakeH2Proxy` 覆盖） | 接受 |
+| 7 | 通告 `SETTINGS_MAX_CONCURRENT_STREAMS = 0` 的服务端：每条新连接上被拒一条流，之后该连接空闲 60 秒才关闭（只影响行为不当的服务端；自"SETTINGS 之前只放一条流"之后，`h2pool::lease` 里 "accepts no streams" 的错误分支已走不到） | 有用户报告再说 |

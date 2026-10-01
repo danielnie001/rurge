@@ -204,7 +204,7 @@
 
 ## M6c　HTTP/2 族
 
-前置：同 M5a 一节的 SOCKS5 UDP 客户端；自己的 `h2-connect` 节点（HTTP/2 over TLS 的 CONNECT 代理，带用户名口令；记下服务端实现与版本，CONNECT-UDP 一项要求它支持 RFC 9298 并通告 extended CONNECT，如 sing-box 1.15 起的 `http` 入站）与自己的 TrustTunnel 节点（TrustTunnel endpoint，记下版本）。每份配置 `[Rule]` 里 `FINAL,<策略名>`，`rurge check -c <配置>` 零错误（没有 `W0007`）。
+前置：同 M5a 一节的 SOCKS5 UDP 客户端；自己的 `h2-connect` 节点（HTTP/2 over TLS 的 CONNECT 代理，带用户名口令；记下服务端实现与版本，CONNECT-UDP 一项要求服务端支持 RFC 8441 extended CONNECT 与 HTTP/2 上的 RFC 9298 CONNECT-UDP，用哪种服务端由所有者决定）与自己的 TrustTunnel 节点（TrustTunnel endpoint，记下版本）。每份配置 `[Rule]` 里 `FINAL,<策略名>`，`rurge check -c <配置>` 零错误（没有 `W0007`）。
 
 - [ ] `h2-connect` 的 TCP：策略写 `h2-connect, <服务器>, <端口>, <用户名>, <口令>`（凭据写在端口之后），`curl -x http://127.0.0.1:<http-listen 端口> https://example.com/ -I` 与 `curl --socks5-hostname 127.0.0.1:<socks5-listen 端口> https://example.com/ -I` 都返回 200，请求记录里策略链是该策略、`error` 为空；把凭据改成 `username=` / `password=` 的写法，重载后同样可用。服务端先说话的协议（经代理连一个 SMTP / SSH 主机）能看到对端的欢迎行。
 - [ ] `max-streams`：缺省（3）时同时打开五六个下载（或用浏览器同时打开多个网站），服务端日志或抓包看到只有两条左右的 TLS 连接、每条上同时最多 3 条流；改成 `max-streams=1` 后每个同时进行的请求各占一条连接；全部结束、空闲 60 秒后连接被关掉。
@@ -212,4 +212,5 @@
 - [ ] `h2-connect` 的 UDP：加 `udp-relay=true`，经 SOCKS5 UDP 发 DNS 查询（如 Proxifier 代理 `nslookup example.com 8.8.8.8`）得到回答；轮流发往两个不同的 DNS 服务器都有回答，服务端日志（或抓包）看到每个目标一条 `connect-udp` 流（对称型，已知差异，见兼容性清单 `h2-connect` 一行）。服务端不支持 extended CONNECT 时（换一个只支持普通 CONNECT 的节点）UDP 流失败，会话记录写 `h2-connect: the server does not support extended CONNECT`，同一节点上的 TCP 照常可用。
 - [ ] `trust-tunnel` 的 TCP：策略写 `trust-tunnel, <服务器>, <端口>, username=<用户名>, password=<口令>`（服务器写成 IP 时另加 `sni=<节点的主机名>`），`curl` 经 HTTP 与 SOCKS5 两个入口都返回 200；服务端日志看到的 `User-Agent` 是 `rurge`，加 `headers=User-Agent:<自定义>` 后变成自定义值。
 - [ ] `trust-tunnel` 不载 UDP：经 SOCKS5 UDP 发 DNS 查询，`udp-policy-not-supported-behaviour` 缺省（`REJECT`）时查询没有回答，会话记录写 `policy does not support UDP`；改成 `DIRECT` 后查询直连得到回答。写 `h3=true` 时 `rurge check` 报一条 `W0029`，运行时仍按 HTTP/2 连通。
+- [ ] 休眠唤醒与换网：`h2-connect` 或 `trust-tunnel` 策略在用时（保持一个下载或反复访问网站），让电脑休眠再唤醒，或在 Wi-Fi 与有线 / 手机热点之间切换；切换后新的连接在大约“策略的连接超时 + 5 秒”内恢复（第一个请求可能超时失败，之后的请求走新建的连接），不必等十几分钟；`--log-level debug` 的日志里能看到 `the HTTP/2 connection does not answer a PING`。
 - [ ] 脱敏：`GET /v1/policies/detail?policy_name=<策略名>` 与 `GET /v1/profiles/current` 里两种策略的用户名、口令（含 `h2-connect` 写在端口之后的位置值）与 `headers` 都是 `***`。

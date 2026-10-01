@@ -253,3 +253,12 @@ v4 / v5 的 TCP 线上格式由 missuo/opensnell（GPLv3，对官方 snell-serve
 6. **没有 extended CONNECT（P9，订正 5.3）**：`open_udp` 不拨号，报错出现在第一个数据报上（`h2-connect: the server does not support extended CONNECT`），这条连接照常承载 TCP；没有为看 SETTINGS 而在打开载体时专门拨号。
 7. **capsule（P9，细化 5.3）**：不认识的类型跳过、context id 不为 0 的跳过、varint 接受非最短写法；DATAGRAM 超过 8 + 65527 字节是错误；超过 65527 字节的数据报发送时报 `InvalidInput`；IPv6 目标在路径里写成冒号转义的 `%3A`；任何 2xx 都接受；每目标流空闲关闭是 RST_STREAM(CANCEL)；`udp-relay=true` 而服务器名发不出去时建出站即报错。
 8. **互操作（P10，订正 5.5 的第 3 层与 M6-D5）**：sing-box 1.14.2 的 `http` 入站只说 HTTP/1，不能当参考服务端；**TrustTunnel endpoint v1.1.0 同时充当 `trust-tunnel` 与 `h2-connect` 普通 CONNECT 的参考服务端**，只在 Linux / macOS CI。CONNECT-UDP over HTTP/2 没有参考服务端，只有 `FakeH2Proxy` 与手工验收。
+
+## 17. M6c 实施期的订正
+
+执行 M6c 计划（`docs/superpowers/plans/2026-10-01-phase2-m6c-http2-plan.md`）时，任务评审与全分支评审改动了若干做法；与上文及第 16 节不一致处以本节为准（明细见计划的「执行期修正记录」）。
+
+1. **服务端立刻结束的 UDP 流有界重开**：代理对 CONNECT-UDP 答 2xx 后立刻结束流时，原先 `send_to` 会无限次重开；现在每个数据报至多重开一次，仍被结束时该数据报失败（`ConnectionAborted`，`h2-connect: the server ended the UDP stream`）。流在空闲或出错后被结束的情形照旧：下一个包重开一条。
+2. **请求没得到应答后的存活检查**：一个请求没得到应答头（调用方超时放弃，或流出错；服务端答了任何状态码都证明连接还活着，不算）时，连接的驱动任务用握手后已取得的 PING 句柄（`h2` 只交出一次）发一个 PING，5 秒（`LIVENESS_TIMEOUT`）内没有回应就把连接标为死，不再分配新流，下一个请求新建连接；有回应则什么也不变。每条连接同时至多一次检查，检查期间的新请求合并。休眠唤醒、换网与 NAT 重绑后静默死掉的连接由此被换掉；只是慢的目标连接本身会回应 PING，不受影响。
+3. **凭据以 never-indexed 发送**：`proxy-authorization` 与 `headers` 配置的字段在 HPACK 里标为敏感（RFC 7541 7.1.3），不进双方的动态表。
+4. **SETTINGS 之前断掉的连接报连接失败**：连接在收到服务端 SETTINGS 之前就结束（用来得知 SETTINGS 的 PING 失败）时，等它的 extended CONNECT 请求报连接本身的错误，不再误报 `the server does not support extended CONNECT`；只有确实收到了不带该标志的 SETTINGS 才报后者。
