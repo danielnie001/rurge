@@ -57,7 +57,7 @@ impl Pool {
             .retain(|(_, since)| now.duration_since(*since) < IDLE_TIMEOUT);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn len(&self) -> usize {
         self.idle.lock().expect("pool").len()
     }

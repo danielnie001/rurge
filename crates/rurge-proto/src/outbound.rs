@@ -169,6 +169,12 @@ pub trait Outbound: Send + Sync {
             "UDP".to_string(),
         ))))
     }
+    /// Test support: how many idle connections the outbound keeps for
+    /// reuse. `None`: it keeps none.
+    #[cfg(any(test, feature = "testing"))]
+    fn idle_connections(&self) -> Option<usize> {
+        None
+    }
 }
 
 pub type OutboundRef = Arc<dyn Outbound>;

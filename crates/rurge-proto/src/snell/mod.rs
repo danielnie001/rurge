@@ -169,6 +169,11 @@ impl Outbound for SnellOutbound {
         &self.name
     }
 
+    #[cfg(any(test, feature = "testing"))]
+    fn idle_connections(&self) -> Option<usize> {
+        self.pool.as_ref().map(|pool| pool.len())
+    }
+
     fn connect_tcp<'a>(
         &'a self,
         target: &'a Target,

@@ -40,6 +40,11 @@ async fn the_records(h: &Harness, n: usize) -> Vec<RequestRecord> {
     records
 }
 
+/// How many idle connections `S` keeps.
+fn idle_now(h: &Harness) -> Option<usize> {
+    outbound_now(h, "S").idle_connections()
+}
+
 /// One session to the echo through `h`: a round trip, then the client
 /// goes and the session finishes.
 async fn one_session(h: &Harness, n: usize, payload: &[u8]) -> RequestRecord {
@@ -118,6 +123,10 @@ async fn reuse_carries_sessions_one_after_another_on_one_connection() {
         for (n, payload) in [(1, &b"first"[..]), (2, b"second")] {
             let record = one_session(&h, n, payload).await;
             assert_eq!(record.status, RecordStatus::Completed, "{record:?}");
+            if reuse == "true" {
+                // the connection is back in the pool before the next dial
+                wait_until("the connection to be pooled", || idle_now(&h) == Some(1)).await;
+            }
         }
         assert_eq!(fake.connections(), connections, "reuse={reuse}");
         let places: Vec<(usize, usize)> = fake
@@ -317,6 +326,7 @@ async fn a_reload_keeps_an_unchanged_snell_policy_and_rebuilds_a_changed_one() {
         async move { runtime(&dir, &next, shared).await }
     };
     one_session(&h, 1, b"before the reload").await;
+    wait_until("the connection to be pooled", || idle_now(&h) == Some(1)).await;
     let before = outbound_now(&h, "S");
     h.engine
         .swap_runtime(reload(base, "Other = http, other.example, 8080").await);
