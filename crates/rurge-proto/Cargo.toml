@@ -23,6 +23,7 @@ idna.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 http.workspace = true
+h2.workspace = true
 bytes.workspace = true
 ring.workspace = true
 aes.workspace = true

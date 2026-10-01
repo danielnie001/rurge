@@ -29,6 +29,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "fs", "sy
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio", "server", "server-auto"] }
 http = "1"
+h2 = "0.4"
 http-body-util = "0.1"
 bytes = "1"
 tower-service = "0.3"
