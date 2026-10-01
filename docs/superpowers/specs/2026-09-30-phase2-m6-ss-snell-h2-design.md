@@ -240,3 +240,16 @@ v4 / v5 的 TCP 线上格式由 missuo/opensnell（GPLv3，对官方 snell-serve
 4. **帧边界上的关闭读作干净结束（登记的差异）**：服务端在两帧之间关闭 TCP 连接（没有发结束空帧）时，这个方向读作结束；在帧边界上被截断的数据无法察觉（截在帧中间的照常报错），这样的连接不回池。
 5. **只用于测试的池计数**：`Outbound::idle_connections()`（只在 `cfg(test)` 或 `testing` feature 下存在）给出出站池里的空闲连接数；引擎的复用与重载用例在发第二个会话之前等连接真正回到池里（有截止时间的轮询），不再依赖异步归还恰好先完成。
 
+
+## 16. M6c 计划期的订正
+
+写 M6c 实施计划（`docs/superpowers/plans/2026-10-01-phase2-m6c-http2-plan.md`）时核对 RFC 9113 / 8441 / 9298 / 9297、`h2` 0.4.19 源码、TrustTunnel 的协议文档与 endpoint 源码、Surge 手册与本仓库源码后，与上文不一致或上文没写到的，以本节为准（括号里是计划「计划期决定」的编号）。
+
+1. **凭据（P1，落实 5.1 与 V1）**：手册自相矛盾；`h2-connect` 位置与命名两种写法都接受，命名的优先。`trust-tunnel` 只认命名写法。`trust-tunnel` 上的 `udp-relay` 是 `W0028`。
+2. **ALPN 与禁用的头（P2）**：用户写了别的 `alpn` 是 `W0028`，仍固定 `h2`；HTTP/2 禁止的连接级头（`connection` `keep-alive` `proxy-connection` `transfer-encoding` `upgrade` `te`）在加载时从 `headers` 去掉，各报一条 `W0028`。
+3. **ALPN 失败的文字（P7，订正 5.1）**：`<协议>: the server does not speak HTTP/2` 只在服务端不参与 ALPN 时出现；服务端有 ALPN 但与 `h2` 不重合时 rustls 直接中止握手，用户看到 `tls: received fatal alert: NoApplicationProtocol`（登记）。
+4. **会话池（P4–P6，细化 5.2）**：池自己数每条连接上的流（`h2` 0.4.19 到了服务端上限会把请求默默排队），上限取 `max-streams` 与服务端上限的较小者；每条连接发一个 PING 来得知服务端的 SETTINGS；**新连接在 SETTINGS 到达之前只放一条流**，同时到来的其它请求等 SETTINGS 后重新挑连接。窗口每条流 1 MiB、每条连接 4 MiB；空闲回收每 30 秒检查一次，体面关闭最多 5 秒；池的 `open` 不限时，由出站套 `opts.timeout`。
+5. **请求的构造（P7、P8，细化 5.3 与 5.4）**：`headers` 同名的覆盖自生成的字段（同 `http`），`<random-string>` 每个请求渲染一次；`h2-connect` 不发 `user-agent`；`trust-tunnel` 总是发 `user-agent: rurge`，`headers` 可替换。`trust-tunnel` 的 407 以外的状态是 `trust-tunnel: the server answered <状态码>`。
+6. **没有 extended CONNECT（P9，订正 5.3）**：`open_udp` 不拨号，报错出现在第一个数据报上（`h2-connect: the server does not support extended CONNECT`），这条连接照常承载 TCP；没有为看 SETTINGS 而在打开载体时专门拨号。
+7. **capsule（P9，细化 5.3）**：不认识的类型跳过、context id 不为 0 的跳过、varint 接受非最短写法；DATAGRAM 超过 8 + 65527 字节是错误；超过 65527 字节的数据报发送时报 `InvalidInput`；IPv6 目标在路径里写成冒号转义的 `%3A`；任何 2xx 都接受；每目标流空闲关闭是 RST_STREAM(CANCEL)；`udp-relay=true` 而服务器名发不出去时建出站即报错。
+8. **互操作（P10，订正 5.5 的第 3 层与 M6-D5）**：sing-box 1.14.2 的 `http` 入站只说 HTTP/1，不能当参考服务端；**TrustTunnel endpoint v1.1.0 同时充当 `trust-tunnel` 与 `h2-connect` 普通 CONNECT 的参考服务端**，只在 Linux / macOS CI。CONNECT-UDP over HTTP/2 没有参考服务端，只有 `FakeH2Proxy` 与手工验收。
