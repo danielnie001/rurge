@@ -194,6 +194,7 @@ impl PacketSocket for H2Udp {
                     format!("h2-connect: a datagram longer than {MAX_PAYLOAD} bytes"),
                 ));
             }
+            let mut reopened = false;
             let (slot, stream) = loop {
                 let slot = self.slot(to);
                 let stream = match slot.get_or_try_init(|| self.open(to)).await {
@@ -209,6 +210,14 @@ impl PacketSocket for H2Udp {
                 let mut streams = self.streams.lock().expect("streams");
                 // an ended stream is not revived: open again
                 if stream.ended.is_cancelled() {
+                    // once only: a proxy may end every stream at once
+                    if reopened {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "h2-connect: the server ended the UDP stream",
+                        ));
+                    }
+                    reopened = true;
                     continue;
                 }
                 match streams.get(to) {

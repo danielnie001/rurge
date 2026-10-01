@@ -42,6 +42,8 @@ pub struct H2ProxyScript {
     /// context id 2 before every datagram sent back, their varints longer
     /// than needed.
     pub udp_extra_capsules: bool,
+    /// Answer CONNECT-UDP with 200 and end the stream at once.
+    pub udp_end_at_once: bool,
     /// Take no part in ALPN, like a TLS server that knows nothing of HTTP/2
     /// (a rustls server with protocols of its own would rather fail the
     /// handshake when none is the client's).
@@ -267,7 +269,7 @@ async fn connect_udp(
         .header("capsule-protocol", "?1")
         .body(())
         .expect("a response");
-    let Ok(send) = respond.send_response(response, false) else {
+    let Ok(send) = respond.send_response(response, script.udp_end_at_once) else {
         return;
     };
     let stream = H2Stream::new("fake-h2", send, request.into_body());

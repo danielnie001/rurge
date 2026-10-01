@@ -901,6 +901,30 @@ mod tests {
             .await
             .unwrap();
         round_trip(&mut stream, b"tcp is fine").await;
+        assert_eq!(fake.connections(), 1, "the same connection");
+    }
+
+    /// A proxy that answers 200 and ends every stream at once: one reopen
+    /// per datagram, then an error.
+    #[tokio::test]
+    async fn streams_ended_at_once_are_reopened_only_once() {
+        let echo = udp_echo_server().await;
+        let (fixture, fake) = udp_fake(H2ProxyScript {
+            udp_end_at_once: true,
+            ..H2ProxyScript::default()
+        })
+        .await;
+        let out = outbound(&fake, ", udp-relay=true", &fixture);
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), carrier.send_to(b"x", &target(echo)))
+                .await
+                .expect("send_to ended");
+        // the stream may be seen ended by the first or the second look
+        if let Err(e) = result {
+            assert_eq!(e.kind(), std::io::ErrorKind::ConnectionAborted);
+        }
+        assert!(fake.requests().len() <= 2, "{}", fake.requests().len());
     }
 
     /// RFC 9297 3.2, RFC 9298 4: other capsule types and context ids are
