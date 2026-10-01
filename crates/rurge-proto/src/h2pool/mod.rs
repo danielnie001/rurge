@@ -16,8 +16,8 @@
 //!   on every request and by a reaper).
 //!
 //! The pool does not know the transport: the outbound's `Dial` opens it
-//! (TCP, Shadow TLS, TLS with ALPN `h2`) and checks that `h2` was
-//! negotiated.
+//! (`StackDial`: TCP, Shadow TLS, TLS with ALPN `h2`) and checks that `h2`
+//! was negotiated.
 
 mod stream;
 
@@ -25,6 +25,7 @@ pub(crate) use stream::H2Stream;
 
 use crate::OutboundError;
 use crate::task::AbortOnDrop;
+use crate::transport::Stack;
 use bytes::Bytes;
 use h2::client::{self, SendRequest};
 use h2::ext::Protocol;
@@ -62,6 +63,32 @@ pub(crate) trait Dial: Send + Sync {
         &'a self,
         opts: &'a ConnectOpts,
     ) -> BoxFuture<'a, Result<BoxedStream, OutboundError>>;
+}
+
+/// The transport of the HTTP/2 policies: their `Stack` (TCP, Shadow TLS,
+/// TLS offering ALPN `h2`), refused unless the server chose `h2`.
+pub(crate) struct StackDial {
+    /// The protocol the error texts start with (`h2-connect`).
+    pub(crate) label: &'static str,
+    pub(crate) stack: Stack,
+}
+
+impl Dial for StackDial {
+    fn dial<'a>(
+        &'a self,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, Result<BoxedStream, OutboundError>> {
+        Box::pin(async move {
+            let (stream, alpn) = self.stack.open_negotiated(opts).await?;
+            if alpn.as_deref() != Some(b"h2".as_slice()) {
+                return Err(OutboundError::Proxy(format!(
+                    "{}: the server does not speak HTTP/2",
+                    self.label
+                )));
+            }
+            Ok(stream)
+        })
+    }
 }
 
 type Conns = Mutex<Vec<Arc<Conn>>>;
@@ -223,8 +250,9 @@ impl H2Pool {
         })
     }
 
+    /// The connections that take new streams.
     #[cfg(test)]
-    fn connections(&self) -> usize {
+    pub(crate) fn connections(&self) -> usize {
         let mut conns = self.conns.lock().expect("conns");
         prune(&mut conns, Instant::now());
         conns.len()

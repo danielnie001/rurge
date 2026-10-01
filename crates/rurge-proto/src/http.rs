@@ -51,7 +51,8 @@ fn random_string(min: usize, max: usize) -> String {
         .collect()
 }
 
-fn render(templates: &[HeaderTemplate]) -> Vec<(String, String)> {
+/// The headers of one request: every `<random-string(..)>` drawn anew.
+pub(crate) fn render(templates: &[HeaderTemplate]) -> Vec<(String, String)> {
     templates
         .iter()
         .map(|t| {
@@ -69,7 +70,7 @@ fn render(templates: &[HeaderTemplate]) -> Vec<(String, String)> {
 }
 
 /// A configured header replaces one of ours with the same name, `Host` included (manual).
-fn merge(base: &mut Vec<(String, String)>, custom: Vec<(String, String)>) {
+pub(crate) fn merge(base: &mut Vec<(String, String)>, custom: Vec<(String, String)>) {
     for (name, value) in custom {
         base.retain(|(existing, _)| !existing.eq_ignore_ascii_case(&name));
         base.push((name, value));

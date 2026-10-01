@@ -2,6 +2,7 @@
 //! by production code. None of them ever resolves a host name.
 
 mod anytls;
+mod h2proxy;
 mod http_proxy;
 mod obfs;
 mod shadow_tls;
@@ -15,6 +16,7 @@ mod vmess;
 pub mod ws;
 
 pub use anytls::{AnyTlsScript, FakeAnyTls, RecordedStream};
+pub use h2proxy::{FakeH2Proxy, H2ProxyScript, RecordedH2Request};
 pub use http_proxy::{FakeHttpProxy, HttpProxyScript, RecordedHead};
 pub use obfs::{ObfsHello, accept_obfs};
 pub use shadow_tls::{

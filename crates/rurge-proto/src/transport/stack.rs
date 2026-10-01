@@ -51,6 +51,17 @@ impl Stack {
     /// No timeout of its own: the caller wraps the ladder and its own
     /// handshake into one budget.
     pub async fn open(&self, opts: &ConnectOpts) -> Result<BoxedStream, OutboundError> {
+        self.open_negotiated(opts)
+            .await
+            .map(|(stream, _alpn)| stream)
+    }
+
+    /// `open`, and the protocol the TLS layer's ALPN settled on (`None`
+    /// without a TLS layer, or when the server chose none).
+    pub async fn open_negotiated(
+        &self,
+        opts: &ConnectOpts,
+    ) -> Result<(BoxedStream, Option<Vec<u8>>), OutboundError> {
         let mut stream = self.connector.connect(&self.server, opts).await?;
         if let Some(shadow_tls) = &self.shadow_tls {
             stream = shadow_tls.wrap(stream).await?;
@@ -58,13 +69,18 @@ impl Stack {
         if let Some(obfs) = &self.obfs {
             stream = obfs.wrap(stream);
         }
+        let mut alpn = None;
         if let Some(tls) = &self.tls {
-            stream = tls.wrap(stream).await.map_err(OutboundError::tls)?;
+            let wrapped = tls
+                .wrap_negotiated(stream)
+                .await
+                .map_err(OutboundError::tls)?;
+            (stream, alpn) = wrapped;
         }
         if let Some(ws) = &self.ws {
             stream = ws.wrap(stream).await?;
         }
-        Ok(stream)
+        Ok((stream, alpn))
     }
 }
 

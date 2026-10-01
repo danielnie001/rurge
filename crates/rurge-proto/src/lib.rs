@@ -6,9 +6,8 @@ pub mod anytls;
 pub mod build;
 pub mod direct;
 pub mod external;
-// the `h2-connect` outbound (M6c task 3) is its first user
-#[allow(dead_code)]
-pub(crate) mod h2pool;
+pub mod h2connect;
+mod h2pool;
 mod hostname;
 pub mod http;
 pub mod keystore;

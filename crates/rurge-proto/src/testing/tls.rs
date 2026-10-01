@@ -140,6 +140,12 @@ impl TlsFixture {
     /// With `require_client_cert`, only clients presenting a certificate
     /// signed by the fixture's CA complete the handshake.
     pub fn acceptor(&self, require_client_cert: bool) -> TlsAcceptor {
+        self.acceptor_with_alpn(require_client_cert, &[b"h2", b"http/1.1"])
+    }
+
+    /// `acceptor`, offering these ALPN protocols (in the server's order of
+    /// preference) instead of `h2` and `http/1.1`.
+    pub fn acceptor_with_alpn(&self, require_client_cert: bool, alpn: &[&[u8]]) -> TlsAcceptor {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let builder = ServerConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
@@ -156,7 +162,7 @@ impl TlsFixture {
         let mut config = builder
             .with_single_cert(vec![self.leaf.clone()], key)
             .expect("server certificate");
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
         TlsAcceptor::from(Arc::new(config))
     }
 

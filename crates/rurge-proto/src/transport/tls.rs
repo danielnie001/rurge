@@ -179,8 +179,19 @@ impl TlsClient {
     }
 
     pub async fn wrap(&self, stream: BoxedStream) -> io::Result<BoxedStream> {
+        self.wrap_negotiated(stream)
+            .await
+            .map(|(stream, _alpn)| stream)
+    }
+
+    /// `wrap`, and the protocol ALPN settled on (`None`: the server chose none).
+    pub async fn wrap_negotiated(
+        &self,
+        stream: BoxedStream,
+    ) -> io::Result<(BoxedStream, Option<Vec<u8>>)> {
         let tls = self.connector.connect(self.name.clone(), stream).await?;
-        Ok(Box::new(tls))
+        let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+        Ok((Box::new(tls), alpn))
     }
 }
 
