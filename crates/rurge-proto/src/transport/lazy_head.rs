@@ -21,8 +21,10 @@ use tokio::time::Sleep;
 /// How long a read waits for the first payload before the head goes out alone.
 pub const HEAD_GRACE: Duration = Duration::from_millis(100);
 
-pub struct LazyHead {
-    inner: BoxedStream,
+/// Over a `BoxedStream` unless a protocol needs its own stream back
+/// (`into_inner`: Snell's reused connections).
+pub struct LazyHead<S = BoxedStream> {
+    inner: S,
     /// `Some` until the head (and whatever payload rides with it) is on the wire.
     head: Option<Vec<u8>>,
     /// How much of `head` has been written.
@@ -40,12 +42,12 @@ pub struct LazyHead {
     reader: Option<Waker>,
 }
 
-impl LazyHead {
-    pub fn new(inner: BoxedStream, head: Vec<u8>) -> LazyHead {
+impl<S: AsyncRead + AsyncWrite + Unpin> LazyHead<S> {
+    pub fn new(inner: S, head: Vec<u8>) -> LazyHead<S> {
         LazyHead::with_grace(inner, head, HEAD_GRACE)
     }
 
-    pub fn with_grace(inner: BoxedStream, head: Vec<u8>, grace: Duration) -> LazyHead {
+    pub fn with_grace(inner: S, head: Vec<u8>, grace: Duration) -> LazyHead<S> {
         LazyHead {
             inner,
             head: Some(head),
@@ -56,6 +58,15 @@ impl LazyHead {
             timer: None,
             reader: None,
         }
+    }
+
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+
+    /// The stream below; a head not yet sent is dropped with its payload.
+    pub fn into_inner(self) -> S {
+        self.inner
     }
 
     /// Drives the pending head (and whatever payload rides with it) out.
@@ -80,7 +91,7 @@ impl LazyHead {
     }
 }
 
-impl AsyncRead for LazyHead {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for LazyHead<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -109,7 +120,7 @@ impl AsyncRead for LazyHead {
     }
 }
 
-impl AsyncWrite for LazyHead {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for LazyHead<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,

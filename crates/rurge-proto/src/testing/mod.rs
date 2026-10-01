@@ -6,6 +6,7 @@ mod http_proxy;
 mod obfs;
 mod shadow_tls;
 mod shadowsocks;
+mod snell;
 mod socks5;
 mod tls;
 mod trojan;
@@ -20,6 +21,7 @@ pub use shadow_tls::{
     Camouflage, FakeShadowTls, RecordedShadowTls, ShadowTlsFault, ShadowTlsScript,
 };
 pub use shadowsocks::{FakeShadowsocks, RecordedDatagram, RecordedShadowsocks, ShadowsocksScript};
+pub use snell::{FakeSnell, RecordedSnell, SnellScript};
 pub use socks5::{FakeSocks5, RecordedSocks5, Socks5Script};
 pub use tls::{SeenHandshake, TlsFixture};
 pub use trojan::{FakeTrojan, RecordedTrojan, TrojanScript};
