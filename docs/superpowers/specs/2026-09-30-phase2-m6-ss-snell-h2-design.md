@@ -217,3 +217,16 @@ v4 / v5 的 TCP 线上格式由 missuo/opensnell（GPLv3，对官方 snell-serve
 2. **SS 2022 首次写失败不丢 salt**：首次写在封装任何东西之前先取填充长度的随机数；这一步失败时本次写报错，而请求 salt 仍留着随下一次写发出，而不是被取走、之后的写不带 salt。
 3. **过长的 `obfs-host` 在配置层报错（细化 3.1）**：`obfs-host` 超过 255 字节是 `E0018`（`` invalid `obfs-host` (expected at most 255 bytes) ``，不引用取值），不再等到构建出站时才以 `BuildError` 失败（出站层的检查保留为兜底）。
 4. **旧式 AEAD 拒绝被反射的流（细化 3.3）**：客户端保留自己的请求 salt；服务端的 salt 与它相同（流被原样反射回来，两个方向的子密钥与 nonce 序列相同、能解开）时以 `ss: the server's data failed to decrypt (wrong password or method?)` 失败。SS 2022 的应答有类型字节与回显的 salt 校验，本来就不受影响。
+
+## 14. M6b 计划期的订正
+
+写 M6b 实施计划（`docs/superpowers/plans/2026-09-30-phase2-m6b-snell-plan.md`）时核对公开资料与本仓库源码后，与上文不一致或上文没写到的，以本节为准（括号里是计划「计划期决定」的编号）。
+
+1. **版本与 obfs（P1，细化 4.2）**：`version` 1–3 允许 `obfs=http/tls`（只解析），6 的 obfs 三个键 `W0028`；v1 的 `W0007` 说明 `version` 缺省为 1；snell 行上的 `udp-relay` 是未知参数。
+2. **记录（P3、P5，细化 4.3）**：nonce 跨复用继续、从不归零（复用 M6a 的 `CountingAead`）；只有本方向第一个数据记录带 256..=511 字节填充；服务端密钥在它的 salt 到达时于阻塞线程上派生（服务端只在目标先发数据时回应，不能先读完 salt 再包装）。
+3. **命令字（P6，订正 4.3）**：公开资料冲突——据报 Surge 总是发 ConnectV2；rurge 不复用时发 Connect、复用时发 ConnectV2，登记为差异。
+4. **陈旧连接（P8，新增）**：从池里取出的连接在应答之前失败时，在新连接上透明地重试一次（重发最多 64 KiB）；池最多 8 条空闲连接，取出前做一次非阻塞探测。
+5. **UDP（P10、P11，订正 4.3 的"沿用 stream_udp"）**：Snell 的数据报没有长度，记录边界即数据报边界，另写 `snell/udp.rs`；放不进一条记录的数据报发送失败；看不懂的回包丢弃；`udp-port` 是 UDP 会话那条 TCP 连接的端口（登记为差异）。
+6. **obfs 的缺省主机（P9）**：沿用 M6a（服务器主机名）；公开资料说 Surge 发 `bing.com`，登记为差异。
+7. **互操作（P12，落实 M6-D6）**：sing-box 1.14.2；官方 snell-server v5.0.1 只在 Linux CI。
+
