@@ -415,10 +415,7 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     }
     let failed = r.has_errors();
     let diagnostics = r.finish();
-    // the engine builds `h2-connect` and `trust-tunnel` from M6c task 6 on:
-    // until then a valid line is checked in full but has no spec
-    let built = !matches!(policy.kind, PolicyKind::H2Connect | PolicyKind::TrustTunnel);
-    let spec = (!failed && not_implemented.is_none() && built).then(|| PolicySpec {
+    let spec = (!failed && not_implemented.is_none()).then(|| PolicySpec {
         name: policy.name.clone(),
         kind: policy.kind,
         server: policy.server.clone(),
@@ -998,10 +995,10 @@ mod tests {
         );
     }
 
-    /// `h2-connect` and `trust-tunnel` lines are read and checked in full;
-    /// they have no spec until the engine builds them (M6c task 6).
+    /// `h2-connect` and `trust-tunnel` lines are read and checked in full,
+    /// and a sound one has a spec (phase 2 M6 design 5.1).
     #[test]
-    fn h2_connect_and_trust_tunnel_lines_are_checked_but_have_no_spec_yet() {
+    fn h2_connect_and_trust_tunnel_lines_are_checked_and_have_a_spec() {
         for def in [
             "h2-connect, 1.2.3.4, 443, max-streams=5",
             "h2-connect, h.test, 443, user, pass, udp-relay=true, client-cert=cert1, shadow-tls-password=st, underlying-proxy=Entry",
@@ -1011,14 +1008,30 @@ mod tests {
             let o = outcome("T", def);
             assert!(o.diagnostics.is_empty(), "{def}: {:?}", o.diagnostics);
             assert!(o.inert.is_empty(), "{def}: {:?}", o.inert);
-            assert!(o.spec.is_none() && o.not_implemented.is_none(), "{def}");
+            assert_eq!(o.not_implemented, None, "{def}");
+            let spec = o.spec.unwrap_or_else(|| panic!("{def}: no spec"));
+            assert!(
+                matches!(
+                    spec.proto,
+                    ProtoSpec::H2Connect(_) | ProtoSpec::TrustTunnel(_)
+                ),
+                "{def}"
+            );
+            let layered = def.contains("shadow-tls-password");
+            assert_eq!(spec.shadow_tls.is_some(), layered, "{def}");
+            assert_eq!(spec.common.underlying_proxy.is_some(), layered, "{def}");
         }
+        // `h3=true` is inert: the policy still has a spec and uses HTTP/2
         let o = outcome(
             "T",
             "trust-tunnel, h.test, 443, username=u, password=p, h3=true",
         );
         assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
         assert_eq!(o.inert, ["h3"]);
+        assert!(matches!(
+            o.spec.map(|s| s.proto),
+            Some(ProtoSpec::TrustTunnel(_))
+        ));
         let o = outcome("T", "trust-tunnel, h.test, 443, max-streams=0");
         let found: Vec<(&str, &str)> = o
             .diagnostics
@@ -1042,6 +1055,7 @@ mod tests {
                 ),
             ]
         );
+        assert!(o.spec.is_none());
         // both always run over TLS: the client certificate is theirs
         let tls = TlsOpts {
             client_cert: Some("cert1".into()),

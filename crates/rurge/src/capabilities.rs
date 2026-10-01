@@ -3,7 +3,8 @@
 //! (phase 2 M2a), `vmess` with the AEAD handshake and `anytls` (phase 2
 //! M2b), `ssh` (phase 2 M4a), `wireguard` (phase 2 M4b), `external`
 //! (phase 2 M4c), `ss` with the AEAD, `none` and 2022 methods (phase 2
-//! M6a), `snell` versions 4 and 5 (phase 2 M6b), `select` groups,
+//! M6a), `snell` versions 4 and 5 (phase 2 M6b), `h2-connect` and
+//! `trust-tunnel` over HTTP/2 only (phase 2 M6c), `select` groups,
 //! `url-test` / `fallback` / `load-balance` groups (phase 2 M3b), and
 //! `smart` groups (phase 2 M3c).
 
@@ -44,6 +45,8 @@ pub fn current() -> Capabilities {
             PolicyKind::External,
             PolicyKind::Shadowsocks,
             PolicyKind::Snell,
+            PolicyKind::H2Connect,
+            PolicyKind::TrustTunnel,
         ]),
         group_kinds: HashSet::from([
             GroupKind::Select,

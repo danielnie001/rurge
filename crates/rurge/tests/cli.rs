@@ -491,6 +491,63 @@ fn check_knows_snell() {
         .stdout(predicate::str::contains("s3cretPsk").not());
 }
 
+const HTTP2: &str = "[General]\n[Proxy]\n\
+H = h2-connect, proxy.test, 443, alice, s3cretPw, headers=X-Token:t0kenValue, max-streams=5, udp-relay=true\n\
+T1 = trust-tunnel, proxy.test, 443, username=bob, password=s3cretPw, h3=true\n\
+T2 = trust-tunnel, proxy.test, 443, username=bob, password=s3cretPw, h3=true\n\
+Old = hysteria2, 1.2.3.4, 443, password=x\n[Rule]\nFINAL,DIRECT\n";
+const HTTP2_NO_PASSWORD: &str = "[General]\n[Proxy]\n\
+T = trust-tunnel, proxy.test, 443, username=bob\n[Rule]\nFINAL,DIRECT\n";
+
+/// `rurge check` knows `h2-connect` and `trust-tunnel` (phase 2 M6 design
+/// 5.1): neither is "not implemented"; `h3=true` is parsed but has no
+/// effect, said once however many lines use it; a `trust-tunnel` without a
+/// password is an error; credentials and headers are never printed.
+#[test]
+fn check_knows_http2() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "http2.conf", HTTP2))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    // `hysteria2` is still a later milestone; the HTTP/2 family is not
+    assert_eq!(out.matches("W0007").count(), 1, "{out}");
+    assert!(
+        out.contains("`hysteria2`")
+            && !out.contains("`h2-connect`")
+            && !out.contains("`trust-tunnel`"),
+        "{out}"
+    );
+    assert_eq!(out.matches("W0029").count(), 1, "{out}");
+    assert!(
+        out.contains("http2.conf:4")
+            && out.contains("policy parameter `h3` is parsed but has no effect in this version"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("s3cretPw") && !out.contains("alice") && !out.contains("t0kenValue"),
+        "{out}"
+    );
+
+    Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "bad.conf", HTTP2_NO_PASSWORD))
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("E0018"))
+        .stdout(predicate::str::contains(
+            "bad.conf:3: policy `T`: `password` is required",
+        ))
+        .stdout(predicate::str::contains("bob").not());
+}
+
 const SUBSCRIBED: &str = "[General]\n[Proxy Group]\nLocal = select, DIRECT, policy-path=nodes.txt\n\
 Remote = select, DIRECT, policy-path=https://sub.test/nodes?token=t0k3n\n[Rule]\nFINAL,Local\n";
 

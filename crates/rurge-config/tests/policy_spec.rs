@@ -101,6 +101,7 @@ B = trust-tunnel, b.example, 443, username=u, password=p, h3=true",
             2
         )]
     );
+    assert!(loaded.config.spec("A").is_some() && loaded.config.spec("B").is_some());
 }
 
 #[test]

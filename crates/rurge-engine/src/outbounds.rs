@@ -13,11 +13,13 @@ use rurge_policy::{BuildError, OutboundFactory};
 use rurge_proto::anytls::AnyTlsOutbound;
 use rurge_proto::build::server_of;
 use rurge_proto::external::{ExternalOutbound, NoProcessGroups, ProcessHook};
+use rurge_proto::h2connect::H2ConnectOutbound;
 use rurge_proto::http::HttpOutbound;
 use rurge_proto::shadowsocks::ShadowsocksOutbound;
 use rurge_proto::snell::SnellOutbound;
 use rurge_proto::socks5::Socks5Outbound;
 use rurge_proto::trojan::TrojanOutbound;
+use rurge_proto::trust_tunnel::TrustTunnelOutbound;
 use rurge_proto::vmess::VmessOutbound;
 use rurge_proto::{Direct, OutboundRef};
 use rurge_proto_ssh::SshOutbound;
@@ -272,14 +274,24 @@ impl OutboundFactory for EngineFactory {
                 self.roots.clone(),
                 connector,
             )?),
-            // the loader makes no spec of these lines before M6c task 6
-            ProtoSpec::H2Connect(_) | ProtoSpec::TrustTunnel(_) => {
-                return Err(BuildError::new(format!(
-                    "policy `{}`: `{}` is not implemented yet",
-                    spec.name,
-                    spec.kind.keyword()
-                )));
-            }
+            ProtoSpec::H2Connect(h2) => Arc::new(H2ConnectOutbound::new(
+                &spec.name,
+                server_of(spec)?,
+                h2,
+                spec.shadow_tls.as_ref(),
+                &self.keystore,
+                self.roots.clone(),
+                connector,
+            )?),
+            ProtoSpec::TrustTunnel(tt) => Arc::new(TrustTunnelOutbound::new(
+                &spec.name,
+                server_of(spec)?,
+                tt,
+                spec.shadow_tls.as_ref(),
+                &self.keystore,
+                self.roots.clone(),
+                connector,
+            )?),
             // nothing starts here: the program starts on the first dial
             ProtoSpec::External(external) => {
                 let outbound = ExternalOutbound::new(
@@ -396,6 +408,8 @@ SK = ss, proxy.test, 8388, encrypt-method=2022-blake3-aes-128-gcm, password=MDEy
 SN = ss, proxy.test, 8388, encrypt-method=none\n\
 N4 = snell, proxy.test, 443, psk=pw, version=4, reuse=true, obfs=http\n\
 N5 = snell, proxy.test, 443, psk=pw, version=5, udp-port=8443, shadow-tls-password=st\n\
+H2 = h2-connect, proxy.test, 443, alice, s3cret, max-streams=8, udp-relay=true\n\
+TT = trust-tunnel, proxy.test, 443, username=u, password=pw, shadow-tls-password=st\n\
 Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule]\nFINAL,DIRECT\n",
         );
         let f = factory(&cfg);
@@ -413,6 +427,8 @@ Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule
             ("SN", "SN"),
             ("N4", "N4"),
             ("N5", "N5"),
+            ("H2", "H2"),
+            ("TT", "TT"),
             ("Corp", "DIRECT"),
         ] {
             let spec = cfg
@@ -522,6 +538,34 @@ N5 = snell, proxy.test, 443, psk=pw, version=5, udp-port=8443, shadow-tls-passwo
         assert!(dry_build(&cfg).is_empty());
     }
 
+    /// Sound `h2-connect` / `trust-tunnel` lines pass the dry build, which
+    /// opens no connection (no tokio runtime here); a client certificate
+    /// that cannot be read is a load error, never quoted (phase 2 M6 design
+    /// 5.1).
+    #[test]
+    fn the_http2_policies_pass_the_dry_build() {
+        let cfg = config(
+            "[Proxy]\nH2 = h2-connect, proxy.test, 443, alice, s3cret, headers=X-Id:<random-string(8)>, max-streams=8, udp-relay=true\n\
+TT = trust-tunnel, proxy.test, 443, username=u, password=pw, sni=tt.test, shadow-tls-password=st, shadow-tls-version=3, shadow-tls-sni=site.test\n\
+[Rule]\nFINAL,DIRECT\n",
+        );
+        assert!(dry_build(&cfg).is_empty());
+
+        let cfg = config(
+            "[Proxy]\nH2 = h2-connect, proxy.test, 443, client-cert=cert1\n\
+TT = trust-tunnel, proxy.test, 443, username=u, password=s3same0pen, client-cert=cert1\n\
+[Keystore]\ncert1 = type=p12, base64=QUJD, password=hunter2\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let diags = dry_build(&cfg).sorted();
+        let messages: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(messages[0].starts_with("policy `H2` cannot be built: keystore item `cert1`"));
+        assert!(messages[1].starts_with("policy `TT` cannot be built: keystore item `cert1`"));
+        for m in &messages {
+            assert!(!m.contains("hunter2") && !m.contains("s3same0pen"), "{m}");
+        }
+    }
+
     #[test]
     fn a_dry_build_of_an_anytls_policy_leaves_no_task_behind() {
         // no tokio runtime here: spawning anything at build time would panic
@@ -535,7 +579,11 @@ N5 = snell, proxy.test, 443, psk=pw, version=5, udp-port=8443, shadow-tls-passwo
         let cfg = config(
             "[Proxy]\nA = anytls, proxy.test, 443, password=pw, skip-cert-verify=true\n\
 V = vmess, proxy.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119, vmess-aead=true, tls=true, skip-cert-verify=true\n\
-Plain = vmess, proxy.test, 80, username=0233d11c-15a4-47d3-ade3-48ffca0ce119, vmess-aead=true\n[Rule]\nFINAL,DIRECT\n",
+Plain = vmess, proxy.test, 80, username=0233d11c-15a4-47d3-ade3-48ffca0ce119, vmess-aead=true\n\
+H2 = h2-connect, proxy.test, 443, skip-cert-verify=true\n\
+TT = trust-tunnel, proxy.test, 443, username=u, password=pw, skip-cert-verify=true\n\
+TP = trust-tunnel, proxy.test, 443, username=u, password=pw, skip-cert-verify=true, server-cert-fingerprint-sha256=0000000000000000000000000000000000000000000000000000000000000000\n\
+[Rule]\nFINAL,DIRECT\n",
         );
         let flagged: Vec<&str> = cfg
             .specs
@@ -543,7 +591,7 @@ Plain = vmess, proxy.test, 80, username=0233d11c-15a4-47d3-ade3-48ffca0ce119, vm
             .filter(|s| skips_verification(s))
             .map(|s| s.name.as_str())
             .collect();
-        assert_eq!(flagged, ["A", "V"]);
+        assert_eq!(flagged, ["A", "V", "H2", "TT"]);
     }
 
     #[test]
