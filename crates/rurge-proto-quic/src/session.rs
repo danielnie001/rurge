@@ -599,11 +599,15 @@ mod tests {
     /// The protocol of these tests: a handshake that is one exchange with
     /// the server (as Hysteria 2's authentication) and fails while `refuse`
     /// is set, and a state the tests set to say the connection is going
-    /// away.
+    /// away. With `stall_first`, the first handshake never ends, as with a
+    /// server that does not answer: it is told on `stalled` when it begins,
+    /// and it ends only with its dial, when the caller gives up on that.
     #[derive(Default)]
     struct Plain {
         handshakes: AtomicUsize,
         refuse: AtomicBool,
+        stall_first: bool,
+        stalled: Notify,
     }
 
     impl Plain {
@@ -625,7 +629,11 @@ mod tests {
             connection: &'a Connection,
         ) -> BoxFuture<'a, Result<AtomicBool, OutboundError>> {
             Box::pin(async move {
-                self.handshakes.fetch_add(1, Ordering::SeqCst);
+                let nth = self.handshakes.fetch_add(1, Ordering::SeqCst);
+                if self.stall_first && nth == 0 {
+                    self.stalled.notify_one();
+                    std::future::pending::<()>().await;
+                }
                 let (mut send, mut recv) = connection
                     .open_bi()
                     .await
@@ -916,6 +924,44 @@ mod tests {
             .refuse
             .store(false, Ordering::SeqCst);
         assert_eq!(echo(&session, b"d").await.unwrap(), b"d");
+        assert_eq!(session.shared.protocol.handshakes(), 2);
+    }
+
+    /// The caller that is dialing gives up while the handshake of its dial
+    /// stalls (its future is dropped, as by its timeout): a request that
+    /// waited for that dial takes the dialing over — the dial is not left in
+    /// flight for ever — and the session goes on with the connection that
+    /// request made.
+    #[tokio::test]
+    async fn a_dial_its_caller_gave_up_on_is_taken_over_by_a_waiter() {
+        let server = Server::spawn();
+        let protocol = Plain {
+            stall_first: true,
+            ..Plain::default()
+        };
+        let session = session(&server, protocol);
+        let opts = ConnectOpts::default();
+        let stalled = &session.shared.protocol.stalled;
+        let request = session.request(&opts, |lease| Box::pin(exchange(lease, b"a")));
+        // A dials and its handshake never ends; B comes with it, finds the
+        // dial in flight and waits for it. A's caller gives up as soon as the
+        // handshake has begun to stall.
+        let (a, b) = tokio::join!(
+            async {
+                tokio::select! {
+                    result = request => Some(result),
+                    () = stalled.notified() => None,
+                }
+            },
+            echo(&session, b"b")
+        );
+        assert!(a.is_none(), "the request ended of its own: {a:?}");
+        assert_eq!(b.unwrap(), b"b");
+        // the dial that was given up on, and the one that took over
+        assert_eq!(session.shared.protocol.handshakes(), 2);
+        assert_eq!(server.accepted(2).await.len(), 2);
+        // the session goes on with the connection of the second
+        assert_eq!(echo(&session, b"c").await.unwrap(), b"c");
         assert_eq!(session.shared.protocol.handshakes(), 2);
     }
 
