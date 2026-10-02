@@ -607,9 +607,14 @@ mod tests {
             round_trip(stream, b"three at once").await;
         }
         assert_eq!(fake.connections(), 2);
-        let mut carried: Vec<usize> = fake.requests().iter().map(|r| r.connection).collect();
+        // two on one connection, one on the other: which of the two dials
+        // ends first is not fixed
+        let mut carried = [0usize; 2];
+        for request in fake.requests() {
+            carried[request.connection] += 1;
+        }
         carried.sort_unstable();
-        assert_eq!(carried, [0, 0, 1]);
+        assert_eq!(carried, [1, 2]);
     }
 
     #[tokio::test]

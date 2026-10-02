@@ -12,10 +12,14 @@
 //!   first request goes out at once, the ones that would join it wait for
 //!   the SETTINGS and then look again (a second connection when the
 //!   server's limit is the lower one). The caller's own timeout bounds
-//!   the wait.
-//! - With no room, a new connection is dialed. One dial at a time: requests
-//!   that come in meanwhile wait for it and then look again, and when it
-//!   fails they share its failure instead of dialing the same thing again.
+//!   the wait; a PING unanswered for `LIVENESS_TIMEOUT` lets the
+//!   connection go.
+//! - With no room, a new connection is dialed. A dial in flight counts as
+//!   room for `max-streams` requests, its own and the ones that wait for
+//!   it; a request that would not fit dials another, up to `MAX_DIALS` at
+//!   once, so a burst brings up the connections it needs together. When
+//!   the dials a request waited for fail, it shares their failure instead
+//!   of dialing the same thing again.
 //! - A connection that received GOAWAY, failed, or ended gets no new
 //!   streams; the ones it carries run to their end.
 //! - A request that got no response head (the caller gave up, or the
@@ -47,7 +51,7 @@ use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts};
 use std::io;
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -61,15 +65,25 @@ pub(crate) const REAP_EVERY: Duration = Duration::from_secs(30);
 /// (SETTINGS_INITIAL_WINDOW_SIZE). The TrustTunnel document's 128 KiB
 /// would cap a tunnel at 1.3 MB/s over a 100 ms round trip.
 const STREAM_WINDOW: u32 = 1 << 20;
-/// What the connection's streams together may receive: the default
-/// `max-streams` at a full window each, and some.
-const CONNECTION_WINDOW: u32 = 4 << 20;
+/// What the connection's streams together may receive: a full window for
+/// each of its `max-streams`, so that the ones whose readers stall never
+/// take the others' share; never less than 4 MiB.
+fn connection_window(max_streams: usize) -> u32 {
+    // the largest window HTTP/2 allows (RFC 9113 6.9.1)
+    const MAX: u32 = (1 << 31) - 1;
+    let streams = u32::try_from(max_streams).unwrap_or(u32::MAX);
+    STREAM_WINDOW.saturating_mul(streams).clamp(4 << 20, MAX)
+}
 /// How long a connection the pool let go of may take to close cleanly
 /// (GOAWAY, then the transport's shutdown).
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// How long a connection whose request got no response head has to answer
-/// a PING before it takes no new streams.
+/// a PING before it takes no new streams; a fresh connection has as long
+/// to answer the one that learns its SETTINGS.
 pub(crate) const LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
+/// The most dials in flight at once: a burst after a network change does
+/// not open hundreds of connections together.
+const MAX_DIALS: usize = 8;
 
 /// Opens the transport of a new connection. No `Debug` for implementers
 /// that hold credentials.
@@ -106,7 +120,23 @@ impl Dial for StackDial {
     }
 }
 
-type Conns = Mutex<Vec<Arc<Conn>>>;
+/// What the pool's requests share: its connections and its dials.
+#[derive(Default)]
+struct State {
+    /// The connections that take new streams, oldest first.
+    conns: Vec<Arc<Conn>>,
+    /// Dials in flight.
+    dialing: usize,
+    /// Requests waiting for them.
+    waiting: usize,
+    /// Dials that have ended, success or failure.
+    dials: u64,
+    /// The latest dial's failure and the `dials` it ended as; `None` after
+    /// a success.
+    failure: Option<(u64, OutboundError)>,
+}
+
+type Shared = Mutex<State>;
 
 /// No `Debug`: the dialer may hold credentials.
 pub(crate) struct H2Pool {
@@ -114,16 +144,10 @@ pub(crate) struct H2Pool {
     label: &'static str,
     max_streams: usize,
     dial: Arc<dyn Dial>,
-    /// The connections that take new streams, oldest first.
-    conns: Arc<Conns>,
-    /// One dial at a time.
-    dialing: tokio::sync::Mutex<()>,
-    /// Bumped after every dial, success or failure: tells a request that
-    /// waited for `dialing` whether a dial finished meanwhile.
-    attempts: AtomicU64,
-    /// The latest dial's failure (`None` after a success); read and written
-    /// with `dialing` held.
-    failure: Mutex<Option<OutboundError>>,
+    state: Arc<Shared>,
+    /// A dial ended (or its request gave up on it): the requests waiting
+    /// for one look again.
+    dialed: Notify,
     /// Started by the first request: building an outbound (a dry build
     /// included) leaves no task behind.
     reaper: OnceLock<AbortOnDrop>,
@@ -136,10 +160,8 @@ impl H2Pool {
             label,
             max_streams: max_streams as usize,
             dial,
-            conns: Arc::default(),
-            dialing: tokio::sync::Mutex::new(()),
-            attempts: AtomicU64::new(0),
-            failure: Mutex::new(None),
+            state: Arc::default(),
+            dialed: Notify::new(),
             reaper: OnceLock::new(),
         }
     }
@@ -156,7 +178,7 @@ impl H2Pool {
         request: Request<()>,
         opts: &ConnectOpts,
     ) -> Result<Response<H2Stream>, OutboundError> {
-        self.reaper.get_or_init(|| spawn_reaper(&self.conns));
+        self.reaper.get_or_init(|| spawn_reaper(&self.state));
         let lease = self.lease(opts).await?;
         let conn = lease.0.clone();
         if request.extensions().get::<Protocol>().is_some() {
@@ -193,67 +215,82 @@ impl H2Pool {
 
     /// A place on a connection with room, dialing one when there is none.
     async fn lease(&self, opts: &ConnectOpts) -> Result<Lease, OutboundError> {
+        // the dials that had ended when this request last began to wait
+        let mut waited_since = None;
         loop {
-            match self.take() {
-                Pick::Lease(lease) => return Ok(lease),
-                Pick::Unsettled(conn) => {
-                    conn.settled().await;
-                    continue;
-                }
-                Pick::Nothing => {}
-            }
-            // read before contending for the lock: tells us whether a dial
-            // finished while we waited for it
-            let attempt = self.attempts.load(Ordering::SeqCst);
-            let dialing = self.dialing.lock().await;
-            match self.take() {
-                Pick::Lease(lease) => return Ok(lease),
-                Pick::Unsettled(conn) => {
-                    drop(dialing);
-                    conn.settled().await;
-                    continue;
-                }
-                Pick::Nothing => {}
-            }
-            if self.attempts.load(Ordering::SeqCst) != attempt
-                && let Some(failure) = self.failure.lock().expect("failure").as_ref()
-            {
-                return Err(copy_error(failure));
-            }
-            let result = self.connect(opts).await;
-            self.attempts.fetch_add(1, Ordering::SeqCst);
-            let conn = match result {
-                Ok(conn) => Arc::new(conn),
-                Err(e) => {
-                    *self.failure.lock().expect("failure") = Some(copy_error(&e));
-                    return Err(e);
+            // registered before the look: a dial that ends after it wakes us
+            let dialed = self.dialed.notified();
+            let mut dialed = pin!(dialed);
+            dialed.as_mut().enable();
+            let step = {
+                let mut state = self.state.lock().expect("pool");
+                match state.pick(self.max_streams) {
+                    Pick::Lease(lease) => return Ok(lease),
+                    Pick::Unsettled(conn) => Step::Settle(conn),
+                    Pick::Nothing => {
+                        if let Some(since) = waited_since
+                            && state.dialing == 0
+                            && let Some((at, failure)) = &state.failure
+                            && *at > since
+                        {
+                            return Err(copy_error(failure));
+                        }
+                        // a dial is room for its own request and
+                        // `max_streams - 1` that wait for it
+                        if state.dialing < MAX_DIALS
+                            && state.waiting >= state.dialing * (self.max_streams - 1)
+                        {
+                            state.dialing += 1;
+                            Step::Dial
+                        } else {
+                            state.waiting += 1;
+                            waited_since = Some(state.dials);
+                            Step::Wait
+                        }
+                    }
                 }
             };
-            *self.failure.lock().expect("failure") = None;
-            let lease = conn.lease(self.max_streams);
-            self.conns.lock().expect("conns").push(conn);
-            return lease.ok_or_else(|| {
-                OutboundError::Proxy(format!("{}: the server accepts no streams", self.label))
-            });
+            match step {
+                Step::Settle(conn) => conn.settled().await,
+                Step::Wait => {
+                    let _waiting = Waiting(&self.state);
+                    dialed.await;
+                }
+                Step::Dial => return self.dial_one(opts).await,
+            }
         }
     }
 
-    /// The oldest connection with room; the ones that are draining or have
-    /// idled too long are let go on the way. Without one, a connection that
-    /// may turn out to have room once its SETTINGS are known.
-    fn take(&self) -> Pick {
-        let mut conns = self.conns.lock().expect("conns");
-        prune(&mut conns, Instant::now());
-        let mut unsettled = None;
-        for conn in conns.iter() {
-            if let Some(lease) = conn.lease(self.max_streams) {
-                return Pick::Lease(lease);
+    /// A new connection and its first place. The dial stays counted until
+    /// it ends or its request gives up on it.
+    async fn dial_one(&self, opts: &ConnectOpts) -> Result<Lease, OutboundError> {
+        let dialing = Dialing(self);
+        let result = self.connect(opts).await;
+        let lease = {
+            let mut state = self.state.lock().expect("pool");
+            state.dials += 1;
+            match result {
+                Ok(conn) => {
+                    state.failure = None;
+                    let conn = Arc::new(conn);
+                    let lease = conn.lease(self.max_streams);
+                    state.conns.push(conn);
+                    lease.ok_or_else(|| {
+                        OutboundError::Proxy(format!(
+                            "{}: the server accepts no streams",
+                            self.label
+                        ))
+                    })
+                }
+                Err(e) => {
+                    let at = state.dials;
+                    state.failure = Some((at, copy_error(&e)));
+                    Err(e)
+                }
             }
-            if unsettled.is_none() && !conn.is_settled() {
-                unsettled = Some(conn.clone());
-            }
-        }
-        unsettled.map_or(Pick::Nothing, Pick::Unsettled)
+        };
+        drop(dialing);
+        lease
     }
 
     async fn connect(&self, opts: &ConnectOpts) -> Result<Conn, OutboundError> {
@@ -261,7 +298,7 @@ impl H2Pool {
         let mut builder = client::Builder::new();
         builder
             .initial_window_size(STREAM_WINDOW)
-            .initial_connection_window_size(CONNECTION_WINDOW)
+            .initial_connection_window_size(connection_window(self.max_streams))
             .enable_push(false);
         // writes the preface; the server's SETTINGS come later
         let (send, mut connection) = builder.handshake::<_, Bytes>(io).await.map_err(|e| {
@@ -304,18 +341,65 @@ impl H2Pool {
     /// The connections that take new streams.
     #[cfg(test)]
     pub(crate) fn connections(&self) -> usize {
-        let mut conns = self.conns.lock().expect("conns");
-        prune(&mut conns, Instant::now());
-        conns.len()
+        let mut state = self.state.lock().expect("pool");
+        prune(&mut state.conns, Instant::now());
+        state.conns.len()
     }
 }
 
-/// What `H2Pool::take` found.
+impl State {
+    /// The oldest connection with room; the ones that are draining or have
+    /// idled too long are let go on the way. Without one, a connection
+    /// whose SETTINGS may yet bring room.
+    fn pick(&mut self, max_streams: usize) -> Pick {
+        prune(&mut self.conns, Instant::now());
+        let mut unsettled = None;
+        for conn in &self.conns {
+            if let Some(lease) = conn.lease(max_streams) {
+                return Pick::Lease(lease);
+            }
+            if unsettled.is_none() && conn.may_have_room(max_streams) {
+                unsettled = Some(conn.clone());
+            }
+        }
+        unsettled.map_or(Pick::Nothing, Pick::Unsettled)
+    }
+}
+
+/// What `State::pick` found.
 enum Pick {
     Lease(Lease),
-    /// No room now, but this connection's limit is not known yet.
+    /// No room now, but this connection's SETTINGS may bring some.
     Unsettled(Arc<Conn>),
     Nothing,
+}
+
+/// What a request without a place does next.
+enum Step {
+    /// Waits for that connection's SETTINGS.
+    Settle(Arc<Conn>),
+    /// Waits for the dials in flight.
+    Wait,
+    Dial,
+}
+
+/// A dial in flight; when it ends, the requests waiting for it look again.
+struct Dialing<'a>(&'a H2Pool);
+
+impl Drop for Dialing<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().expect("pool").dialing -= 1;
+        self.0.dialed.notify_waiters();
+    }
+}
+
+/// A request waiting for the dials in flight.
+struct Waiting<'a>(&'a Shared);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.lock().expect("pool").waiting -= 1;
+    }
 }
 
 /// One pooled connection. Its streams' leases keep it alive after the pool
@@ -327,8 +411,8 @@ struct Conn {
     settled: watch::Receiver<bool>,
     /// The connection's task has finished.
     ended: Arc<AtomicBool>,
-    /// A PING went unanswered (the one that learns the SETTINGS failed, or
-    /// a liveness check timed out): no new streams.
+    /// A PING went unanswered (the one that learns the SETTINGS, or a
+    /// liveness check): no new streams.
     dead: Arc<AtomicBool>,
     /// Asks the connection's task for a liveness check; flags that come
     /// while one runs are merged into a single permit.
@@ -389,6 +473,12 @@ impl Conn {
 
     fn is_settled(&self) -> bool {
         *self.settled.borrow()
+    }
+
+    /// Its SETTINGS are not known yet, and it carries fewer streams than
+    /// `max_streams`: once they are, it may take another.
+    fn may_have_room(&self, max_streams: usize) -> bool {
+        !self.is_settled() && self.usage.lock().expect("usage").open < max_streams
     }
 
     /// The server's SETTINGS are the first frame it sends (RFC 9113 3.4):
@@ -453,9 +543,15 @@ async fn drive<T>(
             settled.send_replace(true);
             return std::future::pending::<()>().await;
         };
-        if ping.ping(Ping::opaque()).await.is_err() {
-            // the connection is failing: the requests waiting for its
-            // SETTINGS learn that it is gone, not that it lacks a setting
+        // no answer (the transport died after TLS) and the connection would
+        // carry one stream until the system gives up on it: let it go, and
+        // the requests waiting for its SETTINGS learn that it is gone, not
+        // that it lacks a setting
+        if !matches!(
+            tokio::time::timeout(LIVENESS_TIMEOUT, ping.ping(Ping::opaque())).await,
+            Ok(Ok(_))
+        ) {
+            tracing::debug!("{label}: the HTTP/2 connection does not answer its first PING");
             dead.store(true, Ordering::SeqCst);
             settled.send_replace(true);
             return std::future::pending::<()>().await;
@@ -525,17 +621,17 @@ fn copy_error(e: &OutboundError) -> OutboundError {
 
 /// Lets go of idle connections until the pool is gone. Holds it weakly: the
 /// pool dies with its outbound.
-fn spawn_reaper(conns: &Arc<Conns>) -> AbortOnDrop {
-    let conns: Weak<Conns> = Arc::downgrade(conns);
+fn spawn_reaper(state: &Arc<Shared>) -> AbortOnDrop {
+    let state: Weak<Shared> = Arc::downgrade(state);
     AbortOnDrop(tokio::spawn(async move {
         let mut tick = tokio::time::interval(REAP_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            let Some(conns) = conns.upgrade() else {
+            let Some(state) = state.upgrade() else {
                 return;
             };
-            prune(&mut conns.lock().expect("conns"), Instant::now());
+            prune(&mut state.lock().expect("pool").conns, Instant::now());
         }
     }))
 }
@@ -565,8 +661,9 @@ mod tests {
 
     /// Dials an in-process `h2` server over a pipe. By the host of the
     /// CONNECT, it echoes (half-closing after us), refuses (`deny…`, 407),
-    /// resets the stream after our first bytes (`reset…`), or answers
-    /// after three seconds (`slow…`).
+    /// resets the stream after our first bytes (`reset…`), answers after
+    /// three seconds (`slow…`), or sends a full stream window and nothing
+    /// more (`fill…`).
     #[derive(Default)]
     struct TestDial {
         server: Server,
@@ -580,6 +677,13 @@ mod tests {
         freeze: Mutex<Vec<Arc<AtomicBool>>>,
         /// Server connections that have ended.
         ended: Arc<AtomicUsize>,
+        /// The first connection's server is frozen from the start: it sends
+        /// not even its SETTINGS.
+        freeze_first: bool,
+        /// How long every dial takes.
+        delay: Option<Duration>,
+        /// Streams to `fill…` whose full window the server got to send.
+        filled: Arc<AtomicUsize>,
     }
 
     impl Dial for TestDial {
@@ -588,7 +692,10 @@ mod tests {
             _opts: &'a ConnectOpts,
         ) -> BoxFuture<'a, Result<BoxedStream, OutboundError>> {
             Box::pin(async move {
-                self.dials.fetch_add(1, Ordering::SeqCst);
+                let first = self.dials.fetch_add(1, Ordering::SeqCst) == 0;
+                if let Some(delay) = self.delay {
+                    tokio::time::sleep(delay).await;
+                }
                 if self.fail {
                     tokio::task::yield_now().await;
                     return Err(OutboundError::Proxy("test: connection refused".into()));
@@ -596,10 +703,16 @@ mod tests {
                 let (near, far) = tokio::io::duplex(64 * 1024);
                 let goaway = Arc::new(Notify::new());
                 self.goaway.lock().unwrap().push(goaway.clone());
-                let frozen = Arc::new(AtomicBool::new(false));
+                let frozen = Arc::new(AtomicBool::new(self.freeze_first && first));
                 self.freeze.lock().unwrap().push(frozen.clone());
                 let far = Freezable { io: far, frozen };
-                tokio::spawn(serve(far, self.server, goaway, self.ended.clone()));
+                tokio::spawn(serve(
+                    far,
+                    self.server,
+                    goaway,
+                    self.ended.clone(),
+                    self.filled.clone(),
+                ));
                 Ok(Box::new(near) as BoxedStream)
             })
         }
@@ -663,6 +776,7 @@ mod tests {
         server: Server,
         goaway: Arc<Notify>,
         ended: Arc<AtomicUsize>,
+        filled: Arc<AtomicUsize>,
     ) {
         if server.hang_up {
             // the client preface's magic (RFC 9113 3.4)
@@ -686,7 +800,7 @@ mod tests {
                 tokio::select! {
                     next = conn.accept() => match next {
                         Some(Ok((request, respond))) => {
-                            tokio::spawn(answer(request, respond));
+                            tokio::spawn(answer(request, respond, filled.clone()));
                         }
                         _ => break,
                     },
@@ -697,7 +811,11 @@ mod tests {
         ended.fetch_add(1, Ordering::SeqCst);
     }
 
-    async fn answer(request: Request<RecvStream>, mut respond: SendResponse<Bytes>) {
+    async fn answer(
+        request: Request<RecvStream>,
+        mut respond: SendResponse<Bytes>,
+        filled: Arc<AtomicUsize>,
+    ) {
         let host = request.uri().host().unwrap_or_default().to_string();
         if host.starts_with("slow") {
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -716,7 +834,19 @@ mod tests {
             send.send_reset(Reason::CONNECT_ERROR);
             return;
         }
-        let stream = H2Stream::new("server", send, recv);
+        let mut stream = H2Stream::new("server", send, recv);
+        if host.starts_with("fill") {
+            // as much as the stream may take, and the client never reads it
+            if stream
+                .write_all(&vec![0; STREAM_WINDOW as usize])
+                .await
+                .is_ok()
+            {
+                filled.fetch_add(1, Ordering::SeqCst);
+            }
+            let _ = stream.read_to_end(&mut Vec::new()).await;
+            return;
+        }
         let (mut r, mut w) = tokio::io::split(stream);
         let _ = tokio::io::copy(&mut r, &mut w).await;
         let _ = w.shutdown().await;
@@ -797,6 +927,27 @@ mod tests {
         assert!(back == data, "the echo differs");
     }
 
+    /// Streams whose readers stall keep a full window each; the
+    /// connection's window holds them all and has room left, so the
+    /// connection's other streams keep moving.
+    #[tokio::test]
+    async fn stalled_streams_leave_the_connection_room() {
+        let dial = Arc::new(TestDial::default());
+        let max_streams = 6;
+        let pool = pool(&dial, max_streams);
+        let mut stalled = Vec::new();
+        for port in 1..max_streams {
+            stalled.push(tunnel(&pool, &format!("fill.test:{port}")).await);
+        }
+        within(Duration::from_secs(5), || {
+            dial.filled.load(Ordering::SeqCst) == stalled.len()
+        })
+        .await;
+        let mut stream = tunnel(&pool, "echo.test:7").await;
+        round_trip(&mut stream, b"still moving").await;
+        assert_eq!(dial.dials.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn shutdown_is_a_half_close() {
         let dial = Arc::new(TestDial::default());
@@ -861,6 +1012,64 @@ mod tests {
             round_trip(stream, b"one each").await;
         }
         assert_eq!(dial.dials.load(Ordering::SeqCst), 3);
+    }
+
+    /// A burst of requests brings up the connections it needs in one dial
+    /// time, not one connection after another.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_dials_the_connections_it_needs_at_once() {
+        const DIAL: Duration = Duration::from_millis(300);
+        for (max_streams, requests, connections) in [(3, 12, 4), (1, 6, 6)] {
+            let dial = Arc::new(TestDial {
+                delay: Some(DIAL),
+                ..TestDial::default()
+            });
+            let pool = Arc::new(pool(&dial, max_streams));
+            let start = Instant::now();
+            let mut burst = tokio::task::JoinSet::new();
+            for port in 0..requests {
+                let pool = pool.clone();
+                burst.spawn(async move {
+                    let stream = tunnel(&pool, &format!("echo.test:{port}")).await;
+                    // the stream goes back with its time: its place stays taken
+                    (start.elapsed(), stream)
+                });
+            }
+            let opened = burst.join_all().await;
+            let slowest = opened.iter().map(|(took, _)| *took).max().unwrap();
+            assert!(
+                slowest < DIAL * 2,
+                "max-streams={max_streams}: the last stream took {slowest:?}"
+            );
+            assert_eq!(dial.dials.load(Ordering::SeqCst), connections);
+        }
+    }
+
+    /// With `max-streams=1` a connection that holds its stream cannot take
+    /// another, SETTINGS or not: nothing to wait for.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_connection_is_not_waited_for_before_its_settings() {
+        let dial = Arc::new(TestDial {
+            freeze_first: true,
+            ..TestDial::default()
+        });
+        let pool = Arc::new(pool(&dial, 1));
+        let first = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let _ = pool
+                    .open(connect("echo.test:1"), &ConnectOpts::default())
+                    .await;
+            })
+        };
+        // the first request holds the frozen connection's only place
+        eventually(|| pool.connections() == 1).await;
+        let mut stream = tokio::time::timeout(Duration::from_secs(1), tunnel(&pool, "echo.test:2"))
+            .await
+            .expect("the second request waited for the first connection");
+        round_trip(&mut stream, b"next").await;
+        assert_eq!(dial.dials.load(Ordering::SeqCst), 2);
+        first.abort();
     }
 
     #[tokio::test]
@@ -1002,6 +1211,30 @@ mod tests {
         .await;
         let mut second = tunnel(&pool, "echo.test:3").await;
         round_trip(&mut second, b"fresh").await;
+        assert_eq!(dial.dials.load(Ordering::SeqCst), 2);
+    }
+
+    /// The transport dies after TLS, before the server's SETTINGS: the PING
+    /// that would learn them is never answered either.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_whose_settings_never_come_is_let_go_of() {
+        let dial = Arc::new(TestDial {
+            freeze_first: true,
+            ..TestDial::default()
+        });
+        let pool = pool(&dial, 3);
+        let opened = tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.open(connect("echo.test:1"), &ConnectOpts::default()),
+        )
+        .await;
+        assert!(opened.is_err(), "a frozen server answered");
+        within(LIVENESS_TIMEOUT + Duration::from_secs(5), || {
+            pool.connections() == 0
+        })
+        .await;
+        let mut stream = tunnel(&pool, "echo.test:2").await;
+        round_trip(&mut stream, b"fresh").await;
         assert_eq!(dial.dials.load(Ordering::SeqCst), 2);
     }
 
