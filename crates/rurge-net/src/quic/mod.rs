@@ -623,10 +623,14 @@ mod tests {
             Tristate::Auto,
         )
         .await;
-        let (client, accepted) = tokio::join!(dial(path, &cert, transport), async {
-            let incoming = server.accept().await.expect("a connection");
-            incoming.await.expect("accepted")
-        });
+        let (client, accepted) = timeout(BOUND, async {
+            tokio::join!(dial(path, &cert, transport), async {
+                let incoming = server.accept().await.expect("a connection");
+                incoming.await.expect("accepted")
+            })
+        })
+        .await
+        .expect("connected within the bound");
         (server, client.unwrap(), accepted)
     }
 

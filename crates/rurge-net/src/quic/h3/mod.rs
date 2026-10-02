@@ -146,7 +146,7 @@ mod tests {
     use tokio::time::{Instant, timeout};
 
     const ALPN: &[&str] = &["h3"];
-    const BOUND: Duration = Duration::from_secs(10);
+    pub(super) const BOUND: Duration = Duration::from_secs(10);
     /// The fake's SETTINGS unless a test says otherwise.
     const SERVER_SETTINGS: &[(u64, u64)] = &[(SETTINGS_MAX_FIELD_SECTION_SIZE, 1 << 16)];
     /// `:status 200` from the static table.
@@ -170,18 +170,24 @@ mod tests {
             remote: server.local_addr().unwrap(),
         };
         let client = client_config(cert.client_tls(ALPN), transport).unwrap();
-        let (connection, accepted) = tokio::join!(connect(path, &client, "localhost"), async {
-            server
-                .accept()
-                .await
-                .expect("a connection")
-                .await
-                .expect("accepted")
-        });
+        let (connection, accepted) = timeout(BOUND, async {
+            tokio::join!(connect(path, &client, "localhost"), async {
+                server
+                    .accept()
+                    .await
+                    .expect("a connection")
+                    .await
+                    .expect("accepted")
+            })
+        })
+        .await
+        .expect("connected within the bound");
         (server, connection.expect("connected"), accepted)
     }
 
-    async fn connected() -> (Endpoint, Connection, Connection) {
+    /// `connected_with` the standard transport; the client's own tests use
+    /// it too.
+    pub(super) async fn connected() -> (Endpoint, Connection, Connection) {
         connected_with(&Transport::STANDARD, |_| {}).await
     }
 
@@ -199,8 +205,9 @@ mod tests {
         let (endpoint, quic, server_quic) = connected().await;
         Pair {
             client: Client::new(quic.clone()),
-            server: H3Server::start(server_quic.clone(), SERVER_SETTINGS)
+            server: timeout(BOUND, H3Server::start(server_quic.clone(), SERVER_SETTINGS))
                 .await
+                .expect("started within the bound")
                 .unwrap(),
             quic,
             server_quic,

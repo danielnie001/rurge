@@ -588,7 +588,11 @@ mod tests {
         });
         let out = outbound_with(&spec(port, "password=pw"), port, &fake);
         let started = Instant::now();
-        let err = out.connect_tcp(&target(echo), &opts).await.err().unwrap();
+        let err = timeout(BOUND, out.connect_tcp(&target(echo), &opts))
+            .await
+            .expect("an outcome within the bound")
+            .err()
+            .unwrap();
         assert!(matches!(err, OutboundError::Timeout), "{err}");
         // well before QUIC's own handshake timeout, about 3 seconds
         assert!(
@@ -606,7 +610,11 @@ mod tests {
                 .unwrap(),
         );
         let started = Instant::now();
-        let err = out.connect_tcp(&target(echo), &opts).await.err().unwrap();
+        let err = timeout(BOUND, out.connect_tcp(&target(echo), &opts))
+            .await
+            .expect("an outcome within the bound")
+            .err()
+            .unwrap();
         assert!(matches!(err, OutboundError::Timeout), "{err}");
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -1325,15 +1333,16 @@ mod tests {
             udp_round_trip(carrier.as_ref(), udp_echo, b"short").await;
             // in Hysteria's own fragments too, both ways
             udp_round_trip(carrier.as_ref(), udp_echo, &[7; 3000]).await;
-            let fragments = fake.gecko_fragments();
+            // with Salamander alone the fake reads no fragments and keeps no
+            // record of any: that the handshake goes whole is the layer's
+            // own test (`what_goes_out_is_sealed_and_the_handshake_with_gecko_in_fragments`)
             if gecko {
+                let fragments = fake.gecko_fragments();
                 assert!(!fragments.is_empty());
                 for fragment in &fragments {
                     assert!((2..=8).contains(&fragment.count), "{fragment:?}");
                     assert!((512..=1200).contains(&fragment.datagram), "{fragment:?}");
                 }
-            } else {
-                assert!(fragments.is_empty(), "{fragments:?}");
             }
 
             fake.restart();
@@ -1390,7 +1399,11 @@ mod tests {
                 });
                 let out = outbound(&fake, &format!("password=pw{client}"));
                 let started = Instant::now();
-                let err = out.connect_tcp(&target(echo), &opts).await.err().unwrap();
+                let err = timeout(BOUND, out.connect_tcp(&target(echo), &opts))
+                    .await
+                    .expect("an outcome within the bound")
+                    .err()
+                    .unwrap();
                 (client, err, started.elapsed(), fake.connections())
             });
         }

@@ -180,10 +180,16 @@ fn head(request: &Request<()>) -> io::Result<Vec<u8>> {
 
 impl Inner {
     /// Closes the connection for `error` (RFC 9114 8): its requests fail
-    /// with what it says. Once only, and not once the connection ended.
+    /// with what it says. Once only, and not once the connection ended —
+    /// even before the task saw it end: quinn's `close` would put a local
+    /// close in place of how it ended (the server's close, a stateless
+    /// reset).
     pub(super) fn fail(&self, error: H3Error) {
         let first = self.state.send_if_modified(|state| {
-            if state.failure.is_some() || state.ended.is_some() {
+            if state.failure.is_some()
+                || state.ended.is_some()
+                || self.quic.close_reason().is_some()
+            {
                 return false;
             }
             state.failure = Some(error.clone());
@@ -486,6 +492,37 @@ async fn qpack_stream(reader: &mut FrameReader) -> Stop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quic::h3::tests::{BOUND, connected};
+    use quinn::VarInt;
+    use tokio::time::timeout;
+
+    /// The server closed the connection, and the client's task has not
+    /// seen it end yet: a failure found now does not close it again, which
+    /// would put a local close in place of the server's.
+    #[tokio::test]
+    async fn a_failure_after_the_end_leaves_how_the_connection_ended() {
+        let (_endpoint, quic, server_quic) = connected().await;
+        server_quic.close(VarInt::from_u32(0x100), b"bye");
+        timeout(BOUND, quic.closed())
+            .await
+            .expect("closed within the bound");
+        // no task: nothing told the state that the connection ended
+        let inner = Inner {
+            quic: quic.clone(),
+            state: watch::Sender::new(State::default()),
+            critical: AtomicU8::new(0),
+        };
+        inner.fail(H3Error::new(H3_FRAME_ERROR, "found late"));
+        assert!(inner.state.borrow().failure.is_none());
+        assert!(
+            matches!(
+                quic.close_reason(),
+                Some(ConnectionError::ApplicationClosed(_))
+            ),
+            "{:?}",
+            quic.close_reason()
+        );
+    }
 
     /// A request without an authority cannot be sent: HTTPS wants one
     /// (RFC 9114 4.3.1), and so does a CONNECT.
