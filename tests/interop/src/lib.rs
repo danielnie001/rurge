@@ -1,10 +1,11 @@
 //! A sing-box child process on the loopback, for interoperability tests
 //! (M1 design §8). Nothing here downloads, installs or configures anything
 //! outside a temporary directory: the rendered configuration listens on
-//! 127.0.0.1 only — but for the UDP port of a WireGuard endpoint, which
-//! sing-box opens on every address — its single outbound is `direct`, and it
-//! never holds a key that touches the machine (`set_system_proxy`, `tun`,
-//! `auto_route`; a WireGuard endpoint runs in user space).
+//! 127.0.0.1 only (a `hysteria2` inbound's UDP port too) — but for the UDP
+//! port of a WireGuard endpoint, which sing-box opens on every address — its
+//! single outbound is `direct`, and it never holds a key that touches the
+//! machine (`set_system_proxy`, `tun`, `auto_route`; a WireGuard endpoint
+//! runs in user space).
 
 pub mod shadowsocks_rust;
 pub mod snell_server;
@@ -267,6 +268,65 @@ pub fn render_wireguard(endpoint: &WireGuardEndpoint, port: u16, ready: u16) -> 
     })
 }
 
+/// Hysteria 2's QUIC obfuscation, as sing-box's `obfs.type` names it
+/// (`gecko` since sing-box 1.14.0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hysteria2Obfs {
+    Salamander,
+    Gecko,
+}
+
+/// sing-box's `hysteria2` inbound: QUIC with TLS (ALPN `h3`) and one user,
+/// optionally behind Salamander or Gecko.
+pub struct Hysteria2Inbound {
+    pub password: String,
+    /// The obfuscation and its password.
+    pub obfs: Option<(Hysteria2Obfs, String)>,
+    /// No client certificate is asked for: `client_ca` must be `None`.
+    pub tls: TlsFiles,
+}
+
+/// The whole configuration for `inbound` on UDP port `port`, and a `mixed`
+/// inbound on `ready` that says when sing-box is up — a UDP port cannot be
+/// probed; sing-box starts its inbounds one after another in the order
+/// written, so the probe comes last. Gecko keeps sing-box's default packet
+/// sizes (512–1200 bytes, rurge's too); without a `masquerade` a wrong
+/// password is answered 404.
+pub fn render_hysteria2(inbound: &Hysteria2Inbound, port: u16, ready: u16) -> Value {
+    assert!(
+        inbound.tls.client_ca.is_none(),
+        "the hysteria2 inbound asks for no client certificate here"
+    );
+    let mut hysteria2 = json!({
+        "type": "hysteria2",
+        "tag": "hysteria2",
+        "listen": "127.0.0.1",
+        "listen_port": port,
+        "users": [{ "name": "u", "password": inbound.password }],
+        "tls": {
+            "enabled": true,
+            "alpn": ["h3"],
+            "certificate_path": inbound.tls.certificate,
+            "key_path": inbound.tls.key,
+        },
+    });
+    if let Some((kind, password)) = &inbound.obfs {
+        let kind = match kind {
+            Hysteria2Obfs::Salamander => "salamander",
+            Hysteria2Obfs::Gecko => "gecko",
+        };
+        hysteria2["obfs"] = json!({ "type": kind, "password": password });
+    }
+    json!({
+        "log": { "level": "warn", "timestamp": false },
+        "inbounds": [
+            hysteria2,
+            { "type": "mixed", "tag": "ready", "listen": "127.0.0.1", "listen_port": ready },
+        ],
+        "outbounds": [{ "type": "direct", "tag": "direct" }],
+    })
+}
+
 /// A reference implementation running as a child on the loopback; killed and
 /// reaped on drop.
 pub(crate) struct Reference {
@@ -369,6 +429,18 @@ impl SingBox {
     ) -> (SingBox, u16) {
         let (port, ready) = (free_udp_port(), free_port());
         let config = render_wireguard(endpoint, port, ready);
+        (SingBox::launch(binary, dir, &config, vec![ready]), port)
+    }
+
+    /// Starts `binary` with `inbound` on a UDP port of its own; that port,
+    /// once sing-box is up.
+    pub fn spawn_hysteria2(
+        binary: &Path,
+        dir: &Path,
+        inbound: &Hysteria2Inbound,
+    ) -> (SingBox, u16) {
+        let (port, ready) = (free_udp_port(), free_port());
+        let config = render_hysteria2(inbound, port, ready);
         (SingBox::launch(binary, dir, &config, vec![ready]), port)
     }
 
@@ -697,6 +769,86 @@ mod tests {
             }])
         );
         assert_eq!(config["inbounds"][0]["listen_port"], 1001);
+    }
+
+    fn hysteria2(obfs: Option<Hysteria2Obfs>) -> Hysteria2Inbound {
+        Hysteria2Inbound {
+            password: "hy-pw".into(),
+            obfs: obfs.map(|kind| (kind, "obfs-pw".to_string())),
+            tls: TlsFiles {
+                certificate: "leaf.pem".into(),
+                key: "leaf.key".into(),
+                client_ca: None,
+            },
+        }
+    }
+
+    /// The QUIC inbound and the probe on 127.0.0.1, nothing of the machine's.
+    #[test]
+    fn the_hysteria2_configuration_never_touches_the_machine() {
+        for obfs in [
+            None,
+            Some(Hysteria2Obfs::Salamander),
+            Some(Hysteria2Obfs::Gecko),
+        ] {
+            let config = render_hysteria2(&hysteria2(obfs), 4443, 1001);
+            let text = config.to_string();
+            for forbidden in ["set_system_proxy", "tun", "auto_route", "0.0.0.0", "::"] {
+                assert!(!text.contains(forbidden), "`{forbidden}` in {text}");
+            }
+            let top: Vec<&String> = config.as_object().unwrap().keys().collect();
+            assert_eq!(top, ["inbounds", "log", "outbounds"]);
+            for inbound in config["inbounds"].as_array().unwrap() {
+                assert_eq!(inbound["listen"], "127.0.0.1");
+            }
+            assert_eq!(
+                config["outbounds"],
+                json!([{ "type": "direct", "tag": "direct" }])
+            );
+        }
+    }
+
+    #[test]
+    fn the_hysteria2_inbound_is_rendered_as_sing_box_spells_it() {
+        let config = render_hysteria2(&hysteria2(None), 4443, 1001);
+        let inbound = &config["inbounds"][0];
+        assert_eq!(
+            (&inbound["type"], &inbound["listen_port"]),
+            (&json!("hysteria2"), &json!(4443))
+        );
+        assert_eq!(
+            inbound["users"],
+            json!([{ "name": "u", "password": "hy-pw" }])
+        );
+        assert_eq!(
+            inbound["tls"],
+            json!({
+                "enabled": true,
+                "alpn": ["h3"],
+                "certificate_path": "leaf.pem",
+                "key_path": "leaf.key",
+            })
+        );
+        // sing-box's defaults: no bandwidth limit, a 404 for a stranger
+        for absent in ["obfs", "up_mbps", "down_mbps", "masquerade"] {
+            assert!(inbound.get(absent).is_none(), "`{absent}` in {inbound}");
+        }
+        // the probe after it: sing-box starts its inbounds in order
+        assert_eq!(
+            config["inbounds"][1],
+            json!({ "type": "mixed", "tag": "ready", "listen": "127.0.0.1", "listen_port": 1001 })
+        );
+        for (kind, name) in [
+            (Hysteria2Obfs::Salamander, "salamander"),
+            (Hysteria2Obfs::Gecko, "gecko"),
+        ] {
+            let config = render_hysteria2(&hysteria2(Some(kind)), 4443, 1001);
+            // Gecko's packet sizes stay sing-box's defaults
+            assert_eq!(
+                config["inbounds"][0]["obfs"],
+                json!({ "type": name, "password": "obfs-pw" })
+            );
+        }
     }
 
     #[test]

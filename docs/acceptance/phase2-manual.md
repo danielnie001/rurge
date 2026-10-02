@@ -220,3 +220,18 @@
 - [ ] `trust-tunnel` 不载 UDP：经 SOCKS5 UDP 发 DNS 查询，`udp-policy-not-supported-behaviour` 缺省（`REJECT`）时查询没有回答，会话记录写 `policy does not support UDP`；改成 `DIRECT` 后查询直连得到回答。写 `h3=true` 时 `rurge check` 报一条 `W0029`，运行时仍按 HTTP/2 连通。
 - [ ] 休眠唤醒与换网：`h2-connect` 或 `trust-tunnel` 策略在用时（保持一个下载或反复访问网站），让电脑休眠再唤醒，或在 Wi-Fi 与有线 / 手机热点之间切换；切换后新的连接在大约“策略的连接超时 + 5 秒”内恢复（第一个请求可能超时失败，之后的请求走新建的连接），不必等十几分钟；`--log-level debug` 的日志里能看到 `the HTTP/2 connection does not answer a PING`。
 - [ ] 脱敏：`GET /v1/policies/detail?policy_name=<策略名>` 与 `GET /v1/profiles/current` 里两种策略的用户名、口令（含 `h2-connect` 写在端口之后的位置值）与 `headers` 都是 `***`。
+
+## M7a　Hysteria 2
+
+前置：同 M5a 一节的 SOCKS5 UDP 客户端；自己的 Hysteria 2 节点（记下服务端实现与版本，如官方 hysteria 或 sing-box 的 `hysteria2` 入站），以及同一服务端配 Salamander 与配 Gecko 的两份变体（Gecko 要服务端支持：官方 hysteria 2.9.2 起，标为实验性；sing-box 1.14.0 起）；Surge（Mac 6.7 / iOS 5.20 以上，Gecko 一项用）；一个开了 UDP 的上游 SOCKS5 节点（`udp-relay=true`，`underlying-proxy` 一项用）。策略行照 Surge 的写法：`H = hysteria2, <服务器>, <端口>, password=<口令>`（证书不是公共 CA 签的时另加 `server-cert-fingerprint-sha256=` 或 `skip-cert-verify=true`）。每份配置 `[Rule]` 里 `FINAL,H`，`rurge check -c <配置>` 零错误（没有 `W0007`）。
+
+- [ ] TCP：`curl -x http://127.0.0.1:<http-listen 端口> https://example.com/ -I` 与 `curl --socks5-hostname 127.0.0.1:<socks5-listen 端口> https://example.com/ -I` 都返回 200，请求记录里策略链是 `H`、`error` 为空；同时打开几个网站，服务端日志（或抓包）只看到一条 QUIC 连接、一次认证。下载一个几百 MiB 的文件，速度与官方客户端在同一量级，记下数字；加上 `download-bandwidth=<本机实际的下行 Mbps>` 后再下一次，记下数字（服务端据此按这个速率发；rurge 自己的拥塞控制仍是 Cubic）。
+- [ ] UDP：不需要参数，经 SOCKS5 UDP 发 DNS 查询（如 Proxifier 代理 `nslookup example.com 8.8.8.8`）得到回答；经它进行一次语音通话或联机游戏；用 NAT 类型检测工具（STUN）检测，结果是 Full Cone（节点的出口须是全锥）。
+- [ ] Salamander：`salamander-password=<混淆口令>` 连配了 Salamander 的服务端，TCP 与 UDP 都能往返；抓包（Wireshark）认不出 QUIC。把混淆口令改错一位后重载：请求在连接超时处失败（`connect timed out`），没有更具体的错误（协议没有完整性校验）。
+- [ ] Gecko：`gecko-password=<混淆口令>` 连配了 Gecko 的服务端，TCP 与 UDP 都能往返；抓包看到连接刚建立时发出的几个 UDP 包都在 512–1200 字节之间（握手包被拆成 2–8 片并填充）。**同一行策略原样放进 Surge 的配置、连同一个服务端**：rurge 与 Surge 都连得上，才说明 rurge 的 Gecko（照 Hysteria 官网的公开规范）就是 Surge 的 `gecko-password`——这一点尚未证实（M7-D11）。记下结果；只有一边连得上时记下服务端实现与版本，在兼容性清单登记差异。
+- [ ] 端口跳跃：服务端把一段 UDP 端口转发到它的监听端口（官方 hysteria 在 Linux 上把 `listen` 写成端口区间即可，它自己设 nftables / iptables 规则；其它服务端手工加 DNAT / REDIRECT 规则），策略写 `port-hopping=<端口区间>, port-hopping-interval=10`：经 `H` 的下载进行中，抓包看到发往服务端的目的端口约每 10 秒换一个（每次换到另一个端口）、下载不中断；`port-hopping-interval=2` 时 `rurge check` 报一条 `W0012`（按 5 秒）。
+- [ ] `underlying-proxy`：策略写 `underlying-proxy=<SOCKS5 节点>`，TCP 与 UDP 都能往返，SOCKS5 节点那边看到的是一条 UDP 关联（QUIC 经它的 UDP 走），没有 TCP 的 CONNECT；同时写了 `port-hopping` 时 `rurge check` 报 `E0018`（`` `port-hopping` cannot be combined with `underlying-proxy` ``）；把底层策略换成一条 `http` 策略后，拨号失败，请求记录写 `via <底层策略>: the underlying policy cannot carry UDP`。
+- [ ] 休眠唤醒与换网：经 `H` 的连接在用时（保持一个下载或反复访问网站），让电脑休眠再唤醒，或在 Wi-Fi 与有线 / 手机热点之间切换：约 30 秒内（QUIC 的空闲超时）之后的请求走新建的连接、恢复正常，不必重启 rurge；其间的请求可能超时失败。
+- [ ] 口令错误：把 `password` 改错一位，重载后访问 `https://example.com/`：请求失败，会话记录的 `error` 是 `hysteria2: authentication failed`；经 SOCKS5 UDP 的 DNS 查询同样失败、记录写同一个错误；**错误文本与日志（含 `--log-level verbose`）里都没有口令与混淆口令**。
+- [ ] 服务端不转发 UDP（官方 hysteria 的 `disableUDP: true`，认证应答里 `Hysteria-UDP: false`）：TCP 照常；经 SOCKS5 UDP 的查询失败，记录写 `hysteria2: the server does not allow UDP`。
+- [ ] 脱敏：`GET /v1/policies/detail?policy_name=H` 与 `GET /v1/profiles/current` 里 `password`、`salamander-password` 与 `gecko-password` 都是 `***`。

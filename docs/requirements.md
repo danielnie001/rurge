@@ -133,7 +133,7 @@ Surge 是 Apple 平台上功能最完整的网络代理与调试工具之一：�
 | 企业配置、许可证相关 URL Scheme | 商业功能 | 忽略 |
 | Tailscale 策略 | 需嵌入 Tailscale 客户端（控制面协议、DERP、MagicDNS），工作量与许可需单独评估 | 远期评估；配置解析通过，策略视为不可用 |
 | Metered Network Mode（按应用限制联网） | Surge Mac 专属 UI 功能 | 远期评估 |
-| Snell v6 与 v5 的 QUIC Proxy Mode、Hysteria 2 的 Gecko 混淆 | 协议细节未公开 | 待评估；Snell v4 / v5（阶段 2 M6b 已实现 TCP 与 UDP over TCP，v1–v3 只解析，阶段 2 M6-D2）与 Salamander 在范围内 |
+| Snell v6 与 v5 的 QUIC Proxy Mode | 协议细节未公开 | 待评估；Snell v4 / v5（阶段 2 M6b 已实现 TCP 与 UDP over TCP，v1–v3 只解析，阶段 2 M6-D2）在范围内；Hysteria 2 的 Salamander 与 Gecko 混淆也在范围内（阶段 2 M7a 已实现；Gecko 照 Hysteria 官网的公开规范，与 Surge 的 `gecko-password` 是否同一算法未证实，在手工验收里核对，阶段 2 M7-D11） |
 
 ### 2.5 与 Surge 的关系
 
@@ -313,7 +313,7 @@ flowchart LR
 | FR-OUT-02 | 别名类型 `direct` / `reject*`，接受通用参数；重定义 `DIRECT` 忽略，重定义其他内置名报错 | P0 | 1 |
 | FR-OUT-03 | 14 个通用策略参数（`interface` `allow-other-interface` `dns-follow-interface` `no-error-alert` `ip-version` `hybrid` `tfo` `tos` `ecn` `block-quic` `test-url` `test-timeout` `test-udp` `underlying-proxy`）及其平台差异 | P0 | 2 |
 | FR-OUT-04 | TLS 参数（`skip-cert-verify` `sni` `server-cert-verify-name` `server-cert-fingerprint-sha256` `alpn` `client-cert`）与 Shadow TLS v2 / v3；证书验证使用 rustls 与系统根证书 | P0 | 2 |
-| FR-OUT-05 | 协议实现：`http` `https` `h2-connect` `socks5` `socks5-tls` `ss`（AEAD、2022、obfs）`snell`（v4 / v5，阶段 2 M6-D2）`vmess` `trojan` `tuic` `tuic-v5` `hysteria2`（Salamander）`masque` `anytls` `trust-tunnel`（h2 / h3）`ssh` `wireguard` `external`；每种协议的专属参数见清单 4.6 | P0 | 2 |
+| FR-OUT-05 | 协议实现：`http` `https` `h2-connect` `socks5` `socks5-tls` `ss`（AEAD、2022、obfs）`snell`（v4 / v5，阶段 2 M6-D2）`vmess` `trojan` `tuic` `tuic-v5` `hysteria2`（Salamander、Gecko，阶段 2 M7a；Gecko 与 Surge 的 `gecko-password` 是否同一算法未证实，阶段 2 M7-D11）`masque` `anytls` `trust-tunnel`（h2 / h3）`ssh` `wireguard` `external`；每种协议的专属参数见清单 4.6 | P0 | 2 |
 | FR-OUT-06 | 低优先级协议能力：Shadowsocks 流式旧方法、VMess 旧握手、Snell v1–v3 | P2 | 2 |
 | FR-OUT-07 | UDP 中继：按协议支持矩阵；`udp-relay` `udp-port`；不支持时按 `udp-policy-not-supported-behaviour` | P0 | 2 |
 | FR-OUT-08 | 链式代理 `underlying-proxy`：值可为策略或组；目标代理主机名远程解析；与 `port-hopping` 互斥 | P0 | 2 |
@@ -323,7 +323,7 @@ flowchart LR
 | FR-OUT-12 | WireGuard：多 peer 最长前缀路由、握手 / 重协商 / keepalive / 过期定时器、分片重组、`client-id`、原生 RTT 探测与 URL 测试两种模式、额外 10 秒初始化、DSCP 0x88、网络变化与底层策略（`underlying-proxy`）的去处变化时重建、本地隧道地址 ICMP echo | P0 | 2 |
 | FR-OUT-13 | 外部代理程序：进程启动 / 自动重启 / 退出清理；`addresses` 从 TUN 路由排除；外部进程自身流量走 DIRECT；日志写数据目录 | P1 | 2 |
 | FR-OUT-14 | 策略错误通知与 `no-error-alert` | P1 | 6 |
-| FR-OUT-15 | Snell v6 与 v5 的 QUIC Proxy Mode、Gecko 混淆、Tailscale 的可行性评估报告 | P2 | 2 / 远期 |
+| FR-OUT-15 | Snell v6 与 v5 的 QUIC Proxy Mode、Tailscale 的可行性评估报告（Hysteria 2 的 Gecko 混淆已在阶段 2 M7a 照 Hysteria 官网的公开规范实现，不再是评估项） | P2 | 2 / 远期 |
 
 ### 4.4 策略组（GRP）
 
@@ -555,7 +555,7 @@ flowchart LR
 
 ### 远期评估
 
-Tailscale 策略、Ponte 替代方案、Metered Network Mode、Snell v6 与 v5 的 QUIC Proxy Mode、Hysteria 2 Gecko 混淆、Windows 网关模式。每项以单独的评估文档决定是否进入路线图。
+Tailscale 策略、Ponte 替代方案、Metered Network Mode、Snell v6 与 v5 的 QUIC Proxy Mode、Windows 网关模式。每项以单独的评估文档决定是否进入路线图。
 
 ---
 
@@ -582,7 +582,7 @@ Tailscale 策略、Ponte 替代方案、Metered Network Mode、Snell v6 与 v5 �
 
 | 编号 | 风险 | 影响 | 应对 |
 | --- | --- | --- | --- |
-| R1 | 非公开的协议与算法（Snell v6 与 v5 的 QUIC Proxy Mode、Gecko、smart 组评分） | 无法完全一致 | 近似实现并在清单标注差异；Snell v4 / v5 依公开描述实现、以对参考服务端的互操作为准（阶段 2 M6b），v6 列为待评估 |
+| R1 | 非公开的协议与算法（Snell v6 与 v5 的 QUIC Proxy Mode、Surge 的 Gecko、smart 组评分） | 无法完全一致 | 近似实现并在清单标注差异；Snell v4 / v5 依公开描述实现、以对参考服务端的互操作为准（阶段 2 M6b），v6 列为待评估；Gecko 照 Hysteria 官网的公开规范实现、以对 sing-box 的互操作为准（阶段 2 M7a），与 Surge 是否同一算法在手工验收里核对 |
 | R2 | Windows 增强模式依赖 Wintun 驱动的分发与管理员权限 | 安装门槛与许可合规 | 阶段 3 确认 Wintun 再分发条款；提供安装向导 |
 | R3 | macOS 直接操作 utun 需要 root，且无法使用 Network Extension | 体验不如 Surge | 通过 launchd 以 root 运行守护进程，客户端与 GUI 以普通用户运行 |
 | R4 | JavaScript 引擎选型：兼容性、性能、体积、WebAPI 支持之间的权衡 | 脚本兼容率 | 阶段 5 设计文档用脚本样本集对比候选引擎 |
