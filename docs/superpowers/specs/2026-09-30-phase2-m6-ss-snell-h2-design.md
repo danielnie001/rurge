@@ -262,3 +262,20 @@ v4 / v5 的 TCP 线上格式由 missuo/opensnell（GPLv3，对官方 snell-serve
 2. **请求没得到应答后的存活检查**：一个请求没得到应答头（调用方超时放弃，或流出错；服务端答了任何状态码都证明连接还活着，不算）时，连接的驱动任务用握手后已取得的 PING 句柄（`h2` 只交出一次）发一个 PING，5 秒（`LIVENESS_TIMEOUT`）内没有回应就把连接标为死，不再分配新流，下一个请求新建连接；有回应则什么也不变。每条连接同时至多一次检查，检查期间的新请求合并。休眠唤醒、换网与 NAT 重绑后静默死掉的连接由此被换掉；只是慢的目标连接本身会回应 PING，不受影响。
 3. **凭据以 never-indexed 发送**：`proxy-authorization` 与 `headers` 配置的字段在 HPACK 里标为敏感（RFC 7541 7.1.3），不进双方的动态表。
 4. **SETTINGS 之前断掉的连接报连接失败**：连接在收到服务端 SETTINGS 之前就结束（用来得知 SETTINGS 的 PING 失败）时，等它的 extended CONNECT 请求报连接本身的错误，不再误报 `the server does not support extended CONNECT`；只有确实收到了不带该标志的 SETTINGS 才报后者。
+
+## 18. 合并后的订正
+
+M6 合并之后对全部提交的复查（2026-10-01，在三份计划的评审之外）改动了若干做法；与上文及第 12–17 节不一致处以本节为准（明细见三份计划「执行期修正记录」里标"合并后"的行，没有改的发现在各计划的「延后事项」里）。
+
+1. **HTTP/2 会话池按需求并行拨号（订正第 16 节第 4 条的"同时到来的请求共用一次拨号"）**：在途的每次拨号算作 `max-streams` 个位置——拨号的请求自己一个、等它的请求其余几个；放不下的请求再拨一条，同时至多 8 条在途（`MAX_DIALS`）。原先一次只拨一条：一批同时到来的请求一条接一条地等，第 k 条连接约等 k ×（拨号 + 1 RTT），RTT 较大时排在后面的会话会撞上连接超时。请求等着的拨号都失败时，失败照旧一并报给它们。已承载 `max-streams` 条流、还没收到 SETTINGS 的连接不再值得等（`max-streams=1` 时原先每个请求都白等一个往返）。
+2. **得知 SETTINGS 的 PING 也有时限（补第 17 节第 2 条）**：它在 `LIVENESS_TIMEOUT`（5 秒）内没有回应时，连接不再分配新流，等它 SETTINGS 的请求得知它已不可用。原先这个 PING 没有时限：TLS 完成后、SETTINGS 到达前静默断掉的连接一直"未定"、每次放一条流，之后的请求一个接一个挑中它而失败，直到系统放弃这条 TCP（Linux 约 15 分钟）；M6c 收尾时把它记作"窗口约 1 RTT"，低估了后果。
+3. **连接窗口随 `max-streams` 增大（订正第 16 节第 4 条的"每条连接 4 MiB"）**：`max-streams` × 1 MiB，至少 4 MiB。原先固定 4 MiB，`max-streams` ≥ 4 时 4 条读端停住的流（暂停的下载）就能占光连接窗口，同一连接上的其它隧道收不到数据。
+4. **CONNECT-UDP 的 `:authority` 用 TLS 的名字（细化 5.3 与第 16 节第 7 条）**：写了 `sni=` 时是那个名字，否则是服务器；原先总是服务器地址，服务器写成 IP 时，按 authority 选主机或比对模板的服务端会拒绝 CONNECT-UDP。
+5. **`headers` 里的 `Host` 在 HTTP/2 下去掉（补第 16 节第 2 条）**：加载时 `W0028`；`:authority` 就是 CONNECT 的目标，与它不同的 `Host` 让请求不合格（RFC 9113 8.3.1）。
+6. **`headers` 的值不进 `Debug`（落实第 6 节）**：`HeaderTemplate` 的 `Debug` 只打印字段名，`h2-connect` / `trust-tunnel` / `http` / `https` 的 spec 一并受益。
+7. **Snell 的 `udp-port` 只解析（订正第 14 节第 5 条与 M6b 计划 P11）**：v4 / v5 上写了它是 `W0029`，UDP over TCP 一律走主端口与同样的各层。手册说 `udp-port` 用于服务端的 TCP 与 UDP 不在同一端口、例如 Shadow TLS 占着 TCP 端口时——那是 v5 QUIC Proxy Mode 的 UDP 端口；原先 rurge 把 UDP 会话那条 TCP 连接连到 `udp-port` 并照样叠 Shadow TLS，按手册的这种部署必然握手失败，不写 `udp-port` 反而能通。
+8. **Snell 的重拨唤醒所有等它的任务（订正 M6b 计划延后事项 #8 的假定）**：重拨期间轮询过它的任务都登记，重拨每推进一步都唤醒它们。原先只记得最后一个轮询者：不带 TLS / WebSocket 的 vmess UDP 以 `reuse=true` 的 snell 为 `underlying-proxy`（读与写在两个任务里）、池里取出的连接 1 秒内失效时，读端被落下，写端可能永久挂住。
+9. **订阅里没写 `version` 的 snell 行也说明缺省（补第 14 节第 1 条）**：订阅告警写作 `` `snell` version 1 (the default when `version` is not written) ``，与主配置的 `W0007` 一致。
+10. **ss 在首字节之前被重置时说明可能的原因（细化 3.3 的错误一段）**：`ss: the server reset the connection without answering (wrong password or method?)`，SS 2022 为 `… (wrong key or method, or a clock more than 30 seconds off?)`。shadowsocks-rust 对 SS 2022 的密钥、时钟与重放失败一律重置连接，原先用户只看到系统的"连接被重置"；它对旧式 AEAD 一直读下去、不回也不关，这种情况客户端无从报错（登记）。
+11. **CI 钉在 MSRV**：CI 工作流设 `RUSTUP_TOOLCHAIN=1.89.0`（它优先于 `rust-toolchain.toml` 的 `stable`），与本机门禁一致。此前 CI 每次装最新的 stable，新版 clippy 多出的 lint 让三个平台都在 clippy 一步失败，测试与全部互操作从首次推送（daba559）起都没有执行过：M6-D5 与各计划里"由 CI 首跑证明"的互操作至今没有被证明，要等钉住之后的第一次推送。
+12. **`obfs-uri` 也脱敏（补第 6 节的脱敏名单）**：前面按路径分流时路径就是共享密钥，与已脱敏的 `ws-path` 同理；`/v1/profiles/current`、`/v1/policies/detail` 与 `lineHash` 里都抹掉（`lineHash` 因此不再随 `obfs-uri` 变化）。

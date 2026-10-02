@@ -11553,6 +11553,8 @@ git commit -m "docs: M6a Shadowsocks——兼容性清单、手工验收、READM
 | 6 | 终审 | 旧式 AEAD 读到的服务端 salt 与自己的请求 salt 相同（流被反射）时以 `UNDECRYPTABLE` 失败；读侧用例的请求 salt 改用与应答不同的 `0xee…`（新用例 `a_reflected_stream_does_not_decrypt`，去掉这条检查时它失败） | 终审 M5：反射的流两个方向子密钥与 nonce 序列相同，照样能解开 |
 | 7 | 终审 | `outbounds_shadowsocks` 重载用例的断言文字改为 "an unrelated reload rebuilt S" | Task 6 评审的延后记录：原文字读反了 |
 | 8 | 门禁 | 最终门禁（终审修正 ef5701b 之后）：fmt、clippy 通过；第一轮 `cargo test --workspace --no-fail-fast` 因磁盘满编译失败（`os error 112`），删掉 `target/debug/incremental` 后以 `CARGO_INCREMENTAL=0` 重跑：55 个测试二进制 1369 通过 / 0 失败 / 2 忽略 | 终审修正加了 #5、#6 的两个用例 |
+| 9 | 合并后 | 首字节之前被重置（`ConnectionReset` / `ConnectionAborted`）时以 `ss: the server reset the connection without answering (wrong password or method?)` 失败，SS 2022 为 `… (wrong key or method, or a clock more than 30 seconds off?)`，错误类别不变；`FakeShadowsocks` 加 `reset`（拒绝时零 linger 关闭，即 RST），模块说明不再说"真实服务端都如此"；用例 `a_reset_before_any_answer_says_what_it_likely_means`；兼容性清单 `ss` 一行与手工验收的口令 / 密钥 / 时钟几项按 shadowsocks-rust 的实际做法改写 | 复查：shadowsocks-rust 对 SS 2022 的密钥、时钟、重放失败一律 RST，对旧式 AEAD 一直读下去、不回也不关；Review Focus 第 1、2 条承诺的文字对它都不会出现，用户只看到系统的"连接被重置" |
+| 10 | 合并后 | `obfs-uri` 进内联参数的脱敏名单（`SECRET_PARAMS` 19 项），用例改名为 `an_obfs_line_loses_its_host_and_path` | 复查（延后事项 #15，项目所有者同意）：与 `ws-path` 同理 |
 
 ## 延后事项
 
@@ -11560,7 +11562,7 @@ git commit -m "docs: M6a Shadowsocks——兼容性清单、手工验收、READM
 | - | ---- | ---- |
 | 1 | 流式旧方法（P5） | M8 |
 | 2 | obfs 没有可用的预编译参考服务端，真实兼容性只能手工验收（P15） | 手工验收；有可用的参考服务端时补互操作 |
-| 3 | 没有"口令错"的互操作用例（`ssserver` 对错误首块的行为未核对） | 需要时另议 |
+| 3 | 没有"口令错"的互操作用例（`ssserver` 的行为合并后已对照源码核对：SS 2022 重置连接、旧式 AEAD 一直读下去，见执行期修正 #9） | 需要时另议 |
 | 4 | 假服务端的多用户只有一层身份密钥（两层只由已知答案覆盖）；它记住的请求 salt 不过期（规范是 60 秒） | 接受（测试设施） |
 | 5 | `2022-blake3-chacha20-poly1305`（SIP022 可选，手册不列） | 手册列出时 |
 | 6 | README 路线图一行停在 M4b；总设计第 1.4 节与第 2 节的 Snell 仍写 v1 ～ v4（M6 设计已取代） | M6b 的文档任务一并订正 |
@@ -11571,3 +11573,5 @@ git commit -m "docs: M6a Shadowsocks——兼容性清单、手工验收、READM
 | 11 | SS 2022 的 UDP：服务端 session 按先进先出淘汰而不是 LRU；未知的服务端 session 先做 BLAKE3 派生再验 tag（伪造的包也花一次派生）；来源过滤只比 IP（与 socks5 相同） | 有用户报告再说 |
 | 12 | 测试：`ss.rs` 用例的 `!printed.contains("97")` 脆弱；假 obfs `tls` 服务端把截断的记录头当作干净的 EOF（测试设施） | 以后顺手改 |
 | 13 | 手工验收：时钟偏差一项可以一并写出客户端侧的 `ss: the server's clock differs from ours by <n> seconds` 文本；`ssserver` 互操作的配置只在 CI 上验证过（发布包的 SHA-256 取自 GitHub API 的 digest 字段） | 以后顺手改；CI 首跑时核对 |
+| 14 | （合并后的复查）`obfs=tls` 的首个 ClientHello 最大可到约 16 KiB：参考 obfs-server 在 stage 0 只等 session ticket 收全，Hello 跨报文段且边界落在其后的扩展里、服务端恰在两段之间读了一次时会截掉首段负载的尾部；参考客户端同样会撞上，16 KiB 的 Hello 本身也是特征。把首包压到一个报文段内（约 1200 字节）是线上行为的改动，没有参考服务端可验证，没有改 | 手工验收（obfs-server）时留意；需要时另议 |
+| 15 | （合并后的复查）`obfs-uri` 不在脱敏名单里：`ws-path` 因"CDN 后面的节点常把路径当共享密钥"而脱敏，simple-obfs 的 `http` 模式经 nginx 按路径分流时 `obfs-uri` 起同样的作用 | 已加进名单（项目所有者同意；用例 `an_obfs_line_loses_its_host_and_path`，设计第 18 节第 12 条） |

@@ -183,12 +183,12 @@
 - [ ] AEAD 的 TCP：`ss` 策略写 `encrypt-method=<方法>, password=<口令>`，`curl -x http://127.0.0.1:<http-listen 端口> https://example.com/ -I` 与 `curl --socks5-hostname 127.0.0.1:<socks5-listen 端口> https://example.com/ -I` 都返回 200，请求记录里策略链是该策略、`error` 为空；服务端先说话的协议（经代理连一个 SMTP / SSH 主机）能看到对端的欢迎行。
 - [ ] 2022 的 TCP：`encrypt-method=2022-blake3-…, password=<Base64 密钥>`，同上；本机时钟准确。
 - [ ] UDP：两个节点都加 `udp-relay=true`，经 SOCKS5 UDP 发 DNS 查询（如 Proxifier 代理 `nslookup example.com 8.8.8.8`）得到回答；经它进行一次语音通话或联机游戏；用 NAT 类型检测工具（STUN）检测，结果是 Full Cone（节点的出口须是全锥）。去掉 `udp-relay=true` 后 UDP 按 `udp-policy-not-supported-behaviour` 处理（默认 REJECT，记录写 `policy does not support UDP`）。
-- [ ] 多用户：`password=<服务端密钥>:<用户密钥>` 连多用户节点，TCP 与 UDP 都能往返；服务端日志（若有）认出的是这个用户。把用户密钥换成节点不认识的一把，连接得不到应答（`ss: the server closed the connection without answering`）。
+- [ ] 多用户：`password=<服务端密钥>:<用户密钥>` 连多用户节点，TCP 与 UDP 都能往返；服务端日志（若有）认出的是这个用户。把用户密钥换成节点不认识的一把，连接得不到应答：shadowsocks-rust 重置连接，会话记录写 `ss: the server reset the connection without answering (wrong key or method, or a clock more than 30 seconds off?)`（别的服务端直接关闭时是 `ss: the server closed the connection without answering`；记下实际是哪一个）。
 - [ ] obfs：`obfs=http, obfs-host=<伪装域名>` 与 `obfs=tls, obfs-host=<伪装域名>` 各连一次带 `obfs-server` 的节点，TCP 都能往返；抓包看到 `http` 模式的首个包是带 `Host: <伪装域名>:<端口>`（端口为 80 时不带端口）与 `Upgrade: websocket` 的 `GET` 请求，`tls` 模式的首个包是 SNI 为伪装域名的 ClientHello；不写 `obfs-host` 时伪装域名是服务器主机名。
 - [ ] `udp-port`：服务端的 UDP 另开在一个端口上（或经端口转发把 UDP 转到另一个端口），策略写 `udp-port=<该端口>`，UDP 照常往返；抓包确认 UDP 发往 `udp-port`、TCP 仍发往主端口。
-- [ ] 口令错误：把 AEAD 节点的 `password` 改错一位，重载后访问 `https://example.com/`：请求失败，会话记录的 `error` 是 `ss: the server closed the connection without answering`（或转发阶段的错误；服务端一直不回时由空闲超时结束），与服务端的其它问题分辨不出（已知差异，见兼容性清单 `ss` 一行）；**错误文本与日志都不含口令**。2022 节点把密钥换成另一把合法长度的 Base64 密钥，表现相同；把密钥写成不合法的 Base64，`rurge check` 报 `E0018` 且不引用取值。
-- [ ] 时钟偏差：2022 节点，把本机时钟拨偏 2 分钟（超出 30 秒的窗口），重复 TCP 一项：服务端不应答，会话记录的 `error` 同上一项；改回时钟后恢复正常。
-- [ ] 脱敏：`GET /v1/policies/detail?policy_name=<策略名>` 与 `GET /v1/profiles/current` 里 `password` 与 `obfs-host` 都是 `***`。
+- [ ] 口令错误：把 AEAD 节点的 `password` 改错一位，重载后访问 `https://example.com/`：请求失败：shadowsocks-rust 对旧式 AEAD 一直不回也不关，请求挂到 curl 放弃或空闲超时为止；别的服务端可能直接关闭（`ss: the server closed the connection without answering`）或重置（`ss: the server reset the connection without answering (wrong password or method?)`）；记下实际表现，它与服务端的其它问题分辨不出（已知差异，见兼容性清单 `ss` 一行）；**错误文本与日志都不含口令**。2022 节点把密钥换成另一把合法长度的 Base64 密钥：shadowsocks-rust 重置连接，`error` 是 `ss: the server reset the connection without answering (wrong key or method, or a clock more than 30 seconds off?)`；把密钥写成不合法的 Base64，`rurge check` 报 `E0018` 且不引用取值。
+- [ ] 时钟偏差：2022 节点，把本机时钟拨偏 2 分钟（超出 30 秒的窗口），重复 TCP 一项：服务端不应答（shadowsocks-rust 重置连接），会话记录的 `error` 同上一项的 2022 文本；改回时钟后恢复正常。
+- [ ] 脱敏：`GET /v1/policies/detail?policy_name=<策略名>` 与 `GET /v1/profiles/current` 里 `password`、`obfs-host` 与 `obfs-uri` 都是 `***`。
 
 ## M6b　Snell
 
@@ -197,10 +197,10 @@
 - [ ] TCP：`snell` 策略写 `psk=<psk>, version=5`，`curl -x http://127.0.0.1:<http-listen 端口> https://example.com/ -I` 与 `curl --socks5-hostname 127.0.0.1:<socks5-listen 端口> https://example.com/ -I` 都返回 200，请求记录里策略链是该策略、`error` 为空；服务端先说话的协议（经代理连一个 SMTP / SSH 主机）能看到对端的欢迎行。把 `version` 改成 4，重载后同样可用（v5 服务端接受 v4 客户端）。
 - [ ] `reuse`：`reuse=true` 时连续访问几个网站，抓包（或服务端日志）看到后面的请求走同一条 TCP 连接、没有新的握手；空闲 60 秒后这条连接被关掉。去掉 `reuse`（或 `reuse=false`）后每个请求各开一条连接。`reuse=true` 下服务端重启一次，之后的第一个请求照常成功（池里的旧连接失效时换新连接重试一次）。
 - [ ] obfs：`obfs=http, obfs-host=<伪装域名>` 连配了 `obfs = http` 的节点，TCP 与 UDP 都能往返；抓包看到首个包是带 `Host: <伪装域名>:<端口>`（端口为 80 时不带端口）与 `Upgrade: websocket` 的 `GET` 请求；不写 `obfs-host` 时伪装域名是服务器主机名（Surge 用 `bing.com`，已知差异，见兼容性清单 `snell` 一行）。
-- [ ] UDP：不需要参数（v4 / v5 自动支持 UDP），经 SOCKS5 UDP 发 DNS 查询（如 Proxifier 代理 `nslookup example.com 8.8.8.8`）得到回答；经它进行一次语音通话或联机游戏；用 NAT 类型检测工具（STUN）检测，结果是 Full Cone（节点的出口须是全锥）；抓包确认 UDP 是经一条 TCP 连接送到节点的（UDP over TCP），不写 `udp-port` 时连的是主端口。
+- [ ] UDP：不需要参数（v4 / v5 自动支持 UDP），经 SOCKS5 UDP 发 DNS 查询（如 Proxifier 代理 `nslookup example.com 8.8.8.8`）得到回答；经它进行一次语音通话或联机游戏；用 NAT 类型检测工具（STUN）检测，结果是 Full Cone（节点的出口须是全锥）；抓包确认 UDP 是经一条连到主端口的 TCP 连接送到节点的（UDP over TCP，与 TCP 同样经 Shadow TLS / obfs）。写了 `udp-port` 时 `rurge check` 报一条 `W0029`，UDP 仍走主端口：节点前面是 Shadow TLS 时（Surge 的配置里常另写 `udp-port=<snell 自己的端口>`），原样照抄这份配置，UDP 照常往返。
 - [ ] psk 错误：把 `psk` 改错一位，重载后访问 `https://example.com/`：请求失败，会话记录的 `error` 是 `snell: the server closed the connection without answering`（或 `snell: the server's data failed to decrypt (wrong psk or version?)`；记下实际是哪一个）；**错误文本与日志都不含 psk**。
 - [ ] 版本不符：删掉 `version`（Surge 的缺省是 1），`rurge check` 报一条 `W0007`：`` `snell` version 1 (the default when `version` is not written) is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT ``；运行时这条策略 REJECT，会话记录写 `policy protocol not implemented: snell v1`。`version=6` 同样是 `W0007`，会话记录写 `snell v6`。
-- [ ] 脱敏：`GET /v1/policies/detail?policy_name=<策略名>` 与 `GET /v1/profiles/current` 里 `psk` 与 `obfs-host` 都是 `***`。
+- [ ] 脱敏：`GET /v1/policies/detail?policy_name=<策略名>` 与 `GET /v1/profiles/current` 里 `psk`、`obfs-host` 与 `obfs-uri` 都是 `***`。
 
 ## M6c　HTTP/2 族
 
@@ -209,7 +209,7 @@
 - [ ] `h2-connect` 的 TCP：策略写 `h2-connect, <服务器>, <端口>, <用户名>, <口令>`（凭据写在端口之后），`curl -x http://127.0.0.1:<http-listen 端口> https://example.com/ -I` 与 `curl --socks5-hostname 127.0.0.1:<socks5-listen 端口> https://example.com/ -I` 都返回 200，请求记录里策略链是该策略、`error` 为空；把凭据改成 `username=` / `password=` 的写法，重载后同样可用。服务端先说话的协议（经代理连一个 SMTP / SSH 主机）能看到对端的欢迎行。
 - [ ] `max-streams`：缺省（3）时同时打开五六个下载（或用浏览器同时打开多个网站），服务端日志或抓包看到只有两条左右的 TLS 连接、每条上同时最多 3 条流；改成 `max-streams=1` 后每个同时进行的请求各占一条连接；全部结束、空闲 60 秒后连接被关掉。
 - [ ] 认证失败：把口令改错一位，重载后访问 `https://example.com/`：请求失败，`h2-connect` 的会话记录 `error` 是 `h2-connect: proxy authentication required`，`trust-tunnel` 的是 `trust-tunnel: authentication failed`；**错误文本与日志都不含用户名、口令与 `headers` 的值**。
-- [ ] `h2-connect` 的 UDP：加 `udp-relay=true`，经 SOCKS5 UDP 发 DNS 查询（如 Proxifier 代理 `nslookup example.com 8.8.8.8`）得到回答；轮流发往两个不同的 DNS 服务器都有回答，服务端日志（或抓包）看到每个目标一条 `connect-udp` 流（对称型，已知差异，见兼容性清单 `h2-connect` 一行）。服务端不支持 extended CONNECT 时（换一个只支持普通 CONNECT 的节点）UDP 流失败，会话记录写 `h2-connect: the server does not support extended CONNECT`，同一节点上的 TCP 照常可用。
+- [ ] `h2-connect` 的 UDP：加 `udp-relay=true`，经 SOCKS5 UDP 发 DNS 查询（如 Proxifier 代理 `nslookup example.com 8.8.8.8`）得到回答；轮流发往两个不同的 DNS 服务器都有回答，服务端日志（或抓包）看到每个目标一条 `connect-udp` 流（对称型，已知差异，见兼容性清单 `h2-connect` 一行）。服务端不支持 extended CONNECT 时（换一个只支持普通 CONNECT 的节点）UDP 流失败，会话记录写 `h2-connect: the server does not support extended CONNECT`，同一节点上的 TCP 照常可用。服务器写成 IP、另写了 `sni=<主机名>` 时，服务端日志（或抓包）里 CONNECT-UDP 请求的 `:authority` 是那个主机名。
 - [ ] `trust-tunnel` 的 TCP：策略写 `trust-tunnel, <服务器>, <端口>, username=<用户名>, password=<口令>`（服务器写成 IP 时另加 `sni=<节点的主机名>`），`curl` 经 HTTP 与 SOCKS5 两个入口都返回 200；服务端日志看到的 `User-Agent` 是 `rurge`，加 `headers=User-Agent:<自定义>` 后变成自定义值。
 - [ ] `trust-tunnel` 不载 UDP：经 SOCKS5 UDP 发 DNS 查询，`udp-policy-not-supported-behaviour` 缺省（`REJECT`）时查询没有回答，会话记录写 `policy does not support UDP`；改成 `DIRECT` 后查询直连得到回答。写 `h3=true` 时 `rurge check` 报一条 `W0029`，运行时仍按 HTTP/2 连通。
 - [ ] 休眠唤醒与换网：`h2-connect` 或 `trust-tunnel` 策略在用时（保持一个下载或反复访问网站），让电脑休眠再唤醒，或在 Wi-Fi 与有线 / 手机热点之间切换；切换后新的连接在大约“策略的连接超时 + 5 秒”内恢复（第一个请求可能超时失败，之后的请求走新建的连接），不必等十几分钟；`--log-level debug` 的日志里能看到 `the HTTP/2 connection does not answer a PING`。

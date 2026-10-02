@@ -7092,6 +7092,9 @@ git commit -m "docs: M6b Snell——兼容性清单、手工验收、README 与 
 | 6 | 终审 | `pool::is_quiet` 注明：非阻塞探测可能取到一条已收到半条记录的连接，那部分留给下一个请求——服务端随后关闭时是截断的记录（传输层失败，1 秒内照常重发），剩余部分到达而解不开时报错、不重发 | 终审：探测的这个边角没有说明；#4 之后两种结局不同，如实写出 |
 | 7 | 终审 | 兼容性清单 `snell` 行补上：重试只针对传输层的失败、解不开的应答如实报错；服务端在两帧之间关闭 TCP 连接读作这个方向干净结束，在帧边界上的截断无法察觉（截在帧中间的报错），这样的连接不回池。设计第 14 节第 4 条补上 1 秒的时间窗，新增第 15 节「M6b 实施期的订正」 | 终审：执行期的偏差没有进计划与设计；帧边界的关闭是 Task 2 评审的延后记录 |
 | 8 | 门禁 | 最终门禁（终审修正 a380b3c 之后）：fmt、clippy 通过；`cargo test --workspace --no-fail-fast` 一轮通过：57 个测试二进制 1456 通过 / 0 失败 / 2 忽略 | 终审修正加了 #4、#5 的三个用例 |
+| 9 | 合并后 | `udp-port` 只解析：`SnellSpec` 去掉 `udp_port`，`SnellRead.udp_port` 标记写了它，v4 / v5 时进 `inert`（`W0029`）；UDP 载体改用主端口的 `Dialer`，出站里为 `udp-port` 另建一套栈的闭包随之去掉；proto 用例 `udp_goes_to_the_udp_port` 删除，新增 `udp_port_on_snell_is_parsed_but_has_no_effect`（配置）与 `udp_keeps_to_the_policys_port_whatever_udp_port_says`（引擎）；引擎的干构建夹具与重载用例不再写 `udp-port` | 复查：手册的 `udp-port` 是 Shadow TLS 占着 TCP 端口时服务端另开的 UDP 端口（v5 QUIC Proxy Mode）；按 P11 把 UDP 会话的 TCP 连接连到它、照样叠 Shadow TLS，这种部署必然失败（设计第 18 节第 7 条） |
+| 10 | 合并后 | 重拨时轮询过它的任务都登记进 `Waiters`，重拨每推进一步都唤醒它们（`std::task::Wake`，无 unsafe）；用例 `a_redial_wakes_both_halves_of_the_tunnel`（第二次拨号慢 300 ms，读写两半在两个任务里） | 复查：延后 #8 的假定被 `vmess/udp.rs`（读端单独一个任务）打破，读端会被落下（实测稳定复现） |
+| 11 | 合并后 | 订阅告警里 v1 也注明 `(the default when `version` is not written)`（`NotImplemented::imported`，与 `warning` 共用 `snell_default`） | 复查：订阅里没写 `version` 的行全部变成 REJECT，提示却只说 "version 1" |
 
 ## 延后事项
 
@@ -7099,9 +7102,10 @@ git commit -m "docs: M6b Snell——兼容性清单、手工验收、README 与 
 | - | ---- | ---- |
 | 1 | `version` 1–3 与 6、v5 的 QUIC Proxy Mode | M8（需要时） |
 | 2 | v5 的动态记录大小（P4） | 接受（只影响发送方） |
-| 3 | `obfs-host` 缺省、命令字、`udp-port` 的含义与 Surge 可能不同（P6、P9、P11） | 有真实 Surge 抓包或用户报告时对齐 |
+| 3 | `obfs-host` 缺省、命令字与 Surge 可能不同（P6、P9）；`udp-port` 合并后改为只解析（`W0029`，执行期修正 #9），v5 的 QUIC Proxy Mode 实现时再让它生效 | 有真实 Surge 抓包或用户报告时对齐 |
 | 4 | 互操作数不了复用的连接数；snell-server 是否默认开 UDP 未确认（P12） | CI 首跑；手工验收 |
 | 5 | 陈旧连接的重试最多重发 64 KiB，超出就不重试（P8）；离开池后 1 秒内的传输层失败仍会重发，旧服务端若已把请求转给目标，同一个请求可能到达两次（已登记进兼容性清单） | 接受 |
 | 6 | 配置：`version` 写作 `04` 或带空格时也被接受；记录流：复用连接上第一个请求没写数据时填充标记不清除（经 `tunnel` 走不到）；池：过期的空闲连接在回收任务清掉之前最多再留约 90 秒（取用时已跳过，模块说明写得过满）；UDP：放不进缓冲的数据报丢弃时没有 `debug` 日志（同 `stream_udp`），`send_to` 写满一条记录只靠 `debug_assert`；测试：引擎参数循环的夹具与假服务端没有关闭、`requests().first()` 在 drop 之前读；兼容性清单 `[Snell Server]` 几行可注明客户端已支持 v4 / v5 | 以后顺手改 |
 | 7 | 每条记录分配一个 `Vec`（至多 128 KiB）；Snell 的 UDP 经 Shadow TLS 没有用例（假定叠起来的流的唤醒彼此独立，同 `tokio::io::split`） | 需要时另议 |
-| 8 | 隧道假定两个方向由同一个任务轮询（重拨的 future 只记得最后一个轮询者的 waker，已注释）；时间窗内重试的用例依赖失败在取出后 1 秒内到达（回环上余量充足）；池探测取到半条记录、剩余部分到达后恰是服务端的合法记录时，它被当作应答之前的数据读出（服务端违反协议才会出现） | 接受 |
+| 8 | ~~隧道假定两个方向由同一个任务轮询~~（合并后已修，执行期修正 #10）；时间窗内重试的用例依赖失败在取出后 1 秒内到达（回环上余量充足）；池探测取到半条记录、剩余部分到达后恰是服务端的合法记录时，它被当作应答之前的数据读出（服务端违反协议才会出现） | 接受 |
+| 9 | （合并后的复查）`reuse=false` 时应用半关闭，rurge 发出空记录后还对 TCP 发 FIN；参考客户端只发空记录。官方 snell-server 收到 FIN 是否拆掉整条隧道未知（若会，写完就半关闭、再等应答的应用收不到回包）；`FakeSnell` 读到空记录后也不再读，覆盖不到 | 互操作首跑时核对（CI 钉住工具链之后）；手工验收 |

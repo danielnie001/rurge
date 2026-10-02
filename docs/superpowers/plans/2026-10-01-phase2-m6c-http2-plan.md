@@ -7573,6 +7573,10 @@ git commit -m "docs: M6c HTTP/2 族——兼容性清单、手工验收、README
 | 2 | Task 4 | RED 一步里 `trust-tunnel` 的并发用例不是挂到超时，而是以 `REFUSED_STREAM` 失败 | 同一个根因：池发出的流超过了服务端的上限 |
 | 3 | Task 5（评审） | 代理对 CONNECT-UDP 答 2xx 后立刻结束每条流时，`send_to` 会无限次重开流；改为每个数据报至多重开一次，仍被结束时该数据报失败（`ConnectionAborted`，`h2-connect: the server ended the UDP stream`）；`H2ProxyScript.udp_end_at_once` 与用例 `streams_ended_at_once_are_reopened_only_once`；没有 extended CONNECT 的用例另外断言 TCP 隧道用的是同一条连接 | 评审发现的无界循环 |
 | 4 | 终审 | 请求没得到应答头（调用方超时放弃或流出错；服务端答了任何状态码都不算）时，连接的驱动任务用已有的 PING 句柄检查它是否还活着，5 秒（`LIVENESS_TIMEOUT`）没有回应就不再分配新流、下一个请求新建连接，慢目标不受影响（用例 `a_connection_that_stops_answering_is_let_go_of`、`a_slow_target_does_not_cost_its_connection`）；`proxy-authorization` 与 `headers` 配置的字段以 HPACK never-indexed 发送（用例 `credentials_and_configured_headers_are_never_indexed`）；收到 SETTINGS 之前就断掉的连接报连接失败，不再报 `the server does not support extended CONNECT`（用例 `a_connection_that_ends_before_its_settings_is_a_connection_failure`）；`a_silent_proxy_times_out` 的连接超时从 300 毫秒改为 2 秒 | 终审：静默死掉的连接（休眠唤醒、换网、NAT 重绑）会一直接下新请求；凭据不应进 HPACK 动态表；错误归因不对；用例在慢机器上偶发失败 |
+| 5 | 合并后 | 会话池按需求并行拨号：去掉一次只拨一条的锁，连接与拨号的计数合进同一把锁（`State`）；在途的每次拨号算作 `max-streams` 个位置，放不下的请求再拨，至多 8 条（`MAX_DIALS`）；请求等着的拨号都失败时共享失败；已承载 `max-streams` 条流的未定连接不再等它的 SETTINGS（用例 `a_burst_dials_the_connections_it_needs_at_once`、`a_full_connection_is_not_waited_for_before_its_settings`）；`max_streams_bounds_each_connection` 的断言改为比较每条连接承载的流数（两次拨号谁先完成不再固定） | 复查：12 个并发请求（max-streams=3）拨 4 条连接要串行等 4 次拨号，`max-streams=1` 时每条都白等一个往返（实测）；P5 / P6 写的"多一个往返"低估了 |
+| 6 | 合并后 | 得知 SETTINGS 的 PING 套上 `LIVENESS_TIMEOUT`，超时即标死并放行等 SETTINGS 的请求（用例 `a_connection_whose_settings_never_come_is_let_go_of`） | 复查：TLS 完成后、SETTINGS 到达前静默断掉的连接会一个接一个吞掉之后的请求，直到 TCP 超时（实测间隔 30 秒的 5 个请求全部失败、只拨过 1 次）；终审记的"窗口约 1 RTT"低估了后果 |
+| 7 | 合并后 | 连接窗口取 `max-streams` × 1 MiB（至少 4 MiB），不再固定 4 MiB（用例 `stalled_streams_leave_the_connection_room`） | 复查：`max-streams` ≥ 4 时读端停住的流能占光连接窗口 |
+| 8 | 合并后 | CONNECT-UDP 的 `:authority` 取 TLS 的名字（`sni=` 写了时是它；`build::tls_name` 与 Shadow TLS 共用，用例 `connect_udp_names_the_server_as_its_tls_does`）；`headers` 里的 `host` 加载时 `W0028` 并去掉（用例 `a_host_header_is_dropped`）；`HeaderTemplate` 的 `Debug` 不再打印值（用例 `the_specs_do_not_print_header_values`） | 复查：RFC 9298 3.4 / RFC 9113 8.3.1；设计第 6 节"`headers` 的值不进 `Debug`" |
 
 ## 延后事项
 
@@ -7584,4 +7588,8 @@ git commit -m "docs: M6c HTTP/2 族——兼容性清单、手工验收、README
 | 4 | 服务端有 ALPN 但与 `h2` 不重合时的报错是 rustls 的原文（P7） | 接受 |
 | 5 | 一个请求在挑中连接之后、发出之前连接死掉时不重试（P5） | 有用户报告再说 |
 | 6 | 互操作数不了 endpoint 那边的连接数（连接数由 `FakeH2Proxy` 覆盖） | 接受 |
-| 7 | 通告 `SETTINGS_MAX_CONCURRENT_STREAMS = 0` 的服务端：每条新连接上被拒一条流，之后该连接空闲 60 秒才关闭（只影响行为不当的服务端；自"SETTINGS 之前只放一条流"之后，`h2pool::lease` 里 "accepts no streams" 的错误分支已走不到） | 有用户报告再说 |
+| 7 | 通告 `SETTINGS_MAX_CONCURRENT_STREAMS = 0` 的服务端：每条新连接上被拒一条流，之后该连接空闲 60 秒才关闭（只影响行为不当的服务端；自"SETTINGS 之前只放一条流"之后，`h2pool` 拨号后取第一个位置时 "accepts no streams" 的错误分支已走不到） | 有用户报告再说 |
+| 8 | （合并后的复查）`h2` 0.4.19 的 `data_frame_budget` 缺省取连接窗口的一半：一条读端停住的流、对端持续发小于 256 字节的 DATA 帧时，预算耗尽，`h2` 以 GOAWAY(ENHANCE_YOUR_CALM) 关掉整条连接上的隧道（源码核实，未实测；连接窗口随 `max-streams` 增大后预算也随之增大）。放大预算是在内存保护上让步，没有改 | 有用户报告再说 |
+| 9 | （合并后的复查）CONNECT-UDP 已有目标的数据报不经过 `pool.open`，存活检查不会被 UDP 触发：只发 UDP、换网后静默死掉的连接上，持续发包的目标会黑洞到系统放弃这条 TCP（trojan / vmess / snell 的 UDP 同样没有存活检查） | 需要时另议（例如"发了包而长时间没有回包"时请求一次检查） |
+| 10 | （合并后的复查）`streams_ended_at_once_are_reopened_only_once` 没有断言 `h2-connect: the server ended the UDP stream` 的文字：单线程运行时里读任务总在检查之后才运行，那条路走不到，用例实际只证明"至多 2 次请求"；同一个无界循环在 `vmess/udp.rs` 的拷贝里还没有修（M5b 的遗留），多线程运行时下才会出现，写不出稳定的失败用例 | 需要时另议（给读任务加可注入的同步点） |
+| 11 | （合并后的复查）小项：DATAGRAM 超长检查在解析 context id 之前（RFC 9297 3.5 对非 0 context id 只要求丢弃）；多线程下重开失败的路径罕见地把已结束的流留在表里，直到该目标的下一个包；`te: trailers` 在 HTTP/2 本是允许的，配置层一并去掉（过严、无害）；`h2connect/udp.rs` 与 `vmess/udp.rs` 的每目标载体几乎逐行重复 | 以后顺手改 |
