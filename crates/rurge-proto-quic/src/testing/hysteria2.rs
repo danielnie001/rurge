@@ -8,12 +8,15 @@
 //! TCP requests and the UDP messages by the code here, which also writes
 //! the answers — every length in them in two bytes, as QUIC allows — and
 //! splits a UDP answer too long for one datagram into fragments of its
-//! own. It never resolves a name.
+//! own. It never resolves a name. Scripted so, its socket obfuscates as
+//! well, Salamander or Gecko, with code of its own too (`obfs`).
 
 use super::ServerPort;
+use super::obfs::{RecordedFragment, ServerObfs};
 use quinn::{
     AsyncUdpSocket, Connection, Endpoint, SendDatagramError, ServerConfig, TransportConfig, VarInt,
 };
+use rurge_config::spec::Hysteria2Obfs;
 use rurge_net::quic::h3::testing::{H3Server, ServerStream};
 use rurge_net::quic::testing::{TestCert, endpoint};
 use rustls::RootCertStore;
@@ -57,6 +60,8 @@ pub struct Hysteria2Script {
     /// Relay here whatever the client asked for, TCP and UDP alike (needed
     /// for a name).
     pub connect_to: Option<SocketAddr>,
+    /// Obfuscate every packet so, with this password.
+    pub obfs: Option<Hysteria2Obfs>,
 }
 
 /// An authentication request.
@@ -199,6 +204,8 @@ struct Shared {
     udp: Mutex<Vec<RecordedUdp>>,
     /// Each UDP session's own socket, in the order they opened.
     outside: Mutex<Vec<SocketAddr>>,
+    /// The client's Gecko fragments, as the endpoints' sockets read them.
+    fragments: Arc<Mutex<Vec<RecordedFragment>>>,
     /// The fragment the next UDP answer in fragments goes without.
     drop_fragment: Mutex<Option<u8>>,
     /// Restart once the next TCP request came.
@@ -260,6 +267,7 @@ impl FakeHysteria2 {
         let addr = socket.local_addr().expect("the socket's address");
         let fake = FakeHysteria2::new(script, addr, None);
         let config = fake.inner.server_config();
+        let socket = fake.inner.obfuscated(socket);
         fake.inner.listen(endpoint(config, socket));
         fake
     }
@@ -278,6 +286,7 @@ impl FakeHysteria2 {
                 requests: Mutex::default(),
                 udp: Mutex::default(),
                 outside: Mutex::default(),
+                fragments: Arc::default(),
                 restart_at_request: AtomicBool::new(false),
                 fake: fake.clone(),
             }),
@@ -315,6 +324,16 @@ impl FakeHysteria2 {
     /// sends to one is heard by the client.
     pub fn udp_outside(&self) -> Vec<SocketAddr> {
         self.inner.shared.outside.lock().expect("outside").clone()
+    }
+
+    /// Every Gecko fragment of the client's it read, in arrival order.
+    pub fn gecko_fragments(&self) -> Vec<RecordedFragment> {
+        self.inner
+            .shared
+            .fragments
+            .lock()
+            .expect("fragments")
+            .clone()
     }
 
     /// Sends `message`, as it is, to the client on connection `n`.
@@ -378,10 +397,22 @@ impl Inner {
         config
     }
 
+    /// `socket` under the script's obfuscation, if any.
+    fn obfuscated(&self, socket: Arc<dyn AsyncUdpSocket>) -> Arc<dyn AsyncUdpSocket> {
+        let (password, gecko) = match &self.shared.script.obfs {
+            None => return socket,
+            Some(Hysteria2Obfs::Salamander(password)) => (password, false),
+            Some(Hysteria2Obfs::Gecko(password)) => (password, true),
+        };
+        let heard = self.shared.fragments.clone();
+        Arc::new(ServerObfs::new(socket, password.expose(), gecko, heard))
+    }
+
     /// A new endpoint takes the port over; the one before falls silent.
     fn take_over(&self) {
         let port = self.port.as_ref().expect("a fake on a port of its own");
-        self.listen(port.endpoint(self.server_config()));
+        let endpoint = port.endpoint_over(self.server_config(), |socket| self.obfuscated(socket));
+        self.listen(endpoint);
     }
 
     /// Serves on `endpoint` until the fake is dropped.

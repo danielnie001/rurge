@@ -3479,6 +3479,7 @@ dependencies = [
 name = "rurge-proto-quic"
 version = "0.1.0"
 dependencies = [
+ "blake2 0.10.6",
  "bytes",
  "getrandom 0.3.4",
  "http",

@@ -9,4 +9,4 @@ pub mod testing;
 mod varint;
 
 pub use hysteria2::Hysteria2Outbound;
-pub use session::{Dialer, Failure, Lease, Protocol, Session};
+pub use session::{Dialer, Failure, Layer, Lease, Protocol, Session};

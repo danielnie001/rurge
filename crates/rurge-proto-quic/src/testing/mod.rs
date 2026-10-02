@@ -4,10 +4,12 @@
 //! used by production code.
 
 mod hysteria2;
+mod obfs;
 
 pub use hysteria2::{
     FakeHysteria2, Hysteria2Script, RecordedAuth, RecordedTcp, RecordedUdp, UdpMessage,
 };
+pub use obfs::RecordedFragment;
 
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{
@@ -57,6 +59,16 @@ impl ServerPort {
     /// A server endpoint presenting `config` that answers on the port from
     /// now on; the one before it falls silent.
     pub fn endpoint(&self, config: ServerConfig) -> Endpoint {
+        self.endpoint_over(config, |socket| socket)
+    }
+
+    /// As `endpoint`, its packets through what `layer` lays over the port
+    /// (a fake's obfuscation): a layer of its own for each endpoint.
+    pub fn endpoint_over(
+        &self,
+        config: ServerConfig,
+        layer: impl FnOnce(Arc<dyn AsyncUdpSocket>) -> Arc<dyn AsyncUdpSocket>,
+    ) -> Endpoint {
         let gate = Arc::new(Gate {
             socket: self.socket.clone(),
             open: AtomicBool::new(true),
@@ -68,7 +80,7 @@ impl ServerPort {
         Endpoint::new_with_abstract_socket(
             self.config.clone(),
             Some(config),
-            gate,
+            layer(gate),
             Arc::new(TokioRuntime),
         )
         .expect("a server endpoint")

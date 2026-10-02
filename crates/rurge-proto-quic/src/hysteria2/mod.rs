@@ -10,13 +10,17 @@
 //!   association a session of its own there (`udp`).
 //! - Requests and the authentication are padded as the reference client
 //!   pads them: letters and digits, of a random length.
+//! - With `salamander-password` or `gecko-password`, every UDP packet of the
+//!   connection is obfuscated (`obfs`).
 
 mod auth;
+mod obfs;
 mod tcp;
 mod udp;
 
 use crate::session::{Dialer, Session};
 use auth::Auth;
+use obfs::Obfuscation;
 use rurge_config::KeystoreItem;
 use rurge_config::spec::{Hysteria2Spec, Tristate};
 use rurge_net::BoxFuture;
@@ -70,7 +74,7 @@ pub struct Hysteria2Outbound {
 
 impl Hysteria2Outbound {
     /// The connection goes as `connector` dials (design 3.3), with the
-    /// policy's `ecn`; `client-cert` comes from `keystore`.
+    /// policy's `ecn` and obfuscation; `client-cert` comes from `keystore`.
     pub fn new(
         name: &str,
         server: Target,
@@ -92,9 +96,13 @@ impl Hysteria2Outbound {
                 "`password` cannot be sent in an HTTP field",
             ));
         };
-        let dialer = Dialer::new(
+        let mut dialer = Dialer::new(
             connector, server, &spec.tls, &spec.quic, ecn, keystore, roots,
         )?;
+        if let Some(obfs) = &spec.obfs {
+            let obfuscation = Obfuscation::new(obfs)?;
+            dialer = dialer.with_layer(Box::new(move |socket| obfuscation.over(socket)));
+        }
         Ok(Hysteria2Outbound {
             name: name.to_string(),
             session: Arc::new(Session::new(name, dialer, auth)),
@@ -160,7 +168,7 @@ mod tests {
     use quinn::{ConnectionError, VarInt};
     use rurge_config::policy::parse_policy;
     use rurge_config::spec::hysteria2::read_hysteria2;
-    use rurge_config::spec::{CommonOpts, ParamReader, PortHopping};
+    use rurge_config::spec::{CommonOpts, Hysteria2Obfs, ParamReader, PortHopping};
     use rurge_config::{HostName, Span};
     use rurge_net::connector::{
         BoxedDatagram, DirectConnector, PacketSocket, Route, SystemResolve,
@@ -1284,5 +1292,196 @@ mod tests {
             "{log}"
         );
         assert!(!log.contains("payload-7c1e9a"));
+    }
+
+    fn obfuscated(obfs: Hysteria2Obfs) -> Hysteria2Script {
+        Hysteria2Script {
+            obfs: Some(obfs),
+            ..script("pw")
+        }
+    }
+
+    /// Design 5.4: TCP and UDP through Salamander, and through Gecko, whose
+    /// handshake goes in 2 to 8 fragments of 512 to 1200 bytes. A server
+    /// that restarts says so through it as well: its stateless reset ends
+    /// the tunnel under way, and the next one comes up on a new connection.
+    #[tokio::test]
+    async fn tcp_and_udp_go_through_either_obfuscation() {
+        let (tcp_echo, udp_echo) = (echo_server().await, udp_echo_server().await);
+        for (param, obfs) in [
+            (
+                "salamander-password=obfs",
+                Hysteria2Obfs::Salamander("obfs".into()),
+            ),
+            ("gecko-password=obfs", Hysteria2Obfs::Gecko("obfs".into())),
+        ] {
+            let gecko = matches!(obfs, Hysteria2Obfs::Gecko(_));
+            let fake = FakeHysteria2::spawn(obfuscated(obfs));
+            let out = outbound(&fake, &format!("password=pw, {param}"));
+            let mut before = tunnel(&out, &target(tcp_echo)).await;
+            let payload: Vec<u8> = (0..1 << 20).map(|i| (i % 251) as u8).collect();
+            round_trip(&mut before, &payload).await;
+            let carrier = udp_carrier(&out).await;
+            udp_round_trip(carrier.as_ref(), udp_echo, b"short").await;
+            // in Hysteria's own fragments too, both ways
+            udp_round_trip(carrier.as_ref(), udp_echo, &[7; 3000]).await;
+            let fragments = fake.gecko_fragments();
+            if gecko {
+                assert!(!fragments.is_empty());
+                for fragment in &fragments {
+                    assert!((2..=8).contains(&fragment.count), "{fragment:?}");
+                    assert!((512..=1200).contains(&fragment.datagram), "{fragment:?}");
+                }
+            } else {
+                assert!(fragments.is_empty(), "{fragments:?}");
+            }
+
+            fake.restart();
+            // room for a keep-alive (10 seconds) to bring the reset, should
+            // the lost endpoint have acknowledged the request
+            let opts = ConnectOpts {
+                timeout: Duration::from_secs(25),
+            };
+            let mut after = timeout(
+                Duration::from_secs(30),
+                out.connect_tcp(&target(tcp_echo), &opts),
+            )
+            .await
+            .expect("an outcome within the bound")
+            .expect("a tunnel");
+            round_trip(&mut after, b"after a restart").await;
+            let mut rest = Vec::new();
+            let err = timeout(BOUND, before.read_to_end(&mut rest))
+                .await
+                .expect("the end of the tunnel")
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "quic: the server no longer knows the connection (stateless reset)"
+            );
+            assert_eq!(fake.connections(), 2);
+        }
+    }
+
+    /// A client and a server that do not obfuscate alike never bring a
+    /// connection up: neither reads what the other sends. The request fails
+    /// by its time, not later.
+    #[tokio::test]
+    async fn obfuscation_that_does_not_match_fails_by_the_time_of_the_request() {
+        let echo = echo_server().await;
+        let opts = ConnectOpts {
+            timeout: Duration::from_millis(500),
+        };
+        let salamander = |password: &str| Some(Hysteria2Obfs::Salamander(password.into()));
+        let gecko = |password: &str| Some(Hysteria2Obfs::Gecko(password.into()));
+        let mut cases = JoinSet::new();
+        for (server, client) in [
+            (salamander("right"), ", salamander-password=wrong"),
+            (gecko("right"), ", gecko-password=wrong"),
+            (salamander("right"), ", gecko-password=right"),
+            (gecko("right"), ""),
+            (None, ", salamander-password=right"),
+        ] {
+            let opts = opts.clone();
+            cases.spawn(async move {
+                let fake = FakeHysteria2::spawn(Hysteria2Script {
+                    obfs: server,
+                    ..script("pw")
+                });
+                let out = outbound(&fake, &format!("password=pw{client}"));
+                let started = Instant::now();
+                let err = out.connect_tcp(&target(echo), &opts).await.err().unwrap();
+                (client, err, started.elapsed(), fake.connections())
+            });
+        }
+        while let Some(case) = cases.join_next().await {
+            let (client, err, took, connections) = case.unwrap();
+            assert!(matches!(err, OutboundError::Timeout), "{client}: {err}");
+            assert!(took < Duration::from_secs(2), "{client}: {took:?}");
+            assert_eq!(connections, 0, "{client}");
+        }
+    }
+
+    /// Design 3.3 and 5.4: the obfuscation is the outermost layer; over
+    /// port hopping, its datagrams go from each hop's socket in turn.
+    #[tokio::test]
+    async fn obfuscated_tunnels_keep_working_while_the_port_hops() {
+        let echo = echo_server().await;
+        let ports = MultiPort::bind(3);
+        let fake = FakeHysteria2::spawn_on(
+            obfuscated(Hysteria2Obfs::Gecko("obfs".into())),
+            ports.clone(),
+        );
+        let mut spec = spec(9, "password=pw, gecko-password=obfs");
+        spec.quic.port_hopping = Some(PortHopping {
+            ports: ports.ports().iter().map(|&p| p..=p).collect(),
+            interval: Duration::from_millis(100),
+        });
+        let out = outbound_with(&spec, 9, &fake);
+        let mut early = tunnel(&out, &target(echo)).await;
+        let deadline = Instant::now() + BOUND;
+        while ports.heard().iter().filter(|&&n| n > 0).count() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "heard only on {:?}",
+                ports.heard()
+            );
+            round_trip(&mut early, b"hop").await;
+        }
+        let mut late = tunnel(&out, &target(echo)).await;
+        round_trip(&mut late, b"after a hop").await;
+        round_trip(&mut early, b"still there").await;
+        assert!(ports.clients() >= 2, "a new local socket per hop");
+        assert_eq!(fake.connections(), 1);
+        assert!(!fake.gecko_fragments().is_empty());
+    }
+
+    /// Design 5.4: over an underlying proxy's carrier as well.
+    #[tokio::test]
+    async fn obfuscation_goes_over_an_underlying_proxys_carrier() {
+        let (tcp_echo, udp_echo) = (echo_server().await, udp_echo_server().await);
+        let fake = FakeHysteria2::spawn(obfuscated(Hysteria2Obfs::Salamander("obfs".into())));
+        let carried = Arc::new(Rerouted {
+            inner: DirectConnector::new(Arc::new(SystemResolve)),
+            route: Mutex::new(Arc::new(1)),
+        });
+        let port = fake.addr().port();
+        let out = Hysteria2Outbound::new(
+            "H",
+            Target::new(HostName::parse("127.0.0.1"), port),
+            &spec(port, "password=pw, salamander-password=obfs"),
+            Tristate::Auto,
+            &[],
+            fake.roots(),
+            carried,
+        )
+        .unwrap();
+        let mut stream = tunnel(&out, &target(tcp_echo)).await;
+        round_trip(&mut stream, b"carried, obfuscated").await;
+        let carrier = udp_carrier(&out).await;
+        udp_round_trip(carrier.as_ref(), udp_echo, b"udp too").await;
+    }
+
+    /// The obfuscation password keys the packets and goes nowhere else:
+    /// not into an error, nor into a log line at any level.
+    #[tokio::test]
+    async fn the_obfuscation_password_never_shows() {
+        const OBFS: &str = "s3cret-obfs";
+        let (log, _logging, _second) = Log::capture();
+        let echo = echo_server().await;
+        let fake = FakeHysteria2::spawn(obfuscated(Hysteria2Obfs::Gecko(OBFS.into())));
+        let out = outbound(&fake, &format!("password=pw, gecko-password={OBFS}"));
+        let mut stream = tunnel(&out, &target(echo)).await;
+        round_trip(&mut stream, b"obfuscated").await;
+        let other = outbound(&fake, &format!("password=pw, gecko-password={OBFS}-not"));
+        let opts = ConnectOpts {
+            timeout: Duration::from_millis(300),
+        };
+        let err = other.connect_tcp(&target(echo), &opts).await.err().unwrap();
+        let shown = format!("{err} {err:?}");
+        assert!(!shown.contains(OBFS), "{shown}");
+        let log = log.text();
+        assert!(!log.is_empty());
+        assert!(!log.contains(OBFS));
     }
 }

@@ -28,7 +28,7 @@
 //! - Nothing here bounds how long a request takes: the caller's
 //!   `opts.timeout` covers the dial, both handshakes and the request.
 
-use quinn::{Connection, ConnectionError, VarInt};
+use quinn::{AsyncUdpSocket, Connection, ConnectionError, VarInt};
 use rurge_config::KeystoreItem;
 use rurge_config::spec::{PortHopping, QuicOpts, TlsOpts, Tristate};
 use rurge_net::BoxFuture;
@@ -50,9 +50,13 @@ use tokio_util::task::AbortOnDropHandle;
 /// it (as the HTTP/2 pool, phase 2 M6 design 5.2).
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// What a protocol lays over each connection's socket, outermost: over the
+/// hops and the carrier too (Hysteria 2's obfuscation, design 5.4).
+pub type Layer = Box<dyn Fn(Arc<dyn AsyncUdpSocket>) -> Arc<dyn AsyncUdpSocket> + Send + Sync>;
+
 /// How a session's connections are made (design 3.2, 3.3): the UDP path to
-/// the server, then QUIC's handshake with the policy's TLS. Built once per
-/// outbound.
+/// the server — under what the protocol lays over it (`with_layer`) —, then
+/// QUIC's handshake with the policy's TLS. Built once per outbound.
 pub struct Dialer {
     connector: Arc<dyn Connector>,
     server: Target,
@@ -61,6 +65,7 @@ pub struct Dialer {
     config: quinn::ClientConfig,
     /// What TLS verifies and sends as SNI (none for an IP address).
     server_name: String,
+    layer: Option<Layer>,
 }
 
 impl Dialer {
@@ -87,13 +92,22 @@ impl Dialer {
             ecn,
             config,
             server_name: tls.server_name,
+            layer: None,
         })
+    }
+
+    /// Lays `layer` over every connection's socket.
+    pub fn with_layer(self, layer: Layer) -> Dialer {
+        Dialer {
+            layer: Some(layer),
+            ..self
+        }
     }
 
     /// A new connection to the server: nothing bounds it here but quinn's
     /// idle timer.
     async fn connect(&self, opts: &ConnectOpts) -> io::Result<Connection> {
-        let path = Path::open(
+        let mut path = Path::open(
             self.connector.as_ref(),
             &self.server,
             self.hopping.as_ref(),
@@ -101,6 +115,9 @@ impl Dialer {
             opts,
         )
         .await?;
+        if let Some(layer) = &self.layer {
+            path.socket = layer(path.socket);
+        }
         quic::connect(path, &self.config, &self.server_name).await
     }
 
