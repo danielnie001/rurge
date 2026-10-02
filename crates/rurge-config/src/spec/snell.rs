@@ -30,8 +30,6 @@ pub struct SnellSpec {
     /// `reuse`: a finished stream hands its connection back for the next
     /// request (ConnectV2).
     pub reuse: bool,
-    /// `udp-port`: where UDP goes; `None`: the policy's port.
-    pub udp_port: Option<u16>,
     /// `obfs`: only `http` on versions 4 and 5.
     pub obfs: Option<ObfsOpts>,
 }
@@ -42,6 +40,11 @@ pub struct SnellSpec {
 pub struct SnellRead {
     pub spec: SnellSpec,
     pub not_implemented_version: Option<u8>,
+    /// `udp-port` is written. It serves v5's QUIC proxy mode, which is not
+    /// implemented: UDP keeps to the policy's own port and layers (behind
+    /// Shadow TLS, `udp-port` names the bare server), so the caller reports
+    /// it as having no effect (`W0029`).
+    pub udp_port: bool,
 }
 
 /// Surge's default when `version` is not written.
@@ -92,9 +95,9 @@ pub fn read_snell(r: &mut ParamReader<'_>) -> SnellRead {
     let udp_port = match r.number::<u16>("udp-port", "a port from 1 to 65535") {
         Some(0) => {
             r.invalid("udp-port", "0", "a port from 1 to 65535");
-            None
+            false
         }
-        port => port,
+        port => port.is_some(),
     };
     let obfs = match number {
         Some(6) => {
@@ -119,10 +122,10 @@ pub fn read_snell(r: &mut ParamReader<'_>) -> SnellRead {
             version,
             psk: psk.into(),
             reuse,
-            udp_port,
             obfs,
         },
         not_implemented_version: number.filter(|n| !matches!(n, 4 | 5)),
+        udp_port,
     }
 }
 
@@ -156,7 +159,7 @@ mod tests {
         assert_eq!(spec.version, SnellVersion::V4);
         assert_eq!(spec.psk.expose(), "xxx");
         assert!(!spec.reuse);
-        assert_eq!(spec.udp_port, None);
+        assert!(!got.udp_port);
         let obfs = spec.obfs.expect("obfs");
         assert_eq!(
             (obfs.mode, obfs.host, obfs.uri.as_str()),
@@ -174,7 +177,7 @@ mod tests {
         let spec = got.spec;
         assert_eq!((spec.version, spec.version.number()), (SnellVersion::V5, 5));
         assert!(spec.reuse);
-        assert_eq!(spec.udp_port, Some(8443));
+        assert!(got.udp_port);
         let obfs = spec.obfs.expect("obfs");
         assert_eq!(
             (obfs.mode, obfs.host.as_deref(), obfs.uri.as_str()),

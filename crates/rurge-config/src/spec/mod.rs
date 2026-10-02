@@ -162,17 +162,10 @@ impl NotImplemented {
             NotImplemented::SsStreamCipher(method) => format!(
                 "`ss` stream cipher `{method}` is not implemented yet; such policies behave as REJECT"
             ),
-            NotImplemented::SnellVersion(n) => {
-                // Surge's default: many lines never say which version they are
-                let default = if *n == 1 {
-                    " (the default when `version` is not written)"
-                } else {
-                    ""
-                };
-                format!(
-                    "`snell` version {n}{default} is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT"
-                )
-            }
+            NotImplemented::SnellVersion(n) => format!(
+                "`snell` version {n}{} is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT",
+                snell_default(*n)
+            ),
         }
     }
 
@@ -194,8 +187,18 @@ impl NotImplemented {
             NotImplemented::SsStreamCipher(method) => {
                 format!("`ss` with the stream cipher `{method}`")
             }
-            NotImplemented::SnellVersion(n) => format!("`snell` version {n}"),
+            NotImplemented::SnellVersion(n) => format!("`snell` version {n}{}", snell_default(*n)),
         }
+    }
+}
+
+/// Surge's default `snell` version is 1: many lines never say which version
+/// they are.
+fn snell_default(version: u8) -> &'static str {
+    if version == 1 {
+        " (the default when `version` is not written)"
+    } else {
+        ""
     }
 }
 
@@ -352,6 +355,9 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             not_implemented = read
                 .not_implemented_version
                 .map(NotImplemented::SnellVersion);
+            if read.udp_port && not_implemented.is_none() {
+                notes.inert.push("udp-port");
+            }
             (common, ProtoSpec::Snell(read.spec))
         }
         PolicyKind::AnyTls => {
@@ -914,13 +920,34 @@ mod tests {
         );
     }
 
+    /// `udp-port` serves Snell v5's QUIC proxy mode, which is not
+    /// implemented: UDP keeps to the policy's own port and layers, and the
+    /// value is only checked.
+    #[test]
+    fn udp_port_on_snell_is_parsed_but_has_no_effect() {
+        for version in [4, 5] {
+            let o = outcome(
+                "N",
+                &format!("snell, h.test, 443, psk=pw, version={version}, udp-port=8443"),
+            );
+            assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+            assert_eq!(o.inert, ["udp-port"], "version {version}");
+            assert!(o.spec.is_some(), "version {version}");
+        }
+        // a version that is not implemented has a word of its own already
+        let o = outcome("N", "snell, h.test, 443, psk=pw, version=3, udp-port=8443");
+        assert!(o.inert.is_empty(), "{:?}", o.inert);
+        let o = outcome("N", "snell, h.test, 443, psk=pw, version=5, udp-port=0");
+        assert_eq!(o.diagnostics[0].code, codes::E_INVALID_POLICY_PARAM);
+    }
+
     /// A `snell` line is read and checked in full; a version other than 4
     /// and 5 has no spec and says why (M6-D2).
     #[test]
     fn a_snell_line_is_checked_and_other_versions_are_not_implemented() {
         let o = outcome(
             "N",
-            "snell, h.test, 443, psk=pw, version=5, reuse=true, udp-port=8443, obfs=http, obfs-host=cdn.test, shadow-tls-password=st, shadow-tls-version=3, shadow-tls-sni=site.test",
+            "snell, h.test, 443, psk=pw, version=5, reuse=true, obfs=http, obfs-host=cdn.test, shadow-tls-password=st, shadow-tls-version=3, shadow-tls-sni=site.test",
         );
         assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
         assert!(o.inert.is_empty(), "{:?}", o.inert);
@@ -929,10 +956,7 @@ mod tests {
         let ProtoSpec::Snell(snell) = &spec.proto else {
             panic!("{:?}", spec.proto)
         };
-        assert_eq!(
-            (snell.version, snell.reuse, snell.udp_port),
-            (SnellVersion::V5, true, Some(8443))
-        );
+        assert_eq!((snell.version, snell.reuse), (SnellVersion::V5, true));
         assert_eq!(snell.obfs.as_ref().map(|o| o.mode), Some(ObfsMode::Http));
         assert!(spec.shadow_tls.is_some());
 
@@ -946,7 +970,11 @@ mod tests {
             "`snell` version 1 (the default when `version` is not written) is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT"
         );
         assert_eq!(why.note(), "snell v1");
-        assert_eq!(why.imported(), "`snell` version 1");
+        // an imported line without `version` says so too
+        assert_eq!(
+            why.imported(),
+            "`snell` version 1 (the default when `version` is not written)"
+        );
         let o = outcome("N", "snell, h.test, 443, psk=pw, version=6");
         let why = o.not_implemented.expect("version 6");
         assert_eq!(
@@ -954,6 +982,7 @@ mod tests {
             "`snell` version 6 is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT"
         );
         assert_eq!(why.note(), "snell v6");
+        assert_eq!(why.imported(), "`snell` version 6");
 
         // a broken line is an error like any other, and not "not implemented"
         let o = outcome("N", "snell, h.test, 443, version=2");
@@ -987,7 +1016,6 @@ mod tests {
                 version: SnellVersion::V4,
                 psk: "pw".into(),
                 reuse: false,
-                udp_port: None,
                 obfs: None,
             })
             .keystore_item(),

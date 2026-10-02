@@ -1086,7 +1086,7 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
                 ),
                 (
                     codes::W_PROTOCOL_NOT_IMPLEMENTED,
-                    "policy group `G`: imported policies of type `snell` version 1 are not implemented in this version; they behave as REJECT".to_string()
+                    "policy group `G`: imported policies of type `snell` version 1 (the default when `version` is not written) are not implemented in this version; they behave as REJECT".to_string()
                 ),
                 (
                     codes::W_PROTOCOL_NOT_IMPLEMENTED,

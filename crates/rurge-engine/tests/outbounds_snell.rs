@@ -279,6 +279,29 @@ async fn udp_goes_through_snell() {
     assert_eq!(fake.connections(), 1);
 }
 
+/// `udp-port` serves v5's QUIC proxy mode, which rurge does not implement:
+/// UDP keeps to the policy's own port. Behind Shadow TLS `udp-port` names
+/// the bare server, which a camouflage handshake cannot reach.
+#[tokio::test]
+async fn udp_keeps_to_the_policys_port_whatever_udp_port_says() {
+    let fake = FakeSnell::spawn(SnellScript::new("s3same")).await;
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let h = through(&snell_line(
+        &fake,
+        &format!("psk=s3same, version=5, udp-port={closed}"),
+    ))
+    .await;
+    let (echo, _) = udp_echo().await;
+    let association = udp_associate(h.socks()).await;
+    association.send("127.0.0.1", echo.port(), b"hello").await;
+    assert_eq!(association.recv().await, (echo, b"hello".to_vec()));
+    assert_eq!(fake.connections(), 1);
+}
+
 /// Full cone: whoever reaches the server's socket for this client reaches
 /// the client, under its own address.
 #[tokio::test]
@@ -302,7 +325,7 @@ async fn anyone_may_answer_through_snell() {
 
 /// The outbound — and with it the idle connection `reuse` keeps — is kept
 /// across a reload that leaves the line alone, and rebuilt when its PSK,
-/// version, `reuse`, obfs or `udp-port` changes (design 6).
+/// version, `reuse` or obfs changes (design 6).
 #[tokio::test]
 async fn a_reload_keeps_an_unchanged_snell_policy_and_rebuilds_a_changed_one() {
     let echo = rurge_proto::testing::echo_server().await;
@@ -343,7 +366,6 @@ async fn a_reload_keeps_an_unchanged_snell_policy_and_rebuilds_a_changed_one() {
         "psk=0ther, version=5, reuse=true",
         "psk=0ther, version=5, reuse=false",
         "psk=0ther, version=5, reuse=false, obfs=http",
-        "psk=0ther, version=5, reuse=false, obfs=http, udp-port=9999",
     ] {
         h.engine.swap_runtime(reload(changed, "").await);
         let now = outbound_now(&h, "S");

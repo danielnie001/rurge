@@ -32,8 +32,8 @@ use rurge_net::BoxFuture;
 use rurge_net::connector::ConnectOpts;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
-use std::task::{Context, Poll, ready};
+use std::sync::{Arc, Mutex, Weak};
+use std::task::{Context, Poll, Wake, Waker, ready};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::time::Instant;
@@ -99,13 +99,47 @@ fn is_stale(error: &io::Error) -> bool {
 enum Conn {
     /// Boxed: the stream's buffers are large and a redial is rare.
     Open(Box<LazyHead<SnellStream>>),
-    /// The request going again on a fresh connection: the dial, and what
-    /// the old one carried (the head and the payload written since).
-    /// The tunnel assumes both halves are polled from one task: the redial
-    /// future keeps only the last poller's waker.
-    Redial(BoxFuture<'static, io::Result<SnellStream>>, Vec<u8>),
+    /// The request going again on a fresh connection: the dial, what the
+    /// old one carried (the head and the payload written since), and the
+    /// tasks waiting for the dial.
+    Redial(
+        BoxFuture<'static, io::Result<SnellStream>>,
+        Vec<u8>,
+        Arc<Waiters>,
+    ),
     /// The redial failed.
     Gone,
+}
+
+/// Every task that polled a redial: the halves may be polled from tasks of
+/// their own (VMess UDP reads in one apart from its writes), and a future
+/// keeps only its last poller's waker; each of them hears when it moves on.
+#[derive(Default)]
+struct Waiters(Mutex<Vec<Waker>>);
+
+impl Waiters {
+    /// Adds `waker`: the waker to poll the dial with.
+    fn join(self: &Arc<Self>, waker: &Waker) -> Waker {
+        let mut wakers = self.0.lock().expect("wakers");
+        if !wakers.iter().any(|w| w.will_wake(waker)) {
+            wakers.push(waker.clone());
+        }
+        drop(wakers);
+        Waker::from(self.clone())
+    }
+}
+
+impl Wake for Waiters {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let wakers = std::mem::take(&mut *self.0.lock().expect("wakers"));
+        for waker in wakers {
+            waker.wake();
+        }
+    }
 }
 
 enum Reply {
@@ -200,7 +234,7 @@ impl SnellTunnel {
                 )),
             }
         });
-        self.conn = Conn::Redial(dial, sent);
+        self.conn = Conn::Redial(dial, sent, Arc::default());
         Ok(())
     }
 
@@ -208,7 +242,10 @@ impl SnellTunnel {
     fn poll_open(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut self.conn {
             Conn::Open(_) => Poll::Ready(Ok(())),
-            Conn::Redial(dial, sent) => match ready!(dial.as_mut().poll(cx)) {
+            Conn::Redial(dial, sent, waiters) => match ready!(
+                dial.as_mut()
+                    .poll(&mut Context::from_waker(&waiters.join(cx.waker())))
+            ) {
                 Ok(stream) => {
                     // no grace: the application's bytes are already here
                     let sent = std::mem::take(sent);

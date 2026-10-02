@@ -11,8 +11,9 @@
 //! outbound's pool (`pool`), and the next request goes out on it.
 //!
 //! UDP needs no parameter on v4 / v5: a connection of its own, never
-//! pooled, to `udp-port` (else the policy's port) through the same layers,
-//! carries every datagram (`udp`).
+//! pooled, to the policy's port through the same layers, carries every
+//! datagram (`udp`). `udp-port` serves v5's QUIC proxy mode, which is not
+//! implemented.
 
 pub(crate) mod kdf;
 mod pool;
@@ -61,8 +62,6 @@ impl Dialer {
 pub struct SnellOutbound {
     name: String,
     dialer: Arc<Dialer>,
-    /// To `udp-port`; the same as `dialer` without one.
-    udp_dialer: Arc<Dialer>,
     /// `CONNECT`, or `CONNECT_V2` with `reuse=true`.
     command: u8,
     /// `Some` with `reuse=true`.
@@ -94,31 +93,23 @@ impl SnellOutbound {
         }
         // no TLS of its own: the camouflage certificate is checked against
         // the server's name
-        let stack = |to: &Target| -> Result<Stack, BuildError> {
-            let shadow_tls = shadow_tls_client(shadow_tls, None, &to.host, roots.clone())?;
-            let mut stack = Stack::new(connector.clone(), to.clone(), shadow_tls, None, None);
-            if let Some(obfs) = &spec.obfs {
-                stack = stack.with_obfs(ObfsClient::new(obfs, to)?);
-            }
-            Ok(stack)
-        };
-        let psk = Psk::new(spec.psk.expose());
+        let shadow_tls = shadow_tls_client(shadow_tls, None, &server.host, roots)?;
+        let obfs = spec
+            .obfs
+            .as_ref()
+            .map(|obfs| ObfsClient::new(obfs, &server))
+            .transpose()?;
+        let mut stack = Stack::new(connector, server, shadow_tls, None, None);
+        if let Some(obfs) = obfs {
+            stack = stack.with_obfs(obfs);
+        }
         let dialer = Arc::new(Dialer {
-            stack: stack(&server)?,
-            psk: psk.clone(),
+            stack,
+            psk: Psk::new(spec.psk.expose()),
         });
-        // UDP rides a TCP connection: `udp-port` is where that one goes
-        let udp_dialer = match spec.udp_port {
-            Some(port) if port != server.port => Arc::new(Dialer {
-                stack: stack(&Target::new(server.host.clone(), port))?,
-                psk,
-            }),
-            _ => dialer.clone(),
-        };
         Ok(SnellOutbound {
             name: name.to_string(),
             dialer,
-            udp_dialer,
             command: if spec.reuse { CONNECT_V2 } else { CONNECT },
             pool: spec.reuse.then(Arc::<Pool>::default),
             reaper: OnceLock::new(),
@@ -204,7 +195,7 @@ impl Outbound for SnellOutbound {
             // one budget for the connection, its layers, the key and the
             // server's answer, which comes at once
             let open = async {
-                let stream = self.udp_dialer.fresh(opts).await?;
+                let stream = self.dialer.fresh(opts).await?;
                 let udp = SnellUdp::open(stream).await?;
                 Ok(Box::new(udp) as BoxedPacketSocket)
             };
@@ -234,6 +225,13 @@ mod tests {
 
     /// The outbound for `definition` (a `snell, host, port, ...` line).
     fn outbound(definition: &str) -> SnellOutbound {
+        outbound_through(
+            definition,
+            Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
+        )
+    }
+
+    fn outbound_through(definition: &str, connector: Arc<dyn Connector>) -> SnellOutbound {
         let span = Span::new(Arc::from(Path::new("p.conf")), 1);
         let policy = parse_policy("N", definition, &span).unwrap();
         let mut r = ParamReader::new(&policy);
@@ -247,7 +245,7 @@ mod tests {
             &read.spec,
             shadow_tls.as_ref(),
             Arc::new(RootCertStore::empty()),
-            Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
+            connector,
         )
         .unwrap()
     }
@@ -452,6 +450,81 @@ mod tests {
         request(&out, echo, b"third").await;
         assert_eq!(places(&fake), [(0, 0), (1, 0), (2, 0)]);
         assert_eq!(fake.unanswered(), 2);
+    }
+
+    /// Opens the first connection at once and every later one after
+    /// `SLOW`: a redial that both halves of a tunnel come to poll.
+    struct SlowAfterFirst {
+        direct: DirectConnector,
+        dials: std::sync::atomic::AtomicUsize,
+    }
+
+    const SLOW: Duration = Duration::from_millis(300);
+
+    impl Connector for SlowAfterFirst {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, std::io::Result<BoxedStream>> {
+            use std::sync::atomic::Ordering;
+            Box::pin(async move {
+                if self.dials.fetch_add(1, Ordering::SeqCst) > 0 {
+                    tokio::time::sleep(SLOW).await;
+                }
+                self.direct.connect(target, opts).await
+            })
+        }
+    }
+
+    /// The halves of a tunnel polled from tasks of their own (VMess UDP over
+    /// this one reads in a task apart from its writes): the redial of a
+    /// stale pooled connection wakes them both.
+    #[tokio::test]
+    async fn a_redial_wakes_both_halves_of_the_tunnel() {
+        use std::sync::atomic::Ordering;
+        let echo = echo_server().await;
+        let fake = FakeSnell::spawn(SnellScript {
+            tunnels_per_connection: Some(1),
+            ..SnellScript::new("secret")
+        })
+        .await;
+        let connector = Arc::new(SlowAfterFirst {
+            direct: DirectConnector::new(Arc::new(SystemResolve)),
+            dials: Default::default(),
+        });
+        let out = outbound_through(
+            &format!(
+                "snell, 127.0.0.1, {}, psk=secret, version=4, reuse=true",
+                fake.addr().port()
+            ),
+            connector.clone(),
+        );
+        request(&out, echo, b"first").await;
+        let tunnel = out
+            .connect_tcp(&target(echo), &ConnectOpts::default())
+            .await
+            .unwrap();
+        let (mut r, mut w) = tokio::io::split(tunnel);
+        let reader = tokio::spawn(async move {
+            let mut back = [0u8; 10];
+            r.read_exact(&mut back).await.map(|_| back)
+        });
+        // the server closes on the request: the reader starts the redial
+        w.write_all(b"hello").await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while connector.dials.load(Ordering::SeqCst) < 2 {
+            assert!(tokio::time::Instant::now() < deadline, "no redial");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // the writer comes to the same redial
+        w.write_all(b"world").await.unwrap();
+        let back = tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("the reader was left behind")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&back, b"helloworld");
     }
 
     #[tokio::test]
@@ -766,7 +839,6 @@ mod tests {
                     version: SnellVersion::V5,
                     psk: Secret::from(psk),
                     reuse: false,
-                    udp_port: None,
                     obfs,
                 },
                 None,
@@ -892,38 +964,6 @@ mod tests {
         udp_roundtrip(carrier.as_ref(), echo, &largest).await;
         assert_eq!(fake.datagrams(), [echo.to_string()]);
         assert_eq!(fake.largest_record(), record::MAX_PAYLOAD);
-    }
-
-    /// `udp-port` is where the UDP session's connection goes, through the
-    /// same layers; TCP keeps the policy's port.
-    #[tokio::test]
-    async fn udp_goes_to_the_udp_port() {
-        // the policy's port accepts and says nothing
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let silent = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((tcp, _)) = listener.accept().await {
-                held.push(tcp);
-            }
-        });
-        let echo = udp_echo_server().await;
-        let fake = FakeSnell::spawn(SnellScript {
-            obfs_http: true,
-            ..SnellScript::new("secret")
-        })
-        .await;
-        let out = outbound(&format!(
-            "snell, 127.0.0.1, {}, psk=secret, version=5, obfs=http, udp-port={}",
-            silent.port(),
-            fake.addr().port()
-        ));
-        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
-        udp_roundtrip(carrier.as_ref(), echo, b"via udp-port").await;
-        assert_eq!(fake.connections(), 1);
-        // the camouflage names the port the connection went to
-        let host = format!("127.0.0.1:{}", fake.addr().port());
-        assert_eq!(fake.obfs_seen()[0].host, host);
     }
 
     #[tokio::test]

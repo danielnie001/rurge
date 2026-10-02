@@ -407,7 +407,7 @@ SS = ss, proxy.test, 8388, encrypt-method=aes-128-gcm, password=pw, obfs=http, u
 SK = ss, proxy.test, 8388, encrypt-method=2022-blake3-aes-128-gcm, password=MDEyMzQ1Njc4OWFiY2RlZg==:MDEyMzQ1Njc4OWFiY2RlZg==, shadow-tls-password=st\n\
 SN = ss, proxy.test, 8388, encrypt-method=none\n\
 N4 = snell, proxy.test, 443, psk=pw, version=4, reuse=true, obfs=http\n\
-N5 = snell, proxy.test, 443, psk=pw, version=5, udp-port=8443, shadow-tls-password=st\n\
+N5 = snell, proxy.test, 443, psk=pw, version=5, shadow-tls-password=st\n\
 H2 = h2-connect, proxy.test, 443, alice, s3cret, max-streams=8, udp-relay=true\n\
 TT = trust-tunnel, proxy.test, 443, username=u, password=pw, shadow-tls-password=st\n\
 Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule]\nFINAL,DIRECT\n",
@@ -532,7 +532,7 @@ password=MDEyMzQ1Njc4OWFiY2RlZg==\n[Rule]\nFINAL,DIRECT\n",
     fn a_snell_policy_passes_the_dry_build() {
         let cfg = config(
             "[Proxy]\nN4 = snell, proxy.test, 443, psk=pw, version=4, reuse=true, obfs=http, obfs-host=cdn.test\n\
-N5 = snell, proxy.test, 443, psk=pw, version=5, udp-port=8443, shadow-tls-password=st, shadow-tls-version=3, shadow-tls-sni=site.test\n\
+N5 = snell, proxy.test, 443, psk=pw, version=5, shadow-tls-password=st, shadow-tls-version=3, shadow-tls-sni=site.test\n\
 [Rule]\nFINAL,DIRECT\n",
         );
         assert!(dry_build(&cfg).is_empty());
