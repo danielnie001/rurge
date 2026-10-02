@@ -6,7 +6,7 @@ use crate::stack::{Outgoing, Stack};
 use crate::stream::TunnelStream;
 use crate::wire;
 use rurge_config::wireguard::WireGuardSection;
-use rurge_net::connector::{BoxedDatagram, ConnectOpts, Connector, Target};
+use rurge_net::connector::{BoxedDatagram, ConnectOpts, Connector, Route, Target};
 use rurge_proto::OutboundError;
 use smoltcp::iface::SocketHandle;
 use std::collections::HashMap;
@@ -169,6 +169,7 @@ impl Device {
             .iter()
             .map(|p| Target::new(p.endpoint.host.clone(), p.endpoint.port))
             .collect();
+        let route = connector.route();
         let mut dials = JoinSet::new();
         for (i, endpoint) in endpoints.iter().enumerate() {
             let (connector, endpoint, opts) = (connector.clone(), endpoint.clone(), opts.clone());
@@ -251,6 +252,7 @@ impl Device {
             carriers,
             endpoints,
             connector: connector.clone(),
+            route,
             redial,
             waiting: vec![false; peers],
             up: vec![false; peers],
@@ -517,6 +519,8 @@ struct Driver {
     carriers: Vec<Option<Carrier>>,
     endpoints: Vec<Target>,
     connector: Arc<dyn Connector>,
+    /// Where `connector` led when every carrier was last dialled.
+    route: Option<Route>,
     redial: Duration,
     /// A handshake initiation went to the peer and nothing answered yet.
     waiting: Vec<bool>,
@@ -538,6 +542,20 @@ impl Driver {
                 (peer, anew, connector.connect_udp(&endpoint, &opts).await)
             });
         }
+    }
+
+    /// Whether the underlying policy leads elsewhere than when every carrier
+    /// was last dialled — a group's member changed, a reload rebuilt it —
+    /// and so every carrier is to be dialled anew: "a change of the
+    /// effective policy resets the WireGuard transport sockets" (manual).
+    fn rerouted(&mut self) -> bool {
+        let route = self.connector.route();
+        if route == self.route {
+            return false;
+        }
+        tracing::info!(policy = %self.policy, "wireguard: the underlying policy changed; the peers are dialled anew");
+        self.route = route;
+        true
     }
 
     /// The carriers of `peers` lost their local address or their route
@@ -641,7 +659,8 @@ impl Driver {
                 return;
             }
             let now = Instant::now();
-            if self.shared.network_changed.swap(false, Ordering::SeqCst) {
+            let rerouted = now >= next_tick && self.rerouted();
+            if self.shared.network_changed.swap(false, Ordering::SeqCst) || rerouted {
                 dials.abort_all();
                 self.dial(&mut dials, (0..self.endpoints.len()).collect(), true);
                 next_redial = now + self.redial;

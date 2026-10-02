@@ -122,6 +122,45 @@ pub trait Connector: Send + Sync {
         let _ = opts;
         Box::pin(std::future::ready(Err(no_udp())))
     }
+
+    /// Where this connector's connections go now, when that can change
+    /// under it (a policy group's member as the underlying proxy): a
+    /// connection made before it changed goes elsewhere. `None`: always the
+    /// same way.
+    fn route(&self) -> Option<Route> {
+        None
+    }
+}
+
+/// Stands for the object a connector's connections go through now — a
+/// policy's outbound. Two are equal when they stand for the same object;
+/// one keeps its object alive, so no newer one can take its place in memory
+/// while it is compared.
+#[derive(Clone)]
+pub struct Route {
+    at: usize,
+    _alive: Arc<dyn Send + Sync>,
+}
+
+impl Route {
+    pub fn of<T: ?Sized + Send + Sync + 'static>(object: &Arc<T>) -> Route {
+        Route {
+            at: Arc::as_ptr(object) as *const () as usize,
+            _alive: Arc::new(object.clone()),
+        }
+    }
+}
+
+impl PartialEq for Route {
+    fn eq(&self, other: &Route) -> bool {
+        self.at == other.at
+    }
+}
+
+impl std::fmt::Debug for Route {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Route({:#x})", self.at)
+    }
 }
 
 fn no_udp() -> io::Error {

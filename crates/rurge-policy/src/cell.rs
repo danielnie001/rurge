@@ -5,7 +5,7 @@ use crate::registry::{PolicyRegistry, TerminalKind};
 use arc_swap::ArcSwapOption;
 use rurge_net::BoxFuture;
 use rurge_net::connector::{
-    BoxedDatagram, BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target,
+    BoxedDatagram, BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Route, Target,
 };
 use rurge_net::packet_datagram::packet_datagram;
 use rurge_proto::{OutboundError, UdpSupport};
@@ -155,6 +155,18 @@ impl Connector for ChainConnector {
             Ok(packet_datagram(socket, to))
         })
     }
+
+    /// The outbound the underlying policy leads to now — a group's current
+    /// member, the policy a reload built: a tunnel over it follows a change
+    /// (the manual: "a change of the effective policy resets the WireGuard
+    /// transport sockets").
+    fn route(&self) -> Option<Route> {
+        let registry = self.cell.load()?;
+        if !registry.contains(&self.name) {
+            return None;
+        }
+        Some(Route::of(&registry.relay_now(&self.name).outbound))
+    }
 }
 
 #[cfg(test)]
@@ -274,6 +286,50 @@ mod tests {
             .expect("no member to relay through");
         assert_eq!(e.to_string(), "via Empty: policy group has no members");
         assert!(connector.seen().is_empty());
+    }
+
+    const GROUPS: &str = "[Proxy]\nA = http, a.example, 80\nB = http, b.example, 80\n\
+[Proxy Group]\nPick = select, A, B\nAuto = url-test, A, B\n[Rule]\nFINAL,DIRECT\n";
+
+    /// Where a relay leads now: the same while nothing changes, elsewhere
+    /// once the member of its group changes. Nothing changes for asking: no
+    /// round of tests is asked for. No registry, or no such name: no route.
+    #[test]
+    fn the_route_follows_the_member_of_the_group() {
+        let loaded = from_text(GROUPS, Path::new("t.conf"), &LoadOptions::for_tests());
+        assert!(!loaded.diagnostics.has_errors());
+        let factory = crate::testing::FakeFactory {
+            connector: Arc::new(RecordingConnector::default()),
+            broken: None,
+            environment: "env",
+        };
+        let selections = Arc::new(crate::selections::SelectionTable::default());
+        let auto = crate::testing::auto_groups();
+        let cell = RegistryCell::new();
+        let registry = PolicyRegistry::build(
+            &loaded.config,
+            &crate::assemble(&loaded.config, &crate::Snapshots::new()),
+            &factory,
+            &cell,
+            selections.clone(),
+            None,
+            crate::EmptyGroup::Direct,
+            &auto,
+        )
+        .expect("builds");
+        cell.store(Arc::new(registry));
+        let pick = ChainConnector::new(cell.clone(), "Pick");
+        let first = pick.route().expect("a route");
+        assert_eq!(pick.route(), Some(first.clone()));
+        selections.set("Pick", "B");
+        assert_ne!(pick.route(), Some(first));
+        assert!(ChainConnector::new(cell.clone(), "Auto").route().is_some());
+        assert!(auto.requested().is_empty(), "{:?}", auto.requested());
+        assert_eq!(ChainConnector::new(cell, "Ghost").route(), None);
+        assert_eq!(
+            ChainConnector::new(RegistryCell::new(), "Pick").route(),
+            None
+        );
     }
 
     #[test]

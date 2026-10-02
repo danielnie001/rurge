@@ -1091,7 +1091,7 @@ impl PolicyRegistry {
         match policy {
             PolicyRef::Builtin(b) => self.builtin(*b, &mut chain),
             PolicyRef::Device(name) => self.device(name, &mut chain),
-            PolicyRef::Named(name) => self.named(name, &mut chain, 0, self.empty_group, ctx),
+            PolicyRef::Named(name) => self.named(name, &mut chain, 0, self.empty_group, ctx, true),
         }
     }
 
@@ -1105,6 +1105,22 @@ impl PolicyRegistry {
             0,
             EmptyGroup::Reject,
             &SelectCtx::default(),
+            true,
+        )
+    }
+
+    /// Where `name` as an `underlying-proxy` leads now, as the control plane
+    /// sees it: nothing changes for asking (no test is started, `url-test`
+    /// does not move). A tunnel over it watches this to follow a change of
+    /// the effective policy.
+    pub fn relay_now(&self, name: &str) -> Resolution {
+        self.named(
+            name,
+            &mut Vec::new(),
+            0,
+            EmptyGroup::Reject,
+            &SelectCtx::default(),
+            false,
         )
     }
 
@@ -1118,6 +1134,7 @@ impl PolicyRegistry {
             0,
             self.empty_group,
             &SelectCtx::default(),
+            true,
         )
     }
 
@@ -1139,6 +1156,7 @@ impl PolicyRegistry {
         self.done(chain, self.direct(), TerminalKind::Direct, None)
     }
 
+    /// `live`: a dial, as for `choose`.
     fn named(
         &self,
         name: &str,
@@ -1146,6 +1164,7 @@ impl PolicyRegistry {
         depth: usize,
         empty: EmptyGroup,
         ctx: &SelectCtx,
+        live: bool,
     ) -> Resolution {
         chain.push(name.to_string());
         if depth > MAX_DEPTH {
@@ -1191,12 +1210,12 @@ impl PolicyRegistry {
             Some(Entry::Group {
                 cycle: Some(cycle), ..
             }) => self.rejected(chain, Some(Note::GroupCycle(cycle.clone()))),
-            Some(Entry::Group { .. }) => match self.choose(name, ctx, true, depth) {
+            Some(Entry::Group { .. }) => match self.choose(name, ctx, live, depth) {
                 Some(choice) => {
                     let mut resolution = match PolicyRef::parse(&choice.member) {
                         PolicyRef::Builtin(b) => self.builtin(b, chain),
                         PolicyRef::Device(d) => self.device(&d, chain),
-                        PolicyRef::Named(n) => self.named(&n, chain, depth + 1, empty, ctx),
+                        PolicyRef::Named(n) => self.named(&n, chain, depth + 1, empty, ctx, live),
                     };
                     if choice.pending {
                         resolution.pending = Some(name.to_string());

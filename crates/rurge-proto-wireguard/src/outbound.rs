@@ -314,7 +314,7 @@ mod tests {
     };
     use rurge_config::wireguard::PeerEndpoint;
     use rurge_net::connector::{
-        BoxedDatagram, Datagram, DirectConnector, PacketSocket, SystemResolve,
+        BoxedDatagram, Datagram, DirectConnector, PacketSocket, Route, SystemResolve,
     };
     use std::io;
     use std::net::{Ipv4Addr, SocketAddrV4};
@@ -1208,6 +1208,61 @@ mod tests {
             .expect("a connection");
         assert_eq!(echo(&mut stream, b"before").await, b"before");
         wg.network_changed();
+        until(|| peer.clients().len() == 2).await;
+        assert_eq!(echo(&mut stream, b"after").await, b"after");
+        assert_eq!(peer.core().handshakes, 2);
+    }
+
+    /// Dials through `inner`; its route is what `route` holds now, as the
+    /// member of a group that is the underlying proxy.
+    struct Rerouted {
+        inner: Arc<dyn Connector>,
+        route: Arc<StdMutex<Arc<u8>>>,
+    }
+
+    impl Connector for Rerouted {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            self.inner.connect(target, opts)
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            self.inner.connect_udp(target, opts)
+        }
+
+        fn route(&self) -> Option<Route> {
+            Some(Route::of(&self.route.lock().unwrap()))
+        }
+    }
+
+    /// The underlying policy leads elsewhere now (a group's member changed):
+    /// every carrier is dialled anew and each peer greeted on its new one;
+    /// the connections carry on. The manual: "a change of the effective
+    /// policy resets the WireGuard transport sockets".
+    #[tokio::test]
+    async fn a_new_route_underneath_gives_every_peer_a_new_carrier() {
+        let route = Arc::new(StdMutex::new(Arc::new(1u8)));
+        let rerouted: Arc<dyn Connector> = Arc::new(Rerouted {
+            inner: direct(),
+            route: route.clone(),
+        });
+        let (peer, wg) = tunnel_with(PeerOpts::default(), |_| {}, no_names(), rerouted).await;
+        let mut stream = wg
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        assert_eq!(echo(&mut stream, b"before").await, b"before");
+        // only to see that the same route keeps the carrier
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(peer.clients().len(), 1);
+        *route.lock().unwrap() = Arc::new(2u8);
         until(|| peer.clients().len() == 2).await;
         assert_eq!(echo(&mut stream, b"after").await, b"after");
         assert_eq!(peer.core().handshakes, 2);

@@ -92,6 +92,44 @@ async fn a_tunnel_goes_over_an_underlying_socks5_proxy() {
     assert!(!up.datagrams().is_empty());
 }
 
+/// The `underlying-proxy` is a group: once another member is selected, the
+/// tunnel's carriers go through that one, and the connections through the
+/// tunnel carry on (the manual: "a change of the effective policy resets
+/// the WireGuard transport sockets").
+#[tokio::test]
+async fn a_tunnel_follows_the_member_of_its_underlying_group() {
+    let (peer, section) = peer().await;
+    let (one, two) = (
+        FakeSocks5::spawn(Socks5Script::default()).await,
+        FakeSocks5::spawn(Socks5Script::default()).await,
+    );
+    let proxies = format!(
+        "WG = wireguard, section-name=w, underlying-proxy=Up\n\
+         One = socks5, 127.0.0.1, {}, udp-relay=true\n\
+         Two = socks5, 127.0.0.1, {}, udp-relay=true",
+        one.addr().port(),
+        two.addr().port()
+    );
+    let h = harness(Profile {
+        proxies: &proxies,
+        groups: "Up = select, One, Two",
+        rules: TO_WG,
+        sections: &section,
+        ..Profile::default()
+    })
+    .await;
+    let mut tunnel = connect_via_http(h.http(), "10.0.0.1:7").await;
+    echo_through(&mut tunnel, b"through one").await;
+    assert!(two.datagrams().is_empty());
+    h.engine.select_group("Up", "Two").await.unwrap();
+    wait_until("the tunnel to go through Two", || {
+        !two.datagrams().is_empty()
+    })
+    .await;
+    echo_through(&mut tunnel, b"through two").await;
+    assert_eq!(peer.core().handshakes, 2, "greeted on the new carrier");
+}
+
 /// An `underlying-proxy` that carries no UDP fails the dial, saying so, and
 /// never goes around the chain (M4-D7).
 #[tokio::test]
