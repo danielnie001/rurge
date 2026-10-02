@@ -10,12 +10,15 @@
 //!   cone, as the server keeps a socket per session). A carrier moves to
 //!   the session's connection on its next datagram once its own takes
 //!   nothing new — ended, going away, or dialled another way than the
-//!   policy leads now (`Session::serves`). Session ids count from 1 per
-//!   outbound, so it keeps its id there, where no other carrier holds it:
-//!   the server takes it for a new session.
+//!   policy leads now (`Session::serves`: where the policy leads is asked
+//!   at most once a second, the rest on every datagram). Session ids count
+//!   from 1 per outbound, so it keeps its id there, where no other carrier
+//!   holds it: the server takes it for a new session.
 //! - A datagram that does not fit one QUIC datagram goes in fragments — at
 //!   most 255, under a random packet id, each with the whole header —; one
-//!   that fits goes whole, packet 0, fragment 0 of 1.
+//!   that fits goes whole, packet 0, fragment 0 of 1. A carrier sends one
+//!   datagram at a time: the server puts one datagram of a session
+//!   together at a time, so another's fragment among them would lose both.
 //! - One task per connection reads its datagrams into their sessions'
 //!   inboxes, putting fragments together first: one datagram at a time per
 //!   session, a fragment of another dropping the one under way. What finds
@@ -38,12 +41,17 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_util::task::AbortOnDropHandle;
 
 /// Datagrams waiting for the engine, per carrier; more are dropped, as a
 /// socket would.
 pub(super) const INBOX: usize = 64;
+/// How often a carrier asks where the policy leads (`Session::serves`): it
+/// can cost a group's resolution, and every datagram would ask.
+const ROUTE_EVERY: Duration = Duration::from_secs(1);
 /// The most fragments a datagram goes in: their count is one byte.
 const MAX_FRAGMENTS: usize = 255;
 /// The longest datagram put together: no UDP datagram is longer.
@@ -388,6 +396,12 @@ pub(super) struct Hysteria2Udp {
     /// The budget of binding to a new connection, its dial included.
     opts: ConnectOpts,
     bound: Mutex<Option<Arc<Bound>>>,
+    /// Held while a datagram's fragments go out: concurrent sends of the
+    /// carrier take turns, as the server puts one datagram of the session
+    /// together at a time.
+    sending: Mutex<()>,
+    /// When the policy's route was last compared (`route_due`).
+    route_checked: Mutex<Option<Instant>>,
     /// What the connections it binds to fill `inbox` through.
     answers: mpsc::Sender<Packet>,
     inbox: tokio::sync::Mutex<mpsc::Receiver<Packet>>,
@@ -407,6 +421,8 @@ impl Hysteria2Udp {
             ids,
             opts: opts.clone(),
             bound: Mutex::default(),
+            sending: Mutex::default(),
+            route_checked: Mutex::default(),
             answers,
             inbox: tokio::sync::Mutex::new(inbox),
         };
@@ -415,10 +431,29 @@ impl Hysteria2Udp {
     }
 
     /// Where the carrier is, while that connection takes what is new
-    /// (`Session::serves`).
+    /// (`Session::serves`): that it is open and not going away is looked at
+    /// on every call, where the policy leads at most once a second.
     fn current(&self) -> Option<Arc<Bound>> {
         let bound = self.bound.lock().expect("bound").clone()?;
-        self.session.serves(&bound.lease).then_some(bound)
+        let serves = if self.route_due() {
+            self.session.serves(&bound.lease)
+        } else {
+            self.session.serves_without_route(&bound.lease)
+        };
+        serves.then_some(bound)
+    }
+
+    /// Whether the policy's route is to be compared now: it is when it was
+    /// not within the last second, or at all, and this then counts as the
+    /// comparison.
+    fn route_due(&self) -> bool {
+        let mut checked = self.route_checked.lock().expect("route checked");
+        let now = Instant::now();
+        if checked.is_some_and(|at| now.duration_since(at) < ROUTE_EVERY) {
+            return false;
+        }
+        *checked = Some(now);
+        true
     }
 
     /// Binds the carrier to the session's connection — a lease on it, the
@@ -499,7 +534,11 @@ impl PacketSocket for Hysteria2Udp {
                     "hysteria2: the server does not support QUIC datagrams",
                 ));
             };
-            transmit(connection, datagrams(bound.id, &address, buf, max)?);
+            let out = datagrams(bound.id, &address, buf, max)?;
+            // all of its fragments in a row, with nothing awaited meanwhile
+            let sending = self.sending.lock().expect("sending");
+            transmit(connection, out);
+            drop(sending);
             Ok(())
         })
     }
@@ -525,7 +564,23 @@ impl PacketSocket for Hysteria2Udp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hysteria2::Hysteria2Outbound;
+    use crate::testing::{FakeHysteria2, Hysteria2Script};
+    use rurge_config::Span;
+    use rurge_config::policy::parse_policy;
+    use rurge_config::spec::hysteria2::read_hysteria2;
+    use rurge_config::spec::{CommonOpts, Hysteria2Spec, ParamReader, Tristate};
+    use rurge_net::connector::{
+        BoxedDatagram, BoxedStream, Connector, DirectConnector, Route, SystemResolve,
+    };
+    use rurge_proto::Outbound;
     use std::collections::HashSet;
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Barrier;
+    use tokio::task::JoinSet;
 
     const SOURCE: &str = "192.0.2.1:53";
 
@@ -824,5 +879,229 @@ mod tests {
         deliver(&sessions, whole(1, SOURCE, b"kept"));
         assert_eq!(&inbox.try_recv().unwrap().0[..], b"kept");
         assert!(inbox.try_recv().is_err());
+    }
+
+    const BOUND: Duration = Duration::from_secs(10);
+
+    /// `hysteria2, 127.0.0.1, <port>, password=pw`, as the configuration
+    /// reads it.
+    fn spec(port: u16) -> Hysteria2Spec {
+        let span = Span::new(Arc::from(Path::new("p.conf")), 1);
+        let line = format!("hysteria2, 127.0.0.1, {port}, password=pw");
+        let policy = parse_policy("H", &line, &span).unwrap();
+        let mut r = ParamReader::new(&policy);
+        let spec = read_hysteria2(&mut r, &mut CommonOpts::default(), &[]);
+        assert!(!r.has_errors(), "{:?}", r.finish());
+        spec
+    }
+
+    fn spawn_fake() -> FakeHysteria2 {
+        FakeHysteria2::spawn(Hysteria2Script {
+            password: "pw".to_string(),
+            ..Hysteria2Script::default()
+        })
+    }
+
+    /// The outbound to `fake`, its connections dialled through `connector`.
+    fn outbound(fake: &FakeHysteria2, connector: Arc<dyn Connector>) -> Hysteria2Outbound {
+        let port = fake.addr().port();
+        Hysteria2Outbound::new(
+            "H",
+            Target::new(HostName::parse("127.0.0.1"), port),
+            &spec(port),
+            Tristate::Auto,
+            &[],
+            fake.roots(),
+            connector,
+        )
+        .unwrap()
+    }
+
+    fn direct() -> Arc<dyn Connector> {
+        Arc::new(DirectConnector::new(Arc::new(SystemResolve)))
+    }
+
+    async fn open_carrier(out: &Hysteria2Outbound) -> Arc<dyn PacketSocket> {
+        let carrier = tokio::time::timeout(BOUND, out.open_udp(&ConnectOpts::default()))
+            .await
+            .expect("an outcome within the bound")
+            .expect("a carrier");
+        Arc::from(carrier)
+    }
+
+    fn target(addr: SocketAddr) -> Target {
+        Target::new(HostName::Ip(addr.ip()), addr.port())
+    }
+
+    /// What the digest target answers for `payload`.
+    fn digest(payload: &[u8]) -> Vec<u8> {
+        let mut hasher = DefaultHasher::new();
+        payload.hash(&mut hasher);
+        hasher.finish().to_be_bytes().to_vec()
+    }
+
+    /// A loopback UDP target that answers each datagram with a digest of
+    /// it: what comes back is small and whole, so it is lost to nothing but
+    /// what went out broken.
+    async fn digest_target() -> SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let (n, from) = match socket.recv_from(&mut buf).await {
+                    Ok(got) => got,
+                    // an ICMP "unreachable" for an earlier datagram (Windows)
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
+                    Err(_) => return,
+                };
+                let _ = socket.send_to(&digest(&buf[..n]), from).await;
+            }
+        });
+        addr
+    }
+
+    /// 3000 bytes, three fragments or more, that no other round's or
+    /// task's resembles.
+    fn payload(round: u8, task: u8) -> Vec<u8> {
+        (0..3000u32)
+            .map(|i| (i as u8) ^ (round << 4 | task))
+            .collect()
+    }
+
+    /// The server puts one datagram of a session together at a time (the
+    /// reference's `Defragger`): the fragments of two datagrams in turn
+    /// lose both. Tasks that send through one carrier at once, on threads
+    /// of their own, must see to it that each datagram's fragments go out
+    /// together: every datagram reaches the target whole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_sends_keep_each_datagrams_fragments_together() {
+        const TASKS: u8 = 8;
+        const ROUNDS: u8 = 5;
+        let to = target(digest_target().await);
+        let fake = spawn_fake();
+        let out = outbound(&fake, direct());
+        let carrier = open_carrier(&out).await;
+        let mut buf = vec![0u8; 65536];
+        for round in 0..ROUNDS {
+            let payloads: Vec<Vec<u8>> = (0..TASKS).map(|task| payload(round, task)).collect();
+            // all of them at once
+            let start = Arc::new(Barrier::new(payloads.len()));
+            let mut sending = JoinSet::new();
+            for payload in payloads.clone() {
+                let (carrier, start, to) = (carrier.clone(), start.clone(), to.clone());
+                sending.spawn(async move {
+                    start.wait().await;
+                    carrier.send_to(&payload, &to).await.unwrap();
+                });
+            }
+            while let Some(sent) = sending.join_next().await {
+                sent.unwrap();
+            }
+            let mut expected: Vec<Vec<u8>> = payloads.iter().map(|p| digest(p)).collect();
+            let mut got = Vec::new();
+            let deadline = Instant::now() + BOUND;
+            while got.len() < expected.len() {
+                let Ok(answer) =
+                    tokio::time::timeout_at(deadline, carrier.recv_from(&mut buf)).await
+                else {
+                    break;
+                };
+                let (n, _) = answer.unwrap();
+                got.push(buf[..n].to_vec());
+            }
+            expected.sort();
+            got.sort();
+            assert_eq!(got, expected, "round {round}");
+        }
+    }
+
+    /// Dials directly, leads where it is told to, and counts the times it
+    /// is asked where it leads.
+    struct Counted {
+        inner: DirectConnector,
+        route: Mutex<Arc<u8>>,
+        asked: AtomicUsize,
+    }
+
+    impl Counted {
+        fn new() -> Counted {
+            Counted {
+                inner: DirectConnector::new(Arc::new(SystemResolve)),
+                route: Mutex::new(Arc::new(1)),
+                asked: AtomicUsize::new(0),
+            }
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Connector for Counted {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            self.inner.connect(target, opts)
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            self.inner.connect_udp(target, opts)
+        }
+
+        fn route(&self) -> Option<Route> {
+            self.asked.fetch_add(1, Ordering::Relaxed);
+            Some(Route::of(&self.route.lock().unwrap()))
+        }
+    }
+
+    /// Where the policy leads can cost a group's resolution: a carrier asks
+    /// at most once a second, however many datagrams it sends meanwhile.
+    #[tokio::test]
+    async fn the_route_is_compared_at_most_once_a_second_on_udp() {
+        let to = target(digest_target().await);
+        let fake = spawn_fake();
+        let counted = Arc::new(Counted::new());
+        let out = outbound(&fake, counted.clone());
+        let carrier = open_carrier(&out).await;
+        let before = counted.asked();
+        for i in 0..50u8 {
+            carrier.send_to(&[i], &to).await.unwrap();
+        }
+        let asked = counted.asked() - before;
+        assert!(asked <= 3, "asked {asked} times for 50 datagrams");
+    }
+
+    /// A carrier finds out for itself, at its next comparison of the
+    /// route, that the policy leads elsewhere now: its datagrams then go on
+    /// a new connection, under the session id it had. Until then — a second
+    /// at most — they go on the one before.
+    #[tokio::test]
+    async fn a_carrier_finds_a_changed_route_by_itself() {
+        let to = target(digest_target().await);
+        let fake = spawn_fake();
+        let counted = Arc::new(Counted::new());
+        let out = outbound(&fake, counted.clone());
+        let carrier = open_carrier(&out).await;
+        carrier.send_to(b"first", &to).await.unwrap();
+        *counted.route.lock().unwrap() = Arc::new(2);
+        let deadline = Instant::now() + BOUND;
+        while !fake.udp_messages().iter().any(|m| m.connection == 1) {
+            assert!(
+                Instant::now() < deadline,
+                "the carrier never left its connection"
+            );
+            carrier.send_to(b"probe", &to).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let messages = fake.udp_messages();
+        assert!(messages.iter().all(|m| m.session == 1), "{messages:?}");
+        assert_eq!(fake.connections(), 2);
     }
 }

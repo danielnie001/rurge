@@ -1053,7 +1053,17 @@ mod tests {
         udp_round_trip(one.as_ref(), udp_echo, b"one").await;
         udp_round_trip(two.as_ref(), udp_echo, b"two").await;
         let mut under_way = tunnel(&out, &target(tcp_echo)).await;
+        let lease = timeout(BOUND, out.session.lease(&ConnectOpts::default()))
+            .await
+            .unwrap()
+            .unwrap();
         *rerouted.route.lock().unwrap() = Arc::new(2);
+        // A carrier asks where the policy leads at most once a second (its
+        // own look: `a_carrier_finds_a_changed_route_by_itself`, in udp.rs).
+        // Here someone else looks first, as a request would, and the
+        // carriers see the connection off the way at once.
+        assert!(!out.session.serves(&lease));
+        drop(lease);
         udp_round_trip(one.as_ref(), udp_echo, b"one, moved").await;
         udp_round_trip(two.as_ref(), udp_echo, b"two, moved").await;
         round_trip(&mut under_way, b"still there").await;

@@ -15,7 +15,9 @@
 //!   elsewhere now (`Connector::route`: a group's member changed, a reload
 //!   rebuilt the policy), for good: the next request dials the new way.
 //!   Looked at whenever a connection is picked — by a request, or by a UDP
-//!   session for its next datagram (`Session::serves`) —, never by a timer.
+//!   session for its next datagram, which compares the route at most once
+//!   a second (`Session::serves`, else `serves_without_route`) —, never by
+//!   a timer.
 //! - A connection that no request or UDP session has held (`Lease`) for
 //!   `IDLE_TIMEOUT` is closed: looked at on every request and by a reaper.
 //! - A request on a connection that was up when it came, which finds the
@@ -271,12 +273,24 @@ impl<P: Protocol> Session<P> {
     /// UDP session's next datagram —: open, not going away, and dialled the
     /// way the connector leads now. A UDP session on one that does not
     /// moves to the session's connection (`lease` again); what is under
-    /// way on it goes on.
+    /// way on it goes on. Where the connector leads can cost a group's
+    /// resolution: a UDP session, which asks for every datagram, asks this
+    /// at most once a second, `serves_without_route` in between.
     pub fn serves(&self, lease: &Lease<P::State>) -> bool {
         let conn = &lease.conn;
         conn.quic.close_reason().is_none()
             && !self.shared.protocol.is_going_away(&conn.state)
             && self.shared.on_route(conn, self.dialer.route().as_ref())
+    }
+
+    /// `serves` without asking where the connector leads now: open, not
+    /// going away, and not found off the way already by whoever asked
+    /// (`on_route` remembers it).
+    pub fn serves_without_route(&self, lease: &Lease<P::State>) -> bool {
+        let conn = &lease.conn;
+        conn.quic.close_reason().is_none()
+            && !self.shared.protocol.is_going_away(&conn.state)
+            && !conn.rerouted.load(Ordering::Relaxed)
     }
 
     /// Runs `attempt` on a lease of the session's connection; what it
