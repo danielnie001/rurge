@@ -3479,6 +3479,7 @@ dependencies = [
 name = "rurge-proto-quic"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "getrandom 0.3.4",
  "http",
  "quinn",
@@ -3489,6 +3490,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

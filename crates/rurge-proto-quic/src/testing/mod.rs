@@ -5,7 +5,9 @@
 
 mod hysteria2;
 
-pub use hysteria2::{FakeHysteria2, Hysteria2Script, RecordedAuth, RecordedTcp};
+pub use hysteria2::{
+    FakeHysteria2, Hysteria2Script, RecordedAuth, RecordedTcp, RecordedUdp, UdpMessage,
+};
 
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{

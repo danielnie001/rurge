@@ -11,14 +11,13 @@
 //!   length past the reference's bounds makes the answer malformed.
 
 use super::auth::Authenticated;
-use super::padding;
+use super::{address, padding};
 use crate::session::{Failure, Lease};
 use crate::varint;
 use quinn::{ReadError, ReadExactError, RecvStream, SendStream, WriteError};
 use rurge_net::connector::Target;
 use rurge_net::quic::connection_error;
 use rurge_proto::OutboundError;
-use rurge_proto::http::wire_host;
 use rurge_proto::outbound::untrusted_text;
 use std::io;
 use std::ops::RangeInclusive;
@@ -29,22 +28,13 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// The frame type that starts a TCP request.
 const TCP_REQUEST: u64 = 0x401;
 /// The reference's bounds (`core/internal/protocol/proxy.go`): the longest
-/// address it reads, the longest message and padding of an answer.
-const MAX_ADDRESS: usize = 2048;
+/// message and padding of an answer.
 const MAX_MESSAGE: u64 = 2048;
 const MAX_PADDING: u64 = 4096;
 /// The reference's padding of a TCP request.
 const REQUEST_PADDING: RangeInclusive<usize> = 64..=511;
 /// How much of the server's message an error text quotes.
 const MESSAGE_MAX: usize = 200;
-
-/// `host:port` as Hysteria 2 names a target: an IPv6 literal in brackets,
-/// a name as its A-labels (`http::wire_host`); `None` for a name that
-/// cannot be sent, or an address longer than the server reads.
-fn address(target: &Target) -> Option<String> {
-    let address = format!("{}:{}", wire_host(target)?, target.port);
-    (address.len() <= MAX_ADDRESS).then_some(address)
-}
 
 /// The TCP request for `target`: refused, before anything is dialed, for a
 /// name that cannot be sent.

@@ -6,26 +6,43 @@
 //!   names the target as `host:port` (an IPv6 literal in brackets, an IDN
 //!   as its A-labels), and the server's answer lets the stream through or
 //!   refuses it with a message (`tcp`).
+//! - UDP goes in QUIC datagrams of the same connection, each client
+//!   association a session of its own there (`udp`).
 //! - Requests and the authentication are padded as the reference client
 //!   pads them: letters and digits, of a random length.
 
 mod auth;
 mod tcp;
+mod udp;
 
 use crate::session::{Dialer, Session};
 use auth::Auth;
 use rurge_config::KeystoreItem;
 use rurge_config::spec::{Hysteria2Spec, Tristate};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
-use rurge_proto::{BuildError, Outbound, OutboundError};
+use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target};
+use rurge_proto::http::wire_host;
+use rurge_proto::{BuildError, Outbound, OutboundError, UdpSupport};
 use rustls::RootCertStore;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+use udp::{Hysteria2Udp, SessionIds};
 
 /// The characters of padding: letters and digits, as the reference's
 /// (`core/internal/protocol/padding.go`).
 const PADDING: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+/// The longest address the reference reads, in a TCP request and in a UDP
+/// message alike (`core/internal/protocol/proxy.go`).
+const MAX_ADDRESS: usize = 2048;
+
+/// `host:port` as Hysteria 2 names a target: an IPv6 literal in brackets,
+/// a name as its A-labels (`http::wire_host`); `None` for a name that
+/// cannot be sent, or an address longer than the server reads.
+fn address(target: &Target) -> Option<String> {
+    let address = format!("{}:{}", wire_host(target)?, target.port);
+    (address.len() <= MAX_ADDRESS).then_some(address)
+}
 
 /// Padding of a random length in `lengths`, of random letters and digits.
 /// Padding, not a secret: without a random source it is the shortest, all
@@ -45,7 +62,10 @@ fn padding(lengths: RangeInclusive<usize>) -> Vec<u8> {
 /// No `Debug`: it holds the password.
 pub struct Hysteria2Outbound {
     name: String,
-    session: Session<Auth>,
+    /// Shared with its UDP carriers, which may outlive it.
+    session: Arc<Session<Auth>>,
+    /// The session ids of its UDP carriers.
+    ids: Arc<SessionIds>,
 }
 
 impl Hysteria2Outbound {
@@ -77,7 +97,8 @@ impl Hysteria2Outbound {
         )?;
         Ok(Hysteria2Outbound {
             name: name.to_string(),
-            session: Session::new(name, dialer, auth),
+            session: Arc::new(Session::new(name, dialer, auth)),
+            ids: Arc::default(),
         })
     }
 }
@@ -106,25 +127,54 @@ impl Outbound for Hysteria2Outbound {
             }
         })
     }
+
+    /// Whatever the policy says: Hysteria 2 always relays UDP (manual). A
+    /// server that relays none refuses the carriers (`open_udp`).
+    fn udp(&self) -> UdpSupport {
+        UdpSupport::Native
+    }
+
+    /// A session of its own on the policy's connection, dialed when there
+    /// is none. The server's word on UDP comes with the authentication: a
+    /// server that relays none refuses the carrier here (design 5.3).
+    fn open_udp<'a>(
+        &'a self,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, Result<BoxedPacketSocket, OutboundError>> {
+        Box::pin(async move {
+            // one budget for the connection (when one is dialed), QUIC's
+            // handshake and the authentication
+            let open = Hysteria2Udp::open(self.session.clone(), self.ids.clone(), opts);
+            match tokio::time::timeout(opts.timeout, open).await {
+                Ok(udp) => Ok(Box::new(udp?) as BoxedPacketSocket),
+                Err(_) => Err(OutboundError::Timeout),
+            }
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{FakeHysteria2, Hysteria2Script};
+    use crate::testing::{FakeHysteria2, Hysteria2Script, RecordedUdp, UdpMessage};
     use quinn::{ConnectionError, VarInt};
     use rurge_config::policy::parse_policy;
     use rurge_config::spec::hysteria2::read_hysteria2;
     use rurge_config::spec::{CommonOpts, ParamReader, PortHopping};
     use rurge_config::{HostName, Span};
-    use rurge_net::connector::{DirectConnector, SystemResolve};
+    use rurge_net::connector::{
+        BoxedDatagram, DirectConnector, PacketSocket, Route, SystemResolve,
+    };
     use rurge_net::quic::testing::MultiPort;
-    use rurge_proto::testing::echo_server;
-    use std::collections::HashSet;
+    use rurge_proto::testing::{echo_server, udp_echo_server};
+    use std::collections::{BTreeSet, HashSet};
+    use std::io;
     use std::net::SocketAddr;
     use std::path::Path;
+    use std::sync::Mutex;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::task::JoinSet;
     use tokio::time::{Instant, timeout};
 
     const BOUND: Duration = Duration::from_secs(10);
@@ -243,7 +293,7 @@ mod tests {
         assert_eq!(requests[0].address, echo.to_string());
         assert!((64..=511).contains(&requests[0].padding));
         let lease = out.session.lease(&ConnectOpts::default()).await.unwrap();
-        assert!(lease.state().udp);
+        assert!(lease.state().udp.is_some());
 
         // without a bandwidth the rate is unknown; a server that relays no
         // UDP says so
@@ -256,7 +306,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(!lease.state().udp);
+        assert!(lease.state().udp.is_none());
         assert_eq!(fake.auths()[0].field("hysteria-cc-rx"), Some("0"));
     }
 
@@ -589,5 +639,640 @@ mod tests {
             .unwrap_err();
             assert_eq!(err.message, message);
         }
+    }
+
+    async fn udp_carrier(out: &Hysteria2Outbound) -> BoxedPacketSocket {
+        timeout(BOUND, out.open_udp(&ConnectOpts::default()))
+            .await
+            .expect("an outcome within the bound")
+            .expect("a carrier")
+    }
+
+    async fn udp_answer(carrier: &dyn PacketSocket) -> (Vec<u8>, Target) {
+        let mut buf = vec![0u8; 65536];
+        let (n, from) = timeout(BOUND, carrier.recv_from(&mut buf))
+            .await
+            .expect("an answer within the bound")
+            .unwrap();
+        (buf[..n].to_vec(), from)
+    }
+
+    async fn udp_round_trip(carrier: &dyn PacketSocket, to: SocketAddr, payload: &[u8]) {
+        carrier.send_to(payload, &target(to)).await.unwrap();
+        assert_eq!(udp_answer(carrier).await, (payload.to_vec(), target(to)));
+    }
+
+    /// Nothing comes for a while: a fixed wait, only to see nothing happen.
+    async fn no_udp_answer(carrier: &dyn PacketSocket) {
+        let mut buf = vec![0u8; 65536];
+        let quiet = timeout(Duration::from_millis(300), carrier.recv_from(&mut buf)).await;
+        assert!(quiet.is_err(), "{quiet:?}");
+    }
+
+    /// Sends `payload` to the echo at `to` until it comes back: what goes
+    /// out on a connection as it ends is lost.
+    async fn until_answered(carrier: &dyn PacketSocket, to: SocketAddr, payload: &[u8]) {
+        let deadline = Instant::now() + BOUND;
+        let mut buf = vec![0u8; 65536];
+        loop {
+            assert!(Instant::now() < deadline, "no answer within the bound");
+            carrier.send_to(payload, &target(to)).await.unwrap();
+            let wait = Instant::now() + Duration::from_millis(500);
+            while let Ok(got) = tokio::time::timeout_at(wait, carrier.recv_from(&mut buf)).await {
+                let (n, _) = got.unwrap();
+                if buf[..n] == *payload {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Design 5.3: a datagram goes whole in one QUIC datagram of the
+    /// connection, in session 1. The carrier reaches any target through
+    /// its session's one socket on the server, and hears anyone who sends
+    /// to that socket (full cone); TCP goes on beside it.
+    #[tokio::test]
+    async fn udp_goes_in_datagrams_of_the_connection_to_any_target() {
+        let (one, two) = (udp_echo_server().await, udp_echo_server().await);
+        let tcp_echo = echo_server().await;
+        let fake = FakeHysteria2::spawn(script("pw"));
+        let out = outbound(&fake, "password=pw");
+        assert_eq!(out.udp(), UdpSupport::Native);
+        let carrier = udp_carrier(&out).await;
+        udp_round_trip(carrier.as_ref(), one, b"to one").await;
+        udp_round_trip(carrier.as_ref(), two, b"to two").await;
+        let whole = |to: SocketAddr| RecordedUdp {
+            connection: 0,
+            session: 1,
+            packet: 0,
+            fragment: 0,
+            fragments: 1,
+            address: to.to_string(),
+            len: 6,
+        };
+        assert_eq!(fake.udp_messages(), [whole(one), whole(two)]);
+        let outside = fake.udp_outside();
+        assert_eq!(outside.len(), 1, "one socket for the session");
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger.send_to(b"unasked", outside[0]).await.unwrap();
+        assert_eq!(
+            udp_answer(carrier.as_ref()).await,
+            (b"unasked".to_vec(), target(stranger.local_addr().unwrap()))
+        );
+        let mut stream = tunnel(&out, &target(tcp_echo)).await;
+        round_trip(&mut stream, b"beside").await;
+        assert_eq!(fake.connections(), 1);
+        assert_eq!(fake.auths().len(), 1);
+    }
+
+    /// A name goes to the server as its A-labels, an IPv6 address in
+    /// brackets; the answer names its source as the server heard it. A
+    /// name that cannot be sent is refused, and nothing goes out.
+    #[tokio::test]
+    async fn udp_names_go_out_as_a_labels_and_ipv6_in_brackets() {
+        let echo = udp_echo_server().await;
+        let fake = FakeHysteria2::spawn(Hysteria2Script {
+            connect_to: Some(echo),
+            ..script("pw")
+        });
+        let out = outbound(&fake, "password=pw");
+        let carrier = udp_carrier(&out).await;
+        for (host, address) in [
+            (
+                HostName::Domain("bücher.example".into()),
+                "xn--bcher-kva.example:53",
+            ),
+            (HostName::parse("2001:db8::1"), "[2001:db8::1]:53"),
+        ] {
+            carrier.send_to(b"q", &Target::new(host, 53)).await.unwrap();
+            assert_eq!(
+                udp_answer(carrier.as_ref()).await,
+                (b"q".to_vec(), target(echo))
+            );
+            assert_eq!(fake.udp_messages().last().unwrap().address, address);
+        }
+        // `name:80` one byte longer than the reference reads
+        let long = "a".repeat(2046);
+        for name in ["x@blocked.test", "a b.test", "", long.as_str()] {
+            let err = carrier
+                .send_to(b"q", &Target::new(HostName::Domain(name.into()), 80))
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                err.to_string(),
+                "hysteria2: the host name cannot be sent to the server"
+            );
+        }
+        assert_eq!(fake.udp_messages().len(), 2);
+    }
+
+    /// Design 5.3: a datagram too long for one QUIC datagram goes in
+    /// fragments, each with the whole header, under one packet id that is
+    /// not 0; the echo, as long, comes back in fragments of the server's
+    /// that the carrier puts together. (At most 9216 bytes: macOS sends
+    /// no longer UDP datagram by default.)
+    #[tokio::test]
+    async fn long_datagrams_go_in_fragments_both_ways() {
+        let echo = udp_echo_server().await;
+        let fake = FakeHysteria2::spawn(script("pw"));
+        let out = outbound(&fake, "password=pw");
+        let carrier = udp_carrier(&out).await;
+        for len in [3000, 9000] {
+            let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            udp_round_trip(carrier.as_ref(), echo, &payload).await;
+            let messages = fake.udp_messages();
+            let count = messages.last().unwrap().fragments;
+            assert!(count > 1, "{count}");
+            let fragments = &messages[messages.len() - usize::from(count)..];
+            let packet = fragments[0].packet;
+            assert_ne!(packet, 0);
+            for (i, fragment) in fragments.iter().enumerate() {
+                assert_eq!(
+                    (fragment.session, fragment.packet, fragment.fragment),
+                    (1, packet, i as u8)
+                );
+                assert_eq!(fragment.address, echo.to_string());
+            }
+            assert_eq!(fragments.iter().map(|f| f.len).sum::<usize>(), len);
+        }
+    }
+
+    /// Design 5.3: a fragment lost loses its datagram and nothing more:
+    /// the next one, its fragments under another packet id, comes whole.
+    #[tokio::test]
+    async fn a_lost_fragment_loses_its_datagram_alone() {
+        let echo = udp_echo_server().await;
+        let fake = FakeHysteria2::spawn(Hysteria2Script {
+            drop_fragment: Some(1),
+            ..script("pw")
+        });
+        let out = outbound(&fake, "password=pw");
+        let carrier = udp_carrier(&out).await;
+        let (lost, kept) = (vec![1u8; 3000], vec![2u8; 3000]);
+        for payload in [&lost[..], &kept, b"short"] {
+            carrier.send_to(payload, &target(echo)).await.unwrap();
+        }
+        // in the order they came: the first never came whole
+        assert_eq!(udp_answer(carrier.as_ref()).await.0, kept);
+        assert_eq!(udp_answer(carrier.as_ref()).await.0, b"short");
+        no_udp_answer(carrier.as_ref()).await;
+    }
+
+    /// The fragments of a newer datagram drop the one under way: its last
+    /// fragment, come late, makes nothing whole, and holds nothing up.
+    #[tokio::test]
+    async fn a_newer_datagram_drops_an_older_one_under_way() {
+        let echo = udp_echo_server().await;
+        let fake = FakeHysteria2::spawn(script("pw"));
+        let out = outbound(&fake, "password=pw");
+        let carrier = udp_carrier(&out).await;
+        udp_round_trip(carrier.as_ref(), echo, b"hello").await;
+        let session = fake.udp_messages()[0].session;
+        let from = "192.0.2.7:7";
+        for (packet, fragment, payload) in [
+            (7, 0, "old-"),
+            (8, 0, "new-"),
+            (8, 1, "one"),
+            (7, 1, "late"),
+        ] {
+            fake.send_udp(
+                0,
+                &UdpMessage {
+                    session,
+                    packet,
+                    fragment,
+                    fragments: 2,
+                    address: from.to_string(),
+                    payload: payload.into(),
+                },
+            );
+        }
+        fake.send_udp(0, &UdpMessage::whole(session, from, b"after"));
+        let source = Target::new(HostName::parse("192.0.2.7"), 7);
+        assert_eq!(
+            udp_answer(carrier.as_ref()).await,
+            (b"new-one".to_vec(), source.clone())
+        );
+        assert_eq!(
+            udp_answer(carrier.as_ref()).await,
+            (b"after".to_vec(), source)
+        );
+    }
+
+    /// Design 5.3: the server's word on UDP comes with the authentication.
+    /// A server that relays none refuses the carrier, as one that takes no
+    /// QUIC datagrams does; TCP goes on, on the same connection.
+    #[tokio::test]
+    async fn a_server_that_relays_no_udp_refuses_the_carrier() {
+        let echo = echo_server().await;
+        for (server, refusal) in [
+            (
+                Hysteria2Script {
+                    no_udp: true,
+                    ..script("pw")
+                },
+                "hysteria2: the server does not allow UDP",
+            ),
+            (
+                Hysteria2Script {
+                    no_datagrams: true,
+                    ..script("pw")
+                },
+                "hysteria2: the server does not support QUIC datagrams",
+            ),
+        ] {
+            let fake = FakeHysteria2::spawn(server);
+            let out = outbound(&fake, "password=pw");
+            assert_eq!(out.udp(), UdpSupport::Native);
+            for _ in 0..2 {
+                let err = timeout(BOUND, out.open_udp(&ConnectOpts::default()))
+                    .await
+                    .expect("an outcome within the bound")
+                    .err()
+                    .expect("refused");
+                assert!(matches!(err, OutboundError::Proxy(_)), "{err}");
+                assert_eq!(err.to_string(), refusal);
+            }
+            let mut stream = tunnel(&out, &target(echo)).await;
+            round_trip(&mut stream, b"tcp still").await;
+            assert_eq!(fake.connections(), 1);
+        }
+    }
+
+    /// A carrier that does not read loses what its inbox cannot hold, and
+    /// holds up no other carrier of the connection.
+    #[tokio::test]
+    async fn a_full_inbox_drops_rather_than_holds_up_the_other_carriers() {
+        let echo = udp_echo_server().await;
+        let fake = FakeHysteria2::spawn(script("pw"));
+        let out = outbound(&fake, "password=pw");
+        let (slow, other) = (udp_carrier(&out).await, udp_carrier(&out).await);
+        udp_round_trip(slow.as_ref(), echo, b"slow").await;
+        udp_round_trip(other.as_ref(), echo, b"other").await;
+        let sessions: Vec<u32> = fake.udp_messages().iter().map(|m| m.session).collect();
+        assert_eq!(sessions, [1, 2]);
+        let from = "192.0.2.9:9";
+        for i in 0..udp::INBOX as u32 + 10 {
+            fake.send_udp(0, &UdpMessage::whole(1, from, &i.to_be_bytes()));
+        }
+        fake.send_udp(0, &UdpMessage::whole(2, from, b"not held up"));
+        assert_eq!(udp_answer(other.as_ref()).await.0, b"not held up");
+        for i in 0..udp::INBOX as u32 {
+            assert_eq!(udp_answer(slow.as_ref()).await.0, i.to_be_bytes());
+        }
+        no_udp_answer(slow.as_ref()).await;
+    }
+
+    /// Design 5.3: a carrier whose connection ended goes on, under the
+    /// same session id, on the connection that replaces it — whether the
+    /// server closed the connection, or lost it in a restart (a stateless
+    /// reset ends it at the next datagram). A carrier opened later gets an
+    /// id of its own.
+    #[tokio::test]
+    async fn a_carrier_keeps_its_session_id_on_the_next_connection() {
+        let echo = udp_echo_server().await;
+        let fake = FakeHysteria2::spawn(script("pw"));
+        let out = outbound(&fake, "password=pw");
+        let carrier = udp_carrier(&out).await;
+        udp_round_trip(carrier.as_ref(), echo, b"first").await;
+        fake.close_connections();
+        until_answered(carrier.as_ref(), echo, b"after a close").await;
+        fake.restart();
+        until_answered(carrier.as_ref(), echo, b"after a restart").await;
+        let messages = fake.udp_messages();
+        assert!(messages.iter().all(|m| m.session == 1), "{messages:?}");
+        let connections: BTreeSet<usize> = messages.iter().map(|m| m.connection).collect();
+        assert_eq!(connections, BTreeSet::from([0, 1, 2]));
+        let later = udp_carrier(&out).await;
+        udp_round_trip(later.as_ref(), echo, b"later").await;
+        assert_eq!(fake.udp_messages().last().unwrap().session, 2);
+    }
+
+    /// Let go of by the client: closed as its session closes a connection,
+    /// with H3_NO_ERROR.
+    async fn closed_by_the_client(connection: &quinn::Connection) {
+        let closed = timeout(BOUND, connection.closed()).await.expect("closed");
+        assert!(
+            matches!(&closed, ConnectionError::ApplicationClosed(close)
+                if close.error_code == VarInt::from_u32(0x100)),
+            "{closed:?}"
+        );
+    }
+
+    /// Design 5.3: a server going away (an HTTP/3 GOAWAY) takes no new UDP
+    /// either: the carrier's next datagram goes on a new connection, under
+    /// the session id it had, and the connection before is closed once
+    /// nothing holds it.
+    #[tokio::test]
+    async fn a_carrier_moves_off_a_connection_that_is_going_away() {
+        let echo = udp_echo_server().await;
+        let fake = FakeHysteria2::spawn(script("pw"));
+        let out = outbound(&fake, "password=pw");
+        let carrier = udp_carrier(&out).await;
+        udp_round_trip(carrier.as_ref(), echo, b"before").await;
+        let lease = timeout(BOUND, out.session.lease(&ConnectOpts::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        fake.goaway(0);
+        let deadline = Instant::now() + BOUND;
+        while out.session.serves(&lease) {
+            assert!(Instant::now() < deadline, "no GOAWAY heard");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        drop(lease);
+        udp_round_trip(carrier.as_ref(), echo, b"after").await;
+        let carried: Vec<(usize, u32)> = fake
+            .udp_messages()
+            .iter()
+            .map(|m| (m.connection, m.session))
+            .collect();
+        assert_eq!(carried, [(0, 1), (1, 1)]);
+        closed_by_the_client(&fake.connection(0)).await;
+    }
+
+    /// Dials through `inner`, the connection over its UDP flow as over an
+    /// `underlying-proxy`'s; where it leads is what `route` holds now, as a
+    /// group that is the underlying proxy leads to its member.
+    struct Rerouted {
+        inner: DirectConnector,
+        route: Mutex<Arc<u8>>,
+    }
+
+    impl Connector for Rerouted {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            self.inner.connect(target, opts)
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            self.inner.connect_udp(target, opts)
+        }
+
+        fn route(&self) -> Option<Route> {
+            Some(Route::of(&self.route.lock().unwrap()))
+        }
+    }
+
+    /// Phase 2 M7 design 3.5 and 5.3: the underlying policy leads elsewhere
+    /// now (a group's member changed). Each carrier's next datagram goes on
+    /// a new connection, dialled the new way, under the session id it had;
+    /// the tunnel under way stays on the connection before, which is closed
+    /// once nothing holds it. Said once in the log, which names the policy
+    /// and nothing secret.
+    #[tokio::test]
+    async fn carriers_move_off_a_connection_whose_underlying_policy_changed() {
+        const PASSWORD: &str = "s3cret-hy2";
+        let (log, _logging, _second) = Log::capture();
+        let (udp_echo, tcp_echo) = (udp_echo_server().await, echo_server().await);
+        let fake = FakeHysteria2::spawn(script(PASSWORD));
+        let rerouted = Arc::new(Rerouted {
+            inner: DirectConnector::new(Arc::new(SystemResolve)),
+            route: Mutex::new(Arc::new(1)),
+        });
+        let port = fake.addr().port();
+        let out = Hysteria2Outbound::new(
+            "H",
+            Target::new(HostName::parse("127.0.0.1"), port),
+            &spec(port, &format!("password={PASSWORD}")),
+            Tristate::Auto,
+            &[],
+            fake.roots(),
+            rerouted.clone(),
+        )
+        .unwrap();
+        let (one, two) = (udp_carrier(&out).await, udp_carrier(&out).await);
+        udp_round_trip(one.as_ref(), udp_echo, b"one").await;
+        udp_round_trip(two.as_ref(), udp_echo, b"two").await;
+        let mut under_way = tunnel(&out, &target(tcp_echo)).await;
+        *rerouted.route.lock().unwrap() = Arc::new(2);
+        udp_round_trip(one.as_ref(), udp_echo, b"one, moved").await;
+        udp_round_trip(two.as_ref(), udp_echo, b"two, moved").await;
+        round_trip(&mut under_way, b"still there").await;
+        let carried: Vec<(usize, u32)> = fake
+            .udp_messages()
+            .iter()
+            .map(|m| (m.connection, m.session))
+            .collect();
+        assert_eq!(carried, [(0, 1), (0, 2), (1, 1), (1, 2)]);
+        assert_eq!(fake.connections(), 2);
+        drop(under_way);
+        closed_by_the_client(&fake.connection(0)).await;
+        let log = log.text();
+        let changed = "hysteria2: the underlying policy changed; a new connection is made";
+        assert_eq!(log.matches(changed).count(), 1, "{log}");
+        assert!(log.contains("policy=H"), "{log}");
+        assert!(!log.contains(PASSWORD));
+    }
+
+    /// Carriers that open together share one connection and one
+    /// authentication, each a session of its own, with a socket of its own
+    /// on the server.
+    #[tokio::test]
+    async fn carriers_that_come_together_share_one_connection_each_its_own_session() {
+        let echo = udp_echo_server().await;
+        let fake = FakeHysteria2::spawn(script("pw"));
+        let out = Arc::new(outbound(&fake, "password=pw"));
+        let mut opening = JoinSet::new();
+        for i in 0..16u8 {
+            let out = out.clone();
+            opening.spawn(async move {
+                let carrier = udp_carrier(&out).await;
+                udp_round_trip(carrier.as_ref(), echo, &[i; 100]).await;
+                carrier
+            });
+        }
+        let mut carriers = Vec::new();
+        while let Some(carrier) = opening.join_next().await {
+            carriers.push(carrier.unwrap());
+        }
+        assert_eq!(fake.connections(), 1);
+        assert_eq!(fake.auths().len(), 1);
+        let sessions: BTreeSet<u32> = fake.udp_messages().iter().map(|m| m.session).collect();
+        assert_eq!(sessions, (1..=16).collect());
+        assert_eq!(fake.udp_outside().len(), 16);
+    }
+
+    /// A datagram that 255 fragments cannot carry, or whose name leaves no
+    /// room in a datagram, is refused, and nothing goes out; the carrier
+    /// goes on.
+    #[tokio::test]
+    async fn a_datagram_too_long_is_refused_and_nothing_goes_out() {
+        let echo = udp_echo_server().await;
+        let fake = FakeHysteria2::spawn(script("pw"));
+        let out = outbound(&fake, "password=pw");
+        let carrier = udp_carrier(&out).await;
+        // past 255 of the longest QUIC datagrams a path carries here
+        let err = carrier
+            .send_to(&vec![0u8; 400_000], &target(echo))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string()
+                .starts_with("hysteria2: a datagram longer than "),
+            "{err}"
+        );
+        let name = Target::new(HostName::Domain("a".repeat(1500)), 53);
+        let err = carrier.send_to(b"q", &name).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "hysteria2: the host name is too long for a datagram"
+        );
+        assert!(fake.udp_messages().is_empty());
+        udp_round_trip(carrier.as_ref(), echo, b"still").await;
+    }
+
+    /// Design 5.3: a carrier gone is forgotten by its connection; what the
+    /// server sends for its session afterwards is dropped.
+    #[tokio::test]
+    async fn a_carrier_gone_is_forgotten_by_its_connection() {
+        let echo = udp_echo_server().await;
+        let fake = FakeHysteria2::spawn(script("pw"));
+        let out = outbound(&fake, "password=pw");
+        let lease = timeout(BOUND, out.session.lease(&ConnectOpts::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        let udp = lease.state().udp.as_ref().expect("the server relays UDP");
+        let carrier = udp_carrier(&out).await;
+        udp_round_trip(carrier.as_ref(), echo, b"here").await;
+        assert_eq!(udp.sessions(), [1]);
+        drop(carrier);
+        assert!(udp.sessions().is_empty());
+        fake.send_udp(0, &UdpMessage::whole(1, "192.0.2.1:53", b"too late"));
+        let next = udp_carrier(&out).await;
+        udp_round_trip(next.as_ref(), echo, b"next").await;
+        assert_eq!(udp.sessions(), [2]);
+    }
+
+    /// The task that reads a connection's datagrams ends with it.
+    #[tokio::test]
+    async fn the_reader_of_datagrams_ends_with_its_connection() {
+        let fake = FakeHysteria2::spawn(script("pw"));
+        let out = outbound(&fake, "password=pw");
+        let lease = timeout(BOUND, out.session.lease(&ConnectOpts::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        let udp = lease.state().udp.as_ref().expect("the server relays UDP");
+        assert!(udp.is_reading());
+        fake.close_connections();
+        let deadline = Instant::now() + BOUND;
+        while udp.is_reading() {
+            assert!(Instant::now() < deadline, "still reading");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// `opts.timeout` bounds opening a carrier: the dial and the
+    /// authentication.
+    #[tokio::test]
+    async fn opening_a_carrier_is_bounded_by_its_time() {
+        // nothing speaks QUIC on this port
+        let quiet = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = quiet.local_addr().unwrap().port();
+        let fake = FakeHysteria2::spawn(script("pw"));
+        let out = outbound_with(&spec(port, "password=pw"), port, &fake);
+        let opts = ConnectOpts {
+            timeout: Duration::from_millis(500),
+        };
+        let started = Instant::now();
+        let err = out.open_udp(&opts).await.err().unwrap();
+        assert!(matches!(err, OutboundError::Timeout), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Captures what is logged, formatted.
+    #[derive(Clone, Default)]
+    struct Log(Arc<Mutex<Vec<u8>>>);
+
+    impl Log {
+        /// What this thread logs, at every level, while the guard and the
+        /// second dispatcher live. While one dispatcher alone is
+        /// registered, tracing-core asks only the thread that first reaches
+        /// a call site whether it is wanted: a site another test reaches
+        /// first would stay shut on this thread too. With a second one it
+        /// asks every dispatcher.
+        fn capture() -> (Log, tracing::subscriber::DefaultGuard, tracing::Dispatch) {
+            let log = Log::default();
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let logging = tracing::subscriber::set_default(subscriber);
+            let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            (log, logging, second)
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl io::Write for Log {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What datagrams carry shows nowhere — in no error and in no log
+    /// line, not even at the finest level — whether they go through, are
+    /// refused, are no message, find no session, or go out again after a
+    /// close.
+    #[tokio::test]
+    async fn payloads_never_show_in_errors_or_logs() {
+        const MARK: &[u8] = b"payload-7c1e9a";
+        let (log, _logging, _second) = Log::capture();
+        let echo = udp_echo_server().await;
+        let fake = FakeHysteria2::spawn(script("pw"));
+        let out = outbound(&fake, "password=pw");
+        let carrier = udp_carrier(&out).await;
+        udp_round_trip(carrier.as_ref(), echo, MARK).await;
+        let err = carrier
+            .send_to(&MARK.repeat(30_000), &target(echo))
+            .await
+            .unwrap_err();
+        // no message (an address of no length), then one for no session:
+        // read before the echo that follows them
+        let mut junk = vec![0, 0, 0, 1, 0, 0, 0, 1, 0];
+        junk.extend_from_slice(MARK);
+        fake.connection(0).send_datagram(junk.into()).unwrap();
+        fake.send_udp(0, &UdpMessage::whole(9, "192.0.2.1:53", MARK));
+        udp_round_trip(carrier.as_ref(), echo, MARK).await;
+        fake.close_connections();
+        until_answered(carrier.as_ref(), echo, MARK).await;
+        let text = format!("{err} {err:?}");
+        assert!(!text.contains("payload-7c1e9a"), "{text}");
+        let log = log.text();
+        assert!(
+            log.contains("hysteria2: a datagram that is no UDP message is dropped"),
+            "{log}"
+        );
+        assert!(
+            log.contains("UDP session 1 moves to a new connection"),
+            "{log}"
+        );
+        assert!(!log.contains("payload-7c1e9a"));
     }
 }

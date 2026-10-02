@@ -9,6 +9,7 @@
 //! `Hysteria-CC-RX` changes nothing here (M7-D10).
 
 use super::padding;
+use super::udp::Datagrams;
 use crate::session::{Protocol, close};
 use http::header::{HeaderName, HeaderValue};
 use http::{HeaderMap, Method, Request, Uri};
@@ -52,10 +53,9 @@ pub(crate) struct Authenticated {
     /// control stream, which a server may take for the end of HTTP/3 on
     /// the connection.
     h3: h3::Client,
-    /// `Hysteria-UDP`: whether the server relays UDP.
-    // only tests read it until the UDP carriers do (M7a task 6)
-    #[allow(dead_code)]
-    pub(crate) udp: bool,
+    /// The connection's UDP sessions, when the server relays UDP
+    /// (`Hysteria-UDP`).
+    pub(super) udp: Option<Datagrams>,
 }
 
 impl Auth {
@@ -124,7 +124,10 @@ impl Protocol for Auth {
         Box::pin(async move {
             let h3 = h3::Client::new(connection.clone());
             match self.authenticate(&h3).await {
-                Ok(udp) => Ok(Authenticated { h3, udp }),
+                Ok(udp) => Ok(Authenticated {
+                    h3,
+                    udp: udp.then(|| Datagrams::start(connection)),
+                }),
                 Err(e) => {
                     close(connection, H3_GENERAL_PROTOCOL_ERROR);
                     Err(e)

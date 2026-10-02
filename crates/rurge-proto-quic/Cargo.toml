@@ -11,6 +11,7 @@ repository.workspace = true
 rurge-config.workspace = true
 rurge-net.workspace = true
 rurge-proto.workspace = true
+bytes.workspace = true
 getrandom.workspace = true
 http.workspace = true
 quinn.workspace = true
@@ -22,6 +23,7 @@ tracing.workspace = true
 [dev-dependencies]
 rurge-net = { workspace = true, features = ["testing"] }
 rurge-proto = { workspace = true, features = ["testing"] }
+tracing-subscriber.workspace = true
 
 [features]
 # Loopback QUIC servers (`rurge_proto_quic::testing`); enabled by dependants' dev-dependencies.
