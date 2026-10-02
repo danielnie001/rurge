@@ -24,10 +24,11 @@ const SECRET_KEYS: [&str; 7] = [
 /// token. A `[WireGuard]` peer's `preshared-key` is the manual's spelling;
 /// `pre-shared-key` stays for profiles written the other way. An `external`
 /// policy's `args` often carry a password (`sshpass -p …`, M4-D12). The
-/// camouflage host of `obfs-host` can identify the user (phase 2 M6 design 6).
-/// Over-redacting is the safe side for an endpoint whose purpose is safe
-/// output.
-const SECRET_PARAMS: [&str; 18] = [
+/// camouflage host of `obfs-host` can identify the user (phase 2 M6 design 6),
+/// and behind a front that routes by path `obfs-uri` is a shared secret, as
+/// `ws-path` is. Over-redacting is the safe side for an endpoint whose
+/// purpose is safe output.
+const SECRET_PARAMS: [&str; 19] = [
     "password",
     "psk",
     "private-key",
@@ -46,6 +47,7 @@ const SECRET_PARAMS: [&str; 18] = [
     "test-url",
     "args",
     "obfs-host",
+    "obfs-uri",
 ];
 const KEY_AT_KEYS: [&str; 4] = [
     "http-api",
@@ -54,8 +56,9 @@ const KEY_AT_KEYS: [&str; 4] = [
     "socks5-listen",
 ];
 /// Policy types written `type, server, port, ...`. Surge documents positional
-/// credentials (`username, password`) for the four classic ones; for the rest
-/// a positional value from index 3 on is never meaningful — it is a stray
+/// credentials (`username, password`) for the four classic ones, and rurge
+/// reads them for `h2-connect` too (phase 2 M6 design 16); for the rest a
+/// positional value from index 3 on is never meaningful — it is a stray
 /// token (`W0001`), often a password written the way another type takes it —
 /// and over-redacting is this module's stated bias.
 const SERVER_PROXY_TYPES: [&str; 16] = [
@@ -574,15 +577,16 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
         );
     }
 
-    /// The camouflage host of an `ss` / `snell` line (phase 2 M6 design 6);
-    /// `obfs-uri` and the method stay.
+    /// The camouflage host and path of an `ss` / `snell` line (phase 2 M6
+    /// design 6): behind a front that routes by path the path is a shared
+    /// secret, as `ws-path` is; the method stays.
     #[test]
-    fn an_obfs_line_loses_its_host() {
+    fn an_obfs_line_loses_its_host_and_path() {
         assert_eq!(
             redact_definition(
-                "ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=pw, obfs=http, obfs-host=my.cdn.test, obfs-uri=/x"
+                "ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=pw, obfs=http, obfs-host=my.cdn.test, obfs-uri=/s3cretPath"
             ),
-            "ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=***, obfs=http, obfs-host=***, obfs-uri=/x"
+            "ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=***, obfs=http, obfs-host=***, obfs-uri=***"
         );
         assert_eq!(
             redact_definition(
