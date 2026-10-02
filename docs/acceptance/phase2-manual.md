@@ -156,6 +156,10 @@
 - [ ] 不支持 UDP 的策略：规则把 UDP 分到一条 `http` 策略，默认 REJECT（记录写 `policy does not support UDP`）；配置 `udp-policy-not-supported-behaviour = DIRECT` 后改经 DIRECT。
 - [ ] 关联结束：客户端断开（关闭软件），它的全部 UDP 记录随即结束。
 - [ ] NAT 后面的中继：上游 SOCKS5 节点放在带 NAT 的云主机上（本机私网地址、另有公网地址），看它对 UDP ASSOCIATE 回的中继地址：回未指定地址（`0.0.0.0`）或公网地址时 UDP 能往返；回私网地址时 UDP 不通（已知限制，见兼容性清单 `socks5` 一行），记下节点软件与它的设置。
+- [ ] 客户端不告而别（合并后的复查）：经 rurge 的 SOCKS5 进行语音通话时，把客户端那台机器直接断网（拔网线或关 Wi-Fi，不退出软件）：约 3～4 分钟内这个关联结束（TCP keepalive：空闲 60 秒后每 15 秒探测一次），它的 UDP 记录随之结束。
+- [ ] 重载后源端口不变（合并后的复查）：经 DIRECT 的语音通话进行中执行 `rurge reload`（只改无关的内容），通话不断；STUN 检测重载前后的外部端口相同。
+- [ ] Windows 上的 `interface`（合并后的复查）：`direct` 策略写 `interface=<网卡名>`，规则把 UDP 分到它，经 SOCKS5 UDP 的 DNS 查询得到回答，抓包看到查询从那块网卡发出。
+- [ ] macOS 上的双栈监听（合并后的复查）：`socks5-listen = [::]:<端口>`，一个 IPv4 客户端经 SOCKS5 UDP 发 DNS 查询，得到回答。
 
 ## M5b　TLS 族的 UDP
 
@@ -172,6 +176,8 @@
 
 - [ ] WireGuard 的 UDP：规则把 UDP 分到 `wireguard` 策略，经 SOCKS5 UDP 发 DNS 查询（如 Proxifier 代理 `nslookup example.com 1.1.1.1`）得到回答；经它进行一次语音通话或联机游戏；用 NAT 类型检测工具（STUN）检测，结果是 Full Cone（服务端的出口须是全锥）。
 - [ ] 经底层策略的隧道：`wireguard` 策略写 `underlying-proxy=<SOCKS5 节点>`（节点 `udp-relay=true`），TCP 与 UDP 都能经隧道往返；把底层策略换成一条 `http` 策略，拨号失败，请求记录写 `via <底层策略>: the underlying policy cannot carry UDP`。
+- [ ] 底层是组时跟随它的选择（合并后的复查）：`wireguard` 策略写 `underlying-proxy=<select 组>`（组里两个 `udp-relay=true` 的 SOCKS5 节点），经隧道的下载进行中把组切到另一个节点（`POST /v1/policy_groups/select`）：日志有一条 `wireguard: the underlying policy changed; the peers are dialled anew`，新节点上出现新的 UDP 关联，下载不中断（手册："a change of the effective policy resets the WireGuard transport sockets"）。
+- [ ] WARP 上的 UDP：用 M4b 一节 WARP 的配置（带 `client-id`），规则把 UDP 分到这条 `wireguard` 策略，经 SOCKS5 UDP 发 DNS 查询（如 Proxifier 代理 `nslookup example.com 1.1.1.1`）得到回答；经它进行一次语音通话或联机游戏能通。
 - [ ] UDP 测试：给一个节点写 `test-udp=apple.com@8.8.8.8`，`POST /v1/policies/test` 的结果里有 `udp` 键与延迟；不写 `test-udp`、写 `[General] proxy-test-udp` 时同样有；`http` 策略的结果里没有 `udp` 键。
 - [ ] `smart` 与 UDP：`smart` 组里放一个 UDP 通的节点与一个 UDP 不通的节点（服务端关掉 UDP），经这个组发一阵 DNS 查询后，UDP 不通的节点的站点记忆里记为失败（日志的健康切换），通的节点记为成功。
 - [ ] `dns-follow-interface`：`direct` 策略写 `interface=<第二块网卡>, dns-follow-interface=true`，`dns-server` 写一个只经第二块网卡可达的 DNS 服务器（或用抓包确认），规则把某个域名分到这条策略，访问它：抓包看到 DNS 查询从第二块网卡发出；配了 `encrypted-dns-server` 时查询照常走加密 DNS，日志有一条 `dns-follow-interface: the encrypted DNS servers are asked as usual` 的说明。

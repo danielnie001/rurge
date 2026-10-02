@@ -320,7 +320,7 @@ flowchart LR
 | FR-OUT-09 | 出站网卡绑定与 `allow-other-interface`、`dns-follow-interface` | P0 | 2 |
 | FR-OUT-10 | 连通性测试：HEAD 两次取第二次；超时（DIRECT 10 秒）；UDP 测试；结果缓存、按需重测、网络变化失效；测试请求出现在请求记录并可区分 | P0 | 2 |
 | FR-OUT-11 | QUIC 阻断：策略级 `block-quic` 与全局 `block-quic` 四种覆盖；增强模式下对 UDP 443 生效 | P0 | 2（TUN：3） |
-| FR-OUT-12 | WireGuard：多 peer 最长前缀路由、握手 / 重协商 / keepalive / 过期定时器、分片重组、`client-id`、原生 RTT 探测与 URL 测试两种模式、额外 10 秒初始化、DSCP 0x88、网络变化重建、本地隧道地址 ICMP echo | P0 | 2 |
+| FR-OUT-12 | WireGuard：多 peer 最长前缀路由、握手 / 重协商 / keepalive / 过期定时器、分片重组、`client-id`、原生 RTT 探测与 URL 测试两种模式、额外 10 秒初始化、DSCP 0x88、网络变化与底层策略（`underlying-proxy`）的去处变化时重建、本地隧道地址 ICMP echo | P0 | 2 |
 | FR-OUT-13 | 外部代理程序：进程启动 / 自动重启 / 退出清理；`addresses` 从 TUN 路由排除；外部进程自身流量走 DIRECT；日志写数据目录 | P1 | 2 |
 | FR-OUT-14 | 策略错误通知与 `no-error-alert` | P1 | 6 |
 | FR-OUT-15 | Snell v6 与 v5 的 QUIC Proxy Mode、Gecko 混淆、Tailscale 的可行性评估报告 | P2 | 2 / 远期 |

@@ -4384,6 +4384,10 @@ git commit -m "docs: M5c WireGuard 的 UDP 与其余——兼容性清单、API�
 | 10 | 终审 | `wireguard: the peer's carrier has ended` 按与"peer 连不上"相同的机制限频（每个策略的每个 peer 5 分钟至多一次 `warn!`，其余 `debug!`；另一张表 `ENDED_SAID`；新用例 `a_carrier_that_keeps_ending_is_said_so_once_in_a_while`） | 终审：底层中继反复关闭关联时每约 10 秒一条告警 |
 | 11 | 终审 | `ResolverCell::resolve_via` 加单元用例 `the_cell_hands_lookups_through_a_via_on`（转给当前解析器自己的 `resolve_via`，带着给它的 `Via`） | 终审：此前没有经 `ResolverCell` 的 `resolve_via` 的用例 |
 | 12 | 门禁 | 最终门禁（终审修正 9741d76 之后）：fmt、clippy 通过；`cargo test --workspace --no-fail-fast` 53 个测试二进制 1267 通过 / 0 失败 / 2 忽略，一次通过，没有重跑 | Task 6 末为 1264，终审修正加了 #8、#10、#11 的三个用例 |
+| 13 | 合并后 | `smart` 的 UDP：发送失败（第一个包发不出去，如 vmess 服务端拒绝连接）与首字节之前载体死掉都标记 `upstream_failed`，结束钩子据此计该成员失败（用例 `a_member_whose_udp_send_fails_counts_against_it`）；3 秒规则只对发往地址的 53 / 443 流生效（`silence_tells`，用例 `where_silence_tells`） | 复查：载体打开之后的 UDP 失败从不计分，"TCP 正常、UDP 坏了"的成员一直被选中；名字目标的回包归流不准，3 秒规则会误判 |
+| 14 | 合并后 | `wireguard` 跟随底层策略：`Connector::route` 与 `rurge_net::connector::Route`（持有对象、按地址比较）、`PolicyRegistry::relay_now`（`named` 多一个 `live` 参数，`relay_now` 传 `false`）、`ChainConnector::route`、设备每个 tick 比较一次（`Driver::rerouted`，变了就重拨全部载体）（用例 `a_new_route_underneath_gives_every_peer_a_new_carrier`、`the_route_follows_the_member_of_the_group`——含"不唤醒测速"的断言、`a_tunnel_follows_the_member_of_its_underlying_group`） | 复查：手册明确要求"a change of the effective policy resets the WireGuard transport sockets"，原先只要旧节点还通就一直用它 |
+| 15 | 合并后 | 经隧道 DNS 的 UDP 目标名：开流时的解析限时 10 秒（引擎侧，M5a 计划合并后 #21；用例 `udp_to_a_name_through_a_tunnel_that_never_comes_up_fails_in_time`，约 10 秒） | 复查：`established()` 没有时限，隧道握不上手时流无限期挂着 |
+| 16 | 合并后 | 合并后复查的门禁：fmt、clippy 零警告；`cargo test --workspace --no-fail-fast` 1573 通过 / 0 失败 / 2 忽略，一次通过 | 本轮复查的修正加了 22 个用例（分布在 `rurge-net`、`rurge-inbound`、`rurge-policy`、`rurge-proto-wireguard` 与 `rurge-engine`） |
 
 ## 延后事项
 
@@ -4402,5 +4406,9 @@ git commit -m "docs: M5c WireGuard 的 UDP 与其余——兼容性清单、API�
 | 11 | 换载体：`connect_udp` 超过 10 秒时同一个 peer 可能同时有两次拨号；换过一次载体、之后一直连不上的 peer 每 10 秒重拨一次、没有退避（从没换过的是 5 分钟一次） | 有用户报告再说 |
 | 12 | 告警限频表 `UNREACHABLE_SAID` / `ENDED_SAID` 从不清理（大小以"策略 × peer"为上限） | 以后顺手改 |
 | 13 | UDP 测试：要有 `registry.test_case`，没有 URL / 原生测速方式的策略就没有 UDP 结果；`test_policies` 因未知名字报错时 `test_udp` 照样跑（无害）；没有 API 层面对 `udp` 键 JSON 形状的用例（均按计划） | 需要时另议 |
-| 14 | `smart` 的 UDP：载体打不开的任何错误都算成员失败（TCP 只算可重试的那些，按计划）；载体打开之后目标解析失败不回报 | 有用户报告再说 |
+| 14 | `smart` 的 UDP：载体打不开的任何错误都算成员失败（TCP 只算可重试的那些，按计划）；载体打开之后目标解析失败不回报（合并后：第一个包发不出去已计入，见 #13） | 有用户报告再说 |
 | 15 | `dns-follow-interface`：经网卡的上游与缓存只按网卡名区分（`allow-other-interface` 不参与）；经网卡问 DNS 的 socket 也用 7 MiB 收发缓冲 | 以后顺手改 |
+| 16 | （合并后的复查）经组中继的 UDP 载体（`ChainConnector::open_udp`，如 `ss` / `socks5` 经组）同样不跟随组的切换，只有 `wireguard` 跟随；底层是 `smart` 组时，`route` 按"最近最常用的成员"看，可能随别的会话的用量变化而重拨隧道 | 有用户报告再说 |
+| 17 | （合并后的复查）`dns-follow-interface` 把 AAAA 迟到的部分结果当成完整结果缓存；`lookup_on` 复制了解析主路径，漏了 stale 与 AAAA 的处理（规范轴） | 以后顺手改 |
+| 18 | （合并后的复查）WireGuard 设备一批收 256 个包，而隧道里每个 UDP socket 只有 64 个包的缓冲，突发时必然丢包（见 #4） | 有吞吐问题时 |
+| 19 | （合并后的复查）`udp_probe` 的错误文本带查询名（名字来自配置，危害小） | 以后顺手改 |

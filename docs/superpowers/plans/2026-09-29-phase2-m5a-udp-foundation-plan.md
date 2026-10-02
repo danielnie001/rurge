@@ -5516,6 +5516,17 @@ git commit -m "docs: M5a UDP 地基——兼容性清单、API 文档的 transpo
 | 12 | 全分支评审 | `serve` 用 drop guard 结束关联（future 被丢弃时流也结束）；关联数上限的告警改为 `the new association is refused`（`warn_udp_limit` 的调用方给出完整说明）；用例的 `udp_echo` 只在 `ConnectionReset` 时继续、其它错误退出 | 小修：原来只有正常返回才结束关联；告警把拒绝关联说成"新流丢弃"；出错时空转 |
 | 13 | 全分支评审 | 文档：兼容性清单 `PROTOCOL` 行改 🟡（UDP 流的 STUN / DNS 嗅探未做），`socks5-listen` 行补上 UDP 流的源端口是控制连接的（`SRC-PORT`）、失败流 5 秒后重试与 IPv4 映射地址，`socks5` 行补上"只替换未指定的中继地址，NAT 后面的中继回私网地址时到不了"与只解析一次；手工验收加 NAT 中继一项；`PacketSocket::recv_from` 与 `Socks5Udp` 收包写明缓冲给 64 KiB（Windows 放不下时报 `WSAEMSGSIZE`，SOCKS5 头要占位）；设计第 18 节 | 文档与交付的行为一致 |
 | 14 | 全分支评审 | 修正后的全工作区门禁：52 个测试二进制，1217 通过、0 失败、2 忽略（fmt、clippy 零警告） | — |
+| 15 | 合并后 | `open_packet`：IPv6 的 UDP socket 在 `interface` 之前设 `only_v6`，网卡绑定已经绑上的 socket 不再 `bind`（`is_bound`；用例 `a_carrier_keeps_the_binding_of_its_interface`，钩子照 Windows 的做法绑到地址）；`a_closed_port_does_not_stop_a_direct_carrier` 真的释放端口（原先第二个 `let closed` 只遮蔽了变量名，socket 没释放，用例走不到 ICMP 不可达那条路径）；`a_direct_carrier_talks_to_any_address` 的三处接收加 5 秒上界 | 复查：Windows 上写了 `interface` 的策略开不出 UDP 载体（实测 10022，同一个钩子下 TCP 正常）；规范：等待必须有界 |
+| 16 | 合并后 | 收包任务发给客户端失败时只丢那一个包、记 `debug!`，不再结束（用例 `an_answer_too_long_for_the_client_is_dropped_alone`） | 复查：全锥下任何远端一个加上 SOCKS5 头后超长的包就能拆掉载体（实测） |
+| 17 | 合并后 | 发往上游失败：`InvalidInput` 或带系统错误码的错误只丢那一个包（原因写进说明，只写第一个；`lost_alone`）；其余失败标记 `upstream_failed`、记为失败并走 `RETRY_AFTER` 的等待；首字节之前载体死掉同样标记（用例 `a_flow_whose_sends_fail_rests_before_it_tries_again`、`a_datagram_the_system_turns_away_is_dropped_alone`——向广播地址发包，没有 `SO_BROADCAST` 时三个平台都拒绝） | 复查：发送失败的流每个包重开一条（实测 10 个包 10 条记录），与 P10 / 设计第 18 节第 6 条不符；只按"失败即等 5 秒"会让 macOS 上偶发的 `ENOBUFS` 卡住整条流 5 秒 |
+| 18 | 合并后 | 发送与关联结束赛跑并以 `SEND_TIMEOUT`（`CONNECT_TIMEOUT` + 5 秒）为限，超时作废载体（取消 `dead`）；kill 不打断发送（用例 `a_send_that_hangs_fails_the_flow_and_its_carrier`、`the_end_of_the_association_cuts_a_send_short`，暂停的时钟） | 复查：卡在 TCP 背压上的发送，kill、关联结束与空闲回收都打断不了 |
+| 19 | 合并后 | `rurge_net::socket::keep_alive`（空闲 60 秒后每 15 秒探测），`connect_one` 与监听的 accept 都调用（用例 `a_direct_connection_keeps_itself_alive`、`an_accepted_connection_keeps_itself_alive`；`rurge-inbound` 的开发依赖加 `socket2`，已在锁文件里） | 复查：不告而别的客户端让关联永久泄漏；上游关联静默死掉后成黑洞 |
+| 20 | 合并后 | `Routes::flow_for`：精确匹配之外，先找发往同一端口的名字中最早的流，再退到最早的流（延后事项 #9；用例 `answers_for_a_name_find_a_flow_on_their_port`、`answers_for_names_count_for_their_flows`；`Socks5Script.udp_names_to` 让假服务端把名字目标发往一个地址） | 复查：交接时丢了的延后事项（M5b、M5c 都没接） |
+| 21 | 合并后 | 开流时的 `resolve` 套 `CONNECT_TIMEOUT`（`looking up <名字> timed out`；用例在 M5c 计划合并后的行） | 复查：隧道 DNS 等握手时流无限期挂着 |
+| 22 | 合并后 | 排队按字节限制：`Queued`（随 `Drop` 归还额度），每个关联 `QUEUED_BYTES` = 1 MiB，首包也计入；被拒或打开失败的流立即放掉首包（用例 `what_waits_for_an_outbound_is_bounded_in_bytes`、`a_refused_flow_holds_no_room`） | 复查：只按包数限制，一个关联最多约 4 GiB；首包原先在被拒的流里占着到空闲为止 |
+| 23 | 合并后 | 载体槽（`Slot`）记失败次数：打开期间等着的流带着同一原因失败，之后来的流再试；`Carriers::get` 的错误改为 `String`（用例 `the_flows_waiting_on_an_opening_that_fails_fail_with_it`，暂停的时钟：修前 30 秒、修后 10 秒） | 复查：第 k 个等着的流约等 k × 10 秒 |
+| 24 | 合并后 | 注册表沿用内置 DIRECT（`PolicyRegistry.environment` 与这一代相同时；注册表的两条沿用 / 重建用例加上 `DIRECT`，端到端用例 `a_reload_keeps_the_source_port_of_direct`） | 复查：重载与订阅更新后同一关联的新目标换了源端口 |
+| 25 | 合并后 | 入站：关联端口是 IPv6 socket 时回包发往 IPv4 客户端的映射地址（`reply_ip`；用例 `an_ipv4_client_hears_back_through_a_dual_stack_port`，Windows 上修前报 10014） | 复查：macOS（XNU）与 Windows 的 IPv6 socket 只接受映射形式 |
 
 ## 延后事项
 
@@ -5524,14 +5535,21 @@ git commit -m "docs: M5a UDP 地基——兼容性清单、API 文档的 transpo
 | 1 | STUN 与 DNS 的嗅探（`PROTOCOL,STUN` 对 UDP 流不命中；DNS 流只按端口 53 定回收时限）（P6） | 需要时另议 |
 | 2 | 全锥时"收到其它来源的包"的标注：请求记录只有 `error` 能写说明（P9） | 请求记录有说明字段时 |
 | 3 | `ChainConnector::connect_udp`（把包载体包成到固定服务器的 `Datagram`）（P15） | M5c（`wireguard` 经 `underlying-proxy`） |
-| 4 | UDP 流不计入 REJECT 的自动升级（P13） | 需要时另议 |
+| 4 | UDP 流不计入 REJECT 的自动升级（P13；合并后的复查已登记进兼容性清单） | 需要时另议 |
 | 5 | `DirectPacket::recv_from` 先轮询 IPv4 再 IPv6：IPv4 持续满载时 IPv6 的回包可能饿死；IPv4 映射的 IPv6 目标发往只收 IPv6 的那个 socket | 有用户报告再说 |
-| 6 | 声明端口的严格程度：没声明端口（0）时由客户端 IP 的第一个包钉住端口，哪怕是垃圾包（回环上任何本机进程都能抢先）；没有声明端口 0、IPv4 映射客户端、先发后收的端到端用例；BND 里丢了 IPv6 的 scope id | 有用户报告再说 |
-| 7 | 发送遇到 `ConnectionReset`（Windows 把 ICMP 不可达报在同一 socket 上）时流按失败结束；收包任务因 `client.send` 失败结束时，流的说明写成 `the outbound's UDP socket has closed`（原因说错）；刚交出的载体随即死掉时新流失败（下一个包恢复） | 以后顺手改 |
+| 6 | 声明端口的严格程度：没声明端口（0）时由客户端 IP 的第一个包钉住端口，哪怕是垃圾包（回环上任何本机进程都能抢先）；没有声明端口 0、IPv4 映射客户端、先发后收的端到端用例；BND 里丢了 IPv6 的 scope id——合并后的复查：比这更重，关联端口绑在链路本地地址上时丢了 scope id，绑定直接失败 | 有用户报告再说 |
+| 7 | ~~发送遇到 `ConnectionReset` 时流按失败结束；收包任务因 `client.send` 失败结束时说明说错~~ 已在合并后解决（#16、#17：系统报的发送错误只丢那个包，发给客户端失败不再结束收包任务）；刚交出的载体随即死掉时新流失败（下一个包恢复） | 以后顺手改 |
 | 8 | 关联里的载体表（`Carriers`）条目在关联存续期间不删：每用过一个出站留一条（多次重载后积累） | 以后顺手改 |
-| 9 | `Routes::flow_for` 按 `Target` 精确比较：回包来源写成名字的出站（经链等）把全部回包记到最早的流上 | M5b（vmess 等协议的归流一起看） |
+| 9 | ~~`Routes::flow_for` 按 `Target` 精确比较~~ 已在合并后解决（#20：名字目标先按端口归流）；同一载体上几条名字流共用一个端口时仍归到其中最早的那条 | 已解决（余下的接受） |
 | 10 | 持续使用的 DNS 流每 10 秒回收一次，下一个查询开新流（多一条请求记录） | 有用户报告再说 |
 | 11 | 入站关联端口的接收缓冲用系统默认值，没有调大 | 有吞吐问题时 |
 | 12 | `ChainConnector::open_udp` 与 `connect_tcp` 的前导（查注册表、已移除、REJECT 带说明）重复；这几个分支与 `external` 在 `udp-relay=false` 时的 `open_udp` 没有单元测试；`external` 关联的中继 socket 用 `ConnectOpts::default()` | M5c 动 `ChainConnector` 时 |
 | 13 | 用例的缺口：嗅探缺固定位清零与 v1 类型 1 的反例；`per_policy_block_quic_follows_the_terminal_policy` 的反向断言只查说明不是 `QUIC blocked`；`tests/udp.rs` 的 `routed` 在记录从进行中移到最近时可能重复计数；没有伪造来源的端到端用例；`SessionInfo::udp` 没有直接用例 | 以后顺手改 |
 | 14 | `tests/interop/README` 的条目顺序（UDP 一条夹在 https 与 socks5 之间）；`socks-helper` 头注释过长，`udp_goes_through_the_program` 的回显任务没有 abort | 以后顺手改 |
+| 15 | （合并后的复查）`socks5` 经不载 UDP 的 `underlying-proxy` 时，要先完整握手、建好关联才报错，而且每 5 秒重来一遍 | 以后顺手改 |
+| 16 | （合并后的复查）DIRECT 的 UDP 对 IP 字面量也套用 `ip-version`（TCP 只对名字套用） | 有用户报告再说 |
+| 17 | （合并后的复查）被 kill 的 UDP 流记成"完成"，TCP 记成"失败"；只丢一个包的原因只记第一个 | 以后顺手改 |
+| 18 | （合并后的复查）端口 53 的流是载体上唯一的流时，它的回收连带关掉载体，在途的回答随之丢失 | 有用户报告再说 |
+| 19 | （合并后的复查）系统报的发送错误一律只丢那个包：持续的系统错误（例如 Windows 上网卡地址变了之后，`interface` 绑在旧地址上的载体每次发送都报地址不可用）既不让流失败也不换载体——网卡绑定的载体在地址变化后不自愈 | 随阶段 3 的网络变化探测 |
+| 20 | （合并后的复查，范围外）双栈监听上 `SRC-IP` 规则匹配不到 IPv4 客户端：客户端源地址是 `::ffff:` 映射形式 | 阶段 1 入站，以后顺手改 |
+| 21 | （合并后的复查，规范轴）SOCKS 地址的编解码写了两遍；`ConnectionReset` 的吞法散在 6 处；限频日志有三套写法 | 以后顺手改 |
