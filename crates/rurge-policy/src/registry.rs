@@ -246,6 +246,9 @@ pub struct PolicyRegistry {
     order: Vec<String>,
     lines: HashMap<String, Line>,
     direct: OutboundRef,
+    /// What the factory captured by value when `direct` was built
+    /// (`OutboundFactory::environment`).
+    environment: String,
     rejects: [OutboundRef; 4],
     selections: Arc<SelectionTable>,
     empty_group: EmptyGroup,
@@ -422,10 +425,16 @@ impl PolicyRegistry {
         empty_group: EmptyGroup,
         auto: &Arc<AutoGroups>,
     ) -> Result<PolicyRegistry, BuildError> {
-        let direct: OutboundRef = Arc::new(Direct::new(
-            factory.direct_connector(&CommonOpts::default()),
-        ));
         let environment = factory.environment();
+        // the built-in DIRECT is kept as long as what it was built with: a
+        // UDP association's new flows keep its carrier, and so their source
+        // port (full cone)
+        let direct = match previous {
+            Some(p) if p.environment == environment => p.direct.clone(),
+            _ => Arc::new(Direct::new(
+                factory.direct_connector(&CommonOpts::default()),
+            )),
+        };
         let outbound_entry = |spec: &PolicySpec, proxy: bool| -> Result<Entry, BuildError> {
             let fingerprint = fingerprint(spec, cfg, &environment);
             let kept = match previous.and_then(|p| p.entries.get(&spec.name)) {
@@ -600,6 +609,7 @@ impl PolicyRegistry {
             order: table.order,
             lines: table.lines,
             direct,
+            environment,
             rejects,
             selections,
             empty_group,
@@ -1638,7 +1648,9 @@ B = https, b.example, 443, client-cert=cert1\nCorp = direct, interface=eth9\n\
         // an unrelated line is added above: every span moves, nothing else does
         let moved = REUSE.replace("[Proxy]\n", "[Proxy]\nNew = http, n.example, 80\n");
         let second = generation(&moved, &factory, Some(&first));
-        for name in ["A", "B", "Corp"] {
+        // the built-in DIRECT too: a UDP association's new flows keep its
+        // carrier, and the carrier its source port
+        for name in ["A", "B", "Corp", "DIRECT"] {
             assert!(
                 Arc::ptr_eq(&outbound_of(&first, name), &outbound_of(&second, name)),
                 "{name} was rebuilt"
@@ -1690,7 +1702,7 @@ B = https, b.example, 443, client-cert=cert1\nCorp = direct, interface=eth9\n\
             ..FakeFactory::new()
         };
         let second = generation(REUSE, &other, Some(&first));
-        for name in ["A", "B", "Corp"] {
+        for name in ["A", "B", "Corp", "DIRECT"] {
             assert!(
                 !Arc::ptr_eq(&outbound_of(&first, name), &outbound_of(&second, name)),
                 "{name} survived a change of environment"

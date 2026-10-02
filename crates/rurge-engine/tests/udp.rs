@@ -137,6 +137,24 @@ async fn a_datagram_goes_direct_and_comes_back() {
     assert!(r.connect_ms.is_some() && r.first_byte_ms.is_some(), "{r:?}");
 }
 
+/// A reload keeps the built-in DIRECT: the association's flow to a new
+/// target leaves from the source port the earlier flows had (full cone).
+#[tokio::test]
+async fn a_reload_keeps_the_source_port_of_direct() {
+    let h = harness(Profile::default()).await;
+    let ((one, seen_one), (two, seen_two)) = (udp_echo().await, udp_echo().await);
+    let association = udp_associate(h.socks()).await;
+    association.send("127.0.0.1", one.port(), b"before").await;
+    assert_eq!(association.recv().await, (one, b"before".to_vec()));
+    let next = Profile::default().text(h.dns.addr());
+    h.engine
+        .swap_runtime(runtime(h.dir.path(), &next, h.engine.shared()).await);
+    association.send("127.0.0.1", two.port(), b"after").await;
+    assert_eq!(association.recv().await, (two, b"after".to_vec()));
+    let (from_one, from_two) = (seen_one.lock().unwrap()[0], seen_two.lock().unwrap()[0]);
+    assert_eq!(from_one, from_two);
+}
+
 /// DIRECT looks a name up here (with the profile's DNS) and sends to the
 /// address; the record keeps the name.
 #[tokio::test]
