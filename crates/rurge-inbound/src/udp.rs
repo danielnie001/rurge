@@ -17,6 +17,10 @@ use tokio::net::UdpSocket;
 pub(crate) struct Socks5UdpClient {
     socket: UdpSocket,
     client_ip: IpAddr,
+    /// Where the answers go: `client_ip`, mapped to IPv6 for an IPv4 client
+    /// when the socket is an IPv6 one (a dual-stack listener's) — macOS and
+    /// Windows send to no other form from it.
+    reply_ip: IpAddr,
     client_port: OnceLock<u16>,
 }
 
@@ -26,9 +30,15 @@ impl Socks5UdpClient {
         if declared_port != 0 {
             let _ = client_port.set(declared_port);
         }
+        let client_ip = canonical(client_ip);
+        let reply_ip = match (client_ip, socket.local_addr()) {
+            (IpAddr::V4(v4), Ok(local)) if local.is_ipv6() => IpAddr::V6(v4.to_ipv6_mapped()),
+            _ => client_ip,
+        };
         Socks5UdpClient {
             socket,
-            client_ip: canonical(client_ip),
+            client_ip,
+            reply_ip,
             client_port,
         }
     }
@@ -129,7 +139,7 @@ impl UdpClient for Socks5UdpClient {
             };
             datagram.extend_from_slice(payload);
             self.socket
-                .send_to(&datagram, SocketAddr::new(self.client_ip, *port))
+                .send_to(&datagram, SocketAddr::new(self.reply_ip, *port))
                 .await?;
             Ok(())
         })
@@ -162,6 +172,48 @@ mod tests {
         assert_eq!(parse_header(&bad), None, "no host name");
         assert_eq!(parse_header(&[0, 0, 0, 1, 10]), None, "cut short");
         assert_eq!(parse_header(&[0, 0, 0, 9, 0, 0]), None, "unknown type");
+    }
+
+    /// On a dual-stack listener the association's port is an IPv6 socket
+    /// that takes IPv4 too: an IPv4 client's answers leave it to the
+    /// client's IPv4-mapped address — the only form macOS sends to from an
+    /// IPv6 socket.
+    #[tokio::test]
+    async fn an_ipv4_client_hears_back_through_a_dual_stack_port() {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        socket.set_only_v6(false).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        socket
+            .bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)).into())
+            .unwrap();
+        let socket = UdpSocket::from_std(socket.into()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ours = Socks5UdpClient::new(socket, client.local_addr().unwrap().ip(), 0);
+        let to = Target::new(HostName::parse("10.0.0.1"), 53);
+        let mut datagram = header(&to).unwrap();
+        datagram.extend_from_slice(b"ask");
+        client
+            .send_to(&datagram, ("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let (n, asked) = ours.recv(&mut buf).await.unwrap();
+        assert_eq!((&buf[..n], asked), (&b"ask"[..], to.clone()));
+        ours.send(b"answer", &to).await.unwrap();
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("the answer comes back")
+        .unwrap();
+        assert!(buf[..n].ends_with(b"answer"));
     }
 
     #[test]
