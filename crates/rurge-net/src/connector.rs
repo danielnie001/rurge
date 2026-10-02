@@ -267,6 +267,11 @@ fn open_socket(
     };
     let socket = socket2::Socket::new(domain, kind, Some(protocol))?;
     socket.set_nonblocking(true)?;
+    // a UDP socket of one family only, set before `interface`: on Windows
+    // that binds the socket, and a bound socket takes the option no more
+    if kind == socket2::Type::DGRAM && family == Family::V6 {
+        socket.set_only_v6(true)?;
+    }
     if opts.tos != 0
         && let Err(e) = hook.set_tos(&socket, family, opts.tos)
     {
@@ -453,11 +458,12 @@ impl DirectConnector {
                 &self.fallback_logged,
             )
             .and_then(|socket| {
-                if *family == Family::V6 {
-                    socket.set_only_v6(true)?;
-                }
                 make_room(&socket);
-                socket.bind(&SocketAddr::new(unspecified, 0).into())?;
+                // `interface` has bound it already on Windows (to the
+                // interface's address): a second bind fails
+                if !is_bound(&socket) {
+                    socket.bind(&SocketAddr::new(unspecified, 0).into())?;
+                }
                 UdpSocket::from_std(socket.into())
             });
             match (opened, family) {
@@ -565,6 +571,15 @@ impl PacketSocket for DirectPacket {
             Poll::Pending
         }))
     }
+}
+
+/// The socket has a local port: something bound it already.
+fn is_bound(socket: &socket2::Socket) -> bool {
+    socket
+        .local_addr()
+        .ok()
+        .and_then(|addr| addr.as_socket())
+        .is_some_and(|addr| addr.port() != 0)
 }
 
 /// A UDP flow may carry a tunnel at full speed: its socket's buffers take a
@@ -1112,6 +1127,49 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
+    /// Binds the socket to the interface's address, as the Windows hook
+    /// does (`rurge-platform::socket::bind_interface`).
+    struct BindingHook;
+
+    impl SocketHook for BindingHook {
+        fn bind_interface(
+            &self,
+            socket: &socket2::Socket,
+            _: &str,
+            family: Family,
+        ) -> io::Result<()> {
+            let source = match family {
+                Family::V4 => ip("127.0.0.1"),
+                Family::V6 => ip("::1"),
+            };
+            socket.bind(&SocketAddr::new(source, 0).into())
+        }
+        fn set_tos(&self, _: &socket2::Socket, _: Family, _: u8) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `interface` on Windows binds the socket to the interface's address:
+    /// the carrier takes that binding instead of binding a second time.
+    #[tokio::test]
+    async fn a_carrier_keeps_the_binding_of_its_interface() {
+        let echo = udp_echo().await;
+        let opts = SocketOpts {
+            interface: Some("lo".into()),
+            ..SocketOpts::default()
+        };
+        let c = DirectConnector::with_opts(Arc::new(SystemResolve), opts, Arc::new(BindingHook));
+        let carrier = c.open_udp(&ConnectOpts::default()).await.unwrap();
+        let to = Target::new(HostName::Ip(echo.ip()), echo.port());
+        carrier.send_to(b"bound", &to).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(5), carrier.recv_from(&mut buf))
+            .await
+            .expect("the echo comes back")
+            .unwrap();
+        assert_eq!((&buf[..n], from), (&b"bound"[..], to));
+    }
+
     /// DIRECT's carrier sends to any address, by address and by name, and
     /// hears from any address — not only from the one it sent to (full cone).
     #[tokio::test]
@@ -1123,9 +1181,13 @@ mod tests {
         let resolved = carrier.resolve(&by_name).await.unwrap();
         assert_eq!(resolved, Target::new(HostName::Ip(echo.ip()), echo.port()));
         let mut buf = [0u8; 64];
+        let within = Duration::from_secs(5);
         for to in [&by_name, &resolved] {
             carrier.send_to(b"ping", to).await.unwrap();
-            let (n, from) = carrier.recv_from(&mut buf).await.unwrap();
+            let (n, from) = tokio::time::timeout(within, carrier.recv_from(&mut buf))
+                .await
+                .expect("the echo comes back")
+                .unwrap();
             assert_eq!((&buf[..n], &from), (&b"ping"[..], &resolved));
         }
         // a stranger writes to the carrier's port, never having been written to
@@ -1138,12 +1200,18 @@ mod tests {
             )
             .await
             .unwrap();
-        let (n, carrier_addr) = seen.recv_from(&mut buf).await.unwrap();
+        let (n, carrier_addr) = tokio::time::timeout(within, seen.recv_from(&mut buf))
+            .await
+            .expect("the datagram arrives")
+            .unwrap();
         assert_eq!(&buf[..n], b"who");
         let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let stranger_addr = stranger.local_addr().unwrap();
         stranger.send_to(b"hello", carrier_addr).await.unwrap();
-        let (n, from) = carrier.recv_from(&mut buf).await.unwrap();
+        let (n, from) = tokio::time::timeout(within, carrier.recv_from(&mut buf))
+            .await
+            .expect("the stranger is heard")
+            .unwrap();
         assert_eq!(&buf[..n], b"hello");
         assert_eq!(
             from,
@@ -1156,8 +1224,12 @@ mod tests {
     #[tokio::test]
     async fn a_closed_port_does_not_stop_a_direct_carrier() {
         let echo = udp_echo().await;
-        let closed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let closed = closed.local_addr().unwrap();
+        // the socket goes with the statement: nobody listens on its port
+        let closed = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
         let c = DirectConnector::new(Arc::new(SystemResolve));
         let carrier = c.open_udp(&ConnectOpts::default()).await.unwrap();
         let to = |addr: SocketAddr| Target::new(HostName::Ip(addr.ip()), addr.port());
