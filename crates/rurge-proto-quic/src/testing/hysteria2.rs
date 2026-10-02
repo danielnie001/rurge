@@ -39,6 +39,8 @@ const TCP_REQUEST: u64 = 0x401;
 const H3_NO_ERROR: VarInt = VarInt::from_u32(0x100);
 /// H3_REQUEST_REJECTED: a stream the fake does not serve.
 const H3_REQUEST_REJECTED: u64 = 0x10b;
+/// How much of a TCP tunnel the fake relays at a time, each way.
+const RELAY: usize = 64 << 10;
 
 #[derive(Clone, Debug, Default)]
 pub struct Hysteria2Script {
@@ -615,7 +617,9 @@ async fn relay(mut stream: ServerStream, connection: usize, shared: &Shared) -> 
     };
     // with the reference's message, which the client passes over
     stream.write_all(&answer(0, b"Connected")).await?;
-    tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
+    // in large pieces, so that a bulk transfer measures the client rather
+    // than this relay (the throughput benchmark)
+    tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut upstream, RELAY, RELAY).await?;
     Ok(())
 }
 

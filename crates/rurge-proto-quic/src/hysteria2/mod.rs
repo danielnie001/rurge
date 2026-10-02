@@ -1484,4 +1484,71 @@ mod tests {
         assert!(!log.is_empty());
         assert!(!log.contains(OBFS));
     }
+
+    /// A TCP echo that keeps up with a bulk transfer: `echo_server` echoes a
+    /// kilobyte at a time, and a throughput measured through it would be
+    /// its own.
+    async fn bulk_echo() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut read = tokio::io::BufReader::with_capacity(256 << 10, read);
+                    let _ = tokio::io::copy_buf(&mut read, &mut write).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Not a gate (design 5.5): how fast a bulk transfer goes through a
+    /// tunnel to a loopback echo behind `FakeHysteria2`, both ways at once,
+    /// plain and with Salamander — the cost of the UDP layers under quinn
+    /// (design 10). In release: `cargo test -p rurge-proto-quic --release
+    /// throughput -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn throughput() {
+        const TOTAL: usize = 64 * 1024 * 1024;
+        let echo = bulk_echo().await;
+        for (what, obfs, params) in [
+            ("plain", None, "password=pw"),
+            (
+                "salamander",
+                Some(Hysteria2Obfs::Salamander("obfs".into())),
+                "password=pw, salamander-password=obfs",
+            ),
+        ] {
+            let fake = FakeHysteria2::spawn(Hysteria2Script {
+                obfs,
+                ..script("pw")
+            });
+            let out = outbound(&fake, params);
+            let (mut read, mut write) = tokio::io::split(tunnel(&out, &target(echo)).await);
+            let started = std::time::Instant::now();
+            let writer = tokio::spawn(async move {
+                let chunk = vec![0x5a; 64 * 1024];
+                for _ in 0..TOTAL / chunk.len() {
+                    write.write_all(&chunk).await.unwrap();
+                }
+                write
+            });
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut received = 0;
+            while received < TOTAL {
+                let n = read.read(&mut buf).await.unwrap();
+                assert!(n > 0, "the echo ended early");
+                received += n;
+            }
+            let elapsed = started.elapsed();
+            let _write = writer.await.unwrap();
+            println!(
+                "{what}: {} MiB through hysteria2 and back in {elapsed:.2?}: {:.1} MiB/s each way",
+                TOTAL >> 20,
+                (TOTAL >> 20) as f64 / elapsed.as_secs_f64()
+            );
+        }
+    }
 }

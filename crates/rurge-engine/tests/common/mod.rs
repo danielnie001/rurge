@@ -21,6 +21,7 @@ pub use rurge_proto::testing::{
     FakeTrojan, FakeVmess, H2ProxyScript, HttpProxyScript, ShadowsocksScript, SnellScript,
     Socks5Script, TlsFixture, TrojanScript, VmessScript,
 };
+pub use rurge_proto_quic::testing::{FakeHysteria2, Hysteria2Script};
 pub use rurge_proto_ssh::testing::{
     Algorithm, FakeSsh, FakeSshOpts, fingerprint_of, keystore_base64, random_key,
 };
@@ -69,8 +70,20 @@ pub fn stack_options(dir: &std::path::Path) -> StackOptions {
 }
 
 pub async fn runtime(dir: &std::path::Path, profile: &str, shared: EngineShared) -> Runtime {
+    runtime_edited(dir, profile, shared, |_| {}).await
+}
+
+/// As `runtime`, with `edit` applied to the loaded configuration first: for
+/// what the text of a profile cannot say (a hop interval under the loader's
+/// minimum).
+pub async fn runtime_edited(
+    dir: &std::path::Path,
+    profile: &str,
+    shared: EngineShared,
+    edit: impl FnOnce(&mut rurge_config::Config),
+) -> Runtime {
     std::fs::write(dir.join("t.conf"), profile).unwrap();
-    let loaded = from_text(profile, &dir.join("t.conf"), &LoadOptions::for_tests());
+    let mut loaded = from_text(profile, &dir.join("t.conf"), &LoadOptions::for_tests());
     assert!(
         !loaded.diagnostics.has_errors(),
         "{:?}",
@@ -80,6 +93,7 @@ pub async fn runtime(dir: &std::path::Path, profile: &str, shared: EngineShared)
             .map(|d| d.to_string())
             .collect::<Vec<_>>()
     );
+    edit(&mut loaded.config);
     Runtime::build(
         loaded.config,
         RuntimeOptions {
@@ -144,13 +158,23 @@ pub async fn harness_trusting(p: Profile<'_>, roots: Arc<rustls::RootCertStore>)
 }
 
 pub async fn harness_with(p: Profile<'_>, shared: EngineShared) -> Harness {
+    harness_edited(p, shared, |_| {}).await
+}
+
+/// As `harness_with`, with `edit` applied to the loaded configuration
+/// first (`runtime_edited`).
+pub async fn harness_edited(
+    p: Profile<'_>,
+    shared: EngineShared,
+    edit: impl FnOnce(&mut rurge_config::Config),
+) -> Harness {
     let dns = MockDns::spawn().await;
     for name in ["target.test", "alt.test"] {
         dns.set(name, &["127.0.0.1"], &[], 60);
     }
     let dir = tempfile::tempdir().unwrap();
     let text = p.text(dns.addr());
-    let engine = Engine::new(runtime(dir.path(), &text, shared).await);
+    let engine = Engine::new(runtime_edited(dir.path(), &text, shared, edit).await);
     let listeners = engine.bind_listeners().await.unwrap();
     Harness {
         dir,
@@ -271,7 +295,7 @@ impl UdpAssociation {
 
     /// The next datagram: where it says it came from (`ip:port`) and its payload.
     pub async fn recv(&self) -> (SocketAddr, Vec<u8>) {
-        let mut buf = [0u8; 2048];
+        let mut buf = vec![0u8; 65536];
         let (n, from) =
             tokio::time::timeout(Duration::from_secs(5), self.socket.recv_from(&mut buf))
                 .await

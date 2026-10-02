@@ -70,9 +70,9 @@ pub struct Dialer {
 
 impl Dialer {
     /// The path goes as `connector` dials: from sockets of its own when it
-    /// dials directly, else over its UDP flow (`underlying-proxy`). `tls` is
-    /// the policy's — ALPN `h3` unless it names others — with `client-cert`
-    /// from `keystore`.
+    /// dials directly, else over its UDP flow (`underlying-proxy`), which
+    /// cannot hop. `tls` is the policy's — ALPN `h3` unless it names others
+    /// — with `client-cert` from `keystore`.
     pub fn new(
         connector: Arc<dyn Connector>,
         server: Target,
@@ -82,6 +82,15 @@ impl Dialer {
         keystore: &[KeystoreItem],
         roots: Arc<RootCertStore>,
     ) -> Result<Dialer, BuildError> {
+        // the configuration refuses a line that has both (E0018), but a
+        // group's `underlying-proxy` chains its members without it (`M (via
+        // R)`, phase 2 M3 design 5.4): such a member is not built, and the
+        // registry leaves it out
+        if quic.port_hopping.is_some() && connector.as_direct().is_none() {
+            return Err(BuildError::new(
+                "`port-hopping` cannot be combined with `underlying-proxy`",
+            ));
+        }
         let tls = quic_tls(tls, &server.host, &["h3"], keystore, roots)?;
         let config = quic::client_config(tls.config, &Transport::STANDARD)
             .map_err(|e| BuildError::new(e.to_string()))?;
@@ -1389,5 +1398,36 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    /// Port hopping cannot go over an `underlying-proxy` (the manual): a
+    /// connector that does not dial directly gets no dialer that hops — as
+    /// a group's relay would make one (phase 2 M3 design 5.4).
+    #[test]
+    fn hopping_over_a_connector_that_does_not_dial_directly_is_refused() {
+        let quic = QuicOpts {
+            port_hopping: Some(PortHopping {
+                ports: vec![5000..=6000],
+                interval: Duration::from_secs(30),
+            }),
+        };
+        let build = |connector: Arc<dyn Connector>| {
+            Dialer::new(
+                connector,
+                Target::new(HostName::parse("127.0.0.1"), 443),
+                &TlsOpts::default(),
+                &quic,
+                Tristate::Auto,
+                &[],
+                TestCert::new().roots(),
+            )
+            .map(|_| ())
+        };
+        let err = build(Arc::new(Chain::default())).unwrap_err();
+        assert_eq!(
+            err.message,
+            "`port-hopping` cannot be combined with `underlying-proxy`"
+        );
+        build(Arc::new(DirectConnector::new(Arc::new(Loopback)))).expect("a direct one hops");
     }
 }

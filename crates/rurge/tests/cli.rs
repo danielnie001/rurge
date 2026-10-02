@@ -131,7 +131,7 @@ fn check_json_and_platform() {
     );
 }
 
-const PROXIES: &str = "[General]\n[Proxy]\nH = http, proxy.test, 8080\nS = socks5-tls, proxy.test, 443\nOld = hysteria2, 1.2.3.4, 443, password=x\n[Rule]\nFINAL,DIRECT\n";
+const PROXIES: &str = "[General]\n[Proxy]\nH = http, proxy.test, 8080\nS = socks5-tls, proxy.test, 443\nOld = tailscale, section-name=ts\n[Rule]\nFINAL,DIRECT\n";
 const BROKEN_P12: &str = "[General]\n[Proxy]\nUp = https, proxy.test, 443, client-cert=cert1\n[Keystore]\ncert1 = type=p12, base64=QUJD, password=hunter2\n[Rule]\nFINAL,DIRECT\n";
 
 #[test]
@@ -151,7 +151,7 @@ fn check_knows_the_m1_protocols_and_runs_the_dry_build() {
     // (W0007 is deduped per protocol kind and names the kind, not the
     // policy, matching `W_GROUP_NOT_IMPLEMENTED`'s established wording)
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
-    assert!(out.contains("`hysteria2`"), "{out}");
+    assert!(out.contains("`tailscale`"), "{out}");
 
     Command::cargo_bin("rurge")
         .unwrap()
@@ -191,7 +191,7 @@ fn check_knows_the_automatic_groups() {
     assert!(!out.contains("W0029"), "{out}");
 }
 
-const TROJAN: &str = "[General]\n[Proxy]\nT = trojan, proxy.test, 443, password=s3same, ws=true, ws-path=/w\nOld = hysteria2, 1.2.3.4, 443, password=x\n[Rule]\nFINAL,DIRECT\n";
+const TROJAN: &str = "[General]\n[Proxy]\nT = trojan, proxy.test, 443, password=s3same, ws=true, ws-path=/w\nOld = tailscale, section-name=ts\n[Rule]\nFINAL,DIRECT\n";
 const TROJAN_BAD_PATH: &str = "[General]\n[Proxy]\nT = trojan, proxy.test, 443, password=s3same, ws=true, ws-path=s3cretpath\n[Rule]\nFINAL,DIRECT\n";
 
 #[test]
@@ -207,10 +207,10 @@ fn check_knows_trojan() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `hysteria2` is still a later milestone; `trojan` is not
+    // `tailscale` is still a later milestone; `trojan` is not
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
     assert!(
-        out.contains("`hysteria2`") && !out.contains("`trojan`"),
+        out.contains("`tailscale`") && !out.contains("`trojan`"),
         "{out}"
     );
 
@@ -269,7 +269,7 @@ fn check_knows_vmess_and_anytls() {
 
 const SSH: &str = "[General]\n[Proxy]\n\
 S = ssh, proxy.test, 22, username=u, password=s3same, idle-timeout=60\n\
-Old = hysteria2, 1.2.3.4, 443, password=x\n[Rule]\nFINAL,DIRECT\n";
+Old = tailscale, section-name=ts\n[Rule]\nFINAL,DIRECT\n";
 const SSH_BAD_KEY: &str = "[General]\n[Proxy]\nS = ssh, proxy.test, 22, username=u, private-key=key1\n\
 [Keystore]\nkey1 = type=openssh-private-key, base64=c2VjcmV0IGtleSBtYXRlcmlhbA==\n[Rule]\nFINAL,DIRECT\n";
 
@@ -288,10 +288,10 @@ fn check_knows_ssh() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `hysteria2` is still a later milestone; `ssh` is not
+    // `tailscale` is still a later milestone; `ssh` is not
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
     assert!(
-        out.contains("`hysteria2`") && !out.contains("`ssh`"),
+        out.contains("`tailscale`") && !out.contains("`ssh`"),
         "{out}"
     );
     assert!(!out.contains("s3same"), "{out}");
@@ -311,7 +311,7 @@ fn check_knows_ssh() {
 }
 
 const WIREGUARD: &str = "[General]\n[Proxy]\nW = wireguard, section-name=home\n\
-Old = hysteria2, 1.2.3.4, 443, password=x\n[Rule]\nFINAL,DIRECT\n\
+Old = tailscale, section-name=ts\n[Rule]\nFINAL,DIRECT\n\
 [WireGuard home]\nprivate-key = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=\nself-ip = 10.9.0.2\n\
 peer = (public-key = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=, allowed-ips = 0.0.0.0/0, endpoint = vpn.test:51820)\n";
 const WIREGUARD_BAD_KEY: &str = "[General]\n[Proxy]\nW = wireguard, section-name=home\n[Rule]\nFINAL,DIRECT\n\
@@ -333,10 +333,10 @@ fn check_knows_wireguard() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `hysteria2` is still a later milestone; `wireguard` is not
+    // `tailscale` is still a later milestone; `wireguard` is not
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
     assert!(
-        out.contains("`hysteria2`") && !out.contains("`wireguard`"),
+        out.contains("`tailscale`") && !out.contains("`wireguard`"),
         "{out}"
     );
     assert!(!out.contains("yAnz5TF"), "{out}");
@@ -360,7 +360,7 @@ fn check_knows_wireguard() {
 
 const EXTERNAL: &str = "[General]\n[Proxy]\n\
 X = external, exec = \"/usr/bin/sshpass\", args = -p, args = hunter2, args = ssh, local-port = 1080\n\
-Old = hysteria2, 1.2.3.4, 443, password=x\n[Rule]\nFINAL,DIRECT\n";
+Old = tailscale, section-name=ts\n[Rule]\nFINAL,DIRECT\n";
 const EXTERNAL_SAME_PORT: &str = "[General]\n[Proxy]\n\
 X = external, exec = /bin/x, local-port = 1080\nY = external, exec = /bin/y, local-port = 1080\n\
 [Rule]\nFINAL,DIRECT\n";
@@ -380,10 +380,10 @@ fn check_knows_external() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `hysteria2` is still a later milestone; `external` is not
+    // `tailscale` is still a later milestone; `external` is not
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
     assert!(
-        out.contains("`hysteria2`") && !out.contains("`external`"),
+        out.contains("`tailscale`") && !out.contains("`external`"),
         "{out}"
     );
     assert!(!out.contains("hunter2"), "{out}");
@@ -495,7 +495,7 @@ const HTTP2: &str = "[General]\n[Proxy]\n\
 H = h2-connect, proxy.test, 443, alice, s3cretPw, headers=X-Token:t0kenValue, max-streams=5, udp-relay=true\n\
 T1 = trust-tunnel, proxy.test, 443, username=bob, password=s3cretPw, h3=true\n\
 T2 = trust-tunnel, proxy.test, 443, username=bob, password=s3cretPw, h3=true\n\
-Old = hysteria2, 1.2.3.4, 443, password=x\n[Rule]\nFINAL,DIRECT\n";
+Old = tailscale, section-name=ts\n[Rule]\nFINAL,DIRECT\n";
 const HTTP2_NO_PASSWORD: &str = "[General]\n[Proxy]\n\
 T = trust-tunnel, proxy.test, 443, username=bob\n[Rule]\nFINAL,DIRECT\n";
 
@@ -516,10 +516,10 @@ fn check_knows_http2() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `hysteria2` is still a later milestone; the HTTP/2 family is not
+    // `tailscale` is still a later milestone; the HTTP/2 family is not
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
     assert!(
-        out.contains("`hysteria2`")
+        out.contains("`tailscale`")
             && !out.contains("`h2-connect`")
             && !out.contains("`trust-tunnel`"),
         "{out}"
@@ -546,6 +546,62 @@ fn check_knows_http2() {
             "bad.conf:3: policy `T`: `password` is required",
         ))
         .stdout(predicate::str::contains("bob").not());
+}
+
+const HYSTERIA2: &str = "[General]\n[Proxy]\n\
+H = hysteria2, proxy.test, 443, password=s3cretPw, download-bandwidth=100, salamander-password=0bfsPw, port-hopping=5000-6000, port-hopping-interval=2, ecn=off\n\
+Old = tailscale, section-name=ts\n[Rule]\nFINAL,DIRECT\n";
+const HYSTERIA2_CHAINED: &str = "[General]\n[Proxy]\n\
+H = hysteria2, proxy.test, 443, password=s3cretPw, port-hopping=5000-6000, underlying-proxy=E\n\
+E = socks5, proxy.test, 1080\n[Rule]\nFINAL,DIRECT\n";
+
+/// `rurge check` knows `hysteria2` (phase 2 M7 design 5.1): it is not "not
+/// implemented"; `ecn` has an effect on it; a hop interval under 5 seconds
+/// is raised to 5, saying so; `port-hopping` over an `underlying-proxy` is
+/// an error; the passwords are never printed.
+#[test]
+fn check_knows_hysteria2() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "hy2.conf", HYSTERIA2))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    // `tailscale` is still a later milestone; `hysteria2` is not
+    assert_eq!(out.matches("W0007").count(), 1, "{out}");
+    assert!(
+        out.contains("`tailscale`") && !out.contains("`hysteria2`"),
+        "{out}"
+    );
+    assert!(!out.contains("W0029"), "{out}");
+    assert!(
+        out.contains("W0012")
+            && out.contains(
+                "hy2.conf:3: policy `H`: `port-hopping-interval` is below the minimum of 5 seconds; using 5"
+            ),
+        "{out}"
+    );
+    assert!(
+        !out.contains("s3cretPw") && !out.contains("0bfsPw"),
+        "{out}"
+    );
+
+    Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "bad.conf", HYSTERIA2_CHAINED))
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("E0018"))
+        .stdout(predicate::str::contains(
+            "bad.conf:3: policy `H`: `port-hopping` cannot be combined with `underlying-proxy`",
+        ))
+        .stdout(predicate::str::contains("s3cretPw").not());
 }
 
 const SUBSCRIBED: &str = "[General]\n[Proxy Group]\nLocal = select, DIRECT, policy-path=nodes.txt\n\

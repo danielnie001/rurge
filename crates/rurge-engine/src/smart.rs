@@ -262,7 +262,7 @@ mod tests {
         assert!(retryable(&OutboundError::Timeout));
         assert!(retryable(&OutboundError::Proxy("refused".into())));
         assert!(!retryable(&OutboundError::Reject(RejectKind::Reject)));
-        assert!(!retryable(&OutboundError::Unsupported("hysteria2".into())));
+        assert!(!retryable(&OutboundError::Unsupported("tailscale".into())));
         assert_eq!(quoted(&["A".into(), "B".into()]), "`A`, `B`");
     }
 }

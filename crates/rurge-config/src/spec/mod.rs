@@ -466,10 +466,7 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     }
     let failed = r.has_errors();
     let diagnostics = r.finish();
-    // the engine builds `hysteria2` from M7a task 8 on: until then a valid
-    // line is checked in full but has no spec
-    let built = policy.kind != PolicyKind::Hysteria2;
-    let spec = (!failed && not_implemented.is_none() && built).then(|| PolicySpec {
+    let spec = (!failed && not_implemented.is_none()).then(|| PolicySpec {
         name: policy.name.clone(),
         kind: policy.kind,
         server: policy.server.clone(),
@@ -1157,21 +1154,37 @@ mod tests {
         assert!(tt.tls().is_some());
     }
 
-    /// A `hysteria2` line is read and checked in full; it has no spec until
-    /// the engine builds `hysteria2` (M7a task 8). `ecn` takes effect on it,
-    /// `tfo` and `udp-relay` do not apply (phase 2 M7 design 3.1, 5.1).
+    /// A `hysteria2` line is read and checked in full, and a sound one has a
+    /// spec. `ecn` takes effect on it, `tfo` and `udp-relay` do not apply
+    /// (phase 2 M7 design 3.1, 5.1).
     #[test]
-    fn a_hysteria2_line_is_checked_but_has_no_spec_yet() {
-        for def in [
-            "hysteria2, 192.168.20.6, 443, password=pwd, download-bandwidth=100",
-            "hysteria2, h.test, 443, password=pw, salamander-password=obfs, port-hopping=1234;5000-6000, port-hopping-interval=10, ecn=off, sni=edge.test, client-cert=cert1",
-            "hysteria2, h.test, 443, password=pw, gecko-password=obfs, alpn=h3, underlying-proxy=Pick",
-            "hysteria2, h.test, 443, password=pw, port-hopping=5000-6000, underlying-proxy=DIRECT",
+    fn a_hysteria2_line_is_checked_and_has_a_spec() {
+        for (def, chained) in [
+            (
+                "hysteria2, 192.168.20.6, 443, password=pwd, download-bandwidth=100",
+                false,
+            ),
+            (
+                "hysteria2, h.test, 443, password=pw, salamander-password=obfs, port-hopping=1234;5000-6000, port-hopping-interval=10, ecn=off, sni=edge.test, client-cert=cert1",
+                false,
+            ),
+            (
+                "hysteria2, h.test, 443, password=pw, gecko-password=obfs, alpn=h3, underlying-proxy=Pick",
+                true,
+            ),
+            // DIRECT is no chain: the hops stay
+            (
+                "hysteria2, h.test, 443, password=pw, port-hopping=5000-6000, underlying-proxy=DIRECT",
+                false,
+            ),
         ] {
             let o = outcome("H", def);
             assert!(o.diagnostics.is_empty(), "{def}: {:?}", o.diagnostics);
             assert!(o.inert.is_empty(), "{def}: {:?}", o.inert);
-            assert!(o.spec.is_none() && o.not_implemented.is_none(), "{def}");
+            assert_eq!(o.not_implemented, None, "{def}");
+            let spec = o.spec.unwrap_or_else(|| panic!("{def}: no spec"));
+            assert!(matches!(spec.proto, ProtoSpec::Hysteria2(_)), "{def}");
+            assert_eq!(spec.common.underlying_proxy.is_some(), chained, "{def}");
         }
         let o = outcome(
             "H",
@@ -1208,6 +1221,7 @@ mod tests {
             ]
         );
         assert!(o.inert.is_empty(), "{:?}", o.inert);
+        assert!(o.spec.is_none());
     }
 
     /// What a QUIC-based line cannot combine (phase 2 M7 design 3.1): port

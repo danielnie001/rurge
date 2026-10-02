@@ -4,9 +4,9 @@
 //! M2b), `ssh` (phase 2 M4a), `wireguard` (phase 2 M4b), `external`
 //! (phase 2 M4c), `ss` with the AEAD, `none` and 2022 methods (phase 2
 //! M6a), `snell` versions 4 and 5 (phase 2 M6b), `h2-connect` and
-//! `trust-tunnel` over HTTP/2 only (phase 2 M6c), `select` groups,
-//! `url-test` / `fallback` / `load-balance` groups (phase 2 M3b), and
-//! `smart` groups (phase 2 M3c).
+//! `trust-tunnel` over HTTP/2 only (phase 2 M6c), `hysteria2` (phase 2
+//! M7a), `select` groups, `url-test` / `fallback` / `load-balance` groups
+//! (phase 2 M3b), and `smart` groups (phase 2 M3c).
 
 use rurge_config::config::Capabilities;
 use rurge_config::policy::{GroupKind, PolicyKind};
@@ -47,6 +47,7 @@ pub fn current() -> Capabilities {
             PolicyKind::Snell,
             PolicyKind::H2Connect,
             PolicyKind::TrustTunnel,
+            PolicyKind::Hysteria2,
         ]),
         group_kinds: HashSet::from([
             GroupKind::Select,

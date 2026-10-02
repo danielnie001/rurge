@@ -1299,7 +1299,7 @@ mod tests {
     use std::path::Path;
 
     const PROFILE: &str = "[General]\nloglevel = notify\n[Proxy]\n\
-HK = hysteria2, 1.2.3.4, 443, password=x\n\
+HK = tailscale, section-name=ts\n\
 D = direct\nCorp = direct, interface=eth9\nBlock = reject-tinygif\n\
 EntryA = socks5, a.example, 1080\nEntryB = socks5, b.example, 1080\n\
 Exit = http, exit.example, 8080, underlying-proxy=Hop\n\
@@ -1424,13 +1424,13 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
     fn unsupported_protocols_and_devices_reject_with_a_note() {
         let reg = built(GroupSelections::new()).registry;
         let hk = reg.resolve(&PolicyRef::parse("HK"));
-        assert_eq!(chain(&hk), vec!["HK", "!unsupported:hysteria2", "REJECT"]);
+        assert_eq!(chain(&hk), vec!["HK", "!unsupported:tailscale", "REJECT"]);
         assert_eq!(
             (hk.outbound.name(), hk.terminal, hk.note.clone()),
             (
                 "REJECT",
                 TerminalKind::Reject,
-                Some(Note::Unsupported("hysteria2".into()))
+                Some(Note::Unsupported("tailscale".into()))
             )
         );
         let dev = reg.resolve(&PolicyRef::parse("DEVICE:Living Room"));
@@ -1445,11 +1445,11 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
         // chain, whichever kind of group it is
         assert_eq!(
             chain(&reg.resolve(&PolicyRef::parse("Pick"))),
-            vec!["Pick", "HK", "!unsupported:hysteria2", "REJECT"]
+            vec!["Pick", "HK", "!unsupported:tailscale", "REJECT"]
         );
         assert_eq!(
             chain(&reg.resolve(&PolicyRef::parse("Auto"))),
-            vec!["Auto", "HK", "!unsupported:hysteria2", "REJECT"]
+            vec!["Auto", "HK", "!unsupported:tailscale", "REJECT"]
         );
     }
 
@@ -2478,7 +2478,7 @@ Only = smart, Sel, DIRECT, D\nE = smart, A, B, evaluate-before-use=true\nOuter =
     }
 
     const SMART_UNSUPPORTED: &str = "[General]\nproxy-test-url = http://127.0.0.1:9/\ninternet-test-url = http://127.0.0.1:9/\n\
-[Proxy]\nU = hysteria2, 1.2.3.4, 443, password=x\nA = http, a.example, 80\nB = http, b.example, 80\n\
+[Proxy]\nU = tailscale, section-name=ts\nA = http, a.example, 80\nB = http, b.example, 80\n\
 [Proxy Group]\nS = smart, U, A, B\nOnlyU = smart, U\n[Rule]\nFINAL,S\n";
 
     /// A member whose protocol is not implemented yet never works: it is no
@@ -2505,7 +2505,7 @@ Only = smart, Sel, DIRECT, D\nE = smart, A, B, evaluate-before-use=true\nOuter =
         let only = reg.resolve(&PolicyRef::parse("OnlyU"));
         assert_eq!(
             only.chain,
-            ["OnlyU", "U", "!unsupported:hysteria2", "REJECT"]
+            ["OnlyU", "U", "!unsupported:tailscale", "REJECT"]
         );
         assert_eq!(only.smart, None);
     }
@@ -2555,7 +2555,7 @@ Only = smart, Sel, DIRECT, D\nE = smart, A, B, evaluate-before-use=true\nOuter =
         );
         let unsupported: Vec<String> = (0..ROUND_SAMPLE / 2 + 1).map(|i| format!("U{i}")).collect();
         for name in &unsupported {
-            profile += &format!("{name} = hysteria2, {name}.example, 443, password=x\n");
+            profile += &format!("{name} = tailscale, section-name={name}\n");
         }
         let names: Vec<String> = (0..ROUND_SAMPLE + 5).map(|i| format!("P{i}")).collect();
         for name in &names {

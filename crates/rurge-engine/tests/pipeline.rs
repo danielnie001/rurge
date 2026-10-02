@@ -47,13 +47,13 @@ impl Harness {
 }
 
 /// `LoadOptions::for_tests` declares every policy kind implemented; the binary
-/// does not declare Hysteria 2 (`crates/rurge/src/capabilities.rs`), so
+/// does not declare Tailscale (`crates/rurge/src/capabilities.rs`), so
 /// dropping it here yields the load-time W0007 warning the profiles below rely on.
 fn load_options() -> LoadOptions {
     let mut opts = LoadOptions::for_tests();
     opts.capabilities
         .policy_kinds
-        .remove(&rurge_config::PolicyKind::Hysteria2);
+        .remove(&rurge_config::PolicyKind::Tailscale);
     opts
 }
 
@@ -69,7 +69,8 @@ async fn harness(general_extra: &str, rules: &str, mode: OutboundMode) -> Harnes
     let dir = tempfile::tempdir().unwrap();
     let profile = format!(
         "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\ndns-server = {}\nipv6 = false\n{general_extra}\n\
-[Proxy]\nHK = hysteria2, 1.2.3.4, 443, password=x\nBlock = reject-tinygif\n\
+[Proxy]\nHK = tailscale, section-name=ts\nBlock = reject-tinygif\n\
+Locked = trojan, 1.2.3.4, 443, password=x\n\
 [Proxy Group]\nPick = select, HK, DIRECT\n\
 [Rule]\n{rules}\nFINAL,DIRECT\n",
         dns.addr()
@@ -363,7 +364,7 @@ async fn reject_rules_close_serve_gifs_or_render_pages() {
     let h = harness("", rules, OutboundMode::Rule).await;
     assert!(
         h.diagnostics.contains(&"W0007"),
-        "unsupported hysteria2 policy warned at load: {:?}",
+        "unsupported tailscale policy warned at load: {:?}",
         h.diagnostics
     );
     let (head, _) = get_via_proxy(h.http(), "http://ads.test/").await;
@@ -409,7 +410,7 @@ async fn reject_rules_close_serve_gifs_or_render_pages() {
     );
     let (head, body) = get_via_proxy(h.http(), "http://hk.test/").await;
     assert!(head.starts_with("HTTP/1.1 403"), "{head}");
-    assert!(String::from_utf8_lossy(&body).contains("!unsupported:hysteria2"));
+    assert!(String::from_utf8_lossy(&body).contains("!unsupported:tailscale"));
 }
 
 #[tokio::test]
@@ -658,7 +659,7 @@ async fn an_unimplemented_policy_rejects_with_an_explanation() {
             assert_eq!(kind, rurge_proto::RejectKind::Reject);
             assert_eq!(
                 handle.error().as_deref(),
-                Some("policy protocol not implemented: hysteria2")
+                Some("policy protocol not implemented: tailscale")
             );
         }
         Err(DialError::Failed { message, .. }) => panic!("expected a reject, failed: {message}"),
@@ -1628,7 +1629,7 @@ async fn persisted_group_selection_is_honored() {
     let dir = tempfile::tempdir().unwrap();
     let profile = format!(
         "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\ndns-server = {}\nipv6 = false\n\
-[Proxy]\nHK = hysteria2, 1.2.3.4, 443, password=x\n[Proxy Group]\nPick = select, HK, DIRECT\n\
+[Proxy]\nHK = tailscale, section-name=ts\n[Proxy Group]\nPick = select, HK, DIRECT\n\
 [Rule]\nDOMAIN,target.test,Pick\nFINAL,DIRECT\n",
         dns.addr()
     );

@@ -1,9 +1,10 @@
 //! `[Proxy]` parameters are typed and validated at load time (phase 2 M1 design §4).
 
 use rurge_config::config::{LoadOptions, Loaded, from_text};
-use rurge_config::spec::{IpVersion, ProtoSpec};
+use rurge_config::spec::{IpVersion, ProtoSpec, Tristate};
 use rurge_config::{Severity, codes};
 use std::path::Path;
+use std::time::Duration;
 
 fn load(proxy: &str, extra: &str) -> Loaded {
     let text = format!("[Proxy]\n{proxy}\n{extra}\n[Rule]\nFINAL,DIRECT\n");
@@ -22,7 +23,7 @@ fn codes_of(loaded: &Loaded, severity: Severity) -> Vec<&'static str> {
 #[test]
 fn specs_are_stored_in_proxy_order() {
     let loaded = load(
-        "A = http, a.example, 80, ip-version=v6-only\nHy = hysteria2, h.example, 443, password=x\nB = socks5, b.example, 1080\nC = direct, interface=eth0",
+        "A = http, a.example, 80, ip-version=v6-only\nTs = tailscale, section-name=ts\nB = socks5, b.example, 1080\nC = direct, interface=eth0",
         "",
     );
     assert!(!loaded.diagnostics.has_errors(), "{:?}", loaded.diagnostics);
@@ -32,7 +33,7 @@ fn specs_are_stored_in_proxy_order() {
         .iter()
         .map(|s| s.name.as_str())
         .collect();
-    assert_eq!(names, ["A", "B", "C"], "hysteria2 has no spec yet");
+    assert_eq!(names, ["A", "B", "C"], "tailscale has no spec");
     assert_eq!(
         loaded.config.spec("A").unwrap().common.ip_version,
         IpVersion::V6Only
@@ -41,7 +42,7 @@ fn specs_are_stored_in_proxy_order() {
         loaded.config.spec("B").unwrap().proto,
         ProtoSpec::Socks5(_)
     ));
-    assert!(loaded.config.spec("Hy").is_none() && loaded.config.spec("nope").is_none());
+    assert!(loaded.config.spec("Ts").is_none() && loaded.config.spec("nope").is_none());
 }
 
 #[test]
@@ -213,9 +214,9 @@ fn a_trojan_policy_takes_part_in_the_chain_checks() {
 }
 
 /// `hysteria2` lines are read and checked at load (phase 2 M7 design 3.1,
-/// 5.1): the combinations they cannot have are errors, and `ecn` has an
-/// effect on them. They have no spec until the engine builds them (M7a
-/// task 8).
+/// 5.1): the combinations they cannot have are errors, which leave no
+/// spec; a hop interval under 5 seconds is raised to 5, and `ecn` has an
+/// effect on them.
 #[test]
 fn hysteria2_lines_are_checked_at_load() {
     let loaded = load(
@@ -258,7 +259,16 @@ E = socks5, e.example, 1080",
             ),
         ]
     );
-    for name in ["A", "B", "C", "D"] {
+    for name in ["A", "B", "C"] {
         assert!(loaded.config.spec(name).is_none(), "{name}");
     }
+    let d = loaded.config.spec("D").expect("a warning leaves the spec");
+    let ProtoSpec::Hysteria2(hysteria2) = &d.proto else {
+        panic!("{:?}", d.proto)
+    };
+    assert_eq!(
+        hysteria2.quic.port_hopping.as_ref().map(|h| h.interval),
+        Some(Duration::from_secs(5))
+    );
+    assert_eq!(d.common.ecn, Tristate::Off);
 }

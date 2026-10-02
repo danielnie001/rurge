@@ -22,6 +22,7 @@ use rurge_proto::trojan::TrojanOutbound;
 use rurge_proto::trust_tunnel::TrustTunnelOutbound;
 use rurge_proto::vmess::VmessOutbound;
 use rurge_proto::{Direct, OutboundRef};
+use rurge_proto_quic::Hysteria2Outbound;
 use rurge_proto_ssh::SshOutbound;
 use rurge_proto_wireguard::WireGuardOutbound;
 use rustls::RootCertStore;
@@ -292,14 +293,15 @@ impl OutboundFactory for EngineFactory {
                 self.roots.clone(),
                 connector,
             )?),
-            // the loader makes no spec of these lines before M7a task 8
-            ProtoSpec::Hysteria2(_) => {
-                return Err(BuildError::new(format!(
-                    "policy `{}`: `{}` is not implemented yet",
-                    spec.name,
-                    spec.kind.keyword()
-                )));
-            }
+            ProtoSpec::Hysteria2(hysteria2) => Arc::new(Hysteria2Outbound::new(
+                &spec.name,
+                server_of(spec)?,
+                hysteria2,
+                spec.common.ecn,
+                &self.keystore,
+                self.roots.clone(),
+                connector,
+            )?),
             // nothing starts here: the program starts on the first dial
             ProtoSpec::External(external) => {
                 let outbound = ExternalOutbound::new(
@@ -418,6 +420,7 @@ N4 = snell, proxy.test, 443, psk=pw, version=4, reuse=true, obfs=http\n\
 N5 = snell, proxy.test, 443, psk=pw, version=5, shadow-tls-password=st\n\
 H2 = h2-connect, proxy.test, 443, alice, s3cret, max-streams=8, udp-relay=true\n\
 TT = trust-tunnel, proxy.test, 443, username=u, password=pw, shadow-tls-password=st\n\
+HY = hysteria2, proxy.test, 443, password=pw, download-bandwidth=100, salamander-password=obfs, port-hopping=5000-6000, ecn=off\n\
 Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule]\nFINAL,DIRECT\n",
         );
         let f = factory(&cfg);
@@ -437,6 +440,7 @@ Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule
             ("N5", "N5"),
             ("H2", "H2"),
             ("TT", "TT"),
+            ("HY", "HY"),
             ("Corp", "DIRECT"),
         ] {
             let spec = cfg
@@ -574,6 +578,31 @@ TT = trust-tunnel, proxy.test, 443, username=u, password=s3same0pen, client-cert
         }
     }
 
+    /// Sound `hysteria2` lines pass the dry build, which opens no connection
+    /// (no tokio runtime here); a client certificate that cannot be read is
+    /// a load error, never quoted (phase 2 M7 design 3.2).
+    #[test]
+    fn a_hysteria2_policy_passes_the_dry_build() {
+        let cfg = config(
+            "[Proxy]\nHY = hysteria2, proxy.test, 443, password=pw, download-bandwidth=100, gecko-password=obfs, port-hopping=1234;5000-6000, port-hopping-interval=10, ecn=off, sni=hy.test\n\
+[Rule]\nFINAL,DIRECT\n",
+        );
+        assert!(dry_build(&cfg).is_empty());
+
+        let cfg = config(
+            "[Proxy]\nHY = hysteria2, proxy.test, 443, password=s3same0pen, client-cert=cert1\n\
+[Keystore]\ncert1 = type=p12, base64=QUJD, password=hunter2\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let messages: Vec<String> = dry_build(&cfg).iter().map(|d| d.message.clone()).collect();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].starts_with("policy `HY` cannot be built: keystore item `cert1`"),
+            "{}",
+            messages[0]
+        );
+        assert!(!messages[0].contains("hunter2") && !messages[0].contains("s3same0pen"));
+    }
+
     #[test]
     fn a_dry_build_of_an_anytls_policy_leaves_no_task_behind() {
         // no tokio runtime here: spawning anything at build time would panic
@@ -591,6 +620,7 @@ Plain = vmess, proxy.test, 80, username=0233d11c-15a4-47d3-ade3-48ffca0ce119, vm
 H2 = h2-connect, proxy.test, 443, skip-cert-verify=true\n\
 TT = trust-tunnel, proxy.test, 443, username=u, password=pw, skip-cert-verify=true\n\
 TP = trust-tunnel, proxy.test, 443, username=u, password=pw, skip-cert-verify=true, server-cert-fingerprint-sha256=0000000000000000000000000000000000000000000000000000000000000000\n\
+HY = hysteria2, proxy.test, 443, password=pw, skip-cert-verify=true\n\
 [Rule]\nFINAL,DIRECT\n",
         );
         let flagged: Vec<&str> = cfg
@@ -599,7 +629,7 @@ TP = trust-tunnel, proxy.test, 443, username=u, password=pw, skip-cert-verify=tr
             .filter(|s| skips_verification(s))
             .map(|s| s.name.as_str())
             .collect();
-        assert_eq!(flagged, ["A", "V", "H2", "TT"]);
+        assert_eq!(flagged, ["A", "V", "H2", "TT", "HY"]);
     }
 
     #[test]

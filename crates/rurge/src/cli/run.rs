@@ -108,11 +108,17 @@ pub(crate) fn level_for(level: &LogLevel) -> LevelFilter {
 type LevelHandle = reload::Handle<LevelFilter, Registry>;
 
 /// What rurge says better itself: boringtun's handshake and timer messages
-/// carry no policy name, and the `wireguard` outbound logs its handshakes.
+/// carry no policy name, and the `wireguard` outbound logs its handshakes;
+/// quinn's are about its drivers and every packet, and the QUIC outbounds
+/// report what comes of them. quinn-udp's warnings stay: what the system
+/// refused to send, which it drops without telling anyone else.
 fn quiet_dependencies() -> Targets {
     Targets::new()
         .with_default(LevelFilter::TRACE)
         .with_target("boringtun", LevelFilter::OFF)
+        // `quinn` covers `quinn_proto` too; the longer target wins
+        .with_target("quinn", LevelFilter::OFF)
+        .with_target("quinn_udp", LevelFilter::WARN)
 }
 
 fn init_logging(
@@ -874,6 +880,20 @@ mod tests {
         let error = &tracing::Level::ERROR;
         assert!(!filter.would_enable("boringtun::noise::timers", error));
         assert!(filter.would_enable("rurge_proto_wireguard::device", &tracing::Level::TRACE));
+    }
+
+    #[test]
+    fn quinn_says_only_what_rurge_cannot() {
+        let filter = quiet_dependencies();
+        let error = &tracing::Level::ERROR;
+        // its drivers and the packets of the protocol: the QUIC outbounds
+        // report what comes of them
+        assert!(!filter.would_enable("quinn", error));
+        assert!(!filter.would_enable("quinn_proto::connection", error));
+        // what the system refused to send, which nothing else sees
+        assert!(filter.would_enable("quinn_udp", &tracing::Level::WARN));
+        assert!(!filter.would_enable("quinn_udp::imp", &tracing::Level::DEBUG));
+        assert!(filter.would_enable("rurge_proto_quic::session", &tracing::Level::TRACE));
     }
 
     #[test]
