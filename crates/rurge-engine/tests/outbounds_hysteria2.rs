@@ -417,7 +417,8 @@ async fn a_new_member_of_the_underlying_group_gets_a_new_connection() {
 
 /// A group's `underlying-proxy` chains its members (`M (via R)`, phase 2
 /// M3 design 5.4), but port hopping cannot go through a chain: the member
-/// that hops is left out, and the group goes on through the others.
+/// that hops is left out — the load says so —, and the group goes on
+/// through the others.
 #[tokio::test]
 async fn a_hopping_member_of_a_relayed_group_is_left_out() {
     let echo = echo_server().await;
@@ -433,16 +434,31 @@ async fn a_hopping_member_of_a_relayed_group_is_left_out() {
          Plain = hysteria2, 127.0.0.1, {port}, password={PASSWORD}",
         entry.addr().port()
     );
-    let h = harness_with(
-        Profile {
-            proxies: &proxies,
-            groups: "G = select, Hop, Plain, underlying-proxy=Entry",
-            rules: "DOMAIN,target.test,G",
-            ..Profile::default()
-        },
-        trusting(&fake),
-    )
-    .await;
+    let p = Profile {
+        proxies: &proxies,
+        groups: "G = select, Hop, Plain, underlying-proxy=Entry",
+        rules: "DOMAIN,target.test,G",
+        ..Profile::default()
+    };
+    // any DNS address will do for the load alone
+    let loaded = from_text(
+        &p.text(SocketAddr::from(([127, 0, 0, 1], 53))),
+        std::path::Path::new("t.conf"),
+        &LoadOptions::for_tests(),
+    );
+    let said: Vec<&str> = loaded
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == rurge_config::codes::W_SET_LINES_SKIPPED)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(
+        said,
+        [
+            "policy group `G` relays its members through `underlying-proxy`: `Hop` uses `port-hopping`, which cannot go through it; `Hop (via Entry)` is left out"
+        ]
+    );
+    let h = harness_with(p, trusting(&fake)).await;
     let registry = h.engine.registry();
     assert!(registry.contains("Hop") && !registry.contains("Hop (via Entry)"));
     assert_eq!(

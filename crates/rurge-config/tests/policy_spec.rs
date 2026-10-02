@@ -272,3 +272,44 @@ E = socks5, e.example, 1080",
     );
     assert_eq!(d.common.ecn, Tristate::Off);
 }
+
+/// A group's `underlying-proxy` chains the proxies it takes in (`M (via
+/// R)`, phase 2 M3 design 5.4), but port hopping cannot go through a chain:
+/// the load says, at the group's line, which member is left out — once,
+/// whether the profile writes it on the line, gives it through
+/// `include-other-group` or through `include-all-proxies`, as the group's
+/// filter lets it in. The load goes on.
+#[test]
+fn a_relayed_group_says_which_member_with_port_hopping_it_leaves_out() {
+    let loaded = load(
+        "Hop = hysteria2, h.example, 443, password=p, port-hopping=5000-6000
+Plain = hysteria2, p.example, 443, password=p
+E = socks5, e.example, 1080",
+        "[Proxy Group]
+G = select, Hop, Plain, include-other-group=Nodes, underlying-proxy=E
+Nodes = select, Hop, Plain
+Via = select, include-other-group=Nodes, underlying-proxy=E
+All = select, include-all-proxies=true, policy-regex-filter=^H, underlying-proxy=E
+Filtered = select, include-other-group=Nodes, policy-regex-filter=^P, underlying-proxy=E
+Direct = select, Hop, underlying-proxy=DIRECT",
+    );
+    assert!(!loaded.diagnostics.has_errors(), "{:?}", loaded.diagnostics);
+    let found: Vec<(&str, String, u32)> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| (d.code, d.message.clone(), d.span.as_ref().unwrap().line))
+        .collect();
+    let left_out = |group: &str| {
+        format!(
+            "policy group `{group}` relays its members through `underlying-proxy`: `Hop` uses `port-hopping`, which cannot go through it; `Hop (via E)` is left out"
+        )
+    };
+    assert_eq!(
+        found,
+        [
+            (codes::W_SET_LINES_SKIPPED, left_out("G"), 6),
+            (codes::W_SET_LINES_SKIPPED, left_out("Via"), 8),
+            (codes::W_SET_LINES_SKIPPED, left_out("All"), 9),
+        ]
+    );
+}

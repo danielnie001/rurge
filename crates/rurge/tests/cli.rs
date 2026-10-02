@@ -550,15 +550,17 @@ fn check_knows_http2() {
 
 const HYSTERIA2: &str = "[General]\n[Proxy]\n\
 H = hysteria2, proxy.test, 443, password=s3cretPw, download-bandwidth=100, salamander-password=0bfsPw, port-hopping=5000-6000, port-hopping-interval=2, ecn=off\n\
-Old = tailscale, section-name=ts\n[Rule]\nFINAL,DIRECT\n";
+Old = tailscale, section-name=ts\nE = socks5, proxy.test, 1080\n\
+[Proxy Group]\nG = select, H, underlying-proxy=E\n[Rule]\nFINAL,DIRECT\n";
 const HYSTERIA2_CHAINED: &str = "[General]\n[Proxy]\n\
 H = hysteria2, proxy.test, 443, password=s3cretPw, port-hopping=5000-6000, underlying-proxy=E\n\
 E = socks5, proxy.test, 1080\n[Rule]\nFINAL,DIRECT\n";
 
 /// `rurge check` knows `hysteria2` (phase 2 M7 design 5.1): it is not "not
 /// implemented"; `ecn` has an effect on it; a hop interval under 5 seconds
-/// is raised to 5, saying so; `port-hopping` over an `underlying-proxy` is
-/// an error; the passwords are never printed.
+/// is raised to 5, saying so; a group that relays a member with
+/// `port-hopping` says it leaves that member out; `port-hopping` over an
+/// `underlying-proxy` is an error; the passwords are never printed.
 #[test]
 fn check_knows_hysteria2() {
     let dir = tempfile::tempdir().unwrap();
@@ -583,6 +585,13 @@ fn check_knows_hysteria2() {
         out.contains("W0012")
             && out.contains(
                 "hy2.conf:3: policy `H`: `port-hopping-interval` is below the minimum of 5 seconds; using 5"
+            ),
+        "{out}"
+    );
+    assert!(
+        out.contains("W0023")
+            && out.contains(
+                "hy2.conf:7: policy group `G` relays its members through `underlying-proxy`: `H` uses `port-hopping`, which cannot go through it; `H (via E)` is left out"
             ),
         "{out}"
     );

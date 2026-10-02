@@ -824,6 +824,90 @@ fn underlying_cycles(
     }
 }
 
+/// `W0023`: a group with a relay chains every proxy it takes in through it
+/// (`M (via R)`, phase 2 M3 design 5.4), but port hopping cannot go through
+/// a chain: the registry leaves such a member out, and a group left without
+/// members falls back to DIRECT unless `--empty-group-reject` (M3-D3). Said
+/// here for the proxies the profile itself gives the group; what a
+/// `policy-path` brings in is not known at load, and the registry leaves
+/// those out with a log line only.
+fn hops_under_group_relays(
+    config: &Config,
+    specs: &[PolicySpec],
+    groups: &[GroupSpec],
+    diags: &mut Diagnostics,
+) {
+    let hops: HashSet<&str> = specs
+        .iter()
+        .filter(|s| {
+            s.proto
+                .quic()
+                .is_some_and(|quic| quic.port_hopping.is_some())
+        })
+        .map(|s| s.name.as_str())
+        .collect();
+    if hops.is_empty() {
+        return;
+    }
+    let by_name: HashMap<&str, &GroupSpec> = groups.iter().map(|g| (g.name.as_str(), g)).collect();
+    let mut taken = HashMap::new();
+    for g in groups {
+        let Some(relay) = &g.underlying_proxy else {
+            continue;
+        };
+        let mut said = HashSet::new();
+        for m in taken_in(config, &by_name, g, &mut taken) {
+            if hops.contains(m) && said.insert(m) {
+                diags.push(
+                    Diagnostic::warning(
+                        codes::W_SET_LINES_SKIPPED,
+                        format!(
+                            "policy group `{}` relays its members through `underlying-proxy`: `{m}` uses `port-hopping`, which cannot go through it; `{m} (via {relay})` is left out",
+                            g.name
+                        ),
+                    )
+                    .at(g.span.clone()),
+                );
+            }
+        }
+    }
+}
+
+/// The names `g` takes in from the profile itself, in the registry's order
+/// (M3 design 5.3): written, then those of the groups `include-other-group`
+/// names, then the proxies of `include-all-proxies`. `taken` keeps each
+/// group's; a group met again on an `include-other-group` cycle gives
+/// nothing more (the cycle is `W0030`).
+fn taken_in<'a>(
+    config: &'a Config,
+    groups: &HashMap<&'a str, &'a GroupSpec>,
+    g: &'a GroupSpec,
+    taken: &mut HashMap<&'a str, Vec<&'a str>>,
+) -> Vec<&'a str> {
+    if let Some(names) = taken.get(g.name.as_str()) {
+        return names.clone();
+    }
+    taken.insert(&g.name, Vec::new());
+    let mut names: Vec<&str> = g.members.iter().map(String::as_str).collect();
+    for other in &g.import.include_other_groups {
+        if let Some(other) = groups.get(other.as_str()) {
+            let theirs = taken_in(config, groups, other, taken);
+            names.extend(theirs.into_iter().filter(|m| g.import.admits(m)));
+        }
+    }
+    if g.import.include_all_proxies {
+        names.extend(
+            config
+                .policies
+                .iter()
+                .filter(|p| !p.kind.is_builtin_alias() && g.import.admits(&p.name))
+                .map(|p| p.name.as_str()),
+        );
+    }
+    taken.insert(&g.name, names.clone());
+    names
+}
+
 fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mut Diagnostics) {
     let exists = |name: &str, config: &Config| config.resolve_policy(name).is_some();
 
@@ -1059,6 +1143,7 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
             group_specs.extend(outcome.spec);
         }
         underlying_cycles(cfg, &specs, &group_specs, diags);
+        hops_under_group_relays(cfg, &specs, &group_specs, diags);
         (specs, not_implemented, group_specs)
     };
     config.specs = specs;
