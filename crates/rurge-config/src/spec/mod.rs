@@ -6,7 +6,9 @@ pub mod external;
 pub mod group;
 pub mod h2;
 pub mod http;
+pub mod hysteria2;
 pub mod obfs;
+pub mod quic;
 pub mod reader;
 pub mod secret;
 pub mod shadow_tls;
@@ -28,7 +30,9 @@ pub use group::{
 };
 pub use h2::{H2ConnectSpec, TrustTunnelSpec};
 pub use http::{HeaderPart, HeaderTemplate, HttpSpec};
+pub use hysteria2::{Hysteria2Obfs, Hysteria2Spec};
 pub use obfs::{ObfsMode, ObfsOpts};
+pub use quic::{PortHopping, QuicOpts};
 pub use reader::ParamReader;
 pub use secret::Secret;
 pub use shadow_tls::{ShadowTlsOpts, ShadowTlsVersion};
@@ -81,6 +85,7 @@ pub enum ProtoSpec {
     Snell(SnellSpec),
     H2Connect(H2ConnectSpec),
     TrustTunnel(TrustTunnelSpec),
+    Hysteria2(Hysteria2Spec),
 }
 
 impl ProtoSpec {
@@ -94,6 +99,7 @@ impl ProtoSpec {
             ProtoSpec::AnyTls(anytls) => Some(&anytls.tls),
             ProtoSpec::H2Connect(h2) => Some(&h2.tls),
             ProtoSpec::TrustTunnel(tt) => Some(&tt.tls),
+            ProtoSpec::Hysteria2(hysteria2) => Some(&hysteria2.tls),
             ProtoSpec::Direct
             | ProtoSpec::Reject(_)
             | ProtoSpec::Ssh(_)
@@ -101,6 +107,27 @@ impl ProtoSpec {
             | ProtoSpec::External(_)
             | ProtoSpec::Ss(_)
             | ProtoSpec::Snell(_) => None,
+        }
+    }
+
+    /// The QUIC options of the protocol, when it runs over QUIC.
+    pub fn quic(&self) -> Option<&QuicOpts> {
+        match self {
+            ProtoSpec::Hysteria2(hysteria2) => Some(&hysteria2.quic),
+            ProtoSpec::Direct
+            | ProtoSpec::Reject(_)
+            | ProtoSpec::Http(_)
+            | ProtoSpec::Socks5(_)
+            | ProtoSpec::Trojan(_)
+            | ProtoSpec::Vmess(_)
+            | ProtoSpec::AnyTls(_)
+            | ProtoSpec::Ssh(_)
+            | ProtoSpec::WireGuard(_)
+            | ProtoSpec::External(_)
+            | ProtoSpec::Ss(_)
+            | ProtoSpec::Snell(_)
+            | ProtoSpec::H2Connect(_)
+            | ProtoSpec::TrustTunnel(_) => None,
         }
     }
 
@@ -379,6 +406,14 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             }
             (common, ProtoSpec::TrustTunnel(read.spec))
         }
+        PolicyKind::Hysteria2 => {
+            let mut common = read_common(&mut r, Applies::Proxy, &mut notes);
+            let hysteria2 = hysteria2::read_hysteria2(&mut r, &mut common, env.keystore);
+            // `ecn` takes effect on QUIC (phase 2 M7 design 3.4); `tfo` does
+            // not apply at all (`W0028`): no second word on either
+            notes.inert.retain(|name| !matches!(*name, "ecn" | "tfo"));
+            (common, ProtoSpec::Hysteria2(hysteria2))
+        }
         PolicyKind::Ssh => {
             let common = read_common(&mut r, Applies::Proxy, &mut notes);
             let ssh = ssh::read_ssh(&mut r, env.keystore);
@@ -405,6 +440,16 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     if !matches!(proto, ProtoSpec::Direct | ProtoSpec::Reject(_)) {
         shadow_tls = shadow_tls::read_shadow_tls(&mut r);
         check_underlying(&mut r, &mut common, env);
+        // the manual: `underlying-proxy` cannot be combined with the
+        // `port-hopping` of the QUIC-based protocols
+        if common.underlying_proxy.is_some()
+            && proto.quic().is_some_and(|quic| quic.port_hopping.is_some())
+        {
+            r.error(
+                codes::E_INVALID_POLICY_PARAM,
+                "`port-hopping` cannot be combined with `underlying-proxy`".to_string(),
+            );
+        }
         // socket options belong to the hop that opens the socket (matrix 4.3)
         if common.underlying_proxy.is_some() {
             for key in ["interface", "allow-other-interface", "tos", "ip-version"] {
@@ -421,7 +466,10 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     }
     let failed = r.has_errors();
     let diagnostics = r.finish();
-    let spec = (!failed && not_implemented.is_none()).then(|| PolicySpec {
+    // the engine builds `hysteria2` from M7a task 8 on: until then a valid
+    // line is checked in full but has no spec
+    let built = policy.kind != PolicyKind::Hysteria2;
+    let spec = (!failed && not_implemented.is_none() && built).then(|| PolicySpec {
         name: policy.name.clone(),
         kind: policy.kind,
         server: policy.server.clone(),
@@ -565,7 +613,7 @@ mod tests {
 
     #[test]
     fn protocols_without_a_spec_are_left_alone() {
-        let o = outcome("H", "hysteria2, h, 443, password=x, mystery=1");
+        let o = outcome("T", "tailscale, section-name=ts, mystery=1");
         assert!(o.spec.is_none() && o.diagnostics.is_empty() && o.inert.is_empty());
     }
 
@@ -1107,5 +1155,138 @@ mod tests {
         });
         assert_eq!(tt.keystore_item(), Some("cert1"));
         assert!(tt.tls().is_some());
+    }
+
+    /// A `hysteria2` line is read and checked in full; it has no spec until
+    /// the engine builds `hysteria2` (M7a task 8). `ecn` takes effect on it,
+    /// `tfo` and `udp-relay` do not apply (phase 2 M7 design 3.1, 5.1).
+    #[test]
+    fn a_hysteria2_line_is_checked_but_has_no_spec_yet() {
+        for def in [
+            "hysteria2, 192.168.20.6, 443, password=pwd, download-bandwidth=100",
+            "hysteria2, h.test, 443, password=pw, salamander-password=obfs, port-hopping=1234;5000-6000, port-hopping-interval=10, ecn=off, sni=edge.test, client-cert=cert1",
+            "hysteria2, h.test, 443, password=pw, gecko-password=obfs, alpn=h3, underlying-proxy=Pick",
+            "hysteria2, h.test, 443, password=pw, port-hopping=5000-6000, underlying-proxy=DIRECT",
+        ] {
+            let o = outcome("H", def);
+            assert!(o.diagnostics.is_empty(), "{def}: {:?}", o.diagnostics);
+            assert!(o.inert.is_empty(), "{def}: {:?}", o.inert);
+            assert!(o.spec.is_none() && o.not_implemented.is_none(), "{def}");
+        }
+        let o = outcome(
+            "H",
+            "hysteria2, h.test, 443, s3cret, tfo=true, udp-relay=true, mystery=1",
+        );
+        let found: Vec<(&str, &str)> = o
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `H`: `tfo` does not apply to `hysteria2` policies; ignored"
+                ),
+                (
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `H`: `password` is required"
+                ),
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `H`: `udp-relay` does not apply to `hysteria2` policies (UDP is always relayed); ignored"
+                ),
+                (
+                    codes::W_UNKNOWN_KEY,
+                    "policy `H`: unknown parameter `mystery` ignored"
+                ),
+                (
+                    codes::W_UNKNOWN_KEY,
+                    "policy `H`: unexpected positional value #1 ignored"
+                ),
+            ]
+        );
+        assert!(o.inert.is_empty(), "{:?}", o.inert);
+    }
+
+    /// What a QUIC-based line cannot combine (phase 2 M7 design 3.1): port
+    /// hopping with a chain (manual), and Shadow TLS, which wraps a TCP
+    /// connection. `underlying-proxy=DIRECT` is no chain.
+    #[test]
+    fn port_hopping_over_a_chain_and_shadow_tls_are_errors_on_hysteria2() {
+        for relay in ["Entry", "Pick"] {
+            let o = outcome(
+                "H",
+                &format!(
+                    "hysteria2, h.test, 443, password=pw, port-hopping=5000-6000, underlying-proxy={relay}"
+                ),
+            );
+            let found: Vec<(&str, &str)> = o
+                .diagnostics
+                .iter()
+                .map(|d| (d.code, d.message.as_str()))
+                .collect();
+            assert_eq!(
+                found,
+                [(
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `H`: `port-hopping` cannot be combined with `underlying-proxy`"
+                )],
+                "{relay}"
+            );
+        }
+        let o = outcome(
+            "H",
+            "hysteria2, h.test, 443, password=pw, shadow-tls-password=st, shadow-tls-version=3, shadow-tls-sni=site.test",
+        );
+        let found: Vec<(&str, &str)> = o
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [(
+                codes::E_INVALID_POLICY_PARAM,
+                "policy `H`: Shadow TLS cannot be combined with a `hysteria2` policy"
+            )]
+        );
+    }
+
+    /// Hysteria 2 runs TLS over QUIC: the TLS options, and with them the
+    /// client certificate, and the QUIC options are its own.
+    #[test]
+    fn a_hysteria2_spec_has_tls_and_quic_options() {
+        let hysteria2 = ProtoSpec::Hysteria2(Hysteria2Spec {
+            tls: TlsOpts {
+                alpn: vec!["h3".into()],
+                client_cert: Some("cert1".into()),
+                ..TlsOpts::default()
+            },
+            quic: QuicOpts {
+                port_hopping: Some(PortHopping {
+                    ports: vec![1234..=1234, 5000..=6000],
+                    interval: quic::DEFAULT_HOP_INTERVAL,
+                }),
+            },
+            password: "pw".into(),
+            download_bandwidth: 0,
+            obfs: Some(Hysteria2Obfs::Salamander("obfs".into())),
+        });
+        assert_eq!(hysteria2.keystore_item(), Some("cert1"));
+        assert_eq!(
+            hysteria2.tls().map(|tls| tls.alpn.clone()),
+            Some(vec!["h3".to_string()])
+        );
+        assert!(
+            hysteria2
+                .quic()
+                .is_some_and(|quic| quic.port_hopping.is_some())
+        );
+        let tcp = outcome("A", "anytls, h.test, 443, password=pw")
+            .spec
+            .unwrap();
+        assert!(tcp.proto.quic().is_none() && ProtoSpec::Direct.quic().is_none());
     }
 }

@@ -211,3 +211,54 @@ fn a_trojan_policy_takes_part_in_the_chain_checks() {
         [codes::E_UNKNOWN_POLICY_REF]
     );
 }
+
+/// `hysteria2` lines are read and checked at load (phase 2 M7 design 3.1,
+/// 5.1): the combinations they cannot have are errors, and `ecn` has an
+/// effect on them. They have no spec until the engine builds them (M7a
+/// task 8).
+#[test]
+fn hysteria2_lines_are_checked_at_load() {
+    let loaded = load(
+        "A = hysteria2, a.example, 443, password=p, port-hopping=5000-6000, underlying-proxy=E
+B = hysteria2, b.example, 443, password=p, salamander-password=s, gecko-password=g
+C = hysteria2, c.example, 443, password=p, shadow-tls-password=st
+D = hysteria2, d.example, 443, password=p, ecn=off, port-hopping=5000-6000, port-hopping-interval=2
+E = socks5, e.example, 1080",
+        "",
+    );
+    let found: Vec<(&str, String, u32)> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| (d.code, d.message.clone(), d.span.as_ref().unwrap().line))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                codes::E_INVALID_POLICY_PARAM,
+                "policy `A`: `port-hopping` cannot be combined with `underlying-proxy`".to_string(),
+                2
+            ),
+            (
+                codes::E_INVALID_POLICY_PARAM,
+                "policy `B`: `salamander-password` cannot be combined with `gecko-password`"
+                    .to_string(),
+                3
+            ),
+            (
+                codes::E_INVALID_POLICY_PARAM,
+                "policy `C`: Shadow TLS cannot be combined with a `hysteria2` policy".to_string(),
+                4
+            ),
+            (
+                codes::W_INVALID_VALUE,
+                "policy `D`: `port-hopping-interval` is below the minimum of 5 seconds; using 5"
+                    .to_string(),
+                5
+            ),
+        ]
+    );
+    for name in ["A", "B", "C", "D"] {
+        assert!(loaded.config.spec(name).is_none(), "{name}");
+    }
+}

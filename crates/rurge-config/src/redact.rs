@@ -17,8 +17,9 @@ const SECRET_KEYS: [&str; 7] = [
 /// `username` also covers harmless SSH user names; `headers` and `ws-headers`
 /// are blanked whole (header names included), and so is `ws-path`, which
 /// nodes behind a CDN routinely use as a shared secret. `shadow-tls-password`
-/// needs its own entry: `password` only matches at a token boundary. A
-/// group's `policy-path` usually carries a subscription token, and its
+/// and Hysteria 2's `salamander-password` / `gecko-password` need entries of
+/// their own: `password` only matches at a token boundary. A group's
+/// `policy-path` usually carries a subscription token, and its
 /// `external-policy-modifier` can set any parameter, a password included. A
 /// policy's `test-url` can come from a subscription line and carry its
 /// token. A `[WireGuard]` peer's `preshared-key` is the manual's spelling;
@@ -28,7 +29,7 @@ const SECRET_KEYS: [&str; 7] = [
 /// and behind a front that routes by path `obfs-uri` is a shared secret, as
 /// `ws-path` is. Over-redacting is the safe side for an endpoint whose
 /// purpose is safe output.
-const SECRET_PARAMS: [&str; 19] = [
+const SECRET_PARAMS: [&str; 21] = [
     "password",
     "psk",
     "private-key",
@@ -42,6 +43,8 @@ const SECRET_PARAMS: [&str; 19] = [
     "ws-headers",
     "ws-path",
     "shadow-tls-password",
+    "salamander-password",
+    "gecko-password",
     "policy-path",
     "external-policy-modifier",
     "test-url",
@@ -611,6 +614,23 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
                 "trust-tunnel, 192.168.20.62, 443, username=test, password=s3cret, headers=X-Padding:<random-string(16-32)>, h3=true"
             ),
             "trust-tunnel, 192.168.20.62, 443, username=***, password=***, headers=***, h3=true"
+        );
+    }
+
+    /// Hysteria 2 (phase 2 M7 design 8): the password and the obfuscation
+    /// password, Salamander or Gecko; `download-bandwidth` and the hopping
+    /// ports stay.
+    #[test]
+    fn a_hysteria2_line_loses_its_passwords() {
+        assert_eq!(
+            redact_definition(
+                "hysteria2, h.test, 443, password=s3cret, download-bandwidth=100, salamander-password=0bfs, port-hopping=1234;5000-6000"
+            ),
+            "hysteria2, h.test, 443, password=***, download-bandwidth=100, salamander-password=***, port-hopping=1234;5000-6000"
+        );
+        assert_eq!(
+            redact_profile("H = hysteria2, h.test, 443, password=s3cret, gecko-password=0bfs"),
+            "H = hysteria2, h.test, 443, password=***, gecko-password=***"
         );
     }
 }
