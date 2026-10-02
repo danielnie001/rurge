@@ -3,6 +3,11 @@ on:
   push:
     branches: [main]
   pull_request:
+# The MSRV, which the local gate runs too: a newer clippy brings new lints
+# that `-D warnings` turns into errors. The variable outranks
+# rust-toolchain.toml's `stable`, which would pick the runner's latest.
+env:
+  RUSTUP_TOOLCHAIN: 1.89.0
 jobs:
   check:
     strategy:
@@ -12,8 +17,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.89.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
@@ -175,7 +181,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo bench -p rurge-rules --no-run
       - run: cargo bench -p rurge-dns --no-run
