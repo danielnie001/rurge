@@ -130,6 +130,14 @@ pub trait Connector: Send + Sync {
     fn route(&self) -> Option<Route> {
         None
     }
+
+    /// This connector, when it dials directly: a QUIC connection then sends
+    /// from UDP sockets of its own, made the way this connector makes them
+    /// (phase 2 M7 design 3.3); through any other connector it goes over
+    /// `connect_udp`'s carrier.
+    fn as_direct(&self) -> Option<&DirectConnector> {
+        None
+    }
 }
 
 /// Stands for the object a connector's connections go through now — a
@@ -258,6 +266,7 @@ pub fn interleave(addrs: Vec<IpAddr>, prefer_v6: bool) -> Vec<IpAddr> {
 /// Plain TCP: resolves through `Resolve`, then races the addresses the
 /// policy's `ip-version` allows (`crate::socket::race`). Plain UDP too: the
 /// first of those addresses, nothing to race.
+#[derive(Clone)]
 pub struct DirectConnector {
     resolver: Arc<dyn Resolve>,
     opts: SocketOpts,
@@ -389,6 +398,44 @@ impl DirectConnector {
             }
         }
     }
+
+    /// Where a UDP flow to `target` goes: nothing answers a UDP
+    /// "connection", so the first address `plan` gives.
+    pub(crate) async fn udp_peer(&self, target: &Target) -> io::Result<SocketAddr> {
+        let (primary, _) = self.plan(target).await?;
+        Ok(SocketAddr::new(primary[0], target.port))
+    }
+
+    /// An unconnected UDP socket of `family` with the policy's socket
+    /// options and room for a burst, bound to the unspecified address —
+    /// unless binding to the policy's interface bound it already (Windows
+    /// binds to an interface by binding to its address). DIRECT's UDP
+    /// carrier and a direct QUIC connection send from these.
+    pub(crate) fn bind_udp(&self, family: Family) -> io::Result<std::net::UdpSocket> {
+        let unspecified = match family {
+            Family::V4 => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            Family::V6 => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        };
+        let socket = open_socket(
+            SocketAddr::new(unspecified, 0),
+            socket2::Type::DGRAM,
+            &self.opts,
+            self.hook.as_ref(),
+            &self.fallback_logged,
+        )?;
+        make_room(&socket);
+        // `interface` has bound it already on Windows (to the interface's
+        // address): a second bind fails
+        if !is_bound(&socket) {
+            socket.bind(&SocketAddr::new(unspecified, 0).into())?;
+        }
+        Ok(socket.into())
+    }
+
+    /// The policy's `tos`; `0` leaves the kernel default.
+    pub(crate) fn tos(&self) -> u8 {
+        self.opts.tos
+    }
 }
 
 /// `attempt`, with `timeout` covering name resolution and everything after.
@@ -441,9 +488,7 @@ impl Connector for DirectConnector {
         opts: &'a ConnectOpts,
     ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
         Box::pin(within(target, opts.timeout, async move {
-            // nothing answers a UDP "connection": the first address it is
-            let (primary, _) = self.plan(target).await?;
-            let addr = SocketAddr::new(primary[0], target.port);
+            let addr = self.udp_peer(target).await?;
             let socket = open_socket(
                 addr,
                 socket2::Type::DGRAM,
@@ -471,13 +516,16 @@ impl Connector for DirectConnector {
             self.open_packet().map(|p| Box::new(p) as BoxedPacketSocket),
         ))
     }
+
+    fn as_direct(&self) -> Option<&DirectConnector> {
+        Some(self)
+    }
 }
 
 impl DirectConnector {
     /// One unconnected UDP socket per address family the policy's
-    /// `ip-version` allows, each bound to the unspecified address and
-    /// carrying the policy's socket options. A family this machine cannot
-    /// open a socket of is left out, unless it is the only one.
+    /// `ip-version` allows (`bind_udp`). A family this machine cannot open
+    /// a socket of is left out, unless it is the only one.
     fn open_packet(&self) -> io::Result<DirectPacket> {
         let families: &[Family] = match self.opts.ip_version {
             IpVersion::V4Only => &[Family::V4],
@@ -486,26 +534,7 @@ impl DirectConnector {
         };
         let (mut v4, mut v6, mut failure) = (None, None, None);
         for family in families {
-            let unspecified = match family {
-                Family::V4 => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                Family::V6 => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-            };
-            let opened = open_socket(
-                SocketAddr::new(unspecified, 0),
-                socket2::Type::DGRAM,
-                &self.opts,
-                self.hook.as_ref(),
-                &self.fallback_logged,
-            )
-            .and_then(|socket| {
-                make_room(&socket);
-                // `interface` has bound it already on Windows (to the
-                // interface's address): a second bind fails
-                if !is_bound(&socket) {
-                    socket.bind(&SocketAddr::new(unspecified, 0).into())?;
-                }
-                UdpSocket::from_std(socket.into())
-            });
+            let opened = self.bind_udp(*family).and_then(UdpSocket::from_std);
             match (opened, family) {
                 (Ok(socket), Family::V4) => v4 = Some(socket),
                 (Ok(socket), Family::V6) => v6 = Some(socket),
@@ -1091,6 +1120,34 @@ mod tests {
         assert_eq!(
             *hook.calls.lock().unwrap(),
             ["tos 0x10 V4", "bind test0 V4", "tos 0x88 V4", "tos 0x10 V4"]
+        );
+    }
+
+    /// The UDP sockets of DIRECT's carrier and of a direct QUIC connection
+    /// have the policy's options and are bound to the unspecified address —
+    /// when binding to the interface did not bind them already, as it does
+    /// on Windows (`a_carrier_keeps_the_binding_of_its_interface`).
+    #[test]
+    fn a_udp_socket_has_the_policys_options() {
+        let hook = Arc::new(RecordingHook::default());
+        let connector = DirectConnector::with_opts(
+            Arc::new(SystemResolve),
+            SocketOpts {
+                interface: Some("test0".into()),
+                tos: 0x10,
+                ..SocketOpts::default()
+            },
+            hook.clone(),
+        );
+        let addr = connector
+            .bind_udp(Family::V4)
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        assert!(addr.ip().is_unspecified() && addr.port() != 0, "{addr}");
+        assert_eq!(
+            *hook.calls.lock().unwrap(),
+            ["tos 0x10 V4", "bind test0 V4"]
         );
     }
 

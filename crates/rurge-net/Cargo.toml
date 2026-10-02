@@ -29,6 +29,8 @@ thiserror.workspace = true
 tracing.workspace = true
 rcgen = { workspace = true, optional = true }
 socket2.workspace = true
+quinn.workspace = true
+getrandom.workspace = true
 
 [features]
 # In-process HTTP(S) test server (`rurge_net::testing`); enabled by dependants' dev-dependencies.

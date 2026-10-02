@@ -103,6 +103,9 @@ boringtun = { version = "0.7.1", default-features = false }
 # the tunnel's own IP stack: TCP with Reno congestion control, UDP for the tunnel's
 # DNS, fragments of up to 16 KiB reassembled; no phy, no log
 smoltcp = { version = "0.12.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "proto-ipv4-fragmentation", "proto-ipv6-fragmentation", "socket-tcp", "socket-tcp-reno", "socket-udp", "async", "reassembly-buffer-size-16384", "reassembly-buffer-count-4"] }
+# QUIC (phase 2 M7): tokio and rustls on ring only; no aws-lc-rs, no platform
+# verifier, no bloom filter (a server's), no `log` bridge
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
