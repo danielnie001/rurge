@@ -15,6 +15,23 @@ use tokio::time::Instant;
 pub const STAGGER: Duration = Duration::from_millis(250);
 /// `prefer-v4` / `prefer-v6`: when the other address family joins the race.
 pub const OTHER_FAMILY_AFTER: Duration = Duration::from_secs(3);
+/// TCP keepalive on what rurge dials and what its listeners take: a quiet
+/// connection is probed after this long, then every `KEEPALIVE_INTERVAL`,
+/// so a peer gone without a word (asleep, off the Wi-Fi, behind a NAT that
+/// forgot it) is noticed in a few minutes — also where nothing else would
+/// notice it, as on the connection that holds a SOCKS5 UDP association.
+pub const KEEPALIVE_TIME: Duration = Duration::from_secs(60);
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Turns TCP keepalive on for `stream` (best effort).
+pub fn keep_alive(stream: &tokio::net::TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_TIME)
+        .with_interval(KEEPALIVE_INTERVAL);
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        tracing::debug!(error = %e, "cannot turn TCP keepalive on");
+    }
+}
 
 /// The socket-level part of a policy's common parameters.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

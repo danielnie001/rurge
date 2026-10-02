@@ -23,6 +23,7 @@ tokio-util.workspace = true
 
 [dev-dependencies]
 rurge-net = { workspace = true, features = ["testing"] }
+socket2.workspace = true
 
 [lints]
 workspace = true

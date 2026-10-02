@@ -305,6 +305,7 @@ async fn connect_one(
         .connect(addr)
         .await?;
     let _ = stream.set_nodelay(true);
+    crate::socket::keep_alive(&stream);
     Ok(stream)
 }
 
@@ -1125,6 +1126,23 @@ mod tests {
             .map(|_| ())
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// What rurge dials keeps itself alive: a peer gone without a word is
+    /// noticed, also on a connection that carries nothing (a SOCKS5 UDP
+    /// association's).
+    #[tokio::test]
+    async fn a_direct_connection_keeps_itself_alive() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = connect_one(
+            listener.local_addr().unwrap(),
+            &SocketOpts::default(),
+            &NoopSocketHook,
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        assert!(socket2::SockRef::from(&stream).keepalive().unwrap());
     }
 
     /// Binds the socket to the interface's address, as the Windows hook

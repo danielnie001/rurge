@@ -3275,6 +3275,7 @@ dependencies = [
  "rurge-config",
  "rurge-net",
  "rurge-proto",
+ "socket2",
  "tokio",
  "tokio-util",
  "tracing",

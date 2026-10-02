@@ -156,6 +156,7 @@ where
                             continue;
                         }
                         let _ = stream.set_nodelay(true);
+                        rurge_net::socket::keep_alive(&stream);
                         let h = handler.clone();
                         sessions.spawn(async move { h(stream, peer).await });
                     }
@@ -225,5 +226,34 @@ mod tests {
         let t2 = t1 + REJECTED_SOURCE_LOG_INTERVAL;
         assert!(warn_due(&mut map, ip(7), t2));
         assert_eq!(map.len(), 1);
+    }
+
+    /// What a listener takes keeps itself alive: a client gone without a
+    /// word (asleep, off the Wi-Fi) holds its UDP association not for ever.
+    #[tokio::test]
+    async fn an_accepted_connection_keeps_itself_alive() {
+        let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = Mutex::new(Some(tx));
+        let _running = serve(
+            listener,
+            "test",
+            false,
+            CancellationToken::new(),
+            move |stream, _| {
+                let on = socket2::SockRef::from(&stream).keepalive().unwrap();
+                if let Some(tx) = tx.lock().unwrap().take() {
+                    let _ = tx.send(on);
+                }
+                async {}
+            },
+        );
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let on = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("the connection is taken")
+            .unwrap();
+        assert!(on);
     }
 }
