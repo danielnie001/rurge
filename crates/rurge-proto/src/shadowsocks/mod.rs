@@ -722,6 +722,49 @@ mod tests {
         }
     }
 
+    /// shadowsocks-rust resets an SS 2022 connection whose request it cannot
+    /// open (a key it does not know, a clock off, a replayed salt); a reset
+    /// before any answer says what it likely means, and quotes nothing.
+    #[tokio::test]
+    async fn a_reset_before_any_answer_says_what_it_likely_means() {
+        let echo = echo_server().await;
+        let s2022 = SsMethod::Blake3Aes128Gcm;
+        for (method, server, client, text) in [
+            (
+                s2022,
+                key_2022(s2022, 1),
+                key_2022(s2022, 9),
+                "ss: the server reset the connection without answering (wrong key or method, or a clock more than 30 seconds off?)",
+            ),
+            (
+                SsMethod::Aes256Gcm,
+                "right".to_string(),
+                "wrong".to_string(),
+                "ss: the server reset the connection without answering (wrong password or method?)",
+            ),
+        ] {
+            let fake = FakeShadowsocks::spawn(ShadowsocksScript {
+                reset: true,
+                ..ShadowsocksScript::new(method, &server)
+            })
+            .await;
+            let out = outbound_2022(&fake, method, &client);
+            let mut stream = out
+                .connect_tcp(&target(echo), &ConnectOpts::default())
+                .await
+                .expect("connecting succeeds");
+            stream.write_all(b"hello").await.unwrap();
+            let err =
+                tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut Vec::new()))
+                    .await
+                    .expect("the server resets")
+                    .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset, "{err}");
+            assert_eq!(err.to_string(), text);
+            assert_eq!(fake.rejected(), 1);
+        }
+    }
+
     fn an_hour_behind() -> u64 {
         s2022::unix_now() - 3600
     }

@@ -7,9 +7,11 @@
 //! derivations, which have vectors of their own) are shared. It never
 //! resolves a name.
 //!
-//! As real servers do, it never tells a client with a wrong password (or
-//! key, or clock, or a replayed salt) so: it stops reading into the stream,
-//! closes its side and waits for the client to go away.
+//! It never tells a client with a wrong password (or key, or clock, or a
+//! replayed salt) so: it stops reading into the stream, closes its side and
+//! waits for the client to go away — or, with `reset`, resets the
+//! connection, as shadowsocks-rust does with an SS 2022 request it cannot
+//! open. (For AEAD shadowsocks-rust reads on until the client goes.)
 //!
 //! UDP: a loopback socket on the TCP port's number (or, with `udp_apart`, a
 //! port of its own). Each client session (SS 2022: its session id; else the
@@ -64,6 +66,8 @@ pub struct ShadowsocksScript {
     /// UDP: every answer goes after a copy of it with a bit flipped (with
     /// `none`, a different answer).
     pub udp_garbled_first: bool,
+    /// A client it rejects gets a reset instead of a close.
+    pub reset: bool,
 }
 
 impl ShadowsocksScript {
@@ -79,6 +83,7 @@ impl ShadowsocksScript {
             udp_apart: false,
             udp_twice: false,
             udp_garbled_first: false,
+            reset: false,
         }
     }
 }
@@ -288,9 +293,14 @@ impl Shared {
         })
     }
 
-    /// A client it cannot understand: no word back, only the close.
+    /// A client it cannot understand: no word back, only the close (or the
+    /// reset: the socket lingers for 0 seconds).
     async fn reject(&self, mut stream: BoxedStream) -> io::Result<()> {
         self.seen.rejected.fetch_add(1, Ordering::SeqCst);
+        if self.script.reset {
+            drop(stream);
+            return Ok(());
+        }
         stream.shutdown().await?;
         // read until the client goes: closing with unread data would reset
         let mut sink = [0u8; 4096];
@@ -300,6 +310,10 @@ impl Shared {
 }
 
 async fn serve(tcp: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
+    if shared.script.reset {
+        // closing resets the connection
+        tcp.set_zero_linger()?;
+    }
     let mut stream: BoxedStream = Box::new(tcp);
     if let Some(mode) = shared.script.obfs {
         let (inner, hello) = accept_obfs(stream, mode).await?;

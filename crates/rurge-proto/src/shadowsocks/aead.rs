@@ -36,6 +36,11 @@ pub(crate) const MAX_PAYLOAD: usize = 0x3FFF;
 /// method) and a server that refuses for any other reason look the same:
 /// the connection closes (phase 2 M6 design 3.3).
 const NO_ANSWER: &str = "ss: the server closed the connection without answering";
+/// What shadowsocks-rust does to an SS 2022 request it cannot open; some
+/// servers do it to an AEAD one too.
+const RESET: &str =
+    "ss: the server reset the connection without answering (wrong password or method?)";
+const RESET_2022: &str = "ss: the server reset the connection without answering (wrong key or method, or a clock more than 30 seconds off?)";
 const UNDECRYPTABLE: &str = "ss: the server's data failed to decrypt (wrong password or method?)";
 const CUT_SHORT: &str = "ss: the connection ended in the middle of a chunk";
 const TOO_LONG: &str = "ss: the server sent a chunk longer than the protocol allows";
@@ -229,7 +234,25 @@ impl AsyncRead for AeadStream {
         loop {
             match &mut this.reading {
                 Reading::Salt { buf, filled } => {
-                    if !ready!(poll_fill(&mut this.inner, cx, buf, filled))? {
+                    let full = match ready!(poll_fill(&mut this.inner, cx, buf, filled)) {
+                        Ok(full) => full,
+                        Err(e)
+                            if *filled == 0
+                                && matches!(
+                                    e.kind(),
+                                    io::ErrorKind::ConnectionReset
+                                        | io::ErrorKind::ConnectionAborted
+                                ) =>
+                        {
+                            let text = match this.edition_2022 {
+                                Some(_) => RESET_2022,
+                                None => RESET,
+                            };
+                            return Poll::Ready(Err(io::Error::new(e.kind(), text)));
+                        }
+                        Err(e) => return Poll::Ready(Err(e)),
+                    };
+                    if !full {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             NO_ANSWER,
