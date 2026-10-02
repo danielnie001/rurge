@@ -528,7 +528,7 @@ impl<S> Drop for Conn<S> {
 /// Closes `connection` with `code`, unless it has ended already: quinn
 /// would then record its own close in place of how the connection ended
 /// (a stateless reset, the server's close) for every handle still on it.
-fn close(connection: &Connection, code: VarInt) {
+pub(crate) fn close(connection: &Connection, code: VarInt) {
     if connection.close_reason().is_none() {
         connection.close(code, b"");
     }

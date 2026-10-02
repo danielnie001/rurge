@@ -90,7 +90,7 @@ impl From<io::Error> for OutboundError {
 /// Text that came from the other end of a connection, made safe for a log
 /// line and the request log: control characters dropped, at most `max`
 /// characters kept.
-pub(crate) fn untrusted_text(text: &str, max: usize) -> String {
+pub fn untrusted_text(text: &str, max: usize) -> String {
     text.chars().filter(|c| !c.is_control()).take(max).collect()
 }
 
