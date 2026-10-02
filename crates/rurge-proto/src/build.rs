@@ -3,7 +3,7 @@
 
 use crate::keystore::decode_p12;
 use crate::transport::shadow_tls::ShadowTlsClient;
-use crate::transport::tls::TlsClient;
+use crate::transport::tls::{ClientIdentity, QuicTls, TlsClient};
 use rurge_config::spec::{PolicySpec, ShadowTlsOpts, Sni, TlsOpts};
 use rurge_config::{HostName, KeystoreItem};
 use rurge_net::connector::Target;
@@ -57,17 +57,36 @@ pub fn tls_client(
     let Some(opts) = opts else {
         return Ok(None);
     };
-    let identity = match &opts.client_cert {
-        None => None,
-        Some(name) => {
-            let item = keystore
-                .iter()
-                .find(|k| &k.name == name)
-                .ok_or_else(|| BuildError::new(format!("keystore item `{name}` does not exist")))?;
-            Some(decode_p12(item)?)
-        }
-    };
+    let identity = client_identity(opts, keystore)?;
     TlsClient::build(opts, server, default_alpn, identity, roots).map(Some)
+}
+
+/// The TLS of a QUIC policy (phase 2 M7 design 3.2): as `tls_client`, on
+/// TLS 1.3 alone.
+pub fn quic_tls(
+    opts: &TlsOpts,
+    server: &HostName,
+    default_alpn: &[&str],
+    keystore: &[KeystoreItem],
+    roots: Arc<RootCertStore>,
+) -> Result<QuicTls, BuildError> {
+    let identity = client_identity(opts, keystore)?;
+    QuicTls::build(opts, server, default_alpn, identity, roots)
+}
+
+/// The `client-cert` of `opts`, looked up in `keystore` and decoded.
+fn client_identity(
+    opts: &TlsOpts,
+    keystore: &[KeystoreItem],
+) -> Result<Option<ClientIdentity>, BuildError> {
+    let Some(name) = &opts.client_cert else {
+        return Ok(None);
+    };
+    let item = keystore
+        .iter()
+        .find(|k| &k.name == name)
+        .ok_or_else(|| BuildError::new(format!("keystore item `{name}` does not exist")))?;
+    decode_p12(item).map(Some)
 }
 
 /// The Shadow TLS layer of a policy, when it has one. Without a
@@ -217,6 +236,46 @@ mod tests {
         .map(|_| ())
         .unwrap_err();
         assert_eq!(err.message, "keystore item `missing` does not exist");
+    }
+
+    /// QUIC's TLS takes `client-cert` from the keystore as `tls_client`
+    /// does: the server that asks for one gets it.
+    #[tokio::test]
+    async fn quic_tls_presents_the_keystores_client_certificate() {
+        use crate::testing::TlsFixture;
+        use rustls::pki_types::ServerName;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let fixture = TlsFixture::new(&["localhost"]);
+        let addr = fixture.spawn_echo(true).await;
+        let item = KeystoreItem {
+            name: "mtls".into(),
+            kind: KeystoreType::P12,
+            base64: fixture.client_p12_base64("quic client"),
+            password: Some("pw".into()),
+            unknown: Vec::new(),
+            span: Span::new(Arc::from(Path::new("p.conf")), 1),
+        };
+        let opts = TlsOpts {
+            client_cert: Some("mtls".to_string()),
+            ..TlsOpts::default()
+        };
+        let localhost = HostName::parse("localhost");
+        let quic = quic_tls(&opts, &localhost, &[], &[item], fixture.roots()).unwrap();
+        let name = ServerName::try_from(quic.server_name.clone()).unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = tokio_rustls::TlsConnector::from(quic.config)
+            .connect(name, tcp)
+            .await
+            .unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        assert!(fixture.seen_at_least(1).await[0].client_cert);
+        let err = quic_tls(&opts, &localhost, &[], &[], no_roots())
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.message, "keystore item `mtls` does not exist");
     }
 
     #[test]

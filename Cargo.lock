@@ -3476,6 +3476,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rurge-proto-quic"
+version = "0.1.0"
+dependencies = [
+ "quinn",
+ "rurge-config",
+ "rurge-net",
+ "rurge-proto",
+ "rustls",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "rurge-proto-ssh"
 version = "0.1.0"
 dependencies = [

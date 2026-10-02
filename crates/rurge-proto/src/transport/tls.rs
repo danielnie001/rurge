@@ -8,7 +8,9 @@ use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme, SupportedProtocolVersion,
+};
 use sha2::{Digest, Sha256};
 use std::io;
 use std::sync::Arc;
@@ -115,6 +117,55 @@ fn dns_name(name: &str) -> Result<ServerName<'static>, BuildError> {
         .map_err(|_| BuildError::new(format!("`{name}` is not a valid TLS server name")))
 }
 
+/// The client configuration of a TLS layer on `versions`, and the name it
+/// knows the server by: what `TlsClient` and `QuicTls` share.
+fn client_config(
+    opts: &TlsOpts,
+    server: &HostName,
+    default_alpn: &[&str],
+    identity: Option<ClientIdentity>,
+    roots: Arc<RootCertStore>,
+    versions: &[&'static SupportedProtocolVersion],
+) -> Result<(ClientConfig, ServerName<'static>), BuildError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let name = match (&opts.sni, server) {
+        (Sni::Name(custom), _) => dns_name(custom)?,
+        (_, HostName::Domain(d)) => dns_name(d)?,
+        // rustls sends no SNI for an IP address
+        (_, HostName::Ip(ip)) => ServerName::IpAddress((*ip).into()),
+    };
+    // parsed whatever the mode: a name that is not one is a build error
+    let verify_name = opts.verify_name.as_deref().map(dns_name).transpose()?;
+    let mode = if let Some(fingerprint) = opts.fingerprint_sha256 {
+        Mode::Pinned(fingerprint)
+    } else if opts.skip_cert_verify {
+        Mode::Insecure
+    } else {
+        let inner = WebPkiServerVerifier::builder_with_provider(roots, provider.clone())
+            .build()
+            .map_err(|e| BuildError::new(format!("cannot set up certificate verification: {e}")))?;
+        Mode::Standard { inner, verify_name }
+    };
+    let builder = ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(versions)
+        .map_err(|e| BuildError::new(format!("cannot set up TLS: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(Verifier { mode, provider }));
+    let mut config = match identity {
+        Some(identity) => builder
+            .with_client_auth_cert(identity.chain, identity.key)
+            .map_err(|e| BuildError::new(format!("the client certificate cannot be used: {e}")))?,
+        None => builder.with_no_client_auth(),
+    };
+    config.enable_sni = opts.sni != Sni::Off;
+    config.alpn_protocols = if opts.alpn.is_empty() {
+        default_alpn.iter().map(|p| p.as_bytes().to_vec()).collect()
+    } else {
+        opts.alpn.iter().map(|p| p.as_bytes().to_vec()).collect()
+    };
+    Ok((config, name))
+}
+
 /// Everything that can be prepared ahead of a connection: built once per
 /// outbound, used for every handshake.
 pub struct TlsClient {
@@ -132,46 +183,14 @@ impl TlsClient {
         identity: Option<ClientIdentity>,
         roots: Arc<RootCertStore>,
     ) -> Result<TlsClient, BuildError> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let name = match (&opts.sni, server) {
-            (Sni::Name(custom), _) => dns_name(custom)?,
-            (_, HostName::Domain(d)) => dns_name(d)?,
-            // rustls sends no SNI for an IP address
-            (_, HostName::Ip(ip)) => ServerName::IpAddress((*ip).into()),
-        };
-        // parsed whatever the mode: a name that is not one is a build error
-        let verify_name = opts.verify_name.as_deref().map(dns_name).transpose()?;
-        let mode = if let Some(fingerprint) = opts.fingerprint_sha256 {
-            Mode::Pinned(fingerprint)
-        } else if opts.skip_cert_verify {
-            Mode::Insecure
-        } else {
-            let inner = WebPkiServerVerifier::builder_with_provider(roots, provider.clone())
-                .build()
-                .map_err(|e| {
-                    BuildError::new(format!("cannot set up certificate verification: {e}"))
-                })?;
-            Mode::Standard { inner, verify_name }
-        };
-        let builder = ClientConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
-            .map_err(|e| BuildError::new(format!("cannot set up TLS: {e}")))?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(Verifier { mode, provider }));
-        let mut config = match identity {
-            Some(identity) => builder
-                .with_client_auth_cert(identity.chain, identity.key)
-                .map_err(|e| {
-                    BuildError::new(format!("the client certificate cannot be used: {e}"))
-                })?,
-            None => builder.with_no_client_auth(),
-        };
-        config.enable_sni = opts.sni != Sni::Off;
-        config.alpn_protocols = if opts.alpn.is_empty() {
-            default_alpn.iter().map(|p| p.as_bytes().to_vec()).collect()
-        } else {
-            opts.alpn.iter().map(|p| p.as_bytes().to_vec()).collect()
-        };
+        let (config, name) = client_config(
+            opts,
+            server,
+            default_alpn,
+            identity,
+            roots,
+            rustls::DEFAULT_VERSIONS,
+        )?;
         Ok(TlsClient {
             connector: TlsConnector::from(Arc::new(config)),
             name,
@@ -192,6 +211,42 @@ impl TlsClient {
         let tls = self.connector.connect(self.name.clone(), stream).await?;
         let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
         Ok((Box::new(tls), alpn))
+    }
+}
+
+/// The TLS of a QUIC connection (phase 2 M7 design 3.2): what `TlsClient`
+/// sets up — verification, `sni`, ALPN, a client certificate — on TLS 1.3
+/// alone, as QUIC requires (quinn's handshake panics on a configuration
+/// without it). Built once per outbound.
+pub struct QuicTls {
+    pub config: Arc<ClientConfig>,
+    /// The name quinn is given for the server: TLS verifies it and sends it
+    /// as SNI — none for an IP address, a server written as one without
+    /// `sni=`.
+    pub server_name: String,
+}
+
+impl QuicTls {
+    /// As `TlsClient::build`.
+    pub fn build(
+        opts: &TlsOpts,
+        server: &HostName,
+        default_alpn: &[&str],
+        identity: Option<ClientIdentity>,
+        roots: Arc<RootCertStore>,
+    ) -> Result<QuicTls, BuildError> {
+        let (config, name) = client_config(
+            opts,
+            server,
+            default_alpn,
+            identity,
+            roots,
+            &[&rustls::version::TLS13],
+        )?;
+        Ok(QuicTls {
+            config: Arc::new(config),
+            server_name: name.to_str().into_owned(),
+        })
     }
 }
 
@@ -390,6 +445,84 @@ mod tests {
         let tcp = TcpStream::connect(addr).await.unwrap();
         let _stream = client.wrap(Box::new(tcp)).await.unwrap();
         assert_eq!(last_seen(&fixture, 2).await.alpn.as_deref(), Some("h2"));
+    }
+
+    /// What quinn is given: the server's name or address, or the name `sni`
+    /// gives — rustls sends no SNI for an address —, and nothing to send
+    /// with `sni=off`. ALPN is chosen as for `TlsClient`.
+    #[test]
+    fn quic_tls_names_the_server_as_quinn_takes_it() {
+        let roots = TlsFixture::new(&["proxy.test"]).roots();
+        let build = |opts: &TlsOpts, host: &str| {
+            QuicTls::build(opts, &HostName::parse(host), &["h3"], None, roots.clone()).unwrap()
+        };
+        let sni = |sni: Sni| TlsOpts {
+            sni,
+            ..TlsOpts::default()
+        };
+        for (opts, host, name, enable_sni) in [
+            (TlsOpts::default(), "proxy.test", "proxy.test", true),
+            (TlsOpts::default(), "192.0.2.1", "192.0.2.1", true),
+            (TlsOpts::default(), "[2001:db8::1]", "2001:db8::1", true),
+            (
+                sni(Sni::Name("front.test".into())),
+                "192.0.2.1",
+                "front.test",
+                true,
+            ),
+            (sni(Sni::Off), "proxy.test", "proxy.test", false),
+        ] {
+            let quic = build(&opts, host);
+            assert_eq!(quic.server_name, name, "{host}");
+            assert_eq!(quic.config.enable_sni, enable_sni, "{host}");
+        }
+        assert_eq!(
+            build(&TlsOpts::default(), "proxy.test")
+                .config
+                .alpn_protocols,
+            [b"h3".to_vec()]
+        );
+        let own = TlsOpts {
+            alpn: vec!["hq-29".into(), "h3".into()],
+            ..TlsOpts::default()
+        };
+        assert_eq!(
+            build(&own, "proxy.test").config.alpn_protocols,
+            [b"hq-29".to_vec(), b"h3".to_vec()]
+        );
+    }
+
+    /// QUIC's TLS is 1.3 alone: a server that speaks only 1.2 is refused.
+    #[tokio::test]
+    async fn quic_tls_speaks_tls13_alone() {
+        let fixture = TlsFixture::new(&["localhost"]);
+        let quic = QuicTls::build(
+            &TlsOpts::default(),
+            &HostName::parse("localhost"),
+            &[],
+            None,
+            fixture.roots(),
+        )
+        .unwrap();
+        for (version, works) in [
+            (&rustls::version::TLS12, false),
+            (&rustls::version::TLS13, true),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let acceptor = fixture.camouflage_acceptor(&[version], 0);
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                acceptor.accept(tcp).await.is_ok()
+            });
+            let name = ServerName::try_from(quic.server_name.clone()).unwrap();
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let client = TlsConnector::from(quic.config.clone())
+                .connect(name, tcp)
+                .await;
+            assert_eq!(client.is_ok(), works, "{:?}", version.version);
+            assert_eq!(server.await.unwrap(), works, "{:?}", version.version);
+        }
     }
 
     #[test]

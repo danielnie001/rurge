@@ -1,0 +1,28 @@
+[package]
+name = "rurge-proto-quic"
+description = "The QUIC outbounds of rurge: one QUIC connection per policy, shared by its requests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rurge-config.workspace = true
+rurge-net.workspace = true
+rurge-proto.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rurge-net = { workspace = true, features = ["testing"] }
+
+[features]
+# Loopback QUIC servers (`rurge_proto_quic::testing`); enabled by dependants' dev-dependencies.
+testing = ["rurge-net/testing"]
+
+[lints]
+workspace = true
