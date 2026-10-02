@@ -71,17 +71,23 @@ fn read_h2_tls(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> TlsOpts {
     tls
 }
 
-/// `headers`, without the fields HTTP/2 forbids (`W0028` each).
+/// `headers`, without the fields HTTP/2 forbids (`W0028` each). `host` is
+/// one of them here: `:authority` names the CONNECT target, and a `Host`
+/// that differs from it makes the request malformed (RFC 9113 8.3.1).
 fn read_h2_headers(r: &mut ParamReader<'_>) -> Vec<HeaderTemplate> {
     let mut headers = read_headers(r);
     headers.retain(|header| {
         let name = header.name.to_ascii_lowercase();
-        if !CONNECTION_SPECIFIC.contains(&name.as_str()) {
+        let why = if CONNECTION_SPECIFIC.contains(&name.as_str()) {
+            ""
+        } else if name == "host" {
+            " (`:authority` names the target)"
+        } else {
             return true;
-        }
+        };
         r.warn(
             codes::W_PARAM_NOT_APPLICABLE,
-            format!("header `{name}` in `headers` is not allowed in HTTP/2; ignored"),
+            format!("header `{name}` in `headers` is not allowed in HTTP/2{why}; ignored"),
         );
         false
     });
@@ -430,6 +436,27 @@ mod tests {
         );
     }
 
+    /// `:authority` names the CONNECT target: a `Host` that differs from it
+    /// makes the request malformed (RFC 9113 8.3.1).
+    #[test]
+    fn a_host_header_is_dropped() {
+        let (spec, failed, diags) = h2("h2-connect, h.test, 443, headers=Host:cdn.test;X-A:1");
+        let (read, tt_failed, tt_diags) =
+            tt("trust-tunnel, h.test, 443, username=u, password=p, headers=host:cdn.test;X-A:1");
+        assert!(!failed && !tt_failed);
+        for (headers, diags) in [(&spec.headers, &diags), (&read.spec.headers, &tt_diags)] {
+            let names: Vec<&str> = headers.iter().map(|h| h.name.as_str()).collect();
+            assert_eq!(names, ["X-A"]);
+            assert_eq!(
+                messages(diags),
+                [(
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `P`: header `host` in `headers` is not allowed in HTTP/2 (`:authority` names the target); ignored"
+                )]
+            );
+        }
+    }
+
     #[test]
     fn connection_specific_headers_are_dropped() {
         let (spec, failed, diags) = h2(
@@ -484,6 +511,20 @@ mod tests {
                 !printed.contains("s3cretUser") && !printed.contains("hunter2"),
                 "{printed}"
             );
+        }
+    }
+
+    /// A header may carry a token: its value is never printed (phase 2 M6
+    /// design 6); its name may be.
+    #[test]
+    fn the_specs_do_not_print_header_values() {
+        let (spec, _, _) = h2("h2-connect, h.test, 443, headers=Authorization:Bearer t0ken");
+        let (got, _, _) = tt(
+            "trust-tunnel, h.test, 443, username=u, password=p, headers=Authorization:Bearer t0ken",
+        );
+        for printed in [format!("{spec:?}"), format!("{:?}", got.spec)] {
+            assert!(printed.contains("Authorization"), "{printed}");
+            assert!(!printed.contains("t0ken"), "{printed}");
         }
     }
 }

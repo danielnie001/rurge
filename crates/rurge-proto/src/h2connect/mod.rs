@@ -17,7 +17,7 @@
 mod capsule;
 mod udp;
 
-use crate::build::{shadow_tls_client, tls_client};
+use crate::build::{shadow_tls_client, tls_client, tls_name};
 use crate::h2pool::{H2Pool, H2Stream, StackDial};
 use crate::http::{merge, render, wire_host};
 use crate::transport::Stack;
@@ -140,10 +140,12 @@ impl H2ConnectOutbound {
                 n + 1
             )));
         }
-        // CONNECT-UDP names the server itself (RFC 9298 3.4)
+        // CONNECT-UDP names the server itself (RFC 9298 3.4), as its TLS
+        // does
+        let named = Target::new(tls_name(Some(&spec.tls), &server.host), server.port);
         let udp_authority = match spec.udp_relay {
             false => None,
-            true => match wire_host(&server) {
+            true => match wire_host(&named) {
                 Some(host) => Some(format!("{host}:{}", server.port)),
                 None => {
                     return Err(BuildError::new(
@@ -857,6 +859,27 @@ mod tests {
         let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
         let err = carrier.send_to(b"x", &target(echo)).await.unwrap_err();
         assert_eq!(err.to_string(), "h2-connect: proxy authentication required");
+    }
+
+    /// With `sni=` the server goes by that name: CONNECT-UDP's `:authority`
+    /// is the name TLS sends, not the address dialed.
+    #[tokio::test]
+    async fn connect_udp_names_the_server_as_its_tls_does() {
+        let echo = udp_echo_server().await;
+        let fixture = TlsFixture::new(&["127.0.0.1", "proxy.test"]);
+        let fake = FakeH2Proxy::spawn(
+            H2ProxyScript {
+                extended_connect: true,
+                ..H2ProxyScript::default()
+            },
+            fixture.clone(),
+        )
+        .await;
+        let out = outbound(&fake, ", sni=proxy.test, udp-relay=true", &fixture);
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        udp_roundtrip(carrier.as_ref(), &target(echo), b"by name").await;
+        let authority = format!("proxy.test:{}", fake.addr().port());
+        assert_eq!(fake.requests()[0].authority, authority);
     }
 
     /// One stream per target (M6-D8), the streams sharing the pooled

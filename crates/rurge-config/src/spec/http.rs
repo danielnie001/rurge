@@ -2,6 +2,7 @@
 
 use super::secret::Secret;
 use super::tls::TlsOpts;
+use std::fmt;
 
 /// One piece of a header value: literal text or a random URL-safe string
 /// rendered anew for every connection.
@@ -11,10 +12,19 @@ pub enum HeaderPart {
     Random { min: usize, max: usize },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `Debug` leaves the value out: it may carry a token.
+#[derive(Clone, PartialEq, Eq)]
 pub struct HeaderTemplate {
     pub name: String,
     pub value: Vec<HeaderPart>,
+}
+
+impl fmt::Debug for HeaderTemplate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HeaderTemplate")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

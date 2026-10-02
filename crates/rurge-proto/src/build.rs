@@ -82,11 +82,16 @@ pub fn shadow_tls_client(
     let Some(opts) = opts else {
         return Ok(None);
     };
-    let fallback = match tls.map(|tls| &tls.sni) {
+    ShadowTlsClient::build(opts, &tls_name(tls, server), roots).map(Some)
+}
+
+/// The name the policy's TLS knows the server by: its `sni`, else the
+/// server.
+pub(crate) fn tls_name(tls: Option<&TlsOpts>, server: &HostName) -> HostName {
+    match tls.map(|tls| &tls.sni) {
         Some(Sni::Name(name)) => HostName::parse(name),
         _ => server.clone(),
-    };
-    ShadowTlsClient::build(opts, &fallback, roots).map(Some)
+    }
 }
 
 #[cfg(test)]
