@@ -16,6 +16,7 @@
 
 mod carrier;
 mod dial;
+pub mod h3;
 mod hop;
 mod socket;
 #[cfg(any(test, feature = "testing"))]
