@@ -19876,6 +19876,17 @@ git commit -m "docs: M7a QUIC 地基与 Hysteria 2——兼容性清单、手工
 
 | # | 任务 | 与计划的出入 | 原因 |
 | - | ---- | ------------ | ---- |
+| 1 | Task 4 | （7c81942）补一条计划没有的用例 `a_dial_its_caller_gave_up_on_is_taken_over_by_a_waiter`：发起单飞拨号的请求放弃（它的 future 被丢掉，如超时）时，等着这次拨号的请求接过拨号，会话随后用它建的连接。只改测试：测试协议 `Plain` 加 `stall_first`（第一次握手不结束）与 `stalled`（卡住时通知） | Task 4 评审（计划规定的做法）：这条分支没有用例，一旦回归，策略会挂到重载为止 |
+| 2 | Task 5 | （071b3f3）计划的 `git add` 没有列 `Cargo.lock`（`rurge-proto-quic` 新增 `getrandom` 与 `http` 两条依赖边），按项目要求一并提交 | 计划的疏漏：`Cargo.lock` 要提交 |
+| 3 | Task 6 | （a0b5088）每个 UDP 载体一把锁（std `Mutex`，只包住同步的 `transmit`，不跨 `.await`），一个包的全部分片连着交给 QUIC；新用例 `concurrent_sends_keep_each_datagrams_fragments_together`（8 个任务经同一载体并发发 3000 字节的包；去掉锁时 30 次失败 29 次；假服务端本来就照参考实现，每个会话同一时刻只重组一个包号） | Task 6 评审（计划规定的做法）：并发发送的两个分片包的片会交错，参考实现的服务端每个会话只重组一个包号，两个包都会丢——多线程运行时下 1200 字节以上的 QUIC Initial 经 Hysteria 的 UDP 时很常见 |
+| 4 | Task 6 | （a0b5088）UDP 载体至多每秒比较一次底层策略的去处：其余发送只看连接是否开着、是否正在离开、是否已被标成换了路（新增 `Session::serves_without_route`）；请求照旧每次比较。新用例 `the_route_is_compared_at_most_once_a_second_on_udp`、`a_carrier_finds_a_changed_route_by_itself`；会话模块文档里"每个数据报都比较"的说法随之改掉，P15 的"UDP 载体的每次发送"以本条为准 | Task 6 评审（计划规定的做法）：经 `underlying-proxy` 的每个数据报都做一次完整的 `ChainConnector::route()`（注册表读取、组解析、分配，`smart` 组还要取全局锁）。代价：没有请求先发现时，UDP 至多晚约 1 秒跟上底层组换的成员 |
+| 5 | Task 6 | （328d817）服务端不支持 QUIC 数据报时 `open_udp` 的文本是 `hysteria2: the server does not support QUIC datagrams`，与 `Hysteria-UDP: false` 的 `hysteria2: the server does not allow UDP` 分开；P18 的文字说两种情况同一条文本，计划的代码与用例本来就是两条 | 计划的文字与代码不一致，以代码为准；设计第 15 节第 3 条、兼容性清单与手工验收列出两条文本 |
+| 6 | 终审 | （63544a8）加载时对组级 `underlying-proxy` 的组里用了 `port-hopping` 的成员报 `W0023`（沿用"组不得不略去一个成员"的码，不新增诊断码），在组的那一行：`` policy group `G` relays its members through `underlying-proxy`: `M` uses `port-hopping`, which cannot go through it; `M (via R)` is left out ``。成员按注册表装配的顺序取配置本身给的（行上写的、`include-other-group` 与 `include-all-proxies` 取来的，各按组的过滤器）；订阅带来的加载时不知道，仍只记日志。新用例 `a_relayed_group_says_which_member_with_port_hopping_it_leaves_out`；`a_hopping_member_of_a_relayed_group_is_left_out` 加断言加载期报了这条，`check_knows_hysteria2` 断言 `rurge check` 的输出 | 终审（I2）：派生成员 `M (via R)` 构建失败只记日志（M3-D7），成员全被略去时组为空、悄悄按 DIRECT 走（M3-D3），`rurge check` 什么也不说（干构建只建配置自己的策略） |
+| 7 | 终审 | （5b5ea5a）`h3::client::Inner::fail` 除了任务记下的 `state.ended`，还看 `quic.close_reason()`：连接已结束而任务还没看到时不再 `close`、也不记 failure。新用例 `a_failure_after_the_end_leaves_how_the_connection_ended`（去掉新条件时失败）；h3 测试模块的 `connected` 与 `BOUND` 改为 `pub(super)` 供它用 | 终审（m1，Task 3 评审的延后记录）：quinn 的 `close()` 会把已记下的结束原因（服务端的关闭、stateless reset）改成 `LocallyClosed` |
+| 8 | 终审 | （5b5ea5a）测试的等待加上 `timeout(BOUND, …)`：h3 测试 `connected_with` 的握手 join 与 `pair` 里的 `H3Server::start`、`quic` 测试 `pair` 的握手 join、hysteria2 超时用例 `a_server_that_never_answers_times_out` 的两次 `connect_tcp` 以及同类的 `obfuscation_that_does_not_match_fails_by_the_time_of_the_request` 里的一次 | 终审（m4，Task 3 / 4 / 5 评审的延后记录）：回归时这些用例会挂住而不是失败 |
+| 9 | 终审 | （5b5ea5a）`tcp_and_udp_go_through_either_obfuscation` 去掉 Salamander 分支的 `assert!(fragments.is_empty())`，注释指向层自身的用例 `what_goes_out_is_sealed_and_the_handshake_with_gecko_in_fragments`（它看到只用 Salamander 时握手整包发出） | 终审（m5，Task 7 评审的延后记录）：假服务端只在 Gecko 模式下记录分片，这条断言永远不会失败 |
+| 10 | 终审 | 兼容性清单：`hysteria2` 行写明 UDP 约 1 秒内跟上底层组换的成员、stateless reset 只在服务端没重启时认得出（quic-go 缺省不发；官方 Hysteria 与 sing-box 每次启动随机生成密钥）、参考实现的服务端丢弃空载荷的 UDP 包；4.3 `underlying-proxy` 行与 4.6 `hysteria2` 参数行登记带跳跃的成员被略去、空组回退与新告警；Shadow TLS 约束行的"还不会真的报出"补上 `tailscale`。设计新增第 15 节「M7a 实施期的订正」；本表与「延后事项」补齐 | 终审（I1、m3）：执行期的偏差没有进计划与设计，清单的几处说法与实现或参考服务端不符 |
+| 11 | 门禁 | 最终门禁（终审修正 5b5ea5a 之后）：fmt、clippy 通过；`cargo test --workspace --no-fail-fast` 一轮通过：63 个测试二进制 1790 通过 / 0 失败 / 3 忽略 | 终审修正加了 #6、#7 的两个用例 |
 
 ## 延后事项
 
@@ -19889,3 +19900,8 @@ git commit -m "docs: M7a QUIC 地基与 Hysteria 2——兼容性清单、手工
 | 6 | Surge 的 `gecko-password` 是否就是公开规范里的 Gecko | 手工验收 |
 | 7 | 端口跳跃对真实服务端的互操作（要服务端配 DNAT） | 手工验收 |
 | 8 | `ecn` 在纯 TCP 协议上照旧是 `W0029`，而手册说它对纯 TCP 协议无效（`W0028` 更合适） | M8 |
+| 9 | CONNECT 的 2xx 之后再来的 HEADERS 眼下当作 trailers 跳过，RFC 9114 4.4 要求报 H3_FRAME_UNEXPECTED（M7c 的隧道要知道自己是 CONNECT） | M7c |
+| 10 | `:authority` 保留了 URI 里的 userinfo，RFC 9114 4.3.1 不允许：从配置来的 DoH3 URL 用到它之前去掉或拒绝 | M7c |
+| 11 | 手写的 HTTP/3 隧道要先 `flush` 再等对端：写了一半的帧只在写、`flush` 或 `shutdown` 时推进（`copy_bidirectional` 没问题） | M7c |
+| 12 | 被淘汰的连接（底层组换了成员、重载、GOAWAY）在最后一个租约放手时立刻 `close`，可能截掉最后一条流还没发出的尾部 | 有用户报告再说（或 M8：有界地等 `stopped()` 再关） |
+| 13 | 混淆口令短于 4 字节时参考实现不接受（这样配置的服务端起不来）；rurge 不设下限，写了这样的口令只表现为连接超时（兼容性清单已登记） | M8 再议加载期告警 |

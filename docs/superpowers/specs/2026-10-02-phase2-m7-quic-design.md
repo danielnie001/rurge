@@ -295,3 +295,14 @@
 8. **Hysteria 2 的 UDP（订正 5.3）**：会话号按出站从 1 计、载体终生不变（上文写的是每条连接内递增）；`Hysteria-UDP: false` 或服务端不支持 QUIC 数据报时 `open_udp` 本身失败；载体在连接关闭、正在离开或底层策略变了时迁到会话当前的连接（P18）。
 9. **混淆（细化 5.4）**：Salamander 丢掉 8 字节及以下的包；Gecko 的每个长头包都分片，待重组的包满 8 个时挤掉最旧的（参考实现拒绝新的）（P19）。
 10. **引擎（细化 3.1 的第二条约束）**：`port-hopping` 遇上非直连的连接器在 `Dialer::new` 里拒绝，经组级 `underlying-proxy` 派生出的 `M (via R)` 因此只略去这一条（P20）。
+
+## 15. M7a 实施期的订正
+
+执行 M7a 计划（`docs/superpowers/plans/2026-10-02-phase2-m7a-quic-hysteria2-plan.md`）时，任务评审与全分支评审改动或补充了若干做法；与上文及第 14 节不一致处以本节为准（明细见计划的「执行期修正记录」）。
+
+1. **同一载体的分片不交错（细化 5.3）**：每个 UDP 载体一把锁，一个包的全部分片连着交给 QUIC（锁只包住同步的发送，不跨 `.await`）。参考实现的服务端每个会话同一时刻只重组一个包号，两个包的分片交错时两个包都会丢；多线程运行时下并发发送很常见（经 Hysteria UDP 的 QUIC Initial 就有 1200 字节以上）。用例 `concurrent_sends_keep_each_datagrams_fragments_together`。
+2. **UDP 至多每秒比较一次底层策略（细化第 14 节第 6 条，P15）**：请求照旧每次取用连接时比较 `Connector::route()`；UDP 载体的发送只看连接是否开着、是否正在离开、是否已被标成换了路（`Session::serves_without_route`），完整的比较距上次满 1 秒才做一次——经 `underlying-proxy` 的每个数据报都做一次（注册表读取、组解析、分配）代价太高。代价：没有请求先发现时，UDP 至多晚约 1 秒跟上底层组换的成员。用例 `the_route_is_compared_at_most_once_a_second_on_udp`、`a_carrier_finds_a_changed_route_by_itself`。
+3. **服务端不支持 QUIC 数据报时的文本（订正第 14 节第 8 条，P18）**：`Hysteria-UDP: false` 是 `hysteria2: the server does not allow UDP`；服务端在 QUIC 层不支持数据报是另一条 `hysteria2: the server does not support QUIC datagrams`（P18 写的是同一条）。两种情况都是打开载体即失败，同一连接上的 TCP 照常。
+4. **放弃了拨号的调用方（第 14 节第 6 条的单飞拨号）**：发起拨号的请求放弃时（它的 future 被丢掉，如超时），等着这次拨号的请求接过拨号，会话随后用它建的连接；补上用例 `a_dial_its_caller_gave_up_on_is_taken_over_by_a_waiter`（只加测试，做法不变）。
+5. **组中继里带端口跳跃的成员（细化第 14 节第 10 条，P20）**：加载时对每个有 `underlying-proxy` 的组，按注册表装配的顺序算出配置本身给它的成员（行上写的、`include-other-group` 与 `include-all-proxies` 取来的，各按组的过滤器），其中用了 `port-hopping` 的各报一条 `W0023`（沿用"组不得不略去一个成员"的码），在组的那一行：`` policy group `G` relays its members through `underlying-proxy`: `M` uses `port-hopping`, which cannot go through it; `M (via R)` is left out ``；`rurge check` 由此报出。`policy-path` 带来的成员加载时不知道，仍只由注册表记日志略去。成员全被略去时组为空，按 M3-D3 由 DIRECT 代替（`--empty-group-reject` 时 REJECT）。用例 `a_relayed_group_says_which_member_with_port_hopping_it_leaves_out`、`a_hopping_member_of_a_relayed_group_is_left_out`、`check_knows_hysteria2`。
+6. **HTTP/3 客户端只关闭仍开着的连接（细化第 14 节第 5 条）**：因违反 HTTP/3 关闭连接之前，除了任务记下的结束，还看 quinn 的 `close_reason()`：连接已经结束（服务端的关闭、stateless reset）而任务还没看到时不再关闭，也不记下失败——quinn 的 `close` 会把已记下的结束原因改成本地关闭。用例 `a_failure_after_the_end_leaves_how_the_connection_ended`。
