@@ -5,6 +5,7 @@
 
 use crate::auto::{EVALUATION_FAILED, resolve_ready};
 use crate::engine::{CONNECT_TIMEOUT, Chosen, Engine};
+use rurge_config::HostName;
 use rurge_config::general::{BlockQuicGlobal, UdpFallback};
 use rurge_config::policy::Builtin;
 use rurge_config::rule::{PolicyRef, ProtocolKind};
@@ -14,8 +15,10 @@ use rurge_inbound::{SessionHandle, SessionOutcome, UdpClient};
 use rurge_net::connector::{ConnectOpts, PacketSocket, Target};
 use rurge_policy::TerminalKind;
 use rurge_policy::auto::SelectCtx;
-use rurge_proto::{OutboundError, OutboundRef, RejectKind, UdpSupport};
+use rurge_proto::{OutboundRef, RejectKind, UdpSupport};
 use std::collections::HashMap;
+use std::io;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -32,12 +35,20 @@ pub const DNS_LINGER: Duration = Duration::from_secs(10);
 pub const FLOWS_PER_ASSOCIATION: usize = 1024;
 /// At most this many associations at once (M5-D11).
 pub const ASSOCIATIONS: usize = 4096;
-/// A flow whose outbound failed to open drops what comes for it this long
-/// after the failure — however much keeps coming — and then ends, so the
-/// next datagram starts a new flow that is routed and opened afresh.
+/// A flow whose outbound failed to open, or whose datagrams stopped going
+/// out, drops what comes for it this long after the failure — however much
+/// keeps coming — and then ends, so the next datagram starts a new flow
+/// that is routed and opened afresh.
 const RETRY_AFTER: Duration = Duration::from_secs(5);
 /// Datagrams waiting for their flow to get going; more are dropped.
 const QUEUE: usize = 64;
+/// What the flows of one association may hold in all, waiting for their
+/// carrier or their turn to go out; more is dropped.
+const QUEUED_BYTES: usize = 1 << 20;
+/// A send to the outbound not done by then is given up: its stream is stuck
+/// behind a peer that reads no more. A send may first dial the target's own
+/// connection (vmess, h2-connect).
+const SEND_TIMEOUT: Duration = CONNECT_TIMEOUT.saturating_add(Duration::from_secs(5));
 /// Room for the largest datagram.
 const DATAGRAM: usize = 65536;
 
@@ -136,7 +147,9 @@ impl Flow {
 }
 
 /// Which flow a datagram coming back counts for: the one that sent to its
-/// source, else the oldest flow still on the carrier (full cone).
+/// source; else the oldest flow sent to a name on its port (the server
+/// looked the name up: the answer comes from the address); else the oldest
+/// flow still on the carrier (full cone).
 #[derive(Default)]
 struct Routes(Mutex<Vec<(Target, Weak<Flow>)>>);
 
@@ -155,11 +168,17 @@ impl Routes {
 
     fn flow_for(&self, from: &Target) -> Option<Arc<Flow>> {
         let routes = self.0.lock().expect("routes");
-        routes
-            .iter()
-            .find(|(to, _)| to == from)
-            .and_then(|(_, f)| f.upgrade())
-            .or_else(|| routes.iter().find_map(|(_, f)| f.upgrade()))
+        let oldest = |sent_to: &dyn Fn(&Target) -> bool| {
+            routes
+                .iter()
+                .filter(|(to, _)| sent_to(to))
+                .find_map(|(_, f)| f.upgrade())
+        };
+        oldest(&|to| to == from)
+            .or_else(|| {
+                oldest(&|to| matches!(to.host, HostName::Domain(_)) && to.port == from.port)
+            })
+            .or_else(|| oldest(&|_| true))
     }
 }
 
@@ -171,7 +190,8 @@ struct Carrier {
     outbound: OutboundRef,
     socket: Arc<dyn PacketSocket>,
     routes: Arc<Routes>,
-    /// Fires when the receive task has ended: nothing comes back any more.
+    /// Fires when the receive task has ended — nothing comes back any more —
+    /// or a send was given up: the carrier is not used again.
     dead: CancellationToken,
     _receive: AbortOnDropHandle<()>,
 }
@@ -190,22 +210,43 @@ async fn receive(
             flow.handle.mark_first_byte();
             flow.answered();
         }
-        if client.send(&buf[..n], &from).await.is_err() {
-            return;
+        // one datagram the client cannot take (too long once the SOCKS5
+        // header is on, a full buffer) is lost alone: anyone may send to
+        // the carrier, and the association lives by its control connection
+        if let Err(e) = client.send(&buf[..n], &from).await {
+            tracing::debug!(error = %e, "udp: a datagram for the client is dropped");
         }
     }
 }
 
 /// The association's carriers, one per outbound object, opened once each.
 #[derive(Default)]
-struct Carriers(Mutex<HashMap<usize, Arc<tokio::sync::Mutex<Weak<Carrier>>>>>);
+struct Carriers(Mutex<HashMap<usize, Arc<Slot>>>);
+
+/// One outbound's carrier within the association: opened by one flow at a
+/// time, while the others wait.
+#[derive(Default)]
+struct Slot {
+    /// How many openings have failed.
+    failures: AtomicU64,
+    held: tokio::sync::Mutex<Held>,
+}
+
+#[derive(Default)]
+struct Held {
+    carrier: Weak<Carrier>,
+    /// Why the last opening failed.
+    why: String,
+}
 
 impl Carriers {
+    /// The carrier of `outbound`, opened now unless there is one; `Err`
+    /// says why it could not be opened.
     async fn get(
         &self,
         outbound: &OutboundRef,
         client: &Arc<dyn UdpClient>,
-    ) -> Result<Arc<Carrier>, OutboundError> {
+    ) -> Result<Arc<Carrier>, String> {
         let key = Arc::as_ptr(outbound) as *const () as usize;
         let slot = self
             .0
@@ -214,17 +255,31 @@ impl Carriers {
             .entry(key)
             .or_default()
             .clone();
-        let mut held = slot.lock().await;
+        let failures = slot.failures.load(Ordering::Acquire);
+        let mut held = slot.held.lock().await;
         if let Some(carrier) = held
+            .carrier
             .upgrade()
             .filter(|c| Arc::ptr_eq(&c.outbound, outbound) && !c.dead.is_cancelled())
         {
             return Ok(carrier);
         }
+        // the opening this flow waited for failed: so does the flow — a try
+        // of its own would hold up every flow behind it as long again
+        if slot.failures.load(Ordering::Acquire) != failures {
+            return Err(held.why.clone());
+        }
         let opts = ConnectOpts {
             timeout: CONNECT_TIMEOUT,
         };
-        let socket: Arc<dyn PacketSocket> = Arc::from(outbound.open_udp(&opts).await?);
+        let socket: Arc<dyn PacketSocket> = match outbound.open_udp(&opts).await {
+            Ok(socket) => Arc::from(socket),
+            Err(e) => {
+                held.why = e.to_string();
+                slot.failures.fetch_add(1, Ordering::Release);
+                return Err(held.why.clone());
+            }
+        };
         let routes = Arc::new(Routes::default());
         let dead = CancellationToken::new();
         let task = tokio::spawn(receive(
@@ -240,8 +295,36 @@ impl Carriers {
             dead,
             _receive: AbortOnDropHandle::new(task),
         });
-        *held = Arc::downgrade(&carrier);
+        held.carrier = Arc::downgrade(&carrier);
         Ok(carrier)
+    }
+}
+
+/// A datagram from the client on its way out: its bytes count against the
+/// association's `QUEUED_BYTES` until it is gone.
+struct Queued {
+    datagram: Vec<u8>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl Queued {
+    /// `None`: the association holds as much as it may.
+    fn new(datagram: Vec<u8>, queued: &Arc<AtomicUsize>) -> Option<Queued> {
+        let len = datagram.len();
+        if queued.fetch_add(len, Ordering::AcqRel) + len > QUEUED_BYTES {
+            queued.fetch_sub(len, Ordering::AcqRel);
+            return None;
+        }
+        Some(Queued {
+            datagram,
+            queued: queued.clone(),
+        })
+    }
+}
+
+impl Drop for Queued {
+    fn drop(&mut self) {
+        self.queued.fetch_sub(self.datagram.len(), Ordering::AcqRel);
     }
 }
 
@@ -273,7 +356,8 @@ pub(crate) async fn serve(
     });
     // the flows end with the association, however this future ends
     let _ended = association.ended.clone().drop_guard();
-    let mut flows: HashMap<Target, (u64, mpsc::Sender<Vec<u8>>)> = HashMap::new();
+    let mut flows: HashMap<Target, (u64, mpsc::Sender<Queued>)> = HashMap::new();
+    let queued = Arc::new(AtomicUsize::new(0));
     let mut next = 0u64;
     let mut buf = vec![0u8; DATAGRAM];
     loop {
@@ -287,7 +371,10 @@ pub(crate) async fn serve(
             }
             got = client.recv(&mut buf) => {
                 let Ok((n, to)) = got else { break };
-                let mut datagram = buf[..n].to_vec();
+                let Some(mut datagram) = Queued::new(buf[..n].to_vec(), &queued) else {
+                    engine.warn_udp_limit("udp: an association holds 1 MiB waiting to go out; datagrams are dropped");
+                    continue;
+                };
                 if let Some((_, queue)) = flows.get(&to) {
                     match queue.try_send(datagram) {
                         Ok(()) | Err(TrySendError::Full(_)) => continue,
@@ -322,19 +409,21 @@ async fn run_flow(
     engine: Arc<Engine>,
     association: Arc<Association>,
     to: Target,
-    first: Vec<u8>,
-    mut waiting: mpsc::Receiver<Vec<u8>>,
+    first: Queued,
+    mut waiting: mpsc::Receiver<Queued>,
     id: u64,
 ) {
     let mut session = association.template.clone();
     session.dst_host = to.host.clone();
     session.dst_port = to.port;
     // the rules see what the first datagram is (`PROTOCOL,QUIC`)
-    session.protocol = Some(if to.port == 443 && crate::sniff::is_quic_initial(&first) {
-        ProtocolKind::Quic
-    } else {
-        ProtocolKind::Udp
-    });
+    session.protocol = Some(
+        if to.port == 443 && crate::sniff::is_quic_initial(&first.datagram) {
+            ProtocolKind::Quic
+        } else {
+            ProtocolKind::Udp
+        },
+    );
     let handle = engine.new_handle(session);
     let opened = tokio::select! {
         _ = association.ended.cancelled() => Err(SessionOutcome::Completed),
@@ -346,10 +435,18 @@ async fn run_flow(
             let outcome =
                 forward(&association, &flow, &carrier, &send_to, first, &mut waiting).await;
             carrier.routes.remove(&flow);
-            waiting.close();
+            // a flow whose datagrams stopped going out is tried again after
+            // `RETRY_AFTER`, as one that could not open
+            let retry = matches!(outcome, SessionOutcome::Failed(_)).then(|| now() + RETRY_AFTER);
             handle.finish(outcome);
+            if retry.is_some() {
+                drain(&association, &handle, &mut waiting, retry).await;
+            }
+            waiting.close();
         }
         Err(outcome) => {
+            // it holds no room while the flow stays
+            drop(first);
             // a refused flow stays until it is idle; a failed one is tried
             // again after `RETRY_AFTER`
             let retry = matches!(outcome, SessionOutcome::Failed(_)).then(|| now() + RETRY_AFTER);
@@ -447,29 +544,41 @@ async fn open(
             return Err(failed(handle, e.to_string()));
         }
     };
-    let send_to = carrier
-        .socket
-        .resolve(to)
+    // within the dial's time, as a TCP session's: a tunnel's DNS waits for
+    // the tunnel to come up first
+    let send_to = tokio::time::timeout(CONNECT_TIMEOUT, carrier.socket.resolve(to))
         .await
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("looking up {} timed out", to.host),
+            ))
+        })
         .map_err(|e| failed(handle, e.to_string()))?;
     handle.mark_connected();
     if let Some(pick) = &smart {
         book.used(&pick.group, &pick.member, Instant::now());
-        // three silent seconds tell only where an answer always comes: DNS,
-        // and the port QUIC answers on; a game may only send
-        let silence = matches!(to.port, 53 | 443);
         crate::smart::watch(
             handle,
             book.clone(),
             &pick.member,
             &outbound,
             &host,
-            silence,
+            silence_tells(&send_to),
         );
     }
     let flow = Arc::new(Flow::new(handle.clone(), to.port));
     carrier.routes.add(send_to.clone(), &flow);
     Ok((flow, carrier, send_to))
+}
+
+/// Whether three silent seconds of a flow sending to `send_to` count
+/// against its `smart` member: only where an answer always comes — DNS, and
+/// the port QUIC answers on; a game may only send — and only to an address:
+/// the answers for a name that the server looks up may count for another
+/// flow on the same port.
+fn silence_tells(send_to: &Target) -> bool {
+    matches!(send_to.port, 53 | 443) && matches!(send_to.host, HostName::Ip(_))
 }
 
 /// The REJECT flavour at the end of `chain`.
@@ -487,23 +596,46 @@ async fn forward(
     flow: &Flow,
     carrier: &Carrier,
     send_to: &Target,
-    first: Vec<u8>,
-    waiting: &mut mpsc::Receiver<Vec<u8>>,
+    first: Queued,
+    waiting: &mut mpsc::Receiver<Queued>,
 ) -> SessionOutcome {
     let mut next = Some(first);
     loop {
         if let Some(datagram) = next.take() {
-            if let Err(e) = carrier.socket.send_to(&datagram, send_to).await {
-                return failed(&flow.handle, e.to_string());
+            // the end of the association cuts a send short (its carriers go
+            // with it), a kill waits for it: one cut short may leave half a
+            // datagram on a stream the other flows share
+            let sending = tokio::time::timeout(
+                SEND_TIMEOUT,
+                carrier.socket.send_to(&datagram.datagram, send_to),
+            );
+            let sent = tokio::select! {
+                _ = association.ended.cancelled() => return SessionOutcome::Completed,
+                sent = sending => sent,
+            };
+            match sent {
+                Ok(Ok(())) => {
+                    flow.handle.add_up(datagram.datagram.len() as u64);
+                    flow.touch();
+                }
+                Ok(Err(e)) if lost_alone(&e) => {
+                    tracing::debug!(error = %e, "udp: a datagram for the target is dropped");
+                    if flow.handle.error().is_none() {
+                        flow.handle.set_error(e.to_string());
+                    }
+                }
+                Ok(Err(e)) => return upstream_failed(&flow.handle, e.to_string()),
+                Err(_) => {
+                    carrier.dead.cancel();
+                    return upstream_failed(&flow.handle, "sending to the outbound timed out");
+                }
             }
-            flow.handle.add_up(datagram.len() as u64);
-            flow.touch();
         }
         tokio::select! {
             _ = association.ended.cancelled() => return SessionOutcome::Completed,
             _ = flow.handle.token().cancelled() => return SessionOutcome::Completed,
             _ = carrier.dead.cancelled() => {
-                return failed(&flow.handle, "the outbound's UDP socket has closed");
+                return upstream_failed(&flow.handle, "the outbound's UDP socket has closed");
             }
             got = waiting.recv() => match got {
                 Some(datagram) => next = Some(datagram),
@@ -514,12 +646,28 @@ async fn forward(
     }
 }
 
-/// Drops what comes for a flow that could not start, until it is idle — or
-/// until `retry`, whatever comes in the meantime.
+/// Whether a send that failed loses only its datagram, as any hop may lose
+/// one: the outbound will not carry it (too long for its framing, a name it
+/// cannot write) or the system turned it away (no buffer space, too long
+/// for it, no route for now). Anything else says the outbound cannot reach
+/// the target: the flow fails.
+fn lost_alone(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::InvalidInput || e.raw_os_error().is_some()
+}
+
+/// The flow failed upstream: a `smart` group's member answers for it.
+fn upstream_failed(handle: &SessionHandle, message: impl Into<String>) -> SessionOutcome {
+    handle.mark_upstream_failed();
+    failed(handle, message)
+}
+
+/// Drops what comes for a flow that could not start, or whose datagrams
+/// stopped going out, until it is idle — or until `retry`, whatever comes in
+/// the meantime.
 async fn drain(
     association: &Association,
     handle: &SessionHandle,
-    waiting: &mut mpsc::Receiver<Vec<u8>>,
+    waiting: &mut mpsc::Receiver<Queued>,
     retry: Option<Instant>,
 ) {
     let mut last = now();
@@ -540,6 +688,8 @@ async fn drain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rurge_net::BoxFuture;
+    use rurge_proto::OutboundError;
 
     #[test]
     fn which_quic_flows_are_blocked() {
@@ -625,5 +775,199 @@ mod tests {
         assert!(Arc::ptr_eq(&routes.flow_for(&target(9)).unwrap(), &b));
         drop(b);
         assert!(routes.flow_for(&target(2)).is_none());
+    }
+
+    /// An answer from an address no flow sent to counts for the oldest flow
+    /// sent to a name on its port — the server looked the name up — before
+    /// the oldest flow of all.
+    #[test]
+    fn answers_for_a_name_find_a_flow_on_their_port() {
+        let routes = Routes::default();
+        let flow = |port| {
+            Arc::new(Flow::new(
+                SessionHandle::new(
+                    u64::from(port),
+                    SessionInfo::udp(HostName::parse("10.0.0.1"), port),
+                ),
+                port,
+            ))
+        };
+        let (a, b, c) = (flow(1), flow(53), flow(443));
+        routes.add(Target::new(HostName::parse("10.0.0.1"), 1), &a);
+        routes.add(Target::new(HostName::parse("dns.test"), 53), &b);
+        routes.add(Target::new(HostName::parse("quic.test"), 443), &c);
+        let from = |port| Target::new(HostName::parse("10.0.0.9"), port);
+        assert!(Arc::ptr_eq(&routes.flow_for(&from(443)).unwrap(), &c));
+        assert!(Arc::ptr_eq(&routes.flow_for(&from(53)).unwrap(), &b));
+        assert!(Arc::ptr_eq(&routes.flow_for(&from(7)).unwrap(), &a));
+    }
+
+    /// A carrier whose sends never finish: a stream stuck behind a peer that
+    /// reads no more.
+    struct Stuck;
+
+    impl PacketSocket for Stuck {
+        fn send_to<'a>(&'a self, _: &'a [u8], _: &'a Target) -> BoxFuture<'a, io::Result<()>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn recv_from<'a>(&'a self, _: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    struct NoClient;
+
+    impl UdpClient for NoClient {
+        fn recv<'a>(&'a self, _: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn send<'a>(&'a self, _: &'a [u8], _: &'a Target) -> BoxFuture<'a, io::Result<()>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    fn queued(datagram: &[u8]) -> Queued {
+        Queued::new(datagram.to_vec(), &Arc::default()).expect("room")
+    }
+
+    /// An association, one of its flows and a carrier that never sends.
+    fn stuck() -> (Association, Arc<Flow>, Carrier, Target) {
+        let to = Target::new(HostName::parse("10.0.0.1"), 9);
+        let session = SessionInfo::udp(to.host.clone(), to.port);
+        let association = Association {
+            client: Arc::new(NoClient),
+            template: session.clone(),
+            carriers: Carriers::default(),
+            ended: CancellationToken::new(),
+            done: mpsc::unbounded_channel().0,
+        };
+        let flow = Arc::new(Flow::new(SessionHandle::new(1, session), to.port));
+        let carrier = Carrier {
+            outbound: Arc::new(rurge_proto::Reject::new(RejectKind::Reject)),
+            socket: Arc::new(Stuck),
+            routes: Arc::default(),
+            dead: CancellationToken::new(),
+            _receive: AbortOnDropHandle::new(tokio::spawn(std::future::pending())),
+        };
+        (association, flow, carrier, to)
+    }
+
+    /// A send that does not finish in time fails the flow, and the carrier
+    /// — whose stream may hold half a datagram now — is not used again.
+    #[tokio::test(start_paused = true)]
+    async fn a_send_that_hangs_fails_the_flow_and_its_carrier() {
+        let (association, flow, carrier, to) = stuck();
+        let (_queue, mut waiting) = mpsc::channel(QUEUE);
+        let sending = forward(
+            &association,
+            &flow,
+            &carrier,
+            &to,
+            queued(b"x"),
+            &mut waiting,
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(60), sending)
+            .await
+            .expect("the send gives up");
+        assert!(matches!(outcome, SessionOutcome::Failed(_)), "{outcome:?}");
+        assert!(flow.handle.upstream_failed());
+        assert!(carrier.dead.is_cancelled());
+    }
+
+    /// The end of the association does not wait for a send that hangs.
+    #[tokio::test(start_paused = true)]
+    async fn the_end_of_the_association_cuts_a_send_short() {
+        let (association, flow, carrier, to) = stuck();
+        let (_queue, mut waiting) = mpsc::channel(QUEUE);
+        association.ended.cancel();
+        let sending = forward(
+            &association,
+            &flow,
+            &carrier,
+            &to,
+            queued(b"x"),
+            &mut waiting,
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(1), sending)
+            .await
+            .expect("the flow ends at once");
+        assert_eq!(outcome, SessionOutcome::Completed);
+    }
+
+    /// An outbound whose carrier fails to open after `delay`; counts the
+    /// tries.
+    struct SlowToFail {
+        delay: Duration,
+        tries: std::sync::atomic::AtomicUsize,
+    }
+
+    impl rurge_proto::Outbound for SlowToFail {
+        fn name(&self) -> &str {
+            "Slow"
+        }
+
+        fn connect_tcp<'a>(
+            &'a self,
+            _: &'a Target,
+            _: &'a ConnectOpts,
+        ) -> BoxFuture<'a, Result<rurge_net::connector::BoxedStream, OutboundError>> {
+            Box::pin(std::future::ready(Err(OutboundError::Timeout)))
+        }
+
+        fn udp(&self) -> UdpSupport {
+            UdpSupport::Native
+        }
+
+        fn open_udp<'a>(
+            &'a self,
+            _: &'a ConnectOpts,
+        ) -> BoxFuture<'a, Result<rurge_net::connector::BoxedPacketSocket, OutboundError>> {
+            Box::pin(async move {
+                self.tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(self.delay).await;
+                Err(OutboundError::Timeout)
+            })
+        }
+    }
+
+    /// The flows waiting on one opening of a carrier take what came of it:
+    /// when it fails they fail with it, rather than each after a try of its
+    /// own (the k-th waiting k times as long). A flow that comes after the
+    /// failure tries again.
+    #[tokio::test(start_paused = true)]
+    async fn the_flows_waiting_on_an_opening_that_fails_fail_with_it() {
+        let carriers = Carriers::default();
+        let slow = Arc::new(SlowToFail {
+            delay: Duration::from_secs(10),
+            tries: Default::default(),
+        });
+        let outbound: OutboundRef = slow.clone();
+        let client: Arc<dyn UdpClient> = Arc::new(NoClient);
+        let begun = tokio::time::Instant::now();
+        let (a, b, c) = tokio::join!(
+            carriers.get(&outbound, &client),
+            carriers.get(&outbound, &client),
+            carriers.get(&outbound, &client),
+        );
+        assert!(a.is_err() && b.is_err() && c.is_err());
+        assert_eq!(begun.elapsed(), Duration::from_secs(10));
+        let tries = || slow.tries.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(tries(), 1);
+        assert!(carriers.get(&outbound, &client).await.is_err());
+        assert_eq!(tries(), 2);
+    }
+
+    /// Three silent seconds tell on DNS and QUIC's port, and only for a
+    /// flow that sent to an address: the answers for a name that the
+    /// server looks up may count for another flow on the same port.
+    #[test]
+    fn where_silence_tells() {
+        let target = |host, port| Target::new(HostName::parse(host), port);
+        assert!(silence_tells(&target("10.0.0.1", 443)));
+        assert!(silence_tells(&target("10.0.0.1", 53)));
+        assert!(!silence_tells(&target("10.0.0.1", 9)));
+        assert!(!silence_tells(&target("quic.test", 443)));
     }
 }

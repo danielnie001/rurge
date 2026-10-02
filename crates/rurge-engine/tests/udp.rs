@@ -40,6 +40,82 @@ async fn finished(h: &Harness, count: usize) -> Vec<RequestRecord> {
     udp_records(h)
 }
 
+/// Full cone: anyone may send to the carrier, also a datagram too long for
+/// the client once the SOCKS5 header is added. Only that one is lost; the
+/// carrier and the flows on it go on.
+#[tokio::test]
+async fn an_answer_too_long_for_the_client_is_dropped_alone() {
+    let h = harness(Profile::default()).await;
+    let remote = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = remote.local_addr().unwrap();
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("127.0.0.1", remote_addr.port(), b"hello")
+        .await;
+    let mut buf = vec![0u8; 70_000];
+    let (n, carrier) = tokio::time::timeout(Duration::from_secs(5), remote.recv_from(&mut buf))
+        .await
+        .expect("the datagram goes out")
+        .unwrap();
+    assert_eq!(&buf[..n], b"hello");
+    // fine for UDP, too long with the 10-byte SOCKS5 header
+    remote.send_to(&vec![7u8; 65_500], carrier).await.unwrap();
+    remote.send_to(b"small", carrier).await.unwrap();
+    assert_eq!(association.recv().await, (remote_addr, b"small".to_vec()));
+}
+
+/// A flow whose datagrams cannot go out (here: a v4-only policy asked for
+/// an IPv6 address) fails once and drops what comes for `RETRY_AFTER`, as
+/// a flow that could not open does — not a new flow, rules and record for
+/// every datagram.
+#[tokio::test]
+async fn a_flow_whose_sends_fail_rests_before_it_tries_again() {
+    let h = harness(Profile {
+        proxies: "V4 = direct, ip-version=v4-only",
+        rules: "IP-CIDR6,::1/128,V4,no-resolve",
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association.send("::1", 9, b"x").await;
+    let records = finished(&h, 1).await;
+    assert_eq!(
+        records[0].error.as_deref(),
+        Some("this policy sends no UDP to [::1]:9")
+    );
+    // the client keeps sending after the failure
+    for _ in 0..9 {
+        association.send("::1", 9, b"x").await;
+    }
+    // only to see that no other flow starts
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let records = udp_records(&h);
+    assert_eq!(records.len(), 1, "{records:?}");
+}
+
+/// A datagram the system will not send (here: to the broadcast address,
+/// which a socket without `SO_BROADCAST` may not reach) is lost alone, as
+/// on any hop: the flow goes on, and its record says why.
+#[tokio::test]
+async fn a_datagram_the_system_turns_away_is_dropped_alone() {
+    let h = harness(Profile::default()).await;
+    let association = udp_associate(h.socks()).await;
+    association.send("255.255.255.255", 9, b"x").await;
+    wait_until("the reason on the record", || {
+        h.engine
+            .request_log()
+            .active()
+            .iter()
+            .any(|r| r.transport == Transport::Udp && r.error.is_some())
+    })
+    .await;
+    association.send("255.255.255.255", 9, b"x").await;
+    // only to see that nothing ends the flow
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let records = udp_records(&h);
+    assert!(records.is_empty(), "{records:?}");
+}
+
 #[tokio::test]
 async fn a_datagram_goes_direct_and_comes_back() {
     let h = harness(Profile::default()).await;
@@ -516,6 +592,110 @@ async fn a_dead_carrier_is_not_used_again() {
     let (other, _) = udp_echo().await;
     association.send("127.0.0.1", other.port(), b"two").await;
     assert_eq!(association.recv().await, (other, b"two".to_vec()));
+}
+
+/// Through a proxy that looks the names up, the answers come from addresses
+/// no flow sent to: each counts for the flow sent to a name on its port,
+/// not all for the oldest flow on the carrier.
+#[tokio::test]
+async fn answers_for_names_count_for_their_flows() {
+    let ((one, _), (two, _)) = (udp_echo().await, udp_echo().await);
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        udp_names_to: Some(one.ip()),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "Up = socks5, 127.0.0.1, {}, udp-relay=true",
+            upstream.addr().port()
+        ),
+        rules: "DOMAIN-SUFFIX,test,Up",
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association.send("one.test", one.port(), b"1").await;
+    assert_eq!(association.recv().await, (one, b"1".to_vec()));
+    association.send("two.test", two.port(), b"22").await;
+    assert_eq!(association.recv().await, (two, b"22".to_vec()));
+    drop(association);
+    let records = finished(&h, 2).await;
+    for (dst, down) in [
+        (format!("one.test:{}", one.port()), 1),
+        (format!("two.test:{}", two.port()), 2),
+    ] {
+        let r = records.iter().find(|r| r.dst == dst).expect("a record");
+        assert_eq!(r.down, down, "{r:?}");
+    }
+}
+
+/// While their outbound is being opened, the flows of an association hold
+/// what comes for them up to 1 MiB in all; more is dropped and starts no
+/// flow. Here 60,000 bytes for each of 30 targets, behind a proxy that
+/// never answers: 17 fit.
+#[tokio::test]
+async fn what_waits_for_an_outbound_is_bounded_in_bytes() {
+    // takes the connections, and never says a word
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = silent.local_addr().unwrap().port();
+    let _silent = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = silent.accept().await {
+            held.push(stream);
+        }
+    });
+    let h = harness(Profile {
+        proxies: &format!("Up = socks5, 127.0.0.1, {port}, udp-relay=true"),
+        rules: "IP-CIDR,127.0.0.1/32,Up,no-resolve",
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    let big = vec![7u8; 60_000];
+    for target in 1..=30 {
+        association.send("127.0.0.1", target, &big).await;
+        // rurge takes each before the next comes
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let waiting = || {
+        h.engine
+            .request_log()
+            .active()
+            .into_iter()
+            .filter(|r| r.transport == Transport::Udp)
+            .count()
+    };
+    wait_until("the first flow", || waiting() > 0).await;
+    // only to see that no more flows start
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(waiting(), 17);
+}
+
+/// A refused flow stays a minute, dropping what comes for it; what it was
+/// sent first is gone with the refusal, and holds no room from the flows
+/// after it: 20 times 60,000 bytes start 20 flows.
+#[tokio::test]
+async fn a_refused_flow_holds_no_room() {
+    let h = harness(Profile {
+        rules: "IP-CIDR,10.0.0.0/8,REJECT,no-resolve",
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    let big = vec![7u8; 60_000];
+    for target in 1..=20 {
+        association.send("10.0.0.1", target, &big).await;
+        // rurge takes each before the next comes
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let records = finished(&h, 20).await;
+    assert!(
+        records
+            .iter()
+            .all(|r| matches!(r.status, RecordStatus::Rejected(_))),
+        "{records:?}"
+    );
 }
 
 /// A flow whose outbound fails to open drops what comes for it for a few

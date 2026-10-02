@@ -147,6 +147,35 @@ async fn udp_goes_through_vmess_one_connection_per_target() {
     assert_eq!(commands, [2, 2], "one connection per target");
 }
 
+/// A datagram vmess cannot send (longer than a chunk) is lost alone: the
+/// flow goes on with the next one.
+#[tokio::test]
+async fn a_datagram_too_long_for_vmess_is_dropped_alone() {
+    let origin = TestServer::spawn().await;
+    let (upstream, params) = vmess_upstream(false, false, origin_addr(&origin)).await;
+    let h = through(&format!(
+        "P = vmess, 127.0.0.1, {}, {params}",
+        upstream.addr().port()
+    ))
+    .await;
+    let (echo, _) = udp_echo().await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("127.0.0.1", echo.port(), &[7u8; 20_000])
+        .await;
+    association.send("127.0.0.1", echo.port(), b"after").await;
+    assert_eq!(association.recv().await, (echo, b"after".to_vec()));
+    drop(association);
+    wait_until("the flow to finish", || !udp_records(&h).is_empty()).await;
+    let records = udp_records(&h);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].status, RecordStatus::Completed, "{records:?}");
+    assert_eq!(
+        records[0].error.as_deref(),
+        Some("vmess: a datagram longer than 16368 bytes")
+    );
+}
+
 /// Symmetric through vmess: an answer can only come back on its target's
 /// connection, and counts as the target's.
 #[tokio::test]

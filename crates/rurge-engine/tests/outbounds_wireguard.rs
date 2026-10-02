@@ -310,6 +310,41 @@ async fn udp_leaves_through_the_tunnel() {
     assert_eq!(log.recent(10)[0].policy, ["WG"]);
 }
 
+/// UDP to a name, through a tunnel that never comes up (the peer does not
+/// know our key), is asked of the tunnel's DNS server only once the tunnel
+/// is up: the flow fails within the connect time — and is tried again
+/// later — instead of waiting for ever.
+#[tokio::test]
+async fn udp_to_a_name_through_a_tunnel_that_never_comes_up_fails_in_time() {
+    let ((private, _), (_, stranger)) = (keypair(), keypair());
+    let peer = FakeWgPeer::start(stranger, PeerOpts::default()).await;
+    let section = format!(
+        "{}dns-server = 10.0.0.53\n",
+        section_text("w", &private, &peer)
+    );
+    let h = harness(Profile {
+        proxies: WG,
+        rules: "DOMAIN,echo.test,WG",
+        sections: &section,
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association.send("echo.test", ECHO_PORT, b"x").await;
+    let log = h.engine.request_log();
+    let failed = async {
+        while log.recent(10).is_empty() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), failed)
+        .await
+        .expect("the flow fails in time");
+    let r = &log.recent(10)[0];
+    assert_eq!(r.status, RecordStatus::Failed, "{r:?}");
+    assert_eq!(r.error.as_deref(), Some("looking up echo.test timed out"));
+}
+
 /// The UDP test (`test-udp`) asks its question through the tunnel; a policy
 /// without UDP, or without a UDP test, has none (phase 2 M5 design 8.4).
 #[tokio::test]

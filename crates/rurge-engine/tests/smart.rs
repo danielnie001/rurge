@@ -417,6 +417,27 @@ async fn a_member_whose_udp_carrier_does_not_open_counts_against_it() {
     .await;
 }
 
+/// A member whose carrier opens but whose first datagram cannot go out (a
+/// VMess server that refuses the connection the datagram dials) counts
+/// against it, as one whose carrier does not open.
+#[tokio::test]
+async fn a_member_whose_udp_send_fails_counts_against_it() {
+    let proxies = format!(
+        "Refusing = vmess, 127.0.0.1, {}, username=0233d11c-15a4-47d3-ade3-48ffca0ce119, vmess-aead=true",
+        closed_port().await
+    );
+    let h = udp_smart("Refusing", &proxies).await;
+    let (echo, _) = udp_echo().await;
+    let association = udp_associate(h.socks()).await;
+    association.send("127.0.0.1", echo.port(), b"hi").await;
+    let registry = h.engine.registry();
+    let smart = &registry.auto().smart;
+    wait_until("the failure of the member", || {
+        smart.site("127.0.0.1", Instant::now()).failed == ["Refusing"]
+    })
+    .await;
+}
+
 /// Three seconds without an answer count against the member only where an
 /// answer always comes — here port 443 — never on another port, where a
 /// game may only send (phase 2 M5 design 8.3).

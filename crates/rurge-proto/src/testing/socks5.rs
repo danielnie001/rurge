@@ -32,6 +32,9 @@ pub struct Socks5Script {
     pub udp_unspecified: bool,
     /// Close the control connection after relaying this many answers.
     pub udp_close_after: Option<usize>,
+    /// Send a datagram for a name to this address, on the datagram's port,
+    /// as if the name were looked up; without it such datagrams are dropped.
+    pub udp_names_to: Option<IpAddr>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,8 +72,9 @@ async fn reply(stream: &mut BoxedStream, code: u8, bound: &[u8]) -> io::Result<(
 }
 
 /// A UDP association: datagrams from the client go out by their address
-/// (names are not resolved: they are dropped), answers from anywhere come
-/// back with the sender's address, until the control connection closes.
+/// (names are not resolved: they go to `udp_names_to`, or are dropped),
+/// answers from anywhere come back with the sender's address, until the
+/// control connection closes.
 async fn relay_udp(
     mut control: BoxedStream,
     script: &Socks5Script,
@@ -102,7 +106,11 @@ async fn relay_udp(
                 client = Some(from);
                 let Some((to, start)) = parse(&up[..n]) else { continue };
                 datagrams.lock().expect("datagrams").push(to.clone());
-                if let HostName::Ip(ip) = to.host {
+                let ip = match to.host {
+                    HostName::Ip(ip) => Some(ip),
+                    HostName::Domain(_) => script.udp_names_to,
+                };
+                if let Some(ip) = ip {
                     let _ = outside.send_to(&up[start..n], SocketAddr::new(ip, to.port)).await;
                 }
             }
