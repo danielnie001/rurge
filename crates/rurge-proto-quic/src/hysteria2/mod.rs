@@ -164,6 +164,7 @@ impl Outbound for Hysteria2Outbound {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_log::Log;
     use crate::testing::{FakeHysteria2, Hysteria2Script, RecordedUdp, UdpMessage};
     use quinn::{ConnectionError, VarInt};
     use rurge_config::policy::parse_policy;
@@ -1220,46 +1221,6 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
-    }
-
-    /// Captures what is logged, formatted.
-    #[derive(Clone, Default)]
-    struct Log(Arc<Mutex<Vec<u8>>>);
-
-    impl Log {
-        /// What this thread logs, at every level, while the guard and the
-        /// second dispatcher live. While one dispatcher alone is
-        /// registered, tracing-core asks only the thread that first reaches
-        /// a call site whether it is wanted: a site another test reaches
-        /// first would stay shut on this thread too. With a second one it
-        /// asks every dispatcher.
-        fn capture() -> (Log, tracing::subscriber::DefaultGuard, tracing::Dispatch) {
-            let log = Log::default();
-            let writer = log.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::TRACE)
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish();
-            let logging = tracing::subscriber::set_default(subscriber);
-            let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-            (log, logging, second)
-        }
-
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
-    impl io::Write for Log {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
     }
 
     /// What datagrams carry shows nowhere — in no error and in no log

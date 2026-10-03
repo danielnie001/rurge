@@ -1,15 +1,17 @@
 //! Loopback QUIC servers for the tests of this crate and of its dependants
 //! (feature `testing`): a server port whose endpoint can be replaced, as
-//! by a server that restarts, and a scriptable Hysteria 2 server. Never
-//! used by production code.
+//! by a server that restarts, and scriptable Hysteria 2 and TUIC servers.
+//! Never used by production code.
 
 mod hysteria2;
 mod obfs;
+mod tuic;
 
 pub use hysteria2::{
     FakeHysteria2, Hysteria2Script, RecordedAuth, RecordedTcp, RecordedUdp, UdpMessage,
 };
 pub use obfs::RecordedFragment;
+pub use tuic::{FakeTuic, RecordedConnect, RecordedTuicAuth, TuicScript};
 
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{
