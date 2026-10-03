@@ -13539,6 +13539,16 @@ git commit -m "docs: M7b TUIC——兼容性清单、手工验收、README 与 C
 
 | # | 任务 | 与计划的出入 | 原因 |
 | - | ---- | ------------ | ---- |
+| 1 | Task 1 | （3c29014）`tuic-v5` 的 `uuid` 与 `vmess` 的 `username` 共用一个读取函数 `vmess::read_uuid(r, key)`（缺失与不合法两条 `E0018` 的文本按键名生成，与原来逐字相同），`parse_uuid` 改回私有；计划里 `tuic.rs` 自带一份 `read_uuid`、`parse_uuid` 改为 `pub(crate)` | Task 1 评审（Important，计划写定）：两份逐行相同的凭据读取块，"凭据不进诊断"要在两处各自维护 |
+| 2 | Task 2 ～ 4 | （9460ec7）v5 认证命令的构造返回 `Result`：TLS 导出密钥失败时拨号以 `tls: the session exports no keying material` 失败；计划的代码在这里 `.expect`。没有新用例（回环上造不出导出失败） | Task 2 评审（Important，计划写定）：rustls 在握手之后的消息出错后导出即失败（服务端可以引起），`.expect` 会让请求所在的任务 panic，等着这次拨号的请求再一个个重拨、再 panic；Task 3 / 4 改写这段代码，所以放到 Task 4 之后修 |
+| 3 | Task 2 ～ 4 | （9460ec7）`Dissociate` 改由连接的写入任务发出：与 `quic` 模式的包共用 `OUTBOX`（64），排在此前交出的包之后，队列满时不发（服务端的关联留到连接结束）；去掉计划里的无界通道、`JoinSet` 与异步的 `dissociate`；写入队列丢弃时的日志改为 `tuic: a message for the server is dropped: …` | Task 3 评审（Minor）：`quic` 模式下 `Dissociate` 可能赶到排队的包前面（服务端随后被迟到的包重建关联）；服务端不给单向流额度时，每丢一个载体就多一个挂起的任务 |
+| 4 | Task 2 ～ 4 | （9460ec7）读任务在一个来源（数据报 / 单向流）结束后继续读另一个和已在读的流，两个都结束才返回；不用 `biased`，免得一侧饿死另一侧 | Task 3 评审（Minor）：计划的 `select!` 一侧报错即返回，另一侧缓冲里的东西随之丢掉，"服务端转发过"的标记因此可能漏标（P5 的推断随之误报） |
+| 5 | Task 2 ～ 4 | （9460ec7）v4 的随机关联号在取 `associations` 锁之前抽取，锁里只在撞上在用的号（或没有随机源）时再取；单元用例 `v4_association_ids_are_drawn_at_random_past_the_ones_in_use` 改为真正走到撞号的分支 | Task 4 评审（Minor）：锁里只做内存操作；原用例只断言 1000 个号互不相同 |
+| 6 | Task 2 ～ 4 | （9460ec7）第一片放下地址之后再无余地时，两个版本的文本都由 `tuic: the host name is too long for a datagram` 改为 `tuic: the address leaves no room in a datagram`（目标是 IP 时原文本不对） | Task 3 / 4 评审（Minor） |
+| 7 | Task 2 ～ 4 | （9460ec7）补用例与时限：`the_credentials_never_show` 加查 token 的十六进制与 `Debug` 形式、UUID 的 `Debug` 形式；`TuicScript` 加 `no_response`（v4 对到不了的目标结束流而不应答）与用例（请求以 `tuic: the server ended the stream without a response` 失败，连接照用）；用例里可能挂住的等待加上 `timeout(BOUND, …)` | Task 2 / 3 / 4 评审（Minor） |
+| 8 | 终审 | （9e2b94d）引擎 `tests/common` 的 SOCKS5 辅助函数里方法选择与 UDP ASSOCIATE 应答的读取加上 10 秒时限；TUIC 用例里其余的 `send_to` 加上时限；两个凭据错误的互操作用例在断言信息里附上服务端日志 | 终审（Task 5 / 6 评审的延后记录）：有界等待；互操作从未真正跑过，第一次 CI 失败时要靠服务端日志分辨问题在哪一边 |
+| 9 | 终审 | 文档：兼容性清单的 `tuic` 行（第 3、6 条的行为与文本，v4 的 0xfffffff2 时 UDP 发送的文本，有效空闲超时取两端较小值、10 秒的保活赶不上空闲超时 10 秒的服务端）与 4.4 的适用范围加上 `tuic-v5`；`CLAUDE.md`（第 1 条、四个关闭码三条文本、`Dissociate` 经写入队列）；`tests/interop/README.md` 写明 tuic 0.8.5 的命令行、配置键与就绪日志还没有对真实二进制核对 | 各评审与终审 |
+| 10 | 门禁 | 最终门禁（终审修正 9e2b94d 之后）：fmt、clippy 通过；`cargo test --workspace --no-fail-fast` 一轮通过：65 个测试二进制 1903 通过 / 0 失败 / 3 忽略 | 比计划的 1902 多出的一条是第 7 条补的用例（`no_response`） |
 
 ## 延后事项
 
@@ -13549,3 +13559,11 @@ git commit -m "docs: M7b TUIC——兼容性清单、手工验收、README 与 C
 | 3 | v5 的"口令错"只能推断（P5）；对 sing-box 可能先表现为空隧道或流被停 | 接受，已登记 |
 | 4 | `quic` 模式下引擎的发送时限不再起作用（P9） | 接受，已登记 |
 | 5 | 认证或握手反复失败时没有退避（M7a 延后事项 #3，TUIC 同样） | 有用户报告再说 |
+| 6 | tuic 0.8.5 的命令行（`-c`）、七个配置键与就绪日志 `Server started`：按 P14 从源码读出、没有对真实二进制跑过，又是夹具唯一的就绪判据 | 第一次在 Linux CI 上运行时核对（填上 #1 之后） |
+| 7 | v5 的线上细节（分片里 `0xff` 地址之后没有端口、SIZE 是本片长度、导出密钥的 label 是 UUID 的原始字节）只对回环假服务端验证过 | 第一次 CI 的 sing-box 互操作（`v5_udp_against_sing_box`、`v5_tcp_against_sing_box`） |
+| 8 | SOCKS5 客户端发往 IPv4 映射地址（`[::ffff:a.b.c.d]`）时，经 `tuic` 的回包来源按 IPv4 读（P12），引擎按来源归流时对不上，回退到这个载体最早的流（字节数与 `smart` 的静默判断记到别的流上） | M8：引擎归流时比较规范化后的地址，或入站把 SOCKS5 的目标规范化 |
+| 9 | `tuic` 与 `hysteria2` 的载体辅助（每秒一次的路由比较、带时限的重新绑定、`transmit`、`recv_from`）与流的错误映射几乎逐字相同 | M7c：第三个 QUIC 协议落地时抽出共用部分 |
+| 10 | `tuic/mod.rs` 约 2400 行，大半是 UDP 用例；v4 的几条用例与 v5 的几乎逐字相同 | 有空时整理（UDP 用例移进 `udp.rs`，按版本做表驱动） |
+| 11 | `native` 模式的 `Dissociate` 也经 64 个的写入队列（执行期修正记录第 3 条）：一条连接上同时丢掉 64 个以上载体时，多出的不发，服务端的关联留到连接结束 | 接受 |
+| 12 | 假服务端对长度不对的 v4 认证命令只是忽略、不关连接（0.8.5 怎样处理没有核对） | 有协议事实时再补 |
+| 13 | 空闲超时不超过 10 秒的服务端上，M7a 的 10 秒保活赶不上：没有转发的连接约 10 秒后关闭（下一个请求重新拨号），`quic` 模式下安静的隧道随之断开 | 接受（兼容性清单已登记）；M8 再评估保活间隔 |
