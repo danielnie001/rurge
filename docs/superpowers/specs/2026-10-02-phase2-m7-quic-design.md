@@ -306,3 +306,16 @@
 4. **放弃了拨号的调用方（第 14 节第 6 条的单飞拨号）**：发起拨号的请求放弃时（它的 future 被丢掉，如超时），等着这次拨号的请求接过拨号，会话随后用它建的连接；补上用例 `a_dial_its_caller_gave_up_on_is_taken_over_by_a_waiter`（只加测试，做法不变）。
 5. **组中继里带端口跳跃的成员（细化第 14 节第 10 条，P20）**：加载时对每个有 `underlying-proxy` 的组，按注册表装配的顺序算出配置本身给它的成员（行上写的、`include-other-group` 与 `include-all-proxies` 取来的，各按组的过滤器），其中用了 `port-hopping` 的各报一条 `W0023`（沿用"组不得不略去一个成员"的码），在组的那一行：`` policy group `G` relays its members through `underlying-proxy`: `M` uses `port-hopping`, which cannot go through it; `M (via R)` is left out ``；`rurge check` 由此报出。`policy-path` 带来的成员加载时不知道，仍只由注册表记日志略去。成员全被略去时组为空，按 M3-D3 由 DIRECT 代替（`--empty-group-reject` 时 REJECT）。用例 `a_relayed_group_says_which_member_with_port_hopping_it_leaves_out`、`a_hopping_member_of_a_relayed_group_is_left_out`、`check_knows_hysteria2`。
 6. **HTTP/3 客户端只关闭仍开着的连接（细化第 14 节第 5 条）**：因违反 HTTP/3 关闭连接之前，除了任务记下的结束，还看 quinn 的 `close_reason()`：连接已经结束（服务端的关闭、stateless reset）而任务还没看到时不再关闭，也不记下失败——quinn 的 `close` 会把已记下的结束原因改成本地关闭。用例 `a_failure_after_the_end_leaves_how_the_connection_ended`。
+
+## 16. M7b 计划期的订正
+
+写 M7b 实施计划（`docs/superpowers/plans/2026-10-03-phase2-m7b-tuic-plan.md`）时核对 TUIC v5 的 `SPEC.md` 与 v4（0.8.5）的协议说明、sing-box 与 tuic-server 的源码（GPL，只读、只取协议事实）、Surge 手册与本仓库源码后，与上文不一致或上文没写到的，以本节为准（括号里是计划「计划期决定」的编号）。
+
+1. **配置（细化 6.1）**：一个 `TuicSpec` 管两个关键字（`TuicVersion::V4 { token }` / `V5 { uuid, password }`）；UUID 也接受 32 位裸十六进制（同 vmess）；写了另一个版本的凭据是 `W0028`；写错的 TUIC 行从此是加载错误（P1、P2）。
+2. **v5 的"口令错"（订正 6.2 的"能认出就报"）**：sing-box 与 tuic-server 对一切失败都以码 0 关连接；只在服务端还没转发过任何字节就关闭时才报 `tuic: authentication failed`，否则报 `tuic: the server closed the connection (code 0x…)`；经引擎时 CONNECT 先回 200、隧道随后断开（P5）。
+3. **v5 的 UDP（细化 6.2）**：关联号按连接从 0 计、跳过正在用的，载体换到新连接时另取；`Dissociate` 由连接自己的任务发出；坏消息丢弃、连接照旧；口令被拒时一次 UDP 发送报认证失败（P7）。
+4. **单向流由连接的写入任务写（新增）**：服务端不收数据报时，每个包交给连接的写入任务逐条写完（`OUTBOX` = 64，满了丢包），因为被取消而截短的单向流会让 sing-box 与 0.8.5 关掉整条连接；代价是这种模式下引擎的发送时限不再起作用（P9）。
+5. **心跳（细化 6.2、6.3）**：v5 的心跳在有 TCP 隧道或 UDP 关联时都发、服务端不收数据报时不发；v4 的心跳走单向流、不论服务端收不收数据报（P10）。
+6. **v4（细化 6.3）**：两个版本共用一套实现；token 是原文 UTF-8 的 BLAKE3；关闭码 `0xfffffff1` / `0xfffffff2` 的错误种类是 `PermissionDenied`；放不进一个数据报的包被拒而不改走单向流；关联号是随机 `u32`（P11）。
+7. **IPv4 映射的来源（新增）**：回包来源里 IPv4 映射的 IPv6 地址按 IPv4 读，v4 与 v5 都是（P12）。
+8. **互操作（细化 6.4 / M7-D6）**：tuic 0.8.5 只经 `RURGE_TEST_TUIC_SERVER` 找，配置必须写 `alpn: ["h3"]`；两个参考服务端都总收数据报，`quic` 模式只靠假服务端与手工验收；0.8.5 的发布资产没有公布 `digest`，CI 里的 SHA-256 先留占位，由项目所有者决定怎样取得（P14、P15）。
