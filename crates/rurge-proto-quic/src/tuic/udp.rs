@@ -1,44 +1,49 @@
-//! UDP over TUIC v5 (SPEC, "Packet", "Dissociate"; phase 2 M7 design 6.2):
-//! each carrier — one client association on the outbound — is an
-//! association of its own on the policy's connection, full cone: every
-//! target through it, and answers from anyone, as the server keeps a UDP
-//! socket per association.
+//! UDP over TUIC (v5 SPEC, "Packet", "Dissociate"; v4's protocol README,
+//! the same; phase 2 M7 design 6.2, 6.3): each carrier — one client
+//! association on the outbound — is an association of its own on the
+//! policy's connection, full cone: every target through it, and answers
+//! from anyone, as the server keeps a UDP socket per association.
 //!
-//! - A packet is `05 02 ‖ ASSOC_ID ‖ PKT_ID ‖ FRAG_TOTAL ‖ FRAG_ID ‖ SIZE ‖
-//!   ADDR ‖ payload`, big endian: SIZE is the payload of this message, ADDR
-//!   (`addr`) names the target going out and the source coming back.
+//! - A v5 packet is `05 02 ‖ ASSOC_ID ‖ PKT_ID ‖ FRAG_TOTAL ‖ FRAG_ID ‖ SIZE
+//!   ‖ ADDR ‖ payload`, a v4 one `04 02 ‖ ASSOC_ID ‖ LEN ‖ ADDR ‖ payload`,
+//!   big endian: SIZE and LEN are the payload of this message, ADDR (`addr`)
+//!   names the target going out and the source coming back.
 //! - Where the server takes QUIC datagrams (`native`), a packet goes in
-//!   datagrams of the connection: whole when it fits one, else in
-//!   fragments, only the first naming the address — the others name none
-//!   —, all under the packet's id. A carrier sends one packet at a time:
-//!   Clash.Meta's first TUIC v5 server put one packet of an association
-//!   together at a time, as Hysteria's does, and lost both of two whose
-//!   fragments came in turn.
+//!   datagrams of the connection: whole when it fits one; else v5 splits it
+//!   into fragments, only the first naming the address — the others name
+//!   none —, all under the packet's id, and v4, which cannot, refuses it as
+//!   too long, as the engine drops what an outbound's framing cannot carry.
+//!   A carrier sends one packet at a time: Clash.Meta's first TUIC v5
+//!   server put one packet of an association together at a time, as
+//!   Hysteria's does, and lost both of two whose fragments came in turn.
 //! - Where it takes none (`quic`), each packet goes whole on a
 //!   unidirectional stream of its own, which the connection's writer opens,
 //!   writes and finishes, one after the other: a send hands its packet over
 //!   and waits for nothing — dropped when `OUTBOX` wait already —, so that
 //!   a send given up on never leaves a packet cut short on the wire, a
 //!   stream sing-box answers by closing the connection, every tunnel and
-//!   association on it with it. The server answers an association the way
-//!   its first packet came (SPEC); answers are read either way.
-//! - Association ids count per connection from 0, past the ones in use. A
-//!   carrier moves to the session's connection on its next packet once its
-//!   own takes nothing new — closed, or dialled another way than the policy
-//!   leads now (`Session::serves`: where the policy leads is asked at most
-//!   once a second, the rest on every packet) —, under an id that
-//!   connection gives it: the server takes it for a new association
+//!   association on it with it, as tuic 0.8.5 does when the cut is in the
+//!   command's header. The server answers an association the way its first
+//!   packet came (v4's holds the whole connection's UDP to that way, which
+//!   one connection never leaves); answers are read either way.
+//! - Association ids are per connection, past the ones in use: v5's count
+//!   from 0 (16 bits), v4's are drawn at random (32 bits), as the reference
+//!   clients' are. A carrier moves to the session's connection on its next
+//!   packet once its own takes nothing new — closed, or dialled another way
+//!   than the policy leads now (`Session::serves`: where the policy leads is
+//!   asked at most once a second, the rest on every packet) —, under an id
+//!   that connection gives it: the server takes it for a new association
 //!   whatever its id.
 //! - A carrier that goes, or moves, dissociates its association on the
-//!   connection it leaves while that is open: `05 03 ‖ ASSOC_ID` on a
+//!   connection it leaves while that is open: `VER 03 ‖ ASSOC_ID` on a
 //!   stream of its own, which the connection's task sends — the drop waits
 //!   for nothing.
 //! - That task reads the server's packets — its datagrams, and its streams
-//!   — into their associations' inboxes, putting fragments together first:
-//!   at most 8 packets of an association at a time, a ninth dropping the
-//!   oldest. What finds no association, or a full inbox, is dropped.
+//!   — into their associations' inboxes, putting v5's fragments together
+//!   first: at most 8 packets of an association at a time, a ninth dropping
+//!   the oldest. What finds no association, or a full inbox, is dropped.
 
-use super::VERSION;
+use super::Version;
 use super::addr::{self, NONE};
 use super::auth::{self, Auth, Authenticated};
 use super::heartbeat::{HEARTBEAT, Relaying};
@@ -75,10 +80,12 @@ const MAX_FRAGMENTS: usize = 255;
 const MAX_DATAGRAM: usize = 65_535;
 /// An association's packets put together at a time (design 6.2).
 const UNDER_WAY: usize = 8;
-/// `VER ‖ TYPE ‖ ASSOC_ID ‖ PKT_ID ‖ FRAG_TOTAL ‖ FRAG_ID ‖ SIZE`.
+/// v5's `VER ‖ TYPE ‖ ASSOC_ID ‖ PKT_ID ‖ FRAG_TOTAL ‖ FRAG_ID ‖ SIZE`.
 const HEADER: usize = 10;
-/// The longest packet a stream carries: the header, the longest address
-/// (a name of 255 bytes), the longest payload.
+/// v4's `VER ‖ TYPE ‖ ASSOC_ID ‖ LEN`.
+const HEADER_V4: usize = 8;
+/// The longest packet a stream carries: v5's header, the longer, the
+/// longest address (a name of 255 bytes), the longest payload.
 const MAX_MESSAGE: usize = HEADER + 1 + 1 + 255 + 2 + MAX_DATAGRAM;
 
 // the commands' types
@@ -92,8 +99,8 @@ fn invalid(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, format!("tuic: {what}"))
 }
 
-/// One Packet command: `05 02 ‖ ASSOC_ID ‖ PKT_ID ‖ FRAG_TOTAL ‖ FRAG_ID ‖
-/// SIZE ‖ ADDR ‖ payload`, `address` the ADDR as `addr::put` writes it.
+/// One v5 Packet command: `05 02 ‖ ASSOC_ID ‖ PKT_ID ‖ FRAG_TOTAL ‖ FRAG_ID
+/// ‖ SIZE ‖ ADDR ‖ payload`, `address` the ADDR as `addr::put` writes it.
 /// `payload` is at most 65535 bytes.
 fn encode(
     association: u16,
@@ -104,7 +111,7 @@ fn encode(
     payload: &[u8],
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER + address.len() + payload.len());
-    out.extend_from_slice(&[VERSION, PACKET]);
+    out.extend_from_slice(&[Version::V5.byte(), PACKET]);
     out.extend_from_slice(&association.to_be_bytes());
     out.extend_from_slice(&packet.to_be_bytes());
     out.extend_from_slice(&[fragments, fragment]);
@@ -159,10 +166,43 @@ fn datagrams(
         .collect())
 }
 
-/// A Packet as it came from the server, its SIZE exactly what follows the
-/// address (as sing-box reads one).
+/// One v4 Packet command: `04 02 ‖ ASSOC_ID ‖ LEN ‖ ADDR ‖ payload`, as
+/// `encode`.
+fn encode_v4(association: u32, address: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HEADER_V4 + address.len() + payload.len());
+    out.extend_from_slice(&[Version::V4.byte(), PACKET]);
+    out.extend_from_slice(&association.to_be_bytes());
+    out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    out.extend_from_slice(address);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// The one QUIC datagram, no longer than `max`, that carries `payload` to
+/// `address` for v4's association `association`: refused when it does not
+/// fit — v4 has no fragments.
+fn datagram_v4(
+    association: u32,
+    address: &[u8],
+    payload: &[u8],
+    max: usize,
+) -> io::Result<Vec<u8>> {
+    let room = max.saturating_sub(HEADER_V4 + address.len());
+    if payload.len() > room {
+        return Err(if room == 0 {
+            invalid("the host name is too long for a datagram")
+        } else {
+            invalid(&format!("a datagram longer than {room} bytes"))
+        });
+    }
+    Ok(encode_v4(association, address, payload))
+}
+
+/// A Packet as it came from the server, its SIZE (v5) or LEN (v4) exactly
+/// what follows the address: as sing-box reads v5's, as tuic 0.8.5's server
+/// writes v4's.
 struct Message {
-    association: u16,
+    association: u32,
     packet: u16,
     fragments: u8,
     fragment: u8,
@@ -172,22 +212,35 @@ struct Message {
 }
 
 impl Message {
-    /// `None` for anything but a Packet a server writes.
-    fn parse(data: Bytes) -> Option<Message> {
-        let header: [u8; HEADER] = data.get(..HEADER)?.try_into().ok()?;
-        if header[..2] != [VERSION, PACKET] {
+    /// `None` for anything but a Packet a server of `version` writes. v4's
+    /// has neither a packet id nor fragments: it reads as fragment 0 of 1.
+    fn parse(version: Version, data: Bytes) -> Option<Message> {
+        let start = match version {
+            Version::V4 => HEADER_V4,
+            Version::V5 => HEADER,
+        };
+        let header = data.get(..start)?;
+        if header[..2] != [version.byte(), PACKET] {
             return None;
         }
-        let (source, len) = addr::get(&data[HEADER..])?;
-        let start = HEADER + len;
-        if data.len() - start != usize::from(u16::from_be_bytes([header[8], header[9]])) {
+        let be16 = |at: usize| u16::from_be_bytes([header[at], header[at + 1]]);
+        let (association, packet, fragments, fragment, size) = match version {
+            Version::V4 => {
+                let association = u32::from_be_bytes(header[2..6].try_into().ok()?);
+                (association, 0, 1, 0, be16(6))
+            }
+            Version::V5 => (u32::from(be16(2)), be16(4), header[6], header[7], be16(8)),
+        };
+        let (source, len) = addr::get(&data[start..])?;
+        let start = start + len;
+        if data.len() - start != usize::from(size) {
             return None;
         }
         Some(Message {
-            association: u16::from_be_bytes([header[2], header[3]]),
-            packet: u16::from_be_bytes([header[4], header[5]]),
-            fragments: header[6],
-            fragment: header[7],
+            association,
+            packet,
+            fragments,
+            fragment,
             source,
             payload: data.slice(start..),
         })
@@ -278,21 +331,35 @@ struct Association {
     reassembly: Reassembly,
 }
 
-/// A connection's associations, by id, and where the search for a free id
-/// goes on.
-#[derive(Default)]
+/// A connection's associations, by id, and where the count of ids goes on
+/// (`join`).
 struct Associations {
-    by_id: HashMap<u16, Association>,
+    version: Version,
+    by_id: HashMap<u32, Association>,
     next: u16,
 }
 
 impl Associations {
-    /// Takes `inbox` in under the next id free, and says which: `None` when
-    /// all 65536 are in use.
-    fn join(&mut self, inbox: &mpsc::Sender<Answer>) -> Option<u16> {
+    fn new(version: Version) -> Associations {
+        Associations {
+            version,
+            by_id: HashMap::new(),
+            next: 0,
+        }
+    }
+
+    /// Takes `inbox` in under an id free, and says which: v5's count from 0
+    /// (as sing-box's client counts them), v4's are drawn at random (as tuic
+    /// 0.8.5's client draws them) — counted as v5's without a random source.
+    /// `None` when all v5's 65536 are in use.
+    fn join(&mut self, inbox: &mpsc::Sender<Answer>) -> Option<u32> {
         for _ in 0..=u16::MAX {
-            let id = self.next;
-            self.next = id.wrapping_add(1);
+            let counted = self.next;
+            self.next = counted.wrapping_add(1);
+            let id = match self.version {
+                Version::V4 => getrandom::u32().unwrap_or(u32::from(counted)),
+                Version::V5 => u32::from(counted),
+            };
             if let hash_map::Entry::Vacant(free) = self.by_id.entry(id) {
                 free.insert(Association {
                     inbox: inbox.clone(),
@@ -311,7 +378,7 @@ impl Associations {
 /// with the connection, or when this is dropped.
 pub(super) struct Udp {
     associations: Arc<Mutex<Associations>>,
-    dissociate: mpsc::UnboundedSender<u16>,
+    dissociate: mpsc::UnboundedSender<u32>,
     /// The writer's queue (`queue`).
     outbox: mpsc::Sender<Vec<u8>>,
     _reader: AbortOnDropHandle<()>,
@@ -319,12 +386,18 @@ pub(super) struct Udp {
 }
 
 impl Udp {
-    /// The reader marks `relayed` for every packet the server relays.
-    pub(super) fn start(connection: &Connection, relayed: Arc<AtomicBool>) -> Udp {
-        let associations = Arc::<Mutex<Associations>>::default();
+    /// The reader reads and writes `version`'s commands, and marks
+    /// `relayed` for every packet the server relays.
+    pub(super) fn start(
+        connection: &Connection,
+        version: Version,
+        relayed: Arc<AtomicBool>,
+    ) -> Udp {
+        let associations = Arc::new(Mutex::new(Associations::new(version)));
         let (dissociate, dissociations) = mpsc::unbounded_channel();
         let reader = tokio::spawn(read(
             connection.clone(),
+            version,
             associations.clone(),
             relayed,
             dissociations,
@@ -340,15 +413,15 @@ impl Udp {
         }
     }
 
-    /// Takes `inbox` in under the next id free on the connection
+    /// Takes `inbox` in under an id free on the connection
     /// (`Associations::join`).
-    fn join(&self, inbox: &mpsc::Sender<Answer>) -> Option<u16> {
+    fn join(&self, inbox: &mpsc::Sender<Answer>) -> Option<u32> {
         self.associations.lock().expect("associations").join(inbox)
     }
 
     /// Forgets association `id`: what comes for it from now on is dropped.
     /// With `dissociate`, the server is told so, by the connection's task.
-    fn leave(&self, id: u16, dissociate: bool) {
+    fn leave(&self, id: u32, dissociate: bool) {
         self.associations
             .lock()
             .expect("associations")
@@ -376,9 +449,9 @@ impl Udp {
 
     /// Test support: the ids of the associations, in order.
     #[cfg(test)]
-    pub(super) fn associations(&self) -> Vec<u16> {
+    pub(super) fn associations(&self) -> Vec<u32> {
         let associations = self.associations.lock().expect("associations");
-        let mut ids: Vec<u16> = associations.by_id.keys().copied().collect();
+        let mut ids: Vec<u32> = associations.by_id.keys().copied().collect();
         ids.sort_unstable();
         ids
     }
@@ -396,23 +469,24 @@ impl Udp {
     }
 }
 
-/// Reads the server's packets on `connection` — its datagrams, and its
-/// unidirectional streams, each read by a task of its own — into their
-/// associations' inboxes, and sends each Dissociate asked for on a stream
-/// of its own, until the connection ends: what came before its end
+/// Reads the server's `version` packets on `connection` — its datagrams,
+/// and its unidirectional streams, each read by a task of its own — into
+/// their associations' inboxes, and sends each Dissociate asked for on a
+/// stream of its own, until the connection ends: what came before its end
 /// included.
 async fn read(
     connection: Connection,
+    version: Version,
     associations: Arc<Mutex<Associations>>,
     relayed: Arc<AtomicBool>,
-    mut dissociations: mpsc::UnboundedReceiver<u16>,
+    mut dissociations: mpsc::UnboundedReceiver<u32>,
 ) {
     let mut streams = JoinSet::new();
     let mut dissociating = JoinSet::new();
     loop {
         tokio::select! {
             datagram = connection.read_datagram() => match datagram {
-                Ok(datagram) => deliver(&associations, &relayed, datagram),
+                Ok(datagram) => deliver(version, &associations, &relayed, datagram),
                 Err(_) => return,
             },
             stream = connection.accept_uni() => match stream {
@@ -423,11 +497,11 @@ async fn read(
             },
             Some(done) = streams.join_next() => {
                 if let Ok(Some(message)) = done {
-                    deliver(&associations, &relayed, message);
+                    deliver(version, &associations, &relayed, message);
                 }
             }
             Some(id) = dissociations.recv() => {
-                dissociating.spawn(dissociate(connection.clone(), id));
+                dissociating.spawn(dissociate(connection.clone(), version, id));
             }
             // a Dissociate gone out; nothing to collect
             Some(_) = dissociating.join_next() => {}
@@ -443,36 +517,43 @@ async fn read_stream(mut stream: RecvStream) -> Option<Bytes> {
     stream.read_to_end(MAX_MESSAGE).await.ok().map(Bytes::from)
 }
 
-/// `05 03 ‖ ASSOC_ID` on a unidirectional stream of its own, finished: the
+/// `VER 03 ‖ ASSOC_ID` on a unidirectional stream of its own, finished —
+/// exactly that: sing-box closes the connection on a longer one —: the
 /// server frees the association's socket.
-async fn dissociate(connection: Connection, id: u16) {
-    let [high, low] = id.to_be_bytes();
+async fn dissociate(connection: Connection, version: Version, id: u32) {
+    let mut command = vec![version.byte(), DISSOCIATE];
+    match version {
+        Version::V4 => command.extend_from_slice(&id.to_be_bytes()),
+        // counted in 16 bits (`Associations::join`)
+        Version::V5 => command.extend_from_slice(&(id as u16).to_be_bytes()),
+    }
     let Ok(mut stream) = connection.open_uni().await else {
         return;
     };
-    if stream
-        .write_all(&[VERSION, DISSOCIATE, high, low])
-        .await
-        .is_ok()
-    {
+    if stream.write_all(&command).await.is_ok() {
         // fails only for a stream finished or reset already
         let _ = stream.finish();
     }
 }
 
 /// Hands what the server sent — a datagram, or a stream's packet — to its
-/// association's inbox, once the packet it carries is whole. A heartbeat
+/// association's inbox, once the packet it carries is whole. A v5 heartbeat
 /// (sing-box sends one every 10 seconds from the connection's start) says
 /// nothing. A packet tells the authentication went through: servers relay
 /// none before (`relayed`). Dropped when it is no packet, for no
 /// association of the connection (a carrier gone), or meets a full inbox:
 /// the reader waits for no carrier, so that one that reads slowly holds up
 /// no other.
-fn deliver(associations: &Mutex<Associations>, relayed: &AtomicBool, data: Bytes) {
-    if data.starts_with(&[VERSION, HEARTBEAT]) {
+fn deliver(
+    version: Version,
+    associations: &Mutex<Associations>,
+    relayed: &AtomicBool,
+    data: Bytes,
+) {
+    if data.starts_with(&[version.byte(), HEARTBEAT]) {
         return;
     }
-    let Some(message) = Message::parse(data) else {
+    let Some(message) = Message::parse(version, data) else {
         tracing::trace!("tuic: what the server sent is no packet; dropped");
         return;
     };
@@ -490,7 +571,7 @@ fn deliver(associations: &Mutex<Associations>, relayed: &AtomicBool, data: Bytes
 /// keeps, counted among the connection's relays. Dropped, the connection
 /// forgets the association, and tells the server when it is still open.
 struct Bound {
-    id: u16,
+    id: u32,
     _relaying: Relaying,
     lease: Lease<Authenticated>,
 }
@@ -510,7 +591,7 @@ impl Drop for Bound {
     }
 }
 
-/// One client association's UDP through the outbound (design 6.2): an
+/// One client association's UDP through the outbound (design 6.2, 6.3): an
 /// association on the policy's connection, then on whichever connection
 /// replaces it. No `Debug`: its session holds the credentials.
 pub(super) struct TuicUdp {
@@ -518,7 +599,7 @@ pub(super) struct TuicUdp {
     /// The budget of binding to a new connection, its dial included.
     opts: ConnectOpts,
     bound: Mutex<Option<Arc<Bound>>>,
-    /// The id of the carrier's next packet.
+    /// The id of the carrier's next v5 packet (`packet`).
     packets: AtomicU16,
     /// Held while a packet's fragments go out: concurrent sends of the
     /// carrier take turns.
@@ -578,6 +659,12 @@ impl TuicUdp {
             }
             _ => Ok(None),
         }
+    }
+
+    /// The id of a v5 packet: one for every packet, whole or not, counted
+    /// from 0. v4's packets have none.
+    fn packet(&self) -> u16 {
+        self.packets.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Whether the policy's route is to be compared now: it is when it was
@@ -670,8 +757,8 @@ fn transmit(connection: &Connection, datagrams: Vec<Vec<u8>>) {
 /// The connection's writer (`quic` mode): each packet handed to it goes on
 /// a stream of its own, one after the other, until the connection ends. No
 /// send waits for it, so no send given up on cuts a packet short: a stream
-/// that ends early is one sing-box cannot read, and it closes the
-/// connection for that.
+/// that ends early is one sing-box cannot read — nor tuic 0.8.5, when its
+/// header is cut —, and either closes the connection for that.
 async fn write(connection: Connection, mut packets: mpsc::Receiver<Vec<u8>>) {
     loop {
         let message = tokio::select! {
@@ -729,10 +816,15 @@ impl PacketSocket for TuicUdp {
                 None => self.rebind().await?,
             };
             let connection = bound.lease.connection();
-            let packet = self.packets.fetch_add(1, Ordering::Relaxed);
+            let version = bound.lease.state().version();
+            // v5's ids are counted in 16 bits (`Associations::join`)
+            let (id, short_id) = (bound.id, bound.id as u16);
             match connection.max_datagram_size() {
                 Some(max) => {
-                    let out = datagrams(bound.id, packet, &address, buf, max)?;
+                    let out = match version {
+                        Version::V4 => vec![datagram_v4(id, &address, buf, max)?],
+                        Version::V5 => datagrams(short_id, self.packet(), &address, buf, max)?,
+                    };
                     // all of its fragments in a row, with nothing awaited
                     // meanwhile
                     let sending = self.sending.lock().expect("sending");
@@ -740,7 +832,10 @@ impl PacketSocket for TuicUdp {
                     drop(sending);
                 }
                 None => {
-                    let message = encode(bound.id, packet, 1, 0, &address, buf);
+                    let message = match version {
+                        Version::V4 => encode_v4(id, &address, buf),
+                        Version::V5 => encode(short_id, self.packet(), 1, 0, &address, buf),
+                    };
                     bound.lease.state().udp.queue(message);
                 }
             }
@@ -770,6 +865,7 @@ impl PacketSocket for TuicUdp {
 mod tests {
     use super::*;
     use rurge_config::HostName;
+    use std::collections::BTreeSet;
 
     /// `10.0.0.1:53` as ADDR.
     const ADDR: [u8; 7] = [0x01, 10, 0, 0, 1, 0, 53];
@@ -778,12 +874,18 @@ mod tests {
         Target::new(HostName::parse("10.0.0.1"), 53)
     }
 
+    /// `data` as a v5 server's packet.
     fn parse(data: &[u8]) -> Option<Message> {
-        Message::parse(Bytes::copy_from_slice(data))
+        Message::parse(Version::V5, Bytes::copy_from_slice(data))
+    }
+
+    /// `data` as a v4 server's packet.
+    fn parse_v4(data: &[u8]) -> Option<Message> {
+        Message::parse(Version::V4, Bytes::copy_from_slice(data))
     }
 
     /// `(association, packet, fragments, fragment)` of `message`.
-    fn ids(message: &Message) -> (u16, u16, u8, u8) {
+    fn ids(message: &Message) -> (u32, u16, u8, u8) {
         (
             message.association,
             message.packet,
@@ -1002,14 +1104,14 @@ mod tests {
     /// is left once all 65536 are in use.
     #[test]
     fn association_ids_count_from_0_past_the_ones_in_use() {
-        let mut associations = Associations::default();
+        let mut associations = Associations::new(Version::V5);
         let (inbox, _rx) = mpsc::channel(1);
         assert_eq!(
             (associations.join(&inbox), associations.join(&inbox)),
             (Some(0), Some(1))
         );
         associations.next = u16::MAX;
-        assert_eq!(associations.join(&inbox), Some(u16::MAX));
+        assert_eq!(associations.join(&inbox), Some(u32::from(u16::MAX)));
         // round again: 0 and 1 are in use
         assert_eq!(associations.join(&inbox), Some(2));
         associations.by_id.remove(&0);
@@ -1019,5 +1121,89 @@ mod tests {
             associations.join(&inbox).unwrap();
         }
         assert_eq!(associations.join(&inbox), None);
+    }
+
+    /// Design 6.3: v4's ids are drawn at random from all 32 bits, as tuic
+    /// 0.8.5's client draws them, never one in use.
+    #[test]
+    fn v4_association_ids_are_drawn_at_random_past_the_ones_in_use() {
+        let mut associations = Associations::new(Version::V4);
+        let (inbox, _rx) = mpsc::channel(1);
+        let ids: BTreeSet<u32> = (0..1000)
+            .map(|_| associations.join(&inbox).unwrap())
+            .collect();
+        assert_eq!(ids.len(), 1000);
+        assert_eq!(associations.by_id.len(), 1000);
+        // a thousand below 65536 would be counted, not drawn
+        assert!(ids.iter().any(|&id| id > u32::from(u16::MAX)), "{ids:?}");
+    }
+
+    /// v4's Packet (protocol README): `04 02 ‖ ASSOC_ID ‖ LEN ‖ ADDR ‖
+    /// payload`, its fields big endian, LEN the payload's length — in one
+    /// datagram when it fits, else not at all: v4 has no fragments.
+    #[test]
+    fn a_v4_packet_goes_whole_or_not_at_all() {
+        let mut expected = vec![0x04, 0x02, 0x12, 0x34, 0x56, 0x78, 0, 5];
+        expected.extend_from_slice(&ADDR);
+        expected.extend_from_slice(b"query");
+        assert_eq!(
+            datagram_v4(0x1234_5678, &ADDR, b"query", 1200).unwrap(),
+            expected
+        );
+        assert_eq!(encode_v4(0x1234_5678, &ADDR, b"query"), expected);
+        // exactly as long as the limit
+        let room = 1200 - HEADER_V4 - ADDR.len();
+        let whole = datagram_v4(1, &ADDR, &vec![7u8; room], 1200).unwrap();
+        assert_eq!(whole.len(), 1200);
+        let err = datagram_v4(1, &ADDR, &vec![7u8; room + 1], 1200).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            format!("tuic: a datagram longer than {room} bytes")
+        );
+        // an address that leaves no room
+        let err = datagram_v4(1, &ADDR, b"x", HEADER_V4 + ADDR.len()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "tuic: the host name is too long for a datagram"
+        );
+    }
+
+    /// A v4 packet is read whole, its LEN exactly what follows the address:
+    /// fragment 0 of 1, with no packet id.
+    #[test]
+    fn a_v4_packet_is_read_whole_with_its_length_exactly() {
+        let mut data = vec![0x04, 0x02, 0xde, 0xad, 0xbe, 0xef, 0, 7];
+        data.extend_from_slice(&ADDR);
+        data.extend_from_slice(b"payload");
+        let message = parse_v4(&data).unwrap();
+        assert_eq!(ids(&message), (0xdead_beef, 0, 1, 0));
+        assert_eq!(message.source, Some(source()));
+        assert_eq!(&message.payload[..], b"payload");
+        let mut short = data.clone();
+        short.pop();
+        let mut long = data.clone();
+        long.push(0);
+        let mut dissociate = data.clone();
+        dissociate[1] = 0x03;
+        let mut v5 = vec![0x05, 0x02, 0, 7, 0x12, 0x34, 1, 0, 0, 7];
+        v5.extend_from_slice(&ADDR);
+        v5.extend_from_slice(b"payload");
+        for bad in [
+            &data[..7],
+            // LEN says otherwise
+            &short[..],
+            &long[..],
+            // another command, another version
+            &dissociate[..],
+            &v5[..],
+            // an address cut short
+            &data[..10],
+        ] {
+            assert!(parse_v4(bad).is_none(), "{bad:?}");
+        }
+        // and the other way round
+        assert!(parse(&data).is_none());
     }
 }

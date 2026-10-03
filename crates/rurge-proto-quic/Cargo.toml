@@ -12,6 +12,7 @@ rurge-config.workspace = true
 rurge-net.workspace = true
 rurge-proto.workspace = true
 blake2.workspace = true
+blake3.workspace = true
 bytes.workspace = true
 getrandom.workspace = true
 http.workspace = true

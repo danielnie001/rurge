@@ -1,19 +1,29 @@
-//! A scriptable TUIC v5 server (phase 2 M7 design 6.4): QUIC with ALPN
+//! A scriptable TUIC server (phase 2 M7 design 6.4) — v5, or v4 as tuic
+//! 0.8.5's server speaks it when its script names a token: QUIC with ALPN
 //! `h3` on a loopback port of its own (`ServerPort`: it can restart) or on
 //! a socket it is given (`MultiPort` for port hopping). It checks the
-//! authentication against what its own side of the TLS session exports,
-//! holds the commands that come before it (as the SPEC asks; sing-box
-//! leaves early datagrams in QUIC's queue so), relays each Connect to its
-//! target, and gives each UDP association a loopback socket of its own
-//! (full cone), which answers the way the association's first packet came:
-//! in datagrams — split into fragments of its own when one cannot hold an
-//! answer — or on streams. A unidirectional stream it cannot read as one
-//! whole command — one cut short — closes the connection, as sing-box
-//! closes it. It can hold the client's streams unread for a while, each
-//! taking no more than a window of the script's meanwhile. What the client
-//! sends is read by code that is not the client's: the commands and their
-//! addresses by the code here, which also writes the answers. It counts
-//! heartbeats and records Dissociates. It never resolves a name.
+//! authentication — v5's against what its own side of the TLS session
+//! exports, v4's against the BLAKE3 hash of its token —, holds the commands
+//! that come before it (as both protocols ask; sing-box leaves early
+//! datagrams in QUIC's queue so), relays each Connect to its target —
+//! answering a v4 one with whether it reached it —, and gives each UDP
+//! association a loopback socket of its own (full cone), which answers the
+//! way the association's first packet came: in datagrams — a v5 answer that
+//! one cannot hold split into fragments of its own, a v4 one dropped — or on
+//! streams. A unidirectional stream it cannot read as one whole command —
+//! one cut short — closes the connection, as sing-box closes it. It can
+//! hold the client's streams unread for a while, each taking no more than a
+//! window of the script's meanwhile. A v4 fake does what tuic 0.8.5's
+//! server does that a client must live with: it names an IPv4 source in
+//! IPv6 form (its dual-stack socket), and closes the connection with the
+//! protocol's codes on a stream whose command's header it cannot read
+//! (0xfffffff0; a packet cut short past its header is only dropped), a
+//! token it does not know (0xfffffff1), a datagram that is no packet and a
+//! packet that does not come the way the connection's first came
+//! (0xfffffff3). What the client sends is read by code that is not the
+//! client's: the commands and their addresses by the code here, which also
+//! writes the answers. It counts heartbeats and records Dissociates. It
+//! never resolves a name.
 
 use super::ServerPort;
 use quinn::{
@@ -35,16 +45,27 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio_util::task::AbortOnDropHandle;
 
-// the wire as the fake knows it
-const VERSION: u8 = 0x05;
+// the wire as the fake knows it: the versions, the commands' types
+const V4: u8 = 0x04;
+const V5: u8 = 0x05;
 const AUTHENTICATE: u8 = 0x00;
 const CONNECT: u8 = 0x01;
 const PACKET: u8 = 0x02;
 const DISSOCIATE: u8 = 0x03;
 const HEARTBEAT: u8 = 0x04;
-/// How the fake closes a connection, and stops a stream: with 0, as sing-box
-/// does.
+/// v4's answer to a Connect, `04 ff ‖ REP`, and its two replies.
+const RESPONSE: u8 = 0xff;
+const SUCCEEDED: u8 = 0x00;
+const FAILED: u8 = 0xff;
+/// How a v5 fake closes a connection, and how every fake stops a stream:
+/// with 0, as sing-box does.
 const CLOSE: VarInt = VarInt::from_u32(0);
+/// How a v4 fake closes a connection, with tuic 0.8.5's codes and reasons:
+/// for a stream it cannot read, the text of the I/O error that a command
+/// cut short gives.
+const PROTOCOL_ERROR: (u32, &[u8]) = (0xffff_fff0, b"early eof");
+const AUTHENTICATION_FAILED: (u32, &[u8]) = (0xffff_fff1, b"authentication failed");
+const BAD_COMMAND: (u32, &[u8]) = (0xffff_fff3, b"bad command");
 /// How much of a TCP tunnel the fake relays at a time, each way.
 const RELAY: usize = 64 << 10;
 /// The longest unidirectional stream it reads: past any one command.
@@ -52,16 +73,22 @@ const MAX_STREAM: usize = 128 << 10;
 
 #[derive(Clone, Debug, Default)]
 pub struct TuicScript {
-    /// The one user it lets in, by its UUID's 16 bytes, and its password.
+    /// v5: the one user it lets in, by its UUID's 16 bytes, and its
+    /// password.
     pub uuid: [u8; 16],
     pub password: String,
-    /// The code it closes a connection with when the authentication
+    /// Speak TUIC v4, as tuic 0.8.5's server, letting this token in.
+    pub v4_token: Option<String>,
+    /// v5: the code it closes a connection with when the authentication
     /// failed, never with a reason: 0 — as tuic-server 1.0.0 and sing-box
-    /// close it — unless set.
+    /// close it — unless set. A v4 fake closes it as tuic 0.8.5 does.
     pub auth_failure_code: u32,
     /// Relay here whatever the client asked for, TCP and UDP alike (needed
     /// for a name).
     pub connect_to: Option<SocketAddr>,
+    /// Never carry out a Connect, nor answer a v4 one: what the client sends
+    /// on it is dropped until it gives up.
+    pub silent: bool,
     /// Take no QUIC datagrams at all: the transport parameter that allows
     /// them is not sent, and the client relays UDP on streams (`quic` mode).
     pub no_datagrams: bool,
@@ -69,9 +96,19 @@ pub struct TuicScript {
     /// the client sends on one goes no further ahead of what the fake read
     /// of it. quinn's (1.25 MB) unless set.
     pub stream_window: Option<u32>,
-    /// The first UDP answer it splits into fragments goes without this
+    /// v5: the first UDP answer it splits into fragments goes without this
     /// one.
     pub drop_fragment: Option<u8>,
+}
+
+impl TuicScript {
+    /// A v4 server that lets `token` in.
+    pub fn v4(token: &str) -> TuicScript {
+        TuicScript {
+            v4_token: Some(token.to_string()),
+            ..TuicScript::default()
+        }
+    }
 }
 
 /// An Authenticate command.
@@ -79,10 +116,11 @@ pub struct TuicScript {
 pub struct RecordedTuicAuth {
     /// The connection it came on, 0 for the first accepted.
     pub connection: usize,
-    pub uuid: [u8; 16],
+    /// v5's user; v4 names none.
+    pub uuid: Option<[u8; 16]>,
     pub token: [u8; 32],
-    /// What the fake's own side of the TLS session exports for its user:
-    /// the token it lets in.
+    /// The token it lets in: v5's as the fake's own side of the TLS session
+    /// exports it for its user, v4's the hash of its token.
     pub expected: [u8; 32],
     pub accepted: bool,
 }
@@ -102,7 +140,9 @@ pub struct RecordedConnect {
 pub struct RecordedTuicPacket {
     /// The connection it came on, 0 for the first accepted.
     pub connection: usize,
-    pub association: u16,
+    /// v5's are 16 bits.
+    pub association: u32,
+    /// v4's packets have neither ids nor fragments: 0, 1 and 0.
     pub packet: u16,
     pub fragments: u8,
     pub fragment: u8,
@@ -121,15 +161,17 @@ pub struct RecordedTuicPacket {
 pub struct RecordedDissociate {
     /// The connection it came on, 0 for the first accepted.
     pub connection: usize,
-    pub association: u16,
+    pub association: u32,
 }
 
 /// A Packet command as the fake reads and writes it, for tests that send
-/// their own: `05 02 ‖ ASSOC_ID ‖ PKT_ID ‖ FRAG_TOTAL ‖ FRAG_ID ‖ SIZE ‖
-/// ADDR ‖ payload`.
+/// their own: v5's `05 02 ‖ ASSOC_ID ‖ PKT_ID ‖ FRAG_TOTAL ‖ FRAG_ID ‖ SIZE
+/// ‖ ADDR ‖ payload`, or v4's `04 02 ‖ ASSOC_ID ‖ LEN ‖ ADDR ‖ payload`, which
+/// has neither a packet id nor fragments.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TuicPacket {
-    pub association: u16,
+    /// v5's are 16 bits.
+    pub association: u32,
     pub packet: u16,
     pub fragments: u8,
     pub fragment: u8,
@@ -141,7 +183,7 @@ pub struct TuicPacket {
 
 impl TuicPacket {
     /// A UDP packet that goes whole: fragment 0 of 1.
-    pub fn whole(association: u16, packet: u16, address: &str, payload: &[u8]) -> TuicPacket {
+    pub fn whole(association: u32, packet: u16, address: &str, payload: &[u8]) -> TuicPacket {
         TuicPacket {
             association,
             packet,
@@ -152,28 +194,66 @@ impl TuicPacket {
         }
     }
 
+    /// As a v5 server writes it.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![VERSION, PACKET];
-        out.extend_from_slice(&self.association.to_be_bytes());
+        let association = u16::try_from(self.association).expect("a v5 association id of 16 bits");
+        let mut out = vec![V5, PACKET];
+        out.extend_from_slice(&association.to_be_bytes());
         out.extend_from_slice(&self.packet.to_be_bytes());
         out.extend_from_slice(&[self.fragments, self.fragment]);
+        self.put_rest(&mut out);
+        out
+    }
+
+    /// As a v4 server writes it: the packet's id and fragments are not.
+    pub fn encode_v4(&self) -> Vec<u8> {
+        let mut out = vec![V4, PACKET];
+        out.extend_from_slice(&self.association.to_be_bytes());
+        self.put_rest(&mut out);
+        out
+    }
+
+    /// `SIZE ‖ ADDR ‖ payload`, v4's LEN alike.
+    fn put_rest(&self, out: &mut Vec<u8>) {
         let size = u16::try_from(self.payload.len()).expect("a payload of at most 65535 bytes");
         out.extend_from_slice(&size.to_be_bytes());
         match self.address.as_deref() {
             None => out.push(0xff),
-            Some(address) => put_address(&mut out, address),
+            Some(address) => put_address(out, address),
         }
         out.extend_from_slice(&self.payload);
-        out
     }
 
-    /// `None` for anything but a Packet whose SIZE is just what follows its
-    /// address, as sing-box reads one.
+    /// `None` for anything but a v5 Packet whose SIZE is just what follows
+    /// its address, as sing-box reads one.
     fn decode(data: &[u8]) -> Option<TuicPacket> {
         let (header, rest) = data.split_at_checked(10)?;
-        if header[..2] != [VERSION, PACKET] {
+        if header[..2] != [V5, PACKET] {
             return None;
         }
+        let association = u16::from_be_bytes([header[2], header[3]]);
+        let mut packet = TuicPacket::rest(header[8..].try_into().ok()?, rest)?;
+        packet.association = u32::from(association);
+        packet.packet = u16::from_be_bytes([header[4], header[5]]);
+        (packet.fragments, packet.fragment) = (header[6], header[7]);
+        Some(packet)
+    }
+
+    /// `None` for anything but a v4 Packet whose LEN is just what follows
+    /// its address — whole, as v4 has no fragments.
+    fn decode_v4(data: &[u8]) -> Option<TuicPacket> {
+        let (header, rest) = data.split_at_checked(8)?;
+        if header[..2] != [V4, PACKET] {
+            return None;
+        }
+        let mut packet = TuicPacket::rest(header[6..].try_into().ok()?, rest)?;
+        packet.association = u32::from_be_bytes(header[2..6].try_into().ok()?);
+        Some(packet)
+    }
+
+    /// The address and the payload that follow a header ending with
+    /// `size`, as a whole packet of association 0.
+    fn rest(size: [u8; 2], rest: &[u8]) -> Option<TuicPacket> {
         let (address, rest) = match rest.split_first()? {
             (&0xff, rest) => (None, rest),
             _ => {
@@ -181,14 +261,14 @@ impl TuicPacket {
                 (Some(address.to_string()), rest)
             }
         };
-        if rest.len() != usize::from(u16::from_be_bytes([header[8], header[9]])) {
+        if rest.len() != usize::from(u16::from_be_bytes(size)) {
             return None;
         }
         Some(TuicPacket {
-            association: u16::from_be_bytes([header[2], header[3]]),
-            packet: u16::from_be_bytes([header[4], header[5]]),
-            fragments: header[6],
-            fragment: header[7],
+            association: 0,
+            packet: 0,
+            fragments: 1,
+            fragment: 0,
             address,
             payload: rest.to_vec(),
         })
@@ -268,6 +348,8 @@ pub struct FakeTuic {
 /// What the connections of every endpoint share.
 struct Shared {
     script: TuicScript,
+    /// The version it speaks, as the script says.
+    version: u8,
     /// The server's side of every connection accepted, in order.
     connections: Mutex<Vec<Connection>>,
     auths: Mutex<Vec<RecordedTuicAuth>>,
@@ -302,13 +384,36 @@ impl Shared {
         }
     }
 
-    /// `answer` in datagrams of at most `max` bytes: whole when it fits,
-    /// else in fragments of one size, only the first naming the source. The
-    /// first answer split goes without the fragment the script drops.
+    /// `packet` as the fake's version writes it.
+    fn encode(&self, packet: &TuicPacket) -> Vec<u8> {
+        if self.version == V4 {
+            packet.encode_v4()
+        } else {
+            packet.encode()
+        }
+    }
+
+    /// A packet of the client's as the fake's version reads it.
+    fn decode(&self, data: &[u8]) -> Option<TuicPacket> {
+        if self.version == V4 {
+            TuicPacket::decode_v4(data)
+        } else {
+            TuicPacket::decode(data)
+        }
+    }
+
+    /// `answer` in datagrams of at most `max` bytes: whole when it fits;
+    /// else a v4 answer is dropped (tuic 0.8.5's server fails to send it),
+    /// and a v5 one goes in fragments of one size, only the first naming
+    /// the source. The first answer split goes without the fragment the
+    /// script drops.
     fn split(&self, answer: TuicPacket, max: usize) -> Vec<Vec<u8>> {
-        let whole = answer.encode();
+        let whole = self.encode(&answer);
         if whole.len() <= max {
             return vec![whole];
+        }
+        if self.version == V4 {
+            return Vec::new();
         }
         let room = max - (whole.len() - answer.payload.len());
         let fragments = u8::try_from(answer.payload.len().div_ceil(room)).expect("255 fragments");
@@ -362,6 +467,7 @@ impl FakeTuic {
             addr,
             port,
             shared: Arc::new(Shared {
+                version: if script.v4_token.is_some() { V4 } else { V5 },
                 drop_fragment: Mutex::new(script.drop_fragment),
                 script,
                 connections: Mutex::default(),
@@ -416,16 +522,17 @@ impl FakeTuic {
         self.shared.dissociates.lock().expect("dissociates").clone()
     }
 
-    /// The heartbeats it heard so far, on every connection.
+    /// The heartbeats it heard so far, on every connection: v5's in
+    /// datagrams, v4's on streams.
     pub fn heartbeats(&self) -> usize {
         self.shared.heartbeats.load(Ordering::SeqCst)
     }
 
-    /// Sends `packet`, as it is, to the client in a datagram of connection
-    /// `n`.
+    /// Sends `packet`, as the fake's version writes it, to the client in a
+    /// datagram of connection `n`.
     pub fn send_udp(&self, n: usize, packet: &TuicPacket) {
         self.connection(n)
-            .send_datagram(packet.encode().into())
+            .send_datagram(self.shared.encode(packet).into())
             .expect("a datagram the client takes");
     }
 
@@ -442,8 +549,13 @@ impl FakeTuic {
     /// Closes every connection accepted so far — code 0, no reason —, as
     /// sing-box ends its sessions.
     pub fn close_connections(&self) {
+        self.close_connections_with(0, b"");
+    }
+
+    /// Closes every connection accepted so far with `code` and `reason`.
+    pub fn close_connections_with(&self, code: u32, reason: &[u8]) {
         for connection in self.shared.connections().iter() {
-            connection.close(CLOSE, b"");
+            connection.close(VarInt::from_u32(code), reason);
         }
     }
 
@@ -541,6 +653,7 @@ async fn serve(connection: Connection, shared: Arc<Shared>) {
         connection: connection.clone(),
         number,
         associations: Mutex::default(),
+        on_streams: Mutex::default(),
         shared: shared.clone(),
     });
     let mut streams = JoinSet::new();
@@ -576,16 +689,22 @@ struct Link {
     connection: Connection,
     /// The connection's number, 0 for the first accepted.
     number: usize,
-    associations: Mutex<HashMap<u16, Association>>,
+    associations: Mutex<HashMap<u32, Association>>,
+    /// v4: whether the connection's UDP comes on streams, as its first
+    /// packet came — tuic 0.8.5's server holds the rest to it.
+    on_streams: Mutex<Option<bool>>,
     shared: Arc<Shared>,
 }
 
 /// A unidirectional stream, read whole — the client finishes each after
 /// its one command —: the Authenticate, or — once that went through — a
-/// Packet (`quic` mode) or a Dissociate. A stream that holds no whole
-/// command — one cut short — closes the connection, as sing-box closes it
-/// on a stream it cannot read: every tunnel and association on it ends.
-/// While the fake holds streams, it waits unread.
+/// Packet (`quic` mode), a Dissociate, or a v4 heartbeat. A stream that
+/// holds no whole command — one cut short — closes the connection, as
+/// sing-box closes it on a stream it cannot read, and tuic 0.8.5 on one
+/// whose command's header it cannot: every tunnel and association on it
+/// ends. tuic 0.8.5 reads a packet's payload apart, and loses no more than
+/// the packet when that is cut short. While the fake holds streams, it
+/// waits unread.
 async fn serve_uni(mut stream: RecvStream, link: Arc<Link>, authenticated: watch::Sender<bool>) {
     link.shared.let_through().await;
     let command = match stream.read_to_end(MAX_STREAM).await {
@@ -594,57 +713,92 @@ async fn serve_uni(mut stream: RecvStream, link: Arc<Link>, authenticated: watch
         Err(ReadToEndError::Read(ReadError::ConnectionLost(_))) => return,
         Err(_) => return link.unreadable(),
     };
-    match command.get(..2) {
-        Some([VERSION, AUTHENTICATE]) => authenticate(&command, &link, &authenticated),
-        Some([VERSION, PACKET | DISSOCIATE]) => {
-            if authenticated
-                .subscribe()
-                .wait_for(|&let_in| let_in)
-                .await
-                .is_err()
-            {
-                return;
-            }
-            if command[1] == PACKET {
-                match TuicPacket::decode(&command) {
-                    Some(packet) => link.relay_packet(packet, true).await,
-                    None => link.unreadable(),
-                }
-            } else if let [_, _, high, low] = command[..] {
-                link.dissociate(u16::from_be_bytes([high, low]));
-            } else {
-                link.unreadable();
-            }
+    let version = link.shared.version;
+    let kind = match command[..] {
+        [v, kind, ..] if v == version => kind,
+        _ => return link.unreadable(),
+    };
+    if kind == AUTHENTICATE {
+        return authenticate(&command, &link, &authenticated);
+    }
+    if !matches!(kind, PACKET | DISSOCIATE | HEARTBEAT) {
+        return link.unreadable();
+    }
+    if authenticated
+        .subscribe()
+        .wait_for(|&let_in| let_in)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    match (version, kind, &command[2..]) {
+        (_, PACKET, _) => match link.shared.decode(&command) {
+            Some(packet) => link.relay_packet(packet, true).await,
+            None if version == V4 && v4_header_whole(&command) => {}
+            None => link.unreadable(),
+        },
+        (V5, DISSOCIATE, &[high, low]) => {
+            link.dissociate(u32::from(u16::from_be_bytes([high, low])))
+        }
+        (V4, DISSOCIATE, &[a, b, c, d]) => link.dissociate(u32::from_be_bytes([a, b, c, d])),
+        // v4's goes on a stream (v5's in a datagram)
+        (V4, HEARTBEAT, []) => {
+            link.shared.heartbeats.fetch_add(1, Ordering::SeqCst);
         }
         _ => link.unreadable(),
     }
 }
 
-/// The authentication, checked against what the fake's own side of the TLS
-/// session exports for its user, with the UUID's bytes as the label and the
-/// password as the context. Let in, the connection's commands go on;
-/// refused, the connection is closed as the reference servers close it,
-/// with no reason.
+/// Whether `command` holds a v4 Packet's header whole — `04 02 ‖ ASSOC_ID ‖
+/// LEN ‖ ADDR` —, whatever follows it.
+fn v4_header_whole(command: &[u8]) -> bool {
+    command.get(8..).and_then(take_address).is_some()
+}
+
+/// The authentication, checked against what the fake lets in: v5's token
+/// against what its own side of the TLS session exports for its user, with
+/// the UUID's bytes as the label and the password as the context; v4's
+/// against the BLAKE3 hash of its token. Let in, the connection's commands
+/// go on; refused, the connection is closed as the reference servers close
+/// it.
 fn authenticate(command: &[u8], link: &Link, authenticated: &watch::Sender<bool>) {
-    let Some((uuid, token)) = command[2..].split_first_chunk::<16>() else {
-        return;
-    };
-    let Ok(token) = <[u8; 32]>::try_from(token) else {
-        return;
-    };
     let script = &link.shared.script;
-    let mut expected = [0u8; 32];
-    link.connection
-        .export_keying_material(&mut expected, &script.uuid, script.password.as_bytes())
-        .expect("the keying material of a session whose handshake is done");
-    let accepted = *uuid == script.uuid && token == expected;
+    let (uuid, token, expected, (code, reason)) = match &script.v4_token {
+        Some(own) => {
+            let Ok(token) = <[u8; 32]>::try_from(&command[2..]) else {
+                return;
+            };
+            let expected = *blake3::hash(own.as_bytes()).as_bytes();
+            (None, token, expected, AUTHENTICATION_FAILED)
+        }
+        None => {
+            let Some((uuid, token)) = command[2..].split_first_chunk::<16>() else {
+                return;
+            };
+            let Ok(token) = <[u8; 32]>::try_from(token) else {
+                return;
+            };
+            let mut expected = [0u8; 32];
+            link.connection
+                .export_keying_material(&mut expected, &script.uuid, script.password.as_bytes())
+                .expect("the keying material of a session whose handshake is done");
+            (
+                Some(*uuid),
+                token,
+                expected,
+                (script.auth_failure_code, &b""[..]),
+            )
+        }
+    };
+    let accepted = token == expected && uuid.is_none_or(|uuid| uuid == script.uuid);
     link.shared
         .auths
         .lock()
         .expect("auths")
         .push(RecordedTuicAuth {
             connection: link.number,
-            uuid: *uuid,
+            uuid,
             token,
             expected,
             accepted,
@@ -652,28 +806,30 @@ fn authenticate(command: &[u8], link: &Link, authenticated: &watch::Sender<bool>
     if accepted {
         authenticated.send_replace(true);
     } else {
-        link.connection
-            .close(VarInt::from_u32(script.auth_failure_code), b"");
+        link.connection.close(VarInt::from_u32(code), reason);
     }
 }
 
 /// The client's datagrams, once the authentication went through — they
-/// wait in QUIC's queue until then, as sing-box leaves them —: heartbeats
-/// counted, packets relayed.
+/// wait in QUIC's queue until then, as sing-box leaves them —: packets
+/// relayed, v5's heartbeats counted. A v4 fake closes the connection on
+/// anything but a packet, as tuic 0.8.5's server does.
 async fn read_datagrams(link: Arc<Link>, mut authenticated: watch::Receiver<bool>) {
     if authenticated.wait_for(|&let_in| let_in).await.is_err() {
         return;
     }
+    let version = link.shared.version;
     while let Ok(datagram) = link.connection.read_datagram().await {
-        match datagram.get(..2) {
-            Some([VERSION, HEARTBEAT]) => {
-                link.shared.heartbeats.fetch_add(1, Ordering::SeqCst);
-            }
-            Some([VERSION, PACKET]) => {
-                if let Some(packet) = TuicPacket::decode(&datagram) {
+        match (version, datagram.get(..2)) {
+            (_, Some(&[v, PACKET])) if v == version => {
+                if let Some(packet) = link.shared.decode(&datagram) {
                     link.relay_packet(packet, false).await;
                 }
             }
+            (V5, Some(&[V5, HEARTBEAT])) => {
+                link.shared.heartbeats.fetch_add(1, Ordering::SeqCst);
+            }
+            (V4, _) => return link.close(BAD_COMMAND),
             _ => {}
         }
     }
@@ -682,8 +838,19 @@ async fn read_datagrams(link: Arc<Link>, mut authenticated: watch::Receiver<bool
 impl Link {
     /// A packet of the client's: recorded, and sent on by its association —
     /// opened with its first packet, answering the way that came — once it
-    /// is whole.
+    /// is whole. A v4 fake closes the connection on a packet that does not
+    /// come the way the connection's first came.
     async fn relay_packet(&self, packet: TuicPacket, on_stream: bool) {
+        if self.shared.version == V4
+            && *self
+                .on_streams
+                .lock()
+                .expect("mode")
+                .get_or_insert(on_stream)
+                != on_stream
+        {
+            return self.close(BAD_COMMAND);
+        }
         self.shared
             .packets
             .lock()
@@ -727,7 +894,7 @@ impl Link {
 
     /// A Dissociate: recorded, and the association, if any, goes — its
     /// socket with it.
-    fn dissociate(&self, association: u16) {
+    fn dissociate(&self, association: u32) {
         self.shared
             .dissociates
             .lock()
@@ -742,10 +909,20 @@ impl Link {
             .remove(&association);
     }
 
-    /// Closes the connection for a stream it cannot read, as sing-box
-    /// closes it: code 0, no reason.
+    /// Closes the connection for a stream it cannot read: as sing-box
+    /// closes it (v5), code 0 and no reason; as tuic 0.8.5 closes it (v4),
+    /// with its protocol error.
     fn unreadable(&self) {
-        self.connection.close(CLOSE, b"");
+        if self.shared.version == V4 {
+            self.close(PROTOCOL_ERROR);
+        } else {
+            self.connection.close(CLOSE, b"");
+        }
+    }
+
+    /// Closes the connection with one of v4's codes and its reason.
+    fn close(&self, (code, reason): (u32, &[u8])) {
+        self.connection.close(VarInt::from_u32(code), reason);
     }
 }
 
@@ -769,7 +946,7 @@ struct Partial {
 impl Association {
     /// Its socket, and the task that sends back whatever reaches it, the
     /// way the association's first packet came.
-    fn open(link: &Link, association: u16, on_stream: bool) -> io::Result<Association> {
+    fn open(link: &Link, association: u32, on_stream: bool) -> io::Result<Association> {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
         socket.set_nonblocking(true)?;
         let socket = Arc::new(UdpSocket::from_std(socket)?);
@@ -827,13 +1004,14 @@ impl Association {
 }
 
 /// Whatever reaches an association's socket goes back to the client under
-/// its source — full cone —, packets counted from 0: on a stream of its own
-/// each when the association's first packet came so, else in datagrams, in
-/// fragments when one cannot hold it.
+/// its source — full cone; a v4 fake names an IPv4 source in IPv6 form, as
+/// tuic 0.8.5's dual-stack socket hears it —, v5's packets counted from 0:
+/// on a stream of its own each when the association's first packet came
+/// so, else in datagrams, in fragments when one cannot hold a v5 one.
 async fn relay_answers(
     socket: Arc<UdpSocket>,
     connection: Connection,
-    association: u16,
+    association: u32,
     on_stream: bool,
     shared: Arc<Shared>,
 ) {
@@ -846,13 +1024,19 @@ async fn relay_answers(
             Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
             Err(_) => return,
         };
+        let from = match from {
+            SocketAddr::V4(v4) if shared.version == V4 => {
+                SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+            }
+            from => from,
+        };
         let answer = TuicPacket::whole(association, packets, &from.to_string(), &buf[..n]);
         packets = packets.wrapping_add(1);
         if on_stream {
             let Ok(mut stream) = connection.open_uni().await else {
                 return;
             };
-            if stream.write_all(&answer.encode()).await.is_ok() {
+            if stream.write_all(&shared.encode(&answer)).await.is_ok() {
                 let _ = stream.finish();
             }
             continue;
@@ -871,19 +1055,21 @@ async fn relay_answers(
 }
 
 /// A Connect: read and recorded, held until the authentication went
-/// through, then relayed to its target, the half-closes too. One it cannot
-/// carry out — no Connect, a name it has no `connect_to` for, a target
-/// that refuses — it ends as sing-box ends one whose target it cannot
-/// reach: STOP_SENDING (code 0) for what the client sends, FIN for what it
-/// reads.
+/// through, then relayed to its target, the half-closes too — a v4 fake
+/// first answers that it reached it. One it cannot carry out — no Connect,
+/// a name it has no `connect_to` for, a target that refuses — it ends as
+/// sing-box ends one whose target it cannot reach: STOP_SENDING (code 0)
+/// for what the client sends, FIN for what it reads; a v4 fake answers it
+/// could not reach the target, as tuic 0.8.5's server does, and ends the
+/// stream.
 async fn relay(
-    send: SendStream,
+    mut send: SendStream,
     mut recv: RecvStream,
     number: usize,
     mut authenticated: watch::Receiver<bool>,
     shared: Arc<Shared>,
 ) {
-    let Some(address) = read_connect(&mut recv).await else {
+    let Some(address) = read_connect(&mut recv, shared.version).await else {
         return refuse(send, recv);
     };
     let connect = RecordedConnect {
@@ -895,6 +1081,10 @@ async fn relay(
     if authenticated.wait_for(|&let_in| let_in).await.is_err() {
         return;
     }
+    if shared.script.silent {
+        let _ = tokio::io::copy(&mut recv, &mut tokio::io::sink()).await;
+        return;
+    }
     // never resolves: a name without `connect_to` is a dead end
     let to = shared.script.connect_to.or(match address {
         Address::Ip(to) => Some(to),
@@ -904,9 +1094,18 @@ async fn relay(
         Some(to) => TcpStream::connect(to).await.ok(),
         None => None,
     };
+    let v4 = shared.version == V4;
     let Some(mut upstream) = upstream else {
+        if v4 {
+            let _ = send.write_all(&[V4, RESPONSE, FAILED]).await;
+            let _ = send.finish();
+            return;
+        }
         return refuse(send, recv);
     };
+    if v4 && send.write_all(&[V4, RESPONSE, SUCCEEDED]).await.is_err() {
+        return;
+    }
     let mut client = tokio::io::join(recv, send);
     // in large pieces, so that a bulk transfer measures the client rather
     // than this relay
@@ -934,11 +1133,11 @@ impl fmt::Display for Address {
     }
 }
 
-/// The target of a Connect: `05 01 ‖ ADDR`; `None` for anything else.
-async fn read_connect(recv: &mut RecvStream) -> Option<Address> {
+/// The target of a Connect: `VER 01 ‖ ADDR`; `None` for anything else.
+async fn read_connect(recv: &mut RecvStream, version: u8) -> Option<Address> {
     let mut header = [0u8; 2];
     recv.read_exact(&mut header).await.ok()?;
-    if header != [VERSION, CONNECT] {
+    if header != [version, CONNECT] {
         return None;
     }
     read_address(recv).await

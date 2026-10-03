@@ -1,16 +1,21 @@
-//! `tuic-v5` outbound (manual: Policies › TUIC; phase 2 M7 design 6): the
-//! policy's QUIC connection, which its requests share (`session`),
-//! authenticated as it comes up (`auth`).
+//! `tuic` and `tuic-v5` outbounds (manual: Policies › TUIC; phase 2 M7
+//! design 6): the policy's QUIC connection, which its requests share
+//! (`session`), authenticated as it comes up (`auth`) — TUIC v5 for
+//! `tuic-v5`, TUIC v4 as tuic 0.8.5 speaks it for `tuic`.
 //!
 //! - Every command is `u8 version ‖ u8 type ‖ …`, big endian (TUIC v5
-//!   SPEC); the server answers none of them.
-//! - A TCP connection is a bidirectional stream of its own, the tunnel as
-//!   soon as the Connect naming its target (`addr`) is written (`tcp`).
+//!   SPEC; v4's protocol README). The server answers none, but for v4's
+//!   Connect.
+//! - A TCP connection is a bidirectional stream of its own, beginning with
+//!   the Connect that names its target (`addr`): the tunnel as soon as that
+//!   is written in v5, once the server answered that it reached the target
+//!   in v4 (`tcp`).
 //! - UDP goes in QUIC datagrams of the same connection, or in streams of
 //!   its own where the server takes no datagrams, each client association
-//!   an association of its own there (`udp`).
+//!   an association of its own there (`udp`): v5 splits a packet that does
+//!   not fit a datagram, v4 cannot.
 //! - While anything is relayed, a heartbeat keeps the connection up
-//!   (`heartbeat`).
+//!   (`heartbeat`): a datagram in v5, a stream in v4.
 
 mod addr;
 mod auth;
@@ -29,19 +34,46 @@ use rustls::RootCertStore;
 use std::sync::Arc;
 use udp::TuicUdp;
 
-/// TUIC v5's version, first in every command.
-const VERSION: u8 = 0x05;
+/// The TUIC a policy speaks (design 6.2, 6.3), which every command names
+/// first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Version {
+    /// `tuic`: tuic 0.8.5's protocol.
+    V4,
+    /// `tuic-v5`: the SPEC's.
+    V5,
+}
+
+impl Version {
+    /// The version `credentials` are for.
+    fn of(credentials: &TuicVersion) -> Version {
+        match credentials {
+            TuicVersion::V4 { .. } => Version::V4,
+            TuicVersion::V5 { .. } => Version::V5,
+        }
+    }
+
+    /// The first byte of every command.
+    const fn byte(self) -> u8 {
+        match self {
+            Version::V4 => 0x04,
+            Version::V5 => 0x05,
+        }
+    }
+}
 
 /// No `Debug`: it holds the credentials.
 pub struct TuicOutbound {
     name: String,
+    version: Version,
     /// Shared with its UDP carriers, which may outlive it.
     session: Arc<Session<Auth>>,
 }
 
 impl TuicOutbound {
     /// The connection goes as `connector` dials (design 3.3), with the
-    /// policy's `ecn`; `client-cert` comes from `keystore`.
+    /// policy's `ecn`; `client-cert` comes from `keystore`. The line's
+    /// keyword is the version (`spec.version`).
     pub fn new(
         name: &str,
         server: Target,
@@ -52,20 +84,23 @@ impl TuicOutbound {
         connector: Arc<dyn Connector>,
     ) -> Result<TuicOutbound, BuildError> {
         // error texts carry no policy name: the registry's `build_one` and
-        // the dry build both prefix it
-        let TuicVersion::V5 { uuid, password } = &spec.version else {
-            return Err(BuildError::new("TUIC v4 (`tuic`) is not supported yet"));
+        // the dry build both prefix it; the configuration checked the
+        // credentials, but a spec made by hand may not be
+        let (key, credential) = match &spec.version {
+            TuicVersion::V4 { token } => ("token", token.expose()),
+            TuicVersion::V5 { password, .. } => ("password", password.expose()),
         };
-        // the configuration checked it, but a spec made by hand may not be
-        if password.expose().is_empty() {
-            return Err(BuildError::new("`password` is empty"));
+        if credential.is_empty() {
+            return Err(BuildError::new(format!("`{key}` is empty")));
         }
         let dialer = Dialer::new(
             connector, server, &spec.tls, &spec.quic, ecn, keystore, roots,
         )?;
-        let auth = Auth::new(*uuid.expose(), password.expose(), heartbeat::EVERY);
+        let version = Version::of(&spec.version);
+        let auth = Auth::new(&spec.version, heartbeat::every(version));
         Ok(TuicOutbound {
             name: name.to_string(),
+            version,
             session: Arc::new(Session::new(name, dialer, auth)),
         })
     }
@@ -83,9 +118,9 @@ impl Outbound for TuicOutbound {
     ) -> BoxFuture<'a, Result<BoxedStream, OutboundError>> {
         Box::pin(async move {
             // never dial for a target whose name cannot be sent
-            let request = tcp::request(target)?;
+            let request = tcp::request(self.version, target)?;
             // one budget for the connection (when one is dialed), QUIC's
-            // handshake and the Connect, which nothing answers
+            // handshake and the Connect — and v4's response to it
             let tunnel = self
                 .session
                 .request(opts, |lease| Box::pin(tcp::open(lease, &request)));
@@ -173,16 +208,21 @@ mod tests {
         format!("uuid={uuid}, password={password}")
     }
 
-    /// The spec of `tuic-v5, 127.0.0.1, <port>, <params>`, as the
+    /// The spec of `<keyword>, 127.0.0.1, <port>, <params>`, as the
     /// configuration reads it.
-    fn spec(port: u16, params: &str) -> TuicSpec {
+    fn spec_of(keyword: &str, port: u16, params: &str) -> TuicSpec {
         let span = Span::new(Arc::from(Path::new("p.conf")), 1);
-        let line = format!("tuic-v5, 127.0.0.1, {port}, {params}");
+        let line = format!("{keyword}, 127.0.0.1, {port}, {params}");
         let policy = parse_policy("T", &line, &span).unwrap();
         let mut r = ParamReader::new(&policy);
         let spec = read_tuic(&mut r, &mut CommonOpts::default(), &[]);
         assert!(!r.has_errors(), "{:?}", r.finish());
         spec
+    }
+
+    /// A `tuic-v5` line's spec.
+    fn spec(port: u16, params: &str) -> TuicSpec {
+        spec_of("tuic-v5", port, params)
     }
 
     /// `spec`'s outbound to `127.0.0.1:<port>`, trusting `fake`.
@@ -265,7 +305,7 @@ mod tests {
         round_trip(&mut stream, b"through tuic").await;
         let auths = fake.auths();
         assert_eq!(auths.len(), 1);
-        assert_eq!((auths[0].connection, auths[0].uuid), (0, UUID));
+        assert_eq!((auths[0].connection, auths[0].uuid), (0, Some(UUID)));
         assert_eq!(auths[0].token, auths[0].expected);
         assert!(auths[0].accepted);
         assert_eq!(
@@ -467,7 +507,7 @@ mod tests {
         let out = user(&fake);
         let mut first = tunnel(&out, &target(echo)).await;
         round_trip(&mut first, b"first").await;
-        let request = tcp::request(&target(echo)).unwrap();
+        let request = tcp::request(Version::V5, &target(echo)).unwrap();
         let attempts = AtomicUsize::new(0);
         let opts = ConnectOpts::default();
         let reopened = out.session.request(&opts, |lease| {
@@ -634,14 +674,24 @@ mod tests {
         Arc::new(DirectConnector::new(Arc::new(SystemResolve)))
     }
 
-    /// The outbound of the fake's user, its connections dialled through
+    /// The outbound of the fake's v5 user, its connections dialled through
     /// `connector` and its heartbeat every `every`.
     fn built(fake: &FakeTuic, connector: Arc<dyn Connector>, every: Duration) -> TuicOutbound {
-        let port = fake.addr().port();
-        let spec = spec(port, &credentials(ID, PASSWORD));
+        let spec = spec(fake.addr().port(), &credentials(ID, PASSWORD));
+        built_from(&spec, fake, connector, every)
+    }
+
+    /// `spec`'s outbound to the fake, its connections dialled through
+    /// `connector` and its heartbeat every `every`.
+    fn built_from(
+        spec: &TuicSpec,
+        fake: &FakeTuic,
+        connector: Arc<dyn Connector>,
+        every: Duration,
+    ) -> TuicOutbound {
         let dialer = Dialer::new(
             connector,
-            Target::new(HostName::parse("127.0.0.1"), port),
+            Target::new(HostName::parse("127.0.0.1"), fake.addr().port()),
             &spec.tls,
             &spec.quic,
             Tristate::Auto,
@@ -649,10 +699,10 @@ mod tests {
             fake.roots(),
         )
         .unwrap();
-        let auth = Auth::new(UUID, PASSWORD, every);
         TuicOutbound {
             name: "T".to_string(),
-            session: Arc::new(Session::new("T", dialer, auth)),
+            version: Version::of(&spec.version),
+            session: Arc::new(Session::new("T", dialer, Auth::new(&spec.version, every))),
         }
     }
 
@@ -720,7 +770,7 @@ mod tests {
     }
 
     /// `(connection, association)` of every packet the fake read.
-    fn carried(fake: &FakeTuic) -> Vec<(usize, u16)> {
+    fn carried(fake: &FakeTuic) -> Vec<(usize, u32)> {
         fake.udp_packets()
             .iter()
             .map(|p| (p.connection, p.association))
@@ -1288,7 +1338,7 @@ mod tests {
         let (udp_echo, tcp_echo) = (udp_echo_server().await, echo_server().await);
         let fake = FakeTuic::spawn(script());
         let rerouted = Arc::new(Rerouted::new());
-        let out = built(&fake, rerouted.clone(), heartbeat::EVERY);
+        let out = built(&fake, rerouted.clone(), heartbeat::every(Version::V5));
         let (one, two) = (udp_carrier(&out).await, udp_carrier(&out).await);
         udp_round_trip(one.as_ref(), udp_echo, b"one").await;
         udp_round_trip(two.as_ref(), udp_echo, b"two").await;
@@ -1307,7 +1357,7 @@ mod tests {
         assert_eq!(carried(&fake), [(0, 0), (0, 1), (1, 0), (1, 1)]);
         assert_eq!(fake.connections(), 2);
         eventually("the Dissociates", || fake.dissociates().len() == 2).await;
-        let mut dissociated: Vec<(usize, u16)> = fake
+        let mut dissociated: Vec<(usize, u32)> = fake
             .dissociates()
             .iter()
             .map(|d| (d.connection, d.association))
@@ -1332,7 +1382,7 @@ mod tests {
         let to = target(digest_target().await);
         let fake = FakeTuic::spawn(script());
         let rerouted = Arc::new(Rerouted::new());
-        let out = built(&fake, rerouted.clone(), heartbeat::EVERY);
+        let out = built(&fake, rerouted.clone(), heartbeat::every(Version::V5));
         let carrier = udp_carrier(&out).await;
         let before = rerouted.asked();
         for i in 0..50u8 {
@@ -1351,7 +1401,7 @@ mod tests {
         let to = target(digest_target().await);
         let fake = FakeTuic::spawn(script());
         let rerouted = Arc::new(Rerouted::new());
-        let out = built(&fake, rerouted.clone(), heartbeat::EVERY);
+        let out = built(&fake, rerouted.clone(), heartbeat::every(Version::V5));
         let carrier = udp_carrier(&out).await;
         carrier.send_to(b"first", &to).await.unwrap();
         *rerouted.route.lock().unwrap() = Arc::new(2);
@@ -1504,7 +1554,7 @@ mod tests {
         }
         assert_eq!(fake.connections(), 1);
         assert_eq!(fake.auths().len(), 1);
-        let associations: BTreeSet<u16> = carried(&fake).iter().map(|&(_, a)| a).collect();
+        let associations: BTreeSet<u32> = carried(&fake).iter().map(|&(_, a)| a).collect();
         assert_eq!(associations, (0..16).collect());
         assert_eq!(fake.udp_outside().len(), 16);
     }
@@ -1596,5 +1646,500 @@ mod tests {
             "{log}"
         );
         assert!(!log.contains("payload-7c1e9a"));
+    }
+
+    /// TUIC v4's (`tuic`): the manual's example token.
+    const TOKEN: &str = "pwd";
+
+    /// `tuic, 127.0.0.1, <the fake's port>, <params>`.
+    fn v4_outbound(fake: &FakeTuic, params: &str) -> TuicOutbound {
+        let port = fake.addr().port();
+        outbound_with(&spec_of("tuic", port, params), port, fake)
+    }
+
+    /// The v4 outbound the fake lets in.
+    fn v4_user(fake: &FakeTuic) -> TuicOutbound {
+        v4_outbound(fake, &format!("token={TOKEN}"))
+    }
+
+    /// Design 6.3: v4 authenticates each connection with the BLAKE3 hash of
+    /// the token, on a stream of its own — the same on every connection,
+    /// unlike v5's token.
+    #[tokio::test]
+    async fn v4_the_authentication_carries_the_hash_of_the_token() {
+        let echo = echo_server().await;
+        let fake = FakeTuic::spawn(TuicScript::v4(TOKEN));
+        let out = v4_user(&fake);
+        let mut stream = tunnel(&out, &target(echo)).await;
+        round_trip(&mut stream, b"through tuic v4").await;
+        let other = v4_user(&fake);
+        let mut stream = tunnel(&other, &target(echo)).await;
+        round_trip(&mut stream, b"on another connection").await;
+        let auths = fake.auths();
+        assert_eq!(auths.len(), 2);
+        for (n, auth) in auths.iter().enumerate() {
+            assert_eq!((auth.connection, auth.uuid), (n, None));
+            assert_eq!(auth.token, auth.expected);
+            assert!(auth.accepted);
+        }
+        assert_eq!(auths[0].token, auths[1].token);
+        let carried: Vec<usize> = fake.connects().iter().map(|c| c.connection).collect();
+        assert_eq!(carried, [0, 1]);
+    }
+
+    /// Design 6.3: v4's Connect waits for the server's response, which
+    /// comes once the server reached the target; the tunnel begins after it
+    /// — with what a target that speaks first sends.
+    #[tokio::test]
+    async fn v4_a_tunnel_begins_after_the_response_with_what_the_target_sends() {
+        let greeter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = greeter.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = greeter.accept().await {
+                let _ = socket.write_all(b"220 ready").await;
+                let mut rest = Vec::new();
+                let _ = socket.read_to_end(&mut rest).await;
+            }
+        });
+        let fake = FakeTuic::spawn(TuicScript::v4(TOKEN));
+        let out = v4_user(&fake);
+        let mut stream = tunnel(&out, &target(at)).await;
+        let mut greeting = [0u8; 9];
+        timeout(BOUND, stream.read_exact(&mut greeting))
+            .await
+            .expect("the greeting within the bound")
+            .unwrap();
+        assert_eq!(&greeting, b"220 ready");
+        assert_eq!(fake.connects()[0].address, at.to_string());
+    }
+
+    /// Design 6.3: a target the server cannot reach is its `ff` response:
+    /// the request fails, saying so, and the connection goes on.
+    #[tokio::test]
+    async fn v4_a_target_the_server_cannot_reach_fails_the_request_and_the_connection_goes_on() {
+        let echo = echo_server().await;
+        let fake = FakeTuic::spawn(TuicScript::v4(TOKEN));
+        let out = v4_user(&fake);
+        // the fake resolves no name
+        let err = failure(&out, &Target::new(HostName::parse("unknown.test"), 80)).await;
+        assert!(matches!(err, OutboundError::Proxy(_)), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "tuic: the server could not connect to the target"
+        );
+        let mut next = tunnel(&out, &target(echo)).await;
+        round_trip(&mut next, b"still up").await;
+        assert_eq!(fake.connections(), 1);
+        assert_eq!(fake.connects().len(), 2);
+    }
+
+    /// Design 6.3: a v4 server that does not know the token closes the
+    /// connection with 0xfffffff1, before the Connect's response: the
+    /// request fails with `tuic: authentication failed`. The next dials and
+    /// authenticates again.
+    #[tokio::test]
+    async fn v4_a_wrong_token_fails_the_request_and_the_next_dials_again() {
+        let echo = echo_server().await;
+        let fake = FakeTuic::spawn(TuicScript::v4(TOKEN));
+        let out = v4_outbound(&fake, "token=wrong");
+        for _ in 0..2 {
+            let err = failure(&out, &target(echo)).await;
+            assert!(
+                matches!(&err, OutboundError::Io(e) if e.kind() == io::ErrorKind::PermissionDenied),
+                "{err:?}"
+            );
+            assert_eq!(err.to_string(), "tuic: authentication failed");
+        }
+        assert_eq!(fake.connections(), 2);
+        let auths = fake.auths();
+        assert_eq!(auths.len(), 2);
+        assert!(auths.iter().all(|auth| !auth.accepted));
+    }
+
+    /// Design 6.3: the code a v4 server closes a connection with says what
+    /// went wrong, the server's reason aside — its authentication refused,
+    /// too late, or a protocol error —; any other code is told as v5's.
+    #[tokio::test]
+    async fn v4_the_servers_close_codes_say_what_went_wrong() {
+        let echo = echo_server().await;
+        for (code, reason, expected) in [
+            (
+                0xffff_fff1,
+                "authentication failed",
+                "tuic: authentication failed",
+            ),
+            (
+                0xffff_fff2,
+                "authentication timeout",
+                "tuic: authentication timed out",
+            ),
+            (
+                0xffff_fff0,
+                "Unsupported TUIC version: 5",
+                "tuic: protocol error",
+            ),
+            (0xffff_fff3, "bad command", "tuic: protocol error"),
+            (
+                0x2a,
+                "",
+                "tuic: the server closed the connection (code 0x2a)",
+            ),
+        ] {
+            let fake = FakeTuic::spawn(TuicScript::v4(TOKEN));
+            let out = v4_user(&fake);
+            let mut stream = tunnel(&out, &target(echo)).await;
+            round_trip(&mut stream, b"up").await;
+            fake.close_connections_with(code, reason.as_bytes());
+            let err = end_of(&mut stream).await.to_string();
+            assert_eq!(err, expected, "{code:#x}");
+        }
+    }
+
+    /// Design 3.5, 6.3: v4's Connect waits for a response, so a request
+    /// that finds its connection gone before that came — the server
+    /// restarted, and answers with a stateless reset — sent nothing of the
+    /// caller's, and goes again, once, on a new connection. The tunnel
+    /// under way on the lost connection ends.
+    #[tokio::test]
+    async fn v4_a_request_that_finds_the_server_restarted_goes_again_on_a_new_connection() {
+        let echo = echo_server().await;
+        let fake = FakeTuic::spawn(TuicScript::v4(TOKEN));
+        let out = v4_user(&fake);
+        let mut before = tunnel(&out, &target(echo)).await;
+        round_trip(&mut before, b"before").await;
+        fake.restart();
+        let mut after = tunnel(&out, &target(echo)).await;
+        round_trip(&mut after, b"after").await;
+        assert_eq!(
+            end_of(&mut before).await.to_string(),
+            "quic: the server no longer knows the connection (stateless reset)"
+        );
+        let carried: Vec<usize> = fake.connects().iter().map(|c| c.connection).collect();
+        assert_eq!(carried, [0, 1]);
+        assert_eq!(fake.auths().len(), 2);
+    }
+
+    /// `opts.timeout` bounds a v4 request, its response included: a server
+    /// that takes the Connect and never answers it.
+    #[tokio::test]
+    async fn v4_a_server_that_never_answers_the_connect_times_out() {
+        let echo = echo_server().await;
+        let fake = FakeTuic::spawn(TuicScript {
+            silent: true,
+            ..TuicScript::v4(TOKEN)
+        });
+        let out = v4_user(&fake);
+        // up already
+        drop(held(&out).await);
+        let opts = ConnectOpts {
+            timeout: Duration::from_millis(500),
+        };
+        let started = Instant::now();
+        let err = timeout(BOUND, out.connect_tcp(&target(echo), &opts))
+            .await
+            .expect("an outcome within the bound")
+            .err()
+            .unwrap();
+        assert!(matches!(err, OutboundError::Timeout), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        eventually("the Connect", || fake.connects().len() == 1).await;
+    }
+
+    /// Design 6.3: v4's UDP goes whole in datagrams of the connection — no
+    /// packet id, no fragments —, under one association id the carrier
+    /// draws at random, and comes back so. A v4 server names an IPv4 source
+    /// in IPv6 form (tuic 0.8.5's dual-stack socket): it reads as the IPv4
+    /// address it is. Full cone.
+    #[tokio::test]
+    async fn v4_udp_goes_whole_in_datagrams_of_the_connection() {
+        let (one, two) = (udp_echo_server().await, udp_echo_server().await);
+        let fake = FakeTuic::spawn(TuicScript::v4(TOKEN));
+        let out = v4_user(&fake);
+        assert_eq!(out.udp(), UdpSupport::Native);
+        let carrier = udp_carrier(&out).await;
+        udp_round_trip(carrier.as_ref(), one, b"to one").await;
+        udp_round_trip(carrier.as_ref(), two, b"to two").await;
+        let packets = fake.udp_packets();
+        assert_eq!(packets.len(), 2);
+        let association = packets[0].association;
+        for (packet, to) in packets.iter().zip([one, two]) {
+            assert_eq!((packet.connection, packet.association), (0, association));
+            assert_eq!(
+                (packet.packet, packet.fragments, packet.fragment),
+                (0, 1, 0)
+            );
+            assert_eq!(packet.address, Some(to.to_string()));
+            assert_eq!(packet.len, 6);
+            assert!(!packet.on_stream);
+        }
+        let outside = fake.udp_outside();
+        assert_eq!(outside.len(), 1, "one socket for the association");
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger.send_to(b"unasked", outside[0]).await.unwrap();
+        assert_eq!(
+            udp_answer(carrier.as_ref()).await,
+            (b"unasked".to_vec(), target(stranger.local_addr().unwrap()))
+        );
+        assert_eq!(fake.connections(), 1);
+    }
+
+    /// Design 6.3: where the server takes no QUIC datagrams, each v4 packet
+    /// goes whole on a unidirectional stream of its own — a long one too —,
+    /// and the server answers on streams.
+    #[tokio::test]
+    async fn v4_without_datagrams_each_packet_goes_on_a_stream_of_its_own() {
+        let echo = udp_echo_server().await;
+        let fake = FakeTuic::spawn(TuicScript {
+            no_datagrams: true,
+            ..TuicScript::v4(TOKEN)
+        });
+        let out = v4_user(&fake);
+        let carrier = udp_carrier(&out).await;
+        udp_round_trip(carrier.as_ref(), echo, b"on a stream").await;
+        let long: Vec<u8> = (0..9000).map(|i| (i % 251) as u8).collect();
+        udp_round_trip(carrier.as_ref(), echo, &long).await;
+        let packets = fake.udp_packets();
+        let seen: Vec<(bool, u8, usize)> = packets
+            .iter()
+            .map(|p| (p.on_stream, p.fragments, p.len))
+            .collect();
+        assert_eq!(seen, [(true, 1, 11), (true, 1, 9000)]);
+        assert_eq!(packets[0].association, packets[1].association);
+        let lease = held(&out).await;
+        assert!(lease.connection().max_datagram_size().is_none());
+        assert_eq!(fake.connections(), 1);
+    }
+
+    /// Design 6.3: as v5's, a v4 send hands its packet to the connection's
+    /// writer and waits for nothing more, so that one its caller gives up
+    /// on still goes whole: tuic 0.8.5 closes the connection, the tunnel
+    /// beside it too, on a stream that ends within its command's header, as
+    /// the fake does. Here the server holds the packet's stream unread, its
+    /// window shorter than the header, until the send was given up on.
+    #[tokio::test]
+    async fn v4_a_send_given_up_on_never_cuts_its_packet_short() {
+        let (tcp_echo, udp_echo) = (echo_server().await, udp_echo_server().await);
+        let fake = FakeTuic::spawn(TuicScript {
+            no_datagrams: true,
+            stream_window: Some(8),
+            ..TuicScript::v4(TOKEN)
+        });
+        let out = v4_user(&fake);
+        let mut tcp = tunnel(&out, &target(tcp_echo)).await;
+        round_trip(&mut tcp, b"up").await;
+        let carrier = udp_carrier(&out).await;
+        let to = target(udp_echo);
+        fake.hold_streams();
+        let held = || fake.held_streams() == 1;
+        // given up on once the server holds its stream, if not done by then
+        tokio::select! {
+            sent = carrier.send_to(b"whole", &to) => sent.unwrap(),
+            () = eventually("the packet's stream held", held) => {}
+        }
+        eventually("the packet's stream held", held).await;
+        fake.release_streams();
+        assert_eq!(udp_answer(carrier.as_ref()).await, (b"whole".to_vec(), to));
+        round_trip(&mut tcp, b"still up").await;
+        assert_eq!(fake.connections(), 1);
+    }
+
+    /// Design 6.3: v4 cannot split a packet. One that no datagram of the
+    /// connection holds is refused — `InvalidInput`, which loses that packet
+    /// alone: the engine drops it, as any its outbound cannot frame —, and
+    /// nothing goes out; the carrier goes on. Without datagrams, the same
+    /// packet goes on a stream.
+    #[tokio::test]
+    async fn v4_a_packet_too_long_for_a_datagram_is_refused_and_nothing_goes_out() {
+        // past what any datagram of the connection holds: path MTU discovery
+        // stops at 1452 bytes
+        let long = vec![7u8; 2000];
+        let echo = udp_echo_server().await;
+        let fake = FakeTuic::spawn(TuicScript::v4(TOKEN));
+        let out = v4_user(&fake);
+        let carrier = udp_carrier(&out).await;
+        let err = carrier.send_to(&long, &target(echo)).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().starts_with("tuic: a datagram longer than "),
+            "{err}"
+        );
+        assert!(fake.udp_packets().is_empty());
+        udp_round_trip(carrier.as_ref(), echo, &[1u8; 1000]).await;
+        let fake = FakeTuic::spawn(TuicScript {
+            no_datagrams: true,
+            ..TuicScript::v4(TOKEN)
+        });
+        let out = v4_user(&fake);
+        let carrier = udp_carrier(&out).await;
+        udp_round_trip(carrier.as_ref(), echo, &long).await;
+    }
+
+    /// Design 6.3: a v4 carrier gone dissociates its association — `04 03
+    /// ‖ ASSOC_ID`, its 32 bits — on the connection it was on; the next
+    /// carrier is an association of its own, with a socket of its own.
+    #[tokio::test]
+    async fn v4_a_carrier_gone_dissociates_its_association() {
+        let echo = udp_echo_server().await;
+        let fake = FakeTuic::spawn(TuicScript::v4(TOKEN));
+        let out = v4_user(&fake);
+        let lease = held(&out).await;
+        let carrier = udp_carrier(&out).await;
+        udp_round_trip(carrier.as_ref(), echo, b"here").await;
+        let association = fake.udp_packets()[0].association;
+        assert_eq!(lease.state().udp.associations(), [association]);
+        drop(carrier);
+        assert!(lease.state().udp.associations().is_empty());
+        eventually("the Dissociate", || {
+            fake.dissociates()
+                == [RecordedDissociate {
+                    connection: 0,
+                    association,
+                }]
+        })
+        .await;
+        let next = udp_carrier(&out).await;
+        udp_round_trip(next.as_ref(), echo, b"next").await;
+        assert_eq!(fake.udp_outside().len(), 2);
+        assert_eq!(fake.connections(), 1);
+    }
+
+    /// Design 6.3: v4's heartbeat — `04 04` on a stream of its own; a v4
+    /// server closes the connection on one in a datagram, as the fake does
+    /// — goes while a relay is under way, and not while none is, whether the
+    /// server takes QUIC datagrams or not. Its interval is cut short here
+    /// (10 seconds otherwise).
+    #[tokio::test]
+    async fn v4_heartbeats_go_on_streams_while_a_relay_is_under_way() {
+        const EVERY: Duration = Duration::from_millis(100);
+        let (tcp_echo, udp_echo) = (echo_server().await, udp_echo_server().await);
+        for no_datagrams in [false, true] {
+            let fake = FakeTuic::spawn(TuicScript {
+                no_datagrams,
+                ..TuicScript::v4(TOKEN)
+            });
+            let spec = spec_of("tuic", fake.addr().port(), &format!("token={TOKEN}"));
+            let out = built_from(&spec, &fake, direct(), EVERY);
+            // up, and nothing relayed
+            let lease = held(&out).await;
+            assert!(lease.state().beats());
+            no_heartbeat(&fake, EVERY).await;
+            assert_eq!(fake.heartbeats(), 0);
+            let mut tcp = tunnel(&out, &target(tcp_echo)).await;
+            round_trip(&mut tcp, b"tcp").await;
+            eventually("heartbeats with a tunnel", || fake.heartbeats() >= 2).await;
+            drop(tcp);
+            no_heartbeat(&fake, EVERY).await;
+            let before = fake.heartbeats();
+            let carrier = udp_carrier(&out).await;
+            udp_round_trip(carrier.as_ref(), udp_echo, b"udp").await;
+            eventually("heartbeats with a carrier", || {
+                fake.heartbeats() >= before + 2
+            })
+            .await;
+            drop(carrier);
+            assert_eq!(lease.state().relays(), 0);
+            // none came in a datagram: the server kept the connection
+            assert!(lease.connection().close_reason().is_none());
+            assert_eq!(fake.connections(), 1);
+        }
+    }
+
+    /// Design 6.3: a v4 carrier whose connection ended goes on, on the
+    /// connection that replaces it — whether the server closed it or lost
+    /// it in a restart —, under an id drawn anew there.
+    #[tokio::test]
+    async fn v4_a_carrier_moves_to_a_new_connection_after_a_close_or_a_restart() {
+        let echo = udp_echo_server().await;
+        let fake = FakeTuic::spawn(TuicScript::v4(TOKEN));
+        let out = v4_user(&fake);
+        let carrier = udp_carrier(&out).await;
+        udp_round_trip(carrier.as_ref(), echo, b"first").await;
+        fake.close_connections_with(0xffff_fff0, b"protocol error");
+        until_answered(carrier.as_ref(), echo, b"after a close").await;
+        fake.restart();
+        until_answered(carrier.as_ref(), echo, b"after a restart").await;
+        let connections: BTreeSet<usize> =
+            fake.udp_packets().iter().map(|p| p.connection).collect();
+        assert_eq!(connections, BTreeSet::from([0, 1, 2]));
+        assert_eq!(fake.auths().len(), 3);
+        // the server lost the old connections: nothing to dissociate there
+        assert!(fake.dissociates().is_empty());
+    }
+
+    /// Design 6.3: as v5's, a v4 carrier comes up before the server's
+    /// verdict on the token; the send that finds the connection closed for
+    /// a token it did not know fails, once, and the next binds anew, on a
+    /// new connection.
+    #[tokio::test]
+    async fn v4_a_wrong_token_fails_a_send_once_and_the_next_binds_anew() {
+        let echo = udp_echo_server().await;
+        let fake = FakeTuic::spawn(TuicScript::v4(TOKEN));
+        let out = v4_outbound(&fake, "token=wrong");
+        let carrier = udp_carrier(&out).await;
+        let deadline = Instant::now() + BOUND;
+        let err = loop {
+            assert!(Instant::now() < deadline, "no send failed");
+            match carrier.send_to(b"x", &target(echo)).await {
+                Ok(()) => tokio::time::sleep(Duration::from_millis(5)).await,
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(err.to_string(), "tuic: authentication failed");
+        carrier.send_to(b"y", &target(echo)).await.unwrap();
+        eventually("the next authentication", || fake.auths().len() == 2).await;
+        assert!(fake.udp_packets().is_empty());
+    }
+
+    /// The token, and its hash — which lets a client in as the token does
+    /// —, go to the server and nowhere else: not into the error of a refused
+    /// authentication, nor into a build error, nor into a log line at any
+    /// level.
+    #[tokio::test]
+    async fn v4_the_token_never_shows() {
+        const SECRET: &str = "s3cret-tuic-v4";
+        // computed apart, with the BLAKE3 from the specification that the
+        // known answers of `a_v4_token_is_the_blake3_hash_of_the_token` come
+        // from
+        const HASH: &str = "557b8d354fae3c1f473c6f2d211cb1d827252b2f2473de4ad3425eb33b3cb1f9";
+        let (log, _logging, _second) = Log::capture();
+        let echo = echo_server().await;
+        let fake = FakeTuic::spawn(TuicScript::v4(TOKEN));
+        let out = v4_outbound(&fake, &format!("token={SECRET}"));
+        let err = failure(&out, &target(echo)).await;
+        assert_eq!(err.to_string(), "tuic: authentication failed");
+        let sent: String = fake.auths()[0]
+            .token
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(sent, HASH);
+        let shown = format!("{err} {err:?}");
+        for secret in [SECRET, HASH] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+        let mut spec = spec_of("tuic", 443, &format!("token={SECRET}"));
+        spec.version = TuicVersion::V4 { token: "".into() };
+        let err = TuicOutbound::new(
+            "T",
+            Target::new(HostName::parse("127.0.0.1"), 443),
+            &spec,
+            Tristate::Auto,
+            &[],
+            fake.roots(),
+            direct(),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.message, "`token` is empty");
+        let log = log.text();
+        assert!(!log.is_empty());
+        for secret in [SECRET, HASH] {
+            assert!(!log.contains(secret));
+        }
     }
 }

@@ -1,14 +1,15 @@
-//! The address of TUIC's commands (TUIC v5 SPEC, "Address"; phase 2 M7
-//! design 6.2): `u8 type ‖ address ‖ u16 port`, big endian — `0x00` a
-//! domain name, its length in a byte first; `0x01` an IPv4 address; `0x02`
-//! an IPv6 address; `0xff` none, with no port either: what every fragment of
-//! a UDP packet but the first carries.
+//! The address of TUIC's commands (TUIC v5 SPEC, "Address"; v4's protocol
+//! README, the same; phase 2 M7 design 6.2, 6.3): `u8 type ‖ address ‖ u16
+//! port`, big endian — `0x00` a domain name, its length in a byte first;
+//! `0x01` an IPv4 address; `0x02` an IPv6 address; in v5 only, `0xff` none,
+//! with no port either: what every fragment of a UDP packet but the first
+//! carries.
 
 use rurge_config::HostName;
 use rurge_net::connector::Target;
 use rurge_proto::http::wire_host;
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 
 const DOMAIN: u8 = 0x00;
 const IPV4: u8 = 0x01;
@@ -64,7 +65,9 @@ pub(super) fn put(out: &mut Vec<u8>, target: &Target) -> Result<(), AddrError> {
 /// (`0xff`). `None` for anything else: a type TUIC does not know, an
 /// address cut short, a name that is no host name (`HostName::from_wire`).
 /// A server may name the source as a name: sing-box answers so for a
-/// target that was one.
+/// target that was one. An IPv4 address in IPv6 form (RFC 4291 2.5.5.2) is
+/// the IPv4 address it names: tuic 0.8.5's server names an IPv4 source so,
+/// as its dual-stack socket heard it.
 pub(super) fn get(data: &[u8]) -> Option<(Option<Target>, usize)> {
     let (&kind, rest) = data.split_first()?;
     let (host, len) = match kind {
@@ -75,7 +78,7 @@ pub(super) fn get(data: &[u8]) -> Option<(Option<Target>, usize)> {
         }
         IPV6 => {
             let octets: [u8; 16] = rest.get(..16)?.try_into().ok()?;
-            (HostName::Ip(IpAddr::from(octets)), 16)
+            (HostName::Ip(Ipv6Addr::from(octets).to_canonical()), 16)
         }
         DOMAIN => {
             let (&n, name) = rest.split_first()?;
@@ -161,6 +164,24 @@ mod tests {
             assert_eq!(get(&data), Some((Some(at(host)), len)), "{host}");
         }
         assert_eq!(get(&[NONE, 0x1f, 0x90]), Some((None, 1)));
+    }
+
+    /// An IPv4 address in IPv6 form names the IPv4 address — tuic 0.8.5's
+    /// server names an IPv4 source so —; any other IPv6 address is itself.
+    #[test]
+    fn an_ipv4_address_in_ipv6_form_reads_as_the_ipv4_address() {
+        for (v6, host) in [
+            ("::ffff:192.0.2.1", "192.0.2.1"),
+            // compatible, not mapped: no IPv4 address
+            ("::192.0.2.1", "::192.0.2.1"),
+            ("2001:db8::1", "2001:db8::1"),
+        ] {
+            let mut data = vec![IPV6];
+            data.extend_from_slice(&v6.parse::<Ipv6Addr>().unwrap().octets());
+            data.extend_from_slice(&[0, 53]);
+            let source = Target::new(HostName::parse(host), 53);
+            assert_eq!(get(&data), Some((Some(source), 19)), "{v6}");
+        }
     }
 
     #[test]

@@ -1,31 +1,42 @@
-//! The heartbeat (TUIC v5 SPEC, "Heartbeat"; phase 2 M7 design 6.2): while
-//! anything is relayed on a connection — a TCP tunnel, a UDP association —
-//! a `05 04` QUIC datagram every few seconds keeps the server from taking
-//! the connection for idle, as tuic-client 1.0.0 keeps it: tuic-server's
-//! idle timeout is 10 seconds, which QUIC's own keep-alive every 10 seconds
-//! (design 3.2) does not beat.
+//! The heartbeat (v5 SPEC, "Heartbeat"; v4's protocol README; phase 2 M7
+//! design 6.2, 6.3): while anything is relayed on a connection — a TCP
+//! tunnel, a UDP association — a `VER 04` command every few seconds keeps
+//! the server from taking the connection for idle.
 //!
+//! - v5: a QUIC datagram every 3 seconds, as tuic-client 1.0.0 sends it:
+//!   tuic-server's idle timeout is 10 seconds, which QUIC's own keep-alive
+//!   every 10 seconds (design 3.2) does not beat. The SPEC sends it as a
+//!   datagram only: a server that takes no QUIC datagrams gets none
+//!   (sing-box ends a connection on a heartbeat in a stream: an unknown
+//!   command there), and QUIC's keep-alive alone keeps the connection up —
+//!   against a server whose idle timeout is longer than 10 seconds
+//!   (sing-box's: quic-go's 30).
+//! - v4: a unidirectional stream of its own every 10 seconds, as tuic
+//!   0.8.5's client sends it — its server takes a heartbeat on a stream
+//!   only, and closes the connection on a datagram that is no packet —,
+//!   whether the server takes QUIC datagrams or not.
 //! - Nothing goes while nothing is relayed: an idle connection is let go of
 //!   — by the server, or by the session (`IDLE_TIMEOUT`).
-//! - The SPEC sends it as a datagram only: a server that takes no QUIC
-//!   datagrams gets none (sing-box ends a connection on a heartbeat in a
-//!   stream: an unknown command there), and QUIC's keep-alive alone keeps
-//!   the connection up — against a server whose idle timeout is longer
-//!   than 10 seconds (sing-box's: quic-go's 30).
 
-use super::VERSION;
+use super::Version;
 use bytes::Bytes;
-use quinn::{Connection, SendDatagramError};
+use quinn::{Connection, ConnectionError, SendDatagramError};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::task::AbortOnDropHandle;
 
-/// How often, while something is relayed: tuic-client 1.0.0's.
-pub(super) const EVERY: Duration = Duration::from_secs(3);
-
 /// The command's type.
 pub(super) const HEARTBEAT: u8 = 0x04;
+
+/// How often, while something is relayed: v5's as tuic-client 1.0.0's,
+/// v4's as tuic 0.8.5's client's.
+pub(super) fn every(version: Version) -> Duration {
+    match version {
+        Version::V4 => Duration::from_secs(10),
+        Version::V5 => Duration::from_secs(3),
+    }
+}
 
 /// The relays under way on a connection — its TCP tunnels and the UDP
 /// associations on it —, which its heartbeat keeps it up for.
@@ -66,25 +77,34 @@ impl Drop for Relaying {
     }
 }
 
-/// Sends the heartbeat on `connection` every `every` while `relays` has
-/// any under way, until the connection ends — or the handle, or `relays`,
-/// goes.
+/// Sends `version`'s heartbeat on `connection` every `every` while `relays`
+/// has any under way, until the connection ends — or the handle, or
+/// `relays`, goes. None for v5 on a connection without QUIC datagrams.
 pub(super) fn start(
     connection: &Connection,
     relays: &Relays,
+    version: Version,
     every: Duration,
-) -> AbortOnDropHandle<()> {
+) -> Option<AbortOnDropHandle<()>> {
+    if version == Version::V5 && connection.max_datagram_size().is_none() {
+        return None;
+    }
     let connection = connection.clone();
     let relays = relays.0.subscribe();
-    AbortOnDropHandle::new(tokio::spawn(async move {
+    Some(AbortOnDropHandle::new(tokio::spawn(async move {
         tokio::select! {
             _ = connection.closed() => {}
-            () = beat(&connection, relays, every) => {}
+            () = beat(&connection, relays, version, every) => {}
         }
-    }))
+    })))
 }
 
-async fn beat(connection: &Connection, mut relays: watch::Receiver<usize>, every: Duration) {
+async fn beat(
+    connection: &Connection,
+    mut relays: watch::Receiver<usize>,
+    version: Version,
+    every: Duration,
+) {
     loop {
         // asleep until a relay begins
         if relays.wait_for(|&relays| relays > 0).await.is_err() {
@@ -94,9 +114,28 @@ async fn beat(connection: &Connection, mut relays: watch::Receiver<usize>, every
         if *relays.borrow() == 0 {
             continue;
         }
-        let heartbeat = Bytes::from_static(&[VERSION, HEARTBEAT]);
-        if let Err(SendDatagramError::ConnectionLost(_)) = connection.send_datagram(heartbeat) {
+        if send(connection, version).await.is_err() {
             return;
+        }
+    }
+}
+
+/// One heartbeat, failing only once the connection is gone. A v4 stream
+/// that breaks takes its heartbeat along; the next goes on another.
+async fn send(connection: &Connection, version: Version) -> Result<(), ConnectionError> {
+    let heartbeat = [version.byte(), HEARTBEAT];
+    match version {
+        Version::V5 => match connection.send_datagram(Bytes::copy_from_slice(&heartbeat)) {
+            Err(SendDatagramError::ConnectionLost(e)) => Err(e),
+            _ => Ok(()),
+        },
+        Version::V4 => {
+            let mut stream = connection.open_uni().await?;
+            if stream.write_all(&heartbeat).await.is_ok() {
+                // fails only for a stream finished or reset already
+                let _ = stream.finish();
+            }
+            Ok(())
         }
     }
 }
