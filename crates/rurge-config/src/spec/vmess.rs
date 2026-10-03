@@ -34,7 +34,7 @@ pub struct VmessRead {
 }
 
 /// The usual 8-4-4-4-12 form, or the same 32 digits without hyphens.
-pub(crate) fn parse_uuid(text: &str) -> Option<[u8; 16]> {
+fn parse_uuid(text: &str) -> Option<[u8; 16]> {
     let text = text.trim();
     let digits: Vec<u8> = match text.len() {
         36 => {
@@ -59,23 +59,31 @@ pub(crate) fn parse_uuid(text: &str) -> Option<[u8; 16]> {
     Some(out)
 }
 
+/// Reads the UUID credential `key`: the hyphenated form, or the same 32
+/// digits without hyphens. A missing or malformed value is an error that
+/// never quotes it; the returned id is then meaningless.
+pub(crate) fn read_uuid(r: &mut ParamReader<'_>, key: &str) -> Secret<[u8; 16]> {
+    let uuid = match r.str(key).map(parse_uuid) {
+        Some(Some(uuid)) => uuid,
+        found => {
+            let text = match found {
+                None => format!("`{key}` is required"),
+                Some(_) => format!("`{key}` is not a valid UUID"),
+            };
+            r.error(codes::E_INVALID_POLICY_PARAM, text);
+            [0; 16]
+        }
+    };
+    Secret::new(uuid)
+}
+
 /// Everything `vmess`-specific on the line. After an error was reported the
 /// returned value is meaningless: the caller checks `r.has_errors()`.
 ///
 /// The id is named-only (`username=`), as the manual writes it, and is never
 /// quoted in a diagnostic: it is the credential.
 pub fn read_vmess(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> VmessRead {
-    let uuid = match r.str("username").map(parse_uuid) {
-        Some(Some(uuid)) => uuid,
-        found => {
-            let text = match found {
-                None => "`username` is required",
-                Some(_) => "`username` is not a valid UUID",
-            };
-            r.error(codes::E_INVALID_POLICY_PARAM, text.to_string());
-            [0; 16]
-        }
-    };
+    let uuid = read_uuid(r, "username");
     let cipher = r
         .choice(
             "encrypt-method",
@@ -95,7 +103,7 @@ pub fn read_vmess(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> VmessRe
     let ws = read_ws(r);
     VmessRead {
         spec: VmessSpec {
-            uuid: Secret::new(uuid),
+            uuid,
             cipher,
             tls,
             ws,

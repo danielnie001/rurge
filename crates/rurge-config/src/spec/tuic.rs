@@ -9,7 +9,7 @@ use super::reader::ParamReader;
 use super::required;
 use super::secret::Secret;
 use super::tls::TlsOpts;
-use super::vmess::parse_uuid;
+use super::vmess::read_uuid;
 use crate::diagnostic::codes;
 use crate::keystore::KeystoreItem;
 use crate::policy::PolicyKind;
@@ -57,7 +57,7 @@ pub fn read_tuic(
         let others = ["uuid", "password"].as_slice();
         (TuicVersion::V4 { token }, PolicyKind::TuicV5, others)
     } else {
-        let uuid = read_uuid(r);
+        let uuid = read_uuid(r, "uuid");
         let password = required(r, "password");
         let others = ["token"].as_slice();
         (TuicVersion::V5 { uuid, password }, PolicyKind::Tuic, others)
@@ -85,23 +85,6 @@ pub fn read_tuic(
         );
     }
     TuicSpec { tls, quic, version }
-}
-
-/// `uuid`: the hyphenated form (manual), or the same 32 digits without
-/// hyphens, as `vmess` takes its id.
-fn read_uuid(r: &mut ParamReader<'_>) -> Secret<[u8; 16]> {
-    let uuid = match r.str("uuid").map(parse_uuid) {
-        Some(Some(uuid)) => uuid,
-        found => {
-            let text = match found {
-                None => "`uuid` is required",
-                Some(_) => "`uuid` is not a valid UUID",
-            };
-            r.error(codes::E_INVALID_POLICY_PARAM, text.to_string());
-            [0; 16]
-        }
-    };
-    Secret::new(uuid)
 }
 
 #[cfg(test)]
