@@ -131,7 +131,7 @@ async fn v5_a_wrong_password_against_sing_box() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let (_sb, port, fixture) = sing_box(&bin, dir.path());
+    let (sb, port, fixture) = sing_box(&bin, dir.path());
     let out = v5(port, "nope", &fixture);
     let bound = Duration::from_secs(10);
     let tunnel = tokio::time::timeout(
@@ -142,7 +142,7 @@ async fn v5_a_wrong_password_against_sing_box() {
     .expect("the tunnel comes up or fails within the bound");
     match tunnel {
         // the refusal was in before the Connect went out
-        Err(err) => assert_eq!(err.to_string(), REFUSED),
+        Err(err) => assert_eq!(err.to_string(), REFUSED, "{}", sb.log_text()),
         Ok(mut tunnel) => {
             let write = tokio::time::timeout(bound, tunnel.write_all(b"interop"))
                 .await
@@ -151,7 +151,8 @@ async fn v5_a_wrong_password_against_sing_box() {
                 let text = e.to_string();
                 assert!(
                     text == REFUSED || text == "tuic: the server stopped the stream (code 0x0)",
-                    "{text}"
+                    "{text}\n{}",
+                    sb.log_text()
                 );
             }
             let mut buf = [0u8; 7];
@@ -159,14 +160,24 @@ async fn v5_a_wrong_password_against_sing_box() {
                 .await
                 .expect("the tunnel ends within the bound");
             match read {
-                Ok(n) => assert_eq!(n, 0, "a wrong password must relay nothing"),
-                Err(e) => assert_eq!(e.to_string(), REFUSED),
+                Ok(n) => assert_eq!(
+                    n,
+                    0,
+                    "a wrong password must relay nothing\n{}",
+                    sb.log_text()
+                ),
+                Err(e) => assert_eq!(e.to_string(), REFUSED, "{}", sb.log_text()),
             }
         }
     }
     let err = udp_until_refused(&out, udp_echo_server().await).await;
-    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-    assert_eq!(err.to_string(), REFUSED);
+    assert_eq!(
+        err.kind(),
+        io::ErrorKind::PermissionDenied,
+        "{}",
+        sb.log_text()
+    );
+    assert_eq!(err.to_string(), REFUSED, "{}", sb.log_text());
 }
 
 /// One chunk and many, each tunnel once the server answered its Connect
@@ -216,14 +227,23 @@ async fn v4_a_wrong_token_against_tuic_server() {
     .await
     .expect("the server answers within the bound");
     let Err(tcp) = tcp else {
-        panic!("a wrong token must not open a tunnel");
+        panic!(
+            "a wrong token must not open a tunnel\n{}",
+            server.log_text()
+        );
     };
     assert!(
         matches!(&tcp, OutboundError::Io(e) if e.kind() == io::ErrorKind::PermissionDenied),
-        "{tcp:?}"
+        "{tcp:?}\n{}",
+        server.log_text()
     );
-    assert_eq!(tcp.to_string(), REFUSED);
+    assert_eq!(tcp.to_string(), REFUSED, "{}", server.log_text());
     let udp = udp_until_refused(&out, udp_echo_server().await).await;
-    assert_eq!(udp.kind(), io::ErrorKind::PermissionDenied);
-    assert_eq!(udp.to_string(), REFUSED);
+    assert_eq!(
+        udp.kind(),
+        io::ErrorKind::PermissionDenied,
+        "{}",
+        server.log_text()
+    );
+    assert_eq!(udp.to_string(), REFUSED, "{}", server.log_text());
 }

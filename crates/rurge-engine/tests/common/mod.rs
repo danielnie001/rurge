@@ -215,7 +215,10 @@ pub async fn connect_via_socks5(proxy: SocketAddr, host: &str, port: u16) -> Tcp
     let mut s = TcpStream::connect(proxy).await.unwrap();
     s.write_all(&[5, 1, 0]).await.unwrap();
     let mut method = [0u8; 2];
-    s.read_exact(&mut method).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), s.read_exact(&mut method))
+        .await
+        .expect("the proxy chooses a method")
+        .unwrap();
     assert_eq!(method, [5, 0]);
     let mut request = vec![5, 1, 0, 3, host.len() as u8];
     request.extend_from_slice(host.as_bytes());
@@ -295,7 +298,10 @@ pub async fn udp_associate(socks: SocketAddr) -> UdpAssociation {
     let mut control = TcpStream::connect(socks).await.unwrap();
     control.write_all(&[5, 1, 0]).await.unwrap();
     let mut method = [0u8; 2];
-    control.read_exact(&mut method).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), control.read_exact(&mut method))
+        .await
+        .expect("the proxy chooses a method")
+        .unwrap();
     assert_eq!(method, [5, 0]);
     let SocketAddr::V4(me) = socket.local_addr().unwrap() else {
         panic!("loopback is v4")
@@ -305,7 +311,10 @@ pub async fn udp_associate(socks: SocketAddr) -> UdpAssociation {
     request.extend_from_slice(&me.port().to_be_bytes());
     control.write_all(&request).await.unwrap();
     let mut reply = [0u8; 10];
-    control.read_exact(&mut reply).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), control.read_exact(&mut reply))
+        .await
+        .expect("the proxy answers the UDP ASSOCIATE")
+        .unwrap();
     assert_eq!((reply[1], reply[3]), (0, 1), "{reply:?}");
     let relay = SocketAddr::from((
         [reply[4], reply[5], reply[6], reply[7]],

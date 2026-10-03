@@ -900,7 +900,10 @@ mod tests {
             ),
             (HostName::parse("2001:db8::1"), "[2001:db8::1]:53"),
         ] {
-            carrier.send_to(b"q", &Target::new(host, 53)).await.unwrap();
+            timeout(BOUND, carrier.send_to(b"q", &Target::new(host, 53)))
+                .await
+                .expect("a send within the bound")
+                .unwrap();
             assert_eq!(
                 udp_answer(carrier.as_ref()).await,
                 (b"q".to_vec(), target(echo))
@@ -918,10 +921,13 @@ mod tests {
                 "tuic: the host name is longer than 255 bytes",
             ),
         ] {
-            let err = carrier
-                .send_to(b"q", &Target::new(HostName::Domain(name), 53))
-                .await
-                .unwrap_err();
+            let err = timeout(
+                BOUND,
+                carrier.send_to(b"q", &Target::new(HostName::Domain(name), 53)),
+            )
+            .await
+            .expect("an outcome within the bound")
+            .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
             assert_eq!(err.to_string(), text);
         }
@@ -978,7 +984,10 @@ mod tests {
         let carrier = udp_carrier(&out).await;
         let (lost, kept) = (vec![1u8; 3000], vec![2u8; 3000]);
         for payload in [&lost[..], &kept, b"short"] {
-            carrier.send_to(payload, &target(echo)).await.unwrap();
+            timeout(BOUND, carrier.send_to(payload, &target(echo)))
+                .await
+                .expect("a send within the bound")
+                .unwrap();
         }
         // in the order they came: the first never came whole
         assert_eq!(udp_answer(carrier.as_ref()).await.0, kept);
@@ -1277,14 +1286,20 @@ mod tests {
         let deadline = Instant::now() + BOUND;
         let err = loop {
             assert!(Instant::now() < deadline, "no send failed");
-            match carrier.send_to(b"x", &target(echo)).await {
+            let sent = timeout(BOUND, carrier.send_to(b"x", &target(echo)))
+                .await
+                .expect("an outcome within the bound");
+            match sent {
                 Ok(()) => tokio::time::sleep(Duration::from_millis(5)).await,
                 Err(e) => break e,
             }
         };
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(err.to_string(), "tuic: authentication failed");
-        carrier.send_to(b"y", &target(echo)).await.unwrap();
+        timeout(BOUND, carrier.send_to(b"y", &target(echo)))
+            .await
+            .expect("a send within the bound")
+            .unwrap();
         eventually("the next authentication", || fake.auths().len() == 2).await;
         assert!(fake.auths().iter().all(|auth| !auth.accepted));
         assert!(fake.udp_packets().is_empty());
@@ -1407,7 +1422,10 @@ mod tests {
         let carrier = udp_carrier(&out).await;
         let before = rerouted.asked();
         for i in 0..50u8 {
-            carrier.send_to(&[i], &to).await.unwrap();
+            timeout(BOUND, carrier.send_to(&[i], &to))
+                .await
+                .expect("a send within the bound")
+                .unwrap();
         }
         let asked = rerouted.asked() - before;
         assert!(asked <= 3, "asked {asked} times for 50 packets");
@@ -1424,7 +1442,10 @@ mod tests {
         let rerouted = Arc::new(Rerouted::new());
         let out = built(&fake, rerouted.clone(), heartbeat::every(Version::V5));
         let carrier = udp_carrier(&out).await;
-        carrier.send_to(b"first", &to).await.unwrap();
+        timeout(BOUND, carrier.send_to(b"first", &to))
+            .await
+            .expect("a send within the bound")
+            .unwrap();
         *rerouted.route.lock().unwrap() = Arc::new(2);
         let deadline = Instant::now() + BOUND;
         while !fake.udp_packets().iter().any(|p| p.connection == 1) {
@@ -1432,7 +1453,10 @@ mod tests {
                 Instant::now() < deadline,
                 "the carrier never left its connection"
             );
-            carrier.send_to(b"probe", &to).await.unwrap();
+            timeout(BOUND, carrier.send_to(b"probe", &to))
+                .await
+                .expect("a send within the bound")
+                .unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(fake.connections(), 2);
@@ -1594,14 +1618,17 @@ mod tests {
             });
             let out = user(&fake);
             let carrier = udp_carrier(&out).await;
-            let err = carrier
-                .send_to(&vec![0u8; 65_536], &target(echo))
+            let err = timeout(BOUND, carrier.send_to(&vec![0u8; 65_536], &target(echo)))
                 .await
+                .expect("an outcome within the bound")
                 .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
             assert_eq!(err.to_string(), "tuic: a datagram longer than 65535 bytes");
             let long = Target::new(HostName::Domain("a".repeat(256)), 53);
-            let err = carrier.send_to(b"q", &long).await.unwrap_err();
+            let err = timeout(BOUND, carrier.send_to(b"q", &long))
+                .await
+                .expect("an outcome within the bound")
+                .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
             assert!(fake.udp_packets().is_empty());
             udp_round_trip(carrier.as_ref(), echo, b"still").await;
@@ -1642,9 +1669,9 @@ mod tests {
         let out = user(&fake);
         let carrier = udp_carrier(&out).await;
         udp_round_trip(carrier.as_ref(), echo, MARK).await;
-        let err = carrier
-            .send_to(&MARK.repeat(5000), &target(echo))
+        let err = timeout(BOUND, carrier.send_to(&MARK.repeat(5000), &target(echo)))
             .await
+            .expect("an outcome within the bound")
             .unwrap_err();
         // no packet (its SIZE says otherwise), then one for no association:
         // read before the echo that follows them
