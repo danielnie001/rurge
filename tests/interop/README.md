@@ -1,6 +1,6 @@
 # rurge-interop
 
-`rurge-interop` 是仅供测试使用的工作区成员（`publish = false`），不对外发布，也不是任何其它 crate 的依赖。它把 [sing-box](https://sing-box.sagernet.org/)、[xray](https://github.com/XTLS/Xray-core)、[shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust) 的 `ssserver`、Surge 官方的 `snell-server` 与 [TrustTunnel](https://github.com/TrustTunnel/TrustTunnel) 的 `trusttunnel_endpoint` 作为参照实现，以回环子进程的方式拉起来，驱动 rurge 的 `http` / `https` / `socks5` / `trojan` / `vmess` / `anytls` / `wireguard` / `ss` / `snell` / `h2-connect` / `trust-tunnel` / `hysteria2` 出站，以及包在 Shadow TLS 里的 `trojan`，去连它们，验证 rurge 与真实的第三方实现互通。xray 只用来跑 `vmess`：VMess 协议由 xray 所在的这一脉实现定义，sing-box 的实现是重写，手写的编解码需要两个独立参照互相印证（M2 设计 M2-D5）。
+`rurge-interop` 是仅供测试使用的工作区成员（`publish = false`），不对外发布，也不是任何其它 crate 的依赖。它把 [sing-box](https://sing-box.sagernet.org/)、[xray](https://github.com/XTLS/Xray-core)、[shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust) 的 `ssserver`、Surge 官方的 `snell-server`、[TrustTunnel](https://github.com/TrustTunnel/TrustTunnel) 的 `trusttunnel_endpoint` 与 TUIC 官方 [tuic](https://github.com/tuic-protocol/tuic) 0.8.5 的 `tuic-server` 作为参照实现，以回环子进程的方式拉起来，驱动 rurge 的 `http` / `https` / `socks5` / `trojan` / `vmess` / `anytls` / `wireguard` / `ss` / `snell` / `h2-connect` / `trust-tunnel` / `hysteria2` / `tuic-v5` / `tuic` 出站，以及包在 Shadow TLS 里的 `trojan`，去连它们，验证 rurge 与真实的第三方实现互通。xray 只用来跑 `vmess`：VMess 协议由 xray 所在的这一脉实现定义，sing-box 的实现是重写，手写的编解码需要两个独立参照互相印证（M2 设计 M2-D5）。tuic-server 只用来跑 `tuic`（TUIC v4）：sing-box 只实现 v5（M7 设计 M7-D3）。
 
 ## 固定版本
 
@@ -14,12 +14,12 @@
 
 ## 本地运行
 
-本地默认不安装 sing-box、xray、shadowsocks-rust、snell-server 与 TrustTunnel endpoint：`cargo test -p rurge-interop` 会正常通过，sing-box 的二十四个互操作用例、xray 的两个、shadowsocks-rust 的两个、snell-server 的四个与 TrustTunnel endpoint 的四个互操作用例各打印一行 `skipping …` 后直接返回（各夹具自身的单元测试——配置渲染、"配置绝不碰本机"的安全守卫、取空闲端口——照常运行并断言）。要在本机真正跑 sing-box 的用例，二选一：
+本地默认不安装 sing-box、xray、shadowsocks-rust、snell-server、TrustTunnel endpoint 与 tuic-server：`cargo test -p rurge-interop` 会正常通过，sing-box 的二十七个互操作用例、xray 的两个、shadowsocks-rust 的两个、snell-server 的四个、TrustTunnel endpoint 的四个与 tuic-server 的三个互操作用例各打印一行 `skipping …` 后直接返回（各夹具自身的单元测试——配置渲染、"配置绝不碰本机"的安全守卫、取空闲端口——照常运行并断言）。要在本机真正跑 sing-box 的用例，二选一：
 
 - 自行安装 sing-box 1.14.2，让 `sing-box` / `sing-box.exe` 出现在 `PATH` 上；或
 - 不安装到 `PATH`，改用 `RURGE_TEST_SING_BOX=<sing-box 可执行文件路径> cargo test -p rurge-interop`。
 
-xray、shadowsocks-rust、snell-server 与 TrustTunnel endpoint 的本机运行方式同理，见下面「xray」「shadowsocks-rust」「snell-server」「TrustTunnel」四节。
+xray、shadowsocks-rust、snell-server、TrustTunnel endpoint 与 tuic-server 的本机运行方式同理（tuic-server 只认环境变量，不在 `PATH` 上找），见下面「xray」「shadowsocks-rust」「snell-server」「TrustTunnel」「tuic-server」五节。
 
 ## 环境变量
 
@@ -28,7 +28,8 @@ xray、shadowsocks-rust、snell-server 与 TrustTunnel endpoint 的本机运行�
 - `RURGE_TEST_SSSERVER`：shadowsocks-rust 的 `ssserver` 可执行文件的路径，优先于 `PATH` 查找。
 - `RURGE_TEST_SNELL_SERVER`：Surge 官方 `snell-server` 可执行文件的路径，优先于 `PATH` 查找。
 - `RURGE_TEST_TRUSTTUNNEL`：TrustTunnel `trusttunnel_endpoint` 可执行文件的路径，优先于 `PATH` 查找。
-- `RURGE_INTEROP_REQUIRED=1`：找不到二进制时让用例直接失败，而不是打印 `skipping …` 后跳过；对 sing-box、xray、shadowsocks-rust 与 sshd 各夹具都生效，对 snell-server 只在 Linux 上生效（它只有 Linux 版），对 TrustTunnel endpoint 只在 Linux 与 macOS 上生效（它没有 Windows 版）。CI 会设置它，本机一般不需要。
+- `RURGE_TEST_TUIC_SERVER`：tuic 0.8.5 的 `tuic-server` 可执行文件的路径；只认这个变量，不在 `PATH` 上找（`PATH` 上的 `tuic-server` 多半是 1.x 版，只说 TUIC v5，配置也不同）。
+- `RURGE_INTEROP_REQUIRED=1`：找不到二进制时让用例直接失败，而不是打印 `skipping …` 后跳过；对 sing-box、xray、shadowsocks-rust 与 sshd 各夹具都生效，对 snell-server 只在 Linux 上生效（它只有 Linux 版），对 TrustTunnel endpoint 只在 Linux 与 macOS 上生效（它没有 Windows 版），对 tuic-server 只在 Linux 上生效（CI 只在 Linux 上装它）。CI 会设置它，本机一般不需要。
 
 ## 覆盖范围
 
@@ -56,7 +57,9 @@ xray、shadowsocks-rust、snell-server 与 TrustTunnel endpoint 的本机运行�
 
 - Hysteria 2（`tests/sing_box_hysteria2.rs` 的五个用例，阶段 2 / M7a）：sing-box 的 `hysteria2` 入站只听回环上的一个 UDP 端口；证书签给 `127.0.0.1`、由夹具的 CA 签发，rurge 信任这个 CA（服务器写成 IP，不发 SNI）；`tls.alpn` 写 `["h3"]`；一个用户（`users[].password`）；不配 `masquerade`（口令不对时 sing-box 回 404）、不限带宽。覆盖 TCP 的单块、跨多块（100 000 字节）与每个方向 9 MiB 同时往返（超过 rurge 每条流 8 MiB 的接收窗口：回来的数据要靠 rurge 边读边放出的流控额度），这三项再用写了 `download-bandwidth=100` 的策略做一遍（sing-box 于是按这个速率用 Brutal 发，不用 BBR）；UDP：同一条连接上两个载体（各占一个会话号）各自往返几个字节与 3000 字节的数据报，后者两个方向都按 Hysteria 的分片走（sing-box 把应答切成约 1200 字节一片，不回超过 4096 字节的消息；macOS 的回环不送超过 9216 字节的数据报）；口令错误时 TCP 与 UDP 都以 `hysteria2: authentication failed` 失败；`obfs` 的 `salamander` 与 `gecko`（包长用 sing-box 的缺省 512–1200 字节，与 rurge 相同）两种混淆下的 TCP（单块与跨多块）与 UDP。
 
-**不覆盖端口跳跃**：`port-hopping` 要在服务端用防火墙把一段端口 DNAT 到它的监听端口（Hysteria 文档的部署方式），夹具不改本机的防火墙与网络设置，回环上做不到；端口跳跃由回环假服务端（`rurge_proto_quic::testing::FakeHysteria2` 同时监听几个端口，跳跃间隔经只用于测试的入口缩短）与手工验收（`docs/acceptance/phase2-manual.md` 的 M7a 一节）覆盖。
+- TUIC v5（`tests/tuic.rs` 里 `v5_…_against_sing_box` 的三个用例，阶段 2 / M7b）：sing-box 的 `tuic` 入站（只实现 v5）只听回环上的一个 UDP 端口，证书同 Hysteria 2 一节；`tls.alpn` 写 `["h3"]`（rurge 没写 `alpn` 时发 `h3`，QUIC 服务端不选协议时握手失败）；一个用户（`users[]` 的 `uuid` 与 `password`）；拥塞控制、认证时限（3 秒）、心跳（10 秒）与 0-RTT（关）都用 sing-box 的缺省。覆盖 TCP 的单块、跨多块（100 000 字节）与每个方向 9 MiB 同时往返（超过 rurge 每条流 8 MiB 的接收窗口）；UDP：同一条连接上两个载体（各占一个关联号）各自往返几个字节与 3000 字节的数据报，后者两个方向都按 TUIC 的分片走（sing-box 把应答切成至多 1197 字节的数据报）；口令错误：sing-box 不回应 v5 的认证，令牌不对时以码 0、空原因关闭连接（它因任何错误关连接都是这样），而且常常先结束手上挂着的 Connect（STOP_SENDING 0 加 FIN），所以 TCP 隧道照样先建立（v5 的隧道一律立即交出），然后什么也没转发就结束——关闭先到时读到 `tuic: authentication failed`，Connect 的结束先到时读到流的结束，写可能遇到 `tuic: the server stopped the stream (code 0x0)`；UDP 没有这种竞争，发现连接被这样关闭的那次发送以 `tuic: authentication failed` 失败。**只覆盖 `native` 模式**：sing-box 的 TUIC 服务端总是接受 QUIC 数据报（配置里没有关掉它的项），`quic` 模式（服务端不接受数据报时每个包一条单向流）只由回环假服务端（`rurge_proto_quic::testing::FakeTuic` 的 `no_datagrams`）覆盖。
+
+**不覆盖端口跳跃**：`port-hopping`（Hysteria 2 与 TUIC）要在服务端用防火墙把一段端口 DNAT 到它的监听端口（Hysteria 文档的部署方式），夹具不改本机的防火墙与网络设置，回环上做不到；端口跳跃由回环假服务端（`rurge_proto_quic::testing::FakeHysteria2` 与 `FakeTuic` 同时监听几个端口，跳跃间隔经只用于测试的入口缩短）与手工验收（`docs/acceptance/phase2-manual.md` 的 M7a 与 M7b 两节）覆盖。
 
 **不覆盖 HTTP/2 的 `h2-connect`**：sing-box 1.14.2 的 `http` 入站只说 HTTP/1（TLS 握手之后按 HTTP/1.x 读请求，不设 ALPN、没有 h2 代码路径；HTTP/2 要到 1.15.0，目前仍是预发布），所以 `h2-connect` 的普通 CONNECT 改由 TrustTunnel endpoint 覆盖（见下面「TrustTunnel」一节）。
 
@@ -145,6 +148,22 @@ CI 只在 Linux 与 macOS 上下载、校验并设置 `RURGE_TEST_TRUSTTUNNEL`�
 
 渲染出的配置（`rurge_interop::trusttunnel::render`）是三个 TOML 文件：`vpn.toml`（`listen_address = "127.0.0.1:<端口>"`、`ipv6_available = false`、只开 `[listen_protocols.http2]`、`[forward_protocol]` 为 `direct`，以及 `allow_private_network_connections = true`——默认值 `false` 会让 endpoint 拒绝连回环上的 echo）、`hosts.toml`（一个主机 `tt.test` 与证书、私钥的绝对路径）与 `credentials.toml`（一个用户）。夹具的单元用例 `the_configuration_stays_on_the_loopback` 断言只监听回环、只开 HTTP/2。启动命令是 `trusttunnel_endpoint vpn.toml hosts.toml`，就绪与否看 TCP 端口能否连上。
 
+## tuic-server
+
+TUIC 官方 [tuic](https://github.com/tuic-protocol/tuic) 的服务端 `tuic-server` 是 `tuic`（TUIC v4）的参照：sing-box 只实现 v5（阶段 2 / M7 设计 M7-D3、M7-D6）。它是 GPL-3.0 程序，只作为外部进程运行，rurge 不链接、不复制它的任何代码。互操作测试固定 **0.8.5**（2022-07-30 发布），只在 Linux 上用这一个资产：
+
+| 平台 | 资产 | SHA-256 |
+| ---- | ---- | ------- |
+| Linux (x86_64，静态链接的 musl 版) | `tuic-server-0.8.5-x86_64-linux-musl`（可执行文件本身，不是压缩包） | **尚未钉住，待项目所有者填写**（见下） |
+
+**SHA-256 尚未钉住**：GitHub 发布 API 给这个版本的每个资产的 `digest` 都是 `null`（2022 年上传的资产没有），发布页也不显示校验和，而本仓库的规矩是不在本机下载二进制来自己算。所以 `.github/workflows/ci.yml` 里这一步的 `sha=` 是一个占位值，**在项目所有者填上真实的值之前，Linux 的 CI 任务会在这一步失败**（Windows 与 macOS 的任务不受影响）。发布里每个二进制旁边都有一个 `sha256sum` 格式的同名校验文件（`tuic-server-0.8.5-x86_64-linux-musl.sha256sum`）：在可信的机器上读它，或下载该二进制自己算一次，把 64 位十六进制填进 `sha=`，再填进上表。
+
+`tests/tuic.rs` 里 `v4_…_against_tuic_server` 的三个用例覆盖：TCP 的单块与跨多块（100 000 字节）往返（每条隧道都在服务端应答 `04 ff 00` 之后才交出）；UDP 往返一个回环 UDP 回显两次（v4 不分片，整包走 QUIC 数据报；服务端经它那一个双栈 socket 把 IPv4 来源写成 IPv4 映射的 IPv6 地址，rurge 按 IPv4 读，用例核对来源就是回显的地址）；token 错误时 TCP 请求以 `tuic: authentication failed` 失败（服务端以 0xfffffff1 关闭连接），UDP 发送同样。0.8.5 同样总是接受 QUIC 数据报，**`quic` 模式只由回环假服务端覆盖**。
+
+CI 只在 Linux 上下载、校验并设置 `RURGE_TEST_TUIC_SERVER`；Windows 与 macOS 上这三个用例照常编译，运行时打印 `skipping …` 后返回（`RURGE_INTEROP_REQUIRED=1` 对 tuic-server 只在 Linux 上生效）。本机不安装它：只认 `RURGE_TEST_TUIC_SERVER`，不在 `PATH` 上找（`PATH` 上的 `tuic-server` 多半是 1.x 版，只说 v5，配置也不同），没设就跳过；这个 crate 不会下载或安装它。
+
+渲染出的配置（`rurge_interop::tuic_server::render`）是一个 JSON 对象，只有 0.8.5 认识的七个键（它拒绝不认识的键）：`port`、`token`（一个 token）、`certificate` 与 `private_key`（夹具的证书与私钥，PEM 文件的路径）、`ip`（`127.0.0.1`）、`alpn`（`["h3"]`：它的缺省是不选 ALPN，rurge 的 QUIC 客户端于是握手失败）与 `log_level`（`info`）；其余用它的缺省（Cubic、空闲 15 秒、认证时限 1 秒）。启动命令是 `tuic-server -c <配置文件>`；它没有 TCP 端口可探，就绪与否看日志里出现 `Server started`（`info` 级，绑定端口之后才打印）。夹具的单元用例 `the_configuration_stays_on_the_loopback` 与 `the_configuration_is_written_as_tuic_server_reads_it` 断言只监听回环、只写这七个键。它转发 UDP 用的 socket 绑在所有地址上的一个空闲端口（`[::]:0`；0.8.5 总是这样，没有配置项）。
+
 ## sshd
 
 `tests/sshd.rs` 用 OpenSSH 的 `sshd` 验证 `ssh` 出站（阶段 2 M4 设计第 10 节）：OpenSSH 的默认算法，以及只开 Surge 手册要求的 `curve25519-sha256` 与 `aes128-gcm@openssh.com` 两种。不以 root 运行的 `sshd` 只能让运行它的用户登录，所以用例用密钥登录（用户名取环境变量 `USER`），并且只在 Unix 上编译。
@@ -155,6 +174,6 @@ CI 只在 Linux 与 macOS 上下载、校验并设置 `RURGE_TEST_TRUSTTUNNEL`�
 
 ## 安全约束
 
-- 夹具渲染出的 sing-box 配置只有 `log` / `inbounds` / `outbounds` 三个顶层键（WireGuard 的配置另有 `endpoints`）；每个入站只监听 `127.0.0.1`（`hysteria2` 入站的 UDP 端口也是，同一份配置里另有一个只用来判断就绪的 `mixed` 入站；`rurge_interop::render_hysteria2` 的单元测试 `the_hysteria2_configuration_never_touches_the_machine` 断言这些）；唯一的出站是 `direct`。WireGuard 端点在用户态运行（`system: false`），它的 UDP 端口开在所有地址上（端点没有监听地址这一项；`rurge_interop::render_wireguard` 的单元测试 `the_wireguard_configuration_never_touches_the_machine` 断言其余各项）。xray 配置同样只有这三个顶层键，唯一的出站是 `freedom`。`ssserver` 的配置只有 `servers`，每个服务端只听 `127.0.0.1`（TCP 与同号的 UDP）。`snell-server` 的配置只有 `[snell-server]` 一节，只听 `127.0.0.1`。TrustTunnel endpoint 只听 `127.0.0.1`、只开 HTTP/2，转发只有 `direct`；`allow_private_network_connections = true` 只是为了让它连回环上的 echo。任何地方都不出现 `set_system_proxy`、`tun`、`auto_route` 这些键（`rurge_interop::render` 与 `rurge_interop::xray::render` 的单元测试 `the_configuration_never_touches_the_machine` 各自断言这一点）；`shadowtls` 入站的 `handshake.server` 恒为 `127.0.0.1`（夹具的单元用例断言）。
-- 每个用例的连接目标都是回环 IP 字面量（`127.0.0.1` 上的 echo / 测试服务器；WireGuard 用例在隧道里连的是 sing-box 自己的隧道地址 `10.9.0.1`，由 sing-box 映射到它的 `127.0.0.1`），sing-box、xray、`ssserver`、`snell-server` 与 TrustTunnel endpoint 因此既不解析域名也不会访问公网。
-- 这个 crate 本身不下载、不安装任何东西；本机是否装有 sing-box、xray、shadowsocks-rust、snell-server 或 TrustTunnel endpoint 由项目所有者决定，没装就跳过。
+- 夹具渲染出的 sing-box 配置只有 `log` / `inbounds` / `outbounds` 三个顶层键（WireGuard 的配置另有 `endpoints`）；每个入站只监听 `127.0.0.1`（`hysteria2` 与 `tuic` 入站的 UDP 端口也是，同一份配置里另有一个只用来判断就绪的 `mixed` 入站；`rurge_interop::render_hysteria2` 与 `rurge_interop::render_tuic` 的单元测试 `the_hysteria2_configuration_never_touches_the_machine` 与 `the_tuic_configuration_never_touches_the_machine` 断言这些）；唯一的出站是 `direct`。WireGuard 端点在用户态运行（`system: false`），它的 UDP 端口开在所有地址上（端点没有监听地址这一项；`rurge_interop::render_wireguard` 的单元测试 `the_wireguard_configuration_never_touches_the_machine` 断言其余各项）。xray 配置同样只有这三个顶层键，唯一的出站是 `freedom`。`ssserver` 的配置只有 `servers`，每个服务端只听 `127.0.0.1`（TCP 与同号的 UDP）。`snell-server` 的配置只有 `[snell-server]` 一节，只听 `127.0.0.1`。TrustTunnel endpoint 只听 `127.0.0.1`、只开 HTTP/2，转发只有 `direct`；`allow_private_network_connections = true` 只是为了让它连回环上的 echo。tuic-server 的配置只有它认识的七个键，只听 `127.0.0.1`（它转发 UDP 的 socket 绑在所有地址上的一个空闲端口，0.8.5 没有配置项）。任何地方都不出现 `set_system_proxy`、`tun`、`auto_route` 这些键（`rurge_interop::render` 与 `rurge_interop::xray::render` 的单元测试 `the_configuration_never_touches_the_machine` 各自断言这一点）；`shadowtls` 入站的 `handshake.server` 恒为 `127.0.0.1`（夹具的单元用例断言）。
+- 每个用例的连接目标都是回环 IP 字面量（`127.0.0.1` 上的 echo / 测试服务器；WireGuard 用例在隧道里连的是 sing-box 自己的隧道地址 `10.9.0.1`，由 sing-box 映射到它的 `127.0.0.1`），sing-box、xray、`ssserver`、`snell-server`、TrustTunnel endpoint 与 `tuic-server` 因此既不解析域名也不会访问公网。
+- 这个 crate 本身不下载、不安装任何东西；本机是否装有 sing-box、xray、shadowsocks-rust、snell-server、TrustTunnel endpoint 或 tuic-server 由项目所有者决定，没装就跳过。

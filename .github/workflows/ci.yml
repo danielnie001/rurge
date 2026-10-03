@@ -139,6 +139,33 @@ jobs:
           [ -n "$bin" ] || { echo "no snell-server binary in $asset"; exit 1; }
           chmod +x "$bin"
           echo "RURGE_TEST_SNELL_SERVER=$bin" >> "$GITHUB_ENV"
+      - name: Install the tuic 0.8.5 server for the TUIC v4 interoperability tests
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=0.8.5
+          asset="tuic-server-$version-x86_64-linux-musl"
+          # PLACEHOLDER: GitHub publishes no `digest` for this release's
+          # assets, so the SHA-256 is not pinned yet. The step fails until the
+          # owner writes the asset's SHA-256 here (tests/interop/README.md,
+          # "tuic-server").
+          sha=FILL-IN-THE-SHA-256-OF-tuic-server-0.8.5-x86_64-linux-musl
+          if ! [[ "$sha" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "tuic-server: no SHA-256 is pinned for $asset; see tests/interop/README.md"
+            exit 1
+          fi
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 --retry-all-errors -o "$asset" "https://github.com/tuic-protocol/tuic/releases/download/$version/$asset"
+          actual=$(sha256sum "$asset" | cut -d' ' -f1)
+          if [ "$actual" != "$sha" ]; then
+            echo "tuic-server checksum mismatch: expected $sha, got $actual"
+            exit 1
+          fi
+          mkdir -p tuic-server
+          mv "$asset" tuic-server/tuic-server
+          chmod +x tuic-server/tuic-server
+          echo "RURGE_TEST_TUIC_SERVER=$PWD/tuic-server/tuic-server" >> "$GITHUB_ENV"
       - name: Install the TrustTunnel endpoint for the HTTP/2 interoperability tests
         if: runner.os != 'Windows'
         shell: bash

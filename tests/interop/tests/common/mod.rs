@@ -82,6 +82,63 @@ pub async fn roundtrip(out: &OutboundRef, echo: SocketAddr) {
     assert_eq!(&buf, b"interop");
 }
 
+/// `len` bytes each way at once through one tunnel. Bounded like
+/// `roundtrip`, by a minute.
+pub async fn transfer(out: &OutboundRef, echo: SocketAddr, len: usize) {
+    let bound = std::time::Duration::from_secs(60);
+    let payload: Vec<u8> = (0..len).map(|i| (i % 253) as u8).collect();
+    let stream = tokio::time::timeout(
+        bound,
+        out.connect_tcp(&target(echo), &ConnectOpts::default()),
+    )
+    .await
+    .expect("the tunnel is established within the bound")
+    .expect("the tunnel is established");
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut back = vec![0u8; len];
+    let both = async {
+        tokio::join!(async { writer.write_all(&payload).await.unwrap() }, async {
+            reader.read_exact(&mut back).await.unwrap()
+        })
+    };
+    tokio::time::timeout(bound, both)
+        .await
+        .expect("the payload makes it there and back within the bound");
+    assert!(back == payload, "the echo differs");
+}
+
+/// Two carriers of one policy at once, each a UDP session of its own on
+/// the policy's connection, each with payloads of its own (an answer handed
+/// to the other carrier would show): a few bytes, then 3000 — more than a
+/// QUIC datagram holds, so a protocol that splits packets sends them in
+/// fragments both ways (macOS carries no loopback datagram past 9216).
+/// Bounded like `roundtrip`.
+pub async fn udp_side_by_side(out: &OutboundRef, echo: SocketAddr) {
+    let bound = std::time::Duration::from_secs(10);
+    let mut carriers = Vec::new();
+    for _ in 0..2 {
+        let carrier = tokio::time::timeout(bound, out.open_udp(&ConnectOpts::default()))
+            .await
+            .expect("the carrier opens within the bound")
+            .expect("the carrier opens");
+        carriers.push(carrier);
+    }
+    let small = |n: u8| vec![n; 7];
+    let large = |n: u8| -> Vec<u8> { (0..3000u32).map(|i| (i as u8) ^ n).collect() };
+    for payloads in [[small(1), small(2)], [large(1), large(2)]] {
+        for (carrier, payload) in carriers.iter().zip(&payloads) {
+            carrier.send_to(payload, &target(echo)).await.unwrap();
+            let mut buf = vec![0u8; 65536];
+            let (n, from) = tokio::time::timeout(bound, carrier.recv_from(&mut buf))
+                .await
+                .expect("the echo comes back within the bound")
+                .unwrap();
+            assert_eq!(from, target(echo));
+            assert!(buf[..n] == payload[..], "the echo differs ({n} bytes)");
+        }
+    }
+}
+
 /// One datagram to `echo` through a fresh UDP carrier of `out`, and its
 /// answer. Bounded like `roundtrip`.
 pub async fn udp_roundtrip(out: &OutboundRef, echo: SocketAddr) {

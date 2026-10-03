@@ -86,7 +86,7 @@ crates/
 │                            # 传输层（tls、shadow-tls、ws、obfs、h2 连接池）、
 │                            # http(s) socks5(-tls) trojan vmess anytls ss snell
 │                            # h2-connect trust-tunnel(h2) external
-├── rurge-proto-quic/        # ★ M7：quinn；QUIC 会话；hysteria2（M7a）tuic tuic-v5 masque trust-tunnel(h3)
+├── rurge-proto-quic/        # ★ M7：quinn；QUIC 会话；hysteria2（M7a）tuic tuic-v5（M7b）masque trust-tunnel(h3)
 ├── rurge-proto-ssh/         # ★ M4：russh；ssh
 ├── rurge-proto-wireguard/   # ★ M4：boringtun + smoltcp；wireguard
 ├── rurge-net/               # + quic 公共件（M7：UDP 层、拨号与 TLS、自写的 HTTP/3 客户端；rurge-dns 的 DoH3 / DoQ 与 rurge-proto-quic 共用）
@@ -393,7 +393,7 @@ Surge 手册没有定义这些端点的响应结构（PRD R5）：以收集到�
 | M4 | sing-box 的用户态 WireGuard 端点（含保留字节，对应 `client-id`）；系统 `sshd`（没有则跳过） |
 | M5 | 同上各服务端的 UDP |
 | M6 | 按 M6 细化设计 M6-D5：shadowsocks-rust v1.25.0（含 2022 与多用户，三平台）与 sing-box 的 `shadowsocks` 入站：`ss`；sing-box 的 `snell` 入站（1.14.0 起，只支持 v5 / v6；`version: 5` 同时接受 v4 客户端）：`snell`，三平台，CI 固定的 sing-box 为此从 1.14.1 升到 1.14.2（M6-D6）；官方 snell-server v5.0.1 只有 Linux 版，只在 Linux CI 跑；TrustTunnel endpoint v1.1.0（只有 Linux / macOS 版，只在这两个平台的 CI 跑）：`trust-tunnel`（h2），它的 TCP 模式是标准的 HTTP/2 CONNECT + Basic 认证，同时充当 `h2-connect` 普通 CONNECT 的参照——sing-box 1.14.2 的 `http` 入站只说 HTTP/1（HTTP/2 要到 1.15.0，仍是预发布），不用于 HTTP/2 族；CONNECT-UDP over HTTP/2 与 obfs 没有可用的预编译参考服务端，只有回环假服务端与手工验收 |
-| M7 | 按 M7 细化设计 M7-D6：sing-box 1.14.2 的 `hysteria2` 入站（无混淆、Salamander、Gecko）与 `tuic` 入站（v5），三平台；官方 tuic 0.8.5（v4；GPL，只作为外部进程运行），只在 Linux CI；Vincent-bin/masque-server v0.13.0（MIT）：`masque`，只在 Linux / macOS CI；TrustTunnel endpoint v1.1.0 的 QUIC 监听：`trust-tunnel` 的 h3，只在 Linux / macOS CI。端口跳跃要在服务端做 DNAT，只有回环假服务端与手工验收。M7a 已接入 sing-box 的 `hysteria2` 入站（TCP、UDP、认证失败、两种混淆） |
+| M7 | 按 M7 细化设计 M7-D6：sing-box 1.14.2 的 `hysteria2` 入站（无混淆、Salamander、Gecko）与 `tuic` 入站（v5），三平台；官方 tuic 0.8.5（v4；GPL，只作为外部进程运行），只在 Linux CI；Vincent-bin/masque-server v0.13.0（MIT）：`masque`，只在 Linux / macOS CI；TrustTunnel endpoint v1.1.0 的 QUIC 监听：`trust-tunnel` 的 h3，只在 Linux / macOS CI。端口跳跃要在服务端做 DNAT，只有回环假服务端与手工验收。M7a 已接入 sing-box 的 `hysteria2` 入站（TCP、UDP、认证失败、两种混淆）；M7b 已接入 sing-box 的 `tuic` 入站（v5：TCP、UDP、认证失败；它总是接受 QUIC 数据报，`quic` 模式只有回环假服务端）与 tuic 0.8.5 的服务端（v4：TCP、UDP、认证失败；它的发布没有 GitHub 的 `digest`，CI 里的 SHA-256 待项目所有者填写） |
 
 **沿用的安全约束**：测试只用回环地址、不碰公网；不修改本机的系统代理，不注册真实服务；`external` 的测试只拉起测试自带的辅助程序。策略组算法用假出站与可控时钟做单元测试；订阅装配用本地文件与回环 HTTP 服务器。
 

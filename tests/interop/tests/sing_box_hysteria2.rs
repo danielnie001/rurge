@@ -37,70 +37,13 @@ fn profile(lines: &[String]) -> String {
     format!("[Proxy]\n{}[Rule]\nFINAL,DIRECT\n", lines.concat())
 }
 
-/// `len` bytes each way at once through one tunnel. Bounded like
-/// `roundtrip`, by a minute.
-async fn transfer(out: &OutboundRef, echo: SocketAddr, len: usize) {
-    let bound = Duration::from_secs(60);
-    let payload: Vec<u8> = (0..len).map(|i| (i % 253) as u8).collect();
-    let stream = tokio::time::timeout(
-        bound,
-        out.connect_tcp(&target(echo), &ConnectOpts::default()),
-    )
-    .await
-    .expect("the tunnel is established within the bound")
-    .expect("the tunnel is established");
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let mut back = vec![0u8; len];
-    let both = async {
-        tokio::join!(async { writer.write_all(&payload).await.unwrap() }, async {
-            reader.read_exact(&mut back).await.unwrap()
-        })
-    };
-    tokio::time::timeout(bound, both)
-        .await
-        .expect("the payload makes it there and back within the bound");
-    assert!(back == payload, "the echo differs");
-}
-
-/// Two carriers of one policy at once, each a UDP session of its own on the
-/// policy's connection, each with payloads of its own (an answer handed to
-/// the other session would show): a few bytes, then 3000 — more than a QUIC
-/// datagram holds, so they go in Hysteria fragments both ways (sing-box
-/// cuts its answers at about 1200 bytes and sends no message past 4096;
-/// macOS carries no loopback datagram past 9216). Bounded like `roundtrip`.
-async fn udp(out: &OutboundRef, echo: SocketAddr) {
-    let bound = Duration::from_secs(10);
-    let mut carriers = Vec::new();
-    for _ in 0..2 {
-        let carrier = tokio::time::timeout(bound, out.open_udp(&ConnectOpts::default()))
-            .await
-            .expect("the carrier opens within the bound")
-            .expect("the carrier opens");
-        carriers.push(carrier);
-    }
-    let small = |n: u8| vec![n; 7];
-    let large = |n: u8| -> Vec<u8> { (0..3000u32).map(|i| (i as u8) ^ n).collect() };
-    for payloads in [[small(1), small(2)], [large(1), large(2)]] {
-        for (carrier, payload) in carriers.iter().zip(&payloads) {
-            carrier.send_to(payload, &target(echo)).await.unwrap();
-            let mut buf = vec![0u8; 65536];
-            let (n, from) = tokio::time::timeout(bound, carrier.recv_from(&mut buf))
-                .await
-                .expect("the echo comes back within the bound")
-                .unwrap();
-            assert_eq!(from, target(echo));
-            assert!(buf[..n] == payload[..], "the echo differs ({n} bytes)");
-        }
-    }
-}
-
 /// TCP with one chunk and with many, then UDP, on the policy's one
 /// connection.
 async fn tcp_and_udp(out: &OutboundRef) {
     let (echo, udp_echo) = (echo_server().await, udp_echo_server().await);
     roundtrip(out, echo).await;
     roundtrip_big(out, echo).await;
-    udp(out, udp_echo).await;
+    udp_side_by_side(out, udp_echo).await;
 }
 
 /// Past rurge's receive window of a stream (8 MiB, phase 2 M7 design 3.2):
@@ -131,6 +74,9 @@ async fn tcp_against_sing_box() {
     }
 }
 
+/// Two sessions side by side; their 3000 bytes go in Hysteria fragments
+/// both ways (sing-box cuts its answers at about 1200 bytes and sends no
+/// message past 4096).
 #[tokio::test]
 async fn udp_against_sing_box() {
     let Some(bin) = sing_box_or_skip("udp_against_sing_box") else {
@@ -140,7 +86,7 @@ async fn udp_against_sing_box() {
     let (_sb, port, fixture) = server(&bin, dir.path(), None);
     let profile = profile(&[line("H", port, &format!("password={PASSWORD}"))]);
     let out = outbound(&profile, "H", Some(&fixture));
-    udp(&out, udp_echo_server().await).await;
+    udp_side_by_side(&out, udp_echo_server().await).await;
 }
 
 /// sing-box answers a wrong password as its masquerade would — 404 without

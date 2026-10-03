@@ -1,16 +1,17 @@
 //! A sing-box child process on the loopback, for interoperability tests
 //! (M1 design §8). Nothing here downloads, installs or configures anything
 //! outside a temporary directory: the rendered configuration listens on
-//! 127.0.0.1 only (a `hysteria2` inbound's UDP port too) — but for the UDP
-//! port of a WireGuard endpoint, which sing-box opens on every address — its
-//! single outbound is `direct`, and it never holds a key that touches the
-//! machine (`set_system_proxy`, `tun`, `auto_route`; a WireGuard endpoint
-//! runs in user space).
+//! 127.0.0.1 only (the UDP port of a `hysteria2` or `tuic` inbound too) —
+//! but for the UDP port of a WireGuard endpoint, which sing-box opens on
+//! every address — its single outbound is `direct`, and it never holds a key
+//! that touches the machine (`set_system_proxy`, `tun`, `auto_route`; a
+//! WireGuard endpoint runs in user space).
 
 pub mod shadowsocks_rust;
 pub mod snell_server;
 pub mod sshd;
 pub mod trusttunnel;
+pub mod tuic_server;
 pub mod xray;
 
 use base64::Engine;
@@ -327,6 +328,48 @@ pub fn render_hysteria2(inbound: &Hysteria2Inbound, port: u16, ready: u16) -> Va
     })
 }
 
+/// sing-box's `tuic` inbound, which speaks TUIC v5 only: QUIC with TLS (ALPN
+/// `h3`) and one user.
+pub struct TuicInbound {
+    /// The user's UUID, hyphenated.
+    pub uuid: String,
+    pub password: String,
+    /// No client certificate is asked for: `client_ca` must be `None`.
+    pub tls: TlsFiles,
+}
+
+/// The whole configuration for `inbound` on UDP port `port`, and a `mixed`
+/// inbound on `ready` that says when sing-box is up, as for `hysteria2`.
+/// sing-box's defaults stay — Cubic, a 3 s authentication timeout, a
+/// heartbeat every 10 s, no 0-RTT —, and its TUIC server always takes QUIC
+/// datagrams: nothing in its configuration turns them off.
+pub fn render_tuic(inbound: &TuicInbound, port: u16, ready: u16) -> Value {
+    assert!(
+        inbound.tls.client_ca.is_none(),
+        "the tuic inbound asks for no client certificate here"
+    );
+    json!({
+        "log": { "level": "warn", "timestamp": false },
+        "inbounds": [
+            {
+                "type": "tuic",
+                "tag": "tuic",
+                "listen": "127.0.0.1",
+                "listen_port": port,
+                "users": [{ "name": "u", "uuid": inbound.uuid, "password": inbound.password }],
+                "tls": {
+                    "enabled": true,
+                    "alpn": ["h3"],
+                    "certificate_path": inbound.tls.certificate,
+                    "key_path": inbound.tls.key,
+                },
+            },
+            { "type": "mixed", "tag": "ready", "listen": "127.0.0.1", "listen_port": ready },
+        ],
+        "outbounds": [{ "type": "direct", "tag": "direct" }],
+    })
+}
+
 /// A reference implementation running as a child on the loopback; killed and
 /// reaped on drop.
 pub(crate) struct Reference {
@@ -391,6 +434,31 @@ impl Reference {
         }
     }
 
+    /// Waits until the child's output holds `needle`: the readiness of a
+    /// reference with no TCP port to probe, which says when it listens.
+    pub(crate) fn wait_for_output(&mut self, needle: &str) {
+        let deadline = Instant::now() + READY_TIMEOUT;
+        loop {
+            if self.log_text().contains(needle) {
+                return;
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!(
+                    "{} exited early ({status}):\n{}",
+                    self.what,
+                    self.log_text()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} never said `{needle}`:\n{}",
+                self.what,
+                self.log_text()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     pub(crate) fn port(&self, index: usize) -> u16 {
         self.ports[index]
     }
@@ -441,6 +509,14 @@ impl SingBox {
     ) -> (SingBox, u16) {
         let (port, ready) = (free_udp_port(), free_port());
         let config = render_hysteria2(inbound, port, ready);
+        (SingBox::launch(binary, dir, &config, vec![ready]), port)
+    }
+
+    /// Starts `binary` with `inbound` on a UDP port of its own; that port,
+    /// once sing-box is up.
+    pub fn spawn_tuic(binary: &Path, dir: &Path, inbound: &TuicInbound) -> (SingBox, u16) {
+        let (port, ready) = (free_udp_port(), free_port());
+        let config = render_tuic(inbound, port, ready);
         (SingBox::launch(binary, dir, &config, vec![ready]), port)
     }
 
@@ -849,6 +925,77 @@ mod tests {
                 json!({ "type": name, "password": "obfs-pw" })
             );
         }
+    }
+
+    fn tuic() -> TuicInbound {
+        TuicInbound {
+            uuid: "0233d11c-15a4-47d3-ade3-48ffca0ce119".into(),
+            password: "tuic-pw".into(),
+            tls: TlsFiles {
+                certificate: "leaf.pem".into(),
+                key: "leaf.key".into(),
+                client_ca: None,
+            },
+        }
+    }
+
+    /// The QUIC inbound and the probe on 127.0.0.1, nothing of the machine's.
+    #[test]
+    fn the_tuic_configuration_never_touches_the_machine() {
+        let config = render_tuic(&tuic(), 4443, 1001);
+        let text = config.to_string();
+        for forbidden in ["set_system_proxy", "tun", "auto_route", "0.0.0.0", "::"] {
+            assert!(!text.contains(forbidden), "`{forbidden}` in {text}");
+        }
+        let top: Vec<&String> = config.as_object().unwrap().keys().collect();
+        assert_eq!(top, ["inbounds", "log", "outbounds"]);
+        for inbound in config["inbounds"].as_array().unwrap() {
+            assert_eq!(inbound["listen"], "127.0.0.1");
+        }
+        assert_eq!(
+            config["outbounds"],
+            json!([{ "type": "direct", "tag": "direct" }])
+        );
+    }
+
+    #[test]
+    fn the_tuic_inbound_is_rendered_as_sing_box_spells_it() {
+        let config = render_tuic(&tuic(), 4443, 1001);
+        let inbound = &config["inbounds"][0];
+        assert_eq!(
+            (&inbound["type"], &inbound["listen_port"]),
+            (&json!("tuic"), &json!(4443))
+        );
+        // a TUIC user is a name, a UUID and a password
+        assert_eq!(
+            inbound["users"],
+            json!([{ "name": "u", "uuid": "0233d11c-15a4-47d3-ade3-48ffca0ce119", "password": "tuic-pw" }])
+        );
+        // rurge offers `h3` unless told otherwise, and a QUIC server that
+        // picks no protocol fails its handshake (phase 2 M7 design 3.2)
+        assert_eq!(
+            inbound["tls"],
+            json!({
+                "enabled": true,
+                "alpn": ["h3"],
+                "certificate_path": "leaf.pem",
+                "key_path": "leaf.key",
+            })
+        );
+        // sing-box's defaults
+        for absent in [
+            "congestion_control",
+            "auth_timeout",
+            "zero_rtt_handshake",
+            "heartbeat",
+        ] {
+            assert!(inbound.get(absent).is_none(), "`{absent}` in {inbound}");
+        }
+        // the probe after it: sing-box starts its inbounds in order
+        assert_eq!(
+            config["inbounds"][1],
+            json!({ "type": "mixed", "tag": "ready", "listen": "127.0.0.1", "listen_port": 1001 })
+        );
     }
 
     #[test]

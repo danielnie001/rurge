@@ -235,3 +235,20 @@
 - [ ] 口令错误：把 `password` 改错一位，重载后访问 `https://example.com/`：请求失败，会话记录的 `error` 是 `hysteria2: authentication failed`；经 SOCKS5 UDP 的 DNS 查询同样失败、记录写同一个错误；**错误文本与日志（含 `--log-level verbose`）里都没有口令与混淆口令**。
 - [ ] 服务端不转发 UDP（官方 hysteria 的 `disableUDP: true`，认证应答里 `Hysteria-UDP: false`）：TCP 照常；经 SOCKS5 UDP 的查询失败，记录写 `hysteria2: the server does not allow UDP`。
 - [ ] 脱敏：`GET /v1/policies/detail?policy_name=H` 与 `GET /v1/profiles/current` 里 `password`、`salamander-password` 与 `gecko-password` 都是 `***`。
+
+## M7b　TUIC
+
+前置：同 M5a 一节的 SOCKS5 UDP 客户端；自己的 TUIC v5 节点（记下服务端实现与版本，如 tuic-server 1.x 或 sing-box 的 `tuic` 入站）与 TUIC v4 节点（官方 tuic 0.8.5 的服务端）——两种服务端都要配 `alpn` 为 `["h3"]`（它们缺省不配 ALPN，rurge 没写 `alpn` 时发 `h3`，服务端不选协议时握手失败）；Surge（对照一项用）；一个开了 UDP 的上游 SOCKS5 节点（`udp-relay=true`，`underlying-proxy` 一项用）。策略行照 Surge 的写法：`T5 = tuic-v5, <服务器>, <端口>, uuid=<UUID>, password=<口令>` 与 `T4 = tuic, <服务器>, <端口>, token=<token>`（证书不是公共 CA 签的时另加 `server-cert-fingerprint-sha256=` 或 `skip-cert-verify=true`）。每份配置 `[Rule]` 里 `FINAL,T5`（v4 的各项换成 `FINAL,T4`），`rurge check -c <配置>` 零错误（没有 `W0007`）。
+
+- [ ] v5 的 TCP：`curl -x http://127.0.0.1:<http-listen 端口> https://example.com/ -I` 与 `curl --socks5-hostname 127.0.0.1:<socks5-listen 端口> https://example.com/ -I` 都返回 200，请求记录里策略链是 `T5`、`error` 为空；同时打开几个网站，服务端日志（或抓包）只看到一条 QUIC 连接、一次认证。下载一个几百 MiB 的文件，速度与官方客户端（tuic-client 1.x 或 sing-box 的 `tuic` 出站）在同一量级，记下数字。
+- [ ] v5 的 UDP：不需要参数，经 SOCKS5 UDP 发 DNS 查询（如 Proxifier 代理 `nslookup example.com 8.8.8.8`）得到回答；查一个应答超过 1200 字节的记录（如 `dig +bufsize=4096 <TXT 记录很多的域名> TXT @8.8.8.8`）也得到完整的回答（放不进一个 QUIC 数据报的包分片走）；经它进行一次语音通话或联机游戏；用 NAT 类型检测工具（STUN）检测，结果是 Full Cone（节点的出口须是全锥）；抓包看到 UDP 走的是 QUIC 数据报（`native` 模式）。
+- [ ] v4（官方 tuic 0.8.5 的服务端）：同上两项换成 `T4`，TCP 与 UDP 都能往返。v4 不分片：经 SOCKS5 UDP 向任一 UDP 目标发一个 1500 字节的包，rurge 不发送它，会话记录写 `tuic: a datagram longer than <n> bytes`，同一条流里之后的小包照常；服务端的大应答同样放不进一个数据报（应答超过约 1.2 KB 的 DNS 查询，如上一项的 `dig`，得不到回答）。
+- [ ] 口令错误（v5）：把 `password` 改错一位，重载后 `curl -x http://… https://example.com/ -I`：CONNECT 先回 200（v5 的 Connect 没有应答），随后传输失败；会话记录的 `error` 是 `tuic: authentication failed`（服务端是 sing-box 时也可能是空的连接或 `tuic: the server stopped the stream (code 0x0)`——记下看到的是哪一个与服务端版本）；经 SOCKS5 UDP 的 DNS 查询失败、记录写 `tuic: authentication failed`。**错误文本与日志（含 `--log-level verbose`）里都没有 UUID 与口令**。
+- [ ] token 错误（v4）：把 `token` 改错一位，重载后 `curl` 得到 502，会话记录写 `tuic: authentication failed`；UDP 同样失败、写同一个错误；日志里没有 token。
+- [ ] 心跳：经 `T5` 开一个 SSH 会话后一分钟不输入（服务端是 tuic-server 1.x 时它的空闲超时只有 10 秒，v5 有转发时每 3 秒一个心跳）、经 `T4` 同样（0.8.5 的空闲超时 15 秒，v4 每 10 秒一个心跳）：会话都不断。
+- [ ] 端口跳跃：服务端把一段 UDP 端口转发到它的监听端口（手工加 DNAT / REDIRECT 规则，如 `iptables -t nat -A PREROUTING -p udp --dport 20000:20100 -j REDIRECT --to-ports <监听端口>`），策略写 `port-hopping=20000-20100, port-hopping-interval=10`：经它的下载进行中，抓包看到发往服务端的目的端口约每 10 秒换一个、下载不中断；`port-hopping-interval=2` 时 `rurge check` 报一条 `W0012`（按 5 秒）。
+- [ ] 不接受 QUIC 数据报的服务端（如果找得到；tuic 0.8.5、tuic-server 1.x 与 sing-box 都总是接受）：UDP 改走每个包一条单向流（`quic` 模式，抓包看不到 DATAGRAM 帧），DNS 查询照常有回答，同一连接上的 TCP 照常。
+- [ ] `underlying-proxy`：策略写 `underlying-proxy=<SOCKS5 节点>`，TCP 与 UDP 都能往返，SOCKS5 节点那边看到的是一条 UDP 关联（QUIC 经它的 UDP 走），没有 TCP 的 CONNECT；同时写了 `port-hopping` 时 `rurge check` 报 `E0018`。
+- [ ] 休眠唤醒与换网：经 `T5`（与 `T4`）的连接在用时，让电脑休眠再唤醒，或在 Wi-Fi 与有线 / 手机热点之间切换：约 30 秒内（QUIC 的空闲超时）之后的请求走新建的连接、恢复正常，不必重启 rurge；其间的请求可能超时失败。
+- [ ] 与 Surge 对照：同样的两行策略原样放进 Surge 的配置、连同两个服务端，rurge 与 Surge 都连得上（`alpn` 的缺省、凭据的写法相同）；只有一边连得上时记下服务端实现与版本，在兼容性清单登记差异。
+- [ ] 脱敏：`GET /v1/policies/detail?policy_name=T5`（与 `T4`）与 `GET /v1/profiles/current` 里 `uuid`、`password` 与 `token` 都是 `***`。
