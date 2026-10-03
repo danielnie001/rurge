@@ -5,6 +5,7 @@
 //! - The stream begins `05 01 ‖ ADDR`, written as it opens, and is the
 //!   tunnel at once: the server answers nothing. A target it cannot reach
 //!   shows as the stream ending.
+//! - While a tunnel lives, the connection's heartbeat goes (`heartbeat`).
 //! - With no answer to wait for, a connection gone unknown to us — its
 //!   server restarted — shows only once packets of the tunnel meet the
 //!   server. A request goes again on a new connection (`Failure::Lost`)
@@ -15,6 +16,7 @@
 use super::VERSION;
 use super::addr;
 use super::auth::Authenticated;
+use super::heartbeat::Relaying;
 use crate::session::{Failure, Lease};
 use quinn::{RecvStream, SendStream, WriteError};
 use rurge_net::connector::Target;
@@ -50,17 +52,23 @@ pub(super) async fn open(lease: Lease<Authenticated>, request: &[u8]) -> Result<
         WriteError::ConnectionLost(e) => Failure::Lost(state.ended(&e).into()),
         e => Failure::Failed(state.write_error(e).into()),
     })?;
-    Ok(Tunnel { send, recv, lease })
+    Ok(Tunnel {
+        send,
+        recv,
+        _relaying: state.relaying(),
+        lease,
+    })
 }
 
 /// A TCP connection through the server: the Connect's stream, on a
-/// connection its lease keeps. Shutdown sends the FIN the target then
-/// sees; reading goes on. Dropped, the stream ends both ways (a FIN, and
-/// STOP_SENDING for what is left unread). No `Debug`: nothing in it is
-/// worth printing.
+/// connection its lease keeps, counted among the connection's relays.
+/// Shutdown sends the FIN the target then sees; reading goes on. Dropped,
+/// the stream ends both ways (a FIN, and STOP_SENDING for what is left
+/// unread). No `Debug`: nothing in it is worth printing.
 pub(super) struct Tunnel {
     send: SendStream,
     recv: RecvStream,
+    _relaying: Relaying,
     /// Last: the stream ends before its connection may be closed.
     lease: Lease<Authenticated>,
 }

@@ -11,7 +11,10 @@ pub use hysteria2::{
     FakeHysteria2, Hysteria2Script, RecordedAuth, RecordedTcp, RecordedUdp, UdpMessage,
 };
 pub use obfs::RecordedFragment;
-pub use tuic::{FakeTuic, RecordedConnect, RecordedTuicAuth, TuicScript};
+pub use tuic::{
+    FakeTuic, RecordedConnect, RecordedDissociate, RecordedTuicAuth, RecordedTuicPacket,
+    TuicPacket, TuicScript,
+};
 
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{
