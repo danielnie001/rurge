@@ -89,6 +89,10 @@ pub struct TuicScript {
     /// Never carry out a Connect, nor answer a v4 one: what the client sends
     /// on it is dropped until it gives up.
     pub silent: bool,
+    /// v4: end the stream of a Connect it cannot carry out with no response,
+    /// rather than with the one that says so: the client finds the stream's
+    /// end where it reads the response.
+    pub no_response: bool,
     /// Take no QUIC datagrams at all: the transport parameter that allows
     /// them is not sent, and the client relays UDP on streams (`quic` mode).
     pub no_datagrams: bool,
@@ -1060,8 +1064,8 @@ async fn relay_answers(
 /// a name it has no `connect_to` for, a target that refuses — it ends as
 /// sing-box ends one whose target it cannot reach: STOP_SENDING (code 0)
 /// for what the client sends, FIN for what it reads; a v4 fake answers it
-/// could not reach the target, as tuic 0.8.5's server does, and ends the
-/// stream.
+/// could not reach the target, as tuic 0.8.5's server does — unless its
+/// script says no response —, and ends the stream.
 async fn relay(
     mut send: SendStream,
     mut recv: RecvStream,
@@ -1097,7 +1101,9 @@ async fn relay(
     let v4 = shared.version == V4;
     let Some(mut upstream) = upstream else {
         if v4 {
-            let _ = send.write_all(&[V4, RESPONSE, FAILED]).await;
+            if !shared.script.no_response {
+                let _ = send.write_all(&[V4, RESPONSE, FAILED]).await;
+            }
             let _ = send.finish();
             return;
         }

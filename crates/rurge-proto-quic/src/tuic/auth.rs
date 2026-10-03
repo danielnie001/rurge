@@ -114,18 +114,21 @@ impl Auth {
         }
     }
 
-    /// The command for `connection`: v5's token is its TLS session's.
-    fn command(&self, connection: &Connection) -> Vec<u8> {
+    /// The command for `connection`: v5's token is its TLS session's. A
+    /// session that exports none fails the dial: rustls exports nothing once
+    /// its state is an error, which a server can bring about after the
+    /// handshake — just as QUIC tells the connection is up.
+    fn command(&self, connection: &Connection) -> Result<Vec<u8>, OutboundError> {
         match &self.credentials {
-            Credentials::V4 { token } => command_v4(token).to_vec(),
+            Credentials::V4 { token } => Ok(command_v4(token).to_vec()),
             Credentials::V5 { uuid, password } => {
                 let mut token = [0u8; 32];
                 connection
                     .export_keying_material(&mut token, uuid, password.as_bytes())
-                    .expect(
-                        "a connection is up once its TLS handshake is done, which exports 32 bytes",
-                    );
-                command_v5(uuid, &token).to_vec()
+                    .map_err(|_| {
+                        OutboundError::Tls("the session exports no keying material".to_string())
+                    })?;
+                Ok(command_v5(uuid, &token).to_vec())
             }
         }
     }
@@ -172,7 +175,7 @@ impl Protocol for Auth {
     ) -> BoxFuture<'a, Result<Authenticated, OutboundError>> {
         Box::pin(async move {
             let version = self.version();
-            let command = self.command(connection);
+            let command = self.command(connection)?;
             // nothing relayed on a connection that just came up
             let mut stream = connection
                 .open_uni()

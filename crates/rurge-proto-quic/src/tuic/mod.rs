@@ -641,10 +641,21 @@ mod tests {
         let mut stream = tunnel(&out, &target(echo)).await;
         let err = end_of(&mut stream).await;
         assert_eq!(err.to_string(), "tuic: authentication failed");
-        let hex: String = UUID.iter().map(|b| format!("{b:02x}")).collect();
+        let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+        // the token the client sent, which the fake recorded
+        let token = fake.auths()[0].token;
+        // each as text, in hex, and as `Debug` prints its bytes
+        let forms = [
+            SECRET.to_string(),
+            ID.to_string(),
+            hex(&UUID),
+            format!("{UUID:?}"),
+            hex(&token),
+            format!("{token:?}"),
+        ];
         let shown = format!("{err} {err:?}");
-        for secret in [SECRET, ID, hex.as_str()] {
-            assert!(!shown.contains(secret), "{shown}");
+        for secret in &forms {
+            assert!(!shown.contains(secret.as_str()), "{shown}");
         }
         let mut spec = spec(443, &credentials(ID, SECRET));
         spec.version = TuicVersion::V5 {
@@ -665,8 +676,8 @@ mod tests {
         assert_eq!(err.message, "`password` is empty");
         let log = log.text();
         assert!(!log.is_empty());
-        for secret in [SECRET, ID, hex.as_str()] {
-            assert!(!log.contains(secret));
+        for secret in &forms {
+            assert!(!log.contains(secret.as_str()));
         }
     }
 
@@ -731,7 +742,10 @@ mod tests {
     }
 
     async fn udp_round_trip(carrier: &dyn PacketSocket, to: SocketAddr, payload: &[u8]) {
-        carrier.send_to(payload, &target(to)).await.unwrap();
+        timeout(BOUND, carrier.send_to(payload, &target(to)))
+            .await
+            .expect("a send within the bound")
+            .unwrap();
         assert_eq!(udp_answer(carrier).await, (payload.to_vec(), target(to)));
     }
 
@@ -749,7 +763,10 @@ mod tests {
         let mut buf = vec![0u8; 65536];
         loop {
             assert!(Instant::now() < deadline, "no answer within the bound");
-            carrier.send_to(payload, &target(to)).await.unwrap();
+            timeout(BOUND, carrier.send_to(payload, &target(to)))
+                .await
+                .expect("a send within the bound")
+                .unwrap();
             let wait = Instant::now() + Duration::from_millis(500);
             while let Ok(got) = tokio::time::timeout_at(wait, carrier.recv_from(&mut buf)).await {
                 let (n, _) = got.unwrap();
@@ -1065,9 +1082,13 @@ mod tests {
                     carrier.send_to(&payload, &to).await.unwrap();
                 });
             }
-            while let Some(sent) = sending.join_next().await {
-                sent.unwrap();
-            }
+            timeout(BOUND, async {
+                while let Some(sent) = sending.join_next().await {
+                    sent.unwrap();
+                }
+            })
+            .await
+            .expect("every send within the bound");
             let mut expected: Vec<Vec<u8>> = payloads.iter().map(|p| digest(p)).collect();
             let mut got = Vec::new();
             let deadline = Instant::now() + BOUND;
@@ -1525,7 +1546,7 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(lens, expected);
         let log = log.text();
-        let dropped = "tuic: a packet for the server is dropped: too many wait for a stream";
+        let dropped = "tuic: a message for the server is dropped: too many wait for a stream";
         assert_eq!(log.matches(dropped).count(), 10, "{log}");
         assert!(!log.contains("payload-3f81c2"));
         assert_eq!(fake.connections(), 1);
@@ -1726,6 +1747,30 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "tuic: the server could not connect to the target"
+        );
+        let mut next = tunnel(&out, &target(echo)).await;
+        round_trip(&mut next, b"still up").await;
+        assert_eq!(fake.connections(), 1);
+        assert_eq!(fake.connects().len(), 2);
+    }
+
+    /// Design 6.3: a v4 request reads the response on the Connect's stream;
+    /// a stream the server ends before it fails the request, saying so, and
+    /// the connection goes on.
+    #[tokio::test]
+    async fn v4_a_connect_ended_without_a_response_fails_and_the_connection_goes_on() {
+        let echo = echo_server().await;
+        let fake = FakeTuic::spawn(TuicScript {
+            no_response: true,
+            ..TuicScript::v4(TOKEN)
+        });
+        let out = v4_user(&fake);
+        // the fake resolves no name
+        let err = failure(&out, &Target::new(HostName::parse("unknown.test"), 80)).await;
+        assert!(matches!(err, OutboundError::Proxy(_)), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "tuic: the server ended the stream without a response"
         );
         let mut next = tunnel(&out, &target(echo)).await;
         round_trip(&mut next, b"still up").await;
@@ -1961,7 +2006,10 @@ mod tests {
         let fake = FakeTuic::spawn(TuicScript::v4(TOKEN));
         let out = v4_user(&fake);
         let carrier = udp_carrier(&out).await;
-        let err = carrier.send_to(&long, &target(echo)).await.unwrap_err();
+        let err = timeout(BOUND, carrier.send_to(&long, &target(echo)))
+            .await
+            .expect("an outcome within the bound")
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(
             err.to_string().starts_with("tuic: a datagram longer than "),
@@ -2083,14 +2131,20 @@ mod tests {
         let deadline = Instant::now() + BOUND;
         let err = loop {
             assert!(Instant::now() < deadline, "no send failed");
-            match carrier.send_to(b"x", &target(echo)).await {
+            let sent = timeout(BOUND, carrier.send_to(b"x", &target(echo)))
+                .await
+                .expect("an outcome within the bound");
+            match sent {
                 Ok(()) => tokio::time::sleep(Duration::from_millis(5)).await,
                 Err(e) => break e,
             }
         };
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(err.to_string(), "tuic: authentication failed");
-        carrier.send_to(b"y", &target(echo)).await.unwrap();
+        timeout(BOUND, carrier.send_to(b"y", &target(echo)))
+            .await
+            .expect("a send within the bound")
+            .unwrap();
         eventually("the next authentication", || fake.auths().len() == 2).await;
         assert!(fake.udp_packets().is_empty());
     }

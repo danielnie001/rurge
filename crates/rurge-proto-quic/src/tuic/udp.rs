@@ -36,12 +36,16 @@
 //!   whatever its id.
 //! - A carrier that goes, or moves, dissociates its association on the
 //!   connection it leaves while that is open: `VER 03 ‖ ASSOC_ID` on a
-//!   stream of its own, which the connection's task sends — the drop waits
-//!   for nothing.
-//! - That task reads the server's packets — its datagrams, and its streams
-//!   — into their associations' inboxes, putting v5's fragments together
-//!   first: at most 8 packets of an association at a time, a ninth dropping
-//!   the oldest. What finds no association, or a full inbox, is dropped.
+//!   stream of its own, which the connection's writer sends after what was
+//!   handed to it before — the association's last packets in `quic` mode
+//!   among them. The drop waits for nothing: with `OUTBOX` waiting already,
+//!   the Dissociate is dropped, and the server keeps the association until
+//!   the connection ends.
+//! - The connection's reader reads the server's packets — its datagrams,
+//!   and its streams — into their associations' inboxes, putting v5's
+//!   fragments together first: at most 8 packets of an association at a
+//!   time, a ninth dropping the oldest. What finds no association, or a full
+//!   inbox, is dropped.
 
 use super::Version;
 use super::addr::{self, NONE};
@@ -67,8 +71,8 @@ use tokio_util::task::AbortOnDropHandle;
 /// Packets waiting for the engine, per carrier; more are dropped, as a
 /// socket would.
 pub(super) const INBOX: usize = 64;
-/// Packets waiting for the connection's writer (`quic` mode); more are
-/// dropped, as a datagram the connection cannot take is.
+/// Packets (`quic` mode) and Dissociates waiting for the connection's
+/// writer; more are dropped, as a datagram the connection cannot take is.
 pub(super) const OUTBOX: usize = 64;
 /// How often a carrier asks where the policy leads (`Session::serves`): it
 /// can cost a group's resolution, and every packet would ask.
@@ -139,7 +143,7 @@ fn datagrams(
     let first = max.saturating_sub(HEADER + address.len());
     let rest = max.saturating_sub(HEADER + 1);
     if first == 0 || rest == 0 {
-        return Err(invalid("the host name is too long for a datagram"));
+        return Err(invalid("the address leaves no room in a datagram"));
     }
     let longest = MAX_DATAGRAM.min(first + (MAX_FRAGMENTS - 1) * rest);
     if payload.len() > longest {
@@ -190,7 +194,7 @@ fn datagram_v4(
     let room = max.saturating_sub(HEADER_V4 + address.len());
     if payload.len() > room {
         return Err(if room == 0 {
-            invalid("the host name is too long for a datagram")
+            invalid("the address leaves no room in a datagram")
         } else {
             invalid(&format!("a datagram longer than {room} bytes"))
         });
@@ -350,14 +354,19 @@ impl Associations {
 
     /// Takes `inbox` in under an id free, and says which: v5's count from 0
     /// (as sing-box's client counts them), v4's are drawn at random (as tuic
-    /// 0.8.5's client draws them) — counted as v5's without a random source.
-    /// `None` when all v5's 65536 are in use.
-    fn join(&mut self, inbox: &mpsc::Sender<Answer>) -> Option<u32> {
+    /// 0.8.5's client draws them) — `drawn`, drawn before the lock was
+    /// taken, when it is free; past one in use, or without it, drawn here,
+    /// and counted as v5's without a random source. `None` when all v5's
+    /// 65536 are in use.
+    fn join(&mut self, inbox: &mpsc::Sender<Answer>, mut drawn: Option<u32>) -> Option<u32> {
         for _ in 0..=u16::MAX {
             let counted = self.next;
             self.next = counted.wrapping_add(1);
             let id = match self.version {
-                Version::V4 => getrandom::u32().unwrap_or(u32::from(counted)),
+                Version::V4 => drawn
+                    .take()
+                    .or_else(|| getrandom::u32().ok())
+                    .unwrap_or(u32::from(counted)),
                 Version::V5 => u32::from(counted),
             };
             if let hash_map::Entry::Vacant(free) = self.by_id.entry(id) {
@@ -373,12 +382,12 @@ impl Associations {
 }
 
 /// A connection's UDP: its associations, the task that reads the server's
-/// packets into them and sends the Dissociates asked for, and the writer
-/// that sends the packets that go on streams (`quic` mode). The tasks end
-/// with the connection, or when this is dropped.
+/// packets into them, and the writer that sends the packets that go on
+/// streams (`quic` mode) and the Dissociates. The tasks end with the
+/// connection, or when this is dropped.
 pub(super) struct Udp {
     associations: Arc<Mutex<Associations>>,
-    dissociate: mpsc::UnboundedSender<u32>,
+    version: Version,
     /// The writer's queue (`queue`).
     outbox: mpsc::Sender<Vec<u8>>,
     _reader: AbortOnDropHandle<()>,
@@ -386,7 +395,7 @@ pub(super) struct Udp {
 }
 
 impl Udp {
-    /// The reader reads and writes `version`'s commands, and marks
+    /// The tasks read and write `version`'s commands; the reader marks
     /// `relayed` for every packet the server relays.
     pub(super) fn start(
         connection: &Connection,
@@ -394,19 +403,17 @@ impl Udp {
         relayed: Arc<AtomicBool>,
     ) -> Udp {
         let associations = Arc::new(Mutex::new(Associations::new(version)));
-        let (dissociate, dissociations) = mpsc::unbounded_channel();
         let reader = tokio::spawn(read(
             connection.clone(),
             version,
             associations.clone(),
             relayed,
-            dissociations,
         ));
         let (outbox, packets) = mpsc::channel(OUTBOX);
         let writer = tokio::spawn(write(connection.clone(), packets));
         Udp {
             associations,
-            dissociate,
+            version,
             outbox,
             _reader: AbortOnDropHandle::new(reader),
             _writer: AbortOnDropHandle::new(writer),
@@ -414,13 +421,24 @@ impl Udp {
     }
 
     /// Takes `inbox` in under an id free on the connection
-    /// (`Associations::join`).
+    /// (`Associations::join`). v4's id is drawn before the lock is taken:
+    /// the reader takes it for every packet the server sends.
     fn join(&self, inbox: &mpsc::Sender<Answer>) -> Option<u32> {
-        self.associations.lock().expect("associations").join(inbox)
+        let drawn = match self.version {
+            Version::V4 => getrandom::u32().ok(),
+            Version::V5 => None,
+        };
+        self.associations
+            .lock()
+            .expect("associations")
+            .join(inbox, drawn)
     }
 
     /// Forgets association `id`: what comes for it from now on is dropped.
-    /// With `dissociate`, the server is told so, by the connection's task.
+    /// With `dissociate`, the server is told so: the Dissociate goes to the
+    /// connection's writer (`queue`), after what waits there already;
+    /// dropped as a packet is, it leaves the association to the server until
+    /// the connection ends.
     fn leave(&self, id: u32, dissociate: bool) {
         self.associations
             .lock()
@@ -428,22 +446,21 @@ impl Udp {
             .by_id
             .remove(&id);
         if dissociate {
-            // the task is gone with its connection: nothing to tell
-            let _ = self.dissociate.send(id);
+            self.queue(dissociation(self.version, id));
         }
     }
 
-    /// Hands `message`, a whole packet, to the connection's writer
-    /// (`write`), never waiting: dropped when `OUTBOX` wait already, as a
-    /// full send buffer drops a datagram, or when the connection ended just
-    /// now — the next send finds it closed and binds anew.
+    /// Hands `message`, a whole packet or a Dissociate, to the connection's
+    /// writer (`write`), never waiting: dropped when `OUTBOX` wait already,
+    /// as a full send buffer drops a datagram, or when the connection ended
+    /// just now — the next send finds it closed and binds anew.
     fn queue(&self, message: Vec<u8>) {
         if let Err(e) = self.outbox.try_send(message) {
             let why = match e {
                 TrySendError::Full(_) => "too many wait for a stream",
                 TrySendError::Closed(_) => "the connection is closed",
             };
-            tracing::debug!("tuic: a packet for the server is dropped: {why}");
+            tracing::debug!("tuic: a message for the server is dropped: {why}");
         }
     }
 
@@ -471,40 +488,38 @@ impl Udp {
 
 /// Reads the server's `version` packets on `connection` — its datagrams,
 /// and its unidirectional streams, each read by a task of its own — into
-/// their associations' inboxes, and sends each Dissociate asked for on a
-/// stream of its own, until the connection ends: what came before its end
-/// included.
+/// their associations' inboxes, until the connection ends: what came before
+/// its end included. Each source tells the end only once what quinn holds
+/// of it is read; the one that tells it first is left, the other read on,
+/// and so are the streams under way, to their ends.
 async fn read(
     connection: Connection,
     version: Version,
     associations: Arc<Mutex<Associations>>,
     relayed: Arc<AtomicBool>,
-    mut dissociations: mpsc::UnboundedReceiver<u32>,
 ) {
     let mut streams = JoinSet::new();
-    let mut dissociating = JoinSet::new();
+    // each source until it ends
+    let (mut datagrams, mut accepting) = (true, true);
     loop {
         tokio::select! {
-            datagram = connection.read_datagram() => match datagram {
+            datagram = connection.read_datagram(), if datagrams => match datagram {
                 Ok(datagram) => deliver(version, &associations, &relayed, datagram),
-                Err(_) => return,
+                Err(_) => datagrams = false,
             },
-            stream = connection.accept_uni() => match stream {
+            stream = connection.accept_uni(), if accepting => match stream {
                 Ok(stream) => {
                     streams.spawn(read_stream(stream));
                 }
-                Err(_) => return,
+                Err(_) => accepting = false,
             },
             Some(done) = streams.join_next() => {
                 if let Ok(Some(message)) = done {
                     deliver(version, &associations, &relayed, message);
                 }
             }
-            Some(id) = dissociations.recv() => {
-                dissociating.spawn(dissociate(connection.clone(), version, id));
-            }
-            // a Dissociate gone out; nothing to collect
-            Some(_) = dissociating.join_next() => {}
+            // both sources ended, and no stream is left to read
+            else => return,
         }
     }
 }
@@ -517,23 +532,17 @@ async fn read_stream(mut stream: RecvStream) -> Option<Bytes> {
     stream.read_to_end(MAX_MESSAGE).await.ok().map(Bytes::from)
 }
 
-/// `VER 03 ‖ ASSOC_ID` on a unidirectional stream of its own, finished —
-/// exactly that: sing-box closes the connection on a longer one —: the
-/// server frees the association's socket.
-async fn dissociate(connection: Connection, version: Version, id: u32) {
+/// `VER 03 ‖ ASSOC_ID`, which the writer sends on a unidirectional stream
+/// of its own, finished — exactly that: sing-box closes the connection on a
+/// longer one —: the server frees the association's socket.
+fn dissociation(version: Version, id: u32) -> Vec<u8> {
     let mut command = vec![version.byte(), DISSOCIATE];
     match version {
         Version::V4 => command.extend_from_slice(&id.to_be_bytes()),
         // counted in 16 bits (`Associations::join`)
         Version::V5 => command.extend_from_slice(&(id as u16).to_be_bytes()),
     }
-    let Ok(mut stream) = connection.open_uni().await else {
-        return;
-    };
-    if stream.write_all(&command).await.is_ok() {
-        // fails only for a stream finished or reset already
-        let _ = stream.finish();
-    }
+    command
 }
 
 /// Hands what the server sent — a datagram, or a stream's packet — to its
@@ -754,11 +763,13 @@ fn transmit(connection: &Connection, datagrams: Vec<Vec<u8>>) {
     }
 }
 
-/// The connection's writer (`quic` mode): each packet handed to it goes on
-/// a stream of its own, one after the other, until the connection ends. No
-/// send waits for it, so no send given up on cuts a packet short: a stream
-/// that ends early is one sing-box cannot read — nor tuic 0.8.5, when its
-/// header is cut —, and either closes the connection for that.
+/// The connection's writer: each message handed to it — a packet (`quic`
+/// mode), a Dissociate — goes on a stream of its own, one after the other,
+/// in the order they came, until the connection ends; a Dissociate so goes
+/// after the packets of its association handed over before it. No send
+/// waits for it, so no send given up on cuts a packet short: a stream that
+/// ends early is one sing-box cannot read — nor tuic 0.8.5, when its header
+/// is cut —, and either closes the connection for that.
 async fn write(connection: Connection, mut packets: mpsc::Receiver<Vec<u8>>) {
     loop {
         let message = tokio::select! {
@@ -777,14 +788,14 @@ async fn write(connection: Connection, mut packets: mpsc::Receiver<Vec<u8>>) {
 /// `message` on a unidirectional stream of its own, finished: the writer's
 /// (`write`). It waits for QUIC to open the stream — the server's limit on
 /// open streams — and to take the message, however long that takes. A
-/// stream that fails loses its packet alone, as any hop may lose one: the
-/// server stopped it, or the connection ended — the next send then finds it
-/// closed and binds anew.
+/// stream that fails loses its message alone, as any hop may lose a packet:
+/// the server stopped it, or the connection ended — the next send then
+/// finds it closed and binds anew.
 async fn send_on_stream(connection: &Connection, message: &[u8]) {
     let mut stream = match connection.open_uni().await {
         Ok(stream) => stream,
         Err(e) => {
-            tracing::debug!("tuic: a packet for the server is dropped: {e}");
+            tracing::debug!("tuic: a message for the server is dropped: {e}");
             return;
         }
     };
@@ -793,7 +804,7 @@ async fn send_on_stream(connection: &Connection, message: &[u8]) {
             // fails only for a stream finished or reset already
             let _ = stream.finish();
         }
-        Err(e) => tracing::debug!("tuic: a packet for the server is dropped: {e}"),
+        Err(e) => tracing::debug!("tuic: a message for the server is dropped: {e}"),
     }
 }
 
@@ -959,7 +970,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(
             err.to_string(),
-            "tuic: the host name is too long for a datagram"
+            "tuic: the address leaves no room in a datagram"
         );
     }
 
@@ -1107,35 +1118,49 @@ mod tests {
         let mut associations = Associations::new(Version::V5);
         let (inbox, _rx) = mpsc::channel(1);
         assert_eq!(
-            (associations.join(&inbox), associations.join(&inbox)),
+            (
+                associations.join(&inbox, None),
+                associations.join(&inbox, None)
+            ),
             (Some(0), Some(1))
         );
         associations.next = u16::MAX;
-        assert_eq!(associations.join(&inbox), Some(u32::from(u16::MAX)));
+        assert_eq!(associations.join(&inbox, None), Some(u32::from(u16::MAX)));
         // round again: 0 and 1 are in use
-        assert_eq!(associations.join(&inbox), Some(2));
+        assert_eq!(associations.join(&inbox, None), Some(2));
         associations.by_id.remove(&0);
         associations.next = u16::MAX;
-        assert_eq!(associations.join(&inbox), Some(0));
+        assert_eq!(associations.join(&inbox, None), Some(0));
         while associations.by_id.len() < 1 << 16 {
-            associations.join(&inbox).unwrap();
+            associations.join(&inbox, None).unwrap();
         }
-        assert_eq!(associations.join(&inbox), None);
+        assert_eq!(associations.join(&inbox, None), None);
     }
 
     /// Design 6.3: v4's ids are drawn at random from all 32 bits, as tuic
-    /// 0.8.5's client draws them, never one in use.
+    /// 0.8.5's client draws them, never one in use: the one drawn before
+    /// the lock is the association's when it is free, else another is.
     #[test]
     fn v4_association_ids_are_drawn_at_random_past_the_ones_in_use() {
         let mut associations = Associations::new(Version::V4);
         let (inbox, _rx) = mpsc::channel(1);
         let ids: BTreeSet<u32> = (0..1000)
-            .map(|_| associations.join(&inbox).unwrap())
+            .map(|_| associations.join(&inbox, getrandom::u32().ok()).unwrap())
             .collect();
         assert_eq!(ids.len(), 1000);
         assert_eq!(associations.by_id.len(), 1000);
         // a thousand below 65536 would be counted, not drawn
         assert!(ids.iter().any(|&id| id > u32::from(u16::MAX)), "{ids:?}");
+        let free = (0u32..).find(|id| !ids.contains(id)).unwrap();
+        assert_eq!(associations.join(&inbox, Some(free)), Some(free));
+        // one in use gives way to another, drawn anew
+        for &in_use in ids.iter().chain([&free]) {
+            let joined = associations.by_id.len();
+            let id = associations.join(&inbox, Some(in_use)).unwrap();
+            assert_ne!(id, in_use);
+            // taken in beside the one in use, not in its place
+            assert_eq!(associations.by_id.len(), joined + 1);
+        }
     }
 
     /// v4's Packet (protocol README): `04 02 ‖ ASSOC_ID ‖ LEN ‖ ADDR ‖
@@ -1166,7 +1191,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(
             err.to_string(),
-            "tuic: the host name is too long for a datagram"
+            "tuic: the address leaves no room in a datagram"
         );
     }
 
