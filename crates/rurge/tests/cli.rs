@@ -613,6 +613,101 @@ fn check_knows_hysteria2() {
         .stdout(predicate::str::contains("s3cretPw").not());
 }
 
+const TUIC: &str = "[General]\n[Proxy]\n\
+T5 = tuic-v5, proxy.test, 443, uuid=0233d11c-15a4-47d3-ade3-48ffca0ce119, password=s3cretPw, port-hopping=5000-6000, port-hopping-interval=2, ecn=off, udp-relay=true\n\
+T4 = tuic, proxy.test, 443, token=t0kenValue, tfo=true\n\
+Old = tailscale, section-name=ts\nE = socks5, proxy.test, 1080\n\
+[Proxy Group]\nG = select, T5, T4, underlying-proxy=E\n[Rule]\nFINAL,DIRECT\n";
+const TUIC_BROKEN: &str = "[General]\n[Proxy]\n\
+A = tuic-v5, proxy.test, 443, uuid=0233d11c-15a4, password=s3cretPw\n\
+B = tuic, proxy.test, 443, token=t0kenValue, port-hopping=5000-6000, underlying-proxy=E\n\
+C = tuic, proxy.test, 443, token=t0kenValue, shadow-tls-password=st, shadow-tls-version=3, shadow-tls-sni=site.test\n\
+E = socks5, proxy.test, 1080\n[Rule]\nFINAL,DIRECT\n";
+
+/// `rurge check` knows `tuic` and `tuic-v5` (phase 2 M7 design 6.1):
+/// neither is "not implemented"; `ecn` has an effect on them, `tfo` and
+/// `udp-relay` do not apply; a hop interval under 5 seconds is raised to 5,
+/// saying so; a group that relays a member with `port-hopping` says it
+/// leaves that member out; a UUID that is not one, `port-hopping` over an
+/// `underlying-proxy` and Shadow TLS are errors; the credentials are never
+/// printed.
+#[test]
+fn check_knows_tuic() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "tuic.conf", TUIC))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    // `tailscale` is still a later milestone; TUIC is not
+    assert_eq!(out.matches("W0007").count(), 1, "{out}");
+    assert!(
+        out.contains("policy type `tailscale`") && !out.contains("policy type `tuic"),
+        "{out}"
+    );
+    assert!(!out.contains("W0029"), "{out}");
+    for (code, said) in [
+        (
+            "W0012",
+            "tuic.conf:3: policy `T5`: `port-hopping-interval` is below the minimum of 5 seconds; using 5",
+        ),
+        (
+            "W0028",
+            "tuic.conf:3: policy `T5`: `udp-relay` does not apply to `tuic-v5` policies (UDP is always relayed); ignored",
+        ),
+        (
+            "W0028",
+            "tuic.conf:4: policy `T4`: `tfo` does not apply to `tuic` policies; ignored",
+        ),
+        (
+            "W0023",
+            "tuic.conf:8: policy group `G` relays its members through `underlying-proxy`: `T5` uses `port-hopping`, which cannot go through it; `T5 (via E)` is left out",
+        ),
+    ] {
+        let warning = format!("warning[{code}]");
+        assert!(
+            out.lines()
+                .any(|line| line.starts_with(&warning) && line.ends_with(said)),
+            "{code} {said}\n{out}"
+        );
+    }
+    assert!(
+        !out.contains("s3cretPw") && !out.contains("t0kenValue") && !out.contains("0233d11c"),
+        "{out}"
+    );
+
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "bad.conf", TUIC_BROKEN))
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    for said in [
+        "bad.conf:3: policy `A`: `uuid` is not a valid UUID",
+        "bad.conf:4: policy `B`: `port-hopping` cannot be combined with `underlying-proxy`",
+        "bad.conf:5: policy `C`: Shadow TLS cannot be combined with a `tuic` policy",
+    ] {
+        assert!(
+            out.lines()
+                .any(|line| line.starts_with("error[E0018]") && line.ends_with(said)),
+            "{said}\n{out}"
+        );
+    }
+    assert!(
+        !out.contains("s3cretPw") && !out.contains("t0kenValue") && !out.contains("0233d11c"),
+        "{out}"
+    );
+}
+
 const SUBSCRIBED: &str = "[General]\n[Proxy Group]\nLocal = select, DIRECT, policy-path=nodes.txt\n\
 Remote = select, DIRECT, policy-path=https://sub.test/nodes?token=t0k3n\n[Rule]\nFINAL,Local\n";
 

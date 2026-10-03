@@ -275,9 +275,8 @@ E = socks5, e.example, 1080",
 
 /// `tuic` and `tuic-v5` lines are read and checked at load (phase 2 M7
 /// design 3.1, 6.1): the combinations they cannot have and a credential
-/// that is not one are errors, a hop interval under 5 seconds is raised to
-/// 5, and `ecn` has an effect on them. They have no spec until the engine
-/// builds them (M7b task 5).
+/// that is not one are errors, which leave no spec; a hop interval under 5
+/// seconds is raised to 5, and `ecn` has an effect on them.
 #[test]
 fn tuic_lines_are_checked_at_load() {
     let loaded = load(
@@ -319,9 +318,18 @@ E = socks5, e.example, 1080",
             ),
         ]
     );
-    for name in ["A", "B", "C", "D"] {
+    for name in ["A", "B", "C"] {
         assert!(loaded.config.spec(name).is_none(), "{name}");
     }
+    let d = loaded.config.spec("D").expect("a warning leaves the spec");
+    let ProtoSpec::Tuic(tuic) = &d.proto else {
+        panic!("{:?}", d.proto)
+    };
+    assert_eq!(
+        tuic.quic.port_hopping.as_ref().map(|h| h.interval),
+        Some(Duration::from_secs(5))
+    );
+    assert_eq!(d.common.ecn, Tristate::Off);
 }
 
 /// A group's `underlying-proxy` chains the proxies it takes in (`M (via

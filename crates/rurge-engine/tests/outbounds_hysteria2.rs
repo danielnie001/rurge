@@ -8,9 +8,7 @@
 mod common;
 use common::*;
 use rurge_config::HostName;
-use rurge_config::session::Transport;
 use rurge_config::spec::{Hysteria2Obfs, ProtoSpec};
-use rurge_engine::RequestRecord;
 use rurge_net::connector::Target;
 use rurge_net::quic::testing::MultiPort;
 use rurge_proto::testing::{echo_server, udp_echo_server};
@@ -56,54 +54,6 @@ fn trusting(fake: &FakeHysteria2) -> EngineShared {
 /// An engine on `proxies` (`profile`) that trusts `fake`.
 async fn through(fake: &FakeHysteria2, proxies: &str) -> Harness {
     harness_with(profile(proxies), trusting(fake)).await
-}
-
-fn udp_records(h: &Harness) -> Vec<RequestRecord> {
-    h.engine
-        .request_log()
-        .recent(4096)
-        .into_iter()
-        .filter(|r| r.transport == Transport::Udp)
-        .collect()
-}
-
-/// The first `n` sessions' records, oldest first, once they have finished.
-async fn the_records(h: &Harness, n: usize) -> Vec<RequestRecord> {
-    let log = h.engine.request_log();
-    wait_until("the sessions to finish", || log.recent(10).len() >= n).await;
-    let mut records = log.recent(10);
-    records.reverse();
-    records
-}
-
-/// One session to the echo through `h`: a round trip, then the client
-/// goes and the session finishes.
-async fn one_session(h: &Harness, n: usize, payload: &[u8]) -> RequestRecord {
-    let mut tunnel = connect_via_http(h.http(), "target.test:7").await;
-    echo_through(&mut tunnel, payload).await;
-    drop(tunnel);
-    the_records(h, n).await[n - 1].clone()
-}
-
-/// `CONNECT host:port` through rurge's SOCKS5 listener, the host as a
-/// name; returns the tunnel.
-async fn connect_via_socks5(proxy: SocketAddr, host: &str, port: u16) -> TcpStream {
-    let mut s = TcpStream::connect(proxy).await.unwrap();
-    s.write_all(&[5, 1, 0]).await.unwrap();
-    let mut method = [0u8; 2];
-    s.read_exact(&mut method).await.unwrap();
-    assert_eq!(method, [5, 0]);
-    let mut request = vec![5, 1, 0, 3, host.len() as u8];
-    request.extend_from_slice(host.as_bytes());
-    request.extend_from_slice(&port.to_be_bytes());
-    s.write_all(&request).await.unwrap();
-    let mut reply = [0u8; 10];
-    tokio::time::timeout(Duration::from_secs(10), s.read_exact(&mut reply))
-        .await
-        .expect("the proxy answers")
-        .unwrap();
-    assert_eq!(reply[1], 0, "{reply:?}");
-    s
 }
 
 /// A CONNECT through the HTTP listener and one through the SOCKS5 listener

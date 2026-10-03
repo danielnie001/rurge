@@ -21,7 +21,7 @@ pub use rurge_proto::testing::{
     FakeTrojan, FakeVmess, H2ProxyScript, HttpProxyScript, ShadowsocksScript, SnellScript,
     Socks5Script, TlsFixture, TrojanScript, VmessScript,
 };
-pub use rurge_proto_quic::testing::{FakeHysteria2, Hysteria2Script};
+pub use rurge_proto_quic::testing::{FakeHysteria2, FakeTuic, Hysteria2Script, TuicScript};
 pub use rurge_proto_ssh::testing::{
     Algorithm, FakeSsh, FakeSshOpts, fingerprint_of, keystore_base64, random_key,
 };
@@ -209,6 +209,27 @@ pub async fn connect_via_http(proxy: SocketAddr, authority: &str) -> TcpStream {
     s
 }
 
+/// `CONNECT host:port` through rurge's SOCKS5 listener, the host as a
+/// name; returns the tunnel.
+pub async fn connect_via_socks5(proxy: SocketAddr, host: &str, port: u16) -> TcpStream {
+    let mut s = TcpStream::connect(proxy).await.unwrap();
+    s.write_all(&[5, 1, 0]).await.unwrap();
+    let mut method = [0u8; 2];
+    s.read_exact(&mut method).await.unwrap();
+    assert_eq!(method, [5, 0]);
+    let mut request = vec![5, 1, 0, 3, host.len() as u8];
+    request.extend_from_slice(host.as_bytes());
+    request.extend_from_slice(&port.to_be_bytes());
+    s.write_all(&request).await.unwrap();
+    let mut reply = [0u8; 10];
+    tokio::time::timeout(Duration::from_secs(10), s.read_exact(&mut reply))
+        .await
+        .expect("the proxy answers")
+        .unwrap();
+    assert_eq!(reply[1], 0, "{reply:?}");
+    s
+}
+
 /// One `GET` over an established tunnel (or any stream to an origin).
 pub async fn get(stream: &mut TcpStream, host: &str, path: &str) -> String {
     stream
@@ -231,6 +252,34 @@ pub async fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// The first `n` sessions' records, oldest first, once they have finished.
+pub async fn the_records(h: &Harness, n: usize) -> Vec<rurge_engine::RequestRecord> {
+    let log = h.engine.request_log();
+    wait_until("the sessions to finish", || log.recent(10).len() >= n).await;
+    let mut records = log.recent(10);
+    records.reverse();
+    records
+}
+
+/// The finished UDP flows' records, newest first.
+pub fn udp_records(h: &Harness) -> Vec<rurge_engine::RequestRecord> {
+    h.engine
+        .request_log()
+        .recent(4096)
+        .into_iter()
+        .filter(|r| r.transport == rurge_config::session::Transport::Udp)
+        .collect()
+}
+
+/// One session to the echo through `h`: a round trip, then the client
+/// goes and the session finishes.
+pub async fn one_session(h: &Harness, n: usize, payload: &[u8]) -> rurge_engine::RequestRecord {
+    let mut tunnel = connect_via_http(h.http(), "target.test:7").await;
+    echo_through(&mut tunnel, payload).await;
+    drop(tunnel);
+    the_records(h, n).await[n - 1].clone()
 }
 
 /// A SOCKS5 UDP association through rurge's listener (phase 2 M5): the

@@ -490,10 +490,7 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     }
     let failed = r.has_errors();
     let diagnostics = r.finish();
-    // the engine builds `tuic` and `tuic-v5` from M7b task 5 on: until then
-    // a valid line is checked in full but has no spec
-    let built = !matches!(policy.kind, PolicyKind::Tuic | PolicyKind::TuicV5);
-    let spec = (!failed && not_implemented.is_none() && built).then(|| PolicySpec {
+    let spec = (!failed && not_implemented.is_none()).then(|| PolicySpec {
         name: policy.name.clone(),
         kind: policy.kind,
         server: policy.server.clone(),
@@ -1331,27 +1328,59 @@ mod tests {
         assert!(tcp.proto.quic().is_none() && ProtoSpec::Direct.quic().is_none());
     }
 
-    /// `tuic` and `tuic-v5` lines are read and checked in full; they have no
-    /// spec until the engine builds TUIC (M7b task 5). `ecn` takes effect on
-    /// them, `tfo` and `udp-relay` do not apply, and neither version takes
-    /// the other's credentials (phase 2 M7 design 3.1, 6.1).
+    /// `tuic` and `tuic-v5` lines are read and checked in full, and a sound
+    /// one has a spec, of the version its keyword names. `ecn` takes effect
+    /// on them, `tfo` and `udp-relay` do not apply, and neither version
+    /// takes the other's credentials (phase 2 M7 design 3.1, 6.1).
     #[test]
-    fn a_tuic_line_is_checked_but_has_no_spec_yet() {
+    fn a_tuic_line_is_checked_and_has_a_spec() {
         let id = "0233d11c-15a4-47d3-ade3-48ffca0ce119";
-        for def in [
-            "tuic, 192.168.20.6, 443, token=pwd, alpn=h3".to_string(),
-            format!("tuic-v5, 192.168.20.6, 443, uuid={id}, password=pwd, alpn=h3"),
-            format!(
-                "tuic-v5, h.test, 443, uuid={id}, password=pw, port-hopping=1234;5000-6000, port-hopping-interval=10, ecn=off, sni=edge.test, client-cert=cert1"
+        for (def, kind, chained) in [
+            (
+                "tuic, 192.168.20.6, 443, token=pwd, alpn=h3".to_string(),
+                PolicyKind::Tuic,
+                false,
             ),
-            "tuic, h.test, 443, token=t, ecn=on, underlying-proxy=Pick".to_string(),
-            "tuic, h.test, 443, token=t, port-hopping=5000-6000, underlying-proxy=DIRECT"
-                .to_string(),
+            (
+                format!("tuic-v5, 192.168.20.6, 443, uuid={id}, password=pwd, alpn=h3"),
+                PolicyKind::TuicV5,
+                false,
+            ),
+            (
+                format!(
+                    "tuic-v5, h.test, 443, uuid={id}, password=pw, port-hopping=1234;5000-6000, port-hopping-interval=10, ecn=off, sni=edge.test, client-cert=cert1"
+                ),
+                PolicyKind::TuicV5,
+                false,
+            ),
+            (
+                "tuic, h.test, 443, token=t, ecn=on, underlying-proxy=Pick".to_string(),
+                PolicyKind::Tuic,
+                true,
+            ),
+            // DIRECT is no chain: the hops stay
+            (
+                "tuic, h.test, 443, token=t, port-hopping=5000-6000, underlying-proxy=DIRECT"
+                    .to_string(),
+                PolicyKind::Tuic,
+                false,
+            ),
         ] {
             let o = outcome("T", &def);
             assert!(o.diagnostics.is_empty(), "{def}: {:?}", o.diagnostics);
             assert!(o.inert.is_empty(), "{def}: {:?}", o.inert);
-            assert!(o.spec.is_none() && o.not_implemented.is_none(), "{def}");
+            assert_eq!(o.not_implemented, None, "{def}");
+            let spec = o.spec.unwrap_or_else(|| panic!("{def}: no spec"));
+            let ProtoSpec::Tuic(tuic) = &spec.proto else {
+                panic!("{def}: {:?}", spec.proto)
+            };
+            assert_eq!(spec.kind, kind, "{def}");
+            assert_eq!(
+                matches!(tuic.version, TuicVersion::V5 { .. }),
+                kind == PolicyKind::TuicV5,
+                "{def}"
+            );
+            assert_eq!(spec.common.underlying_proxy.is_some(), chained, "{def}");
         }
         let o = outcome(
             "T",
@@ -1396,6 +1425,7 @@ mod tests {
             ]
         );
         assert!(o.inert.is_empty(), "{:?}", o.inert);
+        assert!(o.spec.is_none());
     }
 
     /// What a QUIC-based line cannot combine (phase 2 M7 design 3.1), on

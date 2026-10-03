@@ -22,7 +22,7 @@ use rurge_proto::trojan::TrojanOutbound;
 use rurge_proto::trust_tunnel::TrustTunnelOutbound;
 use rurge_proto::vmess::VmessOutbound;
 use rurge_proto::{Direct, OutboundRef};
-use rurge_proto_quic::Hysteria2Outbound;
+use rurge_proto_quic::{Hysteria2Outbound, TuicOutbound};
 use rurge_proto_ssh::SshOutbound;
 use rurge_proto_wireguard::WireGuardOutbound;
 use rustls::RootCertStore;
@@ -302,14 +302,16 @@ impl OutboundFactory for EngineFactory {
                 self.roots.clone(),
                 connector,
             )?),
-            // the loader makes no spec of these lines before M7b task 5
-            ProtoSpec::Tuic(_) => {
-                return Err(BuildError::new(format!(
-                    "policy `{}`: `{}` is not implemented yet",
-                    spec.name,
-                    spec.kind.keyword()
-                )));
-            }
+            // `tuic` and `tuic-v5` alike: the spec says which version
+            ProtoSpec::Tuic(tuic) => Arc::new(TuicOutbound::new(
+                &spec.name,
+                server_of(spec)?,
+                tuic,
+                spec.common.ecn,
+                &self.keystore,
+                self.roots.clone(),
+                connector,
+            )?),
             // nothing starts here: the program starts on the first dial
             ProtoSpec::External(external) => {
                 let outbound = ExternalOutbound::new(
@@ -429,6 +431,8 @@ N5 = snell, proxy.test, 443, psk=pw, version=5, shadow-tls-password=st\n\
 H2 = h2-connect, proxy.test, 443, alice, s3cret, max-streams=8, udp-relay=true\n\
 TT = trust-tunnel, proxy.test, 443, username=u, password=pw, shadow-tls-password=st\n\
 HY = hysteria2, proxy.test, 443, password=pw, download-bandwidth=100, salamander-password=obfs, port-hopping=5000-6000, ecn=off\n\
+TU = tuic, proxy.test, 443, token=pw, port-hopping=5000-6000, ecn=off\n\
+TU5 = tuic-v5, proxy.test, 443, uuid=0233d11c-15a4-47d3-ade3-48ffca0ce119, password=pw, sni=tu.test\n\
 Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule]\nFINAL,DIRECT\n",
         );
         let f = factory(&cfg);
@@ -449,6 +453,8 @@ Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule
             ("H2", "H2"),
             ("TT", "TT"),
             ("HY", "HY"),
+            ("TU", "TU"),
+            ("TU5", "TU5"),
             ("Corp", "DIRECT"),
         ] {
             let spec = cfg
@@ -611,6 +617,37 @@ TT = trust-tunnel, proxy.test, 443, username=u, password=s3same0pen, client-cert
         assert!(!messages[0].contains("hunter2") && !messages[0].contains("s3same0pen"));
     }
 
+    /// Sound `tuic` and `tuic-v5` lines pass the dry build, which opens no
+    /// connection (no tokio runtime here); a client certificate that cannot
+    /// be read is a load error, and neither its password nor the policy's
+    /// credentials are quoted (phase 2 M7 design 3.2, 6.1).
+    #[test]
+    fn the_tuic_policies_pass_the_dry_build() {
+        let cfg = config(
+            "[Proxy]\nT4 = tuic, proxy.test, 443, token=t0ken, port-hopping=1234;5000-6000, port-hopping-interval=10, ecn=off\n\
+T5 = tuic-v5, proxy.test, 443, uuid=0233d11c-15a4-47d3-ade3-48ffca0ce119, password=pw, alpn=h3, sni=tu.test\n\
+[Rule]\nFINAL,DIRECT\n",
+        );
+        assert!(dry_build(&cfg).is_empty());
+
+        let cfg = config(
+            "[Proxy]\nT4 = tuic, proxy.test, 443, token=s3same0pen, client-cert=cert1\n\
+T5 = tuic-v5, proxy.test, 443, uuid=0233d11c-15a4-47d3-ade3-48ffca0ce119, password=s3same0pen, client-cert=cert1\n\
+[Keystore]\ncert1 = type=p12, base64=QUJD, password=hunter2\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let diags = dry_build(&cfg).sorted();
+        let messages: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(messages[0].starts_with("policy `T4` cannot be built: keystore item `cert1`"));
+        assert!(messages[1].starts_with("policy `T5` cannot be built: keystore item `cert1`"));
+        for m in &messages {
+            assert!(
+                !m.contains("hunter2") && !m.contains("s3same0pen") && !m.contains("0233d11c"),
+                "{m}"
+            );
+        }
+    }
+
     #[test]
     fn a_dry_build_of_an_anytls_policy_leaves_no_task_behind() {
         // no tokio runtime here: spawning anything at build time would panic
@@ -629,6 +666,7 @@ H2 = h2-connect, proxy.test, 443, skip-cert-verify=true\n\
 TT = trust-tunnel, proxy.test, 443, username=u, password=pw, skip-cert-verify=true\n\
 TP = trust-tunnel, proxy.test, 443, username=u, password=pw, skip-cert-verify=true, server-cert-fingerprint-sha256=0000000000000000000000000000000000000000000000000000000000000000\n\
 HY = hysteria2, proxy.test, 443, password=pw, skip-cert-verify=true\n\
+TU = tuic, proxy.test, 443, token=pw, skip-cert-verify=true\n\
 [Rule]\nFINAL,DIRECT\n",
         );
         let flagged: Vec<&str> = cfg
@@ -637,7 +675,7 @@ HY = hysteria2, proxy.test, 443, password=pw, skip-cert-verify=true\n\
             .filter(|s| skips_verification(s))
             .map(|s| s.name.as_str())
             .collect();
-        assert_eq!(flagged, ["A", "V", "H2", "TT", "HY"]);
+        assert_eq!(flagged, ["A", "V", "H2", "TT", "HY", "TU"]);
     }
 
     #[test]
