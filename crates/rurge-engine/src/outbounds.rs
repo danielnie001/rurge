@@ -302,6 +302,14 @@ impl OutboundFactory for EngineFactory {
                 self.roots.clone(),
                 connector,
             )?),
+            // the loader makes no spec of these lines before M7b task 5
+            ProtoSpec::Tuic(_) => {
+                return Err(BuildError::new(format!(
+                    "policy `{}`: `{}` is not implemented yet",
+                    spec.name,
+                    spec.kind.keyword()
+                )));
+            }
             // nothing starts here: the program starts on the first dial
             ProtoSpec::External(external) => {
                 let outbound = ExternalOutbound::new(

@@ -633,4 +633,22 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
             "H = hysteria2, h.test, 443, password=***, gecko-password=***"
         );
     }
+
+    /// TUIC (phase 2 M7 design 8): v4's token, v5's UUID and password, and a
+    /// stray positional value; the ALPN and the hopping ports stay.
+    #[test]
+    fn a_tuic_line_loses_its_credentials() {
+        assert_eq!(
+            redact_definition(
+                "tuic, 192.168.20.6, 443, token=s3cret, alpn=h3, port-hopping=1234;5000-6000"
+            ),
+            "tuic, 192.168.20.6, 443, token=***, alpn=h3, port-hopping=1234;5000-6000"
+        );
+        assert_eq!(
+            redact_profile(
+                "T = tuic-v5, h.test, 443, hunter2, uuid=0233d11c-15a4-47d3-ade3-48ffca0ce119, password=s3cret, alpn=h3"
+            ),
+            "T = tuic-v5, h.test, 443, ***, uuid=***, password=***, alpn=h3"
+        );
+    }
 }

@@ -273,6 +273,57 @@ E = socks5, e.example, 1080",
     assert_eq!(d.common.ecn, Tristate::Off);
 }
 
+/// `tuic` and `tuic-v5` lines are read and checked at load (phase 2 M7
+/// design 3.1, 6.1): the combinations they cannot have and a credential
+/// that is not one are errors, a hop interval under 5 seconds is raised to
+/// 5, and `ecn` has an effect on them. They have no spec until the engine
+/// builds them (M7b task 5).
+#[test]
+fn tuic_lines_are_checked_at_load() {
+    let loaded = load(
+        "A = tuic, a.example, 443, token=t, port-hopping=5000-6000, underlying-proxy=E
+B = tuic-v5, b.example, 443, uuid=0233d11c-15a4-47d3-ade3-48ffca0ce119, password=p, shadow-tls-password=st
+C = tuic-v5, c.example, 443, uuid=0233d11c-15a4, password=p
+D = tuic-v5, d.example, 443, uuid=0233d11c-15a4-47d3-ade3-48ffca0ce119, password=p, ecn=off, port-hopping=5000-6000, port-hopping-interval=2
+E = socks5, e.example, 1080",
+        "",
+    );
+    let found: Vec<(&str, String, u32)> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| (d.code, d.message.clone(), d.span.as_ref().unwrap().line))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                codes::E_INVALID_POLICY_PARAM,
+                "policy `A`: `port-hopping` cannot be combined with `underlying-proxy`".to_string(),
+                2
+            ),
+            (
+                codes::E_INVALID_POLICY_PARAM,
+                "policy `B`: Shadow TLS cannot be combined with a `tuic-v5` policy".to_string(),
+                3
+            ),
+            (
+                codes::E_INVALID_POLICY_PARAM,
+                "policy `C`: `uuid` is not a valid UUID".to_string(),
+                4
+            ),
+            (
+                codes::W_INVALID_VALUE,
+                "policy `D`: `port-hopping-interval` is below the minimum of 5 seconds; using 5"
+                    .to_string(),
+                5
+            ),
+        ]
+    );
+    for name in ["A", "B", "C", "D"] {
+        assert!(loaded.config.spec(name).is_none(), "{name}");
+    }
+}
+
 /// A group's `underlying-proxy` chains the proxies it takes in (`M (via
 /// R)`, phase 2 M3 design 5.4), but port hopping cannot go through a chain:
 /// the load says, at the group's line, which member is left out — once,

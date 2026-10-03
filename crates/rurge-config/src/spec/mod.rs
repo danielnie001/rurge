@@ -18,6 +18,7 @@ pub mod ss;
 pub mod ssh;
 pub mod tls;
 pub mod trojan;
+pub mod tuic;
 pub mod vmess;
 pub mod wireguard;
 pub mod ws;
@@ -42,6 +43,7 @@ pub use ss::{SsMethod, SsSpec};
 pub use ssh::{HostKeyPin, SshSpec};
 pub use tls::{Sni, TlsOpts};
 pub use trojan::TrojanSpec;
+pub use tuic::{TuicSpec, TuicVersion};
 pub use vmess::{VmessCipher, VmessSpec};
 pub use wireguard::WireGuardSpec;
 pub use ws::WsOpts;
@@ -86,6 +88,7 @@ pub enum ProtoSpec {
     H2Connect(H2ConnectSpec),
     TrustTunnel(TrustTunnelSpec),
     Hysteria2(Hysteria2Spec),
+    Tuic(TuicSpec),
 }
 
 impl ProtoSpec {
@@ -100,6 +103,7 @@ impl ProtoSpec {
             ProtoSpec::H2Connect(h2) => Some(&h2.tls),
             ProtoSpec::TrustTunnel(tt) => Some(&tt.tls),
             ProtoSpec::Hysteria2(hysteria2) => Some(&hysteria2.tls),
+            ProtoSpec::Tuic(tuic) => Some(&tuic.tls),
             ProtoSpec::Direct
             | ProtoSpec::Reject(_)
             | ProtoSpec::Ssh(_)
@@ -114,6 +118,7 @@ impl ProtoSpec {
     pub fn quic(&self) -> Option<&QuicOpts> {
         match self {
             ProtoSpec::Hysteria2(hysteria2) => Some(&hysteria2.quic),
+            ProtoSpec::Tuic(tuic) => Some(&tuic.quic),
             ProtoSpec::Direct
             | ProtoSpec::Reject(_)
             | ProtoSpec::Http(_)
@@ -252,6 +257,18 @@ fn read_headers(r: &mut ParamReader<'_>) -> Vec<HeaderTemplate> {
             Vec::new()
         }
     }
+}
+
+/// A named credential that must be there; its value is never quoted.
+fn required(r: &mut ParamReader<'_>, key: &str) -> Secret<String> {
+    let value = r.str(key).unwrap_or_default();
+    if value.is_empty() {
+        r.error(
+            codes::E_INVALID_POLICY_PARAM,
+            format!("`{key}` is required"),
+        );
+    }
+    Secret::from(value)
 }
 
 fn check_underlying(r: &mut ParamReader<'_>, common: &mut CommonOpts, env: &SpecEnv<'_>) {
@@ -414,6 +431,13 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             notes.inert.retain(|name| !matches!(*name, "ecn" | "tfo"));
             (common, ProtoSpec::Hysteria2(hysteria2))
         }
+        PolicyKind::Tuic | PolicyKind::TuicV5 => {
+            let mut common = read_common(&mut r, Applies::Proxy, &mut notes);
+            let tuic = tuic::read_tuic(&mut r, &mut common, env.keystore);
+            // as on `hysteria2`: `ecn` takes effect, `tfo` does not apply
+            notes.inert.retain(|name| !matches!(*name, "ecn" | "tfo"));
+            (common, ProtoSpec::Tuic(tuic))
+        }
         PolicyKind::Ssh => {
             let common = read_common(&mut r, Applies::Proxy, &mut notes);
             let ssh = ssh::read_ssh(&mut r, env.keystore);
@@ -466,7 +490,10 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     }
     let failed = r.has_errors();
     let diagnostics = r.finish();
-    let spec = (!failed && not_implemented.is_none()).then(|| PolicySpec {
+    // the engine builds `tuic` and `tuic-v5` from M7b task 5 on: until then
+    // a valid line is checked in full but has no spec
+    let built = !matches!(policy.kind, PolicyKind::Tuic | PolicyKind::TuicV5);
+    let spec = (!failed && not_implemented.is_none() && built).then(|| PolicySpec {
         name: policy.name.clone(),
         kind: policy.kind,
         server: policy.server.clone(),
@@ -1302,5 +1329,155 @@ mod tests {
             .spec
             .unwrap();
         assert!(tcp.proto.quic().is_none() && ProtoSpec::Direct.quic().is_none());
+    }
+
+    /// `tuic` and `tuic-v5` lines are read and checked in full; they have no
+    /// spec until the engine builds TUIC (M7b task 5). `ecn` takes effect on
+    /// them, `tfo` and `udp-relay` do not apply, and neither version takes
+    /// the other's credentials (phase 2 M7 design 3.1, 6.1).
+    #[test]
+    fn a_tuic_line_is_checked_but_has_no_spec_yet() {
+        let id = "0233d11c-15a4-47d3-ade3-48ffca0ce119";
+        for def in [
+            "tuic, 192.168.20.6, 443, token=pwd, alpn=h3".to_string(),
+            format!("tuic-v5, 192.168.20.6, 443, uuid={id}, password=pwd, alpn=h3"),
+            format!(
+                "tuic-v5, h.test, 443, uuid={id}, password=pw, port-hopping=1234;5000-6000, port-hopping-interval=10, ecn=off, sni=edge.test, client-cert=cert1"
+            ),
+            "tuic, h.test, 443, token=t, ecn=on, underlying-proxy=Pick".to_string(),
+            "tuic, h.test, 443, token=t, port-hopping=5000-6000, underlying-proxy=DIRECT"
+                .to_string(),
+        ] {
+            let o = outcome("T", &def);
+            assert!(o.diagnostics.is_empty(), "{def}: {:?}", o.diagnostics);
+            assert!(o.inert.is_empty(), "{def}: {:?}", o.inert);
+            assert!(o.spec.is_none() && o.not_implemented.is_none(), "{def}");
+        }
+        let o = outcome(
+            "T",
+            "tuic-v5, h.test, 443, s3cret, tfo=true, udp-relay=true, token=t, mystery=1",
+        );
+        let found: Vec<(&str, &str)> = o
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `T`: `tfo` does not apply to `tuic-v5` policies; ignored"
+                ),
+                (
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `T`: `uuid` is required"
+                ),
+                (
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `T`: `password` is required"
+                ),
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `T`: `token` only applies to `tuic` policies; ignored"
+                ),
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `T`: `udp-relay` does not apply to `tuic-v5` policies (UDP is always relayed); ignored"
+                ),
+                (
+                    codes::W_UNKNOWN_KEY,
+                    "policy `T`: unknown parameter `mystery` ignored"
+                ),
+                (
+                    codes::W_UNKNOWN_KEY,
+                    "policy `T`: unexpected positional value #1 ignored"
+                ),
+            ]
+        );
+        assert!(o.inert.is_empty(), "{:?}", o.inert);
+    }
+
+    /// What a QUIC-based line cannot combine (phase 2 M7 design 3.1), on
+    /// either TUIC version: port hopping with a chain, and Shadow TLS (the
+    /// manual: a configuration error).
+    #[test]
+    fn port_hopping_over_a_chain_and_shadow_tls_are_errors_on_tuic() {
+        let v5 = "uuid=0233d11c-15a4-47d3-ade3-48ffca0ce119, password=pw";
+        for (kind, credentials) in [("tuic", "token=t"), ("tuic-v5", v5)] {
+            for relay in ["Entry", "Pick"] {
+                let o = outcome(
+                    "T",
+                    &format!(
+                        "{kind}, h.test, 443, {credentials}, port-hopping=5000-6000, underlying-proxy={relay}"
+                    ),
+                );
+                let found: Vec<(&str, &str)> = o
+                    .diagnostics
+                    .iter()
+                    .map(|d| (d.code, d.message.as_str()))
+                    .collect();
+                assert_eq!(
+                    found,
+                    [(
+                        codes::E_INVALID_POLICY_PARAM,
+                        "policy `T`: `port-hopping` cannot be combined with `underlying-proxy`"
+                    )],
+                    "{kind} {relay}"
+                );
+            }
+            let o = outcome(
+                "T",
+                &format!(
+                    "{kind}, h.test, 443, {credentials}, shadow-tls-password=st, shadow-tls-version=3, shadow-tls-sni=site.test"
+                ),
+            );
+            let found: Vec<(&str, String)> = o
+                .diagnostics
+                .iter()
+                .map(|d| (d.code, d.message.clone()))
+                .collect();
+            assert_eq!(
+                found,
+                [(
+                    codes::E_INVALID_POLICY_PARAM,
+                    format!("policy `T`: Shadow TLS cannot be combined with a `{kind}` policy")
+                )]
+            );
+        }
+    }
+
+    /// TUIC runs TLS over QUIC, whichever the version: the TLS options, and
+    /// with them the client certificate, and the QUIC options are its own.
+    #[test]
+    fn a_tuic_spec_has_tls_and_quic_options() {
+        for version in [
+            TuicVersion::V4 { token: "t".into() },
+            TuicVersion::V5 {
+                uuid: Secret::new([7; 16]),
+                password: "pw".into(),
+            },
+        ] {
+            let tuic = ProtoSpec::Tuic(TuicSpec {
+                tls: TlsOpts {
+                    alpn: vec!["h3".into()],
+                    client_cert: Some("cert1".into()),
+                    ..TlsOpts::default()
+                },
+                quic: QuicOpts {
+                    port_hopping: Some(PortHopping {
+                        ports: vec![5000..=6000],
+                        interval: quic::DEFAULT_HOP_INTERVAL,
+                    }),
+                },
+                version,
+            });
+            assert_eq!(tuic.keystore_item(), Some("cert1"));
+            assert_eq!(
+                tuic.tls().map(|tls| tls.alpn.clone()),
+                Some(vec!["h3".to_string()])
+            );
+            assert!(tuic.quic().is_some_and(|quic| quic.port_hopping.is_some()));
+        }
     }
 }

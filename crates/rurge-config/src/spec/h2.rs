@@ -6,7 +6,7 @@ use super::http::HeaderTemplate;
 use super::reader::ParamReader;
 use super::secret::Secret;
 use super::tls::{TlsOpts, read_tls};
-use super::{read_credentials, read_headers};
+use super::{read_credentials, read_headers, required};
 use crate::diagnostic::codes;
 use crate::keystore::KeystoreItem;
 
@@ -92,18 +92,6 @@ fn read_h2_headers(r: &mut ParamReader<'_>) -> Vec<HeaderTemplate> {
         false
     });
     headers
-}
-
-/// A named credential that must be there; its value is never quoted.
-fn required(r: &mut ParamReader<'_>, key: &str) -> Secret<String> {
-    let value = r.str(key).unwrap_or_default();
-    if value.is_empty() {
-        r.error(
-            codes::E_INVALID_POLICY_PARAM,
-            format!("`{key}` is required"),
-        );
-    }
-    Secret::from(value)
 }
 
 fn read_max_streams(r: &mut ParamReader<'_>) -> u32 {

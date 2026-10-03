@@ -34,7 +34,7 @@ pub struct VmessRead {
 }
 
 /// The usual 8-4-4-4-12 form, or the same 32 digits without hyphens.
-fn parse_uuid(text: &str) -> Option<[u8; 16]> {
+pub(crate) fn parse_uuid(text: &str) -> Option<[u8; 16]> {
     let text = text.trim();
     let digits: Vec<u8> = match text.len() {
         36 => {
