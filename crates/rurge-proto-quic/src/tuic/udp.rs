@@ -51,6 +51,7 @@ use super::Version;
 use super::addr::{self, NONE};
 use super::auth::{self, Auth, Authenticated};
 use super::heartbeat::{HEARTBEAT, Relaying};
+use crate::carrier::{Inbox, RouteClock, bounded};
 use crate::session::{Lease, Session};
 use bytes::Bytes;
 use quinn::{Connection, RecvStream};
@@ -61,22 +62,18 @@ use std::collections::{HashMap, VecDeque, hash_map};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinSet;
-use tokio::time::Instant;
 use tokio_util::task::AbortOnDropHandle;
 
-/// Packets waiting for the engine, per carrier; more are dropped, as a
-/// socket would.
-pub(super) const INBOX: usize = 64;
+/// The tests count on the inbox's size.
+#[cfg(test)]
+pub(super) use crate::carrier::INBOX;
+
 /// Packets (`quic` mode) and Dissociates waiting for the connection's
 /// writer; more are dropped, as a datagram the connection cannot take is.
 pub(super) const OUTBOX: usize = 64;
-/// How often a carrier asks where the policy leads (`Session::serves`): it
-/// can cost a group's resolution, and every packet would ask.
-const ROUTE_EVERY: Duration = Duration::from_secs(1);
 /// The most fragments a packet goes in: their count is one byte.
 const MAX_FRAGMENTS: usize = 255;
 /// The longest UDP datagram: what a packet's SIZE allows, and the longest
@@ -613,11 +610,10 @@ pub(super) struct TuicUdp {
     /// Held while a packet's fragments go out: concurrent sends of the
     /// carrier take turns.
     sending: Mutex<()>,
-    /// When the policy's route was last compared (`route_due`).
-    route_checked: Mutex<Option<Instant>>,
-    /// What the connections it binds to fill `inbox` through.
-    answers: mpsc::Sender<Answer>,
-    inbox: tokio::sync::Mutex<mpsc::Receiver<Answer>>,
+    /// When the policy's route was last compared.
+    route: RouteClock,
+    /// What the connections it binds to fill.
+    inbox: Inbox,
 }
 
 impl TuicUdp {
@@ -627,16 +623,14 @@ impl TuicUdp {
         session: Arc<Session<Auth>>,
         opts: &ConnectOpts,
     ) -> Result<TuicUdp, OutboundError> {
-        let (answers, inbox) = mpsc::channel(INBOX);
         let udp = TuicUdp {
             session,
             opts: opts.clone(),
             bound: Mutex::default(),
             packets: AtomicU16::new(0),
             sending: Mutex::default(),
-            route_checked: Mutex::default(),
-            answers,
-            inbox: tokio::sync::Mutex::new(inbox),
+            route: RouteClock::default(),
+            inbox: Inbox::new(),
         };
         udp.bind().await?;
         Ok(udp)
@@ -652,11 +646,7 @@ impl TuicUdp {
         let Some(bound) = self.bound.lock().expect("bound").clone() else {
             return Ok(None);
         };
-        let serves = if self.route_due() {
-            self.session.serves(&bound.lease)
-        } else {
-            self.session.serves_without_route(&bound.lease)
-        };
+        let serves = self.route.serves(&self.session, &bound.lease);
         if serves {
             return Ok(Some(bound));
         }
@@ -676,19 +666,6 @@ impl TuicUdp {
         self.packets.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Whether the policy's route is to be compared now: it is when it was
-    /// not within the last second, or at all, and this then counts as the
-    /// comparison.
-    fn route_due(&self) -> bool {
-        let mut checked = self.route_checked.lock().expect("route checked");
-        let now = Instant::now();
-        if checked.is_some_and(|at| now.duration_since(at) < ROUTE_EVERY) {
-            return false;
-        }
-        *checked = Some(now);
-        true
-    }
-
     /// Binds the carrier to the session's connection — a lease on it, the
     /// connection dialed when there is none — under an association id that
     /// connection gives it.
@@ -699,7 +676,7 @@ impl TuicUdp {
         if let Some(current) = bound.as_ref().filter(|bound| bound.is_on(&lease)) {
             return Ok(current.clone());
         }
-        let Some(id) = lease.state().udp.join(&self.answers) else {
+        let Some(id) = lease.state().udp.join(self.inbox.sender()) else {
             return Err(OutboundError::Proxy(
                 "tuic: no association id is free on the connection".to_string(),
             ));
@@ -725,14 +702,7 @@ impl TuicUdp {
     /// `bind` for a send: within the carrier's budget, failing as a send
     /// fails.
     async fn rebind(&self) -> io::Result<Arc<Bound>> {
-        match tokio::time::timeout(self.opts.timeout, self.bind()).await {
-            Ok(Ok(bound)) => Ok(bound),
-            Ok(Err(e)) => Err(io::Error::other(e.to_string())),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                OutboundError::Timeout.to_string(),
-            )),
-        }
+        bounded(&self.opts, self.bind()).await
     }
 
     /// Lets go of `bound`, unless the carrier is bound elsewhere already.
@@ -856,19 +826,7 @@ impl PacketSocket for TuicUdp {
 
     /// A packet longer than `buf` is dropped: give it 64 KiB.
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
-        Box::pin(async move {
-            let mut inbox = self.inbox.lock().await;
-            loop {
-                // `self` holds a sender: the inbox never closes
-                let Some((packet, from)) = inbox.recv().await else {
-                    return Err(io::ErrorKind::BrokenPipe.into());
-                };
-                if let Some(space) = buf.get_mut(..packet.len()) {
-                    space.copy_from_slice(&packet);
-                    return Ok((packet.len(), from));
-                }
-            }
-        })
+        Box::pin(self.inbox.recv_from(buf))
     }
 }
 

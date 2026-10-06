@@ -1,8 +1,8 @@
 //! What the CONNECT proxies over HTTP/3 share — `masque`, and
-//! `trust-tunnel` with `h3=true` (phase 2 M7 design 7.1, 7.2): the HTTP/3
-//! client a connection keeps (`Connected`), how a request on it fails
-//! (`failure`), and the tunnel of a classic CONNECT (RFC 9114 4.4) on a
-//! stream of its own (`open`).
+//! `trust-tunnel` with `h3=true` (phase 2 M7 design 7.1, 7.2): HTTP/3 on
+//! each new connection (`Http3`), the client a connection keeps
+//! (`Connected`), how a request on it fails (`failure`), and the tunnel of
+//! a classic CONNECT (RFC 9114 4.4) on a stream of its own (`tunnel`).
 //!
 //! - The request goes out at once: a classic CONNECT needs nothing of the
 //!   server's SETTINGS.
@@ -18,12 +18,15 @@
 //!   of a request below the GOAWAY's limit on its own stream too: the
 //!   server may have processed it.
 
-use crate::session::{Failure, Lease};
+use crate::session::{Failure, Lease, Protocol, Session};
 use http::{Request, StatusCode};
-use quinn::VarInt;
+use quinn::{Connection, VarInt};
+use rurge_net::BoxFuture;
+use rurge_net::connector::{BoxedStream, ConnectOpts};
 use rurge_net::quic::h3::{self, RequestStream};
 use rurge_proto::OutboundError;
 use std::io;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -31,12 +34,81 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// H3_NO_ERROR (RFC 9114 8.1): a connection let go of.
 pub(crate) const H3_NO_ERROR: VarInt = VarInt::from_u32(0x100);
 
+/// A CONNECT proxy over HTTP/3, as its connections need it.
+pub(crate) trait Proxy: Send + Sync + 'static {
+    /// As its log lines begin (`masque`).
+    const NAME: &'static str;
+
+    /// Whether its HTTP/3 announces HTTP Datagrams and reads the
+    /// connection's QUIC datagrams as them (`h3::Client::with_datagrams`).
+    const DATAGRAMS: bool;
+}
+
+/// What every new connection of the proxy `X` runs before its requests:
+/// HTTP/3, nothing more — each request carries its own credentials.
+pub(crate) struct Http3<X>(PhantomData<X>);
+
+impl<X> Http3<X> {
+    pub(crate) const fn new() -> Http3<X> {
+        Http3(PhantomData)
+    }
+}
+
+impl<X: Proxy> Protocol for Http3<X> {
+    type State = Connected;
+
+    const NAME: &'static str = X::NAME;
+
+    const NO_ERROR: VarInt = H3_NO_ERROR;
+
+    /// Our SETTINGS go out, and requests may follow at once: a classic
+    /// CONNECT waits for nothing of the server's (a CONNECT-UDP, for its
+    /// SETTINGS alone).
+    fn handshake<'a>(
+        &'a self,
+        connection: &'a Connection,
+    ) -> BoxFuture<'a, Result<Connected, OutboundError>> {
+        Box::pin(async move {
+            let h3 = if X::DATAGRAMS {
+                h3::Client::with_datagrams(connection.clone())
+            } else {
+                h3::Client::new(connection.clone())
+            };
+            Ok(Connected { h3 })
+        })
+    }
+
+    /// The server sent GOAWAY: it is going down.
+    fn is_going_away(&self, state: &Connected) -> bool {
+        state.h3.is_going_away()
+    }
+}
+
 /// What a connection keeps for its requests.
 pub(crate) struct Connected {
     /// Lives as long as the connection: dropped, it would end our HTTP/3
     /// control stream, which a server may take for the end of HTTP/3 on the
     /// connection.
     pub(crate) h3: h3::Client,
+}
+
+/// The tunnel `request` — a classic CONNECT — asks for through one of
+/// `session`'s connections (`open`), `refused` wording a final status
+/// other than 2xx: one budget, `opts.timeout`, for the connection (when one
+/// is dialed), QUIC's handshake and the proxy's response.
+pub(crate) async fn tunnel<P: Protocol<State = Connected>>(
+    session: &Session<P>,
+    request: Request<()>,
+    refused: fn(StatusCode) -> OutboundError,
+    opts: &ConnectOpts,
+) -> Result<BoxedStream, OutboundError> {
+    let tunnel = session.request(opts, |lease| {
+        Box::pin(open(lease, request.clone(), refused))
+    });
+    match tokio::time::timeout(opts.timeout, tunnel).await {
+        Ok(tunnel) => Ok(Box::new(tunnel?) as BoxedStream),
+        Err(_) => Err(OutboundError::Timeout),
+    }
 }
 
 /// How a request failed before its response came — on `stream` once it has
@@ -59,7 +131,7 @@ pub(crate) fn failure(lease: &Lease<Connected>, stream: Option<u64>, e: io::Erro
 /// of `lease`: the request on a stream of its own, then the proxy's
 /// response; a final status other than 2xx is the error `refused` words.
 /// The stream handed back is the caller's.
-pub(crate) async fn open(
+async fn open(
     lease: Lease<Connected>,
     request: Request<()>,
     refused: fn(StatusCode) -> OutboundError,
@@ -93,7 +165,7 @@ pub(crate) async fn open(
 /// sends the FIN the target then sees; reading goes on to the proxy's.
 /// Dropped before both directions ended, the stream is cancelled both ways
 /// (RFC 9114 4.1.1). No `Debug`: nothing in it is worth printing.
-pub(crate) struct Tunnel {
+struct Tunnel {
     stream: RequestStream,
     /// The task whose write, flush or shutdown waits for the stream to take
     /// it: it sends the rest of a frame itself.

@@ -38,6 +38,7 @@
 //!   once.
 
 use super::{Http3, proxy, refused};
+use crate::carrier::{Inbox, RouteClock, bounded};
 use crate::connect::{Connected, failure};
 use crate::session::{Failure, Lease, Protocol, Session};
 use crate::varint;
@@ -53,7 +54,6 @@ use rurge_net::quic::h3::{
     self, Datagrams, RequestStream, SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_H3_DATAGRAM,
     Settings,
 };
-use rurge_proto::OutboundError;
 use rurge_proto::connect_udp::{self, MAX_PAYLOAD, masque_path};
 use std::collections::HashMap;
 use std::io;
@@ -67,15 +67,13 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
-/// Packets waiting for the engine, per carrier; more are dropped, as a
-/// socket would.
-pub(super) const INBOX: usize = 64;
+/// The tests count on the inbox's size.
+#[cfg(test)]
+use crate::carrier::INBOX;
+
 /// A target's stream closes after this long without a datagram either way:
 /// the engine's flow idle (M5-D7), as `h2-connect`'s.
 pub(super) const IDLE: Duration = Duration::from_secs(60);
-/// How often a carrier asks where the policy leads (`Session::serves`): it
-/// can cost a group's resolution, and every datagram would ask.
-const ROUTE_EVERY: Duration = Duration::from_secs(1);
 /// `capsule-protocol` (RFC 9297 3.4).
 const CAPSULE_PROTOCOL: HeaderName = HeaderName::from_static("capsule-protocol");
 
@@ -269,11 +267,10 @@ pub(super) struct MasqueUdp {
     opts: ConnectOpts,
     idle: Duration,
     streams: Arc<Streams>,
-    /// When the policy's route was last compared (`route_due`).
-    route_checked: Mutex<Option<Instant>>,
-    /// What the streams' readers fill `inbox` through.
-    answers: mpsc::Sender<Packet>,
-    inbox: tokio::sync::Mutex<mpsc::Receiver<Packet>>,
+    /// When the policy's route was last compared.
+    route: RouteClock,
+    /// What the streams' readers fill.
+    inbox: Inbox,
 }
 
 impl MasqueUdp {
@@ -286,7 +283,6 @@ impl MasqueUdp {
         opts: ConnectOpts,
         idle: Duration,
     ) -> MasqueUdp {
-        let (answers, inbox) = mpsc::channel(INBOX);
         MasqueUdp {
             session,
             authority,
@@ -294,9 +290,8 @@ impl MasqueUdp {
             opts,
             idle,
             streams: Arc::default(),
-            route_checked: Mutex::default(),
-            answers,
-            inbox: tokio::sync::Mutex::new(inbox),
+            route: RouteClock::default(),
+            inbox: Inbox::new(),
         }
     }
 
@@ -324,27 +319,7 @@ impl MasqueUdp {
     /// the policy leads is asked at most once a second, the rest every
     /// time.
     fn serves(&self, stream: &Stream) -> bool {
-        if stream.ended.is_cancelled() {
-            return false;
-        }
-        if self.route_due() {
-            self.session.serves(&stream.lease)
-        } else {
-            self.session.serves_without_route(&stream.lease)
-        }
-    }
-
-    /// Whether the policy's route is to be compared now: it is when it was
-    /// not within the last second, or at all, and this then counts as the
-    /// comparison.
-    fn route_due(&self) -> bool {
-        let mut checked = self.route_checked.lock().expect("route checked");
-        let now = Instant::now();
-        if checked.is_some_and(|at| now.duration_since(at) < ROUTE_EVERY) {
-            return false;
-        }
-        *checked = Some(now);
-        true
+        !stream.ended.is_cancelled() && self.route.serves(&self.session, &stream.lease)
     }
 
     /// `to`'s stream: the one it has while that takes the datagram, else
@@ -409,23 +384,14 @@ impl MasqueUdp {
             lease,
             stream,
             datagrams,
-        } = match tokio::time::timeout(self.opts.timeout, opening).await {
-            Ok(Ok(opened)) => opened,
-            Ok(Err(e)) => return Err(io::Error::other(e.to_string())),
-            Err(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    OutboundError::Timeout.to_string(),
-                ));
-            }
-        };
+        } = bounded(&self.opts, opening).await?;
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let datagrams = Arc::new(datagrams);
         let last = Arc::new(Mutex::new(Instant::now()));
         let ended = CancellationToken::new();
         let reader = tokio::spawn({
             let (datagrams, last, ended) = (datagrams.clone(), last.clone(), ended.clone());
-            let (answers, to, idle) = (self.answers.clone(), to.clone(), self.idle);
+            let (answers, to, idle) = (self.inbox.sender().clone(), to.clone(), self.idle);
             let streams = Arc::downgrade(&self.streams);
             async move {
                 let why = read(stream, &datagrams, &to, &answers, &last, idle).await;
@@ -598,19 +564,7 @@ impl PacketSocket for MasqueUdp {
 
     /// A packet longer than `buf` is dropped: give it 64 KiB.
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
-        Box::pin(async move {
-            let mut inbox = self.inbox.lock().await;
-            loop {
-                // `self` holds a sender: the inbox never closes
-                let Some((packet, from)) = inbox.recv().await else {
-                    return Err(io::ErrorKind::BrokenPipe.into());
-                };
-                if let Some(space) = buf.get_mut(..packet.len()) {
-                    space.copy_from_slice(&packet);
-                    return Ok((packet.len(), from));
-                }
-            }
-        })
+        Box::pin(self.inbox.recv_from(buf))
     }
 }
 

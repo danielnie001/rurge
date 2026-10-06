@@ -4,6 +4,7 @@
 //! `trust-tunnel` over HTTP/3 (`trust_tunnel`), as many as its requests
 //! need, each carrying `max-streams` of them at most.
 
+mod carrier;
 mod connect;
 pub mod hysteria2;
 pub mod masque;

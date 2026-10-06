@@ -18,16 +18,14 @@
 mod tcp;
 mod udp;
 
-use crate::connect::{self, Connected, H3_NO_ERROR};
-use crate::session::{Dialer, Protocol, Session};
+use crate::connect;
+use crate::session::{Dialer, Session};
 use http::StatusCode;
 use http::header::HeaderValue;
-use quinn::{Connection, VarInt};
 use rurge_config::KeystoreItem;
 use rurge_config::spec::{MasqueSpec, Tristate};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target};
-use rurge_net::quic::h3;
 use rurge_proto::build::tls_name;
 use rurge_proto::http::{basic_authorization, wire_host};
 use rurge_proto::{BuildError, Outbound, OutboundError, UdpSupport};
@@ -78,7 +76,7 @@ impl MasqueOutbound {
         });
         Ok(MasqueOutbound {
             name: name.to_string(),
-            session: Arc::new(Session::new(name, dialer, Http3)),
+            session: Arc::new(Session::new(name, dialer, Http3::new())),
             authorization,
             udp_authority: format!("{host}:{}", named.port),
         })
@@ -98,36 +96,18 @@ fn refused(status: StatusCode) -> OutboundError {
     }
 }
 
-/// What every new connection runs before its requests: HTTP/3, nothing
-/// more — each request carries its own credentials.
-struct Http3;
+/// MASQUE as a CONNECT proxy over HTTP/3: HTTP Datagrams announced, which
+/// CONNECT-UDP rides (`udp`).
+struct Masque;
 
-impl Protocol for Http3 {
-    type State = Connected;
-
+impl connect::Proxy for Masque {
     const NAME: &'static str = "masque";
 
-    const NO_ERROR: VarInt = H3_NO_ERROR;
-
-    /// Our SETTINGS go out, and requests may follow at once: a classic
-    /// CONNECT waits for nothing of the server's, a CONNECT-UDP for its
-    /// SETTINGS alone (`udp`).
-    fn handshake<'a>(
-        &'a self,
-        connection: &'a Connection,
-    ) -> BoxFuture<'a, Result<Connected, OutboundError>> {
-        Box::pin(async move {
-            Ok(Connected {
-                h3: h3::Client::with_datagrams(connection.clone()),
-            })
-        })
-    }
-
-    /// The server sent GOAWAY: it is going down.
-    fn is_going_away(&self, state: &Connected) -> bool {
-        state.h3.is_going_away()
-    }
+    const DATAGRAMS: bool = true;
 }
+
+/// What every new connection runs before its requests (`connect::Http3`).
+type Http3 = connect::Http3<Masque>;
 
 impl Outbound for MasqueOutbound {
     fn name(&self) -> &str {
@@ -142,15 +122,7 @@ impl Outbound for MasqueOutbound {
         Box::pin(async move {
             // never dial for a target whose name cannot be sent
             let request = tcp::request(target, self.authorization.as_ref())?;
-            // one budget for the connection (when one is dialed), QUIC's
-            // handshake and the proxy's response
-            let tunnel = self.session.request(opts, |lease| {
-                Box::pin(connect::open(lease, request.clone(), refused))
-            });
-            match tokio::time::timeout(opts.timeout, tunnel).await {
-                Ok(tunnel) => Ok(Box::new(tunnel?) as BoxedStream),
-                Err(_) => Err(OutboundError::Timeout),
-            }
+            connect::tunnel(&self.session, request, refused, opts).await
         })
     }
 
@@ -180,9 +152,10 @@ impl Outbound for MasqueOutbound {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connect::H3_NO_ERROR;
     use crate::test_log::Log;
     use crate::testing::{FakeH3Proxy, H3ProxyScript, RecordedH3Request};
-    use quinn::ConnectionError;
+    use quinn::{Connection, ConnectionError};
     use rurge_config::policy::parse_policy;
     use rurge_config::spec::masque::read_masque;
     use rurge_config::spec::{CommonOpts, ParamReader, PortHopping};

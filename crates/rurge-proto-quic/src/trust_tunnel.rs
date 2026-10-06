@@ -20,14 +20,12 @@
 //!   the tunnel runs "over HTTP/3 (QUIC) instead of HTTP/2 over TLS"
 //!   (manual).
 
-use crate::connect::{self, Connected, H3_NO_ERROR};
-use crate::session::{Dialer, Protocol, Session};
-use quinn::{Connection, VarInt};
+use crate::connect;
+use crate::session::{Dialer, Session};
 use rurge_config::KeystoreItem;
 use rurge_config::spec::{HeaderTemplate, QuicOpts, Tristate, TrustTunnelSpec};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
-use rurge_net::quic::h3;
 use rurge_proto::http::basic_authorization;
 use rurge_proto::trust_tunnel::{connect_request, refused};
 use rurge_proto::{BuildError, Outbound, OutboundError};
@@ -79,42 +77,24 @@ impl TrustTunnelH3Outbound {
         let max_streams = spec.max_streams as usize;
         Ok(TrustTunnelH3Outbound {
             name: name.to_string(),
-            session: Session::new(name, dialer, Http3).with_stream_cap(max_streams),
+            session: Session::new(name, dialer, Http3::new()).with_stream_cap(max_streams),
             authorization: basic_authorization(spec.username.expose(), spec.password.expose()),
             headers: spec.headers.clone(),
         })
     }
 }
 
-/// What every new connection runs before its tunnels: HTTP/3, nothing
-/// more — each request carries the credentials.
-struct Http3;
+/// `trust-tunnel` as a CONNECT proxy over HTTP/3: without HTTP Datagrams.
+struct TrustTunnel;
 
-impl Protocol for Http3 {
-    type State = Connected;
-
+impl connect::Proxy for TrustTunnel {
     const NAME: &'static str = "trust-tunnel";
 
-    const NO_ERROR: VarInt = H3_NO_ERROR;
-
-    /// Our SETTINGS go out, and tunnels may follow at once: a classic
-    /// CONNECT waits for nothing of the server's.
-    fn handshake<'a>(
-        &'a self,
-        connection: &'a Connection,
-    ) -> BoxFuture<'a, Result<Connected, OutboundError>> {
-        Box::pin(async move {
-            Ok(Connected {
-                h3: h3::Client::new(connection.clone()),
-            })
-        })
-    }
-
-    /// The server sent GOAWAY: it is going down.
-    fn is_going_away(&self, state: &Connected) -> bool {
-        state.h3.is_going_away()
-    }
+    const DATAGRAMS: bool = false;
 }
+
+/// What every new connection runs before its tunnels (`connect::Http3`).
+type Http3 = connect::Http3<TrustTunnel>;
 
 impl Outbound for TrustTunnelH3Outbound {
     fn name(&self) -> &str {
@@ -132,15 +112,7 @@ impl Outbound for TrustTunnelH3Outbound {
         Box::pin(async move {
             // never dial for a target whose name cannot be sent
             let request = connect_request(target, &self.authorization, &self.headers)?;
-            // one budget for the connection (when one is dialed), QUIC's
-            // handshake and the server's response
-            let tunnel = self.session.request(opts, |lease| {
-                Box::pin(connect::open(lease, request.clone(), refused))
-            });
-            match tokio::time::timeout(opts.timeout, tunnel).await {
-                Ok(tunnel) => Ok(Box::new(tunnel?) as BoxedStream),
-                Err(_) => Err(OutboundError::Timeout),
-            }
+            connect::tunnel(&self.session, request, refused, opts).await
         })
     }
 }
@@ -148,6 +120,7 @@ impl Outbound for TrustTunnelH3Outbound {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connect::H3_NO_ERROR;
     use crate::test_log::Log;
     use crate::testing::{FakeH3Proxy, H3ProxyScript};
     use quinn::ConnectionError;

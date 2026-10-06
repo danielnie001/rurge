@@ -29,6 +29,7 @@
 
 use super::auth::{Auth, Authenticated};
 use super::{MAX_ADDRESS, address};
+use crate::carrier::{Inbox, RouteClock, bounded};
 use crate::session::{Lease, Session};
 use crate::varint;
 use bytes::Bytes;
@@ -41,17 +42,13 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::time::Instant;
 use tokio_util::task::AbortOnDropHandle;
 
-/// Datagrams waiting for the engine, per carrier; more are dropped, as a
-/// socket would.
-pub(super) const INBOX: usize = 64;
-/// How often a carrier asks where the policy leads (`Session::serves`): it
-/// can cost a group's resolution, and every datagram would ask.
-const ROUTE_EVERY: Duration = Duration::from_secs(1);
+/// The tests count on the inbox's size.
+#[cfg(test)]
+pub(super) use crate::carrier::INBOX;
+
 /// The most fragments a datagram goes in: their count is one byte.
 const MAX_FRAGMENTS: usize = 255;
 /// The longest datagram put together: no UDP datagram is longer.
@@ -400,11 +397,10 @@ pub(super) struct Hysteria2Udp {
     /// carrier take turns, as the server puts one datagram of the session
     /// together at a time.
     sending: Mutex<()>,
-    /// When the policy's route was last compared (`route_due`).
-    route_checked: Mutex<Option<Instant>>,
-    /// What the connections it binds to fill `inbox` through.
-    answers: mpsc::Sender<Packet>,
-    inbox: tokio::sync::Mutex<mpsc::Receiver<Packet>>,
+    /// When the policy's route was last compared.
+    route: RouteClock,
+    /// What the connections it binds to fill.
+    inbox: Inbox,
 }
 
 impl Hysteria2Udp {
@@ -415,16 +411,14 @@ impl Hysteria2Udp {
         ids: Arc<SessionIds>,
         opts: &ConnectOpts,
     ) -> Result<Hysteria2Udp, OutboundError> {
-        let (answers, inbox) = mpsc::channel(INBOX);
         let udp = Hysteria2Udp {
             session,
             ids,
             opts: opts.clone(),
             bound: Mutex::default(),
             sending: Mutex::default(),
-            route_checked: Mutex::default(),
-            answers,
-            inbox: tokio::sync::Mutex::new(inbox),
+            route: RouteClock::default(),
+            inbox: Inbox::new(),
         };
         udp.bind().await?;
         Ok(udp)
@@ -435,25 +429,8 @@ impl Hysteria2Udp {
     /// on every call, where the policy leads at most once a second.
     fn current(&self) -> Option<Arc<Bound>> {
         let bound = self.bound.lock().expect("bound").clone()?;
-        let serves = if self.route_due() {
-            self.session.serves(&bound.lease)
-        } else {
-            self.session.serves_without_route(&bound.lease)
-        };
+        let serves = self.route.serves(&self.session, &bound.lease);
         serves.then_some(bound)
-    }
-
-    /// Whether the policy's route is to be compared now: it is when it was
-    /// not within the last second, or at all, and this then counts as the
-    /// comparison.
-    fn route_due(&self) -> bool {
-        let mut checked = self.route_checked.lock().expect("route checked");
-        let now = Instant::now();
-        if checked.is_some_and(|at| now.duration_since(at) < ROUTE_EVERY) {
-            return false;
-        }
-        *checked = Some(now);
-        true
     }
 
     /// Binds the carrier to the session's connection — a lease on it, the
@@ -474,7 +451,7 @@ impl Hysteria2Udp {
             return Ok(current.clone());
         }
         let id = bound.as_ref().map_or_else(|| self.ids.next(), |old| old.id);
-        let id = udp.join(id, &self.answers, &self.ids);
+        let id = udp.join(id, self.inbox.sender(), &self.ids);
         if bound.is_some() {
             tracing::debug!("hysteria2: UDP session {id} moves to a new connection");
         }
@@ -489,14 +466,7 @@ impl Hysteria2Udp {
     /// `bind` for a send: within the carrier's budget, failing as a send
     /// fails.
     async fn rebind(&self) -> io::Result<Arc<Bound>> {
-        match tokio::time::timeout(self.opts.timeout, self.bind()).await {
-            Ok(Ok(bound)) => Ok(bound),
-            Ok(Err(e)) => Err(io::Error::other(e.to_string())),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                OutboundError::Timeout.to_string(),
-            )),
-        }
+        bounded(&self.opts, self.bind()).await
     }
 }
 
@@ -545,19 +515,7 @@ impl PacketSocket for Hysteria2Udp {
 
     /// A datagram longer than `buf` is dropped: give it 64 KiB.
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
-        Box::pin(async move {
-            let mut inbox = self.inbox.lock().await;
-            loop {
-                // `self` holds a sender: the inbox never closes
-                let Some((datagram, from)) = inbox.recv().await else {
-                    return Err(io::ErrorKind::BrokenPipe.into());
-                };
-                if let Some(space) = buf.get_mut(..datagram.len()) {
-                    space.copy_from_slice(&datagram);
-                    return Ok((datagram.len(), from));
-                }
-            }
-        })
+        Box::pin(self.inbox.recv_from(buf))
     }
 }
 
@@ -579,8 +537,10 @@ mod tests {
     use std::net::SocketAddr;
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
     use tokio::sync::Barrier;
     use tokio::task::JoinSet;
+    use tokio::time::Instant;
 
     const SOURCE: &str = "192.0.2.1:53";
 
