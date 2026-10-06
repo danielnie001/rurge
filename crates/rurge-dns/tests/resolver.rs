@@ -1,12 +1,13 @@
 //! End to end: profile text → `Resolver` → in-process upstreams over every
-//! transport (UDP, tcp://, tls://, https://), the manual's retry and
-//! partial-result timing with the default 1 s / 5 attempts, `[Host]`
-//! `server:` URLs bootstrapped by traditional upstreams, and set keys.
+//! transport (UDP, tcp://, tls://, https://, quic://, h3://), the manual's
+//! retry and partial-result timing with the default 1 s / 5 attempts,
+//! `[Host]` `server:` URLs bootstrapped by traditional upstreams, and set
+//! keys.
 
 use rurge_config::config::{LoadOptions, from_text};
-use rurge_dns::message::{Qtype, Question, Rcode, build_response};
+use rurge_dns::message::{Qtype, Question, Rcode, build_response, parse_query};
 use rurge_dns::system::StaticSystemDns;
-use rurge_dns::testing::MockDns;
+use rurge_dns::testing::{Doh3Script, DoqScript, FakeDoh3, FakeDoq, MockDns};
 use rurge_dns::{HostKind, LookupOpts, Resolver, ResolverConfig, ResolverDeps, Source};
 use rurge_net::connector::{DirectConnector, SystemResolve};
 use rurge_net::http::{HttpClient, HttpClientConfig};
@@ -180,6 +181,135 @@ async fn host_server_url_is_bootstrapped_by_traditional_upstreams() {
         "the name itself never went to the UDP upstream"
     );
     assert_eq!(corp.queries()[0].1, "tcp");
+}
+
+/// A profile whose encrypted DNS server is `url`, its certificate
+/// unverified (the fakes' is self-signed), A and AAAA asked.
+fn encrypted_profile(url: &str) -> String {
+    profile(
+        &format!(
+            "encrypted-dns-server = {url}\nencrypted-dns-skip-cert-verification = true\nipv6 = true"
+        ),
+        "",
+    )
+}
+
+fn with_ipv6() -> StaticSystemDns {
+    StaticSystemDns {
+        has_ipv6: true,
+        ..StaticSystemDns::default()
+    }
+}
+
+/// DoQ: A and AAAA on one connection, each on a stream of its own, with ID
+/// 0 and padded; the caller's IDs come back (the answers match them).
+#[tokio::test]
+async fn doq_answers_a_and_aaaa() {
+    let dns = MockDns::spawn().await;
+    dns.set("a.test", &["10.0.0.1"], &["fd00::1"], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let url = format!("quic://127.0.0.1:{}", doq.addr().port());
+    let (_d, r) = resolver(&encrypted_profile(&url), with_ipv6());
+    assert_eq!(r.primary_upstreams(), vec![url.clone()]);
+    let a = lookup(&r, "a.test").await;
+    assert_eq!(a.addrs(), vec![ip("10.0.0.1"), ip("fd00::1")]);
+    assert_eq!(a.source, Source::Upstream(url));
+    assert_eq!(doq.connections(), 1);
+    // a resend may have come too, should an answer have taken a second
+    let asked: Vec<_> = doq
+        .queries()
+        .iter()
+        .map(|q| {
+            assert_eq!(q.message().len() % 128, 0, "padded");
+            let (id, question) = parse_query(q.message()).unwrap();
+            (q.connection, id, question.qtype)
+        })
+        .collect();
+    for qtype in [Qtype::A, Qtype::Aaaa] {
+        assert!(asked.contains(&(0, 0, qtype)), "{asked:?}");
+    }
+    assert!(
+        asked
+            .iter()
+            .all(|&(connection, id, _)| (connection, id) == (0, 0))
+    );
+}
+
+/// DoH3: A and AAAA on one connection, POSTed to the default path with ID
+/// 0.
+#[tokio::test]
+async fn doh3_answers_a_and_aaaa() {
+    let dns = MockDns::spawn().await;
+    dns.set("a.test", &["10.0.0.2"], &["fd00::2"], 60);
+    let doh3 = FakeDoh3::spawn(&dns, Doh3Script::default());
+    let url = format!("h3://127.0.0.1:{}", doh3.addr().port());
+    let (_d, r) = resolver(&encrypted_profile(&url), with_ipv6());
+    let name = format!("{url}/dns-query");
+    assert_eq!(r.primary_upstreams(), vec![name.clone()]);
+    let a = lookup(&r, "a.test").await;
+    assert_eq!(a.addrs(), vec![ip("10.0.0.2"), ip("fd00::2")]);
+    assert_eq!(a.source, Source::Upstream(name));
+    assert_eq!(doh3.connections(), 1);
+    let requests = doh3.requests();
+    assert!(requests.len() >= 2, "{requests:?}");
+    for request in &requests {
+        assert_eq!(request.connection, 0);
+        assert_eq!(request.field(":method"), Some("POST"));
+        assert_eq!(request.field(":path"), Some("/dns-query"));
+        assert_eq!(parse_query(&request.body).unwrap().0, 0);
+    }
+}
+
+/// A DoQ server named by host is resolved through the traditional server,
+/// which is asked nothing else.
+#[tokio::test]
+async fn a_doq_server_named_by_host_is_bootstrapped() {
+    let udp = MockDns::spawn().await;
+    udp.set("doq.test", &["127.0.0.1"], &[], 60);
+    udp.set("a.test", &["10.0.0.99"], &[], 60);
+    let dns = MockDns::spawn().await;
+    dns.set("a.test", &["10.0.0.42"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let (_d, r) = resolver(
+        &profile(
+            &format!(
+                "dns-server = {}\nencrypted-dns-server = quic://doq.test:{}\nencrypted-dns-skip-cert-verification = true\nipv6 = false",
+                udp.addr(),
+                doq.addr().port()
+            ),
+            "",
+        ),
+        StaticSystemDns::default(),
+    );
+    assert_eq!(lookup(&r, "a.test").await.addrs(), vec![ip("10.0.0.42")]);
+    assert_eq!(udp.query_count("doq.test", Qtype::A), 1);
+    assert_eq!(udp.query_count("a.test", Qtype::A), 0);
+    assert!(dns.query_count("a.test", Qtype::A) >= 1);
+}
+
+/// `[Host]` can send a name to a DoQ server.
+#[tokio::test]
+async fn a_host_entry_names_a_doq_server() {
+    let udp = MockDns::spawn().await;
+    udp.set("corp.test", &["10.0.0.99"], &[], 60);
+    let dns = MockDns::spawn().await;
+    dns.set("corp.test", &["10.10.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let (_d, r) = resolver(
+        &profile(
+            &format!(
+                "dns-server = {}\nencrypted-dns-skip-cert-verification = true\nipv6 = false",
+                udp.addr()
+            ),
+            &format!("corp.test = server:quic://127.0.0.1:{}", doq.addr().port()),
+        ),
+        StaticSystemDns::default(),
+    );
+    let c = lookup(&r, "corp.test").await;
+    assert_eq!(c.addrs(), vec![ip("10.10.0.1")]);
+    assert_eq!(c.source, Source::Host(HostKind::Server));
+    assert_eq!(udp.query_count("corp.test", Qtype::A), 0);
+    assert!(!doq.queries().is_empty());
 }
 
 #[tokio::test]

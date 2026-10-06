@@ -14,14 +14,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// The transport parameters of a client connection. `STANDARD` is what
-/// every QUIC policy uses; tests shorten its times.
+/// every QUIC policy uses, `DNS` what a DNS server's connection uses; tests
+/// shorten their times.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transport {
     /// Closes the connection when nothing came from the server for this
     /// long: a path that died (sleep, a network change) is noticed.
     pub idle_timeout: Duration,
-    /// How often an otherwise idle connection proves it is alive.
-    pub keep_alive: Duration,
+    /// How often an otherwise idle connection proves it is alive; `None`
+    /// leaves it to idle out.
+    pub keep_alive: Option<Duration>,
     /// What a stream may receive before its reader catches up.
     pub stream_window: u32,
     /// What the connection's streams together may receive.
@@ -34,9 +36,17 @@ impl Transport {
     /// reference client's.
     pub const STANDARD: Transport = Transport {
         idle_timeout: Duration::from_secs(30),
-        keep_alive: Duration::from_secs(10),
+        keep_alive: Some(Duration::from_secs(10)),
         stream_window: 8 << 20,
         connection_window: 20 << 20,
+    };
+
+    /// A DNS server's connection (DoQ, DoH3): as `STANDARD`, but nothing
+    /// keeps it alive — unused, it idles out at the shorter of both ends'
+    /// idle timeouts, and the next query dials again.
+    pub const DNS: Transport = Transport {
+        keep_alive: None,
+        ..Transport::STANDARD
     };
 
     fn config(&self) -> TransportConfig {
@@ -44,7 +54,7 @@ impl Transport {
         config
             // a timeout too long to say is none
             .max_idle_timeout(IdleTimeout::try_from(self.idle_timeout).ok())
-            .keep_alive_interval(Some(self.keep_alive))
+            .keep_alive_interval(self.keep_alive)
             .stream_receive_window(VarInt::from_u32(self.stream_window))
             .receive_window(VarInt::from_u32(self.connection_window))
             // no protocol over QUIC here has the server open a
@@ -233,6 +243,27 @@ mod tests {
             "upper_bound: 1452,",
             "datagram_receive_buffer_size: Some(1250000),",
             "datagram_send_buffer_size: 1048576,",
+        ] {
+            assert!(config.contains(expected), "{expected} in {config}");
+        }
+    }
+
+    /// A DNS server's connection is the standard one, but nothing keeps it
+    /// alive.
+    #[test]
+    fn a_dns_connection_is_not_kept_alive() {
+        assert_eq!(
+            Transport::DNS,
+            Transport {
+                keep_alive: None,
+                ..Transport::STANDARD
+            }
+        );
+        let config = format!("{:?}", Transport::DNS.config());
+        for expected in [
+            "keep_alive_interval: None,",
+            "max_idle_timeout: Some(30000),",
+            "max_concurrent_bidi_streams: 0,",
         ] {
             assert!(config.contains(expected), "{expected} in {config}");
         }

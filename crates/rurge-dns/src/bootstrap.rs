@@ -1,9 +1,11 @@
 //! Bootstrap (design §7.2): the hostnames inside URL-type upstreams
-//! (`tcp://` / `tls://` / `https://`) are resolved only through traditional
-//! upstreams — the plain UDP servers, or the system's — with a small cache
-//! (minimum TTL 60 s). `BootstrapConnector` wraps the injected `Connector` so
-//! DoT / DoH connections dial the pre-resolved address while TLS still sees
-//! the hostname.
+//! (`tcp://` / `tls://` / `https://` / `h3://` / `quic://`) are resolved only
+//! through traditional upstreams — the plain UDP servers, or the system's —
+//! with a small cache (minimum TTL 60 s). `BootstrapConnector` wraps the
+//! injected `Connector` so DoT / DoH connections dial the pre-resolved
+//! address while TLS still sees the hostname; the DoQ / DoH3 upstreams
+//! resolve their server through the bootstrap themselves and open their
+//! QUIC paths on it to an address.
 
 use crate::cache::{CacheHit, CachedAddrs, DnsCache};
 use crate::fanout::{FanoutOpts, resolve_name};
@@ -11,7 +13,10 @@ use crate::upstream::{UpstreamError, UpstreamRef};
 use arc_swap::ArcSwap;
 use rurge_config::HostName;
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target, interleave};
+use rurge_net::connector::{
+    BoxedDatagram, BoxedStream, ConnectOpts, Connector, DirectConnector, Target, interleave,
+};
+use std::future::Future;
 use std::io;
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock, Weak};
@@ -164,6 +169,32 @@ impl BootstrapConnector {
     pub fn new(inner: Arc<dyn Connector>, bootstrap: Arc<Bootstrap>) -> BootstrapConnector {
         BootstrapConnector { inner, bootstrap }
     }
+
+    /// `dial` to `target`: an address as it is, a name to each of its
+    /// addresses through the bootstrap in turn, IPv4 first, until one
+    /// answers.
+    async fn each_address<T, F>(&self, target: &Target, dial: impl Fn(Target) -> F) -> io::Result<T>
+    where
+        F: Future<Output = io::Result<T>>,
+    {
+        let host = match &target.host {
+            HostName::Ip(_) => return dial(target.clone()).await,
+            HostName::Domain(d) => d,
+        };
+        let ips = self
+            .bootstrap
+            .resolve(host)
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let mut last = io::Error::new(io::ErrorKind::NotFound, format!("no addresses for {host}"));
+        for ip in interleave(ips, false) {
+            match dial(Target::new(HostName::Ip(ip), target.port)).await {
+                Ok(done) => return Ok(done),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
 }
 
 impl Connector for BootstrapConnector {
@@ -172,27 +203,26 @@ impl Connector for BootstrapConnector {
         target: &'a Target,
         opts: &'a ConnectOpts,
     ) -> BoxFuture<'a, io::Result<BoxedStream>> {
-        Box::pin(async move {
-            let host = match &target.host {
-                HostName::Ip(_) => return self.inner.connect(target, opts).await,
-                HostName::Domain(d) => d.clone(),
-            };
-            let ips = self
-                .bootstrap
-                .resolve(&host)
-                .await
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            let mut last =
-                io::Error::new(io::ErrorKind::NotFound, format!("no addresses for {host}"));
-            for ip in interleave(ips, false) {
-                let t = Target::new(HostName::Ip(ip), target.port);
-                match self.inner.connect(&t, opts).await {
-                    Ok(stream) => return Ok(stream),
-                    Err(e) => last = e,
-                }
-            }
-            Err(last)
-        })
+        Box::pin(self.each_address(target, move |target| async move {
+            self.inner.connect(&target, opts).await
+        }))
+    }
+
+    fn connect_udp<'a>(
+        &'a self,
+        target: &'a Target,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+        Box::pin(self.each_address(target, move |target| async move {
+            self.inner.connect_udp(&target, opts).await
+        }))
+    }
+
+    /// The inner connector, when it dials directly: a QUIC path then sends
+    /// from sockets of its own, to an address — which the DoQ / DoH3
+    /// upstreams give it, so that no resolver but the bootstrap is asked.
+    fn as_direct(&self) -> Option<&DirectConnector> {
+        self.inner.as_direct()
     }
 }
 
@@ -203,8 +233,9 @@ mod tests {
     use crate::testing::MockDns;
     use crate::upstream::udp::UdpUpstream;
     use rurge_net::connector::{DirectConnector, SystemResolve};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use std::future::poll_fn;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
+    use tokio::net::{TcpListener, UdpSocket};
 
     fn fast() -> FanoutOpts {
         FanoutOpts {
@@ -439,5 +470,58 @@ mod tests {
             .err()
             .expect("the only resolved address is unreachable");
         assert!(!err.to_string().is_empty());
+    }
+
+    /// UDP goes as TCP does: a name to its address through the bootstrap,
+    /// an address as it is. A QUIC path sees the inner connector's
+    /// directness.
+    #[tokio::test]
+    async fn connector_carries_udp_to_the_resolved_address() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+                let _ = echo.send_to(&buf[..n], peer).await;
+            }
+        });
+        let dns = MockDns::spawn().await;
+        dns.set("doq.example", &["127.0.0.1"], &[], 60);
+        let bootstrap = Bootstrap::new(vec![Arc::new(UdpUpstream::new(dns.addr()))], false, fast());
+        let connector = BootstrapConnector::new(
+            Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
+            bootstrap,
+        );
+        assert!(connector.as_direct().is_some());
+        for host in ["doq.example", "127.0.0.1"] {
+            let datagram = connector
+                .connect_udp(
+                    &Target::new(HostName::parse(host), port),
+                    &ConnectOpts::default(),
+                )
+                .await
+                .unwrap();
+            poll_fn(|cx| datagram.poll_send(cx, b"ping")).await.unwrap();
+            let mut buf = [0u8; 8];
+            let mut read = ReadBuf::new(&mut buf);
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                poll_fn(|cx| datagram.poll_recv(cx, &mut read)),
+            )
+            .await
+            .expect("the echo within the bound")
+            .unwrap();
+            assert_eq!(read.filled(), b"ping", "{host}");
+        }
+        assert_eq!(dns.query_count("doq.example", Qtype::A), 1);
+        let err = connector
+            .connect_udp(
+                &Target::new(HostName::parse("nx.example"), port),
+                &ConnectOpts::default(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("nx.example"), "{err}");
     }
 }

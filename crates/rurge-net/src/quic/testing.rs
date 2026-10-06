@@ -1,22 +1,24 @@
 //! Loopback QUIC servers for tests: a certificate and the configurations on
-//! either side of it, an echo server, and a server socket on several ports
-//! for port hopping. Never used by production code.
+//! either side of it, an echo server, a server socket on several ports for
+//! port hopping, and a port whose endpoints restart. Never used by
+//! production code.
 
 use super::socket::NeverBlocks;
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{
-    AsyncUdpSocket, Connection, Endpoint, EndpointConfig, Runtime, ServerConfig, TokioRuntime,
-    UdpPoller,
+    AsyncUdpSocket, Connection, ConnectionId, ConnectionIdGenerator, Endpoint, EndpointConfig,
+    Runtime, ServerConfig, TokioRuntime, UdpPoller,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::HashMap;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::task::JoinHandle;
 
 /// A self-signed certificate for `localhost` and `127.0.0.1`.
@@ -269,5 +271,138 @@ impl AsyncUdpSocket for MultiPort {
 
     fn may_fragment(&self) -> bool {
         self.sockets[0].may_fragment()
+    }
+}
+
+/// A loopback UDP port for QUIC servers that restart (phase 2 M7 design
+/// 3.5: the stale connection). Its endpoints share the key of their
+/// stateless resets and the scheme of their connection IDs, as a server
+/// restarted with the same configuration: a new endpoint knows none of the
+/// connections of the one before and answers their packets with a
+/// stateless reset (RFC 9000 10.3), which ends them at the client. The
+/// endpoint before hears and sends nothing any more.
+pub struct ServerPort {
+    socket: Arc<dyn AsyncUdpSocket>,
+    config: EndpointConfig,
+    /// The way to the port of the endpoint that answers now.
+    current: Mutex<Option<Arc<Gate>>>,
+}
+
+impl ServerPort {
+    /// On `127.0.0.1`, any port.
+    pub fn bind() -> ServerPort {
+        let mut config = EndpointConfig::default();
+        let ids = Arc::new(AtomicU64::new(1));
+        config.cid_generator(move || Box::new(SharedIds(ids.clone())));
+        ServerPort {
+            socket: loopback_socket(),
+            config,
+            current: Mutex::new(None),
+        }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.socket.local_addr().expect("the port's address")
+    }
+
+    /// A server endpoint presenting `config` that answers on the port from
+    /// now on; the one before it falls silent.
+    pub fn endpoint(&self, config: ServerConfig) -> Endpoint {
+        self.endpoint_over(config, |socket| socket)
+    }
+
+    /// As `endpoint`, its packets through what `layer` lays over the port
+    /// (a fake's obfuscation): a layer of its own for each endpoint.
+    pub fn endpoint_over(
+        &self,
+        config: ServerConfig,
+        layer: impl FnOnce(Arc<dyn AsyncUdpSocket>) -> Arc<dyn AsyncUdpSocket>,
+    ) -> Endpoint {
+        let gate = Arc::new(Gate {
+            socket: self.socket.clone(),
+            open: AtomicBool::new(true),
+        });
+        let before = self.current.lock().expect("the gate").replace(gate.clone());
+        if let Some(before) = before {
+            before.open.store(false, Ordering::SeqCst);
+        }
+        Endpoint::new_with_abstract_socket(
+            self.config.clone(),
+            Some(config),
+            layer(gate),
+            Arc::new(TokioRuntime),
+        )
+        .expect("a server endpoint")
+    }
+}
+
+/// Connection IDs from a counter that all of a port's endpoints share:
+/// never the same twice, and each taken for one of theirs (the trait's own
+/// check), so that a packet for a connection an endpoint never had gets a
+/// stateless reset instead of being dropped as not its own.
+struct SharedIds(Arc<AtomicU64>);
+
+impl ConnectionIdGenerator for SharedIds {
+    fn generate_cid(&mut self) -> ConnectionId {
+        ConnectionId::new(&self.0.fetch_add(1, Ordering::Relaxed).to_be_bytes())
+    }
+
+    fn cid_len(&self) -> usize {
+        8
+    }
+
+    fn cid_lifetime(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// One endpoint's way to the port: open, everything passes; closed — for
+/// good —, the endpoint hears nothing and what it sends is dropped.
+#[derive(Debug)]
+struct Gate {
+    socket: Arc<dyn AsyncUdpSocket>,
+    open: AtomicBool,
+}
+
+impl AsyncUdpSocket for Gate {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        self.socket.clone().create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
+        if self.open.load(Ordering::SeqCst) {
+            self.socket.try_send(transmit)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        if !self.open.load(Ordering::SeqCst) {
+            // never opened again: nothing to wake the endpoint for
+            return Poll::Pending;
+        }
+        self.socket.poll_recv(cx, bufs, meta)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.socket.max_transmit_segments()
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.socket.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.socket.may_fragment()
     }
 }

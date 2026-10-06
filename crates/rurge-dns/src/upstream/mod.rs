@@ -2,17 +2,20 @@
 //! DNS messages; message encoding lives in `crate::message`.
 
 pub mod doh;
+pub mod doh3;
+pub mod doq;
+mod session;
 pub mod tcp;
 pub mod udp;
 
-use rurge_config::general::{DnsServer, EncryptedDns, EncryptedDnsScheme};
+use rurge_config::general::{DnsServer, EncryptedDns};
 use rurge_config::host::DnsUpstream;
 use rurge_net::BoxFuture;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::time::Instant;
-use url::Url;
+use url::{Position, Url};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpstreamError {
@@ -54,10 +57,30 @@ pub type UpstreamRef = Arc<dyn Upstream>;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum UpstreamSpec {
     Udp(SocketAddr),
-    Tcp { host: String, port: u16 },
-    Tls { host: String, port: u16 },
+    Tcp {
+        host: String,
+        port: u16,
+    },
+    Tls {
+        host: String,
+        port: u16,
+    },
     Https(Url),
+    /// DNS over dedicated QUIC (RFC 9250): `quic://host[:port]`, port 853
+    /// unless it says.
+    Quic {
+        host: String,
+        port: u16,
+    },
+    /// DNS over HTTP/3: an `h3://` URL as the `https` one its requests go
+    /// to — port 443 unless it says, the path `/dns-query` unless it names
+    /// one.
+    H3(Url),
 }
+
+/// The path of an `h3://` URL that names none, as sing-box, hickory and
+/// CoreDNS take it (RFC 8484 itself sets none).
+const DEFAULT_H3_PATH: &str = "/dns-query";
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     let head = s.get(..prefix.len())?;
@@ -91,6 +114,42 @@ fn host_port(rest: &str, default_port: u16) -> Result<(String, u16), String> {
     Ok((host.trim_end_matches('.').to_ascii_lowercase(), port))
 }
 
+/// An `h3://` URL — `rest` follows the scheme — as the `https` one its
+/// requests go to: no user name or password, which HTTP/3 has no place to
+/// send (RFC 9114 4.3.1), no fragment, `DEFAULT_H3_PATH` when it names no
+/// path.
+fn h3_url(s: &str, rest: &str) -> Result<Url, String> {
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    if let Some(at) = authority.rfind('@') {
+        // quoted without what it carries
+        return Err(format!(
+            "`h3://{}`: an h3:// URL cannot carry a user name or a password",
+            &rest[at + 1..]
+        ));
+    }
+    let mut url = Url::parse(&format!("https://{rest}")).map_err(|e| format!("`{s}`: {e}"))?;
+    if url.path() == "/" {
+        url.set_path(DEFAULT_H3_PATH);
+    }
+    url.set_fragment(None);
+    Ok(url)
+}
+
+/// What an `H3` upstream is called: its URL with the scheme it was written
+/// with.
+fn h3_name(url: &Url) -> String {
+    format!("h3://{}", &url[Position::BeforeHost..])
+}
+
+/// `host:port`, an IPv6 address in brackets.
+fn host_port_text(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 impl UpstreamSpec {
     pub fn parse(s: &str) -> Result<UpstreamSpec, String> {
         let s = s.trim();
@@ -102,10 +161,17 @@ impl UpstreamSpec {
             }
             return Ok(UpstreamSpec::Https(url));
         }
-        if lower.starts_with("h3://") || lower.starts_with("quic://") {
-            return Err(format!(
-                "`{s}`: h3:// and quic:// upstreams are not supported until phase 2"
-            ));
+        if let Some(rest) = strip_prefix_ci(s, "h3://") {
+            return h3_url(s, rest).map(UpstreamSpec::H3);
+        }
+        if let Some(rest) = strip_prefix_ci(s, "quic://") {
+            if rest.trim_end_matches('/').contains(['/', '?', '#']) {
+                return Err(format!(
+                    "`{s}`: a quic:// URL names a host and a port, nothing else"
+                ));
+            }
+            let (host, port) = host_port(rest, 853).map_err(|e| format!("`{s}`: {e}"))?;
+            return Ok(UpstreamSpec::Quic { host, port });
         }
         if let Some(rest) = strip_prefix_ci(s, "tls://") {
             let (host, port) = host_port(rest, 853).map_err(|e| format!("`{s}`: {e}"))?;
@@ -126,7 +192,7 @@ impl UpstreamSpec {
             return Ok(UpstreamSpec::Udp(SocketAddr::new(ip, 53)));
         }
         Err(format!(
-            "`{s}`: expected ip[:port], tcp://, tls:// or https://"
+            "`{s}`: expected ip[:port], tcp://, tls://, https://, h3:// or quic://"
         ))
     }
 
@@ -138,13 +204,7 @@ impl UpstreamSpec {
     }
 
     pub fn from_encrypted(e: &EncryptedDns) -> Result<UpstreamSpec, String> {
-        match e.scheme {
-            EncryptedDnsScheme::H3 | EncryptedDnsScheme::Quic => Err(format!(
-                "`{}`: h3:// and quic:// upstreams are not supported until phase 2",
-                e.url
-            )),
-            _ => UpstreamSpec::parse(&e.url),
-        }
+        UpstreamSpec::parse(&e.url)
     }
 
     pub fn from_dns_upstream(u: &DnsUpstream) -> Result<UpstreamSpec, String> {
@@ -165,14 +225,18 @@ impl UpstreamSpec {
             UpstreamSpec::Tcp { host, port } => format!("tcp://{host}:{port}"),
             UpstreamSpec::Tls { host, port } => format!("tls://{host}:{port}"),
             UpstreamSpec::Https(url) => url.as_str().to_string(),
+            UpstreamSpec::Quic { host, port } => format!("quic://{}", host_port_text(host, *port)),
+            UpstreamSpec::H3(url) => h3_name(url),
         }
     }
 
     pub fn host(&self) -> Option<&str> {
         match self {
             UpstreamSpec::Udp(_) => None,
-            UpstreamSpec::Tcp { host, .. } | UpstreamSpec::Tls { host, .. } => Some(host),
-            UpstreamSpec::Https(url) => url.host_str(),
+            UpstreamSpec::Tcp { host, .. }
+            | UpstreamSpec::Tls { host, .. }
+            | UpstreamSpec::Quic { host, .. } => Some(host),
+            UpstreamSpec::Https(url) | UpstreamSpec::H3(url) => url.host_str(),
         }
     }
 
@@ -236,16 +300,14 @@ mod tests {
             UpstreamSpec::parse("https://dns.example.com/dns-query").unwrap(),
             UpstreamSpec::Https(_)
         ));
-        assert!(
-            UpstreamSpec::parse("h3://dns.example.com/dns-query")
-                .unwrap_err()
-                .contains("phase 2")
-        );
-        assert!(
-            UpstreamSpec::parse("quic://dns.example.com")
-                .unwrap_err()
-                .contains("phase 2")
-        );
+        assert!(matches!(
+            UpstreamSpec::parse("H3://dns.example.com/dns-query").unwrap(),
+            UpstreamSpec::H3(_)
+        ));
+        assert!(matches!(
+            UpstreamSpec::parse("Quic://dns.example.com").unwrap(),
+            UpstreamSpec::Quic { .. }
+        ));
         assert!(UpstreamSpec::parse("system").is_err());
         assert!(
             UpstreamSpec::parse("dns.example.com").is_err(),
@@ -289,11 +351,110 @@ mod tests {
             UpstreamSpec::Https(_)
         ));
         let h3 = EncryptedDns::parse("h3://dns.example.com/dns-query").unwrap();
-        assert!(UpstreamSpec::from_encrypted(&h3).is_err());
+        assert_eq!(
+            UpstreamSpec::from_encrypted(&h3).unwrap(),
+            UpstreamSpec::parse("h3://dns.example.com/dns-query").unwrap()
+        );
+        let doq = EncryptedDns::parse("quic://dns.example.com").unwrap();
+        assert_eq!(
+            UpstreamSpec::from_encrypted(&doq).unwrap(),
+            UpstreamSpec::Quic {
+                host: "dns.example.com".into(),
+                port: 853
+            }
+        );
         assert_eq!(
             UpstreamSpec::from_dns_upstream(&DnsUpstream::Udp("1.1.1.1:53".parse().unwrap()))
                 .unwrap(),
             UpstreamSpec::Udp("1.1.1.1:53".parse().unwrap())
         );
+    }
+
+    /// `quic://` names a host and a port — 853 unless it says —, nothing
+    /// else (RFC 9250 4.1.1).
+    #[test]
+    fn a_quic_url_is_a_host_and_a_port() {
+        for (url, host, port) in [
+            ("quic://dns.Example.com", "dns.example.com", 853),
+            ("quic://dns.example.com:8853", "dns.example.com", 8853),
+            ("quic://dns.example.com/", "dns.example.com", 853),
+            ("quic://[::1]:853", "::1", 853),
+            ("quic://127.0.0.1", "127.0.0.1", 853),
+        ] {
+            assert_eq!(
+                UpstreamSpec::parse(url).unwrap(),
+                UpstreamSpec::Quic {
+                    host: host.into(),
+                    port
+                },
+                "{url}"
+            );
+        }
+        for url in [
+            "quic://dns.example.com/dns-query",
+            "quic://dns.example.com:853/x/",
+            "quic://dns.example.com?x=1",
+            "quic://",
+            "quic://dns.example.com:99999",
+        ] {
+            assert!(UpstreamSpec::parse(url).is_err(), "{url}");
+        }
+        assert!(
+            UpstreamSpec::parse("quic://dns.example.com/dns-query")
+                .unwrap_err()
+                .contains("names a host and a port, nothing else")
+        );
+    }
+
+    /// `h3://` is the `https://` URL of its requests: port 443 unless it
+    /// says, the path `/dns-query` unless it names one, never a user name
+    /// or a password — which no error repeats.
+    #[test]
+    fn an_h3_url_defaults_to_port_443_and_the_dns_query_path() {
+        let spec = |url: &str| match UpstreamSpec::parse(url).unwrap() {
+            UpstreamSpec::H3(url) => url,
+            other => panic!("{other:?}"),
+        };
+        for url in [
+            "h3://dns.example.com",
+            "h3://DNS.example.com/",
+            "h3://dns.example.com:443",
+        ] {
+            let parsed = spec(url);
+            assert_eq!(
+                parsed.as_str(),
+                "https://dns.example.com/dns-query",
+                "{url}"
+            );
+            assert_eq!(parsed.port_or_known_default(), Some(443));
+        }
+        let parsed = spec("h3://dns.example.com:8443/q?x=1#part");
+        assert_eq!(parsed.as_str(), "https://dns.example.com:8443/q?x=1");
+        assert_eq!(spec("h3://[::1]/dns-query").host_str(), Some("[::1]"));
+        let err = UpstreamSpec::parse("h3://user:secret@dns.example.com/dns-query").unwrap_err();
+        assert_eq!(
+            err,
+            "`h3://dns.example.com/dns-query`: an h3:// URL cannot carry a user name or a password"
+        );
+        assert!(UpstreamSpec::parse("h3://user@dns.example.com").is_err());
+        assert!(UpstreamSpec::parse("h3://").is_err());
+    }
+
+    #[test]
+    fn quic_and_h3_names_hosts_and_bootstrap_need() {
+        let doq = UpstreamSpec::parse("quic://dns.example.com").unwrap();
+        assert_eq!(doq.name(), "quic://dns.example.com:853");
+        assert_eq!(doq.host(), Some("dns.example.com"));
+        assert!(doq.needs_bootstrap() && !doq.is_traditional());
+        let doq_v6 = UpstreamSpec::parse("quic://[::1]:8853").unwrap();
+        assert_eq!(doq_v6.name(), "quic://[::1]:8853");
+        assert!(!doq_v6.needs_bootstrap());
+        let doh3 = UpstreamSpec::parse("h3://dns.example.com").unwrap();
+        assert_eq!(doh3.name(), "h3://dns.example.com/dns-query");
+        assert_eq!(doh3.host(), Some("dns.example.com"));
+        assert!(doh3.needs_bootstrap());
+        let doh3_ip = UpstreamSpec::parse("h3://127.0.0.1:8443/q").unwrap();
+        assert_eq!(doh3_ip.name(), "h3://127.0.0.1:8443/q");
+        assert!(!doh3_ip.needs_bootstrap());
     }
 }

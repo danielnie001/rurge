@@ -90,7 +90,8 @@ pub fn run(args: DnsArgs) -> anyhow::Result<ExitCode> {
 }
 
 /// `--server` values follow the `dns-server` key: `system`, `ip[:port]`
-/// (`[v6]:port`), or an encrypted URL (`https://`, `tls://`, `tcp://`).
+/// (`[v6]:port`), or an encrypted URL (`https://`, `h3://`, `quic://`,
+/// `tls://`, `tcp://`).
 fn parse_servers(specs: &[String]) -> anyhow::Result<(Vec<DnsServer>, Vec<EncryptedDns>)> {
     let mut servers = Vec::new();
     let mut encrypted = Vec::new();

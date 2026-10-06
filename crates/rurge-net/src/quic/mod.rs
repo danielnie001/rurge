@@ -603,7 +603,7 @@ mod tests {
             Transport::STANDARD,
             Transport {
                 idle_timeout: Duration::from_secs(30),
-                keep_alive: Duration::from_secs(10),
+                keep_alive: Some(Duration::from_secs(10)),
                 stream_window: 8 * 1024 * 1024,
                 connection_window: 20 * 1024 * 1024,
             }
@@ -656,7 +656,7 @@ mod tests {
     async fn keep_alive_holds_an_idle_connection() {
         let transport = Transport {
             idle_timeout: Duration::from_secs(1),
-            keep_alive: Duration::from_millis(250),
+            keep_alive: Some(Duration::from_millis(250)),
             ..Transport::STANDARD
         };
         let (_server, client, _server_side) = pair(&transport).await;
@@ -670,7 +670,7 @@ mod tests {
         let transport = Transport {
             idle_timeout: Duration::from_millis(300),
             // past the idle timeout: no keep-alive in time
-            keep_alive: Duration::from_secs(10),
+            keep_alive: Some(Duration::from_secs(10)),
             ..Transport::STANDARD
         };
         let (_server, client, _server_side) = pair(&transport).await;

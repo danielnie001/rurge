@@ -5,7 +5,9 @@
 //! plain-UDP bootstrap first and hands this connector an IP target — so the
 //! pipeline never needs to resolve anything itself and cannot re-enter the
 //! resolver. The `Domain` arm below is only a defensive fallback. UDP
-//! upstreams never use a connector.
+//! upstreams never use a connector; the QUIC carriers of the DoQ / DoH3
+//! upstreams (`connect_udp`) go straight to the server through the
+//! fallback, the rules aside.
 
 use crate::engine::Engine;
 use rurge_config::HostName;
@@ -13,7 +15,7 @@ use rurge_config::rule::ProtocolKind;
 use rurge_config::session::{ListenerKind, SessionInfo, Transport};
 use rurge_inbound::{Counting, SessionHandle, SessionOutcome};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
+use rurge_net::connector::{BoxedDatagram, BoxedStream, ConnectOpts, Connector, Target};
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, Weak};
@@ -75,6 +77,16 @@ impl Connector for PipelineConnector {
             session.protocol = Some(protocol_for(target.port));
             engine.dial_internal(session, &self.fallback).await
         })
+    }
+
+    /// A QUIC carrier of the DoQ / DoH3 upstreams: straight to the server,
+    /// through the fallback.
+    fn connect_udp<'a>(
+        &'a self,
+        target: &'a Target,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+        self.fallback.connect_udp(target, opts)
     }
 }
 

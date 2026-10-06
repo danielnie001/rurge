@@ -1,11 +1,12 @@
 //! Wire-format encoding and decoding on top of hickory-proto (design §7.2):
 //! only what a stub resolver needs — A / AAAA questions and answers, EDNS
 //! payload size, response codes and the TC bit. Transports never look inside
-//! messages beyond `wire_id` / `wire_truncated`.
+//! messages beyond `wire_id` / `wire_truncated`, and DoQ's `doq_query`.
 
 use hickory_proto::op::{
     DEFAULT_MAX_PAYLOAD_LEN, Edns, Message, MessageType, OpCode, Query, ResponseCode,
 };
+use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use std::fmt;
@@ -256,6 +257,47 @@ pub fn wire_truncated(bytes: &[u8]) -> bool {
     bytes.len() >= 12 && bytes[2] & 0x02 != 0
 }
 
+/// What DNS over QUIC pads its queries to a multiple of: "Clients SHOULD
+/// pad queries to the closest multiple of 128 octets" (RFC 8467 4.1, the
+/// policy RFC 9250 5.4 points to).
+pub const DOQ_PADDING_BLOCK: usize = 128;
+
+/// The query `wire` as DNS over QUIC sends it (RFC 9250): message ID 0
+/// (4.2.1), no edns-tcp-keepalive option (5.5.2), and an EDNS(0) Padding
+/// option (RFC 7830) of zeros that makes it a multiple of
+/// `DOQ_PADDING_BLOCK` bytes long (5.4) — in place of any it had, in the
+/// OPT record it has or in one added.
+pub fn doq_query(wire: &[u8]) -> Result<Vec<u8>, CodecError> {
+    let mut m = Message::from_vec(wire).map_err(codec)?;
+    m.metadata.id = 0;
+    if let Some(edns) = &mut m.edns {
+        edns.options_mut().remove(EdnsCode::Keepalive);
+    }
+    // an empty option first: its code and length are bytes of the message
+    // too
+    set_padding(&mut m, 0);
+    let unpadded = m.to_vec().map_err(codec)?.len();
+    set_padding(
+        &mut m,
+        (DOQ_PADDING_BLOCK - unpadded % DOQ_PADDING_BLOCK) % DOQ_PADDING_BLOCK,
+    );
+    m.to_vec().map_err(codec)
+}
+
+/// `len` zeros of EDNS(0) padding in `m`, in place of any it had.
+fn set_padding(m: &mut Message, len: usize) {
+    let options = m
+        .edns
+        .get_or_insert_with(|| {
+            let mut edns = Edns::new();
+            edns.set_max_payload(DEFAULT_MAX_PAYLOAD_LEN);
+            edns
+        })
+        .options_mut();
+    options.remove(EdnsCode::Padding);
+    options.insert(EdnsOption::Unknown(EdnsCode::Padding.into(), vec![0; len]));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,5 +404,63 @@ mod tests {
     fn random_ids_vary() {
         let ids: std::collections::HashSet<u16> = (0..64).map(|_| random_id()).collect();
         assert!(ids.len() > 8, "{ids:?}");
+    }
+
+    /// The EDNS(0) padding of `wire`: `None` without any.
+    fn padding(wire: &[u8]) -> Option<Vec<u8>> {
+        let edns = Message::from_vec(wire).unwrap().edns?;
+        match edns.option(EdnsCode::Padding)? {
+            EdnsOption::Unknown(12, padding) => Some(padding.clone()),
+            other => panic!("padding read as {other:?}"),
+        }
+    }
+
+    /// DoQ's query is the resolver's with ID 0, padded with zeros to the
+    /// next multiple of 128 bytes — the option's own four bytes counted,
+    /// no padding at all when they make the multiple.
+    #[test]
+    fn a_doq_query_has_id_0_and_is_padded_to_128_bytes() {
+        // 97 bytes of name: 124 bytes of query, 128 with an empty option
+        let fits = format!("{}.{}", "a".repeat(63), "b".repeat(31));
+        let long = ["c".repeat(63), "d".repeat(63), "e".repeat(63)].join(".");
+        for (name, len, padded) in [("a.test", 128, 89), (&fits, 128, 0), (&long, 256, 32)] {
+            let question = q(name, Qtype::Aaaa);
+            let wire = build_query(0x1234, &question).unwrap();
+            let doq = doq_query(&wire).unwrap();
+            assert_eq!(doq.len(), len, "{name}");
+            assert_eq!(wire_id(&doq), Some(0));
+            assert_eq!(parse_query(&doq).unwrap(), (0, question));
+            assert_eq!(padding(&doq), Some(vec![0; padded]), "{name}");
+        }
+    }
+
+    /// Padding the query had is replaced and its edns-tcp-keepalive left
+    /// out (RFC 9250 5.5.2); a query without an OPT record gets one.
+    #[test]
+    fn a_doq_query_replaces_padding_and_keepalive_and_has_an_opt_record() {
+        let mut m = Message::new(0x4242, MessageType::Query, OpCode::Query);
+        m.add_query(Query::query(fqdn("a.test").unwrap(), RecordType::A));
+        let mut edns = Edns::new();
+        edns.options_mut().insert(EdnsOption::Unknown(
+            EdnsCode::Keepalive.into(),
+            vec![0, 100],
+        ));
+        edns.options_mut().insert(EdnsOption::Unknown(
+            EdnsCode::Padding.into(),
+            vec![0xff; 300],
+        ));
+        m.set_edns(edns);
+        let doq = doq_query(&m.to_vec().unwrap()).unwrap();
+        assert_eq!(doq.len(), 128);
+        assert_eq!(padding(&doq).map(|p| p.iter().all(|&b| b == 0)), Some(true));
+        let edns = Message::from_vec(&doq).unwrap().edns.unwrap();
+        assert!(edns.option(EdnsCode::Keepalive).is_none());
+
+        let mut bare = Message::new(7, MessageType::Query, OpCode::Query);
+        bare.add_query(Query::query(fqdn("a.test").unwrap(), RecordType::A));
+        let doq = doq_query(&bare.to_vec().unwrap()).unwrap();
+        assert_eq!(doq.len(), 128);
+        assert!(padding(&doq).is_some());
+        assert!(doq_query(b"nope").is_err());
     }
 }

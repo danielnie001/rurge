@@ -22,11 +22,13 @@ bytes.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
+quinn.workspace = true
 rcgen = { workspace = true, optional = true }
 
 [features]
-# In-process mock DNS servers (`rurge_dns::testing`); enabled by dependants' dev-dependencies.
-testing = ["dep:rcgen"]
+# In-process mock DNS servers (`rurge_dns::testing`), those over QUIC on
+# `rurge_net`'s loopback QUIC servers; enabled by dependants' dev-dependencies.
+testing = ["dep:rcgen", "rurge-net/testing"]
 
 [dev-dependencies]
 # Self dev-dependency: turns `testing` on for this crate's own integration tests and benches.

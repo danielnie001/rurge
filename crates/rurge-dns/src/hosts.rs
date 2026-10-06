@@ -274,7 +274,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (map, diags) = build(
             dir.path(),
-            "a.com = server:1.1.1.1, tls://dns.example.com\nb.com = server:system\nc.com = server:syslib\nd.com = script:my-script\ne.com = server:h3://dns.example.com/dns-query\nf.com = server:force-syslib\n",
+            "a.com = server:1.1.1.1, tls://dns.example.com\nb.com = server:system\nc.com = server:syslib\nd.com = script:my-script\ne.com = server:quic://dns.example.com/dns-query\nf.com = server:force-syslib\n",
         );
         let codes: Vec<&str> = diags.iter().map(|d| d.code).collect();
         assert!(codes.contains(&codes::W_HOST_SCRIPT_SKIPPED));
@@ -305,6 +305,30 @@ mod tests {
         assert_eq!(
             map.lookup("f.com").unwrap().action,
             HostAction::System(SystemMode::ForceSyslib)
+        );
+    }
+
+    /// `quic://` and `h3://` servers are as good as the others: no W0026.
+    #[tokio::test]
+    async fn quic_and_h3_servers_need_no_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let (map, diags) = build(
+            dir.path(),
+            "a.com = server:quic://dns.example.com\nb.com = server:h3://dns.example.com, 1.1.1.1\n",
+        );
+        assert!(
+            diags.is_empty(),
+            "{:?}",
+            diags.iter().map(|d| d.to_string()).collect::<Vec<_>>()
+        );
+        let servers = |name: &str| match map.lookup(name).unwrap().action {
+            HostAction::Servers(specs) => specs.iter().map(UpstreamSpec::name).collect::<Vec<_>>(),
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(servers("a.com"), ["quic://dns.example.com:853"]);
+        assert_eq!(
+            servers("b.com"),
+            ["h3://dns.example.com/dns-query", "udp://1.1.1.1:53"]
         );
     }
 

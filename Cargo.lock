@@ -3279,6 +3279,7 @@ dependencies = [
  "http",
  "http-body-util",
  "lru",
+ "quinn",
  "rcgen",
  "rurge-config",
  "rurge-dns",

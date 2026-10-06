@@ -225,13 +225,17 @@ impl ServerCertVerifier for NoVerify {
     }
 }
 
-pub(crate) fn build_tls_config(skip_verify: bool) -> Result<rustls::ClientConfig, HttpError> {
+/// A client configuration of `versions` that verifies the server with the
+/// shared roots, or — `skip_verify` — not at all; no ALPN.
+fn verifying_config(
+    skip_verify: bool,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> Result<rustls::ClientConfig, HttpError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(versions)
         .map_err(|e| HttpError::Tls(e.to_string()))?;
-    let mut config = if skip_verify {
-        tracing::warn!("TLS certificate verification is disabled for the internal HTTP client");
+    Ok(if skip_verify {
         builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
@@ -240,7 +244,14 @@ pub(crate) fn build_tls_config(skip_verify: bool) -> Result<rustls::ClientConfig
         builder
             .with_root_certificates(crate::tls::root_store())
             .with_no_client_auth()
-    };
+    })
+}
+
+pub(crate) fn build_tls_config(skip_verify: bool) -> Result<rustls::ClientConfig, HttpError> {
+    if skip_verify {
+        tracing::warn!("TLS certificate verification is disabled for the internal HTTP client");
+    }
+    let mut config = verifying_config(skip_verify, rustls::DEFAULT_VERSIONS)?;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(config)
 }
@@ -249,6 +260,18 @@ pub(crate) fn build_tls_config(skip_verify: bool) -> Result<rustls::ClientConfig
 /// h2 + http/1.1, optional verification bypass) for other transports (DoT).
 pub fn tls_client_config(skip_verify: bool) -> Result<Arc<rustls::ClientConfig>, HttpError> {
     build_tls_config(skip_verify).map(Arc::new)
+}
+
+/// The TLS of a DNS server reached over QUIC (DoQ, DoH3): verified as
+/// `tls_client_config` verifies, on TLS 1.3 alone — which QUIC requires —,
+/// offering `alpn` alone.
+pub fn quic_tls_client_config(
+    skip_verify: bool,
+    alpn: &str,
+) -> Result<Arc<rustls::ClientConfig>, HttpError> {
+    let mut config = verifying_config(skip_verify, &[&rustls::version::TLS13])?;
+    config.alpn_protocols = vec![alpn.as_bytes().to_vec()];
+    Ok(Arc::new(config))
 }
 
 pub struct HttpClient {
@@ -563,5 +586,17 @@ mod tests {
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
         assert!(tls_client_config(true).is_ok());
+    }
+
+    /// A DNS server over QUIC gets TLS 1.3 alone, and the one ALPN of its
+    /// protocol.
+    #[test]
+    fn quic_tls_client_config_is_tls_1_3_with_one_alpn() {
+        for skip_verify in [false, true] {
+            let cfg = quic_tls_client_config(skip_verify, "doq").unwrap();
+            assert_eq!(cfg.alpn_protocols, vec![b"doq".to_vec()]);
+            let debug = format!("{cfg:?}");
+            assert!(debug.contains("versions: [TLSv1_3]"), "{debug}");
+        }
     }
 }

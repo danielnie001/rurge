@@ -4,7 +4,7 @@
 use rurge_config::config::{LoadOptions, from_text};
 use rurge_config::session::{ListenerKind, SessionInfo};
 use rurge_dns::system::StaticSystemDns;
-use rurge_dns::testing::MockDns;
+use rurge_dns::testing::{DoqScript, FakeDoq, MockDns};
 use rurge_engine::stack::StackOptions;
 use rurge_engine::{Engine, EngineShared, ListenerSpec, RequestRecord, Runtime, RuntimeOptions};
 use rurge_inbound::{DialError, Dialer, Running, SessionHandle, SessionOutcome};
@@ -1617,6 +1617,37 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
         internal.iter().all(|r| r.error.is_none()),
         "nothing in this chain is resolved locally: {internal:?}"
     );
+}
+
+/// In follow mode a DoQ server is reached all the same: the pipeline hands
+/// the QUIC carrier to its direct fallback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_follow_mode_resolver_reaches_a_doq_server() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let dir = tempfile::tempdir().unwrap();
+    let profile = format!(
+        "[General]\nencrypted-dns-follow-outbound-mode = true\n\
+encrypted-dns-server = quic://127.0.0.1:{}\nencrypted-dns-skip-cert-verification = true\n\
+ipv6 = false\n[Proxy]\n[Proxy Group]\n[Rule]\nFINAL,DIRECT\n",
+        doq.addr().port()
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = tokio::time::timeout(
+        Duration::from_secs(10),
+        engine
+            .runtime()
+            .stack
+            .resolver
+            .lookup("target.test", rurge_dns::resolver::LookupOpts::default()),
+    )
+    .await
+    .expect("the lookup within the bound")
+    .expect("an answer over DoQ");
+    assert_eq!(res.v4, ["127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap()]);
+    assert_eq!(doq.connections(), 1);
+    assert!(!doq.queries().is_empty());
 }
 
 #[tokio::test]

@@ -9,6 +9,8 @@ use crate::fanout::{Answers, FanoutError, FanoutOpts, resolve_name};
 use crate::hosts::{HostAction, HostMap, parse_hosts_file};
 use crate::system::SystemDns;
 use crate::upstream::doh::DohUpstream;
+use crate::upstream::doh3::Doh3Upstream;
+use crate::upstream::doq::DoqUpstream;
 use crate::upstream::tcp::TcpUpstream;
 use crate::upstream::udp::UdpUpstream;
 use crate::upstream::{UpstreamRef, UpstreamSpec};
@@ -234,14 +236,20 @@ pub struct Resolver {
     /// recorded); DoH upstreams are then skipped, like DoT without `tls`.
     http: Option<Arc<HttpClient>>,
     tls: Option<Arc<rustls::ClientConfig>>,
+    /// The client configuration of the DoQ upstreams; `None` when it could
+    /// not be built (W0026 was recorded): they are skipped then, as DoH is.
+    doq: Option<quinn::ClientConfig>,
+    /// The same of the DoH3 upstreams.
+    doh3: Option<quinn::ClientConfig>,
     /// The `dns-server` UDP entries that survived the IPv6 filter.
     configured_udp: Vec<UpstreamSpec>,
     /// The profile wants the platform's servers: it wrote `dns-server = system`,
     /// or it configured no traditional server at all. The system list is
     /// re-expanded on every network change rather than snapshotted here.
     wants_system: bool,
-    /// The encrypted subsystem (`https://` / `tls://` / `tcp://`). It owns the
-    /// primary set whenever it is non-empty and never depends on the network.
+    /// The encrypted subsystem (`https://` / `h3://` / `quic://` / `tls://` /
+    /// `tcp://`). It owns the primary set whenever it is non-empty and never
+    /// depends on the network.
     encrypted_specs: Vec<UpstreamSpec>,
     primary: ArcSwap<Vec<UpstreamRef>>,
     system_upstreams: ArcSwap<Vec<UpstreamRef>>,
@@ -297,7 +305,7 @@ impl Resolver {
             .map(UpstreamSpec::Udp)
             .collect();
 
-        // Encrypted subsystem: https:// tls:// tcp://
+        // Encrypted subsystem: https:// h3:// quic:// tls:// tcp://
         let mut encrypted: Vec<UpstreamSpec> = Vec::new();
         for e in &cfg.encrypted {
             match UpstreamSpec::from_encrypted(e) {
@@ -344,6 +352,16 @@ impl Resolver {
                 None
             }
         };
+        let doq = available(
+            DoqUpstream::client_config(cfg.skip_cert_verification),
+            "DoQ",
+            &mut diags,
+        );
+        let doh3 = available(
+            Doh3Upstream::client_config(cfg.skip_cert_verification),
+            "DoH3",
+            &mut diags,
+        );
 
         let hosts = HostMap::build(&cfg.hosts, deps.sets.as_ref(), &mut diags);
 
@@ -353,6 +371,8 @@ impl Resolver {
             bootstrap,
             http,
             tls,
+            doq,
+            doh3,
             primary: ArcSwap::from_pointee(Vec::new()),
             system_upstreams: ArcSwap::from_pointee(Vec::new()),
             host_upstreams: Mutex::new(HashMap::new()),
@@ -401,6 +421,23 @@ impl Resolver {
                 .http
                 .as_ref()
                 .map(|http| Arc::new(DohUpstream::new(url.clone(), http.clone())) as UpstreamRef),
+            UpstreamSpec::Quic { host, port } => self.doq.as_ref().map(|config| {
+                Arc::new(DoqUpstream::new(
+                    host,
+                    *port,
+                    self.connector.clone(),
+                    self.bootstrap.clone(),
+                    config.clone(),
+                )) as UpstreamRef
+            }),
+            UpstreamSpec::H3(url) => self.doh3.as_ref().map(|config| {
+                Arc::new(Doh3Upstream::new(
+                    url.clone(),
+                    self.connector.clone(),
+                    self.bootstrap.clone(),
+                    config.clone(),
+                )) as UpstreamRef
+            }),
         }
     }
 
@@ -435,8 +472,8 @@ impl Resolver {
             .collect()
     }
 
-    /// The upstreams that resolve the hostnames of URL-type (DoT / DoH / TCP)
-    /// upstreams. Always plain UDP; see `bootstrap_set`.
+    /// The upstreams that resolve the hostnames of URL-type (DoT / DoH /
+    /// DoH3 / DoQ / TCP) upstreams. Always plain UDP; see `bootstrap_set`.
     pub fn bootstrap_upstreams(&self) -> Vec<String> {
         self.bootstrap.upstream_names()
     }
@@ -928,6 +965,21 @@ impl Resolver {
                 }
             }
         });
+    }
+}
+
+/// A client configuration of the encrypted subsystem, or `None` with a
+/// W0026 that says `what` is unavailable.
+fn available<T>(built: io::Result<T>, what: &str, diags: &mut Diagnostics) -> Option<T> {
+    match built {
+        Ok(config) => Some(config),
+        Err(e) => {
+            diags.push(Diagnostic::warning(
+                codes::W_DNS_UPSTREAM_UNSUPPORTED,
+                format!("{what} unavailable: {e}"),
+            ));
+            None
+        }
     }
 }
 
@@ -1667,7 +1719,7 @@ mod tests {
         let mock = MockDns::spawn().await;
         let e = env(&profile(
             &format!(
-                "dns-server = {}, [::1]:5353\nencrypted-dns-server = h3://dns.example/dns-query",
+                "dns-server = {}, [::1]:5353\nencrypted-dns-server = quic://dns.example/dns-query",
                 mock.addr()
             ),
             "",
@@ -1682,6 +1734,36 @@ mod tests {
             r.primary_upstreams(),
             vec![format!("udp://{}", mock.addr())]
         );
+    }
+
+    /// `quic://` and `h3://` servers are upstreams like the others, in
+    /// `encrypted-dns-server` and in `[Host]`: no W0026.
+    #[tokio::test]
+    async fn quic_and_h3_upstreams_are_built_without_a_warning() {
+        let e = env(&profile(
+            "encrypted-dns-server = quic://127.0.0.1, h3://dns.example:8443",
+            "quic.test = server:quic://[::1]:8853",
+        ));
+        let (r, diags) = resolver(&e, StaticSystemDns::default());
+        assert!(
+            diags.is_empty(),
+            "{:?}",
+            diags.iter().map(|d| d.to_string()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            r.primary_upstreams(),
+            vec![
+                "quic://127.0.0.1:853".to_string(),
+                "h3://dns.example:8443/dns-query".to_string()
+            ]
+        );
+        assert!(matches!(
+            r.host_lookup("quic.test").map(|hit| hit.action),
+            Some(HostAction::Servers(specs)) if specs == [UpstreamSpec::Quic {
+                host: "::1".into(),
+                port: 8853
+            }]
+        ));
     }
 
     #[tokio::test]

@@ -1,6 +1,13 @@
 //! In-process mock DNS servers for tests: one UDP socket and one TCP (or
 //! TLS) listener on the same port, with per-name answers and programmable
-//! misbehaviour (delay, drops, truncation, error codes).
+//! misbehaviour (delay, drops, truncation, error codes) — and DNS over QUIC
+//! and over HTTP/3 servers that answer from such a table (`quic`).
+
+mod quic;
+
+pub use quic::{
+    Doh3Script, DoqScript, FakeDoh3, FakeDoq, RecordedDoh3Request, RecordedDoqQuery, RecordedStop,
+};
 
 use crate::message::{Qtype, Question, Rcode, build_response, parse_query};
 use std::collections::{HashMap, HashSet};
