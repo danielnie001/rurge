@@ -77,6 +77,14 @@ pub(crate) fn merge(base: &mut Vec<(String, String)>, custom: Vec<(String, Strin
     }
 }
 
+/// `Basic base64(user:password)` (RFC 9110 11.7.2, RFC 7617): the
+/// `proxy-authorization` value of the CONNECT proxies over HTTP/2 and
+/// HTTP/3 (`h2-connect`, `trust-tunnel`, `masque`), standard Base64 with
+/// its padding.
+pub fn basic_authorization(user: &str, password: &str) -> String {
+    format!("Basic {}", STANDARD.encode(format!("{user}:{password}")))
+}
+
 /// The host text a request line or a `Host` header may carry for `target`:
 /// an IP literal (IPv6 in brackets), or a domain in its ASCII form (an IDN
 /// becomes its A-labels). `None` means refuse the request: nothing safe to
@@ -841,5 +849,14 @@ mod tests {
             panic!("expected a proxy error");
         };
         assert_eq!(m, "http proxy answered 403 Forbidden");
+    }
+
+    #[test]
+    fn basic_authorization_is_base64_of_user_colon_password() {
+        // RFC 7617 2
+        assert_eq!(
+            basic_authorization("Aladdin", "open sesame"),
+            "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+        );
     }
 }

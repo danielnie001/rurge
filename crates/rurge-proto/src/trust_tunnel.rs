@@ -15,8 +15,9 @@
 //!   a policy test is a URL test.
 
 use crate::build::{shadow_tls_client, tls_client};
-use crate::h2connect::{basic_authorization, connect_request};
+use crate::h2connect::connect_request;
 use crate::h2pool::{H2Pool, StackDial};
+use crate::http::basic_authorization;
 use crate::transport::Stack;
 use crate::{BuildError, Outbound, OutboundError};
 use http::StatusCode;

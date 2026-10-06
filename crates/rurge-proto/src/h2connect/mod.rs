@@ -19,11 +19,9 @@ mod udp;
 
 use crate::build::{shadow_tls_client, tls_client, tls_name};
 use crate::h2pool::{H2Pool, H2Stream, StackDial};
-use crate::http::{merge, render, wire_host};
+use crate::http::{basic_authorization, merge, render, wire_host};
 use crate::transport::Stack;
 use crate::{BuildError, Outbound, OutboundError, UdpSupport};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use h2::ext::Protocol;
 use http::header::{HeaderName, HeaderValue};
 use http::{Method, Request, Response, StatusCode, Version};
@@ -51,11 +49,6 @@ struct Inner {
     headers: Vec<HeaderTemplate>,
     /// `udp-relay=true`: the server's own `:authority` for CONNECT-UDP.
     udp_authority: Option<String>,
-}
-
-/// `Basic base64(user:password)` (RFC 9110 11.7.2, RFC 7617).
-pub(crate) fn basic_authorization(user: &str, password: &str) -> String {
-    format!("Basic {}", STANDARD.encode(format!("{user}:{password}")))
 }
 
 /// The CONNECT request for `target`: `ours` (lowercase names), replaced
@@ -791,15 +784,6 @@ mod tests {
         assert!(headers["proxy-authorization"].is_sensitive());
         assert!(headers["x-token"].is_sensitive());
         assert!(!headers["user-agent"].is_sensitive());
-    }
-
-    #[test]
-    fn basic_authorization_is_base64_of_user_colon_password() {
-        // RFC 7617 2
-        assert_eq!(
-            basic_authorization("Aladdin", "open sesame"),
-            "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
-        );
     }
 
     /// A fake that serves CONNECT-UDP.
