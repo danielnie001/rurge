@@ -194,6 +194,88 @@ jobs:
           [ -n "$bin" ] || { echo "no trusttunnel_endpoint binary in $asset"; exit 1; }
           chmod +x "$bin"
           echo "RURGE_TEST_TRUSTTUNNEL=$bin" >> "$GITHUB_ENV"
+      - name: Install masque-server for the MASQUE interoperability tests
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=0.13.0
+          asset="masque-v$version-linux-x86_64.tar.gz"
+          sha=0ae2e3359db5149670df0d084e86104bf0332d0fd43501c9072ec39a48a1f298
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 --retry-all-errors -o "$asset" "https://github.com/Vincent-bin/masque-server/releases/download/v$version/$asset"
+          actual=$(sha256sum "$asset" | cut -d' ' -f1)
+          if [ "$actual" != "$sha" ]; then
+            echo "masque-server checksum mismatch: expected $sha, got $actual"
+            exit 1
+          fi
+          mkdir -p masque-server
+          tar -xzf "$asset" -C masque-server
+          bin=$(find "$PWD/masque-server" -type f -name masque-server | head -n 1)
+          [ -n "$bin" ] || { echo "no masque-server binary in $asset"; exit 1; }
+          chmod +x "$bin"
+          echo "RURGE_TEST_MASQUE_SERVER=$bin" >> "$GITHUB_ENV"
+      - name: Install dnsproxy for the DNS over QUIC and HTTP/3 interoperability tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=0.86.0
+          case "$RUNNER_OS" in
+            Linux)   asset="dnsproxy-linux-amd64-v$version.tar.gz";  sha=17ac43f76ebfcedf547c663f6f31aa70e68b8eb6fc41d2fc37d3bfe21a2ced66 ;;
+            Windows) asset="dnsproxy-windows-amd64-v$version.zip";   sha=dedc186ddd4b96bf92474f91d972f67da0824e0141d09e3102fd96db9f8a0dbc ;;
+            macOS)   asset="dnsproxy-darwin-arm64-v$version.tar.gz"; sha=5964db3a45d39df4e41f74907f50657a80907c514355f9ad75b9666e3431d277 ;;
+            *) echo "unexpected runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 --retry-all-errors -o "$asset" "https://github.com/AdguardTeam/dnsproxy/releases/download/v$version/$asset"
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum "$asset" | cut -d' ' -f1)
+          else
+            actual=$(shasum -a 256 "$asset" | cut -d' ' -f1)
+          fi
+          if [ "$actual" != "$sha" ]; then
+            echo "dnsproxy checksum mismatch: expected $sha, got $actual"
+            exit 1
+          fi
+          mkdir -p dnsproxy
+          case "$asset" in
+            *.zip) unzip -q "$asset" -d dnsproxy ;;
+            *)     tar -xzf "$asset" -C dnsproxy ;;
+          esac
+          bin=$(find "$PWD/dnsproxy" -type f \( -name dnsproxy -o -name dnsproxy.exe \) | head -n 1)
+          [ -n "$bin" ] || { echo "no dnsproxy binary in $asset"; exit 1; }
+          chmod +x "$bin"
+          if [ "$RUNNER_OS" = "Windows" ]; then bin=$(cygpath -w "$bin"); fi
+          echo "RURGE_TEST_DNSPROXY=$bin" >> "$GITHUB_ENV"
+      - name: Install CoreDNS for the DNS over QUIC and HTTP/3 interoperability tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=1.14.7
+          case "$RUNNER_OS" in
+            Linux)   asset="coredns_${version}_linux_amd64.tgz";   sha=9a09356438c6d9591cb80011a2a7a52f87fc3a113f6690e41f243f98b98faac9 ;;
+            Windows) asset="coredns_${version}_windows_amd64.tgz"; sha=19756e969e4ddd16ee0c189018e5659f6695113223e590709222433f7338504d ;;
+            macOS)   asset="coredns_${version}_darwin_arm64.tgz";  sha=0005d154d49c73a88b2c56f429f35106e46c4ca37ee6de4e4d482d7de5c4b8ba ;;
+            *) echo "unexpected runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 --retry-all-errors -o "$asset" "https://github.com/coredns/coredns/releases/download/v$version/$asset"
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum "$asset" | cut -d' ' -f1)
+          else
+            actual=$(shasum -a 256 "$asset" | cut -d' ' -f1)
+          fi
+          if [ "$actual" != "$sha" ]; then
+            echo "CoreDNS checksum mismatch: expected $sha, got $actual"
+            exit 1
+          fi
+          mkdir -p coredns
+          tar -xzf "$asset" -C coredns
+          bin=$(find "$PWD/coredns" -type f \( -name coredns -o -name coredns.exe \) | head -n 1)
+          [ -n "$bin" ] || { echo "no coredns binary in $asset"; exit 1; }
+          chmod +x "$bin"
+          if [ "$RUNNER_OS" = "Windows" ]; then bin=$(cygpath -w "$bin"); fi
+          echo "RURGE_TEST_COREDNS=$bin" >> "$GITHUB_ENV"
       - name: Point the SSH interoperability tests at OpenSSH's sshd
         if: runner.os != 'Windows'
         shell: bash

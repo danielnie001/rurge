@@ -11,8 +11,13 @@
 //! `sni=<HOSTNAME>` and trusts a certificate for that name; it refuses
 //! private and loopback targets unless `allow_private_network_connections`
 //! is set, which the loopback echo needs.
+//!
+//! Its QUIC listener (`Listen::Http3`) serves the same CONNECTs over HTTP/3:
+//! the reference for `trust-tunnel` with `h3=true`.
 
-use crate::{REQUIRED_ENV, Reference, TlsFiles, free_port};
+use crate::{
+    REQUIRED_ENV, Reference, TlsFiles, free_port, free_tcp_and_udp_port, toml_path, toml_string,
+};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -21,6 +26,9 @@ pub const BINARY_ENV: &str = "RURGE_TEST_TRUSTTUNNEL";
 /// The endpoint's one host: the SNI a client must send and the name its
 /// certificate is for.
 pub const HOSTNAME: &str = "tt.test";
+
+/// What the endpoint logs (at `info`) once its QUIC listener is bound.
+const LISTENING_UDP: &str = "Listening to UDP";
 
 /// `RURGE_TEST_TRUSTTUNNEL`, else the first `trusttunnel_endpoint` on `PATH`.
 pub fn locate() -> Option<PathBuf> {
@@ -50,6 +58,17 @@ pub fn trusttunnel_or_skip(test: &str) -> Option<PathBuf> {
     None
 }
 
+/// What the endpoint serves on its port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Listen {
+    /// HTTP/2 over TLS, on the TCP port (`[listen_protocols.http2]`).
+    Http2,
+    /// HTTP/3 alone, on the UDP port (`[listen_protocols.quic]`). The
+    /// endpoint binds the TCP port of the same number too, and serves
+    /// nothing there.
+    Http3,
+}
+
 /// The endpoint's three files.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Rendered {
@@ -61,51 +80,47 @@ pub struct Rendered {
     pub credentials: String,
 }
 
-/// A TOML basic string.
-fn quoted(text: &str) -> String {
-    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
-fn path(p: &Path) -> String {
-    quoted(&p.to_string_lossy())
-}
-
-/// The whole configuration: HTTP/2 only on `127.0.0.1:port`, IPv4 only,
-/// direct forwarding that may reach the loopback, one client. The endpoint
-/// resolves file paths against its working directory, so they must be
-/// absolute.
+/// The whole configuration: `listen`'s one protocol on `127.0.0.1:port`,
+/// IPv4 only, direct forwarding that may reach the loopback, one client. The
+/// endpoint resolves file paths against its working directory, so they must
+/// be absolute.
 pub fn render(
     port: u16,
+    listen: Listen,
     tls: &TlsFiles,
     credentials: &Path,
     username: &str,
     password: &str,
 ) -> Rendered {
+    let protocol = match listen {
+        Listen::Http2 => "http2",
+        Listen::Http3 => "quic",
+    };
     let vpn = format!(
         "listen_address = \"127.0.0.1:{port}\"\n\
          ipv6_available = false\n\
          allow_private_network_connections = true\n\
          credentials_file = {}\n\
          \n\
-         [listen_protocols.http2]\n\
+         [listen_protocols.{protocol}]\n\
          \n\
          [forward_protocol]\n\
          direct = {{}}\n",
-        path(credentials)
+        toml_path(credentials)
     );
     let hosts = format!(
         "[[main_hosts]]\n\
          hostname = {}\n\
          cert_chain_path = {}\n\
          private_key_path = {}\n",
-        quoted(HOSTNAME),
-        path(&tls.certificate),
-        path(&tls.key)
+        toml_string(HOSTNAME),
+        toml_path(&tls.certificate),
+        toml_path(&tls.key)
     );
     let credentials = format!(
         "[[client]]\nusername = {}\npassword = {}\n",
-        quoted(username),
-        quoted(password)
+        toml_string(username),
+        toml_string(password)
     );
     Rendered {
         vpn,
@@ -119,22 +134,28 @@ pub struct TrustTunnel(Reference);
 
 impl TrustTunnel {
     /// Writes the configuration into `dir` (which must be absolute), starts
-    /// `binary` there and waits until it accepts connections. `tls` is a
-    /// certificate for [`HOSTNAME`].
+    /// `binary` there and waits until it serves `listen`: its TCP port
+    /// accepts connections — and, over HTTP/3, its log says the QUIC
+    /// listener is bound. `tls` is a certificate for [`HOSTNAME`].
     pub fn spawn(
         binary: &Path,
         dir: &Path,
+        listen: Listen,
         tls: &TlsFiles,
         username: &str,
         password: &str,
     ) -> TrustTunnel {
-        let port = free_port();
+        // over HTTP/3 the endpoint binds both on one number
+        let port = match listen {
+            Listen::Http2 => free_port(),
+            Listen::Http3 => free_tcp_and_udp_port(),
+        };
         let (vpn, hosts, credentials) = (
             dir.join("vpn.toml"),
             dir.join("hosts.toml"),
             dir.join("credentials.toml"),
         );
-        let rendered = render(port, tls, &credentials, username, password);
+        let rendered = render(port, listen, tls, &credentials, username, password);
         for (file, text) in [
             (&vpn, &rendered.vpn),
             (&hosts, &rendered.hosts),
@@ -144,15 +165,19 @@ impl TrustTunnel {
         }
         let mut command = Command::new(binary);
         command.arg(&vpn).arg(&hosts).current_dir(dir);
-        TrustTunnel(Reference::start(
+        let mut endpoint = Reference::start(
             "trusttunnel_endpoint",
             command,
             vec![port],
             dir.join("trusttunnel.log"),
-        ))
+        );
+        if listen == Listen::Http3 {
+            endpoint.wait_for_output(LISTENING_UDP);
+        }
+        TrustTunnel(endpoint)
     }
 
-    /// The loopback port.
+    /// The loopback port: TCP over HTTP/2, UDP over HTTP/3.
     pub fn port(&self) -> u16 {
         self.0.port(0)
     }
@@ -174,32 +199,46 @@ mod tests {
         }
     }
 
+    /// One protocol, on the loopback: HTTP/2 alone, or QUIC alone.
     #[test]
     fn the_configuration_stays_on_the_loopback() {
-        let rendered = render(
-            4001,
-            &files(),
-            Path::new("/tmp/tt/credentials.toml"),
-            "u",
-            "pw",
-        );
-        let text = format!("{}{}{}", rendered.vpn, rendered.hosts, rendered.credentials);
-        for forbidden in ["0.0.0.0", "::", "socks5", "listen_protocols.quic", "http1"] {
-            assert!(!text.contains(forbidden), "`{forbidden}` in {text}");
+        for (listen, protocol) in [
+            (Listen::Http2, "[listen_protocols.http2]"),
+            (Listen::Http3, "[listen_protocols.quic]"),
+        ] {
+            let rendered = render(
+                4001,
+                listen,
+                &files(),
+                Path::new("/tmp/tt/credentials.toml"),
+                "u",
+                "pw",
+            );
+            let text = format!("{}{}{}", rendered.vpn, rendered.hosts, rendered.credentials);
+            for forbidden in ["0.0.0.0", "::", "socks5", "http1"] {
+                assert!(!text.contains(forbidden), "`{forbidden}` in {text}");
+            }
+            let addresses: Vec<&str> = rendered
+                .vpn
+                .lines()
+                .filter(|l| l.starts_with("listen_address"))
+                .collect();
+            assert_eq!(addresses, ["listen_address = \"127.0.0.1:4001\""]);
+            let protocols: Vec<&str> = rendered
+                .vpn
+                .lines()
+                .filter(|l| l.starts_with("[listen_protocols."))
+                .collect();
+            assert_eq!(protocols, [protocol]);
+            assert!(rendered.vpn.contains("[forward_protocol]\ndirect = {}\n"));
         }
-        let listen: Vec<&str> = rendered
-            .vpn
-            .lines()
-            .filter(|l| l.starts_with("listen_address"))
-            .collect();
-        assert_eq!(listen, ["listen_address = \"127.0.0.1:4001\""]);
-        assert!(rendered.vpn.contains("[forward_protocol]\ndirect = {}\n"));
     }
 
     #[test]
     fn the_configuration_is_written_as_the_endpoint_reads_it() {
         let rendered = render(
             4001,
+            Listen::Http2,
             &files(),
             Path::new("/tmp/tt/credentials.toml"),
             "u",
@@ -226,10 +265,30 @@ mod tests {
                 credentials: "[[client]]\nusername = \"u\"\npassword = \"p\\\"w\"\n".into(),
             }
         );
-    }
-
-    #[test]
-    fn windows_paths_are_escaped() {
-        assert_eq!(path(Path::new(r"C:\t\x.pem")), r#""C:\\t\\x.pem""#);
+        // the QUIC listener with its defaults: an empty table turns it on
+        let http3 = render(
+            4001,
+            Listen::Http3,
+            &files(),
+            Path::new("/tmp/tt/credentials.toml"),
+            "u",
+            "p\"w",
+        );
+        assert_eq!(
+            http3.vpn,
+            "listen_address = \"127.0.0.1:4001\"\n\
+             ipv6_available = false\n\
+             allow_private_network_connections = true\n\
+             credentials_file = \"/tmp/tt/credentials.toml\"\n\
+             \n\
+             [listen_protocols.quic]\n\
+             \n\
+             [forward_protocol]\n\
+             direct = {}\n"
+        );
+        assert_eq!(
+            (http3.hosts, http3.credentials),
+            (rendered.hosts, rendered.credentials)
+        );
     }
 }

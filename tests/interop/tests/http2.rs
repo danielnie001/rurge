@@ -4,22 +4,24 @@
 //! `h2-connect`'s plain CONNECT too (sing-box 1.14.2's `http` inbound speaks
 //! HTTP/1 only). Over TCP only: no reference server for CONNECT-UDP. Every
 //! target is a loopback IP literal; the endpoint picks its host by SNI, so
-//! every line sends `sni=tt.test` and trusts the fixture's CA.
+//! every line sends `sni=tt.test` and trusts the fixture's CA. With `h3=true`
+//! a `trust-tunnel` goes over HTTP/3 instead (phase 2 M7 design 7.2), to an
+//! endpoint that listens with QUIC alone (`[listen_protocols.quic]`).
 
 mod common;
 
 use common::*;
-use rurge_interop::trusttunnel::{HOSTNAME, TrustTunnel, trusttunnel_or_skip};
+use rurge_interop::trusttunnel::{HOSTNAME, Listen, TrustTunnel, trusttunnel_or_skip};
 use std::time::Duration;
 
 const USER: &str = "alice";
 const PASSWORD: &str = "s3cret-tt";
 
-/// The endpoint with a certificate for its host, and the fixture whose CA
-/// signed it.
-fn endpoint(bin: &Path, dir: &Path) -> (TrustTunnel, Arc<TlsFixture>) {
+/// The endpoint serving `listen`, with a certificate for its host, and the
+/// fixture whose CA signed it.
+fn endpoint(bin: &Path, dir: &Path, listen: Listen) -> (TrustTunnel, Arc<TlsFixture>) {
     let fixture = TlsFixture::new(&[HOSTNAME]);
-    let server = TrustTunnel::spawn(bin, dir, &leaf_files(&fixture, dir), USER, PASSWORD);
+    let server = TrustTunnel::spawn(bin, dir, listen, &leaf_files(&fixture, dir), USER, PASSWORD);
     (server, fixture)
 }
 
@@ -76,7 +78,7 @@ async fn trust_tunnel_against_the_endpoint() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let (server, fixture) = endpoint(&bin, dir.path());
+    let (server, fixture) = endpoint(&bin, dir.path(), Listen::Http2);
     let profile = profile(&[line(
         "TT",
         "trust-tunnel",
@@ -97,7 +99,7 @@ async fn a_wrong_trust_tunnel_password_is_refused() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let (server, fixture) = endpoint(&bin, dir.path());
+    let (server, fixture) = endpoint(&bin, dir.path(), Listen::Http2);
     let profile = profile(&[line(
         "Wrong",
         "trust-tunnel",
@@ -124,7 +126,7 @@ async fn h2_connect_against_the_endpoint() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let (server, fixture) = endpoint(&bin, dir.path());
+    let (server, fixture) = endpoint(&bin, dir.path(), Listen::Http2);
     let profile = profile(&[
         // the credentials positionally after the port, and named
         line(
@@ -155,7 +157,7 @@ async fn h2_connect_streams_share_connections_on_the_endpoint() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let (server, fixture) = endpoint(&bin, dir.path());
+    let (server, fixture) = endpoint(&bin, dir.path(), Listen::Http2);
     let profile = profile(&[line(
         "Shared",
         "h2-connect",
@@ -169,4 +171,68 @@ async fn h2_connect_streams_share_connections_on_the_endpoint() {
     tunnels_at_once(&out, echo, 7).await;
     // the pool still serves new tunnels after they are gone
     roundtrip(&out, echo).await;
+}
+
+/// `h3=true` against an endpoint that listens with QUIC alone: one chunk and
+/// many, each tunnel a classic CONNECT on the policy's QUIC connection.
+#[tokio::test]
+async fn trust_tunnel_over_http3_against_the_endpoint() {
+    let Some(bin) = trusttunnel_or_skip("trust_tunnel_over_http3_against_the_endpoint") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (server, fixture) = endpoint(&bin, dir.path(), Listen::Http3);
+    let profile = profile(&[line(
+        "TT3",
+        "trust-tunnel",
+        server.port(),
+        &format!("username={USER}, password={PASSWORD}, h3=true"),
+    )]);
+    let (out, echo) = (
+        outbound(&profile, "TT3", Some(&fixture)),
+        echo_server().await,
+    );
+    roundtrip(&out, echo).await;
+    roundtrip_big(&out, echo).await;
+}
+
+/// Refused over HTTP/3 as over HTTP/2: the endpoint answers 407.
+#[tokio::test]
+async fn a_wrong_trust_tunnel_password_over_http3_is_refused() {
+    let Some(bin) = trusttunnel_or_skip("a_wrong_trust_tunnel_password_over_http3_is_refused")
+    else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (server, fixture) = endpoint(&bin, dir.path(), Listen::Http3);
+    let profile = profile(&[line(
+        "Wrong",
+        "trust-tunnel",
+        server.port(),
+        &format!("username={USER}, password=nope, h3=true"),
+    )]);
+    let out = outbound(&profile, "Wrong", Some(&fixture));
+    let refused = tokio::time::timeout(
+        Duration::from_secs(10),
+        out.connect_tcp(&target(echo_server().await), &ConnectOpts::default()),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the endpoint answers within the bound\n{}",
+            server.log_text()
+        )
+    });
+    let Err(err) = refused else {
+        panic!(
+            "a wrong password must not open a tunnel\n{}",
+            server.log_text()
+        );
+    };
+    assert_eq!(
+        err.to_string(),
+        "trust-tunnel: authentication failed",
+        "{}",
+        server.log_text()
+    );
 }

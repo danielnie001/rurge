@@ -86,7 +86,7 @@ crates/
 │                            # 传输层（tls、shadow-tls、ws、obfs、h2 连接池）、
 │                            # http(s) socks5(-tls) trojan vmess anytls ss snell
 │                            # h2-connect trust-tunnel(h2) external
-├── rurge-proto-quic/        # ★ M7：quinn；QUIC 会话；hysteria2（M7a）tuic tuic-v5（M7b）masque trust-tunnel(h3)
+├── rurge-proto-quic/        # ★ M7：quinn；QUIC 会话；hysteria2（M7a）tuic tuic-v5（M7b）masque trust-tunnel(h3)（M7c）
 ├── rurge-proto-ssh/         # ★ M4：russh；ssh
 ├── rurge-proto-wireguard/   # ★ M4：boringtun + smoltcp；wireguard
 ├── rurge-net/               # + quic 公共件（M7：UDP 层、拨号与 TLS、自写的 HTTP/3 客户端；rurge-dns 的 DoH3 / DoQ 与 rurge-proto-quic 共用）
@@ -393,7 +393,7 @@ Surge 手册没有定义这些端点的响应结构（PRD R5）：以收集到�
 | M4 | sing-box 的用户态 WireGuard 端点（含保留字节，对应 `client-id`）；系统 `sshd`（没有则跳过） |
 | M5 | 同上各服务端的 UDP |
 | M6 | 按 M6 细化设计 M6-D5：shadowsocks-rust v1.25.0（含 2022 与多用户，三平台）与 sing-box 的 `shadowsocks` 入站：`ss`；sing-box 的 `snell` 入站（1.14.0 起，只支持 v5 / v6；`version: 5` 同时接受 v4 客户端）：`snell`，三平台，CI 固定的 sing-box 为此从 1.14.1 升到 1.14.2（M6-D6）；官方 snell-server v5.0.1 只有 Linux 版，只在 Linux CI 跑；TrustTunnel endpoint v1.1.0（只有 Linux / macOS 版，只在这两个平台的 CI 跑）：`trust-tunnel`（h2），它的 TCP 模式是标准的 HTTP/2 CONNECT + Basic 认证，同时充当 `h2-connect` 普通 CONNECT 的参照——sing-box 1.14.2 的 `http` 入站只说 HTTP/1（HTTP/2 要到 1.15.0，仍是预发布），不用于 HTTP/2 族；CONNECT-UDP over HTTP/2 与 obfs 没有可用的预编译参考服务端，只有回环假服务端与手工验收 |
-| M7 | 按 M7 细化设计 M7-D6：sing-box 1.14.2 的 `hysteria2` 入站（无混淆、Salamander、Gecko）与 `tuic` 入站（v5），三平台；官方 tuic 0.8.5（v4；GPL，只作为外部进程运行），只在 Linux CI；Vincent-bin/masque-server v0.13.0（MIT）：`masque`，只在 Linux / macOS CI；TrustTunnel endpoint v1.1.0 的 QUIC 监听：`trust-tunnel` 的 h3，只在 Linux / macOS CI。端口跳跃要在服务端做 DNAT，只有回环假服务端与手工验收。M7a 已接入 sing-box 的 `hysteria2` 入站（TCP、UDP、认证失败、两种混淆）；M7b 已接入 sing-box 的 `tuic` 入站（v5：TCP、UDP、认证失败；它总是接受 QUIC 数据报，`quic` 模式只有回环假服务端）与 tuic 0.8.5 的服务端（v4：TCP、UDP、认证失败；它的发布没有 GitHub 的 `digest`，CI 里的 SHA-256 待项目所有者填写） |
+| M7 | 按 M7 细化设计 M7-D6：sing-box 1.14.2 的 `hysteria2` 入站（无混淆、Salamander、Gecko）与 `tuic` 入站（v5），三平台；官方 tuic 0.8.5（v4；GPL，只作为外部进程运行），只在 Linux CI；Vincent-bin/masque-server v0.13.0（MIT）：`masque`，服务端只有 Linux 版，只在 Linux CI；TrustTunnel endpoint v1.1.0 的 QUIC 监听：`trust-tunnel` 的 h3，只在 Linux / macOS CI。DoQ / DoH3 上游按 M7c 的计划：AdGuard dnsproxy v0.86.0 与 CoreDNS v1.14.7（都是 Apache-2.0），三平台。端口跳跃要在服务端做 DNAT，只有回环假服务端与手工验收。M7a 已接入 sing-box 的 `hysteria2` 入站（TCP、UDP、认证失败、两种混淆）；M7b 已接入 sing-box 的 `tuic` 入站（v5：TCP、UDP、认证失败；它总是接受 QUIC 数据报，`quic` 模式只有回环假服务端）与 tuic 0.8.5 的服务端（v4：TCP、UDP、认证失败；它的发布没有 GitHub 的 `digest`，CI 里的 SHA-256 待项目所有者填写）；M7c 已接入 masque-server（TCP 的普通 CONNECT、CONNECT-UDP、认证失败；它在 HTTP/3 上不读 capsule，服务端不支持 CONNECT-UDP 的情形只有回环假服务端）、TrustTunnel endpoint 的 QUIC 监听（`[listen_protocols.quic]`；`trust-tunnel` 的 h3：TCP、认证失败）与 dnsproxy、CoreDNS（DoQ 与 DoH3：A 与 AAAA、一条连接上的多个查询、`h3://` 的缺省路径；CoreDNS 对报文 ID 与 edns-tcp-keepalive 从严）。sing-box 1.15 的预发布版给 `http` 入站加了 HTTP/2、HTTP/3 与 CONNECT-UDP，三平台都有，是将来的跨平台参照，alpha 期间不用 |
 
 **沿用的安全约束**：测试只用回环地址、不碰公网；不修改本机的系统代理，不注册真实服务；`external` 的测试只拉起测试自带的辅助程序。策略组算法用假出站与可控时钟做单元测试；订阅装配用本地文件与回环 HTTP 服务器。
 
@@ -443,7 +443,7 @@ Surge 手册没有定义这些端点的响应结构（PRD R5）：以收集到�
 | Q3 | 六个 API 端点的 JSON 形状 | M1 / M3 细化设计时按真实样本定（PRD R5） |
 | Q4 | sing-box 的用户态 WireGuard 端点能否充当带保留字节的对端 | M4b 已决：sing-box 1.14.1 的 `endpoints`（`type: wireguard`，`system: false`）以 `peers[].reserved` 给发往 rurge 的报文写保留字节，可以充当；它的 UDP 端口开在所有地址上（端点没有监听地址这一项）。互操作用例只在 CI 上跑；回环对端另用 boringtun 写（`FakeWgPeer`） |
 | Q5 | `russh` 的算法覆盖 | 已决（2026-09-27，M4-D2 与 M4 设计第 17 节）：russh 0.63.3 支持 `curve25519-sha256` 与 `aes128-gcm@openssh.com`；后者不在默认列表里，rurge 显式加上，并去掉 SHA-1 的 `ssh-rsa` 主机密钥签名 |
-| Q6 | MASQUE 与 trust-tunnel 的参考服务端 | 已决（2026-10-01）：`trust-tunnel` 的 h2 用 TrustTunnel endpoint v1.1.0（Linux / macOS；M6c），它也是 `h2-connect` 普通 CONNECT 的参照；M7 细化设计 M7-D6 定下另外两项——MASQUE 用 Vincent-bin/masque-server v0.13.0（MIT，Linux / macOS），`trust-tunnel` 的 h3 用 TrustTunnel endpoint v1.1.0 的 QUIC 监听（Linux / macOS；能否这样启用在写 M7c 的计划时核对，不行就退到假服务端与手工验收） |
+| Q6 | MASQUE 与 trust-tunnel 的参考服务端 | 已决（2026-10-01）：`trust-tunnel` 的 h2 用 TrustTunnel endpoint v1.1.0（Linux / macOS；M6c），它也是 `h2-connect` 普通 CONNECT 的参照；M7 细化设计 M7-D6 定下另外两项——MASQUE 用 Vincent-bin/masque-server v0.13.0（MIT；M7c 核对：服务端只有 Linux 版，只在 Linux CI），`trust-tunnel` 的 h3 用 TrustTunnel endpoint v1.1.0 的 QUIC 监听（Linux / macOS；M7c 核对：`vpn.toml` 里一个 `[listen_protocols.quic]` 表即启用，UDP 与 TCP 同一个端口号） |
 | Q7 | Snell 各版本可依据的公开资料 | 已决（2026-09-30，M6 细化设计第 4.1 节）：v4 / v5 的 TCP 线上格式依据 missuo/opensnell 与 SagerNet/sing-snell 的公开描述（均为 GPL，只取协议事实，M6-D3），sing-box 1.14.0 起的 `snell` 入站实现 v5 / v6；v1 ～ v3 另有 icpz/open-snell；v6 细节未公开，不做 |
 
 ## 17. 需同步的文档

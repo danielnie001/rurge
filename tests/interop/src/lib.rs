@@ -7,6 +7,9 @@
 //! that touches the machine (`set_system_proxy`, `tun`, `auto_route`; a
 //! WireGuard endpoint runs in user space).
 
+pub mod coredns;
+pub mod dnsproxy;
+pub mod masque_server;
 pub mod shadowsocks_rust;
 pub mod snell_server;
 pub mod sshd;
@@ -16,7 +19,7 @@ pub mod xray;
 
 use base64::Engine;
 use serde_json::{Value, json};
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -67,6 +70,35 @@ pub fn free_udp_port() -> u16 {
         .and_then(|s| s.local_addr())
         .expect("a free loopback port")
         .port()
+}
+
+/// A port that was free a moment ago for TCP and for UDP alike: for a server
+/// that binds both on one number.
+pub fn free_tcp_and_udp_port() -> u16 {
+    for _ in 0..100 {
+        let port = free_port();
+        if UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no loopback port was free for TCP and UDP alike")
+}
+
+/// The one name the DNS references answer — dnsproxy from its hosts file,
+/// CoreDNS from its templates — with one address of each family, both of
+/// documentation ranges: nothing ever connects to them.
+pub const DNS_NAME: &str = "interop.rurge.test";
+pub const DNS_V4: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
+pub const DNS_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10);
+
+/// A TOML basic string.
+pub(crate) fn toml_string(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// A path as a TOML basic string.
+pub(crate) fn toml_path(p: &Path) -> String {
+    toml_string(&p.to_string_lossy())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1003,5 +1035,18 @@ mod tests {
         let port = free_port();
         assert!(port > 0);
         TcpListener::bind(("127.0.0.1", port)).expect("the port is free again");
+    }
+
+    #[test]
+    fn a_port_free_for_tcp_and_udp_takes_both() {
+        let port = free_tcp_and_udp_port();
+        let _tcp = TcpListener::bind(("127.0.0.1", port)).expect("the TCP port is free again");
+        UdpSocket::bind(("127.0.0.1", port)).expect("the UDP port is free too");
+    }
+
+    #[test]
+    fn windows_paths_are_escaped() {
+        assert_eq!(toml_path(Path::new(r"C:\t\x.pem")), r#""C:\\t\\x.pem""#);
+        assert_eq!(toml_string("p\"w"), r#""p\"w""#);
     }
 }
