@@ -21,8 +21,8 @@
 //!   4.4) — or, carrying a `Protocol`, extended (RFC 9220), which goes only
 //!   once the server's SETTINGS allowed it.
 //! - HTTP Datagrams (RFC 9297) ride the connection's QUIC datagrams on a
-//!   client made `with_datagrams`, each for the request stream it names
-//!   (`RequestStream::datagrams`).
+//!   client made `with_datagrams`, each for the CONNECT request stream it
+//!   names (`RequestStream::datagrams`).
 //! - QPACK uses the static table alone: an exact entry, else a literal
 //!   value with the entry of the name, else a literal name and value.
 //!   Nothing sent is Huffman-encoded; what comes back may be.
@@ -1396,6 +1396,42 @@ mod tests {
         assert!(p.quic.close_reason().is_none());
     }
 
+    /// A datagram that comes for a stream after its receive side ended is
+    /// dropped — the stream's flow ended with it — and the connection
+    /// serves on.
+    #[tokio::test]
+    async fn a_datagram_for_a_stream_whose_receive_side_ended_is_dropped() {
+        let p = masque_pair().await;
+        timeout(BOUND, async {
+            let (mut a, mut served_a) = udp_tunnel(&p, "/a").await;
+            let (mut b, mut served_b) = udp_tunnel(&p, "/b").await;
+            let (sa, sb) = (served_a.datagrams(), served_b.datagrams());
+            let da = a.datagrams().await.unwrap();
+            let db = b.datagrams().await.unwrap();
+            // a's receive side ends, its send side stays open
+            served_a.finish();
+            a.read_to_end(&mut Vec::new()).await.unwrap();
+            assert!(da.recv().await.is_none());
+            // what the server sends for a now goes nowhere, what it sends
+            // for b after it still comes
+            sa.send(b"late").unwrap();
+            sb.send(b"b").unwrap();
+            assert_eq!(db.recv().await.unwrap(), &b"b"[..]);
+            assert!(da.recv().await.is_none());
+            // the connection serves on: a new stream's datagrams flow
+            let (mut c, mut served_c) = udp_tunnel(&p, "/c").await;
+            let mut sc = served_c.datagrams();
+            let dc = c.datagrams().await.unwrap();
+            dc.send(b"to c").unwrap();
+            assert_eq!(sc.recv().await.unwrap(), b"to c");
+            sc.send(b"from c").unwrap();
+            assert_eq!(dc.recv().await.unwrap(), &b"from c"[..]);
+        })
+        .await
+        .unwrap();
+        assert!(p.quic.close_reason().is_none());
+    }
+
     /// A datagram too short for its quarter stream ID, or naming a stream
     /// QUIC cannot have, closes the connection (H3_DATAGRAM_ERROR, RFC 9297
     /// 2.1).
@@ -1505,6 +1541,57 @@ mod tests {
         .unwrap();
     }
 
+    /// Only a CONNECT's stream has datagrams: HTTP Datagrams mean what the
+    /// request says (RFC 9297 2), and no other request of the client says
+    /// anything. Any other request is refused at once, without the server's
+    /// SETTINGS; a classic CONNECT is not, and waits for them.
+    #[tokio::test]
+    async fn only_a_connect_has_datagrams() {
+        let (_endpoint, quic, server_quic) = connected().await;
+        let client = Client::with_datagrams(quic);
+        // the server's SETTINGS have not come
+        let mut server = H3Server::new(server_quic);
+        for method in [Method::GET, Method::HEAD, Method::POST] {
+            let request = Request::builder()
+                .method(method.clone())
+                .uri("https://example.test/")
+                .body(())
+                .unwrap();
+            let mut stream = timeout(BOUND, client.request(request))
+                .await
+                .expect("sent within the bound")
+                .unwrap();
+            let err = timeout(BOUND, stream.datagrams())
+                .await
+                .expect("refused within the bound")
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{method}");
+            assert_eq!(
+                err.to_string(),
+                "h3: HTTP datagrams need a CONNECT request",
+                "{method}"
+            );
+        }
+        let mut stream = timeout(BOUND, client.request(tunnel("example.test:443")))
+            .await
+            .expect("sent within the bound")
+            .unwrap();
+        let taking = stream.datagrams();
+        tokio::pin!(taking);
+        assert!(
+            timeout(Duration::from_millis(200), &mut taking)
+                .await
+                .is_err(),
+            "taken before the server's SETTINGS"
+        );
+        timeout(BOUND, async {
+            server.send_settings(MASQUE_SETTINGS).await.unwrap();
+            taking.await.unwrap();
+        })
+        .await
+        .expect("taken within the bound");
+    }
+
     /// A stream that does not read its datagrams holds up no other: those
     /// past what its queue holds are dropped.
     #[tokio::test]
@@ -1581,6 +1668,33 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// A client dropped ends the flows of its streams' datagrams, one that
+    /// waits for a datagram too: its `recv` ends and `send` fails.
+    #[tokio::test]
+    async fn dropping_the_client_ends_the_datagram_flows() {
+        let p = masque_pair().await;
+        let (mut a, _served) = udp_tunnel(&p, "/").await;
+        let da = a.datagrams().await.unwrap();
+        let waiting = da.recv();
+        tokio::pin!(waiting);
+        assert!(
+            timeout(Duration::from_millis(200), &mut waiting)
+                .await
+                .is_err(),
+            "a datagram came from nowhere"
+        );
+        drop(p.client);
+        assert!(
+            timeout(BOUND, waiting)
+                .await
+                .expect("ended within the bound")
+                .is_none()
+        );
+        let err = da.send(b"late").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(err.to_string(), "h3: the stream is closed");
     }
 
     /// Header fields as the fake sends them.

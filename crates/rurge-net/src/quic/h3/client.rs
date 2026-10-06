@@ -102,7 +102,7 @@ impl Client {
     /// HTTP/3 on `connection` with HTTP Datagrams (RFC 9297), as `new`
     /// otherwise: our SETTINGS also say `H3_DATAGRAM = 1`, and the client
     /// reads the connection's QUIC datagrams — all of them: nothing else
-    /// may — each for the request stream it names
+    /// may — each for the CONNECT request stream it names
     /// (`RequestStream::datagrams`).
     pub fn with_datagrams(connection: Connection) -> Client {
         Client::start(connection, Some(Flows::default()))
@@ -589,6 +589,7 @@ mod tests {
     use super::*;
     use crate::quic::h3::tests::{BOUND, connected};
     use quinn::VarInt;
+    use tokio::sync::mpsc;
     use tokio::time::timeout;
 
     /// The server closed the connection, and the client's task has not
@@ -618,6 +619,29 @@ mod tests {
             "{:?}",
             quic.close_reason()
         );
+    }
+
+    /// The reading of the connection's datagrams ends every flow however it
+    /// ends — also when its task is aborted before it ever ran, as with the
+    /// client dropped soon after it was made.
+    #[tokio::test]
+    async fn a_datagram_reading_dropped_before_it_ran_ends_the_flows() {
+        let (_endpoint, quic, _server_quic) = connected().await;
+        let inner = Arc::new(Inner {
+            quic,
+            state: watch::Sender::new(State::default()),
+            critical: AtomicU8::new(0),
+            flows: Some(Flows::default()),
+        });
+        let flows = inner.flows.as_ref().expect("made with flows");
+        let mut open = flows.open(0).expect("flows open before the reading ends");
+        // never polled
+        drop(datagram::read(inner.clone()));
+        assert_eq!(
+            open.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        );
+        assert!(flows.open(1).is_none());
     }
 
     /// A request without an authority cannot be sent: HTTPS wants one

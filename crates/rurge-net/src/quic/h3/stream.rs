@@ -18,7 +18,8 @@
 //! - A stream dropped before both directions ended cancels its request:
 //!   the sending part is reset and the receiving part stopped, with
 //!   H3_REQUEST_CANCELLED (RFC 9114 4.1.1).
-//! - Its HTTP/3 datagrams (`datagrams`) flow until either direction ends.
+//! - A CONNECT's HTTP/3 datagrams (`datagrams`) flow until either direction
+//!   ends.
 
 use super::client::Inner;
 use super::datagram::Datagrams;
@@ -168,16 +169,24 @@ impl RequestStream {
     }
 
     /// The stream's HTTP/3 datagrams (RFC 9297 2.1), taken once per stream
-    /// of a client made `with_datagrams`. They need the server's SETTINGS
-    /// to say `H3_DATAGRAM = 1` — they are waited for; the caller bounds
-    /// the wait — and the connection to have negotiated QUIC datagrams.
-    /// They flow until either direction of the stream ends, the stream or
-    /// the handle is dropped, or the connection ends.
+    /// of a client made `with_datagrams`, and only of a CONNECT's: HTTP
+    /// Datagrams mean what the request says (RFC 9297 2), and no other
+    /// request of this client says anything. They need the server's
+    /// SETTINGS to say `H3_DATAGRAM = 1` — they are waited for; the caller
+    /// bounds the wait — and the connection to have negotiated QUIC
+    /// datagrams. They flow until either direction of the stream ends, the
+    /// stream or the handle is dropped, or the connection ends.
     pub async fn datagrams(&mut self) -> io::Result<Datagrams> {
         if self.inner.flows.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "h3: the client was made without HTTP datagrams",
+            ));
+        }
+        if self.kind != Kind::Connect {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "h3: HTTP datagrams need a CONNECT request",
             ));
         }
         if self.datagrams_taken {

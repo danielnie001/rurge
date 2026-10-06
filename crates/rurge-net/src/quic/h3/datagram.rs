@@ -2,7 +2,7 @@
 //! `with_datagrams`: each QUIC datagram of the connection carries
 //! `varint(stream ID ÷ 4) ‖ payload`, either way.
 //!
-//! - A request stream's datagrams flow once taken
+//! - A CONNECT stream's datagrams flow once taken
 //!   (`RequestStream::datagrams`) until either direction of the stream
 //!   ends — as reading the stream to its end or failure, its shutdown or a
 //!   failed write finds —, the stream or the handle is dropped, or the
@@ -94,29 +94,37 @@ impl Flows {
 
 /// Reads the connection's datagrams into the queues of the streams they
 /// name until the connection ends — or the client goes, and its tasks with
-/// it. Every flow ends with the reading, however it ends.
-pub(super) async fn read(inner: Arc<Inner>) {
-    let Some(flows) = &inner.flows else {
-        return;
-    };
-    let _end = EndFlows(flows);
-    while let Ok(datagram) = inner.quic.read_datagram().await {
-        match parse(datagram) {
-            Ok((quarter, payload)) => flows.deliver(quarter, payload),
-            Err(error) => {
-                inner.fail(error);
-                return;
+/// it. Every flow ends with the reading, however it ends — also when the
+/// future is dropped before it ran: the guard that ends them is made here,
+/// not in the future.
+pub(super) fn read(inner: Arc<Inner>) -> impl Future<Output = ()> {
+    let end = EndFlows(inner.clone());
+    async move {
+        let _end = end;
+        let Some(flows) = &inner.flows else {
+            return;
+        };
+        while let Ok(datagram) = inner.quic.read_datagram().await {
+            match parse(datagram) {
+                Ok((quarter, payload)) => flows.deliver(quarter, payload),
+                Err(error) => {
+                    inner.fail(error);
+                    return;
+                }
             }
         }
     }
 }
 
-/// Ends every flow when dropped: when the reading ends.
-struct EndFlows<'a>(&'a Flows);
+/// Ends every flow when dropped: when the reading ends, or the future that
+/// holds it is dropped before it ran.
+struct EndFlows(Arc<Inner>);
 
-impl Drop for EndFlows<'_> {
+impl Drop for EndFlows {
     fn drop(&mut self) {
-        self.0.end();
+        if let Some(flows) = &self.0.flows {
+            flows.end();
+        }
     }
 }
 
