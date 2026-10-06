@@ -3,10 +3,10 @@
 //! HTTP/3 on it, HTTP Datagrams announced: RFC 9297 recommends announcing
 //! them always (2.1.1), and CONNECT-UDP rides them.
 //!
-//! - A TCP connection is a classic HTTP/3 CONNECT of its own (`tcp`), as
-//!   Surge relays TCP ("HTTP/3 CONNECT tunnels multiplexed over a single
-//!   QUIC connection"): the template-driven `connect-tcp` is still a draft,
-//!   and masque-server answers it 404.
+//! - A TCP connection is a classic HTTP/3 CONNECT of its own (`tcp`,
+//!   `connect`), as Surge relays TCP ("HTTP/3 CONNECT tunnels multiplexed
+//!   over a single QUIC connection"): the template-driven `connect-tcp` is
+//!   still a draft, and masque-server answers it 404.
 //! - UDP goes as CONNECT-UDP (RFC 9298), a stream of its own for each
 //!   target, the packets in HTTP/3 datagrams (`udp`).
 //! - With `username` and `password`, every request carries them as
@@ -18,7 +18,8 @@
 mod tcp;
 mod udp;
 
-use crate::session::{Dialer, Failure, Lease, Protocol, Session};
+use crate::connect::{self, Connected, H3_NO_ERROR};
+use crate::session::{Dialer, Protocol, Session};
 use http::StatusCode;
 use http::header::HeaderValue;
 use quinn::{Connection, VarInt};
@@ -31,12 +32,8 @@ use rurge_proto::build::tls_name;
 use rurge_proto::http::{basic_authorization, wire_host};
 use rurge_proto::{BuildError, Outbound, OutboundError, UdpSupport};
 use rustls::RootCertStore;
-use std::io;
 use std::sync::Arc;
 use udp::MasqueUdp;
-
-/// H3_NO_ERROR (RFC 9114 8.1): a connection let go of.
-const H3_NO_ERROR: VarInt = VarInt::from_u32(0x100);
 
 /// No `Debug`: it holds the credentials.
 pub struct MasqueOutbound {
@@ -88,17 +85,6 @@ impl MasqueOutbound {
     }
 }
 
-/// How a request failed before its response came: `Lost` when its
-/// connection turned out gone or going away, else final. The error says
-/// its layer (`h3: …`, `quic: …`).
-fn failure(lease: &Lease<Connected>, e: io::Error) -> Failure {
-    if lease.connection().close_reason().is_some() || lease.state().h3.is_going_away() {
-        Failure::Lost(e.into())
-    } else {
-        Failure::Failed(e.into())
-    }
-}
-
 fn proxy(text: &str) -> OutboundError {
     OutboundError::Proxy(format!("masque: {text}"))
 }
@@ -115,14 +101,6 @@ fn refused(status: StatusCode) -> OutboundError {
 /// What every new connection runs before its requests: HTTP/3, nothing
 /// more — each request carries its own credentials.
 struct Http3;
-
-/// What a connection keeps for its requests.
-struct Connected {
-    /// Lives as long as the connection: dropped, it would end our HTTP/3
-    /// control stream, which a server may take for the end of HTTP/3 on the
-    /// connection.
-    h3: h3::Client,
-}
 
 impl Protocol for Http3 {
     type State = Connected;
@@ -166,9 +144,9 @@ impl Outbound for MasqueOutbound {
             let request = tcp::request(target, self.authorization.as_ref())?;
             // one budget for the connection (when one is dialed), QUIC's
             // handshake and the proxy's response
-            let tunnel = self
-                .session
-                .request(opts, |lease| Box::pin(tcp::open(lease, request.clone())));
+            let tunnel = self.session.request(opts, |lease| {
+                Box::pin(connect::open(lease, request.clone(), refused))
+            });
             match tokio::time::timeout(opts.timeout, tunnel).await {
                 Ok(tunnel) => Ok(Box::new(tunnel?) as BoxedStream),
                 Err(_) => Err(OutboundError::Timeout),

@@ -1,7 +1,7 @@
 //! Loopback QUIC servers for the tests of this crate and of its dependants
 //! (feature `testing`): a server port whose endpoint can be replaced, as
-//! by a server that restarts, and scriptable Hysteria 2, TUIC and MASQUE
-//! servers. Never used by production code.
+//! by a server that restarts, and scriptable Hysteria 2, TUIC and HTTP/3
+//! CONNECT (MASQUE, TrustTunnel) servers. Never used by production code.
 
 mod h3proxy;
 mod hysteria2;

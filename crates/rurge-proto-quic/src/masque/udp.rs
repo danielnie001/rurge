@@ -37,7 +37,8 @@
 //!   opens one anew, once, then fails: a proxy may end every stream at
 //!   once.
 
-use super::{Connected, Http3, failure, proxy, refused};
+use super::{Http3, proxy, refused};
+use crate::connect::{Connected, failure};
 use crate::session::{Failure, Lease, Protocol, Session};
 use crate::varint;
 use bytes::Bytes;

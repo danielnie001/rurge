@@ -1,11 +1,21 @@
 //! A policy's QUIC connection, shared by its requests (phase 2 M7 design
-//! 3.5).
+//! 3.5) — or its connections, under a cap on the requests each carries
+//! (`Session::with_stream_cap`).
 //!
 //! - The connection is dialed when a request first needs one, and the
 //!   requests that come meanwhile wait for that dial: the path to the
 //!   server, QUIC's handshake, then the protocol's own
 //!   (`Protocol::handshake`: Hysteria 2's authentication). Its failure is
 //!   theirs too.
+//! - Under a cap (`trust-tunnel`'s `max-streams` over HTTP/3), a request
+//!   takes the oldest connection that carries fewer requests than the cap,
+//!   as the HTTP/2 pool does (phase 2 M6 design 16, 18). With none, it
+//!   waits for the dials in flight while they have room for it — each is
+//!   room for `cap` requests, its own and the ones that wait for it —,
+//!   else it dials another, `MAX_DIALS` at most at once. Once no dial is in
+//!   flight, a request that waited shares the latest dial's failure if that
+//!   dial ended after it began to wait. Each connection then goes by the
+//!   rules below on its own.
 //! - A connection that has closed — an error, the idle timeout, the
 //!   server's close, the loss of the UDP path under it (which quinn reports
 //!   as a local close) — or that its protocol state says is going away (an
@@ -20,11 +30,12 @@
 //!   a timer.
 //! - A connection that no request or UDP session has held (`Lease`) for
 //!   `IDLE_TIMEOUT` is closed: looked at on every request and by a reaper.
-//! - A request on a connection that was up when it came, which finds the
-//!   connection gone before any of the request's own data went out, goes
-//!   again, once, on a new connection (`Session::request`): a server that
-//!   dropped the connection while it idled answers the request's first
-//!   packet with a stateless reset.
+//! - A request on a connection it took at once — one that was up when it
+//!   came —, which finds the connection gone before any of the request's
+//!   own data went out, goes again, once, on a new connection — under a
+//!   cap, on another with room if there is one — (`Session::request`): a
+//!   server that dropped the connection while it idled answers the
+//!   request's first packet with a stateless reset.
 //! - Nothing here bounds how long a request takes: the caller's
 //!   `opts.timeout` covers the dial, both handshakes and the request.
 
@@ -49,6 +60,11 @@ use tokio_util::task::AbortOnDropHandle;
 /// How long a connection may go without a lease before the session closes
 /// it (as the HTTP/2 pool, phase 2 M6 design 5.2).
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The most dials in flight at once under a cap, as in the HTTP/2 pool: a
+/// burst after a network change does not open hundreds of connections
+/// together.
+const MAX_DIALS: usize = 8;
 
 /// What a protocol lays over each connection's socket, outermost: over the
 /// hops and the carrier too (Hysteria 2's obfuscation, design 5.4).
@@ -228,11 +244,15 @@ impl From<OutboundError> for Failure {
     }
 }
 
-/// A policy's QUIC connection, shared by its requests (design 3.5). No
-/// `Debug`: the protocol may hold credentials.
+/// A policy's QUIC connection — under a cap, its connections —, shared by
+/// its requests (design 3.5). No `Debug`: the protocol may hold
+/// credentials.
 pub struct Session<P: Protocol> {
     dialer: Dialer,
     shared: Arc<Shared<P>>,
+    /// The most leases a connection carries at once (`with_stream_cap`);
+    /// without a cap, the one connection takes them all.
+    cap: Option<usize>,
     /// A dial ended, or its request gave up on it: the requests waiting for
     /// one look again.
     dialed: Notify,
@@ -251,12 +271,15 @@ struct Shared<P: Protocol> {
     slot: Mutex<Slot<P::State>>,
 }
 
-/// The session's connection and its dial.
+/// The session's connections and their dials.
 struct Slot<S> {
-    /// The connection new requests go to.
-    current: Option<Arc<Conn<S>>>,
-    /// A dial is in flight.
-    dialing: bool,
+    /// The connections new requests go to, oldest first: one at most
+    /// without a cap.
+    conns: Vec<Arc<Conn<S>>>,
+    /// Dials in flight: one at most without a cap.
+    dialing: usize,
+    /// Requests waiting for them.
+    waiting: usize,
     /// Dials that have ended, success or failure.
     dials: u64,
     /// The latest dial's failure and the `dials` it ended as; `None` after
@@ -278,19 +301,32 @@ impl<P: Protocol> Session<P> {
                 protocol,
                 idle,
                 slot: Mutex::new(Slot {
-                    current: None,
-                    dialing: false,
+                    conns: Vec::new(),
+                    dialing: 0,
+                    waiting: 0,
                     dials: 0,
                     failure: None,
                 }),
             }),
+            cap: None,
             dialed: Notify::new(),
             reaper: OnceLock::new(),
         }
     }
 
-    /// A lease on the session's connection, dialing one when there is none
-    /// (once for all the requests that come meanwhile).
+    /// The session with each connection carrying `cap` leases at most (1
+    /// at least): it keeps as many connections as its requests need
+    /// (`trust-tunnel`'s `max-streams` over HTTP/3, design 3.5).
+    pub fn with_stream_cap(self, cap: usize) -> Session<P> {
+        Session {
+            cap: Some(cap.max(1)),
+            ..self
+        }
+    }
+
+    /// A lease on a connection of the session — under a cap, one with room
+    /// —, dialing one when there is none: once for all the requests that
+    /// come meanwhile, or, under a cap, as often as they need.
     pub async fn lease(&self, opts: &ConnectOpts) -> Result<Lease<P::State>, OutboundError> {
         self.take(opts).await.map(|(lease, _)| lease)
     }
@@ -301,7 +337,8 @@ impl<P: Protocol> Session<P> {
     /// moves to the session's connection (`lease` again); what is under
     /// way on it goes on. Where the connector leads can cost a group's
     /// resolution: a UDP session, which asks for every datagram, asks this
-    /// at most once a second, `serves_without_route` in between.
+    /// at most once a second, `serves_without_route` in between. Under a
+    /// cap, a new request needs room on it too.
     pub fn serves(&self, lease: &Lease<P::State>) -> bool {
         let conn = &lease.conn;
         conn.quic.close_reason().is_none()
@@ -321,10 +358,11 @@ impl<P: Protocol> Session<P> {
 
     /// Runs `attempt` on a lease of the session's connection; what it
     /// returns may keep the lease (a stream). A request that finds a
-    /// connection that was up when it came gone before any of its own data
-    /// went out (`Failure::Lost`) is attempted again, once, on a new
-    /// connection; on a connection dialed for it, it fails. Either way the
-    /// connection found gone takes no new requests.
+    /// connection it took at once gone before any of its own data went out
+    /// (`Failure::Lost`) is attempted again, once, on a new connection —
+    /// under a cap, on another with room if there is one —; on a
+    /// connection it waited for, it fails. Either way the connection found
+    /// gone takes no new requests.
     pub async fn request<'a, T>(
         &'a self,
         opts: &'a ConnectOpts,
@@ -348,8 +386,9 @@ impl<P: Protocol> Session<P> {
     }
 
     /// A lease on a connection that takes requests, dialing one when there
-    /// is none; and whether the connection was up when the request came,
-    /// rather than dialed for it or for requests it waited with.
+    /// is none; and whether the request took it at once — a connection that
+    /// was up when it came —, rather than after a dial of its own or of
+    /// others it waited for.
     async fn take(&self, opts: &ConnectOpts) -> Result<(Lease<P::State>, bool), OutboundError> {
         self.reaper.get_or_init(|| spawn_reaper(&self.shared));
         // the dials that had ended when this request last began to wait
@@ -363,25 +402,41 @@ impl<P: Protocol> Session<P> {
             let route = self.dialer.route();
             {
                 let mut slot = self.shared.slot.lock().expect("session");
-                if let Some(lease) = self.shared.pick(&mut slot, route.as_ref()) {
+                if let Some(lease) = self.shared.pick(&mut slot, route.as_ref(), self.cap) {
                     return Ok((lease, waited_since.is_none()));
                 }
                 if let Some(since) = waited_since
-                    && !slot.dialing
+                    && slot.dialing == 0
                     && let Some((at, failure)) = &slot.failure
                     && *at > since
                 {
                     return Err(copy_error(failure));
                 }
-                if !slot.dialing {
-                    slot.dialing = true;
+                if self.dials_another(&slot) {
+                    slot.dialing += 1;
                     break;
                 }
+                slot.waiting += 1;
                 waited_since = Some(slot.dials);
             }
+            let _waiting = Waiting(&self.shared);
             dialed.await;
         }
         self.dial(opts).await.map(|lease| (lease, false))
+    }
+
+    /// Whether a request that found no room dials, rather than waits for
+    /// the dials in flight. Without a cap, a dial is room for every request
+    /// that comes meanwhile. Under one, a dial is room for its own request
+    /// and `cap - 1` that wait for it, and a request that would not fit
+    /// dials another, `MAX_DIALS` at most at once.
+    fn dials_another(&self, slot: &Slot<P::State>) -> bool {
+        match self.cap {
+            None => slot.dialing == 0,
+            Some(cap) => {
+                slot.dialing < MAX_DIALS && slot.waiting >= slot.dialing.saturating_mul(cap - 1)
+            }
+        }
     }
 
     /// A new connection and its first lease. The dial stays in flight until
@@ -397,7 +452,7 @@ impl<P: Protocol> Session<P> {
                     slot.failure = None;
                     let conn = Arc::new(conn);
                     let lease = conn.lease();
-                    slot.current = Some(conn);
+                    slot.conns.push(conn);
                     Ok(lease)
                 }
                 Err(e) => {
@@ -439,13 +494,7 @@ impl<P: Protocol> Session<P> {
     /// Lets go of `conn` if requests still go to it.
     fn forget(&self, conn: &Arc<Conn<P::State>>) {
         let mut slot = self.shared.slot.lock().expect("session");
-        if slot
-            .current
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, conn))
-        {
-            slot.current = None;
-        }
+        slot.conns.retain(|kept| !Arc::ptr_eq(kept, conn));
     }
 
     /// Test support: the reaper's handle, once a request started it.
@@ -456,37 +505,35 @@ impl<P: Protocol> Session<P> {
 }
 
 impl<P: Protocol> Shared<P> {
-    /// A lease on the connection a request goes to, when it takes one; a
-    /// connection that does not — `prune`'s, or one dialled another way
-    /// than the connector leads now (`route`) — is let go of on the way.
-    /// The one place a connection is chosen: a cap on the streams of a
-    /// connection (M7c's `trust-tunnel` over HTTP/3, design 3.5) makes it
-    /// choose among several, the oldest with room first, as the HTTP/2 pool
-    /// does.
-    fn pick(&self, slot: &mut Slot<P::State>, route: Option<&Route>) -> Option<Lease<P::State>> {
+    /// A lease on the connection a request goes to, when one takes it: the
+    /// oldest with room under `cap`. A connection that takes no requests —
+    /// `prune`'s, or one dialled another way than the connector leads now
+    /// (`route`) — is let go of on the way. The one place a connection is
+    /// chosen.
+    fn pick(
+        &self,
+        slot: &mut Slot<P::State>,
+        route: Option<&Route>,
+        cap: Option<usize>,
+    ) -> Option<Lease<P::State>> {
         self.prune(slot, Instant::now());
-        if slot
-            .current
-            .as_ref()
-            .is_some_and(|conn| !self.on_route(conn, route))
-        {
-            slot.current = None;
-        }
-        slot.current.as_ref().map(Conn::lease)
+        slot.conns.retain(|conn| self.on_route(conn, route));
+        slot.conns
+            .iter()
+            .find(|conn| conn.has_room(cap))
+            .map(Conn::lease)
     }
 
-    /// Lets go of the connection once it takes no new requests: closed,
+    /// Lets go of each connection once it takes no new requests: closed,
     /// going away, or without a lease for `idle`. Its leases keep it until
     /// they go too; then it is closed. The reaper's look too, which leaves
     /// where the connector leads to the requests (`pick`).
     fn prune(&self, slot: &mut Slot<P::State>, now: Instant) {
-        if slot.current.as_ref().is_some_and(|conn| {
-            conn.quic.close_reason().is_some()
-                || self.protocol.is_going_away(&conn.state)
-                || conn.is_expired(now, self.idle)
-        }) {
-            slot.current = None;
-        }
+        slot.conns.retain(|conn| {
+            conn.quic.close_reason().is_none()
+                && !self.protocol.is_going_away(&conn.state)
+                && !conn.is_expired(now, self.idle)
+        });
     }
 
     /// Whether `conn` goes the way the connector leads now (`route`). Once
@@ -516,8 +563,17 @@ struct Dialing<'a, P: Protocol>(&'a Session<P>);
 
 impl<P: Protocol> Drop for Dialing<'_, P> {
     fn drop(&mut self) {
-        self.0.shared.slot.lock().expect("session").dialing = false;
+        self.0.shared.slot.lock().expect("session").dialing -= 1;
         self.0.dialed.notify_waiters();
+    }
+}
+
+/// A request waiting for the dials in flight.
+struct Waiting<'a, P: Protocol>(&'a Shared<P>);
+
+impl<P: Protocol> Drop for Waiting<'_, P> {
+    fn drop(&mut self) {
+        self.0.slot.lock().expect("session").waiting -= 1;
     }
 }
 
@@ -548,6 +604,13 @@ impl<S> Conn<S> {
     fn lease(self: &Arc<Self>) -> Lease<S> {
         self.usage.lock().expect("usage").leases += 1;
         Lease { conn: self.clone() }
+    }
+
+    /// Whether the connection carries fewer leases than `cap`; any number
+    /// without one. Looked at under the session's lock, as leases are
+    /// taken: only a lease let go of can change it before `lease`.
+    fn has_room(&self, cap: Option<usize>) -> bool {
+        cap.is_none_or(|cap| self.usage.lock().expect("usage").leases < cap)
     }
 
     fn is_expired(&self, now: Instant, idle: Duration) -> bool {
@@ -621,6 +684,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
     use tokio::io::ReadBuf;
+    use tokio::sync::watch;
+    use tokio::task::JoinSet;
     use tokio::time::timeout;
 
     const BOUND: Duration = Duration::from_secs(10);
@@ -642,12 +707,15 @@ mod tests {
     /// away. With `stall_first`, the first handshake never ends, as with a
     /// server that does not answer: it is told on `stalled` when it begins,
     /// and it ends only with its dial, when the caller gives up on that.
+    /// While `held` says so, every handshake that begins waits, its dial in
+    /// flight, until it is let go.
     #[derive(Default)]
     struct Plain {
         handshakes: AtomicUsize,
         refuse: AtomicBool,
         stall_first: bool,
         stalled: Notify,
+        held: watch::Sender<bool>,
     }
 
     impl Plain {
@@ -674,6 +742,8 @@ mod tests {
                     self.stalled.notify_one();
                     std::future::pending::<()>().await;
                 }
+                let mut held = self.held.subscribe();
+                let _ = held.wait_for(|held| !*held).await;
                 let (mut send, mut recv) = connection
                     .open_bi()
                     .await
@@ -917,6 +987,36 @@ mod tests {
                 if close.error_code == NO_ERROR && close.reason.is_empty()),
             "{closed:?}"
         );
+    }
+
+    /// `session` with each connection carrying `cap` leases at most.
+    fn capped(server: &Server, protocol: Plain, cap: usize) -> Session<Plain> {
+        session(server, protocol).with_stream_cap(cap)
+    }
+
+    /// The leases each connection that takes requests carries, the oldest
+    /// first.
+    fn carried(session: &Session<Plain>) -> Vec<usize> {
+        let slot = session.shared.slot.lock().unwrap();
+        slot.conns
+            .iter()
+            .map(|conn| conn.usage.lock().unwrap().leases)
+            .collect()
+    }
+
+    /// Whether `lease` is on the connection at `n` among those that take
+    /// requests, the oldest first.
+    fn on(session: &Session<Plain>, lease: &Lease<AtomicBool>, n: usize) -> bool {
+        Arc::ptr_eq(&lease.conn, &session.shared.slot.lock().unwrap().conns[n])
+    }
+
+    /// Polls `check` until it holds, within the bound.
+    async fn until(mut check: impl FnMut() -> bool) {
+        let deadline = Instant::now() + BOUND;
+        while !check() {
+            assert!(Instant::now() < deadline, "not within the bound");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     #[tokio::test]
@@ -1429,5 +1529,229 @@ mod tests {
             "`port-hopping` cannot be combined with `underlying-proxy`"
         );
         build(Arc::new(DirectConnector::new(Arc::new(Loopback)))).expect("a direct one hops");
+    }
+
+    /// Under a cap of two, five requests at once: a dial is room for two of
+    /// them, so three dials; the requests that waited fill the oldest
+    /// connections first.
+    #[tokio::test]
+    async fn under_a_cap_requests_that_come_together_dial_the_connections_they_need() {
+        let server = Server::spawn();
+        let session = capped(&server, Plain::default(), 2);
+        let opts = ConnectOpts::default();
+        let (a, b, c, d, e) = timeout(BOUND, async {
+            tokio::join!(
+                session.lease(&opts),
+                session.lease(&opts),
+                session.lease(&opts),
+                session.lease(&opts),
+                session.lease(&opts)
+            )
+        })
+        .await
+        .expect("leases within the bound");
+        let _leases = [a.unwrap(), b.unwrap(), c.unwrap(), d.unwrap(), e.unwrap()];
+        assert_eq!(session.shared.protocol.handshakes(), 3);
+        assert_eq!(server.accepted(3).await.len(), 3);
+        assert_eq!(carried(&session), [2, 2, 1]);
+    }
+
+    /// Under a cap, a connection takes requests until it carries the cap,
+    /// and the next one dials; a lease let go of frees its place, which the
+    /// next request takes, the oldest connection with room first.
+    #[tokio::test]
+    async fn under_a_cap_a_place_let_go_of_is_taken_again_the_oldest_first() {
+        let server = Server::spawn();
+        let session = capped(&server, Plain::default(), 2);
+        let opts = ConnectOpts::default();
+        let mut leases = Vec::new();
+        for _ in 0..5 {
+            leases.push(session.lease(&opts).await.unwrap());
+        }
+        assert_eq!(carried(&session), [2, 2, 1]);
+        assert_eq!(session.shared.protocol.handshakes(), 3);
+        // a place freed on the newest and one on the oldest
+        let newest = leases.iter().position(|l| on(&session, l, 2)).unwrap();
+        drop(leases.remove(newest));
+        let oldest = leases.iter().position(|l| on(&session, l, 0)).unwrap();
+        drop(leases.remove(oldest));
+        assert_eq!(carried(&session), [1, 2, 0]);
+        let next = session.lease(&opts).await.unwrap();
+        assert!(on(&session, &next, 0), "{:?}", carried(&session));
+        leases.push(next);
+        for _ in 0..2 {
+            leases.push(session.lease(&opts).await.unwrap());
+        }
+        assert_eq!(carried(&session), [2, 2, 2]);
+        assert_eq!(
+            session.shared.protocol.handshakes(),
+            3,
+            "places taken again"
+        );
+        // every place taken: the next request dials
+        leases.push(session.lease(&opts).await.unwrap());
+        assert_eq!(carried(&session), [2, 2, 2, 1]);
+        assert_eq!(session.shared.protocol.handshakes(), 4);
+    }
+
+    /// Under a cap, a dial in flight is room for `cap` requests — its own
+    /// and `cap - 1` that wait for it —; a request that would not fit dials
+    /// another, eight at most at once. Held at their handshakes, the dials
+    /// stay in flight while the requests are counted.
+    #[tokio::test]
+    async fn under_a_cap_each_dial_is_room_for_cap_requests_and_eight_dial_at_most() {
+        for (cap, requests, dials, connections) in [(3, 9, 3, 3), (3, 10, 4, 4), (1, 12, 8, 12)] {
+            let server = Server::spawn();
+            let protocol = Plain::default();
+            protocol.held.send_replace(true);
+            let session = Arc::new(capped(&server, protocol, cap));
+            let mut leases = JoinSet::new();
+            for _ in 0..requests {
+                let session = session.clone();
+                leases.spawn(async move { session.lease(&ConnectOpts::default()).await });
+            }
+            let waiting = requests - dials;
+            until(|| session.shared.protocol.handshakes() == dials).await;
+            until(|| session.shared.slot.lock().unwrap().waiting == waiting).await;
+            // and no more while they are held
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let counted = {
+                let slot = session.shared.slot.lock().unwrap();
+                (slot.dialing, slot.waiting)
+            };
+            assert_eq!(counted, (dials, waiting), "cap {cap}, {requests} requests");
+            assert_eq!(session.shared.protocol.handshakes(), dials);
+            session.shared.protocol.held.send_replace(false);
+            let leases = timeout(BOUND, leases.join_all())
+                .await
+                .expect("leases within the bound");
+            assert!(leases.iter().all(Result::is_ok));
+            let carried = carried(&session);
+            assert_eq!(carried.len(), connections, "cap {cap}: {carried:?}");
+            assert!(carried.iter().all(|&n| n <= cap), "cap {cap}: {carried:?}");
+            assert_eq!(carried.iter().sum::<usize>(), requests);
+        }
+    }
+
+    /// Under a cap, the requests that waited for a dial share its failure;
+    /// the next request dials again.
+    #[tokio::test]
+    async fn under_a_cap_a_failed_dial_fails_the_requests_that_waited_for_it() {
+        let server = Server::spawn();
+        let protocol = Plain {
+            refuse: AtomicBool::new(true),
+            ..Plain::default()
+        };
+        let session = capped(&server, protocol, 3);
+        let (a, b, c) = tokio::join!(
+            echo(&session, b"a"),
+            echo(&session, b"b"),
+            echo(&session, b"c")
+        );
+        for result in [a, b, c] {
+            assert_eq!(result.unwrap_err().to_string(), "plain: refused");
+        }
+        // one dial was room for the three
+        assert_eq!(session.shared.protocol.handshakes(), 1);
+        session
+            .shared
+            .protocol
+            .refuse
+            .store(false, Ordering::SeqCst);
+        assert_eq!(echo(&session, b"d").await.unwrap(), b"d");
+        assert_eq!(session.shared.protocol.handshakes(), 2);
+    }
+
+    /// Under a cap, a connection going away takes no new requests, room or
+    /// not; the stream under way on it goes on, and when its lease goes the
+    /// connection is closed.
+    #[tokio::test]
+    async fn under_a_cap_a_connection_going_away_takes_no_new_requests() {
+        let server = Server::spawn();
+        let session = capped(&server, Plain::default(), 2);
+        let opts = ConnectOpts::default();
+        let lease = session.lease(&opts).await.unwrap();
+        let (mut send, mut recv) = lease.connection().open_bi().await.unwrap();
+        send.write_all(b"under ").await.unwrap();
+        lease.state().store(true, Ordering::SeqCst);
+        let new = session.lease(&opts).await.unwrap();
+        assert_ne!(new.connection().stable_id(), lease.connection().stable_id());
+        assert_eq!(carried(&session), [1]);
+        assert_eq!(session.shared.protocol.handshakes(), 2);
+        send.write_all(b"way").await.unwrap();
+        send.finish().unwrap();
+        let echoed = timeout(BOUND, recv.read_to_end(64)).await.unwrap().unwrap();
+        assert_eq!(echoed, b"under way");
+        drop((send, recv, lease));
+        closed_by_us(&server.accepted(1).await[0]).await;
+        assert!(new.connection().close_reason().is_none());
+    }
+
+    /// Under a cap, every connection dialled while the connector led
+    /// elsewhere is let go of, room or not; the next request dials the new
+    /// way.
+    #[tokio::test]
+    async fn under_a_cap_connections_dialled_the_old_way_take_no_new_requests() {
+        let server = Server::spawn();
+        let chain = Arc::new(Chain::default());
+        let rerouted = Arc::new(Rerouted {
+            inner: chain.clone(),
+            route: Mutex::new(Arc::new(1)),
+        });
+        let dialer = dialer_via(
+            rerouted.clone(),
+            server.port.addr().port(),
+            "127.0.0.1",
+            &TlsOpts::default(),
+            server.cert.roots(),
+        );
+        let session = Session::new("P", dialer, Plain::default()).with_stream_cap(2);
+        let opts = ConnectOpts::default();
+        let mut leases = Vec::new();
+        for _ in 0..3 {
+            leases.push(session.lease(&opts).await.unwrap());
+        }
+        assert_eq!(carried(&session), [2, 1]);
+        *rerouted.route.lock().unwrap() = Arc::new(2);
+        leases.push(session.lease(&opts).await.unwrap());
+        assert_eq!(carried(&session), [1]);
+        assert_eq!(chain.flows.lock().unwrap().len(), 3, "dialled anew");
+        assert_eq!(session.shared.protocol.handshakes(), 3);
+        assert!(leases[..3].iter().all(|lease| !session.serves(lease)));
+    }
+
+    /// Under a cap, each connection idles on its own: the one let go of is
+    /// closed after the idle time while another, held, stays; let go of in
+    /// turn, that one follows.
+    #[tokio::test]
+    async fn under_a_cap_idle_connections_are_closed_one_by_one() {
+        const IDLE: Duration = Duration::from_millis(400);
+        let server = Server::spawn();
+        let dialer = dialer(
+            server.port.addr().port(),
+            "127.0.0.1",
+            &TlsOpts::default(),
+            server.cert.roots(),
+        );
+        let session = Session::with_idle("P", dialer, Plain::default(), IDLE).with_stream_cap(1);
+        let opts = ConnectOpts::default();
+        let first = session.lease(&opts).await.unwrap();
+        let second = session.lease(&opts).await.unwrap();
+        let accepted = server.accepted(2).await;
+        for (lease, n) in [(first, 0), (second, 1)] {
+            let since = Instant::now();
+            drop(lease);
+            closed_by_us(&accepted[n]).await;
+            assert!(
+                since.elapsed() >= IDLE,
+                "closed after {:?}",
+                since.elapsed()
+            );
+            // the one still held stays
+            assert!(accepted[n + 1..].iter().all(|c| c.close_reason().is_none()));
+        }
+        assert!(carried(&session).is_empty());
+        assert_eq!(echo(&session, b"again").await.unwrap(), b"again");
+        assert_eq!(session.shared.protocol.handshakes(), 3);
     }
 }

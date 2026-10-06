@@ -1,6 +1,9 @@
 //! `trust-tunnel` outbound over HTTP/2 (manual: Policies › Trust Tunnel;
 //! TrustTunnel protocol 5.1; phase 2 M6 design 5.4): every connection is a
 //! CONNECT stream on a pooled TLS + HTTP/2 connection, as on `h2-connect`.
+//! With `h3=true` the same requests go over HTTP/3 instead
+//! (`rurge-proto-quic`), refused alike: `connect_request` and `refused` are
+//! both transports'.
 //!
 //! - The request is `:method CONNECT`, `:authority host:port`,
 //!   `proxy-authorization: Basic …` and `user-agent`, then the configured
@@ -15,12 +18,12 @@
 //!   a policy test is a URL test.
 
 use crate::build::{shadow_tls_client, tls_client};
-use crate::h2connect::connect_request;
+use crate::h2connect;
 use crate::h2pool::{H2Pool, StackDial};
 use crate::http::basic_authorization;
 use crate::transport::Stack;
 use crate::{BuildError, Outbound, OutboundError};
-use http::StatusCode;
+use http::{Request, StatusCode};
 use rurge_config::KeystoreItem;
 use rurge_config::spec::{HeaderTemplate, ShadowTlsOpts, TrustTunnelSpec};
 use rurge_net::BoxFuture;
@@ -33,6 +36,38 @@ const LABEL: &str = "trust-tunnel";
 /// The `user-agent` when `headers` has none: names the client, nothing
 /// about the platform or the version.
 pub const USER_AGENT: &str = "rurge";
+
+/// The CONNECT for `target`, over HTTP/2 and HTTP/3 alike (TrustTunnel
+/// protocol 5.1): `proxy-authorization` — `authorization`, the Basic value
+/// — and `user-agent`, then `headers` rendered anew, a configured header
+/// replacing one of ours with the same name; the credentials and the
+/// configured values never indexed (HPACK, QPACK). Refused, before anything
+/// is dialed, for a target whose name cannot be sent. The request says
+/// HTTP/2, as `h2` wants; the HTTP/3 client reads its method, its authority
+/// and its fields alone.
+pub fn connect_request(
+    target: &Target,
+    authorization: &str,
+    headers: &[HeaderTemplate],
+) -> Result<Request<()>, OutboundError> {
+    let ours = vec![
+        ("proxy-authorization".to_string(), authorization.to_string()),
+        ("user-agent".to_string(), USER_AGENT.to_string()),
+    ];
+    h2connect::connect_request(LABEL, target, ours, headers)
+}
+
+/// The endpoint's refusal of a CONNECT, a final status other than 2xx, over
+/// HTTP/2 and HTTP/3 alike: 407 is a refused login, any other is quoted by
+/// its number.
+pub fn refused(status: StatusCode) -> OutboundError {
+    match status {
+        StatusCode::PROXY_AUTHENTICATION_REQUIRED => {
+            OutboundError::Proxy(format!("{LABEL}: authentication failed"))
+        }
+        status => OutboundError::Proxy(format!("{LABEL}: the server answered {}", status.as_u16())),
+    }
+}
 
 /// No `Debug`: it holds the credentials.
 pub struct TrustTunnelOutbound {
@@ -84,25 +119,12 @@ impl TrustTunnelOutbound {
         target: &Target,
         opts: &ConnectOpts,
     ) -> Result<BoxedStream, OutboundError> {
-        let ours = vec![
-            (
-                "proxy-authorization".to_string(),
-                self.authorization.clone(),
-            ),
-            ("user-agent".to_string(), USER_AGENT.to_string()),
-        ];
         // never dial for a target whose name cannot be sent
-        let request = connect_request(LABEL, target, ours, &self.headers)?;
+        let request = connect_request(target, &self.authorization, &self.headers)?;
         let response = self.pool.open(request, opts).await?;
         match response.status() {
             status if status.is_success() => Ok(Box::new(response.into_body()) as BoxedStream),
-            StatusCode::PROXY_AUTHENTICATION_REQUIRED => Err(OutboundError::Proxy(format!(
-                "{LABEL}: authentication failed"
-            ))),
-            status => Err(OutboundError::Proxy(format!(
-                "{LABEL}: the server answered {}",
-                status.as_u16()
-            ))),
+            status => Err(refused(status)),
         }
     }
 }
@@ -139,7 +161,7 @@ mod tests {
     use rurge_config::policy::parse_policy;
     use rurge_config::spec::h2::read_trust_tunnel;
     use rurge_config::spec::shadow_tls::read_shadow_tls;
-    use rurge_config::spec::{CommonOpts, ParamReader};
+    use rurge_config::spec::{CommonOpts, HeaderPart, ParamReader};
     use rurge_config::{HostName, Span};
     use rurge_net::connector::{DirectConnector, SystemResolve};
     use std::net::SocketAddr;
@@ -382,5 +404,60 @@ mod tests {
             round_trip(&mut stream, b"one each").await;
         }
         assert_eq!(fake.connections(), 3);
+    }
+
+    /// The request of both transports: a classic CONNECT — the target's
+    /// authority, no scheme, no path — with the credentials and our
+    /// `user-agent`, which a configured header replaces; the credentials
+    /// and the configured values go never indexed.
+    #[test]
+    fn a_connect_request_carries_the_credentials_and_a_user_agent() {
+        let target = Target::new(HostName::parse("2001:db8::1"), 443);
+        let request = connect_request(&target, "Basic dTpw", &[]).unwrap();
+        assert_eq!(request.method(), http::Method::CONNECT);
+        let uri = request.uri();
+        assert_eq!(
+            uri.authority().map(|a| a.as_str()),
+            Some("[2001:db8::1]:443")
+        );
+        assert!(uri.scheme().is_none(), "{uri}");
+        assert!(uri.path_and_query().is_none(), "{uri}");
+        let headers = request.headers();
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers["proxy-authorization"], "Basic dTpw");
+        assert!(headers["proxy-authorization"].is_sensitive());
+        assert_eq!(headers["user-agent"], USER_AGENT);
+        assert!(!headers["user-agent"].is_sensitive());
+
+        let configured = [HeaderTemplate {
+            name: "User-Agent".into(),
+            value: vec![HeaderPart::Literal("Linux client".into())],
+        }];
+        let request = connect_request(&target, "Basic dTpw", &configured).unwrap();
+        let agents: Vec<_> = request.headers().get_all("user-agent").iter().collect();
+        assert_eq!(agents, ["Linux client"]);
+        assert!(agents[0].is_sensitive());
+
+        let unsendable = Target::new(HostName::Domain("a b.test".into()), 443);
+        let err = connect_request(&unsendable, "Basic dTpw", &[]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "trust-tunnel: the host name cannot be sent to the server"
+        );
+    }
+
+    /// Both transports word a refusal alike: 407 is a refused login, any
+    /// other final status is quoted by its number.
+    #[test]
+    fn a_refusal_is_worded_by_its_status() {
+        for (status, text) in [
+            (407, "trust-tunnel: authentication failed"),
+            (502, "trust-tunnel: the server answered 502"),
+            (403, "trust-tunnel: the server answered 403"),
+        ] {
+            let err = refused(StatusCode::from_u16(status).unwrap());
+            assert!(matches!(err, OutboundError::Proxy(_)), "{err}");
+            assert_eq!(err.to_string(), text);
+        }
     }
 }

@@ -1,18 +1,21 @@
-//! A scriptable MASQUE proxy (phase 2 M7 design 7.4): QUIC with ALPN `h3`
-//! on a loopback port of its own (`ServerPort`: it can restart) or on a
-//! socket it is given (`MultiPort` for port hopping), HTTP/3 by the server
-//! side of `rurge_net`, every classic CONNECT relayed to its target over
-//! TCP, the half-closes too, and every CONNECT-UDP over UDP.
+//! A scriptable CONNECT proxy over HTTP/3 — MASQUE's, or the TrustTunnel
+//! endpoint's (phase 2 M7 design 7.4): QUIC with ALPN `h3` on a loopback
+//! port of its own (`ServerPort`: it can restart) or on a socket it is
+//! given (`MultiPort` for port hopping), HTTP/3 by the server side of
+//! `rurge_net`, every classic CONNECT relayed to its target over TCP, the
+//! half-closes too, and every CONNECT-UDP over UDP.
 //!
 //! - Its SETTINGS are masque-server's — field sections of at most 8 KiB,
 //!   extended CONNECT, HTTP Datagrams — unless the script says otherwise.
 //!   Scripted so, it greases as quiche does by default (masque-server and
 //!   the TrustTunnel endpoint are quiche's).
-//! - As masque-server, it wants Basic credentials in `proxy-authorization`
-//!   on every request when its script names users: a request without them,
-//!   or with others, is answered 407 with `proxy-authenticate`. Every
-//!   refusal is a final status with `content-length: 0`, then the end of
-//!   the stream.
+//! - As masque-server and the TrustTunnel endpoint, it wants Basic
+//!   credentials in `proxy-authorization` on every request when its script
+//!   names users: a request without them, or with others, is answered 407
+//!   with `proxy-authenticate` — masque-server's challenge, or the
+//!   script's. Scripted so, a request without `user-agent` is answered 400.
+//!   Every refusal is a final status with `content-length: 0`, then the end
+//!   of the stream.
 //! - A request whose head is not well formed — its pseudo-header fields out
 //!   of place, unknown or twice, a classic CONNECT with `:scheme` or
 //!   `:path`, an authority without a port — is answered 400; one with
@@ -62,6 +65,8 @@ const H3_NO_ERROR: VarInt = VarInt::from_u32(0x100);
 const H3_REQUEST_REJECTED: u64 = 0x10b;
 /// The largest field section masque-server takes, as its SETTINGS say.
 const MAX_FIELD_SECTION_SIZE: u64 = 8192;
+/// masque-server's `proxy-authenticate` on a 407.
+const MASQUE_CHALLENGE: &str = "Basic realm=\"masque\"";
 /// The pseudo-header fields of a request (RFC 9114 4.3.1, RFC 8441 4).
 const PSEUDO: [&str; 5] = [":method", ":protocol", ":scheme", ":authority", ":path"];
 /// What quiche writes in its reserved frame and on its reserved stream.
@@ -76,6 +81,13 @@ pub struct H3ProxyScript {
     /// Want the Basic credentials of one of these (user, password) on every
     /// request; with none, anyone gets in.
     pub users: Vec<(String, String)>,
+    /// The `proxy-authenticate` of a 407, masque-server's unless set (the
+    /// TrustTunnel endpoint's is `Basic realm=Authorization Required`).
+    pub challenge: Option<String>,
+    /// Answer a request without a `user-agent` 400, as an endpoint that
+    /// follows the TrustTunnel document to the letter would (v1.1.0 only
+    /// records it).
+    pub require_user_agent: bool,
     /// Answer every request with this status instead of serving it.
     pub refuse: Option<u16>,
     /// Take requests and never answer them.
@@ -507,6 +519,8 @@ async fn answer(
         Some(400)
     } else if !shared.authorized(&request) {
         Some(407)
+    } else if script.require_user_agent && request.header("user-agent").is_none() {
+        Some(400)
     } else if script.refuse.is_some() {
         script.refuse
     } else if request.method != "CONNECT"
@@ -520,7 +534,7 @@ async fn answer(
         None
     };
     if let Some(status) = refusal {
-        return refuse(&mut stream, status, script.grease).await;
+        return refuse(&mut stream, status, script).await;
     }
     if request.protocol.is_some() {
         return connect_udp(stream, &request, &shared).await;
@@ -535,7 +549,7 @@ async fn answer(
     };
     // a target it cannot reach, as masque-server answers it
     let Some(upstream) = upstream else {
-        return refuse(&mut stream, 502, script.grease).await;
+        return refuse(&mut stream, 502, script).await;
     };
     respond(&mut stream, 200, &[], script.grease).await?;
     tunnel(stream, upstream).await
@@ -596,14 +610,16 @@ fn authority_form(authority: &str) -> bool {
 }
 
 /// A final status and no tunnel, as masque-server refuses: `content-length:
-/// 0` — after the challenge, for a 407 — and the end of the stream.
-async fn refuse(stream: &mut ServerStream, status: u16, grease: bool) -> io::Result<()> {
+/// 0` — after the script's challenge, or masque-server's, for a 407 — and
+/// the end of the stream.
+async fn refuse(stream: &mut ServerStream, status: u16, script: &H3ProxyScript) -> io::Result<()> {
     let mut fields = Vec::new();
     if status == 407 {
-        fields.push(("proxy-authenticate", "Basic realm=\"masque\""));
+        let challenge = script.challenge.as_deref();
+        fields.push(("proxy-authenticate", challenge.unwrap_or(MASQUE_CHALLENGE)));
     }
     fields.push(("content-length", "0"));
-    respond(stream, status, &fields, grease).await?;
+    respond(stream, status, &fields, script.grease).await?;
     stream.finish();
     Ok(())
 }
@@ -661,7 +677,7 @@ async fn connect_udp(
 ) -> io::Result<()> {
     let script = &shared.script;
     let Some((host, port)) = request.path.as_deref().and_then(masque_target) else {
-        return refuse(&mut stream, 400, script.grease).await;
+        return refuse(&mut stream, 400, script).await;
     };
     // never resolves: a name without `connect_to` is a dead end
     let to = script
@@ -673,7 +689,7 @@ async fn connect_udp(
     };
     // a target it cannot reach, as masque-server answers it
     let Some(socket) = socket else {
-        return refuse(&mut stream, 502, script.grease).await;
+        return refuse(&mut stream, 502, script).await;
     };
     let (connection, id) = (request.connection, stream.id());
     let quic = shared.connections()[connection].clone();

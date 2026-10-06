@@ -1,31 +1,19 @@
 //! TCP over MASQUE (manual: Policies › MASQUE; phase 2 M7 design 7.1):
 //! every connection a classic HTTP/3 CONNECT of its own on the policy's
-//! QUIC connection (RFC 9114 4.4).
+//! QUIC connection (RFC 9114 4.4), its tunnel as `connect` makes it.
 //!
 //! - The request is `:method CONNECT` and `:authority host:port` — an IPv6
 //!   literal in brackets, a name as its A-labels —, with
-//!   `proxy-authorization` when the policy has credentials. It goes out at
-//!   once: a classic CONNECT needs nothing of the server's SETTINGS.
-//! - Nothing of the caller's goes before the response: a 2xx makes the
-//!   stream the tunnel (RFC 9110 9.3.6); 407 is a refused login, any other
-//!   final status the proxy's refusal, quoted by its number.
-//! - Until the response came, a request that finds its connection gone —
-//!   closed, lost by a server that restarted, or going away — is `Lost`:
-//!   nothing of the caller's went out, and on another connection it may yet
-//!   go through (`Session::request`).
+//!   `proxy-authorization` when the policy has credentials.
+//! - 407 is a refused login, any other final status but a 2xx the proxy's
+//!   refusal, quoted by its number (`refused`).
 
-use super::{Connected, failure, proxy, refused};
-use crate::session::{Failure, Lease};
+use super::proxy;
 use http::Request;
 use http::header::{HeaderValue, PROXY_AUTHORIZATION};
 use rurge_net::connector::Target;
-use rurge_net::quic::h3::RequestStream;
 use rurge_proto::OutboundError;
 use rurge_proto::http::wire_host;
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// The CONNECT for `target`, carrying the policy's `authorization`: refused,
 /// before anything is dialed, for a name that cannot be sent.
@@ -45,66 +33,6 @@ pub(super) fn request(
             .insert(PROXY_AUTHORIZATION, authorization.clone());
     }
     Ok(request)
-}
-
-/// The tunnel `request` asks for, on the connection of `lease`: the request
-/// on a stream of its own, then the proxy's response. The stream handed
-/// back is the caller's.
-pub(super) async fn open(lease: Lease<Connected>, request: Request<()>) -> Result<Tunnel, Failure> {
-    let mut stream = lease
-        .state()
-        .h3
-        .request(request)
-        .await
-        .map_err(|e| failure(&lease, e))?;
-    let response = stream.response().await.map_err(|e| failure(&lease, e))?;
-    match response.status() {
-        status if status.is_success() => Ok(Tunnel {
-            stream,
-            _lease: lease,
-        }),
-        status => Err(Failure::Failed(refused(status))),
-    }
-}
-
-/// A TCP connection through the proxy: the CONNECT's stream — the bytes go
-/// as DATA frames —, on a connection its lease keeps. A write that returns
-/// may leave the rest of its frame for the next write, flush or shutdown.
-/// Shutdown sends the FIN the target then sees; reading goes on to the
-/// proxy's. Dropped before both directions ended, the stream is cancelled
-/// both ways (RFC 9114 4.1.1). No `Debug`: nothing in it is worth printing.
-pub(super) struct Tunnel {
-    stream: RequestStream,
-    /// Last: the stream ends before its connection may be closed.
-    _lease: Lease<Connected>,
-}
-
-impl AsyncRead for Tunnel {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for Tunnel {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
-    }
 }
 
 #[cfg(test)]
