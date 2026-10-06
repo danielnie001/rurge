@@ -7,6 +7,7 @@ pub mod group;
 pub mod h2;
 pub mod http;
 pub mod hysteria2;
+pub mod masque;
 pub mod obfs;
 pub mod quic;
 pub mod reader;
@@ -32,6 +33,7 @@ pub use group::{
 pub use h2::{H2ConnectSpec, TrustTunnelSpec};
 pub use http::{HeaderPart, HeaderTemplate, HttpSpec};
 pub use hysteria2::{Hysteria2Obfs, Hysteria2Spec};
+pub use masque::{MasqueCredentials, MasqueSpec};
 pub use obfs::{ObfsMode, ObfsOpts};
 pub use quic::{PortHopping, QuicOpts};
 pub use reader::ParamReader;
@@ -89,6 +91,7 @@ pub enum ProtoSpec {
     TrustTunnel(TrustTunnelSpec),
     Hysteria2(Hysteria2Spec),
     Tuic(TuicSpec),
+    Masque(MasqueSpec),
 }
 
 impl ProtoSpec {
@@ -104,6 +107,7 @@ impl ProtoSpec {
             ProtoSpec::TrustTunnel(tt) => Some(&tt.tls),
             ProtoSpec::Hysteria2(hysteria2) => Some(&hysteria2.tls),
             ProtoSpec::Tuic(tuic) => Some(&tuic.tls),
+            ProtoSpec::Masque(masque) => Some(&masque.tls),
             ProtoSpec::Direct
             | ProtoSpec::Reject(_)
             | ProtoSpec::Ssh(_)
@@ -114,11 +118,13 @@ impl ProtoSpec {
         }
     }
 
-    /// The QUIC options of the protocol, when it runs over QUIC.
+    /// The QUIC options of the protocol, when it runs over QUIC and takes
+    /// them: a `trust-tunnel` with `h3=true` takes none (no port hopping).
     pub fn quic(&self) -> Option<&QuicOpts> {
         match self {
             ProtoSpec::Hysteria2(hysteria2) => Some(&hysteria2.quic),
             ProtoSpec::Tuic(tuic) => Some(&tuic.quic),
+            ProtoSpec::Masque(masque) => Some(&masque.quic),
             ProtoSpec::Direct
             | ProtoSpec::Reject(_)
             | ProtoSpec::Http(_)
@@ -415,13 +421,16 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             (common, ProtoSpec::H2Connect(h2))
         }
         PolicyKind::TrustTunnel => {
-            let common = read_common(&mut r, Applies::Proxy, &mut notes);
-            let read = h2::read_trust_tunnel(&mut r, env.keystore);
-            // connects over HTTP/2 until the QUIC family (phase 2 M6 design 5.1)
-            if read.h3 {
+            let mut common = read_common(&mut r, Applies::Proxy, &mut notes);
+            let tt = h2::read_trust_tunnel(&mut r, &mut common, env.keystore);
+            if tt.h3 {
+                // over QUIC, as on `hysteria2`: `ecn` takes effect, `tfo`
+                // does not apply (phase 2 M7 design 7.2)
+                notes.inert.retain(|name| !matches!(*name, "ecn" | "tfo"));
+                // the engine connects over HTTP/2 until M7c task 8
                 notes.inert.push("h3");
             }
-            (common, ProtoSpec::TrustTunnel(read.spec))
+            (common, ProtoSpec::TrustTunnel(tt))
         }
         PolicyKind::Hysteria2 => {
             let mut common = read_common(&mut r, Applies::Proxy, &mut notes);
@@ -437,6 +446,13 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             // as on `hysteria2`: `ecn` takes effect, `tfo` does not apply
             notes.inert.retain(|name| !matches!(*name, "ecn" | "tfo"));
             (common, ProtoSpec::Tuic(tuic))
+        }
+        PolicyKind::Masque => {
+            let mut common = read_common(&mut r, Applies::Proxy, &mut notes);
+            let masque = masque::read_masque(&mut r, &mut common, env.keystore);
+            // as on `hysteria2`: `ecn` takes effect, `tfo` does not apply
+            notes.inert.retain(|name| !matches!(*name, "ecn" | "tfo"));
+            (common, ProtoSpec::Masque(masque))
         }
         PolicyKind::Ssh => {
             let common = read_common(&mut r, Applies::Proxy, &mut notes);
@@ -462,7 +478,19 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     };
     let mut shadow_tls = None;
     if !matches!(proto, ProtoSpec::Direct | ProtoSpec::Reject(_)) {
-        shadow_tls = shadow_tls::read_shadow_tls(&mut r);
+        shadow_tls = match &proto {
+            // Shadow TLS wraps a TCP connection; HTTP/3 runs over QUIC
+            // (phase 2 M7 design 3.1)
+            ProtoSpec::TrustTunnel(tt) if tt.h3 => {
+                shadow_tls::refuse(
+                    &mut r,
+                    "Shadow TLS cannot be combined with `h3=true` on a `trust-tunnel` policy"
+                        .to_string(),
+                );
+                None
+            }
+            _ => shadow_tls::read_shadow_tls(&mut r),
+        };
         check_underlying(&mut r, &mut common, env);
         // the manual: `underlying-proxy` cannot be combined with the
         // `port-hopping` of the QUIC-based protocols
@@ -490,7 +518,10 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     }
     let failed = r.has_errors();
     let diagnostics = r.finish();
-    let spec = (!failed && not_implemented.is_none()).then(|| PolicySpec {
+    // the engine builds `masque` from M7c task 8 on: until then a valid line
+    // is checked in full but has no spec
+    let built = policy.kind != PolicyKind::Masque;
+    let spec = (!failed && not_implemented.is_none() && built).then(|| PolicySpec {
         name: policy.name.clone(),
         kind: policy.kind,
         server: policy.server.clone(),
@@ -1173,6 +1204,7 @@ mod tests {
             password: "p".into(),
             headers: Vec::new(),
             max_streams: h2::DEFAULT_MAX_STREAMS,
+            h3: false,
         });
         assert_eq!(tt.keystore_item(), Some("cert1"));
         assert!(tt.tls().is_some());
@@ -1509,5 +1541,239 @@ mod tests {
             );
             assert!(tuic.quic().is_some_and(|quic| quic.port_hopping.is_some()));
         }
+    }
+
+    /// `masque` lines are read and checked in full; they have no spec until
+    /// the engine builds MASQUE (M7c task 8). `ecn` takes effect on them,
+    /// `tfo` and `udp-relay` do not apply, the credentials go together, and
+    /// what the manual does not list is unknown (phase 2 M7 design 3.1,
+    /// 7.1).
+    #[test]
+    fn a_masque_line_is_checked_but_has_no_spec_yet() {
+        for def in [
+            "masque, example.com, 443, username=user, password=pass",
+            "masque, h.test, 443",
+            "masque, h.test, 443, username=u, password=pw, port-hopping=1234;5000-6000, port-hopping-interval=10, ecn=off, alpn=h3, sni=edge.test, client-cert=cert1",
+            "masque, h.test, 443, ecn=on, underlying-proxy=Pick",
+            // DIRECT is no chain: the hops stay
+            "masque, h.test, 443, port-hopping=5000-6000, underlying-proxy=DIRECT",
+        ] {
+            let o = outcome("M", def);
+            assert!(o.diagnostics.is_empty(), "{def}: {:?}", o.diagnostics);
+            assert!(o.inert.is_empty(), "{def}: {:?}", o.inert);
+            assert!(o.spec.is_none() && o.not_implemented.is_none(), "{def}");
+        }
+        let o = outcome(
+            "M",
+            "masque, h.test, 443, s3cret, tfo=true, udp-relay=true, username=s3cretUser, max-streams=5, headers=X-A:1",
+        );
+        let found: Vec<(&str, &str)> = o
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `M`: `tfo` does not apply to `masque` policies; ignored"
+                ),
+                (
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `M`: `password` is required with `username`"
+                ),
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `M`: `udp-relay` does not apply to `masque` policies (UDP is always relayed); ignored"
+                ),
+                (
+                    codes::W_UNKNOWN_KEY,
+                    "policy `M`: unknown parameter `max-streams` ignored"
+                ),
+                (
+                    codes::W_UNKNOWN_KEY,
+                    "policy `M`: unknown parameter `headers` ignored"
+                ),
+                (
+                    codes::W_UNKNOWN_KEY,
+                    "policy `M`: unexpected positional value #1 ignored"
+                ),
+            ]
+        );
+        assert!(o.inert.is_empty(), "{:?}", o.inert);
+        assert!(o.spec.is_none());
+    }
+
+    /// What a QUIC-based line cannot combine (phase 2 M7 design 3.1), on
+    /// `masque` as on the others: port hopping with a chain, and Shadow TLS
+    /// (manual: it "cannot be combined with QUIC-based protocols").
+    #[test]
+    fn port_hopping_over_a_chain_and_shadow_tls_are_errors_on_masque() {
+        for relay in ["Entry", "Pick"] {
+            let o = outcome(
+                "M",
+                &format!("masque, h.test, 443, port-hopping=5000-6000, underlying-proxy={relay}"),
+            );
+            let found: Vec<(&str, &str)> = o
+                .diagnostics
+                .iter()
+                .map(|d| (d.code, d.message.as_str()))
+                .collect();
+            assert_eq!(
+                found,
+                [(
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `M`: `port-hopping` cannot be combined with `underlying-proxy`"
+                )],
+                "{relay}"
+            );
+        }
+        let o = outcome(
+            "M",
+            "masque, h.test, 443, username=u, password=pw, shadow-tls-password=st, shadow-tls-version=3, shadow-tls-sni=site.test",
+        );
+        let found: Vec<(&str, &str)> = o
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [(
+                codes::E_INVALID_POLICY_PARAM,
+                "policy `M`: Shadow TLS cannot be combined with a `masque` policy"
+            )]
+        );
+    }
+
+    /// MASQUE runs TLS over QUIC: the TLS options, and with them the client
+    /// certificate, and the QUIC options are its own.
+    #[test]
+    fn a_masque_spec_has_tls_and_quic_options() {
+        let masque = ProtoSpec::Masque(MasqueSpec {
+            tls: TlsOpts {
+                alpn: vec!["h3".into()],
+                client_cert: Some("cert1".into()),
+                ..TlsOpts::default()
+            },
+            quic: QuicOpts {
+                port_hopping: Some(PortHopping {
+                    ports: vec![5000..=6000],
+                    interval: quic::DEFAULT_HOP_INTERVAL,
+                }),
+            },
+            credentials: Some(MasqueCredentials {
+                username: "u".into(),
+                password: "pw".into(),
+            }),
+        });
+        assert_eq!(masque.keystore_item(), Some("cert1"));
+        assert_eq!(
+            masque.tls().map(|tls| tls.alpn.clone()),
+            Some(vec!["h3".to_string()])
+        );
+        assert!(
+            masque
+                .quic()
+                .is_some_and(|quic| quic.port_hopping.is_some())
+        );
+    }
+
+    /// `h3=true` runs a `trust-tunnel` over QUIC (phase 2 M7 design 7.2):
+    /// the spec says so and pins the ALPN to `h3`; `ecn` takes effect, `tfo`
+    /// does not apply, and port hopping is no parameter of it. Until the
+    /// engine builds it (M7c task 8) the load says `h3` has no effect yet,
+    /// and the policy connects over HTTP/2.
+    #[test]
+    fn a_trust_tunnel_line_with_h3_runs_over_quic() {
+        let o = outcome(
+            "T",
+            "trust-tunnel, h.test, 443, username=u, password=p, h3=true, alpn=h2, ecn=off, tfo=true, port-hopping=5000-6000",
+        );
+        let found: Vec<(&str, &str)> = o
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `T`: `alpn` is always `h3` on `trust-tunnel` policies with `h3=true`; ignored"
+                ),
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `T`: `tfo` does not apply to `trust-tunnel` policies with `h3=true`; ignored"
+                ),
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `T`: `port-hopping` does not apply to `trust-tunnel` policies; ignored"
+                ),
+            ]
+        );
+        assert_eq!(o.inert, ["h3"]);
+        let spec = o.spec.expect("a spec");
+        let ProtoSpec::TrustTunnel(tt) = &spec.proto else {
+            panic!("{:?}", spec.proto)
+        };
+        assert!(tt.h3);
+        assert_eq!(tt.tls.alpn, ["h3"]);
+        assert_eq!((spec.common.ecn, spec.common.tfo), (Tristate::Off, false));
+        // no QUIC options of its own: port hopping does not apply
+        assert!(spec.proto.quic().is_none());
+
+        // over HTTP/2 `ecn` and `tfo` are parsed but have no effect yet
+        let o = outcome(
+            "T",
+            "trust-tunnel, h.test, 443, username=u, password=p, ecn=off, tfo=true",
+        );
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert_eq!(o.inert, ["tfo", "ecn"]);
+        let spec = o.spec.expect("a spec");
+        let ProtoSpec::TrustTunnel(tt) = &spec.proto else {
+            panic!("{:?}", spec.proto)
+        };
+        assert!(!tt.h3);
+        assert_eq!(tt.tls.alpn, ["h2"]);
+    }
+
+    /// Shadow TLS wraps a TCP connection: a `trust-tunnel` has it over
+    /// HTTP/2, not over HTTP/3 (phase 2 M7 design 3.1). One error, whatever
+    /// the Shadow TLS parameters say.
+    #[test]
+    fn shadow_tls_is_an_error_on_a_trust_tunnel_with_h3() {
+        for layer in [
+            "shadow-tls-password=st, shadow-tls-version=3, shadow-tls-sni=site.test",
+            // errors of their own over HTTP/2
+            "shadow-tls-password=, shadow-tls-version=3",
+        ] {
+            let o = outcome(
+                "T",
+                &format!("trust-tunnel, h.test, 443, username=u, password=p, h3=true, {layer}"),
+            );
+            let found: Vec<(&str, &str)> = o
+                .diagnostics
+                .iter()
+                .map(|d| (d.code, d.message.as_str()))
+                .collect();
+            assert_eq!(
+                found,
+                [(
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `T`: Shadow TLS cannot be combined with `h3=true` on a `trust-tunnel` policy"
+                )],
+                "{layer}"
+            );
+            assert!(o.spec.is_none(), "{layer}");
+        }
+        // over HTTP/2 the layer is the policy's
+        let o = outcome(
+            "T",
+            "trust-tunnel, h.test, 443, username=u, password=p, h3=false, shadow-tls-password=st",
+        );
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert!(o.spec.and_then(|spec| spec.shadow_tls).is_some());
     }
 }

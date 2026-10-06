@@ -651,4 +651,20 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
             "T = tuic-v5, h.test, 443, ***, uuid=***, password=***, alpn=h3"
         );
     }
+
+    /// MASQUE (phase 2 M7 design 7.1): the named credentials and a stray
+    /// positional value; the ALPN and the hopping ports stay.
+    #[test]
+    fn a_masque_line_loses_its_credentials() {
+        assert_eq!(
+            redact_definition(
+                "masque, example.com, 443, username=user, password=s3cret, alpn=h3, port-hopping=1234;5000-6000"
+            ),
+            "masque, example.com, 443, username=***, password=***, alpn=h3, port-hopping=1234;5000-6000"
+        );
+        assert_eq!(
+            redact_profile("M = masque, example.com, 443, hunter2, username=user, password=s3cret"),
+            "M = masque, example.com, 443, ***, username=***, password=***"
+        );
+    }
 }

@@ -34,7 +34,9 @@ const KEYS: [&str; 3] = [
 /// Whether Shadow TLS can wrap a policy of this kind. It wraps a TCP
 /// connection, so the QUIC-based protocols and the two VPN-like ones are out
 /// (manual: a configuration error), and so is `external`, whose connection
-/// goes to a program on this machine.
+/// goes to a program on this machine. A `trust-tunnel` policy has it over
+/// HTTP/2 only: with `h3=true` it runs over QUIC, and `to_spec` refuses
+/// Shadow TLS there (`refuse`).
 pub fn allowed_on(kind: PolicyKind) -> bool {
     !matches!(
         kind,
@@ -57,11 +59,8 @@ pub fn read_shadow_tls(r: &mut ParamReader<'_>) -> Option<ShadowTlsOpts> {
     }
     let kind = r.policy().kind;
     if !allowed_on(kind) {
-        for key in KEYS {
-            r.touch(key);
-        }
-        r.error(
-            codes::E_INVALID_POLICY_PARAM,
+        refuse(
+            r,
             format!(
                 "Shadow TLS cannot be combined with a `{}` policy",
                 kind.keyword()
@@ -113,6 +112,19 @@ pub fn read_shadow_tls(r: &mut ParamReader<'_>) -> Option<ShadowTlsOpts> {
         sni,
         version,
     })
+}
+
+/// For a line that cannot have Shadow TLS: when it asks for it anyway, one
+/// `E0018` saying `why`, and its parameters count as read — the error is
+/// all there is to say about them.
+pub(crate) fn refuse(r: &mut ParamReader<'_>, why: String) {
+    if !KEYS.iter().any(|key| r.has(key)) {
+        return;
+    }
+    for key in KEYS {
+        r.touch(key);
+    }
+    r.error(codes::E_INVALID_POLICY_PARAM, why);
 }
 
 #[cfg(test)]

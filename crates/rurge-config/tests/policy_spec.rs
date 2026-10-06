@@ -332,6 +332,121 @@ E = socks5, e.example, 1080",
     assert_eq!(d.common.ecn, Tristate::Off);
 }
 
+/// `masque` lines are read and checked at load (phase 2 M7 design 3.1,
+/// 7.1): the combinations they cannot have and one credential without the
+/// other are errors; a hop interval under 5 seconds is raised to 5, and
+/// `ecn` has an effect on them. They have no spec until the engine builds
+/// them (M7c task 8).
+#[test]
+fn masque_lines_are_checked_at_load() {
+    let loaded = load(
+        "A = masque, a.example, 443, username=u, password=p, port-hopping=5000-6000, underlying-proxy=E
+B = masque, b.example, 443, shadow-tls-password=st
+C = masque, c.example, 443, username=u
+D = masque, d.example, 443, ecn=off, port-hopping=5000-6000, port-hopping-interval=2
+E = socks5, e.example, 1080",
+        "",
+    );
+    let found: Vec<(&str, String, u32)> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| (d.code, d.message.clone(), d.span.as_ref().unwrap().line))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                codes::E_INVALID_POLICY_PARAM,
+                "policy `A`: `port-hopping` cannot be combined with `underlying-proxy`".to_string(),
+                2
+            ),
+            (
+                codes::E_INVALID_POLICY_PARAM,
+                "policy `B`: Shadow TLS cannot be combined with a `masque` policy".to_string(),
+                3
+            ),
+            (
+                codes::E_INVALID_POLICY_PARAM,
+                "policy `C`: `password` is required with `username`".to_string(),
+                4
+            ),
+            (
+                codes::W_INVALID_VALUE,
+                "policy `D`: `port-hopping-interval` is below the minimum of 5 seconds; using 5"
+                    .to_string(),
+                5
+            ),
+        ]
+    );
+    for name in ["A", "B", "C", "D"] {
+        assert!(loaded.config.spec(name).is_none(), "{name}");
+    }
+}
+
+/// `trust-tunnel` lines with `h3=true` are read and checked at load (phase
+/// 2 M7 design 7.2): another ALPN, `tfo` and port hopping do not apply,
+/// Shadow TLS is an error, which leaves no spec, and `ecn` has an effect on
+/// them. Until the engine builds them over HTTP/3 (M7c task 8), `h3` is
+/// said once to have no effect yet.
+#[test]
+fn trust_tunnel_lines_with_h3_are_checked_at_load() {
+    let loaded = load(
+        "A = trust-tunnel, a.example, 443, username=u, password=p, h3=true, alpn=h2, ecn=off
+B = trust-tunnel, b.example, 443, username=u, password=p, h3=true, tfo=true, port-hopping=5000-6000
+C = trust-tunnel, c.example, 443, username=u, password=p, h3=true, shadow-tls-password=st",
+        "",
+    );
+    let found: Vec<(&str, String, u32)> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| (d.code, d.message.clone(), d.span.as_ref().unwrap().line))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                codes::W_PARAM_NOT_APPLICABLE,
+                "policy `A`: `alpn` is always `h3` on `trust-tunnel` policies with `h3=true`; ignored"
+                    .to_string(),
+                2
+            ),
+            (
+                codes::W_PARAM_NOT_EFFECTIVE,
+                "policy parameter `h3` is parsed but has no effect in this version".to_string(),
+                2
+            ),
+            (
+                codes::W_PARAM_NOT_APPLICABLE,
+                "policy `B`: `tfo` does not apply to `trust-tunnel` policies with `h3=true`; ignored"
+                    .to_string(),
+                3
+            ),
+            (
+                codes::W_PARAM_NOT_APPLICABLE,
+                "policy `B`: `port-hopping` does not apply to `trust-tunnel` policies; ignored"
+                    .to_string(),
+                3
+            ),
+            (
+                codes::E_INVALID_POLICY_PARAM,
+                "policy `C`: Shadow TLS cannot be combined with `h3=true` on a `trust-tunnel` policy"
+                    .to_string(),
+                4
+            ),
+        ]
+    );
+    for (name, ecn) in [("A", Tristate::Off), ("B", Tristate::Auto)] {
+        let spec = loaded.config.spec(name).expect("warnings leave the spec");
+        let ProtoSpec::TrustTunnel(tt) = &spec.proto else {
+            panic!("{:?}", spec.proto)
+        };
+        assert!(tt.h3, "{name}");
+        assert_eq!(tt.tls.alpn, ["h3"], "{name}");
+        assert_eq!((spec.common.ecn, spec.common.tfo), (ecn, false), "{name}");
+    }
+    assert!(loaded.config.spec("C").is_none());
+}
+
 /// A group's `underlying-proxy` chains the proxies it takes in (`M (via
 /// R)`, phase 2 M3 design 5.4), but port hopping cannot go through a chain:
 /// the load says, at the group's line, which member is left out — once,

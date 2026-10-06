@@ -4,7 +4,7 @@
 use crate::shared::ExternalPrograms;
 use rurge_config::config::{LoadError, LoadOptions, Loaded, load};
 use rurge_config::diagnostic::codes;
-use rurge_config::spec::{CommonOpts, IpVersion, PolicySpec, ProtoSpec};
+use rurge_config::spec::{CommonOpts, IpVersion, PolicySpec, ProtoSpec, TlsOpts, TrustTunnelSpec};
 use rurge_config::{Config, Diagnostic, Diagnostics, KeystoreItem};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{Connector, DirectConnector, Resolve, ResolveVia, SystemResolve, Via};
@@ -284,15 +284,27 @@ impl OutboundFactory for EngineFactory {
                 self.roots.clone(),
                 connector,
             )?),
-            ProtoSpec::TrustTunnel(tt) => Arc::new(TrustTunnelOutbound::new(
-                &spec.name,
-                server_of(spec)?,
-                tt,
-                spec.shadow_tls.as_ref(),
-                &self.keystore,
-                self.roots.clone(),
-                connector,
-            )?),
+            ProtoSpec::TrustTunnel(tt) => {
+                // over HTTP/2 until M7c task 8 builds `h3=true` over HTTP/3:
+                // such a line's spec pins `alpn` to `h3`, which an HTTP/2
+                // connection must not offer
+                let h2 = TrustTunnelSpec {
+                    tls: TlsOpts {
+                        alpn: vec!["h2".to_string()],
+                        ..tt.tls.clone()
+                    },
+                    ..tt.clone()
+                };
+                Arc::new(TrustTunnelOutbound::new(
+                    &spec.name,
+                    server_of(spec)?,
+                    &h2,
+                    spec.shadow_tls.as_ref(),
+                    &self.keystore,
+                    self.roots.clone(),
+                    connector,
+                )?)
+            }
             ProtoSpec::Hysteria2(hysteria2) => Arc::new(Hysteria2Outbound::new(
                 &spec.name,
                 server_of(spec)?,
@@ -312,6 +324,13 @@ impl OutboundFactory for EngineFactory {
                 self.roots.clone(),
                 connector,
             )?),
+            // the loader makes no spec of these lines before M7c task 8
+            ProtoSpec::Masque(_) => {
+                return Err(BuildError::new(format!(
+                    "`{}` is not implemented yet",
+                    spec.kind.keyword()
+                )));
+            }
             // nothing starts here: the program starts on the first dial
             ProtoSpec::External(external) => {
                 let outbound = ExternalOutbound::new(
@@ -383,9 +402,12 @@ mod tests {
     use rurge_config::diagnostic::{Severity, codes};
     use rurge_net::connector::{ConnectOpts, Target};
     use rurge_net::socket::NoopSocketHook;
-    use rurge_proto::testing::{FakeSocks5, Socks5Script, echo_server};
+    use rurge_proto::testing::{
+        FakeH2Proxy, FakeSocks5, H2ProxyScript, Socks5Script, TlsFixture, echo_server,
+    };
     use rurge_proto_ssh::testing::ED25519_WITH_PASSPHRASE;
     use std::path::Path;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn config(text: &str) -> Config {
@@ -856,6 +878,54 @@ Plain = direct, interface=eth9\n[Rule]\nFINAL,DIRECT\n",
         assert_eq!(
             *noting.0.lock().unwrap(),
             ["echo.test via eth9", "echo.test"]
+        );
+    }
+
+    /// Until the engine builds `h3=true` over HTTP/3 (M7c task 8), such a
+    /// `trust-tunnel` line connects over HTTP/2 as before: the `h3` its spec
+    /// pins as the ALPN never reaches the TLS handshake over TCP.
+    #[tokio::test]
+    async fn a_trust_tunnel_line_with_h3_still_connects_over_http2() {
+        let echo = echo_server().await;
+        let fixture = TlsFixture::new(&["127.0.0.1"]);
+        let fake = FakeH2Proxy::spawn(
+            H2ProxyScript {
+                users: vec![("u".into(), "p".into())],
+                ..H2ProxyScript::default()
+            },
+            fixture.clone(),
+        )
+        .await;
+        let cfg = config(&format!(
+            "[Proxy]\nTT = trust-tunnel, 127.0.0.1, {}, username=u, password=p, h3=true\n[Rule]\nFINAL,DIRECT\n",
+            fake.addr().port()
+        ));
+        let f = EngineFactory::with_roots(
+            &cfg,
+            Arc::new(SystemResolve),
+            Arc::new(NoopSocketHook),
+            fixture.roots(),
+        );
+        let spec = cfg.spec("TT").unwrap();
+        let out = f.build(spec, f.direct_connector(&spec.common)).unwrap();
+        let target = Target::new(rurge_config::HostName::Ip(echo.ip()), echo.port());
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            out.connect_tcp(&target, &ConnectOpts::default()),
+        )
+        .await
+        .expect("the tunnel opens in time")
+        .unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("the echo arrives")
+            .unwrap();
+        assert_eq!(&buf, b"ping");
+        assert_eq!(
+            fixture.seen_at_least(1).await[0].alpn.as_deref(),
+            Some("h2")
         );
     }
 }

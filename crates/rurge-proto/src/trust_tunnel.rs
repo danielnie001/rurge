@@ -136,9 +136,9 @@ mod tests {
     use crate::UdpSupport;
     use crate::testing::{FakeH2Proxy, H2ProxyScript, TlsFixture, echo_server};
     use rurge_config::policy::parse_policy;
-    use rurge_config::spec::ParamReader;
     use rurge_config::spec::h2::read_trust_tunnel;
     use rurge_config::spec::shadow_tls::read_shadow_tls;
+    use rurge_config::spec::{CommonOpts, ParamReader};
     use rurge_config::{HostName, Span};
     use rurge_net::connector::{DirectConnector, SystemResolve};
     use std::net::SocketAddr;
@@ -151,7 +151,7 @@ mod tests {
         let span = Span::new(Arc::from(Path::new("p.conf")), 1);
         let policy = parse_policy("T", definition, &span).unwrap();
         let mut r = ParamReader::new(&policy);
-        let spec = read_trust_tunnel(&mut r, &[]).spec;
+        let spec = read_trust_tunnel(&mut r, &mut CommonOpts::default(), &[]);
         let shadow_tls = read_shadow_tls(&mut r);
         assert!(!r.has_errors(), "{:?}", r.finish());
         TrustTunnelOutbound::new(

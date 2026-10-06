@@ -1,7 +1,10 @@
 //! `h2-connect` and `trust-tunnel` policy parameters (manual: Policies ›
 //! HTTP and HTTP/2, Policies › Trust Tunnel; phase 2 M6 design 5.1). Both
-//! carry each connection as a CONNECT stream over a TLS + HTTP/2 connection.
+//! carry each connection as a CONNECT stream over a TLS + HTTP/2
+//! connection; `trust-tunnel` with `h3=true` over HTTP/3 (QUIC) instead
+//! (phase 2 M7 design 7.2).
 
+use super::common::CommonOpts;
 use super::http::HeaderTemplate;
 use super::reader::ParamReader;
 use super::secret::Secret;
@@ -25,28 +28,25 @@ pub struct H2ConnectSpec {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrustTunnelSpec {
-    /// Trust Tunnel always runs over TLS; `alpn` is always `h2`.
+    /// Trust Tunnel always runs over TLS; `alpn` is always the transport's:
+    /// `h2`, or `h3` with `h3=true`.
     pub tls: TlsOpts,
     pub username: Secret<String>,
     pub password: Secret<String>,
     pub headers: Vec<HeaderTemplate>,
-    /// `max-streams`: CONNECT streams one HTTP/2 connection carries at once.
+    /// `max-streams`: CONNECT streams one connection carries at once.
     pub max_streams: u32,
-}
-
-/// What a `trust-tunnel` line says: the spec, and whether it asks for
-/// `h3=true`, which is parsed and reported (`W0029`) but connects over
-/// HTTP/2 until the QUIC family lands (phase 2 M6 design 5.1).
-pub struct TrustTunnelRead {
-    pub spec: TrustTunnelSpec,
+    /// `h3=true`: the tunnel runs over HTTP/3 (QUIC) instead of HTTP/2 over
+    /// TLS (manual).
     pub h3: bool,
 }
 
 /// `max-streams` when the line has none (manual).
 pub const DEFAULT_MAX_STREAMS: u32 = 3;
 
-/// Connection-specific header fields HTTP/2 forbids (RFC 9113 8.2.2); the
-/// `h2` crate refuses a request that carries any of them.
+/// Connection-specific header fields HTTP/2 and HTTP/3 forbid (RFC 9113
+/// 8.2.2, RFC 9114 4.2); the `h2` crate refuses a request that carries any
+/// of them.
 const CONNECTION_SPECIFIC: [&str; 6] = [
     "connection",
     "keep-alive",
@@ -56,25 +56,33 @@ const CONNECTION_SPECIFIC: [&str; 6] = [
     "te",
 ];
 
-/// The TLS options with ALPN pinned to `h2`: an `alpn` that says anything
-/// else is `W0028`.
-fn read_h2_tls(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> TlsOpts {
+/// The TLS options with ALPN pinned to `alpn`, the one protocol the
+/// transport speaks: an `alpn` that says anything else is `W0028`, which
+/// names the policies — those of the line's type, narrowed by `which` when
+/// the type has more than one transport.
+fn read_pinned_tls(
+    r: &mut ParamReader<'_>,
+    keystore: &[KeystoreItem],
+    alpn: &str,
+    which: &str,
+) -> TlsOpts {
     let mut tls = read_tls(r, keystore);
-    if !tls.alpn.is_empty() && tls.alpn != ["h2"] {
+    if !tls.alpn.is_empty() && tls.alpn != [alpn] {
         let kind = r.policy().kind.keyword();
         r.warn(
             codes::W_PARAM_NOT_APPLICABLE,
-            format!("`alpn` is always `h2` on `{kind}` policies; ignored"),
+            format!("`alpn` is always `{alpn}` on `{kind}` policies{which}; ignored"),
         );
     }
-    tls.alpn = vec!["h2".to_string()];
+    tls.alpn = vec![alpn.to_string()];
     tls
 }
 
-/// `headers`, without the fields HTTP/2 forbids (`W0028` each). `host` is
-/// one of them here: `:authority` names the CONNECT target, and a `Host`
-/// that differs from it makes the request malformed (RFC 9113 8.3.1).
-fn read_h2_headers(r: &mut ParamReader<'_>) -> Vec<HeaderTemplate> {
+/// `headers`, without the fields `http` (HTTP/2 or HTTP/3) forbids
+/// (`W0028` each). `host` is one of them here: `:authority` names the
+/// CONNECT target, and a `Host` that differs from it makes the request
+/// malformed (RFC 9113 8.3.1, RFC 9114 4.3.1).
+fn read_connect_headers(r: &mut ParamReader<'_>, http: &str) -> Vec<HeaderTemplate> {
     let mut headers = read_headers(r);
     headers.retain(|header| {
         let name = header.name.to_ascii_lowercase();
@@ -87,7 +95,7 @@ fn read_h2_headers(r: &mut ParamReader<'_>) -> Vec<HeaderTemplate> {
         };
         r.warn(
             codes::W_PARAM_NOT_APPLICABLE,
-            format!("header `{name}` in `headers` is not allowed in HTTP/2{why}; ignored"),
+            format!("header `{name}` in `headers` is not allowed in {http}{why}; ignored"),
         );
         false
     });
@@ -114,9 +122,9 @@ fn read_max_streams(r: &mut ParamReader<'_>) -> u32 {
 /// they "may be given positionally after the port": both forms are read, the
 /// named one winning, as on `http` / `https`.
 pub fn read_h2_connect(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> H2ConnectSpec {
-    let tls = read_h2_tls(r, keystore);
+    let tls = read_pinned_tls(r, keystore, "h2", "");
     let (username, password) = read_credentials(r);
-    let headers = read_h2_headers(r);
+    let headers = read_connect_headers(r, "HTTP/2");
     let max_streams = read_max_streams(r);
     let udp_relay = r.bool("udp-relay").unwrap_or(false);
     H2ConnectSpec {
@@ -129,20 +137,52 @@ pub fn read_h2_connect(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> H2
     }
 }
 
-/// Everything `trust-tunnel`-specific on the line. After an error was
-/// reported the returned value is meaningless: the caller checks
-/// `r.has_errors()`.
+/// Everything `trust-tunnel`-specific on the line, and with `h3=true` `tfo`
+/// taken out of `common`. After an error was reported the returned value is
+/// meaningless: the caller checks `r.has_errors()`.
 ///
 /// The credentials are named-only and required, as the manual writes them,
 /// and never quoted in a diagnostic: a positional value stays unread and is
-/// reported as an extra positional value.
-pub fn read_trust_tunnel(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> TrustTunnelRead {
-    let tls = read_h2_tls(r, keystore);
+/// reported as an extra positional value. `h3` picks the transport, and
+/// with it the ALPN (TrustTunnel protocol 3.1, 3.2: `h2` over HTTP/2, `h3`
+/// over HTTP/3). The manual gives `trust-tunnel` no port hopping, over
+/// HTTP/3 either.
+pub fn read_trust_tunnel(
+    r: &mut ParamReader<'_>,
+    common: &mut CommonOpts,
+    keystore: &[KeystoreItem],
+) -> TrustTunnelSpec {
+    let h3 = r.bool("h3").unwrap_or(false);
+    let (alpn, which, http) = if h3 {
+        ("h3", " with `h3=true`", "HTTP/3")
+    } else {
+        ("h2", " without `h3=true`", "HTTP/2")
+    };
+    let tls = read_pinned_tls(r, keystore, alpn, which);
+    if h3 {
+        // HTTP/3 runs over QUIC: there is no TCP connection to open fast
+        if r.has("tfo") {
+            r.warn(
+                codes::W_PARAM_NOT_APPLICABLE,
+                "`tfo` does not apply to `trust-tunnel` policies with `h3=true`; ignored"
+                    .to_string(),
+            );
+        }
+        common.tfo = false;
+    }
     let username = required(r, "username");
     let password = required(r, "password");
-    let headers = read_h2_headers(r);
+    let headers = read_connect_headers(r, http);
     let max_streams = read_max_streams(r);
-    let h3 = r.bool("h3").unwrap_or(false);
+    for key in ["port-hopping", "port-hopping-interval"] {
+        if r.has(key) {
+            r.touch(key);
+            r.warn(
+                codes::W_PARAM_NOT_APPLICABLE,
+                format!("`{key}` does not apply to `trust-tunnel` policies; ignored"),
+            );
+        }
+    }
     if r.has("udp-relay") {
         r.touch("udp-relay");
         r.warn(
@@ -150,14 +190,12 @@ pub fn read_trust_tunnel(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> 
             "`udp-relay` does not apply to `trust-tunnel` policies (no UDP); ignored".to_string(),
         );
     }
-    TrustTunnelRead {
-        spec: TrustTunnelSpec {
-            tls,
-            username,
-            password,
-            headers,
-            max_streams,
-        },
+    TrustTunnelSpec {
+        tls,
+        username,
+        password,
+        headers,
+        max_streams,
         h3,
     }
 }
@@ -168,6 +206,7 @@ mod tests {
     use crate::diagnostic::{Diagnostic, codes};
     use crate::policy::parse_policy;
     use crate::span::Span;
+    use crate::spec::common::{Applies, Notes, read_common};
     use crate::spec::{HeaderPart, Sni};
     use std::path::Path;
     use std::sync::Arc;
@@ -187,8 +226,18 @@ mod tests {
         reader_for(def, |r| read_h2_connect(r, &[]))
     }
 
-    fn tt(def: &str) -> (TrustTunnelRead, bool, Vec<Diagnostic>) {
-        reader_for(def, |r| read_trust_tunnel(r, &[]))
+    fn tt(def: &str) -> (TrustTunnelSpec, bool, Vec<Diagnostic>) {
+        let ((spec, _), failed, diags) = tt_and_common(def);
+        (spec, failed, diags)
+    }
+
+    /// `tt`, and the common parameters as the reader leaves them.
+    fn tt_and_common(def: &str) -> ((TrustTunnelSpec, CommonOpts), bool, Vec<Diagnostic>) {
+        reader_for(def, |r| {
+            let mut common = read_common(r, Applies::Proxy, &mut Notes::default());
+            let spec = read_trust_tunnel(r, &mut common, &[]);
+            (spec, common)
+        })
     }
 
     fn messages(diags: &[Diagnostic]) -> Vec<(&str, &str)> {
@@ -287,11 +336,11 @@ mod tests {
                     .as_str()
                 )]
             );
-            let (got, failed, _) = tt(&format!(
+            let (spec, failed, _) = tt(&format!(
                 "trust-tunnel, h.test, 443, username=u, password=p, max-streams={bad}"
             ));
             assert!(failed, "{bad}");
-            assert_eq!(got.spec.max_streams, DEFAULT_MAX_STREAMS);
+            assert_eq!(spec.max_streams, DEFAULT_MAX_STREAMS);
         }
         let (spec, failed, _) = h2("h2-connect, h.test, 443, max-streams=1");
         assert!(!failed);
@@ -300,11 +349,10 @@ mod tests {
 
     #[test]
     fn the_manuals_trust_tunnel_example() {
-        let (got, failed, diags) =
+        let (spec, failed, diags) =
             tt("trust-tunnel, 192.168.20.62, 443, username=test, password=test");
         assert!(!failed && diags.is_empty(), "{diags:?}");
-        assert!(!got.h3);
-        let spec = got.spec;
+        assert!(!spec.h3);
         assert_eq!(
             (
                 spec.username.expose().as_str(),
@@ -315,13 +363,13 @@ mod tests {
         assert_eq!(spec.max_streams, DEFAULT_MAX_STREAMS);
         assert!(spec.headers.is_empty());
         assert_eq!(spec.tls.alpn, ["h2"]);
-        let (got, failed, diags) = tt(
+        let (spec, failed, diags) = tt(
             "trust-tunnel, tt.test, 443, username=u, password=p, headers=X-Padding:<random-string(16-32)>, max-streams=5, sni=tt.test, client-cert=nope",
         );
         assert!(failed, "an unknown keystore item is an error");
         assert_eq!(diags[0].code, codes::E_KEYSTORE_REF);
-        assert_eq!(got.spec.max_streams, 5);
-        assert_eq!(got.spec.headers.len(), 1);
+        assert_eq!(spec.max_streams, 5);
+        assert_eq!(spec.headers.len(), 1);
     }
 
     #[test]
@@ -413,13 +461,13 @@ mod tests {
                 "policy `P`: `alpn` is always `h2` on `h2-connect` policies; ignored"
             )]
         );
-        let (got, _, diags) = tt("trust-tunnel, h.test, 443, username=u, password=p, alpn=h3");
-        assert_eq!(got.spec.tls.alpn, ["h2"]);
+        let (spec, _, diags) = tt("trust-tunnel, h.test, 443, username=u, password=p, alpn=h3");
+        assert_eq!(spec.tls.alpn, ["h2"]);
         assert_eq!(
             messages(&diags),
             [(
                 codes::W_PARAM_NOT_APPLICABLE,
-                "policy `P`: `alpn` is always `h2` on `trust-tunnel` policies; ignored"
+                "policy `P`: `alpn` is always `h2` on `trust-tunnel` policies without `h3=true`; ignored"
             )]
         );
     }
@@ -432,7 +480,7 @@ mod tests {
         let (read, tt_failed, tt_diags) =
             tt("trust-tunnel, h.test, 443, username=u, password=p, headers=host:cdn.test;X-A:1");
         assert!(!failed && !tt_failed);
-        for (headers, diags) in [(&spec.headers, &diags), (&read.spec.headers, &tt_diags)] {
+        for (headers, diags) in [(&spec.headers, &diags), (&read.headers, &tt_diags)] {
             let names: Vec<&str> = headers.iter().map(|h| h.name.as_str()).collect();
             assert_eq!(names, ["X-A"]);
             assert_eq!(
@@ -493,7 +541,7 @@ mod tests {
     fn the_specs_do_not_print_credentials() {
         let (spec, _, _) = h2("h2-connect, h.test, 443, username=s3cretUser, password=hunter2");
         let (got, _, _) = tt("trust-tunnel, h.test, 443, username=s3cretUser, password=hunter2");
-        for printed in [format!("{spec:?}"), format!("{:?}", got.spec)] {
+        for printed in [format!("{spec:?}"), format!("{got:?}")] {
             assert!(printed.contains("Secret(***)"), "{printed}");
             assert!(
                 !printed.contains("s3cretUser") && !printed.contains("hunter2"),
@@ -510,9 +558,108 @@ mod tests {
         let (got, _, _) = tt(
             "trust-tunnel, h.test, 443, username=u, password=p, headers=Authorization:Bearer t0ken",
         );
-        for printed in [format!("{spec:?}"), format!("{:?}", got.spec)] {
+        for printed in [format!("{spec:?}"), format!("{got:?}")] {
             assert!(printed.contains("Authorization"), "{printed}");
             assert!(!printed.contains("t0ken"), "{printed}");
         }
+    }
+
+    /// Over HTTP/3 the ALPN is `h3` whatever the line says (TrustTunnel
+    /// protocol 3.2): `alpn=h3` is welcome, anything else is said and
+    /// ignored.
+    #[test]
+    fn with_h3_alpn_is_always_h3() {
+        for def in [
+            "trust-tunnel, h.test, 443, username=u, password=p, h3=true",
+            "trust-tunnel, h.test, 443, username=u, password=p, h3=true, alpn=h3",
+        ] {
+            let (spec, failed, diags) = tt(def);
+            assert!(!failed && diags.is_empty(), "{def}: {diags:?}");
+            assert!(spec.h3, "{def}");
+            assert_eq!(spec.tls.alpn, ["h3"], "{def}");
+        }
+        let (spec, failed, diags) =
+            tt("trust-tunnel, h.test, 443, username=u, password=p, h3=true, alpn=h2");
+        assert!(!failed);
+        assert_eq!(spec.tls.alpn, ["h3"]);
+        assert_eq!(
+            messages(&diags),
+            [(
+                codes::W_PARAM_NOT_APPLICABLE,
+                "policy `P`: `alpn` is always `h3` on `trust-tunnel` policies with `h3=true`; ignored"
+            )]
+        );
+    }
+
+    /// HTTP/3 runs over QUIC: TCP Fast Open has nothing to act on there.
+    /// Over HTTP/2 the reader leaves `tfo` alone (the loader says it has no
+    /// effect yet).
+    #[test]
+    fn with_h3_tfo_does_not_apply() {
+        let ((_, common), failed, diags) =
+            tt_and_common("trust-tunnel, h.test, 443, username=u, password=p, h3=true, tfo=true");
+        assert!(!failed);
+        assert!(!common.tfo);
+        assert_eq!(
+            messages(&diags),
+            [(
+                codes::W_PARAM_NOT_APPLICABLE,
+                "policy `P`: `tfo` does not apply to `trust-tunnel` policies with `h3=true`; ignored"
+            )]
+        );
+        let ((_, common), failed, diags) =
+            tt_and_common("trust-tunnel, h.test, 443, username=u, password=p, tfo=true");
+        assert!(!failed && diags.is_empty(), "{diags:?}");
+        assert!(common.tfo);
+    }
+
+    /// The manual gives `trust-tunnel` no port hopping, over HTTP/3 either.
+    #[test]
+    fn port_hopping_does_not_apply() {
+        for h3 in ["false", "true"] {
+            let (_, failed, diags) = tt(&format!(
+                "trust-tunnel, h.test, 443, username=u, password=p, h3={h3}, port-hopping=5000-6000, port-hopping-interval=10"
+            ));
+            assert!(!failed, "h3={h3}");
+            assert_eq!(
+                messages(&diags),
+                [
+                    (
+                        codes::W_PARAM_NOT_APPLICABLE,
+                        "policy `P`: `port-hopping` does not apply to `trust-tunnel` policies; ignored"
+                    ),
+                    (
+                        codes::W_PARAM_NOT_APPLICABLE,
+                        "policy `P`: `port-hopping-interval` does not apply to `trust-tunnel` policies; ignored"
+                    ),
+                ],
+                "h3={h3}"
+            );
+        }
+    }
+
+    /// HTTP/3 forbids what HTTP/2 does (RFC 9114 4.2, 4.3.1); the warning
+    /// names the version the tunnel runs over.
+    #[test]
+    fn with_h3_the_headers_http3_forbids_are_dropped() {
+        let (spec, failed, diags) = tt(
+            "trust-tunnel, h.test, 443, username=u, password=p, h3=true, headers=Connection:close;Host:cdn.test;X-A:1",
+        );
+        assert!(!failed);
+        let names: Vec<&str> = spec.headers.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["X-A"]);
+        assert_eq!(
+            messages(&diags),
+            [
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `P`: header `connection` in `headers` is not allowed in HTTP/3; ignored"
+                ),
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `P`: header `host` in `headers` is not allowed in HTTP/3 (`:authority` names the target); ignored"
+                ),
+            ]
+        );
     }
 }
