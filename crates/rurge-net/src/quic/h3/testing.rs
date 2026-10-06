@@ -1,21 +1,23 @@
 //! The server's side of HTTP/3 for the loopback fakes (phase 2 M7 design
 //! 4, 5.5): SETTINGS on a control stream of its own, the client's streams
-//! read, requests taken apart and answered. Its frames and its QPACK are
-//! code of its own — only the static table and the Huffman code are the
-//! client's — so what the client sends is read by code that is not the
-//! client's. It reads what this client sends and no more: field sections
-//! without a dynamic table, and no Huffman-encoded string (the client
-//! sends none). Never used by production code.
+//! read, requests taken apart and answered, HTTP/3 datagrams by stream.
+//! Its frames, its QPACK and its datagrams are code of its own — only the
+//! static table and the Huffman code are the client's — so what the client
+//! sends is read by code that is not the client's. It reads what this
+//! client sends and no more: field sections without a dynamic table, and
+//! no Huffman-encoded string (the client sends none). Never used by
+//! production code.
 
 use super::huffman::CODES;
 use super::qpack::STATIC_TABLE;
 use quinn::{Connection, RecvStream, SendStream, VarInt};
+use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 // the wire as the fake knows it
@@ -24,15 +26,28 @@ const HEADERS: u64 = 0x01;
 const SETTINGS: u64 = 0x04;
 const GOAWAY: u64 = 0x07;
 const CONTROL: u64 = 0x00;
+const H3_DATAGRAM: u64 = 0x33;
+
+/// The client's datagrams that wait for one of the fake's streams; more
+/// are dropped.
+const DATAGRAM_QUEUE: usize = 1024;
+
+/// The queues of the streams that take the client's datagrams, by quarter
+/// stream ID; `None` while the fake does not read them.
+type Demux = Mutex<Option<HashMap<u64, mpsc::Sender<Vec<u8>>>>>;
 
 /// An HTTP/3 server on an accepted connection. Dropping it stops reading
-/// the client's streams; the connection stays the caller's.
+/// the client's streams and datagrams; the connection stays the caller's.
 pub struct H3Server {
     quic: Connection,
     /// Our control stream, once SETTINGS went out on it.
     control: Option<SendStream>,
     client: watch::Receiver<ClientStreams>,
     reader: JoinHandle<()>,
+    demux: Arc<Demux>,
+    /// Reads the client's datagrams, once our SETTINGS said
+    /// `H3_DATAGRAM = 1`.
+    datagrams: Option<JoinHandle<()>>,
 }
 
 /// What the client's unidirectional streams brought.
@@ -57,6 +72,8 @@ impl H3Server {
             control: None,
             client,
             reader,
+            demux: Arc::default(),
+            datagrams: None,
         }
     }
 
@@ -68,7 +85,10 @@ impl H3Server {
     }
 
     /// Opens our control stream with a SETTINGS frame of `settings`, in
-    /// order.
+    /// order. With `H3_DATAGRAM = 1` among them, the fake reads the
+    /// connection's QUIC datagrams from then on as HTTP/3 datagrams, each
+    /// for the stream it names (`ServerStream::datagrams`); without, it
+    /// leaves them to the caller (Hysteria 2's UDP).
     pub async fn send_settings(&mut self, settings: &[(u64, u64)]) -> io::Result<()> {
         let mut payload = Vec::new();
         for &(id, value) in settings {
@@ -80,6 +100,13 @@ impl H3Server {
         let mut control = self.quic.open_uni().await?;
         control.write_all(&bytes).await?;
         self.control = Some(control);
+        if settings.contains(&(H3_DATAGRAM, 1)) && self.datagrams.is_none() {
+            *self.demux.lock().expect("demux") = Some(HashMap::new());
+            self.datagrams = Some(tokio::spawn(read_datagrams(
+                self.quic.clone(),
+                self.demux.clone(),
+            )));
+        }
         Ok(())
     }
 
@@ -126,6 +153,9 @@ impl H3Server {
                 recv,
                 buf: Vec::new(),
             },
+            quic: self.quic.clone(),
+            demux: self.demux.clone(),
+            datagrams_taken: false,
         })
     }
 }
@@ -133,6 +163,11 @@ impl H3Server {
 impl Drop for H3Server {
     fn drop(&mut self) {
         self.reader.abort();
+        if let Some(datagrams) = &self.datagrams {
+            datagrams.abort();
+        }
+        // the streams' datagram queues end with it
+        *self.demux.lock().expect("demux") = None;
     }
 }
 
@@ -142,6 +177,27 @@ async fn read_client(quic: Connection, seen: Arc<watch::Sender<ClientStreams>>) 
     while let Ok(recv) = quic.accept_uni().await {
         streams.spawn(read_client_stream(recv, seen.clone()));
     }
+}
+
+/// Reads the client's datagrams into the queues of the streams they name
+/// until the connection ends, and the queues with it: a datagram for no
+/// stream that takes them, one that meets a full queue, and one too short
+/// for a quarter stream ID are dropped.
+async fn read_datagrams(quic: Connection, demux: Arc<Demux>) {
+    while let Ok(datagram) = quic.read_datagram().await {
+        let Some((quarter, n)) = parse_varint(&datagram) else {
+            continue;
+        };
+        if let Some(queue) = demux
+            .lock()
+            .expect("demux")
+            .as_ref()
+            .and_then(|queues| queues.get(&quarter))
+        {
+            let _ = queue.try_send(datagram[n..].to_vec());
+        }
+    }
+    *demux.lock().expect("demux") = None;
 }
 
 /// One of the client's unidirectional streams: its type, the SETTINGS of
@@ -191,9 +247,43 @@ fn settings(mut payload: &[u8]) -> Option<Vec<(u64, u64)>> {
 pub struct ServerStream {
     send: SendStream,
     incoming: Incoming,
+    /// The connection, for the stream's datagrams.
+    quic: Connection,
+    demux: Arc<Demux>,
+    /// `datagrams` was called.
+    datagrams_taken: bool,
 }
 
 impl ServerStream {
+    /// The stream's QUIC stream ID.
+    pub fn id(&self) -> u64 {
+        u64::from(self.send.id())
+    }
+
+    /// The stream's HTTP/3 datagrams (RFC 9297 2.1), once per stream: those
+    /// the client sends for it from now on come in, while the fake reads
+    /// datagrams (`H3Server::send_settings`); those sent go out with the
+    /// stream's quarter stream ID either way.
+    pub fn datagrams(&mut self) -> ServerDatagrams {
+        assert!(
+            !self.datagrams_taken,
+            "the stream's datagrams were taken already"
+        );
+        self.datagrams_taken = true;
+        let quarter = self.id() / 4;
+        let (queue, incoming) = mpsc::channel(DATAGRAM_QUEUE);
+        // while the fake does not read datagrams, the queue ends at once
+        if let Some(queues) = self.demux.lock().expect("demux").as_mut() {
+            queues.insert(quarter, queue);
+        }
+        ServerDatagrams {
+            quic: self.quic.clone(),
+            quarter,
+            demux: self.demux.clone(),
+            incoming,
+        }
+    }
+
     /// The stream's first variable-length integer, left unread: a frame
     /// type (HEADERS, 0x01) for HTTP/3, 0x401 for a Hysteria 2 TCP request.
     pub async fn peek_varint(&mut self) -> io::Result<u64> {
@@ -321,6 +411,41 @@ impl AsyncWrite for ServerStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         AsyncWrite::poll_shutdown(Pin::new(&mut self.get_mut().send), cx)
+    }
+}
+
+/// The HTTP/3 datagrams of one of the client's streams, as the fake sends
+/// and takes them (`ServerStream::datagrams`).
+pub struct ServerDatagrams {
+    quic: Connection,
+    quarter: u64,
+    demux: Arc<Demux>,
+    incoming: mpsc::Receiver<Vec<u8>>,
+}
+
+impl ServerDatagrams {
+    /// A datagram of `payload` for the stream.
+    pub fn send(&self, payload: &[u8]) -> io::Result<()> {
+        let mut datagram = varint(self.quarter);
+        datagram.extend_from_slice(payload);
+        self.quic
+            .send_datagram(datagram.into())
+            .map_err(io::Error::other)
+    }
+
+    /// The payload of the client's next datagram for the stream; `None`
+    /// while the fake does not read datagrams, and once the connection
+    /// ended.
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.incoming.recv().await
+    }
+}
+
+impl Drop for ServerDatagrams {
+    fn drop(&mut self) {
+        if let Some(queues) = self.demux.lock().expect("demux").as_mut() {
+            queues.remove(&self.quarter);
+        }
     }
 }
 

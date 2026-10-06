@@ -1,14 +1,15 @@
 //! The client's side of an HTTP/3 connection (phase 2 M7 design 4): our
 //! control stream, the server's unidirectional streams, and requests.
 
+use super::datagram::{self, Flows};
 use super::frame::{self, FrameReader, Header, ReadFailure, Settings};
-use super::stream::RequestStream;
+use super::stream::{Kind, RequestStream};
 use super::{
     CONTROL_STREAM, H3_CLOSED_CRITICAL_STREAM, H3_EXCESSIVE_LOAD, H3_FRAME_ERROR,
     H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_MISSING_SETTINGS, H3_STREAM_CREATION_ERROR, H3Error,
     MAX_FIELD_SECTION_SIZE, PUSH_STREAM, QPACK_DECODER_STREAM, QPACK_ENCODER_STREAM,
-    SETTINGS_MAX_FIELD_SECTION_SIZE, SETTINGS_QPACK_BLOCKED_STREAMS,
-    SETTINGS_QPACK_MAX_TABLE_CAPACITY, code_name, qpack,
+    SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_H3_DATAGRAM, SETTINGS_MAX_FIELD_SECTION_SIZE,
+    SETTINGS_QPACK_BLOCKED_STREAMS, SETTINGS_QPACK_MAX_TABLE_CAPACITY, code_name, qpack,
 };
 use crate::quic::connection_error;
 use bytes::Bytes;
@@ -25,7 +26,8 @@ use tokio::task::{JoinHandle, JoinSet};
 
 /// Our SETTINGS: no dynamic table for the server's QPACK encoder and no
 /// stream blocked on one, field sections of at most
-/// `MAX_FIELD_SECTION_SIZE`. HTTP Datagrams (M7c) add `H3_DATAGRAM`.
+/// `MAX_FIELD_SECTION_SIZE`. A client made `with_datagrams` adds
+/// `H3_DATAGRAM = 1`.
 const OUR_SETTINGS: [(u64, u64); 3] = [
     (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
     (SETTINGS_MAX_FIELD_SECTION_SIZE, MAX_FIELD_SECTION_SIZE),
@@ -36,9 +38,21 @@ const OUR_SETTINGS: [(u64, u64); 3] = [
 /// (SETTINGS, GOAWAY) may take.
 const MAX_CONTROL_FRAME: u64 = 16 << 10;
 
+/// The protocol of an extended CONNECT (RFC 9220, RFC 8441 4), carried as
+/// a request extension: a CONNECT with one says `:protocol`, `:scheme` and
+/// `:path` too, and goes only once the server's SETTINGS allowed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Protocol(&'static str);
+
+impl Protocol {
+    /// Proxying UDP in HTTP (RFC 9298).
+    pub const CONNECT_UDP: Protocol = Protocol("connect-udp");
+}
+
 /// HTTP/3 on one QUIC connection, as its client. A background task reads
-/// the server's unidirectional streams and holds our control stream open;
-/// it ends with the client. No `Debug`: nothing in it is worth printing.
+/// the server's unidirectional streams — and, with datagrams, the
+/// connection's QUIC datagrams — and holds our control stream open; it
+/// ends with the client. No `Debug`: nothing in it is worth printing.
 pub struct Client {
     inner: Arc<Inner>,
     driver: JoinHandle<()>,
@@ -46,11 +60,14 @@ pub struct Client {
 
 /// What the client, its task and its requests share.
 pub(super) struct Inner {
-    quic: Connection,
+    pub(super) quic: Connection,
     state: watch::Sender<State>,
     /// The critical streams the server opened, a bit each (control, QPACK
     /// encoder, QPACK decoder): there is one of each at most.
     critical: AtomicU8,
+    /// The request streams' HTTP/3 datagrams, on a client made
+    /// `with_datagrams`.
+    pub(super) flows: Option<Flows>,
 }
 
 #[derive(Default)]
@@ -74,11 +91,29 @@ impl Client {
     /// HTTP/3 or a protocol's own streams: dropping it ends our control
     /// stream, which the server may take for the end of the connection
     /// (H3_CLOSED_CRITICAL_STREAM, RFC 9114 6.2.1).
+    ///
+    /// The client neither announces nor reads HTTP Datagrams: the
+    /// connection's QUIC datagrams are left to the protocol (Hysteria 2's
+    /// UDP, which a server taking them for HTTP/3's would break).
     pub fn new(connection: Connection) -> Client {
+        Client::start(connection, None)
+    }
+
+    /// HTTP/3 on `connection` with HTTP Datagrams (RFC 9297), as `new`
+    /// otherwise: our SETTINGS also say `H3_DATAGRAM = 1`, and the client
+    /// reads the connection's QUIC datagrams — all of them: nothing else
+    /// may — each for the request stream it names
+    /// (`RequestStream::datagrams`).
+    pub fn with_datagrams(connection: Connection) -> Client {
+        Client::start(connection, Some(Flows::default()))
+    }
+
+    fn start(connection: Connection, flows: Option<Flows>) -> Client {
         let inner = Arc::new(Inner {
             quic: connection,
             state: watch::Sender::new(State::default()),
             critical: AtomicU8::new(0),
+            flows,
         });
         let driver = tokio::spawn(drive(inner.clone()));
         Client { inner, driver }
@@ -88,17 +123,7 @@ impl Client {
     /// Datagrams need them first. The caller bounds the wait; an error when
     /// the connection ended before.
     pub async fn settings(&self) -> io::Result<Settings> {
-        let mut state = self.inner.state.subscribe();
-        let state = state
-            .wait_for(|s| s.settings.is_some() || s.failure.is_some() || s.ended.is_some())
-            .await
-            .expect("the client holds the sender");
-        match (&state.settings, &state.failure, &state.ended) {
-            (Some(settings), _, _) => Ok(settings.clone()),
-            (None, Some(failure), _) => Err(failure.io()),
-            (None, None, Some(ended)) => Err(connection_error(ended)),
-            (None, None, None) => unreachable!("waited for one of them"),
-        }
+        self.inner.settings().await
     }
 
     /// Whether the server sent GOAWAY: no new request goes on this
@@ -109,12 +134,30 @@ impl Client {
 
     /// Sends `request`'s head on a new bidirectional stream, as one
     /// HEADERS frame: its pseudo-header fields — `:method` and `:authority`
-    /// alone for a CONNECT (RFC 9114 4.4), else `:scheme` (`https` unless
-    /// the URI says), `:authority` and `:path` — then its header fields, a
-    /// sensitive value never to be indexed. The request's content, if any,
-    /// is written to the stream and ended by its shutdown; the response
-    /// comes back on it. Refused once the server sent GOAWAY.
+    /// alone for a CONNECT (RFC 9114 4.4); `:protocol`, `:scheme` and
+    /// `:path` too for an extended CONNECT, one carrying a `Protocol` (RFC
+    /// 8441 4); else `:scheme`, `:authority` and `:path` — then its header
+    /// fields, a sensitive value never to be indexed. `:scheme` is `https`
+    /// and `:path` `/` unless the URI says; the authority goes without
+    /// userinfo (RFC 9114 4.3.1). The request's content, if any, is written
+    /// to the stream and ended by its shutdown; the response comes back on
+    /// it.
+    ///
+    /// An extended CONNECT first waits for the server's SETTINGS (the
+    /// caller bounds the wait) and is refused, nothing sent, unless they
+    /// enable it (RFC 8441 3, RFC 9220 3). Refused once the server sent
+    /// GOAWAY.
     pub async fn request(&self, request: Request<()>) -> io::Result<RequestStream> {
+        let head = frame::frame(frame::HEADERS, &head(&request)?);
+        if request.extensions().get::<Protocol>().is_some() {
+            let settings = self.inner.settings().await?;
+            if settings.get(SETTINGS_ENABLE_CONNECT_PROTOCOL) != Some(1) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "h3: the server does not support extended CONNECT",
+                ));
+            }
+        }
         {
             let state = self.inner.state.borrow();
             if let Some(failure) = &state.failure {
@@ -127,7 +170,6 @@ impl Client {
                 ));
             }
         }
-        let head = frame::frame(frame::HEADERS, &head(&request)?);
         let (send, recv) = self
             .inner
             .quic
@@ -135,7 +177,9 @@ impl Client {
             .await
             .map_err(|e| self.inner.lost(&e))?;
         // from here on, a request given up on is cancelled by the stream
-        let mut stream = RequestStream::new(self.inner.clone(), send, recv, Bytes::from(head));
+        let kind = Kind::of(request.method());
+        let mut stream =
+            RequestStream::new(self.inner.clone(), send, recv, Bytes::from(head), kind);
         stream.flush().await?;
         Ok(stream)
     }
@@ -147,7 +191,7 @@ impl Drop for Client {
     }
 }
 
-/// The field section of `request`'s head.
+/// The field section of `request`'s head, as `Client::request` says.
 fn head(request: &Request<()>) -> io::Result<Vec<u8>> {
     let uri = request.uri();
     let Some(authority) = uri.authority() else {
@@ -156,17 +200,38 @@ fn head(request: &Request<()>) -> io::Result<Vec<u8>> {
             "h3: a request needs an authority",
         ));
     };
-    let authority = authority.as_str().as_bytes();
+    // what follows the last `@`, as `Authority::host` finds the host
+    let authority = match authority.as_str().rsplit_once('@') {
+        Some((_userinfo, host)) => host,
+        None => authority.as_str(),
+    }
+    .as_bytes();
+    let scheme = uri.scheme_str().unwrap_or("https").as_bytes();
+    let path = uri
+        .path_and_query()
+        .map_or("/", |path| path.as_str())
+        .as_bytes();
+    let protocol = request.extensions().get::<Protocol>();
     let mut fields = vec![(&b":method"[..], request.method().as_str().as_bytes(), false)];
-    // extended CONNECT (M7c) has `:protocol`, `:scheme` and `:path` too
-    if request.method() == Method::CONNECT {
-        fields.push((&b":authority"[..], authority, false));
-    } else {
-        let scheme = uri.scheme_str().unwrap_or("https");
-        let path = uri.path_and_query().map_or("/", |path| path.as_str());
-        fields.push((&b":scheme"[..], scheme.as_bytes(), false));
-        fields.push((&b":authority"[..], authority, false));
-        fields.push((&b":path"[..], path.as_bytes(), false));
+    match (request.method() == Method::CONNECT, protocol) {
+        (true, None) => fields.push((&b":authority"[..], authority, false)),
+        (true, Some(protocol)) => fields.extend([
+            (&b":protocol"[..], protocol.0.as_bytes(), false),
+            (&b":scheme"[..], scheme, false),
+            (&b":authority"[..], authority, false),
+            (&b":path"[..], path, false),
+        ]),
+        (false, None) => fields.extend([
+            (&b":scheme"[..], scheme, false),
+            (&b":authority"[..], authority, false),
+            (&b":path"[..], path, false),
+        ]),
+        (false, Some(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "h3: a request with a protocol must be a CONNECT",
+            ));
+        }
     }
     fields.extend(request.headers().iter().map(|(name, value)| {
         (
@@ -179,6 +244,22 @@ fn head(request: &Request<()>) -> io::Result<Vec<u8>> {
 }
 
 impl Inner {
+    /// The server's SETTINGS, once they came; an error when the connection
+    /// ended before. The caller bounds the wait.
+    pub(super) async fn settings(&self) -> io::Result<Settings> {
+        let mut state = self.state.subscribe();
+        let state = state
+            .wait_for(|s| s.settings.is_some() || s.failure.is_some() || s.ended.is_some())
+            .await
+            .expect("`self` holds the sender");
+        match (&state.settings, &state.failure, &state.ended) {
+            (Some(settings), _, _) => Ok(settings.clone()),
+            (None, Some(failure), _) => Err(failure.io()),
+            (None, None, Some(ended)) => Err(connection_error(ended)),
+            (None, None, None) => unreachable!("waited for one of them"),
+        }
+    }
+
     /// Closes the connection for `error` (RFC 9114 8): its requests fail
     /// with what it says. Once only, and not once the connection ended —
     /// even before the task saw it end: quinn's `close` would put a local
@@ -240,6 +321,15 @@ impl Inner {
         }
     }
 
+    /// Why a stream's datagrams no longer flow, as an I/O error: the
+    /// connection's end, when it ended; else the stream's.
+    pub(super) fn flow_ended(&self) -> io::Error {
+        match self.quic.close_reason() {
+            Some(e) => self.lost(&e),
+            None => closed_stream(),
+        }
+    }
+
     /// Notes that the server opened its critical stream of `kind` (`bit`);
     /// a second one is H3_STREAM_CREATION_ERROR (RFC 9114 6.2.1, RFC 9204
     /// 4.2).
@@ -287,12 +377,16 @@ fn closed_stream() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "h3: the stream is closed")
 }
 
-/// Holds our control stream and reads the server's unidirectional streams,
-/// each in a task of its own, until the connection ends — or until the
-/// client aborts it, and its tasks with it.
+/// Holds our control stream and reads the server's unidirectional streams
+/// — and, with datagrams, the connection's QUIC datagrams — each in a task
+/// of its own, until the connection ends — or until the client aborts it,
+/// and its tasks with it.
 async fn drive(inner: Arc<Inner>) {
     let mut tasks = JoinSet::new();
     tasks.spawn(control(inner.clone()));
+    if inner.flows.is_some() {
+        tasks.spawn(datagram::read(inner.clone()));
+    }
     loop {
         tokio::select! {
             accepted = inner.quic.accept_uni() => match accepted {
@@ -314,8 +408,9 @@ async fn drive(inner: Arc<Inner>) {
 /// holds it open: closing it would end HTTP/3 on the connection (RFC 9114
 /// 6.2.1). A failure is the connection's, which the driver reports.
 async fn control(inner: Arc<Inner>) {
+    let datagrams = inner.flows.is_some().then_some((SETTINGS_H3_DATAGRAM, 1));
     let mut payload = Vec::new();
-    for (id, value) in OUR_SETTINGS {
+    for (id, value) in OUR_SETTINGS.into_iter().chain(datagrams) {
         frame::put_varint(&mut payload, id);
         frame::put_varint(&mut payload, value);
     }
@@ -511,6 +606,7 @@ mod tests {
             quic: quic.clone(),
             state: watch::Sender::new(State::default()),
             critical: AtomicU8::new(0),
+            flows: None,
         };
         inner.fail(H3Error::new(H3_FRAME_ERROR, "found late"));
         assert!(inner.state.borrow().failure.is_none());
@@ -536,5 +632,18 @@ mod tests {
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
             assert_eq!(err.to_string(), "h3: a request needs an authority");
         }
+    }
+
+    /// Only a CONNECT carries a protocol (RFC 8441 4).
+    #[test]
+    fn a_request_with_a_protocol_must_be_a_connect() {
+        let mut request = Request::post("https://example.test/").body(()).unwrap();
+        request.extensions_mut().insert(Protocol::CONNECT_UDP);
+        let err = head(&request).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "h3: a request with a protocol must be a CONNECT"
+        );
     }
 }

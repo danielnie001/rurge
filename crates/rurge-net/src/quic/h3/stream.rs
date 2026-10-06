@@ -11,22 +11,28 @@
 //! - Shutdown finishes what was begun and sends the FIN; reading goes on.
 //! - Reads hand over the DATA payloads as they come; QUIC's flow control
 //!   holds the server back. Interim responses, frames of unknown types and
-//!   the trailers are passed over.
+//!   the trailers are passed over. The content must be as long as the
+//!   response's `content-length` says (RFC 9114 4.1.2), unless the response
+//!   has none (to HEAD, 204, 304) or makes a tunnel: a 2xx to a CONNECT,
+//!   after which only DATA may come (RFC 9114 4.4).
 //! - A stream dropped before both directions ended cancels its request:
 //!   the sending part is reset and the receiving part stopped, with
 //!   H3_REQUEST_CANCELLED (RFC 9114 4.1.1).
+//! - Its HTTP/3 datagrams (`datagrams`) flow until either direction ends.
 
 use super::client::Inner;
+use super::datagram::Datagrams;
 use super::frame::{self, FrameReader, ReadFailure};
 use super::qpack::{self, Field, Refused};
 use super::{
     H3_EXCESSIVE_LOAD, H3_FRAME_ERROR, H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_MESSAGE_ERROR,
     H3_REQUEST_CANCELLED, H3Error, MAX_FIELD_SECTION_SIZE, QPACK_DECOMPRESSION_FAILED,
+    SETTINGS_H3_DATAGRAM,
 };
 use bytes::{Buf, Bytes, BytesMut};
-use http::header::{HeaderName, HeaderValue};
-use http::{Response, StatusCode};
-use quinn::{RecvStream, SendStream, VarInt};
+use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
+use http::{HeaderMap, Method, Response, StatusCode};
+use quinn::{RecvStream, SendStream, VarInt, WriteError};
 use std::fmt;
 use std::future::poll_fn;
 use std::io;
@@ -59,6 +65,38 @@ pub struct RequestStream {
     finished: bool,
     reader: FrameReader,
     recv: Recv,
+    /// What the request was, which reading the response depends on.
+    kind: Kind,
+    /// The response made the stream a tunnel: a 2xx to a CONNECT.
+    tunnel: bool,
+    /// The content still to come, as the response's `content-length` said;
+    /// `None` when nothing is counted.
+    content_left: Option<u64>,
+    /// Its datagrams were taken (`datagrams`).
+    datagrams_taken: bool,
+}
+
+/// What a request is, as far as reading its response goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Kind {
+    /// A CONNECT, classic or extended: a 2xx makes the stream a tunnel.
+    Connect,
+    /// A HEAD: its response has no content (RFC 9110 9.3.2).
+    Head,
+    /// Any other request.
+    Other,
+}
+
+impl Kind {
+    pub(super) fn of(method: &Method) -> Kind {
+        if *method == Method::CONNECT {
+            Kind::Connect
+        } else if *method == Method::HEAD {
+            Kind::Head
+        } else {
+            Kind::Other
+        }
+    }
 }
 
 /// Where reading the response is.
@@ -100,12 +138,14 @@ impl From<Between> for Recv {
 }
 
 impl RequestStream {
-    /// A request whose head — a whole HEADERS frame — goes out first.
+    /// A request of `kind` whose head — a whole HEADERS frame — goes out
+    /// first.
     pub(super) fn new(
         inner: Arc<Inner>,
         send: SendStream,
         recv: RecvStream,
         head: Bytes,
+        kind: Kind,
     ) -> RequestStream {
         RequestStream {
             inner,
@@ -114,14 +154,79 @@ impl RequestStream {
             finished: false,
             reader: FrameReader::new(recv),
             recv: Recv::Head,
+            kind,
+            tunnel: false,
+            content_left: None,
+            datagrams_taken: false,
+        }
+    }
+
+    /// The stream's QUIC stream ID: 0, 4, 8 … for the client's requests
+    /// (RFC 9000 2.1).
+    pub fn id(&self) -> u64 {
+        u64::from(self.send.id())
+    }
+
+    /// The stream's HTTP/3 datagrams (RFC 9297 2.1), taken once per stream
+    /// of a client made `with_datagrams`. They need the server's SETTINGS
+    /// to say `H3_DATAGRAM = 1` — they are waited for; the caller bounds
+    /// the wait — and the connection to have negotiated QUIC datagrams.
+    /// They flow until either direction of the stream ends, the stream or
+    /// the handle is dropped, or the connection ends.
+    pub async fn datagrams(&mut self) -> io::Result<Datagrams> {
+        if self.inner.flows.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "h3: the client was made without HTTP datagrams",
+            ));
+        }
+        if self.datagrams_taken {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "h3: the stream's datagrams were taken already",
+            ));
+        }
+        if self.finished || matches!(self.recv, Recv::End | Recv::Failed(..)) {
+            return Err(self.inner.flow_ended());
+        }
+        let settings = self.inner.settings().await?;
+        if settings.get(SETTINGS_H3_DATAGRAM) != Some(1)
+            || self.inner.quic.max_datagram_size().is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "h3: the server does not support HTTP datagrams",
+            ));
+        }
+        let quarter = self.id() / 4;
+        let Some(incoming) = self
+            .inner
+            .flows
+            .as_ref()
+            .and_then(|flows| flows.open(quarter))
+        else {
+            return Err(self.inner.flow_ended());
+        };
+        self.datagrams_taken = true;
+        Ok(Datagrams::new(self.inner.clone(), quarter, incoming))
+    }
+
+    /// Either direction of the stream ended: its datagrams flow no more
+    /// (RFC 9297 2.1).
+    fn end_datagrams(&mut self) {
+        if self.datagrams_taken
+            && let Some(flows) = &self.inner.flows
+        {
+            flows.close(self.id() / 4);
         }
     }
 
     /// The response head; interim (1xx) responses and frames of unknown
-    /// types are passed over. A head that is malformed or larger than
-    /// 64 KiB ends the stream (H3_MESSAGE_ERROR, H3_EXCESSIVE_LOAD); a
-    /// field section that cannot be decoded, or a frame where none may be,
-    /// closes the connection.
+    /// types are passed over. A head that is malformed — a
+    /// `content-length` that is no number counted — or larger than 64 KiB
+    /// ends the stream (H3_MESSAGE_ERROR, H3_EXCESSIVE_LOAD); a field
+    /// section that cannot be decoded, or a frame where none may be, closes
+    /// the connection.
     pub async fn response(&mut self) -> io::Result<Response<()>> {
         poll_fn(|cx| self.poll_response(cx)).await
     }
@@ -170,14 +275,16 @@ impl RequestStream {
                         Err(Refused::TooLarge) => return Poll::Ready(Err(self.too_large())),
                     };
                     match head {
-                        None => {
-                            return Poll::Ready(Err(self.stream_error(
-                                H3_MESSAGE_ERROR,
-                                "h3: the server sent a malformed response".to_string(),
-                            )));
-                        }
+                        None => return Poll::Ready(Err(self.malformed(None))),
                         Some(head) if head.status().is_informational() => self.recv = Recv::Head,
                         Some(head) => {
+                            self.tunnel = self.kind == Kind::Connect && head.status().is_success();
+                            if self.counts_content(head.status()) {
+                                match content_length(head.headers()) {
+                                    Ok(length) => self.content_left = length,
+                                    Err(()) => return Poll::Ready(Err(self.malformed(None))),
+                                }
+                            }
                             self.recv = Recv::Body;
                             return Poll::Ready(Ok(head));
                         }
@@ -246,6 +353,27 @@ impl RequestStream {
         )
     }
 
+    /// A malformed response ends the stream (H3_MESSAGE_ERROR, RFC 9114
+    /// 4.1.2); `detail` says how, when the head does not.
+    fn malformed(&mut self, detail: Option<&str>) -> io::Error {
+        let text = match detail {
+            Some(detail) => format!("h3: the server sent a malformed response ({detail})"),
+            None => "h3: the server sent a malformed response".to_string(),
+        };
+        self.stream_error(H3_MESSAGE_ERROR, text)
+    }
+
+    /// Whether the response's content is counted against its
+    /// `content-length` (RFC 9114 4.1.2): not a tunnel's, whose
+    /// `content-length` is ignored (RFC 9110 9.3.6), nor that of a response
+    /// without content — to HEAD, 204, 304 (RFC 9110 6.4.1).
+    fn counts_content(&self, status: StatusCode) -> bool {
+        !self.tunnel
+            && self.kind != Kind::Head
+            && status != StatusCode::NO_CONTENT
+            && status != StatusCode::NOT_MODIFIED
+    }
+
     /// An error of the connection (RFC 9114 8): it closes with `error`,
     /// and the stream fails with what it says.
     fn violation(&mut self, error: H3Error) -> io::Error {
@@ -279,7 +407,20 @@ impl RequestStream {
     fn fail(&mut self, kind: io::ErrorKind, text: String) -> io::Error {
         let error = io::Error::new(kind, text.clone());
         self.recv = Recv::Failed(kind, text.into());
+        self.end_datagrams();
         error
+    }
+
+    /// The server's side ended after its content.
+    fn end(&mut self) {
+        self.recv = Recv::End;
+        self.end_datagrams();
+    }
+
+    /// Writing failed: the sending part is gone.
+    fn write_failed(&mut self, e: WriteError) -> io::Error {
+        self.end_datagrams();
+        self.inner.write_error(e)
     }
 
     /// What is left of a frame begun goes out.
@@ -287,11 +428,33 @@ impl RequestStream {
         while !self.pending.is_empty() {
             match ready!(Pin::new(&mut self.send).poll_write(cx, &self.pending)) {
                 Ok(n) => self.pending.advance(n),
-                Err(e) => return Poll::Ready(Err(self.inner.write_error(e))),
+                Err(e) => return Poll::Ready(Err(self.write_failed(e))),
             }
         }
         Poll::Ready(Ok(()))
     }
+}
+
+/// The response's `content-length` (RFC 9110 8.6): `None` without one; an
+/// error for a value that is no number, or values that differ.
+fn content_length(headers: &HeaderMap) -> Result<Option<u64>, ()> {
+    let mut length = None;
+    for value in headers.get_all(CONTENT_LENGTH) {
+        let digits = value.as_bytes();
+        // `u64::from_str` would take a sign too
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return Err(());
+        }
+        let value = std::str::from_utf8(digits)
+            .ok()
+            .and_then(|digits| digits.parse().ok())
+            .ok_or(())?;
+        if length.is_some_and(|length| length != value) {
+            return Err(());
+        }
+        length = Some(value);
+    }
+    Ok(length)
 }
 
 /// The response `fields` make; `None` for a malformed one (RFC 9114 4.1.2):
@@ -364,7 +527,12 @@ impl AsyncRead for RequestStream {
                     let header = match ready!(this.reader.poll_header(cx)) {
                         Ok(Some(header)) => header,
                         Ok(None) => {
-                            this.recv = Recv::End;
+                            if this.content_left.is_some_and(|left| left > 0) {
+                                return Poll::Ready(Err(
+                                    this.malformed(Some("shorter than its content-length"))
+                                ));
+                            }
+                            this.end();
                             return Poll::Ready(Ok(()));
                         }
                         Err(failure) => return Poll::Ready(Err(this.read_failure(failure))),
@@ -376,10 +544,34 @@ impl AsyncRead for RequestStream {
                                 "the server sent a frame after the trailers",
                             ))));
                         }
-                        frame::DATA if header.len > 0 => this.recv = Recv::Data(header.len),
-                        frame::DATA => {}
-                        // the trailers: ignored
+                        // nothing but DATA follows a tunnel's head (RFC 9114 4.4)
+                        frame::HEADERS if this.tunnel => {
+                            return Poll::Ready(Err(this.violation(H3Error::new(
+                                H3_FRAME_UNEXPECTED,
+                                "the server sent HEADERS on a CONNECT tunnel",
+                            ))));
+                        }
+                        frame::DATA => {
+                            match this.content_left {
+                                Some(left) if header.len > left => {
+                                    return Poll::Ready(Err(
+                                        this.malformed(Some("longer than its content-length"))
+                                    ));
+                                }
+                                Some(left) => this.content_left = Some(left - header.len),
+                                None => {}
+                            }
+                            if header.len > 0 {
+                                this.recv = Recv::Data(header.len);
+                            }
+                        }
+                        // the trailers, which end the content: ignored
                         frame::HEADERS => {
+                            if this.content_left.is_some_and(|left| left > 0) {
+                                return Poll::Ready(Err(
+                                    this.malformed(Some("shorter than its content-length"))
+                                ));
+                            }
                             this.recv = Recv::Skip {
                                 left: header.len,
                                 then: Between::Trailers,
@@ -420,6 +612,11 @@ impl AsyncRead for RequestStream {
     }
 }
 
+/// The request's content, or a tunnel's bytes, as DATA frames. A write
+/// returns once the stream took the start of its frame: the rest of that
+/// frame moves on only when the stream is written, flushed or shut down
+/// again — a caller that writes and then waits for the server must flush
+/// first.
 impl AsyncWrite for RequestStream {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -443,7 +640,7 @@ impl AsyncWrite for RequestStream {
         // nothing is taken until the stream takes the frame's first byte
         let sent = match ready!(Pin::new(&mut this.send).poll_write(cx, header)) {
             Ok(sent) => sent,
-            Err(e) => return Poll::Ready(Err(this.inner.write_error(e))),
+            Err(e) => return Poll::Ready(Err(this.write_failed(e))),
         };
         if sent < header.len() {
             let mut rest = BytesMut::with_capacity(header.len() - sent + payload.len());
@@ -455,7 +652,7 @@ impl AsyncWrite for RequestStream {
         // the frame has begun: its payload follows, now or from `pending`
         let sent = match Pin::new(&mut this.send).poll_write(cx, payload) {
             Poll::Ready(Ok(sent)) => sent,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(this.inner.write_error(e))),
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(this.write_failed(e))),
             Poll::Pending => 0,
         };
         if sent < payload.len() {
@@ -476,6 +673,7 @@ impl AsyncWrite for RequestStream {
             // fails only for a stream reset already, which reads report
             let _ = this.send.finish();
             this.finished = true;
+            this.end_datagrams();
         }
         Poll::Ready(Ok(()))
     }
@@ -491,6 +689,7 @@ impl Drop for RequestStream {
         if !matches!(self.recv, Recv::End) {
             self.reader.stop(H3_REQUEST_CANCELLED);
         }
+        self.end_datagrams();
     }
 }
 
@@ -552,6 +751,37 @@ mod tests {
             &[(":status", "200"), ("x", "a\0b")],
         ] {
             assert!(head(fields).is_none(), "{fields:?}");
+        }
+    }
+
+    /// A `content-length` is one number of digits alone, however many
+    /// times it is given (RFC 9110 8.6).
+    #[test]
+    fn a_content_length_is_one_number() {
+        let length = |values: &[&str]| {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append(CONTENT_LENGTH, HeaderValue::from_str(value).unwrap());
+            }
+            content_length(&headers)
+        };
+        assert_eq!(length(&[]), Ok(None));
+        assert_eq!(length(&["0"]), Ok(Some(0)));
+        assert_eq!(length(&["1234"]), Ok(Some(1234)));
+        assert_eq!(length(&["007"]), Ok(Some(7)));
+        assert_eq!(length(&["7", "7"]), Ok(Some(7)));
+        assert_eq!(length(&["18446744073709551615"]), Ok(Some(u64::MAX)));
+        for values in [
+            &["7", "8"][..],
+            &[""],
+            &["+7"],
+            &["-7"],
+            &["7 "],
+            &["0x7"],
+            &["7, 7"],
+            &["18446744073709551616"],
+        ] {
+            assert_eq!(length(values), Err(()), "{values:?}");
         }
     }
 }

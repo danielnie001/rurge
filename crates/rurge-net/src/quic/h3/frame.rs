@@ -2,7 +2,10 @@
 //! of (RFC 9000 16), the server's SETTINGS, and the reading of a stream
 //! frame by frame.
 
-use super::{H3_FRAME_ERROR, H3_SETTINGS_ERROR, H3Error};
+use super::{
+    H3_FRAME_ERROR, H3_SETTINGS_ERROR, H3Error, SETTINGS_ENABLE_CONNECT_PROTOCOL,
+    SETTINGS_H3_DATAGRAM,
+};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use quinn::{ReadError, RecvStream, VarInt};
 use std::collections::HashSet;
@@ -95,9 +98,11 @@ impl Settings {
     }
 
     /// The payload of the server's SETTINGS frame: pairs of identifier and
-    /// value. A pair cut short is H3_FRAME_ERROR; an identifier twice, or
-    /// one of HTTP/2's that HTTP/3 reserved (0x02 to 0x05), is
-    /// H3_SETTINGS_ERROR (RFC 9114 7.2.4, 7.2.4.1).
+    /// value. A pair cut short is H3_FRAME_ERROR; an identifier twice, one
+    /// of HTTP/2's that HTTP/3 reserved (0x02 to 0x05), or extended
+    /// CONNECT's or HTTP Datagrams' with a value but 0 or 1, is
+    /// H3_SETTINGS_ERROR (RFC 9114 7.2.4, 7.2.4.1; RFC 8441 3, RFC 9297
+    /// 2.1.1).
     pub(crate) fn decode(mut payload: &[u8]) -> Result<Settings, H3Error> {
         let cut = || H3Error::new(H3_FRAME_ERROR, "the server's SETTINGS frame is cut short");
         let mut pairs = Vec::new();
@@ -110,6 +115,12 @@ impl Settings {
                 return Err(H3Error::new(
                     H3_SETTINGS_ERROR,
                     format!("the server sent the HTTP/2 setting {id:#x}"),
+                ));
+            }
+            if matches!(id, SETTINGS_ENABLE_CONNECT_PROTOCOL | SETTINGS_H3_DATAGRAM) && value > 1 {
+                return Err(H3Error::new(
+                    H3_SETTINGS_ERROR,
+                    format!("the server sent the setting {id:#x} as {value}, neither 0 nor 1"),
                 ));
             }
             if !seen.insert(id) {
@@ -339,7 +350,7 @@ impl FrameReader {
 mod tests {
     use super::*;
     use crate::quic::h3::{
-        SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_MAX_FIELD_SECTION_SIZE,
+        SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_H3_DATAGRAM, SETTINGS_MAX_FIELD_SECTION_SIZE,
         SETTINGS_QPACK_MAX_TABLE_CAPACITY,
     };
 
@@ -441,6 +452,32 @@ mod tests {
                 code,
                 "{payload:02x?}"
             );
+        }
+    }
+
+    /// Extended CONNECT and HTTP Datagrams are on (1) or off (0); any other
+    /// value is H3_SETTINGS_ERROR (RFC 8441 3, RFC 9297 2.1.1).
+    #[test]
+    fn extension_settings_are_0_or_1() {
+        for id in [SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_H3_DATAGRAM] {
+            for value in [0, 1] {
+                let mut payload = Vec::new();
+                put_varint(&mut payload, id);
+                put_varint(&mut payload, value);
+                let settings = Settings::decode(&payload).unwrap();
+                assert_eq!(settings.get(id), Some(value), "{id:#x}");
+            }
+            for value in [2, 1 << 20] {
+                let mut payload = Vec::new();
+                put_varint(&mut payload, id);
+                put_varint(&mut payload, value);
+                let error = Settings::decode(&payload).unwrap_err();
+                assert_eq!(error.code, H3_SETTINGS_ERROR, "{id:#x} = {value}");
+                assert_eq!(
+                    error.text,
+                    format!("the server sent the setting {id:#x} as {value}, neither 0 nor 1")
+                );
+            }
         }
     }
 }

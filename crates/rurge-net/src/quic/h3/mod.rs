@@ -1,34 +1,42 @@
 //! A minimal HTTP/3 client (phase 2 M7 design 4): what the QUIC-based
-//! protocols need of HTTP/3 — Hysteria 2's authentication request now,
-//! MASQUE's and `trust-tunnel`'s CONNECT and DNS over HTTP/3 in M7c.
+//! protocols need of HTTP/3 — Hysteria 2's authentication request,
+//! MASQUE's and `trust-tunnel`'s CONNECT, and DNS over HTTP/3.
 //!
 //! - Our control stream carries our SETTINGS: no dynamic QPACK table
-//!   (capacity 0, no blocked streams) and field sections of at most 64 KiB.
-//!   We open no QPACK streams: an encoder that never uses a dynamic table
-//!   and a decoder that has none have nothing to say on them (RFC 9204
-//!   4.2).
+//!   (capacity 0, no blocked streams) and field sections of at most 64 KiB;
+//!   a client made `with_datagrams` adds `H3_DATAGRAM = 1`. We open no
+//!   QPACK streams: an encoder that never uses a dynamic table and a
+//!   decoder that has none have nothing to say on them (RFC 9204 4.2).
 //! - Of the server's streams, its control stream must start with SETTINGS
-//!   and may then bring GOAWAY; its QPACK streams are read and their bytes
-//!   dropped; a push stream is a connection error (we never send
-//!   MAX_PUSH_ID); a stream of any other type is stopped.
+//!   — those of extended CONNECT and of HTTP Datagrams 0 or 1 — and may
+//!   then bring GOAWAY; its QPACK streams are read and their bytes dropped;
+//!   a push stream is a connection error (we never send MAX_PUSH_ID); a
+//!   stream of any other type is stopped.
 //! - Each request is a bidirectional stream of its own: HEADERS, then the
 //!   content as DATA frames written through the stream; the response head
 //!   comes back (interim responses passed over), then the response content
-//!   as the stream's bytes. The trailers are ignored.
+//!   as the stream's bytes, as long as its `content-length` says. The
+//!   trailers are ignored; a tunnel — a CONNECT's 2xx — has none.
+//! - A CONNECT is classic — `:method` and `:authority` alone (RFC 9114
+//!   4.4) — or, carrying a `Protocol`, extended (RFC 9220), which goes only
+//!   once the server's SETTINGS allowed it.
+//! - HTTP Datagrams (RFC 9297) ride the connection's QUIC datagrams on a
+//!   client made `with_datagrams`, each for the request stream it names
+//!   (`RequestStream::datagrams`).
 //! - QPACK uses the static table alone: an exact entry, else a literal
 //!   value with the entry of the name, else a literal name and value.
 //!   Nothing sent is Huffman-encoded; what comes back may be.
-//! - An error of the connection closes it with its RFC 9114 or RFC 9204
-//!   code; an error of a response ends its stream both ways.
+//! - An error of the connection closes it with its RFC 9114, RFC 9204 or
+//!   RFC 9297 code; an error of a response ends its stream both ways.
 //!
 //! The client opens bidirectional streams for its requests and takes none
 //! of the connection's others: a protocol may open streams of its own on
-//! the same connection (Hysteria 2's TCP requests).
-//!
-//! Extended CONNECT (`:protocol`) and HTTP Datagrams come in M7c: the
-//! server's SETTINGS are kept for them (`Settings::get`).
+//! the same connection (Hysteria 2's TCP requests) and, on a client made
+//! without datagrams, read the connection's QUIC datagrams itself
+//! (Hysteria 2's UDP).
 
 mod client;
+mod datagram;
 mod frame;
 mod huffman;
 mod qpack;
@@ -36,7 +44,8 @@ mod stream;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
-pub use client::Client;
+pub use client::{Client, Protocol};
+pub use datagram::Datagrams;
 pub use frame::Settings;
 pub use stream::RequestStream;
 
@@ -68,7 +77,8 @@ pub(crate) const PUSH_STREAM: u64 = 0x01;
 pub(crate) const QPACK_ENCODER_STREAM: u64 = 0x02;
 pub(crate) const QPACK_DECODER_STREAM: u64 = 0x03;
 
-// error codes (RFC 9114 8.1, RFC 9204 6)
+// error codes (RFC 9114 8.1, RFC 9204 6, RFC 9297 5.2)
+pub(crate) const H3_DATAGRAM_ERROR: VarInt = VarInt::from_u32(0x33);
 pub(crate) const H3_STREAM_CREATION_ERROR: VarInt = VarInt::from_u32(0x103);
 pub(crate) const H3_CLOSED_CRITICAL_STREAM: VarInt = VarInt::from_u32(0x104);
 pub(crate) const H3_FRAME_UNEXPECTED: VarInt = VarInt::from_u32(0x105);
@@ -81,10 +91,11 @@ pub(crate) const H3_REQUEST_CANCELLED: VarInt = VarInt::from_u32(0x10c);
 pub(crate) const H3_MESSAGE_ERROR: VarInt = VarInt::from_u32(0x10e);
 pub(crate) const QPACK_DECOMPRESSION_FAILED: VarInt = VarInt::from_u32(0x200);
 
-/// The name of an HTTP/3 or QPACK error code, as error texts say it; an
-/// unknown code in hex.
+/// The name of an HTTP/3, QPACK or HTTP Datagrams error code, as error
+/// texts say it; an unknown code in hex.
 pub(crate) fn code_name(code: VarInt) -> Cow<'static, str> {
     Cow::Borrowed(match u64::from(code) {
+        0x33 => "H3_DATAGRAM_ERROR",
         0x100 => "H3_NO_ERROR",
         0x101 => "H3_GENERAL_PROTOCOL_ERROR",
         0x102 => "H3_INTERNAL_ERROR",
@@ -136,7 +147,8 @@ mod tests {
     use super::*;
     use crate::quic::testing::{TestCert, endpoint, loopback_socket};
     use crate::quic::{Path, Transport, client_config, connect};
-    use http::{HeaderValue, Request, Response};
+    use bytes::Bytes;
+    use http::{HeaderValue, Method, Request, Response};
     use quinn::{Connection, ConnectionError, Endpoint, SendStream, TransportConfig};
     use std::pin::Pin;
     use std::sync::Arc;
@@ -149,6 +161,12 @@ mod tests {
     pub(super) const BOUND: Duration = Duration::from_secs(10);
     /// The fake's SETTINGS unless a test says otherwise.
     const SERVER_SETTINGS: &[(u64, u64)] = &[(SETTINGS_MAX_FIELD_SECTION_SIZE, 1 << 16)];
+    /// The fake's SETTINGS for MASQUE: extended CONNECT and HTTP Datagrams.
+    const MASQUE_SETTINGS: &[(u64, u64)] = &[
+        (SETTINGS_MAX_FIELD_SECTION_SIZE, 1 << 16),
+        (SETTINGS_ENABLE_CONNECT_PROTOCOL, 1),
+        (SETTINGS_H3_DATAGRAM, 1),
+    ];
     /// `:status 200` from the static table.
     const OK: &[u8] = &[0x00, 0x00, 0xd9];
 
@@ -202,10 +220,25 @@ mod tests {
     }
 
     async fn pair() -> Pair {
-        let (endpoint, quic, server_quic) = connected().await;
+        pair_with(Client::new, SERVER_SETTINGS, |_| {}).await
+    }
+
+    /// A client with datagrams, and a fake that allows CONNECT-UDP.
+    async fn masque_pair() -> Pair {
+        pair_with(Client::with_datagrams, MASQUE_SETTINGS, |_| {}).await
+    }
+
+    /// A client `made` on a connection whose server's transport is
+    /// `tune`d, and the fake with `settings` sent.
+    async fn pair_with(
+        made: fn(Connection) -> Client,
+        settings: &[(u64, u64)],
+        tune: impl FnOnce(&mut TransportConfig),
+    ) -> Pair {
+        let (endpoint, quic, server_quic) = connected_with(&Transport::STANDARD, tune).await;
         Pair {
-            client: Client::new(quic.clone()),
-            server: timeout(BOUND, H3Server::start(server_quic.clone(), SERVER_SETTINGS))
+            client: made(quic.clone()),
+            server: timeout(BOUND, H3Server::start(server_quic.clone(), settings))
                 .await
                 .expect("started within the bound")
                 .unwrap(),
@@ -221,6 +254,39 @@ mod tests {
 
     fn tunnel(authority: &str) -> Request<()> {
         Request::connect(authority).body(()).unwrap()
+    }
+
+    /// An extended CONNECT for CONNECT-UDP (RFC 9298) through the proxy
+    /// `proxy.test:4433`, to `path`.
+    fn connect_udp(path: &str) -> Request<()> {
+        let mut request = Request::connect(format!("https://proxy.test:4433{path}"))
+            .header("capsule-protocol", "?1")
+            .body(())
+            .unwrap();
+        request.extensions_mut().insert(Protocol::CONNECT_UDP);
+        request
+    }
+
+    /// A CONNECT-UDP request answered 200: the client's stream and the
+    /// fake's.
+    async fn udp_tunnel(p: &Pair, path: &str) -> (RequestStream, ServerStream) {
+        let request = async {
+            let mut stream = p.client.request(connect_udp(path)).await.unwrap();
+            assert_eq!(stream.response().await.unwrap().status(), 200);
+            stream
+        };
+        let serve = async {
+            let mut stream = p.server.accept().await.expect("a request");
+            stream.read_headers().await.unwrap();
+            stream
+                .send_headers(200, &[("capsule-protocol", "?1")])
+                .await
+                .unwrap();
+            stream
+        };
+        timeout(BOUND, async { tokio::join!(request, serve) })
+            .await
+            .expect("within the bound")
     }
 
     fn owned(fields: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -505,7 +571,7 @@ mod tests {
         use Act::*;
         // a control stream with an empty SETTINGS frame
         const CONTROL: &[u8] = &[0x00, 0x04, 0x00];
-        let cases: [(&str, &[Act], VarInt); 15] = [
+        let cases: [(&str, &[Act], VarInt); 17] = [
             (
                 "a push stream",
                 &[Settings(&[]), Open(&[0x01, 0x00])],
@@ -539,6 +605,16 @@ mod tests {
             (
                 "a setting twice",
                 &[Settings(&[(0x06, 1), (0x06, 2)])],
+                H3_SETTINGS_ERROR,
+            ),
+            (
+                "extended CONNECT neither on nor off",
+                &[Settings(&[(0x08, 2)])],
+                H3_SETTINGS_ERROR,
+            ),
+            (
+                "HTTP Datagrams neither on nor off",
+                &[Settings(&[(0x33, 2)])],
                 H3_SETTINGS_ERROR,
             ),
             (
@@ -1097,6 +1173,704 @@ mod tests {
             code_name(QPACK_DECOMPRESSION_FAILED),
             "QPACK_DECOMPRESSION_FAILED"
         );
+        assert_eq!(code_name(H3_DATAGRAM_ERROR), "H3_DATAGRAM_ERROR");
         assert_eq!(code_name(VarInt::from_u32(0x1234)), "0x1234");
+    }
+
+    /// An extended CONNECT says `:protocol`, `:scheme` and `:path` too (RFC
+    /// 8441 4): the scheme and the path of its URI — `https` and `/` when
+    /// it has none.
+    #[tokio::test]
+    async fn an_extended_connect_says_its_protocol_scheme_and_path() {
+        let p = masque_pair().await;
+        for (uri, scheme, path) in [
+            (
+                "https://proxy.test:4433/.well-known/masque/udp/192.0.2.6/443/",
+                "https",
+                "/.well-known/masque/udp/192.0.2.6/443/",
+            ),
+            ("proxy.test:4433", "https", "/"),
+        ] {
+            let mut request = Request::connect(uri)
+                .header("capsule-protocol", "?1")
+                .body(())
+                .unwrap();
+            request.extensions_mut().insert(Protocol::CONNECT_UDP);
+            let client = async {
+                let mut stream = p.client.request(request).await.unwrap();
+                stream.response().await.unwrap().status()
+            };
+            let server = async {
+                let mut stream = p.server.accept().await.unwrap();
+                let head = stream.read_headers().await.unwrap();
+                stream.send_headers(200, &[]).await.unwrap();
+                head
+            };
+            let (status, head) = timeout(BOUND, async { tokio::join!(client, server) })
+                .await
+                .unwrap();
+            assert_eq!(status, 200);
+            assert_eq!(
+                head,
+                owned(&[
+                    (":method", "CONNECT"),
+                    (":protocol", "connect-udp"),
+                    (":scheme", scheme),
+                    (":authority", "proxy.test:4433"),
+                    (":path", path),
+                    ("capsule-protocol", "?1"),
+                ])
+            );
+        }
+    }
+
+    /// An extended CONNECT goes only once the server's SETTINGS enabled it
+    /// (RFC 8441 3): else it is refused, and nothing goes out.
+    #[tokio::test]
+    async fn an_extended_connect_needs_the_servers_settings_to_allow_it() {
+        for settings in [&[][..], &[(SETTINGS_ENABLE_CONNECT_PROTOCOL, 0)]] {
+            let p = pair_with(Client::with_datagrams, settings, |_| {}).await;
+            let err = timeout(BOUND, p.client.request(connect_udp("/")))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{settings:?}");
+            assert_eq!(
+                err.to_string(),
+                "h3: the server does not support extended CONNECT"
+            );
+            // the next request is the connection's first stream
+            let (sent, served) = timeout(BOUND, async {
+                tokio::join!(
+                    p.client.request(get("https://example.test/")),
+                    p.server.accept()
+                )
+            })
+            .await
+            .unwrap();
+            assert_eq!(sent.unwrap().id(), 0);
+            assert_eq!(served.unwrap().id(), 0);
+        }
+    }
+
+    /// An extended CONNECT waits for the server's SETTINGS, and goes once
+    /// they come.
+    #[tokio::test]
+    async fn an_extended_connect_waits_for_the_servers_settings() {
+        let (_endpoint, quic, server_quic) = connected().await;
+        let client = Client::new(quic);
+        let mut server = H3Server::new(server_quic);
+        let request = client.request(connect_udp("/"));
+        tokio::pin!(request);
+        assert!(
+            timeout(Duration::from_millis(200), &mut request)
+                .await
+                .is_err(),
+            "sent before the server's SETTINGS"
+        );
+        timeout(BOUND, async {
+            server
+                .send_settings(&[(SETTINGS_ENABLE_CONNECT_PROTOCOL, 1)])
+                .await
+                .unwrap();
+            let (sent, served) = tokio::join!(request, server.accept());
+            assert_eq!(sent.unwrap().id(), 0);
+            let head = served.unwrap().read_headers().await.unwrap();
+            assert_eq!(
+                head[..2],
+                owned(&[(":method", "CONNECT"), (":protocol", "connect-udp")])
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Only a client made with HTTP Datagrams announces them (RFC 9297
+    /// 2.1.1): a server would take Hysteria 2's own datagrams for HTTP/3's.
+    #[tokio::test]
+    async fn only_a_client_with_datagrams_announces_them() {
+        for datagrams in [false, true] {
+            let made: fn(Connection) -> Client = if datagrams {
+                Client::with_datagrams
+            } else {
+                Client::new
+            };
+            let p = pair_with(made, SERVER_SETTINGS, |_| {}).await;
+            let settings = timeout(BOUND, p.server.client_settings())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut expected = vec![
+                (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
+                (SETTINGS_MAX_FIELD_SECTION_SIZE, 65_536),
+                (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
+            ];
+            if datagrams {
+                expected.push((SETTINGS_H3_DATAGRAM, 1));
+            }
+            assert_eq!(settings, expected);
+        }
+    }
+
+    /// A client made without datagrams leaves the connection's QUIC
+    /// datagrams to the protocol: Hysteria 2 reads its UDP there.
+    #[tokio::test]
+    async fn a_client_without_datagrams_leaves_them_to_the_protocol() {
+        let p = pair().await;
+        // no HTTP/3 datagram: half a quarter stream ID
+        p.server_quic
+            .send_datagram(Bytes::from_static(&[0x40]))
+            .unwrap();
+        let datagram = timeout(BOUND, p.quic.read_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(datagram, &[0x40][..]);
+        assert_eq!(round_trip(&p.client, &p.server).await.unwrap(), 204);
+    }
+
+    /// Each stream's datagrams go out with its quarter stream ID and come
+    /// back to it by theirs (RFC 9297 2.1).
+    #[tokio::test]
+    async fn datagrams_go_both_ways_by_stream() {
+        let p = masque_pair().await;
+        timeout(BOUND, async {
+            let (mut a, mut served_a) = udp_tunnel(&p, "/a").await;
+            let (mut b, mut served_b) = udp_tunnel(&p, "/b").await;
+            assert_eq!((a.id(), served_a.id(), b.id(), served_b.id()), (0, 0, 4, 4));
+            let (mut sa, mut sb) = (served_a.datagrams(), served_b.datagrams());
+            let da = a.datagrams().await.unwrap();
+            let db = b.datagrams().await.unwrap();
+            da.send(b"to a").unwrap();
+            db.send(b"to b").unwrap();
+            assert_eq!(sa.recv().await.unwrap(), b"to a");
+            assert_eq!(sb.recv().await.unwrap(), b"to b");
+            sb.send(b"from b").unwrap();
+            sa.send(b"from a").unwrap();
+            assert_eq!(da.recv().await.unwrap(), &b"from a"[..]);
+            assert_eq!(db.recv().await.unwrap(), &b"from b"[..]);
+            // an empty payload, each way
+            da.send(b"").unwrap();
+            assert_eq!(sa.recv().await.unwrap(), b"");
+            sa.send(b"").unwrap();
+            assert_eq!(da.recv().await.unwrap(), &b""[..]);
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A datagram for a stream whose datagrams do not flow — one never
+    /// opened, the last QUIC can have, one whose datagrams were not taken,
+    /// one whose handle is gone — is dropped, and the connection serves
+    /// on.
+    #[tokio::test]
+    async fn a_datagram_for_a_stream_without_a_flow_is_dropped() {
+        let p = masque_pair().await;
+        timeout(BOUND, async {
+            let (_a, mut served_a) = udp_tunnel(&p, "/a").await;
+            let (mut b, mut served_b) = udp_tunnel(&p, "/b").await;
+            let (sa, sb) = (served_a.datagrams(), served_b.datagrams());
+            let db = b.datagrams().await.unwrap();
+            // quarter stream IDs 100 (stream 400) and 2^60 - 1
+            for datagram in [
+                &[0x40, 0x64, b'?'][..],
+                &[0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            ] {
+                p.server_quic
+                    .send_datagram(Bytes::copy_from_slice(datagram))
+                    .unwrap();
+            }
+            sa.send(b"not taken").unwrap();
+            sb.send(b"taken").unwrap();
+            assert_eq!(db.recv().await.unwrap(), &b"taken"[..]);
+            drop(db);
+            sb.send(b"gone").unwrap();
+            let (mut c, mut served_c) = udp_tunnel(&p, "/c").await;
+            let sc = served_c.datagrams();
+            let dc = c.datagrams().await.unwrap();
+            sc.send(b"c").unwrap();
+            assert_eq!(dc.recv().await.unwrap(), &b"c"[..]);
+        })
+        .await
+        .unwrap();
+        assert!(p.quic.close_reason().is_none());
+    }
+
+    /// A datagram too short for its quarter stream ID, or naming a stream
+    /// QUIC cannot have, closes the connection (H3_DATAGRAM_ERROR, RFC 9297
+    /// 2.1).
+    #[tokio::test]
+    async fn a_datagram_the_client_cannot_place_closes_the_connection() {
+        let short = "h3: the server sent a datagram too short for a quarter stream ID";
+        for (datagram, text) in [
+            (&[][..], short),
+            (&[0x40], short),
+            // 2^60
+            (
+                &[0xd0, 0, 0, 0, 0, 0, 0, 0],
+                "h3: the server sent a datagram for a stream QUIC cannot have",
+            ),
+        ] {
+            let p = masque_pair().await;
+            p.server_quic
+                .send_datagram(Bytes::copy_from_slice(datagram))
+                .unwrap();
+            assert_eq!(
+                closed_with(&p.server_quic).await,
+                u64::from(H3_DATAGRAM_ERROR),
+                "{datagram:02x?}"
+            );
+            let err = p
+                .client
+                .request(get("https://example.test/"))
+                .await
+                .unwrap_err();
+            assert_eq!(err.to_string(), text);
+        }
+    }
+
+    /// A payload longer than a datagram takes now is refused, and nothing
+    /// goes out.
+    #[tokio::test]
+    async fn a_datagram_too_long_is_refused_and_nothing_goes_out() {
+        let p = masque_pair().await;
+        timeout(BOUND, async {
+            let (mut a, mut served) = udp_tunnel(&p, "/").await;
+            let mut sa = served.datagrams();
+            let da = a.datagrams().await.unwrap();
+            // no task runs between the lines below, the connection's
+            // neither: the path's MTU, and what fits, stay as they are
+            let max = da.max_payload();
+            // stream 0's quarter stream ID takes a byte
+            assert_eq!(max, p.quic.max_datagram_size().unwrap() - 1);
+            let err = da.send(&vec![1; max + 1]).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                err.to_string(),
+                format!("h3: a datagram longer than {max} bytes")
+            );
+            da.send(&vec![2; max]).unwrap();
+            assert_eq!(sa.recv().await.unwrap(), vec![2; max]);
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A stream's datagrams need a client made with them, a server whose
+    /// SETTINGS say `H3_DATAGRAM = 1` and QUIC datagrams on the
+    /// connection; the connection serves on without them.
+    #[tokio::test]
+    async fn datagrams_need_the_servers_support() {
+        let without: &[(u64, u64)] = &[(SETTINGS_ENABLE_CONNECT_PROTOCOL, 1)];
+        let off: &[(u64, u64)] = &[
+            (SETTINGS_ENABLE_CONNECT_PROTOCOL, 1),
+            (SETTINGS_H3_DATAGRAM, 0),
+        ];
+        for (case, settings, quic_datagrams) in [
+            ("no H3_DATAGRAM", without, true),
+            ("H3_DATAGRAM = 0", off, true),
+            ("no QUIC datagrams", MASQUE_SETTINGS, false),
+        ] {
+            let p = pair_with(Client::with_datagrams, settings, |transport| {
+                if !quic_datagrams {
+                    transport.datagram_receive_buffer_size(None);
+                }
+            })
+            .await;
+            timeout(BOUND, async {
+                let (mut a, _served) = udp_tunnel(&p, "/").await;
+                let err = a.datagrams().await.unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{case}");
+                assert_eq!(
+                    err.to_string(),
+                    "h3: the server does not support HTTP datagrams",
+                    "{case}"
+                );
+            })
+            .await
+            .unwrap();
+            assert!(p.quic.close_reason().is_none(), "{case}");
+        }
+        let p = pair_with(Client::new, MASQUE_SETTINGS, |_| {}).await;
+        timeout(BOUND, async {
+            let (mut a, _served) = udp_tunnel(&p, "/").await;
+            let err = a.datagrams().await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+            assert_eq!(
+                err.to_string(),
+                "h3: the client was made without HTTP datagrams"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A stream that does not read its datagrams holds up no other: those
+    /// past what its queue holds are dropped.
+    #[tokio::test]
+    async fn a_full_queue_drops_rather_than_blocks() {
+        let p = masque_pair().await;
+        timeout(BOUND, async {
+            let (mut a, mut served_a) = udp_tunnel(&p, "/a").await;
+            let (mut b, mut served_b) = udp_tunnel(&p, "/b").await;
+            let (sa, sb) = (served_a.datagrams(), served_b.datagrams());
+            let da = a.datagrams().await.unwrap();
+            let db = b.datagrams().await.unwrap();
+            for i in 0..100u8 {
+                sa.send(&[i]).unwrap();
+            }
+            sb.send(b"b").unwrap();
+            assert_eq!(db.recv().await.unwrap(), &b"b"[..]);
+            // a's datagrams flow no more: what its queue holds, then the end
+            drop(a);
+            let mut queued = 0;
+            while da.recv().await.is_some() {
+                queued += 1;
+            }
+            assert_eq!(queued, datagram::QUEUE);
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A stream's datagrams end with it — once the server ended its side,
+    /// once the stream is dropped, once the connection ended: `recv` ends
+    /// and `send` fails. They are taken once, and not once the stream
+    /// ended.
+    #[tokio::test]
+    async fn datagrams_end_with_their_stream() {
+        let p = masque_pair().await;
+        timeout(BOUND, async {
+            let (mut a, mut served_a) = udp_tunnel(&p, "/a").await;
+            let da = a.datagrams().await.unwrap();
+            served_a.finish();
+            a.read_to_end(&mut Vec::new()).await.unwrap();
+            assert!(da.recv().await.is_none());
+            let err = da.send(b"late").unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+            assert_eq!(err.to_string(), "h3: the stream is closed");
+            let err = a.datagrams().await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                err.to_string(),
+                "h3: the stream's datagrams were taken already"
+            );
+            let (mut b, mut served_b) = udp_tunnel(&p, "/b").await;
+            served_b.finish();
+            b.read_to_end(&mut Vec::new()).await.unwrap();
+            let err = b.datagrams().await.unwrap_err();
+            assert_eq!(err.to_string(), "h3: the stream is closed");
+            // the client drops its stream
+            let (mut c, _served_c) = udp_tunnel(&p, "/c").await;
+            let dc = c.datagrams().await.unwrap();
+            drop(c);
+            assert!(dc.recv().await.is_none());
+            assert_eq!(
+                dc.send(b"late").unwrap_err().to_string(),
+                "h3: the stream is closed"
+            );
+            // the connection ends
+            let (mut d, _served_d) = udp_tunnel(&p, "/d").await;
+            let dd = d.datagrams().await.unwrap();
+            p.server_quic.close(VarInt::from_u32(0x100), b"bye");
+            assert!(dd.recv().await.is_none());
+            assert_eq!(
+                dd.send(b"late").unwrap_err().to_string(),
+                "quic: the server closed the connection (code 0x100: bye)"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Header fields as the fake sends them.
+    type Fields = &'static [(&'static str, &'static str)];
+    /// The payloads of DATA frames as the fake sends them.
+    type Payloads = &'static [&'static [u8]];
+
+    /// How the fake ends a response's content.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum End {
+        Fin,
+        /// Trailers, the stream left open.
+        Trailers,
+        /// Nothing more, the stream left open.
+        Open,
+    }
+
+    /// A response's content must be as long as its `content-length` says,
+    /// which must be a number (RFC 9114 4.1.2): else the response is
+    /// malformed, its stream ends (H3_MESSAGE_ERROR), the connection
+    /// serves on.
+    #[tokio::test]
+    async fn content_that_its_content_length_does_not_match_is_malformed() {
+        const SHORTER: &str =
+            "h3: the server sent a malformed response (shorter than its content-length)";
+        const LONGER: &str =
+            "h3: the server sent a malformed response (longer than its content-length)";
+        let p = pair().await;
+        let cases: [(&str, Payloads, End, &str); 5] = [
+            ("5", &[b"abc"], End::Fin, SHORTER),
+            ("5", &[b"abc"], End::Trailers, SHORTER),
+            ("3", &[b"abcde"], End::Open, LONGER),
+            ("3", &[b"ab", b"cd"], End::Open, LONGER),
+            ("0", &[b"x"], End::Open, LONGER),
+        ];
+        for (length, frames, end, text) in cases {
+            let request = async {
+                let mut stream = p.client.request(get("https://example.test/")).await?;
+                stream.shutdown().await?;
+                assert_eq!(stream.response().await?.status(), 200);
+                stream.read_to_end(&mut Vec::new()).await
+            };
+            let serve = async {
+                let mut stream = p.server.accept().await.unwrap();
+                stream.read_headers().await.unwrap();
+                stream
+                    .send_headers(200, &[("content-length", length)])
+                    .await
+                    .unwrap();
+                // a frame after the client stopped the stream finds it gone
+                for frame in frames {
+                    let _ = stream.send_data(frame).await;
+                }
+                match end {
+                    End::Fin => stream.finish(),
+                    End::Trailers => {
+                        let _ = stream.send_frame(0x01, &[0x00, 0x00]).await;
+                    }
+                    End::Open => {}
+                }
+                stream
+            };
+            let (result, served) = timeout(BOUND, async { tokio::join!(request, serve) })
+                .await
+                .unwrap();
+            let err = result.unwrap_err();
+            let case = format!("{length} {frames:?} {end:?}");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{case}");
+            assert_eq!(err.to_string(), text, "{case}");
+            // a stream the server ended takes no STOP_SENDING
+            if end != End::Fin {
+                assert_eq!(
+                    timeout(BOUND, served.client_stopped()).await.unwrap(),
+                    Some(u64::from(H3_MESSAGE_ERROR)),
+                    "{case}"
+                );
+            }
+        }
+        for fields in [
+            &[("content-length", "5x")][..],
+            &[("content-length", "+5")],
+            &[("content-length", "")],
+            &[("content-length", "18446744073709551616")],
+            &[("content-length", "3"), ("content-length", "4")],
+        ] {
+            let (response, served) = answered_with(&p, &response_section(200, fields)).await;
+            assert_eq!(
+                response.unwrap_err().to_string(),
+                "h3: the server sent a malformed response",
+                "{fields:?}"
+            );
+            assert_eq!(
+                timeout(BOUND, served.client_stopped()).await.unwrap(),
+                Some(u64::from(H3_MESSAGE_ERROR))
+            );
+        }
+        assert_eq!(round_trip(&p.client, &p.server).await.unwrap(), 204);
+    }
+
+    /// Content as long as the response's `content-length` says is read
+    /// whole — in frames, the length given twice alike, trailers after it;
+    /// that of a response without content — to HEAD, 204, 304 — is not
+    /// counted.
+    #[tokio::test]
+    async fn content_as_long_as_its_content_length_is_read_whole() {
+        let p = pair().await;
+        let cases: [(Method, u16, Fields, Payloads); 6] = [
+            (
+                Method::GET,
+                200,
+                &[("content-length", "6")],
+                &[b"abc", b"def"],
+            ),
+            (
+                Method::GET,
+                200,
+                &[("content-length", "3"), ("content-length", "3")],
+                &[b"abc"],
+            ),
+            (Method::GET, 200, &[("content-length", "0")], &[]),
+            (Method::HEAD, 200, &[("content-length", "1234")], &[]),
+            (Method::GET, 204, &[("content-length", "5")], &[]),
+            (Method::GET, 304, &[("content-length", "5")], &[]),
+        ];
+        for (method, status, fields, frames) in cases {
+            let request = Request::builder()
+                .method(method.clone())
+                .uri("https://example.test/")
+                .body(())
+                .unwrap();
+            let client = async {
+                let mut stream = p.client.request(request).await.unwrap();
+                stream.shutdown().await.unwrap();
+                assert_eq!(stream.response().await.unwrap().status(), status);
+                let mut content = Vec::new();
+                stream.read_to_end(&mut content).await.unwrap();
+                content
+            };
+            let server = async {
+                let mut stream = p.server.accept().await.unwrap();
+                stream.read_headers().await.unwrap();
+                stream.send_headers(status, fields).await.unwrap();
+                for frame in frames {
+                    stream.send_data(frame).await.unwrap();
+                }
+                stream.send_frame(0x01, &[0x00, 0x00]).await.unwrap();
+                stream.finish();
+            };
+            let (content, ()) = timeout(BOUND, async { tokio::join!(client, server) })
+                .await
+                .unwrap();
+            assert_eq!(content, frames.concat(), "{method} {status}");
+        }
+    }
+
+    /// A 2xx to a CONNECT makes a tunnel, whose `content-length` is ignored
+    /// (RFC 9110 9.3.6): the bytes go both ways.
+    #[tokio::test]
+    async fn a_tunnel_ignores_its_content_length() {
+        let p = pair().await;
+        let client = async {
+            let mut stream = p.client.request(tunnel("example.test:443")).await.unwrap();
+            assert_eq!(stream.response().await.unwrap().status(), 200);
+            stream.write_all(b"hello").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut back = Vec::new();
+            stream.read_to_end(&mut back).await.unwrap();
+            back
+        };
+        let server = async {
+            let mut stream = p.server.accept().await.unwrap();
+            stream.read_headers().await.unwrap();
+            stream
+                .send_headers(200, &[("content-length", "0")])
+                .await
+                .unwrap();
+            let content = stream.read_body().await.unwrap();
+            stream.send_data(b"world").await.unwrap();
+            stream.finish();
+            content
+        };
+        let (back, content) = timeout(BOUND, async { tokio::join!(client, server) })
+            .await
+            .unwrap();
+        assert_eq!(content, b"hello");
+        assert_eq!(back, b"world");
+    }
+
+    /// Nothing but DATA follows a tunnel's head (RFC 9114 4.4): HEADERS
+    /// close the connection (H3_FRAME_UNEXPECTED), on a classic CONNECT or
+    /// an extended one; a frame of an unknown type is passed over.
+    #[tokio::test]
+    async fn headers_on_a_tunnel_close_the_connection() {
+        for connect in [tunnel("example.test:443"), connect_udp("/")] {
+            let p = masque_pair().await;
+            let request = async {
+                let mut stream = p.client.request(connect).await?;
+                assert_eq!(stream.response().await?.status(), 200);
+                let mut content = Vec::new();
+                let read = stream.read_to_end(&mut content).await;
+                assert_eq!(content, b"x");
+                read
+            };
+            let serve = async {
+                let mut stream = p.server.accept().await.unwrap();
+                stream.read_headers().await.unwrap();
+                stream.send_headers(200, &[]).await.unwrap();
+                stream.send_frame(0x21, b"reserved").await.unwrap();
+                stream.send_data(b"x").await.unwrap();
+                // trailers; after the close the stream is gone
+                let _ = stream.send_frame(0x01, &[0x00, 0x00]).await;
+                stream
+            };
+            let (result, _served) = timeout(BOUND, async { tokio::join!(request, serve) })
+                .await
+                .unwrap();
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "h3: the server sent HEADERS on a CONNECT tunnel"
+            );
+            assert_eq!(
+                closed_with(&p.server_quic).await,
+                u64::from(H3_FRAME_UNEXPECTED)
+            );
+        }
+    }
+
+    /// A CONNECT's response other than a 2xx makes no tunnel (RFC 9110
+    /// 9.3.6): its content is counted and its trailers passed over, as any
+    /// response's.
+    #[tokio::test]
+    async fn a_refused_connect_is_an_ordinary_response() {
+        let p = pair().await;
+        let client = async {
+            let mut stream = p.client.request(tunnel("example.test:443")).await.unwrap();
+            let status = stream.response().await.unwrap().status();
+            let mut content = Vec::new();
+            stream.read_to_end(&mut content).await.unwrap();
+            (status, content)
+        };
+        let server = async {
+            let mut stream = p.server.accept().await.unwrap();
+            stream.read_headers().await.unwrap();
+            let fields = [
+                ("proxy-authenticate", "Basic realm=\"masque\""),
+                ("content-length", "6"),
+            ];
+            stream.send_headers(407, &fields).await.unwrap();
+            stream.send_data(b"denied").await.unwrap();
+            stream.send_frame(0x01, &[0x00, 0x00]).await.unwrap();
+            stream.finish();
+        };
+        let ((status, content), ()) = timeout(BOUND, async { tokio::join!(client, server) })
+            .await
+            .unwrap();
+        assert_eq!(status, 407);
+        assert_eq!(content, b"denied");
+        assert!(p.quic.close_reason().is_none());
+    }
+
+    /// The authority goes without userinfo (RFC 9114 4.3.1), a CONNECT's
+    /// too.
+    #[tokio::test]
+    async fn the_authority_carries_no_userinfo() {
+        let p = pair().await;
+        for (request, expected) in [
+            (
+                get("https://user:secret@example.test:8443/x"),
+                owned(&[
+                    (":method", "GET"),
+                    (":scheme", "https"),
+                    (":authority", "example.test:8443"),
+                    (":path", "/x"),
+                ]),
+            ),
+            (
+                tunnel("user:secret@example.test:443"),
+                owned(&[(":method", "CONNECT"), (":authority", "example.test:443")]),
+            ),
+        ] {
+            let (sent, head) = timeout(BOUND, async {
+                tokio::join!(p.client.request(request), async {
+                    let mut stream = p.server.accept().await.unwrap();
+                    stream.read_headers().await.unwrap()
+                })
+            })
+            .await
+            .unwrap();
+            sent.unwrap();
+            assert_eq!(head, expected);
+        }
     }
 }
