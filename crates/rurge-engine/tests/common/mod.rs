@@ -21,7 +21,9 @@ pub use rurge_proto::testing::{
     FakeTrojan, FakeVmess, H2ProxyScript, HttpProxyScript, ShadowsocksScript, SnellScript,
     Socks5Script, TlsFixture, TrojanScript, VmessScript,
 };
-pub use rurge_proto_quic::testing::{FakeHysteria2, FakeTuic, Hysteria2Script, TuicScript};
+pub use rurge_proto_quic::testing::{
+    FakeH3Proxy, FakeHysteria2, FakeTuic, H3ProxyScript, Hysteria2Script, TuicScript,
+};
 pub use rurge_proto_ssh::testing::{
     Algorithm, FakeSsh, FakeSshOpts, fingerprint_of, keystore_base64, random_key,
 };

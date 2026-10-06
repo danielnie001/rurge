@@ -500,8 +500,8 @@ const HTTP2_NO_PASSWORD: &str = "[General]\n[Proxy]\n\
 T = trust-tunnel, proxy.test, 443, username=bob\n[Rule]\nFINAL,DIRECT\n";
 
 /// `rurge check` knows `h2-connect` and `trust-tunnel` (phase 2 M6 design
-/// 5.1): neither is "not implemented"; `h3=true` is parsed but has no
-/// effect, said once however many lines use it; a `trust-tunnel` without a
+/// 5.1): neither is "not implemented"; nothing is said of `h3=true`, which
+/// takes effect (phase 2 M7 design 7.2); a `trust-tunnel` without a
 /// password is an error; credentials and headers are never printed.
 #[test]
 fn check_knows_http2() {
@@ -524,12 +524,7 @@ fn check_knows_http2() {
             && !out.contains("`trust-tunnel`"),
         "{out}"
     );
-    assert_eq!(out.matches("W0029").count(), 1, "{out}");
-    assert!(
-        out.contains("http2.conf:4")
-            && out.contains("policy parameter `h3` is parsed but has no effect in this version"),
-        "{out}"
-    );
+    assert!(!out.contains("W0029"), "{out}");
     assert!(
         !out.contains("s3cretPw") && !out.contains("alice") && !out.contains("t0kenValue"),
         "{out}"
@@ -704,6 +699,101 @@ fn check_knows_tuic() {
     }
     assert!(
         !out.contains("s3cretPw") && !out.contains("t0kenValue") && !out.contains("0233d11c"),
+        "{out}"
+    );
+}
+
+const MASQUE: &str = "[General]\n[Proxy]\n\
+M = masque, proxy.test, 443, username=us3rName, password=s3cretPw, port-hopping=5000-6000, port-hopping-interval=2, ecn=off, udp-relay=true\n\
+N = masque, proxy.test, 443, tfo=true\n\
+Old = tailscale, section-name=ts\nE = socks5, proxy.test, 1080\n\
+[Proxy Group]\nG = select, M, N, underlying-proxy=E\n[Rule]\nFINAL,DIRECT\n";
+const MASQUE_BROKEN: &str = "[General]\n[Proxy]\n\
+A = masque, proxy.test, 443, username=us3rName\n\
+B = masque, proxy.test, 443, port-hopping=5000-6000, underlying-proxy=E\n\
+C = masque, proxy.test, 443, username=us3rName, password=s3cretPw, shadow-tls-password=st, shadow-tls-version=3, shadow-tls-sni=site.test\n\
+E = socks5, proxy.test, 1080\n[Rule]\nFINAL,DIRECT\n";
+
+/// `rurge check` knows `masque` (phase 2 M7 design 7.1): it is not "not
+/// implemented"; `ecn` has an effect on it, `tfo` and `udp-relay` do not
+/// apply; a hop interval under 5 seconds is raised to 5, saying so; a group
+/// that relays a member with `port-hopping` says it leaves that member out;
+/// one credential without the other, `port-hopping` over an
+/// `underlying-proxy` and Shadow TLS are errors; the credentials are never
+/// printed.
+#[test]
+fn check_knows_masque() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "masque.conf", MASQUE))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    // `tailscale` is still a later milestone; `masque` is not
+    assert_eq!(out.matches("W0007").count(), 1, "{out}");
+    assert!(
+        out.contains("policy type `tailscale`") && !out.contains("policy type `masque`"),
+        "{out}"
+    );
+    assert!(!out.contains("W0029"), "{out}");
+    for (code, said) in [
+        (
+            "W0012",
+            "masque.conf:3: policy `M`: `port-hopping-interval` is below the minimum of 5 seconds; using 5",
+        ),
+        (
+            "W0028",
+            "masque.conf:3: policy `M`: `udp-relay` does not apply to `masque` policies (UDP is always relayed); ignored",
+        ),
+        (
+            "W0028",
+            "masque.conf:4: policy `N`: `tfo` does not apply to `masque` policies; ignored",
+        ),
+        (
+            "W0023",
+            "masque.conf:8: policy group `G` relays its members through `underlying-proxy`: `M` uses `port-hopping`, which cannot go through it; `M (via E)` is left out",
+        ),
+    ] {
+        let warning = format!("warning[{code}]");
+        assert!(
+            out.lines()
+                .any(|line| line.starts_with(&warning) && line.ends_with(said)),
+            "{code} {said}\n{out}"
+        );
+    }
+    assert!(
+        !out.contains("s3cretPw") && !out.contains("us3rName"),
+        "{out}"
+    );
+
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "bad.conf", MASQUE_BROKEN))
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    for said in [
+        "bad.conf:3: policy `A`: `password` is required with `username`",
+        "bad.conf:4: policy `B`: `port-hopping` cannot be combined with `underlying-proxy`",
+        "bad.conf:5: policy `C`: Shadow TLS cannot be combined with a `masque` policy",
+    ] {
+        assert!(
+            out.lines()
+                .any(|line| line.starts_with("error[E0018]") && line.ends_with(said)),
+            "{said}\n{out}"
+        );
+    }
+    assert!(
+        !out.contains("s3cretPw") && !out.contains("us3rName"),
         "{out}"
     );
 }

@@ -4,7 +4,7 @@
 use crate::shared::ExternalPrograms;
 use rurge_config::config::{LoadError, LoadOptions, Loaded, load};
 use rurge_config::diagnostic::codes;
-use rurge_config::spec::{CommonOpts, IpVersion, PolicySpec, ProtoSpec, TlsOpts, TrustTunnelSpec};
+use rurge_config::spec::{CommonOpts, IpVersion, PolicySpec, ProtoSpec};
 use rurge_config::{Config, Diagnostic, Diagnostics, KeystoreItem};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{Connector, DirectConnector, Resolve, ResolveVia, SystemResolve, Via};
@@ -22,7 +22,7 @@ use rurge_proto::trojan::TrojanOutbound;
 use rurge_proto::trust_tunnel::TrustTunnelOutbound;
 use rurge_proto::vmess::VmessOutbound;
 use rurge_proto::{Direct, OutboundRef};
-use rurge_proto_quic::{Hysteria2Outbound, TuicOutbound};
+use rurge_proto_quic::{Hysteria2Outbound, MasqueOutbound, TrustTunnelH3Outbound, TuicOutbound};
 use rurge_proto_ssh::SshOutbound;
 use rurge_proto_wireguard::WireGuardOutbound;
 use rustls::RootCertStore;
@@ -284,27 +284,26 @@ impl OutboundFactory for EngineFactory {
                 self.roots.clone(),
                 connector,
             )?),
-            ProtoSpec::TrustTunnel(tt) => {
-                // over HTTP/2 until M7c task 8 builds `h3=true` over HTTP/3:
-                // such a line's spec pins `alpn` to `h3`, which an HTTP/2
-                // connection must not offer
-                let h2 = TrustTunnelSpec {
-                    tls: TlsOpts {
-                        alpn: vec!["h2".to_string()],
-                        ..tt.tls.clone()
-                    },
-                    ..tt.clone()
-                };
-                Arc::new(TrustTunnelOutbound::new(
-                    &spec.name,
-                    server_of(spec)?,
-                    &h2,
-                    spec.shadow_tls.as_ref(),
-                    &self.keystore,
-                    self.roots.clone(),
-                    connector,
-                )?)
-            }
+            // `h3=true`: over HTTP/3 (QUIC) instead of HTTP/2 over TLS; the
+            // loader refuses Shadow TLS on such a line
+            ProtoSpec::TrustTunnel(tt) if tt.h3 => Arc::new(TrustTunnelH3Outbound::new(
+                &spec.name,
+                server_of(spec)?,
+                tt,
+                spec.common.ecn,
+                &self.keystore,
+                self.roots.clone(),
+                connector,
+            )?),
+            ProtoSpec::TrustTunnel(tt) => Arc::new(TrustTunnelOutbound::new(
+                &spec.name,
+                server_of(spec)?,
+                tt,
+                spec.shadow_tls.as_ref(),
+                &self.keystore,
+                self.roots.clone(),
+                connector,
+            )?),
             ProtoSpec::Hysteria2(hysteria2) => Arc::new(Hysteria2Outbound::new(
                 &spec.name,
                 server_of(spec)?,
@@ -324,13 +323,15 @@ impl OutboundFactory for EngineFactory {
                 self.roots.clone(),
                 connector,
             )?),
-            // the loader makes no spec of these lines before M7c task 8
-            ProtoSpec::Masque(_) => {
-                return Err(BuildError::new(format!(
-                    "`{}` is not implemented yet",
-                    spec.kind.keyword()
-                )));
-            }
+            ProtoSpec::Masque(masque) => Arc::new(MasqueOutbound::new(
+                &spec.name,
+                server_of(spec)?,
+                masque,
+                spec.common.ecn,
+                &self.keystore,
+                self.roots.clone(),
+                connector,
+            )?),
             // nothing starts here: the program starts on the first dial
             ProtoSpec::External(external) => {
                 let outbound = ExternalOutbound::new(
@@ -402,9 +403,8 @@ mod tests {
     use rurge_config::diagnostic::{Severity, codes};
     use rurge_net::connector::{ConnectOpts, Target};
     use rurge_net::socket::NoopSocketHook;
-    use rurge_proto::testing::{
-        FakeH2Proxy, FakeSocks5, H2ProxyScript, Socks5Script, TlsFixture, echo_server,
-    };
+    use rurge_proto::testing::{FakeSocks5, Socks5Script, echo_server};
+    use rurge_proto_quic::testing::{FakeH3Proxy, H3ProxyScript};
     use rurge_proto_ssh::testing::ED25519_WITH_PASSPHRASE;
     use std::path::Path;
     use std::time::Duration;
@@ -455,6 +455,8 @@ TT = trust-tunnel, proxy.test, 443, username=u, password=pw, shadow-tls-password
 HY = hysteria2, proxy.test, 443, password=pw, download-bandwidth=100, salamander-password=obfs, port-hopping=5000-6000, ecn=off\n\
 TU = tuic, proxy.test, 443, token=pw, port-hopping=5000-6000, ecn=off\n\
 TU5 = tuic-v5, proxy.test, 443, uuid=0233d11c-15a4-47d3-ade3-48ffca0ce119, password=pw, sni=tu.test\n\
+MQ = masque, proxy.test, 443, username=u, password=pw, port-hopping=5000-6000, ecn=off\n\
+TT3 = trust-tunnel, proxy.test, 443, username=u, password=pw, h3=true, max-streams=2\n\
 Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule]\nFINAL,DIRECT\n",
         );
         let f = factory(&cfg);
@@ -477,6 +479,8 @@ Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule
             ("HY", "HY"),
             ("TU", "TU"),
             ("TU5", "TU5"),
+            ("MQ", "MQ"),
+            ("TT3", "TT3"),
             ("Corp", "DIRECT"),
         ] {
             let spec = cfg
@@ -670,6 +674,35 @@ T5 = tuic-v5, proxy.test, 443, uuid=0233d11c-15a4-47d3-ade3-48ffca0ce119, passwo
         }
     }
 
+    /// Sound `masque` lines and `trust-tunnel` lines with `h3=true` pass the
+    /// dry build, which opens no connection (no tokio runtime here); a
+    /// client certificate that cannot be read is a load error, and neither
+    /// its password nor the policy's is quoted (phase 2 M7 design 7.1, 7.2).
+    #[test]
+    fn the_http3_policies_pass_the_dry_build() {
+        let cfg = config(
+            "[Proxy]\nM = masque, proxy.test, 443, username=u, password=pw, port-hopping=1234;5000-6000, port-hopping-interval=10, ecn=off, sni=mq.test\n\
+N = masque, proxy.test, 443\n\
+TT = trust-tunnel, proxy.test, 443, username=u, password=pw, h3=true, headers=X-Id:<random-string(8)>, max-streams=8, sni=tt.test\n\
+[Rule]\nFINAL,DIRECT\n",
+        );
+        assert!(dry_build(&cfg).is_empty());
+
+        let cfg = config(
+            "[Proxy]\nM = masque, proxy.test, 443, username=u, password=s3same0pen, client-cert=cert1\n\
+TT = trust-tunnel, proxy.test, 443, username=u, password=s3same0pen, h3=true, client-cert=cert1\n\
+[Keystore]\ncert1 = type=p12, base64=QUJD, password=hunter2\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let diags = dry_build(&cfg).sorted();
+        let messages: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(messages[0].starts_with("policy `M` cannot be built: keystore item `cert1`"));
+        assert!(messages[1].starts_with("policy `TT` cannot be built: keystore item `cert1`"));
+        for m in &messages {
+            assert!(!m.contains("hunter2") && !m.contains("s3same0pen"), "{m}");
+        }
+    }
+
     #[test]
     fn a_dry_build_of_an_anytls_policy_leaves_no_task_behind() {
         // no tokio runtime here: spawning anything at build time would panic
@@ -689,6 +722,8 @@ TT = trust-tunnel, proxy.test, 443, username=u, password=pw, skip-cert-verify=tr
 TP = trust-tunnel, proxy.test, 443, username=u, password=pw, skip-cert-verify=true, server-cert-fingerprint-sha256=0000000000000000000000000000000000000000000000000000000000000000\n\
 HY = hysteria2, proxy.test, 443, password=pw, skip-cert-verify=true\n\
 TU = tuic, proxy.test, 443, token=pw, skip-cert-verify=true\n\
+MQ = masque, proxy.test, 443, skip-cert-verify=true\n\
+TT3 = trust-tunnel, proxy.test, 443, username=u, password=pw, h3=true, skip-cert-verify=true\n\
 [Rule]\nFINAL,DIRECT\n",
         );
         let flagged: Vec<&str> = cfg
@@ -697,7 +732,7 @@ TU = tuic, proxy.test, 443, token=pw, skip-cert-verify=true\n\
             .filter(|s| skips_verification(s))
             .map(|s| s.name.as_str())
             .collect();
-        assert_eq!(flagged, ["A", "V", "H2", "TT", "HY", "TU"]);
+        assert_eq!(flagged, ["A", "V", "H2", "TT", "HY", "TU", "MQ", "TT3"]);
     }
 
     #[test]
@@ -881,51 +916,63 @@ Plain = direct, interface=eth9\n[Rule]\nFINAL,DIRECT\n",
         );
     }
 
-    /// Until the engine builds `h3=true` over HTTP/3 (M7c task 8), such a
-    /// `trust-tunnel` line connects over HTTP/2 as before: the `h3` its spec
-    /// pins as the ALPN never reaches the TLS handshake over TCP.
+    /// `masque`, and `trust-tunnel` with `h3=true`, are built over HTTP/3
+    /// (phase 2 M7 design 7.1, 7.2): each tunnel is a CONNECT on its own
+    /// policy's QUIC connection to the loopback `FakeH3Proxy`, the
+    /// `trust-tunnel` one with its `user-agent`.
     #[tokio::test]
-    async fn a_trust_tunnel_line_with_h3_still_connects_over_http2() {
+    async fn masque_and_trust_tunnel_with_h3_connect_over_http3() {
         let echo = echo_server().await;
-        let fixture = TlsFixture::new(&["127.0.0.1"]);
-        let fake = FakeH2Proxy::spawn(
-            H2ProxyScript {
-                users: vec![("u".into(), "p".into())],
-                ..H2ProxyScript::default()
-            },
-            fixture.clone(),
-        )
-        .await;
+        let fake = FakeH3Proxy::spawn(H3ProxyScript {
+            users: vec![("u".into(), "p".into())],
+            ..H3ProxyScript::default()
+        });
+        let port = fake.addr().port();
         let cfg = config(&format!(
-            "[Proxy]\nTT = trust-tunnel, 127.0.0.1, {}, username=u, password=p, h3=true\n[Rule]\nFINAL,DIRECT\n",
-            fake.addr().port()
+            "[Proxy]\nMQ = masque, 127.0.0.1, {port}, username=u, password=p\n\
+TT = trust-tunnel, 127.0.0.1, {port}, username=u, password=p, h3=true\n[Rule]\nFINAL,DIRECT\n"
         ));
         let f = EngineFactory::with_roots(
             &cfg,
             Arc::new(SystemResolve),
             Arc::new(NoopSocketHook),
-            fixture.roots(),
+            fake.roots(),
         );
-        let spec = cfg.spec("TT").unwrap();
-        let out = f.build(spec, f.direct_connector(&spec.common)).unwrap();
         let target = Target::new(rurge_config::HostName::Ip(echo.ip()), echo.port());
-        let mut stream = tokio::time::timeout(
-            Duration::from_secs(5),
-            out.connect_tcp(&target, &ConnectOpts::default()),
-        )
-        .await
-        .expect("the tunnel opens in time")
-        .unwrap();
-        stream.write_all(b"ping").await.unwrap();
-        let mut buf = [0u8; 4];
-        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+        for name in ["MQ", "TT"] {
+            let spec = cfg.spec(name).unwrap();
+            let out = f.build(spec, f.direct_connector(&spec.common)).unwrap();
+            let mut stream = tokio::time::timeout(
+                Duration::from_secs(5),
+                out.connect_tcp(&target, &ConnectOpts::default()),
+            )
             .await
-            .expect("the echo arrives")
+            .expect("the tunnel opens in time")
             .unwrap();
-        assert_eq!(&buf, b"ping");
+            // a write may leave the rest of its DATA frame for the next
+            stream.write_all(b"ping").await.unwrap();
+            stream.flush().await.unwrap();
+            let mut buf = [0u8; 4];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+                .await
+                .expect("the echo arrives")
+                .unwrap();
+            assert_eq!(&buf, b"ping", "{name}");
+        }
+        let seen: Vec<(usize, Option<String>, Option<String>)> = fake
+            .requests()
+            .iter()
+            .map(|r| {
+                let agent = r.header("user-agent").map(str::to_string);
+                (r.connection, r.authority.clone(), agent)
+            })
+            .collect();
         assert_eq!(
-            fixture.seen_at_least(1).await[0].alpn.as_deref(),
-            Some("h2")
+            seen,
+            [
+                (0, Some(echo.to_string()), None),
+                (1, Some(echo.to_string()), Some("rurge".to_string())),
+            ]
         );
     }
 }

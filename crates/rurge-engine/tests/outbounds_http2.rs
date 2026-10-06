@@ -2,6 +2,9 @@
 //! `h2-connect` and `trust-tunnel` through the engine to the loopback
 //! `FakeH2Proxy` — TCP tunnels, `max-streams`, refused credentials, UDP
 //! over CONNECT-UDP (and where there is none), `underlying-proxy`, reloads.
+//! With `h3=true` a `trust-tunnel` goes over HTTP/3 instead (phase 2 M7
+//! design 7.2), to the loopback `FakeH3Proxy`: tunnels, a refused login,
+//! `max-streams` per QUIC connection, reloads, and no Shadow TLS.
 
 mod common;
 use common::*;
@@ -379,4 +382,213 @@ async fn a_reload_keeps_an_unchanged_policy_and_rebuilds_a_changed_one() {
         assert!(!Arc::ptr_eq(&previous, &now), "kept after: {changed}");
         previous = now;
     }
+}
+
+/// A fake TrustTunnel endpoint over HTTP/3, as v1.1.0 answers there,
+/// `script` aside: quiche's grease, neither extended CONNECT nor HTTP
+/// Datagrams, its challenge on a 407, and the user `u` with the password
+/// `p`.
+fn h3_endpoint(script: H3ProxyScript) -> FakeH3Proxy {
+    FakeH3Proxy::spawn(H3ProxyScript {
+        users: vec![("u".into(), "p".into())],
+        challenge: Some("Basic realm=Authorization Required".into()),
+        grease: true,
+        no_extended_connect: true,
+        no_h3_datagram: true,
+        no_datagrams: true,
+        ..script
+    })
+}
+
+/// `P = trust-tunnel, …, h3=true` to `fake`, with `params` after it.
+fn h3_line(fake: &FakeH3Proxy, params: &str) -> String {
+    format!(
+        "P = trust-tunnel, 127.0.0.1, {}, h3=true, {params}",
+        fake.addr().port()
+    )
+}
+
+/// An engine on `proxies`, as `through`, that trusts `fake`'s certificate.
+async fn h3_through(fake: &FakeH3Proxy, proxies: &str) -> Harness {
+    harness_trusting(
+        Profile {
+            proxies,
+            rules: "DOMAIN,target.test,P\nIP-CIDR,127.0.0.1/32,P,no-resolve",
+            ..Profile::default()
+        },
+        fake.roots(),
+    )
+    .await
+}
+
+/// With `h3=true` (phase 2 M7 design 7.2) the tunnel is a classic CONNECT
+/// on the policy's QUIC connection, with the credentials and `user-agent`
+/// as over HTTP/2; the name is left to the endpoint.
+#[tokio::test]
+async fn a_connect_leaves_through_trust_tunnel_over_http3() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let fake = h3_endpoint(H3ProxyScript {
+        require_user_agent: true,
+        connect_to: Some(echo),
+        ..H3ProxyScript::default()
+    });
+    let h = h3_through(&fake, &h3_line(&fake, "username=u, password=p")).await;
+    let mut tunnel = connect_via_http(h.http(), "target.test:7").await;
+    echo_through(&mut tunnel, b"through trust-tunnel over HTTP/3").await;
+    echo_through(&mut tunnel, &vec![0x5a; 300_000]).await;
+    let seen = fake.requests();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(
+        (seen[0].method.as_str(), seen[0].authority.as_deref()),
+        ("CONNECT", Some("target.test:7")),
+        "the endpoint resolves the name"
+    );
+    // base64("u:p")
+    assert_eq!(seen[0].header("proxy-authorization"), Some("Basic dTpw"));
+    assert_eq!(seen[0].header("user-agent"), Some("rurge"));
+    assert!(h.dns.queries().is_empty(), "rurge never looked the name up");
+    drop(tunnel);
+    let record = the_records(&h, 1).await[0].clone();
+    assert_eq!(record.policy, ["P"]);
+    assert_eq!(record.status, RecordStatus::Completed, "{record:?}");
+}
+
+/// Over HTTP/3 as over HTTP/2: a login the endpoint refuses fails the
+/// session with the text that says so, and the password is nowhere in the
+/// record.
+#[tokio::test]
+async fn a_refused_trust_tunnel_login_over_http3_fails_the_session() {
+    let fake = h3_endpoint(H3ProxyScript::default());
+    let h = h3_through(&fake, &h3_line(&fake, "username=u, password=wr0ngPw")).await;
+    let record = a_failed_session(&h).await;
+    assert_eq!(
+        record.error.as_deref(),
+        Some("trust-tunnel: authentication failed")
+    );
+    assert!(!format!("{record:?}").contains("wr0ngPw"));
+    assert_eq!(fake.requests().len(), 1);
+}
+
+/// Over HTTP/3, `max-streams` bounds the tunnels of each QUIC connection
+/// (design 7.2): five open at once, two to a connection, take three.
+#[tokio::test]
+async fn max_streams_bounds_the_tunnels_of_each_quic_connection() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let fake = h3_endpoint(H3ProxyScript {
+        connect_to: Some(echo),
+        ..H3ProxyScript::default()
+    });
+    let h = h3_through(
+        &fake,
+        &h3_line(&fake, "username=u, password=p, max-streams=2"),
+    )
+    .await;
+    let mut tunnels = Vec::new();
+    for n in 0..5u8 {
+        let mut tunnel = connect_via_http(h.http(), "target.test:7").await;
+        echo_through(&mut tunnel, &[n; 16]).await;
+        tunnels.push(tunnel);
+    }
+    // every tunnel is still open
+    for tunnel in &mut tunnels {
+        echo_through(tunnel, b"still here").await;
+    }
+    assert_eq!(fake.connections(), 3);
+    let places: Vec<usize> = fake.requests().iter().map(|r| r.connection).collect();
+    assert_eq!(places, [0, 0, 1, 1, 2]);
+}
+
+/// Over HTTP/3 too, the outbound — and with it its QUIC connection — is
+/// kept across a reload that leaves the line alone, and rebuilt when its
+/// credentials, `headers`, `max-streams`, `ecn` or transport change.
+#[tokio::test]
+async fn a_reload_keeps_an_unchanged_trust_tunnel_over_http3_and_its_connection() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let fake = h3_endpoint(H3ProxyScript {
+        connect_to: Some(echo),
+        ..H3ProxyScript::default()
+    });
+    let policy = |params: &str| {
+        format!(
+            "P = trust-tunnel, 127.0.0.1, {}, {params}",
+            fake.addr().port()
+        )
+    };
+    let base = "h3=true, username=u, password=p";
+    let h = h3_through(&fake, &policy(base)).await;
+    let reload = |proxies: String| {
+        let next = Profile {
+            proxies: &proxies,
+            rules: "DOMAIN,target.test,P",
+            ..Profile::default()
+        }
+        .text(h.dns.addr());
+        let dir = h.dir.path().to_path_buf();
+        let shared = h.engine.shared();
+        async move { runtime(&dir, &next, shared).await }
+    };
+    one_session(&h, 1, b"before the reload").await;
+    let before = outbound_now(&h, "P");
+    h.engine.swap_runtime(
+        reload(format!(
+            "{}\nOther = http, other.example, 8080",
+            policy(base)
+        ))
+        .await,
+    );
+    assert!(
+        Arc::ptr_eq(&before, &outbound_now(&h, "P")),
+        "an unrelated reload rebuilt P"
+    );
+    one_session(&h, 2, b"after the reload").await;
+    assert_eq!(fake.connections(), 1, "the QUIC connection was kept");
+    let places: Vec<usize> = fake.requests().iter().map(|r| r.connection).collect();
+    assert_eq!(places, [0, 0]);
+
+    let mut previous = before;
+    for changed in [
+        "h3=true, username=u, password=0ther",
+        "h3=true, username=u, password=0ther, headers=X-Id:1",
+        "h3=true, username=u, password=0ther, headers=X-Id:1, max-streams=8",
+        "h3=true, username=u, password=0ther, headers=X-Id:1, max-streams=8, ecn=off",
+        // the same over HTTP/2
+        "username=u, password=0ther, headers=X-Id:1, max-streams=8",
+    ] {
+        h.engine.swap_runtime(reload(policy(changed)).await);
+        let now = outbound_now(&h, "P");
+        assert!(!Arc::ptr_eq(&previous, &now), "kept after: {changed}");
+        previous = now;
+    }
+}
+
+/// Shadow TLS wraps a TCP connection (phase 2 M7 design 3.1): a
+/// `trust-tunnel` line with `h3=true` and a Shadow TLS layer is refused at
+/// load — an error at its line — and has nothing to build.
+#[test]
+fn trust_tunnel_over_http3_with_shadow_tls_is_refused_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.conf");
+    std::fs::write(
+        &path,
+        "[Proxy]\nP = trust-tunnel, 127.0.0.1, 443, username=u, password=p, h3=true, shadow-tls-password=st, shadow-tls-version=3, shadow-tls-sni=site.test\n[Rule]\nFINAL,DIRECT\n",
+    )
+    .unwrap();
+    let loaded = rurge_engine::load_checked(&path, &LoadOptions::for_tests()).unwrap();
+    let found: Vec<(&str, u32, &str)> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| {
+            let line = d.span.as_ref().map_or(0, |s| s.line);
+            (d.code, line, d.message.as_str())
+        })
+        .collect();
+    assert_eq!(
+        found,
+        [(
+            rurge_config::codes::E_INVALID_POLICY_PARAM,
+            2,
+            "policy `P`: Shadow TLS cannot be combined with `h3=true` on a `trust-tunnel` policy"
+        )]
+    );
+    assert!(loaded.config.spec("P").is_none());
 }

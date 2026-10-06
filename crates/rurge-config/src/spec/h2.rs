@@ -419,8 +419,8 @@ mod tests {
         );
     }
 
-    /// `h3=true` is read (the loader says once that it has no effect yet)
-    /// and the policy connects over HTTP/2; `udp-relay` has no place here.
+    /// `h3=true` is read: the policy runs over HTTP/3 (phase 2 M7 design
+    /// 7.2); `udp-relay` has no place here.
     #[test]
     fn trust_tunnel_h3_and_udp_relay() {
         let (got, failed, diags) = tt("trust-tunnel, h.test, 443, username=u, password=p, h3=true");

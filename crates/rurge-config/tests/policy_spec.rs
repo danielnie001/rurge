@@ -79,32 +79,6 @@ fn inert_and_ios_only_parameters_are_reported_once_per_name() {
     );
 }
 
-/// `h3=true` on `trust-tunnel` is said once per load and the policy keeps
-/// HTTP/2 (phase 2 M6 design 5.1).
-#[test]
-fn trust_tunnel_h3_is_reported_once_per_load() {
-    let loaded = load(
-        "A = trust-tunnel, a.example, 443, username=u, password=p, h3=true
-B = trust-tunnel, b.example, 443, username=u, password=p, h3=true",
-        "",
-    );
-    assert!(!loaded.diagnostics.has_errors(), "{:?}", loaded.diagnostics);
-    let inert: Vec<(String, u32)> = loaded
-        .diagnostics
-        .iter()
-        .filter(|d| d.code == codes::W_PARAM_NOT_EFFECTIVE)
-        .map(|d| (d.message.clone(), d.span.as_ref().unwrap().line))
-        .collect();
-    assert_eq!(
-        inert,
-        [(
-            "policy parameter `h3` is parsed but has no effect in this version".to_string(),
-            2
-        )]
-    );
-    assert!(loaded.config.spec("A").is_some() && loaded.config.spec("B").is_some());
-}
-
 #[test]
 fn an_invalid_parameter_fails_the_load_and_leaves_no_spec() {
     let loaded = load("A = http, a.example, 80, tos=300", "");
@@ -334,9 +308,8 @@ E = socks5, e.example, 1080",
 
 /// `masque` lines are read and checked at load (phase 2 M7 design 3.1,
 /// 7.1): the combinations they cannot have and one credential without the
-/// other are errors; a hop interval under 5 seconds is raised to 5, and
-/// `ecn` has an effect on them. They have no spec until the engine builds
-/// them (M7c task 8).
+/// other are errors, which leave no spec; a hop interval under 5 seconds is
+/// raised to 5, and `ecn` has an effect on them.
 #[test]
 fn masque_lines_are_checked_at_load() {
     let loaded = load(
@@ -378,16 +351,24 @@ E = socks5, e.example, 1080",
             ),
         ]
     );
-    for name in ["A", "B", "C", "D"] {
+    for name in ["A", "B", "C"] {
         assert!(loaded.config.spec(name).is_none(), "{name}");
     }
+    let d = loaded.config.spec("D").expect("a warning leaves the spec");
+    let ProtoSpec::Masque(masque) = &d.proto else {
+        panic!("{:?}", d.proto)
+    };
+    assert_eq!(
+        masque.quic.port_hopping.as_ref().map(|h| h.interval),
+        Some(Duration::from_secs(5))
+    );
+    assert_eq!(d.common.ecn, Tristate::Off);
 }
 
 /// `trust-tunnel` lines with `h3=true` are read and checked at load (phase
 /// 2 M7 design 7.2): another ALPN, `tfo` and port hopping do not apply,
 /// Shadow TLS is an error, which leaves no spec, and `ecn` has an effect on
-/// them. Until the engine builds them over HTTP/3 (M7c task 8), `h3` is
-/// said once to have no effect yet.
+/// them; nothing is said of `h3` itself.
 #[test]
 fn trust_tunnel_lines_with_h3_are_checked_at_load() {
     let loaded = load(
@@ -408,11 +389,6 @@ C = trust-tunnel, c.example, 443, username=u, password=p, h3=true, shadow-tls-pa
                 codes::W_PARAM_NOT_APPLICABLE,
                 "policy `A`: `alpn` is always `h3` on `trust-tunnel` policies with `h3=true`; ignored"
                     .to_string(),
-                2
-            ),
-            (
-                codes::W_PARAM_NOT_EFFECTIVE,
-                "policy parameter `h3` is parsed but has no effect in this version".to_string(),
                 2
             ),
             (

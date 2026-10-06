@@ -427,8 +427,6 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
                 // over QUIC, as on `hysteria2`: `ecn` takes effect, `tfo`
                 // does not apply (phase 2 M7 design 7.2)
                 notes.inert.retain(|name| !matches!(*name, "ecn" | "tfo"));
-                // the engine connects over HTTP/2 until M7c task 8
-                notes.inert.push("h3");
             }
             (common, ProtoSpec::TrustTunnel(tt))
         }
@@ -518,10 +516,7 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     }
     let failed = r.has_errors();
     let diagnostics = r.finish();
-    // the engine builds `masque` from M7c task 8 on: until then a valid line
-    // is checked in full but has no spec
-    let built = policy.kind != PolicyKind::Masque;
-    let spec = (!failed && not_implemented.is_none() && built).then(|| PolicySpec {
+    let spec = (!failed && not_implemented.is_none()).then(|| PolicySpec {
         name: policy.name.clone(),
         kind: policy.kind,
         server: policy.server.clone(),
@@ -1149,16 +1144,16 @@ mod tests {
             assert_eq!(spec.shadow_tls.is_some(), layered, "{def}");
             assert_eq!(spec.common.underlying_proxy.is_some(), layered, "{def}");
         }
-        // `h3=true` is inert: the policy still has a spec and uses HTTP/2
+        // `h3=true` takes effect: nothing is said of it
         let o = outcome(
             "T",
             "trust-tunnel, h.test, 443, username=u, password=p, h3=true",
         );
         assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
-        assert_eq!(o.inert, ["h3"]);
+        assert!(o.inert.is_empty(), "{:?}", o.inert);
         assert!(matches!(
             o.spec.map(|s| s.proto),
-            Some(ProtoSpec::TrustTunnel(_))
+            Some(ProtoSpec::TrustTunnel(TrustTunnelSpec { h3: true, .. }))
         ));
         let o = outcome("T", "trust-tunnel, h.test, 443, max-streams=0");
         let found: Vec<(&str, &str)> = o
@@ -1543,25 +1538,47 @@ mod tests {
         }
     }
 
-    /// `masque` lines are read and checked in full; they have no spec until
-    /// the engine builds MASQUE (M7c task 8). `ecn` takes effect on them,
+    /// `masque` lines are read and checked in full, and a sound one has a
+    /// spec, with the credentials or without. `ecn` takes effect on them,
     /// `tfo` and `udp-relay` do not apply, the credentials go together, and
     /// what the manual does not list is unknown (phase 2 M7 design 3.1,
     /// 7.1).
     #[test]
-    fn a_masque_line_is_checked_but_has_no_spec_yet() {
-        for def in [
-            "masque, example.com, 443, username=user, password=pass",
-            "masque, h.test, 443",
-            "masque, h.test, 443, username=u, password=pw, port-hopping=1234;5000-6000, port-hopping-interval=10, ecn=off, alpn=h3, sni=edge.test, client-cert=cert1",
-            "masque, h.test, 443, ecn=on, underlying-proxy=Pick",
+    fn a_masque_line_is_checked_and_has_a_spec() {
+        for (def, credentials, chained) in [
+            (
+                "masque, example.com, 443, username=user, password=pass",
+                true,
+                false,
+            ),
+            ("masque, h.test, 443", false, false),
+            (
+                "masque, h.test, 443, username=u, password=pw, port-hopping=1234;5000-6000, port-hopping-interval=10, ecn=off, alpn=h3, sni=edge.test, client-cert=cert1",
+                true,
+                false,
+            ),
+            (
+                "masque, h.test, 443, ecn=on, underlying-proxy=Pick",
+                false,
+                true,
+            ),
             // DIRECT is no chain: the hops stay
-            "masque, h.test, 443, port-hopping=5000-6000, underlying-proxy=DIRECT",
+            (
+                "masque, h.test, 443, port-hopping=5000-6000, underlying-proxy=DIRECT",
+                false,
+                false,
+            ),
         ] {
             let o = outcome("M", def);
             assert!(o.diagnostics.is_empty(), "{def}: {:?}", o.diagnostics);
             assert!(o.inert.is_empty(), "{def}: {:?}", o.inert);
-            assert!(o.spec.is_none() && o.not_implemented.is_none(), "{def}");
+            assert_eq!(o.not_implemented, None, "{def}");
+            let spec = o.spec.unwrap_or_else(|| panic!("{def}: no spec"));
+            let ProtoSpec::Masque(masque) = &spec.proto else {
+                panic!("{def}: {:?}", spec.proto)
+            };
+            assert_eq!(masque.credentials.is_some(), credentials, "{def}");
+            assert_eq!(spec.common.underlying_proxy.is_some(), chained, "{def}");
         }
         let o = outcome(
             "M",
@@ -1682,9 +1699,8 @@ mod tests {
 
     /// `h3=true` runs a `trust-tunnel` over QUIC (phase 2 M7 design 7.2):
     /// the spec says so and pins the ALPN to `h3`; `ecn` takes effect, `tfo`
-    /// does not apply, and port hopping is no parameter of it. Until the
-    /// engine builds it (M7c task 8) the load says `h3` has no effect yet,
-    /// and the policy connects over HTTP/2.
+    /// does not apply, and port hopping is no parameter of it. `h3` itself
+    /// takes effect: nothing is said of it.
     #[test]
     fn a_trust_tunnel_line_with_h3_runs_over_quic() {
         let o = outcome(
@@ -1713,7 +1729,7 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(o.inert, ["h3"]);
+        assert!(o.inert.is_empty(), "{:?}", o.inert);
         let spec = o.spec.expect("a spec");
         let ProtoSpec::TrustTunnel(tt) = &spec.proto else {
             panic!("{:?}", spec.proto)
