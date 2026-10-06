@@ -37,6 +37,7 @@ rurge-proto-quic = { workspace = true, features = ["testing"] }
 rurge-proto-ssh = { workspace = true, features = ["testing"] }
 rurge-proto-wireguard = { workspace = true, features = ["testing"] }
 tokio-rustls.workspace = true
+socket2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 criterion.workspace = true

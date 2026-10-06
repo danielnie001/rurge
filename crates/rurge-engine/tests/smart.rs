@@ -6,8 +6,11 @@
 mod common;
 use common::*;
 use rurge_config::HostName;
-use rurge_config::session::SessionInfo;
+use rurge_config::session::{SessionInfo, Transport};
+use rurge_dns::testing::{DoqScript, FakeDoq};
+use rurge_dns::{LookupOpts, Source};
 use rurge_inbound::{DialError, Dialer};
+use rurge_policy::smart::{Health, SiteMemory};
 use std::time::Instant;
 
 /// A loopback port nothing listens on.
@@ -473,4 +476,154 @@ async fn udp_silence_counts_only_where_answers_always_come() {
         smart.health("Quiet", &quiet, Instant::now()),
         rurge_policy::smart::Health::Unknown { failures: 1 }
     );
+}
+
+/// A harness in follow mode (`encrypted-dns-follow-outbound-mode`) whose
+/// resolver asks the encrypted DNS server `server` and nothing else: the
+/// sessions `rules` send to the `smart` group `S` of `members` — `proxies`
+/// are theirs — go through one of them.
+async fn dns_smart(
+    general: &str,
+    server: &str,
+    proxies: &str,
+    members: &str,
+    rules: &str,
+) -> Harness {
+    let general = format!(
+        "encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = {server}\n\
+encrypted-dns-skip-cert-verification = true\n{general}"
+    );
+    harness(Profile {
+        general: &general,
+        proxies,
+        groups: &format!("S = smart, {members}"),
+        rules,
+        ..Profile::default()
+    })
+    .await
+}
+
+/// `target.test` through the harness's resolver, answered within the bound.
+async fn lookup_target(h: &Harness) -> rurge_dns::DnsResult {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        h.engine
+            .runtime()
+            .stack
+            .resolver
+            .lookup("target.test", LookupOpts::default()),
+    )
+    .await
+    .expect("the lookup within the bound")
+    .expect("an answer")
+}
+
+/// The internal sessions the engine has recorded so far, finished or not.
+fn internal_records(h: &Harness) -> Vec<rurge_engine::RequestRecord> {
+    let log = h.engine.request_log();
+    let mut all = log.recent(50);
+    all.extend(log.active());
+    all.retain(|r| r.listener == ListenerKind::Internal);
+    all
+}
+
+/// An internal session — here the QUIC carrier of a DNS server — tells the
+/// `smart` group of the member it went through, as any session does: the
+/// first datagram back is the member's sample, and the member worked at the
+/// server's address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dns_servers_carrier_is_reported_to_the_smart_group() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let up = FakeSocks5::spawn(Socks5Script::default()).await;
+    let proxies = format!(
+        "Good = socks5, 127.0.0.1, {}, udp-relay=true",
+        up.addr().port()
+    );
+    let server = format!("quic://{}", doq.addr());
+    let h = dns_smart("", &server, &proxies, "Good", "PROTOCOL,DOQ,S").await;
+    let res = lookup_target(&h).await;
+    assert_eq!(res.source, Source::Upstream(server));
+    let registry = h.engine.registry();
+    let smart = &registry.auto().smart;
+    wait_until("the report of the first datagram", || {
+        smart.site("127.0.0.1", Instant::now()).worked == ["Good"]
+    })
+    .await;
+    assert_eq!(
+        smart.most_used("S", &["Good".to_string()], Instant::now()),
+        ["Good"]
+    );
+    let good = outbound_now(&h, "Good");
+    assert!(matches!(
+        smart.health("Good", &good, Instant::now()),
+        Health::Healthy(_)
+    ));
+}
+
+/// The same for the connection of a DNS server over TCP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tcp_dns_session_is_reported_to_the_smart_group() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let up = FakeSocks5::spawn(Socks5Script::default()).await;
+    let proxies = format!("Good = socks5, 127.0.0.1, {}", up.addr().port());
+    let server = format!("tcp://127.0.0.1:{}", dns.addr().port());
+    let h = dns_smart("", &server, &proxies, "Good", "PROTOCOL,DNS,S").await;
+    let res = lookup_target(&h).await;
+    assert_eq!(res.source, Source::Upstream(server));
+    let registry = h.engine.registry();
+    let smart = &registry.auto().smart;
+    wait_until("the report of the first byte", || {
+        smart.site("127.0.0.1", Instant::now()).worked == ["Good"]
+    })
+    .await;
+    assert_eq!(
+        smart.most_used("S", &["Good".to_string()], Instant::now()),
+        ["Good"]
+    );
+    let good = outbound_now(&h, "Good");
+    assert!(matches!(
+        smart.health("Good", &good, Instant::now()),
+        Health::Healthy(_)
+    ));
+}
+
+/// A carrier that goes through DIRECT in place of a member that carries no
+/// UDP (`udp-policy-not-supported-behaviour = DIRECT`) is no session of that
+/// member: the group is told nothing of it, neither of the use nor of the
+/// first datagram back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_carrier_gone_through_direct_in_place_of_a_member_is_not_reported() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let server = format!("quic://{}", doq.addr());
+    let h = dns_smart(
+        "udp-policy-not-supported-behaviour = DIRECT",
+        &server,
+        "NoUdp = http, 127.0.0.1, 9",
+        "NoUdp",
+        "PROTOCOL,DOQ,S",
+    )
+    .await;
+    let res = lookup_target(&h).await;
+    assert_eq!(res.source, Source::Upstream(server));
+    // it did go by the group and its member, and through DIRECT
+    let carriers = internal_records(&h);
+    assert!(
+        carriers.iter().any(|r| r.transport == Transport::Udp
+            && r.policy == ["S", "NoUdp"]
+            && r.error.as_deref() == Some("policy does not support UDP; sent through DIRECT")
+            && r.down > 0),
+        "{carriers:?}"
+    );
+    // a report would have been made by now: the first datagram back is what
+    // the answer came in
+    let registry = h.engine.registry();
+    let smart = &registry.auto().smart;
+    let now = Instant::now();
+    assert_eq!(smart.site("127.0.0.1", now), SiteMemory::default());
+    assert!(smart.most_used("S", &["NoUdp".to_string()], now).is_empty());
 }

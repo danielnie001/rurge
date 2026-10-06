@@ -14,12 +14,14 @@ use rurge_engine::{
 };
 use rurge_inbound::{DialError, Dialer, Running, SessionHandle, SessionOutcome};
 use rurge_net::connector::Target;
+use rurge_net::socket::{Family, NoopSocketHook, SocketHook};
 use rurge_net::testing::TestServer;
 use rurge_policy::GroupSelections;
 use rurge_proto::testing::{FakeHttpProxy, FakeSocks5, HttpProxyScript, Socks5Script};
 use rurge_rules::{GeoUrls, OutboundMode};
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -1156,6 +1158,16 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
 /// need their own `[Proxy]` entries and `encrypted-dns-server`, which
 /// `build_runtime`'s fixed profile shape cannot express.
 async fn engine_from_profile(dir: &std::path::Path, profile: &str) -> Arc<Engine> {
+    engine_with_hook(dir, profile, Arc::new(NoopSocketHook)).await
+}
+
+/// `engine_from_profile` with `hook` applying the socket settings of every
+/// direct connector.
+async fn engine_with_hook(
+    dir: &std::path::Path,
+    profile: &str,
+    hook: Arc<dyn SocketHook>,
+) -> Arc<Engine> {
     let loaded = from_text(profile, &dir.join("t.conf"), &LoadOptions::for_tests());
     assert!(
         !loaded.diagnostics.has_errors(),
@@ -1177,7 +1189,7 @@ async fn engine_from_profile(dir: &std::path::Path, profile: &str) -> Arc<Engine
                 system: Arc::new(StaticSystemDns::default()),
                 wait: Duration::ZERO,
                 dns_connector: None,
-                socket_hook: Arc::new(rurge_net::socket::NoopSocketHook),
+                socket_hook: hook,
             },
             outbound_mode: OutboundMode::Rule,
             idle_timeout: Duration::from_secs(600),
@@ -1629,15 +1641,20 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
 /// certificates, the fakes' own, not checked), with `proxies`, and `rules`
 /// before `FINAL,DIRECT`.
 fn follow_profile(servers: &str, proxies: &str, rules: &str) -> String {
+    follow_profile_with("", servers, proxies, rules)
+}
+
+/// `follow_profile` with `general` — more `[General]` lines — added.
+fn follow_profile_with(general: &str, servers: &str, proxies: &str, rules: &str) -> String {
     format!(
         "[General]\nencrypted-dns-follow-outbound-mode = true\n\
 encrypted-dns-server = {servers}\nencrypted-dns-skip-cert-verification = true\n\
-ipv6 = false\n[Proxy]\n{proxies}\n[Proxy Group]\n[Rule]\n{rules}\nFINAL,DIRECT\n"
+ipv6 = false\n{general}\n[Proxy]\n{proxies}\n[Proxy Group]\n[Rule]\n{rules}\nFINAL,DIRECT\n"
     )
 }
 
-/// `target.test` through the engine's resolver, answered within the bound.
-async fn lookup_target(engine: &Engine) -> rurge_dns::DnsResult {
+/// `target.test` through the engine's resolver, within the bound.
+async fn lookup_outcome(engine: &Engine) -> Result<rurge_dns::DnsResult, rurge_dns::DnsError> {
     tokio::time::timeout(
         Duration::from_secs(10),
         engine
@@ -1648,7 +1665,11 @@ async fn lookup_target(engine: &Engine) -> rurge_dns::DnsResult {
     )
     .await
     .expect("the lookup within the bound")
-    .expect("an answer")
+}
+
+/// `target.test` through the engine's resolver, answered within the bound.
+async fn lookup_target(engine: &Engine) -> rurge_dns::DnsResult {
+    lookup_outcome(engine).await.expect("an answer")
 }
 
 /// The QUIC carriers recorded so far: the internal UDP sessions.
@@ -1656,6 +1677,25 @@ fn carrier_sessions(engine: &Engine) -> Vec<RequestRecord> {
     let mut all = internal_sessions(engine);
     all.retain(|r| r.transport == Transport::Udp);
     all
+}
+
+/// A socket hook that notes the TOS it is asked to set, and for which family
+/// of socket: what the sockets of a direct connector carry of their policy's
+/// settings.
+#[derive(Default)]
+struct TosHook {
+    calls: Mutex<Vec<(Family, u8)>>,
+}
+
+impl SocketHook for TosHook {
+    fn bind_interface(&self, _: &socket2::Socket, _: &str, _: Family) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_tos(&self, _: &socket2::Socket, family: Family, tos: u8) -> io::Result<()> {
+        self.calls.lock().unwrap().push((family, tos));
+        Ok(())
+    }
 }
 
 /// In follow mode a DoQ server's QUIC carrier goes by the rules (phase 2 M7
@@ -1884,6 +1924,179 @@ async fn a_doq_server_routed_to_a_proxy_without_udp_fails_while_another_answers(
     assert_eq!(failed.error.as_deref(), Some("policy does not support UDP"));
     assert_eq!(blocked.connections(), 0);
     assert!(blocked.queries().is_empty());
+}
+
+/// `udp-policy-not-supported-behaviour = DIRECT` goes for the carrier as it
+/// goes for any UDP flow: a proxy that carries no UDP is gone around, through
+/// DIRECT's UDP; the record keeps the policy the rules picked and says so,
+/// and the proxy is not asked for anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_doq_carrier_routed_to_a_proxy_without_udp_may_go_through_direct() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let proxy = FakeHttpProxy::spawn(HttpProxyScript::default()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile_with(
+        "udp-policy-not-supported-behaviour = DIRECT",
+        &format!("quic://{}", doq.addr()),
+        &format!("NoUdp = http, 127.0.0.1, {}", proxy.addr().port()),
+        "PROTOCOL,DOQ,NoUdp",
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = lookup_target(&engine).await;
+    assert_eq!(
+        res.source,
+        Source::Upstream(format!("quic://{}", doq.addr()))
+    );
+    assert_eq!(doq.connections(), 1);
+    assert!(proxy.heads().is_empty(), "{:?}", proxy.heads());
+    let carriers = carrier_sessions(&engine);
+    assert!(
+        carriers
+            .iter()
+            .any(|r| r.protocol == Some(ProtocolKind::Doq)
+                && r.rule.as_deref() == Some("PROTOCOL,DOQ,NoUdp")
+                && r.policy == ["NoUdp"]
+                && r.error.as_deref() == Some("policy does not support UDP; sent through DIRECT")
+                && r.up > 0
+                && r.down > 0),
+        "{carriers:?}"
+    );
+}
+
+/// A REJECT at the end of the chain is not a policy that carries no UDP: it
+/// is gone around with its own note, whichever way
+/// `udp-policy-not-supported-behaviour` goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reject_is_still_bypassed_where_a_policy_without_udp_may_go_through_direct() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile_with(
+        "udp-policy-not-supported-behaviour = DIRECT",
+        &format!("quic://{}", doq.addr()),
+        "",
+        "PROTOCOL,DOQ,REJECT",
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = lookup_target(&engine).await;
+    assert_eq!(
+        res.source,
+        Source::Upstream(format!("quic://{}", doq.addr()))
+    );
+    let carriers = carrier_sessions(&engine);
+    assert!(
+        carriers.iter().any(|r| r.policy == ["REJECT"]
+            && r.error.as_deref() == Some("dns-follow: reject bypassed to keep DNS working")
+            && r.up > 0
+            && r.down > 0),
+        "{carriers:?}"
+    );
+}
+
+/// A DIRECT alias carries the carrier on its own UDP, with its socket
+/// settings — here the TOS, which reaches the sockets through the hook, as
+/// it reaches a TCP DNS session's — and not on a plain socket of the
+/// pipeline's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_doq_carrier_routed_to_a_direct_alias_has_its_socket_settings() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let hook = Arc::new(TosHook::default());
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile(
+        &format!("quic://{}", doq.addr()),
+        "Marked = direct, tos=0x28",
+        "PROTOCOL,DOQ,Marked",
+    );
+    let engine = engine_with_hook(dir.path(), &profile, hook.clone()).await;
+    let res = lookup_target(&engine).await;
+    assert_eq!(
+        res.source,
+        Source::Upstream(format!("quic://{}", doq.addr()))
+    );
+    let calls = hook.calls.lock().unwrap().clone();
+    assert!(calls.contains(&(Family::V4, 0x28)), "{calls:?}");
+    let carriers = carrier_sessions(&engine);
+    assert!(
+        carriers.iter().any(|r| r.policy == ["Marked", "DIRECT"]
+            && r.up > 0
+            && r.down > 0
+            && r.error.is_none()),
+        "{carriers:?}"
+    );
+}
+
+/// What the resolver hears of a carrier that failed names the policy — the
+/// text a proxy fails with could pass for the DNS server's own — and says
+/// that a proxy without UDP carries none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_resolver_hears_which_policy_carries_no_udp() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile(
+        &format!("quic://{}", doq.addr()),
+        "NoUdp = http, 127.0.0.1, 9",
+        "PROTOCOL,DOQ,NoUdp",
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let err = lookup_outcome(&engine)
+        .await
+        .expect_err("the only server is out of reach");
+    assert!(
+        err.to_string()
+            .contains("via NoUdp: policy does not support UDP"),
+        "{err}"
+    );
+    assert_eq!(doq.connections(), 0);
+}
+
+/// A proxy that carries UDP but will not open the association: the resolver
+/// hears the proxy's own words behind its name, the record is a failed
+/// carrier, and no credential is told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_doq_carrier_the_proxy_will_not_open_fails_naming_the_policy() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    // wants credentials the policy does not have
+    let proxy = FakeSocks5::spawn(Socks5Script {
+        auth: Some(("user".into(), "secret".into())),
+        ..Socks5Script::default()
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile(
+        &format!("quic://{}", doq.addr()),
+        &format!(
+            "Socks = socks5, 127.0.0.1, {}, udp-relay=true",
+            proxy.addr().port()
+        ),
+        "PROTOCOL,DOQ,Socks",
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let refusal = "socks5: the proxy accepts none of the offered authentication methods";
+    let err = lookup_outcome(&engine)
+        .await
+        .expect_err("the proxy refuses the carrier");
+    assert!(
+        err.to_string().contains(&format!("via Socks: {refusal}")),
+        "{err}"
+    );
+    assert!(!err.to_string().contains("secret"), "{err}");
+    let failed = wait_for_record(&engine, Duration::from_secs(5), |r| {
+        r.transport == Transport::Udp && r.status == RecordStatus::Failed
+    })
+    .await
+    .expect("the failed carrier is recorded");
+    assert_eq!(failed.policy, ["Socks"]);
+    assert_eq!(failed.error.as_deref(), Some(refusal));
+    assert_eq!(doq.connections(), 0);
 }
 
 /// Without `encrypted-dns-follow-outbound-mode` a carrier goes straight to

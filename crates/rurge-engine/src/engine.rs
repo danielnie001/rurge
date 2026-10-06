@@ -10,7 +10,7 @@ use crate::state::StateStore;
 use arc_swap::ArcSwap;
 use rurge_config::Builtin;
 use rurge_config::HostName;
-use rurge_config::general::General;
+use rurge_config::general::{General, UdpFallback};
 use rurge_config::rule::PolicyRef;
 use rurge_config::session::{ListenerKind, SessionInfo};
 use rurge_config::spec::{PolicySpec, ProtoSpec};
@@ -904,8 +904,10 @@ impl Engine {
     /// a TCP session gets DIRECT's TCP. The routing keeps DNS working as
     /// `dial_internal`'s does: a REJECT, and a proxy that would have to be
     /// resolved first, each warn and go directly instead. A proxy that
-    /// carries no UDP fails the server this time, with no DIRECT in its
-    /// place: the resolver asks its other servers.
+    /// carries no UDP is dealt with as for any UDP flow
+    /// (`udp-policy-not-supported-behaviour`): the server fails this time —
+    /// the resolver asks its other servers —, or the carrier goes through
+    /// DIRECT's UDP, and the record says so.
     pub async fn dial_internal_udp(
         &self,
         session: SessionInfo,
@@ -934,21 +936,41 @@ impl Engine {
         }
         // what the resolver hears names the policy: the text alone could
         // pass for the DNS server's own (`tls: …`)
-        let policy = resolution
+        let mut via = resolution
             .chain
             .last()
             .map(String::as_str)
             .unwrap_or_default();
-        if resolution.outbound.udp() == UdpSupport::Unsupported {
-            let why = "policy does not support UDP";
-            handle.finish(SessionOutcome::Failed(why.to_string()));
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("via {policy}: {why}"),
-            ));
+        let mut outbound = resolution.outbound.clone();
+        // the member of a `smart` group is told how its carrier opened — not
+        // when DIRECT carries it in the member's place
+        let mut report = true;
+        if outbound.udp() == UdpSupport::Unsupported {
+            match rt.config.general.udp_policy_not_supported_behaviour {
+                UdpFallback::Reject => {
+                    let why = "policy does not support UDP";
+                    handle.finish(SessionOutcome::Failed(why.to_string()));
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("via {via}: {why}"),
+                    ));
+                }
+                UdpFallback::Direct => {
+                    handle.set_error("policy does not support UDP; sent through DIRECT");
+                    let ctx = SelectCtx {
+                        host: Some(target.host.to_string()),
+                    };
+                    let direct = PolicyRef::Builtin(Builtin::Direct);
+                    outbound = registry.resolve_with(&direct, &ctx).outbound;
+                    via = "DIRECT";
+                    report = false;
+                }
+            }
         }
-        let opened = resolution.outbound.open_udp(&opts).await;
-        report_internal(&registry, &resolution, &handle, opened.as_ref().map(|_| ()));
+        let opened = outbound.open_udp(&opts).await;
+        if report {
+            report_internal(&registry, &resolution, &handle, opened.as_ref().map(|_| ()));
+        }
         match opened {
             // the server is an address: nothing for the carrier to look up
             Ok(socket) => Ok(crate::dns_pipeline::wrap_internal_udp(
@@ -956,8 +978,8 @@ impl Engine {
                 handle,
             )),
             Err(e) => {
-                handle.finish(SessionOutcome::Failed(e.to_string()));
-                Err(io::Error::other(format!("via {policy}: {e}")))
+                handle.finish(crate::udp::failed(&handle, e.to_string()));
+                Err(io::Error::other(format!("via {via}: {e}")))
             }
         }
     }

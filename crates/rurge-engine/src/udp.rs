@@ -459,7 +459,7 @@ async fn run_flow(
 }
 
 /// A failure, with whatever note is already on the record in front of it.
-fn failed(handle: &SessionHandle, message: impl Into<String>) -> SessionOutcome {
+pub(crate) fn failed(handle: &SessionHandle, message: impl Into<String>) -> SessionOutcome {
     let message = message.into();
     if let Some(note) = handle.error() {
         handle.set_error(format!("{note}; {message}"));
