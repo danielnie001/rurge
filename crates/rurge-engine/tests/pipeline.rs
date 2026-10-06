@@ -1,18 +1,24 @@
 //! Profile text → Runtime → Engine → real listeners on the loopback, talking to
 //! `TestServer` targets through the HTTP and SOCKS5 proxies (M3 design §10).
 
+use rurge_config::HostName;
 use rurge_config::config::{LoadOptions, from_text};
-use rurge_config::session::{ListenerKind, SessionInfo};
+use rurge_config::rule::ProtocolKind;
+use rurge_config::session::{ListenerKind, SessionInfo, Transport};
+use rurge_dns::Source;
 use rurge_dns::system::StaticSystemDns;
-use rurge_dns::testing::{DoqScript, FakeDoq, MockDns};
+use rurge_dns::testing::{Doh3Script, DoqScript, FakeDoh3, FakeDoq, MockDns};
 use rurge_engine::stack::StackOptions;
-use rurge_engine::{Engine, EngineShared, ListenerSpec, RequestRecord, Runtime, RuntimeOptions};
+use rurge_engine::{
+    Engine, EngineShared, ListenerSpec, RecordStatus, RequestRecord, Runtime, RuntimeOptions,
+};
 use rurge_inbound::{DialError, Dialer, Running, SessionHandle, SessionOutcome};
+use rurge_net::connector::Target;
 use rurge_net::testing::TestServer;
 use rurge_policy::GroupSelections;
-use rurge_proto::testing::{FakeHttpProxy, HttpProxyScript};
+use rurge_proto::testing::{FakeHttpProxy, FakeSocks5, HttpProxyScript, Socks5Script};
 use rurge_rules::{GeoUrls, OutboundMode};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1619,22 +1625,20 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
     );
 }
 
-/// In follow mode a DoQ server is reached all the same: the pipeline hands
-/// the QUIC carrier to its direct fallback.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_follow_mode_resolver_reaches_a_doq_server() {
-    let dns = MockDns::spawn().await;
-    dns.set("target.test", &["127.0.0.1"], &[], 60);
-    let doq = FakeDoq::spawn(&dns, DoqScript::default());
-    let dir = tempfile::tempdir().unwrap();
-    let profile = format!(
+/// A follow-mode profile whose encrypted DNS servers are `servers` (their
+/// certificates, the fakes' own, not checked), with `proxies`, and `rules`
+/// before `FINAL,DIRECT`.
+fn follow_profile(servers: &str, proxies: &str, rules: &str) -> String {
+    format!(
         "[General]\nencrypted-dns-follow-outbound-mode = true\n\
-encrypted-dns-server = quic://127.0.0.1:{}\nencrypted-dns-skip-cert-verification = true\n\
-ipv6 = false\n[Proxy]\n[Proxy Group]\n[Rule]\nFINAL,DIRECT\n",
-        doq.addr().port()
-    );
-    let engine = engine_from_profile(dir.path(), &profile).await;
-    let res = tokio::time::timeout(
+encrypted-dns-server = {servers}\nencrypted-dns-skip-cert-verification = true\n\
+ipv6 = false\n[Proxy]\n{proxies}\n[Proxy Group]\n[Rule]\n{rules}\nFINAL,DIRECT\n"
+    )
+}
+
+/// `target.test` through the engine's resolver, answered within the bound.
+async fn lookup_target(engine: &Engine) -> rurge_dns::DnsResult {
+    tokio::time::timeout(
         Duration::from_secs(10),
         engine
             .runtime()
@@ -1644,10 +1648,270 @@ ipv6 = false\n[Proxy]\n[Proxy Group]\n[Rule]\nFINAL,DIRECT\n",
     )
     .await
     .expect("the lookup within the bound")
-    .expect("an answer over DoQ");
-    assert_eq!(res.v4, ["127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap()]);
+    .expect("an answer")
+}
+
+/// The QUIC carriers recorded so far: the internal UDP sessions.
+fn carrier_sessions(engine: &Engine) -> Vec<RequestRecord> {
+    let mut all = internal_sessions(engine);
+    all.retain(|r| r.transport == Transport::Udp);
+    all
+}
+
+/// In follow mode a DoQ server's QUIC carrier goes by the rules (phase 2 M7
+/// design 7.3): `PROTOCOL,DOQ` sends it through a SOCKS5 proxy, whose UDP
+/// association takes the QUIC packets to the server. The carrier is an
+/// internal UDP session of the request log, its bytes counted both ways.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_doq_carrier_follows_the_rules_through_a_socks5_proxy() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let proxy = FakeSocks5::spawn(Socks5Script::default()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile(
+        &format!("quic://{}", doq.addr()),
+        &format!(
+            "Socks = socks5, 127.0.0.1, {}, udp-relay=true",
+            proxy.addr().port()
+        ),
+        "PROTOCOL,DOQ,Socks",
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = lookup_target(&engine).await;
+    assert_eq!(res.v4, [Ipv4Addr::LOCALHOST]);
+    assert_eq!(
+        res.source,
+        Source::Upstream(format!("quic://{}", doq.addr()))
+    );
+    // UDP associations only, and every packet through them to the server
+    let requests = proxy.requests();
+    assert!(
+        !requests.is_empty() && requests.iter().all(|r| r.command == 3),
+        "{requests:?}"
+    );
+    let server = Target::new(HostName::Ip(doq.addr().ip()), doq.addr().port());
+    let datagrams = proxy.datagrams();
+    assert!(
+        !datagrams.is_empty() && datagrams.iter().all(|to| *to == server),
+        "{datagrams:?}"
+    );
+    let carriers = carrier_sessions(&engine);
+    assert!(
+        carriers
+            .iter()
+            .any(|r| r.protocol == Some(ProtocolKind::Doq)
+                && r.rule.as_deref() == Some("PROTOCOL,DOQ,Socks")
+                && r.policy == ["Socks"]
+                && r.dst == doq.addr().to_string()
+                && r.up > 0
+                && r.down > 0
+                && r.error.is_none()),
+        "{carriers:?}"
+    );
+}
+
+/// The same for a DoH3 server, sent by an IP rule. Port 443 alone tags a
+/// carrier `DOH3`, and a loopback server here has another: this one is
+/// tagged `DOQ` (best effort, as the TCP connections' tags are).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_doh3_carrier_follows_an_ip_rule_through_a_socks5_proxy() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doh3 = FakeDoh3::spawn(&dns, Doh3Script::default());
+    let proxy = FakeSocks5::spawn(Socks5Script::default()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile(
+        &format!("h3://{}", doh3.addr()),
+        &format!(
+            "Socks = socks5, 127.0.0.1, {}, udp-relay=true",
+            proxy.addr().port()
+        ),
+        "IP-CIDR,127.0.0.1/32,Socks",
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = lookup_target(&engine).await;
+    assert_eq!(res.v4, [Ipv4Addr::LOCALHOST]);
+    assert_eq!(
+        res.source,
+        Source::Upstream(format!("h3://{}/dns-query", doh3.addr()))
+    );
+    assert!(!doh3.requests().is_empty());
+    let server = Target::new(HostName::Ip(doh3.addr().ip()), doh3.addr().port());
+    let datagrams = proxy.datagrams();
+    assert!(
+        !datagrams.is_empty() && datagrams.iter().all(|to| *to == server),
+        "{datagrams:?}"
+    );
+    let carriers = carrier_sessions(&engine);
+    assert!(
+        carriers
+            .iter()
+            .any(|r| r.protocol == Some(ProtocolKind::Doq)
+                && r.rule.as_deref() == Some("IP-CIDR,127.0.0.1/32,Socks")
+                && r.policy == ["Socks"]
+                && r.dst == doh3.addr().to_string()
+                && r.up > 0
+                && r.down > 0),
+        "{carriers:?}"
+    );
+}
+
+/// `PROTOCOL,DOQ,DIRECT`: the carrier goes out through DIRECT's own UDP —
+/// with its socket settings, as a TCP DNS session goes through DIRECT's
+/// TCP — and is recorded as any internal session is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_doq_carrier_routed_to_direct_is_an_internal_udp_session() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile(&format!("quic://{}", doq.addr()), "", "PROTOCOL,DOQ,DIRECT");
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = lookup_target(&engine).await;
+    assert_eq!(
+        res.source,
+        Source::Upstream(format!("quic://{}", doq.addr()))
+    );
     assert_eq!(doq.connections(), 1);
-    assert!(!doq.queries().is_empty());
+    let carriers = carrier_sessions(&engine);
+    assert!(
+        carriers
+            .iter()
+            .any(|r| r.protocol == Some(ProtocolKind::Doq)
+                && r.rule.as_deref() == Some("PROTOCOL,DOQ,DIRECT")
+                && r.policy == ["DIRECT"]
+                && r.up > 0
+                && r.down > 0
+                && r.connect_ms.is_some()
+                && r.first_byte_ms.is_some()
+                && r.error.is_none()),
+        "{carriers:?}"
+    );
+}
+
+/// A rule that rejects the carrier would cost the resolver its server: the
+/// carrier goes directly instead, noted, as a TCP DNS session does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_doq_carrier_routed_to_reject_goes_directly() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile(&format!("quic://{}", doq.addr()), "", "PROTOCOL,DOQ,REJECT");
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = lookup_target(&engine).await;
+    assert_eq!(
+        res.source,
+        Source::Upstream(format!("quic://{}", doq.addr()))
+    );
+    assert_eq!(doq.connections(), 1);
+    let carriers = carrier_sessions(&engine);
+    assert!(
+        carriers.iter().any(|r| r.policy == ["REJECT"]
+            && r.error.as_deref() == Some("dns-follow: reject bypassed to keep DNS working")
+            && r.up > 0
+            && r.down > 0),
+        "{carriers:?}"
+    );
+}
+
+/// A proxy configured by host name would need the very lookup the carrier
+/// is for: the carrier goes directly instead, noted, and the proxy's name
+/// is never asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_doq_carrier_bypasses_a_proxy_configured_by_host_name() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    dns.set("proxy.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile(
+        &format!("quic://{}", doq.addr()),
+        "Up = socks5, proxy.test, 1080, udp-relay=true",
+        "PROTOCOL,DOQ,Up",
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = lookup_target(&engine).await;
+    assert_eq!(
+        res.source,
+        Source::Upstream(format!("quic://{}", doq.addr()))
+    );
+    let questions = dns.queries();
+    assert!(
+        questions.iter().all(|(q, _)| q.name != "proxy.test"),
+        "{questions:?}"
+    );
+    let carriers = carrier_sessions(&engine);
+    assert!(
+        carriers.iter().any(|r| r.policy == ["Up"]
+            && r.error.as_deref()
+                == Some(
+                    "dns-follow: proxy configured by host name bypassed to avoid a resolution loop"
+                )),
+        "{carriers:?}"
+    );
+}
+
+/// A proxy that carries no UDP cannot take the carrier: that server fails
+/// this time — not sent around the rule — while the resolver's other server
+/// answers (phase 2 M7 design 7.3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_doq_server_routed_to_a_proxy_without_udp_fails_while_another_answers() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let blocked = FakeDoq::spawn(&dns, DoqScript::default());
+    let open = FakeDoq::spawn(&dns, DoqScript::default());
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile(
+        &format!("quic://{}, quic://{}", blocked.addr(), open.addr()),
+        "NoUdp = http, 127.0.0.1, 9",
+        &format!("DEST-PORT,{},NoUdp", blocked.addr().port()),
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = lookup_target(&engine).await;
+    assert_eq!(
+        res.source,
+        Source::Upstream(format!("quic://{}", open.addr()))
+    );
+    let failed = wait_for_record(&engine, Duration::from_secs(5), |r| {
+        r.dst == blocked.addr().to_string() && r.status == RecordStatus::Failed
+    })
+    .await
+    .expect("the blocked server's carrier failed");
+    assert_eq!(failed.transport, Transport::Udp);
+    assert_eq!(failed.policy, ["NoUdp"]);
+    assert_eq!(failed.error.as_deref(), Some("policy does not support UDP"));
+    assert_eq!(blocked.connections(), 0);
+    assert!(blocked.queries().is_empty());
+}
+
+/// Without `encrypted-dns-follow-outbound-mode` a carrier goes straight to
+/// its server whatever the rules say: no internal session, no proxy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_follow_mode_a_doq_carrier_ignores_the_rules() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let proxy = FakeSocks5::spawn(Socks5Script::default()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile = format!(
+        "[General]\nencrypted-dns-server = quic://{}\nencrypted-dns-skip-cert-verification = true\n\
+ipv6 = false\n[Proxy]\nSocks = socks5, 127.0.0.1, {}, udp-relay=true\n[Proxy Group]\n\
+[Rule]\nPROTOCOL,DOQ,Socks\nFINAL,REJECT\n",
+        doq.addr(),
+        proxy.addr().port()
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = lookup_target(&engine).await;
+    assert_eq!(
+        res.source,
+        Source::Upstream(format!("quic://{}", doq.addr()))
+    );
+    assert_eq!(doq.connections(), 1);
+    assert!(proxy.requests().is_empty());
+    let internal = internal_sessions(&engine);
+    assert!(internal.is_empty(), "{internal:?}");
 }
 
 #[tokio::test]

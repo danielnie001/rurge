@@ -19,10 +19,11 @@ use rurge_inbound::{
     SessionHandle, SessionOutcome, Socks5Listener, UdpAdmission, UdpClient,
 };
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
+use rurge_net::connector::{BoxedDatagram, BoxedStream, ConnectOpts, Connector, Target};
+use rurge_net::packet_datagram::packet_datagram;
 use rurge_policy::auto::SelectCtx;
-use rurge_policy::{Note, PolicyRegistry, TerminalKind};
-use rurge_proto::{OutboundError, OutboundRef};
+use rurge_policy::{Note, PolicyRegistry, Resolution, TerminalKind};
+use rurge_proto::{OutboundError, OutboundRef, UdpSupport};
 use rurge_rules::{OutboundMode, Outcome};
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -696,6 +697,10 @@ fn named_server(spec: &PolicySpec) -> bool {
     }
 }
 
+/// The note on an internal DNS session that went directly instead of to a
+/// REJECT, or to a chain that ends at one.
+const REJECT_BYPASSED: &str = "dns-follow: reject bypassed to keep DNS working";
+
 /// The bypass every anti-loop arm of `dial_internal` takes (a REJECT, a
 /// proxy configured by host name, a chain that ends at REJECT): note `why`
 /// on the session, connect with `fallback`, and finish the handle explicitly
@@ -718,18 +723,74 @@ async fn bypass_to_direct(
     }
 }
 
+/// `bypass_to_direct` for the QUIC carrier of `dial_internal_udp`: the
+/// carrier is `fallback`'s.
+async fn bypass_udp_to_direct(
+    handle: Arc<SessionHandle>,
+    fallback: &Arc<dyn Connector>,
+    target: &Target,
+    opts: &ConnectOpts,
+    why: &str,
+) -> io::Result<BoxedDatagram> {
+    handle.set_error(why);
+    match fallback.connect_udp(target, opts).await {
+        Ok(datagram) => Ok(crate::dns_pipeline::wrap_internal_udp(datagram, handle)),
+        Err(e) => {
+            handle.finish(SessionOutcome::Failed(e.to_string()));
+            Err(e)
+        }
+    }
+}
+
+/// Where the routing sends an internal DNS session (`Engine::route_internal`).
+enum InternalRoute {
+    /// Through its policy.
+    Policy(Resolution),
+    /// Directly instead, for the reason noted on the session.
+    Bypass(&'static str),
+}
+
+/// What an internal DNS session tells a `smart` group of the member it went
+/// through (M3c design 4.3): that it could not connect, or — once its
+/// outbound is ready — its first byte back, or three seconds without one;
+/// a DNS session tries no other member (M3c-D5). Silence tells: a DNS
+/// server answers at once what a session sends first, a query or a QUIC
+/// handshake.
+fn report_internal(
+    registry: &PolicyRegistry,
+    resolution: &Resolution,
+    handle: &Arc<SessionHandle>,
+    connected: Result<(), &OutboundError>,
+) {
+    let Some(pick) = &resolution.smart else {
+        return;
+    };
+    let (book, now) = (&registry.auto().smart, Instant::now());
+    let host = handle.session().dst_host.to_string();
+    let outbound = &resolution.outbound;
+    match connected {
+        Ok(()) => {
+            book.used(&pick.group, &pick.member, now);
+            crate::smart::watch(handle, book.clone(), &pick.member, outbound, &host, true);
+        }
+        Err(e) if crate::smart::retryable(e) => {
+            book.report_failure(&pick.member, outbound, Some(&host), now);
+        }
+        Err(_) => {}
+    }
+}
+
 impl Engine {
-    /// Dials a DNS upstream connection through the pipeline (Internal session).
-    /// Never lets the routing break DNS: a REJECT, and a proxy that would have
-    /// to be resolved first, each warn and connect directly instead.
-    pub async fn dial_internal(
+    /// Mode / rule → policy for an internal DNS session (`dial_internal`,
+    /// `dial_internal_udp`), and the bypasses decided before anything is
+    /// dialled, each warned about.
+    async fn route_internal(
         &self,
-        session: SessionInfo,
-        fallback: &Arc<dyn Connector>,
-    ) -> io::Result<BoxedStream> {
-        let (rt, registry) = self.snapshot();
-        let handle = self.new_handle(session);
-        let policy = match self.choose_policy(&rt, &registry, &handle).await {
+        rt: &Runtime,
+        registry: &PolicyRegistry,
+        handle: &SessionHandle,
+    ) -> InternalRoute {
+        let policy = match self.choose_policy(rt, registry, handle).await {
             Chosen::Policy(p) => p,
             // An IP-literal DNS session never needs resolution; a DnsFailed here
             // would only come from a misconfigured rule → direct.
@@ -745,10 +806,6 @@ impl Engine {
         // just resolves with whatever the group already has.
         let resolution = registry.resolve_with(&policy, &ctx);
         handle.set_policy_chain(resolution.chain.clone());
-        let target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
-        let opts = ConnectOpts {
-            timeout: CONNECT_TIMEOUT,
-        };
         // Reaching a proxy that is configured by host name would need the very
         // lookup this session is carrying (M3 design §7.4), so bypass it before
         // dialling. A proxy configured by IP literal has no such loop. A chain
@@ -757,56 +814,56 @@ impl Engine {
         if resolution.terminal == TerminalKind::Proxy
             && let Some(terminal) = resolution.chain.last()
         {
-            match socket_opener(&registry, terminal) {
+            match socket_opener(registry, terminal) {
                 Some(spec) if named_server(spec) => {
                     tracing::warn!(
                         policy = %spec.name,
                         "DNS session routed to a proxy configured by host name; connecting directly to avoid a resolution loop"
                     );
-                    return bypass_to_direct(
-                        handle,
-                        fallback,
-                        &target,
-                        &opts,
+                    return InternalRoute::Bypass(
                         "dns-follow: proxy configured by host name bypassed to avoid a resolution loop",
-                    )
-                    .await;
+                    );
                 }
                 None => {
                     tracing::warn!(
                         policy = %terminal,
                         "DNS session routed to a proxy chain that ends at a reject; connecting directly to keep DNS working"
                     );
-                    return bypass_to_direct(
-                        handle,
-                        fallback,
-                        &target,
-                        &opts,
-                        "dns-follow: reject bypassed to keep DNS working",
-                    )
-                    .await;
+                    return InternalRoute::Bypass(REJECT_BYPASSED);
                 }
                 Some(_) => {}
             }
         }
-        let connected = resolution.outbound.connect_tcp(&target, &opts).await;
-        // the member of a `smart` group reports how it went (M3c design 4.3);
-        // a DNS session tries no other member (M3c-D5)
-        if let Some(pick) = &resolution.smart {
-            let (book, now) = (&registry.auto().smart, Instant::now());
-            let host = handle.session().dst_host.to_string();
-            match &connected {
-                Ok(_) => {
-                    book.used(&pick.group, &pick.member, now);
-                    let outbound = &resolution.outbound;
-                    crate::smart::watch(&handle, book.clone(), &pick.member, outbound, &host, true);
-                }
-                Err(e) if crate::smart::retryable(e) => {
-                    book.report_failure(&pick.member, &resolution.outbound, Some(&host), now);
-                }
-                Err(_) => {}
+        InternalRoute::Policy(resolution)
+    }
+
+    /// Dials a DNS upstream connection through the pipeline (Internal session).
+    /// Never lets the routing break DNS: a REJECT, and a proxy that would have
+    /// to be resolved first, each warn and connect directly instead.
+    pub async fn dial_internal(
+        &self,
+        session: SessionInfo,
+        fallback: &Arc<dyn Connector>,
+    ) -> io::Result<BoxedStream> {
+        let (rt, registry) = self.snapshot();
+        let handle = self.new_handle(session);
+        let target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
+        let opts = ConnectOpts {
+            timeout: CONNECT_TIMEOUT,
+        };
+        let resolution = match self.route_internal(&rt, &registry, &handle).await {
+            InternalRoute::Policy(resolution) => resolution,
+            InternalRoute::Bypass(why) => {
+                return bypass_to_direct(handle, fallback, &target, &opts, why).await;
             }
-        }
+        };
+        let connected = resolution.outbound.connect_tcp(&target, &opts).await;
+        report_internal(
+            &registry,
+            &resolution,
+            &handle,
+            connected.as_ref().map(|_| ()),
+        );
         match connected {
             Ok(stream) => Ok(crate::dns_pipeline::wrap_internal(stream, handle)),
             Err(OutboundError::Reject(_)) | Err(OutboundError::Unsupported(_)) => {
@@ -814,14 +871,7 @@ impl Engine {
                     dst = %target.host,
                     "DNS session routed to a reject/unsupported policy; connecting directly to keep DNS working"
                 );
-                bypass_to_direct(
-                    handle,
-                    fallback,
-                    &target,
-                    &opts,
-                    "dns-follow: reject bypassed to keep DNS working",
-                )
-                .await
+                bypass_to_direct(handle, fallback, &target, &opts, REJECT_BYPASSED).await
             }
             Err(OutboundError::Dns(m)) => {
                 handle.finish(SessionOutcome::Failed(m.clone()));
@@ -844,6 +894,70 @@ impl Engine {
                 let message = e.to_string();
                 handle.finish(SessionOutcome::Failed(message.clone()));
                 Err(io::Error::other(message))
+            }
+        }
+    }
+
+    /// Opens the QUIC carrier of a DNS server (DoQ, DoH3) through the
+    /// pipeline, as an Internal UDP session (phase 2 M7 design 7.3): the UDP
+    /// of the policy the rules pick — DIRECT's with its socket settings, as
+    /// a TCP session gets DIRECT's TCP. The routing keeps DNS working as
+    /// `dial_internal`'s does: a REJECT, and a proxy that would have to be
+    /// resolved first, each warn and go directly instead. A proxy that
+    /// carries no UDP fails the server this time, with no DIRECT in its
+    /// place: the resolver asks its other servers.
+    pub async fn dial_internal_udp(
+        &self,
+        session: SessionInfo,
+        fallback: &Arc<dyn Connector>,
+    ) -> io::Result<BoxedDatagram> {
+        let (rt, registry) = self.snapshot();
+        let handle = self.new_handle(session);
+        let target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
+        let opts = ConnectOpts {
+            timeout: CONNECT_TIMEOUT,
+        };
+        let resolution = match self.route_internal(&rt, &registry, &handle).await {
+            InternalRoute::Policy(resolution) => resolution,
+            InternalRoute::Bypass(why) => {
+                return bypass_udp_to_direct(handle, fallback, &target, &opts, why).await;
+            }
+        };
+        // a TCP session learns of a REJECT from `connect_tcp`; `open_udp`
+        // says of it only what it says of any outbound without UDP
+        if resolution.terminal == TerminalKind::Reject {
+            tracing::warn!(
+                dst = %target.host,
+                "DNS session routed to a reject/unsupported policy; connecting directly to keep DNS working"
+            );
+            return bypass_udp_to_direct(handle, fallback, &target, &opts, REJECT_BYPASSED).await;
+        }
+        // what the resolver hears names the policy: the text alone could
+        // pass for the DNS server's own (`tls: …`)
+        let policy = resolution
+            .chain
+            .last()
+            .map(String::as_str)
+            .unwrap_or_default();
+        if resolution.outbound.udp() == UdpSupport::Unsupported {
+            let why = "policy does not support UDP";
+            handle.finish(SessionOutcome::Failed(why.to_string()));
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("via {policy}: {why}"),
+            ));
+        }
+        let opened = resolution.outbound.open_udp(&opts).await;
+        report_internal(&registry, &resolution, &handle, opened.as_ref().map(|_| ()));
+        match opened {
+            // the server is an address: nothing for the carrier to look up
+            Ok(socket) => Ok(crate::dns_pipeline::wrap_internal_udp(
+                packet_datagram(socket, target),
+                handle,
+            )),
+            Err(e) => {
+                handle.finish(SessionOutcome::Failed(e.to_string()));
+                Err(io::Error::other(format!("via {policy}: {e}")))
             }
         }
     }

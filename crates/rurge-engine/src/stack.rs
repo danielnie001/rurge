@@ -22,8 +22,9 @@ pub struct StackOptions {
     pub system: Arc<dyn SystemDns>,
     /// Wait this long for the first fetch of every external resource (zero = don't wait).
     pub wait: Duration,
-    /// Connector for the resolver's TCP / DoT / DoH upstreams; `None` = plain
-    /// direct. `Runtime::build` injects the pipeline connector here when
+    /// Connector for the resolver's TCP / DoT / DoH upstreams and the QUIC
+    /// carriers of its DoQ / DoH3 ones; `None` = plain direct.
+    /// `Runtime::build` injects the pipeline connector here when
     /// `encrypted-dns-follow-outbound-mode` is on.
     pub dns_connector: Option<Arc<dyn Connector>>,
     /// Interface binding and TOS for outbound sockets (the bin injects

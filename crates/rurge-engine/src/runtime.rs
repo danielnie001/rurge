@@ -127,8 +127,9 @@ impl Runtime {
         &self.stack.diagnostics
     }
 
-    /// The connector this generation's resolver dials TCP / DoT / DoH upstreams
-    /// through, when `encrypted-dns-follow-outbound-mode` is on.
+    /// The connector this generation's resolver reaches its TCP / DoT / DoH /
+    /// DoQ / DoH3 upstreams through, when `encrypted-dns-follow-outbound-mode`
+    /// is on.
     pub fn dns_pipeline(&self) -> Option<&Arc<crate::dns_pipeline::PipelineConnector>> {
         self.dns_pipeline.as_ref()
     }
