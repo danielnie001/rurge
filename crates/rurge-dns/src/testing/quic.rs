@@ -2,9 +2,10 @@
 //! `FakeDoh3` (RFC 8484 over RFC 9114). Each answers from the table of a
 //! `MockDns` — whose queries it records there too — on a port of its own
 //! that can restart (`ServerPort`: the connections before end in a
-//! stateless reset), and records what the client sent. Its certificate is
-//! for `localhost` and `127.0.0.1`, which a resolver takes only with
-//! `encrypted-dns-skip-cert-verification`.
+//! stateless reset, or, `restart_without_resets`, are left unanswered), and
+//! records what the client sent. Its certificate is for `localhost` and
+//! `127.0.0.1` unless a script names others, which a resolver takes only
+//! with `encrypted-dns-skip-cert-verification`.
 //!
 //! - `FakeDoq` reads a query's stream to its FIN before it answers, as
 //!   dnsproxy does, and answers with the FIN after its reply.
@@ -19,6 +20,7 @@ use crate::upstream::doh::DNS_MESSAGE;
 use quinn::{Connection, Endpoint, IdleTimeout, RecvStream, SendStream, TransportConfig, VarInt};
 use rurge_net::quic::h3::testing::{H3Server, ServerStream};
 use rurge_net::quic::testing::{ServerPort, TestCert};
+use rurge_net::quic::{Transport, client_config};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -47,6 +49,13 @@ pub struct DoqScript {
     /// Close a connection that saw nothing for this long (QUIC's idle
     /// timeout): quinn's 30 seconds unless set.
     pub idle_timeout: Option<Duration>,
+    /// Read nothing of a query's stream, and let the client write only this
+    /// many bytes on it: a client with more to write waits, until it gives
+    /// up and resets the stream (`FakeDoq::resets`).
+    pub stall: Option<u32>,
+    /// Present a certificate for these names, not `localhost` and
+    /// `127.0.0.1`.
+    pub cert_names: Option<Vec<String>>,
 }
 
 /// A query, as the fake read it: everything the client sent on its stream
@@ -77,6 +86,17 @@ pub struct RecordedStop {
     pub code: u64,
 }
 
+/// A query's stream the client reset before the fake had read it all, and
+/// the code of its RESET_STREAM.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedReset {
+    /// The connection it came on, 0 for the first accepted.
+    pub connection: usize,
+    /// Its QUIC stream ID.
+    pub stream: u64,
+    pub code: u64,
+}
+
 /// A DNS over QUIC server (ALPN `doq`).
 pub struct FakeDoq {
     port: Port,
@@ -88,28 +108,45 @@ struct DoqShared {
     script: DoqScript,
     queries: Mutex<Vec<RecordedDoqQuery>>,
     stops: Mutex<Vec<RecordedStop>>,
+    resets: Mutex<Vec<RecordedReset>>,
 }
 
 impl FakeDoq {
     /// On a loopback port of its own, answering from `dns`'s table.
     pub fn spawn(dns: &MockDns, script: DoqScript) -> FakeDoq {
+        FakeDoq::spawn_at(dns, script, SocketAddr::from(([127, 0, 0, 1], 0)))
+    }
+
+    /// As `spawn`, on `addr`.
+    pub fn spawn_at(dns: &MockDns, script: DoqScript, addr: SocketAddr) -> FakeDoq {
+        let cert = script
+            .cert_names
+            .as_ref()
+            .map_or_else(TestCert::new, |names| {
+                TestCert::for_names(&names.iter().map(String::as_str).collect::<Vec<_>>())
+            });
         let fake = FakeDoq {
-            port: Port::bind("doq", script.idle_timeout, DOQ_NO_ERROR),
+            port: Port::bind(addr, cert, "doq", DOQ_NO_ERROR)
+                .idle_timeout(script.idle_timeout)
+                .stream_window(script.stall),
             shared: Arc::new(DoqShared {
                 table: dns.state.clone(),
                 script,
                 queries: Mutex::default(),
                 stops: Mutex::default(),
+                resets: Mutex::default(),
             }),
         };
-        fake.listen();
+        fake.listen(false);
         fake
     }
 
-    fn listen(&self) {
+    fn listen(&self, new_key: bool) {
         let shared = self.shared.clone();
-        self.port
-            .listen(move |connection, number| serve_doq(connection, number, shared.clone()));
+        self.port.listen(
+            move |connection, number| serve_doq(connection, number, shared.clone()),
+            new_key,
+        );
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -126,6 +163,19 @@ impl FakeDoq {
         self.shared.stops.lock().expect("stops").clone()
     }
 
+    /// The streams the client reset while the script stalled their reading.
+    pub fn resets(&self) -> Vec<RecordedReset> {
+        self.shared.resets.lock().expect("resets").clone()
+    }
+
+    /// The configuration of a client that verifies the fake's certificate:
+    /// ALPN `doq`, TLS 1.3 and `Transport::DNS`, as
+    /// `DoqUpstream::client_config` makes them with the fake's certificate
+    /// among the roots.
+    pub fn client_config(&self) -> quinn::ClientConfig {
+        self.port.client_config()
+    }
+
     /// The connections accepted so far: QUIC's handshake done.
     pub fn connections(&self) -> usize {
         self.port.connections().len()
@@ -136,11 +186,25 @@ impl FakeDoq {
         self.port.connections()[n].clone()
     }
 
+    /// Waits until the server has sent nothing for a while: what it has to
+    /// say after an answer — acknowledgements, probes — is said, and the
+    /// client that was to read it has.
+    pub async fn idle(&self) {
+        self.port.idle().await;
+    }
+
     /// A new endpoint takes the port over, as after a restart: the
     /// connections of the one before are gone, and the client learns it
     /// from a stateless reset of its next packet.
     pub fn restart(&self) {
-        self.listen();
+        self.listen(false);
+    }
+
+    /// As `restart`, of a server that lost the key of its stateless resets:
+    /// the client is not told, and the connections of the one before go on
+    /// talking to nobody.
+    pub fn restart_without_resets(&self) {
+        self.listen(true);
     }
 }
 
@@ -172,6 +236,17 @@ async fn answer_doq(
     shared: Arc<DoqShared>,
 ) {
     let stream = u64::from(recv.id());
+    if shared.script.stall.is_some() {
+        // nothing is read: the client waits on its window until it gives up
+        if let Ok(Some(code)) = recv.received_reset().await {
+            shared.resets.lock().expect("resets").push(RecordedReset {
+                connection,
+                stream,
+                code: code.into_inner(),
+            });
+        }
+        return;
+    }
     let Ok(bytes) = recv.read_to_end(MAX_QUERY).await else {
         return;
     };
@@ -220,10 +295,15 @@ pub struct Doh3Script {
     pub content_type: Option<String>,
     /// Say this `content-length` instead of the answer's.
     pub content_length: Option<u64>,
+    /// Answer with these bytes as the content instead of the table's.
+    pub reply_bytes: Option<Vec<u8>>,
     /// Send GOAWAY once a connection has taken this many requests: those
     /// run to their end; a later one on that connection is rejected
     /// (H3_REQUEST_REJECTED).
     pub goaway_after: Option<usize>,
+    /// Reject (H3_REQUEST_REJECTED) each request a connection gets once it
+    /// has taken this many, without a GOAWAY.
+    pub reject_after: Option<usize>,
     /// Close a connection that saw nothing for this long (QUIC's idle
     /// timeout): quinn's 30 seconds unless set.
     pub idle_timeout: Option<Duration>,
@@ -268,21 +348,29 @@ impl FakeDoh3 {
     /// On a loopback port of its own, answering from `dns`'s table.
     pub fn spawn(dns: &MockDns, script: Doh3Script) -> FakeDoh3 {
         let fake = FakeDoh3 {
-            port: Port::bind("h3", script.idle_timeout, H3_NO_ERROR),
+            port: Port::bind(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                TestCert::new(),
+                "h3",
+                H3_NO_ERROR,
+            )
+            .idle_timeout(script.idle_timeout),
             shared: Arc::new(Doh3Shared {
                 table: dns.state.clone(),
                 script,
                 requests: Mutex::default(),
             }),
         };
-        fake.listen();
+        fake.listen(false);
         fake
     }
 
-    fn listen(&self) {
+    fn listen(&self, new_key: bool) {
         let shared = self.shared.clone();
-        self.port
-            .listen(move |connection, number| serve_doh3(connection, number, shared.clone()));
+        self.port.listen(
+            move |connection, number| serve_doh3(connection, number, shared.clone()),
+            new_key,
+        );
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -304,17 +392,32 @@ impl FakeDoh3 {
         self.port.connections()[n].clone()
     }
 
+    /// Waits until the server has sent nothing for a while: what it has to
+    /// say after an answer — acknowledgements, probes — is said, and the
+    /// client that was to read it has.
+    pub async fn idle(&self) {
+        self.port.idle().await;
+    }
+
     /// A new endpoint takes the port over, as after a restart: the
     /// connections of the one before are gone, and the client learns it
     /// from a stateless reset of its next packet.
     pub fn restart(&self) {
-        self.listen();
+        self.listen(false);
+    }
+
+    /// As `restart`, of a server that lost the key of its stateless resets:
+    /// the client is not told, and the connections of the one before go on
+    /// talking to nobody.
+    pub fn restart_without_resets(&self) {
+        self.listen(true);
     }
 }
 
 /// One connection: HTTP/3, and each request in a task of its own, until
 /// the connection ends. Once it took `goaway_after` requests it sends
-/// GOAWAY, and rejects any request that comes after.
+/// GOAWAY, and rejects any request that comes after; `reject_after`
+/// rejects them without.
 async fn serve_doh3(connection: Connection, number: usize, shared: Arc<Doh3Shared>) {
     let Ok(mut h3) = H3Server::start(connection, &[]).await else {
         return;
@@ -327,7 +430,9 @@ async fn serve_doh3(connection: Connection, number: usize, shared: Arc<Doh3Share
         tokio::select! {
             stream = h3.accept() => match stream {
                 Some(mut stream) => {
-                    if unserved.is_some_and(|id| stream.id() >= id) {
+                    if unserved.is_some_and(|id| stream.id() >= id)
+                        || shared.script.reject_after.is_some_and(|n| taken >= n)
+                    {
                         stream.reset(H3_REQUEST_REJECTED);
                         continue;
                     }
@@ -372,6 +477,7 @@ async fn answer_doh3(
     };
     tokio::time::sleep(delay).await;
     let script = &shared.script;
+    let reply = script.reply_bytes.clone().unwrap_or(reply);
     let length = script
         .content_length
         .unwrap_or(reply.len() as u64)
@@ -388,13 +494,16 @@ async fn answer_doh3(
     Ok(())
 }
 
-/// A loopback port whose endpoints present the test certificate with one
-/// ALPN, and the connections they accepted, in order.
+/// A loopback port whose endpoints present a certificate with one ALPN, and
+/// the connections they accepted, in order.
 struct Port {
     cert: TestCert,
     port: ServerPort,
     alpn: &'static str,
     idle_timeout: Option<Duration>,
+    /// What a client may write on a stream before the server reads it:
+    /// quinn's window unless set.
+    stream_window: Option<u32>,
     /// What an endpoint closes its connections with when the fake goes.
     no_error: VarInt,
     connections: Arc<Mutex<Vec<Connection>>>,
@@ -403,30 +512,68 @@ struct Port {
 }
 
 impl Port {
-    fn bind(alpn: &'static str, idle_timeout: Option<Duration>, no_error: VarInt) -> Port {
+    fn bind(addr: SocketAddr, cert: TestCert, alpn: &'static str, no_error: VarInt) -> Port {
         Port {
-            cert: TestCert::new(),
-            port: ServerPort::bind(),
+            cert,
+            port: ServerPort::bind_at(addr),
             alpn,
-            idle_timeout,
+            idle_timeout: None,
+            stream_window: None,
             no_error,
             connections: Arc::default(),
             endpoints: Mutex::default(),
         }
     }
 
+    fn idle_timeout(mut self, idle_timeout: Option<Duration>) -> Port {
+        self.idle_timeout = idle_timeout;
+        self
+    }
+
+    fn stream_window(mut self, stream_window: Option<u32>) -> Port {
+        self.stream_window = stream_window;
+        self
+    }
+
     fn addr(&self) -> SocketAddr {
         self.port.addr()
+    }
+
+    /// A client that verifies the certificate.
+    fn client_config(&self) -> quinn::ClientConfig {
+        client_config(self.cert.client_tls(&[self.alpn]), &Transport::DNS)
+            .expect("a client configuration")
     }
 
     fn connections(&self) -> MutexGuard<'_, Vec<Connection>> {
         self.connections.lock().expect("connections")
     }
 
+    /// Waits until the connections have sent nothing for a while.
+    async fn idle(&self) {
+        let sent = || {
+            let connections = self.connections();
+            connections
+                .iter()
+                .map(|connection| connection.stats().udp_tx.datagrams)
+                .sum::<u64>()
+        };
+        let mut last = sent();
+        loop {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let now = sent();
+            if now == last {
+                return;
+            }
+            last = now;
+        }
+    }
+
     /// A new endpoint takes the port over — the one before falls silent —
     /// and serves each connection it accepts, in a task of its own, with
-    /// `serve`, given its number.
-    fn listen<F, S>(&self, serve: S)
+    /// `serve`, given its number. `new_key`: it does not have the key of
+    /// the stateless resets of the endpoints before it.
+    fn listen<F, S>(&self, serve: S, new_key: bool)
     where
         S: Fn(Connection, usize) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + Send + 'static,
@@ -437,9 +584,16 @@ impl Port {
                 IdleTimeout::try_from(idle).expect("an idle timeout QUIC can say"),
             ));
         }
+        if let Some(window) = self.stream_window {
+            transport.stream_receive_window(VarInt::from_u32(window));
+        }
         let mut config = self.cert.server_config(&[self.alpn]);
         config.transport_config(Arc::new(transport));
-        let endpoint = self.port.endpoint(config);
+        let endpoint = if new_key {
+            self.port.endpoint_with_new_key(config)
+        } else {
+            self.port.endpoint(config)
+        };
         let connections = self.connections.clone();
         let serve = Arc::new(serve);
         let accepting = tokio::spawn({

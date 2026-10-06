@@ -5,8 +5,8 @@
 
 use super::{Upstream, UpstreamError};
 use bytes::Bytes;
-use http::Request;
 use http::header::{ACCEPT, CONTENT_TYPE};
+use http::{HeaderMap, Request, StatusCode};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use rurge_net::BoxFuture;
 use rurge_net::http::{HttpClient, HttpError};
@@ -16,6 +16,45 @@ use url::Url;
 
 pub const DNS_MESSAGE: &str = "application/dns-message";
 pub const MAX_RESPONSE: usize = 65_535;
+
+/// The head of an answer to a DoH POST — over HTTP/2 or HTTP/3 — is one
+/// (RFC 8484 4.2): status 200, and a body of `application/dns-message`,
+/// whatever the case or the parameters of the type.
+pub(super) fn check_head(status: StatusCode, headers: &HeaderMap) -> Result<(), UpstreamError> {
+    if status != StatusCode::OK {
+        return Err(UpstreamError::Http(format!("status {status}")));
+    }
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !content_type.starts_with(DNS_MESSAGE) {
+        return Err(UpstreamError::BadResponse(format!(
+            "content-type `{content_type}`"
+        )));
+    }
+    Ok(())
+}
+
+/// A body of more than `MAX_RESPONSE` bytes.
+pub(super) fn too_large() -> UpstreamError {
+    UpstreamError::BadResponse(format!("response larger than {MAX_RESPONSE} bytes"))
+}
+
+/// The body of an answer is a DNS message: it has a header, and is at most
+/// `MAX_RESPONSE` bytes.
+pub(super) fn check_body(body: &[u8]) -> Result<(), UpstreamError> {
+    if body.len() > MAX_RESPONSE {
+        return Err(too_large());
+    }
+    if body.len() < 12 {
+        return Err(UpstreamError::BadResponse(
+            "response shorter than a DNS header".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 pub struct DohUpstream {
     name: String,
@@ -63,21 +102,7 @@ impl Upstream for DohUpstream {
                 HttpError::Timeout => UpstreamError::Timeout,
                 other => UpstreamError::Http(other.to_string()),
             })?;
-            let status = resp.status();
-            if status != http::StatusCode::OK {
-                return Err(UpstreamError::Http(format!("status {status}")));
-            }
-            let content_type = resp
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if !content_type.starts_with(DNS_MESSAGE) {
-                return Err(UpstreamError::BadResponse(format!(
-                    "content-type `{content_type}`"
-                )));
-            }
+            check_head(resp.status(), resp.headers())?;
             let collected = match tokio::time::timeout_at(
                 deadline,
                 Limited::new(resp.into_body(), MAX_RESPONSE).collect(),
@@ -87,7 +112,7 @@ impl Upstream for DohUpstream {
                 Ok(Ok(c)) => c,
                 Ok(Err(e)) => {
                     return Err(if e.downcast_ref::<LengthLimitError>().is_some() {
-                        UpstreamError::BadResponse("response larger than 65535 bytes".to_string())
+                        too_large()
                     } else {
                         UpstreamError::Http(e.to_string())
                     });
@@ -95,11 +120,7 @@ impl Upstream for DohUpstream {
                 Err(_) => return Err(UpstreamError::Timeout),
             };
             let mut bytes = collected.to_bytes().to_vec();
-            if bytes.len() < 12 {
-                return Err(UpstreamError::BadResponse(
-                    "response shorter than a DNS header".to_string(),
-                ));
-            }
+            check_body(&bytes)?;
             bytes[0] = id[0];
             bytes[1] = id[1];
             Ok(bytes)
@@ -208,6 +229,56 @@ mod tests {
             up.query(&header_with_id(5), deadline(200)).await,
             Err(UpstreamError::Timeout)
         );
+    }
+
+    #[test]
+    fn the_head_of_an_answer_is_a_200_of_a_dns_message() {
+        let headers = |content_type: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, content_type.parse().unwrap());
+            headers
+        };
+        for content_type in [
+            "application/dns-message",
+            "application/dns-message; charset=utf-8",
+            "Application/DNS-Message",
+        ] {
+            assert_eq!(
+                check_head(StatusCode::OK, &headers(content_type)),
+                Ok(()),
+                "{content_type}"
+            );
+        }
+        assert_eq!(
+            check_head(StatusCode::NOT_FOUND, &headers("application/dns-message")),
+            Err(UpstreamError::Http("status 404 Not Found".to_string()))
+        );
+        assert_eq!(
+            check_head(StatusCode::OK, &headers("Text/HTML")),
+            Err(UpstreamError::BadResponse(
+                "content-type `text/html`".to_string()
+            ))
+        );
+        assert_eq!(
+            check_head(StatusCode::OK, &HeaderMap::new()),
+            Err(UpstreamError::BadResponse("content-type ``".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_body_of_an_answer_is_a_dns_message_of_at_most_65535_bytes() {
+        assert_eq!(check_body(&[0; 12]), Ok(()));
+        assert_eq!(check_body(&vec![0; MAX_RESPONSE]), Ok(()));
+        assert_eq!(
+            check_body(&[0; 11]),
+            Err(UpstreamError::BadResponse(
+                "response shorter than a DNS header".to_string()
+            ))
+        );
+        let too_large = Err(UpstreamError::BadResponse(
+            "response larger than 65535 bytes".to_string(),
+        ));
+        assert_eq!(check_body(&vec![0; MAX_RESPONSE + 1]), too_large);
     }
 
     #[tokio::test]

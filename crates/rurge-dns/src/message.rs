@@ -463,4 +463,25 @@ mod tests {
         assert!(padding(&doq).is_some());
         assert!(doq_query(b"nope").is_err());
     }
+
+    /// The OPT record a query had says what it said — the UDP payload
+    /// size, the DO bit, an option of another kind — through the padding.
+    #[test]
+    fn a_doq_query_keeps_what_its_opt_record_said() {
+        let mut m = Message::new(0x4242, MessageType::Query, OpCode::Query);
+        m.add_query(Query::query(fqdn("a.test").unwrap(), RecordType::A));
+        let mut edns = Edns::new();
+        edns.set_max_payload(4000);
+        edns.set_dnssec_ok(true);
+        let cookie = EdnsOption::Unknown(EdnsCode::Cookie.into(), vec![7; 8]);
+        edns.options_mut().insert(cookie.clone());
+        m.set_edns(edns);
+        let doq = doq_query(&m.to_vec().unwrap()).unwrap();
+        assert_eq!(doq.len() % 128, 0);
+        let edns = Message::from_vec(&doq).unwrap().edns.unwrap();
+        assert_eq!(edns.max_payload(), 4000);
+        assert!(edns.flags().dnssec_ok);
+        assert_eq!(edns.option(EdnsCode::Cookie), Some(&cookie));
+        assert!(padding(&doq).is_some());
+    }
 }

@@ -6,7 +6,8 @@
 mod quic;
 
 pub use quic::{
-    Doh3Script, DoqScript, FakeDoh3, FakeDoq, RecordedDoh3Request, RecordedDoqQuery, RecordedStop,
+    Doh3Script, DoqScript, FakeDoh3, FakeDoq, RecordedDoh3Request, RecordedDoqQuery, RecordedReset,
+    RecordedStop,
 };
 
 use crate::message::{Qtype, Question, Rcode, build_response, parse_query};

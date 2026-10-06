@@ -114,20 +114,40 @@ fn host_port(rest: &str, default_port: u16) -> Result<(String, u16), String> {
     Ok((host.trim_end_matches('.').to_ascii_lowercase(), port))
 }
 
+/// The refusal of a user name or a password in the upstream URL `s` —
+/// `what` is it: "a quic:// URL" —, whose scheme `rest` follows. No
+/// upstream has a place for them, and no text repeats them: this one quotes
+/// only what follows the last `@`. A user name or a password may hold any
+/// character — a `/`, `?` or `#` among them, which ends the authority
+/// early —, so the `@` is looked for in all of `rest`.
+fn userinfo_refused(s: &str, rest: &str, what: &str) -> String {
+    let quoted = match rest.rfind('@') {
+        Some(at) => format!("{}{}", &s[..s.len() - rest.len()], &rest[at + 1..]),
+        None => s.to_string(),
+    };
+    format!("`{quoted}`: {what} cannot carry a user name or a password")
+}
+
 /// An `h3://` URL — `rest` follows the scheme — as the `https` one its
 /// requests go to: no user name or password, which HTTP/3 has no place to
 /// send (RFC 9114 4.3.1), no fragment, `DEFAULT_H3_PATH` when it names no
 /// path.
 fn h3_url(s: &str, rest: &str) -> Result<Url, String> {
     let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
-    if let Some(at) = authority.rfind('@') {
-        // quoted without what it carries
-        return Err(format!(
-            "`h3://{}`: an h3:// URL cannot carry a user name or a password",
-            &rest[at + 1..]
-        ));
+    if authority.contains('@') {
+        return Err(userinfo_refused(s, rest, "an h3:// URL"));
     }
-    let mut url = Url::parse(&format!("https://{rest}")).map_err(|e| format!("`{s}`: {e}"))?;
+    let mut url = Url::parse(&format!("https://{rest}")).map_err(|e| {
+        if rest.contains('@') {
+            // a user name or a password that ended the authority early,
+            // or a path with an `@`: nothing of it is quoted
+            format!(
+                "an h3:// URL cannot carry a user name or a password, and this one does not parse ({e})"
+            )
+        } else {
+            format!("`{s}`: {e}")
+        }
+    })?;
     if url.path() == "/" {
         url.set_path(DEFAULT_H3_PATH);
     }
@@ -164,8 +184,19 @@ impl UpstreamSpec {
         if let Some(rest) = strip_prefix_ci(s, "h3://") {
             return h3_url(s, rest).map(UpstreamSpec::H3);
         }
+        // a host and a port — no `@` anywhere: a user name or a password
+        // may hold the characters that end an authority, and there is no
+        // telling where it does
         if let Some(rest) = strip_prefix_ci(s, "quic://") {
-            if rest.trim_end_matches('/').contains(['/', '?', '#']) {
+            if rest.contains('@') {
+                return Err(userinfo_refused(s, rest, "a quic:// URL"));
+            }
+            // at most the one `/` of a URL that ends there
+            if rest
+                .strip_suffix('/')
+                .unwrap_or(rest)
+                .contains(['/', '?', '#'])
+            {
                 return Err(format!(
                     "`{s}`: a quic:// URL names a host and a port, nothing else"
                 ));
@@ -174,10 +205,16 @@ impl UpstreamSpec {
             return Ok(UpstreamSpec::Quic { host, port });
         }
         if let Some(rest) = strip_prefix_ci(s, "tls://") {
+            if rest.contains('@') {
+                return Err(userinfo_refused(s, rest, "a tls:// URL"));
+            }
             let (host, port) = host_port(rest, 853).map_err(|e| format!("`{s}`: {e}"))?;
             return Ok(UpstreamSpec::Tls { host, port });
         }
         if let Some(rest) = strip_prefix_ci(s, "tcp://") {
+            if rest.contains('@') {
+                return Err(userinfo_refused(s, rest, "a tcp:// URL"));
+            }
             let (host, port) = host_port(rest, 53).map_err(|e| format!("`{s}`: {e}"))?;
             return Ok(UpstreamSpec::Tcp { host, port });
         }
@@ -393,6 +430,7 @@ mod tests {
         for url in [
             "quic://dns.example.com/dns-query",
             "quic://dns.example.com:853/x/",
+            "quic://dns.example.com//",
             "quic://dns.example.com?x=1",
             "quic://",
             "quic://dns.example.com:99999",
@@ -438,6 +476,72 @@ mod tests {
         );
         assert!(UpstreamSpec::parse("h3://user@dns.example.com").is_err());
         assert!(UpstreamSpec::parse("h3://").is_err());
+    }
+
+    /// No upstream URL has a place for a user name or a password, and no
+    /// text says one: not the error, which quotes only what follows the
+    /// last `@` — a `/`, `?` or `#` in a password ends the authority early,
+    /// and the `@` is looked for beyond it —, nor an upstream's name.
+    #[test]
+    fn a_user_name_or_a_password_is_refused_and_never_quoted() {
+        let secrets = ["alice", "hunter2", "hun/ter2", "hun?ter2", "hun#ter2"];
+        for password in ["hunter2", "hun/ter2", "hun?ter2", "hun#ter2"] {
+            for (scheme, server) in [
+                ("quic", "dns.example"),
+                ("quic", "dns.example:853"),
+                ("QUIC", "dns.example/"),
+                ("tls", "dns.example"),
+                ("tls", "dns.example:8853"),
+                ("tcp", "[::1]:53"),
+                ("h3", "dns.example"),
+                ("h3", "dns.example/dns-query"),
+                ("H3", "dns.example:8443"),
+            ] {
+                for userinfo in [format!("alice:{password}"), "alice".to_string()] {
+                    let url = format!("{scheme}://{userinfo}@{server}");
+                    let err = UpstreamSpec::parse(&url).unwrap_err();
+                    assert!(
+                        err.contains("cannot carry a user name or a password"),
+                        "{url}: {err}"
+                    );
+                    for secret in secrets {
+                        assert!(!err.contains(secret), "{url}: {err}");
+                    }
+                }
+            }
+        }
+        // what follows the last `@` is quoted, the scheme as written
+        for (url, error) in [
+            (
+                "quic://user:pass@dns.example:853",
+                "`quic://dns.example:853`: a quic:// URL cannot carry a user name or a password",
+            ),
+            (
+                "TLS://user:p/ss@dns.example",
+                "`TLS://dns.example`: a tls:// URL cannot carry a user name or a password",
+            ),
+            (
+                "tcp://user:pass@dns.example",
+                "`tcp://dns.example`: a tcp:// URL cannot carry a user name or a password",
+            ),
+        ] {
+            assert_eq!(UpstreamSpec::parse(url).unwrap_err(), error);
+        }
+    }
+
+    /// An `@` in the path of an `h3://` URL is no user name's. A URL that
+    /// has one and does not parse might be a password with a `/` in it —
+    /// the authority ends there —, and none of it is quoted.
+    #[test]
+    fn an_at_sign_in_an_h3_path_is_no_user_name() {
+        match UpstreamSpec::parse("h3://dns.example/@doh/dns-query").unwrap() {
+            UpstreamSpec::H3(url) => assert_eq!(url.as_str(), "https://dns.example/@doh/dns-query"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            UpstreamSpec::parse("h3://user:p/ss@dns.example").unwrap_err(),
+            "an h3:// URL cannot carry a user name or a password, and this one does not parse (invalid port number)"
+        );
     }
 
     #[test]

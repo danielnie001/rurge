@@ -14,7 +14,7 @@
 //!   stops its stream with DOQ_REQUEST_CANCELLED, and resets the sending
 //!   side unless the FIN went out (4.3.1).
 
-use super::session::{self, Conn, Dialer, Failure, Protocol, Session};
+use super::session::{self, Conn, Dialer, Failure, Progress, Protocol, Session};
 use super::tcp::MAX_MESSAGE;
 use super::{Upstream, UpstreamError};
 use crate::bootstrap::Bootstrap;
@@ -106,7 +106,9 @@ impl Upstream for DoqUpstream {
             framed.extend_from_slice(&message);
             let mut reply = self
                 .session
-                .query(deadline, |conn| Box::pin(exchange(conn, &framed)))
+                .query(deadline, |conn, progress| {
+                    Box::pin(exchange(conn, progress, &framed))
+                })
                 .await?;
             reply[..2].copy_from_slice(&id.to_be_bytes());
             Ok(reply)
@@ -116,7 +118,11 @@ impl Upstream for DoqUpstream {
 
 /// One query on a stream of its own: `framed` out and the FIN, then the
 /// reply — its message.
-async fn exchange(conn: Arc<Conn<()>>, framed: &[u8]) -> Result<Vec<u8>, Failure> {
+async fn exchange(
+    conn: Arc<Conn<()>>,
+    progress: Progress,
+    framed: &[u8],
+) -> Result<Vec<u8>, Failure> {
     let (send, recv) = conn.quic.open_bi().await.map_err(|e| Failure::lost(&e))?;
     let mut stream = QueryStream {
         send,
@@ -125,6 +131,7 @@ async fn exchange(conn: Arc<Conn<()>>, framed: &[u8]) -> Result<Vec<u8>, Failure
         read: false,
     };
     stream.send.write_all(framed).await.map_err(write_failure)?;
+    progress.written(&conn.quic);
     // fails only for a stream finished or reset before, which this is not
     let _ = stream.send.finish();
     stream.finished = true;
@@ -237,7 +244,7 @@ mod tests {
     use super::*;
     use crate::fanout::FanoutOpts;
     use crate::message::{Answer, Qtype, Question, build_query, parse_query, parse_response};
-    use crate::testing::{DoqScript, FakeDoq, MockDns, RecordedStop};
+    use crate::testing::{DoqScript, FakeDoq, MockDns, RecordedReset, RecordedStop};
     use crate::upstream::udp::UdpUpstream;
     use quinn::ConnectionError;
     use rurge_config::HostName;
@@ -460,7 +467,8 @@ mod tests {
     }
 
     /// A query given up on — its deadline passed — stops its stream with
-    /// DOQ_REQUEST_CANCELLED; the FIN went out before.
+    /// DOQ_REQUEST_CANCELLED; the FIN went out before. Its connection, which
+    /// answered before and acknowledged the query, carries the next query.
     #[tokio::test]
     async fn a_query_given_up_on_stops_its_stream() {
         let dns = MockDns::spawn().await;
@@ -483,6 +491,94 @@ mod tests {
                 }]
         })
         .await;
+        dns.set_drop_all(false);
+        ask(&up, 3, "a.test").await.unwrap();
+        assert_eq!(fake.connections(), 1);
+        assert_eq!(streams(&fake), [(0, 0), (0, 4), (0, 8)]);
+    }
+
+    /// A query given up on before its FIN went out — a window too small
+    /// for it keeps the client writing — resets the sending side of its
+    /// stream with DOQ_REQUEST_CANCELLED as well (RFC 9250 4.3.1).
+    #[tokio::test]
+    async fn a_query_given_up_on_before_its_fin_resets_its_stream() {
+        let dns = MockDns::spawn().await;
+        let fake = FakeDoq::spawn(
+            &dns,
+            DoqScript {
+                stall: Some(16),
+                ..DoqScript::default()
+            },
+        );
+        let up = upstream(&fake, true);
+        let deadline = Instant::now() + Duration::from_millis(300);
+        assert_eq!(
+            up.query(&query(1, "a.test", Qtype::A), deadline).await,
+            Err(UpstreamError::Timeout)
+        );
+        eventually(|| {
+            fake.resets()
+                == [RecordedReset {
+                    connection: 0,
+                    stream: 0,
+                    code: 0x3,
+                }]
+        })
+        .await;
+    }
+
+    /// A server that restarted and lost the key of its stateless resets
+    /// leaves the connection it had silent: the query that finds it so
+    /// times out, and the next one dials a new connection, instead of
+    /// waiting out the old one's idle timeout.
+    #[tokio::test]
+    async fn a_connection_gone_silent_is_replaced_by_the_next_query() {
+        let dns = MockDns::spawn().await;
+        dns.set("a.test", &["10.0.0.1"], &[], 60);
+        let fake = FakeDoq::spawn(&dns, DoqScript::default());
+        let up = upstream(&fake, true);
+        ask(&up, 1, "a.test").await.unwrap();
+        // what the server had to say after the answer is out: nothing of it
+        // is on its way to the client when the server falls silent
+        timeout(BOUND, fake.idle())
+            .await
+            .expect("idle within the bound");
+        fake.restart_without_resets();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        assert_eq!(
+            up.query(&query(2, "a.test", Qtype::A), deadline).await,
+            Err(UpstreamError::Timeout)
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let reply = up.query(&query(3, "a.test", Qtype::A), deadline).await;
+        assert_eq!(parse_response(&reply.unwrap()).unwrap().id, 3);
+        assert_eq!(fake.connections(), 2);
+        assert_eq!(streams(&fake), [(0, 0), (1, 0)]);
+    }
+
+    /// A query given up on while the server answers others — the fan-out
+    /// drops the upstreams that lost — says nothing of its connection: the
+    /// next query goes on it.
+    #[tokio::test]
+    async fn a_query_given_up_on_while_the_server_answers_others_keeps_the_connection() {
+        let dns = MockDns::spawn().await;
+        dns.set("a.test", &["10.0.0.1"], &["fd00::1"], 60);
+        let fake = FakeDoq::spawn(&dns, DoqScript::default());
+        let up = upstream(&fake, true);
+        ask(&up, 1, "a.test").await.unwrap();
+        // its AAAA goes unanswered, the A of the next is answered meanwhile
+        dns.set_drop_qtype(Qtype::Aaaa, true);
+        let wire = query(2, "a.test", Qtype::Aaaa);
+        let mut slow = Box::pin(up.query(&wire, Instant::now() + BOUND));
+        tokio::select! {
+            slow = &mut slow => panic!("answered: {slow:?}"),
+            answer = ask(&up, 3, "a.test") => assert_eq!(answer.unwrap().id, 3),
+        }
+        // long enough for a connection that took nothing to be told apart
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(slow);
+        ask(&up, 4, "a.test").await.unwrap();
+        assert_eq!(fake.connections(), 1);
     }
 
     /// A server that never answers the handshake costs the query its
@@ -630,6 +726,82 @@ mod tests {
         );
         assert_eq!(traditional.query_count("doq.test", Qtype::A), 1);
         assert_eq!(dns.query_count("a.test", Qtype::A), 2);
+    }
+
+    /// A server written as an IP address is verified by an IP name of its
+    /// certificate, not by a DNS name that spells it.
+    #[tokio::test]
+    async fn the_certificate_of_an_ip_literal_needs_an_ip_name() {
+        let dns = MockDns::spawn().await;
+        dns.set("a.test", &["10.0.0.1"], &[], 60);
+        for (names, accepted) in [(None, true), (Some(vec!["localhost".to_string()]), false)] {
+            let fake = FakeDoq::spawn(
+                &dns,
+                DoqScript {
+                    cert_names: names,
+                    ..DoqScript::default()
+                },
+            );
+            let up = DoqUpstream::new(
+                "127.0.0.1",
+                fake.addr().port(),
+                direct(),
+                no_bootstrap(),
+                fake.client_config(),
+            );
+            let answer = ask(&up, 1, "a.test").await;
+            if accepted {
+                assert_eq!(answer.unwrap().id, 1);
+            } else {
+                assert!(
+                    matches!(&answer, Err(UpstreamError::Tls(text)) if text.starts_with("invalid peer certificate")),
+                    "{answer:?}"
+                );
+            }
+        }
+    }
+
+    /// A server's addresses get the time left by turns, each its share: one
+    /// that never answers — QUIC has no refusal to fail it quickly — does
+    /// not take it all from the one after it. IPv6 where this machine has a
+    /// loopback of it.
+    #[tokio::test]
+    async fn an_address_that_never_answers_costs_its_share_of_the_time() {
+        if std::net::UdpSocket::bind("[::1]:0").is_err() {
+            return;
+        }
+        let dns = MockDns::spawn().await;
+        dns.set("a.test", &["10.0.0.1"], &[], 60);
+        // the server on `::1`, and on the same port of `127.0.0.1` a socket
+        // that nobody reads
+        let (fake, _silent) = (0..16)
+            .find_map(|_| {
+                let fake =
+                    FakeDoq::spawn_at(&dns, DoqScript::default(), "[::1]:0".parse().unwrap());
+                let silent = std::net::UdpSocket::bind(("127.0.0.1", fake.addr().port())).ok()?;
+                Some((fake, silent))
+            })
+            .expect("a port free on both loopbacks");
+        let traditional = MockDns::spawn().await;
+        traditional.set("doq.test", &["127.0.0.1"], &["::1"], 60);
+        let bootstrap = Bootstrap::new(
+            vec![Arc::new(UdpUpstream::new(traditional.addr()))],
+            true,
+            FanoutOpts::default(),
+        );
+        let up = DoqUpstream::new(
+            "doq.test",
+            fake.addr().port(),
+            direct(),
+            bootstrap,
+            DoqUpstream::client_config(true).unwrap(),
+        );
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(3);
+        let reply = up.query(&query(1, "a.test", Qtype::A), deadline).await;
+        assert_eq!(parse_response(&reply.unwrap()).unwrap().id, 1);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(fake.connections(), 1);
     }
 
     #[test]

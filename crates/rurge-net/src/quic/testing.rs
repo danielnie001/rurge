@@ -21,7 +21,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
-/// A self-signed certificate for `localhost` and `127.0.0.1`.
+/// A self-signed certificate: for `localhost` and `127.0.0.1` unless it is
+/// made for other names.
 pub struct TestCert {
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
@@ -35,11 +36,18 @@ impl Default for TestCert {
 
 impl TestCert {
     pub fn new() -> TestCert {
-        let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![
-            "localhost".to_string(),
-            "127.0.0.1".to_string(),
-        ])
-        .expect("a self-signed certificate");
+        TestCert::for_names(&["localhost", "127.0.0.1"])
+    }
+
+    /// A self-signed certificate for `names`: a name that is an IP address
+    /// gets an IP SAN, any other a DNS one.
+    pub fn for_names(names: &[&str]) -> TestCert {
+        let names = names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(names).expect("a self-signed certificate");
         TestCert {
             cert: cert.der().clone(),
             key: signing_key.into(),
@@ -96,7 +104,12 @@ pub fn endpoint(config: ServerConfig, socket: Arc<dyn AsyncUdpSocket>) -> Endpoi
 
 /// A UDP socket on `127.0.0.1`, any port, that quinn-udp drives.
 pub fn loopback_socket() -> Arc<dyn AsyncUdpSocket> {
-    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("a loopback socket");
+    socket_at(SocketAddr::from(([127, 0, 0, 1], 0)))
+}
+
+/// A UDP socket on `addr` that quinn-udp drives.
+pub fn socket_at(addr: SocketAddr) -> Arc<dyn AsyncUdpSocket> {
+    let socket = std::net::UdpSocket::bind(addr).expect("a loopback socket");
     TokioRuntime
         .wrap_udp_socket(socket)
         .expect("a quinn socket")
@@ -280,7 +293,9 @@ impl AsyncUdpSocket for MultiPort {
 /// restarted with the same configuration: a new endpoint knows none of the
 /// connections of the one before and answers their packets with a
 /// stateless reset (RFC 9000 10.3), which ends them at the client. The
-/// endpoint before hears and sends nothing any more.
+/// endpoint before hears and sends nothing any more. A restart that lost
+/// the key (`endpoint_with_new_key`) ends nothing: the connections of the
+/// endpoint before go on, unanswered.
 pub struct ServerPort {
     socket: Arc<dyn AsyncUdpSocket>,
     config: EndpointConfig,
@@ -291,11 +306,16 @@ pub struct ServerPort {
 impl ServerPort {
     /// On `127.0.0.1`, any port.
     pub fn bind() -> ServerPort {
+        ServerPort::bind_at(SocketAddr::from(([127, 0, 0, 1], 0)))
+    }
+
+    /// On `addr`.
+    pub fn bind_at(addr: SocketAddr) -> ServerPort {
         let mut config = EndpointConfig::default();
         let ids = Arc::new(AtomicU64::new(1));
         config.cid_generator(move || Box::new(SharedIds(ids.clone())));
         ServerPort {
-            socket: loopback_socket(),
+            socket: socket_at(addr),
             config,
             current: Mutex::new(None),
         }
@@ -318,6 +338,24 @@ impl ServerPort {
         config: ServerConfig,
         layer: impl FnOnce(Arc<dyn AsyncUdpSocket>) -> Arc<dyn AsyncUdpSocket>,
     ) -> Endpoint {
+        self.endpoint_with(self.config.clone(), config, layer)
+    }
+
+    /// As `endpoint`, of a server that does not have the key the stateless
+    /// resets of the endpoints before it were made with — a restart that
+    /// lost it. What it answers the packets of their connections with, no
+    /// client can tell from noise: those connections are not told that they
+    /// are gone, and go on talking to nobody until their idle timeout.
+    pub fn endpoint_with_new_key(&self, config: ServerConfig) -> Endpoint {
+        self.endpoint_with(EndpointConfig::default(), config, |socket| socket)
+    }
+
+    fn endpoint_with(
+        &self,
+        endpoint: EndpointConfig,
+        config: ServerConfig,
+        layer: impl FnOnce(Arc<dyn AsyncUdpSocket>) -> Arc<dyn AsyncUdpSocket>,
+    ) -> Endpoint {
         let gate = Arc::new(Gate {
             socket: self.socket.clone(),
             open: AtomicBool::new(true),
@@ -327,7 +365,7 @@ impl ServerPort {
             before.open.store(false, Ordering::SeqCst);
         }
         Endpoint::new_with_abstract_socket(
-            self.config.clone(),
+            endpoint,
             Some(config),
             layer(gate),
             Arc::new(TokioRuntime),

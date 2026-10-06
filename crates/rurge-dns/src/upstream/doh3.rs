@@ -9,17 +9,18 @@
 //!   — as long as its `content-length` says, which HTTP/3 checks —, and
 //!   gets the caller's ID back. No EDNS(0) padding, as DoH has none.
 //! - A GOAWAY lets the queries under way on its connection run to their
-//!   end; the next one dials. A query the server rejected for it
-//!   (H3_REQUEST_REJECTED), on a connection that was up when it came, goes
-//!   again on the new one.
+//!   end; the next one dials. A request the server rejected
+//!   (H3_REQUEST_REJECTED: nothing of it was processed, RFC 9114 4.1.1),
+//!   after a GOAWAY or without, on a connection that was up when its query
+//!   came, goes again on a new one.
 
-use super::doh::{DNS_MESSAGE, MAX_RESPONSE};
-use super::session::{self, Conn, Dialer, Failure, Protocol, Session, transport_error};
+use super::doh::{DNS_MESSAGE, MAX_RESPONSE, check_body, check_head};
+use super::session::{self, Conn, Dialer, Failure, Progress, Protocol, Session, transport_error};
 use super::{Upstream, UpstreamError};
 use crate::bootstrap::Bootstrap;
 use crate::message::wire_id;
+use http::Request;
 use http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE};
-use http::{Request, StatusCode};
 use quinn::{Connection, VarInt};
 use rurge_net::BoxFuture;
 use rurge_net::connector::Connector;
@@ -118,7 +119,9 @@ impl Upstream for Doh3Upstream {
             body[..2].fill(0);
             let mut reply = self
                 .session
-                .query(deadline, |conn| Box::pin(exchange(conn, &self.url, &body)))
+                .query(deadline, |conn, progress| {
+                    Box::pin(exchange(conn, progress, &self.url, &body))
+                })
                 .await?;
             reply[..2].copy_from_slice(&id.to_be_bytes());
             Ok(reply)
@@ -139,56 +142,39 @@ fn request(url: &Url, len: usize) -> Result<Request<()>, UpstreamError> {
 
 /// One query: the POST of `body` to `url` on a stream of its own, then the
 /// answer's content.
-async fn exchange(conn: Arc<Conn<h3::Client>>, url: &Url, body: &[u8]) -> Result<Vec<u8>, Failure> {
+async fn exchange(
+    conn: Arc<Conn<h3::Client>>,
+    progress: Progress,
+    url: &Url,
+    body: &[u8],
+) -> Result<Vec<u8>, Failure> {
     let request = request(url, body.len()).map_err(Failure::Failed)?;
     let failed = |e| failure(&conn, e);
     let mut stream = conn.state.request(request).await.map_err(failed)?;
     stream.write_all(body).await.map_err(failed)?;
     // the FIN, and the rest of a DATA frame begun before it
     stream.shutdown().await.map_err(failed)?;
+    progress.written(&conn.quic);
     let response = stream.response().await.map_err(failed)?;
-    let status = response.status();
-    if status != StatusCode::OK {
-        return Err(Failure::Failed(UpstreamError::Http(format!(
-            "status {status}"
-        ))));
-    }
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if !content_type.starts_with(DNS_MESSAGE) {
-        return Err(Failure::Failed(UpstreamError::BadResponse(format!(
-            "content-type `{content_type}`"
-        ))));
-    }
+    check_head(response.status(), response.headers()).map_err(Failure::Failed)?;
     let mut reply = Vec::new();
     (&mut stream)
         .take(MAX_RESPONSE as u64 + 1)
         .read_to_end(&mut reply)
         .await
         .map_err(failed)?;
-    if reply.len() > MAX_RESPONSE {
-        return Err(Failure::Failed(UpstreamError::BadResponse(
-            "response larger than 65535 bytes".to_string(),
-        )));
-    }
-    if reply.len() < 12 {
-        return Err(Failure::Failed(UpstreamError::BadResponse(
-            "response shorter than a DNS header".to_string(),
-        )));
-    }
+    check_body(&reply).map_err(Failure::Failed)?;
     Ok(reply)
 }
 
 /// How a query on `conn` failed: `Lost` when the connection ended or is
-/// going away — a request the server rejected after its GOAWAY included
-/// —, else final. The error says its layer (`h3: …`, `quic: …`).
+/// going away, or the server rejected the request — nothing of it was
+/// processed (RFC 9114 4.1.1), after a GOAWAY or without —, else final. The
+/// error says its layer (`h3: …`, `quic: …`).
 fn failure(conn: &Conn<h3::Client>, e: io::Error) -> Failure {
+    let lost = conn.quic.close_reason().is_some() || conn.state.is_going_away() || h3::rejected(&e);
     let error = transport_error(e);
-    if conn.quic.close_reason().is_some() || conn.state.is_going_away() {
+    if lost {
         Failure::Lost(error)
     } else {
         Failure::Failed(error)
@@ -401,7 +387,8 @@ mod tests {
         assert_eq!(streams(&fake), [(0, 0), (1, 0)]);
     }
 
-    /// A server that never answers costs the query its deadline.
+    /// A server that never answers costs the query its deadline. Its
+    /// connection, which acknowledged the query, carries the next one.
     #[tokio::test]
     async fn a_silent_server_is_bounded_by_the_deadline() {
         let dns = MockDns::spawn().await;
@@ -415,5 +402,174 @@ mod tests {
             up.query(&query(2, "a.test", Qtype::A), deadline).await,
             Err(UpstreamError::Timeout)
         );
+        dns.set_drop_all(false);
+        ask(&up, 3, "a.test").await.unwrap();
+        assert_eq!(fake.connections(), 1);
+        assert_eq!(streams(&fake), [(0, 0), (0, 4), (0, 8)]);
+    }
+
+    /// A server that rejects a request — nothing of it was processed (RFC
+    /// 9114 4.1.1) — without a GOAWAY: the query goes again, once, on a new
+    /// connection, and gets its answer.
+    #[tokio::test]
+    async fn a_rejected_query_goes_again_on_a_new_connection() {
+        let dns = MockDns::spawn().await;
+        dns.set("a.test", &["10.0.0.1"], &[], 60);
+        let fake = FakeDoh3::spawn(
+            &dns,
+            Doh3Script {
+                reject_after: Some(1),
+                ..Doh3Script::default()
+            },
+        );
+        let up = upstream(&fake, "");
+        ask(&up, 1, "a.test").await.unwrap();
+        assert_eq!(ask(&up, 2, "a.test").await.unwrap().id, 2);
+        assert_eq!(fake.connections(), 2);
+        assert_eq!(streams(&fake), [(0, 0), (1, 0)]);
+    }
+
+    /// On a connection dialed for it, a rejected query fails with what the
+    /// server said: a server that rejects every request is not asked
+    /// twice for one.
+    #[tokio::test]
+    async fn a_query_rejected_on_the_connection_it_dialed_fails() {
+        let dns = MockDns::spawn().await;
+        dns.set("a.test", &["10.0.0.1"], &[], 60);
+        let fake = FakeDoh3::spawn(
+            &dns,
+            Doh3Script {
+                reject_after: Some(0),
+                ..Doh3Script::default()
+            },
+        );
+        let up = upstream(&fake, "");
+        let rejected = UpstreamError::Http(
+            "h3: the server reset the stream (H3_REQUEST_REJECTED)".to_string(),
+        );
+        for id in [1, 2] {
+            assert_eq!(ask(&up, id, "a.test").await, Err(rejected.clone()));
+        }
+        // the connection that rejected one takes no other
+        assert_eq!(fake.connections(), 2);
+    }
+
+    /// An answer is a DNS message: a header at least, and at most 65535
+    /// bytes. The size is the content's, whatever its `content-length`
+    /// says: it says it right.
+    #[tokio::test]
+    async fn an_answer_too_short_or_too_long_is_refused() {
+        let dns = MockDns::spawn().await;
+        for (bytes, error) in [
+            (vec![0; 11], "response shorter than a DNS header"),
+            (vec![0; 65_536], "response larger than 65535 bytes"),
+        ] {
+            let fake = FakeDoh3::spawn(
+                &dns,
+                Doh3Script {
+                    reply_bytes: Some(bytes),
+                    ..Doh3Script::default()
+                },
+            );
+            let up = upstream(&fake, "");
+            for id in [1, 2] {
+                assert_eq!(
+                    ask(&up, id, "a.test").await,
+                    Err(UpstreamError::BadResponse(error.to_string()))
+                );
+            }
+            assert_eq!(fake.connections(), 1, "{error}");
+        }
+        // and the largest there is is an answer
+        let largest = [vec![0; 12], vec![0; 65_523]].concat();
+        let fake = FakeDoh3::spawn(
+            &dns,
+            Doh3Script {
+                reply_bytes: Some(largest.clone()),
+                ..Doh3Script::default()
+            },
+        );
+        let reply = upstream(&fake, "")
+            .query(&query(5, "a.test", Qtype::A), Instant::now() + BOUND)
+            .await
+            .unwrap();
+        assert_eq!(reply.len(), largest.len());
+        assert_eq!(&reply[..2], [0, 5]);
+    }
+
+    /// The content type may carry parameters, and is read as its media
+    /// type is: whatever its case.
+    #[tokio::test]
+    async fn a_content_type_with_parameters_is_accepted() {
+        let dns = MockDns::spawn().await;
+        dns.set("a.test", &["10.0.0.1"], &[], 60);
+        for content_type in [
+            "application/dns-message; charset=utf-8",
+            "Application/DNS-Message",
+        ] {
+            let fake = FakeDoh3::spawn(
+                &dns,
+                Doh3Script {
+                    content_type: Some(content_type.to_string()),
+                    ..Doh3Script::default()
+                },
+            );
+            let up = upstream(&fake, "");
+            assert_eq!(ask(&up, 1, "a.test").await.unwrap().id, 1, "{content_type}");
+        }
+    }
+
+    /// A server that restarted and lost the key of its stateless resets
+    /// leaves the connection it had silent: the query that finds it so
+    /// times out, and the next one dials a new connection, instead of
+    /// waiting out the old one's idle timeout.
+    #[tokio::test]
+    async fn a_connection_gone_silent_is_replaced_by_the_next_query() {
+        let dns = MockDns::spawn().await;
+        dns.set("a.test", &["10.0.0.1"], &[], 60);
+        let fake = FakeDoh3::spawn(&dns, Doh3Script::default());
+        let up = upstream(&fake, "");
+        ask(&up, 1, "a.test").await.unwrap();
+        // what the server had to say after the answer is out: nothing of it
+        // is on its way to the client when the server falls silent
+        tokio::time::timeout(BOUND, fake.idle())
+            .await
+            .expect("idle within the bound");
+        fake.restart_without_resets();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        assert_eq!(
+            up.query(&query(2, "a.test", Qtype::A), deadline).await,
+            Err(UpstreamError::Timeout)
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let reply = up.query(&query(3, "a.test", Qtype::A), deadline).await;
+        assert_eq!(parse_response(&reply.unwrap()).unwrap().id, 3);
+        assert_eq!(fake.connections(), 2);
+        assert_eq!(streams(&fake), [(0, 0), (1, 0)]);
+    }
+
+    /// A query given up on while the server answers others — the fan-out
+    /// drops the upstreams that lost — says nothing of its connection: the
+    /// next query goes on it.
+    #[tokio::test]
+    async fn a_query_given_up_on_while_the_server_answers_others_keeps_the_connection() {
+        let dns = MockDns::spawn().await;
+        dns.set("a.test", &["10.0.0.1"], &["fd00::1"], 60);
+        let fake = FakeDoh3::spawn(&dns, Doh3Script::default());
+        let up = upstream(&fake, "");
+        ask(&up, 1, "a.test").await.unwrap();
+        // its AAAA goes unanswered, the A of the next is answered meanwhile
+        dns.set_drop_qtype(Qtype::Aaaa, true);
+        let wire = query(2, "a.test", Qtype::Aaaa);
+        let mut slow = Box::pin(up.query(&wire, Instant::now() + BOUND));
+        tokio::select! {
+            slow = &mut slow => panic!("answered: {slow:?}"),
+            answer = ask(&up, 3, "a.test") => assert_eq!(answer.unwrap().id, 3),
+        }
+        // long enough for a connection that took nothing to be told apart
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(slow);
+        ask(&up, 4, "a.test").await.unwrap();
+        assert_eq!(fake.connections(), 1);
     }
 }
