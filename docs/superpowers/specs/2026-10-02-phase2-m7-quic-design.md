@@ -330,3 +330,17 @@
 4. **读完连接结束前的内容（细化第 16 节第 2 条）**：读任务在数据报与单向流两个来源中的一个结束后，继续读另一个与已在读的流，两个都结束才返回，"服务端转发过"的标记不再因两侧的先后漏标；
 5. **v4 的随机关联号在锁外抽取（细化第 16 节第 6 条）**：锁里只在撞上在用的号时再取；
 6. **放不下地址的数据报（订正 6.2 / 6.3 的文本）**：第一片放下地址之后再无余地时，两个版本都是 `tuic: the address leaves no room in a datagram`。
+
+## 18. M7c 计划期的订正
+
+写 M7c 实施计划（`docs/superpowers/plans/2026-10-06-phase2-m7c-h3-dns-plan.md`）时核对 RFC 9114 / 9220 / 9297 / 9298 / 9250 / 8484 与 draft-ietf-httpbis-connect-tcp-14 的原文、Surge 手册与发布说明（2026-10-06 查阅）、masque-server v0.13.0、TrustTunnel endpoint v1.1.0、quic-go/masque-go、sing-box、AdGuard dnsproxy、hickory-dns 与 CoreDNS 的源码与文档、本机的 quinn / rustls / hickory-proto 源码与本仓库源码后，与上文不一致或上文没写到的，以本节为准（括号里是计划「计划期决定」的编号）。
+
+1. **`masque` 的配置（细化 7.1）**：只写一个凭据是 `E0018` "`password` is required with `username`"（反之同理），写了但为空是 "`x` is empty"；`udp-relay`、`tfo` 是 `W0028`，手册没列的 `headers`、`max-streams` 是 `W0001`（P1）。
+2. **`trust-tunnel` 的 `h3=true`（细化 7.2）**：ALPN 按传输钉住（没有 `h3` 是 `h2`、有 `h3` 是 `h3`）；`h3=true` 时 `ecn` 生效、`tfo` 是 `W0028`；`port-hopping` 在任何 `trust-tunnel` 行上是 `W0028`；Shadow TLS × `h3=true` 是 `E0018`（P2）。
+3. **HTTP/3 客户端（细化第 4 节）**：两种构造——`Client::new` 照旧不宣告 `H3_DATAGRAM`（Hysteria 2 用，Surge 6.9.1 修过这一协商干扰 Hysteria UDP 的问题），`Client::with_datagrams` 宣告并分发；扩展 CONNECT 先等服务端的 SETTINGS；没登记的流的数据报静默丢弃、服务端宣告了 `H3_DATAGRAM` 而 QUIC 层没有数据报时只是不可用（两处都比 RFC 宽松）；一条流的数据报随它任一方向的结束而结束；`content-length` 的核对不计 HEAD / 204 / 304，CONNECT 的 2xx 忽略它，非 2xx 的 CONNECT 应答是普通应答（P4–P7）。
+4. **MASQUE 的 TCP（细化 7.1）**：认证字段取 `proxy-authorization`（手册没写字段名）；应答到达之前按连接的状态判 `Lost`，GOAWAY 之后被拒的请求因此在新连接上重试；服务端的流额满时等流释放而不另拨连接（P8）。
+5. **MASQUE 的 UDP（订正 7.1）**：放不下的负载被拒（`masque: a datagram longer than <n> bytes`）、什么也不发，**不改用 DATAGRAM capsule**（RFC 9297 §3.5、RFC 9298 §6.1；masque-server 在 HTTP/3 上不读请求流里的 capsule）；收包时两种都收；载体惰性打开，服务端能力的检查在每个目标开流时做，"不支持 CONNECT-UDP"出现在发送上；2xx 带 `content-length` / `content-type` / `transfer-encoding` 或是 204 / 205 / 206 时判为畸形（P9）。
+6. **会话的流数上限（细化 3.5）**：`Session::with_stream_cap`；`trust-tunnel` 的 HTTP/3 只数 `max-streams`、不看服务端的 QUIC 流数上限（quinn 不公开；HTTP/2 版取两者较小者——登记）（P11、P12）。
+7. **DNS（细化 7.3）**：配置键是 `encrypted-dns-skip-cert-verification`（上文写作 "-verify"）；`h3://` 没写路径或只有 `/` 时用 `/dns-query`（`https://` 不变），带 userinfo 在解析时拒绝；DoQ 的查询加 EDNS(0) 填充到 128 字节的整数倍（RFC 9250 §5.4 的 MUST），应答 ID 不为 0 等协议错误以 `DOQ_PROTOCOL_ERROR` 关连接，被放弃的查询以 `DOQ_REQUEST_CANCELLED` 停流；DNS 的 QUIC 连接不保活，空闲到期自然关闭；查询可以重问，失效连接上的查询不管数据是否已发出都在新连接上重试一次（上文第 7.3 节写的"空闲 60 秒关闭"由 QUIC 自己的空闲超时代替）（P13–P16）。
+8. **跟随出站模式（细化 7.3，V6）**：新入口 `Engine::dial_internal_udp`；DIRECT 用 DIRECT 出站自己的 UDP；不载 UDP 的代理让该上游这次失败（不改走直连）；协议标签按端口推断（443 为 DOH3，其余 DOQ）（P17）。
+9. **互操作（细化 7.4 / M7-D6）**：DNS 另加两个回环上的参照服务端——AdGuard dnsproxy v0.86.0 与 CoreDNS v1.14.7（三平台）；masque-server 只有 Linux 版；TrustTunnel 的 HTTP/3 用 `[listen_protocols.quic]` 打开（P20）。
