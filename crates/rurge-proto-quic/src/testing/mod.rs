@@ -8,7 +8,9 @@ mod hysteria2;
 mod obfs;
 mod tuic;
 
-pub use h3proxy::{FakeH3Proxy, H3ProxyScript, RecordedH3Request};
+pub use h3proxy::{
+    FakeH3Proxy, H3ProxyScript, RecordedH3Datagram, RecordedH3Request, RecordedUdpEnd,
+};
 pub use hysteria2::{
     FakeHysteria2, Hysteria2Script, RecordedAuth, RecordedTcp, RecordedUdp, UdpMessage,
 };

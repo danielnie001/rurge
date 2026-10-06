@@ -5,17 +5,15 @@
 //! target's first datagram, on the outbound's pooled connections; one that
 //! ends is opened again by the next datagram.
 
-use super::Inner;
-use super::capsule::{self, MAX_PAYLOAD};
+use super::{Inner, LABEL};
 use crate::OutboundError;
+use crate::connect_udp::{self, MAX_PAYLOAD};
 use crate::h2pool::H2Stream;
 use crate::task::AbortOnDrop;
-use rurge_config::HostName;
 use rurge_net::BoxFuture;
 use rurge_net::connector::{ConnectOpts, PacketSocket, Target};
 use std::collections::HashMap;
 use std::io;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -33,20 +31,6 @@ const INBOX: usize = 64;
 pub(super) const IDLE: Duration = Duration::from_secs(60);
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-/// The default URI template's path for `target` (RFC 9298 2, 3): an IPv6
-/// literal without brackets and with its colons percent-encoded, an IDN
-/// as its A-labels. Names and IPv4 literals hold only unreserved
-/// characters, so nothing else needs encoding. `None` for a name that
-/// cannot be sent (the alphabet of `http::wire_host`).
-pub(super) fn masque_path(target: &Target) -> Option<String> {
-    let host = match &target.host {
-        HostName::Ip(IpAddr::V6(v6)) => v6.to_string().replace(':', "%3A"),
-        HostName::Ip(ip) => ip.to_string(),
-        HostName::Domain(name) => crate::hostname::to_ascii(name)?,
-    };
-    Some(format!("/.well-known/masque/udp/{host}/{}/", target.port))
-}
 
 type Streams = std::sync::Mutex<HashMap<Target, Slot>>;
 
@@ -137,7 +121,7 @@ impl H2Udp {
             let why = 'stream: loop {
                 // a capsule is read whole: the idle clock must not cut one
                 // in two, so the read lives on while the deadline moves
-                let mut next = std::pin::pin!(capsule::read_datagram(&mut reader));
+                let mut next = std::pin::pin!(connect_udp::read_datagram(&mut reader, LABEL));
                 let read = loop {
                     let deadline = *clock.lock().expect("clock") + idle;
                     tokio::select! {
@@ -231,7 +215,7 @@ impl PacketSocket for H2Udp {
                 }
             };
             *stream.last.lock().expect("clock") = Instant::now();
-            let capsule = capsule::datagram(buf);
+            let capsule = connect_udp::datagram(buf);
             let mut writer = stream.writer.lock().await;
             if let Err(e) = writer.write_all(&capsule).await {
                 self.forget(to, &slot);
@@ -256,47 +240,5 @@ impl PacketSocket for H2Udp {
                 }
             }
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_path_carries_the_target_by_the_default_template() {
-        for (host, path) in [
-            (
-                HostName::parse("192.0.2.6"),
-                "/.well-known/masque/udp/192.0.2.6/443/",
-            ),
-            // RFC 9298 3's example
-            (
-                HostName::parse("2001:db8::42"),
-                "/.well-known/masque/udp/2001%3Adb8%3A%3A42/443/",
-            ),
-            (
-                HostName::parse("::ffff:192.0.2.6"),
-                "/.well-known/masque/udp/%3A%3Affff%3A192.0.2.6/443/",
-            ),
-            (
-                HostName::Domain("bücher.example".into()),
-                "/.well-known/masque/udp/xn--bcher-kva.example/443/",
-            ),
-            (
-                HostName::Domain("_srv.example.test".into()),
-                "/.well-known/masque/udp/_srv.example.test/443/",
-            ),
-        ] {
-            assert_eq!(
-                masque_path(&Target::new(host.clone(), 443)).as_deref(),
-                Some(path),
-                "{host:?}"
-            );
-        }
-        for name in ["x@blocked.test", "a/b.test", "a b.test", ""] {
-            let target = Target::new(HostName::Domain(name.into()), 443);
-            assert_eq!(masque_path(&target), None, "{name:?}");
-        }
     }
 }

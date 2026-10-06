@@ -1,10 +1,17 @@
-//! Capsules (RFC 9297 3.2) as CONNECT-UDP carries them over HTTP/2 (RFC
-//! 9298 5): `type (varint), length (varint), value`, back to back across
-//! the stream's DATA frames. A DATAGRAM capsule (type 0) holds a context id
-//! (a varint, 0 for a UDP payload) and the datagram. Integers are QUIC
-//! varints (RFC 9000 16), which need not be minimal.
+//! CONNECT-UDP (RFC 9298) as `h2-connect` asks for it over HTTP/2 and
+//! `masque` over HTTP/3: the request's path, by the default URI template,
+//! and the capsules of its stream (RFC 9297 3.2).
+//!
+//! - Capsules go `type (varint), length (varint), value`, back to back
+//!   across the stream's DATA frames. A DATAGRAM capsule (type 0) holds a
+//!   context id (a varint, 0 for a UDP payload) and the datagram. Integers
+//!   are QUIC varints (RFC 9000 16), which need not be minimal.
+//! - Errors name the caller (`h2-connect: …`, `masque: …`).
 
+use rurge_config::HostName;
+use rurge_net::connector::Target;
 use std::io;
+use std::net::IpAddr;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// The DATAGRAM capsule type (RFC 9297 3.5).
@@ -12,11 +19,25 @@ const DATAGRAM: u64 = 0;
 
 /// The longest UDP payload with context id 0 (RFC 9298 5): no longer one
 /// is sent, and a longer one received ends the stream.
-pub(super) const MAX_PAYLOAD: usize = 65527;
+pub const MAX_PAYLOAD: usize = 65527;
 
 /// The longest DATAGRAM capsule value read: an 8-byte context id and the
 /// longest payload. Nothing longer is buffered.
 const MAX_VALUE: u64 = 8 + MAX_PAYLOAD as u64;
+
+/// The default URI template's path for `target` (RFC 9298 2, 3): an IPv6
+/// literal without brackets and with its colons percent-encoded, an IDN
+/// as its A-labels. Names and IPv4 literals hold only unreserved
+/// characters, so nothing else needs encoding. `None` for a name that
+/// cannot be sent (the alphabet of `http::wire_host`).
+pub fn masque_path(target: &Target) -> Option<String> {
+    let host = match &target.host {
+        HostName::Ip(IpAddr::V6(v6)) => v6.to_string().replace(':', "%3A"),
+        HostName::Ip(ip) => ip.to_string(),
+        HostName::Domain(name) => crate::hostname::to_ascii(name)?,
+    };
+    Some(format!("/.well-known/masque/udp/{host}/{}/", target.port))
+}
 
 /// `value` as a minimal varint. Values from 2^62 on cannot be written; the
 /// callers write lengths of at most 64 KiB.
@@ -43,34 +64,38 @@ fn parse_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     Some((value, len))
 }
 
-fn malformed(what: &str) -> io::Error {
+fn malformed(label: &str, what: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("h2-connect: a malformed capsule ({what})"),
+        format!("{label}: a malformed capsule ({what})"),
     )
 }
 
 /// A varint from `r`; `None` at the end of the stream before its first
 /// byte (`at_start`: the end is clean there).
-async fn read_varint<R: AsyncRead + Unpin>(r: &mut R, at_start: bool) -> io::Result<Option<u64>> {
+async fn read_varint<R: AsyncRead + Unpin>(
+    r: &mut R,
+    at_start: bool,
+    label: &str,
+) -> io::Result<Option<u64>> {
     let mut bytes = [0u8; 8];
     if r.read(&mut bytes[..1]).await? == 0 {
         return if at_start {
             Ok(None)
         } else {
-            Err(malformed("truncated"))
+            Err(malformed(label, "truncated"))
         };
     }
     let len = 1usize << (bytes[0] >> 6);
     r.read_exact(&mut bytes[1..len])
         .await
-        .map_err(|_| malformed("truncated"))?;
+        .map_err(|_| malformed(label, "truncated"))?;
     Ok(parse_varint(&bytes[..len]).map(|(value, _)| value))
 }
 
 /// A DATAGRAM capsule with context id 0 carrying `payload` (at most
 /// `MAX_PAYLOAD` bytes).
-pub(super) fn datagram(payload: &[u8]) -> Vec<u8> {
+pub fn datagram(payload: &[u8]) -> Vec<u8> {
     debug_assert!(payload.len() <= MAX_PAYLOAD);
     let mut out = Vec::with_capacity(payload.len() + 5);
     put_varint(&mut out, DATAGRAM);
@@ -85,38 +110,42 @@ pub(super) fn datagram(payload: &[u8]) -> Vec<u8> {
 /// datagrams with another context id are skipped (RFC 9297 3.2, RFC 9298
 /// 4). `None` at a clean end, between two capsules. A capsule cut short,
 /// a DATAGRAM capsule without a context id, or a payload longer than
-/// `MAX_PAYLOAD` is an error (RFC 9297 3.3, RFC 9298 5): the stream is done.
-pub(super) async fn read_datagram<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
+/// `MAX_PAYLOAD` is an error (RFC 9297 3.3, RFC 9298 5), which says `label`:
+/// the stream is done.
+pub async fn read_datagram<R: AsyncRead + Unpin>(
+    r: &mut R,
+    label: &str,
+) -> io::Result<Option<Vec<u8>>> {
     loop {
-        let Some(kind) = read_varint(r, true).await? else {
+        let Some(kind) = read_varint(r, true, label).await? else {
             return Ok(None);
         };
-        let Some(len) = read_varint(r, false).await? else {
-            return Err(malformed("truncated"));
+        let Some(len) = read_varint(r, false, label).await? else {
+            return Err(malformed(label, "truncated"));
         };
         if kind != DATAGRAM {
             // dropped without being buffered
             let skipped = tokio::io::copy(&mut (&mut *r).take(len), &mut tokio::io::sink()).await?;
             if skipped != len {
-                return Err(malformed("truncated"));
+                return Err(malformed(label, "truncated"));
             }
             continue;
         }
         if len > MAX_VALUE {
-            return Err(malformed("a datagram too long"));
+            return Err(malformed(label, "a datagram too long"));
         }
         let mut value = vec![0u8; len as usize];
         r.read_exact(&mut value)
             .await
-            .map_err(|_| malformed("truncated"))?;
+            .map_err(|_| malformed(label, "truncated"))?;
         let Some((context, at)) = parse_varint(&value) else {
-            return Err(malformed("no context id"));
+            return Err(malformed(label, "no context id"));
         };
         if context != 0 {
             continue;
         }
         if value.len() - at > MAX_PAYLOAD {
-            return Err(malformed("a datagram too long"));
+            return Err(malformed(label, "a datagram too long"));
         }
         value.drain(..at);
         return Ok(Some(value));
@@ -127,12 +156,49 @@ pub(super) async fn read_datagram<R: AsyncRead + Unpin>(r: &mut R) -> io::Result
 mod tests {
     use super::*;
 
-    async fn read_all(mut bytes: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+    async fn read_all(mut bytes: &[u8], label: &str) -> io::Result<Vec<Vec<u8>>> {
         let mut got = Vec::new();
-        while let Some(payload) = read_datagram(&mut bytes).await? {
+        while let Some(payload) = read_datagram(&mut bytes, label).await? {
             got.push(payload);
         }
         Ok(got)
+    }
+
+    #[test]
+    fn the_path_carries_the_target_by_the_default_template() {
+        for (host, path) in [
+            (
+                HostName::parse("192.0.2.6"),
+                "/.well-known/masque/udp/192.0.2.6/443/",
+            ),
+            // RFC 9298 3's example
+            (
+                HostName::parse("2001:db8::42"),
+                "/.well-known/masque/udp/2001%3Adb8%3A%3A42/443/",
+            ),
+            (
+                HostName::parse("::ffff:192.0.2.6"),
+                "/.well-known/masque/udp/%3A%3Affff%3A192.0.2.6/443/",
+            ),
+            (
+                HostName::Domain("bücher.example".into()),
+                "/.well-known/masque/udp/xn--bcher-kva.example/443/",
+            ),
+            (
+                HostName::Domain("_srv.example.test".into()),
+                "/.well-known/masque/udp/_srv.example.test/443/",
+            ),
+        ] {
+            assert_eq!(
+                masque_path(&Target::new(host.clone(), 443)).as_deref(),
+                Some(path),
+                "{host:?}"
+            );
+        }
+        for name in ["x@blocked.test", "a/b.test", "a b.test", ""] {
+            let target = Target::new(HostName::Domain(name.into()), 443);
+            assert_eq!(masque_path(&target), None, "{name:?}");
+        }
     }
 
     #[test]
@@ -174,7 +240,7 @@ mod tests {
         let mut wire = datagram(b"one");
         wire.extend(datagram(b""));
         wire.extend(datagram(&vec![9u8; MAX_PAYLOAD]));
-        let got = read_all(&wire).await.unwrap();
+        let got = read_all(&wire, "h2-connect").await.unwrap();
         assert_eq!(got.len(), 3);
         assert_eq!(
             (got[0].as_slice(), got[1].as_slice()),
@@ -189,7 +255,10 @@ mod tests {
         let wire = [
             0xc0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 4, 0x40, 0, b'h', b'i',
         ];
-        assert_eq!(read_all(&wire).await.unwrap(), [b"hi".to_vec()]);
+        assert_eq!(
+            read_all(&wire, "h2-connect").await.unwrap(),
+            [b"hi".to_vec()]
+        );
     }
 
     #[tokio::test]
@@ -202,9 +271,14 @@ mod tests {
         // an unknown type with an empty value
         wire.extend([0x17, 0x00]);
         wire.extend(datagram(b"yes"));
-        assert_eq!(read_all(&wire).await.unwrap(), [b"yes".to_vec()]);
+        assert_eq!(
+            read_all(&wire, "h2-connect").await.unwrap(),
+            [b"yes".to_vec()]
+        );
     }
 
+    /// The error names the caller: the codec is `h2-connect`'s and
+    /// `masque`'s alike.
     #[tokio::test]
     async fn malformed_capsules_end_the_stream() {
         let too_long = {
@@ -229,13 +303,15 @@ mod tests {
             (too_long, "a datagram too long"),
             (over_the_bound, "a datagram too long"),
         ] {
-            let err = read_all(&wire).await.unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{wire:?}");
-            assert_eq!(
-                err.to_string(),
-                format!("h2-connect: a malformed capsule ({what})"),
-                "{wire:?}"
-            );
+            for label in ["h2-connect", "masque"] {
+                let err = read_all(&wire, label).await.unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{wire:?}");
+                assert_eq!(
+                    err.to_string(),
+                    format!("{label}: a malformed capsule ({what})"),
+                    "{wire:?}"
+                );
+            }
         }
     }
 }

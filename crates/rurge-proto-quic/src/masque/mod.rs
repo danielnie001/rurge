@@ -7,6 +7,8 @@
 //!   Surge relays TCP ("HTTP/3 CONNECT tunnels multiplexed over a single
 //!   QUIC connection"): the template-driven `connect-tcp` is still a draft,
 //!   and masque-server answers it 404.
+//! - UDP goes as CONNECT-UDP (RFC 9298), a stream of its own for each
+//!   target, the packets in HTTP/3 datagrams (`udp`).
 //! - With `username` and `password`, every request carries them as
 //!   `proxy-authorization: Basic …`, which QPACK never indexes. The manual
 //!   names no field: this is the one a proxy reads them from (RFC 9110
@@ -14,19 +16,24 @@
 //!   Nothing is authenticated per connection.
 
 mod tcp;
+mod udp;
 
-use crate::session::{Dialer, Protocol, Session};
+use crate::session::{Dialer, Failure, Lease, Protocol, Session};
+use http::StatusCode;
 use http::header::HeaderValue;
 use quinn::{Connection, VarInt};
 use rurge_config::KeystoreItem;
 use rurge_config::spec::{MasqueSpec, Tristate};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
+use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target};
 use rurge_net::quic::h3;
-use rurge_proto::http::basic_authorization;
-use rurge_proto::{BuildError, Outbound, OutboundError};
+use rurge_proto::build::tls_name;
+use rurge_proto::http::{basic_authorization, wire_host};
+use rurge_proto::{BuildError, Outbound, OutboundError, UdpSupport};
 use rustls::RootCertStore;
+use std::io;
 use std::sync::Arc;
+use udp::MasqueUdp;
 
 /// H3_NO_ERROR (RFC 9114 8.1): a connection let go of.
 const H3_NO_ERROR: VarInt = VarInt::from_u32(0x100);
@@ -34,9 +41,13 @@ const H3_NO_ERROR: VarInt = VarInt::from_u32(0x100);
 /// No `Debug`: it holds the credentials.
 pub struct MasqueOutbound {
     name: String,
-    session: Session<Http3>,
+    /// Shared with its UDP carriers, which may outlive it.
+    session: Arc<Session<Http3>>,
     /// `proxy-authorization`, marked sensitive: QPACK never indexes it.
     authorization: Option<HeaderValue>,
+    /// CONNECT-UDP's `:authority`: the server as its TLS names it, and the
+    /// policy's port.
+    udp_authority: String,
 }
 
 impl MasqueOutbound {
@@ -51,11 +62,16 @@ impl MasqueOutbound {
         roots: Arc<RootCertStore>,
         connector: Arc<dyn Connector>,
     ) -> Result<MasqueOutbound, BuildError> {
+        // CONNECT-UDP names the server itself, as its TLS does (RFC 9298
+        // 3.4, phase 2 M6 design 18)
+        let named = Target::new(tls_name(Some(&spec.tls), &server.host), server.port);
         // error texts carry no policy name: the registry's `build_one` and
         // the dry build both prefix it
         let dialer = Dialer::new(
             connector, server, &spec.tls, &spec.quic, ecn, keystore, roots,
         )?;
+        // an address, or a name TLS took: letters, digits, `-`, `_` and dots
+        let host = wire_host(&named).expect("a name TLS takes goes on the wire");
         let authorization = spec.credentials.as_ref().map(|credentials| {
             let basic =
                 basic_authorization(credentials.username.expose(), credentials.password.expose());
@@ -65,9 +81,34 @@ impl MasqueOutbound {
         });
         Ok(MasqueOutbound {
             name: name.to_string(),
-            session: Session::new(name, dialer, Http3),
+            session: Arc::new(Session::new(name, dialer, Http3)),
             authorization,
+            udp_authority: format!("{host}:{}", named.port),
         })
+    }
+}
+
+/// How a request failed before its response came: `Lost` when its
+/// connection turned out gone or going away, else final. The error says
+/// its layer (`h3: …`, `quic: …`).
+fn failure(lease: &Lease<Connected>, e: io::Error) -> Failure {
+    if lease.connection().close_reason().is_some() || lease.state().h3.is_going_away() {
+        Failure::Lost(e.into())
+    } else {
+        Failure::Failed(e.into())
+    }
+}
+
+fn proxy(text: &str) -> OutboundError {
+    OutboundError::Proxy(format!("masque: {text}"))
+}
+
+/// The proxy's refusal, a final status other than 2xx: 407 is a refused
+/// login, any other is quoted by its number.
+fn refused(status: StatusCode) -> OutboundError {
+    match status {
+        StatusCode::PROXY_AUTHENTICATION_REQUIRED => proxy("proxy authentication required"),
+        status => proxy(&format!("the proxy answered {}", status.as_u16())),
     }
 }
 
@@ -91,7 +132,8 @@ impl Protocol for Http3 {
     const NO_ERROR: VarInt = H3_NO_ERROR;
 
     /// Our SETTINGS go out, and requests may follow at once: a classic
-    /// CONNECT waits for nothing of the server's.
+    /// CONNECT waits for nothing of the server's, a CONNECT-UDP for its
+    /// SETTINGS alone (`udp`).
     fn handshake<'a>(
         &'a self,
         connection: &'a Connection,
@@ -133,6 +175,28 @@ impl Outbound for MasqueOutbound {
             }
         })
     }
+
+    /// Always (manual): UDP goes as CONNECT-UDP. A server that does not
+    /// support it fails the datagrams, not the carrier (`udp`).
+    fn udp(&self) -> UdpSupport {
+        UdpSupport::Native
+    }
+
+    /// Nothing is opened yet: each target gets its stream with its first
+    /// datagram.
+    fn open_udp<'a>(
+        &'a self,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, Result<BoxedPacketSocket, OutboundError>> {
+        let udp = MasqueUdp::new(
+            self.session.clone(),
+            self.udp_authority.clone(),
+            self.authorization.clone(),
+            opts.clone(),
+            udp::IDLE,
+        );
+        Box::pin(std::future::ready(Ok(Box::new(udp) as BoxedPacketSocket)))
+    }
 }
 
 #[cfg(test)]
@@ -156,16 +220,16 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::time::{Instant, timeout};
 
-    const BOUND: Duration = Duration::from_secs(10);
+    pub(super) const BOUND: Duration = Duration::from_secs(10);
 
     /// The user `u` with the password `p`.
-    fn users() -> Vec<(String, String)> {
+    pub(super) fn users() -> Vec<(String, String)> {
         vec![("u".to_string(), "p".to_string())]
     }
 
     /// The spec of `masque, 127.0.0.1, <port>[, <params>]`, as the
     /// configuration reads it.
-    fn spec(port: u16, params: &str) -> MasqueSpec {
+    pub(super) fn spec(port: u16, params: &str) -> MasqueSpec {
         let span = Span::new(Arc::from(Path::new("p.conf")), 1);
         let mut line = format!("masque, 127.0.0.1, {port}");
         if !params.is_empty() {
@@ -193,12 +257,12 @@ mod tests {
     }
 
     /// `masque, 127.0.0.1, <the fake's port>[, <params>]`.
-    fn outbound(fake: &FakeH3Proxy, params: &str) -> MasqueOutbound {
+    pub(super) fn outbound(fake: &FakeH3Proxy, params: &str) -> MasqueOutbound {
         let port = fake.addr().port();
         outbound_with(&spec(port, params), port, fake)
     }
 
-    fn target(addr: SocketAddr) -> Target {
+    pub(super) fn target(addr: SocketAddr) -> Target {
         Target::new(HostName::Ip(addr.ip()), addr.port())
     }
 
@@ -215,7 +279,7 @@ mod tests {
         }
     }
 
-    async fn tunnel(out: &MasqueOutbound, to: &Target) -> BoxedStream {
+    pub(super) async fn tunnel(out: &MasqueOutbound, to: &Target) -> BoxedStream {
         timeout(BOUND, out.connect_tcp(to, &ConnectOpts::default()))
             .await
             .expect("an outcome within the bound")
@@ -231,7 +295,7 @@ mod tests {
     }
 
     /// Flushed: a write may leave the rest of its DATA frame for the next.
-    async fn round_trip(stream: &mut BoxedStream, payload: &[u8]) {
+    pub(super) async fn round_trip(stream: &mut BoxedStream, payload: &[u8]) {
         stream.write_all(payload).await.unwrap();
         stream.flush().await.unwrap();
         let mut back = vec![0u8; payload.len()];
@@ -253,7 +317,7 @@ mod tests {
 
     /// Let go of by the client: closed as its session closes a connection,
     /// with H3_NO_ERROR.
-    async fn closed_by_the_client(connection: &Connection) {
+    pub(super) async fn closed_by_the_client(connection: &Connection) {
         let closed = timeout(BOUND, connection.closed()).await.expect("closed");
         assert!(
             matches!(&closed, ConnectionError::ApplicationClosed(close)

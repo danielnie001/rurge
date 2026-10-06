@@ -4,6 +4,7 @@
 mod addr;
 pub mod anytls;
 pub mod build;
+pub mod connect_udp;
 pub mod direct;
 pub mod external;
 pub mod h2connect;

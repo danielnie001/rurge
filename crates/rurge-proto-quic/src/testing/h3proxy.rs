@@ -1,8 +1,8 @@
 //! A scriptable MASQUE proxy (phase 2 M7 design 7.4): QUIC with ALPN `h3`
 //! on a loopback port of its own (`ServerPort`: it can restart) or on a
 //! socket it is given (`MultiPort` for port hopping), HTTP/3 by the server
-//! side of `rurge_net`, and every classic CONNECT relayed to its target
-//! over TCP, the half-closes too.
+//! side of `rurge_net`, every classic CONNECT relayed to its target over
+//! TCP, the half-closes too, and every CONNECT-UDP over UDP.
 //!
 //! - Its SETTINGS are masque-server's — field sections of at most 8 KiB,
 //!   extended CONNECT, HTTP Datagrams — unless the script says otherwise.
@@ -18,11 +18,19 @@
 //!   `:path`, an authority without a port — is answered 400; one with
 //!   another method or with a protocol it does not serve, 501; one whose
 //!   target it cannot reach, 502.
+//! - A CONNECT-UDP (RFC 9298) names its target in the default template's
+//!   path. As masque-server, the fake answers `200` with `capsule-protocol:
+//!   ?1` once its socket to the target is up, then relays the client's
+//!   HTTP/3 datagrams with context id 0 to the target and the target's
+//!   answers back in HTTP/3 datagrams — or, scripted so, in DATAGRAM
+//!   capsules on the stream —; it reads no capsule of the client's. It
+//!   records every datagram of the client's and how the client ended each
+//!   such stream.
 //!
 //! What the client sends is read by code that is not the client's: the
 //! field sections by the HTTP/3 server side of `rurge_net`, the tunnels'
-//! frames and the credentials by the code here. It records every request,
-//! and never resolves a name.
+//! frames, the datagrams and the credentials by the code here. It records
+//! every request, and never resolves a name.
 
 use super::ServerPort;
 use quinn::{AsyncUdpSocket, Connection, Endpoint, ServerConfig, TransportConfig, VarInt};
@@ -30,11 +38,11 @@ use rurge_net::quic::h3::testing::{H3Server, ServerStream};
 use rurge_net::quic::testing::{TestCert, endpoint};
 use rustls::RootCertStore;
 use std::io;
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -44,6 +52,10 @@ const HEADERS: u64 = 0x01;
 const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 0x06;
 const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
 const SETTINGS_H3_DATAGRAM: u64 = 0x33;
+/// The DATAGRAM capsule (RFC 9297 3.5).
+const DATAGRAM_CAPSULE: u64 = 0x00;
+/// A capsule type reserved for greasing (RFC 9297 5.4: 0x29 × N + 0x17).
+const RESERVED_CAPSULE: u64 = 0x29 * 7 + 0x17;
 /// H3_NO_ERROR: how the fake closes its connections.
 const H3_NO_ERROR: VarInt = VarInt::from_u32(0x100);
 /// H3_REQUEST_REJECTED: a request past the fake's GOAWAY, never served.
@@ -89,6 +101,19 @@ pub struct H3ProxyScript {
     /// unidirectional stream of a reserved type, and two frames of reserved
     /// types before every response head (RFC 9114 7.2.4.1, 6.2.3, 7.2.8).
     pub grease: bool,
+    /// Answer a CONNECT-UDP request with this status and these fields in
+    /// place of `200` and `capsule-protocol: ?1`, and serve it as ever.
+    pub udp_response: Option<(u16, Vec<(String, String)>)>,
+    /// End a CONNECT-UDP stream as soon as its head went out.
+    pub udp_end_at_once: bool,
+    /// Send what a CONNECT-UDP target answers in DATAGRAM capsules on the
+    /// stream rather than in HTTP/3 datagrams, each after a capsule of a
+    /// reserved type and a DATAGRAM capsule with context id 2, all of it
+    /// across two DATA frames.
+    pub udp_capsules: bool,
+    /// Follow the head of a CONNECT-UDP response with a DATAGRAM capsule
+    /// that has no room for a context id: a malformed one.
+    pub udp_bad_capsule: bool,
 }
 
 /// A request, as the fake read its head.
@@ -141,6 +166,30 @@ impl RecordedH3Request {
     }
 }
 
+/// One of the client's HTTP/3 datagrams on a CONNECT-UDP stream, as the
+/// fake read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedH3Datagram {
+    /// The connection it came on, 0 for the first accepted.
+    pub connection: usize,
+    /// The QUIC stream ID of its stream.
+    pub stream: u64,
+    pub context: u64,
+    /// The length of what follows the context id: the UDP payload.
+    pub len: usize,
+}
+
+/// How the client ended its side of a CONNECT-UDP stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedUdpEnd {
+    /// The connection it came on, 0 for the first accepted.
+    pub connection: usize,
+    /// Its QUIC stream ID.
+    pub stream: u64,
+    /// With a FIN, gracefully; else with a reset, or with the connection.
+    pub fin: bool,
+}
+
 pub struct FakeH3Proxy {
     inner: Arc<Inner>,
 }
@@ -161,6 +210,8 @@ struct Shared {
     /// The server's side of every connection accepted, in order.
     connections: Mutex<Vec<Connection>>,
     requests: Mutex<Vec<RecordedH3Request>>,
+    datagrams: Mutex<Vec<RecordedH3Datagram>>,
+    udp_ends: Mutex<Vec<RecordedUdpEnd>>,
     /// Restart once the next request came.
     restart_at_request: AtomicBool,
     /// The fake, to restart it.
@@ -236,6 +287,8 @@ impl FakeH3Proxy {
                 script,
                 connections: Mutex::default(),
                 requests: Mutex::default(),
+                datagrams: Mutex::default(),
+                udp_ends: Mutex::default(),
                 restart_at_request: AtomicBool::new(false),
                 fake: fake.clone(),
             }),
@@ -257,6 +310,32 @@ impl FakeH3Proxy {
     /// Every request it read, in arrival order.
     pub fn requests(&self) -> Vec<RecordedH3Request> {
         self.inner.shared.requests.lock().expect("requests").clone()
+    }
+
+    /// The client's datagrams on CONNECT-UDP streams, in arrival order.
+    pub fn datagrams(&self) -> Vec<RecordedH3Datagram> {
+        self.inner
+            .shared
+            .datagrams
+            .lock()
+            .expect("datagrams")
+            .clone()
+    }
+
+    /// How the client ended its side of CONNECT-UDP streams, in order.
+    pub fn udp_ends(&self) -> Vec<RecordedUdpEnd> {
+        self.inner.shared.udp_ends.lock().expect("udp ends").clone()
+    }
+
+    /// An HTTP/3 datagram of `payload` — a context id first, or whatever a
+    /// test wants — for stream `stream` of connection `n`.
+    pub fn send_datagram(&self, n: usize, stream: u64, payload: &[u8]) {
+        let mut datagram = Vec::with_capacity(8 + payload.len());
+        put_varint(&mut datagram, stream / 4);
+        datagram.extend_from_slice(payload);
+        self.connection(n)
+            .send_datagram(datagram.into())
+            .expect("the client takes datagrams");
     }
 
     /// The connections accepted so far: QUIC's handshake done.
@@ -397,7 +476,8 @@ async fn serve(connection: Connection, shared: Arc<Shared>) {
 }
 
 /// A request: read and recorded; then the fake restarts, leaves it
-/// unanswered, refuses it, or makes the tunnel to its target.
+/// unanswered, refuses it, or makes the tunnel to its target — its UDP
+/// relay for a CONNECT-UDP.
 async fn answer(
     mut stream: ServerStream,
     connection: usize,
@@ -429,13 +509,21 @@ async fn answer(
         Some(407)
     } else if script.refuse.is_some() {
         script.refuse
-    } else if request.method != "CONNECT" || request.protocol.is_some() {
+    } else if request.method != "CONNECT"
+        || request
+            .protocol
+            .as_deref()
+            .is_some_and(|protocol| protocol != "connect-udp")
+    {
         Some(501)
     } else {
         None
     };
     if let Some(status) = refusal {
         return refuse(&mut stream, status, script.grease).await;
+    }
+    if request.protocol.is_some() {
+        return connect_udp(stream, &request, &shared).await;
     }
     // never resolves: a name without `connect_to` is a dead end
     let to = script
@@ -560,6 +648,170 @@ async fn tunnel(stream: ServerStream, upstream: TcpStream) -> io::Result<()> {
     tokio::try_join!(up, down).map(|_| ())
 }
 
+/// A CONNECT-UDP request (RFC 9298), as masque-server serves one: the
+/// target in its path — a name only with `connect_to` —, a UDP socket that
+/// hears the target alone, the head once the socket is up, then the
+/// client's datagrams with context id 0 to the target and the target's
+/// answers back, until the client ends its side of the stream or the
+/// connection ends.
+async fn connect_udp(
+    mut stream: ServerStream,
+    request: &RecordedH3Request,
+    shared: &Shared,
+) -> io::Result<()> {
+    let script = &shared.script;
+    let Some((host, port)) = request.path.as_deref().and_then(masque_target) else {
+        return refuse(&mut stream, 400, script.grease).await;
+    };
+    // never resolves: a name without `connect_to` is a dead end
+    let to = script
+        .connect_to
+        .or_else(|| Some(SocketAddr::new(host.parse().ok()?, port)));
+    let socket = match to {
+        Some(to) => udp_socket(to).await.ok(),
+        None => None,
+    };
+    // a target it cannot reach, as masque-server answers it
+    let Some(socket) = socket else {
+        return refuse(&mut stream, 502, script.grease).await;
+    };
+    let (connection, id) = (request.connection, stream.id());
+    let quic = shared.connections()[connection].clone();
+    // taken before the head: whatever the client sends after it is heard
+    let mut datagrams = stream.datagrams();
+    let (status, fields) = match &script.udp_response {
+        Some((status, fields)) => (
+            *status,
+            fields
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect(),
+        ),
+        None => (200, vec![("capsule-protocol", "?1")]),
+    };
+    respond(&mut stream, status, &fields, script.grease).await?;
+    if script.udp_bad_capsule {
+        stream.send_data(&capsule(DATAGRAM_CAPSULE, b"")).await?;
+    }
+    if script.udp_end_at_once {
+        stream.finish();
+        return Ok(());
+    }
+    let (mut from_client, mut to_client) = tokio::io::split(stream);
+    let up = async {
+        while let Some(datagram) = datagrams.recv().await {
+            // the client sends none without a context id
+            let Some((context, n)) = parse_varint(&datagram) else {
+                continue;
+            };
+            shared
+                .datagrams
+                .lock()
+                .expect("datagrams")
+                .push(RecordedH3Datagram {
+                    connection,
+                    stream: id,
+                    context,
+                    len: datagram.len() - n,
+                });
+            if context == 0 {
+                let _ = socket.send(&datagram[n..]).await;
+            }
+        }
+    };
+    let down = async {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let reply = match socket.recv(&mut buf).await {
+                Ok(n) => &buf[..n],
+                // an ICMP "unreachable" for an earlier datagram (Windows)
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
+                Err(_) => return,
+            };
+            if !script.udp_capsules {
+                let mut datagram = Vec::with_capacity(16 + reply.len());
+                put_varint(&mut datagram, id / 4);
+                put_varint(&mut datagram, 0);
+                datagram.extend_from_slice(reply);
+                // what QUIC cannot take now is lost, as on any hop
+                let _ = quic.send_datagram(datagram.into());
+                continue;
+            }
+            let mut capsules = capsule(RESERVED_CAPSULE, GREASE);
+            for context in [2, 0] {
+                let mut value = vec![context];
+                value.extend_from_slice(reply);
+                capsules.extend(capsule(DATAGRAM_CAPSULE, &value));
+            }
+            // capsules run on from one DATA frame to the next (RFC 9297 3.1)
+            let (first, second) = capsules.split_at(capsules.len() / 2);
+            for part in [first, second] {
+                if to_client.write_all(&frame(DATA, part)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    };
+    let end = async {
+        // nothing comes on the stream but its end
+        let fin = loop {
+            match read_data(&mut from_client).await {
+                Ok(Some(_)) => {}
+                Ok(None) => break true,
+                Err(_) => break false,
+            }
+        };
+        shared
+            .udp_ends
+            .lock()
+            .expect("udp ends")
+            .push(RecordedUdpEnd {
+                connection,
+                stream: id,
+                fin,
+            });
+    };
+    // the socket lives as long as the stream (RFC 9298 3.1)
+    tokio::select! {
+        () = up => {}
+        () = down => {}
+        () = end => {}
+    }
+    Ok(())
+}
+
+/// The target in `/.well-known/masque/udp/{host}/{port}/`, the default
+/// template's path (RFC 9298 2): the host percent-decoded, and the port.
+fn masque_target(path: &str) -> Option<(String, u16)> {
+    let rest = path
+        .strip_prefix("/.well-known/masque/udp/")?
+        .strip_suffix('/')?;
+    let (host, port) = rest.split_once('/')?;
+    let mut decoded = Vec::new();
+    let mut bytes = host.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let hex = [bytes.next()?, bytes.next()?];
+            decoded.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+        } else {
+            decoded.push(b);
+        }
+    }
+    Some((String::from_utf8(decoded).ok()?, port.parse().ok()?))
+}
+
+/// A loopback UDP socket that sends to `to` and hears `to` alone.
+async fn udp_socket(to: SocketAddr) -> io::Result<UdpSocket> {
+    let local = if to.is_ipv4() {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
+    } else {
+        SocketAddr::from((Ipv6Addr::LOCALHOST, 0))
+    };
+    let socket = UdpSocket::bind(local).await?;
+    socket.connect(to).await?;
+    Ok(socket)
+}
+
 /// The payload of the client's next DATA frame on a tunnel, frames of
 /// unknown types passed over; `None` at the end of the stream. HEADERS —
 /// trailers — have no place there (RFC 9114 4.4).
@@ -596,6 +848,19 @@ async fn read_varint(from: &mut (impl AsyncRead + Unpin)) -> io::Result<Option<u
     Ok(Some(value))
 }
 
+/// The QUIC integer at the start of `bytes`, and its length; `None` when
+/// `bytes` ends within it.
+fn parse_varint(bytes: &[u8]) -> Option<(u64, usize)> {
+    let len = 1 << (bytes.first()? >> 6);
+    let bytes = bytes.get(..len)?;
+    let value = bytes[1..]
+        .iter()
+        .fold(u64::from(bytes[0] & 0x3f), |value, &b| {
+            value << 8 | u64::from(b)
+        });
+    Some((value, len))
+}
+
 /// `value` as a QUIC integer, as short as it goes.
 fn put_varint(out: &mut Vec<u8>, value: u64) {
     match value {
@@ -612,6 +877,12 @@ fn frame(ty: u64, payload: &[u8]) -> Vec<u8> {
     put_varint(&mut out, payload.len() as u64);
     out.extend_from_slice(payload);
     out
+}
+
+/// A capsule (RFC 9297 3.2): its type, its length and its value, as a
+/// frame goes.
+fn capsule(ty: u64, value: &[u8]) -> Vec<u8> {
+    frame(ty, value)
 }
 
 /// A unidirectional stream of a reserved type, as quiche opens one: the

@@ -106,7 +106,7 @@ pub fn shadow_tls_client(
 
 /// The name the policy's TLS knows the server by: its `sni`, else the
 /// server.
-pub(crate) fn tls_name(tls: Option<&TlsOpts>, server: &HostName) -> HostName {
+pub fn tls_name(tls: Option<&TlsOpts>, server: &HostName) -> HostName {
     match tls.map(|tls| &tls.sni) {
         Some(Sni::Name(name)) => HostName::parse(name),
         _ => server.clone(),

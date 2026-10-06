@@ -14,10 +14,10 @@
 //!   nothing of the caller's went out, and on another connection it may yet
 //!   go through (`Session::request`).
 
-use super::Connected;
+use super::{Connected, failure, proxy, refused};
 use crate::session::{Failure, Lease};
+use http::Request;
 use http::header::{HeaderValue, PROXY_AUTHORIZATION};
-use http::{Request, StatusCode};
 use rurge_net::connector::Target;
 use rurge_net::quic::h3::RequestStream;
 use rurge_proto::OutboundError;
@@ -63,29 +63,8 @@ pub(super) async fn open(lease: Lease<Connected>, request: Request<()>) -> Resul
             stream,
             _lease: lease,
         }),
-        StatusCode::PROXY_AUTHENTICATION_REQUIRED => {
-            Err(Failure::Failed(proxy("proxy authentication required")))
-        }
-        status => Err(Failure::Failed(proxy(&format!(
-            "the proxy answered {}",
-            status.as_u16()
-        )))),
+        status => Err(Failure::Failed(refused(status))),
     }
-}
-
-/// How a request failed before its response came: `Lost` when its
-/// connection turned out gone or going away, else final. The error says
-/// its layer (`h3: …`, `quic: …`).
-fn failure(lease: &Lease<Connected>, e: io::Error) -> Failure {
-    if lease.connection().close_reason().is_some() || lease.state().h3.is_going_away() {
-        Failure::Lost(e.into())
-    } else {
-        Failure::Failed(e.into())
-    }
-}
-
-fn proxy(text: &str) -> OutboundError {
-    OutboundError::Proxy(format!("masque: {text}"))
 }
 
 /// A TCP connection through the proxy: the CONNECT's stream — the bytes go

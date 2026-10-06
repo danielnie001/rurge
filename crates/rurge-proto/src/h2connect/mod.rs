@@ -14,10 +14,10 @@
 //! - With `udp-relay=true`, UDP goes as CONNECT-UDP (RFC 9298) over
 //!   extended CONNECT (RFC 8441), one stream per target (`udp`).
 
-mod capsule;
 mod udp;
 
 use crate::build::{shadow_tls_client, tls_client, tls_name};
+use crate::connect_udp::masque_path;
 use crate::h2pool::{H2Pool, H2Stream, StackDial};
 use crate::http::{basic_authorization, merge, render, wire_host};
 use crate::transport::Stack;
@@ -216,7 +216,7 @@ impl Inner {
         target: &Target,
         opts: &ConnectOpts,
     ) -> Result<H2Stream, OutboundError> {
-        let Some(path) = udp::masque_path(target) else {
+        let Some(path) = masque_path(target) else {
             return Err(unsendable(LABEL));
         };
         let mut ours = self.ours();
