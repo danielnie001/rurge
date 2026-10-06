@@ -30,12 +30,14 @@
 //!   a timer.
 //! - A connection that no request or UDP session has held (`Lease`) for
 //!   `IDLE_TIMEOUT` is closed: looked at on every request and by a reaper.
-//! - A request on a connection it took at once — one that was up when it
-//!   came —, which finds the connection gone before any of the request's
-//!   own data went out, goes again, once, on a new connection — under a
-//!   cap, on another with room if there is one — (`Session::request`): a
-//!   server that dropped the connection while it idled answers the
-//!   request's first packet with a stateless reset.
+//! - A request on a connection that was up when it came — taken at once,
+//!   or, under a cap, once a place freed up while it waited —, which finds
+//!   the connection gone before any of the request's own data went out,
+//!   goes again, once, on a connection dialed after that one: a new one,
+//!   or under a cap one with room (`Session::request`). A server that
+//!   dropped the connection while it idled answers the request's first
+//!   packet with a stateless reset, as it would on any connection dialed
+//!   before that one.
 //! - Nothing here bounds how long a request takes: the caller's
 //!   `opts.timeout` covers the dial, both handshakes and the request.
 
@@ -328,7 +330,7 @@ impl<P: Protocol> Session<P> {
     /// —, dialing one when there is none: once for all the requests that
     /// come meanwhile, or, under a cap, as often as they need.
     pub async fn lease(&self, opts: &ConnectOpts) -> Result<Lease<P::State>, OutboundError> {
-        self.take(opts).await.map(|(lease, _)| lease)
+        self.take(opts, None).await.map(|(lease, _)| lease)
     }
 
     /// Whether `lease`'s connection still takes what is new — a request, a
@@ -358,39 +360,48 @@ impl<P: Protocol> Session<P> {
 
     /// Runs `attempt` on a lease of the session's connection; what it
     /// returns may keep the lease (a stream). A request that finds a
-    /// connection it took at once gone before any of its own data went out
-    /// (`Failure::Lost`) is attempted again, once, on a new connection —
-    /// under a cap, on another with room if there is one —; on a
-    /// connection it waited for, it fails. Either way the connection found
-    /// gone takes no new requests.
+    /// connection that was up when it came gone before any of its own data
+    /// went out (`Failure::Lost`) is attempted again, once, on a connection
+    /// dialed after that one — a new one, or under a cap one with room —:
+    /// any dialed before is as stale. On a connection dialed for it, or
+    /// while it waited, it fails. Either way the connection found gone
+    /// takes no new requests.
     pub async fn request<'a, T>(
         &'a self,
         opts: &'a ConnectOpts,
         mut attempt: impl FnMut(Lease<P::State>) -> BoxFuture<'a, Result<T, Failure>>,
     ) -> Result<T, OutboundError> {
-        let (lease, taken) = self.take(opts).await?;
+        let (lease, was_up) = self.take(opts, None).await?;
         let conn = lease.conn.clone();
         let e = match attempt(lease).await {
             Err(Failure::Lost(e)) => e,
             done => return done.map_err(Failure::into_error),
         };
         self.forget(&conn);
+        let lost = conn.dialed;
         drop(conn);
-        if !taken {
+        if !was_up {
             return Err(e);
         }
         // the error says its layer (`quic: …`, or the protocol's)
         tracing::debug!("{e}; the request goes again on a new connection");
-        let (lease, _) = self.take(opts).await?;
+        let (lease, _) = self.take(opts, Some(lost)).await?;
         attempt(lease).await.map_err(Failure::into_error)
     }
 
-    /// A lease on a connection that takes requests, dialing one when there
-    /// is none; and whether the request took it at once — a connection that
-    /// was up when it came —, rather than after a dial of its own or of
-    /// others it waited for.
-    async fn take(&self, opts: &ConnectOpts) -> Result<(Lease<P::State>, bool), OutboundError> {
+    /// A lease on a connection that takes requests — `after` a dial, only
+    /// on one dialed after it (`Conn::dialed`) —, dialing one when there is
+    /// none; and whether the connection was up when the request came:
+    /// dialed before the request first looked, whether it took it at once
+    /// or once a place freed up on it while it waited.
+    async fn take(
+        &self,
+        opts: &ConnectOpts,
+        after: Option<u64>,
+    ) -> Result<(Lease<P::State>, bool), OutboundError> {
         self.reaper.get_or_init(|| spawn_reaper(&self.shared));
+        // the dials that had ended when this request first looked
+        let mut first_look = None;
         // the dials that had ended when this request last began to wait
         let mut waited_since = None;
         loop {
@@ -402,8 +413,10 @@ impl<P: Protocol> Session<P> {
             let route = self.dialer.route();
             {
                 let mut slot = self.shared.slot.lock().expect("session");
-                if let Some(lease) = self.shared.pick(&mut slot, route.as_ref(), self.cap) {
-                    return Ok((lease, waited_since.is_none()));
+                let came = *first_look.get_or_insert(slot.dials);
+                if let Some(lease) = self.shared.pick(&mut slot, route.as_ref(), self.cap, after) {
+                    let was_up = lease.conn.dialed < came;
+                    return Ok((lease, was_up));
                 }
                 if let Some(since) = waited_since
                     && slot.dialing == 0
@@ -446,11 +459,23 @@ impl<P: Protocol> Session<P> {
         let result = self.connect(opts).await;
         let lease = {
             let mut slot = self.shared.slot.lock().expect("session");
+            let dialed = slot.dials;
             slot.dials += 1;
             match result {
-                Ok(conn) => {
+                Ok((quic, state, route)) => {
                     slot.failure = None;
-                    let conn = Arc::new(conn);
+                    let conn = Arc::new(Conn {
+                        dialed,
+                        quic,
+                        state,
+                        route,
+                        rerouted: AtomicBool::new(false),
+                        usage: Mutex::new(Usage {
+                            leases: 0,
+                            idle_since: Instant::now(),
+                        }),
+                        no_error: P::NO_ERROR,
+                    });
                     let lease = conn.lease();
                     slot.conns.push(conn);
                     Ok(lease)
@@ -465,25 +490,20 @@ impl<P: Protocol> Session<P> {
         lease
     }
 
-    /// QUIC's handshake over the path to the server, then the protocol's.
-    async fn connect(&self, opts: &ConnectOpts) -> Result<Conn<P::State>, OutboundError> {
+    /// QUIC's handshake over the path to the server, then the protocol's:
+    /// the connection, what the protocol's handshake left, and where the
+    /// connector led.
+    async fn connect(
+        &self,
+        opts: &ConnectOpts,
+    ) -> Result<(Connection, P::State, Option<Route>), OutboundError> {
         // asked before the dial: should the connector lead elsewhere while
         // it goes on, the next request finds the connection off the way,
         // never the other way round
         let route = self.dialer.route();
         let quic = self.dialer.connect(opts).await?;
         match self.shared.protocol.handshake(&quic).await {
-            Ok(state) => Ok(Conn {
-                quic,
-                state,
-                route,
-                rerouted: AtomicBool::new(false),
-                usage: Mutex::new(Usage {
-                    leases: 0,
-                    idle_since: Instant::now(),
-                }),
-                no_error: P::NO_ERROR,
-            }),
+            Ok(state) => Ok((quic, state, route)),
             Err(e) => {
                 close(&quic, P::NO_ERROR);
                 Err(e)
@@ -506,21 +526,22 @@ impl<P: Protocol> Session<P> {
 
 impl<P: Protocol> Shared<P> {
     /// A lease on the connection a request goes to, when one takes it: the
-    /// oldest with room under `cap`. A connection that takes no requests —
-    /// `prune`'s, or one dialled another way than the connector leads now
-    /// (`route`) — is let go of on the way. The one place a connection is
-    /// chosen.
+    /// oldest with room under `cap` — `after` a dial, of those dialed after
+    /// it. A connection that takes no requests — `prune`'s, or one dialled
+    /// another way than the connector leads now (`route`) — is let go of on
+    /// the way. The one place a connection is chosen.
     fn pick(
         &self,
         slot: &mut Slot<P::State>,
         route: Option<&Route>,
         cap: Option<usize>,
+        after: Option<u64>,
     ) -> Option<Lease<P::State>> {
         self.prune(slot, Instant::now());
         slot.conns.retain(|conn| self.on_route(conn, route));
         slot.conns
             .iter()
-            .find(|conn| conn.has_room(cap))
+            .find(|conn| after.is_none_or(|after| conn.dialed > after) && conn.has_room(cap))
             .map(Conn::lease)
     }
 
@@ -581,6 +602,9 @@ impl<P: Protocol> Drop for Waiting<'_, P> {
 /// takes requests, each lease while the lease lives; when the last of them
 /// lets go, the connection is closed.
 struct Conn<S> {
+    /// Its place among the session's dials, by when they ended: the dials
+    /// that had ended before it did (`Slot::dials`).
+    dialed: u64,
     quic: Connection,
     state: S,
     /// Where the connector led when the connection was dialled.
@@ -708,11 +732,13 @@ mod tests {
     /// server that does not answer: it is told on `stalled` when it begins,
     /// and it ends only with its dial, when the caller gives up on that.
     /// While `held` says so, every handshake that begins waits, its dial in
-    /// flight, until it is let go.
+    /// flight, until it is let go. The handshake `refuse_at` numbers, 0 for
+    /// the first, is refused at once, held or not.
     #[derive(Default)]
     struct Plain {
         handshakes: AtomicUsize,
         refuse: AtomicBool,
+        refuse_at: Option<usize>,
         stall_first: bool,
         stalled: Notify,
         held: watch::Sender<bool>,
@@ -738,6 +764,9 @@ mod tests {
         ) -> BoxFuture<'a, Result<AtomicBool, OutboundError>> {
             Box::pin(async move {
                 let nth = self.handshakes.fetch_add(1, Ordering::SeqCst);
+                if self.refuse_at == Some(nth) {
+                    return Err(OutboundError::Proxy("plain: refused".into()));
+                }
                 if self.stall_first && nth == 0 {
                     self.stalled.notify_one();
                     std::future::pending::<()>().await;
@@ -992,6 +1021,28 @@ mod tests {
     /// `session` with each connection carrying `cap` leases at most.
     fn capped(server: &Server, protocol: Plain, cap: usize) -> Session<Plain> {
         session(server, protocol).with_stream_cap(cap)
+    }
+
+    /// A lease on a connection of `session`, within the bound.
+    async fn lease_on(session: &Session<Plain>) -> Lease<AtomicBool> {
+        timeout(BOUND, session.lease(&ConnectOpts::default()))
+            .await
+            .expect("a lease within the bound")
+            .unwrap()
+    }
+
+    /// A lease on a connection of `session`, asked for by a task of its
+    /// own.
+    fn spawn_lease(
+        session: &Arc<Session<Plain>>,
+    ) -> tokio::task::JoinHandle<Result<Lease<AtomicBool>, OutboundError>> {
+        let session = session.clone();
+        tokio::spawn(async move { session.lease(&ConnectOpts::default()).await })
+    }
+
+    /// The requests waiting for the dials in flight.
+    fn waiters(session: &Session<Plain>) -> usize {
+        session.shared.slot.lock().unwrap().waiting
     }
 
     /// The leases each connection that takes requests carries, the oldest
@@ -1563,10 +1614,9 @@ mod tests {
     async fn under_a_cap_a_place_let_go_of_is_taken_again_the_oldest_first() {
         let server = Server::spawn();
         let session = capped(&server, Plain::default(), 2);
-        let opts = ConnectOpts::default();
         let mut leases = Vec::new();
         for _ in 0..5 {
-            leases.push(session.lease(&opts).await.unwrap());
+            leases.push(lease_on(&session).await);
         }
         assert_eq!(carried(&session), [2, 2, 1]);
         assert_eq!(session.shared.protocol.handshakes(), 3);
@@ -1576,11 +1626,11 @@ mod tests {
         let oldest = leases.iter().position(|l| on(&session, l, 0)).unwrap();
         drop(leases.remove(oldest));
         assert_eq!(carried(&session), [1, 2, 0]);
-        let next = session.lease(&opts).await.unwrap();
+        let next = lease_on(&session).await;
         assert!(on(&session, &next, 0), "{:?}", carried(&session));
         leases.push(next);
         for _ in 0..2 {
-            leases.push(session.lease(&opts).await.unwrap());
+            leases.push(lease_on(&session).await);
         }
         assert_eq!(carried(&session), [2, 2, 2]);
         assert_eq!(
@@ -1589,7 +1639,7 @@ mod tests {
             "places taken again"
         );
         // every place taken: the next request dials
-        leases.push(session.lease(&opts).await.unwrap());
+        leases.push(lease_on(&session).await);
         assert_eq!(carried(&session), [2, 2, 2, 1]);
         assert_eq!(session.shared.protocol.handshakes(), 4);
     }
@@ -1669,16 +1719,24 @@ mod tests {
     async fn under_a_cap_a_connection_going_away_takes_no_new_requests() {
         let server = Server::spawn();
         let session = capped(&server, Plain::default(), 2);
-        let opts = ConnectOpts::default();
-        let lease = session.lease(&opts).await.unwrap();
-        let (mut send, mut recv) = lease.connection().open_bi().await.unwrap();
-        send.write_all(b"under ").await.unwrap();
+        let lease = lease_on(&session).await;
+        let (mut send, mut recv) = timeout(BOUND, lease.connection().open_bi())
+            .await
+            .expect("a stream within the bound")
+            .unwrap();
+        timeout(BOUND, send.write_all(b"under "))
+            .await
+            .expect("written within the bound")
+            .unwrap();
         lease.state().store(true, Ordering::SeqCst);
-        let new = session.lease(&opts).await.unwrap();
+        let new = lease_on(&session).await;
         assert_ne!(new.connection().stable_id(), lease.connection().stable_id());
         assert_eq!(carried(&session), [1]);
         assert_eq!(session.shared.protocol.handshakes(), 2);
-        send.write_all(b"way").await.unwrap();
+        timeout(BOUND, send.write_all(b"way"))
+            .await
+            .expect("written within the bound")
+            .unwrap();
         send.finish().unwrap();
         let echoed = timeout(BOUND, recv.read_to_end(64)).await.unwrap().unwrap();
         assert_eq!(echoed, b"under way");
@@ -1706,14 +1764,13 @@ mod tests {
             server.cert.roots(),
         );
         let session = Session::new("P", dialer, Plain::default()).with_stream_cap(2);
-        let opts = ConnectOpts::default();
         let mut leases = Vec::new();
         for _ in 0..3 {
-            leases.push(session.lease(&opts).await.unwrap());
+            leases.push(lease_on(&session).await);
         }
         assert_eq!(carried(&session), [2, 1]);
         *rerouted.route.lock().unwrap() = Arc::new(2);
-        leases.push(session.lease(&opts).await.unwrap());
+        leases.push(lease_on(&session).await);
         assert_eq!(carried(&session), [1]);
         assert_eq!(chain.flows.lock().unwrap().len(), 3, "dialled anew");
         assert_eq!(session.shared.protocol.handshakes(), 3);
@@ -1734,9 +1791,8 @@ mod tests {
             server.cert.roots(),
         );
         let session = Session::with_idle("P", dialer, Plain::default(), IDLE).with_stream_cap(1);
-        let opts = ConnectOpts::default();
-        let first = session.lease(&opts).await.unwrap();
-        let second = session.lease(&opts).await.unwrap();
+        let first = lease_on(&session).await;
+        let second = lease_on(&session).await;
         let accepted = server.accepted(2).await;
         for (lease, n) in [(first, 0), (second, 1)] {
             let since = Instant::now();
@@ -1753,5 +1809,168 @@ mod tests {
         assert!(carried(&session).is_empty());
         assert_eq!(echo(&session, b"again").await.unwrap(), b"again");
         assert_eq!(session.shared.protocol.handshakes(), 3);
+    }
+
+    /// Under a cap, the server restarts while a request is on the newer of
+    /// two connections, and a place frees up on the older. The request,
+    /// finding its connection gone, goes again on one dialed after it — a
+    /// new one: the older, with room again, is as stale.
+    #[tokio::test]
+    async fn under_a_cap_a_request_goes_again_on_a_connection_dialed_after_the_one_it_lost() {
+        let server = Server::spawn();
+        let session = capped(&server, Plain::default(), 1);
+        let older = lease_on(&session).await;
+        drop(lease_on(&session).await);
+        assert_eq!(carried(&session), [1, 0]);
+        let older = Mutex::new(Some(older));
+        let attempts = AtomicUsize::new(0);
+        let opts = ConnectOpts::default();
+        let request = session.request(&opts, |lease| {
+            let first = attempts.fetch_add(1, Ordering::SeqCst) == 0;
+            let (server, older) = (&server, &older);
+            Box::pin(async move {
+                if first {
+                    drop(older.lock().unwrap().take());
+                    server.restart();
+                }
+                exchange(lease, b"again").await
+            })
+        });
+        let echoed = timeout(BOUND, request)
+            .await
+            .expect("an outcome within the bound")
+            .unwrap();
+        assert_eq!(echoed, b"again");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(session.shared.protocol.handshakes(), 3);
+    }
+
+    /// Under a cap, a request that waits for a dial in flight is woken by
+    /// its end and takes the older connection, where a place freed up
+    /// meanwhile: one that was up when the request came. Found gone, it is
+    /// as stale as one taken at once: the request goes again, on the
+    /// connection the dial made.
+    #[tokio::test]
+    async fn under_a_cap_a_waiter_woken_onto_a_stale_connection_goes_again() {
+        let server = Server::spawn();
+        let session = Arc::new(capped(&server, Plain::default(), 2));
+        let freed = lease_on(&session).await;
+        let _kept = lease_on(&session).await;
+        assert_eq!(carried(&session), [2]);
+        // a dial held at its handshake: room for the request, which waits
+        session.shared.protocol.held.send_replace(true);
+        let dialing = spawn_lease(&session);
+        until(|| session.shared.protocol.handshakes() == 2).await;
+        let attempts = AtomicUsize::new(0);
+        let opts = ConnectOpts::default();
+        let request = session.request(&opts, |lease| {
+            let first = attempts.fetch_add(1, Ordering::SeqCst) == 0;
+            let server = &server;
+            Box::pin(async move {
+                if first {
+                    // the older connection goes, as one the server dropped
+                    server.accepted(1).await[0].close(VarInt::from_u32(7), b"bye");
+                }
+                exchange(lease, b"woken").await
+            })
+        });
+        let wake = async {
+            until(|| waiters(&session) == 1).await;
+            // a place frees up on the older connection; then the dial ends
+            drop(freed);
+            session.shared.protocol.held.send_replace(false);
+        };
+        let (echoed, ()) = timeout(BOUND, async { tokio::join!(request, wake) })
+            .await
+            .expect("an outcome within the bound");
+        assert_eq!(echoed.unwrap(), b"woken");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            session.shared.protocol.handshakes(),
+            2,
+            "no dial of its own"
+        );
+        timeout(BOUND, dialing)
+            .await
+            .expect("a lease within the bound")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Under a cap, a request that waits and is given up on — its future
+    /// dropped, as by its caller's timeout — counts no more: the next one
+    /// waits for the dial in flight, as it would have, rather than dialing
+    /// another.
+    #[tokio::test]
+    async fn under_a_cap_a_waiter_given_up_on_counts_no_more() {
+        let server = Server::spawn();
+        let protocol = Plain::default();
+        protocol.held.send_replace(true);
+        let session = Arc::new(capped(&server, protocol, 2));
+        // a dial held at its handshake, room for one request more
+        let dialing = spawn_lease(&session);
+        until(|| session.shared.protocol.handshakes() == 1).await;
+        let given_up = spawn_lease(&session);
+        until(|| waiters(&session) == 1).await;
+        given_up.abort();
+        let ended = timeout(BOUND, given_up)
+            .await
+            .expect("ended within the bound");
+        assert!(ended.is_err_and(|e| e.is_cancelled()));
+        assert_eq!(waiters(&session), 0);
+        let next = spawn_lease(&session);
+        until(|| waiters(&session) == 1).await;
+        // and no second dial while the first is held
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(session.shared.protocol.handshakes(), 1);
+        session.shared.protocol.held.send_replace(false);
+        let mut leases = Vec::new();
+        for lease in [dialing, next] {
+            let lease = timeout(BOUND, lease)
+                .await
+                .expect("a lease within the bound");
+            leases.push(lease.unwrap().unwrap());
+        }
+        assert_eq!(carried(&session), [2]);
+        assert_eq!(session.shared.protocol.handshakes(), 1);
+    }
+
+    /// Under a cap, a dial that fails while another is in flight fails its
+    /// own request alone: the request that waited looks again — the dial
+    /// still in flight has room for it — and takes its place on the
+    /// connection that one makes.
+    #[tokio::test]
+    async fn under_a_cap_a_dial_that_fails_while_another_is_in_flight_fails_no_waiter() {
+        let server = Server::spawn();
+        let protocol = Plain {
+            refuse_at: Some(1),
+            ..Plain::default()
+        };
+        protocol.held.send_replace(true);
+        let session = Arc::new(capped(&server, protocol, 2));
+        // the first dial held at its handshake; the request after it waits
+        let dialing = spawn_lease(&session);
+        until(|| session.shared.protocol.handshakes() == 1).await;
+        let waiter = spawn_lease(&session);
+        until(|| waiters(&session) == 1).await;
+        // a third would not fit: it dials, and its dial is refused
+        let err = timeout(BOUND, session.lease(&ConnectOpts::default()))
+            .await
+            .expect("an outcome within the bound")
+            .err()
+            .expect("refused");
+        assert_eq!(err.to_string(), "plain: refused");
+        assert_eq!(session.shared.protocol.handshakes(), 2);
+        // the first dial goes through: the request that waited has its place
+        session.shared.protocol.held.send_replace(false);
+        let mut leases = Vec::new();
+        for lease in [dialing, waiter] {
+            let lease = timeout(BOUND, lease)
+                .await
+                .expect("a lease within the bound");
+            leases.push(lease.unwrap().unwrap());
+        }
+        assert_eq!(carried(&session), [2]);
+        assert_eq!(session.shared.protocol.handshakes(), 2);
     }
 }

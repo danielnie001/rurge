@@ -28,7 +28,7 @@ use super::qpack::{self, Field, Refused};
 use super::{
     H3_EXCESSIVE_LOAD, H3_FRAME_ERROR, H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_MESSAGE_ERROR,
     H3_REQUEST_CANCELLED, H3Error, MAX_FIELD_SECTION_SIZE, QPACK_DECOMPRESSION_FAILED,
-    SETTINGS_H3_DATAGRAM,
+    SETTINGS_H3_DATAGRAM, ServerSaid,
 };
 use bytes::{Buf, Bytes, BytesMut};
 use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
@@ -117,7 +117,31 @@ enum Recv {
     /// The server's side ended after its content.
     End,
     /// Failed: reads fail again, the same way.
-    Failed(io::ErrorKind, Arc<str>),
+    Failed(Failure),
+}
+
+/// How reading failed, for every read after to fail so: with what the
+/// server said of the stream, which the caller may act on (`rejected`), or
+/// with a text of a kind.
+enum Failure {
+    Said(ServerSaid),
+    Text(io::ErrorKind, Arc<str>),
+}
+
+impl Failure {
+    fn of(e: &io::Error) -> Failure {
+        match ServerSaid::of(e) {
+            Some(said) => Failure::Said(said),
+            None => Failure::Text(e.kind(), e.to_string().into()),
+        }
+    }
+
+    fn io(&self) -> io::Error {
+        match self {
+            Failure::Said(said) => said.io(),
+            Failure::Text(kind, text) => io::Error::new(*kind, text.to_string()),
+        }
+    }
 }
 
 /// The places between frames that passing over a frame goes back to.
@@ -300,9 +324,7 @@ impl RequestStream {
                     }
                 }
                 Recv::Skip { .. } => ready!(self.poll_skip(cx))?,
-                Recv::Failed(kind, ref text) => {
-                    return Poll::Ready(Err(io::Error::new(kind, text.to_string())));
-                }
+                Recv::Failed(ref failure) => return Poll::Ready(Err(failure.io())),
                 Recv::Body | Recv::Data(_) | Recv::Trailers | Recv::End => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -407,15 +429,19 @@ impl RequestStream {
             )),
             ReadFailure::Stream(e) => {
                 let e = self.inner.read_error(e);
-                self.fail(e.kind(), e.to_string())
+                self.failed(e)
             }
         }
     }
 
     /// Reading failed with `text`: it fails so from now on.
     fn fail(&mut self, kind: io::ErrorKind, text: String) -> io::Error {
-        let error = io::Error::new(kind, text.clone());
-        self.recv = Recv::Failed(kind, text.into());
+        self.failed(io::Error::new(kind, text))
+    }
+
+    /// Reading failed with `error`: it fails so from now on.
+    fn failed(&mut self, error: io::Error) -> io::Error {
+        self.recv = Recv::Failed(Failure::of(&error));
         self.end_datagrams();
         error
     }
@@ -607,9 +633,7 @@ impl AsyncRead for RequestStream {
                 }
                 Recv::Skip { .. } => ready!(this.poll_skip(cx))?,
                 Recv::End => return Poll::Ready(Ok(())),
-                Recv::Failed(kind, ref text) => {
-                    return Poll::Ready(Err(io::Error::new(kind, text.to_string())));
-                }
+                Recv::Failed(ref failure) => return Poll::Ready(Err(failure.io())),
                 Recv::Head | Recv::HeadFields(_) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::InvalidInput,

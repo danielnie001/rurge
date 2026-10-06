@@ -27,8 +27,10 @@
 //!   HTTP/3 datagrams with context id 0 to the target and the target's
 //!   answers back in HTTP/3 datagrams — or, scripted so, in DATAGRAM
 //!   capsules on the stream —; it reads no capsule of the client's. It
-//!   records every datagram of the client's and how the client ended each
-//!   such stream.
+//!   records every datagram of the client's, the bytes of DATA the client
+//!   sent on such streams, and how the client ended each of them.
+//! - A test may take the next request's stream as it came, to answer it by
+//!   hand or reset it (`hold_next_request`).
 //!
 //! What the client sends is read by code that is not the client's: the
 //! field sections by the HTTP/3 server side of `rurge_net`, the tunnels'
@@ -42,10 +44,11 @@ use rurge_net::quic::testing::{TestCert, endpoint};
 use rustls::RootCertStore;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -102,6 +105,9 @@ pub struct H3ProxyScript {
     /// connection (QUIC's `initial_max_streams_bidi`): quinn's 100 unless
     /// set.
     pub max_streams: Option<u32>,
+    /// The most the client may send on a stream before the fake reads it
+    /// (QUIC's `stream_receive_window`): quinn's 1.25 MB unless set.
+    pub stream_window: Option<u32>,
     /// Leave extended CONNECT out of its SETTINGS.
     pub no_extended_connect: bool,
     /// Say `H3_DATAGRAM = 0` in its SETTINGS.
@@ -223,9 +229,14 @@ struct Shared {
     connections: Mutex<Vec<Connection>>,
     requests: Mutex<Vec<RecordedH3Request>>,
     datagrams: Mutex<Vec<RecordedH3Datagram>>,
+    /// The bytes of DATA the client sent on CONNECT-UDP streams.
+    udp_data: AtomicUsize,
     udp_ends: Mutex<Vec<RecordedUdpEnd>>,
     /// Restart once the next request came.
     restart_at_request: AtomicBool,
+    /// Where the next request's stream goes, once read and recorded,
+    /// instead of being answered (`hold_next_request`).
+    hold_next: Mutex<Option<oneshot::Sender<ServerStream>>>,
     /// The fake, to restart it.
     fake: Weak<Inner>,
 }
@@ -300,8 +311,10 @@ impl FakeH3Proxy {
                 connections: Mutex::default(),
                 requests: Mutex::default(),
                 datagrams: Mutex::default(),
+                udp_data: AtomicUsize::new(0),
                 udp_ends: Mutex::default(),
                 restart_at_request: AtomicBool::new(false),
+                hold_next: Mutex::default(),
                 fake: fake.clone(),
             }),
             endpoints: Mutex::default(),
@@ -337,6 +350,14 @@ impl FakeH3Proxy {
     /// How the client ended its side of CONNECT-UDP streams, in order.
     pub fn udp_ends(&self) -> Vec<RecordedUdpEnd> {
         self.inner.shared.udp_ends.lock().expect("udp ends").clone()
+    }
+
+    /// The bytes of DATA the client sent on its CONNECT-UDP streams, all of
+    /// them together: DATAGRAM capsules, were it to send its packets in
+    /// any. Read as they come; all of a stream's once the client ended it
+    /// with a FIN (`udp_ends`).
+    pub fn udp_data(&self) -> usize {
+        self.inner.shared.udp_data.load(Ordering::SeqCst)
     }
 
     /// An HTTP/3 datagram of `payload` — a context id first, or whatever a
@@ -383,6 +404,15 @@ impl FakeH3Proxy {
             .restart_at_request
             .store(true, Ordering::SeqCst);
     }
+
+    /// The next request is not answered: once read and recorded, its
+    /// stream comes out of what this returns, for the test to answer or
+    /// reset by hand.
+    pub fn hold_next_request(&self) -> oneshot::Receiver<ServerStream> {
+        let (give, held) = oneshot::channel();
+        *self.inner.shared.hold_next.lock().expect("hold") = Some(give);
+        held
+    }
 }
 
 impl Inner {
@@ -396,6 +426,9 @@ impl Inner {
         }
         if let Some(max) = script.max_streams {
             transport.max_concurrent_bidi_streams(VarInt::from_u32(max));
+        }
+        if let Some(window) = script.stream_window {
+            transport.stream_receive_window(VarInt::from_u32(window));
         }
         let mut config = self.cert.server_config(&["h3"]);
         config.transport_config(Arc::new(transport));
@@ -487,9 +520,9 @@ async fn serve(connection: Connection, shared: Arc<Shared>) {
     }
 }
 
-/// A request: read and recorded; then the fake restarts, leaves it
-/// unanswered, refuses it, or makes the tunnel to its target — its UDP
-/// relay for a CONNECT-UDP.
+/// A request: read and recorded; then the fake restarts, hands it to the
+/// test, leaves it unanswered, refuses it, or makes the tunnel to its
+/// target — its UDP relay for a CONNECT-UDP.
 async fn answer(
     mut stream: ServerStream,
     connection: usize,
@@ -507,6 +540,12 @@ async fn answer(
         if let Some(fake) = shared.fake.upgrade() {
             fake.take_over();
         }
+        return Ok(());
+    }
+    let held = shared.hold_next.lock().expect("hold").take();
+    if let Some(give) = held {
+        // the test's to answer
+        let _ = give.send(stream);
         return Ok(());
     }
     let script = &shared.script;
@@ -769,10 +808,12 @@ async fn connect_udp(
         }
     };
     let end = async {
-        // nothing comes on the stream but its end
+        // nothing comes on the stream but its end: DATA is counted
         let fin = loop {
             match read_data(&mut from_client).await {
-                Ok(Some(_)) => {}
+                Ok(Some(data)) => {
+                    shared.udp_data.fetch_add(data.len(), Ordering::SeqCst);
+                }
                 Ok(None) => break true,
                 Err(_) => break false,
             }

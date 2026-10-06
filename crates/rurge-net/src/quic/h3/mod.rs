@@ -28,6 +28,12 @@
 //!   Nothing sent is Huffman-encoded; what comes back may be.
 //! - An error of the connection closes it with its RFC 9114, RFC 9204 or
 //!   RFC 9297 code; an error of a response ends its stream both ways.
+//! - What the server says of a request — that it reset the request's
+//!   stream, or stopped our side of it, with a code, or that it is going
+//!   away — rides in the I/O error the request fails with, for the caller
+//!   to tell a request the server never processed (`rejected`,
+//!   `going_away`, `Client::unprocessed`), which may go again on another
+//!   connection (RFC 9114 4.1.1, 5.2).
 //!
 //! The client opens bidirectional streams for its requests and takes none
 //! of the connection's others: a protocol may open streams of its own on
@@ -51,6 +57,7 @@ pub use stream::RequestStream;
 
 use quinn::VarInt;
 use std::borrow::Cow;
+use std::fmt;
 use std::io;
 
 /// The dynamic table capacity a peer's QPACK encoder may use (RFC 9204 5).
@@ -87,6 +94,7 @@ pub(crate) const H3_EXCESSIVE_LOAD: VarInt = VarInt::from_u32(0x107);
 pub(crate) const H3_ID_ERROR: VarInt = VarInt::from_u32(0x108);
 pub(crate) const H3_SETTINGS_ERROR: VarInt = VarInt::from_u32(0x109);
 pub(crate) const H3_MISSING_SETTINGS: VarInt = VarInt::from_u32(0x10a);
+pub(crate) const H3_REQUEST_REJECTED: VarInt = VarInt::from_u32(0x10b);
 pub(crate) const H3_REQUEST_CANCELLED: VarInt = VarInt::from_u32(0x10c);
 pub(crate) const H3_MESSAGE_ERROR: VarInt = VarInt::from_u32(0x10e);
 pub(crate) const QPACK_DECOMPRESSION_FAILED: VarInt = VarInt::from_u32(0x200);
@@ -139,6 +147,78 @@ impl H3Error {
     pub(crate) fn io(&self) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, format!("h3: {}", self.text))
     }
+}
+
+/// What the server said of a request, carried in the I/O error the request
+/// fails with — its text the error's —: that it reset the request's stream,
+/// or stopped our side of it, with a code (RFC 9114 4.1.1), or — the
+/// request refused before anything went — that it is going away (RFC 9114
+/// 5.2). `rejected` and `going_away` read it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServerSaid {
+    Reset(VarInt),
+    Stopped(VarInt),
+    GoingAway,
+}
+
+impl ServerSaid {
+    pub(crate) fn io(self) -> io::Error {
+        let kind = match self {
+            ServerSaid::Reset(_) | ServerSaid::Stopped(_) => io::ErrorKind::ConnectionReset,
+            ServerSaid::GoingAway => io::ErrorKind::ConnectionAborted,
+        };
+        io::Error::new(kind, self)
+    }
+
+    /// What `e` carries, when it is one of these.
+    pub(crate) fn of(e: &io::Error) -> Option<ServerSaid> {
+        e.get_ref()?.downcast_ref::<ServerSaid>().copied()
+    }
+}
+
+impl fmt::Display for ServerSaid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ServerSaid::Reset(code) => {
+                write!(f, "h3: the server reset the stream ({})", code_name(*code))
+            }
+            ServerSaid::Stopped(code) => {
+                write!(
+                    f,
+                    "h3: the server stopped the stream ({})",
+                    code_name(*code)
+                )
+            }
+            ServerSaid::GoingAway => f.write_str("h3: the server is going away"),
+        }
+    }
+}
+
+/// As its text, as an error of a text shows.
+impl fmt::Debug for ServerSaid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.to_string(), f)
+    }
+}
+
+impl std::error::Error for ServerSaid {}
+
+/// Whether `e` says the server rejected the request — reset its stream, or
+/// stopped our side of it, with H3_REQUEST_REJECTED —: it was not
+/// processed, and may go again, on another connection too (RFC 9114 4.1.1,
+/// 8.1).
+pub fn rejected(e: &io::Error) -> bool {
+    matches!(
+        ServerSaid::of(e),
+        Some(ServerSaid::Reset(code) | ServerSaid::Stopped(code)) if code == H3_REQUEST_REJECTED
+    )
+}
+
+/// Whether `e` is a request refused, nothing sent, because the server sent
+/// GOAWAY (`Client::request`): another connection may take it (RFC 9114
+/// 5.2).
+pub fn going_away(e: &io::Error) -> bool {
+    ServerSaid::of(e) == Some(ServerSaid::GoingAway)
 }
 
 #[cfg(test)]
@@ -530,6 +610,50 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
             assert_eq!(err.to_string(), "h3: the server is going away");
+            served.send_headers(200, &[]).await.unwrap();
+            served.finish();
+            assert_eq!(first.response().await.unwrap().status(), 200);
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A GOAWAY leaves the requests at or past its stream ID unprocessed
+    /// (RFC 9114 5.2), none before it came; a request it makes the client
+    /// refuse says so (`going_away`).
+    #[tokio::test]
+    async fn a_goaway_leaves_the_requests_at_or_past_it_unprocessed() {
+        let mut p = pair().await;
+        timeout(BOUND, async {
+            let mut first = p
+                .client
+                .request(get("https://example.test/a"))
+                .await
+                .unwrap();
+            first.shutdown().await.unwrap();
+            let mut served = p.server.accept().await.unwrap();
+            served.read_headers().await.unwrap();
+            assert_eq!(first.id(), 0);
+            assert!(!p.client.unprocessed(0));
+            assert!(!p.client.unprocessed(8));
+            p.server.goaway(8).await.unwrap();
+            eventually(|| p.client.is_going_away()).await;
+            for (id, unprocessed) in [(0, false), (4, false), (8, true), (12, true)] {
+                assert_eq!(p.client.unprocessed(id), unprocessed, "stream {id}");
+            }
+            // a GOAWAY may come down
+            p.server.goaway(4).await.unwrap();
+            eventually(|| p.client.unprocessed(4)).await;
+            assert!(!p.client.unprocessed(0));
+            let err = p
+                .client
+                .request(get("https://example.test/b"))
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+            assert_eq!(err.to_string(), "h3: the server is going away");
+            assert!(going_away(&err));
+            assert!(!rejected(&err));
             served.send_headers(200, &[]).await.unwrap();
             served.finish();
             assert_eq!(first.response().await.unwrap().status(), 200);
@@ -1095,6 +1219,111 @@ mod tests {
             err.to_string(),
             "h3: the server reset the stream (H3_REQUEST_REJECTED)"
         );
+    }
+
+    /// The server's reset of a request's stream carries its code, read
+    /// after read: H3_REQUEST_REJECTED says the request was not processed
+    /// (`rejected`, RFC 9114 4.1.1); another code does not.
+    #[tokio::test]
+    async fn a_reset_with_h3_request_rejected_is_a_rejection() {
+        for (code, name, rejection) in [
+            (0x10b, "H3_REQUEST_REJECTED", true),
+            (0x10c, "H3_REQUEST_CANCELLED", false),
+        ] {
+            let p = pair().await;
+            let request = async {
+                let mut stream = p.client.request(get("https://example.test/")).await?;
+                stream.shutdown().await?;
+                let first = stream.response().await.unwrap_err();
+                // the stream fails so from now on
+                let again = stream.response().await.unwrap_err();
+                Ok::<_, io::Error>([first, again])
+            };
+            let serve = async {
+                let mut stream = p.server.accept().await.unwrap();
+                stream.read_headers().await.unwrap();
+                stream.reset(code);
+                stream
+            };
+            let (errors, _served) = timeout(BOUND, async { tokio::join!(request, serve) })
+                .await
+                .unwrap();
+            for err in errors.unwrap() {
+                assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+                assert_eq!(
+                    err.to_string(),
+                    format!("h3: the server reset the stream ({name})")
+                );
+                assert_eq!(rejected(&err), rejection, "{name}");
+                assert!(!going_away(&err));
+            }
+        }
+    }
+
+    /// The server's stop of our side of a request's stream reaches our
+    /// writes with its code: H3_REQUEST_REJECTED says the request was not
+    /// processed (`rejected`); another code does not.
+    #[tokio::test]
+    async fn a_stop_with_h3_request_rejected_is_a_rejection() {
+        for (code, name, rejection) in [
+            (0x10b, "H3_REQUEST_REJECTED", true),
+            (0x100, "H3_NO_ERROR", false),
+        ] {
+            let p = pair().await;
+            timeout(BOUND, async {
+                let mut stream = p.client.request(tunnel("example.test:443")).await.unwrap();
+                let mut served = p.server.accept().await.unwrap();
+                served.read_headers().await.unwrap();
+                served.stop(code);
+                served.send_headers(200, &[]).await.unwrap();
+                assert_eq!(stream.response().await.unwrap().status(), 200);
+                // the stop comes when it comes: written to until a write
+                // hears of it
+                let err = loop {
+                    let written = async {
+                        stream.write_all(b"x").await?;
+                        stream.flush().await
+                    };
+                    match written.await {
+                        Ok(()) => tokio::time::sleep(Duration::from_millis(10)).await,
+                        Err(e) => break e,
+                    }
+                };
+                assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+                assert_eq!(
+                    err.to_string(),
+                    format!("h3: the server stopped the stream ({name})")
+                );
+                assert_eq!(rejected(&err), rejection, "{name}");
+                assert!(!going_away(&err));
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    /// What the server said is told by the error's cause, never by its
+    /// text: an error that only reads the same says nothing.
+    #[test]
+    fn an_error_that_only_reads_the_same_is_neither_rejected_nor_going_away() {
+        for e in [
+            io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "h3: the server reset the stream (H3_REQUEST_REJECTED)",
+            ),
+            io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "h3: the server stopped the stream (H3_REQUEST_REJECTED)",
+            ),
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "h3: the server is going away",
+            ),
+            io::Error::other("x"),
+        ] {
+            assert!(!rejected(&e), "{e}");
+            assert!(!going_away(&e), "{e}");
+        }
     }
 
     /// Hysteria 2 opens streams of its own on the client's connection; the
@@ -1676,7 +1905,10 @@ mod tests {
     async fn dropping_the_client_ends_the_datagram_flows() {
         let p = masque_pair().await;
         let (mut a, _served) = udp_tunnel(&p, "/").await;
-        let da = a.datagrams().await.unwrap();
+        let da = timeout(BOUND, a.datagrams())
+            .await
+            .expect("the datagrams within the bound")
+            .unwrap();
         let waiting = da.recv();
         tokio::pin!(waiting);
         assert!(

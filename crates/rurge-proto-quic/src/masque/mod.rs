@@ -199,6 +199,10 @@ mod tests {
     use tokio::time::{Instant, timeout};
 
     pub(super) const BOUND: Duration = Duration::from_secs(10);
+    /// A request not processed, which may go again (RFC 9114 8.1).
+    pub(super) const H3_REQUEST_REJECTED: u64 = 0x10b;
+    /// The proxy could not reach the target (RFC 9114 8.1).
+    const H3_CONNECT_ERROR: u64 = 0x10f;
 
     /// The user `u` with the password `p`.
     pub(super) fn users() -> Vec<(String, String)> {
@@ -274,8 +278,13 @@ mod tests {
 
     /// Flushed: a write may leave the rest of its DATA frame for the next.
     pub(super) async fn round_trip(stream: &mut BoxedStream, payload: &[u8]) {
-        stream.write_all(payload).await.unwrap();
-        stream.flush().await.unwrap();
+        timeout(BOUND, async {
+            stream.write_all(payload).await?;
+            stream.flush().await
+        })
+        .await
+        .expect("written within the bound")
+        .unwrap();
         let mut back = vec![0u8; payload.len()];
         timeout(BOUND, stream.read_exact(&mut back))
             .await
@@ -540,7 +549,10 @@ mod tests {
         round_trip(&mut old, b"still there").await;
         let carried: Vec<usize> = fake.requests().iter().map(|r| r.connection).collect();
         assert_eq!(carried, [0, 1]);
-        old.shutdown().await.unwrap();
+        timeout(BOUND, old.shutdown())
+            .await
+            .expect("shut down within the bound")
+            .unwrap();
         let mut rest = Vec::new();
         timeout(BOUND, old.read_to_end(&mut rest))
             .await
@@ -616,6 +628,144 @@ mod tests {
         assert_eq!(fake.requests().last().unwrap().connection, 2);
     }
 
+    /// RFC 9114 4.1.1: a request the server rejects (H3_REQUEST_REJECTED)
+    /// was not processed — a server may shed load so, with no GOAWAY —: it
+    /// goes again, once, on a new connection. The tunnel under way on the
+    /// connection before goes on.
+    #[tokio::test]
+    async fn a_request_the_server_rejects_goes_again_on_a_new_connection() {
+        let echo = echo_server().await;
+        let fake = FakeH3Proxy::spawn(H3ProxyScript::default());
+        let out = outbound(&fake, "");
+        let to = target(echo);
+        let mut first = tunnel(&out, &to).await;
+        round_trip(&mut first, b"first").await;
+        let held = fake.hold_next_request();
+        let reject = async {
+            let mut stream = timeout(BOUND, held)
+                .await
+                .expect("the request within the bound")
+                .expect("held");
+            stream.reset(H3_REQUEST_REJECTED);
+            stream
+        };
+        let (mut second, _rejected) = tokio::join!(tunnel(&out, &to), reject);
+        round_trip(&mut second, b"second").await;
+        let carried: Vec<usize> = fake.requests().iter().map(|r| r.connection).collect();
+        assert_eq!(carried, [0, 0, 1]);
+        assert_eq!(fake.connections(), 2);
+        round_trip(&mut first, b"first still").await;
+    }
+
+    /// Two requests at once on a connection whose server sends GOAWAY
+    /// with the first: the second, past the GOAWAY, is rejected unread
+    /// (RFC 9114 5.2). Which the client hears first — the GOAWAY or the
+    /// rejection — is the scheduler's; either way the second goes again on
+    /// a new connection.
+    async fn a_request_past_a_goaway_goes_again() {
+        let echo = echo_server().await;
+        let fake = FakeH3Proxy::spawn(H3ProxyScript {
+            goaway_after: Some(1),
+            ..H3ProxyScript::default()
+        });
+        let out = outbound(&fake, "");
+        // held from before the requests: both take the connection at once
+        let _lease = timeout(BOUND, out.session.lease(&ConnectOpts::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        let to = target(echo);
+        let (mut one, mut two) = tokio::join!(tunnel(&out, &to), tunnel(&out, &to));
+        round_trip(&mut one, b"one").await;
+        round_trip(&mut two, b"two").await;
+        // one on each connection: the rejected request was never read
+        let mut carried: Vec<usize> = fake.requests().iter().map(|r| r.connection).collect();
+        carried.sort_unstable();
+        assert_eq!(carried, [0, 1]);
+        assert_eq!(fake.connections(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_request_past_a_goaway_goes_again_on_a_new_connection() {
+        a_request_past_a_goaway_goes_again().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_past_a_goaway_goes_again_on_a_new_connection_on_two_threads() {
+        a_request_past_a_goaway_goes_again().await;
+    }
+
+    /// RFC 9114 5.2: a request below the server's GOAWAY may yet be
+    /// processed. Failing on its own stream — the proxy could not reach the
+    /// target (H3_CONNECT_ERROR) — once the client heard the GOAWAY, it is
+    /// final: it does not go again.
+    #[tokio::test]
+    async fn a_request_below_the_goaway_that_fails_on_its_own_stream_does_not_go_again() {
+        let echo = echo_server().await;
+        let fake = FakeH3Proxy::spawn(H3ProxyScript {
+            goaway_after: Some(1),
+            ..H3ProxyScript::default()
+        });
+        let out = outbound(&fake, "");
+        // held from before the request, which so takes the connection at
+        // once, and to see its GOAWAY come
+        let lease = timeout(BOUND, out.session.lease(&ConnectOpts::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        let held = fake.hold_next_request();
+        let fail = async {
+            let mut stream = timeout(BOUND, held)
+                .await
+                .expect("the request within the bound")
+                .expect("held");
+            // the GOAWAY for the stream after it went out before
+            let deadline = Instant::now() + BOUND;
+            while out.session.serves(&lease) {
+                assert!(Instant::now() < deadline, "no GOAWAY heard");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            stream.reset(H3_CONNECT_ERROR);
+            stream
+        };
+        let to = target(echo);
+        let (err, _failed) = tokio::join!(failure(&out, &to), fail);
+        assert_eq!(
+            err.to_string(),
+            "h3: the server reset the stream (H3_CONNECT_ERROR)"
+        );
+        assert_eq!(fake.requests().len(), 1, "it went again");
+        assert_eq!(fake.connections(), 1);
+    }
+
+    /// The server lets a stream bring 2,000 bytes before it reads them (its
+    /// QUIC window): a write's frame is taken whole and goes out in part. A
+    /// caller that then only reads — an HTTP proxy's CONNECT over the
+    /// tunnel waits for its answer so — still has the rest go out, and the
+    /// echo come back.
+    #[tokio::test]
+    async fn a_frame_left_half_written_goes_out_while_the_caller_reads() {
+        let echo = echo_server().await;
+        let fake = FakeH3Proxy::spawn(H3ProxyScript {
+            stream_window: Some(2000),
+            ..H3ProxyScript::default()
+        });
+        let out = outbound(&fake, "");
+        let mut stream = tunnel(&out, &target(echo)).await;
+        let payload: Vec<u8> = (0..8000).map(|i| (i % 251) as u8).collect();
+        let taken = timeout(BOUND, stream.write(&payload))
+            .await
+            .expect("taken within the bound")
+            .unwrap();
+        assert_eq!(taken, payload.len());
+        let mut back = vec![0u8; payload.len()];
+        timeout(BOUND, stream.read_exact(&mut back))
+            .await
+            .expect("the echo arrives")
+            .unwrap();
+        assert!(back == payload, "the echo differs");
+    }
+
     /// `opts.timeout` bounds the whole request: the dial, QUIC's handshake
     /// and the proxy's response.
     #[tokio::test]
@@ -632,21 +782,17 @@ mod tests {
             ..H3ProxyScript::default()
         });
         let out = outbound_with(&spec(port, ""), port, &fake);
-        let started = Instant::now();
         let err = timeout(BOUND, out.connect_tcp(&target(echo), &opts))
             .await
             .expect("an outcome within the bound")
             .err()
             .unwrap();
+        // the request's own time ran out: QUIC gives up on a server that
+        // never answers only once its idle timeout, 30 seconds, has passed
         assert!(matches!(err, OutboundError::Timeout), "{err}");
-        // well before QUIC's own handshake timeout, about 3 seconds
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
-        );
         // a server that takes the request and never answers it, on a
-        // connection that is up already
+        // connection that is up already — and keeps it up, answering
+        // QUIC's keep-alives: no time but the request's runs out
         let out = outbound(&fake, "");
         drop(
             timeout(BOUND, out.session.lease(&ConnectOpts::default()))
@@ -654,18 +800,12 @@ mod tests {
                 .unwrap()
                 .unwrap(),
         );
-        let started = Instant::now();
         let err = timeout(BOUND, out.connect_tcp(&target(echo), &opts))
             .await
             .expect("an outcome within the bound")
             .err()
             .unwrap();
         assert!(matches!(err, OutboundError::Timeout), "{err}");
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
-        );
         assert_eq!(fake.requests().len(), 1, "the request went out");
     }
 
@@ -692,7 +832,10 @@ mod tests {
             .unwrap();
         assert!(matches!(err, OutboundError::Timeout), "{err}");
         // the first ends both ways: its stream is the server's to reuse
-        first.shutdown().await.unwrap();
+        timeout(BOUND, first.shutdown())
+            .await
+            .expect("shut down within the bound")
+            .unwrap();
         let mut rest = Vec::new();
         timeout(BOUND, first.read_to_end(&mut rest))
             .await

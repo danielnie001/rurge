@@ -360,6 +360,15 @@ impl ServerStream {
             .reset(VarInt::from_u64(code).expect("a QUIC integer"));
     }
 
+    /// Stops the client's side with `code` (STOP_SENDING): its writes fail
+    /// once the client heard it.
+    pub fn stop(&mut self, code: u64) {
+        let _ = self
+            .incoming
+            .recv
+            .stop(VarInt::from_u64(code).expect("a QUIC integer"));
+    }
+
     /// The code of the client's STOP_SENDING; `None` when it read the
     /// server's side to its end.
     pub async fn client_stopped(&self) -> Option<u64> {

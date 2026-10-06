@@ -236,8 +236,13 @@ mod tests {
 
     /// Flushed: a write may leave the rest of its DATA frame for the next.
     async fn round_trip(stream: &mut BoxedStream, payload: &[u8]) {
-        stream.write_all(payload).await.unwrap();
-        stream.flush().await.unwrap();
+        timeout(BOUND, async {
+            stream.write_all(payload).await?;
+            stream.flush().await
+        })
+        .await
+        .expect("written within the bound")
+        .unwrap();
         let mut back = vec![0u8; payload.len()];
         timeout(BOUND, stream.read_exact(&mut back))
             .await
@@ -481,7 +486,10 @@ mod tests {
         round_trip(&mut old, b"still there").await;
         let carried: Vec<usize> = fake.requests().iter().map(|r| r.connection).collect();
         assert_eq!(carried, [0, 1]);
-        old.shutdown().await.unwrap();
+        timeout(BOUND, old.shutdown())
+            .await
+            .expect("shut down within the bound")
+            .unwrap();
         let mut rest = Vec::new();
         timeout(BOUND, old.read_to_end(&mut rest))
             .await

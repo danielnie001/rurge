@@ -144,21 +144,31 @@ struct Opened {
 
 /// The CONNECT-UDP `request` on the connection of `lease`, once the
 /// server's SETTINGS allow it, and the proxy's response. Until the response
-/// came, a request that finds its connection gone or going away is `Lost`,
-/// as a TCP one (`tcp::open`).
+/// came, a request the server never processed is `Lost`, as a TCP one
+/// (`connect::failure`).
 async fn connect(lease: Lease<Connected>, request: Request<()>) -> Result<Opened, Failure> {
     let h3 = &lease.state().h3;
-    let settings = h3.settings().await.map_err(|e| failure(&lease, e))?;
+    let settings = h3.settings().await.map_err(|e| failure(&lease, None, e))?;
     if !supports_connect_udp(&settings, lease.connection()) {
         return Err(Failure::Failed(proxy(
             "the server does not support CONNECT-UDP",
         )));
     }
-    let mut stream = h3.request(request).await.map_err(|e| failure(&lease, e))?;
+    let mut stream = h3
+        .request(request)
+        .await
+        .map_err(|e| failure(&lease, None, e))?;
+    let id = stream.id();
     // taken before the response: what the proxy sends right after its 2xx
     // is not lost
-    let datagrams = stream.datagrams().await.map_err(|e| failure(&lease, e))?;
-    let response = stream.response().await.map_err(|e| failure(&lease, e))?;
+    let datagrams = stream
+        .datagrams()
+        .await
+        .map_err(|e| failure(&lease, Some(id), e))?;
+    let response = stream
+        .response()
+        .await
+        .map_err(|e| failure(&lease, Some(id), e))?;
     let status = response.status();
     if !status.is_success() {
         return Err(Failure::Failed(refused(status)));
@@ -609,7 +619,8 @@ mod tests {
     use super::*;
     use crate::masque::MasqueOutbound;
     use crate::masque::tests::{
-        BOUND, closed_by_the_client, outbound, round_trip, spec, target, tunnel, users,
+        BOUND, H3_REQUEST_REJECTED, closed_by_the_client, outbound, round_trip, spec, target,
+        tunnel, users,
     };
     use crate::test_log::Log;
     use crate::testing::{
@@ -1071,19 +1082,22 @@ mod tests {
     }
 
     /// RFC 9298 5: at most 65527 bytes with context id 0, and no more than
-    /// a datagram of the connection carries now: no DATAGRAM capsule takes
-    /// what does not fit. Refused, nothing sent, the datagram alone: the
-    /// carrier goes on.
+    /// a datagram of the connection carries now — that much goes, in one
+    /// datagram —: no DATAGRAM capsule takes what does not fit. Refused,
+    /// nothing sent, the datagram alone: the carrier goes on.
     #[tokio::test]
     async fn a_datagram_too_long_is_refused_and_nothing_goes_out() {
+        // the stream closes gracefully soon after, once all it carried
+        // was read
+        const IDLE: Duration = Duration::from_secs(2);
         let echo = udp_echo_server().await;
         let fake = FakeH3Proxy::spawn(H3ProxyScript::default());
         let out = outbound(&fake, "");
         let carrier = carrier(&out, IDLE);
         let to = target(echo);
-        let err = carrier
-            .send_to(&vec![0u8; MAX_PAYLOAD + 1], &to)
+        let err = timeout(BOUND, carrier.send_to(&vec![0u8; MAX_PAYLOAD + 1], &to))
             .await
+            .expect("an outcome within the bound")
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(
@@ -1092,22 +1106,35 @@ mod tests {
         );
         assert_eq!(fake.connections(), 0, "nothing is opened for it");
         udp_round_trip(&carrier, &to, b"first").await;
-        // taken and used with nothing awaited between: the path's size of
-        // a datagram stays put
+        // each taken and used with nothing awaited between: the path's size
+        // of a datagram stays put
         let room = carrier.room(&to).expect("the target's stream");
         assert!((1000..MAX_PAYLOAD).contains(&room), "{room}");
-        let err = carrier
-            .send_to(&vec![0u8; room + 1], &to)
+        let err = timeout(BOUND, carrier.send_to(&vec![0u8; room + 1], &to))
             .await
+            .expect("an outcome within the bound")
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(
             err.to_string(),
             format!("masque: a datagram longer than {room} bytes")
         );
-        udp_round_trip(&carrier, &to, b"still").await;
+        let room = carrier.room(&to).expect("the target's stream");
+        timeout(BOUND, carrier.send_to(&vec![0u8; room], &to))
+            .await
+            .expect("sent within the bound")
+            .unwrap();
+        // the client ended the stream with a FIN: the fake read all of it
+        eventually(|| !fake.udp_ends().is_empty()).await;
+        let end = RecordedUdpEnd {
+            connection: 0,
+            stream: 0,
+            fin: true,
+        };
+        assert_eq!(fake.udp_ends(), [end]);
+        assert_eq!(fake.udp_data(), 0, "DATA on the stream");
         let sent: Vec<usize> = fake.datagrams().iter().map(|d| d.len).collect();
-        assert_eq!(sent, [5, 5]);
+        assert_eq!(sent, [5, room]);
     }
 
     /// RFC 9297 3.2, 3.5: the proxy may send a packet in a DATAGRAM capsule
@@ -1198,12 +1225,25 @@ mod tests {
         assert_eq!(fake.requests().len(), 2);
     }
 
-    /// A proxy that answers 200 and ends every stream at once. A datagram
-    /// that meets its stream ended — the one opened for it, or for those it
-    /// waited with — opens one anew, once: met ended too, the datagram
-    /// fails, and no third stream goes out. Senders that wait for another's
-    /// stream run after its reader saw the end (one thread), and meet it
-    /// ended.
+    /// A datagram that meets its stream ended opens one anew, once; met
+    /// ended too, the datagram fails.
+    #[test]
+    fn a_datagram_opens_its_stream_anew_once() {
+        let mut reopened = false;
+        reopen(&mut reopened).unwrap();
+        assert!(reopened);
+        let err = reopen(&mut reopened).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(err.to_string(), "masque: the server ended the UDP stream");
+    }
+
+    /// A proxy that answers 200 and ends every stream at once, eight
+    /// datagrams sent together, round after round. A datagram that meets
+    /// its stream ended — the one opened for it, or for those it waited
+    /// with — opens one anew, once (`reopen`): a round asks for two streams
+    /// at most, and a datagram that fails says why. Which datagrams meet a
+    /// stream ended — its reader saw the server's end before they looked —
+    /// is the scheduler's.
     #[tokio::test]
     async fn a_stream_the_server_ends_at_once_is_opened_anew_once_per_datagram() {
         const SENDERS: usize = 8;
@@ -1215,7 +1255,6 @@ mod tests {
         let out = outbound(&fake, "");
         let carrier = Arc::new(carrier(&out, IDLE));
         let to = target(echo);
-        let mut failed = 0;
         for round in 0..5 {
             let before = fake.requests().len();
             let mut sending = JoinSet::new();
@@ -1231,7 +1270,6 @@ mod tests {
                 if let Err(e) = sent.unwrap() {
                     assert_eq!(e.kind(), io::ErrorKind::ConnectionAborted);
                     assert_eq!(e.to_string(), "masque: the server ended the UDP stream");
-                    failed += 1;
                 }
             }
             // a stream, and one opened anew for the datagrams that met it
@@ -1240,7 +1278,6 @@ mod tests {
             assert!((1..=2).contains(&asked), "round {round}: {asked}");
             eventually(|| carrier.tracked() == 0).await;
         }
-        assert!(failed > 0, "no datagram met its second stream ended");
     }
 
     /// Design 7.1: a stream without a datagram either way for the idle time
@@ -1327,6 +1364,36 @@ mod tests {
         assert_eq!(fake.connections(), 3);
     }
 
+    /// RFC 9114 4.1.1: a CONNECT-UDP the server rejects (H3_REQUEST_REJECTED),
+    /// with no GOAWAY, was not processed: it goes again, once, on a new
+    /// connection, and the datagram with it. Another target's stream goes
+    /// on where it is.
+    #[tokio::test]
+    async fn a_connect_udp_the_server_rejects_goes_again_on_a_new_connection() {
+        let (one, two) = (udp_echo_server().await, udp_echo_server().await);
+        let fake = FakeH3Proxy::spawn(H3ProxyScript::default());
+        let out = outbound(&fake, "");
+        let carrier = udp_carrier(&out).await;
+        udp_round_trip(carrier.as_ref(), &target(one), b"one").await;
+        let held = fake.hold_next_request();
+        let reject = async {
+            let mut stream = timeout(BOUND, held)
+                .await
+                .expect("the request within the bound")
+                .expect("held");
+            stream.reset(H3_REQUEST_REJECTED);
+            stream
+        };
+        let to = target(two);
+        let (sent, _rejected) = tokio::join!(timeout(BOUND, carrier.send_to(b"two", &to)), reject);
+        sent.expect("sent within the bound").unwrap();
+        assert_eq!(answer(carrier.as_ref()).await, (b"two".to_vec(), to));
+        let carried: Vec<usize> = fake.requests().iter().map(|r| r.connection).collect();
+        assert_eq!(carried, [0, 0, 1]);
+        assert_eq!(fake.connections(), 2);
+        udp_round_trip(carrier.as_ref(), &target(one), b"one still").await;
+    }
+
     /// Dials directly, leads where it is told to, and counts the times it
     /// is asked where it leads.
     struct Counted {
@@ -1400,7 +1467,10 @@ mod tests {
         udp_round_trip(carrier.as_ref(), &to, b"open").await;
         let before = counted.asked();
         for i in 0..50u8 {
-            carrier.send_to(&[i], &to).await.unwrap();
+            timeout(BOUND, carrier.send_to(&[i], &to))
+                .await
+                .expect("sent within the bound")
+                .unwrap();
         }
         let asked = counted.asked() - before;
         assert!(asked <= 3, "asked {asked} times for 50 datagrams");
@@ -1427,7 +1497,10 @@ mod tests {
                 Instant::now() < deadline,
                 "the stream never left its connection"
             );
-            carrier.send_to(b"probe", &to).await.unwrap();
+            timeout(BOUND, carrier.send_to(b"probe", &to))
+                .await
+                .expect("sent within the bound")
+                .unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         until_answered(carrier.as_ref(), &to, b"moved").await;
@@ -1527,15 +1600,11 @@ mod tests {
             timeout: Duration::from_millis(500),
         };
         let carrier = timeout(BOUND, out.open_udp(&opts)).await.unwrap().unwrap();
-        let started = Instant::now();
         let err = failure(carrier.as_ref(), &target(echo)).await;
+        // the stream's own time ran out, the only one that says so: the
+        // connection is up, and keeps up
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert_eq!(err.to_string(), "connect timed out");
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
-        );
         assert_eq!(fake.requests().len(), 1, "the request went out");
     }
 
@@ -1585,9 +1654,9 @@ mod tests {
         let out = outbound(&fake, &format!("username=u, password={PASSWORD}"));
         let carrier = udp_carrier(&out).await;
         udp_round_trip(carrier.as_ref(), &target(echo), MARK).await;
-        let too_long = carrier
-            .send_to(&MARK.repeat(5000), &target(echo))
+        let too_long = timeout(BOUND, carrier.send_to(&MARK.repeat(5000), &target(echo)))
             .await
+            .expect("an outcome within the bound")
             .unwrap_err();
         let basic = basic_authorization("u", PASSWORD);
         assert_eq!(

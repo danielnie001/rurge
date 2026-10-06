@@ -9,7 +9,8 @@ use super::{
     H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_MISSING_SETTINGS, H3_STREAM_CREATION_ERROR, H3Error,
     MAX_FIELD_SECTION_SIZE, PUSH_STREAM, QPACK_DECODER_STREAM, QPACK_ENCODER_STREAM,
     SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_H3_DATAGRAM, SETTINGS_MAX_FIELD_SECTION_SIZE,
-    SETTINGS_QPACK_BLOCKED_STREAMS, SETTINGS_QPACK_MAX_TABLE_CAPACITY, code_name, qpack,
+    SETTINGS_QPACK_BLOCKED_STREAMS, SETTINGS_QPACK_MAX_TABLE_CAPACITY, ServerSaid, code_name,
+    qpack,
 };
 use crate::quic::connection_error;
 use bytes::Bytes;
@@ -132,6 +133,18 @@ impl Client {
         self.inner.state.borrow().goaway.is_some()
     }
 
+    /// Whether the request on stream `id` (`RequestStream::id`) is one the
+    /// server's latest GOAWAY leaves unprocessed — its stream at or past
+    /// the ID the GOAWAY names —: it may go again on another connection
+    /// (RFC 9114 5.2). Before a GOAWAY, none is.
+    pub fn unprocessed(&self, id: u64) -> bool {
+        self.inner
+            .state
+            .borrow()
+            .goaway
+            .is_some_and(|limit| id >= limit)
+    }
+
     /// Sends `request`'s head on a new bidirectional stream, as one
     /// HEADERS frame: its pseudo-header fields — `:method` and `:authority`
     /// alone for a CONNECT (RFC 9114 4.4); `:protocol`, `:scheme` and
@@ -146,7 +159,7 @@ impl Client {
     /// An extended CONNECT first waits for the server's SETTINGS (the
     /// caller bounds the wait) and is refused, nothing sent, unless they
     /// enable it (RFC 8441 3, RFC 9220 3). Refused once the server sent
-    /// GOAWAY.
+    /// GOAWAY (`going_away`).
     pub async fn request(&self, request: Request<()>) -> io::Result<RequestStream> {
         let head = frame::frame(frame::HEADERS, &head(&request)?);
         if request.extensions().get::<Protocol>().is_some() {
@@ -164,10 +177,7 @@ impl Client {
                 return Err(failure.io());
             }
             if state.goaway.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "h3: the server is going away",
-                ));
+                return Err(ServerSaid::GoingAway.io());
             }
         }
         let (send, recv) = self
@@ -295,13 +305,11 @@ impl Inner {
         }
     }
 
-    /// A failed read of a request stream as an I/O error.
+    /// A failed read of a request stream as an I/O error: the server's
+    /// reset with its code (`rejected`).
     pub(super) fn read_error(&self, e: ReadError) -> io::Error {
         match e {
-            ReadError::Reset(code) => io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                format!("h3: the server reset the stream ({})", code_name(code)),
-            ),
+            ReadError::Reset(code) => ServerSaid::Reset(code).io(),
             ReadError::ConnectionLost(e) => self.lost(&e),
             ReadError::ClosedStream
             | ReadError::IllegalOrderedRead
@@ -309,13 +317,11 @@ impl Inner {
         }
     }
 
-    /// A failed write of a request stream as an I/O error.
+    /// A failed write of a request stream as an I/O error: the server's
+    /// stop with its code (`rejected`).
     pub(super) fn write_error(&self, e: WriteError) -> io::Error {
         match e {
-            WriteError::Stopped(code) => io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                format!("h3: the server stopped the stream ({})", code_name(code)),
-            ),
+            WriteError::Stopped(code) => ServerSaid::Stopped(code).io(),
             WriteError::ConnectionLost(e) => self.lost(&e),
             WriteError::ClosedStream | WriteError::ZeroRttRejected => closed_stream(),
         }
