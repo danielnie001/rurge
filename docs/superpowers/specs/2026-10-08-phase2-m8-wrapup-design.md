@@ -145,7 +145,7 @@
 - 服务端一侧旧握手已被弃用：v2ray-core 自 2022-01-01 起缺省拒绝（要设 `V2RAY_VMESS_AEAD_FORCED=false` 才收，并预告将来去掉这条退路），Xray 自 v1.8.3（2023-06）起删除，sing-box 与 mihomo 只在 `alterId ≥ 1` 时收、且只认派生的 alter ID——Surge 没有 `alterId`，用哪个 ID 做认证密钥查不到。
 - 自 v2ray-core 4.28.1（2020-09）起的服务端都收 AEAD 握手，不论那个用户配的 `alterId` 是多少。只收旧握手的只剩 2020-09 之前、六年没升级的服务端。
 
-决定：rurge 只说 AEAD 握手。没写 `vmess-aead=true`（或写了 `false`）的 `vmess` 行不再按"协议未实现"拒绝，而是照样用 AEAD 握手，并告警一次（`W0029`：`` `vmess-aead=false` has no effect: rurge always uses the AEAD handshake, which every server since V2Ray 4.28.1 accepts ``，每次加载一条）。
+决定：rurge 只说 AEAD 握手。没写 `vmess-aead=true`（或写了 `false`）的 `vmess` 行不再按"协议未实现"拒绝，而是照样用 AEAD 握手，并告警一次（`W0029`：`` `vmess` without `vmess-aead=true` uses the AEAD handshake all the same: rurge has no other, and every server since V2Ray 4.28.1 accepts it ``，每次加载一条；这句文本终审时改过，见第 12 节第 4 条）。
 
 理由：这样的行在今天的服务端上，Surge 自己用旧握手多半连不上，rurge 用 AEAD 反而连得上；只有对 2020 年之前的服务端 rurge 连不上而 Surge 连得上。比起实现一种各家都在删除的不安全握手、再为它在 CI 里多装一个参照服务端（v2ray-core），这是更有用也更省的取法。`NotImplemented::LegacyVmess` 随之去掉。差异登记进兼容性清单；需求 FR-OUT-06 的"VMess 旧握手"一项以"不实现"结案。
 
@@ -432,12 +432,12 @@ M8b（第 4 节）按 `docs/superpowers/plans/2026-10-08-phase2-m8b-p2-protocols
 1. **`W0007` 的文本**（4.4）。M8b 之后它只有三种来源，各一句：`tailscale` 是 `` policy type `tailscale` is not supported; a tailnet is reached through tailscaled's SOCKS5 proxy with a `socks5` or an `external` policy; such policies behave as REJECT ``（文本自己说出能用的写法，不是指向兼容性清单）；`snell` 的 `version=6` 是 `` `snell` version 6 is not supported: it is a beta protocol without a public specification; such policies behave as REJECT ``；手册不再列出的 9 个 `ss` 方法名是 `` `ss` cipher `<方法>` is not supported (Surge no longer lists it); such policies behave as REJECT ``。第 4.4 节没有提到订阅导入的行：它们的告警同样改了，`` policy group `<组>`: imported policies of type <种类> are not supported; they behave as REJECT ``。会话日志的 `policy protocol not implemented: <说明>` 没有动。代码注释里把 `W0007`、`OutboundError::Unsupported` 与没有 spec 的策略说成"还没实现"的地方，一并改成了"不实现"。
 2. **提示的机制**（4.1、4.2）。"策略照建，每次加载按种类说一次"的两条告警——`vmess-aead` 的 `W0029` 与流式方法的 `W0031`——共用一个新的 `Remark`，与"不建策略"的 `NotImplemented` 并列。主配置里每种每次加载一条，落在第一条这样的策略行上。订阅导入的行按"组 × 种类"各一条（第 4.1 节原来写"每种方法每次装配一条"，已就地改），文本另写：`` policy group `<组>`: imported `vmess` policies without `vmess-aead=true` use the AEAD handshake `` 与 `` policy group `<组>`: imported `ss` policies use the stream cipher `<方法>`: it gives no integrity protection and is deprecated ``——后一句没有"use an AEAD cipher"，订阅的行使用者改不了。按组说是因为组的 `external-policy-modifier` 是使用者能消掉这类提示的地方；导入行的 `W0007` 则照旧按种类跨组只说一次。行有错误或没有 spec 时不给提示。
 3. **流式方法**（4.1）。
-   - 第 4.1 节就地改了三处：`W0031` 的文本是 `… and is deprecated; use an AEAD cipher`（原写 `has been deprecated`）；流的类型叫 `CipherStream`（原写 `StreamCipherStream`）；`FakeShadowsocks` 的密钥流与出站共用 `Keystream`（原写"密钥流独立实现"）。流式方法的"封帧"只有一个 IV，把密码再写一遍没有意义：`Keystream` 的正确性由标准向量与互操作钉住，假服务端的读 IV、解析地址、转发与 UDP 的拆包封包仍是它自己的代码。
+   - 第 4.1 节就地改了四处。一处是订阅导入的行按什么去重，见上面第 2 条；另三处：`W0031` 的文本是 `… and is deprecated; use an AEAD cipher`（原写 `has been deprecated`）；流的类型叫 `CipherStream`（原写 `StreamCipherStream`）；`FakeShadowsocks` 的密钥流与出站共用 `Keystream`（原写"密钥流独立实现"）。流式方法的"封帧"只有一个 IV，把密码再写一遍没有意义：`Keystream` 的正确性由标准向量与互操作钉住，假服务端的读 IV、解析地址、转发与 UDP 的拆包封包仍是它自己的代码。
    - 密钥流有尽头：`chacha20` 0.9.1 的两种 ChaCha20——原版与 `chacha20-ietf`——都以 32 位计块，一条连接的每个方向在 (2^32 − 1) × 64 字节（256 GiB 少 64 字节）处到头。到头时这条连接以 `ss: the cipher's keystream is used up` 失败：不 panic，也不在回绕的密钥流下发出字节。第 4.1 节与第 8 节第 2 条只提了原版 `chacha20`。`salsa20` 以 64 位计块，实际上没有尽头。
    - 口令或方法不对：流式方法什么都不认证，两端各自解出乱码，服务端多半不回一个字节就走。第一个字节到达之前连接结束或被重置，按错误报出，文本与 AEAD 方法相同（`ss: the server closed the connection without answering`、`ss: the server reset the connection without answering (wrong password or method?)`）；IV 收到一半就结束是 `ss: the connection ended in the middle of the server's IV`。代价与 AEAD 方法一样：目标自己一个字节不回就关闭的会话也记成第一句。
    - 我方的 IV 与首段密文在同一次写里发出，一次写至多取 16 KiB；未知 `encrypt-method` 的错误列出全部 19 个可用的名字。
    - 假服务端（对所有方法）只连接、只发往 127.0.0.1 与 ::1 本身：口令不对时流式方法解出的"地址"是任意地址，测试不能因此碰公网。
-4. **VMess**（4.2）。照设计做了，告警的文本逐字相同。不写 `vmess-aead`、写 `false` 与写 `true` 的行得到同一个 spec：重载时在这个参数上来回改不重建出站。
+4. **VMess**（4.2）。照设计做了。告警的文本终审时改过，第 4.2 节已就地改：设计原来写的 `` `vmess-aead=false` has no effect: rurge always uses the AEAD handshake, which every server since V2Ray 4.28.1 accepts `` 对根本没写这个参数的行说不通，现在没写与写了 `false` 的行同是一句 `` `vmess` without `vmess-aead=true` uses the AEAD handshake all the same: rurge has no other, and every server since V2Ray 4.28.1 accepts it ``（订阅导入行的那一句没有动）。不写 `vmess-aead`、写 `false` 与写 `true` 的行得到同一个 spec：重载时在这个参数上来回改不重建出站。
 5. **Snell v1 ～ v3**（4.3）。
    - 零长度块只认一种写法。第 9 节 V5 说"读端两种都要认"；核对 mihomo v1.19.32 的源码之后改了主意：监听端两个方向写的都只是密封的长度那一段，"再密封一段空负载"的写法只在它的另一条写路径上、监听端的应答到不了那里，两份开源实现的读端也都不认它。代价：对写另一种的服务端，复用的 v2 连接上的下一个请求会解不开。
    - 各版本怎样结束自己的方向（第 4.3 节没有写）：v1 / v3 以 TCP 的写关闭结束，不发零长度块——v1 的服务端不认得它；v2 以零长度块结束，连接留着；服务端发来的零长度块在三个版本上都结束它的方向。
@@ -454,3 +454,7 @@ M8b（第 4 节）按 `docs/superpowers/plans/2026-10-08-phase2-m8b-p2-protocols
    - 一次拉起的端口由 `rurge_interop::free_ports` 一次取齐，免得同一份配置的两个监听端拿到同一个号。
    - mihomo 与 `ssserver` 流式方法的用例都还没有对真实的二进制跑过（本机不装参照服务端）：第一次 CI 运行时核对，要核对的项目列在同一份 README 里。
 8. **验收标准第 1 条**（6.2，已就地改；总设计第 14 节第 1 条同改）。simple-obfs 不再属于"没有可用参照服务端的情形"：mihomo 的监听端说它，CI 上装了 mihomo。确切的说法是"有参照、还没跑过"——直到第一次 CI 运行。`ss` 的 `salsa20` 仍在那张名单里。
+9. **终审之后的订正**（整分支评审之后、合并之前的一轮；逐项与提交见该计划「执行期修正记录」里任务一栏写"终审"的各行）。
+   - `W0029` 的文本（4.2，已就地改；见上面第 4 条）。
+   - CI（3.1）。参照服务端的每个安装步骤——连同把 `RURGE_TEST_SSHD` 指向 `sshd` 的那一步——带 `continue-on-error: true`，`RURGE_INTEROP_REQUIRED=1` 从 sing-box 的安装步骤提到工作流一级的 `env`（留在那一步里的话，那一步一失败变量就没有了，全部互操作用例会不声不响地跳过）。某个参照服务端装不上（下载失败、资产挪了地方）时任务不再停在那一步：要用它的互操作用例各自以"找不到二进制"失败，其余的测试照常运行、照常进失败摘要。代价：安装失败不再表现为一个失败的步骤，而是一批失败的用例。3.1 说的"一次运行要给出全部结果"由此也管到安装步骤；同一轮还让互操作用例把一张表里失败的策略全部报出（原来在第一条失败处就停）。
+   - 其余各项不改变本文的说法，只记在该计划里：已经报错的参数不再多说一句（`ecn` 与 `ss` 的 `udp-port`；与第 6 条里 `snell` 的 `version` 写错时不再说 `mode` 同一个道理）；`tests/interop/tests/snell.rs` 对 sing-box 与官方 snell-server 各加一个"版本或 PSK 不符"的用例，兼容性清单 4.2 `snell` 一行里说没写 `version` 的行对 v4 / v5 服务端很快失败的那一句随之加了前提（服务端读不出请求就关闭或重置连接），等第一次 CI 运行核对；回环假服务端 `FakeSnell` 不再按自己的版本拒绝命令；README 里随合并变成不实的几处与文档评审的几处订正。
