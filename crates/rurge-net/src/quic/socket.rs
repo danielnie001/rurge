@@ -108,17 +108,6 @@ impl UdpPoller for Writable {
     }
 }
 
-/// Never waits: for sockets that drop what they cannot send now, as a
-/// full socket buffer would.
-#[derive(Debug)]
-pub(crate) struct NeverBlocks;
-
-impl UdpPoller for NeverBlocks {
-    fn poll_writable(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
 /// `ecn=off` (phase 2 M7 design 3.4): no ECN mark on what goes out, none
 /// seen on what comes in. quinn's ECN validation then fails at the first
 /// acknowledgement on either side, and both stop marking.
@@ -170,6 +159,7 @@ impl AsyncUdpSocket for NoEcn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quic::testing::NeverBlocks;
     use quinn::udp::EcnCodepoint;
     use std::sync::Mutex;
 

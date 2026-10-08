@@ -19,7 +19,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, Weak};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub struct PipelineConnector {
@@ -166,6 +166,9 @@ impl<S: Datagram> Datagram for FinishOnDrop<S> {
     fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         self.inner.poll_send(cx, buf)
     }
+    fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner.poll_send_ready(cx)
+    }
     fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         self.inner.poll_recv(cx, buf)
     }
@@ -189,10 +192,17 @@ pub(crate) fn wrap_internal(stream: BoxedStream, handle: Arc<SessionHandle>) -> 
 }
 
 /// Counts a carrier's datagrams into a session handle, as `Counting` counts
-/// a stream's bytes: what it receives is `down`, what it sends `up`.
+/// a stream's bytes: what it receives is `down`, what it sends `up`. What
+/// the carrier fails with — a datagram it could not send, its own end — is
+/// the session's failure, as a flow's whose datagram cannot be sent: it
+/// goes on the record, counts against the `smart` member that carried the
+/// session, and reaches the resolver under the policy's name.
 struct CountingDatagram {
     inner: BoxedDatagram,
     handle: Arc<SessionHandle>,
+    /// The policy the carrier goes through, which its failure names; `None`
+    /// for one that goes directly in a policy's place.
+    via: Option<String>,
 }
 
 impl Datagram for CountingDatagram {
@@ -203,17 +213,30 @@ impl Datagram for CountingDatagram {
         }
         sent
     }
+    fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner.poll_send_ready(cx)
+    }
     fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let before = buf.filled().len();
-        let received = self.inner.poll_recv(cx, buf);
-        if let Poll::Ready(Ok(())) = &received {
-            let n = buf.filled().len() - before;
-            self.handle.add_down(n as u64);
-            if n > 0 {
-                self.handle.mark_first_byte();
+        match ready!(self.inner.poll_recv(cx, buf)) {
+            Ok(()) => {
+                let n = buf.filled().len() - before;
+                self.handle.add_down(n as u64);
+                if n > 0 {
+                    self.handle.mark_first_byte();
+                }
+                Poll::Ready(Ok(()))
+            }
+            Err(e) => {
+                let failed = crate::udp::upstream_failed(&self.handle, e.to_string());
+                self.handle.finish(failed);
+                Poll::Ready(Err(match &self.via {
+                    // the text alone could pass for the DNS server's own
+                    Some(via) => io::Error::new(e.kind(), format!("via {via}: {e}")),
+                    None => e,
+                }))
             }
         }
-        received
     }
     fn peer_addr(&self) -> Option<SocketAddr> {
         self.inner.peer_addr()
@@ -224,17 +247,20 @@ impl Datagram for CountingDatagram {
 }
 
 /// `wrap_internal` for a freshly opened QUIC carrier: its datagrams are
-/// counted (`CountingDatagram`) and the handle is finished on drop
+/// counted (`CountingDatagram`) — its failure told under the name of the
+/// policy it goes through, `via` — and the handle is finished on drop
 /// (`FinishOnDrop`); the outbound is ready as of now.
 pub(crate) fn wrap_internal_udp(
     datagram: BoxedDatagram,
     handle: Arc<SessionHandle>,
+    via: Option<&str>,
 ) -> BoxedDatagram {
     handle.mark_connected();
     Box::new(FinishOnDrop::new(
         CountingDatagram {
             inner: datagram,
             handle: handle.clone(),
+            via: via.map(str::to_string),
         },
         handle,
     ))
@@ -351,7 +377,7 @@ mod tests {
             .connect_udp(&target, &ConnectOpts::default())
             .await
             .unwrap();
-        let carrier = wrap_internal_udp(datagram, handle.clone());
+        let carrier = wrap_internal_udp(datagram, handle.clone(), None);
         assert!(handle.connect_time().is_some());
         assert_eq!(
             carrier.peer_addr(),
@@ -363,5 +389,50 @@ mod tests {
         assert!(!handle.is_finished());
         drop(carrier);
         assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+    }
+
+    /// A carrier whose receive tells that it failed.
+    struct Failing;
+
+    const NO_RELAY: &str = "proxy: the server relays no UDP";
+
+    impl Datagram for Failing {
+        fn poll_send(&self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_recv(&self, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(io::ErrorKind::Unsupported, NO_RELAY)))
+        }
+    }
+
+    /// What a carrier fails with ends its session as a failure, in the
+    /// carrier's words — the failure of the member that carried it —, and
+    /// goes on to the resolver under the policy's name; the failure of a
+    /// carrier that goes in no policy's name goes on as it is.
+    #[test]
+    fn a_carrier_that_fails_fails_its_session_and_names_its_policy() {
+        for (via, heard) in [
+            (Some("Proxy"), format!("via Proxy: {NO_RELAY}")),
+            (None, NO_RELAY.to_string()),
+        ] {
+            let handle = SessionHandle::new(1, SessionInfo::udp(HostName::parse("192.0.2.1"), 853));
+            let carrier = wrap_internal_udp(Box::new(Failing), handle.clone(), via);
+            let mut storage = [0u8; 64];
+            let mut buf = ReadBuf::new(&mut storage);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            let Poll::Ready(Err(e)) = carrier.poll_recv(&mut cx, &mut buf) else {
+                panic!("the carrier fails");
+            };
+            assert_eq!(
+                (e.kind(), e.to_string()),
+                (io::ErrorKind::Unsupported, heard)
+            );
+            let failed = Some(SessionOutcome::Failed(NO_RELAY.to_string()));
+            assert_eq!(handle.outcome(), failed);
+            assert!(handle.upstream_failed());
+            // and stays so when the carrier goes
+            drop(carrier);
+            assert_eq!(handle.outcome(), failed);
+        }
     }
 }

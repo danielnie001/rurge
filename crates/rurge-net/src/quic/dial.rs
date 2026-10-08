@@ -86,12 +86,14 @@ pub fn client_config(
 /// that ends with the connection. `server_name` is what TLS verifies and
 /// sends as SNI (none for an IP address). Nothing bounds the handshake
 /// here but the idle timeout: the caller's request timeout does (design
-/// 3.5).
+/// 3.5). A handshake that ends because the path's carrier failed fails
+/// with the carrier's own error.
 pub async fn connect(
     path: Path,
     config: &ClientConfig,
     server_name: &str,
 ) -> io::Result<Connection> {
+    let carrier = path.carrier;
     let endpoint = Endpoint::new_with_abstract_socket(
         EndpointConfig::default(),
         None,
@@ -101,7 +103,12 @@ pub async fn connect(
     let connecting = endpoint
         .connect_with(config.clone(), path.remote, server_name)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("quic: {e}")))?;
-    connecting.await.map_err(|e| describe(&e, true))
+    connecting.await.map_err(|e| {
+        // quinn knows only that the endpoint is gone (`DRIVER_LOST`): the
+        // carrier knows why
+        let failure = carrier.and_then(|carrier| carrier.failure());
+        failure.unwrap_or_else(|| describe(&e, true))
+    })
 }
 
 /// A connection's end as an I/O error: `quic: …`, or `tls: …` for a failed

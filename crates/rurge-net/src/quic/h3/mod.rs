@@ -266,6 +266,7 @@ mod tests {
         let path = Path {
             socket: loopback_socket(),
             remote: server.local_addr().unwrap(),
+            carrier: None,
         };
         let client = client_config(cert.client_tls(ALPN), transport).unwrap();
         let (connection, accepted) = timeout(BOUND, async {

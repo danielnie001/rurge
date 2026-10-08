@@ -627,3 +627,43 @@ async fn a_carrier_gone_through_direct_in_place_of_a_member_is_not_reported() {
     assert_eq!(smart.site("127.0.0.1", now), SiteMemory::default());
     assert!(smart.most_used("S", &["NoUdp".to_string()], now).is_empty());
 }
+
+/// A carrier that opens and then cannot send — a MASQUE server without
+/// CONNECT-UDP says so only once the first packet is to go — is its
+/// member's failure at the server, as a flow's that cannot be sent is: the
+/// session ends with it, and tells at once what three silent seconds would
+/// have told of one that stayed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_carrier_that_cannot_send_counts_against_its_member_at_once() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let proxy = FakeH3Proxy::spawn(H3ProxyScript {
+        no_extended_connect: true,
+        ..H3ProxyScript::default()
+    });
+    let proxies = format!(
+        "M = masque, 127.0.0.1, {}, skip-cert-verify=true",
+        proxy.addr().port()
+    );
+    let server = format!("quic://{}", doq.addr());
+    let h = dns_smart("", &server, &proxies, "M", "PROTOCOL,DOQ,S").await;
+    let started = Instant::now();
+    let resolver = h.engine.runtime().stack.resolver.clone();
+    let lookup =
+        tokio::spawn(async move { resolver.lookup("target.test", LookupOpts::default()).await });
+    let registry = h.engine.registry();
+    let smart = &registry.auto().smart;
+    wait_until("the report of the failure", || {
+        smart.site("127.0.0.1", Instant::now()).failed == ["M"]
+    })
+    .await;
+    let told = started.elapsed();
+    assert!(told < Duration::from_secs(2), "{told:?}");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), lookup)
+        .await
+        .expect("the lookup within the bound")
+        .unwrap();
+    assert!(outcome.is_err(), "{outcome:?}");
+    assert_eq!(doq.connections(), 0);
+}

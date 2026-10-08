@@ -38,6 +38,9 @@ use std::sync::Arc;
 pub struct Path {
     pub socket: Arc<dyn AsyncUdpSocket>,
     pub remote: SocketAddr,
+    /// The carrier under `socket`, when the path goes over one: should it
+    /// fail, it says why (`connect`).
+    carrier: Option<Arc<carrier::Carried>>,
 }
 
 impl Path {
@@ -62,6 +65,7 @@ impl Path {
                 Path {
                     socket: socket::direct_socket(direct, Family::of(&remote.ip()))?,
                     remote,
+                    carrier: None,
                 }
             }
             (Some(direct), Some(hopping)) => {
@@ -73,12 +77,18 @@ impl Path {
                 Path {
                     remote: hopping.remote(),
                     socket: Arc::new(hopping),
+                    carrier: None,
                 }
             }
-            (None, None) => Path {
-                socket: Arc::new(carrier::Carried(connector.connect_udp(server, opts).await?)),
-                remote: carrier::STAND_IN,
-            },
+            (None, None) => {
+                let carrier = connector.connect_udp(server, opts).await?;
+                let carried = Arc::new(carrier::Carried::new(carrier));
+                Path {
+                    socket: carried.clone(),
+                    remote: carrier::STAND_IN,
+                    carrier: Some(carried),
+                }
+            }
             (None, Some(_)) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -89,7 +99,7 @@ impl Path {
         Ok(match ecn {
             Tristate::Off => Path {
                 socket: Arc::new(socket::NoEcn(path.socket)),
-                remote: path.remote,
+                ..path
             },
             Tristate::Auto | Tristate::On => path,
         })
@@ -101,7 +111,9 @@ mod tests {
     use super::testing::{EchoServer, MultiPort, TestCert, endpoint, loopback_socket};
     use super::*;
     use crate::BoxFuture;
-    use crate::connector::{BoxedDatagram, BoxedStream, Datagram, DirectConnector, Resolve};
+    use crate::connector::{
+        BoxedDatagram, BoxedStream, Datagram, DirectConnector, PacketSocket, Resolve,
+    };
     use crate::packet_datagram::packet_datagram;
     use crate::socket::{SocketHook, SocketOpts};
     use bytes::Bytes;
@@ -413,6 +425,117 @@ mod tests {
                 ConnectionError::LocallyClosed | ConnectionError::TransportError(_)
             ),
             "{closed:?}"
+        );
+    }
+
+    /// Hands out a direct connector's own UDP flows — connected sockets —
+    /// as a chain's, the way the resolver's connector does for a DNS
+    /// server over QUIC.
+    struct Flows;
+
+    impl Connector for Flows {
+        fn connect<'a>(
+            &'a self,
+            _target: &'a Target,
+            _opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            Box::pin(std::future::ready(Err(io::Error::other("UDP only"))))
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            Box::pin(async move { direct().connect_udp(target, opts).await })
+        }
+    }
+
+    /// A carrier that cannot send yet keeps quinn waiting, where its
+    /// datagram was once dropped: a new socket is not known to be writable
+    /// before the reactor has run, which on this runtime it does between
+    /// the tasks — after the connection's first packet was to go. The
+    /// handshake does not wait for quinn to send that packet again, a
+    /// second later.
+    #[tokio::test]
+    async fn a_carrier_that_cannot_send_yet_keeps_the_first_packet() {
+        let cert = TestCert::new();
+        let server = EchoServer::spawn(cert.server_config(ALPN));
+        let path = open(
+            &Flows,
+            &at("127.0.0.1", server.addr().port()),
+            None,
+            Tristate::Auto,
+        )
+        .await;
+        assert_eq!(path.remote, carrier::STAND_IN);
+        let started = Instant::now();
+        let connection = dial(path, &cert, &Transport::STANDARD).await.unwrap();
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(500), "{took:?}");
+        echoes(&connection).await;
+    }
+
+    /// A carrier nothing goes out on: every send fails, as through a proxy
+    /// that turns out to relay no UDP.
+    struct NoRelay;
+
+    impl PacketSocket for NoRelay {
+        fn send_to<'a>(&'a self, _buf: &'a [u8], _to: &'a Target) -> BoxFuture<'a, io::Result<()>> {
+            Box::pin(std::future::ready(Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "proxy: the server relays no UDP",
+            ))))
+        }
+
+        fn recv_from<'a>(
+            &'a self,
+            _buf: &'a mut [u8],
+        ) -> BoxFuture<'a, io::Result<(usize, Target)>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// The chain of `NoRelay`.
+    struct Unrelayed;
+
+    impl Connector for Unrelayed {
+        fn connect<'a>(
+            &'a self,
+            _target: &'a Target,
+            _opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            Box::pin(std::future::ready(Err(io::Error::other("UDP only"))))
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            target: &'a Target,
+            _opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            let carrier = packet_datagram(Box::new(NoRelay), target.clone());
+            Box::pin(std::future::ready(Ok(carrier)))
+        }
+    }
+
+    /// A carrier that cannot send at all fails the dial at once, and in its
+    /// own words: not in quinn's — which knows only that its endpoint is
+    /// gone —, nor by a handshake left to time out.
+    #[tokio::test]
+    async fn a_carrier_that_cannot_send_fails_the_dial_in_its_own_words() {
+        let path = open(&Unrelayed, &at("quic.test", 443), None, Tristate::Auto).await;
+        // a handshake nothing answers would end here
+        let transport = Transport {
+            idle_timeout: Duration::from_secs(1),
+            ..Transport::STANDARD
+        };
+        let err = dial(path, &TestCert::new(), &transport).await.unwrap_err();
+        assert_eq!(
+            (err.kind(), err.to_string().as_str()),
+            (
+                io::ErrorKind::Unsupported,
+                "proxy: the server relays no UDP"
+            )
         );
     }
 

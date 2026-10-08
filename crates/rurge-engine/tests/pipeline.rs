@@ -18,6 +18,7 @@ use rurge_net::socket::{Family, NoopSocketHook, SocketHook};
 use rurge_net::testing::TestServer;
 use rurge_policy::GroupSelections;
 use rurge_proto::testing::{FakeHttpProxy, FakeSocks5, HttpProxyScript, Socks5Script};
+use rurge_proto_quic::testing::{FakeH3Proxy, H3ProxyScript};
 use rurge_rules::{GeoUrls, OutboundMode};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -2095,6 +2096,48 @@ async fn a_doq_carrier_the_proxy_will_not_open_fails_naming_the_policy() {
     .await
     .expect("the failed carrier is recorded");
     assert_eq!(failed.policy, ["Socks"]);
+    assert_eq!(failed.error.as_deref(), Some(refusal));
+    assert_eq!(doq.connections(), 0);
+}
+
+/// A proxy whose carrier opens and then cannot send — a MASQUE server
+/// without CONNECT-UDP says so only once the first packet is to go — fails
+/// the server at once, not by a handshake left to time out: the resolver
+/// hears the proxy's own words behind its name, and the carrier's record
+/// is a failure with them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_doq_carrier_the_proxy_cannot_send_on_fails_naming_the_policy() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let proxy = FakeH3Proxy::spawn(H3ProxyScript {
+        no_extended_connect: true,
+        ..H3ProxyScript::default()
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile(
+        &format!("quic://{}", doq.addr()),
+        &format!(
+            "M = masque, 127.0.0.1, {}, skip-cert-verify=true",
+            proxy.addr().port()
+        ),
+        "PROTOCOL,DOQ,M",
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let refusal = "masque: the server does not support CONNECT-UDP";
+    let err = lookup_outcome(&engine)
+        .await
+        .expect_err("the proxy carries no UDP");
+    assert!(
+        err.to_string().contains(&format!("via M: {refusal}")),
+        "{err}"
+    );
+    let failed = wait_for_record(&engine, Duration::from_secs(5), |r| {
+        r.transport == Transport::Udp && r.status == RecordStatus::Failed
+    })
+    .await
+    .expect("the failed carrier is recorded");
+    assert_eq!(failed.policy, ["M"]);
     assert_eq!(failed.error.as_deref(), Some(refusal));
     assert_eq!(doq.connections(), 0);
 }

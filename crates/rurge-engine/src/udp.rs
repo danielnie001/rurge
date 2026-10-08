@@ -12,7 +12,7 @@ use rurge_config::rule::{PolicyRef, ProtocolKind};
 use rurge_config::session::SessionInfo;
 use rurge_config::spec::Tristate;
 use rurge_inbound::{SessionHandle, SessionOutcome, UdpClient};
-use rurge_net::connector::{ConnectOpts, PacketSocket, Target};
+use rurge_net::connector::{ConnectOpts, PacketSocket, Target, lost_alone};
 use rurge_policy::TerminalKind;
 use rurge_policy::auto::SelectCtx;
 use rurge_proto::{OutboundRef, RejectKind, UdpSupport};
@@ -646,17 +646,11 @@ async fn forward(
     }
 }
 
-/// Whether a send that failed loses only its datagram, as any hop may lose
-/// one: the outbound will not carry it (too long for its framing, a name it
-/// cannot write) or the system turned it away (no buffer space, too long
-/// for it, no route for now). Anything else says the outbound cannot reach
-/// the target: the flow fails.
-fn lost_alone(e: &io::Error) -> bool {
-    e.kind() == io::ErrorKind::InvalidInput || e.raw_os_error().is_some()
-}
-
 /// The flow failed upstream: a `smart` group's member answers for it.
-fn upstream_failed(handle: &SessionHandle, message: impl Into<String>) -> SessionOutcome {
+pub(crate) fn upstream_failed(
+    handle: &SessionHandle,
+    message: impl Into<String>,
+) -> SessionOutcome {
     handle.mark_upstream_failed();
     failed(handle, message)
 }

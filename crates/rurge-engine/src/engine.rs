@@ -734,7 +734,9 @@ async fn bypass_udp_to_direct(
 ) -> io::Result<BoxedDatagram> {
     handle.set_error(why);
     match fallback.connect_udp(target, opts).await {
-        Ok(datagram) => Ok(crate::dns_pipeline::wrap_internal_udp(datagram, handle)),
+        Ok(datagram) => Ok(crate::dns_pipeline::wrap_internal_udp(
+            datagram, handle, None,
+        )),
         Err(e) => {
             handle.finish(SessionOutcome::Failed(e.to_string()));
             Err(e)
@@ -976,6 +978,7 @@ impl Engine {
             Ok(socket) => Ok(crate::dns_pipeline::wrap_internal_udp(
                 packet_datagram(socket, target),
                 handle,
+                Some(via),
             )),
             Err(e) => {
                 handle.finish(crate::udp::failed(&handle, e.to_string()));

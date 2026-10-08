@@ -28,6 +28,15 @@ pub type BoxedStream = Box<dyn AsyncStream>;
 pub trait Datagram: Send + Sync {
     /// Sends `buf` as one datagram.
     fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>>;
+    /// Waits until a send is worth trying: for a sender that keeps its
+    /// datagram while the carrier cannot take it (a QUIC connection through
+    /// the carrier). A carrier whose `poll_send` may be `Pending` says here
+    /// when, and one that wraps another passes it on; the others — whose
+    /// `poll_send` always takes or drops — are always ready.
+    fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let _ = cx;
+        Poll::Ready(Ok(()))
+    }
     /// Receives one datagram into `buf`.
     fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>>;
     /// Where the datagrams go, when the carrier knows.
@@ -66,6 +75,15 @@ pub trait PacketSocket: Send + Sync {
 }
 
 pub type BoxedPacketSocket = Box<dyn PacketSocket>;
+
+/// Whether a `PacketSocket::send_to` that failed loses only its datagram,
+/// as any hop may lose one: the carrier will not take it (too long for its
+/// framing, a name it cannot write) or the system turned it away (no buffer
+/// space, too long for it, no route for now). Anything else says the
+/// carrier cannot reach the target.
+pub fn lost_alone(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::InvalidInput || e.raw_os_error().is_some()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Target {
@@ -670,6 +688,10 @@ struct DirectDatagram {
 impl Datagram for DirectDatagram {
     fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         self.socket.poll_send(cx, buf)
+    }
+
+    fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.socket.poll_send_ready(cx)
     }
 
     fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {

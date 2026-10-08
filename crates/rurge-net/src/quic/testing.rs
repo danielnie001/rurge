@@ -3,7 +3,6 @@
 //! port hopping, and a port whose endpoints restart. Never used by
 //! production code.
 
-use super::socket::NeverBlocks;
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{
@@ -227,6 +226,17 @@ impl MultiPort {
     /// How many client addresses it heard from.
     pub fn clients(&self) -> usize {
         self.routes.lock().expect("the routes").len()
+    }
+}
+
+/// Never waits: for sockets that drop what they cannot send now, as a
+/// full socket buffer would.
+#[derive(Debug)]
+pub(crate) struct NeverBlocks;
+
+impl UdpPoller for NeverBlocks {
+    fn poll_writable(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
