@@ -9,6 +9,8 @@
 | 前置     | 阶段 1（M1 ～ M4b）已合并：配置解析、规则引擎、DNS、连接流水线、控制面、系统代理与服务安装             |
 
 > 2026-09-19 订正：M1 细化设计（`2026-09-19-phase2-m1-outbound-foundation-design.md` 第 11 节 C1–C8）对本文档做了八处订正，下文已按订正后的内容改写。
+>
+> 2026-10-08 订正：M8 细化设计（`2026-10-08-phase2-m8-wrapup-design.md`）改了三处——`W0007` 与 `OutboundError::Unsupported` 不退役而是改定义（M8-D10），VMess 的旧握手不实现（M8-D8），第 14 节的验收标准第 1、8 条——，下文已按订正后的内容改写。
 
 本文档是阶段 2 的总设计：定目标与范围、技术选型、crate 边界、跨里程碑共用的抽象、里程碑拆分、测试策略与验收。每个里程碑开工前再各写一份细化设计与实施计划（同阶段 1 的 M2 / M3 / M4）；各协议的线上格式、`smart` 的评分公式、API 的 JSON 形状等细节在那里定稿，不在本文档展开。
 
@@ -52,7 +54,7 @@
 | **M5 UDP 路径** | SOCKS5 UDP ASSOCIATE 入站、引擎 UDP 流水线、DIRECT UDP、已有协议的 UDP（`socks5` `trojan` `vmess` `anytls` `wireguard` `external`）、`udp-relay` `udp-port` `udp-policy-not-supported-behaviour`、UDP 测试（`test-udp` / `proxy-test-udp`）、`block-quic`、UDP 载体的链式拨号、`dns-follow-interface` | FR-IN-02（UDP）、FR-OUT-03（`test-udp` `block-quic`）/ 07 / 08（UDP）/ 11、FR-DNS-10 | 各协议 UDP 对参考服务器转发通过；不支持 UDP 的策略按全局设置处理 |
 | **M6 Shadowsocks / Snell / HTTP/2 族** | `ss`（AEAD、2022、obfs，含 UDP）、`snell` v4 / v5（obfs `http`、reuse，UDP over TCP；v1 ～ v3 与 v6 只解析、按 REJECT 处理，见 M6 细化设计 M6-D2）、`h2-connect`（`max-streams`、CONNECT-UDP）、`trust-tunnel`（h2） | FR-OUT-05 / 07 | 四种协议对参考实现转发通过 |
 | **M7 QUIC 族** | `rurge-net::quic` 公共件、`rurge-proto-quic`（`tuic` `tuic-v5` `hysteria2` `masque`、`trust-tunnel` 的 h3 模式）、`port-hopping`、`ecn`、DoH3 / DoQ 上游 | FR-OUT-03（`ecn`）/ 05、FR-DNS-04 | QUIC 族 TCP 与 UDP 转发通过；`h3://` `quic://` 上游解析正常。M7 细化设计 `2026-10-02-phase2-m7-quic-design.md` 把它拆成三份计划：M7a（QUIC 地基与 Hysteria 2）→ M7b（TUIC v5 / v4）→ M7c（HTTP/3 族：MASQUE、`trust-tunnel` 的 h3；DoQ / DoH3） |
-| **M8 收尾与验收** | P2 项（Shadowsocks 流式旧方法、VMess 旧握手）、Snell v1 ～ v3（需要时）、Snell v6 与 v5 QUIC Proxy Mode · Tailscale 可行性报告（Gecko 已在 M7a 照 Hysteria 官网的公开规范实现，M7-D11）、`W0007` 与 `OutboundError::Unsupported` 退役（M7-D12）、阶段验收清单、文档同步 | FR-OUT-06 / 15 | 第 14 节验收标准全部通过 |
+| **M8 收尾与验收** | P2 项（Shadowsocks 流式旧方法、VMess 旧握手）、Snell v1 ～ v3（需要时）、Snell v6 与 v5 QUIC Proxy Mode · Tailscale 可行性报告（Gecko 已在 M7a 照 Hysteria 官网的公开规范实现，M7-D11）、`W0007` 与 `OutboundError::Unsupported` 的归宿（M7-D12）、阶段验收清单、文档同步 | FR-OUT-06 / 15 | 第 14 节验收标准全部通过。M8 细化设计 `2026-10-08-phase2-m8-wrapup-design.md` 把它拆成三份计划：M8a（CI 转绿与凭据不外泄）→ M8b（P2 协议项：手册列出的 11 种流式方法与 Snell v1 ～ v3 实现，VMess 的旧握手不实现、没写 `vmess-aead=true` 的行改用 AEAD 握手）→ M8c（各份计划留下的遗留事项、可行性报告与阶段验收） |
 
 M1 体量大，细化设计时可按阶段 1 的先例拆成 M1a（配置与抽象）/ M1b（协议、注册表、API）。
 
@@ -128,7 +130,7 @@ pub enum ProtoSpec {
 }
 ```
 
-`ProxyPolicy` 保持不变（API 的策略详情、`redact_profile`、快照仍基于它）；`PolicySpec` 由它派生。各协议的 spec 随各自里程碑加入：M1 落 `CommonOpts`、`TlsOpts` 与 http / socks5；没轮到的协议继续产生 `W0007`，运行期按 REJECT 处理（阶段 1 的约定），`W0007` 在 M8 退役（原定 M7 结束时；M7 细化设计 M7-D12：M7 之后仍有 `tailscale`、ss 流式旧方法、vmess 旧握手与 Snell v1 ～ v3 / v6 留给 M8）。`capabilities::current()` 随里程碑增长，`#!REQUIREMENT` 的求值随之正确（PRD Q3）。
+`ProxyPolicy` 保持不变（API 的策略详情、`redact_profile`、快照仍基于它）；`PolicySpec` 由它派生。各协议的 spec 随各自里程碑加入：M1 落 `CommonOpts`、`TlsOpts` 与 http / socks5；没轮到的协议继续产生 `W0007`，运行期按 REJECT 处理（阶段 1 的约定）。`W0007` 原定在最后一个未实现的协议落地时退役（M7 结束时，M7-D12 改到 M8）；M8 细化设计 M8-D10 改为不退役：M8 之后它专指 rurge 不实现的协议与变体（`tailscale`、`snell` 的 `version=6`、手册没列的 `ss` 方法名）。`capabilities::current()` 随里程碑增长，`#!REQUIREMENT` 的求值随之正确（PRD Q3）。
 
 ### 4.2 诊断规则
 
@@ -245,7 +247,7 @@ pub trait OutboundFactory: Send + Sync {
 
 ### 5.7 错误模型
 
-`OutboundError` 增加 `Proxy(String)`（代理侧握手 / 鉴权失败，文本形如 `socks5: authentication failed`）、`Tls(String)`、`Unavailable(String)`；`Unsupported` 随 `W0007` 一起在 M8 退役（原定 M7 结束时，M7-D12）。凭据不出现在任何错误文本与日志里（FR-OBS-01）。
+`OutboundError` 增加 `Proxy(String)`（代理侧握手 / 鉴权失败，文本形如 `socks5: authentication failed`）、`Tls(String)`、`Unavailable(String)`；`Unsupported` 原定随 `W0007` 一起退役（M7-D12）；M8 细化设计 M8-D10 改为留着：它还承担"这个出站不载 UDP"的说明。凭据不出现在任何错误文本与日志里（FR-OBS-01）。
 
 ## 6. 协议一览
 
@@ -254,13 +256,13 @@ pub trait OutboundFactory: Send + Sync {
 | `http` / `https` | `rurge-proto` | M1 | TCP（+ TLS） | 不支持 |
 | `socks5` / `socks5-tls` | `rurge-proto` | M1（UDP：M5） | TCP（+ TLS） | `udp-relay`，UDP ASSOCIATE |
 | `trojan` | `rurge-proto` | M2（UDP：M5） | TLS（+ WS）（+ Shadow TLS） | 自动 |
-| `vmess` | `rurge-proto` | M2（UDP：M5；旧握手：M8） | TCP（+ TLS）（+ WS） | 自动 |
+| `vmess` | `rurge-proto` | M2（UDP：M5；旧握手不实现，M8-D8） | TCP（+ TLS）（+ WS） | 自动 |
 | `anytls` | `rurge-proto` | M2（UDP：M5） | TLS，会话复用 | 自动（UDP over TCP） |
 | `wireguard` | `rurge-proto-wireguard` | M4（UDP：M5） | UDP 载体上的 L3 隧道 + 用户态协议栈 | 自动 |
 | `ssh` | `rurge-proto-ssh` | M4 | SSH 通道 | 不支持 |
 | `external` | `rurge-proto` | M4（UDP：M5） | 到子进程本地端口的 SOCKS5 | `udp-relay` |
 | `ss` | `rurge-proto` | M6（流式旧方法：M8） | TCP（+ obfs） | `udp-relay`、`udp-port` |
-| `snell` v4 / v5 | `rurge-proto` | M6（v1 ～ v3：M8，需要时） | TCP（+ obfs `http`），reuse | 自动（UDP over TCP）、`udp-port` |
+| `snell` v1 ～ v5 | `rurge-proto` | M6（v4 / v5）；M8（v1 ～ v3，M8-D9） | TCP（+ obfs `http`，v1 ～ v3 另有 `tls`），reuse（v2 恒复用，v1 / v3 不复用） | 自动（v3 起，UDP over TCP）、`udp-port` |
 | `h2-connect` | `rurge-proto` | M6 | TLS + HTTP/2 多路复用 | `udp-relay`，CONNECT-UDP |
 | `trust-tunnel` | `rurge-proto`（h2）/ `rurge-proto-quic`（h3） | M6 / M7（h3：M7c） | HTTP/2，或 QUIC 上的 HTTP/3（自写，`rurge-net::quic::h3`） | 不支持 |
 | `tuic` / `tuic-v5` | `rurge-proto-quic` | M7（M7b） | QUIC（+ 端口跳跃） | 自动（`native` 数据报，服务端不支持数据报时每个包一条单向流） |
@@ -401,14 +403,14 @@ Surge 手册没有定义这些端点的响应结构（PRD R5）：以收集到�
 
 ## 14. 阶段 2 验收标准（对应需求文档第 7 节）
 
-1. 每种协议对参考服务器的 TCP 转发通过；支持 UDP 的协议 UDP 转发通过。
+1. 每种协议对参考服务器的 TCP 转发通过；支持 UDP 的协议 UDP 转发通过。没有可用参照服务端的情形（`socks5-tls`、simple-obfs、CONNECT-UDP over HTTP/2、TUIC 的 `quic` 模式、端口跳跃、`ss` 的 `salsa20`）由回环假服务端覆盖并进手工验收清单（M8 细化设计 6.2）。
 2. 链式代理通过：两级 TCP 链；QUIC 类与 WireGuard 经底层代理的 UDP 载体链。
 3. 策略组五种算法的单元测试与端到端测试通过；六个 API 端点的测试与切换行为正确，`select` 的选择重启后保留。
 4. 订阅样本（策略行列表与含 `[Proxy]` 的完整配置两种形式）解析正确；过滤、前缀、修饰与装配顺序符合清单 5.2。
 5. Shadow TLS v2（以及 v3，取决于风险 A 的结论）与六个 TLS 参数各有测试。
 6. WireGuard 与带 `client-id` 的端点握手成功并转发。
 7. `h3://` 与 `quic://` 上游解析正常。
-8. 三平台 CI 绿（含互操作 job）；clippy 零警告；`W0007` 与 `W0008` 不再出现。
+8. 三平台 CI 绿（含互操作 job）；clippy 零警告；`W0007` 只对 rurge 不实现的协议与变体出现（`tailscale`、`snell` 的 `version=6`、手册没列的 `ss` 方法名），`W0008` 只对 `subnet` 组出现（阶段 3）（M8 细化设计 6.2 订正；原文是"`W0007` 与 `W0008` 不再出现"）。
 9. 需要真实公网节点的项目进入 `docs/acceptance/phase2-manual.md`，由项目所有者用自己的节点手工验收。
 
 ## 15. 风险
