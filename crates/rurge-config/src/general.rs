@@ -2,7 +2,9 @@
 
 use crate::diagnostic::{Diagnostic, Diagnostics, codes};
 use crate::hostlist::HostList;
+use crate::redact::{url_without_credentials, without_credentials};
 use crate::span::Span;
+use crate::spec::secret::Secret;
 use crate::text::Section;
 use crate::value::{parse_bool, split_definition, split_list};
 use ipnet::IpNet;
@@ -34,10 +36,21 @@ pub enum EncryptedDnsScheme {
     Tcp,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EncryptedDns {
     pub scheme: EncryptedDnsScheme,
     pub url: String,
+}
+
+/// The URL without a user name and a password it may carry.
+impl fmt::Debug for EncryptedDns {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let EncryptedDns { scheme, url } = self;
+        f.debug_struct("EncryptedDns")
+            .field("scheme", scheme)
+            .field("url", &url_without_credentials(url))
+            .finish()
+    }
 }
 
 impl EncryptedDns {
@@ -79,10 +92,20 @@ pub enum Ipv6Vif {
     Always,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ControllerAccess {
     pub key: String,
     pub addr: SocketAddr,
+}
+
+impl fmt::Debug for ControllerAccess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ControllerAccess { key: _, addr } = self;
+        f.debug_struct("ControllerAccess")
+            .field("key", &"<redacted>")
+            .field("addr", addr)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,7 +201,8 @@ pub struct General {
     pub allow_hotspot_access: bool,
     pub wifi_access_http_port: u16,
     pub wifi_access_socks5_port: u16,
-    pub wifi_access_http_auth: Option<(String, String)>,
+    /// The user name and the password.
+    pub wifi_access_http_auth: Option<(String, Secret<String>)>,
     pub wifi_assist: bool,
     pub all_hybrid: bool,
     pub hide_vpn_icon: bool,
@@ -322,6 +346,28 @@ fn invalid(diags: &mut Diagnostics, span: &Span, key: &str, value: &str) {
     );
 }
 
+/// `invalid` for a value that may be a credential and nothing else (an API
+/// key written without its address): none of it is quoted.
+fn unusable(diags: &mut Diagnostics, span: &Span, key: &str, expected: &str) {
+    diags.push(
+        Diagnostic::warning(
+            codes::W_INVALID_VALUE,
+            format!("invalid value for `{key}` (expected `{expected}`), using default"),
+        )
+        .at(span.clone()),
+    );
+}
+
+/// `invalid` for `http-api` and `external-controller-access`: the key is
+/// never quoted — with an `@` only what follows it is, without one nothing.
+fn invalid_controller(diags: &mut Diagnostics, span: &Span, key: &str, value: &str) {
+    if value.contains(['@', '＠']) {
+        invalid(diags, span, key, &without_credentials(value));
+    } else {
+        unusable(diags, span, key, "key@address:port");
+    }
+}
+
 /// Keeps `current` unless `value` parses as an `http://` or `https://` URL —
 /// never echoed: `internet-test-url` / `proxy-test-url` may be set from the
 /// same profile a subscription line's `test-url=` came from, and the two
@@ -431,7 +477,10 @@ fn parse_listeners(
                     diags.push(
                         Diagnostic::warning(
                             codes::W_INVALID_VALUE,
-                            format!("`{key}` does not support a password; ignoring it in `{item}`"),
+                            format!(
+                                "`{key}` does not support a password; ignoring it in `{}`",
+                                without_credentials(&item)
+                            ),
                         )
                         .at(span.clone()),
                     );
@@ -442,7 +491,7 @@ fn parse_listeners(
             Err(msg) => diags.push(
                 Diagnostic::error(
                     codes::E_LISTENER_NOT_IP,
-                    format!("`{key}`: `{item}`: {msg}"),
+                    format!("`{key}`: `{}`: {msg}", without_credentials(&item)),
                 )
                 .at(span.clone()),
             ),
@@ -539,7 +588,7 @@ pub fn parse_general(section: Option<&Section>, diags: &mut Diagnostics) -> Gene
                     } else if let Some(sa) = parse_socket_addr(&item, 53) {
                         g.dns_server.push(DnsServer::Udp(sa));
                     } else {
-                        invalid(diags, span, key, &item);
+                        invalid(diags, span, key, &url_without_credentials(&item));
                     }
                 }
             }
@@ -550,7 +599,7 @@ pub fn parse_general(section: Option<&Section>, diags: &mut Diagnostics) -> Gene
                 for item in split_list(value) {
                     match EncryptedDns::parse(&item) {
                         Some(enc) => g.encrypted_dns_server.push(enc),
-                        None => invalid(diags, span, key, &item),
+                        None => invalid(diags, span, key, &url_without_credentials(&item)),
                     }
                 }
             }
@@ -614,13 +663,13 @@ pub fn parse_general(section: Option<&Section>, diags: &mut Diagnostics) -> Gene
             "external-controller-access" => {
                 g.external_controller_access = parse_controller(value);
                 if g.external_controller_access.is_none() {
-                    invalid(diags, span, key, value);
+                    invalid_controller(diags, span, key, value);
                 }
             }
             "http-api" => {
                 g.http_api = parse_controller(value);
                 if g.http_api.is_none() {
-                    invalid(diags, span, key, value);
+                    invalid_controller(diags, span, key, value);
                 }
             }
             "http-api-tls" => set_bool!(http_api_tls),
@@ -690,8 +739,10 @@ pub fn parse_general(section: Option<&Section>, diags: &mut Diagnostics) -> Gene
                     u16_or(diags, span, key, value, g.wifi_access_socks5_port)
             }
             "wifi-access-http-auth" => match value.split_once(':') {
-                Some((u, p)) => g.wifi_access_http_auth = Some((u.to_string(), p.to_string())),
-                None => invalid(diags, span, key, value),
+                Some((u, p)) => {
+                    g.wifi_access_http_auth = Some((u.to_string(), Secret::from(p.to_string())))
+                }
+                None => unusable(diags, span, key, "username:password"),
             },
             "wifi-assist" => set_bool!(wifi_assist),
             "all-hybrid" => set_bool!(all_hybrid),
@@ -985,7 +1036,7 @@ internet-test-url = ftp://127.0.0.1:9/?token=t0k3n
         assert!(g.allow_wifi_access);
         assert_eq!(
             g.wifi_access_http_auth,
-            Some(("user".into(), "pass".into()))
+            Some(("user".into(), Secret::from("pass")))
         );
         let c = codes_of(&d);
         assert!(c.contains(&codes::W_INVALID_VALUE));

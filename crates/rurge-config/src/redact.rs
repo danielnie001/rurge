@@ -3,8 +3,9 @@
 //! is preserved so line numbers in diagnostics still line up.
 
 /// Keys whose whole value is a secret when they stand alone on a line
-/// (`[WireGuard]` `private-key`, `[Snell Server]` `psk`, …).
-const SECRET_KEYS: [&str; 7] = [
+/// (`[WireGuard]` `private-key`, `[Snell Server]` `psk`, `[Tailscale]`
+/// `auth-key`, …).
+const SECRET_KEYS: [&str; 8] = [
     "password",
     "ca-passphrase",
     "ca-p12",
@@ -12,6 +13,7 @@ const SECRET_KEYS: [&str; 7] = [
     "psk",
     "pre-shared-key",
     "token",
+    "auth-key",
 ];
 /// Inline `name=value` parameters redacted wherever they appear in a value.
 /// `username` also covers harmless SSH user names; `headers` and `ws-headers`
@@ -52,12 +54,17 @@ const SECRET_PARAMS: [&str; 21] = [
     "obfs-host",
     "obfs-uri",
 ];
+/// Keys whose items are `[secret@]address`: what stands before an item's
+/// last `@` goes.
 const KEY_AT_KEYS: [&str; 4] = [
     "http-api",
     "external-controller-access",
     "http-listen",
     "socks5-listen",
 ];
+/// Keys that list DNS servers, whose URLs may carry a user name and a
+/// password (`https://user:pass@host/…`).
+const DNS_KEYS: [&str; 3] = ["dns-server", "encrypted-dns-server", "doh-server"];
 /// Policy types written `type, server, port, ...`. Surge documents positional
 /// credentials (`username, password`) for the four classic ones, and rurge
 /// reads them for `h2-connect` too (phase 2 M6 design 16); for the rest a
@@ -97,7 +104,7 @@ pub fn redact_profile(text: &str) -> String {
 /// Redacts one line, keeping a CRLF file's `\r` where it was: the line is split
 /// on `\n` by the caller, so `\r` would otherwise be eaten by the branches that
 /// rebuild the line from its parts.
-fn redact_line(line: &str) -> String {
+pub(crate) fn redact_line(line: &str) -> String {
     match line.strip_suffix('\r') {
         Some(rest) => format!("{}\r", redact_body(rest)),
         None => redact_body(line),
@@ -120,16 +127,20 @@ fn redact_body(line: &str) -> String {
             None => format!("{key}={lead}***"),
         };
     }
-    if KEY_AT_KEYS.contains(&k.as_str()) {
+    let shown: Option<fn(&str) -> String> = if KEY_AT_KEYS.contains(&k.as_str()) {
+        Some(without_credentials)
+    } else if DNS_KEYS.contains(&k.as_str()) {
+        Some(url_without_credentials)
+    } else {
+        None
+    };
+    if let Some(shown) = shown {
         let items: Vec<String> = value
             .split(',')
             .map(|item| {
                 let t = item.trim_start();
                 let lead = &item[..item.len() - t.len()];
-                match t.split_once('@') {
-                    Some((_, rest)) => format!("{lead}***@{rest}"),
-                    None => item.to_string(),
-                }
+                format!("{lead}{}", shown(t))
             })
             .collect();
         return format!("{key}={}", items.join(","));
@@ -139,6 +150,46 @@ fn redact_body(line: &str) -> String {
     // (those types carry credentials positionally; on every other type that
     // takes a server and a port a positional value is blanked all the same).
     format!("{key}={}", redact_definition(value))
+}
+
+/// Where the credential of `item` ends: its last `@`, as the parsers split
+/// there — a key may hold one itself. The fullwidth `＠` counts too: what
+/// resolves a name may read it as `@`.
+fn last_at(item: &str) -> Option<(usize, usize)> {
+    item.char_indices()
+        .rfind(|(_, c)| matches!(c, '@' | '＠'))
+        .map(|(at, sign)| (at, at + sign.len_utf8()))
+}
+
+/// `item` — `[secret@]address` — without what stands before its last `@`,
+/// an API key or a listener's password: all a diagnostic or the redacted
+/// profile may show of it.
+pub fn without_credentials(item: &str) -> String {
+    match last_at(item) {
+        Some((_, rest)) => format!("***@{}", &item[rest..]),
+        None => item.to_string(),
+    }
+}
+
+/// A URL without the user name and the password it may carry: its scheme
+/// — what can be one, a mistyped one too — stays in front of what follows
+/// the last `@`.
+pub fn url_without_credentials(url: &str) -> String {
+    let Some((at, rest)) = last_at(url) else {
+        return url.to_string();
+    };
+    let scheme = url[..at]
+        .split_once("://")
+        .map(|(scheme, _)| scheme)
+        .filter(|scheme| {
+            scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        });
+    match scheme {
+        Some(scheme) => format!("{scheme}://***@{}", &url[rest..]),
+        None => format!("***@{}", &url[rest..]),
+    }
 }
 
 /// A policy definition (the text right of `name =`) with its secrets blanked:
@@ -331,6 +382,61 @@ mod tests {
         );
         assert_eq!(out.lines().count(), text.lines().count());
         assert!(out.contains("FINAL,DIRECT"));
+    }
+
+    /// What stands before the last `@` goes, a key that holds an `@` of its
+    /// own with it, and a URL keeps its scheme; a list of DNS servers is
+    /// redacted item by item.
+    #[test]
+    fn what_stands_before_the_last_at_sign_goes() {
+        for (item, shown) in [
+            ("k3y@127.0.0.1:6171", "***@127.0.0.1:6171"),
+            ("pa@ss@127.0.0.1:6171", "***@127.0.0.1:6171"),
+            // a key is no URL, whatever it holds
+            ("pa://ss@127.0.0.1:6171", "***@127.0.0.1:6171"),
+            ("k3y＠127.0.0.1:6171", "***@127.0.0.1:6171"),
+            ("127.0.0.1:6152", "127.0.0.1:6152"),
+        ] {
+            assert_eq!(without_credentials(item), shown, "{item}");
+        }
+        for (url, shown) in [
+            (
+                "https://al1ce:pw@dns.example/dns-query",
+                "https://***@dns.example/dns-query",
+            ),
+            ("htps://al1ce:p://w@dns.example", "htps://***@dns.example"),
+            ("quic://al1ce:pw＠dns.example", "quic://***@dns.example"),
+            // no scheme in front: none of what stands there is one
+            ("al1ce:p://w@1.2.3.4", "***@1.2.3.4"),
+            (
+                "https://dns.example/dns-query",
+                "https://dns.example/dns-query",
+            ),
+            ("8.8.8.8", "8.8.8.8"),
+        ] {
+            assert_eq!(url_without_credentials(url), shown, "{url}");
+        }
+        let out = redact_profile(
+            "[General]
+http-api = pa@ss@127.0.0.1:6171
+encrypted-dns-server = https://al1ce:pw@dns.example/dns-query, quic://dns.example
+dns-server = 8.8.8.8, h3://b0b:pw@dns.example
+[Tailscale home]
+auth-key = tskey-auth-abc
+",
+        );
+        assert!(out.contains("http-api = ***@127.0.0.1:6171"), "{out}");
+        assert!(
+            out.contains(
+                "encrypted-dns-server = https://***@dns.example/dns-query, quic://dns.example"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("dns-server = 8.8.8.8, h3://***@dns.example"),
+            "{out}"
+        );
+        assert!(out.contains("auth-key = ***"), "{out}");
     }
 
     #[test]

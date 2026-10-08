@@ -22,7 +22,20 @@ impl ObfsMode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The camouflage host and the path are left blank, as the redacted
+/// profile leaves `obfs-host` and `obfs-uri`.
+impl std::fmt::Debug for ObfsOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ObfsOpts { mode, host, uri: _ } = self;
+        f.debug_struct("ObfsOpts")
+            .field("mode", mode)
+            .field("host", &host.as_ref().map(|_| "***"))
+            .field("uri", &"***")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct ObfsOpts {
     pub mode: ObfsMode,
     /// `obfs-host`: the `Host` header of `http`, the SNI of `tls`. `None`:

@@ -70,7 +70,8 @@ fn parse_value(text: &str) -> Result<Vec<HeaderPart>, String> {
             None => (spec.trim().parse::<usize>(), spec.trim().parse::<usize>()),
         };
         let (Ok(min), Ok(max)) = (min, max) else {
-            return Err(format!("invalid length in <random-string({spec})>"));
+            // not quoted: what stands there is a piece of the header's value
+            return Err("invalid length in <random-string(...)>".to_string());
         };
         if min == 0 || min > max || max > MAX_RANDOM {
             return Err(format!(
@@ -177,6 +178,18 @@ mod tests {
         ] {
             assert!(HeaderTemplate::parse_list(bad).is_err(), "{bad}");
         }
+    }
+
+    /// What stands where a placeholder's length should is not quoted: it
+    /// is a piece of the header's value, which may be a credential.
+    #[test]
+    fn a_placeholder_whose_length_is_none_is_not_quoted() {
+        let err = HeaderTemplate::parse_list("X-Auth: tok<random-string(en S3CR3T)>").unwrap_err();
+        assert!(!err.contains("S3CR3T"), "{err}");
+        assert!(err.contains("<random-string("), "{err}");
+        // a length out of range is a number, and says which
+        let err = HeaderTemplate::parse_list("X: <random-string(9999)>").unwrap_err();
+        assert!(err.contains("9999"), "{err}");
     }
 
     #[test]

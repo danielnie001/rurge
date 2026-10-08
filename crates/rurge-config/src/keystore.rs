@@ -10,7 +10,7 @@ pub enum KeystoreType {
     OpensshPrivateKey,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct KeystoreItem {
     pub name: String,
     pub kind: KeystoreType,
@@ -18,6 +18,28 @@ pub struct KeystoreItem {
     pub password: Option<String>,
     pub unknown: Vec<String>,
     pub span: Span,
+}
+
+/// Without the key material and its password.
+impl std::fmt::Debug for KeystoreItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let KeystoreItem {
+            name,
+            kind,
+            base64: _,
+            password,
+            unknown,
+            span,
+        } = self;
+        f.debug_struct("KeystoreItem")
+            .field("name", name)
+            .field("kind", kind)
+            .field("base64", &"***")
+            .field("password", &password.as_ref().map(|_| "***"))
+            .field("unknown", unknown)
+            .field("span", span)
+            .finish()
+    }
 }
 
 pub fn parse_keystore_item(

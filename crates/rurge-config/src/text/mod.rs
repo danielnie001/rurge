@@ -21,7 +21,28 @@ pub enum SectionKind {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The line as the redacted profile shows it: a section rurge does not
+/// read yet keeps its lines as written, secrets included.
+impl std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Entry {
+            raw,
+            span,
+            origin,
+            requirement,
+            disabled,
+        } = self;
+        f.debug_struct("Entry")
+            .field("raw", &crate::redact::redact_line(raw))
+            .field("span", span)
+            .field("origin", origin)
+            .field("requirement", requirement)
+            .field("disabled", disabled)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct Entry {
     /// Trimmed line content without inline comment and without requirement directive.
     pub raw: String,

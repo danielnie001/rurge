@@ -151,7 +151,7 @@ impl Builtin {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProxyPolicy {
     pub name: String,
     pub kind: PolicyKind,
@@ -162,6 +162,24 @@ pub struct ProxyPolicy {
     /// The text right of `name =` as written (API policy detail, `lineHash`).
     pub definition: String,
     pub span: Span,
+}
+
+/// `positional` and `params` are left out and `definition` redacted, as a
+/// group's are: they hold the line's credentials as written.
+impl std::fmt::Debug for ProxyPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyPolicy")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("server", &self.server)
+            .field("port", &self.port)
+            .field("span", &self.span)
+            .field(
+                "definition",
+                &crate::redact::redact_definition(&self.definition),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// Whether `s` looks enough like a hand-written keyword to quote safely in a

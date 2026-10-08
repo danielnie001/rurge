@@ -276,7 +276,10 @@ impl Engine {
                     general
                         .wifi_access_http_auth
                         .clone()
-                        .map(|(user, password)| HttpAuth::UserPass { user, password }),
+                        .map(|(user, password)| HttpAuth::UserPass {
+                            user,
+                            password: password.expose().clone(),
+                        }),
                 )
             } else {
                 (

@@ -5,13 +5,29 @@ use super::http::{is_field_text, is_token};
 use super::reader::ParamReader;
 use crate::diagnostic::codes;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WsOpts {
     /// Starts with `/`; may carry a query.
     pub path: String,
     /// Extra handshake headers in the order written. A `Host` entry replaces
     /// the default `Host`.
     pub headers: Vec<(String, String)>,
+}
+
+/// The path and the headers' values are left blank: a node behind a CDN
+/// has its path for a shared secret, and a header can be a credential.
+impl std::fmt::Debug for WsOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let WsOpts { path: _, headers } = self;
+        let names: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, _)| (name.as_str(), "***"))
+            .collect();
+        f.debug_struct("WsOpts")
+            .field("path", &"***")
+            .field("headers", &names)
+            .finish()
+    }
 }
 
 const WS_KEYS: [&str; 2] = ["ws-path", "ws-headers"];

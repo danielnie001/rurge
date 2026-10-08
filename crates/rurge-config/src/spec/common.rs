@@ -33,7 +33,43 @@ pub enum Applies {
     Reject,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// `test_url` is left blank: a subscription line's can carry its token.
+impl std::fmt::Debug for CommonOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let CommonOpts {
+            interface,
+            allow_other_interface,
+            dns_follow_interface,
+            no_error_alert,
+            ip_version,
+            tfo,
+            tos,
+            ecn,
+            block_quic,
+            test_url,
+            test_timeout,
+            test_udp,
+            underlying_proxy,
+        } = self;
+        f.debug_struct("CommonOpts")
+            .field("interface", interface)
+            .field("allow_other_interface", allow_other_interface)
+            .field("dns_follow_interface", dns_follow_interface)
+            .field("no_error_alert", no_error_alert)
+            .field("ip_version", ip_version)
+            .field("tfo", tfo)
+            .field("tos", tos)
+            .field("ecn", ecn)
+            .field("block_quic", block_quic)
+            .field("test_url", &test_url.as_ref().map(|_| "***"))
+            .field("test_timeout", test_timeout)
+            .field("test_udp", test_udp)
+            .field("underlying_proxy", underlying_proxy)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct CommonOpts {
     pub interface: Option<String>,
     pub allow_other_interface: bool,
