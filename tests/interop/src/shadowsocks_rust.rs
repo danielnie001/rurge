@@ -4,7 +4,7 @@
 //! of the rendered configuration listens on 127.0.0.1 only — its TCP port and
 //! the UDP port of the same number (`tcp_and_udp`).
 
-use crate::{REQUIRED_ENV, Reference, free_port};
+use crate::{REQUIRED_ENV, Reference, free_ports};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -82,9 +82,11 @@ impl Ssserver {
     /// Writes the configuration into `dir`, starts `binary` there and waits
     /// until every server accepts TCP connections.
     pub fn spawn(binary: &Path, dir: &Path, servers: Vec<SsInbound>) -> Ssserver {
+        // every server binds its TCP port and the UDP port of the same
+        // number, and no two of them may be given one number
+        let ports = free_ports(&vec![true; servers.len()]);
         let with_ports: Vec<(SsInbound, u16)> =
-            servers.into_iter().map(|s| (s, free_port())).collect();
-        let ports: Vec<u16> = with_ports.iter().map(|(_, p)| *p).collect();
+            servers.into_iter().zip(ports.iter().copied()).collect();
         let config = dir.join("ssserver.json");
         std::fs::write(&config, render(&with_ports).to_string()).expect("write the config");
         let mut command = Command::new(binary);

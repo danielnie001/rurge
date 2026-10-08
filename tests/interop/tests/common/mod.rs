@@ -55,6 +55,29 @@ pub fn outbound(profile: &str, name: &str, fixture: Option<&Arc<TlsFixture>>) ->
         .expect("the policy builds")
 }
 
+/// What a case writes on rurge's side, checked where no reference server
+/// is: `profile` loads with nothing said about it but that a stream cipher
+/// is one (`W0031`), and each of `names` builds its outbound. A misspelt
+/// parameter is a warning only, and its line would dial something else than
+/// the case means.
+pub fn loads_and_builds(profile: &str, names: &[&str]) {
+    let loaded = from_text(
+        profile,
+        Path::new("interop.conf"),
+        &LoadOptions::for_tests(),
+    );
+    let said: Vec<String> = loaded
+        .diagnostics
+        .iter()
+        .filter(|d| d.code != rurge_config::codes::W_STREAM_CIPHER)
+        .map(|d| d.to_string())
+        .collect();
+    assert!(said.is_empty(), "{said:#?}\n{profile}");
+    for name in names {
+        assert_eq!(outbound(profile, name, None).name(), *name);
+    }
+}
+
 pub fn target(addr: SocketAddr) -> Target {
     Target::new(rurge_config::HostName::Ip(addr.ip()), addr.port())
 }

@@ -85,6 +85,42 @@ pub fn free_tcp_and_udp_port() -> u16 {
     panic!("no loopback port was free for TCP and UDP alike")
 }
 
+/// What keeps a port's number taken: its TCP listener, and its UDP socket
+/// when it is a port for both.
+type Held = (TcpListener, Option<UdpSocket>);
+
+/// A loopback port that is free for TCP — and for UDP too when `udp_too` —
+/// with the sockets that hold it.
+fn hold(udp_too: bool) -> (Held, u16) {
+    for _ in 0..100 {
+        let tcp = TcpListener::bind("127.0.0.1:0").expect("a free loopback port");
+        let port = tcp.local_addr().expect("the listener's address").port();
+        if !udp_too {
+            return ((tcp, None), port);
+        }
+        if let Ok(udp) = UdpSocket::bind(("127.0.0.1", port)) {
+            return ((tcp, Some(udp)), port);
+        }
+    }
+    panic!("no loopback port was free for TCP and UDP alike")
+}
+
+/// One port of `hold` for each entry of `udp_too`, none of them let go
+/// before the last is chosen.
+fn choose<H>(udp_too: &[bool], hold: impl FnMut(bool) -> (H, u16)) -> Vec<u16> {
+    let held: Vec<(H, u16)> = udp_too.iter().copied().map(hold).collect();
+    held.into_iter().map(|(_, port)| port).collect()
+}
+
+/// A port for each entry of `udp_too` that was free a moment ago — for TCP,
+/// and where the entry says so for UDP as well, for a server that binds both
+/// on one number —, and no two of them the same. Taken one at a time, two
+/// listeners of one configuration can come by the same number: a port is
+/// free again by the time the next one is asked for.
+pub fn free_ports(udp_too: &[bool]) -> Vec<u16> {
+    choose(udp_too, hold)
+}
+
 /// The one name the DNS references answer — dnsproxy from its hosts file,
 /// CoreDNS from its templates — with one address of each family, both of
 /// documentation ranges: nothing ever connects to them.
@@ -579,6 +615,9 @@ impl SingBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
+    use std::rc::Rc;
 
     fn every_kind() -> Vec<(Inbound, u16)> {
         vec![
@@ -1043,6 +1082,48 @@ mod tests {
         let port = free_tcp_and_udp_port();
         let _tcp = TcpListener::bind(("127.0.0.1", port)).expect("the TCP port is free again");
         UdpSocket::bind(("127.0.0.1", port)).expect("the UDP port is free too");
+    }
+
+    /// Each differs from the others and is free again for what it was asked
+    /// for, all of them at once.
+    #[test]
+    fn the_ports_of_one_call_differ_and_are_free_for_what_was_asked() {
+        let udp_too = [false, true, true, false, true, false, false, true];
+        let ports = free_ports(&udp_too);
+        let mut distinct = ports.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), udp_too.len(), "{ports:?}");
+        let mut taken = Vec::new();
+        for (port, udp_too) in ports.iter().zip(udp_too) {
+            let tcp = TcpListener::bind(("127.0.0.1", *port)).expect("the TCP port is free again");
+            let udp = udp_too
+                .then(|| UdpSocket::bind(("127.0.0.1", *port)).expect("the UDP port is free too"));
+            taken.push((tcp, udp));
+        }
+        assert!(free_ports(&[]).is_empty());
+    }
+
+    /// The system of this test hands out the lowest number that nothing
+    /// holds: a port released before the next one is asked for comes again.
+    #[test]
+    fn no_port_is_released_before_all_are_chosen() {
+        struct Taken(Rc<RefCell<BTreeSet<u16>>>, u16);
+        impl Drop for Taken {
+            fn drop(&mut self) {
+                self.0.borrow_mut().remove(&self.1);
+            }
+        }
+        let taken = Rc::new(RefCell::new(BTreeSet::new()));
+        let lowest_free = |_udp_too: bool| {
+            let port = (1..)
+                .find(|port| !taken.borrow().contains(port))
+                .expect("a number nothing holds");
+            taken.borrow_mut().insert(port);
+            (Taken(taken.clone(), port), port)
+        };
+        assert_eq!(choose(&[false, true, false], lowest_free), [1, 2, 3]);
+        assert!(taken.borrow().is_empty(), "and all are released in the end");
     }
 
     #[test]

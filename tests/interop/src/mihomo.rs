@@ -15,7 +15,7 @@
 //! has one listener more, a `socks` one, and mihomo counts as up once a
 //! connection asked for through it has arrived.
 
-use crate::{READY_TIMEOUT, REQUIRED_ENV, Reference, free_port, free_tcp_and_udp_port};
+use crate::{READY_TIMEOUT, REQUIRED_ENV, Reference, free_ports};
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -241,6 +241,17 @@ fn clients_of(log: &str, target: SocketAddr) -> Vec<String> {
         .collect()
 }
 
+/// What each port of a spawn has to be free for besides TCP: a `shadowsocks`
+/// listener binds the UDP port of its number too. One port per listener, and
+/// the probe's after them.
+fn udp_too(listeners: &[Listener]) -> Vec<bool> {
+    listeners
+        .iter()
+        .map(|listener| matches!(listener, Listener::Shadowsocks { .. }))
+        .chain([false])
+        .collect()
+}
+
 /// A running mihomo; killed and reaped on drop.
 pub struct Mihomo(Reference);
 
@@ -248,21 +259,15 @@ impl Mihomo {
     /// Writes the configuration into `dir`, starts `binary` there and waits
     /// until every listener accepts connections and the tunnel relays them.
     pub fn spawn(binary: &Path, dir: &Path, listeners: Vec<Listener>) -> Mihomo {
-        let with_ports: Vec<(Listener, u16)> = listeners
-            .into_iter()
-            .map(|listener| {
-                let port = match listener {
-                    Listener::Snell { .. } => free_port(),
-                    Listener::Shadowsocks { .. } => free_tcp_and_udp_port(),
-                };
-                (listener, port)
-            })
-            .collect();
-        let ready = free_port();
+        // all of them before any is let go: of two listeners on one number
+        // mihomo opens one and only logs the other's failure, and the one
+        // that listens would answer the fixture for both
+        let ports = free_ports(&udp_too(&listeners));
+        let ready = ports[listeners.len()];
+        let with_ports: Vec<(Listener, u16)> =
+            listeners.into_iter().zip(ports.iter().copied()).collect();
         let config = dir.join("mihomo.yaml");
         std::fs::write(&config, render(&with_ports, ready)).expect("write the config");
-        let mut ports: Vec<u16> = with_ports.iter().map(|(_, port)| *port).collect();
-        ports.push(ready);
         let server = Reference::start(
             "mihomo",
             command(binary, dir, &config),
@@ -287,7 +292,9 @@ impl Mihomo {
     }
 
     /// The client of each TCP connection mihomo has relayed to `target`, in
-    /// order: requests that came on one connection name one client.
+    /// order: requests that came on one connection name one client. For a
+    /// `target` bound before `spawn` — the readiness probe left a line of
+    /// its own in the log, to a port that was free while it ran.
     pub fn clients_of(&self, target: SocketAddr) -> Vec<String> {
         clients_of(&self.log_text(), target)
     }
@@ -543,6 +550,21 @@ mod tests {
         assert_eq!(removed, expected);
         assert!(FLAG_DEFAULTS.iter().all(|name| name.starts_with("CLASH_")));
         assert_eq!(set, [("DISABLE_LOOPBACK_DETECTOR", "true")]);
+    }
+
+    /// A port for each listener and the probe's after them; only that of a
+    /// `shadowsocks` listener is taken for UDP as well.
+    #[test]
+    fn a_shadowsocks_listener_asks_for_the_udp_port_of_its_number_too() {
+        let listeners: Vec<Listener> = every_kind()
+            .into_iter()
+            .map(|(listener, _)| listener)
+            .collect();
+        assert_eq!(
+            udp_too(&listeners),
+            [false, false, false, true, true, true, false]
+        );
+        assert_eq!(udp_too(&[]), [false], "the probe's alone");
     }
 
     /// What a SOCKS5 server does for one client, as mihomo's does: it

@@ -7,18 +7,26 @@
 //! reference speaks. Every target is a loopback IP literal.
 //!
 //! A case is a policy and the listener it dials, in one table per test:
-//! none of the tests runs without mihomo, and the last one loads and builds
-//! the policies of every table where there is none.
+//! no test against mihomo runs without it, and the last test loads and
+//! builds the policies of every table where there is none.
 
 mod common;
 
 use common::*;
 use rurge_interop::mihomo::{Listener, Mihomo, OBFS_HOST, Obfs, mihomo_or_skip};
+use rurge_proto::testing::{FakeSnell, SnellScript};
 use std::time::Duration;
 
 const PSK: &str = "sn3ll-interop";
 const OTHER_PSK: &str = "an0ther-psk";
 const PASSWORD: &str = "s3same";
+
+/// What a session says when the server ended the connection without a byte
+/// of its own: where that arrives as an end, and where it arrives as a reset.
+const UNANSWERED: [&str; 2] = [
+    "snell: the server closed the connection without answering (wrong psk or version?)",
+    "snell: the server reset the connection without answering (wrong psk or version?)",
+];
 
 /// A policy and the listener it dials.
 struct Case {
@@ -165,33 +173,31 @@ async fn tcp(server: &Mihomo, profile: &str, cases: &[Case]) {
     }
 }
 
-/// What reading says after a request the listener cannot read. The tunnel
+/// What reading says after a request the server cannot read. The tunnel
 /// comes up, since nothing is asked before the first payload; the payload
-/// leaves; and then the failure must come within the bound.
-async fn unanswered(server: &Mihomo, out: &OutboundRef, echo: SocketAddr) -> String {
+/// leaves; and then the failure must come within the bound. Whatever goes
+/// otherwise is told with what the server logged (`log`).
+async fn unanswered(log: &dyn Fn() -> String, out: &OutboundRef, echo: SocketAddr) -> String {
     let bound = Duration::from_secs(10);
     let (to, opts) = (target(echo), ConnectOpts::default());
     let mut stream = match tokio::time::timeout(bound, out.connect_tcp(&to, &opts)).await {
         Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => panic!("the tunnel comes up: {e}\n{}", server.log_text()),
-        Err(_) => panic!("no tunnel within the bound\n{}", server.log_text()),
+        Ok(Err(e)) => panic!("the tunnel comes up: {e}\n{}", log()),
+        Err(_) => panic!("no tunnel within the bound\n{}", log()),
     };
     match tokio::time::timeout(bound, stream.write_all(b"interop")).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("the first payload leaves: {e}\n{}", server.log_text()),
-        Err(_) => panic!("no first payload within the bound\n{}", server.log_text()),
+        Ok(Err(e)) => panic!("the first payload leaves: {e}\n{}", log()),
+        Err(_) => panic!("no first payload within the bound\n{}", log()),
     }
     let mut answer = Vec::new();
     match tokio::time::timeout(bound, stream.read_to_end(&mut answer)).await {
         Ok(Err(e)) => e.to_string(),
         Ok(Ok(n)) => panic!(
             "the request ended without an error, {n} bytes in\n{}",
-            server.log_text()
+            log()
         ),
-        Err(_) => panic!(
-            "no failure within the bound: the request hangs\n{}",
-            server.log_text()
-        ),
+        Err(_) => panic!("no failure within the bound: the request hangs\n{}", log()),
     }
 }
 
@@ -221,8 +227,11 @@ async fn snell_v2_requests_share_a_connection_against_mihomo() {
     };
     let dir = tempfile::tempdir().unwrap();
     let cases = reuse_cases();
+    // before mihomo is up: its log holds a line of the readiness probe too,
+    // whose target must not come by the echo's port
+    let echo = echo_server().await;
     let (server, profile) = start(&bin, dir.path(), &cases);
-    let (out, echo) = (outbound(&profile, "V2", None), echo_server().await);
+    let out = outbound(&profile, "V2", None);
     let steps = async move { requests_one_after_another(&out, echo, 3).await };
     attempt("V2", || server.log_text(), steps).await;
     let clients = server.clients_of(echo);
@@ -251,8 +260,10 @@ async fn snell_v3_udp_against_mihomo() {
 /// mihomo closes a connection whose first record it cannot open, without a
 /// word of its own. It has read only the head of what the client sent by
 /// then, so some systems report its close as an end and others as a reset:
-/// either way the session fails at once and says what may be wrong, and
-/// neither PSK is in what it says.
+/// either way the session fails at once, with one of two sentences that say
+/// what may be wrong and nothing of either PSK. A third sentence has the
+/// same hint — the server's data failed to decrypt — and would mean that
+/// mihomo had answered: it is not taken.
 #[tokio::test]
 async fn a_snell_listener_of_another_psk_or_version_against_mihomo() {
     let Some(bin) = mihomo_or_skip("a_snell_listener_of_another_psk_or_version_against_mihomo")
@@ -265,20 +276,34 @@ async fn a_snell_listener_of_another_psk_or_version_against_mihomo() {
     let echo = echo_server().await;
     for case in &cases {
         let out = outbound(&profile, case.name, None);
-        let text = unanswered(&server, &out, echo).await;
-        // `snell: the server closed the connection without answering (…)` or
-        // `snell: the server reset the connection without answering (…)`
+        let text = unanswered(&|| server.log_text(), &out, echo).await;
         assert!(
-            text.ends_with("(wrong psk or version?)"),
+            UNANSWERED.contains(&text.as_str()),
             "{}: {text}\n{}",
             case.name,
             server.log_text()
         );
-        assert!(
-            !text.contains(PSK) && !text.contains(OTHER_PSK),
-            "{}: {text}",
-            case.name
+    }
+}
+
+/// The two sentences as rurge words them, where they can be read without
+/// mihomo: from a loopback server of another PSK that closes without a word
+/// of its own, and from one that resets.
+#[tokio::test]
+async fn the_two_sentences_of_an_unanswered_request_are_rurges_own() {
+    let echo = echo_server().await;
+    for (reset, sentence) in [(false, UNANSWERED[0]), (true, UNANSWERED[1])] {
+        let server = FakeSnell::spawn(SnellScript {
+            reset,
+            ..SnellScript::new(PSK)
+        })
+        .await;
+        let profile = format!(
+            "[Proxy]\nOther = snell, 127.0.0.1, {}, psk={OTHER_PSK}, version=4\n[Rule]\nFINAL,DIRECT\n",
+            server.addr().port()
         );
+        let out = outbound(&profile, "Other", None);
+        assert_eq!(unanswered(&String::new, &out, echo).await, sentence);
     }
 }
 
@@ -323,9 +348,8 @@ async fn snell_behind_simple_obfs_against_mihomo() {
     tcp(&server, &profile, &cases).await;
 }
 
-/// What the cases write on rurge's side, checked without mihomo: every
-/// policy loads with nothing said about it but that a stream cipher is one,
-/// and builds its outbound.
+/// What the cases write on rurge's side, checked without mihomo: the
+/// policies of every table.
 #[tokio::test]
 async fn the_policies_of_every_case_load_and_build() {
     for cases in [
@@ -337,21 +361,7 @@ async fn the_policies_of_every_case_load_and_build() {
         ss_obfs_cases(),
         snell_obfs_cases(),
     ] {
-        let profile = profile(&cases, |index| 4000 + index as u16);
-        let loaded = from_text(
-            &profile,
-            Path::new("interop.conf"),
-            &LoadOptions::for_tests(),
-        );
-        let said: Vec<String> = loaded
-            .diagnostics
-            .iter()
-            .filter(|d| d.code != rurge_config::codes::W_STREAM_CIPHER)
-            .map(|d| d.to_string())
-            .collect();
-        assert!(said.is_empty(), "{said:#?}\n{profile}");
-        for case in &cases {
-            assert_eq!(outbound(&profile, case.name, None).name(), case.name);
-        }
+        let names: Vec<&str> = cases.iter().map(|case| case.name).collect();
+        loads_and_builds(&profile(&cases, |index| 4000 + index as u16), &names);
     }
 }

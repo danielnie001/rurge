@@ -163,27 +163,11 @@ async fn stream_methods_against_ssserver() {
     }
 }
 
-/// What that case writes on rurge's side, checked without ssserver: every
-/// policy loads with nothing said about it but that its cipher is a stream
-/// cipher, and builds its outbound.
+/// What that case writes on rurge's side, checked without ssserver.
 #[tokio::test]
 async fn the_stream_method_policies_load_and_build() {
-    let profile = stream_profile(|index| 4000 + index as u16);
-    let loaded = from_text(
-        &profile,
-        Path::new("interop.conf"),
-        &LoadOptions::for_tests(),
-    );
-    let said: Vec<String> = loaded
-        .diagnostics
-        .iter()
-        .filter(|d| d.code != rurge_config::codes::W_STREAM_CIPHER)
-        .map(|d| d.to_string())
-        .collect();
-    assert!(said.is_empty(), "{said:#?}\n{profile}");
-    for (method, _) in STREAM_METHODS {
-        assert_eq!(outbound(&profile, method, None).name(), method);
-    }
+    let names: Vec<&str> = STREAM_METHODS.iter().map(|(method, _)| *method).collect();
+    loads_and_builds(&stream_profile(|index| 4000 + index as u16), &names);
 }
 
 fn ss_inbound(method: &'static str, password: &str, users: &[&str]) -> Inbound {
