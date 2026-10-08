@@ -11,6 +11,14 @@ pub mod sysproxy;
 use rurge_config::config::Platform;
 use rurge_config::requirement::Environment;
 
+/// How a switch reads its environment variable: the usual spellings of yes
+/// and no (`1` / `0`, `true` / `false`, `yes` / `no`, `on` / `off`, `y` /
+/// `n`, `t` / `f`), anything else an error — clap's own reading of a `bool`
+/// takes `true` and `false` alone.
+pub fn switch() -> clap::builder::BoolishValueParser {
+    clap::builder::BoolishValueParser::new()
+}
+
 pub fn environment(platform: Platform, core_version: u64) -> Environment {
     let language = std::env::var("LANG")
         .ok()

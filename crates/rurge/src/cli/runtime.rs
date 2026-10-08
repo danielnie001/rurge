@@ -3,6 +3,7 @@
 //! objects (resource manager, set registry, GeoIP, resolver) the offline
 //! commands need.
 
+use super::switch;
 use anyhow::Context;
 use clap::Args;
 use rurge_config::Config;
@@ -27,7 +28,7 @@ pub struct RuntimeArgs {
     #[arg(long, env = "RURGE_GEOIP_ASN_URL", value_name = "URL")]
     pub geoip_asn_url: Option<Url>,
     /// Never touch the network: use cached resources only
-    #[arg(long, env = "RURGE_NO_NETWORK")]
+    #[arg(long, env = "RURGE_NO_NETWORK", value_parser = switch())]
     pub no_network: bool,
     /// DNS cache capacity in entries (default 2000)
     #[arg(long, env = "RURGE_DNS_CACHE_SIZE", value_name = "N")]

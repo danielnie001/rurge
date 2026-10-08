@@ -879,6 +879,36 @@ FINAL,DIRECT,dns-failed
         (v, out.status.code().unwrap())
     }
 
+    /// A switch's environment variable takes the usual spellings of yes
+    /// (and of no: `run::an_empty_group_goes_direct_unless_told_to_reject`);
+    /// anything else is an error that names the switch.
+    #[test]
+    fn a_switchs_environment_variable_takes_the_usual_spellings() {
+        let dir = workspace();
+        let with = |value: &str| {
+            let mut cmd = Command::cargo_bin("rurge").unwrap();
+            cmd.arg("rule")
+                .arg("match")
+                .arg("-c")
+                .arg(dir.path().join("t.conf"))
+                .arg("--data-dir")
+                .arg(dir.path().join("data"))
+                .arg("listed.com")
+                .env("RURGE_NO_NETWORK", value);
+            cmd
+        };
+        for value in ["1", "true", "yes", "on", "TRUE", "y"] {
+            with(value)
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("P"));
+        }
+        with("maybe")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--no-network"));
+    }
+
     #[test]
     fn local_rule_set_matches_without_network() {
         let dir = workspace();
@@ -1607,13 +1637,19 @@ mod run {
 [Proxy Group]\nSub = select, policy-path=missing.txt\n[Rule]\nFINAL,Sub\n",
         )
         .unwrap();
-        for (switch, env, rejects) in [
+        for (case, (switch, env, rejects)) in [
             (None, None, false),
             (Some("--empty-group-reject"), None, true),
             (None, Some("true"), true),
-        ] {
+            (None, Some("1"), true),
+            (None, Some("0"), false),
+            (None, Some("off"), false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let (conf, url) = (conf.clone(), url.clone());
-            let data = dir.path().join(format!("data-{rejects}-{}", env.is_some()));
+            let data = dir.path().join(format!("data-{case}"));
             let answer = tokio::task::spawn_blocking(move || {
                 let mut cmd = rurge_run(&conf, &data);
                 cmd.args(switch);
@@ -1634,7 +1670,7 @@ mod run {
                 );
             }
         }
-        assert_eq!(target.requests().len(), 1);
+        assert_eq!(target.requests().len(), 3);
     }
 
     #[cfg(unix)]

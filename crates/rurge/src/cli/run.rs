@@ -2,6 +2,7 @@
 
 use super::rule::{parse_mode, print_diagnostics};
 use super::runtime::{PlatformProcesses, RuntimeArgs};
+use super::switch;
 use super::sysproxy::{SystemProxyManager, describe, proxy_settings};
 use crate::capabilities;
 use anyhow::Context;
@@ -68,13 +69,13 @@ pub struct RunArgs {
     #[arg(long, env = "RURGE_REQUEST_LOG_SIZE", value_name = "N")]
     pub request_log_size: Option<usize>,
     /// Reload the profile when it or its included files change on disk
-    #[arg(long, env = "RURGE_WATCH")]
+    #[arg(long, env = "RURGE_WATCH", value_parser = switch())]
     pub watch: bool,
     /// Point the operating system's proxy settings at rurge while it runs
-    #[arg(long, env = "RURGE_SYSTEM_PROXY")]
+    #[arg(long, env = "RURGE_SYSTEM_PROXY", value_parser = switch())]
     pub system_proxy: bool,
     /// A policy group without members rejects instead of going DIRECT
-    #[arg(long, env = "RURGE_EMPTY_GROUP_REJECT")]
+    #[arg(long, env = "RURGE_EMPTY_GROUP_REJECT", value_parser = switch())]
     pub empty_group_reject: bool,
     #[command(flatten)]
     pub runtime: RuntimeArgs,
