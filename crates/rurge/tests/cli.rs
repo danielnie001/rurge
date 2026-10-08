@@ -414,15 +414,22 @@ fn check_knows_external() {
 const SS: &str = "[General]\n[Proxy]\n\
 A = ss, proxy.test, 8388, encrypt-method=chacha20-ietf-poly1305, password=s3same, obfs=http\n\
 K = ss, proxy.test, 8388, encrypt-method=2022-blake3-aes-128-gcm, password=MDEyMzQ1Njc4OWFiY2RlZg==, udp-relay=true\n\
-Rc1 = ss, proxy.test, 8388, encrypt-method=rc4-md5, password=s3same\n\
-Rc2 = ss, proxy.test, 8388, encrypt-method=rc4-md5, password=s3same\n[Rule]\nFINAL,DIRECT\n";
+Cfb1 = ss, proxy.test, 8388, encrypt-method=aes-256-cfb, password=s3same\n\
+Cfb2 = ss, proxy.test, 8388, encrypt-method=AES-256-CFB, password=s3same, udp-relay=true\n\
+Rc = ss, proxy.test, 8388, encrypt-method=rc4, password=s3same\n[Rule]\nFINAL,DIRECT\n";
+const SS_NOT_SUPPORTED: &str = "[General]\n[Proxy]\n\
+Bf1 = ss, proxy.test, 8388, encrypt-method=bf-cfb, password=s3same\n\
+Bf2 = ss, proxy.test, 8388, encrypt-method=bf-cfb, password=s3same\n[Rule]\nFINAL,DIRECT\n";
 const SS_BAD_KEY: &str = "[General]\n[Proxy]\n\
 K = ss, proxy.test, 8388, encrypt-method=2022-blake3-aes-128-gcm, password=c2VjcmV0IGtleSBtYXRlcmlhbA==\n\
 [Rule]\nFINAL,DIRECT\n";
 
-/// `rurge check` knows `ss` (phase 2 M6 design 6): only a stream cipher is
-/// still "not implemented", once however many lines use it; an SS 2022 key
-/// of the wrong length is an error, named and not quoted (design 3.1).
+/// `rurge check` knows `ss` (phase 2 M6 design 6) with the stream ciphers
+/// of the manual (phase 2 M8 design 4.1): each is a warning of its own
+/// code, once however many lines use it, and `rc4` is told what else is
+/// wrong with it. A cipher Surge no longer lists is "not supported", once
+/// too. An SS 2022 key of the wrong length is an error, named and not
+/// quoted (M6 design 3.1).
 #[test]
 fn check_knows_ss() {
     let dir = tempfile::tempdir().unwrap();
@@ -436,13 +443,43 @@ fn check_knows_ss() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    assert_eq!(out.matches("W0007").count(), 1, "{out}");
+    assert_eq!(out.matches("W0007").count(), 0, "{out}");
+    assert_eq!(out.matches("W0031").count(), 2, "{out}");
     assert!(
-        out.contains("ss.conf:5") && out.contains("`ss` stream cipher `rc4-md5`"),
+        out.contains(
+            "ss.conf:5: `ss` cipher `aes-256-cfb` is a stream cipher: it gives no integrity protection and is deprecated; use an AEAD cipher\n"
+        ),
         "{out}"
     );
+    assert!(
+        out.contains(
+            "ss.conf:7: `ss` cipher `rc4` is a stream cipher: it gives no integrity protection and is deprecated; use an AEAD cipher; `rc4` also repeats its keystream on every connection\n"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("0 error(s), 2 warning(s)"), "{out}");
     assert!(!out.contains("policy type `ss`"), "{out}");
     assert!(!out.contains("s3same") && !out.contains("MDEyMz"), "{out}");
+
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "gone.conf", SS_NOT_SUPPORTED))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    assert_eq!(out.matches("W0007").count(), 1, "{out}");
+    assert_eq!(out.matches("W0031").count(), 0, "{out}");
+    assert!(
+        out.contains(
+            "gone.conf:3: `ss` cipher `bf-cfb` is not supported (Surge no longer lists it); such policies behave as REJECT\n"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("s3same"), "{out}");
 
     Command::cargo_bin("rurge")
         .unwrap()

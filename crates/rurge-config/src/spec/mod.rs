@@ -187,8 +187,9 @@ pub struct SpecOutcome {
 /// policy has no spec and behaves as REJECT.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NotImplemented {
-    /// An `ss` stream cipher, by its name (phase 2 M6 design 3.1).
-    SsStreamCipher(&'static str),
+    /// An `ss` cipher Surge no longer lists, by its name (phase 2 M8 design
+    /// 4.1).
+    SsCipher(&'static str),
     /// A `snell` version other than 4 and 5 (phase 2 M6 design 4.2).
     SnellVersion(u8),
 }
@@ -197,8 +198,8 @@ impl NotImplemented {
     /// The load warning (`W0007`).
     pub fn warning(&self) -> String {
         match self {
-            NotImplemented::SsStreamCipher(method) => format!(
-                "`ss` stream cipher `{method}` is not implemented yet; such policies behave as REJECT"
+            NotImplemented::SsCipher(method) => format!(
+                "`ss` cipher `{method}` is not supported (Surge no longer lists it); such policies behave as REJECT"
             ),
             // out of scope, not a matter of time (phase 2 M8 design 4.4)
             NotImplemented::SnellVersion(6) => "`snell` version 6 is not supported: it is a beta protocol without a public specification; such policies behave as REJECT".to_string(),
@@ -212,7 +213,7 @@ impl NotImplemented {
     /// What the session log says after "policy protocol not implemented: ".
     pub fn note(&self) -> String {
         match self {
-            NotImplemented::SsStreamCipher(method) => format!("ss ({method})"),
+            NotImplemented::SsCipher(method) => format!("ss ({method})"),
             NotImplemented::SnellVersion(n) => format!("snell v{n}"),
         }
     }
@@ -220,9 +221,7 @@ impl NotImplemented {
     /// How a warning about imported policies names the kind.
     pub fn imported(&self) -> String {
         match self {
-            NotImplemented::SsStreamCipher(method) => {
-                format!("`ss` with the stream cipher `{method}`")
-            }
+            NotImplemented::SsCipher(method) => format!("`ss` with the cipher `{method}`"),
             NotImplemented::SnellVersion(n) => format!("`snell` version {n}{}", snell_default(*n)),
         }
     }
@@ -262,7 +261,8 @@ impl Remark {
         match self {
             Remark::VmessAead => "`vmess-aead=false` has no effect: rurge always uses the AEAD handshake, which every server since V2Ray 4.28.1 accepts".to_string(),
             Remark::SsStreamCipher(method) => format!(
-                "`ss` method `{method}` is a stream cipher without integrity protection; prefer an AEAD method"
+                "`ss` cipher `{method}` is a stream cipher: it gives no integrity protection and is deprecated; use an AEAD cipher{}",
+                rc4_keystream(method)
             ),
         }
     }
@@ -274,10 +274,23 @@ impl Remark {
                 "imported `vmess` policies without `vmess-aead=true` use the AEAD handshake"
                     .to_string()
             }
+            // the lines are the subscription's: there is no cipher for the
+            // reader to change
             Remark::SsStreamCipher(method) => format!(
-                "imported `ss` policies use the stream cipher `{method}`, which has no integrity protection"
+                "imported `ss` policies use the stream cipher `{method}`: it gives no integrity protection and is deprecated{}",
+                rc4_keystream(method)
             ),
         }
+    }
+}
+
+/// `rc4` has no IV: the key alone makes its keystream, the same one for
+/// every connection and every datagram of a policy, in both directions.
+fn rc4_keystream(method: &str) -> &'static str {
+    if method == "rc4" {
+        "; `rc4` also repeats its keystream on every connection"
+    } else {
+        ""
     }
 }
 
@@ -438,7 +451,12 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             let common = read_common(&mut r, Applies::Proxy, &mut notes);
             tls::refuse_tls(&mut r);
             let read = ss::read_ss(&mut r);
-            not_implemented = read.stream_cipher.map(NotImplemented::SsStreamCipher);
+            not_implemented = read.unsupported_cipher.map(NotImplemented::SsCipher);
+            // built like any other method, and said to be what it is (phase
+            // 2 M8 design 4.1)
+            if read.spec.method.is_stream() {
+                remarks.push(Remark::SsStreamCipher(read.spec.method.name()));
+            }
             (common, ProtoSpec::Ss(read.spec))
         }
         PolicyKind::Snell => {
@@ -1073,11 +1091,22 @@ mod tests {
         assert_eq!((stream.code(), codes::W_STREAM_CIPHER), ("W0031", "W0031"));
         assert_eq!(
             stream.warning(),
-            "`ss` method `rc4-md5` is a stream cipher without integrity protection; prefer an AEAD method"
+            "`ss` cipher `rc4-md5` is a stream cipher: it gives no integrity protection and is deprecated; use an AEAD cipher"
         );
         assert_eq!(
             stream.imported(),
-            "imported `ss` policies use the stream cipher `rc4-md5`, which has no integrity protection"
+            "imported `ss` policies use the stream cipher `rc4-md5`: it gives no integrity protection and is deprecated"
+        );
+        // `rc4` has no IV: what else is wrong with it is said too
+        let rc4 = Remark::SsStreamCipher("rc4");
+        assert_eq!(rc4.code(), codes::W_STREAM_CIPHER);
+        assert_eq!(
+            rc4.warning(),
+            "`ss` cipher `rc4` is a stream cipher: it gives no integrity protection and is deprecated; use an AEAD cipher; `rc4` also repeats its keystream on every connection"
+        );
+        assert_eq!(
+            rc4.imported(),
+            "imported `ss` policies use the stream cipher `rc4`: it gives no integrity protection and is deprecated; `rc4` also repeats its keystream on every connection"
         );
     }
 
@@ -1135,43 +1164,65 @@ mod tests {
         assert_eq!(o.diagnostics[0].code, codes::E_INVALID_POLICY_PARAM);
     }
 
-    /// An `ss` line is read and checked in full; a stream cipher has no
-    /// spec and says why.
+    /// An `ss` line is read and checked in full. A stream cipher of the
+    /// manual has a spec like any other method, and the loader is given a
+    /// word to say about it; a cipher Surge no longer lists has no spec and
+    /// says why (phase 2 M8 design 4.1).
     #[test]
-    fn an_ss_line_is_checked_and_a_stream_cipher_is_not_implemented() {
-        let o = outcome(
-            "S",
-            "ss, h.test, 8388, encrypt-method=aes-128-gcm, password=pw, udp-relay=true, udp-port=8389, obfs=tls, obfs-host=cdn.test, shadow-tls-password=st",
-        );
-        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
-        assert!(o.inert.is_empty(), "{:?}", o.inert);
-        assert_eq!(o.not_implemented, None);
-        let spec = o.spec.expect("an AEAD line has a spec");
-        let ProtoSpec::Ss(ss) = &spec.proto else {
-            panic!("{:?}", spec.proto)
-        };
-        assert_eq!(
-            (ss.method, ss.udp_relay, ss.udp_port),
-            (SsMethod::Aes128Gcm, true, Some(8389))
-        );
-        assert_eq!(ss.obfs.as_ref().map(|o| o.mode), Some(ObfsMode::Tls));
-        assert!(spec.shadow_tls.is_some());
+    fn an_ss_line_is_checked_a_stream_cipher_is_remarked_on_and_an_unlisted_one_has_no_spec() {
+        for (method, expected) in [
+            ("aes-128-gcm", SsMethod::Aes128Gcm),
+            ("RC4-MD5", SsMethod::Rc4Md5),
+            ("aes-256-cfb", SsMethod::Aes256Cfb),
+        ] {
+            let o = outcome(
+                "S",
+                &format!(
+                    "ss, h.test, 8388, encrypt-method={method}, password=pw, udp-relay=true, udp-port=8389, obfs=tls, obfs-host=cdn.test, shadow-tls-password=st"
+                ),
+            );
+            assert!(o.diagnostics.is_empty(), "{method}: {:?}", o.diagnostics);
+            assert!(o.inert.is_empty(), "{method}: {:?}", o.inert);
+            assert_eq!(o.not_implemented, None, "{method}");
+            // the loader says it once per load and cipher, not this line
+            let remarks = match expected.iv_len() {
+                Some(_) => vec![Remark::SsStreamCipher(expected.name())],
+                None => Vec::new(),
+            };
+            assert_eq!(o.remarks, remarks, "{method}");
+            let spec = o.spec.unwrap_or_else(|| panic!("{method}: no spec"));
+            let ProtoSpec::Ss(ss) = &spec.proto else {
+                panic!("{:?}", spec.proto)
+            };
+            assert_eq!(
+                (ss.method, ss.udp_relay, ss.udp_port),
+                (expected, true, Some(8389)),
+                "{method}"
+            );
+            assert_eq!(ss.obfs.as_ref().map(|o| o.mode), Some(ObfsMode::Tls));
+            assert!(spec.shadow_tls.is_some(), "{method}");
+        }
 
-        let o = outcome("S", "ss, h.test, 8388, encrypt-method=RC4-MD5, password=pw");
+        let o = outcome("S", "ss, h.test, 8388, encrypt-method=BF-CFB, password=pw");
         assert!(o.spec.is_none() && o.diagnostics.is_empty());
-        let why = o.not_implemented.expect("a stream cipher");
-        assert_eq!(why, NotImplemented::SsStreamCipher("rc4-md5"));
+        assert!(o.remarks.is_empty(), "{:?}", o.remarks);
+        let why = o.not_implemented.expect("a cipher that is not supported");
+        assert_eq!(why, NotImplemented::SsCipher("bf-cfb"));
         assert_eq!(
             why.warning(),
-            "`ss` stream cipher `rc4-md5` is not implemented yet; such policies behave as REJECT"
+            "`ss` cipher `bf-cfb` is not supported (Surge no longer lists it); such policies behave as REJECT"
         );
-        assert_eq!(why.note(), "ss (rc4-md5)");
-        assert_eq!(why.imported(), "`ss` with the stream cipher `rc4-md5`");
+        assert_eq!(why.note(), "ss (bf-cfb)");
+        assert_eq!(why.imported(), "`ss` with the cipher `bf-cfb`");
 
-        // a broken line is an error like any other, and not "not implemented"
-        let o = outcome("S", "ss, h.test, 8388, encrypt-method=rc4-md5");
-        assert!(o.not_implemented.is_none());
-        assert_eq!(o.diagnostics[0].code, codes::E_INVALID_POLICY_PARAM);
+        // a broken line is an error like any other: neither "not supported"
+        // nor anything to remark on
+        for method in ["bf-cfb", "rc4-md5"] {
+            let o = outcome("S", &format!("ss, h.test, 8388, encrypt-method={method}"));
+            assert!(o.spec.is_none() && o.not_implemented.is_none(), "{method}");
+            assert!(o.remarks.is_empty(), "{method}: {:?}", o.remarks);
+            assert_eq!(o.diagnostics[0].code, codes::E_INVALID_POLICY_PARAM);
+        }
         // no TLS under `ss`; mystery parameters are unknown as anywhere
         let o = outcome(
             "S",

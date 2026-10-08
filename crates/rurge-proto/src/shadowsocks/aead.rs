@@ -35,10 +35,10 @@ pub(crate) const MAX_PAYLOAD: usize = 0x3FFF;
 /// The server says nothing before the first payload, so a wrong password (or
 /// method) and a server that refuses for any other reason look the same:
 /// the connection closes (phase 2 M6 design 3.3).
-const NO_ANSWER: &str = "ss: the server closed the connection without answering";
+pub(super) const NO_ANSWER: &str = "ss: the server closed the connection without answering";
 /// What shadowsocks-rust does to an SS 2022 request it cannot open; some
 /// servers do it to an AEAD one too.
-const RESET: &str =
+pub(super) const RESET: &str =
     "ss: the server reset the connection without answering (wrong password or method?)";
 const RESET_2022: &str = "ss: the server reset the connection without answering (wrong key or method, or a clock more than 30 seconds off?)";
 const UNDECRYPTABLE: &str = "ss: the server's data failed to decrypt (wrong password or method?)";

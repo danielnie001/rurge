@@ -5,6 +5,9 @@
 //! target of an association: full cone.
 //!
 //! - `none`: the address and the payload as they are.
+//! - A stream cipher (phase 2 M8 design 4.1): a random IV of its own per
+//!   packet — none for `rc4` —, then the address and the payload under it.
+//!   Nothing is authenticated: a packet under another key opens to garbage.
 //! - AEAD: a random salt of its own per packet, the session key under it,
 //!   the nonce all zeros.
 //! - SS 2022 (SIP022 3.2, SIP023): each carrier is a client session with a
@@ -22,6 +25,7 @@
 use super::cipher::{AeadCipher, AeadKind, MasterKey, TAG, aes_decrypt_block, aes_encrypt_block};
 use super::kdf;
 use super::s2022::{self, Identity};
+use super::stream::StreamKey;
 use crate::OutboundError;
 use crate::addr::{AddrError, parse_socks_addr, socks_addr};
 use crate::socks5::from_relay;
@@ -50,6 +54,7 @@ const SERVER_SESSIONS: usize = 8;
 /// No `Debug`: it holds keys.
 pub(crate) enum Packets {
     Plain,
+    Stream(Arc<StreamKey>),
     Aead(Arc<MasterKey>),
     S2022(Arc<Keys2022>),
 }
@@ -145,6 +150,15 @@ fn open_aead(key: &MasterKey, packet: &mut [u8]) -> Result<(Target, Range<usize>
     let (salt, sealed) = packet.split_at_mut(salt_len);
     let n = key.session(salt).open(sealed).ok_or("does not decrypt")?;
     source(&sealed[..n], salt_len)
+}
+
+/// A stream cipher's packet opened in place. It fails to open in one way
+/// only, by having no room for its IV.
+fn open_stream(key: &StreamKey, packet: &mut [u8]) -> Result<(Target, Range<usize>), &'static str> {
+    let plain = key.open(packet).map_err(|_| "too short")?;
+    let start = packet.len() - plain.len();
+    packet[start..].copy_from_slice(&plain);
+    source(&plain, start)
 }
 
 /// Packet ids already seen from one server session: the last 8128 of them
@@ -295,6 +309,7 @@ pub(crate) struct SsUdp {
 /// How one carrier seals: SS 2022 always with a client session of its own.
 enum Sealing {
     Plain,
+    Stream(Arc<StreamKey>),
     Aead(Arc<MasterKey>),
     S2022 {
         keys: Arc<Keys2022>,
@@ -324,6 +339,7 @@ impl SsUdp {
         };
         let sealing = match &*packets {
             Packets::Plain => Sealing::Plain,
+            Packets::Stream(key) => Sealing::Stream(key.clone()),
             Packets::Aead(key) => Sealing::Aead(key.clone()),
             Packets::S2022(keys) => {
                 let mut id = [0u8; 8];
@@ -369,6 +385,7 @@ impl SsUdp {
                     payload,
                 )
             }
+            Sealing::Stream(key) => key.seal(&[addr, payload].concat())?,
             Sealing::Plain => [addr, payload].concat(),
         })
     }
@@ -377,6 +394,7 @@ impl SsUdp {
         match &self.sealing {
             Sealing::Aead(key) => open_aead(key, packet),
             Sealing::S2022 { keys, session } => session.open(keys, packet, (self.now)()),
+            Sealing::Stream(key) => open_stream(key, packet),
             Sealing::Plain => source(packet, 0),
         }
     }
@@ -615,6 +633,33 @@ mod tests {
         assert_eq!(plain[1..9], NOW.to_be_bytes());
         assert_eq!(plain[9..14], [0, 3, 0, 0, 0]);
         assert_eq!(plain[14..], QUERY_TO);
+    }
+
+    /// A stream cipher's packet is opened where it lies: the payload's
+    /// range counts from the packet's start, past the IV and the address.
+    #[test]
+    fn a_stream_ciphers_packet_opens_in_place() {
+        use rurge_config::spec::SsMethod;
+        const FROM: [u8; 7] = [1, 8, 8, 8, 8, 0, 53];
+        for method in [SsMethod::Aes256Cfb, SsMethod::ChaCha20Ietf, SsMethod::Rc4] {
+            let key = StreamKey::from_password(method, "password").unwrap();
+            let mut packet = key.seal(&[&FROM[..], b"answer"].concat()).unwrap();
+            assert_eq!(packet.len(), key.iv_len() + FROM.len() + 6, "{method:?}");
+            let (from, payload) = open_stream(&key, &mut packet).unwrap();
+            assert_eq!(payload.end, packet.len(), "{method:?}");
+            assert_eq!((from, &packet[payload]), (eight_eight(), &b"answer"[..]));
+            // an empty payload behind the address
+            let mut packet = key.seal(&FROM).unwrap();
+            let (from, payload) = open_stream(&key, &mut packet).unwrap();
+            assert_eq!((from, payload.len()), (eight_eight(), 0), "{method:?}");
+            // what is no address, and what has no room for the IV
+            let mut packet = key.seal(&[9, 8, 8, 8, 8, 0, 53]).unwrap();
+            assert_eq!(open_stream(&key, &mut packet).err(), Some("no address"));
+            if let Some(short) = key.iv_len().checked_sub(1) {
+                let mut packet = vec![0u8; short];
+                assert_eq!(open_stream(&key, &mut packet).err(), Some("too short"));
+            }
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! `ss` policy parameters (manual: Policies › Shadowsocks; phase 2 M6
-//! design 3.1).
+//! design 3.1, M8 design 4.1).
 
 use super::obfs::{ObfsMode, ObfsOpts, read_obfs};
 use super::reader::ParamReader;
@@ -22,9 +22,22 @@ pub enum SsMethod {
     /// SS 2022 (SIP022).
     Blake3Aes128Gcm,
     Blake3Aes256Gcm,
+    /// The stream ciphers of the original protocol, as the manual lists
+    /// them: nothing they carry is authenticated.
+    Rc4,
+    Rc4Md5,
+    Aes128Cfb,
+    Aes192Cfb,
+    Aes256Cfb,
+    Aes128Ctr,
+    Aes192Ctr,
+    Aes256Ctr,
+    Salsa20,
+    ChaCha20,
+    ChaCha20Ietf,
 }
 
-const METHODS: [(&str, SsMethod); 8] = [
+const METHODS: [(&str, SsMethod); 19] = [
     ("aes-128-gcm", SsMethod::Aes128Gcm),
     ("aes-192-gcm", SsMethod::Aes192Gcm),
     ("aes-256-gcm", SsMethod::Aes256Gcm),
@@ -33,19 +46,24 @@ const METHODS: [(&str, SsMethod); 8] = [
     ("2022-blake3-aes-128-gcm", SsMethod::Blake3Aes128Gcm),
     ("2022-blake3-aes-256-gcm", SsMethod::Blake3Aes256Gcm),
     ("none", SsMethod::None),
+    ("rc4", SsMethod::Rc4),
+    ("rc4-md5", SsMethod::Rc4Md5),
+    ("aes-128-cfb", SsMethod::Aes128Cfb),
+    ("aes-192-cfb", SsMethod::Aes192Cfb),
+    ("aes-256-cfb", SsMethod::Aes256Cfb),
+    ("aes-128-ctr", SsMethod::Aes128Ctr),
+    ("aes-192-ctr", SsMethod::Aes192Ctr),
+    ("aes-256-ctr", SsMethod::Aes256Ctr),
+    ("salsa20", SsMethod::Salsa20),
+    ("chacha20", SsMethod::ChaCha20),
+    ("chacha20-ietf", SsMethod::ChaCha20Ietf),
 ];
 
-/// The stream ciphers of the original protocol: valid, but not implemented
-/// before M8 (`W0007`, and the policy behaves as REJECT).
-const STREAM_CIPHERS: [&str; 20] = [
-    "rc4",
-    "rc4-md5",
-    "aes-128-cfb",
-    "aes-192-cfb",
-    "aes-256-cfb",
-    "aes-128-ctr",
-    "aes-192-ctr",
-    "aes-256-ctr",
+/// The ciphers shadowsocks-libev knew and the manual does not list: a line
+/// that names one loads, but the cipher is not supported (`W0007`, and the
+/// policy behaves as REJECT). Making them unknown values would turn
+/// profiles that load today into load errors (phase 2 M8 design 4.1).
+const UNSUPPORTED_CIPHERS: [&str; 9] = [
     "bf-cfb",
     "camellia-128-cfb",
     "camellia-192-cfb",
@@ -55,9 +73,6 @@ const STREAM_CIPHERS: [&str; 20] = [
     "idea-cfb",
     "rc2-cfb",
     "seed-cfb",
-    "salsa20",
-    "chacha20",
-    "chacha20-ietf",
 ];
 
 /// SS 2022 keys: the standard alphabet, padding optional (as
@@ -76,17 +91,57 @@ impl SsMethod {
             .expect("every method is in the table")
     }
 
-    /// The key length in bytes, which is also the salt length; 0 for `none`.
+    /// The key length in bytes, which for the AEAD methods is also the salt
+    /// length; 0 for `none`.
     pub fn key_len(self) -> usize {
         match self {
             SsMethod::None => 0,
-            SsMethod::Aes128Gcm | SsMethod::Blake3Aes128Gcm => 16,
-            SsMethod::Aes192Gcm => 24,
+            SsMethod::Aes128Gcm
+            | SsMethod::Blake3Aes128Gcm
+            | SsMethod::Rc4
+            | SsMethod::Rc4Md5
+            | SsMethod::Aes128Cfb
+            | SsMethod::Aes128Ctr => 16,
+            SsMethod::Aes192Gcm | SsMethod::Aes192Cfb | SsMethod::Aes192Ctr => 24,
             SsMethod::Aes256Gcm
             | SsMethod::ChaCha20IetfPoly1305
             | SsMethod::XChaCha20IetfPoly1305
-            | SsMethod::Blake3Aes256Gcm => 32,
+            | SsMethod::Blake3Aes256Gcm
+            | SsMethod::Aes256Cfb
+            | SsMethod::Aes256Ctr
+            | SsMethod::Salsa20
+            | SsMethod::ChaCha20
+            | SsMethod::ChaCha20Ietf => 32,
         }
+    }
+
+    /// `Some(n)`: a stream cipher whose connections and packets start with
+    /// `n` bytes of IV (0 for `rc4`); `None`: not a stream cipher.
+    pub fn iv_len(self) -> Option<usize> {
+        match self {
+            SsMethod::Rc4 => Some(0),
+            SsMethod::Salsa20 | SsMethod::ChaCha20 => Some(8),
+            SsMethod::ChaCha20Ietf => Some(12),
+            SsMethod::Rc4Md5
+            | SsMethod::Aes128Cfb
+            | SsMethod::Aes192Cfb
+            | SsMethod::Aes256Cfb
+            | SsMethod::Aes128Ctr
+            | SsMethod::Aes192Ctr
+            | SsMethod::Aes256Ctr => Some(16),
+            SsMethod::None
+            | SsMethod::Aes128Gcm
+            | SsMethod::Aes192Gcm
+            | SsMethod::Aes256Gcm
+            | SsMethod::ChaCha20IetfPoly1305
+            | SsMethod::XChaCha20IetfPoly1305
+            | SsMethod::Blake3Aes128Gcm
+            | SsMethod::Blake3Aes256Gcm => None,
+        }
+    }
+
+    pub fn is_stream(self) -> bool {
+        self.iv_len().is_some()
     }
 
     /// SS 2022: the password is Base64 keys, not a password.
@@ -98,8 +153,8 @@ impl SsMethod {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SsSpec {
     pub method: SsMethod,
-    /// As written; empty for `none` without one. The AEAD methods derive
-    /// their key from it.
+    /// As written; empty for `none` without one. The AEAD methods and the
+    /// stream ciphers derive their key from it.
     pub password: Secret<String>,
     /// SS 2022: what `password` decodes to, each key of the method's length.
     /// The identity keys come first, outermost first (SIP023), and the user
@@ -113,12 +168,12 @@ pub struct SsSpec {
     pub obfs: Option<ObfsOpts>,
 }
 
-/// What an `ss` line says. With a stream cipher `stream_cipher` names it and
-/// `spec` is meaningless: the caller makes no spec of it (phase 2 M6 design
-/// 3.1).
+/// What an `ss` line says. With a cipher Surge no longer lists
+/// `unsupported_cipher` names it and `spec` is meaningless: the caller makes
+/// no spec of it (phase 2 M8 design 4.1).
 pub struct SsRead {
     pub spec: SsSpec,
-    pub stream_cipher: Option<&'static str>,
+    pub unsupported_cipher: Option<&'static str>,
 }
 
 /// The keys of an SS 2022 password, or the 1-based position of the first
@@ -141,7 +196,7 @@ fn decode_keys(password: &str, len: usize) -> Result<Vec<Vec<u8>>, usize> {
 /// never quoted in a diagnostic; the method may be, it is no secret.
 pub fn read_ss(r: &mut ParamReader<'_>) -> SsRead {
     let mut method = SsMethod::None;
-    let mut stream_cipher = None;
+    let mut unsupported_cipher = None;
     match r.str("encrypt-method").map(str::trim) {
         None => r.error(
             codes::E_INVALID_POLICY_PARAM,
@@ -150,8 +205,11 @@ pub fn read_ss(r: &mut ParamReader<'_>) -> SsRead {
         Some(v) => {
             if let Some((_, m)) = METHODS.iter().find(|(n, _)| n.eq_ignore_ascii_case(v)) {
                 method = *m;
-            } else if let Some(name) = STREAM_CIPHERS.iter().find(|n| n.eq_ignore_ascii_case(v)) {
-                stream_cipher = Some(*name);
+            } else if let Some(name) = UNSUPPORTED_CIPHERS
+                .iter()
+                .find(|n| n.eq_ignore_ascii_case(v))
+            {
+                unsupported_cipher = Some(*name);
             } else {
                 let names: Vec<&str> = METHODS.iter().map(|(name, _)| *name).collect();
                 r.invalid("encrypt-method", v, &names.join(" / "));
@@ -159,7 +217,7 @@ pub fn read_ss(r: &mut ParamReader<'_>) -> SsRead {
         }
     }
     let password = r.str("password").unwrap_or_default();
-    let needs_password = method != SsMethod::None || stream_cipher.is_some();
+    let needs_password = method != SsMethod::None || unsupported_cipher.is_some();
     let mut keys = Vec::new();
     if password.is_empty() {
         if needs_password {
@@ -207,7 +265,7 @@ pub fn read_ss(r: &mut ParamReader<'_>) -> SsRead {
             udp_port,
             obfs,
         },
-        stream_cipher,
+        unsupported_cipher,
     }
 }
 
@@ -242,7 +300,7 @@ mod tests {
             "ss, 1.2.3.4, 8000, encrypt-method=chacha20-ietf-poly1305, password=abcd1234, obfs=http, obfs-host=bing.com, obfs-uri=/resource/file, udp-relay=true",
         );
         assert!(!failed && diags.is_empty(), "{diags:?}");
-        assert!(got.stream_cipher.is_none());
+        assert!(got.unsupported_cipher.is_none());
         let spec = got.spec;
         assert_eq!(spec.method, SsMethod::ChaCha20IetfPoly1305);
         assert_eq!(spec.password.expose(), "abcd1234");
@@ -289,6 +347,60 @@ mod tests {
         let (got, failed, diags) = read("ss, h.test, 8388, encrypt-method=none");
         assert!(!failed && diags.is_empty(), "{diags:?}");
         assert_eq!(got.spec.password.expose(), "");
+    }
+
+    /// The stream ciphers of the original protocol under the manual's
+    /// names: each with its key and its IV length, `rc4` without an IV
+    /// (phase 2 M8 design 4.1).
+    #[test]
+    fn the_stream_ciphers_by_name_with_their_key_and_iv_lengths() {
+        for (name, method, key, iv) in [
+            ("rc4", SsMethod::Rc4, 16, 0),
+            ("rc4-md5", SsMethod::Rc4Md5, 16, 16),
+            ("aes-128-cfb", SsMethod::Aes128Cfb, 16, 16),
+            ("aes-192-cfb", SsMethod::Aes192Cfb, 24, 16),
+            ("AES-256-CFB", SsMethod::Aes256Cfb, 32, 16),
+            ("aes-128-ctr", SsMethod::Aes128Ctr, 16, 16),
+            ("aes-192-ctr", SsMethod::Aes192Ctr, 24, 16),
+            ("aes-256-ctr", SsMethod::Aes256Ctr, 32, 16),
+            ("salsa20", SsMethod::Salsa20, 32, 8),
+            ("chacha20", SsMethod::ChaCha20, 32, 8),
+            ("chacha20-ietf", SsMethod::ChaCha20Ietf, 32, 12),
+        ] {
+            let (got, failed, diags) = read(&format!(
+                "ss, h.test, 8388, encrypt-method={name}, password=pw, udp-relay=true, obfs=tls"
+            ));
+            assert!(!failed && diags.is_empty(), "{name}: {diags:?}");
+            assert_eq!(got.unsupported_cipher, None, "{name}");
+            assert_eq!(got.spec.method, method, "{name}");
+            assert_eq!(method.name(), name.to_ascii_lowercase());
+            assert_eq!(
+                (method.key_len(), method.iv_len()),
+                (key, Some(iv)),
+                "{name}"
+            );
+            assert!(method.is_stream() && !method.is_2022(), "{name}");
+            // keyed from the password, like an AEAD method
+            assert_eq!(got.spec.password.expose(), "pw");
+            assert!(got.spec.keys.expose().is_empty(), "{name}");
+            assert!(got.spec.udp_relay && got.spec.obfs.is_some(), "{name}");
+        }
+        for method in [
+            SsMethod::None,
+            SsMethod::Aes128Gcm,
+            SsMethod::Aes192Gcm,
+            SsMethod::Aes256Gcm,
+            SsMethod::ChaCha20IetfPoly1305,
+            SsMethod::XChaCha20IetfPoly1305,
+            SsMethod::Blake3Aes128Gcm,
+            SsMethod::Blake3Aes256Gcm,
+        ] {
+            assert_eq!(
+                (method.iv_len(), method.is_stream()),
+                (None, false),
+                "{method:?}"
+            );
+        }
     }
 
     #[test]
@@ -373,9 +485,17 @@ mod tests {
             ]
         );
         assert!(diags.iter().all(|d| !d.message.contains("hunter2")));
-        // a stream cipher needs one too
-        let (_, failed, _) = read("ss, h.test, 8388, encrypt-method=rc4-md5");
-        assert!(failed);
+        // a stream cipher needs one too, and so does a cipher that is not
+        // supported: the line is checked like any other
+        for method in ["rc4-md5", "bf-cfb"] {
+            let (_, failed, diags) = read(&format!("ss, h.test, 8388, encrypt-method={method}"));
+            assert!(failed, "{method}");
+            assert_eq!(
+                messages(&diags),
+                ["policy `P`: `password` is required"],
+                "{method}"
+            );
+        }
     }
 
     #[test]
@@ -385,24 +505,31 @@ mod tests {
         assert_eq!(
             messages(&diags),
             [
-                "policy `P`: invalid value `aes-512-gcm` for `encrypt-method` (expected aes-128-gcm / aes-192-gcm / aes-256-gcm / chacha20-ietf-poly1305 / xchacha20-ietf-poly1305 / 2022-blake3-aes-128-gcm / 2022-blake3-aes-256-gcm / none)"
+                "policy `P`: invalid value `aes-512-gcm` for `encrypt-method` (expected aes-128-gcm / aes-192-gcm / aes-256-gcm / chacha20-ietf-poly1305 / xchacha20-ietf-poly1305 / 2022-blake3-aes-128-gcm / 2022-blake3-aes-256-gcm / none / rc4 / rc4-md5 / aes-128-cfb / aes-192-cfb / aes-256-cfb / aes-128-ctr / aes-192-ctr / aes-256-ctr / salsa20 / chacha20 / chacha20-ietf)"
             ]
         );
     }
 
+    /// The names shadowsocks-libev knew and the manual does not list: the
+    /// line loads, and the caller says that the cipher is not supported.
     #[test]
-    fn a_stream_cipher_is_named_and_not_an_error() {
+    fn a_cipher_surge_no_longer_lists_is_named_and_not_an_error() {
         for (written, name) in [
-            ("rc4-md5", "rc4-md5"),
-            ("AES-256-CFB", "aes-256-cfb"),
-            ("chacha20-ietf", "chacha20-ietf"),
+            ("bf-cfb", "bf-cfb"),
             ("camellia-128-cfb", "camellia-128-cfb"),
+            ("CAMELLIA-192-CFB", "camellia-192-cfb"),
+            ("camellia-256-cfb", "camellia-256-cfb"),
+            ("cast5-cfb", "cast5-cfb"),
+            ("des-cfb", "des-cfb"),
+            ("idea-cfb", "idea-cfb"),
+            ("rc2-cfb", "rc2-cfb"),
+            ("seed-cfb", "seed-cfb"),
         ] {
             let (got, failed, diags) = read(&format!(
                 "ss, h.test, 8388, encrypt-method={written}, password=pw"
             ));
             assert!(!failed && diags.is_empty(), "{written}: {diags:?}");
-            assert_eq!(got.stream_cipher, Some(name));
+            assert_eq!(got.unsupported_cipher, Some(name));
         }
     }
 

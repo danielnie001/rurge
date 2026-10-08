@@ -86,6 +86,11 @@ aes-gcm = { version = "0.11.1", default-features = false, features = ["aes"] }
 chacha20poly1305 = { version = "0.10.1", default-features = false }
 hkdf = "0.13"
 sha1 = { version = "0.11", default-features = false }
+# Shadowsocks stream ciphers: ChaCha20 with both nonce sizes and Salsa20, at
+# the versions already in the tree (through chacha20poly1305 and scrypt), of
+# the same `cipher` generation as `aes`
+chacha20 = "0.9"
+salsa20 = "0.10"
 # SS 2022: the session and identity subkeys (BLAKE3 derive_key), the identity hash
 blake3 = "1.8"
 sha3 = "0.10"

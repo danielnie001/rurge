@@ -448,6 +448,7 @@ SSH = ssh, proxy.test, 22, username=u, password=pw\n\
 SS = ss, proxy.test, 8388, encrypt-method=aes-128-gcm, password=pw, obfs=http, udp-relay=true\n\
 SK = ss, proxy.test, 8388, encrypt-method=2022-blake3-aes-128-gcm, password=MDEyMzQ1Njc4OWFiY2RlZg==:MDEyMzQ1Njc4OWFiY2RlZg==, shadow-tls-password=st\n\
 SN = ss, proxy.test, 8388, encrypt-method=none\n\
+SC = ss, proxy.test, 8388, encrypt-method=aes-256-cfb, password=pw, obfs=tls, udp-relay=true\n\
 N4 = snell, proxy.test, 443, psk=pw, version=4, reuse=true, obfs=http\n\
 N5 = snell, proxy.test, 443, psk=pw, version=5, shadow-tls-password=st\n\
 H2 = h2-connect, proxy.test, 443, alice, s3cret, max-streams=8, udp-relay=true\n\
@@ -472,6 +473,7 @@ Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule
             ("SS", "SS"),
             ("SK", "SK"),
             ("SN", "SN"),
+            ("SC", "SC"),
             ("N4", "N4"),
             ("N5", "N5"),
             ("H2", "H2"),

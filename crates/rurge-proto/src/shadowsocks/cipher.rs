@@ -30,11 +30,23 @@ pub(crate) enum AeadKind {
 }
 
 impl AeadKind {
-    /// `None` for `none`, which encrypts nothing. SS 2022 names the AES-GCM
-    /// it seals with.
+    /// `None` for `none`, which encrypts nothing, and for the stream
+    /// ciphers, which seal nothing (`stream`). SS 2022 names the AES-GCM it
+    /// seals with.
     pub(crate) fn of(method: SsMethod) -> Option<AeadKind> {
         match method {
-            SsMethod::None => None,
+            SsMethod::None
+            | SsMethod::Rc4
+            | SsMethod::Rc4Md5
+            | SsMethod::Aes128Cfb
+            | SsMethod::Aes192Cfb
+            | SsMethod::Aes256Cfb
+            | SsMethod::Aes128Ctr
+            | SsMethod::Aes192Ctr
+            | SsMethod::Aes256Ctr
+            | SsMethod::Salsa20
+            | SsMethod::ChaCha20
+            | SsMethod::ChaCha20Ietf => None,
             SsMethod::Aes128Gcm | SsMethod::Blake3Aes128Gcm => Some(AeadKind::Aes128Gcm),
             SsMethod::Aes192Gcm => Some(AeadKind::Aes192Gcm),
             SsMethod::Aes256Gcm | SsMethod::Blake3Aes256Gcm => Some(AeadKind::Aes256Gcm),

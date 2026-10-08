@@ -1458,6 +1458,7 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
         let text = "[Proxy]\nOld = vmess, a.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\n\
 SS = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n\
 Stream = ss, 1.2.3.4, 8388, encrypt-method=rc4-md5, password=x\n\
+Gone = ss, 1.2.3.4, 8388, encrypt-method=bf-cfb, password=x\n\
 Snell1 = snell, 1.2.3.4, 443, psk=x\n[Rule]\nFINAL,DIRECT\n";
         let registry = generation(text, &FakeFactory::new(), None);
         // a `vmess` line without `vmess-aead=true` is a proxy all the same:
@@ -1468,14 +1469,23 @@ Snell1 = snell, 1.2.3.4, 443, psk=x\n[Rule]\nFINAL,DIRECT\n";
             (TerminalKind::Proxy, None)
         );
         assert_eq!(chain(&old), ["Old"]);
-        // an AEAD `ss` is a proxy; only a stream cipher is not implemented
-        let ss = registry.resolve(&PolicyRef::parse("SS"));
-        assert_eq!((ss.terminal, ss.note), (TerminalKind::Proxy, None));
-        let stream = registry.resolve(&PolicyRef::parse("Stream"));
-        assert_eq!(stream.terminal, TerminalKind::Reject);
+        // an `ss` is a proxy with an AEAD method and with a stream cipher
+        // alike; only a cipher Surge no longer lists is not supported
+        for name in ["SS", "Stream"] {
+            let ss = registry.resolve(&PolicyRef::parse(name));
+            assert_eq!(
+                (ss.terminal, ss.note.clone()),
+                (TerminalKind::Proxy, None),
+                "{name}"
+            );
+            assert_eq!(chain(&ss), [name]);
+        }
+        let gone = registry.resolve(&PolicyRef::parse("Gone"));
+        assert_eq!(gone.terminal, TerminalKind::Reject);
+        assert_eq!(chain(&gone), ["Gone", "!unsupported:ss", "REJECT"]);
         assert_eq!(
-            stream.note.clone().unwrap().to_string(),
-            "policy protocol not implemented: ss (rc4-md5)"
+            gone.note.clone().unwrap().to_string(),
+            "policy protocol not implemented: ss (bf-cfb)"
         );
         // a `snell` line without `version` is version 1
         let snell = registry.resolve(&PolicyRef::parse("Snell1"));

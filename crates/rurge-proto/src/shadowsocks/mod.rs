@@ -1,15 +1,19 @@
-//! `ss` outbound (manual: Policies › Shadowsocks; phase 2 M6 design 3.3):
-//! optionally behind Shadow TLS and / or simple-obfs, the AEAD stream
-//! (`aead`) — in its SS 2022 form for the `2022-blake3-*` methods, with the
-//! identity headers of a multi-user key (`s2022`) — or, with `none`, the
+//! `ss` outbound (manual: Policies › Shadowsocks; phase 2 M6 design 3.3,
+//! M8 design 4.1): optionally behind Shadow TLS and / or simple-obfs, the
+//! AEAD stream (`aead`) — in its SS 2022 form for the `2022-blake3-*`
+//! methods, with the identity headers of a multi-user key (`s2022`) —, the
+//! stream of a stream cipher behind its IV (`stream`) or, with `none`, the
 //! bytes as they are. The request header is the target as a SOCKS5 address;
 //! it waits in a `LazyHead` above the stream for the first payload, so both
-//! are sealed into the first chunk (SS 2022: the two header chunks).
+//! are sealed into the first chunk (SS 2022: the two header chunks) or,
+//! under a stream cipher, leave in one write behind the IV.
 //!
 //! The server never answers the header: a wrong password or method only
 //! shows once the relay reads, as a connection closed without an answer or
 //! as data that does not decrypt. SS 2022's answer names the request it
-//! belongs to and the server's time, which the stream checks.
+//! belongs to and the server's time, which the stream checks. A stream
+//! cipher authenticates nothing: whatever comes back decrypts, if only to
+//! garbage, and all that shows is a server that goes without a word.
 //!
 //! With `udp-relay=true` datagrams go to the server by themselves (`udp`),
 //! past Shadow TLS and obfs, which are TCP's.
@@ -18,6 +22,7 @@ pub(crate) mod aead;
 pub(crate) mod cipher;
 pub(crate) mod kdf;
 pub(crate) mod s2022;
+pub(crate) mod stream;
 pub(crate) mod udp;
 
 use crate::addr::{AddrError, socks_addr};
@@ -34,16 +39,20 @@ use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connecto
 use rustls::RootCertStore;
 use s2022::Identity;
 use std::sync::Arc;
+use stream::{CipherStream, StreamKey};
 use udp::{Keys2022, Packets, SsUdp};
 
 /// No `Debug`: the master key is as good as the password.
 pub struct ShadowsocksOutbound {
     name: String,
     stack: Stack,
-    /// `None`: the method is `none`. SS 2022: the user key's.
+    /// `None`: the method is `none` or a stream cipher. SS 2022: the user
+    /// key's.
     key: Option<Arc<MasterKey>>,
     /// `Some` for SS 2022, with no layers for a single key.
     identity: Option<Identity>,
+    /// `Some` for a stream cipher.
+    stream: Option<Arc<StreamKey>>,
     /// Seconds since the Unix epoch, for SS 2022's timestamps.
     now: fn() -> u64,
     /// `udp-relay=true`: where the datagrams go and how they are sealed.
@@ -100,6 +109,13 @@ impl ShadowsocksOutbound {
                 None,
             ),
         };
+        // a stream cipher's key comes from the password as well
+        let stream = match StreamKey::from_password(spec.method, spec.password.expose()) {
+            Some(_) if spec.password.expose().is_empty() => {
+                return Err(BuildError::new("`password` is empty"));
+            }
+            key => key.map(Arc::new),
+        };
         // `ss` has no TLS of its own: the camouflage certificate is checked
         // against the server's name
         let shadow_tls = shadow_tls_client(shadow_tls, None, &server.host, roots)?;
@@ -115,7 +131,7 @@ impl ShadowsocksOutbound {
                     Packets::S2022(Arc::new(Keys2022::new(kind, spec.keys.expose())))
                 }
                 (Some(key), _) => Packets::Aead(key.clone()),
-                (None, _) => Packets::Plain,
+                (None, _) => stream.clone().map_or(Packets::Plain, Packets::Stream),
             }),
         });
         let mut stack = Stack::new(connector.clone(), server, shadow_tls, None, None);
@@ -127,6 +143,7 @@ impl ShadowsocksOutbound {
             stack,
             key,
             identity,
+            stream,
             now: s2022::unix_now,
             udp,
             connector,
@@ -137,6 +154,16 @@ impl ShadowsocksOutbound {
     #[cfg(test)]
     fn with_clock(self, now: fn() -> u64) -> ShadowsocksOutbound {
         ShadowsocksOutbound { now, ..self }
+    }
+
+    /// How many random bytes open each direction of a connection: an AEAD
+    /// method's salt, a stream cipher's IV.
+    fn salt_len(&self) -> usize {
+        match (&self.key, &self.stream) {
+            (Some(key), _) => key.salt_len(),
+            (None, Some(stream)) => stream.iv_len(),
+            (None, None) => 0,
+        }
     }
 }
 
@@ -165,16 +192,9 @@ impl Outbound for ShadowsocksOutbound {
         Box::pin(async move {
             // never dial for a target whose name cannot be sent
             let head = head(target)?;
-            let salt = match &self.key {
-                None => Vec::new(),
-                Some(key) => {
-                    let mut salt = vec![0u8; key.salt_len()];
-                    getrandom::fill(&mut salt).map_err(|_| {
-                        OutboundError::Proxy("ss: no randomness available".to_string())
-                    })?;
-                    salt
-                }
-            };
+            let mut salt = vec![0u8; self.salt_len()];
+            getrandom::fill(&mut salt)
+                .map_err(|_| OutboundError::Proxy("ss: no randomness available".to_string()))?;
             // one budget for the connection, Shadow TLS and obfs; the
             // server's first word comes with its first payload, in the relay
             let transport = match tokio::time::timeout(opts.timeout, self.stack.open(opts)).await {
@@ -182,7 +202,10 @@ impl Outbound for ShadowsocksOutbound {
                 Err(_) => return Err(OutboundError::Timeout),
             };
             let stream: BoxedStream = match (&self.key, &self.identity) {
-                (None, _) => transport,
+                (None, _) => match &self.stream {
+                    Some(key) => Box::new(CipherStream::new(transport, key.clone(), salt)),
+                    None => transport,
+                },
                 (Some(key), None) => Box::new(AeadStream::new(
                     transport,
                     key.clone(),
@@ -260,6 +283,21 @@ mod tests {
         SsMethod::XChaCha20IetfPoly1305,
     ];
 
+    /// The stream ciphers of the original protocol, as the manual lists them.
+    const STREAM: [SsMethod; 11] = [
+        SsMethod::Rc4,
+        SsMethod::Rc4Md5,
+        SsMethod::Aes128Cfb,
+        SsMethod::Aes192Cfb,
+        SsMethod::Aes256Cfb,
+        SsMethod::Aes128Ctr,
+        SsMethod::Aes192Ctr,
+        SsMethod::Aes256Ctr,
+        SsMethod::Salsa20,
+        SsMethod::ChaCha20,
+        SsMethod::ChaCha20Ietf,
+    ];
+
     /// The outbound for `definition` (an `ss, host, port, ...` line).
     fn outbound(definition: &str) -> ShadowsocksOutbound {
         let span = Span::new(Arc::from(Path::new("p.conf")), 1);
@@ -323,6 +361,39 @@ mod tests {
         }
     }
 
+    /// A stream cipher sends its IV, then the head and the first payload
+    /// under it, in one write; `rc4` has no IV to send.
+    #[tokio::test]
+    async fn every_stream_cipher_carries_the_head_with_the_first_payload() {
+        let echo = echo_server().await;
+        for method in STREAM {
+            let fake = FakeShadowsocks::spawn(ShadowsocksScript::new(method, "pw")).await;
+            let out = outbound(&format!(
+                "ss, 127.0.0.1, {}, encrypt-method={}, password=pw",
+                fake.addr().port(),
+                method.name()
+            ));
+            assert_eq!(out.udp(), UdpSupport::Unsupported);
+            let mut stream = out
+                .connect_tcp(&target(echo), &ConnectOpts::default())
+                .await
+                .unwrap();
+            roundtrip(&mut stream, b"hello through ss").await;
+            roundtrip(&mut stream, b"and again").await;
+            roundtrip(&mut stream, &vec![0xa5u8; 100_000]).await;
+            let seen = fake.requests();
+            assert_eq!(seen.len(), 1, "{method:?}");
+            assert_eq!(
+                (seen[0].atyp, seen[0].host.as_str(), seen[0].port),
+                (1, "127.0.0.1", echo.port()),
+                "{method:?}"
+            );
+            assert_eq!(seen[0].early, b"hello through ss", "{method:?}: one write");
+            assert_eq!(Some(seen[0].salt.len()), method.iv_len(), "{method:?}");
+            assert_eq!(fake.rejected(), 0, "{method:?}");
+        }
+    }
+
     #[tokio::test]
     async fn each_connection_has_a_salt_of_its_own() {
         let echo = echo_server().await;
@@ -339,6 +410,31 @@ mod tests {
             roundtrip(&mut stream, b"x").await;
         }
         let seen = fake.requests();
+        assert_ne!(seen[0].salt, seen[1].salt);
+        assert_ne!(
+            seen[0].salt,
+            fake.answer_salts()[0],
+            "and one per direction"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_connection_under_a_stream_cipher_has_an_iv_of_its_own() {
+        let echo = echo_server().await;
+        let fake = FakeShadowsocks::spawn(ShadowsocksScript::new(SsMethod::Aes256Cfb, "pw")).await;
+        let out = outbound(&format!(
+            "ss, 127.0.0.1, {}, encrypt-method=aes-256-cfb, password=pw",
+            fake.addr().port()
+        ));
+        for _ in 0..2 {
+            let mut stream = out
+                .connect_tcp(&target(echo), &ConnectOpts::default())
+                .await
+                .unwrap();
+            roundtrip(&mut stream, b"x").await;
+        }
+        let seen = fake.requests();
+        assert_eq!(seen[0].salt.len(), 16);
         assert_ne!(seen[0].salt, seen[1].salt);
         assert_ne!(
             seen[0].salt,
@@ -456,6 +552,120 @@ mod tests {
         assert_eq!((fake.rejected(), fake.requests().len()), (1, 0));
     }
 
+    /// A stream cipher authenticates nothing: under a wrong password the
+    /// server reads whatever the request decrypts to, which is not the
+    /// address that was asked for. This one gives up on a request it cannot
+    /// connect anywhere with and goes — closing, or resetting — and the
+    /// client hears that, and no answer.
+    #[tokio::test]
+    async fn a_wrong_password_under_a_stream_cipher_never_reaches_the_target() {
+        let echo = echo_server().await;
+        // long enough to hold any address it may decrypt to: the server
+        // has all of whatever it takes the request for, and waits for no more
+        let request = vec![0x42u8; 300];
+        for (reset, kind, text) in [
+            (
+                false,
+                std::io::ErrorKind::UnexpectedEof,
+                "ss: the server closed the connection without answering",
+            ),
+            (
+                true,
+                std::io::ErrorKind::ConnectionReset,
+                "ss: the server reset the connection without answering (wrong password or method?)",
+            ),
+        ] {
+            for method in STREAM {
+                let fake = FakeShadowsocks::spawn(ShadowsocksScript {
+                    reset,
+                    ..ShadowsocksScript::new(method, "right")
+                })
+                .await;
+                let out = outbound(&format!(
+                    "ss, 127.0.0.1, {}, encrypt-method={}, password=wrong",
+                    fake.addr().port(),
+                    method.name()
+                ));
+                let mut stream = out
+                    .connect_tcp(&target(echo), &ConnectOpts::default())
+                    .await
+                    .expect("connecting succeeds");
+                stream.write_all(&request).await.unwrap();
+                let mut answer = Vec::new();
+                let err =
+                    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut answer))
+                        .await
+                        .expect("the server goes")
+                        .unwrap_err();
+                assert_eq!(
+                    (err.kind(), err.to_string().as_str()),
+                    (kind, text),
+                    "{method:?}"
+                );
+                assert!(answer.is_empty(), "{method:?}");
+                assert_eq!(fake.rejected(), 1, "{method:?}");
+                // whatever it took the request for, it was not the target
+                assert!(
+                    fake.requests()
+                        .iter()
+                        .all(|r| (r.host.as_str(), r.port) != ("127.0.0.1", echo.port())),
+                    "{method:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_cipher_goes_through_both_obfs_modes() {
+        let echo = echo_server().await;
+        for (mode, method, extra) in [
+            (
+                ObfsMode::Http,
+                SsMethod::Aes256Cfb,
+                "obfs=http, obfs-host=cdn.example, obfs-uri=/a",
+            ),
+            (
+                ObfsMode::Tls,
+                SsMethod::ChaCha20Ietf,
+                "obfs=tls, obfs-host=cdn.example",
+            ),
+        ] {
+            let fake = FakeShadowsocks::spawn(ShadowsocksScript {
+                obfs: Some(mode),
+                ..ShadowsocksScript::new(method, "pw")
+            })
+            .await;
+            let port = fake.addr().port();
+            let out = outbound(&format!(
+                "ss, 127.0.0.1, {port}, encrypt-method={}, password=pw, {extra}",
+                method.name()
+            ));
+            let mut stream = out
+                .connect_tcp(&target(echo), &ConnectOpts::default())
+                .await
+                .unwrap();
+            roundtrip(&mut stream, b"behind the camouflage").await;
+            let data = vec![0xa5u8; 100_000];
+            roundtrip(&mut stream, &data).await;
+            let hello = &fake.obfs_seen()[0];
+            match mode {
+                ObfsMode::Http => {
+                    assert_eq!(hello.host, format!("cdn.example:{port}"));
+                    assert_eq!(hello.uri.as_deref(), Some("/a"));
+                }
+                ObfsMode::Tls => assert_eq!(hello.host, "cdn.example"),
+            }
+            let seen = fake.requests();
+            assert_eq!(seen[0].early, b"behind the camouflage", "{method:?}");
+            // the camouflage's first packet carried the IV and the request
+            assert_eq!(
+                hello.first_payload.len(),
+                method.iv_len().unwrap() + 7 + seen[0].early.len(),
+                "{method:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn through_both_obfs_modes() {
         let echo = echo_server().await;
@@ -509,7 +719,11 @@ mod tests {
                 });
             }
         });
-        for method in [SsMethod::XChaCha20IetfPoly1305, SsMethod::None] {
+        for method in [
+            SsMethod::XChaCha20IetfPoly1305,
+            SsMethod::None,
+            SsMethod::Rc4Md5,
+        ] {
             let fake = FakeShadowsocks::spawn(ShadowsocksScript::new(method, "pw")).await;
             let out = outbound(&format!(
                 "ss, 127.0.0.1, {}, encrypt-method={}, password=pw",
@@ -911,6 +1125,7 @@ mod tests {
         let mut setups: Vec<_> = AEAD
             .into_iter()
             .chain([SsMethod::None])
+            .chain(STREAM)
             .map(|method| (ShadowsocksScript::new(method, "pw"), "pw".to_string(), None))
             .collect();
         for method in SS_2022 {
@@ -988,10 +1203,33 @@ mod tests {
         }
     }
 
+    /// A datagram may be empty: behind its address there is nothing, and
+    /// under `rc4`, which has no IV, the packet is the address alone,
+    /// encrypted from its first byte.
+    #[tokio::test]
+    async fn an_empty_datagram_makes_the_round_trip_under_a_stream_cipher() {
+        let echo = udp_echo_server().await;
+        for method in [SsMethod::Rc4, SsMethod::Aes256Cfb, SsMethod::ChaCha20Ietf] {
+            let fake = FakeShadowsocks::spawn(ShadowsocksScript::new(method, "pw")).await;
+            let out = udp_outbound(&fake, method, "pw");
+            let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+            udp_roundtrip(carrier.as_ref(), echo, b"").await;
+            udp_roundtrip(carrier.as_ref(), echo, b"and then some").await;
+            let seen = fake.datagrams();
+            let payloads: Vec<&[u8]> = seen.iter().map(|d| d.payload.as_slice()).collect();
+            assert_eq!(payloads, [&b""[..], b"and then some"], "{method:?}");
+            assert_eq!(fake.udp_rejected(), 0, "{method:?}");
+        }
+    }
+
     #[tokio::test]
     async fn udp_goes_to_udp_port_when_it_is_written() {
         let echo = udp_echo_server().await;
-        for method in [SsMethod::Aes128Gcm, SsMethod::Blake3Aes256Gcm] {
+        for method in [
+            SsMethod::Aes128Gcm,
+            SsMethod::Blake3Aes256Gcm,
+            SsMethod::Aes128Ctr,
+        ] {
             let password = udp_password(method);
             let fake = FakeShadowsocks::spawn(ShadowsocksScript {
                 udp_apart: true,
@@ -1016,7 +1254,11 @@ mod tests {
     #[tokio::test]
     async fn udp_is_full_cone() {
         let echo = udp_echo_server().await;
-        for method in [SsMethod::ChaCha20IetfPoly1305, SsMethod::Blake3Aes128Gcm] {
+        for method in [
+            SsMethod::ChaCha20IetfPoly1305,
+            SsMethod::Blake3Aes128Gcm,
+            SsMethod::Salsa20,
+        ] {
             let password = udp_password(method);
             let fake = FakeShadowsocks::spawn(ShadowsocksScript::new(method, &password)).await;
             let out = udp_outbound(&fake, method, &password);
@@ -1200,6 +1442,7 @@ mod tests {
         };
         let build = |method: SsMethod, password: &str| build_keyed(method, password, Vec::new());
         assert_eq!(build(SsMethod::Aes128Gcm, ""), "`password` is empty");
+        assert_eq!(build(SsMethod::Aes256Cfb, ""), "`password` is empty");
         // SS 2022 takes its keys, not the password (the spec has none here)
         assert_eq!(
             build(SsMethod::Blake3Aes128Gcm, "secret"),

@@ -1,17 +1,22 @@
 //! A scriptable Shadowsocks server: optionally simple-obfs in front, then
-//! the AEAD stream (or, with `none`, the bytes as they are; or SS 2022 with
-//! its headers and, for several users, identity headers), the request
-//! header, and a relay. Its framing, nonce counting, headers and address
-//! parsing are written apart from the client's (`crate::shadowsocks`), so
-//! each checks the other; only the primitives (the ciphers and the key
-//! derivations, which have vectors of their own) are shared. It never
-//! resolves a name.
+//! the AEAD stream (or, with `none`, the bytes as they are; or a stream
+//! cipher behind its IV; or SS 2022 with its headers and, for several
+//! users, identity headers), the request header, and a relay. Its framing,
+//! nonce counting, headers and address parsing are written apart from the
+//! client's (`crate::shadowsocks`), so each checks the other; only the
+//! primitives (the ciphers — a stream cipher's keystream among them — and
+//! the key derivations, which have vectors of their own) are shared. It
+//! never resolves a name, and never connects or sends to an address off the
+//! loopback.
 //!
 //! It never tells a client with a wrong password (or key, or clock, or a
 //! replayed salt) so: it stops reading into the stream, closes its side and
 //! waits for the client to go away — or, with `reset`, resets the
 //! connection, as shadowsocks-rust does with an SS 2022 request it cannot
-//! open. (For AEAD shadowsocks-rust reads on until the client goes.)
+//! open. (For AEAD shadowsocks-rust reads on until the client goes.) A
+//! stream cipher authenticates nothing, so there the same goes for every
+//! request it cannot serve: under a wrong password the address is whatever
+//! the bytes decrypt to.
 //!
 //! UDP: a loopback socket on the TCP port's number (or, with `udp_apart`, a
 //! port of its own). Each client session (SS 2022: its session id; else the
@@ -23,6 +28,7 @@ use super::AbortOnDrop;
 use super::obfs::{ObfsHello, accept_obfs};
 use crate::shadowsocks::cipher::{AeadCipher, AeadKind, TAG, aes_decrypt_block, aes_encrypt_block};
 use crate::shadowsocks::kdf;
+use crate::shadowsocks::stream::Keystream;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use rurge_config::spec::{ObfsMode, SsMethod};
@@ -90,14 +96,16 @@ impl ShadowsocksScript {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordedShadowsocks {
-    /// The client's salt; empty for `none`.
+    /// The client's salt, under a stream cipher its IV; empty for `none`
+    /// and for `rc4`.
     pub salt: Vec<u8>,
     pub atyp: u8,
     /// An IP literal, or the name exactly as it was on the wire.
     pub host: String,
     pub port: u16,
-    /// Payload after the address: the rest of the first chunk (`none`: of
-    /// the read that completed the address; SS 2022: after the padding).
+    /// Payload after the address: the rest of the first chunk (`none` and
+    /// the stream ciphers: of the read that completed the address; SS 2022:
+    /// after the padding).
     pub early: Vec<u8>,
     /// SS 2022: the request's padding length.
     pub padding: usize,
@@ -285,11 +293,13 @@ impl Shared {
             .push(request.clone());
     }
 
-    /// Where to relay a request; `None`: a name without `connect_to`.
+    /// Where to relay a request; `None`: a name without `connect_to`, or
+    /// an address off the loopback — what a stream cipher decrypts under a
+    /// wrong password is any address at all.
     fn upstream(&self, request: &RecordedShadowsocks) -> Option<SocketAddr> {
         self.script.connect_to.or_else(|| {
             let ip = request.host.parse::<IpAddr>().ok()?;
-            Some(SocketAddr::new(ip, request.port))
+            ip.is_loopback().then(|| SocketAddr::new(ip, request.port))
         })
     }
 
@@ -320,11 +330,100 @@ async fn serve(tcp: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
         shared.seen.obfs.lock().expect("obfs").push(hello);
         stream = inner;
     }
+    if let Some(iv_len) = shared.script.method.iv_len() {
+        return serve_stream(stream, iv_len, &shared).await;
+    }
     match AeadKind::of(shared.script.method) {
         None => serve_plain(stream, &shared).await,
         Some(kind) if shared.script.method.is_2022() => serve_2022(stream, kind, &shared).await,
         Some(kind) => serve_aead(stream, kind, &shared).await,
     }
+}
+
+/// A stream cipher (the original protocol): the client's IV, then the
+/// address and the payload under it, taken as they come; the answer behind
+/// an IV of its own, which leaves with the answer's first bytes. A request
+/// it cannot serve — no address, a name without `connect_to`, an address off
+/// the loopback or one that refuses — gets what a request that does not
+/// decrypt gets from the other methods: no word.
+async fn serve_stream(mut stream: BoxedStream, iv_len: usize, shared: &Shared) -> io::Result<()> {
+    let method = shared.script.method;
+    let master = kdf::evp_bytes_to_key(shared.script.password.as_bytes(), method.key_len());
+    let mut iv = vec![0u8; iv_len];
+    stream.read_exact(&mut iv).await?;
+    let mut up = Keystream::new(method, &master, &iv);
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut request = loop {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        up.decrypt(&mut chunk[..n])?;
+        buf.extend_from_slice(&chunk[..n]);
+        if !matches!(buf[0], 1 | 3 | 4) {
+            return shared.reject(stream).await;
+        }
+        if let Some((request, _)) = parse_address(&buf) {
+            break request;
+        }
+    };
+    request.salt = iv;
+    shared.record(&request);
+    let upstream = match shared.upstream(&request) {
+        Some(to) => TcpStream::connect(to).await.ok(),
+        None => None,
+    };
+    let Some(mut upstream) = upstream else {
+        return shared.reject(stream).await;
+    };
+    upstream.write_all(&request.early).await?;
+    let (mut client_read, mut client_write) = tokio::io::split(stream);
+    let (mut target_read, mut target_write) = upstream.into_split();
+    let requests = async {
+        while let Ok(n @ 1..) = client_read.read(&mut chunk).await {
+            if up.decrypt(&mut chunk[..n]).is_err()
+                || target_write.write_all(&chunk[..n]).await.is_err()
+            {
+                return;
+            }
+        }
+        let _ = target_write.shutdown().await;
+    };
+    let answers = async {
+        let mut answer_iv = vec![0u8; iv_len];
+        getrandom::fill(&mut answer_iv).expect("randomness");
+        let mut down = Keystream::new(method, &master, &answer_iv);
+        // the IV goes out with the first payload, never alone
+        let mut pending_iv = Some(answer_iv);
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let n = match target_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let mut frame = Vec::with_capacity(iv_len + n);
+            if let Some(iv) = pending_iv.take() {
+                shared
+                    .seen
+                    .answer_salts
+                    .lock()
+                    .expect("salts")
+                    .push(iv.clone());
+                frame.extend_from_slice(&iv);
+            }
+            let body = frame.len();
+            frame.extend_from_slice(&buf[..n]);
+            if down.encrypt(&mut frame[body..]).is_err()
+                || client_write.write_all(&frame).await.is_err()
+            {
+                return;
+            }
+        }
+        let _ = client_write.shutdown().await;
+    };
+    tokio::join!(requests, answers);
+    Ok(())
 }
 
 async fn serve_plain(mut stream: BoxedStream, shared: &Shared) -> io::Result<()> {
@@ -590,6 +689,8 @@ enum ClientKey {
 #[derive(Clone)]
 enum Answering {
     Plain,
+    /// A stream cipher: every answer behind an IV of its own.
+    Stream,
     Aead(AeadKind),
     S2022 {
         kind: AeadKind,
@@ -623,6 +724,11 @@ fn seal_plain(cipher: &AeadCipher, nonce: &[u8], plain: &[u8]) -> Vec<u8> {
     data
 }
 
+/// A stream cipher's master key: `EVP_BytesToKey` of the password.
+fn stream_master(script: &ShadowsocksScript) -> Vec<u8> {
+    kdf::evp_bytes_to_key(script.password.as_bytes(), script.method.key_len())
+}
+
 /// The target and the payload of a datagram's plaintext.
 fn target_of(plain: &[u8]) -> Option<(String, u16, Vec<u8>)> {
     let (request, _) = parse_address(plain)?;
@@ -632,6 +738,16 @@ fn target_of(plain: &[u8]) -> Option<(String, u16, Vec<u8>)> {
 /// A client datagram from `from`; `None` for one it cannot use.
 fn open_datagram(script: &ShadowsocksScript, packet: &[u8], from: SocketAddr) -> Option<Opened> {
     let (plain, answering) = match AeadKind::of(script.method) {
+        // a stream cipher: the packet's IV, then everything under it
+        None if script.method.is_stream() => {
+            let (iv, body) = packet.split_at_checked(script.method.iv_len()?)?;
+            let master = stream_master(script);
+            let mut plain = body.to_vec();
+            Keystream::new(script.method, &master, iv)
+                .decrypt(&mut plain)
+                .ok()?;
+            (plain, Answering::Stream)
+        }
         None => (packet.to_vec(), Answering::Plain),
         Some(kind) if script.method.is_2022() => return open_datagram_2022(script, kind, packet),
         Some(kind) => {
@@ -736,6 +852,15 @@ fn seal_answer(
     let addr = socks_address(from);
     match answering {
         Answering::Plain => [&addr[..], payload].concat(),
+        Answering::Stream => {
+            let mut iv = vec![0u8; script.method.iv_len().expect("a stream cipher")];
+            getrandom::fill(&mut iv).expect("randomness");
+            let mut body = [&addr[..], payload].concat();
+            Keystream::new(script.method, &stream_master(script), &iv)
+                .encrypt(&mut body)
+                .expect("a datagram is far below the keystream's end");
+            [iv, body].concat()
+        }
         Answering::Aead(kind) => {
             let mut salt = vec![0u8; kind.key_len()];
             getrandom::fill(&mut salt).expect("randomness");
@@ -886,7 +1011,10 @@ async fn serve_udp(socket: Arc<UdpSocket>, shared: Arc<Shared>) {
             .expect("datagrams")
             .push(opened.record.clone());
         let to = match (opened.host.parse::<IpAddr>(), shared.script.connect_to) {
-            (Ok(ip), _) => SocketAddr::new(ip, opened.port),
+            (Ok(ip), _) if ip.is_loopback() => SocketAddr::new(ip, opened.port),
+            // never off the loopback: what a stream cipher decrypts under
+            // a wrong password is any address at all
+            (Ok(_), _) => continue,
             (Err(_), Some(addr)) => addr,
             // never resolves: a name without `connect_to` is a dead end
             (Err(_), None) => continue,
@@ -963,7 +1091,8 @@ impl FakeShadowsocks {
         self.shared.seen.obfs.lock().expect("obfs").clone()
     }
 
-    /// The salts of the server's own streams, in the order they started.
+    /// The salts of the server's own streams (a stream cipher's: the IVs),
+    /// in the order they started.
     pub fn answer_salts(&self) -> Vec<Vec<u8>> {
         self.shared.seen.answer_salts.lock().expect("salts").clone()
     }
@@ -978,7 +1107,9 @@ impl FakeShadowsocks {
         self.connections.load(Ordering::SeqCst)
     }
 
-    /// Connections given no answer because they did not decrypt.
+    /// Connections given no answer because they did not decrypt; under a
+    /// stream cipher, which cannot tell, because the request named nothing
+    /// the server could connect to.
     pub fn rejected(&self) -> usize {
         self.shared.seen.rejected.load(Ordering::SeqCst)
     }

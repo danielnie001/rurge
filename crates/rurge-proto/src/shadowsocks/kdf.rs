@@ -1,6 +1,7 @@
 //! Key derivation of the AEAD methods (the Shadowsocks AEAD specification):
 //! the master key from the password, and one session key per salt; and of
-//! SS 2022 (SIP022, SIP023): BLAKE3 `derive_key` of a key and a salt.
+//! SS 2022 (SIP022, SIP023): BLAKE3 `derive_key` of a key and a salt. The
+//! stream ciphers start from the same master key (`stream`).
 
 use hkdf::Hkdf;
 use md5::{Digest, Md5};

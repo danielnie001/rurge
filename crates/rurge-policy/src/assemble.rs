@@ -1052,13 +1052,13 @@ G3 = select, policy-path=https://sub.test/b",
                     "G",
                     "Bad = http, b.test, 80, tos=999\nUp = http, u.test, 80, underlying-proxy=Nowhere\n\
 Ts = tailscale\n\
-Rc = ss, r.test, 8388, encrypt-method=rc4, password=pw\n\
+Bf = ss, r.test, 8388, encrypt-method=bf-cfb, password=pw\n\
 Sn = snell, n.test, 443, psk=pw\n\
 Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = http, g.test, 80",
                 )],
             ),
         );
-        assert_eq!(members(&a, "G"), ["Ts", "Rc", "Sn", "Old", "Good"]);
+        assert_eq!(members(&a, "G"), ["Ts", "Bf", "Sn", "Old", "Good"]);
         let specs: Vec<bool> = a.imported.iter().map(|i| i.spec.is_some()).collect();
         assert_eq!(specs, [false, false, false, true, true]);
         let why: Vec<Option<NotImplemented>> = a
@@ -1070,7 +1070,7 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
             why,
             [
                 None,
-                Some(NotImplemented::SsStreamCipher("rc4")),
+                Some(NotImplemented::SsCipher("bf-cfb")),
                 Some(NotImplemented::SnellVersion(1)),
                 None,
                 None
@@ -1093,7 +1093,7 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
                 ),
                 (
                     codes::W_PROTOCOL_NOT_IMPLEMENTED,
-                    "policy group `G`: imported policies of type `ss` with the stream cipher `rc4` are not supported; they behave as REJECT".to_string()
+                    "policy group `G`: imported policies of type `ss` with the cipher `bf-cfb` are not supported; they behave as REJECT".to_string()
                 ),
                 (
                     codes::W_PROTOCOL_NOT_IMPLEMENTED,
@@ -1151,6 +1151,66 @@ Old2 = vmess, v3.test, 443, username={id}, vmess-aead=false"
                 (
                     codes::W_PARAM_NOT_EFFECTIVE,
                     "policy group `H`: imported `vmess` policies without `vmess-aead=true` use the AEAD handshake".to_string()
+                ),
+            ]
+        );
+    }
+
+    /// An `ss` line with a stream cipher is a member with a spec. Each
+    /// group that takes such lines in says so once per cipher, however many
+    /// they are, and `rc4` with a word more.
+    #[test]
+    fn imported_ss_lines_with_a_stream_cipher_are_members_and_said_once_per_group_and_cipher() {
+        let cfg = profile(
+            "A = http, a.test, 80",
+            "G = select, policy-path=https://sub.test/g\nH = select, policy-path=https://sub.test/h",
+        );
+        let a = assemble(
+            &cfg,
+            &snapshots(
+                &cfg,
+                &[
+                    (
+                        "G",
+                        "Cfb1 = ss, s1.test, 8388, encrypt-method=aes-256-cfb, password=pw\n\
+Aead = ss, s2.test, 8388, encrypt-method=aes-256-gcm, password=pw\n\
+Cfb2 = ss, s3.test, 8388, encrypt-method=AES-256-CFB, password=pw\n\
+Rc = ss, s4.test, 8388, encrypt-method=rc4, password=pw",
+                    ),
+                    (
+                        "H",
+                        "Other = ss, s5.test, 8388, encrypt-method=aes-256-cfb, password=pw",
+                    ),
+                ],
+            ),
+        );
+        assert_eq!(members(&a, "G"), ["Cfb1", "Aead", "Cfb2", "Rc"]);
+        assert_eq!(members(&a, "H"), ["Other"]);
+        for imported in &a.imported {
+            let name = &imported.policy.name;
+            assert!(
+                matches!(
+                    imported.spec.as_ref().map(|spec| &spec.proto),
+                    Some(ProtoSpec::Ss(_))
+                ),
+                "{name}"
+            );
+            assert_eq!(imported.not_implemented, None, "{name}");
+        }
+        assert_eq!(
+            warnings(&a),
+            [
+                (
+                    codes::W_STREAM_CIPHER,
+                    "policy group `G`: imported `ss` policies use the stream cipher `aes-256-cfb`: it gives no integrity protection and is deprecated".to_string()
+                ),
+                (
+                    codes::W_STREAM_CIPHER,
+                    "policy group `G`: imported `ss` policies use the stream cipher `rc4`: it gives no integrity protection and is deprecated; `rc4` also repeats its keystream on every connection".to_string()
+                ),
+                (
+                    codes::W_STREAM_CIPHER,
+                    "policy group `H`: imported `ss` policies use the stream cipher `aes-256-cfb`: it gives no integrity protection and is deprecated".to_string()
                 ),
             ]
         );

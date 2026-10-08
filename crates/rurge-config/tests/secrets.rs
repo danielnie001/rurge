@@ -34,6 +34,7 @@ Vmess = vmess, v.example, 443, username={UUID}, vmess-aead=true
 AnyTls = anytls, a.example, 443, password={MARKER}-anytls
 Ss = ss, ss.example, 8388, encrypt-method=aes-128-gcm, password={MARKER}-ss, obfs=http, obfs-host={MARKER}-obfs.example, obfs-uri=/{MARKER}-uri
 Ss2022 = ss, ss.example, 8389, encrypt-method=2022-blake3-aes-128-gcm, password={KEY_16}
+SsStream = ss, ss.example, 8390, encrypt-method=aes-256-cfb, password={MARKER}-ssstream
 Snell = snell, sn.example, 443, psk={MARKER}-snell, version=4
 Hy2 = hysteria2, hy.example, 443, password={MARKER}-hy2, salamander-password={MARKER}-salamander
 TuicV5 = tuic-v5, tu.example, 443, uuid={UUID}, password={MARKER}-tuic
@@ -95,8 +96,8 @@ fn the_profile_loads() {
     );
     // every line that takes a spec has one: the secrets are really read
     for name in [
-        "Http", "Https", "Socks", "Trojan", "Vmess", "AnyTls", "Ss", "Ss2022", "Snell", "Hy2",
-        "TuicV5", "Tuic", "Masque", "Tt", "H2", "Ssh", "Wg", "Ext", "Shadow", "Tested",
+        "Http", "Https", "Socks", "Trojan", "Vmess", "AnyTls", "Ss", "Ss2022", "SsStream", "Snell",
+        "Hy2", "TuicV5", "Tuic", "Masque", "Tt", "H2", "Ssh", "Wg", "Ext", "Shadow", "Tested",
     ] {
         assert!(loaded.config.spec(name).is_some(), "{name}");
     }

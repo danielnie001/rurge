@@ -1,7 +1,8 @@
-//! Sessions that leave through `ss` (phase 2 M6 design 3.3, 3.4): TCP and
-//! UDP through the engine to the loopback `FakeShadowsocks` — the AEAD
-//! methods, `none` and SS 2022 with identity headers, both obfs modes,
-//! `udp-port`, `underlying-proxy`, reloads, and what is not implemented.
+//! Sessions that leave through `ss` (phase 2 M6 design 3.3, 3.4; M8 design
+//! 4.1): TCP and UDP through the engine to the loopback `FakeShadowsocks` —
+//! the AEAD methods, `none`, SS 2022 with identity headers and the stream
+//! ciphers, both obfs modes, `udp-port`, `underlying-proxy`, reloads, and a
+//! cipher that is not supported.
 
 mod common;
 use common::*;
@@ -161,13 +162,51 @@ async fn a_server_clock_an_hour_off_fails_the_session_with_the_reason() {
     );
 }
 
-/// A stream cipher is parsed and rejects at run time, and the record names
-/// the cipher (design 3.1).
+/// The stream ciphers of the original protocol carry a tunnel like any
+/// other method (phase 2 M8 design 4.1): one over AES-CFB, one of the
+/// ChaCha family and one over RC4. The server is asked for the name, behind
+/// an IV of the cipher's length.
 #[tokio::test]
-async fn a_stream_cipher_rejects_and_says_which() {
+async fn a_connect_leaves_through_ss_with_a_stream_cipher() {
+    let echo = rurge_proto::testing::echo_server().await;
+    for (method, name) in [
+        (SsMethod::Aes256Cfb, "aes-256-cfb"),
+        (SsMethod::ChaCha20Ietf, "chacha20-ietf"),
+        (SsMethod::Rc4Md5, "rc4-md5"),
+    ] {
+        let fake = FakeShadowsocks::spawn(ShadowsocksScript {
+            connect_to: Some(echo),
+            ..ShadowsocksScript::new(method, "s3same")
+        })
+        .await;
+        let params = format!("encrypt-method={name}, password=s3same");
+        let h = through(&ss_line(&fake, &params)).await;
+        let mut tunnel = connect_via_http(h.http(), "target.test:7").await;
+        echo_through(&mut tunnel, b"through ss").await;
+        echo_through(&mut tunnel, &vec![0x5a; 100_000]).await;
+        let seen = fake.requests();
+        let first = seen.first().expect("the server never saw a request");
+        assert_eq!(
+            (first.atyp, first.host.as_str(), first.port),
+            (3, "target.test", 7),
+            "{params}: the server resolves the name"
+        );
+        assert_eq!(Some(first.salt.len()), method.iv_len(), "{params}");
+        assert!(h.dns.queries().is_empty(), "rurge never looked the name up");
+        drop(tunnel);
+        let record = the_record(&h).await;
+        assert_eq!(record.policy, ["S"], "{params}");
+        assert!(record.error.is_none(), "{params}: {:?}", record.error);
+    }
+}
+
+/// A cipher Surge no longer lists is parsed and rejects at run time, and
+/// the record names the cipher (phase 2 M8 design 4.1).
+#[tokio::test]
+async fn a_cipher_that_is_not_supported_rejects_and_says_which() {
     let h = harness(Profile {
-        proxies: "Rc = ss, 127.0.0.1, 9, encrypt-method=rc4-md5, password=s3same",
-        rules: "DOMAIN,target.test,Rc",
+        proxies: "Bf = ss, 127.0.0.1, 9, encrypt-method=bf-cfb, password=s3same",
+        rules: "DOMAIN,target.test,Bf",
         ..Profile::default()
     })
     .await;
@@ -186,7 +225,7 @@ async fn a_stream_cipher_rejects_and_says_which() {
     assert_eq!(record.status, RecordStatus::Rejected("REJECT".into()));
     assert_eq!(
         record.error.as_deref(),
-        Some("policy protocol not implemented: ss (rc4-md5)")
+        Some("policy protocol not implemented: ss (bf-cfb)")
     );
 }
 
@@ -289,6 +328,23 @@ async fn udp_goes_through_ss_aead_and_2022() {
         seen.iter().all(|d| d.session.map(|s| s.0) == Some(session)),
         "one carrier, one session: {seen:?}"
     );
+}
+
+/// A stream cipher carries UDP too, every datagram behind an IV of its own
+/// (phase 2 M8 design 4.1).
+#[tokio::test]
+async fn udp_goes_through_ss_with_a_stream_cipher() {
+    for (method, name) in [
+        (SsMethod::Aes128Ctr, "aes-128-ctr"),
+        (SsMethod::Salsa20, "salsa20"),
+    ] {
+        let fake = FakeShadowsocks::spawn(ShadowsocksScript::new(method, "s3same")).await;
+        udp_through(
+            &fake,
+            &format!("encrypt-method={name}, password=s3same, udp-relay=true"),
+        )
+        .await;
+    }
 }
 
 /// `udp-port`: datagrams go to that port, not to the policy's.

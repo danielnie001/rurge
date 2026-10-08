@@ -1804,40 +1804,63 @@ S = ssh, s.test, 22, username=u, password=p\n[Rule]\nFINAL,DIRECT\n",
         );
     }
 
-    /// An `ss` stream cipher: `W0007` once per load and cipher, at the first
-    /// line that uses it (phase 2 M6 design 3.1).
+    /// An `ss` stream cipher is built like any other method: `W0031` once
+    /// per load and cipher, at the first line that uses it, `rc4` with a
+    /// word more. A cipher Surge no longer lists is `W0007`, once too, and
+    /// its policies have no spec (phase 2 M8 design 4.1).
     #[test]
-    fn ss_stream_ciphers_are_reported_once_per_load_and_cipher() {
+    fn ss_stream_ciphers_are_remarked_on_once_per_load_and_cipher() {
         let loaded = load_text(
             "[Proxy]\nA = ss, a.test, 8388, encrypt-method=rc4-md5, password=pw\n\
 B = ss, b.test, 8388, encrypt-method=aes-256-cfb, password=pw\n\
-C = ss, c.test, 8388, encrypt-method=rc4-md5, password=pw\n\
-D = ss, d.test, 8388, encrypt-method=aes-256-gcm, password=pw\n[Rule]\nFINAL,DIRECT\n",
+C = ss, c.test, 8388, encrypt-method=RC4-MD5, password=pw\n\
+D = ss, d.test, 8388, encrypt-method=aes-256-gcm, password=pw\n\
+E = ss, e.test, 8388, encrypt-method=bf-cfb, password=pw\n\
+F = ss, f.test, 8388, encrypt-method=bf-cfb, password=pw\n\
+G = ss, g.test, 8388, encrypt-method=rc4, password=pw\n[Rule]\nFINAL,DIRECT\n",
         );
-        let found: Vec<(&str, Option<u32>)> = loaded
+        let found: Vec<(&str, &str, Option<u32>)> = loaded
             .diagnostics
             .iter()
-            .filter(|d| d.code == codes::W_PROTOCOL_NOT_IMPLEMENTED)
-            .map(|d| (d.message.as_str(), d.span.as_ref().map(|s| s.line)))
+            .map(|d| (d.code, d.message.as_str(), d.span.as_ref().map(|s| s.line)))
             .collect();
         assert_eq!(
             found,
             [
                 (
-                    "`ss` stream cipher `rc4-md5` is not implemented yet; such policies behave as REJECT",
+                    codes::W_STREAM_CIPHER,
+                    "`ss` cipher `rc4-md5` is a stream cipher: it gives no integrity protection and is deprecated; use an AEAD cipher",
                     Some(2)
                 ),
                 (
-                    "`ss` stream cipher `aes-256-cfb` is not implemented yet; such policies behave as REJECT",
+                    codes::W_STREAM_CIPHER,
+                    "`ss` cipher `aes-256-cfb` is a stream cipher: it gives no integrity protection and is deprecated; use an AEAD cipher",
                     Some(3)
+                ),
+                (
+                    codes::W_PROTOCOL_NOT_IMPLEMENTED,
+                    "`ss` cipher `bf-cfb` is not supported (Surge no longer lists it); such policies behave as REJECT",
+                    Some(6)
+                ),
+                (
+                    codes::W_STREAM_CIPHER,
+                    "`ss` cipher `rc4` is a stream cipher: it gives no integrity protection and is deprecated; use an AEAD cipher; `rc4` also repeats its keystream on every connection",
+                    Some(8)
                 ),
             ]
         );
-        assert_eq!(
-            loaded.config.not_implemented.get("C"),
-            Some(&NotImplemented::SsStreamCipher("rc4-md5"))
-        );
-        assert_eq!(loaded.config.not_implemented.get("D"), None);
+        for name in ["A", "B", "C", "D", "G"] {
+            assert!(loaded.config.spec(name).is_some(), "{name}");
+            assert_eq!(loaded.config.not_implemented.get(name), None, "{name}");
+        }
+        for name in ["E", "F"] {
+            assert!(loaded.config.spec(name).is_none(), "{name}");
+            assert_eq!(
+                loaded.config.not_implemented.get(name),
+                Some(&NotImplemented::SsCipher("bf-cfb")),
+                "{name}"
+            );
+        }
     }
 
     /// A `snell` version other than 4 and 5: `W0007` once per load and
