@@ -146,11 +146,11 @@ jobs:
           set -euo pipefail
           version=0.8.5
           asset="tuic-server-$version-x86_64-linux-musl"
-          # PLACEHOLDER: GitHub publishes no `digest` for this release's
-          # assets, so the SHA-256 is not pinned yet. The step fails until the
-          # owner writes the asset's SHA-256 here (tests/interop/README.md,
-          # "tuic-server").
-          sha=FILL-IN-THE-SHA-256-OF-tuic-server-0.8.5-x86_64-linux-musl
+          # GitHub publishes no `digest` for this release's assets: the
+          # SHA-256 is the one the release's own checksum file gives,
+          # `tuic-server-0.8.5-x86_64-linux-musl.sha256sum`
+          # (tests/interop/README.md, "tuic-server").
+          sha=e4b5d5dcc15209f28de1c8a9ea12edba8a71c35442b4c53177309f728406726c
           if ! [[ "$sha" =~ ^[0-9a-f]{64}$ ]]; then
             echo "tuic-server: no SHA-256 is pinned for $asset; see tests/interop/README.md"
             exit 1
@@ -166,7 +166,7 @@ jobs:
           mv "$asset" tuic-server/tuic-server
           chmod +x tuic-server/tuic-server
           echo "RURGE_TEST_TUIC_SERVER=$PWD/tuic-server/tuic-server" >> "$GITHUB_ENV"
-      - name: Install the TrustTunnel endpoint for the HTTP/2 interoperability tests
+      - name: Install the TrustTunnel endpoint for the HTTP/2 and HTTP/3 interoperability tests
         if: runner.os != 'Windows'
         shell: bash
         run: |

@@ -1,6 +1,6 @@
 # rurge HTTP API（阶段 2）
 
-阶段 2 / M1（装配与控制面，见 `docs/superpowers/specs/2026-09-19-phase2-m1-outbound-foundation-design.md` 第 6.6 节）新增四个策略 / 策略组端点；阶段 2 / M3b（测速与自动组）又新增三个测试端点，并让 `POST /v1/policy_groups/select` 对自动组设临时覆盖（见「连通性测试与自动组（M3b）」一节）；阶段 2 / M3c 让这些端点也接纳 `smart` 组，并给请求记录加了两列耗时（见末节「`smart` 组（M3c）」）。鉴权（`X-Key` 头 / `?x-key=` 查询参数、常量时间比较、封禁）、错误体（`{"error":"<message>"}`）与无内容的成功响应（`{}`）沿用阶段 1 的约定，见 `docs/api/phase1.md`；本页只记录本页新增端点自己的形状。
+阶段 2 / M1（装配与控制面，见 `docs/superpowers/specs/2026-09-19-phase2-m1-outbound-foundation-design.md` 第 6.6 节）新增四个策略 / 策略组端点；阶段 2 / M3b（测速与自动组）又新增三个测试端点，并让 `POST /v1/policy_groups/select` 对自动组设临时覆盖（见「连通性测试与自动组（M3b）」一节）；阶段 2 / M3c 让这些端点也接纳 `smart` 组，并给请求记录加了两列耗时（见「`smart` 组（M3c）」一节）；阶段 2 / M7c 起，`encrypted-dns-follow-outbound-mode` 下 DoQ / DoH3 上游的 QUIC 载体也作为内部会话进请求记录（见末节）。鉴权（`X-Key` 头 / `?x-key=` 查询参数、常量时间比较、封禁）、错误体（`{"error":"<message>"}`）与无内容的成功响应（`{}`）沿用阶段 1 的约定，见 `docs/api/phase1.md`；本页只记录本页新增端点自己的形状。
 
 ## 端点
 
@@ -270,3 +270,13 @@ UDP 测试（M5c）：策略有 UDP 测试时——策略的 `test-udp`，否则
 - **`POST /v1/policy_groups/select`**：临时覆盖，同其它自动组；覆盖期间不换成员重试。
 - **`GET /v1/policy_groups/test_results`**：列出 `smart` 组，内容与其它自动组相同（成员 → 最近测速结果）；分数不经 API 给出。
 - **`POST /v1/policy_groups/test`**：测全部成员（拨号触发的常规轮次在测得了的成员超过 12 个时只测其中 12 个），返回测完后健康的成员。
+
+## 跟随出站模式下 DNS 的内部会话（M7c）
+
+`[General] encrypted-dns-follow-outbound-mode = true` 时，解析器到加密 DNS 上游的连接由规则选策略，每条连接是请求记录（`GET /v1/requests/recent`、`GET /v1/requests/active`）里的一条内部会话：`listener` 为 `internal`，`dst` 是上游服务器的地址与端口，`rule` 与 `policy` 是命中的规则与策略链。TCP / DoT / DoH 上游的连接自阶段 1 起如此（`transport` 为 `tcp`，`protocol` 按端口标为 `dot`（853）、`doh`（443）或 `dns`）；自阶段 2 / M7c 起，DoQ / DoH3 上游的 QUIC 载体也是：
+
+- **形状**：`transport` 为 `udp`，`protocol` 按端口标为 `doh3`（443）或 `doq`（其余端口——不在 443 的 DoH3 服务器因此标成 `doq`）；`up` / `down` 是载体发出与收到的数据报字节数，`connectMs` 到载体打开为止，`firstByteMs` 到服务器的第一个回包为止。
+- **存续**：每个载体——上游的一条 QUIC 连接，或到它某个地址的一次连接尝试——一条会话，随载体存续：在用时 `status` 是 `active`；连接关闭（闲置满两端空闲超时中较短的那个——rurge 一侧 30 秒——、服务端关闭、上游重建）时载体随之放手，会话结束，`status` 为 `completed`。
+- **失败**：`status` 为 `failed` 时 `error` 是——载体打不开时代理自己的错误（如 `socks5: authentication failed`）；载体打开之后发不出去或自己断了时载体的原话（如 `masque: the server does not support CONNECT-UDP`，这种服务端到发第一个包才知道）；规则选中不载 UDP 的代理、`udp-policy-not-supported-behaviour` 为 `REJECT`（缺省）时 `policy does not support UDP`。上游这样立刻失败时，同一次查找里每秒再问它一次，所以它是唯一能问的上游时，一次查找留下至多 5 条失败的记录。
+- **说明**：会话本身成功而 `error` 不为空的三种——`policy does not support UDP; sent through DIRECT`（上一条的设置为 `DIRECT`：载体改经 DIRECT 的 UDP 发出，`policy` 仍是规则选中的那条链）、`dns-follow: reject bypassed to keep DNS working`（规则选中 REJECT，或选中的代理链底是 REJECT，改走直连）、`dns-follow: proxy configured by host name bypassed to avoid a resolution loop`（代理以域名配置，改走直连）。后两种改走直连的载体之后报错时会话为 `failed`，`error` 是这句说明后接 `; ` 与操作系统自己的错误文本（随系统的语言）。
+- 与其它内部会话一样，不能经 `POST /v1/requests/kill` 终止（409）。没开这个选项时 QUIC 载体直连，不产生会话。
