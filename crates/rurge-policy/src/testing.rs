@@ -5,7 +5,7 @@ use crate::factory::{BuildError, OutboundFactory};
 use crate::testbook::TestBook;
 use rurge_config::spec::{CommonOpts, PolicySpec, ProtoSpec};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
+use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target};
 use rurge_proto::{Outbound, OutboundError, OutboundRef};
 use rustls::RootCertStore;
 use std::io;
@@ -17,11 +17,13 @@ pub(crate) fn auto_groups() -> Arc<AutoGroups> {
 }
 
 /// Records every target it is asked to reach; hands out one end of an
-/// in-memory pipe, or refuses when `fail` is set.
+/// in-memory pipe, or refuses when `fail` is set. Its UDP carriers are
+/// `carriers`, one for each asked for; with none left it carries no UDP.
 #[derive(Default)]
 pub(crate) struct RecordingConnector {
     pub log: Arc<Mutex<Vec<String>>>,
     pub fail: bool,
+    pub carriers: Mutex<Vec<BoxedPacketSocket>>,
 }
 
 impl RecordingConnector {
@@ -50,6 +52,16 @@ impl Connector for RecordingConnector {
             let (near, _far) = tokio::io::duplex(64);
             Ok(Box::new(near) as BoxedStream)
         })
+    }
+
+    fn open_udp<'a>(
+        &'a self,
+        _opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, io::Result<BoxedPacketSocket>> {
+        let carrier = self.carriers.lock().expect("carriers").pop();
+        Box::pin(std::future::ready(carrier.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "no UDP in the test")
+        })))
     }
 }
 

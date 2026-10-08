@@ -1857,6 +1857,51 @@ async fn a_doq_carrier_routed_to_reject_goes_directly() {
     );
 }
 
+/// A DNS server whose port is not open yet when the carrier's first packet
+/// goes — the carrier a connected socket here, gone directly around a
+/// REJECT. Windows tells such a socket of the datagram nobody took as a
+/// reset of its next receive; QUIC passes over that, sends the packet
+/// again, and once the server is up the handshake completes on the same
+/// carrier: the session that brings the answer is that one, and no
+/// failure. (Other systems refuse the socket's next receive instead, which
+/// rightly ends that carrier; the answer then comes on a second one.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_doq_carrier_that_outlives_a_port_unreachable_is_no_failed_session() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    // a loopback port nothing listens on yet
+    let addr = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile(&format!("quic://{addr}"), "", "PROTOCOL,DOQ,REJECT");
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let asking = engine.clone();
+    let lookup = tokio::spawn(async move { lookup_outcome(&asking).await });
+    // the first packet has gone, to the closed port
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !carrier_sessions(&engine).iter().any(|r| r.up > 0) {
+        assert!(tokio::time::Instant::now() < deadline, "no packet sent");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _doq = FakeDoq::spawn_at(&dns, DoqScript::default(), addr);
+    let res = lookup
+        .await
+        .unwrap()
+        .expect("an answer once the server is up");
+    assert_eq!(res.source, Source::Upstream(format!("quic://{addr}")));
+    // the record of a session that failed holds what it had counted by
+    // then, nothing back: the one the answer came on did not fail
+    let carriers = carrier_sessions(&engine);
+    assert!(
+        carriers
+            .iter()
+            .any(|r| r.down > 0 && r.status != RecordStatus::Failed),
+        "{carriers:?}"
+    );
+}
+
 /// A proxy configured by host name would need the very lookup the carrier
 /// is for: the carrier goes directly instead, noted, and the proxy's name
 /// is never asked for.

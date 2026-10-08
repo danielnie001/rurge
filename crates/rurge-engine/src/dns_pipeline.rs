@@ -196,7 +196,10 @@ pub(crate) fn wrap_internal(stream: BoxedStream, handle: Arc<SessionHandle>) -> 
 /// the carrier fails with — a datagram it could not send, its own end — is
 /// the session's failure, as a flow's whose datagram cannot be sent: it
 /// goes on the record, counts against the `smart` member that carried the
-/// session, and reaches the resolver under the policy's name.
+/// session, and reaches the resolver under the policy's name. A reset is
+/// no such failure: QUIC, which is all these carriers carry, passes over
+/// it and uses the carrier on — Windows tells a connected socket so of a
+/// datagram nobody took — and the session goes on with it.
 struct CountingDatagram {
     inner: BoxedDatagram,
     handle: Arc<SessionHandle>,
@@ -227,6 +230,8 @@ impl Datagram for CountingDatagram {
                 }
                 Poll::Ready(Ok(()))
             }
+            // as it is: what reads it tells a reset by its kind
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => Poll::Ready(Err(e)),
             Err(e) => {
                 let failed = crate::udp::upstream_failed(&self.handle, e.to_string());
                 self.handle.finish(failed);
@@ -269,10 +274,16 @@ pub(crate) fn wrap_internal_udp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observe::{RecordStatus, RequestLog, TrafficStats};
     use rurge_config::HostName;
     use rurge_net::connector::{ConnectOpts, DirectConnector, SystemResolve, Target};
-    use std::sync::Arc;
-    use std::time::Duration;
+    use rurge_policy::smart::{Health, SmartBook};
+    use rurge_proto::{OutboundRef, Reject, RejectKind};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Wake, Waker};
+    use std::time::{Duration, Instant};
 
     #[tokio::test]
     async fn without_an_engine_it_delegates_to_the_fallback() {
@@ -434,5 +445,197 @@ mod tests {
             drop(carrier);
             assert_eq!(handle.outcome(), failed);
         }
+    }
+
+    /// A carrier whose receives fail with these, in turn; then nothing
+    /// comes.
+    struct FailingWith(Mutex<VecDeque<io::Error>>);
+
+    impl Datagram for FailingWith {
+        fn poll_send(&self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_recv(&self, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            match self.0.lock().unwrap().pop_front() {
+                Some(e) => Poll::Ready(Err(e)),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    /// What `carrier` receives next, without waiting for it.
+    fn received(carrier: &BoxedDatagram) -> Poll<io::Result<()>> {
+        let mut storage = [0u8; 64];
+        let mut cx = Context::from_waker(Waker::noop());
+        carrier.poll_recv(&mut cx, &mut ReadBuf::new(&mut storage))
+    }
+
+    /// A reset is no failure of the carrier: QUIC passes over it and uses
+    /// the carrier on — Windows tells a connected socket so of a datagram
+    /// nobody took, a server whose port was not open yet. It goes on as it
+    /// is, the session stays an active one on the record, and the `smart`
+    /// member that carries it is told nothing. What the carrier fails with
+    /// after that ends the session, and counts, as ever.
+    #[tokio::test]
+    async fn a_reset_neither_ends_the_session_nor_counts_against_its_member() {
+        const SERVER: &str = "192.0.2.1";
+        let handle = SessionHandle::new(1, SessionInfo::udp(HostName::parse(SERVER), 853));
+        // the record and the member's report, hung on the session as the
+        // engine hangs them (`Engine::new_handle`, `report_internal`)
+        let (log, traffic) = (Arc::new(RequestLog::new(8)), TrafficStats::new());
+        log.mark_active(&handle);
+        let finished = log.clone();
+        handle.on_finish(move |h, outcome| finished.record_finished(h, outcome, &traffic));
+        let book = Arc::new(SmartBook::new());
+        let member: OutboundRef = Arc::new(Reject::new(RejectKind::Reject));
+        let script = VecDeque::from([
+            io::Error::new(io::ErrorKind::ConnectionReset, "reset by the peer"),
+            io::Error::new(io::ErrorKind::Unsupported, NO_RELAY),
+        ]);
+        let carrier = wrap_internal_udp(
+            Box::new(FailingWith(Mutex::new(script))),
+            handle.clone(),
+            Some("M"),
+        );
+        crate::smart::watch(&handle, book.clone(), "M", &member, SERVER, true);
+
+        let Poll::Ready(Err(reset)) = received(&carrier) else {
+            panic!("the reset goes on");
+        };
+        assert_eq!(handle.outcome(), None);
+        assert!(!handle.upstream_failed());
+        assert!(log.recent(8).is_empty(), "{:?}", log.recent(8));
+        let active = log.active();
+        assert_eq!(active.len(), 1);
+        assert_eq!(
+            (&active[0].status, &active[0].error),
+            (&RecordStatus::Active, &None)
+        );
+        let now = Instant::now();
+        assert_eq!(
+            book.health("M", &member, now),
+            Health::Unknown { failures: 0 }
+        );
+        assert!(book.site(SERVER, now).failed.is_empty());
+        assert_eq!(
+            (reset.kind(), reset.to_string().as_str()),
+            (io::ErrorKind::ConnectionReset, "reset by the peer")
+        );
+
+        let Poll::Ready(Err(failure)) = received(&carrier) else {
+            panic!("the carrier fails");
+        };
+        assert_eq!(
+            (failure.kind(), failure.to_string()),
+            (io::ErrorKind::Unsupported, format!("via M: {NO_RELAY}"))
+        );
+        let failed = SessionOutcome::Failed(NO_RELAY.to_string());
+        assert_eq!(handle.outcome(), Some(failed));
+        let recorded = log.recent(8);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            (&recorded[0].status, recorded[0].error.as_deref()),
+            (&RecordStatus::Failed, Some(NO_RELAY))
+        );
+        let now = Instant::now();
+        assert_eq!(
+            book.health("M", &member, now),
+            Health::Unknown { failures: 1 }
+        );
+        assert_eq!(book.site(SERVER, now).failed, ["M"]);
+    }
+
+    /// A carrier that cannot send until it is opened, and tells whoever
+    /// waits to send when it is. Its copies are the same carrier.
+    #[derive(Clone, Default)]
+    struct Gate {
+        open: Arc<AtomicBool>,
+        sender: Arc<Mutex<Option<Waker>>>,
+    }
+
+    impl Gate {
+        fn open(&self) {
+            self.open.store(true, Ordering::SeqCst);
+            if let Some(sender) = self.sender.lock().unwrap().take() {
+                sender.wake();
+            }
+        }
+    }
+
+    impl Datagram for Gate {
+        fn poll_send(&self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            if self.open.load(Ordering::SeqCst) {
+                Poll::Ready(Ok(buf.len()))
+            } else {
+                Poll::Pending
+            }
+        }
+        fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            *self.sender.lock().unwrap() = Some(cx.waker().clone());
+            if self.open.load(Ordering::SeqCst) {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+        fn poll_recv(&self, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// Raised by the waker made of it.
+    #[derive(Default)]
+    struct Woken(AtomicBool);
+
+    impl Wake for Woken {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Checks that what waits to send on `outer` waits for `gate`, the
+    /// carrier under it: it is pending while the gate is shut, and woken
+    /// when it opens. A layer that says "ready" of its own accord has QUIC
+    /// drop the first packet of a connection on a socket not known to be
+    /// writable yet, and the dial wait for the packet to be sent again.
+    fn waits_to_send_as(outer: &dyn Datagram, gate: &Gate) {
+        let woken = Arc::new(Woken::default());
+        let waker = Waker::from(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            outer.poll_send_ready(&mut cx).is_pending(),
+            "ready over a carrier that cannot send"
+        );
+        assert!(!woken.0.load(Ordering::SeqCst));
+        gate.open();
+        assert!(
+            woken.0.load(Ordering::SeqCst),
+            "not woken when the carrier can send"
+        );
+        assert!(matches!(
+            outer.poll_send_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    fn a_session() -> Arc<SessionHandle> {
+        SessionHandle::new(1, SessionInfo::udp(HostName::parse("192.0.2.1"), 853))
+    }
+
+    #[test]
+    fn a_carrier_that_finishes_its_session_can_send_when_the_one_under_it_can() {
+        let gate = Gate::default();
+        waits_to_send_as(&FinishOnDrop::new(gate.clone(), a_session()), &gate);
+    }
+
+    #[test]
+    fn a_carrier_that_counts_can_send_when_the_one_under_it_can() {
+        let gate = Gate::default();
+        let counting = CountingDatagram {
+            inner: Box::new(gate.clone()),
+            handle: a_session(),
+            via: None,
+        };
+        waits_to_send_as(&counting, &gate);
     }
 }

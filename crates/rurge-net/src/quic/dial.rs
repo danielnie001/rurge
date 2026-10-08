@@ -130,7 +130,8 @@ pub fn client_config(
 /// sends as SNI (none for an IP address). Nothing bounds the handshake
 /// here but the idle timeout: the caller's request timeout does (design
 /// 3.5). A handshake that ends because the path's carrier failed fails
-/// with the carrier's own error.
+/// with the carrier's own error; one that ends for any other reason says
+/// that reason, whatever the carrier reported before.
 pub async fn connect(
     path: Path,
     config: &ClientConfig,
@@ -147,9 +148,10 @@ pub async fn connect(
         .connect_with(config.clone(), path.remote, server_name)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("quic: {e}")))?;
     connecting.await.map_err(|e| {
-        // quinn knows only that the endpoint is gone (`DRIVER_LOST`): the
-        // carrier knows why
-        let failure = carrier.and_then(|carrier| carrier.failure());
+        // quinn knows only that the endpoint is gone: the carrier knows why
+        let failure = carrier
+            .filter(|_| lost_its_endpoint(&e))
+            .and_then(|carrier| carrier.failure());
         failure.unwrap_or_else(|| describe(&e, true))
     })
 }
@@ -167,6 +169,24 @@ const REASON_MAX: usize = 200;
 /// quinn's reason when the endpoint's receive loop is gone: the socket
 /// under it failed (a carrier that closed) and every connection with it.
 const DRIVER_LOST: &str = "endpoint driver future was dropped";
+
+/// Whether `e` is quinn's word for a connection whose endpoint is gone.
+fn driver_lost(e: &ConnectionError) -> bool {
+    matches!(
+        e,
+        ConnectionError::TransportError(error)
+            if error.code == TransportErrorCode::INTERNAL_ERROR && error.reason == DRIVER_LOST
+    )
+}
+
+/// Whether a handshake that ended with `e` lost its endpoint: the socket
+/// under it failed. The connection's driver says so as it goes
+/// (`DRIVER_LOST`), and the connection it leaves is closed from here in
+/// its wake (`LocallyClosed`): a dial reads either, whichever it finds.
+/// Nothing else closes a connection here before its handshake is over.
+fn lost_its_endpoint(e: &ConnectionError) -> bool {
+    driver_lost(e) || matches!(e, ConnectionError::LocallyClosed)
+}
 
 fn describe(e: &ConnectionError, handshake: bool) -> io::Error {
     use io::ErrorKind::{
@@ -205,9 +225,7 @@ fn describe(e: &ConnectionError, handshake: bool) -> io::Error {
                     InvalidData,
                     format!("tls: {}", untrusted(error.reason.as_bytes())),
                 )
-            } else if error.code == TransportErrorCode::INTERNAL_ERROR
-                && error.reason == DRIVER_LOST
-            {
+            } else if driver_lost(e) {
                 (
                     BrokenPipe,
                     "quic: the UDP path to the server failed".to_string(),
@@ -273,8 +291,15 @@ fn untrusted(text: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::Datagram;
+    use crate::quic::carrier::{Carried, STAND_IN};
     use bytes::Bytes;
-    use quinn::{ApplicationClose, ConnectionClose};
+    use quinn::udp::RecvMeta;
+    use quinn::{ApplicationClose, AsyncUdpSocket, ConnectionClose};
+    use std::io::IoSliceMut;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll, Waker};
+    use tokio::io::ReadBuf;
 
     /// quinn's settings as its `Debug` shows them: ours, and the defaults
     /// HTTP/3 and TUIC rely on (100 unidirectional streams from the server,
@@ -492,6 +517,99 @@ mod tests {
             describe(&ConnectionError::TimedOut, true).to_string(),
             "quic: the handshake timed out"
         );
+    }
+
+    /// A handshake whose endpoint is gone ends in either of two ways, and
+    /// in no other.
+    #[test]
+    fn a_handshake_that_lost_its_endpoint_ends_in_either_of_two_ways() {
+        assert!(lost_its_endpoint(&found(
+            TransportErrorCode::INTERNAL_ERROR,
+            DRIVER_LOST
+        )));
+        assert!(lost_its_endpoint(&ConnectionError::LocallyClosed));
+        for other in [
+            ConnectionError::TimedOut,
+            ConnectionError::Reset,
+            found(TransportErrorCode::INTERNAL_ERROR, "another reason"),
+            found(TransportErrorCode::PROTOCOL_VIOLATION, DRIVER_LOST),
+        ] {
+            assert!(!lost_its_endpoint(&other), "{other:?}");
+        }
+    }
+
+    /// A carrier that takes what it is sent and never answers; its first
+    /// receive fails with `failing`.
+    struct Silent {
+        failing: Mutex<Option<io::Error>>,
+    }
+
+    impl Datagram for Silent {
+        fn poll_send(&self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_recv(&self, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            match self.failing.lock().unwrap().take() {
+                Some(e) => Poll::Ready(Err(e)),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    /// A handshake that ends for a reason of its own says that reason,
+    /// whatever its carrier reported before: a reset, which quinn passed
+    /// over, or a failure the endpoint outlived.
+    #[tokio::test]
+    async fn a_handshake_that_times_out_says_so_whatever_the_carrier_reported_before() {
+        let silent = |first: io::Error| {
+            Arc::new(Carried::new(Box::new(Silent {
+                failing: Mutex::new(Some(first)),
+            })))
+        };
+        let reset = silent(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "reset by the peer",
+        ));
+        let failed = silent(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "proxy: the server relays no UDP",
+        ));
+        // this carrier's failure is taken here: quinn's endpoint never
+        // sees it
+        let mut storage = [0u8; 64];
+        let taken = failed.poll_recv(
+            &mut Context::from_waker(Waker::noop()),
+            &mut [IoSliceMut::new(&mut storage)],
+            &mut [RecvMeta::default()],
+        );
+        assert!(matches!(taken, Poll::Ready(Err(_))), "{taken:?}");
+        // a handshake nothing answers ends at the idle timeout, which QUIC
+        // keeps no shorter than three probe timeouts: both wait at once
+        let transport = Transport {
+            idle_timeout: Duration::from_millis(300),
+            ..Transport::STANDARD
+        };
+        let tls = crate::quic::testing::TestCert::new().client_tls(&["h3"]);
+        let config = client_config(tls, &transport).unwrap();
+        let dial = |carried: Arc<Carried>| {
+            let path = Path {
+                socket: carried.clone(),
+                remote: STAND_IN,
+                carrier: Some(carried),
+            };
+            connect(path, &config, "localhost")
+        };
+        let both = async { tokio::join!(dial(reset), dial(failed)) };
+        let (after_reset, after_failure) = tokio::time::timeout(Duration::from_secs(10), both)
+            .await
+            .expect("both outcomes within the bound");
+        for err in [after_reset.unwrap_err(), after_failure.unwrap_err()] {
+            assert_eq!(
+                (err.kind(), err.to_string().as_str()),
+                (io::ErrorKind::TimedOut, "quic: the handshake timed out")
+            );
+        }
     }
 
     /// What the server says is cut short.

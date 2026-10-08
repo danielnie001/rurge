@@ -8,7 +8,8 @@
 //! a new socket's first datagram — the connection's first packet — is not
 //! lost to the reactor not having said yet that the socket can send. A
 //! carrier that fails takes the endpoint with it, and says why itself
-//! (`Carried::failure`).
+//! (`Carried::failure`); one that reports a reset has not failed — quinn
+//! passes over a reset and uses the carrier on.
 
 use crate::connector::BoxedDatagram;
 use quinn::udp::{RecvMeta, Transmit};
@@ -60,23 +61,30 @@ impl AsyncUdpSocket for Carried {
 
     fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
         let mut cx = Context::from_waker(Waker::noop());
-        match self.datagram.poll_send(&mut cx, transmit.contents) {
-            Poll::Ready(Ok(_)) => Ok(()),
-            // as a socket's own: a datagram that cannot go is lost, which
-            // QUIC recovers from, not a failed connection
-            Poll::Ready(Err(e)) => {
-                tracing::trace!(error = %e, "a QUIC datagram through the chain was not sent");
-                Ok(())
+        // twice: a carrier that could not send and can by the time it is
+        // asked — the reactor told it in between — takes the datagram then
+        for _ in 0..2 {
+            match self.datagram.poll_send(&mut cx, transmit.contents) {
+                Poll::Ready(Ok(_)) => return Ok(()),
+                // as a socket's own: a datagram that cannot go is lost, which
+                // QUIC recovers from, not a failed connection
+                Poll::Ready(Err(e)) => {
+                    tracing::trace!(error = %e, "a QUIC datagram through the chain was not sent");
+                    return Ok(());
+                }
+                // not now: quinn keeps the datagram until the poller says the
+                // carrier can send
+                Poll::Pending => {
+                    if self.datagram.poll_send_ready(&mut cx).is_pending() {
+                        return Err(io::ErrorKind::WouldBlock.into());
+                    }
+                }
             }
-            // not now: quinn keeps the datagram until the poller says the
-            // carrier can send. One that cannot say when — ready to all it
-            // knows — would have quinn try for ever: its datagram is
-            // dropped, as a full socket would drop it
-            Poll::Pending => match self.datagram.poll_send_ready(&mut cx) {
-                Poll::Pending => Err(io::ErrorKind::WouldBlock.into()),
-                Poll::Ready(_) => Ok(()),
-            },
         }
+        // ready to all it knows, and still not sending: a carrier that
+        // cannot say when would have quinn try for ever. Its datagram is
+        // dropped, as a full socket would drop it
+        Ok(())
     }
 
     fn poll_recv(
@@ -87,10 +95,13 @@ impl AsyncUdpSocket for Carried {
     ) -> Poll<io::Result<usize>> {
         let mut buf = ReadBuf::new(&mut bufs[0]);
         // a carrier that has closed fails the endpoint, and with it the
-        // connection, at once
+        // connection, at once. Not so a reset: quinn passes over it and
+        // reads on, and the carrier has not failed
         if let Err(e) = ready!(self.datagram.poll_recv(cx, &mut buf)) {
-            let kept = io::Error::new(e.kind(), e.to_string());
-            *self.failed.lock().expect("the carrier's failure") = Some(kept);
+            if e.kind() != io::ErrorKind::ConnectionReset {
+                let kept = io::Error::new(e.kind(), e.to_string());
+                *self.failed.lock().expect("the carrier's failure") = Some(kept);
+            }
             return Poll::Ready(Err(e));
         }
         let len = buf.filled().len();
@@ -133,6 +144,7 @@ impl UdpPoller for Writable {
 mod tests {
     use super::*;
     use crate::connector::Datagram;
+    use std::collections::VecDeque;
     use std::future::poll_fn;
     use std::pin::pin;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -141,13 +153,17 @@ mod tests {
 
     /// A carrier that takes datagrams only once it is let: until then its
     /// sends are pending. With `says_when` it tells whoever waits to send;
-    /// without, it is ready to all it knows.
+    /// without, it is ready to all it knows. With `opens_when_asked` the
+    /// question itself lets it: it could not send a moment ago, and can
+    /// now. Its receives fail with `failing`, in turn.
     #[derive(Default)]
     struct Gate {
         says_when: bool,
+        opens_when_asked: bool,
         open: AtomicBool,
         sent: Mutex<Vec<Vec<u8>>>,
         sender: Mutex<Option<Waker>>,
+        failing: Mutex<VecDeque<io::Error>>,
     }
 
     impl Gate {
@@ -169,6 +185,9 @@ mod tests {
         }
 
         fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.opens_when_asked {
+                self.open.store(true, Ordering::SeqCst);
+            }
             if !self.says_when {
                 return Poll::Ready(Ok(()));
             }
@@ -180,7 +199,10 @@ mod tests {
         }
 
         fn poll_recv(&self, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-            Poll::Pending
+            match self.failing.lock().unwrap().pop_front() {
+                Some(e) => Poll::Ready(Err(e)),
+                None => Poll::Pending,
+            }
         }
     }
 
@@ -238,5 +260,60 @@ mod tests {
         assert!(gate.sent.lock().unwrap().is_empty());
         socket.try_send(&initial()).unwrap();
         assert_eq!(*gate.sent.lock().unwrap(), [b"initial".to_vec()]);
+    }
+
+    /// A carrier that could not send a moment ago and says it can by the
+    /// time it is asked — the reactor told it in between — is tried again:
+    /// the datagram goes out, where it was once dropped.
+    #[test]
+    fn a_carrier_that_can_send_by_the_time_it_is_asked_is_tried_again() {
+        let gate = Arc::new(Gate {
+            opens_when_asked: true,
+            ..Gate::default()
+        });
+        let socket = Carried::new(Box::new(gate.clone()));
+        socket.try_send(&initial()).unwrap();
+        assert_eq!(*gate.sent.lock().unwrap(), [b"initial".to_vec()]);
+    }
+
+    /// What `socket` receives next, without waiting for it.
+    fn received(socket: &Carried) -> Poll<io::Result<usize>> {
+        let mut storage = [0u8; 64];
+        socket.poll_recv(
+            &mut Context::from_waker(Waker::noop()),
+            &mut [IoSliceMut::new(&mut storage)],
+            &mut [RecvMeta::default()],
+        )
+    }
+
+    /// A reset goes on to quinn, which passes over it and reads on: the
+    /// carrier has not failed. Anything else it reports is its failure,
+    /// told once.
+    #[test]
+    fn a_reset_is_not_the_carriers_failure() {
+        let closed = "socks5: the proxy closed the UDP association";
+        let gate = Arc::new(Gate {
+            failing: Mutex::new(VecDeque::from([
+                io::Error::new(io::ErrorKind::ConnectionReset, "reset by the peer"),
+                io::Error::new(io::ErrorKind::BrokenPipe, closed),
+            ])),
+            ..Gate::default()
+        });
+        let socket = Carried::new(Box::new(gate));
+        let Poll::Ready(Err(reset)) = received(&socket) else {
+            panic!("the reset goes on to quinn");
+        };
+        assert_eq!(reset.kind(), io::ErrorKind::ConnectionReset);
+        assert!(socket.failure().is_none(), "a reset kept as a failure");
+        let Poll::Ready(Err(end)) = received(&socket) else {
+            panic!("the carrier's end goes on to quinn");
+        };
+        assert_eq!(end.kind(), io::ErrorKind::BrokenPipe);
+        let failure = socket.failure().expect("the carrier's failure");
+        assert_eq!(
+            (failure.kind(), failure.to_string().as_str()),
+            (io::ErrorKind::BrokenPipe, closed)
+        );
+        assert!(socket.failure().is_none(), "told twice");
     }
 }

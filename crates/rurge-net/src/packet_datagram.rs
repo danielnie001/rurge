@@ -8,6 +8,11 @@
 //! it with — it cannot reach the peer: a proxy that turns out to relay no
 //! UDP, a login it refuses — is told by the next receive, once, in the
 //! carrier's words. A datagram lost alone (`lost_alone`) is told to nobody.
+//!
+//! The carrier's end is the datagram's. Why it ended — a proxy that closed
+//! the association, say — is told in the carrier's words too, once, by the
+//! receive that has read all that arrived before; after that, or behind a
+//! carrier that ended without a word, the datagram has just closed.
 
 use crate::connector::{
     BoxedDatagram, BoxedPacketSocket, Datagram, PacketSocket, Target, lost_alone,
@@ -33,11 +38,21 @@ struct PacketDatagram {
 }
 
 /// What the carrier last failed a send with, until a receive tells it, and
-/// the receive that waits: a send that fails wakes it.
+/// the receive that waits: a send that fails wakes it. And what the carrier
+/// ended with, when it said why, until the receive that finds nothing more
+/// queued tells it.
 #[derive(Default)]
 struct Failed {
     error: Option<io::Error>,
     receiver: Option<Waker>,
+    ended: Option<io::Error>,
+}
+
+/// Whether `e` tells why the carrier ended: in words of the carrier's own,
+/// or the system's. An error that is its kind and no more — how a carrier
+/// ends that has nothing to tell — does not.
+fn says_why(e: &io::Error) -> bool {
+    e.get_ref().is_some() || e.raw_os_error().is_some()
 }
 
 /// `socket` as a datagram to `to`, which it has resolved (`PacketSocket::resolve`).
@@ -69,14 +84,25 @@ pub fn packet_datagram(socket: BoxedPacketSocket, to: Target) -> BoxedDatagram {
         HostName::Ip(_) => Some(to.clone()),
         HostName::Domain(_) => None,
     };
+    let ending = failed.clone();
     let receive = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
-        // the carrier's end is the datagram's: `arrived` drops with it
-        while let Ok((n, from)) = socket.recv_from(&mut buf).await {
-            if from_peer.as_ref().is_none_or(|peer| *peer == from) {
-                let _ = arrived.try_send(buf[..n].to_vec());
+        let ended = loop {
+            match socket.recv_from(&mut buf).await {
+                Ok((n, from)) => {
+                    if from_peer.as_ref().is_none_or(|peer| *peer == from) {
+                        let _ = arrived.try_send(buf[..n].to_vec());
+                    }
+                }
+                Err(e) => break e,
             }
+        };
+        if says_why(&ended) {
+            ending.lock().expect("the failed send").ended = Some(ended);
         }
+        // the carrier's end is the datagram's. Closed only now: the receive
+        // that finds the queue closed looks for why it is
+        drop(arrived);
     });
     Box::new(PacketDatagram {
         to,
@@ -119,10 +145,17 @@ impl Datagram for PacketDatagram {
                 buf.put_slice(&datagram[..n]);
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "the carrier through the chain has closed",
-            ))),
+            // the carrier has ended and what had arrived is read: why, in
+            // its own words, once
+            Poll::Ready(None) => {
+                let ended = self.failed.lock().expect("the failed send").ended.take();
+                Poll::Ready(Err(ended.unwrap_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "the carrier through the chain has closed",
+                    )
+                })))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -161,6 +194,9 @@ mod tests {
         sent: Log,
         /// What its next sends fail with, in turn.
         failing: Mutex<VecDeque<io::Error>>,
+        /// What it ends with once the script is over; without, it ends
+        /// with nothing to say.
+        ending: Mutex<Option<io::Error>>,
     }
 
     impl PacketSocket for Scripted {
@@ -182,7 +218,10 @@ mod tests {
                         buf[..data.len()].copy_from_slice(&data);
                         Ok((data.len(), from))
                     }
-                    None => Err(io::ErrorKind::BrokenPipe.into()),
+                    None => Err(match self.ending.lock().unwrap().take() {
+                        Some(ending) => ending,
+                        None => io::ErrorKind::BrokenPipe.into(),
+                    }),
                 }
             })
         }
@@ -191,17 +230,26 @@ mod tests {
     type Script = (mpsc::Sender<(Target, Vec<u8>)>, Log);
 
     fn scripted() -> (BoxedPacketSocket, Script) {
-        scripted_failing(Vec::new())
+        scripted_with(Vec::new(), None)
     }
 
     /// `scripted`, its first sends failing with `failures` in turn.
     fn scripted_failing(failures: Vec<io::Error>) -> (BoxedPacketSocket, Script) {
+        scripted_with(failures, None)
+    }
+
+    /// `scripted_failing`, the carrier ending with `ending`.
+    fn scripted_with(
+        failures: Vec<io::Error>,
+        ending: Option<io::Error>,
+    ) -> (BoxedPacketSocket, Script) {
         let (tx, rx) = mpsc::channel(16);
         let sent = Arc::new(Mutex::new(Vec::new()));
         let socket = Scripted {
             arriving: tokio::sync::Mutex::new(rx),
             sent: sent.clone(),
             failing: Mutex::new(failures.into()),
+            ending: Mutex::new(ending),
         };
         (Box::new(socket), (tx, sent))
     }
@@ -261,6 +309,44 @@ mod tests {
             recv(&datagram).await.unwrap_err().to_string(),
             "the carrier through the chain has closed"
         );
+    }
+
+    /// A carrier that says why it ended is heard in its own words, with
+    /// their kind — after what had arrived before its end, and once: from
+    /// then on the datagram has just closed, as it has at once behind a
+    /// carrier that ended without a word
+    /// (`a_peer_by_name_hears_everything_until_the_carrier_ends`).
+    #[tokio::test]
+    async fn the_carriers_end_is_told_in_its_own_words_once() {
+        let endings = [
+            (
+                io::ErrorKind::BrokenPipe,
+                "socks5: the proxy closed the UDP association",
+            ),
+            (
+                io::ErrorKind::UnexpectedEof,
+                "trojan: the server closed the UDP connection",
+            ),
+        ];
+        for (kind, words) in endings {
+            let ending = io::Error::new(kind, words);
+            let (socket, (arrive, _sent)) = scripted_with(Vec::new(), Some(ending));
+            let peer = at("192.0.2.7", 853);
+            let datagram = packet_datagram(socket, peer.clone());
+            arrive.send((peer, b"last".to_vec())).await.unwrap();
+            drop(arrive);
+            assert_eq!(recv(&datagram).await.unwrap(), b"last");
+            let told = recv(&datagram).await.unwrap_err();
+            assert_eq!((told.kind(), told.to_string().as_str()), (kind, words));
+            let after = recv(&datagram).await.unwrap_err();
+            assert_eq!(
+                (after.kind(), after.to_string().as_str()),
+                (
+                    io::ErrorKind::BrokenPipe,
+                    "the carrier through the chain has closed"
+                )
+            );
+        }
     }
 
     fn no_relay() -> io::Error {
