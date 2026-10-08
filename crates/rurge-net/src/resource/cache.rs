@@ -6,13 +6,34 @@ use sha2::{Digest, Sha256};
 use std::io;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Meta {
     pub url: String,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     /// Unix seconds of the last successful fetch or 304.
     pub fetched_at: u64,
+}
+
+/// The URL by where it goes: its path and query often carry a token.
+impl std::fmt::Debug for Meta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Meta {
+            url,
+            etag,
+            last_modified,
+            fetched_at,
+        } = self;
+        let shown = url::Url::parse(url)
+            .map(|url| super::origin(&url))
+            .unwrap_or_else(|_| "…".to_string());
+        f.debug_struct("Meta")
+            .field("url", &shown)
+            .field("etag", etag)
+            .field("last_modified", last_modified)
+            .field("fetched_at", fetched_at)
+            .finish()
+    }
 }
 
 pub struct CacheDir {

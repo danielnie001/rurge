@@ -20,10 +20,29 @@ use url::Url;
 
 pub const DEFAULT_UPDATE_INTERVAL: i64 = 86_400;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum ResourceSource {
     Url(Url),
     File(PathBuf),
+}
+
+/// A URL as a `Debug` shows it: where it goes, without its path and query,
+/// which often carry a token.
+pub(crate) fn origin(url: &Url) -> String {
+    format!(
+        "{}://{}/…",
+        url.scheme(),
+        &url[url::Position::BeforeHost..url::Position::AfterPort]
+    )
+}
+
+impl fmt::Debug for ResourceSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResourceSource::Url(url) => f.debug_tuple("Url").field(&origin(url)).finish(),
+            ResourceSource::File(path) => f.debug_tuple("File").field(path).finish(),
+        }
+    }
 }
 
 impl ResourceSource {
@@ -73,7 +92,7 @@ impl Default for ResourceOptions {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum ResourceState {
     Missing,
     Available {
@@ -87,6 +106,43 @@ pub enum ResourceState {
         since: SystemTime,
         cached: Option<(Arc<Bytes>, u64)>,
     },
+}
+
+/// The body by its length: a subscription's holds its nodes' credentials.
+impl fmt::Debug for ResourceState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let sized = |data: &Bytes| format!("{} bytes", data.len());
+        match self {
+            ResourceState::Missing => f.write_str("Missing"),
+            ResourceState::Available {
+                data,
+                version,
+                fetched_at,
+                stale,
+            } => f
+                .debug_struct("Available")
+                .field("data", &sized(data))
+                .field("version", version)
+                .field("fetched_at", fetched_at)
+                .field("stale", stale)
+                .finish(),
+            ResourceState::Failed {
+                last_error,
+                since,
+                cached,
+            } => f
+                .debug_struct("Failed")
+                .field("last_error", last_error)
+                .field("since", since)
+                .field(
+                    "cached",
+                    &cached
+                        .as_ref()
+                        .map(|(data, version)| (sized(data), version)),
+                )
+                .finish(),
+        }
+    }
 }
 
 impl ResourceState {
@@ -677,6 +733,45 @@ async fn file_task(
 mod tests {
     use super::*;
     use crate::connector::{DirectConnector, SystemResolve};
+
+    /// A resource's URL often carries a token, and its body the credentials
+    /// of a subscription's nodes: a `Debug` shows where the URL goes and how
+    /// long the body is, no more.
+    #[test]
+    fn the_debug_of_a_resource_shows_neither_its_url_nor_its_body() {
+        let url: Url = "https://sub.example:8443/list?token=S3CR3T-token"
+            .parse()
+            .unwrap();
+        let body = Arc::new(Bytes::from_static(b"A = trojan, password=S3CR3T-body"));
+        let shown = format!(
+            "{:?} {:?} {:?} {:?} {:?}",
+            ResourceSpec {
+                source: ResourceSource::Url(url.clone()),
+                update_interval: None,
+            },
+            ResourceState::Available {
+                data: body.clone(),
+                version: 1,
+                fetched_at: UNIX_EPOCH,
+                stale: false,
+            },
+            ResourceState::Failed {
+                last_error: "timed out".to_string(),
+                since: UNIX_EPOCH,
+                cached: Some((body, 1)),
+            },
+            Meta {
+                url: url.to_string(),
+                ..Meta::default()
+            },
+            ResourceSource::File(PathBuf::from("sets/a.list")),
+        );
+        assert!(!shown.contains("S3CR3T"), "{shown}");
+        assert!(!shown.contains("token"), "{shown}");
+        for told in ["https://sub.example:8443/", "32 bytes", "a.list"] {
+            assert!(shown.contains(told), "{told}: {shown}");
+        }
+    }
     use crate::http::{HttpClient, HttpClientConfig};
     use crate::testing::TestServer;
 
