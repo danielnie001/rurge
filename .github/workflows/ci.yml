@@ -285,7 +285,22 @@ jobs:
             sudo apt-get install -y -q --no-install-recommends openssh-server
           fi
           echo "RURGE_TEST_SSHD=/usr/sbin/sshd" >> "$GITHUB_ENV"
-      - run: cargo test --workspace
+      # Every test binary runs, whatever fails before it: the interoperability
+      # tests are the last ones, and one run should say everything it can.
+      - name: Run the tests
+        shell: bash
+        timeout-minutes: 60
+        run: |
+          set -o pipefail
+          cargo test --workspace --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/test.log"
+      # The log is readable only when signed in; annotations and the job
+      # summary are public.
+      - name: Report the failed tests
+        if: failure()
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then python=python; else python=python3; fi
+          "$python" .github/scripts/report-test-failures.py "$RUNNER_TEMP/test.log"
   bench:
     runs-on: ubuntu-latest
     steps:
