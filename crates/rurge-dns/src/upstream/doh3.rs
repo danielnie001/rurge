@@ -15,11 +15,11 @@
 //!   after a GOAWAY or without, on a connection that was up when its query
 //!   came, goes again on a new one.
 
-use super::doh::{DNS_MESSAGE, MAX_RESPONSE, age, check_body, check_head};
+use super::doh::{DNS_MESSAGE, MAX_RESPONSE, answer, check_head};
 use super::session::{self, Conn, Dialer, Failure, Progress, Protocol, Session, transport_error};
 use super::{Upstream, UpstreamError};
 use crate::bootstrap::Bootstrap;
-use crate::message::{lower_ttls, wire_id};
+use crate::message::wire_id;
 use http::Request;
 use http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE};
 use quinn::{Connection, VarInt};
@@ -164,9 +164,7 @@ async fn exchange(
         .read_to_end(&mut reply)
         .await
         .map_err(failed)?;
-    check_body(&reply).map_err(Failure::Failed)?;
-    lower_ttls(&mut reply, age(response.headers()));
-    Ok(reply)
+    answer(response.headers(), reply).map_err(Failure::Failed)
 }
 
 /// How a query on `conn` failed: `Lost` when the connection ended or is
@@ -546,9 +544,9 @@ mod tests {
                     ..Doh3Script::default()
                 },
             );
-            let answer = ask(&upstream(&fake, ""), 1, "a.test").await.unwrap();
+            let handed_on = ask(&upstream(&fake, ""), 1, "a.test").await.unwrap();
             assert_eq!(
-                answer.v4,
+                handed_on.v4,
                 [(addresses[0], ttls[0]), (addresses[1], ttls[1])],
                 "{age:?}"
             );

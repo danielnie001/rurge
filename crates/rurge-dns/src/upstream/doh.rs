@@ -47,23 +47,52 @@ pub(super) fn check_head(status: StatusCode, headers: &HeaderMap) -> Result<(), 
     Ok(())
 }
 
-/// How long ago the answer was made, in seconds, by its `Age` (RFC 9111
-/// 5.1), which the TTLs of its records do not count (RFC 8484 5.1). 0 — the
-/// answer is taken as it is — without the field, with one that is no
-/// number, or with more than one.
-pub(super) fn age(headers: &HeaderMap) -> u32 {
-    let mut fields = headers.get_all(AGE).iter();
-    let (Some(field), None) = (fields.next(), fields.next()) else {
-        return 0;
-    };
-    match field.to_str() {
-        // digits alone: `u32::from_str` would take a sign too
-        Ok(digits) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
+/// What is handed on of an answer whose head passed `check_head` — over
+/// HTTP/2 or HTTP/3 —: its `body`, which is a DNS message (`check_body`),
+/// the TTLs of its records lowered by the age its `headers` say (`age`).
+pub(super) fn answer(headers: &HeaderMap, mut body: Vec<u8>) -> Result<Vec<u8>, UpstreamError> {
+    check_body(&body)?;
+    lower_ttls(&mut body, age(headers));
+    Ok(body)
+}
+
+/// How long ago the answer was made, in seconds, by its `Age`, which the
+/// TTLs of its records do not count (RFC 8484 5.1): the first member of the
+/// field read as the list it may come as (RFC 9111 5.1) — its lines in the
+/// order they came, each split at its commas, the spaces and tabs around a
+/// member and the empty members left out (RFC 9110 5.6.1) —, whatever
+/// follows it. 0 — the answer is taken as it is — without the field, or
+/// with a first member that is no number.
+fn age(headers: &HeaderMap) -> u32 {
+    let first = headers
+        .get_all(AGE)
+        .iter()
+        .flat_map(|line| line.as_bytes().split(|&b| b == b','))
+        .map(without_whitespace_around)
+        .find(|member| !member.is_empty());
+    match first {
+        Some(digits) if digits.iter().all(u8::is_ascii_digit) => digits
+            .iter()
+            .map(|digit| u32::from(digit - b'0'))
+            .try_fold(0u32, |seconds, digit| {
+                seconds.checked_mul(10)?.checked_add(digit)
+            })
             // more seconds than a TTL counts: older than any record lasts
-            digits.parse().unwrap_or(u32::MAX)
-        }
+            .unwrap_or(u32::MAX),
         _ => 0,
     }
+}
+
+/// `bytes` without the optional whitespace of a field value around them:
+/// spaces and tabs (RFC 9110 5.6.3).
+fn without_whitespace_around(mut bytes: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = bytes {
+        bytes = rest;
+    }
+    while let [rest @ .., b' ' | b'\t'] = bytes {
+        bytes = rest;
+    }
+    bytes
 }
 
 /// A body of more than `MAX_RESPONSE` bytes.
@@ -73,7 +102,7 @@ pub(super) fn too_large() -> UpstreamError {
 
 /// The body of an answer is a DNS message: it has a header, and is at most
 /// `MAX_RESPONSE` bytes.
-pub(super) fn check_body(body: &[u8]) -> Result<(), UpstreamError> {
+fn check_body(body: &[u8]) -> Result<(), UpstreamError> {
     if body.len() > MAX_RESPONSE {
         return Err(too_large());
     }
@@ -159,15 +188,14 @@ impl Upstream for DohUpstream {
                 .body(Full::new(Bytes::from(body)))
                 .map_err(|e| UpstreamError::Http(e.to_string()))?;
             let timeout = deadline.saturating_duration_since(Instant::now());
-            let resp = self.http.send(req, timeout).await.map_err(|e| match e {
+            let mut resp = self.http.send(req, timeout).await.map_err(|e| match e {
                 HttpError::Timeout => UpstreamError::Timeout,
                 other => UpstreamError::Http(other.to_string()),
             })?;
             check_head(resp.status(), resp.headers())?;
-            let age = age(resp.headers());
             let collected = match tokio::time::timeout_at(
                 deadline,
-                Limited::new(resp.into_body(), MAX_RESPONSE).collect(),
+                Limited::new(resp.body_mut(), MAX_RESPONSE).collect(),
             )
             .await
             {
@@ -181,9 +209,7 @@ impl Upstream for DohUpstream {
                 }
                 Err(_) => return Err(UpstreamError::Timeout),
             };
-            let mut bytes = collected.to_bytes().to_vec();
-            check_body(&bytes)?;
-            lower_ttls(&mut bytes, age);
+            let mut bytes = answer(resp.headers(), collected.to_bytes().to_vec())?;
             bytes[0] = id[0];
             bytes[1] = id[1];
             Ok(bytes)
@@ -237,7 +263,7 @@ mod tests {
     /// An answer to `question` with an A record of each of `ttls`, and at
     /// its end an OPT record (RFC 6891 6.1.2) whose TTL field — no TTL: it
     /// holds the DO flag — an ageing that took it for one would change.
-    fn answer(id: u16, ttls: [u32; 2]) -> Vec<u8> {
+    fn canned(id: u16, ttls: [u32; 2]) -> Vec<u8> {
         let records = [
             ("10.0.0.1".parse().unwrap(), ttls[0]),
             ("10.0.0.2".parse().unwrap(), ttls[1]),
@@ -469,6 +495,29 @@ mod tests {
         assert_eq!(check_body(&vec![0; MAX_RESPONSE + 1]), too_large);
     }
 
+    /// What is handed on of an answer is its body as old as its head says
+    /// — or the error of a body that is no DNS message —, in the one step
+    /// both transports take with it.
+    #[test]
+    fn an_answer_is_handed_on_checked_and_as_old_as_its_head_says() {
+        let mut aged = HeaderMap::new();
+        aged.insert(AGE, HeaderValue::from_static("30"));
+        let fresh = HeaderMap::new();
+        assert_eq!(answer(&aged, canned(7, [100, 20])), Ok(canned(7, [70, 0])));
+        assert_eq!(
+            answer(&fresh, canned(7, [100, 20])),
+            Ok(canned(7, [100, 20]))
+        );
+        for headers in [&aged, &fresh] {
+            assert_eq!(
+                answer(headers, vec![0; 11]),
+                Err(UpstreamError::BadResponse(
+                    "response shorter than a DNS header".to_string()
+                ))
+            );
+        }
+    }
+
     #[tokio::test]
     async fn oversized_body_is_bad_response() {
         let server = TestServer::spawn().await;
@@ -483,41 +532,60 @@ mod tests {
 
     /// A server written without a path is asked at `/dns-query`, under the
     /// name it was written with; written with the path `/`, it is asked
-    /// there.
+    /// there. Written without a path and with a user name and a password,
+    /// it is asked at `/dns-query` with them as its `Authorization`, under
+    /// the name that leaves them out.
     #[tokio::test]
     async fn a_url_written_without_a_path_posts_to_dns_query() {
         let server = TestServer::spawn_tls().await;
         for (path, address) in [("/dns-query", "10.0.0.1"), ("/", "10.0.0.2")] {
             let records = [(address.parse().unwrap(), 60)];
-            let answer = build_response(0, &question(), Rcode::NoError, &records, false);
-            server.set(path, answer.unwrap());
+            let message = build_response(0, &question(), Rcode::NoError, &records, false);
+            server.set(path, message.unwrap());
             server.set_header(path, "content-type", "application/dns-message");
         }
-        let bare = format!("https://127.0.0.1:{}", server.url("/").port().unwrap());
-        for (written, address) in [(bare.clone(), "10.0.0.1"), (format!("{bare}/"), "10.0.0.2")] {
+        let authority = format!("127.0.0.1:{}", server.url("/").port().unwrap());
+        let bare = format!("https://{authority}");
+        for (written, name, address) in [
+            (bare.clone(), bare.clone(), "10.0.0.1"),
+            (format!("{bare}/"), format!("{bare}/"), "10.0.0.2"),
+            (
+                format!("https://al1ce:s3cret@{authority}"),
+                bare.clone(),
+                "10.0.0.1",
+            ),
+        ] {
             let up = match UpstreamSpec::parse(&written).unwrap() {
                 UpstreamSpec::Https { url, pathless } => {
                     DohUpstream::new(url, pathless, client(true))
                 }
                 other => panic!("{other:?}"),
             };
-            assert_eq!(up.name(), written);
+            assert_eq!(up.name(), name, "{written}");
             let wire = build_query(0x1234, &question()).unwrap();
             let reply = up.query(&wire, deadline(3000)).await.unwrap();
-            let answer = parse_response(&reply).unwrap();
-            assert_eq!(answer.id, 0x1234);
-            assert_eq!(answer.v4, [(address.parse().unwrap(), 60)], "{written}");
+            let parsed = parse_response(&reply).unwrap();
+            assert_eq!(parsed.id, 0x1234);
+            assert_eq!(parsed.v4, [(address.parse().unwrap(), 60)], "{written}");
         }
-        let asked: Vec<_> = server
-            .requests()
-            .into_iter()
-            .map(|request| (request.method, request.path))
+        let requests = server.requests();
+        let asked: Vec<_> = requests
+            .iter()
+            .map(|r| {
+                (
+                    r.method.as_str(),
+                    r.path.as_str(),
+                    r.header("authorization"),
+                )
+            })
             .collect();
         assert_eq!(
             asked,
             [
-                ("POST".to_string(), "/dns-query".to_string()),
-                ("POST".to_string(), "/".to_string())
+                ("POST", "/dns-query", None),
+                ("POST", "/", None),
+                // base64("al1ce:s3cret")
+                ("POST", "/dns-query", Some("Basic YWwxY2U6czNjcmV0")),
             ]
         );
     }
@@ -525,9 +593,10 @@ mod tests {
     /// The age an answer comes with is off the TTL of each of its records
     /// (RFC 8484 5.1), no further than 0, and off nothing else: the OPT
     /// record's TTL field, which is none, and the rest of the message come
-    /// as the server sent them. Without an `Age`, with one that is no
-    /// number, or with two, the answer comes as it is. Over HTTP/1.1 and
-    /// over HTTP/2.
+    /// as the server sent them. Of two `Age` fields, or of a list in one,
+    /// the first counts (RFC 9111 5.1); without an `Age`, or with one that
+    /// is no number, the answer comes as it is. Over HTTP/1.1 and over
+    /// HTTP/2.
     #[tokio::test]
     async fn the_age_of_an_answer_comes_off_its_ttls() {
         for tls in [false, true] {
@@ -542,9 +611,10 @@ mod tests {
                 ("/fresh", &["0"][..], [100, 20]),
                 ("/no-age", &[][..], [100, 20]),
                 ("/no-number", &["abc"][..], [100, 20]),
-                ("/two-ages", &["30", "30"][..], [100, 20]),
+                ("/two-ages", &["30", "90"][..], [70, 0]),
+                ("/listed", &["30, 90"][..], [70, 0]),
             ] {
-                server.set(path, answer(0, [100, 20]));
+                server.set(path, canned(0, [100, 20]));
                 server.set_header(path, "content-type", "application/dns-message");
                 for age in ages {
                     server.set_header(path, "age", age);
@@ -559,40 +629,59 @@ mod tests {
                     .map(|&(_, ttl)| ttl)
                     .collect();
                 assert_eq!(handed_on, ttls, "tls: {tls}, {path}");
-                assert_eq!(reply, answer(0x1234, ttls), "tls: {tls}, {path}");
+                assert_eq!(reply, canned(0x1234, ttls), "tls: {tls}, {path}");
             }
         }
     }
 
-    /// An answer's age is the number its one `Age` field says, in seconds;
-    /// more than a TTL counts is as many as it counts. Without the field,
-    /// with one that is no number, or with more than one, the answer has
-    /// no age.
+    /// An answer's age is the number the first member of its `Age` says, in
+    /// seconds, whatever follows it: the field is a list — its lines in the
+    /// order they came, each split at its commas, spaces and tabs around a
+    /// member and empty members aside (RFC 9111 5.1, RFC 9110 5.6.1). More
+    /// than a TTL counts is as many as it counts. Without the field, or
+    /// with a first member that is no number, the answer has no age.
     #[test]
-    fn the_age_of_an_answer_is_what_its_one_age_field_says() {
-        for (ages, seconds) in [
+    fn the_age_of_an_answer_is_what_the_first_member_of_its_age_says() {
+        for (lines, seconds) in [
             (&["30"][..], 30),
             (&["0"][..], 0),
             (&["007"][..], 7),
             (&["4294967295"][..], u32::MAX),
             (&["4294967296"][..], u32::MAX),
             (&["99999999999999999999999999"][..], u32::MAX),
+            // the first of a list, on one line or on several
+            (&["30, 40"][..], 30),
+            (&["30 , 40"][..], 30),
+            (&["30,abc"][..], 30),
+            (&["30", "30"][..], 30),
+            (&["30", "abc"][..], 30),
+            // spaces and tabs around it, empty members before it
+            (&[" \t30\t "][..], 30),
+            (&[", 30"][..], 30),
+            (&[" , ,30"][..], 30),
+            (&["", "30"][..], 30),
+            // no field, no member, or a first member that is no number
             (&[][..], 0),
             (&[""][..], 0),
+            (&[" , "][..], 0),
             (&["abc"][..], 0),
+            (&["abc", "30"][..], 0),
+            (&["abc, 30"][..], 0),
             (&["-30"][..], 0),
             (&["+30"][..], 0),
             (&["30.5"][..], 0),
             (&["30s"][..], 0),
-            (&["30, 40"][..], 0),
-            (&["30", "30"][..], 0),
-            (&["30", "abc"][..], 0),
+            (&["3 0"][..], 0),
         ] {
             let mut headers = HeaderMap::new();
-            for value in ages {
-                headers.append(AGE, value.parse().unwrap());
+            for line in lines {
+                headers.append(AGE, line.parse().unwrap());
             }
-            assert_eq!(age(&headers), seconds, "{ages:?}");
+            assert_eq!(age(&headers), seconds, "{lines:?}");
         }
+        // what follows the first member is not read, were it no text
+        let mut headers = HeaderMap::new();
+        headers.append(AGE, HeaderValue::from_bytes(b"30, \xff").unwrap());
+        assert_eq!(age(&headers), 30);
     }
 }

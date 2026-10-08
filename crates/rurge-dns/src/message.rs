@@ -643,8 +643,10 @@ mod tests {
 
     /// The walk is over the wire, whatever the records hold: a record of a
     /// type nobody knows is passed over by its length, and the OPT record
-    /// keeps its field wherever it stands. What follows the last record is
-    /// none of the walk's business.
+    /// keeps its field wherever it stands — among the answers and in the
+    /// authority section, where it has no business, too. What follows the
+    /// last record is none of the walk's business, and a message need not
+    /// have a question.
     #[test]
     fn ttls_are_lowered_whatever_the_records_hold() {
         let mut wire = handwritten([300, 45, 60, 86_400]);
@@ -657,6 +659,45 @@ mod tests {
             trailed,
             [handwritten([240, 0, 0, 86_340]), vec![0xff; 3]].concat()
         );
+        let misplaced = |ttls: [u32; 3]| {
+            [
+                // one question, two answers, two authority, one additional
+                vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 2, 0, 2, 0, 1],
+                vec![1, b'a', 4, b't', b'e', b's', b't', 0, 0, 1, 0, 1],
+                record(&[0xc0, 12], 1, ttls[0], &[10, 0, 0, 1]),
+                // OPT, the last of the answers and the first of the
+                // authority section: the DO flag, an extended RCODE
+                record(&[0], 41, 0x0000_8000, &[]),
+                record(&[0], 41, 0x0100_0000, &[0, 10, 0, 2, 7, 7]),
+                record(&[0xc0, 14], 2, ttls[1], &[2, b'n', b's', 0xc0, 14]),
+                record(&[0xc0, 12], 1, ttls[2], &[10, 0, 0, 2]),
+            ]
+            .concat()
+        };
+        let mut wire = misplaced([300, 45, 60]);
+        lower_ttls(&mut wire, 60);
+        assert_eq!(wire, misplaced([240, 0, 0]));
+        let unasked = |ttls: [u32; 2]| {
+            [
+                // no question, one answer, one additional
+                vec![0x12, 0x34, 0x81, 0x80, 0, 0, 0, 1, 0, 0, 0, 1],
+                // `a.test` at offset 12
+                record(
+                    &[1, b'a', 4, b't', b'e', b's', b't', 0],
+                    1,
+                    ttls[0],
+                    &[10, 0, 0, 1],
+                ),
+                record(&[0xc0, 12], 28, ttls[1], &[0; 16]),
+            ]
+            .concat()
+        };
+        let mut wire = unasked([300, 45]);
+        lower_ttls(&mut wire, 60);
+        assert_eq!(wire, unasked([240, 0]));
+        let read = Message::from_vec(&wire).unwrap();
+        assert!(read.queries.is_empty());
+        assert_eq!((read.answers[0].ttl, read.additionals[0].ttl), (240, 0));
     }
 
     /// A message that does not read to its last record keeps every TTL it
@@ -686,6 +727,9 @@ mod tests {
         };
         // ARCOUNT
         unchanged(damage(11, 4), "a record more announced than there is");
+        // QDCOUNT: the first record is taken for a question, and what
+        // follows it for records that run off the end
+        unchanged(damage(5, 2), "a question more announced than there is");
         // of the question's name, of the last record's
         for at in [12, 91] {
             for label in [0x40, 0x80] {
