@@ -24,8 +24,8 @@
 //! reaches that socket goes back with its source — full cone, as the
 //! reference servers do. Packets it cannot use are dropped and counted.
 
-use super::AbortOnDrop;
 use super::obfs::{ObfsHello, accept_obfs};
+use super::{AbortOnDrop, connect_upstream, is_localhost};
 use crate::shadowsocks::cipher::{AeadCipher, AeadKind, TAG, aes_decrypt_block, aes_encrypt_block};
 use crate::shadowsocks::kdf;
 use crate::shadowsocks::stream::Keystream;
@@ -39,25 +39,13 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 /// The largest payload a client chunk may carry (AEAD, SS 2022).
 const MAX_CHUNK: usize = 0x3FFF;
 const MAX_CHUNK_2022: usize = 0xFFFF;
-
-/// How long a stream cipher's request may take to reach its upstream: one
-/// that neither answers nor refuses in that time is refused.
-const CONNECT_LIMIT: Duration = Duration::from_secs(2);
-
-/// 127.0.0.1 or ::1, and no other address of the loopback's. What a stream
-/// cipher decrypts under a wrong password is any address at all; macOS
-/// configures these two alone, and a connection to another address of 127/8
-/// is not refused there but left waiting.
-fn is_localhost(ip: IpAddr) -> bool {
-    ip == IpAddr::V4(Ipv4Addr::LOCALHOST) || ip == IpAddr::V6(Ipv6Addr::LOCALHOST)
-}
 
 #[derive(Clone, Debug)]
 pub struct ShadowsocksScript {
@@ -383,10 +371,7 @@ async fn serve_stream(mut stream: BoxedStream, iv_len: usize, shared: &Shared) -
     request.salt = iv;
     shared.record(&request);
     let upstream = match shared.upstream(&request) {
-        Some(to) => tokio::time::timeout(CONNECT_LIMIT, TcpStream::connect(to))
-            .await
-            .ok()
-            .and_then(Result::ok),
+        Some(to) => connect_upstream(to).await,
         None => None,
     };
     let Some(mut upstream) = upstream else {

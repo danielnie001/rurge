@@ -30,11 +30,33 @@ pub use trojan::{FakeTrojan, RecordedTrojan, TrojanScript};
 pub use vmess::{FakeVmess, RecordedVmess, VmessScript};
 pub use ws::{FakeWs, RecordedWs, WsScript};
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 pub(crate) use crate::task::AbortOnDrop;
+
+/// How long a request may take to reach its upstream (`connect_upstream`).
+const CONNECT_LIMIT: Duration = Duration::from_secs(2);
+
+/// 127.0.0.1 or ::1, and no other address of the loopback's: where a fake
+/// that takes its upstream from the request connects and sends, and nowhere
+/// else. What a stream cipher decrypts under a wrong password is any address
+/// at all; macOS configures these two alone, and a connection to another
+/// address of 127/8 is not refused there but left waiting.
+fn is_localhost(ip: IpAddr) -> bool {
+    ip == IpAddr::V4(Ipv4Addr::LOCALHOST) || ip == IpAddr::V6(Ipv6Addr::LOCALHOST)
+}
+
+/// A request's upstream; `None` for one that refuses, or neither answers
+/// nor refuses within `CONNECT_LIMIT`.
+async fn connect_upstream(to: SocketAddr) -> Option<TcpStream> {
+    tokio::time::timeout(CONNECT_LIMIT, TcpStream::connect(to))
+        .await
+        .ok()
+        .and_then(Result::ok)
+}
 
 /// Echoes every byte back until the peer closes.
 pub async fn echo_server() -> SocketAddr {

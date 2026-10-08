@@ -88,8 +88,8 @@ impl SnellOutbound {
         connector: Arc<dyn Connector>,
     ) -> Result<SnellOutbound, BuildError> {
         // error texts carry no policy name: the registry's `build_one` and the
-        // dry build both prefix it; the configuration checked both, but a
-        // spec made by hand may not be
+        // dry build both prefix it; the configuration checked all of this,
+        // but a spec made by hand may not be
         if spec.psk.expose().is_empty() {
             return Err(BuildError::new("`psk` is empty"));
         }
@@ -117,6 +117,13 @@ impl SnellOutbound {
             SnellVersion::V2 | SnellVersion::V3 => Format::ChunkedAes,
             SnellVersion::V4 | SnellVersion::V5 => Format::V4,
         };
+        // v2 always reuses a connection and v1 and v3 never do, whatever
+        // the spec says; on v4 and v5 it decides
+        let reuse = match spec.version {
+            SnellVersion::V2 => true,
+            SnellVersion::V1 | SnellVersion::V3 => false,
+            SnellVersion::V4 | SnellVersion::V5 => spec.reuse,
+        };
         let dialer = Arc::new(Dialer {
             stack,
             psk: Psk::new(spec.psk.expose()),
@@ -125,9 +132,8 @@ impl SnellOutbound {
         Ok(SnellOutbound {
             name: name.to_string(),
             dialer,
-            // `reuse` is the value in effect: the version's own before v4
-            command: if spec.reuse { CONNECT_V2 } else { CONNECT },
-            pool: spec.reuse.then(Arc::<Pool>::default),
+            command: if reuse { CONNECT_V2 } else { CONNECT },
+            pool: reuse.then(Arc::<Pool>::default),
             udp: spec.version.carries_udp(),
             reaper: OnceLock::new(),
         })
@@ -245,8 +251,10 @@ mod tests {
     use rurge_net::connector::{DirectConnector, PacketSocket, SystemResolve};
     use std::net::SocketAddr;
     use std::path::Path;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
     use tokio::net::TcpListener;
 
     /// The outbound for `definition` (a `snell, host, port, ...` line).
@@ -299,6 +307,8 @@ mod tests {
 
     const NO_ANSWER: &str =
         "snell: the server closed the connection without answering (wrong psk or version?)";
+    const RESET: &str =
+        "snell: the server reset the connection without answering (wrong psk or version?)";
     const UNDECRYPTABLE: &str =
         "snell: the server's data failed to decrypt (wrong psk or version?)";
 
@@ -732,21 +742,66 @@ mod tests {
         }
     }
 
-    /// A target that ends without sending anything leaves the server
-    /// nothing to put its answer in front of: the request ends without one,
-    /// by the zero-length chunk (version 2) or the close (versions 1 and 3).
+    /// A target that ends before it sent anything: the server answers with
+    /// an error — `Remote EOF`, whichever command asked — and the request's
+    /// connection is not kept, on version 2 either.
     #[tokio::test]
-    async fn a_request_that_ends_without_an_answer_is_an_error_on_v1_to_v3() {
+    async fn a_target_that_ends_before_sending_is_the_servers_remote_eof_on_v1_to_v3() {
         // accepts and closes at once
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let closer = listener.local_addr().unwrap();
         tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+        let echo = echo_server().await;
         for version in 1..=3 {
             let fake = server_of(version, SnellScript::new("secret")).await;
             let out = outbound_of(version, &fake, "");
             let err = failure(&out, closer).await;
-            assert_eq!(err.to_string(), NO_ANSWER, "v{version}");
+            assert_eq!(
+                err.to_string(),
+                "snell: the server refused: Remote EOF",
+                "v{version}"
+            );
+            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
             assert_eq!(out.idle_connections().unwrap_or(0), 0, "v{version}");
+            request(&out, echo, b"next").await;
+            assert_eq!(fake.connections(), 2, "v{version}: the next one dials");
+        }
+    }
+
+    /// A server that cannot read the request may close with our bytes still
+    /// unread, which resets the connection: before anything of its own
+    /// arrived that is its answer, as a close is, and says the same hint. A
+    /// line without `version` against a server of version 4, and another
+    /// PSK on a chunked and on a v4 connection.
+    #[tokio::test]
+    async fn a_server_that_resets_without_answering_says_psk_or_version() {
+        let echo = echo_server().await;
+        for (server, psk, line) in [
+            (4, "secret", ""),
+            (2, "0therPsk", ", version=2"),
+            (5, "0therPsk", ", version=5"),
+        ] {
+            let script = SnellScript {
+                reset: true,
+                ..SnellScript::new(psk)
+            };
+            let fake = server_of(server, script).await;
+            let out = outbound(&format!(
+                "snell, 127.0.0.1, {}, psk=secret{line}",
+                fake.addr().port()
+            ));
+            let err = failure(&out, echo).await;
+            assert_eq!(err.to_string(), RESET, "a v{server} server and `{line}`");
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ),
+                "{:?}",
+                err.kind()
+            );
+            assert!(!format!("{err:?}").contains("secret"));
+            assert_eq!((fake.rejected(), fake.requests().len()), (1, 0));
         }
     }
 
@@ -955,7 +1010,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "snell: the server closed the connection without answering (wrong psk or version?)"
+            "snell: the server closed the connection without answering"
         );
         assert_eq!((fake.connections(), fake.unanswered()), (1, 1));
     }
@@ -963,29 +1018,146 @@ mod tests {
     #[tokio::test]
     async fn an_answer_on_a_pooled_connection_that_fails_to_decrypt_is_not_retried() {
         let echo = echo_server().await;
-        let fake = FakeSnell::spawn(SnellScript {
-            garble_after: Some(1),
-            ..SnellScript::new("secret")
-        })
-        .await;
-        let out = outbound_to(&fake, ", reuse=true");
-        request(&out, echo, b"first").await;
-        let mut stream = out
-            .connect_tcp(&target(echo), &ConnectOpts::default())
-            .await
-            .unwrap();
-        stream.write_all(b"second").await.unwrap();
-        let mut buf = [0u8; 16];
-        let err = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-            .await
-            .expect("the failure arrives")
-            .unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(
-            err.to_string(),
-            "snell: the server's data failed to decrypt (wrong psk or version?)"
-        );
-        assert_eq!((fake.connections(), fake.unanswered()), (1, 1));
+        // v4 with `reuse=true`, and v2, which always reuses
+        for (version, extra) in [(4, ", reuse=true"), (2, "")] {
+            let script = SnellScript {
+                garble_after: Some(1),
+                ..SnellScript::new("secret")
+            };
+            let fake = server_of(version, script).await;
+            let out = outbound_of(version, &fake, extra);
+            request(&out, echo, b"first").await;
+            let mut stream = out
+                .connect_tcp(&target(echo), &ConnectOpts::default())
+                .await
+                .unwrap();
+            stream.write_all(b"second").await.unwrap();
+            let mut buf = [0u8; 16];
+            let err = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                .await
+                .expect("the failure arrives")
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "v{version}");
+            assert_eq!(
+                err.to_string(),
+                "snell: the server's data failed to decrypt (wrong psk or version?)"
+            );
+            assert_eq!((fake.connections(), fake.unanswered()), (1, 1));
+        }
+    }
+
+    /// Dials directly; the reads of every connection dialled before
+    /// `break_them` fail from then on, as a reset connection's do.
+    struct Breakable {
+        direct: DirectConnector,
+        dials: std::sync::atomic::AtomicUsize,
+        broken: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Breakable {
+        fn break_them(&self) {
+            use std::sync::atomic::Ordering;
+            self.broken
+                .store(self.dials.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+    }
+
+    struct BreakableStream {
+        inner: BoxedStream,
+        /// Which dial this is, from 0.
+        dial: usize,
+        broken: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsyncRead for BreakableStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if this.dial < this.broken.load(std::sync::atomic::Ordering::SeqCst) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "reset by the peer",
+                )));
+            }
+            Pin::new(&mut this.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for BreakableStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.get_mut().inner).poll_write(cx, data)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    impl Connector for Breakable {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, std::io::Result<BoxedStream>> {
+            use std::sync::atomic::Ordering;
+            Box::pin(async move {
+                let dial = self.dials.fetch_add(1, Ordering::SeqCst);
+                let inner = self.direct.connect(target, opts).await?;
+                let broken = self.broken.clone();
+                Ok(Box::new(BreakableStream {
+                    inner,
+                    dial,
+                    broken,
+                }) as BoxedStream)
+            })
+        }
+    }
+
+    /// A pooled connection that is reset, not closed, is a stale one all
+    /// the same, and its request goes again on a fresh connection: only
+    /// before anything of the server's arrived is a reset an answer, and a
+    /// pooled connection is long past that.
+    #[tokio::test]
+    async fn a_pooled_connection_that_is_reset_is_retried_on_a_fresh_one() {
+        use std::sync::atomic::Ordering;
+        let echo = echo_server().await;
+        for (version, extra) in [(4, ", reuse=true"), (2, "")] {
+            let fake = server_of(version, SnellScript::new("secret")).await;
+            let connector = Arc::new(Breakable {
+                direct: DirectConnector::new(Arc::new(SystemResolve)),
+                dials: Default::default(),
+                broken: Default::default(),
+            });
+            let out = outbound_through(
+                &format!(
+                    "snell, 127.0.0.1, {}, psk=secret, version={version}{extra}",
+                    fake.addr().port()
+                ),
+                connector.clone(),
+            );
+            request(&out, echo, b"first").await;
+            let mut stream = out
+                .connect_tcp(&target(echo), &ConnectOpts::default())
+                .await
+                .unwrap();
+            // the pooled connection is in the request's hands: now it breaks
+            assert_eq!(connector.dials.load(Ordering::SeqCst), 1, "v{version}");
+            connector.break_them();
+            roundtrip(&mut stream, b"second").await;
+            assert_eq!(connector.dials.load(Ordering::SeqCst), 2, "v{version}");
+            assert_eq!(fake.connections(), 2, "v{version}");
+        }
     }
 
     #[tokio::test]
@@ -1264,6 +1436,46 @@ mod tests {
             Err("`snell` versions 4 and 5 take only `obfs=http`".to_string())
         );
         assert_eq!(build("secret", None), Ok(()));
+    }
+
+    /// Version 2 always reuses a connection and versions 1 and 3 never do:
+    /// a spec made by hand that says otherwise is not followed. On versions
+    /// 4 and 5 the spec decides.
+    #[test]
+    fn the_version_decides_about_reuse_whatever_a_hand_made_spec_says() {
+        for (version, written, command, pooled) in [
+            (SnellVersion::V1, true, CONNECT, false),
+            (SnellVersion::V1, false, CONNECT, false),
+            (SnellVersion::V2, false, CONNECT_V2, true),
+            (SnellVersion::V2, true, CONNECT_V2, true),
+            (SnellVersion::V3, true, CONNECT, false),
+            (SnellVersion::V3, false, CONNECT, false),
+            (SnellVersion::V4, true, CONNECT_V2, true),
+            (SnellVersion::V4, false, CONNECT, false),
+            (SnellVersion::V5, true, CONNECT_V2, true),
+            (SnellVersion::V5, false, CONNECT, false),
+        ] {
+            let spec = SnellSpec {
+                version,
+                psk: Secret::from("secret"),
+                reuse: written,
+                obfs: None,
+            };
+            let out = SnellOutbound::new(
+                "N",
+                Target::new(HostName::parse("127.0.0.1"), 8388),
+                &spec,
+                None,
+                Arc::new(RootCertStore::empty()),
+                Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
+            )
+            .unwrap_or_else(|e| panic!("{version:?}: {}", e.message));
+            assert_eq!(
+                (out.command, out.pool.is_some()),
+                (command, pooled),
+                "{version:?} with reuse={written}"
+            );
+        }
     }
 
     /// Versions 1 to 3 take `tls` too; 4 and 5 are checked above.

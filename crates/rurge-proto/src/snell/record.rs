@@ -173,9 +173,14 @@ const HEADER: usize = 7;
 const PADDING_MIN: usize = 0x100;
 
 /// No server says what it could not read: with another PSK, or of another
-/// version, it closes like this, or answers what `UNDECRYPTABLE` reports.
+/// version, it sends nothing at all and closes the connection — or resets
+/// it, `RESET` — or it answers what `UNDECRYPTABLE` reports. The hint is
+/// said only then: a server whose salt has arrived could read the request
+/// (the tunnel has the plain sentence for its silence).
 pub(super) const NO_ANSWER: &str =
     "snell: the server closed the connection without answering (wrong psk or version?)";
+const RESET: &str =
+    "snell: the server reset the connection without answering (wrong psk or version?)";
 pub(super) const UNDECRYPTABLE: &str =
     "snell: the server's data failed to decrypt (wrong psk or version?)";
 pub(super) const CUT_SHORT: &str = "snell: the connection ended in the middle of a record";
@@ -286,6 +291,30 @@ pub(super) fn poll_fill(
         *filled += n;
     }
     Poll::Ready(Ok(true))
+}
+
+/// Fills the server's salt, the first thing it sends. A connection that
+/// ends before any byte of it — closed, or reset: a server that closes with
+/// our bytes still unread resets it — is the server's whole answer, and the
+/// error says what it likely means. Only here: every record starts with
+/// nothing read too, and there a close is an end and a reset the
+/// connection's own failure.
+pub(super) fn poll_salt(
+    inner: &mut BoxedStream,
+    cx: &mut Context<'_>,
+    buf: &mut [u8; SALT_LEN],
+    filled: &mut usize,
+) -> Poll<io::Result<()>> {
+    use io::ErrorKind::{ConnectionAborted, ConnectionReset, UnexpectedEof};
+    Poll::Ready(match ready!(poll_fill(inner, cx, buf, filled)) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(io::Error::new(UnexpectedEof, NO_ANSWER)),
+        // still the kind it was: only the words are ours
+        Err(e) if *filled == 0 && matches!(e.kind(), ConnectionReset | ConnectionAborted) => {
+            Err(io::Error::new(e.kind(), RESET))
+        }
+        Err(e) => Err(e),
+    })
 }
 
 /// No `Debug`: it holds the connection's keys.
@@ -462,12 +491,7 @@ impl V4Stream {
         loop {
             match &mut self.reading {
                 Reading::Salt { buf, filled } => {
-                    if !ready!(poll_fill(&mut self.inner, cx, buf, filled))? {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            NO_ANSWER,
-                        )));
-                    }
+                    ready!(poll_salt(&mut self.inner, cx, buf, filled))?;
                     // our own salt back: a reflected stream, whose records
                     // would open under our own key
                     if *buf == self.salt {
@@ -611,7 +635,9 @@ mod tests {
     use super::super::kdf::derive_key;
     use super::*;
     use crate::vmess::vectors::hex;
+    use std::collections::VecDeque;
     use std::future::poll_fn;
+    use std::task::Waker;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -980,14 +1006,24 @@ mod tests {
         ("v4 / v5", Format::V4),
     ];
 
-    /// Two streams opened in their formats on the two ends of a pipe.
-    async fn opened(client: Format, server: Format) -> (SnellStream, SnellStream) {
-        let (near, far) = tokio::io::duplex(64 * 1024);
+    /// Two streams opened in their formats on the two ends of a pipe of
+    /// `capacity` bytes.
+    async fn opened_through(
+        capacity: usize,
+        client: Format,
+        server: Format,
+    ) -> (SnellStream, SnellStream) {
+        let (near, far) = tokio::io::duplex(capacity);
         let open = |end, format| SnellStream::open(boxed(end), Psk::new("psk"), format);
         (
             open(near, client).await.unwrap(),
             open(far, server).await.unwrap(),
         )
+    }
+
+    /// `opened_through` a pipe that holds whatever a test writes.
+    async fn opened(client: Format, server: Format) -> (SnellStream, SnellStream) {
+        opened_through(64 * 1024, client, server).await
     }
 
     /// Everything `stream` reads up to its end, which comes within the
@@ -1071,6 +1107,170 @@ mod tests {
                     "{ours} reading {theirs}"
                 );
                 assert!(!client.is_reusable());
+            }
+        }
+    }
+
+    /// A transport that plays its reads from a script — bytes, or an error —
+    /// and takes whatever is written.
+    struct Scripted(VecDeque<io::Result<Vec<u8>>>);
+
+    impl AsyncRead for Scripted {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.0.pop_front() {
+                None => Poll::Ready(Ok(())),
+                Some(Err(e)) => Poll::Ready(Err(e)),
+                Some(Ok(mut bytes)) => {
+                    let n = bytes.len().min(buf.remaining());
+                    buf.put_slice(&bytes[..n]);
+                    if n < bytes.len() {
+                        self.0.push_front(Ok(bytes.split_off(n)));
+                    }
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+    }
+
+    impl AsyncWrite for Scripted {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A server that cannot read the request may close with our bytes still
+    /// unread, which resets the connection. Before any byte of its salt that
+    /// is as much of an answer as a close, and says the same of the PSK and
+    /// the version; once anything of the server's has arrived, a reset is
+    /// the connection's own and is told as it is.
+    #[tokio::test]
+    async fn a_reset_before_anything_arrived_says_what_it_likely_means() {
+        const RESET: &str =
+            "snell: the server reset the connection without answering (wrong psk or version?)";
+        // what the system says of a connection that broke
+        let broken = |kind| io::Error::new(kind, "by the peer");
+        // what `stream` over a transport that plays `script` reads
+        async fn read(format: Format, script: Vec<io::Result<Vec<u8>>>) -> io::Error {
+            let transport = Box::new(Scripted(script.into()));
+            let mut stream = SnellStream::open(transport, Psk::new("psk"), format)
+                .await
+                .unwrap();
+            // the server's key is derived off the runtime: bounded
+            let err = tokio::time::timeout(Duration::from_secs(30), stream.read(&mut [0u8; 8]))
+                .await
+                .expect("an error within the bound")
+                .unwrap_err();
+            assert!(!stream.is_reusable());
+            err
+        }
+        for (name, format) in FORMATS {
+            for kind in [
+                io::ErrorKind::ConnectionReset,
+                io::ErrorKind::ConnectionAborted,
+            ] {
+                let err = read(format, vec![Err(broken(kind))]).await;
+                assert_eq!(
+                    (err.kind(), err.to_string().as_str()),
+                    (kind, RESET),
+                    "{name}: before anything arrived"
+                );
+                // a byte of the salt is here: the connection's own failure
+                let err = read(format, vec![Ok(vec![0x5a]), Err(broken(kind))]).await;
+                assert_eq!(
+                    (err.kind(), err.to_string().as_str()),
+                    (kind, "by the peer"),
+                    "{name}: within the salt"
+                );
+                // the salt is here, and the reset comes where the first
+                // record would start: every record starts so
+                let salt = vec![0x5a; SALT_LEN];
+                let err = read(format, vec![Ok(salt), Err(broken(kind))]).await;
+                assert_eq!(
+                    (err.kind(), err.to_string().as_str()),
+                    (kind, "by the peer"),
+                    "{name}: where a record starts"
+                );
+            }
+            // any other failure before anything arrived is told as it is
+            let err = read(format, vec![Err(io::Error::other("the cable"))]).await;
+            assert_eq!(err.to_string(), "the cable", "{name}");
+        }
+    }
+
+    /// What a writer does next while a record of its is still parked.
+    #[derive(Clone, Copy, Debug)]
+    enum Next {
+        End,
+        Flush,
+        Shutdown,
+    }
+
+    /// A write that returned `Pending` leaves its record parked, the nonces
+    /// it was sealed under already spent. Whatever the writer does next —
+    /// end the request, flush, shut down — sends that record first, whole
+    /// and once: a cancelled UDP send and the background end of an
+    /// abandoned request both leave one behind.
+    #[tokio::test]
+    async fn a_parked_record_goes_out_before_the_end_a_flush_or_the_shutdown() {
+        let data: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+        let bound = Duration::from_secs(10);
+        for (name, format) in FORMATS {
+            for next in [Next::End, Next::Flush, Next::Shutdown] {
+                // a pipe far smaller than the record: the write cannot finish
+                let (mut client, mut server) = opened_through(64, format, format).await;
+                let mut cx = Context::from_waker(Waker::noop());
+                let parked = Pin::new(&mut client).poll_write(&mut cx, &data);
+                assert!(parked.is_pending(), "{name}: the pipe took the record");
+                let writer = async {
+                    match next {
+                        Next::End => poll_fn(|cx| client.poll_end(cx)).await,
+                        Next::Flush => client.flush().await,
+                        Next::Shutdown => client.shutdown().await,
+                    }
+                };
+                let reader = async {
+                    let mut got = vec![0u8; data.len()];
+                    server.read_exact(&mut got).await.map(|_| got)
+                };
+                let both = async { tokio::join!(writer, reader) };
+                let (done, got) = tokio::time::timeout(bound, both)
+                    .await
+                    .unwrap_or_else(|_| panic!("{name}, then {next:?}: the record never came"));
+                done.unwrap();
+                assert!(got.unwrap() == data, "{name}, then {next:?}");
+                match next {
+                    // the direction is still open, and its next record
+                    // follows the parked one's nonces
+                    Next::Flush => {
+                        client.write_all(b"after").await.unwrap();
+                        let mut after = [0u8; 5];
+                        tokio::time::timeout(bound, server.read_exact(&mut after))
+                            .await
+                            .expect("the next record within the bound")
+                            .unwrap();
+                        assert_eq!(&after, b"after", "{name}");
+                    }
+                    // the end comes behind the record, and nothing else
+                    Next::End | Next::Shutdown => {
+                        assert_eq!(read_all(&mut server).await, b"", "{name}, then {next:?}");
+                    }
+                }
             }
         }
     }

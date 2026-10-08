@@ -34,7 +34,7 @@
 
 use super::kdf::{OUTPUT_LEN, Psk, SALT_LEN, key_failed};
 use super::record::{
-    ENDED, MAX_PAYLOAD, NO_ANSWER, UNDECRYPTABLE, cut_short, invalid, new_salt, poll_fill,
+    ENDED, MAX_PAYLOAD, UNDECRYPTABLE, cut_short, invalid, new_salt, poll_fill, poll_salt,
 };
 use crate::shadowsocks::cipher::{AeadKind, CountingAead, TAG};
 use rurge_net::connector::BoxedStream;
@@ -266,12 +266,7 @@ impl ChunkedStream {
         loop {
             match &mut self.reading {
                 Reading::Salt { buf, filled } => {
-                    if !ready!(poll_fill(&mut self.inner, cx, buf, filled))? {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            NO_ANSWER,
-                        )));
-                    }
+                    ready!(poll_salt(&mut self.inner, cx, buf, filled))?;
                     // our own salt back: a reflected stream, whose chunks
                     // would open under our own key
                     if *buf == self.salt {
@@ -397,7 +392,7 @@ impl AsyncWrite for ChunkedStream {
 #[cfg(test)]
 mod tests {
     use super::super::kdf::derive;
-    use super::super::record::CUT_SHORT;
+    use super::super::record::{CUT_SHORT, NO_ANSWER};
     use super::*;
     use crate::shadowsocks::cipher::AeadCipher;
     use crate::vmess::vectors::hex;

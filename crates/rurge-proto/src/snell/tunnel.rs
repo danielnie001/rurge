@@ -28,7 +28,7 @@
 
 use super::Dialer;
 use super::pool::Pool;
-use super::record::{NO_ANSWER, SnellStream};
+use super::record::SnellStream;
 use crate::OutboundError;
 use crate::transport::lazy_head::LazyHead;
 use rurge_net::BoxFuture;
@@ -59,9 +59,13 @@ const MAX_DISCARD: usize = 0x80001;
 /// How long a dropped request's connection may take to finish cleanly.
 const FINISH_TIMEOUT: Duration = Duration::from_secs(10);
 
+const NO_ANSWER: &str = "snell: the server closed the connection without answering";
 pub(super) const UNKNOWN_REPLY: &str = "snell: the server answered with an unknown reply";
 
-/// The request ended, or its connection closed, before the server's answer.
+/// The request ended, or its connection closed, before the server's answer
+/// and after its salt: the server could read the request, so nothing is
+/// said of the PSK or the version (the record stream says that, of a server
+/// that sent nothing at all).
 pub(super) fn no_answer() -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, NO_ANSWER)
 }
@@ -612,6 +616,54 @@ mod tests {
                 drop(tunnel);
                 assert_eq!(pool.len(), 1, "pooled once, by the reused request");
             }
+        }
+    }
+
+    /// Two ways to get no answer, whatever the format. A server that ends
+    /// the request without one has sent its salt and an end that decrypts:
+    /// it could read the request, and the sentence is the plain one. A
+    /// server that goes without sending anything at all could not, or would
+    /// not: that sentence carries the hint.
+    #[tokio::test]
+    async fn the_hint_is_said_only_of_a_server_that_sent_nothing_at_all() {
+        let bound = Duration::from_secs(30);
+        for format in [Format::ChunkedChaCha, Format::ChunkedAes, Format::V4] {
+            let (mut tunnel, mut server) = pair_in(format, None).await;
+            tunnel.write_all(b"ping").await.unwrap();
+            let mut request = [0u8; 8];
+            tokio::time::timeout(bound, server.read_exact(&mut request))
+                .await
+                .expect("the request within the bound")
+                .unwrap();
+            std::future::poll_fn(|cx| server.poll_end(cx))
+                .await
+                .unwrap();
+            let err = tokio::time::timeout(bound, tunnel.read(&mut [0u8; 4]))
+                .await
+                .expect("the end within the bound")
+                .unwrap_err();
+            assert_eq!(
+                (err.kind(), err.to_string().as_str()),
+                (
+                    io::ErrorKind::UnexpectedEof,
+                    "snell: the server closed the connection without answering"
+                )
+            );
+
+            let (mut tunnel, server) = pair_in(format, None).await;
+            tunnel.write_all(b"ping").await.unwrap();
+            drop(server);
+            let err = tokio::time::timeout(bound, tunnel.read(&mut [0u8; 4]))
+                .await
+                .expect("the close within the bound")
+                .unwrap_err();
+            assert_eq!(
+                (err.kind(), err.to_string().as_str()),
+                (
+                    io::ErrorKind::UnexpectedEof,
+                    "snell: the server closed the connection without answering (wrong psk or version?)"
+                )
+            );
         }
     }
 

@@ -382,7 +382,7 @@ mod tests {
         let err = open.await.unwrap().err().unwrap();
         assert_eq!(
             err.to_string(),
-            "snell: the server closed the connection without answering (wrong psk or version?)"
+            "snell: the server closed the connection without answering"
         );
     }
 

@@ -302,6 +302,26 @@ async fn a_line_without_version_against_another_server_fails_soon_and_says_why()
     }
 }
 
+/// A server that cannot read the request may reset the connection instead
+/// of closing it: the record then says the same two things may be wrong.
+#[tokio::test]
+async fn a_server_that_resets_fails_the_session_and_says_psk_or_version() {
+    let fake = FakeSnell::spawn(SnellScript {
+        reset: true,
+        ..SnellScript::new("s3same")
+    })
+    .await;
+    // a line without `version` dials version 1; the server speaks version 4
+    let h = through(&snell_line(&fake, "psk=s3same")).await;
+    let record = a_failed_session(&h).await;
+    assert_eq!(
+        record.error.as_deref(),
+        Some("snell: the server reset the connection without answering (wrong psk or version?)")
+    );
+    assert!(!format!("{record:?}").contains("s3same"));
+    assert_eq!((fake.rejected(), fake.requests().len()), (1, 0));
+}
+
 /// Version 6 is parsed and rejects at run time, and the record names the
 /// version (phase 2 M8 design 4.4).
 #[tokio::test]

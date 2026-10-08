@@ -21,10 +21,13 @@
 //! under ChaCha20-Poly1305, and know fewer commands: ConnectV2 came with
 //! version 2 and UDP with version 3, and a request for one a version lacks
 //! is refused with an error. The answer rides with the target's first data
-//! here too, but a target that ends before sending anything gets no answer:
-//! only the end. An end is a zero-length chunk — the sealed length alone —
-//! on a ConnectV2 tunnel, each way; a Connect tunnel takes the client's
-//! close for its end as well, and closes when the target ends.
+//! here too, and a target that ends before sending anything gets
+//! `02 65 "Remote EOF"` whichever command asked, as the reference listener
+//! of these versions answers, and the close (the reference keeps a
+//! ConnectV2 connection; a client drops it after an error either way). An
+//! end is a zero-length chunk — the sealed length alone — on a ConnectV2
+//! tunnel, each way; a Connect tunnel takes the client's close for its end
+//! as well, and closes when the target ends.
 //!
 //! UDP (`06`) is answered `00` at once; then every record of the client's
 //! is one datagram, sent from a loopback socket of the connection's own,
@@ -33,10 +36,11 @@
 //! `connect_to`, or nowhere.
 //!
 //! A wrong PSK — or a client of another record format — gets no word back,
-//! only the close.
+//! only the close; or, with `reset`, the reset a server sends that closes
+//! with the client's bytes still unread.
 
-use super::AbortOnDrop;
 use super::obfs::{ObfsHello, accept_obfs};
+use super::{AbortOnDrop, connect_upstream, is_localhost};
 use crate::shadowsocks::cipher::{AeadCipher, AeadKind, TAG};
 use crate::snell::kdf;
 use rurge_config::spec::ObfsMode;
@@ -45,7 +49,6 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -56,17 +59,6 @@ const MAX_PAYLOAD: usize = 0x3FFF;
 const CONNECT: u8 = 0x01;
 const CONNECT_V2: u8 = 0x05;
 const UDP: u8 = 0x06;
-
-/// How long a request may take to reach its upstream: one that neither
-/// answers nor refuses in that time is refused.
-const CONNECT_LIMIT: Duration = Duration::from_secs(2);
-
-/// 127.0.0.1 or ::1, and no other address of the loopback's: macOS
-/// configures these two alone, and a connection to another address of 127/8
-/// is not refused there but left waiting.
-fn is_localhost(ip: IpAddr) -> bool {
-    ip == IpAddr::V4(Ipv4Addr::LOCALHOST) || ip == IpAddr::V6(Ipv6Addr::LOCALHOST)
-}
 
 /// ConnectV2 came with version 2, UDP with version 3.
 fn knows(version: u8, command: u8) -> bool {
@@ -102,6 +94,8 @@ pub struct SnellScript {
     /// In front of every UDP answer, two records that are no datagram: an
     /// unknown address family and an address cut short.
     pub udp_junk: bool,
+    /// A client it rejects gets a reset instead of a close.
+    pub reset: bool,
 }
 
 impl SnellScript {
@@ -116,6 +110,7 @@ impl SnellScript {
             garble_after: None,
             refuse: None,
             udp_junk: false,
+            reset: false,
         }
     }
 }
@@ -497,10 +492,7 @@ impl Shared {
         let reuse = request.command == CONNECT_V2;
         let chunked = up.chunked;
         let upstream = match self.upstream(request) {
-            Some(to) => tokio::time::timeout(CONNECT_LIMIT, TcpStream::connect(to))
-                .await
-                .ok()
-                .and_then(Result::ok),
+            Some(to) => connect_upstream(to).await,
             None => None,
         };
         let Some(mut upstream) = upstream else {
@@ -537,8 +529,9 @@ impl Shared {
         let replies = async {
             let mut buf = vec![0u8; MAX_PAYLOAD];
             let n = target_read.read(&mut buf[1..]).await.unwrap_or(0);
-            if n == 0 && !chunked {
-                let error = if reuse {
+            if n == 0 {
+                // versions 1 to 3 say `Remote EOF` to a Connect too
+                let error = if reuse || chunked {
                     answers.error(0x65, b"Remote EOF")
                 } else {
                     answers.error(0xff, b"end of file")
@@ -547,24 +540,21 @@ impl Shared {
                 let _ = writer.shutdown().await;
                 return false;
             }
-            // the answer rides with the target's first data; without any
-            // (versions 1 to 3) there is no answer, only the end
-            if n > 0 {
-                buf[0] = 0x00;
-                if writer
-                    .write_all(&answers.record(&buf[..1 + n]))
-                    .await
-                    .is_err()
-                {
-                    return false;
-                }
-                loop {
-                    match target_read.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if writer.write_all(&answers.record(&buf[..n])).await.is_err() {
-                                return false;
-                            }
+            // the answer rides with the target's first data
+            buf[0] = 0x00;
+            if writer
+                .write_all(&answers.record(&buf[..1 + n]))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            loop {
+                match target_read.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if writer.write_all(&answers.record(&buf[..n])).await.is_err() {
+                            return false;
                         }
                     }
                 }
@@ -657,6 +647,10 @@ impl Shared {
 
 async fn serve(tcp: TcpStream, shared: Arc<Shared>, connection: usize) -> io::Result<()> {
     let script = &shared.script;
+    if script.reset {
+        // closing resets the connection
+        tcp.set_zero_linger()?;
+    }
     let mut stream: BoxedStream = Box::new(tcp);
     let obfs = match (script.obfs_tls, script.obfs_http) {
         (true, _) => Some(ObfsMode::Tls),
@@ -682,7 +676,9 @@ async fn serve(tcp: TcpStream, shared: Arc<Shared>, connection: usize) -> io::Re
             Err(_) if tunnel == 0 => {
                 // a wrong PSK: no word back
                 shared.seen.rejected.fetch_add(1, Ordering::SeqCst);
-                close(&mut reader, &mut writer).await;
+                if !script.reset {
+                    close(&mut reader, &mut writer).await;
+                }
                 return Ok(());
             }
             _ => return Ok(()),
