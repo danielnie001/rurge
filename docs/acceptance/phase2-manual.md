@@ -95,7 +95,7 @@
 - [ ] `policy-priority="<节点 C>:0.5"`：C 明显更常被选中；改为 `"<节点 C>:3"` 后 C 很少被选中。
 - [ ] `POST /v1/policy_groups/select {"group_name":"Smart","policy":"<节点 B>"}`：之后固定走 B，停掉 B 时请求失败、不换成员；`{"policy":""}` 清除后恢复。
 - [ ] 日志（含 `--log-level verbose`）里 `smart` 相关的行只有节点名，没有 URL 与凭据；经 `Smart` 用过的节点停掉后，连续三次失败（会话或测速）时有一条 `smart: the policy counts as failed`，恢复后第一次成功时有一条 `smart: the policy works again`；从没经 `smart` 组用过的策略不记这两行。
-- [ ] 用一份混有尚未实现协议的节点（如 `ss`）、总数超过 12 个的订阅建 `smart` 组（`policy-path=<订阅>`）：请求照常，会话的 `policy` 链里从不出现 `ss` 节点；全部能测的节点都有了结论之后（连不上的节点要连续三次测试失败才算），`GET /v1/requests/recent` 里规则为 `policy test` 的会话大约每 5 分钟一批，不会接连不断。
+- [ ] 用一份混有 rurge 不实现的协议或变体的节点（阶段 2 / M8b 起只剩 `tailscale`、`version=6` 的 `snell` 与 `encrypt-method=bf-cfb` 这类手册不再列出的 `ss` 方法；手头的订阅里没有时自己加一行）、总数超过 12 个的订阅建 `smart` 组（`policy-path=<订阅>`）：请求照常，会话的 `policy` 链里从不出现这样的节点；全部能测的节点都有了结论之后（连不上的节点要连续三次测试失败才算），`GET /v1/requests/recent` 里规则为 `policy test` 的会话大约每 5 分钟一批，不会接连不断。
 
 ## M4a　SSH
 
@@ -204,8 +204,8 @@
 - [ ] `reuse`：`reuse=true` 时连续访问几个网站，抓包（或服务端日志）看到后面的请求走同一条 TCP 连接、没有新的握手；空闲 60 秒后这条连接被关掉。去掉 `reuse`（或 `reuse=false`）后每个请求各开一条连接。`reuse=true` 下服务端重启一次，之后的第一个请求照常成功（池里的旧连接失效时换新连接重试一次）。
 - [ ] obfs：`obfs=http, obfs-host=<伪装域名>` 连配了 `obfs = http` 的节点，TCP 与 UDP 都能往返；抓包看到首个包是带 `Host: <伪装域名>:<端口>`（端口为 80 时不带端口）与 `Upgrade: websocket` 的 `GET` 请求；不写 `obfs-host` 时伪装域名是服务器主机名（Surge 用 `bing.com`，已知差异，见兼容性清单 `snell` 一行）。
 - [ ] UDP：不需要参数（v4 / v5 自动支持 UDP），经 SOCKS5 UDP 发 DNS 查询（如 Proxifier 代理 `nslookup example.com 8.8.8.8`）得到回答；经它进行一次语音通话或联机游戏；用 NAT 类型检测工具（STUN）检测，结果是 Full Cone（节点的出口须是全锥）；抓包确认 UDP 是经一条连到主端口的 TCP 连接送到节点的（UDP over TCP，与 TCP 同样经 Shadow TLS / obfs）。写了 `udp-port` 时 `rurge check` 报一条 `W0029`，UDP 仍走主端口：节点前面是 Shadow TLS 时（Surge 的配置里常另写 `udp-port=<snell 自己的端口>`），原样照抄这份配置，UDP 照常往返。
-- [ ] psk 错误：把 `psk` 改错一位，重载后访问 `https://example.com/`：请求失败，会话记录的 `error` 是 `snell: the server closed the connection without answering`（或 `snell: the server's data failed to decrypt (wrong psk or version?)`；记下实际是哪一个）；**错误文本与日志都不含 psk**。
-- [ ] 版本不符：删掉 `version`（Surge 的缺省是 1），`rurge check` 报一条 `W0007`：`` `snell` version 1 (the default when `version` is not written) is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT ``；运行时这条策略 REJECT，会话记录写 `policy protocol not implemented: snell v1`。`version=6` 同样是 `W0007`，会话记录写 `snell v6`。
+- [ ] psk 错误：把 `psk` 改错一位，重载后访问 `https://example.com/`：请求在几秒内失败，会话记录的 `error` 是三句带提示的文本之一（阶段 2 / M8b 起）——服务端一个字节没发就关闭连接时是 `snell: the server closed the connection without answering (wrong psk or version?)`；它关闭时请求还有字节没被它读走、到达本机的是重置时是 `snell: the server reset the connection without answering (wrong psk or version?)`；它回了解不开的数据时是 `snell: the server's data failed to decrypt (wrong psk or version?)`。记下实际是哪一句与服务端实现、本机的平台。不带提示的 `snell: the server closed the connection without answering` 只在服务端已经发过字节、却没有应答就结束时出现，psk 错误不该得到它；重置若先出现在一次写上（首段负载很长时），看到的是系统自己的文本（已知限制，见兼容性清单 `snell` 一行）。**错误文本与日志都不含 psk**。
+- [ ] 版本不符：删掉 `version`（Surge 的缺省是 1；阶段 2 / M8b 起这样的行不再被拒，真的按 v1 去连），`rurge check` 零错误、没有 `W0007`；对这个 v5 节点的请求在几秒内失败（不挂到空闲超时），会话记录的 `error` 是上一项那三句之一，记下是哪一句。`version=6` 是 `W0007`：`` `snell` version 6 is not supported: it is a beta protocol without a public specification; such policies behave as REJECT ``；运行时这条策略 REJECT，会话记录写 `policy protocol not implemented: snell v6`。
 - [ ] 脱敏：`GET /v1/policies/detail?policy_name=<策略名>` 与 `GET /v1/profiles/current` 里 `psk`、`obfs-host` 与 `obfs-uri` 都是 `***`。
 
 ## M6c　HTTP/2 族
@@ -270,3 +270,21 @@
 - [ ] 混用加密上游：`encrypted-dns-server = https://<DoH 服务>/dns-query, quic://<DoQ 服务>`（不开跟随出站模式），`rurge run` 下连续访问十来个不同的网站，同时抓包：发往 DoQ 服务器 853 端口的 QUIC 握手（Initial 包）只出现一次，之后的查询都复用那条连接——DoH 上游先答、这一次查询放弃了其它上游时，DoQ 正在进行的拨号不随之中止：它由后台任务拨完，建好的连接留给后面的查询（拨号以发起它的那次查询的时限为限，约 5 秒；这段时间里连不上就作罢、不算这个上游失败，下一次查询再拨）；连接闲置约 30 秒被关掉之后，下一次查询才再握手一次（DNS 的 QUIC 连接不保活）。把 `quic://` 换成 `h3://<DoH3 服务>/dns-query` 再看一遍 443 端口。不应看到每次查询都重新握手。
 - [ ] 休眠唤醒与换网：经 `M`（与 `TT3`）的连接在用时，让电脑休眠再唤醒，或在 Wi-Fi 与有线 / 手机热点之间切换：约 30 秒内（QUIC 的空闲超时）之后的请求走新建的连接、恢复正常，不必重启 rurge；其间的请求可能超时失败。DoQ / DoH3 恢复得更快：旧连接上第一次没有答案的查找结束时（查找的时限约 5 秒），rurge 看到这条连接自查询发出后什么也没收到，就不再用它，下一次查找新建连接、得到回答，不必等 30 秒；服务端明确关掉了旧连接或回了 stateless reset 时，那个查询当即在新连接上重问一次。
 - [ ] 脱敏：`GET /v1/policies/detail?policy_name=M`（与 `TT3`）与 `GET /v1/profiles/current` 里 `username` 与 `password` 都是 `***`。
+
+## M8b　流式方法、Snell v1 ～ v3
+
+前置：同 M5a 一节的 SOCKS5 UDP 客户端；一个用流式方法的真实 Shadowsocks 节点（记下服务端实现与版本——shadowsocks-libev、shadowsocks-rust、mihomo 等；至少一种 AES 的 CFB 或 CTR 方法与 `chacha20-ietf`，有条件再加 `rc4-md5`、`chacha20` 与 `salsa20`，开 UDP）；一台开了内置 Snell 服务端的 Surge（配置里的 `[Snell Server]` 节：`interface`、`port`、`psk`，`version` 不写即 1；见兼容性清单 9.7）；M2b 一节用过的 VMess 节点（服务端收 AEAD 握手：V2Ray 4.28.1 以来的任何实现）。每份配置 `[Rule]` 里 `FINAL,<策略名>`。自动化测试对这些只有回环假服务端，对 `ssserver` 与 mihomo 的互操作用例只在 CI 上跑、在这一节写下时还没有对真实的二进制跑过；Snell v1 ～ v3 没有官方的独立服务端可作参照。
+
+- [ ] 流式方法的 TCP：`ss` 策略写 `encrypt-method=<流式方法>, password=<口令>`，`rurge check -c <配置>` 零错误、没有 `W0007`，有一条 `W0031`：`` `ss` cipher `<方法>` is a stream cipher: it gives no integrity protection and is deprecated; use an AEAD cipher ``（两条用同一种方法的策略也只有一条，落在第一条上）；`curl -x http://127.0.0.1:<http-listen 端口> https://example.com/ -I` 与 `curl --socks5-hostname 127.0.0.1:<socks5-listen 端口> https://example.com/ -I` 都返回 200，请求记录里策略链是该策略、`error` 为空；下载一个 100 MB 以上的文件并核对校验和（流式方法自己不校验数据）；服务端先说话的协议（经代理连一个 SMTP / SSH 主机）能看到对端的欢迎行。
+- [ ] 流式方法的 UDP：加 `udp-relay=true`，经 SOCKS5 UDP 发 DNS 查询（如 Proxifier 代理 `nslookup example.com 8.8.8.8`）得到回答；经它进行一次语音通话或联机游戏。
+- [ ] `salsa20`（有 shadowsocks-libev 服务端时）：上面两项各做一遍，记下服务端版本与结果——这是唯一没有任何参照服务端的方法，自动化测试里只有已知答案的向量与回环。`chacha20`（8 字节 nonce 的原版）有条件时也做一遍：它的参照只有 mihomo。
+- [ ] `rc4`（如果节点用的是它）：`W0031` 的文本后面多一句 `` ; `rc4` also repeats its keystream on every connection ``。
+- [ ] 流式方法的口令错误：把 `password` 改错一位，重载后访问 `https://example.com/`：请求失败。流式方法下服务端解出的是乱码，表现因服务端而异——不回一个字节就关闭时会话记录是 `ss: the server closed the connection without answering`，重置时是 `ss: the server reset the connection without answering (wrong password or method?)`，一直读下去、不回也不关时请求挂到 curl 放弃或空闲超时为止；记下实际表现与服务端实现。**错误文本与日志都不含口令**。
+- [ ] 不再支持的方法名：`encrypt-method=bf-cfb`，`rurge check` 报一条 `W0007`：`` `ss` cipher `bf-cfb` is not supported (Surge no longer lists it); such policies behave as REJECT ``；运行时这条策略 REJECT，会话记录写 `policy protocol not implemented: ss (bf-cfb)`。
+- [ ] 对 Surge 自带的 Snell 服务端（v1）：策略写 `snell, <Surge 设备的地址>, <端口>, psk=<psk>`（不写 `version`，即 1），`rurge check` 零错误、零告警；`curl` 经 HTTP 与 SOCKS5 两个入口都返回 200，请求记录里策略链是该策略、`error` 为空；下载一个 100 MB 以上的文件并核对校验和；连续访问几个网站，抓包看到每个请求各开一条 TCP 连接（v1 不复用）。写上 `reuse=true` 时 `rurge check` 报一条 `W0028`（`` `reuse` does not apply to `snell` version 1: version 2 always reuses a connection, versions 1 and 3 never do ``），行为不变。v1 不载 UDP：经 SOCKS5 UDP 的 DNS 查询在 `udp-policy-not-supported-behaviour` 缺省（`REJECT`）时没有回答，会话记录写 `policy does not support UDP`。
+- [ ] Snell 的 psk 或版本不符：对上一项的服务端把 `psk` 改错一位，再改回并写上 `version=4`：两次请求都在几秒内失败（不挂到空闲超时），会话记录的 `error` 是 M6b 一节"psk 错误"一项列的三句之一；记下各是哪一句。**错误文本与日志都不含 psk**。
+- [ ] Snell v2 / v3（有这样的服务端时，如 mihomo 的 `snell` 监听端）：`version=2` 时连续访问几个网站，服务端（或抓包）只看到一条 TCP 连接（v2 总是复用），写上 `reuse=false` 时 `rurge check` 报一条 `W0028`、行为不变；`version=3` 时经 SOCKS5 UDP 的 DNS 查询有回答。
+- [ ] `mode` 写在低版本上：在 `version` 不是 6 的 `snell` 行上写 `mode=default`，`rurge check` 报 `E0018`（`` `mode` only applies to `snell` version 6 ``）、退出码 2，`rurge run` 拒绝启动——这样的配置在阶段 2 / M8b 之前能加载（告警并忽略）。
+- [ ] 不写 `vmess-aead` 的 `vmess` 行：把 M2b 一节的策略行去掉 `vmess-aead=true`（或改成 `vmess-aead=false`），`rurge check` 零错误、没有 `W0007`，有一条 `W0029`：`` `vmess-aead=false` has no effect: rurge always uses the AEAD handshake, which every server since V2Ray 4.28.1 accepts ``；`curl` 经 HTTP 入口返回 200，请求记录里策略链是该策略、`error` 为空（rurge 用的是 AEAD 握手）。同一行策略原样放进 Surge 的配置对照：Surge 对这样的行用旧握手，记下它连不连得上与服务端实现、版本（已知差异，见兼容性清单 `vmess` 一行）。
+- [ ] 订阅里的这两类行：把一行流式方法的 `ss` 与一行不写 `vmess-aead` 的 `vmess` 放进自己的订阅文件，`G = select, policy-path=<文件>`：两行都是能用的成员（经 `POST /v1/policy_groups/select` 选中后转发正常）；`rurge check` 按组各报一条——`W0031`（`` policy group `G`: imported `ss` policies use the stream cipher `<方法>`: it gives no integrity protection and is deprecated ``）与 `W0029`（`` policy group `G`: imported `vmess` policies without `vmess-aead=true` use the AEAD handshake ``）。
+- [ ] 脱敏：`GET /v1/policies/detail?policy_name=<策略名>` 与 `GET /v1/profiles/current` 里流式方法的 `password` 与 Snell 的 `psk` 都是 `***`。

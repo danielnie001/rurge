@@ -131,9 +131,9 @@
 
 **依赖**：不新增 crate。`chacha20` 0.9.1 与 `salsa20` 0.10.2 已在依赖树里（只加依赖边，与 `rurge-proto` 现用的 `aes` 0.8 同属 `cipher` 0.4 一代）；CFB128、CTR 与 RC4 各十几二十行，直接写在 `aes` 的单块加密之上，用 NIST SP 800-38A（F.3.13 ～ F.3.18、F.5.1 ～ F.5.6）与 RFC 6229 的向量钉住——shadowsocks-rust 自己的 CFB 与 RC4 也是手写的。`chacha20` 0.9.1 的原版变体内部是 32 位块计数：单条连接超过 256 GiB 时出错而不是进位，登记。
 
-**结构**：`rurge-config` 的 `SsMethod` 加 11 个流式取值；`rurge-proto::shadowsocks` 加 `stream` 模块（按方法造密钥流、`StreamCipherStream`：首次写带出 IV、首次读先取对端的 IV）与 UDP 的一种 `Packets`；请求头照旧经 `LazyHead` 与首段负载一起写出；`obfs`、Shadow TLS、`udp-port` 与 AEAD 方法同样可用。`FakeShadowsocks` 加流式方法（密钥流独立实现）。
+**结构**：`rurge-config` 的 `SsMethod` 加 11 个流式取值；`rurge-proto::shadowsocks` 加 `stream` 模块（按方法造密钥流、`CipherStream`：首次写带出 IV、首次读先取对端的 IV）与 UDP 的一种 `Packets`；请求头照旧经 `LazyHead` 与首段负载一起写出；`obfs`、Shadow TLS、`udp-port` 与 AEAD 方法同样可用。`FakeShadowsocks` 加流式方法（密钥流与出站共用 `Keystream`，其余是它自己的；第 12 节第 3 条）。
 
-**诊断**：用了流式方法的策略每种方法每次加载一条 `W0031`（新）：`` `ss` cipher `<方法>` is a stream cipher: it gives no integrity protection and has been deprecated; use an AEAD cipher ``；`rc4` 的文本另说明密钥流在连接之间重复。订阅导入的行同样（每种方法每次装配一条）。
+**诊断**：用了流式方法的策略每种方法每次加载一条 `W0031`（新）：`` `ss` cipher `<方法>` is a stream cipher: it gives no integrity protection and is deprecated; use an AEAD cipher ``；`rc4` 的文本另说明密钥流在连接之间重复。订阅导入的行同样告警（每个组、每种方法每次装配一条，文本另写；第 12 节第 2、3 条）。
 
 **测试**：向量（上面两份标准，另加 RFC 8439 2.4.2 的 ChaCha20、ECRYPT 的 Salsa20/20 256 位向量）；回环（TCP 往返、UDP、两种 obfs、口令错误的表现——服务端解出乱码后关闭或一直读）；经引擎的端到端；互操作：`ssserver` v1.25.0（CI 已装；它的发布包按 `full` 构建、含 `stream-cipher`）覆盖 `rc4`、`rc4-md5`、AES-CFB 三种、AES-CTR 三种与 `chacha20-ietf` 共 9 种，`chacha20` 对 mihomo（第 4.3 节装的）的 `shadowsocks` 监听端，`salsa20` 没有可用的预编译参照（只有 libev 支持、它没有官方二进制），由向量与回环覆盖并登记。
 
@@ -306,7 +306,7 @@
 九条里订正两条，其余不变：
 
 - 第 8 条"三平台 CI 绿（含互操作 job）；clippy 零警告；`W0007` 与 `W0008` 不再出现"改为：三平台 CI 绿（含互操作）；clippy 零警告；`W0007` 只对 rurge 不实现的协议与变体出现（`tailscale`、`snell` 的 `version=6`、手册没列的 `ss` 方法名），`W0008` 只对 `subnet` 组出现（阶段 3）。
-- 第 1 条"每种协议对参考服务器的 TCP 转发通过；支持 UDP 的协议 UDP 转发通过"补一句：没有可用参照服务端的情形（`socks5-tls`、simple-obfs、CONNECT-UDP over HTTP/2、TUIC 的 `quic` 模式、端口跳跃、`ss` 的 `salsa20`）由回环假服务端覆盖并进手工验收清单。
+- 第 1 条"每种协议对参考服务器的 TCP 转发通过；支持 UDP 的协议 UDP 转发通过"补一句：没有可用参照服务端的情形（`socks5-tls`、CONNECT-UDP over HTTP/2、TUIC 的 `quic` 模式、端口跳跃、`ss` 的 `salsa20`）由回环假服务端覆盖并进手工验收清单。simple-obfs 原来也在这张名单里；M8b 起 mihomo 的监听端是它的参照服务端——CI 上装了，用例还没有对真实的二进制跑过，第一次 CI 运行时核对（第 12 节第 8 条）。
 
 逐条的证据（用例名、CI 运行）写成 `docs/acceptance/phase2-acceptance.md`；需要真实节点的项目仍在 `docs/acceptance/phase2-manual.md`，M8 给它补上流式方法、Snell v1（对 Surge 自带的服务端）与经 tailscaled 接入三节。
 
@@ -424,3 +424,33 @@
 | `docs/api/phase2.md` | DoH 的认证；诊断文本的变化 | M8a |
 | `README.md` / `README_en.md` | 阶段 2 完成；特性表与路线图 | M8c |
 | `CLAUDE.md` | 状态、文档索引、命令、手册路径示例 | 各份计划的文档任务 |
+
+## 12. M8b 实施期的订正
+
+M8b（第 4 节）按 `docs/superpowers/plans/2026-10-08-phase2-m8b-p2-protocols-plan.md` 做完：配置层（提交 4203eb3、0076f61）、`ss` 的流式方法（3ce73f9、d6d3835）、Snell v1 ～ v3（23af242、b106a60）、互操作（a521b65、6ac8bf8），以及收尾的注释与文档。下面是与第 4 节、第 6.2 节的文字不同的地方，以代码为准。第 4 节与第 8 节的原文作为计划期的记录留着，只有已经不成立的几处就地改了，各在所属的条目里注明。逐项的理由与提交见该计划的「执行期修正记录」，留下的事项见它的「延后事项」。
+
+1. **`W0007` 的文本**（4.4）。M8b 之后它只有三种来源，各一句：`tailscale` 是 `` policy type `tailscale` is not supported; a tailnet is reached through tailscaled's SOCKS5 proxy with a `socks5` or an `external` policy; such policies behave as REJECT ``（文本自己说出能用的写法，不是指向兼容性清单）；`snell` 的 `version=6` 是 `` `snell` version 6 is not supported: it is a beta protocol without a public specification; such policies behave as REJECT ``；手册不再列出的 9 个 `ss` 方法名是 `` `ss` cipher `<方法>` is not supported (Surge no longer lists it); such policies behave as REJECT ``。第 4.4 节没有提到订阅导入的行：它们的告警同样改了，`` policy group `<组>`: imported policies of type <种类> are not supported; they behave as REJECT ``。会话日志的 `policy protocol not implemented: <说明>` 没有动。代码注释里把 `W0007`、`OutboundError::Unsupported` 与没有 spec 的策略说成"还没实现"的地方，一并改成了"不实现"。
+2. **提示的机制**（4.1、4.2）。"策略照建，每次加载按种类说一次"的两条告警——`vmess-aead` 的 `W0029` 与流式方法的 `W0031`——共用一个新的 `Remark`，与"不建策略"的 `NotImplemented` 并列。主配置里每种每次加载一条，落在第一条这样的策略行上。订阅导入的行按"组 × 种类"各一条（第 4.1 节原来写"每种方法每次装配一条"，已就地改），文本另写：`` policy group `<组>`: imported `vmess` policies without `vmess-aead=true` use the AEAD handshake `` 与 `` policy group `<组>`: imported `ss` policies use the stream cipher `<方法>`: it gives no integrity protection and is deprecated ``——后一句没有"use an AEAD cipher"，订阅的行使用者改不了。按组说是因为组的 `external-policy-modifier` 是使用者能消掉这类提示的地方；导入行的 `W0007` 则照旧按种类跨组只说一次。行有错误或没有 spec 时不给提示。
+3. **流式方法**（4.1）。
+   - 第 4.1 节就地改了三处：`W0031` 的文本是 `… and is deprecated; use an AEAD cipher`（原写 `has been deprecated`）；流的类型叫 `CipherStream`（原写 `StreamCipherStream`）；`FakeShadowsocks` 的密钥流与出站共用 `Keystream`（原写"密钥流独立实现"）。流式方法的"封帧"只有一个 IV，把密码再写一遍没有意义：`Keystream` 的正确性由标准向量与互操作钉住，假服务端的读 IV、解析地址、转发与 UDP 的拆包封包仍是它自己的代码。
+   - 密钥流有尽头：`chacha20` 0.9.1 的两种 ChaCha20——原版与 `chacha20-ietf`——都以 32 位计块，一条连接的每个方向在 (2^32 − 1) × 64 字节（256 GiB 少 64 字节）处到头。到头时这条连接以 `ss: the cipher's keystream is used up` 失败：不 panic，也不在回绕的密钥流下发出字节。第 4.1 节与第 8 节第 2 条只提了原版 `chacha20`。`salsa20` 以 64 位计块，实际上没有尽头。
+   - 口令或方法不对：流式方法什么都不认证，两端各自解出乱码，服务端多半不回一个字节就走。第一个字节到达之前连接结束或被重置，按错误报出，文本与 AEAD 方法相同（`ss: the server closed the connection without answering`、`ss: the server reset the connection without answering (wrong password or method?)`）；IV 收到一半就结束是 `ss: the connection ended in the middle of the server's IV`。代价与 AEAD 方法一样：目标自己一个字节不回就关闭的会话也记成第一句。
+   - 我方的 IV 与首段密文在同一次写里发出，一次写至多取 16 KiB；未知 `encrypt-method` 的错误列出全部 19 个可用的名字。
+   - 假服务端（对所有方法）只连接、只发往 127.0.0.1 与 ::1 本身：口令不对时流式方法解出的"地址"是任意地址，测试不能因此碰公网。
+4. **VMess**（4.2）。照设计做了，告警的文本逐字相同。不写 `vmess-aead`、写 `false` 与写 `true` 的行得到同一个 spec：重载时在这个参数上来回改不重建出站。
+5. **Snell v1 ～ v3**（4.3）。
+   - 零长度块只认一种写法。第 9 节 V5 说"读端两种都要认"；核对 mihomo v1.19.32 的源码之后改了主意：监听端两个方向写的都只是密封的长度那一段，"再密封一段空负载"的写法只在它的另一条写路径上、监听端的应答到不了那里，两份开源实现的读端也都不认它。代价：对写另一种的服务端，复用的 v2 连接上的下一个请求会解不开。
+   - 各版本怎样结束自己的方向（第 4.3 节没有写）：v1 / v3 以 TCP 的写关闭结束，不发零长度块——v1 的服务端不认得它；v2 以零长度块结束，连接留着；服务端发来的零长度块在三个版本上都结束它的方向。
+   - `reuse` 的 `W0028` 两个方向都有：v1 / v3 上写 `reuse=true`，v2 上写 `reuse=false`。spec 里存的是生效的值，所以 `version=2` 与 `version=2, reuse=true` 是同一个 spec。
+   - 错误文本（第 4.3 节没有写，计划沿用 v4 的三句）。口令或版本不对的服务端多半什么也不回就关，所以"没有应答"也带提示，并按服务端有没有发过字节分开，所有版本如此：一个字节没到就关闭是 `snell: the server closed the connection without answering (wrong psk or version?)`；一个字节没到就被重置是新的一句 `snell: the server reset the connection without answering (wrong psk or version?)`（错误种类不变）；服务端的 salt 已到而没有应答，是不带提示的 `snell: the server closed the connection without answering`；回了解不开的数据仍是 `snell: the server's data failed to decrypt (wrong psk or version?)`。M6b 登记过的 v4 / v5 文本随之改了。已知限制：提示只管读方向（重置若先出现在一次写上，拿到的是系统自己的文本）；它以"服务端随第一次写才发 salt"为前提；上传途中、服务端一个字节还没回时被重置，同样算"什么都没发"。
+   - `udp-port` 在 v1 ～ v3 上与 v4 / v5 一样只解析（`W0029`）。v1 / v2 不载 UDP：经它们的 UDP 流照 `udp-policy-not-supported-behaviour` 处理。
+   - 目标一个字节没回就结束时，参照服务端回的是错误应答，会话记 `snell: the server refused: Remote EOF`；回环假服务端 `FakeSnell` 在这三个版本上照此作答。
+6. **配置层的小项**（4.5）。`ecn` 的 `W0028` 是 `` `ecn` does not apply to `<类型>` policies; ignored ``，写在不带 `h3=true` 的 `trust-tunnel` 上是 `` … policies without `h3=true`; ignored ``（经 HTTP/3 时它生效）；被忽略的 `ecn` 在 spec 里置回 `auto`，重载不因它重建出站；告警从"每个参数名每次加载一条"变成"每行一条"。`snell` 的 `version` 本身写错时不再对 `mode` 报第二条。Hysteria 2 的短混淆口令按参数各自检查、按字节计，4 字节的下限读自参考实现 Salamander 与 Gecko 两份源码。`ss` 的 `udp-port` 在没有 `udp-relay=true` 时被忽略（不进 spec）。
+7. **互操作**（4.1、4.3）。
+   - 计划之外加了 simple-obfs 对 mihomo 监听端的用例：`ss` 的 `http` 与 `tls`（AEAD 与流式方法各走 mihomo 的一套实现），`snell` v1 配 `tls`、v4 配 `http`。
+   - mihomo 的就绪不能看日志行或端口：它先开监听端，稍后才开始转发，其间交来的连接被直接关掉。夹具多配一个 `socks` 监听端，经它真的转发成一次才算就绪。其余读自源码的事实（`obfs-opts` 必须同时写 `mode` 与 `host`、要从子进程环境里去掉的十三个 `CLASH_*` 变量、回环检测的开关、主目录里的 `cache.db`）与出处写在 `tests/interop/README.md` 的「mihomo」一节。
+   - mihomo 的流式方法表里没有单独的 `rc4` 与 `salsa20`：`rc4` 由 `ssserver` 覆盖，`salsa20` 仍没有参照。
+   - 流式方法不写口令错误的互操作用例：参照服务端会按解出的乱码去连任意地址，或一直读到客户端离开。Snell 的 PSK 或版本不对的用例只收带提示的"结束"与"重置"两句。
+   - 一次拉起的端口由 `rurge_interop::free_ports` 一次取齐，免得同一份配置的两个监听端拿到同一个号。
+   - mihomo 与 `ssserver` 流式方法的用例都还没有对真实的二进制跑过（本机不装参照服务端）：第一次 CI 运行时核对，要核对的项目列在同一份 README 里。
+8. **验收标准第 1 条**（6.2，已就地改；总设计第 14 节第 1 条同改）。simple-obfs 不再属于"没有可用参照服务端的情形"：mihomo 的监听端说它，CI 上装了 mihomo。确切的说法是"有参照、还没跑过"——直到第一次 CI 运行。`ss` 的 `salsa20` 仍在那张名单里。

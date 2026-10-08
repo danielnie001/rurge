@@ -133,7 +133,7 @@ Surge 是 Apple 平台上功能最完整的网络代理与调试工具之一：�
 | 企业配置、许可证相关 URL Scheme | 商业功能 | 忽略 |
 | Tailscale 策略 | 需嵌入 Tailscale 客户端（控制面协议、DERP、MagicDNS），工作量与许可需单独评估 | 远期评估；配置解析通过，策略视为不可用 |
 | Metered Network Mode（按应用限制联网） | Surge Mac 专属 UI 功能 | 远期评估 |
-| Snell v6 与 v5 的 QUIC Proxy Mode | 协议细节未公开 | 待评估；Snell v4 / v5（阶段 2 M6b 已实现 TCP 与 UDP over TCP，v1–v3 只解析，阶段 2 M6-D2）在范围内；Hysteria 2 的 Salamander 与 Gecko 混淆也在范围内（阶段 2 M7a 已实现；Gecko 照 Hysteria 官网的公开规范，与 Surge 的 `gecko-password` 是否同一算法未证实，在手工验收里核对，阶段 2 M7-D11） |
+| Snell v6 与 v5 的 QUIC Proxy Mode | 协议细节未公开 | 待评估；Snell v1 ～ v5 在范围内（v4 / v5 阶段 2 M6b 已实现 TCP 与 UDP over TCP；v1 ～ v3 阶段 2 M8b 已实现，UDP 自 v3 起）；Hysteria 2 的 Salamander 与 Gecko 混淆也在范围内（阶段 2 M7a 已实现；Gecko 照 Hysteria 官网的公开规范，与 Surge 的 `gecko-password` 是否同一算法未证实，在手工验收里核对，阶段 2 M7-D11） |
 
 ### 2.5 与 Surge 的关系
 
@@ -313,8 +313,8 @@ flowchart LR
 | FR-OUT-02 | 别名类型 `direct` / `reject*`，接受通用参数；重定义 `DIRECT` 忽略，重定义其他内置名报错 | P0 | 1 |
 | FR-OUT-03 | 14 个通用策略参数（`interface` `allow-other-interface` `dns-follow-interface` `no-error-alert` `ip-version` `hybrid` `tfo` `tos` `ecn` `block-quic` `test-url` `test-timeout` `test-udp` `underlying-proxy`）及其平台差异 | P0 | 2 |
 | FR-OUT-04 | TLS 参数（`skip-cert-verify` `sni` `server-cert-verify-name` `server-cert-fingerprint-sha256` `alpn` `client-cert`）与 Shadow TLS v2 / v3；证书验证使用 rustls 与系统根证书 | P0 | 2 |
-| FR-OUT-05 | 协议实现：`http` `https` `h2-connect` `socks5` `socks5-tls` `ss`（AEAD、2022、obfs）`snell`（v4 / v5，阶段 2 M6-D2）`vmess` `trojan` `tuic` `tuic-v5` `hysteria2`（Salamander、Gecko，阶段 2 M7a；Gecko 与 Surge 的 `gecko-password` 是否同一算法未证实，阶段 2 M7-D11）`masque` `anytls` `trust-tunnel`（h2 / h3）`ssh` `wireguard` `external`；每种协议的专属参数见清单 4.6 | P0 | 2 |
-| FR-OUT-06 | 低优先级协议能力：Shadowsocks 流式旧方法、VMess 旧握手、Snell v1–v3 | P2 | 2 |
+| FR-OUT-05 | 协议实现：`http` `https` `h2-connect` `socks5` `socks5-tls` `ss`（AEAD、2022、obfs；流式方法见 FR-OUT-06）`snell`（v1 ～ v5：v4 / v5 阶段 2 M6b，v1 ～ v3 阶段 2 M8b；v6 见 FR-OUT-15）`vmess`（AEAD 握手）`trojan` `tuic` `tuic-v5` `hysteria2`（Salamander、Gecko，阶段 2 M7a；Gecko 与 Surge 的 `gecko-password` 是否同一算法未证实，阶段 2 M7-D11）`masque` `anytls` `trust-tunnel`（h2 / h3）`ssh` `wireguard` `external`；每种协议的专属参数见清单 4.6 | P0 | 2 |
+| FR-OUT-06 | 低优先级协议能力：Shadowsocks 流式旧方法（阶段 2 M8b 已实现手册列出的 11 种，TCP 与 UDP，用了即告警 `W0031`；手册不再列出的 9 个方法名不支持，`W0007`）、Snell v1–v3（阶段 2 M8b 已实现：Surge 自带的 Snell 服务端说的是 v1，策略行的 `version` 缺省也是 1）、VMess 旧握手（**不实现**，阶段 2 M8-D8：各家服务端都已弃用或删除它，而 V2Ray 4.28.1（2020-09）以来的服务端都收 AEAD 握手；没写 `vmess-aead=true` 的行改用 AEAD 握手并告警 `W0029`，只有那之前、只收旧握手的服务端连不上） | P2 | 2 |
 | FR-OUT-07 | UDP 中继：按协议支持矩阵；`udp-relay` `udp-port`；不支持时按 `udp-policy-not-supported-behaviour` | P0 | 2 |
 | FR-OUT-08 | 链式代理 `underlying-proxy`：值可为策略或组；目标代理主机名远程解析；与 `port-hopping` 互斥 | P0 | 2 |
 | FR-OUT-09 | 出站网卡绑定与 `allow-other-interface`、`dns-follow-interface` | P0 | 2 |

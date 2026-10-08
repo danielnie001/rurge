@@ -214,7 +214,7 @@ trojan、vmess（± WebSocket）、anytls 出站，以及任何带 Shadow TLS �
 - 给了 `url`：全部策略在这个 URL 上各测一次，超时仍用各自的；结果**不保存**，不影响任何组。
 - 各策略同时测（全进程最多 8 个测试同时进行，其余排队）；全部测完才返回。
 
-响应 `{"<名字>": Result 或 {"error": "not testable"}}`；不能测的是策略组、`REJECT` 族、尚未实现的协议，以及自己的测试 URL 解析不了的策略（即使请求里给了 `url`）。
+响应 `{"<名字>": Result 或 {"error": "not testable"}}`；不能测的是策略组、`REJECT` 族、rurge 不实现的协议或变体（加载时报 `W0007` 的策略：`tailscale`、`snell` 的 `version=6`、手册不再列出的 `ss` 方法名），以及自己的测试 URL 解析不了的策略（即使请求里给了 `url`）。
 
 UDP 测试（M5c）：策略有 UDP 测试时——策略的 `test-udp`，否则 `[General]` 的 `proxy-test-udp`——它的 Result 多一个 `udp` 键，与 URL 测试同时进行：经策略的 UDP 向 `hostname@ipv4` 的 53 端口问一次 A 记录，`{"delay": <毫秒>}` 或 `{"error": "<原因>"}`（如 `udp test timed out`），时限同该策略的测试超时；没有 UDP 测试、策略不载 UDP、不能测时没有这个键。UDP 测试的结果不保存、不影响任何组，也不进请求记录；新增的键不改变已有的形状。
 
@@ -230,7 +230,7 @@ UDP 测试（M5c）：策略有 UDP 测试时——策略的 `test-udp`，否则
 
 ### `GET /v1/policy_groups/test_results`
 
-无参数。响应 `{"<组名>": {"<成员>": Result 或 null}}`，只列 `url-test` / `fallback` / `load-balance` / `smart` 组（`smart` 自 M3c 起），成员是装配后的成员表；`null` 表示没有结果：还没测过，或结果对应的定义、测试 URL、超时已经变了；嵌套组、`REJECT` 族、尚未实现的协议与测试 URL 解析不了的策略恒为 `null`（`url-test` / `fallback` / `load-balance` 在选择时把后三种当作失败；`smart` 组不选尚未实现协议的成员，测试 URL 解析不了的成员只按真实会话的表现排序）。
+无参数。响应 `{"<组名>": {"<成员>": Result 或 null}}`，只列 `url-test` / `fallback` / `load-balance` / `smart` 组（`smart` 自 M3c 起），成员是装配后的成员表；`null` 表示没有结果：还没测过，或结果对应的定义、测试 URL、超时已经变了；嵌套组、`REJECT` 族、rurge 不实现的协议（`W0007`）与测试 URL 解析不了的策略恒为 `null`（`url-test` / `fallback` / `load-balance` 在选择时把后三种当作失败；`smart` 组不选 rurge 不实现的协议的成员，测试 URL 解析不了的成员只按真实会话的表现排序）。
 
 ```json
 {"Auto": {"HK": {"delay": 128, "time": 1758790000.25}, "JP": {"error": "timed out", "time": 1758790005.02}}}
@@ -263,7 +263,7 @@ UDP 测试（M5c）：策略有 UDP 测试时——策略的 `test-udp`，否则
 ## `smart` 组（M3c）
 
 - **选择**：按成员的分数——真实会话的首字节耗时与测速结果的时间加权平均，加上失败罚分，乘以 `policy-priority` 因子——排序；最优者 1.2 倍以内的成员里随机选一个；最近在同一目标主机上成功过、分数不超过最优者 2 倍的成员优先，最近在那里失败过的排到最后。细节见 `docs/superpowers/specs/2026-09-26-phase2-m3c-smart-design.md`。
-- **成员表**：`smart` 组只取代理策略；写在里面的嵌套组、内置策略与 `direct` / `reject` 别名被忽略（加载时记一行 INFO），`GET /v1/policy_groups`、`select` 与测试端点里的成员表也不含它们——对这样一个名字，`POST /v1/policy_groups/select` 回 400 `` `Sel` is not a member of `S` ``。协议尚未实现的成员留在成员表里，但不会被选中，也不进换成员的名单；组里一个能用的成员都没有时才用第一个成员（得到带说明的 REJECT）。
+- **成员表**：`smart` 组只取代理策略；写在里面的嵌套组、内置策略与 `direct` / `reject` 别名被忽略（加载时记一行 INFO），`GET /v1/policy_groups`、`select` 与测试端点里的成员表也不含它们——对这样一个名字，`POST /v1/policy_groups/select` 回 400 `` `Sel` is not a member of `S` ``。rurge 不实现其协议的成员（`W0007`）留在成员表里，但不会被选中，也不进换成员的名单；组里一个能用的成员都没有时才用第一个成员（得到带说明的 REJECT）。
 - **换成员**：选中的成员连不上时，这次会话依次再试排在后面的两个成员，每次最多用"剩余时间 ÷ 剩余尝试次数"，总计 10 秒。请求记录的 `policy` 是实际用上的那条链；换过成员时 `error` 是 ``smart group `S`: `A` failed to connect, used `B` ``（会话本身成功）；都连不上时是 ``smart group `S`: tried `A`, `B`, `C`; <最后一次的错误>``。DNS 会话与链的中间跳（`underlying-proxy`）不换成员。
 - **请求记录**：`connectMs` / `firstByteMs` 两个字段见 `docs/api/phase1.md`（所有会话都有）。
 - **`GET /v1/policy_groups/select`**：最近 10 分钟用得最多的成员，最近没用过时是排在第一的成员；读取不触发测速。
