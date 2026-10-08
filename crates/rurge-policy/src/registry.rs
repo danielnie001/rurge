@@ -275,6 +275,19 @@ impl Table {
         self.order.push(name.to_string());
         self.lines.insert(name.to_string(), line);
     }
+
+    /// Takes `names` out again, with everything kept about them.
+    fn forget(&mut self, names: &HashSet<&str>) {
+        if names.is_empty() {
+            return;
+        }
+        self.order.retain(|name| !names.contains(name.as_str()));
+        for name in names {
+            self.entries.remove(*name);
+            self.lines.remove(*name);
+            self.tests.remove(*name);
+        }
+    }
 }
 
 fn reject_slot(kind: RejectKind) -> usize {
@@ -387,6 +400,43 @@ fn smart_members(
         })
         .collect();
     (kept, factors)
+}
+
+/// The imported and the derived policies whose `underlying-proxy` leads to
+/// one of `failed` — those of them that could not be built — however many
+/// of their own kind lie between: none of these could be dialled. A relay
+/// the profile wrote ends the walk: its own chain stays within the profile,
+/// where a policy that cannot be built fails the whole build, and a group
+/// picks its member only when it is dialled.
+fn dangling<'a>(assembly: &'a Assembly, failed: &HashSet<String>) -> HashSet<&'a str> {
+    let mut dangling: HashSet<&str> = HashSet::new();
+    if failed.is_empty() {
+        return dangling;
+    }
+    let imported = assembly
+        .imported
+        .iter()
+        .filter_map(|i| Some((i.policy.name.as_str(), i.spec.as_ref()?)));
+    let derived = assembly
+        .derived
+        .iter()
+        .map(|d| (d.spec.name.as_str(), &d.spec));
+    // relay → those dialled through it
+    let mut over: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (name, spec) in imported.chain(derived) {
+        if let Some(relay) = spec.common.underlying_proxy.as_deref() {
+            over.entry(relay).or_default().push(name);
+        }
+    }
+    let mut gone: Vec<&str> = failed.iter().map(String::as_str).collect();
+    while let Some(relay) = gone.pop() {
+        for &name in over.get(relay).into_iter().flatten() {
+            if !failed.contains(name) && dangling.insert(name) {
+                gone.push(name);
+            }
+        }
+    }
+    dangling
 }
 
 /// Every group on a cycle, with the cycle written out; each cycle is said
@@ -520,8 +570,10 @@ impl PolicyRegistry {
         // a failure leaves that policy out and nothing else (M3-D6). Only the
         // name is logged: the factory's error text may quote a value of the
         // imported line or of the modifier (M3-D7).
-        let left_out = |name: &str| {
+        let mut failed: HashSet<String> = HashSet::new();
+        let mut left_out = |name: &str| {
             tracing::warn!(policy = %name, "policy cannot be built; it is left out");
+            failed.insert(name.to_string());
         };
         for i in &assembly.imported {
             match policy_entry(i.policy.kind, i.spec.as_ref(), i.not_implemented.as_ref()) {
@@ -554,12 +606,30 @@ impl PolicyRegistry {
                 Err(_) => left_out(&d.spec.name),
             }
         }
+        // One of them chained through a policy that was left out would fail
+        // every dial (`the policy no longer exists`): it goes as well.
+        let dangling = dangling(assembly, &failed);
+        table.forget(&dangling);
         let on_cycle = on_cycle(assembly);
         let groups: HashSet<&str> = cfg.group_specs.iter().map(|g| g.name.as_str()).collect();
         for g in &cfg.group_specs {
+            let assembled = assembly.members_of(&g.name);
+            // said once per group and by name only (M3-D7), as the assembly
+            // says it of an import whose relay it left out itself
+            let lost: Vec<&str> = assembled
+                .iter()
+                .map(String::as_str)
+                .filter(|m| dangling.contains(*m))
+                .collect();
+            if !lost.is_empty() {
+                tracing::warn!(
+                    group = %g.name,
+                    members = %lost.join(", "),
+                    "members whose `underlying-proxy` leads to a policy that was left out are left out too"
+                );
+            }
             // a member whose policy was left out is left out too
-            let members: Vec<String> = assembly
-                .members_of(&g.name)
+            let members: Vec<String> = assembled
                 .iter()
                 .filter(|m| {
                     groups.contains(m.as_str())
@@ -1950,6 +2020,201 @@ Plain = select, DIRECT, policy-path=https://sub.example/nodes\n[Rule]\nFINAL,Sub
         assert_eq!(
             reg.members("Sub"),
             Some(&["N1 (via Relay)".to_string()][..])
+        );
+    }
+
+    /// Keeps the message and the fields of every warning and error.
+    struct Warnings(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for Warnings {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = WarningLine::default();
+            event.record(&mut line);
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{}{}", line.message, line.fields));
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[derive(Default)]
+    struct WarningLine {
+        message: String,
+        fields: String,
+    }
+
+    impl tracing::field::Visit for WarningLine {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            } else {
+                self.fields += &format!(" {}={value:?}", field.name());
+            }
+        }
+    }
+
+    /// `build`'s result, and what it warned about on the way.
+    fn warned<T>(build: impl FnOnce() -> T) -> (T, Vec<String>) {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capturing = tracing::subscriber::set_default(Warnings(lines.clone()));
+        // While one dispatcher alone is registered, tracing-core asks only
+        // the thread that first reaches a call site whether it is wanted: a
+        // site another test reaches first would stay shut on this thread
+        // too. With a second one it asks every dispatcher.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let built = build();
+        drop(capturing);
+        let lines = lines.lock().unwrap().clone();
+        (built, lines)
+    }
+
+    /// What a subscription line holds besides its name: none of it may show
+    /// in a warning (M3-D7).
+    const LINE_VALUES: [&str; 6] = [
+        "x.example",
+        "y.example",
+        "z.example",
+        "s3cretX",
+        "s3cretY",
+        "8443",
+    ];
+
+    /// X cannot be built: Y, which is dialled through X, and Z, which is
+    /// dialled through Y, would fail every dial (`via X: the policy no longer
+    /// exists`). They are left out with X, whatever the order of the lines,
+    /// and the group says so once. A policy relayed through one that was
+    /// built stays, and so do the copies the other group derived on its own
+    /// relay: their chain does not go through X.
+    #[test]
+    fn an_imported_policy_relayed_through_one_that_was_left_out_is_left_out_too() {
+        let factory = FakeFactory {
+            broken: Some("X"),
+            ..FakeFactory::new()
+        };
+        let (reg, warnings) = warned(|| {
+            subscribed(
+                "Z = http, z.example, 8443, underlying-proxy=Y\n\
+Y = http, y.example, 8443, password=s3cretY, underlying-proxy=X\n\
+X = http, x.example, 8443, password=s3cretX\n\
+Fine = http, f.example, 80\nOver = http, o.example, 80, underlying-proxy=Fine",
+                &factory,
+                &RegistryCell::new(),
+                None,
+            )
+        });
+        for gone in ["X", "Y", "Z"] {
+            assert!(!reg.contains(gone), "{gone}");
+            assert!(reg.line(gone).is_none(), "{gone}");
+            assert!(reg.test_case(gone).is_none(), "{gone}");
+        }
+        assert_eq!(
+            reg.members("Plain").unwrap(),
+            strings(&["DIRECT", "Fine", "Over"])
+        );
+        assert_eq!(
+            reg.members("Sub").unwrap(),
+            strings(&[
+                "A (via Relay)",
+                "Z (via Relay)",
+                "Y (via Relay)",
+                "X (via Relay)",
+                "Fine (via Relay)",
+                "Over (via Relay)"
+            ])
+        );
+        assert_eq!(
+            reg.policy_names(),
+            [
+                "Relay",
+                "A",
+                "Fine",
+                "Over",
+                "A (via Relay)",
+                "Z (via Relay)",
+                "Y (via Relay)",
+                "X (via Relay)",
+                "Fine (via Relay)",
+                "Over (via Relay)"
+            ]
+        );
+        assert_eq!(
+            warnings,
+            [
+                "policy cannot be built; it is left out policy=X",
+                "members whose `underlying-proxy` leads to a policy that was left out are left out too group=Plain members=Z, Y",
+            ]
+        );
+        for warning in &warnings {
+            for value in LINE_VALUES {
+                assert!(!warning.contains(value), "{warning}");
+            }
+        }
+    }
+
+    /// A derived `M (via R)` whose relay was left out goes the same way. No
+    /// profile gives a group a relay that a subscription brought in (the
+    /// loader wants a name of the profile, `E0007`), so the entry is made by
+    /// hand here: the registry takes any assembly.
+    #[test]
+    fn a_derived_policy_whose_relay_was_left_out_is_left_out_too() {
+        let loaded = from_text(SUBSCRIBED, Path::new("t.conf"), &LoadOptions::for_tests());
+        assert!(!loaded.diagnostics.has_errors());
+        let cfg = loaded.config;
+        let path = cfg.group_specs[0].import.policy_path.clone().unwrap();
+        let nodes = "X = http, x.example, 8443, password=s3cretX\nFine = http, f.example, 80";
+        let snapshots = Snapshots::from([(path, Arc::new(subscription::parse(nodes)))]);
+        let mut assembly = assemble(&cfg, &snapshots);
+        let mut spec = cfg.spec("A").expect("A has a spec").clone();
+        spec.name = "A (via X)".to_string();
+        spec.common.underlying_proxy = Some("X".to_string());
+        assembly.derived.push(crate::assemble::Derived {
+            spec,
+            definition: "http, a.example, 80, underlying-proxy=X".to_string(),
+        });
+        let plain = assembly.members.get_mut("Plain").expect("a group");
+        plain.push("A (via X)".to_string());
+        let factory = FakeFactory {
+            broken: Some("X"),
+            ..FakeFactory::new()
+        };
+        let (reg, warnings) = warned(|| {
+            PolicyRegistry::build(
+                &cfg,
+                &assembly,
+                &factory,
+                &RegistryCell::new(),
+                Arc::new(SelectionTable::default()),
+                None,
+                EmptyGroup::Direct,
+                &crate::testing::auto_groups(),
+            )
+            .expect("builds")
+        });
+        assert!(!reg.contains("A (via X)"));
+        assert_eq!(reg.members("Plain").unwrap(), strings(&["DIRECT", "Fine"]));
+        assert!(reg.contains("A (via Relay)") && reg.contains("X (via Relay)"));
+        assert_eq!(
+            warnings,
+            [
+                "policy cannot be built; it is left out policy=X",
+                "members whose `underlying-proxy` leads to a policy that was left out are left out too group=Plain members=A (via X)",
+            ]
         );
     }
 
