@@ -39,6 +39,38 @@ async fn a_connect_leaves_through_a_vmess_upstream_with_the_name_unresolved() {
     }
 }
 
+/// rurge speaks the AEAD handshake only: a line that does not ask for it
+/// gets it all the same (phase 2 M8 design 4.2), and the fake server, which
+/// speaks nothing else, relays.
+#[tokio::test]
+async fn a_vmess_line_without_vmess_aead_leaves_through_the_aead_handshake() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    let (upstream, _) = vmess_upstream(false, false, origin_addr(&origin)).await;
+    for (round, written) in ["", ", vmess-aead=false"].into_iter().enumerate() {
+        let h = harness(Profile {
+            proxies: &format!(
+                "V = vmess, 127.0.0.1, {}, username={VMESS_ID}{written}",
+                upstream.addr().port()
+            ),
+            rules: "DOMAIN,target.test,V",
+            ..Profile::default()
+        })
+        .await;
+        let mut tunnel = connect_via_http(h.http(), "target.test:8080").await;
+        let response = get(&mut tunnel, "target.test", "/hello").await;
+        assert!(response.ends_with("hi there"), "{written}: {response}");
+        drop(tunnel);
+        let log = h.engine.request_log();
+        wait_until("the session to finish", || !log.recent(10).is_empty()).await;
+        let record = &log.recent(10)[0];
+        assert_eq!(record.policy, ["V"], "{written}");
+        assert!(record.error.is_none(), "{written}: {:?}", record.error);
+        assert_eq!(upstream.requests().len(), round + 1, "{written}");
+    }
+    assert_eq!(upstream.rejected(), 0);
+}
+
 #[tokio::test]
 async fn a_wrong_vmess_id_ends_the_session_with_a_text_that_says_so() {
     let origin = TestServer::spawn().await;

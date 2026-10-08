@@ -13,7 +13,8 @@ use crate::requirement::{self, Environment};
 use crate::rule::{ParseCtx, PolicyRef, Rule, RuleKind, SubRule, parse_rule, parse_subrule};
 use crate::span::Span;
 use crate::spec::{
-    GroupSpec, NameKind, NotImplemented, PolicySpec, ProtoSpec, SpecEnv, to_group_spec, to_spec,
+    GroupSpec, NameKind, NotImplemented, PolicySpec, ProtoSpec, Remark, SpecEnv, to_group_spec,
+    to_spec,
 };
 use crate::text::include::{self, IncludeOptions};
 use crate::text::{Origin, Profile, SectionKind, parse_str};
@@ -1057,6 +1058,7 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
         let mut ios_seen: HashSet<&'static str> = HashSet::new();
         let mut not_implemented = HashMap::new();
         let mut not_implemented_seen: HashSet<NotImplemented> = HashSet::new();
+        let mut remarks_seen: HashSet<Remark> = HashSet::new();
         // `local-port` → the `external` policy that has it
         let mut local_ports: HashMap<u16, &str> = HashMap::new();
         for p in &cfg.policies {
@@ -1132,6 +1134,13 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
                 }
                 not_implemented.insert(p.name.clone(), why);
             }
+            for remark in outcome.remarks {
+                if remarks_seen.insert(remark.clone()) {
+                    diags.push(
+                        Diagnostic::warning(remark.code(), remark.warning()).at(p.span.clone()),
+                    );
+                }
+            }
             specs.extend(outcome.spec);
         }
         let mut group_specs = Vec::new();
@@ -1154,7 +1163,10 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
     let mut seen_kinds: HashSet<PolicyKind> = HashSet::new();
     for p in &config.policies {
         if !opts.capabilities.policy_kinds.contains(&p.kind) && seen_kinds.insert(p.kind) {
-            diags.push(Diagnostic::warning(codes::W_PROTOCOL_NOT_IMPLEMENTED, format!("policy type `{}` is not implemented in this version; such policies behave as REJECT", p.kind.keyword())).at(p.span.clone()));
+            diags.push(
+                Diagnostic::warning(codes::W_PROTOCOL_NOT_IMPLEMENTED, unsupported_kind(p.kind))
+                    .at(p.span.clone()),
+            );
         }
     }
     let mut seen_groups: HashSet<GroupKind> = HashSet::new();
@@ -1179,6 +1191,23 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
             );
         }
     }
+}
+
+/// The load warning for a policy type rurge does not implement (`W0007`).
+/// The type is out of scope rather than still to come, so the text promises
+/// nothing, and it names the way that works where there is one (phase 2 M8
+/// design 4.4).
+fn unsupported_kind(kind: PolicyKind) -> String {
+    let instead = match kind {
+        PolicyKind::Tailscale => {
+            " a tailnet is reached through tailscaled's SOCKS5 proxy with a `socks5` or an `external` policy;"
+        }
+        _ => "",
+    };
+    format!(
+        "policy type `{}` is not supported;{instead} such policies behave as REJECT",
+        kind.keyword()
+    )
 }
 
 /// The listener of rurge's own (`http-listen` or `socks5-listen`) that
@@ -1710,32 +1739,69 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
         );
     }
 
+    /// A `vmess` line without `vmess-aead=true` is built like one with it:
+    /// `W0029` once per load, at the first such line, and no `W0007` (phase
+    /// 2 M8 design 4.2).
     #[test]
-    fn legacy_vmess_lines_are_reported_once_per_load() {
+    fn vmess_lines_without_vmess_aead_are_remarked_on_once_per_load() {
         let id = "0233d11c-15a4-47d3-ade3-48ffca0ce119";
         let text = format!(
-            "[Proxy]\nOld1 = vmess, a.test, 443, username={id}\nOld2 = vmess, b.test, 443, username={id}\n\
-New = vmess, c.test, 443, username={id}, vmess-aead=true\n[Rule]\nFINAL,DIRECT\n"
+            "[Proxy]\nNew = vmess, c.test, 443, username={id}, vmess-aead=true\n\
+Old1 = vmess, a.test, 443, username={id}\nOld2 = vmess, b.test, 443, username={id}\n\
+Off = vmess, d.test, 443, username={id}, vmess-aead=false\n[Rule]\nFINAL,DIRECT\n"
         );
         let loaded = from_text(&text, Path::new("t.conf"), &LoadOptions::for_tests());
-        let legacy: Vec<&Diagnostic> = loaded
+        let found: Vec<(&str, &str, Option<u32>)> = loaded
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str(), d.span.as_ref().map(|s| s.line)))
+            .collect();
+        assert_eq!(
+            found,
+            [(
+                codes::W_PARAM_NOT_EFFECTIVE,
+                "`vmess-aead=false` has no effect: rurge always uses the AEAD handshake, which every server since V2Ray 4.28.1 accepts",
+                Some(3)
+            )]
+        );
+        for name in ["New", "Old1", "Old2", "Off"] {
+            assert!(loaded.config.spec(name).is_some(), "{name}");
+            assert_eq!(loaded.config.not_implemented.get(name), None, "{name}");
+        }
+    }
+
+    /// A policy type rurge does not implement: `W0007` once per type, in
+    /// words that do not promise it for later; `tailscale` is told the way
+    /// that works today (phase 2 M8 design 4.4).
+    #[test]
+    fn a_policy_type_that_is_not_supported_says_so_and_tailscale_how_else() {
+        let mut opts = LoadOptions::for_tests();
+        opts.capabilities.policy_kinds = HashSet::from([PolicyKind::Direct, PolicyKind::Http]);
+        let loaded = from_text(
+            "[Proxy]\nH = http, h.test, 80\nT1 = tailscale, section-name=ts\nT2 = tailscale, section-name=ts\n\
+S = ssh, s.test, 22, username=u, password=p\n[Rule]\nFINAL,DIRECT\n",
+            Path::new("t.conf"),
+            &opts,
+        );
+        let found: Vec<(&str, Option<u32>)> = loaded
             .diagnostics
             .iter()
             .filter(|d| d.code == codes::W_PROTOCOL_NOT_IMPLEMENTED)
+            .map(|d| (d.message.as_str(), d.span.as_ref().map(|s| s.line)))
             .collect();
-        assert_eq!(legacy.len(), 1, "{legacy:?}");
         assert_eq!(
-            legacy[0].message,
-            "`vmess` without `vmess-aead=true` uses the legacy handshake, which is not implemented yet"
+            found,
+            [
+                (
+                    "policy type `tailscale` is not supported; a tailnet is reached through tailscaled's SOCKS5 proxy with a `socks5` or an `external` policy; such policies behave as REJECT",
+                    Some(3)
+                ),
+                (
+                    "policy type `ssh` is not supported; such policies behave as REJECT",
+                    Some(5)
+                ),
+            ]
         );
-        assert_eq!(legacy[0].span.as_ref().map(|s| s.line), Some(2));
-        assert!(loaded.config.spec("New").is_some());
-        assert!(loaded.config.spec("Old1").is_none() && loaded.config.spec("Old2").is_none());
-        assert_eq!(
-            loaded.config.not_implemented.get("Old2"),
-            Some(&NotImplemented::LegacyVmess)
-        );
-        assert_eq!(loaded.config.not_implemented.get("New"), None);
     }
 
     /// An `ss` stream cipher: `W0007` once per load and cipher, at the first
@@ -1798,7 +1864,7 @@ E = snell, e.test, 443, psk=pw, version=3\n[Rule]\nFINAL,DIRECT\n",
                     Some(2)
                 ),
                 (
-                    "`snell` version 6 is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT",
+                    "`snell` version 6 is not supported: it is a beta protocol without a public specification; such policies behave as REJECT",
                     Some(3)
                 ),
                 (

@@ -26,10 +26,12 @@ pub struct VmessSpec {
 }
 
 /// What a `vmess` line says. Without `vmess-aead=true` it asks for the legacy
-/// handshake, which is not implemented: the caller makes no spec of it
-/// (M2 design 4.3).
+/// handshake, which rurge does not speak: the spec is the same either way,
+/// and the caller says that the AEAD handshake is used (phase 2 M8 design
+/// 4.2).
 pub struct VmessRead {
     pub spec: VmessSpec,
+    /// `vmess-aead=true` is written.
     pub aead: bool,
 }
 
@@ -137,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn the_manuals_example_is_a_legacy_line() {
+    fn the_manuals_example_does_not_write_vmess_aead() {
         let (read, failed, diags) = read(&format!("vmess, 1.2.3.4, 8000, username={ID}"));
         assert!(!failed && diags.is_empty(), "{diags:?}");
         assert!(!read.aead, "`vmess-aead` defaults to false");

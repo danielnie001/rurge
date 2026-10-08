@@ -48,13 +48,13 @@ fn specs_are_stored_in_proxy_order() {
 #[test]
 fn inert_and_ios_only_parameters_are_reported_once_per_name() {
     let loaded = load(
-        "A = socks5, a.example, 1080, ecn=on, tfo=true\nB = socks5, b.example, 1080, ecn=on, hybrid=on\nC = http, c.example, 80, hybrid=off",
+        "A = socks5, a.example, 1080, tfo=true\nB = snell, b.example, 443, psk=p, version=4, tfo=true, udp-port=8443, hybrid=on\n\
+C = snell, c.example, 443, psk=p, version=5, udp-port=8443, hybrid=off",
         "",
     );
     let warnings: Vec<(&str, String, u32)> = loaded
         .diagnostics
         .iter()
-        .filter(|d| d.code == codes::W_PARAM_NOT_EFFECTIVE || d.code == codes::W_PLATFORM_IGNORED)
         .map(|d| (d.code, d.message.clone(), d.span.as_ref().unwrap().line))
         .collect();
     assert_eq!(
@@ -67,8 +67,9 @@ fn inert_and_ios_only_parameters_are_reported_once_per_name() {
             ),
             (
                 codes::W_PARAM_NOT_EFFECTIVE,
-                "policy parameter `ecn` is parsed but has no effect in this version".to_string(),
-                2
+                "policy parameter `udp-port` is parsed but has no effect in this version"
+                    .to_string(),
+                3
             ),
             (
                 codes::W_PLATFORM_IGNORED,
@@ -77,6 +78,40 @@ fn inert_and_ios_only_parameters_are_reported_once_per_name() {
             ),
         ]
     );
+}
+
+/// `ecn` is for QUIC: on a protocol over TCP it does not apply, which every
+/// line that writes it is told (`W0028`), unlike a parameter that is only
+/// parsed so far (`W0029`, once per load).
+#[test]
+fn ecn_on_a_protocol_over_tcp_is_not_applicable_on_every_line_that_writes_it() {
+    let loaded = load(
+        "A = socks5, a.example, 1080, ecn=on\nB = trojan, b.example, 443, password=p, ecn=off\n\
+C = hysteria2, c.example, 443, password=p, ecn=off",
+        "",
+    );
+    let warnings: Vec<(&str, String, u32)> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| (d.code, d.message.clone(), d.span.as_ref().unwrap().line))
+        .collect();
+    assert_eq!(
+        warnings,
+        [
+            (
+                codes::W_PARAM_NOT_APPLICABLE,
+                "policy `A`: `ecn` does not apply to `socks5` policies; ignored".to_string(),
+                2
+            ),
+            (
+                codes::W_PARAM_NOT_APPLICABLE,
+                "policy `B`: `ecn` does not apply to `trojan` policies; ignored".to_string(),
+                3
+            ),
+        ]
+    );
+    assert_eq!(loaded.config.spec("B").unwrap().common.ecn, Tristate::Auto);
+    assert_eq!(loaded.config.spec("C").unwrap().common.ecn, Tristate::Off);
 }
 
 #[test]
@@ -195,7 +230,7 @@ fn a_trojan_policy_takes_part_in_the_chain_checks() {
 fn hysteria2_lines_are_checked_at_load() {
     let loaded = load(
         "A = hysteria2, a.example, 443, password=p, port-hopping=5000-6000, underlying-proxy=E
-B = hysteria2, b.example, 443, password=p, salamander-password=s, gecko-password=g
+B = hysteria2, b.example, 443, password=p, salamander-password=obfs1, gecko-password=obfs2
 C = hysteria2, c.example, 443, password=p, shadow-tls-password=st
 D = hysteria2, d.example, 443, password=p, ecn=off, port-hopping=5000-6000, port-hopping-interval=2
 E = socks5, e.example, 1080",

@@ -107,7 +107,8 @@ pub struct SsSpec {
     /// other methods.
     pub keys: Secret<Vec<Vec<u8>>>,
     pub udp_relay: bool,
-    /// `udp-port`: where UDP goes; `None`: the policy's port.
+    /// `udp-port`: where UDP goes; `None`: the policy's port. Only with
+    /// `udp_relay`.
     pub udp_port: Option<u16>,
     pub obfs: Option<ObfsOpts>,
 }
@@ -184,6 +185,14 @@ pub fn read_ss(r: &mut ParamReader<'_>) -> SsRead {
     let udp_port = match r.number::<u16>("udp-port", "a port from 1 to 65535") {
         Some(0) => {
             r.invalid("udp-port", "0", "a port from 1 to 65535");
+            None
+        }
+        // it says where UDP goes: without `udp-relay=true` none goes anywhere
+        Some(_) if !udp_relay => {
+            r.warn(
+                codes::W_PARAM_NOT_APPLICABLE,
+                "`udp-port` only applies with `udp-relay=true`; ignored".to_string(),
+            );
             None
         }
         port => port,
@@ -419,6 +428,29 @@ mod tests {
         }
         let (_, failed, _) = read("ss, h.test, 8388, encrypt-method=none, udp-relay=maybe");
         assert!(failed);
+    }
+
+    /// `udp-port` is where UDP goes: without `udp-relay=true` none goes
+    /// anywhere, and the port is no part of the spec.
+    #[test]
+    fn udp_port_without_udp_relay_does_not_apply() {
+        for relay in ["", ", udp-relay=false"] {
+            let (got, failed, diags) = read(&format!(
+                "ss, h.test, 8388, encrypt-method=none, udp-port=8389{relay}"
+            ));
+            assert!(!failed, "{relay}");
+            assert_eq!(
+                messages(&diags),
+                ["policy `P`: `udp-port` only applies with `udp-relay=true`; ignored"],
+                "{relay}"
+            );
+            assert_eq!(diags[0].code, codes::W_PARAM_NOT_APPLICABLE, "{relay}");
+            assert_eq!(got.spec.udp_port, None, "{relay}");
+        }
+        let (got, failed, diags) =
+            read("ss, h.test, 8388, encrypt-method=none, udp-relay=true, udp-port=8389");
+        assert!(!failed && diags.is_empty(), "{diags:?}");
+        assert_eq!(got.spec.udp_port, Some(8389));
     }
 
     #[test]

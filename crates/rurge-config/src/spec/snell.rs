@@ -82,14 +82,21 @@ pub fn read_snell(r: &mut ParamReader<'_>) -> SnellRead {
         Some(5) => SnellVersion::V5,
         _ => SnellVersion::V4,
     };
-    if number == Some(6) {
-        r.choice("mode", &MODES);
-    } else if r.has("mode") {
-        r.touch("mode");
-        r.warn(
-            codes::W_PARAM_NOT_APPLICABLE,
-            "`mode` only applies to `snell` version 6; ignored".to_string(),
-        );
+    match number {
+        Some(6) => {
+            r.choice("mode", &MODES);
+        }
+        // the manual: on a lower version it is a profile error
+        Some(_) if r.has("mode") => {
+            r.touch("mode");
+            r.error(
+                codes::E_INVALID_POLICY_PARAM,
+                "`mode` only applies to `snell` version 6".to_string(),
+            );
+        }
+        // a bad version is an error already, and it leaves open which
+        // version `mode` is on: no second word
+        _ => r.touch("mode"),
     }
     let reuse = r.bool("reuse").unwrap_or(false);
     let udp_port = match r.number::<u16>("udp-port", "a port from 1 to 65535") {
@@ -269,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn obfs_on_version_6_and_mode_elsewhere_are_not_applicable() {
+    fn obfs_does_not_apply_to_version_6() {
         let (_, failed, diags) = read(
             "snell, h.test, 443, psk=pw, version=6, mode=unshaped, obfs=http, obfs-host=cdn.test",
         );
@@ -287,21 +294,36 @@ mod tests {
                 ),
             ]
         );
-        for version in ["version=4", "version=5", "version=2"] {
-            let (got, failed, diags) = read(&format!(
-                "snell, h.test, 443, psk=pw, {version}, mode=default"
-            ));
-            assert!(!failed, "{version}");
+    }
+
+    /// `mode` is version 6's: on a lower version the manual calls it a
+    /// profile error, whatever it says and whether `version` is written.
+    #[test]
+    fn mode_on_another_version_than_6_is_an_error() {
+        for line in [
+            "version=4, mode=default",
+            "version=5, mode=unshaped",
+            "version=2, mode=unsafe-raw",
+            "mode=default",
+            "version=4, mode=fast",
+        ] {
+            let (_, failed, diags) = read(&format!("snell, h.test, 443, psk=pw, {line}"));
+            assert!(failed, "{line}");
             assert_eq!(
                 messages(&diags),
                 [(
-                    codes::W_PARAM_NOT_APPLICABLE,
-                    "policy `P`: `mode` only applies to `snell` version 6; ignored"
-                )]
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `P`: `mode` only applies to `snell` version 6"
+                )],
+                "{line}"
             );
-            if version != "version=2" {
-                assert_eq!(got.not_implemented_version, None);
-            }
+        }
+        for mode in ["default", "unshaped", "unsafe-raw"] {
+            let (got, failed, diags) = read(&format!(
+                "snell, h.test, 443, psk=pw, version=6, mode={mode}"
+            ));
+            assert!(!failed && diags.is_empty(), "{mode}: {diags:?}");
+            assert_eq!(got.not_implemented_version, Some(6), "{mode}");
         }
         // a mode version 6 does not know is wrong on it
         let (_, failed, diags) = read("snell, h.test, 443, psk=pw, version=6, mode=fast");
@@ -311,6 +333,17 @@ mod tests {
             [(
                 codes::E_INVALID_POLICY_PARAM,
                 "policy `P`: invalid value `fast` for `mode` (expected default / unshaped / unsafe-raw)"
+            )]
+        );
+        // a `version` that is none is the line's error: which version `mode`
+        // is on cannot be told
+        let (_, failed, diags) = read("snell, h.test, 443, psk=pw, version=7, mode=default");
+        assert!(failed);
+        assert_eq!(
+            messages(&diags),
+            [(
+                codes::E_INVALID_POLICY_PARAM,
+                "policy `P`: invalid value `7` for `version` (expected an integer from 1 to 6)"
             )]
         );
     }

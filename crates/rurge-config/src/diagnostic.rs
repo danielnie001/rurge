@@ -211,6 +211,8 @@ pub mod codes {
     pub const W_PARAM_NOT_EFFECTIVE: &str = "W0029";
     /// Policy groups that reference each other; they behave as REJECT.
     pub const W_GROUP_CYCLE: &str = "W0030";
+    /// An `ss` stream cipher is in use: no integrity protection.
+    pub const W_STREAM_CIPHER: &str = "W0031";
     pub const I_LEGACY_MIGRATED: &str = "I0001";
     pub const I_LINE_DISABLED: &str = "I0002";
     /// GeoIP / ASN database file not present yet.

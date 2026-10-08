@@ -1454,19 +1454,20 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
     }
 
     #[test]
-    fn a_legacy_vmess_policy_says_why_it_rejects() {
+    fn a_line_that_asks_for_what_is_not_implemented_says_why_it_rejects() {
         let text = "[Proxy]\nOld = vmess, a.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\n\
 SS = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n\
 Stream = ss, 1.2.3.4, 8388, encrypt-method=rc4-md5, password=x\n\
 Snell1 = snell, 1.2.3.4, 443, psk=x\n[Rule]\nFINAL,DIRECT\n";
         let registry = generation(text, &FakeFactory::new(), None);
+        // a `vmess` line without `vmess-aead=true` is a proxy all the same:
+        // it gets the AEAD handshake
         let old = registry.resolve(&PolicyRef::parse("Old"));
-        assert_eq!(old.terminal, TerminalKind::Reject);
         assert_eq!(
-            old.note,
-            Some(Note::Unsupported("vmess (legacy handshake)".into()))
+            (old.terminal, old.note.clone()),
+            (TerminalKind::Proxy, None)
         );
-        assert_eq!(chain(&old), ["Old", "!unsupported:vmess", "REJECT"]);
+        assert_eq!(chain(&old), ["Old"]);
         // an AEAD `ss` is a proxy; only a stream cipher is not implemented
         let ss = registry.resolve(&PolicyRef::parse("SS"));
         assert_eq!((ss.terminal, ss.note), (TerminalKind::Proxy, None));

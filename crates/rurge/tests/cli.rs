@@ -147,11 +147,15 @@ fn check_knows_the_m1_protocols_and_runs_the_dry_build() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // only the protocol of a later milestone is still "not implemented"
+    // only `tailscale`, which rurge does not implement, is "not supported"
     // (W0007 is deduped per protocol kind and names the kind, not the
-    // policy, matching `W_GROUP_NOT_IMPLEMENTED`'s established wording)
+    // policy), and the text says what reaches a tailnet instead
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
-    assert!(out.contains("`tailscale`"), "{out}");
+    assert!(
+        out.contains("policy type `tailscale` is not supported")
+            && out.contains("tailscaled's SOCKS5 proxy"),
+        "{out}"
+    );
 
     Command::cargo_bin("rurge")
         .unwrap()
@@ -247,10 +251,17 @@ fn check_knows_vmess_and_anytls() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // one W0007, and it is the one about the legacy handshake — once, not per line
-    assert_eq!(out.matches("W0007").count(), 1, "{out}");
-    assert!(out.contains("uses the legacy handshake"), "{out}");
-    assert!(out.contains("m2b.conf:5"), "{out}");
+    // a line without `vmess-aead=true` gets the AEAD handshake all the same:
+    // nothing is "not supported", and one W0029 says so — once, not per line
+    assert_eq!(out.matches("W0007").count(), 0, "{out}");
+    assert_eq!(out.matches("W0029").count(), 1, "{out}");
+    assert!(
+        out.contains(
+            "m2b.conf:5: `vmess-aead=false` has no effect: rurge always uses the AEAD handshake"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("0 error(s), 1 warning(s)"), "{out}");
     assert!(
         !out.contains("`anytls`") && !out.contains("0233d11c"),
         "{out}"
@@ -380,10 +391,11 @@ fn check_knows_external() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `tailscale` is still a later milestone; `external` is not
+    // `tailscale` is not supported (its text names `external` as a way to
+    // a tailnet); `external` is
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
     assert!(
-        out.contains("`tailscale`") && !out.contains("`external`"),
+        out.contains("policy type `tailscale`") && !out.contains("policy type `external`"),
         "{out}"
     );
     assert!(!out.contains("hunter2"), "{out}");

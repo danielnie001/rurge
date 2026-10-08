@@ -74,8 +74,12 @@ pub fn read_hysteria2(
     }
 }
 
+/// The shortest obfuscation password the reference server starts with.
+const MIN_OBFS_PASSWORD: usize = 4;
+
 /// `salamander-password` or `gecko-password`: not both (manual), and not
-/// empty.
+/// empty. A shorter one than `MIN_OBFS_PASSWORD` is used as written, with a
+/// warning (`W0012`).
 fn read_obfuscation(r: &mut ParamReader<'_>) -> Option<Hysteria2Obfs> {
     let salamander = r.str("salamander-password");
     let gecko = r.str("gecko-password");
@@ -83,8 +87,15 @@ fn read_obfuscation(r: &mut ParamReader<'_>) -> Option<Hysteria2Obfs> {
         ("salamander-password", salamander),
         ("gecko-password", gecko),
     ] {
-        if password.is_some_and(str::is_empty) {
-            r.error(codes::E_INVALID_POLICY_PARAM, format!("`{key}` is empty"));
+        match password {
+            Some("") => r.error(codes::E_INVALID_POLICY_PARAM, format!("`{key}` is empty")),
+            Some(password) if password.len() < MIN_OBFS_PASSWORD => r.warn(
+                codes::W_INVALID_VALUE,
+                format!(
+                    "`{key}` is shorter than {MIN_OBFS_PASSWORD} bytes, which the reference server does not accept"
+                ),
+            ),
+            _ => {}
         }
     }
     match (salamander, gecko) {
@@ -255,6 +266,43 @@ mod tests {
                     format!("policy `P`: `{key}` is empty").as_str()
                 )]
             );
+        }
+    }
+
+    /// The reference server does not start with an obfuscation password
+    /// under 4 bytes: the line says so, without quoting it, and the
+    /// password is used as written.
+    #[test]
+    fn a_short_obfuscation_password_is_reported_and_used() {
+        let salamander: fn(Secret<String>) -> Hysteria2Obfs = Hysteria2Obfs::Salamander;
+        let gecko: fn(Secret<String>) -> Hysteria2Obfs = Hysteria2Obfs::Gecko;
+        for (key, obfs) in [
+            ("salamander-password", salamander),
+            ("gecko-password", gecko),
+        ] {
+            let (spec, failed, diags) =
+                read(&format!("hysteria2, h.test, 443, password=pw, {key}=abc"));
+            assert!(!failed, "{key}");
+            assert_eq!(
+                messages(&diags),
+                [(
+                    codes::W_INVALID_VALUE,
+                    format!(
+                        "policy `P`: `{key}` is shorter than 4 bytes, which the reference server does not accept"
+                    )
+                    .as_str()
+                )]
+            );
+            assert!(diags.iter().all(|d| !d.message.contains("abc")), "{key}");
+            assert_eq!(spec.obfs, Some(obfs("abc".into())), "{key}");
+            // four bytes are enough, whatever the number of characters
+            for long_enough in ["abcd", "éé"] {
+                let (spec, failed, diags) = read(&format!(
+                    "hysteria2, h.test, 443, password=pw, {key}={long_enough}"
+                ));
+                assert!(!failed && diags.is_empty(), "{key}: {diags:?}");
+                assert_eq!(spec.obfs, Some(obfs(long_enough.into())), "{key}");
+            }
         }
     }
 

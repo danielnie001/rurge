@@ -194,7 +194,6 @@ mod tests {
         let policy = parse_policy("V", definition, &span).unwrap();
         let mut r = ParamReader::new(&policy);
         let read = read_vmess(&mut r, &[]);
-        assert!(read.aead, "the line asks for the legacy handshake");
         let shadow_tls = read_shadow_tls(&mut r);
         assert!(!r.has_errors(), "{:?}", r.finish());
         VmessOutbound::new(

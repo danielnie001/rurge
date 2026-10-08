@@ -8,7 +8,8 @@ use rurge_config::Config;
 use rurge_config::diagnostic::{Diagnostic, Diagnostics, Severity, codes};
 use rurge_config::policy::{PolicyKind, ProxyPolicy, parse_policy, with_params};
 use rurge_config::spec::{
-    GroupSpec, NameKind, NotImplemented, PolicyPath, PolicySpec, ProtoSpec, SpecEnv, to_spec,
+    GroupSpec, NameKind, NotImplemented, PolicyPath, PolicySpec, ProtoSpec, Remark, SpecEnv,
+    to_spec,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -323,7 +324,9 @@ impl<'a> Imports<'a> {
 
     /// The typed parameters of every import. A line with an error is
     /// skipped (M3-D6); one of a protocol this version does not implement
-    /// stays, as REJECT, which is said once per protocol.
+    /// stays, as REJECT, which is said once per protocol. What a line's
+    /// spec makes rurge say (`Remark`), each group says once for the lines
+    /// it took in.
     fn read_specs(&mut self, cfg: &Config, diags: &mut Diagnostics) {
         let kinds: HashMap<String, PolicyKind> = self
             .list
@@ -341,6 +344,7 @@ impl<'a> Imports<'a> {
         };
         let mut failed: HashSet<String> = HashSet::new();
         let mut said: HashSet<String> = HashSet::new();
+        let mut remarked: HashSet<(&str, Remark)> = HashSet::new();
         for (imported, group) in &mut self.list {
             let group: &GroupSpec = group;
             let outcome = to_spec(&imported.policy, &env);
@@ -380,6 +384,11 @@ impl<'a> Imports<'a> {
                 }
             }
             imported.not_implemented = outcome.not_implemented;
+            for remark in outcome.remarks {
+                if remarked.insert((group.name.as_str(), remark.clone())) {
+                    diags.push(warn(group, remark.code(), remark.imported()));
+                }
+            }
         }
         self.forget(&failed);
     }
@@ -1050,7 +1059,7 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
         );
         assert_eq!(members(&a, "G"), ["Ts", "Rc", "Sn", "Old", "Good"]);
         let specs: Vec<bool> = a.imported.iter().map(|i| i.spec.is_some()).collect();
-        assert_eq!(specs, [false, false, false, false, true]);
+        assert_eq!(specs, [false, false, false, true, true]);
         let why: Vec<Option<NotImplemented>> = a
             .imported
             .iter()
@@ -1062,7 +1071,7 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
                 None,
                 Some(NotImplemented::SsStreamCipher("rc4")),
                 Some(NotImplemented::SnellVersion(1)),
-                Some(NotImplemented::LegacyVmess),
+                None,
                 None
             ]
         );
@@ -1090,8 +1099,57 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
                     "policy group `G`: imported policies of type `snell` version 1 (the default when `version` is not written) are not implemented in this version; they behave as REJECT".to_string()
                 ),
                 (
-                    codes::W_PROTOCOL_NOT_IMPLEMENTED,
-                    "policy group `G`: imported policies of type `vmess` without `vmess-aead=true` (the legacy handshake) are not implemented in this version; they behave as REJECT".to_string()
+                    codes::W_PARAM_NOT_EFFECTIVE,
+                    "policy group `G`: imported `vmess` policies without `vmess-aead=true` use the AEAD handshake".to_string()
+                ),
+            ]
+        );
+    }
+
+    /// A `vmess` line that does not ask for the AEAD handshake is built like
+    /// one that does: a member with a spec. Each group that takes such
+    /// lines in says so once, however many they are.
+    #[test]
+    fn imported_vmess_lines_without_vmess_aead_are_members_and_said_once_per_group() {
+        let cfg = profile(
+            "A = http, a.test, 80",
+            "G = select, policy-path=https://sub.test/g\nH = select, policy-path=https://sub.test/h\n\
+I = select, policy-path=https://sub.test/i",
+        );
+        let id = "0233d11c-15a4-47d3-ade3-48ffca0ce119";
+        let (g, h, i) = (
+            format!(
+                "Old1 = vmess, v1.test, 443, username={id}\nNew = vmess, v2.test, 443, username={id}, vmess-aead=true\n\
+Old2 = vmess, v3.test, 443, username={id}, vmess-aead=false"
+            ),
+            format!("Other = vmess, v4.test, 443, username={id}"),
+            format!("Asked = vmess, v5.test, 443, username={id}, vmess-aead=true"),
+        );
+        let a = assemble(&cfg, &snapshots(&cfg, &[("G", &g), ("H", &h), ("I", &i)]));
+        assert_eq!(members(&a, "G"), ["Old1", "New", "Old2"]);
+        assert_eq!(members(&a, "H"), ["Other"]);
+        assert_eq!(members(&a, "I"), ["Asked"]);
+        for imported in &a.imported {
+            let name = &imported.policy.name;
+            assert!(
+                matches!(
+                    imported.spec.as_ref().map(|spec| &spec.proto),
+                    Some(ProtoSpec::Vmess(_))
+                ),
+                "{name}"
+            );
+            assert_eq!(imported.not_implemented, None, "{name}");
+        }
+        assert_eq!(
+            warnings(&a),
+            [
+                (
+                    codes::W_PARAM_NOT_EFFECTIVE,
+                    "policy group `G`: imported `vmess` policies without `vmess-aead=true` use the AEAD handshake".to_string()
+                ),
+                (
+                    codes::W_PARAM_NOT_EFFECTIVE,
+                    "policy group `H`: imported `vmess` policies without `vmess-aead=true` use the AEAD handshake".to_string()
                 ),
             ]
         );

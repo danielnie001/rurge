@@ -226,6 +226,8 @@ pub(crate) fn read_common(
     if applies != Applies::Reject {
         let inert = [
             ("tfo", tfo),
+            // for `to_spec` to settle, which knows the protocol: it stays on
+            // the list for `wireguard` only
             ("ecn", ecn_present && applies == Applies::Proxy),
         ];
         notes

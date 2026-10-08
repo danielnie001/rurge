@@ -178,14 +178,15 @@ pub struct SpecOutcome {
     /// A valid line that asks for something not implemented yet, so it has
     /// no spec. The caller reports each distinct one once per load (`W0007`).
     pub not_implemented: Option<NotImplemented>,
+    /// What the line's spec makes rurge say. The caller reports each
+    /// distinct one once per load, under the remark's own code.
+    pub remarks: Vec<Remark>,
 }
 
 /// What a valid line asks for that this version does not implement: the
 /// policy has no spec and behaves as REJECT.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NotImplemented {
-    /// `vmess` without `vmess-aead=true`: the legacy handshake (M2 design 4.3).
-    LegacyVmess,
     /// An `ss` stream cipher, by its name (phase 2 M6 design 3.1).
     SsStreamCipher(&'static str),
     /// A `snell` version other than 4 and 5 (phase 2 M6 design 4.2).
@@ -196,10 +197,11 @@ impl NotImplemented {
     /// The load warning (`W0007`).
     pub fn warning(&self) -> String {
         match self {
-            NotImplemented::LegacyVmess => "`vmess` without `vmess-aead=true` uses the legacy handshake, which is not implemented yet".to_string(),
             NotImplemented::SsStreamCipher(method) => format!(
                 "`ss` stream cipher `{method}` is not implemented yet; such policies behave as REJECT"
             ),
+            // out of scope, not a matter of time (phase 2 M8 design 4.4)
+            NotImplemented::SnellVersion(6) => "`snell` version 6 is not supported: it is a beta protocol without a public specification; such policies behave as REJECT".to_string(),
             NotImplemented::SnellVersion(n) => format!(
                 "`snell` version {n}{} is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT",
                 snell_default(*n)
@@ -210,7 +212,6 @@ impl NotImplemented {
     /// What the session log says after "policy protocol not implemented: ".
     pub fn note(&self) -> String {
         match self {
-            NotImplemented::LegacyVmess => "vmess (legacy handshake)".to_string(),
             NotImplemented::SsStreamCipher(method) => format!("ss ({method})"),
             NotImplemented::SnellVersion(n) => format!("snell v{n}"),
         }
@@ -219,9 +220,6 @@ impl NotImplemented {
     /// How a warning about imported policies names the kind.
     pub fn imported(&self) -> String {
         match self {
-            NotImplemented::LegacyVmess => {
-                "`vmess` without `vmess-aead=true` (the legacy handshake)".to_string()
-            }
             NotImplemented::SsStreamCipher(method) => {
                 format!("`ss` with the stream cipher `{method}`")
             }
@@ -237,6 +235,49 @@ fn snell_default(version: u8) -> &'static str {
         " (the default when `version` is not written)"
     } else {
         ""
+    }
+}
+
+/// What a valid line makes rurge say once per load and kind: the policy is
+/// built all the same.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Remark {
+    /// `vmess` without `vmess-aead=true`: the AEAD handshake is used anyway.
+    VmessAead,
+    /// An `ss` stream cipher, by its name.
+    SsStreamCipher(&'static str),
+}
+
+impl Remark {
+    /// The code its warning goes under.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Remark::VmessAead => codes::W_PARAM_NOT_EFFECTIVE,
+            Remark::SsStreamCipher(_) => codes::W_STREAM_CIPHER,
+        }
+    }
+
+    /// The load warning.
+    pub fn warning(&self) -> String {
+        match self {
+            Remark::VmessAead => "`vmess-aead=false` has no effect: rurge always uses the AEAD handshake, which every server since V2Ray 4.28.1 accepts".to_string(),
+            Remark::SsStreamCipher(method) => format!(
+                "`ss` method `{method}` is a stream cipher without integrity protection; prefer an AEAD method"
+            ),
+        }
+    }
+
+    /// The warning about a group's imported policies.
+    pub fn imported(&self) -> String {
+        match self {
+            Remark::VmessAead => {
+                "imported `vmess` policies without `vmess-aead=true` use the AEAD handshake"
+                    .to_string()
+            }
+            Remark::SsStreamCipher(method) => format!(
+                "imported `ss` policies use the stream cipher `{method}`, which has no integrity protection"
+            ),
+        }
     }
 }
 
@@ -301,6 +342,7 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     let mut r = ParamReader::new(policy);
     let mut notes = Notes::default();
     let mut not_implemented = None;
+    let mut remarks = Vec::new();
     let (mut common, proto) = match policy.kind {
         PolicyKind::Direct => {
             let common = read_common(&mut r, Applies::Direct, &mut notes);
@@ -385,9 +427,10 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
         PolicyKind::Vmess => {
             let common = read_common(&mut r, Applies::Proxy, &mut notes);
             let read = vmess::read_vmess(&mut r, env.keystore);
-            // the rest of the line is still checked; it just has no spec
+            // rurge speaks the AEAD handshake only: the line gets it whatever
+            // it asks for (phase 2 M8 design 4.2)
             if !read.aead {
-                not_implemented = Some(NotImplemented::LegacyVmess);
+                remarks.push(Remark::VmessAead);
             }
             (common, ProtoSpec::Vmess(read.spec))
         }
@@ -474,6 +517,24 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
         }
         _ => return SpecOutcome::default(),
     };
+    // `ecn` marks the packets of a QUIC connection: the arms of the
+    // protocols over QUIC took it off the list. One over TCP sends no
+    // packets of its own to mark (manual), so there it does not apply.
+    // `wireguard` alone is left its "no effect yet" (phase 2 M5 design,
+    // M5-D6).
+    if !matches!(proto, ProtoSpec::WireGuard(_)) && notes.inert.contains(&"ecn") {
+        notes.inert.retain(|name| *name != "ecn");
+        let kind = policy.kind.keyword();
+        let which = match &proto {
+            ProtoSpec::TrustTunnel(_) => " without `h3=true`",
+            _ => "",
+        };
+        r.warn(
+            codes::W_PARAM_NOT_APPLICABLE,
+            format!("`ecn` does not apply to `{kind}` policies{which}; ignored"),
+        );
+        common.ecn = Tristate::Auto;
+    }
     let mut shadow_tls = None;
     if !matches!(proto, ProtoSpec::Direct | ProtoSpec::Reject(_)) {
         shadow_tls = match &proto {
@@ -526,12 +587,17 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
         shadow_tls,
         span: policy.span.clone(),
     });
+    // a remark is about how the policy is built: no policy, nothing to say
+    if spec.is_none() {
+        remarks.clear();
+    }
     SpecOutcome {
         spec,
         diagnostics,
         inert: notes.inert,
         ios_only: notes.ios_only,
         not_implemented: not_implemented.filter(|_| !failed),
+        remarks,
     }
 }
 
@@ -703,12 +769,31 @@ mod tests {
     }
 
     /// An `external` line: no server, no port; what does not work yet is said
-    /// once per load (`W0029`), and `tfo` only as not applicable (M4 design 4.4).
+    /// once per load (`W0029`), and `tfo` and `ecn` only as not applicable
+    /// (M4 design 4.4).
     #[test]
     fn an_external_line() {
         let o = outcome(
             "X",
             "external, exec=/usr/bin/ssh, args=-D, args=1080, local-port=1080, addresses=10.0.0.1, udp-relay=true, tfo=true, ecn=on",
+        );
+        let found: Vec<(&str, &str)> = o
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `X`: `tfo` does not apply to `external` policies; ignored"
+                ),
+                (
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "policy `X`: `ecn` does not apply to `external` policies; ignored"
+                ),
+            ]
         );
         let spec = o.spec.expect("an external spec");
         let ProtoSpec::External(external) = &spec.proto else {
@@ -716,7 +801,7 @@ mod tests {
         };
         assert_eq!(external.args.expose(), &["-D", "1080"]);
         assert_eq!((spec.server, spec.port), (None, None));
-        assert_eq!(o.inert, ["ecn", "addresses"]);
+        assert_eq!(o.inert, ["addresses"]);
         assert!(external.udp_relay);
         assert_eq!(spec.proto.keystore_item(), None);
         let o = outcome(
@@ -936,21 +1021,117 @@ mod tests {
         assert!(!anytls.reuse && spec.proto.tls().is_some());
     }
 
+    /// rurge speaks the AEAD handshake only: a line that does not ask for it
+    /// gets it all the same, and the loader says so once (phase 2 M8 design
+    /// 4.2). `vmess-aead=false` is the default written out.
     #[test]
-    fn a_vmess_line_without_the_aead_handshake_has_no_spec() {
+    fn a_vmess_line_without_vmess_aead_uses_the_aead_handshake() {
         let id = "0233d11c-15a4-47d3-ade3-48ffca0ce119";
-        let o = outcome("V", &format!("vmess, h.test, 443, username={id}, ws=true"));
-        assert!(o.spec.is_none());
-        assert_eq!(o.not_implemented, Some(NotImplemented::LegacyVmess));
-        assert!(
-            o.diagnostics.is_empty(),
-            "the loader reports it, once: {:?}",
-            o.diagnostics
+        let asked = outcome(
+            "V",
+            &format!("vmess, h.test, 443, username={id}, ws=true, vmess-aead=true"),
         );
-        // a broken legacy line is an error like any other, and not "legacy"
+        assert!(asked.remarks.is_empty(), "{:?}", asked.remarks);
+        let asked = asked.spec.expect("a spec");
+        for written in ["", ", vmess-aead=false"] {
+            let o = outcome(
+                "V",
+                &format!("vmess, h.test, 443, username={id}, ws=true{written}"),
+            );
+            assert!(
+                o.diagnostics.is_empty(),
+                "the loader says it, once: {:?}",
+                o.diagnostics
+            );
+            assert_eq!(o.not_implemented, None, "{written}");
+            assert_eq!(o.remarks, [Remark::VmessAead], "{written}");
+            let spec = o.spec.unwrap_or_else(|| panic!("no spec: {written}"));
+            assert_eq!(spec.proto, asked.proto, "{written}");
+        }
+        // a broken line is an error like any other: nothing is built of it,
+        // so there is nothing to remark on
         let o = outcome("V", "vmess, h.test, 443, username=nope");
         assert!(o.spec.is_none() && o.not_implemented.is_none());
+        assert!(o.remarks.is_empty(), "{:?}", o.remarks);
         assert_eq!(o.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn a_remark_has_a_code_and_two_texts() {
+        let aead = Remark::VmessAead;
+        assert_eq!(aead.code(), codes::W_PARAM_NOT_EFFECTIVE);
+        assert_eq!(
+            aead.warning(),
+            "`vmess-aead=false` has no effect: rurge always uses the AEAD handshake, which every server since V2Ray 4.28.1 accepts"
+        );
+        assert_eq!(
+            aead.imported(),
+            "imported `vmess` policies without `vmess-aead=true` use the AEAD handshake"
+        );
+        let stream = Remark::SsStreamCipher("rc4-md5");
+        assert_eq!((stream.code(), codes::W_STREAM_CIPHER), ("W0031", "W0031"));
+        assert_eq!(
+            stream.warning(),
+            "`ss` method `rc4-md5` is a stream cipher without integrity protection; prefer an AEAD method"
+        );
+        assert_eq!(
+            stream.imported(),
+            "imported `ss` policies use the stream cipher `rc4-md5`, which has no integrity protection"
+        );
+    }
+
+    /// `ecn` marks the packets of a QUIC connection: a protocol over TCP has
+    /// none of its own to mark, so it does not apply there (phase 2 M8
+    /// design 4.5). It takes effect over QUIC, and `wireguard` only parses
+    /// it so far.
+    #[test]
+    fn ecn_does_not_apply_to_a_protocol_over_tcp() {
+        for (def, kind) in [
+            ("trojan, h.test, 443, password=p, ecn=on", "trojan"),
+            ("http, h.test, 80, ecn=off", "http"),
+            ("socks5-tls, h.test, 1080, ecn=auto", "socks5-tls"),
+            (
+                "ss, h.test, 8388, encrypt-method=aes-128-gcm, password=p, ecn=on",
+                "ss",
+            ),
+            ("snell, h.test, 443, psk=p, version=4, ecn=on", "snell"),
+            ("anytls, h.test, 443, password=p, ecn=on", "anytls"),
+            ("h2-connect, h.test, 443, ecn=on", "h2-connect"),
+            ("ssh, h.test, 22, username=u, password=p, ecn=on", "ssh"),
+        ] {
+            let o = outcome("P", def);
+            let found: Vec<(&str, &str)> = o
+                .diagnostics
+                .iter()
+                .map(|d| (d.code, d.message.as_str()))
+                .collect();
+            assert_eq!(
+                found,
+                [(
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    format!("policy `P`: `ecn` does not apply to `{kind}` policies; ignored")
+                        .as_str()
+                )],
+                "{def}"
+            );
+            assert!(o.inert.is_empty(), "{def}: {:?}", o.inert);
+            let spec = o.spec.unwrap_or_else(|| panic!("{def}: no spec"));
+            assert_eq!(spec.common.ecn, Tristate::Auto, "{def}");
+        }
+        // over QUIC it takes effect: nothing is said
+        let o = outcome("H", "hysteria2, h.test, 443, password=pw, ecn=off");
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert!(o.inert.is_empty(), "{:?}", o.inert);
+        assert_eq!(o.spec.expect("a spec").common.ecn, Tristate::Off);
+        // `wireguard` keeps its "parsed but has no effect"
+        let o = outcome("W", "wireguard, section-name=home, ecn=on");
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert_eq!(o.inert, ["ecn"]);
+        assert_eq!(o.spec.expect("a spec").common.ecn, Tristate::On);
+        // a wrong value is an error wherever it is written
+        let o = outcome("P", "trojan, h.test, 443, password=p, ecn=maybe");
+        assert!(o.spec.is_none());
+        assert_eq!(o.diagnostics[0].code, codes::E_INVALID_POLICY_PARAM);
     }
 
     /// An `ss` line is read and checked in full; a stream cipher has no
@@ -1070,11 +1251,12 @@ mod tests {
             why.imported(),
             "`snell` version 1 (the default when `version` is not written)"
         );
+        // version 6 is out of scope, not a matter of time: the text says why
         let o = outcome("N", "snell, h.test, 443, psk=pw, version=6");
         let why = o.not_implemented.expect("version 6");
         assert_eq!(
             why.warning(),
-            "`snell` version 6 is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT"
+            "`snell` version 6 is not supported: it is a beta protocol without a public specification; such policies behave as REJECT"
         );
         assert_eq!(why.note(), "snell v6");
         assert_eq!(why.imported(), "`snell` version 6");
@@ -1740,19 +1922,32 @@ mod tests {
         // no QUIC options of its own: port hopping does not apply
         assert!(spec.proto.quic().is_none());
 
-        // over HTTP/2 `ecn` and `tfo` are parsed but have no effect yet
+        // over HTTP/2 `tfo` is parsed but has no effect yet, and there is
+        // no QUIC packet for `ecn` to mark
         let o = outcome(
             "T",
             "trust-tunnel, h.test, 443, username=u, password=p, ecn=off, tfo=true",
         );
-        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
-        assert_eq!(o.inert, ["tfo", "ecn"]);
+        let found: Vec<(&str, &str)> = o
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [(
+                codes::W_PARAM_NOT_APPLICABLE,
+                "policy `T`: `ecn` does not apply to `trust-tunnel` policies without `h3=true`; ignored"
+            )]
+        );
+        assert_eq!(o.inert, ["tfo"]);
         let spec = o.spec.expect("a spec");
         let ProtoSpec::TrustTunnel(tt) = &spec.proto else {
             panic!("{:?}", spec.proto)
         };
         assert!(!tt.h3);
         assert_eq!(tt.tls.alpn, ["h2"]);
+        assert_eq!(spec.common.ecn, Tristate::Auto);
     }
 
     /// Shadow TLS wraps a TCP connection: a `trust-tunnel` has it over
