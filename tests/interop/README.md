@@ -33,7 +33,7 @@ xray、shadowsocks-rust、snell-server、TrustTunnel endpoint、tuic-server、ma
 - `RURGE_TEST_DNSPROXY`：AdGuard `dnsproxy` 可执行文件的路径，优先于 `PATH` 查找。
 - `RURGE_TEST_COREDNS`：`coredns` 可执行文件的路径，优先于 `PATH` 查找。
 - `RURGE_TEST_MIHOMO`：`mihomo` 可执行文件的路径，优先于 `PATH` 查找。
-- `RURGE_INTEROP_REQUIRED=1`：找不到二进制时让用例直接失败，而不是打印 `skipping …` 后跳过；对 sing-box、xray、shadowsocks-rust、dnsproxy、CoreDNS、mihomo 与 sshd 各夹具都生效，对 snell-server 与 masque-server 只在 Linux 上生效（它们只有 Linux 版），对 TrustTunnel endpoint 只在 Linux 与 macOS 上生效（它没有 Windows 版），对 tuic-server 只在 Linux 上生效（CI 只在 Linux 上装它）。CI 会设置它，本机一般不需要。
+- `RURGE_INTEROP_REQUIRED=1`：找不到二进制时让用例直接失败，而不是打印 `skipping …` 后跳过；对 sing-box、xray、shadowsocks-rust、dnsproxy、CoreDNS、mihomo 与 sshd 各夹具都生效，对 snell-server 与 masque-server 只在 Linux 上生效（它们只有 Linux 版），对 TrustTunnel endpoint 只在 Linux 与 macOS 上生效（它没有 Windows 版），对 tuic-server 只在 Linux 上生效（CI 只在 Linux 上装它）。本机一般不需要。CI 在工作流一级的 `env` 里设置它（`.github/workflows/ci.yml`，与 `RUSTUP_TOOLCHAIN` 并排），不由哪一个安装步骤设置：那样的话那一步一失败变量就没有了，全部互操作用例会不声不响地跳过。参照服务端的每个安装步骤（连同把 `RURGE_TEST_SSHD` 指向 `sshd` 的那一步）都带 `continue-on-error: true`：某个服务端装不上（下载失败、资产挪了地方）时任务不在那一步结束，要用它的用例各自以"找不到二进制"失败，其余的用例照常运行、照常上报。
 
 ## 覆盖范围
 

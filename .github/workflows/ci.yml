@@ -8,6 +8,11 @@ on:
 # rust-toolchain.toml's `stable`, which would pick the runner's latest.
 env:
   RUSTUP_TOOLCHAIN: 1.89.0
+  # An interoperability case whose reference server is missing fails instead
+  # of skipping, on the platforms the server is installed for (each fixture
+  # knows its own). Set here and not by an install step: were that step to
+  # fail, the variable would stay unset and every case would skip in silence.
+  RURGE_INTEROP_REQUIRED: 1
 jobs:
   check:
     strategy:
@@ -24,7 +29,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
+      # A reference server that cannot be installed — a download that fails,
+      # an asset that moved — costs its own cases and nothing else: the step
+      # does not end the job, RURGE_INTEROP_REQUIRED fails each case that
+      # needs the server, and everything else still runs and reports. The
+      # same goes for every install step below.
       - name: Install sing-box for the interoperability tests
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -56,8 +67,8 @@ jobs:
           chmod +x "$bin"
           if [ "$RUNNER_OS" = "Windows" ]; then bin=$(cygpath -w "$bin"); fi
           echo "RURGE_TEST_SING_BOX=$bin" >> "$GITHUB_ENV"
-          echo "RURGE_INTEROP_REQUIRED=1" >> "$GITHUB_ENV"
       - name: Install xray for the VMess interoperability tests
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -87,6 +98,7 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then bin=$(cygpath -w "$bin"); fi
           echo "RURGE_TEST_XRAY=$bin" >> "$GITHUB_ENV"
       - name: Install shadowsocks-rust for the Shadowsocks interoperability tests
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -120,6 +132,7 @@ jobs:
           echo "RURGE_TEST_SSSERVER=$bin" >> "$GITHUB_ENV"
       - name: Install snell-server for the Snell interoperability tests
         if: runner.os == 'Linux'
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -141,6 +154,7 @@ jobs:
           echo "RURGE_TEST_SNELL_SERVER=$bin" >> "$GITHUB_ENV"
       - name: Install the tuic 0.8.5 server for the TUIC v4 interoperability tests
         if: runner.os == 'Linux'
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -168,6 +182,7 @@ jobs:
           echo "RURGE_TEST_TUIC_SERVER=$PWD/tuic-server/tuic-server" >> "$GITHUB_ENV"
       - name: Install the TrustTunnel endpoint for the HTTP/2 and HTTP/3 interoperability tests
         if: runner.os != 'Windows'
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -196,6 +211,7 @@ jobs:
           echo "RURGE_TEST_TRUSTTUNNEL=$bin" >> "$GITHUB_ENV"
       - name: Install masque-server for the MASQUE interoperability tests
         if: runner.os == 'Linux'
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -216,6 +232,7 @@ jobs:
           chmod +x "$bin"
           echo "RURGE_TEST_MASQUE_SERVER=$bin" >> "$GITHUB_ENV"
       - name: Install dnsproxy for the DNS over QUIC and HTTP/3 interoperability tests
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -248,6 +265,7 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then bin=$(cygpath -w "$bin"); fi
           echo "RURGE_TEST_DNSPROXY=$bin" >> "$GITHUB_ENV"
       - name: Install CoreDNS for the DNS over QUIC and HTTP/3 interoperability tests
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -277,6 +295,7 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then bin=$(cygpath -w "$bin"); fi
           echo "RURGE_TEST_COREDNS=$bin" >> "$GITHUB_ENV"
       - name: Install mihomo for the Snell v1 to v3, Shadowsocks chacha20 and simple-obfs interoperability tests
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -317,6 +336,7 @@ jobs:
           echo "RURGE_TEST_MIHOMO=$bin" >> "$GITHUB_ENV"
       - name: Point the SSH interoperability tests at OpenSSH's sshd
         if: runner.os != 'Windows'
+        continue-on-error: true
         shell: bash
         run: |
           if [ ! -x /usr/sbin/sshd ]; then
