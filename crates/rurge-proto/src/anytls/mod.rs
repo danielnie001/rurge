@@ -3,7 +3,9 @@
 //! scheme's first padding, then a session layer of frames (`frame`) whose
 //! first writes are cut and padded the way the padding scheme says
 //! (`padding`). A session carries one stream at a time and is reused for the
-//! next one (`session`, `pool`); `reuse=false` closes it with its stream.
+//! next one (`session`, `pool`); `reuse=false` closes it with its stream. A
+//! reused session that leaves a new stream unanswered for three seconds is
+//! closed: it may have died in the pool.
 //!
 //! A wrong password cannot be told from a server that closes: it answers
 //! like a web site, and the stream ends in the relay.
@@ -28,10 +30,11 @@ use rurge_config::spec::{AnyTlsSpec, ShadowTlsOpts};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target};
 use rustls::RootCertStore;
-use session::{SchemeCell, Session, pick};
+use session::{SYNACK_TIMEOUT, SchemeCell, Session, pick};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 /// The target that asks the server for UDP over TCP, version 2 (sing's
@@ -52,6 +55,9 @@ pub struct AnyTlsOutbound {
     /// included) leaves no task behind.
     reaper: OnceLock<AbortOnDrop>,
     next_seq: AtomicU64,
+    /// What a server gets to answer a new stream on a reused session:
+    /// `SYNACK_TIMEOUT`, unless a test shortens it.
+    synack_timeout: Duration,
 }
 
 impl AnyTlsOutbound {
@@ -81,7 +87,18 @@ impl AnyTlsOutbound {
             pool: spec.reuse.then(Arc::<Pool>::default),
             reaper: OnceLock::new(),
             next_seq: AtomicU64::new(0),
+            synack_timeout: SYNACK_TIMEOUT,
         })
+    }
+
+    /// Gives the server another time than `SYNACK_TIMEOUT` to answer a new
+    /// stream on a reused session.
+    #[cfg(test)]
+    fn with_synack_timeout(self, synack_timeout: Duration) -> AnyTlsOutbound {
+        AnyTlsOutbound {
+            synack_timeout,
+            ..self
+        }
     }
 
     async fn new_session(&self, opts: &ConnectOpts) -> Result<Session, OutboundError> {
@@ -97,7 +114,7 @@ impl AnyTlsOutbound {
         io.write_all(&auth).await?;
         io.flush().await?;
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        Ok(Session::start(seq, io, self.scheme.clone()))
+        Ok(Session::start(seq, io, self.scheme.clone()).with_synack_timeout(self.synack_timeout))
     }
 
     async fn open(&self, address: &[u8], opts: &ConnectOpts) -> Result<BoxedStream, OutboundError> {
@@ -160,6 +177,11 @@ impl Outbound for AnyTlsOutbound {
 
     /// UDP over TCP, version 2 (sing's `uot`): a stream to the magic name,
     /// not in connect mode, each datagram with its address.
+    ///
+    /// The stream's request leaves with the first datagram, and the
+    /// reference server answers the stream once it has read it: on a reused
+    /// session, a carrier that sends nothing for `SYNACK_TIMEOUT` costs the
+    /// session.
     fn open_udp<'a>(
         &'a self,
         opts: &'a ConnectOpts,
@@ -565,6 +587,202 @@ mod tests {
         drop(pool);
         drop(out);
         assert!(weak.upgrade().is_none(), "the outbound owned the pool");
+    }
+
+    /// What a test that waits for a session to be given up gives its server
+    /// to answer a new stream in.
+    const ANSWER_WITHIN: Duration = Duration::from_millis(300);
+
+    /// `SYNACK_TIMEOUT` passes twice over on tokio's clock, which is paused
+    /// for the jump alone: the sockets go on in real time. The short sleep
+    /// after it is there for a watchdog the jump woke, should there be one,
+    /// to act before the test looks.
+    async fn the_limit_passes_twice() {
+        tokio::time::pause();
+        tokio::time::advance(SYNACK_TIMEOUT * 2).await;
+        tokio::time::resume();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    /// One stream over a new session of `out`, and the session back in the
+    /// pool.
+    async fn a_pooled_session(out: &AnyTlsOutbound, echo: SocketAddr) -> Arc<Pool> {
+        let mut s = connect(out, echo).await;
+        ping(&mut s, b"first").await;
+        drop(s);
+        let pool = out.pool.clone().unwrap();
+        eventually(|| pool.len() == 1, "pooled").await;
+        pool
+    }
+
+    fn sessions_and_sids(fake: &FakeAnyTls) -> Vec<(usize, u32)> {
+        fake.streams().iter().map(|s| (s.session, s.sid)).collect()
+    }
+
+    /// A pooled session whose server has gone without a reset: the next
+    /// stream's `cmdSYN` goes unanswered, and the session is closed for it
+    /// instead of leaving the stream to whoever times it out.
+    #[tokio::test]
+    async fn a_reused_session_that_leaves_a_new_stream_unanswered_is_closed() {
+        let echo = echo_server().await;
+        let (fixture, fake) = server(AnyTlsScript {
+            unanswered: Some(2),
+            ..script("pw")
+        })
+        .await;
+        let out = outbound(&line(&fake, ""), &fixture).with_synack_timeout(ANSWER_WITHIN);
+        let pool = a_pooled_session(&out, echo).await;
+        let opened = tokio::time::Instant::now();
+        let mut s = connect(&out, echo).await;
+        let mut buf = [0u8; 1];
+        let err = tokio::time::timeout(Duration::from_secs(10), s.read(&mut buf))
+            .await
+            .expect("bounded")
+            .unwrap_err();
+        assert_eq!(err.to_string(), "anytls: the session is closed");
+        assert!(
+            opened.elapsed() >= ANSWER_WITHIN,
+            "closed after {:?}",
+            opened.elapsed()
+        );
+        let err = s.write_all(b"late").await.unwrap_err();
+        assert_eq!(err.to_string(), "anytls: the session is closed");
+        drop(s);
+        assert_eq!(pool.len(), 0, "a closed session is not pooled");
+        // the next request dials
+        let mut s = connect(&out, echo).await;
+        ping(&mut s, b"next").await;
+        assert_eq!(fake.sessions(), 2);
+        assert_eq!(sessions_and_sids(&fake), [(0, 1), (0, 2), (1, 1)]);
+    }
+
+    /// The stream is let go of before its answer came: the session, back in
+    /// the pool, still owes it, and is closed where it lies.
+    #[tokio::test]
+    async fn a_pooled_session_that_still_owes_an_answer_is_closed_too() {
+        let echo = echo_server().await;
+        let (fixture, fake) = server(AnyTlsScript {
+            unanswered: Some(2),
+            ..script("pw")
+        })
+        .await;
+        let out = outbound(&line(&fake, ""), &fixture).with_synack_timeout(ANSWER_WITHIN);
+        let pool = a_pooled_session(&out, echo).await;
+        let opened = tokio::time::Instant::now();
+        drop(connect(&out, echo).await);
+        assert_eq!(pool.len(), 1, "back in the pool at once");
+        eventually(
+            || {
+                pool.reap(tokio::time::Instant::now());
+                pool.len() == 0
+            },
+            "the session that owed an answer stayed in the pool",
+        )
+        .await;
+        assert!(
+            opened.elapsed() >= ANSWER_WITHIN,
+            "closed after {:?}",
+            opened.elapsed()
+        );
+        let mut s = connect(&out, echo).await;
+        ping(&mut s, b"next").await;
+        assert_eq!(fake.sessions(), 2);
+    }
+
+    /// A session's first stream is not watched: no pooled session, dead
+    /// for who knows how long, is behind it.
+    #[tokio::test]
+    async fn the_first_stream_of_a_session_may_go_unanswered() {
+        let echo = echo_server().await;
+        let (fixture, fake) = server(AnyTlsScript {
+            unanswered: Some(1),
+            ..script("pw")
+        })
+        .await;
+        let out = outbound(&line(&fake, ""), &fixture);
+        let mut s = connect(&out, echo).await;
+        ping(&mut s, b"first").await;
+        the_limit_passes_twice().await;
+        ping(&mut s, b"still here").await;
+        assert_eq!(fake.sessions(), 1);
+    }
+
+    /// Two streams over one session of a server run by `script`: the
+    /// second still works when the limit on its answer has passed twice
+    /// over.
+    async fn the_second_stream_outlives_the_limit(script: AnyTlsScript) {
+        let echo = echo_server().await;
+        let (fixture, fake) = server(script).await;
+        let out = outbound(&line(&fake, ""), &fixture);
+        a_pooled_session(&out, echo).await;
+        let mut s = connect(&out, echo).await;
+        ping(&mut s, b"second").await;
+        the_limit_passes_twice().await;
+        ping(&mut s, b"still here").await;
+        assert_eq!(fake.sessions(), 1);
+        assert_eq!(sessions_and_sids(&fake), [(0, 1), (0, 2)]);
+    }
+
+    /// A version 1 server never answers a `cmdSYN`: its sessions are not
+    /// watched, whether its settings name the version or it sends none.
+    #[tokio::test]
+    async fn a_version_one_server_is_not_expected_to_answer() {
+        the_second_stream_outlives_the_limit(AnyTlsScript {
+            version: Some(1),
+            unanswered: Some(2),
+            ..script("pw")
+        })
+        .await;
+        the_second_stream_outlives_the_limit(AnyTlsScript {
+            v1: true,
+            ..script("pw")
+        })
+        .await;
+    }
+
+    /// The answer came — it is in front of the echo on the wire —: nothing
+    /// is owed, and the stream goes on past the limit.
+    #[tokio::test]
+    async fn a_stream_that_was_answered_outlives_the_limit() {
+        the_second_stream_outlives_the_limit(script("pw")).await;
+    }
+
+    /// A refusal is an answer too: the stream fails with the server's text,
+    /// as it does on a new session, and the session is kept.
+    #[tokio::test]
+    async fn a_refusal_answers_a_new_stream_on_a_reused_session() {
+        async fn refused(out: &AnyTlsOutbound, pool: &Pool) {
+            let mut s = connect(out, "127.0.0.1:9".parse().unwrap()).await;
+            let mut buf = [0u8; 1];
+            let err = tokio::time::timeout(Duration::from_secs(10), s.read(&mut buf))
+                .await
+                .expect("bounded")
+                .unwrap_err();
+            assert_eq!(err.to_string(), "anytls: dial tcp: no route");
+            drop(s);
+            eventually(
+                || pool.len() == 1,
+                "a refused stream does not cost the session",
+            )
+            .await;
+        }
+        let (fixture, fake) = server(AnyTlsScript {
+            refuse: Some("dial tcp: no route".into()),
+            ..script("pw")
+        })
+        .await;
+        let out = outbound(&line(&fake, ""), &fixture);
+        let pool = out.pool.clone().unwrap();
+        // the second rides the pooled session: its refusal is the answer
+        // the session waits for
+        refused(&out, &pool).await;
+        refused(&out, &pool).await;
+        the_limit_passes_twice().await;
+        pool.reap(tokio::time::Instant::now());
+        assert_eq!(pool.len(), 1, "closed over a stream that was answered");
+        refused(&out, &pool).await;
+        assert_eq!(fake.sessions(), 1);
+        assert_eq!(sessions_and_sids(&fake), [(0, 1), (0, 2), (0, 3)]);
     }
 
     #[tokio::test]

@@ -32,6 +32,11 @@ pub struct AnyTlsScript {
     pub heartbeat: bool,
     /// Speak protocol version 1: no `cmdServerSettings`, no `cmdSYNACK`.
     pub v1: bool,
+    /// The version `cmdServerSettings` names: 2 unless set.
+    pub version: Option<u32>,
+    /// Send no `cmdSYNACK` for this stream — the server's first is 1,
+    /// whatever session carries it — and serve it like any other.
+    pub unanswered: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -209,7 +214,8 @@ async fn serve(
                     }
                 }
                 if !script.v1 {
-                    let _ = out.send(frame::frame(frame::SERVER_SETTINGS, 0, b"v=2"));
+                    let settings = format!("v={}", script.version.unwrap_or(2));
+                    let _ = out.send(frame::frame(frame::SERVER_SETTINGS, 0, settings.as_bytes()));
                 }
                 if script.heartbeat {
                     let _ = out.send(frame::frame(frame::HEART_REQUEST, 0, &[]));
@@ -232,15 +238,25 @@ async fn serve(
                     let Some((atyp, host, port, used)) = parse_addr(&data) else {
                         return Ok(());
                     };
-                    seen.streams.lock().expect("streams").push(RecordedStream {
-                        session,
-                        sid,
-                        atyp,
-                        host: host.clone(),
-                        port,
-                    });
+                    let nth = {
+                        let mut streams = seen.streams.lock().expect("streams");
+                        streams.push(RecordedStream {
+                            session,
+                            sid,
+                            atyp,
+                            host: host.clone(),
+                            port,
+                        });
+                        streams.len()
+                    };
+                    // the stream's `cmdSYNACK`, unless the script keeps it back
+                    let synack = |text: &[u8]| {
+                        if script.unanswered != Some(nth) {
+                            let _ = out.send(frame::frame(frame::SYNACK, sid, text));
+                        }
+                    };
                     if let Some(text) = &script.refuse {
-                        let _ = out.send(frame::frame(frame::SYNACK, sid, text.as_bytes()));
+                        synack(text.as_bytes());
                         live.remove(&sid);
                         continue;
                     }
@@ -268,15 +284,14 @@ async fn serve(
                     };
                     let Some(upstream) = upstream else {
                         if !script.v1 {
-                            let _ =
-                                out.send(frame::frame(frame::SYNACK, sid, b"connection refused"));
+                            synack(b"connection refused");
                         }
                         let _ = out.send(frame::frame(frame::FIN, sid, &[]));
                         live.remove(&sid);
                         continue;
                     };
                     if !script.v1 {
-                        let _ = out.send(frame::frame(frame::SYNACK, sid, &[]));
+                        synack(&[]);
                     }
                     let (mut from_upstream, mut to_upstream) = upstream;
                     to_upstream.write_all(&data[used..]).await?;

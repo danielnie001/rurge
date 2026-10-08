@@ -153,6 +153,61 @@ async fn an_anytls_upstream_carries_two_requests_over_one_session() {
     assert!(h.dns.queries().is_empty(), "rurge never looked the name up");
 }
 
+/// A pooled AnyTLS session whose server has stopped answering — gone, and
+/// no reset came —: the request that reuses it fails when the three seconds
+/// a reused session gives a new stream are up, not at the relay's idle
+/// timeout (ten minutes here), and the request after it dials.
+#[tokio::test]
+async fn a_request_on_a_half_dead_anytls_session_fails_within_seconds() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let script = AnyTlsScript {
+        unanswered: Some(2),
+        ..AnyTlsScript::default()
+    };
+    let (upstream, params) = anytls_upstream_run_by(script, echo).await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "A = anytls, 127.0.0.1, {}, {params}",
+            upstream.addr().port()
+        ),
+        rules: "DOMAIN,target.test,A",
+        ..Profile::default()
+    })
+    .await;
+    // the first request leaves its session in the pool
+    let first = one_session(&h, 1, b"first").await;
+    assert!(first.error.is_none(), "{:?}", first.error);
+    // the second is carried by that session, and its stream goes unanswered
+    let mut tunnel = connect_via_http(h.http(), "target.test:7").await;
+    assert_eq!(upstream.sessions(), 1, "the second request dialled");
+    // Three seconds pass for the session, not for the test: tokio's clock
+    // is paused for the jump alone, and the sockets go on in real time.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(3)).await;
+    tokio::time::resume();
+    let mut rest = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(10), tunnel.read_to_end(&mut rest))
+        .await
+        .expect("the tunnel ends within the bound");
+    let second = the_records(&h, 2).await[1].clone();
+    assert_eq!(
+        second.error.as_deref(),
+        Some("anytls: the session is closed")
+    );
+    // the third finds no session to reuse
+    let third = one_session(&h, 3, b"third").await;
+    assert!(third.error.is_none(), "{:?}", third.error);
+    assert_eq!(upstream.sessions(), 2);
+    assert_eq!(
+        upstream
+            .streams()
+            .iter()
+            .map(|s| (s.session, s.sid))
+            .collect::<Vec<_>>(),
+        [(0, 1), (0, 2), (1, 1)]
+    );
+}
+
 #[tokio::test]
 async fn the_new_protocols_work_at_either_end_of_a_chain() {
     let echo = rurge_proto::testing::echo_server().await;

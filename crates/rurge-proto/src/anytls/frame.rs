@@ -12,9 +12,8 @@ pub(crate) const UPDATE_PADDING_SCHEME: u8 = 6;
 pub(crate) const SYNACK: u8 = 7;
 pub(crate) const HEART_REQUEST: u8 = 8;
 pub(crate) const HEART_RESPONSE: u8 = 9;
-/// Only a server sends it (here: the fake one); a client reads it like any
-/// other frame it has no use for.
-#[cfg(any(test, feature = "testing"))]
+/// The server's answer to `cmdSettings`: `key=value` lines, `v` its
+/// protocol version.
 pub(crate) const SERVER_SETTINGS: u8 = 10;
 
 pub(crate) const HEADER: usize = 7;

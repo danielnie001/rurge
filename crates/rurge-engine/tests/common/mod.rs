@@ -553,6 +553,11 @@ pub async fn vmess_upstream(tls: bool, ws: bool, to: SocketAddr) -> (FakeVmess, 
 }
 
 pub async fn anytls_upstream(to: SocketAddr) -> (FakeAnyTls, String) {
+    anytls_upstream_run_by(AnyTlsScript::default(), to).await
+}
+
+/// As `anytls_upstream`, the server doing what else `script` says.
+pub async fn anytls_upstream_run_by(script: AnyTlsScript, to: SocketAddr) -> (FakeAnyTls, String) {
     let fixture = TlsFixture::new(&["127.0.0.1"]);
     let params = format!(
         "password=s3same, server-cert-fingerprint-sha256={}",
@@ -561,7 +566,7 @@ pub async fn anytls_upstream(to: SocketAddr) -> (FakeAnyTls, String) {
     let script = AnyTlsScript {
         password: "s3same".into(),
         connect_to: Some(to),
-        ..AnyTlsScript::default()
+        ..script
     };
     (FakeAnyTls::spawn(script, fixture).await, params)
 }

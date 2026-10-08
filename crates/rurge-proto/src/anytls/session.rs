@@ -11,6 +11,13 @@
 //! writes, and the stream's own `poll_flush` has nothing to do. AnyTLS has no
 //! half-close: `shutdown` sends `cmdFIN`, which ends the stream in both
 //! directions (sing-box does the same).
+//!
+//! A pooled session can be dead with no sign of it: the server is gone and
+//! no reset came. As the reference client does, a session that is reused
+//! expects a version 2 server's `cmdSYNACK` for the new stream within
+//! `SYNACK_TIMEOUT` and is closed without it. The server answers once it
+//! has reached the stream's target, so a target that takes longer than that
+//! costs the session too: from here the two look the same.
 
 use super::frame::{self, HEADER, MAX_DATA};
 use super::padding::{Scheme, shape};
@@ -20,16 +27,21 @@ use crate::task::AbortOnDrop;
 use rurge_net::connector::BoxedStream;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker, ready};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 use tokio_util::sync::PollSender;
 
 /// Writes waiting for the task, and frames waiting for the stream's reader.
 const QUEUE: usize = 8;
 const CLOSED: &str = "anytls: the session is closed";
+/// How long a reused session may leave a new stream without its
+/// `cmdSYNACK` (the reference client's three seconds).
+pub(crate) const SYNACK_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The scheme of an outbound: shared by its sessions, replaced when the
 /// server pushes a new one.
@@ -79,6 +91,11 @@ struct Slot {
 struct Shared {
     closed: AtomicBool,
     slot: Mutex<Option<Slot>>,
+    /// The server's protocol version as its settings name it; 0 as long as
+    /// it has named none, which a version 1 server never does.
+    peer_version: AtomicU32,
+    /// The stream the server owes its `cmdSYNACK`, and until when.
+    owed: watch::Sender<Option<(u32, Instant)>>,
 }
 
 impl Shared {
@@ -110,10 +127,58 @@ impl Shared {
         }
     }
 
+    /// The server answered stream `sid`'s `cmdSYN`: nothing is owed any
+    /// more when that is the stream the session waits for. The late answer
+    /// to an earlier stream says nothing about this one (the reference
+    /// takes any).
+    fn answered(&self, sid: u32) {
+        self.owed.send_if_modified(|owed| {
+            let awaited = owed.is_some_and(|(stream, _)| stream == sid);
+            if awaited {
+                *owed = None;
+            }
+            awaited
+        });
+    }
+
     fn close(&self, why: String) {
         self.closed.store(true, Ordering::SeqCst);
         if let Some(slot) = self.slot.lock().expect("slot").take() {
             slot.state.set(End::Error(why));
+        }
+    }
+}
+
+/// The `v` of a settings text (`key=value` lines), when it is a number.
+fn version_in(settings: &[u8]) -> Option<u32> {
+    String::from_utf8_lossy(settings)
+        .lines()
+        .find_map(|line| line.strip_prefix("v="))?
+        .parse()
+        .ok()
+}
+
+/// Returns when the stream the server owes a `cmdSYNACK` has waited for it
+/// past its time.
+async fn unanswered(shared: &Shared) {
+    let mut owed = shared.owed.subscribe();
+    loop {
+        let deadline = owed.borrow_and_update().map(|(_, deadline)| deadline);
+        // `changed` never fails: `shared` holds the sender
+        match deadline {
+            // what is owed is looked at before the clock: an answer that
+            // came in with the deadline is an answer
+            Some(deadline) => {
+                if tokio::time::timeout_at(deadline, owed.changed())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            None => {
+                let _ = owed.changed().await;
+            }
         }
     }
 }
@@ -147,9 +212,13 @@ async fn read_loop(
         match command {
             frame::PSH => shared.deliver(sid, data).await,
             frame::FIN => shared.finish(sid, End::Fin),
-            frame::SYNACK if !data.is_empty() => {
-                let text = untrusted_text(&String::from_utf8_lossy(&data), 256);
-                shared.finish(sid, End::Error(format!("anytls: {text}")));
+            frame::SYNACK => {
+                shared.answered(sid);
+                // with a text, the answer is that the stream is refused
+                if !data.is_empty() {
+                    let text = untrusted_text(&String::from_utf8_lossy(&data), 256);
+                    shared.finish(sid, End::Error(format!("anytls: {text}")));
+                }
             }
             frame::ALERT => {
                 let text = untrusted_text(&String::from_utf8_lossy(&data), 256);
@@ -165,7 +234,12 @@ async fn read_loop(
                 // never wait here: a full queue means the writer is busy, which is life enough
                 let _ = replies.try_send(frame::frame(frame::HEART_RESPONSE, sid, &[]));
             }
-            // waste, the server's settings, a heart response, anything newer: read and dropped
+            frame::SERVER_SETTINGS => {
+                if let Some(version) = version_in(&data) {
+                    shared.peer_version.store(version, Ordering::SeqCst);
+                }
+            }
+            // waste, a heart response, anything newer: read and dropped
             _ => {}
         }
     }
@@ -212,6 +286,9 @@ pub(crate) struct Session {
     next_sid: u32,
     /// `cmdSettings` has not gone out yet.
     fresh: bool,
+    /// What the server gets to answer a stream opened on the session once
+    /// it is reused.
+    synack_timeout: Duration,
     _task: AbortOnDrop,
 }
 
@@ -225,10 +302,18 @@ impl Session {
             tokio::spawn(async move {
                 let (reader, writer) = tokio::io::split(io);
                 let why = tokio::select! {
-                    // an alert that arrives together with a write error is the better story
+                    // an alert that arrives together with a write error is the
+                    // better story, and an answer that is in is read before
+                    // its time is found to be up
                     biased;
                     why = read_loop(reader, &shared, &replies, &scheme) => why,
                     why = write_loop(writer, &mut queue, &scheme) => why,
+                    () = unanswered(&shared) => {
+                        tracing::debug!(
+                            "anytls: no answer to a new stream on a reused session; the session is closed"
+                        );
+                        CLOSED.to_string()
+                    }
                 };
                 if why != CLOSED {
                     // an alert: the text is already stripped and bounded
@@ -244,7 +329,17 @@ impl Session {
             scheme,
             next_sid: 0,
             fresh: true,
+            synack_timeout: SYNACK_TIMEOUT,
             _task: AbortOnDrop(task),
+        }
+    }
+
+    /// The session with another time than `SYNACK_TIMEOUT` for the server
+    /// to answer a new stream in: tests shorten it.
+    pub(crate) fn with_synack_timeout(self, synack_timeout: Duration) -> Session {
+        Session {
+            synack_timeout,
+            ..self
         }
     }
 
@@ -258,7 +353,9 @@ impl Session {
 
     /// Opens the next stream: `cmdSYN` and the target address leave in one
     /// write (with `cmdSettings` in front on a new session). The server's
-    /// `cmdSYNACK` is not awaited; a refusal shows up on the first read.
+    /// `cmdSYNACK` is not awaited; a refusal shows up on the first read, and
+    /// on a reused session so does an answer that does not come: the
+    /// session is closed.
     pub(crate) async fn open(
         mut self,
         address: &[u8],
@@ -286,6 +383,15 @@ impl Session {
         }
         frame::push(&mut packet, frame::SYN, sid, &[]);
         frame::push(&mut packet, frame::PSH, sid, address);
+        // A version 2 server answers every `cmdSYN`. The answer to the
+        // session's first is not waited for, as in the reference: no time
+        // in the pool lies behind that stream. Noted before the `cmdSYN` is
+        // queued, so that its answer finds what it answers.
+        if sid >= 2 && self.shared.peer_version.load(Ordering::SeqCst) >= 2 {
+            self.shared
+                .owed
+                .send_replace(Some((sid, Instant::now() + self.synack_timeout)));
+        }
         self.commands.send(packet).await.map_err(|_| closed())?;
         // The task may have ended between the pool's `is_closed()` look and
         // the slot assignment above: its `close()` has then already taken the
@@ -470,6 +576,100 @@ mod tests {
             .err()
             .expect("a dead session must not hand out a stream");
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(err.to_string(), CLOSED);
+    }
+
+    /// A target, as it follows `cmdSYN`.
+    const ADDRESS: &[u8] = &[1, 127, 0, 0, 1, 0, 80];
+
+    /// A session over a pipe whose far end has named its version, 2,
+    /// unasked, and that far end. The tests that use it run on tokio's
+    /// paused clock, which moves when everything waits: what they see
+    /// happens at the second they say.
+    async fn with_a_version_two_server() -> (Session, tokio::io::DuplexStream) {
+        let (near, mut far) = tokio::io::duplex(1 << 16);
+        let scheme: SchemeCell = Arc::new(Mutex::new(Arc::new(Scheme::default_scheme())));
+        let session = Session::start(1, Box::new(near), scheme);
+        far.write_all(&frame::frame(frame::SERVER_SETTINGS, 0, b"v=2"))
+            .await
+            .unwrap();
+        // a turn or two of the session's task
+        for _ in 0..100 {
+            if session.shared.peer_version.load(Ordering::SeqCst) == 2 {
+                return (session, far);
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the server's settings were never read");
+    }
+
+    #[test]
+    fn the_servers_version_is_the_v_of_its_settings() {
+        assert_eq!(version_in(b"v=2"), Some(2));
+        assert_eq!(version_in(b"padding-md5=0af1\nv=3\nx=y"), Some(3));
+        // no such line, or none that is a number: the version it had
+        for settings in [&b""[..], b"x=2", b"dev=2", b"v", b"v=", b"v=two", b"v=-2"] {
+            assert_eq!(
+                version_in(settings),
+                None,
+                "{}",
+                String::from_utf8_lossy(settings)
+            );
+        }
+    }
+
+    /// Not the session's first stream, even when the server is known by
+    /// then to answer: no pooled session, dead for who knows how long, is
+    /// behind it.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_stream_is_not_watched_whatever_the_servers_version() {
+        let (session, mut far) = with_a_version_two_server().await;
+        let shared = session.shared.clone();
+        let mut stream = session.open(ADDRESS, Weak::new()).await.unwrap();
+        tokio::time::sleep(SYNACK_TIMEOUT * 2).await;
+        assert!(!shared.closed.load(Ordering::SeqCst));
+        far.write_all(&frame::frame(frame::PSH, 1, b"late"))
+            .await
+            .unwrap();
+        let mut got = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(60), stream.read_exact(&mut got))
+            .await
+            .expect("bounded")
+            .unwrap();
+        assert_eq!(&got, b"late");
+    }
+
+    /// The session waits for the answer to the stream it carries, from the
+    /// moment that stream was opened: the answer to an earlier one, let go
+    /// of unanswered, is not it.
+    #[tokio::test(start_paused = true)]
+    async fn only_the_answer_to_the_stream_in_hand_counts_and_from_when_it_was_opened() {
+        let (session, mut far) = with_a_version_two_server().await;
+        let shared = session.shared.clone();
+        let pool = Arc::new(Pool::default());
+        let most_of_it = SYNACK_TIMEOUT * 2 / 3;
+        // the first stream is not watched
+        drop(session.open(ADDRESS, Arc::downgrade(&pool)).await.unwrap());
+        let session = pool.take().expect("pooled");
+        // the second is, and is let go of unanswered
+        drop(session.open(ADDRESS, Arc::downgrade(&pool)).await.unwrap());
+        let session = pool.take().expect("pooled");
+        tokio::time::sleep(most_of_it).await;
+        // the third starts the count again, and then the second's answer comes
+        let mut third = session.open(ADDRESS, Arc::downgrade(&pool)).await.unwrap();
+        far.write_all(&frame::frame(frame::SYNACK, 2, &[]))
+            .await
+            .unwrap();
+        tokio::time::sleep(most_of_it).await;
+        assert!(
+            !shared.closed.load(Ordering::SeqCst),
+            "closed when the second stream's time was up"
+        );
+        let mut buf = [0u8; 1];
+        let err = tokio::time::timeout(most_of_it, third.read(&mut buf))
+            .await
+            .expect("the second stream's answer was taken for the third's")
+            .unwrap_err();
         assert_eq!(err.to_string(), CLOSED);
     }
 }
