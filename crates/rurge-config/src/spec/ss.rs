@@ -239,7 +239,10 @@ pub fn read_ss(r: &mut ParamReader<'_>) -> SsRead {
             ),
         }
     }
-    let udp_relay = r.bool("udp-relay").unwrap_or(false);
+    let relay = r.bool("udp-relay");
+    // written, and an error already: whether UDP goes anywhere is open
+    let relay_unknown = relay.is_none() && r.has("udp-relay");
+    let udp_relay = relay.unwrap_or(false);
     let udp_port = match r.number::<u16>("udp-port", "a port from 1 to 65535") {
         Some(0) => {
             r.invalid("udp-port", "0", "a port from 1 to 65535");
@@ -247,10 +250,12 @@ pub fn read_ss(r: &mut ParamReader<'_>) -> SsRead {
         }
         // it says where UDP goes: without `udp-relay=true` none goes anywhere
         Some(_) if !udp_relay => {
-            r.warn(
-                codes::W_PARAM_NOT_APPLICABLE,
-                "`udp-port` only applies with `udp-relay=true`; ignored".to_string(),
-            );
+            if !relay_unknown {
+                r.warn(
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    "`udp-port` only applies with `udp-relay=true`; ignored".to_string(),
+                );
+            }
             None
         }
         port => port,
@@ -578,6 +583,15 @@ mod tests {
             read("ss, h.test, 8388, encrypt-method=none, udp-relay=true, udp-port=8389");
         assert!(!failed && diags.is_empty(), "{diags:?}");
         assert_eq!(got.spec.udp_port, Some(8389));
+        // a `udp-relay` that is an error already leaves open whether the
+        // port applies: no second word
+        let (_, failed, diags) =
+            read("ss, h.test, 8388, encrypt-method=none, udp-relay=maybe, udp-port=8389");
+        assert!(failed);
+        assert_eq!(
+            messages(&diags),
+            ["policy `P`: invalid value `maybe` for `udp-relay` (expected true or false)"]
+        );
     }
 
     #[test]

@@ -257,7 +257,7 @@ fn check_knows_vmess_and_anytls() {
     assert_eq!(out.matches("W0029").count(), 1, "{out}");
     assert!(
         out.contains(
-            "m2b.conf:5: `vmess-aead=false` has no effect: rurge always uses the AEAD handshake"
+            "m2b.conf:5: `vmess` without `vmess-aead=true` uses the AEAD handshake all the same: rurge has no other, and every server since V2Ray 4.28.1 accepts it\n"
         ),
         "{out}"
     );

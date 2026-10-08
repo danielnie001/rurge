@@ -1760,7 +1760,7 @@ Off = vmess, d.test, 443, username={id}, vmess-aead=false\n[Rule]\nFINAL,DIRECT\
             found,
             [(
                 codes::W_PARAM_NOT_EFFECTIVE,
-                "`vmess-aead=false` has no effect: rurge always uses the AEAD handshake, which every server since V2Ray 4.28.1 accepts",
+                "`vmess` without `vmess-aead=true` uses the AEAD handshake all the same: rurge has no other, and every server since V2Ray 4.28.1 accepts it",
                 Some(3)
             )]
         );
@@ -1971,6 +1971,52 @@ self-ip = 10.0.0.2
 peer = (public-key = {WG_PUBLIC}, allowed-ips = 10.0.0.0/24, endpoint = {endpoint})
 "
         )
+    }
+
+    /// A value that is an error is the one thing said of its parameter, and
+    /// of a parameter that depends on it: not also that `ecn` does not apply
+    /// to the protocol — or to a `trust-tunnel` whose `h3` is the error —,
+    /// that it has no effect yet on `wireguard`, or that `udp-port` wants a
+    /// `udp-relay=true`.
+    #[test]
+    fn a_parameter_that_is_an_error_already_gets_no_second_sentence() {
+        let loaded = load_text(&format!(
+            "[Proxy]\nT = trojan, t.test, 443, password=pw, ecn=maybe\n\
+S = ss, s.test, 8388, encrypt-method=aes-128-gcm, password=pw, udp-relay=maybe, udp-port=8389\n\
+W = wireguard, section-name=home, ecn=maybe\n\
+H = trust-tunnel, h.test, 443, username=u, password=pw, h3=maybe, ecn=on\n{}[Rule]\nFINAL,DIRECT\n",
+            wireguard_section("home", "192.0.2.1:51820")
+        ));
+        let found: Vec<(&str, &str, Option<u32>)> = loaded
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str(), d.span.as_ref().map(|s| s.line)))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `T`: invalid value `maybe` for `ecn` (expected auto / on / off / true / false)",
+                    Some(2)
+                ),
+                (
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `S`: invalid value `maybe` for `udp-relay` (expected true or false)",
+                    Some(3)
+                ),
+                (
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `W`: invalid value `maybe` for `ecn` (expected auto / on / off / true / false)",
+                    Some(4)
+                ),
+                (
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `H`: invalid value `maybe` for `h3` (expected true or false)",
+                    Some(5)
+                ),
+            ]
+        );
     }
 
     /// A `[WireGuard <name>]` section is typed, no longer a deferred one

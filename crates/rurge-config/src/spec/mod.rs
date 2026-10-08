@@ -249,7 +249,9 @@ impl Remark {
     /// The load warning.
     pub fn warning(&self) -> String {
         match self {
-            Remark::VmessAead => "`vmess-aead=false` has no effect: rurge always uses the AEAD handshake, which every server since V2Ray 4.28.1 accepts".to_string(),
+            // one text for a line that leaves the parameter out and for one
+            // that writes it `false`: it quotes neither
+            Remark::VmessAead => "`vmess` without `vmess-aead=true` uses the AEAD handshake all the same: rurge has no other, and every server since V2Ray 4.28.1 accepts it".to_string(),
             Remark::SsStreamCipher(method) => format!(
                 "`ss` cipher `{method}` is a stream cipher: it gives no integrity protection and is deprecated; use an AEAD cipher{}",
                 rc4_keystream(method)
@@ -538,10 +540,17 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             ProtoSpec::TrustTunnel(tunnel) if !tunnel.h3 => " without `h3=true`",
             _ => "",
         };
-        r.warn(
-            codes::W_PARAM_NOT_APPLICABLE,
-            format!("`ecn` does not apply to `{kind}` policies{which}; ignored"),
-        );
+        // an `h3` that is an error already leaves open what a `trust-tunnel`
+        // runs over: nothing more is said of the line
+        let open = matches!(proto, ProtoSpec::TrustTunnel(_))
+            && r.has("h3")
+            && policy.params.bool("h3").is_none();
+        if !open {
+            r.warn(
+                codes::W_PARAM_NOT_APPLICABLE,
+                format!("`ecn` does not apply to `{kind}` policies{which}; ignored"),
+            );
+        }
         common.ecn = Tristate::Auto;
     }
     let mut shadow_tls = None;
@@ -1069,9 +1078,11 @@ mod tests {
     fn a_remark_has_a_code_and_two_texts() {
         let aead = Remark::VmessAead;
         assert_eq!(aead.code(), codes::W_PARAM_NOT_EFFECTIVE);
+        // true of a line that never wrote the parameter as of one that wrote
+        // it `false`
         assert_eq!(
             aead.warning(),
-            "`vmess-aead=false` has no effect: rurge always uses the AEAD handshake, which every server since V2Ray 4.28.1 accepts"
+            "`vmess` without `vmess-aead=true` uses the AEAD handshake all the same: rurge has no other, and every server since V2Ray 4.28.1 accepts it"
         );
         assert_eq!(
             aead.imported(),
@@ -1148,10 +1159,30 @@ mod tests {
         assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
         assert_eq!(o.inert, ["ecn"]);
         assert_eq!(o.spec.expect("a spec").common.ecn, Tristate::On);
-        // a wrong value is an error wherever it is written
-        let o = outcome("P", "trojan, h.test, 443, password=p, ecn=maybe");
-        assert!(o.spec.is_none());
-        assert_eq!(o.diagnostics[0].code, codes::E_INVALID_POLICY_PARAM);
+        // a wrong value is an error wherever it is written, and the one word
+        // about it: neither that it does not apply nor, on `wireguard`,
+        // that it has no effect yet
+        for def in [
+            "trojan, h.test, 443, password=p, ecn=maybe",
+            "wireguard, section-name=home, ecn=maybe",
+        ] {
+            let o = outcome("P", def);
+            assert!(o.spec.is_none(), "{def}");
+            let found: Vec<(&str, &str)> = o
+                .diagnostics
+                .iter()
+                .map(|d| (d.code, d.message.as_str()))
+                .collect();
+            assert_eq!(
+                found,
+                [(
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `P`: invalid value `maybe` for `ecn` (expected auto / on / off / true / false)"
+                )],
+                "{def}"
+            );
+            assert!(o.inert.is_empty(), "{def}: {:?}", o.inert);
+        }
     }
 
     /// An `ss` line is read and checked in full. A stream cipher of the
@@ -2022,6 +2053,26 @@ mod tests {
         assert!(!tt.h3);
         assert_eq!(tt.tls.alpn, ["h2"]);
         assert_eq!(spec.common.ecn, Tristate::Auto);
+
+        // an `h3` that is an error already leaves open which of the two it
+        // runs over: nothing is said of `ecn`
+        let o = outcome(
+            "T",
+            "trust-tunnel, h.test, 443, username=u, password=p, h3=maybe, ecn=off",
+        );
+        let found: Vec<(&str, &str)> = o
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [(
+                codes::E_INVALID_POLICY_PARAM,
+                "policy `T`: invalid value `maybe` for `h3` (expected true or false)"
+            )]
+        );
+        assert!(o.spec.is_none());
     }
 
     /// Shadow TLS wraps a TCP connection: a `trust-tunnel` has it over

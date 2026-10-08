@@ -171,8 +171,10 @@ pub(crate) fn read_common(
             None => r.invalid("tos", v, "0-255 or 0x00-0xff"),
         }
     }
-    let ecn_present = r.has("ecn");
-    let mut ecn = r.choice("ecn", &TRISTATES).unwrap_or_default();
+    // `None` when it is not written, and when its value is an error: that
+    // is then all there is to say about it
+    let ecn_read = r.choice("ecn", &TRISTATES);
+    let mut ecn = ecn_read.unwrap_or_default();
     let block_quic = r.choice("block-quic", &TRISTATES).unwrap_or_default();
     let mut test_url = None;
     if let Some(v) = r.str("test-url") {
@@ -228,7 +230,7 @@ pub(crate) fn read_common(
             ("tfo", tfo),
             // for `to_spec` to settle, which knows the protocol: it stays on
             // the list for `wireguard` only
-            ("ecn", ecn_present && applies == Applies::Proxy),
+            ("ecn", ecn_read.is_some() && applies == Applies::Proxy),
         ];
         notes
             .inert
@@ -358,6 +360,9 @@ mod tests {
                 diags[0].message
             );
         }
+        // an `ecn` that is an error is not noted for `to_spec` to speak of
+        let (_, notes, _) = read("http, h, 1, ecn=maybe", Applies::Proxy);
+        assert!(notes.inert.is_empty(), "{:?}", notes.inert);
     }
 
     #[test]
