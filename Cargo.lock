@@ -3273,12 +3273,14 @@ name = "rurge-dns"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "base64",
  "bytes",
  "criterion",
  "hickory-proto",
  "http",
  "http-body-util",
  "lru",
+ "percent-encoding",
  "quinn",
  "rcgen",
  "rurge-config",

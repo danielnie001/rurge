@@ -4,10 +4,13 @@
 //! caller's ID is restored on the reply.
 
 use super::{Upstream, UpstreamError};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
-use http::header::{ACCEPT, CONTENT_TYPE};
-use http::{HeaderMap, Request, StatusCode};
+use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use http::{HeaderMap, HeaderValue, Request, StatusCode};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use percent_encoding::percent_decode_str;
 use rurge_net::BoxFuture;
 use rurge_net::http::{HttpClient, HttpError};
 use std::sync::Arc;
@@ -63,18 +66,43 @@ pub(super) fn check_body(body: &[u8]) -> Result<(), UpstreamError> {
 
 pub struct DohUpstream {
     name: String,
+    /// Where the requests go: the URL without a user name and a password.
     url: Url,
+    /// What the URL's user name and password are sent as, when it has them.
+    authorization: Option<HeaderValue>,
     http: Arc<HttpClient>,
 }
 
 impl DohUpstream {
-    pub fn new(url: Url, http: Arc<HttpClient>) -> DohUpstream {
+    pub fn new(mut url: Url, http: Arc<HttpClient>) -> DohUpstream {
+        let name = super::doh_name(&url);
+        let authorization = basic_authorization(&url);
+        // an https URL has the authority these belong to: neither fails
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
         DohUpstream {
-            name: super::doh_name(&url),
+            name,
             url,
+            authorization,
             http,
         }
     }
+}
+
+/// `Basic base64(user:password)` (RFC 7617) of the user name and the
+/// password `url` carries, percent-decoded; `None` without either. HTTP has
+/// no other place for them: a request's target takes none (RFC 9110 4.2.4),
+/// and HTTP/2 forbids them in `:authority` (RFC 9113 8.3.1).
+fn basic_authorization(url: &Url) -> Option<HeaderValue> {
+    if url.username().is_empty() && url.password().is_none() {
+        return None;
+    }
+    let mut pair = percent_decode_str(url.username()).collect::<Vec<u8>>();
+    pair.push(b':');
+    pair.extend(percent_decode_str(url.password().unwrap_or_default()));
+    let mut value = HeaderValue::from_str(&format!("Basic {}", STANDARD.encode(pair))).ok()?;
+    value.set_sensitive(true);
+    Some(value)
 }
 
 impl Upstream for DohUpstream {
@@ -97,9 +125,13 @@ impl Upstream for DohUpstream {
             let mut body = wire.to_vec();
             body[0] = 0;
             body[1] = 0;
-            let req = Request::post(self.url.as_str())
+            let mut req = Request::post(self.url.as_str())
                 .header(CONTENT_TYPE, DNS_MESSAGE)
-                .header(ACCEPT, DNS_MESSAGE)
+                .header(ACCEPT, DNS_MESSAGE);
+            if let Some(authorization) = &self.authorization {
+                req = req.header(AUTHORIZATION, authorization);
+            }
+            let req = req
                 .body(Full::new(Bytes::from(body)))
                 .map_err(|e| UpstreamError::Http(e.to_string()))?;
             let timeout = deadline.saturating_duration_since(Instant::now());
@@ -284,6 +316,78 @@ mod tests {
                 "x".repeat(195)
             )))
         );
+    }
+
+    /// A user name and a password in the URL go as `Authorization: Basic`
+    /// (RFC 7617), percent-decoded, and leave the request's target: HTTP
+    /// has no other place for them, and HTTP/2 forbids them in `:authority`
+    /// (RFC 9113 8.3.1). A URL without them sends no such header.
+    #[tokio::test]
+    async fn a_urls_user_name_and_password_go_as_basic_authorization() {
+        for tls in [false, true] {
+            let server = if tls {
+                TestServer::spawn_tls().await
+            } else {
+                TestServer::spawn().await
+            };
+            server.set("/dns-query", vec![0u8; 12]);
+            server.set_header("/dns-query", "content-type", "application/dns-message");
+            let mut url = server.url("/dns-query");
+            url.set_username("al ice").unwrap();
+            url.set_password(Some("s3cret:doh")).unwrap();
+            assert_eq!(url.username(), "al%20ice", "the URL holds them encoded");
+            let up = DohUpstream::new(url, client(tls));
+            up.query(&header_with_id(7), deadline(3000)).await.unwrap();
+            let plain = DohUpstream::new(server.url("/dns-query"), client(tls));
+            plain
+                .query(&header_with_id(8), deadline(3000))
+                .await
+                .unwrap();
+            let requests = server.requests();
+            assert_eq!(
+                requests[0].header("authorization"),
+                // base64("al ice:s3cret:doh")
+                Some("Basic YWwgaWNlOnMzY3JldDpkb2g="),
+                "tls: {tls}"
+            );
+            assert_eq!(requests[1].header("authorization"), None, "tls: {tls}");
+            for request in &requests {
+                for (name, value) in &request.headers {
+                    assert!(
+                        name == "authorization" || !value.contains("s3cret"),
+                        "tls: {tls}: {name}: {value}"
+                    );
+                    assert!(!value.contains('@'), "tls: {tls}: {name}: {value}");
+                }
+            }
+        }
+    }
+
+    /// A redirect is an answer that is none, not somewhere to go next: the
+    /// credentials of the URL are never carried to where a server points.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed() {
+        let elsewhere = TestServer::spawn().await;
+        elsewhere.set("/dns-query", vec![0u8; 12]);
+        elsewhere.set_header("/dns-query", "content-type", "application/dns-message");
+        let server = TestServer::spawn().await;
+        server.set("/dns-query", vec![0u8; 12]);
+        server.set_status("/dns-query", 307);
+        server.set_header(
+            "/dns-query",
+            "location",
+            elsewhere.url("/dns-query").as_str(),
+        );
+        let mut url = server.url("/dns-query");
+        url.set_username("alice").unwrap();
+        url.set_password(Some("s3cret")).unwrap();
+        let up = DohUpstream::new(url, client(false));
+        assert!(matches!(
+            up.query(&header_with_id(9), deadline(2000)).await,
+            Err(UpstreamError::Http(_))
+        ));
+        assert_eq!(server.requests().len(), 1);
+        assert!(elsewhere.requests().is_empty());
     }
 
     /// A user name and a password in the URL stay out of the upstream's

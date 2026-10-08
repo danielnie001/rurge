@@ -66,8 +66,8 @@ pub enum UpstreamSpec {
         port: u16,
     },
     /// DNS over HTTPS: the URL as written. It may carry a user name and a
-    /// password, which go where its requests take them and into no text
-    /// (`doh_name`).
+    /// password, which its requests send as `Authorization: Basic`
+    /// (`doh::DohUpstream`) and no text shows (`doh_name`).
     Https(Url),
     /// DNS over dedicated QUIC (RFC 9250): `quic://host[:port]`, port 853
     /// unless it says.
@@ -117,13 +117,17 @@ fn host_port(rest: &str, default_port: u16) -> Result<(String, u16), String> {
         (rest.to_string(), None)
     };
     let port = match port {
-        Some(p) => p
-            .parse::<u16>()
-            .map_err(|_| format!("invalid port `{p}`"))?,
+        // not quoted: the caller quotes the upstream it is in
+        Some(p) => p.parse::<u16>().map_err(|_| "invalid port".to_string())?,
         None => default_port,
     };
     Ok((host.trim_end_matches('.').to_ascii_lowercase(), port))
 }
+
+/// What may end a user name and a password: the `@`, and the fullwidth `＠`
+/// (U+FF20), which whatever maps a host name before resolving it reads as
+/// one.
+const AT: [char; 2] = ['@', '＠'];
 
 /// The upstream `s` as an error may quote it, `rest` being what follows its
 /// scheme: as written without an `@`, else its scheme and what follows the
@@ -132,8 +136,12 @@ fn host_port(rest: &str, default_port: u16) -> Result<(String, u16), String> {
 /// them, which ends the authority early —, so the `@` is looked for in all
 /// of `rest`.
 fn quoted(s: &str, rest: &str) -> String {
-    match rest.rfind('@') {
-        Some(at) => format!("{}{}", &s[..s.len() - rest.len()], &rest[at + 1..]),
+    match rest.char_indices().rfind(|(_, c)| AT.contains(c)) {
+        Some((at, sign)) => format!(
+            "{}{}",
+            &s[..s.len() - rest.len()],
+            &rest[at + sign.len_utf8()..]
+        ),
         None => s.to_string(),
     }
 }
@@ -154,7 +162,7 @@ fn userinfo_refused(s: &str, rest: &str, what: &str) -> String {
 /// digits and goes on with a `/` would pass for a port and a path —, no
 /// fragment, `DEFAULT_H3_PATH` when it names no path.
 fn h3_url(s: &str, rest: &str) -> Result<Url, String> {
-    if rest.contains('@') {
+    if rest.contains(AT) {
         return Err(userinfo_refused(s, rest, "an h3:// URL"));
     }
     let mut url = Url::parse(&format!("https://{rest}")).map_err(|e| format!("`{s}`: {e}"))?;
@@ -190,6 +198,14 @@ impl UpstreamSpec {
     pub fn parse(s: &str) -> Result<UpstreamSpec, String> {
         let s = s.trim();
         if let Some(rest) = strip_prefix_ci(s, "https://") {
+            // not the `@` a URL ends its user name and password with: they
+            // would be read as part of the host
+            if rest.contains('＠') {
+                return Err(format!(
+                    "`{}`: an https:// URL ends a user name and a password with `@`, not with the fullwidth `＠`",
+                    quoted(s, rest)
+                ));
+            }
             let url = Url::parse(s).map_err(|e| format!("`{}`: {e}", quoted(s, rest)))?;
             if url.host_str().is_none() {
                 return Err(format!("`{}`: missing host", quoted(s, rest)));
@@ -213,7 +229,7 @@ impl UpstreamSpec {
         // may hold the characters that end an authority, and there is no
         // telling where it does
         if let Some(rest) = strip_prefix_ci(s, "quic://") {
-            if rest.contains('@') {
+            if rest.contains(AT) {
                 return Err(userinfo_refused(s, rest, "a quic:// URL"));
             }
             // at most the one `/` of a URL that ends there
@@ -230,14 +246,14 @@ impl UpstreamSpec {
             return Ok(UpstreamSpec::Quic { host, port });
         }
         if let Some(rest) = strip_prefix_ci(s, "tls://") {
-            if rest.contains('@') {
+            if rest.contains(AT) {
                 return Err(userinfo_refused(s, rest, "a tls:// URL"));
             }
             let (host, port) = host_port(rest, 853).map_err(|e| format!("`{s}`: {e}"))?;
             return Ok(UpstreamSpec::Tls { host, port });
         }
         if let Some(rest) = strip_prefix_ci(s, "tcp://") {
-            if rest.contains('@') {
+            if rest.contains(AT) {
                 return Err(userinfo_refused(s, rest, "a tcp:// URL"));
             }
             let (host, port) = host_port(rest, 53).map_err(|e| format!("`{s}`: {e}"))?;
@@ -553,6 +569,37 @@ mod tests {
         ] {
             assert_eq!(UpstreamSpec::parse(url).unwrap_err(), error);
         }
+    }
+
+    /// The fullwidth `＠` (U+FF20) is an `@` to whatever maps a host name
+    /// before it resolves it: a URL written with one carries a user name
+    /// and a password like any other, and no text repeats them. Nor does
+    /// the error of a port that is none repeat the port: with a `:` in a
+    /// password and no `@` to tell, the "port" is half of it.
+    #[test]
+    fn a_fullwidth_at_sign_hides_no_credentials() {
+        const PASSWORD: &str = "hunt3r2";
+        for scheme in ["quic", "tls", "tcp", "h3", "https"] {
+            for userinfo in [format!("al1ce:{PASSWORD}"), PASSWORD.to_string()] {
+                for server in ["dns.example", "dns.example:853", "dns.example/dns-query"] {
+                    let url = format!("{scheme}://{userinfo}＠{server}");
+                    let err = UpstreamSpec::parse(&url).unwrap_err();
+                    assert!(
+                        !err.contains(PASSWORD) && !err.contains("al1ce"),
+                        "{url}: {err}"
+                    );
+                    assert!(err.contains("dns.example"), "{url}: {err}");
+                }
+            }
+        }
+        assert_eq!(
+            UpstreamSpec::parse("quic://al1ce:hunt3r2＠dns.example").unwrap_err(),
+            "`quic://dns.example`: a quic:// URL cannot carry a user name or a password"
+        );
+        assert_eq!(
+            UpstreamSpec::parse("tls://dns.example:8x53").unwrap_err(),
+            "`tls://dns.example:8x53`: invalid port"
+        );
     }
 
     /// An `@` anywhere in an `h3://` URL is refused, as in the others: a
