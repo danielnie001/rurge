@@ -276,7 +276,8 @@ mod tests {
     use super::*;
     use crate::observe::{RecordStatus, RequestLog, TrafficStats};
     use rurge_config::HostName;
-    use rurge_net::connector::{ConnectOpts, DirectConnector, SystemResolve, Target};
+    use rurge_net::connector::{ConnectOpts, DirectConnector, PacketSocket, SystemResolve, Target};
+    use rurge_net::packet_datagram::packet_datagram;
     use rurge_policy::smart::{Health, SmartBook};
     use rurge_proto::{OutboundRef, Reject, RejectKind};
     use std::collections::VecDeque;
@@ -543,6 +544,56 @@ mod tests {
             Health::Unknown { failures: 1 }
         );
         assert_eq!(book.site(SERVER, now).failed, ["M"]);
+    }
+
+    /// A proxy's carrier that takes what it is sent and ends by being
+    /// reset: the server reset the stream it runs on.
+    struct ResetCarrier;
+
+    const RESET: &str = "Connection reset by peer (os error 104)";
+
+    impl PacketSocket for ResetCarrier {
+        fn send_to<'a>(&'a self, _buf: &'a [u8], _to: &'a Target) -> BoxFuture<'a, io::Result<()>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+        fn recv_from<'a>(
+            &'a self,
+            _buf: &'a mut [u8],
+        ) -> BoxFuture<'a, io::Result<(usize, Target)>> {
+            let reset = io::Error::new(io::ErrorKind::ConnectionReset, RESET);
+            Box::pin(std::future::ready(Err(reset)))
+        }
+    }
+
+    /// A carrier that ends by being reset is not the reset of a datagram
+    /// that bounced: it comes as the carrier's end — an abort, in the
+    /// carrier's words (`packet_datagram`) — and the session fails with it
+    /// as with any other end.
+    #[tokio::test]
+    async fn a_carrier_that_was_reset_fails_its_session_in_the_carriers_words() {
+        let server = Target::new(HostName::parse("192.0.2.1"), 853);
+        let handle = SessionHandle::new(1, SessionInfo::udp(server.host.clone(), server.port));
+        let carrier = wrap_internal_udp(
+            packet_datagram(Box::new(ResetCarrier), server),
+            handle.clone(),
+            Some("M"),
+        );
+        let mut storage = [0u8; 64];
+        let mut buf = ReadBuf::new(&mut storage);
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| carrier.poll_recv(cx, &mut buf)),
+        )
+        .await
+        .expect("the carrier's end within the bound")
+        .unwrap_err();
+        assert_eq!(
+            (ended.kind(), ended.to_string()),
+            (io::ErrorKind::ConnectionAborted, format!("via M: {RESET}"))
+        );
+        let failed = SessionOutcome::Failed(RESET.to_string());
+        assert_eq!(handle.outcome(), Some(failed));
+        assert!(handle.upstream_failed());
     }
 
     /// A carrier that cannot send until it is opened, and tells whoever

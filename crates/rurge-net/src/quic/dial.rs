@@ -170,6 +170,9 @@ const REASON_MAX: usize = 200;
 /// under it failed (a carrier that closed) and every connection with it.
 const DRIVER_LOST: &str = "endpoint driver future was dropped";
 
+/// What a connection whose endpoint is gone reads as.
+const PATH_FAILED: &str = "quic: the UDP path to the server failed";
+
 /// Whether `e` is quinn's word for a connection whose endpoint is gone.
 fn driver_lost(e: &ConnectionError) -> bool {
     matches!(
@@ -204,6 +207,10 @@ fn describe(e: &ConnectionError, handshake: bool) -> io::Error {
             ConnectionReset,
             "quic: the server no longer knows the connection (stateless reset)".to_string(),
         ),
+        // nothing here closes a connection before its handshake is over:
+        // this one lost its endpoint (`lost_its_endpoint`), and reads as
+        // one that heard so from its driver
+        ConnectionError::LocallyClosed if handshake => (BrokenPipe, PATH_FAILED.to_string()),
         // closed here — or, once its driver goes, a connection whose
         // endpoint was lost (`DRIVER_LOST` before)
         ConnectionError::LocallyClosed => (
@@ -226,10 +233,7 @@ fn describe(e: &ConnectionError, handshake: bool) -> io::Error {
                     format!("tls: {}", untrusted(error.reason.as_bytes())),
                 )
             } else if driver_lost(e) {
-                (
-                    BrokenPipe,
-                    "quic: the UDP path to the server failed".to_string(),
-                )
+                (BrokenPipe, PATH_FAILED.to_string())
             } else if error.reason.is_empty() {
                 (InvalidData, format!("quic: {}", error.code))
             } else {
@@ -536,6 +540,35 @@ mod tests {
         ] {
             assert!(!lost_its_endpoint(&other), "{other:?}");
         }
+    }
+
+    /// A handshake that lost its endpoint says that the path failed,
+    /// whichever of quinn's two errors the dial saw; a connection that was
+    /// up and is closed from here still says that it was closed.
+    #[test]
+    fn a_handshake_that_lost_its_endpoint_says_the_path_failed() {
+        for lost in [
+            found(TransportErrorCode::INTERNAL_ERROR, DRIVER_LOST),
+            ConnectionError::LocallyClosed,
+        ] {
+            let io = describe(&lost, true);
+            assert_eq!(
+                (io.kind(), io.to_string().as_str()),
+                (
+                    io::ErrorKind::BrokenPipe,
+                    "quic: the UDP path to the server failed"
+                ),
+                "{lost:?}"
+            );
+        }
+        let closed = connection_error(&ConnectionError::LocallyClosed);
+        assert_eq!(
+            (closed.kind(), closed.to_string().as_str()),
+            (
+                io::ErrorKind::ConnectionAborted,
+                "quic: the connection was closed"
+            )
+        );
     }
 
     /// A carrier that takes what it is sent and never answers; its first

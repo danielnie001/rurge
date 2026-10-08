@@ -1857,19 +1857,21 @@ async fn a_doq_carrier_routed_to_reject_goes_directly() {
     );
 }
 
-/// A DNS server whose port is not open yet when the carrier's first packet
-/// goes — the carrier a connected socket here, gone directly around a
-/// REJECT. Windows tells such a socket of the datagram nobody took as a
-/// reset of its next receive; QUIC passes over that, sends the packet
-/// again, and once the server is up the handshake completes on the same
-/// carrier: the session that brings the answer is that one, and no
-/// failure. (Other systems refuse the socket's next receive instead, which
-/// rightly ends that carrier; the answer then comes on a second one.)
+/// A DNS server at a port nothing listens on — the carrier a connected
+/// socket here, gone directly around a REJECT. Windows tells such a socket
+/// of the datagram nobody took as a reset of its next receive; QUIC passes
+/// over that and sends its first packet again, on the same carrier, whose
+/// session stays an active one: no failure goes on the record. Windows
+/// only: no other system hands a receive a reset for this, and what the
+/// session does with one is pinned for all of them in `dns_pipeline`'s own
+/// tests.
+#[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_doq_carrier_that_outlives_a_port_unreachable_is_no_failed_session() {
-    let dns = MockDns::spawn().await;
-    dns.set("target.test", &["127.0.0.1"], &[], 60);
-    // a loopback port nothing listens on yet
+    /// What QUIC pads the datagram of its first packet to (RFC 9000 14.1):
+    /// a carrier that has sent more has sent again.
+    const INITIAL: u64 = 1200;
+    // where the packets go, and no more: the port is never bound again
     let addr = std::net::UdpSocket::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -1879,27 +1881,34 @@ async fn a_doq_carrier_that_outlives_a_port_unreachable_is_no_failed_session() {
     let engine = engine_from_profile(dir.path(), &profile).await;
     let asking = engine.clone();
     let lookup = tokio::spawn(async move { lookup_outcome(&asking).await });
-    // the first packet has gone, to the closed port
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !carrier_sessions(&engine).iter().any(|r| r.up > 0) {
-        assert!(tokio::time::Instant::now() < deadline, "no packet sent");
+    // the packet goes again about a second after the first: the reset,
+    // which came back at once, has been read by then
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let carriers = carrier_sessions(&engine);
+        assert!(
+            carriers.iter().all(|r| r.status != RecordStatus::Failed),
+            "{carriers:?}"
+        );
+        let sent_again = carriers
+            .iter()
+            .any(|r| r.status == RecordStatus::Active && r.up > INITIAL);
+        if sent_again {
+            break;
+        }
+        // a lookup that is over met something at the port — another test
+        // took it meanwhile —: its carrier had no reset to live through
+        if lookup.is_finished() {
+            assert!(!carriers.is_empty(), "the lookup opened no carrier");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first packet did not go again: {carriers:?}"
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    let _doq = FakeDoq::spawn_at(&dns, DoqScript::default(), addr);
-    let res = lookup
-        .await
-        .unwrap()
-        .expect("an answer once the server is up");
-    assert_eq!(res.source, Source::Upstream(format!("quic://{addr}")));
-    // the record of a session that failed holds what it had counted by
-    // then, nothing back: the one the answer came on did not fail
-    let carriers = carrier_sessions(&engine);
-    assert!(
-        carriers
-            .iter()
-            .any(|r| r.down > 0 && r.status != RecordStatus::Failed),
-        "{carriers:?}"
-    );
+    lookup.abort();
 }
 
 /// A proxy configured by host name would need the very lookup the carrier

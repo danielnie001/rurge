@@ -12,7 +12,9 @@
 //! The carrier's end is the datagram's. Why it ended — a proxy that closed
 //! the association, say — is told in the carrier's words too, once, by the
 //! receive that has read all that arrived before; after that, or behind a
-//! carrier that ended without a word, the datagram has just closed.
+//! carrier that ended without a word, the datagram has just closed. Every
+//! error keeps its kind but one: a carrier that ended by being reset is
+//! told as aborted (`as_the_end`).
 
 use crate::connector::{
     BoxedDatagram, BoxedPacketSocket, Datagram, PacketSocket, Target, lost_alone,
@@ -53,6 +55,21 @@ struct Failed {
 /// ends that has nothing to tell — does not.
 fn says_why(e: &io::Error) -> bool {
     e.get_ref().is_some() || e.raw_os_error().is_some()
+}
+
+/// `e`, what the carrier ended with, as the receiver is told it: a reset as
+/// an abort, in the same words. Of a live carrier a reset says that one
+/// datagram bounced, and what reads a carrier passes over it and reads on
+/// (QUIC does): the end of a carrier that was reset — a stream to a proxy
+/// the server reset — must not be taken for that. The one kind that is not
+/// kept, and only for the end: a reset the carrier reports while it lives —
+/// a send it failed — stays one.
+fn as_the_end(e: io::Error) -> io::Error {
+    if e.kind() == io::ErrorKind::ConnectionReset {
+        io::Error::new(io::ErrorKind::ConnectionAborted, e.to_string())
+    } else {
+        e
+    }
 }
 
 /// `socket` as a datagram to `to`, which it has resolved (`PacketSocket::resolve`).
@@ -98,7 +115,7 @@ pub fn packet_datagram(socket: BoxedPacketSocket, to: Target) -> BoxedDatagram {
             }
         };
         if says_why(&ended) {
-            ending.lock().expect("the failed send").ended = Some(ended);
+            ending.lock().expect("the failed send").ended = Some(as_the_end(ended));
         }
         // the carrier's end is the datagram's. Closed only now: the receive
         // that finds the queue closed looks for why it is
@@ -390,6 +407,80 @@ mod tests {
         arrive.send((peer.clone(), b"back".to_vec())).await.unwrap();
         assert_eq!(recv(&datagram).await.unwrap(), b"back");
         assert_eq!(*sent.lock().unwrap(), [(peer, b"three".to_vec())]);
+    }
+
+    /// The system's own "connection reset", whatever its number is here.
+    fn system_reset() -> io::Error {
+        (1..20_000)
+            .map(io::Error::from_raw_os_error)
+            .find(|e| e.kind() == io::ErrorKind::ConnectionReset)
+            .expect("the system knows a reset")
+    }
+
+    const CLOSED: &str = "the carrier through the chain has closed";
+
+    /// A reset tells of a live carrier that one datagram bounced — a stream
+    /// the server reset, the next datagram opens another — and keeps its
+    /// kind: QUIC passes over it and reads on. A carrier that ends by being
+    /// reset — the proxy reset the connection it runs on — is no such
+    /// thing: its end is told in its own words as any end is, as an abort.
+    #[tokio::test]
+    async fn a_carrier_that_was_reset_ends_in_its_own_words_as_an_abort() {
+        let bounced = "h2-connect: the server reset the stream (CANCEL)";
+        let (socket, (arrive, _sent)) = scripted_with(
+            vec![io::Error::new(io::ErrorKind::ConnectionReset, bounced)],
+            Some(system_reset()),
+        );
+        let datagram = packet_datagram(socket, at("192.0.2.7", 853));
+        poll_fn(|cx| datagram.poll_send(cx, b"one")).await.unwrap();
+        let told = recv(&datagram).await.unwrap_err();
+        assert_eq!(
+            (told.kind(), told.to_string().as_str()),
+            (io::ErrorKind::ConnectionReset, bounced)
+        );
+        drop(arrive);
+        let ended = recv(&datagram).await.unwrap_err();
+        assert_eq!(
+            (ended.kind(), ended.to_string()),
+            (io::ErrorKind::ConnectionAborted, system_reset().to_string())
+        );
+        let after = recv(&datagram).await.unwrap_err();
+        assert_eq!(
+            (after.kind(), after.to_string().as_str()),
+            (io::ErrorKind::BrokenPipe, CLOSED)
+        );
+    }
+
+    /// A send the carrier failed and the carrier's own end, both waiting
+    /// for a receive: each is told once, the send's failure first.
+    #[tokio::test]
+    async fn a_failed_send_is_told_before_the_carriers_end() {
+        let end = "socks5: the proxy closed the UDP association";
+        let (socket, (arrive, sent)) = scripted_with(
+            vec![no_relay()],
+            Some(io::Error::new(io::ErrorKind::BrokenPipe, end)),
+        );
+        let peer = at("192.0.2.7", 853);
+        let datagram = packet_datagram(socket, peer.clone());
+        poll_fn(|cx| datagram.poll_send(cx, b"one")).await.unwrap();
+        poll_fn(|cx| datagram.poll_send(cx, b"two")).await.unwrap();
+        drop(arrive);
+        // the second went out: the first has failed, and the carrier, left
+        // to run meanwhile, has ended
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while sent.lock().unwrap().is_empty() {
+            assert!(tokio::time::Instant::now() < deadline, "nothing sent");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let told: Vec<String> = [
+            recv(&datagram).await,
+            recv(&datagram).await,
+            recv(&datagram).await,
+        ]
+        .into_iter()
+        .map(|told| told.unwrap_err().to_string())
+        .collect();
+        assert_eq!(told, [no_relay().to_string().as_str(), end, CLOSED]);
     }
 
     /// A datagram the carrier will not take — too long for it — or the

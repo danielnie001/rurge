@@ -155,11 +155,14 @@ mod tests {
     /// sends are pending. With `says_when` it tells whoever waits to send;
     /// without, it is ready to all it knows. With `opens_when_asked` the
     /// question itself lets it: it could not send a moment ago, and can
-    /// now. Its receives fail with `failing`, in turn.
+    /// now. With `ready_once` it answers the first question "ready"
+    /// whether it is or not: what it knew of itself was out of date. Its
+    /// receives fail with `failing`, in turn.
     #[derive(Default)]
     struct Gate {
         says_when: bool,
         opens_when_asked: bool,
+        ready_once: AtomicBool,
         open: AtomicBool,
         sent: Mutex<Vec<Vec<u8>>>,
         sender: Mutex<Option<Waker>>,
@@ -187,6 +190,9 @@ mod tests {
         fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             if self.opens_when_asked {
                 self.open.store(true, Ordering::SeqCst);
+            }
+            if self.ready_once.swap(false, Ordering::SeqCst) {
+                return Poll::Ready(Ok(()));
             }
             if !self.says_when {
                 return Poll::Ready(Ok(()));
@@ -272,6 +278,25 @@ mod tests {
             ..Gate::default()
         });
         let socket = Carried::new(Box::new(gate.clone()));
+        socket.try_send(&initial()).unwrap();
+        assert_eq!(*gate.sent.lock().unwrap(), [b"initial".to_vec()]);
+    }
+
+    /// A carrier that said it could send and cannot after all — what it
+    /// knew of itself was out of date — is asked again after the second
+    /// try: it says when now, so quinn keeps the datagram and waits for it,
+    /// where a carrier that cannot say when has its datagram dropped.
+    #[test]
+    fn a_carrier_that_cannot_send_after_all_has_quinn_wait_for_it() {
+        let gate = Arc::new(Gate {
+            says_when: true,
+            ready_once: AtomicBool::new(true),
+            ..Gate::default()
+        });
+        let socket = Carried::new(Box::new(gate.clone()));
+        let blocked = socket.try_send(&initial()).unwrap_err();
+        assert_eq!(blocked.kind(), io::ErrorKind::WouldBlock);
+        gate.open();
         socket.try_send(&initial()).unwrap();
         assert_eq!(*gate.sent.lock().unwrap(), [b"initial".to_vec()]);
     }

@@ -230,6 +230,7 @@ mod tests {
     use rurge_net::connector::PacketSocket;
     use rurge_net::quic;
     use rurge_net::quic::testing::TestCert;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::path::Path;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -438,8 +439,38 @@ mod tests {
         );
     }
 
+    /// A relay's carrier that ends by being reset — the proxy reset the
+    /// stream it runs on — fails the dial in its own words, as any end
+    /// does: told as a reset, QUIC would pass over it, and the dial would
+    /// know only that the carrier has closed.
+    #[tokio::test]
+    async fn a_relay_whose_carrier_was_reset_fails_the_dial_in_the_carriers_words() {
+        let e = dial_over(Broken {
+            recv: Some((
+                io::ErrorKind::ConnectionReset,
+                "Connection reset by peer (os error 104)",
+            )),
+            ..Broken::default()
+        })
+        .await;
+        assert_eq!(
+            (e.kind(), e.to_string().as_str()),
+            (
+                io::ErrorKind::ConnectionAborted,
+                "via D: Connection reset by peer (os error 104)"
+            )
+        );
+    }
+
     /// A carrier whose sends and receives all fail, each way in its words.
-    struct Failing;
+    /// It knows where its datagrams go, and notes the TOS it is given.
+    struct Failing {
+        marked: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Failing {
+        const PEER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), 51820);
+    }
 
     impl Datagram for Failing {
         fn poll_send(&self, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
@@ -455,17 +486,34 @@ mod tests {
                 "reset by the relay",
             )))
         }
+
+        fn peer_addr(&self) -> Option<SocketAddr> {
+            Some(Failing::PEER)
+        }
+
+        fn set_tos(&self, tos: u8) -> io::Result<()> {
+            self.marked.lock().unwrap().push(tos);
+            Ok(())
+        }
     }
 
     /// Whatever a relay's carrier fails with, sending or receiving, goes on
     /// under the relay's name and with its kind: what tells failures apart
-    /// by kind — QUIC passes over a reset — still can.
+    /// by kind — QUIC passes over a reset — still can. The rest is the
+    /// carrier's own: where its datagrams go, which a WireGuard tunnel
+    /// follows its peer by, and the TOS it is given.
     #[test]
     fn a_relays_carrier_fails_under_the_relays_name_both_ways() {
+        let marked = Arc::new(Mutex::new(Vec::new()));
         let relayed = Relayed {
-            carrier: Box::new(Failing),
+            carrier: Box::new(Failing {
+                marked: marked.clone(),
+            }),
             via: "U".into(),
         };
+        assert_eq!(relayed.peer_addr(), Some(Failing::PEER));
+        relayed.set_tos(0x88).unwrap();
+        assert_eq!(*marked.lock().unwrap(), [0x88]);
         let mut cx = Context::from_waker(Waker::noop());
         let Poll::Ready(Err(sent)) = relayed.poll_send(&mut cx, b"out") else {
             panic!("the send fails");
