@@ -23,11 +23,11 @@ pub type Snapshots = HashMap<PolicyPath, Arc<Subscription>>;
 pub struct Imported {
     /// Named with the group's prefix, parameters overridden by its modifier.
     pub policy: ProxyPolicy,
-    /// `None`: a protocol this version does not implement; it behaves as
-    /// REJECT.
+    /// `None`: a protocol, or a variant of one, that rurge does not
+    /// implement; it behaves as REJECT.
     pub spec: Option<PolicySpec>,
-    /// Why there is no spec, when the line asks for something not
-    /// implemented yet.
+    /// Why there is no spec, when the line asks for something rurge does
+    /// not implement.
     pub not_implemented: Option<NotImplemented>,
 }
 
@@ -323,7 +323,7 @@ impl<'a> Imports<'a> {
     }
 
     /// The typed parameters of every import. A line with an error is
-    /// skipped (M3-D6); one of a protocol this version does not implement
+    /// skipped (M3-D6); one that asks for what rurge does not implement
     /// stays, as REJECT, which is said once per protocol. What a line's
     /// spec makes rurge say (`Remark`) is said once per kind by each group
     /// that brought such a line in first: a line two groups import alike is

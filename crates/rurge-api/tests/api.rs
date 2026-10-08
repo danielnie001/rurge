@@ -107,8 +107,8 @@ impl Api {
     }
 }
 
-/// The binary does not declare Tailscale (yet), so dropping it from the
-/// test capabilities yields the load-time W0007 warning the tests look for.
+/// The binary does not declare Tailscale, so dropping it from the test
+/// capabilities yields the load-time W0007 warning the tests look for.
 fn load_options() -> LoadOptions {
     let mut opts = LoadOptions::for_tests();
     opts.capabilities
@@ -915,7 +915,7 @@ async fn a_select_group_is_switched_for_the_next_request_and_persisted() {
         get(&api, "/v1/policy_groups/select?group_name=Pick").await,
         (200, json!({ "policy": "HK" }))
     );
-    // HK is a protocol rurge does not speak yet: the request is refused
+    // HK is a protocol rurge does not speak: the request is refused
     let (head, _) = get_via_proxy(api.http(), &api.target_url()).await;
     assert!(!head.starts_with("HTTP/1.1 200"), "{head}");
 
@@ -979,8 +979,8 @@ async fn select_refuses_what_is_not_a_member_of_a_select_group() {
     );
 }
 
-/// Falls over from HK (a protocol rurge does not speak yet: it never
-/// passes) to DIRECT, tested at `internet-test-url` on the loopback server.
+/// Falls over from HK (a protocol rurge does not speak: it never passes)
+/// to DIRECT, tested at `internet-test-url` on the loopback server.
 const AUTO: &str = "Auto = fallback, HK, DIRECT";
 
 #[tokio::test]

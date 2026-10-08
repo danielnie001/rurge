@@ -46,7 +46,8 @@ impl RejectKind {
 #[derive(Debug)]
 pub enum OutboundError {
     Reject(RejectKind),
-    /// The policy's protocol is not implemented in this version.
+    /// What the policy asks for that rurge does not implement, or what this
+    /// outbound does not do as the policy is written: relay UDP.
     Unsupported(String),
     Dns(String),
     Io(io::Error),

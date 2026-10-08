@@ -20,7 +20,7 @@ pub(crate) const NO_RESPONSE: Duration = Duration::from_secs(3);
 /// The dials of a session, in order (M3c design §7): through what `first`
 /// picked and — when a `smart` group picked it — through the next members in
 /// line, at most `RETRIES` of them, each with the chain it would have had. A
-/// member that is no proxy (its protocol is not implemented yet) is not
+/// member that is no proxy (rurge does not implement its protocol) is not
 /// tried.
 pub(crate) fn attempts(registry: &PolicyRegistry, first: Resolution) -> Vec<Resolution> {
     let Some(pick) = first.smart.clone() else {
@@ -56,7 +56,7 @@ pub(crate) fn attempts(registry: &PolicyRegistry, first: Resolution) -> Vec<Reso
 }
 
 /// Whether another member may do better: the connection failed — unlike a
-/// REJECT, or a protocol not implemented yet.
+/// REJECT, or a protocol rurge does not implement.
 pub(crate) fn retryable(e: &OutboundError) -> bool {
     !matches!(e, OutboundError::Reject(_) | OutboundError::Unsupported(_))
 }

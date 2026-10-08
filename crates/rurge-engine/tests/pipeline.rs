@@ -657,7 +657,7 @@ async fn relay_counts_bytes_as_they_move_and_keeps_them_on_failure() {
     );
 }
 
-/// A policy naming a protocol rurge has not implemented rejects, and says so
+/// A policy naming a protocol rurge does not implement rejects, and says so
 /// on the handle so the session log can name it (M3 design §7.2 step 4).
 #[tokio::test]
 async fn an_unimplemented_policy_rejects_with_an_explanation() {

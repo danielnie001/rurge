@@ -211,7 +211,7 @@ fn check_knows_trojan() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `tailscale` is still a later milestone; `trojan` is not
+    // `tailscale` is not supported; `trojan` is
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
     assert!(
         out.contains("`tailscale`") && !out.contains("`trojan`"),
@@ -299,7 +299,7 @@ fn check_knows_ssh() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `tailscale` is still a later milestone; `ssh` is not
+    // `tailscale` is not supported; `ssh` is
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
     assert!(
         out.contains("`tailscale`") && !out.contains("`ssh`"),
@@ -344,7 +344,7 @@ fn check_knows_wireguard() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `tailscale` is still a later milestone; `wireguard` is not
+    // `tailscale` is not supported; `wireguard` is
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
     assert!(
         out.contains("`tailscale`") && !out.contains("`wireguard`"),
@@ -586,7 +586,7 @@ fn check_knows_http2() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `tailscale` is still a later milestone; the HTTP/2 family is not
+    // `tailscale` is not supported; the HTTP/2 family is
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
     assert!(
         out.contains("`tailscale`")
@@ -639,7 +639,7 @@ fn check_knows_hysteria2() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `tailscale` is still a later milestone; `hysteria2` is not
+    // `tailscale` is not supported; `hysteria2` is
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
     assert!(
         out.contains("`tailscale`") && !out.contains("`hysteria2`"),
@@ -709,7 +709,7 @@ fn check_knows_tuic() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `tailscale` is still a later milestone; TUIC is not
+    // `tailscale` is not supported; TUIC is
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
     assert!(
         out.contains("policy type `tailscale`") && !out.contains("policy type `tuic"),
@@ -804,7 +804,7 @@ fn check_knows_masque() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `tailscale` is still a later milestone; `masque` is not
+    // `tailscale` is not supported; `masque` is
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
     assert!(
         out.contains("policy type `tailscale`") && !out.contains("policy type `masque`"),

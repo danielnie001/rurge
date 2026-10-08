@@ -104,7 +104,7 @@ impl Engine {
     /// (M3 design 6.3, 6.6): each at its own test URL — the groups then
     /// pick by these results — or all at `url`, a one-off whose results
     /// are not kept. `None` for what cannot be tested: a group, a REJECT, a
-    /// protocol not implemented yet, a test URL that does not parse.
+    /// protocol rurge does not implement, a test URL that does not parse.
     pub async fn test_policies(
         &self,
         names: &[String],

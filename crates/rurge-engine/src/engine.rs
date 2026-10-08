@@ -1148,7 +1148,7 @@ impl Dialer for Engine {
             };
             handle.set_policy_chain(resolution.chain.clone());
             if let Some(note) = &resolution.note {
-                // A protocol rurge cannot speak yet, a group cycle, a group
+                // A protocol rurge does not speak, a group cycle, a group
                 // without members: say why in the session log (§7.2; phase 2
                 // M3 design 5.6).
                 handle.set_error(note.to_string());

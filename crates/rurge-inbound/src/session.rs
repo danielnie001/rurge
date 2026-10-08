@@ -132,7 +132,7 @@ impl SessionHandle {
     }
 
     /// Why the session could not run as asked, when the outcome alone does not
-    /// say (a policy naming a protocol rurge has not implemented, say).
+    /// say (a policy naming a protocol rurge does not implement, say).
     pub fn set_error(&self, msg: impl Into<String>) {
         *self.error.lock().expect("session error") = Some(msg.into());
     }

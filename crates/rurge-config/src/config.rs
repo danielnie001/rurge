@@ -182,7 +182,7 @@ pub struct Config {
     /// `policies`; policies with errors are absent).
     pub specs: Vec<PolicySpec>,
     /// Why a policy without errors has no spec, when its line asks for
-    /// something not implemented yet (`W0007`); by policy name.
+    /// something rurge does not implement (`W0007`); by policy name.
     pub not_implemented: HashMap<String, NotImplemented>,
     pub groups: Vec<PolicyGroup>,
     /// Typed parameters of every group (same order as `groups`; groups

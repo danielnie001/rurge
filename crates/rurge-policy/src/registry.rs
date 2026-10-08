@@ -42,8 +42,9 @@ pub enum TerminalKind {
 /// Why a resolution ended where it did, when that needs saying.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Note {
-    /// The terminal policy's protocol keyword (or `DEVICE`) is not
-    /// implemented in this version: the outbound is REJECT.
+    /// The resolution ends at what rurge does not implement (the terminal
+    /// policy's protocol, a variant of it, or `DEVICE`): the outbound is
+    /// REJECT.
     Unsupported(String),
     /// A group on a cycle of groups, written out (`A → B → A`): REJECT.
     GroupCycle(String),
@@ -181,8 +182,8 @@ enum Entry {
         // otherwise make this variant much larger than the others.
         fingerprint: Box<Fingerprint>,
     },
-    /// The protocol is not implemented yet: REJECT (W0007 at load). `what`
-    /// is what the session log says about it.
+    /// A protocol, or a variant of one, that rurge does not implement:
+    /// REJECT (W0007 at load). `what` is what the session log says about it.
     Unsupported { kind: PolicyKind, what: String },
     Group {
         spec: Arc<GroupSpec>,
@@ -463,7 +464,7 @@ impl PolicyRegistry {
                     }
                     (Some(terminal), _) => Entry::Alias(terminal),
                     (None, Some(spec)) => outbound_entry(spec, true)?,
-                    // no spec: a protocol of a later milestone
+                    // no spec: what rurge does not implement
                     (None, None) => Entry::Unsupported {
                         kind,
                         what: unsupported_text(kind, why),
@@ -783,9 +784,9 @@ impl PolicyRegistry {
                     return Some(Choice::plain(member));
                 }
                 let now = Instant::now();
-                // a member whose protocol is not implemented yet never works:
-                // it is no candidate, and stands in only when no member can
-                // work at all (M3c design 6.1)
+                // a member whose protocol rurge does not implement never
+                // works: it is no candidate, and stands in only when no
+                // member can work at all (M3c design 6.1)
                 let candidates: Vec<Candidate<'_>> = members
                     .iter()
                     .zip(factors)
@@ -840,8 +841,8 @@ impl PolicyRegistry {
         }
     }
 
-    /// What the `smart` groups know of `member` now; a protocol not
-    /// implemented yet never works (M3c design 6.1).
+    /// What the `smart` groups know of `member` now; a protocol rurge does
+    /// not implement never works (M3c design 6.1).
     fn smart_health(&self, member: &str, now: Instant) -> Health {
         match self.entries.get(member) {
             Some(Entry::Outbound { outbound, .. }) => self.auto.smart.health(member, outbound, now),
@@ -1014,8 +1015,8 @@ impl PolicyRegistry {
         if spec.kind != GroupKind::Smart {
             return None;
         }
-        // a member no round can test (a protocol not implemented yet, a test
-        // URL that does not parse) takes no place in the sample
+        // a member no round can test (a protocol rurge does not implement, a
+        // test URL that does not parse) takes no place in the sample
         let testable: Vec<String> = members
             .iter()
             .filter(|m| self.test_slot(m).is_some())
@@ -2500,9 +2501,9 @@ Only = smart, Sel, DIRECT, D\nE = smart, A, B, evaluate-before-use=true\nOuter =
 [Proxy]\nU = tailscale, section-name=ts\nA = http, a.example, 80\nB = http, b.example, 80\n\
 [Proxy Group]\nS = smart, U, A, B\nOnlyU = smart, U\n[Rule]\nFINAL,S\n";
 
-    /// A member whose protocol is not implemented yet never works: it is no
-    /// candidate — not even when every working member failed at the site —
-    /// and stands in only when no member can work at all (M3c design 6.1).
+    /// A member whose protocol rurge does not implement never works: it is
+    /// no candidate — not even when every working member failed at the site
+    /// — and stands in only when no member can work at all (M3c design 6.1).
     #[test]
     fn a_member_that_never_works_stands_in_only_when_nothing_else_can() {
         let reg = generation(SMART_UNSUPPORTED, &FakeFactory::new(), None);
@@ -2564,8 +2565,8 @@ Only = smart, Sel, DIRECT, D\nE = smart, A, B, evaluate-before-use=true\nOuter =
         assert_eq!(tested(&reg), names.len());
     }
 
-    /// Members a round cannot test — a protocol not implemented yet — take
-    /// no place in a big group's sample: two regular rounds test every
+    /// Members a round cannot test — a protocol rurge does not implement —
+    /// take no place in a big group's sample: two regular rounds test every
     /// member that can be tested (M3c design 8.1).
     #[tokio::test]
     async fn members_no_round_can_test_take_no_place_in_the_sample() {

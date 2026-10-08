@@ -167,7 +167,8 @@ pub struct PolicySpec {
 
 #[derive(Debug, Default)]
 pub struct SpecOutcome {
-    /// `None` when the policy type has no spec yet, or when an error was found.
+    /// `None` when the line asks for something rurge does not implement, or
+    /// when an error was found.
     pub spec: Option<PolicySpec>,
     pub diagnostics: Vec<Diagnostic>,
     /// Parameters present on the line that are parsed but do nothing yet;
@@ -175,16 +176,17 @@ pub struct SpecOutcome {
     pub inert: Vec<&'static str>,
     /// iOS-only parameters present on the line (`W0004`, once per load).
     pub ios_only: Vec<&'static str>,
-    /// A valid line that asks for something not implemented yet, so it has
-    /// no spec. The caller reports each distinct one once per load (`W0007`).
+    /// A valid line that asks for something rurge does not implement, so it
+    /// has no spec. The caller reports each distinct one once per load
+    /// (`W0007`).
     pub not_implemented: Option<NotImplemented>,
     /// What the line's spec makes rurge say. The caller reports each
     /// distinct one once per load, under the remark's own code.
     pub remarks: Vec<Remark>,
 }
 
-/// What a valid line asks for that this version does not implement: the
-/// policy has no spec and behaves as REJECT.
+/// What a valid line asks for that rurge does not implement: the policy has
+/// no spec and behaves as REJECT.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NotImplemented {
     /// An `ss` cipher Surge no longer lists, by its name (phase 2 M8 design

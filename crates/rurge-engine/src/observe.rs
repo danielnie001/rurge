@@ -515,9 +515,9 @@ mod tests {
 
         // a chain ending in a `!` marker: distinguishes "last entry that is
         // not a marker" from a naive `.last()`, which would wrongly key this
-        // session under "!unsupported:vmess" instead of "Block"
+        // session under "!unsupported:tailscale" instead of "Block"
         let c = handle(3, "c.test");
-        c.set_policy_chain(vec!["Block".into(), "!unsupported:vmess".into()]);
+        c.set_policy_chain(vec!["Block".into(), "!unsupported:tailscale".into()]);
         c.add_up(1);
         t.record(&c);
         assert_eq!(
