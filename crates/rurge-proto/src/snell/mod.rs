@@ -744,7 +744,8 @@ mod tests {
 
     /// A target that ends before it sent anything: the server answers with
     /// an error — `Remote EOF`, whichever command asked — and the request's
-    /// connection is not kept, on version 2 either.
+    /// connection is not kept, on version 2 either, whose server leaves it
+    /// open for another request.
     #[tokio::test]
     async fn a_target_that_ends_before_sending_is_the_servers_remote_eof_on_v1_to_v3() {
         // accepts and closes at once
@@ -1625,31 +1626,21 @@ mod tests {
         }
     }
 
-    /// The line says version 3 and the server is version 2: the chunks are
-    /// the same, the command is not there. The server's refusal fails the
-    /// open; so does one for a reason of its own.
+    /// A server that answers the UDP request with an error fails the open,
+    /// in chunks as in v4's records.
     #[tokio::test]
     async fn the_servers_refusal_of_udp_fails_the_open_on_v3() {
-        let older = server_of(2, SnellScript::new("secret")).await;
         let script = SnellScript {
             refuse: Some((0x07, b"udp disabled".to_vec())),
             ..SnellScript::new("secret")
         };
         let unwilling = server_of(3, script).await;
-        for (fake, message) in [
-            (&older, "fake snell: a command this version lacks"),
-            (&unwilling, "udp disabled"),
-        ] {
-            let err = outbound_of(3, fake, "")
-                .open_udp(&ConnectOpts::default())
-                .await
-                .err()
-                .expect("refused");
-            assert_eq!(
-                err.to_string(),
-                format!("snell: the server refused: {message}")
-            );
-        }
+        let err = outbound_of(3, &unwilling, "")
+            .open_udp(&ConnectOpts::default())
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(err.to_string(), "snell: the server refused: udp disabled");
     }
 
     /// Full cone: whoever reaches the server's socket is heard, under its

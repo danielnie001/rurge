@@ -18,13 +18,15 @@
 //! Connect tunnel closes instead.
 //!
 //! Versions 1 to 3 speak the chunks of the original protocol, version 1
-//! under ChaCha20-Poly1305, and know fewer commands: ConnectV2 came with
-//! version 2 and UDP with version 3, and a request for one a version lacks
-//! is refused with an error. The answer rides with the target's first data
-//! here too, and a target that ends before sending anything gets
-//! `02 65 "Remote EOF"` whichever command asked, as the reference listener
-//! of these versions answers, and the close (the reference keeps a
-//! ConnectV2 connection; a client drops it after an error either way). An
+//! under ChaCha20-Poly1305. ConnectV2 came with version 2 and UDP with
+//! version 3, but the script's version says how records are written and
+//! nothing of the commands: like the reference listener of these versions,
+//! which compares the request's own version byte and no more, it serves
+//! Connect, ConnectV2 and UDP alike. The answer rides with the target's
+//! first data here too, and a target that ends before sending anything gets
+//! `02 65 "Remote EOF"` whichever command asked, as that listener answers;
+//! a Connect connection is closed after it, and a ConnectV2 one kept, as
+//! the listener keeps it (a client drops it after an error either way). An
 //! end is a zero-length chunk — the sealed length alone — on a ConnectV2
 //! tunnel, each way; a Connect tunnel takes the client's close for its end
 //! as well, and closes when the target ends.
@@ -60,16 +62,6 @@ const CONNECT: u8 = 0x01;
 const CONNECT_V2: u8 = 0x05;
 const UDP: u8 = 0x06;
 
-/// ConnectV2 came with version 2, UDP with version 3.
-fn knows(version: u8, command: u8) -> bool {
-    match command {
-        CONNECT => true,
-        CONNECT_V2 => version >= 2,
-        UDP => version >= 3,
-        _ => false,
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct SnellScript {
     pub psk: String,
@@ -94,7 +86,9 @@ pub struct SnellScript {
     /// In front of every UDP answer, two records that are no datagram: an
     /// unknown address family and an address cut short.
     pub udp_junk: bool,
-    /// A client it rejects gets a reset instead of a close.
+    /// Zero linger on every connection it accepts: one dropped without the
+    /// orderly close is reset. A client it rejects is dropped so, and gets
+    /// the reset in place of the close.
     pub reset: bool,
 }
 
@@ -537,6 +531,12 @@ impl Shared {
                     answers.error(0xff, b"end of file")
                 };
                 let _ = writer.write_all(&error).await;
+                // the listener of versions 1 to 3 keeps a ConnectV2
+                // connection after the error: the client is the one to let
+                // go of it
+                if reuse && chunked {
+                    return true;
+                }
                 let _ = writer.shutdown().await;
                 return false;
             }
@@ -707,12 +707,6 @@ async fn serve(tcp: TcpStream, shared: Arc<Shared>, connection: usize) -> io::Re
             .push(request.clone());
         if let Some((code, message)) = &script.refuse {
             writer.write_all(&answers.error(*code, message)).await?;
-            close(&mut reader, &mut writer).await;
-            return Ok(());
-        }
-        if !knows(script.version, request.command) {
-            let error = answers.error(0x01, b"fake snell: a command this version lacks");
-            writer.write_all(&error).await?;
             close(&mut reader, &mut writer).await;
             return Ok(());
         }
