@@ -269,8 +269,9 @@ mod tests {
     use rurge_config::spec::{ObfsMode, ParamReader, Secret, SsMethod};
     use rurge_config::{HostName, Span};
     use rurge_net::connector::{DirectConnector, PacketSocket, SystemResolve};
-    use std::net::SocketAddr;
+    use std::net::{Ipv4Addr, SocketAddr};
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -612,6 +613,95 @@ mod tests {
                     "{method:?}"
                 );
             }
+        }
+    }
+
+    /// Another address of 127/8 than 127.0.0.1. Linux and Windows answer on
+    /// all of them; macOS configures 127.0.0.1 alone, and a connection to
+    /// another one is not refused there: it waits.
+    const ELSEWHERE: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
+
+    /// What a stream cipher decrypts under a wrong password is any address
+    /// at all, so the fake server relays to 127.0.0.1 and to ::1 and to
+    /// nothing else, the rest of 127/8 included. Here such an address is
+    /// asked for outright, under the right password: the server refuses it
+    /// at once, as a request it cannot read. Where the system lets the test
+    /// listen on that address, a connection that gets there is counted.
+    #[tokio::test]
+    async fn the_fake_server_connects_to_the_loopback_address_itself_and_nowhere_else() {
+        let listener = TcpListener::bind((ELSEWHERE, 0)).await.ok();
+        let port = listener
+            .as_ref()
+            .map_or(9, |l| l.local_addr().unwrap().port());
+        let reached = Arc::new(AtomicUsize::new(0));
+        if let Some(listener) = listener {
+            let reached = reached.clone();
+            tokio::spawn(async move {
+                while listener.accept().await.is_ok() {
+                    reached.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+        let method = SsMethod::Aes256Cfb;
+        let fake = FakeShadowsocks::spawn(ShadowsocksScript::new(method, "pw")).await;
+        let out = outbound(&format!(
+            "ss, 127.0.0.1, {}, encrypt-method={}, password=pw",
+            fake.addr().port(),
+            method.name()
+        ));
+        let mut stream = out
+            .connect_tcp(
+                &target(SocketAddr::from((ELSEWHERE, port))),
+                &ConnectOpts::default(),
+            )
+            .await
+            .unwrap();
+        stream.write_all(b"hello").await.unwrap();
+        let mut answer = Vec::new();
+        let end = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut answer))
+            .await
+            .expect("the server goes without waiting for anyone");
+        assert_eq!(
+            reached.load(Ordering::SeqCst),
+            0,
+            "the server went to 127.0.0.2"
+        );
+        assert_eq!(
+            end.unwrap_err().to_string(),
+            "ss: the server closed the connection without answering"
+        );
+        // it read the request, and went nowhere with it
+        let seen = fake.requests();
+        assert_eq!((seen.len(), fake.rejected()), (1, 1));
+        assert_eq!((seen[0].host.as_str(), seen[0].port), ("127.0.0.2", port));
+    }
+
+    /// The same for datagrams: one for another address of 127/8 is read and
+    /// sent nowhere, and the one for 127.0.0.1 behind it comes back.
+    #[tokio::test]
+    async fn the_fake_server_sends_datagrams_to_the_loopback_address_itself_and_nowhere_else() {
+        let elsewhere = std::net::UdpSocket::bind((ELSEWHERE, 0)).ok();
+        let port = elsewhere
+            .as_ref()
+            .map_or(9, |s| s.local_addr().unwrap().port());
+        let echo = udp_echo_server().await;
+        let method = SsMethod::Aes256Cfb;
+        let fake = FakeShadowsocks::spawn(ShadowsocksScript::new(method, "pw")).await;
+        let out = udp_outbound(&fake, method, "pw");
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        carrier
+            .send_to(b"elsewhere", &target(SocketAddr::from((ELSEWHERE, port))))
+            .await
+            .unwrap();
+        udp_roundtrip(carrier.as_ref(), echo, b"here").await;
+        let targets: Vec<String> = fake.datagrams().into_iter().map(|d| d.target).collect();
+        assert_eq!(targets, [format!("127.0.0.2:{port}"), echo.to_string()]);
+        // the server takes its datagrams one after the other: the first had
+        // gone wherever it was going before the second set out
+        if let Some(elsewhere) = elsewhere {
+            elsewhere.set_nonblocking(true).unwrap();
+            let got = elsewhere.recv_from(&mut [0u8; 64]).map_err(|e| e.kind());
+            assert_eq!(got, Err(std::io::ErrorKind::WouldBlock));
         }
     }
 

@@ -6,8 +6,8 @@
 //! client's (`crate::shadowsocks`), so each checks the other; only the
 //! primitives (the ciphers — a stream cipher's keystream among them — and
 //! the key derivations, which have vectors of their own) are shared. It
-//! never resolves a name, and never connects or sends to an address off the
-//! loopback.
+//! never resolves a name, and never connects or sends to another address
+//! than 127.0.0.1 and ::1.
 //!
 //! It never tells a client with a wrong password (or key, or clock, or a
 //! replayed salt) so: it stops reading into the stream, closes its side and
@@ -39,13 +39,25 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 /// The largest payload a client chunk may carry (AEAD, SS 2022).
 const MAX_CHUNK: usize = 0x3FFF;
 const MAX_CHUNK_2022: usize = 0xFFFF;
+
+/// How long a stream cipher's request may take to reach its upstream: one
+/// that neither answers nor refuses in that time is refused.
+const CONNECT_LIMIT: Duration = Duration::from_secs(2);
+
+/// 127.0.0.1 or ::1, and no other address of the loopback's. What a stream
+/// cipher decrypts under a wrong password is any address at all; macOS
+/// configures these two alone, and a connection to another address of 127/8
+/// is not refused there but left waiting.
+fn is_localhost(ip: IpAddr) -> bool {
+    ip == IpAddr::V4(Ipv4Addr::LOCALHOST) || ip == IpAddr::V6(Ipv6Addr::LOCALHOST)
+}
 
 #[derive(Clone, Debug)]
 pub struct ShadowsocksScript {
@@ -294,12 +306,11 @@ impl Shared {
     }
 
     /// Where to relay a request; `None`: a name without `connect_to`, or
-    /// an address off the loopback — what a stream cipher decrypts under a
-    /// wrong password is any address at all.
+    /// another address than 127.0.0.1 and ::1.
     fn upstream(&self, request: &RecordedShadowsocks) -> Option<SocketAddr> {
         self.script.connect_to.or_else(|| {
             let ip = request.host.parse::<IpAddr>().ok()?;
-            ip.is_loopback().then(|| SocketAddr::new(ip, request.port))
+            is_localhost(ip).then(|| SocketAddr::new(ip, request.port))
         })
     }
 
@@ -343,9 +354,10 @@ async fn serve(tcp: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
 /// A stream cipher (the original protocol): the client's IV, then the
 /// address and the payload under it, taken as they come; the answer behind
 /// an IV of its own, which leaves with the answer's first bytes. A request
-/// it cannot serve — no address, a name without `connect_to`, an address off
-/// the loopback or one that refuses — gets what a request that does not
-/// decrypt gets from the other methods: no word.
+/// it cannot serve — no address, a name without `connect_to`, another
+/// address than 127.0.0.1 and ::1, or one that refuses or does not answer
+/// within `CONNECT_LIMIT` — gets what a request that does not decrypt gets
+/// from the other methods: no word.
 async fn serve_stream(mut stream: BoxedStream, iv_len: usize, shared: &Shared) -> io::Result<()> {
     let method = shared.script.method;
     let master = kdf::evp_bytes_to_key(shared.script.password.as_bytes(), method.key_len());
@@ -371,7 +383,10 @@ async fn serve_stream(mut stream: BoxedStream, iv_len: usize, shared: &Shared) -
     request.salt = iv;
     shared.record(&request);
     let upstream = match shared.upstream(&request) {
-        Some(to) => TcpStream::connect(to).await.ok(),
+        Some(to) => tokio::time::timeout(CONNECT_LIMIT, TcpStream::connect(to))
+            .await
+            .ok()
+            .and_then(Result::ok),
         None => None,
     };
     let Some(mut upstream) = upstream else {
@@ -1011,9 +1026,9 @@ async fn serve_udp(socket: Arc<UdpSocket>, shared: Arc<Shared>) {
             .expect("datagrams")
             .push(opened.record.clone());
         let to = match (opened.host.parse::<IpAddr>(), shared.script.connect_to) {
-            (Ok(ip), _) if ip.is_loopback() => SocketAddr::new(ip, opened.port),
-            // never off the loopback: what a stream cipher decrypts under
-            // a wrong password is any address at all
+            (Ok(ip), _) if is_localhost(ip) => SocketAddr::new(ip, opened.port),
+            // nowhere else: what a stream cipher decrypts under a wrong
+            // password is any address at all
             (Ok(_), _) => continue,
             (Err(_), Some(addr)) => addr,
             // never resolves: a name without `connect_to` is a dead end

@@ -772,6 +772,24 @@ mod tests {
         );
     }
 
+    /// The same vectors, set 6, vector 0, whose IV is not zeros: the one
+    /// above would hold for a cipher that never took its IV. No server that
+    /// speaks `salsa20` is at hand to tell, so its IV is pinned here.
+    #[test]
+    fn salsa20_under_an_iv_is_ecrypts_too() {
+        assert_eq!(
+            keystream(
+                SsMethod::Salsa20,
+                &h("0053a6f94c9ff24598eb3e91e4378add3083d6297ccf2275c81b6ec11467ba0d"),
+                &h("0d74db42a91077de"),
+                64
+            ),
+            h(
+                "f5fad53f79f9df58c4aea0d0ed9a9601 f278112ca7180d565b420a48019670ea f24ce493a86263f677b46ace1924773d 2bb25571e1aa8593758fc382b1280b71"
+            )
+        );
+    }
+
     /// A stream is encrypted as its writes come: wherever a call ends, in
     /// the middle of a block too, the next one goes on from there.
     #[test]
@@ -1064,6 +1082,129 @@ mod tests {
                 .unwrap();
             let sent = [b"hello", &long[..], &large[..MAX_WRITE]].concat();
             assert!(plain == sent, "{method:?}");
+        }
+    }
+
+    /// What a `Trickle` took, and how much of it was there when a flush and
+    /// when a shutdown got to it.
+    #[derive(Default)]
+    struct Trickled {
+        bytes: Vec<u8>,
+        flushed_at: Vec<usize>,
+        shut_at: Vec<usize>,
+    }
+
+    /// A transport that takes three bytes at a time and is not ready every
+    /// other time it is asked, waking whoever asked.
+    struct Trickle {
+        /// The last write was told to wait: the next one is taken.
+        waited: bool,
+        seen: Arc<Mutex<Trickled>>,
+    }
+
+    impl AsyncRead for Trickle {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Trickle {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if !self.waited {
+                self.waited = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.waited = false;
+            let n = data.len().min(3);
+            let mut seen = self.seen.lock().unwrap();
+            seen.bytes.extend_from_slice(&data[..n]);
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let mut seen = self.seen.lock().unwrap();
+            let so_far = seen.bytes.len();
+            seen.flushed_at.push(so_far);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let mut seen = self.seen.lock().unwrap();
+            let so_far = seen.bytes.len();
+            seen.shut_at.push(so_far);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A caller whose write was not taken at once may flush, or shut the
+    /// stream down, with ciphertext still parked. The keystream of those
+    /// bytes is spent, so they go down first — all of them, in order and
+    /// once — and only then does the flush or the shutdown reach the
+    /// transport.
+    #[test]
+    fn a_flush_or_a_shutdown_sends_what_is_parked_first() {
+        let payload = pattern(40, 251);
+        let mut cx = Context::from_waker(Waker::noop());
+        for shutdown in [false, true] {
+            for method in STREAM {
+                let seen = Arc::new(Mutex::new(Trickled::default()));
+                let transport = Trickle {
+                    waited: false,
+                    seen: seen.clone(),
+                };
+                let mut stream = stream(method, transport);
+                // not ready; three bytes and not ready; three more and not
+                // ready: the write is still the caller's to bring again
+                for _ in 0..3 {
+                    let write = Pin::new(&mut stream).poll_write(&mut cx, &payload);
+                    assert!(write.is_pending(), "{method:?}");
+                }
+                assert_eq!(seen.lock().unwrap().bytes.len(), 6, "{method:?}");
+                let mut waits = 0;
+                loop {
+                    let stream = Pin::new(&mut stream);
+                    let end = if shutdown {
+                        stream.poll_shutdown(&mut cx)
+                    } else {
+                        stream.poll_flush(&mut cx)
+                    };
+                    match end {
+                        Poll::Ready(end) => break end.unwrap(),
+                        Poll::Pending => waits += 1,
+                    }
+                    assert!(waits < 1000, "{method:?}: it never ends");
+                }
+
+                let seen = seen.lock().unwrap();
+                let iv = iv(method, OURS);
+                let whole = iv.len() + payload.len();
+                // the transport had everything when the flush (the
+                // shutdown) got to it, and heard of it once
+                let (flushed_at, shut_at) = if shutdown {
+                    (vec![], vec![whole])
+                } else {
+                    (vec![whole], vec![])
+                };
+                assert_eq!(seen.flushed_at, flushed_at, "{method:?}");
+                assert_eq!(seen.shut_at, shut_at, "{method:?}");
+                assert_eq!(seen.bytes.len(), whole, "{method:?}: once");
+                assert_eq!(seen.bytes[..iv.len()], iv[..], "{method:?}");
+                let mut plain = seen.bytes[iv.len()..].to_vec();
+                Keystream::new(method, &master(method), &iv)
+                    .decrypt(&mut plain)
+                    .unwrap();
+                assert!(plain == payload, "{method:?}: in order");
+                assert!(waits > 0, "{method:?}: it had the transport to wait for");
+            }
         }
     }
 
