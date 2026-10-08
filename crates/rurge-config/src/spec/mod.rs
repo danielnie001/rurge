@@ -526,7 +526,8 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
         notes.inert.retain(|name| *name != "ecn");
         let kind = policy.kind.keyword();
         let which = match &proto {
-            ProtoSpec::TrustTunnel(_) => " without `h3=true`",
+            // over HTTP/3 it does apply
+            ProtoSpec::TrustTunnel(tunnel) if !tunnel.h3 => " without `h3=true`",
             _ => "",
         };
         r.warn(

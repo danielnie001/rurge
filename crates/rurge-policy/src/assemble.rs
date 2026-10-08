@@ -325,8 +325,9 @@ impl<'a> Imports<'a> {
     /// The typed parameters of every import. A line with an error is
     /// skipped (M3-D6); one of a protocol this version does not implement
     /// stays, as REJECT, which is said once per protocol. What a line's
-    /// spec makes rurge say (`Remark`), each group says once for the lines
-    /// it took in.
+    /// spec makes rurge say (`Remark`) is said once per kind by each group
+    /// that brought such a line in first: a line two groups import alike is
+    /// the first one's.
     fn read_specs(&mut self, cfg: &Config, diags: &mut Diagnostics) {
         let kinds: HashMap<String, PolicyKind> = self
             .list
@@ -378,7 +379,7 @@ impl<'a> Imports<'a> {
                         group,
                         codes::W_PROTOCOL_NOT_IMPLEMENTED,
                         format!(
-                            "imported policies of type {what} are not implemented in this version; they behave as REJECT"
+                            "imported policies of type {what} are not supported; they behave as REJECT"
                         ),
                     ));
                 }
@@ -1088,15 +1089,15 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
                 ),
                 (
                     codes::W_PROTOCOL_NOT_IMPLEMENTED,
-                    "policy group `G`: imported policies of type `tailscale` are not implemented in this version; they behave as REJECT".to_string()
+                    "policy group `G`: imported policies of type `tailscale` are not supported; they behave as REJECT".to_string()
                 ),
                 (
                     codes::W_PROTOCOL_NOT_IMPLEMENTED,
-                    "policy group `G`: imported policies of type `ss` with the stream cipher `rc4` are not implemented in this version; they behave as REJECT".to_string()
+                    "policy group `G`: imported policies of type `ss` with the stream cipher `rc4` are not supported; they behave as REJECT".to_string()
                 ),
                 (
                     codes::W_PROTOCOL_NOT_IMPLEMENTED,
-                    "policy group `G`: imported policies of type `snell` version 1 (the default when `version` is not written) are not implemented in this version; they behave as REJECT".to_string()
+                    "policy group `G`: imported policies of type `snell` version 1 (the default when `version` is not written) are not supported; they behave as REJECT".to_string()
                 ),
                 (
                     codes::W_PARAM_NOT_EFFECTIVE,
