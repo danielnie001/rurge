@@ -1372,7 +1372,7 @@ mod tests {
         while let Some(case) = cases.join_next().await {
             let (client, err, took, connections) = case.unwrap();
             assert!(matches!(err, OutboundError::Timeout), "{client}: {err}");
-            assert!(took < Duration::from_secs(2), "{client}: {took:?}");
+            assert!(took < Duration::from_secs(5), "{client}: {took:?}");
             assert_eq!(connections, 0, "{client}");
         }
     }

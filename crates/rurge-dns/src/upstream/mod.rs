@@ -194,6 +194,16 @@ impl UpstreamSpec {
             if url.host_str().is_none() {
                 return Err(format!("`{}`: missing host", quoted(s, rest)));
             }
+            // an `@` only before the host: a user name or a password may
+            // hold the characters that end an authority, and its rest, the
+            // `@` and the host are then the path, which the upstream's name
+            // shows; an `@` of the path's own cannot be told from that one
+            if url[Position::BeforePath..].contains('@') {
+                return Err(format!(
+                    "`{}`: an https:// URL takes an `@` only before its host; a `/`, `?` or `#` of a user name or a password, and an `@` after the host, are written percent-encoded",
+                    quoted(s, rest)
+                ));
+            }
             return Ok(UpstreamSpec::Https(url));
         }
         if let Some(rest) = strip_prefix_ci(s, "h3://") {
@@ -615,6 +625,106 @@ mod tests {
             UpstreamSpec::parse("dns.example").unwrap_err(),
             "`dns.example`: expected ip[:port], tcp://, tls://, https://, h3:// or quic://"
         );
+    }
+
+    /// An `@` beyond the authority of an `https://` URL is refused: a user
+    /// name or a password may hold the characters that end an authority —
+    /// its rest, the `@` and the host then read as a path, and would go
+    /// into the upstream's name —, and an `@` of the path's own cannot be
+    /// told from that one. The error quotes what follows the last `@`.
+    /// Before the host, an `@` is the one of a user name and a password, as
+    /// it was.
+    #[test]
+    fn an_at_sign_beyond_the_authority_of_an_https_url_is_refused() {
+        const SECRET: &str = "hunt3r2-doh";
+        const REFUSED: &str = "an https:// URL takes an `@` only before its host; a `/`, `?` or `#` \
+of a user name or a password, and an `@` after the host, are written percent-encoded";
+        for (written, quoted) in [
+            (
+                format!("https://al1ce:123/{SECRET}@dns.example"),
+                "https://dns.example",
+            ),
+            (
+                format!("https://al1ce:/{SECRET}@dns.example/q"),
+                "https://dns.example/q",
+            ),
+            (
+                format!("https://t0k3n/{SECRET}@dns.example/q"),
+                "https://dns.example/q",
+            ),
+            (
+                format!("HTTPS://al1ce:123?{SECRET}@dns.example"),
+                "HTTPS://dns.example",
+            ),
+            (
+                format!("https://al1ce:123#{SECRET}@dns.example:8443/q"),
+                "https://dns.example:8443/q",
+            ),
+            (
+                format!("https://al1ce:123\\{SECRET}@dns.example"),
+                "https://dns.example",
+            ),
+            // behind a user name and a password where they belong, too
+            (
+                format!("https://al1ce:{SECRET}@dns.example/q?to=a@b"),
+                "https://b",
+            ),
+            // an `@` of the path, of the query, of the fragment
+            (
+                "https://dns.example/@doh/dns-query".to_string(),
+                "https://doh/dns-query",
+            ),
+            (
+                "https://dns.example/dns-query?to=a@b".to_string(),
+                "https://b",
+            ),
+            ("https://dns.example/dns-query#a@b".to_string(), "https://b"),
+        ] {
+            let parsed = UpstreamSpec::parse(&written);
+            // in no text: not the error, nor — were it an upstream — its
+            // name and its `Debug`
+            let shown = format!("{parsed:?}");
+            for secret in [SECRET, "al1ce", "t0k3n"] {
+                assert!(!shown.contains(secret), "{shown}");
+            }
+            assert_eq!(parsed.unwrap_err(), format!("`{quoted}`: {REFUSED}"));
+        }
+        // before the host: in no name, and the URL the requests go to is as
+        // it was written — the last of these has no `@` at all
+        for (written, name) in [
+            (
+                format!("https://al1ce:{SECRET}@dns.example/dns-query"),
+                "https://dns.example/dns-query",
+            ),
+            // what the refusal asks for
+            (
+                format!("https://al1ce:123%2F{SECRET}@dns.example/dns-query"),
+                "https://dns.example/dns-query",
+            ),
+            (
+                "https://dns.example/%40doh/dns-query?to=a%40b".to_string(),
+                "https://dns.example/%40doh/dns-query?to=a%40b",
+            ),
+            (
+                "https://dns.example/dns-query".to_string(),
+                "https://dns.example/dns-query",
+            ),
+        ] {
+            let spec = UpstreamSpec::parse(&written).unwrap();
+            assert_eq!(spec.name(), name);
+            let shown = format!("{spec:?}");
+            assert!(
+                !shown.contains(SECRET) && !shown.contains("al1ce"),
+                "{shown}"
+            );
+            let UpstreamSpec::Https(url) = &spec else {
+                panic!("{spec:?}");
+            };
+            assert_eq!(url.as_str(), written);
+        }
+        // an `@` of the password's own stands before the host as well
+        let spec = UpstreamSpec::parse(&format!("https://al1ce:p@{SECRET}@dns.example/q")).unwrap();
+        assert_eq!(spec.name(), "https://dns.example/q");
     }
 
     #[test]

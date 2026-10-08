@@ -1764,6 +1764,40 @@ h3://alice:123/{PASSWORD}@dns.example"
         }
     }
 
+    /// An `https://` server with an `@` beyond its authority — a `/` in its
+    /// password or in its user name — is no upstream, in
+    /// `encrypted-dns-server` and in `[Host]`: W0026, and neither a warning
+    /// nor an upstream's name says what stands before that `@`.
+    #[tokio::test]
+    async fn an_https_server_with_an_at_sign_beyond_its_authority_is_no_upstream() {
+        const SECRET: &str = "hunt3r2-doh";
+        let e = env(&profile(
+            &format!(
+                "encrypted-dns-server = https://al1ce:123/{SECRET}@dns.example, \
+https://al1ce:/{SECRET}@dns.example/q, https://t0k3n/{SECRET}@dns.example/q, \
+https://dns.example/dns-query"
+            ),
+            &format!("leak.test = server:https://al1ce:123/{SECRET}@dns.example"),
+        ));
+        let (r, diags) = resolver(&e, StaticSystemDns::default());
+        assert_eq!(r.primary_upstreams(), ["https://dns.example/dns-query"]);
+        assert!(r.host_lookup("leak.test").is_none());
+        let mut texts: Vec<String> = diags.iter().map(|d| d.to_string()).collect();
+        assert_eq!(texts.len(), 4, "{texts:?}");
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.code == codes::W_DNS_UPSTREAM_UNSUPPORTED),
+            "{texts:?}"
+        );
+        texts.extend(r.primary_upstreams());
+        for text in &texts {
+            for secret in [SECRET, "al1ce", "t0k3n"] {
+                assert!(!text.contains(secret), "{text}");
+            }
+        }
+    }
+
     /// `quic://` and `h3://` servers are upstreams like the others, in
     /// `encrypted-dns-server` and in `[Host]`: no W0026.
     #[tokio::test]
