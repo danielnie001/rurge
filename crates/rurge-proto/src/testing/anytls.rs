@@ -1,6 +1,8 @@
 //! A scriptable AnyTLS server behind TLS (protocol version 2, or 1 on
 //! request); a stream to the UDP-over-TCP name relays datagrams
-//! (`udp::relay`). It never resolves a name.
+//! (`udp::relay`), and gets its `cmdSYNACK` when the reference server
+//! sends it: once the stream's request has come, not when the stream is
+//! opened. It never resolves a name.
 
 use super::udp::{self, UdpSeen, Wire};
 use super::{AbortOnDrop, TlsFixture};
@@ -116,6 +118,8 @@ type Writer = Box<dyn AsyncWrite + Send + Unpin>;
 
 struct Live {
     to_upstream: Writer,
+    /// A UDP stream whose `cmdSYNACK` waits for its request.
+    owes_synack: bool,
     _reader: AbortOnDrop,
 }
 
@@ -250,8 +254,9 @@ async fn serve(
                         streams.len()
                     };
                     // the stream's `cmdSYNACK`, unless the script keeps it back
+                    let answered = script.unanswered != Some(nth);
                     let synack = |text: &[u8]| {
-                        if script.unanswered != Some(nth) {
+                        if answered {
                             let _ = out.send(frame::frame(frame::SYNACK, sid, text));
                         }
                     };
@@ -260,7 +265,8 @@ async fn serve(
                         live.remove(&sid);
                         continue;
                     }
-                    let upstream: Option<(Reader, Writer)> = if host == UOT_MAGIC {
+                    let udp = host == UOT_MAGIC;
+                    let upstream: Option<(Reader, Writer)> = if udp {
                         // datagrams through a pipe to the UDP relay
                         let (ours, relay) = tokio::io::duplex(1 << 16);
                         let (connect_to, seen) = (script.connect_to, seen.udp.clone());
@@ -290,7 +296,10 @@ async fn serve(
                         live.remove(&sid);
                         continue;
                     };
-                    if !script.v1 {
+                    // A TCP stream is answered once its target is reached. A
+                    // UDP stream, as the reference server does it, once its
+                    // request has come: that follows in the next push.
+                    if !script.v1 && !udp {
                         synack(&[]);
                     }
                     let (mut from_upstream, mut to_upstream) = upstream;
@@ -314,10 +323,17 @@ async fn serve(
                     });
                     *slot = Some(Live {
                         to_upstream,
+                        owes_synack: udp && !script.v1 && answered,
                         _reader: AbortOnDrop(reader),
                     });
                 }
-                Some(Some(stream)) => stream.to_upstream.write_all(&data).await?,
+                Some(Some(stream)) => {
+                    // a UDP stream's request has come: its answer goes out
+                    if std::mem::take(&mut stream.owes_synack) {
+                        let _ = out.send(frame::frame(frame::SYNACK, sid, &[]));
+                    }
+                    stream.to_upstream.write_all(&data).await?;
+                }
                 // a stream that is gone: dropped, as the reference does
                 None => {}
             },

@@ -874,4 +874,49 @@ mod tests {
             (b"unasked".to_vec(), target(stranger.local_addr().unwrap()))
         );
     }
+
+    /// A UDP carrier on a reused session. The server answers the stream
+    /// once it has the stream's request, and that leaves with the first
+    /// datagram: sent right after the open, it brings the answer in time,
+    /// and the carrier goes on past the limit.
+    #[tokio::test]
+    async fn a_udp_carrier_on_a_reused_session_is_answered_with_its_first_datagram() {
+        let (tcp, udp) = (echo_server().await, udp_echo_server().await);
+        let (fixture, fake) = server(script("pw")).await;
+        let out = outbound(&line(&fake, ""), &fixture);
+        a_pooled_session(&out, tcp).await;
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        udp_roundtrip(carrier.as_ref(), udp, b"first").await;
+        the_limit_passes_twice().await;
+        udp_roundtrip(carrier.as_ref(), udp, b"still here").await;
+        assert_eq!(fake.sessions(), 1);
+        assert_eq!(sessions_and_sids(&fake), [(0, 1), (0, 2)]);
+    }
+
+    /// And a carrier that sends nothing has not sent its stream's request
+    /// either: the server has nothing to answer, and on a reused session
+    /// the carrier is gone with the session when the time is up.
+    #[tokio::test]
+    async fn a_udp_carrier_that_sends_nothing_costs_its_reused_session() {
+        let tcp = echo_server().await;
+        let (fixture, fake) = server(script("pw")).await;
+        let out = outbound(&line(&fake, ""), &fixture).with_synack_timeout(ANSWER_WITHIN);
+        let pool = a_pooled_session(&out, tcp).await;
+        let opened = tokio::time::Instant::now();
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        let mut buf = [0u8; 1500];
+        let err = tokio::time::timeout(Duration::from_secs(10), carrier.recv_from(&mut buf))
+            .await
+            .expect("bounded")
+            .unwrap_err();
+        assert_eq!(err.to_string(), "anytls: the session is closed");
+        assert!(
+            opened.elapsed() >= ANSWER_WITHIN,
+            "closed after {:?}",
+            opened.elapsed()
+        );
+        drop(carrier);
+        assert_eq!(pool.len(), 0, "a closed session is not pooled");
+        assert_eq!(fake.sessions(), 1, "the carrier dialled for itself");
+    }
 }

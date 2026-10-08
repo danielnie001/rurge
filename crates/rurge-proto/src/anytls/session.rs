@@ -607,8 +607,19 @@ mod tests {
     fn the_servers_version_is_the_v_of_its_settings() {
         assert_eq!(version_in(b"v=2"), Some(2));
         assert_eq!(version_in(b"padding-md5=0af1\nv=3\nx=y"), Some(3));
-        // no such line, or none that is a number: the version it had
-        for settings in [&b""[..], b"x=2", b"dev=2", b"v", b"v=", b"v=two", b"v=-2"] {
+        assert_eq!(version_in(b"v=2\r\npadding-md5=0af1\r\n"), Some(2));
+        // no such line, or a value that is no number, or not even text: the
+        // version it had
+        for settings in [
+            &b""[..],
+            b"x=2",
+            b"dev=2",
+            b"v",
+            b"v=",
+            b"v=two",
+            b"v=-2",
+            b"v=2\xff",
+        ] {
             assert_eq!(
                 version_in(settings),
                 None,
@@ -616,6 +627,9 @@ mod tests {
                 String::from_utf8_lossy(settings)
             );
         }
+        // as long as a frame can make it: read to its end, and no number
+        let long = [&b"v="[..], &[b'9'; MAX_DATA - 2]].concat();
+        assert_eq!(version_in(&long), None);
     }
 
     /// Not the session's first stream, even when the server is known by
