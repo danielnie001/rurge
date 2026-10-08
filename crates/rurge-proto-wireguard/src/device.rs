@@ -14,8 +14,8 @@ use std::future::{Future, poll_fn};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 use tokio::io::ReadBuf;
@@ -80,11 +80,12 @@ fn may_say(said: &Said, policy: &str, peer: usize, now: Instant) -> bool {
 /// policies that name a section *and* a carrier alike share a tunnel
 /// (`shared_tunnel`), and a tunnel that starts ends every other conflicting
 /// one that is older — its key with a peer in common (`conflict`), whatever
-/// its section or carrier. Every lookup, decision and registration that
-/// touches this table happens inside one critical section, with no
-/// `.await` while the lock is held, so two conflicting tunnels can never
-/// both be registered; a dial that only shares an already-running tunnel
-/// never waits on another tunnel's own dial (P10).
+/// its section or carrier; a tunnel is as late as the latest configuration
+/// that shares it (`Device::share`). Every lookup, decision and
+/// registration that touches this table happens inside one critical
+/// section, with no `.await` while the lock is held, so two conflicting
+/// tunnels can never both be registered; a dial that only shares an
+/// already-running tunnel never waits on another tunnel's own dial (P10).
 static TUNNELS: Mutex<Vec<(WireGuardSection, String, Weak<Device>)>> = Mutex::new(Vec::new());
 
 /// Whether a tunnel of `a` and one of `b` would take each other's packets.
@@ -95,21 +96,62 @@ fn conflict(a: &WireGuardSection, b: &WireGuardSection) -> bool {
             .any(|p| b.peers.iter().any(|q| q.public_key == p.public_key))
 }
 
-/// A live tunnel already registered for `section` and `carrier`, if any;
-/// also drops the table's dead and closed entries. Brief on its own: a
-/// dial that only shares a running tunnel never dials anything, so it never
-/// waits behind another tunnel's start (P10).
-fn shared_tunnel(section: &WireGuardSection, carrier: &str) -> Option<Arc<Device>> {
+/// A live tunnel already registered for `section` and `carrier`, if any,
+/// which the configuration of `generation` shares from now on; also drops
+/// the table's dead and closed entries. Brief on its own: a dial that only
+/// shares a running tunnel never dials anything, so it never waits behind
+/// another tunnel's start (P10).
+fn shared_tunnel(
+    section: &WireGuardSection,
+    carrier: &str,
+    generation: u64,
+) -> Option<Arc<Device>> {
     let mut tunnels = TUNNELS.lock().expect("the tunnels");
     tunnels.retain(|(_, _, device)| device.upgrade().is_some_and(|d| !d.is_closed()));
-    tunnels
+    let device = tunnels
         .iter()
         .find(|(other, key, _)| other == section && key.as_str() == carrier)
-        .and_then(|(_, _, device)| device.upgrade())
+        .and_then(|(_, _, device)| device.upgrade())?;
+    device.share(generation);
+    Some(device)
+}
+
+/// Why a tunnel is over.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Ending {
+    /// A tunnel of a later configuration took over.
+    Superseded,
+    /// Its task ended, or a panic with the stack's lock held left the stack
+    /// as it was at that moment.
+    Closed,
+}
+
+/// What a call on the device fails with once the tunnel is over.
+impl From<Ending> for OutboundError {
+    fn from(ending: Ending) -> OutboundError {
+        match ending {
+            Ending::Superseded => OutboundError::Proxy(
+                "wireguard: a newer configuration of this tunnel is in use".to_string(),
+            ),
+            Ending::Closed => OutboundError::Io(closed()),
+        }
+    }
+}
+
+/// What a connection or a UDP carrier of a tunnel that is over says,
+/// whatever ended the tunnel: it fails, as one whose far end went away
+/// does, and is not used again.
+pub(crate) fn closed() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "wireguard: the tunnel has closed",
+    )
 }
 
 pub(crate) struct Shared {
-    pub(crate) stack: Mutex<Stack>,
+    /// Taken through `stack` and `running` alone: they know what a poisoned
+    /// lock means.
+    stack: Mutex<Stack>,
     /// Wakes the task: a stream read, wrote or closed, a connection opened.
     kick: Notify,
     /// Set by `Device::network_changed`, taken by the task.
@@ -117,15 +159,68 @@ pub(crate) struct Shared {
     /// Set by `Device::handshake`, taken by the task: a handshake with
     /// every peer now.
     greet: AtomicBool,
-    /// Told of every handshake that completes.
+    /// Told of every handshake that completes, and of the tunnel's end.
     handshaken: Notify,
-    /// A tunnel of a later configuration took over.
-    closed: AtomicBool,
+    /// Why the tunnel is over, once it is.
+    ending: OnceLock<Ending>,
 }
 
 impl Shared {
     pub(crate) fn kick(&self) {
         self.kick.notify_one();
+    }
+
+    /// Why the tunnel is over, when it is.
+    pub(crate) fn ending(&self) -> Option<Ending> {
+        self.ending.get().copied()
+    }
+
+    /// The stack, of a tunnel that is over too: its sockets are still
+    /// there, reset. Not after a panic with the lock held, which left the
+    /// stack as it was at that moment: the tunnel is over then, and the
+    /// call fails instead of panicking in its turn.
+    pub(crate) fn stack(&self) -> Result<MutexGuard<'_, Stack>, Ending> {
+        match self.stack.lock() {
+            Ok(stack) => Ok(stack),
+            Err(poisoned) => Err(self.end_with(poisoned.into_inner(), Ending::Closed)),
+        }
+    }
+
+    /// The stack of a tunnel that still runs: nothing put into one that is
+    /// over would ever go out or be answered.
+    pub(crate) fn running(&self) -> Result<MutexGuard<'_, Stack>, Ending> {
+        let stack = self.stack()?;
+        match self.ending() {
+            Some(ending) => Err(ending),
+            None => Ok(stack),
+        }
+    }
+
+    /// The tunnel is over, for `ending` unless something ended it before:
+    /// nothing more goes out, every connection through it fails, and
+    /// whoever waits on it is woken.
+    fn end(&self, ending: Ending) {
+        // a poisoned stack still holds the sockets, and the wakers of
+        // whoever waits on one
+        let stack = self.stack.lock().unwrap_or_else(PoisonError::into_inner);
+        self.end_with(stack, ending);
+    }
+
+    /// `end`, by whoever holds the stack's lock already; what ended the
+    /// tunnel. The ending is set with the lock held, here alone: whoever
+    /// looks for it with the lock held either finds it, or has left a waker
+    /// in a socket before the sockets are reset.
+    fn end_with(&self, mut stack: MutexGuard<'_, Stack>, ending: Ending) -> Ending {
+        if let Some(first) = self.ending() {
+            return first;
+        }
+        let _ = self.ending.set(ending);
+        stack.abort_all();
+        drop(stack);
+        // the task leaves its loop
+        self.kick();
+        self.handshaken.notify_waiters();
+        ending
     }
 }
 
@@ -134,8 +229,10 @@ impl Shared {
 pub struct Device {
     pub(crate) shared: Arc<Shared>,
     task: AbortOnDropHandle<()>,
-    /// The `WireGuardOutbound::generation` that started it.
-    generation: u64,
+    /// The latest configuration that uses it: the
+    /// `WireGuardOutbound::generation` that started it, or a later one that
+    /// shares it.
+    generation: AtomicU64,
 }
 
 struct Carrier {
@@ -161,7 +258,7 @@ impl Device {
         opts: &ConnectOpts,
         redial: Duration,
     ) -> Result<Arc<Device>, OutboundError> {
-        if let Some(device) = shared_tunnel(section, carrier) {
+        if let Some(device) = shared_tunnel(section, carrier, generation) {
             return Ok(device);
         }
         let endpoints: Vec<Target> = section
@@ -206,16 +303,17 @@ impl Device {
         }
         // built before the critical section: a panic while building it
         // cannot poison the table for the rest of the process
+        let mut stack = Stack::new(section);
+        let mut out = Vec::new();
+        stack.initiate(&mut out);
         let shared = Arc::new(Shared {
-            stack: Mutex::new(Stack::new(section)),
+            stack: Mutex::new(stack),
             kick: Notify::new(),
             network_changed: AtomicBool::new(false),
             greet: AtomicBool::new(false),
             handshaken: Notify::new(),
-            closed: AtomicBool::new(false),
+            ending: OnceLock::new(),
         });
-        let mut out = Vec::new();
-        shared.stack.lock().expect("the tunnel").initiate(&mut out);
         // one critical section: sharing (another dial may have got there
         // first), conflict and registration decided and acted on together,
         // with no `.await` inside it — so two conflicting tunnels can never
@@ -229,12 +327,11 @@ impl Device {
             if other == section && key.as_str() == carrier {
                 // the carriers just dialled, and the stack just built, are
                 // dropped with this frame
+                device.share(generation);
                 return Ok(device);
             }
-            if conflict(other, section) && device.generation > generation {
-                return Err(OutboundError::Proxy(
-                    "wireguard: a newer configuration of this tunnel is in use".to_string(),
-                ));
+            if conflict(other, section) && device.generation.load(Ordering::SeqCst) > generation {
+                return Err(Ending::Superseded.into());
             }
         }
         // the tunnel it replaces goes quiet before a peer hears of this one
@@ -262,7 +359,7 @@ impl Device {
         let device = Arc::new(Device {
             shared,
             task: AbortOnDropHandle::new(task),
-            generation,
+            generation: AtomicU64::new(generation),
         });
         tunnels.push((
             section.clone(),
@@ -272,18 +369,27 @@ impl Device {
         Ok(device)
     }
 
-    /// A tunnel of a later configuration took over: nothing more goes out,
-    /// and every connection through this one fails.
-    fn close(&self) {
-        self.shared.closed.store(true, Ordering::SeqCst);
-        self.task.abort();
-        if let Ok(mut stack) = self.shared.stack.lock() {
-            stack.abort_all();
-        }
+    /// The configuration of `generation` uses the tunnel too. The tunnel is
+    /// as late as the latest configuration that uses it: after the reloads
+    /// S → S′ → S, with a connection keeping the first tunnel running, what
+    /// is left of S′ does not take over the tunnel S shares again.
+    fn share(&self, generation: u64) {
+        self.generation.fetch_max(generation, Ordering::SeqCst);
     }
 
+    /// A tunnel of a later configuration took over: nothing more goes out,
+    /// every connection through this one fails, and whoever waits on it
+    /// is told so.
+    fn close(&self) {
+        self.shared.end(Ending::Superseded);
+        self.task.abort();
+    }
+
+    /// Whether the tunnel is over: a later configuration took over, its
+    /// task ended, or the stack's lock was poisoned. Whoever holds it starts
+    /// another.
     pub(crate) fn is_closed(&self) -> bool {
-        self.shared.closed.load(Ordering::SeqCst)
+        self.shared.ending().is_some()
     }
 
     /// The network changed: every carrier is dialled anew and each peer
@@ -294,56 +400,49 @@ impl Device {
     }
 
     /// A handshake with every peer now, however fresh their sessions: how
-    /// long until the first completed (phase 2 M4 design 6.7).
-    pub(crate) async fn handshake(&self) -> Duration {
+    /// long until the first completed (phase 2 M4 design 6.7). An error
+    /// when the tunnel is over, as soon as it is.
+    pub(crate) async fn handshake(&self) -> Result<Duration, OutboundError> {
         let asked = Instant::now();
         self.shared.greet.store(true, Ordering::SeqCst);
         self.shared.kick();
         loop {
+            // before the look at the tunnel: its end wakes this too
             let mut completed = pin!(self.shared.handshaken.notified());
             completed.as_mut().enable();
-            let last = self
-                .shared
-                .stack
-                .lock()
-                .expect("the tunnel")
-                .last_handshake();
+            let last = self.shared.running()?.last_handshake();
             if let Some(at) = last.filter(|at| *at > asked) {
-                return at - asked;
+                return Ok(at - asked);
             }
             completed.await;
         }
     }
 
     /// Once a handshake the tunnel started has completed, with any peer: at
-    /// once when one has.
-    pub(crate) async fn established(&self) {
+    /// once when one has. An error when the tunnel is over, as soon as it
+    /// is.
+    pub(crate) async fn established(&self) -> Result<(), OutboundError> {
         loop {
+            // before the look at the tunnel: its end wakes this too
             let mut completed = pin!(self.shared.handshaken.notified());
             completed.as_mut().enable();
-            let last = self
-                .shared
-                .stack
-                .lock()
-                .expect("the tunnel")
-                .last_handshake();
+            let last = self.shared.running()?.last_handshake();
             if last.is_some() {
-                return;
+                return Ok(());
             }
             completed.await;
         }
     }
 
     /// A TCP connection to `to` through the tunnel, once it is established.
+    /// An error when the tunnel is over, as soon as it is.
     pub(crate) async fn connect(
         self: &Arc<Device>,
         to: SocketAddr,
     ) -> Result<TunnelStream, OutboundError> {
         let handle = self
             .shared
-            .stack
-            .lock()
-            .expect("the tunnel")
+            .running()?
             .connect(to)
             .map_err(|refusal| OutboundError::Proxy(refusal.to_string()))?;
         self.shared.kick();
@@ -358,22 +457,24 @@ impl Device {
     /// within `wait`. Until one comes, `message` goes out again every
     /// third of `wait`, on the same socket: one lost packet, either way,
     /// does not lose the exchange. `None` when none came, or no peer takes
-    /// `server`.
+    /// `server`; an error when the tunnel is over, as soon as it is.
     pub(crate) async fn query<T>(
         self: &Arc<Device>,
         server: SocketAddr,
         message: &[u8],
         wait: Duration,
         accept: impl Fn(&[u8]) -> Option<T>,
-    ) -> Option<T> {
+    ) -> Result<Option<T>, OutboundError> {
         let socket = {
-            let mut stack = self.shared.stack.lock().expect("the tunnel");
-            let handle = stack.udp_open(server.ip()).ok()?;
+            let mut stack = self.shared.running()?;
+            let Ok(handle) = stack.udp_open(server.ip()) else {
+                return Ok(None);
+            };
             // the exchange takes the socket once the question is out: its
             // drop takes this lock
             if stack.udp(handle).send_slice(message, server).is_err() {
                 stack.udp_close(handle);
-                return None;
+                return Ok(None);
             }
             UdpExchange {
                 device: self.clone(),
@@ -382,15 +483,16 @@ impl Device {
         };
         self.shared.kick();
         let first = tokio::time::Instant::now();
-        let mut answer = pin!(poll_fn(|cx| {
-            let mut stack = self.shared.stack.lock().expect("the tunnel");
+        let mut answer = pin!(poll_fn(|cx| -> Poll<Result<T, OutboundError>> {
+            // the tunnel's end closes the socket, which wakes this
+            let mut stack = self.shared.running()?;
             let udp = stack.udp(socket.handle);
             while let Ok((datagram, meta)) = udp.recv() {
                 let from = SocketAddr::new(meta.endpoint.addr.into(), meta.endpoint.port);
                 if from == server
                     && let Some(answer) = accept(datagram)
                 {
-                    return Poll::Ready(answer);
+                    return Poll::Ready(Ok(answer));
                 }
             }
             udp.register_recv_waker(cx.waker());
@@ -401,19 +503,29 @@ impl Device {
                 // the same question again: its answer is what `accept` takes
                 let _ = self
                     .shared
-                    .stack
-                    .lock()
-                    .expect("the tunnel")
+                    .running()?
                     .udp(socket.handle)
                     .send_slice(message, server);
                 self.shared.kick();
             }
             let until = first + wait * round / SENDS;
             if let Ok(answer) = tokio::time::timeout_at(until, answer.as_mut()).await {
-                return Some(answer);
+                return answer.map(Some);
             }
         }
-        None
+        Ok(None)
+    }
+
+    /// Poisons the stack's lock, as a panic with it held does (a test's).
+    #[cfg(test)]
+    pub(crate) fn poison(self: &Arc<Device>) {
+        let device = self.clone();
+        let panicked = std::thread::spawn(move || {
+            let _stack = device.shared.stack.lock();
+            panic!("a panic with the stack's lock held (a test's)");
+        })
+        .join();
+        assert!(panicked.is_err());
     }
 }
 
@@ -425,7 +537,7 @@ struct UdpExchange {
 
 impl Drop for UdpExchange {
     fn drop(&mut self) {
-        if let Ok(mut stack) = self.device.shared.stack.lock() {
+        if let Ok(mut stack) = self.device.shared.stack() {
             stack.udp_close(self.handle);
         }
     }
@@ -531,6 +643,15 @@ struct Driver {
     replaced: Vec<Option<Instant>>,
 }
 
+/// However the task ends — of a panic too —, the tunnel is over with it:
+/// whoever holds the device starts another, and whoever waits on this one
+/// is woken instead of waiting for a task that is gone.
+impl Drop for Driver {
+    fn drop(&mut self) {
+        self.shared.end(Ending::Closed);
+    }
+}
+
 impl Driver {
     /// Dials the carriers of `peers` side by side; `anew`: the new carriers
     /// replace the old whatever they go to.
@@ -613,22 +734,21 @@ impl Driver {
             datagram,
             marks: true,
         });
-        self.shared
-            .stack
-            .lock()
-            .expect("the tunnel")
-            .initiate_peer(peer, out);
+        // a poisoned stack greets nobody: the task ends at its next turn
+        if let Ok(mut stack) = self.shared.stack() {
+            stack.initiate_peer(peer, out);
+        }
     }
 
     /// What goes out now, to the peers that have a carrier; the peers whose
     /// carrier lost its local address or its route sending some of it.
-    /// Nothing more goes out once a newer tunnel has taken over: what is
-    /// left in `out` is dropped (P10).
+    /// Nothing more goes out once the tunnel is over — a newer one has
+    /// taken over —: what is left in `out` is dropped (P10).
     async fn send_all(&mut self, out: &mut Vec<Outgoing>) -> Vec<usize> {
         let mut failed = Vec::new();
         for message in out.drain(..) {
             // leaving the loop drops the rest of the drain
-            if self.shared.closed.load(Ordering::SeqCst) {
+            if self.shared.ending().is_some() {
                 return Vec::new();
             }
             let Some(Some(carrier)) = self.carriers.get_mut(message.peer) else {
@@ -654,8 +774,9 @@ impl Driver {
         let mut first = 0;
         let mut dials = JoinSet::new();
         loop {
-            // a newer configuration took over: nothing more goes out (P10)
-            if self.shared.closed.load(Ordering::SeqCst) {
+            // the tunnel is over — a newer configuration took over, or the
+            // stack's lock was found poisoned —: nothing more goes out (P10)
+            if self.shared.ending().is_some() {
                 return;
             }
             let now = Instant::now();
@@ -680,14 +801,15 @@ impl Driver {
                 self.replace_failed(&mut dials, lost);
             }
             if self.shared.greet.swap(false, Ordering::SeqCst) {
-                self.shared
-                    .stack
-                    .lock()
-                    .expect("the tunnel")
-                    .initiate(&mut out);
+                let Ok(mut stack) = self.shared.stack() else {
+                    return;
+                };
+                stack.initiate(&mut out);
             }
             let (deadline, unanswered) = {
-                let mut stack = self.shared.stack.lock().expect("the tunnel");
+                let Ok(mut stack) = self.shared.stack() else {
+                    return;
+                };
                 let mut unanswered = Vec::new();
                 if now >= next_tick {
                     for peer in stack.tick(&mut out) {
@@ -725,7 +847,9 @@ impl Driver {
                             // the lock is for the stack alone: the carriers
                             // are read outside it
                             Ok(n) => {
-                                let mut stack = self.shared.stack.lock().expect("the tunnel");
+                                let Ok(mut stack) = self.shared.stack() else {
+                                    return;
+                                };
                                 if stack.receive(peer, &mut buf[..n], Instant::now(), &mut out) {
                                     completed.push(peer);
                                 }

@@ -3,7 +3,7 @@
 //! for datagrams to and from anywhere the peers take — full cone. Each
 //! datagram leaves through the peer its destination routes to.
 
-use crate::device::Device;
+use crate::device::{Device, closed};
 use crate::outbound::Names;
 use rurge_config::HostName;
 use rurge_net::BoxFuture;
@@ -30,15 +30,6 @@ fn slot(ip: IpAddr) -> usize {
         IpAddr::V4(_) => 0,
         IpAddr::V6(_) => 1,
     }
-}
-
-/// What a carrier of a tunnel that ended says: the flow fails, as a TCP
-/// connection does, and the carrier is not used again.
-fn closed() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::ConnectionAborted,
-        "wireguard: the tunnel has closed",
-    )
 }
 
 impl TunnelUdp {
@@ -79,7 +70,8 @@ impl PacketSocket for TunnelUdp {
             }
             let ip = self.address(to).await?;
             {
-                let mut stack = self.device.shared.stack.lock().expect("the tunnel");
+                // the tunnel may have ended while the name was looked up
+                let mut stack = self.device.shared.running().map_err(|_| closed())?;
                 stack.check(ip).map_err(|refusal| {
                     io::Error::new(io::ErrorKind::Unsupported, refusal.to_string())
                 })?;
@@ -124,7 +116,7 @@ impl PacketSocket for TunnelUdp {
             // told of a socket that opens from here on
             *self.receiver.lock().expect("the receiver") = Some(cx.waker().clone());
             let handles = *self.sockets.lock().expect("the sockets");
-            let mut stack = self.device.shared.stack.lock().expect("the tunnel");
+            let mut stack = self.device.shared.stack().map_err(|_| closed())?;
             for handle in handles.into_iter().flatten() {
                 let socket = stack.udp(handle);
                 if let Ok((datagram, meta)) = socket.recv() {
@@ -148,7 +140,7 @@ impl PacketSocket for TunnelUdp {
 impl Drop for TunnelUdp {
     fn drop(&mut self) {
         let handles = *self.sockets.lock().expect("the sockets");
-        if let Ok(mut stack) = self.device.shared.stack.lock() {
+        if let Ok(mut stack) = self.device.shared.stack() {
             for handle in handles.into_iter().flatten() {
                 stack.udp_close(handle);
             }

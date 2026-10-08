@@ -103,6 +103,10 @@ impl WireGuardOutbound {
         }
     }
 
+    /// The policy's tunnel: the one it has, while that runs; else another
+    /// — the first time, and once the one it had is over (a later
+    /// configuration took it over, its task died, its stack's lock was
+    /// poisoned).
     pub(crate) async fn device(&self, opts: &ConnectOpts) -> Result<Arc<Device>, OutboundError> {
         let mut slot = self.device.lock().await;
         if let Some(device) = slot.as_ref()
@@ -158,17 +162,22 @@ impl Names {
         };
         let addrs = self
             .lookup(name, device)
-            .await
+            .await?
             .ok_or_else(|| OutboundError::Dns(format!("wireguard: dns lookup of {name} failed")))?;
         pick(&addrs, &self.section).map_err(|refusal| OutboundError::Proxy(refusal.to_string()))
     }
 
     /// `name`'s addresses: from the section's `dns-server`s in order through
     /// the tunnel — the first that answers ends the search, `system` asks
-    /// this machine — or, without any, from this machine (M4-D9).
-    async fn lookup(&self, name: &str, device: &Arc<Device>) -> Option<Vec<IpAddr>> {
+    /// this machine — or, without any, from this machine (M4-D9). An error
+    /// when the tunnel is over: none of its servers would answer.
+    async fn lookup(
+        &self,
+        name: &str,
+        device: &Arc<Device>,
+    ) -> Result<Option<Vec<IpAddr>>, OutboundError> {
         if self.section.dns_servers.is_empty() {
-            return self.resolver.resolve(name).await.ok();
+            return Ok(self.resolver.resolve(name).await.ok());
         }
         if let Some(addrs) = self
             .cache
@@ -176,12 +185,12 @@ impl Names {
             .expect("the cache")
             .get(name, Instant::now())
         {
-            return Some(addrs);
+            return Ok(Some(addrs));
         }
         for server in &self.section.dns_servers {
             let server = match server {
                 TunnelDns::System => match self.resolver.resolve(name).await {
-                    Ok(addrs) => return Some(addrs),
+                    Ok(addrs) => return Ok(Some(addrs)),
                     Err(_) => continue,
                 },
                 TunnelDns::Server(server) => *server,
@@ -189,8 +198,8 @@ impl Names {
             // a question sent before the tunnel's first handshake waits for
             // it in boringtun, whose retry of a lost initiation comes after
             // `dns_wait`: the handshake first, within the dial's own time
-            device.established().await;
-            let Some(answer) = self.ask(device, server, name).await else {
+            device.established().await?;
+            let Some(answer) = self.ask(device, server, name).await? else {
                 continue;
             };
             let ttl = answer.iter().map(|(_, ttl)| *ttl).min().unwrap_or(0);
@@ -201,42 +210,42 @@ impl Names {
                 Duration::from_secs(ttl.into()),
                 Instant::now(),
             );
-            return (!addrs.is_empty()).then_some(addrs);
+            return Ok((!addrs.is_empty()).then_some(addrs));
         }
-        None
+        Ok(None)
     }
 
     /// `server`'s answer for `name`: A and AAAA at once, for the families
     /// the tunnel has an address of. `None` when it has not answered
-    /// (`dns::answered`) within `dns_wait`, or no peer takes it.
+    /// (`dns::answered`) within `dns_wait`, or no peer takes it; an error
+    /// when the tunnel is over.
     async fn ask(
         &self,
         device: &Arc<Device>,
         server: SocketAddr,
         name: &str,
-    ) -> Option<Vec<(IpAddr, u32)>> {
+    ) -> Result<Option<Vec<(IpAddr, u32)>>, OutboundError> {
         // `None` for a family not asked, else what came of its question
         let ask = |family: Family, wanted: bool| async move {
             if !wanted {
-                return None;
+                return Ok(None);
             }
             let id = getrandom::u32().unwrap_or(0) as u16;
             let Some(question) = dns::question(id, name, family) else {
-                return Some(None);
+                return Ok(Some(None));
             };
-            Some(
-                device
-                    .query(server, &question, self.dns_wait, |reply| {
-                        dns::answer(reply, id, name, family)
-                    })
-                    .await,
-            )
+            device
+                .query(server, &question, self.dns_wait, |reply| {
+                    dns::answer(reply, id, name, family)
+                })
+                .await
+                .map(Some)
         };
         let (v4, v6) = tokio::join!(
             ask(Family::V4, self.section.self_ip.is_some()),
             ask(Family::V6, self.section.self_ip_v6.is_some())
         );
-        dns::answered(v4.into_iter().chain(v6).collect())
+        Ok(dns::answered(v4?.into_iter().chain(v6?).collect()))
     }
 }
 
@@ -282,7 +291,7 @@ impl Outbound for WireGuardOutbound {
     fn native_test(&self) -> Option<BoxFuture<'_, Result<Duration, OutboundError>>> {
         Some(Box::pin(async move {
             let device = self.device(&ConnectOpts::default()).await?;
-            Ok(device.handshake().await)
+            device.handshake().await
         }))
     }
 
@@ -1861,5 +1870,481 @@ mod tests {
             let err = carrier.send_to(b"x", &at(host, 53)).await.unwrap_err();
             assert_eq!(err.to_string(), text);
         }
+    }
+
+    const SUPERSEDED: &str = "wireguard: a newer configuration of this tunnel is in use";
+    const CLOSED: &str = "wireguard: the tunnel has closed";
+
+    /// Dials through `inner`; once `armed` is set, the next receive on one
+    /// of its carriers panics, and the device's task with it. Once only: a
+    /// carrier dialled after that works.
+    struct Fragile {
+        inner: Arc<dyn Connector>,
+        armed: Arc<AtomicBool>,
+    }
+
+    struct FragileDatagram {
+        inner: BoxedDatagram,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl Connector for Fragile {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            self.inner.connect(target, opts)
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            Box::pin(async move {
+                let inner = self.inner.connect_udp(target, opts).await?;
+                let armed = self.armed.clone();
+                Ok(Box::new(FragileDatagram { inner, armed }) as BoxedDatagram)
+            })
+        }
+    }
+
+    impl Datagram for FragileDatagram {
+        fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            self.inner.poll_send(cx, buf)
+        }
+
+        fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                panic!("a carrier that panics when polled (a test's)");
+            }
+            self.inner.poll_recv(cx, buf)
+        }
+
+        fn peer_addr(&self) -> Option<SocketAddr> {
+            self.inner.peer_addr()
+        }
+    }
+
+    /// A tunnel as `tunnel` gives, over `Fragile` carriers, and the switch
+    /// that kills its task.
+    async fn fragile_tunnel(
+        opts: PeerOpts,
+        edit: impl FnOnce(&mut WireGuardSection),
+    ) -> (FakeWgPeer, WireGuardOutbound, Arc<AtomicBool>) {
+        let armed = Arc::new(AtomicBool::new(false));
+        let fragile: Arc<dyn Connector> = Arc::new(Fragile {
+            inner: direct(),
+            armed: armed.clone(),
+        });
+        let (peer, wg) = tunnel_with(opts, edit, no_names(), fragile).await;
+        (peer, wg, armed)
+    }
+
+    /// The task of the tunnel whose carriers `armed` belongs to dies of a
+    /// panic.
+    async fn dies(armed: &AtomicBool) {
+        armed.store(true, Ordering::SeqCst);
+        until(|| !armed.load(Ordering::SeqCst)).await;
+    }
+
+    /// A later configuration of `old`'s tunnel, with its own tunnel started:
+    /// `old`'s is over.
+    async fn superseding(old: &WireGuardOutbound) -> WireGuardOutbound {
+        let mut section = old.names.section.clone();
+        section.mtu = 1400;
+        let new = WireGuardOutbound::new("WG", &WireGuardSpec { section }, no_names(), direct());
+        new.device(&within(5))
+            .await
+            .expect("the later configuration's tunnel starts");
+        new
+    }
+
+    /// The device's task died — here of a panic: the next connection starts
+    /// a new tunnel instead of waiting on the dead one, and the connections
+    /// the dead one carried end.
+    #[tokio::test]
+    async fn a_tunnel_whose_task_died_is_replaced_by_the_next_connection() {
+        let (peer, wg, armed) = fragile_tunnel(PeerOpts::default(), |_| {}).await;
+        let to = at("10.0.0.1", ECHO_PORT);
+        let mut stream = wg.connect_tcp(&to, &within(5)).await.expect("a connection");
+        assert_eq!(echo(&mut stream, b"before").await, b"before");
+        assert_eq!(peer.core().handshakes, 1);
+
+        dies(&armed).await;
+        let mut fresh = wg
+            .connect_tcp(&to, &within(5))
+            .await
+            .expect("a connection through a new tunnel");
+        assert_eq!(echo(&mut fresh, b"after").await, b"after");
+        assert_eq!(peer.core().handshakes, 2, "a new tunnel greeted the peer");
+        let mut buf = [0u8; 8];
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf))
+            .await
+            .expect("the dead tunnel's connection ends at once");
+        assert!(read.is_err(), "{read:?}");
+    }
+
+    /// A panic with the stack's lock held leaves the lock poisoned. The call
+    /// that finds it so fails, saying the tunnel has closed, instead of
+    /// panicking in its turn; the next connection starts a new tunnel.
+    #[tokio::test]
+    async fn a_poisoned_stack_fails_the_call_and_the_next_connection_starts_a_new_tunnel() {
+        let (peer, wg) = tunnel(PeerOpts::default(), |_| {}).await;
+        let to = at("10.0.0.1", ECHO_PORT);
+        let mut stream = wg.connect_tcp(&to, &within(5)).await.expect("a connection");
+        assert_eq!(echo(&mut stream, b"before").await, b"before");
+
+        wg.device(&within(5)).await.unwrap().poison();
+        let e = wg
+            .connect_tcp(&to, &within(5))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(e.to_string(), CLOSED);
+        let mut fresh = wg
+            .connect_tcp(&to, &within(5))
+            .await
+            .expect("a connection through a new tunnel");
+        assert_eq!(echo(&mut fresh, b"after").await, b"after");
+        assert_eq!(peer.core().handshakes, 2, "a new tunnel greeted the peer");
+    }
+
+    /// Whoever holds a tunnel whose stack's lock is poisoned — a connection,
+    /// a UDP carrier, a call on the device — gets an error, not a panic;
+    /// and letting go of it does not panic either.
+    #[tokio::test]
+    async fn nothing_panics_on_a_poisoned_stack() {
+        let (_peer, wg) = tunnel(PeerOpts::default(), |_| {}).await;
+        let to = at("10.0.0.1", ECHO_PORT);
+        let mut stream = wg.connect_tcp(&to, &within(5)).await.expect("a connection");
+        assert_eq!(echo(&mut stream, b"before").await, b"before");
+        let carrier = wg.open_udp(&within(5)).await.expect("a carrier");
+        carrier.send_to(b"before", &to).await.unwrap();
+        udp_answer(carrier.as_ref()).await;
+        let device = wg.device(&within(5)).await.unwrap();
+
+        device.poison();
+        let read = stream.read(&mut [0u8; 8]).await.unwrap_err();
+        assert_eq!(read.to_string(), CLOSED);
+        let written = stream.write(b"x").await.unwrap_err();
+        assert_eq!(written.to_string(), CLOSED);
+        let shut = stream.shutdown().await.unwrap_err();
+        assert_eq!(shut.to_string(), CLOSED);
+        let sent = carrier.send_to(b"x", &to).await.unwrap_err();
+        assert_eq!(sent.to_string(), CLOSED);
+        let received = carrier.recv_from(&mut [0u8; 64]).await.unwrap_err();
+        assert_eq!(received.to_string(), CLOSED);
+        assert_eq!(refusals(&device).await, [CLOSED; 4]);
+        drop((stream, carrier, device));
+    }
+
+    /// What each of the device's waits fails with on a tunnel that is over:
+    /// each within a second.
+    async fn refusals(device: &Arc<Device>) -> [String; 4] {
+        let to: SocketAddr = "10.0.0.1:7".parse().unwrap();
+        let at_once = Duration::from_secs(1);
+        let connect = tokio::time::timeout(at_once, device.connect(to))
+            .await
+            .expect("the connection fails at once")
+            .map(|_| ())
+            .unwrap_err();
+        let exchange = device.query(to, b"?", Duration::from_secs(30), |_| Some(()));
+        let query = tokio::time::timeout(at_once, exchange)
+            .await
+            .expect("the exchange fails at once")
+            .unwrap_err();
+        let handshake = tokio::time::timeout(at_once, device.handshake())
+            .await
+            .expect("the handshake fails at once")
+            .unwrap_err();
+        let established = tokio::time::timeout(at_once, device.established())
+            .await
+            .expect("the wait for the first handshake fails at once")
+            .unwrap_err();
+        [connect, query, handshake, established].map(|e| e.to_string())
+    }
+
+    /// A call that got the device before the tunnel was over, and comes to
+    /// it after, fails at once: nothing on a tunnel that is over would ever
+    /// answer it. It says why the tunnel is over.
+    #[tokio::test]
+    async fn a_call_on_a_tunnel_that_is_over_fails_at_once() {
+        let (_peer, old) = tunnel(PeerOpts::default(), |_| {}).await;
+        let device = old.device(&within(5)).await.unwrap();
+        let _new = superseding(&old).await;
+        assert_eq!(refusals(&device).await, [SUPERSEDED; 4]);
+
+        let (_peer, wg, armed) = fragile_tunnel(PeerOpts::default(), |_| {}).await;
+        let device = wg.device(&within(5)).await.unwrap();
+        dies(&armed).await;
+        assert_eq!(refusals(&device).await, [CLOSED; 4]);
+    }
+
+    /// Where a call through the outbound waits on the device.
+    #[derive(Clone, Copy)]
+    enum Wait {
+        /// `Device::connect`: the dial of an address.
+        Connect,
+        /// `Device::query`: the dial of a name, its question out.
+        Query,
+        /// `Device::handshake`: the native test.
+        Handshake,
+        /// `Device::established`: the dial of a name, before its question.
+        Established,
+    }
+
+    /// A call that waits on the device, on a tunnel whose peer never lets
+    /// it go on.
+    struct Parked {
+        _peer: FakeWgPeer,
+        wg: Arc<WireGuardOutbound>,
+        /// Kills the tunnel's task (`Fragile`).
+        armed: Arc<AtomicBool>,
+        call: tokio::task::JoinHandle<Result<(), OutboundError>>,
+    }
+
+    async fn parked(wait: Wait) -> Parked {
+        // the name server never answers; for the other waits, the handshake
+        // never completes
+        let opts = match wait {
+            Wait::Query => PeerOpts {
+                dns_ignore: usize::MAX,
+                ..PeerOpts::default()
+            },
+            _ => PeerOpts {
+                handshake_ignore: usize::MAX,
+                ..PeerOpts::default()
+            },
+        };
+        let by_name = matches!(wait, Wait::Query | Wait::Established);
+        let (peer, mut wg, armed) = fragile_tunnel(opts, |s| {
+            if by_name {
+                s.dns_servers = vec![TunnelDns::Server(SocketAddr::new(DNS_ADDRESS.into(), 53))];
+            }
+        })
+        .await;
+        // no round of the lookup runs out while the test waits
+        wg.set_dns_wait(Duration::from_secs(30));
+        let wg = Arc::new(wg);
+        let call = tokio::spawn({
+            let wg = wg.clone();
+            async move {
+                let host = if by_name { "echo.test" } else { "10.0.0.1" };
+                match wait {
+                    Wait::Handshake => {
+                        let test = wg.native_test().expect("wireguard has one");
+                        test.await.map(|_| ())
+                    }
+                    _ => wg
+                        .connect_tcp(&at(host, ECHO_PORT), &within(30))
+                        .await
+                        .map(|_| ()),
+                }
+            }
+        });
+        // the peer heard of it: the call is where it waits
+        until(|| match wait {
+            Wait::Query => !peer.core().dns_questions.is_empty(),
+            _ => !peer.core().reserved.is_empty(),
+        })
+        .await;
+        Parked {
+            _peer: peer,
+            wg,
+            armed,
+            call,
+        }
+    }
+
+    /// What a parked call fails with once its tunnel is over: within a
+    /// second, not when its own time runs out.
+    async fn failure(call: tokio::task::JoinHandle<Result<(), OutboundError>>) -> String {
+        tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("the call ends at once")
+            .expect("the call does not panic")
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_dial_waiting_to_connect_ends_when_a_later_configuration_takes_over() {
+        let parked = parked(Wait::Connect).await;
+        let _new = superseding(&parked.wg).await;
+        assert_eq!(failure(parked.call).await, SUPERSEDED);
+    }
+
+    #[tokio::test]
+    async fn a_lookup_waiting_for_its_answer_ends_when_a_later_configuration_takes_over() {
+        let parked = parked(Wait::Query).await;
+        let _new = superseding(&parked.wg).await;
+        assert_eq!(failure(parked.call).await, SUPERSEDED);
+    }
+
+    #[tokio::test]
+    async fn a_native_test_waiting_for_the_handshake_ends_when_a_later_configuration_takes_over() {
+        let parked = parked(Wait::Handshake).await;
+        let _new = superseding(&parked.wg).await;
+        assert_eq!(failure(parked.call).await, SUPERSEDED);
+    }
+
+    #[tokio::test]
+    async fn a_lookup_waiting_for_the_first_handshake_ends_when_a_later_configuration_takes_over() {
+        let parked = parked(Wait::Established).await;
+        let _new = superseding(&parked.wg).await;
+        assert_eq!(failure(parked.call).await, SUPERSEDED);
+    }
+
+    #[tokio::test]
+    async fn a_dial_waiting_to_connect_ends_when_the_tunnel_closes() {
+        let parked = parked(Wait::Connect).await;
+        dies(&parked.armed).await;
+        assert_eq!(failure(parked.call).await, CLOSED);
+    }
+
+    #[tokio::test]
+    async fn a_lookup_waiting_for_its_answer_ends_when_the_tunnel_closes() {
+        let parked = parked(Wait::Query).await;
+        dies(&parked.armed).await;
+        assert_eq!(failure(parked.call).await, CLOSED);
+    }
+
+    #[tokio::test]
+    async fn a_native_test_waiting_for_the_handshake_ends_when_the_tunnel_closes() {
+        let parked = parked(Wait::Handshake).await;
+        dies(&parked.armed).await;
+        assert_eq!(failure(parked.call).await, CLOSED);
+    }
+
+    #[tokio::test]
+    async fn a_lookup_waiting_for_the_first_handshake_ends_when_the_tunnel_closes() {
+        let parked = parked(Wait::Established).await;
+        dies(&parked.armed).await;
+        assert_eq!(failure(parked.call).await, CLOSED);
+    }
+
+    /// Reloads S → S′ → S while a connection keeps the first tunnel running:
+    /// the last configuration shares that tunnel, which is its own from
+    /// then on — what is left of S′ does not take it over.
+    #[tokio::test]
+    async fn a_shared_tunnel_belongs_to_the_latest_configuration_that_shares_it() {
+        let (peer, first) = tunnel(PeerOpts::default(), |_| {}).await;
+        let to = at("10.0.0.1", ECHO_PORT);
+        let mut kept = first
+            .connect_tcp(&to, &within(5))
+            .await
+            .expect("a connection");
+        assert_eq!(echo(&mut kept, b"first").await, b"first");
+        // the outbounds of the two reloads, in the order they were built
+        let section = first.names.section.clone();
+        let mut edited = section.clone();
+        edited.mtu = 1400;
+        let edited = WireGuardSpec { section: edited };
+        let between = WireGuardOutbound::new("WG", &edited, no_names(), direct());
+        let last = WireGuardOutbound::new("WG", &WireGuardSpec { section }, no_names(), direct());
+        // only the connection holds the first tunnel now
+        drop(first);
+        let mut current = last
+            .connect_tcp(&to, &within(5))
+            .await
+            .expect("a connection");
+        assert_eq!(echo(&mut current, b"last").await, b"last");
+        assert_eq!(peer.core().handshakes, 1, "the tunnel is shared");
+
+        let e = between
+            .connect_tcp(&to, &within(5))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(e.to_string(), SUPERSEDED);
+        assert_eq!(echo(&mut kept, b"kept").await, b"kept");
+        assert_eq!(echo(&mut current, b"current").await, b"current");
+        assert_eq!(peer.core().handshakes, 1);
+    }
+
+    /// Dials through `inner` once `open` lets it: a dial that takes its
+    /// time.
+    struct Gated {
+        inner: Arc<dyn Connector>,
+        asked: Arc<AtomicBool>,
+        open: Arc<tokio::sync::Notify>,
+    }
+
+    impl Connector for Gated {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            self.inner.connect(target, opts)
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            Box::pin(async move {
+                self.asked.store(true, Ordering::SeqCst);
+                self.open.notified().await;
+                self.inner.connect_udp(target, opts).await
+            })
+        }
+    }
+
+    /// The same when the last configuration finds the tunnel only after
+    /// dialling its own carriers — another policy of the section started it
+    /// meanwhile: the tunnel it shares then is its own too.
+    #[tokio::test]
+    async fn a_tunnel_shared_after_dialling_belongs_to_the_later_configuration_too() {
+        let (peer, first) = tunnel(PeerOpts::default(), |_| {}).await;
+        let to = at("10.0.0.1", ECHO_PORT);
+        let section = first.names.section.clone();
+        let mut edited = section.clone();
+        edited.mtu = 1400;
+        let edited = WireGuardSpec { section: edited };
+        let between = WireGuardOutbound::new("WG", &edited, no_names(), direct());
+        let (asked, open) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let gated: Arc<dyn Connector> = Arc::new(Gated {
+            inner: direct(),
+            asked: asked.clone(),
+            open: open.clone(),
+        });
+        let last = Arc::new(WireGuardOutbound::new(
+            "WG",
+            &WireGuardSpec { section },
+            no_names(),
+            gated,
+        ));
+        // the last configuration's dial is under way, no tunnel to share yet
+        let dialling = tokio::spawn({
+            let (last, to) = (last.clone(), to.clone());
+            async move { last.connect_tcp(&to, &within(5)).await }
+        });
+        until(|| asked.load(Ordering::SeqCst)).await;
+        let mut kept = first
+            .connect_tcp(&to, &within(5))
+            .await
+            .expect("a connection");
+        assert_eq!(echo(&mut kept, b"first").await, b"first");
+        open.notify_one();
+        let mut current = dialling.await.unwrap().expect("a connection");
+        assert_eq!(echo(&mut current, b"last").await, b"last");
+        assert_eq!(peer.core().handshakes, 1, "the tunnel is shared");
+
+        let e = between
+            .connect_tcp(&to, &within(5))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(e.to_string(), SUPERSEDED);
+        assert_eq!(echo(&mut kept, b"kept").await, b"kept");
+        assert_eq!(echo(&mut current, b"current").await, b"current");
+        assert_eq!(peer.core().handshakes, 1);
     }
 }

@@ -3,7 +3,7 @@
 //! socket's wakers when there is nothing to read or no room to write, and
 //! wake the device task so the stack runs.
 
-use crate::device::Device;
+use crate::device::{Device, closed};
 use rurge_proto::OutboundError;
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
@@ -25,9 +25,10 @@ impl TunnelStream {
     }
 
     /// Ready once the connection is established; an error when the far end
-    /// refused it.
+    /// refused it, or the tunnel is over.
     pub(crate) fn poll_established(&self, cx: &mut Context<'_>) -> Poll<Result<(), OutboundError>> {
-        let mut stack = self.device.shared.stack.lock().expect("the tunnel");
+        // first: the tunnel's end resets the connection, as a refusal does
+        let mut stack = self.device.shared.running()?;
         let socket = stack.tcp(self.handle);
         match socket.state() {
             tcp::State::SynSent | tcp::State::SynReceived => {
@@ -53,7 +54,7 @@ impl AsyncRead for TunnelStream {
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        let mut stack = self.device.shared.stack.lock().expect("the tunnel");
+        let mut stack = self.device.shared.stack().map_err(|_| closed())?;
         let socket = stack.tcp(self.handle);
         match socket.recv_slice(buf.initialize_unfilled()) {
             Ok(0) => {
@@ -82,7 +83,7 @@ impl AsyncWrite for TunnelStream {
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let mut stack = self.device.shared.stack.lock().expect("the tunnel");
+        let mut stack = self.device.shared.stack().map_err(|_| closed())?;
         let socket = stack.tcp(self.handle);
         if !socket.may_send() {
             let kind = if socket.state() == tcp::State::Closed {
@@ -115,9 +116,8 @@ impl AsyncWrite for TunnelStream {
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.device
             .shared
-            .stack
-            .lock()
-            .expect("the tunnel")
+            .stack()
+            .map_err(|_| closed())?
             .tcp(self.handle)
             .close();
         self.device.shared.kick();
@@ -127,7 +127,7 @@ impl AsyncWrite for TunnelStream {
 
 impl Drop for TunnelStream {
     fn drop(&mut self) {
-        if let Ok(mut stack) = self.device.shared.stack.lock() {
+        if let Ok(mut stack) = self.device.shared.stack() {
             stack.release(self.handle, Instant::now());
         }
         self.device.shared.kick();
