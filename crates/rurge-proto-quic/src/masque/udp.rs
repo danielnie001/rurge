@@ -570,8 +570,8 @@ mod tests {
     use super::*;
     use crate::masque::MasqueOutbound;
     use crate::masque::tests::{
-        BOUND, H3_REQUEST_REJECTED, closed_by_the_client, outbound, round_trip, round_trip_of,
-        spec, target, tunnel, users,
+        BOUND, H3_REQUEST_REJECTED, closed_by_the_client, connection, outbound, round_trip,
+        round_trip_of, spec, target, tunnel, users,
     };
     use crate::test_log::Log;
     use crate::testing::{
@@ -1408,16 +1408,6 @@ mod tests {
         .unwrap()
     }
 
-    /// The connection `out`'s requests go to now.
-    async fn connection(out: &MasqueOutbound) -> Connection {
-        timeout(BOUND, out.session.lease(&ConnectOpts::default()))
-            .await
-            .expect("a connection within the bound")
-            .unwrap()
-            .connection()
-            .clone()
-    }
-
     /// Where the policy leads can cost a group's resolution: a carrier asks
     /// at most once a second, however many datagrams it sends meanwhile.
     #[tokio::test]
@@ -1472,7 +1462,7 @@ mod tests {
     }
 
     /// Over a carrier (`underlying-proxy`) quinn probes no path: the
-    /// connection starts from packets of 1350 bytes, where it stayed at
+    /// connection starts from packets of 1350 bytes, where it would stay at
     /// 1200, and a datagram of it holds a full-sized packet of another QUIC
     /// connection — an Initial has 1200 bytes at least, a browser's packets
     /// 1250. On a socket of its own it starts from 1200 as ever, and probes.

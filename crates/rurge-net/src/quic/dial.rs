@@ -45,10 +45,12 @@ impl Transport {
     /// times that, 256 MiB. Credit for the connection comes back only as
     /// data is read: the streams nobody reads — a paused download is one —
     /// keep what they were sent, a window each at most, and in that
-    /// client's 20 MiB three of them left the other streams nothing. The
-    /// window is a bound, not memory set aside: a connection holds what its
-    /// unread streams were sent. With 32 streams or more stalled at once,
-    /// each with its window full, the others still stall with them.
+    /// client's 20 MiB three of them would leave the other streams nothing.
+    /// The window is a bound, not memory set aside: a connection holds what
+    /// its unread streams were sent. Once they hold more than seven eighths
+    /// of it — 29 with their windows full — the others stop too: quinn
+    /// announces credit an eighth of the window at a time, and the streams
+    /// that are read can no longer bring in that much.
     pub const STANDARD: Transport = Transport {
         idle_timeout: Duration::from_secs(30),
         keep_alive: Some(Duration::from_secs(10)),

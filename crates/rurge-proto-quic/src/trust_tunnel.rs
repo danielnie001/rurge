@@ -447,6 +447,38 @@ mod tests {
         addr
     }
 
+    /// `count` tunnels of `out` to `flood` that nobody reads, megabytes
+    /// later: once the server has more for each of them than its window
+    /// takes — or, were the connection's too small for them all, more than
+    /// that takes.
+    async fn unread_tunnels(
+        out: &TrustTunnelH3Outbound,
+        flood: SocketAddr,
+        count: u64,
+    ) -> Vec<BoxedStream> {
+        let mut unread = Vec::new();
+        for _ in 0..count {
+            unread.push(tunnel(out, &target(flood)).await);
+        }
+        // the connection they are on, without a place on it
+        let quic = timeout(BOUND, out.session.lease(&ConnectOpts::default()))
+            .await
+            .unwrap()
+            .unwrap()
+            .connection()
+            .clone();
+        let deadline = Instant::now() + 6 * BOUND;
+        loop {
+            let said = quic.stats().frame_rx;
+            if said.stream_data_blocked >= count || said.data_blocked >= 1 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the windows never filled");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        unread
+    }
+
     /// A connection's receive window has room for the window of every
     /// tunnel it may carry (`max-streams`): tunnels nobody reads — the
     /// server sends into each all its window takes — leave the others
@@ -458,29 +490,7 @@ mod tests {
         let (flood, echo) = (flood_server().await, echo_server().await);
         let fake = endpoint(H3ProxyScript::default());
         let out = outbound(&fake, &format!("{LOGIN}, max-streams=4"));
-        let mut unread = Vec::new();
-        for _ in 0..3 {
-            unread.push(tunnel(&out, &target(flood)).await);
-        }
-        // the connection they are on, without a place on it
-        let quic = timeout(BOUND, out.session.lease(&ConnectOpts::default()))
-            .await
-            .unwrap()
-            .unwrap()
-            .connection()
-            .clone();
-        // megabytes later, the server has more for each tunnel than its
-        // window takes — or, were the connection's too small for the three,
-        // more than that takes
-        let deadline = Instant::now() + 6 * BOUND;
-        loop {
-            let said = quic.stats().frame_rx;
-            if said.stream_data_blocked >= 3 || said.data_blocked >= 1 {
-                break;
-            }
-            assert!(Instant::now() < deadline, "the windows never filled");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        let unread = unread_tunnels(&out, flood, 3).await;
         let opts = ConnectOpts {
             timeout: Duration::from_secs(5),
         };
@@ -489,6 +499,34 @@ mod tests {
             .expect("an outcome within the bound")
             .expect("a tunnel beside the unread ones");
         round_trip(&mut fourth, b"past the unread").await;
+        assert_eq!(fake.connections(), 1);
+        drop(unread);
+    }
+
+    /// quinn announces credit for the connection only once an eighth of
+    /// its window is waiting to be announced: the window has that eighth to
+    /// spare past the windows of its tunnels. With `max-streams=9`, eight
+    /// that nobody reads leave the ninth far more than a window of its own.
+    /// In a window of nine of them it would stop for good after the first:
+    /// what its reader gives back, 8 MiB, is less than an eighth of 72.
+    #[tokio::test]
+    async fn the_last_tunnel_goes_on_beside_all_the_others_unread() {
+        let flood = flood_server().await;
+        let fake = endpoint(H3ProxyScript::default());
+        let out = outbound(&fake, &format!("{LOGIN}, max-streams=9"));
+        let unread = unread_tunnels(&out, flood, 8).await;
+        let mut ninth = tunnel(&out, &target(flood)).await;
+        // three windows of a stream
+        let (mut read, mut buf) = (0, vec![0u8; 64 << 10]);
+        let deadline = Instant::now() + 3 * BOUND;
+        while read < 24 << 20 {
+            let n = tokio::time::timeout_at(deadline, ninth.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("the ninth tunnel stopped after {read} bytes"))
+                .unwrap();
+            assert!(n > 0, "the ninth tunnel ended after {read} bytes");
+            read += n;
+        }
         assert_eq!(fake.connections(), 1);
         drop(unread);
     }

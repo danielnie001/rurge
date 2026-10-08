@@ -16,10 +16,12 @@
 //!   flight, a request that waited shares the latest dial's failure if that
 //!   dial ended after it began to wait. Each connection then goes by the
 //!   rules below on its own, and receives into a window with room for
-//!   every stream it may carry (`capped_transport`): the streams nobody
-//!   reads cannot take it from the others. Without a cap a connection
-//!   carries any number of streams in the standard window, room for the
-//!   windows of 32: it takes that many unread ones to fill it.
+//!   every stream it may carry and an eighth to spare (`capped_transport`):
+//!   the streams nobody reads cannot take it from the others. Without a cap
+//!   a connection carries any number of streams in the standard window:
+//!   once the unread ones hold more than seven eighths of it — 29 with
+//!   their windows full —, the others stop too. quinn announces credit an
+//!   eighth of the window at a time.
 //! - A connection that has closed — an error, the idle timeout, the
 //!   server's close, the loss of the UDP path under it (which quinn reports
 //!   as a local close) — or that its protocol state says is going away (an
@@ -84,6 +86,8 @@ pub struct Dialer {
     server: Target,
     hopping: Option<PortHopping>,
     ecn: Tristate,
+    /// What its connections are made with (`with_transport`).
+    transport: Transport,
     /// For a connection on sockets of its own.
     config: quinn::ClientConfig,
     /// For a connection over the connector's UDP flow: the same TLS, under
@@ -118,13 +122,15 @@ impl Dialer {
             ));
         }
         let tls = quic_tls(tls, &server.host, &["h3"], keystore, roots)?;
-        let config = quic::client_config(tls.config, &Transport::STANDARD)
+        let transport = Transport::STANDARD;
+        let config = quic::client_config(tls.config, &transport)
             .map_err(|e| BuildError::new(e.to_string()))?;
         Ok(Dialer {
             connector,
             server,
             hopping: quic.port_hopping.clone(),
             ecn,
+            transport,
             // the standard transport is the same either way
             carried: config.clone(),
             config,
@@ -141,17 +147,27 @@ impl Dialer {
         }
     }
 
-    /// Makes every connection with `transport` in place of
-    /// `Transport::STANDARD`, each as its path takes it.
+    /// Makes every connection with `transport` in place of the one the
+    /// dialer had (`Transport::STANDARD` at first), each as its path takes
+    /// it.
     pub(crate) fn with_transport(mut self, transport: &Transport) -> Dialer {
         transport.apply(&mut self.config);
         transport.apply_carried(&mut self.carried);
+        self.transport = transport.clone();
         self
     }
 
     /// A new connection to the server: nothing bounds it here but quinn's
     /// idle timer.
     async fn connect(&self, opts: &ConnectOpts) -> io::Result<Connection> {
+        let (path, config) = self.path(opts).await?;
+        quic::connect(path, config, &self.server_name).await
+    }
+
+    /// The path of a new connection, under what the protocol lays over it,
+    /// and the configuration a connection on it takes: over the connector's
+    /// UDP flow, the one for that.
+    async fn path(&self, opts: &ConnectOpts) -> io::Result<(Path, &quinn::ClientConfig)> {
         let mut path = Path::open(
             self.connector.as_ref(),
             &self.server,
@@ -160,32 +176,24 @@ impl Dialer {
             opts,
         )
         .await?;
-        let config = self.config_on(&path);
-        if let Some(layer) = &self.layer {
-            path.socket = layer(path.socket);
-        }
-        quic::connect(path, config, &self.server_name).await
-    }
-
-    /// The configuration of a connection on `path`.
-    fn config_on(&self, path: &Path) -> &quinn::ClientConfig {
-        if path.is_carried() {
+        let config = if path.is_carried() {
             &self.carried
         } else {
             &self.config
+        };
+        if let Some(layer) = &self.layer {
+            path.socket = layer(path.socket);
         }
+        Ok((path, config))
     }
 
-    /// Test support: the configuration of the connection `connect` would
-    /// make now, as quinn shows it. Opens the path, and sends nothing.
+    /// Test support: the configuration `connect` makes a connection with
+    /// now, as quinn shows it. Takes the path and its configuration as
+    /// `connect` does, and sends nothing.
     #[cfg(test)]
     async fn configuration(&self) -> String {
-        let opts = ConnectOpts::default();
-        let (connector, hopping) = (self.connector.as_ref(), self.hopping.as_ref());
-        let path = Path::open(connector, &self.server, hopping, self.ecn, &opts)
-            .await
-            .expect("a path");
-        format!("{:?}", self.config_on(&path))
+        let (_path, config) = self.path(&ConnectOpts::default()).await.expect("a path");
+        format!("{config:?}")
     }
 
     /// Where the connector leads now (`Connector::route`): a connection
@@ -359,11 +367,13 @@ impl<P: Protocol> Session<P> {
     /// The session with each connection carrying `cap` leases at most (1
     /// at least): it keeps as many connections as its requests need
     /// (`trust-tunnel`'s `max-streams` over HTTP/3, design 3.5), each with
-    /// a receive window for that many streams (`capped_transport`).
+    /// a receive window for that many streams (`capped_transport`). What
+    /// else the dialer's transport says stays as it is.
     pub fn with_stream_cap(self, cap: usize) -> Session<P> {
         let cap = cap.max(1);
+        let transport = capped_transport(&self.dialer.transport, cap);
         Session {
-            dialer: self.dialer.with_transport(&capped_transport(cap)),
+            dialer: self.dialer.with_transport(&transport),
             cap: Some(cap),
             ..self
         }
@@ -633,21 +643,28 @@ impl<P: Protocol> Shared<P> {
 /// 20 MiB the Hysteria reference client has for a connection.
 const LEAST_CAPPED_WINDOW: u32 = 20 << 20;
 
-/// The transport of a connection that carries `cap` streams at most:
-/// `Transport::STANDARD`, its connection window with room for the window of
-/// each of them, and never smaller than `LEAST_CAPPED_WINDOW`. A stream
-/// nobody reads fills its own window and no more: with room for all, the
-/// unread ones leave every other stream its own, as on the connections of
-/// the HTTP/2 pool (phase 2 M6 design 18).
-fn capped_transport(cap: usize) -> Transport {
-    let standard = Transport::STANDARD;
-    let streams = u32::try_from(cap).unwrap_or(u32::MAX);
+/// `transport` for a connection that carries `cap` streams at most: its
+/// connection window with room for the window of each of them and an eighth
+/// of itself to spare — eight sevenths of their windows —, and never
+/// smaller than `LEAST_CAPPED_WINDOW`. A stream nobody reads fills its own
+/// window and no more, but quinn announces credit for the connection only
+/// once an eighth of its window waits to be announced: the streams that are
+/// read must be left that eighth, or they take in what is left and stop
+/// with the others. A window of just the streams' windows leaves the last
+/// stream one of them, less than the eighth from a cap of nine on. With the
+/// eighth to spare the unread streams leave every other its own, as on the
+/// connections of the HTTP/2 pool (phase 2 M6 design 18).
+fn capped_transport(transport: &Transport, cap: usize) -> Transport {
+    let streams = u64::try_from(cap).unwrap_or(u64::MAX);
+    let window = u64::from(transport.stream_window)
+        .saturating_mul(streams)
+        .saturating_mul(8)
+        .div_ceil(7);
     Transport {
-        connection_window: standard
-            .stream_window
-            .saturating_mul(streams)
+        connection_window: u32::try_from(window)
+            .unwrap_or(u32::MAX)
             .max(LEAST_CAPPED_WINDOW),
-        ..standard
+        ..transport.clone()
     }
 }
 
@@ -1142,8 +1159,11 @@ mod tests {
     }
 
     /// Under a cap a connection's window has room for the window of every
-    /// stream it may carry — past the standard one's 32 too —, and is never
-    /// smaller than 20 MiB.
+    /// stream it may carry and an eighth of itself to spare — eight
+    /// sevenths of their windows, rounded up —, and is never smaller than
+    /// 20 MiB. With every stream but one full and unread, what is left for
+    /// the last is at least the eighth quinn waits for before it announces
+    /// credit.
     #[test]
     fn a_capped_connections_window_takes_a_window_of_each_stream() {
         const MIB: u32 = 1 << 20;
@@ -1155,18 +1175,37 @@ mod tests {
         for (cap, window) in [
             (1, 20 * MIB),
             (2, 20 * MIB),
-            (3, 24 * MIB),
-            (4, 32 * MIB),
-            (16, 128 * MIB),
-            (40, 320 * MIB),
+            (3, 28_760_942),
+            (4, 38_347_923),
+            (8, 76_695_845),
+            (9, 86_282_826),
+            (16, 153_391_690),
+            (40, 383_479_223),
             (usize::MAX, u32::MAX),
         ] {
             let expected = Transport {
                 connection_window: window,
                 ..Transport::STANDARD
             };
-            assert_eq!(capped_transport(cap), expected, "{cap}");
+            assert_eq!(capped_transport(&standard, cap), expected, "{cap}");
         }
+        for cap in 1..=256u32 {
+            let window = u64::from(capped_transport(&standard, cap as usize).connection_window);
+            let unread = u64::from(cap - 1) * u64::from(standard.stream_window);
+            assert!(window - unread >= window / 8, "{cap}: {window}");
+        }
+        // what else the transport says stays: the window is counted in its
+        // own streams', and a connection over a carrier starts as it said
+        let own = Transport {
+            stream_window: MIB,
+            carried_initial_mtu: Some(1300),
+            ..Transport::STANDARD
+        };
+        let expected = Transport {
+            connection_window: 32 * MIB,
+            ..own.clone()
+        };
+        assert_eq!(capped_transport(&own, 28), expected);
     }
 
     #[tokio::test]
@@ -1684,10 +1723,14 @@ mod tests {
     /// A connection takes the dialer's transport as its path takes it: over
     /// a chain's flow (`underlying-proxy`) it starts from the size the
     /// transport names for that, on sockets of its own from 1200 bytes all
-    /// the same. The standard transport names none, nor does a capped one,
-    /// whose window is that of a connection either way.
+    /// the same. The standard transport names none. A cap changes the
+    /// window, on either path, and nothing else: the size a connection over
+    /// a chain's flow starts from stays.
     #[tokio::test]
     async fn a_connection_takes_the_transport_as_its_path_does() {
+        const STANDARD: u32 = 256 << 20;
+        /// Under a cap of four: eight sevenths of four streams' windows.
+        const CAPPED: u32 = 38_347_923;
         let roots = TestCert::new().roots();
         // nothing is sent to the port
         let tls = TlsOpts::default();
@@ -1703,20 +1746,30 @@ mod tests {
             carried_initial_mtu: Some(1300),
             ..Transport::STANDARD
         };
-        let capped = capped_transport(4);
-        for (dialer, start, window) in [
-            (own(), 1200, 256),
-            (chained(), 1200, 256),
-            (own().with_transport(&larger), 1200, 256),
-            (chained().with_transport(&larger), 1300, 256),
-            (own().with_transport(&capped), 1200, 32),
-            (chained().with_transport(&capped), 1200, 32),
+        let of = |dialer: Dialer| Session::new("P", dialer, Plain::default());
+        for (session, start, window) in [
+            (of(own()), 1200, STANDARD),
+            (of(chained()), 1200, STANDARD),
+            (of(own().with_transport(&larger)), 1200, STANDARD),
+            (of(chained().with_transport(&larger)), 1300, STANDARD),
+            (of(own()).with_stream_cap(4), 1200, CAPPED),
+            (of(chained()).with_stream_cap(4), 1200, CAPPED),
+            (
+                of(own().with_transport(&larger)).with_stream_cap(4),
+                1200,
+                CAPPED,
+            ),
+            (
+                of(chained().with_transport(&larger)).with_stream_cap(4),
+                1300,
+                CAPPED,
+            ),
         ] {
-            let config = dialer.configuration().await;
+            let config = session.configuration().await;
             for expected in [
                 format!(" initial_mtu: {start},"),
                 " min_mtu: 1200,".to_string(),
-                format!(" receive_window: {},", window << 20),
+                format!(" receive_window: {window},"),
             ] {
                 assert!(config.contains(&expected), "{expected} in {config}");
             }

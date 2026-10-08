@@ -297,7 +297,7 @@ async fn masque_goes_over_an_underlying_socks5_proxy() {
 /// Over an `underlying-proxy` no path MTU is probed, and the connection
 /// starts from packets of 1350 bytes: a UDP packet of 1250 bytes — what a
 /// browser's QUIC sends — fits a datagram of it and goes there and back,
-/// where it was dropped as too long for one.
+/// where at 1200 bytes it would be dropped as too long for one.
 #[tokio::test]
 async fn over_an_underlying_proxy_a_packet_of_1250_bytes_goes_through() {
     let udp_echo = udp_echo_server().await;

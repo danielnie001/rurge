@@ -41,7 +41,7 @@ use udp::MasqueUdp;
 /// The packet size a connection over a carrier starts from (`Transport::
 /// carried_initial_mtu`). quinn probes no such path and would stay at 1200
 /// bytes, where no datagram holds a full-sized packet of another QUIC
-/// connection — an Initial alone has 1200 bytes —: no QUIC went through
+/// connection — an Initial alone has 1200 bytes —: no QUIC would go through
 /// the policy. At 1350 bytes a datagram holds a packet of some 1300, a
 /// browser's 1250 too, and the carrier's own headers are left some 120
 /// bytes of what a path of 1500 carries. A path that carries less brings
@@ -259,6 +259,16 @@ mod tests {
             .await
             .expect("an outcome within the bound")
             .expect("a tunnel")
+    }
+
+    /// The connection `out`'s requests go to now.
+    pub(super) async fn connection(out: &MasqueOutbound) -> Connection {
+        timeout(BOUND, out.session.lease(&ConnectOpts::default()))
+            .await
+            .expect("a connection within the bound")
+            .unwrap()
+            .connection()
+            .clone()
     }
 
     async fn failure(out: &MasqueOutbound, to: &Target) -> OutboundError {
@@ -890,12 +900,14 @@ mod tests {
         addr
     }
 
-    /// The connection's receive window has room for the windows of 32
-    /// tunnels: four that nobody reads — the server sends into each more
-    /// than its window takes, as into a download that was paused — leave
-    /// the others theirs. In a window of 20 MiB they took all of it: no
-    /// other tunnel of the policy heard from the server again, not even
-    /// that it was made.
+    /// The connection receives into 256 MiB: four tunnels that nobody
+    /// reads — the server sends into each more than its window takes, as
+    /// into a download that was paused — leave the others theirs. Only if
+    /// the unread ones held more than seven eighths of it — 29 full ones —
+    /// would the others stop too: quinn announces credit an eighth of the
+    /// window at a time. In a window of 20 MiB the four would take all of
+    /// it: no other tunnel of the policy would hear from the server again,
+    /// not even that it was made.
     #[tokio::test]
     async fn tunnels_nobody_reads_leave_the_others_their_window() {
         const UNREAD: u64 = 4;
@@ -906,13 +918,7 @@ mod tests {
         for _ in 0..UNREAD {
             unread.push(tunnel(&out, &target(burst)).await);
         }
-        // the connection they are on
-        let quic = timeout(BOUND, out.session.lease(&ConnectOpts::default()))
-            .await
-            .unwrap()
-            .unwrap()
-            .connection()
-            .clone();
+        let quic = connection(&out).await;
         // megabytes later, the server has more for each tunnel than its
         // window takes — or, were the connection's too small for the four,
         // more than that takes
