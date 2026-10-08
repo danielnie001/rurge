@@ -17,6 +17,10 @@ use url::Url;
 pub const DNS_MESSAGE: &str = "application/dns-message";
 pub const MAX_RESPONSE: usize = 65_535;
 
+/// How much of what the server calls its content an error quotes: a field
+/// value may be as long as a field section, and every query would log it.
+const QUOTED_MAX: usize = 200;
+
 /// The head of an answer to a DoH POST — over HTTP/2 or HTTP/3 — is one
 /// (RFC 8484 4.2): status 200, and a body of `application/dns-message`,
 /// whatever the case or the parameters of the type.
@@ -30,8 +34,9 @@ pub(super) fn check_head(status: StatusCode, headers: &HeaderMap) -> Result<(), 
         .unwrap_or("")
         .to_ascii_lowercase();
     if !content_type.starts_with(DNS_MESSAGE) {
+        let quoted: String = content_type.chars().take(QUOTED_MAX).collect();
         return Err(UpstreamError::BadResponse(format!(
-            "content-type `{content_type}`"
+            "content-type `{quoted}`"
         )));
     }
     Ok(())
@@ -65,7 +70,7 @@ pub struct DohUpstream {
 impl DohUpstream {
     pub fn new(url: Url, http: Arc<HttpClient>) -> DohUpstream {
         DohUpstream {
-            name: url.as_str().to_string(),
+            name: super::doh_name(&url),
             url,
             http,
         }
@@ -263,6 +268,33 @@ mod tests {
             check_head(StatusCode::OK, &HeaderMap::new()),
             Err(UpstreamError::BadResponse("content-type ``".to_string()))
         );
+    }
+
+    /// What the server calls its content goes into the error cut short:
+    /// a field value may be as long as a field section.
+    #[test]
+    fn a_long_content_type_is_cut_short() {
+        let long = format!("text/{}", "x".repeat(60_000));
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, long.parse().unwrap());
+        assert_eq!(
+            check_head(StatusCode::OK, &headers),
+            Err(UpstreamError::BadResponse(format!(
+                "content-type `text/{}`",
+                "x".repeat(195)
+            )))
+        );
+    }
+
+    /// A user name and a password in the URL stay out of the upstream's
+    /// name.
+    #[tokio::test]
+    async fn the_name_leaves_the_urls_credentials_out() {
+        let url: Url = "https://alice:s3cret-doh@dns.example/dns-query"
+            .parse()
+            .unwrap();
+        let up = DohUpstream::new(url, client(false));
+        assert_eq!(up.name(), "https://dns.example/dns-query");
     }
 
     #[test]

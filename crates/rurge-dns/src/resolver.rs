@@ -1736,6 +1736,34 @@ mod tests {
         );
     }
 
+    /// A user name and a password written into a server's URL are in no
+    /// upstream's name and in no warning: `https://` takes them — DoH sends
+    /// them as it always did —, the other schemes refuse them, and a URL
+    /// that cannot be used is quoted from its last `@` on.
+    #[tokio::test]
+    async fn the_credentials_of_a_dns_server_are_in_no_name_and_no_warning() {
+        const PASSWORD: &str = "s3cret-doh";
+        let e = env(&profile(
+            &format!(
+                "encrypted-dns-server = https://alice:{PASSWORD}@dns.example/dns-query, \
+https://alice:{PASSWORD}@dns.example:99999/q, quic://alice:{PASSWORD}@dns.example, \
+h3://alice:123/{PASSWORD}@dns.example"
+            ),
+            "",
+        ));
+        let (r, diags) = resolver(&e, StaticSystemDns::default());
+        assert_eq!(r.primary_upstreams(), ["https://dns.example/dns-query"]);
+        let mut texts: Vec<String> = diags.iter().map(|d| d.to_string()).collect();
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        texts.extend(r.primary_upstreams());
+        for text in &texts {
+            assert!(
+                !text.contains(PASSWORD) && !text.contains("alice"),
+                "{text}"
+            );
+        }
+    }
+
     /// `quic://` and `h3://` servers are upstreams like the others, in
     /// `encrypted-dns-server` and in `[Host]`: no W0026.
     #[tokio::test]

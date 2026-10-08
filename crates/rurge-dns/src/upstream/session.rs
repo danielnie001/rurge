@@ -2,25 +2,37 @@
 //! shared by its queries — the rules of a policy's QUIC session (phase 2
 //! M7 design 3.5), as DNS needs them:
 //!
-//! - The connection is dialed when a query first needs one; the queries
-//!   that come meanwhile wait for that dial and share its failure. A dial
-//!   whose query gave up on it (its future dropped) is taken over by one of
-//!   those that wait.
+//! - The connection is dialed when a query first needs one, by a task of
+//!   the session's: the queries that come meanwhile wait for that dial and
+//!   share its failure — or how its connection ended, should that have
+//!   closed before they took it —, and the dial goes on when none of them
+//!   is left.
+//!   The fan-out drops a lookup's queries as soon as another server has
+//!   answered, sooner than a handshake takes: a dial dropped with them
+//!   would never make the connection, and the server would get a handshake
+//!   from every lookup. The dial has until the deadline of the query that
+//!   began it; out of that time it is given up without a verdict on the
+//!   server, and a query still waiting dials anew, with its own time. It
+//!   ends with the session.
 //! - A dial tries the server's addresses in turn — a name's from the
 //!   bootstrap, IPv4 first — until one connects, each on a path opened on
 //!   the resolver's connector to the address itself: a direct path asks no
-//!   resolver. Each gets its share of the time left, what is left divided
-//!   by the addresses that are: one that never answers — QUIC has no
-//!   refusal to fail it quickly — cannot take it all from those after it.
+//!   resolver. Each but the last gets its share of the time left, what is
+//!   left divided by the addresses that are: one that never answers — QUIC
+//!   has no refusal to fail it quickly — cannot take it all from those
+//!   after it.
 //! - A connection that has closed — its idle timeout, the server's close, a
 //!   protocol error — or that is going away (an HTTP/3 GOAWAY) takes no new
 //!   query: the next one dials. Nothing keeps a connection alive
-//!   (`Transport::DNS`): unused, it idles out.
+//!   (`Transport::DNS`): unused, it idles out. The session lets go of a
+//!   connection as it closes, not when the next query comes: with it go its
+//!   socket and what the resolver's connector carries that over — a
+//!   proxy's UDP association, say.
 //! - A query on a connection that was up when it came, which finds the
 //!   connection gone (`Failure::Lost`) — a server that dropped it while it
 //!   idled answers with a stateless reset, an HTTP/3 server may reject the
 //!   request unprocessed (H3_REQUEST_REJECTED) —, goes again, once, on a
-//!   new connection: a DNS query can be asked again. The connection found
+//!   new connection: a DNS query can be asked again. A connection found
 //!   gone takes no new query.
 //! - A connection that went dead without a word — a server restarted
 //!   without the key of its stateless resets, a path that lets nothing
@@ -29,7 +41,7 @@
 //!   nothing received on the connection since (`Progress`). It takes no new
 //!   query either, instead of every query to the upstream timing out until
 //!   the connection's idle timeout.
-//! - The caller's deadline bounds a query: the dial, the handshake and the
+//! - The caller's deadline bounds a query: its wait for the dial, and the
 //!   exchange.
 
 use super::UpstreamError;
@@ -43,14 +55,18 @@ use rurge_net::http::quic_tls_client_config;
 use rurge_net::quic::{self, Path, Transport};
 use std::io;
 use std::pin::pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 /// What a peer may take, beyond a round trip, to acknowledge a packet: the
 /// default of its `max_ack_delay` (RFC 9000 18.2).
 const MAX_ACK_DELAY: Duration = Duration::from_millis(25);
+
+/// The least silence that says anything of a connection (`dead_after`).
+const LEAST_SILENCE: Duration = Duration::from_millis(100);
 
 /// The client configuration of the DNS servers over QUIC that speak `alpn`
 /// (`doq`, `h3`): their certificates verified with the shared roots, or not
@@ -112,9 +128,11 @@ impl Dialer {
     }
 
     /// A connection to the server: its addresses in turn, IPv4 first, until
-    /// one connects, each with its share of the time left until `deadline`
-    /// — what is left divided by the addresses that are —, the last with
-    /// all of it. The query's deadline bounds it all the same.
+    /// one connects. Each but the last has its share of the time left until
+    /// `deadline` — what is left divided by the addresses that are — and
+    /// fails when that is up; the last has all that is left, and nothing
+    /// here ends it: the caller's bound does, which is no failure of the
+    /// server's.
     async fn connect(&self, deadline: Instant) -> Result<Connection, UpstreamError> {
         let addresses = interleave(self.bootstrap.resolve(&self.host).await?, false);
         let mut last = UpstreamError::Bootstrap(format!("no addresses for {}", self.host));
@@ -123,15 +141,24 @@ impl Dialer {
             let left = u32::try_from(count - done).unwrap_or(u32::MAX);
             let share = deadline.saturating_duration_since(Instant::now()) / left;
             let server = Target::new(HostName::Ip(address), self.port);
-            match tokio::time::timeout(share, self.connect_to(&server, share)).await {
-                Ok(Ok(connection)) => return Ok(connection),
-                Ok(Err(e)) => {
+            let connecting = self.connect_to(&server, share);
+            let connected = if left == 1 {
+                connecting.await
+            } else {
+                match tokio::time::timeout(share, connecting).await {
+                    Ok(connected) => connected,
+                    Err(_) => {
+                        tracing::debug!(upstream = %self.name, %address, "the server did not answer at this address in its share of the time");
+                        last = UpstreamError::Timeout;
+                        continue;
+                    }
+                }
+            };
+            match connected {
+                Ok(connection) => return Ok(connection),
+                Err(e) => {
                     tracing::debug!(upstream = %self.name, %address, error = %e, "cannot connect to the server at this address");
                     last = transport_error(e);
-                }
-                Err(_) => {
-                    tracing::debug!(upstream = %self.name, %address, "the server did not answer at this address in its share of the time");
-                    last = UpstreamError::Timeout;
                 }
             }
         }
@@ -248,17 +275,29 @@ impl Progress {
     }
 
     /// Whether `connection` has received nothing since the data was
-    /// written, though long enough for a live one to have answered, if only
-    /// with an acknowledgement: two round trips and the ack delay of its
-    /// peer — the second lets a packet be lost. Never before the data went
-    /// out.
+    /// written, though for longer than a live one would have taken to show
+    /// a sign of life (`dead_after`). Never before the data went out.
     fn quiet(&self, connection: &Connection) -> bool {
         let Some(written) = *self.0.lock().expect("progress") else {
             return false;
         };
-        written.at.elapsed() >= connection.rtt() * 2 + MAX_ACK_DELAY
+        written.at.elapsed() >= dead_after(connection.rtt())
             && datagrams_received(connection) == written.received
     }
+}
+
+/// How long a connection with a round trip of `rtt` may have received
+/// nothing since a query's data went out before that says it is dead. A
+/// live one hears of the data — its acknowledgement at least — within a
+/// round trip and what the peer may wait before it acknowledges a lone
+/// packet (`MAX_ACK_DELAY`). Three round trips and twice that delay leave
+/// the timers of both ends room to run late, and `LEAST_SILENCE` covers a
+/// round trip shorter than their grain. A packet that was lost is not
+/// waited for: it goes again only after a probe timeout, which may be
+/// longer; a query given up on in between costs a live connection its
+/// place, and the next query a handshake.
+fn dead_after(rtt: Duration) -> Duration {
+    (rtt * 3 + MAX_ACK_DELAY * 2).max(LEAST_SILENCE)
 }
 
 /// How many datagrams `connection` has taken in so far, whatever they
@@ -269,11 +308,16 @@ fn datagrams_received(connection: &Connection) -> u64 {
 
 /// A DNS server's QUIC connection, shared by its queries.
 pub(super) struct Session<P: Protocol> {
+    shared: Arc<Shared<P>>,
+}
+
+/// What the session's queries share with its dial, and with what watches
+/// its connections close.
+struct Shared<P: Protocol> {
     protocol: P,
     dialer: Dialer,
     slot: Mutex<Slot<P::State>>,
-    /// A dial ended, or its query gave up on it: the queries waiting for it
-    /// look again.
+    /// A dial ended: the queries waiting for it look again.
     dialed: Notify,
 }
 
@@ -281,41 +325,61 @@ pub(super) struct Session<P: Protocol> {
 struct Slot<S> {
     /// The connection new queries go to.
     current: Option<Arc<Conn<S>>>,
-    /// A query is dialing.
-    dialing: bool,
+    /// The dial in flight.
+    dialing: Option<JoinHandle<()>>,
     /// Dials that have ended, success or failure.
     dials: u64,
-    /// The latest dial's failure and the `dials` it ended as; `None` after
-    /// a success.
+    /// What the queries that waited for the latest dial share when it left
+    /// them no connection: its failure — or how the connection it made
+    /// ended, when that closed while it was the session's — and the `dials`
+    /// that dial ended as. `None` after a success.
     failure: Option<(u64, UpstreamError)>,
+}
+
+impl<S> Slot<S> {
+    /// Lets go of the connection new queries go to if it has closed. How
+    /// it ended is the failure of the queries that waited for it to be
+    /// made and come for it only now: they do not dial again, each in its
+    /// turn, a server that closes what it has just accepted.
+    fn let_go_if_closed(&mut self) {
+        if let Some(conn) = &self.current
+            && let Some(how) = conn.quic.close_reason()
+        {
+            self.failure = Some((self.dials, Failure::lost(&how).into_error()));
+            self.current = None;
+        }
+    }
 }
 
 impl<P: Protocol> Session<P> {
     /// Dials nothing yet: the first query does.
     pub(super) fn new(protocol: P, dialer: Dialer) -> Session<P> {
         Session {
-            protocol,
-            dialer,
-            slot: Mutex::new(Slot {
-                current: None,
-                dialing: false,
-                dials: 0,
-                failure: None,
+            shared: Arc::new(Shared {
+                protocol,
+                dialer,
+                slot: Mutex::new(Slot {
+                    current: None,
+                    dialing: None,
+                    dials: 0,
+                    failure: None,
+                }),
+                dialed: Notify::new(),
             }),
-            dialed: Notify::new(),
         }
     }
 
     /// The upstream's name.
     pub(super) fn name(&self) -> &str {
-        &self.dialer.name
+        &self.shared.dialer.name
     }
 
     /// Runs `attempt` on the session's connection, all of it by `deadline`;
     /// it tells its `Progress` when its data is written. A query that finds
     /// a connection it took at once gone (`Failure::Lost`) is attempted
     /// again, once, on a new connection; on a connection it waited for, it
-    /// fails. The connection found gone takes no new query either way.
+    /// fails. A connection found gone takes no new query, whichever attempt
+    /// found it so.
     pub(super) async fn query<'a>(
         &'a self,
         deadline: Instant,
@@ -327,17 +391,19 @@ impl<P: Protocol> Session<P> {
                 Err(Failure::Lost(e)) => e,
                 done => return done.map_err(Failure::into_error),
             };
-            self.forget(&conn);
+            self.shared.forget(&conn);
             drop(conn);
             if !taken {
                 return Err(e);
             }
             // the error says its layer (`quic: …`, `h3: …`)
-            tracing::debug!(upstream = %self.dialer.name, "{e}; the query goes again on a new connection");
+            tracing::debug!(upstream = %self.name(), "{e}; the query goes again on a new connection");
             let (conn, _) = self.take(deadline).await?;
-            self.attempt(&attempt, conn)
-                .await
-                .map_err(Failure::into_error)
+            let again = self.attempt(&attempt, conn.clone()).await;
+            if matches!(again, Err(Failure::Lost(_))) {
+                self.shared.forget(&conn);
+            }
+            again.map_err(Failure::into_error)
         };
         tokio::time::timeout_at(deadline, query)
             .await
@@ -355,7 +421,7 @@ impl<P: Protocol> Session<P> {
     ) -> Result<Vec<u8>, Failure> {
         let progress = Progress::default();
         let mut unanswered = Unanswered {
-            session: self,
+            shared: &self.shared,
             conn: conn.clone(),
             progress: progress.clone(),
             answered: false,
@@ -363,6 +429,102 @@ impl<P: Protocol> Session<P> {
         let result = attempt(conn, progress).await;
         unanswered.answered = result.is_ok();
         result
+    }
+
+    /// The connection a query goes to, waiting for the dial that makes one
+    /// — begun here when none is in flight — when there is none; and
+    /// whether the query took it at once — one that was up when it came —,
+    /// rather than after a dial it waited for.
+    async fn take(&self, deadline: Instant) -> Result<(Arc<Conn<P::State>>, bool), UpstreamError> {
+        let shared = &self.shared;
+        // the dials that had ended when this query began to wait
+        let mut waited_since = None;
+        loop {
+            // registered before the look: a dial that ends after it wakes us
+            let dialed = shared.dialed.notified();
+            let mut dialed = pin!(dialed);
+            dialed.as_mut().enable();
+            {
+                let mut slot = shared.slot.lock().expect("session");
+                slot.let_go_if_closed();
+                if let Some(conn) = &slot.current {
+                    // one that is going away is still the query's that
+                    // waited for it to be made, to fail on: it does not
+                    // dial again, as the next query will
+                    let made_for_it = waited_since.is_some_and(|since| slot.dials > since);
+                    if made_for_it || !shared.protocol.is_going_away(&conn.state) {
+                        return Ok((conn.clone(), waited_since.is_none()));
+                    }
+                    // the queries under way keep it
+                    slot.current = None;
+                }
+                if let Some(since) = waited_since
+                    && slot.dialing.is_none()
+                    && let Some((at, failure)) = &slot.failure
+                    && *at > since
+                {
+                    return Err(failure.clone());
+                }
+                if slot.dialing.is_none() {
+                    // a dial has its query's time: none without any left
+                    if Instant::now() >= deadline {
+                        return Err(UpstreamError::Timeout);
+                    }
+                    slot.dialing = Some(tokio::spawn(shared.clone().dial(deadline)));
+                }
+                waited_since = Some(slot.dials);
+            }
+            dialed.await;
+        }
+    }
+}
+
+impl<P: Protocol> Drop for Session<P> {
+    fn drop(&mut self) {
+        // the dial is the session's: it does not outlive it
+        let dial = self.shared.slot.lock().expect("session").dialing.take();
+        if let Some(dial) = dial {
+            dial.abort();
+        }
+    }
+}
+
+impl<P: Protocol> Shared<P> {
+    /// The session's dial, a task of its own: a new connection by
+    /// `deadline`, which becomes the session's, or the failure the queries
+    /// that waited for it share. Out of time it leaves neither.
+    async fn dial(self: Arc<Self>, deadline: Instant) {
+        let dialing = Dialing(&self);
+        let dialed = tokio::time::timeout_at(deadline, self.dialer.connect(deadline)).await;
+        match dialed {
+            Ok(dialed) => {
+                let dialed = dialed.map(|quic| {
+                    Arc::new(Conn {
+                        state: self.protocol.start(&quic),
+                        quic,
+                        no_error: P::NO_ERROR,
+                    })
+                });
+                let mut slot = self.slot.lock().expect("session");
+                slot.dials += 1;
+                match dialed {
+                    Ok(conn) => {
+                        tokio::spawn(let_go_when_closed(
+                            Arc::downgrade(&self),
+                            conn.quic.clone(),
+                            Arc::downgrade(&conn),
+                        ));
+                        slot.current = Some(conn);
+                        slot.failure = None;
+                    }
+                    Err(e) => slot.failure = Some((slot.dials, e)),
+                }
+            }
+            Err(_) => {
+                tracing::debug!(upstream = %self.dialer.name, "the server was not reached in the time of the query that dialed");
+            }
+        }
+        drop(dialing);
     }
 
     /// `conn` takes no new query from now on, unless it is not the
@@ -378,70 +540,31 @@ impl<P: Protocol> Session<P> {
             slot.current = None;
         }
     }
+}
 
-    /// The connection a query goes to, dialing one when there is none; and
-    /// whether the query took it at once — one that was up when it came —,
-    /// rather than after a dial of its own or of another it waited for.
-    async fn take(&self, deadline: Instant) -> Result<(Arc<Conn<P::State>>, bool), UpstreamError> {
-        // the dials that had ended when this query began to wait
-        let mut waited_since = None;
-        loop {
-            // registered before the look: a dial that ends after it wakes us
-            let dialed = self.dialed.notified();
-            let mut dialed = pin!(dialed);
-            dialed.as_mut().enable();
-            {
-                let mut slot = self.slot.lock().expect("session");
-                if let Some(conn) = &slot.current
-                    && conn.quic.close_reason().is_none()
-                    && !self.protocol.is_going_away(&conn.state)
-                {
-                    return Ok((conn.clone(), waited_since.is_none()));
-                }
-                // closed or going away: the queries under way keep it
-                slot.current = None;
-                if let Some(since) = waited_since
-                    && !slot.dialing
-                    && let Some((at, failure)) = &slot.failure
-                    && *at > since
-                {
-                    return Err(failure.clone());
-                }
-                if !slot.dialing {
-                    slot.dialing = true;
-                    break;
-                }
-                waited_since = Some(slot.dials);
-            }
-            dialed.await;
-        }
-        self.dial(deadline).await.map(|conn| (conn, false))
-    }
-
-    /// A new connection, which becomes the session's. The dial stays in
-    /// flight until it ends or its query gives up on it.
-    async fn dial(&self, deadline: Instant) -> Result<Arc<Conn<P::State>>, UpstreamError> {
-        let dialing = Dialing(self);
-        let dialed = self.dialer.connect(deadline).await.map(|quic| {
-            Arc::new(Conn {
-                state: self.protocol.start(&quic),
-                quic,
-                no_error: P::NO_ERROR,
-            })
-        });
-        {
-            let mut slot = self.slot.lock().expect("session");
-            slot.dials += 1;
-            match &dialed {
-                Ok(conn) => {
-                    slot.current = Some(conn.clone());
-                    slot.failure = None;
-                }
-                Err(e) => slot.failure = Some((slot.dials, e.clone())),
-            }
-        }
-        drop(dialing);
-        dialed
+/// Lets the session go of `conn` once the connection — `quic` — has closed,
+/// if it still is the session's: kept until the next query came, it would
+/// keep its socket and what carries that. The connection closes at the
+/// latest when its last holder lets go (`Conn::drop`), and this ends with
+/// it.
+async fn let_go_when_closed<P: Protocol>(
+    shared: Weak<Shared<P>>,
+    quic: Connection,
+    conn: Weak<Conn<P::State>>,
+) {
+    quic.closed().await;
+    // a handle on the connection keeps its socket too
+    drop(quic);
+    let Some(shared) = shared.upgrade() else {
+        return;
+    };
+    let mut slot = shared.slot.lock().expect("session");
+    if slot
+        .current
+        .as_ref()
+        .is_some_and(|current| std::ptr::eq(Arc::as_ptr(current), conn.as_ptr()))
+    {
+        slot.let_go_if_closed();
     }
 }
 
@@ -450,7 +573,7 @@ impl<P: Protocol> Session<P> {
 /// fan-out having no use for the upstream any more — it finds out whether
 /// `conn` went dead (`Progress::quiet`), and then `conn` takes no new query.
 struct Unanswered<'a, P: Protocol> {
-    session: &'a Session<P>,
+    shared: &'a Shared<P>,
     conn: Arc<Conn<P::State>>,
     progress: Progress,
     answered: bool,
@@ -459,19 +582,19 @@ struct Unanswered<'a, P: Protocol> {
 impl<P: Protocol> Drop for Unanswered<'_, P> {
     fn drop(&mut self) {
         if !self.answered && self.progress.quiet(&self.conn.quic) {
-            tracing::debug!(upstream = %self.session.dialer.name, "the connection received nothing since a query went out on it; the next query dials a new one");
-            self.session.forget(&self.conn);
+            tracing::debug!(upstream = %self.shared.dialer.name, "the connection received nothing since a query went out on it; the next query dials a new one");
+            self.shared.forget(&self.conn);
         }
     }
 }
 
-/// A dial in flight; when it ends — or its query gives up on it —, the
+/// The dial in flight; when it ends — or ends with the session —, the
 /// queries waiting for it look again.
-struct Dialing<'a, P: Protocol>(&'a Session<P>);
+struct Dialing<'a, P: Protocol>(&'a Shared<P>);
 
 impl<P: Protocol> Drop for Dialing<'_, P> {
     fn drop(&mut self) {
-        self.0.slot.lock().expect("session").dialing = false;
+        self.0.slot.lock().expect("session").dialing = None;
         self.0.dialed.notify_waiters();
     }
 }
@@ -479,13 +602,21 @@ impl<P: Protocol> Drop for Dialing<'_, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fanout::FanoutOpts;
-    use crate::testing::{DoqScript, FakeDoq, MockDns};
-    use rurge_net::connector::{BoxedDatagram, BoxedStream, DirectConnector, SystemResolve};
+    use crate::fanout::{FanoutOpts, resolve_name};
+    use crate::testing::{Doh3Script, DoqScript, FakeDoh3, FakeDoq, MockDns};
+    use crate::upstream::doh3::Doh3Upstream;
+    use crate::upstream::doq::DoqUpstream;
+    use crate::upstream::udp::UdpUpstream;
+    use crate::upstream::{UpstreamRef, UpstreamSpec};
+    use rurge_net::connector::{
+        BoxedDatagram, BoxedStream, Datagram, DirectConnector, SystemResolve,
+    };
     use std::future::{Future, pending, poll_fn};
+    use std::sync::MutexGuard;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::task::Poll;
+    use std::task::{Context, Poll};
     use std::time::Duration;
+    use tokio::io::ReadBuf;
     use tokio::sync::watch;
     use tokio::time::timeout;
 
@@ -505,13 +636,37 @@ mod tests {
     }
 
     /// A direct connector's UDP flows, which it opens only once it is let
-    /// to; it counts the flows it was asked for, and refuses them while it
-    /// is told to.
+    /// to; it counts the flows it was asked for and those that are still
+    /// held, and refuses them while it is told to.
     struct Gated {
         inner: DirectConnector,
         asked: AtomicUsize,
+        held: Arc<AtomicUsize>,
         gate: watch::Sender<bool>,
         refusing: AtomicBool,
+    }
+
+    /// A flow of `Gated`, counted while it is held.
+    struct Held(BoxedDatagram, Arc<AtomicUsize>);
+
+    impl Datagram for Held {
+        fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            self.0.poll_send(cx, buf)
+        }
+
+        fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.0.poll_send_ready(cx)
+        }
+
+        fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            self.0.poll_recv(cx, buf)
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.1.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     impl Gated {
@@ -519,6 +674,7 @@ mod tests {
             Arc::new(Gated {
                 inner: DirectConnector::new(Arc::new(SystemResolve)),
                 asked: AtomicUsize::new(0),
+                held: Arc::default(),
                 gate: watch::channel(false).0,
                 refusing: AtomicBool::new(false),
             })
@@ -526,6 +682,11 @@ mod tests {
 
         fn asked(&self) -> usize {
             self.asked.load(Ordering::SeqCst)
+        }
+
+        /// The flows it handed out that are still held.
+        fn held(&self) -> usize {
+            self.held.load(Ordering::SeqCst)
         }
 
         fn open(&self) {
@@ -570,19 +731,19 @@ mod tests {
                     return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"));
                 }
                 let datagram = self.inner.connect_udp(target, opts).await?;
-                // a flow not yet known to be writable drops what the carrier
-                // first sends on it — the carrier does not wait, and the
-                // connection starts a second late, after QUIC's first
-                // retransmission —: ready it with an empty datagram, which
-                // the server takes for noise
-                poll_fn(|cx| datagram.poll_send(cx, &[])).await?;
-                Ok(datagram)
+                self.held.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(Held(datagram, self.held.clone())) as BoxedDatagram)
             })
         }
     }
 
     /// A session to `fake` through a gated connector.
     fn session(fake: &FakeDoq) -> (Session<Plain>, Arc<Gated>) {
+        session_of(fake, Plain)
+    }
+
+    /// `session`, of `protocol`.
+    fn session_of<P: Protocol>(fake: &FakeDoq, protocol: P) -> (Session<P>, Arc<Gated>) {
         let gated = Gated::new();
         let dialer = Dialer::new(
             "quic://test".to_string(),
@@ -592,7 +753,7 @@ mod tests {
             Bootstrap::new(Vec::new(), false, FanoutOpts::default()),
             client_config(true, "doq").unwrap(),
         );
-        (Session::new(Plain, dialer), gated)
+        (Session::new(protocol, dialer), gated)
     }
 
     fn far() -> Instant {
@@ -655,10 +816,13 @@ mod tests {
         })
     }
 
+    fn slot(session: &Session<Plain>) -> MutexGuard<'_, Slot<()>> {
+        session.shared.slot.lock().expect("session")
+    }
+
     /// The session's connection.
     fn current(session: &Session<Plain>) -> Arc<Conn<()>> {
-        let slot = session.slot.lock().expect("session");
-        slot.current.clone().expect("a connection")
+        slot(session).current.clone().expect("a connection")
     }
 
     /// Waits until `conn` has taken in nothing for a while: what the server
@@ -682,7 +846,7 @@ mod tests {
 
     /// How long a connection must have received nothing to be called quiet.
     fn quiet_for(conn: &Connection) -> Duration {
-        conn.rtt() * 2 + MAX_ACK_DELAY
+        dead_after(conn.rtt())
     }
 
     /// Polls `query` once — as far as it gets without the network — and
@@ -705,27 +869,234 @@ mod tests {
         (session, gated)
     }
 
-    /// The query that was dialing is dropped — the fan-out has what it
-    /// wants from another upstream —, and one that waited for its dial
-    /// takes it over: it dials, once, in its place.
+    /// The query that began the dial is dropped — the fan-out has what it
+    /// wants from another upstream —: the dial goes on, and one that waited
+    /// for it gets its connection. The path was asked for once.
     #[tokio::test]
-    async fn a_dial_dropped_with_its_query_is_taken_over_by_a_waiter() {
+    async fn a_dial_goes_on_without_the_query_that_began_it() {
         let dns = MockDns::spawn().await;
         let fake = FakeDoq::spawn(&dns, DoqScript::default());
         let (session, gated) = session(&fake);
         let mut first = Box::pin(session.query(far(), answered));
         let mut second = Box::pin(session.query(far(), answered));
-        // the first dials and waits for its path, the second for that dial
+        // the first begins the dial, which waits for its path; the second
+        // waits for that dial
         assert!(timeout(SETTLE, &mut first).await.is_err());
         assert!(timeout(SETTLE, &mut second).await.is_err());
         assert_eq!(gated.asked(), 1);
         drop(first);
         assert!(timeout(SETTLE, &mut second).await.is_err());
-        assert_eq!(gated.asked(), 2);
         gated.open();
         let answer = timeout(BOUND, &mut second).await.expect("within the bound");
         assert_eq!(answer, Ok(vec![1]));
+        assert_eq!(gated.asked(), 1);
         eventually(|| fake.connections() == 1).await;
+    }
+
+    /// With no query left that waits for it, the dial goes on all the
+    /// same: the connection it makes is the session's, and the next query
+    /// takes it.
+    #[tokio::test]
+    async fn a_dial_nobody_waits_for_still_makes_the_sessions_connection() {
+        let dns = MockDns::spawn().await;
+        let fake = FakeDoq::spawn(&dns, DoqScript::default());
+        let (session, gated) = session(&fake);
+        let mut only = Box::pin(session.query(far(), answered));
+        assert!(timeout(SETTLE, &mut only).await.is_err());
+        drop(only);
+        gated.open();
+        eventually(|| fake.connections() == 1).await;
+        let next = timeout(BOUND, session.query(far(), answered)).await;
+        assert_eq!(next.expect("within the bound"), Ok(vec![1]));
+        assert_eq!(gated.asked(), 1);
+        assert_eq!(fake.connections(), 1);
+    }
+
+    /// A dial has until the deadline of the query that began it. Out of
+    /// that time it is given up without a verdict on the server: a query
+    /// that waited for it and has time left dials anew, with its own time,
+    /// rather than share a failure.
+    #[tokio::test]
+    async fn a_dial_out_of_its_time_leaves_the_dialing_to_a_query_with_time_left() {
+        let dns = MockDns::spawn().await;
+        let fake = FakeDoq::spawn(&dns, DoqScript::default());
+        let (session, gated) = session(&fake);
+        let soon = Instant::now() + 2 * SETTLE;
+        // the path opens only after the first query's deadline
+        let later = async {
+            tokio::time::sleep(4 * SETTLE).await;
+            gated.open();
+        };
+        let both = async {
+            tokio::join!(
+                session.query(soon, answered),
+                session.query(far(), answered),
+                later
+            )
+        };
+        let (first, second, ()) = timeout(BOUND, both).await.expect("within the bound");
+        assert_eq!(first, Err(UpstreamError::Timeout));
+        assert_eq!(second, Ok(vec![1]));
+        assert_eq!(gated.asked(), 2);
+    }
+
+    /// A protocol whose connections take no query from the moment they are
+    /// made: closed, as by a server that sheds its load, or going away, as
+    /// by one that is shutting down.
+    struct Unfit {
+        closed: bool,
+    }
+
+    impl Protocol for Unfit {
+        type State = ();
+        const NO_ERROR: VarInt = VarInt::from_u32(0);
+
+        fn start(&self, connection: &Connection) {
+            if self.closed {
+                connection.close(VarInt::from_u32(4), b"");
+            }
+        }
+
+        fn is_going_away(&self, _: &()) -> bool {
+            !self.closed
+        }
+    }
+
+    /// A connection that takes no query from the moment it is made — it
+    /// has closed, or is going away — fails the queries that waited for it
+    /// with what they find. They do not dial again and again until their
+    /// time is up: a server that sheds its load, or is shutting down, gets
+    /// a handshake for each of them at the most, not a storm.
+    #[tokio::test]
+    async fn a_connection_unfit_as_it_was_made_fails_the_queries_that_waited_for_it() {
+        let dns = MockDns::spawn().await;
+        let fake = FakeDoq::spawn(&dns, DoqScript::default());
+        // closed: how it ended, shared, and one dial for all; going away:
+        // what the attempt on it finds, and a query that comes for it after
+        // another let go of it dials once more
+        for (closed, found, dials) in [
+            (true, "quic: the connection was closed", 1),
+            (false, "lost", 2),
+        ] {
+            let (session, gated) = session_of(&fake, Unfit { closed });
+            gated.open();
+            let soon = Instant::now() + Duration::from_secs(2);
+            let both = async { tokio::join!(session.query(soon, lost), session.query(soon, lost)) };
+            let (first, second) = timeout(BOUND, both).await.expect("within the bound");
+            let found = Err(UpstreamError::Io(found.to_string()));
+            assert_eq!((first, second), (found.clone(), found), "{closed}");
+            assert!(gated.asked() <= dials, "{closed}: {}", gated.asked());
+        }
+    }
+
+    /// The dial is the session's: it ends with it, wherever it was.
+    #[tokio::test]
+    async fn a_dial_in_flight_ends_with_its_session() {
+        let dns = MockDns::spawn().await;
+        let fake = FakeDoq::spawn(&dns, DoqScript::default());
+        let (session, gated) = session(&fake);
+        // time enough for a dial left behind to outlast the test's bound
+        let deadline = Instant::now() + 6 * BOUND;
+        given_up_at_once(session.query(deadline, answered)).await;
+        eventually(|| gated.asked() == 1).await;
+        drop(session);
+        // nothing holds the connector but the test: the dial is gone
+        eventually(|| Arc::strong_count(&gated) == 1).await;
+        gated.open();
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(fake.connections(), 0);
+    }
+
+    /// A server that takes longer to connect to than another takes to
+    /// answer: the fan-out drops its query as soon as the other has
+    /// answered, every time. Its dial goes on without the query, once: the
+    /// lookups that follow find its connection and use it, and it is not
+    /// sent a handshake by each of them.
+    #[tokio::test]
+    async fn a_server_slower_to_connect_than_another_to_answer_gets_its_connection() {
+        // the fast server, and what the slow ones answer from
+        let fast_dns = MockDns::spawn().await;
+        fast_dns.set("a.test", &["10.0.0.1"], &[], 60);
+        let dns = MockDns::spawn().await;
+        dns.set("a.test", &["10.0.0.2"], &[], 60);
+        let doq = FakeDoq::spawn(&dns, DoqScript::default());
+        let doh3 = FakeDoh3::spawn(&dns, Doh3Script::default());
+        let bootstrap = || Bootstrap::new(Vec::new(), false, FanoutOpts::default());
+        let (over_quic, over_h3) = (Gated::new(), Gated::new());
+        let slow_doq: UpstreamRef = Arc::new(DoqUpstream::new(
+            "127.0.0.1",
+            doq.addr().port(),
+            over_quic.clone(),
+            bootstrap(),
+            DoqUpstream::client_config(true).unwrap(),
+        ));
+        let h3 = format!("h3://127.0.0.1:{}", doh3.addr().port());
+        let Ok(UpstreamSpec::H3(url)) = UpstreamSpec::parse(&h3) else {
+            panic!("{h3}");
+        };
+        let slow_doh3: UpstreamRef = Arc::new(Doh3Upstream::new(
+            url,
+            over_h3.clone(),
+            bootstrap(),
+            Doh3Upstream::client_config(true).unwrap(),
+        ));
+        let connections: [&dyn Fn() -> usize; 2] = [&|| doq.connections(), &|| doh3.connections()];
+        for ((slow, gated), connections) in [(slow_doq, over_quic), (slow_doh3, over_h3)]
+            .into_iter()
+            .zip(connections)
+        {
+            let fast: UpstreamRef = Arc::new(UdpUpstream::new(fast_dns.addr()));
+            let both = [fast.clone(), slow.clone()];
+            let opts = FanoutOpts::default();
+            let lookup = || async {
+                let answers = resolve_name(&both, "a.test", false, &opts);
+                timeout(BOUND, answers)
+                    .await
+                    .expect("within the bound")
+                    .unwrap()
+            };
+            // answered by the fast one while the slow one's dial waits for
+            // its path
+            assert_eq!(lookup().await.upstream, fast.name());
+            assert_eq!(gated.asked(), 1, "{}", slow.name());
+            // the path opens with the lookup over and its queries dropped
+            gated.open();
+            eventually(|| connections() == 1).await;
+            for _ in 0..3 {
+                lookup().await;
+            }
+            // and the connection is used: the slow one answers alone
+            fast_dns.set_drop_all(true);
+            let answers = lookup().await;
+            assert_eq!(answers.upstream, slow.name());
+            assert_eq!(answers.v4[0].0.to_string(), "10.0.0.2");
+            fast_dns.set_drop_all(false);
+            assert_eq!(gated.asked(), 1, "{}", slow.name());
+            assert_eq!(connections(), 1, "{}", slow.name());
+        }
+    }
+
+    /// A connection that has closed — here by the server's idle timeout —
+    /// is let go of at once, no query asking: the session holds none, and
+    /// the flow that carried the connection is dropped.
+    #[tokio::test]
+    async fn a_connection_that_closed_is_let_go_of_with_its_carrier() {
+        let dns = MockDns::spawn().await;
+        let fake = FakeDoq::spawn(
+            &dns,
+            DoqScript {
+                idle_timeout: Some(Duration::from_millis(300)),
+                ..DoqScript::default()
+            },
+        );
+        let (session, gated) = session(&fake);
+        gated.open();
+        assert_eq!(session.query(far(), answered).await, Ok(vec![1]));
+        assert_eq!(gated.held(), 1);
+        eventually(|| slot(&session).current.is_none() && gated.held() == 0).await;
+        // and the next query dials
+        assert_eq!(session.query(far(), answered).await, Ok(vec![1]));
+        assert_eq!(gated.asked(), 2);
     }
 
     /// The queries that wait for a dial share its failure, and none dials
@@ -915,5 +1286,64 @@ mod tests {
         assert_eq!(next, Ok(vec![1]));
         assert_eq!(session.query(far(), answered).await, Ok(vec![1]));
         assert_eq!(gated.asked(), 2);
+    }
+
+    /// A query that went again and finds the connection it went again on
+    /// gone too fails with what it found; that connection takes no new
+    /// query either: the next one dials.
+    #[tokio::test]
+    async fn a_connection_the_second_attempt_finds_gone_takes_no_more() {
+        let dns = MockDns::spawn().await;
+        let fake = FakeDoq::spawn(&dns, DoqScript::default());
+        let (session, gated) = settled_session(&fake).await;
+        let twice = timeout(BOUND, session.query(far(), lost)).await;
+        assert_eq!(
+            twice.expect("within the bound"),
+            Err(UpstreamError::Io("lost".to_string()))
+        );
+        assert_eq!(gated.asked(), 2);
+        let next = timeout(BOUND, session.query(far(), answered)).await;
+        assert_eq!(next.expect("within the bound"), Ok(vec![1]));
+        assert_eq!(gated.asked(), 3);
+    }
+
+    /// Sets when `progress` says its data was written to `ago`.
+    fn written_ago(progress: &Progress, ago: Duration) {
+        let mut written = progress.0.lock().unwrap();
+        written.as_mut().expect("written").at = Instant::now() - ago;
+    }
+
+    /// A connection is called dead for a silence only a dead one keeps: a
+    /// live one may take a round trip and its peer's ack delay to show a
+    /// sign of life, and timers run late. Sixty milliseconds of silence on
+    /// the loopback — many round trips — say nothing yet.
+    #[tokio::test]
+    async fn a_silence_a_live_connection_may_keep_says_nothing() {
+        let dns = MockDns::spawn().await;
+        let fake = FakeDoq::spawn(&dns, DoqScript::default());
+        let (session, _gated) = settled_session(&fake).await;
+        let conn = current(&session);
+        let rtt = conn.quic.rtt();
+        let progress = Progress::default();
+        assert!(!progress.quiet(&conn.quic), "nothing written");
+        progress.written(&conn.quic);
+        assert!(!progress.quiet(&conn.quic), "just written");
+        written_ago(&progress, Duration::from_millis(60));
+        assert!(!progress.quiet(&conn.quic), "a round trip of {rtt:?}");
+        written_ago(&progress, quiet_for(&conn.quic));
+        assert!(progress.quiet(&conn.quic), "a round trip of {rtt:?}");
+    }
+
+    /// Three round trips and two ack delays, and a tenth of a second at
+    /// the least.
+    #[test]
+    fn the_silence_that_tells_grows_with_the_round_trip() {
+        let ms = Duration::from_millis;
+        assert_eq!(dead_after(Duration::ZERO), ms(100));
+        assert_eq!(dead_after(ms(10)), ms(100));
+        assert_eq!(dead_after(ms(20)), ms(110));
+        assert_eq!(dead_after(ms(100)), ms(350));
+        // quinn's estimate before it has a sample
+        assert_eq!(dead_after(ms(333)), ms(1049));
     }
 }
