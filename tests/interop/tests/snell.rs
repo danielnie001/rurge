@@ -24,37 +24,6 @@ fn snell_inbound(obfs_http: bool) -> Inbound {
     plain(InboundKind::Snell { obfs_http }, &[("ignored", PSK)])
 }
 
-/// `count` requests one after another, each ended cleanly both ways, so
-/// that with `reuse=true` each one hands its connection to the next.
-/// Bounded like `roundtrip`.
-async fn requests_one_after_another(out: &OutboundRef, echo: SocketAddr, count: usize) {
-    let bound = std::time::Duration::from_secs(10);
-    for i in 0..count {
-        let mut stream = tokio::time::timeout(
-            bound,
-            out.connect_tcp(&target(echo), &ConnectOpts::default()),
-        )
-        .await
-        .expect("the tunnel is established within the bound")
-        .expect("the tunnel is established");
-        let payload = format!("request {i}");
-        let mut back = vec![0u8; payload.len()];
-        let exchange = async {
-            stream.write_all(payload.as_bytes()).await.unwrap();
-            stream.read_exact(&mut back).await.unwrap();
-            stream.shutdown().await.unwrap();
-            // the target's end comes back as the server's end of the request
-            let mut rest = Vec::new();
-            stream.read_to_end(&mut rest).await.unwrap();
-            rest
-        };
-        let rest = tokio::time::timeout(bound, exchange)
-            .await
-            .expect("the request completes within the bound");
-        assert_eq!((back.as_slice(), rest.len()), (payload.as_bytes(), 0));
-    }
-}
-
 /// Each policy: one small and one large TCP round trip.
 async fn tcp(profile: &str, names: &[&str]) {
     let echo = echo_server().await;

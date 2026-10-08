@@ -158,6 +158,50 @@ pub async fn udp_roundtrip(out: &OutboundRef, echo: SocketAddr) {
     }
 }
 
+/// `count` requests one after another, each ended cleanly both ways, so
+/// that an outbound that reuses connections hands each one's to the next.
+/// Bounded like `roundtrip`.
+pub async fn requests_one_after_another(out: &OutboundRef, echo: SocketAddr, count: usize) {
+    let bound = std::time::Duration::from_secs(10);
+    for i in 0..count {
+        let mut stream = tokio::time::timeout(
+            bound,
+            out.connect_tcp(&target(echo), &ConnectOpts::default()),
+        )
+        .await
+        .expect("the tunnel is established within the bound")
+        .expect("the tunnel is established");
+        let payload = format!("request {i}");
+        let mut back = vec![0u8; payload.len()];
+        let exchange = async {
+            stream.write_all(payload.as_bytes()).await.unwrap();
+            stream.read_exact(&mut back).await.unwrap();
+            stream.shutdown().await.unwrap();
+            // the target's end comes back as the server's end of the request
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).await.unwrap();
+            rest
+        };
+        let rest = tokio::time::timeout(bound, exchange)
+            .await
+            .expect("the request completes within the bound");
+        assert_eq!((back.as_slice(), rest.len()), (payload.as_bytes(), 0));
+    }
+}
+
+/// `steps` as a task of its own, so that its failure is not the last word:
+/// the panic says what happened, and this adds which of the test's policies
+/// it happened to and what the reference server logged. On CI nobody can
+/// ask the server afterwards.
+pub async fn attempt<F>(what: &str, log: impl FnOnce() -> String, steps: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Err(failed) = tokio::spawn(steps).await {
+        panic!("{what}: {failed}\n--- the server's log ---\n{}", log());
+    }
+}
+
 pub fn plain(kind: InboundKind, users: &[(&str, &str)]) -> Inbound {
     Inbound {
         kind,

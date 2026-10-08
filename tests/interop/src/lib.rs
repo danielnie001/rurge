@@ -10,6 +10,7 @@
 pub mod coredns;
 pub mod dnsproxy;
 pub mod masque_server;
+pub mod mihomo;
 pub mod shadowsocks_rust;
 pub mod snell_server;
 pub mod sshd;

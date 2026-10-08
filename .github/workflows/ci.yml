@@ -276,6 +276,45 @@ jobs:
           chmod +x "$bin"
           if [ "$RUNNER_OS" = "Windows" ]; then bin=$(cygpath -w "$bin"); fi
           echo "RURGE_TEST_COREDNS=$bin" >> "$GITHUB_ENV"
+      - name: Install mihomo for the Snell v1 to v3, Shadowsocks chacha20 and simple-obfs interoperability tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=1.19.32
+          # The amd64 builds are the `v1` ones: they run on any x86-64.
+          case "$RUNNER_OS" in
+            Linux)   asset="mihomo-linux-amd64-v1-v$version.gz";    sha=306f81e723e60ce6b828899a6fe83e1d00e9ecefb2dc8d4d849312a5bc00efdc ;;
+            Windows) asset="mihomo-windows-amd64-v1-v$version.zip"; sha=00549b347d8e124600e46cac67d59293358454f465e9d86d2511567da56b7029 ;;
+            macOS)   asset="mihomo-darwin-arm64-v$version.gz";      sha=3312a6780652c622890fd4357c6a853bbf865464fd047ac7b7f52dab8de18652 ;;
+            *) echo "unexpected runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 --retry-all-errors -o "$asset" "https://github.com/MetaCubeX/mihomo/releases/download/v$version/$asset"
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum "$asset" | cut -d' ' -f1)
+          else
+            actual=$(shasum -a 256 "$asset" | cut -d' ' -f1)
+          fi
+          if [ "$actual" != "$sha" ]; then
+            echo "mihomo checksum mismatch: expected $sha, got $actual"
+            exit 1
+          fi
+          mkdir -p mihomo
+          case "$asset" in
+            *.zip)
+              unzip -q "$asset" -d mihomo
+              bin=$(find "$PWD/mihomo" -type f -name '*.exe' | head -n 1)
+              ;;
+            *)
+              # The executable itself, gzipped: not a tar archive.
+              gunzip -c "$asset" > mihomo/mihomo
+              bin="$PWD/mihomo/mihomo"
+              ;;
+          esac
+          [ -n "$bin" ] || { echo "no mihomo binary in $asset"; exit 1; }
+          chmod +x "$bin"
+          if [ "$RUNNER_OS" = "Windows" ]; then bin=$(cygpath -w "$bin"); fi
+          echo "RURGE_TEST_MIHOMO=$bin" >> "$GITHUB_ENV"
       - name: Point the SSH interoperability tests at OpenSSH's sshd
         if: runner.os != 'Windows'
         shell: bash

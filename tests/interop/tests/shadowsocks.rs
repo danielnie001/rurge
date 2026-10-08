@@ -1,7 +1,8 @@
 //! rurge's `ss` outbound against shadowsocks-rust's `ssserver` and sing-box's
 //! `shadowsocks` inbound (phase 2 M6 design 3.4, M6-D5): TCP with one chunk
 //! and with many, and UDP, for the AEAD and the 2022 methods, the latter
-//! also as one of several users. Every target is a loopback IP literal.
+//! also as one of several users; and against `ssserver` the stream ciphers
+//! it knows (phase 2 M8 design 4.1). Every target is a loopback IP literal.
 
 mod common;
 
@@ -100,6 +101,89 @@ async fn ss_2022_against_ssserver_with_one_key_and_as_a_user() {
         ),
     );
     every_way(&profile, &["B128", "B256", "User"]).await;
+}
+
+/// The stream ciphers ssserver's release build knows by the manual's names
+/// — it has neither `salsa20` nor the `chacha20` of an 8-byte nonce —, and
+/// whether the case goes on to UDP: once with an IV of 16 bytes and once
+/// with one of 12.
+const STREAM_METHODS: [(&str, bool); 9] = [
+    ("rc4", false),
+    ("rc4-md5", false),
+    ("aes-128-cfb", false),
+    ("aes-192-cfb", false),
+    ("aes-256-cfb", true),
+    ("aes-128-ctr", false),
+    ("aes-192-ctr", false),
+    ("aes-256-ctr", false),
+    ("chacha20-ietf", true),
+];
+
+/// A policy for each stream method, named after it, the `index`-th dialling
+/// `port(index)`.
+fn stream_profile(port: impl Fn(usize) -> u16) -> String {
+    let lines: String = STREAM_METHODS
+        .iter()
+        .enumerate()
+        .map(|(index, (method, _))| line(method, port(index), method, "s3same"))
+        .collect();
+    format!("[Proxy]\n{lines}[Rule]\nFINAL,DIRECT\n")
+}
+
+/// Nothing a stream cipher carries is authenticated, so the bytes that come
+/// back are the proof that key, IV and keystream are ssserver's — over more
+/// than one write each way too. ssserver takes these ciphers as it takes any
+/// other, with a warning in its log.
+#[tokio::test]
+async fn stream_methods_against_ssserver() {
+    let Some(bin) = ssserver_or_skip("stream_methods_against_ssserver") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ss = Ssserver::spawn(
+        &bin,
+        dir.path(),
+        STREAM_METHODS
+            .iter()
+            .map(|(method, _)| server(method, "s3same"))
+            .collect(),
+    );
+    let profile = stream_profile(|index| ss.port(index));
+    let (echo, udp_echo) = (echo_server().await, udp_echo_server().await);
+    for (method, udp) in STREAM_METHODS {
+        let out = outbound(&profile, method, None);
+        let steps = async move {
+            roundtrip(&out, echo).await;
+            roundtrip_big(&out, echo).await;
+            if udp {
+                udp_roundtrip(&out, udp_echo).await;
+            }
+        };
+        attempt(method, || ss.log_text(), steps).await;
+    }
+}
+
+/// What that case writes on rurge's side, checked without ssserver: every
+/// policy loads with nothing said about it but that its cipher is a stream
+/// cipher, and builds its outbound.
+#[tokio::test]
+async fn the_stream_method_policies_load_and_build() {
+    let profile = stream_profile(|index| 4000 + index as u16);
+    let loaded = from_text(
+        &profile,
+        Path::new("interop.conf"),
+        &LoadOptions::for_tests(),
+    );
+    let said: Vec<String> = loaded
+        .diagnostics
+        .iter()
+        .filter(|d| d.code != rurge_config::codes::W_STREAM_CIPHER)
+        .map(|d| d.to_string())
+        .collect();
+    assert!(said.is_empty(), "{said:#?}\n{profile}");
+    for (method, _) in STREAM_METHODS {
+        assert_eq!(outbound(&profile, method, None).name(), method);
+    }
 }
 
 fn ss_inbound(method: &'static str, password: &str, users: &[&str]) -> Inbound {
