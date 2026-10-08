@@ -133,7 +133,8 @@ fn stream_profile(port: impl Fn(usize) -> u16) -> String {
 /// Nothing a stream cipher carries is authenticated, so the bytes that come
 /// back are the proof that key, IV and keystream are ssserver's — over more
 /// than one write each way too. ssserver takes these ciphers as it takes any
-/// other, with a warning in its log.
+/// other, with a warning in its log. Every method is tried, whatever the
+/// ones before it met.
 #[tokio::test]
 async fn stream_methods_against_ssserver() {
     let Some(bin) = ssserver_or_skip("stream_methods_against_ssserver") else {
@@ -150,6 +151,7 @@ async fn stream_methods_against_ssserver() {
     );
     let profile = stream_profile(|index| ss.port(index));
     let (echo, udp_echo) = (echo_server().await, udp_echo_server().await);
+    let mut failures = Failures::default();
     for (method, udp) in STREAM_METHODS {
         let out = outbound(&profile, method, None);
         let steps = async move {
@@ -159,8 +161,9 @@ async fn stream_methods_against_ssserver() {
                 udp_roundtrip(&out, udp_echo).await;
             }
         };
-        attempt(method, || ss.log_text(), steps).await;
+        attempt(&mut failures, method, steps).await;
     }
+    failures.finish(|| ss.log_text());
 }
 
 /// What that case writes on rurge's side, checked without ssserver.
@@ -168,6 +171,53 @@ async fn stream_methods_against_ssserver() {
 async fn the_stream_method_policies_load_and_build() {
     let names: Vec<&str> = STREAM_METHODS.iter().map(|(method, _)| *method).collect();
     loads_and_builds(&stream_profile(|index| 4000 + index as u16), &names);
+}
+
+/// How that case tells what failed, checked without ssserver: a method that
+/// fails does not keep the next from being tried, each failure is told
+/// under its method with what its own panic said, on one line, and the
+/// server's log comes after them all, once.
+#[tokio::test]
+async fn every_method_that_fails_is_told_not_the_first_alone() {
+    let mut failures = Failures::default();
+    attempt(&mut failures, "rc4", async {
+        panic!("the echo differs");
+    })
+    .await;
+    attempt(&mut failures, "rc4-md5", async {}).await;
+    attempt(&mut failures, "aes-128-cfb", async {
+        let sent = 7;
+        panic!("the echo comes back within the bound:\n  {sent} bytes sent,\n  none back");
+    })
+    .await;
+    assert_eq!(
+        failures.report("a line of the log\nand another"),
+        "2 of 3 failed\n\
+         rc4: the echo differs\n\
+         aes-128-cfb: the echo comes back within the bound: 7 bytes sent, none back\n\
+         --- the server's log ---\n\
+         a line of the log\n\
+         and another"
+    );
+    // nothing failed: nothing is said, and the log is not asked for
+    let mut passed = Failures::default();
+    attempt(&mut passed, "rc4", async {}).await;
+    passed.finish(|| unreachable!("the log of a test that passed"));
+}
+
+/// And the test fails with that report, once, at its end.
+#[tokio::test]
+#[should_panic(
+    expected = "1 of 2 failed\nrc4: the echo differs\n--- the server's log ---\nthe log"
+)]
+async fn a_method_that_fails_fails_its_test_at_the_end() {
+    let mut failures = Failures::default();
+    attempt(&mut failures, "rc4", async {
+        panic!("the echo differs");
+    })
+    .await;
+    attempt(&mut failures, "rc4-md5", async {}).await;
+    failures.finish(|| "the log".to_string());
 }
 
 fn ss_inbound(method: &'static str, password: &str, users: &[&str]) -> Inbound {

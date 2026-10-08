@@ -212,16 +212,145 @@ pub async fn requests_one_after_another(out: &OutboundRef, echo: SocketAddr, cou
     }
 }
 
-/// `steps` as a task of its own, so that its failure is not the last word:
-/// the panic says what happened, and this adds which of the test's policies
-/// it happened to and what the reference server logged. On CI nobody can
-/// ask the server afterwards.
-pub async fn attempt<F>(what: &str, log: impl FnOnce() -> String, steps: F)
+/// What failed of the policies a test tried, each under its policy's name.
+/// A test that stops at the first failure hides what its other policies
+/// would have met, and on CI every run costs a push: so a test tries them
+/// all and fails once, at its end.
+#[derive(Default)]
+pub struct Failures {
+    tried: usize,
+    failed: Vec<(String, String)>,
+}
+
+impl Failures {
+    /// `what` went as `outcome` says.
+    pub fn record(&mut self, what: &str, outcome: Result<(), String>) {
+        self.tried += 1;
+        if let Err(why) = outcome {
+            self.failed.push((what.to_string(), why));
+        }
+    }
+
+    /// What `finish` panics with: how many failed, then each failure on a
+    /// line of its own, and `log` — what the reference server logged — last
+    /// and once. The digest CI makes of a failed test shows the head of its
+    /// output, 60 lines or 3 000 characters of it: the log is what may go.
+    pub fn report(&self, log: &str) -> String {
+        let mut text = format!("{} of {} failed\n", self.failed.len(), self.tried);
+        for (what, why) in &self.failed {
+            // one line, whatever the layout of the panic's own text
+            let why: Vec<&str> = why.split_whitespace().collect();
+            text += &format!("{what}: {}\n", why.join(" "));
+        }
+        text + "--- the server's log ---\n" + log
+    }
+
+    /// Fails the test when anything failed. `log` is read only then: on CI
+    /// nobody can ask the server afterwards.
+    #[track_caller]
+    pub fn finish(self, log: impl FnOnce() -> String) {
+        if !self.failed.is_empty() {
+            panic!("{}", self.report(&log()));
+        }
+    }
+}
+
+/// What a panic said, when it said it in words.
+fn panic_text(panic: Box<dyn std::any::Any + Send>) -> String {
+    match panic.downcast::<String>() {
+        Ok(text) => *text,
+        Err(panic) => match panic.downcast::<&'static str>() {
+            Ok(text) => text.to_string(),
+            Err(_) => "a panic without a message".to_string(),
+        },
+    }
+}
+
+/// `steps` as a task of its own, so that its failure is not the test's last
+/// word: the panic says what happened, and `failures` keeps it under `what`,
+/// the policy it happened to, for the test to go on to the next one.
+pub async fn attempt<F>(failures: &mut Failures, what: &str, steps: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    if let Err(failed) = tokio::spawn(steps).await {
-        panic!("{what}: {failed}\n--- the server's log ---\n{}", log());
+    let outcome = tokio::spawn(steps)
+        .await
+        .map_err(|failed| match failed.try_into_panic() {
+            Ok(panic) => panic_text(panic),
+            Err(cancelled) => cancelled.to_string(),
+        });
+    failures.record(what, outcome);
+}
+
+/// What a `snell` session says when the server ended the connection without
+/// a byte of its own: where that arrives as an end, and where it arrives as
+/// a reset.
+pub const UNANSWERED: [&str; 2] = [
+    "snell: the server closed the connection without answering (wrong psk or version?)",
+    "snell: the server reset the connection without answering (wrong psk or version?)",
+];
+
+/// How long a request no server can read may take to fail.
+pub const UNANSWERED_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What reading says after a request the server cannot read: `Ok` with the
+/// error's text. The tunnel comes up, since nothing is asked before the
+/// first payload; the payload leaves; and then the failure must come within
+/// `bound`. Whatever goes otherwise is the `Err`, in words.
+pub async fn unanswered(
+    out: &OutboundRef,
+    echo: SocketAddr,
+    bound: std::time::Duration,
+) -> Result<String, String> {
+    // bounded like `roundtrip`: neither step waits for the server
+    let step = std::time::Duration::from_secs(10);
+    let (to, opts) = (target(echo), ConnectOpts::default());
+    let mut stream = match tokio::time::timeout(step, out.connect_tcp(&to, &opts)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => return Err(format!("the tunnel did not come up: {e}")),
+        Err(_) => return Err(format!("no tunnel within {step:?}")),
+    };
+    match tokio::time::timeout(step, stream.write_all(b"interop")).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(format!("the first payload did not leave: {e}")),
+        Err(_) => return Err(format!("the first payload did not leave within {step:?}")),
+    }
+    let mut answer = Vec::new();
+    match tokio::time::timeout(bound, stream.read_to_end(&mut answer)).await {
+        Ok(Err(e)) => Ok(e.to_string()),
+        Ok(Ok(_)) => Err(format!(
+            "the request ended without an error, {} bytes in",
+            answer.len()
+        )),
+        Err(_) => Err(format!(
+            "no failure within {bound:?}, {} bytes in: the request hangs",
+            answer.len()
+        )),
+    }
+}
+
+/// Each policy of `names` dials a server that cannot read its request — one
+/// of another PSK, or of another version's records. Such a server has no
+/// word to answer with: the session must fail within `bound`, with one of
+/// the two sentences that say what may be wrong and nothing of either PSK.
+/// A third sentence has the same hint — the server's data failed to decrypt
+/// — and would mean that the server had answered: it is not taken. Whatever
+/// a policy meets instead is its failure, told as what it was.
+pub async fn none_is_answered(
+    failures: &mut Failures,
+    profile: &str,
+    names: &[&str],
+    bound: std::time::Duration,
+) {
+    let echo = echo_server().await;
+    for name in names {
+        let out = outbound(profile, name, None);
+        let outcome = match unanswered(&out, echo, bound).await {
+            Ok(text) if UNANSWERED.contains(&text.as_str()) => Ok(()),
+            Ok(text) => Err(format!("failed with another sentence: {text}")),
+            Err(otherwise) => Err(otherwise),
+        };
+        failures.record(name, outcome);
     }
 }
 

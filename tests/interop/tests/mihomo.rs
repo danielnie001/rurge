@@ -21,13 +21,6 @@ const PSK: &str = "sn3ll-interop";
 const OTHER_PSK: &str = "an0ther-psk";
 const PASSWORD: &str = "s3same";
 
-/// What a session says when the server ended the connection without a byte
-/// of its own: where that arrives as an end, and where it arrives as a reset.
-const UNANSWERED: [&str; 2] = [
-    "snell: the server closed the connection without answering (wrong psk or version?)",
-    "snell: the server reset the connection without answering (wrong psk or version?)",
-];
-
 /// A policy and the listener it dials.
 struct Case {
     name: &'static str,
@@ -160,8 +153,9 @@ fn start(bin: &Path, dir: &Path, cases: &[Case]) -> (Mihomo, String) {
     (server, profile)
 }
 
-/// One small and one large TCP round trip through each policy of `cases`.
-async fn tcp(server: &Mihomo, profile: &str, cases: &[Case]) {
+/// One small and one large TCP round trip through each policy of `cases`,
+/// whatever the ones before it met.
+async fn tcp(failures: &mut Failures, profile: &str, cases: &[Case]) {
     let echo = echo_server().await;
     for case in cases {
         let out = outbound(profile, case.name, None);
@@ -169,35 +163,7 @@ async fn tcp(server: &Mihomo, profile: &str, cases: &[Case]) {
             roundtrip(&out, echo).await;
             roundtrip_big(&out, echo).await;
         };
-        attempt(case.name, || server.log_text(), steps).await;
-    }
-}
-
-/// What reading says after a request the server cannot read. The tunnel
-/// comes up, since nothing is asked before the first payload; the payload
-/// leaves; and then the failure must come within the bound. Whatever goes
-/// otherwise is told with what the server logged (`log`).
-async fn unanswered(log: &dyn Fn() -> String, out: &OutboundRef, echo: SocketAddr) -> String {
-    let bound = Duration::from_secs(10);
-    let (to, opts) = (target(echo), ConnectOpts::default());
-    let mut stream = match tokio::time::timeout(bound, out.connect_tcp(&to, &opts)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => panic!("the tunnel comes up: {e}\n{}", log()),
-        Err(_) => panic!("no tunnel within the bound\n{}", log()),
-    };
-    match tokio::time::timeout(bound, stream.write_all(b"interop")).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("the first payload leaves: {e}\n{}", log()),
-        Err(_) => panic!("no first payload within the bound\n{}", log()),
-    }
-    let mut answer = Vec::new();
-    match tokio::time::timeout(bound, stream.read_to_end(&mut answer)).await {
-        Ok(Err(e)) => e.to_string(),
-        Ok(Ok(n)) => panic!(
-            "the request ended without an error, {n} bytes in\n{}",
-            log()
-        ),
-        Err(_) => panic!("no failure within the bound: the request hangs\n{}", log()),
+        attempt(failures, case.name, steps).await;
     }
 }
 
@@ -212,7 +178,9 @@ async fn snell_v1_to_v3_against_mihomo() {
     let dir = tempfile::tempdir().unwrap();
     let cases = tcp_cases();
     let (server, profile) = start(&bin, dir.path(), &cases);
-    tcp(&server, &profile, &cases).await;
+    let mut failures = Failures::default();
+    tcp(&mut failures, &profile, &cases).await;
+    failures.finish(|| server.log_text());
 }
 
 /// Version 2 always reuses its connection: each direction of a request
@@ -233,7 +201,9 @@ async fn snell_v2_requests_share_a_connection_against_mihomo() {
     let (server, profile) = start(&bin, dir.path(), &cases);
     let out = outbound(&profile, "V2", None);
     let steps = async move { requests_one_after_another(&out, echo, 3).await };
-    attempt("V2", || server.log_text(), steps).await;
+    let mut failures = Failures::default();
+    attempt(&mut failures, "V2", steps).await;
+    failures.finish(|| server.log_text());
     let clients = server.clients_of(echo);
     assert!(
         clients.len() == 3 && clients.iter().all(|client| *client == clients[0]),
@@ -254,16 +224,16 @@ async fn snell_v3_udp_against_mihomo() {
     let (server, profile) = start(&bin, dir.path(), &cases);
     let (out, echo) = (outbound(&profile, "V3", None), udp_echo_server().await);
     let steps = async move { udp_roundtrip(&out, echo).await };
-    attempt("V3", || server.log_text(), steps).await;
+    let mut failures = Failures::default();
+    attempt(&mut failures, "V3", steps).await;
+    failures.finish(|| server.log_text());
 }
 
 /// mihomo closes a connection whose first record it cannot open, without a
 /// word of its own. It has read only the head of what the client sent by
 /// then, so some systems report its close as an end and others as a reset:
-/// either way the session fails at once, with one of two sentences that say
-/// what may be wrong and nothing of either PSK. A third sentence has the
-/// same hint — the server's data failed to decrypt — and would mean that
-/// mihomo had answered: it is not taken.
+/// either way the session fails at once, with one of the two sentences
+/// `none_is_answered` takes.
 #[tokio::test]
 async fn a_snell_listener_of_another_psk_or_version_against_mihomo() {
     let Some(bin) = mihomo_or_skip("a_snell_listener_of_another_psk_or_version_against_mihomo")
@@ -273,38 +243,78 @@ async fn a_snell_listener_of_another_psk_or_version_against_mihomo() {
     let dir = tempfile::tempdir().unwrap();
     let cases = unanswered_cases();
     let (server, profile) = start(&bin, dir.path(), &cases);
-    let echo = echo_server().await;
-    for case in &cases {
-        let out = outbound(&profile, case.name, None);
-        let text = unanswered(&|| server.log_text(), &out, echo).await;
-        assert!(
-            UNANSWERED.contains(&text.as_str()),
-            "{}: {text}\n{}",
-            case.name,
-            server.log_text()
-        );
-    }
+    let names: Vec<&str> = cases.iter().map(|case| case.name).collect();
+    let mut failures = Failures::default();
+    none_is_answered(&mut failures, &profile, &names, UNANSWERED_BOUND).await;
+    failures.finish(|| server.log_text());
 }
 
-/// The two sentences as rurge words them, where they can be read without
-/// mihomo: from a loopback server of another PSK that closes without a word
-/// of its own, and from one that resets.
+/// What `none_is_answered` takes and what it does not, where that can be
+/// tried without a reference server: against loopback servers of four
+/// kinds. One of another PSK that closes without a word of its own and one
+/// that resets give the two sentences, as rurge words them, and pass. One
+/// that answers with what no key opens, and one that keeps the connection
+/// and says nothing — as a server may, to tell a prober nothing — are
+/// failures, each told as what it was.
 #[tokio::test]
-async fn the_two_sentences_of_an_unanswered_request_are_rurges_own() {
-    let echo = echo_server().await;
-    for (reset, sentence) in [(false, UNANSWERED[0]), (true, UNANSWERED[1])] {
-        let server = FakeSnell::spawn(SnellScript {
+async fn only_the_two_sentences_of_an_unanswered_request_are_taken() {
+    let other_psk = |reset| {
+        FakeSnell::spawn(SnellScript {
             reset,
-            ..SnellScript::new(PSK)
+            ..SnellScript::new(OTHER_PSK)
         })
-        .await;
-        let profile = format!(
-            "[Proxy]\nOther = snell, 127.0.0.1, {}, psk={OTHER_PSK}, version=4\n[Rule]\nFINAL,DIRECT\n",
-            server.addr().port()
-        );
-        let out = outbound(&profile, "Other", None);
-        assert_eq!(unanswered(&String::new, &out, echo).await, sentence);
+    };
+    let (closes, resets) = (other_psk(false).await, other_psk(true).await);
+    let garbles = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ports = [
+        closes.addr().port(),
+        resets.addr().port(),
+        garbles.local_addr().unwrap().port(),
+        silent.local_addr().unwrap().port(),
+    ];
+    // a salt and a record's worth of bytes, then the client's to end
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = garbles.accept().await {
+            tokio::spawn(async move {
+                let _ = client.write_all(&[0x5a; 64]).await;
+                let _ = client.read_to_end(&mut Vec::new()).await;
+            });
+        }
+    });
+    // accepts, and neither reads nor closes
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((client, _)) = silent.accept().await {
+            held.push(client);
+        }
+    });
+    let names = ["Closes", "Resets", "Garbles", "Silent"];
+    let lines: String = names
+        .iter()
+        .zip(ports)
+        .map(|(name, port)| format!("{name} = snell, 127.0.0.1, {port}, psk={PSK}, version=4\n"))
+        .collect();
+    let profile = format!("[Proxy]\n{lines}[Rule]\nFINAL,DIRECT\n");
+    let echo = echo_server().await;
+    for (name, sentence) in [("Closes", UNANSWERED[0]), ("Resets", UNANSWERED[1])] {
+        let out = outbound(&profile, name, None);
+        let said = unanswered(&out, echo, UNANSWERED_BOUND).await;
+        assert_eq!(said.as_deref(), Ok(sentence), "{name}");
     }
+    let mut failures = Failures::default();
+    none_is_answered(&mut failures, &profile, &names[..3], UNANSWERED_BOUND).await;
+    // the wait for a server that never ends the request, cut short
+    let short = Duration::from_millis(300);
+    none_is_answered(&mut failures, &profile, &names[3..], short).await;
+    assert_eq!(
+        failures.report("the server's log"),
+        "2 of 4 failed\n\
+         Garbles: failed with another sentence: snell: the server's data failed to decrypt (wrong psk or version?)\n\
+         Silent: no failure within 300ms, 0 bytes in: the request hangs\n\
+         --- the server's log ---\n\
+         the server's log"
+    );
 }
 
 /// The original ChaCha20, of an 8-byte nonce: over TCP, and a datagram at a
@@ -317,13 +327,15 @@ async fn ss_chacha20_against_mihomo() {
     let dir = tempfile::tempdir().unwrap();
     let cases = chacha20_cases();
     let (server, profile) = start(&bin, dir.path(), &cases);
-    tcp(&server, &profile, &cases).await;
+    let mut failures = Failures::default();
+    tcp(&mut failures, &profile, &cases).await;
     let (out, echo) = (
         outbound(&profile, "Chacha20", None),
         udp_echo_server().await,
     );
     let steps = async move { udp_roundtrip(&out, echo).await };
-    attempt("Chacha20 over UDP", || server.log_text(), steps).await;
+    attempt(&mut failures, "Chacha20 over UDP", steps).await;
+    failures.finish(|| server.log_text());
 }
 
 #[tokio::test]
@@ -334,7 +346,9 @@ async fn ss_behind_simple_obfs_against_mihomo() {
     let dir = tempfile::tempdir().unwrap();
     let cases = ss_obfs_cases();
     let (server, profile) = start(&bin, dir.path(), &cases);
-    tcp(&server, &profile, &cases).await;
+    let mut failures = Failures::default();
+    tcp(&mut failures, &profile, &cases).await;
+    failures.finish(|| server.log_text());
 }
 
 #[tokio::test]
@@ -345,7 +359,9 @@ async fn snell_behind_simple_obfs_against_mihomo() {
     let dir = tempfile::tempdir().unwrap();
     let cases = snell_obfs_cases();
     let (server, profile) = start(&bin, dir.path(), &cases);
-    tcp(&server, &profile, &cases).await;
+    let mut failures = Failures::default();
+    tcp(&mut failures, &profile, &cases).await;
+    failures.finish(|| server.log_text());
 }
 
 /// What the cases write on rurge's side, checked without mihomo: the
