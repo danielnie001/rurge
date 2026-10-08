@@ -51,7 +51,7 @@
 
 ---
 
-## 任务 1：配置层——`vmess-aead`、`Remark`、`W0007` 的文本与三处小项
+## Task 1：配置层——`vmess-aead`、`Remark`、`W0007` 的文本与三处小项
 
 **文件**：`crates/rurge-config/src/{diagnostic.rs,config.rs}`、`src/spec/{mod,vmess,snell,hysteria2,common,ss}.rs`、`crates/rurge-policy/src/assemble.rs`、`crates/rurge-policy/src/registry.rs`（用例里的旧握手例子）、`crates/rurge/tests/cli.rs`、`crates/rurge-api/tests/api.rs`、`crates/rurge-engine/tests/{pipeline,outbounds_tls_family}.rs`（凡断言旧文本或旧行为的用例）。
 
@@ -112,7 +112,7 @@ pub struct SpecOutcome { /* 原有字段 */ pub remarks: Vec<Remark> }
 
 ---
 
-## 任务 2：`ss` 的流式方法
+## Task 2：`ss` 的流式方法
 
 **文件**：`crates/rurge-config/src/spec/{ss,mod}.rs`；`crates/rurge-proto/Cargo.toml`（两条依赖边）、根 `Cargo.toml`（工作区依赖 `chacha20 = "0.9"`、`salsa20 = "0.10"`）；`crates/rurge-proto/src/shadowsocks/stream.rs`（新）、`shadowsocks/{mod,udp,kdf}.rs`、`testing/shadowsocks.rs`；`crates/rurge-engine/tests/outbounds_shadowsocks.rs`；`crates/rurge/tests/cli.rs`；`crates/rurge-config/tests/secrets.rs`（加一条流式方法的行）。
 
@@ -206,7 +206,7 @@ CFB128、CTR 与 RC4 直接写在 `stream.rs` 里（AES 的单块加密用 `rurg
 
 ---
 
-## 任务 3：`snell` v1 ～ v3
+## Task 3：`snell` v1 ～ v3
 
 **文件**：`crates/rurge-config/src/spec/{snell,mod}.rs`；`crates/rurge-proto/src/snell/chunked.rs`（新）、`snell/{mod,record,kdf,tunnel,pool,udp}.rs`、`testing/snell.rs`；`crates/rurge-engine/tests/outbounds_snell.rs`；`crates/rurge/tests/cli.rs`；`crates/rurge-engine/src/outbounds.rs`（工厂分支若按版本分支）。
 
@@ -288,7 +288,7 @@ pub(crate) enum SnellStream { V4(V4Stream), Chunked(ChunkedStream) }
 
 ---
 
-## 任务 4：互操作
+## Task 4：互操作
 
 **文件**：`tests/interop/src/lib.rs`（或夹具所在的模块）、`tests/interop/tests/shadowsocks.rs`、`tests/interop/tests/snell.rs`、`tests/interop/tests/mihomo.rs`（新，若按参照服务端分文件）、`tests/interop/README.md`、`.github/workflows/ci.yml`。
 
@@ -315,7 +315,7 @@ pub(crate) enum SnellStream { V4(V4Stream), Chunked(ChunkedStream) }
 
 ---
 
-## 任务 5：文档
+## Task 5：文档
 
 - `docs/surge-compatibility-matrix.md`：4.2 节 `ss`、`snell`、`vmess` 三行与"策略指向 rurge 尚未实现的协议类型"一行（改写为"不实现的协议与变体"）；4.6 节 `ss` 流式方法一行（11 种 ✅、9 个名字 ⛔）、`snell` 的参数（`version` 1 ～ 5、`reuse` 按版本、`obfs` 按版本、`mode` 的错误）；4.5 节 UDP（Snell v3 起）；4.3 节 `ecn`；`hysteria2` 的混淆口令；设计第 8 节第 1 ～ 3 条逐条落到位。
 - `docs/requirements.md`：FR-OUT-05（`snell` v1 ～ v5）、FR-OUT-06（流式方法与 Snell v1 ～ v3 已实现；VMess 旧握手不实现及理由）。
