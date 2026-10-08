@@ -350,8 +350,13 @@ mod tests {
             .expect("the target's end")
             .unwrap();
         assert_eq!(greeting, b"hello, and goodbye");
-        stream.write_all(b"still here").await.unwrap();
-        stream.shutdown().await.unwrap();
+        timeout(BOUND, async {
+            stream.write_all(b"still here").await?;
+            stream.shutdown().await
+        })
+        .await
+        .expect("written and shut down within the bound")
+        .unwrap();
         let heard = timeout(BOUND, target_side).await.expect("our end").unwrap();
         assert_eq!(heard, b"still here");
     }
@@ -755,14 +760,18 @@ mod tests {
             ..H3ProxyScript::default()
         });
         let out = outbound_with(&spec(port, ""), port, &fake);
+        let started = Instant::now();
         let err = timeout(BOUND, out.connect_tcp(&target(echo), &opts))
             .await
             .expect("an outcome within the bound")
             .err()
             .unwrap();
-        // the request's own time ran out: QUIC gives up on a server that
-        // never answers only once its idle timeout, 30 seconds, has passed
+        // the request's own time ran out, half a second: QUIC gives up on
+        // a server that never answers only once its idle timeout, 30
+        // seconds, has passed
         assert!(matches!(err, OutboundError::Timeout), "{err}");
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(5), "{took:?}");
         // a server that takes the request and never answers it, on a
         // connection that is up already — and keeps it up, answering
         // QUIC's keep-alives: no time but the request's runs out
@@ -773,12 +782,15 @@ mod tests {
                 .unwrap()
                 .unwrap(),
         );
+        let started = Instant::now();
         let err = timeout(BOUND, out.connect_tcp(&target(echo), &opts))
             .await
             .expect("an outcome within the bound")
             .err()
             .unwrap();
         assert!(matches!(err, OutboundError::Timeout), "{err}");
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(5), "{took:?}");
         assert_eq!(fake.requests().len(), 1, "the request went out");
     }
 

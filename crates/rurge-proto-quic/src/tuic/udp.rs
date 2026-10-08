@@ -51,7 +51,7 @@ use super::Version;
 use super::addr::{self, NONE};
 use super::auth::{self, Auth, Authenticated};
 use super::heartbeat::{HEARTBEAT, Relaying};
-use crate::carrier::{Inbox, RouteClock, bounded};
+use crate::carrier::{Inbox, Packet, RouteClock, bounded};
 use crate::session::{Lease, Session};
 use bytes::Bytes;
 use quinn::{Connection, RecvStream};
@@ -92,9 +92,6 @@ const MAX_MESSAGE: usize = HEADER + 1 + 1 + 255 + 2 + MAX_DATAGRAM;
 // the commands' types
 const PACKET: u8 = 0x02;
 const DISSOCIATE: u8 = 0x03;
-
-/// A packet for the engine, and where it came from.
-type Answer = (Bytes, Target);
 
 fn invalid(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, format!("tuic: {what}"))
@@ -271,7 +268,7 @@ impl Reassembly {
     /// The packet `message` makes whole, and its source: the message's own
     /// payload when it is no fragment; `None` while fragments are missing,
     /// and for a packet that names no source.
-    fn feed(&mut self, message: Message) -> Option<Answer> {
+    fn feed(&mut self, message: Message) -> Option<Packet> {
         let count = usize::from(message.fragments);
         // a count of 0 too, as sing-box reads it
         if count <= 1 {
@@ -328,7 +325,7 @@ impl Reassembly {
 
 /// A carrier's association on a connection.
 struct Association {
-    inbox: mpsc::Sender<Answer>,
+    inbox: mpsc::Sender<Packet>,
     reassembly: Reassembly,
 }
 
@@ -355,7 +352,7 @@ impl Associations {
     /// taken, when it is free; past one in use, or without it, drawn here,
     /// and counted as v5's without a random source. `None` when all v5's
     /// 65536 are in use.
-    fn join(&mut self, inbox: &mpsc::Sender<Answer>, mut drawn: Option<u32>) -> Option<u32> {
+    fn join(&mut self, inbox: &mpsc::Sender<Packet>, mut drawn: Option<u32>) -> Option<u32> {
         for _ in 0..=u16::MAX {
             let counted = self.next;
             self.next = counted.wrapping_add(1);
@@ -420,7 +417,7 @@ impl Udp {
     /// Takes `inbox` in under an id free on the connection
     /// (`Associations::join`). v4's id is drawn before the lock is taken:
     /// the reader takes it for every packet the server sends.
-    fn join(&self, inbox: &mpsc::Sender<Answer>) -> Option<u32> {
+    fn join(&self, inbox: &mpsc::Sender<Packet>) -> Option<u32> {
         let drawn = match self.version {
             Version::V4 => getrandom::u32().ok(),
             Version::V5 => None,
@@ -980,7 +977,7 @@ mod tests {
         }
     }
 
-    fn whole(payload: &[u8]) -> Option<Answer> {
+    fn whole(payload: &[u8]) -> Option<Packet> {
         Some((Bytes::copy_from_slice(payload), source()))
     }
 

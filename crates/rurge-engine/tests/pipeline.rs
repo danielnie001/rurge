@@ -2057,15 +2057,17 @@ async fn the_resolver_hears_which_policy_carries_no_udp() {
     assert_eq!(doq.connections(), 0);
 }
 
-/// A proxy that carries UDP but will not open the association: the resolver
-/// hears the proxy's own words behind its name, the record is a failed
-/// carrier, and no credential is told.
+/// A proxy that carries UDP but will not open the association — it refuses
+/// the policy's login —: the resolver hears the proxy's own words behind its
+/// name, the record is a failed carrier, and neither tells the password the
+/// policy tried.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_doq_carrier_the_proxy_will_not_open_fails_naming_the_policy() {
+    const TRIED: &str = "wr0ng-passw0rd";
     let dns = MockDns::spawn().await;
     dns.set("target.test", &["127.0.0.1"], &[], 60);
     let doq = FakeDoq::spawn(&dns, DoqScript::default());
-    // wants credentials the policy does not have
+    // wants another password than the policy's
     let proxy = FakeSocks5::spawn(Socks5Script {
         auth: Some(("user".into(), "secret".into())),
         ..Socks5Script::default()
@@ -2075,13 +2077,13 @@ async fn a_doq_carrier_the_proxy_will_not_open_fails_naming_the_policy() {
     let profile = follow_profile(
         &format!("quic://{}", doq.addr()),
         &format!(
-            "Socks = socks5, 127.0.0.1, {}, udp-relay=true",
+            "Socks = socks5, 127.0.0.1, {}, user, {TRIED}, udp-relay=true",
             proxy.addr().port()
         ),
         "PROTOCOL,DOQ,Socks",
     );
     let engine = engine_from_profile(dir.path(), &profile).await;
-    let refusal = "socks5: the proxy accepts none of the offered authentication methods";
+    let refusal = "socks5: authentication failed";
     let err = lookup_outcome(&engine)
         .await
         .expect_err("the proxy refuses the carrier");
@@ -2089,7 +2091,6 @@ async fn a_doq_carrier_the_proxy_will_not_open_fails_naming_the_policy() {
         err.to_string().contains(&format!("via Socks: {refusal}")),
         "{err}"
     );
-    assert!(!err.to_string().contains("secret"), "{err}");
     let failed = wait_for_record(&engine, Duration::from_secs(5), |r| {
         r.transport == Transport::Udp && r.status == RecordStatus::Failed
     })
@@ -2097,6 +2098,8 @@ async fn a_doq_carrier_the_proxy_will_not_open_fails_naming_the_policy() {
     .expect("the failed carrier is recorded");
     assert_eq!(failed.policy, ["Socks"]);
     assert_eq!(failed.error.as_deref(), Some(refusal));
+    let told = format!("{err} {err:?} {failed:?}");
+    assert!(!told.contains(TRIED), "{told}");
     assert_eq!(doq.connections(), 0);
 }
 

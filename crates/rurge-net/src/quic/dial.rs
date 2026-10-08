@@ -49,6 +49,12 @@ impl Transport {
         ..Transport::STANDARD
     };
 
+    /// `config` with these parameters in place of the ones it was made
+    /// with (`client_config`).
+    pub fn apply(&self, config: &mut ClientConfig) {
+        config.transport_config(Arc::new(self.config()));
+    }
+
     fn config(&self) -> TransportConfig {
         let mut config = TransportConfig::default();
         config
@@ -252,6 +258,27 @@ mod tests {
             "datagram_send_buffer_size: 1048576,",
         ] {
             assert!(config.contains(expected), "{expected} in {config}");
+        }
+    }
+
+    /// `apply` puts a transport's parameters in place of the ones a
+    /// configuration was made with.
+    #[test]
+    fn a_transport_replaces_the_one_a_configuration_was_made_with() {
+        let tls = crate::quic::testing::TestCert::new().client_tls(&["h3"]);
+        let mut config = client_config(tls, &Transport::STANDARD).unwrap();
+        let wider = Transport {
+            connection_window: 32 << 20,
+            ..Transport::STANDARD
+        };
+        wider.apply(&mut config);
+        let shown = format!("{config:?}");
+        for expected in [
+            "receive_window: 33554432,",
+            "stream_receive_window: 8388608,",
+            "max_idle_timeout: Some(30000),",
+        ] {
+            assert!(shown.contains(expected), "{expected} in {shown}");
         }
     }
 

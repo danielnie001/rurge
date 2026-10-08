@@ -186,6 +186,23 @@ pub async fn harness_edited(
     }
 }
 
+/// Every policy over QUIC of `cfg` hops every `interval`: the loader takes
+/// no `port-hopping-interval` under 5 seconds (`harness_edited`).
+pub fn hop_every(cfg: &mut rurge_config::Config, interval: Duration) {
+    use rurge_config::spec::ProtoSpec;
+    for spec in &mut cfg.specs {
+        let quic = match &mut spec.proto {
+            ProtoSpec::Hysteria2(hysteria2) => &mut hysteria2.quic,
+            ProtoSpec::Tuic(tuic) => &mut tuic.quic,
+            ProtoSpec::Masque(masque) => &mut masque.quic,
+            _ => continue,
+        };
+        if let Some(hopping) = &mut quic.port_hopping {
+            hopping.interval = interval;
+        }
+    }
+}
+
 /// `CONNECT host:port` through rurge's HTTP listener; returns the tunnel.
 pub async fn connect_via_http(proxy: SocketAddr, authority: &str) -> TcpStream {
     let mut s = TcpStream::connect(proxy).await.unwrap();
@@ -285,6 +302,29 @@ pub async fn one_session(h: &Harness, n: usize, payload: &[u8]) -> rurge_engine:
     echo_through(&mut tunnel, payload).await;
     drop(tunnel);
     the_records(h, n).await[n - 1].clone()
+}
+
+/// Opens a session the proxy refuses: the client's CONNECT is answered
+/// with 502 within the bound, and the record says why.
+pub async fn a_failed_session(h: &Harness) -> rurge_engine::RequestRecord {
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    s.write_all(b"CONNECT target.test:7 HTTP/1.1\r\nHost: target.test:7\r\n\r\n")
+        .await
+        .unwrap();
+    let mut answer = [0u8; 12];
+    tokio::time::timeout(Duration::from_secs(10), s.read_exact(&mut answer))
+        .await
+        .expect("the CONNECT is answered within the bound")
+        .unwrap();
+    assert_eq!(
+        &answer,
+        b"HTTP/1.1 502",
+        "{}",
+        String::from_utf8_lossy(&answer)
+    );
+    let record = the_records(h, 1).await[0].clone();
+    assert_eq!(record.status, RecordStatus::Failed, "{record:?}");
+    record
 }
 
 /// A SOCKS5 UDP association through rurge's listener (phase 2 M5): the

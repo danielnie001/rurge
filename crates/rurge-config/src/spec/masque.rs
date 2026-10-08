@@ -42,7 +42,7 @@ pub fn read_masque(
 ) -> MasqueSpec {
     let tls = read_quic_tls(r, keystore);
     let quic = read_quic(r, common);
-    let credentials = read_credentials(r);
+    let credentials = read_masque_credentials(r);
     if r.has("udp-relay") {
         r.touch("udp-relay");
         r.warn(
@@ -59,7 +59,7 @@ pub fn read_masque(
 }
 
 /// `username` and `password`: both or neither, and neither empty.
-fn read_credentials(r: &mut ParamReader<'_>) -> Option<MasqueCredentials> {
+fn read_masque_credentials(r: &mut ParamReader<'_>) -> Option<MasqueCredentials> {
     let username = r.str("username");
     let password = r.str("password");
     for (key, value) in [("username", username), ("password", password)] {

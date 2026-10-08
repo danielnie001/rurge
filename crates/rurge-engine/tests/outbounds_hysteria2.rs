@@ -8,7 +8,7 @@
 mod common;
 use common::*;
 use rurge_config::HostName;
-use rurge_config::spec::{Hysteria2Obfs, ProtoSpec};
+use rurge_config::spec::Hysteria2Obfs;
 use rurge_net::connector::Target;
 use rurge_net::quic::testing::MultiPort;
 use rurge_proto::testing::{echo_server, udp_echo_server};
@@ -237,18 +237,6 @@ async fn either_obfuscation_carries_tcp_and_udp() {
         );
         assert_eq!(fake.connections(), 1, "{param}");
         assert_eq!(!fake.gecko_fragments().is_empty(), gecko, "{param}");
-    }
-}
-
-/// Every `hysteria2` policy of `cfg` hops every `interval`: the loader
-/// takes no `port-hopping-interval` under 5 seconds.
-fn hop_every(cfg: &mut rurge_config::Config, interval: Duration) {
-    for spec in &mut cfg.specs {
-        if let ProtoSpec::Hysteria2(hysteria2) = &mut spec.proto
-            && let Some(hopping) = &mut hysteria2.quic.port_hopping
-        {
-            hopping.interval = interval;
-        }
     }
 }
 

@@ -38,7 +38,7 @@
 //!   once.
 
 use super::{Http3, proxy, refused};
-use crate::carrier::{Inbox, RouteClock, bounded};
+use crate::carrier::{Inbox, Packet, RouteClock, bounded};
 use crate::connect::{Connected, failure};
 use crate::session::{Failure, Lease, Protocol, Session};
 use crate::varint;
@@ -78,9 +78,6 @@ pub(super) const IDLE: Duration = Duration::from_secs(60);
 const CAPSULE_PROTOCOL: HeaderName = HeaderName::from_static("capsule-protocol");
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-/// A packet for the engine, and where it came from.
-type Packet = (Bytes, Target);
 
 /// A target's stream, opened once for the datagrams that come meanwhile.
 type Slot = Arc<OnceCell<Arc<Stream>>>;
@@ -1554,11 +1551,14 @@ mod tests {
             timeout: Duration::from_millis(500),
         };
         let carrier = timeout(BOUND, out.open_udp(&opts)).await.unwrap().unwrap();
+        let started = Instant::now();
         let err = failure(carrier.as_ref(), &target(echo)).await;
-        // the stream's own time ran out, the only one that says so: the
-        // connection is up, and keeps up
+        // the stream's own time ran out, half a second, the only one that
+        // says so: the connection is up, and keeps up
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert_eq!(err.to_string(), "connect timed out");
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(5), "{took:?}");
         assert_eq!(fake.requests().len(), 1, "the request went out");
     }
 

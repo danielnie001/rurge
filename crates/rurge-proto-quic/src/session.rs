@@ -15,7 +15,11 @@
 //!   else it dials another, `MAX_DIALS` at most at once. Once no dial is in
 //!   flight, a request that waited shares the latest dial's failure if that
 //!   dial ended after it began to wait. Each connection then goes by the
-//!   rules below on its own.
+//!   rules below on its own, and receives into a window with room for
+//!   every stream it may carry (`capped_transport`): the streams nobody
+//!   reads cannot take it from the others. Without a cap a connection
+//!   carries any number of streams in the standard window, which a few
+//!   unread ones fill.
 //! - A connection that has closed — an error, the idle timeout, the
 //!   server's close, the loss of the UDP path under it (which quinn reports
 //!   as a local close) — or that its protocol state says is going away (an
@@ -129,6 +133,13 @@ impl Dialer {
             layer: Some(layer),
             ..self
         }
+    }
+
+    /// Makes every connection with `transport` in place of
+    /// `Transport::STANDARD`.
+    fn with_transport(mut self, transport: &Transport) -> Dialer {
+        transport.apply(&mut self.config);
+        self
     }
 
     /// A new connection to the server: nothing bounds it here but quinn's
@@ -318,10 +329,13 @@ impl<P: Protocol> Session<P> {
 
     /// The session with each connection carrying `cap` leases at most (1
     /// at least): it keeps as many connections as its requests need
-    /// (`trust-tunnel`'s `max-streams` over HTTP/3, design 3.5).
+    /// (`trust-tunnel`'s `max-streams` over HTTP/3, design 3.5), each with
+    /// a receive window for that many streams (`capped_transport`).
     pub fn with_stream_cap(self, cap: usize) -> Session<P> {
+        let cap = cap.max(1);
         Session {
-            cap: Some(cap.max(1)),
+            dialer: self.dialer.with_transport(&capped_transport(cap)),
+            cap: Some(cap),
             ..self
         }
     }
@@ -576,6 +590,24 @@ impl<P: Protocol> Shared<P> {
             );
         }
         false
+    }
+}
+
+/// The transport of a connection that carries `cap` streams at most:
+/// `Transport::STANDARD`, its connection window with room for the window of
+/// each of them, and never smaller than the standard one. A stream nobody
+/// reads fills its own window and no more: with room for all, the unread
+/// ones leave every other stream its own, as on the connections of the
+/// HTTP/2 pool (phase 2 M6 design 18).
+fn capped_transport(cap: usize) -> Transport {
+    let standard = Transport::STANDARD;
+    let streams = u32::try_from(cap).unwrap_or(u32::MAX);
+    Transport {
+        connection_window: standard
+            .stream_window
+            .saturating_mul(streams)
+            .max(standard.connection_window),
+        ..standard
     }
 }
 
@@ -1004,8 +1036,7 @@ mod tests {
 
     /// The client's handle on the connection requests go to now.
     async fn current(session: &Session<Plain>) -> Connection {
-        let lease = session.lease(&ConnectOpts::default()).await.unwrap();
-        lease.connection().clone()
+        lease_on(session).await.connection().clone()
     }
 
     /// Closed by the session: with the protocol's code, nothing else.
@@ -1067,6 +1098,32 @@ mod tests {
         while !check() {
             assert!(Instant::now() < deadline, "not within the bound");
             tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Under a cap a connection's window has room for the window of every
+    /// stream it may carry, and is never smaller than the standard one.
+    #[test]
+    fn a_capped_connections_window_takes_a_window_of_each_stream() {
+        const MIB: u32 = 1 << 20;
+        let standard = Transport::STANDARD;
+        assert_eq!(
+            (standard.stream_window, standard.connection_window),
+            (8 * MIB, 20 * MIB)
+        );
+        for (cap, window) in [
+            (1, 20 * MIB),
+            (2, 20 * MIB),
+            (3, 24 * MIB),
+            (4, 32 * MIB),
+            (16, 128 * MIB),
+            (usize::MAX, u32::MAX),
+        ] {
+            let expected = Transport {
+                connection_window: window,
+                ..Transport::STANDARD
+            };
+            assert_eq!(capped_transport(cap), expected, "{cap}");
         }
     }
 

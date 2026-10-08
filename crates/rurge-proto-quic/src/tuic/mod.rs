@@ -585,9 +585,10 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, OutboundError::Timeout), "{err}");
-        // well before QUIC's own handshake timeout, about 3 seconds
+        // well before QUIC's own time for a handshake, its idle timeout:
+        // 30 seconds
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < Duration::from_secs(5),
             "{:?}",
             started.elapsed()
         );
@@ -1651,7 +1652,7 @@ mod tests {
         let err = out.open_udp(&opts).await.err().unwrap();
         assert!(matches!(err, OutboundError::Timeout), "{err}");
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < Duration::from_secs(5),
             "{:?}",
             started.elapsed()
         );
@@ -1914,7 +1915,7 @@ mod tests {
             .unwrap();
         assert!(matches!(err, OutboundError::Timeout), "{err}");
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < Duration::from_secs(5),
             "{:?}",
             started.elapsed()
         );

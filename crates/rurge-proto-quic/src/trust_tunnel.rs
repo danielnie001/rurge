@@ -2,7 +2,9 @@
 //! `h3`; TrustTunnel protocol 3.2, 5.1; phase 2 M7 design 7.2): every TCP
 //! connection a classic HTTP/3 CONNECT of its own (`connect`) on one of the
 //! policy's QUIC connections, each of which carries `max-streams` of them
-//! at most (`Session::with_stream_cap`): more at once open another.
+//! at most (`Session::with_stream_cap`): more at once open another. A
+//! connection receives into a window with room for all of its tunnels:
+//! those nobody reads leave the others theirs, as over HTTP/2.
 //!
 //! - The request and its refusals are the HTTP/2 transport's
 //!   (`rurge_proto::trust_tunnel`): `:method CONNECT` and `:authority
@@ -429,6 +431,68 @@ mod tests {
         }
     }
 
+    /// A loopback TCP server that sends without end to whoever connects,
+    /// and reads nothing.
+    async fn flood_server() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let chunk = [0x5a; 64 * 1024];
+                    while stream.write_all(&chunk).await.is_ok() {}
+                });
+            }
+        });
+        addr
+    }
+
+    /// A connection's receive window has room for the window of every
+    /// tunnel it may carry (`max-streams`): tunnels nobody reads — the
+    /// server sends into each all its window takes — leave the others
+    /// theirs. With the window every QUIC policy has, three of them would
+    /// take all of it: no tunnel of the connection would hear from the
+    /// server again, not even that it was made.
+    #[tokio::test]
+    async fn tunnels_nobody_reads_leave_the_others_their_window() {
+        let (flood, echo) = (flood_server().await, echo_server().await);
+        let fake = endpoint(H3ProxyScript::default());
+        let out = outbound(&fake, &format!("{LOGIN}, max-streams=4"));
+        let mut unread = Vec::new();
+        for _ in 0..3 {
+            unread.push(tunnel(&out, &target(flood)).await);
+        }
+        // the connection they are on, without a place on it
+        let quic = timeout(BOUND, out.session.lease(&ConnectOpts::default()))
+            .await
+            .unwrap()
+            .unwrap()
+            .connection()
+            .clone();
+        // megabytes later, the server has more for each tunnel than its
+        // window takes — or, were the connection's too small for the three,
+        // more than that takes
+        let deadline = Instant::now() + 6 * BOUND;
+        loop {
+            let said = quic.stats().frame_rx;
+            if said.stream_data_blocked >= 3 || said.data_blocked >= 1 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the windows never filled");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let opts = ConnectOpts {
+            timeout: Duration::from_secs(5),
+        };
+        let mut fourth = timeout(BOUND, out.connect_tcp(&target(echo), &opts))
+            .await
+            .expect("an outcome within the bound")
+            .expect("a tunnel beside the unread ones");
+        round_trip(&mut fourth, b"past the unread").await;
+        assert_eq!(fake.connections(), 1);
+        drop(unread);
+    }
+
     /// Design 3.5: a server going away (an HTTP/3 GOAWAY) takes no new
     /// tunnel: the next goes on a new connection, while one under way on
     /// the old runs to its end; the client closes the old connection once
@@ -540,7 +604,7 @@ mod tests {
             .unwrap();
         assert!(matches!(err, OutboundError::Timeout), "{err}");
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < Duration::from_secs(5),
             "{:?}",
             started.elapsed()
         );

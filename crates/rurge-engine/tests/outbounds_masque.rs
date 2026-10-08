@@ -8,7 +8,6 @@
 mod common;
 use common::*;
 use rurge_config::HostName;
-use rurge_config::spec::ProtoSpec;
 use rurge_net::connector::Target;
 use rurge_net::quic::testing::MultiPort;
 use rurge_proto::testing::{echo_server, udp_echo_server};
@@ -129,18 +128,7 @@ async fn tcp_leaves_through_masque_on_one_connection() {
 async fn refused_credentials_fail_the_session() {
     let fake = FakeH3Proxy::spawn(script());
     let h = through(&fake, &line(&fake, "username=u, password=wr0ngPw")).await;
-    let mut s = TcpStream::connect(h.http()).await.unwrap();
-    s.write_all(b"CONNECT target.test:7 HTTP/1.1\r\nHost: target.test:7\r\n\r\n")
-        .await
-        .unwrap();
-    let mut answer = [0u8; 12];
-    tokio::time::timeout(Duration::from_secs(10), s.read_exact(&mut answer))
-        .await
-        .expect("the CONNECT is answered within the bound")
-        .unwrap();
-    assert_eq!(&answer, b"HTTP/1.1 502");
-    let record = the_records(&h, 1).await[0].clone();
-    assert_eq!(record.status, RecordStatus::Failed, "{record:?}");
+    let record = a_failed_session(&h).await;
     assert_eq!(
         record.error.as_deref(),
         Some("masque: proxy authentication required")
@@ -240,18 +228,6 @@ async fn a_packet_too_long_for_a_datagram_is_dropped_alone() {
             .is_some_and(|e| e.starts_with("masque: a datagram longer than ")),
         "{record:?}"
     );
-}
-
-/// Every `masque` policy of `cfg` hops every `interval`: the loader takes
-/// no `port-hopping-interval` under 5 seconds.
-fn hop_every(cfg: &mut rurge_config::Config, interval: Duration) {
-    for spec in &mut cfg.specs {
-        if let ProtoSpec::Masque(masque) = &mut spec.proto
-            && let Some(hopping) = &mut masque.quic.port_hopping
-        {
-            hopping.interval = interval;
-        }
-    }
 }
 
 /// Port hopping (design 3.3) with a server on three ports: the connection

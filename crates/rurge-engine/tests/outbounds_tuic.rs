@@ -9,7 +9,6 @@
 mod common;
 use common::*;
 use rurge_config::HostName;
-use rurge_config::spec::ProtoSpec;
 use rurge_net::connector::Target;
 use rurge_net::quic::testing::MultiPort;
 use rurge_proto::testing::{echo_server, udp_echo_server};
@@ -352,18 +351,6 @@ async fn a_refused_token_fails_the_session() {
     let auths = fake.auths();
     assert_eq!(auths.len(), 1);
     assert_eq!((auths[0].uuid, auths[0].accepted), (None, false));
-}
-
-/// Every `tuic` and `tuic-v5` policy of `cfg` hops every `interval`: the
-/// loader takes no `port-hopping-interval` under 5 seconds.
-fn hop_every(cfg: &mut rurge_config::Config, interval: Duration) {
-    for spec in &mut cfg.specs {
-        if let ProtoSpec::Tuic(tuic) = &mut spec.proto
-            && let Some(hopping) = &mut tuic.quic.port_hopping
-        {
-            hopping.interval = interval;
-        }
-    }
 }
 
 /// Port hopping (design 3.3) with a server on three ports: the connection

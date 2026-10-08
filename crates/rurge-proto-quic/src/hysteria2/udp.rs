@@ -29,7 +29,7 @@
 
 use super::auth::{Auth, Authenticated};
 use super::{MAX_ADDRESS, address};
-use crate::carrier::{Inbox, RouteClock, bounded};
+use crate::carrier::{Inbox, Packet, RouteClock, bounded};
 use crate::session::{Lease, Session};
 use crate::varint;
 use bytes::Bytes;
@@ -55,9 +55,6 @@ const MAX_FRAGMENTS: usize = 255;
 const MAX_DATAGRAM: usize = 65_535;
 /// `u32 session ‖ u16 packet ‖ u8 fragment ‖ u8 fragments`.
 const FIXED: usize = 8;
-
-/// A datagram for the engine, and where it came from.
-type Packet = (Bytes, Target);
 
 /// The session ids of an outbound's carriers: from 1 upward, never 0.
 #[derive(Default)]
