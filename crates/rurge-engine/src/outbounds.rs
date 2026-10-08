@@ -449,6 +449,9 @@ SS = ss, proxy.test, 8388, encrypt-method=aes-128-gcm, password=pw, obfs=http, u
 SK = ss, proxy.test, 8388, encrypt-method=2022-blake3-aes-128-gcm, password=MDEyMzQ1Njc4OWFiY2RlZg==:MDEyMzQ1Njc4OWFiY2RlZg==, shadow-tls-password=st\n\
 SN = ss, proxy.test, 8388, encrypt-method=none\n\
 SC = ss, proxy.test, 8388, encrypt-method=aes-256-cfb, password=pw, obfs=tls, udp-relay=true\n\
+N1 = snell, proxy.test, 443, psk=pw, obfs=tls\n\
+N2 = snell, proxy.test, 443, psk=pw, version=2\n\
+N3 = snell, proxy.test, 443, psk=pw, version=3, obfs=http, shadow-tls-password=st\n\
 N4 = snell, proxy.test, 443, psk=pw, version=4, reuse=true, obfs=http\n\
 N5 = snell, proxy.test, 443, psk=pw, version=5, shadow-tls-password=st\n\
 H2 = h2-connect, proxy.test, 443, alice, s3cret, max-streams=8, udp-relay=true\n\
@@ -474,6 +477,9 @@ Corp = direct, interface=eth9, allow-other-interface=true\nBlock = reject\n[Rule
             ("SK", "SK"),
             ("SN", "SN"),
             ("SC", "SC"),
+            ("N1", "N1"),
+            ("N2", "N2"),
+            ("N3", "N3"),
             ("N4", "N4"),
             ("N5", "N5"),
             ("H2", "H2"),
@@ -587,6 +593,19 @@ password=MDEyMzQ1Njc4OWFiY2RlZg==\n[Rule]\nFINAL,DIRECT\n",
         let cfg = config(
             "[Proxy]\nN4 = snell, proxy.test, 443, psk=pw, version=4, reuse=true, obfs=http, obfs-host=cdn.test\n\
 N5 = snell, proxy.test, 443, psk=pw, version=5, shadow-tls-password=st, shadow-tls-version=3, shadow-tls-sni=site.test\n\
+[Rule]\nFINAL,DIRECT\n",
+        );
+        assert!(dry_build(&cfg).is_empty());
+    }
+
+    /// So do lines of versions 1 to 3, a line without `version` among them
+    /// and `obfs=tls` (phase 2 M8 design 4.3).
+    #[test]
+    fn snell_versions_1_to_3_pass_the_dry_build() {
+        let cfg = config(
+            "[Proxy]\nN1 = snell, proxy.test, 443, psk=pw, obfs=tls, obfs-host=cdn.test\n\
+N2 = snell, proxy.test, 443, psk=pw, version=2, shadow-tls-password=st\n\
+N3 = snell, proxy.test, 443, psk=pw, version=3, obfs=http\n\
 [Rule]\nFINAL,DIRECT\n",
         );
         assert!(dry_build(&cfg).is_empty());

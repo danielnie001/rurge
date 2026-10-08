@@ -1053,7 +1053,7 @@ G3 = select, policy-path=https://sub.test/b",
                     "Bad = http, b.test, 80, tos=999\nUp = http, u.test, 80, underlying-proxy=Nowhere\n\
 Ts = tailscale\n\
 Bf = ss, r.test, 8388, encrypt-method=bf-cfb, password=pw\n\
-Sn = snell, n.test, 443, psk=pw\n\
+Sn = snell, n.test, 443, psk=pw, version=6\n\
 Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = http, g.test, 80",
                 )],
             ),
@@ -1071,7 +1071,7 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
             [
                 None,
                 Some(NotImplemented::SsCipher("bf-cfb")),
-                Some(NotImplemented::SnellVersion(1)),
+                Some(NotImplemented::SnellVersion(6)),
                 None,
                 None
             ]
@@ -1097,7 +1097,7 @@ Old = vmess, v.test, 443, username=0233d11c-15a4-47d3-ade3-48ffca0ce119\nGood = 
                 ),
                 (
                     codes::W_PROTOCOL_NOT_IMPLEMENTED,
-                    "policy group `G`: imported policies of type `snell` version 1 (the default when `version` is not written) are not supported; they behave as REJECT".to_string()
+                    "policy group `G`: imported policies of type `snell` version 6 are not supported; they behave as REJECT".to_string()
                 ),
                 (
                     codes::W_PARAM_NOT_EFFECTIVE,

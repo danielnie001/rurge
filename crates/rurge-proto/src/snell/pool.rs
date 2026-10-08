@@ -1,6 +1,7 @@
-//! Idle Snell connections of one outbound (`reuse=true`, phase 2 M6 design
-//! 4.3): the newest is reused first, at most `MAX_IDLE` are kept, and one
-//! that has idled for a minute is closed (as anytls's pool).
+//! Idle Snell connections of one outbound (`reuse=true` on v4 and v5,
+//! always on v2; phase 2 M6 design 4.3): the newest is reused first, at
+//! most `MAX_IDLE` are kept, and one that has idled for a minute is closed
+//! (as anytls's pool).
 //!
 //! The server may close an idle connection at any moment; `take` skips one
 //! whose close has already arrived, and a request on a connection that dies
@@ -100,12 +101,19 @@ pub(crate) fn spawn_reaper(pool: &Arc<Pool>) -> AbortOnDrop {
 #[cfg(test)]
 mod tests {
     use super::super::kdf::{Psk, derive_key};
+    use super::super::record::{Format, V4Stream};
     use super::*;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn keyed(pipe: tokio::io::DuplexStream, salt: [u8; 16]) -> SnellStream {
         let key = derive_key(b"psk", &salt);
-        SnellStream::new(Box::new(pipe), Psk::new("psk"), salt, key, Vec::new())
+        SnellStream::V4(V4Stream::new(
+            Box::new(pipe),
+            Psk::new("psk"),
+            salt,
+            key,
+            Vec::new(),
+        ))
     }
 
     /// A client stream whose request has ended both ways, and the server's
@@ -154,6 +162,46 @@ mod tests {
         // the newest is closed: skipped and dropped
         assert!(pool.take().is_some());
         assert_eq!(pool.len(), 0);
+    }
+
+    /// Version 2's connections are pooled as v4's are: one that is still
+    /// open and quiet is taken, one the server closed while it idled is not.
+    #[tokio::test]
+    async fn a_chunked_connection_is_taken_while_quiet_and_dropped_once_closed() {
+        const BOUND: Duration = Duration::from_secs(30);
+        async fn ended() -> (SnellStream, SnellStream) {
+            let (near, far) = tokio::io::duplex(4096);
+            let open = |end| SnellStream::open(Box::new(end), Psk::new("psk"), Format::ChunkedAes);
+            let (mut client, mut server) = (open(near).await.unwrap(), open(far).await.unwrap());
+            for side in [&mut client, &mut server] {
+                std::future::poll_fn(|cx| side.poll_end(cx)).await.unwrap();
+            }
+            let mut buf = [0u8; 1];
+            for side in [&mut client, &mut server] {
+                let read = tokio::time::timeout(BOUND, side.read(&mut buf)).await;
+                assert_eq!(read.expect("the peer's end within the bound").unwrap(), 0);
+            }
+            assert!(client.is_reusable());
+            (client, server)
+        }
+        let pool = Pool::default();
+        let (open, mut server) = ended().await;
+        let (closed, gone) = ended().await;
+        pool.put(open);
+        pool.put(closed);
+        drop(gone);
+        // the newest is closed: skipped and dropped
+        let mut taken = pool.take().expect("the open one");
+        assert_eq!(pool.len(), 0);
+        // and what was taken carries the next request
+        server.next_tunnel();
+        taken.write_all(b"next").await.unwrap();
+        let mut got = [0u8; 4];
+        tokio::time::timeout(BOUND, server.read_exact(&mut got))
+            .await
+            .expect("the request within the bound")
+            .unwrap();
+        assert_eq!(&got, b"next");
     }
 
     #[tokio::test]

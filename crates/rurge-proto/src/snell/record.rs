@@ -1,5 +1,10 @@
-//! The Snell v4 / v5 record stream (phase 2 M6 design 4.3). Each direction
-//! starts with its own salt, then records:
+//! The record stream of a Snell connection (phase 2 M6 design 4.3, M8 design
+//! 4.3). `SnellStream` is what the tunnel, the pool and UDP hold, in one of
+//! two formats they need not tell apart: the chunks of v1 to v3 (`chunked`),
+//! or the records of v4, which v5 keeps (`V4Stream`, the rest of this
+//! module).
+//!
+//! In v4's format each direction starts with its own salt, then records:
 //!
 //! ```text
 //! sealed(04 00 00 ‖ padding length, u16 BE ‖ payload length, u16 BE)
@@ -30,6 +35,7 @@
 //! Two contracts on the caller, as for `AeadStream`: a write that returned
 //! `Pending` must be retried with the same bytes, and an error is final.
 
+use super::chunked::ChunkedStream;
 use super::kdf::{KEY_LEN, Psk, SALT_LEN, key_failed};
 use crate::shadowsocks::cipher::{AeadKind, CountingAead, TAG};
 use rurge_net::connector::BoxedStream;
@@ -39,6 +45,125 @@ use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
 
+/// How a connection's records are laid out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Format {
+    /// v1: chunks under ChaCha20-Poly1305.
+    ChunkedChaCha,
+    /// v2, v3: chunks under AES-128-GCM.
+    ChunkedAes,
+    /// v4, v5.
+    V4,
+}
+
+/// A connection's record stream, in the format of its version. No `Debug`:
+/// it holds the connection's keys.
+pub(crate) enum SnellStream {
+    V4(V4Stream),
+    Chunked(ChunkedStream),
+}
+
+impl SnellStream {
+    /// A stream over `inner` with a fresh salt, its key derived on a
+    /// blocking thread. Nothing is written yet.
+    pub(crate) async fn open(
+        inner: BoxedStream,
+        psk: Psk,
+        format: Format,
+    ) -> io::Result<SnellStream> {
+        let kind = match format {
+            Format::ChunkedChaCha => AeadKind::ChaCha20Poly1305,
+            Format::ChunkedAes => AeadKind::Aes128Gcm,
+            Format::V4 => return Ok(SnellStream::V4(V4Stream::open(inner, psk).await?)),
+        };
+        let stream = ChunkedStream::open(inner, psk, kind).await?;
+        Ok(SnellStream::Chunked(stream))
+    }
+
+    /// Both sides of the current request have ended, cleanly, and our end
+    /// has gone out: the next request may follow (`next_tunnel`).
+    pub(crate) fn is_reusable(&self) -> bool {
+        match self {
+            SnellStream::V4(stream) => stream.is_reusable(),
+            SnellStream::Chunked(stream) => stream.is_reusable(),
+        }
+    }
+
+    /// Starts the next request on the same salts, keys and counters. Only
+    /// when `is_reusable`.
+    pub(crate) fn next_tunnel(&mut self) {
+        match self {
+            SnellStream::V4(stream) => stream.next_tunnel(),
+            SnellStream::Chunked(stream) => stream.next_tunnel(),
+        }
+    }
+
+    /// Ends our side of the current request and flushes; the connection
+    /// stays open. Once per request.
+    pub(crate) fn poll_end(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self {
+            SnellStream::V4(stream) => stream.poll_end(cx),
+            SnellStream::Chunked(stream) => stream.poll_end(cx),
+        }
+    }
+
+    /// The rest of the current record's payload, whole, or the next
+    /// record's when nothing of it is left: UDP carries one datagram per
+    /// record (`udp`). `None` once the server's side ended or the connection
+    /// closed between records.
+    pub(crate) fn poll_record(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Option<Vec<u8>>>> {
+        match self {
+            SnellStream::V4(stream) => stream.poll_record(cx),
+            SnellStream::Chunked(stream) => stream.poll_record(cx),
+        }
+    }
+}
+
+impl AsyncRead for SnellStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            SnellStream::V4(stream) => Pin::new(stream).poll_read(cx, out),
+            SnellStream::Chunked(stream) => Pin::new(stream).poll_read(cx, out),
+        }
+    }
+}
+
+impl AsyncWrite for SnellStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            SnellStream::V4(stream) => Pin::new(stream).poll_write(cx, data),
+            SnellStream::Chunked(stream) => Pin::new(stream).poll_write(cx, data),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            SnellStream::V4(stream) => Pin::new(stream).poll_flush(cx),
+            SnellStream::Chunked(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    /// Ends our side for good, each format its own way. A request on a
+    /// reused connection ends with `poll_end`.
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            SnellStream::V4(stream) => Pin::new(stream).poll_shutdown(cx),
+            SnellStream::Chunked(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
 /// The largest payload we put in a record.
 pub(crate) const MAX_PAYLOAD: usize = 0x3FFF;
 /// The version byte of v4's records, which v5 keeps.
@@ -47,17 +172,21 @@ const HEADER: usize = 7;
 /// The first record's padding: `PADDING_MIN + (0..256)` bytes.
 const PADDING_MIN: usize = 0x100;
 
-const NO_ANSWER: &str = "snell: the server closed the connection without answering";
-const UNDECRYPTABLE: &str = "snell: the server's data failed to decrypt (wrong psk or version?)";
-const CUT_SHORT: &str = "snell: the connection ended in the middle of a record";
+/// No server says what it could not read: with another PSK, or of another
+/// version, it closes like this, or answers what `UNDECRYPTABLE` reports.
+pub(super) const NO_ANSWER: &str =
+    "snell: the server closed the connection without answering (wrong psk or version?)";
+pub(super) const UNDECRYPTABLE: &str =
+    "snell: the server's data failed to decrypt (wrong psk or version?)";
+pub(super) const CUT_SHORT: &str = "snell: the connection ended in the middle of a record";
 const UNKNOWN_VERSION: &str = "snell: the server sent a record of an unknown version";
-const ENDED: &str = "snell: the request's sending side has already ended";
+pub(super) const ENDED: &str = "snell: the request's sending side has already ended";
 
-fn invalid(text: &'static str) -> io::Error {
+pub(super) fn invalid(text: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, text)
 }
 
-fn cut_short() -> io::Error {
+pub(super) fn cut_short() -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, CUT_SHORT)
 }
 
@@ -137,7 +266,7 @@ enum Reading {
 }
 
 /// Fills `buf[*filled..]`. `Ok(false)`: the peer closed before the first byte.
-fn poll_fill(
+pub(super) fn poll_fill(
     inner: &mut BoxedStream,
     cx: &mut Context<'_>,
     buf: &mut [u8],
@@ -160,7 +289,7 @@ fn poll_fill(
 }
 
 /// No `Debug`: it holds the connection's keys.
-pub(crate) struct SnellStream {
+pub(crate) struct V4Stream {
     inner: BoxedStream,
     psk: Psk,
     /// Ours, sent in front of the first record; kept to tell a reflected
@@ -184,7 +313,7 @@ pub(crate) struct SnellStream {
     failed: bool,
 }
 
-impl SnellStream {
+impl V4Stream {
     /// `up_key` is `salt`'s key under `psk`; `padding` goes into the first
     /// record that carries a payload (`first_padding`).
     pub(crate) fn new(
@@ -193,8 +322,8 @@ impl SnellStream {
         salt: [u8; SALT_LEN],
         up_key: [u8; KEY_LEN],
         padding: Vec<u8>,
-    ) -> SnellStream {
-        SnellStream {
+    ) -> V4Stream {
+        V4Stream {
             inner,
             psk,
             salt,
@@ -216,11 +345,11 @@ impl SnellStream {
 
     /// A stream over `inner` with a fresh salt and padding, its key derived
     /// on a blocking thread. Nothing is written yet.
-    pub(crate) async fn open(inner: BoxedStream, psk: Psk) -> io::Result<SnellStream> {
+    pub(crate) async fn open(inner: BoxedStream, psk: Psk) -> io::Result<V4Stream> {
         let salt = new_salt()?;
         let padding = first_padding()?;
         let key = psk.key(salt).await?;
-        Ok(SnellStream::new(inner, psk, salt, key, padding))
+        Ok(V4Stream::new(inner, psk, salt, key, padding))
     }
 
     /// The server has ended its side of the current request.
@@ -421,7 +550,7 @@ impl SnellStream {
     }
 }
 
-impl AsyncRead for SnellStream {
+impl AsyncRead for V4Stream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -433,7 +562,7 @@ impl AsyncRead for SnellStream {
     }
 }
 
-impl AsyncWrite for SnellStream {
+impl AsyncWrite for V4Stream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -499,9 +628,9 @@ mod tests {
     }
 
     /// A stream keyed with `psk` and `salt`, its key derived here.
-    fn keyed(inner: BoxedStream, psk: &str, salt: [u8; SALT_LEN], padding: Vec<u8>) -> SnellStream {
+    fn keyed(inner: BoxedStream, psk: &str, salt: [u8; SALT_LEN], padding: Vec<u8>) -> V4Stream {
         let key = derive_key(psk.as_bytes(), &salt);
-        SnellStream::new(inner, Psk::new(psk), salt, key, padding)
+        V4Stream::new(inner, Psk::new(psk), salt, key, padding)
     }
 
     fn boxed(stream: DuplexStream) -> BoxedStream {
@@ -523,7 +652,7 @@ mod tests {
 
     /// Two streams on the two ends of a pipe of `capacity` bytes, each
     /// with its own salt and a padding of 300 bytes.
-    fn pair(capacity: usize) -> (SnellStream, SnellStream) {
+    fn pair(capacity: usize) -> (V4Stream, V4Stream) {
         let (near, far) = tokio::io::duplex(capacity);
         (
             keyed(boxed(near), "psk", salt(0), vec![0x11; 300]),
@@ -682,8 +811,8 @@ mod tests {
     /// One request each way: `ask` from the client, `answer` back, each
     /// side ending its direction. `first`: the salts and paddings go too.
     async fn exchange(
-        client: &mut SnellStream,
-        server: &mut SnellStream,
+        client: &mut V4Stream,
+        server: &mut V4Stream,
         wires: (&mut DuplexStream, &mut DuplexStream),
         (ask, answer): (&[u8], &[u8]),
         first: bool,
@@ -844,6 +973,108 @@ mod tests {
         assert!(!stream.is_reusable());
     }
 
+    /// The three formats, by the versions that write them.
+    const FORMATS: [(&str, Format); 3] = [
+        ("v1", Format::ChunkedChaCha),
+        ("v2 / v3", Format::ChunkedAes),
+        ("v4 / v5", Format::V4),
+    ];
+
+    /// Two streams opened in their formats on the two ends of a pipe.
+    async fn opened(client: Format, server: Format) -> (SnellStream, SnellStream) {
+        let (near, far) = tokio::io::duplex(64 * 1024);
+        let open = |end, format| SnellStream::open(boxed(end), Psk::new("psk"), format);
+        (
+            open(near, client).await.unwrap(),
+            open(far, server).await.unwrap(),
+        )
+    }
+
+    /// Everything `stream` reads up to its end, which comes within the
+    /// bound: a stream that gets a record wrong leaves its peer waiting.
+    async fn read_all(stream: &mut SnellStream) -> Vec<u8> {
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut got))
+            .await
+            .expect("the end within the bound")
+            .unwrap();
+        got
+    }
+
+    /// Whatever the format, the tunnel and the pool see one stream: a
+    /// request each way, both ends, and the next request on the same stream.
+    #[tokio::test]
+    async fn every_format_carries_requests_one_after_another() {
+        for (name, format) in FORMATS {
+            let (mut client, mut server) = opened(format, format).await;
+            for (ask, answer) in [(&b"one"[..], &b"1"[..]), (b"two", b"22")] {
+                assert!(!client.is_reusable() && !server.is_reusable(), "{name}");
+                client.write_all(ask).await.unwrap();
+                poll_fn(|cx| client.poll_end(cx)).await.unwrap();
+                assert_eq!(read_all(&mut server).await, ask, "{name}");
+                server.write_all(answer).await.unwrap();
+                poll_fn(|cx| server.poll_end(cx)).await.unwrap();
+                // the answer is one record, and the end follows it
+                let records = async {
+                    let first = poll_fn(|cx| client.poll_record(cx)).await.unwrap();
+                    (first, poll_fn(|cx| client.poll_record(cx)).await.unwrap())
+                };
+                let (first, end) = tokio::time::timeout(Duration::from_secs(30), records)
+                    .await
+                    .expect("the records within the bound");
+                assert_eq!((first.as_deref(), end), (Some(answer), None), "{name}");
+                assert!(client.is_reusable() && server.is_reusable(), "{name}");
+                client.next_tunnel();
+                server.next_tunnel();
+            }
+        }
+    }
+
+    /// A shutdown is each format's own end for good: v4's empty record goes
+    /// in front of the close, the chunked formats send the close alone.
+    /// Either way the peer reads the end.
+    #[tokio::test]
+    async fn every_format_shuts_down_for_good() {
+        for (name, format) in FORMATS {
+            let (mut client, mut server) = opened(format, format).await;
+            client.write_all(b"last").await.unwrap();
+            client.shutdown().await.unwrap();
+            assert_eq!(read_all(&mut server).await, b"last", "{name}");
+            server.write_all(b"bye").await.unwrap();
+            poll_fn(|cx| server.poll_end(cx)).await.unwrap();
+            assert_eq!(read_all(&mut client).await, b"bye", "{name}");
+            // what the server read: v4's empty record, or of a chunked
+            // stream only the close
+            assert_eq!(server.is_reusable(), format == Format::V4, "{name}");
+        }
+    }
+
+    /// The formats are three wires: under one PSK, none reads another's
+    /// first bytes, and each says so at once.
+    #[tokio::test]
+    async fn a_peer_of_another_format_fails_to_decrypt() {
+        for (ours, format) in FORMATS {
+            for (theirs, other) in FORMATS {
+                if format == other {
+                    continue;
+                }
+                let (mut client, mut server) = opened(format, other).await;
+                server.write_all(b"hello").await.unwrap();
+                let mut buf = [0u8; 8];
+                let err = tokio::time::timeout(Duration::from_secs(10), client.read(&mut buf))
+                    .await
+                    .expect("an error while the connection is still open")
+                    .unwrap_err();
+                assert_eq!(
+                    (err.kind(), err.to_string().as_str()),
+                    (io::ErrorKind::InvalidData, UNDECRYPTABLE),
+                    "{ours} reading {theirs}"
+                );
+                assert!(!client.is_reusable());
+            }
+        }
+    }
+
     /// With the only blocking thread busy, the server's key cannot be
     /// derived: the read waits instead of deriving on the runtime's thread,
     /// and goes on once the thread is free.
@@ -872,7 +1103,7 @@ mod tests {
         });
 
         /// The stream, and the server's end, which stays open.
-        async fn stream_from(wire: Vec<u8>) -> (SnellStream, DuplexStream) {
+        async fn stream_from(wire: Vec<u8>) -> (V4Stream, DuplexStream) {
             let (near, mut far) = tokio::io::duplex(4096);
             far.write_all(&wire).await.unwrap();
             (

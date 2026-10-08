@@ -1,7 +1,7 @@
-//! UDP over a Snell connection (phase 2 M6 design 4.3): a fresh connection
-//! of its own asks `01 06 00` (UDP, no client id) and the server answers at
-//! once — `00`, or an error as for TCP. From then on every record carries
-//! one datagram, each way:
+//! UDP over a Snell connection, v3 and later (phase 2 M6 design 4.3): a
+//! fresh connection of its own asks `01 06 00` (UDP, no client id) and the
+//! server answers at once — `00`, or an error as for TCP. From then on
+//! every record (on v3: every chunk) carries one datagram, each way:
 //!
 //! ```text
 //! ours:   01 ‖ host-length host | 00 04 IPv4 | 00 06 IPv6 ‖ port ‖ payload
@@ -204,6 +204,7 @@ impl PacketSocket for SnellUdp {
 #[cfg(test)]
 mod tests {
     use super::super::kdf::Psk;
+    use super::super::record::Format;
     use super::*;
     use rurge_net::connector::BoxedStream;
     use std::time::Duration;
@@ -265,13 +266,19 @@ mod tests {
         assert_eq!(source(&v6[..18]), Err("a datagram cut short"));
     }
 
-    /// Our stream and the server's, on the two ends of a pipe.
-    async fn pair() -> (SnellStream, SnellStream) {
+    /// Our stream and the server's, on the two ends of a pipe, both in
+    /// `format`.
+    async fn pair_in(format: Format) -> (SnellStream, SnellStream) {
         let (near, far) = tokio::io::duplex(64 * 1024);
         let open = |end: tokio::io::DuplexStream| {
-            SnellStream::open(Box::new(end) as BoxedStream, Psk::new("psk"))
+            SnellStream::open(Box::new(end) as BoxedStream, Psk::new("psk"), format)
         };
         (open(near).await.unwrap(), open(far).await.unwrap())
+    }
+
+    /// `pair_in` v4's format.
+    async fn pair() -> (SnellStream, SnellStream) {
+        pair_in(Format::V4).await
     }
 
     async fn next_record(server: &mut SnellStream) -> Option<Vec<u8>> {
@@ -375,7 +382,7 @@ mod tests {
         let err = open.await.unwrap().err().unwrap();
         assert_eq!(
             err.to_string(),
-            "snell: the server closed the connection without answering"
+            "snell: the server closed the connection without answering (wrong psk or version?)"
         );
     }
 
@@ -397,6 +404,45 @@ mod tests {
         let (client, mut server) = pair().await;
         let udp = opened(client, &mut server, &[&[0]]).await.unwrap();
         drop(server);
+        let err = received(&udp).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "snell: the server closed the UDP connection"
+        );
+    }
+
+    /// Version 3: the same carrier over chunks. The answer is a chunk of
+    /// its own, every datagram one chunk each way, and the server's
+    /// zero-length chunk is the carrier's end.
+    #[tokio::test]
+    async fn over_v3s_chunks_a_datagram_is_a_chunk_each_way() {
+        let (client, mut server) = pair_in(Format::ChunkedAes).await;
+        let udp = opened(client, &mut server, &[&[0]]).await.unwrap();
+        udp.send_to(b"one", &to("1.2.3.4", 53)).await.unwrap();
+        udp.send_to(b"", &to("5.6.7.8", 53)).await.unwrap();
+        assert_eq!(
+            next_record(&mut server).await.unwrap(),
+            [1, 0, 4, 1, 2, 3, 4, 0, 53, b'o', b'n', b'e']
+        );
+        assert_eq!(
+            next_record(&mut server).await.unwrap(),
+            [1, 0, 4, 5, 6, 7, 8, 0, 53],
+            "an empty datagram is a chunk all the same"
+        );
+        server
+            .write_all(&[4, 9, 8, 7, 6, 0, 53, b'a'])
+            .await
+            .unwrap();
+        server.write_all(&[4, 9, 8, 7, 6, 0, 53]).await.unwrap();
+        assert_eq!(
+            received(&udp).await.unwrap(),
+            (b"a".to_vec(), to("9.8.7.6", 53))
+        );
+        assert_eq!(
+            received(&udp).await.unwrap(),
+            (Vec::new(), to("9.8.7.6", 53))
+        );
+        poll_fn(|cx| server.poll_end(cx)).await.unwrap();
         let err = received(&udp).await.unwrap_err();
         assert_eq!(
             err.to_string(),

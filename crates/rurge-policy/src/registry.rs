@@ -1459,7 +1459,8 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
 SS = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x\n\
 Stream = ss, 1.2.3.4, 8388, encrypt-method=rc4-md5, password=x\n\
 Gone = ss, 1.2.3.4, 8388, encrypt-method=bf-cfb, password=x\n\
-Snell1 = snell, 1.2.3.4, 443, psk=x\n[Rule]\nFINAL,DIRECT\n";
+Snell1 = snell, 1.2.3.4, 443, psk=x\n\
+Snell6 = snell, 1.2.3.4, 443, psk=x, version=6\n[Rule]\nFINAL,DIRECT\n";
         let registry = generation(text, &FakeFactory::new(), None);
         // a `vmess` line without `vmess-aead=true` is a proxy all the same:
         // it gets the AEAD handshake
@@ -1487,13 +1488,20 @@ Snell1 = snell, 1.2.3.4, 443, psk=x\n[Rule]\nFINAL,DIRECT\n";
             gone.note.clone().unwrap().to_string(),
             "policy protocol not implemented: ss (bf-cfb)"
         );
-        // a `snell` line without `version` is version 1
+        // a `snell` line without `version` is version 1, a proxy like the
+        // other versions rurge speaks; version 6 is not one of them
         let snell = registry.resolve(&PolicyRef::parse("Snell1"));
+        assert_eq!(
+            (snell.terminal, snell.note.clone()),
+            (TerminalKind::Proxy, None)
+        );
+        assert_eq!(chain(&snell), ["Snell1"]);
+        let snell = registry.resolve(&PolicyRef::parse("Snell6"));
         assert_eq!(snell.terminal, TerminalKind::Reject);
-        assert_eq!(chain(&snell), ["Snell1", "!unsupported:snell", "REJECT"]);
+        assert_eq!(chain(&snell), ["Snell6", "!unsupported:snell", "REJECT"]);
         assert_eq!(
             snell.note.clone().unwrap().to_string(),
-            "policy protocol not implemented: snell v1"
+            "policy protocol not implemented: snell v6"
         );
     }
 

@@ -1,19 +1,30 @@
-//! A scriptable Snell v4 / v5 server: optionally simple-obfs `http` in
-//! front, then the record stream, requests one after another on a
-//! connection (ConnectV2), and a relay. Its records, nonce counting,
-//! padding and request parsing are written apart from the client's
-//! (`crate::snell`), so each checks the other; only the primitives (the
-//! Argon2id derivation and AES-GCM, which have vectors of their own) are
-//! shared. It never resolves a name.
+//! A scriptable Snell server of one version, 1 to 5: optionally simple-obfs
+//! in front, then the version's record stream, requests one after another
+//! on a connection (ConnectV2), and a relay. Its records, chunks, nonce
+//! counting, padding and request parsing are written apart from the
+//! client's (`crate::snell`), so each checks the other; only the primitives
+//! (the Argon2id derivation and the two AEAD ciphers, which have vectors of
+//! their own) are shared. It never resolves a name, and never connects or
+//! sends to another address than 127.0.0.1 and ::1.
 //!
-//! As the reference server (per the byte-level notes of the M6b plan) it
-//! answers a request only when the target first sends: `00` and the data
-//! in one record, the direction's first record padded. A target that ends
-//! before sending anything gets `02 65 "Remote EOF"` (ConnectV2) or
-//! `02 ff "end of file"` (Connect) and the close. When the target ends, a
-//! ConnectV2 tunnel sends its empty record, forwards (or, once the target
-//! is gone, discards) the client's records until the client's empty record,
-//! then reads the next request; a Connect tunnel closes instead.
+//! Versions 4 and 5 are one wire format. As the reference server (per the
+//! byte-level notes of the M6b plan) it answers a request only when the
+//! target first sends: `00` and the data in one record, the direction's
+//! first record padded. A target that ends before sending anything gets
+//! `02 65 "Remote EOF"` (ConnectV2) or `02 ff "end of file"` (Connect) and
+//! the close. When the target ends, a ConnectV2 tunnel sends its empty
+//! record, forwards (or, once the target is gone, discards) the client's
+//! records until the client's empty record, then reads the next request; a
+//! Connect tunnel closes instead.
+//!
+//! Versions 1 to 3 speak the chunks of the original protocol, version 1
+//! under ChaCha20-Poly1305, and know fewer commands: ConnectV2 came with
+//! version 2 and UDP with version 3, and a request for one a version lacks
+//! is refused with an error. The answer rides with the target's first data
+//! here too, but a target that ends before sending anything gets no answer:
+//! only the end. An end is a zero-length chunk — the sealed length alone —
+//! on a ConnectV2 tunnel, each way; a Connect tunnel takes the client's
+//! close for its end as well, and closes when the target ends.
 //!
 //! UDP (`06`) is answered `00` at once; then every record of the client's
 //! is one datagram, sent from a loopback socket of the connection's own,
@@ -21,7 +32,8 @@
 //! (full cone). Names are never resolved: a datagram for one goes to
 //! `connect_to`, or nowhere.
 //!
-//! A wrong PSK gets no word back, only the close.
+//! A wrong PSK — or a client of another record format — gets no word back,
+//! only the close.
 
 use super::AbortOnDrop;
 use super::obfs::{ObfsHello, accept_obfs};
@@ -33,6 +45,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -44,11 +57,37 @@ const CONNECT: u8 = 0x01;
 const CONNECT_V2: u8 = 0x05;
 const UDP: u8 = 0x06;
 
+/// How long a request may take to reach its upstream: one that neither
+/// answers nor refuses in that time is refused.
+const CONNECT_LIMIT: Duration = Duration::from_secs(2);
+
+/// 127.0.0.1 or ::1, and no other address of the loopback's: macOS
+/// configures these two alone, and a connection to another address of 127/8
+/// is not refused there but left waiting.
+fn is_localhost(ip: IpAddr) -> bool {
+    ip == IpAddr::V4(Ipv4Addr::LOCALHOST) || ip == IpAddr::V6(Ipv6Addr::LOCALHOST)
+}
+
+/// ConnectV2 came with version 2, UDP with version 3.
+fn knows(version: u8, command: u8) -> bool {
+    match command {
+        CONNECT => true,
+        CONNECT_V2 => version >= 2,
+        UDP => version >= 3,
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SnellScript {
     pub psk: String,
+    /// The version it speaks, 1 to 5: 1 to 3 in chunks, 4 and 5 in v4's
+    /// records (it takes either's clients).
+    pub version: u8,
     /// Expect simple-obfs `http` in front of the protocol.
     pub obfs_http: bool,
+    /// Expect simple-obfs `tls` in front of the protocol (versions 1 to 3).
+    pub obfs_tls: bool,
     /// Relay here whatever the client asked for (needed for a domain target).
     pub connect_to: Option<SocketAddr>,
     /// A request that arrives after this many tunnels on its connection is
@@ -69,7 +108,9 @@ impl SnellScript {
     pub fn new(psk: &str) -> SnellScript {
         SnellScript {
             psk: psk.to_string(),
+            version: 4,
             obfs_http: false,
+            obfs_tls: false,
             connect_to: None,
             tunnels_per_connection: None,
             garble_after: None,
@@ -131,13 +172,24 @@ fn bad(what: &str) -> io::Error {
 struct Direction {
     cipher: AeadCipher,
     count: u64,
+    /// Versions 1 to 3: chunks, not v4's records.
+    chunked: bool,
 }
 
 impl Direction {
-    fn new(psk: &str, salt: &[u8; SALT]) -> Direction {
+    /// Version 1 keys ChaCha20-Poly1305 with all of Argon2id's output, the
+    /// later ones AES-128-GCM with its first half.
+    fn new(version: u8, psk: &str, salt: &[u8; SALT]) -> Direction {
+        let output = kdf::derive(psk.as_bytes(), salt);
+        let cipher = if version == 1 {
+            AeadCipher::new(AeadKind::ChaCha20Poly1305, &output)
+        } else {
+            AeadCipher::new(AeadKind::Aes128Gcm, &output[..16])
+        };
         Direction {
-            cipher: AeadCipher::new(AeadKind::Aes128Gcm, &kdf::derive_key(psk.as_bytes(), salt)),
+            cipher,
             count: 0,
+            chunked: version <= 3,
         }
     }
 
@@ -196,6 +248,53 @@ async fn read_record<R: AsyncRead + Unpin>(
     up: &mut Direction,
     seen: &Seen,
 ) -> io::Result<Option<Record>> {
+    if up.chunked {
+        read_chunk(r, up, seen).await
+    } else {
+        read_v4_record(r, up, seen).await
+    }
+}
+
+/// A chunk of versions 1 to 3: the sealed length, then the sealed payload —
+/// which a length of zero, the end, does not have.
+async fn read_chunk<R: AsyncRead + Unpin>(
+    r: &mut R,
+    up: &mut Direction,
+    seen: &Seen,
+) -> io::Result<Option<Record>> {
+    let mut sealed = [0u8; 2 + TAG];
+    if !read_full(r, &mut sealed).await? {
+        return Ok(None);
+    }
+    let len = up
+        .open(&sealed)
+        .ok_or_else(|| bad("a length that does not authenticate"))?;
+    // the reserved bits too: a client never sets them
+    let len = usize::from(u16::from_be_bytes([len[0], len[1]]));
+    if len > MAX_PAYLOAD {
+        return Err(bad("a chunk over 0x3fff"));
+    }
+    seen.largest_record.fetch_max(len, Ordering::SeqCst);
+    if len == 0 {
+        return Ok(Some(Record::End));
+    }
+    let mut body = vec![0u8; len + TAG];
+    r.read_exact(&mut body).await?;
+    let payload = up
+        .open(&body)
+        .ok_or_else(|| bad("a payload that does not authenticate"))?;
+    Ok(Some(Record::Data {
+        payload,
+        padding: 0,
+    }))
+}
+
+/// A record of versions 4 and 5.
+async fn read_v4_record<R: AsyncRead + Unpin>(
+    r: &mut R,
+    up: &mut Direction,
+    seen: &Seen,
+) -> io::Result<Option<Record>> {
     let mut sealed = [0u8; HEADER];
     if !read_full(r, &mut sealed).await? {
         return Ok(None);
@@ -225,8 +324,8 @@ async fn read_record<R: AsyncRead + Unpin>(
     Ok(Some(Record::Data { payload, padding }))
 }
 
-/// The server's direction: its salt goes with the first record, and the
-/// first record with a payload is padded.
+/// The server's direction: its salt goes with the first record, and in v4's
+/// format the first record with a payload is padded.
 struct Answers {
     down: Direction,
     salt: Option<[u8; SALT]>,
@@ -234,11 +333,11 @@ struct Answers {
 }
 
 impl Answers {
-    fn new(psk: &str) -> Answers {
+    fn new(version: u8, psk: &str) -> Answers {
         let mut salt = [0u8; SALT];
         getrandom::fill(&mut salt).expect("randomness");
         Answers {
-            down: Direction::new(psk, &salt),
+            down: Direction::new(version, psk, &salt),
             salt: Some(salt),
             padded: false,
         }
@@ -247,6 +346,15 @@ impl Answers {
     /// One record of `payload`; empty: the end of this tunnel.
     fn record(&mut self, payload: &[u8]) -> Vec<u8> {
         let mut out = self.salt.take().map(Vec::from).unwrap_or_default();
+        if self.down.chunked {
+            // the sealed length, and no payload behind a length of zero
+            let len = (payload.len() as u16).to_be_bytes();
+            out.extend_from_slice(&self.down.seal(&len));
+            if !payload.is_empty() {
+                out.extend_from_slice(&self.down.seal(payload));
+            }
+            return out;
+        }
         let mut padding = Vec::new();
         if !payload.is_empty() && !self.padded {
             self.padded = true;
@@ -367,10 +475,12 @@ type Reader = ReadHalf<BoxedStream>;
 type Writer = WriteHalf<BoxedStream>;
 
 impl Shared {
+    /// Where to relay a request; `None`: a name without `connect_to`, or
+    /// another address than 127.0.0.1 and ::1.
     fn upstream(&self, request: &RecordedSnell) -> Option<SocketAddr> {
         self.script.connect_to.or_else(|| {
             let ip = request.host.parse::<IpAddr>().ok()?;
-            Some(SocketAddr::new(ip, request.port))
+            is_localhost(ip).then(|| SocketAddr::new(ip, request.port))
         })
     }
 
@@ -385,8 +495,12 @@ impl Shared {
         answers: &mut Answers,
     ) -> bool {
         let reuse = request.command == CONNECT_V2;
+        let chunked = up.chunked;
         let upstream = match self.upstream(request) {
-            Some(to) => TcpStream::connect(to).await.ok(),
+            Some(to) => tokio::time::timeout(CONNECT_LIMIT, TcpStream::connect(to))
+                .await
+                .ok()
+                .and_then(Result::ok),
             None => None,
         };
         let Some(mut upstream) = upstream else {
@@ -410,6 +524,12 @@ impl Shared {
                         let _ = target_write.shutdown().await;
                         return true;
                     }
+                    // versions 1 and 3 end a request with the close: no
+                    // zero-length chunk, and no connection for another
+                    Ok(None) if chunked => {
+                        let _ = target_write.shutdown().await;
+                        return false;
+                    }
                     _ => return false,
                 }
             }
@@ -417,7 +537,7 @@ impl Shared {
         let replies = async {
             let mut buf = vec![0u8; MAX_PAYLOAD];
             let n = target_read.read(&mut buf[1..]).await.unwrap_or(0);
-            if n == 0 {
+            if n == 0 && !chunked {
                 let error = if reuse {
                     answers.error(0x65, b"Remote EOF")
                 } else {
@@ -427,21 +547,24 @@ impl Shared {
                 let _ = writer.shutdown().await;
                 return false;
             }
-            // the answer rides with the target's first data
-            buf[0] = 0x00;
-            if writer
-                .write_all(&answers.record(&buf[..1 + n]))
-                .await
-                .is_err()
-            {
-                return false;
-            }
-            loop {
-                match target_read.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if writer.write_all(&answers.record(&buf[..n])).await.is_err() {
-                            return false;
+            // the answer rides with the target's first data; without any
+            // (versions 1 to 3) there is no answer, only the end
+            if n > 0 {
+                buf[0] = 0x00;
+                if writer
+                    .write_all(&answers.record(&buf[..1 + n]))
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
+                loop {
+                    match target_read.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if writer.write_all(&answers.record(&buf[..n])).await.is_err() {
+                                return false;
+                            }
                         }
                     }
                 }
@@ -474,7 +597,8 @@ impl Shared {
             .lock()
             .expect("outside")
             .push(socket.local_addr()?);
-        // the answer at once, in the direction's first (padded) record
+        // the answer at once, in a record of its own: the direction's
+        // first, which v4's format pads
         writer.write_all(&answers.record(&[0x00])).await?;
         let datagrams = async {
             while let Some(Record::Data { payload, .. }) =
@@ -488,7 +612,9 @@ impl Shared {
                     .expect("datagrams")
                     .push(format!("{host}:{port}"));
                 let to = match (host.parse::<IpAddr>(), self.script.connect_to) {
-                    (Ok(ip), _) => SocketAddr::new(ip, port),
+                    (Ok(ip), _) if is_localhost(ip) => SocketAddr::new(ip, port),
+                    // nowhere else
+                    (Ok(_), _) => continue,
                     (Err(_), Some(addr)) => addr,
                     // never resolves: a name without `connect_to` is a dead end
                     (Err(_), None) => continue,
@@ -532,8 +658,13 @@ impl Shared {
 async fn serve(tcp: TcpStream, shared: Arc<Shared>, connection: usize) -> io::Result<()> {
     let script = &shared.script;
     let mut stream: BoxedStream = Box::new(tcp);
-    if script.obfs_http {
-        let (inner, hello) = accept_obfs(stream, ObfsMode::Http).await?;
+    let obfs = match (script.obfs_tls, script.obfs_http) {
+        (true, _) => Some(ObfsMode::Tls),
+        (false, true) => Some(ObfsMode::Http),
+        (false, false) => None,
+    };
+    if let Some(mode) = obfs {
+        let (inner, hello) = accept_obfs(stream, mode).await?;
         shared.seen.obfs.lock().expect("obfs").push(hello);
         stream = inner;
     }
@@ -541,8 +672,8 @@ async fn serve(tcp: TcpStream, shared: Arc<Shared>, connection: usize) -> io::Re
     if !read_full(&mut stream, &mut salt).await? {
         return Ok(());
     }
-    let mut up = Direction::new(&script.psk, &salt);
-    let mut answers = Answers::new(&script.psk);
+    let mut up = Direction::new(script.version, &script.psk, &salt);
+    let mut answers = Answers::new(script.version, &script.psk);
     let (mut reader, mut writer) = tokio::io::split(stream);
     for tunnel in 0.. {
         let (payload, padding) = match read_record(&mut reader, &mut up, &shared.seen).await {
@@ -583,6 +714,12 @@ async fn serve(tcp: TcpStream, shared: Arc<Shared>, connection: usize) -> io::Re
             close(&mut reader, &mut writer).await;
             return Ok(());
         }
+        if !knows(script.version, request.command) {
+            let error = answers.error(0x01, b"fake snell: a command this version lacks");
+            writer.write_all(&error).await?;
+            close(&mut reader, &mut writer).await;
+            return Ok(());
+        }
         if request.command == UDP {
             let _ = shared
                 .udp(&mut reader, &mut up, &mut writer, &mut answers)
@@ -603,6 +740,7 @@ async fn serve(tcp: TcpStream, shared: Arc<Shared>, connection: usize) -> io::Re
 
 impl FakeSnell {
     pub async fn spawn(script: SnellScript) -> FakeSnell {
+        assert!((1..=5).contains(&script.version), "a version from 1 to 5");
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback");

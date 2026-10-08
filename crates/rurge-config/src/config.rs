@@ -1863,44 +1863,43 @@ G = ss, g.test, 8388, encrypt-method=rc4, password=pw\n[Rule]\nFINAL,DIRECT\n",
         }
     }
 
-    /// A `snell` version other than 4 and 5: `W0007` once per load and
-    /// version, at the first line that uses it; a line without `version` is
-    /// version 1 (phase 2 M6 design 4.2).
+    /// `snell` versions 1 to 5 are built, a line without `version` as
+    /// version 1; version 6 is `W0007`, once per load, at the first line
+    /// that asks for it, and its policies have no spec (phase 2 M8 design
+    /// 4.3).
     #[test]
-    fn snell_versions_are_reported_once_per_load_and_version() {
+    fn snell_version_6_is_reported_once_per_load_and_the_others_are_built() {
         let loaded = load_text(
             "[Proxy]\nA = snell, a.test, 443, psk=pw\nB = snell, b.test, 443, psk=pw, version=6\n\
 C = snell, c.test, 443, psk=pw, version=1\nD = snell, d.test, 443, psk=pw, version=5\n\
-E = snell, e.test, 443, psk=pw, version=3\n[Rule]\nFINAL,DIRECT\n",
+E = snell, e.test, 443, psk=pw, version=3\nF = snell, f.test, 443, psk=pw, version=6, mode=unshaped\n\
+G = snell, g.test, 443, psk=pw, version=2\n[Rule]\nFINAL,DIRECT\n",
         );
-        let found: Vec<(&str, Option<u32>)> = loaded
+        let found: Vec<(&str, &str, Option<u32>)> = loaded
             .diagnostics
             .iter()
-            .filter(|d| d.code == codes::W_PROTOCOL_NOT_IMPLEMENTED)
-            .map(|d| (d.message.as_str(), d.span.as_ref().map(|s| s.line)))
+            .map(|d| (d.code, d.message.as_str(), d.span.as_ref().map(|s| s.line)))
             .collect();
         assert_eq!(
             found,
-            [
-                (
-                    "`snell` version 1 (the default when `version` is not written) is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT",
-                    Some(2)
-                ),
-                (
-                    "`snell` version 6 is not supported: it is a beta protocol without a public specification; such policies behave as REJECT",
-                    Some(3)
-                ),
-                (
-                    "`snell` version 3 is not implemented; rurge supports versions 4 and 5 (`version` must match the server); such policies behave as REJECT",
-                    Some(6)
-                ),
-            ]
+            [(
+                codes::W_PROTOCOL_NOT_IMPLEMENTED,
+                "`snell` version 6 is not supported: it is a beta protocol without a public specification; such policies behave as REJECT",
+                Some(3)
+            )]
         );
-        assert_eq!(
-            loaded.config.not_implemented.get("C"),
-            Some(&NotImplemented::SnellVersion(1))
-        );
-        assert_eq!(loaded.config.not_implemented.get("D"), None);
+        for name in ["A", "C", "D", "E", "G"] {
+            assert!(loaded.config.spec(name).is_some(), "{name}");
+            assert_eq!(loaded.config.not_implemented.get(name), None, "{name}");
+        }
+        for name in ["B", "F"] {
+            assert!(loaded.config.spec(name).is_none(), "{name}");
+            assert_eq!(
+                loaded.config.not_implemented.get(name),
+                Some(&NotImplemented::SnellVersion(6)),
+                "{name}"
+            );
+        }
     }
 
     /// Two `external` policies on one `local-port`: the second is an error

@@ -4,8 +4,8 @@
 //! M2b), `ssh` (phase 2 M4a), `wireguard` (phase 2 M4b), `external`
 //! (phase 2 M4c), `ss` with the AEAD, `none` and 2022 methods (phase 2
 //! M6a) and the stream ciphers of the manual (phase 2 M8b), `snell`
-//! versions 4 and 5 (phase 2 M6b), `h2-connect` and
-//! `trust-tunnel` over HTTP/2 (phase 2 M6c), `hysteria2` (phase 2 M7a),
+//! versions 4 and 5 (phase 2 M6b) and 1 to 3 (phase 2 M8b), `h2-connect`
+//! and `trust-tunnel` over HTTP/2 (phase 2 M6c), `hysteria2` (phase 2 M7a),
 //! `tuic` and `tuic-v5` (phase 2 M7b), `masque` and `trust-tunnel` over
 //! HTTP/3 (phase 2 M7c), `select` groups, `url-test` / `fallback` /
 //! `load-balance` groups (phase 2 M3b), and `smart` groups (phase 2 M3c).

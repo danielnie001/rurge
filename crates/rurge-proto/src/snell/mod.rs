@@ -1,20 +1,24 @@
-//! `snell` outbound, versions 4 and 5 (manual: Policies › Snell; phase 2 M6
-//! design 4): optionally behind Shadow TLS and / or simple-obfs `http`, the
-//! record stream (`record`) keyed per direction by Argon2id of the PSK
-//! (`kdf`). v5 speaks v4's wire format over TCP.
+//! `snell` outbound, versions 1 to 5 (manual: Policies › Snell; phase 2 M6
+//! design 4, M8 design 4.3): optionally behind Shadow TLS and / or
+//! simple-obfs, the version's record stream (`record`) keyed per direction
+//! by Argon2id of the PSK (`kdf`). v1 to v3 write the chunks of the original
+//! protocol (`chunked`), v4 its own records, and v5 speaks v4's wire format
+//! over TCP.
 //!
 //! A request is `01 command 00 host-length host port`, the host as text
 //! (an IP literal too, an IDN as its A-labels) and no client id; it waits
 //! for the first payload and goes out in the same record (`tunnel`). The
-//! command is Connect (`01`), or ConnectV2 (`05`) with `reuse=true`: a
-//! request whose two sides both ended hands its connection back to the
-//! outbound's pool (`pool`), and the next request goes out on it.
+//! command is Connect (`01`), or ConnectV2 (`05`) where connections are
+//! reused — always on v2, never on v1 and v3, with `reuse=true` on v4 and
+//! v5: a request whose two sides both ended hands its connection back to
+//! the outbound's pool (`pool`), and the next request goes out on it.
 //!
-//! UDP needs no parameter on v4 / v5: a connection of its own, never
+//! UDP came with v3 and needs no parameter: a connection of its own, never
 //! pooled, to the policy's port through the same layers, carries every
 //! datagram (`udp`). `udp-port` serves v5's QUIC proxy mode, which is not
 //! implemented.
 
+mod chunked;
 pub(crate) mod kdf;
 mod pool;
 pub(crate) mod record;
@@ -28,9 +32,9 @@ use crate::transport::obfs::ObfsClient;
 use crate::{BuildError, Outbound, OutboundError, UdpSupport};
 use kdf::Psk;
 use pool::Pool;
-use record::SnellStream;
+use record::{Format, SnellStream};
 use rurge_config::HostName;
-use rurge_config::spec::{ObfsMode, ShadowTlsOpts, SnellSpec};
+use rurge_config::spec::{ObfsMode, ShadowTlsOpts, SnellSpec, SnellVersion};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target};
 use rustls::RootCertStore;
@@ -49,12 +53,13 @@ const CONNECT_V2: u8 = 0x05;
 pub(crate) struct Dialer {
     stack: Stack,
     psk: Psk,
+    format: Format,
 }
 
 impl Dialer {
     pub(crate) async fn fresh(&self, opts: &ConnectOpts) -> Result<SnellStream, OutboundError> {
         let transport = self.stack.open(opts).await?;
-        Ok(SnellStream::open(transport, self.psk.clone()).await?)
+        Ok(SnellStream::open(transport, self.psk.clone(), self.format).await?)
     }
 }
 
@@ -62,10 +67,12 @@ impl Dialer {
 pub struct SnellOutbound {
     name: String,
     dialer: Arc<Dialer>,
-    /// `CONNECT`, or `CONNECT_V2` with `reuse=true`.
+    /// `CONNECT`, or `CONNECT_V2` where connections are reused.
     command: u8,
-    /// `Some` with `reuse=true`.
+    /// `Some` where connections are reused.
     pool: Option<Arc<Pool>>,
+    /// Version 3 and later.
+    udp: bool,
     /// Started by the first connection: building an outbound (a dry build
     /// included) leaves no task behind.
     reaper: OnceLock<AbortOnDrop>,
@@ -86,7 +93,9 @@ impl SnellOutbound {
         if spec.psk.expose().is_empty() {
             return Err(BuildError::new("`psk` is empty"));
         }
-        if spec.obfs.as_ref().is_some_and(|o| o.mode != ObfsMode::Http) {
+        // versions 1 to 3 take `tls` too
+        let http_only = !spec.version.is_chunked();
+        if http_only && spec.obfs.as_ref().is_some_and(|o| o.mode != ObfsMode::Http) {
             return Err(BuildError::new(
                 "`snell` versions 4 and 5 take only `obfs=http`",
             ));
@@ -103,15 +112,23 @@ impl SnellOutbound {
         if let Some(obfs) = obfs {
             stack = stack.with_obfs(obfs);
         }
+        let format = match spec.version {
+            SnellVersion::V1 => Format::ChunkedChaCha,
+            SnellVersion::V2 | SnellVersion::V3 => Format::ChunkedAes,
+            SnellVersion::V4 | SnellVersion::V5 => Format::V4,
+        };
         let dialer = Arc::new(Dialer {
             stack,
             psk: Psk::new(spec.psk.expose()),
+            format,
         });
         Ok(SnellOutbound {
             name: name.to_string(),
             dialer,
+            // `reuse` is the value in effect: the version's own before v4
             command: if spec.reuse { CONNECT_V2 } else { CONNECT },
             pool: spec.reuse.then(Arc::<Pool>::default),
+            udp: spec.version.carries_udp(),
             reaper: OnceLock::new(),
         })
     }
@@ -182,9 +199,13 @@ impl Outbound for SnellOutbound {
         })
     }
 
-    /// v4 and v5 carry UDP whatever the policy says.
+    /// v3 and later carry UDP whatever the policy says.
     fn udp(&self) -> UdpSupport {
-        UdpSupport::Native
+        if self.udp {
+            UdpSupport::Native
+        } else {
+            UdpSupport::Unsupported
+        }
     }
 
     fn open_udp<'a>(
@@ -192,6 +213,11 @@ impl Outbound for SnellOutbound {
         opts: &'a ConnectOpts,
     ) -> BoxFuture<'a, Result<BoxedPacketSocket, OutboundError>> {
         Box::pin(async move {
+            if !self.udp {
+                return Err(OutboundError::Unsupported(
+                    "UDP below `snell` version 3".to_string(),
+                ));
+            }
             // one budget for the connection, its layers, the key and the
             // server's answer, which comes at once
             let open = async {
@@ -215,7 +241,7 @@ mod tests {
     use rurge_config::policy::parse_policy;
     use rurge_config::spec::shadow_tls::read_shadow_tls;
     use rurge_config::spec::snell::read_snell;
-    use rurge_config::spec::{ObfsOpts, ParamReader, Secret, SnellVersion};
+    use rurge_config::spec::{ObfsOpts, ParamReader, Secret};
     use rurge_net::connector::{DirectConnector, PacketSocket, SystemResolve};
     use std::net::SocketAddr;
     use std::path::Path;
@@ -256,6 +282,39 @@ mod tests {
             "snell, 127.0.0.1, {}, psk=secret, version=4{extra}",
             fake.addr().port()
         ))
+    }
+
+    /// A server of `version`, and what else `script` says.
+    async fn server_of(version: u8, script: SnellScript) -> FakeSnell {
+        FakeSnell::spawn(SnellScript { version, ..script }).await
+    }
+
+    /// An outbound of `version` to `fake`, with `extra` parameters.
+    fn outbound_of(version: u8, fake: &FakeSnell, extra: &str) -> SnellOutbound {
+        outbound(&format!(
+            "snell, 127.0.0.1, {}, psk=secret, version={version}{extra}",
+            fake.addr().port()
+        ))
+    }
+
+    const NO_ANSWER: &str =
+        "snell: the server closed the connection without answering (wrong psk or version?)";
+    const UNDECRYPTABLE: &str =
+        "snell: the server's data failed to decrypt (wrong psk or version?)";
+
+    /// Writes `hello` on a fresh request and reads the failure, which must
+    /// come within the bound.
+    async fn failure(out: &SnellOutbound, to: SocketAddr) -> std::io::Error {
+        let mut stream = out
+            .connect_tcp(&target(to), &ConnectOpts::default())
+            .await
+            .expect("connecting succeeds");
+        stream.write_all(b"hello").await.unwrap();
+        let mut answer = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut answer))
+            .await
+            .expect("a failure within the bound, not a wait")
+            .unwrap_err()
     }
 
     fn target(addr: SocketAddr) -> Target {
@@ -342,6 +401,352 @@ mod tests {
             assert!(seen[0].client_id.is_empty());
             assert_eq!(seen[0].early, b"hello through snell", "one record");
             assert!((256..512).contains(&seen[0].padding), "{}", seen[0].padding);
+        }
+    }
+
+    /// Versions 1 to 3 against a server of the same version; a line
+    /// without `version` is version 1. Connect on 1 and 3, ConnectV2 on 2.
+    #[tokio::test]
+    async fn v1_to_v3_carry_the_head_with_the_first_payload_in_one_chunk() {
+        let echo = echo_server().await;
+        for (line, version, command) in [
+            ("", 1, CONNECT),
+            (", version=1", 1, CONNECT),
+            (", version=2", 2, CONNECT_V2),
+            (", version=3", 3, CONNECT),
+        ] {
+            let fake = server_of(version, SnellScript::new("secret")).await;
+            let out = outbound(&format!(
+                "snell, 127.0.0.1, {}, psk=secret{line}",
+                fake.addr().port()
+            ));
+            let mut stream = out
+                .connect_tcp(&target(echo), &ConnectOpts::default())
+                .await
+                .unwrap();
+            roundtrip(&mut stream, b"hello through snell").await;
+            roundtrip(&mut stream, b"and again").await;
+            let seen = fake.requests();
+            assert_eq!(seen.len(), 1, "v{version}");
+            assert_eq!(
+                (seen[0].command, seen[0].host.as_str(), seen[0].port),
+                (command, "127.0.0.1", echo.port()),
+                "v{version}"
+            );
+            assert!(seen[0].client_id.is_empty());
+            assert_eq!(seen[0].early, b"hello through snell", "v{version}");
+            assert_eq!(seen[0].padding, 0, "a chunk has no padding");
+        }
+    }
+
+    /// Version 2 always reuses, whatever `reuse` says: three requests, one
+    /// connection, each ended by a zero-length chunk each way.
+    #[tokio::test]
+    async fn v2_carries_its_requests_one_after_another_on_one_connection() {
+        let echo = echo_server().await;
+        for extra in ["", ", reuse=false"] {
+            let fake = server_of(2, SnellScript::new("secret")).await;
+            let out = outbound_of(2, &fake, extra);
+            for text in [&b"one"[..], b"two", b"three"] {
+                request(&out, echo, text).await;
+            }
+            assert_eq!(fake.connections(), 1, "{extra}");
+            assert_eq!(places(&fake), [(0, 0), (0, 1), (0, 2)]);
+            let seen = fake.requests();
+            assert!(seen.iter().all(|r| r.command == CONNECT_V2));
+            assert_eq!(seen[1].early, b"two");
+            assert_eq!(out.idle_connections(), Some(1), "{extra}");
+        }
+    }
+
+    /// The server closes a reused connection on the next request: the
+    /// request goes again on a fresh one, and its user sees no failure.
+    #[tokio::test]
+    async fn a_pooled_v2_connection_the_server_closed_is_retried_on_a_fresh_one() {
+        let echo = echo_server().await;
+        let script = SnellScript {
+            tunnels_per_connection: Some(1),
+            ..SnellScript::new("secret")
+        };
+        let fake = server_of(2, script).await;
+        let out = outbound_of(2, &fake, "");
+        request(&out, echo, b"first").await;
+        // taken from the pool; the server closes on the request
+        request(&out, echo, b"second").await;
+        assert_eq!(fake.unanswered(), 1);
+        assert_eq!(fake.connections(), 2);
+        assert_eq!(places(&fake), [(0, 0), (1, 0)]);
+        // the fresh connection carried the head and the payload again
+        assert_eq!(fake.requests()[1].early, b"second");
+        // and was pooled in turn
+        request(&out, echo, b"third").await;
+        assert_eq!(places(&fake), [(0, 0), (1, 0), (2, 0)]);
+        assert_eq!(fake.unanswered(), 2);
+    }
+
+    /// Dropped before either side ended, a v2 request ends in the
+    /// background — our zero-length chunk, then the server's — and its
+    /// connection carries the next request.
+    #[tokio::test]
+    async fn a_v2_request_dropped_before_its_end_finishes_in_the_background_and_is_reused() {
+        let echo = echo_server().await;
+        let fake = server_of(2, SnellScript::new("secret")).await;
+        let out = outbound_of(2, &fake, "");
+        let mut stream = out
+            .connect_tcp(&target(echo), &ConnectOpts::default())
+            .await
+            .unwrap();
+        roundtrip(&mut stream, b"left open").await;
+        drop(stream);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while out.idle_connections() != Some(1) {
+            assert!(tokio::time::Instant::now() < deadline, "pooled again");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        request(&out, echo, b"next").await;
+        assert_eq!(places(&fake), [(0, 0), (0, 1)]);
+    }
+
+    /// Versions 1 and 3 never reuse, whatever `reuse` says: every request
+    /// has a connection of its own, ended by the close.
+    #[tokio::test]
+    async fn v1_and_v3_give_every_request_a_connection_of_its_own() {
+        let echo = echo_server().await;
+        for version in [1, 3] {
+            for extra in ["", ", reuse=true"] {
+                let fake = server_of(version, SnellScript::new("secret")).await;
+                let out = outbound_of(version, &fake, extra);
+                for text in [&b"one"[..], b"two"] {
+                    request(&out, echo, text).await;
+                }
+                assert_eq!(fake.connections(), 2, "v{version}{extra}");
+                assert_eq!(places(&fake), [(0, 0), (1, 0)]);
+                assert!(fake.requests().iter().all(|r| r.command == CONNECT));
+                assert_eq!(out.idle_connections(), None, "v{version}{extra}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_large_payload_crosses_many_chunks_both_ways_on_v1_to_v3() {
+        let echo = echo_server().await;
+        let data: Vec<u8> = (0..1 << 20).map(|i: u32| (i % 251) as u8).collect();
+        for version in 1..=3 {
+            let fake = server_of(version, SnellScript::new("secret")).await;
+            let out = outbound_of(version, &fake, "");
+            let stream = out
+                .connect_tcp(&target(echo), &ConnectOpts::default())
+                .await
+                .unwrap();
+            let (mut read, mut write) = tokio::io::split(stream);
+            let sent = data.clone();
+            let writer = tokio::spawn(async move {
+                write.write_all(&sent).await.unwrap();
+            });
+            let mut back = vec![0u8; data.len()];
+            tokio::time::timeout(Duration::from_secs(30), read.read_exact(&mut back))
+                .await
+                .expect("the echo arrives within the bound")
+                .unwrap();
+            assert!(back == data, "v{version}: the echo differs");
+            writer.await.unwrap();
+            // the fake refuses anything longer
+            assert_eq!(fake.largest_record(), record::MAX_PAYLOAD, "full chunks");
+        }
+    }
+
+    /// Our end reaches the target as its end-of-file — the zero-length chunk
+    /// of version 2, the close of versions 1 and 3 — and the answer the
+    /// target then sends still arrives.
+    #[tokio::test]
+    async fn a_half_close_reaches_the_target_on_v1_to_v3() {
+        // reads to the end, then answers with how much it got
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let counter = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut all = Vec::new();
+                    if tcp.read_to_end(&mut all).await.is_ok() {
+                        let _ = tcp.write_all(format!("got {}", all.len()).as_bytes()).await;
+                    }
+                });
+            }
+        });
+        for (version, connections) in [(1, 2), (2, 1), (3, 2)] {
+            let fake = server_of(version, SnellScript::new("secret")).await;
+            let out = outbound_of(version, &fake, "");
+            for _ in 0..2 {
+                let mut stream = out
+                    .connect_tcp(&target(counter), &ConnectOpts::default())
+                    .await
+                    .unwrap();
+                stream.write_all(b"12345").await.unwrap();
+                stream.shutdown().await.unwrap();
+                let mut answer = Vec::new();
+                tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut answer))
+                    .await
+                    .expect("the answer arrives")
+                    .unwrap();
+                assert_eq!(answer, b"got 5", "v{version}");
+            }
+            assert_eq!(fake.connections(), connections, "v{version}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silent_client_sends_its_head_alone_on_v1_to_v3() {
+        // a target that speaks first, then echoes
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let greeter = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    tcp.write_all(b"220 ready").await?;
+                    let (mut r, mut w) = tcp.split();
+                    tokio::io::copy(&mut r, &mut w).await
+                });
+            }
+        });
+        for version in 1..=3 {
+            let fake = server_of(version, SnellScript::new("secret")).await;
+            let out = outbound_of(version, &fake, "");
+            let mut stream = out
+                .connect_tcp(&target(greeter), &ConnectOpts::default())
+                .await
+                .unwrap();
+            let mut greeting = [0u8; 9];
+            tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut greeting))
+                .await
+                .expect("the greeting arrives")
+                .unwrap();
+            assert_eq!(&greeting, b"220 ready", "v{version}");
+            roundtrip(&mut stream, b"HELO").await;
+            assert!(fake.requests()[0].early.is_empty(), "v{version}");
+        }
+    }
+
+    /// `tls` in front of version 1 and of version 2, `http` in front of
+    /// version 3: one camouflage per connection.
+    #[tokio::test]
+    async fn through_obfs_on_v1_to_v3() {
+        let echo = echo_server().await;
+        for (version, mode, connections) in [(1, "tls", 2), (2, "tls", 1), (3, "http", 2)] {
+            let script = SnellScript {
+                obfs_tls: mode == "tls",
+                obfs_http: mode == "http",
+                ..SnellScript::new("secret")
+            };
+            let fake = server_of(version, script).await;
+            let port = fake.addr().port();
+            let extra = format!(", obfs={mode}, obfs-host=cdn.example");
+            let out = outbound_of(version, &fake, &extra);
+            request(&out, echo, b"behind the camouflage").await;
+            let data = vec![0x5au8; 100_000];
+            let mut stream = out
+                .connect_tcp(&target(echo), &ConnectOpts::default())
+                .await
+                .unwrap();
+            roundtrip(&mut stream, &data).await;
+            let hellos = fake.obfs_seen();
+            assert_eq!(hellos.len(), connections, "v{version} behind {mode}");
+            // a server name carries no port, a `Host` does
+            let (host, uri) = match mode {
+                "tls" => ("cdn.example".to_string(), None),
+                _ => (format!("cdn.example:{port}"), Some("/")),
+            };
+            assert_eq!(hellos[0].host, host, "v{version}");
+            assert_eq!(hellos[0].uri.as_deref(), uri, "v{version}");
+            assert_eq!(fake.requests()[0].early, b"behind the camouflage");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_servers_refusal_is_the_error_on_v1_to_v3() {
+        let echo = echo_server().await;
+        for version in 1..=3 {
+            let script = SnellScript {
+                refuse: Some((0x05, b"no such host\r\n".to_vec())),
+                ..SnellScript::new("secret")
+            };
+            let fake = server_of(version, script).await;
+            let out = outbound_of(version, &fake, "");
+            for _ in 0..2 {
+                let err = failure(&out, echo).await;
+                assert_eq!(err.to_string(), "snell: the server refused: no such host");
+                assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+            }
+            // a refused request's connection is not reused, on version 2 either
+            assert_eq!(fake.connections(), 2, "v{version}");
+        }
+    }
+
+    /// A server that cannot open the first chunk says nothing and closes:
+    /// the error names the two things that can be wrong, and not the PSK.
+    #[tokio::test]
+    async fn a_wrong_psk_is_a_connection_closed_without_an_answer_on_v1_to_v3() {
+        let echo = echo_server().await;
+        for version in 1..=3 {
+            let fake = server_of(version, SnellScript::new("right")).await;
+            let out = outbound(&format!(
+                "snell, 127.0.0.1, {}, psk=wr0ngPsk, version={version}",
+                fake.addr().port()
+            ));
+            let err = failure(&out, echo).await;
+            assert_eq!(err.to_string(), NO_ANSWER, "v{version}");
+            assert!(!format!("{err:?}").contains("wr0ngPsk"));
+            assert_eq!((fake.rejected(), fake.requests().len()), (1, 0));
+        }
+    }
+
+    /// The line's version is not the server's — a line without `version`,
+    /// which dials version 1, against a server that speaks version 4 above
+    /// all. Neither side can read the other, and the request fails within
+    /// the bound with the hint, whichever way the server shows it.
+    #[tokio::test]
+    async fn a_server_of_another_version_fails_soon_and_says_psk_or_version() {
+        let echo = echo_server().await;
+        for (server, line) in [
+            (4, ""),
+            (4, ", version=1"),
+            (4, ", version=2"),
+            (4, ", version=3"),
+            (1, ", version=4"),
+            (2, ", version=5"),
+            (1, ", version=2"),
+            (3, ", version=1"),
+        ] {
+            let fake = server_of(server, SnellScript::new("secret")).await;
+            let out = outbound(&format!(
+                "snell, 127.0.0.1, {}, psk=secret{line}",
+                fake.addr().port()
+            ));
+            let text = failure(&out, echo).await.to_string();
+            assert!(
+                text == NO_ANSWER || text == UNDECRYPTABLE,
+                "a v{server} server and `{line}`: {text}"
+            );
+            assert!(text.ends_with("(wrong psk or version?)"), "{text}");
+            assert!(!text.contains("secret"), "{text}");
+            assert_eq!((fake.rejected(), fake.requests().len()), (1, 0));
+        }
+    }
+
+    /// A target that ends without sending anything leaves the server
+    /// nothing to put its answer in front of: the request ends without one,
+    /// by the zero-length chunk (version 2) or the close (versions 1 and 3).
+    #[tokio::test]
+    async fn a_request_that_ends_without_an_answer_is_an_error_on_v1_to_v3() {
+        // accepts and closes at once
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closer = listener.local_addr().unwrap();
+        tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+        for version in 1..=3 {
+            let fake = server_of(version, SnellScript::new("secret")).await;
+            let out = outbound_of(version, &fake, "");
+            let err = failure(&out, closer).await;
+            assert_eq!(err.to_string(), NO_ANSWER, "v{version}");
+            assert_eq!(out.idle_connections().unwrap_or(0), 0, "v{version}");
         }
     }
 
@@ -550,7 +955,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "snell: the server closed the connection without answering"
+            "snell: the server closed the connection without answering (wrong psk or version?)"
         );
         assert_eq!((fake.connections(), fake.unanswered()), (1, 1));
     }
@@ -656,7 +1061,7 @@ mod tests {
                 .unwrap_err();
             assert_eq!(
                 err.to_string(),
-                "snell: the server closed the connection without answering"
+                "snell: the server closed the connection without answering (wrong psk or version?)"
             );
         }
         assert_eq!((fake.rejected(), fake.requests().len()), (2, 0));
@@ -861,6 +1266,34 @@ mod tests {
         assert_eq!(build("secret", None), Ok(()));
     }
 
+    /// Versions 1 to 3 take `tls` too; 4 and 5 are checked above.
+    #[test]
+    fn versions_1_to_3_build_with_either_obfs() {
+        for version in [SnellVersion::V1, SnellVersion::V2, SnellVersion::V3] {
+            for mode in [ObfsMode::Tls, ObfsMode::Http] {
+                let spec = SnellSpec {
+                    version,
+                    psk: Secret::from("secret"),
+                    reuse: version == SnellVersion::V2,
+                    obfs: Some(ObfsOpts {
+                        mode,
+                        host: None,
+                        uri: "/".into(),
+                    }),
+                };
+                let built = SnellOutbound::new(
+                    "N",
+                    Target::new(HostName::parse("127.0.0.1"), 8388),
+                    &spec,
+                    None,
+                    Arc::new(RootCertStore::empty()),
+                    Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
+                );
+                assert!(built.is_ok(), "{version:?} behind {mode:?}");
+            }
+        }
+    }
+
     async fn udp_answer(carrier: &dyn PacketSocket) -> (Vec<u8>, Target) {
         let mut buf = vec![0u8; 65536];
         let (n, from) = tokio::time::timeout(Duration::from_secs(10), carrier.recv_from(&mut buf))
@@ -911,6 +1344,99 @@ mod tests {
                 [one.to_string(), "xn--bcher-kva.example:53".to_string()]
             );
             assert_eq!(fake.connections(), 1);
+        }
+    }
+
+    /// Version 3 carries UDP as 4 and 5 do, a datagram a chunk: two
+    /// targets through one connection, and whoever reaches the server's
+    /// socket is heard under its own address (full cone).
+    #[tokio::test]
+    async fn v3_carries_udp_through_one_connection_to_any_target() {
+        let (one, two) = (udp_echo_server().await, udp_echo_server().await);
+        let script = SnellScript {
+            connect_to: Some(two),
+            ..SnellScript::new("secret")
+        };
+        let fake = server_of(3, script).await;
+        let out = outbound_of(3, &fake, "");
+        assert_eq!(out.udp(), UdpSupport::Native);
+        let carrier = out.open_udp(&ConnectOpts::default()).await.unwrap();
+        udp_roundtrip(carrier.as_ref(), one, b"to one").await;
+        let name = Target::new(HostName::Domain("bücher.example".into()), 53);
+        carrier.send_to(b"by name", &name).await.unwrap();
+        assert_eq!(
+            udp_answer(carrier.as_ref()).await,
+            (b"by name".to_vec(), target(two))
+        );
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger
+            .send_to(b"unasked", fake.udp_outside()[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            udp_answer(carrier.as_ref()).await,
+            (b"unasked".to_vec(), target(stranger.local_addr().unwrap()))
+        );
+        let seen = fake.requests();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].command, udp::UDP);
+        assert!(seen[0].client_id.is_empty() && seen[0].early.is_empty());
+        assert_eq!(
+            fake.datagrams(),
+            [one.to_string(), "xn--bcher-kva.example:53".to_string()]
+        );
+        assert_eq!(fake.connections(), 1);
+        // the largest datagram fills a chunk exactly
+        let largest = vec![7u8; 16_374];
+        udp_roundtrip(carrier.as_ref(), one, &largest).await;
+        assert_eq!(fake.largest_record(), record::MAX_PAYLOAD);
+    }
+
+    /// UDP came with version 3: an outbound of version 1 or 2 says so
+    /// without dialling.
+    #[tokio::test]
+    async fn v1_and_v2_carry_no_udp() {
+        for version in [1, 2] {
+            let fake = server_of(version, SnellScript::new("secret")).await;
+            let out = outbound_of(version, &fake, "");
+            assert_eq!(out.udp(), UdpSupport::Unsupported, "v{version}");
+            let err = out
+                .open_udp(&ConnectOpts::default())
+                .await
+                .err()
+                .expect("no UDP");
+            assert_eq!(
+                err.to_string(),
+                "policy protocol not implemented: UDP below `snell` version 3"
+            );
+            assert_eq!(fake.connections(), 0, "nothing was dialled");
+        }
+    }
+
+    /// The line says version 3 and the server is version 2: the chunks are
+    /// the same, the command is not there. The server's refusal fails the
+    /// open; so does one for a reason of its own.
+    #[tokio::test]
+    async fn the_servers_refusal_of_udp_fails_the_open_on_v3() {
+        let older = server_of(2, SnellScript::new("secret")).await;
+        let script = SnellScript {
+            refuse: Some((0x07, b"udp disabled".to_vec())),
+            ..SnellScript::new("secret")
+        };
+        let unwilling = server_of(3, script).await;
+        for (fake, message) in [
+            (&older, "fake snell: a command this version lacks"),
+            (&unwilling, "udp disabled"),
+        ] {
+            let err = outbound_of(3, fake, "")
+                .open_udp(&ConnectOpts::default())
+                .await
+                .err()
+                .expect("refused");
+            assert_eq!(
+                err.to_string(),
+                format!("snell: the server refused: {message}")
+            );
         }
     }
 

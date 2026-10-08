@@ -1,15 +1,19 @@
 //! `snell` policy parameters (manual: Policies › Snell; phase 2 M6 design
-//! 4.2).
+//! 4.2, M8 design 4.3).
 
 use super::obfs::{ObfsMode, ObfsOpts, read_obfs};
 use super::reader::ParamReader;
 use super::secret::Secret;
 use crate::diagnostic::codes;
 
-/// The versions this version implements: v5 speaks the v4 wire format over
-/// TCP (M6-D2).
+/// The versions rurge speaks: v1 to v3 share the record format of the
+/// original protocol (phase 2 M8 design 4.3), and v5 speaks v4's over TCP
+/// (M6-D2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnellVersion {
+    V1,
+    V2,
+    V3,
     V4,
     V5,
 }
@@ -17,9 +21,22 @@ pub enum SnellVersion {
 impl SnellVersion {
     pub fn number(self) -> u8 {
         match self {
+            SnellVersion::V1 => 1,
+            SnellVersion::V2 => 2,
+            SnellVersion::V3 => 3,
             SnellVersion::V4 => 4,
             SnellVersion::V5 => 5,
         }
+    }
+
+    /// v1 to v3: the chunked record format of the original protocol.
+    pub fn is_chunked(self) -> bool {
+        matches!(self, SnellVersion::V1 | SnellVersion::V2 | SnellVersion::V3)
+    }
+
+    /// v3 and later relay UDP.
+    pub fn carries_udp(self) -> bool {
+        !matches!(self, SnellVersion::V1 | SnellVersion::V2)
     }
 }
 
@@ -27,16 +44,17 @@ impl SnellVersion {
 pub struct SnellSpec {
     pub version: SnellVersion,
     pub psk: Secret<String>,
-    /// `reuse`: a finished stream hands its connection back for the next
-    /// request (ConnectV2).
+    /// A finished request hands its connection back for the next one
+    /// (ConnectV2). The value in effect: version 2 always does and versions
+    /// 1 and 3 never do, whatever `reuse` says; 4 and 5 do as it says.
     pub reuse: bool,
-    /// `obfs`: only `http` on versions 4 and 5.
+    /// `obfs`: `http` or `tls` on versions 1 to 3, only `http` on 4 and 5.
     pub obfs: Option<ObfsOpts>,
 }
 
-/// What a `snell` line says. With a version that is valid but not
-/// implemented (1–3, 6) `not_implemented_version` holds it and `spec` is
-/// meaningless: the caller makes no spec of it (M6-D2).
+/// What a `snell` line says. Version 6 is valid but not supported:
+/// `not_implemented_version` holds it and `spec` is meaningless, the caller
+/// makes no spec of it (phase 2 M8 design 4.4).
 pub struct SnellRead {
     pub spec: SnellSpec,
     pub not_implemented_version: Option<u8>,
@@ -79,8 +97,12 @@ pub fn read_snell(r: &mut ParamReader<'_>) -> SnellRead {
         },
     };
     let version = match number {
+        Some(2) => SnellVersion::V2,
+        Some(3) => SnellVersion::V3,
+        Some(4) => SnellVersion::V4,
         Some(5) => SnellVersion::V5,
-        _ => SnellVersion::V4,
+        // 1, Surge's default (version 6 and a bad version make no spec)
+        _ => SnellVersion::V1,
     };
     match number {
         Some(6) => {
@@ -98,7 +120,23 @@ pub fn read_snell(r: &mut ParamReader<'_>) -> SnellRead {
         // version `mode` is on: no second word
         _ => r.touch("mode"),
     }
-    let reuse = r.bool("reuse").unwrap_or(false);
+    let written = r.bool("reuse");
+    // the manual: "Snell v2 always reuses connections, and v1/v3 never do"
+    let reuse = match number {
+        Some(2) => true,
+        Some(1 | 3) => false,
+        _ => written.unwrap_or(false),
+    };
+    if let (Some(n @ 1..=3), Some(written)) = (number, written)
+        && written != reuse
+    {
+        r.warn(
+            codes::W_PARAM_NOT_APPLICABLE,
+            format!(
+                "`reuse` does not apply to `snell` version {n}: version 2 always reuses a connection, versions 1 and 3 never do"
+            ),
+        );
+    }
     let udp_port = match r.number::<u16>("udp-port", "a port from 1 to 65535") {
         Some(0) => {
             r.invalid("udp-port", "0", "a port from 1 to 65535");
@@ -120,7 +158,7 @@ pub fn read_snell(r: &mut ParamReader<'_>) -> SnellRead {
             None
         }
         Some(4 | 5) => read_obfs(r, &[ObfsMode::Http]),
-        // versions 1 to 3 had `tls` too (and a bad version is an error
+        // versions 1 to 3 take `tls` too (and a bad version is an error
         // already: no second word on the mode)
         _ => read_obfs(r, &[ObfsMode::Http, ObfsMode::Tls]),
     };
@@ -131,7 +169,7 @@ pub fn read_snell(r: &mut ParamReader<'_>) -> SnellRead {
             reuse,
             obfs,
         },
-        not_implemented_version: number.filter(|n| !matches!(n, 4 | 5)),
+        not_implemented_version: number.filter(|n| *n == 6),
         udp_port,
     }
 }
@@ -192,17 +230,98 @@ mod tests {
         );
     }
 
-    /// Surge's default is 1, so a line without `version` is valid but not
-    /// implemented; so are 2, 3 and 6 (M6-D2).
+    /// Versions 1 to 5 all have a spec, and Surge's default is 1: so is a
+    /// line without `version` (phase 2 M8 design 4.3).
     #[test]
-    fn versions_1_to_3_and_6_are_valid_but_not_implemented() {
+    fn versions_1_to_5_have_a_spec_and_the_default_is_1() {
         let (got, failed, diags) = read("snell, h.test, 443, psk=pw");
         assert!(!failed && diags.is_empty(), "{diags:?}");
-        assert_eq!(got.not_implemented_version, Some(1));
-        for n in [1, 2, 3, 6] {
+        assert_eq!(got.not_implemented_version, None);
+        assert_eq!(got.spec.version, SnellVersion::V1);
+        for (n, version, chunked, udp) in [
+            (1, SnellVersion::V1, true, false),
+            (2, SnellVersion::V2, true, false),
+            (3, SnellVersion::V3, true, true),
+            (4, SnellVersion::V4, false, true),
+            (5, SnellVersion::V5, false, true),
+        ] {
             let (got, failed, diags) = read(&format!("snell, h.test, 443, psk=pw, version={n}"));
             assert!(!failed && diags.is_empty(), "{n}: {diags:?}");
-            assert_eq!(got.not_implemented_version, Some(n));
+            assert_eq!(got.not_implemented_version, None, "{n}");
+            assert_eq!(got.spec.version, version);
+            assert_eq!(
+                (
+                    version.number(),
+                    version.is_chunked(),
+                    version.carries_udp()
+                ),
+                (n, chunked, udp)
+            );
+        }
+    }
+
+    /// Version 6 is a version of the manual's, and none rurge speaks.
+    #[test]
+    fn version_6_is_valid_but_not_supported() {
+        let (got, failed, diags) = read("snell, h.test, 443, psk=pw, version=6");
+        assert!(!failed && diags.is_empty(), "{diags:?}");
+        assert_eq!(got.not_implemented_version, Some(6));
+    }
+
+    /// Version 2 always reuses a connection and versions 1 and 3 never do,
+    /// whatever the line says: `reuse` written against that is `W0028`. On
+    /// versions 4 and 5 it is the line's to choose.
+    #[test]
+    fn reuse_is_the_versions_own_before_version_4() {
+        let (got, ..) = read("snell, h.test, 443, psk=pw");
+        assert!(!got.spec.reuse, "the default version is 1");
+        for (line, expected) in [
+            ("version=1", false),
+            ("version=1, reuse=false", false),
+            ("version=2", true),
+            ("version=2, reuse=true", true),
+            ("version=3", false),
+            ("version=3, reuse=false", false),
+            ("version=4", false),
+            ("version=4, reuse=true", true),
+            ("version=5, reuse=true", true),
+            ("version=5, reuse=false", false),
+        ] {
+            let (got, failed, diags) = read(&format!("snell, h.test, 443, psk=pw, {line}"));
+            assert!(!failed && diags.is_empty(), "{line}: {diags:?}");
+            assert_eq!(got.spec.reuse, expected, "{line}");
+        }
+        for (line, n, expected) in [
+            ("version=1, reuse=true", 1, false),
+            ("reuse=true", 1, false),
+            ("version=2, reuse=false", 2, true),
+            ("version=3, reuse=true", 3, false),
+        ] {
+            let (got, failed, diags) = read(&format!("snell, h.test, 443, psk=pw, {line}"));
+            assert!(!failed, "{line}");
+            assert_eq!(
+                messages(&diags),
+                [(
+                    codes::W_PARAM_NOT_APPLICABLE,
+                    format!(
+                        "policy `P`: `reuse` does not apply to `snell` version {n}: version 2 always reuses a connection, versions 1 and 3 never do"
+                    )
+                    .as_str()
+                )],
+                "{line}"
+            );
+            assert_eq!(got.spec.reuse, expected, "{line}");
+        }
+        // version 6 has a word of its own, and a line that is wrong already
+        // gets no second one
+        for line in ["version=6, reuse=true", "version=7, reuse=true"] {
+            let (_, _, diags) = read(&format!("snell, h.test, 443, psk=pw, {line}"));
+            assert!(
+                diags
+                    .iter()
+                    .all(|d| d.code != codes::W_PARAM_NOT_APPLICABLE),
+                "{line}: {diags:?}"
+            );
         }
     }
 
@@ -269,10 +388,27 @@ mod tests {
                 )]
             );
         }
-        // versions 1 to 3 had it: the line is valid, just not implemented
-        let (got, failed, diags) = read("snell, h.test, 443, psk=pw, version=3, obfs=tls");
-        assert!(!failed && diags.is_empty(), "{diags:?}");
-        assert_eq!(got.not_implemented_version, Some(3));
+    }
+
+    /// Versions 1 to 3 take `tls` as well as `http`, `version` written or
+    /// not.
+    #[test]
+    fn versions_1_to_3_take_obfs_tls() {
+        for line in ["", ", version=1", ", version=2", ", version=3"] {
+            for (mode, expected) in [("tls", ObfsMode::Tls), ("http", ObfsMode::Http)] {
+                let (got, failed, diags) = read(&format!(
+                    "snell, h.test, 443, psk=pw{line}, obfs={mode}, obfs-host=cdn.test"
+                ));
+                assert!(!failed && diags.is_empty(), "{line} {mode}: {diags:?}");
+                assert_eq!(got.not_implemented_version, None, "{line}");
+                let obfs = got.spec.obfs.expect("obfs");
+                assert_eq!(
+                    (obfs.mode, obfs.host.as_deref()),
+                    (expected, Some("cdn.test")),
+                    "{line}"
+                );
+            }
+        }
     }
 
     #[test]

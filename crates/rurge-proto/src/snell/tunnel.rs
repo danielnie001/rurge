@@ -1,7 +1,7 @@
-//! One request on a Snell connection (phase 2 M6 design 4.3): the request
-//! head waits in a `LazyHead` for the first payload, and the server's
-//! answer — the first byte of its first payload of this request — is read
-//! in front of the data:
+//! One request on a Snell connection, whatever its version (phase 2 M6
+//! design 4.3): the request head waits in a `LazyHead` for the first
+//! payload, and the server's answer — the first byte of its first payload
+//! of this request — is read in front of the data:
 //!
 //! - `00` (tunnel): the rest is the target's data;
 //! - `02 code length message` (error): `snell: the server refused: …`;
@@ -10,11 +10,14 @@
 //! The server answers only once the target has sent something, so the
 //! answer surfaces at the first read, never before a write.
 //!
-//! With `reuse=true` the application's shutdown sends only our empty
-//! record, and a request whose two sides both ended cleanly hands its
-//! connection back to the pool when dropped. Dropped earlier, the
-//! connection finishes in the background: our end, then the server's data
-//! discarded (at most `MAX_DISCARD` bytes, as Surge) up to its end.
+//! Where connections are reused (`reuse=true` on v4 and v5, always on v2)
+//! the application's shutdown sends only our end of the request — v4's
+//! empty record, v2's zero-length chunk — and a request whose two sides
+//! both ended cleanly hands its connection back to the pool when dropped.
+//! Dropped earlier, the connection finishes in the background: our end,
+//! then the server's data discarded (at most `MAX_DISCARD` bytes, as Surge)
+//! up to its end. Elsewhere the shutdown is the record stream's own, which
+//! closes our side of the connection.
 //!
 //! A pooled connection may have been closed by the server while it idled.
 //! A request on one whose transport fails before any answer arrived and
@@ -25,7 +28,7 @@
 
 use super::Dialer;
 use super::pool::Pool;
-use super::record::SnellStream;
+use super::record::{NO_ANSWER, SnellStream};
 use crate::OutboundError;
 use crate::transport::lazy_head::LazyHead;
 use rurge_net::BoxFuture;
@@ -56,9 +59,9 @@ const MAX_DISCARD: usize = 0x80001;
 /// How long a dropped request's connection may take to finish cleanly.
 const FINISH_TIMEOUT: Duration = Duration::from_secs(10);
 
-const NO_ANSWER: &str = "snell: the server closed the connection without answering";
 pub(super) const UNKNOWN_REPLY: &str = "snell: the server answered with an unknown reply";
 
+/// The request ended, or its connection closed, before the server's answer.
 pub(super) fn no_answer() -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, NO_ANSWER)
 }
@@ -171,7 +174,7 @@ pub(crate) struct SnellTunnel {
     end_owed: bool,
     /// The connection is not in a state to be reused.
     broken: bool,
-    /// `reuse=true`: where the connection goes after a clean end.
+    /// Where the connection goes after a clean end, when it is reused.
     pool: Option<Weak<Pool>>,
 }
 
@@ -274,8 +277,8 @@ impl SnellTunnel {
         }
     }
 
-    /// Sends our end: the empty record alone when the connection may be
-    /// reused, else the connection's shutdown too.
+    /// Sends our end: of this request alone when the connection may be
+    /// reused, else the record stream's shutdown.
     fn poll_end(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let reuse = self.pool.is_some();
         let lazy = self.lazy();
@@ -461,20 +464,23 @@ async fn finish(mut stream: SnellStream, pool: Weak<Pool>) {
 #[cfg(test)]
 mod tests {
     use super::super::kdf::Psk;
+    use super::super::record::Format;
     use super::*;
     use tokio::io::AsyncWriteExt;
 
     /// A request on one end of a pipe and the server's stream on the other
-    /// (the record format is symmetric).
-    async fn pair(pool: Option<Weak<Pool>>) -> (SnellTunnel, SnellStream) {
+    /// (the record format is symmetric), both in `format`.
+    async fn pair_in(format: Format, pool: Option<Weak<Pool>>) -> (SnellTunnel, SnellStream) {
         let (near, far) = tokio::io::duplex(64 * 1024);
-        let client = SnellStream::open(Box::new(near), Psk::new("psk"))
-            .await
-            .unwrap();
-        let server = SnellStream::open(Box::new(far), Psk::new("psk"))
-            .await
-            .unwrap();
+        let open = |end| SnellStream::open(Box::new(end), Psk::new("psk"), format);
+        let client = open(near).await.unwrap();
+        let server = open(far).await.unwrap();
         (SnellTunnel::new(client, b"HEAD".to_vec(), pool), server)
+    }
+
+    /// `pair_in` v4's format.
+    async fn pair(pool: Option<Weak<Pool>>) -> (SnellTunnel, SnellStream) {
+        pair_in(Format::V4, pool).await
     }
 
     /// What the tunnel reads after the server sent `records`, one write each.
@@ -566,6 +572,47 @@ mod tests {
         // the server's end without an answer
         let err = answered(&[]).await.unwrap_err();
         assert_eq!(err.to_string(), NO_ANSWER);
+    }
+
+    /// On chunks a request that keeps its connection (version 2) ends with
+    /// the zero-length chunk, and its connection is pooled; one that has the
+    /// connection to itself (versions 1 and 3) ends with the close, which
+    /// the server reads as no end of a request it could follow.
+    #[tokio::test]
+    async fn a_chunked_request_ends_by_the_zero_length_chunk_only_where_it_is_reused() {
+        for format in [Format::ChunkedChaCha, Format::ChunkedAes] {
+            let pool = Arc::new(Pool::default());
+            for reused in [true, false] {
+                let back = reused.then(|| Arc::downgrade(&pool));
+                let (mut tunnel, mut server) = pair_in(format, back).await;
+                tunnel.write_all(b"ping").await.unwrap();
+                tunnel.shutdown().await.unwrap();
+                // (a request that ended neither way would leave these reads
+                // waiting: they are bounded)
+                let bound = Duration::from_secs(30);
+                let mut request = Vec::new();
+                tokio::time::timeout(bound, server.read_to_end(&mut request))
+                    .await
+                    .expect("our end within the bound")
+                    .unwrap();
+                assert_eq!(request, b"HEADping", "one chunk");
+                server.write_all(b"\x00pong").await.unwrap();
+                std::future::poll_fn(|cx| server.poll_end(cx))
+                    .await
+                    .unwrap();
+                // only a zero-length chunk leaves the connection for another
+                // request
+                assert_eq!(server.is_reusable(), reused);
+                let mut got = Vec::new();
+                tokio::time::timeout(bound, tunnel.read_to_end(&mut got))
+                    .await
+                    .expect("the server's end within the bound")
+                    .unwrap();
+                assert_eq!(got, b"pong");
+                drop(tunnel);
+                assert_eq!(pool.len(), 1, "pooled once, by the reused request");
+            }
+        }
     }
 
     #[tokio::test]

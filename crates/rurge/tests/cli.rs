@@ -497,14 +497,20 @@ fn check_knows_ss() {
 const SNELL: &str = "[General]\n[Proxy]\n\
 N = snell, proxy.test, 443, psk=s3cretPsk, version=4, reuse=true, obfs=http\n\
 Old1 = snell, proxy.test, 443, psk=s3cretPsk\n\
-Old2 = snell, proxy.test, 443, psk=s3cretPsk, version=1\n[Rule]\nFINAL,DIRECT\n";
+Old2 = snell, proxy.test, 443, psk=s3cretPsk, version=1, obfs=tls\n\
+Old3 = snell, proxy.test, 443, psk=s3cretPsk, version=2\n\
+Old4 = snell, proxy.test, 443, psk=s3cretPsk, version=3\n[Rule]\nFINAL,DIRECT\n";
+const SNELL_V6: &str = "[General]\n[Proxy]\n\
+New1 = snell, proxy.test, 443, psk=s3cretPsk, version=6\n\
+New2 = snell, proxy.test, 443, psk=s3cretPsk, version=6, mode=unshaped\n[Rule]\nFINAL,DIRECT\n";
 const SNELL_BAD_VERSION: &str = "[General]\n[Proxy]\n\
 N = snell, proxy.test, 443, psk=s3cretPsk, version=7\n[Rule]\nFINAL,DIRECT\n";
 
-/// `rurge check` knows `snell` versions 4 and 5 (phase 2 M6 design 4.2):
-/// version 1 — also the default — is still "not implemented", once however
-/// many lines use it; a version out of range is an error; the PSK is never
-/// printed.
+/// `rurge check` knows `snell` versions 1 to 5 (phase 2 M6 design 4.2, M8
+/// design 4.3): a line that does not say its version is version 1, and is
+/// no longer "not implemented". Version 6 is "not supported", once however
+/// many lines ask for it; a version out of range is an error; the PSK is
+/// never printed.
 #[test]
 fn check_knows_snell() {
     let dir = tempfile::tempdir().unwrap();
@@ -518,10 +524,25 @@ fn check_knows_snell() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
+    assert_eq!(out.matches("W0007").count(), 0, "{out}");
+    assert!(out.contains("0 error(s), 0 warning(s)"), "{out}");
+    assert!(!out.contains("s3cretPsk"), "{out}");
+
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(&dir, "v6.conf", SNELL_V6))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
     assert_eq!(out.matches("W0007").count(), 1, "{out}");
     assert!(
-        out.contains("snell.conf:4")
-            && out.contains("`snell` version 1 (the default when `version` is not written)"),
+        out.contains(
+            "v6.conf:3: `snell` version 6 is not supported: it is a beta protocol without a public specification; such policies behave as REJECT\n"
+        ),
         "{out}"
     );
     assert!(!out.contains("policy type `snell`"), "{out}");

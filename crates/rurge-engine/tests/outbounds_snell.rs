@@ -1,7 +1,8 @@
-//! Sessions that leave through `snell` (phase 2 M6 design 4.3): TCP and
-//! UDP through the engine to the loopback `FakeSnell` — versions 4 and 5,
-//! `reuse`, obfs `http`, the server's refusal, a wrong PSK,
-//! `underlying-proxy`, reloads, and the versions that are not implemented.
+//! Sessions that leave through `snell` (phase 2 M6 design 4.3, M8 design
+//! 4.3): TCP and UDP through the engine to the loopback `FakeSnell` —
+//! versions 1 to 5, `reuse`, obfs, the server's refusal, a wrong PSK or
+//! version, `underlying-proxy`, reloads, and version 6, which is not
+//! supported.
 
 mod common;
 use common::*;
@@ -189,19 +190,125 @@ async fn a_wrong_psk_fails_the_session_closed_without_an_answer() {
     let record = a_failed_session(&h).await;
     assert_eq!(
         record.error.as_deref(),
-        Some("snell: the server closed the connection without answering")
+        Some("snell: the server closed the connection without answering (wrong psk or version?)")
     );
     assert!(!format!("{record:?}").contains("wr0ngPsk"));
     assert_eq!((fake.rejected(), fake.requests().len()), (1, 0));
 }
 
-/// A version other than 4 and 5 is parsed and rejects at run time, and the
-/// record names the version (M6-D2).
+/// Versions 1 to 3 each carry a tunnel to the echo, and so does a line that
+/// does not say its version, which is version 1 (phase 2 M8 design 4.3).
+/// Connect on 1 and 3, ConnectV2 on 2; `tls` camouflage in front of 1.
 #[tokio::test]
-async fn snell_v1_rejects_and_says_which() {
+async fn a_connect_leaves_through_snell_v1_to_v3() {
+    let echo = rurge_proto::testing::echo_server().await;
+    for (params, version, command) in [
+        ("psk=s3same", 1, 1),
+        ("psk=s3same, version=1, obfs=tls, obfs-host=cdn.test", 1, 1),
+        ("psk=s3same, version=2", 2, 5),
+        ("psk=s3same, version=3, obfs=http", 3, 1),
+    ] {
+        let fake = FakeSnell::spawn(SnellScript {
+            version,
+            obfs_tls: params.contains("obfs=tls"),
+            obfs_http: params.contains("obfs=http"),
+            connect_to: Some(echo),
+            ..SnellScript::new("s3same")
+        })
+        .await;
+        let h = through(&snell_line(&fake, params)).await;
+        let mut tunnel = connect_via_http(h.http(), "target.test:7").await;
+        echo_through(&mut tunnel, b"through snell").await;
+        echo_through(&mut tunnel, &vec![0x5a; 100_000]).await;
+        let seen = fake.requests();
+        let first = seen.first().expect("the server never saw a request");
+        assert_eq!(
+            (first.command, first.host.as_str(), first.port),
+            (command, "target.test", 7),
+            "{params}: the server resolves the name"
+        );
+        assert!(h.dns.queries().is_empty(), "rurge never looked the name up");
+        drop(tunnel);
+        let record = the_records(&h, 1).await[0].clone();
+        assert_eq!(record.policy, ["S"], "{params}");
+        assert!(record.error.is_none(), "{params}: {:?}", record.error);
+    }
+}
+
+/// Version 2 always reuses: two sessions one after the other share one
+/// Snell connection, whatever `reuse` says. Versions 1 and 3 never do.
+#[tokio::test]
+async fn v2_shares_one_connection_and_v1_and_v3_never_do() {
+    let echo = rurge_proto::testing::echo_server().await;
+    for (version, params, connections) in [
+        (2, "psk=s3same, version=2", 1),
+        (2, "psk=s3same, version=2, reuse=false", 1),
+        (1, "psk=s3same, reuse=true", 2),
+        (3, "psk=s3same, version=3", 2),
+    ] {
+        let fake = FakeSnell::spawn(SnellScript {
+            version,
+            connect_to: Some(echo),
+            ..SnellScript::new("s3same")
+        })
+        .await;
+        let h = through(&snell_line(&fake, params)).await;
+        for (n, payload) in [(1, &b"first"[..]), (2, b"second")] {
+            let record = one_session(&h, n, payload).await;
+            assert_eq!(record.status, RecordStatus::Completed, "{record:?}");
+            if connections == 1 {
+                // the connection is back in the pool before the next dial
+                wait_until("the connection to be pooled", || idle_now(&h) == Some(1)).await;
+            }
+        }
+        assert_eq!(fake.connections(), connections, "{params}");
+        let places: Vec<(usize, usize)> = fake
+            .requests()
+            .iter()
+            .map(|r| (r.connection, r.tunnel))
+            .collect();
+        let expected: &[(usize, usize)] = if connections == 1 {
+            &[(0, 0), (0, 1)]
+        } else {
+            &[(0, 0), (1, 0)]
+        };
+        assert_eq!(places, expected, "{params}");
+    }
+}
+
+/// A line that never said its version used to be refused; now it dials
+/// version 1. Against a server that speaks version 4, or with another PSK,
+/// the session fails within the bound and its record says what may be
+/// wrong, without the PSK.
+#[tokio::test]
+async fn a_line_without_version_against_another_server_fails_soon_and_says_why() {
+    for (version, psk) in [(4, "s3same"), (5, "s3same"), (1, "0therPsk")] {
+        let fake = FakeSnell::spawn(SnellScript {
+            version,
+            ..SnellScript::new(psk)
+        })
+        .await;
+        let h = through(&snell_line(&fake, "psk=s3same")).await;
+        let record = a_failed_session(&h).await;
+        assert_eq!(
+            record.error.as_deref(),
+            Some(
+                "snell: the server closed the connection without answering (wrong psk or version?)"
+            ),
+            "a v{version} server with `{psk}`"
+        );
+        assert!(!format!("{record:?}").contains("s3same"));
+        assert_eq!((fake.rejected(), fake.requests().len()), (1, 0));
+    }
+}
+
+/// Version 6 is parsed and rejects at run time, and the record names the
+/// version (phase 2 M8 design 4.4).
+#[tokio::test]
+async fn snell_v6_rejects_and_says_which() {
     let h = harness(Profile {
-        proxies: "V1 = snell, 127.0.0.1, 9, psk=s3same, version=1",
-        rules: "DOMAIN,target.test,V1",
+        proxies: "V6 = snell, 127.0.0.1, 9, psk=s3same, version=6",
+        rules: "DOMAIN,target.test,V6",
         ..Profile::default()
     })
     .await;
@@ -220,7 +327,7 @@ async fn snell_v1_rejects_and_says_which() {
     assert_eq!(record.status, RecordStatus::Rejected("REJECT".into()));
     assert_eq!(
         record.error.as_deref(),
-        Some("policy protocol not implemented: snell v1")
+        Some("policy protocol not implemented: snell v6")
     );
 }
 
@@ -277,6 +384,66 @@ async fn udp_goes_through_snell() {
     let commands: Vec<u8> = fake.requests().iter().map(|r| r.command).collect();
     assert_eq!(commands, [6], "one UDP session");
     assert_eq!(fake.connections(), 1);
+}
+
+/// Version 3 carries UDP as 4 and 5 do: datagrams to two echoes over one
+/// association leave through `S`, over one Snell connection.
+#[tokio::test]
+async fn udp_goes_through_snell_v3() {
+    let fake = FakeSnell::spawn(SnellScript {
+        version: 3,
+        ..SnellScript::new("s3same")
+    })
+    .await;
+    let h = through(&snell_line(&fake, "psk=s3same, version=3")).await;
+    let ((one, _), (two, _)) = (udp_echo().await, udp_echo().await);
+    let association = udp_associate(h.socks()).await;
+    for (echo, payload) in [(one, &b"one"[..]), (two, b"two"), (one, b"again")] {
+        association.send("127.0.0.1", echo.port(), payload).await;
+        assert_eq!(association.recv().await, (echo, payload.to_vec()));
+    }
+    drop(association);
+    wait_until("both flows to finish", || udp_records(&h).len() == 2).await;
+    for r in udp_records(&h) {
+        assert_eq!(r.policy, ["S"], "{r:?}");
+        assert_eq!(r.status, RecordStatus::Completed, "{r:?}");
+    }
+    assert_eq!(
+        fake.datagrams(),
+        [one.to_string(), two.to_string(), one.to_string()]
+    );
+    let commands: Vec<u8> = fake.requests().iter().map(|r| r.command).collect();
+    assert_eq!(commands, [6], "one UDP session");
+    assert_eq!(fake.connections(), 1);
+}
+
+/// Versions 1 and 2 carry no UDP: `udp-policy-not-supported-behaviour`
+/// (REJECT by default) decides, and nothing reaches the server.
+#[tokio::test]
+async fn snell_v1_and_v2_carry_no_udp() {
+    for (version, params) in [(1, "psk=s3same"), (2, "psk=s3same, version=2")] {
+        let fake = FakeSnell::spawn(SnellScript {
+            version,
+            ..SnellScript::new("s3same")
+        })
+        .await;
+        let h = through(&snell_line(&fake, params)).await;
+        let association = udp_associate(h.socks()).await;
+        association.send("127.0.0.1", 53, b"q").await;
+        assert!(association.quiet_for(Duration::from_millis(300)).await);
+        wait_until("the flow to finish", || !udp_records(&h).is_empty()).await;
+        let records = udp_records(&h);
+        assert_eq!(
+            records[0].status,
+            RecordStatus::Rejected("REJECT".into()),
+            "{params}"
+        );
+        assert_eq!(
+            records[0].error.as_deref(),
+            Some("policy does not support UDP")
+        );
+        assert_eq!(fake.connections(), 0, "{params}");
+    }
 }
 
 /// `udp-port` serves v5's QUIC proxy mode, which rurge does not implement:
