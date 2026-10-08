@@ -570,8 +570,8 @@ mod tests {
     use super::*;
     use crate::masque::MasqueOutbound;
     use crate::masque::tests::{
-        BOUND, H3_REQUEST_REJECTED, closed_by_the_client, outbound, round_trip, spec, target,
-        tunnel, users,
+        BOUND, H3_REQUEST_REJECTED, closed_by_the_client, outbound, round_trip, round_trip_of,
+        spec, target, tunnel, users,
     };
     use crate::test_log::Log;
     use crate::testing::{
@@ -581,7 +581,7 @@ mod tests {
     use rurge_config::HostName;
     use rurge_config::spec::Tristate;
     use rurge_net::connector::{
-        BoxedDatagram, BoxedPacketSocket, BoxedStream, Connector, DirectConnector, Route,
+        BoxedDatagram, BoxedPacketSocket, BoxedStream, Connector, Datagram, DirectConnector, Route,
         SystemResolve,
     };
     use rurge_proto::http::basic_authorization;
@@ -590,6 +590,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicUsize;
+    use std::task::{Context, Poll, ready};
+    use tokio::io::ReadBuf;
     use tokio::sync::Barrier;
     use tokio::task::JoinSet;
     use tokio::time::timeout;
@@ -1390,8 +1392,9 @@ mod tests {
         }
     }
 
-    /// The outbound to `fake`, its connections dialled through `counted`.
-    fn outbound_via(fake: &FakeH3Proxy, counted: Arc<Counted>) -> MasqueOutbound {
+    /// The outbound to `fake`, its connections dialled through `connector`:
+    /// over its UDP flows, as over an `underlying-proxy`.
+    fn outbound_via(fake: &FakeH3Proxy, connector: Arc<dyn Connector>) -> MasqueOutbound {
         let port = fake.addr().port();
         MasqueOutbound::new(
             "M",
@@ -1400,9 +1403,19 @@ mod tests {
             Tristate::Auto,
             &[],
             fake.roots(),
-            counted,
+            connector,
         )
         .unwrap()
+    }
+
+    /// The connection `out`'s requests go to now.
+    async fn connection(out: &MasqueOutbound) -> Connection {
+        timeout(BOUND, out.session.lease(&ConnectOpts::default()))
+            .await
+            .expect("a connection within the bound")
+            .unwrap()
+            .connection()
+            .clone()
     }
 
     /// Where the policy leads can cost a group's resolution: a carrier asks
@@ -1456,6 +1469,179 @@ mod tests {
         }
         until_answered(carrier.as_ref(), &to, b"moved").await;
         assert_eq!(fake.connections(), 2);
+    }
+
+    /// Over a carrier (`underlying-proxy`) quinn probes no path: the
+    /// connection starts from packets of 1350 bytes, where it stayed at
+    /// 1200, and a datagram of it holds a full-sized packet of another QUIC
+    /// connection — an Initial has 1200 bytes at least, a browser's packets
+    /// 1250. On a socket of its own it starts from 1200 as ever, and probes.
+    #[tokio::test]
+    async fn over_a_carrier_a_datagram_holds_another_connections_packet() {
+        let echo = udp_echo_server().await;
+        let fake = FakeH3Proxy::spawn(H3ProxyScript::default());
+        let out = outbound_via(&fake, Arc::new(Counted::new()));
+        let carrier = udp_carrier(&out).await;
+        let to = target(echo);
+        udp_round_trip(carrier.as_ref(), &to, b"first").await;
+        let quic = connection(&out).await;
+        assert_eq!(quic.stats().path.current_mtu, 1350);
+        let room = quic.max_datagram_size().expect("datagrams");
+        assert!(room >= 1280, "{room}");
+        // sent again until the answer fits the server's own packets, which
+        // grow as it probes its path
+        until_answered(carrier.as_ref(), &to, &[0x51; 1250]).await;
+        assert_eq!(quic.stats().path.sent_plpmtud_probes, 0);
+        let carried = out.session.configuration().await;
+        for expected in [" initial_mtu: 1350,", " min_mtu: 1200,"] {
+            assert!(carried.contains(expected), "{expected} in {carried}");
+        }
+        let own = outbound(&fake, "").session.configuration().await;
+        for expected in [" initial_mtu: 1200,", " min_mtu: 1200,"] {
+            assert!(own.contains(expected), "{expected} in {own}");
+        }
+    }
+
+    /// Dials directly, as a chain over a path that carries no datagram
+    /// longer than `limit` bytes: a longer one is lost, either way, and
+    /// nobody is told.
+    struct Narrow {
+        inner: DirectConnector,
+        limit: usize,
+    }
+
+    /// One of `Narrow`'s UDP flows.
+    struct NarrowFlow {
+        flow: BoxedDatagram,
+        limit: usize,
+    }
+
+    impl Datagram for NarrowFlow {
+        fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            if buf.len() > self.limit {
+                return Poll::Ready(Ok(buf.len()));
+            }
+            self.flow.poll_send(cx, buf)
+        }
+
+        fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flow.poll_send_ready(cx)
+        }
+
+        fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            loop {
+                ready!(self.flow.poll_recv(cx, buf))?;
+                if buf.filled().len() <= self.limit {
+                    return Poll::Ready(Ok(()));
+                }
+                buf.clear();
+            }
+        }
+    }
+
+    impl Connector for Narrow {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            self.inner.connect(target, opts)
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            Box::pin(async move {
+                let flow = self.inner.connect_udp(target, opts).await?;
+                let limit = self.limit;
+                Ok(Box::new(NarrowFlow { flow, limit }) as BoxedDatagram)
+            })
+        }
+    }
+
+    /// The outbound to `fake` over a path that carries datagrams of 1250
+    /// bytes and no longer: less than the connection starts from.
+    fn outbound_over_a_narrow_path(fake: &FakeH3Proxy) -> MasqueOutbound {
+        let narrow = Narrow {
+            inner: DirectConnector::new(Arc::new(SystemResolve)),
+            limit: 1250,
+        };
+        outbound_via(fake, Arc::new(narrow))
+    }
+
+    /// A path under the carrier that cannot carry the packets the
+    /// connection starts from loses every one of them, and no other. quinn
+    /// finds that out by itself (its black-hole detection) and comes down
+    /// to the 1200 bytes every path carries, for the rest of the
+    /// connection: a packet too long for a datagram is refused from then
+    /// on — where it was lost on the way —, and what fits goes there and
+    /// back.
+    #[tokio::test]
+    async fn a_path_that_cannot_carry_the_first_size_brings_the_connection_down_to_1200_bytes() {
+        let echo = udp_echo_server().await;
+        let fake = FakeH3Proxy::spawn(H3ProxyScript::default());
+        let out = outbound_over_a_narrow_path(&fake);
+        let carrier = carrier(&out, IDLE);
+        let to = target(echo);
+        // what fits the path goes there and back from the start
+        udp_round_trip(&carrier, &to, b"first").await;
+        let quic = connection(&out).await;
+        let room = quic.max_datagram_size().expect("datagrams");
+        assert!(room >= 1280, "{room}");
+        // each long packet is lost on the way, which quinn learns when a
+        // probe of its own is answered and the packet was not
+        let long = vec![0x4c; 1280];
+        let deadline = Instant::now() + BOUND;
+        while quic.max_datagram_size().is_some_and(|room| room >= 1200) {
+            let path = quic.stats().path;
+            assert!(
+                Instant::now() < deadline,
+                "still packets of {} bytes, {} found lost",
+                path.current_mtu,
+                path.lost_packets
+            );
+            timeout(BOUND, carrier.send_to(&long, &to))
+                .await
+                .expect("sent within the bound")
+                .unwrap();
+            while quic.stats().path.lost_packets == path.lost_packets && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        let path = quic.stats().path;
+        assert_eq!((path.current_mtu, path.black_holes_detected), (1200, 1));
+        udp_round_trip(&carrier, &to, &[0x73; 1000]).await;
+        let room = carrier.room(&to).expect("the target's stream");
+        assert!(room < 1200, "{room}");
+        let err = timeout(BOUND, carrier.send_to(&long, &to))
+            .await
+            .expect("an outcome within the bound")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            format!("masque: a datagram longer than {room} bytes")
+        );
+        // none of the long ones arrived
+        let arrived: Vec<usize> = fake.datagrams().iter().map(|d| d.len).collect();
+        assert_eq!(arrived.iter().max(), Some(&1000), "{arrived:?}");
+    }
+
+    /// A tunnel on such a path is held up for a moment, not for good: the
+    /// full packets its upload begins with are lost, quinn comes down to
+    /// 1200 bytes, sends what they carried again, and the upload goes
+    /// through.
+    #[tokio::test]
+    async fn a_tunnel_gets_through_a_path_that_cannot_carry_the_first_size() {
+        let echo = echo_server().await;
+        let fake = FakeH3Proxy::spawn(H3ProxyScript::default());
+        let out = outbound_over_a_narrow_path(&fake);
+        let mut stream = tunnel(&out, &target(echo)).await;
+        round_trip_of(&mut stream, 256 << 10).await;
+        let path = connection(&out).await.stats().path;
+        assert_eq!((path.current_mtu, path.black_holes_detected), (1200, 1));
     }
 
     /// A carrier that does not read loses what its inbox cannot hold, and

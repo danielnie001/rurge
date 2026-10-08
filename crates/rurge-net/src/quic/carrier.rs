@@ -109,7 +109,9 @@ impl AsyncUdpSocket for Carried {
     }
 
     /// Datagrams through a proxy may be fragmented on the way: no path MTU
-    /// discovery, quinn stays at the 1200 bytes every path carries.
+    /// discovery, quinn stays at the size the connection starts from — the
+    /// 1200 bytes every path carries, unless its transport names another
+    /// (`Transport::carried_initial_mtu`).
     fn may_fragment(&self) -> bool {
         true
     }

@@ -450,9 +450,9 @@ mod tests {
     /// A connection's receive window has room for the window of every
     /// tunnel it may carry (`max-streams`): tunnels nobody reads — the
     /// server sends into each all its window takes — leave the others
-    /// theirs. With the window every QUIC policy has, three of them would
-    /// take all of it: no tunnel of the connection would hear from the
-    /// server again, not even that it was made.
+    /// theirs. In 20 MiB, the least a connection receives into, three of
+    /// them would take all of it: no tunnel of the connection would hear
+    /// from the server again, not even that it was made.
     #[tokio::test]
     async fn tunnels_nobody_reads_leave_the_others_their_window() {
         let (flood, echo) = (flood_server().await, echo_server().await);

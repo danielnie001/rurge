@@ -9,6 +9,10 @@
 //!   still a draft, and masque-server answers it 404.
 //! - UDP goes as CONNECT-UDP (RFC 9298), a stream of its own for each
 //!   target, the packets in HTTP/3 datagrams (`udp`).
+//! - A datagram has the room of the connection's packets, less forty bytes
+//!   or more. On sockets of its own the connection starts from packets of
+//!   1200 bytes and probes its path for more; over an `underlying-proxy`,
+//!   where nothing is probed, it starts from `CARRIED_MTU`.
 //! - With `username` and `password`, every request carries them as
 //!   `proxy-authorization: Basic …`, which QPACK never indexes. The manual
 //!   names no field: this is the one a proxy reads them from (RFC 9110
@@ -26,12 +30,24 @@ use rurge_config::KeystoreItem;
 use rurge_config::spec::{MasqueSpec, Tristate};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target};
+use rurge_net::quic::Transport;
 use rurge_proto::build::tls_name;
 use rurge_proto::http::{basic_authorization, wire_host};
 use rurge_proto::{BuildError, Outbound, OutboundError, UdpSupport};
 use rustls::RootCertStore;
 use std::sync::Arc;
 use udp::MasqueUdp;
+
+/// The packet size a connection over a carrier starts from (`Transport::
+/// carried_initial_mtu`). quinn probes no such path and would stay at 1200
+/// bytes, where no datagram holds a full-sized packet of another QUIC
+/// connection — an Initial alone has 1200 bytes —: no QUIC went through
+/// the policy. At 1350 bytes a datagram holds a packet of some 1300, a
+/// browser's 1250 too, and the carrier's own headers are left some 120
+/// bytes of what a path of 1500 carries. A path that carries less brings
+/// the connection down to 1200 again (quinn's black-hole detection), at the
+/// price of the packets lost until then.
+const CARRIED_MTU: u16 = 1350;
 
 /// No `Debug`: it holds the credentials.
 pub struct MasqueOutbound {
@@ -64,7 +80,11 @@ impl MasqueOutbound {
         // the dry build both prefix it
         let dialer = Dialer::new(
             connector, server, &spec.tls, &spec.quic, ecn, keystore, roots,
-        )?;
+        )?
+        .with_transport(&Transport {
+            carried_initial_mtu: Some(CARRIED_MTU),
+            ..Transport::STANDARD
+        });
         // an address, or a name TLS took: letters, digits, `-`, `_` and dots
         let host = wire_host(&named).expect("a name TLS takes goes on the wire");
         let authorization = spec.credentials.as_ref().map(|credentials| {
@@ -264,6 +284,25 @@ mod tests {
             .expect("the echo arrives")
             .unwrap();
         assert_eq!(back, payload);
+    }
+
+    /// As `round_trip`, with `len` bytes of a pattern: more than a failure
+    /// should print.
+    pub(super) async fn round_trip_of(stream: &mut BoxedStream, len: usize) {
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        timeout(BOUND, async {
+            stream.write_all(&payload).await?;
+            stream.flush().await
+        })
+        .await
+        .expect("written within the bound")
+        .unwrap();
+        let mut back = vec![0u8; len];
+        timeout(BOUND, stream.read_exact(&mut back))
+            .await
+            .expect("the echo arrives")
+            .unwrap();
+        assert!(back == payload, "the echo differs");
     }
 
     /// How a tunnel ends, read out: with an error.
@@ -832,6 +871,64 @@ mod tests {
         assert_eq!(fake.connections(), 1);
         // the one that waited never went out
         assert_eq!(fake.requests().len(), 2);
+    }
+
+    /// A loopback TCP server that sends `len` bytes to whoever connects,
+    /// reads nothing, and keeps the connection until the other end goes.
+    async fn burst_server(len: usize) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if stream.write_all(&vec![0x5a; len]).await.is_ok() {
+                        let _ = stream.read(&mut [0u8; 1]).await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// The connection's receive window has room for the windows of 32
+    /// tunnels: four that nobody reads — the server sends into each more
+    /// than its window takes, as into a download that was paused — leave
+    /// the others theirs. In a window of 20 MiB they took all of it: no
+    /// other tunnel of the policy heard from the server again, not even
+    /// that it was made.
+    #[tokio::test]
+    async fn tunnels_nobody_reads_leave_the_others_their_window() {
+        const UNREAD: u64 = 4;
+        let (burst, echo) = (burst_server(9 << 20).await, echo_server().await);
+        let fake = FakeH3Proxy::spawn(H3ProxyScript::default());
+        let out = outbound(&fake, "");
+        let mut unread = Vec::new();
+        for _ in 0..UNREAD {
+            unread.push(tunnel(&out, &target(burst)).await);
+        }
+        // the connection they are on
+        let quic = timeout(BOUND, out.session.lease(&ConnectOpts::default()))
+            .await
+            .unwrap()
+            .unwrap()
+            .connection()
+            .clone();
+        // megabytes later, the server has more for each tunnel than its
+        // window takes — or, were the connection's too small for the four,
+        // more than that takes
+        let deadline = Instant::now() + 6 * BOUND;
+        loop {
+            let said = quic.stats().frame_rx;
+            if said.stream_data_blocked >= UNREAD || said.data_blocked >= 1 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the windows never filled");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut fifth = tunnel(&out, &target(echo)).await;
+        round_trip_of(&mut fifth, 1 << 20).await;
+        assert_eq!(fake.connections(), 1);
+        drop(unread);
     }
 
     /// quiche greases (masque-server, the TrustTunnel endpoint): a setting

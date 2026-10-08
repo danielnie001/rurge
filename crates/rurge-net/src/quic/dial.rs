@@ -28,34 +28,62 @@ pub struct Transport {
     pub stream_window: u32,
     /// What the connection's streams together may receive.
     pub connection_window: u32,
+    /// The packet size — the UDP payload — a connection over a carrier
+    /// (`underlying-proxy`) starts from; `None` is the 1200 bytes every
+    /// path carries. quinn probes no path whose datagrams may be fragmented
+    /// on the way: such a connection stays at the size it starts from,
+    /// unless its packets of that size turn out to be lost, which brings it
+    /// down to 1200 for good (quinn's black-hole detection). A connection
+    /// on a socket of its own starts from 1200 whatever this says, and
+    /// finds what its path carries by probing.
+    pub carried_initial_mtu: Option<u16>,
 }
 
 impl Transport {
-    /// Idle timeout 30 seconds, keep-alive every 10; receive windows of
-    /// 8 MiB per stream and 20 MiB per connection, as the Hysteria
-    /// reference client's.
+    /// Idle timeout 30 seconds, keep-alive every 10. A stream receives into
+    /// 8 MiB, as the Hysteria reference client's; the connection into 32
+    /// times that, 256 MiB. Credit for the connection comes back only as
+    /// data is read: the streams nobody reads — a paused download is one —
+    /// keep what they were sent, a window each at most, and in that
+    /// client's 20 MiB three of them left the other streams nothing. The
+    /// window is a bound, not memory set aside: a connection holds what its
+    /// unread streams were sent. With 32 streams or more stalled at once,
+    /// each with its window full, the others still stall with them.
     pub const STANDARD: Transport = Transport {
         idle_timeout: Duration::from_secs(30),
         keep_alive: Some(Duration::from_secs(10)),
         stream_window: 8 << 20,
-        connection_window: 20 << 20,
+        connection_window: 32 * (8 << 20),
+        carried_initial_mtu: None,
     };
 
     /// A DNS server's connection (DoQ, DoH3): as `STANDARD`, but nothing
     /// keeps it alive — unused, it idles out at the shorter of both ends'
-    /// idle timeouts, and the next query dials again.
+    /// idle timeouts, and the next query dials again —, and it receives
+    /// into 20 MiB: an answer is short and read as it comes, none of its
+    /// streams holds the window.
     pub const DNS: Transport = Transport {
         keep_alive: None,
+        connection_window: 20 << 20,
         ..Transport::STANDARD
     };
 
     /// `config` with these parameters in place of the ones it was made
-    /// with (`client_config`).
+    /// with (`client_config`), as a connection on a socket of its own takes
+    /// them.
     pub fn apply(&self, config: &mut ClientConfig) {
-        config.transport_config(Arc::new(self.config()));
+        config.transport_config(Arc::new(self.config(false)));
     }
 
-    fn config(&self) -> TransportConfig {
+    /// As `apply`, as a connection over a carrier takes them
+    /// (`Path::is_carried`): it starts from `carried_initial_mtu`.
+    pub fn apply_carried(&self, config: &mut ClientConfig) {
+        config.transport_config(Arc::new(self.config(true)));
+    }
+
+    /// quinn's configuration of a connection over a carrier (`carried`), or
+    /// of one on a socket of its own.
+    fn config(&self, carried: bool) -> TransportConfig {
         let mut config = TransportConfig::default();
         config
             // a timeout too long to say is none
@@ -70,13 +98,20 @@ impl Transport {
             // quinn's own default, and its only congestion control not
             // marked experimental (M7-D10)
             .congestion_controller_factory(Arc::new(CubicConfig::default()));
+        // `min_mtu` stays quinn's 1200 bytes: what the connection comes
+        // down to on a path that does not carry the size it started from
+        if let Some(mtu) = self.carried_initial_mtu.filter(|_| carried) {
+            config.initial_mtu(mtu);
+        }
         config
     }
 }
 
 /// The client configuration of a QUIC policy: `tls` — which must allow TLS
 /// 1.3 (quinn panics on a handshake without it) and offers the protocol's
-/// ALPN — with `transport`. Built once per outbound; never 0-RTT.
+/// ALPN — with `transport`, as a connection on a socket of its own takes it
+/// (a copy with `Transport::apply_carried` is what one over a carrier
+/// takes). Built once per outbound; never 0-RTT.
 pub fn client_config(
     tls: Arc<rustls::ClientConfig>,
     transport: &Transport,
@@ -84,7 +119,7 @@ pub fn client_config(
     let crypto = QuicClientConfig::try_from(tls)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("tls: {e}")))?;
     let mut config = ClientConfig::new(Arc::new(crypto));
-    config.transport_config(Arc::new(transport.config()));
+    transport.apply(&mut config);
     Ok(config)
 }
 
@@ -244,13 +279,13 @@ mod tests {
     /// datagram buffers, path MTU discovery from 1200 bytes).
     #[test]
     fn the_transport_parameters_reach_quinn() {
-        let config = format!("{:?}", Transport::STANDARD.config());
+        let config = format!("{:?}", Transport::STANDARD.config(false));
         for expected in [
             "max_concurrent_bidi_streams: 0,",
             "max_concurrent_uni_streams: 100,",
             "max_idle_timeout: Some(30000),",
             "stream_receive_window: 8388608,",
-            "receive_window: 20971520,",
+            "receive_window: 268435456,",
             "keep_alive_interval: Some(10s),",
             "initial_mtu: 1200,",
             "upper_bound: 1452,",
@@ -267,11 +302,11 @@ mod tests {
     fn a_transport_replaces_the_one_a_configuration_was_made_with() {
         let tls = crate::quic::testing::TestCert::new().client_tls(&["h3"]);
         let mut config = client_config(tls, &Transport::STANDARD).unwrap();
-        let wider = Transport {
+        let narrower = Transport {
             connection_window: 32 << 20,
             ..Transport::STANDARD
         };
-        wider.apply(&mut config);
+        narrower.apply(&mut config);
         let shown = format!("{config:?}");
         for expected in [
             "receive_window: 33554432,",
@@ -283,23 +318,57 @@ mod tests {
     }
 
     /// A DNS server's connection is the standard one, but nothing keeps it
-    /// alive.
+    /// alive, and it receives into 20 MiB.
     #[test]
     fn a_dns_connection_is_not_kept_alive() {
         assert_eq!(
             Transport::DNS,
             Transport {
                 keep_alive: None,
+                connection_window: 20 << 20,
                 ..Transport::STANDARD
             }
         );
-        let config = format!("{:?}", Transport::DNS.config());
+        let config = format!("{:?}", Transport::DNS.config(false));
         for expected in [
             "keep_alive_interval: None,",
             "max_idle_timeout: Some(30000),",
             "max_concurrent_bidi_streams: 0,",
+            "stream_receive_window: 8388608,",
+            "receive_window: 20971520,",
         ] {
             assert!(config.contains(expected), "{expected} in {config}");
+        }
+    }
+
+    /// The size a connection over a carrier starts from reaches quinn for
+    /// such a connection alone, and its floor stays at 1200 bytes; on a
+    /// socket of its own the connection starts from 1200 as ever. A
+    /// transport that names no size starts from 1200 over a carrier too.
+    #[test]
+    fn only_a_connection_over_a_carrier_starts_from_the_carried_size() {
+        let transport = Transport {
+            carried_initial_mtu: Some(1350),
+            ..Transport::STANDARD
+        };
+        let tls = crate::quic::testing::TestCert::new().client_tls(&["h3"]);
+        let own = client_config(tls, &transport).unwrap();
+        let mut carried = own.clone();
+        transport.apply_carried(&mut carried);
+        let (own, carried) = (format!("{own:?}"), format!("{carried:?}"));
+        for expected in ["initial_mtu: 1200,", "min_mtu: 1200,"] {
+            assert!(own.contains(expected), "{expected} in {own}");
+        }
+        for expected in [
+            "initial_mtu: 1350,",
+            "min_mtu: 1200,",
+            "receive_window: 268435456,",
+        ] {
+            assert!(carried.contains(expected), "{expected} in {carried}");
+        }
+        for unnamed in [Transport::STANDARD, Transport::DNS] {
+            let carried = format!("{:?}", unnamed.config(true));
+            assert!(carried.contains("initial_mtu: 1200,"), "{carried}");
         }
     }
 

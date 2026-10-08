@@ -104,6 +104,14 @@ impl Path {
             Tristate::Auto | Tristate::On => path,
         })
     }
+
+    /// Whether the path goes over a carrier — the UDP flow of an
+    /// `underlying-proxy` — rather than sockets of the connection's own: a
+    /// connection on it takes its transport as `Transport::apply_carried`
+    /// sets it.
+    pub fn is_carried(&self) -> bool {
+        self.carrier.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -397,6 +405,25 @@ mod tests {
         let connection = dial(path, &cert, &Transport::STANDARD).await.unwrap();
         echoes(&connection).await;
         assert_eq!(connection.stats().path.sent_plpmtud_probes, 0);
+    }
+
+    /// A path says whether it goes over a carrier, whatever lies over it
+    /// (`ecn=off`): a connection takes its transport accordingly
+    /// (`Transport::apply_carried`). Nothing is sent here.
+    #[tokio::test]
+    async fn a_path_says_whether_it_goes_over_a_carrier() {
+        let server = at("127.0.0.1", 443);
+        let hopping = PortHopping {
+            ports: vec![5000..=6000],
+            interval: Duration::from_secs(30),
+        };
+        for ecn in [Tristate::Auto, Tristate::Off] {
+            assert!(!open(&direct(), &server, None, ecn).await.is_carried());
+            let hops = open(&direct(), &server, Some(&hopping), ecn).await;
+            assert!(!hops.is_carried());
+            let carried = open(&Chained::default(), &server, None, ecn).await;
+            assert!(carried.is_carried());
+        }
     }
 
     /// A carrier that ends takes the connection with it at once, not after
@@ -728,7 +755,8 @@ mod tests {
                 idle_timeout: Duration::from_secs(30),
                 keep_alive: Some(Duration::from_secs(10)),
                 stream_window: 8 * 1024 * 1024,
-                connection_window: 20 * 1024 * 1024,
+                connection_window: 256 * 1024 * 1024,
+                carried_initial_mtu: None,
             }
         );
     }

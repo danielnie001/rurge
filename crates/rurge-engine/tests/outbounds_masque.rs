@@ -294,6 +294,52 @@ async fn masque_goes_over_an_underlying_socks5_proxy() {
     assert_eq!(fake.connections(), 1);
 }
 
+/// Over an `underlying-proxy` no path MTU is probed, and the connection
+/// starts from packets of 1350 bytes: a UDP packet of 1250 bytes — what a
+/// browser's QUIC sends — fits a datagram of it and goes there and back,
+/// where it was dropped as too long for one.
+#[tokio::test]
+async fn over_an_underlying_proxy_a_packet_of_1250_bytes_goes_through() {
+    let udp_echo = udp_echo_server().await;
+    let fake = FakeH3Proxy::spawn(script());
+    let entry = FakeSocks5::spawn(Socks5Script::default()).await;
+    let proxies = format!(
+        "Entry = socks5, 127.0.0.1, {}, udp-relay=true\n{}",
+        entry.addr().port(),
+        line(&fake, &format!("{LOGIN}, underlying-proxy=Entry"))
+    );
+    let h = through(&fake, &proxies).await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("127.0.0.1", udp_echo.port(), b"first")
+        .await;
+    assert_eq!(association.recv().await, (udp_echo, b"first".to_vec()));
+    let packet = vec![0x51; 1250];
+    // sent again until the answer fits the server's own packets, which grow
+    // as it probes its path
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let answer = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no answer to a packet of 1250 bytes"
+        );
+        association
+            .send("127.0.0.1", udp_echo.port(), &packet)
+            .await;
+        let window = Duration::from_millis(500);
+        if let Some(answer) = association.recv_within(window).await {
+            break answer;
+        }
+    };
+    assert!(answer == (udp_echo, packet), "the answer differs");
+    assert!(fake.datagrams().iter().any(|d| d.len == 1250));
+    drop(association);
+    wait_until("the flow to finish", || !udp_records(&h).is_empty()).await;
+    let record = &udp_records(&h)[0];
+    assert_eq!(record.status, RecordStatus::Completed, "{record:?}");
+    assert_eq!(record.error, None, "{record:?}");
+}
+
 /// A policy test fetches the policy's `test-url` through its connection:
 /// one tunnel to the loopback origin, two HEADs on it.
 #[tokio::test]

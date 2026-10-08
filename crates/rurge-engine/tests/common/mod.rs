@@ -395,12 +395,18 @@ impl UdpAssociation {
 
     /// The next datagram: where it says it came from (`ip:port`) and its payload.
     pub async fn recv(&self) -> (SocketAddr, Vec<u8>) {
+        self.recv_within(Duration::from_secs(5))
+            .await
+            .expect("a datagram comes back")
+    }
+
+    /// As `recv`; `None` when no datagram comes within `window`.
+    pub async fn recv_within(&self, window: Duration) -> Option<(SocketAddr, Vec<u8>)> {
         let mut buf = vec![0u8; 65536];
-        let (n, from) =
-            tokio::time::timeout(Duration::from_secs(5), self.socket.recv_from(&mut buf))
-                .await
-                .expect("a datagram comes back")
-                .unwrap();
+        let (n, from) = tokio::time::timeout(window, self.socket.recv_from(&mut buf))
+            .await
+            .ok()?
+            .unwrap();
         assert_eq!(from, self.relay);
         assert_eq!(&buf[..3], [0, 0, 0]);
         let (ip, rest): (std::net::IpAddr, usize) = match buf[3] {
@@ -409,7 +415,7 @@ impl UdpAssociation {
             other => panic!("address type {other}"),
         };
         let port = u16::from_be_bytes([buf[rest], buf[rest + 1]]);
-        (SocketAddr::new(ip, port), buf[rest + 2..n].to_vec())
+        Some((SocketAddr::new(ip, port), buf[rest + 2..n].to_vec()))
     }
 
     /// Whether nothing comes back within `window` (only to observe that
