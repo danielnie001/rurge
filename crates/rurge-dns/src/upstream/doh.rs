@@ -1,13 +1,15 @@
 //! DNS over HTTPS (design §7.2): RFC 8484 POST bodies of type
 //! `application/dns-message` through the shared HTTP client (HTTP/2 when the
 //! server negotiates it). The message ID is sent as 0 (RFC 8484 §4.1) and the
-//! caller's ID is restored on the reply.
+//! caller's ID is restored on the reply, whose records' TTLs are lowered by
+//! the age it comes with (RFC 8484 §5.1).
 
 use super::{Upstream, UpstreamError};
+use crate::message::lower_ttls;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
-use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use http::header::{ACCEPT, AGE, AUTHORIZATION, CONTENT_TYPE};
 use http::{HeaderMap, HeaderValue, Request, StatusCode};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use percent_encoding::percent_decode_str;
@@ -45,6 +47,25 @@ pub(super) fn check_head(status: StatusCode, headers: &HeaderMap) -> Result<(), 
     Ok(())
 }
 
+/// How long ago the answer was made, in seconds, by its `Age` (RFC 9111
+/// 5.1), which the TTLs of its records do not count (RFC 8484 5.1). 0 — the
+/// answer is taken as it is — without the field, with one that is no
+/// number, or with more than one.
+pub(super) fn age(headers: &HeaderMap) -> u32 {
+    let mut fields = headers.get_all(AGE).iter();
+    let (Some(field), None) = (fields.next(), fields.next()) else {
+        return 0;
+    };
+    match field.to_str() {
+        // digits alone: `u32::from_str` would take a sign too
+        Ok(digits) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
+            // more seconds than a TTL counts: older than any record lasts
+            digits.parse().unwrap_or(u32::MAX)
+        }
+        _ => 0,
+    }
+}
+
 /// A body of more than `MAX_RESPONSE` bytes.
 pub(super) fn too_large() -> UpstreamError {
     UpstreamError::BadResponse(format!("response larger than {MAX_RESPONSE} bytes"))
@@ -74,8 +95,11 @@ pub struct DohUpstream {
 }
 
 impl DohUpstream {
-    pub fn new(mut url: Url, http: Arc<HttpClient>) -> DohUpstream {
-        let name = super::doh_name(&url);
+    /// The server of `url` (`UpstreamSpec::Https`'s), where its requests
+    /// go; `pathless`: the URL was written without its path, which the
+    /// upstream's name leaves out.
+    pub fn new(mut url: Url, pathless: bool, http: Arc<HttpClient>) -> DohUpstream {
+        let name = super::doh_name(&url, pathless);
         let authorization = basic_authorization(&url);
         // an https URL has the authority these belong to: neither fails
         let _ = url.set_username("");
@@ -140,6 +164,7 @@ impl Upstream for DohUpstream {
                 other => UpstreamError::Http(other.to_string()),
             })?;
             check_head(resp.status(), resp.headers())?;
+            let age = age(resp.headers());
             let collected = match tokio::time::timeout_at(
                 deadline,
                 Limited::new(resp.into_body(), MAX_RESPONSE).collect(),
@@ -158,6 +183,7 @@ impl Upstream for DohUpstream {
             };
             let mut bytes = collected.to_bytes().to_vec();
             check_body(&bytes)?;
+            lower_ttls(&mut bytes, age);
             bytes[0] = id[0];
             bytes[1] = id[1];
             Ok(bytes)
@@ -168,6 +194,8 @@ impl Upstream for DohUpstream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::{Qtype, Question, Rcode, build_query, build_response, parse_response};
+    use crate::upstream::UpstreamSpec;
     use rurge_net::connector::{DirectConnector, SystemResolve};
     use rurge_net::http::HttpClientConfig;
     use rurge_net::testing::TestServer;
@@ -198,6 +226,30 @@ mod tests {
         Instant::now() + Duration::from_millis(ms)
     }
 
+    /// What the canned answers answer.
+    fn question() -> Question {
+        Question {
+            name: "a.test".to_string(),
+            qtype: Qtype::A,
+        }
+    }
+
+    /// An answer to `question` with an A record of each of `ttls`, and at
+    /// its end an OPT record (RFC 6891 6.1.2) whose TTL field — no TTL: it
+    /// holds the DO flag — an ageing that took it for one would change.
+    fn answer(id: u16, ttls: [u32; 2]) -> Vec<u8> {
+        let records = [
+            ("10.0.0.1".parse().unwrap(), ttls[0]),
+            ("10.0.0.2".parse().unwrap(), ttls[1]),
+        ];
+        let mut wire = build_response(id, &question(), Rcode::NoError, &records, false).unwrap();
+        // the root name, OPT, a payload size of 1232, the DO flag, no data
+        wire.extend([0, 0, 41, 0x04, 0xd0, 0, 0, 0x80, 0, 0, 0]);
+        // ARCOUNT
+        wire[11] += 1;
+        wire
+    }
+
     #[tokio::test]
     async fn posts_dns_message_and_restores_the_id() {
         let server = TestServer::spawn().await;
@@ -206,7 +258,7 @@ mod tests {
         canned.extend_from_slice(b"answer");
         server.set("/dns-query", canned.clone());
         server.set_header("/dns-query", "content-type", "application/dns-message");
-        let up = DohUpstream::new(server.url("/dns-query"), client(false));
+        let up = DohUpstream::new(server.url("/dns-query"), false, client(false));
         assert_eq!(up.name(), server.url("/dns-query").as_str());
         let resp = up
             .query(&header_with_id(0x1234), deadline(2000))
@@ -225,7 +277,7 @@ mod tests {
         let server = TestServer::spawn_tls().await;
         server.set("/dns-query", vec![0u8; 12]);
         server.set_header("/dns-query", "content-type", "application/dns-message");
-        let up = DohUpstream::new(server.url("/dns-query"), client(true));
+        let up = DohUpstream::new(server.url("/dns-query"), false, client(true));
         let resp = up.query(&header_with_id(1), deadline(3000)).await.unwrap();
         assert_eq!(&resp[0..2], &[0, 1]);
         assert_eq!(server.requests()[0].version, "HTTP/2.0");
@@ -236,19 +288,19 @@ mod tests {
         let server = TestServer::spawn().await;
         server.set("/html", vec![0u8; 12]);
         server.set_header("/html", "content-type", "text/html");
-        let up = DohUpstream::new(server.url("/html"), client(false));
+        let up = DohUpstream::new(server.url("/html"), false, client(false));
         assert!(matches!(
             up.query(&header_with_id(2), deadline(2000)).await,
             Err(UpstreamError::BadResponse(_))
         ));
         server.set("/fail", vec![0u8; 12]);
         server.set_status("/fail", 500);
-        let up = DohUpstream::new(server.url("/fail"), client(false));
+        let up = DohUpstream::new(server.url("/fail"), false, client(false));
         assert!(matches!(
             up.query(&header_with_id(3), deadline(2000)).await,
             Err(UpstreamError::Http(_))
         ));
-        let up = DohUpstream::new(server.url("/missing"), client(false));
+        let up = DohUpstream::new(server.url("/missing"), false, client(false));
         assert!(matches!(
             up.query(&header_with_id(4), deadline(2000)).await,
             Err(UpstreamError::Http(_))
@@ -261,7 +313,7 @@ mod tests {
         server.set("/slow", vec![0u8; 12]);
         server.set_header("/slow", "content-type", "application/dns-message");
         server.set_delay("/slow", Duration::from_secs(3));
-        let up = DohUpstream::new(server.url("/slow"), client(false));
+        let up = DohUpstream::new(server.url("/slow"), false, client(false));
         assert_eq!(
             up.query(&header_with_id(5), deadline(200)).await,
             Err(UpstreamError::Timeout)
@@ -336,9 +388,9 @@ mod tests {
             url.set_username("al ice").unwrap();
             url.set_password(Some("s3cret:doh")).unwrap();
             assert_eq!(url.username(), "al%20ice", "the URL holds them encoded");
-            let up = DohUpstream::new(url, client(tls));
+            let up = DohUpstream::new(url, false, client(tls));
             up.query(&header_with_id(7), deadline(3000)).await.unwrap();
-            let plain = DohUpstream::new(server.url("/dns-query"), client(tls));
+            let plain = DohUpstream::new(server.url("/dns-query"), false, client(tls));
             plain
                 .query(&header_with_id(8), deadline(3000))
                 .await
@@ -381,7 +433,7 @@ mod tests {
         let mut url = server.url("/dns-query");
         url.set_username("alice").unwrap();
         url.set_password(Some("s3cret")).unwrap();
-        let up = DohUpstream::new(url, client(false));
+        let up = DohUpstream::new(url, false, client(false));
         assert!(matches!(
             up.query(&header_with_id(9), deadline(2000)).await,
             Err(UpstreamError::Http(_))
@@ -397,7 +449,7 @@ mod tests {
         let url: Url = "https://alice:s3cret-doh@dns.example/dns-query"
             .parse()
             .unwrap();
-        let up = DohUpstream::new(url, client(false));
+        let up = DohUpstream::new(url, false, client(false));
         assert_eq!(up.name(), "https://dns.example/dns-query");
     }
 
@@ -422,10 +474,125 @@ mod tests {
         let server = TestServer::spawn().await;
         server.set("/big", vec![0u8; 70_000]);
         server.set_header("/big", "content-type", "application/dns-message");
-        let up = DohUpstream::new(server.url("/big"), client(false));
+        let up = DohUpstream::new(server.url("/big"), false, client(false));
         assert!(matches!(
             up.query(&header_with_id(6), deadline(2000)).await,
             Err(UpstreamError::BadResponse(_))
         ));
+    }
+
+    /// A server written without a path is asked at `/dns-query`, under the
+    /// name it was written with; written with the path `/`, it is asked
+    /// there.
+    #[tokio::test]
+    async fn a_url_written_without_a_path_posts_to_dns_query() {
+        let server = TestServer::spawn_tls().await;
+        for (path, address) in [("/dns-query", "10.0.0.1"), ("/", "10.0.0.2")] {
+            let records = [(address.parse().unwrap(), 60)];
+            let answer = build_response(0, &question(), Rcode::NoError, &records, false);
+            server.set(path, answer.unwrap());
+            server.set_header(path, "content-type", "application/dns-message");
+        }
+        let bare = format!("https://127.0.0.1:{}", server.url("/").port().unwrap());
+        for (written, address) in [(bare.clone(), "10.0.0.1"), (format!("{bare}/"), "10.0.0.2")] {
+            let up = match UpstreamSpec::parse(&written).unwrap() {
+                UpstreamSpec::Https { url, pathless } => {
+                    DohUpstream::new(url, pathless, client(true))
+                }
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(up.name(), written);
+            let wire = build_query(0x1234, &question()).unwrap();
+            let reply = up.query(&wire, deadline(3000)).await.unwrap();
+            let answer = parse_response(&reply).unwrap();
+            assert_eq!(answer.id, 0x1234);
+            assert_eq!(answer.v4, [(address.parse().unwrap(), 60)], "{written}");
+        }
+        let asked: Vec<_> = server
+            .requests()
+            .into_iter()
+            .map(|request| (request.method, request.path))
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                ("POST".to_string(), "/dns-query".to_string()),
+                ("POST".to_string(), "/".to_string())
+            ]
+        );
+    }
+
+    /// The age an answer comes with is off the TTL of each of its records
+    /// (RFC 8484 5.1), no further than 0, and off nothing else: the OPT
+    /// record's TTL field, which is none, and the rest of the message come
+    /// as the server sent them. Without an `Age`, with one that is no
+    /// number, or with two, the answer comes as it is. Over HTTP/1.1 and
+    /// over HTTP/2.
+    #[tokio::test]
+    async fn the_age_of_an_answer_comes_off_its_ttls() {
+        for tls in [false, true] {
+            let server = if tls {
+                TestServer::spawn_tls().await
+            } else {
+                TestServer::spawn().await
+            };
+            let http = client(tls);
+            for (path, ages, ttls) in [
+                ("/aged", &["30"][..], [70, 0]),
+                ("/fresh", &["0"][..], [100, 20]),
+                ("/no-age", &[][..], [100, 20]),
+                ("/no-number", &["abc"][..], [100, 20]),
+                ("/two-ages", &["30", "30"][..], [100, 20]),
+            ] {
+                server.set(path, answer(0, [100, 20]));
+                server.set_header(path, "content-type", "application/dns-message");
+                for age in ages {
+                    server.set_header(path, "age", age);
+                }
+                let up = DohUpstream::new(server.url(path), false, http.clone());
+                let wire = build_query(0x1234, &question()).unwrap();
+                let reply = up.query(&wire, deadline(3000)).await.unwrap();
+                let handed_on: Vec<u32> = parse_response(&reply)
+                    .unwrap()
+                    .v4
+                    .iter()
+                    .map(|&(_, ttl)| ttl)
+                    .collect();
+                assert_eq!(handed_on, ttls, "tls: {tls}, {path}");
+                assert_eq!(reply, answer(0x1234, ttls), "tls: {tls}, {path}");
+            }
+        }
+    }
+
+    /// An answer's age is the number its one `Age` field says, in seconds;
+    /// more than a TTL counts is as many as it counts. Without the field,
+    /// with one that is no number, or with more than one, the answer has
+    /// no age.
+    #[test]
+    fn the_age_of_an_answer_is_what_its_one_age_field_says() {
+        for (ages, seconds) in [
+            (&["30"][..], 30),
+            (&["0"][..], 0),
+            (&["007"][..], 7),
+            (&["4294967295"][..], u32::MAX),
+            (&["4294967296"][..], u32::MAX),
+            (&["99999999999999999999999999"][..], u32::MAX),
+            (&[][..], 0),
+            (&[""][..], 0),
+            (&["abc"][..], 0),
+            (&["-30"][..], 0),
+            (&["+30"][..], 0),
+            (&["30.5"][..], 0),
+            (&["30s"][..], 0),
+            (&["30, 40"][..], 0),
+            (&["30", "30"][..], 0),
+            (&["30", "abc"][..], 0),
+        ] {
+            let mut headers = HeaderMap::new();
+            for value in ages {
+                headers.append(AGE, value.parse().unwrap());
+            }
+            assert_eq!(age(&headers), seconds, "{ages:?}");
+        }
     }
 }

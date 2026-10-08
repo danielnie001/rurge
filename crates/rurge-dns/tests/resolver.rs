@@ -150,6 +150,40 @@ async fn every_transport_resolves() {
     assert_eq!(doh.hits("/dns-query"), 1);
 }
 
+/// A DoH server the profile writes without a path is asked at `/dns-query`
+/// and keeps the name it was written with; the age its answer comes with is
+/// off the TTL the answer is kept for (RFC 8484 5.1).
+#[tokio::test]
+async fn a_doh_server_written_without_a_path_and_the_age_of_its_answer() {
+    let doh = TestServer::spawn_tls().await;
+    let q = Question {
+        name: "a.test".to_string(),
+        qtype: Qtype::A,
+    };
+    doh.set(
+        "/dns-query",
+        build_response(0, &q, Rcode::NoError, &[(ip("10.0.0.5"), 100)], false).unwrap(),
+    );
+    doh.set_header("/dns-query", "content-type", "application/dns-message");
+    doh.set_header("/dns-query", "age", "30");
+    let written = format!("https://127.0.0.1:{}", doh.url("/").port().unwrap());
+    let (_d, r) = resolver(
+        &profile(
+            &format!(
+                "encrypted-dns-server = {written}\nencrypted-dns-skip-cert-verification = true\nipv6 = false"
+            ),
+            "",
+        ),
+        StaticSystemDns::default(),
+    );
+    assert_eq!(r.primary_upstreams(), vec![written.clone()]);
+    let a = lookup(&r, "a.test").await;
+    assert_eq!(a.addrs(), vec![ip("10.0.0.5")]);
+    assert_eq!(a.source, Source::Upstream(written));
+    assert_eq!(a.ttl, Duration::from_secs(70));
+    assert_eq!((doh.hits("/dns-query"), doh.hits("/")), (1, 0));
+}
+
 #[tokio::test]
 async fn host_server_url_is_bootstrapped_by_traditional_upstreams() {
     let udp = MockDns::spawn().await;

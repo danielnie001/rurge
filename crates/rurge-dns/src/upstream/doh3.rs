@@ -7,18 +7,19 @@
 //!   `application/dns-message`, the message with ID 0 as its content, then
 //!   the FIN. Its answer is a 200 of that content type, at most 65535 bytes
 //!   — as long as its `content-length` says, which HTTP/3 checks —, and
-//!   gets the caller's ID back. No EDNS(0) padding, as DoH has none.
+//!   gets the caller's ID back, its records' TTLs lowered by the age it
+//!   comes with (RFC 8484 5.1). No EDNS(0) padding, as DoH has none.
 //! - A GOAWAY lets the queries under way on its connection run to their
 //!   end; the next one dials. A request the server rejected
 //!   (H3_REQUEST_REJECTED: nothing of it was processed, RFC 9114 4.1.1),
 //!   after a GOAWAY or without, on a connection that was up when its query
 //!   came, goes again on a new one.
 
-use super::doh::{DNS_MESSAGE, MAX_RESPONSE, check_body, check_head};
+use super::doh::{DNS_MESSAGE, MAX_RESPONSE, age, check_body, check_head};
 use super::session::{self, Conn, Dialer, Failure, Progress, Protocol, Session, transport_error};
 use super::{Upstream, UpstreamError};
 use crate::bootstrap::Bootstrap;
-use crate::message::wire_id;
+use crate::message::{lower_ttls, wire_id};
 use http::Request;
 use http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE};
 use quinn::{Connection, VarInt};
@@ -164,6 +165,7 @@ async fn exchange(
         .await
         .map_err(failed)?;
     check_body(&reply).map_err(Failure::Failed)?;
+    lower_ttls(&mut reply, age(response.headers()));
     Ok(reply)
 }
 
@@ -185,10 +187,13 @@ fn failure(conn: &Conn<h3::Client>, e: io::Error) -> Failure {
 mod tests {
     use super::*;
     use crate::fanout::FanoutOpts;
-    use crate::message::{Answer, Qtype, Question, build_query, parse_response};
+    use crate::message::{
+        Answer, Qtype, Question, Rcode, build_query, build_response, parse_response,
+    };
     use crate::testing::{Doh3Script, FakeDoh3, MockDns};
     use crate::upstream::UpstreamSpec;
     use rurge_net::connector::{DirectConnector, SystemResolve};
+    use std::net::Ipv4Addr;
     use std::time::Duration;
 
     const BOUND: Duration = Duration::from_secs(10);
@@ -516,6 +521,37 @@ mod tests {
             );
             let up = upstream(&fake, "");
             assert_eq!(ask(&up, 1, "a.test").await.unwrap().id, 1, "{content_type}");
+        }
+    }
+
+    /// The age an answer comes with is off the TTL of each of its records,
+    /// no further than 0, as over HTTP/2 (RFC 8484 5.1); an answer without
+    /// an age comes as it is.
+    #[tokio::test]
+    async fn the_age_of_an_answer_comes_off_its_ttls() {
+        let dns = MockDns::spawn().await;
+        let question = Question {
+            name: "a.test".to_string(),
+            qtype: Qtype::A,
+        };
+        let addresses = [Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2)];
+        let records = [(addresses[0].into(), 100), (addresses[1].into(), 20)];
+        let reply = build_response(0, &question, Rcode::NoError, &records, false).unwrap();
+        for (age, ttls) in [(Some(30), [70, 0]), (Some(0), [100, 20]), (None, [100, 20])] {
+            let fake = FakeDoh3::spawn(
+                &dns,
+                Doh3Script {
+                    reply_bytes: Some(reply.clone()),
+                    age,
+                    ..Doh3Script::default()
+                },
+            );
+            let answer = ask(&upstream(&fake, ""), 1, "a.test").await.unwrap();
+            assert_eq!(
+                answer.v4,
+                [(addresses[0], ttls[0]), (addresses[1], ttls[1])],
+                "{age:?}"
+            );
         }
     }
 

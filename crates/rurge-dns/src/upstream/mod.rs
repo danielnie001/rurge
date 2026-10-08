@@ -65,10 +65,15 @@ pub enum UpstreamSpec {
         host: String,
         port: u16,
     },
-    /// DNS over HTTPS: the URL as written. It may carry a user name and a
+    /// DNS over HTTPS: the URL its requests go to. `pathless`: it was
+    /// written without a path, and has `DEFAULT_PATH` for one, which the
+    /// upstream's name leaves out again. It may carry a user name and a
     /// password, which its requests send as `Authorization: Basic`
     /// (`doh::DohUpstream`) and no text shows (`doh_name`).
-    Https(Url),
+    Https {
+        url: Url,
+        pathless: bool,
+    },
     /// DNS over dedicated QUIC (RFC 9250): `quic://host[:port]`, port 853
     /// unless it says.
     Quic {
@@ -90,8 +95,9 @@ impl fmt::Debug for UpstreamSpec {
 }
 
 /// The path of an `h3://` URL that names none, as sing-box, hickory and
-/// CoreDNS take it (RFC 8484 itself sets none).
-const DEFAULT_H3_PATH: &str = "/dns-query";
+/// CoreDNS take it (RFC 8484 itself sets none), and of an `https://` URL
+/// written without any.
+const DEFAULT_PATH: &str = "/dns-query";
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     let head = s.get(..prefix.len())?;
@@ -160,14 +166,14 @@ fn userinfo_refused(s: &str, rest: &str, what: &str) -> String {
 /// requests go to: no user name or password, which HTTP/3 has no place to
 /// send (RFC 9114 4.3.1) — no `@` anywhere: a password that begins with
 /// digits and goes on with a `/` would pass for a port and a path —, no
-/// fragment, `DEFAULT_H3_PATH` when it names no path.
+/// fragment, `DEFAULT_PATH` when it names no path.
 fn h3_url(s: &str, rest: &str) -> Result<Url, String> {
     if rest.contains(AT) {
         return Err(userinfo_refused(s, rest, "an h3:// URL"));
     }
     let mut url = Url::parse(&format!("https://{rest}")).map_err(|e| format!("`{s}`: {e}"))?;
     if url.path() == "/" {
-        url.set_path(DEFAULT_H3_PATH);
+        url.set_path(DEFAULT_PATH);
     }
     url.set_fragment(None);
     Ok(url)
@@ -179,10 +185,16 @@ fn h3_name(url: &Url) -> String {
     format!("h3://{}", &url[Position::BeforeHost..])
 }
 
-/// What a DoH upstream is called: its URL without the user name and the
-/// password it may carry.
-fn doh_name(url: &Url) -> String {
-    format!("{}://{}", url.scheme(), &url[Position::BeforeHost..])
+/// What a DoH upstream is called: its URL as it was written — `pathless`,
+/// without the path it was given —, without the user name and the password
+/// it may carry.
+fn doh_name(url: &Url, pathless: bool) -> String {
+    let end = if pathless {
+        Position::AfterPort
+    } else {
+        Position::AfterFragment
+    };
+    format!("{}://{}", url.scheme(), &url[Position::BeforeHost..end])
 }
 
 /// `host:port`, an IPv6 address in brackets.
@@ -206,7 +218,7 @@ impl UpstreamSpec {
                     quoted(s, rest)
                 ));
             }
-            let url = Url::parse(s).map_err(|e| format!("`{}`: {e}", quoted(s, rest)))?;
+            let mut url = Url::parse(s).map_err(|e| format!("`{}`: {e}", quoted(s, rest)))?;
             if url.host_str().is_none() {
                 return Err(format!("`{}`: missing host", quoted(s, rest)));
             }
@@ -220,7 +232,14 @@ impl UpstreamSpec {
                     quoted(s, rest)
                 ));
             }
-            return Ok(UpstreamSpec::Https(url));
+            // written without a path: nothing follows the host and the port.
+            // Only the text says so — with the path `/`, it parses to the
+            // same URL —, and a `\` is a `/` to an `https` URL
+            let pathless = !rest.contains(['/', '\\', '?', '#']);
+            if pathless {
+                url.set_path(DEFAULT_PATH);
+            }
+            return Ok(UpstreamSpec::Https { url, pathless });
         }
         if let Some(rest) = strip_prefix_ci(s, "h3://") {
             return h3_url(s, rest).map(UpstreamSpec::H3);
@@ -303,7 +322,7 @@ impl UpstreamSpec {
             UpstreamSpec::Udp(addr) => format!("udp://{addr}"),
             UpstreamSpec::Tcp { host, port } => format!("tcp://{host}:{port}"),
             UpstreamSpec::Tls { host, port } => format!("tls://{host}:{port}"),
-            UpstreamSpec::Https(url) => doh_name(url),
+            UpstreamSpec::Https { url, pathless } => doh_name(url, *pathless),
             UpstreamSpec::Quic { host, port } => format!("quic://{}", host_port_text(host, *port)),
             UpstreamSpec::H3(url) => h3_name(url),
         }
@@ -315,7 +334,7 @@ impl UpstreamSpec {
             UpstreamSpec::Tcp { host, .. }
             | UpstreamSpec::Tls { host, .. }
             | UpstreamSpec::Quic { host, .. } => Some(host),
-            UpstreamSpec::Https(url) | UpstreamSpec::H3(url) => url.host_str(),
+            UpstreamSpec::Https { url, .. } | UpstreamSpec::H3(url) => url.host_str(),
         }
     }
 
@@ -377,7 +396,7 @@ mod tests {
         );
         assert!(matches!(
             UpstreamSpec::parse("https://dns.example.com/dns-query").unwrap(),
-            UpstreamSpec::Https(_)
+            UpstreamSpec::Https { .. }
         ));
         assert!(matches!(
             UpstreamSpec::parse("H3://dns.example.com/dns-query").unwrap(),
@@ -427,7 +446,7 @@ mod tests {
         let e = EncryptedDns::parse("https://dns.example.com/dns-query").unwrap();
         assert!(matches!(
             UpstreamSpec::from_encrypted(&e).unwrap(),
-            UpstreamSpec::Https(_)
+            UpstreamSpec::Https { .. }
         ));
         let h3 = EncryptedDns::parse("h3://dns.example.com/dns-query").unwrap();
         assert_eq!(
@@ -646,7 +665,7 @@ mod tests {
             "{shown}"
         );
         // the URL the requests go to is as it was written
-        let UpstreamSpec::Https(url) = &spec else {
+        let UpstreamSpec::Https { url, .. } = &spec else {
             panic!("{spec:?}");
         };
         assert_eq!(url.as_str(), written);
@@ -764,7 +783,7 @@ of a user name or a password, and an `@` after the host, are written percent-enc
                 !shown.contains(SECRET) && !shown.contains("al1ce"),
                 "{shown}"
             );
-            let UpstreamSpec::Https(url) = &spec else {
+            let UpstreamSpec::Https { url, .. } = &spec else {
                 panic!("{spec:?}");
             };
             assert_eq!(url.as_str(), written);
@@ -772,6 +791,111 @@ of a user name or a password, and an `@` after the host, are written percent-enc
         // an `@` of the password's own stands before the host as well
         let spec = UpstreamSpec::parse(&format!("https://al1ce:p@{SECRET}@dns.example/q")).unwrap();
         assert_eq!(spec.name(), "https://dns.example/q");
+    }
+
+    /// An `https://` URL written without a path — it ends after its host
+    /// and port — sends its requests to `/dns-query`; one that names a
+    /// path, be it `/`, sends them there. The upstream is called what was
+    /// written: without the path it was given, and, as ever, without a
+    /// user name and a password.
+    #[test]
+    fn an_https_url_written_without_a_path_goes_to_dns_query() {
+        let https = |written: &str| match UpstreamSpec::parse(written).unwrap() {
+            UpstreamSpec::Https { url, .. } => url,
+            other => panic!("{other:?}"),
+        };
+        let name = |written: &str| UpstreamSpec::parse(written).unwrap().name();
+        for (written, path, called) in [
+            ("https://dns.example", "/dns-query", "https://dns.example"),
+            (
+                "https://dns.example:8443",
+                "/dns-query",
+                "https://dns.example:8443",
+            ),
+            (
+                "https://u:p@dns.example",
+                "/dns-query",
+                "https://dns.example",
+            ),
+            ("https://dns.example/", "/", "https://dns.example/"),
+            (
+                "https://dns.example/custom",
+                "/custom",
+                "https://dns.example/custom",
+            ),
+        ] {
+            assert_eq!(https(written).path(), path, "{written}");
+            assert_eq!(name(written), called, "{written}");
+        }
+        // the whole of where the requests go: only the text tells a URL that
+        // ends after its host from one with the path `/` — both parse to
+        // that path —, a `?` or a `#` is more than a host and a port, and a
+        // `\` is a `/` to an `https` URL
+        for (written, target, called) in [
+            (
+                " HTTPS://DNS.Example ",
+                "https://dns.example/dns-query",
+                "https://dns.example",
+            ),
+            ("https://[::1]", "https://[::1]/dns-query", "https://[::1]"),
+            (
+                "https://[::1]:8443/",
+                "https://[::1]:8443/",
+                "https://[::1]:8443/",
+            ),
+            (
+                "https://al1ce:s3cret@dns.example:8443",
+                "https://al1ce:s3cret@dns.example:8443/dns-query",
+                "https://dns.example:8443",
+            ),
+            // a `/` written percent-encoded is none
+            (
+                "https://al1ce:123%2Fs3cret@dns.example",
+                "https://al1ce:123%2Fs3cret@dns.example/dns-query",
+                "https://dns.example",
+            ),
+            (
+                "https://dns.example/dns-query",
+                "https://dns.example/dns-query",
+                "https://dns.example/dns-query",
+            ),
+            (
+                "https://dns.example?x=1",
+                "https://dns.example/?x=1",
+                "https://dns.example/?x=1",
+            ),
+            (
+                "https://dns.example#x",
+                "https://dns.example/#x",
+                "https://dns.example/#x",
+            ),
+            (
+                "https://dns.example\\",
+                "https://dns.example/",
+                "https://dns.example/",
+            ),
+            (
+                "https://dns.example\\custom",
+                "https://dns.example/custom",
+                "https://dns.example/custom",
+            ),
+        ] {
+            assert_eq!(https(written).as_str(), target, "{written}");
+            assert_eq!(name(written), called, "{written}");
+        }
+        // a server written both ways is two upstreams, each kept under its
+        // own spec and name
+        let spec = |written: &str| UpstreamSpec::parse(written).unwrap();
+        assert_eq!(spec("https://dns.example"), spec("https://dns.example"));
+        for other in ["https://dns.example/", "https://dns.example/dns-query"] {
+            assert_ne!(spec("https://dns.example"), spec(other), "{other}");
+        }
+        let pathless = spec("https://al1ce:s3cret@dns.example");
+        assert_eq!(pathless.host(), Some("dns.example"));
+        assert_eq!(
+            format!("{pathless:?}"),
+            r#"UpstreamSpec("https://dns.example")"#
+        );
     }
 
     #[test]

@@ -417,10 +417,9 @@ impl Resolver {
                     tls.clone(),
                 )) as UpstreamRef
             }),
-            UpstreamSpec::Https(url) => self
-                .http
-                .as_ref()
-                .map(|http| Arc::new(DohUpstream::new(url.clone(), http.clone())) as UpstreamRef),
+            UpstreamSpec::Https { url, pathless } => self.http.as_ref().map(|http| {
+                Arc::new(DohUpstream::new(url.clone(), *pathless, http.clone())) as UpstreamRef
+            }),
             UpstreamSpec::Quic { host, port } => self.doq.as_ref().map(|config| {
                 Arc::new(DoqUpstream::new(
                     host,

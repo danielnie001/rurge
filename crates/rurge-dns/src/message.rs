@@ -1,7 +1,8 @@
 //! Wire-format encoding and decoding on top of hickory-proto (design §7.2):
 //! only what a stub resolver needs — A / AAAA questions and answers, EDNS
 //! payload size, response codes and the TC bit. Transports never look inside
-//! messages beyond `wire_id` / `wire_truncated`, and DoQ's `doq_query`.
+//! messages beyond `wire_id` / `wire_truncated`, DoQ's `doq_query` and DoH's
+//! `lower_ttls`.
 
 use hickory_proto::op::{
     DEFAULT_MAX_PAYLOAD_LEN, Edns, Message, MessageType, OpCode, Query, ResponseCode,
@@ -257,6 +258,70 @@ pub fn wire_truncated(bytes: &[u8]) -> bool {
     bytes.len() >= 12 && bytes[2] & 0x02 != 0
 }
 
+/// The type of the OPT pseudo-record (RFC 6891 6.1.1).
+const OPT: u16 = 41;
+
+/// Lowers the TTL of every record of the response `wire` — in its answer,
+/// authority and additional sections — by `seconds`, no further than 0: the
+/// response as it reads that long after it was made. The OPT pseudo-record
+/// keeps its TTL field, which holds no TTL but its extended RCODE, version
+/// and flags (RFC 6891 6.1.3). Only the TTLs are rewritten, where they
+/// stand; a message that does not read to its last record keeps them all.
+pub fn lower_ttls(wire: &mut [u8], seconds: u32) {
+    if seconds == 0 {
+        return;
+    }
+    for at in ttl_offsets(wire).unwrap_or_default() {
+        let ttl = u32::from_be_bytes([wire[at], wire[at + 1], wire[at + 2], wire[at + 3]]);
+        wire[at..at + 4].copy_from_slice(&ttl.saturating_sub(seconds).to_be_bytes());
+    }
+}
+
+/// Where the TTLs of `wire`'s records stand, the OPT pseudo-record's field
+/// left out; `None` for a message that does not read to its last record.
+fn ttl_offsets(wire: &[u8]) -> Option<Vec<usize>> {
+    let questions = wire_u16(wire, 4)?;
+    // ANCOUNT, NSCOUNT and ARCOUNT
+    let records = u32::from(wire_u16(wire, 6)?)
+        + u32::from(wire_u16(wire, 8)?)
+        + u32::from(wire_u16(wire, 10)?);
+    let mut at = 12;
+    for _ in 0..questions {
+        // QTYPE and QCLASS follow the name
+        at = name_end(wire, at)? + 4;
+    }
+    let mut ttls = Vec::new();
+    for _ in 0..records {
+        // TYPE, CLASS, TTL and RDLENGTH follow the name, the data follows them
+        at = name_end(wire, at)?;
+        if wire_u16(wire, at)? != OPT {
+            ttls.push(at + 4);
+        }
+        at += 10 + usize::from(wire_u16(wire, at + 8)?);
+    }
+    (at <= wire.len()).then_some(ttls)
+}
+
+/// Where the name at `at` ends: after its root label, or after the pointer
+/// that stands for the rest of it (RFC 1035 4.1.4).
+fn name_end(wire: &[u8], mut at: usize) -> Option<usize> {
+    loop {
+        match *wire.get(at)? {
+            0 => return Some(at + 1),
+            len @ 1..=0x3f => at += 1 + usize::from(len),
+            0xc0.. => return Some(at + 2),
+            // a label of a type there is none of
+            _ => return None,
+        }
+    }
+}
+
+/// The 16-bit number at `at`.
+fn wire_u16(wire: &[u8], at: usize) -> Option<u16> {
+    let bytes = wire.get(at..at + 2)?;
+    Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
 /// What DNS over QUIC pads its queries to a multiple of: "Clients SHOULD
 /// pad queries to the closest multiple of 128 octets" (RFC 8467 4.1, the
 /// policy RFC 9250 5.4 points to).
@@ -301,6 +366,7 @@ fn set_padding(m: &mut Message, len: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_proto::rr::rdata::NS;
 
     fn q(name: &str, qtype: Qtype) -> Question {
         Question {
@@ -483,5 +549,154 @@ mod tests {
         assert!(edns.flags().dnssec_ok);
         assert_eq!(edns.option(EdnsCode::Cookie), Some(&cookie));
         assert!(padding(&doq).is_some());
+    }
+
+    /// A response as a server writes it, its names compressed: an A record
+    /// of each of the first two of `ttls`, a record of the third in its
+    /// authority section and one of the fourth in its additional section —
+    /// and an OPT record, whose TTL field is no TTL: it holds the DO flag.
+    fn sections(ttls: [u32; 4]) -> Vec<u8> {
+        let mut m = Message::new(0x4242, MessageType::Response, OpCode::Query);
+        let name = fqdn("a.test").unwrap();
+        let server = fqdn("ns.test").unwrap();
+        m.add_query(Query::query(name.clone(), RecordType::A));
+        for (ttl, host) in [(ttls[0], 1), (ttls[1], 2)] {
+            let data = RData::A(A(Ipv4Addr::new(10, 0, 0, host)));
+            m.answers.push(Record::from_rdata(name.clone(), ttl, data));
+        }
+        let data = RData::NS(NS(server.clone()));
+        m.authorities
+            .push(Record::from_rdata(fqdn("test").unwrap(), ttls[2], data));
+        let data = RData::AAAA(AAAA(Ipv6Addr::LOCALHOST));
+        m.additionals
+            .push(Record::from_rdata(server, ttls[3], data));
+        let mut edns = Edns::new();
+        edns.set_max_payload(1232);
+        edns.set_dnssec_ok(true);
+        m.set_edns(edns);
+        m.to_vec().unwrap()
+    }
+
+    /// The TTL of every record is lowered, in each of the three sections,
+    /// to 0 at the least — and nothing else of the message is another: not
+    /// the OPT record's TTL field, which holds its flags.
+    #[test]
+    fn ttls_are_lowered_in_every_section_and_nothing_else_changes() {
+        let mut wire = sections([100, 20, 3600, 30]);
+        lower_ttls(&mut wire, 30);
+        assert_eq!(wire, sections([70, 0, 3570, 0]));
+        let aged = Message::from_vec(&wire).unwrap();
+        let ttls = |records: &[Record]| records.iter().map(|r| r.ttl).collect::<Vec<_>>();
+        assert_eq!(ttls(&aged.answers), [70, 0]);
+        assert_eq!(ttls(&aged.authorities), [3570]);
+        assert_eq!(ttls(&aged.additionals), [0]);
+        let edns = aged.edns.unwrap();
+        assert!(edns.flags().dnssec_ok);
+        assert_eq!(edns.max_payload(), 1232);
+        // not by a second more than said, nor by any when none is
+        let mut wire = sections([100, u32::MAX, 0, 1]);
+        lower_ttls(&mut wire, 0);
+        assert_eq!(wire, sections([100, u32::MAX, 0, 1]));
+        lower_ttls(&mut wire, 1);
+        assert_eq!(wire, sections([99, u32::MAX - 1, 0, 0]));
+        lower_ttls(&mut wire, u32::MAX);
+        assert_eq!(wire, sections([0; 4]));
+    }
+
+    /// One record on the wire: its name, type, class IN, TTL field and
+    /// data.
+    fn record(name: &[u8], rtype: u16, ttl: u32, data: &[u8]) -> Vec<u8> {
+        let mut wire = name.to_vec();
+        wire.extend(rtype.to_be_bytes());
+        wire.extend([0, 1]);
+        wire.extend(ttl.to_be_bytes());
+        wire.extend((data.len() as u16).to_be_bytes());
+        wire.extend(data);
+        wire
+    }
+
+    /// A response written by hand, 121 bytes: the question `a.test`, then
+    /// five records of the TTLs `ttls` — but for the fourth, an OPT record
+    /// before the last of the additional ones, with an extended RCODE and
+    /// the DO flag where the others have their TTL. Their names end in a
+    /// pointer, in the root, or are the root; the second is of a type
+    /// nobody knows, its data what looks like pointers.
+    fn handwritten(ttls: [u32; 4]) -> Vec<u8> {
+        [
+            // one question, one answer, one authority, three additional
+            vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 1, 0, 3],
+            // `a.test` at offset 12, A, IN
+            vec![1, b'a', 4, b't', b'e', b's', b't', 0, 0, 1, 0, 1],
+            record(&[0xc0, 12], 1, ttls[0], &[10, 0, 0, 1]),
+            record(
+                &[3, b'w', b'w', b'w', 0xc0, 12],
+                0xff00,
+                ttls[1],
+                &[0xc0; 7],
+            ),
+            record(&[0], 2, ttls[2], &[]),
+            record(&[0], 41, 0x0100_8000, &[0, 10, 0, 2, 7, 7]),
+            record(&[1, b'b', 0xc0, 14], 28, ttls[3], &[0; 16]),
+        ]
+        .concat()
+    }
+
+    /// The walk is over the wire, whatever the records hold: a record of a
+    /// type nobody knows is passed over by its length, and the OPT record
+    /// keeps its field wherever it stands. What follows the last record is
+    /// none of the walk's business.
+    #[test]
+    fn ttls_are_lowered_whatever_the_records_hold() {
+        let mut wire = handwritten([300, 45, 60, 86_400]);
+        assert_eq!(wire.len(), 121);
+        lower_ttls(&mut wire, 60);
+        assert_eq!(wire, handwritten([240, 0, 0, 86_340]));
+        let mut trailed = [handwritten([300, 45, 60, 86_400]), vec![0xff; 3]].concat();
+        lower_ttls(&mut trailed, 60);
+        assert_eq!(
+            trailed,
+            [handwritten([240, 0, 0, 86_340]), vec![0xff; 3]].concat()
+        );
+    }
+
+    /// A message that does not read to its last record keeps every TTL it
+    /// has, those before the damage too: what is wrong with it is for
+    /// whoever reads it next to say.
+    #[test]
+    fn a_message_that_does_not_read_to_its_last_record_is_left_alone() {
+        let unchanged = |damaged: Vec<u8>, what: &str| {
+            let mut wire = damaged.clone();
+            lower_ttls(&mut wire, 30);
+            assert_eq!(wire, damaged, "{what}");
+        };
+        // cut short anywhere: in the header, in a name, in a record's data
+        for whole in [
+            sections([100, 20, 3600, 300]),
+            handwritten([100, 20, 60, 300]),
+        ] {
+            for len in 0..whole.len() {
+                unchanged(whole[..len].to_vec(), &format!("cut to {len} bytes"));
+            }
+        }
+        let whole = handwritten([100, 20, 60, 300]);
+        let damage = |at: usize, byte: u8| {
+            let mut damaged = whole.clone();
+            damaged[at] = byte;
+            damaged
+        };
+        // ARCOUNT
+        unchanged(damage(11, 4), "a record more announced than there is");
+        // of the question's name, of the last record's
+        for at in [12, 91] {
+            for label in [0x40, 0x80] {
+                unchanged(damage(at, label), "a label of a type there is none of");
+            }
+        }
+        // the last record's RDLENGTH
+        unchanged(damage(104, 17), "data said longer than the message");
+        // and the walk does read these to their end
+        let mut wire = whole.clone();
+        lower_ttls(&mut wire, 30);
+        assert_eq!(wire, handwritten([70, 0, 30, 270]));
     }
 }

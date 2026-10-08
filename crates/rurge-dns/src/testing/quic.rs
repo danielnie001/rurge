@@ -297,6 +297,8 @@ pub struct Doh3Script {
     pub content_length: Option<u64>,
     /// Answer with these bytes as the content instead of the table's.
     pub reply_bytes: Option<Vec<u8>>,
+    /// Say the answer is this many seconds old (`age`).
+    pub age: Option<u32>,
     /// Send GOAWAY once a connection has taken this many requests: those
     /// run to their end; a later one on that connection is rejected
     /// (H3_REQUEST_REJECTED).
@@ -483,11 +485,14 @@ async fn answer_doh3(
         .unwrap_or(reply.len() as u64)
         .to_string();
     let content_type = script.content_type.as_deref().unwrap_or(DNS_MESSAGE);
+    let age = script.age.map(|age| age.to_string());
+    let mut head = vec![
+        ("content-type", content_type),
+        ("content-length", length.as_str()),
+    ];
+    head.extend(age.as_deref().map(|age| ("age", age)));
     stream
-        .send_headers(
-            script.status.unwrap_or(200),
-            &[("content-type", content_type), ("content-length", &length)],
-        )
+        .send_headers(script.status.unwrap_or(200), &head)
         .await?;
     stream.send_data(&reply).await?;
     stream.finish();
