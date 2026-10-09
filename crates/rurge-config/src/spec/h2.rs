@@ -166,7 +166,7 @@ pub fn read_trust_tunnel(
     let tls = read_pinned_tls(r, keystore, alpn, which);
     if h3 {
         // HTTP/3 runs over QUIC: there is no TCP connection to open fast
-        if r.has("tfo") && !r.rejected("tfo") {
+        if r.has_unrejected("tfo") {
             r.warn(
                 codes::W_PARAM_NOT_APPLICABLE,
                 "`tfo` does not apply to `trust-tunnel` policies with `h3=true`; ignored"

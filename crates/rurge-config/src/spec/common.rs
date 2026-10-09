@@ -217,7 +217,7 @@ pub(crate) fn read_common(
 
     if applies == Applies::Direct {
         for key in PROXY_ONLY {
-            if r.has(key) && !r.rejected(key) {
+            if r.has_unrejected(key) {
                 r.warn(
                     codes::W_PARAM_NOT_APPLICABLE,
                     format!("`{key}` does not apply to `direct` policies; ignored"),

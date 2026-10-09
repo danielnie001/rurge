@@ -41,7 +41,7 @@ pub struct ExternalSpec {
 pub fn read_external(r: &mut ParamReader<'_>, common: &mut CommonOpts) -> ExternalSpec {
     refuse_tls(r);
     for key in NOT_APPLICABLE {
-        if r.has(key) && !r.rejected(key) {
+        if r.has_unrejected(key) {
             r.warn(
                 codes::W_PARAM_NOT_APPLICABLE,
                 format!("`{key}` does not apply to `external` policies; ignored"),

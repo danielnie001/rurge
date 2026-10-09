@@ -328,13 +328,11 @@ fn check_underlying(r: &mut ParamReader<'_>, common: &mut CommonOpts, env: &Spec
         return;
     };
     match (env.lookup)(&name) {
-        None => {
-            r.reject("underlying-proxy");
-            r.error(
-                codes::E_UNKNOWN_POLICY_REF,
-                format!("`underlying-proxy` references unknown policy `{name}`"),
-            );
-        }
+        None => r.error_on(
+            "underlying-proxy",
+            codes::E_UNKNOWN_POLICY_REF,
+            format!("`underlying-proxy` references unknown policy `{name}`"),
+        ),
         // DIRECT is the absence of a chain
         Some(NameKind::Builtin(Builtin::Direct)) => common.underlying_proxy = None,
         Some(NameKind::Builtin(_)) => r.invalid(
@@ -546,6 +544,9 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
         PolicyKind::WireGuard => {
             let mut common = read_common(&mut r, Applies::Proxy, &mut notes);
             let wireguard = wireguard::read_wireguard(&mut r, &mut common, env.wireguard);
+            // `tfo` does not apply at all (`W0028`): no second word on it;
+            // `ecn` is left its "no effect yet" below
+            notes.inert.retain(|name| *name != "tfo");
             (common, ProtoSpec::WireGuard(wireguard))
         }
         PolicyKind::External => {
@@ -575,9 +576,7 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
         };
         // an `h3` that is an error already leaves open what a `trust-tunnel`
         // runs over: nothing more is said of the line
-        let open = matches!(proto, ProtoSpec::TrustTunnel(_))
-            && r.has("h3")
-            && policy.params.bool("h3").is_none();
+        let open = r.rejected("h3");
         if !open {
             r.warn(
                 codes::W_PARAM_NOT_APPLICABLE,
@@ -602,21 +601,22 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             _ => shadow_tls::read_shadow_tls(&mut r),
         };
         check_underlying(&mut r, &mut common, env);
+        // a chain that is an error already leaves open what it conflicts
+        // with and what it takes from the policy: nothing more is said of
+        // either
+        let chained = common.underlying_proxy.is_some() && !r.rejected("underlying-proxy");
         // the manual: `underlying-proxy` cannot be combined with the
         // `port-hopping` of the QUIC-based protocols
-        if common.underlying_proxy.is_some()
-            && proto.quic().is_some_and(|quic| quic.port_hopping.is_some())
-        {
+        if chained && proto.quic().is_some_and(|quic| quic.port_hopping.is_some()) {
             r.error(
                 codes::E_INVALID_POLICY_PARAM,
                 "`port-hopping` cannot be combined with `underlying-proxy`".to_string(),
             );
         }
-        // socket options belong to the hop that opens the socket (matrix 4.3);
-        // a chain that is an error leaves open whether this one does
-        if common.underlying_proxy.is_some() && !r.rejected("underlying-proxy") {
+        // socket options belong to the hop that opens the socket (matrix 4.3)
+        if chained {
             for key in ["interface", "allow-other-interface", "tos", "ip-version"] {
-                if r.has(key) && !r.rejected(key) {
+                if r.has_unrejected(key) {
                     r.warn(
                         codes::W_PARAM_NOT_APPLICABLE,
                         format!(

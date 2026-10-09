@@ -241,7 +241,7 @@ pub fn read_ss(r: &mut ParamReader<'_>) -> SsRead {
     }
     let relay = r.bool("udp-relay");
     // written, and an error already: whether UDP goes anywhere is open
-    let relay_unknown = relay.is_none() && r.has("udp-relay");
+    let relay_unknown = r.rejected("udp-relay");
     let udp_relay = relay.unwrap_or(false);
     let udp_port = match r.number::<u16>("udp-port", "a port from 1 to 65535") {
         Some(0) => {

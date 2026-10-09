@@ -2182,6 +2182,24 @@ H = trust-tunnel, h.test, 443, username=u, password=pw, h3=maybe, ecn=on\n{}[Rul
                     "a proxy policy or a policy group",
                 )],
             ),
+            // nor is it said of a QUIC policy's `port-hopping` that it cannot
+            // be combined with a chain that is an error
+            on(
+                "P = hysteria2, h.test, 443, password=pw, port-hopping=1000-2000, underlying-proxy=Missing",
+                vec![(
+                    codes::E_UNKNOWN_POLICY_REF,
+                    "policy `P`: `underlying-proxy` references unknown policy `Missing`"
+                        .to_string(),
+                )],
+            ),
+            on(
+                "P = hysteria2, h.test, 443, password=pw, port-hopping=1000-2000, underlying-proxy=REJECT",
+                vec![bad_value(
+                    "underlying-proxy",
+                    "REJECT",
+                    "a proxy policy or a policy group",
+                )],
+            ),
             // and a socket parameter that is an error itself
             on(
                 "P = http, p.test, 80, underlying-proxy=Q, interface=, allow-other-interface=maybe, tos=300, ip-version=v5",
@@ -2267,6 +2285,11 @@ H = trust-tunnel, h.test, 443, username=u, password=pw, h3=maybe, ecn=on\n{}[Rul
                     })
                     .collect(),
             ),
+            // one sentence for `tfo`, not also that it has no effect yet
+            on(
+                "P = wireguard, section-name=home, tfo=true",
+                not_applicable("`tfo` does not apply to `wireguard` policies; ignored"),
+            ),
             on(
                 &format!(
                     "P = vmess, v.test, 443, username={UUID}, vmess-aead=true, tls=false, sni=edge.test"
@@ -2326,6 +2349,195 @@ H = trust-tunnel, h.test, 443, username=u, password=pw, h3=maybe, ecn=on\n{}[Rul
                     "policy parameter `addresses` is parsed but has no effect in this version"
                         .to_string(),
                 )],
+            ),
+        ]);
+    }
+
+    /// The silence is about the parameter that is an error, not about the
+    /// line: a parameter whose value is fine still gets its sentence, before
+    /// the error or after it. What a faulty `port-hopping` says of a chain is
+    /// left as it is — every valid value would conflict with it —, and a
+    /// faulty `port-hopping` leaves the interval's own warning alone.
+    #[test]
+    fn an_error_in_one_parameter_leaves_the_sentences_of_the_others() {
+        let not_applicable =
+            |text: &str| (codes::W_PARAM_NOT_APPLICABLE, format!("policy `P`: {text}"));
+        let tos = "0-255 or 0x00-0xff";
+        let on = |line: &str, said: Vec<(&'static str, String)>| (line.to_string(), said);
+        assert_said(vec![
+            on(
+                "P = direct, ecn=maybe, no-error-alert=true",
+                vec![
+                    bad_value("ecn", "maybe", "auto / on / off / true / false"),
+                    not_applicable("`no-error-alert` does not apply to `direct` policies; ignored"),
+                ],
+            ),
+            on(
+                "P = external, exec=/bin/x, local-port=1080, interface=, tos=16",
+                vec![
+                    bad_value("interface", "", "a network interface name"),
+                    not_applicable("`tos` does not apply to `external` policies; ignored"),
+                ],
+            ),
+            on(
+                "P = wireguard, section-name=home, interface=, tos=16",
+                vec![
+                    bad_value("interface", "", "a network interface name"),
+                    not_applicable("`tos` does not apply to `wireguard` policies; ignored"),
+                ],
+            ),
+            on(
+                "P = http, p.test, 80, underlying-proxy=Q, interface=, tos=0x10",
+                vec![
+                    bad_value("interface", "", "a network interface name"),
+                    not_applicable(
+                        "`tos` has no effect on a policy with `underlying-proxy`; ignored",
+                    ),
+                ],
+            ),
+            // a chain that is fine, an error in some other parameter
+            on(
+                "P = http, p.test, 80, underlying-proxy=Q, interface=en0, block-quic=maybe",
+                vec![
+                    bad_value("block-quic", "maybe", "auto / on / off / true / false"),
+                    not_applicable(
+                        "`interface` has no effect on a policy with `underlying-proxy`; ignored",
+                    ),
+                ],
+            ),
+            on(
+                "P = http, h.test, 80, dns-follow-interface=true, tos=300",
+                vec![
+                    not_applicable(
+                        "`dns-follow-interface` has no effect without `interface`; ignored",
+                    ),
+                    bad_value("tos", "300", tos),
+                ],
+            ),
+            on(
+                "P = hysteria2, h.test, 443, password=pw, tfo=true, tos=300",
+                vec![
+                    bad_value("tos", "300", tos),
+                    not_applicable("`tfo` does not apply to `hysteria2` policies; ignored"),
+                ],
+            ),
+            on(
+                "P = trust-tunnel, u.test, 443, username=u, password=pw, h3=true, tfo=true, tos=300",
+                vec![
+                    bad_value("tos", "300", tos),
+                    not_applicable(
+                        "`tfo` does not apply to `trust-tunnel` policies with `h3=true`; ignored",
+                    ),
+                ],
+            ),
+            on(
+                "P = trust-tunnel, u.test, 443, username=u, password=pw, alpn=h3, tos=300",
+                vec![
+                    bad_value("tos", "300", tos),
+                    not_applicable(
+                        "`alpn` is always `h2` on `trust-tunnel` policies without `h3=true`; ignored",
+                    ),
+                ],
+            ),
+            on(
+                "P = trust-tunnel, u.test, 443, username=u, password=pw, headers=Connection:close, tos=300",
+                vec![
+                    bad_value("tos", "300", tos),
+                    not_applicable("header `connection` in `headers` is not allowed in HTTP/2; ignored"),
+                ],
+            ),
+            on(
+                "P = trust-tunnel, u.test, 443, username=u, password=pw, ecn=on, tos=300",
+                vec![
+                    bad_value("tos", "300", tos),
+                    not_applicable(
+                        "`ecn` does not apply to `trust-tunnel` policies without `h3=true`; ignored",
+                    ),
+                ],
+            ),
+            on(
+                "P = trust-tunnel, u.test, 443, username=u, password=pw, h3=false, tfo=true, tos=300",
+                vec![
+                    bad_value("tos", "300", tos),
+                    (
+                        codes::W_PARAM_NOT_EFFECTIVE,
+                        "policy parameter `tfo` is parsed but has no effect in this version"
+                            .to_string(),
+                    ),
+                ],
+            ),
+            on(
+                &format!(
+                    "P = vmess, v.test, 443, username={UUID}, vmess-aead=true, sni=edge.test, tos=300"
+                ),
+                vec![
+                    bad_value("tos", "300", tos),
+                    not_applicable("`sni` has no effect without `tls=true`; ignored"),
+                ],
+            ),
+            on(
+                "P = trojan, t.test, 443, password=pw, ws-path=/w, tos=300",
+                vec![
+                    bad_value("tos", "300", tos),
+                    not_applicable("`ws-path` has no effect without `ws=true`; ignored"),
+                ],
+            ),
+            on(
+                "P = ss, s.test, 8388, encrypt-method=aes-128-gcm, password=pw, udp-port=8389, tos=300",
+                vec![
+                    bad_value("tos", "300", tos),
+                    not_applicable("`udp-port` only applies with `udp-relay=true`; ignored"),
+                ],
+            ),
+            on(
+                "P = external, exec=/bin/x, local-port=0, addresses=192.0.2.1",
+                vec![
+                    bad_value("local-port", "0", "a port, 1-65535"),
+                    (
+                        codes::W_PARAM_NOT_EFFECTIVE,
+                        "policy parameter `addresses` is parsed but has no effect in this version"
+                            .to_string(),
+                    ),
+                ],
+            ),
+            // a valid chain is something every `port-hopping` conflicts with
+            on(
+                "P = hysteria2, h.test, 443, password=pw, port-hopping=1000-2000, underlying-proxy=Q",
+                vec![(
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `P`: `port-hopping` cannot be combined with `underlying-proxy`"
+                        .to_string(),
+                )],
+            ),
+            on(
+                "P = hysteria2, h.test, 443, password=pw, port-hopping=bogus, underlying-proxy=Q",
+                vec![
+                    bad_value(
+                        "port-hopping",
+                        "bogus",
+                        "ports from 1 to 65535 and ranges such as `5000-6000`, separated by `;`",
+                    ),
+                    (
+                        codes::E_INVALID_POLICY_PARAM,
+                        "policy `P`: `port-hopping` cannot be combined with `underlying-proxy`"
+                            .to_string(),
+                    ),
+                ],
+            ),
+            on(
+                "P = hysteria2, h.test, 443, password=pw, port-hopping=bogus, port-hopping-interval=2",
+                vec![
+                    bad_value(
+                        "port-hopping",
+                        "bogus",
+                        "ports from 1 to 65535 and ranges such as `5000-6000`, separated by `;`",
+                    ),
+                    (
+                        codes::W_INVALID_VALUE,
+                        "policy `P`: `port-hopping-interval` is below the minimum of 5 seconds; using 5"
+                            .to_string(),
+                    ),
+                ],
             ),
         ]);
     }

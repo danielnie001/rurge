@@ -31,9 +31,18 @@ impl<'a> ParamReader<'a> {
         self.policy
     }
 
-    /// `true` when the parameter is written on the policy line.
+    /// `true` when the parameter is written on the policy line. To say of a
+    /// parameter that it does not apply or has no effect, ask `has_unrejected`.
     pub fn has(&self, key: &str) -> bool {
         self.policy.params.contains(key)
+    }
+
+    /// `true` when `key` is written and its value is not an error already:
+    /// the parameters a warning that they do not apply, or have no effect,
+    /// may be said of. What is an error already gets that one sentence and
+    /// no other.
+    pub fn has_unrejected(&self, key: &str) -> bool {
+        self.has(key) && !self.rejected(key)
     }
 
     /// Marks `key` as known without reading it.
@@ -99,17 +108,19 @@ impl<'a> ParamReader<'a> {
 
     /// `E0018`. Never call this for a parameter whose value is a secret.
     pub fn invalid(&mut self, key: &str, value: &str, expected: &str) {
-        self.reject(key);
-        self.error(
+        self.error_on(
+            key,
             codes::E_INVALID_POLICY_PARAM,
             format!("invalid value `{value}` for `{key}` (expected {expected})"),
         );
     }
 
-    /// Notes that the value of `key` is reported as an error, for an error
-    /// that does not go through `invalid` (which notes it itself).
-    pub fn reject(&mut self, key: &str) {
+    /// An error about the value of `key`, which is then `rejected`. This is
+    /// the one way a key becomes rejected, so none is without an error beside
+    /// it.
+    pub fn error_on(&mut self, key: &str, code: &'static str, message: String) {
         self.rejected.insert(key.to_ascii_lowercase());
+        self.error(code, message);
     }
 
     /// Whether the value of `key` was reported as an error. That error is
@@ -202,9 +213,16 @@ mod tests {
         assert_eq!(r.str("tos"), Some("1"));
         assert!(r.rejected("tfo") && r.rejected("TFO") && r.rejected("ip-version"));
         assert!(!r.rejected("tos") && !r.rejected("absent"));
-        // an error that did not go through `invalid`
-        r.reject("Underlying-Proxy");
-        assert!(r.rejected("underlying-proxy"));
+        // a parameter a warning may be said of: written, and not an error
+        assert!(r.has_unrejected("tos"));
+        assert!(!r.has_unrejected("tfo") && !r.has_unrejected("absent"));
+        // an error that is not `invalid`'s is the other way to reject
+        r.error_on(
+            "Underlying-Proxy",
+            codes::E_UNKNOWN_POLICY_REF,
+            "x".to_string(),
+        );
+        assert!(r.rejected("underlying-proxy") && r.has_errors());
     }
 
     #[test]
