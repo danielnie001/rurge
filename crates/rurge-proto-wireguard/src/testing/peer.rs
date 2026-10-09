@@ -2,7 +2,7 @@
 
 use super::{PeerCore, PeerOpts};
 use std::net::{SocketAddr, SocketAddrV4};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -19,6 +19,7 @@ pub struct FakeWgPeer {
     public_key: [u8; 32],
     core: Arc<Mutex<PeerCore>>,
     silent: Arc<AtomicBool>,
+    due_while_silent: Arc<AtomicUsize>,
     clients: Arc<Mutex<Vec<SocketAddr>>>,
     socket: Arc<UdpSocket>,
     task: JoinHandle<()>,
@@ -38,12 +39,14 @@ impl FakeWgPeer {
         let public_key = core.public_key();
         let core = Arc::new(Mutex::new(core));
         let silent = Arc::new(AtomicBool::new(false));
+        let due_while_silent = Arc::new(AtomicUsize::new(0));
         let clients = Arc::new(Mutex::new(Vec::new()));
         let socket = Arc::new(socket);
         let task = tokio::spawn(serve(
             socket.clone(),
             core.clone(),
             silent.clone(),
+            due_while_silent.clone(),
             clients.clone(),
         ));
         FakeWgPeer {
@@ -51,6 +54,7 @@ impl FakeWgPeer {
             public_key,
             core,
             silent,
+            due_while_silent,
             clients,
             socket,
             task,
@@ -92,6 +96,12 @@ impl FakeWgPeer {
     pub fn go_silent(&self, silent: bool) {
         self.silent.store(silent, Ordering::SeqCst);
     }
+
+    /// How many times its stack came due while it was silent: once for
+    /// each deadline a silence caught, however long the silence lasted.
+    pub fn due_while_silent(&self) -> usize {
+        self.due_while_silent.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for FakeWgPeer {
@@ -104,6 +114,7 @@ async fn serve(
     socket: Arc<UdpSocket>,
     core: Arc<Mutex<PeerCore>>,
     silent: Arc<AtomicBool>,
+    due_while_silent: Arc<AtomicUsize>,
     clients: Arc<Mutex<Vec<SocketAddr>>>,
 ) {
     let mut buf = vec![0u8; 65536];
@@ -153,6 +164,11 @@ async fn serve(
             }
             _ = stack_due => {
                 if silent.load(Ordering::SeqCst) {
+                    due_while_silent.fetch_add(1, Ordering::SeqCst);
+                    // or it would be due again at once, round and round for
+                    // as long as the silence lasts; the timer's first tick
+                    // after the silence finds when the stack is due next
+                    due = None;
                     continue;
                 }
                 core.lock().expect("the peer").advance(&mut out)

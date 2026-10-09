@@ -13,7 +13,8 @@ use smoltcp::socket::udp;
 use std::future::poll_fn;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::pin::pin;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Poll, Waker};
 
 pub(crate) struct TunnelUdp {
@@ -30,6 +31,15 @@ fn slot(ip: IpAddr) -> usize {
         IpAddr::V4(_) => 0,
         IpAddr::V6(_) => 1,
     }
+}
+
+/// One of the carrier's own locks, poisoned or not. `send_to` holds them
+/// together with the stack's: a panic there poisons all three, and what
+/// these two guard — which sockets are open, who waits — is as valid after
+/// it as before. The carrier then says what the stack's lock makes it say,
+/// that the tunnel is over, instead of panicking in its turn.
+fn lock<T>(of: &Mutex<T>) -> MutexGuard<'_, T> {
+    of.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl TunnelUdp {
@@ -75,7 +85,7 @@ impl PacketSocket for TunnelUdp {
                 stack.check(ip).map_err(|refusal| {
                     io::Error::new(io::ErrorKind::Unsupported, refusal.to_string())
                 })?;
-                let mut sockets = self.sockets.lock().expect("the sockets");
+                let mut sockets = lock(&self.sockets);
                 let handle = match sockets[slot(ip)] {
                     Some(handle) => handle,
                     None => {
@@ -84,7 +94,7 @@ impl PacketSocket for TunnelUdp {
                         })?;
                         sockets[slot(ip)] = Some(handle);
                         // the receiver waits on the sockets it knew of
-                        if let Some(waker) = self.receiver.lock().expect("the receiver").take() {
+                        if let Some(waker) = lock(&self.receiver).take() {
                             waker.wake();
                         }
                         handle
@@ -112,34 +122,44 @@ impl PacketSocket for TunnelUdp {
 
     /// A datagram longer than `buf` is cut to it: give it 64 KiB.
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
-        Box::pin(poll_fn(move |cx| {
-            // told of a socket that opens from here on
-            *self.receiver.lock().expect("the receiver") = Some(cx.waker().clone());
-            let handles = *self.sockets.lock().expect("the sockets");
-            let mut stack = self.device.shared.stack().map_err(|_| closed())?;
-            for handle in handles.into_iter().flatten() {
-                let socket = stack.udp(handle);
-                if let Ok((datagram, meta)) = socket.recv() {
-                    let n = datagram.len().min(buf.len());
-                    buf[..n].copy_from_slice(&datagram[..n]);
-                    let from =
-                        Target::new(HostName::Ip(meta.endpoint.addr.into()), meta.endpoint.port);
-                    return Poll::Ready(Ok((n, from)));
+        Box::pin(async move {
+            // the tunnel's end wakes whoever waits on a socket; a carrier
+            // that has sent nothing has none, and waits on this as well
+            let mut ended = pin!(self.device.shared.ended());
+            poll_fn(|cx| {
+                let _ = ended.as_mut().poll(cx);
+                // told of a socket that opens from here on
+                *lock(&self.receiver) = Some(cx.waker().clone());
+                let handles = *lock(&self.sockets);
+                let mut stack = self.device.shared.stack().map_err(|_| closed())?;
+                for handle in handles.into_iter().flatten() {
+                    let socket = stack.udp(handle);
+                    if let Ok((datagram, meta)) = socket.recv() {
+                        let n = datagram.len().min(buf.len());
+                        buf[..n].copy_from_slice(&datagram[..n]);
+                        let from = Target::new(
+                            HostName::Ip(meta.endpoint.addr.into()),
+                            meta.endpoint.port,
+                        );
+                        return Poll::Ready(Ok((n, from)));
+                    }
+                    socket.register_recv_waker(cx.waker());
                 }
-                socket.register_recv_waker(cx.waker());
-            }
-            // after the wakers are in: a close that races this poll wakes them
-            if self.device.is_closed() {
-                return Poll::Ready(Err(closed()));
-            }
-            Poll::Pending
-        }))
+                // after the wakers are in: an end that races this poll
+                // wakes them
+                if self.device.is_closed() {
+                    return Poll::Ready(Err(closed()));
+                }
+                Poll::Pending
+            })
+            .await
+        })
     }
 }
 
 impl Drop for TunnelUdp {
     fn drop(&mut self) {
-        let handles = *self.sockets.lock().expect("the sockets");
+        let handles = *lock(&self.sockets);
         if let Ok(mut stack) = self.device.shared.stack() {
             for handle in handles.into_iter().flatten() {
                 stack.udp_close(handle);

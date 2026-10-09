@@ -20,6 +20,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 use tokio::io::ReadBuf;
 use tokio::sync::Notify;
+use tokio::sync::futures::Notified;
 use tokio::task::JoinSet;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -138,9 +139,12 @@ impl From<Ending> for OutboundError {
     }
 }
 
-/// What a connection or a UDP carrier of a tunnel that is over says,
-/// whatever ended the tunnel: it fails, as one whose far end went away
-/// does, and is not used again.
+/// What a UDP carrier says of a tunnel that is over, whatever ended it, and
+/// what a call on the device says of one that closed: the flow fails, as
+/// one whose far end went away does, and is not used again. An established
+/// connection says it only when the stack's lock is poisoned: on a tunnel
+/// that a later configuration took over, or whose task ended, its reads
+/// and writes report the reset of its socket, or a broken pipe (`stream`).
 pub(crate) fn closed() -> io::Error {
     io::Error::new(
         io::ErrorKind::ConnectionAborted,
@@ -161,6 +165,8 @@ pub(crate) struct Shared {
     greet: AtomicBool,
     /// Told of every handshake that completes, and of the tunnel's end.
     handshaken: Notify,
+    /// Told of the tunnel's end alone (`ended`).
+    ended: Notify,
     /// Why the tunnel is over, once it is.
     ending: OnceLock<Ending>,
 }
@@ -173,6 +179,14 @@ impl Shared {
     /// Why the tunnel is over, when it is.
     pub(crate) fn ending(&self) -> Option<Ending> {
         self.ending.get().copied()
+    }
+
+    /// Resolves when the tunnel ends: for whoever waits on the tunnel with
+    /// no socket of its stack to wait on — a UDP carrier that has sent
+    /// nothing yet. Made before the look at `ending`, it misses no end: an
+    /// end before it was made shows in `ending`, a later one wakes it.
+    pub(crate) fn ended(&self) -> Notified<'_> {
+        self.ended.notified()
     }
 
     /// The stack, of a tunnel that is over too: its sockets are still
@@ -207,9 +221,10 @@ impl Shared {
     }
 
     /// `end`, by whoever holds the stack's lock already; what ended the
-    /// tunnel. The ending is set with the lock held, here alone: whoever
-    /// looks for it with the lock held either finds it, or has left a waker
-    /// in a socket before the sockets are reset.
+    /// tunnel. The ending is set with the lock held, here alone, and before
+    /// anyone is woken: whoever looks for it with the lock held either finds
+    /// it, or has left a waker in a socket before the sockets are reset;
+    /// whoever waits to be notified asked for that before looking.
     fn end_with(&self, mut stack: MutexGuard<'_, Stack>, ending: Ending) -> Ending {
         if let Some(first) = self.ending() {
             return first;
@@ -220,6 +235,7 @@ impl Shared {
         // the task leaves its loop
         self.kick();
         self.handshaken.notify_waiters();
+        self.ended.notify_waiters();
         ending
     }
 }
@@ -312,6 +328,7 @@ impl Device {
             network_changed: AtomicBool::new(false),
             greet: AtomicBool::new(false),
             handshaken: Notify::new(),
+            ended: Notify::new(),
             ending: OnceLock::new(),
         });
         // one critical section: sharing (another dial may have got there
@@ -390,6 +407,13 @@ impl Device {
     /// another.
     pub(crate) fn is_closed(&self) -> bool {
         self.shared.ending().is_some()
+    }
+
+    /// Whether the tunnel ended on its own — its task ended, or its stack's
+    /// lock was found poisoned — rather than by a later configuration
+    /// taking it over.
+    pub(crate) fn ended_unexpectedly(&self) -> bool {
+        matches!(self.shared.ending(), Some(Ending::Closed))
     }
 
     /// The network changed: every carrier is dialled anew and each peer
@@ -526,6 +550,13 @@ impl Device {
         })
         .join();
         assert!(panicked.is_err());
+    }
+
+    /// Whether a panic with the stack's lock held has poisoned it (a
+    /// test's).
+    #[cfg(test)]
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.shared.stack.is_poisoned()
     }
 }
 

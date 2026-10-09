@@ -114,6 +114,15 @@ impl WireGuardOutbound {
         {
             return Ok(device.clone());
         }
+        // a tunnel that ended on its own is said so, once: the slot stays
+        // empty until another has started. One that a later configuration
+        // took over is no surprise, and one that nobody holds any more is
+        // never found here
+        if let Some(ended) = slot.take()
+            && ended.ended_unexpectedly()
+        {
+            tracing::warn!(policy = %self.name, "wireguard: the tunnel ended unexpectedly; the next connection starts a new one");
+        }
         let device = Device::start(
             &self.name,
             &self.names.section,
@@ -335,11 +344,12 @@ mod tests {
     };
     use std::io;
     use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::task::{Context, Poll};
+    use std::task::{Context, Poll, Waker};
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 
     /// Names to addresses, for the destinations resolved on this machine.
     struct Names(Vec<(&'static str, Vec<IpAddr>)>);
@@ -2006,6 +2016,9 @@ mod tests {
     /// panic.
     async fn dies(armed: &AtomicBool) {
         armed.store(true, Ordering::SeqCst);
+        // on the tests' current-thread runtime the task has unwound, and
+        // ended the tunnel, by the time this one sees the switch taken; on
+        // a multi-thread one the switch could be seen before the end
         until(|| !armed.load(Ordering::SeqCst)).await;
     }
 
@@ -2057,6 +2070,10 @@ mod tests {
         assert_eq!(echo(&mut stream, b"before").await, b"before");
 
         wg.device(&within(5)).await.unwrap().poison();
+        // on the tests' current-thread runtime nothing runs between the
+        // poisoning and this call, which is the first to find it; on a
+        // multi-thread one the device's task could find it first, and this
+        // call would start a new tunnel instead of failing
         let e = wg
             .connect_tcp(&to, &within(5))
             .await
@@ -2158,7 +2175,7 @@ mod tests {
     /// A call that waits on the device, on a tunnel whose peer never lets
     /// it go on.
     struct Parked {
-        _peer: FakeWgPeer,
+        peer: FakeWgPeer,
         wg: Arc<WireGuardOutbound>,
         /// Kills the tunnel's task (`Fragile`).
         armed: Arc<AtomicBool>,
@@ -2211,7 +2228,7 @@ mod tests {
         })
         .await;
         Parked {
-            _peer: peer,
+            peer,
             wg,
             armed,
             call,
@@ -2406,5 +2423,284 @@ mod tests {
         assert_eq!(echo(&mut kept, b"kept").await, b"kept");
         assert_eq!(echo(&mut current, b"current").await, b"current");
         assert_eq!(peer.core().handshakes, 1);
+    }
+
+    /// A receive on `carrier` in a task of its own, once it has been
+    /// polled: from here on only a wake-up ends it.
+    async fn receiving(carrier: BoxedPacketSocket) -> tokio::task::JoinHandle<io::Result<()>> {
+        let polled = Arc::new(AtomicBool::new(false));
+        let receive = tokio::spawn({
+            let polled = polled.clone();
+            async move {
+                let mut buf = [0u8; 64];
+                let mut receive = carrier.recv_from(&mut buf);
+                std::future::poll_fn(|cx| {
+                    let received = receive.as_mut().poll(cx);
+                    polled.store(true, Ordering::SeqCst);
+                    received
+                })
+                .await
+                .map(|_| ())
+            }
+        });
+        until(|| polled.load(Ordering::SeqCst)).await;
+        receive
+    }
+
+    /// What a receive that waits ends with once its tunnel is over: within
+    /// a second.
+    async fn ended(receive: tokio::task::JoinHandle<io::Result<()>>) -> String {
+        tokio::time::timeout(Duration::from_secs(1), receive)
+            .await
+            .expect("the receive ends at once")
+            .expect("the receive does not panic")
+            .unwrap_err()
+            .to_string()
+    }
+
+    /// A UDP carrier that has sent nothing has no socket of the stack to
+    /// wait on: its receive is woken all the same when a later
+    /// configuration takes the tunnel over. A carrier says that the tunnel
+    /// has closed, whatever ended it.
+    #[tokio::test]
+    async fn a_carrier_that_has_sent_nothing_is_woken_when_a_later_configuration_takes_over() {
+        let (_peer, old) = tunnel(PeerOpts::default(), |_| {}).await;
+        let carrier = old.open_udp(&within(5)).await.expect("a carrier");
+        let receive = receiving(carrier).await;
+        let _new = superseding(&old).await;
+        assert_eq!(ended(receive).await, CLOSED);
+    }
+
+    /// And when the tunnel closes: its task died.
+    #[tokio::test]
+    async fn a_carrier_that_has_sent_nothing_is_woken_when_the_tunnel_closes() {
+        let (_peer, wg, armed) = fragile_tunnel(PeerOpts::default(), |_| {}).await;
+        let carrier = wg.open_udp(&within(5)).await.expect("a carrier");
+        let receive = receiving(carrier).await;
+        dies(&armed).await;
+        assert_eq!(ended(receive).await, CLOSED);
+    }
+
+    /// Panics when woken (a test's): a panic inside whoever wakes it.
+    struct Bomb;
+
+    impl std::task::Wake for Bomb {
+        fn wake(self: Arc<Self>) {
+            panic!("a waker that panics when woken (a test's)");
+        }
+    }
+
+    /// A panic inside `send_to` — here of the waker it wakes when the
+    /// carrier's first socket opens — leaves the stack's lock and the
+    /// carrier's own two poisoned. The carrier then reports the tunnel's
+    /// end, as everyone on that tunnel does, instead of panicking on its
+    /// own locks; and it can be let go of.
+    #[tokio::test]
+    async fn a_carrier_whose_send_panicked_reports_the_tunnels_end() {
+        let (_peer, wg) = tunnel(PeerOpts::default(), |_| {}).await;
+        let device = wg.device(&within(5)).await.unwrap();
+        let carrier = Arc::new(TunnelUdp::new(device.clone(), wg.names.clone()));
+        let to = at("10.0.0.1", ECHO_PORT);
+        // a receiver whose waker panics: the send that opens the first
+        // socket wakes it, with the three locks held
+        let bomb = Waker::from(Arc::new(Bomb));
+        let mut buf = [0u8; 64];
+        let waiting = carrier
+            .recv_from(&mut buf)
+            .as_mut()
+            .poll(&mut Context::from_waker(&bomb));
+        assert!(waiting.is_pending());
+        let sending = tokio::spawn({
+            let (carrier, to) = (carrier.clone(), to.clone());
+            async move { carrier.send_to(b"x", &to).await }
+        });
+        assert!(sending.await.unwrap_err().is_panic(), "the send panicked");
+        assert!(device.is_poisoned(), "with the stack's lock held");
+
+        let at_once = Duration::from_secs(1);
+        let received = tokio::time::timeout(at_once, carrier.recv_from(&mut [0u8; 64]))
+            .await
+            .expect("the receive ends")
+            .unwrap_err();
+        assert_eq!(received.to_string(), CLOSED);
+        let sent = tokio::time::timeout(at_once, carrier.send_to(b"x", &to))
+            .await
+            .expect("the send ends")
+            .unwrap_err();
+        assert_eq!(sent.to_string(), CLOSED);
+        // the last holder: the carrier's own `Drop` runs here
+        drop(carrier);
+    }
+
+    /// The device's task itself panics while it holds the stack's lock —
+    /// here in the waker of a connection's reader, which the stack wakes as
+    /// the data arrives: unwinding leaves the lock poisoned, and the task's
+    /// end ends the tunnel all the same. Whoever waits on it is told that
+    /// it has closed, and the next connection starts another.
+    #[tokio::test]
+    async fn a_task_that_panics_with_the_stack_locked_ends_the_tunnel_all_the_same() {
+        // a dial of a name, waiting for an answer its name server never gives
+        let parked = parked(Wait::Query).await;
+        let to = at("10.0.0.1", ECHO_PORT);
+        let mut stream = parked
+            .wg
+            .connect_tcp(&to, &within(5))
+            .await
+            .expect("a connection");
+        let device = parked.wg.device(&within(5)).await.unwrap();
+        let bomb = Waker::from(Arc::new(Bomb));
+        let mut buf = [0u8; 8];
+        let reading = Pin::new(&mut stream)
+            .poll_read(&mut Context::from_waker(&bomb), &mut ReadBuf::new(&mut buf));
+        assert!(reading.is_pending());
+        // its echo is what the stack wakes the reader for
+        stream.write_all(b"x").await.unwrap();
+        assert_eq!(failure(parked.call).await, CLOSED);
+        assert!(device.is_poisoned(), "the task panicked with the lock held");
+
+        let mut fresh = parked
+            .wg
+            .connect_tcp(&to, &within(5))
+            .await
+            .expect("a connection through a new tunnel");
+        assert_eq!(echo(&mut fresh, b"after").await, b"after");
+        let handshakes = parked.peer.core().handshakes;
+        assert_eq!(handshakes, 2, "a new tunnel greeted the peer");
+    }
+
+    /// What this thread logs, captured: a line for each event — its level,
+    /// then its fields by name. Hand-written: the crate depends on no
+    /// subscriber.
+    #[derive(Clone, Default)]
+    struct Log(Arc<StdMutex<Vec<String>>>);
+
+    impl Log {
+        /// Captures while the guard and the second dispatcher live. While
+        /// one dispatcher alone is registered, tracing asks only the thread
+        /// that first reaches a call site whether it is wanted: a site
+        /// another test reached first would stay shut on this thread too.
+        fn capture() -> (Log, tracing::subscriber::DefaultGuard, tracing::Dispatch) {
+            let log = Log::default();
+            let logging = tracing::subscriber::set_default(log.clone());
+            let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            (log, logging, second)
+        }
+
+        /// The lines that have `text` in them.
+        fn with(&self, text: &str) -> Vec<String> {
+            let lines = self.0.lock().unwrap();
+            lines
+                .iter()
+                .filter(|line| line.contains(text))
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl tracing::Subscriber for Log {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = Fields(Vec::new());
+            event.record(&mut fields);
+            fields.0.sort();
+            let line = format!("{} {}", event.metadata().level(), fields.0.join(" "));
+            self.0.lock().unwrap().push(line);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// An event's fields, each as `name=value`.
+    struct Fields(Vec<String>);
+
+    impl tracing::field::Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    /// A tunnel that ended on its own — its task died — is said so in the
+    /// log when the next connection finds it: once, with the policy's name
+    /// and nothing else, whether another tunnel can start or not. One that
+    /// a later configuration took over is not.
+    #[tokio::test]
+    async fn a_tunnel_that_ended_unexpectedly_is_said_so_once() {
+        const SAID: &str = "WARN message=wireguard: the tunnel ended unexpectedly; \
+                            the next connection starts a new one policy=WG";
+        let (log, _logging, _second) = Log::capture();
+        let (_peer, wg, armed) = fragile_tunnel(PeerOpts::default(), |_| {}).await;
+        let to = at("10.0.0.1", ECHO_PORT);
+        wg.connect_tcp(&to, &within(5)).await.expect("a connection");
+        dies(&armed).await;
+        for _ in 0..2 {
+            wg.connect_tcp(&to, &within(5))
+                .await
+                .expect("a connection through a new tunnel");
+        }
+        assert_eq!(log.with("ended unexpectedly"), [SAID]);
+
+        // the new tunnel dies too, and this time none can take its place: a
+        // later configuration has started its own meanwhile
+        dies(&armed).await;
+        let _later = superseding(&wg).await;
+        for _ in 0..2 {
+            let e = wg
+                .connect_tcp(&to, &within(5))
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert_eq!(e.to_string(), SUPERSEDED);
+        }
+        assert_eq!(log.with("ended unexpectedly"), [SAID, SAID]);
+
+        // a later configuration taking a running tunnel over is no surprise
+        let (_peer, old) = tunnel(PeerOpts::default(), |_| {}).await;
+        old.connect_tcp(&to, &within(5))
+            .await
+            .expect("a connection");
+        let _newer = superseding(&old).await;
+        let e = old
+            .connect_tcp(&to, &within(5))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(e.to_string(), SUPERSEDED);
+        assert_eq!(log.with("ended unexpectedly").len(), 2);
+    }
+
+    /// The fake peer told to be silent while its stack has a deadline — a
+    /// connection is open, what it echoed not acknowledged yet — waits the
+    /// silence out instead of going round and round: the deadline comes due
+    /// once, and the stack carries on when the silence ends.
+    #[tokio::test]
+    async fn a_silent_fake_peer_waits_instead_of_spinning() {
+        let (peer, wg) = tunnel(PeerOpts::default(), |_| {}).await;
+        let mut stream = wg
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        // the acknowledgement of this echo is still to come: the peer's
+        // stack is due to send the echo again
+        assert_eq!(echo(&mut stream, b"before").await, b"before");
+        peer.go_silent(true);
+        until(|| peer.due_while_silent() > 0).await;
+        // what is measured: it stays silent a while longer
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(peer.due_while_silent(), 1, "it went round while silent");
+        peer.go_silent(false);
+        assert_eq!(echo(&mut stream, b"after").await, b"after");
     }
 }
