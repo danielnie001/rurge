@@ -351,16 +351,19 @@ fn check_underlying(r: &mut ParamReader<'_>, common: &mut CommonOpts, env: &Spec
 fn read_server(r: &mut ParamReader<'_>) -> Option<HostName> {
     match &r.policy().server {
         Some(HostName::Domain(name)) if !name.is_ascii() => {
-            let ascii = crate::hostname::to_ascii(name);
-            if ascii.is_none() {
+            // read as a written name is: a dot that UTS #46 left at its end
+            // goes, and digits it made ASCII are an address
+            let server = crate::hostname::to_ascii(name)
+                .map(|ascii| HostName::parse(&ascii))
+                // nothing but dots: no name is left of it
+                .filter(|server| server.as_domain() != Some(""));
+            if server.is_none() {
                 r.error(
                     codes::E_INVALID_POLICY_PARAM,
                     "the server's host name cannot be written in ASCII (IDNA)".to_string(),
                 );
             }
-            // read as a written name is: a dot that UTS #46 left at its end
-            // goes, and digits it made ASCII are an address
-            ascii.map(|ascii| HostName::parse(&ascii))
+            server
         }
         written => written.clone(),
     }
@@ -754,13 +757,16 @@ mod tests {
     }
 
     /// A name that UTS #46 cannot turn into a host name — the fullwidth `＠`
-    /// folds onto `@` — is an error, which does not quote it.
+    /// folds onto `@` — is an error, which does not quote it; and so is one
+    /// of nothing but dots, which leaves no name at all.
     #[test]
     fn a_server_without_an_ascii_form_is_an_error() {
         for (kind, written) in [
             ("trojan", "a＠b.example"),
             ("http", "bü cher.example"),
             ("https", "bücher：8388"),
+            ("trojan", "。"),
+            ("http", "．。"),
         ] {
             let o = outcome("T", &format!("{kind}, {written}, 443, password=x"));
             assert!(o.spec.is_none(), "{written}");

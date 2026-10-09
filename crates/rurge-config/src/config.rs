@@ -1589,7 +1589,8 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
     }
 
     /// A server written in Unicode is looked up by its A-labels: that is
-    /// the name `[Host]` must not apply to.
+    /// the name `[Host]` must not apply to. The spelling it was written in
+    /// stays in the list as well.
     #[test]
     fn proxy_hostnames_hold_the_a_labels_of_a_server_written_in_unicode() {
         let l = load_text("[Proxy]\nA = http, bücher.example, 8080\n[Rule]\nFINAL,DIRECT\n");
@@ -1598,8 +1599,9 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
             "{:?}",
             l.diagnostics.into_vec()
         );
-        let names = l.config.proxy_hostnames();
-        assert!(names.contains("xn--bcher-kva.example"), "{names:?}");
+        let mut names: Vec<String> = l.config.proxy_hostnames().into_iter().collect();
+        names.sort();
+        assert_eq!(names, ["bücher.example", "xn--bcher-kva.example"]);
     }
 
     #[test]

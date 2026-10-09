@@ -402,6 +402,13 @@ fn smart_members(
     (kept, factors)
 }
 
+/// The warning about the members a group loses with a relay that was left
+/// out names this many of them at most. A subscription is somebody else's
+/// content and may hold thousands behind one relay: the rest are only
+/// counted, as a subscription's skipped lines are
+/// (`subscription::MAX_SKIPPED_LISTED`).
+const MAX_DANGLING_NAMED: usize = 20;
+
 /// The imported and the derived policies whose `underlying-proxy` leads to
 /// one of `failed` — those of them that could not be built — however many
 /// of their own kind lie between: none of these could be dialled. A relay
@@ -616,15 +623,21 @@ impl PolicyRegistry {
             let assembled = assembly.members_of(&g.name);
             // said once per group and by name only (M3-D7), as the assembly
             // says it of an import whose relay it left out itself
-            let lost: Vec<&str> = assembled
+            let mut lost = assembled
                 .iter()
                 .map(String::as_str)
-                .filter(|m| dangling.contains(*m))
-                .collect();
-            if !lost.is_empty() {
+                .filter(|m| dangling.contains(*m));
+            let named: Vec<&str> = lost.by_ref().take(MAX_DANGLING_NAMED).collect();
+            let more = lost.count();
+            if !named.is_empty() {
+                let mut members = named.join(", ");
+                if more > 0 {
+                    members += &format!(" and {more} more");
+                }
                 tracing::warn!(
                     group = %g.name,
-                    members = %lost.join(", "),
+                    count = named.len() + more,
+                    members = %members,
                     "members whose `underlying-proxy` leads to a policy that was left out are left out too"
                 );
             }
@@ -2157,7 +2170,7 @@ Fine = http, f.example, 80\nOver = http, o.example, 80, underlying-proxy=Fine",
             warnings,
             [
                 "policy cannot be built; it is left out policy=X",
-                "members whose `underlying-proxy` leads to a policy that was left out are left out too group=Plain members=Z, Y",
+                "members whose `underlying-proxy` leads to a policy that was left out are left out too group=Plain count=2 members=Z, Y",
             ]
         );
         for warning in &warnings {
@@ -2165,6 +2178,34 @@ Fine = http, f.example, 80\nOver = http, o.example, 80, underlying-proxy=Fine",
                 assert!(!warning.contains(value), "{warning}");
             }
         }
+    }
+
+    /// A subscription is somebody else's content and may hold thousands of
+    /// lines behind one relay: the warning names the first twenty members
+    /// it leaves out and counts them all.
+    #[test]
+    fn the_warning_names_twenty_members_at_most_and_counts_them_all() {
+        let factory = FakeFactory {
+            broken: Some("X"),
+            ..FakeFactory::new()
+        };
+        let names: Vec<String> = (1..=25).map(|i| format!("N{i:02}")).collect();
+        let mut nodes = String::from("X = http, x.example, 8443\n");
+        for name in &names {
+            nodes += &format!("{name} = http, n.example, 80, underlying-proxy=X\n");
+        }
+        let (reg, warnings) = warned(|| subscribed(&nodes, &factory, &RegistryCell::new(), None));
+        assert_eq!(reg.members("Plain").unwrap(), strings(&["DIRECT"]));
+        assert_eq!(
+            warnings,
+            [
+                "policy cannot be built; it is left out policy=X".to_string(),
+                format!(
+                    "members whose `underlying-proxy` leads to a policy that was left out are left out too group=Plain count=25 members={} and 5 more",
+                    names[..20].join(", ")
+                ),
+            ]
+        );
     }
 
     /// A derived `M (via R)` whose relay was left out goes the same way. No
@@ -2213,7 +2254,7 @@ Fine = http, f.example, 80\nOver = http, o.example, 80, underlying-proxy=Fine",
             warnings,
             [
                 "policy cannot be built; it is left out policy=X",
-                "members whose `underlying-proxy` leads to a policy that was left out are left out too group=Plain members=A (via X)",
+                "members whose `underlying-proxy` leads to a policy that was left out are left out too group=Plain count=1 members=A (via X)",
             ]
         );
     }

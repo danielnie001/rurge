@@ -849,7 +849,6 @@ impl Outbound for SshOutbound {
 mod tests {
     use super::*;
     use crate::testing::{FakeSsh, FakeSshOpts, RSA_KEY, keystore_item, random_key};
-    use rurge_config::HostName;
     use rurge_config::spec::ssh::DEFAULT_IDLE_TIMEOUT;
     use rurge_net::connector::{DirectConnector, SystemResolve};
     use russh::keys::PublicKey;

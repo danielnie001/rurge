@@ -180,8 +180,9 @@ impl Names {
     /// the tunnel — the first that answers ends the search, `system` asks
     /// this machine — or, without any, from this machine (M4-D9). A server
     /// in the tunnel is asked for the name in its ASCII form, an IDN as its
-    /// A-labels. An error when one is to be asked and the name has no such
-    /// form, and when the tunnel is over: none of its servers would answer.
+    /// A-labels, and passed over for a name without one. An error when the
+    /// search ends without an answer and one was passed over so, and when
+    /// the tunnel is over: none of its servers would answer.
     async fn lookup(
         &self,
         name: &str,
@@ -199,6 +200,7 @@ impl Names {
             return Ok(Some(addrs));
         }
         let asked = rurge_config::hostname::to_ascii(name);
+        let mut passed_over = false;
         for server in &self.section.dns_servers {
             let server = match server {
                 TunnelDns::System => match self.resolver.resolve(name).await {
@@ -207,10 +209,11 @@ impl Names {
                 },
                 TunnelDns::Server(server) => *server,
             };
+            // no question can carry the name: `system`, further down the
+            // list, may still know it
             let Some(asked) = &asked else {
-                return Err(OutboundError::Dns(
-                    "wireguard: the host name cannot be looked up".to_string(),
-                ));
+                passed_over = true;
+                continue;
             };
             // a question sent before the tunnel's first handshake waits for
             // it in boringtun, whose retry of a lost initiation comes after
@@ -228,6 +231,11 @@ impl Names {
                 Instant::now(),
             );
             return Ok((!addrs.is_empty()).then_some(addrs));
+        }
+        if passed_over {
+            return Err(OutboundError::Dns(
+                "wireguard: the host name cannot be looked up".to_string(),
+            ));
         }
         Ok(None)
     }
@@ -814,6 +822,62 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(2), "{host}");
         }
         assert!(peer.core().dns_questions.is_empty());
+    }
+
+    /// A tunnel with `servers` as its `dns-server`s, where this machine
+    /// knows `known` at 10.0.0.1; and its peer.
+    async fn with_dns_servers(
+        servers: Vec<TunnelDns>,
+        known: &'static str,
+    ) -> (FakeWgPeer, WireGuardOutbound) {
+        let names = Arc::new(Names(vec![(known, vec![ip("10.0.0.1")])]));
+        tunnel_with(
+            PeerOpts::default(),
+            |s| s.dns_servers = servers,
+            names,
+            direct(),
+        )
+        .await
+    }
+
+    /// A server in the tunnel passes over a name no question can carry; it
+    /// does not end the search. `system`, further down the list, is still
+    /// asked, and answers for this machine as it did.
+    #[tokio::test]
+    async fn a_name_a_tunnel_server_cannot_be_asked_for_still_reaches_system() {
+        let in_tunnel = TunnelDns::Server(SocketAddr::new(DNS_ADDRESS.into(), 53));
+        let unaskable = |port| Target::new(HostName::Domain("a＠b.example".into()), port);
+        let (peer, wg) = with_dns_servers(vec![in_tunnel, TunnelDns::System], "a＠b.example").await;
+        let mut stream = wg
+            .connect_tcp(&unaskable(ECHO_PORT), &within(5))
+            .await
+            .expect("resolved on this machine");
+        assert_eq!(echo(&mut stream, b"ping").await, b"ping");
+        assert!(peer.core().dns_questions.is_empty());
+
+        // nobody answers: the lookup fails for what the tunnel's server
+        // could not be asked ...
+        let (_peer, wg) = with_dns_servers(vec![in_tunnel, TunnelDns::System], "other.test").await;
+        let e = wg
+            .connect_tcp(&unaskable(ECHO_PORT), &within(5))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "dns: wireguard: the host name cannot be looked up"
+        );
+        // ... and a list without one fails as no `dns-server` at all does
+        let (_peer, wg) = with_dns_servers(vec![TunnelDns::System], "other.test").await;
+        let e = wg
+            .connect_tcp(&unaskable(ECHO_PORT), &within(5))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "dns: wireguard: dns lookup of a＠b.example failed"
+        );
     }
 
     /// A question that goes unanswered is sent again, the same one, every
