@@ -67,7 +67,8 @@ fn read_pinned_tls(
     which: &str,
 ) -> TlsOpts {
     let mut tls = read_tls(r, keystore);
-    if !tls.alpn.is_empty() && tls.alpn != [alpn] {
+    // an `h3` that is an error leaves open which one a `trust-tunnel` speaks
+    if !tls.alpn.is_empty() && tls.alpn != [alpn] && !r.rejected("h3") {
         let kind = r.policy().kind.keyword();
         r.warn(
             codes::W_PARAM_NOT_APPLICABLE,
@@ -84,6 +85,8 @@ fn read_pinned_tls(
 /// malformed (RFC 9113 8.3.1, RFC 9114 4.3.1).
 fn read_connect_headers(r: &mut ParamReader<'_>, http: &str) -> Vec<HeaderTemplate> {
     let mut headers = read_headers(r);
+    // an `h3` that is an error leaves open which HTTP the line speaks
+    let open = r.rejected("h3");
     headers.retain(|header| {
         let name = header.name.to_ascii_lowercase();
         let why = if CONNECTION_SPECIFIC.contains(&name.as_str()) {
@@ -93,10 +96,12 @@ fn read_connect_headers(r: &mut ParamReader<'_>, http: &str) -> Vec<HeaderTempla
         } else {
             return true;
         };
-        r.warn(
-            codes::W_PARAM_NOT_APPLICABLE,
-            format!("header `{name}` in `headers` is not allowed in {http}{why}; ignored"),
-        );
+        if !open {
+            r.warn(
+                codes::W_PARAM_NOT_APPLICABLE,
+                format!("header `{name}` in `headers` is not allowed in {http}{why}; ignored"),
+            );
+        }
         false
     });
     headers
@@ -161,7 +166,7 @@ pub fn read_trust_tunnel(
     let tls = read_pinned_tls(r, keystore, alpn, which);
     if h3 {
         // HTTP/3 runs over QUIC: there is no TCP connection to open fast
-        if r.has("tfo") {
+        if r.has("tfo") && !r.rejected("tfo") {
             r.warn(
                 codes::W_PARAM_NOT_APPLICABLE,
                 "`tfo` does not apply to `trust-tunnel` policies with `h3=true`; ignored"

@@ -42,18 +42,22 @@ fn valid_path(path: &str) -> bool {
     path.starts_with('/') && path.bytes().all(|b| b.is_ascii_graphic())
 }
 
-/// `None` without `ws=true`; the other two parameters are then `W0028`.
+/// `None` without `ws=true`; the other two parameters are then `W0028`,
+/// unless `ws` is an error, which leaves open whether they have an effect.
 /// Neither the path nor a header value is ever quoted in a diagnostic: both
 /// are routinely used as shared secrets.
 pub fn read_ws(r: &mut ParamReader<'_>) -> Option<WsOpts> {
     if !r.bool("ws").unwrap_or(false) {
+        let open = r.rejected("ws");
         for key in WS_KEYS {
             if r.has(key) {
                 r.touch(key);
-                r.warn(
-                    codes::W_PARAM_NOT_APPLICABLE,
-                    format!("`{key}` has no effect without `ws=true`; ignored"),
-                );
+                if !open {
+                    r.warn(
+                        codes::W_PARAM_NOT_APPLICABLE,
+                        format!("`{key}` has no effect without `ws=true`; ignored"),
+                    );
+                }
             }
         }
         return None;

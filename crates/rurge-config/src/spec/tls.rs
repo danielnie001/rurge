@@ -177,8 +177,16 @@ pub(crate) fn refuse_tls(r: &mut ParamReader<'_>) {
     });
 }
 
-/// For `vmess` without `tls=true`: the TLS parameters are there but idle (`W0028`).
+/// For `vmess` without `tls=true`: the TLS parameters are there but idle
+/// (`W0028`) — unless `tls` is an error, which leaves open whether they are:
+/// they count as read, and nothing more is said.
 pub(crate) fn idle_tls(r: &mut ParamReader<'_>) {
+    if r.rejected("tls") {
+        for key in TLS_KEYS {
+            r.touch(key);
+        }
+        return;
+    }
     warn_tls_keys(r, |key| {
         format!("`{key}` has no effect without `tls=true`; ignored")
     });

@@ -155,10 +155,13 @@ pub(crate) fn read_common(
     // it moves the policy's lookups onto its interface: without one there
     // is nothing to move them to (phase 2 M5 design 8.5)
     if dns_follow_interface && interface.is_none() {
-        r.warn(
-            codes::W_PARAM_NOT_APPLICABLE,
-            "`dns-follow-interface` has no effect without `interface`; ignored".to_string(),
-        );
+        // an `interface` that is an error is the one thing said of it
+        if !r.rejected("interface") {
+            r.warn(
+                codes::W_PARAM_NOT_APPLICABLE,
+                "`dns-follow-interface` has no effect without `interface`; ignored".to_string(),
+            );
+        }
         dns_follow_interface = false;
     }
     let mut no_error_alert = r.bool("no-error-alert").unwrap_or(false);
@@ -214,7 +217,7 @@ pub(crate) fn read_common(
 
     if applies == Applies::Direct {
         for key in PROXY_ONLY {
-            if r.has(key) {
+            if r.has(key) && !r.rejected(key) {
                 r.warn(
                     codes::W_PARAM_NOT_APPLICABLE,
                     format!("`{key}` does not apply to `direct` policies; ignored"),

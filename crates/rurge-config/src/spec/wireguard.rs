@@ -30,7 +30,7 @@ pub fn read_wireguard(
 ) -> WireGuardSpec {
     refuse_tls(r);
     for key in NOT_APPLICABLE {
-        if r.has(key) {
+        if r.has(key) && !r.rejected(key) {
             r.warn(
                 codes::W_PARAM_NOT_APPLICABLE,
                 format!("`{key}` does not apply to `wireguard` policies; ignored"),

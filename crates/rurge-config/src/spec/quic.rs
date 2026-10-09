@@ -50,7 +50,7 @@ pub(crate) fn read_quic_tls(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) 
 /// an error was reported the returned value is meaningless: the caller
 /// checks `r.has_errors()`.
 pub fn read_quic(r: &mut ParamReader<'_>, common: &mut CommonOpts) -> QuicOpts {
-    if r.has("tfo") {
+    if r.has("tfo") && !r.rejected("tfo") {
         let kind = r.policy().kind.keyword();
         r.warn(
             codes::W_PARAM_NOT_APPLICABLE,

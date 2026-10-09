@@ -11,6 +11,8 @@ pub struct ParamReader<'a> {
     policy: &'a ProxyPolicy,
     used: HashSet<String>,
     positional_used: usize,
+    /// The parameters whose value was reported as an error.
+    rejected: HashSet<String>,
     diags: Vec<Diagnostic>,
 }
 
@@ -20,6 +22,7 @@ impl<'a> ParamReader<'a> {
             policy,
             used: HashSet::new(),
             positional_used: 0,
+            rejected: HashSet::new(),
             diags: Vec::new(),
         }
     }
@@ -96,10 +99,25 @@ impl<'a> ParamReader<'a> {
 
     /// `E0018`. Never call this for a parameter whose value is a secret.
     pub fn invalid(&mut self, key: &str, value: &str, expected: &str) {
+        self.reject(key);
         self.error(
             codes::E_INVALID_POLICY_PARAM,
             format!("invalid value `{value}` for `{key}` (expected {expected})"),
         );
+    }
+
+    /// Notes that the value of `key` is reported as an error, for an error
+    /// that does not go through `invalid` (which notes it itself).
+    pub fn reject(&mut self, key: &str) {
+        self.rejected.insert(key.to_ascii_lowercase());
+    }
+
+    /// Whether the value of `key` was reported as an error. That error is
+    /// the one thing said of the parameter, and of what its value decides: a
+    /// warning that it does not apply, or that another parameter has no
+    /// effect because of it, is left unsaid.
+    pub fn rejected(&self, key: &str) -> bool {
+        self.rejected.contains(&key.to_ascii_lowercase())
     }
 
     pub fn error(&mut self, code: &'static str, message: String) {
@@ -173,6 +191,20 @@ mod tests {
             "policy `P`: invalid value `maybe` for `bad` (expected true or false)"
         );
         assert_eq!(diags[0].span.as_ref().unwrap().line, 7);
+    }
+
+    #[test]
+    fn a_value_reported_as_an_error_is_remembered() {
+        let p = policy("http, 1.2.3.4, 80, tfo=maybe, tos=1, ip-version=v5");
+        let mut r = ParamReader::new(&p);
+        assert_eq!(r.bool("tfo"), None);
+        assert_eq!(r.choice("ip-version", &[("dual", 0u8)]), None);
+        assert_eq!(r.str("tos"), Some("1"));
+        assert!(r.rejected("tfo") && r.rejected("TFO") && r.rejected("ip-version"));
+        assert!(!r.rejected("tos") && !r.rejected("absent"));
+        // an error that did not go through `invalid`
+        r.reject("Underlying-Proxy");
+        assert!(r.rejected("underlying-proxy"));
     }
 
     #[test]

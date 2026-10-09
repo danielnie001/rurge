@@ -328,10 +328,13 @@ fn check_underlying(r: &mut ParamReader<'_>, common: &mut CommonOpts, env: &Spec
         return;
     };
     match (env.lookup)(&name) {
-        None => r.error(
-            codes::E_UNKNOWN_POLICY_REF,
-            format!("`underlying-proxy` references unknown policy `{name}`"),
-        ),
+        None => {
+            r.reject("underlying-proxy");
+            r.error(
+                codes::E_UNKNOWN_POLICY_REF,
+                format!("`underlying-proxy` references unknown policy `{name}`"),
+            );
+        }
         // DIRECT is the absence of a chain
         Some(NameKind::Builtin(Builtin::Direct)) => common.underlying_proxy = None,
         Some(NameKind::Builtin(_)) => r.invalid(
@@ -507,6 +510,9 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
                 // over QUIC, as on `hysteria2`: `ecn` takes effect, `tfo`
                 // does not apply (phase 2 M7 design 7.2)
                 notes.inert.retain(|name| !matches!(*name, "ecn" | "tfo"));
+            } else if r.rejected("h3") {
+                // an `h3` that is an error leaves open what `tfo` does here
+                notes.inert.retain(|name| *name != "tfo");
             }
             (common, ProtoSpec::TrustTunnel(tt))
         }
@@ -547,7 +553,7 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
             let external = external::read_external(&mut r, &mut common);
             // `tfo` does not apply at all (`W0028`): no second word on it
             notes.inert.retain(|name| *name != "tfo");
-            if !external.addresses.is_empty() {
+            if !external.addresses.is_empty() && !r.rejected("addresses") {
                 notes.inert.push("addresses");
             }
             (common, ProtoSpec::External(external))
@@ -606,10 +612,11 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
                 "`port-hopping` cannot be combined with `underlying-proxy`".to_string(),
             );
         }
-        // socket options belong to the hop that opens the socket (matrix 4.3)
-        if common.underlying_proxy.is_some() {
+        // socket options belong to the hop that opens the socket (matrix 4.3);
+        // a chain that is an error leaves open whether this one does
+        if common.underlying_proxy.is_some() && !r.rejected("underlying-proxy") {
             for key in ["interface", "allow-other-interface", "tos", "ip-version"] {
-                if r.has(key) {
+                if r.has(key) && !r.rejected(key) {
                     r.warn(
                         codes::W_PARAM_NOT_APPLICABLE,
                         format!(

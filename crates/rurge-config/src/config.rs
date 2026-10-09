@@ -2038,6 +2038,298 @@ H = trust-tunnel, h.test, 443, username=u, password=pw, h3=maybe, ecn=on\n{}[Rul
         );
     }
 
+    const UUID: &str = "0233d11c-15a4-47d3-ade3-48ffca0ce119";
+
+    /// A policy line `P` loaded alone, with a policy `Q` to chain to and a
+    /// `[WireGuard home]` section to name: the code and message of every
+    /// diagnostic.
+    fn said_of(line: &str) -> Vec<(&'static str, String)> {
+        let loaded = load_text(&format!(
+            "[Proxy]\nQ = http, q.test, 80\n{line}\n{}[Rule]\nFINAL,DIRECT\n",
+            wireguard_section("home", "192.0.2.1:51820")
+        ));
+        loaded
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.clone()))
+            .collect()
+    }
+
+    /// Fails with every case whose diagnostics are not the expected ones.
+    fn assert_said(cases: Vec<(String, Vec<(&'static str, String)>)>) {
+        let wrong: Vec<String> = cases
+            .into_iter()
+            .filter_map(|(line, expected)| {
+                let found = said_of(&line);
+                (found != expected)
+                    .then(|| format!("{line}\n  expected {expected:#?}\n  found    {found:#?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+    }
+
+    /// The error `E0018` of a value, as a policy `P` has it.
+    fn bad_value(key: &str, value: &str, expected: &str) -> (&'static str, String) {
+        (
+            codes::E_INVALID_POLICY_PARAM,
+            format!("policy `P`: invalid value `{value}` for `{key}` (expected {expected})"),
+        )
+    }
+
+    /// A value that is an error is the one thing said of its parameter, and
+    /// of the parameters that depend on it — not also that it does not apply
+    /// to the protocol or has no effect: wherever there is such a sentence,
+    /// not only where the test above looks.
+    #[test]
+    fn an_error_in_a_parameter_leaves_nothing_else_to_say_of_it() {
+        let flag = "true or false";
+        let tristate = "auto / on / off / true / false";
+        let tos = "0-255 or 0x00-0xff";
+        let versions = "dual / v4-only / v6-only / prefer-v4 / prefer-v6";
+        let on = |line: &str, said: Vec<(&'static str, String)>| (line.to_string(), said);
+        assert_said(vec![
+            // a proxy-only parameter on `direct`
+            on(
+                "P = direct, ecn=maybe",
+                vec![bad_value("ecn", "maybe", tristate)],
+            ),
+            on(
+                "P = direct, no-error-alert=maybe",
+                vec![bad_value("no-error-alert", "maybe", flag)],
+            ),
+            // `tfo` on a protocol over QUIC, and on one with no TCP connection
+            on(
+                "P = hysteria2, h.test, 443, password=pw, tfo=maybe",
+                vec![bad_value("tfo", "maybe", flag)],
+            ),
+            on(
+                &format!("P = tuic-v5, t.test, 443, uuid={UUID}, password=pw, tfo=maybe"),
+                vec![bad_value("tfo", "maybe", flag)],
+            ),
+            on(
+                "P = masque, m.test, 443, tfo=maybe",
+                vec![bad_value("tfo", "maybe", flag)],
+            ),
+            on(
+                "P = trust-tunnel, u.test, 443, username=u, password=pw, h3=true, tfo=maybe",
+                vec![bad_value("tfo", "maybe", flag)],
+            ),
+            on(
+                "P = external, exec=/bin/x, local-port=1080, tfo=maybe",
+                vec![bad_value("tfo", "maybe", flag)],
+            ),
+            // the other common parameters `external` and `wireguard` have no use for
+            on(
+                "P = external, exec=/bin/x, local-port=1080, interface=, allow-other-interface=maybe, tos=300, ip-version=v5",
+                vec![
+                    bad_value("interface", "", "a network interface name"),
+                    bad_value("allow-other-interface", "maybe", flag),
+                    bad_value("ip-version", "v5", versions),
+                    bad_value("tos", "300", tos),
+                ],
+            ),
+            on(
+                "P = wireguard, section-name=home, interface=, allow-other-interface=maybe, tos=300",
+                vec![
+                    bad_value("interface", "", "a network interface name"),
+                    bad_value("allow-other-interface", "maybe", flag),
+                    bad_value("tos", "300", tos),
+                ],
+            ),
+            // what `tls`, `ws` and `h3` decide
+            on(
+                &format!(
+                    "P = vmess, v.test, 443, username={UUID}, tls=maybe, sni=edge.test, alpn=h2"
+                ),
+                vec![bad_value("tls", "maybe", flag)],
+            ),
+            on(
+                "P = trojan, t.test, 443, password=pw, ws=maybe, ws-path=/w, ws-headers=X: y",
+                vec![bad_value("ws", "maybe", flag)],
+            ),
+            on(
+                "P = trust-tunnel, u.test, 443, username=u, password=pw, h3=maybe, alpn=h3",
+                vec![bad_value("h3", "maybe", flag)],
+            ),
+            on(
+                "P = trust-tunnel, u.test, 443, username=u, password=pw, h3=maybe, tfo=true",
+                vec![bad_value("h3", "maybe", flag)],
+            ),
+            on(
+                "P = trust-tunnel, u.test, 443, username=u, password=pw, h3=maybe, headers=Connection:close",
+                vec![bad_value("h3", "maybe", flag)],
+            ),
+            // `interface` is what `dns-follow-interface` follows
+            on(
+                "P = http, h.test, 80, interface=, dns-follow-interface=true",
+                vec![bad_value("interface", "", "a network interface name")],
+            ),
+            // a chain that is an error: whether it takes the socket
+            // parameters from the policy is open
+            on(
+                "P = http, p.test, 80, underlying-proxy=Missing, interface=en0, allow-other-interface=true, tos=0x10, ip-version=v4-only",
+                vec![(
+                    codes::E_UNKNOWN_POLICY_REF,
+                    "policy `P`: `underlying-proxy` references unknown policy `Missing`"
+                        .to_string(),
+                )],
+            ),
+            on(
+                "P = http, p.test, 80, underlying-proxy=REJECT, interface=en0",
+                vec![bad_value(
+                    "underlying-proxy",
+                    "REJECT",
+                    "a proxy policy or a policy group",
+                )],
+            ),
+            // and a socket parameter that is an error itself
+            on(
+                "P = http, p.test, 80, underlying-proxy=Q, interface=, allow-other-interface=maybe, tos=300, ip-version=v5",
+                vec![
+                    bad_value("interface", "", "a network interface name"),
+                    bad_value("allow-other-interface", "maybe", flag),
+                    bad_value("ip-version", "v5", versions),
+                    bad_value("tos", "300", tos),
+                ],
+            ),
+            // one address of two is an error: not also that they do nothing yet
+            on(
+                "P = external, exec=/bin/x, local-port=1080, addresses=192.0.2.1, addresses=bogus",
+                vec![bad_value("addresses", "bogus", "an IP address")],
+            ),
+        ]);
+    }
+
+    /// The same parameters with values that are fine: every sentence the
+    /// previous test takes away is still said.
+    #[test]
+    fn the_same_parameters_with_good_values_still_get_their_sentence() {
+        let not_applicable =
+            |text: &str| vec![(codes::W_PARAM_NOT_APPLICABLE, format!("policy `P`: {text}"))];
+        let on = |line: &str, said: Vec<(&'static str, String)>| (line.to_string(), said);
+        assert_said(vec![
+            on(
+                "P = direct, ecn=on",
+                not_applicable("`ecn` does not apply to `direct` policies; ignored"),
+            ),
+            on(
+                "P = direct, no-error-alert=true",
+                not_applicable("`no-error-alert` does not apply to `direct` policies; ignored"),
+            ),
+            on(
+                "P = hysteria2, h.test, 443, password=pw, tfo=true",
+                not_applicable("`tfo` does not apply to `hysteria2` policies; ignored"),
+            ),
+            on(
+                &format!("P = tuic-v5, t.test, 443, uuid={UUID}, password=pw, tfo=true"),
+                not_applicable("`tfo` does not apply to `tuic-v5` policies; ignored"),
+            ),
+            on(
+                "P = masque, m.test, 443, tfo=true",
+                not_applicable("`tfo` does not apply to `masque` policies; ignored"),
+            ),
+            on(
+                "P = trust-tunnel, u.test, 443, username=u, password=pw, h3=true, tfo=true",
+                not_applicable(
+                    "`tfo` does not apply to `trust-tunnel` policies with `h3=true`; ignored",
+                ),
+            ),
+            on(
+                "P = external, exec=/bin/x, local-port=1080, tfo=true",
+                not_applicable("`tfo` does not apply to `external` policies; ignored"),
+            ),
+            on(
+                "P = external, exec=/bin/x, local-port=1080, interface=en0, allow-other-interface=true, tos=16, ip-version=v4-only",
+                [
+                    "interface",
+                    "allow-other-interface",
+                    "tos",
+                    "ip-version",
+                ]
+                .iter()
+                .map(|key| {
+                    (
+                        codes::W_PARAM_NOT_APPLICABLE,
+                        format!("policy `P`: `{key}` does not apply to `external` policies; ignored"),
+                    )
+                })
+                .collect(),
+            ),
+            on(
+                "P = wireguard, section-name=home, interface=en0, allow-other-interface=true, tos=16",
+                ["interface", "allow-other-interface", "tos"]
+                    .iter()
+                    .map(|key| {
+                        (
+                            codes::W_PARAM_NOT_APPLICABLE,
+                            format!("policy `P`: `{key}` does not apply to `wireguard` policies; ignored"),
+                        )
+                    })
+                    .collect(),
+            ),
+            on(
+                &format!(
+                    "P = vmess, v.test, 443, username={UUID}, vmess-aead=true, tls=false, sni=edge.test"
+                ),
+                not_applicable("`sni` has no effect without `tls=true`; ignored"),
+            ),
+            on(
+                "P = trojan, t.test, 443, password=pw, ws=false, ws-path=/w, ws-headers=X: y",
+                [
+                    not_applicable("`ws-path` has no effect without `ws=true`; ignored"),
+                    not_applicable("`ws-headers` has no effect without `ws=true`; ignored"),
+                ]
+                .concat(),
+            ),
+            on(
+                "P = trust-tunnel, u.test, 443, username=u, password=pw, h3=false, alpn=h3",
+                not_applicable(
+                    "`alpn` is always `h2` on `trust-tunnel` policies without `h3=true`; ignored",
+                ),
+            ),
+            on(
+                "P = trust-tunnel, u.test, 443, username=u, password=pw, h3=false, tfo=true",
+                vec![(
+                    codes::W_PARAM_NOT_EFFECTIVE,
+                    "policy parameter `tfo` is parsed but has no effect in this version"
+                        .to_string(),
+                )],
+            ),
+            on(
+                "P = trust-tunnel, u.test, 443, username=u, password=pw, h3=false, headers=Connection:close",
+                not_applicable("header `connection` in `headers` is not allowed in HTTP/2; ignored"),
+            ),
+            on(
+                "P = trust-tunnel, u.test, 443, username=u, password=pw, h3=true, headers=Connection:close",
+                not_applicable("header `connection` in `headers` is not allowed in HTTP/3; ignored"),
+            ),
+            on(
+                "P = http, h.test, 80, dns-follow-interface=true",
+                not_applicable("`dns-follow-interface` has no effect without `interface`; ignored"),
+            ),
+            on(
+                "P = http, p.test, 80, underlying-proxy=Q, interface=en0, allow-other-interface=true, tos=0x10, ip-version=v4-only",
+                ["interface", "allow-other-interface", "tos", "ip-version"]
+                    .iter()
+                    .map(|key| {
+                        (
+                            codes::W_PARAM_NOT_APPLICABLE,
+                            format!("policy `P`: `{key}` has no effect on a policy with `underlying-proxy`; ignored"),
+                        )
+                    })
+                    .collect(),
+            ),
+            on(
+                "P = external, exec=/bin/x, local-port=1080, addresses=192.0.2.1, addresses=192.0.2.2",
+                vec![(
+                    codes::W_PARAM_NOT_EFFECTIVE,
+                    "policy parameter `addresses` is parsed but has no effect in this version"
+                        .to_string(),
+                )],
+            ),
+        ]);
+    }
+
     /// A `[WireGuard <name>]` section is typed, no longer a deferred one
     /// (phase 2 M4 design 4.1).
     #[test]
