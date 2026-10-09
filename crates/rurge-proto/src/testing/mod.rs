@@ -3,6 +3,8 @@
 
 mod anytls;
 mod h2proxy;
+#[cfg(test)]
+pub(crate) mod held;
 mod http_proxy;
 mod obfs;
 mod shadow_tls;

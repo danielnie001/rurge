@@ -335,6 +335,14 @@ pub(crate) async fn negotiate_bound(
     Ok((stream, bound))
 }
 
+/// One step of the handshake, sent on its way: its answer is waited for
+/// next, and a hop below that buffers keeps what it was given until it is
+/// flushed.
+async fn send(stream: &mut BoxedStream, step: &[u8]) -> Result<(), OutboundError> {
+    stream.write_all(step).await.map_err(handshake_io)?;
+    stream.flush().await.map_err(handshake_io)
+}
+
 /// The handshake itself; the reply's `ATYP ADDR PORT` comes back as read.
 async fn exchange(
     mut stream: BoxedStream,
@@ -348,7 +356,7 @@ async fn exchange(
     };
     let mut greeting = vec![VERSION, offered.len() as u8];
     greeting.extend_from_slice(offered);
-    stream.write_all(&greeting).await.map_err(handshake_io)?;
+    send(&mut stream, &greeting).await?;
     let mut selected = [0u8; 2];
     stream
         .read_exact(&mut selected)
@@ -371,7 +379,7 @@ async fn exchange(
             auth.extend_from_slice(user.as_bytes());
             auth.push(password.len() as u8);
             auth.extend_from_slice(password.as_bytes());
-            stream.write_all(&auth).await.map_err(handshake_io)?;
+            send(&mut stream, &auth).await?;
             let mut status = [0u8; 2];
             stream.read_exact(&mut status).await.map_err(handshake_io)?;
             if status[1] != 0 {
@@ -380,7 +388,7 @@ async fn exchange(
         }
         _ => {}
     }
-    stream.write_all(request).await.map_err(handshake_io)?;
+    send(&mut stream, request).await?;
     let mut reply = [0u8; 4];
     stream.read_exact(&mut reply).await.map_err(handshake_io)?;
     if reply[1] != 0 {
@@ -454,6 +462,7 @@ impl Outbound for Socks5Outbound {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::held::{Gone, HoldingConnector};
     use crate::testing::{
         Camouflage, FakeShadowTls, FakeSocks5, ShadowTlsScript, Socks5Script, TlsFixture,
         echo_server,
@@ -486,14 +495,20 @@ mod tests {
     }
 
     fn outbound(definition: &str, roots: Arc<RootCertStore>) -> Socks5Outbound {
-        let keystore: Vec<KeystoreItem> = Vec::new();
-        Socks5Outbound::from_spec(
-            &spec(definition),
-            &keystore,
+        outbound_through(
+            definition,
             roots,
             Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
         )
-        .unwrap()
+    }
+
+    fn outbound_through(
+        definition: &str,
+        roots: Arc<RootCertStore>,
+        connector: Arc<dyn Connector>,
+    ) -> Socks5Outbound {
+        let keystore: Vec<KeystoreItem> = Vec::new();
+        Socks5Outbound::from_spec(&spec(definition), &keystore, roots, connector).unwrap()
     }
 
     fn no_roots() -> Arc<RootCertStore> {
@@ -807,6 +822,71 @@ mod tests {
         assert_eq!(seen.methods, [0, 2]);
         assert_eq!(seen.credentials, Some(("user".into(), "pass".into())));
         assert_eq!((seen.atyp, seen.port), (1, echo.port()));
+    }
+
+    /// The hop below may keep what it is given until it is flushed (an
+    /// `underlying-proxy` that buffers): the greeting, the credentials and
+    /// the request each have to be on their way before their answer is
+    /// waited for.
+    #[tokio::test]
+    async fn every_step_is_flushed_before_its_answer_is_awaited() {
+        let echo = echo_server().await;
+        let server = FakeSocks5::spawn(Socks5Script {
+            auth: Some(("user".into(), "pass".into())),
+            ..Socks5Script::default()
+        })
+        .await;
+        let out = outbound_through(
+            &format!("socks5, 127.0.0.1, {}, user, pass", server.addr().port()),
+            no_roots(),
+            HoldingConnector::new(),
+        );
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            out.connect_tcp(&target(echo), &ConnectOpts::default()),
+        )
+        .await
+        .expect("a step of the handshake stayed behind in the hop below")
+        .unwrap();
+        let seen = &server.requests()[0];
+        assert_eq!(seen.credentials, Some(("user".into(), "pass".into())));
+        assert_eq!((seen.command, seen.port), (1, echo.port()));
+        // the tunnel is that same hop: what goes through it is the relay's
+        // to flush
+        stream.write_all(b"through the hop").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut back = [0u8; 15];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut back))
+            .await
+            .expect("the echo arrives")
+            .unwrap();
+        assert_eq!(&back, b"through the hop");
+    }
+
+    /// A connection gone before the greeting is out is the proxy's refusal
+    /// like any other it closes, whether the write or the flush is what
+    /// finds out.
+    #[tokio::test]
+    async fn a_connection_gone_before_the_greeting_is_out_is_the_proxys_refusal() {
+        for held in [false, true] {
+            let out = outbound_through(
+                "socks5, 127.0.0.1, 1080",
+                no_roots(),
+                Arc::new(Gone { held }),
+            );
+            let err = out
+                .connect_tcp(
+                    &Target::new(HostName::parse("192.0.2.1"), 443),
+                    &ConnectOpts::default(),
+                )
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert!(
+                matches!(&err, OutboundError::Proxy(m) if m == "socks5: the proxy closed the connection during the handshake"),
+                "held = {held}: {err}"
+            );
+        }
     }
 
     #[tokio::test]

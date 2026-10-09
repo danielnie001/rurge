@@ -105,6 +105,21 @@ pub fn valid_target(target: &Target) -> bool {
     wire_host(target).is_some()
 }
 
+/// A connection the proxy closes during the CONNECT exchange is its refusal,
+/// not an I/O fault of ours. Depending on timing and platform the close shows
+/// up as an EOF, a reset or a broken pipe, on the write as well as the read.
+fn handshake_io(e: io::Error) -> OutboundError {
+    match e.kind() {
+        io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::BrokenPipe => {
+            OutboundError::Proxy("http proxy closed the connection during CONNECT".to_string())
+        }
+        _ => OutboundError::from(e),
+    }
+}
+
 fn check_status(head: &[u8]) -> Result<(), OutboundError> {
     let text = String::from_utf8_lossy(head);
     let line = text.lines().next().unwrap_or_default();
@@ -222,17 +237,18 @@ impl HttpOutbound {
         let mut stream = self.dial(opts).await?;
         stream
             .write_all(&self.connect_request(&host, target.port))
-            .await?;
+            .await
+            .map_err(handshake_io)?;
+        // the answer is waited for next: a hop below that buffers keeps the
+        // request until it is flushed
+        stream.flush().await.map_err(handshake_io)?;
         let (head, rest) = read_head(&mut stream, MAX_HEAD)
             .await
             .map_err(|e| match e.kind() {
                 io::ErrorKind::InvalidData => OutboundError::Proxy(format!(
                     "http proxy sent a response header larger than {MAX_HEAD} bytes"
                 )),
-                io::ErrorKind::UnexpectedEof => OutboundError::Proxy(
-                    "http proxy closed the connection during CONNECT".to_string(),
-                ),
-                _ => OutboundError::from(e),
+                _ => handshake_io(e),
             })?;
         check_status(&head)?;
         Ok(prefixed::boxed(rest, stream))
@@ -289,6 +305,7 @@ impl HttpForward for HttpOutbound {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::held::{Gone, HoldingConnector};
     use crate::testing::{
         Camouflage, FakeHttpProxy, FakeShadowTls, HttpProxyScript, ShadowTlsScript, TlsFixture,
         echo_server,
@@ -301,6 +318,7 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn spec(definition: &str) -> PolicySpec {
         let span = Span::new(Arc::from(Path::new("p.conf")), 1);
@@ -320,14 +338,20 @@ mod tests {
     }
 
     fn outbound(definition: &str, roots: Arc<RootCertStore>) -> HttpOutbound {
-        let keystore: Vec<KeystoreItem> = Vec::new();
-        HttpOutbound::from_spec(
-            &spec(definition),
-            &keystore,
+        outbound_through(
+            definition,
             roots,
             Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
         )
-        .unwrap()
+    }
+
+    fn outbound_through(
+        definition: &str,
+        roots: Arc<RootCertStore>,
+        connector: Arc<dyn Connector>,
+    ) -> HttpOutbound {
+        let keystore: Vec<KeystoreItem> = Vec::new();
+        HttpOutbound::from_spec(&spec(definition), &keystore, roots, connector).unwrap()
     }
 
     fn no_roots() -> Arc<RootCertStore> {
@@ -545,6 +569,157 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// The hop below may keep what it is given until it is flushed (an
+    /// `underlying-proxy` that buffers): the request has to be on its way
+    /// before its answer is waited for.
+    #[tokio::test]
+    async fn the_request_is_flushed_before_its_answer_is_awaited() {
+        let echo = echo_server().await;
+        let proxy = FakeHttpProxy::spawn(HttpProxyScript::default()).await;
+        let out = outbound_through(
+            &format!("http, 127.0.0.1, {}", proxy.addr().port()),
+            no_roots(),
+            HoldingConnector::new(),
+        );
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            out.connect_tcp(&target(echo), &ConnectOpts::default()),
+        )
+        .await
+        .expect("the request stayed behind in the hop below")
+        .unwrap();
+        assert_eq!(
+            proxy.heads()[0].request_line,
+            format!("CONNECT {echo} HTTP/1.1")
+        );
+        // the tunnel is that same hop: what goes through it is the relay's
+        // to flush
+        stream.write_all(b"through the hop").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut back = [0u8; 15];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut back))
+            .await
+            .expect("the echo arrives")
+            .unwrap();
+        assert_eq!(&back, b"through the hop");
+    }
+
+    /// How a proxy ends a connection instead of answering it.
+    enum Ends {
+        /// Closes with the request lying unread.
+        Unread,
+        /// Reads the request, then resets.
+        Reset,
+        /// Closes in the middle of its answer.
+        MidAnswer,
+    }
+
+    /// Takes one connection and ends it as `how` says.
+    async fn a_proxy_that(how: Ends) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut tcp, _)) = listener.accept().await else {
+                return;
+            };
+            match how {
+                // dropped over what it never read
+                Ends::Unread => {
+                    let _ = tcp.readable().await;
+                }
+                Ends::Reset => {
+                    let _ = read_head(&mut tcp, MAX_HEAD).await;
+                    // closing resets the connection
+                    let _ = tcp.set_zero_linger();
+                }
+                Ends::MidAnswer => {
+                    let _ = read_head(&mut tcp, MAX_HEAD).await;
+                    let _ = tcp.write_all(b"HTTP/1.1 200 Connection esta").await;
+                    let _ = tcp.shutdown().await;
+                }
+            }
+        });
+        addr
+    }
+
+    /// A connection the proxy ends during the exchange is its refusal,
+    /// whether the end shows as an EOF or as a reset.
+    #[tokio::test]
+    async fn a_connection_the_proxy_ends_during_connect_is_its_refusal() {
+        let echo = echo_server().await;
+        for (how, what) in [
+            (Ends::Unread, "the request unread"),
+            (Ends::Reset, "a reset"),
+            (Ends::MidAnswer, "half an answer"),
+        ] {
+            let proxy = a_proxy_that(how).await;
+            let out = outbound(&format!("http, 127.0.0.1, {}", proxy.port()), no_roots());
+            let err = tokio::time::timeout(
+                Duration::from_secs(5),
+                out.connect_tcp(&target(echo), &ConnectOpts::default()),
+            )
+            .await
+            .expect("the proxy ends the connection")
+            .map(|_| ())
+            .unwrap_err();
+            assert!(
+                matches!(&err, OutboundError::Proxy(m) if m == "http proxy closed the connection during CONNECT"),
+                "{what}: {err}"
+            );
+        }
+    }
+
+    /// The same when the connection is gone before the request is out,
+    /// whether the write or the flush is what finds out.
+    #[tokio::test]
+    async fn a_connection_gone_before_the_request_is_out_is_the_proxys_refusal() {
+        for held in [false, true] {
+            let out =
+                outbound_through("http, 127.0.0.1, 8080", no_roots(), Arc::new(Gone { held }));
+            let err = out
+                .connect_tcp(
+                    &Target::new(HostName::parse("192.0.2.1"), 443),
+                    &ConnectOpts::default(),
+                )
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert!(
+                matches!(&err, OutboundError::Proxy(m) if m == "http proxy closed the connection during CONNECT"),
+                "held = {held}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_closed_connection_is_read_as_the_proxys_refusal() {
+        use io::ErrorKind::{
+            BrokenPipe, ConnectionAborted, ConnectionReset, PermissionDenied, TimedOut,
+            UnexpectedEof,
+        };
+        for kind in [
+            UnexpectedEof,
+            ConnectionReset,
+            ConnectionAborted,
+            BrokenPipe,
+        ] {
+            let err = handshake_io(kind.into());
+            assert!(
+                matches!(&err, OutboundError::Proxy(m) if m == "http proxy closed the connection during CONNECT"),
+                "{kind:?}: {err}"
+            );
+        }
+        // anything else is still what it was
+        assert!(matches!(
+            handshake_io(PermissionDenied.into()),
+            OutboundError::Io(e) if e.kind() == PermissionDenied
+        ));
+        assert!(matches!(
+            handshake_io(TimedOut.into()),
+            OutboundError::Timeout
+        ));
     }
 
     #[tokio::test]
