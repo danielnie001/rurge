@@ -1185,8 +1185,34 @@ mod tests {
     }
 
     fn resolver_with(e: &Env, system: Arc<dyn SystemDns>) -> (Arc<Resolver>, Diagnostics) {
+        resolver_with_fanout(e, system, fast())
+    }
+
+    /// The fanout options of a test that counts the questions it was asked
+    /// and in which every question is answered: each upstream is asked once
+    /// and never again, however late the answer comes — `fast()` asks again
+    /// whenever an answer is 100 ms late, which on a busy machine it can be.
+    /// A lookup that gets no answer takes 30 seconds to end, so a test that
+    /// expects one is not for it. (`bootstrap::tests::once` is the same.)
+    fn once() -> FanoutOpts {
+        FanoutOpts {
+            resend: Duration::from_secs(30),
+            attempts: 1,
+        }
+    }
+
+    /// `resolver`, its fanout `once()`.
+    fn resolver_once(e: &Env, system: StaticSystemDns) -> (Arc<Resolver>, Diagnostics) {
+        resolver_with_fanout(e, Arc::new(system), once())
+    }
+
+    fn resolver_with_fanout(
+        e: &Env,
+        system: Arc<dyn SystemDns>,
+        fanout: FanoutOpts,
+    ) -> (Arc<Resolver>, Diagnostics) {
         let mut cfg = ResolverConfig::from_config(&e.cfg);
-        cfg.fanout = fast();
+        cfg.fanout = fanout;
         Resolver::new(
             cfg,
             ResolverDeps {
@@ -1205,6 +1231,15 @@ mod tests {
     /// its way: how many questions it asks, and what each lookup comes back
     /// with, is the same however busy the machine is. A sleep in such a test
     /// ends when nothing else is left to run.
+    ///
+    /// Only the primary set is replaced. The system's servers, the servers of
+    /// the `[Host]` section, the per-interface set and the bootstrap stay on
+    /// UDP, and `on_network_change` builds a UDP primary set again. A lookup
+    /// that reaches one of those on the paused clock is not kept to the
+    /// resolver's own timing: each time the runtime waits for the datagram the
+    /// clock jumps to the next timer — the resend, in the end the deadline —,
+    /// so the lookup may ask again, or time out, whatever the answer would
+    /// have been.
     fn resolver_in_memory(e: &Env, mock: &MockDns, system: StaticSystemDns) -> Arc<Resolver> {
         let (r, _) = resolver(e, system);
         r.primary.store(Arc::new(vec![mock.upstream()]));
@@ -1257,7 +1292,7 @@ mod tests {
     async fn literals_loopback_and_trailing_dot() {
         let mock = MockDns::spawn().await;
         let e = env(&profile(&format!("dns-server = {}", mock.addr()), ""));
-        let (r, diags) = resolver(&e, StaticSystemDns::default());
+        let (r, diags) = resolver_once(&e, StaticSystemDns::default());
         assert!(
             diags.is_empty(),
             "{:?}",
@@ -1354,7 +1389,7 @@ mod tests {
             search_domains: vec!["home.lan".into()],
             ..StaticSystemDns::default()
         };
-        let (r, _) = resolver(&e, sys);
+        let (r, _) = resolver_once(&e, sys);
         let c = r.lookup("corp.test", LookupOpts::default()).await.unwrap();
         assert_eq!(
             (c.v4, c.source),
@@ -1400,6 +1435,8 @@ mod tests {
         let stale = r.lookup("c.test", LookupOpts::default()).await.unwrap();
         assert_eq!(stale.source, Source::Cache { stale: true });
         assert_eq!(stale.v4, vec![v4("10.0.0.1")]);
+        // On the paused clock this ends when every other task has run out of
+        // work, the refresh with them.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             mock.query_count("c.test", Qtype::A),
@@ -1462,7 +1499,7 @@ mod tests {
         let mock = MockDns::spawn().await;
         mock.set("dual.test", &["10.0.0.1"], &["fd00::1"], 60);
         let e = env(&profile(&format!("dns-server = {}", mock.addr()), ""));
-        let (r, _) = resolver(&e, StaticSystemDns::default());
+        let (r, _) = resolver_once(&e, StaticSystemDns::default());
         let v4_only = |bypass| LookupOpts {
             bypass_cache: bypass,
             want_v6: Some(false),
@@ -1524,6 +1561,8 @@ mod tests {
         // The completion query was spawned but, on this single-threaded
         // runtime, cannot have run before the next await point.
         mock.set_drop_qtype(Qtype::Aaaa, false);
+        // On the paused clock this ends when every other task has run out of
+        // work, the completion with them.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let second = r.lookup("late.test", LookupOpts::default()).await.unwrap();
@@ -1548,6 +1587,13 @@ mod tests {
         );
     }
 
+    /// How the resolver counts the timeouts that turn AAAA off. A lookup
+    /// that ends with A answered and AAAA timed out counts one, and so does
+    /// the background completion that asks again for the AAAA answer the
+    /// lookup did not wait for, when that times out too. Names asked one
+    /// after another, each completion over before the next name: the first
+    /// two names count two each, the third name's lookup is the fifth — it,
+    /// not the fifth name's, turns AAAA off — and its completion makes six.
     #[tokio::test(start_paused = true)]
     async fn aaaa_suppression_after_five_timeouts_and_flush_resumes() {
         let mock = MockDns::spawn().await;
@@ -1571,6 +1617,16 @@ mod tests {
                 .unwrap();
             assert_eq!(res.v4.len(), 1);
             assert!(res.v6.is_empty());
+            // Counted so far: h0 one, h1 three, h2 five; none after that.
+            assert_eq!(r.aaaa_suppressed(), i >= 2, "h{i}: when its lookup is over");
+            // Longer than a fanout lasts (300 ms): its completion is over too.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            // Counted so far: h0 two, h1 four, h2 six; none after that.
+            assert_eq!(
+                r.aaaa_suppressed(),
+                i >= 2,
+                "h{i}: when its completion is over"
+            );
         }
         assert!(r.aaaa_suppressed());
         r.lookup("h5.test", LookupOpts::default()).await.unwrap();
@@ -1602,7 +1658,7 @@ mod tests {
             ),
             "",
         ));
-        let (r, diags) = resolver(&e, StaticSystemDns::default());
+        let (r, diags) = resolver_once(&e, StaticSystemDns::default());
         assert!(diags.is_empty());
         assert_eq!(
             r.primary_upstreams(),
@@ -1999,7 +2055,7 @@ https://dns.example/dns-query"
             &format!("dns-server = {}", mock.addr()),
             "b.test = 10.0.0.9",
         ));
-        let (r, _) = resolver(&e, StaticSystemDns::default());
+        let (r, _) = resolver_once(&e, StaticSystemDns::default());
         let (via, noting) = Noting::via("en1");
 
         let a = r
@@ -2046,7 +2102,7 @@ https://dns.example/dns-query"
             ),
             "",
         ));
-        let (r, _) = resolver(&e, StaticSystemDns::default());
+        let (r, _) = resolver_once(&e, StaticSystemDns::default());
         let (via, noting) = Noting::via("en1");
         let a = r
             .lookup_via("a.test", LookupOpts::default(), &via)

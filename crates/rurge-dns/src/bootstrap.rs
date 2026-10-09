@@ -249,7 +249,7 @@ mod tests {
     /// more, and `fast()` re-sends whenever an answer is 100 ms late, which
     /// on a busy machine it can be. The deadline of a lookup is 30 seconds,
     /// so a test that expects one to fail, with no answer coming, waits that
-    /// long: it is not for such a test.
+    /// long: it is not for such a test. (`resolver::tests::once` is the same.)
     fn once() -> FanoutOpts {
         FanoutOpts {
             resend: Duration::from_secs(30),

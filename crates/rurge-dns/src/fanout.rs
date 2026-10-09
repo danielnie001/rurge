@@ -289,11 +289,8 @@ mod tests {
     use super::*;
     use crate::message::Rcode;
     use crate::testing::MockDns;
-    use crate::upstream::Upstream;
     use crate::upstream::udp::UdpUpstream;
-    use rurge_net::BoxFuture;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::timeout;
 
     const BOUND: Duration = Duration::from_secs(10);
@@ -305,46 +302,21 @@ mod tests {
         }
     }
 
+    /// The mock over UDP, for the tests that stay on the real clock: the two
+    /// on a multi-thread runtime, which has no paused clock, and
+    /// `server_failures_are_reported`, which asserts neither a count nor a
+    /// time. The others ask the mock in memory (`MockDns::upstream`) on a
+    /// paused clock, where no answer is late for a timer of the fanout's and
+    /// a time it takes is exactly the time it waits.
     fn up(server: &MockDns) -> UpstreamRef {
         Arc::new(UdpUpstream::new(server.addr()))
     }
 
-    /// A server that is not there: a question to it ends at its deadline,
-    /// unanswered. It counts the questions it was asked.
-    #[derive(Default)]
-    struct Silent {
-        asked: AtomicUsize,
-    }
-
-    impl Silent {
-        fn asked(&self) -> usize {
-            self.asked.load(Ordering::Relaxed)
-        }
-    }
-
-    impl Upstream for Silent {
-        fn name(&self) -> &str {
-            "silent"
-        }
-
-        fn query<'a>(
-            &'a self,
-            _wire: &'a [u8],
-            deadline: Instant,
-        ) -> BoxFuture<'a, Result<Vec<u8>, UpstreamError>> {
-            Box::pin(async move {
-                self.asked.fetch_add(1, Ordering::Relaxed);
-                sleep_until(deadline).await;
-                Err(UpstreamError::Timeout)
-            })
-        }
-    }
-
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn single_upstream_answers() {
         let s = MockDns::spawn().await;
         s.set("a.test", &["10.0.0.1", "10.0.0.2"], &[], 300);
-        let ans = resolve_name(&[up(&s)], "a.test", false, &fast())
+        let ans = resolve_name(&[s.upstream()], "a.test", false, &fast())
             .await
             .unwrap();
         assert_eq!(
@@ -355,7 +327,7 @@ mod tests {
             ]
         );
         assert!(ans.v6.is_empty() && !ans.partial && !ans.aaaa_timed_out);
-        assert_eq!(ans.upstream, format!("udp://{}", s.addr()));
+        assert_eq!(ans.upstream, format!("memory://{}", s.addr()));
         assert_eq!(s.query_count("a.test", Qtype::A), 1);
         assert_eq!(
             s.query_count("a.test", Qtype::Aaaa),
@@ -364,7 +336,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn first_valid_answer_wins() {
         let slow = MockDns::spawn().await;
         slow.set("a.test", &["10.0.0.9"], &[], 60);
@@ -372,42 +344,74 @@ mod tests {
         let fast_srv = MockDns::spawn().await;
         fast_srv.set("a.test", &["10.0.0.1"], &[], 60);
         let started = Instant::now();
-        let ans = resolve_name(&[up(&slow), up(&fast_srv)], "a.test", false, &fast())
-            .await
-            .unwrap();
+        let ans = resolve_name(
+            &[slow.upstream(), fast_srv.upstream()],
+            "a.test",
+            false,
+            &fast(),
+        )
+        .await
+        .unwrap();
         assert_eq!(ans.v4[0].0, "10.0.0.1".parse::<Ipv4Addr>().unwrap());
-        assert_eq!(ans.upstream, format!("udp://{}", fast_srv.addr()));
-        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(ans.upstream, format!("memory://{}", fast_srv.addr()));
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "the fast answer ends the fanout; the slow one's 300 ms are not waited for"
+        );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn resends_after_the_timer_and_recovers() {
         let s = MockDns::spawn().await;
         s.set("a.test", &["10.0.0.1"], &[], 60);
         s.set_drop_first(1);
         let started = Instant::now();
-        let ans = resolve_name(&[up(&s)], "a.test", false, &fast())
+        let ans = resolve_name(&[s.upstream()], "a.test", false, &fast())
             .await
             .unwrap();
         assert_eq!(ans.v4.len(), 1);
-        assert!(
-            started.elapsed() >= Duration::from_millis(100),
-            "answer came from the second round"
+        assert_eq!(
+            started.elapsed(),
+            fast().resend,
+            "answer came from the second round, sent at the first resend"
         );
         assert_eq!(s.query_count("a.test", Qtype::A), 2);
     }
 
+    /// What only a multi-thread runtime shows: a dropped upstream's own
+    /// `Timeout` and the loop's deadline are one instant and can be seen in
+    /// either order, and the result is the timeout, not `AllFailed` (the test
+    /// became multi-thread with the fix that stopped the fanout counting a
+    /// question's own timeout as a failure). That every round goes out, and
+    /// when the fanout ends, depend on the clock and are
+    /// `all_dropped_sends_every_round_and_times_out_at_the_deadline`'s.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn all_dropped_is_a_timeout_after_every_attempt() {
         let s = MockDns::spawn().await;
         s.set("a.test", &["10.0.0.1"], &[], 60);
         s.set_drop_all(true);
-        let started = Instant::now();
         let err = resolve_name(&[up(&s)], "a.test", false, &fast())
             .await
             .unwrap_err();
         assert_eq!(err, FanoutError::Timeout);
-        assert!(started.elapsed() >= Duration::from_millis(400));
+    }
+
+    /// Nothing answers: every round goes out, one question each, and the
+    /// fanout ends as a timeout at the deadline, `resend × attempts` after it
+    /// began.
+    #[tokio::test(start_paused = true)]
+    async fn all_dropped_sends_every_round_and_times_out_at_the_deadline() {
+        let s = MockDns::spawn().await;
+        s.set("a.test", &["10.0.0.1"], &[], 60);
+        s.set_drop_all(true);
+        let opts = fast();
+        let started = Instant::now();
+        let err = resolve_name(&[s.upstream()], "a.test", false, &opts)
+            .await
+            .unwrap_err();
+        assert_eq!(err, FanoutError::Timeout);
+        assert_eq!(started.elapsed(), opts.resend * opts.attempts);
         assert_eq!(s.query_count("a.test", Qtype::A), 4);
     }
 
@@ -418,14 +422,17 @@ mod tests {
     /// whose time has come and gone.
     #[tokio::test]
     async fn a_fanout_kept_from_running_until_past_its_deadline_ends_as_a_timeout() {
-        let silent = Arc::new(Silent::default());
-        let upstreams: Vec<UpstreamRef> = vec![silent.clone()];
+        // A server that is not there: a question to it ends at its deadline,
+        // unanswered. The mock records every question as it comes.
+        let mock = MockDns::spawn().await;
+        mock.set_drop_all(true);
+        let upstreams: Vec<UpstreamRef> = vec![mock.upstream()];
         let opts = fast();
         let whole = opts.resend * opts.attempts;
         let fanout =
             tokio::spawn(async move { resolve_name(&upstreams, "a.test", false, &opts).await });
         timeout(BOUND, async {
-            while silent.asked() == 0 {
+            while mock.query_count("a.test", Qtype::A) == 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -433,7 +440,7 @@ mod tests {
         .expect("the first round goes out within the bound");
         // The fanout waits for a resend, and runs next when the clock is
         // past its deadline: nothing of it runs in between.
-        let sent = silent.asked();
+        let sent = mock.query_count("a.test", Qtype::A);
         tokio::time::pause();
         tokio::time::advance(whole).await;
         tokio::time::resume();
@@ -441,10 +448,57 @@ mod tests {
             .await
             .expect("a fanout past its deadline ends within the bound");
         assert_eq!(outcome.unwrap(), Err(FanoutError::Timeout));
-        assert_eq!(silent.asked(), sent, "no round goes out past the deadline");
+        assert_eq!(
+            mock.query_count("a.test", Qtype::A),
+            sent,
+            "no round goes out past the deadline"
+        );
     }
 
-    #[tokio::test]
+    /// The same wake-up past the deadline, with the A answer taken and the
+    /// AAAA answer never to come: the fanout hands over the address it has,
+    /// and what it hands over is what it hands over when it ends at the first
+    /// resend instead — the two ways out of the loop do not differ in the
+    /// value. (It passes without the fix the test above is for, too: a
+    /// fanout with A in hand always had the partial-result exit to leave by.)
+    #[tokio::test(start_paused = true)]
+    async fn a_fanout_kept_from_running_until_past_its_deadline_hands_over_what_it_has() {
+        let mock = MockDns::spawn().await;
+        mock.set("dual.test", &["10.0.0.1"], &["fd00::1"], 60);
+        mock.set_drop_qtype(Qtype::Aaaa, true);
+        let upstreams: Vec<UpstreamRef> = vec![mock.upstream()];
+        let opts = fast();
+        let whole = opts.resend * opts.attempts;
+        let expected = Answers {
+            v4: vec![("10.0.0.1".parse().unwrap(), 60)],
+            v6: Vec::new(),
+            upstream: format!("memory://{}", mock.addr()),
+            partial: true,
+            aaaa_timed_out: true,
+        };
+        // The ordinary way out: A is in, and the first resend finds AAAA missing.
+        let ordinary = resolve_name(&upstreams, "dual.test", true, &opts)
+            .await
+            .unwrap();
+        assert_eq!(ordinary, expected);
+
+        let late = upstreams.clone();
+        let fanout =
+            tokio::spawn(async move { resolve_name(&late, "dual.test", true, &opts).await });
+        // On this clock a sleep ends when every other task has run out of
+        // work: the first round is out and the fanout has taken A's answer.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::advance(whole).await;
+        // The clock is the real one again, so that a fanout that does not end
+        // fails the bound instead of waiting for a paused clock.
+        tokio::time::resume();
+        let outcome = timeout(BOUND, fanout)
+            .await
+            .expect("a fanout past its deadline ends within the bound");
+        assert_eq!(outcome.unwrap().unwrap(), expected);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn empty_answer_rules() {
         // all empty → EmptyAnswer immediately
         let e1 = MockDns::spawn().await;
@@ -453,27 +507,29 @@ mod tests {
         e2.set_empty("nx.test");
         let started = Instant::now();
         assert_eq!(
-            resolve_name(&[up(&e1), up(&e2)], "nx.test", false, &fast()).await,
+            resolve_name(&[e1.upstream(), e2.upstream()], "nx.test", false, &fast()).await,
             Err(FanoutError::EmptyAnswer)
         );
-        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(started.elapsed(), Duration::ZERO);
         // one empty + one dropping → EmptyAnswer at the deadline
         let d = MockDns::spawn().await;
         d.set_drop_all(true);
+        let started = Instant::now();
         assert_eq!(
-            resolve_name(&[up(&e1), up(&d)], "nx.test", false, &fast()).await,
+            resolve_name(&[e1.upstream(), d.upstream()], "nx.test", false, &fast()).await,
             Err(FanoutError::EmptyAnswer)
         );
+        assert_eq!(started.elapsed(), fast().resend * fast().attempts);
         // one empty + one valid → valid
         let v = MockDns::spawn().await;
         v.set("nx.test", &["10.0.0.5"], &[], 60);
-        let ans = resolve_name(&[up(&e1), up(&v)], "nx.test", false, &fast())
+        let ans = resolve_name(&[e1.upstream(), v.upstream()], "nx.test", false, &fast())
             .await
             .unwrap();
-        assert_eq!(ans.upstream, format!("udp://{}", v.addr()));
+        assert_eq!(ans.upstream, format!("memory://{}", v.addr()));
         // unknown names answer NXDOMAIN, which is also "empty"
         assert_eq!(
-            resolve_name(&[up(&v)], "unknown.test", false, &fast()).await,
+            resolve_name(&[v.upstream()], "unknown.test", false, &fast()).await,
             Err(FanoutError::EmptyAnswer)
         );
     }
@@ -511,11 +567,11 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_and_aaaa_in_parallel_with_partial_results() {
         let s = MockDns::spawn().await;
         s.set("dual.test", &["10.0.0.1"], &["fd00::1"], 60);
-        let ans = resolve_name(&[up(&s)], "dual.test", true, &fast())
+        let ans = resolve_name(&[s.upstream()], "dual.test", true, &fast())
             .await
             .unwrap();
         assert_eq!(ans.v4.len(), 1);
@@ -525,7 +581,7 @@ mod tests {
 
         s.set_drop_qtype(Qtype::Aaaa, true);
         let started = Instant::now();
-        let ans = resolve_name(&[up(&s)], "dual.test", true, &fast())
+        let ans = resolve_name(&[s.upstream()], "dual.test", true, &fast())
             .await
             .unwrap();
         assert_eq!(ans.v4.len(), 1);
@@ -534,15 +590,15 @@ mod tests {
             ans.partial && ans.aaaa_timed_out,
             "A answered, AAAA missing at the resend tick"
         );
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed >= Duration::from_millis(100) && elapsed < Duration::from_millis(350),
-            "{elapsed:?}"
+        assert_eq!(
+            started.elapsed(),
+            fast().resend,
+            "the partial result comes at the first resend"
         );
 
         s.set_drop_qtype(Qtype::Aaaa, false);
         s.set_drop_qtype(Qtype::A, true);
-        let ans = resolve_name(&[up(&s)], "dual.test", true, &fast())
+        let ans = resolve_name(&[s.upstream()], "dual.test", true, &fast())
             .await
             .unwrap();
         assert!(ans.v4.is_empty() && ans.v6.len() == 1);
@@ -551,7 +607,7 @@ mod tests {
         // AAAA empty (no record) is not "timed out"
         s.set_drop_qtype(Qtype::A, false);
         s.set("v4only.test", &["10.0.0.2"], &[], 60);
-        let ans = resolve_name(&[up(&s)], "v4only.test", true, &fast())
+        let ans = resolve_name(&[s.upstream()], "v4only.test", true, &fast())
             .await
             .unwrap();
         assert!(!ans.partial && !ans.aaaa_timed_out && ans.v6.is_empty());

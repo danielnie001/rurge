@@ -192,14 +192,18 @@ impl MockDns {
     }
 
     /// An upstream that puts its questions to this mock's table directly, on
-    /// no socket, and gets what a socket would bring: the table's answer
-    /// after the table's delay, or — a question the table drops — nothing by
-    /// its deadline. Its questions are recorded like the others'.
+    /// no socket: the table's answer after the table's delay, or — a question
+    /// the table drops — nothing by its deadline. Its questions are recorded
+    /// like the others', as transport `memory`.
     ///
     /// For a test on a paused clock, which a socket cannot keep up with — a
     /// datagram takes real time. On that clock time passes only while every
     /// task waits: none goes by while an answer is on its way, however busy
     /// the machine, and no answer is late for a timer of the resolver's.
+    ///
+    /// Not everything a socket brings is there: `set_truncate_udp` applies to
+    /// the UDP transport only, so a truncated answer, and the retry over TCP
+    /// that follows it, cannot be tested through this upstream.
     pub fn upstream(&self) -> UpstreamRef {
         Arc::new(InMemory {
             name: format!("memory://{}", self.addr),
