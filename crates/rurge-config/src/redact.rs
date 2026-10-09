@@ -6,8 +6,9 @@
 /// (`[WireGuard]` `private-key`, `[Snell Server]` `psk`, `[Tailscale]`
 /// `auth-key`, …). `[General]`'s two test URLs are among them as a policy's
 /// `test-url` is among the inline parameters: a profile that came from a
-/// provider can carry a token in them.
-const SECRET_KEYS: [&str; 10] = [
+/// provider can carry a token in them. So is `geoip-maxmind-url`: MaxMind's
+/// own download link carries the account's licence key in its query.
+const SECRET_KEYS: [&str; 11] = [
     "password",
     "ca-passphrase",
     "ca-p12",
@@ -18,6 +19,7 @@ const SECRET_KEYS: [&str; 10] = [
     "auth-key",
     "proxy-test-url",
     "internet-test-url",
+    "geoip-maxmind-url",
 ];
 /// Inline `name=value` parameters redacted wherever they appear in a value.
 /// `username` also covers harmless SSH user names; `headers` and `ws-headers`
@@ -28,14 +30,15 @@ const SECRET_KEYS: [&str; 10] = [
 /// `policy-path` usually carries a subscription token, and its
 /// `external-policy-modifier` can set any parameter, a password included. A
 /// policy's `test-url` can come from a subscription line and carry its
-/// token. A `[WireGuard]` peer's `preshared-key` is the manual's spelling;
+/// token, and so can the `url` that older profiles write on a group line
+/// instead. A `[WireGuard]` peer's `preshared-key` is the manual's spelling;
 /// `pre-shared-key` stays for profiles written the other way. An `external`
 /// policy's `args` often carry a password (`sshpass -p …`, M4-D12). The
 /// camouflage host of `obfs-host` can identify the user (phase 2 M6 design 6),
 /// and behind a front that routes by path `obfs-uri` is a shared secret, as
 /// `ws-path` is. Over-redacting is the safe side for an endpoint whose
 /// purpose is safe output.
-const SECRET_PARAMS: [&str; 21] = [
+const SECRET_PARAMS: [&str; 22] = [
     "password",
     "psk",
     "private-key",
@@ -54,6 +57,7 @@ const SECRET_PARAMS: [&str; 21] = [
     "policy-path",
     "external-policy-modifier",
     "test-url",
+    "url",
     "args",
     "obfs-host",
     "obfs-uri",
@@ -116,6 +120,9 @@ pub(crate) fn redact_line(line: &str) -> String {
 }
 
 fn redact_body(line: &str) -> String {
+    if let Some(managed) = redact_managed(line) {
+        return managed;
+    }
     let Some((key, value)) = line.split_once('=') else {
         return line.to_string();
     };
@@ -154,6 +161,25 @@ fn redact_body(line: &str) -> String {
     // (those types carry credentials positionally; on every other type that
     // takes a server and a port a positional value is blanked all the same).
     format!("{key}={}", redact_definition(value))
+}
+
+/// `#!MANAGED-CONFIG <link> …` with the link — the first word after the
+/// directive, as `parse_managed` reads it — replaced by `***`: the one a
+/// provider issues carries the subscription token. The directive is a word of
+/// its own; a longer one that only starts like it is another directive and,
+/// like every other `#!` line, left alone.
+fn redact_managed(line: &str) -> Option<String> {
+    let rest = line.trim_start().strip_prefix("#!MANAGED-CONFIG")?;
+    let link = rest.trim_start();
+    if link.len() == rest.len() || link.is_empty() {
+        return None;
+    }
+    let end = link.find(char::is_whitespace).unwrap_or(link.len());
+    Some(format!(
+        "{}***{}",
+        &line[..line.len() - link.len()],
+        &link[end..]
+    ))
 }
 
 /// Where the credential of `item` ends: its last `@`, as the parsers split
@@ -666,7 +692,8 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
 
     /// A policy's `test-url` can come from a subscription line and carry its
     /// token; so can `[General]`'s `proxy-test-url` / `internet-test-url`,
-    /// in a profile that came from a provider.
+    /// in a profile that came from a provider. MaxMind's download link,
+    /// `geoip-maxmind-url`, carries the account's licence key.
     #[test]
     fn a_policy_line_and_the_profile_lose_their_test_urls() {
         assert_eq!(
@@ -676,9 +703,90 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
         assert_eq!(
             redact_profile(
                 "[General]\nproxy-test-url = http://p.test/?token=t0k3n\n\
-                 Internet-Test-URL=http://i.test/\ntest-timeout = 5\n"
+                 Internet-Test-URL=http://i.test/\ntest-timeout = 5\n\
+                 geoip-maxmind-url = https://download.maxmind.test/geoip?license_key=t0k3n&suffix=tar.gz\n"
             ),
-            "[General]\nproxy-test-url = ***\nInternet-Test-URL= ***\ntest-timeout = 5\n"
+            "[General]\nproxy-test-url = ***\nInternet-Test-URL= ***\ntest-timeout = 5\n\
+             geoip-maxmind-url = ***\n"
+        );
+    }
+
+    /// Older profiles write a group's test URL as `url=`: the same kind of
+    /// value as `test-url`. The name counts at a token boundary only, so
+    /// whatever else holds `url` stays as it was.
+    #[test]
+    fn a_groups_obsolete_url_is_hidden_and_what_only_holds_url_is_not() {
+        assert_eq!(
+            redact_profile("G = url-test, A, B, url=http://t.test/?token=t0k3n, interval=600"),
+            "G = url-test, A, B, url=***, interval=600"
+        );
+        assert_eq!(
+            redact_profile("G = fallback, A, url = http://t.test/?token=t0k3n"),
+            "G = fallback, A, url = ***"
+        );
+        // `test-url` has an entry of its own, and `[General]`'s test URL a key
+        assert_eq!(
+            redact_profile("G = select, A, test-url=http://t.test/?token=t0k3n"),
+            "G = select, A, test-url=***"
+        );
+        assert_eq!(
+            redact_profile("proxy-test-url = http://t.test/"),
+            "proxy-test-url = ***"
+        );
+        // neither a name that ends in `url` nor a `url=` inside a value is the
+        // parameter
+        for line in [
+            "G = select, A, icon-url=https://example.com/icon.png",
+            "G = select, A, icon-url=https://example.com/i.png?a=1&url=https://example.com/",
+            "cron = type=cron, cronexp=0 0 * * *, script-path=https://example.com/s.js?url=https://example.com/",
+        ] {
+            assert_eq!(redact_profile(line), line);
+        }
+    }
+
+    /// A profile issued by a provider starts with `#!MANAGED-CONFIG <link> …`,
+    /// and the link carries the subscription token: the directive and its
+    /// parameters stay, the link — the first word after the directive, as
+    /// `parse_managed` reads it — goes.
+    #[test]
+    fn a_managed_config_line_loses_its_link() {
+        for (line, shown) in [
+            (
+                "#!MANAGED-CONFIG https://provider.test/link/t0k3n?surge=4 interval=43200 strict=true",
+                "#!MANAGED-CONFIG *** interval=43200 strict=true",
+            ),
+            (
+                "#!MANAGED-CONFIG https://provider.test/t0k3n",
+                "#!MANAGED-CONFIG ***",
+            ),
+            // the spacing as written, and a CRLF file's `\r`
+            (
+                "  #!MANAGED-CONFIG\thttps://provider.test/t0k3n  strict=true\r",
+                "  #!MANAGED-CONFIG\t***  strict=true\r",
+            ),
+            // no link: nothing to hide
+            ("#!MANAGED-CONFIG", "#!MANAGED-CONFIG"),
+            ("#!MANAGED-CONFIG  \r", "#!MANAGED-CONFIG  \r"),
+            // other `#!` lines are left alone, a longer word that only starts
+            // like the directive too: the word after it is no link in any
+            // reading of the format (`parse_managed`, which takes the
+            // directive by its prefix, reads the `X` of this one as the link)
+            (
+                "#!FORBIDDEN-AUTO-UPGRADE smart-group",
+                "#!FORBIDDEN-AUTO-UPGRADE smart-group",
+            ),
+            (
+                "#!MANAGED-CONFIGX https://provider.test/t0k3n interval=60",
+                "#!MANAGED-CONFIGX https://provider.test/t0k3n interval=60",
+            ),
+        ] {
+            assert_eq!(redact_profile(line), shown, "{line:?}");
+        }
+        assert_eq!(
+            redact_profile(
+                "#!MANAGED-CONFIG https://provider.test/t0k3n?surge=4 interval=60\r\n[General]\r\nloglevel = notify\r\n"
+            ),
+            "#!MANAGED-CONFIG *** interval=60\r\n[General]\r\nloglevel = notify\r\n"
         );
     }
 

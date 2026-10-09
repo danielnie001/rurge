@@ -21,7 +21,12 @@ pub struct ControlArgs {
     #[arg(long, value_name = "HOST:PORT")]
     pub remote: Option<SocketAddr>,
     /// API key (overrides the profile)
-    #[arg(long, env = "RURGE_API_KEY", value_name = "KEY")]
+    #[arg(
+        long,
+        env = "RURGE_API_KEY",
+        hide_env_values = true,
+        value_name = "KEY"
+    )]
     pub key: Option<String>,
     /// Evaluate the profile as if running on this platform
     #[arg(long, value_parser = super::check::parse_platform)]

@@ -221,7 +221,8 @@ pub struct General {
 
 /// `internet_test_url` and `proxy_test_url` are left blank, as a policy's
 /// own `test-url` is: a profile that came from a provider can carry a token
-/// in them.
+/// in them. So is `geoip_maxmind_url`: MaxMind's own download link carries
+/// the account's licence key in its query.
 impl fmt::Debug for General {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let General {
@@ -305,7 +306,10 @@ impl fmt::Debug for General {
             )
             .field("hijack_dns", hijack_dns)
             .field("always_real_ip", always_real_ip)
-            .field("geoip_maxmind_url", geoip_maxmind_url)
+            .field(
+                "geoip_maxmind_url",
+                &geoip_maxmind_url.as_ref().map(|_| "***"),
+            )
             .field("disable_geoip_db_auto_update", disable_geoip_db_auto_update)
             .field("ipv6", ipv6)
             .field("ipv6_vif", ipv6_vif)

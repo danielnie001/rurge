@@ -1,15 +1,51 @@
 //! `#!MANAGED-CONFIG` and other header directives.
 
 use crate::diagnostic::{Diagnostic, Diagnostics, codes};
-use crate::text::Directive;
+use crate::text::{Directive, directive_name};
 use crate::value::parse_bool;
+use std::fmt;
 use std::time::Duration;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ManagedConfig {
     pub url: String,
     pub interval: Duration,
     pub strict: bool,
+}
+
+/// The URL is left blank: the link a provider issues carries the
+/// subscription token.
+impl fmt::Debug for ManagedConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ManagedConfig {
+            url: _,
+            interval,
+            strict,
+        } = self;
+        f.debug_struct("ManagedConfig")
+            .field("url", &"***")
+            .field("interval", interval)
+            .field("strict", strict)
+            .finish()
+    }
+}
+
+/// What a diagnostic says of a parameter it does not know: its name. What
+/// follows the `=` can be a token, and so can a word that is no `name=value`
+/// at all — a link pasted twice has its `=` somewhere in its query — so only
+/// a plain name is quoted.
+fn describe(parameter: &str) -> String {
+    match parameter.split_once('=') {
+        Some((name, _))
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) =>
+        {
+            format!("`{name}`")
+        }
+        _ => "(not written as `name=value`)".to_string(),
+    }
 }
 
 pub fn parse_managed(header: &[Directive], diags: &mut Diagnostics) -> Option<ManagedConfig> {
@@ -57,7 +93,7 @@ pub fn parse_managed(header: &[Directive], diags: &mut Diagnostics) -> Option<Ma
                     _ => diags.push(
                         Diagnostic::warning(
                             codes::W_INVALID_VALUE,
-                            format!("unknown MANAGED-CONFIG parameter `{p}`"),
+                            format!("unknown MANAGED-CONFIG parameter {}", describe(p)),
                         )
                         .at(d.span.clone()),
                     ),
@@ -70,7 +106,7 @@ pub fn parse_managed(header: &[Directive], diags: &mut Diagnostics) -> Option<Ma
             diags.push(
                 Diagnostic::warning(
                     codes::W_UNKNOWN_DIRECTIVE,
-                    format!("unknown directive ignored: {}", d.raw),
+                    format!("unknown directive ignored: {}", directive_name(&d.raw)),
                 )
                 .at(d.span.clone()),
             );

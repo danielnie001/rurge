@@ -74,6 +74,14 @@ pub struct Directive {
     pub span: Span,
 }
 
+/// The first word of a `#!` line, the directive's name. What follows it can
+/// be a link that carries a token (a misspelt `#!MANAGED-CONFIG` is an
+/// unknown directive), so a diagnostic names the directive and quotes nothing
+/// more.
+pub(crate) fn directive_name(line: &str) -> &str {
+    line.split_whitespace().next().unwrap_or(line)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Profile {
     pub main: Option<Arc<Path>>,
@@ -250,7 +258,7 @@ pub fn parse_str(text: &str, file: Arc<Path>, origin: Origin) -> (Profile, Diagn
                 Some(_) => diags.push(
                     Diagnostic::warning(
                         codes::W_UNKNOWN_DIRECTIVE,
-                        format!("unknown directive ignored: {trimmed}"),
+                        format!("unknown directive ignored: {}", directive_name(trimmed)),
                     )
                     .at(span),
                 ),

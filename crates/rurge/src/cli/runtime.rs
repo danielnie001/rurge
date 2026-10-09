@@ -22,10 +22,20 @@ pub struct RuntimeArgs {
     #[arg(long, env = "RURGE_DATA_DIR", value_name = "DIR")]
     pub data_dir: Option<PathBuf>,
     /// GeoIP country database URL (overrides geoip-maxmind-url)
-    #[arg(long, env = "RURGE_GEOIP_URL", value_name = "URL")]
+    #[arg(
+        long,
+        env = "RURGE_GEOIP_URL",
+        hide_env_values = true,
+        value_name = "URL"
+    )]
     pub geoip_url: Option<Url>,
     /// GeoIP ASN database URL
-    #[arg(long, env = "RURGE_GEOIP_ASN_URL", value_name = "URL")]
+    #[arg(
+        long,
+        env = "RURGE_GEOIP_ASN_URL",
+        hide_env_values = true,
+        value_name = "URL"
+    )]
     pub geoip_asn_url: Option<Url>,
     /// Never touch the network: use cached resources only
     #[arg(long, env = "RURGE_NO_NETWORK", value_parser = switch())]
@@ -60,7 +70,8 @@ impl RuntimeArgs {
         if let Some(u) = &cfg.general.geoip_maxmind_url {
             match Url::parse(u) {
                 Ok(parsed) => geo_urls.country = parsed,
-                Err(e) => eprintln!("warning: ignoring geoip-maxmind-url `{u}`: {e}"),
+                // not quoted: MaxMind's own link carries the account's licence key
+                Err(e) => eprintln!("warning: ignoring geoip-maxmind-url: {e}"),
             }
         }
         if let Some(u) = &self.geoip_url {

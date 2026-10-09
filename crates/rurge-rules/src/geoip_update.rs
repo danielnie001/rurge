@@ -69,7 +69,9 @@ impl GeoUpdater {
                     -1
                 }),
             };
-            let handle = resources.get(&spec);
+            // MaxMind's own download link carries the account's licence key:
+            // the log calls the database by its file name, not by the link
+            let handle = resources.get_labelled(&spec, kind.file_name());
             tasks.push(tokio::spawn(install_loop(geo.clone(), kind, handle)));
         }
         GeoUpdater { tasks }
@@ -319,5 +321,99 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(server.hits("/country"), 0);
         assert_eq!(server.hits("/asn"), 1);
+    }
+
+    /// Keeps the fields of every event down to INFO, the message among them.
+    struct Lines(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for Lines {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::INFO
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(String);
+
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0 += &format!(" {}={value:?}", field.name());
+                }
+            }
+
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// MaxMind's own download link carries the account's licence key in its
+    /// query, so the resource manager's log lines call a database by its file
+    /// name and not by where it comes from.
+    #[tokio::test]
+    async fn the_log_names_a_database_and_not_the_link_it_comes_from() {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // held across the awaits: the manager's tasks run on this thread
+        let _capturing = tracing::subscriber::set_default(Lines(lines.clone()));
+        // While one dispatcher alone is registered, tracing-core asks only
+        // the thread that first reaches a call site whether it is wanted: a
+        // site another test reaches first would stay shut on this thread
+        // too. With a second one it asks every dispatcher.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/country", fixture("GeoIP2-Country-Test.mmdb"));
+        server.set("/asn", "an error page");
+        server.set_status("/asn", 500);
+        let (geo, _) = GeoDb::open(&root.path().join("geoip"));
+        let mgr = manager(root.path());
+        let _updater = GeoUpdater::spawn(
+            geo,
+            mgr.clone(),
+            GeoUrls {
+                country: server.url("/country?license_key=S3CR3T-country"),
+                asn: server.url("/asn?license_key=S3CR3T-asn"),
+            },
+            true,
+        );
+        let said = |what: &str| {
+            lines
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|l| l.contains(what))
+                .cloned()
+        };
+        wait_until("a fetch that worked and one that failed are logged", || {
+            said("resource updated").is_some() && said("resource fetch failed").is_some()
+        })
+        .await;
+        let leaked: Vec<String> = lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains("S3CR3T"))
+            .cloned()
+            .collect();
+        assert!(leaked.is_empty(), "{leaked:#?}");
+        let updated = said("resource updated").unwrap();
+        assert!(updated.contains(COUNTRY_FILE), "{updated}");
+        let failed = said("resource fetch failed").unwrap();
+        assert!(failed.contains(ASN_FILE), "{failed}");
     }
 }

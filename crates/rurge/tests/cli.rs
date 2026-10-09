@@ -11,6 +11,41 @@ fn version_prints_crate_version() {
         .stdout(predicate::str::starts_with("rurge 0.1.0"));
 }
 
+/// clap prints `[env: NAME=<value>]` in an option's help unless told not to.
+/// The API's key and the two GeoIP links (MaxMind's carry the account's
+/// licence key) have their variable named in the help and the value left out.
+#[test]
+fn help_names_a_credential_variable_and_leaves_its_value_out() {
+    let mut printed = Vec::new();
+    for (command, variable, value) in [
+        ("status", "RURGE_API_KEY", "S3CR3T-key"),
+        (
+            "run",
+            "RURGE_GEOIP_URL",
+            "https://download.example/geoip?license_key=S3CR3T-geoip",
+        ),
+        (
+            "run",
+            "RURGE_GEOIP_ASN_URL",
+            "https://download.example/asn?license_key=S3CR3T-asn",
+        ),
+    ] {
+        let out = Command::cargo_bin("rurge")
+            .unwrap()
+            .args([command, "--help"])
+            .env(variable, value)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{command} --help");
+        let help = String::from_utf8_lossy(&out.stdout);
+        assert!(help.contains(variable), "{command} --help: {help}");
+        if help.contains("S3CR3T") {
+            printed.push(variable);
+        }
+    }
+    assert!(printed.is_empty(), "--help prints the value of {printed:?}");
+}
+
 use std::fs;
 
 const VALID: &str = "[General]\nloglevel = notify\n[Rule]\nGEOIP,CN,DIRECT\nFINAL,DIRECT\n";
@@ -1115,6 +1150,26 @@ FINAL,DIRECT,dns-failed
             warnings.iter().any(|w| w["code"] == "W0001"),
             "{warnings:?}"
         );
+    }
+
+    /// MaxMind's own download link carries the account's licence key, so a
+    /// link that cannot be read (here: its scheme is missing) is said to be
+    /// ignored without being quoted.
+    #[test]
+    fn an_unreadable_geoip_link_is_ignored_without_being_quoted() {
+        let dir = workspace();
+        std::fs::write(
+            dir.path().join("t.conf"),
+            format!(
+                "[General]\ngeoip-maxmind-url = download.example/geoip?license_key=S3CR3T-geoip\n{CONF}"
+            ),
+        )
+        .unwrap();
+        rule_match(dir.path(), &["listed.com"])
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("ignoring geoip-maxmind-url"))
+            .stderr(predicate::str::contains("S3CR3T").not());
     }
 }
 

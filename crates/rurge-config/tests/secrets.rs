@@ -18,7 +18,8 @@ const PUBLIC: &str = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU=";
 
 fn profile() -> String {
     format!(
-        "[General]
+        "#!MANAGED-CONFIG https://sub.example/managed/{MARKER}-managedpath?token={MARKER}-managed interval=43200 strict=true
+[General]
 http-api = {MARKER}-a@{MARKER}-pi@127.0.0.1:6171
 external-controller-access = {MARKER}-eca@127.0.0.1:6170
 http-listen = {MARKER}-listen@127.0.0.1:6152
@@ -26,6 +27,7 @@ wifi-access-http-auth = user:{MARKER}-wifi
 encrypted-dns-server = https://al1ce:{MARKER}-doh@dns.example/dns-query
 proxy-test-url = http://t.example/?token={MARKER}-proxytest
 internet-test-url = http://t.example/?token={MARKER}-internettest
+geoip-maxmind-url = https://download.example/geoip?edition_id=GeoLite2-Country&license_key={MARKER}-geoip&suffix=tar.gz
 
 [Proxy]
 Http = http, h.example, 8080, user, {MARKER}-http
@@ -53,6 +55,7 @@ Ts = tailscale, section-name=ts
 
 [Proxy Group]
 G = select, Http, policy-path=https://sub.example/list?token={MARKER}-sub, external-policy-modifier=\"password={MARKER}-modifier\"
+Old = url-test, Http, url=http://t.example/?token={MARKER}-groupurl
 
 [Keystore]
 cert = type=p12, password={MARKER}-p12, base64={MARKER}{MARKER}
@@ -132,7 +135,10 @@ fn the_redacted_profile_holds_no_secret() {
 #[test]
 fn a_diagnostic_of_a_mistyped_general_value_holds_no_secret() {
     let text = format!(
-        "[General]
+        "#!MANAGED-CONFIG https://sub.example/managed/{MARKER}-managedurl interval=43200 token={MARKER}-managedparam {MARKER}-bare https://other.example/{MARKER}-pasted?a=b
+#!MANAGED_CONFIG https://sub.example/link/{MARKER}-directive?surge=4
+[General]
+#!MANAGED_CONFIG https://sub.example/link/{MARKER}-inside?surge=4
 dns-server = htps://al1ce:{MARKER}-one@dns.example/dns-query
 encrypted-dns-server = doq://b0b:{MARKER}-two@dns.example
 doh-server = http://carol:{MARKER}-three@dns.example/dns-query
@@ -162,6 +168,9 @@ FINAL,DIRECT
         "***@listen.example:6152",
         "***@127.0.0.1:6153",
         "`wifi-access-http-auth`",
+        "unknown MANAGED-CONFIG parameter `token`",
+        "unknown MANAGED-CONFIG parameter (not written as `name=value`)",
+        "unknown directive ignored: #!MANAGED_CONFIG",
     ] {
         assert!(
             messages.iter().any(|m| m.contains(told)),
