@@ -152,7 +152,7 @@ pub struct UnknownKey {
     pub span: Span,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct General {
     pub loglevel: LogLevel,
     pub debug_cpu_usage: bool,
@@ -217,6 +217,146 @@ pub struct General {
     pub read_etc_hosts: bool,
     pub subnet_exp_wifi_always_match: bool,
     pub unknown: Vec<UnknownKey>,
+}
+
+/// `internet_test_url` and `proxy_test_url` are left blank, as a policy's
+/// own `test-url` is: a profile that came from a provider can carry a token
+/// in them.
+impl fmt::Debug for General {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let General {
+            loglevel,
+            debug_cpu_usage,
+            debug_memory_usage,
+            dns_server,
+            encrypted_dns_server,
+            encrypted_dns_follow_outbound_mode,
+            encrypted_dns_skip_cert_verification,
+            allow_dns_svcb,
+            use_local_host_item_for_proxy,
+            hijack_dns,
+            always_real_ip,
+            geoip_maxmind_url,
+            disable_geoip_db_auto_update,
+            ipv6,
+            ipv6_vif,
+            tun_excluded_routes,
+            tun_included_routes,
+            icmp_forwarding,
+            skip_proxy,
+            exclude_simple_hostnames,
+            proxy_restricted_to_lan,
+            gateway_restricted_to_lan,
+            external_controller_access,
+            http_api,
+            http_api_tls,
+            http_api_web_dashboard,
+            internet_test_url: _,
+            proxy_test_url: _,
+            test_timeout,
+            proxy_test_udp,
+            force_http_engine_hosts,
+            always_raw_tcp_hosts,
+            always_raw_tcp_keywords,
+            udp_policy_not_supported_behaviour,
+            udp_priority,
+            block_quic,
+            show_error_page,
+            show_error_page_for_reject,
+            compatibility_mode,
+            auto_suspend,
+            allow_wifi_access,
+            allow_hotspot_access,
+            wifi_access_http_port,
+            wifi_access_socks5_port,
+            wifi_access_http_auth,
+            wifi_assist,
+            all_hybrid,
+            hide_vpn_icon,
+            include_all_networks,
+            include_local_networks,
+            include_apns,
+            include_cellular_services,
+            http_listen,
+            socks5_listen,
+            set_system_socks_proxy,
+            read_etc_hosts,
+            subnet_exp_wifi_always_match,
+            unknown,
+        } = self;
+        f.debug_struct("General")
+            .field("loglevel", loglevel)
+            .field("debug_cpu_usage", debug_cpu_usage)
+            .field("debug_memory_usage", debug_memory_usage)
+            .field("dns_server", dns_server)
+            .field("encrypted_dns_server", encrypted_dns_server)
+            .field(
+                "encrypted_dns_follow_outbound_mode",
+                encrypted_dns_follow_outbound_mode,
+            )
+            .field(
+                "encrypted_dns_skip_cert_verification",
+                encrypted_dns_skip_cert_verification,
+            )
+            .field("allow_dns_svcb", allow_dns_svcb)
+            .field(
+                "use_local_host_item_for_proxy",
+                use_local_host_item_for_proxy,
+            )
+            .field("hijack_dns", hijack_dns)
+            .field("always_real_ip", always_real_ip)
+            .field("geoip_maxmind_url", geoip_maxmind_url)
+            .field("disable_geoip_db_auto_update", disable_geoip_db_auto_update)
+            .field("ipv6", ipv6)
+            .field("ipv6_vif", ipv6_vif)
+            .field("tun_excluded_routes", tun_excluded_routes)
+            .field("tun_included_routes", tun_included_routes)
+            .field("icmp_forwarding", icmp_forwarding)
+            .field("skip_proxy", skip_proxy)
+            .field("exclude_simple_hostnames", exclude_simple_hostnames)
+            .field("proxy_restricted_to_lan", proxy_restricted_to_lan)
+            .field("gateway_restricted_to_lan", gateway_restricted_to_lan)
+            .field("external_controller_access", external_controller_access)
+            .field("http_api", http_api)
+            .field("http_api_tls", http_api_tls)
+            .field("http_api_web_dashboard", http_api_web_dashboard)
+            .field("internet_test_url", &"***")
+            .field("proxy_test_url", &"***")
+            .field("test_timeout", test_timeout)
+            .field("proxy_test_udp", proxy_test_udp)
+            .field("force_http_engine_hosts", force_http_engine_hosts)
+            .field("always_raw_tcp_hosts", always_raw_tcp_hosts)
+            .field("always_raw_tcp_keywords", always_raw_tcp_keywords)
+            .field(
+                "udp_policy_not_supported_behaviour",
+                udp_policy_not_supported_behaviour,
+            )
+            .field("udp_priority", udp_priority)
+            .field("block_quic", block_quic)
+            .field("show_error_page", show_error_page)
+            .field("show_error_page_for_reject", show_error_page_for_reject)
+            .field("compatibility_mode", compatibility_mode)
+            .field("auto_suspend", auto_suspend)
+            .field("allow_wifi_access", allow_wifi_access)
+            .field("allow_hotspot_access", allow_hotspot_access)
+            .field("wifi_access_http_port", wifi_access_http_port)
+            .field("wifi_access_socks5_port", wifi_access_socks5_port)
+            .field("wifi_access_http_auth", wifi_access_http_auth)
+            .field("wifi_assist", wifi_assist)
+            .field("all_hybrid", all_hybrid)
+            .field("hide_vpn_icon", hide_vpn_icon)
+            .field("include_all_networks", include_all_networks)
+            .field("include_local_networks", include_local_networks)
+            .field("include_apns", include_apns)
+            .field("include_cellular_services", include_cellular_services)
+            .field("http_listen", http_listen)
+            .field("socks5_listen", socks5_listen)
+            .field("set_system_socks_proxy", set_system_socks_proxy)
+            .field("read_etc_hosts", read_etc_hosts)
+            .field("subnet_exp_wifi_always_match", subnet_exp_wifi_always_match)
+            .field("unknown", unknown)
+            .finish()
+    }
 }
 
 impl General {

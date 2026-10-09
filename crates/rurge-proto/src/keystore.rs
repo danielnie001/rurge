@@ -7,18 +7,25 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use rurge_config::KeystoreItem;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-/// Decodes a `p12` keystore item into a client identity (leaf first).
-/// The error names the item; it never repeats the password or the material.
-pub fn decode_p12(item: &KeystoreItem) -> Result<ClientIdentity, BuildError> {
-    let name = &item.name;
-    let der = STANDARD
+/// What a keystore item's `base64` holds, written with or without its
+/// padding. The error names the item; it never repeats the material.
+pub fn decode_base64(item: &KeystoreItem) -> Result<Vec<u8>, BuildError> {
+    STANDARD
         .decode(&item.base64)
         .or_else(|_| STANDARD_NO_PAD.decode(&item.base64))
         .map_err(|_| {
             BuildError::new(format!(
-                "keystore item `{name}`: `base64` is not valid Base64"
+                "keystore item `{}`: `base64` is not valid Base64",
+                item.name
             ))
-        })?;
+        })
+}
+
+/// Decodes a `p12` keystore item into a client identity (leaf first).
+/// The error names the item; it never repeats the password or the material.
+pub fn decode_p12(item: &KeystoreItem) -> Result<ClientIdentity, BuildError> {
+    let name = &item.name;
+    let der = decode_base64(item)?;
     let store = p12_keystore::KeyStore::from_pkcs12(&der, item.password.as_deref().unwrap_or(""))
         .map_err(|e| {
         BuildError::new(format!(
@@ -100,6 +107,24 @@ mod tests {
                 .load_private_key(identity.key)
                 .expect("a usable PKCS#8 key");
         }
+    }
+
+    /// A `base64` is read with its padding or without; what is not Base64
+    /// is named by its item and not repeated.
+    #[test]
+    fn base64_is_read_with_or_without_its_padding() {
+        for written in ["aGVsbG8=", "aGVsbG8"] {
+            assert_eq!(
+                decode_base64(&item(written, None)).unwrap(),
+                b"hello",
+                "{written}"
+            );
+        }
+        let err = decode_base64(&item("aGVsbG8=s3cret", None)).unwrap_err();
+        assert_eq!(
+            err.message,
+            "keystore item `cert1`: `base64` is not valid Base64"
+        );
     }
 
     #[test]

@@ -4,8 +4,10 @@
 
 /// Keys whose whole value is a secret when they stand alone on a line
 /// (`[WireGuard]` `private-key`, `[Snell Server]` `psk`, `[Tailscale]`
-/// `auth-key`, …).
-const SECRET_KEYS: [&str; 8] = [
+/// `auth-key`, …). `[General]`'s two test URLs are among them as a policy's
+/// `test-url` is among the inline parameters: a profile that came from a
+/// provider can carry a token in them.
+const SECRET_KEYS: [&str; 10] = [
     "password",
     "ca-passphrase",
     "ca-p12",
@@ -14,6 +16,8 @@ const SECRET_KEYS: [&str; 8] = [
     "pre-shared-key",
     "token",
     "auth-key",
+    "proxy-test-url",
+    "internet-test-url",
 ];
 /// Inline `name=value` parameters redacted wherever they appear in a value.
 /// `username` also covers harmless SSH user names; `headers` and `ws-headers`
@@ -661,17 +665,20 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
     }
 
     /// A policy's `test-url` can come from a subscription line and carry its
-    /// token; `[General]`'s own `proxy-test-url` / `internet-test-url` are
-    /// not inline parameters and are left alone.
+    /// token; so can `[General]`'s `proxy-test-url` / `internet-test-url`,
+    /// in a profile that came from a provider.
     #[test]
-    fn a_policy_line_loses_its_test_url() {
+    fn a_policy_line_and_the_profile_lose_their_test_urls() {
         assert_eq!(
             redact_definition("http, 127.0.0.1, 80, test-url=http://t.test/?token=t0k3n, tfo=true"),
             "http, 127.0.0.1, 80, test-url=***, tfo=true"
         );
         assert_eq!(
-            redact_profile("[General]\nproxy-test-url = http://p.test/\n"),
-            "[General]\nproxy-test-url = http://p.test/\n"
+            redact_profile(
+                "[General]\nproxy-test-url = http://p.test/?token=t0k3n\n\
+                 Internet-Test-URL=http://i.test/\ntest-timeout = 5\n"
+            ),
+            "[General]\nproxy-test-url = ***\nInternet-Test-URL= ***\ntest-timeout = 5\n"
         );
     }
 

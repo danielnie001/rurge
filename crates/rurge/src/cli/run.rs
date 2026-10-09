@@ -112,7 +112,10 @@ type LevelHandle = reload::Handle<LevelFilter, Registry>;
 /// carry no policy name, and the `wireguard` outbound logs its handshakes;
 /// quinn's are about its drivers and every packet, and the QUIC outbounds
 /// report what comes of them. quinn-udp's warnings stay: what the system
-/// refused to send, which it drops without telling anyone else.
+/// refused to send, which it drops without telling anyone else. russh
+/// narrates every session through `log`, down to what the server sent;
+/// the `ssh` outbound says what comes of one, and russh's own warnings and
+/// errors stay.
 fn quiet_dependencies() -> Targets {
     Targets::new()
         .with_default(LevelFilter::TRACE)
@@ -120,6 +123,8 @@ fn quiet_dependencies() -> Targets {
         // `quinn` covers `quinn_proto` too; the longer target wins
         .with_target("quinn", LevelFilter::OFF)
         .with_target("quinn_udp", LevelFilter::WARN)
+        // a `log` record's target is its module: `russh::…`, `russh_cryptovec::…`
+        .with_target("russh", LevelFilter::WARN)
 }
 
 fn init_logging(
@@ -973,6 +978,22 @@ mod tests {
         assert!(filter.would_enable("quinn_udp", &tracing::Level::WARN));
         assert!(!filter.would_enable("quinn_udp::imp", &tracing::Level::DEBUG));
         assert!(filter.would_enable("rurge_proto_quic::session", &tracing::Level::TRACE));
+    }
+
+    #[test]
+    fn russh_says_only_its_warnings() {
+        let filter = quiet_dependencies();
+        // its own account of a session, down to what the server sent: the
+        // `ssh` outbound reports what comes of it
+        assert!(!filter.would_enable("russh::client::encrypted", &tracing::Level::INFO));
+        assert!(!filter.would_enable("russh::client", &tracing::Level::DEBUG));
+        assert!(!filter.would_enable("russh::cipher", &tracing::Level::TRACE));
+        assert!(!filter.would_enable("russh_cryptovec::platform::windows", &tracing::Level::DEBUG));
+        // what went wrong inside it, which nothing else sees
+        assert!(filter.would_enable("russh::client::encrypted", &tracing::Level::WARN));
+        assert!(filter.would_enable("russh_cryptovec::platform", &tracing::Level::WARN));
+        assert!(filter.would_enable("russh::client", &tracing::Level::ERROR));
+        assert!(filter.would_enable("rurge_proto_ssh::outbound", &tracing::Level::TRACE));
     }
 
     #[test]

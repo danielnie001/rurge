@@ -15,14 +15,15 @@ russh.workspace = true
 rustls.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-base64.workspace = true
+base64 = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 
 [features]
 # Loopback SSH server and test keys (`rurge_proto_ssh::testing`); enabled by dependants' dev-dependencies.
-testing = ["dep:rand"]
+testing = ["dep:rand", "dep:base64"]
 
 [dev-dependencies]
+base64.workspace = true
 rand.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 

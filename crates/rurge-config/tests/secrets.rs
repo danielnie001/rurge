@@ -24,6 +24,8 @@ external-controller-access = {MARKER}-eca@127.0.0.1:6170
 http-listen = {MARKER}-listen@127.0.0.1:6152
 wifi-access-http-auth = user:{MARKER}-wifi
 encrypted-dns-server = https://al1ce:{MARKER}-doh@dns.example/dns-query
+proxy-test-url = http://t.example/?token={MARKER}-proxytest
+internet-test-url = http://t.example/?token={MARKER}-internettest
 
 [Proxy]
 Http = http, h.example, 8080, user, {MARKER}-http

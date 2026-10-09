@@ -1,10 +1,9 @@
 //! `[Keystore]` OpenSSH private keys, decoded at build time (phase 2 M4
 //! design 4.5).
 
-use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use rurge_config::KeystoreItem;
 use rurge_proto::BuildError;
+use rurge_proto::keystore::decode_base64;
 use russh::keys::ssh_key::{self, Algorithm};
 use russh::keys::{Error, PrivateKey, decode_secret_key};
 
@@ -12,14 +11,7 @@ use russh::keys::{Error, PrivateKey, decode_secret_key};
 /// it never repeats any of the material.
 pub fn decode_private_key(item: &KeystoreItem) -> Result<PrivateKey, BuildError> {
     let name = &item.name;
-    let file = STANDARD
-        .decode(&item.base64)
-        .or_else(|_| STANDARD_NO_PAD.decode(&item.base64))
-        .map_err(|_| {
-            BuildError::new(format!(
-                "keystore item `{name}`: `base64` is not valid Base64"
-            ))
-        })?;
+    let file = decode_base64(item)?;
     let not_a_key = || {
         BuildError::new(format!(
             "keystore item `{name}` is not an OpenSSH private key"
