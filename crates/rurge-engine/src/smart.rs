@@ -301,6 +301,9 @@ mod tests {
         assert!(unsendable(&named("")));
         assert!(!unsendable(&named(&"a".repeat(255))));
         assert!(unsendable(&named(&"a".repeat(256))));
+        // a dot at the end goes out with the name, and counts
+        assert!(!unsendable(&named(&format!("{}.", "a".repeat(254)))));
+        assert!(unsendable(&named(&format!("{}.", "a".repeat(255)))));
         // 159 bytes as written, 279 as A-labels
         let idn = ["bücher"; 20].join(".");
         assert_eq!(idn.len(), 159);

@@ -195,6 +195,72 @@ async fn a_site_that_is_down_costs_one_member_one_penalty() {
     assert_eq!(failed, ["A", "B", "C"]);
 }
 
+/// Nor does it cost more when the sessions come all at once, as a browser
+/// opens its connections to a host: they all pick the member that is first
+/// in line and all fail through it, and it answers for one of them — a
+/// member's own failure at a site excuses its next one there as another's
+/// does.
+#[tokio::test]
+async fn a_burst_of_sessions_to_a_site_that_is_down_costs_one_penalty() {
+    let mut proxies = String::new();
+    let mut upstreams = Vec::new();
+    for name in ["A", "B", "C"] {
+        let upstream = FakeSocks5::spawn(Socks5Script {
+            reply: 5,
+            ..Socks5Script::default()
+        })
+        .await;
+        proxies += &format!(
+            "{name} = socks5, 127.0.0.1, {}, {UNTESTED}\n",
+            upstream.addr().port()
+        );
+        upstreams.push(upstream);
+    }
+    let h = harness(Profile {
+        proxies: &proxies,
+        groups: "S = smart, A, B, C",
+        rules: "DOMAIN,down.test,S",
+        ..Profile::default()
+    })
+    .await;
+    let dials: Vec<_> = (0..6)
+        .map(|_| {
+            let engine = h.engine.clone();
+            tokio::spawn(async move {
+                match engine.dial(session("down.test")).await {
+                    Err(DialError::Failed { message, .. }) => message,
+                    Err(DialError::Reject { kind, .. }) => format!("rejected by {}", kind.name()),
+                    Ok(_) => "connected".to_string(),
+                }
+            })
+        })
+        .collect();
+    for dial in dials {
+        assert_eq!(dial.await.unwrap(), "socks5: connection refused");
+    }
+    for upstream in &upstreams {
+        assert_eq!(upstream.requests().len(), 6, "every session tried it");
+    }
+    // whichever session told first, it told of the member all of them
+    // tried first
+    assert_eq!(
+        healths(&h, &["A", "B", "C"]),
+        [
+            Health::Unknown { failures: 1 },
+            Health::Unknown { failures: 0 },
+            Health::Unknown { failures: 0 },
+        ]
+    );
+    let registry = h.engine.registry();
+    let mut failed = registry
+        .auto()
+        .smart
+        .site("down.test", Instant::now())
+        .failed;
+    failed.sort();
+    assert_eq!(failed, ["A", "B", "C"]);
+}
+
 /// A name no member's request can carry says nothing of the members (phase 2
 /// M8 design 5.5): every one of them refuses it alike. The session goes
 /// through the member the group picked and no further, fails in that
@@ -583,6 +649,42 @@ async fn a_member_whose_udp_send_fails_counts_against_it() {
         smart.site("127.0.0.1", Instant::now()).failed == ["Refusing"]
     })
     .await;
+}
+
+/// Flows that fail at one address through the same member — UDP tries no
+/// other — cost it one penalty: here two associations send there, and the
+/// member's carrier opens for neither.
+#[tokio::test]
+async fn udp_flows_failing_at_one_address_cost_their_member_one_penalty() {
+    // takes the control connection and hangs up before the association
+    let dead = FakeSocks5::spawn(Socks5Script {
+        hang_up_after_greeting: true,
+        ..Socks5Script::default()
+    })
+    .await;
+    let proxies = format!(
+        "Dead = socks5, 127.0.0.1, {}, udp-relay=true, {UNTESTED}",
+        dead.addr().port()
+    );
+    let h = udp_smart("Dead", &proxies).await;
+    let (echo, _) = udp_echo().await;
+    let (one, two) = (
+        udp_associate(h.socks()).await,
+        udp_associate(h.socks()).await,
+    );
+    one.send("127.0.0.1", echo.port(), b"hi").await;
+    two.send("127.0.0.1", echo.port(), b"hi").await;
+    wait_until("both flows to fail", || udp_records(&h).len() == 2).await;
+    for record in udp_records(&h) {
+        assert_eq!(
+            record.error.as_deref(),
+            Some("socks5: the proxy closed the connection during the handshake")
+        );
+    }
+    assert_eq!(healths(&h, &["Dead"]), [Health::Unknown { failures: 1 }]);
+    let registry = h.engine.registry();
+    let site = registry.auto().smart.site("127.0.0.1", Instant::now());
+    assert_eq!(site.failed, ["Dead"]);
 }
 
 /// The same over UDP for a name no member can send (phase 2 M8 design 5.5):
