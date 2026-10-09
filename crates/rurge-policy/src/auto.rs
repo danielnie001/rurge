@@ -280,15 +280,21 @@ impl AutoGroups {
     /// no longer does (a subscription update took the member away) is said
     /// once and ignored.
     pub(crate) fn override_of(&self, group: &str, members: &[String]) -> Option<String> {
-        let mut state = self.state.lock().expect("auto groups");
-        let o = state.overrides.get_mut(group)?;
-        if members.contains(&o.member) {
-            return Some(o.member.clone());
-        }
-        if !o.warned {
+        let gone = {
+            let mut state = self.state.lock().expect("auto groups");
+            let o = state.overrides.get_mut(group)?;
+            if members.contains(&o.member) {
+                return Some(o.member.clone());
+            }
+            if o.warned {
+                return None;
+            }
             o.warned = true;
-            tracing::warn!(group, member = %o.member, "the overriding member is gone from the group; the override has no effect");
-        }
+            o.member.clone()
+        };
+        // said with the lock released: every dial through an automatic
+        // group takes it, and the writer behind `tracing` is I/O
+        tracing::warn!(group, member = %gone, "the overriding member is gone from the group; the override has no effect");
         None
     }
 

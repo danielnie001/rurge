@@ -216,9 +216,12 @@ impl Engine {
     /// after its successor (M3 design 5.7) — and by every dial's `snapshot`,
     /// to read the runtime and the registry as one pair. Nothing inside it
     /// may do I/O, a name resolution, a dial or a build: that would hold up
-    /// every dial.
+    /// every dial. It guards no data, so a holder that panicked has left
+    /// nothing half done: the poison is ignored.
     pub(crate) fn generation_lock(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.generation.lock().expect("generation lock")
+        self.generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The current config generation (sessions snapshot it once at dial time).

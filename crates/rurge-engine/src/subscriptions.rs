@@ -467,4 +467,37 @@ Remote = select, DIRECT, policy-path=https://sub.test/nodes?token=t0k3n\n[Rule]\
             "the replaced generation is still alive"
         );
     }
+
+    /// The generation lock guards an order of events and no data: a thread
+    /// that panicked while it held it has left nothing half done. Every
+    /// dial takes the lock for its snapshot, and goes on taking it.
+    #[tokio::test]
+    async fn a_panic_under_the_generation_lock_stops_no_dial() {
+        use rurge_config::HostName;
+        use rurge_config::session::SessionInfo;
+        use rurge_inbound::Dialer;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(generation(dir.path(), "", EngineShared::default()).await);
+        let holder = engine.clone();
+        let held = std::thread::spawn(move || {
+            let _generation = holder.generation_lock();
+            panic!("while the generation lock is held");
+        });
+        assert!(held.join().is_err());
+
+        let (runtime, registry) = engine.snapshot();
+        assert!(Arc::ptr_eq(&runtime, &engine.runtime()));
+        assert!(Arc::ptr_eq(&registry, &engine.registry()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let to = listener.local_addr().unwrap();
+        let dial = engine.dial(SessionInfo::tcp(HostName::Ip(to.ip()), to.port()));
+        let dialed = tokio::time::timeout(Duration::from_secs(10), dial)
+            .await
+            .expect("the dial ends within the bound");
+        assert_eq!(
+            dialed.ok().map(|d| d.handle.policy_chain()),
+            Some(vec!["DIRECT".to_string()])
+        );
+    }
 }

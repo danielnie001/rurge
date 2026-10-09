@@ -546,7 +546,8 @@ impl PolicyRegistry {
                 return Some(TestSpec::at(definition, None, url, timeout));
             };
             let section = &wireguard.section;
-            let timeout = timeout + WIREGUARD_START;
+            // `test-timeout` takes any number of seconds
+            let timeout = timeout.saturating_add(WIREGUARD_START);
             // without a `dns-server` or a `test-url` of its own: a handshake
             // with the peers (phase 2 M4 design 6.7)
             Some(if section.dns_servers.is_empty() && own_url.is_none() {
@@ -1066,7 +1067,8 @@ impl PolicyRegistry {
             .map(|(_, test)| test.timeout)
             .collect();
         let longest = timeouts.iter().max().copied().unwrap_or_default();
-        longest * timeouts.len().div_ceil(MAX_CONCURRENT_TESTS) as u32
+        // `test-timeout` takes any number of seconds
+        longest.saturating_mul(timeouts.len().div_ceil(MAX_CONCURRENT_TESTS) as u32)
     }
 
     /// Tests every member of `group` now — the members of the groups in it
@@ -2566,6 +2568,27 @@ E = url-test, A, B, evaluate-before-use=true\nS = select, E\n[Rule]\nFINAL,U\n";
         assert_eq!(picked(&reg, "U"), "B");
     }
 
+    /// An override whose member is gone from the group is said once, however
+    /// many dials find it so.
+    #[test]
+    fn an_override_whose_member_is_gone_is_said_once() {
+        let reg = generation(AUTO, &FakeFactory::new(), None);
+        let spec = reg.group_spec("U").expect("a group").clone();
+        reg.auto().set_override(&spec, "Gone");
+        let ((), warnings) = warned(|| {
+            for _ in 0..3 {
+                assert_eq!(picked(&reg, "U"), "A", "nothing tested: the first");
+            }
+        });
+        assert_eq!(
+            warnings,
+            [
+                "the overriding member is gone from the group; the override has no effect \
+                 group=\"U\" member=Gone"
+            ]
+        );
+    }
+
     /// A round tests every member of the group and of the groups in it,
     /// and is recorded for each of those groups.
     #[tokio::test]
@@ -2657,6 +2680,45 @@ D = wireguard, section-name=dns\n[Rule]\nFINAL,DIRECT\n{}{}",
         assert_eq!(reg.round_timeout("Nine"), Duration::from_secs(10));
         assert_eq!(reg.round_timeout("WithSlow"), Duration::from_secs(7));
         assert_eq!(reg.round_timeout("Nothing"), Duration::ZERO);
+    }
+
+    /// `[General] test-timeout` takes any number of seconds: a round of
+    /// more than eight tests, each within the largest of them, may take as
+    /// long as a `Duration` can say, and no longer.
+    #[test]
+    fn a_round_of_tests_with_an_absurd_timeout_is_bounded_by_the_longest_duration() {
+        let members: Vec<String> = (1..=9).map(|i| format!("P{i}")).collect();
+        let proxies: String = members
+            .iter()
+            .map(|m| format!("{m} = http, 127.0.0.1, 80\n"))
+            .collect();
+        let profile = format!(
+            "[General]\ntest-timeout = {}\n[Proxy]\n{proxies}[Proxy Group]\n\
+             Nine = url-test, {}\n[Rule]\nFINAL,DIRECT\n",
+            u64::MAX,
+            members.join(", ")
+        );
+        let reg = generation(&profile, &FakeFactory::new(), None);
+        assert_eq!(
+            reg.test_case("P1").unwrap().timeout,
+            Duration::from_secs(u64::MAX)
+        );
+        assert_eq!(reg.round_timeout("Nine"), Duration::MAX);
+    }
+
+    /// The ten seconds a `wireguard` policy's test may take more are added
+    /// to whatever `test-timeout` says: the profile loads with the largest
+    /// too.
+    #[test]
+    fn a_wireguard_policy_with_an_absurd_test_timeout_is_built() {
+        let profile = format!(
+            "[General]\ntest-timeout = {}\n[Proxy]\nW = wireguard, section-name=plain\n\
+             [Rule]\nFINAL,DIRECT\n{}",
+            u64::MAX,
+            wireguard_section("plain", 1280, "")
+        );
+        let reg = generation(&profile, &FakeFactory::new(), None);
+        assert_eq!(reg.test_case("W").unwrap().timeout, Duration::MAX);
     }
 
     /// A round asked for a group that a reload then took away still ends

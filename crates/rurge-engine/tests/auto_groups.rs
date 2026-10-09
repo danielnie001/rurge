@@ -149,6 +149,46 @@ async fn evaluate_before_use_waits_for_the_first_round() {
     }
 }
 
+/// `[General] test-timeout` takes any number of seconds. With the largest,
+/// a dial through an `evaluate-before-use` group of more than eight members
+/// still waits for its first round — two timeouts long, more than can be
+/// counted — and the round, whose members all answer, ends like any other.
+#[tokio::test]
+async fn an_absurd_test_timeout_does_not_stop_a_round() {
+    let origin = TestServer::spawn().await;
+    origin.set("/ok", "");
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let members: Vec<String> = (1..=9).map(|i| format!("P{i}")).collect();
+    let proxies: String = members
+        .iter()
+        .map(|m| format!("{m} = socks5, 127.0.0.1, {}\n", upstream.addr().port()))
+        .collect();
+    let h = harness(Profile {
+        general: &format!(
+            "proxy-test-url = {}\ntest-timeout = {}",
+            origin.url("/ok"),
+            u64::MAX
+        ),
+        proxies: &proxies,
+        groups: &format!(
+            "E = fallback, {}, evaluate-before-use=true",
+            members.join(", ")
+        ),
+        rules: "DOMAIN,target.test,E",
+        ..Profile::default()
+    })
+    .await;
+    let chain = tokio::time::timeout(Duration::from_secs(10), chain_of(&h, "target.test"))
+        .await
+        .expect("the dial ends within the bound");
+    assert_eq!(chain, ["E", "P1"]);
+    assert!(h.engine.registry().auto().last_round("E").is_some());
+}
+
 #[tokio::test]
 async fn every_test_is_a_session_of_the_request_log() {
     let origin = TestServer::spawn().await;
