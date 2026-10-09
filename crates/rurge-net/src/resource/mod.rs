@@ -549,22 +549,22 @@ async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>, mut gone: watc
         drop(mgr);
         let due = next_due(&entry, backoff);
         *entry.next_refresh.lock().expect("next") = next_refresh_at(due);
-        // `due` is `None` only when auto-refresh is disabled (negative interval); bound that
-        // wait too, so an orphaned task (manager dropped, nobody left to `force_update`) still
-        // wakes periodically to notice `weak.upgrade()` failing instead of parking forever.
-        let wait = due.unwrap_or(Duration::from_secs(60));
-        let kicked = tokio::select! {
-            _ = tokio::time::sleep(wait) => false,
-            _ = entry.kick.notified() => true,
+        // `due` is `None` only when auto-refresh is disabled (negative interval): then the
+        // task waits for a kick (`force_update`) or for the manager to go, and for nothing else
+        let timer = async {
+            match due {
+                Some(wait) => tokio::time::sleep(wait).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = timer => {}
+            _ = entry.kick.notified() => {}
             // nothing is ever sent: this is the manager going
             _ = gone.changed() => return,
-        };
+        }
         if weak.upgrade().is_none() {
             return;
-        }
-        if due.is_none() && !kicked {
-            // Periodic liveness tick only; no refresh is actually due.
-            continue;
         }
         let meta = entry.meta.lock().expect("meta").clone();
         match fetch::fetch(
@@ -1165,6 +1165,37 @@ mod tests {
         // the first label stays
         mgr.get_labelled(&url_spec(url, None), "policy-path of `H`");
         assert_eq!(plain.entry.log_name(), "policy-path of `G`");
+    }
+
+    /// With auto-refresh off (`update-interval` below zero) a URL task waits
+    /// for a kick and for its manager to go, and for nothing else: once
+    /// something is fetched, `force_update` makes it fetch again, and it ends
+    /// when the manager is dropped.
+    #[tokio::test]
+    async fn a_url_task_without_auto_refresh_waits_for_a_kick_and_for_its_manager() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/k", "kilo");
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(server.url("/k"), Some(-1)));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        assert_eq!(server.hits("/k"), 1);
+        server.set("/k", "kilo two");
+        assert!(mgr.force_update(&ResourceSource::Url(server.url("/k"))));
+        let s = wait_for(&h, "v2", |s| available_version(s) == Some(2)).await;
+        assert_eq!(&s.data().unwrap().0[..], b"kilo two");
+        assert_eq!(server.hits("/k"), 2);
+        let entry = Arc::downgrade(&h.entry);
+        drop(h);
+        drop(mgr);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while entry.strong_count() > 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the task still holds its entry"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// A manager that is dropped takes its URL tasks with it: a reload

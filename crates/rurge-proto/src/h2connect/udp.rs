@@ -263,8 +263,9 @@ mod tests {
 
     /// A proxy that answers 200 and ends every stream at once: a datagram
     /// that finds its stream ended opens one more, and fails when that one
-    /// has ended too. The loop is handed each stream after its reader has
-    /// seen the end: on its own it may look before that.
+    /// has ended too — the target is not failed for good: the next datagram
+    /// opens twice again. The loop is handed each stream after its reader
+    /// has seen the end: on its own it may look before that.
     #[tokio::test]
     async fn a_stream_that_has_ended_is_opened_again_only_once() {
         let echo = udp_echo_server().await;
@@ -278,23 +279,28 @@ mod tests {
         let udp = H2Udp::new(out.inner.clone(), authority, ConnectOpts::default(), IDLE);
         let to = target(echo);
         let opens = AtomicUsize::new(0);
+        // what the opens may add up to by the end of the datagram in hand
+        let allowed = AtomicUsize::new(0);
         let ended = || async {
             let n = opens.fetch_add(1, Ordering::Relaxed) + 1;
-            assert!(n <= 2, "opened a third time");
+            assert!(n <= allowed.load(Ordering::Relaxed), "opened a third time");
             let stream = udp.open(&to).await?;
             stream.ended.cancelled().await;
             Ok(stream)
         };
-        let found = tokio::time::timeout(Duration::from_secs(10), udp.stream(&to, ended))
-            .await
-            .expect("an end within the bound");
-        let err = found.map(drop).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
-        assert_eq!(
-            err.to_string(),
-            "h2-connect: the server ended the UDP stream"
-        );
-        assert_eq!(opens.load(Ordering::Relaxed), 2);
-        assert_eq!(fake.requests().len(), 2);
+        for datagram in 1..=2 {
+            allowed.store(2 * datagram, Ordering::Relaxed);
+            let found = tokio::time::timeout(Duration::from_secs(10), udp.stream(&to, &ended))
+                .await
+                .expect("an end within the bound");
+            let err = found.map(drop).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+            assert_eq!(
+                err.to_string(),
+                "h2-connect: the server ended the UDP stream"
+            );
+            assert_eq!(opens.load(Ordering::Relaxed), 2 * datagram);
+            assert_eq!(fake.requests().len(), 2 * datagram);
+        }
     }
 }

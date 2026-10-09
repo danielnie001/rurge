@@ -216,8 +216,10 @@ impl Engine {
     /// after its successor (M3 design 5.7) — and by every dial's `snapshot`,
     /// to read the runtime and the registry as one pair. Nothing inside it
     /// may do I/O, a name resolution, a dial or a build: that would hold up
-    /// every dial. It guards no data, so a holder that panicked has left
-    /// nothing half done: the poison is ignored.
+    /// every dial. It guards no data, and what is done under it runs
+    /// everything that can fail before its first store, so a holder that
+    /// panicked has published a whole generation or none: the poison is
+    /// ignored.
     pub(crate) fn generation_lock(&self) -> std::sync::MutexGuard<'_, ()> {
         self.generation
             .lock()
@@ -443,15 +445,18 @@ impl Engine {
             .registry
             .take()
             .expect("a generation is published once");
+        // the retains come first: they can panic and the stores cannot, so a
+        // generation goes out whole or not at all
+        //
         // what the `smart` groups knew of what is gone goes with it (phase 2
         // M3c design 5.1)
         self.shared
             .auto
             .smart
             .retain(|name| registry.contains(name));
+        self.shared.auto.retain(&next.config.group_specs);
         self.shared.cell.store(registry);
         self.shared.resolver.store(next.stack.resolver.clone());
-        self.shared.auto.retain(&next.config.group_specs);
     }
 }
 

@@ -273,7 +273,9 @@ pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPo
 /// where it first appears and dropped where it repeats, a key it lacks is
 /// appended. An item's key is the one the parser reads — with the quotes
 /// around a whole item taken off, without its case; every other item keeps
-/// its text.
+/// its text. The fields the parser takes for the type, and for a server and
+/// a port unless the type has none, are no parameters, however they are
+/// spelled.
 ///
 /// The line then reads as it did alone, the overrides in place. What is
 /// appended therefore stands in front of a last item that leaves a quote or
@@ -282,13 +284,24 @@ pub fn with_params(definition: &str, overrides: &[(String, String)]) -> String {
     let mut written: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
     let items = crate::redact::split_top_level(definition);
+    // how many fields the parser reads before the parameters; an item it
+    // drops, an empty one, is none of them
+    let mut head = items
+        .iter()
+        .find_map(|item| split_list(item).pop())
+        .and_then(|keyword| PolicyKind::parse(&keyword))
+        .map_or(1, |kind| if kind.takes_server() { 3 } else { 1 });
     let mut open_tail = false;
     for (i, item) in items.iter().enumerate() {
         let field = split_list(item).pop();
-        let key = field
-            .as_deref()
-            .and_then(parse_key_value)
-            .map(|(k, _)| k.to_ascii_lowercase());
+        let key = match field.as_deref() {
+            Some(_) if head > 0 => {
+                head -= 1;
+                None
+            }
+            Some(field) => parse_key_value(field).map(|(k, _)| k.to_ascii_lowercase()),
+            None => None,
+        };
         let found = key
             .as_ref()
             .and_then(|k| overrides.iter().find(|(o, _)| o.eq_ignore_ascii_case(k)));
@@ -866,13 +879,24 @@ external-policy-modifier=\"password=hunter2\"",
     }
 
     /// `with_params` and the parser agree on what a line's items are, for
-    /// every line of up to three of these: the parser takes the quotes off a
-    /// whole item before it looks for a key, keeps a comma inside a quoted
-    /// item, compares keys without their case, and gives an unclosed quote
-    /// or group the rest of the line — what is appended must not end up in
-    /// it.
+    /// every line of up to three of these after each head: the parser takes
+    /// the quotes off a whole item before it looks for a key, keeps a comma
+    /// inside a quoted item, compares keys without their case, and gives an
+    /// unclosed quote or group the rest of the line — what is appended must
+    /// not end up in it. And it takes the type, and a server and a port
+    /// unless the type has none, for what they are whatever they are spelled
+    /// like.
     #[test]
     fn a_modified_line_reads_as_the_line_did_with_the_modifier_in_place() {
+        const HEADS: [&str; 4] = [
+            "trojan, t.test, 443",
+            // a server spelled like a parameter the modifier sets
+            "http, tfo=false, 80",
+            // a type without a server: its first item is a parameter
+            "direct, tfo=false",
+            // the parser drops an empty item, which is then no field
+            "trojan, , , tfo=false, 443",
+        ];
         const ITEMS: [&str; 16] = [
             " password=pw",
             " tfo=false",
@@ -898,12 +922,14 @@ external-policy-modifier=\"password=hunter2\"",
         ];
         let modifier = pairs(&[("tfo", "true"), ("sni", "edge.test")]);
         let mut lines: Vec<String> = Vec::new();
-        for a in ITEMS {
-            lines.push(format!("trojan, t.test, 443,{a}"));
-            for b in ITEMS {
-                lines.push(format!("trojan, t.test, 443,{a},{b}"));
-                for c in ITEMS {
-                    lines.push(format!("trojan, t.test, 443,{a},{b},{c}"));
+        for head in HEADS {
+            for a in ITEMS {
+                lines.push(format!("{head},{a}"));
+                for b in ITEMS {
+                    lines.push(format!("{head},{a},{b}"));
+                    for c in ITEMS {
+                        lines.push(format!("{head},{a},{b},{c}"));
+                    }
                 }
             }
         }
@@ -952,5 +978,13 @@ external-policy-modifier=\"password=hunter2\"",
         ] {
             assert_eq!(with_params(line, &modifier), modified, "{line}");
         }
+        // the server and the port are no parameters, however they are
+        // spelled; the first item after a type without a server is one
+        let tfo = pairs(&[("tfo", "true")]);
+        assert_eq!(
+            with_params("http, tfo=x, 80", &tfo),
+            "http, tfo=x, 80, tfo=true"
+        );
+        assert_eq!(with_params("direct, tfo=x", &tfo), "direct, tfo=true");
     }
 }

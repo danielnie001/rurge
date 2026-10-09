@@ -50,7 +50,8 @@ fn failure(cmd: &[String], status: impl fmt::Display, detail: &str) -> String {
 
 /// `arg` without what stands before its last `@` — a URL's user name and
 /// password, which may hold an `@` themselves; what can be a scheme stays in
-/// front. An argument without an `@` is shown whole.
+/// front. An argument without an `@`, or with nothing in front of it but a
+/// scheme (GNOME's empty list is `@as []`), is shown whole.
 fn without_credentials(arg: &str) -> String {
     let Some((before, rest)) = arg.rsplit_once('@') else {
         return arg.to_string();
@@ -60,7 +61,12 @@ fn without_credentials(arg: &str) -> String {
         s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
     };
-    match scheme.filter(is_scheme) {
+    let scheme = scheme.filter(is_scheme);
+    let credentials = scheme.map_or(before, |scheme| &before[scheme.len() + "://".len()..]);
+    if credentials.is_empty() {
+        return arg.to_string();
+    }
+    match scheme {
         Some(scheme) => format!("{scheme}://***@{rest}"),
         None => format!("***@{rest}"),
     }
@@ -173,6 +179,11 @@ mod tests {
             ("socks://al1ce:p@ss@[::1] 1080", "socks://***@[::1] 1080"),
             ("al1ce:p://w@proxy.example", "***@proxy.example"),
             ("al1ce@proxy.example", "***@proxy.example"),
+            // nothing in front of the `@` but a scheme: nothing is hidden, and
+            // the command is shown as it ran (GNOME's empty list is `@as []`)
+            ("@as []", "@as []"),
+            ("@", "@"),
+            ("http://@proxy.example", "http://@proxy.example"),
         ] {
             assert_eq!(
                 failure(&cmd(&["tool", arg]), 2, ""),

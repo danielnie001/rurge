@@ -257,8 +257,9 @@ mod tests {
     /// A server that ends every UDP connection as soon as it is up: a
     /// datagram that finds its connection ended dials once more, and fails
     /// when that one has ended too — it does not go on dialling for as long
-    /// as its sender waits. The loop is handed each connection after its
-    /// reader has seen the end: on its own it may look before that.
+    /// as its sender waits, and the target is not failed for good: the next
+    /// datagram dials twice again. The loop is handed each connection after
+    /// its reader has seen the end: on its own it may look before that.
     #[tokio::test]
     async fn a_connection_that_has_ended_is_dialled_again_only_once() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -282,22 +283,27 @@ mod tests {
         let udp = VmessUdp::new(dialer, ConnectOpts::default(), IDLE);
         let to = Target::new(HostName::parse("target.test"), 53);
         let dials = AtomicUsize::new(0);
+        // what the dials may add up to by the end of the datagram in hand
+        let allowed = AtomicUsize::new(0);
         let ended = || async {
             let n = dials.fetch_add(1, Ordering::Relaxed) + 1;
-            assert!(n <= 2, "dialled a third time");
+            assert!(n <= allowed.load(Ordering::Relaxed), "dialled a third time");
             let conn = udp.dial(&to).await?;
             conn.ended.cancelled().await;
             Ok(conn)
         };
-        let found = tokio::time::timeout(Duration::from_secs(10), udp.connection(&to, ended))
-            .await
-            .expect("an end within the bound");
-        let err = found.map(drop).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
-        assert_eq!(
-            err.to_string(),
-            "vmess: the server ended the UDP connection"
-        );
-        assert_eq!(dials.load(Ordering::Relaxed), 2);
+        for datagram in 1..=2 {
+            allowed.store(2 * datagram, Ordering::Relaxed);
+            let found = tokio::time::timeout(Duration::from_secs(10), udp.connection(&to, &ended))
+                .await
+                .expect("an end within the bound");
+            let err = found.map(drop).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+            assert_eq!(
+                err.to_string(),
+                "vmess: the server ended the UDP connection"
+            );
+            assert_eq!(dials.load(Ordering::Relaxed), 2 * datagram);
+        }
     }
 }
