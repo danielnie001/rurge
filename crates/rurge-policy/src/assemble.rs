@@ -1385,6 +1385,52 @@ external-policy-modifier=\"headers=Authorization Bearer s3cr3tT0ken\"",
         }
     }
 
+    /// An imported line's server written in Unicode goes into its spec as
+    /// the A-labels, as one of the profile's does — and into the policy a
+    /// group's relay derives from it. A line whose server has no such form
+    /// is skipped by its number, with nothing of the line in the warning.
+    #[test]
+    fn an_imported_server_written_in_unicode_becomes_its_a_labels() {
+        let cfg = profile(
+            "Relay = http, r.test, 80",
+            "G = select, policy-path=https://sub.test/g\n\
+H = select, policy-path=https://sub.test/g, underlying-proxy=Relay",
+        );
+        let a = assemble(
+            &cfg,
+            &snapshots(
+                &cfg,
+                &[(
+                    "G",
+                    "Idn = trojan, bücher.example, 8443, password=s3cretPw\n\
+Bad = trojan, a＠b.example, 8443, password=s3cretPw\n\
+Fine = http, f.test, 80",
+                )],
+            ),
+        );
+        assert_eq!(members(&a, "G"), ["Idn", "Fine"]);
+        assert_eq!(members(&a, "H"), ["Idn (via Relay)", "Fine (via Relay)"]);
+        let a_labels = Some(rurge_config::HostName::Domain(
+            "xn--bcher-kva.example".into(),
+        ));
+        assert_eq!(a.imported[0].policy.name, "Idn");
+        assert_eq!(a.imported[0].spec.as_ref().unwrap().server, a_labels);
+        assert_eq!(a.derived[0].spec.name, "Idn (via Relay)");
+        assert_eq!(a.derived[0].spec.server, a_labels);
+        assert_eq!(
+            warnings(&a),
+            [(
+                codes::W_SET_LINES_SKIPPED,
+                "policy group `G`: `policy-path` line 2: policy `Bad` has a parameter whose value cannot be used (E0018); skipped".to_string()
+            )]
+        );
+        for (_, message) in warnings(&a) {
+            for value in ["＠", "b.example", "s3cretPw", "8443"] {
+                assert!(!message.contains(value), "{message}");
+            }
+        }
+    }
+
     /// An import whose relay was itself left out — because it formed a
     /// cycle, or because one of its own parameters was invalid — would dial
     /// nowhere on its own: it is left out too, whatever the length of the

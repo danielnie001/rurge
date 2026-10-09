@@ -174,7 +174,7 @@ mod tests {
         assert_eq!(
             question(1, "bücher.test", Family::V4),
             None,
-            "no IDN before M8"
+            "the caller asks for the A-labels"
         );
     }
 

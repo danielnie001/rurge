@@ -19,7 +19,6 @@ rcgen = { workspace = true, optional = true }
 p12-keystore.workspace = true
 getrandom.workspace = true
 tracing.workspace = true
-idna.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 http.workspace = true

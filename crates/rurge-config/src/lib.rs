@@ -12,6 +12,7 @@ pub mod general;
 pub mod glob;
 pub mod host;
 pub mod hostlist;
+pub mod hostname;
 pub mod keystore;
 pub mod managed;
 pub mod policy;

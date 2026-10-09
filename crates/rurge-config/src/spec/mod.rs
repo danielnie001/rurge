@@ -343,8 +343,32 @@ fn check_underlying(r: &mut ParamReader<'_>, common: &mut CommonOpts, env: &Spec
     }
 }
 
+/// The policy's server as its spec carries it: a name written in Unicode in
+/// its A-label form (UTS #46), so that the TLS layer, the resolver and every
+/// request that names the server take ASCII; an ASCII name and an address
+/// as they are. A name without such a form is `E0018`, which does not quote
+/// it: the line may be a subscription's.
+fn read_server(r: &mut ParamReader<'_>) -> Option<HostName> {
+    match &r.policy().server {
+        Some(HostName::Domain(name)) if !name.is_ascii() => {
+            let ascii = crate::hostname::to_ascii(name);
+            if ascii.is_none() {
+                r.error(
+                    codes::E_INVALID_POLICY_PARAM,
+                    "the server's host name cannot be written in ASCII (IDNA)".to_string(),
+                );
+            }
+            // read as a written name is: a dot that UTS #46 left at its end
+            // goes, and digits it made ASCII are an address
+            ascii.map(|ascii| HostName::parse(&ascii))
+        }
+        written => written.clone(),
+    }
+}
+
 pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     let mut r = ParamReader::new(policy);
+    let server = read_server(&mut r);
     let mut notes = Notes::default();
     let mut not_implemented = None;
     let mut remarks = Vec::new();
@@ -598,7 +622,7 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
     let spec = (!failed && not_implemented.is_none()).then(|| PolicySpec {
         name: policy.name.clone(),
         kind: policy.kind,
-        server: policy.server.clone(),
+        server,
         port: policy.port,
         common,
         proto,
@@ -636,7 +660,10 @@ mod tests {
     }
 
     fn outcome(name: &str, def: &str) -> SpecOutcome {
-        let p = parse_policy(name, def, &span()).unwrap();
+        outcome_of(&parse_policy(name, def, &span()).unwrap())
+    }
+
+    fn outcome_of(p: &ProxyPolicy) -> SpecOutcome {
         let keystore = vec![KeystoreItem {
             name: "cert1".into(),
             kind: KeystoreType::P12,
@@ -658,13 +685,99 @@ mod tests {
             ..WireGuardSection::default()
         }];
         to_spec(
-            &p,
+            p,
             &SpecEnv {
                 keystore: &keystore,
                 wireguard: &wireguard,
                 lookup: &lookup,
             },
         )
+    }
+
+    /// A server written in Unicode goes into the spec as its A-labels (UTS
+    /// #46): the TLS layer, the resolver and every request that names the
+    /// server take ASCII from there. Its case and a dot at its end go as an
+    /// ASCII name's do.
+    #[test]
+    fn a_server_written_in_unicode_becomes_its_a_labels() {
+        for (written, expected) in [
+            ("bücher.example", "xn--bcher-kva.example"),
+            ("例え.テスト", "xn--r8jz45g.xn--zckzah"),
+            ("BÜCHER.Example.", "xn--bcher-kva.example"),
+            // the ideographic full stop is a dot, also at the end
+            ("例え。テスト。", "xn--r8jz45g.xn--zckzah"),
+        ] {
+            let o = outcome("T", &format!("trojan, {written}, 443, password=x"));
+            assert!(o.diagnostics.is_empty(), "{written}: {:?}", o.diagnostics);
+            assert_eq!(
+                o.spec.expect("a spec").server,
+                Some(HostName::Domain(expected.into())),
+                "{written}"
+            );
+        }
+        // digits written wide are an address, as the ASCII ones are
+        let o = outcome("T", "trojan, １９２.０.２.７, 443, password=x");
+        assert_eq!(
+            o.spec.expect("a spec").server,
+            Some(HostName::Ip("192.0.2.7".parse().unwrap()))
+        );
+    }
+
+    /// An ASCII name is not touched — one that is A-labels already, one
+    /// with an underscore — and neither is an address.
+    #[test]
+    fn an_ascii_server_and_an_address_are_left_as_they_are() {
+        for written in [
+            "proxy.example",
+            "xn--bcher-kva.example",
+            "_srv.a-b.example",
+            "localhost",
+            "192.0.2.7",
+            "[2001:db8::1]",
+        ] {
+            let p =
+                parse_policy("T", &format!("trojan, {written}, 443, password=x"), &span()).unwrap();
+            let o = outcome_of(&p);
+            assert!(o.diagnostics.is_empty(), "{written}: {:?}", o.diagnostics);
+            assert_eq!(o.spec.expect("a spec").server, p.server, "{written}");
+        }
+        // Its case stays what the policy holds, and an ASCII name that is
+        // no host name is no error here: it fails where it is used, as it
+        // did.
+        let mut p = parse_policy("T", "trojan, proxy.example, 443, password=x", &span()).unwrap();
+        for unchanged in ["MiXed.Example", "a@b.example"] {
+            p.server = Some(HostName::Domain(unchanged.into()));
+            let o = outcome_of(&p);
+            assert!(o.diagnostics.is_empty(), "{unchanged}: {:?}", o.diagnostics);
+            assert_eq!(o.spec.expect("a spec").server, p.server, "{unchanged}");
+        }
+    }
+
+    /// A name that UTS #46 cannot turn into a host name — the fullwidth `＠`
+    /// folds onto `@` — is an error, which does not quote it.
+    #[test]
+    fn a_server_without_an_ascii_form_is_an_error() {
+        for (kind, written) in [
+            ("trojan", "a＠b.example"),
+            ("http", "bü cher.example"),
+            ("https", "bücher：8388"),
+        ] {
+            let o = outcome("T", &format!("{kind}, {written}, 443, password=x"));
+            assert!(o.spec.is_none(), "{written}");
+            let found: Vec<(&str, &str)> = o
+                .diagnostics
+                .iter()
+                .map(|d| (d.code, d.message.as_str()))
+                .collect();
+            assert_eq!(
+                found,
+                [(
+                    codes::E_INVALID_POLICY_PARAM,
+                    "policy `T`: the server's host name cannot be written in ASCII (IDNA)"
+                )],
+                "{written}"
+            );
+        }
     }
 
     #[test]

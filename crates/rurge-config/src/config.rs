@@ -304,16 +304,19 @@ impl Config {
     }
 
     /// Lowercase hostnames of every proxy server — WireGuard peers' endpoints
-    /// among them; `[Host]` never applies to them.
+    /// among them; `[Host]` never applies to them. A server written in
+    /// Unicode is here as its A-labels too: its spec holds that form, and it
+    /// is the one its outbound looks up.
     pub fn proxy_hostnames(&self) -> HashSet<String> {
         let endpoints = self
             .wireguard
             .iter()
             .flat_map(|w| &w.peers)
             .map(|p| &p.endpoint.host);
-        self.policies
-            .iter()
-            .filter_map(|p| p.server.as_ref())
+        let written = self.policies.iter().filter_map(|p| p.server.as_ref());
+        let looked_up = self.specs.iter().filter_map(|s| s.server.as_ref());
+        written
+            .chain(looked_up)
             .chain(endpoints)
             .filter_map(|host| host.as_domain().map(str::to_string))
             .collect()
@@ -1583,6 +1586,20 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
         let names = l.config.proxy_hostnames();
         assert!(names.contains("proxy.example.com"));
         assert_eq!(names.len(), 1);
+    }
+
+    /// A server written in Unicode is looked up by its A-labels: that is
+    /// the name `[Host]` must not apply to.
+    #[test]
+    fn proxy_hostnames_hold_the_a_labels_of_a_server_written_in_unicode() {
+        let l = load_text("[Proxy]\nA = http, bücher.example, 8080\n[Rule]\nFINAL,DIRECT\n");
+        assert!(
+            !l.diagnostics.has_errors(),
+            "{:?}",
+            l.diagnostics.into_vec()
+        );
+        let names = l.config.proxy_hostnames();
+        assert!(names.contains("xn--bcher-kva.example"), "{names:?}");
     }
 
     #[test]

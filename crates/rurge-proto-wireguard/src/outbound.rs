@@ -169,8 +169,10 @@ impl Names {
 
     /// `name`'s addresses: from the section's `dns-server`s in order through
     /// the tunnel — the first that answers ends the search, `system` asks
-    /// this machine — or, without any, from this machine (M4-D9). An error
-    /// when the tunnel is over: none of its servers would answer.
+    /// this machine — or, without any, from this machine (M4-D9). A server
+    /// in the tunnel is asked for the name in its ASCII form, an IDN as its
+    /// A-labels. An error when one is to be asked and the name has no such
+    /// form, and when the tunnel is over: none of its servers would answer.
     async fn lookup(
         &self,
         name: &str,
@@ -187,6 +189,7 @@ impl Names {
         {
             return Ok(Some(addrs));
         }
+        let asked = rurge_config::hostname::to_ascii(name);
         for server in &self.section.dns_servers {
             let server = match server {
                 TunnelDns::System => match self.resolver.resolve(name).await {
@@ -195,11 +198,16 @@ impl Names {
                 },
                 TunnelDns::Server(server) => *server,
             };
+            let Some(asked) = &asked else {
+                return Err(OutboundError::Dns(
+                    "wireguard: the host name cannot be looked up".to_string(),
+                ));
+            };
             // a question sent before the tunnel's first handshake waits for
             // it in boringtun, whose retry of a lost initiation comes after
             // `dns_wait`: the handshake first, within the dial's own time
             device.established().await?;
-            let Some(answer) = self.ask(device, server, name).await? else {
+            let Some(answer) = self.ask(device, server, asked).await? else {
                 continue;
             };
             let ttl = answer.iter().map(|(_, ttl)| *ttl).min().unwrap_or(0);
@@ -744,6 +752,58 @@ mod tests {
             assert_eq!(echo(&mut stream, b"ping").await, b"ping");
         }
         assert_eq!(peer.core().dns_questions, ["echo.test A"], "asked once");
+    }
+
+    /// The tunnel's name server is asked for a name in its ASCII form: one
+    /// written in Unicode as its A-labels.
+    #[tokio::test]
+    async fn the_tunnel_dns_is_asked_for_the_a_labels_of_a_name_in_unicode() {
+        let dns = vec![("xn--bcher-kva.example".to_string(), vec![ip("10.0.0.1")])];
+        let (peer, wg) = tunnel(
+            PeerOpts {
+                dns,
+                ..PeerOpts::default()
+            },
+            |s| s.dns_servers = vec![TunnelDns::Server(SocketAddr::new(DNS_ADDRESS.into(), 53))],
+        )
+        .await;
+        for _ in 0..2 {
+            let mut stream = wg
+                .connect_tcp(&at("bücher.example", ECHO_PORT), &within(5))
+                .await
+                .expect("a connection");
+            assert_eq!(echo(&mut stream, b"ping").await, b"ping");
+        }
+        assert_eq!(
+            peer.core().dns_questions,
+            ["xn--bcher-kva.example A"],
+            "asked once"
+        );
+    }
+
+    /// A name without such a form can be asked of no server: the lookup
+    /// fails at once, before the tunnel's first handshake is waited for.
+    #[tokio::test]
+    async fn a_name_no_question_can_carry_fails_the_lookup_at_once() {
+        let (peer, wg) = with_tunnel_dns(&["10.0.0.1"], &[], |_| {}).await;
+        peer.go_silent(true);
+        for host in ["a＠b.example", "a b.example"] {
+            let started = std::time::Instant::now();
+            let e = wg
+                .connect_tcp(
+                    &Target::new(HostName::Domain(host.into()), ECHO_PORT),
+                    &within(5),
+                )
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                "dns: wireguard: the host name cannot be looked up"
+            );
+            assert!(started.elapsed() < Duration::from_secs(2), "{host}");
+        }
+        assert!(peer.core().dns_questions.is_empty());
     }
 
     /// A question that goes unanswered is sent again, the same one, every

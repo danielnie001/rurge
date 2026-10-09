@@ -937,6 +937,41 @@ Plain = direct, interface=eth9\n[Rule]\nFINAL,DIRECT\n",
         );
     }
 
+    /// A server written in Unicode is a policy like any other from its spec
+    /// on: the TLS layer is given the A-labels — the name as written is no
+    /// TLS server name, which made the policy a load error — and so is the
+    /// resolver.
+    #[tokio::test]
+    async fn a_server_written_in_unicode_is_built_and_looked_up_by_its_a_labels() {
+        // takes every connection and hangs up: each dial ends at once
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+        let cfg = config(&format!(
+            "[Proxy]\nT = trojan, bücher.example, {port}, password=pw\n\
+H = http, 例え.テスト, {port}\n[Rule]\nFINAL,DIRECT\n"
+        ));
+        assert!(dry_build(&cfg).is_empty());
+        let noting = Arc::new(Noting::default());
+        let f = EngineFactory::new(&cfg, noting.clone(), Arc::new(NoopSocketHook));
+        let target = Target::new(rurge_config::HostName::parse("site.test"), 80);
+        for name in ["T", "H"] {
+            let spec = cfg.spec(name).unwrap();
+            let out = f.build(spec, f.direct_connector(&spec.common)).unwrap();
+            let dialed = tokio::time::timeout(
+                Duration::from_secs(10),
+                out.connect_tcp(&target, &ConnectOpts::default()),
+            )
+            .await
+            .expect("the dial ends");
+            assert!(dialed.is_err(), "{name}: nobody answers there");
+        }
+        assert_eq!(
+            *noting.0.lock().unwrap(),
+            ["xn--bcher-kva.example", "xn--r8jz45g.xn--zckzah"]
+        );
+    }
+
     /// `masque`, and `trust-tunnel` with `h3=true`, are built over HTTP/3
     /// (phase 2 M7 design 7.1, 7.2): each tunnel is a CONNECT on its own
     /// policy's QUIC connection to the loopback `FakeH3Proxy`, the

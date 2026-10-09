@@ -3,8 +3,8 @@
 
 use crate::keys::decode_private_key;
 use crate::pins::host_key_allowed;
-use rurge_config::KeystoreItem;
 use rurge_config::spec::{HostKeyPin, ShadowTlsOpts, SshSpec};
+use rurge_config::{HostName, KeystoreItem};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, Connector, Target};
 use rurge_proto::build::shadow_tls_client;
@@ -629,13 +629,15 @@ impl SshOutbound {
         target: &Target,
         opts: &ConnectOpts,
     ) -> Result<BoxedStream, OutboundError> {
+        // never dial for a target whose name cannot be sent
+        let host = channel_host(target)?;
         let session = self.session(opts).await?;
-        match open_channel(&session, target).await {
+        match open_channel(&session, &host, target.port).await {
             Err(ChannelError::Gone) => {
                 // the session ended since it was last used: one new one
                 self.forget(&session).await;
                 let session = self.session(opts).await?;
-                open_channel(&session, target)
+                open_channel(&session, &host, target.port)
                     .await
                     .map_err(ChannelError::into_outbound)
             }
@@ -767,18 +769,29 @@ impl SshOutbound {
     }
 }
 
-async fn open_channel(session: &Session, target: &Target) -> Result<BoxedStream, ChannelError> {
+/// The host a `direct-tcpip` request names for `target`: an address as it
+/// is, a name in its ASCII form (an IDN as its A-labels) for the server to
+/// resolve. A name without one is refused, as the other outbounds refuse it.
+fn channel_host(target: &Target) -> Result<String, OutboundError> {
+    match &target.host {
+        HostName::Ip(ip) => Ok(ip.to_string()),
+        HostName::Domain(name) => rurge_config::hostname::to_ascii(name).ok_or_else(|| {
+            OutboundError::Proxy("ssh: the host name cannot be sent to the server".to_string())
+        }),
+    }
+}
+
+async fn open_channel(
+    session: &Session,
+    host: &str,
+    port: u16,
+) -> Result<BoxedStream, ChannelError> {
     // counted from the request on, so the idle watch never finds the session
     // unused while a channel is being opened; a failed open drops it
     let open = OpenChannel::new(session);
     let opened = session
         .handle
-        .channel_open_direct_tcpip(
-            target.host.to_string(),
-            u32::from(target.port),
-            "127.0.0.1",
-            0,
-        )
+        .channel_open_direct_tcpip(host, u32::from(port), "127.0.0.1", 0)
         .await;
     match opened {
         Ok(channel) => Ok(Box::new(SshStream {
@@ -1325,6 +1338,61 @@ mod tests {
             );
         }
         assert_eq!(server.logins(), 1);
+    }
+
+    /// A server that takes "pw" and connects every channel to an echo server,
+    /// wherever the channel asks to go.
+    async fn fake_to_echo() -> FakeSsh {
+        let echo = echo().await;
+        fake(FakeSshOpts {
+            password: Some("pw".into()),
+            connect_to: Some(std::net::SocketAddr::new(
+                echo.host.as_ip().expect("an address"),
+                echo.port,
+            )),
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// The server is asked for a name in its ASCII form — an IDN as its
+    /// A-labels, as every other outbound sends it — and for an address as it
+    /// is, an IPv6 one without brackets.
+    #[tokio::test]
+    async fn the_channel_asks_for_a_name_in_its_ascii_form() {
+        let server = fake_to_echo().await;
+        let ssh = outbound_to(server.addr, &spec(Some("pw"), None, vec![]), &[]);
+        for host in ["bücher.example", "Plain.Example", "2001:db8::1"] {
+            round_trip(&ssh, &Target::new(HostName::parse(host), 443))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            server.requested(),
+            [
+                ("xn--bcher-kva.example".to_string(), 443),
+                ("plain.example".to_string(), 443),
+                ("2001:db8::1".to_string(), 443),
+            ]
+        );
+    }
+
+    /// A name with no ASCII form a request may carry is refused before
+    /// anything is dialed: no login, no channel.
+    #[tokio::test]
+    async fn a_name_that_cannot_be_sent_opens_no_channel() {
+        let server = fake_to_echo().await;
+        let ssh = outbound_to(server.addr, &spec(Some("pw"), None, vec![]), &[]);
+        for host in ["a＠b.example", "a b.example"] {
+            let target = Target::new(HostName::Domain(host.into()), 443);
+            let refused = round_trip(&ssh, &target).await.unwrap_err();
+            assert_eq!(
+                refused.to_string(),
+                "ssh: the host name cannot be sent to the server"
+            );
+        }
+        assert!(server.requested().is_empty(), "{:?}", server.requested());
+        assert_eq!(server.attempts(), 0);
     }
 
     /// rurge asks for no forwarding: a channel the server opens toward it is
