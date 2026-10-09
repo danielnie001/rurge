@@ -19,7 +19,36 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-const BUF: usize = 8 * 1024;
+/// When a direction pushes what it wrote through its writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flush {
+    /// After every write.
+    EveryWrite,
+    /// Once the reader has nothing more right now, as `tokio::io::copy`
+    /// does, and before the half-close. Only the tests and the benchmark
+    /// ask for it: it is what `TUNING` was measured against.
+    #[cfg_attr(not(test), allow(dead_code))]
+    ReaderIdle,
+}
+
+/// How a direction copies. Not a setting: every session runs `TUNING`, and
+/// the other values exist to be measured against it (`relay_throughput`).
+#[derive(Clone, Copy, Debug)]
+struct Tuning {
+    /// The most that is read, and so written, at once.
+    buf: usize,
+    flush: Flush,
+}
+
+/// What was measured against the rest (phase 2 M8 design 5.11). Flushing
+/// less often than after every write gained nothing. A larger buffer did —
+/// 64 KiB moved a tenth more than this through every encrypting stack — but
+/// a session holds two of them for as long as it lives, busy or not, and
+/// 10,000 sessions are to fit in 300 MB (NFR-01).
+const TUNING: Tuning = Tuning {
+    buf: 8 * 1024,
+    flush: Flush::EveryWrite,
+};
 
 /// Runs once on the first non-empty read of a `copy_half` direction (M3b SNI
 /// sniffing, and the first byte from upstream; see `pump`).
@@ -35,6 +64,16 @@ pub async fn pump(
     upstream: BoxedStream,
     handle: Arc<SessionHandle>,
     idle: Duration,
+) {
+    pump_tuned(client, upstream, handle, idle, TUNING).await
+}
+
+async fn pump_tuned(
+    client: BoxedStream,
+    upstream: BoxedStream,
+    handle: Arc<SessionHandle>,
+    idle: Duration,
+    tuning: Tuning,
 ) {
     let (cr, cw) = tokio::io::split(client);
     let (ur, uw) = tokio::io::split(upstream);
@@ -87,6 +126,7 @@ pub async fn pump(
                     move |n| h_up.add_up(n),
                     sniff_first,
                     move || h_client_gone.mark_client_gone(),
+                    tuning,
                 )
                 .await;
                 if r.is_err() {
@@ -108,6 +148,7 @@ pub async fn pump(
                             h_end.mark_upstream_failed();
                         }
                     },
+                    tuning,
                 )
                 .await;
                 if r.is_err() {
@@ -163,7 +204,8 @@ async fn idle_watchdog(
 /// error, or `stop`. Both the read and the write race against `stop`. `first`,
 /// when given, runs once on the first non-empty read (before it is written
 /// onward) and is then consumed; `reader_done` runs when the reader ends —
-/// at EOF or on a read error, not when `stop` ends the direction.
+/// at EOF or on a read error, not when `stop` ends the direction. `tuning`:
+/// how much is read at once, and when what was written is flushed.
 #[allow(clippy::too_many_arguments)]
 async fn copy_half<R, W>(
     mut reader: R,
@@ -174,28 +216,67 @@ async fn copy_half<R, W>(
     count: impl Fn(u64),
     mut first: Option<FirstChunkHook>,
     reader_done: impl Fn(),
+    tuning: Tuning,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; BUF];
+    let mut buf = vec![0u8; tuning.buf];
     let cancelled = stop.cancelled();
     tokio::pin!(cancelled);
+    // `Flush::ReaderIdle`: the writer has taken bytes that no flush followed.
+    let mut unflushed = false;
     loop {
-        let n = tokio::select! {
-            biased;
-            _ = &mut cancelled => return Ok(()),
-            r = reader.read(&mut buf) => match r {
-                Ok(n) => n,
-                Err(e) => {
-                    reader_done();
-                    return Err(e);
+        let read = 'read: {
+            let read = reader.read(&mut buf);
+            tokio::pin!(read);
+            if unflushed {
+                // Whether the reader has more right now. This comes between
+                // two writes, never inside one: a write the writer could not
+                // take at once is retried before anything else is asked of
+                // it — the encrypting streams have sealed its bytes by then,
+                // and a flush would send them a first time.
+                let more = tokio::select! {
+                    biased;
+                    _ = &mut cancelled => return Ok(()),
+                    r = &mut read => Some(r),
+                    _ = std::future::ready(()) => None,
+                };
+                if let Some(r) = more {
+                    break 'read r;
                 }
-            },
+                // it has not: what the writer holds does not wait for it
+                tokio::select! {
+                    biased;
+                    _ = &mut cancelled => return Ok(()),
+                    f = writer.flush() => f?,
+                }
+                unflushed = false;
+            }
+            tokio::select! {
+                biased;
+                _ = &mut cancelled => return Ok(()),
+                r = &mut read => r,
+            }
+        };
+        let n = match read {
+            Ok(n) => n,
+            Err(e) => {
+                reader_done();
+                return Err(e);
+            }
         };
         if n == 0 {
             reader_done();
+            if unflushed {
+                // the end comes after everything written before it
+                tokio::select! {
+                    biased;
+                    _ = &mut cancelled => return Ok(()),
+                    f = writer.flush() => f?,
+                }
+            }
             // Half-close. A TCP writer sends a FIN and cannot block, but a TLS /
             // WebSocket writer has to push a close_notify / Close frame (and a
             // `LazyHead` may still owe its head) through a socket the peer may
@@ -216,13 +297,18 @@ where
             _ = &mut cancelled => return Ok(()),
             w = async {
                 writer.write_all(&buf[..n]).await?;
-                // `write_all` only says the writer took the bytes. A TLS
-                // writer whose socket is full keeps its last record to itself
-                // until the next write or flush — and after the final bytes of
-                // a request there is no next write.
-                writer.flush().await
+                match tuning.flush {
+                    // `write_all` only says the writer took the bytes. A TLS
+                    // writer whose socket is full keeps its last record to
+                    // itself until the next write or flush — and after the
+                    // final bytes of a request there is no next write.
+                    Flush::EveryWrite => writer.flush().await,
+                    // (before the reader is waited for, and before the end)
+                    Flush::ReaderIdle => Ok(()),
+                }
             } => w?,
         }
+        unflushed = tuning.flush == Flush::ReaderIdle;
         count(n as u64);
         activity.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
@@ -449,6 +535,7 @@ mod tests {
                     |_| {},
                     None,
                     || {},
+                    TUNING,
                 )
                 .await
             }
@@ -463,51 +550,272 @@ mod tests {
     }
 
     /// Not a test of anything: prints how fast `pump` moves bytes over
-    /// loopback TCP. Run before and after a change to the copy loop:
-    /// `cargo test -p rurge-engine --release relay_throughput -- --ignored --nocapture`
-    #[tokio::test(flavor = "multi_thread")]
+    /// loopback — to a plain TCP upstream and through three stacks that
+    /// encrypt (TLS, a WebSocket inside TLS, VMess) — under every flush
+    /// strategy and buffer size: the numbers `TUNING` is chosen by. A run is
+    /// one session that carries its bytes up and then as many down. The
+    /// rounds are the outer loop and the combinations take turns inside it,
+    /// each in every place of the order once, so that drift hits them all
+    /// alike.
+    ///
+    /// Everything runs on one thread — the application, the relay, the fake
+    /// server and the origin — so that their costs add up and what the relay
+    /// saves shows in the total. With a thread for each, the slowest of them
+    /// sets the pace, and behind an encrypting stack that is the fake
+    /// server: nothing the relay did would show.
+    ///
+    /// `cargo test -p rurge-engine --release --lib relay_throughput -- --ignored --nocapture`
+    /// (`RELAY_BENCH_MIB=64` carries that many MiB each way instead of 256:
+    /// for a machine on which the whole matrix would take hours.)
+    #[tokio::test]
     #[ignore]
     async fn relay_throughput() {
+        use rurge_config::spec::{Secret, TlsOpts, TrojanSpec, VmessCipher, VmessSpec, WsOpts};
+        use rurge_net::connector::{ConnectOpts, DirectConnector, SystemResolve, Target};
+        use rurge_proto::Outbound;
+        use rurge_proto::testing::{FakeTrojan, FakeVmess, TlsFixture, TrojanScript, VmessScript};
+        use rurge_proto::trojan::TrojanOutbound;
+        use rurge_proto::vmess::VmessOutbound;
+        use std::net::SocketAddr;
         use tokio::net::{TcpListener, TcpStream};
-        const TOTAL: usize = 512 * 1024 * 1024;
+
+        const ROUNDS: usize = 8;
+        const MIB: usize = 1024 * 1024;
+        const BLOCK: usize = 64 * 1024;
+
+        /// `TCP_NODELAY`, as the listeners and the connector set it on theirs.
+        fn no_delay(stream: TcpStream) -> TcpStream {
+            stream.set_nodelay(true).unwrap();
+            stream
+        }
+
         async fn pair() -> (TcpStream, TcpStream) {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let (a, b) = tokio::join!(TcpStream::connect(addr), listener.accept());
-            (a.unwrap(), b.unwrap().0)
+            (no_delay(a.unwrap()), no_delay(b.unwrap().0))
         }
-        let (mut app, client) = pair().await;
-        let (upstream, mut origin) = pair().await;
-        let relay = tokio::spawn(pump(
-            Box::new(client),
-            Box::new(upstream),
-            handle(),
-            Duration::from_secs(600),
-        ));
-        let started = std::time::Instant::now();
-        let send = tokio::spawn(async move {
-            let block = vec![7u8; 64 * 1024];
-            for _ in 0..TOTAL / block.len() {
-                app.write_all(&block).await.unwrap();
+
+        /// Writes `total` bytes into `into`, in a task of its own.
+        fn send(mut into: TcpStream, total: usize) -> tokio::task::JoinHandle<TcpStream> {
+            tokio::spawn(async move {
+                let block = vec![7u8; BLOCK];
+                for _ in 0..total / BLOCK {
+                    into.write_all(&block).await.unwrap();
+                }
+                into
+            })
+        }
+
+        /// Reads `total` bytes out of `from`.
+        async fn receive(from: &mut TcpStream, total: usize) {
+            let mut buf = vec![0u8; BLOCK];
+            let mut got = 0;
+            while got < total {
+                let n = from.read(&mut buf).await.unwrap();
+                assert!(n > 0, "the relay stopped at {got} bytes");
+                got += n;
             }
-            app.shutdown().await.unwrap();
-            app
-        });
-        let mut got = 0;
-        let mut buf = vec![0u8; 64 * 1024];
-        while got < TOTAL {
-            let n = origin.read(&mut buf).await.unwrap();
-            assert!(n > 0, "the relay stopped at {got} bytes");
-            got += n;
         }
-        let secs = started.elapsed().as_secs_f64();
+
+        fn target(addr: SocketAddr) -> Target {
+            Target::new(HostName::Ip(addr.ip()), addr.port())
+        }
+
+        fn median(of: impl Iterator<Item = f64>) -> f64 {
+            let mut sorted: Vec<f64> = of.collect();
+            sorted.sort_by(f64::total_cmp);
+            let mid = sorted.len() / 2;
+            if sorted.len() % 2 == 0 {
+                (sorted[mid - 1] + sorted[mid]) / 2.0
+            } else {
+                sorted[mid]
+            }
+        }
+
+        let mib = std::env::var("RELAY_BENCH_MIB").map_or(256, |v| {
+            v.parse::<usize>()
+                .expect("RELAY_BENCH_MIB is a number of MiB")
+        });
+        let each_way = mib * MIB;
+        let direct = || Arc::new(DirectConnector::new(Arc::new(SystemResolve)));
+        let fixture = TlsFixture::new(&["127.0.0.1"]);
+        let mut trojan: Vec<(FakeTrojan, Box<dyn Outbound>)> = Vec::new();
+        for ws in [false, true] {
+            let fake = FakeTrojan::spawn(
+                TrojanScript {
+                    password: "pw".into(),
+                    ws,
+                    connect_to: None,
+                },
+                fixture.clone(),
+            )
+            .await;
+            let spec = TrojanSpec {
+                tls: TlsOpts::default(),
+                password: Secret::from("pw"),
+                ws: ws.then(|| WsOpts {
+                    path: "/".into(),
+                    headers: Vec::new(),
+                }),
+            };
+            let outbound = TrojanOutbound::new(
+                "T",
+                target(fake.addr()),
+                &spec,
+                None,
+                &[],
+                fixture.roots(),
+                direct(),
+            )
+            .unwrap();
+            trojan.push((fake, Box::new(outbound)));
+        }
+        let script = VmessScript::new("0233d11c-15a4-47d3-ade3-48ffca0ce119");
+        let spec = VmessSpec {
+            uuid: Secret::new(script.uuid),
+            cipher: VmessCipher::Aes128Gcm,
+            tls: None,
+            ws: None,
+        };
+        let fake_vmess = FakeVmess::spawn(script, None).await;
+        let vmess = VmessOutbound::new(
+            "V",
+            target(fake_vmess.addr()),
+            &spec,
+            None,
+            &[],
+            fixture.roots(),
+            direct(),
+        )
+        .unwrap();
+        // the upstreams; `None` is the origin itself over plain TCP
+        let stacks: [(&str, Option<&dyn Outbound>); 4] = [
+            ("plain", None),
+            ("tls", Some(trojan[0].1.as_ref())),
+            ("ws", Some(trojan[1].1.as_ref())),
+            ("vmess", Some(&vmess)),
+        ];
+        let combos: Vec<Tuning> = BOTH
+            .iter()
+            .flat_map(|&flush| {
+                [8, 16, 32, 64].map(|kib| Tuning {
+                    buf: kib * 1024,
+                    flush,
+                })
+            })
+            .collect();
+
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        // seconds[stack][combination]: every round's (up, down)
+        let mut seconds = vec![vec![Vec::new(); combos.len()]; stacks.len()];
+        let began = std::time::Instant::now();
+        for round in 0..ROUNDS {
+            for s in (0..stacks.len()).map(|i| (i + round) % stacks.len()) {
+                for c in (0..combos.len()).map(|i| (i + round) % combos.len()) {
+                    let (name, outbound) = stacks[s];
+                    let tuning = combos[c];
+                    let run = async {
+                        let (app, client) = pair().await;
+                        let upstream: BoxedStream = match outbound {
+                            None => {
+                                Box::new(no_delay(TcpStream::connect(origin_addr).await.unwrap()))
+                            }
+                            Some(outbound) => outbound
+                                .connect_tcp(&target(origin_addr), &ConnectOpts::default())
+                                .await
+                                .unwrap(),
+                        };
+                        let relay = tokio::spawn(pump_tuned(
+                            Box::new(client),
+                            upstream,
+                            handle(),
+                            Duration::from_secs(600),
+                            tuning,
+                        ));
+                        let started = std::time::Instant::now();
+                        let sending = send(app, each_way);
+                        // a proxy connects to the origin once it has the
+                        // request, and that comes with the first bytes
+                        let mut far = no_delay(origin.accept().await.unwrap().0);
+                        receive(&mut far, each_way).await;
+                        let up = started.elapsed().as_secs_f64();
+                        let mut app = sending.await.unwrap();
+                        let started = std::time::Instant::now();
+                        let sending = send(far, each_way);
+                        receive(&mut app, each_way).await;
+                        let down = started.elapsed().as_secs_f64();
+                        // The application leaves first and the origin once
+                        // it has seen that: every connection is then closed
+                        // from the side that opened it, and none waits out
+                        // its time on a listener's side, where a later run's
+                        // connection from the same port would get no answer.
+                        drop(app);
+                        let mut far = sending.await.unwrap();
+                        assert_eq!(far.read(&mut [0u8; 1]).await.unwrap(), 0);
+                        drop(far);
+                        relay.await.unwrap();
+                        (up, down)
+                    };
+                    let (up, down) = tokio::time::timeout(Duration::from_secs(1800), run)
+                        .await
+                        .unwrap_or_else(|_| panic!("{name} {tuning:?}: the run never ended"));
+                    println!(
+                        "round {} {name:<5} {:<10} {:>2} KiB: up {:>7.1}  down {:>7.1}  MiB/s",
+                        round + 1,
+                        format!("{:?}", tuning.flush),
+                        tuning.buf / 1024,
+                        mib as f64 / up,
+                        mib as f64 / down,
+                    );
+                    seconds[s][c].push((up, down));
+                }
+            }
+        }
+
         println!(
-            "relay: {:.0} MiB/s",
-            (TOTAL as f64 / (1024.0 * 1024.0)) / secs
+            "\nrelay throughput in MiB/s: {mib} MiB each way, {ROUNDS} rounds, {:.0} s in all",
+            began.elapsed().as_secs_f64()
         );
-        drop(origin);
-        drop(send.await.unwrap());
-        relay.await.unwrap();
+        println!(
+            "{:<5} {:<10} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8} {:>9}  every round",
+            "stack", "flush", "buffer", "median", "min", "max", "up", "down", "of TUNING"
+        );
+        let default = combos
+            .iter()
+            .position(|t| t.buf == TUNING.buf && t.flush == TUNING.flush)
+            .expect("the default is one of the combinations");
+        for (s, (name, _)) in stacks.iter().enumerate() {
+            // both ways together: all the bytes over all the time
+            let both = |c: usize| -> Vec<f64> {
+                seconds[s][c]
+                    .iter()
+                    .map(|(up, down)| 2.0 * mib as f64 / (up + down))
+                    .collect()
+            };
+            let of_default = median(both(default).into_iter());
+            for (c, tuning) in combos.iter().enumerate() {
+                let rounds = both(c);
+                let mid = median(rounds.iter().copied());
+                println!(
+                    "{name:<5} {:<10} {:>2} KiB {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}%  {}",
+                    format!("{:?}", tuning.flush),
+                    tuning.buf / 1024,
+                    mid,
+                    rounds.iter().copied().fold(f64::INFINITY, f64::min),
+                    rounds.iter().copied().fold(0.0, f64::max),
+                    median(seconds[s][c].iter().map(|(up, _)| mib as f64 / up)),
+                    median(seconds[s][c].iter().map(|(_, down)| mib as f64 / down)),
+                    100.0 * mid / of_default,
+                    rounds
+                        .iter()
+                        .map(|r| format!("{r:.1}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            }
+        }
     }
 
     /// Accepts every write at once but only passes it on when flushed: what
@@ -553,30 +861,157 @@ mod tests {
         }
     }
 
+    const BOTH: [Flush; 2] = [Flush::EveryWrite, Flush::ReaderIdle];
+
+    fn flushing(flush: Flush) -> Tuning {
+        Tuning { flush, ..TUNING }
+    }
+
     #[tokio::test]
     async fn what_was_written_is_flushed_without_waiting_for_more() {
-        let (mut app, client) = tokio::io::duplex(4096);
-        let (near, mut far) = tokio::io::duplex(4096);
-        let upstream = HoldsUntilFlushed {
-            inner: near,
-            held: Vec::new(),
+        for flush in BOTH {
+            let (mut app, client) = tokio::io::duplex(4096);
+            let (near, mut far) = tokio::io::duplex(4096);
+            let upstream = HoldsUntilFlushed {
+                inner: near,
+                held: Vec::new(),
+            };
+            let relay = tokio::spawn(pump_tuned(
+                Box::new(client),
+                Box::new(upstream),
+                handle(),
+                Duration::from_secs(600),
+                flushing(flush),
+            ));
+            // the last bytes of a request: nothing follows them, and the
+            // answer only comes once they have arrived
+            app.write_all(b"the last bytes of a request").await.unwrap();
+            let mut got = [0u8; 27];
+            tokio::time::timeout(Duration::from_secs(5), far.read_exact(&mut got))
+                .await
+                .unwrap_or_else(|_| panic!("{flush:?}: the tail stayed behind in the writer"))
+                .unwrap();
+            assert_eq!(&got, b"the last bytes of a request");
+            relay.abort();
+        }
+    }
+
+    /// Takes every write whole and notes what is asked of it, in order.
+    /// `parks`: every write is turned away once before it is taken, as by a
+    /// writer whose socket is full.
+    struct Noting {
+        asked: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        parks: bool,
+        parked: bool,
+    }
+
+    impl Noting {
+        fn note(&self, what: &'static str) {
+            // The encrypting streams seal the bytes of a write that could not
+            // go out at once, and send them when it is retried: anything in
+            // between would push that ciphertext out, and the retry would
+            // send the same bytes again.
+            assert!(!self.parked, "{what} between a parked write and its retry");
+            self.asked.lock().unwrap().push(what);
+        }
+    }
+
+    impl AsyncWrite for Noting {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.parks && !self.parked {
+                self.parked = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.parked = false;
+            self.note("write");
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.note("flush");
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.note("shutdown");
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// One direction from `data`, all of it ready at once and then the end,
+    /// into a `Noting` writer: what was asked of the writer, in order.
+    async fn asked_of_the_writer(data: &[u8], tuning: Tuning, parks: bool) -> Vec<&'static str> {
+        let asked: Arc<std::sync::Mutex<Vec<&'static str>>> = Arc::default();
+        let writer = Noting {
+            asked: asked.clone(),
+            parks,
+            parked: false,
         };
-        let relay = tokio::spawn(pump(
-            Box::new(client),
-            Box::new(upstream),
-            handle(),
-            Duration::from_secs(600),
-        ));
-        // the last bytes of a request: nothing follows them, and the answer
-        // only comes once they have arrived
-        app.write_all(b"the last bytes of a request").await.unwrap();
-        let mut got = [0u8; 27];
-        tokio::time::timeout(Duration::from_secs(5), far.read_exact(&mut got))
-            .await
-            .expect("the tail stayed behind in the writer")
-            .unwrap();
-        assert_eq!(&got, b"the last bytes of a request");
-        relay.abort();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            copy_half(
+                data,
+                writer,
+                CancellationToken::new(),
+                Arc::new(AtomicU64::new(0)),
+                Instant::now(),
+                |_| {},
+                None,
+                || {},
+                tuning,
+            ),
+        )
+        .await
+        .expect("the direction ends with its reader")
+        .unwrap();
+        asked.lock().unwrap().clone()
+    }
+
+    /// The half-close comes after everything written before it, whether or
+    /// not the writer would see to that on its own.
+    #[tokio::test]
+    async fn a_half_close_flushes_first() {
+        for flush in BOTH {
+            assert_eq!(
+                asked_of_the_writer(b"the last bytes", flushing(flush), false).await,
+                ["write", "flush", "shutdown"],
+                "{flush:?}"
+            );
+        }
+    }
+
+    /// While the reader has more ready, `ReaderIdle` writes on and flushes
+    /// once nothing is left; `EveryWrite` flushes each time.
+    #[tokio::test]
+    async fn reader_idle_does_not_flush_while_the_reader_has_more() {
+        let data = vec![7u8; 8 * TUNING.buf];
+        for (flush, flushes) in [(Flush::EveryWrite, 8), (Flush::ReaderIdle, 1)] {
+            let asked = asked_of_the_writer(&data, flushing(flush), false).await;
+            let count = |what| asked.iter().filter(|a| **a == what).count();
+            assert_eq!(count("write"), 8, "{flush:?}");
+            assert_eq!(count("flush"), flushes, "{flush:?}");
+        }
+    }
+
+    /// A write that could not go out at once is retried before anything
+    /// else is asked of the writer (`Noting::note`).
+    #[tokio::test]
+    async fn nothing_comes_between_a_parked_write_and_its_retry() {
+        let data = vec![7u8; 3 * TUNING.buf];
+        for flush in BOTH {
+            let asked = asked_of_the_writer(&data, flushing(flush), true).await;
+            assert_eq!(
+                asked.iter().filter(|a| **a == "write").count(),
+                3,
+                "{flush:?}"
+            );
+            assert_eq!(asked.last(), Some(&"shutdown"), "{flush:?}");
+        }
     }
 
     /// Reads fail at once; writes vanish.
