@@ -48,17 +48,24 @@ fn proxy(message: impl Into<String>) -> OutboundError {
 }
 
 /// A connection the proxy closes mid-handshake is its refusal, not an I/O
-/// fault of ours. Depending on timing and platform the close shows up as an
-/// EOF, a reset or a broken pipe.
+/// fault of ours: depending on timing and platform it shows up as an EOF, or
+/// as a reset, abort or broken pipe with no words of its own (an
+/// operating-system error or a bare kind). A reset, abort or broken pipe that
+/// does carry words is a hop below (an `underlying-proxy`) saying what went
+/// wrong, and is reported in them; an EOF stays the proxy's whatever it
+/// carries, because the TLS layer of this same policy and `read_exact` word
+/// theirs too.
 fn handshake_io(e: io::Error) -> OutboundError {
-    match e.kind() {
-        io::ErrorKind::UnexpectedEof
-        | io::ErrorKind::ConnectionReset
-        | io::ErrorKind::ConnectionAborted
-        | io::ErrorKind::BrokenPipe => {
-            proxy("the proxy closed the connection during the handshake")
-        }
-        _ => OutboundError::from(e),
+    use io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset, UnexpectedEof};
+    let closed = match e.kind() {
+        UnexpectedEof => true,
+        ConnectionReset | ConnectionAborted | BrokenPipe => e.get_ref().is_none(),
+        _ => false,
+    };
+    if closed {
+        proxy("the proxy closed the connection during the handshake")
+    } else {
+        OutboundError::from(e)
     }
 }
 
@@ -462,7 +469,7 @@ impl Outbound for Socks5Outbound {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::held::{Gone, HoldingConnector};
+    use crate::testing::held::{Breaks, Gone, HoldingConnector, Stage};
     use crate::testing::{
         Camouflage, FakeShadowTls, FakeSocks5, ShadowTlsScript, Socks5Script, TlsFixture,
         echo_server,
@@ -887,6 +894,79 @@ mod tests {
                 "held = {held}: {err}"
             );
         }
+    }
+
+    /// What a policy below says when it knows what went wrong: a
+    /// shadowsocks server that reset the connection without answering.
+    const BELOW: &str =
+        "ss: the server reset the connection without answering (wrong password or method?)";
+
+    /// An `underlying-proxy` that fails in words of its own is not this
+    /// proxy closing the connection: the words are what the user is told,
+    /// wherever in the handshake they come.
+    #[tokio::test]
+    async fn a_hop_below_that_says_what_went_wrong_is_not_overruled() {
+        for (stage, kind) in [
+            (Stage::Read, io::ErrorKind::ConnectionReset),
+            (Stage::Write, io::ErrorKind::BrokenPipe),
+            (Stage::Flush, io::ErrorKind::ConnectionAborted),
+        ] {
+            let out = outbound_through(
+                "socks5, 127.0.0.1, 1080",
+                no_roots(),
+                Arc::new(Breaks {
+                    stage,
+                    kind,
+                    text: BELOW,
+                }),
+            );
+            let err = out
+                .connect_tcp(
+                    &Target::new(HostName::parse("192.0.2.1"), 443),
+                    &ConnectOpts::default(),
+                )
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert!(
+                matches!(&err, OutboundError::Io(e) if e.kind() == kind),
+                "{stage:?}: {err}"
+            );
+            assert_eq!(err.to_string(), BELOW, "{stage:?}");
+        }
+    }
+
+    #[test]
+    fn only_an_error_without_words_of_its_own_is_read_as_the_proxys_refusal() {
+        use io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset, UnexpectedEof};
+        let closed = "socks5: the proxy closed the connection during the handshake";
+        for kind in [
+            UnexpectedEof,
+            ConnectionReset,
+            ConnectionAborted,
+            BrokenPipe,
+        ] {
+            let err = handshake_io(kind.into());
+            assert!(
+                matches!(&err, OutboundError::Proxy(m) if m == closed),
+                "{kind:?}: {err}"
+            );
+        }
+        for kind in [ConnectionReset, ConnectionAborted, BrokenPipe] {
+            let err = handshake_io(io::Error::new(kind, BELOW));
+            assert!(
+                matches!(&err, OutboundError::Io(e) if e.kind() == kind),
+                "{kind:?}: {err}"
+            );
+            assert_eq!(err.to_string(), BELOW, "{kind:?}");
+        }
+        // An end is the proxy's whatever it says: the TLS layer of this very
+        // policy words its own (no close_notify), and so does `read_exact`.
+        let err = handshake_io(io::Error::new(UnexpectedEof, "early eof"));
+        assert!(
+            matches!(&err, OutboundError::Proxy(m) if m == closed),
+            "{err}"
+        );
     }
 
     #[tokio::test]

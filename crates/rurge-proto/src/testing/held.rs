@@ -1,6 +1,7 @@
 //! Hops below an outbound's own handshake, for the tests of what the
 //! handshake does to the stream it is given: one that keeps what is written
-//! to it until it is flushed, and one whose far end is gone already.
+//! to it until it is flushed, one whose far end is gone already, and one that
+//! fails in words of its own.
 
 use rurge_net::BoxFuture;
 use rurge_net::connector::{
@@ -111,5 +112,85 @@ impl Connector for Gone {
             near
         };
         Box::pin(std::future::ready(Ok(stream)))
+    }
+}
+
+/// What a connection of `Breaks` fails at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stage {
+    Read,
+    Write,
+    Flush,
+}
+
+/// Every connection fails at `stage` with an error of `kind` and `text` for
+/// its words, as a hop below does that knows what went wrong: a policy that
+/// keeps the kind of the error and says why (`ss: the server reset the
+/// connection …` is a reset), or a TLS layer reporting an alert it received
+/// (`InvalidData`). Everything else goes through: writes vanish, and a read
+/// finds the end.
+pub(crate) struct Breaks {
+    pub(crate) stage: Stage,
+    pub(crate) kind: io::ErrorKind,
+    pub(crate) text: &'static str,
+}
+
+impl Connector for Breaks {
+    fn connect<'a>(
+        &'a self,
+        _: &'a Target,
+        _: &'a ConnectOpts,
+    ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+        let stream = Broken {
+            stage: self.stage,
+            kind: self.kind,
+            text: self.text,
+        };
+        Box::pin(std::future::ready(Ok(Box::new(stream) as BoxedStream)))
+    }
+}
+
+struct Broken {
+    stage: Stage,
+    kind: io::ErrorKind,
+    text: &'static str,
+}
+
+impl Broken {
+    /// The failure, when this is the stage it was set for.
+    fn at(&self, stage: Stage) -> io::Result<()> {
+        if self.stage == stage {
+            Err(io::Error::new(self.kind, self.text))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl AsyncRead for Broken {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(self.at(Stage::Read))
+    }
+}
+
+impl AsyncWrite for Broken {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(self.at(Stage::Write).map(|()| data.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(self.at(Stage::Flush))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }

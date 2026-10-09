@@ -4,7 +4,7 @@
 use crate::build::{shadow_tls_client, tls_client};
 use crate::outbound::untrusted_text;
 use crate::transport::Stack;
-use crate::transport::head::read_head;
+use crate::transport::head::{is_too_long, read_head};
 use crate::transport::prefixed;
 use crate::{BuildError, HttpForward, Outbound, OutboundError};
 use base64::Engine as _;
@@ -106,17 +106,24 @@ pub fn valid_target(target: &Target) -> bool {
 }
 
 /// A connection the proxy closes during the CONNECT exchange is its refusal,
-/// not an I/O fault of ours. Depending on timing and platform the close shows
-/// up as an EOF, a reset or a broken pipe, on the write as well as the read.
+/// not an I/O fault of ours: depending on timing and platform it shows up as
+/// an EOF, or as a reset, abort or broken pipe with no words of its own (an
+/// operating-system error or a bare kind), on the write as well as the read.
+/// A reset, abort or broken pipe that does carry words is a hop below (an
+/// `underlying-proxy`) saying what went wrong, and is reported in them; an
+/// EOF stays the proxy's whatever it carries, because the TLS layer of this
+/// same policy and `read_exact` word theirs too.
 fn handshake_io(e: io::Error) -> OutboundError {
-    match e.kind() {
-        io::ErrorKind::UnexpectedEof
-        | io::ErrorKind::ConnectionReset
-        | io::ErrorKind::ConnectionAborted
-        | io::ErrorKind::BrokenPipe => {
-            OutboundError::Proxy("http proxy closed the connection during CONNECT".to_string())
-        }
-        _ => OutboundError::from(e),
+    use io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset, UnexpectedEof};
+    let closed = match e.kind() {
+        UnexpectedEof => true,
+        ConnectionReset | ConnectionAborted | BrokenPipe => e.get_ref().is_none(),
+        _ => false,
+    };
+    if closed {
+        OutboundError::Proxy("http proxy closed the connection during CONNECT".to_string())
+    } else {
+        OutboundError::from(e)
     }
 }
 
@@ -242,14 +249,15 @@ impl HttpOutbound {
         // the answer is waited for next: a hop below that buffers keeps the
         // request until it is flushed
         stream.flush().await.map_err(handshake_io)?;
-        let (head, rest) = read_head(&mut stream, MAX_HEAD)
-            .await
-            .map_err(|e| match e.kind() {
-                io::ErrorKind::InvalidData => OutboundError::Proxy(format!(
+        let (head, rest) = read_head(&mut stream, MAX_HEAD).await.map_err(|e| {
+            if is_too_long(&e) {
+                OutboundError::Proxy(format!(
                     "http proxy sent a response header larger than {MAX_HEAD} bytes"
-                )),
-                _ => handshake_io(e),
-            })?;
+                ))
+            } else {
+                handshake_io(e)
+            }
+        })?;
         check_status(&head)?;
         Ok(prefixed::boxed(rest, stream))
     }
@@ -305,7 +313,7 @@ impl HttpForward for HttpOutbound {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::held::{Gone, HoldingConnector};
+    use crate::testing::held::{Breaks, Gone, HoldingConnector, Stage};
     use crate::testing::{
         Camouflage, FakeHttpProxy, FakeShadowTls, HttpProxyScript, ShadowTlsScript, TlsFixture,
         echo_server,
@@ -720,6 +728,120 @@ mod tests {
             handshake_io(TimedOut.into()),
             OutboundError::Timeout
         ));
+    }
+
+    /// What a policy below says when it knows what went wrong: a
+    /// shadowsocks server that reset the connection without answering.
+    const BELOW: &str =
+        "ss: the server reset the connection without answering (wrong password or method?)";
+
+    /// An `underlying-proxy` that fails in words of its own is not this
+    /// proxy closing the connection: the words are what the user is told,
+    /// wherever in the exchange they come.
+    #[tokio::test]
+    async fn a_hop_below_that_says_what_went_wrong_is_not_overruled() {
+        for (stage, kind) in [
+            (Stage::Read, io::ErrorKind::ConnectionReset),
+            (Stage::Write, io::ErrorKind::BrokenPipe),
+            (Stage::Flush, io::ErrorKind::ConnectionAborted),
+        ] {
+            let out = outbound_through(
+                "http, 127.0.0.1, 8080",
+                no_roots(),
+                Arc::new(Breaks {
+                    stage,
+                    kind,
+                    text: BELOW,
+                }),
+            );
+            let err = out
+                .connect_tcp(
+                    &Target::new(HostName::parse("192.0.2.1"), 443),
+                    &ConnectOpts::default(),
+                )
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert!(
+                matches!(&err, OutboundError::Io(e) if e.kind() == kind),
+                "{stage:?}: {err}"
+            );
+            assert_eq!(err.to_string(), BELOW, "{stage:?}");
+        }
+    }
+
+    /// Words of their own exempt a reset, an abort and a broken pipe from
+    /// being the proxy's refusal, and do not exempt an end.
+    #[test]
+    fn words_of_its_own_exempt_a_reset_but_not_an_end() {
+        use io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset, UnexpectedEof};
+        for kind in [ConnectionReset, ConnectionAborted, BrokenPipe] {
+            let err = handshake_io(io::Error::new(kind, BELOW));
+            assert!(
+                matches!(&err, OutboundError::Io(e) if e.kind() == kind),
+                "{kind:?}: {err}"
+            );
+            assert_eq!(err.to_string(), BELOW, "{kind:?}");
+        }
+        // An end is the proxy's whatever it says: the TLS layer of this very
+        // policy words its own (no close_notify), and so does `read_exact`.
+        let err = handshake_io(io::Error::new(UnexpectedEof, "early eof"));
+        assert!(
+            matches!(&err, OutboundError::Proxy(m) if m == "http proxy closed the connection during CONNECT"),
+            "{err}"
+        );
+    }
+
+    /// `InvalidData` is what tokio-rustls reports for every TLS error, an
+    /// alert from the proxy included: a TLS 1.3 handshake is complete on
+    /// our side before the proxy has looked at the client certificate, so a
+    /// proxy that wants one says so on the first read. Only `read_head`
+    /// giving up on a head is a head that is too long.
+    #[tokio::test]
+    async fn an_error_of_the_stream_is_not_a_head_that_is_too_long() {
+        let alert = "received fatal alert: CertificateRequired";
+        let out = outbound_through(
+            "http, 127.0.0.1, 8080",
+            no_roots(),
+            Arc::new(Breaks {
+                stage: Stage::Read,
+                kind: io::ErrorKind::InvalidData,
+                text: alert,
+            }),
+        );
+        let err = out
+            .connect_tcp(
+                &Target::new(HostName::parse("192.0.2.1"), 443),
+                &ConnectOpts::default(),
+            )
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.to_string(), alert);
+    }
+
+    /// The same with the real thing: an `https` proxy that wants a client
+    /// certificate, and a profile that has none.
+    #[tokio::test]
+    async fn a_proxy_that_wants_a_client_certificate_says_so() {
+        let echo = echo_server().await;
+        let fixture = TlsFixture::new(&["localhost"]);
+        let proxy =
+            FakeHttpProxy::spawn_tls(HttpProxyScript::default(), fixture.clone(), true).await;
+        let out = outbound(
+            &format!("https, localhost, {}", proxy.addr().port()),
+            fixture.roots(),
+        );
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            out.connect_tcp(&target(echo), &ConnectOpts::default()),
+        )
+        .await
+        .expect("the proxy answers")
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.to_string(), "received fatal alert: CertificateRequired");
+        assert!(proxy.heads().is_empty(), "no request got through");
     }
 
     #[tokio::test]
