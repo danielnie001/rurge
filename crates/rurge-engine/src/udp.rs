@@ -512,8 +512,12 @@ async fn open(
     }
     let mut outbound = resolution.outbound.clone();
     // a `smart` group's member tells the book how it did (phase 2 M5
-    // design 8.3); not when the flow goes through DIRECT in its place
-    let mut smart = resolution.smart.clone();
+    // design 8.3); not when the flow goes through DIRECT in its place, nor
+    // when its target is a name no member can send (phase 2 M8 design 5.5)
+    let mut smart = resolution
+        .smart
+        .clone()
+        .filter(|_| !crate::smart::unsendable(to));
     if outbound.udp() == UdpSupport::Unsupported {
         match rt.config.general.udp_policy_not_supported_behaviour {
             UdpFallback::Reject => {

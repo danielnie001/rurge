@@ -41,6 +41,35 @@ async fn upstream(origin: &TestServer) -> FakeSocks5 {
     .await
 }
 
+/// A parameter that keeps the connectivity tests off a member: no round can
+/// test at a URL that does not parse, so the member is known through
+/// sessions only (M3c design 8.1). For the tests below that count the
+/// failures sessions told of: the harness's test URL is a closed port, and
+/// every member's failed test would count beside them — at once or seconds
+/// later, as the platform is quick or slow to refuse a closed loopback port.
+const UNTESTED: &str = "test-url=http://[";
+
+/// What the book knows of each of `members` now.
+fn healths(h: &Harness, members: &[&str]) -> Vec<Health> {
+    let registry = h.engine.registry();
+    let now = Instant::now();
+    members
+        .iter()
+        .map(|m| registry.auto().smart.health(m, &outbound_now(h, m), now))
+        .collect()
+}
+
+/// A dial of `host` that fails: what it failed with, and its session.
+async fn failure_of(h: &Harness, host: &str) -> (String, Arc<rurge_inbound::SessionHandle>) {
+    match h.engine.dial(session(host)).await {
+        Err(DialError::Failed {
+            message, handle, ..
+        }) => (message, handle),
+        Err(DialError::Reject { kind, .. }) => panic!("{host}: rejected by {}", kind.name()),
+        Ok(_) => panic!("{host}: connected"),
+    }
+}
+
 /// A member that does not connect hands the session over to the next one in
 /// line: the session goes through that one, and the note says who failed
 /// (M3c design §7).
@@ -111,6 +140,121 @@ async fn when_no_member_connects_the_session_fails_naming_them() {
         "{note}"
     );
     assert_eq!(handle.policy_chain(), ["S", "C"]);
+}
+
+/// A site that is down is no fault of the members (phase 2 M8 design 5.5):
+/// every session to it goes through the three of them and fails, time and
+/// again, and one member answers for it — the first that failed there. The
+/// others are remembered at the site, and nothing is held against them.
+#[tokio::test]
+async fn a_site_that_is_down_costs_one_member_one_penalty() {
+    let mut proxies = String::new();
+    let mut upstreams = Vec::new();
+    for name in ["A", "B", "C"] {
+        // reaches its proxy, which says the target refused the connection
+        let upstream = FakeSocks5::spawn(Socks5Script {
+            reply: 5,
+            ..Socks5Script::default()
+        })
+        .await;
+        proxies += &format!(
+            "{name} = socks5, 127.0.0.1, {}, {UNTESTED}\n",
+            upstream.addr().port()
+        );
+        upstreams.push(upstream);
+    }
+    let h = harness(Profile {
+        proxies: &proxies,
+        groups: "S = smart, A, B, C",
+        rules: "DOMAIN,down.test,S",
+        ..Profile::default()
+    })
+    .await;
+    for _ in 0..3 {
+        let (error, _) = failure_of(&h, "down.test").await;
+        assert_eq!(error, "socks5: connection refused");
+    }
+    for upstream in &upstreams {
+        assert_eq!(upstream.requests().len(), 3, "every session tried it");
+    }
+    assert_eq!(
+        healths(&h, &["A", "B", "C"]),
+        [
+            Health::Unknown { failures: 1 },
+            Health::Unknown { failures: 0 },
+            Health::Unknown { failures: 0 },
+        ]
+    );
+    let registry = h.engine.registry();
+    let mut failed = registry
+        .auto()
+        .smart
+        .site("down.test", Instant::now())
+        .failed;
+    failed.sort();
+    assert_eq!(failed, ["A", "B", "C"]);
+}
+
+/// A name no member's request can carry says nothing of the members (phase 2
+/// M8 design 5.5): every one of them refuses it alike. The session goes
+/// through the member the group picked and no further, fails in that
+/// member's own words, and counts against nobody.
+#[tokio::test]
+async fn a_name_no_member_can_send_is_tried_once_and_counts_against_nobody() {
+    let (a, b) = (
+        FakeHttpProxy::spawn(HttpProxyScript::default()).await,
+        FakeHttpProxy::spawn(HttpProxyScript::default()).await,
+    );
+    let proxies = format!(
+        "A = http, 127.0.0.1, {}, {UNTESTED}\nB = http, 127.0.0.1, {}, {UNTESTED}",
+        a.addr().port(),
+        b.addr().port()
+    );
+    let h = harness(Profile {
+        proxies: &proxies,
+        groups: "S = smart, A, B",
+        rules: "DOMAIN-SUFFIX,test,S",
+        ..Profile::default()
+    })
+    .await;
+    // 300 bytes, every label a valid one: an HTTP proxy's request line has
+    // room for it — the proxy is asked, and cannot connect —, the address
+    // of a SOCKS5 request has not
+    let label = "a".repeat(63);
+    let long = format!("{}.{}.test", [label.as_str(); 4].join("."), "a".repeat(39));
+    assert_eq!(long.len(), 300);
+    // no ASCII form: no member writes a request for it at all
+    let unwritable = "x@blocked.test";
+    for (host, error) in [
+        (long.as_str(), "http proxy answered 502 Bad Gateway"),
+        (
+            unwritable,
+            "the target host name is not valid for an HTTP proxy request",
+        ),
+    ] {
+        let (message, handle) = failure_of(&h, host).await;
+        assert_eq!(message, error);
+        assert_eq!(handle.policy_chain(), ["S", "A"]);
+        assert_eq!(handle.error(), None, "no note of members tried");
+    }
+    // the long name went to the member the group picked, and nothing to
+    // the next in line
+    let asked = a.heads();
+    assert_eq!(asked.len(), 1);
+    assert!(asked[0].request_line.contains(&long));
+    assert!(b.heads().is_empty(), "the next member was tried");
+    assert_eq!(
+        healths(&h, &["A", "B"]),
+        [Health::Unknown { failures: 0 }; 2]
+    );
+    let registry = h.engine.registry();
+    let smart = &registry.auto().smart;
+    let now = Instant::now();
+    for host in [long.as_str(), unwritable] {
+        assert_eq!(smart.site(host, now), SiteMemory::default(), "{host}");
+    }
+    let members = ["A".to_string(), "B".to_string()];
+    assert!(smart.most_used("S", &members, now).is_empty());
 }
 
 /// A session that gets its first byte back is a sample of the member it
@@ -439,6 +583,41 @@ async fn a_member_whose_udp_send_fails_counts_against_it() {
         smart.site("127.0.0.1", Instant::now()).failed == ["Refusing"]
     })
     .await;
+}
+
+/// The same over UDP for a name no member can send (phase 2 M8 design 5.5):
+/// the flow fails on its first datagram, which never leaves, and the group
+/// hears nothing of it — neither a failure of the member nor a use.
+#[tokio::test]
+async fn a_udp_flow_to_a_name_no_member_can_send_counts_against_nobody() {
+    let good = FakeSocks5::spawn(Socks5Script::default()).await;
+    let proxies = format!(
+        "Good = socks5, 127.0.0.1, {}, udp-relay=true, {UNTESTED}",
+        good.addr().port()
+    );
+    let h = harness(Profile {
+        proxies: &proxies,
+        groups: "S = smart, Good",
+        rules: "DOMAIN-SUFFIX,test,S",
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association.send("x@blocked.test", 4000, b"hi").await;
+    wait_until("the flow to fail", || !udp_records(&h).is_empty()).await;
+    let record = &udp_records(&h)[0];
+    assert_eq!(record.policy, ["S", "Good"]);
+    assert_eq!(
+        record.error.as_deref(),
+        Some("socks5: the host name cannot be sent to a SOCKS5 proxy")
+    );
+    assert!(good.datagrams().is_empty());
+    let registry = h.engine.registry();
+    let smart = &registry.auto().smart;
+    let now = Instant::now();
+    assert_eq!(smart.site("x@blocked.test", now), SiteMemory::default());
+    assert_eq!(healths(&h, &["Good"]), [Health::Unknown { failures: 0 }]);
+    assert!(smart.most_used("S", &["Good".to_string()], now).is_empty());
 }
 
 /// Three seconds without an answer count against the member only where an

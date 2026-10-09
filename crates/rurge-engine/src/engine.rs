@@ -1139,7 +1139,7 @@ impl Dialer for Engine {
             let ctx = SelectCtx {
                 host: Some(handle.session().dst_host.to_string()),
             };
-            let resolution = match resolve_ready(&registry, &policy, &ctx).await {
+            let mut resolution = match resolve_ready(&registry, &policy, &ctx).await {
                 Ok(resolution) => resolution,
                 Err(chain) => {
                     handle.set_policy_chain(chain);
@@ -1189,6 +1189,13 @@ impl Dialer for Engine {
             let may_forward = plain_http && !pinned;
             let host = handle.session().dst_host.to_string();
             let book = registry.auto().smart.clone();
+            // a name no member can send is refused by all of them alike: the
+            // session goes through the one the group picked as through a
+            // policy of its own — no other is tried, and the group is told
+            // nothing of it (phase 2 M8 design 5.5)
+            if resolution.smart.is_some() && crate::smart::unsendable(&target) {
+                resolution.smart = None;
+            }
             // the member a `smart` group picked, then the next ones in line
             // while they do not connect (phase 2 M3c design §7)
             let attempts = crate::smart::attempts(&registry, resolution);

@@ -1,7 +1,9 @@
 //! What the `smart` groups know of their members (phase 2 M3c design §5): a
 //! score per policy from the first-byte times of real sessions and from the
-//! connectivity tests, a penalty for every failure, and whether a member is
-//! healthy, failed or not known yet. It is kept per policy, so groups that
+//! connectivity tests, a penalty for every failure of its own — a session
+//! that fails where another member failed lately tells of the site, not of
+//! the member (phase 2 M8 design 5.5) — and whether a member is healthy,
+//! failed or not known yet. It is kept per policy, so groups that
 //! share a member share what is known of it (M3c-D2), and it outlives config
 //! generations; a policy whose definition changed starts over. Beside it,
 //! what happened at each site lately and how often each group used each
@@ -172,7 +174,12 @@ struct Site {
 }
 
 impl Sites {
-    fn remember(&mut self, host: &str, policy: &str, worked: bool, now: Instant) {
+    /// Remembers how `policy` did at `host`, and says whether the site
+    /// remembered a failure of another policy when it came: one step under
+    /// the caller's lock, so that of several policies failing at a site at
+    /// the same moment every one but the first finds another's failure
+    /// there.
+    fn remember(&mut self, host: &str, policy: &str, worked: bool, now: Instant) -> bool {
         self.clock += 1;
         let clock = self.clock;
         if !self.hosts.contains_key(host) && self.hosts.len() >= SITES {
@@ -192,10 +199,12 @@ impl Sites {
         site.used = clock;
         site.policies
             .retain(|(p, _, at)| p != policy && now.saturating_duration_since(*at) < SITE_MEMORY);
+        let another_failed = site.policies.iter().any(|(_, it_worked, _)| !it_worked);
         site.policies.push((policy.to_string(), worked, now));
         if site.policies.len() > POLICIES_PER_SITE {
             site.policies.remove(0);
         }
+        another_failed
     }
 
     fn read(&mut self, host: &str, now: Instant) -> SiteMemory {
@@ -443,7 +452,14 @@ impl SmartBook {
     }
 
     /// A dial through `policy` did not connect, or its session got no answer
-    /// (M3c design 4.3): a failure, and `policy` failed at `host`.
+    /// (M3c design 4.3): `policy` failed at `host`, and the failure is its
+    /// own — unless another policy failed at `host` within `SITE_MEMORY`.
+    /// Then the site is likelier down than the policy: the failure is
+    /// remembered there and the policy's record is left as it was (phase 2
+    /// M8 design 5.5). A site that is down so costs at most one penalty an
+    /// hour, however many policies are tried there and however often; a
+    /// policy that fails there alone answers for every failure. Without a
+    /// `host` there is no site to ask.
     pub fn report_failure(
         &self,
         policy: &str,
@@ -451,12 +467,14 @@ impl SmartBook {
         host: Option<&str>,
         now: Instant,
     ) {
-        self.change(policy, outbound, now, true, |r| r.failure(now));
-        if let Some(host) = host {
+        let excused = host.is_some_and(|host| {
             self.sites
                 .lock()
                 .expect("smart sites")
-                .remember(host, policy, false, now);
+                .remember(host, policy, false, now)
+        });
+        if !excused {
+            self.change(policy, outbound, now, true, |r| r.failure(now));
         }
     }
 
@@ -911,5 +929,168 @@ mod tests {
         book.report_success("A", &a, None, ms(100), t0);
         book.report_failure("A", &a, None, t0);
         healthy_near(book.health("A", &a, t0), ms(900));
+    }
+
+    /// What `policy`'s record holds against it at `now`: its penalty in
+    /// whole milliseconds and its failures in a row — nothing of either
+    /// while it has no record.
+    fn against(book: &SmartBook, policy: &str, now: Instant) -> (u64, u32) {
+        let records = book.records.lock().expect("smart records");
+        records
+            .get(policy)
+            .map_or((0, 0), |r| (r.penalty_at(now).round() as u64, r.failures))
+    }
+
+    /// A site that is down is no fault of the members (phase 2 M8 design
+    /// 5.5): the first to fail there answers for it, with a penalty and a
+    /// step in its run of failures; one that fails there while that is
+    /// remembered is remembered at the site, and its record stays as it was.
+    #[test]
+    fn where_another_member_failed_lately_a_failure_is_the_sites() {
+        let (book, a, b, t0) = (SmartBook::new(), outbound(), outbound(), Instant::now());
+        book.sample("A", &a, ms(100), t0);
+        book.sample("B", &b, ms(100), t0);
+        book.report_failure("A", &a, Some("x.test"), t0);
+        assert_eq!(against(&book, "A", t0), (800, 1));
+        healthy_near(book.health("A", &a, t0), ms(900));
+        book.report_failure("B", &b, Some("x.test"), t0);
+        assert_eq!(against(&book, "B", t0), (0, 0));
+        healthy_near(book.health("B", &b, t0), ms(100));
+        assert_eq!(book.site("x.test", t0).failed, names(&["A", "B"]));
+    }
+
+    /// Nor does the first one pay again while the other's failure is
+    /// remembered there: members failing at a site in turn cost one penalty
+    /// between them, however long they go on.
+    #[test]
+    fn the_first_to_fail_does_not_pay_again_while_anothers_failure_is_remembered() {
+        let (book, a, b, t0) = (SmartBook::new(), outbound(), outbound(), Instant::now());
+        for _ in 0..5 {
+            book.report_failure("A", &a, Some("x.test"), t0);
+            book.report_failure("B", &b, Some("x.test"), t0);
+        }
+        assert_eq!(against(&book, "A", t0), (800, 1));
+        assert_eq!(against(&book, "B", t0), (0, 0));
+        assert_eq!(book.health("A", &a, t0), Health::Unknown { failures: 1 });
+        assert_eq!(book.health("B", &b, t0), Health::Unknown { failures: 0 });
+    }
+
+    /// The other's failure excuses for as long as the site remembers it: an
+    /// hour on, a failure there is the member's own again.
+    #[test]
+    fn a_failure_is_the_members_own_again_once_the_others_is_forgotten() {
+        let book = SmartBook::new();
+        let (a, b, c, t0) = (outbound(), outbound(), outbound(), Instant::now());
+        book.report_failure("A", &a, Some("x.test"), t0);
+        book.report_failure("A", &a, Some("y.test"), t0);
+        // a second short of the hour, A's failure still excuses
+        let within = t0 + SITE_MEMORY - Duration::from_secs(1);
+        book.report_failure("C", &c, Some("y.test"), within);
+        assert_eq!(against(&book, "C", within), (0, 0));
+        let after = t0 + SITE_MEMORY;
+        book.report_failure("B", &b, Some("x.test"), after);
+        assert_eq!(against(&book, "B", after), (800, 1));
+        assert_eq!(book.site("x.test", after).failed, names(&["B"]));
+    }
+
+    /// What happened at one site says nothing of another.
+    #[test]
+    fn a_failure_at_another_site_is_the_members_own() {
+        let (book, a, b, t0) = (SmartBook::new(), outbound(), outbound(), Instant::now());
+        book.report_failure("A", &a, Some("x.test"), t0);
+        book.report_failure("B", &b, Some("y.test"), t0);
+        assert_eq!(against(&book, "A", t0), (800, 1));
+        assert_eq!(against(&book, "B", t0), (800, 1));
+    }
+
+    /// A member that fails at a site alone answers for every failure: no
+    /// other member's tells that the site may be down.
+    #[test]
+    fn a_member_failing_alone_at_a_site_pays_every_time() {
+        let (book, a, t0) = (SmartBook::new(), outbound(), Instant::now());
+        for n in 1..=3 {
+            book.report_failure("A", &a, Some("x.test"), t0);
+            assert_eq!(against(&book, "A", t0), (800 * u64::from(n), n));
+        }
+        assert_eq!(book.health("A", &a, t0), Health::Failed(None));
+    }
+
+    /// That another member worked at the site excuses nobody — the site was
+    /// up then. The member that worked there is excused later like any
+    /// other, once someone else's failure is remembered.
+    #[test]
+    fn anothers_success_at_the_site_excuses_nobody() {
+        let (book, a, b, t0) = (SmartBook::new(), outbound(), outbound(), Instant::now());
+        book.report_success("B", &b, Some("x.test"), ms(100), t0);
+        book.report_failure("A", &a, Some("x.test"), t0);
+        assert_eq!(against(&book, "A", t0), (800, 1));
+        book.report_failure("B", &b, Some("x.test"), t0);
+        assert_eq!(against(&book, "B", t0), (0, 0));
+        healthy_near(book.health("B", &b, t0), ms(100));
+        assert_eq!(
+            book.site("x.test", t0),
+            SiteMemory {
+                worked: Vec::new(),
+                failed: names(&["A", "B"]),
+            }
+        );
+    }
+
+    /// A report without a host has no site to ask: the failure is the
+    /// member's own, whoever else failed.
+    #[test]
+    fn failures_without_a_host_are_the_members_own() {
+        let (book, a, b, t0) = (SmartBook::new(), outbound(), outbound(), Instant::now());
+        book.report_failure("A", &a, None, t0);
+        book.report_failure("B", &b, None, t0);
+        assert_eq!(against(&book, "A", t0), (800, 1));
+        assert_eq!(against(&book, "B", t0), (800, 1));
+    }
+
+    /// A connectivity test is no session at a site: one that fails counts
+    /// against its policy whatever the sites remember, and is remembered at
+    /// none — it excuses no session.
+    #[test]
+    fn a_failed_test_counts_whatever_the_sites_remember() {
+        let (book, a, b, t0) = (SmartBook::new(), outbound(), outbound(), Instant::now());
+        book.report_failure("A", &a, Some("x.test"), t0);
+        book.failure("B", &b, t0);
+        assert_eq!(against(&book, "B", t0), (800, 1));
+        book.failure("A", &a, t0);
+        assert_eq!(against(&book, "A", t0), (1600, 2));
+        assert_eq!(book.site("x.test", t0).failed, names(&["A"]));
+    }
+
+    /// Sessions to a site that is down fail at the same moment through
+    /// different members: one of them pays, whichever comes first. Looking
+    /// the site up and remembering the failure there are one step — were
+    /// they two, members that looked before any had been remembered would
+    /// all pay.
+    #[test]
+    fn of_the_members_failing_at_a_site_at_once_exactly_one_pays() {
+        const MEMBERS: usize = 4;
+        let (book, t0) = (SmartBook::new(), Instant::now());
+        let members: Vec<(String, OutboundRef)> = (0..MEMBERS)
+            .map(|i| (format!("P{i}"), outbound()))
+            .collect();
+        for round in 1..=500u32 {
+            let host = format!("{round}.test");
+            let start = std::sync::Barrier::new(MEMBERS);
+            std::thread::scope(|scope| {
+                for (name, outbound) in &members {
+                    let (book, host, start) = (&book, &host, &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        book.report_failure(name, outbound, Some(host), t0);
+                    });
+                }
+            });
+            let paid: u32 = members
+                .iter()
+                .map(|(name, _)| against(&book, name, t0).1)
+                .sum();
+            assert_eq!(paid, round, "{host}: one member pays for a site");
+            assert_eq!(book.site(&host, t0).failed.len(), MEMBERS);
+        }
     }
 }

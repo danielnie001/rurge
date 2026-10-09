@@ -1,9 +1,12 @@
 //! The engine's side of the `smart` groups (phase 2 M3c design §4, §7): a
 //! dial that does not connect through the member a group picked tries the
 //! next ones in line, and every session through such a group reports what it
-//! saw of the member it went through.
+//! saw of the member it went through — all but a session to a name that no
+//! member can send (`unsendable`), which tells nothing of any of them.
 
+use rurge_config::HostName;
 use rurge_inbound::SessionHandle;
+use rurge_net::connector::Target;
 use rurge_policy::smart::SmartBook;
 use rurge_policy::{PolicyRegistry, Resolution, SmartPick, TerminalKind};
 use rurge_proto::{OutboundError, OutboundRef};
@@ -59,6 +62,24 @@ pub(crate) fn attempts(registry: &PolicyRegistry, first: Resolution) -> Vec<Reso
 /// REJECT, or a protocol rurge does not implement.
 pub(crate) fn retryable(e: &OutboundError) -> bool {
     !matches!(e, OutboundError::Reject(_) | OutboundError::Unsupported(_))
+}
+
+/// The longest host name a proxy request carries: its length is one byte in
+/// the address most protocols write, and no DNS name is longer.
+const LONGEST_NAME: usize = 255;
+
+/// Whether no member can send to `target`: a name without an ASCII form, or
+/// one longer in that form than a proxy request carries. A member refuses
+/// it before it sends anything, or its server does once it is asked — every
+/// member alike, so a session to it tells nothing of the member it was
+/// given and has no better one to try (phase 2 M8 design 5.5).
+pub(crate) fn unsendable(target: &Target) -> bool {
+    match &target.host {
+        HostName::Ip(_) => false,
+        HostName::Domain(name) => {
+            rurge_config::hostname::to_ascii(name).is_none_or(|ascii| ascii.len() > LONGEST_NAME)
+        }
+    }
 }
 
 /// `members`, quoted the way the session log's notes quote names.
@@ -150,7 +171,6 @@ pub(crate) fn watch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rurge_config::HostName;
     use rurge_config::session::SessionInfo;
     use rurge_inbound::SessionOutcome;
     use rurge_policy::smart::{Health, SiteMemory};
@@ -264,5 +284,30 @@ mod tests {
         assert!(!retryable(&OutboundError::Reject(RejectKind::Reject)));
         assert!(!retryable(&OutboundError::Unsupported("tailscale".into())));
         assert_eq!(quoted(&["A".into(), "B".into()]), "`A`, `B`");
+    }
+
+    /// No member can send to a name that has no ASCII form, or whose ASCII
+    /// form is longer than 255 bytes — the form that goes out is what is
+    /// measured, not the name as written.
+    #[test]
+    fn a_name_no_proxy_request_can_carry_is_unsendable() {
+        let named = |host: &str| Target::new(HostName::Domain(host.to_string()), 443);
+        for address in ["10.0.0.1", "2001:db8::1"] {
+            assert!(!unsendable(&Target::new(HostName::parse(address), 443)));
+        }
+        assert!(!unsendable(&named("example.test")));
+        assert!(!unsendable(&named("bücher.example")));
+        assert!(unsendable(&named("x@blocked.test")));
+        assert!(unsendable(&named("")));
+        assert!(!unsendable(&named(&"a".repeat(255))));
+        assert!(unsendable(&named(&"a".repeat(256))));
+        // 159 bytes as written, 279 as A-labels
+        let idn = ["bücher"; 20].join(".");
+        assert_eq!(idn.len(), 159);
+        assert_eq!(
+            rurge_config::hostname::to_ascii(&idn).map(|ascii| ascii.len()),
+            Some(279)
+        );
+        assert!(unsendable(&named(&idn)));
     }
 }
