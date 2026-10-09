@@ -191,22 +191,24 @@ impl SystemProxyManager {
     }
 
     /// Startup: a backup still in `state.json` means the last run died with
-    /// the system proxy pointing at it.
-    pub async fn recover(&mut self) {
-        let Some(saved) = self.store.snapshot().await.system_proxy_backup else {
-            return;
-        };
+    /// the system proxy pointing at it. What became of that backup comes back
+    /// as well as going to the log (`None`: there was none), for the start
+    /// that ends before it has a log.
+    pub async fn recover(&mut self) -> Option<Result<(), String>> {
+        let saved = self.store.snapshot().await.system_proxy_backup?;
         tracing::warn!(
             "a previous run left the system proxy pointing at rurge; restoring the saved settings"
         );
         let backend = self.backend.clone();
-        match blocking(move || backend.restore(&Backup(saved))).await {
+        let restored = blocking(move || backend.restore(&Backup(saved))).await;
+        match &restored {
             Ok(()) => self.forget().await,
             Err(e) => tracing::error!(
                 error = %e,
                 "cannot restore the system proxy; the saved settings stay in state.json for the next attempt"
             ),
         }
+        Some(restored)
     }
 
     pub async fn enable(&mut self, settings: ProxySettings) -> Result<(), String> {
@@ -438,7 +440,7 @@ mod tests {
     #[tokio::test]
     async fn recover_restores_what_a_crashed_run_left_behind() {
         let (_dir, mock, store, mut manager) = manager().await;
-        manager.recover().await;
+        assert_eq!(manager.recover().await, None);
         assert!(
             mock.calls().is_empty(),
             "nothing to recover on a clean state"
@@ -451,7 +453,7 @@ mod tests {
                 s.features.system_proxy = true;
             })
             .await;
-        manager.recover().await;
+        assert_eq!(manager.recover().await, Some(Ok(())));
         assert_eq!(*mock.restored.lock().unwrap(), [Backup(left_behind)]);
         let state = store.snapshot().await;
         assert_eq!(state.system_proxy_backup, None);
@@ -467,7 +469,10 @@ mod tests {
             .update(move |s| s.system_proxy_backup = Some(saved))
             .await;
         mock.fail_restore.store(true, Ordering::SeqCst);
-        manager.recover().await;
+        assert_eq!(
+            manager.recover().await,
+            Some(Err("restore refused".to_string()))
+        );
         assert_eq!(
             store.snapshot().await.system_proxy_backup,
             Some(left_behind.clone()),

@@ -620,6 +620,65 @@ fn lock_data_dir(dir: &Path) -> Result<Option<File>, String> {
     }
 }
 
+/// Crash recovery for a start that ends at the profile. A run that died with
+/// the system proxy pointing at it is undone by the next start, but only a
+/// profile that loads gets a start that far: one broken in the meantime
+/// would leave the machine pointing at a dead port until it is repaired.
+///
+/// Unlike a start, this leaves a directory rurge keeps no state in exactly as
+/// it finds it: the data directory is not created, and `state.json` is looked
+/// for before the lock, so not even `rurge.lock` appears. What happened goes
+/// to standard error, because logging starts only with a loaded profile, and
+/// never changes how the start ends.
+fn recover_without_a_profile(args: &RuntimeArgs) {
+    let dir = args.data_dir();
+    let path = dir.join(STATE_FILE);
+    if !path.is_file() {
+        return;
+    }
+    // As at a start, only a lock somebody else holds is a refusal: the backup
+    // is then that live instance's to restore.
+    let Ok(_lock) = lock_data_dir(&dir) else {
+        return;
+    };
+    // Read here rather than through `StateStore`, which moves a file it
+    // cannot parse aside and says so in the log: there is no log yet, and
+    // without a backup nothing here has any business with the file.
+    let left_behind = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<State>(&text).ok())
+        .is_some_and(|state| state.system_proxy_backup.is_some());
+    if !left_behind {
+        return;
+    }
+    let backend = match super::sysproxy::backend() {
+        Ok(backend) => backend,
+        Err(e) => {
+            eprintln!("warning: {e}; the system proxy was not restored");
+            return;
+        }
+    };
+    let recovered = match tokio::runtime::Builder::new_current_thread().build() {
+        Ok(runtime) => runtime.block_on(async {
+            let (store, _) = StateStore::open(path).await;
+            SystemProxyManager::new(backend, store).recover().await
+        }),
+        Err(e) => Some(Err(e.to_string())),
+    };
+    match recovered {
+        Some(Ok(())) => eprintln!(
+            "warning: a previous run left the system proxy pointing at rurge; the saved settings were restored"
+        ),
+        Some(Err(e)) => eprintln!(
+            "warning: cannot restore the system proxy: {e}; the saved settings stay in state.json and are restored on the next start"
+        ),
+        // The store reads the file again; it finds the backup gone only when
+        // somebody else took it away meanwhile, in a directory that cannot
+        // be locked.
+        None => {}
+    }
+}
+
 pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let platform = args.platform.unwrap_or_else(Platform::current);
     let opts = LoadOptions {
@@ -627,9 +686,13 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         platform,
         capabilities: capabilities::current(),
     };
-    let loaded = rurge_engine::load_checked(&args.config, &opts)?;
+    // A profile that does not load ends the start here, in one of two ways;
+    // in both, what a crashed run left behind is put back on the way out.
+    let loaded = rurge_engine::load_checked(&args.config, &opts)
+        .inspect_err(|_| recover_without_a_profile(&args.runtime))?;
     if loaded.diagnostics.has_errors() {
         print_diagnostics(&loaded.diagnostics.sorted());
+        recover_without_a_profile(&args.runtime);
         return Ok(ExitCode::from(2));
     }
     print_diagnostics(&loaded.diagnostics.sorted());

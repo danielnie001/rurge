@@ -44,11 +44,16 @@ pub struct Runtime {
 }
 
 impl RuntimeArgs {
-    pub fn resolve(&self, cfg: &Config) -> anyhow::Result<Runtime> {
-        let data_dir = self
-            .data_dir
+    /// Where the data directory is, whether or not it exists: `resolve`
+    /// creates it, and needs a profile to do the rest of its work.
+    pub fn data_dir(&self) -> PathBuf {
+        self.data_dir
             .clone()
-            .unwrap_or_else(rurge_platform::dirs::data_dir);
+            .unwrap_or_else(rurge_platform::dirs::data_dir)
+    }
+
+    pub fn resolve(&self, cfg: &Config) -> anyhow::Result<Runtime> {
+        let data_dir = self.data_dir();
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("cannot create data dir {}", data_dir.display()))?;
         let mut geo_urls = GeoUrls::default();

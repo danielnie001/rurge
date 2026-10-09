@@ -2594,6 +2594,313 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         assert!(state["system_proxy_backup"].is_null());
         assert_eq!(state["features"]["system_proxy"], false);
     }
+
+    const RESTORED: &str = "warning: a previous run left the system proxy pointing at rurge; the saved settings were restored\n";
+
+    /// The two ways `rurge run` gives up before it has a profile — the text
+    /// has an error, the file cannot be read — each with what its exit says
+    /// on standard error. Both exit 2.
+    fn profiles_that_do_not_load(dir: &Path) -> [(std::path::PathBuf, &'static str); 2] {
+        let broken = dir.join("broken.conf");
+        std::fs::write(
+            &broken,
+            "[General]\n[Proxy]\n[Rule]\nDOMAIN,a.test,DIRECT\n",
+        )
+        .unwrap(); // no FINAL
+        [
+            (broken, "error[E0010]"),
+            (dir.join("no-such.conf"), "error: cannot read"),
+        ]
+    }
+
+    /// Runs a `rurge run` that is expected to give up at once: its exit code
+    /// and standard error.
+    fn give_up(mut cmd: Command) -> (Option<i32>, String) {
+        let mut child = cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("rurge run did not give up on its profile within 20 s");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        (status.code(), stderr)
+    }
+
+    /// A data directory as a crashed `rurge run --system-proxy` leaves it: the
+    /// "system proxy" points at the dead daemon and `state.json` holds what
+    /// was there before.
+    fn crashed_with_the_system_proxy_on(dir: &Path) -> std::path::PathBuf {
+        let conf = write_conf(dir, API_GENERAL);
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let file = sysproxy_file(&data);
+        std::fs::write(&file, ORIGINAL_PROXY).unwrap();
+        let crashed = spawn_daemon_full(&conf, &data, false, None, &["--system-proxy"]);
+        wait_for_line(&crashed, "system proxy enabled: ");
+        drop(crashed); // `Daemon::drop` kills the process: no cleanup runs
+        assert_ne!(
+            std::fs::read_to_string(&file).unwrap(),
+            ORIGINAL_PROXY,
+            "still pointing at the dead daemon"
+        );
+        assert!(!read_json(&data.join("state.json"))["system_proxy_backup"].is_null());
+        data
+    }
+
+    fn assert_restored(data: &Path, stderr: &str) {
+        assert_eq!(stderr.matches(RESTORED).count(), 1, "{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(sysproxy_file(data)).unwrap(),
+            ORIGINAL_PROXY
+        );
+        let state = read_json(&data.join("state.json"));
+        assert!(state["system_proxy_backup"].is_null(), "{state}");
+        assert_eq!(state["features"]["system_proxy"], false);
+    }
+
+    /// A crashed run left the operating system pointing at a dead port, and
+    /// by the next start the profile is broken: the load error ends the start
+    /// as it always did, but the saved settings go back first. Otherwise they
+    /// would wait for a profile that loads, with the machine offline until
+    /// then.
+    #[test]
+    fn run_restores_a_crashed_system_proxy_when_the_profile_has_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = crashed_with_the_system_proxy_on(dir.path());
+        let [(broken, says), _] = profiles_that_do_not_load(dir.path());
+        let (code, stderr) = give_up(rurge_run(&broken, &data));
+        assert_eq!(code, Some(2), "{stderr}");
+        assert!(stderr.contains(says), "{stderr}");
+        assert_restored(&data, &stderr);
+        // once: the backup is gone, so the next attempt has nothing to say
+        let (code, stderr) = give_up(rurge_run(&broken, &data));
+        assert_eq!(code, Some(2), "{stderr}");
+        assert!(!stderr.contains("system proxy"), "{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(sysproxy_file(&data)).unwrap(),
+            ORIGINAL_PROXY
+        );
+    }
+
+    #[test]
+    fn run_restores_a_crashed_system_proxy_when_the_profile_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = crashed_with_the_system_proxy_on(dir.path());
+        let [_, (missing, says)] = profiles_that_do_not_load(dir.path());
+        let (code, stderr) = give_up(rurge_run(&missing, &data));
+        assert_eq!(code, Some(2), "{stderr}");
+        assert!(stderr.contains(says), "{stderr}");
+        assert_restored(&data, &stderr);
+    }
+
+    /// A directory rurge keeps no state in gains nothing: not even the lock
+    /// file a start would create.
+    #[test]
+    fn a_profile_that_does_not_load_adds_nothing_to_a_data_dir_without_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        for (profile, says) in profiles_that_do_not_load(dir.path()) {
+            let (code, stderr) = give_up(rurge_run(&profile, &data));
+            assert_eq!(code, Some(2), "{stderr}");
+            assert!(stderr.contains(says), "{stderr}");
+            assert!(!stderr.contains("system proxy"), "{stderr}");
+            let left: Vec<_> = std::fs::read_dir(&data)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert!(left.is_empty(), "{left:?}");
+        }
+    }
+
+    #[test]
+    fn a_profile_that_does_not_load_does_not_create_the_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        for (profile, says) in profiles_that_do_not_load(dir.path()) {
+            let (code, stderr) = give_up(rurge_run(&profile, &data));
+            assert_eq!(code, Some(2), "{stderr}");
+            assert!(stderr.contains(says), "{stderr}");
+            assert!(!stderr.contains("system proxy"), "{stderr}");
+            assert!(!data.exists());
+        }
+    }
+
+    /// A backup under the lock of a live instance is that instance's own:
+    /// giving up on a profile beside it restores nothing and says nothing.
+    #[test]
+    fn a_profile_that_does_not_load_leaves_a_live_instances_system_proxy_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let file = sysproxy_file(&data);
+        std::fs::write(&file, ORIGINAL_PROXY).unwrap();
+        let mut first = spawn_daemon_full(&conf, &data, false, None, &["--system-proxy"]);
+        let port = api_port(&first);
+        wait_for_line(&first, "system proxy enabled: ");
+        let applied = std::fs::read_to_string(&file).unwrap();
+        assert_ne!(applied, ORIGINAL_PROXY, "the first run owns the settings");
+        let state = std::fs::read_to_string(data.join("state.json")).unwrap();
+        assert!(!read_json(&data.join("state.json"))["system_proxy_backup"].is_null());
+        for (profile, says) in profiles_that_do_not_load(dir.path()) {
+            let (code, stderr) = give_up(rurge_run(&profile, &data));
+            assert_eq!(code, Some(2), "{stderr}");
+            assert!(stderr.contains(says), "{stderr}");
+            assert!(!stderr.contains("system proxy"), "{stderr}");
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                applied,
+                "the first instance's system proxy is left alone"
+            );
+            assert_eq!(
+                std::fs::read_to_string(data.join("state.json")).unwrap(),
+                state,
+                "the first run's backup is still there to restore"
+            );
+        }
+        // the first instance still owns the settings and puts them back
+        assert_eq!(api_call(port, "POST", "/v1/stop", "k", Some("{}")).0, 200);
+        wait_for_line(&first, "system proxy restored");
+        assert_eq!(wait_for_exit(&mut first, 5), Some(0));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+    }
+
+    /// A `RURGE_SYSTEM_PROXY_BACKEND` rurge does not know never becomes the
+    /// operating system's backend: nothing is restored, the backup stays, and
+    /// the exit code is still the profile's.
+    #[test]
+    fn run_says_so_when_an_unknown_backend_keeps_it_from_restoring() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = crashed_with_the_system_proxy_on(dir.path());
+        let applied = std::fs::read_to_string(sysproxy_file(&data)).unwrap();
+        let state = std::fs::read_to_string(data.join("state.json")).unwrap();
+        let [(broken, says), _] = profiles_that_do_not_load(dir.path());
+        let mut cmd = rurge_run(&broken, &data);
+        // the guard's own backend, replaced by a value that names none
+        cmd.env("RURGE_SYSTEM_PROXY_BACKEND", "bogus");
+        let (code, stderr) = give_up(cmd);
+        assert_eq!(code, Some(2), "{stderr}");
+        assert!(stderr.contains(says), "{stderr}");
+        assert!(
+            stderr.contains(
+                "warning: unknown RURGE_SYSTEM_PROXY_BACKEND value `bogus` (expected file:<path>); the system proxy was not restored\n"
+            ),
+            "{stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(sysproxy_file(&data)).unwrap(),
+            applied
+        );
+        assert_eq!(
+            std::fs::read_to_string(data.join("state.json")).unwrap(),
+            state
+        );
+        // the backup stayed, so an attempt with a backend that works restores
+        let (code, stderr) = give_up(rurge_run(&broken, &data));
+        assert_eq!(code, Some(2), "{stderr}");
+        assert_restored(&data, &stderr);
+    }
+
+    /// A restore that fails is reported and keeps the backup for the next
+    /// start; the exit code is still the profile's.
+    #[test]
+    fn run_keeps_the_backup_when_it_cannot_restore_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        // not taken by the file backend, whose `restore` therefore refuses it
+        let state = r#"{"version":1,"features":{"system_proxy":true},"system_proxy_backup":{"platform":"elsewhere"}}"#;
+        std::fs::write(data.join("state.json"), state).unwrap();
+        for (profile, says) in profiles_that_do_not_load(dir.path()) {
+            let (code, stderr) = give_up(rurge_run(&profile, &data));
+            assert_eq!(code, Some(2), "{stderr}");
+            assert!(stderr.contains(says), "{stderr}");
+            assert!(
+                stderr.contains(
+                    "warning: cannot restore the system proxy: the system proxy backup was not taken by the file backend; the saved settings stay in state.json and are restored on the next start\n"
+                ),
+                "{stderr}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(data.join("state.json")).unwrap(),
+                state
+            );
+            assert!(!sysproxy_file(&data).exists());
+        }
+    }
+
+    /// `state.json` without a backup: nothing to put back and nothing to say.
+    /// The backend is not even looked at, so a value that names none goes
+    /// unreported here.
+    #[test]
+    fn a_profile_that_does_not_load_says_nothing_without_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let state = r#"{"version":1,"outbound_mode":"direct","system_proxy_backup":null}"#;
+        std::fs::write(data.join("state.json"), state).unwrap();
+        for (profile, says) in profiles_that_do_not_load(dir.path()) {
+            for backend in [None, Some("bogus")] {
+                let mut cmd = rurge_run(&profile, &data);
+                if let Some(backend) = backend {
+                    cmd.env("RURGE_SYSTEM_PROXY_BACKEND", backend);
+                }
+                let (code, stderr) = give_up(cmd);
+                assert_eq!(code, Some(2), "{stderr}");
+                assert!(stderr.contains(says), "{stderr}");
+                assert!(!stderr.contains("system proxy"), "{stderr}");
+                assert_eq!(
+                    std::fs::read_to_string(data.join("state.json")).unwrap(),
+                    state
+                );
+                assert!(!sysproxy_file(&data).exists());
+            }
+        }
+    }
+
+    /// A `state.json` that does not parse holds no backup rurge could use. A
+    /// start moves such a file aside and says so in its log; a start that
+    /// ends at the profile has no log yet, and leaves the file to one that
+    /// has.
+    #[test]
+    fn a_profile_that_does_not_load_leaves_a_state_file_it_cannot_parse_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("state.json"), "{ not json").unwrap();
+        for (profile, says) in profiles_that_do_not_load(dir.path()) {
+            let (code, stderr) = give_up(rurge_run(&profile, &data));
+            assert_eq!(code, Some(2), "{stderr}");
+            assert!(stderr.contains(says), "{stderr}");
+            assert!(!stderr.contains("system proxy"), "{stderr}");
+            assert!(
+                !data.join("state.json.broken").exists(),
+                "the file was moved aside"
+            );
+            assert_eq!(
+                std::fs::read_to_string(data.join("state.json")).unwrap(),
+                "{ not json"
+            );
+        }
+    }
 }
 
 mod service {
