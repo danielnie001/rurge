@@ -1198,6 +1198,19 @@ mod tests {
         )
     }
 
+    /// The resolver of `e`, its questions put to `mock` in memory
+    /// (`MockDns::upstream`) and not over UDP: for a test on a paused clock.
+    /// There the only time that passes is the time the resolver waits — for
+    /// a resend, for an entry to go stale —, and none while an answer is on
+    /// its way: how many questions it asks, and what each lookup comes back
+    /// with, is the same however busy the machine is. A sleep in such a test
+    /// ends when nothing else is left to run.
+    fn resolver_in_memory(e: &Env, mock: &MockDns, system: StaticSystemDns) -> Arc<Resolver> {
+        let (r, _) = resolver(e, system);
+        r.primary.store(Arc::new(vec![mock.upstream()]));
+        r
+    }
+
     /// A `SystemDns` whose server list changes, standing in for a network change.
     struct SwapSystemDns {
         servers: Mutex<Vec<SocketAddr>>,
@@ -1368,13 +1381,13 @@ mod tests {
         assert_eq!(primary.query_count("nas.home.lan", Qtype::A), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cache_fresh_stale_negative_and_coalescing() {
         let mock = MockDns::spawn().await;
         mock.set("c.test", &["10.0.0.1"], &[], 1);
         mock.set_empty("nx.test");
         let e = env(&profile(&format!("dns-server = {}", mock.addr()), ""));
-        let (r, _) = resolver(&e, StaticSystemDns::default());
+        let r = resolver_in_memory(&e, &mock, StaticSystemDns::default());
         let first = r.lookup("c.test", LookupOpts::default()).await.unwrap();
         assert!(matches!(first.source, Source::Upstream(_)));
         let second = r.lookup("c.test", LookupOpts::default()).await.unwrap();
@@ -1487,7 +1500,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_partial_result_completes_aaaa_in_the_background() {
         let mock = MockDns::spawn().await;
         mock.set("late.test", &["10.0.0.1"], &["fd00::1"], 60);
@@ -1502,7 +1515,7 @@ mod tests {
             has_ipv6: true,
             ..StaticSystemDns::default()
         };
-        let (r, _) = resolver(&e, sys);
+        let r = resolver_in_memory(&e, &mock, sys);
 
         let first = r.lookup("late.test", LookupOpts::default()).await.unwrap();
         assert_eq!(first.v4, vec![v4("10.0.0.1")]);
@@ -1535,7 +1548,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn aaaa_suppression_after_five_timeouts_and_flush_resumes() {
         let mock = MockDns::spawn().await;
         for i in 0..7 {
@@ -1550,7 +1563,7 @@ mod tests {
             has_ipv6: true,
             ..StaticSystemDns::default()
         };
-        let (r, _) = resolver(&e, sys);
+        let r = resolver_in_memory(&e, &mock, sys);
         for i in 0..5 {
             let res = r
                 .lookup(&format!("h{i}.test"), LookupOpts::default())

@@ -1,7 +1,8 @@
 //! In-process mock DNS servers for tests: one UDP socket and one TCP (or
 //! TLS) listener on the same port, with per-name answers and programmable
 //! misbehaviour (delay, drops, truncation, error codes) — and DNS over QUIC
-//! and over HTTP/3 servers that answer from such a table (`quic`).
+//! and over HTTP/3 servers that answer from such a table (`quic`), and an
+//! upstream that asks one in memory (`MockDns::upstream`).
 
 mod quic;
 
@@ -11,6 +12,8 @@ pub use quic::{
 };
 
 use crate::message::{Qtype, Question, Rcode, build_response, parse_query};
+use crate::upstream::{Upstream, UpstreamError, UpstreamRef};
+use rurge_net::BoxFuture;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -18,6 +21,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 
 #[derive(Clone, Debug)]
@@ -187,6 +191,22 @@ impl MockDns {
         self.addr
     }
 
+    /// An upstream that puts its questions to this mock's table directly, on
+    /// no socket, and gets what a socket would bring: the table's answer
+    /// after the table's delay, or — a question the table drops — nothing by
+    /// its deadline. Its questions are recorded like the others'.
+    ///
+    /// For a test on a paused clock, which a socket cannot keep up with — a
+    /// datagram takes real time. On that clock time passes only while every
+    /// task waits: none goes by while an answer is on its way, however busy
+    /// the machine, and no answer is late for a timer of the resolver's.
+    pub fn upstream(&self) -> UpstreamRef {
+        Arc::new(InMemory {
+            name: format!("memory://{}", self.addr),
+            state: self.state.clone(),
+        })
+    }
+
     pub fn set(&self, name: &str, v4: &[&str], v6: &[&str], ttl: u32) {
         let v4 = v4.iter().map(|s| s.parse().expect("ipv4")).collect();
         let v6 = v6.iter().map(|s| s.parse().expect("ipv6")).collect();
@@ -251,6 +271,39 @@ impl MockDns {
             .iter()
             .filter(|(q, _)| q.name == name && q.qtype == qtype)
             .count()
+    }
+}
+
+/// `MockDns::upstream`: the mock's table, asked in memory.
+struct InMemory {
+    name: String,
+    state: Arc<Mutex<State>>,
+}
+
+impl Upstream for InMemory {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn query<'a>(
+        &'a self,
+        wire: &'a [u8],
+        deadline: Instant,
+    ) -> BoxFuture<'a, Result<Vec<u8>, UpstreamError>> {
+        Box::pin(async move {
+            let Some((delay, reply)) = respond(&self.state, wire, "memory") else {
+                tokio::time::sleep_until(deadline).await;
+                return Err(UpstreamError::Timeout);
+            };
+            // Without a delay the answer is there at once: a sleep of no
+            // length would still wait for the clock's next millisecond.
+            if !delay.is_zero() {
+                tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
+                    .await
+                    .map_err(|_| UpstreamError::Timeout)?;
+            }
+            Ok(reply)
+        })
     }
 }
 
@@ -412,6 +465,46 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(200));
         m.set_drop_all(true);
         assert!(udp_ask(m.addr(), &wire).await.is_none());
+    }
+
+    /// The table asked in memory: its answer at once, or after its delay,
+    /// or — a question it drops — nothing by the deadline; the questions
+    /// recorded all the same. On a paused clock the time each takes is what
+    /// the table says, and no more.
+    #[tokio::test(start_paused = true)]
+    async fn the_table_answers_in_memory() {
+        let m = MockDns::spawn().await;
+        m.set("a.test", &["10.0.0.1"], &[], 42);
+        let up = m.upstream();
+        assert_eq!(up.name(), format!("memory://{}", m.addr()));
+        let wire = build_query(5, &q("a.test", Qtype::A)).unwrap();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(1);
+        let a = parse_response(&up.query(&wire, deadline).await.unwrap()).unwrap();
+        assert_eq!(a.id, 5);
+        assert_eq!(a.v4, vec![("10.0.0.1".parse().unwrap(), 42)]);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        m.set_delay(Duration::from_millis(40));
+        up.query(&wire, deadline).await.unwrap();
+        let delayed = started.elapsed();
+        assert!(
+            delayed >= Duration::from_millis(40) && delayed < Duration::from_millis(50),
+            "{delayed:?}"
+        );
+        m.set_drop_all(true);
+        assert_eq!(up.query(&wire, deadline).await, Err(UpstreamError::Timeout));
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        // a delay that reaches past the deadline is no answer either
+        m.set_drop_all(false);
+        m.set_delay(Duration::from_secs(5));
+        let late = Instant::now() + Duration::from_secs(1);
+        assert_eq!(up.query(&wire, late).await, Err(UpstreamError::Timeout));
+        assert_eq!(m.query_count("a.test", Qtype::A), 4);
+        assert!(
+            m.queries()
+                .iter()
+                .all(|(_, transport)| transport == "memory")
+        );
     }
 
     #[tokio::test]
