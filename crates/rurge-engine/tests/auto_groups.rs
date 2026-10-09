@@ -11,12 +11,6 @@ use rurge_engine::RequestRecord;
 use rurge_inbound::{DialError, Dialer};
 use std::collections::HashSet;
 
-/// A loopback port nothing listens on.
-async fn closed_port() -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().port()
-}
-
 fn session(host: &str) -> SessionInfo {
     SessionInfo::tcp(HostName::parse(host), 80)
 }
@@ -52,7 +46,7 @@ async fn upstreams(origin: &TestServer) -> (FakeSocks5, FakeSocks5, String) {
         origin.url("/slow"),
         b.addr().port(),
         origin.url("/fast"),
-        closed_port().await
+        closed_tcp_port()
     );
     (a, b, proxies)
 }

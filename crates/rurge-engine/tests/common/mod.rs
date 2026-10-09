@@ -110,7 +110,16 @@ pub async fn runtime_edited(
     .unwrap()
 }
 
-/// A test URL nothing answers at.
+/// The test URL of the profiles here, so that no connectivity test goes to
+/// the default `http://bing.com/`. Nothing is assumed of what is at the
+/// port: a connection to it is refused at once (Linux, macOS), refused
+/// after two seconds (Windows), or taken and never answered (a machine that
+/// runs the discard service), so a member tested there fails early, late,
+/// or only at the timeout. A dial through an automatic group asks for a
+/// round of such tests, which then runs on its own: whatever is asserted
+/// after the dial has to hold whenever the round ends. Where it would not —
+/// a count of a member's failures — the members are kept out of the rounds
+/// (`UNTESTED` in `smart.rs`) or given a test URL of their own.
 pub const NO_TEST: &str = "http://127.0.0.1:9/";
 
 /// The variable parts of a test profile; everything else is fixed.
@@ -128,8 +137,8 @@ pub struct Profile<'a> {
 }
 
 impl Profile<'_> {
-    /// Connectivity tests go to a closed loopback port unless `general`
-    /// says otherwise: never to the default `http://bing.com/`.
+    /// Connectivity tests go to `NO_TEST` unless `general` says otherwise:
+    /// never to the default `http://bing.com/`.
     pub fn text(&self, dns: SocketAddr) -> String {
         format!(
             "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\ndns-server = {dns}\nipv6 = false\n\
@@ -451,14 +460,14 @@ pub async fn udp_echo() -> (SocketAddr, Arc<std::sync::Mutex<Vec<SocketAddr>>>) 
     (addr, seen)
 }
 
-/// A loopback UDP port with nothing on it (so that a datagram to it is
-/// answered with an ICMP "port unreachable") that no socket another test
-/// opens can come by. A port the system handed out and the test then gave
-/// back can be handed out again to anyone, a moment later; this one lies in
-/// a range the system does not hand out by itself — the dynamic ports of
-/// Windows (by default), Linux and macOS are all above it — and is tried
-/// just before it is returned.
-pub fn closed_udp_port() -> u16 {
+/// A loopback port that `binds` could bind just now, and that no socket
+/// another test opens can come by. A port the system handed out and the
+/// test then gave back can be handed out again to anyone, a moment later;
+/// this one lies in a range the system does not hand out by itself — the
+/// dynamic ports of Windows (by default), Linux and macOS are all above it —
+/// and is tried just before it is returned. One walk for every caller: no
+/// two of them are given the same port.
+fn unassigned_port(binds: impl Fn(u16) -> bool) -> u16 {
     const PORTS: std::ops::Range<u64> = 20_000..30_000;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     // this process starts somewhere else in the range than the one before it
@@ -467,11 +476,24 @@ pub fn closed_udp_port() -> u16 {
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let port = PORTS.start + start.wrapping_add(n) % (PORTS.end - PORTS.start);
         let port = u16::try_from(port).expect("a port");
-        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+        if binds(port) {
             return port;
         }
     }
     panic!("no port of {PORTS:?} is free");
+}
+
+/// A loopback UDP port with nothing on it: a datagram to it is answered
+/// with an ICMP "port unreachable".
+pub fn closed_udp_port() -> u16 {
+    unassigned_port(|port| std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok())
+}
+
+/// A loopback TCP port with nothing on it: a connection to it is refused.
+/// The socket that tried it is gone again: one left bound and not listening
+/// refuses on Linux and Windows, and leaves the connection waiting on macOS.
+pub fn closed_tcp_port() -> u16 {
+    unassigned_port(|port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
 }
 
 /// One request/response over a fresh connection to rurge's HTTP listener.

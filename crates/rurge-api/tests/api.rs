@@ -126,8 +126,9 @@ async fn api_with(rules: &str) -> Api {
     api_in(rules, "").await
 }
 
-/// `groups` go after `Pick`. A proxy is tested at a closed loopback port,
-/// never at the default `http://bing.com/`.
+/// `groups` go after `Pick`. A proxy would be tested at a loopback port,
+/// never at the default `http://bing.com/`; no test here has one tested,
+/// and none may count on what that port answers.
 async fn api_in(rules: &str, groups: &str) -> Api {
     let dns = MockDns::spawn().await;
     dns.set("target.test", &["127.0.0.1"], &[], 60);

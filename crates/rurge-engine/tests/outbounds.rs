@@ -380,11 +380,7 @@ async fn a_chain_enters_through_the_groups_current_member() {
 
 #[tokio::test]
 async fn a_broken_hop_is_named_in_the_error() {
-    // a port nothing listens on: bind one, note it, let it go
-    let closed = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let closed = closed_tcp_port();
     let h = harness(Profile {
         proxies: &format!(
             "Entry = socks5, 127.0.0.1, {closed}\nExit = http, exit.example, 8080, underlying-proxy=Entry"

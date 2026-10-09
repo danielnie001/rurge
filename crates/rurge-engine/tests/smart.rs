@@ -13,12 +13,6 @@ use rurge_inbound::{DialError, Dialer};
 use rurge_policy::smart::{Health, SiteMemory};
 use std::time::Instant;
 
-/// A loopback port nothing listens on.
-async fn closed_port() -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().port()
-}
-
 fn session(host: &str) -> SessionInfo {
     SessionInfo::tcp(HostName::parse(host), 80)
 }
@@ -44,9 +38,10 @@ async fn upstream(origin: &TestServer) -> FakeSocks5 {
 /// A parameter that keeps the connectivity tests off a member: no round can
 /// test at a URL that does not parse, so the member is known through
 /// sessions only (M3c design 8.1). For the tests below that count the
-/// failures sessions told of: the harness's test URL is a closed port, and
-/// every member's failed test would count beside them — at once or seconds
-/// later, as the platform is quick or slow to refuse a closed loopback port.
+/// failures sessions told of: a test at the harness's URL (`NO_TEST`) fails,
+/// and every member's failed test would count beside them — at once, seconds
+/// later, or only after the count was read, as the machine refuses a
+/// connection to that port quickly, slowly, or takes it and never answers.
 const UNTESTED: &str = "test-url=http://[";
 
 /// What the book knows of each of `members` now.
@@ -79,7 +74,7 @@ async fn a_member_that_does_not_connect_hands_over_to_the_next() {
     let good = upstream(&origin).await;
     let proxies = format!(
         "Dead = socks5, 127.0.0.1, {}\nGood = socks5, 127.0.0.1, {}",
-        closed_port().await,
+        closed_tcp_port(),
         good.addr().port()
     );
     let h = harness(Profile {
@@ -114,7 +109,7 @@ async fn a_member_that_does_not_connect_hands_over_to_the_next() {
 async fn when_no_member_connects_the_session_fails_naming_them() {
     let mut proxies = String::new();
     for name in ["A", "B", "C", "D"] {
-        proxies += &format!("{name} = socks5, 127.0.0.1, {}\n", closed_port().await);
+        proxies += &format!("{name} = socks5, 127.0.0.1, {}\n", closed_tcp_port());
     }
     let h = harness(Profile {
         proxies: &proxies,
@@ -616,7 +611,7 @@ async fn a_udp_answer_is_reported() {
 async fn a_member_whose_udp_carrier_does_not_open_counts_against_it() {
     let proxies = format!(
         "Dead = socks5, 127.0.0.1, {}, udp-relay=true",
-        closed_port().await
+        closed_tcp_port()
     );
     let h = udp_smart("Dead", &proxies).await;
     let (echo, _) = udp_echo().await;
@@ -637,7 +632,7 @@ async fn a_member_whose_udp_carrier_does_not_open_counts_against_it() {
 async fn a_member_whose_udp_send_fails_counts_against_it() {
     let proxies = format!(
         "Refusing = vmess, 127.0.0.1, {}, username=0233d11c-15a4-47d3-ade3-48ffca0ce119, vmess-aead=true",
-        closed_port().await
+        closed_tcp_port()
     );
     let h = udp_smart("Refusing", &proxies).await;
     let (echo, _) = udp_echo().await;
@@ -729,7 +724,7 @@ async fn a_udp_flow_to_a_name_no_member_can_send_counts_against_nobody() {
 async fn udp_silence_counts_only_where_answers_always_come() {
     let quiet = FakeSocks5::spawn(Socks5Script::default()).await;
     let proxies = format!(
-        "Quiet = socks5, 127.0.0.1, {}, udp-relay=true",
+        "Quiet = socks5, 127.0.0.1, {}, udp-relay=true, {UNTESTED}",
         quiet.addr().port()
     );
     let h = udp_smart("Quiet", &proxies).await;
