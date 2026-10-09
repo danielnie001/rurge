@@ -2,6 +2,7 @@
 //! group's members come from, the relay it chains them through, and the
 //! testing options the automatic groups act on (M3b / M3c).
 
+use super::reader::{invalid_value, quotable, unknown_reference};
 use super::{NameKind, Secret};
 use crate::diagnostic::{Diagnostic, Severity, codes};
 use crate::policy::{Builtin, GroupKind, PolicyGroup};
@@ -165,11 +166,12 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// `E0018`. Never call this for a value that may carry a credential.
+    /// `E0018`. Never call this for a value that may carry a credential; the
+    /// value is quoted only when `quotable`.
     fn invalid(&mut self, key: &str, value: &str, expected: &str) {
         self.error(
             codes::E_INVALID_POLICY_PARAM,
-            format!("invalid value `{value}` for `{key}` (expected {expected})"),
+            invalid_value(key, value, expected),
         );
     }
 
@@ -297,7 +299,11 @@ fn read_import(
             Ok(pattern) => import.regex_filter = Some(pattern),
             Err(e) => r.error(
                 codes::E_INVALID_POLICY_PARAM,
-                format!("invalid `policy-regex-filter` `{value}`: {e}"),
+                if quotable(value) {
+                    format!("invalid `policy-regex-filter` `{value}`: {e}")
+                } else {
+                    format!("invalid `policy-regex-filter`: {e}")
+                },
             ),
         }
     }
@@ -329,7 +335,7 @@ fn read_import(
             if lookup(name) != Some(NameKind::Group) {
                 r.error(
                     codes::E_UNKNOWN_GROUP_MEMBER,
-                    format!("`include-other-group` references unknown policy group `{name}`"),
+                    unknown_reference("include-other-group", "policy group", name),
                 );
             }
         }
@@ -393,7 +399,7 @@ fn read_underlying(
         None => {
             r.error(
                 codes::E_UNKNOWN_POLICY_REF,
-                format!("`underlying-proxy` references unknown policy `{name}`"),
+                unknown_reference("underlying-proxy", "policy", name),
             );
             None
         }
@@ -612,6 +618,45 @@ icon-url=https://example.com/i.png, category=Media",
         );
     }
 
+    /// The value of a group's parameter is quoted by the rule a policy's
+    /// is: only when it can be what somebody wrote for that one key.
+    #[test]
+    fn a_value_another_field_slid_into_is_not_quoted() {
+        for (def, message) in [
+            (
+                "select, A, policy-path=a.txt, update-interval=0 psk=S3CR3T",
+                "policy group `G`: invalid value for `update-interval` (expected a positive number of seconds)",
+            ),
+            (
+                "select, A, include-all-proxies=true policy-path=https://sub.test/S3CR3T",
+                "policy group `G`: invalid value for `include-all-proxies` (expected true or false)",
+            ),
+            (
+                "url-test, A, interval=0 token=S3CR3T",
+                "policy group `G`: invalid value for `interval` (expected a positive number of seconds)",
+            ),
+            (
+                "select, A, policy-regex-filter=(HK policy-path=https://sub.test/S3CR3T",
+                "policy group `G`: invalid `policy-regex-filter`: Parsing error at position ",
+            ),
+            // what can be a value is quoted, as it was
+            (
+                "select, A, include-all-proxies=maybe",
+                "policy group `G`: invalid value `maybe` for `include-all-proxies` (expected true or false)",
+            ),
+            (
+                "select, A, policy-regex-filter=(",
+                "policy group `G`: invalid `policy-regex-filter` `(`: Parsing error at position ",
+            ),
+        ] {
+            let found = messages(def);
+            assert_eq!(found.len(), 1, "{def}: {found:?}");
+            assert_eq!(found[0].0, codes::E_INVALID_POLICY_PARAM);
+            assert!(found[0].1.starts_with(message), "{def}: {}", found[0].1);
+            assert!(!found[0].1.contains("S3CR3T"), "{}", found[0].1);
+        }
+    }
+
     #[test]
     fn values_that_cannot_be_used_are_errors() {
         for (def, message) in [
@@ -625,7 +670,7 @@ icon-url=https://example.com/i.png, category=Media",
             ),
             (
                 "select, external-policy-name-prefix=a=b",
-                "policy group `G`: invalid value `a=b` for `external-policy-name-prefix` (expected a prefix without `=`)",
+                "policy group `G`: invalid value for `external-policy-name-prefix` (expected a prefix without `=`)",
             ),
             (
                 "select, include-all-proxies=maybe",

@@ -498,3 +498,40 @@ Direct = select, Hop, underlying-proxy=DIRECT",
         ]
     );
 }
+
+/// A name a parameter refers to is quoted when it can be a name: a comma that
+/// is missing lets the next field slide into it (`Gone password=…`), as it
+/// does into a value.
+#[test]
+fn a_name_another_field_slid_into_is_not_quoted() {
+    let loaded = load(
+        "Entry = http, e.example, 80
+U1 = trojan, u.example, 443, password=p, underlying-proxy=Gone password=S3CR3T
+U2 = ssh, s.example, 22, username=root, private-key=nokey password=S3CR3T
+U3 = trojan, c.example, 443, password=p, client-cert=nocert password=S3CR3T
+U4 = trojan, d.example, 443, password=p, underlying-proxy=Gone",
+        "[Proxy Group]
+G1 = select, Entry, underlying-proxy=Gone password=S3CR3T
+G2 = select, Entry, include-other-group=nogroup password=S3CR3T
+G3 = select, Entry, include-other-group=nogroup",
+    );
+    let errors: Vec<(String, u32)> = loaded
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| (d.message.clone(), d.span.as_ref().unwrap().line))
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            ("policy `U1`: `underlying-proxy` references unknown policy".to_string(), 3),
+            ("policy `U2`: `private-key` references unknown keystore item".to_string(), 4),
+            ("policy `U3`: `client-cert` references unknown keystore item".to_string(), 5),
+            // a name that can be one is quoted, as it was
+            ("policy `U4`: `underlying-proxy` references unknown policy `Gone`".to_string(), 6),
+            ("policy group `G1`: `underlying-proxy` references unknown policy".to_string(), 8),
+            ("policy group `G2`: `include-other-group` references unknown policy group".to_string(), 9),
+            ("policy group `G3`: `include-other-group` references unknown policy group `nogroup`".to_string(), 10),
+        ]
+    );
+}

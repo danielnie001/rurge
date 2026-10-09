@@ -331,7 +331,7 @@ fn check_underlying(r: &mut ParamReader<'_>, common: &mut CommonOpts, env: &Spec
         None => r.error_on(
             "underlying-proxy",
             codes::E_UNKNOWN_POLICY_REF,
-            format!("`underlying-proxy` references unknown policy `{name}`"),
+            reader::unknown_reference("underlying-proxy", "policy", &name),
         ),
         // DIRECT is the absence of a chain
         Some(NameKind::Builtin(Builtin::Direct)) => common.underlying_proxy = None,

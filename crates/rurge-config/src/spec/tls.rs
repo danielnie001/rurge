@@ -127,7 +127,7 @@ pub(crate) fn read_tls(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> Tl
         match keystore.iter().find(|k| k.name == name) {
             None => r.error(
                 codes::E_KEYSTORE_REF,
-                format!("`client-cert` references unknown keystore item `{name}`"),
+                super::reader::unknown_reference("client-cert", "keystore item", name),
             ),
             Some(item) if item.kind != KeystoreType::P12 => r.error(
                 codes::E_KEYSTORE_REF,

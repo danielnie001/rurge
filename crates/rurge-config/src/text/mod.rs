@@ -68,18 +68,51 @@ impl Section {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Directive {
     pub raw: String,
     pub span: Span,
 }
 
-/// The first word of a `#!` line, the directive's name. What follows it can
-/// be a link that carries a token (a misspelt `#!MANAGED-CONFIG` is an
-/// unknown directive), so a diagnostic names the directive and quotes nothing
-/// more.
+/// The line as the redacted profile shows it: a link on a `#!` line can
+/// carry a token.
+impl std::fmt::Debug for Directive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Directive { raw, span } = self;
+        f.debug_struct("Directive")
+            .field("raw", &crate::redact::redact_line(raw))
+            .field("span", span)
+            .finish()
+    }
+}
+
+/// The name of a `#!` line: the `#!` and the run of ASCII letters, digits,
+/// `-` and `_` right after it, which can be empty. What follows can be a link
+/// that carries a token (a misspelt `#!MANAGED-CONFIG` is an unknown
+/// directive), glued to the name or not, so a diagnostic and the redacted
+/// profile both go by the name and by nothing more. `""` for a line that does
+/// not start with `#!`.
 pub(crate) fn directive_name(line: &str) -> &str {
-    line.split_whitespace().next().unwrap_or(line)
+    let Some(rest) = line.strip_prefix("#!") else {
+        return "";
+    };
+    let run = rest
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        .count();
+    &line[..2 + run]
+}
+
+/// What a diagnostic says of a `#!` line it ignores: the directive's name
+/// when that can be one. A run of letters, digits, `-` and `_` longer than
+/// 32 characters is no name anyone wrote, and is not quoted.
+pub(crate) fn unknown_directive(line: &str) -> String {
+    let name = directive_name(line);
+    if name.len().saturating_sub(2) <= 32 {
+        format!("unknown directive ignored: {name}")
+    } else {
+        "unknown directive ignored".to_string()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -256,11 +289,8 @@ pub fn parse_str(text: &str, file: Arc<Path>, origin: Origin) -> (Profile, Diagn
                     span,
                 }),
                 Some(_) => diags.push(
-                    Diagnostic::warning(
-                        codes::W_UNKNOWN_DIRECTIVE,
-                        format!("unknown directive ignored: {}", directive_name(trimmed)),
-                    )
-                    .at(span),
+                    Diagnostic::warning(codes::W_UNKNOWN_DIRECTIVE, unknown_directive(trimmed))
+                        .at(span),
                 ),
             }
             continue;
@@ -446,5 +476,65 @@ whatever = 1
         assert_eq!(p.sections.len(), 1);
         assert_eq!(p.sections[0].kind, SectionKind::Unknown);
         assert_eq!(p.sections[0].entries.len(), 1);
+    }
+
+    /// The name is the `#!` and the run of letters, digits, `-` and `_`
+    /// right after it: a link or a token glued to it, or a space in between,
+    /// does not make it longer.
+    #[test]
+    fn a_directive_is_named_by_the_run_after_its_hash_bang() {
+        for (line, name) in [
+            ("#!MANAGED-CONFIG https://x.test/y", "#!MANAGED-CONFIG"),
+            ("#!include a.conf", "#!include"),
+            ("#!", "#!"),
+            ("#! MANAGED-CONFIG https://x.test/y", "#!"),
+            ("#!MANAGED_CONFIG=https://x.test/y", "#!MANAGED_CONFIG"),
+            ("#!MANAGED-CONFIGhttps://x.test/y", "#!MANAGED-CONFIGhttps"),
+            ("#!a_b-9Z\u{200b}x", "#!a_b-9Z"),
+            ("#!é", "#!"),
+            ("not a directive", ""),
+        ] {
+            assert_eq!(directive_name(line), name, "{line:?}");
+        }
+    }
+
+    /// A diagnostic names the directive it ignores, and nothing of what
+    /// follows; a run longer than a name can be is no name anyone wrote.
+    #[test]
+    fn an_unknown_directive_is_named_only_when_that_can_be_a_name() {
+        let longest = "A".repeat(32);
+        let too_long = "A".repeat(33);
+        let (_, d) = parse(&format!(
+            "[General]\n#!{longest} x\n#!{too_long} x\n#! x\n#!MANAGED_CONFIG=https://x.test/S3CR3T\n#!MANAGED-CONFIG https://x.test/S3CR3T\n"
+        ));
+        let messages: Vec<String> = d.into_vec().into_iter().map(|d| d.message).collect();
+        assert_eq!(
+            messages,
+            [
+                format!("unknown directive ignored: #!{longest}"),
+                "unknown directive ignored".to_string(),
+                "unknown directive ignored: #!".to_string(),
+                "unknown directive ignored: #!MANAGED_CONFIG".to_string(),
+                "unknown directive ignored: #!MANAGED-CONFIG".to_string(),
+            ]
+        );
+    }
+
+    /// `Profile` is public and holds its header: its `Debug` shows a line as
+    /// the redacted profile does.
+    #[test]
+    fn a_directive_shows_its_line_as_the_redacted_profile_would() {
+        let (p, _) = parse(
+            "#!MANAGED-CONFIG https://x.test/S3CR3T interval=60\n#!MANAGED_CONFIG=https://x.test/S3CR3T\n#!NOTE\n[General]\n",
+        );
+        let shown = format!("{:?}", p.header);
+        assert!(!shown.contains("S3CR3T"), "{shown}");
+        assert!(
+            shown.contains("#!MANAGED-CONFIG *** interval=60"),
+            "{shown}"
+        );
+        assert!(shown.contains("#!MANAGED_CONFIG***"), "{shown}");
+        assert!(shown.contains("#!NOTE"), "{shown}");
+        assert!(!format!("{p:?}").contains("S3CR3T"));
     }
 }

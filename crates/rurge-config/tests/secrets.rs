@@ -13,12 +13,16 @@ const UUID: &str = "5ec4e75e-c4e7-45ec-8e75-ec4e75ec4e75";
 const KEY: &str = "S3CR3TS3CR3TS3CR3TS3CR3TS3CR3TS3CR3TS3CR3TQ=";
 /// 16 bytes of it: a Shadowsocks 2022 key.
 const KEY_16: &str = "S3CR3TS3CR3TS3CR3TS3CQ==";
+/// 32 bytes of it, behind the quotes of a whole item.
+const KEY_QUOTED: &str = "S3CR3TquotedquotedquotedquotedquotedquotedQ=";
 /// A peer's public key is no secret.
 const PUBLIC: &str = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU=";
 
 fn profile() -> String {
     format!(
-        "#!MANAGED-CONFIG https://sub.example/managed/{MARKER}-managedpath?token={MARKER}-managed interval=43200 strict=true
+        "\u{feff}#!MANAGED-CONFIG https://sub.example/managed/{MARKER}-managedpath?token={MARKER}-managed interval=43200 strict=true
+#!MANAGED_CONFIG https://sub.example/link/{MARKER}-lookalike?surge=4
+#!MANAGED-CONFIG interval=43200 https://sub.example/managed/{MARKER}-notfirst?token={MARKER}-notfirsttoken
 [General]
 http-api = {MARKER}-a@{MARKER}-pi@127.0.0.1:6171
 external-controller-access = {MARKER}-eca@127.0.0.1:6170
@@ -52,18 +56,23 @@ Ext = external, exec=/bin/true, local-port=1080, args={MARKER}-args
 Shadow = trojan, st.example, 443, password={MARKER}-st, shadow-tls-password={MARKER}-shadow, shadow-tls-version=3, shadow-tls-sni=st.example
 Tested = http, tested.example, 80, test-url=http://t.example/?token={MARKER}-testurl
 Ts = tailscale, section-name=ts
+Ideo = trojan, i.example, 443,\u{3000}password={MARKER}-ideographic
+ExtQ = external, exec=/bin/true, local-port=1081, \"args=-p {MARKER}-quotedargs\"
 
 [Proxy Group]
 G = select, Http, policy-path=https://sub.example/list?token={MARKER}-sub, external-policy-modifier=\"password={MARKER}-modifier\"
 Old = url-test, Http, url=http://t.example/?token={MARKER}-groupurl
+GQ = select, Http, \"policy-path=https://sub.example/list?token={MARKER}-quotedpath\"
 
 [Keystore]
 cert = type=p12, password={MARKER}-p12, base64={MARKER}{MARKER}
+certq = type=p12, \"password={MARKER}-quotedp12\", base64={MARKER}Quoted
 
 [WireGuard Home]
 private-key = {KEY}
 self-ip = 10.0.0.2
 peer = (public-key = {PUBLIC}, preshared-key = {KEY}, allowed-ips = 0.0.0.0/0, endpoint = wg.example:51820)
+peer = (public-key = {PUBLIC}, \"preshared-key={KEY_QUOTED}\", allowed-ips = 10.1.0.0/16, endpoint = wg2.example:51820)
 
 [Tailscale ts]
 auth-key = tskey-{MARKER}-tailscale
@@ -73,6 +82,7 @@ ca-passphrase = {MARKER}-ca
 ca-p12 = {MARKER}{MARKER}{MARKER}
 
 [Rule]
+#!include https://sub.example/rules/{MARKER}-include.conf?token={MARKER}-includetoken
 FINAL,DIRECT
 "
     )
@@ -103,6 +113,7 @@ fn the_profile_loads() {
     for name in [
         "Http", "Https", "Socks", "Trojan", "Vmess", "AnyTls", "Ss", "Ss2022", "SsStream", "Snell",
         "Hy2", "TuicV5", "Tuic", "Masque", "Tt", "H2", "Ssh", "Wg", "Ext", "Shadow", "Tested",
+        "Ideo", "ExtQ",
     ] {
         assert!(loaded.config.spec(name).is_some(), "{name}");
     }
@@ -135,8 +146,9 @@ fn the_redacted_profile_holds_no_secret() {
 #[test]
 fn a_diagnostic_of_a_mistyped_general_value_holds_no_secret() {
     let text = format!(
-        "#!MANAGED-CONFIG https://sub.example/managed/{MARKER}-managedurl interval=43200 token={MARKER}-managedparam {MARKER}-bare https://other.example/{MARKER}-pasted?a=b
+        "#!MANAGED-CONFIG https://sub.example/managed/{MARKER}-managedurl interval=43200 token={MARKER}-managedparam {MARKER}-bare https://other.example/{MARKER}-pasted?a=b {MARKER}Zm9vYmFy=
 #!MANAGED_CONFIG https://sub.example/link/{MARKER}-directive?surge=4
+#!MANAGED_CONFIG=https://sub.example/link/{MARKER}-glued?surge=4
 [General]
 #!MANAGED_CONFIG https://sub.example/link/{MARKER}-inside?surge=4
 dns-server = htps://al1ce:{MARKER}-one@dns.example/dns-query
@@ -147,7 +159,17 @@ external-controller-access = {MARKER}-five@api.example:6170
 http-listen = {MARKER}-six@listen.example:6152
 socks5-listen = {MARKER}-seven@127.0.0.1:6153
 wifi-access-http-auth = {MARKER}-eight
+[Proxy]
+Slid = snell, sn.example, 443, psk=pw, version=4 psk={MARKER}-slid
+Slid2 = trojan, t.example, 443, password=pw, tfo=true password={MARKER}-slid2
+Slid3 = trojan, t.example, 443, password=pw, underlying-proxy=Gone password={MARKER}-slid3
+Slid4 = ssh, ssh.example, 22, username=root, private-key=nokey password={MARKER}-slid4
+Slid5 = trojan, t.example, 443, password=pw, client-cert=nocert password={MARKER}-slid5
+[Proxy Group]
+SlidG = select, Slid3, underlying-proxy=Gone password={MARKER}-slid6
+SlidH = select, Slid3, include-other-group=gone password={MARKER}-slid7
 [Rule]
+#!include https://sub.example/rules/{MARKER}-remoteinclude.conf
 FINAL,DIRECT
 "
     );
@@ -169,8 +191,15 @@ FINAL,DIRECT
         "***@127.0.0.1:6153",
         "`wifi-access-http-auth`",
         "unknown MANAGED-CONFIG parameter `token`",
-        "unknown MANAGED-CONFIG parameter (not written as `name=value`)",
+        "unknown MANAGED-CONFIG parameter (not written as a lower-case `name=value`)",
         "unknown directive ignored: #!MANAGED_CONFIG",
+        "remote include not supported yet",
+        "invalid value for `version` (expected an integer from 1 to 6)",
+        "invalid value for `tfo` (expected true or false)",
+        "`underlying-proxy` references unknown policy",
+        "`private-key` references unknown keystore item",
+        "`client-cert` references unknown keystore item",
+        "`include-other-group` references unknown policy group",
     ] {
         assert!(
             messages.iter().any(|m| m.contains(told)),

@@ -2,6 +2,8 @@
 //! design §4.3): secrets become `***`, everything else (including line count)
 //! is preserved so line numbers in diagnostics still line up.
 
+use crate::value::{parse_key_value, split_list};
+
 /// Keys whose whole value is a secret when they stand alone on a line
 /// (`[WireGuard]` `private-key`, `[Snell Server]` `psk`, `[Tailscale]`
 /// `auth-key`, …). `[General]`'s two test URLs are among them as a policy's
@@ -120,9 +122,28 @@ pub(crate) fn redact_line(line: &str) -> String {
 }
 
 fn redact_body(line: &str) -> String {
-    if let Some(managed) = redact_managed(line) {
-        return managed;
+    if let Some((lead, MANAGED_CONFIG, words)) = split_hash_bang(line) {
+        return format!("{lead}{MANAGED_CONFIG}{}", each_word(words, managed_word));
     }
+    // a requirement directive stands in front of a line of the profile, which
+    // is redacted as any other; a link is hidden wherever it is left
+    let shown = redact_entry(line);
+    match split_hash_bang(&shown) {
+        Some((lead, name, words)) => {
+            let words = if name == "#!include" {
+                hide_include_links(words)
+            } else {
+                each_word(words, link_hidden)
+            };
+            format!("{lead}{name}{words}")
+        }
+        None => shown,
+    }
+}
+
+/// `key = value` lines: the keys that are secrets, the lists of addresses
+/// that may hold a user name and a password, and the definitions of policies.
+fn redact_entry(line: &str) -> String {
     let Some((key, value)) = line.split_once('=') else {
         return line.to_string();
     };
@@ -163,23 +184,82 @@ fn redact_body(line: &str) -> String {
     format!("{key}={}", redact_definition(value))
 }
 
-/// `#!MANAGED-CONFIG <link> …` with the link — the first word after the
-/// directive, as `parse_managed` reads it — replaced by `***`: the one a
-/// provider issues carries the subscription token. The directive is a word of
-/// its own; a longer one that only starts like it is another directive and,
-/// like every other `#!` line, left alone.
-fn redact_managed(line: &str) -> Option<String> {
-    let rest = line.trim_start().strip_prefix("#!MANAGED-CONFIG")?;
-    let link = rest.trim_start();
-    if link.len() == rest.len() || link.is_empty() {
+/// The directive of a profile a provider issues, whose line carries the
+/// subscription's link, and a token with it.
+const MANAGED_CONFIG: &str = "#!MANAGED-CONFIG";
+
+/// A `#!` line in three parts: what stands in front of the `#!` (white space
+/// and byte-order marks, such as a file saved by Notepad starts with), the
+/// directive's name, and the rest of the line. The profile is read by this
+/// shape and not by what a parser makes of it: a directive spelt a little
+/// differently, one with a link glued to it, or a requirement directive in
+/// front of a line of the profile is a `#!` line all the same.
+fn split_hash_bang(line: &str) -> Option<(&str, &str, &str)> {
+    let body = line.trim_start_matches(|c: char| c == '\u{feff}' || c.is_whitespace());
+    if !body.starts_with("#!") {
         return None;
     }
-    let end = link.find(char::is_whitespace).unwrap_or(link.len());
-    Some(format!(
-        "{}***{}",
-        &line[..line.len() - link.len()],
-        &link[end..]
-    ))
+    let (lead, body) = line.split_at(line.len() - body.len());
+    let name = crate::text::directive_name(body);
+    Some((lead, name, &body[name.len()..]))
+}
+
+/// `text` with each of its white-space-separated words replaced by what
+/// `shown` makes of it. The white space between them stays as it was: it can
+/// be a tab, a no-break space or a `\r`.
+fn each_word(text: &str, shown: impl Fn(&str) -> String) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let space = rest.len() - rest.trim_start().len();
+        out.push_str(&rest[..space]);
+        rest = &rest[space..];
+        let word = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        if word > 0 {
+            out.push_str(&shown(&rest[..word]));
+        }
+        rest = &rest[word..];
+    }
+    out
+}
+
+/// Of the words that follow `#!MANAGED-CONFIG` only the two parameters the
+/// format has, written plainly, are shown: the link stands wherever the
+/// profile has it, and a word that is none of those can be a token.
+fn managed_word(word: &str) -> String {
+    let plain = match word.split_once('=') {
+        Some(("interval", value)) => !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()),
+        Some(("strict", value)) => {
+            !value.is_empty() && value.bytes().all(|b| b.is_ascii_alphabetic())
+        }
+        _ => false,
+    };
+    if plain { word } else { "***" }.to_string()
+}
+
+/// On any other `#!` line a word with `://` in it is a link.
+fn link_hidden(word: &str) -> String {
+    if word.contains("://") { "***" } else { word }.to_string()
+}
+
+/// The targets of `#!include` are a list separated by commas, and a path with
+/// a space in it can be quoted: a target with `://` in it is a link, a local
+/// path stays.
+fn hide_include_links(targets: &str) -> String {
+    split_top_level(targets)
+        .into_iter()
+        .map(|target| {
+            if target.contains("://") {
+                let rest = target.trim_start();
+                let lead = &target[..target.len() - rest.len()];
+                let trail = &rest[rest.trim_end().len()..];
+                format!("{lead}***{trail}")
+            } else {
+                target.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Where the credential of `item` ends: its last `@`, as the parsers split
@@ -224,13 +304,81 @@ pub fn url_without_credentials(url: &str) -> String {
 
 /// A policy definition (the text right of `name =`) with its secrets blanked:
 /// the positional values of every type that takes a server and a port, and
-/// every secret `name=value` parameter.
+/// every secret `name=value` parameter, however the line spells it.
 pub fn redact_definition(definition: &str) -> String {
-    let mut redacted = redact_positional_credentials(definition);
-    for param in SECRET_PARAMS {
-        redacted = redact_param(&redacted, param);
+    redact_items(&redact_positional_credentials(definition), 0)
+}
+
+/// How many parenthesised groups deep `redact_items` follows. A `[WireGuard]`
+/// peer is one and no parser reads a group inside a group as anything but a
+/// value; deeper than this the search by name still runs, and a line of
+/// ten thousand parentheses costs a few levels, not a stack.
+const MAX_GROUP_DEPTH: usize = 4;
+
+/// `text`, a list of items, with every item redacted. The items are the
+/// parsers' own (`split_top_level` is `split_list`'s state machine) and the
+/// commas between them stay.
+fn redact_items(text: &str, depth: usize) -> String {
+    split_top_level(text)
+        .into_iter()
+        .map(|item| redact_item(item, depth))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// One item, the way the parsers read it: `split_list` takes the quotes off
+/// an item that is wholly in them, `parse_key_value` splits what is left at
+/// its first `=`, and both trim whatever `char::is_whitespace` knows.
+///
+/// - A parameter whose name is a secret one loses its value. Written plainly
+///   it keeps its own spacing and name; from inside quotes only the name
+///   is left, `name=***`.
+/// - A parenthesised group, which is how a `[WireGuard]` peer is written
+///   (`wireguard.rs` takes the parentheses off and splits what is inside),
+///   has its items redacted the same way.
+/// - Anything else goes through the search by name, which finds a secret
+///   wherever one stands in the text: what the parsers read as one value (an
+///   item with a quote left open, say) can hold a secret parameter of its own.
+fn redact_item(item: &str, depth: usize) -> String {
+    let rest = item.trim_start();
+    let lead = &item[..item.len() - rest.len()];
+    let body = rest.trim_end();
+    let trail = &rest[body.len()..];
+    let Some(field) = split_list(item).pop() else {
+        // nothing in it: an empty item, or one made of nothing but quotes
+        return item.to_string();
+    };
+    if depth < MAX_GROUP_DEPTH {
+        let inside = group_inside(body).or_else(|| group_inside(&field));
+        if let Some(inside) = inside {
+            let redacted = redact_items(inside, depth + 1);
+            // a group that is wholly in quotes loses them only for a secret
+            return if redacted == inside {
+                item.to_string()
+            } else {
+                format!("{lead}({redacted}){trail}")
+            };
+        }
     }
-    redacted
+    let secret = parse_key_value(&field)
+        .map(|(key, _)| key)
+        .filter(|key| SECRET_PARAMS.contains(&key.to_ascii_lowercase().as_str()));
+    match (secret, body.split_once('=')) {
+        (Some(key), Some((name, value))) if name.trim() == key => {
+            let blank = &value[..value.len() - value.trim_start().len()];
+            format!("{lead}{name}={blank}***{trail}")
+        }
+        (Some(key), _) => format!("{lead}{key}=***{trail}"),
+        (None, _) => SECRET_PARAMS
+            .iter()
+            .fold(item.to_string(), |text, param| redact_param(&text, param)),
+    }
+}
+
+/// What stands between the parentheses of a group, as `wireguard.rs` takes
+/// a peer apart.
+fn group_inside(item: &str) -> Option<&str> {
+    item.trim().strip_prefix('(')?.strip_suffix(')')
 }
 
 /// For a `SERVER_PROXY_TYPES` policy line, blanks every positional token from
@@ -348,9 +496,14 @@ fn redact_param(value: &str, param: &str) -> String {
     while let Some(pos) = lower[search..].find(param) {
         let start = search + pos;
         // must be at a token boundary followed by optional spaces and '=';
-        // `(` is one too: a group's first item has nothing but it in front
-        let before_ok =
-            start == 0 || matches!(lower.as_bytes()[start - 1], b',' | b' ' | b'\t' | b'(');
+        // `(` is one too: a group's first item has nothing but it in front.
+        // The parsers trim any Unicode whitespace, so does the boundary. A
+        // quote is none: `"password=a,b"` would be cut at its comma, an
+        // item that is wholly in quotes is `redact_item`'s
+        let before_ok = lower[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| matches!(c, ',' | '(') || c.is_whitespace());
         let after = &value[start + param.len()..];
         let eq = after.trim_start().strip_prefix('=');
         match (before_ok, eq) {
@@ -745,11 +898,12 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
     }
 
     /// A profile issued by a provider starts with `#!MANAGED-CONFIG <link> …`,
-    /// and the link carries the subscription token: the directive and its
-    /// parameters stay, the link — the first word after the directive, as
-    /// `parse_managed` reads it — goes.
+    /// and the link carries the subscription token: the directive stays, and
+    /// of the words after it only `interval=` with digits and `strict=` with
+    /// letters; the link wherever it stands, a second one, a stray `token=`
+    /// go, with whatever else is there.
     #[test]
-    fn a_managed_config_line_loses_its_link() {
+    fn a_managed_config_line_shows_nothing_but_its_interval_and_strictness() {
         for (line, shown) in [
             (
                 "#!MANAGED-CONFIG https://provider.test/link/t0k3n?surge=4 interval=43200 strict=true",
@@ -764,21 +918,58 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
                 "  #!MANAGED-CONFIG\thttps://provider.test/t0k3n  strict=true\r",
                 "  #!MANAGED-CONFIG\t***  strict=true\r",
             ),
+            (
+                "#!MANAGED-CONFIG\u{a0}https://provider.test/t0k3n\u{a0}strict=true\r",
+                "#!MANAGED-CONFIG\u{a0}***\u{a0}strict=true\r",
+            ),
+            (
+                "#!MANAGED-CONFIG https://provider.test/t0k3n\r\r",
+                "#!MANAGED-CONFIG ***\r\r",
+            ),
+            // a file saved with a byte-order mark, as Notepad does
+            (
+                "\u{feff}#!MANAGED-CONFIG https://provider.test/t0k3n?surge=4 interval=60",
+                "\u{feff}#!MANAGED-CONFIG *** interval=60",
+            ),
+            (
+                "\u{feff}  #!MANAGED-CONFIG https://provider.test/t0k3n",
+                "\u{feff}  #!MANAGED-CONFIG ***",
+            ),
+            // as many marks and spaces as there are, in either order
+            (
+                "\u{feff}\u{feff}#!MANAGED-CONFIG https://provider.test/t0k3n",
+                "\u{feff}\u{feff}#!MANAGED-CONFIG ***",
+            ),
+            (
+                "\u{3000}\u{feff}\u{a0}#!MANAGED-CONFIG https://provider.test/t0k3n",
+                "\u{3000}\u{feff}\u{a0}#!MANAGED-CONFIG ***",
+            ),
+            // the link is not the first word, or there are two, or a word
+            // that is no parameter
+            (
+                "#!MANAGED-CONFIG interval=60 https://provider.test/t0k3n strict=true",
+                "#!MANAGED-CONFIG interval=60 *** strict=true",
+            ),
+            (
+                "#!MANAGED-CONFIG https://a.test/t0k3n https://b.test/t0k3n2",
+                "#!MANAGED-CONFIG *** ***",
+            ),
+            (
+                "#!MANAGED-CONFIG https://provider.test/x token=t0k3n interval=60",
+                "#!MANAGED-CONFIG *** *** interval=60",
+            ),
+            (
+                "#!MANAGED-CONFIG interval=60 sub.test/t0k3n \"https://q.test/t0k3n\"",
+                "#!MANAGED-CONFIG interval=60 *** ***",
+            ),
+            // a parameter is shown in its plain form only
+            (
+                "#!MANAGED-CONFIG https://p.test/x interval=abc123 strict=t0k3n interval=60 strict=false Interval=60 interval= interval=6 0",
+                "#!MANAGED-CONFIG *** *** *** interval=60 strict=false *** *** interval=6 ***",
+            ),
             // no link: nothing to hide
             ("#!MANAGED-CONFIG", "#!MANAGED-CONFIG"),
             ("#!MANAGED-CONFIG  \r", "#!MANAGED-CONFIG  \r"),
-            // other `#!` lines are left alone, a longer word that only starts
-            // like the directive too: the word after it is no link in any
-            // reading of the format (`parse_managed`, which takes the
-            // directive by its prefix, reads the `X` of this one as the link)
-            (
-                "#!FORBIDDEN-AUTO-UPGRADE smart-group",
-                "#!FORBIDDEN-AUTO-UPGRADE smart-group",
-            ),
-            (
-                "#!MANAGED-CONFIGX https://provider.test/t0k3n interval=60",
-                "#!MANAGED-CONFIGX https://provider.test/t0k3n interval=60",
-            ),
         ] {
             assert_eq!(redact_profile(line), shown, "{line:?}");
         }
@@ -788,6 +979,118 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
             ),
             "#!MANAGED-CONFIG *** interval=60\r\n[General]\r\nloglevel = notify\r\n"
         );
+    }
+
+    /// Every `#!` line is read by its shape: the name, and a word with `://`
+    /// in it is a link whoever the directive is. A name that is spelled a
+    /// little differently is another directive, and so is one with something
+    /// glued to it; neither is `#!MANAGED-CONFIG`, and both lose their links.
+    #[test]
+    fn a_look_alike_of_the_managed_config_line_loses_its_link_too() {
+        for (line, shown) in [
+            (
+                "#!MANAGED_CONFIG https://provider.test/t0k3n?surge=4",
+                "#!MANAGED_CONFIG ***",
+            ),
+            (
+                "#!managed-config https://provider.test/t0k3n",
+                "#!managed-config ***",
+            ),
+            (
+                "#! MANAGED-CONFIG https://provider.test/t0k3n",
+                "#! MANAGED-CONFIG ***",
+            ),
+            (
+                "#!MANAGED-CONFIGX https://provider.test/t0k3n interval=60",
+                "#!MANAGED-CONFIGX *** interval=60",
+            ),
+            (
+                "#!MANAGED_CONFIG=https://provider.test/t0k3n",
+                "#!MANAGED_CONFIG***",
+            ),
+            (
+                "#!MANAGED-CONFIGhttps://provider.test/t0k3n",
+                "#!MANAGED-CONFIGhttps***",
+            ),
+            // glued to the exact name, `parse_managed` takes it for the link
+            (
+                "#!MANAGED-CONFIG=https://provider.test/t0k3n interval=60",
+                "#!MANAGED-CONFIG*** interval=60",
+            ),
+            (
+                "#!MANAGED-CONFIG.provider.test/t0k3n",
+                "#!MANAGED-CONFIG***",
+            ),
+            (
+                "#!Managed-Config https://p.test/t0k3n",
+                "#!Managed-Config ***",
+            ),
+            (
+                "#!MANAGED-CONFIG\u{200b} https://p.test/t0k3n",
+                "#!MANAGED-CONFIG*** ***",
+            ),
+        ] {
+            assert_eq!(redact_profile(line), shown, "{line:?}");
+        }
+    }
+
+    /// A remote include is a link on a `#!include` line, one target of a list
+    /// separated by commas; a local path stays.
+    #[test]
+    fn a_remote_include_loses_its_link_and_a_local_one_stays() {
+        for (line, shown) in [
+            (
+                "#!include a.conf, https://h.example/p?token=t0k3n",
+                "#!include a.conf, ***",
+            ),
+            ("#!include https://h.example/p?token=t0k3n", "#!include ***"),
+            (
+                "#!include \"my list.conf\", \"https://h.example/a b?token=t0k3n\" , b.conf",
+                "#!include \"my list.conf\", *** , b.conf",
+            ),
+            (
+                "#!include conf=1/a.conf, b.conf",
+                "#!include conf=1/a.conf, b.conf",
+            ),
+            ("#!include", "#!include"),
+            // another spelling of the directive is no include: its words
+            ("#!INCLUDE a.conf,https://h.example/t0k3n", "#!INCLUDE ***"),
+            ("#!includehttps://h.example/t0k3n", "#!includehttps***"),
+        ] {
+            assert_eq!(redact_profile(line), shown, "{line:?}");
+        }
+    }
+
+    /// Lines with nothing to hide stay as written: a directive without a link,
+    /// and a line that only has `#!` in its middle, which is no directive line.
+    /// A requirement directive in front of a line of the profile does not take
+    /// the line's own redaction away.
+    #[test]
+    fn what_has_no_link_stays_as_written() {
+        for line in [
+            "#!",
+            "#!FORBIDDEN-AUTO-UPGRADE smart-group",
+            "#!SOMETHING-ELSE",
+            "#!REQUIREMENT CORE_VERSION>=20",
+            "#!MACOS-ONLY DOMAIN,a.com,REJECT",
+            "loglevel = notify #!MANAGED-CONFIG https://provider.test/t0k3n",
+            "DOMAIN,a.com,REJECT #!MACOS-ONLY",
+            "  # #!MANAGED-CONFIG https://provider.test/t0k3n",
+        ] {
+            assert_eq!(redact_profile(line), line, "{line:?}");
+        }
+        for (line, shown) in [
+            (
+                "#!MACOS-ONLY Hk = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=x1",
+                "#!MACOS-ONLY Hk = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=***",
+            ),
+            (
+                "#!IOS-ONLY G = select, A, policy-path=https://sub.test/n?token=t0k3n",
+                "#!IOS-ONLY G = select, A, policy-path=***",
+            ),
+        ] {
+            assert_eq!(redact_profile(line), shown, "{line:?}");
+        }
     }
 
     /// Every `args` of an `external` line, quoted or not (M4-D12).
@@ -887,5 +1190,567 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
             redact_profile("M = masque, example.com, 443, hunter2, username=user, password=s3cret"),
             "M = masque, example.com, 443, ***, username=***, password=***"
         );
+    }
+
+    // What the parsers read as a secret parameter is hidden, however the
+    // item is written.
+
+    /// Values that are nothing but distinctive: whatever of them is in an
+    /// output is a leak.
+    const V: &str = "Zq9kV7xM";
+    const W: &str = "Wp4nT2yR";
+    /// A WireGuard peer's keys are Base64 of 32 bytes.
+    const PSK: &str = "Zq9kV7xMZq9kV7xMZq9kV7xMZq9kV7xMZq9kV7xMZq8=";
+    const PUBLIC: &str = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=";
+    const PRIVATE: &str = "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=";
+    /// Harmless items to stand beside the secret one: a plain one and a
+    /// quoted one with a comma in it.
+    const NEIGHBOURS: [&str; 2] = ["tfo=true", "\"sni=a.test,b.test\""];
+    /// Where the secret item (`S`) stands among the neighbours (`0`, `1`).
+    const ARRANGEMENTS: [&[&str]; 5] = [
+        &["S"],
+        &["0", "S", "1"],
+        &["1", "S", "0"],
+        &["0", "1", "S"],
+        &["S", "0"],
+    ];
+
+    fn span() -> crate::span::Span {
+        crate::span::Span::new(std::sync::Arc::from(std::path::Path::new("r.conf")), 1)
+    }
+
+    /// One way to write a parameter between two commas, the value the parser
+    /// reads from it, and whether it leaves a quote open (the rest of the
+    /// line is its value then, so nothing can follow).
+    struct Spelling {
+        text: String,
+        value: String,
+        open: bool,
+    }
+
+    fn spellings(name: &str) -> Vec<Spelling> {
+        let upper = name.to_ascii_uppercase();
+        let both = format!("{V},{W}");
+        let spelling = |text: String, value: &str| Spelling {
+            text,
+            value: value.to_string(),
+            open: false,
+        };
+        vec![
+            spelling(format!("{name}={V}"), V),
+            spelling(format!("{name} = {V} "), V),
+            spelling(format!("{upper}={V}"), V),
+            spelling(format!("\"{name}={V}\""), V),
+            spelling(format!("'{name}={V}'"), V),
+            spelling(format!("\"{name}={both}\""), &both),
+            spelling(format!("{name}=\"{both}\""), &both),
+            spelling(format!("\u{3000}{name}={V}"), V),
+            spelling(format!("\u{a0}{name}={V}"), V),
+            spelling(format!("{name}={V}\u{3000}"), V),
+            // more of what the parser takes
+            spelling(format!("'{name}={both}'"), &both),
+            spelling(format!("{name}='{both}'"), &both),
+            spelling(format!("\"{upper} = {V}\""), V),
+            spelling(format!("{name}\t=\t{V}"), V),
+            spelling(format!("{name}\u{3000}=\u{3000}{V}"), V),
+            spelling(format!("\u{2003}{name} = \"{both}\"\u{a0}"), &both),
+            spelling(format!("{name}=\"{V}\\\"{W}\""), &format!("{V}\"{W}")),
+            spelling(format!("{name}=a\"{both}\"b"), &format!("a\"{both}\"b")),
+            spelling(format!("{name}=a({both})b"), &format!("a({both})b")),
+            Spelling {
+                text: format!("{name}=\"{both}"),
+                value: format!("\"{both}"),
+                open: true,
+            },
+        ]
+    }
+
+    /// A spelling with the name and the values taken out: what its leak is
+    /// called in a failure message.
+    fn shape(text: &str, name: &str) -> String {
+        let upper = name.to_ascii_uppercase();
+        let shape = text
+            .replace(name, "name")
+            .replace(&upper, "NAME")
+            .replace(V, "v")
+            .replace(W, "w");
+        format!("{shape:?}")
+    }
+
+    /// How many lines of each head and shape went wrong, and the first few.
+    fn summary(kinds: &[String], lines: &[String]) -> String {
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for kind in kinds {
+            *counts.entry(kind).or_default() += 1;
+        }
+        format!(
+            "{} lines go wrong, by kind: {counts:#?}, the first of them: {:#?}",
+            kinds.len(),
+            &lines[..lines.len().min(8)]
+        )
+    }
+
+    /// `slots` of `ARRANGEMENTS` as the items between the commas.
+    fn arranged(slots: &[&str], secret: &str, neighbours: &[&str; 2]) -> Vec<String> {
+        slots
+            .iter()
+            .map(|slot| match *slot {
+                "S" => secret.to_string(),
+                n => neighbours[n.parse::<usize>().unwrap()].to_string(),
+            })
+            .collect()
+    }
+
+    /// For every head, every secret name and every spelling of its item,
+    /// alone and among harmless ones: the parser reads the name with that
+    /// value, and the redacted text then has none of the value. The parser
+    /// goes first, so that the spellings are no wishful thinking.
+    #[test]
+    fn whatever_the_parser_reads_as_a_secret_parameter_is_hidden_however_it_is_written() {
+        const HEADS: [(&str, bool); 7] = [
+            ("trojan, t.test, 443", false),
+            ("http, h.test, 80", false),
+            ("external", false),
+            ("external, exec=/bin/x, local-port=1080", false),
+            ("direct", false),
+            ("select, A, B", true),
+            ("url-test, A, B", true),
+        ];
+        let mut checked = 0usize;
+        let mut unread: Vec<String> = Vec::new();
+        let mut kinds: Vec<String> = Vec::new();
+        let mut leaked: Vec<String> = Vec::new();
+        for (head, group) in HEADS {
+            let server = SERVER_PROXY_TYPES.contains(&head.split(',').next().unwrap().trim());
+            for name in SECRET_PARAMS {
+                for spelling in spellings(name) {
+                    for slots in ARRANGEMENTS {
+                        if spelling.open && slots.last() != Some(&"S") {
+                            continue;
+                        }
+                        for pad in ["", " "] {
+                            let items = arranged(slots, &spelling.text, &NEIGHBOURS);
+                            let line = format!(
+                                "{head}{}",
+                                items
+                                    .iter()
+                                    .map(|i| format!(",{pad}{i}"))
+                                    .collect::<String>()
+                            );
+                            // the parser first
+                            let (read, shown) = if group {
+                                match crate::policy::parse_group("G", &line, &span()) {
+                                    Ok(g) => (
+                                        g.params
+                                            .get_all(name)
+                                            .iter()
+                                            .map(|v| v.to_string())
+                                            .collect(),
+                                        format!("{g:?}"),
+                                    ),
+                                    Err(_) => (Vec::new(), String::new()),
+                                }
+                            } else {
+                                match crate::policy::parse_policy("P", &line, &span()) {
+                                    Ok(p) => (
+                                        p.params
+                                            .get_all(name)
+                                            .iter()
+                                            .map(|v| v.to_string())
+                                            .collect(),
+                                        format!("{p:?}"),
+                                    ),
+                                    Err(_) => (Vec::new(), String::new()),
+                                }
+                            };
+                            let read: Vec<String> = read;
+                            if !read.contains(&spelling.value) {
+                                unread.push(line);
+                                continue;
+                            }
+                            checked += 1;
+                            let out = redact_definition(&line);
+                            let mut bad = Vec::new();
+                            for secret in [V, W] {
+                                if out.contains(secret) {
+                                    bad.push(format!("shows {secret}"));
+                                }
+                                if shown.contains(secret) {
+                                    bad.push(format!("Debug shows {secret}"));
+                                }
+                            }
+                            // the neighbours stay as written, but for a quoted
+                            // one on a line of a type that takes a server: it is
+                            // a positional value there, and those go whole
+                            for slot in slots.iter().filter(|s| **s != "S") {
+                                let n = NEIGHBOURS[slot.parse::<usize>().unwrap()];
+                                let expected = if server && n.starts_with('"') {
+                                    format!(",{pad}***")
+                                } else {
+                                    format!(",{pad}{n}")
+                                };
+                                if !out.contains(&expected) {
+                                    bad.push(format!("lost {n}"));
+                                }
+                            }
+                            // one rule, two entry points
+                            if redact_profile(&format!("X = {line}")) != format!("X = {out}") {
+                                bad.push("the profile endpoint differs".to_string());
+                            }
+                            // and what is redacted is redacted
+                            if redact_definition(&out) != out {
+                                bad.push("redacting it again changes it".to_string());
+                            }
+                            if !bad.is_empty() {
+                                kinds.push(format!("{head} | {}", shape(&spelling.text, name)));
+                                leaked.push(format!("{line:?} -> {out:?}: {}", bad.join(", ")));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("{checked} lines read by the parser and redacted");
+        assert!(
+            unread.is_empty(),
+            "{} lines the parser does not read as generated, the first of them: {:#?}",
+            unread.len(),
+            &unread[..unread.len().min(8)]
+        );
+        assert!(checked > 5000, "{checked}");
+        assert!(
+            kinds.is_empty(),
+            "of {checked} lines, {}",
+            summary(&kinds, &leaked)
+        );
+    }
+
+    /// The same for a `[Keystore]` line: its password and its payload.
+    #[test]
+    fn a_keystore_line_loses_what_the_parser_reads_as_its_password_and_payload() {
+        let mut checked = 0usize;
+        let mut kinds: Vec<String> = Vec::new();
+        let mut leaked: Vec<String> = Vec::new();
+        for name in ["password", "base64"] {
+            for spelling in spellings(name) {
+                for slots in ARRANGEMENTS {
+                    // an open quote takes the payload that follows with it
+                    if spelling.open && (slots.last() != Some(&"S") || name == "password") {
+                        continue;
+                    }
+                    let items = arranged(slots, &spelling.text, &NEIGHBOURS);
+                    let mut line = format!("type=p12, {}", items.join(", "));
+                    if name == "password" {
+                        line.push_str(", base64=B64B64");
+                    }
+                    let item = crate::keystore::parse_keystore_item("k", &line, &span()).unwrap();
+                    let read = if name == "password" {
+                        item.password.clone().unwrap_or_default()
+                    } else {
+                        item.base64.clone()
+                    };
+                    assert_eq!(read, spelling.value, "{line}");
+                    checked += 1;
+                    let out = redact_profile(&format!("k = {line}"));
+                    let mut bad = Vec::new();
+                    for secret in [V, W, "B64B64"] {
+                        if out.contains(secret) {
+                            bad.push(format!("shows {secret}"));
+                        }
+                    }
+                    for slot in slots.iter().filter(|s| **s != "S") {
+                        let n = NEIGHBOURS[slot.parse::<usize>().unwrap()];
+                        if !out.contains(&format!(", {n}")) {
+                            bad.push(format!("lost {n}"));
+                        }
+                    }
+                    if !bad.is_empty() {
+                        kinds.push(format!("{name} | {}", shape(&spelling.text, name)));
+                        leaked.push(format!("{line:?} -> {out:?}: {}", bad.join(", ")));
+                    }
+                }
+            }
+        }
+        println!("{checked} keystore lines read by the parser and redacted");
+        assert!(checked > 100, "{checked}");
+        assert!(
+            kinds.is_empty(),
+            "of {checked} lines, {}",
+            summary(&kinds, &leaked)
+        );
+    }
+
+    /// The same for a `[WireGuard]` peer, alone on its line and with another
+    /// beside it: the key the section parser reads as the peer's pre-shared
+    /// key is hidden, and the group keeps its shape.
+    #[test]
+    fn a_wireguard_peer_loses_what_the_parser_reads_as_its_preshared_key() {
+        use base64::Engine;
+        let psk: [u8; 32] = base64::engine::general_purpose::STANDARD
+            .decode(PSK)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let neighbours = ["keepalive = 25", "client-id = 83/12/235"];
+        let base = format!(
+            "public-key = {PUBLIC}, \"allowed-ips = 10.0.0.0/8, 192.168.0.0/16\", endpoint = a.test:1"
+        );
+        let mut checked = 0usize;
+        let mut kinds: Vec<String> = Vec::new();
+        let mut leaked: Vec<String> = Vec::new();
+        for spelling in spellings("preshared-key") {
+            // one 32-byte key is all a peer takes
+            if spelling.value != V {
+                continue;
+            }
+            let secret = spelling.text.replace(V, PSK);
+            for slots in ARRANGEMENTS {
+                if spelling.open && slots.last() != Some(&"S") {
+                    continue;
+                }
+                let items = arranged(slots, &secret, &[neighbours[0], neighbours[1]]);
+                let peer = format!("({base}, {})", items.join(", "));
+                for line in [
+                    format!("peer = {peer}"),
+                    format!(
+                        "peer = (public-key = {PUBLIC}, allowed-ips = 10.1.0.0/16, endpoint = b.test:2), {peer}"
+                    ),
+                ] {
+                    let text = format!(
+                        "[WireGuard w]\nprivate-key = {PRIVATE}\nself-ip = 10.0.0.2\n{line}\n"
+                    );
+                    let (profile, d) = crate::text::parse_str(
+                        &text,
+                        std::sync::Arc::from(std::path::Path::new("w.conf")),
+                        crate::text::Origin::Main,
+                    );
+                    assert!(d.is_empty(), "{:?}", d.into_vec());
+                    let mut diags = crate::diagnostic::Diagnostics::default();
+                    let section = crate::wireguard::parse_section(&profile.sections[0], &mut diags)
+                        .unwrap_or_else(|| panic!("{line}: {:?}", diags.into_vec()));
+                    let last = section.peers.last().unwrap();
+                    assert_eq!(
+                        last.preshared_key.as_ref().map(|k| *k.expose()),
+                        Some(psk),
+                        "{line}"
+                    );
+                    checked += 1;
+                    let out = redact_profile(&text);
+                    let shown = out.lines().nth(3).unwrap();
+                    let mut bad = Vec::new();
+                    if out.contains(PSK) || out.contains("Zq9kV7xM") {
+                        bad.push("shows the key".to_string());
+                    }
+                    if !shown.contains(&base) || !shown.ends_with(')') {
+                        bad.push("lost the shape".to_string());
+                    }
+                    for slot in slots.iter().filter(|s| **s != "S") {
+                        let n = neighbours[slot.parse::<usize>().unwrap()];
+                        if !shown.contains(&format!(", {n}")) {
+                            bad.push(format!("lost {n}"));
+                        }
+                    }
+                    if !bad.is_empty() {
+                        kinds.push(shape(&spelling.text, "preshared-key"));
+                        leaked.push(format!("{shown:?}: {}", bad.join(", ")));
+                    }
+                }
+            }
+        }
+        println!("{checked} peer lines read by the parser and redacted");
+        assert!(checked > 50, "{checked}");
+        assert!(
+            kinds.is_empty(),
+            "of {checked} lines, {}",
+            summary(&kinds, &leaked)
+        );
+    }
+
+    /// How such lines come out: the item as the parser reads it, the
+    /// spacing, the name and the case of one written plainly kept; from
+    /// inside quotes only `name=***` is left, and every other item as it was
+    /// written.
+    #[test]
+    fn an_item_is_hidden_the_way_the_parser_reads_it() {
+        for (line, shown) in [
+            // the full-width space an East Asian input method types
+            (
+                "HK = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm,\u{3000}password=x1",
+                "HK = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm,\u{3000}password=***",
+            ),
+            (
+                "Ext = external,\u{a0}args = hunter2 ,exec=/bin/x",
+                "Ext = external,\u{a0}args = *** ,exec=/bin/x",
+            ),
+            // the whole item in quotes: read as the parameter of that name
+            (
+                "G = select, \"policy-path=https://sub.example/list?token=t0k3n\"",
+                "G = select, policy-path=***",
+            ),
+            (
+                "Ext = external, exec=/bin/x, local-port=1080, \"args=-p hunter2\"",
+                "Ext = external, exec=/bin/x, local-port=1080, args=***",
+            ),
+            (
+                "k = type=p12, \"password=pw\", base64=AAAA",
+                "k = type=p12, password=***, base64=***",
+            ),
+            // single quotes, a comma inside, a space around `=`
+            (
+                "Ext = external, 'args = a,b' , local-port=1080",
+                "Ext = external, args=*** , local-port=1080",
+            ),
+            (
+                "Ext = external, \"ARGS=a,b\", args=\"c,d\", Args = 'e' ",
+                "Ext = external, ARGS=***, args=***, Args = *** ",
+            ),
+            // a quote that opens inside the value takes the rest of the line,
+            // as it does for the parser; so does one left open
+            (
+                "Ext = external, args=a\"b,c\"d, local-port=1080",
+                "Ext = external, args=***, local-port=1080",
+            ),
+            (
+                "Ext = external, local-port=1080, args=\"p,w",
+                "Ext = external, local-port=1080, args=***",
+            ),
+            // a name that only ends like a secret one, a secret one in the
+            // value of another, and a quoted item that is nobody's secret
+            (
+                "Ext = external, my-args=a, exec=/bin/args=x, \"sni=a.test,b.test\"",
+                "Ext = external, my-args=a, exec=/bin/args=x, \"sni=a.test,b.test\"",
+            ),
+        ] {
+            assert_eq!(redact_profile(line), shown, "{line:?}");
+        }
+    }
+
+    /// A `[WireGuard]` peer is a group whose items are read as a line's are,
+    /// a group in quotes too; the parentheses stay.
+    #[test]
+    fn the_items_of_a_group_are_hidden_the_way_the_parser_reads_them() {
+        for (line, shown) in [
+            (
+                "peer = (public-key = P, \"preshared-key = V\", endpoint = a.test:1)",
+                "peer = (public-key = P, preshared-key=***, endpoint = a.test:1)",
+            ),
+            (
+                "peer = (public-key = P,\u{3000}preshared-key = V)",
+                "peer = (public-key = P,\u{3000}preshared-key = ***)",
+            ),
+            (
+                "peer = (public-key = P, endpoint = a.test:1, 'PRESHARED-KEY=V' )",
+                "peer = (public-key = P, endpoint = a.test:1, PRESHARED-KEY=*** )",
+            ),
+            // several peers on a line; a group in quotes is read as one
+            (
+                "peer = (public-key = P, preshared-key = V), (public-key = Q, endpoint = b.test:2)",
+                "peer = (public-key = P, preshared-key = ***), (public-key = Q, endpoint = b.test:2)",
+            ),
+            (
+                "peer = \"(public-key = P, preshared-key = V)\", (public-key = Q, preshared-key=W)",
+                "peer = (public-key = P, preshared-key = ***), (public-key = Q, preshared-key=***)",
+            ),
+            (
+                "peer = \"(public-key = P, endpoint = a.test:1)\", (public-key = Q, endpoint = b.test:2)",
+                "peer = \"(public-key = P, endpoint = a.test:1)\", (public-key = Q, endpoint = b.test:2)",
+            ),
+            // a group on a line of another kind
+            (
+                "T = trojan, h, 443, (password=V), tfo=true",
+                "T = trojan, h, 443, (password=***), tfo=true",
+            ),
+            // a group left open is no group: the search by name finds the secret
+            (
+                "peer = (public-key = P, preshared-key = V",
+                "peer = (public-key = P, preshared-key = ***",
+            ),
+        ] {
+            assert_eq!(redact_profile(line), shown, "{line:?}");
+        }
+    }
+
+    /// What the parsers read as one value can hold a secret parameter of its
+    /// own, wherever the item pass cannot tell: the search by name stays, and
+    /// it too takes any Unicode whitespace for the start of a name.
+    #[test]
+    fn the_search_by_name_finds_a_secret_in_what_is_one_value() {
+        for (def, shown) in [
+            (
+                "external, x=\"a,\u{3000}password=V",
+                "external, x=\"a,\u{3000}password=***",
+            ),
+            (
+                "external, x=\"a,\u{a0}token = V, b\"",
+                "external, x=\"a,\u{a0}token = ***, b\"",
+            ),
+            (
+                "external, x=1\u{2003}uuid=V",
+                "external, x=1\u{2003}uuid=***",
+            ),
+            (
+                "external, x=(1,\u{3000}psk=V)",
+                "external, x=(1,\u{3000}psk=***",
+            ),
+        ] {
+            assert_eq!(redact_definition(def), shown, "{def:?}");
+        }
+    }
+
+    /// Text the parsers make nothing of, and text that is long or deep:
+    /// nothing panics, nothing overflows, and what is a secret still goes.
+    #[test]
+    fn odd_text_neither_panics_nor_keeps_a_secret() {
+        for text in [
+            "",
+            ",",
+            ",,,",
+            "(",
+            ")",
+            "()",
+            "(,)",
+            "\"",
+            "'",
+            "\\",
+            "\"\\",
+            "=",
+            "==",
+            " = ",
+            "password",
+            "password=",
+            "\u{3000}",
+            "\u{feff}",
+            "é=x, ééé=é, \u{3000}é",
+            "\"é",
+            "(é",
+            "é)",
+        ] {
+            let shown = redact_definition(text);
+            assert_eq!(redact_definition(&shown), shown, "{text:?}");
+        }
+        for (text, shown) in [
+            ("password=", "password=***"),
+            (
+                "\u{3000}password\u{3000}=\u{3000}é",
+                "\u{3000}password\u{3000}=\u{3000}***",
+            ),
+            ("é,\u{a0}password=é,é", "é,\u{a0}password=***,é"),
+            ("\"é\",\"password=é\"", "\"é\",password=***"),
+            ("(é, password=é)", "(é, password=***)"),
+            ("((é), \"password=é\")", "((é), password=***)"),
+        ] {
+            assert_eq!(redact_definition(text), shown, "{text:?}");
+        }
+        let depth = 10_000;
+        let nested = format!("{}password={V}{}", "(".repeat(depth), ")".repeat(depth));
+        assert!(!redact_definition(&nested).contains(V));
+        let nested = format!("trojan, h, 443, {}password={V}", "(".repeat(depth));
+        assert!(!redact_definition(&nested).contains(V));
+        let nested = format!("x=\"{}\", password={V}", "(\"".repeat(depth));
+        assert!(!redact_definition(&nested).contains(V));
+        let long = format!("external, {}, args={V}", "a=b,".repeat(100_000));
+        assert!(!redact_definition(&long).contains(V));
+        let wide = format!("external, args={}", V.repeat(100_000));
+        assert!(!redact_definition(&wide).contains(V));
     }
 }

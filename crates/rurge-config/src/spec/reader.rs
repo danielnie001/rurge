@@ -7,6 +7,33 @@ use crate::value::parse_bool;
 use std::collections::HashSet;
 use std::str::FromStr;
 
+/// Whether a diagnostic may quote `value` of a parameter: only when it can be
+/// what somebody wrote for that one key. A comma that is missing lets the next
+/// field slide into the value (`4 psk=…`), and what does not fit one key — a
+/// space, an `=`, more than 64 characters — can be a credential.
+pub(crate) fn quotable(value: &str) -> bool {
+    value.chars().nth(64).is_none() && !value.contains(char::is_whitespace) && !value.contains('=')
+}
+
+/// The text of `E0018`, the value quoted when it can be.
+pub(crate) fn invalid_value(key: &str, value: &str, expected: &str) -> String {
+    if quotable(value) {
+        format!("invalid value `{value}` for `{key}` (expected {expected})")
+    } else {
+        format!("invalid value for `{key}` (expected {expected})")
+    }
+}
+
+/// What a diagnostic says of a name that `key` refers to and nothing has: the
+/// name is quoted when it can be one, as a value is.
+pub(crate) fn unknown_reference(key: &str, what: &str, name: &str) -> String {
+    if quotable(name) {
+        format!("`{key}` references unknown {what} `{name}`")
+    } else {
+        format!("`{key}` references unknown {what}")
+    }
+}
+
 pub struct ParamReader<'a> {
     policy: &'a ProxyPolicy,
     used: HashSet<String>,
@@ -106,12 +133,13 @@ impl<'a> ParamReader<'a> {
         found
     }
 
-    /// `E0018`. Never call this for a parameter whose value is a secret.
+    /// `E0018`. Never call this for a parameter whose value is a secret; the
+    /// value is quoted only when `quotable`.
     pub fn invalid(&mut self, key: &str, value: &str, expected: &str) {
         self.error_on(
             key,
             codes::E_INVALID_POLICY_PARAM,
-            format!("invalid value `{value}` for `{key}` (expected {expected})"),
+            invalid_value(key, value, expected),
         );
     }
 
@@ -202,6 +230,55 @@ mod tests {
             "policy `P`: invalid value `maybe` for `bad` (expected true or false)"
         );
         assert_eq!(diags[0].span.as_ref().unwrap().line, 7);
+    }
+
+    /// A value is quoted when it can be what somebody wrote for the one key
+    /// it stands at. A comma that is missing lets the next field slide into
+    /// it (`4 psk=…`); a space, an `=` and a length no value of a parameter
+    /// has do not fit one key.
+    #[test]
+    fn a_value_is_quoted_only_when_it_can_be_what_was_written_for_the_key() {
+        let longest = "a".repeat(64);
+        let too_long = "a".repeat(65);
+        let wide = "é".repeat(64);
+        for (value, quoted) in [
+            ("maybe", true),
+            ("", true),
+            (longest.as_str(), true),
+            (too_long.as_str(), false),
+            // 64 characters, twice as many bytes
+            (wide.as_str(), true),
+            ("true password", false),
+            ("4 psk=S3CR3T", false),
+            ("a\u{3000}b", false),
+            ("a\tb", false),
+            ("a=b", false),
+            ("psk=S3CR3T", false),
+        ] {
+            let p = policy("http, 1.2.3.4, 80");
+            let mut r = ParamReader::new(&p);
+            r.invalid("bad", value, "true or false");
+            let diags = r.finish();
+            let expected = if quoted {
+                format!("policy `P`: invalid value `{value}` for `bad` (expected true or false)")
+            } else {
+                "policy `P`: invalid value for `bad` (expected true or false)".to_string()
+            };
+            assert_eq!(diags[0].message, expected, "{value:?}");
+        }
+        // through the typed reads as well: the value another field slid into
+        let p = policy("http, 1.2.3.4, 80, tfo=true password=S3CR3T, test-timeout=5 psk=S3CR3T");
+        let mut r = ParamReader::new(&p);
+        assert_eq!(r.bool("tfo"), None);
+        assert_eq!(r.number::<u32>("test-timeout", "seconds"), None);
+        let messages: Vec<String> = r.finish().into_iter().map(|d| d.message).collect();
+        assert_eq!(
+            messages,
+            [
+                "policy `P`: invalid value for `tfo` (expected true or false)",
+                "policy `P`: invalid value for `test-timeout` (expected seconds)",
+            ]
+        );
     }
 
     #[test]

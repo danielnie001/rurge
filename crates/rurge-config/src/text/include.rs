@@ -77,7 +77,7 @@ fn expand_inner(
                     diags.push(
                         Diagnostic::warning(
                             codes::W_REMOTE_INCLUDE_UNSUPPORTED,
-                            format!("remote include not supported yet: {target}"),
+                            "remote include not supported yet",
                         )
                         .at(entry.span.clone()),
                     );
@@ -285,6 +285,24 @@ mod tests {
             p.section("Rule").unwrap().entries.last().unwrap().raw,
             "FINAL,DIRECT"
         );
+    }
+
+    /// The link of a remote include can carry a token: the warning says what
+    /// is not supported and the span says where.
+    #[test]
+    fn a_remote_include_does_not_quote_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("main.conf"),
+            "[Rule]\n#!include https://example.com/S3CR3T/x.conf?token=S3CR3T\nFINAL,DIRECT\n",
+        )
+        .unwrap();
+        let (_, d) = load(dir.path(), "main.conf");
+        let found: Vec<_> = d.iter().collect();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].code, codes::W_REMOTE_INCLUDE_UNSUPPORTED);
+        assert_eq!(found[0].message, "remote include not supported yet");
+        assert_eq!(found[0].span.as_ref().unwrap().line, 2);
     }
 
     #[test]

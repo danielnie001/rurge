@@ -58,7 +58,7 @@ pub fn read_ssh(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> SshSpec {
         match keystore.iter().find(|k| k.name == name) {
             None => r.error(
                 codes::E_KEYSTORE_REF,
-                format!("`private-key` references unknown keystore item `{name}`"),
+                super::reader::unknown_reference("private-key", "keystore item", name),
             ),
             Some(item) if item.kind != KeystoreType::OpensshPrivateKey => r.error(
                 codes::E_KEYSTORE_REF,
