@@ -15,7 +15,10 @@ use rurge_config::policy::{GroupKind, PolicyKind};
 use std::collections::HashSet;
 
 /// Reported as `CORE_VERSION` to requirement expressions (see FR-CFG-08).
-pub const CORE_VERSION: u64 = 20;
+/// The manual ties 22 to the `smart` group, which rurge has. It ties 20 to
+/// Body Rewrite and inline Map Local, which rurge parses without effect
+/// (`W0016`): a profile that asks for 20 gets the same here either way.
+pub const CORE_VERSION: u64 = 22;
 
 const INACTIVE_RULE_TYPES: [&str; 7] = [
     "PROCESS-NAME",

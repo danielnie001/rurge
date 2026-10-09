@@ -131,6 +131,42 @@ fn check_json_and_platform() {
     );
 }
 
+/// rurge reports `CORE_VERSION` 22, the version that brought the `smart`
+/// group: a line that asks for 22 is read, one that asks for 23 is not.
+#[test]
+fn check_reports_core_version_22() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write(
+        &dir,
+        "core-version.conf",
+        "[General]\n[Proxy]\nH = http, proxy.test, 8080\n[Proxy Group]\n\
+#!REQUIREMENT CORE_VERSION>=22 Smart = smart, H, DIRECT\n\
+#!REQUIREMENT CORE_VERSION>=23 Later = smart, H, DIRECT\n[Rule]\nFINAL,Smart\n",
+    );
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "--json", "-c"])
+        .arg(&conf)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let skipped: Vec<&str> = v["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["code"] == "I0002")
+        .map(|d| d["message"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        skipped,
+        ["line disabled: requirement `CORE_VERSION>=23` not met"],
+        "{v}"
+    );
+}
+
 const PROXIES: &str = "[General]\n[Proxy]\nH = http, proxy.test, 8080\nS = socks5-tls, proxy.test, 443\nOld = tailscale, section-name=ts\n[Rule]\nFINAL,DIRECT\n";
 const BROKEN_P12: &str = "[General]\n[Proxy]\nUp = https, proxy.test, 443, client-cert=cert1\n[Keystore]\ncert1 = type=p12, base64=QUJD, password=hunter2\n[Rule]\nFINAL,DIRECT\n";
 
