@@ -890,6 +890,15 @@ mod tests {
         Target::new(HostName::Ip(addr.ip()), addr.port())
     }
 
+    /// `send_to`, bounded like the rest: a send may wait for the carrier to
+    /// be moved onto a new connection.
+    async fn send(carrier: &dyn PacketSocket, payload: &[u8], to: &Target) {
+        tokio::time::timeout(BOUND, carrier.send_to(payload, to))
+            .await
+            .expect("the send ends within the bound")
+            .unwrap();
+    }
+
     /// What the digest target answers for `payload`.
     fn digest(payload: &[u8]) -> Vec<u8> {
         let mut hasher = DefaultHasher::new();
@@ -949,7 +958,7 @@ mod tests {
                 let (carrier, start, to) = (carrier.clone(), start.clone(), to.clone());
                 sending.spawn(async move {
                     start.wait().await;
-                    carrier.send_to(&payload, &to).await.unwrap();
+                    send(carrier.as_ref(), &payload, &to).await;
                 });
             }
             while let Some(sent) = sending.join_next().await {
@@ -1029,7 +1038,7 @@ mod tests {
         let carrier = open_carrier(&out).await;
         let before = counted.asked();
         for i in 0..50u8 {
-            carrier.send_to(&[i], &to).await.unwrap();
+            send(carrier.as_ref(), &[i], &to).await;
         }
         let asked = counted.asked() - before;
         assert!(asked <= 3, "asked {asked} times for 50 datagrams");
@@ -1046,7 +1055,7 @@ mod tests {
         let counted = Arc::new(Counted::new());
         let out = outbound(&fake, counted.clone());
         let carrier = open_carrier(&out).await;
-        carrier.send_to(b"first", &to).await.unwrap();
+        send(carrier.as_ref(), b"first", &to).await;
         *counted.route.lock().unwrap() = Arc::new(2);
         let deadline = Instant::now() + BOUND;
         while !fake.udp_messages().iter().any(|m| m.connection == 1) {
@@ -1054,7 +1063,7 @@ mod tests {
                 Instant::now() < deadline,
                 "the carrier never left its connection"
             );
-            carrier.send_to(b"probe", &to).await.unwrap();
+            send(carrier.as_ref(), b"probe", &to).await;
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let messages = fake.udp_messages();

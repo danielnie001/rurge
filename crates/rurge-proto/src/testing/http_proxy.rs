@@ -168,10 +168,12 @@ impl FakeHttpProxy {
                 let (script, log, tls) = (script.clone(), log.clone(), tls.clone());
                 tokio::spawn(async move {
                     let stream: BoxedStream = match &tls {
-                        Some((fixture, acceptor)) => match fixture.accept(acceptor, tcp).await {
-                            Ok(s) => s,
-                            Err(_) => return,
-                        },
+                        Some((fixture, acceptor)) => {
+                            match fixture.accept_patiently(acceptor, tcp).await {
+                                Ok(s) => s,
+                                Err(_) => return,
+                            }
+                        }
                         None => Box::new(tcp),
                     };
                     let _ = serve(stream, script, log).await;

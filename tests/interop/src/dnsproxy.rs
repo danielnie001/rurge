@@ -9,10 +9,7 @@
 //! is asked goes nowhere. It has no port to probe that says QUIC is up: it
 //! is up once its log says so.
 
-use crate::{
-    DNS_NAME, DNS_V4, DNS_V6, REQUIRED_ENV, Reference, TlsFiles, free_tcp_and_udp_port,
-    free_udp_port,
-};
+use crate::{DNS_NAME, DNS_V4, DNS_V6, REQUIRED_ENV, Reference, TlsFiles, free_ports};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -110,11 +107,14 @@ impl Dnsproxy {
     /// until it says DoQ and DoH3 listen.
     pub fn spawn(binary: &Path, dir: &Path, tls: &TlsFiles) -> Dnsproxy {
         // the HTTPS port is TCP's and HTTP/3's (UDP) alike, and so is the
-        // plain one
+        // plain one; all three before any is let go, so that no two of them
+        // come by one number (the QUIC port is free for TCP as well, which
+        // nothing needs)
+        let taken = free_ports(&[true, true, true]);
         let ports = Ports {
-            plain: free_tcp_and_udp_port(),
-            quic: free_udp_port(),
-            https: free_tcp_and_udp_port(),
+            plain: taken[0],
+            quic: taken[1],
+            https: taken[2],
         };
         let hosts_file = dir.join("hosts.txt");
         std::fs::write(&hosts_file, hosts()).expect("write the hosts file");

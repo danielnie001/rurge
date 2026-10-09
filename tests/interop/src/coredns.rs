@@ -10,7 +10,7 @@
 //! `forward`. It has no TCP port to probe: it is up once it has listed its
 //! servers.
 
-use crate::{DNS_NAME, DNS_V4, DNS_V6, REQUIRED_ENV, Reference, TlsFiles, free_udp_port};
+use crate::{DNS_NAME, DNS_V4, DNS_V6, REQUIRED_ENV, Reference, TlsFiles, free_ports};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -94,7 +94,10 @@ impl CoreDns {
     /// Writes the Corefile into `dir`, starts `binary` there and waits until
     /// it says both servers listen.
     pub fn spawn(binary: &Path, dir: &Path, tls: &TlsFiles) -> CoreDns {
-        let (quic, h3) = (free_udp_port(), free_udp_port());
+        // both before either is let go, so that the two servers do not come
+        // by one number (each is free for TCP as well, which nothing needs)
+        let ports = free_ports(&[true, true]);
+        let (quic, h3) = (ports[0], ports[1]);
         let corefile = dir.join("Corefile");
         std::fs::write(&corefile, render(quic, h3, tls)).expect("write the Corefile");
         let mut command = Command::new(binary);

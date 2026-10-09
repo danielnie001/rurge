@@ -451,6 +451,29 @@ pub async fn udp_echo() -> (SocketAddr, Arc<std::sync::Mutex<Vec<SocketAddr>>>) 
     (addr, seen)
 }
 
+/// A loopback UDP port with nothing on it (so that a datagram to it is
+/// answered with an ICMP "port unreachable") that no socket another test
+/// opens can come by. A port the system handed out and the test then gave
+/// back can be handed out again to anyone, a moment later; this one lies in
+/// a range the system does not hand out by itself — the dynamic ports of
+/// Windows (by default), Linux and macOS are all above it — and is tried
+/// just before it is returned.
+pub fn closed_udp_port() -> u16 {
+    const PORTS: std::ops::Range<u64> = 20_000..30_000;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // this process starts somewhere else in the range than the one before it
+    let start = u64::from(std::process::id()).wrapping_mul(7919);
+    for _ in 0..100 {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let port = PORTS.start + start.wrapping_add(n) % (PORTS.end - PORTS.start);
+        let port = u16::try_from(port).expect("a port");
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no port of {PORTS:?} is free");
+}
+
 /// One request/response over a fresh connection to rurge's HTTP listener.
 pub async fn plain_get(proxy: SocketAddr, url: &str, host: &str) -> String {
     let mut s = TcpStream::connect(proxy).await.unwrap();

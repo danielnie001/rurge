@@ -486,6 +486,74 @@ mod tests {
             .unwrap();
     }
 
+    /// A writer that takes everything but never finishes a flush: the shape
+    /// of a TLS writer whose socket is full and whose last record cannot go
+    /// out. `entered` fires on the first `poll_flush`, so the test needs no
+    /// sleep to know it is parked.
+    struct FlushParks {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    impl AsyncWrite for FlushParks {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.entered.notify_one();
+            Poll::Pending // and never wakes
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The flush that follows a write waits like the read, the write and the
+    /// half-close do, so it races `stop` like them: a writer that cannot
+    /// finish it would otherwise hold the direction, and with it the
+    /// session, against `kill`, shutdown and the idle timeout.
+    #[tokio::test]
+    async fn cancelling_stop_interrupts_a_flush_that_never_completes() {
+        let bound = Duration::from_secs(5);
+        let stop = CancellationToken::new();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let writer = FlushParks {
+            entered: entered.clone(),
+        };
+        let reader: &[u8] = b"the last bytes of a request";
+        let half = tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                copy_half(
+                    reader,
+                    writer,
+                    stop,
+                    Arc::new(AtomicU64::new(0)),
+                    Instant::now(),
+                    |_| {},
+                    None,
+                    || {},
+                    BUF,
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(bound, entered.notified())
+            .await
+            .expect("the bytes are written and the flush is asked for");
+        stop.cancel();
+        tokio::time::timeout(bound, half)
+            .await
+            .expect("a cancelled stop token ends a flush that never completes")
+            .unwrap()
+            .unwrap();
+    }
+
     /// Accepts every write at once but only passes it on when flushed: what
     /// `AsyncWrite` allows, and what tokio-rustls does with its last record
     /// once the socket below it is full.

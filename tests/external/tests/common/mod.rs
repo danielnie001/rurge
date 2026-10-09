@@ -20,13 +20,29 @@ pub fn helper() -> String {
     env!("CARGO_BIN_EXE_socks-helper").to_string()
 }
 
-/// A port that was free a moment ago.
+/// A port that was free a moment ago, and that no socket the tests open for
+/// themselves can be given before the helper has bound it. The port goes
+/// into the profile before the program is started, so it cannot be kept
+/// bound until the program binds it; and a port the system handed out and
+/// the test then gave back can be handed out again — to a parallel test's
+/// echo server, say, which would answer the outbound's SOCKS5 greeting by
+/// echoing it. This one lies in a range the system does not hand out by
+/// itself (the dynamic ports of Windows by default, Linux and macOS are all
+/// above it), and is tried just before it is returned.
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    const PORTS: std::ops::Range<u64> = 20_000..30_000;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // this process starts somewhere else in the range than the one before it
+    let start = u64::from(std::process::id()).wrapping_mul(7919);
+    for _ in 0..100 {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let port = PORTS.start + start.wrapping_add(n) % (PORTS.end - PORTS.start);
+        let port = u16::try_from(port).unwrap();
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no port of {PORTS:?} is free");
 }
 
 /// `rurge-platform::process` behind the hook, as the bin wires it.

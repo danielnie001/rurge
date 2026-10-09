@@ -675,8 +675,16 @@ mod tests {
         (buf[..n].to_vec(), from)
     }
 
+    /// `send_to`, bounded like the rest: a send may wait for the carrier to
+    /// be moved onto a new connection.
+    async fn udp_send(carrier: &dyn PacketSocket, payload: &[u8], to: &Target) -> io::Result<()> {
+        timeout(BOUND, carrier.send_to(payload, to))
+            .await
+            .expect("the send ends within the bound")
+    }
+
     async fn udp_round_trip(carrier: &dyn PacketSocket, to: SocketAddr, payload: &[u8]) {
-        carrier.send_to(payload, &target(to)).await.unwrap();
+        udp_send(carrier, payload, &target(to)).await.unwrap();
         assert_eq!(udp_answer(carrier).await, (payload.to_vec(), target(to)));
     }
 
@@ -694,7 +702,7 @@ mod tests {
         let mut buf = vec![0u8; 65536];
         loop {
             assert!(Instant::now() < deadline, "no answer within the bound");
-            carrier.send_to(payload, &target(to)).await.unwrap();
+            udp_send(carrier, payload, &target(to)).await.unwrap();
             let wait = Instant::now() + Duration::from_millis(500);
             while let Ok(got) = tokio::time::timeout_at(wait, carrier.recv_from(&mut buf)).await {
                 let (n, _) = got.unwrap();
@@ -762,7 +770,9 @@ mod tests {
             ),
             (HostName::parse("2001:db8::1"), "[2001:db8::1]:53"),
         ] {
-            carrier.send_to(b"q", &Target::new(host, 53)).await.unwrap();
+            udp_send(carrier.as_ref(), b"q", &Target::new(host, 53))
+                .await
+                .unwrap();
             assert_eq!(
                 udp_answer(carrier.as_ref()).await,
                 (b"q".to_vec(), target(echo))
@@ -772,10 +782,13 @@ mod tests {
         // `name:80` one byte longer than the reference reads
         let long = "a".repeat(2046);
         for name in ["x@blocked.test", "a b.test", "", long.as_str()] {
-            let err = carrier
-                .send_to(b"q", &Target::new(HostName::Domain(name.into()), 80))
-                .await
-                .unwrap_err();
+            let err = udp_send(
+                carrier.as_ref(),
+                b"q",
+                &Target::new(HostName::Domain(name.into()), 80),
+            )
+            .await
+            .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
             assert_eq!(
                 err.to_string(),
@@ -829,7 +842,9 @@ mod tests {
         let carrier = udp_carrier(&out).await;
         let (lost, kept) = (vec![1u8; 3000], vec![2u8; 3000]);
         for payload in [&lost[..], &kept, b"short"] {
-            carrier.send_to(payload, &target(echo)).await.unwrap();
+            udp_send(carrier.as_ref(), payload, &target(echo))
+                .await
+                .unwrap();
         }
         // in the order they came: the first never came whole
         assert_eq!(udp_answer(carrier.as_ref()).await.0, kept);
@@ -1139,8 +1154,7 @@ mod tests {
         let out = outbound(&fake, "password=pw");
         let carrier = udp_carrier(&out).await;
         // past 255 of the longest QUIC datagrams a path carries here
-        let err = carrier
-            .send_to(&vec![0u8; 400_000], &target(echo))
+        let err = udp_send(carrier.as_ref(), &vec![0u8; 400_000], &target(echo))
             .await
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -1150,7 +1164,7 @@ mod tests {
             "{err}"
         );
         let name = Target::new(HostName::Domain("a".repeat(1500)), 53);
-        let err = carrier.send_to(b"q", &name).await.unwrap_err();
+        let err = udp_send(carrier.as_ref(), b"q", &name).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(
             err.to_string(),
@@ -1237,8 +1251,7 @@ mod tests {
         let out = outbound(&fake, "password=pw");
         let carrier = udp_carrier(&out).await;
         udp_round_trip(carrier.as_ref(), echo, MARK).await;
-        let err = carrier
-            .send_to(&MARK.repeat(30_000), &target(echo))
+        let err = udp_send(carrier.as_ref(), &MARK.repeat(30_000), &target(echo))
             .await
             .unwrap_err();
         // no message (an address of no length), then one for no session:

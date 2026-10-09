@@ -1846,6 +1846,10 @@ mod run {
         })
         .await
         .unwrap();
+        // `rurge run` arms the watch after it says where it listens and
+        // before it says it is running: a profile written in between is a
+        // change that nothing ever sees.
+        wait_for_line(&daemon, "rurge ");
         let http = daemon.http;
         let before = tokio::task::spawn_blocking(move || {
             http_get(http, &format!("http://127.0.0.1:{tport}/hello"))
@@ -1862,8 +1866,10 @@ mod run {
             "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nloglevel = warning\n[Rule]\nFINAL,DIRECT\n",
         )
         .unwrap();
+        // What is waited for is the reload, after a quiet half second and a
+        // load of the profile; a slow machine takes as long as it takes.
         let ok = tokio::task::spawn_blocking(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
             loop {
                 if http_get(http, &format!("http://127.0.0.1:{tport}/hello")).contains("reloaded") {
                     return true;

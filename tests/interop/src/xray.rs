@@ -5,7 +5,7 @@
 //! downloaded or installed here, the rendered configuration listens on
 //! 127.0.0.1 only, and its single outbound is `freedom`.
 
-use crate::{REQUIRED_ENV, Reference, free_port};
+use crate::{REQUIRED_ENV, Reference, free_ports};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -76,9 +76,11 @@ impl Xray {
     /// Writes the configuration into `dir`, starts `binary` there and waits
     /// until every inbound accepts connections.
     pub fn spawn(binary: &Path, dir: &Path, inbounds: Vec<XrayInbound>) -> Xray {
+        // all of them before any is let go, so that no two inbounds come by
+        // one number
+        let ports = free_ports(&vec![false; inbounds.len()]);
         let with_ports: Vec<(XrayInbound, u16)> =
-            inbounds.into_iter().map(|i| (i, free_port())).collect();
-        let ports: Vec<u16> = with_ports.iter().map(|(_, p)| *p).collect();
+            inbounds.into_iter().zip(ports.iter().copied()).collect();
         let config = dir.join("xray.json");
         std::fs::write(&config, render(&with_ports).to_string()).expect("write the config");
         let mut command = Command::new(binary);

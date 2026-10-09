@@ -15,6 +15,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
+/// How long `accept_patiently` waits for a client to hang up.
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Always resolves to the fixture's real leaf certificate, but signed with a
 /// key that does not match it: what `TlsFixture::impostor_acceptor` serves.
 #[derive(Debug)]
@@ -214,6 +217,35 @@ impl TlsFixture {
     /// Completes the server side of a handshake and records what the client sent.
     pub async fn accept(&self, acceptor: &TlsAcceptor, tcp: TcpStream) -> io::Result<BoxedStream> {
         let tls = acceptor.accept(tcp).await?;
+        Ok(self.record(tls))
+    }
+
+    /// `accept`, except that when the handshake fails the connection is
+    /// left to the client to hang up (for `PATIENCE` at most), once the
+    /// alert has gone out. A TLS 1.3 client is done with its handshake
+    /// before the server has looked at its certificate and goes on to send
+    /// its request: hung up on, a socket with unread data — or one that the
+    /// request reaches afterwards — answers with a reset, and whether the
+    /// client then reads the alert or the reset is up to its platform.
+    pub async fn accept_patiently(
+        &self,
+        acceptor: &TlsAcceptor,
+        tcp: TcpStream,
+    ) -> io::Result<BoxedStream> {
+        match acceptor.accept(tcp).into_fallible().await {
+            Ok(tls) => Ok(self.record(tls)),
+            Err((error, mut tcp)) => {
+                let _ = tokio::time::timeout(
+                    PATIENCE,
+                    tokio::io::copy(&mut tcp, &mut tokio::io::sink()),
+                )
+                .await;
+                Err(error)
+            }
+        }
+    }
+
+    fn record(&self, tls: tokio_rustls::server::TlsStream<TcpStream>) -> BoxedStream {
         let (_, conn) = tls.get_ref();
         self.seen.lock().expect("seen").push(SeenHandshake {
             sni: conn.server_name().map(str::to_string),
@@ -222,7 +254,7 @@ impl TlsFixture {
                 .map(|p| String::from_utf8_lossy(p).into_owned()),
             client_cert: conn.peer_certificates().is_some(),
         });
-        Ok(Box::new(tls))
+        Box::new(tls)
     }
 
     pub fn seen(&self) -> Vec<SeenHandshake> {

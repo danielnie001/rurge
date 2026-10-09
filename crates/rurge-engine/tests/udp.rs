@@ -230,9 +230,7 @@ async fn anyone_may_answer_the_carrier() {
 async fn a_closed_port_does_not_break_the_carrier() {
     let h = harness(Profile::default()).await;
     let (echo, _) = udp_echo().await;
-    let closed = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let closed_port = closed.local_addr().unwrap().port();
-    drop(closed);
+    let closed_port = closed_udp_port();
     let association = udp_associate(h.socks()).await;
     association.send("127.0.0.1", echo.port(), b"one").await;
     association.recv().await;

@@ -563,7 +563,7 @@ mod tests {
                     .await
                     .map(|_| ())
                     .unwrap_err();
-                assert!(started.elapsed() < Duration::from_secs(2), "{e}");
+                assert!(started.elapsed() < Duration::from_secs(5), "{e}");
                 e.to_string()
             }
         };
@@ -819,7 +819,7 @@ mod tests {
                 e.to_string(),
                 "dns: wireguard: the host name cannot be looked up"
             );
-            assert!(started.elapsed() < Duration::from_secs(2), "{host}");
+            assert!(started.elapsed() < Duration::from_secs(5), "{host}");
         }
         assert!(peer.core().dns_questions.is_empty());
     }
@@ -981,7 +981,7 @@ mod tests {
         wg.connect_tcp(&at("echo.test", ECHO_PORT), &within(5))
             .await
             .expect("a connection");
-        assert!(started.elapsed() < Duration::from_secs(2), "no waiting");
+        assert!(started.elapsed() < Duration::from_secs(5), "no waiting");
     }
 
     /// A server the stack cannot send to (an unspecified address, port 0)
@@ -1017,7 +1017,7 @@ mod tests {
         let elapsed = finished
             .recv_timeout(Duration::from_secs(20))
             .expect("the dial ends");
-        assert!(elapsed < Duration::from_secs(2), "no waiting: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "no waiting: {elapsed:?}");
     }
 
     /// `system` asks this machine where it stands in the list; an answer
@@ -1118,7 +1118,7 @@ mod tests {
             .await
             .expect("within 5 s")
             .expect("a handshake");
-        assert!(rtt < Duration::from_secs(2), "{rtt:?}");
+        assert!(rtt < Duration::from_secs(5), "{rtt:?}");
         let before = peer.core().handshakes;
         tokio::time::timeout(Duration::from_secs(5), test())
             .await

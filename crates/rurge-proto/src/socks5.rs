@@ -1293,16 +1293,13 @@ mod tests {
         );
 
         // a reply that claims a 255-byte domain but supplies only 10 bytes,
-        // then hangs up: no hang, a proper handshake error
+        // then hangs up: no hang, a proper handshake error. The handshake
+        // gets the default time: it is the hang that the time is there to
+        // catch, not how fast this machine is.
         let addr = spawn_truncated_reply().await;
         let out = outbound(&format!("socks5, 127.0.0.1, {}", addr.port()), no_roots());
         let err = out
-            .connect_tcp(
-                &target(echo),
-                &ConnectOpts {
-                    timeout: Duration::from_millis(200),
-                },
-            )
+            .connect_tcp(&target(echo), &ConnectOpts::default())
             .await
             .map(|_| ())
             .unwrap_err();

@@ -169,6 +169,51 @@ mod tests {
         assert!(answer.starts_with("HTTP/1.1 502 "), "{answer}");
     }
 
+    /// A TLS 1.3 client is done with its handshake before the server has
+    /// looked at its certificate: the server's refusal is an alert that the
+    /// client reads next, and a request the client sends meanwhile reaches a
+    /// server that may have hung up. Hanging up on unread data resets the
+    /// connection, and what a client reads after a reset is up to its
+    /// platform — the alert or the reset. The fake leaves the hanging up to
+    /// the client, so that it is the alert, whenever the request comes.
+    #[tokio::test]
+    async fn the_fake_https_proxy_lets_a_refused_client_read_the_alert() {
+        let fixture = TlsFixture::new(&["localhost"]);
+        let proxy =
+            FakeHttpProxy::spawn_tls(HttpProxyScript::default(), fixture.clone(), true).await;
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(fixture.roots())
+        .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let tcp = TcpStream::connect(proxy.addr()).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls = connector
+            .connect(name, tcp)
+            .await
+            .expect("the client's side of the handshake is done");
+        // the server has looked at the (missing) certificate and answered;
+        // only now does the request go out
+        let bound = Duration::from_secs(5);
+        tokio::time::timeout(bound, tls.get_ref().0.readable())
+            .await
+            .expect("the server answers")
+            .unwrap();
+        let _ = tls
+            .write_all(b"CONNECT 192.0.2.1:443 HTTP/1.1\r\n\r\n")
+            .await;
+        let _ = tls.flush().await;
+        let mut byte = [0u8; 1];
+        let err = tokio::time::timeout(bound, tls.read(&mut byte))
+            .await
+            .expect("the read ends")
+            .unwrap_err();
+        assert_eq!(err.to_string(), "received fatal alert: CertificateRequired");
+    }
+
     #[tokio::test]
     async fn the_fake_socks5_server_connects_and_records() {
         let echo = echo_server().await;

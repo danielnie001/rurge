@@ -1038,7 +1038,12 @@ async fn rebind_moves_the_listener_to_the_new_address() {
 
 /// A rebind onto a taken port fails after the old listeners are already gone,
 /// so the engine is left serving nothing — and a later rebind from that empty
-/// state (what `run.rs` forces when `listeners.is_empty()`) recovers it.
+/// state (what `run.rs` forces when `listeners.is_empty()`) recovers it. The
+/// port stays taken to the end of the test: giving it back and binding it
+/// again would leave the number to whatever else on the machine asks the
+/// system for a port in between. The recovery is a generation that asks for
+/// a port of the system's choosing, as a profile edited off the taken port
+/// does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rebind_failure_leaves_no_listeners_and_a_later_rebind_recovers() {
     let dns = MockDns::spawn().await;
@@ -1080,15 +1085,28 @@ async fn rebind_failure_leaves_no_listeners_and_a_later_rebind_recovers() {
     };
     assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
 
-    // Degraded: nothing is listening. Free the port and rebind from empty.
-    drop(squatter);
+    // Degraded: nothing is listening. The squatter stays; the next
+    // generation no longer wants its port, and a rebind from empty brings
+    // the daemon back.
+    let next = build_runtime(
+        dir.path(),
+        &dns,
+        "",
+        "",
+        OutboundMode::Rule,
+        Duration::from_secs(600),
+        engine.shared(),
+    )
+    .await;
+    assert!(engine.swap_runtime(next), "the listen address changed");
     let listeners = engine
         .rebind_listeners(Vec::new())
         .await
         .expect("a later rebind recovers the daemon");
     let http = http_addr(&listeners);
-    assert_eq!(http.port(), taken);
+    assert_ne!(http.port(), taken);
     assert_eq!(connect_status(http, target_port, None).await, "200");
+    drop(squatter);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

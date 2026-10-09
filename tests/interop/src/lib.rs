@@ -544,6 +544,16 @@ impl Drop for Reference {
     }
 }
 
+/// The UDP port of a sing-box inbound that listens on UDP, and the TCP port of
+/// the `mixed` inbound that says when sing-box is up, taken together so that
+/// they come out different. (The UDP port is one that is free for TCP as
+/// well, which nothing needs: `free_ports` holds a TCP listener for each of
+/// its ports.)
+fn udp_and_ready_ports() -> (u16, u16) {
+    let ports = free_ports(&[true, false]);
+    (ports[0], ports[1])
+}
+
 /// A running sing-box; killed and reaped on drop.
 pub struct SingBox(Reference);
 
@@ -551,9 +561,11 @@ impl SingBox {
     /// Writes the configuration into `dir`, starts `binary` there and waits
     /// until every inbound accepts connections.
     pub fn spawn(binary: &Path, dir: &Path, inbounds: Vec<Inbound>) -> SingBox {
+        // all of them before any is let go, so that no two inbounds come by
+        // one number
+        let ports = free_ports(&vec![false; inbounds.len()]);
         let with_ports: Vec<(Inbound, u16)> =
-            inbounds.into_iter().map(|i| (i, free_port())).collect();
-        let ports: Vec<u16> = with_ports.iter().map(|(_, p)| *p).collect();
+            inbounds.into_iter().zip(ports.iter().copied()).collect();
         SingBox::launch(binary, dir, &render(&with_ports), ports)
     }
 
@@ -564,7 +576,7 @@ impl SingBox {
         dir: &Path,
         endpoint: &WireGuardEndpoint,
     ) -> (SingBox, u16) {
-        let (port, ready) = (free_udp_port(), free_port());
+        let (port, ready) = udp_and_ready_ports();
         let config = render_wireguard(endpoint, port, ready);
         (SingBox::launch(binary, dir, &config, vec![ready]), port)
     }
@@ -576,7 +588,7 @@ impl SingBox {
         dir: &Path,
         inbound: &Hysteria2Inbound,
     ) -> (SingBox, u16) {
-        let (port, ready) = (free_udp_port(), free_port());
+        let (port, ready) = udp_and_ready_ports();
         let config = render_hysteria2(inbound, port, ready);
         (SingBox::launch(binary, dir, &config, vec![ready]), port)
     }
@@ -584,7 +596,7 @@ impl SingBox {
     /// Starts `binary` with `inbound` on a UDP port of its own; that port,
     /// once sing-box is up.
     pub fn spawn_tuic(binary: &Path, dir: &Path, inbound: &TuicInbound) -> (SingBox, u16) {
-        let (port, ready) = (free_udp_port(), free_port());
+        let (port, ready) = udp_and_ready_ports();
         let config = render_tuic(inbound, port, ready);
         (SingBox::launch(binary, dir, &config, vec![ready]), port)
     }

@@ -216,6 +216,7 @@ pub async fn requests_one_after_another(out: &OutboundRef, echo: SocketAddr, cou
 /// A test that stops at the first failure hides what its other policies
 /// would have met, and on CI every run costs a push: so a test tries them
 /// all and fails once, at its end.
+#[must_use = "a `Failures` that is never `finish`ed lets its test pass whatever failed"]
 #[derive(Default)]
 pub struct Failures {
     tried: usize,
