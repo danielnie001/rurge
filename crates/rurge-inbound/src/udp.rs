@@ -59,6 +59,18 @@ fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// A target the way the engine is handed it: an IPv4 address that the client
+/// wrote in IPv6 form (`::ffff:a.b.c.d`, as an address or as a name) is the
+/// IPv4 address it names. The datagrams go out over an IPv4 socket, and the
+/// answers say they come from the IPv4 address — the form the outbounds
+/// report — which is how the engine finds the flow they belong to.
+pub(crate) fn canonical_host(host: HostName) -> HostName {
+    match host {
+        HostName::Ip(ip) => HostName::Ip(canonical(ip)),
+        name => name,
+    }
+}
+
 /// RSV RSV FRAG ATYP ADDR PORT: where the datagram goes and where its
 /// payload starts; `None` for a fragment (FRAG ≠ 0, never reassembled), an
 /// unknown address type, or a name that is no host name.
@@ -83,22 +95,25 @@ pub(crate) fn parse_header(datagram: &[u8]) -> Option<(Target, usize)> {
         _ => return None,
     };
     let port = u16::from_be_bytes(datagram.get(end..end + 2)?.try_into().ok()?);
-    Some((Target::new(host, port), end + 2))
+    Some((Target::new(canonical_host(host), port), end + 2))
 }
 
-/// The header of a datagram to the client, as coming from `from`; `None`
-/// for a name too long to write.
+/// The header of a datagram to the client, as coming from `from` (an IPv4
+/// address in IPv6 form as the IPv4 address it names); `None` for a name too
+/// long to write.
 pub(crate) fn header(from: &Target) -> Option<Vec<u8>> {
     let mut out = vec![0, 0, 0];
     match &from.host {
-        HostName::Ip(IpAddr::V4(v4)) => {
-            out.push(1);
-            out.extend_from_slice(&v4.octets());
-        }
-        HostName::Ip(IpAddr::V6(v6)) => {
-            out.push(4);
-            out.extend_from_slice(&v6.octets());
-        }
+        HostName::Ip(ip) => match canonical(*ip) {
+            IpAddr::V4(v4) => {
+                out.push(1);
+                out.extend_from_slice(&v4.octets());
+            }
+            IpAddr::V6(v6) => {
+                out.push(4);
+                out.extend_from_slice(&v6.octets());
+            }
+        },
         HostName::Domain(name) => {
             out.push(3);
             out.push(u8::try_from(name.len()).ok()?);
@@ -149,6 +164,7 @@ impl UdpClient for Socks5UdpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv6Addr;
 
     #[test]
     fn a_header_reads_back_as_it_was_written() {
@@ -159,6 +175,29 @@ mod tests {
             datagram.extend_from_slice(b"quic");
             assert_eq!(parse_header(&datagram), Some((target, start)));
         }
+    }
+
+    /// A target in IPv6 form (`::ffff:a.b.c.d`) is the IPv4 address it names
+    /// — as an address or as a name —, and an answer from it comes back from
+    /// that IPv4 address, whichever form the outbound reported it in.
+    #[test]
+    fn an_ipv4_mapped_address_is_the_ipv4_address_both_ways() {
+        let v4 = Target::new(HostName::parse("10.0.0.1"), 53);
+        let mut by_address = vec![0, 0, 0, 4];
+        by_address.extend_from_slice(&"::ffff:10.0.0.1".parse::<Ipv6Addr>().unwrap().octets());
+        by_address.extend_from_slice(&53u16.to_be_bytes());
+        let mut by_name = vec![0, 0, 0, 3, 15];
+        by_name.extend_from_slice(b"::ffff:10.0.0.1");
+        by_name.extend_from_slice(&53u16.to_be_bytes());
+        for datagram in [by_address, by_name] {
+            assert_eq!(parse_header(&datagram), Some((v4.clone(), datagram.len())));
+        }
+        let mapped = Target::new(HostName::parse("::ffff:10.0.0.1"), 53);
+        assert_eq!(header(&mapped), header(&v4));
+        assert_eq!(header(&mapped).unwrap()[3], 1, "address type 1");
+        // a real IPv6 address stays one
+        let v6 = Target::new(HostName::parse("2001:db8::1"), 53);
+        assert_eq!(header(&v6).unwrap()[3], 4);
     }
 
     #[test]

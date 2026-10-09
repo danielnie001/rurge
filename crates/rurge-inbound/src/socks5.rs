@@ -3,7 +3,7 @@
 
 use crate::listener::{ListenerOpts, Running, bind, serve};
 use crate::session::{DialError, Dialer, FailKind, SessionOutcome, UdpAdmission};
-use crate::udp::Socks5UdpClient;
+use crate::udp::{Socks5UdpClient, canonical_host};
 use rurge_config::HostName;
 use rurge_config::session::{ListenerKind, SessionInfo, Transport};
 use rurge_proto::RejectKind;
@@ -147,7 +147,7 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Result<Request, u8>>
     }
     Ok(Ok(Request {
         command: head[1],
-        host,
+        host: canonical_host(host),
         port,
     }))
 }
@@ -761,6 +761,32 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// A client may write an IPv4 target in IPv6 form (`::ffff:a.b.c.d`), as
+    /// an address or as a name: the dialer, and with it the rules and the
+    /// record, get the IPv4 address.
+    #[tokio::test]
+    async fn an_ipv4_mapped_target_is_dialed_as_ipv4() {
+        let (running, dialer) = listener(Duration::from_secs(30)).await;
+        let mapped = "::ffff:127.0.0.1";
+        let mut by_address = vec![VERSION, CMD_CONNECT, 0, ATYP_V6];
+        by_address.extend_from_slice(&mapped.parse::<Ipv6Addr>().unwrap().octets());
+        by_address.extend_from_slice(&7u16.to_be_bytes());
+        for request in [by_address, domain_request(mapped, 7)] {
+            let mut s = negotiate(running.local_addr).await;
+            s.write_all(&request).await.unwrap();
+            // `FakeDialer` reaches its echo server through "127.0.0.1" only:
+            // dialed in another form, the target would be refused
+            assert_eq!(read_reply(&mut s).await[1], REP_SUCCESS, "{request:?}");
+        }
+        let want = HostName::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let hosts: Vec<HostName> = dialer
+            .sessions()
+            .iter()
+            .map(|h| h.session().dst_host.clone())
+            .collect();
+        assert_eq!(hosts, [want.clone(), want]);
     }
 
     #[tokio::test]

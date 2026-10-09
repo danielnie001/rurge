@@ -137,6 +137,35 @@ async fn a_datagram_goes_direct_and_comes_back() {
     assert!(r.connect_ms.is_some() && r.first_byte_ms.is_some(), "{r:?}");
 }
 
+/// A client may write an IPv4 target in IPv6 form (`::ffff:a.b.c.d`). The
+/// inbound hands the engine the IPv4 address: the datagram leaves from the
+/// IPv4 socket, the answer is credited to the flow that sent it — not to the
+/// oldest flow of the carrier — and reaches the client from an IPv4 address.
+#[tokio::test]
+async fn an_ipv4_mapped_target_is_the_ipv4_address() {
+    let h = harness(Profile::default()).await;
+    let ((older, _), (mapped, _)) = (udp_echo().await, udp_echo().await);
+    let association = udp_associate(h.socks()).await;
+    // the older flow: an answer credited to "the oldest flow" would be seen
+    association.send("127.0.0.1", older.port(), b"a").await;
+    assert_eq!(association.recv().await, (older, b"a".to_vec()));
+    association
+        .send("::ffff:127.0.0.1", mapped.port(), b"bb")
+        .await;
+    // `recv` reads the address type: IPv4 equals `mapped`, IPv6 would not
+    assert_eq!(association.recv().await, (mapped, b"bb".to_vec()));
+    drop(association);
+    let records = finished(&h, 2).await;
+    let record = |echo: SocketAddr| {
+        records
+            .iter()
+            .find(|r| r.dst == echo.to_string())
+            .unwrap_or_else(|| panic!("no record of {echo}: {records:?}"))
+    };
+    assert_eq!((record(older).up, record(older).down), (1, 1));
+    assert_eq!((record(mapped).up, record(mapped).down), (2, 2));
+}
+
 /// A reload keeps the built-in DIRECT: the association's flow to a new
 /// target leaves from the source port the earlier flows had (full cone).
 #[tokio::test]
