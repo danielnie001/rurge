@@ -3,7 +3,7 @@
 
 use crate::listener::{ListenerOpts, Running, bind, serve};
 use crate::session::{DialError, Dialer, FailKind, SessionOutcome, UdpAdmission};
-use crate::udp::{Socks5UdpClient, canonical_host};
+use crate::udp::Socks5UdpClient;
 use rurge_config::HostName;
 use rurge_config::session::{ListenerKind, SessionInfo, Transport};
 use rurge_proto::RejectKind;
@@ -147,7 +147,7 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Result<Request, u8>>
     }
     Ok(Ok(Request {
         command: head[1],
-        host: canonical_host(host),
+        host: host.canonical(),
         port,
     }))
 }

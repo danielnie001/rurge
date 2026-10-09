@@ -205,6 +205,10 @@ async fn receive(
     let _dead = dead.drop_guard();
     let mut buf = vec![0u8; DATAGRAM];
     while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+        // a server whose socket is dual-stack reports an IPv4 source as
+        // `::ffff:a.b.c.d`; the flows are told apart by the IPv4 address the
+        // client named, and the client is told the same
+        let from = Target::new(from.host.canonical(), from.port);
         if let Some(flow) = routes.flow_for(&from) {
             flow.handle.add_down(n as u64);
             flow.handle.mark_first_byte();
@@ -798,6 +802,92 @@ mod tests {
         assert!(Arc::ptr_eq(&routes.flow_for(&from(443)).unwrap(), &c));
         assert!(Arc::ptr_eq(&routes.flow_for(&from(53)).unwrap(), &b));
         assert!(Arc::ptr_eq(&routes.flow_for(&from(7)).unwrap(), &a));
+    }
+
+    /// A carrier that hears one datagram, from `from`, and nothing after it.
+    struct HearsOnce(Mutex<Option<(Vec<u8>, Target)>>);
+
+    impl PacketSocket for HearsOnce {
+        fn send_to<'a>(&'a self, _: &'a [u8], _: &'a Target) -> BoxFuture<'a, io::Result<()>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn recv_from<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> BoxFuture<'a, io::Result<(usize, Target)>> {
+            Box::pin(std::future::ready(match self.0.lock().unwrap().take() {
+                Some((payload, from)) => {
+                    buf[..payload.len()].copy_from_slice(&payload);
+                    Ok((payload.len(), from))
+                }
+                // ends `receive`
+                None => Err(io::ErrorKind::ConnectionAborted.into()),
+            }))
+        }
+    }
+
+    /// A client that keeps what it is sent.
+    #[derive(Default)]
+    struct Hears(Mutex<Vec<(Vec<u8>, Target)>>);
+
+    impl UdpClient for Hears {
+        fn recv<'a>(&'a self, _: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn send<'a>(
+            &'a self,
+            payload: &'a [u8],
+            from: &'a Target,
+        ) -> BoxFuture<'a, io::Result<()>> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((payload.to_vec(), from.clone()));
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    /// A server whose socket is dual-stack reports the source of an answer
+    /// from an IPv4 host as `::ffff:a.b.c.d`. The flow that sent to the IPv4
+    /// address owns that answer — not the oldest flow of the carrier — and the
+    /// client hears it from the IPv4 address.
+    #[tokio::test]
+    async fn an_answer_from_a_source_in_ipv6_form_finds_its_flow() {
+        let flow = |port: u16| {
+            Arc::new(Flow::new(
+                SessionHandle::new(
+                    u64::from(port),
+                    SessionInfo::udp(HostName::parse("10.0.0.1"), port),
+                ),
+                port,
+            ))
+        };
+        let (oldest, wanted) = (flow(9), flow(53));
+        let routes = Arc::new(Routes::default());
+        routes.add(Target::new(HostName::parse("10.0.0.9"), 9), &oldest);
+        routes.add(Target::new(HostName::parse("10.0.0.1"), 53), &wanted);
+        let client = Arc::new(Hears::default());
+        let socket = HearsOnce(Mutex::new(Some((
+            b"answer".to_vec(),
+            Target::new(HostName::parse("::ffff:10.0.0.1"), 53),
+        ))));
+        receive(
+            Arc::new(socket),
+            routes,
+            client.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!((oldest.handle.bytes().1, wanted.handle.bytes().1), (0, 6));
+        assert_eq!(
+            *client.0.lock().unwrap(),
+            [(
+                b"answer".to_vec(),
+                Target::new(HostName::parse("10.0.0.1"), 53)
+            )]
+        );
     }
 
     /// A carrier whose sends never finish: a stream stuck behind a peer that

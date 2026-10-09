@@ -169,7 +169,7 @@ async fn connect(
     let Some(authority) = req.uri().authority().cloned() else {
         return Ok(responses::bad_request("CONNECT needs host:port"));
     };
-    let host = HostName::parse(authority.host());
+    let host = HostName::parse(authority.host()).canonical();
     // RFC 7231 §4.3.6: the CONNECT target is always host:port, never a bare host.
     let Some(port) = authority.port_u16() else {
         return Ok(responses::bad_request("CONNECT needs host:port"));
@@ -362,7 +362,7 @@ async fn forward(
             "only http:// absolute URIs can be forwarded",
         ));
     }
-    let host = HostName::parse(authority.host());
+    let host = HostName::parse(authority.host()).canonical();
     let port = authority.port_u16().unwrap_or(80);
     let mut session = session_for(&ctx, host, port);
     session.protocol = Some(ProtocolKind::Http);
@@ -546,6 +546,7 @@ mod tests {
     use super::*;
     use crate::testing::{FakeDialer, echo_server};
     use rurge_net::testing::TestServer;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::sync::CancellationToken;
@@ -666,6 +667,34 @@ mod tests {
         );
         assert_eq!(info.in_port, running.local_addr.port());
         assert!(sessions[0].is_finished());
+    }
+
+    /// A client may write an IPv4 target in IPv6 form (`::ffff:a.b.c.d`), in a
+    /// CONNECT or in an absolute URI: the dialer, and with it the rules, get the
+    /// IPv4 address, as they do from the SOCKS5 listener.
+    #[tokio::test]
+    async fn an_ipv4_mapped_target_is_dialed_as_ipv4() {
+        let (running, dialer) = listener(ListenerOpts::default()).await;
+        let (_tunnel, head) = raw(
+            running.local_addr,
+            "CONNECT [::ffff:127.0.0.1]:443 HTTP/1.1\r\nHost: [::ffff:127.0.0.1]:443\r\n\r\n",
+        )
+        .await;
+        let _ = raw(
+            running.local_addr,
+            "GET http://[::ffff:127.0.0.1]:8080/ HTTP/1.1\r\nHost: [::ffff:127.0.0.1]:8080\r\n\r\n",
+        )
+        .await;
+        let want = HostName::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let dialed: Vec<(HostName, u16)> = dialer
+            .sessions()
+            .iter()
+            .map(|h| (h.session().dst_host.clone(), h.session().dst_port))
+            .collect();
+        assert_eq!(dialed, [(want.clone(), 443), (want, 8080)]);
+        // `FakeDialer` reaches its echo server through "127.0.0.1" only:
+        // dialed in another form, the CONNECT would have been refused
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     }
 
     #[tokio::test]

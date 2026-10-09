@@ -59,18 +59,6 @@ fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// A target the way the engine is handed it: an IPv4 address that the client
-/// wrote in IPv6 form (`::ffff:a.b.c.d`, as an address or as a name) is the
-/// IPv4 address it names. The datagrams go out over an IPv4 socket, and the
-/// answers say they come from the IPv4 address — the form the outbounds
-/// report — which is how the engine finds the flow they belong to.
-pub(crate) fn canonical_host(host: HostName) -> HostName {
-    match host {
-        HostName::Ip(ip) => HostName::Ip(canonical(ip)),
-        name => name,
-    }
-}
-
 /// RSV RSV FRAG ATYP ADDR PORT: where the datagram goes and where its
 /// payload starts; `None` for a fragment (FRAG ≠ 0, never reassembled), an
 /// unknown address type, or a name that is no host name.
@@ -95,7 +83,7 @@ pub(crate) fn parse_header(datagram: &[u8]) -> Option<(Target, usize)> {
         _ => return None,
     };
     let port = u16::from_be_bytes(datagram.get(end..end + 2)?.try_into().ok()?);
-    Some((Target::new(canonical_host(host), port), end + 2))
+    Some((Target::new(host.canonical(), port), end + 2))
 }
 
 /// The header of a datagram to the client, as coming from `from` (an IPv4

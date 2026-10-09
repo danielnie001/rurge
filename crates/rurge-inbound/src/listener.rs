@@ -121,6 +121,17 @@ fn warn_due(map: &mut HashMap<IpAddr, Instant>, source: IpAddr, now: Instant) ->
     true
 }
 
+/// The client the way the rules and the request log name it. An IPv4 client
+/// of a listener bound to an IPv6 address (dual-stack on Linux and macOS)
+/// shows up as `::ffff:a.b.c.d`, which no IPv4 `SRC-IP` network contains.
+fn canonical_peer(peer: SocketAddr) -> SocketAddr {
+    match peer.ip().to_canonical() {
+        IpAddr::V4(v4) => SocketAddr::new(IpAddr::V4(v4), peer.port()),
+        // as it is, scope and all
+        IpAddr::V6(_) => peer,
+    }
+}
+
 pub(crate) fn serve<F, Fut>(
     listener: TcpListener,
     name: &'static str,
@@ -158,6 +169,7 @@ where
                         let _ = stream.set_nodelay(true);
                         rurge_net::socket::keep_alive(&stream);
                         let h = handler.clone();
+                        let peer = canonical_peer(peer);
                         sessions.spawn(async move { h(stream, peer).await });
                     }
                     Err(e) => {
@@ -226,6 +238,19 @@ mod tests {
         let t2 = t1 + REJECTED_SOURCE_LOG_INTERVAL;
         assert!(warn_due(&mut map, ip(7), t2));
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn an_ipv4_client_of_a_dual_stack_listener_is_named_by_its_ipv4_address() {
+        let addr = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert_eq!(
+            canonical_peer(addr("[::ffff:192.168.1.7]:5555")),
+            addr("192.168.1.7:5555")
+        );
+        // what is no IPv4 client stays as the socket reported it
+        for same in ["192.168.1.7:5555", "[2001:db8::1]:6", "[::1]:7"] {
+            assert_eq!(canonical_peer(addr(same)), addr(same), "{same}");
+        }
     }
 
     /// What a listener takes keeps itself alive: a client gone without a
