@@ -620,35 +620,44 @@ fn lock_data_dir(dir: &Path) -> Result<Option<File>, String> {
     }
 }
 
-/// Crash recovery for a start that ends at the profile. A run that died with
-/// the system proxy pointing at it is undone by the next start, but only a
-/// profile that loads gets a start that far: one broken in the meantime
-/// would leave the machine pointing at a dead port until it is repaired.
+/// Whether `state.json` holds a system proxy backup. Read here rather than
+/// through `StateStore`, which moves a file it cannot parse aside and says
+/// so in the log: where this is asked there is no log, and without a backup
+/// nothing there has any business with the file.
+fn holds_a_backup(state: &Path) -> bool {
+    std::fs::read_to_string(state)
+        .ok()
+        .and_then(|text| serde_json::from_str::<State>(&text).ok())
+        .is_some_and(|state| state.system_proxy_backup.is_some())
+}
+
+/// Crash recovery for a start that ends before it has a log: at a profile
+/// that does not load, or at a log file that cannot be opened. A run that
+/// died with the system proxy pointing at it is undone by the next start, but
+/// only by one that gets as far as its own recovery: a start that ends here
+/// every time would leave the machine pointing at a dead port until whatever
+/// stops it is repaired.
 ///
 /// Unlike a start, this leaves a directory rurge keeps no state in exactly as
 /// it finds it: the data directory is not created, and `state.json` is looked
 /// for before the lock, so not even `rurge.lock` appears. What happened goes
-/// to standard error, because logging starts only with a loaded profile, and
-/// never changes how the start ends.
-fn recover_without_a_profile(args: &RuntimeArgs) {
+/// to standard error, there being no log, and never changes how the start
+/// ends.
+fn recover_without_a_log(args: &RuntimeArgs) {
     let dir = args.data_dir();
     let path = dir.join(STATE_FILE);
     if !path.is_file() {
         return;
     }
-    // As at a start, only a lock somebody else holds is a refusal: the backup
-    // is then that live instance's to restore.
-    let Ok(_lock) = lock_data_dir(&dir) else {
+    // Only with the lock in hand. Held by somebody else, the backup is that
+    // live instance's to restore; and where no lock can be had at all,
+    // nothing shows that there is no such instance. A start runs unlocked
+    // there rather than not at all, but this one is ending anyway: the
+    // backup waits for a start that gets further.
+    let Ok(Some(_lock)) = lock_data_dir(&dir) else {
         return;
     };
-    // Read here rather than through `StateStore`, which moves a file it
-    // cannot parse aside and says so in the log: there is no log yet, and
-    // without a backup nothing here has any business with the file.
-    let left_behind = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<State>(&text).ok())
-        .is_some_and(|state| state.system_proxy_backup.is_some());
-    if !left_behind {
+    if !holds_a_backup(&path) {
         return;
     }
     let backend = match super::sysproxy::backend() {
@@ -660,21 +669,25 @@ fn recover_without_a_profile(args: &RuntimeArgs) {
     };
     let recovered = match tokio::runtime::Builder::new_current_thread().build() {
         Ok(runtime) => runtime.block_on(async {
-            let (store, _) = StateStore::open(path).await;
+            let (store, _) = StateStore::open(path.clone()).await;
             SystemProxyManager::new(backend, store).recover().await
         }),
         Err(e) => Some(Err(e.to_string())),
     };
     match recovered {
+        // Forgetting the backup is a rewrite of `state.json`, and one that
+        // fails reaches nothing but the log. A backup still there is restored
+        // again by the next start, over whatever has been set since.
+        Some(Ok(())) if holds_a_backup(&path) => eprintln!(
+            "warning: a previous run left the system proxy pointing at rurge; the saved settings were restored, but state.json could not be updated: the next start restores them again"
+        ),
         Some(Ok(())) => eprintln!(
             "warning: a previous run left the system proxy pointing at rurge; the saved settings were restored"
         ),
         Some(Err(e)) => eprintln!(
             "warning: cannot restore the system proxy: {e}; the saved settings stay in state.json and are restored on the next start"
         ),
-        // The store reads the file again; it finds the backup gone only when
-        // somebody else took it away meanwhile, in a directory that cannot
-        // be locked.
+        // not under the lock: the store has just read the file looked at above
         None => {}
     }
 }
@@ -689,19 +702,21 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // A profile that does not load ends the start here, in one of two ways;
     // in both, what a crashed run left behind is put back on the way out.
     let loaded = rurge_engine::load_checked(&args.config, &opts)
-        .inspect_err(|_| recover_without_a_profile(&args.runtime))?;
+        .inspect_err(|_| recover_without_a_log(&args.runtime))?;
     if loaded.diagnostics.has_errors() {
         print_diagnostics(&loaded.diagnostics.sorted());
-        recover_without_a_profile(&args.runtime);
+        recover_without_a_log(&args.runtime);
         return Ok(ExitCode::from(2));
     }
     print_diagnostics(&loaded.diagnostics.sorted());
     let cfg = loaded.config;
+    // A log file that cannot be opened ends it as well, and in the same way.
     let (_log_guard, level_handle) = init_logging(
         args.log_level
             .unwrap_or_else(|| level_for(&cfg.general.loglevel)),
         args.log_file.as_deref(),
-    )?;
+    )
+    .inspect_err(|_| recover_without_a_log(&args.runtime))?;
     let rt = args.runtime.resolve(&cfg)?;
     // Named, so the lock lives until `run` returns — past the shutdown restore.
     let _instance_lock = match lock_data_dir(&rt.data_dir) {

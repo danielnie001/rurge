@@ -2629,7 +2629,7 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             if std::time::Instant::now() > deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("rurge run did not give up on its profile within 20 s");
+                panic!("rurge run did not give up within 20 s");
             }
             std::thread::sleep(Duration::from_millis(100));
         };
@@ -2899,6 +2899,127 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
                 std::fs::read_to_string(data.join("state.json")).unwrap(),
                 "{ not json"
             );
+        }
+    }
+
+    /// A data directory that cannot be locked: nothing shows that the backup
+    /// is a dead run's and not a live instance's. A start runs there without
+    /// the lock rather than not at all; a start that is about to end anyway
+    /// leaves the backup to one that gets further.
+    #[test]
+    fn a_profile_that_does_not_load_restores_nothing_in_a_data_dir_it_cannot_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = crashed_with_the_system_proxy_on(dir.path());
+        let file = sysproxy_file(&data);
+        let applied = std::fs::read_to_string(&file).unwrap();
+        let state = std::fs::read_to_string(data.join("state.json")).unwrap();
+        // a directory where the lock file belongs: it cannot be opened as one
+        let lock = data.join("rurge.lock");
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        for (profile, says) in profiles_that_do_not_load(dir.path()) {
+            let (code, stderr) = give_up(rurge_run(&profile, &data));
+            assert_eq!(code, Some(2), "{stderr}");
+            assert!(stderr.contains(says), "{stderr}");
+            assert!(!stderr.contains("system proxy"), "{stderr}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), applied);
+            assert_eq!(
+                std::fs::read_to_string(data.join("state.json")).unwrap(),
+                state
+            );
+        }
+        // left, not lost: with a lock to take, the next attempt restores
+        std::fs::remove_dir(&lock).unwrap();
+        let [(broken, _), _] = profiles_that_do_not_load(dir.path());
+        let (code, stderr) = give_up(rurge_run(&broken, &data));
+        assert_eq!(code, Some(2), "{stderr}");
+        assert_restored(&data, &stderr);
+    }
+
+    /// The settings went back, but `state.json` could not be rewritten: the
+    /// backup is still in it, and the next start restores it once more, over
+    /// whatever has been set since. That is what is said, not "restored".
+    #[test]
+    fn run_says_so_when_it_restored_but_cannot_update_the_state() {
+        const NOT_UPDATED: &str = "warning: a previous run left the system proxy pointing at rurge; the saved settings were restored, but state.json could not be updated: the next start restores them again\n";
+        let dir = tempfile::tempdir().unwrap();
+        let data = crashed_with_the_system_proxy_on(dir.path());
+        let file = sysproxy_file(&data);
+        let state = std::fs::read_to_string(data.join("state.json")).unwrap();
+        // the store writes `state.json.tmp` and renames it: a directory of
+        // that name is in the way of every rewrite
+        let in_the_way = data.join("state.json.tmp");
+        std::fs::create_dir(&in_the_way).unwrap();
+        for (profile, says) in profiles_that_do_not_load(dir.path()) {
+            let (code, stderr) = give_up(rurge_run(&profile, &data));
+            assert_eq!(code, Some(2), "{stderr}");
+            assert!(stderr.contains(says), "{stderr}");
+            assert_eq!(stderr.matches(NOT_UPDATED).count(), 1, "{stderr}");
+            assert!(!stderr.contains(RESTORED), "{stderr}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+            assert_eq!(
+                std::fs::read_to_string(data.join("state.json")).unwrap(),
+                state
+            );
+            // what the next start, true to its word, puts the backup over
+            std::fs::write(&file, "set since").unwrap();
+        }
+        std::fs::remove_dir(&in_the_way).unwrap();
+        let [(broken, _), _] = profiles_that_do_not_load(dir.path());
+        let (code, stderr) = give_up(rurge_run(&broken, &data));
+        assert_eq!(code, Some(2), "{stderr}");
+        assert_restored(&data, &stderr);
+    }
+
+    /// A log file `rurge run` cannot open: where its directory would be there
+    /// is a regular file.
+    fn log_file_that_cannot_be_opened(dir: &Path) -> std::path::PathBuf {
+        let in_the_way = dir.join("logs");
+        std::fs::write(&in_the_way, "").unwrap();
+        in_the_way.join("rurge.log")
+    }
+
+    /// The profile loads, but the log file cannot be opened: this start, too,
+    /// ends before its own recovery, and for a reason that goes well with a
+    /// crash (a full disk, a log directory on a mount that is gone).
+    #[test]
+    fn run_restores_a_crashed_system_proxy_when_the_log_file_cannot_be_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = crashed_with_the_system_proxy_on(dir.path());
+        // the profile of the crashed run: it loads
+        let mut cmd = rurge_run(&dir.path().join("t.conf"), &data);
+        cmd.arg("--log-file")
+            .arg(log_file_that_cannot_be_opened(dir.path()));
+        let (code, stderr) = give_up(cmd);
+        assert_eq!(code, Some(2), "{stderr}");
+        assert!(stderr.contains("error: cannot open log file"), "{stderr}");
+        assert_restored(&data, &stderr);
+    }
+
+    #[test]
+    fn a_log_file_that_cannot_be_opened_says_nothing_about_the_system_proxy_without_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let state = r#"{"version":1,"outbound_mode":"direct","system_proxy_backup":null}"#;
+        std::fs::write(data.join("state.json"), state).unwrap();
+        let log = log_file_that_cannot_be_opened(dir.path());
+        for backend in [None, Some("bogus")] {
+            let mut cmd = rurge_run(&conf, &data);
+            cmd.arg("--log-file").arg(&log);
+            if let Some(backend) = backend {
+                cmd.env("RURGE_SYSTEM_PROXY_BACKEND", backend);
+            }
+            let (code, stderr) = give_up(cmd);
+            assert_eq!(code, Some(2), "{stderr}");
+            assert!(stderr.contains("error: cannot open log file"), "{stderr}");
+            assert!(!stderr.contains("system proxy"), "{stderr}");
+            assert_eq!(
+                std::fs::read_to_string(data.join("state.json")).unwrap(),
+                state
+            );
+            assert!(!sysproxy_file(&data).exists());
         }
     }
 }
