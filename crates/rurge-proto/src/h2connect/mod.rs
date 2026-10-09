@@ -328,7 +328,11 @@ mod tests {
     }
 
     /// `h2-connect, 127.0.0.1, <the fake's port><extra>`.
-    fn outbound(fake: &FakeH2Proxy, extra: &str, fixture: &TlsFixture) -> H2ConnectOutbound {
+    pub(super) fn outbound(
+        fake: &FakeH2Proxy,
+        extra: &str,
+        fixture: &TlsFixture,
+    ) -> H2ConnectOutbound {
         outbound_with(
             &format!("h2-connect, 127.0.0.1, {}{extra}", fake.addr().port()),
             fixture,
@@ -342,7 +346,7 @@ mod tests {
         (fixture, fake)
     }
 
-    fn target(addr: SocketAddr) -> Target {
+    pub(super) fn target(addr: SocketAddr) -> Target {
         Target::new(HostName::Ip(addr.ip()), addr.port())
     }
 
@@ -787,7 +791,7 @@ mod tests {
     }
 
     /// A fake that serves CONNECT-UDP.
-    async fn udp_fake(script: H2ProxyScript) -> (Arc<TlsFixture>, FakeH2Proxy) {
+    pub(super) async fn udp_fake(script: H2ProxyScript) -> (Arc<TlsFixture>, FakeH2Proxy) {
         fake(H2ProxyScript {
             extended_connect: true,
             ..script

@@ -1657,17 +1657,21 @@ M = select, policy-path=https://sub.test/m, external-policy-modifier=\"underlyin
         assert_eq!(a.cycles, [["P", "Q", "P"]]);
     }
 
-    /// Quoted items or unclosed quotes in a subscription line may not bypass
-    /// the check that the line's parameters match what the modifier sets. The
-    /// check is done on the parsed, modified policy, so every spelling of a
-    /// parameter that gets around `with_params` is still caught.
+    /// The user's modifier reaches a line however the line is spelled: an
+    /// item in quotes is the parameter it reads as and takes the modifier's
+    /// value, and an unclosed quote at the end of the line keeps nothing of
+    /// the modifier away — a line cannot shed the relay or the certificate
+    /// the user gives it. Nor does an unclosed quote hide a line's own
+    /// `client-cert` or relay from the check that follows the modifier.
     #[test]
-    fn a_modified_line_may_not_keep_its_own_value_by_its_spelling() {
+    fn a_line_does_not_get_around_the_modifier_by_its_spelling() {
         let cfg = profile(
             "Corp = http, corp.test, 80",
             "Pool = select, Corp\n\
 R = select, policy-path=https://sub.test/r, external-policy-modifier=\"underlying-proxy=Corp\"\n\
-C = select, policy-path=https://sub.test/c, external-policy-modifier=\"client-cert=my-cert\"",
+C = select, policy-path=https://sub.test/c, external-policy-modifier=\"client-cert=my-cert\"\n\
+T = select, policy-path=https://sub.test/t, external-policy-modifier=\"tfo=true\"\n\
+[Keystore]\nmy-cert = type=p12, base64=QUJD\ncorp-cert = type=p12, base64=QUJD",
         );
         let a = assemble(
             &cfg,
@@ -1682,38 +1686,104 @@ Plain = http, p.test, 80, underlying-proxy=Pool",
                     ),
                     (
                         "C",
-                        "QuotedCert = https, c.test, 443, \"client-cert=corp-cert\"",
+                        "QuotedCert = https, c.test, 443, \"client-cert=corp-cert\"\n\
+SwallowCert = https, d.test, 443, foo=\"bar",
+                    ),
+                    (
+                        "T",
+                        "OwnCert = https, e.test, 443, client-cert=corp-cert, foo=\"bar\n\
+OwnRelay = http, f.test, 80, underlying-proxy=Pool, foo=\"bar\n\
+Fast = http, g.test, 80, foo=\"bar",
                     ),
                 ],
             ),
         );
-        assert_eq!(members(&a, "R"), ["Plain"]);
-        assert_eq!(members(&a, "C"), &[] as &[&str]);
-        let relay = |name: &str| {
+        assert_eq!(members(&a, "R"), ["Quoted", "Swallow", "Plain"]);
+        assert_eq!(members(&a, "C"), ["QuotedCert", "SwallowCert"]);
+        assert_eq!(members(&a, "T"), ["Fast"]);
+        let spec = |name: &str| {
             a.imported
                 .iter()
                 .find(|i| i.policy.name == name)
                 .and_then(|i| i.spec.as_ref())
-                .and_then(|s| s.common.underlying_proxy.clone())
+                .unwrap_or_else(|| panic!("{name} has a spec"))
         };
-        assert_eq!(relay("Plain").as_deref(), Some("Corp"));
+        for name in ["Quoted", "Swallow", "Plain"] {
+            assert_eq!(
+                spec(name).common.underlying_proxy.as_deref(),
+                Some("Corp"),
+                "{name}"
+            );
+        }
+        for name in ["QuotedCert", "SwallowCert"] {
+            assert_eq!(spec(name).proto.keystore_item(), Some("my-cert"), "{name}");
+        }
+        assert!(spec("Fast").common.tfo);
         assert_eq!(
             warnings(&a),
             [
                 (
                     codes::W_SET_LINES_SKIPPED,
-                    "policy group `R`: `policy-path` line 1: `external-policy-modifier` cannot set `underlying-proxy` on this line; skipped".to_string()
+                    "policy group `T`: `policy-path` line 1: a subscription line's own `client-cert` is not honoured (only `external-policy-modifier` may set it); skipped".to_string()
                 ),
                 (
                     codes::W_SET_LINES_SKIPPED,
-                    "policy group `R`: `policy-path` line 2: `external-policy-modifier` cannot set `underlying-proxy` on this line; skipped".to_string()
-                ),
-                (
-                    codes::W_SET_LINES_SKIPPED,
-                    "policy group `C`: `policy-path` line 1: `external-policy-modifier` cannot set `client-cert` on this line; skipped".to_string()
+                    "policy group `T`: `policy-path` line 2: a subscription line's own `underlying-proxy` may not name a policy or group of the profile (only `external-policy-modifier` may); skipped".to_string()
                 ),
             ]
         );
+    }
+
+    /// The check that follows the modifier looks at the line as it will be
+    /// used, whatever became of the modifier on the way: a value of the
+    /// line's own beside the modifier's, or the modifier's taken in by an
+    /// unclosed quote, and the line is refused.
+    #[test]
+    fn a_line_that_is_not_as_the_modifier_sets_it_is_refused() {
+        let cfg = profile("Corp = http, corp.test, 80", "Pool = select, Corp");
+        let span = cfg.policies[0].span.clone();
+        let refusal = |key: &str, value: &str, definition: &str| {
+            let policy = parse_policy("X", definition, &span).expect("a policy line");
+            reaches_into_profile(&cfg, &policy, &[(key.to_string(), value.to_string())])
+        };
+        assert_eq!(
+            refusal(
+                "underlying-proxy",
+                "Corp",
+                "http, x.test, 80, underlying-proxy=Corp"
+            ),
+            None
+        );
+        for (key, value, definition) in [
+            (
+                "underlying-proxy",
+                "Corp",
+                "http, x.test, 80, underlying-proxy=Pool, underlying-proxy=Corp",
+            ),
+            (
+                "underlying-proxy",
+                "Corp",
+                "http, x.test, 80, foo=\"bar, underlying-proxy=Corp",
+            ),
+            (
+                "client-cert",
+                "my-cert",
+                "https, x.test, 443, client-cert=corp-cert, client-cert=my-cert",
+            ),
+            (
+                "client-cert",
+                "my-cert",
+                "https, x.test, 443, foo=\"bar, client-cert=my-cert",
+            ),
+        ] {
+            assert_eq!(
+                refusal(key, value, definition),
+                Some(format!(
+                    "`external-policy-modifier` cannot set `{key}` on this line"
+                )),
+                "{definition}"
+            );
+        }
     }
 
     /// A subscription is somebody else's content: its lines may not reach

@@ -13,6 +13,7 @@ use crate::task::AbortOnDrop;
 use rurge_net::BoxFuture;
 use rurge_net::connector::{ConnectOpts, PacketSocket, Target};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -100,6 +101,51 @@ impl H2Udp {
         }
     }
 
+    /// `to`'s stream and the slot it is in: `open` opens one when there is
+    /// none, and one more when that one has ended already.
+    async fn stream<F, Fut>(&self, to: &Target, open: F) -> io::Result<(Slot, Arc<Stream>)>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = io::Result<Arc<Stream>>>,
+    {
+        let mut reopened = false;
+        loop {
+            let slot = self.slot(to);
+            let stream = match slot.get_or_try_init(&open).await {
+                Ok(stream) => stream.clone(),
+                Err(e) => {
+                    self.forget(to, &slot);
+                    return Err(e);
+                }
+            };
+            // A sender waiting on a cell whose opener failed opens
+            // again, after that opener forgot the slot: the stream must
+            // be reachable from the table or its answers are lost.
+            let mut streams = self.streams.lock().expect("streams");
+            // an ended stream is not revived: open again
+            if stream.ended.is_cancelled() {
+                // once only: a proxy may end every stream at once
+                if reopened {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "h2-connect: the server ended the UDP stream",
+                    ));
+                }
+                reopened = true;
+                continue;
+            }
+            match streams.get(to) {
+                None => {
+                    streams.insert(to.clone(), slot.clone());
+                    return Ok((slot, stream));
+                }
+                Some(s) if Arc::ptr_eq(s, &slot) => return Ok((slot, stream)),
+                // another slot took its place: use that one
+                Some(_) => {}
+            }
+        }
+    }
+
     async fn open(&self, to: &Target) -> io::Result<Arc<Stream>> {
         // one budget for the connection (when one is dialed), TLS, the
         // HTTP/2 handshake and the CONNECT-UDP exchange
@@ -178,42 +224,7 @@ impl PacketSocket for H2Udp {
                     format!("h2-connect: a datagram longer than {MAX_PAYLOAD} bytes"),
                 ));
             }
-            let mut reopened = false;
-            let (slot, stream) = loop {
-                let slot = self.slot(to);
-                let stream = match slot.get_or_try_init(|| self.open(to)).await {
-                    Ok(stream) => stream.clone(),
-                    Err(e) => {
-                        self.forget(to, &slot);
-                        return Err(e);
-                    }
-                };
-                // A sender waiting on a cell whose opener failed opens
-                // again, after that opener forgot the slot: the stream must
-                // be reachable from the table or its answers are lost.
-                let mut streams = self.streams.lock().expect("streams");
-                // an ended stream is not revived: open again
-                if stream.ended.is_cancelled() {
-                    // once only: a proxy may end every stream at once
-                    if reopened {
-                        return Err(io::Error::new(
-                            io::ErrorKind::ConnectionAborted,
-                            "h2-connect: the server ended the UDP stream",
-                        ));
-                    }
-                    reopened = true;
-                    continue;
-                }
-                match streams.get(to) {
-                    None => {
-                        streams.insert(to.clone(), slot.clone());
-                        break (slot, stream);
-                    }
-                    Some(s) if Arc::ptr_eq(s, &slot) => break (slot, stream),
-                    // another slot took its place: use that one
-                    Some(_) => {}
-                }
-            };
+            let (slot, stream) = self.stream(to, || self.open(to)).await?;
             *stream.last.lock().expect("clock") = Instant::now();
             let capsule = connect_udp::datagram(buf);
             let mut writer = stream.writer.lock().await;
@@ -240,5 +251,50 @@ impl PacketSocket for H2Udp {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::h2connect::tests::{outbound, target, udp_fake};
+    use crate::testing::{H2ProxyScript, udp_echo_server};
+    use std::sync::atomic::AtomicUsize;
+
+    /// A proxy that answers 200 and ends every stream at once: a datagram
+    /// that finds its stream ended opens one more, and fails when that one
+    /// has ended too. The loop is handed each stream after its reader has
+    /// seen the end: on its own it may look before that.
+    #[tokio::test]
+    async fn a_stream_that_has_ended_is_opened_again_only_once() {
+        let echo = udp_echo_server().await;
+        let (fixture, fake) = udp_fake(H2ProxyScript {
+            udp_end_at_once: true,
+            ..H2ProxyScript::default()
+        })
+        .await;
+        let out = outbound(&fake, ", udp-relay=true", &fixture);
+        let authority = out.inner.udp_authority.clone().expect("`udp-relay=true`");
+        let udp = H2Udp::new(out.inner.clone(), authority, ConnectOpts::default(), IDLE);
+        let to = target(echo);
+        let opens = AtomicUsize::new(0);
+        let ended = || async {
+            let n = opens.fetch_add(1, Ordering::Relaxed) + 1;
+            assert!(n <= 2, "opened a third time");
+            let stream = udp.open(&to).await?;
+            stream.ended.cancelled().await;
+            Ok(stream)
+        };
+        let found = tokio::time::timeout(Duration::from_secs(10), udp.stream(&to, ended))
+            .await
+            .expect("an end within the bound");
+        let err = found.map(drop).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(
+            err.to_string(),
+            "h2-connect: the server ended the UDP stream"
+        );
+        assert_eq!(opens.load(Ordering::Relaxed), 2);
+        assert_eq!(fake.requests().len(), 2);
     }
 }

@@ -271,13 +271,24 @@ pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPo
 /// `definition` with the parameters of `overrides` in place (phase 2 M3
 /// design 5.3, `external-policy-modifier`): a key the line has is replaced
 /// where it first appears and dropped where it repeats, a key it lacks is
-/// appended. Keys compare case-insensitively; every other item keeps its
-/// text.
+/// appended. An item's key is the one the parser reads — with the quotes
+/// around a whole item taken off, without its case; every other item keeps
+/// its text.
+///
+/// The line then reads as it did alone, the overrides in place. What is
+/// appended therefore stands in front of a last item that leaves a quote or
+/// a group open: the parser gives such an item the rest of the line.
 pub fn with_params(definition: &str, overrides: &[(String, String)]) -> String {
     let mut written: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
-    for item in crate::redact::split_top_level(definition) {
-        let key = parse_key_value(item.trim()).map(|(k, _)| k.to_ascii_lowercase());
+    let items = crate::redact::split_top_level(definition);
+    let mut open_tail = false;
+    for (i, item) in items.iter().enumerate() {
+        let field = split_list(item).pop();
+        let key = field
+            .as_deref()
+            .and_then(parse_key_value)
+            .map(|(k, _)| k.to_ascii_lowercase());
         let found = key
             .as_ref()
             .and_then(|k| overrides.iter().find(|(o, _)| o.eq_ignore_ascii_case(k)));
@@ -288,15 +299,26 @@ pub fn with_params(definition: &str, overrides: &[(String, String)]) -> String {
                     out.push(format!("{lead}{k}={}", param_value(v)));
                 }
             }
-            None => out.push(item.to_string()),
+            None => {
+                out.push(item.to_string());
+                open_tail = i + 1 == items.len() && leaves_open(item);
+            }
         }
     }
-    for (k, v) in overrides {
-        if written.insert(k.to_ascii_lowercase()) {
-            out.push(format!(" {k}={}", param_value(v)));
-        }
-    }
+    let appended: Vec<String> = overrides
+        .iter()
+        .filter(|(k, _)| written.insert(k.to_ascii_lowercase()))
+        .map(|(k, v)| format!(" {k}={}", param_value(v)))
+        .collect();
+    let at = out.len() - usize::from(open_tail);
+    out.splice(at..at, appended);
     out.join(",")
+}
+
+/// Whether `item` — one item of a line — ends inside a quote or a
+/// parenthesised group: a comma after it would not end it.
+fn leaves_open(item: &str) -> bool {
+    crate::redact::split_top_level(&format!("{item},")).len() == 1
 }
 
 /// `value` as a line has to spell it to read it back the same. The parser
@@ -796,5 +818,139 @@ external-policy-modifier=\"password=hunter2\"",
         assert_eq!(p.params.get("double"), Some("\"abc\""));
         assert_eq!(p.params.get("spaced"), Some(" padded "));
         assert_eq!(p.positional, ["alice", "s3cret"]);
+    }
+
+    /// What the parser reads of `line` after its type, server and port: the
+    /// positional values, and each parameter's values in the order of the
+    /// line. Two parameters of different names have no order: no lookup
+    /// tells it.
+    fn read(line: &str) -> (Vec<String>, Vec<(String, String)>) {
+        let p = parse_policy("P", line, &span()).unwrap();
+        let mut params: Vec<(String, String)> = p
+            .params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        params.sort_by(|a, b| a.0.cmp(&b.0));
+        (p.positional, params)
+    }
+
+    /// What `line` reads as once `modifier` is in place: a parameter the
+    /// modifier names has the modifier's value where the line first has it
+    /// and is gone where the line repeats it, the rest of the modifier comes
+    /// after.
+    fn read_modified(
+        line: &str,
+        modifier: &[(String, String)],
+    ) -> (Vec<String>, Vec<(String, String)>) {
+        let p = parse_policy("P", line, &span()).unwrap();
+        let mut set: HashSet<&str> = HashSet::new();
+        let mut params: Vec<(String, String)> = Vec::new();
+        for (k, v) in p.params.iter() {
+            match modifier.iter().find(|(m, _)| m == k) {
+                Some((m, value)) => {
+                    if set.insert(m) {
+                        params.push((k.to_string(), value.clone()));
+                    }
+                }
+                None => params.push((k.to_string(), v.to_string())),
+            }
+        }
+        for (m, value) in modifier {
+            if set.insert(m) {
+                params.push((m.clone(), value.clone()));
+            }
+        }
+        params.sort_by(|a, b| a.0.cmp(&b.0));
+        (p.positional, params)
+    }
+
+    /// `with_params` and the parser agree on what a line's items are, for
+    /// every line of up to three of these: the parser takes the quotes off a
+    /// whole item before it looks for a key, keeps a comma inside a quoted
+    /// item, compares keys without their case, and gives an unclosed quote
+    /// or group the rest of the line — what is appended must not end up in
+    /// it.
+    #[test]
+    fn a_modified_line_reads_as_the_line_did_with_the_modifier_in_place() {
+        const ITEMS: [&str; 16] = [
+            " password=pw",
+            " tfo=false",
+            " Tfo = false ",
+            " alice",
+            "",
+            // a whole item in quotes is the parameter it reads as
+            " \"tfo=false\"",
+            " 'TFO=false'",
+            // a comma inside a quoted item is the item's
+            " \"sni=a.test,b.test\"",
+            " ws-path=\"/a,b\"",
+            // an unclosed quote, in a value, around an item, of a positional
+            " password=\"p,w",
+            " \"password=p,w",
+            " \"s3cret",
+            " sni='a.test",
+            // an unclosed group
+            " password=(p,w",
+            " (tfo=false",
+            // a backslash that takes the closing quote
+            " password=\"pw\\\"",
+        ];
+        let modifier = pairs(&[("tfo", "true"), ("sni", "edge.test")]);
+        let mut lines: Vec<String> = Vec::new();
+        for a in ITEMS {
+            lines.push(format!("trojan, t.test, 443,{a}"));
+            for b in ITEMS {
+                lines.push(format!("trojan, t.test, 443,{a},{b}"));
+                for c in ITEMS {
+                    lines.push(format!("trojan, t.test, 443,{a},{b},{c}"));
+                }
+            }
+        }
+        let mut wrong: Vec<String> = Vec::new();
+        for line in &lines {
+            // nothing to set leaves the line as it is
+            assert_eq!(&with_params(line, &[]), line);
+            let modified = with_params(line, &modifier);
+            if read(&modified) != read_modified(line, &modifier) {
+                wrong.push(format!("{line} -> {modified}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {} lines, the first of them: {:#?}",
+            wrong.len(),
+            lines.len(),
+            &wrong[..wrong.len().min(8)]
+        );
+    }
+
+    /// How such lines are written: a quoted item is replaced whole, and what
+    /// is appended stands in front of a last item that would take it for
+    /// its own.
+    #[test]
+    fn with_params_writes_around_quotes() {
+        let modifier = pairs(&[("tfo", "true"), ("sni", "edge.test")]);
+        for (line, modified) in [
+            (
+                "trojan, t.test, 443, 'tfo=false', password=pw, \"TFO=false\"",
+                "trojan, t.test, 443, tfo=true, password=pw, sni=edge.test",
+            ),
+            (
+                "trojan, t.test, 443, \"password=p,w\", \"sni=a.test,b.test\"",
+                "trojan, t.test, 443, \"password=p,w\", sni=edge.test, tfo=true",
+            ),
+            (
+                "trojan, t.test, 443, password=\"p,w",
+                "trojan, t.test, 443, tfo=true, sni=edge.test, password=\"p,w",
+            ),
+            // the open item is the one replaced: nothing is left open
+            (
+                "trojan, t.test, 443, password=pw, sni='a.test",
+                "trojan, t.test, 443, password=pw, sni=edge.test, tfo=true",
+            ),
+        ] {
+            assert_eq!(with_params(line, &modifier), modified, "{line}");
+        }
     }
 }

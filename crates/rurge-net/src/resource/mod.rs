@@ -245,14 +245,19 @@ impl ResourceHandle {
 /// One `ResourceManager` per configuration generation: there is no API to
 /// retire individual entries. On reload, build a new manager and drop the
 /// old one — cached files are re-read from disk, and the dropped manager's
-/// background tasks (see the periodic liveness checks in `url_task` /
-/// `file_task`) notice within 60 s and exit.
+/// background tasks exit: a URL task as soon as it waits for its next
+/// refresh (`gone`), a file task within 60 s (the periodic liveness checks in
+/// `file_task`).
 pub struct ResourceManager {
     root: PathBuf,
     client: Arc<HttpClient>,
     opts: ResourceOptions,
     entries: Mutex<HashMap<String, Arc<Entry>>>,
     self_weak: Mutex<Weak<ResourceManager>>,
+    /// Closed when the manager is dropped: its URL tasks wait on it beside
+    /// their timers, so none sits out a refresh interval with its entry
+    /// after the manager is gone.
+    gone: watch::Sender<()>,
 }
 
 fn unix(t: SystemTime) -> u64 {
@@ -326,6 +331,7 @@ impl ResourceManager {
             opts,
             entries: Mutex::new(HashMap::new()),
             self_weak: Mutex::new(Weak::new()),
+            gone: watch::Sender::new(()),
         });
         *mgr.self_weak.lock().expect("weak") = Arc::downgrade(&mgr);
         mgr
@@ -479,7 +485,7 @@ impl ResourceManager {
                     }
                     return;
                 }
-                self.spawn(url_task(self.weak(), entry));
+                self.spawn(url_task(self.weak(), entry, self.gone.subscribe()));
             }
             ResourceSource::File(path) => {
                 read_file(&entry, &path, 0);
@@ -530,7 +536,7 @@ fn next_due(entry: &Entry, backoff: Option<Duration>) -> Option<Duration> {
     }
 }
 
-async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>) {
+async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>, mut gone: watch::Receiver<()>) {
     let ResourceSource::Url(url) = entry.source.clone() else {
         return;
     };
@@ -550,6 +556,8 @@ async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>) {
         let kicked = tokio::select! {
             _ = tokio::time::sleep(wait) => false,
             _ = entry.kick.notified() => true,
+            // nothing is ever sent: this is the manager going
+            _ = gone.changed() => return,
         };
         if weak.upgrade().is_none() {
             return;
@@ -1157,5 +1165,41 @@ mod tests {
         // the first label stays
         mgr.get_labelled(&url_spec(url, None), "policy-path of `H`");
         assert_eq!(plain.entry.log_name(), "policy-path of `G`");
+    }
+
+    /// A manager that is dropped takes its URL tasks with it: a reload
+    /// leaves no task behind that sits out the rest of its refresh interval
+    /// — a day here — with the entry and its body.
+    #[tokio::test(start_paused = true)]
+    async fn a_url_task_ends_with_its_manager() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        let url = server.url("/day");
+        // fresh in the cache: nothing is due for a day
+        let meta = Meta {
+            url: url.to_string(),
+            fetched_at: unix(SystemTime::now()),
+            ..Meta::default()
+        };
+        cache::CacheDir::for_url(root.path(), url.as_str())
+            .store(b"cached", &meta)
+            .unwrap();
+        let mgr = manager(root.path(), fast());
+        let handle = mgr.get(&url_spec(url, Some(86_400)));
+        // the task has taken its entry and waits for the refresh
+        let waiting = || mgr.statuses()[0].next_refresh.is_some();
+        for _ in 0..100 {
+            if waiting() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(waiting(), "the task never ran");
+        let entry = Arc::downgrade(&handle.entry);
+        drop(handle);
+        drop(mgr);
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert_eq!(entry.strong_count(), 0, "the task still holds its entry");
+        assert_eq!(server.hits("/day"), 0);
     }
 }

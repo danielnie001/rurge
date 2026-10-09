@@ -11,6 +11,7 @@ use crate::task::AbortOnDrop;
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts, PacketSocket, Target};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -93,6 +94,51 @@ impl VmessUdp {
         }
     }
 
+    /// `to`'s connection and the slot it is in: `dial` opens one when there
+    /// is none, and one more when that one has ended already.
+    async fn connection<F, Fut>(&self, to: &Target, dial: F) -> io::Result<(Slot, Arc<Conn>)>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = io::Result<Arc<Conn>>>,
+    {
+        let mut redialled = false;
+        loop {
+            let slot = self.slot(to);
+            let conn = match slot.get_or_try_init(&dial).await {
+                Ok(conn) => conn.clone(),
+                Err(e) => {
+                    self.forget(to, &slot);
+                    return Err(e);
+                }
+            };
+            // A sender waiting on a cell whose dialler failed dials
+            // again, after that dialler forgot the slot: the connection
+            // must be reachable from the table or its answers are lost.
+            let mut conns = self.conns.lock().expect("conns");
+            // an ended connection is not revived: dial again
+            if conn.ended.is_cancelled() {
+                // once only: a server may end every connection at once
+                if redialled {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "vmess: the server ended the UDP connection",
+                    ));
+                }
+                redialled = true;
+                continue;
+            }
+            match conns.get(to) {
+                None => {
+                    conns.insert(to.clone(), slot.clone());
+                    return Ok((slot, conn));
+                }
+                Some(s) if Arc::ptr_eq(s, &slot) => return Ok((slot, conn)),
+                // another slot took its place: use that one
+                Some(_) => {}
+            }
+        }
+    }
+
     async fn dial(&self, to: &Target) -> io::Result<Arc<Conn>> {
         let stream = self
             .dialer
@@ -165,33 +211,7 @@ impl PacketSocket for VmessUdp {
                 // an empty chunk would end the connection
                 return Ok(());
             }
-            let (slot, conn) = loop {
-                let slot = self.slot(to);
-                let conn = match slot.get_or_try_init(|| self.dial(to)).await {
-                    Ok(conn) => conn.clone(),
-                    Err(e) => {
-                        self.forget(to, &slot);
-                        return Err(e);
-                    }
-                };
-                // A sender waiting on a cell whose dialler failed dials
-                // again, after that dialler forgot the slot: the connection
-                // must be reachable from the table or its answers are lost.
-                let mut conns = self.conns.lock().expect("conns");
-                // an ended connection is not revived: dial again
-                if conn.ended.is_cancelled() {
-                    continue;
-                }
-                match conns.get(to) {
-                    None => {
-                        conns.insert(to.clone(), slot.clone());
-                        break (slot, conn);
-                    }
-                    Some(s) if Arc::ptr_eq(s, &slot) => break (slot, conn),
-                    // another slot took its place: use that one
-                    Some(_) => {}
-                }
-            };
+            let (slot, conn) = self.connection(to, || self.dial(to)).await?;
             *conn.last.lock().expect("clock") = Instant::now();
             let mut writer = conn.writer.lock().await;
             let written = async {
@@ -221,5 +241,63 @@ impl PacketSocket for VmessUdp {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::Stack;
+    use crate::vmess::header::Security;
+    use rurge_config::HostName;
+    use rurge_net::connector::{DirectConnector, SystemResolve};
+    use std::sync::atomic::AtomicUsize;
+    use tokio::net::TcpListener;
+
+    /// A server that ends every UDP connection as soon as it is up: a
+    /// datagram that finds its connection ended dials once more, and fails
+    /// when that one has ended too — it does not go on dialling for as long
+    /// as its sender waits. The loop is handed each connection after its
+    /// reader has seen the end: on its own it may look before that.
+    #[tokio::test]
+    async fn a_connection_that_has_ended_is_dialled_again_only_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let dialer = Arc::new(Dialer {
+            stack: Stack::new(
+                Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
+                Target::new(HostName::Ip(server.ip()), server.port()),
+                None,
+                None,
+                None,
+            ),
+            cmd_key: [0; 16],
+            security: Security::Aes128Gcm,
+        });
+        let udp = VmessUdp::new(dialer, ConnectOpts::default(), IDLE);
+        let to = Target::new(HostName::parse("target.test"), 53);
+        let dials = AtomicUsize::new(0);
+        let ended = || async {
+            let n = dials.fetch_add(1, Ordering::Relaxed) + 1;
+            assert!(n <= 2, "dialled a third time");
+            let conn = udp.dial(&to).await?;
+            conn.ended.cancelled().await;
+            Ok(conn)
+        };
+        let found = tokio::time::timeout(Duration::from_secs(10), udp.connection(&to, ended))
+            .await
+            .expect("an end within the bound");
+        let err = found.map(drop).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(
+            err.to_string(),
+            "vmess: the server ended the UDP connection"
+        );
+        assert_eq!(dials.load(Ordering::Relaxed), 2);
     }
 }
