@@ -215,8 +215,10 @@ pub async fn requests_one_after_another(out: &OutboundRef, echo: SocketAddr, cou
 /// What failed of the policies a test tried, each under its policy's name.
 /// A test that stops at the first failure hides what its other policies
 /// would have met, and on CI every run costs a push: so a test tries them
-/// all and fails once, at its end.
-#[must_use = "a `Failures` that is never `finish`ed lets its test pass whatever failed"]
+/// all and fails once, at its end. A `Failures` that holds failures and is
+/// dropped without `finish` fails its test there and then, so that a test
+/// cannot pass by leaving the call out.
+#[must_use = "a `Failures` is there to be recorded into and `finish`ed; one dropped as soon as it is built checks nothing"]
 #[derive(Default)]
 pub struct Failures {
     tried: usize,
@@ -232,32 +234,54 @@ impl Failures {
         }
     }
 
-    /// What `finish` panics with: how many failed, then each failure on a
-    /// line of its own, and `log` — what the reference server logged — last
-    /// and once. The digest CI makes of a failed test shows the head of its
-    /// output, 60 lines or 3 000 characters of it: the log is what may go.
-    pub fn report(&self, log: &str) -> String {
+    /// How many failed, then each failure on a line of its own.
+    fn summary(&self) -> String {
         let mut text = format!("{} of {} failed\n", self.failed.len(), self.tried);
         for (what, why) in &self.failed {
             // one line, whatever the layout of the panic's own text
             let why: Vec<&str> = why.split_whitespace().collect();
             text += &format!("{what}: {}\n", why.join(" "));
         }
-        text + "--- the server's log ---\n" + log
+        text
+    }
+
+    /// What `finish` panics with: the summary and `log` — what the reference
+    /// server logged — last and once. The digest CI makes of a failed test
+    /// shows the head of its output, 60 lines or 3 000 characters of it: the
+    /// log is what may go.
+    pub fn report(&self, log: &str) -> String {
+        self.summary() + "--- the server's log ---\n" + log
     }
 
     /// Fails the test when anything failed. `log` is read only then: on CI
     /// nobody can ask the server afterwards.
     #[track_caller]
-    pub fn finish(self, log: impl FnOnce() -> String) {
+    pub fn finish(mut self, log: impl FnOnce() -> String) {
         if !self.failed.is_empty() {
-            panic!("{}", self.report(&log()));
+            let report = self.report(&log());
+            // the panic below tells them: dropping `self` on the way out has
+            // nothing left to guard
+            self.failed.clear();
+            panic!("{report}");
+        }
+    }
+}
+
+impl Drop for Failures {
+    fn drop(&mut self) {
+        // A test that is failing for another reason says that: a panic here,
+        // in the middle of its unwind, would abort the process.
+        if !self.failed.is_empty() && !std::thread::panicking() {
+            panic!(
+                "failures were recorded and never finished, so the test would have passed:\n{}",
+                self.summary()
+            );
         }
     }
 }
 
 /// What a panic said, when it said it in words.
-fn panic_text(panic: Box<dyn std::any::Any + Send>) -> String {
+pub fn panic_text(panic: Box<dyn std::any::Any + Send>) -> String {
     match panic.downcast::<String>() {
         Ok(text) => *text,
         Err(panic) => match panic.downcast::<&'static str>() {

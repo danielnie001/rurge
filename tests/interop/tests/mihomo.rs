@@ -307,8 +307,11 @@ async fn only_the_two_sentences_of_an_unanswered_request_are_taken() {
     // the wait for a server that never ends the request, cut short
     let short = Duration::from_millis(300);
     none_is_answered(&mut failures, &profile, &names[3..], short).await;
+    // two of the four failed, and `finish` fails the test with their report
+    let told = std::panic::catch_unwind(|| failures.finish(|| "the server's log".to_string()))
+        .expect_err("finish fails the test when something failed");
     assert_eq!(
-        failures.report("the server's log"),
+        panic_text(told),
         "2 of 4 failed\n\
          Garbles: failed with another sentence: snell: the server's data failed to decrypt (wrong psk or version?)\n\
          Silent: no failure within 300ms, 0 bytes in: the request hangs\n\

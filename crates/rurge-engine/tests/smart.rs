@@ -719,7 +719,11 @@ async fn a_udp_flow_to_a_name_no_member_can_send_counts_against_nobody() {
 
 /// Three seconds without an answer count against the member only where an
 /// answer always comes — here port 443 — never on another port, where a
-/// game may only send (phase 2 M5 design 8.3).
+/// game may only send (phase 2 M5 design 8.3). Both flows go to one site,
+/// and a member's second failure at a site is excused by its first: were
+/// they sent together, a silence counted wrongly would hide behind the
+/// one counted rightly. So the flow that must not count goes first and
+/// alone, and the other follows once it has had its three seconds.
 #[tokio::test]
 async fn udp_silence_counts_only_where_answers_always_come() {
     let quiet = FakeSocks5::spawn(Socks5Script::default()).await;
@@ -731,6 +735,9 @@ async fn udp_silence_counts_only_where_answers_always_come() {
     // a socket that takes datagrams and never answers
     let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let association = udp_associate(h.socks()).await;
+    let registry = h.engine.registry();
+    let smart = &registry.auto().smart;
+
     association
         .send(
             "127.0.0.1",
@@ -738,20 +745,34 @@ async fn udp_silence_counts_only_where_answers_always_come() {
             b"only sends",
         )
         .await;
+    // the datagram has got there, so the flow is set up and its three
+    // seconds are running
+    let mut datagram = [0u8; 64];
+    tokio::time::timeout(Duration::from_secs(10), silent.recv_from(&mut datagram))
+        .await
+        .expect("the datagram reaches the silent socket within the bound")
+        .unwrap();
+    // The one wait here that is for nothing to happen: the three seconds of
+    // the flow's silence and half a second more, since a timer that is late
+    // would let a wrong count come after the check.
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    assert_eq!(
+        smart.site("127.0.0.1", Instant::now()),
+        SiteMemory::default(),
+        "a silence on another port than 53 and 443 was remembered"
+    );
+    assert_eq!(
+        healths(&h, &["Quiet"]),
+        [Health::Unknown { failures: 0 }],
+        "a silence on another port than 53 and 443 counted against the member"
+    );
+
     association.send("127.0.0.1", 443, b"not quic").await;
-    let registry = h.engine.registry();
-    let smart = &registry.auto().smart;
     wait_until("the silence on port 443 counted", || {
         smart.site("127.0.0.1", Instant::now()).failed == ["Quiet"]
     })
     .await;
-    // the other flow's three seconds are up too by now: it did not count
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let quiet = outbound_now(&h, "Quiet");
-    assert_eq!(
-        smart.health("Quiet", &quiet, Instant::now()),
-        rurge_policy::smart::Health::Unknown { failures: 1 }
-    );
+    assert_eq!(healths(&h, &["Quiet"]), [Health::Unknown { failures: 1 }]);
 }
 
 /// A harness in follow mode (`encrypted-dns-follow-outbound-mode`) whose

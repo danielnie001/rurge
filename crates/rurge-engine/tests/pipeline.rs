@@ -1,6 +1,9 @@
 //! Profile text → Runtime → Engine → real listeners on the loopback, talking to
 //! `TestServer` targets through the HTTP and SOCKS5 proxies (M3 design §10).
 
+// not `use common::*`: this file has a harness of its own
+mod common;
+
 use rurge_config::HostName;
 use rurge_config::config::{LoadOptions, from_text};
 use rurge_config::rule::ProtocolKind;
@@ -681,9 +684,7 @@ async fn an_unimplemented_policy_rejects_with_an_explanation() {
 /// record must not lose the failure behind the substitution note.
 #[tokio::test]
 async fn a_failed_dial_through_a_direct_substituted_empty_group_keeps_both_reasons() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
+    let port = common::closed_tcp_port();
     let dir = tempfile::tempdir().unwrap();
     let profile = "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nipv6 = false\n\
 [Proxy]\n[Proxy Group]\nG = select, policy-path=https://sub.test/g\n[Rule]\nFINAL,G\n";

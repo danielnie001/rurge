@@ -247,7 +247,9 @@ mod tests {
     /// One question per upstream and resolve, never asked again: a test that
     /// counts the questions a server was asked counts every re-send as one
     /// more, and `fast()` re-sends whenever an answer is 100 ms late, which
-    /// on a busy machine it can be.
+    /// on a busy machine it can be. The deadline of a lookup is 30 seconds,
+    /// so a test that expects one to fail, with no answer coming, waits that
+    /// long: it is not for such a test.
     fn once() -> FanoutOpts {
         FanoutOpts {
             resend: Duration::from_secs(30),
@@ -324,13 +326,14 @@ mod tests {
     /// again before that refresh has finished.
     #[tokio::test]
     async fn stale_entries_are_served_and_refreshed_once() {
+        let old = "10.0.0.1".parse::<IpAddr>().unwrap();
+        let new = "10.0.0.2".parse::<IpAddr>().unwrap();
         let s = MockDns::spawn().await;
         s.set("stale.example", &["10.0.0.1"], &[], 5);
-        let b = Bootstrap::new(vec![Arc::new(UdpUpstream::new(s.addr()))], false, fast());
-        assert_eq!(
-            b.resolve("stale.example").await.unwrap(),
-            vec!["10.0.0.1".parse::<IpAddr>().unwrap()]
-        );
+        // `once()`: the number of questions below is the number of lookups,
+        // however late an answer comes.
+        let b = Bootstrap::new(vec![Arc::new(UdpUpstream::new(s.addr()))], false, once());
+        assert_eq!(b.resolve("stale.example").await.unwrap(), vec![old]);
         assert_eq!(s.query_count("stale.example", Qtype::A), 1);
 
         // Past the 60s floor: the cache entry is now stale. Pause only for the
@@ -340,26 +343,40 @@ mod tests {
         tokio::time::advance(Duration::from_secs(61)).await;
         tokio::time::resume();
 
-        let started = std::time::Instant::now();
-        let addrs = b.resolve("stale.example").await.unwrap();
-        assert_eq!(addrs, vec!["10.0.0.1".parse::<IpAddr>().unwrap()]);
-        assert!(
-            started.elapsed() < Duration::from_millis(50),
-            "a stale hit must return immediately, not block on a fanout round trip: {:?}",
-            started.elapsed()
+        // From here the upstream answers with another address, and a second
+        // late. A stale hit that waited for the upstream would come back with
+        // that address; one served on the spot has the old one in hand. The
+        // second keeps the refresh in flight while the name is asked for
+        // again below.
+        s.set("stale.example", &["10.0.0.2"], &[], 5);
+        s.set_delay(Duration::from_secs(1));
+        assert_eq!(
+            b.resolve("stale.example").await.unwrap(),
+            vec![old],
+            "a stale hit is answered from the cache, not by a fanout round trip"
         );
 
         // Calling resolve again right away must not start a second refresh:
         // `begin_refresh` is claimed synchronously inside the first call.
-        let addrs2 = b.resolve("stale.example").await.unwrap();
-        assert_eq!(addrs2, vec!["10.0.0.1".parse::<IpAddr>().unwrap()]);
+        assert_eq!(b.resolve("stale.example").await.unwrap(), vec![old]);
 
-        // Give the one background refresh a moment to complete.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The refresh is done when the name resolves to the new address.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while b.resolve("stale.example").await.unwrap() != vec![new] {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the background refresh completes within the bound");
+        // The count is final by now. The mock counts a question when it
+        // receives it, not when it answers, and an entry can start a refresh
+        // only while it is stale: a second refresh would have asked during the
+        // second the first one waited for its answer. From the new address on
+        // the entry is fresh again, for a minute.
         assert_eq!(
             s.query_count("stale.example", Qtype::A),
             2,
-            "exactly one background refresh, not two"
+            "the first lookup and exactly one background refresh, not two"
         );
     }
 
@@ -369,9 +386,9 @@ mod tests {
         s1.set("switch.example", &["10.0.0.1"], &[], 60);
         let s2 = MockDns::spawn().await;
         s2.set("switch.example", &["10.0.0.2"], &[], 60);
-        // Slower than `fast()` waits before it asks again: under it the one
-        // question would be counted three times, every time. Under `once()`
-        // the answers may take as long as they like.
+        // Slower than `fast()` waits before it asks again: under `fast()` the
+        // one question would be counted three times, every time. Under
+        // `once()` the answers may take as long as they like.
         s1.set_delay(Duration::from_millis(250));
         s2.set_delay(Duration::from_millis(250));
         let b = Bootstrap::new(vec![Arc::new(UdpUpstream::new(s1.addr()))], false, once());

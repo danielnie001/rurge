@@ -189,23 +189,28 @@ mod tests {
         .with_root_certificates(fixture.roots())
         .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let bound = Duration::from_secs(5);
         let tcp = TcpStream::connect(proxy.addr()).await.unwrap();
         let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-        let mut tls = connector
-            .connect(name, tcp)
+        let mut tls = tokio::time::timeout(bound, connector.connect(name, tcp))
             .await
+            .expect("the client's side of the handshake is done within the bound")
             .expect("the client's side of the handshake is done");
         // the server has looked at the (missing) certificate and answered;
         // only now does the request go out
-        let bound = Duration::from_secs(5);
         tokio::time::timeout(bound, tls.get_ref().0.readable())
             .await
             .expect("the server answers")
             .unwrap();
-        let _ = tls
-            .write_all(b"CONNECT 192.0.2.1:443 HTTP/1.1\r\n\r\n")
-            .await;
-        let _ = tls.flush().await;
+        let _ = tokio::time::timeout(
+            bound,
+            tls.write_all(b"CONNECT 192.0.2.1:443 HTTP/1.1\r\n\r\n"),
+        )
+        .await
+        .expect("the request is written within the bound");
+        let _ = tokio::time::timeout(bound, tls.flush())
+            .await
+            .expect("the request is flushed within the bound");
         let mut byte = [0u8; 1];
         let err = tokio::time::timeout(bound, tls.read(&mut byte))
             .await

@@ -190,8 +190,13 @@ async fn every_method_that_fails_is_told_not_the_first_alone() {
         panic!("the echo comes back within the bound:\n  {sent} bytes sent,\n  none back");
     })
     .await;
+    // `finish` is what fails the test, with that report
+    let told = std::panic::catch_unwind(|| {
+        failures.finish(|| "a line of the log\nand another".to_string())
+    })
+    .expect_err("finish fails the test when something failed");
     assert_eq!(
-        failures.report("a line of the log\nand another"),
+        panic_text(told),
         "2 of 3 failed\n\
          rc4: the echo differs\n\
          aes-128-cfb: the echo comes back within the bound: 7 bytes sent, none back\n\
@@ -218,6 +223,65 @@ async fn a_method_that_fails_fails_its_test_at_the_end() {
     .await;
     attempt(&mut failures, "rc4-md5", async {}).await;
     failures.finish(|| "the log".to_string());
+}
+
+/// A test that leaves `finish` out does not pass by it: failures dropped
+/// without it fail the test there and then, each one named.
+#[test]
+#[should_panic(expected = "1 of 1 failed\nrc4: the echo differs")]
+fn failures_that_are_never_finished_fail_the_test() {
+    let mut failures = Failures::default();
+    failures.record("rc4", Err("the echo differs".to_string()));
+}
+
+/// With nothing recorded, or nothing that failed, there is nothing to finish.
+#[test]
+fn nothing_that_failed_need_not_be_finished() {
+    drop(Failures::default());
+    let mut passed = Failures::default();
+    passed.record("rc4", Ok(()));
+}
+
+/// A test that fails for a reason of its own says that, not that it left
+/// failures unfinished: a panic out of a drop in the middle of an unwind
+/// aborts the process. Were the guard to do that this binary would go with
+/// it, so the case runs in a child process — this test again, told so by
+/// its environment — and is judged by how that ended.
+#[tokio::test]
+async fn failures_dropped_by_a_test_that_fails_otherwise_say_nothing() {
+    const CHILD: &str = "RURGE_INTEROP_UNWINDING_CHILD";
+    const SAID: &str = "unwound without a second panic";
+    const NAME: &str = "failures_dropped_by_a_test_that_fails_otherwise_say_nothing";
+    if std::env::var_os(CHILD).is_some() {
+        let told = std::panic::catch_unwind(|| {
+            let mut failures = Failures::default();
+            failures.record("rc4", Err("the echo differs".to_string()));
+            panic!("the test fails for a reason of its own");
+        })
+        .expect_err("the closure panics");
+        assert_eq!(panic_text(told), "the test fails for a reason of its own");
+        println!("{SAID}");
+        return;
+    }
+    let mut command =
+        tokio::process::Command::new(std::env::current_exe().expect("the path of this binary"));
+    command
+        .args(["--exact", NAME, "--nocapture"])
+        .env(CHILD, "1")
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(60), command.output())
+        .await
+        .expect("the child process ends within the bound")
+        .expect("the child process runs");
+    let (said, stderr) = (
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        output.status.success() && said.contains(SAID),
+        "the child process ended with {}\n{said}\n{stderr}",
+        output.status
+    );
 }
 
 fn ss_inbound(method: &'static str, password: &str, users: &[&str]) -> Inbound {
