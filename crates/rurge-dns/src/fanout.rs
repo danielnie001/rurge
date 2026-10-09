@@ -219,7 +219,13 @@ pub async fn resolve_name(
                 }
             }
             _ = sleep_until(tick) => {
-                if round >= attempts {
+                // The end: every round went out, or — past the deadline —
+                // those that are left never will. A fanout that did not get
+                // to run from one resend until the deadline (the process was
+                // stopped, the machine slept) would otherwise wait for the
+                // next resend, whose time has passed, over and over without
+                // ever sleeping.
+                if round >= attempts || Instant::now() >= deadline {
                     break;
                 }
                 let any_valid = tracks.iter().any(|t| matches!(t.state, State::Valid(..)));
@@ -283,8 +289,14 @@ mod tests {
     use super::*;
     use crate::message::Rcode;
     use crate::testing::MockDns;
+    use crate::upstream::Upstream;
     use crate::upstream::udp::UdpUpstream;
+    use rurge_net::BoxFuture;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::timeout;
+
+    const BOUND: Duration = Duration::from_secs(10);
 
     fn fast() -> FanoutOpts {
         FanoutOpts {
@@ -295,6 +307,37 @@ mod tests {
 
     fn up(server: &MockDns) -> UpstreamRef {
         Arc::new(UdpUpstream::new(server.addr()))
+    }
+
+    /// A server that is not there: a question to it ends at its deadline,
+    /// unanswered. It counts the questions it was asked.
+    #[derive(Default)]
+    struct Silent {
+        asked: AtomicUsize,
+    }
+
+    impl Silent {
+        fn asked(&self) -> usize {
+            self.asked.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Upstream for Silent {
+        fn name(&self) -> &str {
+            "silent"
+        }
+
+        fn query<'a>(
+            &'a self,
+            _wire: &'a [u8],
+            deadline: Instant,
+        ) -> BoxFuture<'a, Result<Vec<u8>, UpstreamError>> {
+            Box::pin(async move {
+                self.asked.fetch_add(1, Ordering::Relaxed);
+                sleep_until(deadline).await;
+                Err(UpstreamError::Timeout)
+            })
+        }
     }
 
     #[tokio::test]
@@ -366,6 +409,39 @@ mod tests {
         assert_eq!(err, FanoutError::Timeout);
         assert!(started.elapsed() >= Duration::from_millis(400));
         assert_eq!(s.query_count("a.test", Qtype::A), 4);
+    }
+
+    /// A fanout that does not get to run from one of its rounds until its
+    /// deadline has passed — the process was stopped, the machine slept or
+    /// was too busy — has rounds it never sent and no time to send them in:
+    /// it ends as the timeout it is, and does not go on waiting for a resend
+    /// whose time has come and gone.
+    #[tokio::test]
+    async fn a_fanout_kept_from_running_until_past_its_deadline_ends_as_a_timeout() {
+        let silent = Arc::new(Silent::default());
+        let upstreams: Vec<UpstreamRef> = vec![silent.clone()];
+        let opts = fast();
+        let whole = opts.resend * opts.attempts;
+        let fanout =
+            tokio::spawn(async move { resolve_name(&upstreams, "a.test", false, &opts).await });
+        timeout(BOUND, async {
+            while silent.asked() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first round goes out within the bound");
+        // The fanout waits for a resend, and runs next when the clock is
+        // past its deadline: nothing of it runs in between.
+        let sent = silent.asked();
+        tokio::time::pause();
+        tokio::time::advance(whole).await;
+        tokio::time::resume();
+        let outcome = timeout(BOUND, fanout)
+            .await
+            .expect("a fanout past its deadline ends within the bound");
+        assert_eq!(outcome.unwrap(), Err(FanoutError::Timeout));
+        assert_eq!(silent.asked(), sent, "no round goes out past the deadline");
     }
 
     #[tokio::test]
