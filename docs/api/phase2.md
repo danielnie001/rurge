@@ -132,11 +132,11 @@ trojan、vmess（± WebSocket）、anytls 出站，任何带 Shadow TLS 的出�
 | `wireguard: the tunnel has closed` | 正等着隧道的操作（拨号、隧道内的 DNS 查询、握手测速）遇上隧道结束——它的设备任务因任何原因结束，或协议栈的锁被发现中毒；隧道上的每个 UDP 载体也以这条文本结束。经这个策略的下一个连接启动一条新隧道 |
 | `wireguard: a newer configuration of this tunnel is in use` | 同一私钥、有共同 peer 的更晚的配置取代了这条隧道（M4b 起就有）；M8c 起，被取代时正等着这条隧道的操作也立刻以它结束 |
 
-已结束的隧道上的 TCP 连接读到的是连接被重置、写到的是管道已断（操作系统式的文本），不是上面两条。细节见 `docs/surge-compatibility-matrix.md` 4.2 `wireguard` 行。
+已结束的隧道上的 TCP 连接读到的是连接被重置、写到的是管道已断（操作系统式的文本），不是上面两条——只有协议栈的锁中毒时，已建立的连接才报 `wireguard: the tunnel has closed`。细节见 `docs/surge-compatibility-matrix.md` 4.2 `wireguard` 行。
 
 ## `GET /v1/policy_groups`
 
-无参数。响应是 `{"<组名>": [Member…], …}`，键是每个策略组的名字（配置顺序），值是该组成员的列表（配置顺序）。永不失败（没有策略组时返回 `{}`）。
+无参数。响应是 `{"<组名>": [Member…], …}`，键是每个策略组的名字（配置顺序），值是该组成员的列表（配置顺序）。永不失败（没有策略组时返回 `{}`）。组参数 `hidden` 不在响应里：写了 `hidden=true` 的组同别的组一样列出（它在 Surge 里把组从界面上隐藏，rurge 没有界面；要不要由 API 携带它，随阶段 6 的 Dashboard 定）。
 
 `Member` 的字段：
 

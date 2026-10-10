@@ -120,7 +120,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 - `[Script]` 的 `script-path` 的 URL（用户名口令除外）。
 - `[URL Rewrite]`、`[Body Rewrite]` 各行的文字，`[Header Rewrite]` 写进去的头值，`[Map Local]` 的 `header=` / `data=`。
 
-**已知没有覆盖的。** 位置口令里带 `=`（`P = http, h.example, 8080, alice, Xk9=mQ2p` 的最后一个字段，对解析器和对脱敏都读成参数）；名字本身就是整行键的策略（`DNS-Server = trojan, …, password=…`）；没有任何分隔符的秘密键（`ca-passphrase hunter2`）；行内参数名里以 `_` 代 `-`（`policy_path=…`）；为别的客户端写的格式（Loon 的 `peers=[{…}]`、Clash 的 YAML、Quantumult X 的节、整份 Base64 的订阅）；折成几行的 Base64；滑进 `sni=`、`interface=` 这类不是秘密的参数里的秘密；等等。逐条列在 M8c 计划「延后事项」的第 58 ～ 77 行。三轮修正与两次对抗性复审之后，第二位复审者的判断是：这样一张清单对这种格式做不成可靠的，写法没有边界（同表第 51 行）——所以上面那句"不是保证"要按字面读。
+**已知没有覆盖的。** 位置口令里带 `=`（`P = http, h.example, 8080, alice, Xk9=mQ2p` 的最后一个字段，对解析器和对脱敏都读成参数）；名字本身就是整行键的策略（`DNS-Server = trojan, …, password=…`）；没有任何分隔符的秘密键（`ca-passphrase hunter2`）；行内参数名里以 `_` 代 `-`（`policy_path=…`）；为别的客户端写的格式（Loon 的 `peers=[{…}]`、Clash 的 YAML、Quantumult X 的节、整份 Base64 的订阅）；折成几行的 Base64；滑进 `sni=`、`interface=` 这类不是秘密的参数里的秘密；URL 的用户信息里带不加引号逗号的口令（`https://user:pa,ss@dns.example/…`）；带空白又不加引号的要求表达式后面跟一个键（`#!REQUIREMENT CORE_VERSION >= 20 http-api = KEY@…`）；`external` 策略写在 `exec=` 里的口令（`exec="sshpass -p hunter2 ssh …"`）；等等。逐条列在 M8c 计划「延后事项」的第 58 ～ 77 行。三轮修正与两次对抗性复审之后，第二位复审者的判断是：这样一张清单对这种格式做不成可靠的，写法没有边界（同表第 51 行）——所以上面那句"不是保证"要按字面读。
 
 ## 系统代理
 

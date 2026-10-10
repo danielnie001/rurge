@@ -493,7 +493,7 @@ flowchart LR
 
 每个阶段开始前写设计文档（`docs/superpowers/specs/`）与实施计划（`docs/superpowers/plans/`），结束时更新兼容性清单与 README 的状态。阶段内按 P0 → P1 → P2 顺序推进；P2 未完成不阻塞进入下一阶段。
 
-### 阶段 0：需求与文档（当前）
+### 阶段 0：需求与文档
 
 - **交付物**：本需求文档、兼容性清单、README、`.gitignore`、`CLAUDE.md`。
 - **验收**：需求评审通过；路线图与非目标获得确认。
@@ -504,6 +504,7 @@ flowchart LR
 - **范围**：FR-CFG-01 ～ 09、12、14 ～ 17、19；FR-IN-01 ～ 05；FR-OUT-01、02；FR-RULE-01 ～ 09、15；FR-DNS-01 ～ 06、11（API 部分）；FR-HTTP-10（基础）、12；FR-OBS-01、02（骨架）、04（`run` `check` `reload` `stop`）、05（基础）、09（基础）、10。
 - **交付物**：workspace 骨架、配置解析器、规则引擎、DNS 客户端、入站监听、系统代理、CLI、API 骨架、三平台 CI。
 - **验收标准**：兼容性语料库中的配置全部加载无错误；`rurge check` 对故意破坏的配置给出准确行号；HTTP / SOCKS5 经 DIRECT 转发通过；规则引擎黄金测试全部通过；GeoIP / ASN 查询正确；DoH / DoT 解析正常；系统代理开关后浏览器流量经 rurge；三平台 CI 绿。
+- **状态（2026-10-10）**：里程碑 M1 ～ M4b 已合并，代理端到端可用。2026-10-10 把本阶段的功能需求逐条对着代码读过一遍（只读代码，没有运行），查出十余处条款没有落地或只做到解析：托管配置的缓存与按间隔更新（FR-CFG-05）、远程 URL 的 `#!include`（FR-CFG-04、FR-CFG-14）、外部资源的手动强制更新（FR-CFG-14）、`pre-matching` 规则优先（FR-RULE-03）、子规则命中日志（FR-RULE-15）、同一资源不可同时作两种集（FR-RULE-04）、GeoIP / ASN 数据库日期可查询（FR-RULE-06）、平台变量取自操作系统（FR-CFG-09）、监听覆盖（FR-CFG-17）、`rurge check` 的建议（FR-CFG-03）、请求记录的远端地址 / 监听端口 / DNS 耗时（FR-HTTP-10）、当前 Profile 记录（FR-CFG-15）、`#!WINDOWS-ONLY` / `#!LINUX-ONLY`（FR-CFG-10）。清单与证据见阶段 2 的验收文档 [`docs/acceptance/phase2-acceptance.md`](acceptance/phase2-acceptance.md) 的「需求逐条对照代码」一节；计划在阶段 3 开始之前补做（去向登记在 M8c 计划 [`docs/superpowers/plans/2026-10-09-phase2-m8c-leftovers-acceptance-plan.md`](superpowers/plans/2026-10-09-phase2-m8c-leftovers-acceptance-plan.md)「延后事项」第 100 ～ 103 行）。另有几行需求的阶段与兼容性清单登记的不一致（FR-RULE-07 / 08 在规则匹配之前识别 SNI 等，同一节列出），以哪份为准待定。需要真实桌面环境的手工验收清单 [`docs/acceptance/phase1-manual.md`](acceptance/phase1-manual.md) 还没有执行；CI 还没有绿过。
 
 ### 阶段 2：出站协议与策略组
 
@@ -511,7 +512,7 @@ flowchart LR
 - **范围**：FR-CFG-11；FR-IN-02（UDP）；FR-OUT-03 ～ 13、15；FR-GRP-01、03 ～ 07；FR-DNS-04（DoH3 / DoQ）、07、10。
 - **交付物**：每种协议的实现与集成测试环境（回环测试服务器 + 对参考实现的互操作测试）、策略组算法、订阅解析、连通性测试。
 - **验收标准**：每种协议对参考服务器的 TCP 与 UDP（若支持）转发通过；链式代理通过；策略组测试与切换 API 正确；订阅样本解析正确；Shadow TLS 与 TLS 参数各有测试；WireGuard 与 WARP 类端点（`client-id`）握手成功。
-- **状态（2026-10-10）**：功能已齐备；验收证据汇总在阶段 2 的验收文档 [`docs/acceptance/phase2-acceptance.md`](acceptance/phase2-acceptance.md)（M8c 收尾时建立）；CI 还没有绿过；对参考实现的互操作用例还没有对真实的二进制跑过；手工验收清单 [`docs/acceptance/phase2-manual.md`](acceptance/phase2-manual.md)（需要真实公网节点的项目）还没有执行。
+- **状态（2026-10-10）**：功能已齐备（同一次逐条核对在本阶段没有查出缺失的条款；只解析、不生效的参数都已在兼容性清单登记）；验收证据汇总在阶段 2 的验收文档 [`docs/acceptance/phase2-acceptance.md`](acceptance/phase2-acceptance.md)（M8c 收尾时建立）；CI 还没有绿过；对参考实现的互操作用例还没有对真实的二进制跑过；手工验收清单 [`docs/acceptance/phase2-manual.md`](acceptance/phase2-manual.md)（需要真实公网节点的项目）还没有执行。
 
 ### 阶段 3：增强模式（TUN）
 
