@@ -916,6 +916,18 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             tracing::info!(%applied, "system proxy enabled");
         }
 
+        // Nothing below can end the start: this is the profile that runs, and
+        // a start that did not get here did not run its profile. `update`
+        // rewrites the file, so a profile that is recorded already is not
+        // written again.
+        let profile = std::path::absolute(&args.config)
+            .unwrap_or_else(|_| args.config.clone())
+            .to_string_lossy()
+            .into_owned();
+        if state.current_profile.as_deref() != Some(profile.as_str()) {
+            store.update(|s| s.current_profile = Some(profile)).await;
+        }
+
         // The one startup line that also reaches `--log-file` (the per-listener
         // "listening" records are DEBUG; stdout gets the lines above).
         tracing::info!(policies, rules, mode = %mode_name(&outbound_mode), "rurge running");

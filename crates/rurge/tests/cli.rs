@@ -2882,6 +2882,10 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         std::fs::write(&file, ORIGINAL_PROXY).unwrap();
         let crashed = spawn_daemon_full(&conf, &data, false, None, &["--system-proxy"]);
         wait_for_line(&crashed, "system proxy enabled: ");
+        // once it is up: a start writes `state.json` once more on its way to
+        // saying so, and a kill in the middle of that write leaves a
+        // half-written `state.json.tmp` behind
+        wait_for_line(&crashed, "rurge ");
         drop(crashed); // `Daemon::drop` kills the process: no cleanup runs
         assert_ne!(
             std::fs::read_to_string(&file).unwrap(),
@@ -2986,6 +2990,8 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         wait_for_line(&first, "system proxy enabled: ");
         let applied = std::fs::read_to_string(&file).unwrap();
         assert_ne!(applied, ORIGINAL_PROXY, "the first run owns the settings");
+        // up: a start writes `state.json` once more on its way to saying so
+        wait_for_line(&first, "rurge ");
         let state = std::fs::read_to_string(data.join("state.json")).unwrap();
         assert!(!read_json(&data.join("state.json"))["system_proxy_backup"].is_null());
         for (profile, says) in profiles_that_do_not_load(dir.path()) {
@@ -3472,6 +3478,158 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         assert!(stderr.contains("error: --listen-http: "), "{stderr}");
         assert!(!stderr.contains("S3CR3T"), "{stderr}");
         assert_restored(&data, &stderr);
+    }
+
+    /// The profile `state.json` in `data` names as the current one.
+    fn recorded_profile(data: &Path) -> Option<String> {
+        let text = std::fs::read_to_string(data.join("state.json")).ok()?;
+        let state: serde_json::Value = serde_json::from_str(&text).unwrap();
+        state["current_profile"].as_str().map(str::to_string)
+    }
+
+    /// Waits for the daemon to say it is running; `state.json` names its
+    /// profile by then, or soon after.
+    fn wait_until_recorded(daemon: &Daemon, data: &Path) -> String {
+        wait_for_line(daemon, "rurge ");
+        wait_until("state.json to name the profile", || {
+            recorded_profile(data).is_some()
+        });
+        recorded_profile(data).unwrap()
+    }
+
+    /// What `rurge run` was started with is the profile that is running, and
+    /// `state.json` says so: the path as an absolute one, however `-c` gave it.
+    #[test]
+    fn a_running_daemon_records_its_profile_as_the_current_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        assert_eq!(recorded_profile(&data), None);
+        let daemon = spawn_daemon(&conf, &data);
+        assert_eq!(
+            wait_until_recorded(&daemon, &data),
+            conf.to_str().unwrap(),
+            "the path as given, when that is an absolute one"
+        );
+        drop(daemon);
+
+        // the same profile by a relative path, in a data directory of its own
+        let fresh = dir.path().join("fresh");
+        let mut cmd = rurge_run(Path::new("t.conf"), &fresh);
+        cmd.current_dir(dir.path());
+        let daemon = spawn_command(cmd);
+        let recorded = wait_until_recorded(&daemon, &fresh);
+        assert!(Path::new(&recorded).is_absolute(), "{recorded}");
+        assert!(!recorded.starts_with(r"\\?\"), "{recorded}");
+        assert_eq!(
+            std::fs::canonicalize(&recorded).unwrap(),
+            std::fs::canonicalize(&conf).unwrap()
+        );
+    }
+
+    /// Starting the profile that is recorded already writes nothing: the file
+    /// is whatever an earlier run, or somebody, left, down to its spaces.
+    #[test]
+    fn a_start_with_the_recorded_profile_leaves_state_json_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        // not the form the daemon writes, so that a rewrite shows
+        let written = serde_json::json!({"version": 1, "current_profile": conf.to_str().unwrap()})
+            .to_string();
+        std::fs::write(data.join("state.json"), &written).unwrap();
+        let mut daemon = spawn_daemon(&conf, &data);
+        let api = api_port(&daemon);
+        wait_for_line(&daemon, "rurge ");
+        // gone, so that nothing it was going to write is still to come
+        assert_eq!(api_call(api, "POST", "/v1/stop", "k", Some("{}")).0, 200);
+        assert_eq!(wait_for_exit(&mut daemon, 10), Some(0), "stop exits 0");
+        assert_eq!(
+            std::fs::read_to_string(data.join("state.json")).unwrap(),
+            written
+        );
+    }
+
+    /// Another profile started in the same data directory is the current one
+    /// from then on.
+    #[test]
+    fn another_profile_becomes_the_recorded_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = write_conf(dir.path(), API_GENERAL);
+        let second = dir.path().join("other.conf");
+        std::fs::copy(&first, &second).unwrap();
+        let data = dir.path().join("data");
+        let daemon = spawn_daemon(&first, &data);
+        assert_eq!(wait_until_recorded(&daemon, &data), first.to_str().unwrap());
+        drop(daemon);
+        let daemon = spawn_daemon(&second, &data);
+        wait_for_line(&daemon, "rurge ");
+        wait_until("the other profile to be recorded", || {
+            recorded_profile(&data).as_deref() == second.to_str()
+        });
+    }
+
+    /// A start that does not get to the point of saying it is running did not
+    /// run its profile: not when a listener or the API cannot be bound, not
+    /// when the system proxy cannot be set, and whatever was recorded before
+    /// stays.
+    #[test]
+    fn a_start_that_fails_does_not_record_its_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let earlier = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        let daemon = spawn_daemon(&earlier, &data);
+        wait_until_recorded(&daemon, &data);
+        drop(daemon);
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = held.local_addr().unwrap();
+        let broken_backend = dir.path().join("no-such-dir").join("sysproxy.json");
+        let fresh = dir.path().join("fresh");
+        let other = dir.path().join("other.conf");
+        for (what, general, system_proxy) in [
+            (
+                "a listener's port is taken",
+                format!("http-listen = {taken}\nsocks5-listen = 127.0.0.1:0"),
+                false,
+            ),
+            (
+                "the API's port is taken",
+                format!(
+                    "http-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nhttp-api = k@{taken}"
+                ),
+                false,
+            ),
+            (
+                "the system proxy cannot be set",
+                API_GENERAL.to_string(),
+                true,
+            ),
+        ] {
+            std::fs::write(
+                &other,
+                format!("[General]\n{general}\n[Proxy]\n[Rule]\nFINAL,DIRECT\n"),
+            )
+            .unwrap();
+            for state_dir in [&data, &fresh] {
+                let mut cmd = rurge_run(&other, state_dir);
+                if system_proxy {
+                    cmd.arg("--system-proxy").env(
+                        "RURGE_SYSTEM_PROXY_BACKEND",
+                        format!("file:{}", broken_backend.display()),
+                    );
+                }
+                let (code, stderr) = give_up(cmd);
+                assert_eq!(code, Some(1), "{what}: {stderr}");
+            }
+            assert_eq!(
+                recorded_profile(&data).as_deref(),
+                earlier.to_str(),
+                "{what}: the earlier one stays"
+            );
+            assert_eq!(recorded_profile(&fresh), None, "{what}");
+        }
+        drop(held);
     }
 }
 
