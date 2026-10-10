@@ -29,8 +29,10 @@ pub fn environment(platform: Platform, core_version: u64) -> Environment {
 /// What a profile's requirement expressions see. The version, the model, the
 /// language and the name are the operating system's own word; what it does
 /// not say is what has always been reported: `unknown`, the CPU architecture,
-/// `$LANG` (`en-US` without it) and the computer name from `$COMPUTERNAME` or
-/// `$HOSTNAME` (`rurge` without them).
+/// the language `$LANG` names (`en-US` when it names none) and the computer
+/// name from `$COMPUTERNAME` or `$HOSTNAME` (`rurge` without them). `$LANG` is
+/// asked on its own: a system that found no language because `LC_ALL` says `C`
+/// still gets the language `$LANG` names.
 ///
 /// `--platform` has a profile read as if on another system, on this machine.
 /// This machine's version is not that system's, and a version test would
@@ -49,8 +51,7 @@ fn environment_from(
         .unwrap_or_else(|| "unknown".to_string());
     let language = info.language.unwrap_or_else(|| {
         var("LANG")
-            .and_then(|l| l.split('.').next().map(|s| s.replace('_', "-")))
-            .filter(|l| !l.is_empty() && l != "C")
+            .and_then(|lang| sysinfo::language_of(&lang))
             .unwrap_or_else(|| "en-US".to_string())
     });
     let device_name = info.name.unwrap_or_else(|| {
@@ -93,7 +94,11 @@ mod tests {
     }
 
     /// What `environment` reported before the system was asked, for a system
-    /// that says nothing: the same words, whatever the variables hold.
+    /// that says nothing: the same words, whatever the variables hold — except
+    /// the language of three `$LANG` values, which is now read the way the
+    /// system's own locale variables are: `POSIX` and `@euro` name no language
+    /// (they were reported as themselves), and `sr_RS@latin` is `sr-RS` (it was
+    /// `sr-RS@latin`).
     #[test]
     fn a_system_that_says_nothing_leaves_what_the_variables_always_gave() {
         let host = Platform::current();
@@ -116,9 +121,21 @@ mod tests {
             ("C", "en-US"),
             ("C.UTF-8", "en-US"),
             ("", "en-US"),
+            ("sr_RS.UTF-8@latin", "sr-RS"),
+            (".UTF-8", "en-US"),
+            // the three that are read differently now
+            ("POSIX", "en-US"),
+            ("sr_RS@latin", "sr-RS"),
+            ("@euro", "en-US"),
         ] {
             assert_eq!(none(&[("LANG", lang)]).language, language, "{lang:?}");
         }
+        // `$LANG` is asked on its own: `LC_ALL` is read only by the system's
+        // own reader, which has already said it found no language
+        assert_eq!(
+            none(&[("LC_ALL", "C"), ("LANG", "de_DE.UTF-8")]).language,
+            "de-DE"
+        );
         assert_eq!(none(&[("COMPUTERNAME", "BOX")]).device_name, "BOX");
         assert_eq!(none(&[("HOSTNAME", "box")]).device_name, "box");
         assert_eq!(

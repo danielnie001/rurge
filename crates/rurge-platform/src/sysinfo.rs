@@ -82,7 +82,7 @@ pub fn read_macos(from: &Sources<'_>) -> SystemInfo {
         model: ask(&["sysctl", "-n", "hw.model"]).and_then(|out| model(&out)),
         language: ask(&["defaults", "read", "-g", "AppleLanguages"])
             .and_then(|out| apple_languages(&out))
-            .or_else(|| locale_language(from)),
+            .or_else(|| language_from_variables(from)),
         // the name in System Settings; a Mac that has none is still known by
         // its Bonjour name
         name: ask(&["scutil", "--get", "ComputerName"])
@@ -109,7 +109,7 @@ pub fn read_linux(from: &Sources<'_>) -> SystemInfo {
             &["/sys/class/dmi/id/product_name", "/proc/device-tree/model"],
             model,
         ),
-        language: locale_language(from),
+        language: language_from_variables(from),
         name: first_of(&["/proc/sys/kernel/hostname", "/etc/hostname"], name)
             .or_else(|| variable(from, "HOSTNAME").and_then(|host| name(&host))),
     }
@@ -188,7 +188,7 @@ fn read_file(path: &str) -> Option<String> {
 }
 
 /// The language the locale variables name.
-fn locale_language(from: &Sources<'_>) -> Option<String> {
+fn language_from_variables(from: &Sources<'_>) -> Option<String> {
     let lc_all = variable(from, "LC_ALL");
     let lc_messages = variable(from, "LC_MESSAGES");
     let lang = variable(from, "LANG");
@@ -260,43 +260,77 @@ fn linux_version(osrelease: &str) -> Option<(String, String)> {
     Some((build[..end].to_string(), build.to_string()))
 }
 
-/// A model as the firmware gives it. What a maker leaves in the field when it
-/// did not fill it in is not a model.
+/// A model as the firmware gives it, unless it is what a maker leaves in the
+/// field when it did not fill it in: a template that begins `To be filled`,
+/// `OEM` or `System Product` (in any case), or one of the words that stand for
+/// "no value" (`None`, `Default string`, `N/A`, `Unknown`, …) as the whole text.
 fn model(raw: &str) -> Option<String> {
-    const PLACEHOLDERS: [&str; 5] = [
-        "To Be Filled By O.E.M.",
-        "System Product Name",
-        "Default string",
-        "None",
-        "Not Specified",
+    // a template goes on after its first words (`To Be Filled By O.E.M.`)
+    const TEMPLATES: [&str; 6] = [
+        "To be filled",
+        "To be set",
+        "OEM",
+        "O.E.M.",
+        "System Product",
+        "Unknown Product",
     ];
+    // a word that stands for "no value" is the whole text
+    const NO_VALUE: [&str; 13] = [
+        "None",
+        "Default string",
+        "Undefined",
+        "Not Specified",
+        "Not Applicable",
+        "Not Defined",
+        "Not Available",
+        "INVALID",
+        "Type1ProductConfigId",
+        "TBD by OEM",
+        "N/A",
+        "Unknown",
+        "System Name",
+    ];
+    // bytes, not characters: where a prefix ends may be inside a character
+    let begins_with = |text: &str, prefix: &str| {
+        text.as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+    };
     name(raw).filter(|model| {
-        !PLACEHOLDERS
+        !TEMPLATES
             .iter()
-            .any(|placeholder| placeholder.eq_ignore_ascii_case(model))
+            .any(|template| begins_with(model, template))
+            && !NO_VALUE.iter().any(|word| word.eq_ignore_ascii_case(model))
     })
 }
 
-/// The language of the locale the first of the three variables names — the
-/// first that is set to something, as POSIX has it: `zh_CN.UTF-8` is `zh-CN`.
-/// `C` and `POSIX` name no language, and a variable that says so is not
-/// skipped in favour of the next.
-fn posix_language(
-    lc_all: Option<&str>,
-    lc_messages: Option<&str>,
-    lang: Option<&str>,
-) -> Option<String> {
-    let locale = [lc_all, lc_messages, lang]
-        .into_iter()
-        .flatten()
-        .map(str::trim)
-        .find(|value| !value.is_empty())?;
-    // `sr_RS.UTF-8@latin`: what comes before the encoding and the modifier
+/// The language a locale name stands for: `zh_CN.UTF-8` is `zh-CN` — what
+/// comes before the encoding and the modifier (`sr_RS.UTF-8@latin` is
+/// `sr-RS`). `C` and `POSIX` name no language.
+pub fn language_of(locale: &str) -> Option<String> {
+    let locale = locale.trim();
     let language = &locale[..locale.find(['.', '@']).unwrap_or(locale.len())];
     if matches!(language, "" | "C" | "POSIX") {
         return None;
     }
     Some(language.replace('_', "-"))
+}
+
+/// The language of the locale the first of the three variables names — the
+/// first that is set to something, as POSIX has it. A variable that names no
+/// language is not skipped in favour of the next: `LC_ALL=C` is the locale,
+/// whatever `LANG` says.
+fn posix_language(
+    lc_all: Option<&str>,
+    lc_messages: Option<&str>,
+    lang: Option<&str>,
+) -> Option<String> {
+    [lc_all, lc_messages, lang]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .and_then(language_of)
 }
 
 /// The first language of `defaults read -g AppleLanguages`, a list that is
@@ -476,6 +510,102 @@ mod tests {
     }
 
     #[test]
+    fn a_text_that_begins_like_an_unfilled_template_is_no_model() {
+        for template in [
+            "To be filled",
+            "To be set",
+            "OEM",
+            "O.E.M.",
+            "System Product",
+            "Unknown Product",
+        ] {
+            // as it is, in other cases, and with more after it
+            for text in [
+                template.to_string(),
+                template.to_uppercase(),
+                template.to_lowercase(),
+                format!("{template} by O.E.M."),
+                format!(" {} NAME\r\n", template.to_uppercase()),
+            ] {
+                assert_eq!(model(&text), None, "{text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_word_that_stands_for_no_value_is_no_model_only_as_the_whole_text() {
+        for word in [
+            "None",
+            "Default string",
+            "Undefined",
+            "Not Specified",
+            "Not Applicable",
+            "Not Defined",
+            "Not Available",
+            "INVALID",
+            "Type1ProductConfigId",
+            "TBD by OEM",
+            "N/A",
+            "Unknown",
+            "System Name",
+        ] {
+            for text in [
+                word.to_string(),
+                word.to_uppercase(),
+                word.to_lowercase(),
+                format!(" {word}\r\n"),
+            ] {
+                assert_eq!(model(&text), None, "{text:?}");
+            }
+            let longer = format!("{word} 3");
+            assert_eq!(model(&longer), some(&longer), "{longer:?}");
+        }
+    }
+
+    #[test]
+    fn real_models_are_models_even_when_they_look_like_a_filler() {
+        for text in [
+            "Latitude 7440",
+            "Mac15,6",
+            "Raspberry Pi 4 Model B Rev 1.4",
+            "20XW00FEUS",
+            "Standard PC (Q35 + ICH9, 2009)",
+            "VMware Virtual Platform",
+            "Virtual Machine",
+            // begins with an `O`, not with `OEM`
+            "OptiPlex 7010",
+            // begins with a word that is a filler only on its own
+            "Nonesuch 3",
+            // begins like `System Product`
+            "Systems Inc. Box",
+        ] {
+            assert_eq!(model(text), some(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_end_of_a_prefix_may_fall_inside_a_character() {
+        // none of these is a filler, and where a prefix would end is the
+        // middle of a character in most of them: comparing must not panic
+        for text in [
+            // `OEM` and `SYSTEM` in full-width letters, three bytes each
+            "\u{ff2f}\u{ff25}\u{ff2d}",
+            "\u{ff33}\u{ff39}\u{ff33}\u{ff34}\u{ff25}\u{ff2d}",
+            // a two-byte character where a prefix ends
+            "OE\u{e9}",
+            "O.E.M\u{e9}",
+            "To be se\u{e9}",
+            "To be fille\u{e9}",
+            "System Produc\u{e9}",
+            "Unknown Produc\u{e9}",
+            // shorter than every prefix
+            "\u{e9}",
+        ] {
+            assert_eq!(model(text), some(text), "{text:?}");
+        }
+    }
+
+    #[test]
     fn a_posix_locale_becomes_a_language_tag() {
         let lang = |value: &str| posix_language(None, None, Some(value));
         assert_eq!(lang("zh_CN.UTF-8"), some("zh-CN"));
@@ -486,6 +616,29 @@ mod tests {
         // C and POSIX are no language, whatever follows them
         for value in ["C", "POSIX", "C.UTF-8", "POSIX.UTF-8", "", " ", ".UTF-8"] {
             assert_eq!(lang(value), None, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn a_locale_name_stands_for_one_language_or_for_none() {
+        for (locale, language) in [
+            ("zh_CN.UTF-8", some("zh-CN")),
+            ("en_US", some("en-US")),
+            ("sr_RS.UTF-8@latin", some("sr-RS")),
+            ("sr_RS@latin", some("sr-RS")),
+            // the white space around a name is no part of it
+            (" \tzh_CN.UTF-8\r\n", some("zh-CN")),
+            // C and POSIX are no language, whatever follows them
+            ("C", None),
+            ("C.UTF-8", None),
+            ("POSIX", None),
+            // no name, or nothing before the encoding or the modifier
+            ("", None),
+            (" \t\r\n", None),
+            ("@euro", None),
+            (".UTF-8", None),
+        ] {
+            assert_eq!(language_of(locale), language, "{locale:?}");
         }
     }
 
