@@ -30,7 +30,15 @@ pub struct RequestRecord {
     /// TCP, or a UDP flow (phase 2 M5 design 5.2).
     pub transport: Transport,
     pub src: SocketAddr,
+    /// The port of the listener the session came in on; `0` for a session
+    /// rurge started itself, which came in on none.
+    pub listen_port: u16,
     pub dst: String,
+    /// Where the TCP socket the session opened itself went: the first hop
+    /// when the policy chains. `None` when it opened none — it was rejected,
+    /// it is UDP, or its policy carried it over a connection or tunnel that
+    /// already existed.
+    pub remote_addr: Option<SocketAddr>,
     pub rule: Option<String>,
     pub policy: Vec<String>,
     pub sni: Option<String>,
@@ -45,6 +53,10 @@ pub struct RequestRecord {
     /// From the outbound being ready until the first byte came back from
     /// upstream; `None` until one does.
     pub first_byte_ms: Option<u64>,
+    /// The time the dial spent on name lookups, the rules' and the
+    /// outbound's together; `None` when it made none — the target is an
+    /// address, or the proxy resolves the name itself.
+    pub dns_ms: Option<u64>,
     pub status: RecordStatus,
     pub error: Option<String>,
     /// Remarks on how the session was handled that explain no failure — which
@@ -80,7 +92,9 @@ fn record_of(h: &SessionHandle, outcome: Option<&SessionOutcome>) -> RequestReco
         listener: s.listener,
         transport: s.transport,
         src: s.src,
+        listen_port: s.in_port,
         dst: format!("{}:{}", s.dst_host, s.dst_port),
+        remote_addr: h.trail().peer(),
         rule: h.rule(),
         policy: h.policy_chain(),
         sni: h.sni(),
@@ -91,6 +105,7 @@ fn record_of(h: &SessionHandle, outcome: Option<&SessionOutcome>) -> RequestReco
         elapsed_ms,
         connect_ms: h.connect_time().map(|d| d.as_millis() as u64),
         first_byte_ms: h.first_byte_time().map(|d| d.as_millis() as u64),
+        dns_ms: h.trail().dns().map(|d| d.as_millis() as u64),
         status,
         error,
         notes: h.notes(),
@@ -408,6 +423,40 @@ mod tests {
         let recent = log.recent(1);
         assert_eq!(recent[0].notes, ["first", "second"]);
         assert_eq!(recent[0].error, None);
+    }
+
+    /// The port a session came in on is the session's own; the address it
+    /// connected to and the time it spent on lookups are read off its trail,
+    /// while it runs and after.
+    #[tokio::test]
+    async fn a_record_tells_the_port_the_address_and_the_lookup_time_of_its_session() {
+        let log = RequestLog::new(2);
+        let t = TrafficStats::new();
+        let mut s = SessionInfo::tcp(HostName::parse("a.test"), 443);
+        s.in_port = 6152;
+        let a = SessionHandle::new(1, s);
+        log.mark_active(&a);
+        let live = log.active().remove(0);
+        assert_eq!(
+            (live.listen_port, live.remote_addr, live.dns_ms),
+            (6152, None, None)
+        );
+        let peer: SocketAddr = "192.0.2.7:443".parse().unwrap();
+        a.trail()
+            .follow(async {
+                rurge_net::trail::connected(peer);
+                rurge_net::trail::looked_up(std::time::Duration::from_millis(12));
+            })
+            .await;
+        let live = log.active().remove(0);
+        assert_eq!((live.remote_addr, live.dns_ms), (Some(peer), Some(12)));
+        a.finish(SessionOutcome::Completed);
+        log.record_finished(&a, &SessionOutcome::Completed, &t);
+        let done = log.recent(1).remove(0);
+        assert_eq!(
+            (done.listen_port, done.remote_addr, done.dns_ms),
+            (6152, Some(peer), Some(12))
+        );
     }
 
     #[test]

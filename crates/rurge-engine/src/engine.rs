@@ -871,6 +871,21 @@ impl Engine {
     ) -> io::Result<BoxedStream> {
         let (rt, registry) = self.snapshot();
         let handle = self.new_handle(session);
+        let trail = handle.trail().clone();
+        trail
+            .follow(self.connect_internal(rt, registry, handle, fallback))
+            .await
+    }
+
+    /// `dial_internal` from the session's handle on, run inside the trail of
+    /// the session.
+    async fn connect_internal(
+        &self,
+        rt: Arc<Runtime>,
+        registry: Arc<PolicyRegistry>,
+        handle: Arc<SessionHandle>,
+        fallback: &Arc<dyn Connector>,
+    ) -> io::Result<BoxedStream> {
         let target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
         let opts = ConnectOpts {
             timeout: CONNECT_TIMEOUT,
@@ -939,6 +954,25 @@ impl Engine {
     ) -> io::Result<BoxedDatagram> {
         let (rt, registry) = self.snapshot();
         let handle = self.new_handle(session);
+        let trail = handle.trail().clone();
+        let opened = trail
+            .follow(self.open_internal_udp(rt, registry, handle, fallback))
+            .await;
+        // a carrier has no single far end: the TCP connection a proxy's
+        // association opened for it is no address of its record
+        trail.clear_peer();
+        opened
+    }
+
+    /// `dial_internal_udp` from the session's handle on, run inside the trail
+    /// of the session.
+    async fn open_internal_udp(
+        &self,
+        rt: Arc<Runtime>,
+        registry: Arc<PolicyRegistry>,
+        handle: Arc<SessionHandle>,
+        fallback: &Arc<dyn Connector>,
+    ) -> io::Result<BoxedDatagram> {
         let target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
         let opts = ConnectOpts {
             timeout: CONNECT_TIMEOUT,
@@ -1144,6 +1178,189 @@ fn rule_raw(rules: &rurge_rules::RuleEngine, index: usize) -> Option<String> {
         .map(|pos| all[pos].raw.clone())
 }
 
+impl Engine {
+    /// `Dialer::dial` from the session's handle on, run inside the trail of
+    /// the session.
+    async fn connect_session(
+        &self,
+        rt: Arc<Runtime>,
+        registry: Arc<PolicyRegistry>,
+        handle: Arc<SessionHandle>,
+    ) -> Result<Dialed, DialError> {
+        let policy = match self.choose_policy(&rt, &registry, &handle).await {
+            Chosen::Policy(p) => p,
+            Chosen::DnsFailed => return fail(handle, FailKind::Dns, "dns lookup failed"),
+        };
+        // `load-balance` with `persistent=true` picks by the host
+        let ctx = SelectCtx {
+            host: Some(handle.session().dst_host.to_string()),
+        };
+        let mut resolution = match resolve_ready(&registry, &policy, &ctx).await {
+            Ok(resolution) => resolution,
+            Err(chain) => {
+                handle.set_policy_chain(chain);
+                return fail(handle, FailKind::Connect, EVALUATION_FAILED);
+            }
+        };
+        handle.set_policy_chain(resolution.chain.clone());
+        if let Some(note) = &resolution.note {
+            // A protocol rurge does not speak, a group cycle, a group
+            // without members: say why in the session log (§7.2; phase 2
+            // M3 design 5.6).
+            handle.set_error(note.to_string());
+        }
+        let mut target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
+        // FR-DNS-07: a proxy normally gets the name and resolves it itself;
+        // with `use-local-host-item-for-proxy`, an address pinned in [Host]
+        // goes to the proxy instead. Alias / server items leave the name alone.
+        let pinned_ip = match &target.host {
+            HostName::Domain(name)
+                if resolution.terminal == rurge_policy::TerminalKind::Proxy
+                    && rt.config.general.use_local_host_item_for_proxy =>
+            {
+                rt.stack
+                    .resolver
+                    .host_lookup(name)
+                    .and_then(|hit| match hit.action {
+                        rurge_dns::hosts::HostAction::Ips(ips) => ips.first().copied(),
+                        _ => None,
+                    })
+            }
+            _ => None,
+        };
+        let pinned = pinned_ip.is_some();
+        if let Some(ip) = pinned_ip {
+            target = Target::new(HostName::Ip(ip), target.port);
+        }
+        // A plain request of the HTTP listener can go to an HTTP proxy in
+        // absolute form instead of through a tunnel (M1 design 6.5). The
+        // inbound writes the request line, so the target is checked here
+        // first, and the headers are rendered once for this connection
+        // (the two obligations `HttpForward` puts on its caller).
+        let plain_http =
+            handle.session().listener == ListenerKind::Http && handle.session().url.is_some();
+        // a pinned address only reaches the proxy through a tunnel: in
+        // absolute form the request URI carries the name
+        let may_forward = plain_http && !pinned;
+        let host = handle.session().dst_host.to_string();
+        let book = registry.auto().smart.clone();
+        // a name no member can send is refused by all of them alike: the
+        // session goes through the one the group picked as through a
+        // policy of its own — no other is tried, and the group is told
+        // nothing of it (phase 2 M8 design 5.5)
+        if resolution.smart.is_some() && crate::smart::unsendable(&target) {
+            resolution.smart = None;
+        }
+        // the member a `smart` group picked, then the next ones in line
+        // while they do not connect (phase 2 M3c design §7)
+        let attempts = crate::smart::attempts(&registry, resolution);
+        let begun = Instant::now();
+        let mut tried: Vec<String> = Vec::new();
+        let mut failure = None;
+        for (k, attempt) in attempts.iter().enumerate() {
+            // what the attempt before it connected to is not this one's
+            handle.trail().clear_peer();
+            if k > 0 {
+                handle.set_policy_chain(attempt.chain.clone());
+            }
+            // every try gets its share of the time that is left
+            let timeout = match attempts.len() {
+                1 => CONNECT_TIMEOUT,
+                n => CONNECT_TIMEOUT.saturating_sub(begun.elapsed()) / (n - k) as u32,
+            };
+            let opts = ConnectOpts { timeout };
+            let connecting = connect_through(&attempt.outbound, &target, may_forward, &opts);
+            let connected = if attempts.len() == 1 {
+                connecting.await
+            } else {
+                tokio::time::timeout(timeout, connecting)
+                    .await
+                    .unwrap_or(Err(OutboundError::Timeout))
+            };
+            let e = match connected {
+                Ok((stream, forward)) => {
+                    handle.mark_connected();
+                    if let Some(pick) = &attempt.smart {
+                        book.used(&pick.group, &pick.member, Instant::now());
+                        let outbound = &attempt.outbound;
+                        crate::smart::watch(
+                            &handle,
+                            book.clone(),
+                            &pick.member,
+                            outbound,
+                            &host,
+                            true,
+                        );
+                        if !tried.is_empty() {
+                            handle.set_error(format!(
+                                "smart group `{}`: {} failed to connect, used `{}`",
+                                pick.group,
+                                crate::smart::quoted(&tried),
+                                pick.member
+                            ));
+                        }
+                    }
+                    return Ok(Dialed {
+                        stream,
+                        handle,
+                        forward,
+                    });
+                }
+                Err(e) => e,
+            };
+            let retry = crate::smart::retryable(&e);
+            if let Some(pick) = &attempt.smart
+                && retry
+            {
+                let (outbound, now) = (&attempt.outbound, Instant::now());
+                book.report_failure(&pick.member, outbound, Some(&host), now);
+                tried.push(pick.member.clone());
+            }
+            failure = Some(e);
+            if !retry {
+                break;
+            }
+        }
+        if tried.len() > 1
+            && let Some(pick) = attempts.first().and_then(|a| a.smart.as_ref())
+        {
+            handle.set_error(format!(
+                "smart group `{}`: tried {}",
+                pick.group,
+                crate::smart::quoted(&tried)
+            ));
+        }
+        match failure.expect("a dial was tried") {
+            OutboundError::Reject(kind) => {
+                let effective = if kind.escalates() {
+                    let host = handle.session().dst_host.to_string();
+                    let now = Instant::now();
+                    self.escalation.record(&host, now);
+                    if self.escalation.should_drop(&host, now) {
+                        rurge_proto::RejectKind::Drop
+                    } else {
+                        kind
+                    }
+                } else {
+                    kind
+                };
+                reject(handle, effective)
+            }
+            OutboundError::Unsupported(what) => {
+                // what the outbound cannot do here (M4-D7): say so
+                handle.set_error(Note::Unsupported(what).to_string());
+                reject(handle, rurge_proto::RejectKind::Reject)
+            }
+            OutboundError::Dns(m) => fail(handle, FailKind::Dns, m),
+            OutboundError::Io(e) => fail(handle, FailKind::Connect, e.to_string()),
+            OutboundError::Timeout => fail(handle, FailKind::Timeout, "connect timed out"),
+            e @ (OutboundError::Proxy(_)
+            | OutboundError::Tls(_)
+            | OutboundError::Unavailable(_)) => fail(handle, FailKind::Connect, e.to_string()),
+        }
+    }
+}
+
 impl Dialer for Engine {
     fn dial<'a>(&'a self, session: SessionInfo) -> BoxFuture<'a, Result<Dialed, DialError>> {
         Box::pin(async move {
@@ -1151,176 +1368,10 @@ impl Dialer for Engine {
             // resolved against the same generation
             let (rt, registry) = self.snapshot();
             let handle = self.new_handle(session);
-            let policy = match self.choose_policy(&rt, &registry, &handle).await {
-                Chosen::Policy(p) => p,
-                Chosen::DnsFailed => return fail(handle, FailKind::Dns, "dns lookup failed"),
-            };
-            // `load-balance` with `persistent=true` picks by the host
-            let ctx = SelectCtx {
-                host: Some(handle.session().dst_host.to_string()),
-            };
-            let mut resolution = match resolve_ready(&registry, &policy, &ctx).await {
-                Ok(resolution) => resolution,
-                Err(chain) => {
-                    handle.set_policy_chain(chain);
-                    return fail(handle, FailKind::Connect, EVALUATION_FAILED);
-                }
-            };
-            handle.set_policy_chain(resolution.chain.clone());
-            if let Some(note) = &resolution.note {
-                // A protocol rurge does not speak, a group cycle, a group
-                // without members: say why in the session log (§7.2; phase 2
-                // M3 design 5.6).
-                handle.set_error(note.to_string());
-            }
-            let mut target =
-                Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
-            // FR-DNS-07: a proxy normally gets the name and resolves it itself;
-            // with `use-local-host-item-for-proxy`, an address pinned in [Host]
-            // goes to the proxy instead. Alias / server items leave the name alone.
-            let pinned_ip = match &target.host {
-                HostName::Domain(name)
-                    if resolution.terminal == rurge_policy::TerminalKind::Proxy
-                        && rt.config.general.use_local_host_item_for_proxy =>
-                {
-                    rt.stack
-                        .resolver
-                        .host_lookup(name)
-                        .and_then(|hit| match hit.action {
-                            rurge_dns::hosts::HostAction::Ips(ips) => ips.first().copied(),
-                            _ => None,
-                        })
-                }
-                _ => None,
-            };
-            let pinned = pinned_ip.is_some();
-            if let Some(ip) = pinned_ip {
-                target = Target::new(HostName::Ip(ip), target.port);
-            }
-            // A plain request of the HTTP listener can go to an HTTP proxy in
-            // absolute form instead of through a tunnel (M1 design 6.5). The
-            // inbound writes the request line, so the target is checked here
-            // first, and the headers are rendered once for this connection
-            // (the two obligations `HttpForward` puts on its caller).
-            let plain_http =
-                handle.session().listener == ListenerKind::Http && handle.session().url.is_some();
-            // a pinned address only reaches the proxy through a tunnel: in
-            // absolute form the request URI carries the name
-            let may_forward = plain_http && !pinned;
-            let host = handle.session().dst_host.to_string();
-            let book = registry.auto().smart.clone();
-            // a name no member can send is refused by all of them alike: the
-            // session goes through the one the group picked as through a
-            // policy of its own — no other is tried, and the group is told
-            // nothing of it (phase 2 M8 design 5.5)
-            if resolution.smart.is_some() && crate::smart::unsendable(&target) {
-                resolution.smart = None;
-            }
-            // the member a `smart` group picked, then the next ones in line
-            // while they do not connect (phase 2 M3c design §7)
-            let attempts = crate::smart::attempts(&registry, resolution);
-            let begun = Instant::now();
-            let mut tried: Vec<String> = Vec::new();
-            let mut failure = None;
-            for (k, attempt) in attempts.iter().enumerate() {
-                if k > 0 {
-                    handle.set_policy_chain(attempt.chain.clone());
-                }
-                // every try gets its share of the time that is left
-                let timeout = match attempts.len() {
-                    1 => CONNECT_TIMEOUT,
-                    n => CONNECT_TIMEOUT.saturating_sub(begun.elapsed()) / (n - k) as u32,
-                };
-                let opts = ConnectOpts { timeout };
-                let connecting = connect_through(&attempt.outbound, &target, may_forward, &opts);
-                let connected = if attempts.len() == 1 {
-                    connecting.await
-                } else {
-                    tokio::time::timeout(timeout, connecting)
-                        .await
-                        .unwrap_or(Err(OutboundError::Timeout))
-                };
-                let e = match connected {
-                    Ok((stream, forward)) => {
-                        handle.mark_connected();
-                        if let Some(pick) = &attempt.smart {
-                            book.used(&pick.group, &pick.member, Instant::now());
-                            let outbound = &attempt.outbound;
-                            crate::smart::watch(
-                                &handle,
-                                book.clone(),
-                                &pick.member,
-                                outbound,
-                                &host,
-                                true,
-                            );
-                            if !tried.is_empty() {
-                                handle.set_error(format!(
-                                    "smart group `{}`: {} failed to connect, used `{}`",
-                                    pick.group,
-                                    crate::smart::quoted(&tried),
-                                    pick.member
-                                ));
-                            }
-                        }
-                        return Ok(Dialed {
-                            stream,
-                            handle,
-                            forward,
-                        });
-                    }
-                    Err(e) => e,
-                };
-                let retry = crate::smart::retryable(&e);
-                if let Some(pick) = &attempt.smart
-                    && retry
-                {
-                    let (outbound, now) = (&attempt.outbound, Instant::now());
-                    book.report_failure(&pick.member, outbound, Some(&host), now);
-                    tried.push(pick.member.clone());
-                }
-                failure = Some(e);
-                if !retry {
-                    break;
-                }
-            }
-            if tried.len() > 1
-                && let Some(pick) = attempts.first().and_then(|a| a.smart.as_ref())
-            {
-                handle.set_error(format!(
-                    "smart group `{}`: tried {}",
-                    pick.group,
-                    crate::smart::quoted(&tried)
-                ));
-            }
-            match failure.expect("a dial was tried") {
-                OutboundError::Reject(kind) => {
-                    let effective = if kind.escalates() {
-                        let host = handle.session().dst_host.to_string();
-                        let now = Instant::now();
-                        self.escalation.record(&host, now);
-                        if self.escalation.should_drop(&host, now) {
-                            rurge_proto::RejectKind::Drop
-                        } else {
-                            kind
-                        }
-                    } else {
-                        kind
-                    };
-                    reject(handle, effective)
-                }
-                OutboundError::Unsupported(what) => {
-                    // what the outbound cannot do here (M4-D7): say so
-                    handle.set_error(Note::Unsupported(what).to_string());
-                    reject(handle, rurge_proto::RejectKind::Reject)
-                }
-                OutboundError::Dns(m) => fail(handle, FailKind::Dns, m),
-                OutboundError::Io(e) => fail(handle, FailKind::Connect, e.to_string()),
-                OutboundError::Timeout => fail(handle, FailKind::Timeout, "connect timed out"),
-                e @ (OutboundError::Proxy(_)
-                | OutboundError::Tls(_)
-                | OutboundError::Unavailable(_)) => fail(handle, FailKind::Connect, e.to_string()),
-            }
+            let trail = handle.trail().clone();
+            trail
+                .follow(self.connect_session(rt, registry, handle))
+                .await
         })
     }
 

@@ -429,11 +429,15 @@ async fn run_flow(
         },
     );
     let handle = engine.new_handle(session);
+    let trail = handle.trail().clone();
     let opened = tokio::select! {
         _ = association.ended.cancelled() => Err(SessionOutcome::Completed),
         _ = handle.token().cancelled() => Err(SessionOutcome::Completed),
-        opened = open(&engine, &association, &handle, &to) => opened,
+        opened = trail.follow(open(&engine, &association, &handle, &to)) => opened,
     };
+    // a flow has no single far end: the TCP connection that opened a proxy's
+    // carrier is the first flow's by chance, and no address of its record
+    trail.clear_peer();
     match opened {
         Ok((flow, carrier, send_to)) => {
             let outcome =

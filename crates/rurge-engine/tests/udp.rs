@@ -437,6 +437,70 @@ async fn udp_goes_through_a_socks5_proxy() {
     );
 }
 
+/// A UDP flow has no single far end. The control connection of the proxy's
+/// association is a TCP socket of the flow that happened to open the
+/// carrier, and it is no address of the flow's record.
+#[tokio::test]
+async fn a_flow_through_a_socks5_proxy_has_no_remote_address() {
+    let up = FakeSocks5::spawn(Socks5Script::default()).await;
+    let proxies = format!(
+        "Up = socks5, 127.0.0.1, {}, udp-relay=true",
+        up.addr().port()
+    );
+    let h = harness(Profile {
+        proxies: &proxies,
+        rules: "IP-CIDR,127.0.0.1/32,Up",
+        ..Profile::default()
+    })
+    .await;
+    let (echo, _) = udp_echo().await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("127.0.0.1", echo.port(), b"via the proxy")
+        .await;
+    assert_eq!(association.recv().await, (echo, b"via the proxy".to_vec()));
+    let commands: Vec<u8> = up.requests().iter().map(|r| r.command).collect();
+    assert_eq!(
+        commands,
+        [3],
+        "the association's control connection was made"
+    );
+    drop(association);
+    let records = finished(&h, 1).await;
+    assert_eq!(records[0].policy, ["Up"]);
+    assert_eq!(records[0].remote_addr, None, "{:?}", records[0]);
+    assert_eq!(records[0].listen_port, h.socks().port());
+}
+
+/// The lookup DIRECT makes of the name a flow is addressed to counts, as a
+/// TCP session's does; a flow addressed to an address looked nothing up.
+#[tokio::test]
+async fn a_flow_counts_the_lookup_of_its_name() {
+    let h = harness(Profile::default()).await;
+    let (echo, _) = udp_echo().await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("target.test", echo.port(), b"by name")
+        .await;
+    association
+        .send("127.0.0.1", echo.port(), b"by address")
+        .await;
+    let mut answers = vec![association.recv().await.1, association.recv().await.1];
+    answers.sort();
+    assert_eq!(answers, [b"by address".to_vec(), b"by name".to_vec()]);
+    drop(association);
+    let records = finished(&h, 2).await;
+    let of = |host: &str| {
+        records
+            .iter()
+            .find(|r| r.dst.starts_with(host))
+            .unwrap_or_else(|| panic!("no record of {host} in {records:?}"))
+    };
+    let (named, addressed) = (of("target.test"), of("127.0.0.1"));
+    assert!(named.dns_ms.is_some(), "{named:?}");
+    assert_eq!(addressed.dns_ms, None, "{addressed:?}");
+}
+
 /// `underlying-proxy` carries UDP (M5 design 4.3): the front proxy's
 /// association is set up through the back one, and its datagrams go
 /// through the back one's association.

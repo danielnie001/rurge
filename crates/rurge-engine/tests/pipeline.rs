@@ -2539,3 +2539,293 @@ async fn runtime_mode_and_global_policy_override_routing() {
     let full = h.engine.config_text(true).await.unwrap();
     assert!(full.contains("password=x"));
 }
+
+// What a dial leaves on the request record: the port of the listener the
+// session came in on, where the socket it opened itself went, how long it
+// waited for name lookups.
+
+/// A DIRECT session says which listener it came in on and where its
+/// connection went. Its target is an address, so it looked nothing up.
+#[tokio::test]
+async fn a_direct_session_records_its_listener_and_the_address_it_connected_to() {
+    let h = common::harness(common::Profile::default()).await;
+    let echo = rurge_proto::testing::echo_server().await;
+    let mut over_http = common::connect_via_http(h.http(), &echo.to_string()).await;
+    common::echo_through(&mut over_http, b"http").await;
+    drop(over_http);
+    let mut over_socks = common::connect_via_socks5(h.socks(), "127.0.0.1", echo.port()).await;
+    common::echo_through(&mut over_socks, b"socks").await;
+    drop(over_socks);
+    let records = common::the_records(&h, 2).await;
+    let by = |kind| {
+        records
+            .iter()
+            .find(|r| r.listener == kind)
+            .unwrap_or_else(|| panic!("no {kind:?} record in {records:?}"))
+    };
+    let (http, socks) = (by(ListenerKind::Http), by(ListenerKind::Socks5));
+    assert_eq!(http.listen_port, h.http().port());
+    assert_eq!(socks.listen_port, h.socks().port());
+    for r in [http, socks] {
+        assert_eq!(r.status, RecordStatus::Completed, "{r:?}");
+        assert_eq!(r.remote_addr, Some(echo));
+        assert_eq!(r.dns_ms, None, "an address needs no lookup: {r:?}");
+    }
+}
+
+/// A lookup the dial waits for counts, whoever answers it: here `[Host]`,
+/// which answers in next to no time.
+#[tokio::test]
+async fn a_name_pinned_in_host_counts_as_a_lookup() {
+    let h = common::harness(common::Profile {
+        hosts: "pinned.test = 127.0.0.1",
+        ..common::Profile::default()
+    })
+    .await;
+    let echo = rurge_proto::testing::echo_server().await;
+    let authority = format!("pinned.test:{}", echo.port());
+    let mut tunnel = common::connect_via_http(h.http(), &authority).await;
+    common::echo_through(&mut tunnel, b"by name").await;
+    drop(tunnel);
+    let r = common::the_records(&h, 1).await.remove(0);
+    assert_eq!(r.remote_addr, Some(echo));
+    assert!(r.dns_ms.is_some(), "{r:?}");
+}
+
+/// A session through a proxy connected to the proxy, and that is the address
+/// on its record. The proxy resolves the name: this machine looked up none.
+#[tokio::test]
+async fn a_session_through_a_proxy_records_the_proxy_it_connected_to() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let up = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(echo),
+        ..Socks5Script::default()
+    })
+    .await;
+    let proxies = format!("Up = socks5, 127.0.0.1, {}", up.addr().port());
+    let h = common::harness(common::Profile {
+        proxies: &proxies,
+        rules: "DOMAIN,target.test,Up",
+        ..common::Profile::default()
+    })
+    .await;
+    let mut tunnel = common::connect_via_http(h.http(), "target.test:7").await;
+    common::echo_through(&mut tunnel, b"via the proxy").await;
+    drop(tunnel);
+    let r = common::the_records(&h, 1).await.remove(0);
+    assert_eq!(r.policy, ["Up"]);
+    assert_eq!(r.remote_addr, Some(up.addr()));
+    assert_eq!(r.dns_ms, None, "{r:?}");
+}
+
+/// Of a chain the record has the first hop: the address this machine's
+/// socket went to. The names behind it are the proxies' to look up.
+#[tokio::test]
+async fn a_chained_session_records_the_first_hop() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let exit = FakeHttpProxy::spawn(HttpProxyScript {
+        connect_to: Some(echo),
+        ..HttpProxyScript::default()
+    })
+    .await;
+    let entry = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(exit.addr()),
+        ..Socks5Script::default()
+    })
+    .await;
+    let proxies = format!(
+        "Entry = socks5, 127.0.0.1, {}\nExit = http, exit.example, 8080, underlying-proxy=Entry",
+        entry.addr().port()
+    );
+    let h = common::harness(common::Profile {
+        proxies: &proxies,
+        rules: "DOMAIN,target.test,Exit",
+        ..common::Profile::default()
+    })
+    .await;
+    let mut tunnel = common::connect_via_http(h.http(), "target.test:7").await;
+    common::echo_through(&mut tunnel, b"two hops").await;
+    drop(tunnel);
+    let r = common::the_records(&h, 1).await.remove(0);
+    assert_eq!(r.policy, ["Exit"]);
+    assert_eq!(r.remote_addr, Some(entry.addr()));
+    assert_eq!(r.dns_ms, None, "{r:?}");
+}
+
+/// A session the rules reject opened no socket. What the rules had to look up
+/// to decide counts all the same; a rule that needs no lookup leaves none.
+#[tokio::test]
+async fn a_rejected_session_has_no_remote_address_but_the_lookups_of_the_rules() {
+    let h = common::harness(common::Profile {
+        rules: "DOMAIN,ads.test,REJECT\nIP-CIDR,127.0.0.1/32,REJECT",
+        ..common::Profile::default()
+    })
+    .await;
+    common::plain_get(h.http(), "http://ads.test/", "ads.test").await;
+    common::plain_get(h.http(), "http://target.test/", "target.test").await;
+    let records = common::the_records(&h, 2).await;
+    let of = |host: &str| {
+        records
+            .iter()
+            .find(|r| r.dst.starts_with(host))
+            .unwrap_or_else(|| panic!("no record of {host} in {records:?}"))
+    };
+    let (ads, target) = (of("ads.test"), of("target.test"));
+    for r in [ads, target] {
+        assert!(matches!(r.status, RecordStatus::Rejected(_)), "{r:?}");
+        assert_eq!(r.remote_addr, None);
+        assert_eq!(r.listen_port, h.http().port());
+    }
+    assert_eq!(ads.dns_ms, None, "a domain rule looks nothing up: {ads:?}");
+    assert!(target.dns_ms.is_some(), "the IP rule did: {target:?}");
+}
+
+/// Two sessions dialling together each record their own address and their
+/// own lookup time: the one that waits for a slow answer has the wait, the
+/// one that connects to an address meanwhile has none.
+#[tokio::test]
+async fn sessions_dialling_together_record_their_own_address_and_lookup_time() {
+    let h = common::harness(common::Profile::default()).await;
+    h.dns.set("slow.test", &["127.0.0.1"], &[], 60);
+    let delay = Duration::from_millis(400);
+    h.dns.set_delay(delay);
+    let (slow, quick) = (
+        rurge_proto::testing::echo_server().await,
+        rurge_proto::testing::echo_server().await,
+    );
+    let (slow_authority, quick_authority) =
+        (format!("slow.test:{}", slow.port()), quick.to_string());
+    let (mut slow_tunnel, mut quick_tunnel) = tokio::join!(
+        common::connect_via_http(h.http(), &slow_authority),
+        common::connect_via_http(h.http(), &quick_authority),
+    );
+    common::echo_through(&mut slow_tunnel, b"slow").await;
+    common::echo_through(&mut quick_tunnel, b"quick").await;
+    drop((slow_tunnel, quick_tunnel));
+    let records = common::the_records(&h, 2).await;
+    let of = |echo: SocketAddr| {
+        records
+            .iter()
+            .find(|r| r.remote_addr == Some(echo))
+            .unwrap_or_else(|| panic!("no record at {echo} in {records:?}"))
+    };
+    let (slow, quick) = (of(slow), of(quick));
+    assert!(slow.dst.starts_with("slow.test:"), "{slow:?}");
+    assert!(slow.dns_ms.unwrap() >= delay.as_millis() as u64, "{slow:?}");
+    assert_eq!(quick.dns_ms, None, "{quick:?}");
+}
+
+/// Keeps the connectivity tests off a member: the sessions of a test round
+/// are records of the request log as well, and the members' fakes would
+/// count their connections.
+const UNTESTED: &str = "test-url=http://[";
+
+/// When a `smart` group moves on from a member it could not reach, the
+/// record has the address of the member that connected.
+#[tokio::test]
+async fn after_a_smart_group_moves_on_the_record_has_the_member_that_connected() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let good = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(echo),
+        ..Socks5Script::default()
+    })
+    .await;
+    let proxies = format!(
+        "Dead = socks5, 127.0.0.1, {}, {UNTESTED}\nGood = socks5, 127.0.0.1, {}, {UNTESTED}",
+        common::closed_tcp_port(),
+        good.addr().port()
+    );
+    let h = common::harness(common::Profile {
+        proxies: &proxies,
+        groups: "S = smart, Dead, Good",
+        rules: "DOMAIN,target.test,S",
+        ..common::Profile::default()
+    })
+    .await;
+    let mut tunnel = common::connect_via_http(h.http(), "target.test:7").await;
+    common::echo_through(&mut tunnel, b"second member").await;
+    drop(tunnel);
+    let r = common::the_records(&h, 1).await.remove(0);
+    assert_eq!(r.policy, ["S", "Good"]);
+    assert_eq!(r.remote_addr, Some(good.addr()));
+}
+
+/// Each attempt of a `smart` group's dial starts from nothing: a member that
+/// connected and then failed in its handshake leaves no address behind when
+/// the next one does not connect at all.
+#[tokio::test]
+async fn a_smart_group_forgets_the_address_of_a_member_that_failed() {
+    let refusing = FakeSocks5::spawn(Socks5Script {
+        reply: 5,
+        ..Socks5Script::default()
+    })
+    .await;
+    let proxies = format!(
+        "Refuses = socks5, 127.0.0.1, {}, {UNTESTED}\nDead = socks5, 127.0.0.1, {}, {UNTESTED}",
+        refusing.addr().port(),
+        common::closed_tcp_port()
+    );
+    let h = common::harness(common::Profile {
+        proxies: &proxies,
+        groups: "S = smart, Refuses, Dead",
+        rules: "DOMAIN,target.test,S",
+        ..common::Profile::default()
+    })
+    .await;
+    let r = common::a_failed_session(&h).await;
+    assert_eq!(refusing.requests().len(), 1, "the first member did connect");
+    assert_eq!(r.remote_addr, None, "{r:?}");
+}
+
+/// DNS sessions rurge starts itself record where they went, too: the server
+/// of a `tcp://` upstream. They came in on no listener.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_internal_dns_session_records_the_server_it_connected_to() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile(&format!("tcp://{}", dns.addr()), "", "");
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    lookup_target(&engine).await;
+    let sessions = internal_sessions(&engine);
+    let session = sessions
+        .iter()
+        .find(|r| r.remote_addr.is_some())
+        .unwrap_or_else(|| panic!("no session of the TCP server in {sessions:?}"));
+    assert_eq!(session.remote_addr, Some(dns.addr()));
+    assert_eq!((session.listen_port, session.dns_ms), (0, None));
+}
+
+/// A QUIC carrier is UDP: the control connection of the SOCKS5 association
+/// it rides on is no address of its record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_carrier_over_a_socks5_association_has_no_remote_address() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let proxy = FakeSocks5::spawn(Socks5Script::default()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile(
+        &format!("quic://{}", doq.addr()),
+        &format!(
+            "Socks = socks5, 127.0.0.1, {}, udp-relay=true",
+            proxy.addr().port()
+        ),
+        "PROTOCOL,DOQ,Socks",
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    lookup_target(&engine).await;
+    let requests = proxy.requests();
+    assert!(
+        !requests.is_empty() && requests.iter().all(|r| r.command == 3),
+        "the proxy was reached, for its UDP association: {requests:?}"
+    );
+    let carriers = carrier_sessions(&engine);
+    assert!(
+        carriers.iter().any(|r| r.policy == ["Socks"]),
+        "{carriers:?}"
+    );
+    for carrier in &carriers {
+        assert_eq!(carrier.remote_addr, None, "{carrier:?}");
+    }
+}

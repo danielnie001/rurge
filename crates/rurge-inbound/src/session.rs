@@ -4,6 +4,7 @@ use rurge_config::rule::ProtocolKind;
 use rurge_config::session::SessionInfo;
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, Target};
+use rurge_net::trail::Trail;
 use rurge_proto::RejectKind;
 use std::io;
 use std::pin::Pin;
@@ -34,6 +35,7 @@ pub struct SessionHandle {
     policy_chain: Mutex<Vec<String>>,
     error: Mutex<Option<String>>,
     notes: Mutex<Vec<String>>,
+    trail: Trail,
     sni: Mutex<Option<String>>,
     protocol: Mutex<Option<ProtocolKind>>,
     up: AtomicU64,
@@ -73,6 +75,7 @@ impl SessionHandle {
             policy_chain: Mutex::new(Vec::new()),
             error: Mutex::new(None),
             notes: Mutex::new(Vec::new()),
+            trail: Trail::new(),
             sni: Mutex::new(None),
             protocol: Mutex::new(None),
             up: AtomicU64::new(0),
@@ -152,6 +155,13 @@ impl SessionHandle {
 
     pub fn notes(&self) -> Vec<String> {
         self.notes.lock().expect("session notes").clone()
+    }
+
+    /// What the session's dial leaves of itself: the address its connection
+    /// went to and the time it spent on name lookups. The engine runs the
+    /// dial inside `follow` of this, and the request record reads it.
+    pub fn trail(&self) -> &Trail {
+        &self.trail
     }
 
     /// The sniffed TLS SNI, filled by the engine's relay path (M3b).
@@ -461,6 +471,22 @@ mod tests {
         h.add_note(String::from("second"));
         assert_eq!(h.notes(), ["first", "second"]);
         assert_eq!(h.error().as_deref(), Some("why it failed"));
+    }
+
+    /// Every session has a trail of its own: what a dial notes while it
+    /// follows one handle's is not the other's.
+    #[tokio::test]
+    async fn a_session_has_a_trail_of_its_own() {
+        let (a, b) = (
+            SessionHandle::new(1, SessionInfo::tcp(HostName::parse("a.test"), 80)),
+            SessionHandle::new(2, SessionInfo::tcp(HostName::parse("b.test"), 80)),
+        );
+        let peer = "192.0.2.1:80".parse().unwrap();
+        a.trail()
+            .follow(async { rurge_net::trail::connected(peer) })
+            .await;
+        assert_eq!(a.trail().peer(), Some(peer));
+        assert_eq!(b.trail().peer(), None);
     }
 
     #[tokio::test]

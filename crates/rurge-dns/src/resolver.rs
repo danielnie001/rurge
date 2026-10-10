@@ -627,6 +627,8 @@ impl Resolver {
         if let Ok(ip) = bare.parse::<IpAddr>() {
             return Ok(literal(ip, Source::Literal, started));
         }
+        // an address needed no lookup; every other way out of here is one
+        let _noted = Noted(started);
         let lower = trimmed.to_ascii_lowercase();
         let no_search = lower.ends_with('.');
         let name = lower.trim_end_matches('.').to_string();
@@ -1016,6 +1018,17 @@ fn build_plain_udp(spec: &UpstreamSpec) -> UpstreamRef {
     }
 }
 
+/// Notes a lookup on the trail of the session that is dialling when it ends,
+/// however it ends: a dial that gives up on a lookup drops it half way, and
+/// the session has spent that time on it all the same.
+struct Noted(Instant);
+
+impl Drop for Noted {
+    fn drop(&mut self) {
+        rurge_net::trail::looked_up(self.0.elapsed());
+    }
+}
+
 fn literal(ip: IpAddr, source: Source, started: Instant) -> DnsResult {
     from_ips(&[ip], Duration::ZERO, source, started)
 }
@@ -1133,6 +1146,7 @@ mod tests {
         BoxedDatagram, BoxedStream, ConnectOpts, DirectConnector, SystemResolve, Target,
     };
     use rurge_net::resource::ResourceOptions;
+    use rurge_net::trail::Trail;
     use std::net::SocketAddr;
     use std::path::PathBuf;
 
@@ -1325,6 +1339,103 @@ mod tests {
         assert_eq!(d.v4, vec![v4("10.0.0.7")]);
         assert_eq!(mock.query_count("dotted.test", Qtype::A), 1);
         assert!(r.lookup("", LookupOpts::default()).await.is_err());
+    }
+
+    /// A lookup made while a session dials is noted on the session's trail,
+    /// whoever answers it — `[Host]`, the cache or an upstream — and whether
+    /// it succeeds or not. An address is no lookup.
+    #[tokio::test]
+    async fn lookups_are_noted_on_the_trail_of_whoever_is_dialling() {
+        let mock = MockDns::spawn().await;
+        mock.set("up.test", &["10.0.0.1"], &[], 60);
+        mock.set_empty("nx.test");
+        let e = env(&profile(
+            &format!("dns-server = {}", mock.addr()),
+            "pinned.test = 10.1.2.3\n",
+        ));
+        let (r, _) = resolver_once(&e, StaticSystemDns::default());
+        let spent = |name: &'static str| {
+            let r = r.clone();
+            async move {
+                let trail = Trail::new();
+                let _ = trail.follow(r.lookup(name, LookupOpts::default())).await;
+                trail.dns()
+            }
+        };
+        assert!(spent("pinned.test").await.is_some(), "[Host]");
+        assert!(spent("up.test").await.is_some(), "an upstream");
+        assert!(spent("up.test").await.is_some(), "the cache");
+        assert_eq!(
+            mock.query_count("up.test", Qtype::A),
+            1,
+            "the second was the cache's"
+        );
+        assert!(spent("nx.test").await.is_some(), "an empty answer");
+        assert!(spent("localhost").await.is_some(), "the loopback name");
+        assert_eq!(spent("10.9.9.9").await, None, "an address");
+        assert_eq!(spent("[::1]").await, None, "an address in brackets");
+    }
+
+    /// A lookup through an interface counts as any other.
+    #[tokio::test]
+    async fn a_lookup_via_an_interface_is_noted_too() {
+        let mock = MockDns::spawn().await;
+        mock.set("a.test", &["10.0.0.1"], &[], 60);
+        let e = env(&profile(&format!("dns-server = {}", mock.addr()), ""));
+        let (r, _) = resolver_once(&e, StaticSystemDns::default());
+        let (via, _) = Noting::via("en1");
+        let trail = Trail::new();
+        trail
+            .follow(r.lookup_via("a.test", LookupOpts::default(), &via))
+            .await
+            .unwrap();
+        assert!(trail.dns().is_some());
+    }
+
+    /// The connections a lookup makes itself — to a `tcp://` server here —
+    /// are made by the tasks the query fans out into, not by the dial that
+    /// waits for the answer: the session's trail has the time the lookup took
+    /// and no address.
+    #[tokio::test]
+    async fn the_connections_a_lookup_makes_are_not_the_dialling_sessions() {
+        let tcp = MockDns::spawn().await;
+        tcp.set("a.test", &["10.0.0.42"], &[], 60);
+        let e = env(&profile(
+            &format!("encrypted-dns-server = tcp://{}", tcp.addr()),
+            "",
+        ));
+        let (r, diags) = resolver_once(&e, StaticSystemDns::default());
+        assert!(diags.is_empty());
+        assert_eq!(r.primary_upstreams(), vec![format!("tcp://{}", tcp.addr())]);
+        let trail = Trail::new();
+        let a = trail
+            .follow(r.lookup("a.test", LookupOpts::default()))
+            .await
+            .unwrap();
+        assert_eq!(a.v4, vec![v4("10.0.0.42")]);
+        assert_eq!(tcp.query_count("a.test", Qtype::A), 1, "asked over TCP");
+        assert!(trail.dns().is_some());
+        assert_eq!(trail.peer(), None);
+    }
+
+    /// A lookup the dial gives up on — the timeout around it fires — took the
+    /// time it took, and the trail has it.
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_cut_short_is_noted_for_the_time_it_took() {
+        let mock = MockDns::spawn().await;
+        mock.set("slow.test", &["10.0.0.1"], &[], 60);
+        mock.set_delay(Duration::from_secs(30));
+        let e = env(&profile(&format!("dns-server = {}", mock.addr()), ""));
+        let r = resolver_in_memory(&e, &mock, StaticSystemDns::default());
+        let trail = Trail::new();
+        let cut = trail
+            .follow(tokio::time::timeout(
+                Duration::from_millis(50),
+                r.lookup("slow.test", LookupOpts::default()),
+            ))
+            .await;
+        assert!(cut.is_err(), "the timeout fired first");
+        assert!(trail.dns().unwrap() >= Duration::from_millis(50));
     }
 
     #[tokio::test]

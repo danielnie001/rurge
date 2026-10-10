@@ -678,6 +678,67 @@ async fn requests_carry_the_notes_of_their_sessions() {
     assert_eq!(rejected["notes"], json!([]));
 }
 
+/// A request says which port of the proxy it came in on, where the socket it
+/// opened itself went and how long it waited for name lookups — in flight and
+/// finished; `null` when there is none of the last two.
+#[tokio::test]
+async fn requests_carry_the_listen_port_the_remote_address_and_the_lookup_time() {
+    let api = api().await;
+    let port = api.http().port();
+    let target = format!("127.0.0.1:{}", api.target_port());
+    let (head, _) = get_via_proxy(api.http(), &api.target_url()).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let _ = get_via_proxy(api.http(), "http://ads.test/").await;
+    let mut recent = Vec::new();
+    wait_until(async || {
+        recent = get(&api, "/v1/requests/recent").await.1["requests"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        recent.iter().any(|r| r["status"] == "completed")
+            && recent.iter().any(|r| r["status"] == "rejected")
+    })
+    .await;
+    // target.test is looked up (the mock DNS answers it), then connected to
+    let served = recent.iter().find(|r| r["status"] == "completed").unwrap();
+    assert_eq!(served["listenPort"], port);
+    assert_eq!(served["remoteAddr"], target);
+    assert!(served["dnsMs"].is_u64(), "{served}");
+    // rejected by a domain rule: no lookup, no socket
+    let rejected = recent.iter().find(|r| r["status"] == "rejected").unwrap();
+    assert_eq!(rejected["listenPort"], port);
+    assert!(
+        rejected["remoteAddr"].is_null() && rejected["dnsMs"].is_null(),
+        "{rejected}"
+    );
+    // a tunnel still open shows the same while it runs
+    let dst = format!("target.test:{}", api.target_port());
+    let mut tunnel = TcpStream::connect(api.http()).await.unwrap();
+    tunnel
+        .write_all(format!("CONNECT {dst} HTTP/1.1\r\nHost: {dst}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 256];
+    let n = tunnel.read(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+    let mut live = Value::Null;
+    wait_until(async || {
+        let body = get(&api, "/v1/requests/active").await.1;
+        live = body["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["dst"] == dst && r["status"] == "active")
+            .cloned()
+            .unwrap_or(Value::Null);
+        !live.is_null()
+    })
+    .await;
+    assert_eq!(live["listenPort"], port);
+    assert_eq!(live["remoteAddr"], target);
+    assert!(live["dnsMs"].is_u64(), "{live}");
+}
+
 #[tokio::test]
 async fn traffic_reports_totals_by_policy_and_listener() {
     let api = api().await;

@@ -47,7 +47,9 @@ pub struct RequestJson {
     pub listener: &'static str,
     pub transport: &'static str,
     pub src: String,
+    pub listen_port: u16,
     pub dst: String,
+    pub remote_addr: Option<String>,
     pub rule: Option<String>,
     pub policy: Vec<String>,
     pub sni: Option<String>,
@@ -58,6 +60,7 @@ pub struct RequestJson {
     pub elapsed_ms: u64,
     pub connect_ms: Option<u64>,
     pub first_byte_ms: Option<u64>,
+    pub dns_ms: Option<u64>,
     pub status: &'static str,
     pub reject_kind: Option<String>,
     pub error: Option<String>,
@@ -80,7 +83,9 @@ impl From<&RequestRecord> for RequestJson {
                 Transport::Udp => "udp",
             },
             src: r.src.to_string(),
+            listen_port: r.listen_port,
             dst: r.dst.clone(),
+            remote_addr: r.remote_addr.map(|a| a.to_string()),
             rule: r.rule.clone(),
             policy: r.policy.clone(),
             sni: r.sni.clone(),
@@ -91,6 +96,7 @@ impl From<&RequestRecord> for RequestJson {
             elapsed_ms: r.elapsed_ms,
             connect_ms: r.connect_ms,
             first_byte_ms: r.first_byte_ms,
+            dns_ms: r.dns_ms,
             status,
             reject_kind,
             error: r.error.clone(),
@@ -185,7 +191,9 @@ mod tests {
             listener,
             transport: Transport::Tcp,
             src: "127.0.0.1:1".parse().unwrap(),
+            listen_port: 6152,
             dst: "1.1.1.1:443".into(),
+            remote_addr: None,
             rule: None,
             policy: vec![],
             sni: None,
@@ -196,6 +204,7 @@ mod tests {
             elapsed_ms: 0,
             connect_ms: None,
             first_byte_ms: None,
+            dns_ms: None,
             status: RecordStatus::Active,
             error: None,
             notes: vec![],
@@ -258,5 +267,25 @@ mod tests {
         let v = serde_json::to_value(RequestJson::from(&r)).unwrap();
         assert_eq!(v["connectMs"], 12);
         assert_eq!(v["firstByteMs"], 34);
+    }
+
+    /// The listener's port is always a number; the address of the session's
+    /// own connection and the time spent on lookups are `null` when there is
+    /// none.
+    #[test]
+    fn the_listen_port_the_remote_address_and_the_lookup_time() {
+        let mut r = record(1, ListenerKind::Http);
+        let v = serde_json::to_value(RequestJson::from(&r)).unwrap();
+        assert_eq!(v["listenPort"], 6152);
+        assert_eq!(v["remoteAddr"], Value::Null);
+        assert_eq!(v["dnsMs"], Value::Null);
+        r.remote_addr = Some("192.0.2.7:443".parse().unwrap());
+        r.dns_ms = Some(0);
+        let v = serde_json::to_value(RequestJson::from(&r)).unwrap();
+        assert_eq!(v["remoteAddr"], "192.0.2.7:443");
+        assert_eq!(v["dnsMs"], 0);
+        r.remote_addr = Some("[2001:db8::1]:443".parse().unwrap());
+        let v = serde_json::to_value(RequestJson::from(&r)).unwrap();
+        assert_eq!(v["remoteAddr"], "[2001:db8::1]:443");
     }
 }

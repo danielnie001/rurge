@@ -496,6 +496,11 @@ impl Connector for DirectConnector {
                 async move { connect_one(addr, &socket_opts, hook.as_ref(), &logged).await }
             })
             .await?;
+            // noted here, not in the attempt: each attempt of the race runs
+            // in a task of its own, where no trail is followed
+            if let Ok(peer) = stream.peer_addr() {
+                crate::trail::connected(peer);
+            }
             Ok(Box::new(stream) as BoxedStream)
         }))
     }
@@ -828,6 +833,7 @@ mod tests {
     }
 
     use crate::socket::{Family, SocketHook, SocketOpts};
+    use crate::trail::Trail;
     use rurge_config::spec::IpVersion;
     use std::sync::Mutex;
 
@@ -1427,6 +1433,60 @@ mod tests {
             *hook.calls.lock().unwrap(),
             ["tos 0x10 V4", "bind test0 V4"]
         );
+    }
+
+    /// The connection a direct dial makes is noted on the trail of whoever
+    /// dials, at the address that answered: the winner of the race, not the
+    /// first one tried.
+    #[tokio::test]
+    async fn a_connection_is_noted_at_the_address_that_answered() {
+        let (l, port) = listener().await;
+        let connector = DirectConnector::new(Arc::new(Fixed(vec![ip("::1"), ip("127.0.0.1")])));
+        let target = Target::new(HostName::parse("both.test"), port);
+        let trail = Trail::new();
+        let _stream = trail
+            .follow(connector.connect(&target, &ConnectOpts::default()))
+            .await
+            .unwrap();
+        assert_eq!(trail.peer(), Some(l.local_addr().unwrap()));
+    }
+
+    /// A dial that makes no connection notes none; nor does a UDP flow, which
+    /// has no connection to note.
+    #[tokio::test]
+    async fn a_dial_that_connects_nowhere_notes_no_address() {
+        let (_l, port) = listener().await;
+        let hook = Arc::new(RecordingHook {
+            refuse_interface: true,
+            ..RecordingHook::default()
+        });
+        let refusing = DirectConnector::with_opts(
+            Arc::new(Fixed(vec![ip("127.0.0.1")])),
+            SocketOpts {
+                interface: Some("gone0".into()),
+                ..SocketOpts::default()
+            },
+            hook,
+        );
+        let target = Target::new(HostName::parse("127.0.0.1"), port);
+        let trail = Trail::new();
+        let err = trail
+            .follow(refusing.connect(&target, &ConnectOpts::default()))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "cannot use interface gone0: no such interface"
+        );
+        assert_eq!(trail.peer(), None);
+
+        let plain = DirectConnector::new(Arc::new(Fixed(vec![ip("127.0.0.1")])));
+        trail
+            .follow(plain.connect_udp(&target, &ConnectOpts::default()))
+            .await
+            .unwrap();
+        assert_eq!(trail.peer(), None);
     }
 
     #[test]
