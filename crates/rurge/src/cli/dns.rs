@@ -163,7 +163,7 @@ fn warnings(config_diags: &Diagnostics, stack_diags: &Diagnostics) -> Vec<serde_
     config_diags
         .iter()
         .chain(stack_diags.iter())
-        .map(|x| json!({ "code": x.code, "message": x.message }))
+        .map(|x| json!({ "code": x.code, "message": x.message, "hint": x.hint }))
         .collect()
 }
 

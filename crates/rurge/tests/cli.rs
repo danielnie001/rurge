@@ -1406,9 +1406,14 @@ FINAL,DIRECT
         let (v, code) = json(dir.path(), &["listed.com"]);
         assert_eq!(code, 0);
         let warnings = v["warnings"].as_array().expect("warnings array");
-        assert!(
-            warnings.iter().any(|w| w["code"] == "W0001"),
-            "{warnings:?}"
+        let unknown_key = warnings
+            .iter()
+            .find(|w| w["code"] == "W0001")
+            .unwrap_or_else(|| panic!("{warnings:?}"));
+        // the hint is there as in `check --json`
+        assert_eq!(
+            unknown_key["hint"],
+            rurge_config::codes::hint("W0001").expect("W0001 has a hint")
         );
     }
 
@@ -1545,6 +1550,49 @@ mod dns {
         assert_eq!(v["addresses"], serde_json::json!(["1.2.3.4"]));
         assert_eq!(v["source"], "host(ip)");
         assert!(mock.queries().is_empty());
+    }
+
+    /// The warnings of a profile are in `--json` the way `check --json` has
+    /// them: with the hint of their code, and `null` where the code has none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_json_warnings_of_a_lookup_carry_the_hint_of_their_code() {
+        let mock = MockDns::spawn().await;
+        let dir = workspace();
+        std::fs::write(
+            dir.path().join("t.conf"),
+            CONF.replace(
+                "ipv6 = false",
+                "ipv6 = false\nsome-made-up-key = 1\ncompatibility-mode = true",
+            ),
+        )
+        .unwrap();
+        let out = output(dns_cmd(
+            dir.path(),
+            "lookup",
+            &mock.addr().to_string(),
+            &["fixed.test", "--json"],
+        ))
+        .await;
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v = json_of(&out);
+        let warnings = v["warnings"].as_array().expect("warnings array");
+        let warning = |code: &str| {
+            warnings
+                .iter()
+                .find(|w| w["code"] == code)
+                .unwrap_or_else(|| panic!("{code} is not in {warnings:?}"))
+        };
+        assert_eq!(
+            warning("W0001")["hint"],
+            rurge_config::codes::hint("W0001").expect("W0001 has a hint")
+        );
+        // `W0004` is a code without a hint: the key is there all the same
+        assert_eq!(warning("W0004").get("hint"), Some(&serde_json::Value::Null));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -319,7 +319,7 @@ fn to_json(
     let warnings: Vec<_> = config_diags
         .iter()
         .chain(stack_diags.iter())
-        .map(|x| json!({ "code": x.code, "message": x.message }))
+        .map(|x| json!({ "code": x.code, "message": x.message, "hint": x.hint }))
         .collect();
     json!({
         "policy": d.policy().map(|p| p.to_string()),
