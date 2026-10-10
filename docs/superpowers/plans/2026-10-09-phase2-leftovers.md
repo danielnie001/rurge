@@ -2,9 +2,11 @@
 
 阶段 2 的 20 份计划（M1a ～ M7c）各有一张「延后事项」表，共 403 行。本表给每一行写明最后的结局和依据，让事情不会在里程碑之间丢掉：一行被送给"M5"，要看 M5 是不是真的接了。读法：「小计」给各结局的数目，「阶段 2 结束时仍开着的事项」按去向列出所有 `移交` 的行，「逐份计划」是逐行的明细（`#` 沿用各计划自己的行号；M1a、M1b、M2a、M2b 的表原来没有编号，按出现顺序编号）。
 
-各行的结局核对到提交 `28340f3`（M8c 的代码在此冻结；任务 12 的文档提交在它之上）。三件事要先知道。第一，没有推送过：`origin/main` 仍是 `0154e73`，那次 CI 运行之后的所有提交都没有推送，CI 没有在 M8 的任何提交上跑过；M8a 任务 6（CI 首跑的修正）要等推送之后读 CI 的失败清单，还没有开始，所以结局是 `移交：CI 首跑` 的行都还开着。第二，互操作用例在本机没有参照服务端，全部跳过，从未对真实二进制跑过；依据里写「M8c 做掉」的互操作夹具改动也只能这样说。第三，M8c 自己的「延后事项」不在本表里，在 M8c 计划（`docs/superpowers/plans/2026-10-09-phase2-m8c-leftovers-acceptance-plan.md`）的同名一节里。
+各行的结局先核对到提交 `28340f3`（M8c 的代码冻结点：交给整分支终审的那一版；任务 12 的文档提交在它之上）；终审之后的最终修正波（九个提交，到 `087f399`）碰到的几行，由任务 12 A 部分的补充补核，写在下面「终审之后」一段。三件事要先知道。第一，没有推送过：`origin/main` 仍是 `0154e73`，那次 CI 运行之后的所有提交都没有推送，CI 没有在 M8 的任何提交上跑过；M8a 任务 6（CI 首跑的修正）要等推送之后读 CI 的失败清单，还没有开始，所以结局是 `移交：CI 首跑` 的行都还开着。第二，互操作用例在本机没有参照服务端，全部跳过，从未对真实二进制跑过；依据里写「M8c 做掉」的互操作夹具改动也只能这样说。第三，M8c 自己的「延后事项」不在本表里，在 M8c 计划（`docs/superpowers/plans/2026-10-09-phase2-m8c-leftovers-acceptance-plan.md`）的同名一节里。
 
-草稿是任务 4 ～ 13 还没有执行时写的；核对时改了三行的结局：M1a #20（移交：其它 → M8 做掉：两条计时类用例都已改掉）、M3c #1（移交：有用户报告再说 → 关闭：登记为已知限制，不改）、M5a #20（移交：下次动到时 → M8 做掉：任务 10 的修正轮把 TCP 客户端自己的地址也归成 IPv4）。其余依赖 M8c 任务的行结局不变，依据补上了提交与名字。
+草稿写成时，依赖任务 4、任务 6 的修正轮和任务 8 ～ 13 的行还不能确认（任务 5 ～ 7 已经执行）；核对时改了三行的结局：M1a #20（移交：其它 → M8 做掉：两条计时类用例都已改掉）、M3c #1（移交：有用户报告再说 → 关闭：登记为已知限制，不改）、M5a #20（移交：下次动到时 → M8 做掉：任务 10 的修正轮把 TCP 客户端自己的地址也归成 IPv4）。其余依赖 M8c 任务的行结局不变，依据补上了提交与名字。
+
+终审之后：最终修正波补核了它碰到的行，结局改了一行、依据改了几行。结局：M5c #9（按来源过滤回包时精确比较 `Target`）由 `移交：有用户报告再说` 改为 `M8 做掉`——`packet_datagram` 的接收任务与 `udp_probe` 比较来源时两侧先归一，`from_relay` 随后同样（`8e581e7`、`b14b45a`）——；小计与开着的清单随之重数：M8 做掉 63 → 64，移交 187 → 186，有用户报告再说 98 → 97。依据改了的：M2b #1（看门狗没有对真实服务端验证过）、M3a #20（又有 `cf8df9a`）、M3a #33（URL 任务每分钟的醒来恢复了）、M3b #20（`generation_lock` 的说法）、M5a #20 与 M7b #8（归一的地方，「唯一的实现」的措辞）、M3a #23（资源管理器的显示）、M8a #3（`UnknownKey` 的 `Debug`）、M2b #29、M4a #11、M7c #15（评审指出的措辞与数字）。
 
 ## 结局的写法
 
@@ -23,7 +25,7 @@
   - `下次动到时`：代码里留着一处小整理，下一次动那个文件的人顺手做。
   - `其它`：冒号后写明条件。
 
-M8 设计第 7 节用"动到那些文件时再整理"作理由关闭了五行（M4b #26、#27，M7c #18、#19、#21），意思与 `移交：下次动到时` 相同；表里照设计的写法保持为 `关闭`。
+M8 设计第 7 节用"动到那些文件时再整理"作理由关闭了五行（M4b #26、#27，M7c #18、#19、#21），意思与 `移交：下次动到时` 相同；表里照设计的写法保持为 `关闭`。另一个例外是 M3c #1（组环检测把 `smart` 组里写的嵌套组当作边）：它原来的去向写的是"有用户报告再说"，按上面的写法该是 `移交：有用户报告再说`；M8c 执行中裁定它登记为已知限制、不改（有绕开的办法：把那个本来就不起作用的嵌套组从 `smart` 组里删掉），所以表里记为 `关闭`。小计里的关闭 73 / 移交 186 因此比按上面的写法数多一行关闭、少一行移交。
 
 ## 小计
 
@@ -42,18 +44,18 @@ M8 设计第 7 节用"动到那些文件时再整理"作理由关闭了五行（
 | M4c | 0 | 0 | 0 | 9 | 9 |
 | M5a | 2 | 1 | 0 | 18 | 21 |
 | M5b | 2 | 0 | 2 | 10 | 14 |
-| M5c | 1 | 1 | 2 | 15 | 19 |
+| M5c | 1 | 2 | 2 | 14 | 19 |
 | M6a | 2 | 2 | 2 | 9 | 15 |
 | M6b | 0 | 0 | 3 | 6 | 9 |
 | M6c | 1 | 1 | 2 | 7 | 11 |
 | M7a | 5 | 2 | 2 | 4 | 13 |
 | M7b | 2 | 2 | 6 | 6 | 16 |
 | M7c | 1 | 15 | 10 | 10 | 36 |
-| 合计 | 80 | 63 | 73 | 187 | 403 |
+| 合计 | 80 | 64 | 73 | 186 | 403 |
 
 ## 阶段 2 结束时仍开着的事项
 
-20 份计划里结局是 `移交` 的 187 行，按标签分组，一行一项；括号里是标签后面的补充。
+20 份计划里结局是 `移交` 的 186 行，按标签分组，一行一项；括号里是标签后面的补充。
 
 ### 项目所有者（2）
 
@@ -111,7 +113,7 @@ M8 设计第 7 节用"动到那些文件时再整理"作理由关闭了五行（
 - M2c #10 — 自检 3、4 没有失败路径的测试
 - M4b #1 — smoltcp 0.12 的 TCP 限制
 
-### 有用户报告再说（98）
+### 有用户报告再说（97）
 
 - M1a #16 — `decode_p12` 的无私钥 / 链为空 / 无填充 Base64 分支没有用例
 - M1a #30 — `BootstrapConnector` 不能表达 `prefer_v6`
@@ -193,7 +195,6 @@ M8 设计第 7 节用"动到那些文件时再整理"作理由关闭了五行（
 - M5c #1 — `dns-follow-interface` 不跟随加密 DNS
 - M5c #3 — UDP 测试的结果不保存、不进 `test_results`、不进请求记录
 - M5c #4 — 隧道里 UDP socket 的缓冲固定 64 包 / 256 KiB
-- M5c #9 — 按来源过滤回包时精确比较 `Target`
 - M5c #11 — 换载体：`connect_udp` 超过 10 秒时可能同时两次拨号；换过载体后连不上的 peer 每 10 秒重拨
 - M5c #13 — UDP 测试：无 `test_case` 的策略没有 UDP 结果等三处
 - M5c #14 — `smart` 的 UDP：载体打不开的任何错误都算成员失败等
@@ -272,7 +273,7 @@ M8a 计划（`docs/superpowers/plans/2026-10-08-phase2-m8a-ci-credentials-plan.m
 
 - M8a #1 — `h3://` 的 DoH3 URL 带用户名口令仍被拒（`W0026`），与 `https://` 的 Basic 认证不对称 — 去向：有用户报告再说（做法同 DoH：加一个头）
 - M8a #2 — 缓存目录 `meta.json` 里资源的完整 URL — 去向：不处理（与缓存的订阅正文、配置文件同在使用者的数据目录里）
-- M8a #3 — `[General]` 里不认识的键的取值在 `General.unknown` 的 `Debug` 里可见 — 去向：有用户报告再说；M8c 任务 13 复查后仍不动（隐藏它们会隐藏配置的大半），在 M8c 计划的「延后事项」里列为由项目所有者决定的一条
+- M8a #3 — `[General]` 里不认识的键的取值在 `General.unknown` 的 `Debug` 里可见 — 去向：有用户报告再说；M8c 任务 13 复查后仍不动（隐藏它们会隐藏配置的大半），在 M8c 计划的「延后事项」里列为由项目所有者决定的一条；终审之后 `UnknownKey` 的 `Debug` 显示脱敏后的那一行（`b4a5759`），未知键的取值本身仍有意显示
 - M8a #4 — `General` 的 `proxy_test_url` / `internet_test_url` 在 `Debug` 里可见 — 去向：M8c 任务 13，已做掉（`eafd6be`；`redact_profile` 也隐去这两个键，修正轮 `199148c` 又收进 `geoip-maxmind-url`）
 - M8a #5 — 失败摘要脚本没有自动化测试；注解长度上限没有文档依据 — 去向：第一次真正用上时核对；需要时给脚本配一组样本日志
 - M8a #6 — `url_without_credentials` 对查询串里带 `@` 的 URL 过度脱敏 — 去向：接受（偏安全一侧；只出现在诊断与脱敏输出里）
@@ -289,7 +290,7 @@ M8a 计划（`docs/superpowers/plans/2026-10-08-phase2-m8a-ci-credentials-plan.m
 - M8b #11 — 只靠读代码、没有本机用例盖住的三处 — 去向：接受
 - M8b #12 — 一行已经有错误时仍多说一句的其余各处 — 去向：M8c 任务 10，已做掉（`57977af`，修正轮 `c870456`）
 
-M8c 自己的「延后事项」（50 行）列在 M8c 计划（`docs/superpowers/plans/2026-10-09-phase2-m8c-leftovers-acceptance-plan.md`）的「延后事项」一节里；其中去向写「由项目所有者决定」的几行是阶段 2 留给项目所有者的问题。
+M8c 自己的「延后事项」（97 行）列在 M8c 计划（`docs/superpowers/plans/2026-10-09-phase2-m8c-leftovers-acceptance-plan.md`）的「延后事项」一节里；其中去向写「由项目所有者决定」的几行（第 51 ～ 77 行等）是阶段 2 留给项目所有者的问题。
 
 ## 逐份计划
 
@@ -392,7 +393,7 @@ M8c 自己的「延后事项」（50 行）列在 M8c 计划（`docs/superpowers
 
 | # | 事项 | 原去向 | 结局 | 依据 |
 | - | ---- | ------ | ---- | ---- |
-| 1 | （计划期）AnyTLS 不实现 3 秒 SYNACK 看门狗（P7） | M8 收尾时评估；清单已登记 | M8 做掉 | M8c 任务 5（设计 5.6、M8-D14；M8c「承接事项」「M2b 计划期」一行）：`cf22f19` 做掉主体，`16b54c5` 让假服务端照参考服务端的次序应答 UDP 流并补复用会话上的 UDP 载体用例。复用的会话（流号不小于 2、对端协议版本不低于 2）上新流发出后 3 秒没有它的 `cmdSYNACK` 即关闭整条会话，流上的读写以 `anytls: the session is closed` 结束；差异与限制由任务 12 的 B 部分登记进兼容性清单 |
+| 1 | （计划期）AnyTLS 不实现 3 秒 SYNACK 看门狗（P7） | M8 收尾时评估；清单已登记 | M8 做掉 | M8c 任务 5（设计 5.6、M8-D14；M8c「承接事项」「M2b 计划期」一行）：`cf22f19` 做掉主体，`16b54c5` 让假服务端照参考服务端的次序应答 UDP 流并补复用会话上的 UDP 载体用例。复用的会话（流号不小于 2、对端协议版本不低于 2）上新流发出后 3 秒没有它的 `cmdSYNACK` 即关闭整条会话，流上的读写以 `anytls: the session is closed` 结束；差异与限制由任务 12 的 B 部分登记进兼容性清单。终审另记：看门狗没有对真实服务端验证过——互操作用例在几毫秒内放掉每条流，UDP 用例用新会话的第一条流，第一次 CI 运行也改变不了这一点；缺的是一条在复用的会话上活过三秒的流的互操作用例（M8c 计划「延后事项」第 87 行） |
 | 2 | （计划期）Unicode 写的代理服务器名不可用（P15） | M8：连同规则、`[Host]`、解析器做全面 IDN；清单已登记 | 移交：阶段 3 之后 | 做掉的一半：出站一侧（策略行 `server` 转 A-label，`ssh` 与 `wireguard` 的目标名）→ M8c 任务 7（设计 5.9；`010a9ca`，修正轮 `2e4cb63`）。未做的一半：规则、`[Host]` 的键、解析器对 Unicode 名 → M8 设计第 7 节「M2b P15 的其余部分」移交阶段 3 之后。兼容性清单「所有协议通用 / 策略行里的代理服务器主机名」一行由任务 12 的 B 部分从「须写成 ASCII」改为「出站一侧已支持，规则与 `[Host]` 须写成 `xn--` 形式」 |
 | 3 | （计划期）`Secret<T>` 只包了部分凭据字段（P14） | M8 | M8 做掉 | M8a 任务 2（设计 3.3，b09b126）：`WsOpts`、`KeystoreItem` 手写 `Debug`；`HttpSpec.headers` 的值早在 6f58b74 起不进 `Debug`（`HeaderTemplate`）。判据 `crates/rurge-config/tests/secrets.rs` 的标记配置含 `ws-path`、`ws-headers` 与 `[Keystore]` |
 | 4 | （计划期）VMess 旧式（非 AEAD）握手 | M8（设计 M2-D4） | M8 做掉 | M8b 任务 1（设计 4.2、M8-D8），以「不实现」结案：没写 `vmess-aead=true` 的行改用 AEAD 握手并报 `W0029`（4203eb3，断言在 `crates/rurge/tests/cli.rs`）；`NotImplemented::LegacyVmess` 已删；差异登记在清单 `vmess` 行 |
@@ -420,7 +421,7 @@ M8c 自己的「延后事项」（50 行）列在 M8c 计划（`docs/superpowers
 | 26 | 互操作 anytls 复用用例只断言往返成功 | 保持现状 | 关闭 | 原文「保持现状」：复用本身由回环假服务端的用例钉住；用例仍在 `tests/interop/tests/sing_box_tls_family.rs` |
 | 27 | `sing_box.rs` 已 518 行 | M2c 动它时考虑按协议拆文件 | 已做掉 | M2c 任务 6（288a529；M2c 计划「承接事项」C2）：拆出 `sing_box_tls_family.rs` 与 `common/mod.rs`，`tests/interop/tests/sing_box.rs` 现 250 行 |
 | 28 | vmess"连接在分块中间断开"文本也用于应答头读半截 | 保持延后（罕见路径） | 关闭 | 原文「保持延后」：罕见路径，改文本要动已验证的流代码。文本未变，`docs/api/phase2.md` 如实写了两种成因 |
-| 29 | `crates/rurge-engine/tests/outbounds.rs` 已 1500 多行 | M2c 动它时按协议拆分 | 已做掉 | M2c 任务 6（288a529；M2c 计划「承接事项」C2）：该文件现 831 行，协议用例分到 `outbounds_tls_family.rs` 等文件 |
+| 29 | `crates/rurge-engine/tests/outbounds.rs` 已 1500 多行 | M2c 动它时按协议拆分 | 已做掉 | M2c 任务 6（288a529；M2c 计划「承接事项」C2）：该文件现 827 行（任务 14 的 `6c83d07` 去掉了四行），协议用例分到 `outbounds_tls_family.rs` 等文件 |
 | 30 | 每 8 KiB 一次 flush 在 TLS / WS / VMess 栈上的成本 | M8 的性能工作里必须测 | M8 做掉 | M8c 任务 9（设计 5.11）：结论同 #16——每次写后 flush 在 TLS / WebSocket / VMess 栈上不花吞吐，保留（`6752afa`、`d309f33`） |
 | 31 | "anytls 鉴权必须一次写出"的唯一守卫是 CI 运行 | 首次推送后盯住互操作 job | 移交：CI 首跑 | M8 设计 3.2 点名「sing-box 的 anytls 鉴权」；M8a 任务 6 还没有开始，要等推送 |
 | 32 | `environment()` 第二例：`with_roots` 公开而根证书库不在指纹里 | M2c 迁 http / socks5 到 `Stack` 时复核，考虑改成派生值 | 已做掉 | M2c 任务 5、7（M2c 计划「承接事项」C3，计划期决定 P15、P16）：复核结论 `environment()` 不变；根证书库移进 `EngineShared.roots`（`crates/rurge-engine/src/shared.rs`，60943c8）。改成派生值考虑后没做，约定仍靠人工维护，见 #19 |
@@ -468,10 +469,10 @@ M8c 自己的「延后事项」（50 行）列在 M8c 计划（`docs/superpowers
 | 17 | 坏的 `external-policy-modifier` 每行一条 `W0023` | 与 #6 一起 | 移交：有用户报告再说 | 随 #6（同一处：每次重建逐条记告警）；M8 各计划未点名 |
 | 18 | `derive` 线性查名；派生名撞车 | 有用户报告再说 | 移交：有用户报告再说 | 限制仍在（`crates/rurge-policy/src/assemble.rs` 的 `derive`）；M8 各计划未点名 |
 | 19 | `<random-string(…)>` 长度错误引用括号内文字 | 单独小改动 | M8 做掉 | M8a 任务 2，提交 b09b126：长度不是数字时错误不再引用括号里的文字（`crates/rurge-config/src/spec/http.rs`，用例 `a_placeholder_whose_length_is_none_is_not_quoted`）；M8 设计 3.3 |
-| 20 | 计时类偶发失败；`rurge-dns` 用例空转 | 单独排查 | M8 做掉 | M8c 任务 15（`f28d67c`、`f0412ca`，修正轮 `dd22e04`）与任务 11（`6e22fa2`、`284c40a`）。空转查明并修好：`rurge_dns::fanout::resolve_name` 在循环醒来时已过查询的截止时间、还有轮次没发的情形下没有出口（`667af52` 引入），一个条件修复，用例 `a_fanout_kept_from_running_until_past_its_deadline_ends_as_a_timeout`。与原行的观察相符，但那次运行没有留下日志，不能证明就是它；没有证据表明还有第二个。四条计时类用例：`bootstrap::tests::set_upstreams_takes_effect_for_the_next_resolve` 在任务 11（改用不重发的 `once()`），`resolver::tests` 的三条（`a_partial_result_completes_aaaa_in_the_background`、`aaaa_suppression_after_five_timeouts_and_flush_resumes`、`cache_fresh_stale_negative_and_coalescing`）在任务 15（暂停的时钟与 `MockDns::upstream()`）；同一 crate 里同类的其余用例（`fanout::tests` 5 条、`resolver::tests` 6 条）在任务 15 的修正轮改掉 |
+| 20 | 计时类偶发失败；`rurge-dns` 用例空转 | 单独排查 | M8 做掉 | M8c 任务 15（`f28d67c`、`f0412ca`，修正轮 `dd22e04`）与任务 11（`6e22fa2`、`284c40a`）。空转查明并修好：`rurge_dns::fanout::resolve_name` 在循环醒来时已过查询的截止时间、还有轮次没发的情形下没有出口（`667af52` 引入），一个条件修复，用例 `a_fanout_kept_from_running_until_past_its_deadline_ends_as_a_timeout`。与原行的观察相符，但那次运行没有留下日志，不能证明就是它；没有证据表明还有第二个。四条计时类用例：`bootstrap::tests::set_upstreams_takes_effect_for_the_next_resolve` 在任务 11（改用不重发的 `once()`），`resolver::tests` 的三条（`a_partial_result_completes_aaaa_in_the_background`、`aaaa_suppression_after_five_timeouts_and_flush_resumes`、`cache_fresh_stale_negative_and_coalescing`）在任务 15（暂停的时钟与 `MockDns::upstream()`）；同一 crate 里同类的其余用例（`fanout::tests` 5 条、`resolver::tests` 6 条）在任务 15 的修正轮改掉；终审之后的 `cf8df9a` 又改了剩下的几条靠时间窗的用例（多线程用例改名为 `all_dropped_is_a_timeout_on_a_multi_thread_runtime`，TCP 等锁的用例与假服务端的 `misbehaviours` 不再靠时间窗，三条解析器用例改用不重发的选项） |
 | 21 | 1 秒内多次更新只重建一次，无用例 | 有用户报告再说 | 移交：有用户报告再说 | 限制仍在：去抖只由常数 `REBUILD_DEBOUNCE` 保证（`crates/rurge-engine/src/subscriptions.rs`），`crates/rurge-engine` 的用例里没有去抖的断言 |
 | 22 | 订阅下载的 User-Agent | 已修（M3a 合并后的小修正） | 已做掉 | 提交 b6caa13：`build_stack_with` 把 `HttpClientConfig.user_agent` 设为 `rurge/<版本> (Surge-compatible)`（`crates/rurge-engine/src/stack.rs`）；兼容性清单 5.2 `policy-path` 行已登记 |
-| 23 | 资源管理器 `Debug`；`meta.json` 里的完整 URL | 单独小改动 | 关闭 | `Debug` 一半：M8a 任务 5，提交 8fb7bf7（URL 只显示到主机与端口、正文只显示长度，用例 `the_debug_of_a_resource_shows_neither_its_url_nor_its_body`）。`meta.json` 里的完整 URL 一半不动：M8 设计 3.3「不动的」与 M8a 延后事项 #2（与缓存的订阅正文同在使用者的数据目录里），`Meta.url` 仍写盘（`crates/rurge-net/src/resource/cache.rs`）。M8 设计第 7 节把本行整行列在「M8 做掉」 |
+| 23 | 资源管理器 `Debug`；`meta.json` 里的完整 URL | 单独小改动 | 关闭 | `Debug` 一半：M8a 任务 5，提交 8fb7bf7（URL 只显示到主机与端口、正文只显示长度，用例 `the_debug_of_a_resource_shows_neither_its_url_nor_its_body`）。`meta.json` 里的完整 URL 一半不动：M8 设计 3.3「不动的」与 M8a 延后事项 #2（与缓存的订阅正文同在使用者的数据目录里），`Meta.url` 仍写盘（`crates/rurge-net/src/resource/cache.rs`）。M8 设计第 7 节把本行整行列在「M8 做掉」。终审之后的补充：`Entry::log_name` 的回退走 `ResourceSource::shown()`（`ec3bc9d`），`Display for ResourceSource` 与 `Response` 派生的 `Debug`（`final_url` 保留用户信息）今天没有东西打印（M8c 计划「延后事项」第 86 行） |
 | 24 | `include-other-group` 取未派生成员，绕过中继 | 手工验收时对照 Surge 再定 | 移交：手工验收 | 现状已登记：兼容性清单 5.2 `underlying-proxy` 行（"经 `include-other-group` 取到的是未派生的成员"）；与 Surge 的对照加入 `docs/acceptance/phase2-manual.md`（M8c 任务 12 的 B 部分） |
 | 25 | 订阅导入的 `external` 须一律跳过 | M4 设计必查 | 已做掉 | M4c 计划承接事项 C1 → 任务 1，提交 fe9bc16；代码：`Imports::collect` 对 `PolicyKind::External` 一律跳过并 `W0023`，`external-policy-modifier` 设什么都不例外（`crates/rurge-policy/src/assemble.rs`） |
 | 26 | 漏写 `=` 的行让 `E0004` 回显口令 | 已修（M3a 合并后的小修正） | 已做掉 | 提交 b6caa13：`definition_entries` 遇到名字含逗号的行报 `E0017` 且不引用行内容（`crates/rurge-config/src/config.rs`，用例 `a_missing_equals_after_the_name_quotes_nothing_of_the_line`） |
@@ -481,7 +482,7 @@ M8c 自己的「延后事项」（50 行）列在 M8c 计划（`docs/superpowers
 | 30 | `E0017` 引用整行、`E0001` 引用端口字段 | 已修（M3a 合并后的小修正） | 已做掉 | 提交 b6caa13：`E0017` 不再引用整行（同 #26）；端口字段只在是数字时引用（`crates/rurge-config/src/policy.rs` 的 `parse_policy`，用例 `an_invalid_port_is_quoted_only_when_it_is_a_number`） |
 | 31 | `ProxyPolicy` 派生 `Debug` 带出原文 | 单独小改动 | M8 做掉 | M8a 任务 2，提交 b09b126：`ProxyPolicy` 手写 `Debug`，不打印 `positional` / `params`，`definition` 经 `redact_definition`（`crates/rurge-config/src/policy.rs`）；标记用例 `crates/rurge-config/tests/secrets.rs`；M8 设计 3.3 |
 | 32 | 单行长度与本地文件大小无上限 | M8 | 移交：有用户报告再说 | M8 设计第 7 节「移交」表（有用户报告或性能数据再说） |
-| 33 | 旧资源管理器的 `url_task` 睡满刷新间隔 | 单独排查 | M8 做掉 | M8c 任务 13（第 5 项；`8812e3f`，修正轮 `28340f3`）：`ResourceManager`（`crates/rurge-net/src/resource/mod.rs`）多一个 `gone` 的 `watch` 通道，管理器一没，它的 URL 任务立刻结束（正在抓取的等这次抓取结束，至多 `fetch_timeout`，缺省 30 秒），不论刷新间隔多长；自动刷新关闭的任务只等刷新请求与管理器消失，原来每 60 秒醒一次的几行随修正轮去掉。用例 `a_url_task_ends_with_its_manager`、`a_url_task_without_auto_refresh_waits_for_a_kick_and_for_its_manager` |
+| 33 | 旧资源管理器的 `url_task` 睡满刷新间隔 | 单独排查 | M8 做掉 | M8c 任务 13（第 5 项；`8812e3f`，修正轮 `28340f3`）：`ResourceManager`（`crates/rurge-net/src/resource/mod.rs`）多一个 `gone` 的 `watch` 通道，管理器一没，它的 URL 任务立刻结束（正在抓取的等这次抓取结束，至多 `fetch_timeout`，缺省 30 秒），不论刷新间隔多长；自动刷新关闭的任务每分钟醒一次、只看间隔而不抓取——修正轮（`28340f3`）曾把这次醒来去掉，复评指出那是个回归（它是停着的任务看到同一 URL 的另一处引用并入的间隔的办法），最终修正波在 `8e581e7` 里恢复了它；管理器消失由 `gone` 立刻通知，不靠这次醒来。用例 `a_url_task_ends_with_its_manager`、`a_url_task_without_auto_refresh_waits_for_a_kick_and_for_its_manager` |
 | 34 | 导入行的 `W0023` 无数量上限 | 与 #6 一起 | 移交：有用户报告再说 | 随 #6（同一处：每次重建逐条记告警）；M8 各计划未点名 |
 
 ### M3b — `2026-09-25-phase2-m3b-testing-auto-groups-plan.md`（23 行；原表有 # 列，按原编号）
@@ -507,7 +508,7 @@ M8c 自己的「延后事项」（50 行）列在 M8c 计划（`docs/superpowers
 | 17 | 嵌套 `load-balance` 外层打分不看覆盖 | 有用户报告再说 | 移交：有用户报告再说 | M8 各计划与之后的计划都未点名；原去向不变 |
 | 18 | `override_of` 持状态锁写告警 | 单独小改动 | M8 做掉 | M8c 任务 13（第 3 项；`5cd3fc8`）：`override_of`（`crates/rurge-policy/src/auto.rs`）把要说的话带出 `state` 锁再写告警，文本、字段与「只说一次」不变；用例 `an_override_whose_member_is_gone_is_said_once` 钉住告警，改动前后都通过，它咬得住由变异证明。「写日志时锁确实已放开」靠读代码，没有用例 |
 | 19 | 巨大的 `test-timeout` 让 `round_timeout` 溢出 | 单独小改动 | M8 做掉 | M8c 任务 13（第 1 项；`5cd3fc8`）：溢出点有两处——`PolicyRegistry::round_timeout` 的乘法（`evaluate-before-use` 的组多于 8 个可测成员、第一次拨号时 panic）与 `wireguard` 策略的 `test_spec` 里 `+ 10 秒` 的加法（加载配置时就 panic），都改饱和运算；用到这个取值的其余地方都经 `tokio::time::timeout`，本来就不 panic。用例 `a_round_of_tests_with_an_absurd_timeout_is_bounded_by_the_longest_duration`、`a_wireguard_policy_with_an_absurd_test_timeout_is_built`（`crates/rurge-policy/src/registry.rs`）与 `an_absurd_test_timeout_does_not_stop_a_round`（`crates/rurge-engine/tests/auto_groups.rs`） |
-| 20 | `generation_lock` 中毒时 `expect` | 单独小改动 | M8 做掉 | M8c 任务 13（第 2 项；`5cd3fc8`）：`generation_lock`（`crates/rurge-engine/src/engine.rs`）改用 `PoisonError::into_inner`，锁中毒时不再 `expect`（这把锁只护着 `()`）；修正轮 `28340f3` 又把 `publish_generation` 里会失败的 `auto.retain` 挪到第一次 store 之前，一代要么整个发布要么不发布。用例 `a_panic_under_the_generation_lock_stops_no_dial`（`crates/rurge-engine/src/subscriptions.rs`）；修正轮的顺序调整没有新用例（要让它 panic 得毒化 `rurge-policy` 里引擎够不着的锁），由 `reload`、`auto_groups`、`smart`、`subscriptions` 的现有用例守着 |
+| 20 | `generation_lock` 中毒时 `expect` | 单独小改动 | M8 做掉 | M8c 任务 13（第 2 项；`5cd3fc8`）：`generation_lock`（`crates/rurge-engine/src/engine.rs`）改用 `PoisonError::into_inner`，锁中毒时不再 `expect`（这把锁只护着 `()`）；修正轮 `28340f3` 又把 `publish_generation` 里会失败的 `auto.retain` 挪到第一次 store 之前：已知会失败的都在第一次 store 之前；store 还会在最后一个持有者时丢掉被替换的东西（前一代的注册表与没有沿用的出站），没有已知会 panic 的 `Drop`（终审之后 `9c5ee82` 把两处注释改成只说已知的）。用例 `a_panic_under_the_generation_lock_stops_no_dial`（`crates/rurge-engine/src/subscriptions.rs`）；修正轮的顺序调整没有新用例（要让它 panic 得毒化 `rurge-policy` 里引擎够不着的锁），由 `reload`、`auto_groups`、`smart`、`subscriptions` 的现有用例守着 |
 | 21 | `CommonOpts` 的 `Debug` 打印 `test_url` | 单独小改动 | M8 做掉 | M8a 任务 2，提交 b09b126：`CommonOpts` 手写 `Debug`，`test_url` 显示为 `***`（`crates/rurge-config/src/spec/common.rs`）；M8 设计 3.3；M3c 承接事项 C3 把它留在原处 |
 | 22 | 策略 `test-url` 只按前缀校验 | 有用户报告再说 | 移交：有用户报告再说 | 限制仍在：策略的 `test-url` 只查 `http://` / `https://` 前缀（`crates/rurge-config/src/spec/common.rs`） |
 | 23 | 探针、选法、引擎、API 的测试缺口 | 单独补测试 | 移交：下次动到时 | M8 各计划与之后的计划都未点名；原去向（单独补测试）不变 |
@@ -543,7 +544,7 @@ M8c 自己的「延后事项」（50 行）列在 M8c 计划（`docs/superpowers
 | 8 | 无 RST 的断线要等保活判定 | 有用户报告再说（已登记） | 移交：有用户报告再说 | 已登记：兼容性清单 4.2 `ssh` 行（没有 RST 的断线要等保活判定约 2 分钟，其间新连接各自超时失败）；其余按原去向 |
 | 9 | 口令只走 `password` 方法 | 有用户报告再说（已登记为差异） | 移交：有用户报告再说 | 已登记：兼容性清单 4.6 `ssh` 行（口令不走 `keyboard-interactive`）；其余按原去向 |
 | 10 | `server-fingerprint` 一项后带注释是 `E0018` | 有用户报告再说 | 移交：有用户报告再说 | M8 各计划未点名；原去向不变 |
-| 11 | russh 的 `log` 记录进 rurge 日志 | 日志策略由项目所有者决定 | M8 做掉 | M8c 任务 13（第 8 项；`eafd6be`）：决定为 `russh` 只留 WARN 及以上，照 `boringtun` 与 `quinn` 的先例，`quiet_dependencies()`（`crates/rurge/src/cli/run.rs`）加一条；用例 `russh_says_only_its_warnings` |
+| 11 | russh 的 `log` 记录进 rurge 日志 | 日志策略由项目所有者决定 | M8 做掉 | M8c 任务 13（第 8 项；`eafd6be`）：决定（原留给项目所有者，由控制者代定）为 `russh` 只留 WARN 及以上，照 `boringtun` 与 `quinn` 的先例，`quiet_dependencies()`（`crates/rurge/src/cli/run.rs`）加一条；用例 `russh_says_only_its_warnings` |
 | 12 | `smart` 给首个成员的时间与 SSH 握手 | 跨里程碑的设计问题，有用户报告再说 | 移交：有用户报告再说 | M8 各计划未点名；原去向不变 |
 | 13 | CI 里装 `openssh-server` 的 apt 无重试 | 首次推送后看 CI；不稳就加 `Acquire::Retries` | 移交：CI 首跑 | M8 设计 3.2 / M8a 计划承接事项（各计划"首次推送后看 CI"的条目 → 任务 6）；`.github/workflows/ci.yml` 里该步仍无 `Acquire::Retries`，但已是 `continue-on-error: true`（M8b 终审，提交 33b38c0）；M8 设计 3.1 记着首跑时参照服务端的安装步骤都通过 |
 | 14 | 测试覆盖缺口 | 以后顺手补 | 移交：下次动到时 | M8 各计划与之后的计划都未点名；原去向（以后顺手补）不变 |
@@ -622,7 +623,7 @@ M8c 自己的「延后事项」（50 行）列在 M8c 计划（`docs/superpowers
 | 17 | 被 kill 的 UDP 流记成「完成」；只丢一个包的原因只记第一个 | 以后顺手改 | 移交：下次动到时 | 原去向未变，M8 未认领 |
 | 18 | 端口 53 的流是载体上唯一的流时，回收连带关掉载体 | 有用户报告再说 | 移交：有用户报告再说 | 原去向未变，M8 未认领 |
 | 19 | 网卡绑定的载体在地址变化后不自愈 | 随阶段 3 的网络变化探测 | 移交：阶段 3 | 第 7 节「移交」表（M3b #5、#11，M4b #3、#19，M5a #19 → 阶段 3） |
-| 20 | 双栈监听上 `SRC-IP` 规则匹配不到 IPv4 客户端 | 阶段 1 入站，以后顺手改 | M8 做掉 | M8c 任务 10 的修正轮（`0d7dac0`）：接受循环在交给 HTTP / SOCKS5 的处理之前把客户端的 `::ffff:a.b.c.d` 归成 IPv4（`canonical_peer`，`crates/rurge-inbound/src/listener.rs`），双栈监听上 `SRC-IP` 的 IPv4 网段命中 IPv4 客户端，请求记录里显示 IPv4；`HostName::canonical`（`rurge-config`）是「映射地址即 IPv4」的唯一实现。用例 `an_ipv4_client_of_a_dual_stack_listener_is_named_by_its_ipv4_address`；接受循环里那个调用点只靠读代码核对，监听层面没有用例（Windows 上产品不设那个 socket 选项，造不出收 IPv4 客户端的 IPv6 监听） |
+| 20 | 双栈监听上 `SRC-IP` 规则匹配不到 IPv4 客户端 | 阶段 1 入站，以后顺手改 | M8 做掉 | M8c 任务 10 的修正轮（`0d7dac0`）：接受循环在交给 HTTP / SOCKS5 的处理之前把客户端的 `::ffff:a.b.c.d` 归成 IPv4（`canonical_peer`，`crates/rurge-inbound/src/listener.rs`），双栈监听上 `SRC-IP` 的 IPv4 网段命中 IPv4 客户端，请求记录里显示 IPv4；`HostName::canonical`（`rurge-config`）是目标地址与出站报回的来源归一的唯一实现（入站里另有 `udp.rs` 的 `canonical`、`restrict.rs` 各自归一的老代码，`rurge-proto` 的 `from_relay` 直接用 `IpAddr::to_canonical`）。用例 `an_ipv4_client_of_a_dual_stack_listener_is_named_by_its_ipv4_address`；接受循环里那个调用点只靠读代码核对，监听层面没有用例（Windows 上产品不设那个 socket 选项，造不出收 IPv4 客户端的 IPv6 监听） |
 | 21 | SOCKS 地址编解码写了两遍；`ConnectionReset` 吞法散在 6 处；限频日志三套写法 | 以后顺手改 | 移交：下次动到时 | 原去向未变，M8 未认领；M8c 任务 2（`e6f65b7`、`df814a6`）又在 `crates/rurge-net/src/quic/carrier.rs`、`crates/rurge-engine/src/dns_pipeline.rs` 与 `crates/rurge-net/src/packet_datagram.rs` 各加了一处对 `ConnectionReset` 的特别处理，没有合并 |
 
 ### M5b — `2026-09-29-phase2-m5b-udp-tls-family-plan.md`（14 行）
@@ -656,7 +657,7 @@ M8c 自己的「延后事项」（50 行）列在 M8c 计划（`docs/superpowers
 | 6 | `udp::a_closed_port_does_not_break_the_carrier` 偶发失败 | 以后顺手改 | M8 做掉 | M8c 任务 11（`6e22fa2`）：`a_closed_port_does_not_break_the_carrier`（`crates/rurge-engine/tests/udp.rs`）原来先绑定再释放端口当关着的端口，并行时该号可被旁边的用例占用；改用 `crates/rurge-engine/tests/common/mod.rs` 的 `closed_udp_port()`（取自 20000–29999、现场试绑，不取自系统分配的区间）。让端口一直被占着不行：在 Windows 上被占用的端口不产生 ICMP「端口不可达」，那样改了这条用例测的东西 |
 | 7 | `packet_datagram` 发送失败只记 `trace!`；名字目标的回包不按来源过滤 | 接受 | 关闭 | 原去向「接受」；其后 M7c 的 4f9bbbc 已把载体发送失败的原因交给下一次接收（`lost_alone` 除外），名字目标不过滤的一半不变（`packet_datagram.rs` 的 `from_peer`） |
 | 8 | 隧道里 UDP 载体：`recv_from` 先看 IPv4 等三处 | 以后顺手改 | 移交：下次动到时 | 原去向未变，M8 未认领 |
-| 9 | 按来源过滤回包时精确比较 `Target` | 有用户报告再说 | 移交：有用户报告再说 | 原去向未变；`packet_datagram.rs` 仍是 `*peer == from` |
+| 9 | 按来源过滤回包时精确比较 `Target` | 有用户报告再说 | M8 做掉 | 终审之后的最终修正波（`8e581e7`、`b14b45a`）：`packet_datagram`（`crates/rurge-net/src/packet_datagram.rs`）的接收任务把对端与每个收到的来源先取 `HostName::canonical` 再比较，`udp_probe`（`crates/rurge-policy/src/udp_probe.rs`）同样，`rurge-proto` 的 `from_relay`（SOCKS5 UDP 与 Shadowsocks UDP 共用）用 `IpAddr::to_canonical` 比较；中继或服务器从 IPv4 映射的 IPv6 地址回包不再被丢掉。用例 `a_peer_is_heard_from_its_ipv4_address_in_ipv6_form`、`an_answer_from_the_other_form_of_the_servers_address_is_its_answer`、`the_relay_is_the_relay_in_either_form_of_its_address`、`the_relay_is_heard_from_its_address_in_either_form`。名字目标的回包不按来源过滤的一半不变（`from_peer` 只对地址目标设） |
 | 10 | 链式载体：收包任务遇任何收包错误都结束；`BrokenPipe` 不算 `gone()` | 以后顺手改 | 移交：下次动到时 | 原去向未变；`packet_datagram.rs` 的收包任务仍 `Err(e) => break e`（M8c 任务 2 只改了它交给接收方的结束原因），`device.rs` 的 `gone()` 仍不含 `BrokenPipe` |
 | 11 | 换载体：`connect_udp` 超过 10 秒时可能同时两次拨号；换过载体后连不上的 peer 每 10 秒重拨 | 有用户报告再说 | 移交：有用户报告再说 | 原去向未变，M8 未认领 |
 | 12 | 告警限频表 `UNREACHABLE_SAID` / `ENDED_SAID` 从不清理 | 以后顺手改 | 移交：下次动到时 | 原去向未变，M8 未认领 |
@@ -747,7 +748,7 @@ M8c 自己的「延后事项」（50 行）列在 M8c 计划（`docs/superpowers
 | 5 | 认证或握手反复失败没有退避 | 有用户报告再说 | 移交：有用户报告再说 | 同 M7a #3 |
 | 6 | tuic 0.8.5 的命令行、配置键、就绪日志未核对 | 第一次 Linux CI 运行时核对 | 移交：CI 首跑 | SHA-256 已钉住（见 #1），核对仍等第一次 Linux CI：M8 设计 3.2，M8a 任务 6 |
 | 7 | v5 线上细节只对回环假服务端验证 | 第一次 CI 的 sing-box 互操作 | 移交：CI 首跑 | `v5_tcp_against_sing_box`、`v5_udp_against_sing_box`（`tests/interop/tests/tuic.rs`）没有在真实 sing-box 上跑过：M8 设计 3.2，M8a 任务 6 |
-| 8 | SOCKS5 对 IPv4 映射地址的回包归流 | M8 | M8 做掉 | M8c 任务 10（`21ecb85`，修正轮 `0d7dac0`；设计 5.12）：SOCKS5 入站把 `::ffff:a.b.c.d` 的目标（地址类型 4 或写成名字的文本）归成 IPv4，UDP 回包头里的来源写回地址类型 1；出站报回的来源在引擎的 `receive()` 里同样先归一再认流（`HostName::canonical`），回包不再记到载体上最老的流名下。用例 `an_ipv4_mapped_target_is_the_ipv4_address`（`crates/rurge-engine/tests/udp.rs`）、`an_answer_from_a_source_in_ipv6_form_finds_its_flow`（`crates/rurge-engine/src/udp.rs`） |
+| 8 | SOCKS5 对 IPv4 映射地址的回包归流 | M8 | M8 做掉 | M8c 任务 10（`21ecb85`，修正轮 `0d7dac0`；设计 5.12）：SOCKS5 入站把 `::ffff:a.b.c.d` 的目标（地址类型 4 或写成名字的文本）归成 IPv4，UDP 回包头里的来源写回地址类型 1；出站报回的来源在引擎的 `receive()` 里同样先归一再认流（`HostName::canonical`），回包不再记到载体上最老的流名下。比较报告来源与目标的地方共四处——引擎的 `receive()`、`packet_datagram` 的接收任务、`udp_probe`、`from_relay`——，后三处是终审之后补的（`8e581e7`、`b14b45a`，见 M5c #9）。用例 `an_ipv4_mapped_target_is_the_ipv4_address`（`crates/rurge-engine/tests/udp.rs`）、`an_answer_from_a_source_in_ipv6_form_finds_its_flow`（`crates/rurge-engine/src/udp.rs`） |
 | 9 | `tuic` 与 `hysteria2` 的载体辅助几乎相同 | M7c | 已做掉 | 链：M7c 承接事项 C7（原定"不抽"）→ M7c 延后 #11 → M7c 执行期修正 #5（5d040ad）做掉：`crates/rurge-proto-quic/src/carrier.rs`（`RouteClock`、`Inbox`、`bounded`）由 `hysteria2/udp.rs`、`tuic/udp.rs`、`masque/udp.rs` 共用 |
 | 10 | `tuic/mod.rs` 约 2200 行 | 有空时整理 | 移交：下次动到时 | 约 2200 行，没有整理；M8 设计第 7 节没有点名 |
 | 11 | `native` 模式的 `Dissociate` 也经 64 个的写入队列 | 接受 | 关闭 | 原去向"接受" |
@@ -775,7 +776,7 @@ M8c 自己的「延后事项」（50 行）列在 M8c 计划（`docs/superpowers
 | 12 | 互操作的 DNS 用例开着 `encrypted-dns-skip-cert-verification` | 接受 | 关闭 | 原去向"接受"：解析器没有注入测试根证书的入口 |
 | 13 | sing-box 1.15 的 `http` 入站可作 MASQUE 的三平台参照 | 发布正式版后再加 | 移交：其它：sing-box 1.15 发布正式版之后 | M8 设计第 7 节移交表 |
 | 14 | 不设流数上限的 QUIC 出站的流控 | M8 | M8 做掉 | M8c 任务 1（`7222293`，修正轮 `17dd21f`），设计 5.1：`crates/rurge-net/src/quic/dial.rs` 的 `Transport::STANDARD` 连接窗口取 32 × 每流窗口 = 256 MiB；`Transport::DNS` 与 `capped_transport` 的下限各自写成 20 MiB。登记的限制是 29 条，不是设计写的 32 条：quinn 的连接级额度攒到窗口的八分之一才公布一次，没人读的数据超过窗口的八分之七（224 MiB）时其余隧道才停住。`trust-tunnel` 的 HTTP/3 的连接窗口改为 ⌈`max-streams` × 8 MiB × 8/7⌉（至少 20 MiB）：原来的 max(`max-streams` × 8 MiB, 20 MiB) 在 `max-streams` ≥ 9 时保不住「没人读的隧道占不光它」。兼容性清单 `hysteria2` 行的 20 MiB 说法由任务 12 的 B 部分改 |
-| 15 | MASQUE 经链式载体的 UDP 余量 | M8 | M8 做掉 | M8c 任务 1（`7222293`），设计 5.2：经载体的 `masque` 连接从 1350 字节的包起步（`crates/rurge-proto-quic/src/masque/mod.rs` 的 `CARRIED_MTU`，经 `Transport::carried_initial_mtu` 与 `Dialer` 按路径选的配置生效，`min_mtu` 仍是 1200）；路径带不动时 quinn 的黑洞检测在**四**批只丢大包之后退回 1200，这条连接此后不再升回，回环上约 0.19 ～ 0.23 秒。缺省 `mtu`（1280）的 WireGuard 带不动 1350 字节的数据报，设计 5.2 的「缺省 MTU 的 WireGuard 也带得动」不成立；那时的行为按源码推断、没有实测。清单（`masque` 一行）与手工验收清单 M7c 一节「MASQUE 经 `underlying-proxy`」一项里「UDP 负载不到 1200 字节」的旧说法由任务 12 的 B 部分改 |
+| 15 | MASQUE 经链式载体的 UDP 余量 | M8 | M8 做掉 | M8c 任务 1（`7222293`），设计 5.2：经载体的 `masque` 连接从 1350 字节的包起步（`crates/rurge-proto-quic/src/masque/mod.rs` 的 `CARRIED_MTU`，经 `Transport::carried_initial_mtu` 与 `Dialer` 按路径选的配置生效，`min_mtu` 仍是 1200）；路径带不动时 quinn 的黑洞检测在**四**批只丢大包之后退回 1200，这条连接此后不再升回，回环上（debug 构建）UDP 驱动 187 ～ 226 毫秒、TCP 驱动 158 ～ 217 毫秒。缺省 `mtu`（1280）的 WireGuard 带不动 1350 字节的数据报，设计 5.2 的「缺省 MTU 的 WireGuard 也带得动」不成立；那时的行为按源码推断、没有实测。清单（`masque` 一行）与手工验收清单 M7c 一节「MASQUE 经 `underlying-proxy`」一项里「UDP 负载不到 1200 字节」的旧说法由任务 12 的 B 部分改 |
 | 16 | CONNECT-UDP 流与 TCP 隧道共用连接的流额 | 有用户报告再议 | 移交：有用户报告再说 | 已登记（`masque` 行："登记的限制"）；M8 设计第 7 节没有点名 |
 | 17 | 被放弃的内部 DNS 拨号不留记录、不向 `smart` 回报 | M8（TCP 与 UDP 一起改） | 移交：有用户报告再说 | M8 设计第 7 节移交表改定：只影响记录与一次回报；M8c 承接事项没有这一行 |
 | 18 | 互操作夹具 `locate()` / `…_or_skip()` 各十份副本 | 有空时收成辅助函数 | 关闭 | M8 设计第 7 节关闭表：只影响测试代码的整洁，动到那些文件时再整理 |
