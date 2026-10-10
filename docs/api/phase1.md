@@ -87,7 +87,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 
 **位置凭据**：类型带服务器与端口的策略行（`http` `https` `socks5` `socks5-tls` `ss` `snell` `vmess` `trojan` `anytls` `ssh` 等——`wireguard`、`tailscale`、`external` 与内置策略的别名以外的全部类型），以及第三个字段是端口号的任何行（为别的客户端写的行，其类型 rurge 不认识），第四个字段起凡不是 `name=value` 具名参数的字段一律换成 `***`。含 `=` 的字段，要 `=` 前面是一个参数名、后面非空且不全是 `=` 才算具名参数（`tfo=true` 保留；带填充的 Base64 `aHVudGVyMg==` 换掉；`sni=` 这样值为空的也被换掉）；以引号开头的字段整个算一个位置值。类型带服务器的行上，端口位置不是数字的字段也换掉（漏了逗号的 `8080 alice`）。类型后面漏了逗号的行（`http h.example, 8080, …`），只在拆开之后第三个字段是端口号时才这样读。全角的 `，` 在这里当逗号。`http` `https` `socks5` `socks5-tls` 与 `h2-connect` 的位置凭据是解析器接受的写法；其余类型这个位置本就是多余参数（`W0001`），按偏安全一侧一并换掉。
 
-**URL**：任何位置的 `scheme://authority` 里，authority 中最后一个 `@` 之前的部分换成 `***`（路径、查询串与片段里的 `@` 不动）。scheme 不是 `http` `https` `h3` `quic` `tls` `tcp` 这六种之一的 URL——分享链接 `trojan://…`、`ss://…`、`vmess://…` 把秘密放在哪里各有各的写法——从 `://` 之后到下一个空白整段换成 `***`。注释里那六种 scheme 的 URL 只显示 scheme 与 authority，其后换成 `/***`。
+**URL**：任何位置的 `scheme://authority` 里，authority 中最后一个 `@` 之前的部分换成 `***`（路径、查询串与片段里的 `@` 不动）。scheme 不是 `http` `https` `h3` `quic` `tls` `tcp` 这六种之一的 URL——分享链接 `trojan://…`、`ss://…`、`vmess://…` 把秘密放在哪里各有各的写法——从 `://` 之后到下一个空白整段换成 `***`。scheme 指 `://` 前面紧挨着的那串字母、数字、`+`、`-`、`.` 里从第一个字母起的部分（scheme 以字母开头，RFC 3986）：`1password://vault/item` 显示成 `1password://***`，`3http://u:p@h.test/x` 显示成 `3http://***@h.test/x`；`://` 前面没有这样一串的（正则 `^https?://`、`^[a-z]+://`、`^.+://`）不算带 scheme 的 URL，只藏 authority 里的用户名口令。注释里那六种 scheme 的 URL 只显示 scheme 与 authority，其后换成 `/***`。
 
 **`#!` 行**按形状：`#!MANAGED-CONFIG` 之后只显示写成 `interval=<数字>`、`strict=<字母>` 的词，其余每个词换成 `***`（指令名写错的，如 `#!MANAGED_CONFIG`、`#MANAGED-CONFIG`，同样处理）；`#!include` 按目标，含 `://` 的换成 `***`，本地路径保留；别的 `#!` 行里含 `://` 的词换成 `***`。
 
@@ -110,7 +110,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 | `#!MANAGED-CONFIG https://provider.test/link/t0k3n?surge=4 interval=43200 strict=true` | `#!MANAGED-CONFIG *** interval=43200 strict=true` |
 | `#!include a.conf, https://h.example/p?token=t0k3n` | `#!include a.conf, ***` |
 
-**有意多藏的**（不是缺陷，换来的是少漏）：名字以清单里的键结尾的策略、组或脚本——名叫 `HK Token` 的策略，整行显示成 `HK Token = ***`；散文里 `password:`、`token:`、`url:`、`args:` 之后的文字（`# see url: https://x.example/y` 显示成 `# see url: ***`）；以协议类型开头、第三个词恰是端口号的注释；注释里 URL 的路径；scheme 不是那六种的整个 URL——URL 重写里指向 App 的目标也在内（`myapp://item/$1` 显示成 `myapp://***`）。
+**有意多藏的**（不是缺陷，换来的是少漏）：名字以清单里的键结尾的策略、组或脚本——名叫 `HK Token` 的策略，整行显示成 `HK Token = ***`；散文里 `password:`、`token:`、`url:`、`args:` 之后的文字（`# see url: https://x.example/y` 显示成 `# see url: ***`）；以协议类型开头、第三个词恰是端口号的注释；注释里 URL 的路径；scheme 不是那六种的整个 URL——URL 重写里指向 App 的目标也在内（`myapp://item/$1` 显示成 `myapp://***`）——这一段一直藏到下一个空白，紧跟的逗号也在内：`external, exec=ssh://git@h.test/x, local-port=1080` 显示成 `external, exec=ssh://*** local-port=1080`；`://` 前面恰好是一串以字母开头的 scheme 字符的正则——`^\w+://example\.com/x` 显示成 `^\w+://***`，`w+` 被读成了 scheme。
 
 **有意照原样显示的**（登记现状，不是改动的承诺；要不要藏、怎样藏由项目所有者定，同一张「延后事项」的第 43 行）：
 
