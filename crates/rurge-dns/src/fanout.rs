@@ -302,7 +302,7 @@ mod tests {
         }
     }
 
-    /// The mock over UDP, for the tests that stay on the real clock: the two
+    /// The mock over UDP, for the tests that run on the real clock: the two
     /// on a multi-thread runtime, which has no paused clock, and
     /// `server_failures_are_reported`, which asserts neither a count nor a
     /// time. The others ask the mock in memory (`MockDns::upstream`) on a
@@ -381,13 +381,12 @@ mod tests {
 
     /// What only a multi-thread runtime shows: a dropped upstream's own
     /// `Timeout` and the loop's deadline are one instant and can be seen in
-    /// either order, and the result is the timeout, not `AllFailed` (the test
-    /// became multi-thread with the fix that stopped the fanout counting a
-    /// question's own timeout as a failure). That every round goes out, and
-    /// when the fanout ends, depend on the clock and are
+    /// either order, and the result is the timeout, not `AllFailed`: a
+    /// question's own timeout is not counted as a failure. That every round
+    /// goes out, and when the fanout ends, depend on the clock and are
     /// `all_dropped_sends_every_round_and_times_out_at_the_deadline`'s.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn all_dropped_is_a_timeout_after_every_attempt() {
+    async fn all_dropped_is_a_timeout_on_a_multi_thread_runtime() {
         let s = MockDns::spawn().await;
         s.set("a.test", &["10.0.0.1"], &[], 60);
         s.set_drop_all(true);
@@ -459,8 +458,9 @@ mod tests {
     /// AAAA answer never to come: the fanout hands over the address it has,
     /// and what it hands over is what it hands over when it ends at the first
     /// resend instead — the two ways out of the loop do not differ in the
-    /// value. (It passes without the fix the test above is for, too: a
-    /// fanout with A in hand always had the partial-result exit to leave by.)
+    /// value. With the A answer in hand the partial-result exit leaves the
+    /// loop at that wake-up whether or not the deadline check is there, so
+    /// this pins the value, not the check the test above is for.
     #[tokio::test(start_paused = true)]
     async fn a_fanout_kept_from_running_until_past_its_deadline_hands_over_what_it_has() {
         let mock = MockDns::spawn().await;

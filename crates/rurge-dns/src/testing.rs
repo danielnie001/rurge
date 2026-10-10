@@ -366,15 +366,26 @@ mod tests {
         }
     }
 
-    async fn udp_ask(addr: SocketAddr, wire: &[u8]) -> Option<Vec<u8>> {
+    /// The answer to `wire`, if one comes within `wait`.
+    async fn udp_ask_within(addr: SocketAddr, wire: &[u8], wait: Duration) -> Option<Vec<u8>> {
         let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         s.send_to(wire, addr).await.unwrap();
         let mut buf = vec![0u8; 4096];
-        match tokio::time::timeout(Duration::from_millis(500), s.recv_from(&mut buf)).await {
+        match tokio::time::timeout(wait, s.recv_from(&mut buf)).await {
             Ok(Ok((n, _))) => Some(buf[..n].to_vec()),
             _ => None,
         }
     }
+
+    /// The answer to `wire`, for a question that is answered: the wait is
+    /// generous and ends when the answer comes.
+    async fn udp_ask(addr: SocketAddr, wire: &[u8]) -> Option<Vec<u8>> {
+        udp_ask_within(addr, wire, Duration::from_secs(10)).await
+    }
+
+    /// How long a question that is not answered is waited for: that nothing
+    /// comes can only be seen by waiting.
+    const SILENCE: Duration = Duration::from_millis(500);
 
     async fn tcp_ask<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         stream: &mut S,
@@ -431,10 +442,10 @@ mod tests {
         m.set_rcode("fail.test", Rcode::ServFail);
         let wire = build_query(1, &q("a.test", Qtype::A)).unwrap();
         m.set_drop_first(1);
-        assert!(udp_ask(m.addr(), &wire).await.is_none());
+        assert!(udp_ask_within(m.addr(), &wire, SILENCE).await.is_none());
         assert!(udp_ask(m.addr(), &wire).await.is_some());
         m.set_drop_qtype(Qtype::A, true);
-        assert!(udp_ask(m.addr(), &wire).await.is_none());
+        assert!(udp_ask_within(m.addr(), &wire, SILENCE).await.is_none());
         m.set_drop_qtype(Qtype::A, false);
         m.set_truncate_udp(true);
         let tc = parse_response(&udp_ask(m.addr(), &wire).await.unwrap()).unwrap();
@@ -468,7 +479,7 @@ mod tests {
         assert!(udp_ask(m.addr(), &wire).await.is_some());
         assert!(started.elapsed() >= Duration::from_millis(200));
         m.set_drop_all(true);
-        assert!(udp_ask(m.addr(), &wire).await.is_none());
+        assert!(udp_ask_within(m.addr(), &wire, SILENCE).await.is_none());
     }
 
     /// The table asked in memory: its answer at once, or after its delay,

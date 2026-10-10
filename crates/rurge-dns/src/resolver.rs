@@ -1335,7 +1335,7 @@ mod tests {
             &format!("dns-server = {}", mock.addr()),
             "fixed.test = 1.2.3.4, ::2\nalias.test = fixed.test\nloop-a.test = loop-b.test\nloop-b.test = loop-a.test\nproxy.example = 127.0.0.1\nip-alias.test = 9.9.9.9\n",
         ));
-        let (r, _) = resolver(&e, StaticSystemDns::default());
+        let (r, _) = resolver_once(&e, StaticSystemDns::default());
         let f = r.lookup("fixed.test", LookupOpts::default()).await.unwrap();
         assert_eq!(
             (f.v4.clone(), f.v6.clone(), f.source.clone()),
@@ -1901,7 +1901,7 @@ https://dns.example/dns-query"
         let system = MockDns::spawn().await;
         system.set("s.test", &["10.30.0.1"], &[], 60);
         let e = env(&profile("", ""));
-        let (r, _) = resolver(
+        let (r, _) = resolver_once(
             &e,
             StaticSystemDns {
                 servers: vec![system.addr()],
@@ -1914,7 +1914,7 @@ https://dns.example/dns-query"
         );
         let s = r.lookup("s.test", LookupOpts::default()).await.unwrap();
         assert_eq!(s.v4, vec![v4("10.30.0.1")]);
-        let (r2, _) = resolver(&e, StaticSystemDns::default());
+        let (r2, _) = resolver_once(&e, StaticSystemDns::default());
         assert!(r2.primary_upstreams().is_empty());
         let lo = r2.lookup("localhost", LookupOpts::default()).await.unwrap();
         assert_eq!(lo.source, Source::Loopback);
@@ -1979,7 +1979,7 @@ https://dns.example/dns-query"
         mock.set("t.test", &["10.0.0.1"], &[], 60);
         mock.set_empty("nx.test");
         let e = env(&profile(&format!("dns-server = {}", mock.addr()), ""));
-        let (r, _) = resolver(&e, StaticSystemDns::default());
+        let (r, _) = resolver_once(&e, StaticSystemDns::default());
         let lazy: &dyn LazyResolver = r.as_ref();
         assert_eq!(
             lazy.resolve("t.test").await.unwrap().v4,

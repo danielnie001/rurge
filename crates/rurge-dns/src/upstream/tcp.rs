@@ -376,10 +376,17 @@ mod tests {
         );
     }
 
+    /// A query queued behind another on the connection gives up at its own
+    /// deadline. The server answers the first query when the test says so,
+    /// and the test says so once the second has returned: a second query that
+    /// waited for the lock past its deadline would wait for the first, which
+    /// waits for the test, and the bound on the whole is what ends the test.
     #[tokio::test]
     async fn lock_wait_respects_the_callers_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let (received_tx, received) = tokio::sync::oneshot::channel::<()>();
+        let (answer_now, answer) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             let (mut s, _) = listener.accept().await.unwrap();
             let mut len = [0u8; 2];
@@ -387,27 +394,32 @@ mod tests {
             let n = usize::from(u16::from_be_bytes(len));
             let mut msg = vec![0u8; n];
             s.read_exact(&mut msg).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            // the first query is in, and holds the connection until it is answered
+            let _ = received_tx.send(());
+            let _ = answer.await;
             let mut out = len.to_vec();
             out.extend_from_slice(&msg);
-            s.write_all(&out).await.unwrap();
+            let _ = s.write_all(&out).await;
         });
         let up = TcpUpstream::plain("127.0.0.1", addr.port(), connector());
         let a_wire = fake_wire(0xaaaa, b"a");
         let b_wire = fake_wire(0xbbbb, b"b");
-        let started = Instant::now();
-        let a_task = async { up.query(&a_wire, deadline(1000)).await };
-        let b_task = async {
-            let r = up.query(&b_wire, deadline(100)).await;
-            (r, started.elapsed())
+        let both = async {
+            // generous: it is answered as soon as the second has returned
+            let a_task = up.query(&a_wire, deadline(120_000));
+            let b_task = async {
+                received.await.unwrap();
+                let b = up.query(&b_wire, deadline(100)).await;
+                answer_now.send(()).unwrap();
+                b
+            };
+            tokio::join!(a_task, b_task)
         };
-        let (a, (b, b_elapsed)) = tokio::join!(a_task, b_task);
-        assert_eq!(a.unwrap(), a_wire);
+        let (a, b) = tokio::time::timeout(Duration::from_secs(30), both)
+            .await
+            .expect("both queries end within the bound, the second at its own deadline");
         assert_eq!(b, Err(UpstreamError::Timeout));
-        assert!(
-            b_elapsed < Duration::from_millis(300),
-            "expected the lock wait to time out well under 400ms, took {b_elapsed:?}"
-        );
+        assert_eq!(a.unwrap(), a_wire);
     }
 
     #[test]
