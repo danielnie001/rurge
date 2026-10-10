@@ -657,6 +657,41 @@ fn parse_listeners(
     out
 }
 
+/// The value of `http-listen` given outside a profile: one or more
+/// `[password@]address[:port]`, comma separated, the port 6152 when it is left
+/// out. A profile warns about an item it cannot read and goes on with the
+/// others; here the whole value fails, as it does when it holds no item, and
+/// the reason never quotes it: it can hold a password.
+pub fn parse_http_listen(value: &str) -> Result<Vec<Listener>, &'static str> {
+    parse_listen_value(value, 6152, true)
+}
+
+/// The value of `socks5-listen` given outside a profile, read as
+/// `parse_http_listen` reads one, with the port 6153; a password is an error,
+/// where a profile ignores it with a warning.
+pub fn parse_socks5_listen(value: &str) -> Result<Vec<Listener>, &'static str> {
+    parse_listen_value(value, 6153, false)
+}
+
+fn parse_listen_value(
+    value: &str,
+    default_port: u16,
+    allow_password: bool,
+) -> Result<Vec<Listener>, &'static str> {
+    let mut out = Vec::new();
+    for item in split_list(value) {
+        let listener = parse_listener(&item, default_port)?;
+        if listener.password.is_some() && !allow_password {
+            return Err("a password is not supported");
+        }
+        out.push(listener);
+    }
+    if out.is_empty() {
+        return Err("no address given");
+    }
+    Ok(out)
+}
+
 fn parse_nets(diags: &mut Diagnostics, span: &Span, key: &str, value: &str) -> Vec<IpNet> {
     let mut out = Vec::new();
     for item in split_list(value) {
@@ -1233,6 +1268,92 @@ internet-test-url = ftp://127.0.0.1:9/?token=t0k3n
         let c = codes_of(&d);
         assert!(c.contains(&codes::W_INVALID_VALUE));
         assert!(c.contains(&codes::W_PLATFORM_IGNORED));
+    }
+
+    fn addrs(listeners: Result<Vec<Listener>, &'static str>) -> Vec<String> {
+        let listeners = listeners.expect("a value to read");
+        listeners.iter().map(|l| l.addr.to_string()).collect()
+    }
+
+    /// What `--listen-http` and `--listen-socks5` take is what a profile's
+    /// `http-listen` and `socks5-listen` take, with the same default ports.
+    #[test]
+    fn listen_values_from_outside_a_profile_are_read_as_a_profile_reads_them() {
+        assert_eq!(addrs(parse_http_listen("127.0.0.1")), ["127.0.0.1:6152"]);
+        assert_eq!(addrs(parse_socks5_listen("127.0.0.1")), ["127.0.0.1:6153"]);
+        assert_eq!(addrs(parse_http_listen("[::1]")), ["[::1]:6152"]);
+        assert_eq!(addrs(parse_socks5_listen("[::1]")), ["[::1]:6153"]);
+        for parse in [parse_http_listen, parse_socks5_listen] {
+            assert_eq!(addrs(parse("127.0.0.1:0")), ["127.0.0.1:0"]);
+            assert_eq!(addrs(parse("[::1]:7000")), ["[::1]:7000"]);
+            assert_eq!(
+                addrs(parse("127.0.0.1:1, [::1]:2")),
+                ["127.0.0.1:1", "[::1]:2"]
+            );
+            // an empty item between the commas is no item, as in a profile
+            assert_eq!(addrs(parse("127.0.0.1:1,,")), ["127.0.0.1:1"]);
+        }
+    }
+
+    #[test]
+    fn only_an_http_listen_value_carries_a_password() {
+        let listeners = parse_http_listen("pw@127.0.0.1:1, 127.0.0.1:2, p@ss@[::1]:3").unwrap();
+        let read: Vec<_> = listeners
+            .iter()
+            .map(|l| (l.password.as_deref(), l.addr.to_string()))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                (Some("pw"), "127.0.0.1:1".to_string()),
+                (None, "127.0.0.1:2".to_string()),
+                (Some("p@ss"), "[::1]:3".to_string()),
+            ]
+        );
+        assert!(parse_socks5_listen("pw@127.0.0.1").is_err());
+        assert!(parse_socks5_listen("127.0.0.1:1, pw@127.0.0.1:2").is_err());
+    }
+
+    /// A value that cannot be used is an error, all of it: the profile's way,
+    /// to warn about an item and go on with the others, would start a proxy
+    /// that listens somewhere other than where it was told to. The reason never
+    /// quotes the value, which can hold a password.
+    #[test]
+    fn a_listen_value_that_cannot_be_used_is_an_error_that_does_not_quote_it() {
+        type Parse = fn(&str) -> Result<Vec<Listener>, &'static str>;
+        for value in [
+            "",
+            " ",
+            ",",
+            "localhost:1",
+            "S3CR3T@localhost:1",
+            "127.0.0.1:1, S3CR3T@nowhere",
+            "S3CR3T@",
+            "127.0.0.1:99999",
+        ] {
+            for (name, parse) in [
+                ("http", parse_http_listen as Parse),
+                ("socks5", parse_socks5_listen),
+            ] {
+                let reason = parse(value).expect_err(&format!("{name}: {value:?}"));
+                assert!(!reason.is_empty(), "{name}: {value:?}");
+                assert!(
+                    !reason.contains("S3CR3T") && !reason.contains("nowhere"),
+                    "{name}: {value:?}: {reason}"
+                );
+            }
+        }
+        for value in ["S3CR3T@127.0.0.1", "127.0.0.1:1, S3CR3T@127.0.0.1:2"] {
+            let reason = parse_socks5_listen(value).unwrap_err();
+            assert!(!reason.contains("S3CR3T"), "{value:?}: {reason}");
+        }
+        // the three reasons tell the three mistakes apart
+        let nothing = parse_http_listen("").unwrap_err();
+        let not_an_address = parse_http_listen("localhost:1").unwrap_err();
+        let password = parse_socks5_listen("pw@127.0.0.1").unwrap_err();
+        assert_ne!(nothing, not_an_address);
+        assert_ne!(nothing, password);
+        assert_ne!(not_an_address, password);
     }
 
     #[test]

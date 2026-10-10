@@ -11,6 +11,7 @@ use rurge_api::ApiContext;
 use rurge_config::config::{LoadOptions, Platform};
 use rurge_config::general::ControllerAccess;
 use rurge_config::general::LogLevel;
+use rurge_config::general::{Listener, parse_http_listen, parse_socks5_listen};
 use rurge_config::rule::PolicyRef;
 use rurge_config::session::ListenerKind;
 use rurge_engine::control::{Control, LogLevel as ApiLogLevel, Mode, ReloadReport};
@@ -77,6 +78,24 @@ pub struct RunArgs {
     /// A policy group without members rejects instead of going DIRECT
     #[arg(long, env = "RURGE_EMPTY_GROUP_REJECT", value_parser = switch())]
     pub empty_group_reject: bool,
+    /// Listen for HTTP proxy clients here instead of at the profile's
+    /// http-listen: [password@]address[:port], comma separated
+    #[arg(
+        long,
+        env = "RURGE_LISTEN_HTTP",
+        hide_env_values = true,
+        value_name = "ADDR"
+    )]
+    pub listen_http: Option<String>,
+    /// Listen for SOCKS5 clients here instead of at the profile's
+    /// socks5-listen: address[:port], comma separated
+    #[arg(
+        long,
+        env = "RURGE_LISTEN_SOCKS5",
+        hide_env_values = true,
+        value_name = "ADDR"
+    )]
+    pub listen_socks5: Option<String>,
     #[command(flatten)]
     pub runtime: RuntimeArgs,
 }
@@ -185,6 +204,45 @@ fn mode_name(mode: &OutboundMode) -> String {
 struct RunOptions {
     idle_timeout: Duration,
     request_log_size: usize,
+}
+
+/// Where `--listen-http` and `--listen-socks5` say to listen, read. Each
+/// replaces the profile's whole list of its kind, so the profile's own
+/// addresses are never bound while one is given. A `Listener` shows its
+/// password as `<redacted>`, so this can be printed.
+#[derive(Debug)]
+struct Overrides {
+    http: Option<Vec<Listener>>,
+    socks5: Option<Vec<Listener>>,
+}
+
+impl Overrides {
+    /// Reads the two options. An error is what to print after `error: `: the
+    /// option and the reason, never the value, which can hold a password.
+    fn parse(http: Option<&str>, socks5: Option<&str>) -> Result<Overrides, String> {
+        let http = http
+            .map(parse_http_listen)
+            .transpose()
+            .map_err(|reason| format!("--listen-http: {reason}"))?;
+        let socks5 = socks5
+            .map(parse_socks5_listen)
+            .transpose()
+            .map_err(|reason| format!("--listen-socks5: {reason}"))?;
+        Ok(Overrides { http, socks5 })
+    }
+}
+
+/// Puts the overrides over a profile that has just been loaded. A start and
+/// every reload do it before they build anything from the profile, so that a
+/// reload compares two configurations that both carry the overrides: editing
+/// `http-listen` in the profile while `--listen-http` is given rebinds nothing.
+fn apply(cfg: &mut rurge_config::Config, overrides: &Overrides) {
+    if let Some(http) = &overrides.http {
+        cfg.general.http_listen = http.clone();
+    }
+    if let Some(socks5) = &overrides.socks5 {
+        cfg.general.socks5_listen = socks5.clone();
+    }
 }
 
 /// What the API can ask the main loop to do (M4 design §6).
@@ -334,6 +392,7 @@ struct Daemon<'a> {
     run_opts: &'a RunOptions,
     outbound_mode: &'a OutboundMode,
     http_api: &'a Option<ControllerAccess>,
+    overrides: &'a Overrides,
 }
 
 fn count(diags: &rurge_config::Diagnostics, severity: rurge_config::Severity) -> usize {
@@ -345,7 +404,7 @@ fn count(diags: &rurge_config::Diagnostics, severity: rurge_config::Severity) ->
 /// daemon down.
 async fn reload(d: &Daemon<'_>, listeners: &mut Vec<(ListenerSpec, Running)>) -> ReloadReport {
     use rurge_config::Severity;
-    let loaded = match rurge_engine::load_checked(d.config, d.load_opts) {
+    let mut loaded = match rurge_engine::load_checked(d.config, d.load_opts) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("error: reload failed, keeping current config: {e}");
@@ -376,6 +435,7 @@ async fn reload(d: &Daemon<'_>, listeners: &mut Vec<(ListenerSpec, Running)>) ->
         };
         tracing::warn!("{message}");
     }
+    apply(&mut loaded.config, d.overrides);
     let next = match build_engine_runtime(
         loaded.config,
         d.rt,
@@ -698,6 +758,17 @@ fn recover_without_a_log(args: &RuntimeArgs) {
 }
 
 pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
+    // Before the profile: the listen options are a command-line matter, and a
+    // start that ends on one ends the way a profile that does not load does.
+    let overrides =
+        match Overrides::parse(args.listen_http.as_deref(), args.listen_socks5.as_deref()) {
+            Ok(overrides) => overrides,
+            Err(message) => {
+                eprintln!("error: {message}");
+                recover_without_a_log(&args.runtime);
+                return Ok(ExitCode::from(2));
+            }
+        };
     let platform = args.platform.unwrap_or_else(Platform::current);
     let opts = LoadOptions {
         environment: super::environment(platform, capabilities::CORE_VERSION),
@@ -714,7 +785,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::from(2));
     }
     print_diagnostics(&loaded.diagnostics.sorted());
-    let cfg = loaded.config;
+    let mut cfg = loaded.config;
+    apply(&mut cfg, &overrides);
     // A log file that cannot be opened ends it as well, and in the same way.
     let (_log_guard, level_handle) = init_logging(
         args.log_level
@@ -860,6 +932,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             run_opts: &run_opts,
             outbound_mode: &outbound_mode,
             http_api: &http_api,
+            overrides: &overrides,
         };
 
         loop {
@@ -1006,6 +1079,110 @@ mod tests {
         assert_eq!(parse_log_level("error").unwrap(), LevelFilter::ERROR);
         assert!(parse_log_level("loud").is_err());
         assert_eq!(mode_name(&OutboundMode::Rule), "rule");
+    }
+
+    fn profile(general: &str) -> rurge_config::Config {
+        let text = format!("[General]\n{general}\n[Rule]\nFINAL,DIRECT\n");
+        let loaded =
+            rurge_config::config::from_text(&text, Path::new("t.conf"), &LoadOptions::for_tests());
+        assert!(!loaded.diagnostics.has_errors());
+        loaded.config
+    }
+
+    fn overrides(http: Option<&str>, socks5: Option<&str>) -> Overrides {
+        Overrides::parse(http, socks5).expect("values to read")
+    }
+
+    fn addresses(listeners: &[Listener]) -> Vec<String> {
+        listeners.iter().map(|l| l.addr.to_string()).collect()
+    }
+
+    const TWO_HTTP_AND_ONE_SOCKS5: &str =
+        "http-listen = 127.0.0.1:7001, pw@127.0.0.1:7002\nsocks5-listen = 127.0.0.1:7003";
+
+    /// An override replaces the profile's whole list of its kind, however long
+    /// it is, and nothing else of the profile moves.
+    #[test]
+    fn an_http_override_replaces_every_http_listener_and_leaves_socks5_alone() {
+        let mut cfg = profile(TWO_HTTP_AND_ONE_SOCKS5);
+        let before = cfg.general.clone();
+        assert_eq!(addresses(&before.http_listen).len(), 2);
+        apply(&mut cfg, &overrides(Some("S3CR3T@127.0.0.1:9001"), None));
+        assert_eq!(addresses(&cfg.general.http_listen), ["127.0.0.1:9001"]);
+        assert_eq!(
+            cfg.general.http_listen[0].password.as_deref(),
+            Some("S3CR3T")
+        );
+        assert_eq!(cfg.general.socks5_listen, before.socks5_listen);
+        let mut expected = before;
+        expected.http_listen = cfg.general.http_listen.clone();
+        assert_eq!(cfg.general, expected);
+    }
+
+    #[test]
+    fn a_socks5_override_replaces_the_socks5_listeners_and_leaves_http_alone() {
+        let mut cfg = profile(TWO_HTTP_AND_ONE_SOCKS5);
+        let before = cfg.general.clone();
+        apply(
+            &mut cfg,
+            &overrides(None, Some("[::1]:9003, 127.0.0.1:9004")),
+        );
+        assert_eq!(
+            addresses(&cfg.general.socks5_listen),
+            ["[::1]:9003", "127.0.0.1:9004"]
+        );
+        assert_eq!(cfg.general.http_listen, before.http_listen);
+    }
+
+    #[test]
+    fn both_overrides_apply_and_none_leaves_the_profile_as_it_is() {
+        let mut cfg = profile(TWO_HTTP_AND_ONE_SOCKS5);
+        let before = cfg.general.clone();
+        apply(&mut cfg, &overrides(None, None));
+        assert_eq!(cfg.general, before);
+        apply(
+            &mut cfg,
+            &overrides(Some("127.0.0.1:9001"), Some("127.0.0.1:9003")),
+        );
+        assert_eq!(addresses(&cfg.general.http_listen), ["127.0.0.1:9001"]);
+        assert_eq!(addresses(&cfg.general.socks5_listen), ["127.0.0.1:9003"]);
+        // applied to a profile read again, as a reload does, it gives the same
+        let mut again = profile("http-listen = 127.0.0.1:7777");
+        apply(
+            &mut again,
+            &overrides(Some("127.0.0.1:9001"), Some("127.0.0.1:9003")),
+        );
+        assert_eq!(again.general.http_listen, cfg.general.http_listen);
+        assert_eq!(again.general.socks5_listen, cfg.general.socks5_listen);
+    }
+
+    /// The error is for the person at the terminal: the option and the
+    /// reason, and not the value, which can hold a password.
+    #[test]
+    fn a_listen_option_that_cannot_be_read_is_named_and_not_quoted() {
+        for (http, socks5, option) in [
+            (Some("S3CR3T@not-an-address"), None, "--listen-http"),
+            (Some(""), None, "--listen-http"),
+            (Some(","), None, "--listen-http"),
+            (None, Some("S3CR3T@127.0.0.1:1080"), "--listen-socks5"),
+            (None, Some("nowhere:1080"), "--listen-socks5"),
+            // the first of two is the one that is named
+            (Some("not-an-address"), Some("nowhere"), "--listen-http"),
+        ] {
+            let message = Overrides::parse(http, socks5).unwrap_err();
+            assert!(message.starts_with(&format!("{option}: ")), "{message}");
+            for value in ["S3CR3T", "not-an-address", "nowhere"] {
+                assert!(!message.contains(value), "{message}");
+            }
+        }
+    }
+
+    /// `Overrides` is printable: a password is `<redacted>`.
+    #[test]
+    fn the_overrides_do_not_show_a_password() {
+        let shown = format!("{:?}", overrides(Some("S3CR3T@127.0.0.1:9001"), None));
+        assert!(!shown.contains("S3CR3T"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
     }
 
     #[test]

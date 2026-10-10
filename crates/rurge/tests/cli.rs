@@ -12,13 +12,16 @@ fn version_prints_crate_version() {
 }
 
 /// clap prints `[env: NAME=<value>]` in an option's help unless told not to.
-/// The API's key and the two GeoIP links (MaxMind's carry the account's
-/// licence key) have their variable named in the help and the value left out.
+/// The API's key, the two GeoIP links (MaxMind's carry the account's licence
+/// key) and the two listen addresses (an HTTP one can carry the proxy's
+/// password) have their variable named in the help and the value left out.
 #[test]
 fn help_names_a_credential_variable_and_leaves_its_value_out() {
     let mut printed = Vec::new();
     for (command, variable, value) in [
         ("status", "RURGE_API_KEY", "S3CR3T-key"),
+        ("run", "RURGE_LISTEN_HTTP", "S3CR3T-http@127.0.0.1:6152"),
+        ("run", "RURGE_LISTEN_SOCKS5", "S3CR3T-socks@127.0.0.1:6153"),
         (
             "run",
             "RURGE_GEOIP_URL",
@@ -1648,7 +1651,9 @@ mod run {
                 format!("file:{}", sysproxy_file(data).display()),
             )
             .env_remove("RURGE_SYSTEM_PROXY")
-            .env_remove("RURGE_EMPTY_GROUP_REJECT");
+            .env_remove("RURGE_EMPTY_GROUP_REJECT")
+            .env_remove("RURGE_LISTEN_HTTP")
+            .env_remove("RURGE_LISTEN_SOCKS5");
         cmd
     }
 
@@ -1738,17 +1743,42 @@ mod run {
     }
 
     fn http_get(port: u16, url: &str) -> String {
+        http_get_with(port, url, "")
+    }
+
+    /// `http_get` with more header lines, each ending in `\r\n`.
+    fn http_get_with(port: u16, url: &str, headers: &str) -> String {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let host = url.trim_start_matches("http://").split('/').next().unwrap();
         write!(
             s,
-            "GET {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+            "GET {url} HTTP/1.1\r\nHost: {host}\r\n{headers}Connection: close\r\n\r\n"
         )
         .unwrap();
         let mut out = String::new();
         let _ = s.read_to_string(&mut out);
         out
+    }
+
+    /// The `Proxy-Authorization` line for `user:password` (RFC 7617).
+    fn basic_credentials(user_and_password: &str) -> String {
+        const DIGITS: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut encoded = String::new();
+        for chunk in user_and_password.as_bytes().chunks(3) {
+            let bits = chunk.iter().enumerate().fold(0u32, |bits, (i, byte)| {
+                bits | (u32::from(*byte) << (16 - 8 * i))
+            });
+            for i in 0..4 {
+                encoded.push(if i <= chunk.len() {
+                    DIGITS[((bits >> (18 - 6 * i)) & 63) as usize] as char
+                } else {
+                    '='
+                });
+            }
+        }
+        format!("Proxy-Authorization: Basic {encoded}\r\n")
     }
 
     /// Next stdout line starting with `prefix`, without the prefix.
@@ -3219,6 +3249,229 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             );
             assert!(!sysproxy_file(&data).exists());
         }
+    }
+
+    /// `http_get_with` on a thread of its own: the target server it reaches
+    /// runs on the test's runtime.
+    async fn http_get_off_the_runtime(port: u16, url: &str, headers: &str) -> String {
+        let (url, headers) = (url.to_string(), headers.to_string());
+        tokio::task::spawn_blocking(move || http_get_with(port, &url, &headers))
+            .await
+            .unwrap()
+    }
+
+    /// `--listen-http` takes the place of everything the profile says in
+    /// `http-listen`, a password included, and keeps it across reloads. The
+    /// profile's own addresses are ports somebody else holds: were one of them
+    /// tried, the start would fail, and so would the reload after an edit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn listen_http_replaces_the_profiles_http_listeners_for_good() {
+        let target = TestServer::spawn().await;
+        target.set("/hello", "hi from target");
+        let url = format!("http://127.0.0.1:{}/hello", target.url("/").port().unwrap());
+        let held: Vec<std::net::TcpListener> = (0..3)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let at = |i: usize| held[i].local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let profile = |http_listen: String| {
+            write_conf(
+                dir.path(),
+                &format!(
+                    "http-listen = {http_listen}\nsocks5-listen = 127.0.0.1:0\nhttp-api = k@127.0.0.1:0\nloglevel = warning"
+                ),
+            )
+        };
+        let conf = profile(format!("{}, {}", at(0), at(1)));
+        let daemon = tokio::task::spawn_blocking({
+            let data = dir.path().join("data");
+            move || {
+                spawn_daemon_full(
+                    &conf,
+                    &data,
+                    false,
+                    None,
+                    &["--listen-http", "S3CR3T@127.0.0.1:0"],
+                )
+            }
+        })
+        .await
+        .unwrap();
+        let (proxy, api) = (daemon.http, api_port(&daemon));
+        // the profile's SOCKS5 listener is where the profile put it
+        assert!(daemon.socks > 0);
+        let credentials = basic_credentials("anyone:S3CR3T");
+        let check = |when: &'static str| {
+            let denied = http_get(proxy, &url);
+            assert!(denied.starts_with("HTTP/1.1 407"), "{when}: {denied}");
+            let wrong = http_get_with(proxy, &url, &basic_credentials("anyone:wrong"));
+            assert!(wrong.starts_with("HTTP/1.1 407"), "{when}: {wrong}");
+        };
+        check("at the start");
+        let served = http_get_off_the_runtime(proxy, &url, &credentials).await;
+        assert!(
+            served.starts_with("HTTP/1.1 200") && served.ends_with("hi from target"),
+            "{served}"
+        );
+        let reload = |when: &'static str| {
+            let (status, body) = api_call(api, "POST", "/v1/profiles/reload", "k", Some("{}"));
+            assert_eq!(status, 200, "{when}: {body}");
+            assert!(
+                body.contains("\"ok\":true") && body.contains("\"listenersRebound\":false"),
+                "{when}: {body}"
+            );
+        };
+        reload("the profile as it was");
+        check("after a reload");
+        // the profile's `http-listen` is edited to another address: the
+        // listeners stay, with the port that answered before
+        profile(at(2).to_string());
+        reload("the profile edited");
+        check("after the profile's http-listen was edited");
+        let served = http_get_off_the_runtime(proxy, &url, &credentials).await;
+        assert!(
+            served.starts_with("HTTP/1.1 200") && served.ends_with("hi from target"),
+            "{served}"
+        );
+    }
+
+    /// The environment does what the option does, for the other kind of
+    /// listener and for an address of the other family: the SOCKS5 listener is
+    /// on `::1`, and the profile's own address is not tried.
+    #[test]
+    fn listen_socks5_in_the_environment_replaces_the_profiles_socks5_listeners() {
+        if std::net::TcpListener::bind("[::1]:0").is_err() {
+            eprintln!("skipped: this machine has no IPv6 loopback");
+            return;
+        }
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(
+            dir.path(),
+            &format!(
+                "http-listen = 127.0.0.1:0\nsocks5-listen = {}\nloglevel = warning",
+                held.local_addr().unwrap()
+            ),
+        );
+        let mut cmd = rurge_run(&conf, &dir.path().join("data"));
+        cmd.env("RURGE_LISTEN_SOCKS5", "[::1]:0");
+        let daemon = spawn_command(cmd);
+        let mut socks = TcpStream::connect(("::1", daemon.socks)).unwrap();
+        socks
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socks.write_all(&[5, 1, 0]).unwrap();
+        let mut reply = [0u8; 2];
+        socks.read_exact(&mut reply).unwrap();
+        assert_eq!(reply, [5, 0], "SOCKS5 without authentication");
+        drop(held);
+    }
+
+    /// An option replaces the listeners of its own kind only. The profile's
+    /// listeners of the other kind are still bound: at a port somebody else
+    /// holds, the start fails.
+    #[test]
+    fn a_listen_option_leaves_the_other_kind_of_listener_to_the_profile() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = held.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for (general, option) in [
+            (
+                format!("http-listen = 127.0.0.1:0\nsocks5-listen = {taken}"),
+                "--listen-http",
+            ),
+            (
+                format!("http-listen = {taken}\nsocks5-listen = 127.0.0.1:0"),
+                "--listen-socks5",
+            ),
+        ] {
+            let conf = write_conf(dir.path(), &general);
+            let mut cmd = rurge_run(&conf, &dir.path().join("data"));
+            cmd.args([option, "127.0.0.1:0"]);
+            let (code, stderr) = give_up(cmd);
+            assert_eq!(code, Some(1), "{option}: {stderr}");
+            assert!(
+                stderr.contains("cannot bind listener"),
+                "{option}: {stderr}"
+            );
+        }
+        drop(held);
+    }
+
+    /// Where rurge listens is not guessed. A value it cannot use ends the
+    /// start, and the message names the option and the reason, never the
+    /// value: it can hold the proxy's password. An empty value counts, from the
+    /// environment too.
+    #[test]
+    fn a_listen_value_that_cannot_be_used_ends_the_start_without_quoting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        let by_argument = [
+            (["--listen-http", "S3CR3T@not-an-address"], "--listen-http"),
+            (["--listen-http", ",S3CR3T@nowhere"], "--listen-http"),
+            (["--listen-http", ""], "--listen-http"),
+            (["--listen-http", ","], "--listen-http"),
+            (
+                ["--listen-socks5", "S3CR3T@127.0.0.1:1080"],
+                "--listen-socks5",
+            ),
+            (["--listen-socks5", "nowhere:1080"], "--listen-socks5"),
+        ];
+        let by_variable = [
+            (
+                "RURGE_LISTEN_HTTP",
+                "S3CR3T@not-an-address",
+                "--listen-http",
+            ),
+            ("RURGE_LISTEN_HTTP", "", "--listen-http"),
+            (
+                "RURGE_LISTEN_SOCKS5",
+                "S3CR3T@127.0.0.1:1080",
+                "--listen-socks5",
+            ),
+        ];
+        let mut starts = Vec::new();
+        for (args, option) in by_argument {
+            let mut cmd = rurge_run(&conf, &data);
+            cmd.args(args);
+            starts.push((cmd, option, format!("{args:?}")));
+        }
+        for (variable, value, option) in by_variable {
+            let mut cmd = rurge_run(&conf, &data);
+            cmd.env(variable, value);
+            starts.push((cmd, option, format!("{variable}={value:?}")));
+        }
+        for (cmd, option, how) in starts {
+            let (code, stderr) = give_up(cmd);
+            assert_eq!(code, Some(2), "{how}: {stderr}");
+            assert!(
+                stderr.starts_with(&format!("error: {option}: ")),
+                "{how}: {stderr}"
+            );
+            for value in ["S3CR3T", "not-an-address", "nowhere"] {
+                assert!(!stderr.contains(value), "{how}: {stderr}");
+            }
+            assert!(
+                !data.exists(),
+                "{how}: the start left a data directory behind"
+            );
+        }
+    }
+
+    /// The start that ends on a listen value is one of those that end before
+    /// the log is open, and puts back what a crashed run left behind as they do.
+    #[test]
+    fn a_listen_value_that_cannot_be_used_still_restores_the_system_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = crashed_with_the_system_proxy_on(dir.path());
+        let mut cmd = rurge_run(&dir.path().join("t.conf"), &data);
+        cmd.args(["--listen-http", "S3CR3T@not-an-address"]);
+        let (code, stderr) = give_up(cmd);
+        assert_eq!(code, Some(2), "{stderr}");
+        assert!(stderr.contains("error: --listen-http: "), "{stderr}");
+        assert!(!stderr.contains("S3CR3T"), "{stderr}");
+        assert_restored(&data, &stderr);
     }
 }
 
