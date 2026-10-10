@@ -1,6 +1,6 @@
 # 阶段 2 遗留事项总表
 
-阶段 2 的 20 份计划（M1a ～ M7c）各有一张「延后事项」表，共 403 行。本表给每一行写明最后的结局和依据，让事情不会在里程碑之间丢掉：一行被送给"M5"，要看 M5 是不是真的接了。读法：「小计」给各结局的数目，「阶段 2 结束时仍开着的事项」按去向列出所有 `移交` 的行，「逐份计划」是逐行的明细（`#` 沿用各计划自己的行号；M1a、M1b、M2a、M2b 的表原来没有编号，按出现顺序编号）。
+阶段 2 的 20 份计划（M1a ～ M7c）各有一张「延后事项」表，共 403 行。本表给每一行写明最后的结局和依据，让事情不会在里程碑之间丢掉：一行被送给"M5"，要看 M5 是不是真的接了。读法：「小计」给各结局的数目，「阶段 2 结束时仍开着的事项」按去向列出所有 `移交` 的行，「逐份计划」是逐行的明细（`#` 沿用各计划自己的行号；M1a、M1b、M2a、M2b 的表原来没有编号，按出现顺序编号）。本表收的是这 20 份计划的「延后事项」记下的事，不是阶段 1 与阶段 2 没做完的一切；没有任何一份计划记下的不在这里——例如阶段 1 的托管配置更新与远程 `#!include` 从没做过，M8c 的需求审计（逐句对照代码）又查出一批——，它们的行在 M8c 计划「延后事项」的第 100 ～ 105 行。
 
 各行的结局先核对到提交 `28340f3`（M8c 的代码冻结点：交给整分支终审的那一版；任务 12 的文档提交在它之上）；终审之后的最终修正波（九个提交，到 `087f399`）碰到的几行，由任务 12 A 部分的补充补核，写在下面「终审之后」一段。三件事要先知道。第一，没有推送过：`origin/main` 仍是 `0154e73`，那次 CI 运行之后的所有提交都没有推送，CI 没有在 M8 的任何提交上跑过；M8a 任务 6（CI 首跑的修正）要等推送之后读 CI 的失败清单，还没有开始，所以结局是 `移交：CI 首跑` 的行都还开着。第二，互操作用例在本机没有参照服务端，全部跳过，从未对真实二进制跑过；依据里写「M8c 做掉」的互操作夹具改动也只能这样说。第三，M8c 自己的「延后事项」不在本表里，在 M8c 计划（`docs/superpowers/plans/2026-10-09-phase2-m8c-leftovers-acceptance-plan.md`）的同名一节里。
 
@@ -269,7 +269,7 @@ M8 设计第 7 节用"动到那些文件时再整理"作理由关闭了五行（
 
 ### M8 自己留下的（18 行）
 
-M8a 计划（`docs/superpowers/plans/2026-10-08-phase2-m8a-ci-credentials-plan.md`）6 行与 M8b 计划（`docs/superpowers/plans/2026-10-08-phase2-m8b-p2-protocols-plan.md`）12 行的「延后事项」，只列编号与一个短语，去向照那两张表写；其中 5 行由 M8c 承接：M8a #4、M8b #6、#7、#12 已做掉（任务号与提交写在行里），M8b #9 由任务 12 的 B 部分订正。
+M8a 计划（`docs/superpowers/plans/2026-10-08-phase2-m8a-ci-credentials-plan.md`）6 行与 M8b 计划（`docs/superpowers/plans/2026-10-08-phase2-m8b-p2-protocols-plan.md`）12 行的「延后事项」，只列编号与一个短语，去向照那两张表写；其中 5 行由 M8c 承接：M8a #4、M8b #6、#7、#12 已做掉（任务号与提交写在行里），M8b #9 已由任务 12 的 B 部分订正（`e7d0eef`）。
 
 - M8a #1 — `h3://` 的 DoH3 URL 带用户名口令仍被拒（`W0026`），与 `https://` 的 Basic 认证不对称 — 去向：有用户报告再说（做法同 DoH：加一个头）
 - M8a #2 — 缓存目录 `meta.json` 里资源的完整 URL — 去向：不处理（与缓存的订阅正文、配置文件同在使用者的数据目录里）
@@ -285,12 +285,12 @@ M8a 计划（`docs/superpowers/plans/2026-10-08-phase2-m8a-ci-credentials-plan.m
 - M8b #6 — 互操作夹具仍一个一个地取端口 — 去向：M8c 任务 11，已做掉（`6e22fa2`；`Failures` 的 `Drop` 守卫到 `284c40a` 才做完）
 - M8b #7 — 本机连着跑全量时偶发失败的两条用例 — 去向：M8c 任务 11，已做掉（`6e22fa2`、`284c40a`；另有五条同类用例一并按原因改掉）
 - M8b #8 — Snell「没有应答」提示的已知限制 — 去向：接受（已登记进兼容性清单 4.2 `snell` 一行）
-- M8b #9 — `snell` 的 `udp-port` 的注释与清单措辞 — 去向：M8c 任务 12 的 B 部分
+- M8b #9 — `snell` 的 `udp-port` 的注释与清单措辞 — 去向：M8c 任务 12 的 B 部分，已做掉（`e7d0eef`：四个源文件里讲 `udp-port` 的注释与兼容性清单 4.2、4.5 的两行改用手册的原话，把它同 v5 的 QUIC Proxy Mode 画等号的说法去掉；M6 设计第 18 节第 7 条加了旁注）
 - M8b #10 — 评审留下的小项（不影响行为） — 去向：动到那些文件时再整理
 - M8b #11 — 只靠读代码、没有本机用例盖住的三处 — 去向：接受
 - M8b #12 — 一行已经有错误时仍多说一句的其余各处 — 去向：M8c 任务 10，已做掉（`57977af`，修正轮 `c870456`）
 
-M8c 自己的「延后事项」（97 行）列在 M8c 计划（`docs/superpowers/plans/2026-10-09-phase2-m8c-leftovers-acceptance-plan.md`）的「延后事项」一节里；其中去向写「由项目所有者决定」的几行（第 51 ～ 77 行等）是阶段 2 留给项目所有者的问题。
+M8c 自己的「延后事项」（105 行）列在 M8c 计划（`docs/superpowers/plans/2026-10-09-phase2-m8c-leftovers-acceptance-plan.md`）的「延后事项」一节里；其中去向写「由项目所有者决定」的 32 行（第 26、36、43 行，第 51 ～ 77 行，第 99 行，第 105 行）是留给项目所有者的问题；第 100 ～ 103 行是阶段 1 从没做的托管配置更新与远程 `#!include`、需求审计查出的其余缺口和做了而没找到用例的几句，移交到 M8c 之后、阶段 3 开始之前补做；第 104 行（`hidden`）移交阶段 6。
 
 ## 逐份计划
 
@@ -457,7 +457,7 @@ M8c 自己的「延后事项」（97 行）列在 M8c 计划（`docs/superpowers
 | 5 | 布尔环境变量只认 `true` / `false` | 等项目所有者决定；单独小改动 | M8 做掉 | M8a 任务 4，提交 aa8837d：`crates/rurge/src/cli/mod.rs` 的 `switch()` 返回 `BoolishValueParser`，用例 `a_switchs_environment_variable_takes_the_usual_spellings`；M8 设计 3.4、M8-D6 |
 | 6 | 每次重建把装配告警逐条再 WARN | 有用户报告再说 | 移交：有用户报告再说 | 限制仍在：`rebuild_registry` 每次对 `assembly.diagnostics` 逐条 `tracing::warn!`（`crates/rurge-engine/src/subscriptions.rs`）；M8 各计划与之后的计划都未点名 |
 | 7 | 每次重建重新解析全部订阅 | 需要时（M8） | 移交：有用户报告再说 | M8 设计第 7 节「移交」表（有用户报告或性能数据再说）；限制仍在：`rebuild_registry` 每次对全部订阅快照重新 `assemble` |
-| 8 | 兼容性清单附录的统计对不上 | 单独核对 | M8 做掉 | M8b 任务 5：计划「执行期修正记录」#20（附录整张重数；改之前写的合计 529，按每行第一个状态标记数出 538，附录自 M2a 起由各文档任务手工增减）与终审 #28，提交 71d03d0、68ba8ff；现附录合计 539 / 396 / 96 / 29 / 14 / 4（`docs/surge-compatibility-matrix.md`「附录：统计」）；M8c 任务 12 的 B 部分还会再重数一遍 |
+| 8 | 兼容性清单附录的统计对不上 | 单独核对 | M8 做掉 | M8b 任务 5：计划「执行期修正记录」#20（附录整张重数；改之前写的合计 529，按每行第一个状态标记数出 538，附录自 M2a 起由各文档任务手工增减）与终审 #28，提交 71d03d0、68ba8ff；现附录合计 539 / 396 / 96 / 29 / 14 / 4（`docs/surge-compatibility-matrix.md`「附录：统计」）；M8c 任务 12 的 B 部分按脚本重数过一遍，每格不变（`e7d0eef`） |
 | 9 | 坏配置时先退出、后 `sysproxy.recover()` | 单独跟进（等项目所有者点头） | M8 做掉 | M8c 任务 8（M8 设计 5.10；M8c 承接事项「M1b」一行；`6a473ed`、`9bab75e`）：`rurge run` 在配置读不了或有错误时先试一次系统代理恢复；本行与 M1b 登记的是同一缺陷，M8 设计第 7 节与 M8c 承接事项只写了 M1b，没写本行 |
 | 10 | 两组导入同名策略时命名空间先于校验裁决 | 有用户报告再说 | 移交：有用户报告再说 | 限制仍在：`Imports::collect` 按名字占位（`crates/rurge-policy/src/assemble.rs`，`to_spec` 的校验在它之后）；兼容性清单 5.2「成员装配顺序」一行登记了"同名时先声明的组那份生效"；M8 各计划未点名 |
 | 11 | 订阅行能用主配置的 `client-cert` / 策略 | 已处理（M3b 任务 1） | 已做掉 | M3b 计划 P1 / 承接事项 C1 → 任务 1，提交 990f627、b41574f；代码：`reaches_into_profile` 对订阅行自己写的 `client-cert` 与指向主配置的 `underlying-proxy` 跳过并 `W0023`（`crates/rurge-policy/src/assemble.rs`）；兼容性清单 5.2 `policy-path` 行已登记 |
@@ -556,7 +556,7 @@ M8c 自己的「延后事项」（97 行）列在 M8c 计划（`docs/superpowers
 | - | ---- | ------ | ---- | ---- |
 | 1 | smoltcp 0.12 的 TCP 限制 | MSRV 升到 1.91 时换 smoltcp 0.13（所有者决定）；已登记差异 | 移交：依赖升级时 | 第 7 节「移交」表（M4b #1：MSRV 升到 1.91 时换 smoltcp 0.13 并逐条核对）；已登记：matrix 的 `wireguard` 行有「已知的 smoltcp 0.12 限制」一段 |
 | 2 | WireGuard 的 UDP、`underlying-proxy`、`ecn` | M5 | 关闭 | 前两项已做掉：M5c 承接事项 C2，任务 1（69dc92a，`TunnelUdp`）与任务 2（2ab61e1，`ChainConnector::connect_udp`）。留着的是 `ecn`：M5c 承接事项 C2 与延后 #5 照 M5-D6 只解析（`W0029`），M7 设计第 1 节表与 3.4 明确不含 `wireguard`，matrix 的 `ecn` 行写「`wireguard` 上仍只解析」，`rurge-config` 的 spec 用例钉住 `assert_eq!(o.inert, ["ecn"])`；第 7 节与三份 M8 计划没有再提，按保持现状关闭 |
-| 3 | "网络已变化"的探测器 | 阶段 3 | 移交：阶段 3 | 第 7 节「移交」表（M3b #5、#11，M4b #3、#19，M5a #19 → 阶段 3）；`network_changed` 在 `rurge-proto-wireguard` 之外没有调用者（grep）；matrix 的 `wireguard` 行写「阶段 2 没有触发它的探测器」 |
+| 3 | "网络已变化"的探测器 | 阶段 3 | 移交：阶段 3 | 第 7 节「移交」表（M3b #5、#11，M4b #3、#19，M5a #19 → 阶段 3）；`network_changed` 在 `rurge-proto-wireguard` 之外没有调用者（grep）；matrix 的 `wireguard` 行写「阶段 2 没有触发它的探测器」；探测器要接的入口共三个，产品代码里都还没有调用者（只有用例调用）：`TestBook::invalidate_all`（`crates/rurge-policy/src/testbook.rs`，M3b #11）、`WireGuardOutbound::network_changed`（`crates/rurge-proto-wireguard/src/outbound.rs`，M4b #19）、`Resolver::on_network_change`（`crates/rurge-dns/src/resolver.rs`；需求审计查出，M8c 计划「延后事项」第 105 行） |
 | 4 | 对 sing-box WireGuard 端点的互操作只在 CI 上跑 | 首次推送后看 CI | 移交：CI 首跑 | 用例在 `tests/interop/tests/sing_box_wireguard.rs`；M8a 计划承接事项「各计划『首次推送后看 CI』的条目 → 任务 6」，任务 6 还没有开始，要等推送；0154e73 的 CI 三平台 `cargo test` 失败、失败清单还没读到（M8 设计 3.1） |
 | 5 | 每包开销以 UDP 系统调用为主；无批量收发 | 有吞吐问题报告、或阶段 3 做 TUN 时再看 | 移交：有用户报告再说 | 原去向未变，第 7 节与三份 M8 计划未认领；`rurge-proto-wireguard/src` 与 `crates/rurge-net/src/connector.rs` 里仍没有 `recvmmsg` / `sendmmsg` / GRO / GSO；M5c 延后 #4、#18 同题 |
 | 6 | （已取消）隧道逐个启动 `STARTING` | — | 已做掉 | 行内已写取消；执行期修正记录「任务 6」一行（c1addb4，提交存在）去掉了全局启动锁；`rurge-proto-wireguard/src` 里已无 `STARTING`；matrix 的 `wireguard` 行写「隧道之间的启动不排队」 |
@@ -623,7 +623,7 @@ M8c 自己的「延后事项」（97 行）列在 M8c 计划（`docs/superpowers
 | 17 | 被 kill 的 UDP 流记成「完成」；只丢一个包的原因只记第一个 | 以后顺手改 | 移交：下次动到时 | 原去向未变，M8 未认领 |
 | 18 | 端口 53 的流是载体上唯一的流时，回收连带关掉载体 | 有用户报告再说 | 移交：有用户报告再说 | 原去向未变，M8 未认领 |
 | 19 | 网卡绑定的载体在地址变化后不自愈 | 随阶段 3 的网络变化探测 | 移交：阶段 3 | 第 7 节「移交」表（M3b #5、#11，M4b #3、#19，M5a #19 → 阶段 3） |
-| 20 | 双栈监听上 `SRC-IP` 规则匹配不到 IPv4 客户端 | 阶段 1 入站，以后顺手改 | M8 做掉 | M8c 任务 10 的修正轮（`0d7dac0`）：接受循环在交给 HTTP / SOCKS5 的处理之前把客户端的 `::ffff:a.b.c.d` 归成 IPv4（`canonical_peer`，`crates/rurge-inbound/src/listener.rs`），双栈监听上 `SRC-IP` 的 IPv4 网段命中 IPv4 客户端，请求记录里显示 IPv4；`HostName::canonical`（`rurge-config`）是目标地址与出站报回的来源归一的唯一实现（入站里另有 `udp.rs` 的 `canonical`、`restrict.rs` 各自归一的老代码，`rurge-proto` 的 `from_relay` 直接用 `IpAddr::to_canonical`）。用例 `an_ipv4_client_of_a_dual_stack_listener_is_named_by_its_ipv4_address`；接受循环里那个调用点只靠读代码核对，监听层面没有用例（Windows 上产品不设那个 socket 选项，造不出收 IPv4 客户端的 IPv6 监听） |
+| 20 | 双栈监听上 `SRC-IP` 规则匹配不到 IPv4 客户端 | 阶段 1 入站，以后顺手改 | M8 做掉 | M8c 任务 10 的修正轮（`0d7dac0`）：接受循环在交给 HTTP / SOCKS5 的处理之前把客户端的 `::ffff:a.b.c.d` 归成 IPv4（`canonical_peer`，`crates/rurge-inbound/src/listener.rs`），双栈监听上 `SRC-IP` 的 IPv4 网段命中 IPv4 客户端，请求记录里显示 IPv4；`HostName::canonical`（`rurge-config`）是目标地址与出站报回的来源归一的唯一实现（入站里另有几处各自归一的老代码：`udp.rs` 的 `canonical`、`restrict.rs`、`socks5.rs` 的 `reply_bound`，`rurge-proto` 的 `from_relay` 直接用 `IpAddr::to_canonical`）。用例 `an_ipv4_client_of_a_dual_stack_listener_is_named_by_its_ipv4_address`；接受循环里那个调用点只靠读代码核对，监听层面没有用例（Windows 上产品不设那个 socket 选项，造不出收 IPv4 客户端的 IPv6 监听） |
 | 21 | SOCKS 地址编解码写了两遍；`ConnectionReset` 吞法散在 6 处；限频日志三套写法 | 以后顺手改 | 移交：下次动到时 | 原去向未变，M8 未认领；M8c 任务 2（`e6f65b7`、`df814a6`）又在 `crates/rurge-net/src/quic/carrier.rs`、`crates/rurge-engine/src/dns_pipeline.rs` 与 `crates/rurge-net/src/packet_datagram.rs` 各加了一处对 `ConnectionReset` 的特别处理，没有合并 |
 
 ### M5b — `2026-09-29-phase2-m5b-udp-tls-family-plan.md`（14 行）
@@ -695,7 +695,7 @@ M8c 自己的「延后事项」（97 行）列在 M8c 计划（`docs/superpowers
 | - | ---- | ------ | ---- | ---- |
 | 1 | `version` 1–3 与 6、v5 的 QUIC Proxy Mode | M8（需要时） | 移交：项目所有者 | 三部分：v1–v3 做掉——M8b 任务 3（23af242、b106a60），设计 4.3，`SnellVersion::V1`–`V3`、`crates/rurge-proto/src/snell/chunked.rs`；v5 的 QUIC Proxy Mode 关闭——M8 设计 6.1，第 7 节关闭表；v6 待项目所有者表态——可行性报告 `docs/reports/2026-10-08-phase2-feasibility-snell-v6-quic-tailscale.md` 第 1 节，第 7 节移交表；`version=6` 仍是 `W0007` + REJECT |
 | 2 | v5 的动态记录大小（P4） | 接受（只影响发送方） | 关闭 | 原去向"接受"：只影响发送方 |
-| 3 | `obfs-host` 缺省、命令字与 Surge 的差异；`udp-port` 只解析 | 有真实 Surge 抓包或用户报告时对齐 | 移交：有用户报告再说 | 两处差异已登记（兼容性清单 `snell` 行："Surge 的缺省据报是 `bing.com`"、"据报 Surge 总是发 `0x05`，未核对"）；`udp-port` 仍只解析（`W0029`），"v5 的 QUIC Proxy Mode 实现时再让它生效"随该模式关闭而落空；`udp-port` 的措辞由 M8c 任务 12 的 B 部分订正（M8b 延后 #9） |
+| 3 | `obfs-host` 缺省、命令字与 Surge 的差异；`udp-port` 只解析 | 有真实 Surge 抓包或用户报告时对齐 | 移交：有用户报告再说 | 两处差异已登记（兼容性清单 `snell` 行："Surge 的缺省据报是 `bing.com`"、"据报 Surge 总是发 `0x05`，未核对"）；`udp-port` 仍只解析（`W0029`）；M6b 的"v5 的 QUIC Proxy Mode 实现时再让它生效"把它同该模式画等号，手册没有这样说，注释与清单里的这句话已由任务 12 的 B 部分（`e7d0eef`；M8b 延后 #9）换成手册的原话；rurge 不跟随 `udp-port`，因为连到它再照样叠 Shadow TLS，在 Shadow TLS 占着 TCP 端口的部署里必然握手失败，而 Surge 往那个端口发什么不知道 |
 | 4 | 互操作数不了复用的连接数；snell-server 是否默认开 UDP | CI 首跑；手工验收 | 移交：CI 首跑 | 复用已在 mihomo 的日志里数（M8b 任务 4，`snell_v2_requests_share_a_connection_against_mihomo`）；官方 snell-server 的 `udp_against_snell_server`（`tests/interop/tests/snell.rs`）没有在真实二进制上跑过：M8 设计 3.2，M8a 任务 6 |
 | 5 | 陈旧连接的重试：至多 64 KiB，只在 1 秒内，会重发 | 接受 | 关闭 | 原去向"接受"，已登记（兼容性清单 `snell` 行："同一个请求可能到达目标两次"） |
 | 6 | 配置、记录流、池、UDP、测试的小项 | 以后顺手改 | 移交：下次动到时 | 原去向"以后顺手改"；M8 设计第 7 节没有点名 |
