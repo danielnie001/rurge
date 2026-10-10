@@ -2,7 +2,7 @@
 //! so that `finish` can warn about the rest.
 
 use crate::diagnostic::{Diagnostic, Severity, codes};
-use crate::policy::{ProxyPolicy, named};
+use crate::policy::{ProxyPolicy, is_name, named};
 use crate::redact::split_top_level;
 use crate::value::{parse_bool, parse_key_value, split_list};
 use std::collections::HashSet;
@@ -50,12 +50,23 @@ pub(crate) fn invalid_value(key: &str, value: &str, expected: &str) -> String {
 }
 
 /// What a diagnostic says of a name that `key` refers to and nothing has: the
-/// name is quoted when it can be one, as a value is.
+/// name is quoted when it can be one, as a value is, and when it is a name
+/// (`underlying-proxy=https://user:password@host:port` is none).
 pub(crate) fn unknown_reference(key: &str, what: &str, name: &str) -> String {
-    if quotable(name) {
+    if quotable(name) && is_name(name) {
         format!("`{key}` references unknown {what} `{name}`")
     } else {
         format!("`{key}` references unknown {what}")
+    }
+}
+
+/// The keystore item `name` as a diagnostic that found it says it: quoted when
+/// its name is one, else "the item".
+pub(crate) fn found_item(name: &str) -> String {
+    if is_name(name) {
+        format!("`{name}`")
+    } else {
+        "the item".to_string()
     }
 }
 

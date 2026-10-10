@@ -7,8 +7,8 @@ use crate::host::{HostEntry, parse_host_entry};
 use crate::keystore::{KeystoreItem, parse_keystore_item, unknown_field};
 use crate::managed::{ManagedConfig, parse_managed};
 use crate::policy::{
-    Builtin, GroupKind, PolicyGroup, PolicyKind, ProxyPolicy, named, parse_group, parse_policy,
-    quoted_name,
+    Builtin, GroupKind, PolicyGroup, PolicyKind, ProxyPolicy, is_name, named, parse_group,
+    parse_policy, quoted_name, shown_members,
 };
 use crate::requirement::{self, Environment};
 use crate::rule::{ParseCtx, PolicyRef, Rule, RuleKind, SubRule, parse_rule, parse_subrule};
@@ -273,7 +273,7 @@ impl Config {
                         "{} ({}) -> [{}]",
                         g.name,
                         g.kind.keyword(),
-                        g.members.join(", ")
+                        shown_members(&g.members).join(", ")
                     )
                 })
                 .collect(),
@@ -612,7 +612,10 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
                     diags.push(
                         Diagnostic::error(
                             codes::E_KEYSTORE_BASE64,
-                            format!("keystore item `{}`: `base64` is not valid Base64", k.name),
+                            format!(
+                                "{}: `base64` is not valid Base64",
+                                named("keystore item", &k.name)
+                            ),
                         )
                         .at(span.clone()),
                     );
@@ -922,10 +925,15 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
     for r in &config.rules {
         match &r.policy {
             PolicyRef::Named(n) if !exists(n, config) => {
+                let told = if is_name(n) {
+                    format!("unknown policy `{n}`")
+                } else {
+                    "an unknown policy".to_string()
+                };
                 diags.push(
                     Diagnostic::error(
                         codes::E_UNKNOWN_POLICY_REF,
-                        format!("rule references unknown policy `{n}`"),
+                        format!("rule references {told}"),
                     )
                     .at(r.span.clone()),
                 );
@@ -955,13 +963,15 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
     for g in &config.groups {
         for m in group_refs(g) {
             if !exists(&m, config) {
+                let told = if is_name(&m) {
+                    format!("unknown policy `{m}`")
+                } else {
+                    "an unknown policy".to_string()
+                };
                 diags.push(
                     Diagnostic::error(
                         codes::E_UNKNOWN_GROUP_MEMBER,
-                        format!(
-                            "{} references unknown policy `{m}`",
-                            named("policy group", &g.name)
-                        ),
+                        format!("{} references {told}", named("policy group", &g.name)),
                     )
                     .at(g.span.clone()),
                 );
@@ -993,8 +1003,9 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
                         Diagnostic::warning(
                             codes::W_GROUP_CYCLE,
                             format!(
-                                "policy groups `{}` and `{}` form a cycle; they behave as REJECT",
-                                groups[i].name, groups[j].name
+                                "policy groups {} and {} form a cycle; they behave as REJECT",
+                                quoted_name(&groups[i].name),
+                                quoted_name(&groups[j].name)
                             ),
                         )
                         .at(groups[i].span.clone()),
@@ -1378,6 +1389,101 @@ S snell, s.test, 443, psk=s3cretPw42, version=4\nX http, h.test, 80, alice, s3cr
         assert!(c.contains(&codes::E_UNKNOWN_GROUP_MEMBER));
         assert!(c.contains(&codes::W_GROUP_CYCLE));
         assert!(l.diagnostics.has_errors());
+    }
+
+    /// The name of a policy that a rule, a group or a parameter refers to is
+    /// quoted when it is a name. A member is whatever lies between two commas
+    /// and has no `=`: a link whose `=` was typed as a `:`, text an input
+    /// method joined with a full-width `＝` or `，`, is none.
+    #[test]
+    fn an_unknown_policy_is_quoted_only_when_it_is_a_name() {
+        let l = load_text(
+            "[Proxy]\nA = direct\nP = http, p.test, 80, underlying-proxy=https://al1ce:hunter2@proxy.test:8080\n[Proxy Group]\nG = select, A, Missing 01, policy-path:https://sub.test/link/t0k3n, B\u{ff1d}t0k3n2, C\u{ff0c}t0k3n3\n[Rule]\nDOMAIN,a.com,Nope\nDOMAIN,b.com,policy-path\u{ff1d}https://sub.test/link/t0k3n4\nDOMAIN,c.com,P\u{ff0c}t0k3n5\nFINAL,DIRECT\n",
+        );
+        let said = |code: &str| -> Vec<&str> {
+            l.diagnostics
+                .iter()
+                .filter(|d| d.code == code)
+                .map(|d| d.message.as_str())
+                .collect()
+        };
+        assert_eq!(
+            said(codes::E_UNKNOWN_GROUP_MEMBER),
+            [
+                "policy group `G` references unknown policy `Missing 01`",
+                "policy group `G` references an unknown policy",
+                "policy group `G` references an unknown policy",
+                "policy group `G` references an unknown policy",
+            ]
+        );
+        assert_eq!(
+            said(codes::E_UNKNOWN_POLICY_REF),
+            [
+                "rule references unknown policy `Nope`",
+                "rule references an unknown policy",
+                "rule references an unknown policy",
+                "policy `P`: `underlying-proxy` references unknown policy",
+            ]
+        );
+        for d in l.diagnostics.iter() {
+            assert!(!d.message.contains("t0k3n"), "{}", d.message);
+            assert!(!d.message.contains("hunter2"), "{}", d.message);
+        }
+    }
+
+    /// A group whose name is none, in a cycle: the warning does not quote it.
+    #[test]
+    fn groups_whose_names_are_none_form_a_cycle_without_being_quoted() {
+        let l = load_text(
+            "[Proxy]\nA = direct\n[Proxy Group]\nG1\u{ff0c}t0k3n = select, G2\u{ff0c}t0k3n\nG2\u{ff0c}t0k3n = select, G1\u{ff0c}t0k3n\nG3 = select, G4\nG4 = select, G3\n[Rule]\nFINAL,A\n",
+        );
+        let found: Vec<&str> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::W_GROUP_CYCLE)
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "policy groups a link and a link form a cycle; they behave as REJECT",
+                "policy groups `G4` and `G3` form a cycle; they behave as REJECT",
+            ]
+        );
+    }
+
+    /// A keystore item is named by what stands in front of the `=` of its
+    /// line, which can be a password that slid there.
+    #[test]
+    fn a_keystore_item_is_named_only_when_the_name_is_one() {
+        let l = load_text(
+            "[Keystore]\nk\u{ff0c}t0k3n = type=p12, base64=!!!\nk 1 = type=p12, base64=!!!\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let found: Vec<&str> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::E_KEYSTORE_BASE64)
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "keystore item: `base64` is not valid Base64",
+                "keystore item `k 1`: `base64` is not valid Base64",
+            ]
+        );
+    }
+
+    /// The summary lists a group's members; a member that is none is `***`.
+    #[test]
+    fn the_summary_lists_the_members_that_are_names() {
+        let l = load_text(
+            "[Proxy]\nA = direct\n[Proxy Group]\nG = select, A, Hong Kong 01, policy-path:https://sub.test/link/t0k3n, B\u{ff1d}t0k3n2, DIRECT\n[Rule]\nFINAL,DIRECT\n",
+        );
+        assert_eq!(
+            l.config.summary().groups,
+            ["G (select) -> [A, Hong Kong 01, ***, ***, DIRECT]"]
+        );
     }
 
     /// Through members and through `include-other-group` alike; no longer

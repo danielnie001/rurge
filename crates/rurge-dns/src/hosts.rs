@@ -308,6 +308,34 @@ mod tests {
         );
     }
 
+    /// The key of a set is its URL, and the URL can carry a user name and a
+    /// password: the messages that name the entry have `***` for them.
+    #[tokio::test]
+    async fn an_entry_keyed_by_a_set_url_is_named_without_its_user_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let (map, diags) = build(
+            dir.path(),
+            "DOMAIN-SET:https://al1ce:S3CR3T@sets.example/d.txt = script:my-script\n\
+RULE-SET:https://al1ce:S3CR3T@sets.example/r.list = server:quic://dns.example.com/dns-query\n\
+DOMAIN-SET:https://al1ce:S3CR3T@sets.example/ok.txt = 1.2.3.4\n",
+        );
+        assert_eq!(map.rules_len(), 1);
+        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(
+            messages[0],
+            "[Host] `DOMAIN-SET:https://***@sets.example/d.txt`: script `my-script` is not supported in this version; entry skipped"
+        );
+        assert!(
+            messages[1].starts_with("[Host] `RULE-SET:https://***@sets.example/r.list`: "),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().all(|m| !m.contains("S3CR3T")),
+            "{messages:?}"
+        );
+    }
+
     /// `quic://` and `h3://` servers are as good as the others: no W0026.
     #[tokio::test]
     async fn quic_and_h3_servers_need_no_warning() {

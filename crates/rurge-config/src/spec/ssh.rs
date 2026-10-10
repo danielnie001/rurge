@@ -62,7 +62,10 @@ pub fn read_ssh(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> SshSpec {
             ),
             Some(item) if item.kind != KeystoreType::OpensshPrivateKey => r.error(
                 codes::E_KEYSTORE_REF,
-                format!("`private-key` needs an `openssh-private-key` keystore item, but `{name}` is `p12`"),
+                format!(
+                    "`private-key` needs an `openssh-private-key` keystore item, but {} is `p12`",
+                    super::reader::found_item(name)
+                ),
             ),
             Some(_) => private_key = Some(name.to_string()),
         }
@@ -243,6 +246,37 @@ mod tests {
                 "policy `P`: `private-key` needs an `openssh-private-key` keystore item, but `cert1` is `p12`".to_string()
             )]
         );
+    }
+
+    /// The item of the wrong kind is named by what the line calls it, unless
+    /// that is no name (an input method's `，` and `＝` are none).
+    #[test]
+    fn an_item_of_the_wrong_kind_is_named_only_when_the_name_is_one() {
+        let said = |name: &str| {
+            let def = format!("ssh, h.test, 22, username=u, private-key={name}");
+            let p = parse_policy("P", &def, &Span::new(Arc::from(Path::new("p.conf")), 1)).unwrap();
+            let keystore = [item(name, KeystoreType::P12)];
+            let mut r = ParamReader::new(&p);
+            read_ssh(&mut r, &keystore);
+            r.finish()
+                .into_iter()
+                .map(|d| d.message)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            said("cert 1"),
+            [
+                "policy `P`: `private-key` needs an `openssh-private-key` keystore item, but `cert 1` is `p12`"
+            ]
+        );
+        for name in ["k\u{ff0c}t0k3n", "k\u{ff1d}t0k3n"] {
+            assert_eq!(
+                said(name),
+                [
+                    "policy `P`: `private-key` needs an `openssh-private-key` keystore item, but the item is `p12`"
+                ]
+            );
+        }
     }
 
     #[test]

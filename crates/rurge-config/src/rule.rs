@@ -3,6 +3,7 @@
 use crate::diagnostic::{ParseError, codes};
 use crate::glob::{Glob, GlobOptions};
 use crate::policy::{Builtin, SubnetExpr};
+use crate::redact::url_without_credentials;
 use crate::span::Span;
 use crate::value::split_list;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
@@ -68,15 +69,49 @@ pub enum InternalSet {
     Lan,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum ResourceRef {
     Internal(InternalSet),
     Inline(String),
     File(PathBuf),
+    /// As written: it is what is fetched, a user name and a password in it
+    /// included. Everything that shows it goes through `shown_url`.
     Url(String),
 }
 
+/// The URL of a set without the user name and the password it may carry
+/// (`https://user:password@host/…`), as `Debug` shows it.
+impl fmt::Debug for ResourceRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResourceRef::Internal(set) => f.debug_tuple("Internal").field(set).finish(),
+            ResourceRef::Inline(name) => f.debug_tuple("Inline").field(name).finish(),
+            ResourceRef::File(path) => f.debug_tuple("File").field(path).finish(),
+            ResourceRef::Url(url) => f
+                .debug_tuple("Url")
+                .field(&ResourceRef::shown_url(url))
+                .finish(),
+        }
+    }
+}
+
 impl ResourceRef {
+    /// `url` as a view shows the URL of a set — a `Debug`, a rule's text, a
+    /// log line, a diagnostic —: the user name and the password in its
+    /// authority are `***`. The rest stays as written, for a set is named by
+    /// its URL, and an `@` further on is no credential
+    /// (`cdn.example/gh/user/repo@main/list.txt`).
+    pub fn shown_url(url: &str) -> String {
+        let Some(start) = url.find("://").map(|at| at + "://".len()) else {
+            return url.to_string();
+        };
+        let end = url[start..]
+            .find(['/', '?', '#'])
+            .map_or(url.len(), |at| start + at);
+        let (authority, rest) = url.split_at(end);
+        format!("{}{rest}", url_without_credentials(authority))
+    }
+
     pub fn parse(raw: &str, ctx: &ParseCtx) -> ResourceRef {
         let raw = raw.trim();
         match raw {
@@ -318,6 +353,7 @@ pub struct SubRule {
     pub no_resolve: bool,
     pub extended_matching: bool,
     pub unknown: Vec<String>,
+    /// The line as the views show it (see `Rule::raw`).
     pub raw: String,
 }
 
@@ -403,6 +439,10 @@ pub struct Rule {
     pub policy: PolicyRef,
     pub params: RuleParams,
     pub span: Span,
+    /// The line as the views show it: its `Display`, the request record, the
+    /// API's rule list, `rule match --explain`. A set's URL in it has `***`
+    /// for the user name and the password it carries; nothing reads the line
+    /// again from here, `kind` holds the URL as written.
     pub raw: String,
 }
 
@@ -570,13 +610,65 @@ fn parse_kind(ty: &str, value: &str, ctx: &ParseCtx, depth: usize) -> Result<Rul
         "SCRIPT" => RuleKind::Script(value.to_string()),
         "RULE-SET" => RuleKind::RuleSet(ResourceRef::parse(value, ctx)),
         _ => {
+            let told = quotable_type(ty).map_or(String::new(), |ty| format!(" `{ty}`"));
             return Err(ParseError::new(
                 codes::E_UNKNOWN_RULE_TYPE,
-                format!("unknown rule type `{ty}`"),
+                format!("unknown rule type{told}"),
             ));
         }
     };
     Ok(kind)
+}
+
+/// `ty` — the first field of a line, upper-cased — when a diagnostic may quote
+/// it: when it is shaped like a rule type, ASCII letters, digits and `-`, at
+/// most 32 of them. A line without a comma is all "type": a share link pasted
+/// at the end of the profile, a `key = value` left in `[Rule]` by a section
+/// header the parser does not take for one.
+fn quotable_type(ty: &str) -> Option<&str> {
+    let shaped = !ty.is_empty()
+        && ty.len() <= 32
+        && ty.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    shaped.then_some(ty)
+}
+
+/// What a diagnostic says of a line whose type is `ty`: `<ty>: <what>`, or
+/// `<what>` when the type is not one to quote.
+fn of_type(ty: &str, what: &str) -> String {
+    match quotable_type(ty) {
+        Some(ty) => format!("{ty}: {what}"),
+        None => what.to_string(),
+    }
+}
+
+/// The URLs of the sets that `kind` takes, those of its sub-rules included.
+fn set_urls<'a>(kind: &'a RuleKind, urls: &mut Vec<&'a str>) {
+    match kind {
+        RuleKind::DomainSet(ResourceRef::Url(url)) | RuleKind::RuleSet(ResourceRef::Url(url)) => {
+            urls.push(url)
+        }
+        RuleKind::And(subs) | RuleKind::Or(subs) => {
+            subs.iter().for_each(|sub| set_urls(&sub.kind, urls))
+        }
+        RuleKind::Not(sub) => set_urls(&sub.kind, urls),
+        _ => {}
+    }
+}
+
+/// The text of a line (`raw`) that parsed to `kind`, as the views show it: the
+/// URL of a set, wherever it stands in the line, without the user name and the
+/// password it may carry. Nothing else of the line is touched.
+fn shown_line(raw: &str, kind: &RuleKind) -> String {
+    let mut urls = Vec::new();
+    set_urls(kind, &mut urls);
+    let mut shown = raw.to_string();
+    for url in urls {
+        let hidden = ResourceRef::shown_url(url);
+        if hidden != url {
+            shown = shown.replace(url, &hidden);
+        }
+    }
+    shown
 }
 
 /// `((R1),(R2),...)` -> sub-rules.
@@ -637,14 +729,14 @@ fn parse_subrule_depth(raw: &str, ctx: &ParseCtx, depth: usize) -> Result<SubRul
     }
     let value = fields
         .get(1)
-        .ok_or_else(|| ParseError::new(codes::E_SYNTAX, format!("{ty}: missing value")))?;
+        .ok_or_else(|| ParseError::new(codes::E_SYNTAX, of_type(&ty, "missing value")))?;
     let kind = parse_kind(&ty, value, ctx, depth)?;
     let mut sub = SubRule {
+        raw: shown_line(raw.trim(), &kind),
         kind,
         no_resolve: false,
         extended_matching: false,
         unknown: Vec::new(),
-        raw: raw.trim().to_string(),
     };
     for flag in &fields[2..] {
         match flag.to_ascii_lowercase().as_str() {
@@ -679,12 +771,12 @@ pub fn parse_rule(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<Rule, ParseE
     } else {
         let value = fields
             .get(1)
-            .ok_or_else(|| ParseError::new(codes::E_SYNTAX, format!("{ty}: missing value")))?;
+            .ok_or_else(|| ParseError::new(codes::E_SYNTAX, of_type(&ty, "missing value")))?;
         (parse_kind(&ty, value, ctx, 1)?, 2)
     };
     let policy = fields
         .get(policy_idx)
-        .ok_or_else(|| ParseError::new(codes::E_SYNTAX, format!("{ty}: missing policy")))?;
+        .ok_or_else(|| ParseError::new(codes::E_SYNTAX, of_type(&ty, "missing policy")))?;
     let policy = PolicyRef::parse(policy);
     let params = RuleParams::parse(&fields[policy_idx + 1..]);
     if params.pre_matching {
@@ -703,11 +795,11 @@ pub fn parse_rule(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<Rule, ParseE
         }
     }
     Ok(Rule {
+        raw: shown_line(raw.trim(), &kind),
         kind,
         policy,
         params,
         span: span.clone(),
-        raw: raw.trim().to_string(),
     })
 }
 
@@ -993,6 +1085,213 @@ mod tests {
         );
         assert!(parse("NOT,((DOMAIN,a)),REJECT,pre-matching").is_ok());
         assert!(parse("OR,((DOMAIN,a),(IP-CIDR,10.0.0.0/8)),REJECT-DROP,pre-matching").is_ok());
+    }
+
+    /// A set's URL may carry a user name and a password. The rule's text —
+    /// what `Display` writes, and with it the request record, the API's rule
+    /// list, the summary and `rule match --explain` — shows them as `***`
+    /// and the rest of the line as it was; the set itself keeps the URL as
+    /// written, for that is what is fetched.
+    #[test]
+    fn a_rule_is_written_without_the_user_info_of_its_set_url() {
+        for (raw, shown) in [
+            (
+                "RULE-SET,https://al1ce:hunter2@rules.example/list.txt,DIRECT",
+                "RULE-SET,https://***@rules.example/list.txt,DIRECT",
+            ),
+            (
+                "DOMAIN-SET,https://al1ce:hunter2@rules.example:8443/d.txt?v=1#top,REJECT,update-interval=60",
+                "DOMAIN-SET,https://***@rules.example:8443/d.txt?v=1#top,REJECT,update-interval=60",
+            ),
+            // the sets of a logical rule, at any depth
+            (
+                "AND,((PROTOCOL,UDP),(RULE-SET,https://al1ce:hunter2@rules.example/s.list)),REJECT",
+                "AND,((PROTOCOL,UDP),(RULE-SET,https://***@rules.example/s.list)),REJECT",
+            ),
+            (
+                "OR,((NOT,((DOMAIN-SET,https://al1ce:hunter2@rules.example/d.txt))),(DOMAIN,a.com)),Proxy",
+                "OR,((NOT,((DOMAIN-SET,https://***@rules.example/d.txt))),(DOMAIN,a.com)),Proxy",
+            ),
+            // a field in quotes, a password with an `@` in it, a scheme in capitals
+            (
+                "RULE-SET,\"https://al1ce:hunter2@rules.example/list.txt\",DIRECT",
+                "RULE-SET,\"https://***@rules.example/list.txt\",DIRECT",
+            ),
+            (
+                "RULE-SET,https://al1ce:p@ss@rules.example/list.txt,DIRECT",
+                "RULE-SET,https://***@rules.example/list.txt,DIRECT",
+            ),
+            (
+                "RULE-SET,HTTPS://al1ce:hunter2@rules.example/list.txt,DIRECT",
+                "RULE-SET,HTTPS://***@rules.example/list.txt,DIRECT",
+            ),
+            // a set is named by its URL: an `@` in the path, the query or the
+            // fragment is no credential, and a line without a user name stays
+            // as it was
+            (
+                "RULE-SET,https://cdn.example/gh/user/repo@main/list.txt,DIRECT",
+                "RULE-SET,https://cdn.example/gh/user/repo@main/list.txt,DIRECT",
+            ),
+            (
+                "RULE-SET,https://rules.example/list.txt?mail=a@b.example#c@d,DIRECT",
+                "RULE-SET,https://rules.example/list.txt?mail=a@b.example#c@d,DIRECT",
+            ),
+            // the authority ends at a `?` or a `#` as well as at a `/`
+            (
+                "RULE-SET,https://rules.example?mail=a@b.example,DIRECT",
+                "RULE-SET,https://rules.example?mail=a@b.example,DIRECT",
+            ),
+            (
+                "RULE-SET,https://rules.example#c@d,DIRECT",
+                "RULE-SET,https://rules.example#c@d,DIRECT",
+            ),
+            (
+                "RULE-SET,https://al1ce:hunter2@rules.example?v=1,DIRECT",
+                "RULE-SET,https://***@rules.example?v=1,DIRECT",
+            ),
+            (
+                "RULE-SET,https://al1ce:hunter2@rules.example#top,DIRECT",
+                "RULE-SET,https://***@rules.example#top,DIRECT",
+            ),
+        ] {
+            let r = parse(raw).unwrap_or_else(|e| panic!("{raw}: {}", e.message));
+            assert_eq!(r.to_string(), shown, "{raw}");
+            assert_eq!(r.raw, shown, "{raw}");
+            assert!(!format!("{r:?}").contains("hunter2"), "{raw}");
+        }
+        let r = parse("RULE-SET,https://al1ce:hunter2@rules.example/list.txt,DIRECT").unwrap();
+        assert_eq!(
+            r.kind,
+            RuleKind::RuleSet(ResourceRef::Url(
+                "https://al1ce:hunter2@rules.example/list.txt".into()
+            ))
+        );
+    }
+
+    /// The same for the lines of an inline rule set and of a set file, which
+    /// have no policy.
+    #[test]
+    fn a_sub_rule_is_written_without_the_user_info_of_its_set_url() {
+        let inline = HashSet::new();
+        let ctx = ParseCtx {
+            inline_rulesets: &inline,
+            base_dir: Path::new("/profiles"),
+        };
+        for (raw, shown) in [
+            (
+                "RULE-SET,https://al1ce:hunter2@rules.example/s.list,no-resolve",
+                "RULE-SET,https://***@rules.example/s.list,no-resolve",
+            ),
+            (
+                "DOMAIN-SET,https://al1ce:hunter2@rules.example/d.txt",
+                "DOMAIN-SET,https://***@rules.example/d.txt",
+            ),
+            ("DOMAIN-SUFFIX,example.com", "DOMAIN-SUFFIX,example.com"),
+        ] {
+            let sub = parse_subrule(raw, &ctx).unwrap();
+            assert_eq!(sub.raw, shown, "{raw}");
+            assert!(!format!("{sub:?}").contains("hunter2"), "{raw}");
+        }
+    }
+
+    /// `Debug` shows the URL of a set without its user name and its password,
+    /// and every other kind of reference as it always showed it.
+    #[test]
+    fn the_debug_of_a_resource_reference_hides_the_user_info_of_a_url() {
+        assert_eq!(
+            format!(
+                "{:?}",
+                ResourceRef::Url(
+                    "https://al1ce:hunter2@rules.example/gh/user/repo@main/a.list".into()
+                )
+            ),
+            "Url(\"https://***@rules.example/gh/user/repo@main/a.list\")"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                ResourceRef::Url("https://rules.example/a.list".into())
+            ),
+            "Url(\"https://rules.example/a.list\")"
+        );
+        assert_eq!(
+            format!("{:?}", ResourceRef::Internal(InternalSet::Lan)),
+            "Internal(Lan)"
+        );
+        assert_eq!(
+            format!("{:?}", ResourceRef::Inline("Streaming".into())),
+            "Inline(\"Streaming\")"
+        );
+        assert_eq!(
+            format!("{:?}", ResourceRef::File(PathBuf::from("sets/a.list"))),
+            "File(\"sets/a.list\")"
+        );
+        // pretty-printed, as the `Debug` of a loaded profile is
+        assert_eq!(
+            format!(
+                "{:#?}",
+                ResourceRef::Url("https://al1ce:hunter2@rules.example/a.list".into())
+            ),
+            "Url(\n    \"https://***@rules.example/a.list\",\n)"
+        );
+    }
+
+    /// A line without a comma is all "type": a share link pasted at the end
+    /// of the profile, a `key = value` that a header the parser does not take
+    /// for one left in `[Rule]`. A type is quoted when it is shaped like one.
+    #[test]
+    fn a_rule_type_is_quoted_only_when_it_is_shaped_like_one() {
+        let longest = "A".repeat(32);
+        let too_long = "A".repeat(33);
+        let said = |raw: &str| parse(raw).unwrap_err().message;
+        for (raw, expected) in [
+            ("DOMAIN-SUFFIX", "DOMAIN-SUFFIX: missing value".to_string()),
+            (
+                "domain-suffix,example.com",
+                "DOMAIN-SUFFIX: missing policy".to_string(),
+            ),
+            ("FINAL", "FINAL: missing policy".to_string()),
+            ("IP-CIDR6", "IP-CIDR6: missing value".to_string()),
+            (
+                "DOMAIN-FOO,a.com,DIRECT",
+                "unknown rule type `DOMAIN-FOO`".to_string(),
+            ),
+            (&longest, format!("{longest}: missing value")),
+            (&too_long, "missing value".to_string()),
+            (
+                "trojan://hunter2@t.example:443?sni=t.example#HK",
+                "missing value".to_string(),
+            ),
+            ("CA-PASSPHRASE = hunter2", "missing value".to_string()),
+            ("psk=hunter2", "missing value".to_string()),
+            (
+                "trojan://hunter2@t.example:443?sni=t.example#HK,a.com,DIRECT",
+                "unknown rule type".to_string(),
+            ),
+            (
+                "ca passphrase,a.com,DIRECT",
+                "unknown rule type".to_string(),
+            ),
+        ] {
+            assert_eq!(said(raw), expected, "{raw}");
+        }
+        // a line of a rule set has no policy; its type is quoted the same way
+        let inline = HashSet::new();
+        let ctx = ParseCtx {
+            inline_rulesets: &inline,
+            base_dir: Path::new("/profiles"),
+        };
+        let said_sub = |raw: &str| parse_subrule(raw, &ctx).unwrap_err().message;
+        assert_eq!(said_sub("DOMAIN-SUFFIX"), "DOMAIN-SUFFIX: missing value");
+        assert_eq!(
+            said_sub("trojan://hunter2@t.example:443?sni=t.example#HK"),
+            "missing value"
+        );
+        assert_eq!(
+            said_sub("DOMAIN-FOO,a.com"),
+            "unknown rule type `DOMAIN-FOO`"
+        );
+        assert_eq!(said_sub("a b,c"), "unknown rule type");
     }
 
     #[test]

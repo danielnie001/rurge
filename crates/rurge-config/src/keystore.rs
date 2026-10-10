@@ -1,6 +1,7 @@
 //! `[Keystore]` certificates and private keys.
 
 use crate::diagnostic::{ParseError, codes};
+use crate::policy::named;
 use crate::span::Span;
 use crate::spec::reader::{quotable, written_as_name};
 use crate::value::{ParamMap, parse_key_value, split_list};
@@ -70,7 +71,7 @@ pub fn parse_keystore_item(
         .ok_or_else(|| {
             ParseError::new(
                 codes::E_SYNTAX,
-                format!("keystore item `{name}`: missing `base64`"),
+                format!("{}: missing `base64`", named("keystore item", name)),
             )
         })?
         .to_string();
@@ -87,7 +88,7 @@ pub fn parse_keystore_item(
             };
             return Err(ParseError::new(
                 codes::E_INVALID_RULE_VALUE,
-                format!("keystore item `{name}`: unknown type{shown}"),
+                format!("{}: unknown type{shown}", named("keystore item", name)),
             ));
         }
         None if password.is_some() => KeystoreType::P12,
@@ -229,6 +230,47 @@ mod tests {
                 said(&definition),
                 "keystore item `k`: unknown type",
                 "{definition}"
+            );
+        }
+    }
+
+    /// An item is named by what stands in front of the `=` of its line, and
+    /// that is a password when the line is a share link or has its fields
+    /// joined by an input method's `，` or `＝`: the name is told when it is one.
+    #[test]
+    fn an_item_is_named_only_when_the_name_is_one() {
+        let said = |name: &str, definition: &str| {
+            parse_keystore_item(name, definition, &span())
+                .unwrap_err()
+                .message
+        };
+        assert_eq!(
+            said("cert 1", "type=p12, password=x"),
+            "keystore item `cert 1`: missing `base64`"
+        );
+        assert_eq!(
+            said("cert 1", "type=jks, base64=AAAA"),
+            "keystore item `cert 1`: unknown type `jks`"
+        );
+        for name in [
+            "trojan://hunter2@t.example:443?sni",
+            "k\u{ff0c}hunter2",
+            "k\u{ff1d}hunter2",
+        ] {
+            assert_eq!(
+                said(name, "type=p12, password=x"),
+                "keystore item: missing `base64`",
+                "{name}"
+            );
+            assert_eq!(
+                said(name, "type=jks, base64=AAAA"),
+                "keystore item: unknown type `jks`",
+                "{name}"
+            );
+            assert_eq!(
+                said(name, "type=p12 password=hunter2, base64=AAAA"),
+                "keystore item: unknown type",
+                "{name}"
             );
         }
     }

@@ -43,9 +43,26 @@ pub enum HostKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostEntry {
     pub key: HostKey,
+    /// The key as the views show it: the summary, the resolver's messages and
+    /// lookups. A set's URL in it has `***` for the user name and the
+    /// password it carries; nothing reads the key again from here, `key`
+    /// holds the URL as written.
     pub raw_key: String,
     pub value: HostValue,
     pub span: Span,
+}
+
+/// The prefixes of the keys that name a set.
+const SET_KEY_PREFIXES: [&str; 2] = ["DOMAIN-SET:", "RULE-SET:"];
+
+/// `key` with the user name and the password of a set's URL gone.
+fn shown_key(key: &str) -> String {
+    for prefix in SET_KEY_PREFIXES {
+        if let Some(url) = strip_prefix_ci(key, prefix) {
+            return format!("{}{}", &key[..prefix.len()], ResourceRef::shown_url(url));
+        }
+    }
+    key.to_string()
 }
 
 fn parse_upstream(item: &str) -> Option<DnsUpstream> {
@@ -66,17 +83,28 @@ fn parse_upstream(item: &str) -> Option<DnsUpstream> {
 
 pub fn parse_host_entry(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<HostEntry, ParseError> {
     // A host never holds whitespace: a key that does came from an `=` further
-    // on (a URL's query) standing in for the missing one after the host.
-    // Nothing of the line is quoted — it can carry a token (M3-D7).
+    // on (a URL's query) standing in for the missing one after the host. Nor
+    // does it hold a `://`, unless it is the URL of a set: a share link pasted
+    // here has its first `=` in its query, and the password that stands in
+    // front of it would be a host. Nothing of the line is quoted — it can
+    // carry a token (M3-D7).
     let (key, value) = split_definition(raw)
-        .filter(|(key, _)| !key.contains(char::is_whitespace))
+        .filter(|(key, _)| {
+            !key.contains(char::is_whitespace)
+                && (!key.contains("://")
+                    || SET_KEY_PREFIXES
+                        .iter()
+                        .any(|prefix| strip_prefix_ci(key, prefix).is_some()))
+        })
         .ok_or_else(|| {
             ParseError::new(codes::E_INVALID_DEFINITION, "expected `<host> = <value>`")
         })?;
+    // a set's URL can carry a user name and a password
+    let shown = shown_key(key);
     if value.is_empty() {
         return Err(ParseError::new(
             codes::E_SYNTAX,
-            format!("`{key}`: empty value"),
+            format!("`{shown}`: empty value"),
         ));
     }
     let host_key = if let Some(r) = strip_prefix_ci(key, "DOMAIN-SET:") {
@@ -92,7 +120,7 @@ pub fn parse_host_entry(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<HostEn
                     classes: false,
                 },
             )
-            .map_err(|e| ParseError::new(codes::E_SYNTAX, format!("`{key}`: {e}")))?,
+            .map_err(|e| ParseError::new(codes::E_SYNTAX, format!("`{shown}`: {e}")))?,
         )
     };
     let host_value = if let Some(rest) = strip_prefix_ci(value, "server:") {
@@ -103,7 +131,7 @@ pub fn parse_host_entry(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<HostEn
             "" => {
                 return Err(ParseError::new(
                     codes::E_SYNTAX,
-                    format!("`{key}`: `server:` needs at least one server"),
+                    format!("`{shown}`: `server:` needs at least one server"),
                 ));
             }
             _ => {
@@ -113,7 +141,7 @@ pub fn parse_host_entry(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<HostEn
                         ParseError::new(
                             codes::E_SYNTAX,
                             format!(
-                                "`{key}`: invalid DNS server `{}`",
+                                "`{shown}`: invalid DNS server `{}`",
                                 url_without_credentials(&item)
                             ),
                         )
@@ -141,13 +169,15 @@ pub fn parse_host_entry(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<HostEn
         } else {
             return Err(ParseError::new(
                 codes::E_SYNTAX,
-                format!("`{key}`: expected IP addresses, a hostname alias, `server:` or `script:`"),
+                format!(
+                    "`{shown}`: expected IP addresses, a hostname alias, `server:` or `script:`"
+                ),
             ));
         }
     };
     Ok(HostEntry {
         key: host_key,
-        raw_key: key.to_string(),
+        raw_key: shown,
         value: host_value,
         span: span.clone(),
     })
@@ -254,6 +284,86 @@ mod tests {
     fn non_ascii_host_key_does_not_panic() {
         let e = parse("中文中文中文 = 1.2.3.4").unwrap();
         assert!(matches!(e.key, HostKey::Pattern(_)));
+    }
+
+    /// The key of a set is the set's URL, and the URL may carry a user name
+    /// and a password. What shows the key — the summary, the resolver's
+    /// messages and lookups, the diagnostics below — shows `***` for them;
+    /// the entry keeps the URL as written, for that is what is fetched.
+    #[test]
+    fn the_key_of_a_set_is_shown_without_the_user_info_of_its_url() {
+        for (key, shown) in [
+            (
+                "DOMAIN-SET:https://al1ce:hunter2@sets.example/d.txt",
+                "DOMAIN-SET:https://***@sets.example/d.txt",
+            ),
+            (
+                "rule-set:HTTPS://al1ce:p@ss@sets.example:8443/r.list#top",
+                "rule-set:HTTPS://***@sets.example:8443/r.list#top",
+            ),
+            // an `@` further on is no credential
+            (
+                "DOMAIN-SET:https://cdn.example/gh/user/repo@main/d.txt",
+                "DOMAIN-SET:https://cdn.example/gh/user/repo@main/d.txt",
+            ),
+            ("DOMAIN-SET:sets/d.txt", "DOMAIN-SET:sets/d.txt"),
+            ("example.com", "example.com"),
+        ] {
+            let e = parse(&format!("{key} = 10.0.0.1")).unwrap();
+            assert_eq!(e.raw_key, shown, "{key}");
+            assert!(!format!("{e:?}").contains("hunter2"), "{key}");
+        }
+        let e = parse("DOMAIN-SET:https://al1ce:hunter2@sets.example/d.txt = 10.0.0.1").unwrap();
+        assert_eq!(
+            e.key,
+            HostKey::DomainSet(ResourceRef::Url(
+                "https://al1ce:hunter2@sets.example/d.txt".into()
+            ))
+        );
+        let key = "RULE-SET:https://al1ce:hunter2@sets.example/r.list";
+        for (rest, expected) in [
+            ("", "empty value"),
+            ("server:", "`server:` needs at least one server"),
+            ("server:not an ip", "invalid DNS server `not an ip`"),
+            (
+                "1.2.3.4, not-ip",
+                "expected IP addresses, a hostname alias, `server:` or `script:`",
+            ),
+        ] {
+            let e = parse(&format!("{key} = {rest}")).unwrap_err();
+            assert_eq!(
+                e.message,
+                format!("`RULE-SET:https://***@sets.example/r.list`: {expected}"),
+                "{rest}"
+            );
+        }
+    }
+
+    /// A share link pasted under `[Host]` is `<key> = <value>` with the first
+    /// `=` of the link: the key has no white space, and the value can read as
+    /// an alias, so that the line used to load, the link's password in the
+    /// key of the entry. A key with a `://` in it is a host only as the URL of
+    /// a set.
+    #[test]
+    fn a_link_is_no_host_key() {
+        for raw in [
+            "trojan://hunter2@t.example:443?sni=t.example#HK",
+            "hysteria2://hunter2@h.example:443/?obfs=salamander&obfs-password=hunter3#HK",
+            "vmess://eyJhZGQiOiJ2LmV4YW1wbGUiLCJpZCI6Imh1bnRlcjIifQ==",
+            "https://hunter2@sub.example/path = 1.2.3.4",
+        ] {
+            let e = parse(raw).unwrap_err();
+            assert_eq!(
+                (e.code, e.message.as_str()),
+                (codes::E_INVALID_DEFINITION, "expected `<host> = <value>`"),
+                "{raw}"
+            );
+        }
+        // a set's key is one, and so is a host that merely looks like a link
+        assert!(parse("DOMAIN-SET:https://example.com/list.txt = server:8.8.8.8").is_ok());
+        assert!(parse("RULE-SET:https://example.com/list.txt = 10.0.0.1").is_ok());
+        assert!(parse("example.com = 1.2.3.4").is_ok());
+        assert!(parse("a:/b.example = 1.2.3.4").is_ok());
     }
 
     /// The server a diagnostic quotes is shown without the user name and the

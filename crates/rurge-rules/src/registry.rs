@@ -41,12 +41,15 @@ impl Key {
         }
     }
 
+    /// What the log lines, the diagnostics, the statuses and a match call the
+    /// set. The URL of a set can carry a user name and a password: they are
+    /// `***` here, the path and the query stay.
     fn display(&self) -> String {
         match self {
             Key::Internal(InternalSet::System) => "SYSTEM".to_string(),
             Key::Internal(InternalSet::Lan) => "LAN".to_string(),
             Key::Inline(n) => n.clone(),
-            Key::Url(u) => u.clone(),
+            Key::Url(u) => ResourceRef::shown_url(u),
             Key::File(p) => p.display().to_string(),
         }
     }
@@ -683,6 +686,56 @@ mod tests {
         let (reg2, diags2) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
         assert!(diags2.is_empty(), "{:?}", codes_of(&diags2));
         assert_eq!(reg2.statuses()[0].state, "ok");
+    }
+
+    /// A set is named by its URL in the diagnostics and the log lines, in the
+    /// statuses and in what a match reports, and the URL can carry a user
+    /// name and a password: the name has `***` for them and keeps the path
+    /// and the query, which name the set.
+    #[tokio::test]
+    async fn a_set_is_named_without_the_user_info_of_its_url() {
+        assert_eq!(
+            Key::Url("https://al1ce:S3CR3T@sets.example:8443/gh/user/repo@main/a.list?v=1".into())
+                .display(),
+            "https://***@sets.example:8443/gh/user/repo@main/a.list?v=1"
+        );
+        assert_eq!(
+            Key::Url("https://sets.example/gh/user/repo@main/a.list".into()).display(),
+            "https://sets.example/gh/user/repo@main/a.list"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/a.list", "DOMAIN,a.com\n");
+        let port = server.url("/").port().unwrap();
+        let cfg = load(
+            &format!(
+                "[Proxy]\nP = direct\n[Rule]\nRULE-SET,http://al1ce:S3CR3T@127.0.0.1:{port}/a.list,P\nFINAL,DIRECT\n"
+            ),
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        let name = format!("http://***@127.0.0.1:{port}/a.list");
+        assert_eq!(
+            diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>(),
+            [format!(
+                "set `{name}`: resource not downloaded yet; treated as empty until it loads"
+            )]
+        );
+        assert_eq!(reg.statuses()[0].name, name);
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        let handle = reg.get(
+            &ResourceRef::Url(format!("http://al1ce:S3CR3T@127.0.0.1:{port}/a.list")),
+            SetKind::RuleSet,
+        );
+        wait_version(&handle, 1).await;
+        let d = engine
+            .evaluate(
+                &SessionInfo::tcp(HostName::parse("a.com"), 443),
+                OutboundMode::Rule,
+                &crate::engine::NoResolve,
+            )
+            .await;
+        assert_eq!(d.sub_rule.map(|hit| hit.set), Some(name));
     }
 
     #[tokio::test]

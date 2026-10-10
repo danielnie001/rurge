@@ -9,6 +9,7 @@ pub use cache::Meta;
 
 use crate::http::HttpClient;
 use bytes::Bytes;
+use rurge_config::ResourceRef;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
@@ -50,6 +51,16 @@ impl ResourceSource {
         match self {
             ResourceSource::Url(u) => u.as_str().to_string(),
             ResourceSource::File(p) => format!("file:{}", p.display()),
+        }
+    }
+
+    /// What a log line calls the source when nobody labelled it. The URL of a
+    /// rule set can carry a user name and a password, which are `***` here;
+    /// the path and the query, which name the set, stay.
+    fn shown(&self) -> String {
+        match self {
+            ResourceSource::Url(u) => ResourceRef::shown_url(u.as_str()),
+            ResourceSource::File(p) => p.display().to_string(),
         }
     }
 }
@@ -186,11 +197,12 @@ struct Entry {
 }
 
 impl Entry {
-    /// What log lines call this resource: its label, else its source.
+    /// What log lines call this resource: its label, else its source (a URL
+    /// without its user name and its password).
     fn log_name(&self) -> String {
         match &*self.label.lock().expect("label") {
             Some(label) => label.clone(),
-            None => self.source.to_string(),
+            None => self.source.shown(),
         }
     }
 
@@ -1178,6 +1190,36 @@ mod tests {
         // the first label stays
         mgr.get_labelled(&url_spec(url, None), "policy-path of `H`");
         assert_eq!(plain.entry.log_name(), "policy-path of `G`");
+    }
+
+    /// The URL of a rule set can carry a user name and a password. A resource
+    /// nobody labelled is named by its URL in the log lines, without them; its
+    /// path and its query, which name the set, stay.
+    #[tokio::test]
+    async fn an_unlabelled_url_is_logged_without_its_user_info() {
+        let root = tempfile::tempdir().unwrap();
+        let offline = ResourceOptions {
+            offline: true,
+            ..fast()
+        };
+        let mgr = manager(root.path(), offline);
+        for (url, shown) in [
+            (
+                "https://al1ce:S3CR3T@sets.example:8443/gh/user/repo@main/a.list?v=1",
+                "https://***@sets.example:8443/gh/user/repo@main/a.list?v=1",
+            ),
+            (
+                "https://al1ce@sets.example/b.list",
+                "https://***@sets.example/b.list",
+            ),
+            (
+                "https://sets.example/gh/user/repo@main/c.list",
+                "https://sets.example/gh/user/repo@main/c.list",
+            ),
+        ] {
+            let handle = mgr.get(&url_spec(Url::parse(url).unwrap(), None));
+            assert_eq!(handle.entry.log_name(), shown, "{url}");
+        }
     }
 
     /// With auto-refresh off (`update-interval` below zero), once something is

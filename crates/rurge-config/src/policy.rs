@@ -2,6 +2,7 @@
 
 use crate::diagnostic::{ParseError, codes};
 use crate::glob::{Glob, GlobOptions};
+use crate::redact::is_secret_key;
 use crate::span::Span;
 use crate::types::HostName;
 use crate::value::{ParamMap, parse_key_value, split_list, strip_prefix_ci, unquote};
@@ -193,36 +194,64 @@ fn looks_like_keyword(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// `unknown type` (`E0004`), the keyword quoted only when `looks_like_keyword`.
-fn unknown_type(type_kw: &str) -> String {
-    if looks_like_keyword(type_kw) {
+/// `unknown type` (`E0004`) of the policy or the group `name`, the keyword
+/// quoted only when `looks_like_keyword` — and not when `name` is a key whose
+/// value is a secret: `psk = hunter2` under `[Proxy]` (a header the parser
+/// does not take for one leaves the lines of `[Snell Server]` there) is a
+/// policy named `psk` of the type `hunter2`.
+fn unknown_type(name: &str, type_kw: &str) -> String {
+    if looks_like_keyword(type_kw) && !is_secret_key(name) {
         format!("unknown type `{type_kw}`")
     } else {
         "unknown type".to_string()
     }
 }
 
+/// Whether `name` can be what somebody wrote as the name of a policy, a
+/// group, a group's member or a keystore item. A share link pasted into a
+/// section has its first `=` in its query, so everything in front of it — a
+/// password included — is taken for the name; a line whose fields an input
+/// method joined with its full-width `，` and `＝` has them in the name too
+/// (`P snell， h.example， 443， alice， pw， tfo=true`): a text that holds a
+/// `://`, a `＝` or a `，` is no name. A space, an emoji, CJK characters, a
+/// `|`, a `-` or a full stop are an ordinary name's.
+pub(crate) fn is_name(name: &str) -> bool {
+    !name.contains("://") && !name.contains(['＝', '，'])
+}
+
 /// `what` and the name of a policy or a group, the way a diagnostic of the
-/// loader says it. A share link pasted into `[Proxy]` has its first `=` in
-/// its query, so everything in front of it — a password included — is taken
-/// for the name: a name that holds `://` is no name but a link, and is not
-/// quoted.
+/// loader says it: a text that is no name (see `is_name`) is not quoted.
 pub(crate) fn named(what: &str, name: &str) -> String {
-    if name.contains("://") {
-        what.to_string()
-    } else {
+    if is_name(name) {
         format!("{what} `{name}`")
+    } else {
+        what.to_string()
     }
 }
 
 /// The name of a policy or a group a diagnostic mentions in passing, quoted;
-/// a link is none (see `named`).
+/// a text that is no name is none (see `is_name`).
 pub(crate) fn quoted_name(name: &str) -> String {
-    if name.contains("://") {
-        "a link".to_string()
-    } else {
+    if is_name(name) {
         format!("`{name}`")
+    } else {
+        "a link".to_string()
     }
+}
+
+/// The members of a group as the views show them: a member that is no name is
+/// `***`.
+pub(crate) fn shown_members(members: &[String]) -> Vec<&str> {
+    members
+        .iter()
+        .map(|member| {
+            if is_name(member) {
+                member.as_str()
+            } else {
+                "***"
+            }
+        })
+        .collect()
 }
 
 pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPolicy, ParseError> {
@@ -236,7 +265,7 @@ pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPo
     let kind = PolicyKind::parse(type_kw).ok_or_else(|| {
         ParseError::new(
             codes::E_UNKNOWN_POLICY_TYPE,
-            format!("{}: {}", named("policy", name), unknown_type(type_kw)),
+            format!("{}: {}", named("policy", name), unknown_type(name, type_kw)),
         )
     })?;
     let (server, port, rest) = if kind.takes_server() {
@@ -509,13 +538,15 @@ pub struct PolicyGroup {
 
 /// `params` is left out and `definition` redacted (M3-D7): a group's
 /// `policy-path` usually carries a subscription token, and its
-/// `external-policy-modifier` can set any parameter, a password included.
+/// `external-policy-modifier` can set any parameter, a password included. A
+/// member is whatever lies between two commas and has no `=`, a link whose `=`
+/// was typed as a `:` among it: one that is no name is `***`.
 impl std::fmt::Debug for PolicyGroup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PolicyGroup")
             .field("name", &self.name)
             .field("kind", &self.kind)
-            .field("members", &self.members)
+            .field("members", &shown_members(&self.members))
             .field("conditions", &self.conditions)
             .field("legacy_keyword", &self.legacy_keyword)
             .field("span", &self.span)
@@ -564,7 +595,11 @@ pub fn parse_group(name: &str, definition: &str, span: &Span) -> Result<PolicyGr
     let (kind, legacy_keyword) = GroupKind::parse(type_kw).ok_or_else(|| {
         ParseError::new(
             codes::E_UNKNOWN_POLICY_TYPE,
-            format!("{}: {}", named("policy group", name), unknown_type(type_kw)),
+            format!(
+                "{}: {}",
+                named("policy group", name),
+                unknown_type(name, type_kw)
+            ),
         )
     })?;
     let mut members = Vec::new();
@@ -1051,5 +1086,122 @@ external-policy-modifier=\"password=hunter2\"",
         }
         assert_eq!(named("policy", "P"), "policy `P`");
         assert_eq!(named("policy group name", link), "policy group name");
+    }
+
+    /// What an input method types for an `=` and for a `,` is no part of a
+    /// name either: text with one of them in it is a line whose fields slid
+    /// together (`P snell， h.example， 443， alice， pw， tfo=true` has its
+    /// "name" run to the first ASCII `=`). Each mark is enough on its own, a
+    /// link too; a name with a space, an emoji, CJK characters, a `|`, a `-` or
+    /// a full stop is an ordinary name.
+    #[test]
+    fn a_name_is_quoted_unless_it_holds_a_link_or_a_full_width_mark() {
+        for name in [
+            "https://sub.example/link/TOKEN",
+            "policy-path\u{ff1d}sub.example/TOKEN",
+            "P snell\u{ff0c} h.example\u{ff0c} 443\u{ff0c} alice\u{ff0c} pw\u{ff0c} tfo",
+            "a\u{ff1d}b",
+            "a\u{ff0c}b",
+        ] {
+            assert_eq!(named("policy", name), "policy", "{name}");
+            assert_eq!(named("policy group", name), "policy group", "{name}");
+            assert_eq!(quoted_name(name), "a link", "{name}");
+        }
+        for name in [
+            "Hong Kong 01",
+            "\u{1f680} Fast",
+            "\u{9999}\u{6e2f} 01",
+            "A|B",
+            "us-west-1",
+            "v1.2",
+            "a:/b",
+            "policy-path:sub",
+            "\u{ff08}HK\u{ff09}",
+        ] {
+            assert_eq!(named("policy", name), format!("policy `{name}`"), "{name}");
+            assert_eq!(quoted_name(name), format!("`{name}`"), "{name}");
+        }
+        let e = parse_policy(
+            "P snell\u{ff0c} h.example\u{ff0c} 443\u{ff0c} alice\u{ff0c} pw\u{ff0c} tfo",
+            "true",
+            &span(),
+        )
+        .unwrap_err();
+        assert_eq!(e.message, "policy: unknown type `true`");
+    }
+
+    /// `psk = hunter2abc` under `[Proxy]` (a header the parser does not take
+    /// for one leaves the lines of `[Snell Server]` there) is a policy named
+    /// `psk` of the type `hunter2abc`: when the name is a key whose value is a
+    /// secret, the type is none that should be told. Any other name: as it was.
+    #[test]
+    fn the_type_of_a_policy_named_like_a_secret_key_is_not_quoted() {
+        for name in [
+            "psk",
+            "PSK",
+            "password",
+            "ca-passphrase",
+            "Pre_Shared_Key",
+            "token",
+            "private-key",
+            "http-api",
+            "external-controller-access",
+            "http-listen",
+            "wifi-access-http-auth",
+        ] {
+            let e = parse_policy(name, "hunter2abc", &span()).unwrap_err();
+            assert_eq!(
+                e.message,
+                format!("policy `{name}`: unknown type"),
+                "{name}"
+            );
+            assert_eq!(e.code, codes::E_UNKNOWN_POLICY_TYPE);
+            let e = parse_group(name, "hunter2abc, A", &span()).unwrap_err();
+            assert_eq!(
+                e.message,
+                format!("policy group `{name}`: unknown type"),
+                "{name}"
+            );
+        }
+        for name in [
+            "HK",
+            "dns-server",
+            "interface",
+            "port",
+            "Http",
+            "Secret Service",
+        ] {
+            let e = parse_policy(name, "vless, h.example, 443", &span()).unwrap_err();
+            assert_eq!(
+                e.message,
+                format!("policy `{name}`: unknown type `vless`"),
+                "{name}"
+            );
+            let e = parse_group(name, "round-robin, A", &span()).unwrap_err();
+            assert_eq!(
+                e.message,
+                format!("policy group `{name}`: unknown type `round-robin`"),
+                "{name}"
+            );
+        }
+    }
+
+    /// A group's `Debug` shows a member that is a name, and `***` for text
+    /// that is none: a member is whatever lies between two commas and has no
+    /// `=`, a link whose `=` was typed as a `:` among it.
+    #[test]
+    fn the_debug_of_a_policy_group_shows_a_member_only_when_it_is_a_name() {
+        let g = parse_group(
+            "G",
+            "select, A, Hong Kong 01, policy-path:https://sub.test/link/t0k3n, B\u{ff1d}t0k3n2, C\u{ff0c}t0k3n3",
+            &span(),
+        )
+        .unwrap();
+        assert_eq!(g.members.len(), 5);
+        let debug = format!("{g:?}");
+        assert!(
+            debug.contains("members: [\"A\", \"Hong Kong 01\", \"***\", \"***\", \"***\"]"),
+            "{debug}"
+        );
     }
 }

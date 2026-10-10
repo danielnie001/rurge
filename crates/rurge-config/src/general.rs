@@ -698,6 +698,20 @@ fn migrated(diags: &mut Diagnostics, span: &Span, old: &str, new: &str) {
     );
 }
 
+/// Whether `key`, the text in front of the first `=` of a line of `[General]`
+/// that nothing reads, can be what somebody wrote for a key: ASCII letters,
+/// digits, `-` and `_`, at most 64 of them. When a section header is not
+/// recognised, every line below it arrives here, and its "key" is a policy's
+/// name — or, for a line whose `=` after the name is missing and for a pasted
+/// share link, text with a password in it.
+fn is_key_name(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
 pub fn parse_general(section: Option<&Section>, diags: &mut Diagnostics) -> General {
     let mut g = General::default();
     let Some(section) = section else { return g };
@@ -946,10 +960,15 @@ pub fn parse_general(section: Option<&Section>, diags: &mut Diagnostics) -> Gene
                 );
             }
             _ => {
+                let told = if is_key_name(key) {
+                    format!(" `{key}`")
+                } else {
+                    String::new()
+                };
                 diags.push(
                     Diagnostic::warning(
                         codes::W_UNKNOWN_KEY,
-                        format!("unknown [General] key `{key}` ignored"),
+                        format!("unknown [General] key{told} ignored"),
                     )
                     .at(span.clone()),
                 );
@@ -1227,6 +1246,44 @@ internet-test-url = ftp://127.0.0.1:9/?token=t0k3n
         assert!(
             shown.contains("<redacted>") && shown.contains("6152"),
             "{shown}"
+        );
+    }
+
+    /// The warning for a key nobody reads quotes it when it can be what
+    /// somebody wrote for a key: ASCII letters, digits, `-` and `_`, at most 64
+    /// of them. When a section header is not recognised, the "key" of a line
+    /// below it is a policy's name, or text with a password in it (a line whose
+    /// `=` after the name is missing, a share link).
+    #[test]
+    fn an_unknown_key_is_quoted_only_when_it_can_be_one() {
+        let longest = "a".repeat(64);
+        let too_long = "a".repeat(65);
+        let (_, d) = parse(&format!(
+            "[General]\nmystery-key = 1\nMy_Key2 = 2\n{longest} = 3\n{too_long} = 4\n\
+HK = trojan, t.example, 443, password=S3CR3T1\n\
+http h.example, 8080, alice, S3CR3T2, tfo=true\n\
+trojan://S3CR3T3@t.example:443?sni=t.example#HK\n\
+\u{9999}\u{6e2f} = 5\nmy key = 6\n"
+        ));
+        let said: Vec<&str> = d
+            .iter()
+            .filter(|x| x.code == codes::W_UNKNOWN_KEY)
+            .map(|x| x.message.as_str())
+            .collect();
+        let quoted_longest = format!("unknown [General] key `{longest}` ignored");
+        assert_eq!(
+            said,
+            [
+                "unknown [General] key `mystery-key` ignored",
+                "unknown [General] key `my_key2` ignored",
+                quoted_longest.as_str(),
+                "unknown [General] key ignored",
+                "unknown [General] key `hk` ignored",
+                "unknown [General] key ignored",
+                "unknown [General] key ignored",
+                "unknown [General] key ignored",
+                "unknown [General] key ignored",
+            ]
         );
     }
 

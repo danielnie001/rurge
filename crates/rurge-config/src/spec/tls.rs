@@ -131,7 +131,10 @@ pub(crate) fn read_tls(r: &mut ParamReader<'_>, keystore: &[KeystoreItem]) -> Tl
             ),
             Some(item) if item.kind != KeystoreType::P12 => r.error(
                 codes::E_KEYSTORE_REF,
-                format!("`client-cert` needs a `p12` keystore item, but `{name}` is `openssh-private-key`"),
+                format!(
+                    "`client-cert` needs a `p12` keystore item, but {} is `openssh-private-key`",
+                    super::reader::found_item(name)
+                ),
             ),
             Some(_) => client_cert = Some(name.to_string()),
         }
@@ -296,6 +299,44 @@ mod tests {
             diags[0].message,
             "policy `P`: `client-cert` needs a `p12` keystore item, but `key1` is `openssh-private-key`"
         );
+    }
+
+    /// The item of the wrong kind is named by what the line calls it, unless
+    /// that is no name (an input method's `，` and `＝` are none).
+    #[test]
+    fn an_item_of_the_wrong_kind_is_named_only_when_the_name_is_one() {
+        let said = |name: &str| {
+            let def = format!("https, h, 443, client-cert={name}");
+            let p = parse_policy("P", &def, &span()).unwrap();
+            let item = KeystoreItem {
+                name: name.into(),
+                kind: KeystoreType::OpensshPrivateKey,
+                base64: "AAAA".into(),
+                password: None,
+                unknown: Vec::new(),
+                span: span(),
+            };
+            let mut r = ParamReader::new(&p);
+            read_tls(&mut r, &[item]);
+            r.finish()
+                .into_iter()
+                .map(|d| d.message)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            said("key 1"),
+            [
+                "policy `P`: `client-cert` needs a `p12` keystore item, but `key 1` is `openssh-private-key`"
+            ]
+        );
+        for name in ["k\u{ff0c}t0k3n", "k\u{ff1d}t0k3n"] {
+            assert_eq!(
+                said(name),
+                [
+                    "policy `P`: `client-cert` needs a `p12` keystore item, but the item is `openssh-private-key`"
+                ]
+            );
+        }
     }
 
     #[test]

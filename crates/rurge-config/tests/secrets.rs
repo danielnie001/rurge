@@ -77,6 +77,8 @@ GQ = select, Http, \"policy-path=https://sub.example/list?token={MARKER}-quotedp
 
 [Host]
 corp.example = server:https://al1ce:{MARKER}-hostdoh@dns.example/dns-query
+DOMAIN-SET:https://al1ce:{MARKER}-hostdomainset@sets.example/hosts.txt = 10.1.1.1
+RULE-SET:https://al1ce:{MARKER}-hostruleset@sets.example/hosts.list = server:8.8.8.8
 
 [Keystore]
 cert = type=p12, password={MARKER}-p12, base64={MARKER}{MARKER}
@@ -100,7 +102,13 @@ Cookie = type=http-response, pattern=^https?://x.example, script-path=s.js, argu
 
 [Rule]
 #!include https://sub.example/rules/{MARKER}-include.conf?token={MARKER}-includetoken
+RULE-SET,https://al1ce:{MARKER}-ruleset@rules.example/list.txt,DIRECT
+DOMAIN-SET,https://al1ce:{MARKER}-domainset@rules.example/domains.txt,REJECT
+AND,((PROTOCOL,UDP),(RULE-SET,https://al1ce:{MARKER}-nestedset@rules.example/nested.list)),DIRECT
 FINAL,DIRECT
+
+[Ruleset Inline]
+RULE-SET,https://al1ce:{MARKER}-inlineset@rules.example/inline.list
 "
     )
 }
@@ -121,7 +129,7 @@ fn leaks(text: &str) -> Vec<String> {
 #[test]
 fn the_profile_loads() {
     use base64::Engine as _;
-    use rurge_config::{DnsUpstream, HostValue};
+    use rurge_config::{DnsUpstream, HostKey, HostValue, ResourceRef, RuleKind};
     let loaded = load(&profile());
     assert!(
         !loaded.diagnostics.has_errors(),
@@ -207,6 +215,30 @@ fn the_profile_loads() {
         HostValue::Servers(servers)
             if matches!(&servers[0], DnsUpstream::Encrypted(dns) if dns.url.contains("hostdoh"))
     ));
+    // the URL of a set keeps its user name and its password in what is read,
+    // for that is what is fetched: the views are what hide them
+    let user_info = |what: &str| format!("al1ce:{MARKER}-{what}@");
+    let set_url = |kind: &RuleKind| match kind {
+        RuleKind::RuleSet(ResourceRef::Url(url)) | RuleKind::DomainSet(ResourceRef::Url(url)) => {
+            url.clone()
+        }
+        other => panic!("not a set with a URL: {other:?}"),
+    };
+    assert!(set_url(&config.rules[0].kind).contains(&user_info("ruleset")));
+    assert!(set_url(&config.rules[1].kind).contains(&user_info("domainset")));
+    let RuleKind::And(parts) = &config.rules[2].kind else {
+        panic!("{:?}", config.rules[2].kind)
+    };
+    assert!(set_url(&parts[1].kind).contains(&user_info("nestedset")));
+    assert!(set_url(&config.rulesets[0].rules[0].kind).contains(&user_info("inlineset")));
+    assert!(matches!(
+        &config.hosts[1].key,
+        HostKey::DomainSet(ResourceRef::Url(url)) if url.contains(&user_info("hostdomainset"))
+    ));
+    assert!(matches!(
+        &config.hosts[2].key,
+        HostKey::RuleSet(ResourceRef::Url(url)) if url.contains(&user_info("hostruleset"))
+    ));
     // and what is commented out is not read at all
     assert!(
         general
@@ -222,6 +254,39 @@ fn the_debug_of_a_loaded_profile_holds_no_secret() {
     let loaded = load(&profile());
     let shown = format!("{:#?}", loaded.config);
     assert_eq!(leaks(&shown), Vec::<String>::new());
+}
+
+/// What a loaded profile writes out as text. A rule as `Display` gives it is
+/// what the request record, the API's rule list, `rule match --explain` and
+/// the summary show; the key of a `[Host]` entry goes to the summary and to
+/// the resolver's messages.
+#[test]
+fn the_texts_a_loaded_profile_gives_out_hold_no_secret() {
+    let loaded = load(&profile());
+    let config = &loaded.config;
+    let summary = config.summary();
+    let mut texts: Vec<String> = config.rules.iter().map(ToString::to_string).collect();
+    texts.extend(
+        config
+            .rulesets
+            .iter()
+            .flat_map(|set| set.rules.iter().map(|rule| rule.raw.clone())),
+    );
+    texts.extend(config.hosts.iter().map(|host| host.raw_key.clone()));
+    texts.extend(summary.rules);
+    texts.extend(summary.hosts);
+    assert_eq!(leaks(&texts.join("\n")), Vec::<String>::new());
+    // and they still say which line it was
+    for told in [
+        "RULE-SET,https://***@rules.example/list.txt,DIRECT",
+        "DOMAIN-SET,https://***@rules.example/domains.txt,REJECT",
+        "AND,((PROTOCOL,UDP),(RULE-SET,https://***@rules.example/nested.list)),DIRECT",
+        "RULE-SET,https://***@rules.example/inline.list",
+        "DOMAIN-SET:https://***@sets.example/hosts.txt",
+        "RULE-SET:https://***@sets.example/hosts.list",
+    ] {
+        assert!(texts.iter().any(|t| t == told), "{told}: {texts:#?}");
+    }
 }
 
 #[test]
@@ -741,4 +806,128 @@ fn an_inline_comment_is_redacted_as_a_commented_out_line_is() {
         ),
     ];
     assert_eq!(shown_with_secret(&lines), Vec::<String>::new());
+}
+
+/// A line that lands in another section than its author meant.
+#[test]
+fn a_line_in_the_wrong_section_is_neither_quoted_nor_kept() {
+    let texts = [
+        // a share link pasted at the end of a profile that ends with [Rule]
+        format!(
+            "[Rule]\nFINAL,DIRECT\ntrojan://{MARKER}-rulelink@t.example:443?sni=t.example#HK\n"
+        ),
+        // ... or under [Host], where it loads: an alias
+        format!(
+            "[Host]\ntrojan://{MARKER}-hostlink@t.example:443?sni=t.example#HK\n\n[Rule]\nFINAL,DIRECT\n"
+        ),
+        // a header the parser does not take for one: the keys below it are
+        // lines of the section above
+        format!("[Rule]\nFINAL,DIRECT\n[MITM] # my certificate\nca-passphrase = {MARKER}CA\n"),
+        format!(
+            "[Proxy]\nHttp = http, h.example, 8080\n[Snell Server] # mine\ninterface = 0.0.0.0\nport = 6160\npsk = {MARKER}psk\n\n[Rule]\nFINAL,DIRECT\n"
+        ),
+    ];
+    let mut found = Vec::new();
+    for text in &texts {
+        let loaded = load(text);
+        // a diagnostic may change the case of what it quotes
+        let messages: Vec<String> = loaded
+            .diagnostics
+            .iter()
+            .map(|d| d.message.to_ascii_uppercase())
+            .collect();
+        found.extend(leaks(&messages.join("\n")));
+        found.extend(leaks(&format!("{:#?}", loaded.config)));
+    }
+    assert_eq!(found, Vec::<String>::new());
+}
+
+/// A header the section parser does not take for one hands every line below
+/// it to the section above. Under `[General]` the "key" of such a line is a
+/// policy's name, or, when the `=` after the name is missing or the line is a
+/// share link, text with a password in it: only a key that can be one is
+/// quoted.
+#[test]
+fn a_line_under_general_that_is_no_setting_is_not_quoted() {
+    let text = format!(
+        "[General]\nloglevel = notify\nmy-key = 1\nHttp = http, h.example, 8080, alice, {MARKER}-named\ntrojan://{MARKER}-link@t.example:443?sni=t.example#HK\nP http h.example, 8080, alice, {MARKER}-nocomma, tfo=true\n\n[Rule]\nFINAL,DIRECT\n"
+    );
+    let loaded = load(&text);
+    let said: Vec<&str> = loaded
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == rurge_config::codes::W_UNKNOWN_KEY)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(
+        said,
+        [
+            "unknown [General] key `my-key` ignored",
+            "unknown [General] key `http` ignored",
+            "unknown [General] key ignored",
+            "unknown [General] key ignored",
+        ]
+    );
+    let messages: Vec<String> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| d.message.to_ascii_uppercase())
+        .collect();
+    let mut found = leaks(&messages.join("\n"));
+    found.extend(leaks(&format!("{:#?}", loaded.config)));
+    assert_eq!(found, Vec::<String>::new());
+}
+
+/// Text that is no name — a share link, what an input method types for an `=`
+/// or a `,` — is neither quoted by the diagnostics nor shown by the `Debug`
+/// and the summary, wherever a policy, a group, one of its members, a rule's
+/// policy or a keystore item is named.
+#[test]
+fn a_name_that_is_none_is_neither_quoted_nor_shown() {
+    let text = format!(
+        "[Proxy]
+A = http, a.example, 8080
+P snell\u{ff0c} h.example\u{ff0c} 443\u{ff0c} alice\u{ff0c} {MARKER}-fwcomma\u{ff0c} tfo=true
+
+[Proxy Group]
+G = select, A, policy-path:https://sub.example/link/{MARKER}-member, policy-path\u{ff1d}https://sub.example/link/{MARKER}-fwmember
+
+[Keystore]
+k\u{ff0c}{MARKER}-keystore = type=jks, base64=AAAA
+
+[Rule]
+FINAL,DIRECT
+"
+    );
+    let loaded = load(&text);
+    let said: Vec<&str> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| d.message.as_str())
+        .collect();
+    for told in [
+        "policy: unknown type `true`",
+        "policy group `G` references an unknown policy",
+        "keystore item: unknown type `jks`",
+    ] {
+        assert!(said.contains(&told), "{told}: {said:#?}");
+    }
+    let messages: Vec<String> = said.iter().map(|m| m.to_ascii_uppercase()).collect();
+    let summary = loaded.config.summary();
+    let mut found = leaks(&messages.join("\n"));
+    found.extend(leaks(&format!("{:#?}", loaded.config)));
+    found.extend(leaks(&summary.groups.join("\n")));
+    assert_eq!(found, Vec::<String>::new());
+    // a member that is a name is shown as it was
+    assert_eq!(summary.groups, ["G (select) -> [A, ***, ***]"]);
+    // and a rule whose policy is none is not quoted either
+    let loaded = load(&format!(
+        "[Rule]\nDOMAIN,a.com,policy-path\u{ff1d}https://sub.example/link/{MARKER}-rulepolicy\nFINAL,DIRECT\n"
+    ));
+    let said: Vec<&str> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(said, ["rule references an unknown policy"]);
 }

@@ -5,11 +5,12 @@
 use super::reader::{invalid_value, quotable, unknown_reference, written_as_name};
 use super::{NameKind, Secret};
 use crate::diagnostic::{Diagnostic, Severity, codes};
-use crate::policy::{Builtin, GroupKind, PolicyGroup, named};
+use crate::policy::{Builtin, GroupKind, PolicyGroup, named, shown_members};
 use crate::rule::Pattern;
 use crate::span::Span;
 use crate::value::{parse_bool, parse_key_value, split_list};
 use std::collections::HashSet;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use url::Url;
@@ -91,7 +92,7 @@ pub struct Priority {
 // A factor is finite and above zero (checked at load), so `==` is total.
 impl Eq for Priority {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GroupSpec {
     pub name: String,
     pub kind: GroupKind,
@@ -105,6 +106,36 @@ pub struct GroupSpec {
     pub priority: Vec<Priority>,
     pub hidden: bool,
     pub span: Span,
+}
+
+/// What a derived `Debug` would show, except for the members: they are the
+/// text between two commas of the line, a link whose `=` was typed as a `:`
+/// among it, and one that is no name is `***` (as in `PolicyGroup`'s).
+impl fmt::Debug for GroupSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let GroupSpec {
+            name,
+            kind,
+            members,
+            import,
+            underlying_proxy,
+            test,
+            priority,
+            hidden,
+            span,
+        } = self;
+        f.debug_struct("GroupSpec")
+            .field("name", name)
+            .field("kind", kind)
+            .field("members", &shown_members(members))
+            .field("import", import)
+            .field("underlying_proxy", underlying_proxy)
+            .field("test", test)
+            .field("priority", priority)
+            .field("hidden", hidden)
+            .field("span", span)
+            .finish()
+    }
 }
 
 #[derive(Debug, Default)]
