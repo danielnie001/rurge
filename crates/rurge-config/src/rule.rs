@@ -459,6 +459,12 @@ fn invalid(ty: &str, value: &str, why: &str) -> ParseError {
     )
 }
 
+/// An `E0014`. The code has no default hint — each place wants a different
+/// fix —, so every place that reports it says its own through here.
+fn not_allowed_here(message: impl Into<String>, hint: &'static str) -> ParseError {
+    ParseError::new(codes::E_NOT_ALLOWED_HERE, message).with_hint(hint)
+}
+
 fn glob(value: &str, ci: bool, classes: bool) -> Result<Glob, String> {
     Glob::new(
         value,
@@ -722,11 +728,10 @@ fn parse_subrule_depth(raw: &str, ctx: &ParseCtx, depth: usize) -> Result<SubRul
     };
     let ty = ty.to_ascii_uppercase();
     if ty == "FINAL" {
-        return Err(ParseError::new(
-            codes::E_NOT_ALLOWED_HERE,
+        return Err(not_allowed_here(
             "FINAL is not allowed as a sub-rule or inside a rule set",
-        )
-        .with_hint("use `FINAL` only as a top-level rule in `[Rule]`"));
+            "use `FINAL` only as a top-level rule in `[Rule]`",
+        ));
     }
     let value = fields
         .get(1)
@@ -744,11 +749,10 @@ fn parse_subrule_depth(raw: &str, ctx: &ParseCtx, depth: usize) -> Result<SubRul
             "no-resolve" => sub.no_resolve = true,
             "extended-matching" => sub.extended_matching = true,
             "pre-matching" => {
-                return Err(ParseError::new(
-                    codes::E_NOT_ALLOWED_HERE,
+                return Err(not_allowed_here(
                     "pre-matching is only allowed on top-level rules",
-                )
-                .with_hint("put `pre-matching` on the top-level rule instead of the sub-rule"));
+                    "put `pre-matching` on the top-level rule instead of the sub-rule",
+                ));
             }
             _ => sub.unknown.push(flag.clone()),
         }
@@ -784,18 +788,14 @@ pub fn parse_rule(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<Rule, ParseE
     if params.pre_matching {
         let reject = matches!(&policy, PolicyRef::Builtin(b) if b.is_reject());
         if !reject {
-            return Err(ParseError::new(
-                codes::E_NOT_ALLOWED_HERE,
+            return Err(not_allowed_here(
                 "pre-matching requires a REJECT-family policy",
-            )
-            .with_hint("give the rule a REJECT policy, or remove `pre-matching`"));
+                "give the rule a REJECT policy, or remove `pre-matching`",
+            ));
         }
         if !kind.supports_pre_matching() {
-            return Err(ParseError::new(
-                codes::E_NOT_ALLOWED_HERE,
+            return Err(not_allowed_here(
                 format!("{ty} does not support pre-matching"),
-            )
-            .with_hint(
                 "remove `pre-matching`: the Surge manual allows it only on domain, IP, port, SUBNET, CELLULAR and set rules, and on logical rules made of them",
             ));
         }

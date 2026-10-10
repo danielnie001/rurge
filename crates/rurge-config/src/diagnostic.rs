@@ -27,7 +27,8 @@ pub struct Diagnostic {
     pub code: &'static str,
     pub message: String,
     pub span: Option<Span>,
-    pub hint: Option<String>,
+    /// What to do about the problem. Static, so it cannot quote the profile.
+    pub hint: Option<&'static str>,
 }
 
 impl Diagnostic {
@@ -38,7 +39,7 @@ impl Diagnostic {
             code,
             message: message.into(),
             span: None,
-            hint: codes::hint(code).map(str::to_string),
+            hint: codes::hint(code),
         }
     }
     pub fn error(code: &'static str, message: impl Into<String>) -> Self {
@@ -56,8 +57,8 @@ impl Diagnostic {
     }
     /// Replaces the default hint of the code, or gives one to a code that has
     /// none.
-    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = Some(hint.into());
+    pub fn with_hint(mut self, hint: &'static str) -> Self {
+        self.hint = Some(hint);
         self
     }
     /// What `Display` writes before the hint: severity, code, position and
@@ -497,7 +498,7 @@ mod tests {
             Diagnostic::warning(codes::W_UNKNOWN_KEY, "m"),
             Diagnostic::info(codes::W_UNKNOWN_KEY, "m"),
         ] {
-            assert_eq!(d.hint.as_deref(), Some(said));
+            assert_eq!(d.hint, Some(said));
         }
         assert_eq!(Diagnostic::info(codes::I_LEGACY_MIGRATED, "m").hint, None);
     }
@@ -505,10 +506,10 @@ mod tests {
     #[test]
     fn a_hint_of_its_own_replaces_the_default() {
         let d = Diagnostic::warning(codes::W_UNKNOWN_KEY, "m").with_hint("say it this way");
-        assert_eq!(d.hint.as_deref(), Some("say it this way"));
+        assert_eq!(d.hint, Some("say it this way"));
         assert!(d.to_string().ends_with("\n  hint: say it this way"));
         let d = Diagnostic::warning(codes::W_PARAM_NOT_APPLICABLE, "m").with_hint("and this");
-        assert_eq!(d.hint.as_deref(), Some("and this"));
+        assert_eq!(d.hint, Some("and this"));
     }
 
     /// The one hint that existed before the table: its display is the same.
@@ -541,12 +542,12 @@ mod tests {
     #[test]
     fn a_parse_error_takes_the_default_hint_unless_it_has_its_own() {
         let plain = Diagnostic::from_parse(ParseError::new(codes::E_SYNTAX, "m"), span(1));
-        assert_eq!(plain.hint.as_deref(), codes::hint(codes::E_SYNTAX));
+        assert_eq!(plain.hint, codes::hint(codes::E_SYNTAX));
         let own = Diagnostic::from_parse(
             ParseError::new(codes::E_NOT_ALLOWED_HERE, "m").with_hint("move it"),
             span(1),
         );
-        assert_eq!(own.hint.as_deref(), Some("move it"));
+        assert_eq!(own.hint, Some("move it"));
         assert_eq!(own.severity, Severity::Error);
         let none = Diagnostic::from_parse(ParseError::new(codes::E_NOT_ALLOWED_HERE, "m"), span(1));
         assert_eq!(none.hint, None);

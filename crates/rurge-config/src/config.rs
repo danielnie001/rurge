@@ -1765,7 +1765,7 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
             .find(|d| d.code == codes::E_NOT_ALLOWED_HERE)
             .expect("E0014");
         assert_eq!(codes::hint(d.code), None);
-        let hint = d.hint.as_deref().expect("the site's own hint");
+        let hint = d.hint.expect("the site's own hint");
         assert!(hint.starts_with("remove `pre-matching`"), "{hint}");
     }
 
@@ -1781,7 +1781,7 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
 [Rule]\nDOMAIN,a,Missing\nFOO,a,DIRECT\nFINAL,DIRECT\nFINAL,DIRECT\nDOMAIN,z,DIRECT\n",
         );
         for d in l.diagnostics.iter() {
-            assert_eq!(d.hint.as_deref(), codes::hint(d.code), "{d}");
+            assert_eq!(d.hint, codes::hint(d.code), "{d}");
         }
         for (code, has_one) in [
             (codes::W_LINE_OUTSIDE_SECTION, true),
@@ -2278,7 +2278,7 @@ C = external, exec=/bin/c, local-port=1080\n[Rule]\nFINAL,DIRECT\n",
         );
         // the manual's page for the policy says nothing of a clash between two
         assert_eq!(
-            errors[0].hint.as_deref(),
+            errors[0].hint,
             Some("give every `external` policy a `local-port` of its own")
         );
         assert_eq!(errors[0].span.as_ref().map(|s| s.line), Some(4));
@@ -2323,7 +2323,7 @@ C = external, exec=/bin/c, local-port=7000\n[Rule]\nFINAL,DIRECT\n",
             .filter(|d| d.code == codes::E_INVALID_POLICY_PARAM)
         {
             assert_eq!(
-                d.hint.as_deref(),
+                d.hint,
                 Some("choose a `local-port` that neither `http-listen` nor `socks5-listen` uses")
             );
         }
