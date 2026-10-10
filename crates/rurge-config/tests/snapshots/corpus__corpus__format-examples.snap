@@ -16,4 +16,4 @@ expression: "(loaded.config.summary(), diags)"
   deferred: []
   unknown_sections: []
   managed: ~
-- - "warning[W0001] valid/format-examples.conf:9: unknown [General] key `example-quoted` ignored"
+- - "warning[W0001] valid/format-examples.conf:9: unknown [General] key `example-quoted` ignored\n  hint: check the spelling against the Surge manual, or remove it"

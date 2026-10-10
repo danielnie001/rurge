@@ -182,6 +182,9 @@ pub(crate) fn print_diagnostics(diags: &Diagnostics) {
             Severity::Info => "note",
         };
         eprintln!("{level}[{}]: {}", d.code, d.message);
+        if let Some(hint) = &d.hint {
+            eprintln!("  hint: {hint}");
+        }
     }
 }
 

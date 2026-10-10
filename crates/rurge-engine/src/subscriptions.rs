@@ -154,7 +154,8 @@ impl Engine {
         }
         let assembly = assemble(&rt.config, &rt.subscriptions.snapshots());
         for d in assembly.diagnostics.iter() {
-            tracing::warn!("{d}");
+            // a log record stays one line: the hint is left out
+            tracing::warn!("{}", d.headline());
         }
         let shared = self.shared();
         // Built outside the lock, which is never held across I/O: a

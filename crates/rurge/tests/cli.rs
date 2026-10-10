@@ -131,6 +131,74 @@ fn check_exit_codes() {
         }));
 }
 
+/// A problem is reported with what to do about it: in the text the hint is
+/// the line after its diagnostic, in the JSON it is a field of it, and a
+/// code that has no hint has `null`.
+#[test]
+fn check_says_what_to_do_about_a_problem() {
+    let dir = tempfile::tempdir().unwrap();
+    let said = |code: &str| format!("  hint: {}", rurge_config::codes::hint(code).unwrap());
+    let stdout = |file: &str, extra: &[&str]| {
+        let out = Command::cargo_bin("rurge")
+            .unwrap()
+            .args(["check", "-c"])
+            .arg(file)
+            .args(extra)
+            .output()
+            .unwrap()
+            .stdout;
+        String::from_utf8_lossy(&out).into_owned()
+    };
+
+    let warning = write(&dir, "warning.conf", WARNING);
+    let out = stdout(warning.to_str().unwrap(), &[]);
+    let lines: Vec<&str> = out.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with("warning[W0001]"))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert_eq!(lines[at + 1], said("W0001"), "{out}");
+
+    // an error that had its hint before the table of hints
+    let error = write(&dir, "error.conf", ERROR);
+    let out = stdout(error.to_str().unwrap(), &[]);
+    assert!(
+        out.contains(
+            "the [Rule] section must end with an enabled FINAL rule\n  hint: add `FINAL,DIRECT` as the last rule\n"
+        ),
+        "{out}"
+    );
+
+    let ios = write(
+        &dir,
+        "ios.conf",
+        "[General]\ncompatibility-mode = true\n[Rule]\nFINAL,DIRECT\n",
+    );
+    let both = write(
+        &dir,
+        "both.conf",
+        "[General]\nmystery = 1\ncompatibility-mode = true\n[Rule]\nFINAL,DIRECT\n",
+    );
+    let out = stdout(both.to_str().unwrap(), &["--json"]);
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let diagnostics = report["diagnostics"].as_array().expect("diagnostics");
+    let hint_of = |code: &str| {
+        diagnostics
+            .iter()
+            .find(|d| d["code"] == code)
+            .unwrap_or_else(|| panic!("{code} is not in {out}"))["hint"]
+            .clone()
+    };
+    assert_eq!(
+        hint_of("W0001"),
+        rurge_config::codes::hint("W0001").unwrap()
+    );
+    assert!(hint_of("W0004").is_null(), "{out}");
+    // and the text of a code without one has no hint line
+    let out = stdout(ios.to_str().unwrap(), &[]);
+    assert!(!out.contains("hint:"), "{out}");
+}
+
 #[test]
 fn bom_prefixed_config_is_accepted() {
     let dir = tempfile::tempdir().unwrap();
@@ -1310,10 +1378,28 @@ FINAL,DIRECT
             format!("[General]\nsome-made-up-key = 1\n{CONF}"),
         )
         .unwrap();
-        rule_match(dir.path(), &["listed.com"])
+        let out = rule_match(dir.path(), &["listed.com"])
             .assert()
             .success()
-            .stderr(predicate::str::contains("W0001"));
+            .stderr(predicate::str::contains("W0001"))
+            .get_output()
+            .stderr
+            .clone();
+        // printed for a person: the hint is the line after its diagnostic
+        let stderr = String::from_utf8_lossy(&out);
+        let lines: Vec<&str> = stderr.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.starts_with("warning[W0001]"))
+            .unwrap_or_else(|| panic!("{stderr}"));
+        assert_eq!(
+            lines[at + 1],
+            format!(
+                "  hint: {}",
+                rurge_config::codes::hint("W0001").expect("W0001 has a hint")
+            ),
+            "{stderr}"
+        );
         let (v, code) = json(dir.path(), &["listed.com"]);
         assert_eq!(code, 0);
         let warnings = v["warnings"].as_array().expect("warnings array");
@@ -3048,6 +3134,23 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
                 .collect();
             assert!(left.is_empty(), "{left:?}");
         }
+    }
+
+    /// What `rurge run` prints of a profile that does not load is what
+    /// `rurge check` prints: the hint is the line after its error.
+    #[test]
+    fn a_profile_that_does_not_load_is_printed_with_its_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let [(broken, _), _] = profiles_that_do_not_load(dir.path());
+        let (code, stderr) = give_up(rurge_run(&broken, &data));
+        assert_eq!(code, Some(2), "{stderr}");
+        assert!(
+            stderr.contains(
+                "error[E0010]: the [Rule] section must end with an enabled FINAL rule\n  hint: add `FINAL,DIRECT` as the last rule\n"
+            ),
+            "{stderr}"
+        );
     }
 
     #[test]

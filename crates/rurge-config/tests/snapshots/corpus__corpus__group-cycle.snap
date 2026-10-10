@@ -15,4 +15,4 @@ expression: "(loaded.config.summary(), diags)"
   deferred: []
   unknown_sections: []
   managed: ~
-- - "warning[W0030] valid/group-cycle.conf:3: policy groups `B` and `A` form a cycle; they behave as REJECT"
+- - "warning[W0030] valid/group-cycle.conf:3: policy groups `B` and `A` form a cycle; they behave as REJECT\n  hint: remove the reference from one of the two groups to the other"

@@ -22,6 +22,7 @@ fn conf_files(sub: &str) -> Vec<PathBuf> {
 }
 
 /// Render a diagnostic with the file path relative to the corpus directory so snapshots are portable.
+/// The hint follows on a line of its own, as `Display` writes it.
 fn render(d: &Diagnostic, root: &Path) -> String {
     let location = d
         .span
@@ -36,7 +37,12 @@ fn render(d: &Diagnostic, root: &Path) -> String {
             format!(" {rel}:{}", s.line)
         })
         .unwrap_or_default();
-    format!("{}[{}]{location}: {}", d.severity, d.code, d.message)
+    let hint = d
+        .hint
+        .as_ref()
+        .map(|hint| format!("\n  hint: {hint}"))
+        .unwrap_or_default();
+    format!("{}[{}]{location}: {}{hint}", d.severity, d.code, d.message)
 }
 
 #[test]

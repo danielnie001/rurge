@@ -31,13 +31,14 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
+    /// The hint is the default one of `code`, if it has one (`codes::hint`).
     pub fn new(severity: Severity, code: &'static str, message: impl Into<String>) -> Self {
         Self {
             severity,
             code,
             message: message.into(),
             span: None,
-            hint: None,
+            hint: codes::hint(code).map(str::to_string),
         }
     }
     pub fn error(code: &'static str, message: impl Into<String>) -> Self {
@@ -53,19 +54,35 @@ impl Diagnostic {
         self.span = Some(span);
         self
     }
+    /// Replaces the default hint of the code, or gives one to a code that has
+    /// none.
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
         self
+    }
+    /// What `Display` writes before the hint: severity, code, position and
+    /// message, on one line. A log record stays one line, so it writes this.
+    pub fn headline(&self) -> impl fmt::Display + '_ {
+        Headline(self)
+    }
+}
+
+struct Headline<'a>(&'a Diagnostic);
+
+impl fmt::Display for Headline<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let d = self.0;
+        write!(f, "{}[{}]", d.severity, d.code)?;
+        if let Some(span) = &d.span {
+            write!(f, " {span}")?;
+        }
+        write!(f, ": {}", d.message)
     }
 }
 
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}[{}]", self.severity, self.code)?;
-        if let Some(span) = &self.span {
-            write!(f, " {span}")?;
-        }
-        write!(f, ": {}", self.message)?;
+        write!(f, "{}", Headline(self))?;
         if let Some(hint) = &self.hint {
             write!(f, "\n  hint: {hint}")?;
         }
@@ -117,6 +134,9 @@ impl Diagnostics {
 pub struct ParseError {
     pub code: &'static str,
     pub message: String,
+    /// What to do about this error where the default hint of its code does
+    /// not say it. Static, so it cannot quote the profile.
+    pub hint: Option<&'static str>,
 }
 
 impl ParseError {
@@ -124,13 +144,22 @@ impl ParseError {
         Self {
             code,
             message: message.into(),
+            hint: None,
         }
+    }
+    pub fn with_hint(mut self, hint: &'static str) -> Self {
+        self.hint = Some(hint);
+        self
     }
 }
 
 impl Diagnostic {
     pub fn from_parse(err: ParseError, span: Span) -> Diagnostic {
-        Diagnostic::error(err.code, err.message).at(span)
+        let d = Diagnostic::error(err.code, err.message).at(span);
+        match err.hint {
+            Some(hint) => d.with_hint(hint),
+            None => d,
+        }
     }
 }
 
@@ -223,6 +252,103 @@ pub mod codes {
     pub const I_LINE_DISABLED: &str = "I0002";
     /// GeoIP / ASN database file not present yet.
     pub const I_GEOIP_DB_MISSING: &str = "I0003";
+
+    /// What to do about a diagnostic of `code`, when there is one thing to say
+    /// for every place that emits it. The constructors of `Diagnostic` take
+    /// it as the hint and `with_hint` replaces it. A sentence is static, so
+    /// it never quotes anything of the profile.
+    ///
+    /// Where the places that emit a code want different fixes, the sentence
+    /// says what they share or the code has none. `E0014` has none because
+    /// each of its four places carries a hint of its own. The other codes
+    /// without one:
+    ///
+    /// - `E0009`: no place emits it any more.
+    /// - `E0017`: the message is the shape to write, a different one at each
+    ///   of its three places.
+    /// - `E0022`: the message holds the reason the policy could not be built.
+    /// - `E0023`: the message says what is missing or wrong in the section;
+    ///   what to do about a `section-name` that names none depends on whether
+    ///   the section exists.
+    /// - `W0004`, `W0009`, `W0010`, `W0016`, `W0027`: the line asks for what
+    ///   does not apply on this platform or in this version, and there is
+    ///   nothing to change in it.
+    /// - `W0007`, `W0008`: each text of the message says where the policy or
+    ///   the group goes instead.
+    /// - `W0011`: remote `#!include` lines are not read in this version.
+    /// - `W0013`: the rule type cannot be matched on this platform in this
+    ///   version; nothing in the rule is wrong.
+    /// - `W0012`, `W0018`, `W0022`, `W0023`, `W0024`, `W0026`, `W0028`,
+    ///   `W0029`: many places for different reasons, and the message says
+    ///   what was done about each. `W0024` has two limits, a set's entries
+    ///   and a subscription's policies and lines, with different remedies.
+    /// - `W0031`: the cipher of an imported line is not the reader's to
+    ///   change, and the message of the profile's own line says to use an AEAD
+    ///   cipher.
+    /// - `I0001`, `I0002`, `I0003`: they inform.
+    pub fn hint(code: &str) -> Option<&'static str> {
+        Some(match code {
+            E_SYNTAX => "compare the line with the syntax the Surge manual gives for this section",
+            E_INCLUDE_NOT_FOUND => {
+                "check that the file named after `#!include` exists and can be read as text; a relative path starts at the profile's directory"
+            }
+            E_REQUIREMENT_SYNTAX => {
+                "write the condition as the Surge manual does, for example `#!REQUIREMENT CORE_VERSION>=22`"
+            }
+            E_UNKNOWN_POLICY_TYPE => {
+                "use a type the Surge manual lists for this section, and check its spelling"
+            }
+            E_BUILTIN_REDEFINED => {
+                "pick another name, or remove the line to keep the built-in policy"
+            }
+            E_DUPLICATE_NAME => "give every policy and policy group a name of its own",
+            E_UNKNOWN_POLICY_REF => {
+                "define the policy in `[Proxy]` or `[Proxy Group]`, or correct the name"
+            }
+            E_UNKNOWN_GROUP_MEMBER => {
+                "define the missing policy or group in `[Proxy]` or `[Proxy Group]`, or correct the name"
+            }
+            E_MISSING_FINAL => "add `FINAL,DIRECT` as the last rule",
+            E_INVALID_RULE_VALUE => "check the value against what the Surge manual allows for it",
+            E_UNKNOWN_RULE_TYPE => "check the rule type's spelling against the Surge manual",
+            E_LISTENER_NOT_IP => {
+                "write an IP address with an optional port: `127.0.0.1` listens on this machine only, `0.0.0.0` on every interface"
+            }
+            E_NESTING_TOO_DEEP => "flatten the logical rule, or split it into several rules",
+            E_INCLUDE_CYCLE => {
+                "simplify the `#!include` lines: a file cannot include itself, directly or through other files, and both the nesting and the number of files are limited"
+            }
+            E_INVALID_POLICY_PARAM => {
+                "check the parameter against the Surge manual's page for this policy or group type"
+            }
+            E_UNDERLYING_PROXY_CYCLE => {
+                "remove or change one of the `underlying-proxy` parameters on the loop"
+            }
+            E_KEYSTORE_REF => "name a `[Keystore]` item of the kind this parameter needs",
+            E_KEYSTORE_BASE64 => "encode the file as standard Base64 on a single line",
+            E_SET_KIND_CONFLICT | W_SET_KIND_CONFLICT => {
+                "use the resource as one kind of set only; when both kinds are needed, keep a separate copy for each"
+            }
+            W_UNKNOWN_KEY => "check the spelling against the Surge manual, or remove it",
+            W_UNKNOWN_SECTION => "check the section name's spelling against the Surge manual",
+            W_UNKNOWN_RULE_PARAM => "check the parameter's spelling against the Surge manual",
+            W_INVALID_HOST_LIST_ENTRY => "correct or remove the entry",
+            W_VANISHED_KEY => "remove the key",
+            W_UNKNOWN_DIRECTIVE => "check the directive's spelling against the Surge manual",
+            W_LINE_OUTSIDE_SECTION => "move the line under a `[Section]` header",
+            W_INCLUDE_SECTION_MISSING => {
+                "move the `#!include` line to a section the file has, or add that section to the file"
+            }
+            W_RULES_AFTER_FINAL => "move `FINAL` to the end of `[Rule]`",
+            W_DUPLICATE_RULESET => "remove one of the two sections, or give it another name",
+            W_DUPLICATE_FINAL => "keep a single `FINAL` rule",
+            W_SET_NESTING => {
+                "remove the reference to this set from the set that nests it, or flatten the sets"
+            }
+            W_GROUP_CYCLE => "remove the reference from one of the two groups to the other",
+            _ => return None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -233,6 +359,197 @@ mod tests {
 
     fn span(line: u32) -> Span {
         Span::new(Arc::from(Path::new("a.conf")), line)
+    }
+
+    /// The codes that have a default hint.
+    const WITH_DEFAULT: &[&str] = &[
+        codes::E_SYNTAX,
+        codes::E_INCLUDE_NOT_FOUND,
+        codes::E_REQUIREMENT_SYNTAX,
+        codes::E_UNKNOWN_POLICY_TYPE,
+        codes::E_BUILTIN_REDEFINED,
+        codes::E_DUPLICATE_NAME,
+        codes::E_UNKNOWN_POLICY_REF,
+        codes::E_UNKNOWN_GROUP_MEMBER,
+        codes::E_MISSING_FINAL,
+        codes::E_INVALID_RULE_VALUE,
+        codes::E_UNKNOWN_RULE_TYPE,
+        codes::E_LISTENER_NOT_IP,
+        codes::E_NESTING_TOO_DEEP,
+        codes::E_INCLUDE_CYCLE,
+        codes::E_INVALID_POLICY_PARAM,
+        codes::E_UNDERLYING_PROXY_CYCLE,
+        codes::E_KEYSTORE_REF,
+        codes::E_KEYSTORE_BASE64,
+        codes::E_SET_KIND_CONFLICT,
+        codes::W_UNKNOWN_KEY,
+        codes::W_UNKNOWN_SECTION,
+        codes::W_UNKNOWN_RULE_PARAM,
+        codes::W_INVALID_HOST_LIST_ENTRY,
+        codes::W_VANISHED_KEY,
+        codes::W_UNKNOWN_DIRECTIVE,
+        codes::W_LINE_OUTSIDE_SECTION,
+        codes::W_INCLUDE_SECTION_MISSING,
+        codes::W_RULES_AFTER_FINAL,
+        codes::W_DUPLICATE_RULESET,
+        codes::W_DUPLICATE_FINAL,
+        codes::W_SET_NESTING,
+        codes::W_GROUP_CYCLE,
+        codes::W_SET_KIND_CONFLICT,
+    ];
+
+    /// The codes whose every site carries a hint of its own.
+    const PER_SITE: &[&str] = &[codes::E_NOT_ALLOWED_HERE];
+
+    /// The codes without a hint; `codes::hint` says why beside its table.
+    const WITHOUT: &[&str] = &[
+        codes::E_GROUP_CYCLE,
+        codes::E_INVALID_DEFINITION,
+        codes::E_POLICY_BUILD,
+        codes::E_WIREGUARD_SECTION,
+        codes::W_PLATFORM_IGNORED,
+        codes::W_PROTOCOL_NOT_IMPLEMENTED,
+        codes::W_GROUP_NOT_IMPLEMENTED,
+        codes::W_IOS_BUILTIN_AS_DIRECT,
+        codes::W_DEVICE_POLICY_AS_REJECT,
+        codes::W_REMOTE_INCLUDE_UNSUPPORTED,
+        codes::W_INVALID_VALUE,
+        codes::W_RULE_NEVER_MATCHES,
+        codes::W_DEFERRED_SECTION,
+        codes::W_RULESET_LINE_SKIPPED,
+        codes::W_RESOURCE_UNAVAILABLE,
+        codes::W_SET_LINES_SKIPPED,
+        codes::W_SET_TRUNCATED,
+        codes::W_DNS_UPSTREAM_UNSUPPORTED,
+        codes::W_HOST_SCRIPT_SKIPPED,
+        codes::W_PARAM_NOT_APPLICABLE,
+        codes::W_PARAM_NOT_EFFECTIVE,
+        codes::W_STREAM_CIPHER,
+        codes::I_LEGACY_MIGRATED,
+        codes::I_LINE_DISABLED,
+        codes::I_GEOIP_DB_MISSING,
+    ];
+
+    /// The codes of `codes`, read off the source, so that a constant added
+    /// later has to be put on one of the lists above.
+    fn declared() -> Vec<&'static str> {
+        let source = include_str!("diagnostic.rs");
+        let from = source.find("pub mod codes {").expect("the codes module");
+        let to = from + source[from..].find("#[cfg(test)]").expect("the tests");
+        source[from..to]
+            .lines()
+            .filter(|line| line.trim_start().starts_with("pub const "))
+            .map(|line| line.split('"').nth(1).expect("a code in quotes"))
+            .collect()
+    }
+
+    #[test]
+    fn every_code_is_decided_once() {
+        let mut listed: Vec<&str> = WITH_DEFAULT
+            .iter()
+            .chain(PER_SITE)
+            .chain(WITHOUT)
+            .copied()
+            .collect();
+        listed.sort();
+        let all = listed.len();
+        listed.dedup();
+        assert_eq!(listed.len(), all, "a code is on two lists, or twice on one");
+        let mut declared = declared();
+        declared.sort();
+        assert_eq!(
+            listed, declared,
+            "a code in `codes` is on no list: give it a hint in `codes::hint`, or list it as one without"
+        );
+        for code in WITH_DEFAULT {
+            assert!(codes::hint(code).is_some(), "{code} has no default hint");
+        }
+        for code in PER_SITE.iter().chain(WITHOUT) {
+            assert_eq!(codes::hint(code), None, "{code} is not to have a default");
+        }
+        assert_eq!(codes::hint("E9999"), None);
+    }
+
+    #[test]
+    fn a_default_hint_is_one_plain_sentence() {
+        for code in WITH_DEFAULT {
+            let hint = codes::hint(code).unwrap_or_default();
+            assert!(!hint.is_empty(), "{code}");
+            assert!(!hint.ends_with('.'), "{code} ends with a full stop: {hint}");
+            assert!(
+                !hint.starts_with(|c: char| c.is_uppercase()),
+                "{code} starts with a capital: {hint}"
+            );
+            assert!(
+                !hint.contains(['{', '}']),
+                "{code} has a placeholder left: {hint}"
+            );
+            assert!(!hint.contains('\n'), "{code} is not one line: {hint}");
+            assert!(hint.is_ascii(), "{code}: {hint}");
+        }
+    }
+
+    #[test]
+    fn a_diagnostic_takes_the_default_hint_of_its_code() {
+        let said = codes::hint(codes::W_UNKNOWN_KEY).expect("W0001 has a hint");
+        for d in [
+            Diagnostic::error(codes::W_UNKNOWN_KEY, "m"),
+            Diagnostic::warning(codes::W_UNKNOWN_KEY, "m"),
+            Diagnostic::info(codes::W_UNKNOWN_KEY, "m"),
+        ] {
+            assert_eq!(d.hint.as_deref(), Some(said));
+        }
+        assert_eq!(Diagnostic::info(codes::I_LEGACY_MIGRATED, "m").hint, None);
+    }
+
+    #[test]
+    fn a_hint_of_its_own_replaces_the_default() {
+        let d = Diagnostic::warning(codes::W_UNKNOWN_KEY, "m").with_hint("say it this way");
+        assert_eq!(d.hint.as_deref(), Some("say it this way"));
+        assert!(d.to_string().ends_with("\n  hint: say it this way"));
+        let d = Diagnostic::warning(codes::W_PARAM_NOT_APPLICABLE, "m").with_hint("and this");
+        assert_eq!(d.hint.as_deref(), Some("and this"));
+    }
+
+    /// The one hint that existed before the table: its display is the same.
+    #[test]
+    fn a_missing_final_reads_as_it_always_did() {
+        let d = Diagnostic::error(codes::E_MISSING_FINAL, "missing FINAL rule").at(span(12));
+        assert_eq!(
+            d.to_string(),
+            "error[E0010] a.conf:12: missing FINAL rule\n  hint: add `FINAL,DIRECT` as the last rule"
+        );
+    }
+
+    #[test]
+    fn the_headline_is_the_display_without_the_hint() {
+        let d = Diagnostic::error(codes::E_MISSING_FINAL, "missing FINAL rule")
+            .at(span(12))
+            .with_hint("add something");
+        assert_eq!(
+            d.headline().to_string(),
+            "error[E0010] a.conf:12: missing FINAL rule"
+        );
+        assert_eq!(
+            d.to_string(),
+            "error[E0010] a.conf:12: missing FINAL rule\n  hint: add something"
+        );
+        let spanless = Diagnostic::warning(codes::W_UNKNOWN_KEY, "m");
+        assert_eq!(spanless.headline().to_string(), "warning[W0001]: m");
+    }
+
+    #[test]
+    fn a_parse_error_takes_the_default_hint_unless_it_has_its_own() {
+        let plain = Diagnostic::from_parse(ParseError::new(codes::E_SYNTAX, "m"), span(1));
+        assert_eq!(plain.hint.as_deref(), codes::hint(codes::E_SYNTAX));
+        let own = Diagnostic::from_parse(
+            ParseError::new(codes::E_NOT_ALLOWED_HERE, "m").with_hint("move it"),
+            span(1),
+        );
+        assert_eq!(own.hint.as_deref(), Some("move it"));
+        assert_eq!(own.severity, Severity::Error);
+        let none = Diagnostic::from_parse(ParseError::new(codes::E_NOT_ALLOWED_HERE, "m"), span(1));
+        assert_eq!(none.hint, None);
     }
 
     #[test]
@@ -269,5 +586,17 @@ mod tests {
         assert_eq!(json["code"], "W0001");
         assert_eq!(json["span"]["line"], 3);
         assert_eq!(json["span"]["file"], "a.conf");
+    }
+
+    #[test]
+    fn json_carries_the_hint() {
+        let with = serde_json::to_value(Diagnostic::warning(codes::W_UNKNOWN_KEY, "m")).unwrap();
+        assert_eq!(
+            with["hint"],
+            codes::hint(codes::W_UNKNOWN_KEY).expect("W0001 has a hint")
+        );
+        let without =
+            serde_json::to_value(Diagnostic::info(codes::I_LEGACY_MIGRATED, "m")).unwrap();
+        assert!(without["hint"].is_null());
     }
 }

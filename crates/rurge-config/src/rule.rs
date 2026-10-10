@@ -725,7 +725,8 @@ fn parse_subrule_depth(raw: &str, ctx: &ParseCtx, depth: usize) -> Result<SubRul
         return Err(ParseError::new(
             codes::E_NOT_ALLOWED_HERE,
             "FINAL is not allowed as a sub-rule or inside a rule set",
-        ));
+        )
+        .with_hint("use `FINAL` only as a top-level rule in `[Rule]`"));
     }
     let value = fields
         .get(1)
@@ -746,7 +747,8 @@ fn parse_subrule_depth(raw: &str, ctx: &ParseCtx, depth: usize) -> Result<SubRul
                 return Err(ParseError::new(
                     codes::E_NOT_ALLOWED_HERE,
                     "pre-matching is only allowed on top-level rules",
-                ));
+                )
+                .with_hint("put `pre-matching` on the top-level rule instead of the sub-rule"));
             }
             _ => sub.unknown.push(flag.clone()),
         }
@@ -785,12 +787,16 @@ pub fn parse_rule(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<Rule, ParseE
             return Err(ParseError::new(
                 codes::E_NOT_ALLOWED_HERE,
                 "pre-matching requires a REJECT-family policy",
-            ));
+            )
+            .with_hint("give the rule a REJECT policy, or remove `pre-matching`"));
         }
         if !kind.supports_pre_matching() {
             return Err(ParseError::new(
                 codes::E_NOT_ALLOWED_HERE,
                 format!("{ty} does not support pre-matching"),
+            )
+            .with_hint(
+                "remove `pre-matching`: the Surge manual allows it only on domain, IP, port, SUBNET, CELLULAR and set rules, and on logical rules made of them",
             ));
         }
     }
@@ -1085,6 +1091,37 @@ mod tests {
         );
         assert!(parse("NOT,((DOMAIN,a)),REJECT,pre-matching").is_ok());
         assert!(parse("OR,((DOMAIN,a),(IP-CIDR,10.0.0.0/8)),REJECT-DROP,pre-matching").is_ok());
+    }
+
+    /// `E0014` is said for four different reasons, each with the fix of its own.
+    #[test]
+    fn each_place_a_rule_part_is_not_allowed_says_what_to_do() {
+        let hint = |raw: &str| {
+            let err = parse(raw).unwrap_err();
+            assert_eq!(err.code, codes::E_NOT_ALLOWED_HERE, "{raw}");
+            err.hint.unwrap_or_else(|| panic!("{raw} has no hint"))
+        };
+        let says = [
+            (
+                "AND,((FINAL,DIRECT),(DOMAIN,a)),DIRECT",
+                "use `FINAL` only as a top-level rule in `[Rule]`",
+            ),
+            (
+                "AND,((DOMAIN,a,pre-matching),(DOMAIN,b)),REJECT",
+                "put `pre-matching` on the top-level rule instead of the sub-rule",
+            ),
+            (
+                "DOMAIN,a,Proxy,pre-matching",
+                "give the rule a REJECT policy, or remove `pre-matching`",
+            ),
+            (
+                "USER-AGENT,x,REJECT,pre-matching",
+                "remove `pre-matching`: the Surge manual allows it only on domain, IP, port, SUBNET, CELLULAR and set rules, and on logical rules made of them",
+            ),
+        ];
+        for (raw, want) in says {
+            assert_eq!(hint(raw), want, "{raw}");
+        }
     }
 
     /// A set's URL may carry a user name and a password. The rule's text —

@@ -770,7 +770,10 @@ peer = (public-key = n0tAKey, allowed-ips = 10.0.0.0/8, endpoint = a.test:1, pre
             }
         }
         assert!(
-            shown[3].ends_with("peer 1: a field without `=` ignored"),
+            shown[3].ends_with(&format!(
+                "peer 1: a field without `=` ignored\n  hint: {}",
+                codes::hint(codes::W_UNKNOWN_KEY).expect("W0001 has a hint")
+            )),
             "{shown:?}"
         );
         let s = ok(&format!(

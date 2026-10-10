@@ -1123,8 +1123,7 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
             let d = Diagnostic::error(
                 codes::E_MISSING_FINAL,
                 "the [Rule] section must end with an enabled FINAL rule",
-            )
-            .with_hint("add `FINAL,DIRECT` as the last rule");
+            );
             diags.push(match span {
                 Some(s) => d.at(s),
                 None => d,
@@ -1195,6 +1194,9 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
                                 named("policy", &p.name)
                             ),
                         )
+                        .with_hint(
+                            "choose a `local-port` that neither `http-listen` nor `socks5-listen` uses",
+                        )
                         .at(p.span.clone()),
                     );
                     outcome.spec = None;
@@ -1209,6 +1211,7 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
                                 named("policy", first)
                             ),
                         )
+                        .with_hint("give every `external` policy a `local-port` of its own")
                         .at(p.span.clone()),
                     );
                     outcome.spec = None;
@@ -1736,6 +1739,72 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
         assert!(codes_of(&l).contains(&codes::E_MISSING_FINAL));
     }
 
+    /// The hint of `E0010` reads as it did when the site gave it itself.
+    #[test]
+    fn a_missing_final_is_printed_with_the_hint_it_always_had() {
+        let l = load_text("[Rule]\nDOMAIN,a,DIRECT\n");
+        let d = l
+            .diagnostics
+            .iter()
+            .find(|d| d.code == codes::E_MISSING_FINAL)
+            .expect("E0010");
+        assert_eq!(
+            d.to_string(),
+            "error[E0010] /profiles/t.conf:2: the [Rule] section must end with an enabled FINAL rule\n  hint: add `FINAL,DIRECT` as the last rule"
+        );
+    }
+
+    /// A parse error that carries a hint of its own keeps it on its way into
+    /// the report, where its code has no default to give.
+    #[test]
+    fn a_rule_part_in_the_wrong_place_is_reported_with_the_hint_of_its_site() {
+        let l = load_text("[Rule]\nUSER-AGENT,x,REJECT,pre-matching\nFINAL,DIRECT\n");
+        let d = l
+            .diagnostics
+            .iter()
+            .find(|d| d.code == codes::E_NOT_ALLOWED_HERE)
+            .expect("E0014");
+        assert_eq!(codes::hint(d.code), None);
+        let hint = d.hint.as_deref().expect("the site's own hint");
+        assert!(hint.starts_with("remove `pre-matching`"), "{hint}");
+    }
+
+    /// Whichever way a site builds its diagnostic — from a parse error, from
+    /// a parameter reader, in the loader itself —, it has the hint of its
+    /// code, and a code without one stays without.
+    #[test]
+    fn a_load_gives_each_diagnostic_the_hint_of_its_code() {
+        let l = load_text(
+            "stray line\n[General]\nmystery = 1\nvif-mode = on\ncompatibility-mode = true\n\
+[Nowhere]\nx = 1\n[MITM]\nx = 1\n\
+[Proxy]\nA = nope, h.test, 1\nB = http, h.test, 80, bogus=1\nB = http, h.test, 81\n\
+[Rule]\nDOMAIN,a,Missing\nFOO,a,DIRECT\nFINAL,DIRECT\nFINAL,DIRECT\nDOMAIN,z,DIRECT\n",
+        );
+        for d in l.diagnostics.iter() {
+            assert_eq!(d.hint.as_deref(), codes::hint(d.code), "{d}");
+        }
+        for (code, has_one) in [
+            (codes::W_LINE_OUTSIDE_SECTION, true),
+            (codes::W_UNKNOWN_KEY, true),
+            (codes::W_VANISHED_KEY, true),
+            (codes::W_UNKNOWN_SECTION, true),
+            (codes::E_UNKNOWN_POLICY_TYPE, true),
+            (codes::E_DUPLICATE_NAME, true),
+            (codes::E_UNKNOWN_POLICY_REF, true),
+            (codes::E_UNKNOWN_RULE_TYPE, true),
+            (codes::W_DUPLICATE_FINAL, true),
+            (codes::W_RULES_AFTER_FINAL, true),
+            (codes::W_PLATFORM_IGNORED, false),
+            (codes::W_DEFERRED_SECTION, false),
+        ] {
+            let found: Vec<&Diagnostic> = l.diagnostics.iter().filter(|d| d.code == code).collect();
+            assert!(!found.is_empty(), "{code} is not reported");
+            for d in found {
+                assert_eq!(d.hint.is_some(), has_one, "{d}");
+            }
+        }
+    }
+
     /// A system tag holds a line to its system wherever it is written. At the
     /// start of a line it has to get past the section parser first, which takes
     /// every other `#!` line for a directive of its own: dropped in a section,
@@ -2207,6 +2276,11 @@ C = external, exec=/bin/c, local-port=1080\n[Rule]\nFINAL,DIRECT\n",
             errors[0].message,
             "policy `C`: `local-port` 1080 is also the `local-port` of policy `A`"
         );
+        // the manual's page for the policy says nothing of a clash between two
+        assert_eq!(
+            errors[0].hint.as_deref(),
+            Some("give every `external` policy a `local-port` of its own")
+        );
         assert_eq!(errors[0].span.as_ref().map(|s| s.line), Some(4));
         assert!(loaded.config.spec("A").is_some() && loaded.config.spec("B").is_some());
         assert!(loaded.config.spec("C").is_none());
@@ -2243,6 +2317,16 @@ C = external, exec=/bin/c, local-port=7000\n[Rule]\nFINAL,DIRECT\n",
                 ),
             ]
         );
+        for d in loaded
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::E_INVALID_POLICY_PARAM)
+        {
+            assert_eq!(
+                d.hint.as_deref(),
+                Some("choose a `local-port` that neither `http-listen` nor `socks5-listen` uses")
+            );
+        }
         assert!(loaded.config.spec("A").is_none() && loaded.config.spec("B").is_none());
         assert!(loaded.config.spec("C").is_some());
     }

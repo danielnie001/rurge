@@ -869,13 +869,16 @@ async fn profiles_current_check_and_reload() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["ok"], false);
     assert!(body["errors"].as_u64().unwrap() >= 1);
-    assert!(
-        body["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|d| d["code"] == "E0007"),
-        "{body}"
+    let unknown_policy = body["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["code"] == "E0007")
+        .unwrap_or_else(|| panic!("{body}"));
+    // what to do about it travels with the diagnostic
+    assert_eq!(
+        unknown_policy["hint"],
+        rurge_config::codes::hint("E0007").expect("E0007 has a hint")
     );
     let (head, _) = get_via_proxy(api.http(), &api.target_url()).await;
     assert!(head.starts_with("HTTP/1.1 200"), "still serving: {head}");
