@@ -12,8 +12,8 @@
 //! its scheme and its authority only.
 
 use crate::policy::PolicyKind;
-use crate::requirement::split_line_slice;
-use crate::text::{directive_name, is_comment, is_requirement_prefix, strip_inline_comment};
+use crate::requirement::{is_requirement_prefix, split_line_slice};
+use crate::text::{directive_name, is_comment, strip_inline_comment};
 use crate::value::{parse_key_value, split_list};
 
 /// Keys whose whole value is a secret when they stand alone on a line
@@ -2676,6 +2676,43 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
             (
                 "#!MACOS-ONLY #!MANAGED-CONFIG https://provider.test/t0k3n interval=60",
                 "#!MACOS-ONLY #!MANAGED-CONFIG *** interval=60",
+            ),
+        ] {
+            assert_eq!(redact_profile(line), shown, "{line:?}");
+        }
+    }
+
+    /// `#!WINDOWS-ONLY` and `#!LINUX-ONLY` are requirement directives like the
+    /// other three, in front of a line and at its end: kept as written, and the
+    /// line they stand on is redacted as any other.
+    #[test]
+    fn the_windows_and_linux_tags_are_requirement_directives_too() {
+        for (line, shown) in [
+            (
+                "#!WINDOWS-ONLY http-api = key@127.0.0.1:6170",
+                "#!WINDOWS-ONLY http-api = ***@127.0.0.1:6170",
+            ),
+            (
+                "#!LINUX-ONLY http-api = key@127.0.0.1:6170",
+                "#!LINUX-ONLY http-api = ***@127.0.0.1:6170",
+            ),
+            (
+                "#!WINDOWS-ONLY P = http, h.test, 80, alice, hunter2",
+                "#!WINDOWS-ONLY P = http, h.test, 80, ***, ***",
+            ),
+            (
+                "http-api = key@127.0.0.1:6170 #!WINDOWS-ONLY",
+                "http-api = ***@127.0.0.1:6170 #!WINDOWS-ONLY",
+            ),
+            (
+                "P = http, h.test, 80, alice, hunter2 //!LINUX-ONLY",
+                "P = http, h.test, 80, ***, *** //!LINUX-ONLY",
+            ),
+            // the tag alone, and one in front of a line with nothing to hide
+            ("#!LINUX-ONLY", "#!LINUX-ONLY"),
+            (
+                "#!WINDOWS-ONLY RULE-SET,https://example.com/a.list,Proxy",
+                "#!WINDOWS-ONLY RULE-SET,https://example.com/a.list,Proxy",
             ),
         ] {
             assert_eq!(redact_profile(line), shown, "{line:?}");

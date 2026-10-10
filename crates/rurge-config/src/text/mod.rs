@@ -244,12 +244,6 @@ fn section_header(line: &str) -> Option<&str> {
     (!inner.is_empty()).then_some(inner)
 }
 
-pub(crate) fn is_requirement_prefix(line: &str) -> bool {
-    ["#!REQUIREMENT", "#!IOS-ONLY", "#!MACOS-ONLY", "#!TVOS-ONLY"]
-        .iter()
-        .any(|p| line.starts_with(p))
-}
-
 /// Parse profile text. Never fails; problems are reported as diagnostics.
 pub fn parse_str(text: &str, file: Arc<Path>, origin: Origin) -> (Profile, Diagnostics) {
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
@@ -281,7 +275,7 @@ pub fn parse_str(text: &str, file: Arc<Path>, origin: Origin) -> (Profile, Diagn
         }
         if trimmed.starts_with("#!")
             && !trimmed.starts_with("#!include")
-            && !is_requirement_prefix(trimmed)
+            && !requirement::is_requirement_prefix(trimmed)
         {
             match current.as_mut() {
                 None => profile.header.push(Directive {

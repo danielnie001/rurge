@@ -1718,6 +1718,69 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
         assert!(codes_of(&l).contains(&codes::E_MISSING_FINAL));
     }
 
+    /// A system tag holds a line to its system wherever it is written. At the
+    /// start of a line it has to get past the section parser first, which takes
+    /// every other `#!` line for a directive of its own: dropped in a section,
+    /// kept in the header before the first one.
+    #[test]
+    fn a_system_tag_gates_a_line_as_loaded() {
+        let load_on = |system: &str, text: &str| {
+            let mut opts = LoadOptions::for_tests();
+            opts.environment.system = system.to_string();
+            from_text(text, Path::new("/profiles/t.conf"), &opts)
+        };
+        for (tag, own) in [
+            ("IOS-ONLY", "iOS"),
+            ("LINUX-ONLY", "Linux"),
+            ("MACOS-ONLY", "macOS"),
+            ("TVOS-ONLY", "tvOS"),
+            ("WINDOWS-ONLY", "Windows"),
+        ] {
+            for line in [
+                format!("#!{tag} DOMAIN,a.example,DIRECT"),
+                format!("DOMAIN,a.example,DIRECT #!{tag}"),
+                format!("DOMAIN,a.example,DIRECT //!{tag}"),
+            ] {
+                for system in ["iOS", "Linux", "macOS", "tvOS", "Windows"] {
+                    let l = load_on(system, &format!("[Rule]\n{line}\nFINAL,DIRECT\n"));
+                    let codes = codes_of(&l);
+                    assert!(
+                        !l.diagnostics.has_errors(),
+                        "{line:?} on {system}: {codes:?}"
+                    );
+                    assert!(
+                        !codes.contains(&codes::W_UNKNOWN_DIRECTIVE),
+                        "{line:?} on {system}: {codes:?}"
+                    );
+                    let active = system == own;
+                    assert_eq!(
+                        l.config.rules.len(),
+                        if active { 2 } else { 1 },
+                        "{line:?} on {system}"
+                    );
+                    assert_eq!(
+                        codes.contains(&codes::I_LINE_DISABLED),
+                        !active,
+                        "{line:?} on {system}: {codes:?}"
+                    );
+                }
+            }
+            // before the first section header the line is in no section, as
+            // it is for every tag, and is not a directive of the header
+            let l = load_on(
+                own,
+                &format!("#!{tag} DOMAIN,a.example,DIRECT\n[Rule]\nFINAL,DIRECT\n"),
+            );
+            let codes = codes_of(&l);
+            assert!(
+                codes.contains(&codes::W_LINE_OUTSIDE_SECTION)
+                    && !codes.contains(&codes::W_UNKNOWN_DIRECTIVE),
+                "{tag}: {codes:?}"
+            );
+            assert_eq!(l.config.rules.len(), 1, "{tag}");
+        }
+    }
+
     #[test]
     fn dead_rules_after_last_final_are_counted() {
         // The last FINAL takes effect (manual: "if there are multiple FINAL

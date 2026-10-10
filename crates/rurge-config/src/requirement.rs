@@ -341,11 +341,23 @@ pub fn eval(expr: &Expr, env: &Environment) -> bool {
     }
 }
 
-const SIMPLIFIED: [(&str, &str); 3] = [
+const SIMPLIFIED: [(&str, &str); 5] = [
     ("IOS-ONLY", "SYSTEM == 'iOS'"),
+    ("LINUX-ONLY", "SYSTEM == 'Linux'"),
     ("MACOS-ONLY", "SYSTEM == 'macOS'"),
     ("TVOS-ONLY", "SYSTEM == 'tvOS'"),
+    ("WINDOWS-ONLY", "SYSTEM == 'Windows'"),
 ];
+
+/// Whether `line` starts with a requirement directive: `#!REQUIREMENT` or the
+/// `#!` form of a simplified tag. The section parser asks this before it takes
+/// a `#!` line for a directive of its own, and reads the tags from the table
+/// `split_line` reads, so the two cannot disagree about which there are.
+pub(crate) fn is_requirement_prefix(line: &str) -> bool {
+    line.strip_prefix("#!").is_some_and(|rest| {
+        rest.starts_with("REQUIREMENT") || SIMPLIFIED.iter().any(|(tag, _)| rest.starts_with(tag))
+    })
+}
 
 /// Take the expression at the start of `rest`: a quoted string, or the first whitespace-delimited token.
 fn take_expr(rest: &str) -> Result<(String, &str), ReqError> {
@@ -585,6 +597,85 @@ mod tests {
         );
         assert_eq!(ok("plain line"), (None, "plain line".into()));
         assert!(split_line("x #!REQUIREMENT").is_err());
+    }
+
+    /// Every system a tag can be held against; the tag names one of them.
+    const SYSTEMS: [&str; 5] = ["iOS", "Linux", "macOS", "tvOS", "Windows"];
+
+    /// Whether the requirement of `line`, written in a `[Rule]` section and read
+    /// by the section parser, is not met on `system`.
+    fn disabled_on(line: &str, system: &str) -> bool {
+        use crate::text::{Origin, parse_str};
+        use std::path::Path;
+        use std::sync::Arc;
+        let text = format!("[Rule]\n{line}\nFINAL,DIRECT\n");
+        let (mut p, mut d) = parse_str(&text, Arc::from(Path::new("t.conf")), Origin::Main);
+        let env = Environment {
+            system: system.to_string(),
+            ..env()
+        };
+        apply(&mut p, &env, &mut d);
+        assert!(
+            !d.iter().any(|x| x.code == codes::W_UNKNOWN_DIRECTIVE),
+            "{line:?}: {:?}",
+            d.into_vec()
+        );
+        let entries = &p.section("Rule").unwrap().entries;
+        assert_eq!(entries.len(), 2, "{line:?}");
+        assert_eq!(entries[0].raw, "DOMAIN,a.example,DIRECT", "{line:?}");
+        entries[0].disabled
+    }
+
+    #[test]
+    fn each_tag_holds_a_line_to_its_own_system_only() {
+        for (tag, own) in [
+            ("IOS-ONLY", "iOS"),
+            ("LINUX-ONLY", "Linux"),
+            ("MACOS-ONLY", "macOS"),
+            ("TVOS-ONLY", "tvOS"),
+            ("WINDOWS-ONLY", "Windows"),
+        ] {
+            for line in [
+                format!("#!{tag} DOMAIN,a.example,DIRECT"),
+                format!("DOMAIN,a.example,DIRECT #!{tag}"),
+                format!("DOMAIN,a.example,DIRECT //!{tag}"),
+            ] {
+                for system in SYSTEMS {
+                    assert_eq!(
+                        disabled_on(&line, system),
+                        system != own,
+                        "{line:?} on {system}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn windows_only_and_linux_only_are_simplified_requirements() {
+        let ok = |l: &str| split_line(l).unwrap();
+        for (tag, system) in [("WINDOWS-ONLY", "Windows"), ("LINUX-ONLY", "Linux")] {
+            let expression = Some(format!("SYSTEM == '{system}'"));
+            for line in [
+                format!("#!{tag} DOMAIN,a,REJECT"),
+                format!("DOMAIN,a,REJECT #!{tag}"),
+                format!("DOMAIN,a,REJECT //!{tag}"),
+            ] {
+                assert_eq!(
+                    ok(&line),
+                    (expression.clone(), "DOMAIN,a,REJECT".into()),
+                    "{line:?}"
+                );
+            }
+            // a name that only starts like the tag is none
+            for line in [
+                format!("#!{tag}X DOMAIN,a,REJECT"),
+                format!("DOMAIN,a,REJECT #!{tag}X"),
+                format!("DOMAIN,a,REJECT //!{tag}X"),
+            ] {
+                assert_eq!(ok(&line), (None, line.clone()), "{line:?}");
+            }
+        }
     }
 
     #[test]
