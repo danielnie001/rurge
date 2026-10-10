@@ -307,6 +307,7 @@ impl RuleEngine {
         }
         for (pos, rule) in self.rules.iter().enumerate() {
             let started = Instant::now();
+            ctx.sub_hit = None;
             let mut verdict = self.eval_rule(rule, s, &mut ctx);
             if verdict == Verdict::NeedsResolve {
                 let host = s.dst_host.as_domain().unwrap_or_default().to_string();
@@ -1018,6 +1019,170 @@ DOMAIN-SUFFIX,apple.com,DIRECT\nFINAL,P\n";
             .await;
         assert_eq!(d.notes.len(), 1, "{:?}", d.notes);
         assert_eq!(e.rules()[2].hits(), 1);
+    }
+
+    /// `X` lists `hit.example`; the logical rules below are written so that
+    /// the set matches while the rule, or the branch the set stands in, does
+    /// not.
+    const HIT_CONF: &str = "\
+[Proxy]
+P = direct
+[Rule]
+AND,((RULE-SET,X),(DEST-PORT,1)),REJECT
+DOMAIN,hit.example,P
+FINAL,DIRECT
+[Ruleset X]
+DOMAIN,hit.example
+";
+
+    async fn sub_rule_of(e: &RuleEngine, host: &str) -> (Option<usize>, Option<(String, String)>) {
+        let d = e
+            .evaluate(&session(host), OutboundMode::Rule, &NoResolve)
+            .await;
+        (d.matched, d.sub_rule.map(|h| (h.set, h.entry)))
+    }
+
+    fn hit(set: &str, entry: &str) -> Option<(String, String)> {
+        Some((set.to_string(), entry.to_string()))
+    }
+
+    /// A rule that did not match cannot hand the hit of its set on to the
+    /// next rule that does.
+    #[tokio::test]
+    async fn a_rule_that_did_not_match_leaves_no_sub_rule_for_the_next() {
+        let e = engine(HIT_CONF);
+        assert_eq!(sub_rule_of(&e, "hit.example").await, (Some(1), None));
+    }
+
+    /// Inside one rule, a branch that did not decide the match leaves no hit
+    /// either: here the set matches but the port does not, and the `DOMAIN`
+    /// half is what makes the `OR` match.
+    #[tokio::test]
+    async fn a_branch_that_did_not_decide_the_rule_leaves_no_sub_rule() {
+        let e = engine(
+            "[Proxy]\nP = direct\n[Rule]\n\
+OR,((AND,((RULE-SET,X),(DEST-PORT,1))),(DOMAIN,hit.example)),P\nFINAL,DIRECT\n\
+[Ruleset X]\nDOMAIN,hit.example\n",
+        );
+        assert_eq!(sub_rule_of(&e, "hit.example").await, (Some(0), None));
+    }
+
+    /// What matched inside a `NOT` is not why the rule matched.
+    #[tokio::test]
+    async fn a_not_carries_no_sub_rule() {
+        let e = engine(
+            "[Proxy]\nP = direct\n[Rule]\nNOT,((RULE-SET,X)),REJECT\n\
+DOMAIN,hit.example,P\nFINAL,DIRECT\n[Ruleset X]\nDOMAIN,hit.example\n",
+        );
+        // the set matches, so the NOT does not: the next rule has no hit of its own
+        assert_eq!(sub_rule_of(&e, "hit.example").await, (Some(1), None));
+        // the set misses, so the NOT matches, with nothing to name
+        assert_eq!(sub_rule_of(&e, "other.example").await, (Some(0), None));
+    }
+
+    /// The hit of a pre-matching rule that missed is not the next flagged
+    /// rule's.
+    #[tokio::test]
+    async fn the_pre_pass_does_not_hand_a_hit_on_either() {
+        let e = engine(
+            "[Proxy]\nP = direct\n[Rule]\n\
+AND,((RULE-SET,X),(DEST-PORT,1)),REJECT,pre-matching\n\
+DOMAIN,hit.example,REJECT,pre-matching\nFINAL,DIRECT\n[Ruleset X]\nDOMAIN,hit.example\n",
+        );
+        let d = e
+            .evaluate(&session("hit.example"), OutboundMode::Rule, &NoResolve)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::PreMatching, Some(1)));
+        assert!(d.sub_rule.is_none());
+    }
+
+    /// The hit that survives is the one of a set that took part in the match.
+    #[tokio::test]
+    async fn the_sub_rule_is_the_set_that_made_the_rule_match() {
+        let e = engine(
+            "[Proxy]\nP = direct\n[Rule]\n\
+AND,((RULE-SET,X),(DOMAIN-KEYWORD,example)),P\n\
+OR,((RULE-SET,X),(RULE-SET,Y)),P\nFINAL,DIRECT\n\
+[Ruleset X]\nDOMAIN,x.example\n[Ruleset Y]\nDOMAIN,y.example\n",
+        );
+        // the other half of the AND adds nothing, and takes nothing
+        assert_eq!(
+            sub_rule_of(&e, "x.example").await,
+            (Some(0), hit("X", "DOMAIN,x.example"))
+        );
+        // an OR carries the set that matched, not the one that was tried first
+        assert_eq!(
+            sub_rule_of(&e, "y.example").await,
+            (Some(1), hit("Y", "DOMAIN,y.example"))
+        );
+        // a logical rule inside the AND that matches without a set of its own
+        // does not take away the hit of the set beside it
+        let e = engine(
+            "[Proxy]\nP = direct\n[Rule]\n\
+AND,((RULE-SET,Y),(OR,((DEST-PORT,1),(DEST-PORT,443)))),P\nFINAL,DIRECT\n\
+[Ruleset Y]\nDOMAIN,y.example\n",
+        );
+        assert_eq!(
+            sub_rule_of(&e, "y.example").await,
+            (Some(0), hit("Y", "DOMAIN,y.example"))
+        );
+    }
+
+    /// A rule that has to resolve before it can match names the line it
+    /// matched afterwards.
+    #[tokio::test]
+    async fn a_rule_set_that_needs_a_lookup_names_the_line_the_lookup_matched() {
+        let e = engine(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,Ips,P\nFINAL,DIRECT\n\
+[Ruleset Ips]\nIP-CIDR,172.16.0.0/12\n",
+        );
+        let d = e
+            .evaluate(
+                &session("host.example"),
+                OutboundMode::Rule,
+                &Counting::v4("172.16.1.1"),
+            )
+            .await;
+        assert_eq!(d.matched, Some(0));
+        let found = d.sub_rule.expect("the line the lookup made match");
+        assert_eq!(
+            (found.set.as_str(), found.entry.as_str()),
+            ("Ips", "IP-CIDR,172.16.0.0/12")
+        );
+    }
+
+    /// The set of an `AND` matches before the lookup its other half asks
+    /// for, and again after it: the hit is the one of the evaluation that
+    /// matched.
+    #[tokio::test]
+    async fn a_set_beside_a_lookup_keeps_its_hit_once_the_rule_matches() {
+        let e = engine(
+            "[Proxy]\nP = direct\n[Rule]\nAND,((RULE-SET,X),(IP-CIDR,10.0.0.0/8)),P\nFINAL,DIRECT\n\
+[Ruleset X]\nDOMAIN,hit.example\n",
+        );
+        let d = e
+            .evaluate(
+                &session("hit.example"),
+                OutboundMode::Rule,
+                &Counting::v4("10.9.9.9"),
+            )
+            .await;
+        assert_eq!(d.matched, Some(0));
+        let found = d.sub_rule.expect("the set of the rule that resolved");
+        assert_eq!(
+            (found.set.as_str(), found.entry.as_str()),
+            ("X", "DOMAIN,hit.example")
+        );
+        // and when the lookup then says no, nothing is left of the set's hit
+        let d = e
+            .evaluate(
+                &session("hit.example"),
+                OutboundMode::Rule,
+                &Counting::v4("11.9.9.9"),
+            )
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::Final, Some(1)));
+        assert!(d.sub_rule.is_none());
     }
 
     #[test]

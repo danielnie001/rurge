@@ -33,6 +33,7 @@ pub struct SessionHandle {
     rule: Mutex<Option<String>>,
     policy_chain: Mutex<Vec<String>>,
     error: Mutex<Option<String>>,
+    notes: Mutex<Vec<String>>,
     sni: Mutex<Option<String>>,
     protocol: Mutex<Option<ProtocolKind>>,
     up: AtomicU64,
@@ -71,6 +72,7 @@ impl SessionHandle {
             rule: Mutex::new(None),
             policy_chain: Mutex::new(Vec::new()),
             error: Mutex::new(None),
+            notes: Mutex::new(Vec::new()),
             sni: Mutex::new(None),
             protocol: Mutex::new(None),
             up: AtomicU64::new(0),
@@ -139,6 +141,17 @@ impl SessionHandle {
 
     pub fn error(&self) -> Option<String> {
         self.error.lock().expect("session error").clone()
+    }
+
+    /// A remark on how the session was handled that is no explanation of a
+    /// failure (which sub-rule matched, say): the request record lists them,
+    /// oldest first, apart from the `error`.
+    pub fn add_note(&self, note: impl Into<String>) {
+        self.notes.lock().expect("session notes").push(note.into());
+    }
+
+    pub fn notes(&self) -> Vec<String> {
+        self.notes.lock().expect("session notes").clone()
     }
 
     /// The sniffed TLS SNI, filled by the engine's relay path (M3b).
@@ -437,6 +450,17 @@ mod tests {
         assert_eq!(h.outcome(), Some(SessionOutcome::Completed));
         assert_eq!(h.rule().as_deref(), Some("DOMAIN,a.test,DIRECT"));
         assert_eq!(h.policy_chain(), vec!["DIRECT".to_string()]);
+    }
+
+    #[test]
+    fn notes_are_kept_in_order_and_apart_from_the_error() {
+        let h = SessionHandle::new(1, SessionInfo::tcp(HostName::parse("a.test"), 443));
+        assert!(h.notes().is_empty());
+        h.add_note("first");
+        h.set_error("why it failed");
+        h.add_note(String::from("second"));
+        assert_eq!(h.notes(), ["first", "second"]);
+        assert_eq!(h.error().as_deref(), Some("why it failed"));
     }
 
     #[tokio::test]

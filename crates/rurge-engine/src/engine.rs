@@ -611,7 +611,8 @@ impl Engine {
     }
 
     /// Mode / rule → policy, shared by `dial`, `dial_internal` and the UDP
-    /// flows (M4 §4.1).
+    /// flows (M4 §4.1). When a line of a set decided the rule, the session's
+    /// log line and its notes say which.
     pub(crate) async fn choose_policy(
         &self,
         rt: &Runtime,
@@ -645,6 +646,11 @@ impl Engine {
             .await;
         if let Some(i) = decision.matched {
             handle.set_rule(rule_raw(&rt.rules, i));
+        }
+        if let Some(hit) = &decision.sub_rule {
+            let note = format!("Sub-rule matched: {} (in {})", hit.entry, hit.set);
+            tracing::debug!(session = handle.id(), "{note}");
+            handle.add_note(note);
         }
         match decision.outcome {
             Outcome::Policy(p) => Chosen::Policy(p),

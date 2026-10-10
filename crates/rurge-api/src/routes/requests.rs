@@ -61,6 +61,7 @@ pub struct RequestJson {
     pub status: &'static str,
     pub reject_kind: Option<String>,
     pub error: Option<String>,
+    pub notes: Vec<String>,
 }
 
 impl From<&RequestRecord> for RequestJson {
@@ -93,6 +94,7 @@ impl From<&RequestRecord> for RequestJson {
             status,
             reject_kind,
             error: r.error.clone(),
+            notes: r.notes.clone(),
         }
     }
 }
@@ -196,6 +198,7 @@ mod tests {
             first_byte_ms: None,
             status: RecordStatus::Active,
             error: None,
+            notes: vec![],
         }
     }
 
@@ -226,6 +229,20 @@ mod tests {
         assert_eq!(j.status, "rejected");
         assert_eq!(j.reject_kind.as_deref(), Some("REJECT-TINYGIF"));
         assert_eq!(j.protocol, Some("mtproto"));
+    }
+
+    /// `notes` is always a list, empty when the session has none.
+    #[test]
+    fn notes_are_a_list() {
+        let mut r = record(1, ListenerKind::Http);
+        let v = serde_json::to_value(RequestJson::from(&r)).unwrap();
+        assert_eq!(v["notes"], json!([]));
+        r.notes = vec!["Sub-rule matched: DOMAIN,a.test (in S)".to_string()];
+        let v = serde_json::to_value(RequestJson::from(&r)).unwrap();
+        assert_eq!(
+            v["notes"],
+            json!(["Sub-rule matched: DOMAIN,a.test (in S)"])
+        );
     }
 
     /// The two timing fields (M3c design 4.1): `null` until the moment has

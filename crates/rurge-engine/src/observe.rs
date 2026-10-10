@@ -47,6 +47,9 @@ pub struct RequestRecord {
     pub first_byte_ms: Option<u64>,
     pub status: RecordStatus,
     pub error: Option<String>,
+    /// Remarks on how the session was handled that explain no failure — which
+    /// sub-rule of a set matched. `error` keeps the explanations.
+    pub notes: Vec<String>,
 }
 
 fn unix_millis() -> u64 {
@@ -90,6 +93,7 @@ fn record_of(h: &SessionHandle, outcome: Option<&SessionOutcome>) -> RequestReco
         first_byte_ms: h.first_byte_time().map(|d| d.as_millis() as u64),
         status,
         error,
+        notes: h.notes(),
     }
 }
 
@@ -385,6 +389,25 @@ mod tests {
         assert_eq!((recent[0].up, recent[0].down), (10, 20));
         assert_eq!(recent[0].status, RecordStatus::Completed);
         assert_eq!(recent[0].rule.as_deref(), Some("DOMAIN,a.test,DIRECT"));
+    }
+
+    /// The notes of a session reach its record, in flight and finished, apart
+    /// from the `error`.
+    #[test]
+    fn a_record_lists_the_notes_of_its_session() {
+        let log = RequestLog::new(2);
+        let t = TrafficStats::new();
+        let a = handle(1, "a.test");
+        log.mark_active(&a);
+        assert!(log.active()[0].notes.is_empty());
+        a.add_note("first");
+        a.add_note("second");
+        assert_eq!(log.active()[0].notes, ["first", "second"]);
+        a.finish(SessionOutcome::Completed);
+        log.record_finished(&a, &SessionOutcome::Completed, &t);
+        let recent = log.recent(1);
+        assert_eq!(recent[0].notes, ["first", "second"]);
+        assert_eq!(recent[0].error, None);
     }
 
     #[test]

@@ -61,7 +61,9 @@ pub struct EvalCtx<'a> {
     /// Runtime notes (unsupported rule kinds, missing databases); the engine
     /// de-duplicates them per rule.
     pub notes: Vec<String>,
-    /// Filled by `Matcher::Set` on a match (FR-RULE-15).
+    /// Filled by `Matcher::Set` on a match (FR-RULE-15). The engine clears it
+    /// before each rule; the logical matchers see to it that a rule leaves
+    /// only the hit of a set that is part of why it matched.
     pub sub_hit: Option<SubRuleHit>,
     geo: &'a dyn GeoLookup,
     country_cache: Option<(IpAddr, Option<[u8; 2]>)>,
@@ -108,6 +110,20 @@ impl<'a> EvalCtx<'a> {
         let asn = self.geo.asn(ip);
         self.asn_cache = Some((ip, asn));
         asn
+    }
+
+    /// Runs `eval`, the branches of an `AND` / `OR`. A hit is only the reason
+    /// the rule matched when the branch that wrote it is part of the match —
+    /// one that did not decide anything (an `AND` that failed on its other
+    /// half) leaves `sub_hit` as it found it. The hit found on entry is moved
+    /// aside and back, not cloned.
+    fn in_branches(&mut self, eval: impl FnOnce(&mut Self) -> Verdict) -> Verdict {
+        let found = self.sub_hit.take();
+        let verdict = eval(self);
+        if verdict != Verdict::Match || self.sub_hit.is_none() {
+            self.sub_hit = found;
+        }
+        verdict
     }
 }
 
@@ -329,7 +345,7 @@ impl Matcher {
                 ))
             .into(),
             Matcher::HostnameType(t) => (s.hostname_type() == *t).into(),
-            Matcher::And(subs) => {
+            Matcher::And(subs) => ctx.in_branches(|ctx| {
                 let mut needs = false;
                 for sub in subs {
                     match sub.eval(s, ctx) {
@@ -343,8 +359,8 @@ impl Matcher {
                 } else {
                     Verdict::Match
                 }
-            }
-            Matcher::Or(subs) => {
+            }),
+            Matcher::Or(subs) => ctx.in_branches(|ctx| {
                 let mut needs = false;
                 for sub in subs {
                     match sub.eval(s, ctx) {
@@ -358,12 +374,18 @@ impl Matcher {
                 } else {
                     Verdict::NoMatch
                 }
+            }),
+            Matcher::Not(sub) => {
+                // what matched inside a NOT is not what matched the rule
+                let found = ctx.sub_hit.take();
+                let verdict = sub.eval(s, ctx);
+                ctx.sub_hit = found;
+                match verdict {
+                    Verdict::Match => Verdict::NoMatch,
+                    Verdict::NoMatch => Verdict::Match,
+                    Verdict::NeedsResolve => Verdict::NeedsResolve,
+                }
             }
-            Matcher::Not(sub) => match sub.eval(s, ctx) {
-                Verdict::Match => Verdict::NoMatch,
-                Verdict::NoMatch => Verdict::Match,
-                Verdict::NeedsResolve => Verdict::NeedsResolve,
-            },
             Matcher::Set(set) => {
                 if ctx.set_depth >= MAX_NESTING {
                     // Should be unreachable for any graph `SetRegistry` built

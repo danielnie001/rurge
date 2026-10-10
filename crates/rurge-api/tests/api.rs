@@ -644,6 +644,40 @@ async fn recent_and_active_requests_and_kill() {
     .await;
 }
 
+/// `notes` says which line of a set decided a request; a request no set had
+/// a say in has an empty list.
+#[tokio::test]
+async fn requests_carry_the_notes_of_their_sessions() {
+    let sets = tempfile::tempdir().unwrap();
+    let list = sets.path().join("listed.list");
+    std::fs::write(&list, "DOMAIN,target.test\n").unwrap();
+    let api = api_with(&format!("RULE-SET,{},DIRECT", list.display())).await;
+    let (head, _) = get_via_proxy(api.http(), &api.target_url()).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let _ = get_via_proxy(api.http(), "http://ads.test/").await;
+    let mut recent = Vec::new();
+    wait_until(async || {
+        recent = get(&api, "/v1/requests/recent").await.1["requests"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        recent.iter().any(|r| r["status"] == "completed")
+            && recent.iter().any(|r| r["status"] == "rejected")
+    })
+    .await;
+    let listed = recent.iter().find(|r| r["status"] == "completed").unwrap();
+    assert_eq!(
+        listed["notes"],
+        json!([format!(
+            "Sub-rule matched: DOMAIN,target.test (in {})",
+            list.display()
+        )])
+    );
+    assert!(listed["error"].is_null());
+    let rejected = recent.iter().find(|r| r["status"] == "rejected").unwrap();
+    assert_eq!(rejected["notes"], json!([]));
+}
+
 #[tokio::test]
 async fn traffic_reports_totals_by_policy_and_listener() {
     let api = api().await;
