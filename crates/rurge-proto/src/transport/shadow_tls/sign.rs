@@ -192,6 +192,10 @@ fn well_formed(hello: &[u8]) -> bool {
 
 /// HMAC-SHA1 under the password over the ClientHello without its record
 /// header and with the 4 bytes of the tag as zeroes.
+///
+/// `hello` must have passed `well_formed`: the tag sits at the fixed offset
+/// of a 32-byte session id's last 4 bytes, and the slicing panics on a
+/// record too short to hold one.
 pub(crate) fn hello_tag(password: &[u8], hello: &[u8]) -> [u8; TAG] {
     let mut chain = Chain::new(password, &[]);
     chain.update(&hello[HEADER..TAG_AT]);

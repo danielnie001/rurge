@@ -131,9 +131,9 @@ Surge 是 Apple 平台上功能最完整的网络代理与调试工具之一：�
 | Apple 专属界面：菜单栏、小组件、快捷指令、Surge Dashboard 原生应用 | 平台专属 | 功能通过 API / CLI / Web Dashboard 提供 |
 | Surge Dashboard 的原生控制协议（`external-controller-access`） | 专有协议 | 远程控制统一走 HTTP API |
 | 企业配置、许可证相关 URL Scheme | 商业功能 | 忽略 |
-| Tailscale 策略 | 需嵌入 Tailscale 客户端（控制面协议、DERP、MagicDNS），工作量与许可需单独评估 | 远期评估；配置解析通过，策略视为不可用 |
+| Tailscale 策略（原生支持） | 需嵌入 Tailscale 客户端（控制面协议、DERP、MagicDNS）；评估见[可行性报告](reports/2026-10-08-phase2-feasibility-snell-v6-quic-tailscale.md)第 3 节 | 已评估（阶段 2，FR-OUT-15）：现在不做原生支持——官方的 Rust 库仍是预览版，原生自研的规模相当于或超过整个 QUIC 族——，报告 3.4 列出的条件具备时复评。眼下的接入办法是让本机的 tailscaled 开 SOCKS5，以 `socks5` 或 `external` 策略经它进入 tailnet（报告 3.3 给出写法，未实测，列在阶段 2 的手工验收清单里）。`tailscale` 策略行与 `[Tailscale <名>]` 节解析通过，策略按 REJECT 处理并告警 `W0007`（告警文本指出上面的写法） |
 | Metered Network Mode（按应用限制联网） | Surge Mac 专属 UI 功能 | 远期评估 |
-| Snell v6 与 v5 的 QUIC Proxy Mode | 协议细节未公开 | 待评估；Snell v1 ～ v5 在范围内（v4 / v5 阶段 2 M6b 已实现 TCP 与 UDP over TCP；v1 ～ v3 阶段 2 M8b 已实现，UDP 自 v3 起）；Hysteria 2 的 Salamander 与 Gecko 混淆也在范围内（阶段 2 M7a 已实现；Gecko 照 Hysteria 官网的公开规范，与 Surge 的 `gecko-password` 是否同一算法未证实，在手工验收里核对，阶段 2 M7-D11） |
+| Snell v6 与 v5 的 QUIC Proxy Mode | 协议细节未公开 | 已评估（阶段 2，FR-OUT-15，[可行性报告](reports/2026-10-08-phase2-feasibility-snell-v6-quic-tailscale.md)第 1、2 节）：v6 技术上可行，但阶段 2 不实现——协议仍是测试版、没有规范，可依据的只有一份逆向所得的实现，要等正式版，并须项目所有者先对"照逆向所得实现"表态；`version=6` 的行按 REJECT 处理并告警 `W0007`。v5 的 QUIC Proxy Mode 不做（Surge 在 v6 已取消），有明确的用户需求时再评估。Snell v1 ～ v5 在范围内（v4 / v5 阶段 2 M6b 已实现 TCP 与 UDP over TCP；v1 ～ v3 阶段 2 M8b 已实现，UDP 自 v3 起）；Hysteria 2 的 Salamander 与 Gecko 混淆也在范围内（阶段 2 M7a 已实现；Gecko 照 Hysteria 官网的公开规范，与 Surge 的 `gecko-password` 是否同一算法未证实，在手工验收里核对，阶段 2 M7-D11） |
 
 ### 2.5 与 Surge 的关系
 
@@ -274,7 +274,7 @@ flowchart LR
 | FR-CFG-05 | 托管配置：`#!MANAGED-CONFIG <URL> interval= strict=`；缓存、按间隔更新、`strict` 到期未更新成功时拒绝启动新会话但保留 API 可用、更新后自动重载并记录 Logbook | P0 | 1 |
 | FR-CFG-06 | `[General]` 全部 57 个选项与 7 组旧键的内存迁移；已从手册消失的旧键忽略并告警；iOS 专属键忽略，`allow-wifi-access` 与 `wifi-access-*` 在未配置监听器时映射为监听参数 | P0 | 1（各键随所属功能阶段生效） |
 | FR-CFG-07 | Requirement 表达式：行首 / 行尾 / `//!` 形式、`#!IOS-ONLY` 等简写、全部比较 / 逻辑 / 字符串运算符、引号规则；不满足的行视为禁用或注释 | P0 | 1 |
-| FR-CFG-08 | 版本标识：`CORE_VERSION` 与 `$environment["surge-version"]` 随实现进度递增。阶段 1 报告 `20`（Body Rewrite 与内联 Map Local 之前的基线），阶段 2 完成 smart 组后报告 `22`，阶段 5 完成后切换到新编码并报告与已实现功能对齐的 Surge Mac 版本（首个值 `6009000`）。每个阶段评审时决定是否上调，避免托管配置启用尚未实现的特性 | P0 | 1 |
+| FR-CFG-08 | 版本标识：`CORE_VERSION` 与 `$environment["surge-version"]` 随实现进度递增。阶段 1 报告 `20`（Body Rewrite 与内联 Map Local 之前的基线），阶段 2 完成 smart 组后报告 `22`（阶段 2 / M8c 起 `CORE_VERSION` 已是 `22`，M8-D18；`$environment["surge-version"]` 随脚本引擎在阶段 5 才有），阶段 5 完成后切换到新编码并报告与已实现功能对齐的 Surge Mac 版本（首个值 `6009000`）。每个阶段评审时决定是否上调，避免托管配置启用尚未实现的特性 | P0 | 1 |
 | FR-CFG-09 | 平台变量：`SYSTEM` 报告 `Windows` / `Linux` / `macOS`；`#!MACOS-ONLY` 只在 macOS 生效，`#!IOS-ONLY` `#!TVOS-ONLY` 永不生效；`SYSTEM_VERSION` `DEVICE_MODEL` `LANGUAGE` `DEVICE_NAME` 取自操作系统 | P0 | 1 |
 | FR-CFG-10 | 可选扩展简写 `#!WINDOWS-ONLY` `#!LINUX-ONLY`，Surge 会将其视为普通注释 | P2 | 1 |
 | FR-CFG-11 | `[Keystore]`：`p12` 与 `openssh-private-key` 两种类型、类型推断、密码；被 `client-cert` `ca-keystore-name` `private-key` 引用 | P0 | 2 |
@@ -323,7 +323,7 @@ flowchart LR
 | FR-OUT-12 | WireGuard：多 peer 最长前缀路由、握手 / 重协商 / keepalive / 过期定时器、分片重组、`client-id`、原生 RTT 探测与 URL 测试两种模式、额外 10 秒初始化、DSCP 0x88、网络变化与底层策略（`underlying-proxy`）的去处变化时重建、本地隧道地址 ICMP echo | P0 | 2 |
 | FR-OUT-13 | 外部代理程序：进程启动 / 自动重启 / 退出清理；`addresses` 从 TUN 路由排除；外部进程自身流量走 DIRECT；日志写数据目录 | P1 | 2 |
 | FR-OUT-14 | 策略错误通知与 `no-error-alert` | P1 | 6 |
-| FR-OUT-15 | Snell v6 与 v5 的 QUIC Proxy Mode、Tailscale 的可行性评估报告（Hysteria 2 的 Gecko 混淆已在阶段 2 M7a 照 Hysteria 官网的公开规范实现，不再是评估项） | P2 | 2 / 远期 |
+| FR-OUT-15 | Snell v6 与 v5 的 QUIC Proxy Mode、Tailscale 的可行性评估报告（Hysteria 2 的 Gecko 混淆已在阶段 2 M7a 照 Hysteria 官网的公开规范实现，不再是评估项）。报告已写成（2026-10-08，`docs/reports/2026-10-08-phase2-feasibility-snell-v6-quic-tailscale.md`；只读调研，没有构建或运行任何东西），三项都不在阶段 2 实现：Snell v6 技术上可行，等正式版并需项目所有者对"照逆向所得实现"表态；v5 的 QUIC Proxy Mode 不做（Surge 在 v6 已取消）；Tailscale 现在经本机 tailscaled 的 SOCKS5 以 `socks5` / `external` 策略接入，原生支持留待官方 Rust 库成熟后复评 | P2 | 2 / 远期 |
 
 ### 4.4 策略组（GRP）
 
@@ -511,6 +511,7 @@ flowchart LR
 - **范围**：FR-CFG-11；FR-IN-02（UDP）；FR-OUT-03 ～ 13、15；FR-GRP-01、03 ～ 07；FR-DNS-04（DoH3 / DoQ）、07、10。
 - **交付物**：每种协议的实现与集成测试环境（回环测试服务器 + 对参考实现的互操作测试）、策略组算法、订阅解析、连通性测试。
 - **验收标准**：每种协议对参考服务器的 TCP 与 UDP（若支持）转发通过；链式代理通过；策略组测试与切换 API 正确；订阅样本解析正确；Shadow TLS 与 TLS 参数各有测试；WireGuard 与 WARP 类端点（`client-id`）握手成功。
+- **状态（2026-10-10）**：功能已齐备；验收证据汇总在阶段 2 的验收文档 [`docs/acceptance/phase2-acceptance.md`](acceptance/phase2-acceptance.md)（M8c 收尾时建立）；CI 还没有绿过；对参考实现的互操作用例还没有对真实的二进制跑过；手工验收清单 [`docs/acceptance/phase2-manual.md`](acceptance/phase2-manual.md)（需要真实公网节点的项目）还没有执行。
 
 ### 阶段 3：增强模式（TUN）
 
@@ -555,7 +556,7 @@ flowchart LR
 
 ### 远期评估
 
-Tailscale 策略、Ponte 替代方案、Metered Network Mode、Snell v6 与 v5 的 QUIC Proxy Mode、Windows 网关模式。每项以单独的评估文档决定是否进入路线图。
+Tailscale 策略、Ponte 替代方案、Metered Network Mode、Snell v6 与 v5 的 QUIC Proxy Mode、Windows 网关模式。每项以单独的评估文档决定是否进入路线图。其中三项已有评估（阶段 2，FR-OUT-15，`docs/reports/2026-10-08-phase2-feasibility-snell-v6-quic-tailscale.md`），都没有进入路线图：Tailscale 的原生支持等官方的 Rust 库成熟后复评，眼下经本机 tailscaled 的 SOCKS5 以 `socks5` / `external` 策略接入；Snell v6 技术上可行，等正式版并需项目所有者对"照逆向所得实现"表态；v5 的 QUIC Proxy Mode 不做（Surge 在 v6 已取消），有明确的用户需求时再评估。
 
 ---
 
@@ -582,7 +583,7 @@ Tailscale 策略、Ponte 替代方案、Metered Network Mode、Snell v6 与 v5 �
 
 | 编号 | 风险 | 影响 | 应对 |
 | --- | --- | --- | --- |
-| R1 | 非公开的协议与算法（Snell v6 与 v5 的 QUIC Proxy Mode、Surge 的 Gecko、smart 组评分） | 无法完全一致 | 近似实现并在清单标注差异；Snell v4 / v5 依公开描述实现、以对参考服务端的互操作为准（阶段 2 M6b），v6 列为待评估；Gecko 照 Hysteria 官网的公开规范实现、以对 sing-box 的互操作为准（阶段 2 M7a），与 Surge 是否同一算法在手工验收里核对 |
+| R1 | 非公开的协议与算法（Snell v6 与 v5 的 QUIC Proxy Mode、Surge 的 Gecko、smart 组评分） | 无法完全一致 | 近似实现并在清单标注差异；Snell v4 / v5 依公开描述实现、以对参考服务端的互操作为准（阶段 2 M6b），v6 已评估（阶段 2 的可行性报告，FR-OUT-15）：技术上可行，阶段 2 不实现，等正式版并需项目所有者对"照逆向所得实现"表态，v5 的 QUIC Proxy Mode 不做；Gecko 照 Hysteria 官网的公开规范实现、以对 sing-box 的互操作为准（阶段 2 M7a），与 Surge 是否同一算法在手工验收里核对 |
 | R2 | Windows 增强模式依赖 Wintun 驱动的分发与管理员权限 | 安装门槛与许可合规 | 阶段 3 确认 Wintun 再分发条款；提供安装向导 |
 | R3 | macOS 直接操作 utun 需要 root，且无法使用 Network Extension | 体验不如 Surge | 通过 launchd 以 root 运行守护进程，客户端与 GUI 以普通用户运行 |
 | R4 | JavaScript 引擎选型：兼容性、性能、体积、WebAPI 支持之间的权衡 | 脚本兼容率 | 阶段 5 设计文档用脚本样本集对比候选引擎 |
@@ -597,7 +598,7 @@ Tailscale 策略、Ponte 替代方案、Metered Network Mode、Snell v6 与 v5 �
 | --- | --- | --- | --- |
 | Q1 | 数据目录与配置目录的具体布局（多 Profile、缓存、状态、日志） | 采用第 6 节默认目录，配置目录下每个 `.conf` 为一个 Profile | 1 |
 | Q2 | rurge 是否回写配置文件（Surge 会在保存时迁移旧键） | 不回写；迁移只在内存中进行 | 1（已在 FR-CFG-02 采纳） |
-| Q3 | `CORE_VERSION` 的报告策略 | FR-CFG-08 的递增方案 | 1，每阶段复核 |
+| Q3 | `CORE_VERSION` 的报告策略 | FR-CFG-08 的递增方案 | 1，每阶段复核（阶段 2 的复核：上调到 22，M8-D18） |
 | Q4 | Web Dashboard 技术栈：复用开源的 Surge 兼容面板还是自研 | 阶段 6 前调研现有面板的许可证与完成度 | 6 |
 | Q5 | Windows 网关模式的实现方式 | 阶段 7 评估 WinDivert 等方案 | 7 |
 | Q6 | 是否提供 Surge 没有的 API（如 `GET /v1/panels`） | 允许以 `/v1/rurge/...` 命名空间扩展，不占用 Surge 路径 | 6 |

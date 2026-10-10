@@ -466,9 +466,11 @@ async fn snell_v1_and_v2_carry_no_udp() {
     }
 }
 
-/// `udp-port` serves v5's QUIC proxy mode, which rurge does not implement:
-/// UDP keeps to the policy's own port. Behind Shadow TLS `udp-port` names
-/// the bare server, which a camouflage handshake cannot reach.
+/// `udp-port` is read and not followed: UDP keeps to the policy's own port
+/// and layers. The manual has it name "another server port number" for UDP
+/// forwarding, for a server whose "TCP and UDP services do not listen on
+/// the same port" ("for example when Shadow TLS occupies the TCP port",
+/// Policies › UDP Relay).
 #[tokio::test]
 async fn udp_keeps_to_the_policys_port_whatever_udp_port_says() {
     let fake = FakeSnell::spawn(SnellScript::new("s3same")).await;

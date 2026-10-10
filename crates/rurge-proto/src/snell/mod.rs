@@ -15,8 +15,8 @@
 //!
 //! UDP came with v3 and needs no parameter: a connection of its own, never
 //! pooled, to the policy's port through the same layers, carries every
-//! datagram (`udp`). `udp-port` serves v5's QUIC proxy mode, which is not
-//! implemented.
+//! datagram (`udp`). `udp-port` — the manual: "When performing UDP
+//! forwarding, use another server port number" — is not followed.
 
 mod chunked;
 pub(crate) mod kdf;

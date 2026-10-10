@@ -19,7 +19,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 | GET | `/v1/outbound/global` | | `{"policy":"<name>"\|null}` |
 | POST | `/v1/outbound/global` | `{"policy":"<name>"}`（空串清除） | `{}`；未知策略 → 400；出站模式为 `proxy` 时用空串清空 → 400（先切到 direct / rule） |
 | GET | `/v1/policies` | | `{"proxies":[…5 个内置策略 + 配置策略],"policy-groups":[…]}` |
-| GET | `/v1/rules` | | `{"rules":[{"index":0,"rule":"DOMAIN,…","hits":3}]}` |
+| GET | `/v1/rules` | | `{"rules":[{"index":0,"rule":"DOMAIN,…","hits":3}]}`；`RULE-SET` / `DOMAIN-SET` 的 URL 写了用户名口令时，`rule` 的文本里显示为 `https://***@host/…`（阶段 2 / M8c） |
 | GET | `/v1/requests/recent?limit=N` | 默认 100；上限是 `--request-log-size` 的环形缓冲容量；`limit=0` → 400 `limit must be at least 1` | `{"requests":[Request…]}`（最新在前） |
 | GET | `/v1/requests/active` | | 同上 |
 | POST | `/v1/requests/kill` | `{"id":N}` | `{}`；404 不在进行中；409 `not killable: internal session`；UDP 流（`transport` 为 `udp`）同样可结束 |
@@ -27,7 +27,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 | GET | `/v1/dns` | | `{"dnsCache":[Cache…],"upstreams":[…],"bootstrap":[…]}` |
 | POST | `/v1/dns/flush` | | `{}` |
 | POST | `/v1/test/dns_delay` | `{"name":"<host>"}`，缺省为 `internet-test-url` 的主机 | `{"delays":[{"upstream":"udp://…","ms":12,"error":null}]}` |
-| GET | `/v1/profiles/current?sensitive=0\|1` | | `text/plain`；默认（`sensitive=0`）把下列内容替换为 `***`，其余内容与行数、行尾 CRLF 原样保留：① 独立成行的密钥 `key = value`（键名大小写不敏感）`password`、`ca-passphrase`、`ca-p12`、`private-key`、`psk`、`pre-shared-key`、`token`、`auth-key`（阶段 2 / M8a 加的：`[Tailscale <名>]` 的登录密钥）；② 值里任意位置的内联参数 `name = value`（值到**第一个顶层逗号**为止，顶层按解析器自己的规则判定：`"` 或 `'` 在值里**任何位置**都会开启一段引号，`"` 内 `\` 转义下一个字符、`'` 内不转义，`(` / `)` 分组，引号内与括号内的逗号都属于值——`password="p,w"`、`password=ab"c,d"`、`password=a(b,c)d` 都是一整个值；引号或括号未闭合时抹到行尾。参数名前面必须是行首、逗号、空白或 `(`）`password`、`psk`、`private-key`、`pre-shared-key`、`preshared-key`、`base64`、`token`、`uuid`、`username`、`headers`、`ws-headers`、`ws-path`、`shadow-tls-password`、`policy-path`、`external-policy-modifier`、`test-url`（后三个是阶段 2 加的：订阅链接与订阅行设的测试 URL 常带 token，修饰列表能设任何参数；`preshared-key` 是 M4b 加的，即 `[WireGuard]` 节 `peer` 里的预共享密钥；`username` 会连带脱敏无害的 SSH 用户名；`headers=` 与 `ws-headers=` 的值整体被抹掉，连 header 名也不保留，`ws-path=` 的值同样整体被抹掉——这是有意的过度脱敏，自定义 header 的值与 WebSocket 路径都属于凭据）；③ `http-api` / `external-controller-access` / `http-listen` / `socks5-listen` 的 `key@` 前缀（最后一个 `@` 之前的全部，与解析器的切法一致；阶段 2 / M8a 之前按第一个 `@` 切）、`dns-server` / `encrypted-dns-server` / `doh-server` 各项 URL 里的用户名口令（阶段 2 / M8a 加的：`https://user:pass@host/…` 显示为 `https://***@host/…`）与 `wifi-access-http-auth` 的口令；④ 所有写作 `type, server, port` 的代理类型（`http` `https` `h2-connect` `socks5` `socks5-tls` `ss` `snell` `vmess` `trojan` `tuic` `tuic-v5` `hysteria2` `masque` `anytls` `trust-tunnel` `ssh`）策略行第 4 个起的 token——**凡不是 `name=value` 具名参数的 token 一律抹掉**，最常见的就是根本不含 `=` 的裸 token（位置凭据）；含 `=` 时还要首个 `=` 之后非空且不全是 `=` 才算具名参数并保留（`tfo=true` 保留，`aHVudGVyMg==` 脱敏，`sni=` 属于可接受的过度脱敏；以引号开头的 token 整个算一个位置值，里面的 `=` 与逗号都不作数）。切分只在顶层逗号处进行（引号内与括号内的逗号不切，与 ② 同一套扫描）。前四种是 Surge 文档化的位置凭据写法；其余类型这个位置本就是多余参数（`W0001`），按偏安全一侧一并抹掉。列出的以外一律不脱敏 |
+| GET | `/v1/profiles/current?sensitive=0\|1` | | `text/plain`；`sensitive=1` 给出配置文件的原文，默认（`sensitive=0`）给出脱敏后的文本：行数与行尾 CRLF 原样保留，认得出的秘密换成 `***`。**脱敏是尽力而为，不是保证**——藏什么、有意不藏什么、已知漏什么，见下面「脱敏后的配置」 |
 | POST | `/v1/profiles/reload` | | `{"ok":true,"errors":0,"warnings":1,"listenersRebound":false}`；解析失败或构建 `Runtime` 失败时 `ok:false`，运行中的配置不变；重绑监听器失败时也是 `ok:false`，但新配置这时已经生效，只是监听器归零，直到下一次重载成功为止（下一次重载会无条件重试绑定） |
 | POST | `/v1/profiles/check` | | `{"ok":…,"errors":N,"warnings":N,"diagnostics":[Diagnostic…]}`（校验磁盘上的当前配置，不影响运行；`Diagnostic` 与 `rurge check --json` 相同） |
 | POST | `/v1/log/level` | `{"level":"verbose"\|"debug"\|"info"\|"notify"\|"warning"\|"error"}` | `{}` |
@@ -44,7 +44,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 {"id":12,"listener":"http","transport":"tcp","src":"127.0.0.1:51234","dst":"example.com:443","rule":"DOMAIN-SUFFIX,example.com,Proxy","policy":["Proxy","HK"],"sni":"example.com","protocol":"https","up":1234,"down":56789,"startedMs":1757200000000,"elapsedMs":812,"connectMs":35,"firstByteMs":120,"status":"completed","rejectKind":null,"error":null}
 ```
 
-`listener` ∈ `http` `socks5` `tun` `forward` `internal`；`status` ∈ `active` `completed` `rejected` `failed`；`rejectKind` 在 `rejected` 时是 `REJECT` / `REJECT-DROP` / `REJECT-NO-DROP` / `REJECT-TINYGIF`；`protocol` 是嗅探到的协议小写名或 `null`。
+`listener` ∈ `http` `socks5` `tun` `forward` `internal`；`status` ∈ `active` `completed` `rejected` `failed`；`rejectKind` 在 `rejected` 时是 `REJECT` / `REJECT-DROP` / `REJECT-NO-DROP` / `REJECT-TINYGIF`；`protocol` 是嗅探到的协议小写名或 `null`。`src` 与 `dst` 里，IPv4 映射的 IPv6 地址（`::ffff:a.b.c.d`：双栈监听上的 IPv4 客户端，或写成这种形式的目标）显示为它指的 IPv4 地址 `a.b.c.d`（阶段 2 / M8c；规则与出站看到的也是它）。
 
 `transport` 是 `tcp` 或 `udp`（阶段 2 / M5a 起：经 SOCKS5 UDP ASSOCIATE 进来的每条 UDP 流各有一条记录，`dst` 是它的目标，`up` / `down` 是载荷字节数）。`connectMs` 是会话开始到出站就绪的毫秒数（规则匹配、DNS、`evaluate-before-use` 的等待与 `smart` 组换成员的重试都在内），`firstByteMs` 是出站就绪到收到第一个上游字节的毫秒数；还没有对应时刻（被拒绝、拨号失败、还没收到数据）时为 `null`，测试会话（`rule` 为 `policy test`）两者恒为 `null`（阶段 2 / M3c 起）。
 
@@ -54,7 +54,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 {"startTime":1757200000.5,"total":{"in":123,"out":45,"inCurrentSpeed":0,"outCurrentSpeed":0},"connector":{"DIRECT":{"in":123,"out":45}},"listener":{"http":{"in":123,"out":45},"socks5":{"in":0,"out":0}}}
 ```
 
-`in` 是下行（远端 → 客户端）字节，`out` 是上行；速度是最近一秒的字节数；`startTime` 是 API 启动时的 Unix 时间戳，**秒**（`f64`，可带小数）——设计文档 §5.2 / 开放问题 Q1 曾写作毫秒，以本页为准。
+`in` 是下行（远端 → 客户端）字节，`out` 是上行；速度是最近两次采样之间走的字节数，每秒采样一次，所以平时就是最近一秒的字节数——机器休眠错过的采样不补（阶段 2 / M8c）：醒来后只采一次，第一次读到的是休眠前后这一整段里走的字节，随后恢复为每秒的字节数（此前醒来后连发的补采会把它冲成 0）；`startTime` 是 API 启动时的 Unix 时间戳，**秒**（`f64`，可带小数）——设计文档 §5.2 / 开放问题 Q1 曾写作毫秒，以本页为准。
 
 `total` 统计所有会话，包括仍在进行中的会话与 rurge 自己的内部 DNS 拨号（与 `inCurrentSpeed` / `outCurrentSpeed` 同源，长传输期间不会出现「总量 0 但速度非 0」）；`connector` 与 `listener` 只统计已结束的会话，且 `listener` 在阶段 1 只有 `http` / `socks5` 两项。因此这三个层级不应相互对得上，不要拿它们互相校验。
 
@@ -66,6 +66,62 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 
 `expiresTime` 与 `startTime` 同单位（Unix 秒，`f64`）；条目没有剩余 TTL 信息时为 `null`。
 
+### 脱敏后的配置
+
+`GET /v1/profiles/current` 不带 `sensitive=1` 时给出的文本。阶段 2 / M8c 重写了这套规则，下面写的是代码现在的做法（`crates/rurge-config/src/redact.rs`）；同一套规则里管策略定义的那一半也用于 `GET /v1/policies/detail` 与 `GET /v1/policy_groups` 的 `lineHash`（`docs/api/phase2.md`）。
+
+**先说它不是什么。** 脱敏是尽力而为，不是"没有秘密会出现"的保证：它是一张"藏什么"的清单，照各个解析器读一行的方式去认，清单之外的键、读法之外的写法它认不出。能取到这个视图的人拿着 API key，本来就能用 `sensitive=1` 取到原文——所以它防的是一张截图、一次粘贴、一份贴出去的报告，不是防 API 的调用方。**把这份文本给别人看之前，自己再读一遍**，对照下面"有意照原样显示的"与"已知没有覆盖的"两段。清单是照 Surge 手册里放秘密的地方列的——口令、密钥、订阅与托管配置的链接、URL 里的用户名口令——，而且只是"目前所知"：两轮修正之后它还漏着手册里的一个键（`[MTProto]` 的 `secret`，已补上）。这些地方之外不要指望它：规则集 URL 的查询串里带 token、秘密写在自定义的头或重写规则里、配置里混着为别的客户端写的行，都会照原样显示。要不要换成"只显示已知无害内容"的视图是留给项目所有者的问题，还没有决定（M8c 计划 `docs/superpowers/plans/2026-10-09-phase2-m8c-leftovers-acceptance-plan.md`「延后事项」第 51 行）。
+
+**怎样读一行。** 照节解析器的顺序：行首的空白（连同字节顺序标记与零宽字符）、注释标记（`#`（后面不是 `!`）、`;`、`//`，连着几个也算）与行首的要求指令（`#!MACOS-ONLY`、`#!REQUIREMENT <表达式>` 等）原样保留；行尾的行内注释与要求指令照解析器的切法切开；剩下的内容按它的键或它的定义脱敏。被注释掉的行与行尾注释里的文字不是原样放过，而是照"没有被注释"那样再脱敏一遍——旧口令常留在那里；注释里再套注释跟到四层，更深的只按名字搜索。秘密键的取值为空而行尾有注释时，注释的文字整个换成 `***`（以 `#` 开头的口令会被解析器当成注释）。行数、行的顺序与行尾的 CRLF 不变。
+
+**整行键**（`key = value`，整个取值换成 `***`）：`password` `ca-passphrase` `ca-p12` `private-key` `psk` `pre-shared-key` `preshared-key` `token` `auth-key` `proxy-test-url` `internet-test-url` `geoip-maxmind-url` `secret` `passphrase`。键名不分大小写，也不计 `-` 与 `_`（`PrivateKey`、`Pre_Shared_Key` 都算）。键是分隔符前面那段文字的**结尾**：分隔符是第一个 `=`（或全角的 `＝`），以及它之前的 `:`（或 `：`）；键的前面可以另有文字，只要键名从头开始，或接在空白、逗号、`(`、引号或任何非 ASCII 字符之后；`=` 之前有顶层逗号的不是键行。另有四类键各有各的处理：
+
+| 键 | 处理 |
+| --- | --- |
+| `http-api` `external-controller-access` | 取值在最后一个 `@` 处切开，之前的换成 `***`；没有 `@` 时整个换掉 |
+| `http-listen` `socks5-listen` | 逐项去掉最后一个 `@` 之前的部分 |
+| `wifi-access-http-auth` | `user:***`；没有 `:` 时整个换掉 |
+| `dns-server` `encrypted-dns-server` `doh-server` | 逐项去掉 URL 里的用户名口令（全角的 `＠` 也算）。只在键的前面除空白外没有别的文字时才算键行，否则（`[SSID Setting]` 的行）按策略定义读 |
+
+**行内参数**（`name=value`，取值换成 `***`）：`password` `passphrase` `psk` `private-key` `pre-shared-key` `preshared-key` `base64` `token` `uuid` `username` `headers` `ws-headers` `ws-path` `shadow-tls-password` `salamander-password` `gecko-password` `policy-path` `external-policy-modifier` `test-url` `url` `args` `argument` `obfs-host` `obfs-uri`。参数照解析器的读法认：整项写在引号里的 `"password=x"` 是 `password` 参数；括号组（`[WireGuard]` 的 `peer = (…)`）逐项处理；取值到解析器自己的第一个顶层逗号为止——`"` 或 `'` 在值里任何位置都会开启一段引号（`"` 内 `\` 转义下一个字符），`(` / `)` 分组，引号内与括号内的逗号属于取值，引号或括号没闭合时到行尾。读不成这样一项的文字，以及注释，再按名字搜索一遍：名字前面是行首、空白、逗号、`(`、引号或非 ASCII 字符，后面是 `=`、`＝`、`:`、`：`（中间可隔一个收尾的引号）。其中几个是有意宽藏的：`username` 连带藏起无害的 SSH 用户名；`headers` / `ws-headers` 连 header 名也不保留；`ws-path` 与 `obfs-uri` 在按路径分流的前置后面就是共享密钥；`obfs-host` 可能认得出用户；`policy-path`、`test-url` 与组行上的旧参数 `url` 常带订阅的 token；`external-policy-modifier` 能设任何参数；`external` 的 `args` 与 `[Script]` 的 `argument` 里常有口令或 cookie。
+
+**位置凭据**：类型带服务器与端口的策略行（`http` `https` `socks5` `socks5-tls` `ss` `snell` `vmess` `trojan` `anytls` `ssh` 等——`wireguard`、`tailscale`、`external` 与内置策略的别名以外的全部类型），以及第三个字段是端口号的任何行（为别的客户端写的行，其类型 rurge 不认识），第四个字段起凡不是 `name=value` 具名参数的字段一律换成 `***`。含 `=` 的字段，要 `=` 前面是一个参数名、后面非空且不全是 `=` 才算具名参数（`tfo=true` 保留；带填充的 Base64 `aHVudGVyMg==` 换掉；`sni=` 这样值为空的也被换掉）；以引号开头的字段整个算一个位置值。类型带服务器的行上，端口位置不是数字的字段也换掉（漏了逗号的 `8080 alice`）。类型后面漏了逗号的行（`http h.example, 8080, …`），只在拆开之后第三个字段是端口号时才这样读。全角的 `，` 在这里当逗号。`http` `https` `socks5` `socks5-tls` 与 `h2-connect` 的位置凭据是解析器接受的写法；其余类型这个位置本就是多余参数（`W0001`），按偏安全一侧一并换掉。
+
+**URL**：任何位置的 `scheme://authority` 里，authority 中最后一个 `@` 之前的部分换成 `***`（路径、查询串与片段里的 `@` 不动）。scheme 不是 `http` `https` `h3` `quic` `tls` `tcp` 这六种之一的 URL——分享链接 `trojan://…`、`ss://…`、`vmess://…` 把秘密放在哪里各有各的写法——从 `://` 之后到下一个空白整段换成 `***`。注释里那六种 scheme 的 URL 只显示 scheme 与 authority，其后换成 `/***`。
+
+**`#!` 行**按形状：`#!MANAGED-CONFIG` 之后只显示写成 `interval=<数字>`、`strict=<字母>` 的词，其余每个词换成 `***`（指令名写错的，如 `#!MANAGED_CONFIG`、`#MANAGED-CONFIG`，同样处理）；`#!include` 按目标，含 `://` 的换成 `***`，本地路径保留；别的 `#!` 行里含 `://` 的词换成 `***`。
+
+例子（每一对都是 `redact.rs` 里的用例钉住的）：
+
+| 配置里的行 | 显示为 |
+| --- | --- |
+| `http-api = s3cret@127.0.0.1:6171` | `http-api = ***@127.0.0.1:6171` |
+| `wifi-access-http-auth = alice:hunter2` | `wifi-access-http-auth = alice:***` |
+| `encrypted-dns-server = https://al1ce:pw@dns.example/dns-query, quic://dns.example` | `encrypted-dns-server = https://***@dns.example/dns-query, quic://dns.example` |
+| `ProxyA = https, 1.2.3.4, 443, carol, trustno1` | `ProxyA = https, 1.2.3.4, 443, ***, ***` |
+| `P = http h.example, 8080, alice, hunter2` | `P = http h.example, 8080, ***, ***` |
+| `peer = (pre-shared-key = PSK1, endpoint = 1.2.3.4:51820)` | `peer = (pre-shared-key = ***, endpoint = 1.2.3.4:51820)` |
+| `G = url-test, A, B, url=http://t.test/?token=t0k3n, interval=600` | `G = url-test, A, B, url=***, interval=600` |
+| `# old: ca-passphrase = hunter2` | `# old: ca-passphrase = ***` |
+| `PosC = socks5, s.test, 1080, alice, hunter2 # expires=2027-01` | `PosC = socks5, s.test, 1080, ***, *** # expires=2027-01` |
+| `RULE-SET,https://al1ce:hunter2@rules.example/a.list,Proxy` | `RULE-SET,https://***@rules.example/a.list,Proxy` |
+| `trojan://hunter2@t.example:443?sni=t.example#HK` | `trojan://***` |
+| `# 订阅: https://sub.example/api/v1/client/subscribe?token=TOKEN` | `# 订阅: https://sub.example/***` |
+| `#!MANAGED-CONFIG https://provider.test/link/t0k3n?surge=4 interval=43200 strict=true` | `#!MANAGED-CONFIG *** interval=43200 strict=true` |
+| `#!include a.conf, https://h.example/p?token=t0k3n` | `#!include a.conf, ***` |
+
+**有意多藏的**（不是缺陷，换来的是少漏）：名字以清单里的键结尾的策略、组或脚本——名叫 `HK Token` 的策略，整行显示成 `HK Token = ***`；散文里 `password:`、`token:`、`url:`、`args:` 之后的文字（`# see url: https://x.example/y` 显示成 `# see url: ***`）；以协议类型开头、第三个词恰是端口号的注释；注释里 URL 的路径；scheme 不是那六种的整个 URL——URL 重写里指向 App 的目标也在内（`myapp://item/$1` 显示成 `myapp://***`）。
+
+**有意照原样显示的**（登记现状，不是改动的承诺；要不要藏、怎样藏由项目所有者定，同一张「延后事项」的第 43 行）：
+
+- 不是注释的行上，规则集与域名集的 URL，连同路径与查询串。规则集在规则列表、请求记录与日志里到处以 URL 命名（与 Surge 一样），只在这里藏起来没有用；**查询串里的 token 因此看得见**。URL 里的用户名口令仍然藏。
+- `encrypted-dns-server` 各项 URL 的路径与查询串：它们是上游名字的一部分。
+- `[General]` 里 rurge 不认识的键的取值。
+- `[Script]` 的 `script-path` 的 URL（用户名口令除外）。
+- `[URL Rewrite]`、`[Body Rewrite]` 各行的文字，`[Header Rewrite]` 写进去的头值，`[Map Local]` 的 `header=` / `data=`。
+
+**已知没有覆盖的。** 位置口令里带 `=`（`P = http, h.example, 8080, alice, Xk9=mQ2p` 的最后一个字段，对解析器和对脱敏都读成参数）；名字本身就是整行键的策略（`DNS-Server = trojan, …, password=…`）；没有任何分隔符的秘密键（`ca-passphrase hunter2`）；行内参数名里以 `_` 代 `-`（`policy_path=…`）；为别的客户端写的格式（Loon 的 `peers=[{…}]`、Clash 的 YAML、Quantumult X 的节、整份 Base64 的订阅）；折成几行的 Base64；滑进 `sni=`、`interface=` 这类不是秘密的参数里的秘密；等等。逐条列在 M8c 计划「延后事项」的第 58 ～ 77 行。三轮修正与两次对抗性复审之后，第二位复审者的判断是：这样一张清单对这种格式做不成可靠的，写法没有边界（同表第 51 行）——所以上面那句"不是保证"要按字面读。
+
 ## 系统代理
 
 M4b 起 `system_proxy` 已生效（见上面「端点」表）；这里记录地址取值、`skip-proxy` 转换与生命周期。
@@ -73,7 +129,14 @@ M4b 起 `system_proxy` 已生效（见上面「端点」表）；这里记录地
 - **地址**：http / https 取第一个 `http-listen`；`set-system-socks-proxy = true`（默认）时 socks 取第一个 `socks5-listen`，为 false 时不设置 socks。监听地址是通配地址时换成**同族**回环：`0.0.0.0` → `127.0.0.1`，`::` → `::1`（`[::]` 在 Windows 上默认只监听 v6，`127.0.0.1` 连不上）。一个 http/socks5 监听器都没有时视为「未启用」，`POST` 打开会失败。
 - **`skip-proxy` → 系统绕过列表**：采用 macOS 语义。取反项（`-host`）与 `<…>` 特殊记号（`<ip-address>` 等）整条丢弃；端口一律丢弃（`host:port` 只留主机部分）；CIDR 网段保留 `/前缀`、主机位清零（如 `192.168.1.5/16` → `192.168.0.0/16`），单地址网段（`/32`、`/128`）写成裸地址。macOS 与 Linux（GNOME `ignore-hosts` / KDE 逗号拼接的 `NoProxyFor`）原样使用这份列表；Windows 的 `ProxyOverride` 没有 CIDR 语法，把 IPv4 网段展开成通配符模式（`10.0.0.0/8` → `10.*`；`172.16.0.0/12` 展开成 16 条 `172.16.*`…`172.31.*`；单条 `/1`、`/9`、`/17` 或 `/25` 网段最多展开到 128 条，没有上限），IPv6 字面量加中括号（`::1` → `[::1]`），IPv6 网段无法表示、丢弃。`exclude-simple-hostnames` 只在 Windows 生效（追加 `<local>`）；macOS 经 `networksetup` 无法设置，`true` 时 WARN 并忽略这一项，其余设置照常应用；Linux 无对应项。
 - **`state.json` 备份与崩溃恢复**：开启前先 `snapshot()` 当前系统设置，连同 `features.system_proxy = true` 一起写入 `state.json`（先于 `apply`，这样崩溃后仍能找回原始设置；已经存在的备份不会被覆盖——它就是最初的原值）；`apply` 失败会尽力 `restore` 并清空这两个字段。关闭或优雅退出 → `restore` 并清空。启动时若 `system_proxy_backup` 非空（上一次异常退出留下的）→ 先 `restore` 并打一条 WARN，再按本次是否带 `--system-proxy` 决定要不要重新开启（详见下一条）；`state.json` 的写入是尽力而为（原子写但不 `fsync`），写失败只记日志，不影响调用方。
-- **崩溃恢复不依赖本次能否启动**：任何一次 `rurge run` 都做这件事，**不需要**带 `--system-proxy`——只要 `state.json` 里有非空的 `system_proxy_backup` 就恢复。这一步紧跟打开 `state.json` 之后，**早于**监听器绑定与 `http-api` 绑定：上一次崩溃留下的端口往往正是本次绑不上的原因，所以即使本次以 `error: cannot bind listener`（或 `cannot bind http-api`）退出 1，崩溃前的系统设置也已经放回去了；否则机器会一直指着一个死掉的端口，而且每次重试都卡在同一处。排在恢复之前的只剩加载配置、打开日志文件、解析运行时参数和取数据目录的实例锁（见下一条）这几步：前三步失败时退出 2，rurge 还没有打开 `state.json`，恢复要等下一次能走到这一步的启动；实例锁被另一个还在运行的实例占着时退出 1——那份备份属于它，本来就不该由别的进程恢复。
+- **崩溃恢复不依赖本次能否启动**：任何一次 `rurge run` 都做这件事，**不需要**带 `--system-proxy`——只要 `state.json` 里有非空的 `system_proxy_backup` 就恢复。这一步紧跟打开 `state.json` 之后，**早于**监听器绑定与 `http-api` 绑定：上一次崩溃留下的端口往往正是本次绑不上的原因，所以即使本次以 `error: cannot bind listener`（或 `cannot bind http-api`）退出 1，崩溃前的系统设置也已经放回去了；否则机器会一直指着一个死掉的端口，而且每次重试都卡在同一处。排在恢复之前的只剩加载配置、打开日志文件、解析运行时参数（建数据目录）和取数据目录的实例锁（见下面"一台机器只跑一个实例"一条）这几步：实例锁被另一个还在运行的实例占着时退出 1——那份备份属于它，本来就不该由别的进程恢复；数据目录建不出来时退出 2，那里也就没有 `state.json` 可恢复；配置加载不了或日志文件打不开时退出 2，自阶段 2 / M8c 起在退出之前另做一次恢复，见下一条（此前要等下一次能走到这一步的启动）。
+- **配置加载不了时也恢复（阶段 2 / M8c）**：`rurge run` 在日志建起来之前就结束的三个出口——配置读不了、配置有错误、配置能加载但 `--log-file`（`RURGE_LOG_FILE`）打不开——都以 2 退出，退出之前都先试一次恢复。此前这三个出口不恢复：配置坏着的时候，机器一直指着一个死掉的端口，直到把配置修好。条件依次是：数据目录（照 `--data-dir` / `RURGE_DATA_DIR` / 平台缺省取，**不创建**）里有 `state.json`；**拿到**实例锁——别的实例持着，或者锁文件打不开、锁不了，都不做、也不出声（与正常启动不同：正常启动锁不了时不带锁照跑；这里进程反正要退出，备份留给走得更远的那次启动）；`state.json` 里有备份（只读地看：读不了或解析不了的文件原样留着，不像正常启动那样把它挪开，也不出声）。然后取后端、恢复、清掉备份。结果写到标准错误（这时还没有日志），不改变退出码，是下面四句之一：
+  - `warning: a previous run left the system proxy pointing at rurge; the saved settings were restored`——已恢复，备份已清掉。
+  - `warning: a previous run left the system proxy pointing at rurge; the saved settings were restored, but state.json could not be updated: the next start restores them again`——已恢复，但 `state.json` 没有写成：下一次启动会再恢复一遍，盖掉其间对系统设置的改动。
+  - `warning: cannot restore the system proxy: <原因>; the saved settings stay in state.json and are restored on the next start`——恢复失败；`<原因>` 是后端自己的错误文本（macOS / Linux 上是失败的命令，它的参数里最后一个 `@` 之前的部分显示为 `***`）。
+  - `warning: <后端的报错>; the system proxy was not restored`——取不到后端（只在测试钩子 `RURGE_SYSTEM_PROXY_BACKEND` 的取值不对时）。
+
+  输出的先后：配置有错误时诊断在前、告警在后；配置读不了时告警在前、`error: cannot read …` 在后；日志文件打不开时告警在前、`error: cannot open log file <路径>` 在后（日志目录列不了时，日志库自己先往标准错误打一行）。没有 `state.json` 的目录里什么也不多出来（连 `rurge.lock` 也没有），不存在的数据目录不被创建；恢复期间这个进程持着 `rurge.lock`。自动化用例只经测试用的文件后端：真实的后端（Windows 注册表、macOS `networksetup`、Linux 的 `gsettings` / `kwriteconfig`）没有在这条路径上跑过，手工的一项列在 `docs/acceptance/phase1-manual.md`。
 - **带 `--system-proxy` 时一台机器只跑一个实例**：备份存在各自的 `--data-dir` 的 `state.json` 里。两个实例用**不同**的数据目录先后开启系统代理时，第二个实例会把第一个实例刚写进去的地址当成「原始设置」快照下来；两个都退出后，系统设置停在一个已经失效的地址上，而两份 `state.json` 里都没有真正的原值可以恢复。共用同一个 `--data-dir` 的情况由实例锁挡住：每次 `rurge run`（不限于带 `--system-proxy` 的）都会在打开 `state.json` **之前**对 `<data-dir>/rurge.lock` 取独占锁，同一数据目录上的第二个实例在碰任何东西之前就以 `error: another rurge instance is already running with the data directory <路径>` 退出 1——既不改系统设置，也不动 `state.json`。锁由操作系统在进程死亡时释放，所以崩溃之后的下一次启动照常拿到锁并恢复备份；反过来说，握着锁时在 `state.json` 里看到的备份必定属于一个已经死掉的运行，而不是一个还活着的实例。锁文件从不删除——删除会与另一个进程的打开竞争。文件系统不支持加锁（或锁文件打不开）时，rurge 记一条 WARN 后不带这项检查继续启动：不能因为文件系统的限制把守护进程整个丢掉。
 - **运行期不巡检**：rurge 只在开启、重载跟随、关闭这三个时刻写系统设置。运行期间别的程序（或用户自己）改了系统代理，rurge 既不会察觉也不会重新写回去；退出时 rurge 把**开启那一刻**的快照原样写回，覆盖掉期间的任何改动。
 - **`RURGE_SYSTEM_PROXY_BACKEND` 是测试钩子**：取值只能是 `file:<path>`，把「系统代理」换成对一个 JSON 文件的读写（端到端测试用，见设计文档 §15 的 P5）。其它任何取值都直接报错退出，不会静默退回真实后端——否则测试里的一个拼写错误就会改动开发机的真实设置。这个变量不是给用户用的。

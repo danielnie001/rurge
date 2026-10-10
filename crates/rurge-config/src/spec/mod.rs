@@ -1395,9 +1395,9 @@ mod tests {
         );
     }
 
-    /// `udp-port` serves Snell v5's QUIC proxy mode, which is not
-    /// implemented: UDP keeps to the policy's own port and layers, and the
-    /// value is only checked.
+    /// `udp-port` on `snell` (the manual: "another server port number" for
+    /// UDP forwarding) is not followed: UDP keeps to the policy's own port
+    /// and layers, and the value is only checked.
     #[test]
     fn udp_port_on_snell_is_parsed_but_has_no_effect() {
         for version in 1..=5 {

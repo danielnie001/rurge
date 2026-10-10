@@ -58,10 +58,11 @@ pub struct SnellSpec {
 pub struct SnellRead {
     pub spec: SnellSpec,
     pub not_implemented_version: Option<u8>,
-    /// `udp-port` is written. It serves v5's QUIC proxy mode, which is not
-    /// implemented: UDP keeps to the policy's own port and layers (behind
-    /// Shadow TLS, `udp-port` names the bare server), so the caller reports
-    /// it as having no effect (`W0029`).
+    /// `udp-port` is written. The manual: "When performing UDP forwarding,
+    /// use another server port number", for a server whose "TCP and UDP
+    /// services do not listen on the same port". rurge reads it and does
+    /// not follow it: UDP keeps to the policy's own port and layers, so the
+    /// caller reports it as having no effect (`W0029`).
     pub udp_port: bool,
 }
 
