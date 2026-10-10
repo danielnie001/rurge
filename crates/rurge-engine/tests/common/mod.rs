@@ -489,9 +489,13 @@ pub fn closed_udp_port() -> u16 {
     unassigned_port(|port| std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok())
 }
 
-/// A loopback TCP port with nothing on it: a connection to it is refused.
-/// The socket that tried it is gone again: one left bound and not listening
-/// refuses on Linux and Windows, and leaves the connection waiting on macOS.
+/// A loopback TCP port with nothing on it: a connection to it is refused —
+/// at once on Linux and macOS, after about two seconds on Windows (measured
+/// on the development machine: 2.03 to 2.05 s), which whoever connects to it
+/// allows for. The socket that tried the port is closed before the number is
+/// handed out, so that nothing is left on it: a socket left bound and not
+/// listening refuses on Linux and Windows, and leaves the connection waiting
+/// on macOS.
 pub fn closed_tcp_port() -> u16 {
     unassigned_port(|port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
 }

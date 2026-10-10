@@ -723,7 +723,7 @@ async fn a_udp_flow_to_a_name_no_member_can_send_counts_against_nobody() {
 /// and a member's second failure at a site is excused by its first: were
 /// they sent together, a silence counted wrongly would hide behind the
 /// one counted rightly. So the flow that must not count goes first and
-/// alone, and the other follows once it has had its three seconds.
+/// alone, and the other follows once the first has had its three seconds.
 #[tokio::test]
 async fn udp_silence_counts_only_where_answers_always_come() {
     let quiet = FakeSocks5::spawn(Socks5Script::default()).await;

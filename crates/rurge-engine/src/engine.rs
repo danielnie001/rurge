@@ -216,10 +216,11 @@ impl Engine {
     /// after its successor (M3 design 5.7) — and by every dial's `snapshot`,
     /// to read the runtime and the registry as one pair. Nothing inside it
     /// may do I/O, a name resolution, a dial or a build: that would hold up
-    /// every dial. It guards no data, and what is done under it runs
-    /// everything that can fail before its first store, so a holder that
-    /// panicked has published a whole generation or none: the poison is
-    /// ignored.
+    /// every dial. It guards no data. What is done under it runs everything
+    /// that is known to be able to fail before its first store; a store also
+    /// drops what it replaces when that was its last holder, and nothing in
+    /// those drops is known to panic. A holder that panicked is taken to have
+    /// published a whole generation or none: the poison is ignored.
     pub(crate) fn generation_lock(&self) -> std::sync::MutexGuard<'_, ()> {
         self.generation
             .lock()
@@ -445,8 +446,12 @@ impl Engine {
             .registry
             .take()
             .expect("a generation is published once");
-        // the retains come first: they can panic and the stores cannot, so a
-        // generation goes out whole or not at all
+        // the retains come before the first store: they take locks with
+        // `expect`, so they can panic, and nothing that is known to fail
+        // comes after them. A store also drops what it replaces when this was
+        // its last holder (the previous registry, with the outbounds that
+        // were not carried over), and nothing in those drops is known to
+        // panic
         //
         // what the `smart` groups knew of what is gone goes with it (phase 2
         // M3c design 5.1)
@@ -1032,6 +1037,7 @@ impl Engine {
         let engine = self.clone();
         self.tracker.spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = engine.accept.cancelled() => break,

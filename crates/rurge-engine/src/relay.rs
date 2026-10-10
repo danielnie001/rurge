@@ -22,10 +22,11 @@ use tokio_util::sync::CancellationToken;
 /// What each direction reads into, and so the most it writes at once. It was
 /// measured against the alternatives (phase 2 M8 design 5.11): flushing less
 /// often than after every write gained nothing, and a larger buffer moved
-/// more — 64 KiB about a tenth more through every encrypting stack, in the
-/// upload direction, on the one machine it was measured on — but a session
-/// holds two buffers for as long as it lives, busy or not, and 10,000
-/// sessions are to fit in 300 MB (NFR-01).
+/// more — 64 KiB about a tenth more through every encrypting stack, the two
+/// directions taken together and all of it in the upload direction, on the
+/// one machine it was measured on — but a session holds two buffers for as
+/// long as it lives, busy or not, and 10,000 sessions are to fit in 300 MB
+/// (NFR-01).
 const BUF: usize = 8 * 1024;
 
 /// Runs once on the first non-empty read of a `copy_half` direction (M3b SNI

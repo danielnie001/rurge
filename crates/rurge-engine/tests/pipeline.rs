@@ -660,6 +660,33 @@ async fn relay_counts_bytes_as_they_move_and_keeps_them_on_failure() {
     );
 }
 
+/// The traffic sampler takes a sample a second. Time that passes without it
+/// running — a machine that slept, on a platform whose clock counts the
+/// sleep — is not made up for: one sample follows, not one for every second
+/// missed (each takes the request log's lock and sums the live sessions). The
+/// rate is the change since the previous sample, so a sampler that made up
+/// the missed seconds would end by reporting none.
+#[tokio::test(start_paused = true)]
+async fn the_traffic_sampler_does_not_make_up_for_missed_seconds() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = "[General]\nipv6 = false\n[Proxy]\n[Proxy Group]\n[Rule]\nFINAL,DIRECT\n";
+    let engine = engine_from_profile(dir.path(), profile).await;
+    engine.start_sampler();
+    // the clock moves when nothing else can run: the sampler has taken its
+    // first sample, with nothing moved yet
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let live = SessionHandle::new(
+        1,
+        SessionInfo::tcp(rurge_config::HostName::parse("live.test"), 443),
+    );
+    engine.request_log().mark_active(&live);
+    live.add_up(1000);
+    // thirty seconds in which the sampler did not run
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(engine.traffic().rate(), (1000, 0));
+}
+
 /// A policy naming a protocol rurge does not implement rejects, and says so
 /// on the handle so the session log can name it (M3 design §7.2 step 4).
 #[tokio::test]
