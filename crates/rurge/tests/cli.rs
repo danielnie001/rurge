@@ -49,6 +49,32 @@ fn help_names_a_credential_variable_and_leaves_its_value_out() {
     assert!(printed.is_empty(), "--help prints the value of {printed:?}");
 }
 
+/// What an option does to the profile's own listeners is said in its help: it
+/// takes the place of every address of its kind, not just the first. And a
+/// password given on the command line is there in the process list for anyone
+/// to read, which the environment variable avoids.
+#[test]
+fn help_says_that_a_listen_option_replaces_every_address_of_its_kind() {
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["run", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // clap wraps the text to the width of the terminal: read it as words
+    let help = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for said in [
+        "every http-listen address",
+        "every socks5-listen address",
+        "process list",
+    ] {
+        assert!(help.contains(said), "`{said}` is not in: {help}");
+    }
+}
+
 use std::fs;
 
 const VALID: &str = "[General]\nloglevel = notify\n[Rule]\nGEOIP,CN,DIRECT\nFINAL,DIRECT\n";
@@ -3508,14 +3534,12 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         state["current_profile"].as_str().map(str::to_string)
     }
 
-    /// Waits for the daemon to say it is running; `state.json` names its
-    /// profile by then, or soon after.
+    /// Waits for the daemon to say it is running, and gives the profile
+    /// `state.json` names by then: the record is written before that line is
+    /// printed.
     fn wait_until_recorded(daemon: &Daemon, data: &Path) -> String {
         wait_for_line(daemon, "rurge ");
-        wait_until("state.json to name the profile", || {
-            recorded_profile(data).is_some()
-        });
-        recorded_profile(data).unwrap()
+        recorded_profile(data).expect("state.json names the profile of a daemon that runs")
     }
 
     /// What `rurge run` was started with is the profile that is running, and
@@ -3586,9 +3610,7 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         drop(daemon);
         let daemon = spawn_daemon(&second, &data);
         wait_for_line(&daemon, "rurge ");
-        wait_until("the other profile to be recorded", || {
-            recorded_profile(&data).as_deref() == second.to_str()
-        });
+        assert_eq!(recorded_profile(&data).as_deref(), second.to_str());
     }
 
     /// A start that does not get to the point of saying it is running did not
@@ -3651,6 +3673,46 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             assert_eq!(recorded_profile(&fresh), None, "{what}");
         }
         drop(held);
+    }
+
+    /// The record of the profile is written on the way to saying the daemon
+    /// runs, and a record that cannot be written is a line in the log and
+    /// no more, as it is for every other write of `state.json`: the start goes
+    /// on and the daemon serves. The obstacle is the one that stops every
+    /// rewrite of the file: a directory where its temporary file goes.
+    #[test]
+    fn a_start_that_cannot_write_state_json_still_runs_and_serves() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(data.join("state.json.tmp")).unwrap();
+        let daemon = spawn_daemon(&conf, &data);
+        let api = api_port(&daemon);
+        // the lines up to the one that says it runs
+        let mut said = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let line = daemon
+                .lines
+                .recv_timeout(remaining)
+                .expect("rurge run said it runs");
+            let runs = line.starts_with("rurge ");
+            said.push(line);
+            if runs {
+                break;
+            }
+        }
+        assert!(
+            said.iter()
+                .any(|line| line.contains("cannot write state.json")),
+            "{said:?}"
+        );
+        assert_eq!(
+            api_call(api, "GET", "/v1/outbound", "k", None),
+            (200, r#"{"mode":"rule"}"#.to_string())
+        );
+        assert!(!data.join("state.json").exists());
     }
 
     /// `t.conf` with an `external` policy whose program is to listen on `port`.

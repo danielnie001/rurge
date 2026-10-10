@@ -78,8 +78,10 @@ pub struct RunArgs {
     /// A policy group without members rejects instead of going DIRECT
     #[arg(long, env = "RURGE_EMPTY_GROUP_REJECT", value_parser = switch())]
     pub empty_group_reject: bool,
-    /// Listen for HTTP proxy clients here instead of at the profile's
-    /// http-listen: [password@]address[:port], comma separated
+    /// Listen for HTTP proxy clients at these addresses, in place of every
+    /// http-listen address of the profile: [password@]address[:port], comma
+    /// separated. A password given as the option shows in the process list;
+    /// RURGE_LISTEN_HTTP keeps it out of it
     #[arg(
         long,
         env = "RURGE_LISTEN_HTTP",
@@ -87,8 +89,8 @@ pub struct RunArgs {
         value_name = "ADDR"
     )]
     pub listen_http: Option<String>,
-    /// Listen for SOCKS5 clients here instead of at the profile's
-    /// socks5-listen: address[:port], comma separated
+    /// Listen for SOCKS5 clients at these addresses, in place of every
+    /// socks5-listen address of the profile: address[:port], comma separated
     #[arg(
         long,
         env = "RURGE_LISTEN_SOCKS5",
