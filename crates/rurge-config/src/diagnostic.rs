@@ -291,7 +291,7 @@ pub mod codes {
         Some(match code {
             E_SYNTAX => "compare the line with the syntax the Surge manual gives for this section",
             E_INCLUDE_NOT_FOUND => {
-                "check that the file named after `#!include` exists and can be read as text; a relative path starts at the profile's directory"
+                "check that the file named after `#!include` exists and can be read as text; a relative path starts at the main profile's directory"
             }
             E_REQUIREMENT_SYNTAX => {
                 "write the condition as the Surge manual does, for example `#!REQUIREMENT CORE_VERSION>=22`"
@@ -315,7 +315,7 @@ pub mod codes {
             E_LISTENER_NOT_IP => {
                 "write an IP address with an optional port: `127.0.0.1` listens on this machine only, `0.0.0.0` on every interface"
             }
-            E_NESTING_TOO_DEEP => "flatten the logical rule, or split it into several rules",
+            E_NESTING_TOO_DEEP => "rewrite the logical rule with fewer levels",
             E_INCLUDE_CYCLE => {
                 "simplify the `#!include` lines: a file cannot include itself, directly or through other files, and both the nesting and the number of files are limited"
             }
@@ -325,7 +325,9 @@ pub mod codes {
             E_UNDERLYING_PROXY_CYCLE => {
                 "remove or change one of the `underlying-proxy` parameters on the loop"
             }
-            E_KEYSTORE_REF => "name a `[Keystore]` item of the kind this parameter needs",
+            E_KEYSTORE_REF => {
+                "name a `[Keystore]` item that exists and is of the kind this parameter needs"
+            }
             E_KEYSTORE_BASE64 => "encode the file as standard Base64 on a single line",
             E_SET_KIND_CONFLICT | W_SET_KIND_CONFLICT => {
                 "use the resource as one kind of set only; when both kinds are needed, keep a separate copy for each"
@@ -334,7 +336,7 @@ pub mod codes {
             W_UNKNOWN_SECTION => "check the section name's spelling against the Surge manual",
             W_UNKNOWN_RULE_PARAM => "check the parameter's spelling against the Surge manual",
             W_INVALID_HOST_LIST_ENTRY => "correct or remove the entry",
-            W_VANISHED_KEY => "remove the key",
+            W_VANISHED_KEY => "remove it",
             W_UNKNOWN_DIRECTIVE => "check the directive's spelling against the Surge manual",
             W_LINE_OUTSIDE_SECTION => "move the line under a `[Section]` header",
             W_INCLUDE_SECTION_MISSING => {
@@ -346,7 +348,7 @@ pub mod codes {
             W_SET_NESTING => {
                 "remove the reference to this set from the set that nests it, or flatten the sets"
             }
-            W_GROUP_CYCLE => "remove the reference from one of the two groups to the other",
+            W_GROUP_CYCLE => "remove one of the group references on the loop",
             _ => return None,
         })
     }
