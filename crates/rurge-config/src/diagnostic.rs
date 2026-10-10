@@ -167,6 +167,9 @@ pub mod codes {
     /// A `[WireGuard <name>]` section that cannot be used, or a
     /// `section-name` that names no usable section.
     pub const E_WIREGUARD_SECTION: &str = "E0023";
+    /// One URL or file used as both a `RULE-SET` and a `DOMAIN-SET`: one of
+    /// the two reads the file in the wrong format.
+    pub const E_SET_KIND_CONFLICT: &str = "E0024";
     pub const W_UNKNOWN_KEY: &str = "W0001";
     pub const W_UNKNOWN_SECTION: &str = "W0002";
     pub const W_UNKNOWN_RULE_PARAM: &str = "W0003";
@@ -213,6 +216,9 @@ pub mod codes {
     pub const W_GROUP_CYCLE: &str = "W0030";
     /// An `ss` stream cipher is in use: no integrity protection.
     pub const W_STREAM_CIPHER: &str = "W0031";
+    /// A set reference inside a set file that names a resource already used
+    /// as the other kind of set; it matches nothing.
+    pub const W_SET_KIND_CONFLICT: &str = "W0032";
     pub const I_LEGACY_MIGRATED: &str = "I0001";
     pub const I_LINE_DISABLED: &str = "I0002";
     /// GeoIP / ASN database file not present yet.

@@ -3,7 +3,7 @@
 use crate::deferred::DeferredSections;
 use crate::diagnostic::{Diagnostic, Diagnostics, codes};
 use crate::general::{General, parse_general};
-use crate::host::{HostEntry, parse_host_entry};
+use crate::host::{HostEntry, HostKey, parse_host_entry};
 use crate::keystore::{KeystoreItem, parse_keystore_item, unknown_field};
 use crate::managed::{ManagedConfig, parse_managed};
 use crate::policy::{
@@ -11,7 +11,9 @@ use crate::policy::{
     parse_policy, quoted_name, shown_members,
 };
 use crate::requirement::{self, Environment};
-use crate::rule::{ParseCtx, PolicyRef, Rule, RuleKind, SubRule, parse_rule, parse_subrule};
+use crate::rule::{
+    ParseCtx, PolicyRef, ResourceRef, Rule, RuleKind, SubRule, parse_rule, parse_subrule,
+};
 use crate::span::Span;
 use crate::spec::{
     GroupSpec, NameKind, NotImplemented, PolicySpec, ProtoSpec, Remark, SpecEnv, to_group_spec,
@@ -917,6 +919,76 @@ fn taken_in<'a>(
     names
 }
 
+/// A set a profile line names: the resource, the keyword it is named by and
+/// the line.
+type SetUse<'a> = (&'a ResourceRef, &'static str, &'a Span);
+
+/// The sets `kind` names — itself, or in the sub-rules of a logical rule —,
+/// all of them on `span`, the line that holds the rule.
+fn collect_set_uses<'a>(kind: &'a RuleKind, span: &'a Span, out: &mut Vec<SetUse<'a>>) {
+    match kind {
+        RuleKind::RuleSet(r) => out.push((r, "RULE-SET", span)),
+        RuleKind::DomainSet(r) => out.push((r, "DOMAIN-SET", span)),
+        RuleKind::And(subs) | RuleKind::Or(subs) => {
+            for sub in subs {
+                collect_set_uses(&sub.kind, span, out);
+            }
+        }
+        RuleKind::Not(sub) => collect_set_uses(&sub.kind, span, out),
+        _ => {}
+    }
+}
+
+/// `E0024`: a URL or a file used as a `RULE-SET` and as a `DOMAIN-SET`. The
+/// two read the same text in different formats, so one of them is a set
+/// that is empty, and the rules after it silently do not apply. Whichever
+/// use is written second is the one reported, once per resource, with the
+/// line of the first use and nothing of the reference, which can carry a
+/// password. A set of the profile or a built-in one is no resource here.
+/// Uses are taken in the order `Config` keeps them: the rules, the `[Host]`
+/// entries, the inline sets.
+fn set_kind_conflicts(config: &Config, diags: &mut Diagnostics) {
+    let mut uses = Vec::new();
+    for rule in &config.rules {
+        collect_set_uses(&rule.kind, &rule.span, &mut uses);
+    }
+    for host in &config.hosts {
+        match &host.key {
+            HostKey::RuleSet(r) => uses.push((r, "RULE-SET", &host.span)),
+            HostKey::DomainSet(r) => uses.push((r, "DOMAIN-SET", &host.span)),
+            HostKey::Pattern(_) => {}
+        }
+    }
+    // a line of an inline set has no line of its own: the set's stands for it
+    for set in &config.rulesets {
+        for line in &set.rules {
+            collect_set_uses(&line.kind, &set.span, &mut uses);
+        }
+    }
+    // the first use of each resource, and whether it has been reported
+    let mut first: HashMap<&ResourceRef, (&str, &Span, bool)> = HashMap::new();
+    for (resource, keyword, span) in uses {
+        if !matches!(resource, ResourceRef::Url(_) | ResourceRef::File(_)) {
+            continue;
+        }
+        let seen = first.entry(resource).or_insert((keyword, span, false));
+        if seen.0 != keyword && !seen.2 {
+            seen.2 = true;
+            diags.push(
+                Diagnostic::error(
+                    codes::E_SET_KIND_CONFLICT,
+                    format!(
+                        "the same resource cannot be both a RULE-SET and a DOMAIN-SET \
+(first used as a {} at {})",
+                        seen.0, seen.1
+                    ),
+                )
+                .at(span.clone()),
+            );
+        }
+    }
+}
+
 fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mut Diagnostics) {
     let exists = |name: &str, config: &Config| config.resolve_policy(name).is_some();
 
@@ -959,6 +1031,8 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
             _ => {}
         }
     }
+
+    set_kind_conflicts(config, diags);
 
     for g in &config.groups {
         for m in group_refs(g) {
@@ -2730,6 +2804,172 @@ FINAL,DIRECT
         let mut names: Vec<String> = l.config.proxy_hostnames().into_iter().collect();
         names.sort();
         assert_eq!(names, ["proxy.example.com", "vpn.example.com"]);
+    }
+
+    const SETS: &str = "https://sets.example/u.list";
+
+    /// What `E0024` said: `(line, message)`, in the order of the report.
+    fn kind_conflicts(l: &Loaded) -> Vec<(u32, String)> {
+        l.diagnostics
+            .iter()
+            .filter(|d| d.code == codes::E_SET_KIND_CONFLICT)
+            .map(|d| {
+                assert_eq!(d.severity, crate::Severity::Error);
+                assert_eq!(d.hint, None);
+                (d.span.as_ref().expect("a span").line, d.message.clone())
+            })
+            .collect()
+    }
+
+    fn conflict(first: &str, line: u32) -> String {
+        format!(
+            "the same resource cannot be both a RULE-SET and a DOMAIN-SET \
+(first used as a {first} at /profiles/t.conf:{line})"
+        )
+    }
+
+    /// The second use is the one at fault, whichever kind came first, and
+    /// the text never quotes the reference.
+    #[test]
+    fn one_resource_as_a_rule_set_and_a_domain_set_is_an_error_at_the_second_use() {
+        let l = load_text(&format!(
+            "[Rule]\nRULE-SET,{SETS},DIRECT\nDOMAIN-SET,{SETS},REJECT\nFINAL,DIRECT\n"
+        ));
+        assert!(l.diagnostics.has_errors());
+        assert_eq!(kind_conflicts(&l), [(3, conflict("RULE-SET", 2))]);
+        let l = load_text(&format!(
+            "[Rule]\nDOMAIN-SET,{SETS},REJECT\nRULE-SET,{SETS},DIRECT\nFINAL,DIRECT\n"
+        ));
+        assert_eq!(kind_conflicts(&l), [(3, conflict("DOMAIN-SET", 2))]);
+        // a path is a resource as well
+        let l =
+            load_text("[Rule]\nRULE-SET,a.list,DIRECT\nDOMAIN-SET,a.list,REJECT\nFINAL,DIRECT\n");
+        assert_eq!(kind_conflicts(&l), [(3, conflict("RULE-SET", 2))]);
+    }
+
+    /// One report per resource, however many more uses follow.
+    #[test]
+    fn a_resource_is_reported_once() {
+        let l = load_text(&format!(
+            "[Rule]\nRULE-SET,{SETS},DIRECT\nDOMAIN-SET,{SETS},REJECT\n\
+DOMAIN-SET,{SETS},REJECT\nRULE-SET,{SETS},DIRECT\nFINAL,DIRECT\n"
+        ));
+        assert_eq!(kind_conflicts(&l), [(3, conflict("RULE-SET", 2))]);
+    }
+
+    #[test]
+    fn a_host_entry_is_a_use_too() {
+        let l = load_text(&format!(
+            "[Rule]\nRULE-SET,{SETS},DIRECT\nFINAL,DIRECT\n[Host]\nDOMAIN-SET:{SETS} = 1.2.3.4\n"
+        ));
+        assert_eq!(kind_conflicts(&l), [(5, conflict("RULE-SET", 2))]);
+        let l = load_text(&format!(
+            "[Rule]\nDOMAIN-SET,{SETS},REJECT\nFINAL,DIRECT\n[Host]\nRULE-SET:{SETS} = 1.2.3.4\n"
+        ));
+        assert_eq!(kind_conflicts(&l), [(5, conflict("DOMAIN-SET", 2))]);
+    }
+
+    /// The sub-rules of a logical rule stand on the line of the rule.
+    #[test]
+    fn the_sub_rules_of_a_logical_rule_are_uses_on_the_line_of_the_rule() {
+        let l = load_text(&format!(
+            "[Rule]\nAND,((RULE-SET,{SETS}),(DEST-PORT,443)),DIRECT\nDOMAIN-SET,{SETS},REJECT\nFINAL,DIRECT\n"
+        ));
+        assert_eq!(kind_conflicts(&l), [(3, conflict("RULE-SET", 2))]);
+        let l = load_text(&format!(
+            "[Rule]\nDOMAIN-SET,{SETS},REJECT\n\
+OR,((AND,((DOMAIN,a.example),(NOT,((RULE-SET,{SETS}))))),(DEST-PORT,80)),DIRECT\nFINAL,DIRECT\n"
+        ));
+        assert_eq!(kind_conflicts(&l), [(3, conflict("DOMAIN-SET", 2))]);
+    }
+
+    /// A line of an inline set has no line of its own: the set's header is
+    /// where it stands.
+    #[test]
+    fn the_lines_of_an_inline_set_are_uses_on_the_line_of_the_set() {
+        let l = load_text(&format!(
+            "[Rule]\nRULE-SET,{SETS},DIRECT\nFINAL,DIRECT\n[Ruleset X]\nDOMAIN,a.example\nDOMAIN-SET,{SETS}\n"
+        ));
+        assert_eq!(kind_conflicts(&l), [(4, conflict("RULE-SET", 2))]);
+        let l = load_text(&format!(
+            "[Rule]\nDOMAIN-SET,{SETS},REJECT\nFINAL,DIRECT\n[Ruleset X]\n\
+AND,((RULE-SET,{SETS}),(DEST-PORT,443))\n"
+        ));
+        assert_eq!(kind_conflicts(&l), [(4, conflict("DOMAIN-SET", 2))]);
+    }
+
+    /// Two spellings of one path are one resource; a different path is not.
+    #[test]
+    fn two_spellings_of_a_path_are_one_resource() {
+        let l =
+            load_text("[Rule]\nRULE-SET,a.list,DIRECT\nDOMAIN-SET,./a.list,REJECT\nFINAL,DIRECT\n");
+        assert_eq!(kind_conflicts(&l), [(3, conflict("RULE-SET", 2))]);
+        let l =
+            load_text("[Rule]\nRULE-SET,a.list,DIRECT\nDOMAIN-SET,b.list,REJECT\nFINAL,DIRECT\n");
+        assert!(kind_conflicts(&l).is_empty());
+    }
+
+    #[test]
+    fn the_same_kind_twice_is_no_conflict() {
+        let l = load_text(&format!(
+            "[Rule]\nRULE-SET,{SETS},DIRECT\nRULE-SET,{SETS},REJECT\n\
+DOMAIN-SET,b.list,DIRECT\nDOMAIN-SET,b.list,REJECT\n\
+AND,((RULE-SET,{SETS}),(DEST-PORT,443)),DIRECT\nFINAL,DIRECT\n\
+[Host]\nRULE-SET:{SETS} = 1.2.3.4\nDOMAIN-SET:b.list = 1.2.3.4\n\
+[Ruleset X]\nRULE-SET,{SETS}\nDOMAIN-SET,b.list\n"
+        ));
+        assert!(kind_conflicts(&l).is_empty(), "{:?}", codes_of(&l));
+    }
+
+    /// Only a URL and a file are one resource under two kinds: `SYSTEM`,
+    /// `LAN` and the name of an inline set are not read as the other kind
+    /// (`DOMAIN-SET` takes a URL or a file, and a file it is, here).
+    #[test]
+    fn the_built_in_and_inline_sets_are_not_checked() {
+        let l = load_text(
+            "[Rule]\nRULE-SET,SYSTEM,DIRECT\nDOMAIN-SET,SYSTEM,REJECT\n\
+RULE-SET,LAN,DIRECT\nDOMAIN-SET,LAN,REJECT\nRULE-SET,X,DIRECT\nDOMAIN-SET,X,REJECT\nFINAL,DIRECT\n\
+[Ruleset X]\nDOMAIN,a.example\n",
+        );
+        assert!(kind_conflicts(&l).is_empty(), "{:?}", codes_of(&l));
+    }
+
+    /// A line that a requirement turned off is not a use: it never gets this
+    /// far, for the lists the check reads hold the lines that are on.
+    #[test]
+    fn a_line_that_is_off_is_not_a_use() {
+        let l = load_text(&format!(
+            "[Rule]\nRULE-SET,{SETS},DIRECT\nDOMAIN-SET,{SETS},REJECT #!IOS-ONLY\nFINAL,DIRECT\n\
+[Host]\nDOMAIN-SET:{SETS} = 1.2.3.4 #!IOS-ONLY\n[Ruleset X]\nDOMAIN-SET,{SETS} #!IOS-ONLY\n"
+        ));
+        assert!(codes_of(&l).contains(&codes::I_LINE_DISABLED));
+        assert!(kind_conflicts(&l).is_empty(), "{:?}", codes_of(&l));
+        let l = load_text(&format!(
+            "[Rule]\nRULE-SET,{SETS},DIRECT\n#!REQUIREMENT CORE_VERSION>=99 DOMAIN-SET,{SETS},REJECT\nFINAL,DIRECT\n"
+        ));
+        assert!(codes_of(&l).contains(&codes::I_LINE_DISABLED));
+        assert!(kind_conflicts(&l).is_empty(), "{:?}", codes_of(&l));
+    }
+
+    /// A URL can carry a user name and a password; neither it nor the rest
+    /// of the reference is in the text.
+    #[test]
+    fn the_report_quotes_no_part_of_the_reference() {
+        let url = "https://al1ce:S3CR3T@sets.example/gh/user/repo@main/u.list?token=t0k3n";
+        let l = load_text(&format!(
+            "[Rule]\nRULE-SET,{url},DIRECT\nDOMAIN-SET,{url},REJECT\nFINAL,DIRECT\n"
+        ));
+        assert_eq!(kind_conflicts(&l), [(3, conflict("RULE-SET", 2))]);
+        for d in l
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::E_SET_KIND_CONFLICT)
+        {
+            let shown = d.to_string();
+            for part in ["S3CR3T", "al1ce", "t0k3n", "sets.example", "u.list"] {
+                assert!(!shown.contains(part), "{shown}");
+            }
+        }
     }
 
     #[test]

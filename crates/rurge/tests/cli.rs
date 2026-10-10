@@ -973,6 +973,47 @@ fn check_assembles_the_subscriptions_it_has() {
     assert!(!out.contains("t0k3n"), "{out}");
 }
 
+/// One resource used as both a `RULE-SET` and a `DOMAIN-SET` is an error of
+/// the profile — the one thing `check` has to say about it, quoting nothing
+/// of the reference (a URL can carry a password).
+#[test]
+fn check_refuses_one_resource_as_two_kinds_of_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = "https://al1ce:S3CR3T@sets.example/u.list";
+    let conf = write(
+        &dir,
+        "kinds.conf",
+        &format!("[Rule]\nRULE-SET,{url},DIRECT\nDOMAIN-SET,{url},REJECT\nFINAL,DIRECT\n"),
+    );
+    Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(&conf)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("error[E0024] "))
+        .stdout(predicate::str::contains(
+            "kinds.conf:3: the same resource cannot be both a RULE-SET and a DOMAIN-SET",
+        ))
+        .stdout(predicate::str::contains("kinds.conf:2)"))
+        .stdout(predicate::str::contains("1 error(s)"))
+        .stdout(predicate::str::contains("W0032").not())
+        .stdout(predicate::str::contains("S3CR3T").not())
+        .stdout(predicate::str::contains("sets.example").not());
+    // the same resource in one role twice is fine
+    Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(write(
+            &dir,
+            "once.conf",
+            &format!("[Rule]\nRULE-SET,{url},DIRECT\nRULE-SET,{url},REJECT\nFINAL,DIRECT\n"),
+        ))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("E0024").not());
+}
+
 mod rule_match {
     use assert_cmd::Command;
     use predicates::prelude::*;

@@ -2,7 +2,9 @@
 //! Internal and inline sets compile once; external sets come from the
 //! `ResourceManager` and are recompiled and swapped whenever the resource
 //! changes. Nested references are resolved through the same registry with
-//! cycle detection and a nesting limit of 8.
+//! cycle detection and a nesting limit of 8. A file or URL is read in one
+//! format only, the one it is first registered in: a later reference to it as
+//! the other kind of set is left out with a warning.
 
 use crate::matcher::{SetLookup, SetRef};
 use crate::set::{CompiledSet, SetHandle};
@@ -237,21 +239,40 @@ impl SetRegistry {
             tracing::warn!(set = %name, "nested set reference ignored: {why}");
             return SetHandle::new(CompiledSet::empty(&name, kind));
         }
-        {
+        let other = match kind {
+            SetKind::RuleSet => SetKind::DomainSet,
+            SetKind::DomainSet => SetKind::RuleSet,
+        };
+        let conflicts = {
             let mut entries = self.entries.lock().expect("registry lock");
             if let Some(e) = entries.get(&(key.clone(), kind)) {
                 return e.handle.clone();
             }
-            entries.insert(
-                (key.clone(), kind),
-                Entry {
-                    handle: SetHandle::new(CompiledSet::empty(&name, kind)),
-                    resource: None,
-                    skipped: 0,
-                    truncated: 0,
-                    state: "compiling".to_string(),
-                },
+            // One file or URL, two formats: the first role keeps the set.
+            let conflicts = matches!(key, Key::Url(_) | Key::File(_))
+                && entries.contains_key(&(key.clone(), other));
+            if !conflicts {
+                entries.insert(
+                    (key.clone(), kind),
+                    Entry {
+                        handle: SetHandle::new(CompiledSet::empty(&name, kind)),
+                        resource: None,
+                        skipped: 0,
+                        truncated: 0,
+                        state: "compiling".to_string(),
+                    },
+                );
+            }
+            conflicts
+        };
+        if conflicts {
+            let said = format!(
+                "set `{name}` ignored: the same resource is already used as a {}",
+                other.keyword()
             );
+            self.push_diag(Diagnostic::warning(codes::W_SET_KIND_CONFLICT, &said));
+            tracing::warn!("{said}");
+            return SetHandle::new(CompiledSet::empty(&name, kind));
         }
         let handle = self.handle_of(&key, kind);
         let _guard = push_key(key.clone());
@@ -536,6 +557,20 @@ mod tests {
         )
     }
 
+    /// Nothing is fetched: a URL is unavailable unless a copy is cached.
+    fn offline_manager(root: &Path) -> Arc<ResourceManager> {
+        let connector = Arc::new(DirectConnector::new(Arc::new(SystemResolve)));
+        let client = Arc::new(HttpClient::new(connector, HttpClientConfig::default()).unwrap());
+        ResourceManager::with_options(
+            root.to_path_buf(),
+            client,
+            ResourceOptions {
+                offline: true,
+                ..ResourceOptions::default()
+            },
+        )
+    }
+
     fn load(text: &str, base: &Path) -> Config {
         let l = from_text(text, &base.join("t.conf"), &LoadOptions::for_tests());
         let codes: Vec<&str> = l.diagnostics.iter().map(|d| d.code).collect();
@@ -744,22 +779,12 @@ mod tests {
     #[tokio::test]
     async fn a_pre_matching_rule_set_that_is_not_downloaded_matches_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let connector = Arc::new(DirectConnector::new(Arc::new(SystemResolve)));
-        let client = Arc::new(HttpClient::new(connector, HttpClientConfig::default()).unwrap());
-        let offline = ResourceManager::with_options(
-            dir.path().to_path_buf(),
-            client,
-            ResourceOptions {
-                offline: true,
-                ..ResourceOptions::default()
-            },
-        );
         let cfg = load(
             "[Proxy]\nP = direct\n[Rule]\nRULE-SET,http://sets.example/a.list,REJECT,pre-matching\n\
 DOMAIN,a.com,P\nFINAL,DIRECT\n",
             dir.path(),
         );
-        let (reg, diags) = SetRegistry::build(&cfg, offline, dir.path());
+        let (reg, diags) = SetRegistry::build(&cfg, offline_manager(dir.path()), dir.path());
         assert_eq!(codes_of(&diags), vec![codes::W_RESOURCE_UNAVAILABLE]);
         let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
         assert_eq!(
@@ -785,6 +810,174 @@ DOMAIN,a.com,P\nFINAL,DIRECT\n",
         assert_eq!(st.len(), 1);
         assert_eq!(st[0].kind, SetKind::DomainSet);
         assert_eq!(st[0].entries, 1);
+    }
+
+    /// `rule.com` is a line of a rule set and `domain-set.com` one of a domain
+    /// set: each name is matched by one reading of the file only, and is a
+    /// skipped line in the other.
+    const BOTH_KINDS: &str = "DOMAIN,rule.com\ndomain-set.com\n";
+
+    /// A file that is a rule set at the top of the profile and a domain set
+    /// inside another set file is one set, the first: the nested reference
+    /// is left out with a warning, and the file is not read a second time
+    /// in the other format.
+    #[tokio::test]
+    async fn a_domain_set_nested_in_a_file_cannot_reuse_a_rule_set() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.list"), BOTH_KINDS).unwrap();
+        std::fs::write(
+            dir.path().join("b.list"),
+            "DOMAIN-SET,a.list\nDOMAIN,b.com\n",
+        )
+        .unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,a.list,P\nRULE-SET,b.list,REJECT\nFINAL,DIRECT\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        // the one reading of `a.list` skips `domain-set.com`; a second one
+        // would have skipped `DOMAIN,rule.com` and said so
+        assert_eq!(
+            codes_of(&diags),
+            [codes::W_SET_LINES_SKIPPED, codes::W_SET_KIND_CONFLICT]
+        );
+        let a = dir.path().join("a.list").display().to_string();
+        assert_eq!(
+            diags.iter().last().map(|d| d.message.as_str()),
+            Some(
+                format!("set `{a}` ignored: the same resource is already used as a RULE-SET")
+                    .as_str()
+            )
+        );
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "rule.com").await.0, "P");
+        // read as a domain set, `a.list` would have matched this one
+        assert_eq!(decide(&engine, "domain-set.com").await.0, "DIRECT");
+        assert_eq!(decide(&engine, "b.com").await.0, "REJECT");
+        let statuses: Vec<(String, SetKind)> = reg
+            .statuses()
+            .into_iter()
+            .map(|s| (s.name, s.kind))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                (a, SetKind::RuleSet),
+                (
+                    dir.path().join("b.list").display().to_string(),
+                    SetKind::RuleSet
+                )
+            ]
+        );
+    }
+
+    /// And the other way round: the first role is the one that stays.
+    #[tokio::test]
+    async fn a_rule_set_nested_in_a_file_cannot_reuse_a_domain_set() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.list"), BOTH_KINDS).unwrap();
+        std::fs::write(dir.path().join("b.list"), "RULE-SET,a.list\nDOMAIN,b.com\n").unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nDOMAIN-SET,a.list,P\nRULE-SET,b.list,REJECT\nFINAL,DIRECT\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        assert_eq!(
+            codes_of(&diags),
+            [codes::W_SET_LINES_SKIPPED, codes::W_SET_KIND_CONFLICT]
+        );
+        let a = dir.path().join("a.list").display().to_string();
+        assert_eq!(
+            diags.iter().last().map(|d| d.message.as_str()),
+            Some(
+                format!("set `{a}` ignored: the same resource is already used as a DOMAIN-SET")
+                    .as_str()
+            )
+        );
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "domain-set.com").await.0, "P");
+        assert_eq!(decide(&engine, "rule.com").await.0, "DIRECT");
+        assert_eq!(decide(&engine, "b.com").await.0, "REJECT");
+        let kinds: Vec<SetKind> = reg
+            .statuses()
+            .into_iter()
+            .filter(|s| s.name == a)
+            .map(|s| s.kind)
+            .collect();
+        assert_eq!(kinds, [SetKind::DomainSet]);
+    }
+
+    /// A file that nests itself as the other kind is a cycle, as it always
+    /// was: the cycle is looked for first.
+    #[tokio::test]
+    async fn a_file_nesting_itself_as_the_other_kind_is_still_a_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.list"),
+            "DOMAIN-SET,a.list\nDOMAIN,a.com\n",
+        )
+        .unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,a.list,P\nFINAL,DIRECT\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        assert_eq!(codes_of(&diags), [codes::W_SET_NESTING]);
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "a.com").await.0, "P");
+    }
+
+    /// The warning names a URL the way the statuses do: its user name and
+    /// password are `***`, nowhere else.
+    #[tokio::test]
+    async fn the_warning_for_a_nested_url_hides_its_user_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://al1ce:S3CR3T@sets.example/gh/user/repo@main/a.list";
+        std::fs::write(
+            dir.path().join("b.list"),
+            format!("DOMAIN-SET,{url}\nDOMAIN,b.com\n"),
+        )
+        .unwrap();
+        let cfg = load(
+            &format!(
+                "[Proxy]\nP = direct\n[Rule]\nRULE-SET,{url},P\nRULE-SET,b.list,REJECT\nFINAL,DIRECT\n"
+            ),
+            dir.path(),
+        );
+        let (_reg, diags) = SetRegistry::build(&cfg, offline_manager(dir.path()), dir.path());
+        let texts: Vec<(&str, &str)> = diags.iter().map(|d| (d.code, d.message.as_str())).collect();
+        assert!(
+            texts.contains(&(
+                codes::W_SET_KIND_CONFLICT,
+                "set `https://***@sets.example/gh/user/repo@main/a.list` ignored: \
+the same resource is already used as a RULE-SET"
+            )),
+            "{texts:?}"
+        );
+        for (_, text) in texts {
+            assert!(
+                !text.contains("S3CR3T") && !text.contains("al1ce"),
+                "{text}"
+            );
+        }
+    }
+
+    /// The same resource in the same role, however often and from wherever,
+    /// is one set and no conflict.
+    #[tokio::test]
+    async fn the_same_resource_in_the_same_role_is_one_set() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.list"), "DOMAIN,a.com\n").unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,a.list,P\nRULE-SET,a.list,REJECT\nFINAL,DIRECT\n\
+[Host]\nRULE-SET:a.list = 1.2.3.4\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        assert!(diags.is_empty(), "{:?}", codes_of(&diags));
+        assert_eq!(reg.statuses().len(), 1);
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "a.com").await.0, "P");
     }
 
     /// F1 regression: a hot reload used to clear the compile stack and
