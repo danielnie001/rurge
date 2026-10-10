@@ -12,6 +12,7 @@ use rurge_config::rule::PolicyRef;
 use rurge_policy::PolicyRegistry;
 use sha2::{Digest, Sha256};
 use std::fmt;
+use std::net::IpAddr;
 
 pub struct MemberView {
     pub name: String,
@@ -32,6 +33,17 @@ pub struct GroupView {
     pub members: Vec<MemberView>,
     /// The member the group points at right now.
     pub selected: Option<String>,
+}
+
+/// What the GeoIP and ASN databases in use say of an address, and when they
+/// were built (UNIX seconds); `None` for what a database does not say or is
+/// not there to say.
+pub struct GeoIpView {
+    pub country: Option<String>,
+    pub asn: Option<u32>,
+    pub organization: Option<String>,
+    pub country_db_date: Option<u64>,
+    pub asn_db_date: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +101,22 @@ fn member_view(registry: &PolicyRegistry, name: &str) -> MemberView {
 }
 
 impl Engine {
+    /// What the databases behind the `GEOIP` and `IP-ASN` rules say of `ip`,
+    /// as of now: a database the updater has just swapped in is the one asked.
+    pub fn geoip_view(&self, ip: IpAddr) -> GeoIpView {
+        let runtime = self.runtime();
+        let geo = &runtime.stack.geo;
+        let answer = geo.describe(ip);
+        let info = geo.info();
+        GeoIpView {
+            country: answer.country,
+            asn: answer.asn,
+            organization: answer.organization,
+            country_db_date: info.country_epoch,
+            asn_db_date: info.asn_epoch,
+        }
+    }
+
     pub fn groups_view(&self) -> Vec<GroupView> {
         let registry = self.registry();
         registry

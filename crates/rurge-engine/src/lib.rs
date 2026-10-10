@@ -30,4 +30,4 @@ pub use rurge_policy::EmptyGroup;
 pub use rurge_policy::testbook::TestResult;
 pub use shared::{EngineShared, ExternalPrograms, ResolverCell};
 pub use subscriptions::check_profile;
-pub use views::{GroupView, MemberView, SelectError};
+pub use views::{GeoIpView, GroupView, MemberView, SelectError};

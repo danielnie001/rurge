@@ -90,6 +90,7 @@ pub fn router(key: String, ctx: ApiContext) -> Router {
         .route("/v1/dns", get(routes::dns::dns))
         .route("/v1/dns/flush", post(routes::dns::flush))
         .route("/v1/test/dns_delay", post(routes::dns::dns_delay))
+        .route("/v1/geoip", get(routes::geoip::geoip))
         .route("/v1/profiles/current", get(routes::profiles::current))
         .route("/v1/profiles/reload", post(routes::profiles::reload))
         .route("/v1/profiles/check", post(routes::profiles::check))

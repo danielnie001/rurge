@@ -1,5 +1,6 @@
 pub mod dns;
 pub mod features;
+pub mod geoip;
 pub mod log;
 pub mod misc;
 pub mod outbound;

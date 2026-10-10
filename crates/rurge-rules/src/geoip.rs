@@ -43,6 +43,16 @@ pub struct GeoDbInfo {
     pub asn_path: PathBuf,
 }
 
+/// What the databases in use say of one address: a field whose database is
+/// not loaded, or has no entry for the address, is `None`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GeoAnswer {
+    /// The ISO 3166 code as the database gives it.
+    pub country: Option<String>,
+    pub asn: Option<u32>,
+    pub organization: Option<String>,
+}
+
 pub struct GeoDb {
     dir: PathBuf,
     country: ArcSwapOption<Reader<Vec<u8>>>,
@@ -137,6 +147,35 @@ impl GeoDb {
         }
     }
 
+    /// Everything the databases know of `ip`. It asks for what there is: unlike
+    /// the lookups the rules make, it does not warn of a database that is not
+    /// loaded.
+    pub fn describe(&self, ip: IpAddr) -> GeoAnswer {
+        let country = self.country.load();
+        let country = country.as_ref().and_then(|reader| {
+            let result = reader.lookup(ip).ok()?;
+            let record = result.decode::<geoip2::Country>().ok().flatten()?;
+            record.country.iso_code.map(str::to_string)
+        });
+        let asn = self.asn.load();
+        let (asn, organization) = asn
+            .as_ref()
+            .and_then(|reader| {
+                let result = reader.lookup(ip).ok()?;
+                let record = result.decode::<geoip2::Asn>().ok().flatten()?;
+                Some((
+                    record.autonomous_system_number,
+                    record.autonomous_system_organization.map(str::to_string),
+                ))
+            })
+            .unwrap_or_default();
+        GeoAnswer {
+            country,
+            asn,
+            organization,
+        }
+    }
+
     fn warn_missing(&self, kind: DbKind) {
         let flag = match kind {
             DbKind::Country => &self.warned_country,
@@ -223,6 +262,60 @@ mod tests {
         let info = db.info();
         assert!(info.country_epoch.is_some() && info.asn_epoch.is_some());
         assert!(info.country_path.ends_with(COUNTRY_FILE));
+    }
+
+    /// `describe` gives what each loaded database knows: the country from the
+    /// country database, the number and the organisation from the ASN one.
+    #[test]
+    fn describe_gives_what_the_loaded_databases_know() {
+        let dir = dir_with_fixtures();
+        let (db, _) = GeoDb::open(dir.path());
+        let answer = |ip: &str| db.describe(ip.parse().unwrap());
+        // in both
+        assert_eq!(
+            answer("89.160.20.112"),
+            GeoAnswer {
+                country: Some("SE".into()),
+                asn: Some(29518),
+                organization: Some("Bredband2 AB".into()),
+            }
+        );
+        // in one of them each
+        assert_eq!(
+            answer("2001:218::1"),
+            GeoAnswer {
+                country: Some("JP".into()),
+                asn: None,
+                organization: None,
+            }
+        );
+        assert_eq!(
+            answer("1.0.0.1"),
+            GeoAnswer {
+                country: None,
+                asn: Some(15169),
+                organization: Some("Google Inc.".into()),
+            }
+        );
+        // in neither
+        assert_eq!(answer("127.0.0.1"), GeoAnswer::default());
+    }
+
+    /// Asking what is known is no rule that needs a database: a missing one
+    /// leaves its fields empty and is not warned of, while the lookups the
+    /// rules make warn once.
+    #[test]
+    fn describe_does_not_warn_of_a_missing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _) = GeoDb::open(dir.path());
+        let ip: IpAddr = "89.160.20.112".parse().unwrap();
+        assert_eq!(db.describe(ip), GeoAnswer::default());
+        assert!(!db.warned_country.load(Ordering::Relaxed));
+        assert!(!db.warned_asn.load(Ordering::Relaxed));
+        assert_eq!(db.country(ip), None);
+        assert_eq!(db.asn(ip), None);
+        assert!(db.warned_country.load(Ordering::Relaxed));
+        assert!(db.warned_asn.load(Ordering::Relaxed));
     }
 
     #[test]

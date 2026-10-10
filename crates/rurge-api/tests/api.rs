@@ -17,10 +17,11 @@ use rurge_engine::state::{STATE_FILE, State, StateStore};
 use rurge_engine::{Engine, EngineShared, ListenerSpec, Running, Runtime, RuntimeOptions};
 use rurge_net::BoxFuture;
 use rurge_net::testing::TestServer;
-use rurge_rules::{GeoUrls, OutboundMode};
+use rurge_rules::geoip::{ASN_FILE, COUNTRY_FILE};
+use rurge_rules::{DbKind, GeoDb, GeoUrls, OutboundMode};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -130,6 +131,11 @@ async fn api_with(rules: &str) -> Api {
 /// never at the default `http://bing.com/`; no test here has one tested,
 /// and none may count on what that port answers.
 async fn api_in(rules: &str, groups: &str) -> Api {
+    api_seeded(rules, groups, |_| {}).await
+}
+
+/// `api_in`, `seed` having filled the data directory before the engine starts.
+async fn api_seeded(rules: &str, groups: &str, seed: impl FnOnce(&Path)) -> Api {
     let dns = MockDns::spawn().await;
     dns.set("target.test", &["127.0.0.1"], &[], 60);
     dns.set("cached.test", &["10.0.0.1"], &[], 300);
@@ -137,6 +143,7 @@ async fn api_in(rules: &str, groups: &str) -> Api {
     target.set("/hello", "hi there");
     target.set("/big", "x".repeat(4096));
     let dir = tempfile::tempdir().unwrap();
+    seed(dir.path());
     let conf = dir.path().join("t.conf");
     let profile = format!(
         "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\ndns-server = {}\nipv6 = false\n\
@@ -1222,4 +1229,124 @@ async fn profile_check_includes_the_dry_build() {
         .collect();
     assert!(codes.contains(&"E0022"), "{codes:?}");
     assert!(!body.to_string().contains("hunter2"));
+}
+
+/// The test databases of the rule engine's crate.
+fn geoip_fixture(file: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../rurge-rules/tests/fixtures")
+        .join(file)
+}
+
+/// Puts the test databases where the engine looks for the ones it uses.
+fn with_geoip_databases(data: &Path) {
+    let dir = data.join("geoip");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (fixture, name) in [
+        ("GeoIP2-Country-Test.mmdb", COUNTRY_FILE),
+        ("GeoLite2-ASN-Test.mmdb", ASN_FILE),
+    ] {
+        std::fs::copy(geoip_fixture(fixture), dir.join(name)).unwrap();
+    }
+}
+
+/// `/v1/geoip` answers from the databases the rules use: each field from the
+/// one that has it, the dates the ones the databases were built on, and
+/// `null` for what an address has no entry for.
+#[tokio::test]
+async fn geoip_says_what_the_databases_in_use_know() {
+    let api = api_seeded("", "", with_geoip_databases).await;
+    let built = |fixture: &str, kind| {
+        GeoDb::validate(&std::fs::read(geoip_fixture(fixture)).unwrap(), kind).unwrap()
+    };
+    let country_date = built("GeoIP2-Country-Test.mmdb", DbKind::Country);
+    let asn_date = built("GeoLite2-ASN-Test.mmdb", DbKind::Asn);
+    let ask = async |ip: &str| get(&api, &format!("/v1/geoip?ip={ip}")).await;
+    // in both databases
+    assert_eq!(
+        ask("89.160.20.112").await,
+        (
+            200,
+            json!({
+                "address": "89.160.20.112",
+                "country": "SE",
+                "asn": 29518,
+                "organization": "Bredband2 AB",
+                "geoip-db-date": country_date,
+                "asn-db-date": asn_date,
+            })
+        )
+    );
+    // in the country database only; the address is echoed as parsed
+    assert_eq!(
+        ask("2001:0218:0:0:0:0:0:1").await,
+        (
+            200,
+            json!({
+                "address": "2001:218::1",
+                "country": "JP",
+                "asn": null,
+                "organization": null,
+                "geoip-db-date": country_date,
+                "asn-db-date": asn_date,
+            })
+        )
+    );
+    // in neither: nothing to say, and the dates are still there
+    assert_eq!(
+        ask("127.0.0.1").await,
+        (
+            200,
+            json!({
+                "address": "127.0.0.1",
+                "country": null,
+                "asn": null,
+                "organization": null,
+                "geoip-db-date": country_date,
+                "asn-db-date": asn_date,
+            })
+        )
+    );
+}
+
+/// With no database in the data directory every field is `null`.
+#[tokio::test]
+async fn geoip_without_databases_has_nothing_to_say() {
+    let api = api().await;
+    assert_eq!(
+        get(&api, "/v1/geoip?ip=89.160.20.112").await,
+        (
+            200,
+            json!({
+                "address": "89.160.20.112",
+                "country": null,
+                "asn": null,
+                "organization": null,
+                "geoip-db-date": null,
+                "asn-db-date": null,
+            })
+        )
+    );
+}
+
+/// An `ip` that is missing or no address is a 400 in the shape of every other
+/// one; the endpoint wants the key like the rest.
+#[tokio::test]
+async fn geoip_wants_an_address_and_the_key() {
+    let api = api().await;
+    assert_eq!(
+        get(&api, "/v1/geoip?ip=nonsense").await,
+        (400, json!({ "error": "ip is not a valid IP address" }))
+    );
+    assert_eq!(
+        get(&api, "/v1/geoip?ip=").await,
+        (400, json!({ "error": "ip is not a valid IP address" }))
+    );
+    let (status, body) = get(&api, "/v1/geoip").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("`ip`"), "{body}");
+    assert_eq!(
+        call(api.addr, "GET", "/v1/geoip?ip=1.0.0.1", None, None).await,
+        (401, json!({ "error": "unauthorized" }))
+    );
 }
