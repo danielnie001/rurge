@@ -97,8 +97,10 @@ pub fn packet_datagram(socket: BoxedPacketSocket, to: Target) -> BoxedDatagram {
             }
         }
     });
+    // Compared in the canonical form, on both sides: a relay whose socket is dual-stack reports
+    // the source of an IPv4 peer as `::ffff:a.b.c.d`.
     let from_peer = match &to.host {
-        HostName::Ip(_) => Some(to.clone()),
+        HostName::Ip(_) => Some(Target::new(to.host.clone().canonical(), to.port)),
         HostName::Domain(_) => None,
     };
     let ending = failed.clone();
@@ -107,6 +109,7 @@ pub fn packet_datagram(socket: BoxedPacketSocket, to: Target) -> BoxedDatagram {
         let ended = loop {
             match socket.recv_from(&mut buf).await {
                 Ok((n, from)) => {
+                    let from = Target::new(from.host.canonical(), from.port);
                     if from_peer.as_ref().is_none_or(|peer| *peer == from) {
                         let _ = arrived.try_send(buf[..n].to_vec());
                     }
@@ -306,6 +309,29 @@ mod tests {
         arrive.send((peer.clone(), b"back".to_vec())).await.unwrap();
         assert_eq!(recv(&datagram).await.unwrap(), b"back");
         assert_eq!(*sent.lock().unwrap(), [(peer, b"out".to_vec())]);
+    }
+
+    /// A relay whose socket is dual-stack reports the source of an answer
+    /// from an IPv4 peer as `::ffff:a.b.c.d`: still the peer, whichever of
+    /// the two forms the peer was given in. A stranger in that form is not.
+    #[tokio::test]
+    async fn a_peer_is_heard_from_its_ipv4_address_in_ipv6_form() {
+        for (peer, source, stranger) in [
+            ("127.0.0.1", "::ffff:127.0.0.1", "::ffff:198.51.100.1"),
+            ("::ffff:127.0.0.1", "127.0.0.1", "198.51.100.1"),
+        ] {
+            let (socket, (arrive, _sent)) = scripted();
+            let datagram = packet_datagram(socket, at(peer, 51820));
+            let stranger = (at(stranger, 51820), b"stranger".to_vec());
+            arrive.send(stranger).await.unwrap();
+            let answer = (at(source, 51820), b"back".to_vec());
+            arrive.send(answer).await.unwrap();
+            assert_eq!(
+                recv(&datagram).await.unwrap(),
+                b"back",
+                "{peer} heard from {source}"
+            );
+        }
     }
 
     /// A peer known by name (the chain's server resolves it) cannot be told

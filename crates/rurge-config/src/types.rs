@@ -42,8 +42,13 @@ impl HostName {
     /// An IPv4 address written in IPv6 form (`::ffff:a.b.c.d`) is the IPv4
     /// address it names. That is the form the rules look an address up in
     /// (by family), the request log shows, and an answer's source is compared
-    /// in to find the flow it belongs to: every target an inbound hands on,
-    /// and every source an outbound reports, passes through here.
+    /// in to find the flow it belongs to. Every target an inbound hands on
+    /// passes through here. A source an outbound reports does not: a
+    /// dual-stack server reports an IPv4 peer in IPv6 form, and the places
+    /// that compare a reported source with a target put both in this form
+    /// first — `receive` of the UDP pipeline in `rurge-engine`, the receive
+    /// task of `packet_datagram` in `rurge-net`, and `udp_probe` in
+    /// `rurge-policy`.
     pub fn canonical(self) -> HostName {
         match self {
             HostName::Ip(ip) => HostName::Ip(ip.to_canonical()),

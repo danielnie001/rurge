@@ -76,6 +76,9 @@ pub(crate) async fn probe_udp_at(
     let question =
         question(id, hostname).ok_or_else(|| format!("`{hostname}` cannot be asked for"))?;
     let to = Target::new(HostName::Ip(server.ip()), server.port());
+    // Compared in the canonical form, on both sides: a relay whose socket is dual-stack reports
+    // the source of an IPv4 server as `::ffff:a.b.c.d`.
+    let asked = Target::new(to.host.clone().canonical(), to.port);
     let exchange = async {
         let carrier = outbound
             .open_udp(&ConnectOpts { timeout })
@@ -92,7 +95,8 @@ pub(crate) async fn probe_udp_at(
                 .recv_from(&mut buf)
                 .await
                 .map_err(|e| e.to_string())?;
-            if from == to && answers(&buf[..n], id) {
+            let from = Target::new(from.host.canonical(), from.port);
+            if from == asked && answers(&buf[..n], id) {
                 return Ok(sent.elapsed());
             }
         }
@@ -106,10 +110,15 @@ pub(crate) async fn probe_udp_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rurge_net::connector::{DirectConnector, SystemResolve};
-    use rurge_proto::{Direct, Reject, RejectKind};
+    use rurge_net::BoxFuture;
+    use rurge_net::connector::{
+        BoxedPacketSocket, BoxedStream, DirectConnector, PacketSocket, SystemResolve,
+    };
+    use rurge_proto::{Direct, Outbound, OutboundError, Reject, RejectKind};
+    use std::io;
     use std::sync::Arc;
     use tokio::net::UdpSocket;
+    use tokio::sync::mpsc;
 
     fn direct() -> OutboundRef {
         Arc::new(Direct::new(Arc::new(DirectConnector::new(Arc::new(
@@ -173,6 +182,100 @@ mod tests {
             .await
             .expect("an answer");
         assert!(took < Duration::from_secs(5));
+    }
+
+    /// A carrier that answers every question at once, from the address it
+    /// was asked at in its other form: an IPv4 address in IPv6 form, which is
+    /// what a dual-stack relay's socket reports of an IPv4 server, or the
+    /// IPv4 address of one written in IPv6 form.
+    struct FromTheOtherForm {
+        answers: mpsc::UnboundedSender<(Vec<u8>, Target)>,
+        heard: tokio::sync::Mutex<mpsc::UnboundedReceiver<(Vec<u8>, Target)>>,
+    }
+
+    impl PacketSocket for FromTheOtherForm {
+        fn send_to<'a>(&'a self, buf: &'a [u8], to: &'a Target) -> BoxFuture<'a, io::Result<()>> {
+            let mut answer = buf.to_vec();
+            answer[2] |= 0x80;
+            let from = match &to.host {
+                HostName::Ip(IpAddr::V4(ip)) => IpAddr::V6(ip.to_ipv6_mapped()),
+                HostName::Ip(ip) => ip.to_canonical(),
+                HostName::Domain(_) => unreachable!("the probe asks an address"),
+            };
+            let _ = self
+                .answers
+                .send((answer, Target::new(HostName::Ip(from), to.port)));
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn recv_from<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> BoxFuture<'a, io::Result<(usize, Target)>> {
+            Box::pin(async move {
+                let (answer, from) = self
+                    .heard
+                    .lock()
+                    .await
+                    .recv()
+                    .await
+                    .ok_or(io::ErrorKind::BrokenPipe)?;
+                buf[..answer.len()].copy_from_slice(&answer);
+                Ok((answer.len(), from))
+            })
+        }
+    }
+
+    /// An outbound that carries UDP over `FromTheOtherForm`.
+    struct Relay;
+
+    impl Outbound for Relay {
+        fn name(&self) -> &str {
+            "Relay"
+        }
+
+        fn connect_tcp<'a>(
+            &'a self,
+            _target: &'a Target,
+            _opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, Result<BoxedStream, OutboundError>> {
+            Box::pin(std::future::ready(Err(OutboundError::Proxy(
+                "no TCP in the test".to_string(),
+            ))))
+        }
+
+        fn udp(&self) -> UdpSupport {
+            UdpSupport::Native
+        }
+
+        fn open_udp<'a>(
+            &'a self,
+            _opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, Result<BoxedPacketSocket, OutboundError>> {
+            let (answers, heard) = mpsc::unbounded_channel();
+            let carrier = FromTheOtherForm {
+                answers,
+                heard: tokio::sync::Mutex::new(heard),
+            };
+            Box::pin(std::future::ready(Ok(
+                Box::new(carrier) as BoxedPacketSocket
+            )))
+        }
+    }
+
+    /// An IPv4 server's answer that comes from `::ffff:a.b.c.d` is the
+    /// server's answer, and so is one that comes from `a.b.c.d` when the
+    /// server was written in IPv6 form.
+    #[tokio::test]
+    async fn an_answer_from_the_other_form_of_the_servers_address_is_its_answer() {
+        let relay: OutboundRef = Arc::new(Relay);
+        for server in ["192.0.2.53:53", "[::ffff:192.0.2.53]:53"] {
+            let at: SocketAddr = server.parse().unwrap();
+            let took = probe_udp_at(&relay, "apple.com", at, Duration::from_secs(5))
+                .await
+                .unwrap_or_else(|e| panic!("{server}: {e}"));
+            assert!(took < Duration::from_secs(5), "{server}");
+        }
     }
 
     /// No answer within the time is a failure, saying so; a policy without

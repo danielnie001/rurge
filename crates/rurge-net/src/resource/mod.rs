@@ -355,6 +355,10 @@ impl ResourceManager {
 
     fn register(&self, spec: &ResourceSpec, label: Option<&str>) -> ResourceHandle {
         let key = spec.source.key();
+        // An interval of 0 is read as none written: a refresh due again as soon as it is done
+        // would make the task fetch as fast as the server answers. Here, where every caller's
+        // interval enters, so that `effective_interval` never sees 0.
+        let interval = spec.update_interval.filter(|&seconds| seconds != 0);
         // Look up and (if absent) insert inside one critical section: releasing the lock
         // between a "not found" lookup and the insert let two concurrent first calls for the
         // same source each create their own `Entry` and background task. `start` itself is
@@ -362,7 +366,7 @@ impl ResourceManager {
         let (entry, is_new) = {
             let mut entries = self.entries.lock().expect("entries");
             if let Some(existing) = entries.get(&key) {
-                merge_interval(existing, spec.update_interval);
+                merge_interval(existing, interval);
                 if let Some(label) = label {
                     existing
                         .label
@@ -378,7 +382,7 @@ impl ResourceManager {
                     label: Mutex::new(label.map(str::to_string)),
                     state: Mutex::new(ResourceState::Missing),
                     meta: Mutex::new(None),
-                    interval: Mutex::new(spec.update_interval),
+                    interval: Mutex::new(interval),
                     next_refresh: Mutex::new(None),
                     tx,
                     kick: Notify::new(),
@@ -549,25 +553,26 @@ async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>, mut gone: watc
         drop(mgr);
         let due = next_due(&entry, backoff);
         *entry.next_refresh.lock().expect("next") = next_refresh_at(due);
-        // `due` is `None` only when auto-refresh is disabled (negative interval): then the
-        // task waits for a kick (`force_update`) or for the manager to go, and for nothing else
-        let timer = async {
-            match due {
-                Some(wait) => tokio::time::sleep(wait).await,
-                None => std::future::pending().await,
-            }
-        };
-        tokio::select! {
-            _ = timer => {}
-            _ = entry.kick.notified() => {}
+        // `due` is `None` only when auto-refresh is disabled (negative interval): nothing is due
+        // then, but another user of the same resource may ask for auto-refresh (`merge_interval`
+        // turns the interval positive), and waking once a minute is how the task comes to see
+        // it. The manager going is `gone`'s business.
+        let wait = due.unwrap_or(Duration::from_secs(60));
+        let kicked = tokio::select! {
+            _ = tokio::time::sleep(wait) => false,
+            _ = entry.kick.notified() => true,
             // nothing is ever sent: this is the manager going
             _ = gone.changed() => return,
-        }
+        };
         if weak.upgrade().is_none() {
             return;
         }
+        if due.is_none() && !kicked {
+            // nothing is due: look at the interval again
+            continue;
+        }
         let meta = entry.meta.lock().expect("meta").clone();
-        match fetch::fetch(
+        let fetched = fetch::fetch(
             &client,
             &url,
             meta.as_ref(),
@@ -575,7 +580,15 @@ async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>, mut gone: watc
             opts.max_size,
         )
         .await
-        {
+        .and_then(|fetched| match fetched {
+            // a server that answers "not modified" to a request that carried no validator: there
+            // is nothing to refresh, which is a failed fetch like any other
+            fetch::Fetched::NotModified if entry.state.lock().expect("state").data().is_none() => {
+                Err(r#"the server answered "not modified" but nothing is cached"#.to_string())
+            }
+            fetched => Ok(fetched),
+        });
+        match fetched {
             Ok(fetch::Fetched::New {
                 data,
                 etag,
@@ -1232,5 +1245,129 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(61)).await;
         assert_eq!(entry.strong_count(), 0, "the task still holds its entry");
         assert_eq!(server.hits("/day"), 0);
+    }
+
+    /// A profile can write `update-interval=0`. Nothing says what that means;
+    /// a refresh "every 0 seconds" would be due again as soon as it is done,
+    /// and the task would fetch as fast as the server answers. 0 is read as
+    /// not written: the default interval.
+    #[tokio::test]
+    async fn an_interval_of_zero_is_read_as_none_written() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/zero", "zulu");
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(server.url("/zero"), Some(0)));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        // that nothing more happens can only be seen by waiting
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let hits = server.hits("/zero");
+        assert!(hits <= 2, "fetched {hits} times in 300 ms");
+        assert_eq!(h.version(), 1);
+        assert_eq!(h.entry.effective_interval(), DEFAULT_UPDATE_INTERVAL);
+    }
+
+    /// The same in the other doors of the interval: a 0 that is merged into
+    /// the interval of a resource somebody else asked for changes nothing,
+    /// and a resource first asked for with 0 takes the interval of the next.
+    #[tokio::test]
+    async fn an_interval_of_zero_does_not_merge_into_a_shared_one() {
+        let root = tempfile::tempdir().unwrap();
+        let offline = ResourceOptions {
+            offline: true,
+            ..fast()
+        };
+        let mgr = manager(root.path(), offline);
+        let one = Url::parse("https://lists.test/one").unwrap();
+        let first = mgr.get(&url_spec(one.clone(), Some(3600)));
+        mgr.get(&url_spec(one, Some(0)));
+        assert_eq!(first.entry.effective_interval(), 3600);
+        let two = Url::parse("https://lists.test/two").unwrap();
+        let second = mgr.get(&url_spec(two.clone(), Some(0)));
+        assert_eq!(second.entry.effective_interval(), DEFAULT_UPDATE_INTERVAL);
+        mgr.get(&url_spec(two.clone(), Some(600)));
+        assert_eq!(second.entry.effective_interval(), 600);
+        // 0 is none written, and none written leaves auto-refresh off as asked
+        mgr.get(&url_spec(two, Some(-1)));
+        assert_eq!(second.entry.effective_interval(), 600);
+        let off = Url::parse("https://lists.test/off").unwrap();
+        let third = mgr.get(&url_spec(off.clone(), Some(-1)));
+        mgr.get(&url_spec(off, Some(0)));
+        assert_eq!(third.entry.effective_interval(), -1);
+    }
+
+    /// A server that answers "not modified" to a request that carried no
+    /// validator leaves a resource with nothing cached nothing to refresh
+    /// from: a failed fetch like any other. The state says so, and the task
+    /// waits out its back-off instead of asking again at once.
+    #[tokio::test]
+    async fn a_not_modified_with_nothing_cached_is_a_failed_fetch() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/nm", "");
+        server.set_status("/nm", 304);
+        // long enough that no second request fits in the wait below
+        let opts = ResourceOptions {
+            min_backoff: Duration::from_secs(5),
+            max_backoff: Duration::from_secs(5),
+            ..fast()
+        };
+        let mgr = manager(root.path(), opts);
+        let h = mgr.get(&url_spec(server.url("/nm"), None));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while server.hits("/nm") == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the server was never asked"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // that nothing more happens can only be seen by waiting
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let hits = server.hits("/nm");
+        let state = h.current();
+        assert_eq!(hits, 1, "asked {hits} times in 300 ms; {state:?}");
+        assert!(
+            matches!(
+                state,
+                ResourceState::Failed { ref last_error, cached: None, .. }
+                    if last_error == r#"the server answered "not modified" but nothing is cached"#
+            ),
+            "{state:?}"
+        );
+        assert_eq!(mgr.statuses()[0].state, "failed");
+    }
+
+    /// With auto-refresh off nothing is due, but the resource may have other
+    /// users: one that asks for auto-refresh turns the interval positive
+    /// (`merge_interval`), and a parked task comes to see that by its wake
+    /// once a minute. Without the wake such a resource is never refreshed.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_url_task_sees_an_interval_merged_in_later() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        let url = server.url("/parked");
+        // fresh in the cache: nothing is due for a day, whatever the interval
+        let meta = Meta {
+            url: url.to_string(),
+            fetched_at: unix(SystemTime::now()),
+            ..Meta::default()
+        };
+        cache::CacheDir::for_url(root.path(), url.as_str())
+            .store(b"cached", &meta)
+            .unwrap();
+        let mgr = manager(root.path(), fast());
+        mgr.get(&url_spec(url.clone(), Some(-1)));
+        // the clock moves when the task has nothing left to do: it has parked
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(mgr.statuses()[0].next_refresh, None);
+        // a second user of the same URL asks for a refresh every day
+        mgr.get(&url_spec(url, Some(86_400)));
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert!(
+            mgr.statuses()[0].next_refresh.is_some(),
+            "the task never looked at the interval again"
+        );
+        assert_eq!(server.hits("/parked"), 0);
     }
 }
