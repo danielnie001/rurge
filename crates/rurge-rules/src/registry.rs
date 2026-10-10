@@ -3,8 +3,8 @@
 //! `ResourceManager` and are recompiled and swapped whenever the resource
 //! changes. Nested references are resolved through the same registry with
 //! cycle detection and a nesting limit of 8. A file or URL is read in one
-//! format only, the one it is first registered in: a later reference to it as
-//! the other kind of set is left out with a warning.
+//! format only: the one the profile itself gives it. A reference to it as the
+//! other kind of set from inside a set file is left out with a warning.
 
 use crate::matcher::{SetLookup, SetRef};
 use crate::set::{CompiledSet, SetHandle};
@@ -83,6 +83,8 @@ pub struct SetRegistry {
     inline: HashMap<String, Vec<SubRule>>,
     inline_names: HashSet<String>,
     entries: Mutex<HashMap<(Key, SetKind), Entry>>,
+    /// The role the profile's own text gives each URL and file (`claims_of`).
+    claims: HashMap<Key, SetKind>,
     diags: Mutex<Diagnostics>,
     /// `true` only while `build` is running; `push_diag` is a no-op outside
     /// that window so reloads (which already log through `tracing`) don't
@@ -120,6 +122,52 @@ fn push_key(key: Key) -> StackGuard {
     StackGuard
 }
 
+/// The role the profile's own text gives each URL and file: the rules (the
+/// sub-rules of logical rules included), the `[Host]` set keys and the lines
+/// of its inline sets — the references the loader's `E0024` looks at, which
+/// it guarantees to give a resource one role. Should a profile break that
+/// anyway, the first role met stands.
+fn claims_of(cfg: &Config) -> HashMap<Key, SetKind> {
+    let mut claims = HashMap::new();
+    for rule in &cfg.rules {
+        claim_kind(&rule.kind, &mut claims);
+    }
+    for host in &cfg.hosts {
+        match &host.key {
+            HostKey::DomainSet(r) => claim(r, SetKind::DomainSet, &mut claims),
+            HostKey::RuleSet(r) => claim(r, SetKind::RuleSet, &mut claims),
+            HostKey::Pattern(_) => {}
+        }
+    }
+    for set in &cfg.rulesets {
+        for line in &set.rules {
+            claim_kind(&line.kind, &mut claims);
+        }
+    }
+    claims
+}
+
+fn claim_kind(kind: &RuleKind, claims: &mut HashMap<Key, SetKind>) {
+    match kind {
+        RuleKind::RuleSet(r) => claim(r, SetKind::RuleSet, claims),
+        RuleKind::DomainSet(r) => claim(r, SetKind::DomainSet, claims),
+        RuleKind::And(subs) | RuleKind::Or(subs) => {
+            for sub in subs {
+                claim_kind(&sub.kind, claims);
+            }
+        }
+        RuleKind::Not(sub) => claim_kind(&sub.kind, claims),
+        _ => {}
+    }
+}
+
+fn claim(r: &ResourceRef, role: SetKind, claims: &mut HashMap<Key, SetKind>) {
+    let key = Key::from_ref(r);
+    if matches!(key, Key::Url(_) | Key::File(_)) {
+        claims.entry(key).or_insert(role);
+    }
+}
+
 impl SetRegistry {
     pub fn build(
         cfg: &Config,
@@ -138,6 +186,7 @@ impl SetRegistry {
             inline,
             inline_names,
             entries: Mutex::new(HashMap::new()),
+            claims: claims_of(cfg),
             diags: Mutex::new(Diagnostics::default()),
             building: AtomicBool::new(true),
             self_weak: Mutex::new(Weak::new()),
@@ -243,15 +292,25 @@ impl SetRegistry {
             SetKind::RuleSet => SetKind::DomainSet,
             SetKind::DomainSet => SetKind::RuleSet,
         };
-        let conflicts = {
+        let loses = {
             let mut entries = self.entries.lock().expect("registry lock");
             if let Some(e) = entries.get(&(key.clone(), kind)) {
                 return e.handle.clone();
             }
-            // One file or URL, two formats: the first role keeps the set.
-            let conflicts = matches!(key, Key::Url(_) | Key::File(_))
-                && entries.contains_key(&(key.clone(), other));
-            if !conflicts {
+            // A URL or file is read in one format only. The role the profile
+            // itself gives it is the one that stays, whether or not that
+            // role has an entry yet: which entry comes first would depend on
+            // which set files already have content while the registry is
+            // built. References nested in set files that the profile does not
+            // back, and that disagree with each other, are left to the order
+            // in which they are registered; which comes first then depends
+            // on which parent is compiled first, and that is accepted.
+            let loses = matches!(key, Key::Url(_) | Key::File(_))
+                && match self.claims.get(&key) {
+                    Some(claimed) => *claimed != kind,
+                    None => entries.contains_key(&(key.clone(), other)),
+                };
+            if !loses {
                 entries.insert(
                     (key.clone(), kind),
                     Entry {
@@ -263,15 +322,20 @@ impl SetRegistry {
                     },
                 );
             }
-            conflicts
+            loses
         };
-        if conflicts {
+        if loses {
+            // the set being compiled is the one the reference is written in
+            let parent = STACK.with(|s| s.borrow().last().map(Key::display));
+            let written_in = parent
+                .map(|parent| format!(" (referenced in `{parent}`)"))
+                .unwrap_or_default();
             let said = format!(
-                "set `{name}` ignored: the same resource is already used as a {}",
+                "set `{name}`{written_in} ignored: the same resource is used as a {}",
                 other.keyword()
             );
             self.push_diag(Diagnostic::warning(codes::W_SET_KIND_CONFLICT, &said));
-            tracing::warn!("{said}");
+            tracing::warn!(set = %name, "{said}");
             return SetHandle::new(CompiledSet::empty(&name, kind));
         }
         let handle = self.handle_of(&key, kind);
@@ -818,9 +882,9 @@ DOMAIN,a.com,P\nFINAL,DIRECT\n",
     const BOTH_KINDS: &str = "DOMAIN,rule.com\ndomain-set.com\n";
 
     /// A file that is a rule set at the top of the profile and a domain set
-    /// inside another set file is one set, the first: the nested reference
-    /// is left out with a warning, and the file is not read a second time
-    /// in the other format.
+    /// inside another set file is one set, the profile's: the nested
+    /// reference is left out with a warning, and the file is not read a
+    /// second time in the other format.
     #[tokio::test]
     async fn a_domain_set_nested_in_a_file_cannot_reuse_a_rule_set() {
         let dir = tempfile::tempdir().unwrap();
@@ -842,11 +906,14 @@ DOMAIN,a.com,P\nFINAL,DIRECT\n",
             [codes::W_SET_LINES_SKIPPED, codes::W_SET_KIND_CONFLICT]
         );
         let a = dir.path().join("a.list").display().to_string();
+        let b = dir.path().join("b.list").display().to_string();
         assert_eq!(
             diags.iter().last().map(|d| d.message.as_str()),
             Some(
-                format!("set `{a}` ignored: the same resource is already used as a RULE-SET")
-                    .as_str()
+                format!(
+                    "set `{a}` (referenced in `{b}`) ignored: the same resource is used as a RULE-SET"
+                )
+                .as_str()
             )
         );
         let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
@@ -859,19 +926,11 @@ DOMAIN,a.com,P\nFINAL,DIRECT\n",
             .into_iter()
             .map(|s| (s.name, s.kind))
             .collect();
-        assert_eq!(
-            statuses,
-            [
-                (a, SetKind::RuleSet),
-                (
-                    dir.path().join("b.list").display().to_string(),
-                    SetKind::RuleSet
-                )
-            ]
-        );
+        assert_eq!(statuses, [(a, SetKind::RuleSet), (b, SetKind::RuleSet)]);
     }
 
-    /// And the other way round: the first role is the one that stays.
+    /// And the other way round: the role the profile gives the file is the
+    /// one that stays.
     #[tokio::test]
     async fn a_rule_set_nested_in_a_file_cannot_reuse_a_domain_set() {
         let dir = tempfile::tempdir().unwrap();
@@ -887,11 +946,14 @@ DOMAIN,a.com,P\nFINAL,DIRECT\n",
             [codes::W_SET_LINES_SKIPPED, codes::W_SET_KIND_CONFLICT]
         );
         let a = dir.path().join("a.list").display().to_string();
+        let b = dir.path().join("b.list").display().to_string();
         assert_eq!(
             diags.iter().last().map(|d| d.message.as_str()),
             Some(
-                format!("set `{a}` ignored: the same resource is already used as a DOMAIN-SET")
-                    .as_str()
+                format!(
+                    "set `{a}` (referenced in `{b}`) ignored: the same resource is used as a DOMAIN-SET"
+                )
+                .as_str()
             )
         );
         let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
@@ -905,6 +967,156 @@ DOMAIN,a.com,P\nFINAL,DIRECT\n",
             .map(|s| s.kind)
             .collect();
         assert_eq!(kinds, [SetKind::DomainSet]);
+    }
+
+    /// The role the profile itself gives a file wins, also when a set file
+    /// written above it nests the file in the other role. Which role stays
+    /// must not depend on which set files have content while the registry is
+    /// built, so it is the profile's own that is looked up, not the entry
+    /// that happens to exist first.
+    #[tokio::test]
+    async fn the_role_the_profile_gives_a_file_wins_over_one_nested_above_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.list"), BOTH_KINDS).unwrap();
+        std::fs::write(
+            dir.path().join("b.list"),
+            "DOMAIN-SET,a.list\nDOMAIN,b.com\n",
+        )
+        .unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,b.list,REJECT\nRULE-SET,a.list,P\nFINAL,DIRECT\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        // `b.list` is compiled first, and its nested reference is the one left
+        // out; `a.list` is then read once, as a rule set, which skips `domain-set.com`
+        assert_eq!(
+            codes_of(&diags),
+            [codes::W_SET_KIND_CONFLICT, codes::W_SET_LINES_SKIPPED]
+        );
+        let a = dir.path().join("a.list").display().to_string();
+        let b = dir.path().join("b.list").display().to_string();
+        assert_eq!(
+            diags.iter().next().map(|d| d.message.as_str()),
+            Some(
+                format!(
+                    "set `{a}` (referenced in `{b}`) ignored: the same resource is used as a RULE-SET"
+                )
+                .as_str()
+            )
+        );
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "rule.com").await.0, "P");
+        // read as a domain set, `a.list` would have matched this one
+        assert_eq!(decide(&engine, "domain-set.com").await.0, "DIRECT");
+        assert_eq!(decide(&engine, "b.com").await.0, "REJECT");
+        let statuses: Vec<(String, SetKind)> = reg
+            .statuses()
+            .into_iter()
+            .map(|s| (s.name, s.kind))
+            .collect();
+        assert_eq!(statuses, [(a, SetKind::RuleSet), (b, SetKind::RuleSet)]);
+    }
+
+    /// The same when the profile's claim is a `[Host]` entry: the entries of
+    /// `[Host]` are registered after all of the rules, so here the claim is
+    /// there before the entry is.
+    #[tokio::test]
+    async fn the_role_a_host_entry_gives_a_file_wins_over_one_nested_in_a_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.list"), BOTH_KINDS).unwrap();
+        std::fs::write(
+            dir.path().join("b.list"),
+            "DOMAIN-SET,a.list\nDOMAIN,b.com\n",
+        )
+        .unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,b.list,REJECT\nFINAL,DIRECT\n\
+[Host]\nRULE-SET:a.list = 1.2.3.4\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        assert_eq!(
+            codes_of(&diags),
+            [codes::W_SET_KIND_CONFLICT, codes::W_SET_LINES_SKIPPED]
+        );
+        let a = dir.path().join("a.list").display().to_string();
+        let b = dir.path().join("b.list").display().to_string();
+        assert_eq!(
+            diags.iter().next().map(|d| d.message.as_str()),
+            Some(
+                format!(
+                    "set `{a}` (referenced in `{b}`) ignored: the same resource is used as a RULE-SET"
+                )
+                .as_str()
+            )
+        );
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "domain-set.com").await.0, "DIRECT");
+        assert_eq!(decide(&engine, "b.com").await.0, "REJECT");
+        // the entry's set has its line, as a rule set
+        let host_set = reg
+            .statuses()
+            .into_iter()
+            .filter(|s| s.name == a)
+            .map(|s| (s.kind, s.entries))
+            .collect::<Vec<_>>();
+        assert_eq!(host_set, [(SetKind::RuleSet, 1)]);
+    }
+
+    /// A claim made only by a line of an inline set that no rule references
+    /// holds as well, although nothing ever creates the entry it claims.
+    #[tokio::test]
+    async fn the_role_an_unreferenced_inline_set_gives_a_file_wins_too() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.list"), BOTH_KINDS).unwrap();
+        std::fs::write(
+            dir.path().join("b.list"),
+            "DOMAIN-SET,a.list\nDOMAIN,b.com\n",
+        )
+        .unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,b.list,REJECT\nFINAL,DIRECT\n\
+[Ruleset Claim]\nRULE-SET,a.list\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        assert_eq!(codes_of(&diags), [codes::W_SET_KIND_CONFLICT]);
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "domain-set.com").await.0, "DIRECT");
+        assert_eq!(decide(&engine, "b.com").await.0, "REJECT");
+        // `a.list` is claimed and never registered: `Claim` is not referenced
+        let names: Vec<String> = reg.statuses().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, [dir.path().join("b.list").display().to_string()]);
+    }
+
+    /// A parent set that is reloaded later compiles its nested references
+    /// then, and reaches the same verdict: the profile's claim is kept for
+    /// the registry's whole life.
+    #[tokio::test]
+    async fn a_reloaded_set_loses_its_nested_reference_to_the_profiles_role_too() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.list"), BOTH_KINDS).unwrap();
+        let b_file = dir.path().join("b.list");
+        std::fs::write(&b_file, "DOMAIN,b.com\n").unwrap();
+        // `Claim` is referenced by no rule: nothing registers `a.list`
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,b.list,REJECT\nFINAL,DIRECT\n\
+[Ruleset Claim]\nRULE-SET,a.list\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        assert!(diags.is_empty(), "{:?}", codes_of(&diags));
+        let handle = reg.get(&ResourceRef::File(b_file.clone()), SetKind::RuleSet);
+        let v1 = handle.version();
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "domain-set.com").await.0, "DIRECT");
+        std::fs::write(&b_file, "DOMAIN-SET,a.list\nDOMAIN,b.com\n").unwrap();
+        wait_version(&handle, v1 + 1).await;
+        assert_eq!(decide(&engine, "domain-set.com").await.0, "DIRECT");
+        assert_eq!(decide(&engine, "b.com").await.0, "REJECT");
+        let names: Vec<String> = reg.statuses().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, [b_file.display().to_string()]);
     }
 
     /// A file that nests itself as the other kind is a cycle, as it always
@@ -946,12 +1158,13 @@ DOMAIN,a.com,P\nFINAL,DIRECT\n",
         );
         let (_reg, diags) = SetRegistry::build(&cfg, offline_manager(dir.path()), dir.path());
         let texts: Vec<(&str, &str)> = diags.iter().map(|d| (d.code, d.message.as_str())).collect();
+        let said = format!(
+            "set `https://***@sets.example/gh/user/repo@main/a.list` (referenced in `{}`) \
+ignored: the same resource is used as a RULE-SET",
+            dir.path().join("b.list").display()
+        );
         assert!(
-            texts.contains(&(
-                codes::W_SET_KIND_CONFLICT,
-                "set `https://***@sets.example/gh/user/repo@main/a.list` ignored: \
-the same resource is already used as a RULE-SET"
-            )),
+            texts.contains(&(codes::W_SET_KIND_CONFLICT, said.as_str())),
             "{texts:?}"
         );
         for (_, text) in texts {
@@ -959,6 +1172,66 @@ the same resource is already used as a RULE-SET"
                 !text.contains("S3CR3T") && !text.contains("al1ce"),
                 "{text}"
             );
+        }
+    }
+
+    /// The DEBUG line of a hit, the `notes` of a request and the API are all
+    /// built from two strings of the hit: the line that matched and the name
+    /// of the set it was found in. Neither holds the user name or the
+    /// password of a URL — not when the set was fetched from it, and not when
+    /// the matching line is itself a reference to it.
+    #[tokio::test]
+    async fn a_hit_shows_no_user_info_in_the_set_or_in_the_line() {
+        const MARKER: &str = "S3CR3T-hit";
+        let dir = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        let port = server.url("/").port().unwrap();
+        server.set("/fetched.list", "DOMAIN,fetched.com\n");
+        server.set("/inner.list", "DOMAIN,inner.com\n");
+        let fetched = format!("http://al1ce:{MARKER}@127.0.0.1:{port}/fetched.list");
+        let inner = format!("http://al1ce:{MARKER}@127.0.0.1:{port}/inner.list");
+        std::fs::write(dir.path().join("outer.list"), format!("RULE-SET,{inner}\n")).unwrap();
+        let cfg = load(
+            &format!(
+                "[Proxy]\nP = direct\n[Rule]\nRULE-SET,{fetched},P\nRULE-SET,outer.list,P\nFINAL,DIRECT\n"
+            ),
+            dir.path(),
+        );
+        let (reg, _) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        for url in [&fetched, &inner] {
+            let handle = reg.get(&ResourceRef::Url(url.clone()), SetKind::RuleSet);
+            wait_version(&handle, 1).await;
+        }
+        let outer = dir.path().join("outer.list").display().to_string();
+        let cases = [
+            (
+                "fetched.com",
+                format!("http://***@127.0.0.1:{port}/fetched.list"),
+                "DOMAIN,fetched.com".to_string(),
+            ),
+            (
+                "inner.com",
+                outer,
+                format!("RULE-SET,http://***@127.0.0.1:{port}/inner.list"),
+            ),
+        ];
+        for (host, set, entry) in cases {
+            let d = engine
+                .evaluate(
+                    &SessionInfo::tcp(HostName::parse(host), 443),
+                    OutboundMode::Rule,
+                    &crate::engine::NoResolve,
+                )
+                .await;
+            let hit = d.sub_rule.unwrap_or_else(|| panic!("{host} has no hit"));
+            assert_eq!((hit.set.as_str(), hit.entry.as_str()), (&*set, &*entry));
+            for shown in [&hit.set, &hit.entry] {
+                assert!(
+                    !shown.contains(MARKER) && !shown.contains("al1ce"),
+                    "{shown}"
+                );
+            }
         }
     }
 
