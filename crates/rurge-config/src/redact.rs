@@ -403,6 +403,16 @@ pub(crate) fn is_secret_key(key: &str) -> bool {
     listed_key(key).is_some_and(|(kind, _)| kind != KeyKind::Dns)
 }
 
+/// `listed_key` for the key of a line. A DNS key counts only when nothing but
+/// blanks stands around it: with text in front of it the line is another kind
+/// of line — an `[SSID Setting]` line is `<subnet expression> key=value,
+/// key=value`, and `encrypted-dns-server=https://…` is a parameter there, not
+/// a server — and is redacted as a definition, whose URLs lose their user-info
+/// wherever they stand.
+fn line_key(text: &str) -> Option<(KeyKind, bool)> {
+    listed_key(text).filter(|&(kind, alone)| alone || kind != KeyKind::Dns)
+}
+
 /// A line that is `<text><key><separator><value>` with a listed key.
 struct KeyLine<'a> {
     kind: KeyKind,
@@ -419,14 +429,15 @@ struct KeyLine<'a> {
 /// key that has no comma in front of it: a text with a comma in front of the
 /// `=` is no key. A `:` — or `：` — is a separator too, in front of the first
 /// `=`: a text that holds an `=` is no key either, so a colon in a value is not
-/// one.
+/// one. A DNS key with text in front of it is no key (`line_key`): the search
+/// goes on to the next colon, and behind the `=` there is none.
 fn key_line(line: &str) -> Option<KeyLine<'_>> {
     let equals = line.find(['=', '＝']);
     let colons = line[..equals.unwrap_or(line.len())]
         .char_indices()
         .filter(|(_, c)| matches!(c, ':' | '：'));
     for (at, colon) in colons {
-        if let Some((kind, alone)) = listed_key(&line[..at]) {
+        if let Some((kind, alone)) = line_key(&line[..at]) {
             let (key, rest) = line.split_at(at);
             let (sep, value) = rest.split_at(colon.len_utf8());
             return Some(KeyLine {
@@ -445,7 +456,7 @@ fn key_line(line: &str) -> Option<KeyLine<'_>> {
     if next_comma(key, true).is_some() {
         return None;
     }
-    let (kind, alone) = listed_key(key)?;
+    let (kind, alone) = line_key(key)?;
     let width = line[at..].chars().next().map_or(1, char::len_utf8);
     let (sep, value) = line[at..].split_at(width);
     Some(KeyLine {
@@ -688,11 +699,14 @@ pub fn url_without_credentials(url: &str) -> String {
 const READ_SCHEMES: [&str; 6] = ["http", "https", "h3", "quic", "tls", "tcp"];
 
 /// The scheme of the URL whose `://` ends `head`: the run of `[A-Za-z0-9+.-]`
-/// right in front of it, empty for a regular expression (`^https?://`).
+/// right in front of it, less what leads it and is no ASCII letter — a scheme
+/// begins with one (RFC 3986, section 3.1), and the `+` of `[a-z]+://` or the
+/// `.+` of `^.+://` is a regular expression's. Empty for a regular expression
+/// (`^https?://`) and when nothing is left (`^.+://`).
 fn scheme_before(head: &str) -> &str {
     let front =
         head.trim_end_matches(|c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
-    &head[front.len()..]
+    head[front.len()..].trim_start_matches(|c: char| !c.is_ascii_alphabetic())
 }
 
 /// Where the authority of a URL ends: a `/`, a `?`, a `#`, a comma, a quote, a
@@ -884,8 +898,9 @@ fn is_param_name(name: &str) -> bool {
 /// tfo=true`); `sni=` with an empty value is over-redacted. A first field of
 /// several words whose first word is a type that takes a server is that type
 /// with the commas after it missing (`http h.example, 8080, alice, hunter2`):
-/// its words are fields, the server second and the port third. Any other line
-/// is returned unchanged.
+/// its words are fields, the server second and the port third — when a port
+/// number stands there, `words_of_type_field` says. Any other line is
+/// returned unchanged.
 fn redact_positional_credentials(value: &str) -> String {
     // the fields as where they start, where they end and where the separator
     // after them ends. A line typed with an input method may have `，` for some
@@ -949,6 +964,15 @@ fn takes_server_type(keyword: &str) -> bool {
 /// it is several words, the first a type that takes a server — split into its
 /// words: the white space between them is their separator, and the last word
 /// keeps the separator the field had.
+///
+/// It is split only when a port number stands where the third field is after
+/// the split (the third word, or the next field when the first has two, read
+/// as `redact_positional_credentials` reads the port): a comment that opens
+/// with a protocol word is prose and not a policy line that lost its commas
+/// (`# HTTP DNS blocking list`, `// ss node via Hong Kong`). The cost is
+/// known and accepted: a line that lost the comma after its type and has no
+/// port number in the third place (`P = http h.example, 8080 alice, hunter2`)
+/// is not read as a policy line by this rule.
 fn words_of_type_field(
     value: &str,
     spans: Vec<(usize, usize, usize)>,
@@ -983,7 +1007,12 @@ fn words_of_type_field(
         at += word + gap;
     }
     split.extend_from_slice(&spans[first + 1..]);
-    split
+    let port_third = split
+        .iter()
+        .filter_map(|&(start, end, _)| split_list(&value[start..end]).pop())
+        .nth(2)
+        .is_some_and(|field| field.trim_matches(is_blank).parse::<u16>().is_ok());
+    if port_third { split } else { spans }
 }
 
 /// The first comma that is inside no quote and no parenthesised group, by the
@@ -3442,6 +3471,59 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
         }
     }
 
+    /// A DNS key with text in front of it is no key line: a line of
+    /// `[SSID Setting]` is `<subnet expression> key=value, key=value`, and its
+    /// items are not URLs. It is read as a definition, whose URLs lose their
+    /// user-info and nothing else.
+    #[test]
+    fn an_ssid_line_keeps_the_names_of_its_dns_parameters() {
+        assert_eq!(
+            redact_profile(
+                "SSID:Office dns-server=192.168.1.1,encrypted-dns-server=https://u:p@dns.example/dns-query"
+            ),
+            "SSID:Office dns-server=192.168.1.1,encrypted-dns-server=https://***@dns.example/dns-query"
+        );
+    }
+
+    /// Passing over a DNS key that has text in front of it must not pass over
+    /// what stands behind it: the search for a key goes on to the next
+    /// separator, and the rest of the line is a definition.
+    #[test]
+    fn a_secret_behind_a_dns_key_with_text_in_front_is_found() {
+        for (line, shown) in [
+            // the colon
+            (
+                "x dns-server: 1.1.1.1 password: hunter2",
+                "x dns-server: 1.1.1.1 password: ***",
+            ),
+            (
+                "x dns-server: 1.1.1.1 http-api: KEY@127.0.0.1:6171",
+                "x dns-server: 1.1.1.1 http-api: ***@127.0.0.1:6171",
+            ),
+            // the `=`
+            (
+                "SSID:Office dns-server=1.1.1.1 password=hunter2",
+                "SSID:Office dns-server=1.1.1.1 password=***",
+            ),
+            // nothing to hide, nothing changes
+            (
+                "SSID:Office dns-server=192.168.1.1,encrypted-dns-server=off",
+                "SSID:Office dns-server=192.168.1.1,encrypted-dns-server=off",
+            ),
+            // a DNS key that stands alone is read as before
+            (
+                "encrypted-dns-server: https://u:p@dns.example/dns-query",
+                "encrypted-dns-server: https://***@dns.example/dns-query",
+            ),
+            (
+                "dns-server = 8.8.8.8, https://u:p@dns.example/dns-query",
+                "dns-server = 8.8.8.8, https://***@dns.example/dns-query",
+            ),
+        ] {
+            assert_eq!(redact_profile(line), shown, "{line:?}");
+        }
+    }
+
     /// A URL whose scheme no parser here reads shows nothing of what follows
     /// its `://` up to the next white space: a share link carries its secret
     /// where the user-info is not.
@@ -3524,6 +3606,34 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
         );
     }
 
+    /// A scheme begins with a letter (RFC 3986, section 3.1): what leads the
+    /// run of scheme characters in front of a `://` and is none — the `+` of
+    /// `[a-z]+://`, the `.+` of `^.+://` — belongs to a regular expression, and
+    /// what is left of the run is the scheme.
+    #[test]
+    fn a_scheme_begins_with_a_letter() {
+        for (line, shown) in [
+            // a quantifier or a wildcard in front of the `://` of a pattern
+            (
+                "URL-REGEX,^[a-z]+://example\\.com/path,REJECT",
+                "URL-REGEX,^[a-z]+://example\\.com/path,REJECT",
+            ),
+            (
+                "^.+://example\\.com/(.*) https://example.org/$1 302",
+                "^.+://example\\.com/(.*) https://example.org/$1 302",
+            ),
+            // what leads the run and is no letter is no part of the scheme
+            ("1password://vault/item", "1password://***"),
+            ("3http://u:p@h.test/x", "3http://***@h.test/x"),
+            ("-ss://YWVz", "-ss://***"),
+            // a run that begins with a letter is a scheme, a `\w+` included
+            ("^\\w+://example\\.com/x", "^\\w+://***"),
+            ("x.y+z-1://secret", "x.y+z-1://***"),
+        ] {
+            assert_eq!(redact_profile(line), shown, "{line:?}");
+        }
+    }
+
     /// A first field of several words whose first word is a type that takes a
     /// server is that type with the commas after it missing: its words are
     /// fields, the server second and the port third.
@@ -3551,10 +3661,12 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
                 "P = http  h.example\t8080 alice, hunter2 tfo=true",
                 "P = http  h.example\t8080 ***, ***",
             ),
-            // the port as it may be
+            // the port as it may be: the words are fields only when a number
+            // stands in the third place, and the line that has none is not
+            // read as a policy line by this rule (the cost, known and accepted)
             (
                 "P = trojan h.example, alice, hunter2",
-                "P = trojan h.example, ***, ***",
+                "P = trojan h.example, alice, hunter2",
             ),
             ("P = http h.example, 8080", "P = http h.example, 8080"),
             ("P = http h.example", "P = http h.example"),
@@ -3588,6 +3700,29 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
         ] {
             assert_eq!(redact_profile(line), shown, "{line:?}");
         }
+    }
+
+    /// Words that open with a type are the fields of a policy line only when a
+    /// port number follows them: a comment that starts with a protocol word is
+    /// prose, and prose is shown as written.
+    #[test]
+    fn prose_that_opens_with_a_type_word_is_shown_as_written() {
+        for line in [
+            "# HTTP DNS blocking list",
+            "# SSH tunnel to the home server",
+            "# Trojan nodes below",
+            "# ss is fine, really, ok",
+        ] {
+            assert_eq!(redact_profile(line), line, "{line:?}");
+        }
+    }
+
+    /// The same in the inline comment of a line, which is redacted as a
+    /// commented-out line is.
+    #[test]
+    fn an_ordinary_inline_comment_that_starts_with_a_protocol_word_is_kept() {
+        let line = "DOMAIN,example.com,Proxy // ss node via Hong Kong";
+        assert_eq!(redact_profile(line), line);
     }
 
     /// The inline comment of a line — its marker kept as written — is
