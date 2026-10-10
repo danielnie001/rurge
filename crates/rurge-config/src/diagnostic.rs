@@ -446,6 +446,17 @@ mod tests {
             .collect()
     }
 
+    /// The codes that occur more than once in a sorted list, each named once.
+    fn repeated<'a>(sorted: &[&'a str]) -> Vec<&'a str> {
+        let mut again: Vec<&str> = sorted
+            .windows(2)
+            .filter(|pair| pair[0] == pair[1])
+            .map(|pair| pair[0])
+            .collect();
+        again.dedup();
+        again
+    }
+
     #[test]
     fn every_code_is_decided_once() {
         let mut listed: Vec<&str> = WITH_DEFAULT
@@ -455,15 +466,50 @@ mod tests {
             .copied()
             .collect();
         listed.sort();
-        let all = listed.len();
-        listed.dedup();
-        assert_eq!(listed.len(), all, "a code is on two lists, or twice on one");
         let mut declared = declared();
         declared.sort();
-        assert_eq!(
-            listed, declared,
-            "a code in `codes` is on no list: give it a hint in `codes::hint`, or list it as one without"
-        );
+        let listed_twice = repeated(&listed);
+        let declared_twice = repeated(&declared);
+        listed.dedup();
+        declared.dedup();
+        let undecided: Vec<&str> = declared
+            .iter()
+            .copied()
+            .filter(|code| !listed.contains(code))
+            .collect();
+        let undeclared: Vec<&str> = listed
+            .iter()
+            .copied()
+            .filter(|code| !declared.contains(code))
+            .collect();
+        let mut problems = String::new();
+        for (what, named, remedy) in [
+            (
+                "declared in `codes` and on none of WITH_DEFAULT, PER_SITE and WITHOUT",
+                undecided,
+                "give each an arm in `codes::hint` and list it in WITH_DEFAULT, or list it in WITHOUT and say why in the comment above `codes::hint` (in PER_SITE when every place that reports it carries a hint of its own)",
+            ),
+            (
+                "on a list but not declared in `codes`",
+                undeclared,
+                "declare each in `codes`, or take it off the list",
+            ),
+            (
+                "on the lists more than once",
+                listed_twice,
+                "a code is decided once: keep it on one list, once",
+            ),
+            (
+                "declared in `codes` more than once",
+                declared_twice,
+                "a code is never reused: give each constant a code of its own",
+            ),
+        ] {
+            if !named.is_empty() {
+                problems += &format!("\n{what}: {}\n  {remedy}", named.join(", "));
+            }
+        }
+        assert!(problems.is_empty(), "{problems}");
         for code in WITH_DEFAULT {
             assert!(codes::hint(code).is_some(), "{code} has no default hint");
         }
