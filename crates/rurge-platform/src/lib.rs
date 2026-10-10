@@ -6,4 +6,5 @@ pub mod dns;
 pub mod process;
 pub mod service;
 pub mod socket;
+pub mod sysinfo;
 pub mod sysproxy;

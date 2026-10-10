@@ -231,6 +231,47 @@ fn check_reports_core_version_22() {
     );
 }
 
+/// The one line that can give the profile its FINAL rule is on only where the
+/// system has a version of its own to report, in the words of the manual's
+/// example (`System Version 17.4.1 (Build 21E236)`).
+const NEEDS_A_SYSTEM_VERSION: &str = "[General]\n[Rule]\n\
+#!REQUIREMENT \"SYSTEM_VERSION BEGINSWITH 'System Version '\" FINAL,DIRECT\n";
+
+/// `SYSTEM_VERSION` is read from the operating system on every platform; a
+/// version that cannot be read leaves the profile without its FINAL rule.
+/// Asking the system adds nothing to what `check` prints.
+#[test]
+fn check_reads_the_system_version_from_the_operating_system() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write(&dir, "system-version.conf", NEEDS_A_SYSTEM_VERSION);
+    Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(&conf)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "0 error(s), 0 warning(s), 0 note(s)",
+        ))
+        .stderr(predicate::str::is_empty());
+}
+
+/// `--platform` evaluates the profile as if on another system. This machine's
+/// version is not that system's, so the line stays off.
+#[test]
+fn check_does_not_give_this_systems_version_to_another_platform() {
+    let other = if cfg!(windows) { "linux" } else { "windows" };
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write(&dir, "system-version.conf", NEEDS_A_SYSTEM_VERSION);
+    Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "--platform", other, "-c"])
+        .arg(&conf)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("E0010"));
+}
+
 const PROXIES: &str = "[General]\n[Proxy]\nH = http, proxy.test, 8080\nS = socks5-tls, proxy.test, 443\nOld = tailscale, section-name=ts\n[Rule]\nFINAL,DIRECT\n";
 const BROKEN_P12: &str = "[General]\n[Proxy]\nUp = https, proxy.test, 443, client-cert=cert1\n[Keystore]\ncert1 = type=p12, base64=QUJD, password=hunter2\n[Rule]\nFINAL,DIRECT\n";
 
