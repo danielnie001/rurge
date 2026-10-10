@@ -512,7 +512,7 @@ flowchart LR
 - **范围**：FR-CFG-11；FR-IN-02（UDP）；FR-OUT-03 ～ 13、15；FR-GRP-01、03 ～ 07；FR-DNS-04（DoH3 / DoQ）、07、10。
 - **交付物**：每种协议的实现与集成测试环境（回环测试服务器 + 对参考实现的互操作测试）、策略组算法、订阅解析、连通性测试。
 - **验收标准**：每种协议对参考服务器的 TCP 与 UDP（若支持）转发通过；链式代理通过；策略组测试与切换 API 正确；订阅样本解析正确；Shadow TLS 与 TLS 参数各有测试；WireGuard 与 WARP 类端点（`client-id`）握手成功。
-- **状态（2026-10-10）**：功能已齐备（同一次逐条核对在本阶段没有查出缺失的条款；只解析、不生效的参数都已在兼容性清单登记）；验收证据汇总在阶段 2 的验收文档 [`docs/acceptance/phase2-acceptance.md`](acceptance/phase2-acceptance.md)（M8c 收尾时建立）；CI 还没有绿过；对参考实现的互操作用例还没有对真实的二进制跑过；手工验收清单 [`docs/acceptance/phase2-manual.md`](acceptance/phase2-manual.md)（需要真实公网节点的项目）还没有执行。
+- **状态（2026-10-10）**：功能上已完成（同一次逐条核对在本阶段没有查出缺失的条款——判为"做了"的句子没有人复核，所以这不证明没有缺口——；只解析、不生效的参数都已在兼容性清单登记）；验收证据汇总在阶段 2 的验收文档 [`docs/acceptance/phase2-acceptance.md`](acceptance/phase2-acceptance.md)（M8c 收尾时建立）；CI 还没有绿过；对参考实现的互操作用例还没有对真实的二进制跑过；手工验收清单 [`docs/acceptance/phase2-manual.md`](acceptance/phase2-manual.md)（需要真实公网节点的项目）还没有执行。
 
 ### 阶段 3：增强模式（TUN）
 
