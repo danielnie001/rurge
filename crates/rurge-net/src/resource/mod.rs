@@ -1180,10 +1180,11 @@ mod tests {
         assert_eq!(plain.entry.log_name(), "policy-path of `G`");
     }
 
-    /// With auto-refresh off (`update-interval` below zero) a URL task waits
-    /// for a kick and for its manager to go, and for nothing else: once
-    /// something is fetched, `force_update` makes it fetch again, and it ends
-    /// when the manager is dropped.
+    /// With auto-refresh off (`update-interval` below zero), once something is
+    /// fetched, what makes a URL task fetch is a kick and what makes it end is
+    /// its manager going: `force_update` makes it fetch again, and it ends
+    /// when the manager is dropped. It also wakes once a minute, to look at its
+    /// interval again; that wake fetches nothing.
     #[tokio::test]
     async fn a_url_task_without_auto_refresh_waits_for_a_kick_and_for_its_manager() {
         let root = tempfile::tempdir().unwrap();
@@ -1287,9 +1288,9 @@ mod tests {
         assert_eq!(second.entry.effective_interval(), DEFAULT_UPDATE_INTERVAL);
         mgr.get(&url_spec(two.clone(), Some(600)));
         assert_eq!(second.entry.effective_interval(), 600);
-        // 0 is none written, and none written leaves auto-refresh off as asked
         mgr.get(&url_spec(two, Some(-1)));
         assert_eq!(second.entry.effective_interval(), 600);
+        // 0 is none written, and none written leaves auto-refresh off as asked
         let off = Url::parse("https://lists.test/off").unwrap();
         let third = mgr.get(&url_spec(off.clone(), Some(-1)));
         mgr.get(&url_spec(off, Some(0)));
@@ -1314,14 +1315,10 @@ mod tests {
         };
         let mgr = manager(root.path(), opts);
         let h = mgr.get(&url_spec(server.url("/nm"), None));
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while server.hits("/nm") == 0 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the server was never asked"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_for(&h, "the failed fetch", |s| {
+            matches!(s, ResourceState::Failed { .. })
+        })
+        .await;
         // that nothing more happens can only be seen by waiting
         tokio::time::sleep(Duration::from_millis(300)).await;
         let hits = server.hits("/nm");

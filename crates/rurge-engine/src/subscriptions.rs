@@ -468,9 +468,11 @@ Remote = select, DIRECT, policy-path=https://sub.test/nodes?token=t0k3n\n[Rule]\
         );
     }
 
-    /// The generation lock guards an order of events and no data: a thread
-    /// that panicked while it held it has left nothing half done. Every
-    /// dial takes the lock for its snapshot, and goes on taking it.
+    /// The generation lock guards an order of events and no data. What is done
+    /// under it runs everything that is known to be able to fail before its
+    /// first store, so a thread that panicked while it held it is taken to
+    /// have published a whole generation or none, and the poison is ignored:
+    /// every dial takes the lock for its snapshot, and goes on taking it.
     #[tokio::test]
     async fn a_panic_under_the_generation_lock_stops_no_dial() {
         use rurge_config::HostName;

@@ -264,10 +264,13 @@ impl Socks5Udp {
 
 /// Whether a datagram from `sender` may be the relay's: when the relay is
 /// known by address its source must be that address (the port may differ);
-/// a relay still known by name (a chained carrier) is not filtered.
+/// a relay still known by name (a chained carrier) is not filtered. An IPv4
+/// address and the same address in IPv6 form (`::ffff:a.b.c.d`) are one
+/// address: the last hop of a chain may be a dual-stack socket, which reports
+/// an IPv4 sender in the latter (`HostName::canonical`).
 pub(crate) fn from_relay(relay: Option<IpAddr>, sender: &Target) -> bool {
     match (relay, &sender.host) {
-        (Some(relay), HostName::Ip(ip)) => relay == *ip,
+        (Some(relay), HostName::Ip(ip)) => relay.to_canonical() == ip.to_canonical(),
         (Some(_), HostName::Domain(_)) => false,
         (None, _) => true,
     }
@@ -670,6 +673,21 @@ mod tests {
         );
     }
 
+    /// A chained carrier whose last hop is a dual-stack socket reports the
+    /// sender of an IPv4 relay as `::ffff:a.b.c.d`, and a relay may be
+    /// written in that form while the sender is reported plain: either way
+    /// it is the relay. Another address, in either form, is not.
+    #[test]
+    fn the_relay_is_the_relay_in_either_form_of_its_address() {
+        let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+        let from = |s: &str| Target::new(HostName::parse(s), 1);
+        assert!(from_relay(ip("10.0.0.1"), &from("::ffff:10.0.0.1")));
+        assert!(from_relay(ip("::ffff:10.0.0.1"), &from("10.0.0.1")));
+        assert!(from_relay(ip("::ffff:10.0.0.1"), &from("::ffff:10.0.0.1")));
+        assert!(!from_relay(ip("10.0.0.1"), &from("::ffff:10.0.0.2")));
+        assert!(!from_relay(ip("::ffff:10.0.0.1"), &from("10.0.0.2")));
+    }
+
     /// A carrier that counts its lookups; `None` = every lookup fails.
     struct Lookups(Arc<std::sync::atomic::AtomicUsize>, Option<IpAddr>);
 
@@ -718,6 +736,71 @@ mod tests {
             err.to_string(),
             "socks5: cannot look up the UDP relay: no such name"
         );
+    }
+
+    /// A carrier that hears what is queued for it, each datagram from the
+    /// address it comes with, and fails when there is nothing more.
+    struct Hears(std::sync::Mutex<std::vec::IntoIter<(Target, Vec<u8>)>>);
+
+    impl PacketSocket for Hears {
+        fn send_to<'a>(&'a self, _: &'a [u8], _: &'a Target) -> BoxFuture<'a, io::Result<()>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn recv_from<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> BoxFuture<'a, io::Result<(usize, Target)>> {
+            let next = self.0.lock().unwrap().next();
+            Box::pin(std::future::ready(match next {
+                Some((from, datagram)) => {
+                    buf[..datagram.len()].copy_from_slice(&datagram);
+                    Ok((datagram.len(), from))
+                }
+                None => Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "no more datagrams were queued",
+                )),
+            }))
+        }
+    }
+
+    /// The relay's datagrams are heard whichever of the two forms of its
+    /// address the carrier below reports them from (a dual-stack socket
+    /// reports an IPv4 relay as `::ffff:a.b.c.d`), and a stranger's are not,
+    /// in either form.
+    #[tokio::test]
+    async fn the_relay_is_heard_from_its_address_in_either_form() {
+        let at = |s: &str, port| Target::new(HostName::parse(s), port);
+        let datagram = |from: &str, payload: &[u8]| {
+            let mut datagram = udp_header(&at("10.0.0.9", 53)).unwrap();
+            datagram.extend_from_slice(payload);
+            (at(from, 1080), datagram)
+        };
+        for (relay, relay_heard_from, stranger) in [
+            ("10.0.0.7", "::ffff:10.0.0.7", "::ffff:10.0.0.8"),
+            ("::ffff:10.0.0.7", "10.0.0.7", "10.0.0.8"),
+        ] {
+            let queued = vec![
+                datagram(stranger, b"stranger"),
+                datagram(relay_heard_from, b"relay"),
+            ];
+            let socket = Hears(std::sync::Mutex::new(queued.into_iter()));
+            let (control, _peer) = tokio::io::duplex(64);
+            let udp = Socks5Udp::open(Box::new(control), at(relay, 1080), Box::new(socket))
+                .await
+                .unwrap();
+            let mut buf = [0u8; 1500];
+            let (n, from) = tokio::time::timeout(Duration::from_secs(5), udp.recv_from(&mut buf))
+                .await
+                .expect("an outcome within the bound")
+                .unwrap_or_else(|e| panic!("{relay} heard from {relay_heard_from}: {e}"));
+            assert_eq!(
+                (&buf[..n], from),
+                (&b"relay"[..], at("10.0.0.9", 53)),
+                "{relay} heard from {relay_heard_from}"
+            );
+        }
     }
 
     #[tokio::test]

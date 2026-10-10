@@ -47,8 +47,9 @@ impl HostName {
     /// dual-stack server reports an IPv4 peer in IPv6 form, and the places
     /// that compare a reported source with a target put both in this form
     /// first — `receive` of the UDP pipeline in `rurge-engine`, the receive
-    /// task of `packet_datagram` in `rurge-net`, and `udp_probe` in
-    /// `rurge-policy`.
+    /// task of `packet_datagram` in `rurge-net`, `udp_probe` in
+    /// `rurge-policy`, and `from_relay` of the SOCKS5 and Shadowsocks UDP
+    /// carriers in `rurge-proto`.
     pub fn canonical(self) -> HostName {
         match self {
             HostName::Ip(ip) => HostName::Ip(ip.to_canonical()),
