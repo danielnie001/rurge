@@ -1696,12 +1696,22 @@ mod run {
 
     /// Spawns a prepared `rurge_run` command and waits for both `listening
     /// on` lines.
-    fn spawn_command(mut cmd: Command) -> Daemon {
-        let mut child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
+    fn spawn_command(cmd: Command) -> Daemon {
+        spawn_command_with(cmd, Stdio::inherit()).0
+    }
+
+    /// `spawn_command`, with the daemon's standard error read as well: the
+    /// receiver has its lines.
+    fn spawn_command_reading_stderr(cmd: Command) -> (Daemon, mpsc::Receiver<String>) {
+        let (daemon, errors) = spawn_command_with(cmd, Stdio::piped());
+        (daemon, errors.expect("standard error was piped"))
+    }
+
+    fn spawn_command_with(
+        mut cmd: Command,
+        stderr: Stdio,
+    ) -> (Daemon, Option<mpsc::Receiver<String>>) {
+        let mut child = cmd.stdout(Stdio::piped()).stderr(stderr).spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (tx, rx) = mpsc::channel::<String>();
         std::thread::spawn(move || {
@@ -1710,6 +1720,17 @@ mod run {
                     break;
                 }
             }
+        });
+        let errors = child.stderr.take().map(|stderr| {
+            let (tx, rx) = mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            rx
         });
         // Own the child before anything can panic, so no path leaks the process.
         let mut daemon = Daemon {
@@ -1739,7 +1760,7 @@ mod run {
                     .unwrap_or(0);
             }
         }
-        daemon
+        (daemon, errors)
     }
 
     fn http_get(port: u16, url: &str) -> String {
@@ -3630,6 +3651,147 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             assert_eq!(recorded_profile(&fresh), None, "{what}");
         }
         drop(held);
+    }
+
+    /// `t.conf` with an `external` policy whose program is to listen on `port`.
+    /// The program does not exist and is never started: nothing is sent
+    /// through the policy.
+    fn write_conf_with_external(dir: &Path, port: u16) -> std::path::PathBuf {
+        let conf = dir.join("t.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "[General]\n{API_GENERAL}\n[Proxy]\nX = external, exec = /no/such/program, local-port = {port}\n\
+[Rule]\nFINAL,DIRECT\n"
+            ),
+        )
+        .unwrap();
+        conf
+    }
+
+    /// The load keeps an `external` policy's `local-port` off the listeners
+    /// the profile writes. An override is put over the profile after the load,
+    /// and rurge on that port would dial itself: the start ends, and says the
+    /// option and the port, not the value.
+    #[test]
+    fn a_listen_override_on_the_port_of_an_external_policy_ends_the_start() {
+        // the port only has to be a number: nothing binds it
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf_with_external(dir.path(), port);
+        let data = dir.path().join("data");
+        for (option, value) in [
+            ("--listen-socks5", format!("127.0.0.1:{port}")),
+            ("--listen-http", format!("S3CR3T@127.0.0.1:{port}")),
+        ] {
+            let mut cmd = rurge_run(&conf, &data);
+            cmd.args([option, &value]);
+            let (code, stderr) = give_up(cmd);
+            assert_eq!(code, Some(2), "{option}: {stderr}");
+            assert_eq!(
+                stderr,
+                format!(
+                    "error: {option}: port {port} is the `local-port` of an `external` policy\n"
+                ),
+                "{option}"
+            );
+            assert!(!data.exists(), "{option}: the start left a data directory");
+        }
+        drop(held);
+    }
+
+    /// This start, too, ends before the log is open, and puts back what a
+    /// crashed run left behind.
+    #[test]
+    fn a_listen_override_on_the_port_of_an_external_policy_still_restores_the_system_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = crashed_with_the_system_proxy_on(dir.path());
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let conf = write_conf_with_external(dir.path(), port);
+        let mut cmd = rurge_run(&conf, &data);
+        cmd.args(["--listen-socks5", &format!("127.0.0.1:{port}")]);
+        let (code, stderr) = give_up(cmd);
+        assert_eq!(code, Some(2), "{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "error: --listen-socks5: port {port} is the `local-port` of an `external` policy\n"
+            )),
+            "{stderr}"
+        );
+        assert_restored(&data, &stderr);
+        drop(held);
+    }
+
+    /// A port for a profile to name before rurge binds it, which rurge itself
+    /// does: one that was free a moment ago, in a range the system does not
+    /// hand out by itself (the dynamic ports of Windows by default, Linux and
+    /// macOS are all above it), tried just before it is returned. Not one
+    /// the test gave back after the system had chosen it.
+    fn free_tcp_port() -> u16 {
+        const PORTS: std::ops::Range<u64> = 20_000..30_000;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // this process starts somewhere else in the range than the one before it
+        let start = u64::from(std::process::id()).wrapping_mul(7919);
+        for _ in 0..100 {
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let port = PORTS.start + start.wrapping_add(n) % (PORTS.end - PORTS.start);
+            let port = u16::try_from(port).unwrap();
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+        }
+        panic!("no port of {PORTS:?} is free");
+    }
+
+    /// The next line of the daemon's standard error that has `needle` in it.
+    fn wait_for_stderr_line(lines: &mpsc::Receiver<String>, needle: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let line = lines
+                .recv_timeout(remaining)
+                .unwrap_or_else(|_| panic!("rurge run never wrote a line with `{needle}`"));
+            if line.contains(needle) {
+                return line;
+            }
+        }
+    }
+
+    /// A reload puts the overrides over the profile it reads, and the profile
+    /// may have gained an `external` policy on the port an override listens
+    /// on: the reload fails, as one that cannot read the profile does, and the
+    /// daemon goes on as it was. Here rurge itself binds the port.
+    #[test]
+    fn a_reload_that_puts_an_external_policy_on_an_overridden_listener_is_refused() {
+        let port = free_tcp_port();
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let mut cmd = rurge_run(&conf, &dir.path().join("data"));
+        cmd.args(["--listen-socks5", &format!("127.0.0.1:{port}")]);
+        let (daemon, errors) = spawn_command_reading_stderr(cmd);
+        assert_eq!(daemon.socks, port);
+        let api = api_port(&daemon);
+        write_conf_with_external(dir.path(), port);
+        let (status, body) = api_call(api, "POST", "/v1/profiles/reload", "k", Some("{}"));
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"ok\":false"), "{body}");
+        wait_for_stderr_line(
+            &errors,
+            &format!(
+                "reload failed, keeping current config: --listen-socks5: port {port} is the `local-port` of an `external` policy"
+            ),
+        );
+        // it goes on as it was: the SOCKS5 listener answers
+        let mut socks = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        socks
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socks.write_all(&[5, 1, 0]).unwrap();
+        let mut reply = [0u8; 2];
+        socks.read_exact(&mut reply).unwrap();
+        assert_eq!(reply, [5, 0], "SOCKS5 without authentication");
     }
 }
 

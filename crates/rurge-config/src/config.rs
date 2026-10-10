@@ -239,6 +239,20 @@ impl Config {
         self.specs.iter().find(|s| s.name == name)
     }
 
+    /// The listener of rurge's own that an `external` policy's program would
+    /// be listening on, as `general` has the listeners now: the key of that
+    /// listener and the port. A load reports this for the profile's own
+    /// addresses (`E0018`) and does not build the policy, so a profile that
+    /// loaded without errors has none; whoever replaces the listeners
+    /// afterwards asks again.
+    pub fn external_on_own_listener(&self) -> Option<(&'static str, u16)> {
+        self.specs.iter().find_map(|spec| match &spec.proto {
+            ProtoSpec::External(external) => own_listener(&self.general, external.local_port)
+                .map(|key| (key, external.local_port)),
+            _ => None,
+        })
+    }
+
     /// What `name` refers to, as a policy or group line sees it.
     pub fn name_kind(&self, name: &str) -> Option<NameKind> {
         Some(match self.resolve_policy(name)? {
@@ -2231,6 +2245,74 @@ C = external, exec=/bin/c, local-port=7000\n[Rule]\nFINAL,DIRECT\n",
         );
         assert!(loaded.config.spec("A").is_none() && loaded.config.spec("B").is_none());
         assert!(loaded.config.spec("C").is_some());
+    }
+
+    /// The load keeps an `external` policy off the listeners the profile
+    /// has. Whoever puts others in their place afterwards asks again, of the
+    /// listeners the configuration has by then.
+    #[test]
+    fn an_external_policy_is_asked_about_the_listeners_the_config_has_now() {
+        use crate::general::{parse_http_listen, parse_socks5_listen};
+        let loaded = load_text(
+            "[General]\nhttp-listen = 127.0.0.1:6152\nsocks5-listen = 127.0.0.1:6153\n\
+[Proxy]\nA = external, exec=/bin/a, local-port=7000\nB = external, exec=/bin/b, local-port=7001\n\
+[Rule]\nFINAL,DIRECT\n",
+        );
+        assert!(!loaded.diagnostics.has_errors());
+        let config = loaded.config;
+        assert_eq!(config.external_on_own_listener(), None);
+
+        for address in ["127.0.0.1:7000", "0.0.0.0:7000", "[::1]:7000", "[::]:7000"] {
+            let mut on_socks5 = config.clone();
+            on_socks5.general.socks5_listen = parse_socks5_listen(address).unwrap();
+            assert_eq!(
+                on_socks5.external_on_own_listener(),
+                Some(("socks5-listen", 7000)),
+                "{address}"
+            );
+            let mut on_http = config.clone();
+            on_http.general.http_listen = parse_http_listen(address).unwrap();
+            assert_eq!(
+                on_http.external_on_own_listener(),
+                Some(("http-listen", 7000)),
+                "{address}"
+            );
+        }
+
+        // the port is the policy's, and the address one that the program's
+        // loopback port does not share
+        let mut elsewhere = config.clone();
+        elsewhere.general.socks5_listen = parse_socks5_listen("192.0.2.1:7000").unwrap();
+        elsewhere.general.http_listen = parse_http_listen("192.0.2.1:7001").unwrap();
+        assert_eq!(elsewhere.external_on_own_listener(), None);
+        let mut other_port = config.clone();
+        other_port.general.socks5_listen = parse_socks5_listen("127.0.0.1:7002").unwrap();
+        assert_eq!(other_port.external_on_own_listener(), None);
+
+        // the first policy in the profile's order that has one is the one told
+        let mut both = config.clone();
+        both.general.socks5_listen = parse_socks5_listen("127.0.0.1:7001").unwrap();
+        both.general.http_listen = parse_http_listen("127.0.0.1:7000").unwrap();
+        assert_eq!(both.external_on_own_listener(), Some(("http-listen", 7000)));
+        both.general.http_listen = parse_http_listen("127.0.0.1:7002").unwrap();
+        assert_eq!(
+            both.external_on_own_listener(),
+            Some(("socks5-listen", 7001))
+        );
+    }
+
+    #[test]
+    fn a_profile_without_an_external_policy_has_none_on_its_listeners() {
+        use crate::general::parse_socks5_listen;
+        let loaded = load_text(
+            "[General]\nsocks5-listen = 127.0.0.1:6153\n[Proxy]\nA = direct\nB = http, 127.0.0.1, 7000\n\
+[Rule]\nFINAL,DIRECT\n",
+        );
+        assert!(!loaded.diagnostics.has_errors());
+        let mut config = loaded.config;
+        assert_eq!(config.external_on_own_listener(), None);
+        config.general.socks5_listen = parse_socks5_listen("127.0.0.1:7000").unwrap();
+        assert_eq!(config.external_on_own_listener(), None);
     }
 
     const WG_PRIVATE: &str = "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=";

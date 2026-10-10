@@ -236,12 +236,31 @@ impl Overrides {
 /// every reload do it before they build anything from the profile, so that a
 /// reload compares two configurations that both carry the overrides: editing
 /// `http-listen` in the profile while `--listen-http` is given rebinds nothing.
-fn apply(cfg: &mut rurge_config::Config, overrides: &Overrides) {
+///
+/// The load keeps an `external` policy's `local-port` off the listeners the
+/// profile writes, and the overrides come after it: rurge listening where the
+/// program is to would dial itself, round and round. So the question is asked
+/// again of the listeners as they are now. The error is what to print after
+/// `error: `, as `Overrides::parse`'s is: the option and the reason, and not
+/// the value.
+fn apply(cfg: &mut rurge_config::Config, overrides: &Overrides) -> Result<(), String> {
     if let Some(http) = &overrides.http {
         cfg.general.http_listen = http.clone();
     }
     if let Some(socks5) = &overrides.socks5 {
         cfg.general.socks5_listen = socks5.clone();
+    }
+    match cfg.external_on_own_listener() {
+        None => Ok(()),
+        Some((key, port)) => {
+            let option = match key {
+                "http-listen" => "--listen-http",
+                _ => "--listen-socks5",
+            };
+            Err(format!(
+                "{option}: port {port} is the `local-port` of an `external` policy"
+            ))
+        }
     }
 }
 
@@ -435,7 +454,10 @@ async fn reload(d: &Daemon<'_>, listeners: &mut Vec<(ListenerSpec, Running)>) ->
         };
         tracing::warn!("{message}");
     }
-    apply(&mut loaded.config, d.overrides);
+    if let Err(e) = apply(&mut loaded.config, d.overrides) {
+        eprintln!("error: reload failed, keeping current config: {e}");
+        return failed_report();
+    }
     let next = match build_engine_runtime(
         loaded.config,
         d.rt,
@@ -786,7 +808,13 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     }
     print_diagnostics(&loaded.diagnostics.sorted());
     let mut cfg = loaded.config;
-    apply(&mut cfg, &overrides);
+    // An override that puts rurge's own listener on the port of an `external`
+    // policy ends the start as an option that cannot be read does.
+    if let Err(message) = apply(&mut cfg, &overrides) {
+        eprintln!("error: {message}");
+        recover_without_a_log(&args.runtime);
+        return Ok(ExitCode::from(2));
+    }
     // A log file that cannot be opened ends it as well, and in the same way.
     let (_log_guard, level_handle) = init_logging(
         args.log_level
@@ -1119,7 +1147,7 @@ mod tests {
         let mut cfg = profile(TWO_HTTP_AND_ONE_SOCKS5);
         let before = cfg.general.clone();
         assert_eq!(addresses(&before.http_listen).len(), 2);
-        apply(&mut cfg, &overrides(Some("S3CR3T@127.0.0.1:9001"), None));
+        apply(&mut cfg, &overrides(Some("S3CR3T@127.0.0.1:9001"), None)).unwrap();
         assert_eq!(addresses(&cfg.general.http_listen), ["127.0.0.1:9001"]);
         assert_eq!(
             cfg.general.http_listen[0].password.as_deref(),
@@ -1138,7 +1166,8 @@ mod tests {
         apply(
             &mut cfg,
             &overrides(None, Some("[::1]:9003, 127.0.0.1:9004")),
-        );
+        )
+        .unwrap();
         assert_eq!(
             addresses(&cfg.general.socks5_listen),
             ["[::1]:9003", "127.0.0.1:9004"]
@@ -1150,12 +1179,13 @@ mod tests {
     fn both_overrides_apply_and_none_leaves_the_profile_as_it_is() {
         let mut cfg = profile(TWO_HTTP_AND_ONE_SOCKS5);
         let before = cfg.general.clone();
-        apply(&mut cfg, &overrides(None, None));
+        apply(&mut cfg, &overrides(None, None)).unwrap();
         assert_eq!(cfg.general, before);
         apply(
             &mut cfg,
             &overrides(Some("127.0.0.1:9001"), Some("127.0.0.1:9003")),
-        );
+        )
+        .unwrap();
         assert_eq!(addresses(&cfg.general.http_listen), ["127.0.0.1:9001"]);
         assert_eq!(addresses(&cfg.general.socks5_listen), ["127.0.0.1:9003"]);
         // applied to a profile read again, as a reload does, it gives the same
@@ -1163,9 +1193,81 @@ mod tests {
         apply(
             &mut again,
             &overrides(Some("127.0.0.1:9001"), Some("127.0.0.1:9003")),
-        );
+        )
+        .unwrap();
         assert_eq!(again.general.http_listen, cfg.general.http_listen);
         assert_eq!(again.general.socks5_listen, cfg.general.socks5_listen);
+    }
+
+    /// A profile that loads, with its own listeners elsewhere and an
+    /// `external` policy whose program is to listen on `port`.
+    fn profile_with_an_external_policy(port: u16) -> rurge_config::Config {
+        profile(&format!(
+            "http-listen = 127.0.0.1:7001\nsocks5-listen = 127.0.0.1:7003\n\
+[Proxy]\nX = external, exec=/no/such/program, local-port={port}"
+        ))
+    }
+
+    /// The load keeps an `external` policy off the listeners the profile has,
+    /// but the overrides come after it: rurge on the port the program is to
+    /// listen on would dial itself. The message is the option and the reason,
+    /// as for a value that cannot be read, and not the value.
+    #[test]
+    fn an_override_on_the_port_of_an_external_policy_is_refused() {
+        let mut cfg = profile_with_an_external_policy(1080);
+        assert_eq!(
+            apply(&mut cfg, &overrides(None, Some("127.0.0.1:1080"))),
+            Err(
+                "--listen-socks5: port 1080 is the `local-port` of an `external` policy"
+                    .to_string()
+            )
+        );
+        let mut cfg = profile_with_an_external_policy(1080);
+        let message = apply(&mut cfg, &overrides(Some("S3CR3T@127.0.0.1:1080"), None)).unwrap_err();
+        assert_eq!(
+            message,
+            "--listen-http: port 1080 is the `local-port` of an `external` policy"
+        );
+        assert!(!message.contains("S3CR3T"), "{message}");
+        // an address of the other family or on every interface is the port too
+        for (http, socks5, option) in [
+            (None, Some("[::1]:1080"), "--listen-socks5"),
+            (None, Some("0.0.0.0:1080"), "--listen-socks5"),
+            (Some("[::]:1080"), None, "--listen-http"),
+            (
+                Some("127.0.0.1:1081"),
+                Some("127.0.0.1:1080"),
+                "--listen-socks5",
+            ),
+        ] {
+            let mut cfg = profile_with_an_external_policy(1080);
+            let message = apply(&mut cfg, &overrides(http, socks5)).unwrap_err();
+            assert!(
+                message.starts_with(&format!("{option}: port 1080 ")),
+                "{http:?} {socks5:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_override_on_another_port_is_taken_beside_an_external_policy() {
+        let mut cfg = profile_with_an_external_policy(1080);
+        apply(
+            &mut cfg,
+            &overrides(Some("127.0.0.1:1081"), Some("127.0.0.1:1082")),
+        )
+        .unwrap();
+        assert_eq!(addresses(&cfg.general.http_listen), ["127.0.0.1:1081"]);
+        assert_eq!(addresses(&cfg.general.socks5_listen), ["127.0.0.1:1082"]);
+        // the program listens at loopback: an address elsewhere is not its port
+        let mut cfg = profile_with_an_external_policy(1080);
+        apply(&mut cfg, &overrides(None, Some("192.0.2.1:1080"))).unwrap();
+        assert_eq!(addresses(&cfg.general.socks5_listen), ["192.0.2.1:1080"]);
+        // and with no override there is nothing to ask
+        let mut cfg = profile_with_an_external_policy(1080);
+        let before = cfg.general.clone();
+        apply(&mut cfg, &overrides(None, None)).unwrap();
+        assert_eq!(cfg.general, before);
     }
 
     /// The error is for the person at the terminal: the option and the
