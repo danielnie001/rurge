@@ -1,6 +1,7 @@
-//! Rules flagged `pre-matching` (M2 design §6.5): REJECT-family decisions M3
-//! applies at the DNS / SYN stage. The config layer already guarantees that
-//! such rules carry a REJECT-family policy and a supported rule type.
+//! Rules flagged `pre-matching` (M2 design §6.5): REJECT-family decisions that
+//! are taken ahead of everything else, without resolving. The config layer
+//! already guarantees that such rules carry a REJECT-family policy and a
+//! supported rule type.
 
 use crate::engine::CompiledRule;
 use rurge_config::rule::PolicyRef;

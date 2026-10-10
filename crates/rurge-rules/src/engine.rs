@@ -1,6 +1,7 @@
-//! Rule engine (M2 design §6.5): top-level rules evaluated in order, DNS on
-//! demand through `LazyResolver`, FINAL / `dns-failed` fallbacks, per-rule hit
-//! counters and one-time runtime notes.
+//! Rule engine (M2 design §6.5): top-level rules evaluated in order — after
+//! the ones flagged `pre-matching`, which are checked first and never resolve —,
+//! DNS on demand through `LazyResolver`, FINAL / `dns-failed` fallbacks,
+//! per-rule hit counters and one-time runtime notes.
 
 use crate::matcher::{EvalCtx, GeoLookup, Matcher, ResolvedAddrs, SetLookup, SubRuleHit, Verdict};
 use crate::pre_matching::{PreMatch, PreMatchingSet};
@@ -96,6 +97,8 @@ pub enum Reason {
     Final,
     DnsFailedFallback,
     DnsFailed,
+    /// A rule flagged `pre-matching` matched ahead of the written order.
+    PreMatching,
 }
 
 impl Reason {
@@ -107,6 +110,7 @@ impl Reason {
             Reason::Final => "final",
             Reason::DnsFailedFallback => "dns-failed-fallback",
             Reason::DnsFailed => "dns-failed",
+            Reason::PreMatching => "pre-matching",
         }
     }
 }
@@ -298,6 +302,9 @@ impl RuleEngine {
         }
         let mut ctx = EvalCtx::new(self.geo.as_ref());
         let mut notes: Vec<String> = Vec::new();
+        if let Some(decision) = self.pre_pass(s, &mut ctx, &mut notes, trace.as_deref_mut()) {
+            return decision;
+        }
         for (pos, rule) in self.rules.iter().enumerate() {
             let started = Instant::now();
             let mut verdict = self.eval_rule(rule, s, &mut ctx);
@@ -367,6 +374,57 @@ impl RuleEngine {
         )
     }
 
+    /// Rules flagged `pre-matching` have the highest priority: each is
+    /// checked once, ahead of the written order and without resolving, and
+    /// the first that matches decides. A rule that misses here is not
+    /// dropped — it is evaluated again where it is written, which is where
+    /// an IP rule that needs a lookup can still match.
+    fn pre_pass(
+        &self,
+        s: &SessionInfo,
+        ctx: &mut EvalCtx<'_>,
+        notes: &mut Vec<String>,
+        mut trace: Option<&mut Vec<TraceStep>>,
+    ) -> Option<Decision> {
+        for &pos in self.pre.positions() {
+            let rule = &self.rules[pos];
+            let started = Instant::now();
+            ctx.sub_hit = None;
+            let matched = Self::pre_matches(rule, s, ctx);
+            Self::collect_notes(rule, ctx, notes);
+            if !matched {
+                continue;
+            }
+            if let Some(t) = trace.as_mut() {
+                t.push(TraceStep {
+                    rule: rule.index,
+                    verdict: "pre-match",
+                    elapsed: started.elapsed(),
+                });
+            }
+            rule.hits.fetch_add(1, Ordering::Relaxed);
+            return Some(Decision {
+                outcome: Outcome::Policy(rule.policy.clone()),
+                reason: Reason::PreMatching,
+                matched: Some(rule.index),
+                sub_rule: ctx.sub_hit.take(),
+                resolved: None,
+                notes: std::mem::take(notes),
+            });
+        }
+        None
+    }
+
+    /// Whether a flagged rule pre-matches: it is evaluated as if it had
+    /// `no-resolve` (an IP rule that needs a lookup misses), and only a
+    /// match of a REJECT-family rule counts.
+    fn pre_matches(rule: &CompiledRule, s: &SessionInfo, ctx: &mut EvalCtx<'_>) -> bool {
+        let verdict = rule
+            .matcher
+            .eval(s, ctx, true, rule.params.extended_matching);
+        verdict == Verdict::Match && matches!(&rule.policy, PolicyRef::Builtin(b) if b.is_reject())
+    }
+
     /// Runtime notes are surfaced once per rule (and logged once).
     fn collect_notes(rule: &CompiledRule, ctx: &mut EvalCtx<'_>, notes: &mut Vec<String>) {
         if ctx.notes.is_empty() {
@@ -427,14 +485,9 @@ impl RuleEngine {
         let mut ctx = EvalCtx::new(self.geo.as_ref());
         for &pos in self.pre.positions() {
             let rule = &self.rules[pos];
-            let v = rule
-                .matcher
-                .eval(&s, &mut ctx, true, rule.params.extended_matching);
+            let matched = Self::pre_matches(rule, &s, &mut ctx);
             ctx.notes.clear();
-            if v == Verdict::Match
-                && let PolicyRef::Builtin(b) = &rule.policy
-                && b.is_reject()
-            {
+            if matched {
                 return Some(PreMatch {
                     rule: rule.index,
                     policy: rule.policy.clone(),
@@ -773,6 +826,198 @@ DOMAIN,inline.example.com
         assert_eq!(m.policy.name(), "REJECT-DROP");
         assert!(e.pre_match_domain("other.com", 443).is_none());
         assert!(e.pre_match_ip("10.0.0.1".parse().unwrap(), 80).is_none());
+    }
+
+    /// The allowing rule is written first; the flagged ones still go first.
+    const PRE_CONF: &str = "\
+[Proxy]
+P = direct
+[Rule]
+DOMAIN,both.example,P
+DOMAIN,both.example,REJECT,pre-matching
+RULE-SET,Listed,REJECT,pre-matching
+DOMAIN-SUFFIX,late.example,P
+IP-CIDR,10.0.0.0/8,REJECT,pre-matching
+FINAL,DIRECT
+[Ruleset Listed]
+DOMAIN,listed.example
+";
+
+    fn steps(trace: &[TraceStep]) -> Vec<(usize, &'static str)> {
+        trace.iter().map(|t| (t.rule, t.verdict)).collect()
+    }
+
+    #[tokio::test]
+    async fn a_pre_matching_rule_decides_before_the_written_order() {
+        let e = engine(PRE_CONF);
+        let d = e
+            .evaluate(&session("both.example"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!(d.reason, Reason::PreMatching);
+        assert_eq!(d.reason.as_str(), "pre-matching");
+        assert_eq!(d.matched, Some(1));
+        assert_eq!(d.policy().map(named).as_deref(), Some("REJECT"));
+        assert!(d.resolved.is_none());
+        assert_eq!(e.rules()[0].hits(), 0);
+        assert_eq!(e.rules()[1].hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pre_matching_rule_set_reports_the_line_it_matched() {
+        let e = engine(PRE_CONF);
+        let d = e
+            .evaluate(&session("listed.example"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::PreMatching, Some(2)));
+        let hit = d.sub_rule.expect("sub rule");
+        assert_eq!(hit.set, "Listed");
+        assert_eq!(hit.entry, "DOMAIN,listed.example");
+    }
+
+    /// A flagged IP rule misses in the pre-pass (which never resolves) and
+    /// is evaluated again where it is written: one lookup, one hit.
+    #[tokio::test]
+    async fn a_pre_matching_ip_rule_only_resolves_at_its_own_place() {
+        let e = engine(PRE_CONF);
+        // `late.example` is decided by rule 3, before the lookup rule 4
+        // would ask for: had the pre-pass resolved, `Panicking` would fire
+        let d = e
+            .evaluate(&session("late.example"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::Rule, Some(3)));
+        let r = Counting::v4("10.1.1.1");
+        let d = e
+            .evaluate(&session("foo.org"), OutboundMode::Rule, &r)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::Rule, Some(4)));
+        assert_eq!(d.policy().map(named).as_deref(), Some("REJECT"));
+        assert_eq!(r.calls.load(Ordering::SeqCst), 1);
+        assert!(d.resolved.is_some());
+        assert_eq!(e.rules()[4].hits(), 1);
+    }
+
+    /// A logical rule's sub-rules carry their own `no-resolve`: one that
+    /// needs a lookup is a miss for the pre-pass, not a reason to resolve.
+    #[tokio::test]
+    async fn a_pre_matching_logical_rule_with_a_lookup_in_it_misses_without_resolving() {
+        let e = engine(
+            "[Proxy]\nP = direct\n[Rule]\nDOMAIN,early.example,P\n\
+AND,((DOMAIN-SUFFIX,example),(IP-CIDR,10.0.0.0/8)),REJECT,pre-matching\nFINAL,DIRECT\n",
+        );
+        let d = e
+            .evaluate(&session("early.example"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::Rule, Some(0)));
+        let r = Counting::v4("10.1.1.1");
+        let d = e
+            .evaluate(&session("other.example"), OutboundMode::Rule, &r)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::Rule, Some(1)));
+        assert_eq!(r.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_and_global_modes_do_not_look_at_pre_matching() {
+        let e = engine(PRE_CONF);
+        let d = e
+            .evaluate(&session("both.example"), OutboundMode::Direct, &Panicking)
+            .await;
+        assert_eq!(d.reason, Reason::OutboundModeDirect);
+        assert_eq!(d.policy().map(named).as_deref(), Some("DIRECT"));
+        let d = e
+            .evaluate(
+                &session("both.example"),
+                OutboundMode::Proxy(PolicyRef::Named("P".into())),
+                &Panicking,
+            )
+            .await;
+        assert_eq!(d.reason, Reason::OutboundModeProxy);
+        assert_eq!(d.policy().map(named).as_deref(), Some("P"));
+        assert_eq!(e.rules()[1].hits(), 0);
+    }
+
+    /// A set that is not there yet is an empty set: no match, no error, and
+    /// no session rejected for it.
+    #[tokio::test]
+    async fn a_pre_matching_rule_whose_set_is_empty_matches_nothing() {
+        // `InlineSets` answers a file it does not have with an empty set
+        let e = engine(
+            "[Proxy]\nP = direct\n[Rule]\nDOMAIN,a.example,P\n\
+RULE-SET,not-there.list,REJECT,pre-matching\nFINAL,DIRECT\n",
+        );
+        let d = e
+            .evaluate(&session("a.example"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::Rule, Some(0)));
+        let d = e
+            .evaluate(&session("b.example"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!(d.reason, Reason::Final);
+        assert_eq!(d.policy().map(named).as_deref(), Some("DIRECT"));
+        assert_eq!(e.rules()[1].hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_trace_has_one_step_for_a_pre_match_and_none_for_a_miss() {
+        let e = engine(PRE_CONF);
+        let (d, trace) = e
+            .evaluate_traced(&session("both.example"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!(d.reason, Reason::PreMatching);
+        assert_eq!(steps(&trace), [(1, "pre-match")]);
+        // a miss adds nothing: the written order is walked as it always was
+        let (d, trace) = e
+            .evaluate_traced(&session("late.example"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!(d.matched, Some(3));
+        assert_eq!(
+            steps(&trace),
+            [
+                (0, "no-match"),
+                (1, "no-match"),
+                (2, "no-match"),
+                (3, "match")
+            ]
+        );
+        // and a flagged rule that matches at its own place is listed once
+        let (_, trace) = e
+            .evaluate_traced(
+                &session("foo.org"),
+                OutboundMode::Rule,
+                &Counting::v4("10.1.1.1"),
+            )
+            .await;
+        assert_eq!(trace.iter().filter(|t| t.rule == 4).count(), 1);
+        assert_eq!(steps(&trace).last(), Some(&(4, "match")));
+    }
+
+    /// `SUBNET` has no runtime support, so its rule notes it — once, whichever
+    /// pass meets the rule first, and the note reaches the decision.
+    #[tokio::test]
+    async fn a_note_of_the_pre_pass_is_surfaced_once_and_reaches_the_decision() {
+        const NOTING: &str = "[Proxy]\nP = direct\n[Rule]\n\
+SUBNET,SSID:Home,REJECT,pre-matching\nDOMAIN,ads.example,REJECT,pre-matching\n\
+DOMAIN-SUFFIX,apple.com,DIRECT\nFINAL,P\n";
+        // a hit of the pre-pass, after the rule that noted
+        let e = engine(NOTING);
+        let d = e
+            .evaluate(&session("ads.example"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!(d.reason, Reason::PreMatching);
+        assert_eq!(d.notes.len(), 1, "{:?}", d.notes);
+        assert!(d.notes[0].contains("SUBNET"));
+        let d = e
+            .evaluate(&session("www.apple.com"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!(d.reason, Reason::Rule);
+        assert!(d.notes.is_empty(), "{:?}", d.notes);
+        // and a pass without a hit: the note is not said again at the rule's own place
+        let e = engine(NOTING);
+        let d = e
+            .evaluate(&session("www.apple.com"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!(d.notes.len(), 1, "{:?}", d.notes);
+        assert_eq!(e.rules()[2].hits(), 1);
     }
 
     #[test]

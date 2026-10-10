@@ -1108,6 +1108,66 @@ FINAL,DIRECT,dns-failed
         .stdout(predicate::str::contains("#0 no-match"));
     }
 
+    /// The rule that lets `both.example` through is written first; the
+    /// flagged ones go before it, and a flagged IP rule still gets its turn
+    /// where it is written.
+    const PRE_CONF: &str = "\
+[Proxy]
+P = direct
+[Rule]
+DOMAIN,both.example,P
+DOMAIN,both.example,REJECT,pre-matching
+IP-CIDR,10.0.0.0/8,REJECT,pre-matching
+FINAL,DIRECT
+";
+
+    #[test]
+    fn a_pre_matching_rule_decides_before_the_written_order() {
+        let dir = workspace();
+        std::fs::write(dir.path().join("t.conf"), PRE_CONF).unwrap();
+        let (v, code) = json(dir.path(), &["both.example"]);
+        assert_eq!(code, 0);
+        assert_eq!(v["reason"], "pre-matching");
+        assert_eq!(v["policy"], "REJECT");
+        assert_eq!(v["matched"]["index"], 1);
+        rule_match(dir.path(), &["both.example", "--explain"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("reason: pre-matching"))
+            .stdout(predicate::str::contains(
+                "rule #1: DOMAIN,both.example,REJECT,pre-matching",
+            ))
+            // one step, and the rule written first is never evaluated
+            .stdout(predicate::str::contains("#1 pre-match "))
+            .stdout(predicate::str::contains("#0 ").not());
+        // direct and global modes do not look at the flagged rules
+        let (v, _) = json(dir.path(), &["both.example", "--mode", "direct"]);
+        assert_eq!(v["reason"], "outbound-mode-direct");
+    }
+
+    #[test]
+    fn a_pre_matching_ip_rule_that_misses_is_evaluated_once_in_its_place() {
+        let dir = workspace();
+        std::fs::write(dir.path().join("t.conf"), PRE_CONF).unwrap();
+        let args = ["other.example", "--resolve", "10.1.2.3"];
+        let (v, _) = json(dir.path(), &args);
+        assert_eq!(v["reason"], "rule");
+        assert_eq!(v["matched"]["index"], 2);
+        assert_eq!(v["resolved"]["v4"][0], "10.1.2.3");
+        let out = rule_match(dir.path(), &[args[0], args[1], args[2], "--explain"])
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            out.lines()
+                .filter(|l| l.trim_start().starts_with("#2 "))
+                .count(),
+            1,
+            "{out}"
+        );
+        assert!(!out.contains("pre-match "), "{out}");
+    }
+
     #[test]
     fn outbound_mode_bypasses_rules() {
         let dir = workspace();

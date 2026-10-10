@@ -738,6 +738,40 @@ mod tests {
         assert_eq!(d.sub_rule.map(|hit| hit.set), Some(name));
     }
 
+    /// A flagged rule whose set has not been downloaded yet (here: offline,
+    /// with nothing cached) matches nothing: the warning says so, and no
+    /// session is rejected on account of it.
+    #[tokio::test]
+    async fn a_pre_matching_rule_set_that_is_not_downloaded_matches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let connector = Arc::new(DirectConnector::new(Arc::new(SystemResolve)));
+        let client = Arc::new(HttpClient::new(connector, HttpClientConfig::default()).unwrap());
+        let offline = ResourceManager::with_options(
+            dir.path().to_path_buf(),
+            client,
+            ResourceOptions {
+                offline: true,
+                ..ResourceOptions::default()
+            },
+        );
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,http://sets.example/a.list,REJECT,pre-matching\n\
+DOMAIN,a.com,P\nFINAL,DIRECT\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, offline, dir.path());
+        assert_eq!(codes_of(&diags), vec![codes::W_RESOURCE_UNAVAILABLE]);
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(
+            decide(&engine, "a.com").await,
+            ("P".to_string(), Reason::Rule)
+        );
+        assert_eq!(
+            decide(&engine, "b.com").await,
+            ("DIRECT".to_string(), Reason::Final)
+        );
+    }
+
     #[tokio::test]
     async fn host_section_sets_are_registered() {
         let dir = tempfile::tempdir().unwrap();

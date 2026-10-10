@@ -480,6 +480,39 @@ async fn outbound_modes_bypass_the_rules() {
     assert_eq!(h.target.requests().len(), 0, "the target is never reached");
 }
 
+/// The rule that lets the target through is written first, the flagged
+/// REJECT after it: the flagged one decides. The outbound mode still takes
+/// all of the rules, flagged or not, out of the way.
+#[tokio::test]
+async fn a_pre_matching_reject_written_last_still_rejects_first() {
+    use rurge_engine::control::Mode;
+    let h = harness(
+        "",
+        "DOMAIN,target.test,DIRECT\nDOMAIN,target.test,REJECT,pre-matching",
+        OutboundMode::Rule,
+    )
+    .await;
+    let url = format!("http://target.test:{}/hello", h.target_port());
+    let (head, _) = get_via_proxy(h.http(), &url).await;
+    assert!(head.is_empty(), "rejected: {head}");
+    let rec = wait_for_record(&h.engine, Duration::from_secs(3), |r| {
+        r.dst.starts_with("target.test:") && matches!(r.status, RecordStatus::Rejected(_))
+    })
+    .await
+    .expect("the rejected session's record");
+    assert_eq!(
+        rec.rule.as_deref(),
+        Some("DOMAIN,target.test,REJECT,pre-matching")
+    );
+    assert_eq!(h.target.requests().len(), 0, "the target is never reached");
+    let hits: Vec<u64> = h.engine.rules_view().iter().map(|r| r.hits).collect();
+    assert_eq!(hits[..2], [0, 1]);
+    h.engine.set_mode(Mode::Direct).await;
+    let (head, body) = get_via_proxy(h.http(), &url).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"hi there");
+}
+
 async fn harness_with_final_reject(mode: OutboundMode) -> Harness {
     // every rule rejects (plain REJECT: close, no body); only the outbound mode
     // can let traffic through or answer differently
