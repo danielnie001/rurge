@@ -425,6 +425,8 @@ FINAL,DIRECT
 
 /// More values another field slid into, a field nobody reads, a link that
 /// is no policy line: no diagnostic quotes them and no `Debug` shows them.
+/// The `[WireGuard]` section is one that does not load, for its diagnostics;
+/// a section that loads is the next test's.
 #[test]
 fn more_diagnostics_and_debug_hold_no_secret() {
     let text = format!(
@@ -449,6 +451,22 @@ FINAL,DIRECT
 "
     );
     let loaded = load(&text);
+    // the loader said what the lines are there to provoke
+    let said: Vec<&str> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| d.message.as_str())
+        .collect();
+    for told in [
+        "policy: unknown type",
+        "`corp.example`: invalid DNS server `htps://***@dns.example/dns-query`",
+        "unknown [Keystore] field `passphrase` ignored",
+        "keystore item `cert2`: unknown type",
+        "`dns-server` `https://***@dns.example/dns-query`: an encrypted-DNS URL is not accepted here",
+        "peer 1: invalid `endpoint` (expected host:port)",
+    ] {
+        assert!(said.iter().any(|m| m.contains(told)), "{told}: {said:#?}");
+    }
     // `unknown type` lower-cases what it quotes
     let messages: Vec<String> = loaded
         .diagnostics
@@ -460,9 +478,54 @@ FINAL,DIRECT
     assert_eq!(found, Vec::<String>::new());
 }
 
+/// A `[WireGuard]` section that loads, a peer's pre-shared key among its
+/// lines: the keys are read, and the `Debug` of what the loader returns
+/// shows neither.
+#[test]
+fn a_wireguard_section_that_loads_shows_no_key_in_debug() {
+    use base64::Engine as _;
+    let text = format!(
+        "[Proxy]
+Wg = wireguard, section-name=Home
+
+[WireGuard Home]
+private-key = {KEY}
+self-ip = 10.0.0.2
+dns-server = 1.1.1.1
+peer = (public-key = {PUBLIC}, preshared-key = {KEY}, allowed-ips = 0.0.0.0/0, endpoint = wg.example:51820)
+
+[Rule]
+FINAL,DIRECT
+"
+    );
+    let loaded = load(&text);
+    assert!(
+        !loaded.diagnostics.has_errors() && loaded.diagnostics.is_empty(),
+        "{:#?}",
+        loaded.diagnostics
+    );
+    // the section loads, and both keys are read
+    let key: [u8; 32] = base64::engine::general_purpose::STANDARD
+        .decode(KEY)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let section = &loaded.config.wireguard[0];
+    assert_eq!(*section.private_key.expose(), key);
+    assert_eq!(
+        section.peers[0].preshared_key.as_ref().map(|k| *k.expose()),
+        Some(key)
+    );
+    // the Debug has the section, and not what is secret in it
+    let shown = format!("{:#?}", loaded.config);
+    assert!(shown.contains("WireGuardSection"), "{shown}");
+    assert_eq!(leaks(&shown), Vec::<String>::new());
+}
+
 /// A secret parameter behind what an input method or a copy from a web page
-/// puts in front of it, or written with a full-width `=`: the parsers read
-/// none of these as the parameter, and the redacted profile shows no value.
+/// puts in front of it, or written with a full-width `=`: spellings a person
+/// means as the parameter, whatever a parser makes of them, and the redacted
+/// profile shows no value after any of them.
 #[test]
 fn a_secret_behind_full_width_or_invisible_characters_is_hidden() {
     let lines = [
@@ -535,4 +598,147 @@ fn a_line_that_does_not_load_shows_no_secret_either() {
         .filter(|shown| shown.contains(MARKER))
         .collect();
     assert_eq!(shown, Vec::<String>::new());
+}
+
+/// The redacted form of each line that still holds a secret.
+fn shown_with_secret(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|line| redact_profile(line))
+        .filter(|shown| !leaks(shown).is_empty())
+        .collect()
+}
+
+/// A key the manual has and neither list of secrets named.
+#[test]
+fn the_secret_of_the_mtproto_server_is_hidden() {
+    let text = format!(
+        "[MTProto]\ninterface = 0.0.0.0\nport = 8443\nsecret = dd0123456789abcdef{MARKER}0123456789\n\n[Rule]\nFINAL,DIRECT\n"
+    );
+    let loaded = load(&text);
+    // the parser keeps the section, its lines with it
+    assert!(
+        loaded
+            .config
+            .summary()
+            .deferred
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("MTProto")),
+        "{:#?}",
+        loaded.diagnostics
+    );
+    let mut found = leaks(&redact_profile(&text));
+    found.extend(leaks(&format!("{:#?}", loaded.config)));
+    assert_eq!(found, Vec::<String>::new());
+}
+
+/// Something stands in front of a whole-line key.
+#[test]
+fn a_key_with_something_in_front_of_it_is_hidden() {
+    let lines = [
+        format!("\u{ff1b}ca-passphrase = {MARKER}-fwsemi"),
+        format!("\u{ff1b} http-api = {MARKER}-fwsemiapi@127.0.0.1:6171"),
+        format!("\u{ff1b}private-key = {KEY}"),
+        format!("# was http-api = {MARKER}-wasapi@127.0.0.1:6171"),
+        format!("# old: ca-passphrase = {MARKER}-oldcolon"),
+    ];
+    assert_eq!(shown_with_secret(&lines), Vec::<String>::new());
+}
+
+/// A secret named with a colon: in a comment, in a line for another client.
+#[test]
+fn a_secret_named_with_a_colon_is_hidden_too() {
+    let lines = [
+        format!("# an old password: {MARKER}-colonprose"),
+        format!("P = trojan, t.example, 443, password=x // old password: {MARKER}-colontail"),
+        format!(
+            "# - {{name: HK, type: ss, server: s.example, port: 8388, cipher: aes-256-gcm, password: {MARKER}-clashflow}}"
+        ),
+        format!("    uuid: {UUID}"),
+        format!("    \"password\": \"{MARKER}-json\","),
+    ];
+    assert_eq!(shown_with_secret(&lines), Vec::<String>::new());
+}
+
+/// The other keys that stand on a line of their own, written with a colon.
+#[test]
+fn a_whole_line_key_written_with_a_colon_is_hidden_whatever_the_key() {
+    let lines = [
+        format!("http-api: {MARKER}-colonapi@127.0.0.1:6171"),
+        format!("external-controller-access: {MARKER}-coloneca@0.0.0.0:6170"),
+        format!("http-listen: {MARKER}-colonlisten@0.0.0.0:6152"),
+        format!("wifi-access-http-auth: user:{MARKER}-colonwifi"),
+    ];
+    assert_eq!(shown_with_secret(&lines), Vec::<String>::new());
+}
+
+/// A share link that carries its secret anywhere but in a user-info.
+#[test]
+fn a_share_link_shows_nothing_of_what_follows_its_scheme() {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let vmess = b64.encode(format!(
+        "{{\"v\":\"2\",\"ps\":\"HK\",\"add\":\"v.example\",\"port\":\"443\",\"id\":\"{UUID}\",\"aid\":\"0\",\"net\":\"ws\",\"tls\":\"tls\"}}"
+    ));
+    let legacy = b64.encode(format!("aes-256-gcm:{MARKER}-legacyss@ss.example:8388"));
+    let auth = format!("{MARKER}-hyauth");
+    let obfs = format!("{MARKER}-hy2obfs");
+    let cases = [
+        (format!("vmess://{vmess}"), vmess.clone()),
+        (format!("# vmess://{vmess}"), vmess.clone()),
+        (format!("ss://{legacy}#HK"), legacy.clone()),
+        (
+            format!("hysteria://hy.example:443?protocol=udp&auth={auth}&peer=hy.example#HK"),
+            auth.clone(),
+        ),
+        (
+            format!(
+                "hysteria2://{MARKER}-hy2@hy.example:443/?obfs=salamander&obfs-password={obfs}#HK"
+            ),
+            obfs.clone(),
+        ),
+    ];
+    let shown: Vec<String> = cases
+        .iter()
+        .map(|(line, secret)| (redact_profile(line), secret))
+        .filter(|(shown, secret)| shown.contains(secret.as_str()))
+        .map(|(shown, _)| shown)
+        .collect();
+    assert_eq!(shown, Vec::<String>::new());
+}
+
+/// The comma after the type is the one that is missing.
+#[test]
+fn a_policy_line_that_lost_the_comma_after_its_type_shows_no_credential() {
+    let lines = [
+        format!("P = http h.example, 8080, alice, {MARKER}-typecomma"),
+        format!("S = socks5 1.2.3.4, 1080, user, {MARKER}-typecomma2"),
+        format!("# Old = https h.example, 443, bob, {MARKER}-typecomma3"),
+    ];
+    assert_eq!(shown_with_secret(&lines), Vec::<String>::new());
+}
+
+/// A link in a comment.
+#[test]
+fn a_link_in_a_comment_shows_no_token() {
+    let lines = [
+        format!(
+            "# \u{8ba2}\u{9605}: https://sub.example/api/v1/client/subscribe?token={MARKER}-commentlink"
+        ),
+        format!("# updated from https://sub.example/link/{MARKER}-commentpath?surge=4"),
+        format!("// https://sub.example/link/{MARKER}-barelink"),
+    ];
+    assert_eq!(shown_with_secret(&lines), Vec::<String>::new());
+}
+
+/// What an inline comment holds besides a name with a blank in front of it.
+#[test]
+fn an_inline_comment_is_redacted_as_a_commented_out_line_is() {
+    let lines = [
+        format!("P = trojan, t.example, 443, password=x #password={MARKER}-gluedtail"),
+        format!(
+            "P = http, h.example, 8080, alice, x # was: http, old.example, 8080, alice, {MARKER}-oldtail"
+        ),
+    ];
+    assert_eq!(shown_with_secret(&lines), Vec::<String>::new());
 }
