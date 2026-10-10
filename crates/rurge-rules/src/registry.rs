@@ -1018,6 +1018,82 @@ DOMAIN,a.com,P\nFINAL,DIRECT\n",
         assert_eq!(statuses, [(a, SetKind::RuleSet), (b, SetKind::RuleSet)]);
     }
 
+    /// The sub-rules of a logical rule give a file its role too, at any depth:
+    /// a file the profile names only inside an `AND`, an `OR` or a `NOT` keeps
+    /// that role against a set file written above it that nests the file in
+    /// the other. `b.list` is compiled first, so without the claim the nested
+    /// reference would be the one to register `a.list`, as a domain set.
+    #[tokio::test]
+    async fn the_role_a_logical_rule_gives_a_file_wins_too() {
+        // What each rule decides for the names beside it. `rule.com` is a line
+        // of `a.list` read as a rule set, so the rules that need the set to
+        // match decide `P`; with the empty set a reference that loses turns
+        // into, `FINAL` would decide. `NOT` is the other way round: with the
+        // set it does not match `rule.com` (`FINAL` decides), with the empty
+        // set it would, as it would match any name. `other.com` is not in the
+        // set and shows that the `NOT` can match at all, so the `FINAL` for
+        // `rule.com` is the set's doing.
+        let rules: [(&str, &[(&str, &str)]); 4] = [
+            (
+                "AND,((RULE-SET,a.list),(DOMAIN-SUFFIX,com)),P",
+                &[("rule.com", "P")],
+            ),
+            (
+                "OR,((RULE-SET,a.list),(DOMAIN,never.example)),P",
+                &[("rule.com", "P")],
+            ),
+            (
+                "NOT,((RULE-SET,a.list)),P",
+                &[("rule.com", "DIRECT"), ("other.com", "P")],
+            ),
+            (
+                "AND,((OR,((RULE-SET,a.list),(DOMAIN,never.example))),(DOMAIN-SUFFIX,com)),P",
+                &[("rule.com", "P")],
+            ),
+        ];
+        for (rule, decides) in rules {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.list"), BOTH_KINDS).unwrap();
+            std::fs::write(
+                dir.path().join("b.list"),
+                "DOMAIN-SET,a.list\nDOMAIN,b.com\n",
+            )
+            .unwrap();
+            let cfg = load(
+                &format!(
+                    "[Proxy]\nP = direct\n[Rule]\nRULE-SET,b.list,REJECT\n{rule}\nFINAL,DIRECT\n"
+                ),
+                dir.path(),
+            );
+            let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+            let a = dir.path().join("a.list").display().to_string();
+            let b = dir.path().join("b.list").display().to_string();
+            // the reference nested in `b.list` is the one left out, and the
+            // only one
+            let said = format!(
+                "set `{a}` (referenced in `{b}`) ignored: the same resource is used as a RULE-SET"
+            );
+            let left_out: Vec<&str> = diags
+                .iter()
+                .filter(|d| d.code == codes::W_SET_KIND_CONFLICT)
+                .map(|d| d.message.as_str())
+                .collect();
+            assert_eq!(left_out, [said.as_str()], "{rule}");
+            // and `a.list` is read once, as a rule set
+            let kinds: Vec<SetKind> = reg
+                .statuses()
+                .into_iter()
+                .filter(|s| s.name == a)
+                .map(|s| s.kind)
+                .collect();
+            assert_eq!(kinds, [SetKind::RuleSet], "{rule}");
+            let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+            for (name, policy) in decides {
+                assert_eq!(decide(&engine, name).await.0, *policy, "{rule}: {name}");
+            }
+        }
+    }
+
     /// The same when the profile's claim is a `[Host]` entry: the entries of
     /// `[Host]` are registered after all of the rules, so here the claim is
     /// there before the entry is.
