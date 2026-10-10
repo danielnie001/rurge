@@ -1094,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn reading_this_system_does_not_fail_and_reads_once() {
+    fn reading_this_system_twice_gives_the_same_answer() {
         let first = read();
         assert_eq!(read(), first);
         if let Some(version) = &first.version {
@@ -1113,7 +1113,8 @@ mod tests {
         use windows_registry::LOCAL_MACHINE;
         let string = |path: &str, value: &str| registry_string(LOCAL_MACHINE, path, value);
         assert!(string(CURRENT_VERSION, "CurrentBuildNumber").is_some());
-        // no such key, no such value, a number and a list where a string is wanted
+        // no such key, no such value, a number and (in a Windows as installed)
+        // a list where a string is wanted
         assert_eq!(string(r"SOFTWARE\no-such-key", "CurrentBuildNumber"), None);
         assert_eq!(string(CURRENT_VERSION, "NoSuchValue"), None);
         assert_eq!(string(CURRENT_VERSION, "UBR"), None);
@@ -1132,14 +1133,19 @@ mod tests {
         use windows_registry::LOCAL_MACHINE;
         let manager = r"SYSTEM\CurrentControlSet\Control\Session Manager";
         let first = |path: &str, value: &str| registry_first_string(LOCAL_MACHINE, path, value);
-        // `BootExecute` is a list in every Windows
+        // `BootExecute` is a list in a Windows as installed; a machine may
+        // have emptied or removed it, and then the test has only the cases
+        // below
         let list = LOCAL_MACHINE
             .open(manager)
-            .unwrap()
-            .get_multi_string("BootExecute")
-            .unwrap();
-        assert!(first(manager, "BootExecute").is_some(), "{list:?}");
-        assert_eq!(first(manager, "BootExecute"), name(&list[0]));
+            .ok()
+            .and_then(|key| key.get_multi_string("BootExecute").ok())
+            .unwrap_or_default();
+        assert_eq!(
+            first(manager, "BootExecute"),
+            list.iter().find_map(|item| name(item)),
+            "{list:?}"
+        );
         // a string is a list of one
         assert_eq!(
             first(CURRENT_VERSION, "CurrentBuildNumber"),

@@ -307,7 +307,10 @@ const NEEDS_A_SYSTEM_VERSION: &str = "[General]\n[Rule]\n\
 
 /// `SYSTEM_VERSION` is read from the operating system on every platform; a
 /// version that cannot be read leaves the profile without its FINAL rule.
-/// Asking the system adds nothing to what `check` prints.
+/// Asking the system adds nothing to what `check` prints. Only on Windows,
+/// macOS and Linux: any other Unix is read the way Linux is, and may have no
+/// `/proc/sys/kernel/osrelease`.
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 #[test]
 fn check_reads_the_system_version_from_the_operating_system() {
     let dir = tempfile::tempdir().unwrap();
