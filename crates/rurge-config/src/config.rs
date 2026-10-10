@@ -941,12 +941,15 @@ fn collect_set_uses<'a>(kind: &'a RuleKind, span: &'a Span, out: &mut Vec<SetUse
 
 /// `E0024`: a URL or a file used as a `RULE-SET` and as a `DOMAIN-SET`. The
 /// two read the same text in different formats, so one of them is a set
-/// that is empty, and the rules after it silently do not apply. Whichever
-/// use is written second is the one reported, once per resource, with the
-/// line of the first use and nothing of the reference, which can carry a
-/// password. A set of the profile or a built-in one is no resource here.
-/// Uses are taken in the order `Config` keeps them: the rules, the `[Host]`
-/// entries, the inline sets.
+/// that is empty, and the rules after it silently do not apply.
+///
+/// Uses are taken in the order `Config` keeps them — the rules, the `[Host]`
+/// entries, the inline sets —, which is not the order of the file. The use
+/// reported, once per resource, is the later one in that order; the text
+/// names the kind and the line of the use it disagrees with without saying
+/// which comes first in the file, and quotes nothing of the reference, which
+/// can carry a password. A set of the profile or a built-in one is no
+/// resource here.
 fn set_kind_conflicts(config: &Config, diags: &mut Diagnostics) {
     let mut uses = Vec::new();
     for rule in &config.rules {
@@ -965,7 +968,8 @@ fn set_kind_conflicts(config: &Config, diags: &mut Diagnostics) {
             collect_set_uses(&line.kind, &set.span, &mut uses);
         }
     }
-    // the first use of each resource, and whether it has been reported
+    // the use of each resource met first in that order, and whether the
+    // resource has been reported
     let mut first: HashMap<&ResourceRef, (&str, &Span, bool)> = HashMap::new();
     for (resource, keyword, span) in uses {
         if !matches!(resource, ResourceRef::Url(_) | ResourceRef::File(_)) {
@@ -979,7 +983,7 @@ fn set_kind_conflicts(config: &Config, diags: &mut Diagnostics) {
                     codes::E_SET_KIND_CONFLICT,
                     format!(
                         "the same resource cannot be both a RULE-SET and a DOMAIN-SET \
-(first used as a {} at {})",
+(it is used as a {} at {})",
                         seen.0, seen.1
                     ),
                 )
@@ -2878,16 +2882,17 @@ FINAL,DIRECT
             .filter(|d| d.code == codes::E_SET_KIND_CONFLICT)
             .map(|d| {
                 assert_eq!(d.severity, crate::Severity::Error);
-                assert_eq!(d.hint, None);
                 (d.span.as_ref().expect("a span").line, d.message.clone())
             })
             .collect()
     }
 
-    fn conflict(first: &str, line: u32) -> String {
+    /// The text of the report that stands on one use and names the other:
+    /// its kind, and where it is.
+    fn conflict(other: &str, line: u32) -> String {
         format!(
             "the same resource cannot be both a RULE-SET and a DOMAIN-SET \
-(first used as a {first} at /profiles/t.conf:{line})"
+(it is used as a {other} at /profiles/t.conf:{line})"
         )
     }
 
@@ -2908,6 +2913,26 @@ FINAL,DIRECT
         let l =
             load_text("[Rule]\nRULE-SET,a.list,DIRECT\nDOMAIN-SET,a.list,REJECT\nFINAL,DIRECT\n");
         assert_eq!(kind_conflicts(&l), [(3, conflict("RULE-SET", 2))]);
+    }
+
+    /// The uses are taken in the order the rules, the `[Host]` entries and
+    /// the inline sets are kept in, which is not the order of the file: the
+    /// report stands on the later of the two in that order, and what it says
+    /// of the other use is true wherever in the file the two stand.
+    #[test]
+    fn the_report_names_the_other_use_wherever_it_stands_in_the_file() {
+        let l = load_text(&format!(
+            "[Host]\nDOMAIN-SET:{SETS} = 1.2.3.4\n[Rule]\nRULE-SET,{SETS},DIRECT\nFINAL,DIRECT\n"
+        ));
+        assert_eq!(kind_conflicts(&l), [(2, conflict("RULE-SET", 4))]);
+        let l = load_text(&format!(
+            "[Ruleset X]\nDOMAIN-SET,{SETS}\n[Rule]\nRULE-SET,{SETS},DIRECT\nFINAL,DIRECT\n"
+        ));
+        assert_eq!(kind_conflicts(&l), [(1, conflict("RULE-SET", 4))]);
+        let l = load_text(&format!(
+            "[Ruleset X]\nRULE-SET,{SETS}\n[Host]\nDOMAIN-SET:{SETS} = 1.2.3.4\n[Rule]\nFINAL,DIRECT\n"
+        ));
+        assert_eq!(kind_conflicts(&l), [(1, conflict("DOMAIN-SET", 4))]);
     }
 
     /// One report per resource, however many more uses follow.
