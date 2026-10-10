@@ -202,18 +202,41 @@ fn unknown_type(type_kw: &str) -> String {
     }
 }
 
+/// `what` and the name of a policy or a group, the way a diagnostic of the
+/// loader says it. A share link pasted into `[Proxy]` has its first `=` in
+/// its query, so everything in front of it — a password included — is taken
+/// for the name: a name that holds `://` is no name but a link, and is not
+/// quoted.
+pub(crate) fn named(what: &str, name: &str) -> String {
+    if name.contains("://") {
+        what.to_string()
+    } else {
+        format!("{what} `{name}`")
+    }
+}
+
+/// The name of a policy or a group a diagnostic mentions in passing, quoted;
+/// a link is none (see `named`).
+pub(crate) fn quoted_name(name: &str) -> String {
+    if name.contains("://") {
+        "a link".to_string()
+    } else {
+        format!("`{name}`")
+    }
+}
+
 pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPolicy, ParseError> {
     let fields = split_list(definition);
     let Some(type_kw) = fields.first() else {
         return Err(ParseError::new(
             codes::E_SYNTAX,
-            format!("policy `{name}`: missing type"),
+            format!("{}: missing type", named("policy", name)),
         ));
     };
     let kind = PolicyKind::parse(type_kw).ok_or_else(|| {
         ParseError::new(
             codes::E_UNKNOWN_POLICY_TYPE,
-            format!("policy `{name}`: {}", unknown_type(type_kw)),
+            format!("{}: {}", named("policy", name), unknown_type(type_kw)),
         )
     })?;
     let (server, port, rest) = if kind.takes_server() {
@@ -221,7 +244,8 @@ pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPo
             ParseError::new(
                 codes::E_SYNTAX,
                 format!(
-                    "policy `{name}`: expected `{}, <server>, <port>`",
+                    "{}: expected `{}, <server>, <port>`",
+                    named("policy", name),
                     kind.keyword()
                 ),
             )
@@ -230,7 +254,8 @@ pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPo
             ParseError::new(
                 codes::E_SYNTAX,
                 format!(
-                    "policy `{name}`: expected `{}, <server>, <port>`",
+                    "{}: expected `{}, <server>, <port>`",
+                    named("policy", name),
                     kind.keyword()
                 ),
             )
@@ -248,7 +273,7 @@ pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPo
             };
             ParseError::new(
                 codes::E_SYNTAX,
-                format!("policy `{name}`: invalid port{shown}"),
+                format!("{}: invalid port{shown}", named("policy", name)),
             )
         })?;
         (Some(HostName::parse(server)), Some(port), &fields[3..])
@@ -533,13 +558,13 @@ pub fn parse_group(name: &str, definition: &str, span: &Span) -> Result<PolicyGr
     let Some(type_kw) = fields.first() else {
         return Err(ParseError::new(
             codes::E_SYNTAX,
-            format!("policy group `{name}`: missing type"),
+            format!("{}: missing type", named("policy group", name)),
         ));
     };
     let (kind, legacy_keyword) = GroupKind::parse(type_kw).ok_or_else(|| {
         ParseError::new(
             codes::E_UNKNOWN_POLICY_TYPE,
-            format!("policy group `{name}`: {}", unknown_type(type_kw)),
+            format!("{}: {}", named("policy group", name), unknown_type(type_kw)),
         )
     })?;
     let mut members = Vec::new();
@@ -986,5 +1011,45 @@ external-policy-modifier=\"password=hunter2\"",
             "http, tfo=x, 80, tfo=true"
         );
         assert_eq!(with_params("direct, tfo=x", &tfo), "direct, tfo=true");
+    }
+
+    /// A name that holds `://` is a link and not a name: a share link pasted
+    /// into `[Proxy]` has its first `=` in its query, and all that stands in
+    /// front of it — the password — is taken for the name. A `:/` is a name.
+    #[test]
+    fn a_name_that_holds_a_link_is_not_quoted() {
+        let link = "trojan://hunter2@t.example:443?sni";
+        for (name, definition, expected) in [
+            ("P", "wat, t.example", "policy `P`: unknown type `wat`"),
+            (
+                "a:/b",
+                "wat, t.example",
+                "policy `a:/b`: unknown type `wat`",
+            ),
+            ("a:/", "", "policy `a:/`: missing type"),
+            (link, "wat, t.example", "policy: unknown type `wat`"),
+            (link, "", "policy: missing type"),
+            (
+                link,
+                "http, h.test",
+                "policy: expected `http, <server>, <port>`",
+            ),
+            (link, "http, h.test, 99999", "policy: invalid port `99999`"),
+            (link, "http, h.test, hunter2", "policy: invalid port"),
+            ("a://", "wat, t.example", "policy: unknown type `wat`"),
+        ] {
+            let e = parse_policy(name, definition, &span()).unwrap_err();
+            assert_eq!(e.message, expected, "{name} = {definition}");
+        }
+        for (name, definition, expected) in [
+            ("G", "wat, A", "policy group `G`: unknown type `wat`"),
+            (link, "wat, A", "policy group: unknown type `wat`"),
+            (link, "", "policy group: missing type"),
+        ] {
+            let e = parse_group(name, definition, &span()).unwrap_err();
+            assert_eq!(e.message, expected, "{name} = {definition}");
+        }
+        assert_eq!(named("policy", "P"), "policy `P`");
+        assert_eq!(named("policy group name", link), "policy group name");
     }
 }

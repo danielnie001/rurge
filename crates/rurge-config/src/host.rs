@@ -3,6 +3,7 @@
 use crate::diagnostic::{ParseError, codes};
 use crate::general::EncryptedDns;
 use crate::glob::{Glob, GlobOptions};
+use crate::redact::url_without_credentials;
 use crate::rule::{ParseCtx, ResourceRef};
 use crate::span::Span;
 use crate::value::{split_definition, split_list, strip_prefix_ci};
@@ -111,7 +112,10 @@ pub fn parse_host_entry(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<HostEn
                     servers.push(parse_upstream(&item).ok_or_else(|| {
                         ParseError::new(
                             codes::E_SYNTAX,
-                            format!("`{key}`: invalid DNS server `{item}`"),
+                            format!(
+                                "`{key}`: invalid DNS server `{}`",
+                                url_without_credentials(&item)
+                            ),
                         )
                     })?);
                 }
@@ -250,5 +254,28 @@ mod tests {
     fn non_ascii_host_key_does_not_panic() {
         let e = parse("中文中文中文 = 1.2.3.4").unwrap();
         assert!(matches!(e.key, HostKey::Pattern(_)));
+    }
+
+    /// The server a diagnostic quotes is shown without the user name and the
+    /// password it carries (the resolver sends them as `Authorization: Basic`).
+    #[test]
+    fn an_invalid_dns_server_is_quoted_without_its_credentials() {
+        for (raw, expected) in [
+            (
+                "corp.example = server:htps://al1ce:hunter2@dns.example/dns-query",
+                "`corp.example`: invalid DNS server `htps://***@dns.example/dns-query`",
+            ),
+            (
+                "corp.example = server:8.8.8.8, al1ce:hunter2@1.1.1.1",
+                "`corp.example`: invalid DNS server `***@1.1.1.1`",
+            ),
+            (
+                "corp.example = server:8.8.8.8, not-an-ip",
+                "`corp.example`: invalid DNS server `not-an-ip`",
+            ),
+        ] {
+            let e = parse(raw).unwrap_err();
+            assert_eq!(e.message, expected, "{raw}");
+        }
     }
 }

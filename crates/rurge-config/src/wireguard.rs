@@ -4,8 +4,10 @@
 //! uses it or not.
 
 use crate::diagnostic::{Diagnostic, Diagnostics, codes};
+use crate::redact::url_without_credentials;
 use crate::span::Span;
 use crate::spec::Secret;
+use crate::spec::reader::quotable as value_quotable;
 use crate::text::Section;
 use crate::types::HostName;
 use crate::value::{parse_bool, parse_key_value, split_definition, split_list};
@@ -117,6 +119,18 @@ fn quotable(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// ` `value``, for a diagnostic to say after the name of a field of a peer when
+/// it can be what somebody wrote for that field (`spec::reader::quotable`):
+/// another field slides in when a comma is missing (`endpoint = host:51820
+/// preshared-key = …`), and the peer's key can be that field.
+fn said(value: &str) -> String {
+    if value_quotable(value) {
+        format!(" `{value}`")
+    } else {
+        String::new()
+    }
+}
+
 /// A 32-byte key, the way WireGuard writes it (Base64) or as 64 hex digits.
 fn key32(value: &str) -> Option<[u8; 32]> {
     let value = value.trim();
@@ -140,7 +154,8 @@ fn tunnel_dns(entry: &str) -> Result<TunnelDns, String> {
     }
     if entry.contains("://") {
         return Err(format!(
-            "`dns-server` `{entry}`: an encrypted-DNS URL is not accepted here"
+            "`dns-server` `{}`: an encrypted-DNS URL is not accepted here",
+            url_without_credentials(entry)
         ));
     }
     let addr = match entry.parse::<SocketAddr>() {
@@ -225,7 +240,7 @@ fn allowed_ips(value: &str) -> Result<Vec<IpNet>, String> {
             // a bare address is a route to that address alone
             Err(_) => match entry.parse::<IpAddr>() {
                 Ok(ip) => IpNet::from(ip),
-                Err(_) => return Err(format!("invalid `allowed-ips` entry `{entry}`")),
+                Err(_) => return Err(format!("invalid `allowed-ips` entry{}", said(entry))),
             },
         };
         out.push(net);
@@ -277,7 +292,10 @@ fn peer(report: &mut Report<'_>, span: &Span, item: &str, n: usize) -> Option<Wi
                 Some(e) => end = Some(e),
                 None => report.error(
                     span,
-                    format!("peer {n}: invalid `endpoint` `{value}` (expected host:port)"),
+                    format!(
+                        "peer {n}: invalid `endpoint`{} (expected host:port)",
+                        said(value)
+                    ),
                 ),
             },
             "preshared-key" => match key32(value) {
@@ -291,7 +309,10 @@ fn peer(report: &mut Report<'_>, span: &Span, item: &str, n: usize) -> Option<Wi
                 Ok(secs) => keepalive = (secs > 0).then_some(secs),
                 Err(_) => report.error(
                     span,
-                    format!("peer {n}: invalid `keepalive` `{value}` (expected 0-65535 seconds)"),
+                    format!(
+                        "peer {n}: invalid `keepalive`{} (expected 0-65535 seconds)",
+                        said(value)
+                    ),
                 ),
             },
             "client-id" => match client_id(value) {
@@ -299,7 +320,8 @@ fn peer(report: &mut Report<'_>, span: &Span, item: &str, n: usize) -> Option<Wi
                 None => report.error(
                     span,
                     format!(
-                        "peer {n}: invalid `client-id` `{value}` (expected `a/b/c`, three bytes in hex or four Base64 characters)"
+                        "peer {n}: invalid `client-id`{} (expected `a/b/c`, three bytes in hex or four Base64 characters)",
+                        said(value)
                     ),
                 ),
             },
@@ -819,5 +841,103 @@ peer = (public-key = {PUBLIC}, allowed-ips = 10.0.0.0/8, endpoint = a.test:1, pe
             ]
         );
         assert_eq!(diags[0].span.as_ref().map(|s| s.line), Some(4));
+    }
+
+    /// A peer's field value is quoted by a diagnostic only when it can be what
+    /// somebody wrote for that field: another field slides in when a comma is
+    /// missing (`endpoint = host:51820 preshared-key = <key>` is one field to
+    /// the parser), and the peer's own key can be that field.
+    #[test]
+    fn a_peers_field_value_is_quoted_only_when_it_can_be_what_was_written_for_it() {
+        const SHARED: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+        let peer = |fields: &str| {
+            errors(&format!(
+                "[WireGuard q]\nprivate-key = {PRIVATE}\nself-ip = 10.0.0.2\npeer = (public-key = {PUBLIC}, {fields})\n"
+            ))
+        };
+        let (longest, too_long) = ("a".repeat(64), "a".repeat(65));
+        // `endpoint`
+        assert_eq!(
+            peer("allowed-ips = 10.0.0.0/8, endpoint = nope"),
+            ["[WireGuard q]: peer 1: invalid `endpoint` `nope` (expected host:port)"]
+        );
+        assert_eq!(
+            peer(&format!("allowed-ips = 10.0.0.0/8, endpoint = {longest}")),
+            [format!(
+                "[WireGuard q]: peer 1: invalid `endpoint` `{longest}` (expected host:port)"
+            )]
+        );
+        for value in [
+            too_long.clone(),
+            format!("a.test:51820 preshared-key = {SHARED}"),
+            format!("a.test:1\u{3000}{SHARED}"),
+            "a.test:1=".to_string(),
+        ] {
+            assert_eq!(
+                peer(&format!("allowed-ips = 10.0.0.0/8, endpoint = {value}")),
+                ["[WireGuard q]: peer 1: invalid `endpoint` (expected host:port)"],
+                "{value}"
+            );
+        }
+        // `keepalive`
+        assert_eq!(
+            peer("allowed-ips = 10.0.0.0/8, endpoint = a.test:1, keepalive = 70000"),
+            ["[WireGuard q]: peer 1: invalid `keepalive` `70000` (expected 0-65535 seconds)"]
+        );
+        assert_eq!(
+            peer(&format!(
+                "allowed-ips = 10.0.0.0/8, endpoint = a.test:1, keepalive = 25 preshared-key = {SHARED}"
+            )),
+            ["[WireGuard q]: peer 1: invalid `keepalive` (expected 0-65535 seconds)"]
+        );
+        // `client-id`
+        assert_eq!(
+            peer("allowed-ips = 10.0.0.0/8, endpoint = a.test:1, client-id = 1/2"),
+            [
+                "[WireGuard q]: peer 1: invalid `client-id` `1/2` (expected `a/b/c`, three bytes in hex or four Base64 characters)"
+            ]
+        );
+        assert_eq!(
+            peer(&format!(
+                "allowed-ips = 10.0.0.0/8, endpoint = a.test:1, client-id = 1/2/3 preshared-key = {SHARED}"
+            )),
+            [
+                "[WireGuard q]: peer 1: invalid `client-id` (expected `a/b/c`, three bytes in hex or four Base64 characters)"
+            ]
+        );
+        // an entry of `allowed-ips`, each of a list in quotes on its own
+        assert_eq!(
+            peer("allowed-ips = \"10.0.0.0/8, bad\", endpoint = a.test:1"),
+            ["[WireGuard q]: peer 1: invalid `allowed-ips` entry `bad`"]
+        );
+        assert_eq!(
+            peer(&format!(
+                "allowed-ips = 10.0.0.0/8 preshared-key = {SHARED}, endpoint = a.test:1"
+            )),
+            ["[WireGuard q]: peer 1: invalid `allowed-ips` entry"]
+        );
+        assert_eq!(
+            peer(&format!("allowed-ips = {too_long}, endpoint = a.test:1")),
+            ["[WireGuard q]: peer 1: invalid `allowed-ips` entry"]
+        );
+    }
+
+    /// `dns-server` takes no encrypted-DNS URL, and the one it is shown is
+    /// shown without the user name and the password it may carry.
+    #[test]
+    fn an_encrypted_dns_url_is_said_without_its_credentials() {
+        let found = errors(&format!(
+            "[WireGuard d]\nprivate-key = {PRIVATE}\nself-ip = 10.0.0.2\n\
+dns-server = https://al1ce:hunter2@dns.example/dns-query, tls://dns.example, h3://b0b:pw＠dns.example\n\
+peer = (public-key = {PUBLIC}, allowed-ips = 10.0.0.0/8, endpoint = a.test:1)\n"
+        ));
+        assert_eq!(
+            found,
+            [
+                "[WireGuard d]: `dns-server` `https://***@dns.example/dns-query`: an encrypted-DNS URL is not accepted here",
+                "[WireGuard d]: `dns-server` `tls://dns.example`: an encrypted-DNS URL is not accepted here",
+                "[WireGuard d]: `dns-server` `h3://***@dns.example`: an encrypted-DNS URL is not accepted here",
+            ]
+        );
     }
 }

@@ -535,3 +535,67 @@ G3 = select, Entry, include-other-group=nogroup",
         ]
     );
 }
+
+/// A policy or a group named by a share link pasted into the profile — all
+/// that stands in front of the first `=` of its query, the password among
+/// it — is not named in a diagnostic of the loader, as its subject or in
+/// passing. A name that can be one is quoted, as it was.
+#[test]
+fn a_policy_named_by_a_link_is_not_named_in_a_diagnostic() {
+    let link = "trojan://hunter2@t.example:443?sni";
+    let loaded = load(
+        &format!(
+            "{link} = trojan, t.example, 443, password=pw, tfo=maybe
+{link} = http, h.example, 80
+Ext1 = external, exec=/bin/true, local-port=1080
+{link}x = external, exec=/bin/true, local-port=1080
+{link}y = external, exec=/bin/true, local-port=1081
+Ext2 = external, exec=/bin/true, local-port=1081
+{link}L = http, l.example, 80, underlying-proxy=Loop
+Loop = http, l2.example, 80, underlying-proxy={link}L
+{link}Hop = hysteria2, h.example, 443, password=p, port-hopping=5000-6000
+{link}W = http, w.example, 80, mystery=1
+{link}Own = external, exec=/bin/true, local-port=6152
+Entry = http, e.example, 80"
+        ),
+        &format!(
+            "[General]
+http-listen = 127.0.0.1:6152
+[Proxy Group]
+{link}G = select, Ext1, mystery=1
+{link}G = select, Ext1
+{link}H = select, Nope
+{link}E = url-test, Ext1, interval=soon
+{link}Loop = select, Ext1, underlying-proxy={link}Loop
+{link}R = select, {link}Hop, underlying-proxy=Entry
+PG = select, {link}Hop, underlying-proxy=Entry"
+        ),
+    );
+    let said: Vec<String> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    for message in &said {
+        assert!(!message.contains("hunter2"), "{message}");
+    }
+    for expected in [
+        "policy: invalid value `maybe` for `tfo` (expected true or false)",
+        "duplicate policy name",
+        "policy: `local-port` 1080 is also the `local-port` of policy `Ext1`",
+        "policy `Ext2`: `local-port` 1081 is also the `local-port` of policy",
+        "policy: `underlying-proxy` leads back to the policy itself (via `Loop`)",
+        "policy `Loop`: `underlying-proxy` leads back to the policy itself (via a link)",
+        "policy: unknown parameter `mystery` ignored",
+        "policy: `local-port` 6152 is the port of rurge's own `http-listen`",
+        "policy group: unknown parameter `mystery` ignored",
+        "duplicate policy group name",
+        "policy group references unknown policy `Nope`",
+        "policy group: invalid value `soon` for `interval` (expected a positive number of seconds)",
+        "policy group: `underlying-proxy` leads back to the group itself (via a link)",
+        "policy group relays its members through `underlying-proxy`: a link uses `port-hopping`, which cannot go through it; a link is left out",
+        "policy group `PG` relays its members through `underlying-proxy`: a link uses `port-hopping`, which cannot go through it; a link is left out",
+    ] {
+        assert!(said.iter().any(|m| m == expected), "{expected}: {said:#?}");
+    }
+}

@@ -400,17 +400,24 @@ fn find_suffix_marker(line: &str, marker: &str) -> Option<usize> {
 
 /// Split a profile line into (requirement expression source, content).
 pub fn split_line(line: &str) -> Result<(Option<String>, String), ReqError> {
+    split_line_slice(line).map(|(requirement, content)| (requirement, content.to_string()))
+}
+
+/// `split_line`, the content as the slice of `line` it is: what the
+/// redaction of a profile needs to tell the directive from the line it
+/// stands on.
+pub(crate) fn split_line_slice(line: &str) -> Result<(Option<String>, &str), ReqError> {
     let line = line.trim();
     if let Some(rest) = line.strip_prefix("#!REQUIREMENT") {
         let (expr, content) = take_expr(rest)?;
-        return Ok((Some(expr), content.trim().to_string()));
+        return Ok((Some(expr), content.trim()));
     }
     for (tag, expr) in SIMPLIFIED {
         let prefix = format!("#!{tag}");
         if let Some(rest) = line.strip_prefix(&prefix)
             && (rest.is_empty() || rest.starts_with(char::is_whitespace))
         {
-            return Ok((Some(expr.to_string()), rest.trim().to_string()));
+            return Ok((Some(expr.to_string()), rest.trim()));
         }
     }
     for marker in ["#!REQUIREMENT", "//!REQUIREMENT"] {
@@ -423,7 +430,7 @@ pub fn split_line(line: &str) -> Result<(Option<String>, String), ReqError> {
                 .strip_prefix('"')
                 .and_then(|e| e.strip_suffix('"'))
                 .unwrap_or(expr);
-            return Ok((Some(expr.to_string()), line[..pos].trim().to_string()));
+            return Ok((Some(expr.to_string()), line[..pos].trim()));
         }
     }
     for (tag, expr) in SIMPLIFIED {
@@ -432,11 +439,11 @@ pub fn split_line(line: &str) -> Result<(Option<String>, String), ReqError> {
             if let Some(body) = line.strip_suffix(&marker)
                 && body.ends_with(char::is_whitespace)
             {
-                return Ok((Some(expr.to_string()), body.trim().to_string()));
+                return Ok((Some(expr.to_string()), body.trim()));
             }
         }
     }
-    Ok((None, line.to_string()))
+    Ok((None, line))
 }
 
 /// Evaluate every entry's requirement; unmet or invalid lines are disabled.

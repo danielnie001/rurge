@@ -2,10 +2,10 @@
 //! group's members come from, the relay it chains them through, and the
 //! testing options the automatic groups act on (M3b / M3c).
 
-use super::reader::{invalid_value, quotable, unknown_reference};
+use super::reader::{invalid_value, quotable, unknown_reference, written_as_name};
 use super::{NameKind, Secret};
 use crate::diagnostic::{Diagnostic, Severity, codes};
-use crate::policy::{Builtin, GroupKind, PolicyGroup};
+use crate::policy::{Builtin, GroupKind, PolicyGroup, named};
 use crate::rule::Pattern;
 use crate::span::Span;
 use crate::value::{parse_bool, parse_key_value, split_list};
@@ -176,13 +176,13 @@ impl<'a> Reader<'a> {
     }
 
     fn error(&mut self, code: &'static str, message: String) {
-        let message = format!("policy group `{}`: {message}", self.group.name);
+        let message = format!("{}: {message}", named("policy group", &self.group.name));
         self.diags
             .push(Diagnostic::error(code, message).at(self.group.span.clone()));
     }
 
     fn warn(&mut self, code: &'static str, message: String) {
-        let message = format!("policy group `{}`: {message}", self.group.name);
+        let message = format!("{}: {message}", named("policy group", &self.group.name));
         self.diags
             .push(Diagnostic::warning(code, message).at(self.group.span.clone()));
     }
@@ -210,10 +210,12 @@ impl<'a> Reader<'a> {
         let mut reported = HashSet::new();
         for (key, _) in group.params.iter() {
             if !self.used.contains(key) && reported.insert(key) {
-                self.warn(
-                    codes::W_UNKNOWN_KEY,
-                    format!("unknown parameter `{key}` ignored"),
-                );
+                let message = if written_as_name(&group.definition, key) {
+                    format!("unknown parameter `{key}` ignored")
+                } else {
+                    "unknown parameter ignored".to_string()
+                };
+                self.warn(codes::W_UNKNOWN_KEY, message);
             }
         }
         self.diags
@@ -823,5 +825,54 @@ icon-url=https://example.com/i.png, category=Media",
         let s = o.spec.unwrap();
         assert_eq!(s.members, ["A"]);
         assert!(s.hidden);
+    }
+
+    /// A group's unknown parameter is named the way a policy's is: only
+    /// when the item writes a parameter name.
+    #[test]
+    fn the_name_of_an_unknown_parameter_of_a_group_is_quoted_only_when_it_is_written_as_one() {
+        let longest = "a".repeat(32);
+        let too_long = "a".repeat(33);
+        let named = |name: &str| {
+            vec![(
+                codes::W_UNKNOWN_KEY,
+                format!("policy group `G`: unknown parameter `{name}` ignored"),
+            )]
+        };
+        let nameless = || {
+            vec![(
+                codes::W_UNKNOWN_KEY,
+                "policy group `G`: unknown parameter ignored".to_string(),
+            )]
+        };
+        assert_eq!(messages("select, A, mystery=1"), named("mystery"));
+        assert_eq!(
+            messages(&format!("select, A, {longest}=1")),
+            named(&longest)
+        );
+        assert_eq!(messages(&format!("select, A, {too_long}=1")), nameless());
+        assert_eq!(messages("select, A, aHVudGVyMg=="), nameless());
+        assert_eq!(messages("select, A, \"pa=ss\""), nameless());
+        assert_eq!(messages("select, A, Mystery=1"), nameless());
+        // a group's `{name}` in the message is not a policy's
+        assert_eq!(
+            messages("url-test, A, interval=600, \u{3000}mystery=1"),
+            named("mystery")
+        );
+    }
+
+    /// A name that holds a link is no name: a share link pasted into
+    /// `[Proxy Group]` has its first `=` in its query.
+    #[test]
+    fn a_group_named_by_a_link_is_not_quoted() {
+        let group = parse_group(
+            "trojan://hunter2@t.example:443?sni",
+            "select, A, mystery=1",
+            &span(),
+        )
+        .unwrap();
+        let o = to_group_spec(&group, Path::new("/profiles"), &lookup);
+        let said: Vec<String> = o.diagnostics.into_iter().map(|d| d.message).collect();
+        assert_eq!(said, ["policy group: unknown parameter `mystery` ignored"]);
     }
 }

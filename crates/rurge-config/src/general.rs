@@ -2,7 +2,7 @@
 
 use crate::diagnostic::{Diagnostic, Diagnostics, codes};
 use crate::hostlist::HostList;
-use crate::redact::{url_without_credentials, without_credentials};
+use crate::redact::{redact_line, url_without_credentials, without_credentials};
 use crate::span::Span;
 use crate::spec::secret::Secret;
 use crate::text::Section;
@@ -145,11 +145,24 @@ impl fmt::Debug for Listener {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UnknownKey {
     pub key: String,
     pub value: String,
     pub span: Span,
+}
+
+/// The line as the redacted profile shows it. When a section header is not
+/// recognised (`[Proxy] # note`, `【Proxy】`), every line below it lands here,
+/// a policy's password and a `ca-passphrase` among them.
+impl fmt::Debug for UnknownKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let UnknownKey { key, value, span } = self;
+        f.debug_struct("UnknownKey")
+            .field("line", &redact_line(&format!("{key} = {value}")))
+            .field("span", span)
+            .finish()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1215,5 +1228,28 @@ internet-test-url = ftp://127.0.0.1:9/?token=t0k3n
             shown.contains("<redacted>") && shown.contains("6152"),
             "{shown}"
         );
+    }
+
+    /// When a section header is not recognised (`[Proxy] # note`), every line
+    /// below it lands among the unknown keys of the section above: a policy's
+    /// password, a line whose `=` is missing, a `ca-passphrase`. Their `Debug`
+    /// is the line as the redacted profile shows it.
+    #[test]
+    fn an_unknown_key_shows_its_line_as_the_redacted_profile_would() {
+        let (g, _) = parse(
+            "[General]\nloglevel = notify\n[Proxy] # nodes\nHK = trojan, t.example, 443, password=S3CR3T1, ws-path=/S3CR3T2\n\
+ca-passphrase = S3CR3T3\nhttp, h.example, 8080, alice, S3CR3T4, tfo=true\nSS = ss, s.example, 8388, alice, S3CR3T5\n",
+        );
+        assert_eq!(g.unknown.len(), 4, "{:?}", g.unknown);
+        // the key is held lower-cased: so is what slid into it
+        let shown = format!("{:?}", g.unknown).to_ascii_lowercase();
+        assert!(!shown.contains("s3cr3t"), "{shown}");
+        assert!(!shown.contains("alice"), "{shown}");
+        // and it still tells which line it was
+        assert!(
+            shown.contains("hk = trojan, t.example, 443, password=***, ws-path=***"),
+            "{shown}"
+        );
+        assert!(shown.contains("ca-passphrase = ***"), "{shown}");
     }
 }

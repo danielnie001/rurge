@@ -4,10 +4,11 @@ use crate::deferred::DeferredSections;
 use crate::diagnostic::{Diagnostic, Diagnostics, codes};
 use crate::general::{General, parse_general};
 use crate::host::{HostEntry, parse_host_entry};
-use crate::keystore::{KeystoreItem, parse_keystore_item};
+use crate::keystore::{KeystoreItem, parse_keystore_item, unknown_field};
 use crate::managed::{ManagedConfig, parse_managed};
 use crate::policy::{
-    Builtin, GroupKind, PolicyGroup, PolicyKind, ProxyPolicy, parse_group, parse_policy,
+    Builtin, GroupKind, PolicyGroup, PolicyKind, ProxyPolicy, named, parse_group, parse_policy,
+    quoted_name,
 };
 use crate::requirement::{self, Environment};
 use crate::rule::{ParseCtx, PolicyRef, Rule, RuleKind, SubRule, parse_rule, parse_subrule};
@@ -464,7 +465,7 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
             diags.push(
                 Diagnostic::error(
                     codes::E_DUPLICATE_NAME,
-                    format!("duplicate policy name `{name}`"),
+                    format!("duplicate {}", named("policy name", name)),
                 )
                 .at(span.clone()),
             );
@@ -491,7 +492,7 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
             diags.push(
                 Diagnostic::error(
                     codes::E_DUPLICATE_NAME,
-                    format!("duplicate policy group name `{name}`"),
+                    format!("duplicate {}", named("policy group name", name)),
                 )
                 .at(span.clone()),
             );
@@ -603,11 +604,8 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
                 // Ruling R14: unknown [Keystore] fields warn at the item's span.
                 for u in &k.unknown {
                     diags.push(
-                        Diagnostic::warning(
-                            codes::W_UNKNOWN_KEY,
-                            format!("unknown [Keystore] field `{u}` ignored"),
-                        )
-                        .at(span.clone()),
+                        Diagnostic::warning(codes::W_UNKNOWN_KEY, unknown_field(def, u))
+                            .at(span.clone()),
                     );
                 }
                 if !is_base64(&k.base64) {
@@ -802,8 +800,9 @@ fn underlying_cycles(
                 Diagnostic::error(
                     codes::E_UNDERLYING_PROXY_CYCLE,
                     format!(
-                        "policy `{}`: `underlying-proxy` leads back to the policy itself (via `{first}`)",
-                        s.name
+                        "{}: `underlying-proxy` leads back to the policy itself (via {})",
+                        named("policy", &s.name),
+                        quoted_name(first)
                     ),
                 )
                 .at(s.span.clone()),
@@ -818,8 +817,9 @@ fn underlying_cycles(
                 Diagnostic::error(
                     codes::E_UNDERLYING_PROXY_CYCLE,
                     format!(
-                        "policy group `{}`: `underlying-proxy` leads back to the group itself (via `{first}`)",
-                        g.name
+                        "{}: `underlying-proxy` leads back to the group itself (via {})",
+                        named("policy group", &g.name),
+                        quoted_name(first)
                     ),
                 )
                 .at(g.span.clone()),
@@ -866,8 +866,10 @@ fn hops_under_group_relays(
                     Diagnostic::warning(
                         codes::W_SET_LINES_SKIPPED,
                         format!(
-                            "policy group `{}` relays its members through `underlying-proxy`: `{m}` uses `port-hopping`, which cannot go through it; `{m} (via {relay})` is left out",
-                            g.name
+                            "{} relays its members through `underlying-proxy`: {} uses `port-hopping`, which cannot go through it; {} is left out",
+                            named("policy group", &g.name),
+                            quoted_name(m),
+                            quoted_name(&format!("{m} (via {relay})"))
                         ),
                     )
                     .at(g.span.clone()),
@@ -956,7 +958,10 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
                 diags.push(
                     Diagnostic::error(
                         codes::E_UNKNOWN_GROUP_MEMBER,
-                        format!("policy group `{}` references unknown policy `{m}`", g.name),
+                        format!(
+                            "{} references unknown policy `{m}`",
+                            named("policy group", &g.name)
+                        ),
                     )
                     .at(g.span.clone()),
                 );
@@ -1083,8 +1088,8 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
                         Diagnostic::error(
                             codes::E_INVALID_POLICY_PARAM,
                             format!(
-                                "policy `{}`: `local-port` {port} is the port of rurge's own `{key}`",
-                                p.name
+                                "{}: `local-port` {port} is the port of rurge's own `{key}`",
+                                named("policy", &p.name)
                             ),
                         )
                         .at(p.span.clone()),
@@ -1095,8 +1100,10 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
                         Diagnostic::error(
                             codes::E_INVALID_POLICY_PARAM,
                             format!(
-                                "policy `{}`: `local-port` {} is also the `local-port` of policy `{first}`",
-                                p.name, port
+                                "{}: `local-port` {} is also the `local-port` of {}",
+                                named("policy", &p.name),
+                                port,
+                                named("policy", first)
                             ),
                         )
                         .at(p.span.clone()),

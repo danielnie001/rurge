@@ -244,7 +244,7 @@ fn section_header(line: &str) -> Option<&str> {
     (!inner.is_empty()).then_some(inner)
 }
 
-fn is_requirement_prefix(line: &str) -> bool {
+pub(crate) fn is_requirement_prefix(line: &str) -> bool {
     ["#!REQUIREMENT", "#!IOS-ONLY", "#!MACOS-ONLY", "#!TVOS-ONLY"]
         .iter()
         .any(|p| line.starts_with(p))

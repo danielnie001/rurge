@@ -2,17 +2,42 @@
 //! so that `finish` can warn about the rest.
 
 use crate::diagnostic::{Diagnostic, Severity, codes};
-use crate::policy::ProxyPolicy;
-use crate::value::parse_bool;
+use crate::policy::{ProxyPolicy, named};
+use crate::redact::split_top_level;
+use crate::value::{parse_bool, parse_key_value, split_list};
 use std::collections::HashSet;
 use std::str::FromStr;
 
 /// Whether a diagnostic may quote `value` of a parameter: only when it can be
 /// what somebody wrote for that one key. A comma that is missing lets the next
 /// field slide into the value (`4 psk=…`), and what does not fit one key — a
-/// space, an `=`, more than 64 characters — can be a credential.
+/// space, an `=`, more than 64 characters — can be a credential. So can what
+/// an input method types for a comma or an `=`, `，` and `＝`: the field after
+/// a `，` is in the same value.
 pub(crate) fn quotable(value: &str) -> bool {
-    value.chars().nth(64).is_none() && !value.contains(char::is_whitespace) && !value.contains('=')
+    value.chars().nth(64).is_none()
+        && !value.contains(char::is_whitespace)
+        && !value.contains(['=', '＝', '，'])
+}
+
+/// Whether a diagnostic may quote the name of the parameter `key`: only when
+/// every item of `definition` that the parser reads as that parameter writes
+/// it as a parameter name — ASCII lower-case letters, digits, `-` and `_`, at
+/// most 32 of them. The key is held lower-cased and unquoted — a Base64
+/// password `aHVudGVyMg==` arrives as `ahvudgvymg`, `"pa=ss"` as `pa` — so
+/// this is decided on the text of the line, not on the key.
+pub(crate) fn written_as_name(definition: &str, key: &str) -> bool {
+    split_top_level(definition).into_iter().all(|item| {
+        let reads_as_key = split_list(item).pop().is_some_and(|field| {
+            parse_key_value(&field).is_some_and(|(name, _)| name.eq_ignore_ascii_case(key))
+        });
+        let written = item.split('=').next().unwrap_or_default().trim();
+        !reads_as_key
+            || ((1..=32).contains(&written.len())
+                && written.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_')
+                }))
+    })
 }
 
 /// The text of `E0018`, the value quoted when it can be.
@@ -160,13 +185,13 @@ impl<'a> ParamReader<'a> {
     }
 
     pub fn error(&mut self, code: &'static str, message: String) {
-        let message = format!("policy `{}`: {message}", self.policy.name);
+        let message = format!("{}: {message}", named("policy", &self.policy.name));
         self.diags
             .push(Diagnostic::error(code, message).at(self.policy.span.clone()));
     }
 
     pub fn warn(&mut self, code: &'static str, message: String) {
-        let message = format!("policy `{}`: {message}", self.policy.name);
+        let message = format!("{}: {message}", named("policy", &self.policy.name));
         self.diags
             .push(Diagnostic::warning(code, message).at(self.policy.span.clone()));
     }
@@ -181,10 +206,12 @@ impl<'a> ParamReader<'a> {
         let mut reported = HashSet::new();
         for (key, _) in policy.params.iter() {
             if !self.used.contains(key) && reported.insert(key.to_string()) {
-                self.warn(
-                    codes::W_UNKNOWN_KEY,
-                    format!("unknown parameter `{key}` ignored"),
-                );
+                let message = if written_as_name(&policy.definition, key) {
+                    format!("unknown parameter `{key}` ignored")
+                } else {
+                    "unknown parameter ignored".to_string()
+                };
+                self.warn(codes::W_UNKNOWN_KEY, message);
             }
         }
         for index in self.positional_used..policy.positional.len() {
@@ -254,6 +281,10 @@ mod tests {
             ("a\tb", false),
             ("a=b", false),
             ("psk=S3CR3T", false),
+            // the field after a `，` is in the same value
+            ("true\u{ff0c}S3CR3T", false),
+            ("true\u{ff0c}psk\u{ff1d}S3CR3T", false),
+            ("psk\u{ff1d}S3CR3T", false),
         ] {
             let p = policy("http, 1.2.3.4, 80");
             let mut r = ParamReader::new(&p);
@@ -343,5 +374,53 @@ mod tests {
             diags[0].message,
             "policy `P`: invalid value `soon` for `test-timeout` (expected seconds)"
         );
+    }
+
+    /// The name of an unknown parameter is quoted only when the item writes it
+    /// as a parameter name — ASCII lower-case letters, digits, `-` and `_`, at
+    /// most 32 of them. The reader holds the key lower-cased and unquoted, so
+    /// what somebody wrote as a password (`aHVudGVyMg==` reads as
+    /// `ahvudgvymg`, the quoted `"pa=ss"` as `pa`) is told by the line.
+    #[test]
+    fn the_name_of_an_unknown_parameter_is_quoted_only_when_it_is_written_as_one() {
+        let longest = "a".repeat(32);
+        let too_long = "a".repeat(33);
+        let said = |definition: &str| -> Vec<String> {
+            let p = policy(definition);
+            ParamReader::new(&p)
+                .finish()
+                .into_iter()
+                .map(|d| d.message)
+                .collect()
+        };
+        let named = |name: &str| vec![format!("policy `P`: unknown parameter `{name}` ignored")];
+        let nameless = || vec!["policy `P`: unknown parameter ignored".to_string()];
+        assert_eq!(said("http, 1.2.3.4, 80, mystery=1"), named("mystery"));
+        assert_eq!(said("http, 1.2.3.4, 80, my-key_2=1"), named("my-key_2"));
+        // 32 characters is a name, 33 is not
+        assert_eq!(
+            said(&format!("http, 1.2.3.4, 80, {longest}=1")),
+            named(&longest)
+        );
+        assert_eq!(
+            said(&format!("http, 1.2.3.4, 80, {too_long}=1")),
+            nameless()
+        );
+        // upper case is not how a name is written: a Base64 password reads so
+        assert_eq!(said("http, 1.2.3.4, 80, aHVudGVyMg=="), nameless());
+        assert_eq!(said("http, 1.2.3.4, 80, Mystery=1"), nameless());
+        // a whole item in quotes holds a name no more
+        assert_eq!(said("http, 1.2.3.4, 80, \"pa=ss\""), nameless());
+        assert_eq!(said("http, 1.2.3.4, 80, 'pa=ss'"), nameless());
+        // quotes around the value only are no matter; blanks around the name
+        // are none of it; other characters are
+        assert_eq!(said("http, 1.2.3.4, 80, mystery=\"a,b\""), named("mystery"));
+        assert_eq!(
+            said("http, 1.2.3.4, 80,\u{3000}mystery\u{3000}=1"),
+            named("mystery")
+        );
+        assert_eq!(said("http, 1.2.3.4, 80, my.key=1"), nameless());
+        // a name written two ways: the one that is no name decides
+        assert_eq!(said("http, 1.2.3.4, 80, mystery=1, MYSTERY=2"), nameless());
     }
 }
