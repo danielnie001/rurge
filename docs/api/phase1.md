@@ -1,6 +1,6 @@
 # rurge HTTP API（阶段 1）
 
-rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surge 兼容的 HTTP API。本页记录阶段 1（M4a / M4b）实现的端点与 rurge 暂定的 JSON 结构；手册未定义的结构在阶段 6 与真实 Surge 对齐时可能调整（见 `docs/surge-compatibility-matrix.md` 第 10.4 节）。
+rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surge 兼容的 HTTP API。本页记录阶段 1（M4a / M4b，以及阶段 1 补遗（M5a）加的 `GET /v1/geoip`）实现的端点与 rurge 暂定的 JSON 结构；手册未定义的结构在阶段 6 与真实 Surge 对齐时可能调整（见 `docs/surge-compatibility-matrix.md` 第 10.4 节）。
 
 ## 鉴权与错误
 
@@ -27,9 +27,10 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 | GET | `/v1/dns` | | `{"dnsCache":[Cache…],"upstreams":[…],"bootstrap":[…]}` |
 | POST | `/v1/dns/flush` | | `{}` |
 | POST | `/v1/test/dns_delay` | `{"name":"<host>"}`，缺省为 `internet-test-url` 的主机 | `{"delays":[{"upstream":"udp://…","ms":12,"error":null}]}` |
+| GET | `/v1/geoip?ip=<地址>` | | `{"address":"198.51.100.23","country":"SE","asn":64500,"organization":"Example Network","geoip-db-date":1760000000,"asn-db-date":1760000000}`；见下「GeoIP」 |
 | GET | `/v1/profiles/current?sensitive=0\|1` | | `text/plain`；`sensitive=1` 给出配置文件的原文，默认（`sensitive=0`）给出脱敏后的文本：行数与行尾 CRLF 原样保留，认得出的秘密换成 `***`。**脱敏是尽力而为，不是保证**——藏什么、有意不藏什么、已知漏什么，见下面「脱敏后的配置」 |
 | POST | `/v1/profiles/reload` | | `{"ok":true,"errors":0,"warnings":1,"listenersRebound":false}`；解析失败或构建 `Runtime` 失败时 `ok:false`，运行中的配置不变；重绑监听器失败时也是 `ok:false`，但新配置这时已经生效，只是监听器归零，直到下一次重载成功为止（下一次重载会无条件重试绑定） |
-| POST | `/v1/profiles/check` | | `{"ok":…,"errors":N,"warnings":N,"diagnostics":[Diagnostic…]}`（校验磁盘上的当前配置，不影响运行；`Diagnostic` 与 `rurge check --json` 相同） |
+| POST | `/v1/profiles/check` | | `{"ok":…,"errors":N,"warnings":N,"diagnostics":[Diagnostic…]}`（校验磁盘上的当前配置，不影响运行；`Diagnostic` 与 `rurge check --json` 相同，每项另有 `hint`——字符串或 `null`：阶段 1 补遗（M5a）起多数诊断码有缺省建议，见兼容性清单 10.3 节 `--check` 一行） |
 | POST | `/v1/log/level` | `{"level":"verbose"\|"debug"\|"info"\|"notify"\|"warning"\|"error"}` | `{}` |
 | GET | `/v1/features/{system_proxy\|enhanced_mode\|mitm\|capture\|rewrite\|scripting}` | | `system_proxy` 返回真实状态 `{"enabled":bool}`；其余恒 `{"enabled":false}` |
 | POST | `/v1/features/{name}` | `{"enabled":bool}` | `system_proxy`：成功 `{}`；失败 500 `{"error":"<原因>"}`（例如不支持的 Linux 桌面会带 `export http_proxy=…` 提示）；其余功能 501 |
@@ -41,12 +42,25 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 ### Request
 
 ```json
-{"id":12,"listener":"http","transport":"tcp","src":"127.0.0.1:51234","dst":"example.com:443","rule":"DOMAIN-SUFFIX,example.com,Proxy","policy":["Proxy","HK"],"sni":"example.com","protocol":"https","up":1234,"down":56789,"startedMs":1757200000000,"elapsedMs":812,"connectMs":35,"firstByteMs":120,"status":"completed","rejectKind":null,"error":null}
+{"id":12,"listener":"http","transport":"tcp","src":"127.0.0.1:51234","listenPort":6152,"dst":"example.com:443","remoteAddr":"203.0.113.7:8443","rule":"DOMAIN-SUFFIX,example.com,Proxy","policy":["Proxy","HK"],"sni":"example.com","protocol":"https","up":1234,"down":56789,"startedMs":1757200000000,"elapsedMs":812,"connectMs":35,"firstByteMs":120,"dnsMs":14,"status":"completed","rejectKind":null,"error":null,"notes":[]}
 ```
 
 `listener` ∈ `http` `socks5` `tun` `forward` `internal`；`status` ∈ `active` `completed` `rejected` `failed`；`rejectKind` 在 `rejected` 时是 `REJECT` / `REJECT-DROP` / `REJECT-NO-DROP` / `REJECT-TINYGIF`；`protocol` 是嗅探到的协议小写名或 `null`。`src` 与 `dst` 里，IPv4 映射的 IPv6 地址（`::ffff:a.b.c.d`：双栈监听上的 IPv4 客户端，或写成这种形式的目标）显示为它指的 IPv4 地址 `a.b.c.d`（阶段 2 / M8c；规则与出站看到的也是它）。
 
 `transport` 是 `tcp` 或 `udp`（阶段 2 / M5a 起：经 SOCKS5 UDP ASSOCIATE 进来的每条 UDP 流各有一条记录，`dst` 是它的目标，`up` / `down` 是载荷字节数）。`connectMs` 是会话开始到出站就绪的毫秒数（规则匹配、DNS、`evaluate-before-use` 的等待与 `smart` 组换成员的重试都在内），`firstByteMs` 是出站就绪到收到第一个上游字节的毫秒数；还没有对应时刻（被拒绝、拨号失败、还没收到数据）时为 `null`，测试会话（`rule` 为 `policy test`）两者恒为 `null`（阶段 2 / M3c 起）。
+
+阶段 1 补遗（M5a）起每条记录多四个键：`listenPort`（紧跟 `src`）、`remoteAddr`（紧跟 `dst`）、`dnsMs`（紧跟 `firstByteMs`）与最后的 `notes`。测试会话（`rule` 为 `policy test`）的 `listenPort`、`remoteAddr`、`dnsMs` 恒为 `null`。
+
+- **`listenPort`**：会话进来的监听端口，数字；经 SOCKS5 UDP ASSOCIATE 进来的 UDP 流是 SOCKS5 监听端的 TCP 端口。rurge 自己发起的会话——内部 DNS 会话（`listener` 为 `internal`）与连通性测试——没有监听端口，是 `null`。
+- **`remoteAddr`**：这条会话**自己**开的那条 TCP 连接连到的地址，`ip:port`，IPv6 地址带方括号，IPv4 映射的地址（`::ffff:a.b.c.d`）显示为 IPv4；链式策略（`underlying-proxy`）记的是第一跳，`smart` 组换过成员时是最后连上的那个成员的地址。会话没有开过这样一条连接时是 `null`。具体到各种策略（TCP 会话）：
+  - DIRECT 是连上的那个地址（地址族竞速里赢的那一个）；`http` / `https`、`socks5` / `socks5-tls`、`trojan`、`vmess`、`ss`（含 simple-obfs 与 Shadow TLS 之后）是代理服务器的地址；`external` 是 `127.0.0.1:<local-port>`，程序的本机端口（程序自己再连到哪里，rurge 不知道）。
+  - 复用已有连接或隧道的会话没有：`snell` 与 `anytls` 取自池里的连接是 `null`（取出的 `snell` 连接已失效、拨号返回之后才换新连接重发的会话也是 `null`，尽管它自己开了 socket），`h2-connect` 与 HTTP/2 的 `trust-tunnel` 共用一条连接的其余流是 `null`（只有真的拨了新连接的那一条会话有），`ssh` 只有建立（或重建）那条 SSH 会话的会话有，`wireguard` 是 `null`（隧道由设备任务建立）；QUIC 族（`hysteria2`、`tuic` / `tuic-v5`、`masque`、`trust-tunnel` 的 `h3=true`）走 UDP，是 `null`。例外：底层策略的 UDP 载体是当场开的一条 TCP 连接时（带 `udp-relay=true` 的 `socks5` / `socks5-tls`、`external`、`trojan`、v3 起的 `snell`、没有空闲会话的 `anytls`；`wireguard` 与 `vmess` 不是），碰巧打开那条 QUIC 连接的会话带着底层代理服务器的地址（`external` 是程序的本机端口），共用这条 QUIC 连接的会话是 `null`——读代码得出，没有用例。
+  - 被拒绝的会话（`REJECT` 一族）与 rurge 不实现的协议（`W0007`）：`null`。所有 UDP 会话——UDP 流与内部 UDP 会话，失败的也算——一律 `null`：UDP 没有单一的远端，而经代理的载体只由第一条用到它的流打开，只让那一条带上地址反而误导。
+  - 内部 DNS 会话（`encrypted-dns-follow-outbound-mode`）：DoT / DoH / `tcp://` 上游的会话是服务器的地址；DoQ / DoH3 的 QUIC 载体是 UDP，`null`。
+
+  这是登记的限制（任务局部变量只在会话自己的任务里可见），补全随阶段 4 的 FR-HTTP-10 完整部分。
+- **`dnsMs`**：这条会话拨号期间花在域名解析上的毫秒数，只算 rurge 自己的解析器——规则要的解析（`IP-CIDR` 一类遇到域名）与出站自己的解析（含以域名配置的代理服务器）合计；`[Host]` 与缓存命中的也算一次接近 0 的查找（可能是 0），等另一条会话在同一个名字上已在途的查询的时间也算，被外层超时打断的查找记它已花的时间。目标是地址、名字交给代理去解析、或隧道自己的 `dns-server` 解析了它时，会话没有做过查找，是 `null`，不是 0。查找在结束时才记下，所以卡在一次慢解析里的进行中会话显示 `null`。UDP 流照记；解析器向上游发的查询、查找自己开的连接不算会话的。
+- **`notes`**：备注，字符串数组，没有时 `[]`。现在只有子规则命中那一句 ``Sub-rule matched: <行> (in <集合>)``（兼容性清单 3.3 节）。`error` 里已登记的说明（组环、空组兜底、`policy does not support UDP; sent through DIRECT` 一类，见 `docs/api/phase2.md`）仍在 `error` 里，不搬进 `notes`。
 
 ### Traffic
 
@@ -65,6 +79,19 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 ```
 
 `expiresTime` 与 `startTime` 同单位（Unix 秒，`f64`）；条目没有剩余 TTL 信息时为 `null`。
+
+### GeoIP
+
+阶段 1 补遗（M5a）起，`GET /v1/geoip?ip=<地址>`（Surge iOS 5.23 / Mac 6.10 起的端点）用 `GEOIP`、`IP-ASN` 规则在用的两个库查一个地址；更新器换上新文件之后立刻是新的。`ip` 是 IPv4 或 IPv6 地址。
+
+```json
+{"address":"198.51.100.23","country":"SE","asn":64500,"organization":"Example Network","geoip-db-date":1760000000,"asn-db-date":1760000000}
+```
+
+- `address`：解析之后的样子（`2001:0218:0:0:0:0:0:1` 回显 `2001:218::1`）；IPv4 映射的地址（`::ffff:198.51.100.23`）按它指的 IPv4 地址查，回显也是 IPv4。
+- `country`：国家库给的 ISO 3166 代码；`asn`：数字；`organization`：ASN 库里的组织名。库里没有这个地址的项，或对应的库不在（数据目录的 `geoip/` 里没有那个文件）时是 `null`。
+- `geoip-db-date`、`asn-db-date`：两个库自己带的构建时间（MMDB 元数据的 `build_epoch`），UNIX 秒；库不在时是 `null`，地址在库里没有项时日期仍在。手册只说是"the UNIX timestamps of the databases in use"，没有说是构建时间还是下载时间——登记的差异。
+- 错误：`ip` 不是 IP 地址（含空串）→ 400 `{"error":"ip is not a valid IP address"}`，不回显取值；缺 `ip` → 400，正文是查询串拒绝的原文（含 `` `ip` ``）；鉴权同其它端点（没有 `X-Key` → 401）。
 
 ### 脱敏后的配置
 

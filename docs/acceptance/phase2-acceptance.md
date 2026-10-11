@@ -2,7 +2,7 @@
 
 阶段 2（出站协议与策略组）的验收标准有九条。本文逐条给出现有的证据：用例的文件与名字、证据属于哪一种，以及这一条要算作满足还缺什么。没有证据的地方照实写，不写成通过。
 
-另有两节不属于九条标准。「需求逐条对照代码」一节记 2026-10-10 把需求文档里阶段 1、2 的功能需求逐句对着代码读过一遍的结果：阶段 1 没有自己的验收文档，它的缺口也记在那里，因为项目所有者读的是这一份。最后的「留给项目所有者的」一节列出要做的事与要定的事。
+另有两节不属于九条标准。「需求逐条对照代码」一节记 2026-10-10 把需求文档里阶段 1、2 的功能需求逐句对着代码读过一遍的结果：阶段 1 没有自己的验收文档，它的缺口也记在那里，因为项目所有者读的是这一份；2026-10-11 的阶段 1 补遗（M5a）补上了其中的大部分，补在哪里记在同一节里。最后的「留给项目所有者的」一节列出要做的事与要定的事。
 
 依据两份设计：
 
@@ -34,7 +34,7 @@
 - **第 7 条　回环用例满足，等第一次 CI 绿**。DoQ / DoH3 的 4 个互操作用例没有对真实二进制运行过。
 - **第 8 条　未满足**。三平台 CI 没有绿过；clippy 零警告与 `W0007` / `W0008` 两项在本机成立。
 - **第 9 条　清单已有，手工验收一项没做**。21 节 185 项。
-- **需求逐条对照代码　阶段 1 有 20 句不在**。阶段 1：287 句里 20 句没有落地或只做到解析（只解析 12、没有 8），其中有托管配置的更新与远程 `#!include` 两项 P0；阶段 2：196 句里 5 句只做到解析（4 句启动时由 `W0029` 登记，1 句 `hidden` 没有登记），没有完全缺失的，另有 1 句未能判定。审计只读代码，没有运行，不证明别处没有缺口。
+- **需求逐条对照代码　阶段 1 有 20 句不在（2026-10-10 的数），阶段 1 补遗（M5a）补上了大部分**。阶段 1：287 句里 20 句没有落地或只做到解析（只解析 12、没有 8），其中有托管配置的更新与远程 `#!include` 两项 P0；2026-10-11 的阶段 1 补遗（M5a）之后，表里的 13 行补上了 10 行，剩下托管配置的更新、远程 `#!include` 与外部资源的手动强制更新三行，属阶段 1 补遗（M5b）；阶段 2：196 句里 5 句只做到解析（4 句启动时由 `W0029` 登记，1 句 `hidden` 没有登记），没有完全缺失的，另有 1 句未能判定。审计只读代码，没有运行，不证明别处没有缺口；阶段 1 补遗（M5a）就在判为"做了"的 FR-RULE-05 上查出一条只做了一部分的。
 
 | 标准 | 回环用例（本机通过） | 互操作用例（已写，未运行） | 还缺什么 |
 | ---- | -------------------- | -------------------------- | -------- |
@@ -46,9 +46,9 @@
 | 6　WireGuard 与带 `client-id` 的端点 | `FakeWgPeer` 上带 `client-id` 的握手与转发（TCP、UDP、测速）；保留字节的编解码；隧道的结束方式与重建 | 1 个：sing-box 的 WireGuard 端点，`client-id = 1/2/3` | 对真实 WireGuard 服务端与 WARP 的运行（手工清单 M4b）；重新握手 / keepalive / 过期的计时器没有用例让 90 或 120 秒过去 |
 | 7　`h3://` 与 `quic://` 上游 | URL 解析、DoQ、DoH3、两者共用的会话、经解析器与经跟随出站模式的用例 | 4 个：dnsproxy v0.86.0 与 CoreDNS v1.14.7 各 DoQ、DoH3 | 对真实二进制的运行；夹具的命令行、Corefile 与就绪日志读自源码；公共 DoQ / DoH3 服务（手工清单 M7c） |
 | 8　CI 绿、clippy、`W0007` / `W0008` | `W0007`、`W0008` 的出现条件在配置层、注册表、引擎与 `rurge check` 各有用例；clippy 在本机零警告 | 不适用 | CI 没有绿过：最近一次运行（`0154e73`）的 `cargo test` 在三平台都失败，失败清单未读到；那以后的提交（到 `44a0204` 是 76 个）没有一个被 CI 见过；CI 里没有单独的互操作任务，互操作用例在 `cargo test --workspace` 一步里 |
-| 9　手工验收清单 | 不适用 | 不适用 | `docs/acceptance/phase2-manual.md` 存在，21 节共 185 项，没有一项做过；阶段 1 的 `docs/acceptance/phase1-manual.md` 的 32 项也没做 |
+| 9　手工验收清单 | 不适用 | 不适用 | `docs/acceptance/phase2-manual.md` 存在，21 节共 185 项，没有一项做过；阶段 1 的 `docs/acceptance/phase1-manual.md` 的 34 项也没做 |
 
-能说的：第 2、3、4、5、7 条的文字要求的是用例，这些用例存在，并在本机（Windows）的全量运行里通过；第 6 条在回环对端上成立；第 8 条的 clippy 与 `W0007` / `W0008` 两项在本机成立；第 9 条要求的清单存在。不能说的：第 1 条要求对参考服务器，63 个互操作用例没有一个对真实的二进制运行过；第 8 条要求三平台 CI 绿，CI 没有绿过——本地的 `origin/main` 是 `0154e73`，之后的提交（到 `44a0204` 是 76 个）没有一个被 CI 见过——；第 9 条的手工验收，185 项没有一项做过。回环用例的结果只有本机（Windows）的，Linux 与 macOS 上还没有一次可读的结果（`0154e73` 那次 CI 运行的日志读不到）。阶段 1 也不能说"齐备"：它有 20 句需求条款没有落地或只做到解析，见「需求逐条对照代码」一节。
+能说的：第 2、3、4、5、7 条的文字要求的是用例，这些用例存在，并在本机（Windows）的全量运行里通过；第 6 条在回环对端上成立；第 8 条的 clippy 与 `W0007` / `W0008` 两项在本机成立；第 9 条要求的清单存在。不能说的：第 1 条要求对参考服务器，63 个互操作用例没有一个对真实的二进制运行过；第 8 条要求三平台 CI 绿，CI 没有绿过——本地的 `origin/main` 是 `0154e73`，之后的提交（到 `44a0204` 是 76 个）没有一个被 CI 见过——；第 9 条的手工验收，185 项没有一项做过。回环用例的结果只有本机（Windows）的，Linux 与 macOS 上还没有一次可读的结果（`0154e73` 那次 CI 运行的日志读不到）。阶段 1 也不能说"齐备"：2026-10-10 查出 20 句需求条款没有落地或只做到解析，阶段 1 补遗（M5a）补上了其中的大部分，还剩托管配置的更新、远程 `#!include` 与外部资源的手动强制更新（阶段 1 补遗（M5b））；判为"做了"的条款没有人复核过，阶段 1 补遗（M5a）就在 FR-RULE-05 上查出一条只做了一部分的，见「需求逐条对照代码」一节。
 
 ## 1. 每种协议对参考服务器的 TCP 转发通过；支持 UDP 的协议 UDP 转发通过
 
@@ -422,7 +422,7 @@ Shadow TLS：
 
 ## 需求逐条对照代码
 
-九条标准是阶段 2 自己定的验收；这一节查的是另一件事：需求文档（`docs/requirements.md`）列给阶段 1 和阶段 2 的功能需求，代码里是不是真的有。阶段 1 没有自己的验收文档，它的缺口也记在这里。下文说"计划「延后事项」第 N 行"，指 `docs/superpowers/plans/2026-10-09-phase2-m8c-leftovers-acceptance-plan.md` 的同名一节；说"遗留事项总表 M1a #1"，指 `docs/superpowers/plans/2026-10-09-phase2-leftovers.md` 里 M1a 一节的第 1 行。
+九条标准是阶段 2 自己定的验收；这一节查的是另一件事：需求文档（`docs/requirements.md`）列给阶段 1 和阶段 2 的功能需求，代码里是不是真的有。阶段 1 没有自己的验收文档，它的缺口也记在这里。下文说"计划「延后事项」第 N 行"，指 `docs/superpowers/plans/2026-10-09-phase2-m8c-leftovers-acceptance-plan.md` 的同名一节；说"遗留事项总表 M1a #1"，指 `docs/superpowers/plans/2026-10-09-phase2-leftovers.md` 里 M1a 一节的第 1 行；说"M5a 计划「延后事项」第 N 行"（或「执行期修正记录」第 N 行），指 `docs/superpowers/plans/2026-10-11-phase1-m5a-small-items-plan.md`（阶段 1 补遗（M5a）的计划）的同名一节。
 
 ### 为什么做
 
@@ -450,23 +450,33 @@ Shadow TLS：
 
 本文说"不在"的条款，是上表里"只解析"与"没有"两行的和：阶段 1 是 12 + 8 = 20 句，阶段 2 是 5 + 0 = 5 句。下面两张表逐句列出它们。
 
+### 阶段 1 补遗（M5a）之后（2026-10-11）
+
+上面的数字是 2026-10-10 审计当时的，不改。2026-10-11 的阶段 1 补遗（M5a）（设计 `docs/superpowers/specs/2026-10-11-phase1-m5-addendum-design.md`，计划 `docs/superpowers/plans/2026-10-11-phase1-m5a-small-items-plan.md`，下称"M5a 计划"）补上了其中的大部分。本节与下面表格最后一列引用的提交都在 `e347044..09f1a7a` 里（`e347044` 是 `main`）。引用的用例都存在；除了下面点名的几处，它们在本机（Windows）的全量运行里通过——`09f1a7a` 上的那一次：71 个结果行，2800 个通过，0 个失败，6 个忽略（三个吞吐基准与三个内存实测）——，通过的意思也只是这个。点名的几处：只在 Unix 上编译的 `sighup_reloads_the_profile` 与 `run_shuts_down_gracefully_on_sigint` 里新加的一行等待，以及 macOS、Linux 上的 `rurge_platform::sysinfo` 读取，在本机没有编译过、运行过；三平台 CI 没有绿过。
+
+- **还剩什么**：下表有 13 行（审计数的是句，一行可以含几句，这里数的是行，没有按句重数），10 行补上了，最后一列逐行写补在哪个提交、凭哪些用例。没有做的是三行，都属阶段 1 补遗（M5b）：托管配置的缓存与按间隔更新（FR-CFG-05）、远程 `#!include`（FR-CFG-04、FR-CFG-14）、外部资源的手动强制更新（FR-CFG-14）。代码里没有它们的任何部分，设计在同一份设计文档的第 7 节，计划还没有写。
+- **一条审计读成"做了"、其实只做了一部分的**：FR-RULE-05「规则集预处理索引：域名精确 / 后缀索引、IP 前缀树、ASN 常数时间查询；大集合内存可控」。2026-10-10 的审计把它判成"做了"，阶段 1 补遗（M5a）里量大集合的内存时发现，集合里带 `no-resolve` 的 `IP-CIDR` / `IP-CIDR6` 行不进前缀树、留在逐条求值的行里，而常用的列表每条 IP 行都带 `no-resolve`（blackmatrix7 的 `ChinaMax.list`，2026-10-11 读它自己的说明：124,509 行里 `IP-CIDR` 8,244 条、`IP-CIDR6` 4,281 条），所以"IP 前缀树"只对一半的写法成立；接着对着手册的原句（`rules/ruleset.html`："IP-ASN entries are checked in constant time."）和两份常用的 ASN 列表（`missuo/ASN-China`、`VirgilClyne/GetSomeFries`，每条规则行都写成 `IP-ASN,<号码> // 说明`）又发现，集合里的 `IP-ASN` 行是逐条比较而不是常数时间，规则集文件只认整行注释，这两份列表的每一行都因号码读不出来被跳过、集合是空的，使用者只在加载时看到一条 `W0023`。三处都补上了：带 `no-resolve` 的 IP 行进前缀树（`e4f0991`；用例 `crates/rurge-rules/src/set.rs`：`no_resolve_ip_lines_go_into_the_index_not_the_linear_list`、`among_no_resolve_ip_lines_the_longest_prefix_is_reported`），规则集文件的行尾注释（`92aa656`；用例 `crates/rurge-rules/src/set_format.rs`：`a_rule_line_may_end_in_a_note_that_is_not_part_of_the_rule`、`a_file_of_the_usual_shape_yields_its_rule_lines_and_nothing_is_skipped`），集合里的 `IP-ASN` 行按号码查（`ee5b458`；用例 `crates/rurge-rules/src/set.rs`：`asn_lines_are_not_in_the_list_of_lines_walked_one_by_one`、`a_walked_line_that_matches_is_reported_ahead_of_an_asn_line_that_also_matches`）。这是审计自己的保留（判为"做了"的没有人复核，见「审计没有查的」）第一次被印证。
+- **由此该做的**：阶段 1 称齐备之前，把需求再对一遍代码，每条"做了"指到一条会因它而红的用例，并对着手册的原句、拿一份真实的列表或配置读（M5a 计划「延后事项」第 28 行；排在阶段 1 补遗（M5b）收尾，阶段 3 开始之前）。
+
 ### 阶段 1 里只解析或没有的条款
 
-| FR（优先级） | 需求文档的原话 | 代码现在做什么 | 用户今天看到什么 | 登记在 |
-| ------------ | -------------- | -------------- | ---------------- | ------ |
-| FR-CFG-05（P0） | 「托管配置：`#!MANAGED-CONFIG <URL> interval= strict=`；缓存、按间隔更新、`strict` 到期未更新成功时拒绝启动新会话但保留 API 可用、更新后自动重载并记录 Logbook」 | 只解析：`crates/rurge-config/src/managed.rs`：`parse_managed` 把指令读成 `ManagedConfig { url, interval, strict }`；`Config.managed` 只有 `Config::summary()`（`crates/rurge-config/src/config.rs`）读它，`rurge-net`、`rurge-engine`、`rurge-api` 与 bin 里没有任何地方碰它 | URL 从不被抓取，没有缓存，`interval` 与 `strict` 不起作用，不会因更新而重载（"记录 Logbook"属阶段 6） | 第 100 行；兼容性清单开头一句与 1.3 节 |
-| FR-CFG-04（P0）、FR-CFG-14（P0） | 「`#!include`：单文件、多文件、与普通内容混合（按位置展开）、通配命名节、远程 URL」；「…远程 include 的下载、磁盘缓存…」 | 没有：目标是 URL 的 `#!include` 被 `crates/rurge-config/src/text/include.rs` 跳过，报 `W0011`（`remote include not supported yet`），一条用例钉着这句文本；`rurge-config` 不依赖 `rurge-net`，也没有别处预先取回 | `#!include https://…` 什么也不加，只有一条告警 | 第 100 行；兼容性清单 1.3 节 |
-| FR-CFG-14（P0） | 「…本地文件监视自动重载、手动强制更新」 | 只在库里：`crates/rurge-net/src/resource/mod.rs`：`force_update` 除用例外没有调用者，没有 API 路由，没有 CLI 命令（M2 设计写"M4 的 API 调用它"） | 要立刻重新抓一个规则集或 GeoIP 库，只能等间隔到期或重启 | 第 101 行 |
-| FR-RULE-03（P0）、FR-RULE-02（P0） | 「评估语义：顺序与首个命中；`pre-matching` 规则优先；…」 | 只在库里：规则引擎按配置里的先后逐条走；`crates/rurge-rules/src/engine.rs`：`pre_match_domain`、`pre_match_ip` 与 `PreMatchingSet`（`crates/rurge-rules/src/pre_matching.rs`）除 `rurge-rules` 自己的用例外没有调用者（M2 设计写"M3 在 DNS 应答与 SYN 阶段调用"） | 排在另一条后面的 `…,REJECT,pre-matching` 输给先命中的那一条 | 第 101 行；兼容性清单 3.2、3.3 节 |
-| FR-RULE-15（P0） | 「子规则命中日志 `Sub-rule matched: <rule> (in <set>)`」 | 只在库里：`Decision.sub_rule` 算出来了，只有离线的 `rurge rule match` 打印它（`crates/rurge/src/cli/rule.rs`，写成 `sub-rule: <entry> (in <set>)`）；源码里没有 `Sub-rule matched` 这个字符串 | 运行中的会话日志与请求记录只写 `RULE-SET` 那一行，不写集合里命中的那一行 | 第 101 行；兼容性清单 3.3 节 |
-| FR-RULE-04（P0） | 「…同一资源不可同时作两种集…」 | 没有：集合注册表按（资源，种类）记条目（`crates/rurge-rules/src/registry.rs`），同一个 URL 或文件既当 `RULE-SET` 又当 `DOMAIN-SET` 时载入两次 | 没有错误，也没有告警 | 第 101 行；兼容性清单 3.5 节 |
-| FR-RULE-06（P0） | 「…数据库日期可查询」 | 只在库里：`GeoDbInfo`（`crates/rurge-rules/src/geoip.rs`）里两个库的更新日期只被启动时的等待（`crates/rurge-engine/src/stack.rs`）和用例读 | 没有 API 路由，没有 CLI 命令显示数据库的日期 | 第 101 行 |
-| FR-CFG-09（P0） | 「…`SYSTEM_VERSION` `DEVICE_MODEL` `LANGUAGE` `DEVICE_NAME` 取自操作系统」 | `crates/rurge/src/cli/mod.rs`：`environment` 里 `SYSTEM_VERSION` 是字面的 `unknown`，`DEVICE_MODEL` 是 CPU 架构（`std::env::consts::ARCH`），`LANGUAGE` 取环境变量 `LANG`（Windows 上没有，永远是 `en-US`），`DEVICE_NAME` 取 `COMPUTERNAME` / `HOSTNAME`（都没有时是 `rurge`） | 对这些变量写的 Requirement 表达式就按这些值比较；`LANGUAGE`、`DEVICE_NAME` 没有用例 | 第 102 行；兼容性清单 1.4 节 |
-| FR-CFG-17（P0） | 「rurge 专有运行时选项（数据目录、TUN 设备名、日志文件、监听覆盖等）只通过命令行参数与环境变量提供」 | 没有监听覆盖：阶段 1 设计列在 `rurge run` 上的 `--config-dir`、`--listen-http ADDR`、`--listen-socks5 ADDR` 一个都没有，环境变量也没有；数据目录和日志文件有各自的选项 | 监听地址只能改配置文件 | 第 102 行 |
-| FR-CFG-03（P0） | 「`rurge check` 输出文件、行号、原因与建议」 | 几乎没有建议：`crates/rurge-config/src/config.rs` 里 `E0010`（"add `FINAL,DIRECT` as the last rule"）是唯一设了建议的诊断，别的都不带 | `rurge check` 的输出里只有这一条诊断有建议 | 第 102 行 |
-| FR-HTTP-10（P0；"1 基础 / 4 完整"） | 「…监听端口、协议、命中规则、策略与链、远端地址、状态、上下行流量、各阶段耗时…」 | `crates/rurge-engine/src/observe.rs`：`RequestRecord` 没有远端（上游）地址；只记监听器的种类，不记监听端口；耗时只有 `connect_ms / first_byte_ms / elapsed_ms`，没有 DNS 阶段。"基础"是否包含它们，需求文档没有写；阶段 1 设计 8.4 列了 `remote_addr / timings { dns, … }` | `GET /v1/requests/recent` 里看不到远端地址、监听端口和 DNS 耗时 | 第 102 行 |
-| FR-CFG-15（P1） | 「多 Profile 管理：配置目录、当前 Profile 记录、列出 / 切换 / 校验 / 查看当前内容（可脱敏）」 | 当前 Profile 记录只在类型里：`crates/rurge-engine/src/state.rs` 的 `State.current_profile` 声明了、初始化成 `None`，没有任何地方写它或读它；配置目录、列出与切换登记在阶段 6 | `state.json` 里没有当前配置的记录 | 第 102 行 |
-| FR-CFG-10（P2） | 「可选扩展简写 `#!WINDOWS-ONLY` `#!LINUX-ONLY`，Surge 会将其视为普通注释」 | 没有：`crates/rurge-config/src/requirement.rs` 的 `SIMPLIFIED` 只有三个 Apple 标签，这样的行按未知指令丢掉并报 `W0014` | 在 Windows 上 `#!WINDOWS-ONLY` 不起作用 | 第 102 行 |
+前五列是 2026-10-10 审计当时的样子，不改；最后一列是 2026-10-11 阶段 1 补遗（M5a）之后的结果。
+
+| FR（优先级） | 需求文档的原话 | 代码现在做什么 | 用户今天看到什么 | 登记在 | 阶段 1 补遗（M5a）之后 |
+| ------------ | -------------- | -------------- | ---------------- | ------ | ---------------------- |
+| FR-CFG-05（P0） | 「托管配置：`#!MANAGED-CONFIG <URL> interval= strict=`；缓存、按间隔更新、`strict` 到期未更新成功时拒绝启动新会话但保留 API 可用、更新后自动重载并记录 Logbook」 | 只解析：`crates/rurge-config/src/managed.rs`：`parse_managed` 把指令读成 `ManagedConfig { url, interval, strict }`；`Config.managed` 只有 `Config::summary()`（`crates/rurge-config/src/config.rs`）读它，`rurge-net`、`rurge-engine`、`rurge-api` 与 bin 里没有任何地方碰它 | URL 从不被抓取，没有缓存，`interval` 与 `strict` 不起作用，不会因更新而重载（"记录 Logbook"属阶段 6） | 第 100 行；兼容性清单开头一句与 1.3 节 | 没有做：属阶段 1 补遗（M5b），代码里还没有它的任何部分 |
+| FR-CFG-04（P0）、FR-CFG-14（P0） | 「`#!include`：单文件、多文件、与普通内容混合（按位置展开）、通配命名节、远程 URL」；「…远程 include 的下载、磁盘缓存…」 | 没有：目标是 URL 的 `#!include` 被 `crates/rurge-config/src/text/include.rs` 跳过，报 `W0011`（`remote include not supported yet`），一条用例钉着这句文本；`rurge-config` 不依赖 `rurge-net`，也没有别处预先取回 | `#!include https://…` 什么也不加，只有一条告警 | 第 100 行；兼容性清单 1.3 节 | 没有做：同上；`W0011` 的文本与钉着它的用例照旧 |
+| FR-CFG-14（P0） | 「…本地文件监视自动重载、手动强制更新」 | 只在库里：`crates/rurge-net/src/resource/mod.rs`：`force_update` 除用例外没有调用者，没有 API 路由，没有 CLI 命令（M2 设计写"M4 的 API 调用它"） | 要立刻重新抓一个规则集或 GeoIP 库，只能等间隔到期或重启 | 第 101 行 | 没有做：属阶段 1 补遗（M5b）（设计第 7.6 节：`GET /v1/external_resources` 与 `POST /v1/external_resources/update`）；`ResourceManager::force_update` 仍只有用例调用 |
+| FR-RULE-03（P0）、FR-RULE-02（P0） | 「评估语义：顺序与首个命中；`pre-matching` 规则优先；…」 | 只在库里：规则引擎按配置里的先后逐条走；`crates/rurge-rules/src/engine.rs`：`pre_match_domain`、`pre_match_ip` 与 `PreMatchingSet`（`crates/rurge-rules/src/pre_matching.rs`）除 `rurge-rules` 自己的用例外没有调用者（M2 设计写"M3 在 DNS 应答与 SYN 阶段调用"） | 排在另一条后面的 `…,REJECT,pre-matching` 输给先命中的那一条 | 第 101 行；兼容性清单 3.2、3.3 节 | 补上了。`23b5c75`：规则模式下 `RuleEngine::run` 先把带 `pre-matching` 的规则不解析地评估一遍，命中者的 `reason` 是 `pre-matching`；用例 `crates/rurge-rules/src/engine.rs`：`a_pre_matching_rule_decides_before_the_written_order`、`the_trace_has_one_step_for_a_pre_match_and_none_for_a_miss`、`a_pre_matching_ip_rule_only_resolves_at_its_own_place`、`direct_and_global_modes_do_not_look_at_pre_matching`，`crates/rurge-engine/tests/pipeline.rs`：`a_pre_matching_reject_written_last_still_rejects_first`，`crates/rurge/tests/cli.rs`：`rule_match::a_pre_matching_rule_decides_before_the_written_order`。DNS 查询与 TCP 握手两个阶段的预匹配仍在阶段 3：`pre_match_domain` / `pre_match_ip` 还是只有 `rurge-rules` 自己的用例调用 |
+| FR-RULE-15（P0） | 「子规则命中日志 `Sub-rule matched: <rule> (in <set>)`」 | 只在库里：`Decision.sub_rule` 算出来了，只有离线的 `rurge rule match` 打印它（`crates/rurge/src/cli/rule.rs`，写成 `sub-rule: <entry> (in <set>)`）；源码里没有 `Sub-rule matched` 这个字符串 | 运行中的会话日志与请求记录只写 `RULE-SET` 那一行，不写集合里命中的那一行 | 第 101 行；兼容性清单 3.3 节 | 补上了。`0b07366`：集合里命中某一行时，引擎记一条 DEBUG 日志 `Sub-rule matched: <行> (in <集合>)`，并把同一句放进请求记录的 `notes`；用例 `crates/rurge-engine/tests/pipeline.rs`：`a_rule_set_hit_is_logged_and_noted_on_the_request`，`crates/rurge-api/tests/api.rs`：`requests_carry_the_notes_of_their_sessions`。命中的子规则只属于命中的那条规则（原来未命中的逻辑规则会把它留给后面命中的规则）：`crates/rurge-rules/src/engine.rs`：`a_rule_that_did_not_match_leaves_no_sub_rule_for_the_next`、`a_branch_that_did_not_decide_the_rule_leaves_no_sub_rule`、`a_not_carries_no_sub_rule` |
+| FR-RULE-04（P0） | 「…同一资源不可同时作两种集…」 | 没有：集合注册表按（资源，种类）记条目（`crates/rurge-rules/src/registry.rs`），同一个 URL 或文件既当 `RULE-SET` 又当 `DOMAIN-SET` 时载入两次 | 没有错误，也没有告警 | 第 101 行；兼容性清单 3.5 节 | 补上了。`08b7246`（加载期 `E0024`，运行期 `W0032`），修正 `e7f870e`、`c2c9d88`、`519cbd4`（配置自己写出的身份总是压过集合文件里嵌套的引用）；用例 `crates/rurge-config/src/config.rs`：`one_resource_as_a_rule_set_and_a_domain_set_is_an_error_at_the_second_use`、`the_report_names_the_other_use_wherever_it_stands_in_the_file`，`crates/rurge-rules/src/registry.rs`：`a_domain_set_nested_in_a_file_cannot_reuse_a_rule_set`、`the_role_the_profile_gives_a_file_wins_over_one_nested_above_it`、`the_role_a_logical_rule_gives_a_file_wins_too`，`crates/rurge/tests/cli.rs`：`check_refuses_one_resource_as_two_kinds_of_set`。Surge 自己怎样处理没有证据（M5a 计划「延后事项」第 9 行） |
+| FR-RULE-06（P0） | 「…数据库日期可查询」 | 只在库里：`GeoDbInfo`（`crates/rurge-rules/src/geoip.rs`）里两个库的更新日期只被启动时的等待（`crates/rurge-engine/src/stack.rs`）和用例读 | 没有 API 路由，没有 CLI 命令显示数据库的日期 | 第 101 行 | 补上了。`82659e3`，修正 `e964445`：`GET /v1/geoip?ip=<地址>`（`GeoDb::describe`，`Engine::geoip_view`）；用例 `crates/rurge-rules/src/geoip.rs`：`describe_gives_what_the_loaded_databases_know`、`describe_does_not_warn_of_a_missing_database`，`crates/rurge-api/tests/api.rs`：`geoip_says_what_the_databases_in_use_know`、`geoip_without_databases_has_nothing_to_say`、`geoip_wants_an_address_and_the_key`。两个日期是库自己带的构建时间，手册没有说是构建时间还是下载时间；没有 CLI 命令（阶段 6） |
+| FR-CFG-09（P0） | 「…`SYSTEM_VERSION` `DEVICE_MODEL` `LANGUAGE` `DEVICE_NAME` 取自操作系统」 | `crates/rurge/src/cli/mod.rs`：`environment` 里 `SYSTEM_VERSION` 是字面的 `unknown`，`DEVICE_MODEL` 是 CPU 架构（`std::env::consts::ARCH`），`LANGUAGE` 取环境变量 `LANG`（Windows 上没有，永远是 `en-US`），`DEVICE_NAME` 取 `COMPUTERNAME` / `HOSTNAME`（都没有时是 `rurge`） | 对这些变量写的 Requirement 表达式就按这些值比较；`LANGUAGE`、`DEVICE_NAME` 没有用例 | 第 102 行；兼容性清单 1.4 节 | 补上了。`0d3889f`，修正 `118a553`、`49bf061`：`rurge_platform::sysinfo` 读操作系统，`cli::environment_from` 把读不到的退回原来的取值；用例 `crates/rurge-platform/src/sysinfo.rs`：`a_locale_name_stands_for_one_language_or_for_none`、`a_text_that_begins_like_an_unfilled_template_is_no_model`（另有各平台的纯函数与对假来源的读取），`crates/rurge/src/cli/mod.rs`：`a_system_that_says_nothing_leaves_what_the_variables_always_gave`，`crates/rurge/tests/cli.rs`：`check_reads_the_system_version_from_the_operating_system`、`check_does_not_give_this_systems_version_to_another_platform`。Windows 的注册表读取在本机运行过；macOS 与 Linux 的读取只对着假的命令、文件与环境变量测过，没有在这两个平台上编译、运行过，第一次 CI 运行时核对（手工清单各有一行；M5a 计划「延后事项」第 2、13 行）。下面"做了而没找到用例"里的 `LANGUAGE`、`DEVICE_NAME` 因此也有了用例 |
+| FR-CFG-17（P0） | 「rurge 专有运行时选项（数据目录、TUN 设备名、日志文件、监听覆盖等）只通过命令行参数与环境变量提供」 | 没有监听覆盖：阶段 1 设计列在 `rurge run` 上的 `--config-dir`、`--listen-http ADDR`、`--listen-socks5 ADDR` 一个都没有，环境变量也没有；数据目录和日志文件有各自的选项 | 监听地址只能改配置文件 | 第 102 行 | 补上了。`25d0a25`，修正 `c9c327c`、`44787e1`：`rurge run --listen-http` / `--listen-socks5`（环境变量 `RURGE_LISTEN_HTTP` / `RURGE_LISTEN_SOCKS5`）整项替换配置里同一种的监听；用例 `crates/rurge-config/src/general.rs`：`listen_values_from_outside_a_profile_are_read_as_a_profile_reads_them`，`crates/rurge/src/cli/run.rs`：`an_http_override_replaces_every_http_listener_and_leaves_socks5_alone`，`crates/rurge/tests/cli.rs`：`listen_http_replaces_the_profiles_http_listeners_for_good`、`a_listen_value_that_cannot_be_used_ends_the_start_without_quoting_it`、`a_listen_override_on_the_port_of_an_external_policy_ends_the_start`。需求原话里的 `--config-dir` 不在内（多 Profile 管理，阶段 6）；`rurge service install` 不把这两个选项带进安装的服务（M5a 计划「延后事项」第 11 行） |
+| FR-CFG-03（P0） | 「`rurge check` 输出文件、行号、原因与建议」 | 几乎没有建议：`crates/rurge-config/src/config.rs` 里 `E0010`（"add `FINAL,DIRECT` as the last rule"）是唯一设了建议的诊断，别的都不带 | `rurge check` 的输出里只有这一条诊断有建议 | 第 102 行 | 补上了。`a299190`，修正 `7fc57b0`、`b88f7d8`、`66f2513`、`29de23a`：`codes::hint`，59 个诊断码里 33 个有缺省建议、`E0014` 的四处各自带、25 个不设；用例 `crates/rurge-config/src/diagnostic.rs`：`every_code_is_decided_once`，`crates/rurge-config/src/rule.rs`：`each_place_a_rule_part_is_not_allowed_says_what_to_do`，`crates/rurge/tests/cli.rs`：`check_says_what_to_do_about_a_problem`、`a_profile_that_does_not_load_is_printed_with_its_hint`。"每条建议对发出这个码的每一处都成立"是读发出点得出的，没有用例能证明（M5a 计划「执行期修正记录」第 24 ～ 33 行） |
+| FR-HTTP-10（P0；"1 基础 / 4 完整"） | 「…监听端口、协议、命中规则、策略与链、远端地址、状态、上下行流量、各阶段耗时…」 | `crates/rurge-engine/src/observe.rs`：`RequestRecord` 没有远端（上游）地址；只记监听器的种类，不记监听端口；耗时只有 `connect_ms / first_byte_ms / elapsed_ms`，没有 DNS 阶段。"基础"是否包含它们，需求文档没有写；阶段 1 设计 8.4 列了 `remote_addr / timings { dns, … }` | `GET /v1/requests/recent` 里看不到远端地址、监听端口和 DNS 耗时 | 第 102 行 | 补上了基础部分。`630fcd9`，修正 `b0d27c8`、`8106adf`、`e964445`、`4f208d1`：请求记录多 `listenPort`、`remoteAddr`、`dnsMs`（经 `rurge_net::trail::Trail` 从连接器与解析器带回），没有值时 JSON 里是 `null`；用例 `crates/rurge-engine/tests/pipeline.rs`：`a_direct_session_records_its_listener_and_the_address_it_connected_to`、`a_name_pinned_in_host_counts_as_a_lookup`、`sessions_dialling_together_record_their_own_address_and_lookup_time`，`crates/rurge-engine/src/observe.rs`：`the_record_of_a_udp_session_has_no_remote_address`，`crates/rurge-api/tests/api.rs`：`requests_carry_the_listen_port_the_remote_address_and_the_lookup_time`。`remoteAddr` 只在会话自己开了 TCP 连接时有，复用已有连接或隧道的会话与所有 UDP 会话是 `null`（登记的限制，完整补全随阶段 4；M5a 计划「延后事项」第 3、20 ～ 22 行） |
+| FR-CFG-15（P1） | 「多 Profile 管理：配置目录、当前 Profile 记录、列出 / 切换 / 校验 / 查看当前内容（可脱敏）」 | 当前 Profile 记录只在类型里：`crates/rurge-engine/src/state.rs` 的 `State.current_profile` 声明了、初始化成 `None`，没有任何地方写它或读它；配置目录、列出与切换登记在阶段 6 | `state.json` 里没有当前配置的记录 | 第 102 行 | 补上了阶段 1 的部分。`f0fc354`：`rurge run` 启动完成时把 `-c` 的绝对路径写进 `State.current_profile`；用例 `crates/rurge/tests/cli.rs`：`a_running_daemon_records_its_profile_as_the_current_one`、`another_profile_becomes_the_recorded_one`、`a_start_that_fails_does_not_record_its_profile`、`a_start_with_the_recorded_profile_leaves_state_json_as_it_is`、`a_start_that_cannot_write_state_json_still_runs_and_serves`。读它的是阶段 6 的多 Profile 管理，现在没有端点显示它 |
+| FR-CFG-10（P2） | 「可选扩展简写 `#!WINDOWS-ONLY` `#!LINUX-ONLY`，Surge 会将其视为普通注释」 | 没有：`crates/rurge-config/src/requirement.rs` 的 `SIMPLIFIED` 只有三个 Apple 标签，这样的行按未知指令丢掉并报 `W0014` | 在 Windows 上 `#!WINDOWS-ONLY` 不起作用 | 第 102 行 | 补上了。`76fc3dc`：`SIMPLIFIED` 多 `WINDOWS-ONLY`、`LINUX-ONLY`，`is_requirement_prefix` 与脱敏共用同一份清单；用例 `crates/rurge-config/src/requirement.rs`：`windows_only_and_linux_only_are_simplified_requirements`、`each_tag_holds_a_line_to_its_own_system_only`，`crates/rurge-config/src/config.rs`：`a_system_tag_gates_a_line_as_loaded`，`crates/rurge-config/src/redact.rs`：`the_windows_and_linux_tags_are_requirement_directives_too`。Surge 把行首写法的整行当注释，只推荐行首写法（兼容性清单 1.4 节） |
 
 ### 阶段 2 里只解析的条款
 
@@ -483,6 +493,15 @@ Shadow TLS：
 ### 做了而没找到用例
 
 阶段 1 的 11 句：FR-CFG-02「rurge 不改写用户配置文件」没有用例断言读完之后文件一字节未变；FR-CFG-09 的 `LANGUAGE`、`DEVICE_NAME`（取自环境变量）；FR-CFG-16 的 SIGHUP 重载（只在 Unix，靠读代码核对）；FR-CFG-17「只通过命令行参数与环境变量提供」没有用例断言；FR-RULE-05 一个 1,000,000 条的集合占多少内存从没量过；FR-OBS-01 与 FR-OBS-10 没有用例抓会话日志那一行，也没有用例拿日志里的连接 id 同请求记录里的对照；第 7 节三行自己的证据——"三平台 CI"这一项交付物只有工作流，"三平台 CI 绿"没有绿过，"系统代理开关后浏览器流量经 rurge"只有假后端的用例与没有做的手工清单。审计判为"做了"、但也缺一块用例的还有 FR-IN-03 的 `proxy-restricted-to-lan`：判断来源的谓词有单测，监听器一级的拒绝没有端到端用例（回环造不出非本子网的来源）。
+
+阶段 1 补遗（M5a）之后：
+
+- FR-CFG-02：`crates/rurge/tests/cli.rs`：`run_leaves_the_profile_and_the_files_it_includes_as_they_are`——带一个本地 `#!include` 与一个 `select` 组的 Profile，启动、经 API 重载、切一次组、停止之后，两个文件的字节与修改时间都和启动前一样（`518085b`、`72b0668`）。
+- FR-CFG-16：`crates/rurge/tests/cli.rs`：`sighup_reloads_the_profile`（`#[cfg(unix)]`，`518085b`）。写好了，没有编译过、没有运行过——本机是 Windows，它用到的 `nix` 0.31.3 的每个签名对着锁定版本的源码核过——，第一次 CI 运行时核对（M5a 计划「延后事项」第 1、23 行）。
+- FR-OBS-01 / FR-OBS-10：`crates/rurge-engine/tests/pipeline.rs`：`a_rule_set_hit_is_logged_and_noted_on_the_request`、`the_log_line_of_a_completed_session_carries_what_its_record_does`、`the_log_line_of_a_rejected_session_carries_what_its_record_does`、`the_log_line_of_a_failed_session_carries_what_its_record_does`——会话日志那一行的 `session=` 等于请求记录的 `id`，并带 `rule=`、`policy=`（`742e8dc`、`875df43`；日志用 `crates/rurge-engine/tests/common/log_capture.rs` 的 `LogCapture` 抓）。注意日志行与记录不总是同一句：日志行的 `error=` 是失败的原因本身，请求记录的 `error` 在会话带备注时是 `<备注>; <原因>`；记录的 `rule` 是 `null` 时，日志行的 `rule=` 为空。
+- FR-CFG-09 的 `LANGUAGE`、`DEVICE_NAME`：随上表那一行有了用例。
+- FR-RULE-05：量了，不是断言。`crates/rurge-rules/tests/memory.rs` 的三条 `#[ignore]` 用例（`a_domain_set_of_a_million_entries`、`a_rule_set_of_a_million_entries`、`nothing_is_built_is_the_baseline`，`50b1f46`），普通的 `cargo test --workspace` 只编译不运行（所以全量运行的忽略数从 3 变成 6）。在这台开发机（Windows 11，x86-64）上，发布构建，每个用例单独一个进程，从进程外轮询读它的峰值工作集，四轮：什么也不建 14.2 ～ 15.6 MB；一个 100 万条的 `DOMAIN-SET` 峰值 416.7 ～ 416.9 MB（比基线多约 403 MB），建好之后约 137.5 MiB；一个 100 万条的 `RULE-SET`（五分之三 `DOMAIN-SUFFIX`、五分之一 `DOMAIN`、五分之一不带 `no-resolve` 的 `IP-CIDR`）峰值 470.1 ～ 470.4 MB（多约 456 MB），建好之后约 156.4 MiB。相减得编译后的集合本身约 101 / 111 MiB（每条约 106 / 116 字节），是 M2 设计估的"约 60 MB"（那只说排序数组）的 1.8 / 1.9 倍，两者在这次测量里分不开。峰值是载入那一刻的瞬时量（文本、解析出的行、条目与索引构建器同时在），约为建好之后的三倍；刷新时旧的集合要到新的编译完才放手，所以刷新的瞬时量比第一次载入再高约一个稳定水位——这一句是读代码的推断，没有量。只量了 Windows，工作集不等于分配量；测量的方法写在 `memory.rs` 的开头（Linux 上读 `VmHWM`）。FR-RULE-05 没有数字（"大集合内存可控"），NFR-01 写的是"1 万并发连接常驻内存 < 300 MB"：一个满额的集合建好之后比基线多 130 ～ 150 MB，两个约 280 MB，载入一个时的瞬时量单独就超过 300 MB。"可控"算不算、NFR-01 要不要在载了满额集合的前提下成立，是项目所有者的问题（M5a 计划「延后事项」第 24 行）。
+- 仍没有用例的：FR-CFG-17「只通过命令行参数与环境变量提供」（新加的两个选项有用例，没有用例断言 Profile 格式里没有这样的键）；FR-IN-03 的 `proxy-restricted-to-lan` 在监听器一级的拒绝；第 7 节三行自己的证据；阶段 2 的 WireGuard 计时器——都和上面一样。
 
 阶段 2 的 3 句：FR-OUT-12 的 WireGuard 重新握手、keepalive 与过期计时器——设备任务每 250 毫秒推进 boringtun 的计时器，peer 的 `keepalive` 交给它，没有用例让 90 或 120 秒过去，假对端建时没有 keepalive。
 
@@ -517,9 +536,11 @@ Shadow TLS：
 
 ### 怎么处理
 
-没做到的每一句都登记了：兼容性清单里说得比代码多的几行改成了实情（开头一句与 1.3、1.4、3.2、3.3、3.5、5.2 节），需求文档第 7 节给阶段 1 加了一条状态行，计划「延后事项」第 100 ～ 105 行逐项记下。一句也没有在 M8c 里实现：它们是有自己设计问题的功能，不是阶段 2 收尾的遗留。计划是：M8c 合并之后、阶段 3 开始之前，作为一项自己的工作补做——先写它自己的设计与计划，范围在设计里定——，它接下托管配置和上面阶段 1 的各项；这是写下的计划，代码里还没有它的任何部分。
+没做到的每一句都登记了：兼容性清单里说得比代码多的几行改成了实情（开头一句与 1.3、1.4、3.2、3.3、3.5、5.2 节），需求文档第 7 节给阶段 1 加了一条状态行，计划「延后事项」第 100 ～ 105 行逐项记下。2026-10-11 之后的状况见本节末尾的一段。一句也没有在 M8c 里实现：它们是有自己设计问题的功能，不是阶段 2 收尾的遗留。计划是：M8c 合并之后、阶段 3 开始之前，作为一项自己的工作补做——先写它自己的设计与计划，范围在设计里定——，它接下托管配置和上面阶段 1 的各项；这是写下的计划，代码里还没有它的任何部分。
 
 教训出在流程上：这些条款都是某份设计交给同一阶段"以后的里程碑"的，没有一份计划的「延后事项」接住它们，所以收集那些表的 M8c 总表也不会有它们。一个阶段要在它的需求逐句对照过代码之后才称齐备，不是在它的里程碑都合并之后。
+
+2026-10-11，阶段 1 补遗（M5a）（分支 `phase1-m5a-small-items`）把上面表里的 10 行补上了（最后一列），给有实现而没有用例的几条补了用例（上一节），并对 FR-RULE-05 另补两处：带 `no-resolve` 的 IP 行进前缀树（`00d97d3`、`39817cf`、`e4f0991`），规则集文件的行尾注释与集合里的 `IP-ASN` 行按号码查（`5b03f3d`、`92aa656`、`96b4cf7`、`3d964a9`、`ee5b458`，之后的三个修正 `ffb6477`、`3034ccb`、`09f1a7a`）。没有做的是 M5b 的三行：托管配置的更新、远程 `#!include`、外部资源的手动强制更新——设计与 M5a 写在同一份文档里（第 7 节），计划还没有写，代码里没有它们的任何部分。M5a 的每一处行为变化都登记在兼容性清单（开头一句列出这次动过的行）与 `docs/api/phase1.md`；与计划的出入记在 M5a 计划的「执行期修正记录」（66 行），留下的事记在它的「延后事项」（第 5 ～ 34 行）。
 
 ## 留给项目所有者的
 
@@ -535,14 +556,17 @@ Shadow TLS：
 
 跟在它后面、同样没做的：`hidden`（第 104 行，移交阶段 6）；需求文档的阶段列同兼容性清单与设计的七处矛盾（第 105 行，由所有者定）；四个只解析的参数 `tfo`、`wireguard` 上的 `ecn`、`snell` 的 `udp-port`、`external` 的 `addresses`（已登记在兼容性清单，加载时 `W0029`；遗留事项总表各有一行：M1a #1、M4b #2 与 M5c #5、M6b #3、M4c #5，M8c 的计划「延后事项」里没有）。
 
+2026-10-11 的更新：阶段 1 补遗的第一部分（M5a）已经做完，上面「需求逐条对照代码」一节表里除这三行以外的 10 行都补上了；剩下的三行——托管配置的更新、远程 `#!include`、外部资源的手动强制更新——是阶段 1 补遗（M5b）：设计已写（`docs/superpowers/specs/2026-10-11-phase1-m5-addendum-design.md` 第 7 节，已决事项 M5-D1 ～ D12 是实施者在常设授权下定的，可以改），计划还没有写，代码里没有它们的任何部分。上面"其余阶段 1 缺口一并接下"的那一部分因此已经做完。
+
 ### 2. 验收证据还缺的
 
 1. **CI 从没绿过。** 最近一次运行在本地 `origin/main` 的 `0154e73` 上，`cargo test` 在三个平台都失败，之后的提交（到 `44a0204` 是 76 个）没有一个被 CI 见过。要产生证据：项目所有者推送；读三平台的失败清单（失败摘要把它发成注解与任务摘要，不登录也读得到）；修掉——这是 M8a 的任务 6，等推送之后做；再有一次三平台全绿的运行（计划「延后事项」第 49 行）。
 2. **没有一个互操作用例对真实的二进制跑过。** 63 个用例在本机跳过（61 个在本机编译）；好几个参照服务端的命令行、配置与就绪日志是读源码写的，夹具改取端口的改动也没有对真实的服务端跑过。要产生证据：同一次三平台全绿的 CI 运行，其中 `RURGE_INTEROP_REQUIRED=1` 保证这些用例跑了而不是跳过；某个用例红了，先分清是夹具与参照服务端不符，还是 rurge 的问题。
 3. **AnyTLS 的 SYNACK 看门狗没有对真实服务端验证过，第一次 CI 运行也验证不了**：互操作用例在几毫秒内放掉每条流，UDP 用例用新会话的第一条流，看门狗不看它；假服务端应答的次序是照参考实现的源码写的。要产生证据：一个在复用的会话上活过 3 秒的流的互操作用例（计划「延后事项」第 87 行）；手工清单 M8c 一节有对应的两项。
 4. **mihomo 的用例**（Snell v1 ～ v3、`ss` 的流式方法、两种协议前面的 simple-obfs）可以在本机对项目所有者自己的 mihomo 跑，设 `RURGE_TEST_MIHOMO` 即可——是否这样做由所有者定。
-5. **两份手工清单一项也没做**：`docs/acceptance/phase2-manual.md` 21 节 185 项，`docs/acceptance/phase1-manual.md` 32 行。其中有几项的写法是读文档或源码得出的，没有人照着走过一遍（经 tailscaled 的 SOCKS5 接入、MASQUE 经 `underlying-proxy` 的数字）。
+5. **两份手工清单一项也没做**：`docs/acceptance/phase2-manual.md` 21 节 185 项，`docs/acceptance/phase1-manual.md` 34 行。其中有几项的写法是读文档或源码得出的，没有人照着走过一遍（经 tailscaled 的 SOCKS5 接入、MASQUE 经 `underlying-proxy` 的数字）。
 6. **这台开发机与 CI 不同**：本机开着 Windows 的 Simple TCP/IP Services（回环 TCP 与 UDP 的 7、9、13、17、19 号端口），CI 上关着。写到 9 号端口的 66 行换成关着的端口后，整套用例只有一条变红，已改（`crates/rurge-engine/tests/smart.rs`：`udp_silence_counts_only_where_answers_always_come`），现在没有用例依赖它们。"立刻拒绝"（Linux、macOS）在本机只能用"接了立刻关"顶替，真的要等 CI。
+7. **阶段 1 补遗（M5a）里本机验不了的三处**：`sighup_reloads_the_profile` 与 `run_shuts_down_gracefully_on_sigint` 新加的一行等待只在 Unix 上编译，本机（Windows）没有编译过、运行过；`rurge_platform::sysinfo` 对 macOS 与 Linux 的读取只对着假的命令、文件与环境变量测过，macOS 的三种格式（`SystemVersion.plist`、`defaults read -g AppleLanguages`、`scutil --get`）取自公开描述。要产生证据：同一次三平台全绿的 CI 运行；`docs/acceptance/phase1-manual.md` 的 macOS 与 Linux 各有一行，由项目所有者在真实的机器上做（M5a 计划「延后事项」第 1、2、13、23 行）。
 
 ### 3. 要定的事
 
@@ -559,8 +583,21 @@ Shadow TLS：
 - clap 在自己的报错里引用解析不了的 `--geoip-url` / `--geoip-asn-url` 取值，取值里可以带 MaxMind 的授权密钥：第 57 行。
 - `update-interval=0` 有两种读法——规则集与域名集上读作没写，策略组上是加载错误 `E0018`——，要不要一致、一致到哪一边：第 99 行。
 - 阶段 1 补遗与需求文档的阶段列：第 100 ～ 103 行与第 105 行（本节第 1 项）。
+- 阶段 1 补遗（M5a）留下的（每条的来龙去脉在 M5a 计划的对应行里）：
+  - 设了而为空的环境变量（`RURGE_LISTEN_HTTP=`）现在是错误（退出 2，`no address given`），与 `--listen-http ''` 相同——决定代理在哪里监听的设置，拒绝启动比悄悄照 Profile 监听稳妥；另一种读法是当作没设：执行期修正记录第 10 行。
+  - `external` 策略的 `local-port` 的检查看不到 rurge 的缺省监听——一份不写任何监听键的 Profile 监听 `127.0.0.1:6152` 与 `:6153`，写 `local-port=6153` 的 `external` 策略能加载、没有诊断，启动后经这条策略的每个连接都是 rurge 连自己——，改法的草图在那一行；要不要在阶段 3 之前做：延后事项第 10 行。
+  - `rurge service install` 不把 `--listen-http` / `--listen-socks5` 带进安装的服务：延后事项第 11 行。
+  - Windows 的 `DEVICE_NAME` 取 DNS 主机名而不是大写的 NetBIOS 名（`COMPUTERNAME`），Profile 里按大写名字比较的会落空：执行期修正记录第 18 行。
+  - Surge 对"同一资源既当 `RULE-SET` 又当 `DOMAIN-SET`"怎么办不知道，rurge 的做法（直接写出的是 `E0024`，嵌套的是 `W0032`）是自己定的，手边有 Surge 时核对：延后事项第 9 行。
+  - `--listen-socks5` 写错取值时的原因 `address must be an IP literal like 0.0.0.0:6152` 与 `E0013` 共用一句，示例端口是 HTTP 的缺省端口：延后事项第 34 行。
+  - 满额集合的内存（数字见「做了而没找到用例」一节）："可控"的判据、NFR-01 的前提，以及要不要像 Surge 那样把大集合的索引放到磁盘上（手册 `rules/ruleset.html`："sets with more than 1000 domain entries use an on-disk database instead of an in-memory tree"）：延后事项第 24 行。
+  - 规则集文件行尾的注释照 Profile 的规则读：手册没有写 Surge 这样读集合文件，是从两份常用列表推断的，手边有 Surge 时拿一行 `IP-ASN,4134 // 说明` 的列表核对一次：执行期修正记录第 57 行。
+  - 一个集合里几行同时命中同一条会话时报成子规则的是哪一行，以及两句提示出现的时机（逐条求值的行现在全部先走完），是 rurge 自己定的，Surge 报不报、报哪一行不知道：执行期修正记录第 53、60 行。
+  - 域名集里读不了的行不再被告警引用，只给行号：照"凭据不进日志与错误文本"当场改的（`09f1a7a`），所有者若宁可看到那一行的文字，是一行的改动；规则集里类型认得而取值不对的行（`IP-CIDR,<不是网段的文字>`）仍引用那个取值，与同一条规则写在 Profile 里相同（M8c 的裁定），要不要连它也不引用由所有者定：执行期修正记录第 66 行。
+  - 集合文件的行上的未知参数没有人报告（`no-resolve` 拼成 `no-resolv` 就丢了它而不出声），启动之后才载入的集合跳过了行也不出声：延后事项第 31、32 行，留给阶段 1 补遗（M5b）写计划时定做不做、怎么报。
+  - 审计判为"做了"的条款没有人复核过，这一次查出一条（FR-RULE-05）只做了一部分；阶段 1 称齐备之前要再对一遍需求，每条"做了"指到一条会因它而红的用例：延后事项第 28 行。
 - 推送是所有者的；两个提交说明的排版有误（`21ecb85`、`d309f33`），推送前是否 reword：第 26 行；约三十份较早的计划引用了一个含 Windows 用户名的本机 `rustfmt` 路径，要不要改写历史计划里的路径：第 95 行。
-- 知悉，不需要决定的两件事。一、2026-10-09 上午（07:30 ～ 11:00），这次执行用的账号的每周模型用量上限用尽过一次，派出去的子代理都停住，上限复位后接着做；此后每个角色（实现、评审、审计）都用能胜任的最弱的模型，较弱的模型没有一次做对的部分要多一轮修正（第 96 行，「执行期修正记录」第 7 行）。二、任务 10 的实现者（一个子代理）为了查明一个测试为什么失败，用 `rustc` 编过一个只依赖标准库的 5 行小程序并运行过一次（向本机回环地址发一个 UDP 包），它自己在报告里说了这件事；这违反"不运行不是由本仓库构建的二进制"这条约束的字面，源码全是它自己写的，没有东西离开本机；此后给子代理的约束写明，探测要写成仓库里的测试、用 `cargo test` 跑（第 97 行，「执行期修正记录」第 46 行）。
+- 知悉，不需要决定的三件事。一、2026-10-09 上午（07:30 ～ 11:00），这次执行用的账号的每周模型用量上限用尽过一次，派出去的子代理都停住，上限复位后接着做；此后每个角色（实现、评审、审计）都用能胜任的最弱的模型，较弱的模型没有一次做对的部分要多一轮修正（第 96 行，「执行期修正记录」第 7 行）。二、任务 10 的实现者（一个子代理）为了查明一个测试为什么失败，用 `rustc` 编过一个只依赖标准库的 5 行小程序并运行过一次（向本机回环地址发一个 UDP 包），它自己在报告里说了这件事；这违反"不运行不是由本仓库构建的二进制"这条约束的字面，源码全是它自己写的，没有东西离开本机；此后给子代理的约束写明，探测要写成仓库里的测试、用 `cargo test` 跑（第 97 行，「执行期修正记录」第 46 行）。三、阶段 1 补遗（M5a）执行中，磁盘被聚焦构建写满过一次（`target/` 涨到 141 GiB，只剩 5.3 GiB 可用）：cargo 按所选的包统一依赖特性，每换一种 `-p` 的选择就另编一份依赖树；此后聚焦运行一律用 `--workspace --lib` / `--bin rurge` / `--test <名字>` 的形式，不用 `-p`，与全量门禁共用同一份构建（M5a 计划「执行期修正记录」第 8 行）。
 
 ### 4. 脱敏后的视图
 
