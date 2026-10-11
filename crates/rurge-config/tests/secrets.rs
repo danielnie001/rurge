@@ -5,7 +5,12 @@
 
 use rurge_config::config::{LoadOptions, Loaded, from_text};
 use rurge_config::redact::redact_profile;
-use std::path::Path;
+use rurge_config::{Remote, RemoteSource};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
+use url::Url;
 
 const MARKER: &str = "S3CR3T";
 const UUID: &str = "5ec4e75e-c4e7-45ec-8e75-ec4e75ec4e75";
@@ -364,7 +369,7 @@ FINAL,DIRECT
         "unknown MANAGED-CONFIG parameter `token`",
         "unknown MANAGED-CONFIG parameter (not written as a lower-case `name=value`)",
         "unknown directive ignored: #!MANAGED_CONFIG",
-        "remote include not supported yet",
+        "remote include not read: no data directory",
         "invalid value for `version` (expected an integer from 1 to 6)",
         "invalid value for `tfo` (expected true or false)",
         "`underlying-proxy` references unknown policy",
@@ -930,4 +935,113 @@ FINAL,DIRECT
         .map(|d| d.message.as_str())
         .collect();
     assert_eq!(said, ["rule references an unknown policy"]);
+}
+
+/// What the links of the profile below were downloaded as: texts that hold
+/// credentials of their own.
+struct Downloaded(HashMap<String, Remote>);
+
+impl RemoteSource for Downloaded {
+    fn get(&self, url: &Url) -> Remote {
+        self.0
+            .get(url.as_str())
+            .cloned()
+            .unwrap_or(Remote::Missing {
+                why: Some("no answer".to_string()),
+            })
+    }
+}
+
+fn downloaded(text: String, n: u32) -> Remote {
+    Remote::Text {
+        text,
+        path: PathBuf::from(format!("/cache/{n}.conf")),
+        fetched_at: SystemTime::UNIX_EPOCH,
+    }
+}
+
+/// The link of a remote include is a credential as a whole: its user name,
+/// password, path and query. Nothing of it, and nothing of the text that was
+/// downloaded from it, comes out of a load: not in the `Debug` of what loaded
+/// or of the options, not in a diagnostic, not in the redacted profile.
+#[test]
+fn a_remote_include_shows_nothing_of_its_link_or_its_text() {
+    let rules = format!(
+        "https://al1ce:{MARKER}-user@sub.example/rules/{MARKER}-path.conf?token={MARKER}-query"
+    );
+    let proxies =
+        format!("https://sub.example/proxies/{MARKER}-proxies?token={MARKER}-proxiesquery");
+    let gone = format!("https://sub.example/gone/{MARKER}-gone?token={MARKER}-gonequery");
+    let page = format!("https://sub.example/page/{MARKER}-page");
+    let profile = format!(
+        "[Proxy]\n#!include {proxies}\n[Rule]\n#!include {rules}\n#!include {gone}\n#!include {page}\nFINAL,DIRECT\n"
+    );
+    let key = |link: &str| Url::parse(link).unwrap().to_string();
+    let answers = Downloaded(HashMap::from([
+        (
+            key(&proxies),
+            downloaded(
+                format!(
+                    "[Proxy]\nT = trojan, t.example, 443, password={MARKER}-remotepw\nE = external, exec=/bin/true, local-port=1090, args={MARKER}-remoteargs\n#!include {MARKER}-local.dconf\n"
+                ),
+                1,
+            ),
+        ),
+        (
+            key(&rules),
+            downloaded(
+                format!(
+                    "#!MANAGED-CONFIG https://other.example/{MARKER}-managed interval=7200 strict=true\n[Rule]\nRULE-SET,https://al1ce:{MARKER}-remoteset@rules.example/r.list,DIRECT\nDOMAIN,a.example,T\n"
+                ),
+                2,
+            ),
+        ),
+        (
+            key(&gone),
+            Remote::Missing {
+                why: Some("connection refused".to_string()),
+            },
+        ),
+        (
+            key(&page),
+            downloaded(format!("<html>{MARKER}-html</html>\n"), 3),
+        ),
+    ]));
+    let mut opts = LoadOptions::for_tests();
+    opts.remote = Some(Arc::new(answers));
+    let loaded = from_text(&profile, Path::new("t.conf"), &opts);
+
+    // the links were read, or the checks below would find nothing to find
+    let remote = &loaded.config.source.remote;
+    assert_eq!(remote.len(), 4);
+    let found: Vec<bool> = remote.iter().map(|r| r.found()).collect();
+    assert_eq!(found, [true, true, false, true]);
+    assert!(remote[3].lacks_section);
+    assert_eq!(remote[1].interval.as_secs(), 7200);
+    assert!(loaded.config.policies.iter().any(|p| p.name == "T"));
+    assert!(loaded.config.spec("T").is_some());
+    assert!(loaded.config.spec("E").is_none());
+    let codes: Vec<&str> = loaded.diagnostics.iter().map(|d| d.code).collect();
+    for code in ["W0015", "W0017", "W0022", "W0033"] {
+        assert!(codes.contains(&code), "{code}: {codes:?}");
+    }
+
+    let mut found = leaks(&format!("{loaded:#?}"));
+    for d in loaded.diagnostics.iter() {
+        found.extend(leaks(&d.to_string()));
+        found.extend(leaks(&format!("{d:?}")));
+    }
+    for r in remote {
+        found.extend(leaks(&format!("{r:?}")));
+    }
+    found.extend(leaks(&format!("{opts:?}")));
+    found.extend(leaks(&redact_profile(&profile)));
+    assert_eq!(found, Vec::<String>::new());
+
+    // what is shown of a link is where it goes
+    let shown = format!("{:?}", remote[0]);
+    assert!(shown.contains("https://sub.example/\u{2026}"), "{shown}");
+    // and of the options only that there is a source
+    assert!(format!("{opts:?}").contains("remote: Some("));
+    assert!(format!("{:?}", LoadOptions::for_tests()).contains("remote: None"));
 }

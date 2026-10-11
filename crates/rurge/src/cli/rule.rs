@@ -200,6 +200,7 @@ fn run_match(args: MatchArgs) -> anyhow::Result<ExitCode> {
         environment: super::environment(platform, capabilities::CORE_VERSION),
         platform,
         capabilities: capabilities::current(),
+        remote: None,
     };
     let loaded = load(&args.config, &opts)?;
     if loaded.diagnostics.has_errors() {

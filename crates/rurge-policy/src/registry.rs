@@ -43,8 +43,8 @@ pub enum TerminalKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Note {
     /// The resolution ends at what rurge does not implement (the terminal
-    /// policy's protocol, a variant of it, or `DEVICE`): the outbound is
-    /// REJECT.
+    /// policy's protocol, a variant of it, an `external` policy that
+    /// downloaded text defines, or `DEVICE`): the outbound is REJECT.
     Unsupported(String),
     /// A group on a cycle of groups, written out (`A → B → A`): REJECT.
     GroupCycle(String),
@@ -1381,8 +1381,11 @@ mod tests {
     use crate::testing::FakeFactory;
     use rurge_config::HostName;
     use rurge_config::config::{LoadOptions, from_text};
+    use rurge_config::{Remote, RemoteSource};
     use rurge_net::connector::{ConnectOpts, Target};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
+    use url::Url;
 
     const PROFILE: &str = "[General]\nloglevel = notify\n[Proxy]\n\
 HK = tailscale, section-name=ts\n\
@@ -1588,6 +1591,62 @@ Snell6 = snell, 1.2.3.4, 443, psk=x, version=6\n[Rule]\nFINAL,DIRECT\n";
         assert_eq!(
             snell.note.clone().unwrap().to_string(),
             "policy protocol not implemented: snell v6"
+        );
+    }
+
+    /// An `external` policy that a downloaded text defines is never started:
+    /// it rejects, and the session log says it is the downloaded text and not
+    /// a missing protocol.
+    #[test]
+    fn an_external_policy_from_downloaded_text_rejects_and_says_why() {
+        struct Downloaded;
+        impl RemoteSource for Downloaded {
+            fn get(&self, _: &Url) -> Remote {
+                Remote::Text {
+                    text: "[Proxy]\nExt = external, exec=/bin/true, local-port=1080\n".to_string(),
+                    path: PathBuf::from("/cache/1.conf"),
+                    fetched_at: SystemTime::UNIX_EPOCH,
+                }
+            }
+        }
+        let mut opts = LoadOptions::for_tests();
+        opts.remote = Some(Arc::new(Downloaded));
+        let loaded = from_text(
+            "[Proxy]\n#!include https://example.com/p.conf\nHere = socks5, here.example, 1080\n[Rule]\nFINAL,DIRECT\n",
+            Path::new("t.conf"),
+            &opts,
+        );
+        assert!(
+            !loaded.diagnostics.has_errors(),
+            "{:?}",
+            loaded
+                .diagnostics
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+        );
+        let registry = PolicyRegistry::build(
+            &loaded.config,
+            &assemble(&loaded.config, &Snapshots::new()),
+            &FakeFactory::new(),
+            &RegistryCell::new(),
+            Arc::new(SelectionTable::new(GroupSelections::new())),
+            None,
+            EmptyGroup::Direct,
+            &crate::testing::auto_groups(),
+        )
+        .expect("builds");
+        let ext = registry.resolve(&PolicyRef::parse("Ext"));
+        assert_eq!(ext.terminal, TerminalKind::Reject);
+        assert_eq!(chain(&ext), ["Ext", "!unsupported:external", "REJECT"]);
+        assert_eq!(
+            ext.note.clone().unwrap().to_string(),
+            "policy protocol not implemented: external (downloaded text)"
+        );
+        let here = registry.resolve(&PolicyRef::parse("Here"));
+        assert_eq!(
+            (here.terminal, here.note.clone()),
+            (TerminalKind::Proxy, None)
         );
     }
 

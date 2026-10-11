@@ -798,6 +798,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         environment: super::environment(platform, capabilities::CORE_VERSION),
         platform,
         capabilities: capabilities::current(),
+        remote: None,
     };
     // A profile that does not load ends the start here, in one of two ways;
     // in both, what a crashed run left behind is put back on the way out.

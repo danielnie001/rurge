@@ -17,6 +17,7 @@ pub mod keystore;
 pub mod managed;
 pub mod policy;
 pub mod redact;
+pub mod remote;
 pub mod requirement;
 pub mod rule;
 pub mod session;
@@ -43,6 +44,7 @@ pub use hostlist::{HostList, HostListEntry, HostPattern, PortSpec};
 pub use keystore::{KeystoreItem, KeystoreType};
 pub use managed::ManagedConfig;
 pub use policy::{Builtin, GroupKind, NetType, PolicyGroup, PolicyKind, ProxyPolicy, SubnetExpr};
+pub use remote::{Remote, RemoteRef, RemoteRole, RemoteSource};
 pub use requirement::Environment;
 pub use rule::{
     HostnameType, InternalSet, ParseCtx, Pattern, PolicyRef, PortExpr, ProcessPattern,

@@ -12,6 +12,8 @@ pub enum Origin {
     Main,
     Include(Arc<Path>),
     Module(String),
+    /// A line of a text that was downloaded: the file that holds it.
+    Remote(Arc<Path>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

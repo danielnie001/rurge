@@ -53,6 +53,7 @@ pub fn run(args: CheckArgs) -> anyhow::Result<ExitCode> {
         ),
         platform,
         capabilities: capabilities::current(),
+        remote: None,
     };
     let data_dir = args
         .data_dir

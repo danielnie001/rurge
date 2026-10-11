@@ -121,6 +121,7 @@ fn load_profile(common: &CommonArgs) -> anyhow::Result<Option<(Config, Diagnosti
         environment: super::environment(platform, capabilities::CORE_VERSION),
         platform,
         capabilities: capabilities::current(),
+        remote: None,
     };
     let loaded = load(&common.config, &opts)?;
     if loaded.diagnostics.has_errors() {

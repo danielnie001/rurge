@@ -210,7 +210,7 @@ pub mod codes {
     pub const W_GROUP_NOT_IMPLEMENTED: &str = "W0008";
     pub const W_IOS_BUILTIN_AS_DIRECT: &str = "W0009";
     pub const W_DEVICE_POLICY_AS_REJECT: &str = "W0010";
-    pub const W_REMOTE_INCLUDE_UNSUPPORTED: &str = "W0011";
+    pub const W_REMOTE_INCLUDE_NOT_READ: &str = "W0011";
     pub const W_INVALID_VALUE: &str = "W0012";
     pub const W_RULE_NEVER_MATCHES: &str = "W0013";
     pub const W_UNKNOWN_DIRECTIVE: &str = "W0014";
@@ -250,6 +250,10 @@ pub mod codes {
     /// A set reference inside a set file that names a resource already used
     /// as the other kind of set; it matches nothing.
     pub const W_SET_KIND_CONFLICT: &str = "W0032";
+    /// A downloaded text asks for something that would make this machine do a
+    /// thing the user did not write: it includes a local file, or defines an
+    /// `external` policy. The line is ignored or the policy is not started.
+    pub const W_REMOTE_LOCAL_ACCESS: &str = "W0033";
     pub const I_LEGACY_MIGRATED: &str = "I0001";
     pub const I_LINE_DISABLED: &str = "I0002";
     /// GeoIP / ASN database file not present yet.
@@ -262,8 +266,8 @@ pub mod codes {
     ///
     /// Where the places that emit a code want different fixes, the sentence
     /// says what they share or the code has none. `E0014` has none because
-    /// each of its four places carries a hint of its own. The other codes
-    /// without one:
+    /// each of its four places carries a hint of its own, and `W0033` because
+    /// each of its two does. The other codes without one:
     ///
     /// - `E0009`: no place emits it any more.
     /// - `E0017`: the message is the shape to write, a different one at each
@@ -277,7 +281,8 @@ pub mod codes {
     ///   nothing to change in it.
     /// - `W0007`, `W0008`: each text of the message says where the policy or
     ///   the group goes instead.
-    /// - `W0011`: remote `#!include` lines are not read in this version.
+    /// - `W0011`: only a caller that gave the loader no place to get
+    ///   downloaded text from sees it, and the message says so.
     /// - `W0013`: the rule type cannot be matched on this platform in this
     ///   version; nothing in the rule is wrong.
     /// - `W0012`, `W0018`, `W0022`, `W0023`, `W0024`, `W0026`, `W0028`,
@@ -403,7 +408,7 @@ mod tests {
     ];
 
     /// The codes whose every site carries a hint of its own.
-    const PER_SITE: &[&str] = &[codes::E_NOT_ALLOWED_HERE];
+    const PER_SITE: &[&str] = &[codes::E_NOT_ALLOWED_HERE, codes::W_REMOTE_LOCAL_ACCESS];
 
     /// The codes without a hint; `codes::hint` says why beside its table.
     const WITHOUT: &[&str] = &[
@@ -416,7 +421,7 @@ mod tests {
         codes::W_GROUP_NOT_IMPLEMENTED,
         codes::W_IOS_BUILTIN_AS_DIRECT,
         codes::W_DEVICE_POLICY_AS_REJECT,
-        codes::W_REMOTE_INCLUDE_UNSUPPORTED,
+        codes::W_REMOTE_INCLUDE_NOT_READ,
         codes::W_INVALID_VALUE,
         codes::W_RULE_NEVER_MATCHES,
         codes::W_DEFERRED_SECTION,

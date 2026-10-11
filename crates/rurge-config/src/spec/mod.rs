@@ -178,7 +178,7 @@ pub struct SpecOutcome {
     pub ios_only: Vec<&'static str>,
     /// A valid line that asks for something rurge does not implement, so it
     /// has no spec. The caller reports each distinct one once per load
-    /// (`W0007`).
+    /// (`W0007`, or `W0033`).
     pub not_implemented: Option<NotImplemented>,
     /// What the line's spec makes rurge say. The caller reports each
     /// distinct one once per load, under the remark's own code.
@@ -194,10 +194,13 @@ pub enum NotImplemented {
     SsCipher(&'static str),
     /// A `snell` version rurge does not speak: 6 (phase 2 M8 design 4.4).
     SnellVersion(u8),
+    /// An `external` policy written in downloaded text: it would start a
+    /// program on this machine that nobody here wrote, so it is not started.
+    DownloadedExternal,
 }
 
 impl NotImplemented {
-    /// The load warning (`W0007`).
+    /// The text of the load warning.
     pub fn warning(&self) -> String {
         match self {
             NotImplemented::SsCipher(method) => format!(
@@ -207,6 +210,21 @@ impl NotImplemented {
             NotImplemented::SnellVersion(n) => format!(
                 "`snell` version {n} is not supported: it is a beta protocol without a public specification; such policies behave as REJECT"
             ),
+            NotImplemented::DownloadedExternal => "`external` policies written in downloaded text are not started; they behave as REJECT".to_string(),
+        }
+    }
+
+    /// The load warning: `W0007`, or `W0033` for what a downloaded text asks
+    /// of this machine.
+    pub fn diagnostic(&self) -> Diagnostic {
+        match self {
+            NotImplemented::DownloadedExternal => {
+                Diagnostic::warning(codes::W_REMOTE_LOCAL_ACCESS, self.warning())
+                    .with_hint("define the policy in the local profile to use it")
+            }
+            NotImplemented::SsCipher(_) | NotImplemented::SnellVersion(_) => {
+                Diagnostic::warning(codes::W_PROTOCOL_NOT_IMPLEMENTED, self.warning())
+            }
         }
     }
 
@@ -215,6 +233,7 @@ impl NotImplemented {
         match self {
             NotImplemented::SsCipher(method) => format!("ss ({method})"),
             NotImplemented::SnellVersion(n) => format!("snell v{n}"),
+            NotImplemented::DownloadedExternal => "external (downloaded text)".to_string(),
         }
     }
 
@@ -223,6 +242,7 @@ impl NotImplemented {
         match self {
             NotImplemented::SsCipher(method) => format!("`ss` with the cipher `{method}`"),
             NotImplemented::SnellVersion(n) => format!("`snell` version {n}"),
+            NotImplemented::DownloadedExternal => "`external` in downloaded text".to_string(),
         }
     }
 }
@@ -1414,6 +1434,39 @@ mod tests {
         assert!(o.inert.is_empty(), "{:?}", o.inert);
         let o = outcome("N", "snell, h.test, 443, psk=pw, version=5, udp-port=0");
         assert_eq!(o.diagnostics[0].code, codes::E_INVALID_POLICY_PARAM);
+    }
+
+    /// An `external` policy in downloaded text is not one rurge lacks the
+    /// protocol for but one it will not start: the warning is the one about
+    /// downloaded text, with a suggestion of its own, and the others stay
+    /// `W0007` without one.
+    #[test]
+    fn a_downloaded_external_is_not_started_and_says_so_apart_from_a_missing_protocol() {
+        let why = NotImplemented::DownloadedExternal;
+        assert_eq!(
+            why.warning(),
+            "`external` policies written in downloaded text are not started; they behave as REJECT"
+        );
+        assert_eq!(why.note(), "external (downloaded text)");
+        assert_eq!(why.imported(), "`external` in downloaded text");
+        let d = why.diagnostic();
+        assert_eq!(d.code, codes::W_REMOTE_LOCAL_ACCESS);
+        assert_eq!(d.message, why.warning());
+        assert_eq!(
+            d.hint,
+            Some("define the policy in the local profile to use it")
+        );
+        for other in [
+            NotImplemented::SsCipher("bf-cfb"),
+            NotImplemented::SnellVersion(6),
+        ] {
+            let d = other.diagnostic();
+            assert_eq!(
+                (d.code, d.message.as_str()),
+                (codes::W_PROTOCOL_NOT_IMPLEMENTED, other.warning().as_str())
+            );
+            assert_eq!(d.hint, None);
+        }
     }
 
     /// A `snell` line is read and checked in full, and versions 1 to 5 have

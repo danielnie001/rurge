@@ -10,14 +10,15 @@ use crate::policy::{
     Builtin, GroupKind, PolicyGroup, PolicyKind, ProxyPolicy, is_name, named, parse_group,
     parse_policy, quoted_name, shown_members,
 };
+use crate::remote::{RemoteRef, RemoteSource};
 use crate::requirement::{self, Environment};
 use crate::rule::{
     ParseCtx, PolicyRef, ResourceRef, Rule, RuleKind, SubRule, parse_rule, parse_subrule,
 };
 use crate::span::Span;
 use crate::spec::{
-    GroupSpec, NameKind, NotImplemented, PolicySpec, ProtoSpec, Remark, SpecEnv, to_group_spec,
-    to_spec,
+    GroupSpec, NameKind, NotImplemented, PolicySpec, ProtoSpec, Remark, SpecEnv, SpecOutcome,
+    to_group_spec, to_spec,
 };
 use crate::text::include::{self, IncludeOptions};
 use crate::text::{Origin, Profile, SectionKind, parse_str};
@@ -26,6 +27,7 @@ use crate::wireguard::{WireGuardSection, parse_section};
 use base64::Engine as _;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -147,11 +149,33 @@ impl Capabilities {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LoadOptions {
     pub environment: Environment,
     pub platform: Platform,
     pub capabilities: Capabilities,
+    /// Where the text of what the profile names by a URL comes from. `None`
+    /// for a caller with no data directory to keep downloaded texts in: a
+    /// remote `#!include` is then not read.
+    pub remote: Option<Arc<dyn RemoteSource>>,
+}
+
+/// The source of downloaded text is not shown, only whether there is one.
+impl fmt::Debug for LoadOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let LoadOptions {
+            environment,
+            platform,
+            capabilities,
+            remote,
+        } = self;
+        f.debug_struct("LoadOptions")
+            .field("environment", environment)
+            .field("platform", platform)
+            .field("capabilities", capabilities)
+            .field("remote", &remote.as_ref().map(|_| ".."))
+            .finish()
+    }
 }
 
 impl LoadOptions {
@@ -160,6 +184,7 @@ impl LoadOptions {
             environment: Environment::fixed(),
             platform: Platform::Linux,
             capabilities: Capabilities::all(),
+            remote: None,
         }
     }
 }
@@ -173,8 +198,16 @@ pub struct InlineRuleset {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceInfo {
+    /// The local file that was loaded.
     pub main: PathBuf,
+    /// The local files it includes. The files that downloaded texts are kept
+    /// in are not among them.
     pub includes: Vec<PathBuf>,
+    /// The file the text of the profile was read from.
+    pub main_text: PathBuf,
+    /// Every remote file the load came across, one per URL, in the order it
+    /// first came to them.
+    pub remote: Vec<RemoteRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -185,7 +218,8 @@ pub struct Config {
     /// `policies`; policies with errors are absent).
     pub specs: Vec<PolicySpec>,
     /// Why a policy without errors has no spec, when its line asks for
-    /// something rurge does not implement (`W0007`); by policy name.
+    /// something rurge does not implement (`W0007`) or does not start
+    /// (`W0033`); by policy name.
     pub not_implemented: HashMap<String, NotImplemented>,
     pub groups: Vec<PolicyGroup>,
     /// Typed parameters of every group (same order as `groups`; groups
@@ -383,27 +417,30 @@ pub fn from_text(text: &str, path: &Path, opts: &LoadOptions) -> Loaded {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .to_path_buf();
-    include::expand(
+    let remote = include::expand(
         &mut profile,
         &IncludeOptions {
             base_dir: base_dir.clone(),
             max_depth: 8,
             max_files: 200,
         },
+        opts.remote.as_deref(),
         &mut diags,
     );
     requirement::apply(&mut profile, &opts.environment, &mut diags);
-    let mut loaded = from_profile(profile, &base_dir, opts);
+    let mut loaded = from_profile(profile, &base_dir, opts, remote);
     diags.extend(loaded.diagnostics);
     loaded.diagnostics = diags;
     loaded
 }
 
+/// The `Name = definition` entries of a section, each with where its line
+/// stands and where it came from.
 fn definition_entries<'a>(
     profile: &'a Profile,
     section: &str,
     diags: &mut Diagnostics,
-) -> Vec<(&'a str, &'a str, &'a Span)> {
+) -> Vec<(&'a str, &'a str, &'a Span, &'a Origin)> {
     let mut out = Vec::new();
     if let Some(sec) = profile.section(section) {
         for e in sec.active_entries() {
@@ -411,7 +448,9 @@ fn definition_entries<'a>(
                 // A name never holds a comma (member lists are
                 // comma-separated): one that does came from the parameters'
                 // first `=` standing in for a missing one after the name.
-                Some((name, def)) if !name.contains(',') => out.push((name, def, &e.span)),
+                Some((name, def)) if !name.contains(',') => {
+                    out.push((name, def, &e.span, &e.origin))
+                }
                 _ => diags.push(
                     Diagnostic::error(
                         codes::E_INVALID_DEFINITION,
@@ -450,7 +489,13 @@ fn collect_kind_unknowns(kind: &RuleKind, out: &mut Vec<String>) {
     }
 }
 
-pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Loaded {
+/// `remote` is what expanding the includes of `profile` came across.
+pub fn from_profile(
+    profile: Profile,
+    base_dir: &Path,
+    opts: &LoadOptions,
+    remote: Vec<RemoteRef>,
+) -> Loaded {
     let mut diags = Diagnostics::default();
     let main = profile
         .main
@@ -473,7 +518,9 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
     // Policies and groups with name registry.
     let mut names: HashMap<String, &'static str> = HashMap::new();
     let mut policies = Vec::new();
-    for (name, def, span) in definition_entries(&profile, "Proxy", &mut diags) {
+    // `external` policies a downloaded text defines, by name
+    let mut downloaded_externals: HashSet<String> = HashSet::new();
+    for (name, def, span, origin) in definition_entries(&profile, "Proxy", &mut diags) {
         match Builtin::parse(name) {
             Some(Builtin::Direct) => continue,
             Some(_) => {
@@ -499,12 +546,17 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
             continue;
         }
         match parse_policy(name, def, span) {
-            Ok(p) => policies.push(p),
+            Ok(p) => {
+                if p.kind == PolicyKind::External && matches!(origin, Origin::Remote(_)) {
+                    downloaded_externals.insert(p.name.clone());
+                }
+                policies.push(p);
+            }
             Err(e) => diags.push(Diagnostic::from_parse(e, span.clone())),
         }
     }
     let mut groups = Vec::new();
-    for (name, def, span) in definition_entries(&profile, "Proxy Group", &mut diags) {
+    for (name, def, span, _) in definition_entries(&profile, "Proxy Group", &mut diags) {
         if Builtin::parse(name).is_some() {
             diags.push(
                 Diagnostic::error(
@@ -625,7 +677,7 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
         }
     }
     let mut keystore = Vec::new();
-    for (name, def, span) in definition_entries(&profile, "Keystore", &mut diags) {
+    for (name, def, span, _) in definition_entries(&profile, "Keystore", &mut diags) {
         match parse_keystore_item(name, def, span) {
             Ok(k) => {
                 // Ruling R14: unknown [Keystore] fields warn at the item's span.
@@ -705,6 +757,8 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
         }
     }
 
+    // The files the user wrote. A line of a downloaded text is in a file of
+    // the cache, which nobody edits and a watcher has no use for.
     let mut includes: Vec<PathBuf> = Vec::new();
     for sec in &profile.sections {
         for e in &sec.entries {
@@ -732,9 +786,20 @@ pub fn from_profile(profile: Profile, base_dir: &Path, opts: &LoadOptions) -> Lo
         deferred,
         managed,
         unknown_sections,
-        source: SourceInfo { main, includes },
+        source: SourceInfo {
+            main_text: main.clone(),
+            main,
+            includes,
+            remote,
+        },
     };
-    validate(&mut config, base_dir, opts, &mut diags);
+    validate(
+        &mut config,
+        base_dir,
+        opts,
+        &downloaded_externals,
+        &mut diags,
+    );
     Loaded {
         config,
         diagnostics: diags,
@@ -1018,7 +1083,13 @@ fn set_kind_conflicts(config: &Config, diags: &mut Diagnostics) {
     }
 }
 
-fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mut Diagnostics) {
+fn validate(
+    config: &mut Config,
+    base_dir: &Path,
+    opts: &LoadOptions,
+    downloaded_externals: &HashSet<String>,
+    diags: &mut Diagnostics,
+) {
     let exists = |name: &str, config: &Config| config.resolve_policy(name).is_some();
 
     // Rule policy references.
@@ -1186,7 +1257,16 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
         // `local-port` → the `external` policy that has it
         let mut local_ports: HashMap<u16, &str> = HashMap::new();
         for p in &cfg.policies {
-            let mut outcome = to_spec(p, &env);
+            // A program that a downloaded text names is not started, so its
+            // parameters are not read: nothing is said about them.
+            let mut outcome = if downloaded_externals.contains(&p.name) {
+                SpecOutcome {
+                    not_implemented: Some(NotImplemented::DownloadedExternal),
+                    ..SpecOutcome::default()
+                }
+            } else {
+                to_spec(p, &env)
+            };
             for d in outcome.diagnostics {
                 diags.push(d);
             }
@@ -1257,10 +1337,7 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
             }
             if let Some(why) = outcome.not_implemented {
                 if not_implemented_seen.insert(why.clone()) {
-                    diags.push(
-                        Diagnostic::warning(codes::W_PROTOCOL_NOT_IMPLEMENTED, why.warning())
-                            .at(p.span.clone()),
-                    );
+                    diags.push(why.diagnostic().at(p.span.clone()));
                 }
                 not_implemented.insert(p.name.clone(), why);
             }
@@ -2041,6 +2118,66 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
         assert_eq!(
             at(codes::W_DUPLICATE_FINAL),
             [("shared.dconf".to_string(), 3)]
+        );
+    }
+
+    /// What the manual warns about, with the included file downloaded: it ends
+    /// with a FINAL of its own and the profile goes on after the include. The
+    /// rule that follows is never evaluated and the policy is that of the
+    /// profile's own FINAL; the warnings stand in the file that holds the
+    /// line each is about.
+    #[test]
+    fn a_downloaded_final_ends_matching_for_the_rules_that_follow_it() {
+        let link = "https://example.com/shared.conf";
+        let fake = Arc::new(crate::remote::fake::Fake::new().text(
+            link,
+            "[Rule]\nDOMAIN,included.example,DIRECT\nFINAL,DIRECT\n",
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_with_remote(
+            dir.path(),
+            &format!(
+                "[Proxy]\nP = direct\n[Rule]\nDOMAIN,first.example,DIRECT\n#!include {link}\nDOMAIN,local.example,P\nFINAL,P\n"
+            ),
+            &fake,
+        );
+        assert!(
+            !l.diagnostics.has_errors(),
+            "{:?}",
+            l.diagnostics.into_vec()
+        );
+        let raws: Vec<&str> = l.config.rules.iter().map(|r| r.raw.as_str()).collect();
+        assert_eq!(
+            raws,
+            [
+                "DOMAIN,first.example,DIRECT",
+                "DOMAIN,included.example,DIRECT",
+                "FINAL,DIRECT",
+                "DOMAIN,local.example,P",
+                "FINAL,P"
+            ]
+        );
+        // matching ends at the downloaded FINAL, so the rule after it is dead;
+        // the policy is the last FINAL's
+        assert_eq!(l.config.first_final(), Some(2));
+        assert_eq!(l.config.effective_final(), Some(4));
+        let at = |code: &str| -> Vec<(String, u32)> {
+            l.diagnostics
+                .iter()
+                .filter(|d| d.code == code)
+                .map(|d| {
+                    let span = d.span.as_ref().expect("a position");
+                    (span.file.display().to_string(), span.line)
+                })
+                .collect()
+        };
+        assert_eq!(
+            at(codes::W_RULES_AFTER_FINAL),
+            [(dir.path().join("main.conf").display().to_string(), 6)]
+        );
+        assert_eq!(
+            at(codes::W_DUPLICATE_FINAL),
+            [(fake.path_of(link).display().to_string(), 3)]
         );
     }
 
@@ -3365,6 +3502,314 @@ RULE-SET,LAN,DIRECT\nDOMAIN-SET,LAN,REJECT\nRULE-SET,X,DIRECT\nDOMAIN-SET,X,REJE
                 assert!(!shown.contains(part), "{shown}");
             }
         }
+    }
+
+    /// A load whose `#!include` lines name links, with the texts those links
+    /// were downloaded as.
+    fn load_with_remote(
+        dir: &Path,
+        profile: &str,
+        fake: &Arc<crate::remote::fake::Fake>,
+    ) -> Loaded {
+        let mut opts = LoadOptions::for_tests();
+        opts.remote = Some(fake.clone());
+        let main = dir.join("main.conf");
+        std::fs::write(&main, profile).unwrap();
+        load(&main, &opts).unwrap()
+    }
+
+    /// A downloaded text is no file the user edits: the list of local
+    /// includes, which a watcher follows, has none, and the remote files are
+    /// listed apart, in the order the load came across them.
+    #[test]
+    fn the_source_lists_the_local_includes_and_the_remote_files_apart() {
+        let (b, a, gone) = (
+            "https://example.com/b.conf",
+            "https://example.com/a.conf",
+            "https://example.com/gone.conf",
+        );
+        let fake = Arc::new(
+            crate::remote::fake::Fake::new()
+                .text(b, "[Rule]\nDOMAIN,b.example,A\n")
+                .text(a, "[Rule]\nDOMAIN,a.example,A\n")
+                .missing(gone, None),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("p.dconf"), "[Proxy]\nA = direct\n").unwrap();
+        let l = load_with_remote(
+            dir.path(),
+            &format!(
+                "[Proxy]\n#!include p.dconf\n[Rule]\n#!include {b}\n#!include {a}\n#!include {gone}\nFINAL,A\n"
+            ),
+            &fake,
+        );
+        assert!(
+            !l.diagnostics.has_errors(),
+            "{:?}",
+            l.diagnostics.into_vec()
+        );
+        let source = &l.config.source;
+        assert!(source.main.ends_with("main.conf"));
+        assert_eq!(source.main_text, source.main);
+        assert_eq!(source.includes.len(), 1);
+        assert!(source.includes[0].ends_with("p.dconf"));
+        let found: Vec<(&str, Option<&Path>)> = source
+            .remote
+            .iter()
+            .map(|r| (r.url.as_str(), r.path.as_deref()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (b, Some(fake.path_of(b).as_path())),
+                (a, Some(fake.path_of(a).as_path())),
+                (gone, None),
+            ]
+        );
+        assert_eq!(l.config.rules.len(), 3);
+    }
+
+    /// A line of a downloaded text that does not load is reported in the file
+    /// the text is kept in, at the line it has there.
+    #[test]
+    fn a_line_of_a_remote_text_that_does_not_load_is_reported_where_it_is_written() {
+        let link = "https://example.com/r.conf";
+        let fake = Arc::new(crate::remote::fake::Fake::new().text(
+            link,
+            "[Rule]\nDOMAIN,a.example,DIRECT\nFOO,b.example,DIRECT\n",
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_with_remote(
+            dir.path(),
+            &format!("[Rule]\n#!include {link}\nFINAL,DIRECT\n"),
+            &fake,
+        );
+        let found: Vec<(&str, &Path, u32)> = l
+            .diagnostics
+            .iter()
+            .map(|d| {
+                let span = d.span.as_ref().expect("a position");
+                (d.code, span.file.as_ref(), span.line)
+            })
+            .collect();
+        let cached = fake.path_of(link);
+        assert_eq!(found, [(codes::E_UNKNOWN_RULE_TYPE, cached.as_path(), 3)]);
+        assert_eq!(l.config.rules.len(), 2);
+    }
+
+    /// A downloaded text goes through the reader of a profile as a local
+    /// include does: a byte order mark is not part of the first line, comments
+    /// are not part of a value, and a requirement directive in front of a line
+    /// or behind it turns the line off where it is not met.
+    #[test]
+    fn a_remote_text_is_read_as_a_local_include_of_the_same_bytes_is() {
+        let text = "\u{feff}[Rule]\r\n#!MACOS-ONLY DOMAIN,mac.example,DIRECT\r\n#!IOS-ONLY DOMAIN,ios.example,DIRECT\r\nDOMAIN,tail.example,DIRECT // a comment\r\nDOMAIN,late.example,DIRECT #!IOS-ONLY\r\nDOMAIN,keep.example,DIRECT #!REQUIREMENT CORE_VERSION<22\r\n; a comment line\r\n";
+        let link = "https://example.com/r.conf";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("inc.dconf"), text).unwrap();
+        let local = load_with_remote(
+            dir.path(),
+            "[Rule]\n#!include inc.dconf\nFINAL,DIRECT\n",
+            &Arc::new(crate::remote::fake::Fake::new()),
+        );
+        let fake = Arc::new(crate::remote::fake::Fake::new().text(link, text));
+        let remote = load_with_remote(
+            dir.path(),
+            &format!("[Rule]\n#!include {link}\nFINAL,DIRECT\n"),
+            &fake,
+        );
+        let raws =
+            |l: &Loaded| -> Vec<String> { l.config.rules.iter().map(|r| r.raw.clone()).collect() };
+        let told = |l: &Loaded| -> Vec<(&'static str, String)> {
+            let mut told: Vec<_> = l
+                .diagnostics
+                .iter()
+                .map(|d| (d.code, d.message.clone()))
+                .collect();
+            told.sort();
+            told
+        };
+        assert_eq!(
+            raws(&remote),
+            [
+                "DOMAIN,mac.example,DIRECT",
+                "DOMAIN,tail.example,DIRECT",
+                "DOMAIN,keep.example,DIRECT",
+                "FINAL,DIRECT"
+            ]
+        );
+        assert_eq!(raws(&remote), raws(&local));
+        assert_eq!(told(&remote), told(&local));
+        // the two lines that were turned off said so, in the file they are in
+        let off: Vec<(&Path, u32)> = remote
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::I_LINE_DISABLED)
+            .map(|d| {
+                let span = d.span.as_ref().expect("a position");
+                (span.file.as_ref(), span.line)
+            })
+            .collect();
+        let cached = fake.path_of(link);
+        assert_eq!(off, [(cached.as_path(), 3), (cached.as_path(), 5)]);
+    }
+
+    /// Two files that bring a section of one name: the profile's own wins over
+    /// the files it includes, and of two included files the one included first
+    /// does. The other is reported at its section, in its own file.
+    #[test]
+    fn of_two_sections_of_one_name_the_profiles_own_and_then_the_first_included_is_used() {
+        let remote_link = "https://example.com/remote.conf";
+        let fake = Arc::new(
+            crate::remote::fake::Fake::new()
+                .text(remote_link, "[Ruleset x]\nDOMAIN,remote.example\n"),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("local.conf"),
+            "[Ruleset x]\nDOMAIN,local.example\n",
+        )
+        .unwrap();
+        let own = "[Ruleset x]\nDOMAIN,main.example\n";
+        let tail = "[Rule]\nRULE-SET,x,DIRECT\nFINAL,DIRECT\n";
+        let include = |target: &str| format!("#!include {target}\n");
+        let (local, remote) = ("local.conf", remote_link);
+        let cached = fake.path_of(remote_link);
+        for (profile, wins, ignored) in [
+            (
+                format!(
+                    "[Ruleset *]\n{}{}{own}{tail}",
+                    include(local),
+                    include(remote)
+                ),
+                "DOMAIN,main.example",
+                vec![(dir.path().join("local.conf"), 1), (cached.clone(), 1)],
+            ),
+            (
+                format!("[Ruleset *]\n{}{}{tail}", include(local), include(remote)),
+                "DOMAIN,local.example",
+                vec![(cached.clone(), 1)],
+            ),
+            (
+                format!("[Ruleset *]\n{}{}{tail}", include(remote), include(local)),
+                "DOMAIN,remote.example",
+                vec![(dir.path().join("local.conf"), 1)],
+            ),
+        ] {
+            let l = load_with_remote(dir.path(), &profile, &fake);
+            assert!(
+                !l.diagnostics.has_errors(),
+                "{profile}: {:?}",
+                l.diagnostics.clone().into_vec()
+            );
+            let sets: Vec<Vec<&str>> = l
+                .config
+                .rulesets
+                .iter()
+                .map(|s| s.rules.iter().map(|r| r.raw.as_str()).collect())
+                .collect();
+            assert_eq!(sets, [vec![wins]], "{profile}");
+            let said: Vec<(&str, std::path::PathBuf, u32)> = l
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == codes::W_DUPLICATE_RULESET)
+                .map(|d| {
+                    let span = d.span.as_ref().expect("a position");
+                    (d.message.as_str(), span.file.to_path_buf(), span.line)
+                })
+                .collect();
+            let message = "duplicate [Ruleset x] ignored; the first definition is used";
+            let expected: Vec<(&str, std::path::PathBuf, u32)> = ignored
+                .into_iter()
+                .map(|(file, line)| (message, file, line))
+                .collect();
+            assert_eq!(said, expected, "{profile}");
+        }
+    }
+
+    /// An `external` policy starts a program on this machine, so one that a
+    /// downloaded text defines is kept (the groups and rules that name it
+    /// still hold) but is not built: it has no spec, behaves as REJECT, and
+    /// takes no part in the checks of the policies that will be started. One
+    /// warning says so for the load, at the first of them.
+    #[test]
+    fn an_external_policy_in_downloaded_text_is_not_started() {
+        let link = "https://example.com/proxies.conf";
+        let fake = Arc::new(crate::remote::fake::Fake::new().text(
+            link,
+            "[Proxy]\nE1 = external, exec=/bin/true, local-port=1081, args=-a\nE2 = external, exec=/bin/true, local-port=1081\nBare = external\nH = http, h.example, 8080\n",
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_with_remote(
+            dir.path(),
+            &format!(
+                "[Proxy]\n#!include {link}\nLocal = external, exec=/bin/true, local-port=1081\n[Proxy Group]\nG = select, E1, E2, Bare, H, Local\n[Rule]\nFINAL,G\n"
+            ),
+            &fake,
+        );
+        // no error: not an unknown member, not a missing `exec`, not a port
+        // that two programs would want
+        let told: Vec<(&str, &str)> = l
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            told,
+            [(
+                codes::W_REMOTE_LOCAL_ACCESS,
+                "`external` policies written in downloaded text are not started; they behave as REJECT"
+            )]
+        );
+        let warning = l.diagnostics.iter().next().unwrap();
+        assert_eq!(
+            warning.hint,
+            Some("define the policy in the local profile to use it")
+        );
+        let span = warning.span.as_ref().expect("a position");
+        assert_eq!(
+            (span.file.as_ref(), span.line),
+            (fake.path_of(link).as_path(), 2)
+        );
+        let config = &l.config;
+        let names: Vec<&str> = config.policies.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["E1", "E2", "Bare", "H", "Local"]);
+        for name in ["E1", "E2", "Bare"] {
+            assert!(config.spec(name).is_none(), "{name}");
+            assert_eq!(
+                config.not_implemented.get(name),
+                Some(&NotImplemented::DownloadedExternal),
+                "{name}"
+            );
+        }
+        for name in ["H", "Local"] {
+            assert!(config.spec(name).is_some(), "{name}");
+            assert_eq!(config.not_implemented.get(name), None, "{name}");
+        }
+        assert_eq!(config.groups[0].members.len(), 5);
+        assert_eq!(config.external_on_own_listener(), None);
+    }
+
+    /// The same lines in the profile itself and in a file of its own, which
+    /// the user wrote, are built as they always were.
+    #[test]
+    fn an_external_policy_in_a_local_file_is_built() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ext.dconf"),
+            "[Proxy]\nIncluded = external, exec=/bin/true, local-port=1083\n",
+        )
+        .unwrap();
+        let l = load_with_remote(
+            dir.path(),
+            "[Proxy]\n#!include ext.dconf\nMain = external, exec=/bin/true, local-port=1082\n[Rule]\nFINAL,DIRECT\n",
+            &Arc::new(crate::remote::fake::Fake::new()),
+        );
+        assert!(l.diagnostics.is_empty(), "{:?}", l.diagnostics.into_vec());
+        for name in ["Included", "Main"] {
+            assert!(l.config.spec(name).is_some(), "{name}");
+        }
+        assert!(l.config.not_implemented.is_empty());
     }
 
     #[test]

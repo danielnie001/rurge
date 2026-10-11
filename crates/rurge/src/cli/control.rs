@@ -72,6 +72,7 @@ pub fn resolve_endpoint(args: &ControlArgs) -> anyhow::Result<(SocketAddr, Strin
         environment: super::environment(platform, capabilities::CORE_VERSION),
         platform,
         capabilities: capabilities::current(),
+        remote: None,
     };
     let loaded =
         load(config, &opts).with_context(|| format!("cannot read {}", config.display()))?;
