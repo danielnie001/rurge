@@ -72,6 +72,12 @@
 | M5-D17 | 远端地址怎么取 | 这条会话自己开的 socket 连到的地址，经任务局部变量从连接器带回；复用已有连接或隧道的会话没有这一项（登记） |
 | M5-D18 | 诊断的建议 | 按诊断码给缺省建议，诊断自己带了建议时用自己的；不设建议的码要写明理由（第 5.3 节） |
 | M5-D19 | 新的诊断码 | `E0024`、`W0032`、`W0033`、`W0034`、`I0004`；`W0011` 只剩"没有数据目录"一种情形 |
+| M5-D20 | 下载到的文本里的 `external` 策略（写 M5b 计划时加，见第 13 节） | 远程 include 与托管配置的副本里的 `external` 定义不建出站，行为同 REJECT（`W0033`）；写在本地文件里的照旧。`external` 启动本机的程序，一份会自己更新的文本不该有这个能力。Surge 的托管配置能带这种策略——登记为差异；要不要给一个放开它的命令行开关由项目所有者定 |
+| M5-D21 | 新版本提到还没下载过的来源（写 M5b 计划时加，见第 13 节） | 不立刻采用：新来源先被跟踪并下载，试完第一次时与新版本一并采用；其间旧的一代照常运行，`strict` 不把这段等待算作失败 |
+| M5-D22 | `[Rule]` 里几条 `FINAL` 的读法（M5a 重读手册时查出，见第 13 节） | 匹配在第一条启用的 `FINAL` 处结束，策略与选项（`dns-failed`）取最后一条启用的 `FINAL` 的——手册 `rules/final.html` 与 `profile/format.html` 的三句话同时成立的唯一读法。rurge 原先让夹在两条 `FINAL` 之间的规则照常评估。是推断，没有在 Surge 上观察过 |
+| M5-D23 | API 关连接的方式（M5a 的一条偶发失败的用例查出，见第 13 节） | 分三步：关写端、读掉晚到的字节（至多 1 秒、256 KiB）、再关——RFC 9112 第 9.6 节说的做法，nginx 的 `lingering_close` 与 Go 的 `closeWriteAndWait` 同此。放在连接一层，对每条连接都做；不取"答复之前先读完正文"的中间件 |
+| M5-D24 | 集合文件里没有用上的行（M5a 延后，见第 13 节） | 带未知参数的行按集合计数、建注册表时一条 `W0003`（不引用参数）；启动之后载入的集合有没用上的行、且数与上一次不同时一行 WARN（只有数与行号）；三个数进 `/v1/external_resources`。同一个注册表的重编译一次一个 |
+| M5-D25 | 称阶段 1"齐备"之前的需求复读（CLAUDE.md 的规矩，见第 13 节） | 是 M5b 的一个任务，排在全部代码任务之后；每条"做了"指到一条会因它而红的用例；产出 `docs/acceptance/phase1-acceptance.md`；"齐备"写不写由它的结论定 |
 
 ## 4. 规则引擎（M5a）
 
@@ -321,6 +327,17 @@ rurge 这边：列表合并当前这一代的资源管理器与 `ProfileSources`
 12. `#!WINDOWS-ONLY` / `#!LINUX-ONLY` 是 rurge 的扩展，只推荐行首写法（第 5.1 节）。
 13. 请求记录的 `remoteAddr` 只在会话自己开了 socket 时有（M5-D17）。
 14. `--listen-http` / `--listen-socks5` 是 rurge 的运行时选项（FR-CFG-17）。
+15. 下载到的文本（远程 include、托管配置的副本）里的 `external` 策略不启动，行为同 REJECT（M5-D20）。
+16. 只有一行 `#!MANAGED-CONFIG`、没有任何节的本地文件只是一个指针：它被改动不会让它生效。服务商换过地址之后，本地文件与副本的先后看的是整条链上最新的那次检查。手册（`profile/format.html`）："A managed profile cannot be modified locally because it can be updated remotely. To make changes, first create a copy to turn it into a normal profile."——Surge 不让使用者改托管配置，"本地文件被改过"时怎么办没有 Surge 的行为可循，第 1 项与这一项都是 rurge 自己的规则。
+17. 托管配置的新版本提到还没下载过的来源时，等它们试完第一次再一并采用（M5-D21）；几个来源要一起换的同样。
+18. 远程 include 的新内容缺它被 include 的节时不采用（一页 HTML 不会被当成一份空的规则表）。
+19. 内容没变的 200 不算新版本、不触发重载；对规则集、域名集与订阅同样。
+20. Profile 的来源走直连下载，不经策略；`interval` 是下限，间隔的抖动只往后；只在 `rurge run` 运行时更新（手册："The profile can only be updated while the main Surge app is running."），`rurge check` 与其余命令只读缓存。
+21. `strict`：等新版本提到的来源不算失败；本地文件生效时取本地那一行的 `strict`。
+22. `reload` / `stop` / `status` 的 `--data-dir`；`/v1/external_resources` 的 `ready` 与 `updatedAt`（最近一次成功的检查，"没有变化"的应答也算）、`suspended`，更新请求的 60 秒时限与 `"timed out"`；规则集与域名集的项多 `skipped`、`truncated`、`unknownParams` 三个 rurge 自己的字段，`error` 不因它们出现。
+23. `[Rule]` 里匹配在第一条启用的 `FINAL` 处结束、策略取最后一条的（M5-D22）；读法是从手册的三句话推断的。
+24. 规则集文件里带未知参数的行：参数被忽略，按集合报一条 `W0003`，不引用参数（内联小节逐行报、引用参数）。
+25. API 关连接之前先关写端并读掉晚到的字节（M5-D23）：不读正文的端点与在读正文之前被拒绝的请求，正文晚到的客户端也读得到应答。
 
 ## 9. 测试
 
@@ -389,3 +406,50 @@ M5a 的执行（计划 `docs/superpowers/plans/2026-10-11-phase1-m5a-small-items
 12. **第 6.3 节：补用例。** (a) FR-RULE-05 的实测数字回填在 M2 设计第 16 节的 Q3 一行：100 万条的 `DOMAIN-SET` 载入时的峰值比基线多约 403 MB，`RULE-SET` 约 456 MB，建好之后各约 137.5 MiB 与 156.4 MiB（Windows，发布构建，四轮）；"可控"没有判据，留给项目所有者（延后第 24 行）。内存实测是三条 `#[ignore]` 用例（域名集、规则集、基线），不是两条（记录第 45 行）。(b) `SIGHUP` 用例先等守护进程说出 `rurge … running` 再发信号——处理器是在那一行之前才装上的；同一文件里早先的 `SIGINT` 用例同样改过（记录第 46 行）。两条都只在 Unix 上编译，本机没有编译过，第一次 CI 运行时核对（延后第 1、23 行）。
 13. **第 8 节：又多了这些差异。** 除第 8 节的 14 条之外，执行中又定了下面这些；兼容性清单（1.4、3.3、3.5、10.3、10.4 各节）已经登记的有：规则集文件的行可以带行尾注释（手册只对 Profile 写明了这条规则，说内联规则集与外部文件是同一种行语法，"Surge 读得了集合文件行尾的注释"是从两份常用的列表推断的，记录第 57 行）；值里有"空白加 `#`、`;` 或 `//`"的行现在在那里截断，单引号括起来也一样，要保留用双引号（记录第 58、64 行）；集合文件开头的 UTF-8 BOM 不算进第一行（记录第 65 行）；带 `no-resolve` 的 IP 行与 `IP-ASN` 行改变了报成子规则的是哪一行，以及运行期不求值的类型的那句提示出现的时机（记录第 53、60 行）；Windows 的 `DEVICE_NAME` 取 DNS 主机名、`--platform` 下的 `SYSTEM_VERSION`；设了而为空的环境变量是错误、只给 `--listen-http` 时没有缺省的 SOCKS5 监听；`#!WINDOWS-ONLYX` 这样的行不是简写。只记在计划里、没有进兼容性清单的一处是：没有载入 GeoIP / ASN 库时那句每个进程一次的告警，可能由这样的会话提前触发，也可能被推后（记录第 53、60 行）。
 14. **整分支的评审之后：第 5.2、5.3、6.2 节各改了一处（记录第 71 ～ 74 行）。** (a) **第 5.2 节：`external` 策略拉起的程序得不到 rurge 自己的设置。** 本文没有说。`--listen-http` 的口令可以放在 `RURGE_LISTEN_HTTP` 里（本里程碑加的建议），而 `external` 策略拉起的程序原先继承 rurge 的全部环境，程序只要把自己的环境打印出来（脚本里的一句 `env`），口令就进了 `<数据目录>/external/<策略名>.log`；拉起的程序本身是另一个 rurge 时，它还会照第一个的设置监听，不照自己 Profile 里的 `local-port`。现在名字以 `RURGE_` 开头的变量（不分大小写）都不交给程序，按前缀判断而不列名单：这些名字声明在可执行文件里，名单迟早过时（`is_own_setting`，`crates/rurge-proto/src/external.rs`；记录第 72 行）。(b) **第 5.3 节：`E0008` 在 `include-other-group` 的一处带自己的建议。** 缺省建议是"定义缺的策略或组"，而这个参数只收策略组的名字，名字是 `[Proxy]` 里已有的一条策略时照着做不成；这一处改说给参数写 `[Proxy Group]` 里定义的组的名字，单独一条策略作为组的成员列出。`E0008` 的其余各处仍用缺省建议，59 / 33 / 25 的数没有变（记录第 73 行）。(c) **第 6.2 节：内部 DNS 会话的 `remoteAddr` 与别的 TCP 会话同一条规则。** 文档写成"上游服务器的地址"，只在会话直连时成立；经以地址配置的代理时是代理服务器的地址，代理走复用的连接或隧道时是 `null`。两份 API 参考改了，经代理与因代理以域名配置而改走直连两种情形各补了一条断言；测速会话的三个键恒为空也补了断言（记录第 74 行）。
+
+## 13. M5b 计划期的订正
+
+写 M5b 实施计划（`docs/superpowers/plans/2026-10-11-phase1-m5b-profile-remote-sources-plan.md`）时核对本仓库的源码（资源管理器的登记、抖动、缓存与状态；加载器的 include 展开与头部指令；`rurge run` 的启动顺序与崩溃恢复；监听端对拨号失败的应答；UDP 流的重试；M5a 合并之后又对了一遍：诊断的建议表、`RuleEngine::build`、集合注册表的重载任务、`rurge-api` 的 `serve` 与它依赖的 axum 0.8.9 的 `Listener`）与手册的四页（`profile/managed-profile.html`、`profile/format.html`、`rules/final.html`、`tools/http-api.html`，2026-10-11 重读；上文引用的 31 句原话逐句对过页面的文本，一句不差）后，与上文不一致或上文没写到的，以本节为准（括号里是计划「计划期决定」的编号）。第 3 节的表多出 M5-D20 ～ D25 六行，第 8 节多出第 15 ～ 25 项。
+
+1. **资源管理器（细化与订正 7.1）**：
+   - 状态里的 `fetched_at` 放宽为"最近一次成功的下载或'没有变化'的应答，只要知道就给"（今天在 `failed` 时是 `None`），另加 `ready`（手里有内容）。缓存的 `Meta` 多一个纳秒字段，时刻到纳秒：只到秒的话，同一秒里"先存文件、后下载"会被判成本地文件更新。公开的 `cached_copy(root, url)` 给出正文、正文所在的文件与时刻（P1、P2）。
+   - 正文与手里的逐字节相同的 200 照"没有变化"办，对所有种类生效：不带校验器的服务端因此不会每个间隔触发一次重载（P3）。
+   - 管理器加 `retire(source)`；7.3 的"来源集合变小时重建管理器"不做。间隔变了的来源撤掉重登——对同一个条目再登记只会把间隔往短里并（P4）。
+   - `update_now` 返回 `Option<Result<(), String>>`（没有这个条目是 `None`），等的是调用之后才开始的那一次尝试，离线时立刻给错误（P5）；另加 `attempted(key)`：等到这个条目此刻没有一次该做而没做完的尝试。
+   - `ResourceOptions.never_early`：Profile 的来源的间隔抖动只往后（0 ～ +10 %），手册说 `interval` 是最短的时间（P6）；它们的退避上限是 600 秒（P23）。
+   - 失败原因（`last_error`）里不出现 URL 的任何部分，重定向的 `Location` 也算。
+2. **加载器的接口（订正 7.2）**：`RemoteSource::get(&Url)`，不是 `&str`——缓存目录的名字取自 `Url` 的规范写法，加载器与资源管理器必须说的是同一个值（P26）。`RemoteRef { url, role, path, interval, strict, lacks_section }`：`role` 是 `Managed`（定期更新的那一个）、`ManagedHop`（链上经过的，只读缓存）、`Include` 三种，一个 URL 一项、先出现的身份留下。`Origin` 加 `Remote`（这一行来自下载到的文本）。`#!MANAGED-CONFIG` 的 URL 与远程 include 的目标解析不成 `http(s)` 的 URL 时是 `W0012`（不引用取值），那一行当作没写。下载到的文本经 Profile 自己的读取器，与本地 include 的文件完全相同（BOM、注释、要求指令）。
+3. **下载到的文本里的 `external` 策略（新增，M5-D20）**：远程 include 与托管配置的副本里的 `external` 定义不建出站——它留在 `Config.policies` 里（组与规则对它的引用照常成立）、没有 spec、`NotImplemented::DownloadedExternal`，行为同 REJECT，每次加载一条 `W0033`；写在主文件或本地 include 里的照旧。`W0033` 因此有两种用处（下载到的文本里的本地 include、`external` 策略），各带各的建议。订阅导入的 `external` 行自阶段 2 / M4c 起已经一律跳过，这是同一条理由（P7）。
+4. **远程 include 的"不是 Profile"（新增）**：新内容缺它被 include 的节时不采用（`RemoteRef.lacks_section`）。一页 HTML 当作 include 展开时只有告警，没有这一条它会被当成一份空的规则表采用。已经在缓存里的照旧只是 `W0017`（P8）。
+5. **谁生效（订正 7.2 的第 2 步，细化 M5-D2）**：
+   - 本地文件一个节也没有时（只有一行 `#!MANAGED-CONFIG` 的指针）不参与先后的比较，副本在就用副本。这样的文件被动过之后按原来的规则会加载不了，而副本没到期、不会去更新（P9）。
+   - 先沿缓存里的副本走到头，再拿本地文件的修改时间与链上各份副本里最新的那次检查比——7.2 只比第一跳的副本。第一跳换了地址之后不再刷新，它的时刻停在换地址的那一天：此后本地文件一被动过就永远"更新"，被跟踪的退回本地那一行的旧地址。被跟踪的总是链的头，哪怕本地文件生效；本地文件生效时间隔与 `strict` 取本地那一行的；走过不止一个地址时多一条 `I0004`，提醒本地那一行该改了（P10）。
+   - 副本没有 `#!MANAGED-CONFIG` 而本地文件生效时，那份副本的 URL 仍被跟踪：本地那一行说这份 Profile 是托管的。
+   - `Config.managed` 是生效的主文本自己的那一行；被跟踪的 URL、间隔与 `strict` 以 `SourceInfo.remote` 里 `Managed` 一项为准（本地文件生效而地址换过时，两者的 URL 不同）。
+6. **诊断（订正 7.2）**：不带时间戳——同样的输入给出同样的诊断，时刻在 `/v1/external_resources` 里。托管配置没拿到时也给一条 `W0022`（`managed profile not downloaded yet`，带原因）：只有一行的本地文件第一次启动失败时，使用者靠它知道为什么。`I0004` 的三句与 `W0034` 的两句见计划任务 4。副本生效时，本地文件自己的文本的诊断不出现（P16）。新的码在 M5a 的建议表里各有去处：`W0033`、`W0034` 每一处各带建议，`I0004` 是告知，`W0011` 的理由改写为"只有没给加载器远程来源的调用方才见得到它"（P34）。
+7. **采用之前的判定（订正 7.3，M5-D21）**：
+   - 一次判定有三种结论：通过、不通过、等待。等待是"加载得了，但这次加载提到的来源里有没拿到内容、又还没试完第一次的"：它们随即被跟踪，候选留着；它们下载到时一并采用，下载失败时候选在自己那个来源的下一次重试时采用（那一行照 `W0022` 不展开）。没有这一条，多了一行远程 include 的新版本会先换上缺着那一块的一代，几秒后再补齐（P12）。
+   - 顺序：另有留着的候选时先带上全部留着的一起判，再只带这一份——7.3 写的是反过来。新来源到达的那一刻就能把等它的候选一并采用（P11）。
+   - 不通过另有两种：Profile 已不提这个地址（P14）；候选缺它被 include 的节（上面第 4 条）。
+   - 留着的候选在它的来源回到 `available` 时作废：服务端又答了"没有变化"，留着的那份已不是它现在给的内容。
+   - `ProfileSources::new(data_dir, offline, check)` 改为 `new(SourcesOptions)` 与 `production(..)`：判定是它自己的事，不由调用方给。
+8. **`outdated()`（新增）**：本地文件生效的一代里，一次"没有变化"的应答不升版本，`changed()` 不会返回，而 M5-D2 要它结束本地文件的优先。主循环每秒看一次 `outdated()`，为真时重载；对同一个检查时刻只真一次（P15）。
+9. **`strict`（细化与订正 7.4）**：
+   - 上一次检查的时刻在将来（系统时钟被拨回）不算到期。
+   - 候选因"等待"而留着的不算失败——下载是成功的；因"不通过"而留着的算（P13）。
+   - 7.4 的"恢复的路径只有一条"订正为两条：一次成功的更新；或者使用者把本地文件（一份完整的 Profile）那一行的 `strict` 去掉并重载——本地文件生效时 `strict` 取它那一行的。只有一行的本地文件没有第二条路：`strict` 是副本那一行说的，使用者换一份 Profile 启动。
+   - 被拒的入口是四个：`dial`、UDP 流的打开、`dial_internal`、`dial_internal_udp`。UDP 以"失败"而不是"拒绝"结束：失败的流 5 秒后重试，暂停一结束目标就恢复，被拒绝的流要等客户端停下来 60 秒才放手（P22）。
+10. **`settle`（细化 7.3）**：除了没有内容的来源，还等到了期的 `strict` 来源（否则启动时判断不了要不要暂停）与等待期间新登记的来源；到期而不是 `strict` 的不等；返回之前把留着的候选再判一次（P17）。
+11. **启动时的引导（订正 7.5）**：
+    - 位置仍在日志之前，但先建数据目录、拿数据目录的实例锁——下载要写缓存，不能与另一个实例同时写——，这把锁沿用到进程结束；开始时往标准错误写一行。引导之后仍加载不了、与 `--log-file` 打不开的两条退出，共用"拿到锁之后"的那一半崩溃恢复：原来的函数自己去拿锁，同一个进程拿不到第二把（P18）。
+    - 要不要引导由 `boot_need` 定。有没拿到内容的来源或到期的 `strict`：等一轮。有一条错误诊断的位置在下载到的文件里：把每个来源更新一遍——7.5 第 3 步对加载不了的 Profile 是直接退出，而生效的副本一旦加载不了（升级后校验变严、它引用的本地 include 被删），每次启动都死在同一份副本上，没有运行着的进程去刷新它。错误全在本地文件里的照旧以 2 退出：不拿一次更新去盖掉使用者自己的错误（P19）。
+    - 一轮什么也没改变时即结束，不空转到上限；逻辑在 `rurge-engine::profile`（`boot_need`、`ProfileSources::bootstrap`），可执行文件只接线（P20）。
+    - M5a 的监听覆盖（第 12 节第 6 条）：套覆盖的 `apply` 只对最后用来启动的那一次加载做，它失败与"加载有错误"同样处理。
+12. **其余命令（订正 7.5 的末段）**：`reload` / `stop` / `status -c` 加 `--data-dir`——它们读 Profile 是为了 `http-api`，托管配置生效时这一项在副本里；`service install` 不加载 Profile，不动（P21）。
+13. **两个端点（细化 7.6）**：`ready` 是"手里有内容"，`updatedAt` 是最近一次成功的检查（"没有变化"的应答也算）（P24）；`ApiContext.sources`（P25）；整个更新请求至多 60 秒，到时限还没结束的键是 `"timed out"`；新版本在等它提到的来源时，那个键的结果是等待的那一句；列表里 Profile 的来源排在最前；`all` 的下载同时发出，下载到的集合的重编译由注册表排队（P32）。
+14. **标签（订正 7.3）**：`managed profile (<scheme>://<host>[:port]/…)`、`remote include <key 的前 8 位> (<scheme>://<host>[:port]/…)`。序号随 Profile 的改动而变，而一个条目的标签在它登记时就定了；`key` 的前 8 位不变，也对得上 `/v1/external_resources` 里的那一项。
+15. **`[Rule]` 里几条 `FINAL`（新增，M5-D22；订正 M2 设计 4.2 与 6.5）**：手册 `rules/final.html`："A FINAL rule always matches, so any rules written below it never take effect. If several enabled FINAL rules are present, the last one is the effective one."；`profile/format.html`："In the `[Rule]` section, a `FINAL` rule immediately terminates rule matching. Rules included or defined after it are never evaluated, so check the position of `FINAL` in both the main profile and the included files."。rurge 原先只照"最后一条生效"读：编译到最后一条 `FINAL`、跳过此前的每一条、它们之间的规则照常评估。改为：匹配在第一条启用的 `FINAL` 处结束（`Config::first_final`），策略与选项取最后一条的（`effective_final`，不变）；`W0019` 从第一条 `FINAL` 起数，`W0021` 的文本改为 `this FINAL does not give the policy; the last FINAL rule does`。排在远程 include 之前做：把一整份托管配置的 `[Rule]` include 进本地的 `[Rule]`（手册的 Linked Profiles）正是带来第二条 `FINAL` 的写法。只有带两条或更多启用的 `FINAL`、且之间夹着规则的 Profile 受影响（P28）。
+16. **集合文件里没有用上的行（新增，M5-D24）**：规则集文件里带未知参数的行按集合计数（`ParsedSet.unknown_params`、`SetStatus.unknown_params`），建注册表时一条 `W0003`、说集合与第一处的行号、不引用参数；启动之后载入的集合，三个数（`skipped`、`truncated`、`unknown_params`）不全为零且与上一次不同时一行 WARN；`SetStatus.key` 把集合的状态接到 `/v1/external_resources` 的那一项上。同一个注册表的重编译由一把异步锁排队（P30 ～ P32）。集合文件里的要求指令仍不是指令：手册的两页说的都是 Profile 的行。
+17. **API 的连接收尾（新增，M5-D23）**：`rurge-api` 用自己的 `axum::serve::Listener`（`Lingering`），它交出的连接（`Closing`）被丢掉时由一个被跟踪的任务关写端、读掉晚到的字节（至多 1 秒、256 KiB；同时至多 64 条，满了的当场关）、再关；`serve` 的 future 等这些任务结束才完成，守护进程本来就在退出的宽限里等它。对端地址改由本 crate 的 `Peer` 带给鉴权一层（axum 只为 `TcpListener` 实现了 `ConnectInfo<SocketAddr>`）。请求怎样被读、鉴权与应答不变（P29）。
+18. **需求复读（新增，M5-D25）**：阶段 1 的每一条功能需求逐句对着手册的原句、代码与一条会因它而红的用例读一遍，产出 `docs/acceptance/phase1-acceptance.md`；小的缺口当场补，要设计的登记；"阶段 1 功能齐备"写不写由它的结论定（P33）。
+19. **任务（订正第 11 节）**：M5b 是 14 个任务（0 ～ 13）——`FINAL`；资源管理器两个（种类、状态与磁盘上的副本；检查、可等待的更新、采用与撤销）、加载器两个、引擎的暂停、`ProfileSources` 两个（跟踪；判定与引导）、可执行文件、两个端点；集合文件里没有用上的行；API 的连接收尾；需求复读；文档（P27）。
