@@ -2233,7 +2233,12 @@ mod run {
         let daemon = tokio::task::spawn_blocking({
             let conf = conf.clone();
             let data = dir.path().join("data");
-            move || spawn_daemon(&conf, &data)
+            move || {
+                let daemon = spawn_daemon(&conf, &data);
+                // the handlers for the signals are in place once this line is printed
+                wait_for_line(&daemon, "rurge ");
+                daemon
+            }
         })
         .await
         .unwrap();
