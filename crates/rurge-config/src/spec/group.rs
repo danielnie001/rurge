@@ -207,20 +207,21 @@ impl<'a> Reader<'a> {
     }
 
     fn error(&mut self, code: &'static str, message: String) {
-        self.report(code, message, codes::hint(code));
+        let error = self.failure(code, message);
+        self.diags.push(error);
     }
 
     /// `error`, with a hint of the place's own where the code's default does
     /// not fit it.
     fn error_with_hint(&mut self, code: &'static str, message: String, hint: &'static str) {
-        self.report(code, message, Some(hint));
+        let error = self.failure(code, message).with_hint(hint);
+        self.diags.push(error);
     }
 
-    fn report(&mut self, code: &'static str, message: String, hint: Option<&'static str>) {
+    /// An error of this group, with the default hint of its code.
+    fn failure(&self, code: &'static str, message: String) -> Diagnostic {
         let message = format!("{}: {message}", named("policy group", &self.group.name));
-        let mut error = Diagnostic::error(code, message).at(self.group.span.clone());
-        error.hint = hint;
-        self.diags.push(error);
+        Diagnostic::error(code, message).at(self.group.span.clone())
     }
 
     fn warn(&mut self, code: &'static str, message: String) {
