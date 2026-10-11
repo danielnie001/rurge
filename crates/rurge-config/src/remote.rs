@@ -115,21 +115,21 @@ impl RemoteRef {
 /// a managed profile and from the includes of the text in effect, and what the
 /// wrapped source reads can change in between (a download lands on the disk):
 /// a load must read one text for an address.
-pub(crate) struct Once<'a> {
+pub(crate) struct Memo<'a> {
     source: &'a dyn RemoteSource,
     answers: Mutex<HashMap<Url, Remote>>,
 }
 
-impl<'a> Once<'a> {
-    pub(crate) fn new(source: &'a dyn RemoteSource) -> Once<'a> {
-        Once {
+impl<'a> Memo<'a> {
+    pub(crate) fn new(source: &'a dyn RemoteSource) -> Memo<'a> {
+        Memo {
             source,
             answers: Mutex::new(HashMap::new()),
         }
     }
 }
 
-impl RemoteSource for Once<'_> {
+impl RemoteSource for Memo<'_> {
     fn get(&self, url: &Url) -> Remote {
         let mut answers = self.answers.lock().unwrap_or_else(PoisonError::into_inner);
         answers
@@ -177,6 +177,13 @@ pub(crate) mod fake {
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Mutex;
+
+    /// An instant `n` hours after one well in the past: the tests give a copy
+    /// its time and a local file its modification time hours apart, never
+    /// "now" against "now".
+    pub(crate) fn hours(n: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + n * 3600)
+    }
 
     /// A source that answers from a table, and remembers what it was asked.
     #[derive(Default)]
@@ -303,9 +310,9 @@ mod tests {
         }
     }
 
-    /// What `once` has for `url`, as a word: the reason or the text.
-    fn said(once: &Once<'_>, url: &Url) -> String {
-        match once.get(url) {
+    /// What `memo` has for `url`, as a word: the reason or the text.
+    fn said(memo: &Memo<'_>, url: &Url) -> String {
+        match memo.get(url) {
             Remote::Missing { why } => why.unwrap_or_default(),
             Remote::Text { text, .. } => text,
         }
@@ -315,15 +322,15 @@ mod tests {
     /// for, and the source is asked once for each: an answer that said nothing
     /// is as good as any other.
     #[test]
-    fn a_source_wrapped_in_once_answers_the_same_for_the_rest_of_its_life() {
+    fn a_source_behind_a_memo_answers_the_same_for_the_rest_of_its_life() {
         let source = Changing(Default::default());
-        let once = Once::new(&source);
+        let memo = Memo::new(&source);
         let a = Url::parse("https://example.com/a.conf").unwrap();
         let b = Url::parse("https://example.com/b.conf").unwrap();
-        assert_eq!(said(&once, &a), "not yet");
-        assert_eq!(said(&once, &b), "answer 1");
-        assert_eq!(said(&once, &a), "not yet");
-        assert_eq!(said(&once, &b), "answer 1");
+        assert_eq!(said(&memo, &a), "not yet");
+        assert_eq!(said(&memo, &b), "answer 1");
+        assert_eq!(said(&memo, &a), "not yet");
+        assert_eq!(said(&memo, &b), "answer 1");
         assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 

@@ -448,6 +448,7 @@ pub(crate) fn choose(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::fake::hours;
     use crate::text::{Origin, parse_str};
     use std::path::Path;
     use std::sync::Arc;
@@ -468,11 +469,6 @@ mod tests {
             Origin::Main,
         );
         find(&p.header, &mut Diagnostics::default()).expect("a line")
-    }
-
-    /// `n` hours after one well in the past.
-    fn hours(n: u64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + n * 3600)
     }
 
     fn downloaded_at(fetched: SystemTime) -> crate::remote::fake::Fake {

@@ -963,11 +963,7 @@ impl RemoteSource for Downloaded {
 }
 
 fn downloaded(text: String, n: u32) -> Remote {
-    Remote::Text {
-        text,
-        path: PathBuf::from(format!("/cache/{n}.conf")),
-        fetched_at: SystemTime::UNIX_EPOCH,
-    }
+    copy_at(text, n, SystemTime::UNIX_EPOCH)
 }
 
 /// The link of a remote include is a credential as a whole: its user name,
@@ -1062,7 +1058,7 @@ fn a_remote_include_shows_nothing_of_its_link_or_its_text() {
     assert!(format!("{:?}", LoadOptions::for_tests()).contains("remote: None"));
 }
 
-/// A copy of the managed profile, downloaded at `at`.
+/// A text that was downloaded at `at`, kept in a file of its own.
 fn copy_at(text: String, n: u32, at: SystemTime) -> Remote {
     Remote::Text {
         text,

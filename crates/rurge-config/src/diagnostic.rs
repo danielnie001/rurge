@@ -225,7 +225,9 @@ pub mod codes {
     /// A FINAL before the last one: matching ends at it all the same, but the
     /// policy and the options are the last FINAL's.
     pub const W_DUPLICATE_FINAL: &str = "W0021";
-    /// External set resource has no data yet (never downloaded, or failed without cache).
+    /// Something the profile names by a URL has no data yet (never downloaded,
+    /// or failed without a cache): a set, the text of a remote include, a
+    /// managed profile.
     pub const W_RESOURCE_UNAVAILABLE: &str = "W0022";
     /// A set file or a `policy-path` subscription contained lines that were
     /// skipped, or a group had to leave a member out.

@@ -10,7 +10,7 @@ use crate::policy::{
     Builtin, GroupKind, PolicyGroup, PolicyKind, ProxyPolicy, is_name, named, parse_group,
     parse_policy, quoted_name, shown_members,
 };
-use crate::remote::{Once, RemoteRef, RemoteSource};
+use crate::remote::{Memo, RemoteRef, RemoteRole, RemoteSource};
 use crate::requirement::{self, Environment};
 use crate::rule::{
     ParseCtx, PolicyRef, ResourceRef, Rule, RuleKind, SubRule, parse_rule, parse_subrule,
@@ -432,7 +432,7 @@ pub fn load(path: &Path, opts: &LoadOptions) -> Result<Loaded, LoadError> {
     };
     // an address gets one answer in this load, whoever asks: the walk or an
     // include of the text that comes out of it
-    let source = Once::new(source);
+    let source = Memo::new(source);
     let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
     let choice = managed::choose(&line, !profile.sections.is_empty(), modified, &source);
     // A copy is the profile while it is in effect, and the local file is not:
@@ -1299,10 +1299,23 @@ fn validate(
     match config.first_final().zip(config.effective_final()) {
         None => {
             let span = config.rules.last().map(|r| r.span.clone());
-            let d = Diagnostic::error(
+            let mut d = Diagnostic::error(
                 codes::E_MISSING_FINAL,
                 "the [Rule] section must end with an enabled FINAL rule",
             );
+            // A profile that is only the line naming its managed profile has
+            // nothing to add a rule to: a rule written into it would make the
+            // local file the text in effect.
+            let awaited = config
+                .source
+                .remote
+                .iter()
+                .any(|r| r.role == RemoteRole::Managed && !r.found());
+            if config.rules.is_empty() && awaited {
+                d = d.with_hint(
+                    "the rules come with the managed profile, which has not been downloaded yet",
+                );
+            }
             diags.push(match span {
                 Some(s) => d.at(s),
                 None => d,
@@ -1535,8 +1548,7 @@ fn own_listener(general: &General, port: u16) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote::RemoteRole;
-    use crate::remote::fake::Fake;
+    use crate::remote::fake::{Fake, hours};
     use std::path::Path;
     use std::time::{Duration, SystemTime};
     use url::Url;
@@ -3947,13 +3959,6 @@ RULE-SET,LAN,DIRECT\nDOMAIN-SET,LAN,REJECT\nRULE-SET,X,DIRECT\nDOMAIN-SET,X,REJE
     const NO_WAY_OUT: &str = "the #!MANAGED-CONFIG lines of the downloaded profiles lead through too many addresses; the last copy found is in effect";
     const NO_WAY_OUT_HINT: &str = "write the address the profile is finally served from into the #!MANAGED-CONFIG line of the local file";
 
-    /// An instant `n` hours after one well in the past: the tests give the
-    /// copy its time and the local file its modification time hours apart,
-    /// never "now" against "now".
-    fn hours(n: u64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + n * 3600)
-    }
-
     fn managed_line(url: &str, interval: u64, strict: bool) -> String {
         format!("#!MANAGED-CONFIG {url} interval={interval} strict={strict}")
     }
@@ -4141,7 +4146,8 @@ RULE-SET,LAN,DIRECT\nDOMAIN-SET,LAN,REJECT\nRULE-SET,X,DIRECT\nDOMAIN-SET,X,REJE
 
     /// A local file that is only the line pointing to the managed profile is a
     /// profile without rules until something is downloaded: it says that, and
-    /// that nothing was.
+    /// that nothing was. It does not say to add a rule: a rule written into the
+    /// file would make the file the profile.
     #[test]
     fn a_pointer_that_has_not_been_downloaded_yet_is_a_profile_without_rules() {
         let fake = Arc::new(Fake::new().missing(MANAGED, Some("connection refused")));
@@ -4179,6 +4185,27 @@ RULE-SET,LAN,DIRECT\nDOMAIN-SET,LAN,REJECT\nRULE-SET,X,DIRECT\nDOMAIN-SET,X,REJE
             ]
         );
         assert!(l.config.rules.is_empty());
+        assert_eq!(
+            hint_of(&l, codes::E_MISSING_FINAL),
+            [Some(
+                "the rules come with the managed profile, which has not been downloaded yet"
+            )]
+        );
+        // a local file with rules of its own that lack the last one is told to
+        // add it, waiting for a download or not
+        let l = load_modified(
+            dir.path(),
+            &format!(
+                "{}\n[Rule]\nDOMAIN,local.example,DIRECT\n",
+                managed_line(MANAGED, 3600, false)
+            ),
+            Some(hours(5)),
+            &fake,
+        );
+        assert_eq!(
+            hint_of(&l, codes::E_MISSING_FINAL),
+            [codes::hint(codes::E_MISSING_FINAL)]
+        );
     }
 
     /// The copy is the profile once it is newer than the local file: its rules,
@@ -4516,6 +4543,29 @@ RULE-SET,LAN,DIRECT\nDOMAIN-SET,LAN,REJECT\nRULE-SET,X,DIRECT\nDOMAIN-SET,X,REJE
             tracked(&l),
             [on_the_way(MANAGED), updated(MOVED, true, 3600, false),]
         );
+    }
+
+    /// The newest copy on the way is not always the last one: the address the
+    /// local file names can have been checked again after the profile moved on.
+    /// A local file changed before that check is older than the last update,
+    /// though it is newer than the copy that is in effect.
+    #[test]
+    fn the_newest_copy_on_the_way_need_not_be_the_last_one() {
+        let fake = Arc::new(
+            Fake::new()
+                .text(MANAGED, &copy_profile(&managed_line(MOVED, 7200, true)))
+                .fetched(MANAGED, hours(8))
+                .text(MOVED, &copy_profile(&managed_line(MOVED, 1800, true)))
+                .fetched(MOVED, hours(2)),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let local = local_profile(&managed_line(MANAGED, 3600, false));
+        // newer than the last copy and older than the first: a copy is
+        let l = load_modified(dir.path(), &local, Some(hours(5)), &fake);
+        assert_eq!(rules_of(&l), COPY_RULES);
+        // newer than both
+        let l = load_modified(dir.path(), &local, Some(hours(10)), &fake);
+        assert_eq!(rules_of(&l), LOCAL_RULES);
     }
 
     /// The local file edited after the last update stays the profile whatever
