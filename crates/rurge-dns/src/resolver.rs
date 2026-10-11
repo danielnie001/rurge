@@ -21,7 +21,9 @@ use rurge_config::{Config, Diagnostic, Diagnostics, codes};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{Connector, Resolve, Via};
 use rurge_net::http::{HttpClient, HttpClientConfig, tls_client_config};
-use rurge_net::resource::{ResourceManager, ResourceSource, ResourceSpec, ResourceState};
+use rurge_net::resource::{
+    ResourceKind, ResourceManager, ResourceSource, ResourceSpec, ResourceState,
+};
 use rurge_rules::engine::{LazyResolver, ResolveError};
 use rurge_rules::matcher::ResolvedAddrs;
 use rurge_rules::registry::SetRegistry;
@@ -932,6 +934,7 @@ impl Resolver {
         let handle = resources.get(&ResourceSpec {
             source: ResourceSource::File(path.clone()),
             update_interval: None,
+            kind: ResourceKind::System,
         });
         // Subscribe before the first read: `watch::Sender::subscribe` marks the
         // current version as seen, so subscribing afterwards would swallow a
@@ -2058,6 +2061,27 @@ https://dns.example/dns-query"
             assert!(Instant::now() < deadline, "hosts file change not picked up");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// The manager knows the hosts file for what it is: something the system
+    /// keeps.
+    #[tokio::test]
+    async fn the_hosts_file_is_a_system_resource() {
+        let mock = MockDns::spawn().await;
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts");
+        std::fs::write(&hosts_path, "10.40.0.1 nas.lan\n").unwrap();
+        let e = env(&profile(&format!("dns-server = {}", mock.addr()), ""));
+        let sys = StaticSystemDns {
+            hosts_path: Some(hosts_path.clone()),
+            ..StaticSystemDns::default()
+        };
+        let (_resolver, _) = resolver(&e, sys);
+        let statuses = e.resources.statuses();
+        assert_eq!(statuses.len(), 1, "{statuses:?}");
+        assert_eq!(statuses[0].source, ResourceSource::File(hosts_path));
+        assert_eq!(statuses[0].kind, ResourceKind::System);
+        assert!(statuses[0].local && statuses[0].ready, "{statuses:?}");
     }
 
     #[tokio::test]

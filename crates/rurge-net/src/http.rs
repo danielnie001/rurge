@@ -387,10 +387,9 @@ impl HttpClient {
         opts: &RequestOpts,
     ) -> Result<Request<Full<Bytes>>, HttpError> {
         if url.scheme() != "http" && url.scheme() != "https" {
-            return Err(HttpError::InvalidUrl(format!(
-                "unsupported scheme `{}`",
-                url.scheme()
-            )));
+            // Not quoted: after a redirect the URL is the server's, not the
+            // caller's
+            return Err(HttpError::InvalidUrl("unsupported scheme".to_string()));
         }
         let uri: Uri = url
             .as_str()

@@ -12,7 +12,7 @@ use crate::set_format::{ParsedSet, SetKind, SetLine, internal_set_text, parse_se
 use rurge_config::rule::{InternalSet, ParseCtx, ResourceRef, RuleKind, SubRule};
 use rurge_config::{Config, Diagnostic, Diagnostics, HostKey, codes};
 use rurge_net::resource::{
-    ResourceHandle, ResourceManager, ResourceSource, ResourceSpec, ResourceState,
+    ResourceHandle, ResourceKind, ResourceManager, ResourceSource, ResourceSpec, ResourceState,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -452,6 +452,10 @@ impl SetRegistry {
         let resource = self.resources.get(&ResourceSpec {
             source,
             update_interval,
+            kind: match kind {
+                SetKind::RuleSet => ResourceKind::RuleSet,
+                SetKind::DomainSet => ResourceKind::DomainSet,
+            },
         });
         // Subscribe before the first `resource.current()` read below: a
         // `watch` receiver only observes changes published *after* it
@@ -873,6 +877,41 @@ IP-CIDR,10.0.0.0/8,no-resolve # lan
         let (reg2, diags2) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
         assert!(diags2.is_empty(), "{:?}", codes_of(&diags2));
         assert_eq!(reg2.statuses()[0].state, "ok");
+    }
+
+    /// The manager knows each external set for what it is, which the rule
+    /// that names it says.
+    #[tokio::test]
+    async fn external_sets_are_registered_with_their_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/rules.list", "DOMAIN,a.com\n");
+        server.set("/domains.txt", ".b.com\n");
+        let cfg = load(
+            &format!(
+                "[Proxy]\nP = direct\n[Rule]\nRULE-SET,{},P\nDOMAIN-SET,{},P\nFINAL,DIRECT\n",
+                server.url("/rules.list"),
+                server.url("/domains.txt")
+            ),
+            dir.path(),
+        );
+        let mgr = manager(dir.path());
+        let (_reg, _) = SetRegistry::build(&cfg, mgr.clone(), dir.path());
+        let kinds: Vec<(String, ResourceKind)> = mgr
+            .statuses()
+            .into_iter()
+            .map(|s| match s.source {
+                ResourceSource::Url(url) => (url.path().to_string(), s.kind),
+                ResourceSource::File(file) => panic!("a file: {}", file.display()),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("/domains.txt".to_string(), ResourceKind::DomainSet),
+                ("/rules.list".to_string(), ResourceKind::RuleSet),
+            ]
+        );
     }
 
     /// A set is named by its URL in the diagnostics and the log lines, in the

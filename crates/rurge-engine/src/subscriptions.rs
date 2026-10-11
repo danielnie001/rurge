@@ -8,7 +8,9 @@ use crate::runtime::Runtime;
 use rurge_config::config::{LoadError, LoadOptions, Loaded};
 use rurge_config::spec::PolicyPath;
 use rurge_config::{Config, Diagnostics};
-use rurge_net::resource::{ResourceHandle, ResourceManager, ResourceSource, ResourceSpec};
+use rurge_net::resource::{
+    ResourceHandle, ResourceKind, ResourceManager, ResourceSource, ResourceSpec,
+};
 use rurge_policy::{PolicyRegistry, Snapshots, assemble, subscription};
 use std::collections::HashSet;
 use std::future::Future;
@@ -82,6 +84,7 @@ impl Subscriptions {
             let spec = ResourceSpec {
                 source: source_of(&s.path),
                 update_interval: s.interval,
+                kind: ResourceKind::PolicyGroup,
             };
             let handle = resources.get_labelled(&spec, &s.label);
             receivers.push(handle.subscribe());

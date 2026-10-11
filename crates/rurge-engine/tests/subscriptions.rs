@@ -8,6 +8,7 @@ use rurge_config::rule::PolicyRef;
 use rurge_config::session::SessionInfo;
 use rurge_engine::{EmptyGroup, check_profile};
 use rurge_inbound::{DialError, Dialer};
+use rurge_net::resource::{ResourceKind, ResourceSource};
 
 /// Like `common::wait_until`, with room for a file watcher's or a refresh
 /// interval's delay plus the rebuild's own pause.
@@ -99,6 +100,45 @@ async fn a_subscription_file_is_in_from_the_first_generation() {
     .text(dns.addr());
     let engine = Engine::new(runtime(dir.path(), &text, EngineShared::default()).await);
     assert_eq!(engine.registry().members("Sub").unwrap(), ["N1", "N2"]);
+}
+
+/// The resource manager knows a `policy-path` for what it is, whether it is
+/// a file or a URL, and calls it after the first group that names it.
+#[tokio::test]
+async fn a_policy_path_is_a_policy_group_resource() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("nodes.txt"), "N1 = http, n1.test, 80\n").unwrap();
+    let dns = MockDns::spawn().await;
+    let text = Profile {
+        groups: "Local = select, policy-path=nodes.txt\n\
+Remote = select, policy-path=https://sub.example/nodes?token=t0k3n",
+        ..Profile::default()
+    }
+    .text(dns.addr());
+    let engine = Engine::new(runtime(dir.path(), &text, EngineShared::default()).await);
+    // listed by their sources, the file's first
+    let statuses = engine.runtime().stack.resources.statuses();
+    let seen: Vec<(bool, ResourceKind, Option<&str>)> = statuses
+        .iter()
+        .map(|s| (s.local, s.kind, s.label.as_deref()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (
+                true,
+                ResourceKind::PolicyGroup,
+                Some("policy-path of `Local`")
+            ),
+            (
+                false,
+                ResourceKind::PolicyGroup,
+                Some("policy-path of `Remote`")
+            ),
+        ],
+        "{statuses:?}"
+    );
+    assert!(matches!(statuses[1].source, ResourceSource::Url(_)));
 }
 
 /// An edit of the file rebuilds the registry alone: the members follow, and

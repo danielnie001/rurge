@@ -5,6 +5,8 @@ mod cache;
 mod fetch;
 mod local;
 
+#[cfg(any(test, feature = "testing"))]
+pub(crate) use cache::CacheDir;
 pub use cache::Meta;
 
 use crate::http::HttpClient;
@@ -14,12 +16,33 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, watch};
 use url::Url;
 
 pub const DEFAULT_UPDATE_INTERVAL: i64 = 86_400;
+
+/// What a resource is for. The first registration of a source fixes it, as it
+/// fixes the label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ResourceKind {
+    /// A rule set a `RULE-SET` rule names.
+    RuleSet,
+    /// A domain set a `DOMAIN-SET` rule or a `[Host]` key names.
+    DomainSet,
+    /// The `policy-path` of a policy group: a subscription.
+    PolicyGroup,
+    /// A GeoIP or ASN database.
+    GeoIp,
+    /// A profile that is kept up to date from a URL.
+    Profile,
+    /// A file a profile includes from a URL.
+    Include,
+    /// What the system keeps and rurge only watches: the hosts file.
+    System,
+}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum ResourceSource {
@@ -78,6 +101,7 @@ impl fmt::Display for ResourceSource {
 pub struct ResourceSpec {
     pub source: ResourceSource,
     pub update_interval: Option<i64>,
+    pub kind: ResourceKind,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +112,10 @@ pub struct ResourceOptions {
     pub max_backoff: Duration,
     pub debounce: Duration,
     pub max_size: u64,
+    /// The spread of the refresh times goes only later, never earlier than the
+    /// interval: for a resource whose interval is the shortest time before an
+    /// update may be triggered.
+    pub never_early: bool,
 }
 
 impl Default for ResourceOptions {
@@ -99,6 +127,7 @@ impl Default for ResourceOptions {
             max_backoff: Duration::from_secs(3600),
             debounce: Duration::from_millis(500),
             max_size: 64 * 1024 * 1024,
+            never_early: false,
         }
     }
 }
@@ -179,31 +208,84 @@ pub struct ResourceStatus {
     pub source: ResourceSource,
     pub state: &'static str,
     pub version: u64,
+    /// The last successful download or "not modified" answer, also while the
+    /// resource is `failed` and keeps the copy it had. `None` for a resource
+    /// that never had one, and for a file that cannot be read any more: the
+    /// manager does not keep the time it last read it.
     pub fetched_at: Option<SystemTime>,
     pub next_refresh: Option<SystemTime>,
     pub last_error: Option<String>,
+    pub kind: ResourceKind,
+    pub label: Option<String>,
+    /// `resource_key` of the source.
+    pub key: String,
+    /// The source is a file on this machine.
+    pub local: bool,
+    /// The manager has a copy to give: the resource is `available`, or
+    /// `failed` and keeps the copy it had.
+    pub ready: bool,
+    /// A download is under way.
+    pub updating: bool,
+}
+
+impl ResourceStatus {
+    /// The name the resource goes by outside the manager, as the log lines
+    /// call it: its label, else its source with the user name and the
+    /// password of a URL left out.
+    pub fn shown(&self) -> String {
+        shown_as(self.label.as_deref(), &self.source)
+    }
+}
+
+/// How a resource is called wherever it is shown, in a log line or in its
+/// status: its label, else its source (a URL without its user name and its
+/// password).
+fn shown_as(label: Option<&str>, source: &ResourceSource) -> String {
+    label.map_or_else(|| source.shown(), str::to_string)
+}
+
+/// `source.key()` hashed with SHA-256, in 64 lower-case hex digits. For a URL
+/// it names the directory of the resource's cache.
+pub fn resource_key(source: &ResourceSource) -> String {
+    cache::name_of(&source.key())
 }
 
 struct Entry {
     source: ResourceSource,
+    kind: ResourceKind,
     /// What log lines call the resource instead of its URL (`get_labelled`).
     label: Mutex<Option<String>>,
     state: Mutex<ResourceState>,
     meta: Mutex<Option<Meta>>,
     interval: Mutex<Option<i64>>,
     next_refresh: Mutex<Option<SystemTime>>,
+    updating: AtomicBool,
     tx: watch::Sender<u64>,
     kick: Notify,
+}
+
+/// Marks an entry as being downloaded while it lives, so that an attempt that
+/// is dropped half-way leaves nothing that claims to be downloading for good.
+struct Updating<'a>(&'a AtomicBool);
+
+impl<'a> Updating<'a> {
+    fn begin(flag: &'a AtomicBool) -> Updating<'a> {
+        flag.store(true, Ordering::Release);
+        Updating(flag)
+    }
+}
+
+impl Drop for Updating<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl Entry {
     /// What log lines call this resource: its label, else its source (a URL
     /// without its user name and its password).
     fn log_name(&self) -> String {
-        match &*self.label.lock().expect("label") {
-            Some(label) => label.clone(),
-            None => self.source.shown(),
-        }
+        shown_as(self.label.lock().expect("label").as_deref(), &self.source)
     }
 
     fn version(&self) -> u64 {
@@ -272,12 +354,6 @@ pub struct ResourceManager {
     gone: watch::Sender<()>,
 }
 
-fn unix(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 fn is_stale(fetched_at: SystemTime, interval: i64) -> bool {
     if interval < 0 {
         return false;
@@ -303,16 +379,27 @@ fn merge_interval(entry: &Entry, new: Option<i64>) {
     }
 }
 
-/// ±10 % from a time-derived seed, so refreshes of many resources spread out.
-fn jitter(d: Duration) -> Duration {
-    let nanos = SystemTime::now()
+/// The seed of `jitter`: the clock's nanoseconds, which differ from one
+/// resource to the next.
+fn clock_seed() -> u32 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|x| x.subsec_nanos())
-        .unwrap_or(0);
-    let pct = i64::from(nanos % 21) - 10;
-    let millis = i64::try_from(d.as_millis()).unwrap_or(i64::MAX);
-    let adjusted = millis.saturating_add(millis / 100 * pct).max(0);
-    Duration::from_millis(u64::try_from(adjusted).unwrap_or(0))
+        .unwrap_or(0)
+}
+
+/// `d` spread by ±10 %, so refreshes of many resources spread out, or with
+/// `never_early` by 0 ~ +10 %. Any `seed` will do: it picks one of 21 shares.
+fn jitter(d: Duration, seed: u32, never_early: bool) -> Duration {
+    let share = seed % 21;
+    let one_percent = d / 100;
+    if never_early {
+        d.saturating_add(one_percent.saturating_mul(share / 2))
+    } else if share >= 10 {
+        d.saturating_add(one_percent.saturating_mul(share - 10))
+    } else {
+        d.saturating_sub(one_percent.saturating_mul(10 - share))
+    }
 }
 
 /// What `get` would start a resource with, read without a manager and
@@ -325,6 +412,40 @@ pub fn cached(root: &Path, source: &ResourceSource) -> Option<Bytes> {
             .map(|(data, _)| data),
         ResourceSource::File(path) => std::fs::read(path).ok().map(Bytes::from),
     }
+}
+
+/// The cache of a URL as it lies on disk.
+pub struct CachedCopy {
+    pub data: Bytes,
+    /// The file the body is in: `<root>/resources/<key>/data`.
+    pub path: PathBuf,
+    /// When the copy was last checked successfully, to the nanosecond.
+    pub fetched_at: SystemTime,
+}
+
+/// The body by its length, as `ResourceState` shows it: it can hold
+/// credentials.
+impl fmt::Debug for CachedCopy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CachedCopy")
+            .field("data", &format!("{} bytes", self.data.len()))
+            .field("path", &self.path)
+            .field("fetched_at", &self.fetched_at)
+            .finish()
+    }
+}
+
+/// The cache of `url` under `root`, read without a manager and without the
+/// network. `None` when one of its two files is missing or `meta.json` cannot
+/// be read.
+pub fn cached_copy(root: &Path, url: &Url) -> Option<CachedCopy> {
+    let dir = cache::CacheDir::for_url(root, url.as_str());
+    let (data, meta) = dir.load()?;
+    Some(CachedCopy {
+        data,
+        path: dir.path().join("data"),
+        fetched_at: meta.fetched_time(),
+    })
 }
 
 impl ResourceManager {
@@ -391,11 +512,13 @@ impl ResourceManager {
                 let (tx, _rx) = watch::channel(0u64);
                 let entry = Arc::new(Entry {
                     source: spec.source.clone(),
+                    kind: spec.kind,
                     label: Mutex::new(label.map(str::to_string)),
                     state: Mutex::new(ResourceState::Missing),
                     meta: Mutex::new(None),
                     interval: Mutex::new(interval),
                     next_refresh: Mutex::new(None),
+                    updating: AtomicBool::new(false),
                     tx,
                     kick: Notify::new(),
                 });
@@ -442,10 +565,21 @@ impl ResourceManager {
         let mut out: Vec<ResourceStatus> = entries
             .values()
             .map(|e| {
+                // For a resource that has failed since: the last check its
+                // cache knows of. Read before the state is locked.
+                let last_check = e
+                    .meta
+                    .lock()
+                    .expect("meta")
+                    .as_ref()
+                    .map(Meta::fetched_time);
+                let label = e.label.lock().expect("label").clone();
                 let state = e.state.lock().expect("state");
                 let (fetched_at, last_error) = match &*state {
                     ResourceState::Available { fetched_at, .. } => (Some(*fetched_at), None),
-                    ResourceState::Failed { last_error, .. } => (None, Some(last_error.clone())),
+                    ResourceState::Failed { last_error, .. } => {
+                        (last_check, Some(last_error.clone()))
+                    }
                     ResourceState::Missing => (None, None),
                 };
                 ResourceStatus {
@@ -455,6 +589,12 @@ impl ResourceManager {
                     fetched_at,
                     next_refresh: *e.next_refresh.lock().expect("next"),
                     last_error,
+                    kind: e.kind,
+                    label,
+                    key: resource_key(&e.source),
+                    local: matches!(e.source, ResourceSource::File(_)),
+                    ready: state.data().is_some(),
+                    updating: e.updating.load(Ordering::Acquire),
                 }
             })
             .collect();
@@ -480,7 +620,7 @@ impl ResourceManager {
             ResourceSource::Url(url) => {
                 let cache = cache::CacheDir::for_url(&self.root, url.as_str());
                 if let Some((data, meta)) = cache.load() {
-                    let fetched_at = UNIX_EPOCH + Duration::from_secs(meta.fetched_at);
+                    let fetched_at = meta.fetched_time();
                     let stale = is_stale(fetched_at, entry.effective_interval());
                     *entry.meta.lock().expect("meta") = Some(meta);
                     entry.set_state(ResourceState::Available {
@@ -532,7 +672,7 @@ fn next_refresh_at(due: Option<Duration>) -> Option<SystemTime> {
     due.and_then(|d| SystemTime::now().checked_add(d))
 }
 
-fn next_due(entry: &Entry, backoff: Option<Duration>) -> Option<Duration> {
+fn next_due(entry: &Entry, backoff: Option<Duration>, never_early: bool) -> Option<Duration> {
     if let Some(b) = backoff {
         return Some(b);
     }
@@ -547,8 +687,47 @@ fn next_due(entry: &Entry, backoff: Option<Duration>) -> Option<Duration> {
             }
             let interval = Duration::from_secs(interval.unsigned_abs());
             let elapsed = fetched_at.elapsed().unwrap_or(Duration::ZERO);
-            Some(jitter(interval.saturating_sub(elapsed)))
+            Some(jitter(
+                interval.saturating_sub(elapsed),
+                clock_seed(),
+                never_early,
+            ))
         }
+    }
+}
+
+/// Whether `body` is, byte for byte, what the entry holds: a copy it has
+/// fetched, or one it has kept through a failure.
+fn holds(entry: &Entry, body: &Bytes) -> bool {
+    let held = entry.state.lock().expect("state").data();
+    held.is_some_and(|(held, _)| held.as_ref() == body)
+}
+
+/// A check that found nothing new: what the entry holds is as current as now.
+/// The disk is written first, so that whoever sees the new time in memory
+/// finds it there too. `revise` changes the rest of the metadata, if the
+/// check has anything to say about it.
+fn checked(entry: &Entry, cache: &cache::CacheDir, revise: impl FnOnce(&mut Meta)) {
+    let now = SystemTime::now();
+    if let Some(m) = entry.meta.lock().expect("meta").as_mut() {
+        m.stamp(now);
+        revise(m);
+        let _ = cache.store_meta(m);
+    }
+    let mut st = entry.state.lock().expect("state");
+    if let ResourceState::Available {
+        fetched_at, stale, ..
+    } = &mut *st
+    {
+        *fetched_at = now;
+        *stale = false;
+    } else if let Some((data, version)) = st.data() {
+        *st = ResourceState::Available {
+            data,
+            version,
+            fetched_at: now,
+            stale: false,
+        };
     }
 }
 
@@ -563,7 +742,7 @@ async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>, mut gone: watc
         let client = mgr.client.clone();
         let cache = cache::CacheDir::for_url(&mgr.root, url.as_str());
         drop(mgr);
-        let due = next_due(&entry, backoff);
+        let due = next_due(&entry, backoff, opts.never_early);
         *entry.next_refresh.lock().expect("next") = next_refresh_at(due);
         // `due` is `None` only when auto-refresh is disabled (negative interval): nothing is due
         // then, but another user of the same resource may ask for auto-refresh (`merge_interval`
@@ -584,6 +763,9 @@ async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>, mut gone: watc
             continue;
         }
         let meta = entry.meta.lock().expect("meta").clone();
+        // Held until the result is recorded below, or until the attempt is
+        // dropped
+        let _updating = Updating::begin(&entry.updating);
         let fetched = fetch::fetch(
             &client,
             &url,
@@ -601,6 +783,22 @@ async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>, mut gone: watc
             fetched => Ok(fetched),
         });
         match fetched {
+            // A body that is what the entry holds is no new version: a server
+            // that sends no validators, or ones that do not hold, answers
+            // every refresh with the whole body, and nothing downstream has
+            // anything to reload. It is a check that found nothing new, and
+            // the validators it came with are the ones to send next time.
+            Ok(fetch::Fetched::New {
+                data,
+                etag,
+                last_modified,
+            }) if holds(&entry, &data) => {
+                checked(&entry, &cache, |meta| {
+                    meta.etag = etag;
+                    meta.last_modified = last_modified;
+                });
+                backoff = None;
+            }
             Ok(fetch::Fetched::New {
                 data,
                 etag,
@@ -608,12 +806,13 @@ async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>, mut gone: watc
             }) => {
                 let version = entry.version() + 1;
                 let now = SystemTime::now();
-                let new_meta = Meta {
+                let mut new_meta = Meta {
                     url: url.to_string(),
                     etag,
                     last_modified,
-                    fetched_at: unix(now),
+                    ..Meta::default()
                 };
+                new_meta.stamp(now);
                 if let Err(e) = cache.store(&data, &new_meta) {
                     tracing::warn!(resource = %entry.log_name(), error = %e, "cannot write resource cache");
                 }
@@ -629,27 +828,7 @@ async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>, mut gone: watc
                 tracing::info!(resource = %entry.log_name(), version, "resource updated");
             }
             Ok(fetch::Fetched::NotModified) => {
-                let now = SystemTime::now();
-                if let Some(m) = entry.meta.lock().expect("meta").as_mut() {
-                    m.fetched_at = unix(now);
-                    let _ = cache.store_meta(m);
-                }
-                let mut st = entry.state.lock().expect("state");
-                if let ResourceState::Available {
-                    fetched_at, stale, ..
-                } = &mut *st
-                {
-                    *fetched_at = now;
-                    *stale = false;
-                } else if let Some((data, version)) = st.data() {
-                    *st = ResourceState::Available {
-                        data,
-                        version,
-                        fetched_at: now,
-                        stale: false,
-                    };
-                }
-                drop(st);
+                checked(&entry, &cache, |_| {});
                 backoff = None;
             }
             Err(e) => {
@@ -781,6 +960,7 @@ mod tests {
             ResourceSpec {
                 source: ResourceSource::Url(url.clone()),
                 update_interval: None,
+                kind: ResourceKind::Profile,
             },
             ResourceState::Available {
                 data: body.clone(),
@@ -806,7 +986,8 @@ mod tests {
         }
     }
     use crate::http::{HttpClient, HttpClientConfig};
-    use crate::testing::TestServer;
+    use crate::testing::{Lines, TestServer, seed_cache};
+    use sha2::{Digest, Sha256};
 
     fn fast() -> ResourceOptions {
         ResourceOptions {
@@ -825,9 +1006,14 @@ mod tests {
     }
 
     fn url_spec(url: Url, interval: Option<i64>) -> ResourceSpec {
+        url_spec_of(ResourceKind::RuleSet, url, interval)
+    }
+
+    fn url_spec_of(kind: ResourceKind, url: Url, interval: Option<i64>) -> ResourceSpec {
         ResourceSpec {
             source: ResourceSource::Url(url),
             update_interval: interval,
+            kind,
         }
     }
 
@@ -1109,6 +1295,7 @@ mod tests {
         let h = mgr.get(&ResourceSpec {
             source: ResourceSource::File(file.clone()),
             update_interval: None,
+            kind: ResourceKind::RuleSet,
         });
         let s = h.current();
         assert_eq!(available_version(&s), Some(1));
@@ -1140,6 +1327,7 @@ mod tests {
         let h = mgr.get(&ResourceSpec {
             source: ResourceSource::File(root.path().join("nope.list")),
             update_interval: None,
+            kind: ResourceKind::RuleSet,
         });
         assert!(matches!(
             h.current(),
@@ -1263,11 +1451,11 @@ mod tests {
         let server = TestServer::spawn().await;
         let url = server.url("/day");
         // fresh in the cache: nothing is due for a day
-        let meta = Meta {
+        let mut meta = Meta {
             url: url.to_string(),
-            fetched_at: unix(SystemTime::now()),
             ..Meta::default()
         };
+        meta.stamp(SystemTime::now());
         cache::CacheDir::for_url(root.path(), url.as_str())
             .store(b"cached", &meta)
             .unwrap();
@@ -1387,11 +1575,11 @@ mod tests {
         let server = TestServer::spawn().await;
         let url = server.url("/parked");
         // fresh in the cache: nothing is due for a day, whatever the interval
-        let meta = Meta {
+        let mut meta = Meta {
             url: url.to_string(),
-            fetched_at: unix(SystemTime::now()),
             ..Meta::default()
         };
+        meta.stamp(SystemTime::now());
         cache::CacheDir::for_url(root.path(), url.as_str())
             .store(b"cached", &meta)
             .unwrap();
@@ -1408,5 +1596,545 @@ mod tests {
             "the task never looked at the interval again"
         );
         assert_eq!(server.hits("/parked"), 0);
+    }
+
+    /// Waits, for at most ten seconds, until `done`.
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn status_of(mgr: &ResourceManager, source: &ResourceSource) -> ResourceStatus {
+        mgr.statuses()
+            .into_iter()
+            .find(|s| &s.source == source)
+            .expect("a status for the source")
+    }
+
+    /// What the status says about a resource besides its state: what it is
+    /// for, what it is called, the key that names its cache, whether it is a
+    /// file, whether there is a copy to give.
+    #[tokio::test]
+    async fn the_status_says_what_a_resource_is() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/s", "sierra");
+        let url = server.url("/s");
+        let source = ResourceSource::Url(url.clone());
+        let mgr = manager(root.path(), fast());
+        let spec = url_spec_of(ResourceKind::DomainSet, url.clone(), None);
+        let h = mgr.get_labelled(&spec, "the set");
+        // nothing has run yet on this runtime
+        assert!(!status_of(&mgr, &source).ready);
+        wait_for(&h, "available", |s| available_version(s) == Some(1)).await;
+        let status = status_of(&mgr, &source);
+        assert_eq!(status.kind, ResourceKind::DomainSet);
+        assert_eq!(status.label.as_deref(), Some("the set"));
+        assert_eq!(status.shown(), "the set");
+        assert!(!status.local);
+        assert!(status.ready);
+        let digest = format!("{:x}", Sha256::digest(url.as_str().as_bytes()));
+        assert_eq!(status.key, digest);
+        assert_eq!(resource_key(&source), digest);
+        let dir = cache::CacheDir::for_url(root.path(), url.as_str());
+        assert_eq!(dir.path().file_name().unwrap(), digest.as_str());
+
+        // a file is local, and its key is that of its own `key()`
+        let file = root.path().join("local.list");
+        std::fs::write(&file, "DOMAIN,local.test").unwrap();
+        let local = ResourceSource::File(file.clone());
+        mgr.get(&ResourceSpec {
+            source: local.clone(),
+            update_interval: None,
+            kind: ResourceKind::System,
+        });
+        let status = status_of(&mgr, &local);
+        assert!(status.local && status.ready, "{status:?}");
+        assert_eq!(status.kind, ResourceKind::System);
+        assert_eq!(status.label, None);
+        assert_eq!(status.shown(), file.display().to_string());
+        assert_eq!(
+            status.key,
+            format!("{:x}", Sha256::digest(local.key().as_bytes()))
+        );
+    }
+
+    /// Without a label a URL is shown as the log lines show it: the user name
+    /// and the password are `***`.
+    #[tokio::test]
+    async fn an_unlabelled_status_is_shown_without_the_user_info() {
+        let root = tempfile::tempdir().unwrap();
+        let offline = ResourceOptions {
+            offline: true,
+            ..fast()
+        };
+        let mgr = manager(root.path(), offline);
+        let url = Url::parse("http://al1ce:S3CR3T@sets.example:8080/a.list?v=1").unwrap();
+        mgr.get(&url_spec(url, None));
+        let shown = mgr.statuses()[0].shown();
+        assert_eq!(shown, "http://***@sets.example:8080/a.list?v=1");
+        assert!(!shown.contains("S3CR3T"), "{shown}");
+        assert!(!shown.contains("al1ce"), "{shown}");
+    }
+
+    /// Two callers that register one source with different kinds share one
+    /// resource, and the first one's kind is the one it has.
+    #[tokio::test]
+    async fn the_first_registration_fixes_the_kind() {
+        let root = tempfile::tempdir().unwrap();
+        let offline = ResourceOptions {
+            offline: true,
+            ..fast()
+        };
+        let mgr = manager(root.path(), offline);
+        let url = Url::parse("https://sets.test/shared.list").unwrap();
+        let first = mgr.get(&url_spec_of(ResourceKind::RuleSet, url.clone(), None));
+        let second = mgr.get(&url_spec_of(ResourceKind::DomainSet, url.clone(), None));
+        assert!(Arc::ptr_eq(&first.entry, &second.entry));
+        let statuses = mgr.statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].kind, ResourceKind::RuleSet);
+        // and the other way round, on a source of its own
+        let other = Url::parse("https://sets.test/other.list").unwrap();
+        mgr.get(&url_spec_of(ResourceKind::DomainSet, other.clone(), None));
+        mgr.get(&url_spec_of(ResourceKind::RuleSet, other.clone(), None));
+        assert_eq!(
+            status_of(&mgr, &ResourceSource::Url(other)).kind,
+            ResourceKind::DomainSet
+        );
+    }
+
+    /// `updating` is on from the request to the recorded result.
+    #[tokio::test]
+    async fn updating_lasts_from_the_request_to_the_recorded_result() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/slow", "sloth");
+        server.set_delay("/slow", Duration::from_secs(2));
+        let source = ResourceSource::Url(server.url("/slow"));
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(server.url("/slow"), None));
+        // the task has not run yet on this runtime
+        assert!(!status_of(&mgr, &source).updating);
+        // the request is at the server, which holds the answer back
+        wait_until("the request to arrive", || server.hits("/slow") == 1).await;
+        let status = status_of(&mgr, &source);
+        assert!(status.updating, "{status:?}");
+        assert!(!status.ready, "{status:?}");
+        wait_for(&h, "available", |s| available_version(s) == Some(1)).await;
+        wait_until("the download to be over", || {
+            !status_of(&mgr, &source).updating
+        })
+        .await;
+        assert!(status_of(&mgr, &source).ready);
+    }
+
+    /// A resource that fails after it has had a copy keeps the time of its
+    /// last success and the copy; one that never had one has neither.
+    #[tokio::test]
+    async fn a_failed_resource_keeps_the_time_of_its_last_success() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/f", "foxtrot");
+        server.set("/never", "never");
+        server.set_status("/never", 500);
+        let mgr = manager(root.path(), fast());
+        let source = ResourceSource::Url(server.url("/f"));
+        let h = mgr.get(&url_spec(server.url("/f"), None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        let succeeded = status_of(&mgr, &source).fetched_at.expect("a time");
+        server.set_status("/f", 500);
+        assert!(mgr.force_update(&source));
+        wait_for(&h, "failed with a copy", |s| {
+            matches!(
+                s,
+                ResourceState::Failed {
+                    cached: Some(_),
+                    ..
+                }
+            )
+        })
+        .await;
+        let status = status_of(&mgr, &source);
+        assert_eq!(status.state, "failed");
+        assert_eq!(status.fetched_at, Some(succeeded));
+        assert!(status.ready, "{status:?}");
+        assert!(status.last_error.is_some(), "{status:?}");
+
+        let never = ResourceSource::Url(server.url("/never"));
+        let h = mgr.get(&url_spec(server.url("/never"), None));
+        wait_for(&h, "failed", |s| matches!(s, ResourceState::Failed { .. })).await;
+        let status = status_of(&mgr, &never);
+        assert_eq!(status.fetched_at, None);
+        assert!(!status.ready, "{status:?}");
+        assert!(status.last_error.is_some(), "{status:?}");
+    }
+
+    /// A "not modified" answer moves the time of the last check forward, and
+    /// the time on disk is the one in memory, to the nanosecond.
+    #[tokio::test]
+    async fn a_not_modified_moves_the_time_and_the_cache_says_the_same() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/c", "charlie");
+        let url = server.url("/c");
+        let source = ResourceSource::Url(url.clone());
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url.clone(), None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        let first = status_of(&mgr, &source).fetched_at.expect("a time");
+        assert!(mgr.force_update(&source));
+        wait_until("the check to be recorded", || {
+            status_of(&mgr, &source).fetched_at > Some(first)
+        })
+        .await;
+        let reqs = server.requests();
+        assert!(reqs[1].header("if-none-match").is_some());
+        let status = status_of(&mgr, &source);
+        let copy = cached_copy(root.path(), &url).expect("a cache");
+        assert_eq!(Some(copy.fetched_at), status.fetched_at);
+        assert_eq!(h.version(), 1);
+    }
+
+    /// A body that is what the manager holds is no new version, from a server
+    /// that cannot say whether it changed: nobody is told, nothing is logged
+    /// as an update, and the check still counts.
+    #[tokio::test]
+    async fn a_200_with_the_body_in_hand_is_not_a_new_version() {
+        let lines = Lines::default();
+        let _capturing = lines.capture();
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/u", "uniform");
+        server.set_validators("/u", false);
+        let url = server.url("/u");
+        let source = ResourceSource::Url(url.clone());
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url, None));
+        let mut rx = h.subscribe();
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        rx.borrow_and_update();
+        let first = status_of(&mgr, &source).fetched_at.expect("a time");
+        lines.forget();
+
+        assert!(mgr.force_update(&source));
+        wait_until("the check to be recorded", || {
+            status_of(&mgr, &source).fetched_at > Some(first)
+        })
+        .await;
+        assert_eq!(server.hits("/u"), 2, "the server sent the whole body again");
+        assert_eq!(h.version(), 1);
+        assert!(!rx.has_changed().unwrap(), "somebody was told");
+        assert_eq!(status_of(&mgr, &source).state, "available");
+        assert_eq!(lines.said("resource updated"), Vec::<String>::new());
+
+        // a body that differs is a new version, as before
+        server.set("/u", "different");
+        assert!(mgr.force_update(&source));
+        let s = wait_for(&h, "v2", |s| available_version(s) == Some(2)).await;
+        assert_eq!(&s.data().unwrap().0[..], b"different");
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(lines.said("resource updated").len(), 1);
+    }
+
+    /// The same after a restart: a copy an earlier run cached, from a server
+    /// that sends no validators and the same body, stays version 1.
+    #[tokio::test]
+    async fn a_copy_cached_by_an_earlier_run_is_not_replaced_by_the_same_body() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/r", "romeo");
+        server.set_validators("/r", false);
+        let url = server.url("/r");
+        let source = ResourceSource::Url(url.clone());
+        let long_ago = SystemTime::now() - Duration::from_secs(2 * 86_400);
+        seed_cache(root.path(), &url, b"romeo", long_ago);
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url.clone(), None));
+        assert_eq!(h.version(), 1);
+        // a day old: due at once
+        wait_until("the check to be recorded", || {
+            status_of(&mgr, &source).fetched_at > Some(long_ago + Duration::from_secs(86_400))
+        })
+        .await;
+        assert_eq!(server.hits("/r"), 1);
+        assert_eq!(h.version(), 1);
+        let copy = cached_copy(root.path(), &url).unwrap();
+        assert_eq!(Some(copy.fetched_at), status_of(&mgr, &source).fetched_at);
+    }
+
+    /// The validators of the answer replace the ones stored, also when the
+    /// body is the same: the next request carries the new ones.
+    #[tokio::test]
+    async fn the_validators_of_an_unchanged_200_replace_the_stored_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/v", "victor");
+        server.set_validators("/v", false);
+        let url = server.url("/v");
+        let source = ResourceSource::Url(url.clone());
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url, None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        // from now on the server names the body, but still never says 304
+        server.set_header("/v", "etag", "\"fresh\"");
+        for asked in [2, 3] {
+            let before = status_of(&mgr, &source).fetched_at;
+            assert!(mgr.force_update(&source));
+            wait_until("the check to be recorded", || {
+                server.hits("/v") == asked && status_of(&mgr, &source).fetched_at > before
+            })
+            .await;
+        }
+        let reqs = server.requests();
+        assert!(reqs[0].header("if-none-match").is_none());
+        assert!(reqs[1].header("if-none-match").is_none());
+        assert_eq!(reqs[2].header("if-none-match"), Some("\"fresh\""));
+        assert_eq!(h.version(), 1);
+    }
+
+    /// A cache written before the nanoseconds were kept reads back, as whole
+    /// seconds.
+    #[tokio::test]
+    async fn a_cache_from_before_the_nanoseconds_reads_back() {
+        let root = tempfile::tempdir().unwrap();
+        let url = Url::parse("https://sets.test/old.list").unwrap();
+        let dir = cache::CacheDir::for_url(root.path(), url.as_str());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join("data"), "old").unwrap();
+        std::fs::write(
+            dir.path().join("meta.json"),
+            r#"{"url":"https://sets.test/old.list","etag":null,"last_modified":null,"fetched_at":1700000000}"#,
+        )
+        .unwrap();
+        let then = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let copy = cached_copy(root.path(), &url).expect("a cache");
+        assert_eq!((&copy.data[..], copy.fetched_at), (&b"old"[..], then));
+        let offline = ResourceOptions {
+            offline: true,
+            ..fast()
+        };
+        let mgr = manager(root.path(), offline);
+        let h = mgr.get(&url_spec(url, None));
+        assert!(
+            matches!(h.current(), ResourceState::Available { fetched_at, .. } if fetched_at == then)
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_copy_gives_the_body_the_file_and_the_time() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/cc", "copy");
+        let url = server.url("/cc");
+        let source = ResourceSource::Url(url.clone());
+        assert!(cached_copy(root.path(), &url).is_none());
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url.clone(), None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        let copy = cached_copy(root.path(), &url).expect("a cache");
+        assert_eq!(&copy.data[..], b"copy");
+        let file = root
+            .path()
+            .join("resources")
+            .join(resource_key(&source))
+            .join("data");
+        assert_eq!(copy.path, file);
+        assert_eq!(std::fs::read(&file).unwrap(), b"copy");
+        assert_eq!(Some(copy.fetched_at), status_of(&mgr, &source).fetched_at);
+        drop(h);
+        drop(mgr);
+        // next to the body, metadata that cannot be read and none at all: no copy
+        let meta = file.with_file_name("meta.json");
+        std::fs::write(&meta, "{").unwrap();
+        assert!(cached_copy(root.path(), &url).is_none());
+        std::fs::remove_file(&meta).unwrap();
+        assert!(cached_copy(root.path(), &url).is_none());
+        // and the metadata without the body
+        let lone = Url::parse("https://sets.test/lone.list").unwrap();
+        let dir = cache::CacheDir::for_url(root.path(), lone.as_str());
+        dir.store_meta(&Meta::default()).unwrap();
+        assert!(cached_copy(root.path(), &lone).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_seeded_cache_reads_back_and_registers_as_version_one() {
+        let root = tempfile::tempdir().unwrap();
+        let url = Url::parse("https://sets.test/seeded.list").unwrap();
+        let at = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_700);
+        seed_cache(root.path(), &url, b"seeded", at);
+        let copy = cached_copy(root.path(), &url).expect("a cache");
+        assert_eq!((&copy.data[..], copy.fetched_at), (&b"seeded"[..], at));
+        let offline = ResourceOptions {
+            offline: true,
+            ..fast()
+        };
+        let mgr = manager(root.path(), offline);
+        let h = mgr.get(&url_spec(url, None));
+        assert!(
+            matches!(
+                h.current(),
+                ResourceState::Available { version: 1, fetched_at, .. } if fetched_at == at
+            ),
+            "{:?}",
+            h.current()
+        );
+    }
+
+    /// The spread of a refresh time: ±10 % by default, 0 ~ +10 % when the
+    /// interval is the shortest time before an update may happen.
+    #[test]
+    fn a_refresh_is_spread_by_ten_percent_and_never_early_only_later() {
+        let interval = Duration::from_secs(1000);
+        for seed in 0..21 {
+            let spread = jitter(interval, seed, false);
+            assert!(
+                spread >= interval * 9 / 10 && spread <= interval * 11 / 10,
+                "{seed}: {spread:?}"
+            );
+            let later = jitter(interval, seed, true);
+            assert!(
+                later >= interval && later <= interval * 11 / 10,
+                "{seed}: {later:?}"
+            );
+        }
+        // the whole range is used, and the seed wraps
+        assert_eq!(jitter(interval, 0, false), interval * 9 / 10);
+        assert_eq!(jitter(interval, 10, false), interval);
+        assert_eq!(jitter(interval, 20, false), interval * 11 / 10);
+        assert_eq!(jitter(interval, 21, false), jitter(interval, 0, false));
+        assert_eq!(jitter(interval, 0, true), interval);
+        assert_eq!(jitter(interval, 20, true), interval * 11 / 10);
+        // not even a fraction of a millisecond early
+        let odd = Duration::from_micros(1_234_567);
+        assert!((0..21).all(|seed| jitter(odd, seed, true) >= odd));
+        // nothing overflows
+        assert_eq!(jitter(Duration::MAX, 20, true), Duration::MAX);
+        assert!(jitter(Duration::ZERO, 7, false).is_zero());
+    }
+
+    /// The option reaches the timer: none of the refresh times of a resource
+    /// that was last checked a moment ago is before its interval is over.
+    #[tokio::test]
+    async fn never_early_reaches_the_refresh_timer() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        let checked = SystemTime::now();
+        let urls: Vec<Url> = (0..30).map(|n| server.url(&format!("/n{n}"))).collect();
+        for url in &urls {
+            seed_cache(root.path(), url, b"seeded", checked);
+        }
+        let opts = ResourceOptions {
+            never_early: true,
+            ..fast()
+        };
+        let mgr = manager(root.path(), opts);
+        for url in &urls {
+            mgr.get(&url_spec(url.clone(), Some(1000)));
+        }
+        wait_until("every task to schedule its refresh", || {
+            mgr.statuses().iter().all(|s| s.next_refresh.is_some())
+        })
+        .await;
+        for status in mgr.statuses() {
+            let earliest = checked + Duration::from_secs(1000);
+            assert!(
+                status.next_refresh.unwrap() >= earliest,
+                "{} is due before its interval is over",
+                status.key
+            );
+        }
+        assert_eq!(server.requests().len(), 0);
+    }
+
+    /// The URL of a profile source is a credential as a whole, and the status
+    /// and the log are read by people who must not be given it: no failure
+    /// says any part of it — user name, password, path, query — nor what a
+    /// redirect's `Location` says.
+    #[tokio::test]
+    async fn a_failure_never_quotes_the_url_it_came_from() {
+        let lines = Lines::default();
+        let _capturing = lines.capture();
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        let port = server.url("/").port().unwrap();
+        server.set("/S3CR3T/status", "x");
+        server.set_status("/S3CR3T/status", 500);
+        server.set("/S3CR3T/big", vec![b'x'; 100]);
+        server.set("/S3CR3T/slow", "x");
+        server.set_delay("/S3CR3T/slow", Duration::from_secs(5));
+        for (path, to) in [
+            ("/S3CR3T/loop", "/S3CR3T/loop?token=S3CR3T"),
+            // not a port
+            ("/S3CR3T/port", "http://S3CR3T:x/S3CR3T?token=S3CR3T"),
+            // a scheme nobody speaks, and whose name is the secret
+            ("/S3CR3T/scheme", "S3CR3T://elsewhere/S3CR3T?token=S3CR3T"),
+        ] {
+            server.set(path, "");
+            server.set_status(path, 302);
+            server.set_header(path, "location", to);
+        }
+        let opts = ResourceOptions {
+            fetch_timeout: Duration::from_secs(1),
+            max_size: 8,
+            ..fast()
+        };
+        let mgr = manager(root.path(), opts);
+        // each way a download can end badly, and what it says first
+        let cases = [
+            ("http", "/S3CR3T/missing", "http status 404"),
+            ("http", "/S3CR3T/status", "http status 500"),
+            ("http", "/S3CR3T/big", "body exceeds 8 bytes"),
+            ("http", "/S3CR3T/slow", "timeout"),
+            ("http", "/S3CR3T/loop", "too many redirects"),
+            ("http", "/S3CR3T/port", "invalid url"),
+            ("http", "/S3CR3T/scheme", "invalid url"),
+            // a server that does not speak TLS
+            ("https", "/S3CR3T/tls", "connect"),
+        ];
+        let sources: Vec<ResourceSource> = cases
+            .iter()
+            .map(|(scheme, path, _)| {
+                let url = format!("{scheme}://al1ce:S3CR3T@127.0.0.1:{port}{path}?token=S3CR3T");
+                let source = ResourceSource::Url(Url::parse(&url).unwrap());
+                let spec = ResourceSpec {
+                    source: source.clone(),
+                    update_interval: None,
+                    kind: ResourceKind::Profile,
+                };
+                mgr.get_labelled(&spec, "the profile");
+                source
+            })
+            .collect();
+        wait_until("every download to fail", || {
+            mgr.statuses().iter().all(|s| s.state == "failed")
+        })
+        .await;
+        let secret = |text: &str| {
+            let text = text.to_ascii_lowercase();
+            text.contains("s3cr3t") || text.contains("al1ce")
+        };
+        let errors: Vec<(&str, String)> = cases
+            .iter()
+            .zip(&sources)
+            .map(|((_, path, _), source)| {
+                (*path, status_of(&mgr, source).last_error.expect("an error"))
+            })
+            .collect();
+        for ((_, _, says), (path, error)) in cases.iter().zip(&errors) {
+            assert!(error.starts_with(says), "{path}: {error}");
+        }
+        let told: Vec<&(&str, String)> = errors.iter().filter(|(_, e)| secret(e)).collect();
+        assert!(told.is_empty(), "{told:#?}\nall of them: {errors:#?}");
+        let logged = lines.said("resource fetch failed");
+        assert!(logged.len() >= cases.len(), "{logged:#?}");
+        let leaked: Vec<&String> = logged.iter().filter(|line| secret(line)).collect();
+        assert!(leaked.is_empty(), "{leaked:#?}");
     }
 }

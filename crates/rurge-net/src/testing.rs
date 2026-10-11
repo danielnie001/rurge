@@ -1,6 +1,8 @@
-//! In-process HTTP(S) server for tests: programmable routes, ETag / 304,
-//! delays and request recording. Never used by production code.
+//! What tests share: an in-process HTTP(S) server (programmable routes, ETag /
+//! 304, delays and request recording), a resource cache with a copy already in
+//! it, and a capture of the log. Never used by production code.
 
+use crate::resource::{CacheDir, Meta};
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::Full;
@@ -11,9 +13,11 @@ use hyper_util::server::conn::auto;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::fmt::Debug;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
@@ -42,6 +46,9 @@ struct Route {
     status: u16,
     delay: Duration,
     headers: Vec<(String, String)>,
+    /// Whether the route sends an ETag and answers 304 to a matching
+    /// If-None-Match.
+    validators: bool,
 }
 
 #[derive(Default)]
@@ -125,6 +132,7 @@ impl TestServer {
             status: 200,
             delay: Duration::ZERO,
             headers: Vec::new(),
+            validators: true,
         });
         route.body = body.into();
     }
@@ -147,6 +155,15 @@ impl TestServer {
         }
     }
 
+    /// With `on` false the route is a server that cannot say whether a body
+    /// changed: it sends no ETag of its own and ignores If-None-Match, so
+    /// every request gets the whole body.
+    pub fn set_validators(&self, path: &str, on: bool) {
+        if let Some(r) = self.state.lock().unwrap().routes.get_mut(path) {
+            r.validators = on;
+        }
+    }
+
     pub fn requests(&self) -> Vec<RecordedRequest> {
         self.state.lock().unwrap().requests.clone()
     }
@@ -164,6 +181,87 @@ impl TestServer {
 
 fn etag_of(body: &[u8]) -> String {
     format!("\"{:x}\"", Sha256::digest(body))
+}
+
+/// Puts `data` in the cache of the resource manager under `root` as the copy
+/// of `url` that was last checked at `fetched_at`, the way a download of
+/// it would have left it.
+pub fn seed_cache(root: &Path, url: &Url, data: &[u8], fetched_at: SystemTime) {
+    let mut meta = Meta {
+        url: url.to_string(),
+        ..Meta::default()
+    };
+    meta.stamp(fetched_at);
+    CacheDir::for_url(root, url.as_str())
+        .store(data, &meta)
+        .expect("seed the cache");
+}
+
+/// The events of a test, down to INFO, one line to an event: its fields, the
+/// message among them. For tests that say what a log must not contain.
+#[derive(Clone, Default)]
+pub struct Lines(pub Arc<Mutex<Vec<String>>>);
+
+impl Lines {
+    /// Routes the events of this thread here until the guard is dropped.
+    /// While one dispatcher alone is registered, tracing-core asks only the
+    /// thread that first reaches a call site whether it is wanted: a site
+    /// another test reaches first would stay shut on this thread too. With a
+    /// second one it asks every dispatcher, which the second element of the
+    /// result is for: it is kept for as long as the guard.
+    pub fn capture(&self) -> (tracing::subscriber::DefaultGuard, tracing::Dispatch) {
+        (
+            tracing::subscriber::set_default(self.clone()),
+            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()),
+        )
+    }
+
+    /// The lines that contain `what`.
+    pub fn said(&self, what: &str) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains(what))
+            .cloned()
+            .collect()
+    }
+
+    pub fn forget(&self) {
+        self.0.lock().unwrap().clear();
+    }
+}
+
+impl tracing::Subscriber for Lines {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::INFO
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields(String);
+
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn Debug) {
+                self.0 += &format!(" {}={value:?}", field.name());
+            }
+        }
+
+        let mut fields = Fields(String::new());
+        event.record(&mut fields);
+        self.0.lock().unwrap().push(fields.0);
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
 }
 
 async fn handle(
@@ -199,7 +297,7 @@ async fn handle(
     if !route.delay.is_zero() {
         tokio::time::sleep(route.delay).await;
     }
-    let etag = etag_of(&route.body);
+    let etag = route.validators.then(|| etag_of(&route.body));
     let if_none_match = req
         .headers()
         .get("if-none-match")
@@ -208,15 +306,20 @@ async fn handle(
     for (k, v) in &route.headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
-    if route.status == 200 && if_none_match == Some(etag.as_str()) {
+    if route.status == 200
+        && let Some(etag) = &etag
+        && if_none_match == Some(etag.as_str())
+    {
         return Ok(builder
             .status(304)
-            .header("etag", etag)
+            .header("etag", etag.as_str())
             .body(Full::new(Bytes::new()))
             .unwrap());
     }
     let status = StatusCode::from_u16(route.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    if status == StatusCode::OK {
+    if status == StatusCode::OK
+        && let Some(etag) = etag
+    {
         builder = builder.header("etag", etag);
     }
     Ok(builder.status(status).body(Full::new(route.body)).unwrap())

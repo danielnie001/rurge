@@ -5,7 +5,7 @@
 use crate::geoip::{DbKind, GeoDb};
 use flate2::read::GzDecoder;
 use rurge_net::resource::{
-    ResourceHandle, ResourceManager, ResourceSource, ResourceSpec, ResourceState,
+    ResourceHandle, ResourceKind, ResourceManager, ResourceSource, ResourceSpec, ResourceState,
 };
 use std::io::Read;
 use std::sync::Arc;
@@ -68,6 +68,7 @@ impl GeoUpdater {
                 } else {
                     -1
                 }),
+                kind: ResourceKind::GeoIp,
             };
             // MaxMind's own download link carries the account's licence key:
             // the log calls the database by its file name, not by the link
@@ -168,7 +169,7 @@ mod tests {
     use rurge_net::connector::{DirectConnector, SystemResolve};
     use rurge_net::http::{HttpClient, HttpClientConfig};
     use rurge_net::resource::ResourceOptions;
-    use rurge_net::testing::TestServer;
+    use rurge_net::testing::{Lines, TestServer};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -323,43 +324,24 @@ mod tests {
         assert_eq!(server.hits("/asn"), 1);
     }
 
-    /// Keeps the fields of every event down to INFO, the message among them.
-    struct Lines(Arc<std::sync::Mutex<Vec<String>>>);
-
-    impl tracing::Subscriber for Lines {
-        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            *metadata.level() <= tracing::Level::INFO
-        }
-
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            struct Fields(String);
-
-            impl tracing::field::Visit for Fields {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    self.0 += &format!(" {}={value:?}", field.name());
-                }
-            }
-
-            let mut fields = Fields(String::new());
-            event.record(&mut fields);
-            self.0.lock().unwrap().push(fields.0);
-        }
-
-        fn enter(&self, _: &tracing::span::Id) {}
-
-        fn exit(&self, _: &tracing::span::Id) {}
+    /// Both databases are GeoIP resources, however they are named.
+    #[tokio::test]
+    async fn both_databases_are_geoip_resources() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        let (geo, _) = GeoDb::open(&root.path().join("geoip"));
+        let mgr = manager(root.path());
+        let _updater = GeoUpdater::spawn(
+            geo,
+            mgr.clone(),
+            GeoUrls {
+                country: server.url("/country"),
+                asn: server.url("/asn"),
+            },
+            true,
+        );
+        let kinds: Vec<ResourceKind> = mgr.statuses().iter().map(|s| s.kind).collect();
+        assert_eq!(kinds, [ResourceKind::GeoIp, ResourceKind::GeoIp]);
     }
 
     /// MaxMind's own download link carries the account's licence key in its
