@@ -2639,7 +2639,10 @@ mod run {
     /// reload, a change of a group's selection (which `state.json` keeps) and
     /// a stop leave both as they were. They are written the way nothing would
     /// write them back (CRLF, comments, spaces around a value, no newline at
-    /// the end), so a rewrite could not leave them as they are.
+    /// the end), so a rewrite could not leave them as they are. Their
+    /// modification times stay too: writing the bytes that are there is still
+    /// a write to the user's file, which can fail halfway and which `--watch`
+    /// takes for a change.
     #[test]
     fn run_leaves_the_profile_and_the_files_it_includes_as_they_are() {
         let dir = tempfile::tempdir().unwrap();
@@ -2671,6 +2674,8 @@ mod run {
         .join("\r\n");
         std::fs::write(&conf, &profile).unwrap();
         std::fs::write(&included, &rules).unwrap();
+        let modified = |path: &Path| std::fs::metadata(path).unwrap().modified().unwrap();
+        let (conf_modified, included_modified) = (modified(&conf), modified(&included));
         let as_written = |when: &str| {
             assert_eq!(
                 std::fs::read_to_string(&conf).unwrap(),
@@ -2681,6 +2686,16 @@ mod run {
                 std::fs::read_to_string(&included).unwrap(),
                 rules,
                 "the included file was rewritten {when}"
+            );
+            assert_eq!(
+                modified(&conf),
+                conf_modified,
+                "the profile was written to {when}"
+            );
+            assert_eq!(
+                modified(&included),
+                included_modified,
+                "the included file was written to {when}"
             );
         };
         let data = dir.path().join("data");
