@@ -31,18 +31,31 @@ pub(crate) struct Refusal {
     pub(crate) hint: &'static str,
 }
 
+/// As what a local file is taken in by a line that may include it: how it is
+/// read, and what its own lines may do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TakenIn {
+    /// As the user's own text, like the line that includes it.
+    AsOwnText,
+    /// As the downloaded copy of a managed profile is: an ordinary file of
+    /// bounded size, whose lines have the reach of the copy.
+    AsTheCopy,
+}
+
 impl Reach {
-    /// What is said when text of this reach `#!include`s the local file
-    /// `target`, if it may not. The line is ignored.
-    pub(crate) fn include_refusal(self, target: &str) -> Option<Refusal> {
+    /// Whether text of this reach may `#!include` the local file `target`,
+    /// and as what the file is then taken in; else what is said, and the line
+    /// is ignored. The one place that decides both: no reach is taken in as
+    /// the user's own text for want of a decision.
+    pub(crate) fn include(self, target: &str) -> Result<TakenIn, Refusal> {
         match self {
-            Reach::Anywhere => None,
-            Reach::BelowProfile if is_plain_relative(target) => None,
-            Reach::BelowProfile => Some(Refusal {
+            Reach::Anywhere => Ok(TakenIn::AsOwnText),
+            Reach::BelowProfile if is_plain_relative(target) => Ok(TakenIn::AsTheCopy),
+            Reach::BelowProfile => Err(Refusal {
                 message: "the downloaded copy of a managed profile (or a file it includes) can include a local file only by a relative path below the profile's directory; the line is ignored",
                 hint: "name the file by a relative path without a drive, a leading slash or `..`",
             }),
-            Reach::Nowhere => Some(Refusal {
+            Reach::Nowhere => Err(Refusal {
                 message: "a downloaded file cannot include a local file; the line is ignored",
                 hint: "include the local file from the local profile instead",
             }),
@@ -243,5 +256,30 @@ mod tests {
             refused_wrongly.is_empty() && admitted_wrongly.is_empty(),
             "refused, though plain: {refused_wrongly:?}\nadmitted, though not: {admitted_wrongly:?}"
         );
+    }
+
+    /// Only the user's own text takes a file in as the user's own; the copy of
+    /// a managed profile takes one in as the copy is, and other downloaded
+    /// text takes in none.
+    #[test]
+    fn a_file_is_taken_in_as_the_text_that_includes_it() {
+        for target in ADMITTED.iter().chain(REFUSED) {
+            assert_eq!(
+                Reach::Anywhere.include(target),
+                Ok(TakenIn::AsOwnText),
+                "{target}"
+            );
+            assert!(Reach::Nowhere.include(target).is_err(), "{target}");
+        }
+        for target in ADMITTED {
+            assert_eq!(
+                Reach::BelowProfile.include(target),
+                Ok(TakenIn::AsTheCopy),
+                "{target}"
+            );
+        }
+        for target in REFUSED {
+            assert!(Reach::BelowProfile.include(target).is_err(), "{target}");
+        }
     }
 }

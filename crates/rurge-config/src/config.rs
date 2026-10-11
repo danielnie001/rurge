@@ -630,9 +630,9 @@ pub fn from_profile(
     // Policies and groups with name registry.
     let mut names: HashMap<String, &'static str> = HashMap::new();
     let mut policies = Vec::new();
-    // `external` policies that are not started, by name, with what keeps
-    // them from it: the text they are defined in may not start a program
-    let mut unstarted_externals: HashMap<String, NotImplemented> = HashMap::new();
+    // whether the text each `external` policy is defined in may start a
+    // program: its reach, by the policy's name
+    let mut external_reach: HashMap<String, Reach> = HashMap::new();
     for (name, def, span, origin) in definition_entries(&profile, "Proxy", &mut diags) {
         match Builtin::parse(name) {
             Some(Builtin::Direct) => continue,
@@ -660,10 +660,8 @@ pub fn from_profile(
         }
         match parse_policy(name, def, span) {
             Ok(p) => {
-                if p.kind == PolicyKind::External
-                    && let Some(why) = NotImplemented::external_in(origin.reach())
-                {
-                    unstarted_externals.insert(p.name.clone(), why);
+                if p.kind == PolicyKind::External {
+                    external_reach.insert(p.name.clone(), origin.reach());
                 }
                 policies.push(p);
             }
@@ -918,7 +916,7 @@ pub fn from_profile(
         &mut config,
         base_dir,
         opts,
-        &unstarted_externals,
+        &external_reach,
         &group_reach,
         &mut diags,
     );
@@ -1209,7 +1207,7 @@ fn validate(
     config: &mut Config,
     base_dir: &Path,
     opts: &LoadOptions,
-    unstarted_externals: &HashMap<String, NotImplemented>,
+    external_reach: &HashMap<String, Reach>,
     group_reach: &HashMap<String, Reach>,
     diags: &mut Diagnostics,
 ) {
@@ -1394,10 +1392,14 @@ fn validate(
         let mut local_ports: HashMap<u16, &str> = HashMap::new();
         for p in &cfg.policies {
             // A program that a downloaded text names is not started, so its
-            // parameters are not read: nothing is said about them.
-            let mut outcome = match unstarted_externals.get(&p.name) {
+            // parameters are not read: nothing is said about them. An
+            // `external` policy the map does not know is not the user's own.
+            let unstarted = (p.kind == PolicyKind::External)
+                .then(|| external_reach.get(&p.name).copied())
+                .and_then(|reach| NotImplemented::external_in(reach.unwrap_or(Reach::Nowhere)));
+            let mut outcome = match unstarted {
                 Some(why) => SpecOutcome {
-                    not_implemented: Some(why.clone()),
+                    not_implemented: Some(why),
                     ..SpecOutcome::default()
                 },
                 None => to_spec(p, &env),
@@ -4952,23 +4954,26 @@ RULE-SET,LAN,DIRECT\nDOMAIN-SET,LAN,REJECT\nRULE-SET,X,DIRECT\nDOMAIN-SET,X,REJE
     // What downloaded text may name on this machine: nothing, or, for the copy
     // of a managed profile, a local file below the profile's directory. The
     // paths such text names carry a marker, so that a search of what a load
-    // says finds a path that got into a message.
+    // says finds a path that got into a message. What is said of a line, and
+    // its hint: `…_IN_DOWNLOADED` of a downloaded file's, `…_IN_COPY` of a
+    // line of the copy of a managed profile or of a file the copy takes in.
 
     const PATH_MARK: &str = "marker-path";
-    const S1: &str = "a downloaded file cannot name a local file as a set; the line is ignored";
-    const S1_HINT: &str = "write the line in the local profile to use a local set";
-    const S2: &str = "the downloaded copy of a managed profile (or a file it includes) cannot name a local file as a set; the line is ignored";
-    const S2_HINT: &str = "name the set by a URL instead";
-    const I2: &str = "the downloaded copy of a managed profile (or a file it includes) can include a local file only by a relative path below the profile's directory; the line is ignored";
-    const I2_HINT: &str =
+    const SET_IN_DOWNLOADED: &str =
+        "a downloaded file cannot name a local file as a set; the line is ignored";
+    const SET_IN_DOWNLOADED_HINT: &str = "write the line in the local profile to use a local set";
+    const SET_IN_COPY: &str = "the downloaded copy of a managed profile (or a file it includes) cannot name a local file as a set; the line is ignored";
+    const SET_IN_COPY_HINT: &str = "name the set by a URL instead";
+    const INCLUDE_IN_COPY: &str = "the downloaded copy of a managed profile (or a file it includes) can include a local file only by a relative path below the profile's directory; the line is ignored";
+    const INCLUDE_IN_COPY_HINT: &str =
         "name the file by a relative path without a drive, a leading slash or `..`";
-    const P1: &str = "policy group `G`: a downloaded file cannot name a local file as `policy-path`; the parameter is ignored";
-    const P1_HINT: &str =
+    const POLICY_PATH_IN_DOWNLOADED: &str = "policy group `G`: a downloaded file cannot name a local file as `policy-path`; the parameter is ignored";
+    const POLICY_PATH_IN_DOWNLOADED_HINT: &str =
         "define the group in the local profile to import policies from a local file";
-    const P2: &str = "policy group `G`: the downloaded copy of a managed profile (or a file it includes) cannot name a local file as `policy-path`; the parameter is ignored";
-    const P2_HINT: &str = "give `policy-path` a URL instead";
-    const X2: &str = "`external` policies in the downloaded copy of a managed profile (or in a file it includes) are not started; they behave as REJECT";
-    const X2_HINT: &str = "to use an `external` policy, load a profile without `#!MANAGED-CONFIG` that takes the downloaded parts in by `#!include`";
+    const POLICY_PATH_IN_COPY: &str = "policy group `G`: the downloaded copy of a managed profile (or a file it includes) cannot name a local file as `policy-path`; the parameter is ignored";
+    const POLICY_PATH_IN_COPY_HINT: &str = "give `policy-path` a URL instead";
+    const EXTERNAL_IN_COPY: &str = "`external` policies in the downloaded copy of a managed profile (or in a file it includes) are not started; they behave as REJECT";
+    const EXTERNAL_IN_COPY_HINT: &str = "to use an `external` policy, load a profile without `#!MANAGED-CONFIG` that takes the downloaded parts in by `#!include`";
 
     /// What a load said of lines their text may not write (`W0033`), by file
     /// and line: the name of the file, the line, the message and the hint.
@@ -5043,7 +5048,15 @@ RULE-SET,https://example.com/e.list,DIRECT\nRULE-SET,LAN,DIRECT\nRULE-SET,Inline
             ),
             &fake,
         );
-        assert_eq!(refusals(&l), refused("1.conf", &[2, 3, 4, 5], S1, S1_HINT));
+        assert_eq!(
+            refusals(&l),
+            refused(
+                "1.conf",
+                &[2, 3, 4, 5],
+                SET_IN_DOWNLOADED,
+                SET_IN_DOWNLOADED_HINT
+            )
+        );
         // nothing else is said, and the load has no error
         assert_eq!(
             l.diagnostics.len(),
@@ -5080,7 +5093,10 @@ DOMAIN-SET:https://example.com/h.list = 10.0.0.3\n"
             &format!("[Host]\n#!include {link}\n[Rule]\nFINAL,DIRECT\n"),
             &fake,
         );
-        assert_eq!(refusals(&l), refused("1.conf", &[2, 3], S1, S1_HINT));
+        assert_eq!(
+            refusals(&l),
+            refused("1.conf", &[2, 3], SET_IN_DOWNLOADED, SET_IN_DOWNLOADED_HINT)
+        );
         assert_eq!(
             l.diagnostics.len(),
             2,
@@ -5175,7 +5191,15 @@ DOMAIN-SET:https://example.com/h.list = 10.0.0.3\n"
             ),
             &fake,
         );
-        assert_eq!(refusals(&l), refused("1.conf", &[2], P1, P1_HINT));
+        assert_eq!(
+            refusals(&l),
+            refused(
+                "1.conf",
+                &[2],
+                POLICY_PATH_IN_DOWNLOADED,
+                POLICY_PATH_IN_DOWNLOADED_HINT
+            )
+        );
         assert_eq!(
             l.diagnostics.len(),
             1,
@@ -5225,16 +5249,31 @@ DOMAIN-SET:https://example.com/h.list = 10.0.0.3\n"
             "{}\n[Proxy]\nA = http, a.example, 8080\n[Proxy Group]\nG = select, A, policy-path={PATH_MARK}-nodes.txt\n\
 H = select, A, policy-path=https://example.com/nodes.txt\n[Host]\nDOMAIN-SET:{PATH_MARK}-hosts.list = 10.0.0.1\n\
 DOMAIN-SET:https://example.com/hosts.list = 10.0.0.2\n[Rule]\n#!include sets/ok.dconf\n#!include {}\n\
-#!include ../{PATH_MARK}-up.dconf\n#!include C:\\{PATH_MARK}-x.dconf\n#!include \\\\host\\share\\{PATH_MARK}-x.dconf\n\
+#!include ../{PATH_MARK}-up.dconf\n#!include C:\\{PATH_MARK}-x.dconf\n#!include \\\\127.0.0.1\\share\\{PATH_MARK}-x.dconf\n\
 #!include nul\nRULE-SET,sets/{PATH_MARK}-a.list,DIRECT\nRULE-SET,/abs/{PATH_MARK}-a.list,DIRECT\n\
 DOMAIN-SET,../{PATH_MARK}-up.list,DIRECT\nRULE-SET,https://example.com/e.list,DIRECT\nFINAL,DIRECT\n",
             managed_line(MANAGED, 3600, false),
             absent.display()
         );
         let l = load_copy(dir.path(), &copy);
-        let mut expected = refused("1.conf", &[5], P2, P2_HINT);
-        expected.extend(refused("1.conf", &[8, 17, 18, 19], S2, S2_HINT));
-        expected.extend(refused("1.conf", &[12, 13, 14, 15, 16], I2, I2_HINT));
+        let mut expected = refused(
+            "1.conf",
+            &[5],
+            POLICY_PATH_IN_COPY,
+            POLICY_PATH_IN_COPY_HINT,
+        );
+        expected.extend(refused(
+            "1.conf",
+            &[8, 17, 18, 19],
+            SET_IN_COPY,
+            SET_IN_COPY_HINT,
+        ));
+        expected.extend(refused(
+            "1.conf",
+            &[12, 13, 14, 15, 16],
+            INCLUDE_IN_COPY,
+            INCLUDE_IN_COPY_HINT,
+        ));
         expected.sort_by_key(|(file, line, ..)| (file.clone(), *line));
         assert_eq!(refusals(&l), expected);
         // and nothing else but where the text comes from: no include was
@@ -5318,12 +5357,22 @@ DOMAIN-SET,../{PATH_MARK}-up.list,DIRECT\nRULE-SET,https://example.com/e.list,DI
             managed_line(MANAGED, 3600, false)
         );
         let l = load_copy(dir.path(), &copy);
-        let mut expected = refused("one.dconf", &[2], X2, X2_HINT);
-        expected.extend(refused("one.dconf", &[5], P2, P2_HINT));
-        expected.extend(refused("one.dconf", &[7], S2, S2_HINT));
+        let mut expected = refused("one.dconf", &[2], EXTERNAL_IN_COPY, EXTERNAL_IN_COPY_HINT);
+        expected.extend(refused(
+            "one.dconf",
+            &[5],
+            POLICY_PATH_IN_COPY,
+            POLICY_PATH_IN_COPY_HINT,
+        ));
+        expected.extend(refused("one.dconf", &[7], SET_IN_COPY, SET_IN_COPY_HINT));
         // the file is taken in under three sections, and its include is
         // refused each time
-        expected.extend(refused("one.dconf", &[8, 8, 8], I2, I2_HINT));
+        expected.extend(refused(
+            "one.dconf",
+            &[8, 8, 8],
+            INCLUDE_IN_COPY,
+            INCLUDE_IN_COPY_HINT,
+        ));
         assert_eq!(refusals(&l), expected);
         assert!(
             !l.diagnostics.has_errors(),

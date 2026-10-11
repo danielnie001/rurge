@@ -5,7 +5,7 @@
 use super::{Entry, Origin, Profile, Section, parse_str};
 use crate::diagnostic::{Diagnostic, Diagnostics, codes};
 use crate::managed::parse_managed;
-use crate::reach::Reach;
+use crate::reach::{Reach, TakenIn};
 use crate::remote::{DEFAULT_INTERVAL, Remote, RemoteRef, RemoteRole, RemoteSource};
 use crate::span::Span;
 use crate::value::{split_list, starts_with_ci};
@@ -261,15 +261,17 @@ impl Expansion<'_> {
         }
         // the first thing done with a path: nothing of this machine is
         // joined, resolved, opened or looked at for one the text may not name
-        if let Some(refusal) = reach.include_refusal(target) {
-            self.diags.push(
-                Diagnostic::warning(codes::W_REMOTE_LOCAL_ACCESS, refusal.message)
-                    .with_hint(refusal.hint)
-                    .at(span.clone()),
-            );
-            return None;
+        match reach.include(target) {
+            Ok(how) => self.take_in_local(target, span, depth, how),
+            Err(refusal) => {
+                self.diags.push(
+                    Diagnostic::warning(codes::W_REMOTE_LOCAL_ACCESS, refusal.message)
+                        .with_hint(refusal.hint)
+                        .at(span.clone()),
+                );
+                None
+            }
         }
-        self.take_in_local(target, span, depth, reach == Reach::BelowProfile)
     }
 
     /// Whether the include may go on: it does not lead back to where it is
@@ -321,16 +323,16 @@ impl Expansion<'_> {
         true
     }
 
-    /// A local file. `managed` is whether the line that includes it is of the
-    /// downloaded copy of a managed profile or of a file it took in: the file
-    /// must then be an ordinary one of bounded size, and its lines are read
-    /// as the copy's are and not as the user's own.
+    /// A local file the line may include, taken in as `how` says: a file of
+    /// the downloaded copy of a managed profile, or of a file it took in, must
+    /// be an ordinary one of bounded size, and its lines are read as the
+    /// copy's are and not as the user's own.
     fn take_in_local(
         &mut self,
         target: &str,
         span: &Span,
         depth: usize,
-        managed: bool,
+        how: TakenIn,
     ) -> Option<Included> {
         let path = if Path::new(target).is_absolute() {
             PathBuf::from(target)
@@ -341,10 +343,9 @@ impl Expansion<'_> {
         if !self.admit(&key, &path.display().to_string(), span, depth) {
             return None;
         }
-        let read = if managed {
-            read_ordinary_file(&path, MOST_A_COPY_TAKES_IN)
-        } else {
-            fs::read_to_string(&path)
+        let read = match how {
+            TakenIn::AsOwnText => fs::read_to_string(&path),
+            TakenIn::AsTheCopy => read_ordinary_file(&path, MOST_A_COPY_TAKES_IN),
         };
         let text = match read {
             Ok(t) => t,
@@ -360,10 +361,9 @@ impl Expansion<'_> {
             }
         };
         let file: Arc<Path> = Arc::from(path.as_path());
-        let origin = if managed {
-            Origin::ManagedInclude(file.clone())
-        } else {
-            Origin::Include(file.clone())
+        let origin = match how {
+            TakenIn::AsOwnText => Origin::Include(file.clone()),
+            TakenIn::AsTheCopy => Origin::ManagedInclude(file.clone()),
         };
         let (mut profile, sub_diags) = parse_str(&text, file.clone(), origin);
         self.diags.extend(sub_diags);
@@ -1088,7 +1088,7 @@ FINAL,DIRECT
         let (p, d) = expand_copy(
             dir.path(),
             &format!(
-                "[Rule]\n#!include {}\n#!include ../up.dconf\n#!include C:\\x.dconf\n#!include \\\\host\\share\\x.dconf\n#!include nul\nFINAL,DIRECT\n",
+                "[Rule]\n#!include {}\n#!include ../up.dconf\n#!include C:\\x.dconf\n#!include \\\\127.0.0.1\\share\\x.dconf\n#!include nul\nFINAL,DIRECT\n",
                 absolute.display()
             ),
         );
