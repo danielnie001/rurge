@@ -349,14 +349,9 @@ mod tests {
     /// name and not by where it comes from.
     #[tokio::test]
     async fn the_log_names_a_database_and_not_the_link_it_comes_from() {
-        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lines = Lines::default();
         // held across the awaits: the manager's tasks run on this thread
-        let _capturing = tracing::subscriber::set_default(Lines(lines.clone()));
-        // While one dispatcher alone is registered, tracing-core asks only
-        // the thread that first reaches a call site whether it is wanted: a
-        // site another test reaches first would stay shut on this thread
-        // too. With a second one it asks every dispatcher.
-        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _capturing = lines.capture();
         let root = tempfile::tempdir().unwrap();
         let server = TestServer::spawn().await;
         server.set("/country", fixture("GeoIP2-Country-Test.mmdb"));
@@ -373,29 +368,16 @@ mod tests {
             },
             true,
         );
-        let said = |what: &str| {
-            lines
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|l| l.contains(what))
-                .cloned()
-        };
         wait_until("a fetch that worked and one that failed are logged", || {
-            said("resource updated").is_some() && said("resource fetch failed").is_some()
+            !lines.said("resource updated").is_empty()
+                && !lines.said("resource fetch failed").is_empty()
         })
         .await;
-        let leaked: Vec<String> = lines
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|l| l.contains("S3CR3T"))
-            .cloned()
-            .collect();
+        let leaked = lines.said("S3CR3T");
         assert!(leaked.is_empty(), "{leaked:#?}");
-        let updated = said("resource updated").unwrap();
+        let updated = &lines.said("resource updated")[0];
         assert!(updated.contains(COUNTRY_FILE), "{updated}");
-        let failed = said("resource fetch failed").unwrap();
+        let failed = &lines.said("resource fetch failed")[0];
         assert!(failed.contains(ASN_FILE), "{failed}");
     }
 }

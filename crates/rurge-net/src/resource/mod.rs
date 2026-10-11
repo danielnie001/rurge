@@ -985,6 +985,21 @@ mod tests {
             assert!(shown.contains(told), "{told}: {shown}");
         }
     }
+
+    /// The copy on disk is shown the same way: its body by its length.
+    #[test]
+    fn the_debug_of_a_cached_copy_shows_its_body_by_its_length() {
+        let copy = CachedCopy {
+            data: Bytes::from_static(b"A = trojan, password=S3CR3T-body"),
+            path: PathBuf::from("resources/0a1b/data"),
+            fetched_at: UNIX_EPOCH,
+        };
+        let shown = format!("{copy:?}");
+        assert!(!shown.contains("S3CR3T"), "{shown}");
+        for told in ["32 bytes", "0a1b"] {
+            assert!(shown.contains(told), "{told}: {shown}");
+        }
+    }
     use crate::http::{HttpClient, HttpClientConfig};
     use crate::testing::{Lines, TestServer, seed_cache};
     use sha2::{Digest, Sha256};
@@ -1867,6 +1882,56 @@ mod tests {
         assert_eq!(h.version(), 1);
         let copy = cached_copy(root.path(), &url).unwrap();
         assert_eq!(Some(copy.fetched_at), status_of(&mgr, &source).fetched_at);
+    }
+
+    /// A resource that failed and kept its copy is `available` again when a
+    /// check succeeds, also when all the server has to send is the body the
+    /// resource holds: no new version, nobody told, the failure gone from
+    /// the status, and the next refresh an interval away again.
+    #[tokio::test]
+    async fn the_body_in_hand_brings_a_failed_resource_back() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/b", "bravo");
+        server.set_validators("/b", false);
+        let url = server.url("/b");
+        let source = ResourceSource::Url(url.clone());
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url, None));
+        let mut rx = h.subscribe();
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        rx.borrow_and_update();
+        let succeeded = status_of(&mgr, &source).fetched_at.expect("a time");
+
+        server.set_status("/b", 500);
+        assert!(mgr.force_update(&source));
+        wait_for(&h, "failed with a copy", |s| {
+            matches!(
+                s,
+                ResourceState::Failed {
+                    cached: Some(_),
+                    ..
+                }
+            )
+        })
+        .await;
+
+        // the resource is backing off and tries again by itself
+        server.set_status("/b", 200);
+        let s = wait_for(&h, "available again", |s| available_version(s).is_some()).await;
+        assert_eq!(available_version(&s), Some(1));
+        assert_eq!(&s.data().unwrap().0[..], b"bravo");
+        assert!(!rx.has_changed().unwrap(), "somebody was told");
+        let status = status_of(&mgr, &source);
+        assert_eq!(status.state, "available");
+        assert_eq!(status.last_error, None);
+        assert!(status.fetched_at > Some(succeeded), "{status:?}");
+        // the backoff is over: the interval is a day, less at most a tenth
+        let in_an_hour = SystemTime::now() + Duration::from_secs(3600);
+        wait_until("the next refresh to be an interval away", || {
+            status_of(&mgr, &source).next_refresh > Some(in_an_hour)
+        })
+        .await;
     }
 
     /// The validators of the answer replace the ones stored, also when the
