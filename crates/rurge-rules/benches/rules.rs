@@ -6,12 +6,13 @@ use rurge_config::session::SessionInfo;
 use rurge_rules::domain_index::DomainIndexBuilder;
 use rurge_rules::engine::NoResolve;
 use rurge_rules::ip_index::IpIndexBuilder;
-use rurge_rules::matcher::{EvalCtx, NoGeo, SetLookup, SetRef, Verdict};
+use rurge_rules::matcher::{EvalCtx, GeoLookup, NoGeo, SetLookup, SetRef, Verdict};
 use rurge_rules::set::{CompiledSet, SetHandle};
 use rurge_rules::set_format::{ParsedSet, SetKind, SetLine, parse_set};
 use rurge_rules::{OutboundMode, RuleEngine};
 use std::collections::{HashMap, HashSet};
 use std::hint::black_box;
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -179,5 +180,90 @@ fn set_no_resolve_cidr(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, domain_index, ip_index, engine, set_no_resolve_cidr);
+/// Answers by address: `hit` has the number `hit_asn`, every other address a
+/// number that no line of the list names.
+struct AsnByAddress {
+    hit: IpAddr,
+    hit_asn: u32,
+}
+
+impl GeoLookup for AsnByAddress {
+    fn country(&self, _: IpAddr) -> Option<[u8; 2]> {
+        None
+    }
+    fn asn(&self, ip: IpAddr) -> Option<u32> {
+        Some(if ip == self.hit { self.hit_asn } else { 7 })
+    }
+}
+
+/// A rule set the way the ASN lists are written: 5,000 `IP-ASN` lines, a
+/// note after every number, which is about the size of the lists in common
+/// use. Built from the text of the file as a set file is. The database gives
+/// the address of one case the number of the last line of the file, and the
+/// address of another a number no line names; the third case is a name that
+/// nobody has resolved.
+fn set_asn_list(c: &mut Criterion) {
+    const LINES: u32 = 5_000;
+    let asn = |i: u32| 1_000 + 13 * i;
+    let mut text = String::new();
+    for i in 0..LINES {
+        text.push_str(&format!(
+            "IP-ASN,{} // Example Networks, Building {i}\n",
+            asn(i)
+        ));
+    }
+    let inline = HashSet::new();
+    let ctx = ParseCtx {
+        inline_rulesets: &inline,
+        base_dir: Path::new("."),
+    };
+    let parsed = parse_set(SetKind::RuleSet, &text, &ctx);
+    assert_eq!(parsed.lines.len(), LINES as usize);
+    assert_eq!(parsed.skipped_total, 0);
+    let set = CompiledSet::compile(
+        "asn_list",
+        SetKind::RuleSet,
+        &parsed,
+        &Sets(HashMap::new()),
+        1,
+    );
+    assert_eq!(set.entry_count(), LINES as usize);
+    let last = asn(LINES - 1);
+    let db = AsnByAddress {
+        hit: "198.51.100.1".parse().unwrap(),
+        hit_asn: last,
+    };
+    let miss = SessionInfo::tcp(HostName::parse("203.0.113.1"), 443);
+    // the number of the last line of the file: the worst case for comparing
+    // the lines one by one (the whole file is gone through before it is
+    // found), and the case the timings from before and after the lines went
+    // into a map compare
+    let hit = SessionInfo::tcp(HostName::parse("198.51.100.1"), 443);
+    let asks = SessionInfo::tcp(HostName::parse("example.org"), 443);
+    let ask = |s: &SessionInfo| set.eval(s, &mut EvalCtx::new(&db), false, false);
+    // the three cases measure what their names say
+    assert_eq!(ask(&miss).verdict, Verdict::NoMatch);
+    let found = ask(&hit);
+    assert_eq!(found.verdict, Verdict::Match);
+    assert_eq!(found.entry, Some(format!("IP-ASN,{last}")));
+    assert_eq!(ask(&asks).verdict, Verdict::NeedsResolve);
+    c.bench_function("set_5k_asn_miss", |bench| {
+        bench.iter(|| ask(black_box(&miss)))
+    });
+    c.bench_function("set_5k_asn_hit", |bench| {
+        bench.iter(|| ask(black_box(&hit)))
+    });
+    c.bench_function("set_5k_asn_asks", |bench| {
+        bench.iter(|| ask(black_box(&asks)))
+    });
+}
+
+criterion_group!(
+    benches,
+    domain_index,
+    ip_index,
+    engine,
+    set_no_resolve_cidr,
+    set_asn_list
+);
 criterion_main!(benches);
