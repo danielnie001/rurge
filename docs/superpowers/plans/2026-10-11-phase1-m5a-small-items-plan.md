@@ -399,6 +399,34 @@ impl Engine { pub fn geoip_view(&self, ip: IpAddr) -> GeoIpView; }
 
 ---
 
+### Task 10（执行中新加）：两条偶发失败的进程用例
+
+（这一节里写"记录第 N 行"的，指本文末尾「执行期修正记录」的行；写"延后事项第 N 行"的，指「延后事项」的行。两个提交 `bbf220d`、`6ceeba8` 都在 `09f1a7a` 之后，只动 `crates/rurge/tests/cli.rs`。）
+
+**为什么加**：写文档时把 CLAUDE.md 里列的每个测试过滤词各跑了一遍；其中一次，本里程碑的一个用例红了：`a_start_with_the_recorded_profile_leaves_state_json_as_it_is` 里 `POST /v1/stop` 的状态读成了 0。一个 N 次里失败一次的用例，会让门禁 N 次里失败一次，所以并进本计划查清（记录第 67 行）。同一轮反复跑里另有一个用例也失败了一次，见最后一段。
+
+**查明的原因**：辅助函数 `api_call` 用 `write!` 把请求直接写到套接字上，格式串的每一段是一次 `send`，请求头和正文（`{}`）可能分在几个 TCP 段里，正文晚于请求头到达。`POST /v1/stop`、`/v1/dns/flush`、`/v1/profiles/reload`、`/v1/profiles/check` 的处理函数不读正文，服务端凭请求头就答复：axum-core 0.5.6 在跑一个只取 `State` 的处理函数之前就把请求的正文丢掉；hyper 1.11.1 发现正文的接收端在正文到齐之前被丢掉，就调 `poll_drain_or_close_read`（`src/proto/h1/dispatch.rs`、`src/proto/h1/conn.rs`）：试读一次正文，没读到就 `close_read`，它同时结束 keep-alive，所以这与请求带不带 `Connection: close` 无关（两个版本取自 `Cargo.lock`，源码是读的）。连接在应答之后关掉，晚到的正文落在关了的连接上，对端回一个 RST；在 Windows 上，RST 让客户端的系统把已经收到而还没读的应答丢掉（RFC 9112 第 9.6 节 Tear-down 描述的正是这件事），`read_to_string` 什么也没读到就以 `ConnectionAborted`（os error 10053）失败，`api_call` 又把这个错误丢掉，状态成了 0。
+
+**证据**，按取得的次序。一、在负载下复现：给失败的那一刻加了临时的记录之后，这一组用例（过滤词 `its_profile recorded cannot_write_state_json` 选中的五个）单独跑 150 次没有失败；旁边另有一到两组用例反复跑着时跑了 665 次，失败一次，是第一个有负载的系列的第 115 次：状态 0，应答一个字节也没读到，`ConnectionAborted`（os error 10053），出现在写完请求之后 13 µs；那次写请求用了 8.19 ms，平时约 1 ms（550 次有负载而通过的运行：中位数 1.01 ms）。二、临时探针（对着真实的 API 服务端，回环；先发请求头，300 ms 后发正文，其间客户端不读；每一行重复十次，十次完全一样，密钥不对的那一行两次）：
+
+| 请求 | 正文晚到 | 请求头与正文一次写出 |
+| --- | --- | --- |
+| `POST /v1/dns/flush`、`/v1/stop`、`/v1/profiles/reload`、`/v1/profiles/check`（处理函数不读正文） | 正文的写成功；读失败，`ConnectionAborted`（10053），0 字节 | `200`，然后流结束 |
+| `POST /v1/log/level`（处理函数读正文） | `200`，然后流结束 | `200`，然后流结束 |
+| `POST /v1/dns/flush`，密钥不对（在读正文之前就被拒绝） | 读同样失败，0 字节 | `401`，然后流结束 |
+
+在发正文之前先读的客户端读到 `200`（服务端凭请求头就答复了），在本该读到流结束的地方遇到中止。三、不强迫晚到：一个像 `api_call` 那样写（`write!`，分几段）的客户端，在另外几组用例反复跑着的负载下，对进程内的真实服务端各发 1500 次：`POST /v1/dns/flush` 丢了 12 次应答（每一次都是状态 0、10053、什么也没读到，写出请求用了 5.9 ～ 19.8 ms）；`POST /v1/log/level` 一次也没丢；`POST /v1/dns/flush` 一次写出，一次也没丢。四、不是守护进程死了：一个在连接开着时被杀掉的守护进程，客户端读到的是 `ConnectionReset`（os error 10054），五次都是，不是 10053。第一次失败那一次，守护进程自己的退出码没有记下（记退出码的改动是事后加的，之后 550 次有负载的运行没有再失败，每次 `POST /v1/stop` 都是 200、守护进程退出码 0）：对那一次，这个解释有证据支持，没有证明。探针和上面这些记录都是临时的，提交之前删掉了。
+
+**改了什么**（`bbf220d`）：`api_call` 与 `http_get_with` 把整个请求拼成一个 `String`，用一次 `write_all` 写出；`http_get_with` 没有正文，丢不了应答，但一个请求一次写出是同一条规则。测试代码里手写的 HTTP 客户端只有 `api_call` 把正文分几次写，其余的本来就是一次 `write_all` 写完整个请求。改动之后，同一组用例在三组用例同时反复跑着的负载下跑了 400 次，没有失败。这个数的分量要说清：改动之前负载下 665 次里才失败一次，单看 400 次干净的运行，没有这次改动也有约 55% 的机会看到；一次写出去掉了原因，靠的是探针（正文晚到的请求每次都丢应答，一次写出的每次都得到应答）和 1500 次的对照（分几段写丢 12 次，一次写出 0 次）。
+
+**没有改的**：服务端这一侧是 API 自己的性质，早于本计划：带着正确密钥、处理函数不读正文的请求，或在读正文之前就被拒绝的请求，在请求头与正文分开到达时，可能让客户端读不到应答（只在 Windows 上量过）。谁分开发：CPython 的 `http.client`——读 v3.13.0 的 `Lib/http/client.py`，`_send_output` 用一次 `send` 发请求头、对正文的每一块各用一次——，所以 `urllib.request` 也是；`requests` 经 urllib3 也是（读 urllib3 2.7.0 的 `HTTPConnection.request`：`endheaders()` 之后逐块 `send`）。谁不：rurge 自己的客户端（`crates/rurge/src/cli/api_client.rs`，hyper-util 的客户端加 `Full` 正文）——hyper 1.11.1 把请求头和已经备好的正文放进同一个写缓冲，`Buffered::poll_flush`（`src/proto/h1/io.rs`）一次向量化写出——这是读源码得出的，没有量过。有名的服务端怎么做：Go 的 `net/http`（读 go1.23.0 的 `src/net/http/server.go`）在应答之前替处理函数读掉最多 `maxPostHandlerReadBytes`（256 KiB）没读的正文，读不完的，应答带 `Connection: close`，关连接之前先 `closeWriteAndWait`：只关写的一半，等 `rstAvoidanceDelay`（500 ms）再关整条连接。登记给阶段 1 补遗（M5b），它本来就要动 API（延后事项第 35 行；写给使用者的版本在 `docs/api/phase1.md` 的「鉴权与错误」）。
+
+**第二条**：同一轮反复跑里，`run::a_listen_value_that_cannot_be_used_ends_the_start_without_quoting_it` 失败了一次：辅助函数 `give_up` 在 20 秒期限后 panic，"rurge run did not give up within 20 s"，那时有三组用例同时反复跑着。信息既没有说是这个用例里九次启动中的哪一次，也没有说子进程打印过什么；读代码，那次启动的路径上没有东西在等（`Overrides::parse`、`error:` 一行、`recover_without_a_log`、退出码 2——`crates/rurge/src/cli/run.rs`）。`6ceeba8` 让 `give_up` 在期限到时说出这次启动（设置的环境变量、程序与参数）、把子进程已经写到标准错误的内容读完附上、`try_wait` 返回过错误时附上最后一个错误。改动之前这一组在同样的负载下跑了 398 次、失败一次（第 183 次），旁边一组跑了 405 次没有失败，更早单独一组的 347 次也没有；改动之后同样的负载下 810 次（两组各 405 次）没有再出现，所以没有信息可引，原因不知道，也没有查下去（延后事项第 37 行）。
+
+**判据**：门禁 71 个结果行 / 2800 通过 / 0 失败 / 6 忽略（`6ceeba8` 上，与 `09f1a7a` 的数字相同；第一遍里一个测试二进制死于本机已知的偶发崩溃，没有用例失败，单独重跑通过）。
+
+---
+
 ## 计划期决定
 
 | # | 事项 | 核对到的事实 | 决定 |
@@ -495,6 +523,10 @@ impl Engine { pub fn geoip_view(&self, ip: IpAddr) -> GeoIpView; }
 | 64 | 9 | 评审指出甲带来的第三处变化，实现者的报告没有登记 | 取值用**单引号**括起来、里面有"空白加 `#`、`;` 或 `//`"的行：拆字段的函数认单引号，切行尾注释的函数只认双引号，所以这样的行原先在规则集文件里读得完整，现在在引号里面被截断（行照收、没有告警、取值不是作者写的；`URL-REGEX,'^http://a // b'` 的取值成了 `'^http://a`）。这是 Profile 的读取器一向的读法，规则集文件现在与它一致；裁定不改（让切注释的函数也认单引号会改变 Profile 每一行的读法——取值里一个撇号就会吞掉后面的注释——，而 Surge 怎么读没有证据），用一条用例钉住，登记进兼容性清单：要保留就用双引号。另：甲顺带修好了一种写法——嵌套引用后面跟注释（`RULE-SET,other.list // 说明`）原先把 `other.list // 说明` 当成文件名（找不到，悄悄成了空集合） |
 | 65 | 9 | 计划之外、早于本计划的一个缺陷，在这一轮修正里修了：规则集与域名集文件开头的 UTF-8 BOM 被算进第一行 | 实现者读出来、评审对着代码核实：集合文件的字节经 `String::from_utf8_lossy` 成为文本，沿途没有任何一处去掉 BOM（Profile 的读取器与订阅解析器一向去掉）。带 BOM 保存的 `RULE-SET` 丢第一条规则、`DOMAIN-SET` 丢第一个名字，第一行是注释时多出一条被跳过的行；文本在启动时已在缓存里才有一条 `W0023`，启动之后才下载到的列表什么也不说。裁定在这一轮修（控制者；与任务 9 是同一个函数、同一类问题——人们实际在用的列表文件 rurge 读不对——，一行）：`parse_set_with_limit` 在文本开头去掉一个 U+FEFF，别处的不动、行号不变。五条用例先红后绿（规则集与域名集各两条、经注册表一条），另一条钉住范围（只去开头的一个） |
 | 66 | 9 | 计划之外、早于本计划的第二个缺陷，第二轮修正里修了：**域名集里读不了的行被告警原样引用** | 第一轮修正的实现者从红日志里读出来：`DOMAIN-SET` 文件里不是主机名的行，原因写成 ``invalid DOMAIN-SET line `<整行>` ``，而第一条被跳过的行的原因是 `W0023` 文字的一部分（每个加载 Profile 的命令的标准错误与日志）。域名集文件的一行是某个文件或 URL 正文里的任意文字：把订阅、一份代理行的列表误当成域名集时，它的第一行——分享链接、带 `password=` 的行——就进了告警。项目所有者的规矩是凭据不进日志与错误文本；规则行的读取器在 M8c 已经不引用"不像规则"的行，域名集是剩下的唯一一处引用整行的地方。裁定当场修（控制者）：原因改为 `invalid DOMAIN-SET line`，告警照旧给出行号（提交 `09f1a7a`；两条用例改之前是红的，另一条钉住"同样的三行当规则集读，原因里也没有口令"）。代价：域名集第一条被跳过的行的文字不再显示，只有行号。规则集的行的原因没有变（类型认得而取值不对时仍引用取值，与 Profile 里相同） |
+| 67 | 10 | 计划里没有这一项。写文档时把 CLAUDE.md 里列的每个测试过滤词各跑了一遍，本里程碑的 `a_start_with_the_recorded_profile_leaves_state_json_as_it_is` 红了一次（`POST /v1/stop` 的状态读成 0）；N 次里失败一次的用例会让门禁 N 次里失败一次 | 查明并修了，详见「Task 10」一节。原因：辅助函数 `api_call` 用 `write!` 一段一段地写请求，正文可能晚于请求头到达；`/v1/stop` 一类的处理函数不读正文，服务端凭请求头就答复并关掉连接，晚到的正文引来一个 RST，Windows 上的客户端因此丢掉已收到而没读的应答（`ConnectionAborted`，os error 10053，状态 0）。证据各一句：有负载的 665 次运行里失败一次，失败的那次读到 10053、一个字节没读到，出在写完请求之后 13 µs；探针里正文晚到的请求每次都丢应答、一次写出的每次都得到应答；同样的写法对进程内的真实服务端发 1500 次丢了 12 次，一次写出 0 次。修法：`api_call` 与 `http_get_with` 把整个请求一次 `write_all` 写出（提交 `bbf220d`，在 `09f1a7a` 之后，只动 `crates/rurge/tests/cli.rs`）；之后同一组用例在三组用例同时反复跑着的负载下跑了 400 次，没有失败。服务端这一侧没有改，登记为延后事项第 35 行 |
+| 68 | 10 | `run::a_listen_value_that_cannot_be_used_ends_the_start_without_quoting_it` 在同一轮反复跑里失败了一次：本该立刻放弃的启动 20 秒后还没有结束（辅助函数 `give_up` 的 panic："rurge run did not give up within 20 s"），那时有三组用例同时反复跑着；信息没有说是这个用例里九次启动中的哪一次，也没有说子进程打印过什么 | 读代码，那次启动的路径上没有东西在等（`Overrides::parse`、`error:` 一行、`recover_without_a_log`、退出码 2——`crates/rurge/src/cli/run.rs`）。提交 `6ceeba8` 让 `give_up` 在期限到时说出这次启动（设置的环境变量、程序、参数）、子进程已经写到标准错误的内容，和等待子进程是否失败过。改动之前这一组在同样的负载下跑了 398 次、失败一次，旁边一组 405 次没有失败，更早单独一组的 347 次也没有；改动之后同样的负载下 810 次（两组各 405 次）没有再出现，所以没有信息可引。这样合并：原因不知道，登记为延后事项第 37 行 |
+| 69 | 7 | 文档任务的评审：通过，十四条小项 | 十三条在这一轮订正了：CLAUDE.md 里两条测试命令选中的用例比它们的说明少（`pre_match`；E0024 一行补四个过滤词与两句说明）；验收文档里十八处没带阶段的里程碑名；四处把证据说得比实际硬——子规则日志行里相对路径的集合名、`rurge check` 缺省建议的"每一处都成立"、`remoteAddr` 清单里哪些情形有用例、平台变量在 macOS 与 Linux 上的读取；一处没有依据的解释（三个不同的基准数字不是"测量噪声"，改为原因没有查；清单里的"三次会话"改为"三次测量"）；范围与位置——需求文档状态行里的行号范围、验收文档里已决事项的范围，FR-CFG-15 一行漏记的提交，测试库 README 少的一句，M2 设计第 17 节漏的一条和开头一句，CLAUDE.md 状态段开头一个子句的位置，Task 8 里三条用例所在的文件。一条改不了：提交 `83e3932` 的说明正文提到了工作过程，与 `fa75f2d` 的说明里那处裸写的 M5b 同一类；历史不改写 |
+| 70 | — | 2026-10-11 准备阶段 1 补遗（M5b）时，手册的 `rules/final.html`、`profile/format.html`、`profile/managed-profile.html`、`rules/ruleset.html` 和 `tools/http-api.html` 又读了一遍：设计与清单引用它们的句子逐字相符；读出两处早于本计划、与手册不同的地方 | 一、几条启用的 `FINAL`：手册的几句话合起来是"匹配在第一条启用的 `FINAL` 处结束，策略与选项取最后一条的"，rurge 让写在两条 `FINAL` 之间的规则仍被评估；登记在兼容性清单 3.1 节的 `FINAL` 一行（第一格与备注带"目前"，状态标记没有动）和清单开头一句、验收文档「要定的事」、CLAUDE.md；改动排在阶段 1 补遗（M5b）的第一项（延后事项第 36 行）。二、重名的具名节：手册说两个被 include 的文件提供同名的节、或被 include 的节与 Profile 里已有的同名时加载失败，rurge 不拒绝，给 `W0020`、用第一段（比手册说的 Surge 宽松）；登记在清单 1.3 节通配命名节一行的备注里，决定保持现状，没有延后事项 |
 
 ## 延后事项
 
@@ -534,3 +566,7 @@ impl Engine { pub fn geoip_view(&self, ip: IpAddr) -> GeoIpView; }
 | 32 | 启动之后才载入或刷新的集合跳过了行，什么也不说：数被跳过的行的那条 `W0023` 只在建注册表时发（文本当时已在缓存里才有），之后只更新集合状态里的计数，而阶段 1 没有接口显示这个计数。早于本计划 | M5b（外部资源的接口显示每个资源的 `skipped`） |
 | 33 | 切行尾注释的函数只认双引号，拆字段的函数另认单引号（记录第 64 行）；这是 Profile 读取器早有的不一致，规则集文件现在继承了它 | 有用户报告再说 |
 | 34 | `--listen-socks5` 的取值写得不对时，报错的原因是 `address must be an IP literal like 0.0.0.0:6152`：这句话在 `parse_listener`（`crates/rurge-config/src/general.rs`）里，与 `E0013` 共用，示例端口 6152 是 HTTP 的缺省端口，对 SOCKS5（缺省 6153）不贴切；没有改 | 项目所有者（改不改；要改就是给两处各一句） |
+| 35 | **API 的一处性质：不读请求正文的端点，和在读正文之前就被拒绝的请求，只凭请求头就答复并关掉连接；正文晚于请求头到达时，客户端可能读不到那个应答。** 客户端看到的（只在 Windows 上量过，别的系统没有量）：正文的写成功，接着的读失败——`ConnectionAborted`（os error 10053），一个字节也读不到——，尽管请求已经执行。量过的是 `POST /v1/dns/flush`、`/v1/stop`、`/v1/profiles/reload`、`/v1/profiles/check` 和密钥不对的 `401`；`403`、`404`、`405` 的应答同样不读正文（读代码得出），没有量过。请求头与正文一次写出的客户端、不发正文的客户端不受影响。早于本计划；来由与证据在「Task 10」一节，写给使用者的版本在 `docs/api/phase1.md` 的「鉴权与错误」 | 阶段 1 补遗（M5b）（它本来就要动 API） |
+| 36 | **几条启用的 `FINAL` 之间写的规则仍被评估，手册的读法与此不同。** 手册（`rules/final.html`）："If several enabled FINAL rules are present, the last one is the effective one."；`profile/format.html`："In the `[Rule]` section, a `FINAL` rule immediately terminates rule matching. Rules included or defined after it are never evaluated, …"。rurge 今天：策略取最后一条启用的 `FINAL` 的（与手册一致），但写在两条 `FINAL` 之间的规则仍被评估——`FINAL,DIRECT` / `DOMAIN,a.com,P` / `FINAL,P` 里，`a.com` 被中间的 `DOMAIN` 规则命中；最后一条之前的每条 `FINAL` 得 `W0021`，`W0019` 只数最后一条之后的规则（钉着这一点的用例：`last_final_wins_and_shadowed_final_is_dropped`、`rules_after_the_last_final_are_excluded`，`crates/rurge-rules/src/engine.rs`；`last_final_takes_effect_and_earlier_final_is_shadowed`、`dead_rules_after_last_final_are_counted`，`crates/rurge-config/src/config.rs`）。决定要改成的读法，是能让手册那几句话同时成立的唯一一种：匹配在第一条启用的 `FINAL` 处结束，策略与选项（`dns-failed`）取最后一条启用的 `FINAL` 的；它是从手册的几句话推断的，没有在 Surge 上观察过。受影响的只有带两条或更多启用的 `FINAL`、且它们之间还有规则的 Profile——`#!include` 一个自己以 `FINAL` 结尾的规则文件、又在 include 之后接着写规则，就是这样。早于本计划，2026-10-11 重读手册时发现；登记在兼容性清单 3.1 节的 `FINAL` 一行 | 阶段 1 补遗（M5b）的第一项 |
+| 37 | `run::a_listen_value_that_cannot_be_used_ends_the_start_without_quoting_it` 里有一次启动没有在 20 秒内结束，**原因不知道**（记录第 68 行）。再出现时先看辅助函数 `give_up` 现在带的信息：它说出这次启动（环境变量、程序、参数）和子进程已写到标准错误的内容。标准错误里已经有 `error: --listen-…` 一行，说明子进程把该做的做完了、卡在退出的路上——那是产品的缺陷；标准错误是空的，说明它没有走到 `run`——那是机器 | 再出现时 |
+| 38 | `api_call` 与 `http_get_with`（`crates/rurge/tests/cli.rs`）仍然丢掉读应答时的错误（`let _ = s.read_to_string(…)`），所以第一次失败只显示成"状态 0"，看不出是 10053；记录第 67 行的那次修改没有动它 | 下次动到时 |
