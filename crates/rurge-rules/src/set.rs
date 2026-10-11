@@ -384,6 +384,144 @@ DEST-PORT,8443
         );
     }
 
+    /// What `set` says about a session to `host` and the line it names, asked
+    /// by a rule that did or did not say `no-resolve`, after an earlier rule
+    /// left `resolved` behind (or nothing).
+    fn ask(
+        set: &CompiledSet,
+        host: &str,
+        resolved: Option<ResolvedAddrs>,
+        no_resolve: bool,
+    ) -> (Verdict, Option<String>) {
+        let mut ctx = EvalCtx::new(&NoGeo);
+        ctx.resolved = resolved;
+        let v = set.eval(&session(host), &mut ctx, no_resolve, false);
+        (v.verdict, v.entry)
+    }
+
+    fn addrs(v4: &[&str], v6: &[&str]) -> Option<ResolvedAddrs> {
+        Some(ResolvedAddrs {
+            v4: v4.iter().map(|a| a.parse().unwrap()).collect(),
+            v6: v6.iter().map(|a| a.parse().unwrap()).collect(),
+        })
+    }
+
+    fn matches_line(line: &str) -> (Verdict, Option<String>) {
+        (Verdict::Match, Some(line.to_string()))
+    }
+
+    const NO_MATCH: (Verdict, Option<String>) = (Verdict::NoMatch, None);
+    const ASKS: (Verdict, Option<String>) = (Verdict::NeedsResolve, None);
+
+    #[test]
+    fn a_set_of_no_resolve_ip_lines_never_asks_for_a_lookup() {
+        let set = compile(
+            SetKind::RuleSet,
+            "IP-CIDR,10.0.0.0/8,no-resolve\nIP-CIDR6,fd00::/8,no-resolve\n",
+            &Stub::default(),
+        );
+        assert!(!set.needs_dns);
+        for no_resolve in [false, true] {
+            let why = format!("no_resolve = {no_resolve}");
+            // an address is matched whatever the rule said
+            assert_eq!(
+                ask(&set, "10.1.1.1", None, no_resolve),
+                matches_line("IP-CIDR,10.0.0.0/8,no-resolve"),
+                "{why}"
+            );
+            assert_eq!(
+                ask(&set, "[fd00::1]", None, no_resolve),
+                matches_line("IP-CIDR6,fd00::/8,no-resolve"),
+                "{why}"
+            );
+            assert_eq!(ask(&set, "11.1.1.1", None, no_resolve), NO_MATCH, "{why}");
+            assert_eq!(ask(&set, "[fc00::1]", None, no_resolve), NO_MATCH, "{why}");
+            // a name nobody has resolved is no reason to resolve it
+            assert_eq!(ask(&set, "other.org", None, no_resolve), NO_MATCH, "{why}");
+            // one an earlier rule resolved is matched against its addresses
+            assert_eq!(
+                ask(&set, "other.org", addrs(&["10.2.3.4"], &[]), no_resolve),
+                matches_line("IP-CIDR,10.0.0.0/8,no-resolve"),
+                "{why}"
+            );
+            assert_eq!(
+                ask(&set, "other.org", addrs(&[], &["fd00::9"]), no_resolve),
+                matches_line("IP-CIDR6,fd00::/8,no-resolve"),
+                "{why}"
+            );
+            assert_eq!(
+                ask(
+                    &set,
+                    "other.org",
+                    addrs(&["11.2.3.4"], &["fc00::9"]),
+                    no_resolve
+                ),
+                NO_MATCH,
+                "{why}"
+            );
+        }
+        let mut ctx = EvalCtx::new(&NoGeo);
+        for no_resolve in [false, true] {
+            let v = set.eval(&session("other.org"), &mut ctx, no_resolve, false);
+            assert_eq!(v.verdict, Verdict::NoMatch);
+        }
+        assert!(ctx.resolved.is_none());
+    }
+
+    #[test]
+    fn the_same_network_with_and_without_no_resolve_still_asks() {
+        let set = compile(
+            SetKind::RuleSet,
+            "IP-CIDR,10.0.0.0/8,no-resolve\nIP-CIDR,10.0.0.0/8\n",
+            &Stub::default(),
+        );
+        assert!(set.needs_dns);
+        assert_eq!(ask(&set, "other.org", None, false), ASKS);
+        assert_eq!(ask(&set, "other.org", None, true), NO_MATCH);
+        for no_resolve in [false, true] {
+            assert_eq!(
+                ask(&set, "10.1.1.1", None, no_resolve).0,
+                Verdict::Match,
+                "no_resolve = {no_resolve}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_of_the_other_family_that_may_ask_makes_the_set_ask() {
+        let set = compile(
+            SetKind::RuleSet,
+            "IP-CIDR,10.0.0.0/8,no-resolve\nIP-CIDR6,fd00::/8\n",
+            &Stub::default(),
+        );
+        assert_eq!(ask(&set, "other.org", None, false), ASKS);
+        assert_eq!(ask(&set, "other.org", None, true), NO_MATCH);
+        assert_eq!(
+            ask(&set, "other.org", addrs(&["10.2.3.4"], &[]), false),
+            matches_line("IP-CIDR,10.0.0.0/8,no-resolve")
+        );
+    }
+
+    /// `needs_dns` counts a nested set whether or not it ends up asking; the
+    /// set asks only when one of its own IP lines may.
+    #[test]
+    fn a_nested_set_beside_no_resolve_lines_does_not_make_the_set_ask() {
+        let mut stub = Stub::default();
+        let inner = compile(SetKind::DomainSet, ".inner.com\n", &stub);
+        stub.0.insert("inner.txt".into(), SetHandle::new(inner));
+        let outer = compile(
+            SetKind::RuleSet,
+            "IP-CIDR,10.0.0.0/8,no-resolve\nDOMAIN-SET,inner.txt\n",
+            &stub,
+        );
+        assert!(outer.needs_dns);
+        assert_eq!(ask(&outer, "other.org", None, false), NO_MATCH);
+        assert_eq!(
+            ask(&outer, "10.1.1.1", None, false),
+            matches_line("IP-CIDR,10.0.0.0/8,no-resolve")
+        );
+    }
+
     #[test]
     fn extended_matching_applies_to_domain_entries() {
         let set = compile(

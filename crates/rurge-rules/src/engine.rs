@@ -1151,6 +1151,36 @@ AND,((RULE-SET,Y),(OR,((DEST-PORT,1),(DEST-PORT,443)))),P\nFINAL,DIRECT\n\
         );
     }
 
+    /// A list written the usual way, `no-resolve` on every IP line: a name is
+    /// no reason for the rule that refers to it to resolve, and an address in
+    /// the list is a hit that names the line.
+    #[tokio::test]
+    async fn a_rule_set_of_no_resolve_lines_never_asks_for_a_lookup() {
+        let e = engine(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,Ips,P\nFINAL,DIRECT\n\
+[Ruleset Ips]\nIP-CIDR,10.0.0.0/8,no-resolve\n",
+        );
+        // the answer is inside the network, so a lookup would show as a hit
+        let r = Counting::v4("10.1.1.1");
+        let d = e
+            .evaluate(&session("host.example"), OutboundMode::Rule, &r)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::Final, Some(1)));
+        assert_eq!(r.calls.load(Ordering::SeqCst), 0);
+        assert!(d.resolved.is_none());
+        assert!(d.sub_rule.is_none());
+        let d = e
+            .evaluate(&session("10.1.1.1"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::Rule, Some(0)));
+        assert_eq!(d.policy().map(named).as_deref(), Some("P"));
+        let found = d.sub_rule.expect("the line that matched");
+        assert_eq!(
+            (found.set.as_str(), found.entry.as_str()),
+            ("Ips", "IP-CIDR,10.0.0.0/8,no-resolve")
+        );
+    }
+
     /// The set of an `AND` matches before the lookup its other half asks
     /// for, and again after it: the hit is the one of the evaluation that
     /// matched.
