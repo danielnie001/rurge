@@ -1153,15 +1153,14 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
                     );
                 }
             }
-            let dead: Vec<&Rule> = config.rules[first + 1..]
+            let mut dead = config.rules[first + 1..]
                 .iter()
-                .filter(|r| !matches!(r.kind, RuleKind::Final))
-                .collect();
-            if let Some(head) = dead.first() {
+                .filter(|r| !matches!(r.kind, RuleKind::Final));
+            if let Some(head) = dead.next() {
                 diags.push(
                     Diagnostic::warning(
                         codes::W_RULES_AFTER_FINAL,
-                        format!("{} rule(s) after FINAL never take effect", dead.len()),
+                        format!("{} rule(s) after FINAL never take effect", 1 + dead.count()),
                     )
                     .at(head.span.clone()),
                 );
