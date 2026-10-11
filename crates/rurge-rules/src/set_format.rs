@@ -2,6 +2,7 @@
 //! built-in `SYSTEM` / `LAN` sets (manual `rules/ruleset.html`, Internal Rule Sets).
 
 use rurge_config::rule::{InternalSet, ParseCtx, SubRule, parse_subrule};
+use rurge_config::text::strip_inline_comment;
 
 /// Manual: "A set may contain at most 1,000,000 entries." rurge truncates and warns.
 pub const MAX_ENTRIES: usize = 1_000_000;
@@ -61,8 +62,10 @@ pub fn parse_set_with_limit(kind: SetKind, text: &str, ctx: &ParseCtx, limit: us
         if line.is_empty() || is_comment(kind, line) {
             continue;
         }
+        // A rule may be followed by a note, as in the profile; a domain set
+        // line is one name, read by its own, stricter rule.
         let parsed = match kind {
-            SetKind::RuleSet => parse_rule_line(line, ctx),
+            SetKind::RuleSet => parse_rule_line(strip_inline_comment(line), ctx),
             SetKind::DomainSet => parse_domain_line(line),
         };
         match parsed {
@@ -161,6 +164,7 @@ pub fn internal_set_text(set: InternalSet) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rurge_config::rule::RuleKind;
     use std::collections::HashSet;
     use std::path::Path;
 
@@ -255,5 +259,149 @@ mod tests {
         );
         assert_eq!(lan.lines.len(), 14);
         assert!(lan.skipped.is_empty());
+    }
+
+    /// The sub-rules of a parsed set; every line of it must be a rule line.
+    fn rules(p: &ParsedSet) -> Vec<&SubRule> {
+        p.lines
+            .iter()
+            .map(|l| match l {
+                SetLine::Rule(r) => r,
+                other => panic!("expected a rule line, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Three lines the way the ASN lists in use write them: a note after the
+    /// number, which may hold a comma or a `#` of its own.
+    const NOTED_ASNS: &str = "\
+IP-ASN,4134 // 中国电信骨干网
+IP-ASN,132203 // Tencent Building, Kejizhongyi Avenue
+IP-ASN,131326 // 2308 Yinlaige # 22 Jinsui Road
+";
+
+    #[test]
+    fn a_rule_line_may_end_in_a_note_that_is_not_part_of_the_rule() {
+        let names = HashSet::new();
+        let p = parse_set(SetKind::RuleSet, NOTED_ASNS, &ctx_with(&names));
+        assert_eq!(p.skipped_total, 0, "{:?}", p.skipped);
+        let found = rules(&p);
+        assert_eq!(found.len(), 3);
+        for (rule, (asn, shown)) in found.into_iter().zip([
+            (4134, "IP-ASN,4134"),
+            (132203, "IP-ASN,132203"),
+            (131326, "IP-ASN,131326"),
+        ]) {
+            assert_eq!(rule.kind, RuleKind::IpAsn(asn));
+            // the comma inside a note does not start a parameter
+            assert!(rule.unknown.is_empty(), "{:?}", rule.unknown);
+            // the note is no part of what is shown as the sub-rule
+            assert_eq!(rule.raw, shown);
+        }
+    }
+
+    #[test]
+    fn a_note_may_follow_a_tab_and_start_with_any_of_the_three_markers() {
+        let names = HashSet::new();
+        for line in [
+            "IP-CIDR,10.0.0.0/8,no-resolve\t// lan",
+            "IP-CIDR,10.0.0.0/8,no-resolve\t# lan",
+            "IP-CIDR,10.0.0.0/8,no-resolve # lan",
+            "IP-CIDR,10.0.0.0/8,no-resolve ; lan",
+        ] {
+            let p = parse_set(SetKind::RuleSet, line, &ctx_with(&names));
+            assert_eq!(p.skipped_total, 0, "{line}: {:?}", p.skipped);
+            let found = rules(&p);
+            assert_eq!(found.len(), 1, "{line}");
+            assert!(found[0].no_resolve, "{line}");
+            assert!(
+                found[0].unknown.is_empty(),
+                "{line}: {:?}",
+                found[0].unknown
+            );
+            assert_eq!(found[0].raw, "IP-CIDR,10.0.0.0/8,no-resolve", "{line}");
+        }
+    }
+
+    /// A marker starts a note only after whitespace and outside double quotes:
+    /// these lines keep every character they carry.
+    #[test]
+    fn a_marker_without_whitespace_before_it_or_inside_quotes_starts_no_note() {
+        let names = HashSet::new();
+        for (line, value) in [
+            // `//` after a colon, `#` inside the pattern
+            (
+                r"URL-REGEX,^https?://example\.com/a#b",
+                r"^https?://example\.com/a#b",
+            ),
+            // `;` right after a word
+            (
+                "USER-AGENT,Mozilla/5.0 (iPhone; CPU*",
+                "Mozilla/5.0 (iPhone; CPU*",
+            ),
+            // `//` after whitespace, but inside double quotes
+            (r#"URL-REGEX,"^http://a // b""#, "^http://a // b"),
+        ] {
+            let p = parse_set(SetKind::RuleSet, line, &ctx_with(&names));
+            assert_eq!(p.skipped_total, 0, "{line}: {:?}", p.skipped);
+            let found = rules(&p);
+            assert_eq!(found.len(), 1, "{line}");
+            let text = match &found[0].kind {
+                RuleKind::UrlRegex(pattern) => pattern.source.as_str(),
+                RuleKind::UserAgent(glob) => glob.source(),
+                other => panic!("{line}: {other:?}"),
+            };
+            assert_eq!(text, value, "{line}");
+            assert_eq!(found[0].raw, line);
+        }
+    }
+
+    #[test]
+    fn a_whole_line_comment_is_still_one_with_any_of_the_three_markers() {
+        let names = HashSet::new();
+        let text = "\
+#!name=ASN.China
+# IP-ASN,1 // a note
+// IP-ASN,2 # a note
+; IP-ASN,3 ; a note
+   # IP-ASN,4 // indented
+";
+        let p = parse_set(SetKind::RuleSet, text, &ctx_with(&names));
+        assert!(p.lines.is_empty(), "{:?}", p.lines);
+        assert_eq!(p.skipped_total, 0, "{:?}", p.skipped);
+    }
+
+    /// A list as it is published: header lines, comments, blank lines, then a
+    /// note after every number.
+    #[test]
+    fn a_file_of_the_usual_shape_yields_its_rule_lines_and_nothing_is_skipped() {
+        let names = HashSet::new();
+        let text = format!(
+            "#!name=ASN.China\n#!desc=AS numbers of networks in China\n# Updated: 2026-10-11\n\
+// one line per AS number\n\n{NOTED_ASNS}"
+        );
+        let p = parse_set(SetKind::RuleSet, &text, &ctx_with(&names));
+        assert_eq!(p.skipped_total, 0, "{:?}", p.skipped);
+        let kinds: Vec<&RuleKind> = rules(&p).into_iter().map(|r| &r.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                &RuleKind::IpAsn(4134),
+                &RuleKind::IpAsn(132203),
+                &RuleKind::IpAsn(131326)
+            ]
+        );
+    }
+
+    /// A domain set has its own, stricter line rule: a name followed by a note
+    /// is a skipped line.
+    #[test]
+    fn a_domain_set_line_with_a_note_is_still_a_skipped_line() {
+        let names = HashSet::new();
+        let text = "example.com // note\nexample.org # note\n.example.net ; note\n";
+        let p = parse_set(SetKind::DomainSet, text, &ctx_with(&names));
+        assert!(p.lines.is_empty(), "{:?}", p.lines);
+        let numbers: Vec<usize> = p.skipped.iter().map(|(n, _)| *n).collect();
+        assert_eq!(numbers, [1, 2, 3]);
     }
 }

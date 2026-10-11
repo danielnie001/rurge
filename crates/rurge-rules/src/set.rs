@@ -622,6 +622,25 @@ DEST-PORT,8443
         }
     }
 
+    /// A note after a name is not part of the name: the line matches the name
+    /// it is for, and is shown without the note.
+    #[test]
+    fn a_name_line_with_a_note_after_it_matches_its_name() {
+        let names: HashSet<String> = HashSet::new();
+        let ctx = ParseCtx {
+            inline_rulesets: &names,
+            base_dir: Path::new("."),
+        };
+        let text = "DOMAIN-SUFFIX,example.com // note\n";
+        let parsed = parse_set(SetKind::RuleSet, text, &ctx);
+        assert_eq!(parsed.skipped_total, 0, "{:?}", parsed.skipped);
+        let set = CompiledSet::compile("t", SetKind::RuleSet, &parsed, &Stub::default(), 1);
+        assert_eq!(
+            ask(&set, "www.example.com", None, false),
+            matches_line("DOMAIN-SUFFIX,example.com")
+        );
+    }
+
     #[test]
     fn extended_matching_applies_to_domain_entries() {
         let set = compile(
