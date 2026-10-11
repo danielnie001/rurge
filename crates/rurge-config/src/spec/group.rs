@@ -207,9 +207,20 @@ impl<'a> Reader<'a> {
     }
 
     fn error(&mut self, code: &'static str, message: String) {
+        self.report(code, message, codes::hint(code));
+    }
+
+    /// `error`, with a hint of the place's own where the code's default does
+    /// not fit it.
+    fn error_with_hint(&mut self, code: &'static str, message: String, hint: &'static str) {
+        self.report(code, message, Some(hint));
+    }
+
+    fn report(&mut self, code: &'static str, message: String, hint: Option<&'static str>) {
         let message = format!("{}: {message}", named("policy group", &self.group.name));
-        self.diags
-            .push(Diagnostic::error(code, message).at(self.group.span.clone()));
+        let mut error = Diagnostic::error(code, message).at(self.group.span.clone());
+        error.hint = hint;
+        self.diags.push(error);
     }
 
     fn warn(&mut self, code: &'static str, message: String) {
@@ -366,9 +377,12 @@ fn read_import(
         }
         for name in &names {
             if lookup(name) != Some(NameKind::Group) {
-                r.error(
+                // the default hint says to define the name; this parameter
+                // takes groups only, and the name may be a policy that exists
+                r.error_with_hint(
                     codes::E_UNKNOWN_GROUP_MEMBER,
                     unknown_reference("include-other-group", "policy group", name),
+                    "give `include-other-group` the names of groups defined in `[Proxy Group]`, and list a single policy as a member of the group instead",
                 );
             }
         }
@@ -744,6 +758,12 @@ icon-url=https://example.com/i.png, category=Media",
             assert_eq!(found.len(), 1, "{def}: {found:?}");
             assert!(found[0].starts_with(message), "{def}: {}", found[0]);
             assert_eq!(o.diagnostics[0].code, codes::E_INVALID_POLICY_PARAM);
+            // an error without a hint of its place's own takes its code's
+            assert_eq!(
+                o.diagnostics[0].hint,
+                codes::hint(codes::E_INVALID_POLICY_PARAM),
+                "{def}"
+            );
         }
     }
 
@@ -779,6 +799,17 @@ icon-url=https://example.com/i.png, category=Media",
                 ),
             ]
         );
+        // the default hint of the code says to define the name, and `A` is
+        // defined: this place says what the parameter takes
+        for d in outcome("select, include-other-group=\"g1, A, missing\"").diagnostics {
+            assert_eq!(
+                d.hint,
+                Some(
+                    "give `include-other-group` the names of groups defined in `[Proxy Group]`, and list a single policy as a member of the group instead"
+                ),
+                "{d}"
+            );
+        }
     }
 
     #[test]
