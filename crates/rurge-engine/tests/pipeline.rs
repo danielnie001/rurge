@@ -4,7 +4,7 @@
 // not `use common::*`: this file has a harness of its own
 mod common;
 
-use common::UNTESTED;
+use common::{LogCapture, UNTESTED};
 use rurge_config::HostName;
 use rurge_config::config::{LoadOptions, from_text};
 use rurge_config::rule::ProtocolKind;
@@ -514,65 +514,13 @@ async fn a_pre_matching_reject_written_last_still_rejects_first() {
     assert_eq!(body, b"hi there");
 }
 
-/// Keeps the message and the fields of every event down to DEBUG.
-struct Debugging(Arc<Mutex<Vec<String>>>);
-
-#[derive(Default)]
-struct EventLine {
-    message: String,
-    fields: String,
-}
-
-impl tracing::field::Visit for EventLine {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.message = format!("{value:?}");
-        } else {
-            self.fields += &format!(" {}={value:?}", field.name());
-        }
-    }
-}
-
-impl tracing::Subscriber for Debugging {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        *metadata.level() <= tracing::Level::DEBUG
-    }
-
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-        let mut line = EventLine::default();
-        event.record(&mut line);
-        self.0
-            .lock()
-            .unwrap()
-            .push(format!("{}{}", line.message, line.fields));
-    }
-
-    fn enter(&self, _: &tracing::span::Id) {}
-
-    fn exit(&self, _: &tracing::span::Id) {}
-}
-
 /// A session a set decided says which line of the set matched: in one DEBUG
 /// line with the session's id, and on its record, where the list of notes
 /// keeps clear of `error`.
 #[tokio::test]
 async fn a_rule_set_hit_is_logged_and_noted_on_the_request() {
-    let lines = Arc::new(Mutex::new(Vec::new()));
     // held across the awaits: the engine's tasks run on this thread
-    let _capturing = tracing::subscriber::set_default(Debugging(lines.clone()));
-    // While one dispatcher alone is registered, tracing-core asks only the
-    // thread that first reaches a call site whether it is wanted: a site
-    // another test reaches first would stay shut on this thread too. With a
-    // second one it asks every dispatcher.
-    let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let log = LogCapture::start();
     let sets = tempfile::tempdir().unwrap();
     let list = sets.path().join("listed.list");
     std::fs::write(&list, "DOMAIN,target.test\n").unwrap();
@@ -596,15 +544,17 @@ async fn a_rule_set_hit_is_logged_and_noted_on_the_request() {
     );
     assert_eq!(listed.notes, [sentence.as_str()]);
     assert_eq!(listed.error, None);
-    let said: Vec<String> = lines
-        .lock()
-        .unwrap()
-        .iter()
+    let said: Vec<String> = log
+        .lines()
+        .into_iter()
         .filter(|l| l.contains("Sub-rule matched"))
-        .cloned()
         .collect();
     assert_eq!(said.len(), 1, "{said:?}");
-    assert!(said[0].starts_with(&sentence), "{}", said[0]);
+    assert!(
+        said[0].starts_with(&format!("DEBUG {sentence}")),
+        "{}",
+        said[0]
+    );
     assert!(
         said[0].ends_with(&format!(" session={}", listed.id)),
         "{}",
@@ -619,6 +569,110 @@ async fn a_rule_set_hit_is_logged_and_noted_on_the_request() {
     .await
     .expect("the other session's record");
     assert!(other.notes.is_empty(), "{other:?}");
+}
+
+/// The line of `log` that says `message` about the session going to `dst`;
+/// there is exactly one.
+fn session_line(log: &LogCapture, message: &str, dst: &str) -> String {
+    let lines: Vec<String> = log
+        .lines()
+        .into_iter()
+        .filter(|l| l.contains(message) && l.contains(&format!(" dst={dst} ")))
+        .collect();
+    assert_eq!(lines.len(), 1, "{message} about {dst}: {lines:?}");
+    lines.into_iter().next().unwrap()
+}
+
+/// Whether `line` has the field `name` with exactly `value`.
+fn has_field(line: &str, name: &str, value: impl std::fmt::Display) -> bool {
+    line.contains(&format!(" {name}={value} ")) || line.ends_with(&format!(" {name}={value}"))
+}
+
+/// The line a finished session leaves in the log has the id of the session's
+/// request record, and the rule and the policy the record has. The line that
+/// says which line of a set matched is about the same session.
+#[tokio::test]
+async fn the_log_line_of_a_completed_session_carries_what_its_record_does() {
+    let log = LogCapture::start();
+    let sets = tempfile::tempdir().unwrap();
+    let list = sets.path().join("listed.list");
+    std::fs::write(&list, "DOMAIN,target.test\n").unwrap();
+    let h = harness(
+        "",
+        &format!("RULE-SET,{},DIRECT", list.display()),
+        OutboundMode::Rule,
+    )
+    .await;
+    let url = format!("http://target.test:{}/hello", h.target_port());
+    let (head, _) = get_via_proxy(h.http(), &url).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let record = wait_for_record(&h.engine, Duration::from_secs(3), |r| {
+        r.dst.starts_with("target.test:") && matches!(r.status, RecordStatus::Completed)
+    })
+    .await
+    .expect("the session's record");
+    let line = session_line(&log, "session completed", &record.dst);
+    assert!(has_field(&line, "session", record.id), "{line}");
+    let rule = record.rule.as_deref().expect("a rule decided it");
+    assert!(rule.starts_with("RULE-SET,"), "{rule}");
+    assert!(has_field(&line, "rule", rule), "{line}");
+    assert!(
+        has_field(&line, "policy", record.policy.join(" > ")),
+        "{line}"
+    );
+    let hits: Vec<String> = log
+        .lines()
+        .into_iter()
+        .filter(|l| l.contains("Sub-rule matched"))
+        .collect();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert!(has_field(&hits[0], "session", record.id), "{}", hits[0]);
+}
+
+#[tokio::test]
+async fn the_log_line_of_a_rejected_session_carries_what_its_record_does() {
+    let log = LogCapture::start();
+    let h = harness("", "DOMAIN,ads.test,REJECT", OutboundMode::Rule).await;
+    let (head, _) = get_via_proxy(h.http(), "http://ads.test/").await;
+    assert!(head.is_empty(), "{head}");
+    let record = wait_for_record(&h.engine, Duration::from_secs(3), |r| {
+        r.dst.starts_with("ads.test:") && matches!(r.status, RecordStatus::Rejected(_))
+    })
+    .await
+    .expect("the session's record");
+    let line = session_line(&log, "session rejected by REJECT", &record.dst);
+    assert!(has_field(&line, "session", record.id), "{line}");
+    let rule = record.rule.as_deref().expect("a rule decided it");
+    assert!(has_field(&line, "rule", rule), "{line}");
+    assert!(
+        has_field(&line, "policy", record.policy.join(" > ")),
+        "{line}"
+    );
+}
+
+/// A session that could not connect says why in its line, in the words its
+/// record has.
+#[tokio::test]
+async fn the_log_line_of_a_failed_session_carries_what_its_record_does() {
+    let log = LogCapture::start();
+    let h = harness("", "", OutboundMode::Rule).await;
+    let port = common::closed_tcp_port();
+    // What the client is told does not matter here, and the connection may
+    // take two seconds to be refused (Windows): the record is what is waited
+    // for.
+    get_via_proxy(h.http(), &format!("http://target.test:{port}/hello")).await;
+    let dst = format!("target.test:{port}");
+    let record = wait_for_record(&h.engine, Duration::from_secs(15), |r| {
+        r.dst == dst && r.status == RecordStatus::Failed
+    })
+    .await
+    .expect("the session's record");
+    let line = session_line(&log, "session failed", &dst);
+    assert!(has_field(&line, "session", record.id), "{line}");
+    let rule = record.rule.as_deref().expect("a rule decided it");
+    assert!(has_field(&line, "rule", rule), "{line}");
+    let error = record.error.as_deref().expect("a failure says why");
+    assert!(has_field(&line, "error", error), "{line}");
 }
 
 async fn harness_with_final_reject(mode: OutboundMode) -> Harness {

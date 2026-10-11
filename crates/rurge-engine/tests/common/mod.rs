@@ -5,6 +5,9 @@
 
 #![allow(dead_code, unused_imports)]
 
+mod log_capture;
+
+pub use log_capture::LogCapture;
 pub use rurge_config::config::{LoadOptions, from_text};
 pub use rurge_config::session::ListenerKind;
 pub use rurge_dns::system::StaticSystemDns;
