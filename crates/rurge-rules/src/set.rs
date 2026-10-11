@@ -147,8 +147,11 @@ impl CompiledSet {
     /// caller did not say `no-resolve` and some line in it did not either (a
     /// line that said it never asks). When several lines match, the one
     /// reported is the first found in that order, which is not always the first
-    /// in the file: an IP line is found after the linear ones, and among IP
-    /// lines the longest prefix wins.
+    /// in the file: an IP line is found after the linear ones, and among the
+    /// IP lines of one address family the longest prefix wins. The IPv4
+    /// address is asked first and the IPv6 one after it, so a name resolved to
+    /// both, each inside a line, reports the IPv4 line whatever the prefix
+    /// lengths.
     pub fn eval(
         &self,
         s: &SessionInfo,
@@ -517,6 +520,34 @@ DEST-PORT,8443
             ask(&set, "other.org", addrs(&["10.2.3.4"], &[]), false),
             matches_line("IP-CIDR,10.0.0.0/8,no-resolve")
         );
+    }
+
+    /// A line that is walked can ask on its own account: the IP lines beside
+    /// it all say `no-resolve`, and the set asks all the same.
+    #[test]
+    fn a_walked_line_that_may_ask_makes_the_set_ask_beside_no_resolve_ip_lines() {
+        let set = compile(
+            SetKind::RuleSet,
+            "GEOIP,US\nIP-CIDR,10.0.0.0/8,no-resolve\n",
+            &Stub::default(),
+        );
+        assert_eq!(ask(&set, "other.org", None, false), ASKS);
+        assert_eq!(ask(&set, "other.org", None, true), NO_MATCH);
+        // the IP line is not what asks: without the GEOIP line the set never does
+        let ip_line_alone = compile(
+            SetKind::RuleSet,
+            "IP-CIDR,10.0.0.0/8,no-resolve\n",
+            &Stub::default(),
+        );
+        assert_eq!(ask(&ip_line_alone, "other.org", None, false), NO_MATCH);
+        // once the name is resolved, an address inside the network is the IP line's
+        for no_resolve in [false, true] {
+            assert_eq!(
+                ask(&set, "other.org", addrs(&["10.2.3.4"], &[]), no_resolve),
+                matches_line("IP-CIDR,10.0.0.0/8,no-resolve"),
+                "no_resolve = {no_resolve}"
+            );
+        }
     }
 
     /// `needs_dns` counts a nested set whether or not it ends up asking; the

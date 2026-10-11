@@ -151,19 +151,31 @@ fn set_no_resolve_cidr(c: &mut Criterion) {
         &Sets(HashMap::new()),
         1,
     );
+    // far from every network of the file
     let miss = SessionInfo::tcp(HostName::parse("203.0.113.1"), 443);
-    // inside the last network of the file: found only after the whole length
-    // of the file by a walk down the lines
+    // inside the last network of the file: the worst case for comparing the
+    // lines one by one (the whole file is gone through before it is found),
+    // and the address the timings from before and after the lines went into
+    // the prefix tree compare
     let hit = SessionInfo::tcp(HostName::parse(&format!("{}.7", network(99_999))), 443);
+    // in the /24 right after that network: no line has it, and it shares its
+    // leading bits with the hit, which the miss above does not
+    let last: std::net::Ipv4Addr = format!("{}.0", network(99_999)).parse().unwrap();
+    let next = std::net::Ipv4Addr::from(u32::from(last) + 256 + 7);
+    let near_miss = SessionInfo::tcp(HostName::parse(&next.to_string()), 443);
     let ask = |s: &SessionInfo| set.eval(s, &mut EvalCtx::new(&NoGeo), false, false);
-    // the two cases measure what their names say
+    // the three cases measure what their names say
     assert_eq!(ask(&miss).verdict, Verdict::NoMatch);
     assert_eq!(ask(&hit).verdict, Verdict::Match);
+    assert_eq!(ask(&near_miss).verdict, Verdict::NoMatch);
     c.bench_function("set_100k_no_resolve_cidr_miss", |bench| {
         bench.iter(|| ask(black_box(&miss)))
     });
     c.bench_function("set_100k_no_resolve_cidr_hit", |bench| {
         bench.iter(|| ask(black_box(&hit)))
+    });
+    c.bench_function("set_100k_no_resolve_cidr_near_miss", |bench| {
+        bench.iter(|| ask(black_box(&near_miss)))
     });
 }
 
