@@ -111,7 +111,10 @@ fn parse_domain_line(line: &str) -> Result<SetLine, String> {
         && !name.starts_with('.')
         && !name.contains("..");
     if !valid {
-        return Err(format!("invalid DOMAIN-SET line `{line}`"));
+        // The line is not quoted: a set file is arbitrary text, and one given by
+        // mistake can be a share link or a proxy line with a password in it.
+        // The warning names the line by its number.
+        return Err("invalid DOMAIN-SET line".to_string());
     }
     Ok(SetLine::Domain { name, suffix })
 }
@@ -516,6 +519,44 @@ IP-ASN,131326 // 2308 Yinlaige # 22 Jinsui Road
             assert_eq!(p.lines.len(), parsed, "{text:?}");
             let numbers: Vec<usize> = p.skipped.iter().map(|(n, _)| *n).collect();
             assert_eq!(numbers, skipped, "{text:?}");
+        }
+    }
+
+    /// A share link, a proxy line and a URL with user-info: what a subscription,
+    /// a list of proxy lines or a profile has in it when it is given as a set
+    /// file by mistake. None is a rule or a name, and each carries a password.
+    const LINES_WITH_A_SECRET: &str = "\
+trojan://S3CR3T@example.com:443
+P = ss, example.com, 8388, password=S3CR3T
+https://user:S3CR3T@example.com/list
+";
+
+    /// The reason of a skipped line reaches the log and the standard error of
+    /// every command that loads the profile, so it must not quote the line.
+    #[test]
+    fn a_domain_set_line_that_is_not_a_name_is_skipped_without_being_quoted() {
+        let names = HashSet::new();
+        let p = parse_set(SetKind::DomainSet, LINES_WITH_A_SECRET, &ctx_with(&names));
+        assert!(p.lines.is_empty(), "{:?}", p.lines);
+        let numbers: Vec<usize> = p.skipped.iter().map(|(n, _)| *n).collect();
+        assert_eq!(numbers, [1, 2, 3]);
+        for (number, reason) in &p.skipped {
+            assert_eq!(reason, "invalid DOMAIN-SET line", "line {number}");
+        }
+    }
+
+    /// The same lines as a rule set: the rule parser does not quote a line that
+    /// does not start with something shaped like a rule type, so nothing of
+    /// them reaches the reason.
+    #[test]
+    fn a_rule_set_line_without_a_rule_type_is_skipped_without_being_quoted() {
+        let names = HashSet::new();
+        let p = parse_set(SetKind::RuleSet, LINES_WITH_A_SECRET, &ctx_with(&names));
+        assert!(p.lines.is_empty(), "{:?}", p.lines);
+        let numbers: Vec<usize> = p.skipped.iter().map(|(n, _)| *n).collect();
+        assert_eq!(numbers, [1, 2, 3]);
+        for (number, reason) in &p.skipped {
+            assert!(!reason.contains("S3CR3T"), "line {number}: {reason}");
         }
     }
 }

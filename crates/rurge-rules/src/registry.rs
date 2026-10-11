@@ -777,6 +777,28 @@ IP-CIDR,10.0.0.0/8,no-resolve # lan
         assert_eq!(decide(&engine, "a.com").await.0, "P");
     }
 
+    /// A file given as a domain set by mistake can be a subscription or a list
+    /// of proxy lines: the warning counts the lines it skipped and names the
+    /// first by its number, and says nothing of what that line holds.
+    #[tokio::test]
+    async fn a_domain_set_given_the_wrong_file_warns_without_quoting_its_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.list");
+        std::fs::write(&file, "trojan://S3CR3T@example.com:443\ngood.example.com\n").unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nDOMAIN-SET,a.list,P\nFINAL,DIRECT\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        assert_eq!(codes_of(&diags), vec![codes::W_SET_LINES_SKIPPED]);
+        let message = &diags.iter().next().unwrap().message;
+        assert!(!message.contains("S3CR3T"), "{message}");
+        assert!(message.contains("1 line(s) skipped"), "{message}");
+        assert!(message.contains("first: line 1"), "{message}");
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "good.example.com").await.0, "P");
+    }
+
     #[tokio::test]
     async fn missing_file_is_an_empty_set_with_a_warning() {
         let dir = tempfile::tempdir().unwrap();
