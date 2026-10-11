@@ -13,6 +13,7 @@ use rurge_net::BoxFuture;
 use rurge_net::connector::{
     BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, DirectConnector, SystemResolve, Target,
 };
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write as _};
 use std::net::Ipv4Addr;
@@ -45,6 +46,21 @@ const PROXY_VARIABLES: [&str; 6] = [
     "https_proxy",
     "all_proxy",
 ];
+
+/// The names of rurge's own settings start with this. The program gets none
+/// of them: a listener's password can be in one, and a rurge started as the
+/// program would follow them instead of its own profile. Told by the prefix,
+/// not by a list: the names are declared in the executable, and a list here
+/// would go stale.
+const OWN_SETTINGS_PREFIX: &str = "RURGE_";
+
+/// Whether the variable called `name` is one of rurge's own settings. ASCII
+/// case does not count, as it does not for a variable's name on Windows.
+fn is_own_setting(name: &OsStr) -> bool {
+    name.to_string_lossy()
+        .get(..OWN_SETTINGS_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(OWN_SETTINGS_PREFIX))
+}
 
 /// How external programs are started and stopped: the bin injects
 /// `rurge-platform::process` (a process group on Unix, a Job Object on
@@ -139,7 +155,8 @@ fn open_log(path: &Path) -> io::Result<File> {
 }
 
 /// The command for one start: the arguments in order, no input, output to
-/// the log, and no proxy settings to follow back into rurge (M4-D11).
+/// the log, no proxy settings to follow back into rurge (M4-D11), and none of
+/// rurge's own settings.
 fn command(exec: &str, args: &[String], log: &File) -> io::Result<Command> {
     let mut command = Command::new(exec);
     command
@@ -149,6 +166,11 @@ fn command(exec: &str, args: &[String], log: &File) -> io::Result<Command> {
         .stderr(log.try_clone()?);
     for name in PROXY_VARIABLES {
         command.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        if is_own_setting(&name) {
+            command.env_remove(name);
+        }
     }
     command.env("NO_PROXY", "*").env("no_proxy", "*");
     Ok(command)
@@ -606,6 +628,30 @@ mod tests {
                 .any(|(k, v)| k.eq_ignore_ascii_case("NO_PROXY") && v.as_deref() == Some("*")),
             "{envs:?}"
         );
+    }
+
+    #[test]
+    fn rurges_own_settings_are_told_by_their_prefix() {
+        for own in [
+            "RURGE_LISTEN_HTTP",
+            "RURGE_API_KEY",
+            "rurge_listen_http",
+            "Rurge_X",
+            "RURGE_",
+        ] {
+            assert!(is_own_setting(OsStr::new(own)), "{own}");
+        }
+        for other in [
+            "RURGE",
+            "RURGEX_Y",
+            "MY_RURGE_X",
+            "PATH",
+            "",
+            // a character of more than one byte across the sixth byte
+            "RURGE\u{e9}",
+        ] {
+            assert!(!is_own_setting(OsStr::new(other)), "{other:?}");
+        }
     }
 
     fn outbound(exec: &str, port: u16, dir: &Path) -> ExternalOutbound {

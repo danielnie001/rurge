@@ -2749,7 +2749,9 @@ mod run {
 
     /// `rurge run` starts an `external` policy's program on first use and
     /// stops it on the way out (phase 2 M4 design 7.3, 8.2). The program is
-    /// a second rurge: a SOCKS5 proxy on the policy's `local-port`.
+    /// a second rurge: a SOCKS5 proxy on the policy's `local-port`. The outer
+    /// rurge is started with a setting of its own in the environment, which
+    /// the program does not get.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_starts_an_external_program_and_stops_it_on_exit() {
         let target = TestServer::spawn().await;
@@ -2784,7 +2786,14 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         let data = dir.path().join("data");
         let mut daemon = tokio::task::spawn_blocking({
             let (conf, data) = (conf.clone(), data.clone());
-            move || spawn_daemon(&conf, &data)
+            move || {
+                let mut cmd = rurge_run(&conf, &data);
+                // The program is a second rurge: handed this setting of the
+                // first, it would listen where the variable says and not on
+                // the `local-port` its profile names.
+                cmd.env("RURGE_LISTEN_SOCKS5", "127.0.0.1:0");
+                spawn_command(cmd)
+            }
         })
         .await
         .unwrap();
