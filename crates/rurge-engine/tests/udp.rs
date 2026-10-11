@@ -6,7 +6,7 @@ mod common;
 use common::*;
 use rurge_config::HostName;
 use rurge_config::session::Transport;
-use rurge_engine::RequestRecord;
+use rurge_engine::{REFUSED_STRICT, RequestRecord};
 use rurge_net::connector::Target;
 
 fn udp_records(h: &Harness) -> Vec<RequestRecord> {
@@ -898,4 +898,54 @@ async fn a_failed_flow_is_tried_again_while_datagrams_keep_coming() {
             .all(|r| r.status == RecordStatus::Failed),
         "the new flow is still active"
     );
+}
+
+/// While the engine is suspended the datagrams of a new flow are dropped,
+/// and the record says why. The flow fails — it is not refused — so that it
+/// is tried again after `RETRY_AFTER`: a client that keeps sending is served
+/// as soon as the suspension ends, not when it has been quiet for a minute.
+#[tokio::test]
+async fn a_suspended_engine_drops_the_datagrams_and_serves_the_flow_again_when_it_ends() {
+    let h = harness(Profile::default()).await;
+    let (echo, seen) = udp_echo().await;
+    h.engine
+        .suspend(Some("the update failed: marker-reason".to_string()));
+    // the association itself is taken: the listener is not suspended
+    let association = udp_associate(h.socks()).await;
+    association.send("127.0.0.1", echo.port(), b"one").await;
+    let records = finished(&h, 1).await;
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    assert_eq!(
+        records[0].error.as_deref(),
+        Some(REFUSED_STRICT),
+        "{records:?}"
+    );
+    assert_eq!(records[0].rule, None, "{records:?}");
+    assert!(records[0].policy.is_empty(), "{records:?}");
+    // The client goes on, a datagram every 500 ms. Each wait only observes
+    // that nothing comes back: the first datagram was dropped before
+    // anything was sent, so nothing is on its way that 500 ms could miss.
+    for _ in 0..3 {
+        association.send("127.0.0.1", echo.port(), b"again").await;
+        let back = association.recv_within(Duration::from_millis(500)).await;
+        assert_eq!(back, None);
+    }
+    assert!(seen.lock().unwrap().is_empty(), "the target saw a datagram");
+    let records = udp_records(&h);
+    assert_eq!(records.len(), 1, "no other flow starts: {records:?}");
+
+    h.engine.suspend(None);
+    // the flow is tried again 5 seconds after it failed, by the next datagram
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let back = loop {
+        association.send("127.0.0.1", echo.port(), b"again").await;
+        if let Some(back) = association.recv_within(Duration::from_millis(500)).await {
+            break back;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no answer after the suspension ended"
+        );
+    };
+    assert_eq!(back, (echo, b"again".to_vec()));
 }

@@ -54,6 +54,9 @@ const ESCALATE_MAX_HOSTS: usize = 4096;
 /// How long a rebind waits for an old listener's socket to close before
 /// binding the new one (Windows sets no `SO_REUSEADDR`).
 pub const REBIND_WAIT: Duration = Duration::from_secs(2);
+/// What a session says when it is refused because the managed profile
+/// requires an update (`Engine::suspend`).
+pub const REFUSED_STRICT: &str = "refused: the managed profile requires an update (strict)";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListenerSpec {
@@ -148,6 +151,10 @@ pub struct Engine {
     /// the first `Runtime`, changed by the API / CLI, never touched by reload.
     mode: ArcSwap<Mode>,
     global_policy: ArcSwap<Option<String>>,
+    /// Why new sessions are refused (`suspend`); `None` while they are not.
+    /// Like the mode, reload does not touch it, and it is not kept in
+    /// `state.json`: the caller works it out again at every start.
+    suspended: ArcSwap<Option<String>>,
     /// "proxy mode but no usable global policy" is warned once per change.
     global_warned: AtomicBool,
     state: OnceLock<Arc<StateStore>>,
@@ -194,6 +201,7 @@ impl Engine {
             escalation: Escalation::new(),
             mode: ArcSwap::from_pointee(mode),
             global_policy: ArcSwap::from_pointee(global),
+            suspended: ArcSwap::from_pointee(None),
             global_warned: AtomicBool::new(false),
             state: OnceLock::new(),
             shared,
@@ -522,6 +530,30 @@ impl Engine {
         (**self.global_policy.load()).clone()
     }
 
+    /// Refuses the sessions that begin from now on (`Some(why)`), or ends the
+    /// refusal (`None`). Only new sessions are refused, at the four places a
+    /// session begins: a client's TCP connection, a UDP flow, and — under
+    /// `encrypted-dns-follow-outbound-mode` — a DNS server's connection and
+    /// its QUIC carrier. A session that is open goes on, and the listeners,
+    /// the API and the connectivity tests are not touched. A refused session
+    /// fails with `REFUSED_STRICT` and says nothing of `why`, which is for the
+    /// log and the API: whoever calls this logs the change. `Some` while
+    /// already suspended replaces the reason; `None` while not suspended
+    /// changes nothing.
+    pub fn suspend(&self, why: Option<String>) {
+        self.suspended.store(Arc::new(why));
+    }
+
+    /// Why new sessions are refused, while they are (`suspend`).
+    pub fn suspended(&self) -> Option<String> {
+        (**self.suspended.load()).clone()
+    }
+
+    /// Whether a session that begins now is refused.
+    pub(crate) fn is_suspended(&self) -> bool {
+        self.suspended.load().is_some()
+    }
+
     /// `true` for the built-in policies and every policy / group of the
     /// current registry (for API / CLI callers).
     pub fn policy_exists(&self, name: &str) -> bool {
@@ -589,7 +621,8 @@ impl Engine {
         self.runtime().config.general.internet_test_url.clone()
     }
 
-    /// The main profile file of the current config generation.
+    /// The main profile file of the current config generation: the local
+    /// file, even when the text in effect is a downloaded copy of it.
     pub fn profile_path(&self) -> std::path::PathBuf {
         self.runtime().config.source.main.clone()
     }
@@ -599,9 +632,11 @@ impl Engine {
         self.runtime().stack.resources.root().to_path_buf()
     }
 
-    /// The current main profile text; secrets redacted unless `sensitive`.
+    /// The text of the profile in effect: the local file, or the downloaded
+    /// copy of a managed profile while that is in effect (`profile_path` is
+    /// the local file either way); secrets redacted unless `sensitive`.
     pub async fn config_text(&self, sensitive: bool) -> io::Result<String> {
-        let path = self.profile_path();
+        let path = self.runtime().config.source.main_text.clone();
         let text = tokio::fs::read_to_string(&path).await?;
         Ok(if sensitive {
             text
@@ -722,6 +757,14 @@ fn named_server(spec: &PolicySpec) -> bool {
 /// The note on an internal DNS session that went directly instead of to a
 /// REJECT, or to a chain that ends at one.
 const REJECT_BYPASSED: &str = "dns-follow: reject bypassed to keep DNS working";
+
+/// The refusal of an internal DNS session while the engine is suspended: the
+/// session fails with the sentence, and the resolver hears the same — no
+/// policy was chosen, so none is named.
+fn refused_internal(handle: &SessionHandle) -> io::Error {
+    handle.finish(SessionOutcome::Failed(REFUSED_STRICT.to_string()));
+    io::Error::other(REFUSED_STRICT)
+}
 
 /// The bypass every anti-loop arm of `dial_internal` takes (a REJECT, a
 /// proxy configured by host name, a chain that ends at REJECT): note `why`
@@ -886,6 +929,9 @@ impl Engine {
         handle: Arc<SessionHandle>,
         fallback: &Arc<dyn Connector>,
     ) -> io::Result<BoxedStream> {
+        if self.is_suspended() {
+            return Err(refused_internal(&handle));
+        }
         let target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
         let opts = ConnectOpts {
             timeout: CONNECT_TIMEOUT,
@@ -969,6 +1015,9 @@ impl Engine {
         handle: Arc<SessionHandle>,
         fallback: &Arc<dyn Connector>,
     ) -> io::Result<BoxedDatagram> {
+        if self.is_suspended() {
+            return Err(refused_internal(&handle));
+        }
         let target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
         let opts = ConnectOpts {
             timeout: CONNECT_TIMEOUT,
@@ -1183,6 +1232,11 @@ impl Engine {
         registry: Arc<PolicyRegistry>,
         handle: Arc<SessionHandle>,
     ) -> Result<Dialed, DialError> {
+        // Refused before anything is asked of the rules, a lookup or a `smart`
+        // group: each would count a session that goes nowhere.
+        if self.is_suspended() {
+            return fail(handle, FailKind::Other, REFUSED_STRICT);
+        }
         let policy = match self.choose_policy(&rt, &registry, &handle).await {
             Chosen::Policy(p) => p,
             Chosen::DnsFailed => return fail(handle, FailKind::Dns, "dns lookup failed"),

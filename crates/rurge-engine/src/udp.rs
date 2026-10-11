@@ -4,7 +4,7 @@
 //! every datagram it receives, whoever sent it (full cone, M5-D2).
 
 use crate::auto::{EVALUATION_FAILED, resolve_ready};
-use crate::engine::{CONNECT_TIMEOUT, Chosen, Engine};
+use crate::engine::{CONNECT_TIMEOUT, Chosen, Engine, REFUSED_STRICT};
 use rurge_config::HostName;
 use rurge_config::general::{BlockQuicGlobal, UdpFallback};
 use rurge_config::policy::Builtin;
@@ -479,6 +479,14 @@ async fn open(
     handle: &Arc<SessionHandle>,
     to: &Target,
 ) -> Result<(Arc<Flow>, Arc<Carrier>, Target), SessionOutcome> {
+    // Refused before anything is asked of the rules, a lookup or a `smart`
+    // group, and as a failure, not a rejection: a failed flow is tried again
+    // after `RETRY_AFTER`, so it is served as soon as the suspension ends,
+    // where a rejected one stays until its client has been quiet for
+    // `FLOW_IDLE`.
+    if engine.is_suspended() {
+        return Err(failed(handle, REFUSED_STRICT));
+    }
     let (rt, registry) = engine.snapshot();
     let policy = match engine.choose_policy(&rt, &registry, handle).await {
         Chosen::Policy(p) => p,

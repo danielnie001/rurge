@@ -21,7 +21,7 @@ mod udp;
 pub mod views;
 
 pub use control::{Control, LogLevel, Mode, ReloadReport};
-pub use engine::{Engine, ListenerSpec, PoliciesView, RuleView, UnknownPolicy};
+pub use engine::{Engine, ListenerSpec, PoliciesView, REFUSED_STRICT, RuleView, UnknownPolicy};
 pub use observe::{RecordStatus, RequestLog, RequestRecord, TrafficStats, TrafficTotals};
 pub use outbounds::{EngineFactory, dry_build, load_checked};
 pub use runtime::{Runtime, RuntimeOptions};

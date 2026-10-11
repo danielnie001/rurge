@@ -9,12 +9,14 @@ use rurge_config::HostName;
 use rurge_config::config::{LoadOptions, from_text};
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::{ListenerKind, SessionInfo, Transport};
+use rurge_config::{Remote, RemoteSource};
 use rurge_dns::Source;
 use rurge_dns::system::StaticSystemDns;
 use rurge_dns::testing::{Doh3Script, DoqScript, FakeDoh3, FakeDoq, MockDns};
 use rurge_engine::stack::StackOptions;
 use rurge_engine::{
-    Engine, EngineShared, ListenerSpec, RecordStatus, RequestRecord, Runtime, RuntimeOptions,
+    Engine, EngineShared, ListenerSpec, REFUSED_STRICT, RecordStatus, RequestRecord, Runtime,
+    RuntimeOptions,
 };
 use rurge_inbound::{DialError, Dialer, Running, SessionHandle, SessionOutcome};
 use rurge_net::connector::Target;
@@ -27,9 +29,10 @@ use rurge_rules::{GeoUrls, OutboundMode};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use url::Url;
 
 struct Harness {
     _dir: tempfile::TempDir,
@@ -2532,6 +2535,84 @@ ipv6 = false\n[Proxy]\nSocks = socks5, 127.0.0.1, {}, udp-relay=true\n[Proxy Gro
     assert!(internal.is_empty(), "{internal:?}");
 }
 
+/// A suspended engine refuses the connection of a DNS server that follows
+/// the outbound mode like any other session: the resolver hears the sentence
+/// — no policy was chosen, so none is named —, the server is never reached,
+/// and the session is a failed one with no rule and no policy. When the
+/// suspension ends the same server answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_suspended_engine_refuses_a_dns_servers_tcp_connection() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile(&format!("tcp://{}", dns.addr()), "", "");
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    engine.suspend(Some(WHY.to_string()));
+    let err = lookup_outcome(&engine)
+        .await
+        .expect_err("the only server is refused");
+    let heard = err.to_string();
+    assert!(heard.contains(REFUSED_STRICT), "{heard}");
+    assert!(
+        !heard.contains("via ") && !heard.contains("marker-reason"),
+        "{heard}"
+    );
+    let sessions = internal_sessions(&engine);
+    assert!(
+        sessions.iter().any(|r| r.status == RecordStatus::Failed
+            && r.transport == Transport::Tcp
+            && r.error.as_deref() == Some(REFUSED_STRICT)
+            && r.rule.is_none()
+            && r.policy.is_empty()),
+        "{sessions:?}"
+    );
+    assert!(dns.queries().is_empty(), "the server is never reached");
+
+    engine.suspend(None);
+    let res = lookup_target(&engine).await;
+    assert_eq!(res.v4, [Ipv4Addr::LOCALHOST]);
+    assert!(!dns.queries().is_empty());
+}
+
+/// The same for the QUIC carrier of a DoQ server: the carrier is not opened,
+/// and the server sees no connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_suspended_engine_refuses_a_dns_servers_quic_carrier() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile(&format!("quic://{}", doq.addr()), "", "");
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    engine.suspend(Some(WHY.to_string()));
+    let err = lookup_outcome(&engine)
+        .await
+        .expect_err("the only server is refused");
+    let heard = err.to_string();
+    assert!(heard.contains(REFUSED_STRICT), "{heard}");
+    assert!(
+        !heard.contains("via ") && !heard.contains("marker-reason"),
+        "{heard}"
+    );
+    let carriers = carrier_sessions(&engine);
+    assert!(
+        carriers.iter().any(|r| r.status == RecordStatus::Failed
+            && r.error.as_deref() == Some(REFUSED_STRICT)
+            && r.rule.is_none()
+            && r.policy.is_empty()),
+        "{carriers:?}"
+    );
+    assert_eq!(doq.connections(), 0, "the server is never reached");
+
+    engine.suspend(None);
+    let res = lookup_target(&engine).await;
+    assert_eq!(
+        res.source,
+        Source::Upstream(format!("quic://{}", doq.addr()))
+    );
+    assert_eq!(doq.connections(), 1);
+}
+
 #[tokio::test]
 async fn persisted_group_selection_is_honored() {
     // Pick = select, HK, DIRECT; a state selecting DIRECT must resolve to DIRECT
@@ -2657,6 +2738,279 @@ async fn runtime_mode_and_global_policy_override_routing() {
     );
     let full = h.engine.config_text(true).await.unwrap();
     assert!(full.contains("password=x"));
+}
+
+/// What a managed profile was downloaded as: the copy of the one address.
+struct Downloaded {
+    url: Url,
+    text: String,
+    path: std::path::PathBuf,
+}
+
+impl RemoteSource for Downloaded {
+    fn get(&self, url: &Url) -> Remote {
+        if *url != self.url {
+            return Remote::Missing {
+                why: Some("not downloaded".to_string()),
+            };
+        }
+        Remote::Text {
+            text: self.text.clone(),
+            path: self.path.clone(),
+            fetched_at: SystemTime::now(),
+        }
+    }
+}
+
+/// The text of the profile in effect is what `GET /v1/profiles/current`
+/// shows. While the downloaded copy of a managed profile is in effect that is
+/// the copy, not the local file that points to it — the engine still names the
+/// local file as the profile —, and secrets are redacted in it as in any text.
+#[tokio::test]
+async fn the_profile_text_is_the_downloaded_copy_while_that_is_in_effect() {
+    const ADDRESS: &str = "https://profiles.example/managed.conf";
+    let pointer = format!("#!MANAGED-CONFIG {ADDRESS} interval=3600\n");
+    let copy = format!(
+        "#!MANAGED-CONFIG {ADDRESS} interval=3600\n[General]\nhttp-listen = 127.0.0.1:0\n\
+socks5-listen = 127.0.0.1:0\nipv6 = false\n[Proxy]\n\
+Locked = trojan, 1.2.3.4, 443, password=copy-secret\n[Proxy Group]\n[Rule]\nFINAL,DIRECT\n"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let local = dir.path().join("t.conf");
+    std::fs::write(&local, &pointer).unwrap();
+    let kept = dir.path().join("managed-copy.conf");
+    std::fs::write(&kept, &copy).unwrap();
+    let mut opts = LoadOptions::for_tests();
+    opts.remote = Some(Arc::new(Downloaded {
+        url: Url::parse(ADDRESS).unwrap(),
+        text: copy.clone(),
+        path: kept.clone(),
+    }));
+    let loaded = rurge_config::config::load(&local, &opts).unwrap();
+    assert!(
+        !loaded.diagnostics.has_errors(),
+        "{:?}",
+        loaded
+            .diagnostics
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+    );
+    // the copy is the generation's text, and the local file stays its profile
+    assert_eq!(loaded.config.source.main_text, kept);
+    assert_eq!(loaded.config.source.main, local);
+    let runtime = Runtime::build(
+        loaded.config,
+        RuntimeOptions {
+            stack: common::stack_options(dir.path()),
+            outbound_mode: OutboundMode::Rule,
+            idle_timeout: Duration::from_secs(600),
+            shared: EngineShared::default(),
+            request_log_size: 1000,
+        },
+    )
+    .await
+    .unwrap();
+    let engine = Engine::new(runtime);
+    assert_eq!(engine.profile_path(), local);
+    assert_eq!(engine.config_text(true).await.unwrap(), copy);
+    let shown = engine.config_text(false).await.unwrap();
+    assert!(
+        shown.contains("Locked = trojan, 1.2.3.4, 443, password=***")
+            && !shown.contains("copy-secret"),
+        "{shown}"
+    );
+}
+
+/// What a test gives as the reason of a suspension; no session says it.
+const WHY: &str = "the update failed: marker-reason";
+
+/// The reply of the SOCKS5 listener to a CONNECT to `host:port` (the host as
+/// a name), and the connection it came on.
+async fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> ([u8; 10], TcpStream) {
+    let mut s = TcpStream::connect(proxy).await.unwrap();
+    s.write_all(&[5, 1, 0]).await.unwrap();
+    let mut method = [0u8; 2];
+    s.read_exact(&mut method).await.unwrap();
+    assert_eq!(method, [5, 0]);
+    let mut request = vec![5, 1, 0, 3, host.len() as u8];
+    request.extend_from_slice(host.as_bytes());
+    request.extend_from_slice(&port.to_be_bytes());
+    s.write_all(&request).await.unwrap();
+    let mut reply = [0u8; 10];
+    tokio::time::timeout(Duration::from_secs(10), s.read_exact(&mut reply))
+        .await
+        .expect("the proxy answers")
+        .unwrap();
+    (reply, s)
+}
+
+/// While the engine is suspended a CONNECT is answered with the 502 page,
+/// which says why. The refusal comes before the rules — a destination a rule
+/// rejects is refused the same way —, nothing is looked up for the session,
+/// and its record has no rule and no policy. Once the suspension ends the
+/// same requests are treated as ever.
+#[tokio::test]
+async fn a_suspended_engine_refuses_a_connect_before_the_rules_and_lets_it_through_again() {
+    let h = harness("", "DOMAIN,ads.test,REJECT", OutboundMode::Rule).await;
+    let port = h.target_port();
+    h.engine.suspend(Some(WHY.to_string()));
+    for host in ["target.test", "ads.test"] {
+        let mut s = TcpStream::connect(h.http()).await.unwrap();
+        let (head, body) = http_exchange(
+            &mut s,
+            &format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n"),
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{host}: {head}");
+        let page = String::from_utf8_lossy(&body);
+        assert!(page.contains(REFUSED_STRICT), "{host}: {page}");
+        let dst = format!("{host}:{port}");
+        let record = wait_for_record(&h.engine, Duration::from_secs(3), |r| r.dst == dst)
+            .await
+            .expect("the refused session's record");
+        assert_eq!(record.status, RecordStatus::Failed, "{record:?}");
+        assert_eq!(record.error.as_deref(), Some(REFUSED_STRICT), "{record:?}");
+        assert_eq!(record.rule, None, "{record:?}");
+        assert!(record.policy.is_empty(), "{record:?}");
+    }
+    assert_eq!(
+        h.dns
+            .query_count("target.test", rurge_dns::message::Qtype::A),
+        0,
+        "nothing is looked up for a refused session"
+    );
+
+    h.engine.suspend(None);
+    let mut tunnel = common::connect_via_http(h.http(), &format!("target.test:{port}")).await;
+    let page = common::get(&mut tunnel, "target.test", "/hello").await;
+    assert!(page.ends_with("hi there"), "{page}");
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    let (head, _) = http_exchange(
+        &mut s,
+        &format!("CONNECT ads.test:{port} HTTP/1.1\r\nHost: ads.test:{port}\r\n\r\n"),
+    )
+    .await;
+    assert!(head.is_empty(), "the rule rejects again: {head}");
+}
+
+/// A plain request gets the same page and the SOCKS5 listener its "connection
+/// refused" (0x05); the target is never reached, and the sessions are failed
+/// ones on the record. After the suspension both go through.
+#[tokio::test]
+async fn a_suspended_engine_refuses_a_plain_request_and_a_socks5_connect() {
+    let h = harness("", "", OutboundMode::Rule).await;
+    let port = h.target_port();
+    let url = format!("http://target.test:{port}/hello");
+    h.engine.suspend(Some(WHY.to_string()));
+    let (head, body) = get_via_proxy(h.http(), &url).await;
+    assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+    let page = String::from_utf8_lossy(&body);
+    assert!(page.contains(REFUSED_STRICT), "{page}");
+    let (reply, _) = socks5_connect(h.socks(), "target.test", port).await;
+    assert_eq!(reply[1], 0x05, "{reply:?}");
+    assert!(
+        h.target.requests().is_empty(),
+        "the target is never reached"
+    );
+    assert_eq!(
+        h.dns
+            .query_count("target.test", rurge_dns::message::Qtype::A),
+        0,
+        "nothing is looked up for a refused session"
+    );
+    for listener in [ListenerKind::Http, ListenerKind::Socks5] {
+        let record = wait_for_record(&h.engine, Duration::from_secs(3), |r| {
+            r.listener == listener
+        })
+        .await
+        .expect("the refused session's record");
+        assert_eq!(record.status, RecordStatus::Failed, "{record:?}");
+        assert_eq!(record.error.as_deref(), Some(REFUSED_STRICT), "{record:?}");
+        assert_eq!(record.rule, None, "{record:?}");
+        assert!(record.policy.is_empty(), "{record:?}");
+    }
+
+    h.engine.suspend(None);
+    let (head, body) = get_via_proxy(h.http(), &url).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"hi there");
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", port).await;
+    assert_eq!(reply[1], 0, "{reply:?}");
+    let (head, body) = http_exchange(
+        &mut tunnel,
+        "GET /hello HTTP/1.1\r\nHost: target.test\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"hi there");
+}
+
+/// A suspension outlives a reload, like the outbound mode; its reason is
+/// kept, replaced and cleared, and goes into no session's text.
+#[tokio::test]
+async fn a_suspension_outlives_a_reload_and_its_reason_stays_out_of_the_sessions() {
+    let h = harness("", "", OutboundMode::Rule).await;
+    let port = h.target_port();
+    h.engine.suspend(Some(WHY.to_string()));
+    let next = build_runtime(
+        h._dir.path(),
+        &h.dns,
+        "",
+        "",
+        OutboundMode::Rule,
+        Duration::from_secs(600),
+        h.engine.shared(),
+    )
+    .await;
+    h.engine.swap_runtime(next);
+    assert_eq!(h.engine.suspended().as_deref(), Some(WHY));
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    let (head, body) = http_exchange(
+        &mut s,
+        &format!("CONNECT target.test:{port} HTTP/1.1\r\nHost: target.test:{port}\r\n\r\n"),
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+    let page = String::from_utf8_lossy(&body);
+    assert!(page.contains(REFUSED_STRICT), "{page}");
+    let record = wait_for_record(&h.engine, Duration::from_secs(3), |r| {
+        r.dst.starts_with("target.test:")
+    })
+    .await
+    .expect("the refused session's record");
+    for text in [page.to_string(), format!("{record:?}")] {
+        assert!(!text.contains("marker-reason"), "{text}");
+    }
+
+    h.engine.suspend(Some("another reason".to_string()));
+    assert_eq!(h.engine.suspended().as_deref(), Some("another reason"));
+    h.engine.suspend(None);
+    assert_eq!(h.engine.suspended(), None);
+    // nothing to end: nothing changes
+    h.engine.suspend(None);
+    assert_eq!(h.engine.suspended(), None);
+    common::connect_via_http(h.http(), &format!("target.test:{port}")).await;
+}
+
+/// Only sessions that begin are refused: a tunnel that is open goes on, and
+/// the listener still takes the connections of new ones.
+#[tokio::test]
+async fn a_suspension_leaves_the_sessions_that_are_open_alone() {
+    let h = common::harness(common::Profile::default()).await;
+    let echo = rurge_proto::testing::echo_server().await;
+    let mut open = common::connect_via_http(h.http(), &echo.to_string()).await;
+    common::echo_through(&mut open, b"before").await;
+    h.engine.suspend(Some(WHY.to_string()));
+    common::echo_through(&mut open, b"after").await;
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    let (head, _) = http_exchange(
+        &mut s,
+        &format!("CONNECT {echo} HTTP/1.1\r\nHost: {echo}\r\n\r\n"),
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+    common::echo_through(&mut open, b"still open").await;
 }
 
 // What a dial leaves on the request record: the port of the listener the
