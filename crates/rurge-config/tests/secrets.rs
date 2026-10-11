@@ -3,13 +3,13 @@
 //! profile. Every secret below carries the marker `S3CR3T`, or is the one
 //! UUID, so one search finds whatever got out.
 
-use rurge_config::config::{LoadOptions, Loaded, from_text};
+use rurge_config::config::{LoadOptions, Loaded, from_text, load as load_file};
 use rurge_config::redact::redact_profile;
 use rurge_config::{Remote, RemoteSource};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use url::Url;
 
 const MARKER: &str = "S3CR3T";
@@ -270,6 +270,15 @@ fn the_texts_a_loaded_profile_gives_out_hold_no_secret() {
     let loaded = load(&profile());
     let config = &loaded.config;
     let summary = config.summary();
+    // the summary derives `Debug` and `Serialize` and has a field for where a
+    // managed profile comes from. That is the link, a credential as a whole:
+    // the summary shows where it goes and nothing more
+    assert_eq!(
+        summary.managed.as_deref(),
+        Some("https://sub.example/\u{2026}")
+    );
+    let whole = format!("{summary:?} {}", serde_json::to_string(&summary).unwrap());
+    assert_eq!(leaks(&whole), Vec::<String>::new());
     let mut texts: Vec<String> = config.rules.iter().map(ToString::to_string).collect();
     texts.extend(
         config
@@ -280,6 +289,7 @@ fn the_texts_a_loaded_profile_gives_out_hold_no_secret() {
     texts.extend(config.hosts.iter().map(|host| host.raw_key.clone()));
     texts.extend(summary.rules);
     texts.extend(summary.hosts);
+    texts.extend(summary.managed);
     assert_eq!(leaks(&texts.join("\n")), Vec::<String>::new());
     // and they still say which line it was
     for told in [
@@ -1050,4 +1060,140 @@ fn a_remote_include_shows_nothing_of_its_link_or_its_text() {
     // and of the options only that there is a source
     assert!(format!("{opts:?}").contains("remote: Some("));
     assert!(format!("{:?}", LoadOptions::for_tests()).contains("remote: None"));
+}
+
+/// A copy of the managed profile, downloaded at `at`.
+fn copy_at(text: String, n: u32, at: SystemTime) -> Remote {
+    Remote::Text {
+        text,
+        path: PathBuf::from(format!("/cache/{n}.conf")),
+        fetched_at: at,
+    }
+}
+
+/// The link of a managed profile is a credential as a whole, in the local
+/// file and in every copy on the way: its user name, password, path, query and
+/// fragment. Nothing of it, and nothing of a copy's text, comes out of a load
+/// of any of the ways it can go: not in the `Debug` of what loaded, not in a
+/// diagnostic or in the summary, not in the redacted profile.
+#[test]
+fn a_managed_profile_shows_nothing_of_its_link_or_its_copy() {
+    let local_link = format!(
+        "https://{MARKER}-name:{MARKER}-user@sub.example/managed/{MARKER}-path?token={MARKER}-query#{MARKER}-fragment"
+    );
+    let moved_link =
+        format!("https://sub.example/moved/{MARKER}-moved?token={MARKER}-movedquery#{MARKER}-frag");
+    let local =
+        format!("#!MANAGED-CONFIG {local_link} interval=43200 strict=true\n[Rule]\nFINAL,DIRECT\n");
+    let body = format!(
+        "[Proxy]\nT = trojan, t.example, 443, password={MARKER}-copypw\n[Rule]\nDOMAIN,a.example,T\nFINAL,DIRECT\n"
+    );
+    let naming = |to: &str| format!("#!MANAGED-CONFIG {to} interval=7200 strict=true\n{body}");
+    // the loader asks for a link without its fragment, which no server sees
+    let key = |link: &str| {
+        let mut url = Url::parse(link).unwrap();
+        url.set_fragment(None);
+        url.to_string()
+    };
+    let at = |seconds: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+    let (before, downloaded_at, after) = (at(1_000_000_000), at(1_100_000_000), at(1_200_000_000));
+    let moved_never_downloaded = || {
+        HashMap::from([
+            (
+                key(&local_link),
+                copy_at(naming(&moved_link), 1, downloaded_at),
+            ),
+            (
+                key(&moved_link),
+                Remote::Missing {
+                    why: Some("connection refused".to_string()),
+                },
+            ),
+        ])
+    };
+    // the scene, what the remote files are, when the local file was changed,
+    // whether a copy is in effect, and a code the load has to say
+    let scenes = [
+        (
+            "an address that moved and was never downloaded",
+            moved_never_downloaded(),
+            before,
+            true,
+            "W0022",
+        ),
+        (
+            "the same, with the local file changed after the download",
+            moved_never_downloaded(),
+            after,
+            false,
+            "I0004",
+        ),
+        (
+            "a copy that names no address",
+            HashMap::from([(key(&local_link), copy_at(body.clone(), 1, downloaded_at))]),
+            before,
+            true,
+            "W0034",
+        ),
+        (
+            "addresses that lead back to each other",
+            HashMap::from([
+                (
+                    key(&local_link),
+                    copy_at(naming(&moved_link), 1, downloaded_at),
+                ),
+                (
+                    key(&moved_link),
+                    copy_at(naming(&local_link), 2, downloaded_at),
+                ),
+            ]),
+            before,
+            true,
+            "W0034",
+        ),
+    ];
+    for (what, answers, modified, copy_in_effect, code) in scenes {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.conf");
+        std::fs::write(&main, &local).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&main)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let mut opts = LoadOptions::for_tests();
+        opts.remote = Some(Arc::new(Downloaded(answers)));
+        let loaded = load_file(&main, &opts).unwrap();
+
+        // the links were read, and the text in effect is the one meant, or the
+        // checks below would find nothing to find
+        let said: Vec<&str> = loaded.diagnostics.iter().map(|d| d.code).collect();
+        assert!(said.contains(&code), "{what}: {said:?}");
+        assert!(!loaded.config.source.remote.is_empty(), "{what}");
+        assert_eq!(
+            loaded.config.spec("T").is_some(),
+            copy_in_effect,
+            "{what}: {said:?}"
+        );
+
+        let mut found = leaks(&format!("{loaded:#?}"));
+        for d in loaded.diagnostics.iter() {
+            found.extend(leaks(&d.to_string()));
+            found.extend(leaks(&format!("{d:?}")));
+        }
+        for r in &loaded.config.source.remote {
+            found.extend(leaks(&format!("{r:?}")));
+        }
+        let summary = loaded.config.summary();
+        found.extend(leaks(&format!(
+            "{summary:?} {}",
+            serde_json::to_string(&summary).unwrap()
+        )));
+        found.extend(leaks(&format!("{:?}", loaded.config.managed)));
+        found.extend(leaks(&format!("{opts:?}")));
+        found.extend(leaks(&redact_profile(&local)));
+        found.extend(leaks(&redact_profile(&naming(&moved_link))));
+        assert_eq!(found, Vec::<String>::new(), "{what}");
+    }
 }

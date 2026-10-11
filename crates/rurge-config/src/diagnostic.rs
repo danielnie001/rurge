@@ -254,10 +254,18 @@ pub mod codes {
     /// thing the user did not write: it includes a local file, or defines an
     /// `external` policy. The line is ignored or the policy is not started.
     pub const W_REMOTE_LOCAL_ACCESS: &str = "W0033";
+    /// The downloaded copy of a managed profile is in effect and will not be
+    /// updated: it carries no `#!MANAGED-CONFIG` line of its own, or the lines
+    /// of the copies lead through too many addresses.
+    pub const W_MANAGED_NOT_UPDATED: &str = "W0034";
     pub const I_LEGACY_MIGRATED: &str = "I0001";
     pub const I_LINE_DISABLED: &str = "I0002";
     /// GeoIP / ASN database file not present yet.
     pub const I_GEOIP_DB_MISSING: &str = "I0003";
+    /// Which text of a managed profile is in effect when it is not the local
+    /// file alone: the downloaded copy, or the local file changed since the
+    /// last update.
+    pub const I_MANAGED_SOURCE: &str = "I0004";
 
     /// What to do about a diagnostic of `code`, when there is one thing to say
     /// for every place that emits it. The constructors of `Diagnostic` take
@@ -266,8 +274,8 @@ pub mod codes {
     ///
     /// Where the places that emit a code want different fixes, the sentence
     /// says what they share or the code has none. `E0014` has none because
-    /// each of its four places carries a hint of its own, and `W0033` because
-    /// each of its two does. The other codes without one:
+    /// each of its four places carries a hint of its own, and `W0033` and
+    /// `W0034` because each of their two does. The other codes without one:
     ///
     /// - `E0009`: no place emits it any more.
     /// - `E0017`: the message is the shape to write, a different one at each
@@ -292,7 +300,7 @@ pub mod codes {
     /// - `W0031`: the cipher of an imported line is not the reader's to
     ///   change, and the message of the profile's own line says to use an AEAD
     ///   cipher.
-    /// - `I0001`, `I0002`, `I0003`: they inform.
+    /// - `I0001`, `I0002`, `I0003`, `I0004`: they inform.
     pub fn hint(code: &str) -> Option<&'static str> {
         Some(match code {
             E_SYNTAX => "compare the line with the syntax the Surge manual gives for this section",
@@ -408,7 +416,11 @@ mod tests {
     ];
 
     /// The codes whose every site carries a hint of its own.
-    const PER_SITE: &[&str] = &[codes::E_NOT_ALLOWED_HERE, codes::W_REMOTE_LOCAL_ACCESS];
+    const PER_SITE: &[&str] = &[
+        codes::E_NOT_ALLOWED_HERE,
+        codes::W_REMOTE_LOCAL_ACCESS,
+        codes::W_MANAGED_NOT_UPDATED,
+    ];
 
     /// The codes without a hint; `codes::hint` says why beside its table.
     const WITHOUT: &[&str] = &[
@@ -437,6 +449,7 @@ mod tests {
         codes::I_LEGACY_MIGRATED,
         codes::I_LINE_DISABLED,
         codes::I_GEOIP_DB_MISSING,
+        codes::I_MANAGED_SOURCE,
     ];
 
     /// The codes of `codes`, read off the source, so that a constant added

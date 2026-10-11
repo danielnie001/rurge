@@ -5,8 +5,10 @@
 //! loader reports in `SourceInfo::remote` what it asked for, so that the
 //! caller can download what is missing and keep the rest up to date.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 use url::Url;
 
@@ -108,6 +110,35 @@ impl RemoteRef {
     }
 }
 
+/// A source that asks the one it wraps once per URL and answers the same from
+/// then on. A load comes back to an address more than once, from the walk along
+/// a managed profile and from the includes of the text in effect, and what the
+/// wrapped source reads can change in between (a download lands on the disk):
+/// a load must read one text for an address.
+pub(crate) struct Once<'a> {
+    source: &'a dyn RemoteSource,
+    answers: Mutex<HashMap<Url, Remote>>,
+}
+
+impl<'a> Once<'a> {
+    pub(crate) fn new(source: &'a dyn RemoteSource) -> Once<'a> {
+        Once {
+            source,
+            answers: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl RemoteSource for Once<'_> {
+    fn get(&self, url: &Url) -> Remote {
+        let mut answers = self.answers.lock().unwrap_or_else(PoisonError::into_inner);
+        answers
+            .entry(url.clone())
+            .or_insert_with(|| self.source.get(url))
+            .clone()
+    }
+}
+
 /// Where a link goes, without its user name, password, path and query: all
 /// that a `Debug`, a label or a log line may show of a link, whose other parts
 /// can be the token a provider issued.
@@ -177,6 +208,16 @@ pub(crate) mod fake {
             self
         }
 
+        /// The text of `url` was downloaded, or last confirmed up to date, at
+        /// `at`.
+        pub(crate) fn fetched(mut self, url: &str, at: SystemTime) -> Fake {
+            match self.answers.get_mut(&Url::parse(url).unwrap()) {
+                Some(Remote::Text { fetched_at, .. }) => *fetched_at = at,
+                _ => panic!("no text for {url}"),
+            }
+            self
+        }
+
         pub(crate) fn missing(mut self, url: &str, why: Option<&str>) -> Fake {
             self.answers.insert(
                 Url::parse(url).unwrap(),
@@ -241,6 +282,49 @@ mod tests {
                 assert!(!debug.contains(part), "{part}: {debug}");
             }
         }
+    }
+
+    /// A source whose answer is not the same twice, as the disk is when a
+    /// download lands between two asks: nothing the first time, a text after.
+    struct Changing(std::sync::atomic::AtomicUsize);
+
+    impl RemoteSource for Changing {
+        fn get(&self, _: &Url) -> Remote {
+            match self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => Remote::Missing {
+                    why: Some("not yet".to_string()),
+                },
+                n => Remote::Text {
+                    text: format!("answer {n}"),
+                    path: PathBuf::from("/cache/1.conf"),
+                    fetched_at: SystemTime::UNIX_EPOCH,
+                },
+            }
+        }
+    }
+
+    /// What `once` has for `url`, as a word: the reason or the text.
+    fn said(once: &Once<'_>, url: &Url) -> String {
+        match once.get(url) {
+            Remote::Missing { why } => why.unwrap_or_default(),
+            Remote::Text { text, .. } => text,
+        }
+    }
+
+    /// An address keeps the answer it got first, however often it is asked
+    /// for, and the source is asked once for each: an answer that said nothing
+    /// is as good as any other.
+    #[test]
+    fn a_source_wrapped_in_once_answers_the_same_for_the_rest_of_its_life() {
+        let source = Changing(Default::default());
+        let once = Once::new(&source);
+        let a = Url::parse("https://example.com/a.conf").unwrap();
+        let b = Url::parse("https://example.com/b.conf").unwrap();
+        assert_eq!(said(&once, &a), "not yet");
+        assert_eq!(said(&once, &b), "answer 1");
+        assert_eq!(said(&once, &a), "not yet");
+        assert_eq!(said(&once, &b), "answer 1");
+        assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// The text of a profile can hold credentials.

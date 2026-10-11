@@ -110,7 +110,7 @@ expression: "(loaded.config.summary(), diags)"
     - MTProto
     - Testing
   unknown_sections: []
-  managed: "https://example.com/kitchen-sink.conf"
+  managed: "https://example.com/…"
 - - "warning[W0016]: sections parsed but inactive in this version: [MITM], [URL Rewrite], [Header Rewrite], [Body Rewrite], [Map Local], [Script], [Panel], [SSID Setting], [Port Forwarding], [Tailscale tailnet], [DHCP], [Snell Server], [MTProto], [Testing]"
   - "warning[W0004] valid/kitchen-sink.conf:40: `compatibility-mode` is iOS-only and has no effect on desktop platforms"
   - "warning[W0004] valid/kitchen-sink.conf:41: `allow-wifi-access` is iOS-only and has no effect on desktop platforms"

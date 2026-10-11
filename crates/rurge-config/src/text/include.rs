@@ -1288,6 +1288,29 @@ FINAL,DIRECT
         assert!(remote.iter().all(|r| !r.strict));
     }
 
+    /// The line of an included text is read as the line of any profile is: an
+    /// interval below the shortest is the shortest, and 0 says nothing. What
+    /// is wrong in the line is not reported, as for a local include.
+    #[test]
+    fn the_interval_of_a_remote_include_is_at_least_sixty_seconds() {
+        let fake = Fake::new()
+            .text(
+                "https://example.com/short.conf",
+                "#!MANAGED-CONFIG https://elsewhere.example/p.conf interval=30\n[Rule]\nDOMAIN,a.example,DIRECT\n",
+            )
+            .text(
+                "https://example.com/zero.conf",
+                "#!MANAGED-CONFIG https://elsewhere.example/p.conf interval=0\n[Rule]\nDOMAIN,b.example,DIRECT\n",
+            );
+        let (_, d, remote) = expand_text(
+            "[Rule]\n#!include https://example.com/short.conf\n#!include https://example.com/zero.conf\nFINAL,DIRECT\n",
+            Some(&fake),
+        );
+        assert!(d.is_empty(), "{:?}", d.into_vec());
+        let intervals: Vec<u64> = remote.iter().map(|r| r.interval.as_secs()).collect();
+        assert_eq!(intervals, [60, 86400]);
+    }
+
     /// One link named in several sections is one remote file, asked for once
     /// and flagged when any of them lacks the section it is named for.
     #[test]

@@ -14,6 +14,10 @@ pub enum Origin {
     Module(String),
     /// A line of a text that was downloaded: the file that holds it.
     Remote(Arc<Path>),
+    /// A line of the downloaded copy of the managed profile, and the file that
+    /// holds it. While the copy is in effect it is the profile itself, unlike
+    /// the text of a remote include, so it may include local files.
+    Managed(Arc<Path>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

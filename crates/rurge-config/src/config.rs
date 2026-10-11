@@ -5,12 +5,12 @@ use crate::diagnostic::{Diagnostic, Diagnostics, codes};
 use crate::general::{General, parse_general};
 use crate::host::{HostEntry, HostKey, parse_host_entry};
 use crate::keystore::{KeystoreItem, parse_keystore_item, unknown_field};
-use crate::managed::{ManagedConfig, parse_managed};
+use crate::managed::{self, ManagedConfig, parse_managed};
 use crate::policy::{
     Builtin, GroupKind, PolicyGroup, PolicyKind, ProxyPolicy, is_name, named, parse_group,
     parse_policy, quoted_name, shown_members,
 };
-use crate::remote::{RemoteRef, RemoteSource};
+use crate::remote::{Once, RemoteRef, RemoteSource};
 use crate::requirement::{self, Environment};
 use crate::rule::{
     ParseCtx, PolicyRef, ResourceRef, Rule, RuleKind, SubRule, parse_rule, parse_subrule,
@@ -156,7 +156,8 @@ pub struct LoadOptions {
     pub capabilities: Capabilities,
     /// Where the text of what the profile names by a URL comes from. `None`
     /// for a caller with no data directory to keep downloaded texts in: a
-    /// remote `#!include` is then not read.
+    /// remote `#!include` is then not read, and the local file is the profile
+    /// even when it is a managed one.
     pub remote: Option<Arc<dyn RemoteSource>>,
 }
 
@@ -200,13 +201,15 @@ pub struct InlineRuleset {
 pub struct SourceInfo {
     /// The local file that was loaded.
     pub main: PathBuf,
-    /// The local files it includes. The files that downloaded texts are kept
-    /// in are not among them.
+    /// The local files the text in effect includes. The files that downloaded
+    /// texts are kept in are not among them.
     pub includes: Vec<PathBuf>,
-    /// The file the text of the profile was read from.
+    /// The file the text of the profile was read from: `main`, or the
+    /// downloaded copy of a managed profile while that is in effect.
     pub main_text: PathBuf,
     /// Every remote file the load came across, one per URL, in the order it
-    /// first came to them.
+    /// first came to them: the addresses a managed profile leads through
+    /// come first.
     pub remote: Vec<RemoteRef>,
 }
 
@@ -232,6 +235,8 @@ pub struct Config {
     /// Every `[WireGuard <name>]` section without errors, in profile order.
     pub wireguard: Vec<WireGuardSection>,
     pub deferred: DeferredSections,
+    /// The `#!MANAGED-CONFIG` line of the text in effect: none when it is a
+    /// downloaded copy that carries no line.
     pub managed: Option<ManagedConfig>,
     pub unknown_sections: Vec<String>,
     pub source: SourceInfo,
@@ -342,7 +347,7 @@ impl Config {
                 .map(|s| s.name.clone())
                 .collect(),
             unknown_sections: self.unknown_sections.clone(),
-            managed: self.managed.as_ref().map(|m| m.url.clone()),
+            managed: self.managed.as_ref().map(ManagedConfig::shown),
         }
     }
 
@@ -401,36 +406,124 @@ pub enum LoadError {
     },
 }
 
+/// Loads the profile in the file `path`. When its header carries a
+/// `#!MANAGED-CONFIG` line and `opts.remote` is there, the text that is in
+/// effect is the file itself, or the copy that was downloaded from the address
+/// the line names: `managed::choose` says which. The lines of a copy stand in
+/// the file that holds it, and `SourceInfo::main_text` names it.
 pub fn load(path: &Path, opts: &LoadOptions) -> Result<Loaded, LoadError> {
     let text = std::fs::read_to_string(path).map_err(|source| LoadError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    Ok(from_text(&text, path, opts))
+    let Some(source) = opts.remote.as_deref() else {
+        return Ok(from_text(&text, path, opts));
+    };
+    let (mut profile, diags) = parse_str(&text, Arc::from(path), Origin::Main);
+    let Some(line) = managed::find(&profile.header, &mut Diagnostics::default()) else {
+        return Ok(finish(
+            profile,
+            diags,
+            path,
+            opts,
+            Some(source),
+            Additions::default(),
+        ));
+    };
+    // an address gets one answer in this load, whoever asks: the walk or an
+    // include of the text that comes out of it
+    let source = Once::new(source);
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let choice = managed::choose(&line, !profile.sections.is_empty(), modified, &source);
+    // A copy is the profile while it is in effect, and the local file is not:
+    // what its text has to say, errors included, is not reported.
+    let (profile, diags, kept_in) = match choice.copy {
+        Some(copy) => {
+            let mut downloaded = copy.profile;
+            // the cycle check and the relative paths are the local file's
+            downloaded.main = profile.main.take();
+            (downloaded, copy.diagnostics, Some(copy.file))
+        }
+        None => (profile, diags, None),
+    };
+    let additions = Additions {
+        diagnostics: choice.diagnostics,
+        remote: choice.remote,
+        kept_in,
+    };
+    Ok(finish(profile, diags, path, opts, Some(&source), additions))
 }
 
+/// Loads the text it is given as the profile in the file `path`. There is no
+/// file to be changed or to be older than a download, so a `#!MANAGED-CONFIG`
+/// line in the text asks for nothing: the text is what is read.
 pub fn from_text(text: &str, path: &Path, opts: &LoadOptions) -> Loaded {
-    let file: Arc<Path> = Arc::from(path);
-    let (mut profile, mut diags) = parse_str(text, file, Origin::Main);
+    let (profile, diags) = parse_str(text, Arc::from(path), Origin::Main);
+    finish(
+        profile,
+        diags,
+        path,
+        opts,
+        opts.remote.as_deref(),
+        Additions::default(),
+    )
+}
+
+/// What choosing the text of a managed profile adds to a load.
+#[derive(Default)]
+struct Additions {
+    /// What is said of the choice, which stands before everything else.
+    diagnostics: Diagnostics,
+    /// The remote files the choice came across.
+    remote: Vec<RemoteRef>,
+    /// The file the text in effect is kept in, when it is a downloaded copy.
+    kept_in: Option<PathBuf>,
+}
+
+/// The load from the point where the text in effect is read: the includes
+/// are expanded, the requirements applied, and the profile typed. `path` is
+/// the local file, whose directory the relative paths start from; `source`
+/// answers for the remote includes.
+fn finish(
+    mut profile: Profile,
+    mut diags: Diagnostics,
+    path: &Path,
+    opts: &LoadOptions,
+    source: Option<&dyn RemoteSource>,
+    additions: Additions,
+) -> Loaded {
     let base_dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .to_path_buf();
-    let remote = include::expand(
+    let mut remote = additions.remote;
+    let included = include::expand(
         &mut profile,
         &IncludeOptions {
             base_dir: base_dir.clone(),
             max_depth: 8,
             max_files: 200,
         },
-        opts.remote.as_deref(),
+        source,
         &mut diags,
     );
+    // an include of an address the choice was at keeps the role it gave it
+    for found in included {
+        match remote.iter_mut().find(|r| r.url == found.url) {
+            Some(known) => known.lacks_section |= found.lacks_section,
+            None => remote.push(found),
+        }
+    }
     requirement::apply(&mut profile, &opts.environment, &mut diags);
     let mut loaded = from_profile(profile, &base_dir, opts, remote);
-    diags.extend(loaded.diagnostics);
-    loaded.diagnostics = diags;
+    let mut said = additions.diagnostics;
+    said.extend(diags);
+    said.extend(loaded.diagnostics);
+    loaded.diagnostics = said;
+    if let Some(file) = additions.kept_in {
+        loaded.config.source.main_text = file;
+    }
     loaded
 }
 
@@ -518,7 +611,8 @@ pub fn from_profile(
     // Policies and groups with name registry.
     let mut names: HashMap<String, &'static str> = HashMap::new();
     let mut policies = Vec::new();
-    // `external` policies a downloaded text defines, by name
+    // `external` policies a downloaded text defines, by name: the text of a
+    // remote include, and the copy of the managed profile
     let mut downloaded_externals: HashSet<String> = HashSet::new();
     for (name, def, span, origin) in definition_entries(&profile, "Proxy", &mut diags) {
         match Builtin::parse(name) {
@@ -547,7 +641,9 @@ pub fn from_profile(
         }
         match parse_policy(name, def, span) {
             Ok(p) => {
-                if p.kind == PolicyKind::External && matches!(origin, Origin::Remote(_)) {
+                if p.kind == PolicyKind::External
+                    && matches!(origin, Origin::Remote(_) | Origin::Managed(_))
+                {
                     downloaded_externals.insert(p.name.clone());
                 }
                 policies.push(p);
@@ -1439,7 +1535,11 @@ fn own_listener(general: &General, port: u16) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::RemoteRole;
+    use crate::remote::fake::Fake;
     use std::path::Path;
+    use std::time::{Duration, SystemTime};
+    use url::Url;
 
     fn load_text(text: &str) -> Loaded {
         from_text(
@@ -3511,10 +3611,29 @@ RULE-SET,LAN,DIRECT\nDOMAIN-SET,LAN,REJECT\nRULE-SET,X,DIRECT\nDOMAIN-SET,X,REJE
         profile: &str,
         fake: &Arc<crate::remote::fake::Fake>,
     ) -> Loaded {
+        load_modified(dir, profile, None, fake)
+    }
+
+    /// `load_with_remote` for a local file that was last modified at
+    /// `modified`, when that is given.
+    fn load_modified(
+        dir: &Path,
+        profile: &str,
+        modified: Option<SystemTime>,
+        fake: &Arc<crate::remote::fake::Fake>,
+    ) -> Loaded {
         let mut opts = LoadOptions::for_tests();
         opts.remote = Some(fake.clone());
         let main = dir.join("main.conf");
         std::fs::write(&main, profile).unwrap();
+        if let Some(at) = modified {
+            std::fs::File::options()
+                .write(true)
+                .open(&main)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+        }
         load(&main, &opts).unwrap()
     }
 
@@ -3810,6 +3929,1054 @@ RULE-SET,LAN,DIRECT\nDOMAIN-SET,LAN,REJECT\nRULE-SET,X,DIRECT\nDOMAIN-SET,X,REJE
             assert!(l.config.spec(name).is_some(), "{name}");
         }
         assert!(l.config.not_implemented.is_empty());
+    }
+
+    // Which text of a managed profile is in effect: the local file, or the
+    // copy downloaded from the address its `#!MANAGED-CONFIG` line names.
+
+    const MANAGED: &str = "https://example.com/managed.conf";
+    const MOVED: &str = "https://example.com/moved.conf";
+    const LOCAL_RULES: [&str; 2] = ["DOMAIN,local.example,DIRECT", "FINAL,DIRECT"];
+    const COPY_RULES: [&str; 2] = ["DOMAIN,copy.example,DIRECT", "FINAL,DIRECT"];
+    const LOCAL_CHANGED: &str = "managed profile: the local file was changed after the last update; it is in effect until the next one";
+    const NOT_DOWNLOADED: &str = "managed profile not downloaded yet";
+    const NO_LINE: &str =
+        "the downloaded managed profile has no #!MANAGED-CONFIG line; it is no longer updated";
+    const NO_LINE_HINT: &str =
+        "to keep it updated, the profile the address serves has to carry a #!MANAGED-CONFIG line";
+    const NO_WAY_OUT: &str = "the #!MANAGED-CONFIG lines of the downloaded profiles lead through too many addresses; the last copy found is in effect";
+    const NO_WAY_OUT_HINT: &str = "write the address the profile is finally served from into the #!MANAGED-CONFIG line of the local file";
+
+    /// An instant `n` hours after one well in the past: the tests give the
+    /// copy its time and the local file its modification time hours apart,
+    /// never "now" against "now".
+    fn hours(n: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + n * 3600)
+    }
+
+    fn managed_line(url: &str, interval: u64, strict: bool) -> String {
+        format!("#!MANAGED-CONFIG {url} interval={interval} strict={strict}")
+    }
+
+    /// A local profile: rules of its own under the given first line.
+    fn local_profile(line: &str) -> String {
+        format!(
+            "{line}\n[General]\nloglevel = notify\n[Rule]\nDOMAIN,local.example,DIRECT\nFINAL,DIRECT\n"
+        )
+    }
+
+    /// A downloaded profile: rules the local one does not have.
+    fn copy_profile(line: &str) -> String {
+        format!("{line}\n[Rule]\nDOMAIN,copy.example,DIRECT\nFINAL,DIRECT\n")
+    }
+
+    fn url(text: &str) -> Url {
+        Url::parse(text).unwrap()
+    }
+
+    fn rules_of(l: &Loaded) -> Vec<&str> {
+        l.config.rules.iter().map(|r| r.raw.as_str()).collect()
+    }
+
+    /// What a managed profile says about itself, in order: code and message.
+    fn managed_said(l: &Loaded) -> Vec<(&'static str, String)> {
+        l.diagnostics
+            .iter()
+            .filter(|d| {
+                [
+                    codes::W_RESOURCE_UNAVAILABLE,
+                    codes::I_MANAGED_SOURCE,
+                    codes::W_MANAGED_NOT_UPDATED,
+                ]
+                .contains(&d.code)
+            })
+            .map(|d| (d.code, d.message.clone()))
+            .collect()
+    }
+
+    /// Where the diagnostics of the given codes stand: the name of the file
+    /// and the line.
+    fn placed(l: &Loaded, of: &[&str]) -> Vec<(String, u32)> {
+        l.diagnostics
+            .iter()
+            .filter(|d| of.contains(&d.code))
+            .map(|d| {
+                let span = d.span.as_ref().expect("a position");
+                let file = span.file.file_name().unwrap();
+                (file.to_string_lossy().into_owned(), span.line)
+            })
+            .collect()
+    }
+
+    /// The remote files a load tracks, in order: address, role, whether it has
+    /// the text, interval in seconds and strictness.
+    fn tracked(l: &Loaded) -> Vec<(String, RemoteRole, bool, u64, bool)> {
+        l.config
+            .source
+            .remote
+            .iter()
+            .map(|r| {
+                (
+                    r.url.to_string(),
+                    r.role,
+                    r.found(),
+                    r.interval.as_secs(),
+                    r.strict,
+                )
+            })
+            .collect()
+    }
+
+    /// An address the walk passed through: its copy exists, and the profile is
+    /// not updated from it.
+    fn on_the_way(address: &str) -> (String, RemoteRole, bool, u64, bool) {
+        (
+            address.to_string(),
+            RemoteRole::ManagedHop,
+            true,
+            86400,
+            false,
+        )
+    }
+
+    /// The address the profile is updated from.
+    fn updated(
+        address: &str,
+        found: bool,
+        seconds: u64,
+        strict: bool,
+    ) -> (String, RemoteRole, bool, u64, bool) {
+        (
+            address.to_string(),
+            RemoteRole::Managed,
+            found,
+            seconds,
+            strict,
+        )
+    }
+
+    fn copy_in_effect(file: &Path) -> String {
+        format!(
+            "managed profile: the downloaded copy is in effect (`{}`)",
+            file.display()
+        )
+    }
+
+    fn leads_elsewhere(first: &Path) -> String {
+        format!(
+            "managed profile: the address in the local file leads to another one (see the #!MANAGED-CONFIG line of `{}`); the local file still names the old address",
+            first.display()
+        )
+    }
+
+    fn hint_of(l: &Loaded, code: &str) -> Vec<Option<&'static str>> {
+        l.diagnostics
+            .iter()
+            .filter(|d| d.code == code)
+            .map(|d| d.hint)
+            .collect()
+    }
+
+    /// A caller with nowhere to get downloaded text from loads the local file
+    /// as it always did, whatever its first line says.
+    #[test]
+    fn a_managed_profile_without_a_source_is_the_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = local_profile(&managed_line(MANAGED, 3600, true));
+        let main = dir.path().join("main.conf");
+        std::fs::write(&main, &text).unwrap();
+        let l = load(&main, &LoadOptions::for_tests()).unwrap();
+        let given = from_text(&text, &main, &LoadOptions::for_tests());
+        assert_eq!(rules_of(&l), LOCAL_RULES);
+        assert_eq!(l.diagnostics, given.diagnostics);
+        assert!(
+            l.diagnostics.is_empty(),
+            "{:?}",
+            l.diagnostics.clone().into_vec()
+        );
+        assert!(l.config.source.remote.is_empty());
+        assert_eq!(l.config.source.main_text, l.config.source.main);
+        let managed = l.config.managed.as_ref().expect("the line is read");
+        assert_eq!((managed.interval.as_secs(), managed.strict), (3600, true));
+    }
+
+    /// The local file is the only text there is until the first download; the
+    /// address is tracked all the same, so that somebody downloads it.
+    #[test]
+    fn a_managed_profile_that_was_never_downloaded_is_the_local_file() {
+        for (why, said) in [
+            (
+                Some("connection refused"),
+                "managed profile not downloaded yet: connection refused",
+            ),
+            (None, NOT_DOWNLOADED),
+        ] {
+            let fake = Arc::new(Fake::new().missing(MANAGED, why));
+            let dir = tempfile::tempdir().unwrap();
+            let l = load_modified(
+                dir.path(),
+                &local_profile(&managed_line(MANAGED, 3600, true)),
+                Some(hours(5)),
+                &fake,
+            );
+            assert!(
+                !l.diagnostics.has_errors(),
+                "{:?}",
+                l.diagnostics.clone().into_vec()
+            );
+            assert_eq!(rules_of(&l), LOCAL_RULES);
+            assert_eq!(
+                managed_said(&l),
+                [(codes::W_RESOURCE_UNAVAILABLE, said.to_string())]
+            );
+            assert_eq!(
+                placed(&l, &[codes::W_RESOURCE_UNAVAILABLE]),
+                [("main.conf".to_string(), 1)]
+            );
+            assert_eq!(tracked(&l), [updated(MANAGED, false, 3600, true)]);
+            assert_eq!(l.config.source.main_text, l.config.source.main);
+            assert_eq!(fake.asked(), [url(MANAGED)]);
+        }
+    }
+
+    /// A local file that is only the line pointing to the managed profile is a
+    /// profile without rules until something is downloaded: it says that, and
+    /// that nothing was.
+    #[test]
+    fn a_pointer_that_has_not_been_downloaded_yet_is_a_profile_without_rules() {
+        let fake = Arc::new(Fake::new().missing(MANAGED, Some("connection refused")));
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_modified(
+            dir.path(),
+            &format!("{}\n", managed_line(MANAGED, 3600, false)),
+            Some(hours(5)),
+            &fake,
+        );
+        let told: Vec<(&str, &str, Option<u32>)> = l
+            .diagnostics
+            .iter()
+            .map(|d| {
+                (
+                    d.code,
+                    d.message.as_str(),
+                    d.span.as_ref().map(|span| span.line),
+                )
+            })
+            .collect();
+        assert_eq!(
+            told,
+            [
+                (
+                    codes::W_RESOURCE_UNAVAILABLE,
+                    "managed profile not downloaded yet: connection refused",
+                    Some(1)
+                ),
+                (
+                    codes::E_MISSING_FINAL,
+                    "the [Rule] section must end with an enabled FINAL rule",
+                    None
+                ),
+            ]
+        );
+        assert!(l.config.rules.is_empty());
+    }
+
+    /// The copy is the profile once it is newer than the local file: its rules,
+    /// its own `#!MANAGED-CONFIG` line, and the file its lines stand in. The
+    /// local file is not the profile then, and what is wrong in it is not
+    /// reported.
+    #[test]
+    fn a_copy_newer_than_the_local_file_is_in_effect() {
+        let local = format!(
+            "{}\n[Rule]\nBAR,local.example,DIRECT\nFINAL,DIRECT\n",
+            managed_line(MANAGED, 3600, false)
+        );
+        let copy = format!(
+            "{}\n[Rule]\nDOMAIN,copy.example,DIRECT\nFOO,copy-bad.example,DIRECT\nFINAL,DIRECT\n",
+            managed_line(MANAGED, 7200, true)
+        );
+        let fake = Arc::new(Fake::new().text(MANAGED, &copy).fetched(MANAGED, hours(10)));
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_modified(dir.path(), &local, Some(hours(5)), &fake);
+        let cached = fake.path_of(MANAGED);
+        assert_eq!(rules_of(&l), COPY_RULES);
+        // what is said stands in the file that holds the line it is about
+        assert_eq!(
+            placed(&l, &[codes::I_MANAGED_SOURCE]),
+            [("main.conf".to_string(), 1)]
+        );
+        assert_eq!(
+            placed(&l, &[codes::E_UNKNOWN_RULE_TYPE]),
+            [("1.conf".to_string(), 4)]
+        );
+        assert_eq!(
+            l.diagnostics.len(),
+            2,
+            "{:?}",
+            l.diagnostics.clone().into_vec()
+        );
+        let source = &l.config.source;
+        assert!(source.main.ends_with("main.conf"));
+        assert_eq!(source.main_text, cached);
+        assert_eq!(
+            managed_said(&l),
+            [(codes::I_MANAGED_SOURCE, copy_in_effect(&cached))]
+        );
+        // its line is the profile's, and what the address is updated by
+        let managed = l.config.managed.as_ref().expect("the copy's line");
+        assert_eq!((managed.interval.as_secs(), managed.strict), (7200, true));
+        assert_eq!(tracked(&l), [updated(MANAGED, true, 7200, true)]);
+        assert_eq!(source.remote[0].path.as_deref(), Some(cached.as_path()));
+        assert_eq!(fake.asked(), [url(MANAGED)]);
+    }
+
+    /// A local file changed after the last download is the profile until the
+    /// next successful check. What is wrong in it is reported, and the address
+    /// is updated at the pace its line says, with the strictness its line says:
+    /// the copy's line asked for `strict=true`, the local one does not.
+    #[test]
+    fn a_local_file_changed_after_the_last_update_is_in_effect() {
+        let local = format!(
+            "#!MANAGED-CONFIG {MANAGED} interval=3600\n[Rule]\nBAR,bad.example,DIRECT\nDOMAIN,local.example,DIRECT\nFINAL,DIRECT\n"
+        );
+        let copy = copy_profile(&managed_line(MANAGED, 7200, true));
+        let fake = Arc::new(Fake::new().text(MANAGED, &copy).fetched(MANAGED, hours(5)));
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_modified(dir.path(), &local, Some(hours(10)), &fake);
+        assert_eq!(rules_of(&l), LOCAL_RULES);
+        assert_eq!(
+            placed(&l, &[codes::I_MANAGED_SOURCE, codes::E_UNKNOWN_RULE_TYPE]),
+            [("main.conf".to_string(), 1), ("main.conf".to_string(), 3)]
+        );
+        assert_eq!(
+            managed_said(&l),
+            [(codes::I_MANAGED_SOURCE, LOCAL_CHANGED.to_string())]
+        );
+        let source = &l.config.source;
+        assert_eq!(source.main_text, source.main);
+        let managed = l.config.managed.as_ref().expect("the local line");
+        assert_eq!((managed.interval.as_secs(), managed.strict), (3600, false));
+        assert_eq!(tracked(&l), [updated(MANAGED, true, 3600, false)]);
+        assert_eq!(
+            source.remote[0].path.as_deref(),
+            Some(fake.path_of(MANAGED).as_path())
+        );
+    }
+
+    /// The profile in effect, when the downloaded copy of `MANAGED` was fetched
+    /// at `fetched` and the local file `local` was last modified at
+    /// `modified`: the rules, and what the load says about it.
+    fn in_effect(local: &str, modified: SystemTime, fetched: SystemTime) -> (Vec<String>, String) {
+        let fake = Arc::new(
+            Fake::new()
+                .text(MANAGED, &copy_profile(&managed_line(MANAGED, 7200, false)))
+                .fetched(MANAGED, fetched),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_modified(dir.path(), local, Some(modified), &fake);
+        let rules = rules_of(&l).into_iter().map(str::to_string).collect();
+        let said = managed_said(&l);
+        assert_eq!(said.len(), 1, "{said:?}");
+        let (code, said) = said.into_iter().next().unwrap();
+        assert_eq!(code, codes::I_MANAGED_SOURCE);
+        (
+            rules,
+            said.replace(&fake.path_of(MANAGED).display().to_string(), "<copy>"),
+        )
+    }
+
+    const COPY_IN_EFFECT: &str = "managed profile: the downloaded copy is in effect (`<copy>`)";
+
+    /// A local file that was changed before the copy was fetched has nothing
+    /// the copy lacks.
+    #[test]
+    fn a_copy_fetched_after_the_local_file_was_changed_is_in_effect() {
+        let own = local_profile(&managed_line(MANAGED, 3600, false));
+        let (rules, said) = in_effect(&own, hours(5), hours(10));
+        assert_eq!(rules, COPY_RULES);
+        assert_eq!(said, COPY_IN_EFFECT);
+    }
+
+    /// The local file wins only when it is strictly later: a file changed at
+    /// the very instant of the download cannot be told from it.
+    #[test]
+    fn a_local_file_changed_at_the_instant_of_the_download_is_not_in_effect() {
+        let own = local_profile(&managed_line(MANAGED, 3600, false));
+        let (rules, said) = in_effect(&own, hours(5), hours(5));
+        assert_eq!(rules, COPY_RULES);
+        assert_eq!(said, COPY_IN_EFFECT);
+    }
+
+    /// A file dated in the future (a clock that was set back, a file copied
+    /// from a machine whose clock is ahead) would keep the copy out for as
+    /// long as the date lasts: it is not trusted.
+    #[test]
+    fn a_local_file_dated_in_the_future_is_not_in_effect() {
+        let own = local_profile(&managed_line(MANAGED, 3600, false));
+        let tomorrow = SystemTime::now() + Duration::from_secs(24 * 3600);
+        let (rules, said) = in_effect(&own, tomorrow, hours(5));
+        assert_eq!(rules, COPY_RULES);
+        assert_eq!(said, COPY_IN_EFFECT);
+    }
+
+    /// A local file that is only the line pointing to the address is no
+    /// profile: the copy is, however new the file is.
+    #[test]
+    fn a_local_file_with_no_section_is_never_in_effect() {
+        let pointer = format!("{}\n", managed_line(MANAGED, 3600, false));
+        let (rules, said) = in_effect(&pointer, hours(10), hours(5));
+        assert_eq!(rules, COPY_RULES);
+        assert_eq!(said, COPY_IN_EFFECT);
+    }
+
+    /// A copy without the line is in effect and is not updated any more: the
+    /// profile became an ordinary one, which the address does not say how to
+    /// update. The address is tracked as a stop on the way and nothing more.
+    #[test]
+    fn a_copy_without_the_line_is_in_effect_and_no_longer_updated() {
+        let fake = Arc::new(
+            Fake::new()
+                .text(
+                    MANAGED,
+                    "[Rule]\nDOMAIN,copy.example,DIRECT\nFINAL,DIRECT\n",
+                )
+                .fetched(MANAGED, hours(10)),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_modified(
+            dir.path(),
+            &local_profile(&managed_line(MANAGED, 3600, true)),
+            Some(hours(5)),
+            &fake,
+        );
+        assert_eq!(rules_of(&l), COPY_RULES);
+        assert_eq!(
+            managed_said(&l),
+            [
+                (
+                    codes::I_MANAGED_SOURCE,
+                    copy_in_effect(&fake.path_of(MANAGED))
+                ),
+                (codes::W_MANAGED_NOT_UPDATED, NO_LINE.to_string()),
+            ]
+        );
+        assert_eq!(
+            placed(&l, &[codes::W_MANAGED_NOT_UPDATED]),
+            [("main.conf".to_string(), 1)]
+        );
+        assert_eq!(
+            hint_of(&l, codes::W_MANAGED_NOT_UPDATED),
+            [Some(NO_LINE_HINT)]
+        );
+        assert_eq!(tracked(&l), [on_the_way(MANAGED)]);
+        assert!(l.config.managed.is_none());
+    }
+
+    /// The same copy, with a local file edited after it was downloaded: the
+    /// local file is the profile, its line says the address is the managed one
+    /// and how it is updated, and nothing is said of the copy having no line.
+    #[test]
+    fn a_local_file_newer_than_a_copy_without_the_line_is_the_one_that_is_updated() {
+        let fake = Arc::new(
+            Fake::new()
+                .text(
+                    MANAGED,
+                    "[Rule]\nDOMAIN,copy.example,DIRECT\nFINAL,DIRECT\n",
+                )
+                .fetched(MANAGED, hours(5)),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_modified(
+            dir.path(),
+            &local_profile(&managed_line(MANAGED, 1800, true)),
+            Some(hours(10)),
+            &fake,
+        );
+        assert_eq!(rules_of(&l), LOCAL_RULES);
+        assert_eq!(
+            managed_said(&l),
+            [(codes::I_MANAGED_SOURCE, LOCAL_CHANGED.to_string())]
+        );
+        assert_eq!(tracked(&l), [updated(MANAGED, true, 1800, true)]);
+        assert!(l.config.managed.is_some());
+    }
+
+    /// The copy's line names another address, which was never downloaded: the
+    /// copy that exists is in effect and the new address is what is updated,
+    /// by the line of the copy that names it. The local file still names the
+    /// old one, and is told so.
+    #[test]
+    fn an_address_that_moved_and_was_never_downloaded_keeps_the_old_copy_in_effect() {
+        let moved_line = managed_line(MOVED, 7200, true);
+        let fake = Arc::new(
+            Fake::new()
+                .text(MANAGED, &copy_profile(&moved_line))
+                .fetched(MANAGED, hours(10))
+                .missing(MOVED, Some("timed out")),
+        );
+        let cached = fake.path_of(MANAGED);
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_modified(
+            dir.path(),
+            &local_profile(&managed_line(MANAGED, 3600, false)),
+            Some(hours(5)),
+            &fake,
+        );
+        assert_eq!(rules_of(&l), COPY_RULES);
+        assert_eq!(
+            managed_said(&l),
+            [
+                (
+                    codes::W_RESOURCE_UNAVAILABLE,
+                    "managed profile not downloaded yet: timed out".to_string()
+                ),
+                (codes::I_MANAGED_SOURCE, copy_in_effect(&cached)),
+                (codes::I_MANAGED_SOURCE, leads_elsewhere(&cached)),
+            ]
+        );
+        assert_eq!(
+            tracked(&l),
+            [on_the_way(MANAGED), updated(MOVED, false, 7200, true),]
+        );
+        assert_eq!(fake.asked(), [url(MANAGED), url(MOVED)]);
+        // the profile in effect is the copy, with its line
+        let managed = l.config.managed.as_ref().expect("the copy's line");
+        assert_eq!(managed.url, MOVED);
+    }
+
+    /// The same, with the new address downloaded: its copy is the profile, and
+    /// the old address is a stop on the way.
+    #[test]
+    fn the_copy_of_the_address_a_copy_moved_to_is_in_effect() {
+        let fake = Arc::new(
+            Fake::new()
+                .text(MANAGED, &copy_profile(&managed_line(MOVED, 7200, true)))
+                .fetched(MANAGED, hours(2))
+                .text(
+                    MOVED,
+                    "#!MANAGED-CONFIG https://example.com/moved.conf interval=1800 strict=false\n[Rule]\nDOMAIN,moved.example,DIRECT\nFINAL,DIRECT\n",
+                )
+                .fetched(MOVED, hours(8)),
+        );
+        let (first, last) = (fake.path_of(MANAGED), fake.path_of(MOVED));
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_modified(
+            dir.path(),
+            &local_profile(&managed_line(MANAGED, 3600, false)),
+            Some(hours(5)),
+            &fake,
+        );
+        assert_eq!(
+            rules_of(&l),
+            ["DOMAIN,moved.example,DIRECT", "FINAL,DIRECT"]
+        );
+        assert_eq!(
+            managed_said(&l),
+            [
+                (codes::I_MANAGED_SOURCE, copy_in_effect(&last)),
+                (codes::I_MANAGED_SOURCE, leads_elsewhere(&first)),
+            ]
+        );
+        assert_eq!(
+            tracked(&l),
+            [on_the_way(MANAGED), updated(MOVED, true, 1800, false),]
+        );
+        assert_eq!(l.config.source.main_text, last);
+        let managed = l.config.managed.as_ref().expect("the moved copy's line");
+        assert_eq!((managed.interval.as_secs(), managed.strict), (1800, false));
+    }
+
+    /// A local file newer than the copy of the old address and older than that
+    /// of the new one is older than the newest copy on the way, and that is
+    /// the one that counts. Edited after all of them it is the profile, and the
+    /// address the walk ended at is still the one that is updated, at the pace
+    /// of the local line.
+    #[test]
+    fn the_newest_copy_on_the_way_decides_between_it_and_the_local_file() {
+        let fake = Arc::new(
+            Fake::new()
+                .text(MANAGED, &copy_profile(&managed_line(MOVED, 7200, true)))
+                .fetched(MANAGED, hours(2))
+                .text(MOVED, &copy_profile(&managed_line(MOVED, 1800, true)))
+                .fetched(MOVED, hours(8)),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let local = local_profile(&managed_line(MANAGED, 3600, false));
+        // newer than the first copy and older than the second: a copy is
+        let l = load_modified(dir.path(), &local, Some(hours(5)), &fake);
+        assert_eq!(rules_of(&l), COPY_RULES);
+        // newer than both
+        let l = load_modified(dir.path(), &local, Some(hours(10)), &fake);
+        assert_eq!(rules_of(&l), LOCAL_RULES);
+        assert_eq!(
+            managed_said(&l),
+            [(codes::I_MANAGED_SOURCE, LOCAL_CHANGED.to_string())]
+        );
+        assert_eq!(
+            tracked(&l),
+            [on_the_way(MANAGED), updated(MOVED, true, 3600, false),]
+        );
+    }
+
+    /// The local file edited after the last update stays the profile whatever
+    /// the walk came to. The address it ended at is still the one that is
+    /// updated, at the pace and with the strictness of the local line, and what
+    /// is said is what holds: that the address was not downloaded, not that the
+    /// copy is in effect or has no way out.
+    #[test]
+    fn a_local_file_in_effect_updates_the_address_the_walk_ended_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = local_profile(&managed_line(MANAGED, 3600, true));
+        // an address that moved and was never downloaded
+        let fake = Arc::new(
+            Fake::new()
+                .text(MANAGED, &copy_profile(&managed_line(MOVED, 7200, false)))
+                .fetched(MANAGED, hours(5))
+                .missing(MOVED, Some("timed out")),
+        );
+        let l = load_modified(dir.path(), &local, Some(hours(10)), &fake);
+        assert_eq!(rules_of(&l), LOCAL_RULES);
+        assert_eq!(
+            managed_said(&l),
+            [
+                (
+                    codes::W_RESOURCE_UNAVAILABLE,
+                    "managed profile not downloaded yet: timed out".to_string()
+                ),
+                (codes::I_MANAGED_SOURCE, LOCAL_CHANGED.to_string()),
+            ]
+        );
+        assert_eq!(
+            tracked(&l),
+            [on_the_way(MANAGED), updated(MOVED, false, 3600, true),]
+        );
+        // addresses that lead back to each other
+        let fake = Arc::new(
+            Fake::new()
+                .text(MANAGED, &copy_profile(&managed_line(MOVED, 7200, false)))
+                .fetched(MANAGED, hours(5))
+                .text(MOVED, &copy_profile(&managed_line(MANAGED, 900, false)))
+                .fetched(MOVED, hours(5)),
+        );
+        let l = load_modified(dir.path(), &local, Some(hours(10)), &fake);
+        assert_eq!(rules_of(&l), LOCAL_RULES);
+        assert_eq!(
+            managed_said(&l),
+            [(codes::I_MANAGED_SOURCE, LOCAL_CHANGED.to_string())]
+        );
+        assert_eq!(
+            tracked(&l),
+            [on_the_way(MANAGED), updated(MOVED, true, 3600, true),]
+        );
+    }
+
+    /// Two addresses that name each other lead nowhere: the last copy found
+    /// is in effect, and the local file is told to name the address the
+    /// profile is finally served from.
+    #[test]
+    fn addresses_that_lead_back_to_each_other_have_no_way_out() {
+        let fake = Arc::new(
+            Fake::new()
+                .text(MANAGED, &copy_profile(&managed_line(MOVED, 7200, false)))
+                .fetched(MANAGED, hours(10))
+                .text(MOVED, &copy_profile(&managed_line(MANAGED, 900, true)))
+                .fetched(MOVED, hours(10)),
+        );
+        let (first, last) = (fake.path_of(MANAGED), fake.path_of(MOVED));
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_modified(
+            dir.path(),
+            &local_profile(&managed_line(MANAGED, 3600, false)),
+            Some(hours(5)),
+            &fake,
+        );
+        assert_eq!(rules_of(&l), COPY_RULES);
+        assert_eq!(
+            managed_said(&l),
+            [
+                (codes::I_MANAGED_SOURCE, copy_in_effect(&last)),
+                (codes::I_MANAGED_SOURCE, leads_elsewhere(&first)),
+                (codes::W_MANAGED_NOT_UPDATED, NO_WAY_OUT.to_string()),
+            ]
+        );
+        assert_eq!(
+            hint_of(&l, codes::W_MANAGED_NOT_UPDATED),
+            [Some(NO_WAY_OUT_HINT)]
+        );
+        // the last address is the one updated, by its own line
+        assert_eq!(
+            tracked(&l),
+            [on_the_way(MANAGED), updated(MOVED, true, 900, true),]
+        );
+        // the first address is not asked for again
+        assert_eq!(fake.asked(), [url(MANAGED), url(MOVED)]);
+    }
+
+    /// A chain of ten addresses is followed through eight changes of address:
+    /// the copies of the first nine are read, the ninth is the last, and the
+    /// tenth is never asked for.
+    #[test]
+    fn a_chain_of_ten_addresses_stops_at_the_eighth_change() {
+        let address = |n: u64| format!("https://example.com/hop{n}.conf");
+        let mut fake = Fake::new();
+        for n in 0..10 {
+            fake = fake
+                .text(
+                    &address(n),
+                    &copy_profile(&managed_line(&address(n + 1), 600 + n, false)),
+                )
+                .fetched(&address(n), hours(10));
+        }
+        let fake = Arc::new(fake);
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_modified(
+            dir.path(),
+            &local_profile(&managed_line(&address(0), 3600, false)),
+            Some(hours(5)),
+            &fake,
+        );
+        let asked: Vec<Url> = (0..9).map(|n| url(&address(n))).collect();
+        assert_eq!(fake.asked(), asked);
+        let mut expected: Vec<_> = (0..8).map(|n| on_the_way(&address(n))).collect();
+        expected.push(updated(&address(8), true, 608, false));
+        assert_eq!(tracked(&l), expected);
+        assert_eq!(
+            managed_said(&l),
+            [
+                (
+                    codes::I_MANAGED_SOURCE,
+                    copy_in_effect(&fake.path_of(&address(8)))
+                ),
+                (
+                    codes::I_MANAGED_SOURCE,
+                    leads_elsewhere(&fake.path_of(&address(0)))
+                ),
+                (codes::W_MANAGED_NOT_UPDATED, NO_WAY_OUT.to_string()),
+            ]
+        );
+    }
+
+    /// A fragment is never sent to a server: an address with one is the
+    /// address without it. A copy whose line names its own address with a
+    /// fragment added has not moved, and the address is tracked without the
+    /// fragment, whichever line wrote it.
+    #[test]
+    fn a_fragment_does_not_make_an_address_another_one() {
+        let local = local_profile(&format!(
+            "#!MANAGED-CONFIG {MANAGED}#local interval=3600 strict=false"
+        ));
+        let copy = copy_profile(&format!(
+            "#!MANAGED-CONFIG {MANAGED}#copy interval=7200 strict=true"
+        ));
+        let fake = Arc::new(Fake::new().text(MANAGED, &copy).fetched(MANAGED, hours(10)));
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_modified(dir.path(), &local, Some(hours(5)), &fake);
+        assert_eq!(rules_of(&l), COPY_RULES);
+        assert_eq!(fake.asked(), [url(MANAGED)]);
+        assert_eq!(tracked(&l), [updated(MANAGED, true, 7200, true)]);
+        assert_eq!(
+            managed_said(&l),
+            [(
+                codes::I_MANAGED_SOURCE,
+                copy_in_effect(&fake.path_of(MANAGED))
+            )]
+        );
+    }
+
+    /// The addresses a remote include of the copy in effect names are asked for
+    /// once, like the ones the walk was at: here the copy of the new address
+    /// includes the text of the old one. The address keeps the role the walk
+    /// gave it, and what the include found out about it lands on that item.
+    #[test]
+    fn an_address_the_walk_was_at_is_asked_for_once_per_load() {
+        let fake = Arc::new(
+            Fake::new()
+                .text(MANAGED, &copy_profile(&managed_line(MOVED, 600, false)))
+                .fetched(MANAGED, hours(5))
+                .text(
+                    MOVED,
+                    &format!(
+                        "{}\n[Proxy]\n#!include {MANAGED}\n[Rule]\nDOMAIN,moved.example,DIRECT\nFINAL,DIRECT\n",
+                        managed_line(MOVED, 900, false)
+                    ),
+                )
+                .fetched(MOVED, hours(5)),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_modified(
+            dir.path(),
+            &local_profile(&managed_line(MANAGED, 3600, false)),
+            Some(hours(1)),
+            &fake,
+        );
+        assert_eq!(fake.asked(), [url(MANAGED), url(MOVED)]);
+        assert_eq!(
+            tracked(&l),
+            [on_the_way(MANAGED), updated(MOVED, true, 900, false),]
+        );
+        // the old address's text has no [Proxy] section for the line to take
+        let lacks: Vec<bool> = l
+            .config
+            .source
+            .remote
+            .iter()
+            .map(|r| r.lacks_section)
+            .collect();
+        assert_eq!(lacks, [true, false]);
+        assert_eq!(
+            placed(&l, &[codes::W_INCLUDE_SECTION_MISSING]),
+            [("2.conf".to_string(), 3)]
+        );
+    }
+
+    /// The lines of a copy are read like the lines of any profile, and a
+    /// copy is allowed to include the local files its author names, which are
+    /// read from the directory of the local file, not from the cache. The
+    /// program of an `external` policy that the copy's own line defines is not
+    /// started; one defined in a local file of the copy is.
+    #[test]
+    fn a_copy_includes_local_files_from_the_directory_of_the_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("shared.dconf"),
+            "[Rule]\nDOMAIN,shared.example,DIRECT\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("ext.dconf"),
+            "[Proxy]\nIncluded = external, exec=/bin/true, local-port=1083\n",
+        )
+        .unwrap();
+        let copy = format!(
+            "{}\n[Proxy]\nOwn = external, exec=/bin/true, local-port=1082\n#!include ext.dconf\n[Rule]\n#!include shared.dconf\nFINAL,DIRECT\n",
+            managed_line(MANAGED, 3600, false)
+        );
+        let fake = Arc::new(Fake::new().text(MANAGED, &copy).fetched(MANAGED, hours(10)));
+        let l = load_modified(
+            dir.path(),
+            &local_profile(&managed_line(MANAGED, 3600, false)),
+            Some(hours(5)),
+            &fake,
+        );
+        assert!(
+            !l.diagnostics.has_errors(),
+            "{:?}",
+            l.diagnostics.clone().into_vec()
+        );
+        assert_eq!(
+            rules_of(&l),
+            ["DOMAIN,shared.example,DIRECT", "FINAL,DIRECT"]
+        );
+        // the files the user wrote, and not the cache
+        assert_eq!(
+            l.config.source.includes,
+            [
+                dir.path().join("ext.dconf"),
+                dir.path().join("shared.dconf")
+            ]
+        );
+        // one warning for the program the copy's own line defines
+        assert_eq!(
+            placed(&l, &[codes::W_REMOTE_LOCAL_ACCESS]),
+            [("1.conf".to_string(), 3)]
+        );
+        let config = &l.config;
+        assert!(config.spec("Own").is_none());
+        assert_eq!(
+            config.not_implemented.get("Own"),
+            Some(&NotImplemented::DownloadedExternal)
+        );
+        assert!(config.spec("Included").is_some());
+        assert_eq!(config.not_implemented.get("Included"), None);
+    }
+
+    /// A text the copy reaches through a remote include is downloaded text of
+    /// the other kind: expanded, and not allowed to include a local file.
+    #[test]
+    fn a_remote_include_in_a_copy_is_expanded_and_includes_no_local_file() {
+        let remote = "https://example.com/rules.conf";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("shared.dconf"),
+            "[Rule]\nDOMAIN,shared.example,DIRECT\n",
+        )
+        .unwrap();
+        let fake = Arc::new(
+            Fake::new()
+                .text(
+                    MANAGED,
+                    &format!(
+                        "{}\n[Rule]\n#!include {remote}\nFINAL,DIRECT\n",
+                        managed_line(MANAGED, 3600, false)
+                    ),
+                )
+                .fetched(MANAGED, hours(10))
+                .text(
+                    remote,
+                    "[Rule]\nDOMAIN,remote.example,DIRECT\n#!include shared.dconf\n",
+                ),
+        );
+        let l = load_modified(
+            dir.path(),
+            &local_profile(&managed_line(MANAGED, 3600, false)),
+            Some(hours(5)),
+            &fake,
+        );
+        assert_eq!(
+            rules_of(&l),
+            ["DOMAIN,remote.example,DIRECT", "FINAL,DIRECT"]
+        );
+        assert_eq!(
+            placed(&l, &[codes::W_REMOTE_LOCAL_ACCESS]),
+            [("2.conf".to_string(), 3)]
+        );
+        assert!(l.config.source.includes.is_empty());
+        assert_eq!(
+            tracked(&l),
+            [
+                updated(MANAGED, true, 3600, false),
+                (remote.to_string(), RemoteRole::Include, true, 86400, false),
+            ]
+        );
+    }
+
+    /// The cycle check begins at the local file, wherever the text is read
+    /// from: a copy that includes the local file includes itself.
+    #[test]
+    fn a_copy_that_includes_the_local_file_is_a_cycle() {
+        let fake = Arc::new(
+            Fake::new()
+                .text(
+                    MANAGED,
+                    &format!(
+                        "{}\n[Rule]\n#!include main.conf\nFINAL,DIRECT\n",
+                        managed_line(MANAGED, 3600, false)
+                    ),
+                )
+                .fetched(MANAGED, hours(10)),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_modified(
+            dir.path(),
+            &local_profile(&managed_line(MANAGED, 3600, false)),
+            Some(hours(5)),
+            &fake,
+        );
+        assert_eq!(
+            placed(&l, &[codes::E_INCLUDE_CYCLE]),
+            [("1.conf".to_string(), 3)]
+        );
+    }
+
+    /// A captive portal or an error page that answered with a 200 is a text
+    /// that does not load. Whether it is adopted is not the loader's to say;
+    /// the loader says what it is: no rules.
+    #[test]
+    fn a_page_that_is_no_profile_does_not_load_as_one() {
+        let fake = Arc::new(
+            Fake::new()
+                .text(
+                    MANAGED,
+                    "<html><body>Sign in to the network</body></html>\n",
+                )
+                .fetched(MANAGED, hours(10)),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_modified(
+            dir.path(),
+            &format!("{}\n", managed_line(MANAGED, 3600, false)),
+            Some(hours(5)),
+            &fake,
+        );
+        // the page is what was read: its line stands outside any section, in
+        // the file that holds it
+        assert_eq!(
+            placed(&l, &[codes::W_LINE_OUTSIDE_SECTION]),
+            [("1.conf".to_string(), 1)]
+        );
+        assert!(l.diagnostics.has_errors());
+        assert!(codes_of(&l).contains(&codes::E_MISSING_FINAL));
+        assert!(l.config.rules.is_empty());
+    }
+
+    /// `from_text` has no file: it reads the text it is given, whatever its
+    /// first line says, and asks for no download.
+    #[test]
+    fn from_text_reads_the_text_it_is_given() {
+        let fake = Arc::new(
+            Fake::new()
+                .text(MANAGED, &copy_profile(&managed_line(MANAGED, 7200, true)))
+                .fetched(MANAGED, hours(10)),
+        );
+        let mut opts = LoadOptions::for_tests();
+        opts.remote = Some(fake.clone());
+        let l = from_text(
+            &local_profile(&managed_line(MANAGED, 3600, false)),
+            Path::new("/profiles/t.conf"),
+            &opts,
+        );
+        assert_eq!(rules_of(&l), LOCAL_RULES);
+        assert!(l.config.source.remote.is_empty());
+        assert_eq!(l.config.source.main_text, l.config.source.main);
+        assert!(managed_said(&l).is_empty());
+        assert!(fake.asked().is_empty());
+        let managed = l.config.managed.as_ref().expect("the line is read");
+        assert_eq!((managed.interval.as_secs(), managed.strict), (3600, false));
+    }
+
+    /// The floor of the interval holds for the line of the profile in effect,
+    /// wherever it is: it is said at the line in the file that holds it, and a
+    /// local file that is not in effect says nothing.
+    #[test]
+    fn the_shortest_interval_is_said_for_the_line_in_effect_only() {
+        let message = "interval below 60 seconds; 60 is used";
+        let fake = Arc::new(Fake::new().missing(MANAGED, None));
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_modified(
+            dir.path(),
+            &local_profile(&managed_line(MANAGED, 10, false)),
+            Some(hours(5)),
+            &fake,
+        );
+        let said: Vec<&str> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::W_INVALID_VALUE)
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(said, [message]);
+        assert_eq!(tracked(&l)[0].3, 60);
+        let fake = Arc::new(
+            Fake::new()
+                .text(MANAGED, &copy_profile(&managed_line(MANAGED, 30, false)))
+                .fetched(MANAGED, hours(10)),
+        );
+        let l = load_modified(
+            dir.path(),
+            &local_profile(&managed_line(MANAGED, 10, false)),
+            Some(hours(5)),
+            &fake,
+        );
+        assert_eq!(
+            placed(&l, &[codes::W_INVALID_VALUE]),
+            [("1.conf".to_string(), 1)]
+        );
+        assert_eq!(tracked(&l)[0].3, 60);
+    }
+
+    /// The summary shows where a managed profile comes from and no more: its
+    /// path and query can be the token a provider issued.
+    #[test]
+    fn the_summary_shows_where_a_managed_profile_comes_from_and_no_more() {
+        let l = load_text(
+            "#!MANAGED-CONFIG https://al1ce:pw@sub.example:8443/s/t0k3n?x=y#f interval=3600\n[Rule]\nFINAL,DIRECT\n",
+        );
+        assert_eq!(
+            l.config.summary().managed.as_deref(),
+            Some("https://sub.example:8443/\u{2026}")
+        );
+        let l = load_text("[Rule]\nFINAL,DIRECT\n");
+        assert_eq!(l.config.summary().managed, None);
     }
 
     #[test]
