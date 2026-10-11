@@ -34,10 +34,12 @@ pub struct RequestRecord {
     /// rurge started itself, which came in on none.
     pub listen_port: u16,
     pub dst: String,
-    /// Where the TCP socket the session opened itself went: the first hop
-    /// when the policy chains. `None` when it opened none — it was rejected,
-    /// it is UDP, or its policy carried it over a connection or tunnel that
-    /// already existed.
+    /// Where the TCP connection the session's own dial made went: the first
+    /// hop when the policy chains. `None` when the dial made none — the
+    /// session was rejected, or its policy carried it over a connection that
+    /// was there already or over a tunnel —, and always for UDP: a flow has
+    /// no single far end, and the TCP connection a proxy's association rides
+    /// on is no address of it.
     pub remote_addr: Option<SocketAddr>,
     pub rule: Option<String>,
     pub policy: Vec<String>,
@@ -94,7 +96,10 @@ fn record_of(h: &SessionHandle, outcome: Option<&SessionOutcome>) -> RequestReco
         src: s.src,
         listen_port: s.in_port,
         dst: format!("{}:{}", s.dst_host, s.dst_port),
-        remote_addr: h.trail().peer(),
+        remote_addr: match s.transport {
+            Transport::Tcp => h.trail().peer(),
+            Transport::Udp => None,
+        },
         rule: h.rule(),
         policy: h.policy_chain(),
         sni: h.sni(),
@@ -457,6 +462,31 @@ mod tests {
             (done.listen_port, done.remote_addr, done.dns_ms),
             (6152, Some(peer), Some(12))
         );
+    }
+
+    /// A flow has no single far end: the TCP connection its dial made — the
+    /// one a proxy's association rides on — is no address of its record, in
+    /// flight and after. The time it waited for lookups is.
+    #[tokio::test]
+    async fn the_record_of_a_udp_session_has_no_remote_address() {
+        let log = RequestLog::new(2);
+        let t = TrafficStats::new();
+        let a = SessionHandle::new(1, SessionInfo::udp(HostName::parse("a.test"), 443));
+        log.mark_active(&a);
+        let peer: SocketAddr = "192.0.2.7:1080".parse().unwrap();
+        a.trail()
+            .follow(async {
+                rurge_net::trail::connected(peer);
+                rurge_net::trail::looked_up(std::time::Duration::from_millis(12));
+            })
+            .await;
+        assert_eq!(a.trail().peer(), Some(peer), "the dial did note it");
+        let live = log.active().remove(0);
+        assert_eq!((live.remote_addr, live.dns_ms), (None, Some(12)));
+        a.finish(SessionOutcome::Completed);
+        log.record_finished(&a, &SessionOutcome::Completed, &t);
+        let done = log.recent(1).remove(0);
+        assert_eq!((done.remote_addr, done.dns_ms), (None, Some(12)));
     }
 
     #[test]

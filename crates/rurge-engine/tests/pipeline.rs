@@ -2338,6 +2338,9 @@ async fn a_doq_carrier_the_proxy_will_not_open_fails_naming_the_policy() {
     .expect("the failed carrier is recorded");
     assert_eq!(failed.policy, ["Socks"]);
     assert_eq!(failed.error.as_deref(), Some(refusal));
+    // the proxy's TCP connection was made before it refused the login, and it
+    // is no address of a UDP record
+    assert_eq!(failed.remote_addr, None, "{failed:?}");
     let told = format!("{err} {err:?} {failed:?}");
     assert!(!told.contains(TRIED), "{told}");
     assert_eq!(doq.connections(), 0);

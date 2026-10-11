@@ -955,13 +955,9 @@ impl Engine {
         let (rt, registry) = self.snapshot();
         let handle = self.new_handle(session);
         let trail = handle.trail().clone();
-        let opened = trail
+        trail
             .follow(self.open_internal_udp(rt, registry, handle, fallback))
-            .await;
-        // a carrier has no single far end: the TCP connection a proxy's
-        // association opened for it is no address of its record
-        trail.clear_peer();
-        opened
+            .await
     }
 
     /// `dial_internal_udp` from the session's handle on, run inside the trail
