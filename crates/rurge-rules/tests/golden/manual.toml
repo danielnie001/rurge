@@ -169,6 +169,14 @@ policy = "P"
 reason = "final"
 
 [[case]]
+name = "a rule written below a FINAL never takes effect"
+rules = ["FINAL,DIRECT", "DOMAIN,a.com,REJECT"]
+final = "FINAL,P"
+host = "a.com"
+policy = "P"
+reason = "final"
+
+[[case]]
 name = "inline rule set with nested inline set"
 rules = ["RULE-SET,Outer,P"]
 rulesets = ["[Ruleset Outer]\nRULE-SET,Inner", "[Ruleset Inner]\nDOMAIN-SUFFIX,nested.example"]

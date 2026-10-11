@@ -195,7 +195,8 @@ impl SetRegistry {
         // Pre-create everything the profile uses so statuses are complete and
         // downloads start now. Matching ends at the first FINAL: a set that
         // only the rules after it name is never consulted, and is neither
-        // read nor downloaded.
+        // read nor downloaded. The roles in `claims` are still those of every
+        // rule written, the way the loader's `E0024` reads them.
         let evaluated = cfg.first_final().unwrap_or(cfg.rules.len());
         for rule in &cfg.rules[..evaluated] {
             reg.walk_kind(&rule.kind, rule.params.update_interval);
@@ -1286,6 +1287,31 @@ AND,((DOMAIN-SET,missing.txt),(DEST-PORT,443)),P\nFINAL,P\n",
         assert_eq!(decide(&engine, "domain-set.com").await.0, "DIRECT");
         assert_eq!(decide(&engine, "b.com").await.0, "REJECT");
         // `a.list` is claimed and never registered: `Claim` is not referenced
+        let names: Vec<String> = reg.statuses().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, [dir.path().join("b.list").display().to_string()]);
+    }
+
+    /// So does a claim made only by a rule that stands after the first FINAL
+    /// and is never evaluated: the roles are read from every rule written,
+    /// the way the loader reads them, although the set of such a rule is not
+    /// registered.
+    #[tokio::test]
+    async fn the_role_a_rule_after_the_first_final_gives_a_file_wins_too() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.list"), BOTH_KINDS).unwrap();
+        std::fs::write(dir.path().join("b.list"), "RULE-SET,a.list\nDOMAIN,b.com\n").unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,b.list,REJECT\nFINAL,DIRECT\n\
+DOMAIN-SET,a.list,P\nFINAL,P\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        assert_eq!(codes_of(&diags), [codes::W_SET_KIND_CONFLICT]);
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "b.com").await.0, "REJECT");
+        // the nested reference is left out: `rule.com` falls to the last FINAL
+        assert_eq!(decide(&engine, "rule.com").await.0, "P");
+        // `a.list` is claimed and never registered: its rule is not evaluated
         let names: Vec<String> = reg.statuses().into_iter().map(|s| s.name).collect();
         assert_eq!(names, [dir.path().join("b.list").display().to_string()]);
     }
