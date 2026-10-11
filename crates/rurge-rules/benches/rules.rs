@@ -1,16 +1,16 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use rurge_config::HostName;
 use rurge_config::config::{LoadOptions, from_text};
-use rurge_config::rule::ResourceRef;
+use rurge_config::rule::{ParseCtx, ResourceRef};
 use rurge_config::session::SessionInfo;
 use rurge_rules::domain_index::DomainIndexBuilder;
 use rurge_rules::engine::NoResolve;
 use rurge_rules::ip_index::IpIndexBuilder;
-use rurge_rules::matcher::{NoGeo, SetLookup, SetRef};
+use rurge_rules::matcher::{EvalCtx, NoGeo, SetLookup, SetRef, Verdict};
 use rurge_rules::set::{CompiledSet, SetHandle};
-use rurge_rules::set_format::{ParsedSet, SetKind, SetLine};
+use rurge_rules::set_format::{ParsedSet, SetKind, SetLine, parse_set};
 use rurge_rules::{OutboundMode, RuleEngine};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hint::black_box;
 use std::path::Path;
 use std::sync::Arc;
@@ -129,5 +129,43 @@ fn engine(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, domain_index, ip_index, engine);
+/// A rule set the way the big lists are written: 100,000 `IP-CIDR` lines, every
+/// one with `no-resolve`, built from the text of the file as a set file is.
+fn set_no_resolve_cidr(c: &mut Criterion) {
+    let network = |i: u32| format!("{}.{}.{}", 10 + (i >> 16) % 100, (i >> 8) & 255, i & 255);
+    let mut text = String::new();
+    for i in 0..100_000 {
+        text.push_str(&format!("IP-CIDR,{}.0/24,no-resolve\n", network(i)));
+    }
+    let inline = HashSet::new();
+    let ctx = ParseCtx {
+        inline_rulesets: &inline,
+        base_dir: Path::new("."),
+    };
+    let parsed = parse_set(SetKind::RuleSet, &text, &ctx);
+    assert_eq!(parsed.lines.len(), 100_000);
+    let set = CompiledSet::compile(
+        "no_resolve_cidr",
+        SetKind::RuleSet,
+        &parsed,
+        &Sets(HashMap::new()),
+        1,
+    );
+    let miss = SessionInfo::tcp(HostName::parse("203.0.113.1"), 443);
+    // inside the last network of the file: found only after the whole length
+    // of the file by a walk down the lines
+    let hit = SessionInfo::tcp(HostName::parse(&format!("{}.7", network(99_999))), 443);
+    let ask = |s: &SessionInfo| set.eval(s, &mut EvalCtx::new(&NoGeo), false, false);
+    // the two cases measure what their names say
+    assert_eq!(ask(&miss).verdict, Verdict::NoMatch);
+    assert_eq!(ask(&hit).verdict, Verdict::Match);
+    c.bench_function("set_100k_no_resolve_cidr_miss", |bench| {
+        bench.iter(|| ask(black_box(&miss)))
+    });
+    c.bench_function("set_100k_no_resolve_cidr_hit", |bench| {
+        bench.iter(|| ask(black_box(&hit)))
+    });
+}
+
+criterion_group!(benches, domain_index, ip_index, engine, set_no_resolve_cidr);
 criterion_main!(benches);
