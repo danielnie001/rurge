@@ -3244,22 +3244,39 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
     }
 
     /// Runs a `rurge run` that is expected to give up at once: its exit code
-    /// and standard error.
+    /// and standard error. A start that does not end in time says which start
+    /// it was and what it had printed, and whether waiting for it failed.
     fn give_up(mut cmd: Command) -> (Option<i32>, String) {
+        let start = describe_start(&cmd);
         let mut child = cmd
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut wait_error = None;
         let status = loop {
-            if let Ok(Some(status)) = child.try_wait() {
-                break status;
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(e) => wait_error = Some(e),
             }
             if std::time::Instant::now() > deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("rurge run did not give up within 20 s");
+                let mut printed = String::new();
+                let read = child.stderr.take().unwrap().read_to_string(&mut printed);
+                panic!(
+                    "rurge run did not give up within 20 s\n  the start: {start}\n  what it wrote to standard error: {printed:?}{}{}",
+                    read.err()
+                        .map(|e| format!(" (reading it failed: {e})"))
+                        .unwrap_or_default(),
+                    wait_error
+                        .map(|e| format!(
+                            "\n  waiting for it failed at least once, the last time with: {e}"
+                        ))
+                        .unwrap_or_default(),
+                );
             }
             std::thread::sleep(Duration::from_millis(100));
         };
@@ -3271,6 +3288,19 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             .read_to_string(&mut stderr)
             .unwrap();
         (status.code(), stderr)
+    }
+
+    /// A start as it was made: the environment it sets, the program and its
+    /// arguments.
+    fn describe_start(cmd: &Command) -> String {
+        let environment: String = cmd
+            .get_envs()
+            .filter_map(|(name, value)| {
+                value.map(|value| format!("{}={value:?} ", name.to_string_lossy()))
+            })
+            .collect();
+        let arguments: String = cmd.get_args().map(|arg| format!(" {arg:?}")).collect();
+        format!("{environment}{:?}{arguments}", cmd.get_program())
     }
 
     /// A data directory as a crashed `rurge run --system-proxy` leaves it: the
