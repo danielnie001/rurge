@@ -1277,6 +1277,11 @@ async fn geoip_says_what_the_databases_in_use_know() {
             })
         )
     );
+    // an IPv4-mapped address is the IPv4 address, as everywhere else
+    assert_eq!(
+        ask("::ffff:89.160.20.112").await,
+        ask("89.160.20.112").await
+    );
     // in the country database only; the address is echoed as parsed
     assert_eq!(
         ask("2001:0218:0:0:0:0:0:1").await,

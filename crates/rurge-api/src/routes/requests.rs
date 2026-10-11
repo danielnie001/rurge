@@ -47,7 +47,7 @@ pub struct RequestJson {
     pub listener: &'static str,
     pub transport: &'static str,
     pub src: String,
-    pub listen_port: u16,
+    pub listen_port: Option<u16>,
     pub dst: String,
     pub remote_addr: Option<String>,
     pub rule: Option<String>,
@@ -83,7 +83,9 @@ impl From<&RequestRecord> for RequestJson {
                 Transport::Udp => "udp",
             },
             src: r.src.to_string(),
-            listen_port: r.listen_port,
+            // `0` is no port: a session rurge started itself came in on no
+            // listener
+            listen_port: (r.listen_port != 0).then_some(r.listen_port),
             dst: r.dst.clone(),
             remote_addr: r.remote_addr.map(|a| a.to_string()),
             rule: r.rule.clone(),
@@ -269,9 +271,9 @@ mod tests {
         assert_eq!(v["firstByteMs"], 34);
     }
 
-    /// The listener's port is always a number; the address of the session's
-    /// own connection and the time spent on lookups are `null` when there is
-    /// none.
+    /// The listener's port is a number, `null` for a session that came in on
+    /// no listener (rurge's own); the address of the session's own connection
+    /// and the time spent on lookups are `null` when there is none.
     #[test]
     fn the_listen_port_the_remote_address_and_the_lookup_time() {
         let mut r = record(1, ListenerKind::Http);
@@ -279,6 +281,10 @@ mod tests {
         assert_eq!(v["listenPort"], 6152);
         assert_eq!(v["remoteAddr"], Value::Null);
         assert_eq!(v["dnsMs"], Value::Null);
+        let mut own = record(2, ListenerKind::Internal);
+        own.listen_port = 0;
+        let v = serde_json::to_value(RequestJson::from(&own)).unwrap();
+        assert_eq!(v["listenPort"], Value::Null);
         r.remote_addr = Some("192.0.2.7:443".parse().unwrap());
         r.dns_ms = Some(0);
         let v = serde_json::to_value(RequestJson::from(&r)).unwrap();

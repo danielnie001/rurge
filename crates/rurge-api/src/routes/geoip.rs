@@ -37,6 +37,8 @@ pub async fn geoip(
         .ip
         .parse()
         .map_err(|_| ApiError::bad_request("ip is not a valid IP address"))?;
+    // an IPv4-mapped address is the IPv4 address it names, here as everywhere
+    let ip = ip.to_canonical();
     let view = app.engine.geoip_view(ip);
     Ok(Json(GeoIpJson {
         address: ip.to_string(),
