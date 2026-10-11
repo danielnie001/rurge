@@ -20,7 +20,12 @@ pub struct CompiledSet {
     pub version: u64,
     domains: DomainIndex,
     ips: IpIndex,
-    /// Everything that is neither a plain domain nor an indexable CIDR, in file order.
+    /// Whether a line in `ips` may ask for a lookup, that is, one that did not
+    /// say `no-resolve`. Not `needs_dns`, which is wider: a nested set, a
+    /// logical rule, `GEOIP` and `IP-ASN` set it whether or not they end up
+    /// asking.
+    ips_resolve: bool,
+    /// Everything that is neither a plain domain nor a CIDR, in file order.
     linear: Vec<(u32, CompiledSubRule)>,
     entries: Vec<Box<str>>,
 }
@@ -34,6 +39,7 @@ impl CompiledSet {
             version: 0,
             domains: DomainIndex::default(),
             ips: IpIndexBuilder::new().build(),
+            ips_resolve: false,
             linear: Vec::new(),
             entries: Vec::new(),
         }
@@ -51,6 +57,7 @@ impl CompiledSet {
         let mut linear = Vec::new();
         let mut entries: Vec<Box<str>> = Vec::with_capacity(parsed.lines.len());
         let mut needs_dns = false;
+        let mut ips_resolve = false;
         for (i, line) in parsed.lines.iter().enumerate() {
             let i = u32::try_from(i).expect("set size is bounded by MAX_ENTRIES");
             match line {
@@ -68,21 +75,25 @@ impl CompiledSet {
                     match &sub.kind {
                         RuleKind::Domain(d) => domains.add_exact(d, i),
                         RuleKind::DomainSuffix(d) => domains.add_suffix(d, i),
-                        RuleKind::IpCidr(net) if !sub.no_resolve => {
-                            needs_dns = true;
+                        RuleKind::IpCidr(net) => {
                             ips.add_v4(*net, i);
+                            if !sub.no_resolve {
+                                needs_dns = true;
+                                ips_resolve = true;
+                            }
                         }
-                        RuleKind::IpCidr6(net) if !sub.no_resolve => {
-                            needs_dns = true;
+                        RuleKind::IpCidr6(net) => {
                             ips.add_v6(*net, i);
+                            if !sub.no_resolve {
+                                needs_dns = true;
+                                ips_resolve = true;
+                            }
                         }
                         other => {
                             if !sub.no_resolve
                                 && matches!(
                                     other,
-                                    RuleKind::IpCidr(_)
-                                        | RuleKind::IpCidr6(_)
-                                        | RuleKind::GeoIp(_)
+                                    RuleKind::GeoIp(_)
                                         | RuleKind::IpAsn(_)
                                         | RuleKind::RuleSet(_)
                                         | RuleKind::DomainSet(_)
@@ -106,6 +117,7 @@ impl CompiledSet {
             version,
             domains: domains.build(),
             ips: ips.build(),
+            ips_resolve,
             linear,
             entries,
         }
@@ -130,8 +142,13 @@ impl CompiledSet {
     }
 
     /// Domain index first (never resolves), then linear entries in file order,
-    /// then the IP index — which asks for resolution only when the set has IP
-    /// entries and the line did not say `no-resolve`.
+    /// then the IP index. The index holds every `IP-CIDR` / `IP-CIDR6` line,
+    /// with or without `no-resolve`; it asks for resolution only when the
+    /// caller did not say `no-resolve` and some line in it did not either (a
+    /// line that said it never asks). When several lines match, the one
+    /// reported is the first found in that order, which is not always the first
+    /// in the file: an IP line is found after the linear ones, and among IP
+    /// lines the longest prefix wins.
     pub fn eval(
         &self,
         s: &SessionInfo,
@@ -167,7 +184,7 @@ impl CompiledSet {
         }
         if !self.ips.is_empty() {
             for family in [Family::V4, Family::V6] {
-                match target_ip(s, ctx, no_resolve, family) {
+                match target_ip(s, ctx, no_resolve || !self.ips_resolve, family) {
                     Ok(ip) => {
                         if let Some(i) = self.ips.lookup(ip) {
                             return self.hit(i);
@@ -520,6 +537,58 @@ DEST-PORT,8443
             ask(&outer, "10.1.1.1", None, false),
             matches_line("IP-CIDR,10.0.0.0/8,no-resolve")
         );
+    }
+
+    #[test]
+    fn no_resolve_ip_lines_go_into_the_index_not_the_linear_list() {
+        let set = compile(
+            SetKind::RuleSet,
+            "IP-CIDR,10.0.0.0/8,no-resolve\nIP-CIDR6,fd00::/8,no-resolve\n",
+            &Stub::default(),
+        );
+        assert_eq!(set.linear.len(), 0);
+        assert_eq!(set.ips.len(), 2);
+        // what is neither a name nor a CIDR is still walked, line by line
+        let set = compile(
+            SetKind::RuleSet,
+            "IP-CIDR,10.0.0.0/8,no-resolve\nDOMAIN-KEYWORD,keyw\nIP-CIDR6,fd00::/8,no-resolve\n",
+            &Stub::default(),
+        );
+        assert_eq!(set.ips.len(), 2);
+        assert_eq!(set.linear.len(), 1);
+        assert_eq!(set.entry(set.linear[0].0), "DOMAIN-KEYWORD,keyw");
+    }
+
+    #[test]
+    fn among_no_resolve_ip_lines_the_longest_prefix_is_reported() {
+        let set = compile(
+            SetKind::RuleSet,
+            "IP-CIDR,10.0.0.0/8,no-resolve\nIP-CIDR,10.1.0.0/16,no-resolve\n",
+            &Stub::default(),
+        );
+        assert_eq!(
+            ask(&set, "10.1.2.3", None, false),
+            matches_line("IP-CIDR,10.1.0.0/16,no-resolve")
+        );
+    }
+
+    /// The lines that are walked come before the IP index: a `DEST-PORT` line
+    /// is the one reported wherever it stands in the file, for an IP line
+    /// written either way.
+    #[test]
+    fn a_walked_line_is_reported_ahead_of_an_ip_line_however_it_is_written() {
+        for ip_line in ["IP-CIDR,10.0.0.0/8", "IP-CIDR,10.0.0.0/8,no-resolve"] {
+            let set = compile(
+                SetKind::RuleSet,
+                &format!("{ip_line}\nDEST-PORT,443\n"),
+                &Stub::default(),
+            );
+            assert_eq!(
+                ask(&set, "10.1.1.1", None, false),
+                matches_line("DEST-PORT,443"),
+                "{ip_line}"
+            );
+        }
     }
 
     #[test]
