@@ -192,9 +192,12 @@ impl SetRegistry {
             self_weak: Mutex::new(Weak::new()),
         });
         *reg.self_weak.lock().expect("registry lock") = Arc::downgrade(&reg);
-        // Pre-create everything the profile references so statuses are complete
-        // and downloads start now.
-        for rule in &cfg.rules {
+        // Pre-create everything the profile uses so statuses are complete and
+        // downloads start now. Matching ends at the first FINAL: a set that
+        // only the rules after it name is never consulted, and is neither
+        // read nor downloaded.
+        let evaluated = cfg.first_final().unwrap_or(cfg.rules.len());
+        for rule in &cfg.rules[..evaluated] {
             reg.walk_kind(&rule.kind, rule.params.update_interval);
         }
         for host in &cfg.hosts {
@@ -958,6 +961,43 @@ DOMAIN,a.com,P\nFINAL,DIRECT\n",
         assert_eq!(st.len(), 1);
         assert_eq!(st[0].kind, SetKind::DomainSet);
         assert_eq!(st[0].entries, 1);
+    }
+
+    /// Matching ends at the first FINAL, so a set that only the rules written
+    /// after it name is never consulted: it is not registered, nothing is
+    /// read or downloaded for it, and nothing is said about it (the loader
+    /// has said that those rules never take effect).
+    #[tokio::test]
+    async fn a_set_only_rules_after_the_first_final_name_is_not_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("live.list"), "DOMAIN,a.com\n").unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,live.list,P\nFINAL,DIRECT\n\
+RULE-SET,http://sets.example/after.list,P\n\
+AND,((DOMAIN-SET,missing.txt),(DEST-PORT,443)),P\nFINAL,P\n",
+            dir.path(),
+        );
+        let mgr = offline_manager(dir.path());
+        let (reg, diags) = SetRegistry::build(&cfg, mgr.clone(), dir.path());
+        // registered, each of the two would be a `W0022`: nothing is cached
+        // for the URL, and the file does not exist
+        assert!(diags.is_empty(), "{:?}", codes_of(&diags));
+        let live = dir.path().join("live.list").display().to_string();
+        let names = || -> Vec<String> { reg.statuses().into_iter().map(|s| s.name).collect() };
+        let urls = || {
+            mgr.statuses()
+                .into_iter()
+                .filter(|s| matches!(s.source, ResourceSource::Url(_)))
+                .count()
+        };
+        assert_eq!(names(), [live.clone()]);
+        assert_eq!(urls(), 0);
+        // compiling the rules registers nothing more
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "a.com").await.0, "P");
+        assert_eq!(decide(&engine, "b.com").await.0, "P");
+        assert_eq!(names(), [live]);
+        assert_eq!(urls(), 0);
     }
 
     /// `rule.com` is a line of a rule set and `domain-set.com` one of a domain
