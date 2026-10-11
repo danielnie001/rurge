@@ -58,7 +58,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
   - 被拒绝的会话（`REJECT` 一族）与 rurge 不实现的协议（`W0007`）：`null`。所有 UDP 会话——UDP 流与内部 UDP 会话，失败的也算——一律 `null`：UDP 没有单一的远端，而经代理的载体只由第一条用到它的流打开，只让那一条带上地址反而误导。
   - 内部 DNS 会话（`encrypted-dns-follow-outbound-mode`）：DoT / DoH / `tcp://` 上游的会话是服务器的地址；DoQ / DoH3 的 QUIC 载体是 UDP，`null`。
 
-  这是登记的限制（任务局部变量只在会话自己的任务里可见），补全随阶段 4 的 FR-HTTP-10 完整部分。
+  这是登记的限制（任务局部变量只在会话自己的任务里可见），补全随阶段 4 的 FR-HTTP-10 完整部分。以上各情形里有用例钉住的是：DIRECT（HTTP 与 SOCKS5 两种入站）、经 `socks5` 的上游、链式策略的第一跳、`smart` 组换成员（记连上的那个成员；先连上又失败、换到的成员没连上时是 `null`）、被拒绝的会话、`external`、内部 DNS 会话（`tcp://` 上游的地址；SOCKS5 UDP 关联上的 DoQ 载体是 `null`）与 UDP 流（`null`）；其余的是读代码得出的，没有用例：`http`、`https`、`socks5-tls`、`trojan`、`vmess`、`ss` 与上面测过的 `socks5` 走连接器里同一条路径，各自没有用例，取自池的 `snell` / `anytls` 连接、共用一条连接的 `h2-connect` 与 HTTP/2 `trust-tunnel` 的其余流、`ssh`、`wireguard`、QUIC 族、DoT / DoH 的内部会话、底层 UDP 载体是 TCP 连接的那个例外也是。
 - **`dnsMs`**：这条会话拨号期间花在域名解析上的毫秒数，只算 rurge 自己的解析器——规则要的解析（`IP-CIDR` 一类遇到域名）与出站自己的解析（含以域名配置的代理服务器）合计；`[Host]` 与缓存命中的也算一次接近 0 的查找（可能是 0），等另一条会话在同一个名字上已在途的查询的时间也算，被外层超时打断的查找记它已花的时间。目标是地址、名字交给代理去解析、或隧道自己的 `dns-server` 解析了它时，会话没有做过查找，是 `null`，不是 0。查找在结束时才记下，所以卡在一次慢解析里的进行中会话显示 `null`。UDP 流照记；解析器向上游发的查询、查找自己开的连接不算会话的。
 - **`notes`**：备注，字符串数组，没有时 `[]`。现在只有子规则命中那一句 ``Sub-rule matched: <行> (in <集合>)``（兼容性清单 3.3 节）。`error` 里已登记的说明（组环、空组兜底、`policy does not support UDP; sent through DIRECT` 一类，见 `docs/api/phase2.md`）仍在 `error` 里，不搬进 `notes`。
 
