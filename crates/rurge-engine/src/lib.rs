@@ -8,6 +8,7 @@ pub mod dns_pipeline;
 pub mod engine;
 pub mod observe;
 pub mod outbounds;
+pub mod profile;
 pub mod relay;
 mod reload;
 pub mod runtime;

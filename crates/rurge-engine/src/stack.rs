@@ -58,18 +58,9 @@ pub async fn build_stack_with(
     customize: impl FnOnce(&mut ResolverConfig),
 ) -> anyhow::Result<Stack> {
     let connector = Arc::new(DirectConnector::new(Arc::new(SystemResolve)));
-    let client = Arc::new(HttpClient::new(
-        connector.clone(),
-        HttpClientConfig {
-            // Subscription panels pick the format of what they send by
-            // User-Agent; "Surge" in it asks for Surge's.
-            user_agent: format!("rurge/{} (Surge-compatible)", env!("CARGO_PKG_VERSION")),
-            ..HttpClientConfig::default()
-        },
-    )?);
     let resources = ResourceManager::with_options(
         opts.data_dir.clone(),
-        client,
+        resource_client()?,
         ResourceOptions {
             offline: opts.no_network,
             ..ResourceOptions::default()
@@ -124,6 +115,22 @@ pub async fn build_stack_with(
         resolver,
         diagnostics,
     })
+}
+
+/// The HTTP client that downloads external resources and the sources of the
+/// profile: direct connections, never through the pipeline, so that an
+/// engine that refuses sessions can still update.
+pub fn resource_client() -> anyhow::Result<Arc<HttpClient>> {
+    let connector = Arc::new(DirectConnector::new(Arc::new(SystemResolve)));
+    Ok(Arc::new(HttpClient::new(
+        connector,
+        HttpClientConfig {
+            // Subscription panels pick the format of what they send by
+            // User-Agent; "Surge" in it asks for Surge's.
+            user_agent: format!("rurge/{} (Surge-compatible)", env!("CARGO_PKG_VERSION")),
+            ..HttpClientConfig::default()
+        },
+    )?))
 }
 
 /// Gives the background reload / install tasks up to two seconds to apply
