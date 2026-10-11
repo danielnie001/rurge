@@ -7,7 +7,7 @@ mod common;
 use common::*;
 use rurge_config::HostName;
 use rurge_config::session::SessionInfo;
-use rurge_engine::RequestRecord;
+use rurge_engine::{REFUSED_STRICT, RequestRecord};
 use rurge_inbound::{DialError, Dialer};
 use std::collections::HashSet;
 
@@ -236,6 +236,77 @@ async fn every_test_is_a_session_of_the_request_log() {
             "{r:?}"
         );
     }
+}
+
+/// A suspension refuses the sessions of clients and nothing else: a policy
+/// and a group are still tested when the API asks, through the policies' own
+/// outbounds, and each test is a session of the request log that ends as its
+/// probe did — none of them with the refusal.
+#[tokio::test]
+async fn a_suspended_engine_still_tests_its_policies() {
+    let origin = TestServer::spawn().await;
+    let (_a, _b, proxies) = upstreams(&origin).await;
+    let h = harness(Profile {
+        proxies: &proxies,
+        groups: "F = fallback, Dead, A",
+        rules: "DOMAIN,target.test,F",
+        ..Profile::default()
+    })
+    .await;
+    h.engine.suspend(Some("the update failed".to_string()));
+    match h.engine.dial(session("target.test")).await {
+        Err(DialError::Failed { message, .. }) => assert_eq!(message, REFUSED_STRICT),
+        Err(DialError::Reject { kind, .. }) => panic!("rejected by {}", kind.name()),
+        Ok(_) => panic!("a client's session got through a suspended engine"),
+    }
+
+    let results = h
+        .engine
+        .test_policies(&["A".to_string()], None)
+        .await
+        .unwrap();
+    let (name, result) = &results[0];
+    assert_eq!(name, "A");
+    let result = result.as_ref().expect("a socks5 policy can be tested");
+    assert!(result.outcome.is_ok(), "{:?}", result.outcome);
+    assert_eq!(h.engine.test_group("F").await.unwrap(), ["A"]);
+
+    let log = h.engine.request_log();
+    let tests = || -> Vec<RequestRecord> {
+        log.recent(100)
+            .into_iter()
+            .filter(|r| r.rule.as_deref() == Some("policy test"))
+            .collect()
+    };
+    wait_until("the sessions of the tests", || {
+        let tests = tests();
+        tests
+            .iter()
+            .any(|r| r.policy == ["A"] && r.status == RecordStatus::Completed)
+            && tests
+                .iter()
+                .any(|r| r.policy == ["Dead"] && r.status == RecordStatus::Failed)
+    })
+    .await;
+    let tests = tests();
+    // Dead fails as it does on any day: its own server refuses the connection
+    let dead = tests
+        .iter()
+        .find(|r| r.policy == ["Dead"])
+        .expect("Dead tested");
+    assert!(
+        dead.error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("connect: ")),
+        "{:?}",
+        dead.error
+    );
+    assert!(
+        tests
+            .iter()
+            .all(|r| r.error.as_deref() != Some(REFUSED_STRICT)),
+        "{tests:?}"
+    );
 }
 
 /// A group's own `underlying-proxy` makes its members `M (via R)`; such a

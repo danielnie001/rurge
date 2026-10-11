@@ -544,7 +544,7 @@ impl Engine {
         self.suspended.store(Arc::new(why));
     }
 
-    /// Why new sessions are refused, while they are (`suspend`).
+    /// Why new sessions are refused (`suspend`); `None` while they are not.
     pub fn suspended(&self) -> Option<String> {
         (**self.suspended.load()).clone()
     }

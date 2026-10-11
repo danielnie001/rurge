@@ -2740,7 +2740,8 @@ async fn runtime_mode_and_global_policy_override_routing() {
     assert!(full.contains("password=x"));
 }
 
-/// What a managed profile was downloaded as: the copy of the one address.
+/// A `RemoteSource` with one address downloaded: its text, and the file the
+/// copy is kept in. Any other address is missing.
 struct Downloaded {
     url: Url,
     text: String,
@@ -2831,7 +2832,10 @@ async fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> ([u8; 10], 
     let mut s = TcpStream::connect(proxy).await.unwrap();
     s.write_all(&[5, 1, 0]).await.unwrap();
     let mut method = [0u8; 2];
-    s.read_exact(&mut method).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), s.read_exact(&mut method))
+        .await
+        .expect("the proxy chooses a method")
+        .unwrap();
     assert_eq!(method, [5, 0]);
     let mut request = vec![5, 1, 0, 3, host.len() as u8];
     request.extend_from_slice(host.as_bytes());
