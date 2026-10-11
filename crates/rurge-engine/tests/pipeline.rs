@@ -4,6 +4,7 @@
 // not `use common::*`: this file has a harness of its own
 mod common;
 
+use common::UNTESTED;
 use rurge_config::HostName;
 use rurge_config::config::{LoadOptions, from_text};
 use rurge_config::rule::ProtocolKind;
@@ -2717,11 +2718,6 @@ async fn sessions_dialling_together_record_their_own_address_and_lookup_time() {
     assert!(slow.dns_ms.unwrap() >= delay.as_millis() as u64, "{slow:?}");
     assert_eq!(quick.dns_ms, None, "{quick:?}");
 }
-
-/// Keeps the connectivity tests off a member: the sessions of a test round
-/// are records of the request log as well, and the members' fakes would
-/// count their connections.
-const UNTESTED: &str = "test-url=http://[";
 
 /// When a `smart` group moves on from a member it could not reach, the
 /// record has the address of the member that connected.

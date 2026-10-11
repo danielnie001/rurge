@@ -501,6 +501,38 @@ async fn a_flow_counts_the_lookup_of_its_name() {
     assert_eq!(addressed.dns_ms, None, "{addressed:?}");
 }
 
+/// The lookup a rule makes counts for a flow, as it does for a TCP session:
+/// an `IP-CIDR` rule without `no-resolve` has the name looked up, while a flow
+/// addressed to an address is matched without one. Both flows are rejected,
+/// so neither opened a socket.
+#[tokio::test]
+async fn the_lookup_a_rule_makes_counts_for_a_flow_too() {
+    let h = harness(Profile {
+        rules: "IP-CIDR,127.0.0.1/32,REJECT",
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association.send("target.test", 443, b"by name").await;
+    association.send("127.0.0.1", 443, b"by address").await;
+    // the association stays open meanwhile: ending it would end the flows
+    // still being routed
+    let records = finished(&h, 2).await;
+    let of = |host: &str| {
+        records
+            .iter()
+            .find(|r| r.dst.starts_with(host))
+            .unwrap_or_else(|| panic!("no record of {host} in {records:?}"))
+    };
+    let (named, addressed) = (of("target.test"), of("127.0.0.1"));
+    for r in [named, addressed] {
+        assert!(matches!(r.status, RecordStatus::Rejected(_)), "{r:?}");
+        assert_eq!(r.remote_addr, None, "{r:?}");
+    }
+    assert!(named.dns_ms.is_some(), "{named:?}");
+    assert_eq!(addressed.dns_ms, None, "{addressed:?}");
+}
+
 /// `underlying-proxy` carries UDP (M5 design 4.3): the front proxy's
 /// association is set up through the back one, and its datagrams go
 /// through the back one's association.

@@ -35,15 +35,6 @@ async fn upstream(origin: &TestServer) -> FakeSocks5 {
     .await
 }
 
-/// A parameter that keeps the connectivity tests off a member: no round can
-/// test at a URL that does not parse, so the member is known through
-/// sessions only (M3c design 8.1). For the tests below that count the
-/// failures sessions told of: a test at the harness's URL (`NO_TEST`) fails,
-/// and every member's failed test would count beside them — at once, seconds
-/// later, or only after the count was read, as the machine refuses a
-/// connection to that port quickly, slowly, or takes it and never answers.
-const UNTESTED: &str = "test-url=http://[";
-
 /// What the book knows of each of `members` now.
 fn healths(h: &Harness, members: &[&str]) -> Vec<Health> {
     let registry = h.engine.registry();

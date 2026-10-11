@@ -119,8 +119,19 @@ pub async fn runtime_edited(
 /// round of such tests, which then runs on its own: whatever is asserted
 /// after the dial has to hold whenever the round ends. Where it would not —
 /// a count of a member's failures — the members are kept out of the rounds
-/// (`UNTESTED` in `smart.rs`) or given a test URL of their own.
+/// (`UNTESTED`) or given a test URL of their own.
 pub const NO_TEST: &str = "http://127.0.0.1:9/";
+
+/// A parameter that keeps the connectivity tests off a member: no round can
+/// test at a URL that does not parse, so the member is known through
+/// sessions only. For the tests that count the failures sessions told of: a
+/// test at the harness's URL (`NO_TEST`) fails, and every member's failed
+/// test would count beside them — at once, seconds later, or only after the
+/// count was read, as the machine refuses a connection to that port quickly,
+/// slowly, or takes it and never answers. For the tests that read the request
+/// log or count connections at the members' fakes: the sessions of a test
+/// round are records of the log as well, and connections at the fakes.
+pub const UNTESTED: &str = "test-url=http://[";
 
 /// The variable parts of a test profile; everything else is fixed.
 #[derive(Default)]
