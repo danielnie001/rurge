@@ -982,7 +982,7 @@ AND,((DOMAIN-SET,missing.txt),(DEST-PORT,443)),P\nFINAL,P\n",
         // registered, each of the two would be a `W0022`: nothing is cached
         // for the URL, and the file does not exist
         assert!(diags.is_empty(), "{:?}", codes_of(&diags));
-        let live = dir.path().join("live.list").display().to_string();
+        let live = [dir.path().join("live.list").display().to_string()];
         let names = || -> Vec<String> { reg.statuses().into_iter().map(|s| s.name).collect() };
         let urls = || {
             mgr.statuses()
@@ -990,13 +990,13 @@ AND,((DOMAIN-SET,missing.txt),(DEST-PORT,443)),P\nFINAL,P\n",
                 .filter(|s| matches!(s.source, ResourceSource::Url(_)))
                 .count()
         };
-        assert_eq!(names(), [live.clone()]);
+        assert_eq!(names(), live);
         assert_eq!(urls(), 0);
         // compiling the rules registers nothing more
         let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
         assert_eq!(decide(&engine, "a.com").await.0, "P");
         assert_eq!(decide(&engine, "b.com").await.0, "P");
-        assert_eq!(names(), [live]);
+        assert_eq!(names(), live);
         assert_eq!(urls(), 0);
     }
 
