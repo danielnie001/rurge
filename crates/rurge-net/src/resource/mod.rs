@@ -1005,9 +1005,9 @@ impl ResourceManager {
                     entry.end();
                     return;
                 }
+                let progress = entry.progress.subscribe();
                 // Without a runtime the task is dropped as it is, and says so
                 // as it goes
-                let progress = entry.progress.subscribe();
                 self.spawn(url_task(
                     Ends(entry.clone()),
                     self.weak(),
@@ -3187,7 +3187,7 @@ mod tests {
             })
         };
         // a task of the same runtime: it gets its turns only while the check leaves the
-        // thread alone, and opens the latch only once the check waits for it
+        // thread alone, and opens the latch only once the check has begun
         tokio::spawn({
             let (entered, opened) = (entered.clone(), opened.clone());
             async move {
@@ -3648,7 +3648,12 @@ mod tests {
                 }
             });
         }
-        let all = async { while jobs.join_next().await.is_some() {} };
+        let all = async {
+            // a job that gave up waiting has to fail the test, not just end
+            while let Some(done) = jobs.join_next().await {
+                done.expect("a job failed");
+            }
+        };
         tokio::time::timeout(Duration::from_secs(30), all)
             .await
             .expect("a deadlock");
@@ -4629,6 +4634,23 @@ mod tests {
         }
     }
 
+    /// `wait_until` for a test that stops a thread of its runtime, on the
+    /// test's own thread and by the clock of the system. A timer of the
+    /// runtime is fired by a worker that has nothing else to do; the one that
+    /// did it goes on to run the task that stops it without waking another,
+    /// and the other can be asleep until somebody gives it a task. A wait on
+    /// such a timer would then never end.
+    fn wait_here(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// `updating` is lowered before the new version is announced: whoever the
     /// version wakes finds a download that is over. The test holds a value of
     /// the version channel, which keeps the next one from being announced: the
@@ -4642,16 +4664,21 @@ mod tests {
         let source = source_of(&url);
         let mgr = manager(root.path(), fast());
         let h = mgr.get(&url_spec(url, None));
-        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
         let mut rx = h.subscribe();
+        // the first version has been announced: nothing of it is still on its way to the
+        // channel when the value is held
+        wait_until("the first version to be announced", || *rx.borrow() == 1).await;
+        assert_eq!(*rx.borrow_and_update(), 1);
         server.set("/v", "two");
+        // from here until the value is let go the task may stop a thread of the runtime
         let held = rx.borrow();
         assert!(mgr.force_update(&source));
-        wait_until("the request to arrive", || server.hits("/v") == 2).await;
-        wait_until("the download to be over", || {
+        wait_here("the request to arrive", || server.hits("/v") == 2);
+        // This wait is the test. Nothing is announced while the value is held, so a download
+        // that is not over by now stays so until the wait gives up.
+        wait_here("the download to be over", || {
             !h.entry.updating.load(Ordering::SeqCst)
-        })
-        .await;
+        });
         assert!(!rx.has_changed().unwrap(), "the version was announced");
         drop(held);
         told(&mut rx).await;
@@ -4680,16 +4707,66 @@ mod tests {
         let mgr = manager(root.path(), fast());
         let h = mgr.get_checked(&profile_spec(&url), "the profile", check);
         wait_until("the check to begin", || entered.is_open()).await;
+        // from here until the value is let go the task may stop a thread of the runtime
         let held = h.entry.progress.borrow();
         assert_eq!((held.started, held.finished), (1, 0));
         assert!(h.entry.updating.load(Ordering::SeqCst));
         release.open();
-        wait_until("the download to be over", || {
+        // This wait is the test. The attempt is not counted while the value is held, so a
+        // download that is not over by now stays so until the wait gives up.
+        wait_here("the download to be over", || {
             !h.entry.updating.load(Ordering::SeqCst)
-        })
-        .await;
+        });
         assert_eq!(held.finished, 0, "the attempt was counted");
         drop(held);
         wait_finished(&h, 1).await;
+    }
+
+    /// And when the attempt found nothing new, which is how most of them end.
+    /// Another thread keeps the lock of the cache files until the test has the
+    /// value of the progress channel: the answer is recorded, and the download
+    /// has to be over, with the count still to come.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn updating_is_down_before_an_attempt_that_found_nothing_new_counts_as_finished() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/s", "same");
+        let url = server.url("/s");
+        let source = source_of(&url);
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url, None));
+        wait_finished(&h, 1).await;
+        let (holding, let_go) = (Arc::new(Latch::default()), Arc::new(Latch::default()));
+        let holder = std::thread::spawn({
+            let (entry, holding, let_go) = (h.entry.clone(), holding.clone(), let_go.clone());
+            move || {
+                let _record = entry.record.lock().unwrap();
+                holding.open();
+                let_go.wait();
+            }
+        });
+        // from here until the value is let go the task may stop a thread of the runtime:
+        // at that lock first, then where it would count the attempt
+        wait_here("the lock of the cache files to be taken", || {
+            holding.is_open()
+        });
+        assert!(mgr.force_update(&source));
+        wait_here("the request to arrive", || server.hits("/s") == 2);
+        // the answer cannot be recorded yet, so the attempt is under way for as long as it
+        // takes to get hold of the value
+        let held = h.entry.progress.borrow();
+        assert_eq!((held.started, held.finished), (2, 1));
+        assert!(h.entry.updating.load(Ordering::SeqCst));
+        let_go.open();
+        // This wait is the test, as above.
+        wait_here("the download to be over", || {
+            !h.entry.updating.load(Ordering::SeqCst)
+        });
+        assert_eq!(held.finished, 1, "the attempt was counted");
+        drop(held);
+        holder.join().unwrap();
+        wait_finished(&h, 2).await;
+        // "not modified": the copy and its version are the ones there were
+        assert_eq!(h.version(), 1);
     }
 }
