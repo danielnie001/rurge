@@ -583,9 +583,57 @@ fn session_line(log: &LogCapture, message: &str, dst: &str) -> String {
     lines.into_iter().next().unwrap()
 }
 
-/// Whether `line` has the field `name` with exactly `value`.
-fn has_field(line: &str, name: &str, value: impl std::fmt::Display) -> bool {
-    line.contains(&format!(" {name}={value} ")) || line.ends_with(&format!(" {name}={value}"))
+/// The names a session's line carries, as the engine logs it.
+const SESSION_FIELDS: &[&str] = &[
+    "session",
+    "listener",
+    "src",
+    "dst",
+    "rule",
+    "policy",
+    "up",
+    "down",
+    "elapsed_ms",
+    "error",
+];
+
+/// The value of the field `name` of a session's line, whole. Values are
+/// printed without quotes and may hold spaces and commas (`policy=DIRECT >
+/// Proxy`), so a value runs to the next field of the line, not to the next
+/// space.
+fn field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let start = line.find(&format!(" {name}="))? + name.len() + 2;
+    let rest = &line[start..];
+    let end = SESSION_FIELDS
+        .iter()
+        .filter_map(|next| rest.find(&format!(" {next}=")))
+        .min()
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+#[test]
+fn a_field_of_a_log_line_is_read_whole() {
+    let completed = "DEBUG session completed session=123 listener=Http src=127.0.0.1:50000 \
+        dst=a.test:80 rule=RULE-SET,C:/some dir/a.list,DIRECT policy=DIRECT > Proxy up=1 \
+        down=2 elapsed_ms=3";
+    assert_eq!(field(completed, "policy"), Some("DIRECT > Proxy"));
+    assert_eq!(field(completed, "session"), Some("123"));
+    assert_ne!(field(completed, "session"), Some("12"));
+    assert_eq!(
+        field(completed, "rule"),
+        Some("RULE-SET,C:/some dir/a.list,DIRECT")
+    );
+    assert_eq!(field(completed, "error"), None);
+    // the last field of a line runs to the end of it
+    let failed = "INFO session failed session=7 listener=Socks5 src=127.0.0.1:50001 \
+        dst=a.test:9 rule=FINAL,DIRECT policy=DIRECT up=0 down=0 elapsed_ms=2 \
+        error=connection refused (os error 111)";
+    assert_eq!(
+        field(failed, "error"),
+        Some("connection refused (os error 111)")
+    );
+    assert_eq!(field(failed, "elapsed_ms"), Some("2"));
 }
 
 /// The line a finished session leaves in the log has the id of the session's
@@ -603,30 +651,40 @@ async fn the_log_line_of_a_completed_session_carries_what_its_record_does() {
         OutboundMode::Rule,
     )
     .await;
-    let url = format!("http://target.test:{}/hello", h.target_port());
-    let (head, _) = get_via_proxy(h.http(), &url).await;
+    let port = h.target_port();
+    // Another session goes first, one that no set has a say in: the one under
+    // test is then not the engine's first, and its id is not a number a line
+    // would carry by chance.
+    let (head, _) = get_via_proxy(h.http(), &format!("http://tls.test:{port}/hello")).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let first = wait_for_record(&h.engine, Duration::from_secs(3), |r| {
+        r.dst.starts_with("tls.test:") && matches!(r.status, RecordStatus::Completed)
+    })
+    .await
+    .expect("the first session's record");
+    let (head, _) = get_via_proxy(h.http(), &format!("http://target.test:{port}/hello")).await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     let record = wait_for_record(&h.engine, Duration::from_secs(3), |r| {
         r.dst.starts_with("target.test:") && matches!(r.status, RecordStatus::Completed)
     })
     .await
     .expect("the session's record");
+    assert_ne!(record.id, first.id, "{record:?}");
     let line = session_line(&log, "session completed", &record.dst);
-    assert!(has_field(&line, "session", record.id), "{line}");
+    let id = record.id.to_string();
+    assert_eq!(field(&line, "session"), Some(id.as_str()), "{line}");
     let rule = record.rule.as_deref().expect("a rule decided it");
     assert!(rule.starts_with("RULE-SET,"), "{rule}");
-    assert!(has_field(&line, "rule", rule), "{line}");
-    assert!(
-        has_field(&line, "policy", record.policy.join(" > ")),
-        "{line}"
-    );
+    assert_eq!(field(&line, "rule"), Some(rule), "{line}");
+    let policy = record.policy.join(" > ");
+    assert_eq!(field(&line, "policy"), Some(policy.as_str()), "{line}");
     let hits: Vec<String> = log
         .lines()
         .into_iter()
         .filter(|l| l.contains("Sub-rule matched"))
         .collect();
     assert_eq!(hits.len(), 1, "{hits:?}");
-    assert!(has_field(&hits[0], "session", record.id), "{}", hits[0]);
+    assert_eq!(field(&hits[0], "session"), Some(id.as_str()), "{}", hits[0]);
 }
 
 #[tokio::test]
@@ -641,13 +699,12 @@ async fn the_log_line_of_a_rejected_session_carries_what_its_record_does() {
     .await
     .expect("the session's record");
     let line = session_line(&log, "session rejected by REJECT", &record.dst);
-    assert!(has_field(&line, "session", record.id), "{line}");
+    let id = record.id.to_string();
+    assert_eq!(field(&line, "session"), Some(id.as_str()), "{line}");
     let rule = record.rule.as_deref().expect("a rule decided it");
-    assert!(has_field(&line, "rule", rule), "{line}");
-    assert!(
-        has_field(&line, "policy", record.policy.join(" > ")),
-        "{line}"
-    );
+    assert_eq!(field(&line, "rule"), Some(rule), "{line}");
+    let policy = record.policy.join(" > ");
+    assert_eq!(field(&line, "policy"), Some(policy.as_str()), "{line}");
 }
 
 /// A session that could not connect says why in its line, in the words its
@@ -668,11 +725,12 @@ async fn the_log_line_of_a_failed_session_carries_what_its_record_does() {
     .await
     .expect("the session's record");
     let line = session_line(&log, "session failed", &dst);
-    assert!(has_field(&line, "session", record.id), "{line}");
+    let id = record.id.to_string();
+    assert_eq!(field(&line, "session"), Some(id.as_str()), "{line}");
     let rule = record.rule.as_deref().expect("a rule decided it");
-    assert!(has_field(&line, "rule", rule), "{line}");
+    assert_eq!(field(&line, "rule"), Some(rule), "{line}");
     let error = record.error.as_deref().expect("a failure says why");
-    assert!(has_field(&line, "error", error), "{line}");
+    assert_eq!(field(&line, "error"), Some(error), "{line}");
 }
 
 async fn harness_with_final_reject(mode: OutboundMode) -> Harness {
