@@ -1997,11 +1997,10 @@ mod run {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let host = url.trim_start_matches("http://").split('/').next().unwrap();
-        write!(
-            s,
-            "GET {url} HTTP/1.1\r\nHost: {host}\r\n{headers}Connection: close\r\n\r\n"
-        )
-        .unwrap();
+        // one write, as in `api_call`
+        let request =
+            format!("GET {url} HTTP/1.1\r\nHost: {host}\r\n{headers}Connection: close\r\n\r\n");
+        s.write_all(request.as_bytes()).unwrap();
         let mut out = String::new();
         let _ = s.read_to_string(&mut out);
         out
@@ -2051,6 +2050,14 @@ mod run {
     }
 
     /// Minimal HTTP/1.1 call against the API: (status, body).
+    ///
+    /// The request leaves in one write. Written in pieces (`write!` on a
+    /// socket sends once per piece) it can arrive in several segments, the
+    /// body after the head. An endpoint that does not read its body, `POST
+    /// /v1/stop` among them, answers on the head alone and closes; a body that
+    /// then reaches the closed connection is met with a reset, and on Windows
+    /// the reset makes the client's system discard the answer it has not read
+    /// yet: nothing is read and the status comes out as 0.
     fn api_call(
         port: u16,
         method: &str,
@@ -2061,12 +2068,11 @@ mod run {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let body = body.unwrap_or("");
-        write!(
-            s,
+        let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
-        )
-        .unwrap();
+        );
+        s.write_all(request.as_bytes()).unwrap();
         let mut out = String::new();
         let _ = s.read_to_string(&mut out);
         let status = out
