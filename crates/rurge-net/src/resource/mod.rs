@@ -15,14 +15,32 @@ use rurge_config::ResourceRef;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, watch};
 use url::Url;
 
 pub const DEFAULT_UPDATE_INTERVAL: i64 = 86_400;
+
+/// Decides whether a body that was downloaded is taken (`get_checked`). It runs
+/// on a thread of the blocking pool and under none of the manager's locks, so
+/// it may call the manager: `adopt`, `get`, `statuses`. The entry keeps its
+/// check for as long as it lives, so a check that calls the manager holds it
+/// by a `Weak`. The reason it gives is the `last_error` of the resource, as it
+/// is.
+pub type Check = Arc<dyn Fn(&[u8]) -> Result<(), String> + Send + Sync>;
+
+/// What `update_now` answers for an entry whose task is over: it was retired,
+/// its manager is gone, or it never got a task.
+const NO_LONGER_UPDATED: &str = "the resource is no longer updated";
+const OFFLINE_NO_DOWNLOADS: &str = "offline mode: nothing is downloaded";
+/// What a check that panicked comes to: the panic's own text is not repeated.
+const CHECK_DID_NOT_FINISH: &str = "the check of the downloaded copy did not finish";
+const NOT_MODIFIED_NOTHING_CACHED: &str =
+    r#"the server answered "not modified" but nothing is cached"#;
 
 /// What a resource is for. The first registration of a source fixes it, as it
 /// fixes the label.
@@ -224,7 +242,7 @@ pub struct ResourceStatus {
     /// The manager has a copy to give: the resource is `available`, or
     /// `failed` and keeps the copy it had.
     pub ready: bool,
-    /// A download is under way.
+    /// A download is under way, or the check of what it brought.
     pub updating: bool,
 }
 
@@ -250,8 +268,49 @@ pub fn resource_key(source: &ResourceSource) -> String {
     cache::name_of(&source.key())
 }
 
+/// How far the attempts of a URL entry have come, for whoever waits for them.
+/// It is state to wait on with a predicate (`Receiver::wait_for`), never an
+/// event that can be missed: a waiter that arrives late finds the numbers as
+/// they are.
+struct Progress {
+    /// Attempts begun. One begins when the task takes the validators for its
+    /// request: an attempt that begins after a call is numbered above the
+    /// `started` the call read.
+    started: u64,
+    /// The number of the last attempt whose result is recorded, and that
+    /// result.
+    finished: u64,
+    last: Result<(), String>,
+    /// The attempt somebody asked for: while `wanted > started` the task
+    /// begins one without waiting for its timer or its backoff.
+    wanted: u64,
+    /// An attempt was due when the entry was registered: it had no copy, or a
+    /// stale one.
+    due_at_start: bool,
+    /// `retire` was called.
+    retired: bool,
+    /// The task is over, or there never was one: nothing more will be
+    /// attempted.
+    ended: bool,
+}
+
+/// What an entry knows about the files of its cache, under the lock that is
+/// held across them.
+struct Disk {
+    /// The entry holds a body, or metadata, that the disk does not: a write
+    /// failed. The next write that succeeds writes the body too.
+    behind: bool,
+}
+
+/// `record` is the first lock of an entry to be taken: before `meta`, `state`
+/// and the rest, and before the manager's `entries` in the one place that holds
+/// both, `retire`. Nothing takes `record` while holding `entries`. Every lock
+/// but `record` is held for a moment, never across file IO, the network, a
+/// check or an `.await`, and `record` is held across nothing but file IO.
 struct Entry {
     source: ResourceSource,
+    /// `resource_key(&source)`, worked out once.
+    key: String,
     kind: ResourceKind,
     /// What log lines call the resource instead of its URL (`get_labelled`).
     label: Mutex<Option<String>>,
@@ -261,7 +320,16 @@ struct Entry {
     next_refresh: Mutex<Option<SystemTime>>,
     updating: AtomicBool,
     tx: watch::Sender<u64>,
+    /// Wakes the task of a file; a URL's task is woken through `progress`.
     kick: Notify,
+    /// Decides about a body before it is taken (`get_checked`); the first one
+    /// the entry is given stays.
+    check: OnceLock<Check>,
+    /// The one lock that is held across the files of the cache of this entry:
+    /// whoever reads or writes them, and changes `meta` and `state` to go with
+    /// what they hold, does so under it. A URL entry only.
+    record: Mutex<Disk>,
+    progress: watch::Sender<Progress>,
 }
 
 /// Marks an entry as being downloaded while it lives, so that an attempt that
@@ -281,7 +349,85 @@ impl Drop for Updating<'_> {
     }
 }
 
+/// Tells whoever waits that the task of an entry is over, however it ends: a
+/// return, a panic, the future being dropped. It is the first thing a task
+/// declares, so that it is the last thing to go.
+struct Ends(Arc<Entry>);
+
+impl Drop for Ends {
+    fn drop(&mut self) {
+        self.0.end();
+    }
+}
+
 impl Entry {
+    fn new(
+        spec: &ResourceSpec,
+        interval: Option<i64>,
+        label: Option<&str>,
+        check: Option<Check>,
+    ) -> Entry {
+        let (tx, _rx) = watch::channel(0u64);
+        let entry = Entry {
+            source: spec.source.clone(),
+            key: resource_key(&spec.source),
+            kind: spec.kind,
+            label: Mutex::new(label.map(str::to_string)),
+            state: Mutex::new(ResourceState::Missing),
+            meta: Mutex::new(None),
+            interval: Mutex::new(interval),
+            next_refresh: Mutex::new(None),
+            updating: AtomicBool::new(false),
+            tx,
+            kick: Notify::new(),
+            check: OnceLock::new(),
+            record: Mutex::new(Disk { behind: false }),
+            // Due until `start` has seen the cache: whoever arrives between the
+            // insertion into the map and `start` has to wait.
+            progress: watch::Sender::new(Progress {
+                started: 0,
+                finished: 0,
+                last: Ok(()),
+                wanted: 0,
+                due_at_start: true,
+                retired: false,
+                ended: false,
+            }),
+        };
+        if let Some(check) = check {
+            let _ = entry.check.set(check);
+        }
+        entry
+    }
+
+    fn retired(&self) -> bool {
+        self.progress.borrow().retired
+    }
+
+    fn end(&self) {
+        self.progress.send_modify(|p| p.ended = true);
+    }
+
+    /// Asks for an attempt that begins after this call, whatever the timer
+    /// and the backoff of the task say, and gives its number. `None` when the
+    /// task is over: nobody is left to make it.
+    fn ask(&self) -> Option<u64> {
+        let mut number = None;
+        self.progress.send_if_modified(|p| {
+            if p.ended {
+                return false;
+            }
+            let next = p.started + 1;
+            number = Some(next);
+            if p.wanted >= next {
+                return false;
+            }
+            p.wanted = next;
+            true
+        });
+        number
+    }
+
     /// What log lines call this resource: its label, else its source (a URL
     /// without its user name and its password).
     fn log_name(&self) -> String {
@@ -336,12 +482,16 @@ impl ResourceHandle {
     }
 }
 
-/// One `ResourceManager` per configuration generation: there is no API to
-/// retire individual entries. On reload, build a new manager and drop the
-/// old one — cached files are re-read from disk, and the dropped manager's
-/// background tasks exit: a URL task as soon as it waits for its next
-/// refresh (`gone`), a file task within 60 s (the periodic liveness checks in
-/// `file_task`).
+/// A manager serves one configuration generation, or lives as long as the
+/// process. A generation's: on reload, build a new manager and drop the old
+/// one — cached files are re-read from disk, and the dropped manager's
+/// background tasks exit: a URL task as soon as it waits for its next refresh
+/// (`gone`), a file task within 60 s (the periodic liveness checks in
+/// `file_task`). The process's: an entry nobody needs any more is retired
+/// (`retire`). It is no longer listed and its task ends at once, also
+/// half-way through an attempt, which then writes and publishes nothing; a
+/// handle that is still held reads the content the entry had last, and
+/// registering the source again starts a new entry from the cache.
 pub struct ResourceManager {
     root: PathBuf,
     client: Arc<HttpClient>,
@@ -475,7 +625,7 @@ impl ResourceManager {
     }
 
     pub fn get(&self, spec: &ResourceSpec) -> ResourceHandle {
-        self.register(spec, None)
+        self.register(spec, None, None)
     }
 
     /// `get` for a resource whose URL must not reach the logs — a
@@ -483,10 +633,31 @@ impl ResourceManager {
     /// call it `label` instead, also when another caller shares it. The first
     /// label a resource gets is the one it keeps.
     pub fn get_labelled(&self, spec: &ResourceSpec, label: &str) -> ResourceHandle {
-        self.register(spec, Some(label))
+        self.register(spec, Some(label), None)
     }
 
-    fn register(&self, spec: &ResourceSpec, label: Option<&str>) -> ResourceHandle {
+    /// `get_labelled` for a resource whose body is taken only after `check`
+    /// has seen it. The check sees a body that is new: not the answer to a
+    /// request for an update that says nothing changed, not a body the entry
+    /// holds already, and not what the cache held when the entry started (it
+    /// passed when it was written). A body it refuses leaves the cache, the
+    /// version and the validators as they were; the resource is `failed`, with
+    /// the reason as its `last_error`, and backs off as it does after any
+    /// failed download; the next attempt downloads and checks again. The first
+    /// check an entry is given stays, also when the entry was registered
+    /// without one: that entry takes the first one it is given later. A file
+    /// is not downloaded: it is registered as `get_labelled` registers it, and
+    /// the check is never called.
+    pub fn get_checked(&self, spec: &ResourceSpec, label: &str, check: Check) -> ResourceHandle {
+        self.register(spec, Some(label), Some(check))
+    }
+
+    fn register(
+        &self,
+        spec: &ResourceSpec,
+        label: Option<&str>,
+        check: Option<Check>,
+    ) -> ResourceHandle {
         let key = spec.source.key();
         // An interval of 0 is read as none written: a refresh due again as soon as it is done
         // would make the task fetch as fast as the server answers. Here, where every caller's
@@ -498,7 +669,9 @@ impl ResourceManager {
         // called after the lock is released, and only for an entry this call actually created.
         let (entry, is_new) = {
             let mut entries = self.entries.lock().expect("entries");
-            if let Some(existing) = entries.get(&key) {
+            // An entry that is retired and not yet taken out of the map by
+            // `retire` is not there: the new one takes its place.
+            if let Some(existing) = entries.get(&key).filter(|existing| !existing.retired()) {
                 merge_interval(existing, interval);
                 if let Some(label) = label {
                     existing
@@ -507,21 +680,12 @@ impl ResourceManager {
                         .expect("label")
                         .get_or_insert_with(|| label.to_string());
                 }
+                if let Some(check) = check {
+                    let _ = existing.check.set(check);
+                }
                 (existing.clone(), false)
             } else {
-                let (tx, _rx) = watch::channel(0u64);
-                let entry = Arc::new(Entry {
-                    source: spec.source.clone(),
-                    kind: spec.kind,
-                    label: Mutex::new(label.map(str::to_string)),
-                    state: Mutex::new(ResourceState::Missing),
-                    meta: Mutex::new(None),
-                    interval: Mutex::new(interval),
-                    next_refresh: Mutex::new(None),
-                    updating: AtomicBool::new(false),
-                    tx,
-                    kick: Notify::new(),
-                });
+                let entry = Arc::new(Entry::new(spec, interval, label, check));
                 entries.insert(key, entry.clone());
                 (entry, true)
             }
@@ -550,14 +714,185 @@ impl ResourceManager {
         self.statuses()
     }
 
+    /// Asks for an update of `source` and does not wait for it. Asking twice
+    /// before the task has begun one makes one.
     pub fn force_update(&self, source: &ResourceSource) -> bool {
-        match self.entries.lock().expect("entries").get(&source.key()) {
-            Some(e) => {
-                e.kick.notify_one();
-                true
+        let Some(entry) = self.entry_of(&source.key()) else {
+            return false;
+        };
+        match entry.source {
+            ResourceSource::Url(_) => {
+                entry.ask();
             }
-            None => false,
+            ResourceSource::File(_) => entry.kick.notify_one(),
         }
+        true
+    }
+
+    /// An update of the resource `key` names (`resource_key`), awaited: the
+    /// first attempt that begins after this call, whatever its timer and its
+    /// backoff say, and not one that is under way when it is made. `Ok` when
+    /// the attempt brought a new version, a body the entry holds already, or a
+    /// "not modified"; otherwise the reason, as `last_error` has it. `None`
+    /// when there is no such entry. A file is read again and the answer is
+    /// `Ok` at once; a manager that is offline downloads nothing and says so.
+    /// An entry whose task is over, or that is retired while this waits,
+    /// is an error too. The wait has no limit of its own: an attempt ends
+    /// within `fetch_timeout` plus the time of its check, and a caller that
+    /// wants less puts its own limit around the call.
+    pub async fn update_now(&self, key: &str) -> Option<Result<(), String>> {
+        let entry = self.entry_by_key(key)?;
+        if matches!(entry.source, ResourceSource::File(_)) {
+            entry.kick.notify_one();
+            return Some(Ok(()));
+        }
+        if self.opts.offline {
+            return Some(Err(OFFLINE_NO_DOWNLOADS.to_string()));
+        }
+        let mut progress = entry.progress.subscribe();
+        let Some(number) = entry.ask() else {
+            return Some(Err(NO_LONGER_UPDATED.to_string()));
+        };
+        // `finished` and `last` change together: when the attempt is the one
+        // that finished last, so is its result
+        let finished = progress
+            .wait_for(|p| p.finished >= number || p.ended)
+            .await
+            .map(|p| (p.finished >= number).then(|| p.last.clone()));
+        match finished {
+            Ok(Some(last)) => Some(last),
+            Ok(None) | Err(_) => Some(Err(NO_LONGER_UPDATED.to_string())),
+        }
+    }
+
+    /// Waits until the entry `key` names has no attempt that is due and not
+    /// done: one has ended since it was registered, or the copy it started
+    /// from was not due. Returns at once for no such entry, a file, an entry
+    /// that is retired or has no task (offline, or no runtime to run it on).
+    pub async fn attempted(&self, key: &str) {
+        let Some(entry) = self.entry_by_key(key) else {
+            return;
+        };
+        if matches!(entry.source, ResourceSource::File(_)) {
+            return;
+        }
+        let _ = entry
+            .progress
+            .subscribe()
+            .wait_for(|p| p.ended || p.finished >= 1 || !p.due_at_start)
+            .await;
+    }
+
+    /// Takes `data` as if it had just been downloaded from `source`: it goes
+    /// into the cache with the time now and no validators, so that the next
+    /// refresh fetches the whole body. If the source is registered, it is also
+    /// the content of its entry: `available`, published, and a new version
+    /// unless the entry holds that very body already. No check is made (the
+    /// caller has made it), and a download that is under way is none of this
+    /// call's business: it finds the body in hand when it brings the same,
+    /// and a version more when it brings another. A file cannot be adopted.
+    /// When the cache cannot be written the error is returned and the entry
+    /// stays as it was. It is synchronous, so that a check can call it.
+    pub fn adopt(&self, source: &ResourceSource, data: Bytes) -> io::Result<()> {
+        let ResourceSource::Url(url) = source else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only a resource that is downloaded can be adopted",
+            ));
+        };
+        let cache = cache::CacheDir::for_url(&self.root, url.as_str());
+        let now = SystemTime::now();
+        let mut meta = Meta {
+            url: url.to_string(),
+            ..Meta::default()
+        };
+        meta.stamp(now);
+        let entry = self
+            .entries
+            .lock()
+            .expect("entries")
+            .get(&source.key())
+            .filter(|entry| !entry.retired())
+            .cloned();
+        // Not registered: the cache is all there is to write. A registration
+        // that races this is harmless: the entry starts from whichever copy it
+        // reads, and its next refresh brings the same body and finds nothing
+        // new, or one new version.
+        let Some(entry) = entry else {
+            return cache.store(&data, &meta);
+        };
+        let mut disk = entry.record.lock().expect("record");
+        if entry.retired() {
+            // retired since the lookup
+            return cache.store(&data, &meta);
+        }
+        cache.store(&data, &meta)?;
+        disk.behind = false;
+        let held = entry.state.lock().expect("state").data();
+        let (version, new) = match held {
+            // the same rule as for a download that brings the body in hand
+            Some((held, version)) if held.as_ref() == &data => (version, false),
+            held => (held.map_or(0, |(_, version)| version) + 1, true),
+        };
+        *entry.meta.lock().expect("meta") = Some(meta);
+        entry.set_state(ResourceState::Available {
+            data: Arc::new(data),
+            version,
+            fetched_at: now,
+            stale: false,
+        });
+        if new {
+            entry.publish(version);
+        }
+        Ok(())
+    }
+
+    /// Takes the entry of `source` out of service: it is no longer listed, its
+    /// task ends at once (also one that waits for its next refresh), an attempt
+    /// that is under way writes and publishes nothing, a handle that is still
+    /// held reads the content the entry had last, and registering the source
+    /// again starts a new entry from the cache. Whether this call retired it:
+    /// `false` when there is no such entry, or somebody else retired it first.
+    pub fn retire(&self, source: &ResourceSource) -> bool {
+        let key = source.key();
+        let Some(entry) = self.entries.lock().expect("entries").get(&key).cloned() else {
+            return false;
+        };
+        // Under the lock the task records under, so that an attempt either is
+        // recorded in full before this, or finds the entry retired and writes
+        // nothing. The entry leaves the map in the same hold: a registration
+        // that gets in between has put a new entry there already.
+        let _disk = entry.record.lock().expect("record");
+        let retired = entry
+            .progress
+            .send_if_modified(|p| !std::mem::replace(&mut p.retired, true));
+        let mut entries = self.entries.lock().expect("entries");
+        if entries
+            .get(&key)
+            .is_some_and(|held| Arc::ptr_eq(held, &entry))
+        {
+            entries.remove(&key);
+        }
+        retired
+    }
+
+    /// The entry of the source whose `ResourceSource::key` is `source_key`.
+    fn entry_of(&self, source_key: &str) -> Option<Arc<Entry>> {
+        self.entries
+            .lock()
+            .expect("entries")
+            .get(source_key)
+            .cloned()
+    }
+
+    /// The entry whose `resource_key` is `key`.
+    fn entry_by_key(&self, key: &str) -> Option<Arc<Entry>> {
+        self.entries
+            .lock()
+            .expect("entries")
+            .values()
+            .find(|entry| entry.key == key)
+            .cloned()
     }
 
     pub fn statuses(&self) -> Vec<ResourceStatus> {
@@ -591,7 +926,7 @@ impl ResourceManager {
                     last_error,
                     kind: e.kind,
                     label,
-                    key: resource_key(&e.source),
+                    key: e.key.clone(),
                     local: matches!(e.source, ResourceSource::File(_)),
                     ready: state.data().is_some(),
                     updating: e.updating.load(Ordering::Acquire),
@@ -606,12 +941,17 @@ impl ResourceManager {
         self.self_weak.lock().expect("weak").clone()
     }
 
-    fn spawn(&self, fut: impl Future<Output = ()> + Send + 'static) {
+    /// Whether there was a runtime to run `fut` on.
+    fn spawn(&self, fut: impl Future<Output = ()> + Send + 'static) -> bool {
         match tokio::runtime::Handle::try_current() {
             Ok(h) => {
                 h.spawn(fut);
+                true
             }
-            Err(_) => tracing::debug!("no tokio runtime: resource refresh disabled"),
+            Err(_) => {
+                tracing::debug!("no tokio runtime: resource refresh disabled");
+                false
+            }
         }
     }
 
@@ -619,29 +959,57 @@ impl ResourceManager {
         match entry.source.clone() {
             ResourceSource::Url(url) => {
                 let cache = cache::CacheDir::for_url(&self.root, url.as_str());
-                if let Some((data, meta)) = cache.load() {
-                    let fetched_at = meta.fetched_time();
-                    let stale = is_stale(fetched_at, entry.effective_interval());
-                    *entry.meta.lock().expect("meta") = Some(meta);
-                    entry.set_state(ResourceState::Available {
-                        data: Arc::new(data),
-                        version: 1,
-                        fetched_at,
-                        stale,
-                    });
-                    entry.publish(1);
-                }
-                if self.opts.offline {
-                    if matches!(*entry.state.lock().expect("state"), ResourceState::Missing) {
+                {
+                    let _disk = entry.record.lock().expect("record");
+                    // `adopt` may have been here first, between the insertion
+                    // into the map and now: what it put in is the copy
+                    let missing =
+                        matches!(*entry.state.lock().expect("state"), ResourceState::Missing);
+                    if missing && let Some((data, meta)) = cache.load() {
+                        let fetched_at = meta.fetched_time();
+                        let stale = is_stale(fetched_at, entry.effective_interval());
+                        *entry.meta.lock().expect("meta") = Some(meta);
+                        entry.set_state(ResourceState::Available {
+                            data: Arc::new(data),
+                            version: 1,
+                            fetched_at,
+                            stale,
+                        });
+                        entry.publish(1);
+                    }
+                    if self.opts.offline
+                        && matches!(*entry.state.lock().expect("state"), ResourceState::Missing)
+                    {
                         entry.set_state(ResourceState::Failed {
                             last_error: "offline mode: no cached copy".to_string(),
                             since: SystemTime::now(),
                             cached: None,
                         });
                     }
+                    // An attempt is due when there is no copy, or it is stale
+                    let due = !matches!(
+                        *entry.state.lock().expect("state"),
+                        ResourceState::Available { stale: false, .. }
+                    );
+                    if !due {
+                        entry.progress.send_modify(|p| p.due_at_start = false);
+                    }
+                }
+                if self.opts.offline {
+                    entry.end();
                     return;
                 }
-                self.spawn(url_task(self.weak(), entry, self.gone.subscribe()));
+                // Subscribed before the task exists, so it starts from the
+                // numbers as they are now
+                let progress = entry.progress.subscribe();
+                if !self.spawn(url_task(
+                    self.weak(),
+                    entry.clone(),
+                    self.gone.subscribe(),
+                    progress,
+                )) {
+                    entry.end();
+                }
             }
             ResourceSource::File(path) => {
                 read_file(&entry, &path, 0);
@@ -657,7 +1025,8 @@ impl ResourceManager {
                         None
                     }
                 };
-                self.spawn(file_task(self.weak(), entry, rx, watcher));
+                let progress = entry.progress.subscribe();
+                self.spawn(file_task(self.weak(), entry, rx, watcher, progress));
             }
         }
     }
@@ -703,35 +1072,275 @@ fn holds(entry: &Entry, body: &Bytes) -> bool {
     held.is_some_and(|(held, _)| held.as_ref() == body)
 }
 
-/// A check that found nothing new: what the entry holds is as current as now.
-/// The disk is written first, so that whoever sees the new time in memory
-/// finds it there too. `revise` changes the rest of the metadata, if the
-/// check has anything to say about it.
-fn checked(entry: &Entry, cache: &cache::CacheDir, revise: impl FnOnce(&mut Meta)) {
-    let now = SystemTime::now();
-    if let Some(m) = entry.meta.lock().expect("meta").as_mut() {
-        m.stamp(now);
-        revise(m);
-        let _ = cache.store_meta(m);
-    }
-    let mut st = entry.state.lock().expect("state");
-    if let ResourceState::Available {
-        fetched_at, stale, ..
-    } = &mut *st
-    {
-        *fetched_at = now;
-        *stale = false;
-    } else if let Some((data, version)) = st.data() {
-        *st = ResourceState::Available {
+/// What an attempt came to, before it is recorded.
+enum Outcome {
+    /// Nothing new: the server says nothing changed, or it sent the body the
+    /// entry holds. A 200 comes with validators, which are the ones to send
+    /// next time.
+    Same {
+        validators: Option<(Option<String>, Option<String>)>,
+    },
+    /// A body the entry does not hold, which its check, if it has one, took.
+    New {
+        data: Bytes,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    },
+    Failed(Failure),
+}
+
+enum Failure {
+    /// The download failed.
+    Fetch(String),
+    /// The check refused the body.
+    Check(String),
+}
+
+/// What the log says about an attempt that failed in some way, one line for
+/// what failed.
+enum Warning {
+    Fetch(String),
+    NotAdopted(String),
+    Cache(String),
+}
+
+/// What is left to do once an attempt is recorded and its lock released.
+struct Recorded {
+    result: Result<(), String>,
+    warning: Option<Warning>,
+    /// The version a new body was published as.
+    updated: Option<u64>,
+}
+
+/// One request for the resource and what comes of the answer: for a body that
+/// is new, the verdict of the check the entry has. Nothing is written here, and
+/// no lock is held while it waits.
+async fn attempt(
+    entry: &Entry,
+    client: &HttpClient,
+    url: &Url,
+    validators: Option<&Meta>,
+    opts: &ResourceOptions,
+) -> Outcome {
+    let fetched = fetch::fetch(client, url, validators, opts.fetch_timeout, opts.max_size).await;
+    match fetched {
+        Err(e) => Outcome::Failed(Failure::Fetch(e)),
+        // a server that answers "not modified" to a request that carried no validator: there
+        // is nothing to refresh, which is a failed fetch like any other
+        Ok(fetch::Fetched::NotModified) if entry.state.lock().expect("state").data().is_none() => {
+            Outcome::Failed(Failure::Fetch(NOT_MODIFIED_NOTHING_CACHED.to_string()))
+        }
+        Ok(fetch::Fetched::NotModified) => Outcome::Same { validators: None },
+        // A body that is what the entry holds is no new version: a server that sends no
+        // validators, or ones that do not hold, answers every refresh with the whole body, and
+        // nothing downstream has anything to reload. It is a check that found nothing new, and
+        // the validators it came with are the ones to send next time.
+        Ok(fetch::Fetched::New {
             data,
-            version,
-            fetched_at: now,
-            stale: false,
-        };
+            etag,
+            last_modified,
+        }) if holds(entry, &data) => Outcome::Same {
+            validators: Some((etag, last_modified)),
+        },
+        Ok(fetch::Fetched::New {
+            data,
+            etag,
+            last_modified,
+        }) => {
+            let new = Outcome::New {
+                data: data.clone(),
+                etag,
+                last_modified,
+            };
+            let Some(check) = entry.check.get().cloned() else {
+                return new;
+            };
+            // On a thread of the blocking pool, where it may take as long as loading a
+            // profile; no lock is held while it runs or while it is awaited.
+            match tokio::task::spawn_blocking(move || check(&data[..])).await {
+                Ok(Ok(())) => new,
+                Ok(Err(reason)) => Outcome::Failed(Failure::Check(reason)),
+                // it panicked: what it said is not repeated
+                Err(_) => Outcome::Failed(Failure::Check(CHECK_DID_NOT_FINISH.to_string())),
+            }
+        }
     }
 }
 
-async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>, mut gone: watch::Receiver<()>) {
+/// A failed attempt: the entry is `failed` and keeps the copy it had.
+fn failed_attempt(entry: &Entry, last_error: String, warning: Warning) -> Recorded {
+    let cached = entry.state.lock().expect("state").data();
+    entry.updating.store(false, Ordering::Release);
+    entry.set_state(ResourceState::Failed {
+        last_error: last_error.clone(),
+        since: SystemTime::now(),
+        cached,
+    });
+    Recorded {
+        result: Err(last_error),
+        warning: Some(warning),
+        updated: None,
+    }
+}
+
+/// An attempt that cannot go into the cache, for an entry whose readers go by
+/// the disk.
+fn not_written(entry: &Entry, error: &io::Error) -> Recorded {
+    failed_attempt(
+        entry,
+        format!("cannot write the cache: {error}"),
+        Warning::Cache(error.to_string()),
+    )
+}
+
+/// What a write to the cache comes to. A failed one is `Err` when the readers
+/// of the entry go by the disk: it must not be given what the disk does not
+/// hold. For the others the entry goes on with what it has, the disk is marked
+/// as behind it, and the next write that succeeds writes the body too.
+fn wrote(
+    disk: &mut Disk,
+    written: io::Result<()>,
+    by_disk: bool,
+) -> Result<Option<Warning>, io::Error> {
+    match written {
+        Ok(()) => {
+            disk.behind = false;
+            Ok(None)
+        }
+        Err(e) if by_disk => Err(e),
+        Err(e) => {
+            disk.behind = true;
+            Ok(Some(Warning::Cache(e.to_string())))
+        }
+    }
+}
+
+/// Records what an attempt came to, in the cache and then in the entry, and
+/// publishes a new version, all under the lock of the entry's cache files, so
+/// that `adopt`, `retire` and the task never write over one another. `None`
+/// when the entry is retired: nothing is written or changed then.
+fn record_attempt(
+    entry: &Entry,
+    cache: &cache::CacheDir,
+    url: &Url,
+    outcome: Outcome,
+) -> Option<Recorded> {
+    let mut disk = entry.record.lock().expect("record");
+    if entry.retired() {
+        return None;
+    }
+    let now = SystemTime::now();
+    // An entry with a check has readers that go by the disk
+    let by_disk = entry.check.get().is_some();
+    // `adopt` may have put this very body in while the answer, or its check,
+    // was under way
+    let outcome = match outcome {
+        Outcome::New {
+            data,
+            etag,
+            last_modified,
+        } if holds(entry, &data) => Outcome::Same {
+            validators: Some((etag, last_modified)),
+        },
+        outcome => outcome,
+    };
+    Some(match outcome {
+        Outcome::Failed(Failure::Fetch(e)) => failed_attempt(entry, e.clone(), Warning::Fetch(e)),
+        Outcome::Failed(Failure::Check(reason)) => {
+            failed_attempt(entry, reason.clone(), Warning::NotAdopted(reason))
+        }
+        // What the entry holds is as current as now. The disk is written first, so that
+        // whoever sees the new time in memory finds it there too.
+        Outcome::Same { validators } => {
+            let Some((data, version)) = entry.state.lock().expect("state").data() else {
+                let e = NOT_MODIFIED_NOTHING_CACHED.to_string();
+                return Some(failed_attempt(entry, e.clone(), Warning::Fetch(e)));
+            };
+            let held = entry.meta.lock().expect("meta").clone();
+            let whole = disk.behind || held.is_none();
+            let mut meta = held.unwrap_or_else(|| Meta {
+                url: url.to_string(),
+                ..Meta::default()
+            });
+            meta.stamp(now);
+            if let Some((etag, last_modified)) = validators {
+                meta.etag = etag;
+                meta.last_modified = last_modified;
+            }
+            let written = if whole {
+                cache.store(&data, &meta)
+            } else {
+                cache.store_meta(&meta)
+            };
+            let warning = match wrote(&mut disk, written, by_disk) {
+                Ok(warning) => warning,
+                Err(e) => return Some(not_written(entry, &e)),
+            };
+            entry.updating.store(false, Ordering::Release);
+            *entry.meta.lock().expect("meta") = Some(meta);
+            entry.set_state(ResourceState::Available {
+                data,
+                version,
+                fetched_at: now,
+                stale: false,
+            });
+            Recorded {
+                result: Ok(()),
+                warning,
+                updated: None,
+            }
+        }
+        Outcome::New {
+            data,
+            etag,
+            last_modified,
+        } => {
+            let version = entry.version() + 1;
+            let mut meta = Meta {
+                url: url.to_string(),
+                etag,
+                last_modified,
+                ..Meta::default()
+            };
+            meta.stamp(now);
+            let warning = match wrote(&mut disk, cache.store(&data, &meta), by_disk) {
+                Ok(warning) => warning,
+                Err(e) => return Some(not_written(entry, &e)),
+            };
+            // Down before anyone is told: whoever the new version wakes finds a download
+            // that is over.
+            entry.updating.store(false, Ordering::Release);
+            *entry.meta.lock().expect("meta") = Some(meta);
+            entry.set_state(ResourceState::Available {
+                data: Arc::new(data),
+                version,
+                fetched_at: now,
+                stale: false,
+            });
+            entry.publish(version);
+            Recorded {
+                result: Ok(()),
+                warning,
+                updated: Some(version),
+            }
+        }
+    })
+}
+
+/// Ends when the entry is retired.
+async fn until_retired(progress: &mut watch::Receiver<Progress>) {
+    let _ = progress.wait_for(|p| p.retired).await;
+}
+
+async fn url_task(
+    weak: Weak<ResourceManager>,
+    entry: Arc<Entry>,
+    mut gone: watch::Receiver<()>,
+    mut progress: watch::Receiver<Progress>,
+) {
+    // Declared before everything else, so that it is dropped last: whoever waits
+    // for this task is told it is over when nothing of it is left.
+    let _ends = Ends(entry.clone());
     let ResourceSource::Url(url) = entry.source.clone() else {
         return;
     };
@@ -749,102 +1358,75 @@ async fn url_task(weak: Weak<ResourceManager>, entry: Arc<Entry>, mut gone: watc
         // turns the interval positive), and waking once a minute is how the task comes to see
         // it. The manager going is `gone`'s business.
         let wait = due.unwrap_or(Duration::from_secs(60));
-        let kicked = tokio::select! {
-            _ = tokio::time::sleep(wait) => false,
-            _ = entry.kick.notified() => true,
+        let asked = tokio::select! {
+            biased;
+            // Retired, or an attempt somebody asked for: a state that is looked at, so that one
+            // asked for before the task got here is found.
+            changed = progress.wait_for(|p| p.retired || p.wanted > p.started) => {
+                // owned before anything else is done: it holds the channel's read lock
+                match changed.map(|p| p.retired) {
+                    Ok(false) => true,
+                    Ok(true) | Err(_) => return,
+                }
+            }
             // nothing is ever sent: this is the manager going
             _ = gone.changed() => return,
+            _ = tokio::time::sleep(wait) => false,
         };
         if weak.upgrade().is_none() {
             return;
         }
-        if due.is_none() && !kicked {
+        if due.is_none() && !asked {
             // nothing is due: look at the interval again
             continue;
         }
-        let meta = entry.meta.lock().expect("meta").clone();
+        let number = {
+            let mut number = 0;
+            entry.progress.send_modify(|p| {
+                p.started += 1;
+                number = p.started;
+            });
+            number
+        };
+        let validators = entry.meta.lock().expect("meta").clone();
         // Held until the result is recorded below, or until the attempt is
         // dropped
         let _updating = Updating::begin(&entry.updating);
-        let fetched = fetch::fetch(
-            &client,
-            &url,
-            meta.as_ref(),
-            opts.fetch_timeout,
-            opts.max_size,
-        )
-        .await
-        .and_then(|fetched| match fetched {
-            // a server that answers "not modified" to a request that carried no validator: there
-            // is nothing to refresh, which is a failed fetch like any other
-            fetch::Fetched::NotModified if entry.state.lock().expect("state").data().is_none() => {
-                Err(r#"the server answered "not modified" but nothing is cached"#.to_string())
+        // A retired entry's task ends wherever it is: in the request, in the check
+        let outcome = tokio::select! {
+            biased;
+            _ = until_retired(&mut progress) => return,
+            outcome = attempt(&entry, &client, &url, validators.as_ref(), &opts) => outcome,
+        };
+        let Some(recorded) = record_attempt(&entry, &cache, &url, outcome) else {
+            return;
+        };
+        match &recorded.warning {
+            Some(Warning::Fetch(error)) => {
+                tracing::warn!(resource = %entry.log_name(), error = %error, "resource fetch failed");
             }
-            fetched => Ok(fetched),
-        });
-        match fetched {
-            // A body that is what the entry holds is no new version: a server
-            // that sends no validators, or ones that do not hold, answers
-            // every refresh with the whole body, and nothing downstream has
-            // anything to reload. It is a check that found nothing new, and
-            // the validators it came with are the ones to send next time.
-            Ok(fetch::Fetched::New {
-                data,
-                etag,
-                last_modified,
-            }) if holds(&entry, &data) => {
-                checked(&entry, &cache, |meta| {
-                    meta.etag = etag;
-                    meta.last_modified = last_modified;
-                });
-                backoff = None;
+            Some(Warning::NotAdopted(error)) => {
+                tracing::warn!(resource = %entry.log_name(), error = %error, "downloaded resource not adopted");
             }
-            Ok(fetch::Fetched::New {
-                data,
-                etag,
-                last_modified,
-            }) => {
-                let version = entry.version() + 1;
-                let now = SystemTime::now();
-                let mut new_meta = Meta {
-                    url: url.to_string(),
-                    etag,
-                    last_modified,
-                    ..Meta::default()
-                };
-                new_meta.stamp(now);
-                if let Err(e) = cache.store(&data, &new_meta) {
-                    tracing::warn!(resource = %entry.log_name(), error = %e, "cannot write resource cache");
-                }
-                *entry.meta.lock().expect("meta") = Some(new_meta);
-                entry.set_state(ResourceState::Available {
-                    data: Arc::new(data),
-                    version,
-                    fetched_at: now,
-                    stale: false,
-                });
-                entry.publish(version);
-                backoff = None;
-                tracing::info!(resource = %entry.log_name(), version, "resource updated");
+            Some(Warning::Cache(error)) => {
+                tracing::warn!(resource = %entry.log_name(), error = %error, "cannot write resource cache");
             }
-            Ok(fetch::Fetched::NotModified) => {
-                checked(&entry, &cache, |_| {});
-                backoff = None;
-            }
-            Err(e) => {
-                let cached = entry.state.lock().expect("state").data();
-                tracing::warn!(resource = %entry.log_name(), error = %e, "resource fetch failed");
-                entry.set_state(ResourceState::Failed {
-                    last_error: e,
-                    since: SystemTime::now(),
-                    cached,
-                });
-                backoff = Some(match backoff {
-                    None => opts.min_backoff,
-                    Some(b) => (b * 2).min(opts.max_backoff),
-                });
-            }
+            None => {}
         }
+        if let Some(version) = recorded.updated {
+            tracing::info!(resource = %entry.log_name(), version, "resource updated");
+        }
+        backoff = match &recorded.result {
+            Ok(()) => None,
+            Err(_) => Some(match backoff {
+                None => opts.min_backoff,
+                Some(b) => (b * 2).min(opts.max_backoff),
+            }),
+        };
+        entry.progress.send_modify(|p| {
+            p.finished = number;
+            p.last = recorded.result;
+        });
     }
 }
 
@@ -890,11 +1472,25 @@ fn read_file(entry: &Entry, path: &Path, prev_version: u64) {
     }
 }
 
+/// Follows the file of an entry until its manager is gone or the entry is
+/// retired. The watcher is kept for as long as that lasts.
 async fn file_task(
     weak: Weak<ResourceManager>,
     entry: Arc<Entry>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     _watcher: Option<local::AnyWatcher>,
+    mut progress: watch::Receiver<Progress>,
+) {
+    tokio::select! {
+        _ = until_retired(&mut progress) => {}
+        _ = follow_file(weak, entry, rx) => {}
+    }
+}
+
+async fn follow_file(
+    weak: Weak<ResourceManager>,
+    entry: Arc<Entry>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
 ) {
     let ResourceSource::File(path) = entry.source.clone() else {
         return;
@@ -2201,5 +2797,1711 @@ mod tests {
         assert!(logged.len() >= cases.len(), "{logged:#?}");
         let leaked: Vec<&String> = logged.iter().filter(|line| secret(line)).collect();
         assert!(leaked.is_empty(), "{leaked:#?}");
+    }
+
+    // checks, awaited updates, adopt and retire
+
+    use std::sync::Condvar;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A check that takes a body unless it starts with `bad`, and remembers each body it was
+    /// shown.
+    #[derive(Default)]
+    struct Picky {
+        seen: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl Picky {
+        fn calls(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+
+        fn seen(&self) -> Vec<Vec<u8>> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    fn picky_check(picky: &Arc<Picky>) -> Check {
+        let picky = picky.clone();
+        Arc::new(move |body: &[u8]| {
+            picky.seen.lock().unwrap().push(body.to_vec());
+            if body.starts_with(b"bad") {
+                Err("not a profile".to_string())
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    /// What a thread of the blocking pool can wait on. It gives up after ten seconds, so that a
+    /// test that has failed does not keep its runtime from shutting down.
+    #[derive(Default)]
+    struct Latch {
+        open: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl Latch {
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.changed.notify_all();
+        }
+
+        fn is_open(&self) -> bool {
+            *self.open.lock().unwrap()
+        }
+
+        fn wait(&self) {
+            let open = self.open.lock().unwrap();
+            let _ = self
+                .changed
+                .wait_timeout_while(open, Duration::from_secs(10), |open| !*open)
+                .unwrap();
+        }
+    }
+
+    fn profile_spec(url: &Url) -> ResourceSpec {
+        url_spec_of(ResourceKind::Profile, url.clone(), None)
+    }
+
+    fn source_of(url: &Url) -> ResourceSource {
+        ResourceSource::Url(url.clone())
+    }
+
+    fn cache_of(root: &Path, url: &Url) -> cache::CacheDir {
+        cache::CacheDir::for_url(root, url.as_str())
+    }
+
+    /// The two files of a cache, `None` for one that is not there. Both are text.
+    fn cache_files(root: &Path, url: &Url) -> (Option<String>, Option<String>) {
+        let dir = cache_of(root, url);
+        let text = |name: &str| std::fs::read_to_string(dir.path().join(name)).ok();
+        (text("data"), text("meta.json"))
+    }
+
+    /// A directory where the cache wants to write `<name>.tmp`: writing that fails on every
+    /// platform, and the files that are there stay as they are. The directory of the cache has
+    /// to exist.
+    fn block_writes(root: &Path, url: &Url, name: &str) -> PathBuf {
+        let blocked = cache_of(root, url).path().join(format!("{name}.tmp"));
+        std::fs::create_dir(&blocked).unwrap();
+        blocked
+    }
+
+    fn two_days_ago() -> SystemTime {
+        SystemTime::now() - Duration::from_secs(2 * 86_400)
+    }
+
+    /// Waits until the task of the entry has recorded `attempts` attempts.
+    async fn wait_finished(h: &ResourceHandle, attempts: u64) {
+        wait_until("an attempt to be recorded", || {
+            h.entry.progress.borrow().finished >= attempts
+        })
+        .await;
+    }
+
+    /// Waits until the task of the entry is over.
+    async fn wait_ended(h: &ResourceHandle) {
+        wait_until("the task to end", || h.entry.progress.borrow().ended).await;
+    }
+
+    /// Waits, for at most ten seconds, until a new version is published to the
+    /// receiver.
+    async fn told(rx: &mut watch::Receiver<u64>) {
+        tokio::time::timeout(Duration::from_secs(10), rx.changed())
+            .await
+            .expect("nobody was told")
+            .expect("the entry is gone");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_passes_its_check_is_adopted() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/p", "profile");
+        let url = server.url("/p");
+        let picky = Arc::new(Picky::default());
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get_checked(&profile_spec(&url), "the profile", picky_check(&picky));
+        let mut rx = h.subscribe();
+        let s = wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        assert_eq!(&s.data().unwrap().0[..], b"profile");
+        told(&mut rx).await;
+        assert_eq!(*rx.borrow_and_update(), 1);
+        let copy = cached_copy(root.path(), &url).expect("a cache");
+        assert_eq!(&copy.data[..], b"profile");
+        assert_eq!(picky.seen(), vec![b"profile".to_vec()]);
+    }
+
+    /// A body the check refuses is not a download that went well: the resource
+    /// fails, nothing is cached or published, and the log says what failed.
+    #[tokio::test]
+    async fn a_first_download_that_fails_its_check_leaves_no_cache() {
+        let lines = Lines::default();
+        let _capturing = lines.capture();
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/p", "bad: a login page");
+        let url = server.url("/p");
+        let source = source_of(&url);
+        let picky = Arc::new(Picky::default());
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get_checked(&profile_spec(&url), "the profile", picky_check(&picky));
+        let rx = h.subscribe();
+        wait_for(&h, "failed", |s| {
+            matches!(s, ResourceState::Failed { cached: None, .. })
+        })
+        .await;
+        let status = status_of(&mgr, &source);
+        assert_eq!(
+            (status.state, status.version, status.ready),
+            ("failed", 0, false)
+        );
+        assert_eq!(status.last_error.as_deref(), Some("not a profile"));
+        assert!(
+            !cache_of(root.path(), &url).path().exists(),
+            "a cache was made"
+        );
+        assert!(!rx.has_changed().unwrap(), "somebody was told");
+        let said = lines.said("downloaded resource not adopted");
+        assert!(
+            !said.is_empty() && said.iter().all(|line| line.contains("not a profile")),
+            "{said:?}"
+        );
+        assert_eq!(lines.said("resource fetch failed"), Vec::<String>::new());
+
+        // it backs off and asks again, and the check sees the body again
+        wait_until("the check to be asked again", || picky.calls() >= 2).await;
+        server.set("/p", "profile");
+        let s = wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        assert_eq!(&s.data().unwrap().0[..], b"profile");
+        assert_eq!(
+            &cached_copy(root.path(), &url).expect("a cache").data[..],
+            b"profile"
+        );
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(status_of(&mgr, &source).last_error, None);
+    }
+
+    /// What the entry had stays as it was, down to the bytes of the two files.
+    #[tokio::test]
+    async fn a_new_body_that_fails_its_check_leaves_the_cache_as_it_was() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/p", "bad: a login page");
+        let url = server.url("/p");
+        let source = source_of(&url);
+        seed_cache(root.path(), &url, b"held", two_days_ago());
+        let before = cache_files(root.path(), &url);
+        let picky = Arc::new(Picky::default());
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get_checked(&profile_spec(&url), "the profile", picky_check(&picky));
+        let rx = h.subscribe();
+        let ready = status_of(&mgr, &source).ready;
+        assert!(ready);
+        wait_for(&h, "failed with the copy", |s| {
+            matches!(
+                s,
+                ResourceState::Failed {
+                    cached: Some(_),
+                    ..
+                }
+            )
+        })
+        .await;
+        let status = status_of(&mgr, &source);
+        assert_eq!(
+            (status.state, status.version, status.ready),
+            ("failed", 1, ready)
+        );
+        assert_eq!(status.last_error.as_deref(), Some("not a profile"));
+        assert_eq!(cache_files(root.path(), &url), before);
+        assert_eq!(&h.current().data().unwrap().0[..], b"held");
+        assert!(!rx.has_changed().unwrap(), "somebody was told");
+
+        wait_until("the check to be asked again", || picky.calls() >= 2).await;
+        server.set("/p", "profile");
+        let s = wait_for(&h, "v2", |s| available_version(s) == Some(2)).await;
+        assert_eq!(&s.data().unwrap().0[..], b"profile");
+        assert_eq!(
+            &cached_copy(root.path(), &url).expect("a cache").data[..],
+            b"profile"
+        );
+        assert!(rx.has_changed().unwrap());
+    }
+
+    /// The request that follows a refusal is a request for the next version of
+    /// what the entry holds: a "not modified" would leave it failed with
+    /// nothing more to try.
+    #[tokio::test]
+    async fn the_request_after_a_failed_check_carries_the_validators_of_the_body_still_held() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/p", "held");
+        let url = server.url("/p");
+        let picky = Arc::new(Picky::default());
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get_checked(&profile_spec(&url), "the profile", picky_check(&picky));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        let etag = cache_of(root.path(), &url)
+            .load()
+            .unwrap()
+            .1
+            .etag
+            .expect("an etag");
+        server.set("/p", "bad: new");
+        assert!(mgr.force_update(&source_of(&url)));
+        wait_until("two refusals", || picky.calls() >= 3).await;
+        let requests = server.requests();
+        assert!(requests[0].header("if-none-match").is_none());
+        for request in &requests[1..] {
+            assert_eq!(request.header("if-none-match"), Some(etag.as_str()));
+        }
+        assert_eq!(h.version(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_check_is_not_asked_about_a_not_modified() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/p", "profile");
+        let url = server.url("/p");
+        let source = source_of(&url);
+        let picky = Arc::new(Picky::default());
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get_checked(&profile_spec(&url), "the profile", picky_check(&picky));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        let first = status_of(&mgr, &source).fetched_at.expect("a time");
+        assert_eq!(picky.calls(), 1);
+
+        assert!(mgr.force_update(&source));
+        wait_until("the check to be recorded", || {
+            status_of(&mgr, &source).fetched_at > Some(first)
+        })
+        .await;
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].header("if-none-match").is_some());
+        assert_eq!(picky.calls(), 1);
+        assert_eq!(h.version(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_check_is_not_asked_about_a_body_the_entry_holds() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/p", "profile");
+        server.set_validators("/p", false);
+        let url = server.url("/p");
+        let source = source_of(&url);
+        let picky = Arc::new(Picky::default());
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get_checked(&profile_spec(&url), "the profile", picky_check(&picky));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        let first = status_of(&mgr, &source).fetched_at.expect("a time");
+        assert_eq!(picky.calls(), 1);
+
+        assert!(mgr.force_update(&source));
+        wait_until("the check to be recorded", || {
+            status_of(&mgr, &source).fetched_at > Some(first)
+        })
+        .await;
+        assert_eq!(server.hits("/p"), 2, "the server sent the whole body again");
+        assert_eq!(picky.calls(), 1);
+        assert_eq!(h.version(), 1);
+    }
+
+    /// A copy the cache holds went in after a check, or after somebody took
+    /// the responsibility for it.
+    #[tokio::test]
+    async fn a_check_is_not_asked_about_what_the_cache_holds() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        let url = server.url("/p");
+        seed_cache(root.path(), &url, b"held", SystemTime::now());
+        let picky = Arc::new(Picky::default());
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get_checked(&profile_spec(&url), "the profile", picky_check(&picky));
+        assert_eq!(available_version(&h.current()), Some(1));
+        tokio::time::timeout(
+            Duration::ZERO,
+            mgr.attempted(&resource_key(&source_of(&url))),
+        )
+        .await
+        .expect("nothing is due, so it returns at once");
+        assert_eq!(picky.calls(), 0);
+        assert_eq!(server.hits("/p"), 0);
+    }
+
+    /// The check of a profile loads it, which takes as long as it takes: the
+    /// timers of the runtime go on meanwhile, though this one has the one
+    /// thread there is.
+    #[tokio::test]
+    async fn a_check_does_not_hold_the_thread_of_the_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/p", "profile");
+        let ran = Arc::new(AtomicBool::new(false));
+        let check: Check = {
+            let ran = ran.clone();
+            Arc::new(move |_: &[u8]| {
+                ran.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(400));
+                Ok(())
+            })
+        };
+        let ticks = Arc::new(Mutex::new(vec![std::time::Instant::now()]));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    ticks.lock().unwrap().push(std::time::Instant::now());
+                }
+            })
+        };
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get_checked(&profile_spec(&server.url("/p")), "the profile", check);
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        ticker.abort();
+        assert!(ran.load(Ordering::SeqCst));
+        let ticks = ticks.lock().unwrap();
+        let longest = ticks
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .max()
+            .unwrap();
+        assert!(
+            longest < Duration::from_millis(300),
+            "the runtime stood still for {longest:?}"
+        );
+    }
+
+    /// The check of a profile registers the sources the profile mentions, and
+    /// adopts what it has already got for them. It runs on a thread of the
+    /// blocking pool and under none of the manager's locks.
+    #[tokio::test]
+    async fn a_check_may_call_the_manager() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/p", "profile");
+        server.set("/other", "other");
+        server.set("/known", "known");
+        let (own, other, known) = (server.url("/p"), server.url("/other"), server.url("/known"));
+        let mgr = manager(root.path(), fast());
+        let known_handle = mgr.get(&url_spec(known.clone(), None));
+        wait_for(&known_handle, "known", |s| available_version(s) == Some(1)).await;
+        let check: Check = {
+            // not the manager itself: it holds the entry, which holds the check
+            let weak = Arc::downgrade(&mgr);
+            let (own, other, known) = (source_of(&own), other.clone(), source_of(&known));
+            Arc::new(move |body: &[u8]| {
+                let mgr = weak.upgrade().expect("the manager");
+                // the runtime's context reaches a thread of the blocking pool, so the
+                // task of the new entry can be spawned
+                mgr.get(&url_spec(other.clone(), None));
+                mgr.adopt(&known, Bytes::from_static(b"adopted"))
+                    .map_err(|e| e.to_string())?;
+                mgr.adopt(&own, Bytes::copy_from_slice(body))
+                    .map_err(|e| e.to_string())
+            })
+        };
+        let h = mgr.get_checked(&profile_spec(&own), "the profile", check);
+        wait_finished(&h, 1).await;
+        // the source it registered has a task, and the task downloaded
+        let other_handle = mgr.get(&url_spec(other, None));
+        let s = wait_for(&other_handle, "other", |s| available_version(s) == Some(1)).await;
+        assert_eq!(&s.data().unwrap().0[..], b"other");
+        assert_eq!(server.hits("/other"), 1);
+        // the one it adopted into holds what it was given
+        let s = known_handle.current();
+        assert_eq!(available_version(&s), Some(2));
+        assert_eq!(&s.data().unwrap().0[..], b"adopted");
+        // and the profile that was adopted by its own check and then downloaded is one version
+        assert_eq!(h.version(), 1);
+        assert_eq!(status_of(&mgr, &source_of(&own)).state, "available");
+    }
+
+    /// What the check says about itself is not what the log or the status
+    /// carries; the task goes on.
+    #[tokio::test]
+    async fn a_check_that_panics_fails_the_attempt_and_not_the_task() {
+        let lines = Lines::default();
+        let _capturing = lines.capture();
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/p", "profile");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let check: Check = {
+            let calls = calls.clone();
+            Arc::new(move |_: &[u8]| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("the check broke: S3CR3T");
+                }
+                Ok(())
+            })
+        };
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get_checked(&profile_spec(&server.url("/p")), "the profile", check);
+        let s = wait_for(&h, "failed", |s| matches!(s, ResourceState::Failed { .. })).await;
+        assert!(
+            matches!(&s, ResourceState::Failed { last_error, .. }
+                if last_error == "the check of the downloaded copy did not finish"),
+            "{s:?}"
+        );
+        let said = lines.said("downloaded resource not adopted");
+        assert!(!said.is_empty() && said.iter().all(|line| !line.contains("S3CR3T")));
+        // the next attempt, whose check passes, adopts
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn the_first_check_an_entry_is_given_stays() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/p", "profile");
+        let url = server.url("/p");
+        let (first, second) = (Arc::new(Picky::default()), Arc::new(Picky::default()));
+        let mgr = manager(root.path(), fast());
+        // registered without one, it takes the first one it is given later
+        mgr.get(&profile_spec(&url));
+        let h = mgr.get_checked(&profile_spec(&url), "the profile", picky_check(&first));
+        mgr.get_checked(&profile_spec(&url), "another", picky_check(&second));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        assert_eq!((first.calls(), second.calls()), (1, 0));
+        assert_eq!(
+            status_of(&mgr, &source_of(&url)).label.as_deref(),
+            Some("the profile")
+        );
+
+        // a file is registered as a labelled one is, and nothing of it is downloaded
+        let file = root.path().join("local.list");
+        std::fs::write(&file, "one").unwrap();
+        let spec = ResourceSpec {
+            source: ResourceSource::File(file.clone()),
+            update_interval: None,
+            kind: ResourceKind::RuleSet,
+        };
+        let local = mgr.get_checked(&spec, "a file", picky_check(&first));
+        assert_eq!(available_version(&local.current()), Some(1));
+        std::fs::write(&file, "two").unwrap();
+        wait_for(&local, "v2", |s| available_version(s) == Some(2)).await;
+        assert_eq!(first.calls(), 1);
+        let status = status_of(&mgr, &ResourceSource::File(file));
+        assert!(status.local);
+        assert_eq!(status.label.as_deref(), Some("a file"));
+    }
+
+    /// A write that fails leaves the entry ahead of its disk. The next check
+    /// that succeeds brings the disk up to date, the body included: a restart
+    /// would otherwise find the old body with validators that call it current.
+    #[tokio::test]
+    async fn the_disk_catches_up_after_a_write_that_failed() {
+        let lines = Lines::default();
+        let _capturing = lines.capture();
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/c", "B");
+        let url = server.url("/c");
+        let source = source_of(&url);
+        seed_cache(root.path(), &url, b"A", two_days_ago());
+        let blocked = block_writes(root.path(), &url, "data");
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url.clone(), None));
+        let s = wait_for(&h, "B", |s| available_version(s) == Some(2)).await;
+        assert_eq!(&s.data().unwrap().0[..], b"B");
+        assert_eq!(&cached_copy(root.path(), &url).unwrap().data[..], b"A");
+        assert_eq!(lines.said("cannot write resource cache").len(), 1);
+
+        // the way is clear again; the server says nothing changed
+        std::fs::remove_dir(&blocked).unwrap();
+        let before = status_of(&mgr, &source).fetched_at;
+        assert!(mgr.force_update(&source));
+        wait_until("the check to be recorded", || {
+            status_of(&mgr, &source).fetched_at > before
+        })
+        .await;
+        assert!(server.requests()[1].header("if-none-match").is_some());
+        let copy = cached_copy(root.path(), &url).unwrap();
+        assert_eq!(&copy.data[..], b"B");
+        assert_eq!(Some(copy.fetched_at), status_of(&mgr, &source).fetched_at);
+        assert_eq!(h.version(), 2);
+        assert_eq!(lines.said("cannot write resource cache").len(), 1);
+    }
+
+    /// The same for the metadata alone: the time on disk is the one in memory
+    /// again after the next check.
+    #[tokio::test]
+    async fn the_time_on_disk_catches_up_after_a_write_of_the_metadata_that_failed() {
+        let lines = Lines::default();
+        let _capturing = lines.capture();
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/m", "A");
+        let url = server.url("/m");
+        let source = source_of(&url);
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url.clone(), None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        let first = status_of(&mgr, &source).fetched_at.expect("a time");
+        let blocked = block_writes(root.path(), &url, "meta");
+        assert!(mgr.force_update(&source));
+        wait_until("the check to be recorded", || {
+            status_of(&mgr, &source).fetched_at > Some(first)
+        })
+        .await;
+        let status = status_of(&mgr, &source);
+        assert_eq!(status.state, "available");
+        assert_eq!(lines.said("cannot write resource cache").len(), 1);
+        assert_eq!(
+            cached_copy(root.path(), &url).unwrap().fetched_at,
+            first,
+            "the disk has the time of the first download"
+        );
+
+        std::fs::remove_dir(&blocked).unwrap();
+        let second = status.fetched_at;
+        assert!(mgr.force_update(&source));
+        wait_until("the check to be recorded", || {
+            status_of(&mgr, &source).fetched_at > second
+        })
+        .await;
+        let copy = cached_copy(root.path(), &url).unwrap();
+        assert_eq!(Some(copy.fetched_at), status_of(&mgr, &source).fetched_at);
+        assert_eq!(&copy.data[..], b"A");
+        assert_eq!(h.version(), 1);
+        assert_eq!(lines.said("cannot write resource cache").len(), 1);
+    }
+
+    /// The readers of an entry with a check go by the disk: what the disk
+    /// cannot take, the entry does not hold either.
+    #[tokio::test]
+    async fn a_checked_entry_does_not_adopt_what_it_cannot_write() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/c", "B");
+        let url = server.url("/c");
+        let source = source_of(&url);
+        let key = resource_key(&source);
+        seed_cache(root.path(), &url, b"A", two_days_ago());
+        let blocked = block_writes(root.path(), &url, "data");
+        let picky = Arc::new(Picky::default());
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get_checked(&profile_spec(&url), "the profile", picky_check(&picky));
+        let rx = h.subscribe();
+        wait_for(&h, "failed with the copy", |s| {
+            matches!(
+                s,
+                ResourceState::Failed {
+                    cached: Some(_),
+                    ..
+                }
+            )
+        })
+        .await;
+        let status = status_of(&mgr, &source);
+        assert_eq!((status.state, status.version), ("failed", 1));
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("cannot write the cache: ")),
+            "{status:?}"
+        );
+        assert_eq!(&h.current().data().unwrap().0[..], b"A");
+        assert_eq!(&cached_copy(root.path(), &url).unwrap().data[..], b"A");
+        assert!(!rx.has_changed().unwrap(), "somebody was told");
+        let told = mgr
+            .update_now(&key)
+            .await
+            .expect("an entry")
+            .expect_err("the same failure");
+        assert!(told.starts_with("cannot write the cache: "), "{told}");
+
+        // the way is clear again: the next attempt adopts
+        std::fs::remove_dir(&blocked).unwrap();
+        assert_eq!(mgr.update_now(&key).await, Some(Ok(())));
+        assert_eq!(h.version(), 2);
+        assert_eq!(&h.current().data().unwrap().0[..], b"B");
+        assert_eq!(&cached_copy(root.path(), &url).unwrap().data[..], b"B");
+        assert!(rx.has_changed().unwrap());
+    }
+
+    /// The same for a "not modified": the time of the check goes into the
+    /// cache too, and an entry whose readers go by the disk is not told it was
+    /// checked when the disk does not say so.
+    #[tokio::test]
+    async fn a_checked_entry_that_cannot_write_a_not_modified_is_failed() {
+        let lines = Lines::default();
+        let _capturing = lines.capture();
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/c", "A");
+        let url = server.url("/c");
+        let source = source_of(&url);
+        let key = resource_key(&source);
+        let picky = Arc::new(Picky::default());
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get_checked(&profile_spec(&url), "the profile", picky_check(&picky));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        let first = status_of(&mgr, &source).fetched_at.expect("a time");
+        let blocked = block_writes(root.path(), &url, "meta");
+        let told = mgr
+            .update_now(&key)
+            .await
+            .expect("an entry")
+            .expect_err("the check cannot be written down");
+        assert!(told.starts_with("cannot write the cache: "), "{told}");
+        let status = status_of(&mgr, &source);
+        assert_eq!((status.state, status.version), ("failed", 1));
+        assert_eq!(status.last_error, Some(told));
+        assert_eq!(status.fetched_at, Some(first), "the check was not recorded");
+        assert_eq!(cached_copy(root.path(), &url).unwrap().fetched_at, first);
+        assert!(!lines.said("cannot write resource cache").is_empty());
+
+        std::fs::remove_dir(&blocked).unwrap();
+        assert_eq!(mgr.update_now(&key).await, Some(Ok(())));
+        let status = status_of(&mgr, &source);
+        assert_eq!((status.state, status.version), ("available", 1));
+        assert!(status.fetched_at > Some(first));
+        let copy = cached_copy(root.path(), &url).unwrap();
+        assert_eq!(Some(copy.fetched_at), status.fetched_at);
+        assert_eq!(picky.calls(), 1);
+    }
+
+    /// A write to the cache can take as long as the disk takes, and the lock
+    /// that is held across it is nobody's but the files': what only looks at
+    /// the entries, or registers one, does not wait for it.
+    #[tokio::test]
+    async fn the_entries_can_be_looked_at_while_the_cache_is_written() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/a", "one");
+        let (url, other) = (server.url("/a"), server.url("/b"));
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url.clone(), None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        let writing = h.entry.record.lock().unwrap();
+        // from a thread of its own, so that a wait would not stop the test
+        let (done, finished) = std::sync::mpsc::channel();
+        let looker = std::thread::spawn({
+            let mgr = mgr.clone();
+            move || {
+                let listed = mgr.statuses().len();
+                let asked = mgr.force_update(&source_of(&url));
+                mgr.get(&url_spec(url, Some(60)));
+                mgr.get(&url_spec(other, None));
+                let _ = done.send((listed, asked, mgr.statuses().len()));
+            }
+        });
+        let seen = finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("it waited for the write");
+        assert_eq!(seen, (1, true, 2));
+        drop(writing);
+        looker.join().unwrap();
+    }
+
+    /// All that touches an entry at once, from several threads: nothing
+    /// deadlocks, the disk and the entry agree on what the resource is when it
+    /// is over, and a retirement in the middle of it all ends the waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn asking_adopting_and_listing_at_once_leaves_the_disk_and_the_entry_agreeing() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/s", "served");
+        let url = server.url("/s");
+        let source = source_of(&url);
+        let key = resource_key(&source);
+        let picky = Arc::new(Picky::default());
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get_checked(&profile_spec(&url), "the profile", picky_check(&picky));
+        let mut jobs = tokio::task::JoinSet::new();
+        for _ in 0..3 {
+            let (mgr, key) = (mgr.clone(), key.clone());
+            jobs.spawn(async move {
+                for _ in 0..5 {
+                    mgr.update_now(&key).await;
+                }
+            });
+        }
+        for n in 0..2 {
+            let (mgr, source) = (mgr.clone(), source.clone());
+            jobs.spawn_blocking(move || {
+                for i in 0..20 {
+                    mgr.adopt(&source, Bytes::from(format!("adopted {n} {i}")))
+                        .unwrap();
+                }
+            });
+        }
+        {
+            let (mgr, source) = (mgr.clone(), source.clone());
+            jobs.spawn(async move {
+                for _ in 0..100 {
+                    mgr.statuses();
+                    mgr.force_update(&source);
+                    tokio::task::yield_now().await;
+                }
+            });
+        }
+        let all = async { while jobs.join_next().await.is_some() {} };
+        tokio::time::timeout(Duration::from_secs(30), all)
+            .await
+            .expect("a deadlock");
+        wait_until("the last attempt to be over", || {
+            let p = h.entry.progress.borrow();
+            p.finished == p.started && p.wanted <= p.started
+        })
+        .await;
+        let held = h.current().data().expect("a copy");
+        let copy = cached_copy(root.path(), &url).expect("a cache");
+        assert_eq!(&copy.data[..], &held.0[..]);
+        assert_eq!(Some(copy.fetched_at), status_of(&mgr, &source).fetched_at);
+
+        // a retirement while others wait for an attempt ends their waiting
+        server.set_delay("/s", Duration::from_millis(200));
+        let waiting: Vec<_> = (0..3)
+            .map(|_| {
+                let (mgr, key) = (mgr.clone(), key.clone());
+                tokio::spawn(async move { mgr.update_now(&key).await })
+            })
+            .collect();
+        assert!(mgr.retire(&source));
+        for caller in waiting {
+            // answered by an attempt that had begun, by the end of the entry, or
+            // finding it gone; it must not go on waiting for an attempt that will never be
+            tokio::time::timeout(Duration::from_secs(10), caller)
+                .await
+                .expect("it is still waiting")
+                .unwrap();
+        }
+        wait_ended(&h).await;
+    }
+
+    #[tokio::test]
+    async fn update_now_waits_for_the_attempt_and_says_how_it_went() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/u", "one");
+        let url = server.url("/u");
+        let source = source_of(&url);
+        let key = resource_key(&source);
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url, None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+
+        // a new version is in, and the download is over, when it returns
+        server.set("/u", "two");
+        assert_eq!(mgr.update_now(&key).await, Some(Ok(())));
+        assert_eq!(h.version(), 2);
+        assert_eq!(&h.current().data().unwrap().0[..], b"two");
+        assert!(!status_of(&mgr, &source).updating);
+        // a "not modified"
+        assert_eq!(mgr.update_now(&key).await, Some(Ok(())));
+        assert_eq!(h.version(), 2);
+        // the body in hand
+        server.set_validators("/u", false);
+        assert_eq!(mgr.update_now(&key).await, Some(Ok(())));
+        assert_eq!(h.version(), 2);
+        // a failure, as the status tells it
+        server.set_status("/u", 500);
+        let told = mgr
+            .update_now(&key)
+            .await
+            .expect("an entry")
+            .expect_err("a failure");
+        let status = status_of(&mgr, &source);
+        assert_eq!(status.state, "failed");
+        assert_eq!(status.last_error, Some(told));
+    }
+
+    #[tokio::test]
+    async fn update_now_gives_the_reason_a_check_gave() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/p", "bad: a login page");
+        let url = server.url("/p");
+        let source = source_of(&url);
+        let picky = Arc::new(Picky::default());
+        let mgr = manager(root.path(), fast());
+        mgr.get_checked(&profile_spec(&url), "the profile", picky_check(&picky));
+        assert_eq!(
+            mgr.update_now(&resource_key(&source)).await,
+            Some(Err("not a profile".to_string()))
+        );
+        assert_eq!(
+            status_of(&mgr, &source).last_error.as_deref(),
+            Some("not a profile")
+        );
+    }
+
+    /// A call while an attempt is under way waits for the attempt after it:
+    /// the one in flight began with the validators of before the call.
+    #[tokio::test]
+    async fn update_now_waits_for_an_attempt_that_begins_after_the_call() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/w", "one");
+        let url = server.url("/w");
+        let source = source_of(&url);
+        let key = resource_key(&source);
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url, None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        // the next request is held back, so that it is under way for a while
+        server.set_delay("/w", Duration::from_millis(400));
+        assert!(mgr.force_update(&source));
+        wait_until("the request to arrive", || server.hits("/w") == 2).await;
+        // it has the route as it was; the one after it finds the new body
+        server.set("/w", "two");
+        assert_eq!(mgr.update_now(&key).await, Some(Ok(())));
+        assert_eq!(
+            server.hits("/w"),
+            3,
+            "it waited for a request made after it"
+        );
+        assert_eq!(&h.current().data().unwrap().0[..], b"two");
+        assert_eq!(h.version(), 2);
+    }
+
+    /// Asking for an update twice before the task has begun one makes one.
+    #[tokio::test]
+    async fn two_force_updates_during_an_attempt_make_one_more_request() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/f", "one");
+        server.set_delay("/f", Duration::from_millis(300));
+        let url = server.url("/f");
+        let source = source_of(&url);
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url, None));
+        wait_until("the first request", || server.hits("/f") == 1).await;
+        assert!(mgr.force_update(&source));
+        assert!(mgr.force_update(&source));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        wait_until("the second request", || server.hits("/f") == 2).await;
+        wait_until("the second attempt to be over", || {
+            !status_of(&mgr, &source).updating
+        })
+        .await;
+        // that nothing more is asked can only be seen by waiting: a third request would follow
+        // the second at once, and the wait is as long as an attempt takes
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(server.hits("/f"), 2);
+    }
+
+    #[tokio::test]
+    async fn two_update_nows_during_an_attempt_are_answered_by_one_more_request() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/g", "one");
+        server.set_delay("/g", Duration::from_millis(300));
+        let url = server.url("/g");
+        let source = source_of(&url);
+        let key = resource_key(&source);
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url, None));
+        wait_until("the first request", || server.hits("/g") == 1).await;
+        let (a, b) = tokio::join!(mgr.update_now(&key), mgr.update_now(&key));
+        assert_eq!((a, b), (Some(Ok(())), Some(Ok(()))));
+        assert_eq!(server.hits("/g"), 2);
+        assert_eq!(h.version(), 1);
+        // see above for the wait
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(server.hits("/g"), 2);
+    }
+
+    /// A call during the backoff does not wait it out, and with auto-refresh
+    /// off nothing but a call makes an attempt.
+    #[tokio::test]
+    async fn update_now_does_not_wait_for_a_backoff_or_a_timer() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/b", "one");
+        server.set_status("/b", 500);
+        let url = server.url("/b");
+        let source = source_of(&url);
+        let key = resource_key(&source);
+        // the backoff is a minute
+        let opts = ResourceOptions {
+            min_backoff: Duration::from_secs(60),
+            max_backoff: Duration::from_secs(60),
+            ..fast()
+        };
+        let mgr = manager(root.path(), opts);
+        let h = mgr.get(&url_spec(url, Some(-1)));
+        wait_for(&h, "failed", |s| matches!(s, ResourceState::Failed { .. })).await;
+        assert_eq!(server.hits("/b"), 1);
+        server.set_status("/b", 200);
+        let started = std::time::Instant::now();
+        assert_eq!(mgr.update_now(&key).await, Some(Ok(())));
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert_eq!(h.version(), 1);
+        // the backoff is over; with auto-refresh off nothing is due but a call
+        server.set("/b", "two");
+        assert_eq!(mgr.update_now(&key).await, Some(Ok(())));
+        assert_eq!(h.version(), 2);
+    }
+
+    #[tokio::test]
+    async fn update_now_of_a_key_nobody_registered_is_none() {
+        let root = tempfile::tempdir().unwrap();
+        let mgr = manager(root.path(), fast());
+        let unknown = resource_key(&ResourceSource::Url(
+            Url::parse("https://lists.test/nothing").unwrap(),
+        ));
+        assert_eq!(mgr.update_now(&unknown).await, None);
+        tokio::time::timeout(Duration::ZERO, mgr.attempted(&unknown))
+            .await
+            .expect("there is nothing to wait for");
+    }
+
+    #[tokio::test]
+    async fn update_now_of_a_local_file_returns_at_once_and_the_file_is_read_again() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("local.list");
+        std::fs::write(&file, "one").unwrap();
+        let mgr = manager(root.path(), fast());
+        let source = ResourceSource::File(file.clone());
+        let h = mgr.get(&ResourceSpec {
+            source: source.clone(),
+            update_interval: None,
+            kind: ResourceKind::RuleSet,
+        });
+        std::fs::write(&file, "two").unwrap();
+        let key = resource_key(&source);
+        tokio::time::timeout(Duration::from_secs(5), mgr.update_now(&key))
+            .await
+            .expect("it returns")
+            .expect("an entry")
+            .expect("nothing to fail");
+        wait_for(&h, "v2", |s| available_version(s) == Some(2)).await;
+        tokio::time::timeout(Duration::ZERO, mgr.attempted(&key))
+            .await
+            .expect("a file has no attempts to wait for");
+    }
+
+    #[tokio::test]
+    async fn update_now_of_an_offline_manager_says_so() {
+        let root = tempfile::tempdir().unwrap();
+        let offline = ResourceOptions {
+            offline: true,
+            ..fast()
+        };
+        let mgr = manager(root.path(), offline);
+        let source = ResourceSource::Url(Url::parse("https://lists.test/a.list").unwrap());
+        mgr.get(&ResourceSpec {
+            source: source.clone(),
+            update_interval: None,
+            kind: ResourceKind::Profile,
+        });
+        let key = resource_key(&source);
+        assert_eq!(
+            mgr.update_now(&key).await,
+            Some(Err("offline mode: nothing is downloaded".to_string()))
+        );
+        tokio::time::timeout(Duration::ZERO, mgr.attempted(&key))
+            .await
+            .expect("an offline manager makes no attempts to wait for");
+    }
+
+    /// The call is over when the entry is retired, with the reason.
+    #[tokio::test]
+    async fn update_now_is_answered_when_the_entry_is_retired_meanwhile() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/x", "one");
+        let url = server.url("/x");
+        let source = source_of(&url);
+        let key = resource_key(&source);
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url, None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        // an attempt that takes three seconds, which is far longer than the wait below
+        server.set_delay("/x", Duration::from_secs(3));
+        assert!(mgr.force_update(&source));
+        wait_until("the request to arrive", || server.hits("/x") == 2).await;
+        let waiting = tokio::spawn({
+            let (mgr, key) = (mgr.clone(), key.clone());
+            async move { mgr.update_now(&key).await }
+        });
+        wait_until("the call to ask", || h.entry.progress.borrow().wanted == 3).await;
+        assert!(mgr.retire(&source));
+        let told = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("it does not wait for the attempts")
+            .unwrap();
+        assert_eq!(
+            told,
+            Some(Err("the resource is no longer updated".to_string()))
+        );
+    }
+
+    /// An entry that never got a task (there was no runtime to run it on) is
+    /// over from the start, and nothing waits for it.
+    #[tokio::test]
+    async fn an_entry_without_a_task_is_over_from_the_start() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/n", "none");
+        let url = server.url("/n");
+        let source = source_of(&url);
+        let mgr = manager(root.path(), fast());
+        // a thread that has no runtime
+        let registered = std::thread::spawn({
+            let (mgr, url) = (mgr.clone(), url.clone());
+            move || mgr.get(&url_spec(url, None))
+        })
+        .join()
+        .unwrap();
+        let key = resource_key(&source);
+        let bound = Duration::from_secs(5);
+        let told = tokio::time::timeout(bound, mgr.update_now(&key))
+            .await
+            .expect("it returns");
+        assert_eq!(
+            told,
+            Some(Err("the resource is no longer updated".to_string()))
+        );
+        tokio::time::timeout(bound, mgr.attempted(&key))
+            .await
+            .expect("it returns");
+        assert_eq!(server.hits("/n"), 0);
+        assert!(registered.entry.progress.borrow().ended);
+    }
+
+    /// The task says it is over when the manager goes.
+    #[tokio::test]
+    async fn a_task_says_it_is_over_when_its_manager_goes() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/e", "end");
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(server.url("/e"), None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        assert!(!h.entry.progress.borrow().ended);
+        drop(mgr);
+        wait_ended(&h).await;
+    }
+
+    #[tokio::test]
+    async fn attempted_returns_when_the_first_attempt_has_failed() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/a", "x");
+        server.set_status("/a", 500);
+        let url = server.url("/a");
+        let source = source_of(&url);
+        let mgr = manager(root.path(), fast());
+        mgr.get(&url_spec(url, None));
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            mgr.attempted(&resource_key(&source)),
+        )
+        .await
+        .expect("it returns");
+        assert_eq!(status_of(&mgr, &source).state, "failed");
+    }
+
+    #[tokio::test]
+    async fn attempted_waits_for_the_refresh_of_a_copy_that_is_due() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/s", "held");
+        server.set_delay("/s", Duration::from_millis(300));
+        let url = server.url("/s");
+        let source = source_of(&url);
+        let key = resource_key(&source);
+        let long_ago = two_days_ago();
+        seed_cache(root.path(), &url, b"held", long_ago);
+        let mgr = manager(root.path(), fast());
+        mgr.get(&url_spec(url, None));
+        wait_until("the request to arrive", || server.hits("/s") == 1).await;
+        assert!(
+            tokio::time::timeout(Duration::ZERO, mgr.attempted(&key))
+                .await
+                .is_err(),
+            "it returned while the refresh was under way"
+        );
+        tokio::time::timeout(Duration::from_secs(5), mgr.attempted(&key))
+            .await
+            .expect("it returns when the refresh is over");
+        let status = status_of(&mgr, &source);
+        assert!(
+            status.fetched_at > Some(long_ago + Duration::from_secs(86_400)),
+            "{status:?}"
+        );
+        assert!(!status.updating);
+    }
+
+    #[tokio::test]
+    async fn attempted_returns_at_once_for_a_copy_that_is_not_due() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        let url = server.url("/f");
+        seed_cache(root.path(), &url, b"fresh", SystemTime::now());
+        let mgr = manager(root.path(), fast());
+        mgr.get(&url_spec(url.clone(), None));
+        tokio::time::timeout(
+            Duration::ZERO,
+            mgr.attempted(&resource_key(&source_of(&url))),
+        )
+        .await
+        .expect("nothing is due");
+        assert_eq!(server.hits("/f"), 0);
+    }
+
+    #[tokio::test]
+    async fn attempted_returns_when_the_entry_is_retired_meanwhile() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/s", "held");
+        server.set_delay("/s", Duration::from_secs(3));
+        let url = server.url("/s");
+        let source = source_of(&url);
+        let key = resource_key(&source);
+        seed_cache(root.path(), &url, b"held", two_days_ago());
+        let mgr = manager(root.path(), fast());
+        mgr.get(&url_spec(url, None));
+        wait_until("the request to arrive", || server.hits("/s") == 1).await;
+        let waiting = tokio::spawn({
+            let (mgr, key) = (mgr.clone(), key.clone());
+            async move { mgr.attempted(&key).await }
+        });
+        // it is waiting: nothing has been recorded
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        assert!(mgr.retire(&source));
+        tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("it does not wait for the attempt")
+            .unwrap();
+    }
+
+    /// What `adopt` leaves behind for a source that is registered: the body is
+    /// the content, as a version of its own, and the cache says it was taken
+    /// just now and that nothing is known of its validators.
+    #[tokio::test]
+    async fn adopting_into_a_registered_source_is_a_version_of_its_own() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/a", "one");
+        let url = server.url("/a");
+        let source = source_of(&url);
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url.clone(), None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        let mut rx = h.subscribe();
+        let first = status_of(&mgr, &source).fetched_at.expect("a time");
+
+        mgr.adopt(&source, Bytes::from_static(b"two")).unwrap();
+        let s = h.current();
+        assert_eq!(available_version(&s), Some(2));
+        assert_eq!(&s.data().unwrap().0[..], b"two");
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(*rx.borrow_and_update(), 2);
+        let (data, meta) = cache_of(root.path(), &url).load().expect("a cache");
+        assert_eq!(&data[..], b"two");
+        assert_eq!(
+            (meta.etag.as_deref(), meta.last_modified.as_deref()),
+            (None, None)
+        );
+        let status = status_of(&mgr, &source);
+        assert!(status.fetched_at > Some(first));
+        assert_eq!(Some(meta.fetched_time()), status.fetched_at);
+
+        // the next refresh fetches the whole body: it carries no validators
+        server.set("/a", "two");
+        assert!(mgr.force_update(&source));
+        wait_until("the check to be recorded", || {
+            status_of(&mgr, &source).fetched_at > status.fetched_at
+        })
+        .await;
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].header("if-none-match").is_none());
+        assert_eq!(h.version(), 2);
+    }
+
+    /// The body the entry holds already is no new version, as for a download
+    /// that brings it: the time moves, the validators go, nobody is told.
+    #[tokio::test]
+    async fn adopting_the_body_the_entry_holds_is_no_new_version() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/a", "one");
+        let url = server.url("/a");
+        let source = source_of(&url);
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url.clone(), None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        let rx = h.subscribe();
+        let before = status_of(&mgr, &source).fetched_at.expect("a time");
+        assert!(cache_of(root.path(), &url).load().unwrap().1.etag.is_some());
+
+        mgr.adopt(&source, Bytes::from_static(b"one")).unwrap();
+        assert_eq!(h.version(), 1);
+        assert!(!rx.has_changed().unwrap(), "somebody was told");
+        let meta = cache_of(root.path(), &url).load().unwrap().1;
+        assert_eq!(
+            (meta.etag.as_deref(), meta.last_modified.as_deref()),
+            (None, None)
+        );
+        let status = status_of(&mgr, &source);
+        assert!(status.fetched_at > Some(before));
+        assert_eq!(Some(meta.fetched_time()), status.fetched_at);
+
+        // also for an entry that failed and kept its copy: it is `available` again
+        server.set_status("/a", 500);
+        assert!(mgr.force_update(&source));
+        wait_for(&h, "failed with the copy", |s| {
+            matches!(
+                s,
+                ResourceState::Failed {
+                    cached: Some(_),
+                    ..
+                }
+            )
+        })
+        .await;
+        mgr.adopt(&source, Bytes::from_static(b"one")).unwrap();
+        let status = status_of(&mgr, &source);
+        assert_eq!((status.state, status.version), ("available", 1));
+        assert_eq!(status.last_error, None);
+        assert!(!rx.has_changed().unwrap(), "somebody was told");
+    }
+
+    /// A source nobody registered only has its cache written; whoever registers
+    /// it afterwards starts from that.
+    #[tokio::test]
+    async fn adopting_a_source_nobody_registered_writes_the_cache_only() {
+        let root = tempfile::tempdir().unwrap();
+        let offline = ResourceOptions {
+            offline: true,
+            ..fast()
+        };
+        let mgr = manager(root.path(), offline);
+        let url = Url::parse("https://lists.test/adopted.list").unwrap();
+        let source = source_of(&url);
+        mgr.adopt(&source, Bytes::from_static(b"adopted")).unwrap();
+        assert!(mgr.statuses().is_empty());
+        let copy = cached_copy(root.path(), &url).expect("a cache");
+        assert_eq!(&copy.data[..], b"adopted");
+        let (_, meta) = cache_of(root.path(), &url).load().unwrap();
+        assert_eq!((meta.etag, meta.last_modified), (None, None));
+        let h = mgr.get(&url_spec(url, None));
+        let s = h.current();
+        assert_eq!(available_version(&s), Some(1));
+        assert_eq!(&s.data().unwrap().0[..], b"adopted");
+    }
+
+    /// A cache that cannot be written is an error, and the entry stays as it
+    /// was.
+    #[tokio::test]
+    async fn adopting_into_a_cache_that_cannot_be_written_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // the root is a file
+        let root = dir.path().join("root");
+        std::fs::write(&root, "not a directory").unwrap();
+        let offline = ResourceOptions {
+            offline: true,
+            ..fast()
+        };
+        let mgr = manager(&root, offline);
+        let url = Url::parse("https://lists.test/adopted.list").unwrap();
+        let source = source_of(&url);
+        assert!(mgr.adopt(&source, Bytes::from_static(b"adopted")).is_err());
+        let h = mgr.get(&url_spec(url, None));
+        let rx = h.subscribe();
+        let before = status_of(&mgr, &source);
+        assert_eq!(before.state, "failed");
+        assert!(mgr.adopt(&source, Bytes::from_static(b"adopted")).is_err());
+        let after = status_of(&mgr, &source);
+        assert_eq!(
+            (after.state, after.version, after.last_error, after.ready),
+            (
+                before.state,
+                before.version,
+                before.last_error,
+                before.ready
+            )
+        );
+        assert!(!rx.has_changed().unwrap(), "somebody was told");
+    }
+
+    /// The same for an entry that holds a copy.
+    #[tokio::test]
+    async fn adopting_what_the_disk_cannot_take_leaves_the_entry_as_it_was() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/a", "one");
+        let url = server.url("/a");
+        let source = source_of(&url);
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url.clone(), None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        let rx = h.subscribe();
+        let before = (status_of(&mgr, &source), cache_files(root.path(), &url));
+        let blocked = block_writes(root.path(), &url, "data");
+        assert!(mgr.adopt(&source, Bytes::from_static(b"two")).is_err());
+        let after = (status_of(&mgr, &source), cache_files(root.path(), &url));
+        assert_eq!(after.1, before.1);
+        assert_eq!(
+            (after.0.state, after.0.version, after.0.fetched_at),
+            (before.0.state, before.0.version, before.0.fetched_at)
+        );
+        assert_eq!(&h.current().data().unwrap().0[..], b"one");
+        assert!(!rx.has_changed().unwrap(), "somebody was told");
+        // and the way clear, it goes in
+        std::fs::remove_dir(&blocked).unwrap();
+        mgr.adopt(&source, Bytes::from_static(b"two")).unwrap();
+        assert_eq!(h.version(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_file_cannot_be_adopted() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("local.list");
+        std::fs::write(&file, "one").unwrap();
+        let mgr = manager(root.path(), fast());
+        let source = ResourceSource::File(file);
+        let h = mgr.get(&ResourceSpec {
+            source: source.clone(),
+            update_interval: None,
+            kind: ResourceKind::RuleSet,
+        });
+        let error = mgr
+            .adopt(&source, Bytes::from_static(b"two"))
+            .expect_err("a file");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(&h.current().data().unwrap().0[..], b"one");
+        assert_eq!(h.version(), 1);
+    }
+
+    /// An adoption while the entry's own download is under way: a download
+    /// that brings the same body finds it in hand, and one that brings
+    /// another is a version of its own.
+    #[tokio::test]
+    async fn an_adoption_during_a_download_of_the_same_body_is_one_version() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/o", "one");
+        let url = server.url("/o");
+        let source = source_of(&url);
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url.clone(), None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        let mut rx = h.subscribe();
+        server.set("/o", "two");
+        server.set_delay("/o", Duration::from_millis(300));
+        assert!(mgr.force_update(&source));
+        wait_until("the request to arrive", || server.hits("/o") == 2).await;
+        mgr.adopt(&source, Bytes::from_static(b"two")).unwrap();
+        assert_eq!(h.version(), 2);
+        assert!(
+            status_of(&mgr, &source).updating,
+            "the download is not the adoption's"
+        );
+        wait_until("the answer to be recorded", || {
+            !status_of(&mgr, &source).updating
+        })
+        .await;
+        assert_eq!(h.version(), 2);
+        assert_eq!(&h.current().data().unwrap().0[..], b"two");
+        assert_eq!(*rx.borrow_and_update(), 2);
+        assert!(!rx.has_changed().unwrap(), "told twice");
+        let copy = cached_copy(root.path(), &url).unwrap();
+        assert_eq!(&copy.data[..], b"two");
+        assert_eq!(Some(copy.fetched_at), status_of(&mgr, &source).fetched_at);
+    }
+
+    #[tokio::test]
+    async fn an_adoption_during_a_download_of_another_body_is_followed_by_the_download() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/o", "one");
+        let url = server.url("/o");
+        let source = source_of(&url);
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url.clone(), None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        server.set("/o", "two");
+        server.set_delay("/o", Duration::from_millis(300));
+        assert!(mgr.force_update(&source));
+        wait_until("the request to arrive", || server.hits("/o") == 2).await;
+        mgr.adopt(&source, Bytes::from_static(b"three")).unwrap();
+        assert_eq!(h.version(), 2);
+        assert_eq!(&h.current().data().unwrap().0[..], b"three");
+        wait_until("the answer to be recorded", || {
+            !status_of(&mgr, &source).updating
+        })
+        .await;
+        // what was downloaded is the content
+        assert_eq!(h.version(), 3);
+        assert_eq!(&h.current().data().unwrap().0[..], b"two");
+        assert_eq!(&cached_copy(root.path(), &url).unwrap().data[..], b"two");
+    }
+
+    /// The check of an entry runs before the lock is taken for recording, so
+    /// an adoption can get in: the result is looked at again when it is
+    /// recorded.
+    #[tokio::test]
+    async fn an_adoption_during_the_check_is_looked_at_again_when_the_result_is_recorded() {
+        for adopted in ["profile", "another"] {
+            let root = tempfile::tempdir().unwrap();
+            let server = TestServer::spawn().await;
+            server.set("/p", "profile");
+            let url = server.url("/p");
+            let source = source_of(&url);
+            let (entered, release) = (Arc::new(Latch::default()), Arc::new(Latch::default()));
+            let check: Check = {
+                let (entered, release) = (entered.clone(), release.clone());
+                Arc::new(move |_: &[u8]| {
+                    entered.open();
+                    release.wait();
+                    Ok(())
+                })
+            };
+            let mgr = manager(root.path(), fast());
+            let h = mgr.get_checked(&profile_spec(&url), "the profile", check);
+            let mut rx = h.subscribe();
+            wait_until("the check to begin", || entered.is_open()).await;
+            mgr.adopt(&source, Bytes::from(adopted)).unwrap();
+            assert_eq!(h.version(), 1);
+            release.open();
+            wait_finished(&h, 1).await;
+            // the same body is the version the adoption made; another is a version more
+            let expected = if adopted == "profile" { 1 } else { 2 };
+            assert_eq!(h.version(), expected, "{adopted}");
+            assert_eq!(&h.current().data().unwrap().0[..], b"profile");
+            assert_eq!(*rx.borrow_and_update(), expected);
+            assert_eq!(
+                &cached_copy(root.path(), &url).unwrap().data[..],
+                b"profile"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retired_entry_is_no_longer_listed_and_asks_for_nothing_more() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/r", "r");
+        // a resource that fails asks again and again
+        server.set_status("/r", 500);
+        let url = server.url("/r");
+        let source = source_of(&url);
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url.clone(), None));
+        wait_until("a few requests", || server.hits("/r") >= 3).await;
+        assert!(mgr.retire(&source));
+        assert!(mgr.statuses().is_empty());
+        assert!(!mgr.force_update(&source));
+        wait_ended(&h).await;
+        // a request that was on its way when the task ended gets to the server in no time
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let asked = server.hits("/r");
+        // that nothing more happens can only be seen by waiting: a resource that fails asks
+        // again within 200 ms, and the wait is three times that
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(server.hits("/r"), asked);
+        // the second call finds nothing to retire
+        assert!(!mgr.retire(&source));
+        assert!(!mgr.retire(&ResourceSource::File(PathBuf::from("nothing.list"))));
+    }
+
+    /// The task of an entry that waits for its next refresh ends at once.
+    #[tokio::test]
+    async fn retiring_an_entry_that_waits_for_its_refresh_ends_its_task_at_once() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        let url = server.url("/w");
+        let source = source_of(&url);
+        seed_cache(root.path(), &url, b"fresh", SystemTime::now());
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url, None));
+        wait_until("the task to wait for its refresh", || {
+            h.entry.next_refresh.lock().unwrap().is_some()
+        })
+        .await;
+        assert!(mgr.retire(&source));
+        // the refresh is a day away
+        wait_ended(&h).await;
+        assert_eq!(server.hits("/w"), 0);
+    }
+
+    #[tokio::test]
+    async fn retiring_an_entry_during_an_attempt_leaves_the_cache_and_the_version_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/a", "one");
+        let url = server.url("/a");
+        let source = source_of(&url);
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url.clone(), None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        let rx = h.subscribe();
+        let before = cache_files(root.path(), &url);
+        server.set("/a", "two");
+        server.set_delay("/a", Duration::from_millis(300));
+        assert!(mgr.force_update(&source));
+        wait_until("the request to arrive", || server.hits("/a") == 2).await;
+        assert!(status_of(&mgr, &source).updating);
+        assert!(mgr.retire(&source));
+        wait_ended(&h).await;
+        assert!(!h.entry.updating.load(Ordering::SeqCst));
+        // the answer comes to the server in 300 ms and is nobody's now: the wait is longer
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(cache_files(root.path(), &url), before);
+        assert_eq!(h.version(), 1);
+        assert_eq!(&h.current().data().unwrap().0[..], b"one");
+        assert!(!rx.has_changed().unwrap(), "somebody was told");
+    }
+
+    #[tokio::test]
+    async fn retiring_an_entry_during_its_check_leaves_nothing_behind() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/p", "profile");
+        let url = server.url("/p");
+        let source = source_of(&url);
+        let (entered, release, done) = (
+            Arc::new(Latch::default()),
+            Arc::new(Latch::default()),
+            Arc::new(Latch::default()),
+        );
+        let check: Check = {
+            let (entered, release, done) = (entered.clone(), release.clone(), done.clone());
+            Arc::new(move |_: &[u8]| {
+                entered.open();
+                release.wait();
+                done.open();
+                Ok(())
+            })
+        };
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get_checked(&profile_spec(&url), "the profile", check);
+        let rx = h.subscribe();
+        wait_until("the check to begin", || entered.is_open()).await;
+        assert!(mgr.retire(&source));
+        wait_ended(&h).await;
+        // the check goes on to its end, which nobody waits for any more
+        release.open();
+        wait_until("the check to end", || done.is_open()).await;
+        tokio::task::yield_now().await;
+        assert!(!cache_of(root.path(), &url).path().exists());
+        assert!(matches!(h.current(), ResourceState::Missing));
+        assert!(!rx.has_changed().unwrap(), "somebody was told");
+        assert!(!h.entry.updating.load(Ordering::SeqCst));
+    }
+
+    /// A retired entry is gone for whoever looks for it, and a handle that is
+    /// still held reads what the entry had last. Registering the source again
+    /// is a new entry that reads the cache.
+    #[tokio::test]
+    async fn registering_a_retired_source_again_starts_from_its_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/a", "one");
+        let url = server.url("/a");
+        let source = source_of(&url);
+        let mgr = manager(root.path(), fast());
+        let old = mgr.get_labelled(&url_spec(url.clone(), None), "the old one");
+        wait_for(&old, "v1", |s| available_version(s) == Some(1)).await;
+        assert!(mgr.retire(&source));
+        mgr.adopt(&source, Bytes::from_static(b"adopted after"))
+            .unwrap();
+        let new = mgr.get_labelled(&url_spec(url, None), "the new one");
+        assert!(!Arc::ptr_eq(&old.entry, &new.entry));
+        // what the cache holds, not what the old entry had
+        let s = new.current();
+        assert_eq!(available_version(&s), Some(1));
+        assert_eq!(&s.data().unwrap().0[..], b"adopted after");
+        let statuses = mgr.statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].label.as_deref(), Some("the new one"));
+        assert_eq!(&old.current().data().unwrap().0[..], b"one");
+        // the new entry has a task: it can be asked
+        server.set("/a", "two");
+        assert_eq!(mgr.update_now(&resource_key(&source)).await, Some(Ok(())));
+        assert_eq!(&new.current().data().unwrap().0[..], b"two");
+        assert_eq!(&old.current().data().unwrap().0[..], b"one");
+    }
+
+    /// `retire` has set the flag and not yet taken the entry out of the map:
+    /// whoever registers the source then gets an entry of its own.
+    #[tokio::test]
+    async fn a_source_is_registered_anew_over_an_entry_that_is_retired() {
+        let root = tempfile::tempdir().unwrap();
+        let offline = ResourceOptions {
+            offline: true,
+            ..fast()
+        };
+        let mgr = manager(root.path(), offline);
+        let url = Url::parse("https://lists.test/a.list").unwrap();
+        let source = source_of(&url);
+        let old = mgr.get(&url_spec(url.clone(), None));
+        old.entry.progress.send_modify(|p| p.retired = true);
+        let new = mgr.get(&url_spec(url, None));
+        assert!(!Arc::ptr_eq(&old.entry, &new.entry));
+        // the entry `retire` finds is the new one
+        assert!(mgr.retire(&source));
+        assert!(mgr.statuses().is_empty());
+        assert!(new.entry.progress.borrow().retired);
+    }
+
+    /// A file's task ends too.
+    #[tokio::test]
+    async fn retiring_a_file_ends_its_task() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("local.list");
+        std::fs::write(&file, "one").unwrap();
+        let mgr = manager(root.path(), fast());
+        let source = ResourceSource::File(file.clone());
+        let h = mgr.get(&ResourceSpec {
+            source: source.clone(),
+            update_interval: None,
+            kind: ResourceKind::RuleSet,
+        });
+        let entry = Arc::downgrade(&h.entry);
+        assert!(mgr.retire(&source));
+        assert_eq!(&h.current().data().unwrap().0[..], b"one");
+        drop(h);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while entry.strong_count() > 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the task still holds its entry"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The version is published after the download is over: whoever it wakes
+    /// finds `updating` down.
+    #[tokio::test]
+    async fn updating_is_down_when_a_new_version_wakes_a_subscriber() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/v", "one");
+        server.set("/c", "profile");
+        let (plain_url, checked_url) = (server.url("/v"), server.url("/c"));
+        let picky = Arc::new(Picky::default());
+        let mgr = manager(root.path(), fast());
+        let plain = mgr.get(&url_spec(plain_url.clone(), None));
+        let checked = mgr.get_checked(&profile_spec(&checked_url), "checked", picky_check(&picky));
+        let (mut plain_rx, mut checked_rx) = (plain.subscribe(), checked.subscribe());
+        // a first download, without a check and with one
+        told(&mut plain_rx).await;
+        assert!(!status_of(&mgr, &source_of(&plain_url)).updating);
+        told(&mut checked_rx).await;
+        assert!(!status_of(&mgr, &source_of(&checked_url)).updating);
+        // and a version that an update asked for brings
+        server.set("/v", "two");
+        let key = resource_key(&source_of(&plain_url));
+        assert_eq!(mgr.update_now(&key).await, Some(Ok(())));
+        told(&mut plain_rx).await;
+        assert!(!status_of(&mgr, &source_of(&plain_url)).updating);
     }
 }
