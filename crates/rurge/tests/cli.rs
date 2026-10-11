@@ -1911,45 +1911,66 @@ mod run {
         (daemon, errors.expect("standard error was piped"))
     }
 
-    fn spawn_command_with(
-        mut cmd: Command,
-        stderr: Stdio,
-    ) -> (Daemon, Option<mpsc::Receiver<String>>) {
-        let mut child = cmd.stdout(Stdio::piped()).stderr(stderr).spawn().unwrap();
-        let stdout = child.stdout.take().unwrap();
+    /// The lines `reader` yields, on a channel. A thread of its own reads
+    /// them, so that a pipe nobody is reading from does not fill up and stop
+    /// the daemon.
+    fn forward_lines(reader: impl Read + Send + 'static) -> mpsc::Receiver<String> {
         let (tx, rx) = mpsc::channel::<String>();
         std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            for line in BufReader::new(reader).lines().map_while(Result::ok) {
                 if tx.send(line).is_err() {
                     break;
                 }
             }
         });
-        let errors = child.stderr.take().map(|stderr| {
-            let (tx, rx) = mpsc::channel::<String>();
-            std::thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    if tx.send(line).is_err() {
-                        break;
-                    }
-                }
-            });
-            rx
-        });
+        rx
+    }
+
+    /// What the daemon wrote to standard error, for the end of a panic message:
+    /// all of it once the daemon has ended and closed it, what came in the
+    /// first two seconds if it has not.
+    fn standard_error_so_far(errors: Option<&mpsc::Receiver<String>>) -> String {
+        let Some(errors) = errors else {
+            return String::new();
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut text = String::new();
+        while let Ok(line) =
+            errors.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        {
+            text.push('\n');
+            text.push_str(&line);
+        }
+        if text.is_empty() {
+            return "\nit wrote nothing to standard error".to_string();
+        }
+        format!("\nwhat it wrote to standard error:{text}")
+    }
+
+    fn spawn_command_with(
+        mut cmd: Command,
+        stderr: Stdio,
+    ) -> (Daemon, Option<mpsc::Receiver<String>>) {
+        let mut child = cmd.stdout(Stdio::piped()).stderr(stderr).spawn().unwrap();
+        let lines = forward_lines(child.stdout.take().unwrap());
+        let errors = child.stderr.take().map(forward_lines);
         // Own the child before anything can panic, so no path leaks the process.
         let mut daemon = Daemon {
             child,
             http: 0,
             socks: 0,
-            lines: rx,
+            lines,
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while daemon.http == 0 || daemon.socks == 0 {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let line = daemon
-                .lines
-                .recv_timeout(remaining)
-                .expect("rurge run printed its listening lines");
+            let line = match daemon.lines.recv_timeout(remaining) {
+                Ok(line) => line,
+                Err(e) => panic!(
+                    "rurge run did not print its listening lines: {e:?}{}",
+                    standard_error_so_far(errors.as_ref())
+                ),
+            };
             if let Some(rest) = line.strip_prefix("listening on http://") {
                 daemon.http = rest
                     .rsplit(':')
@@ -2092,6 +2113,17 @@ mod run {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// A daemon that ends before it says where it listens fails the test that
+    /// started it with what the daemon wrote to standard error, not with a
+    /// bare `Disconnected`.
+    #[test]
+    #[should_panic(expected = "error: cannot read")]
+    fn a_daemon_that_cannot_start_fails_its_test_with_its_own_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let [_, (unreadable, _)] = profiles_that_do_not_load(dir.path());
+        spawn_command_reading_stderr(rurge_run(&unreadable, &dir.path().join("data")));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
