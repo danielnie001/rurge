@@ -10,7 +10,7 @@
 //! to another task (`tokio::spawn`, a `JoinSet`): work there writes nowhere.
 
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -61,8 +61,15 @@ impl Trail {
     }
 }
 
-/// A TCP connection was made to `addr`. Does nothing outside a `follow`.
+/// A TCP connection was made to `addr`; an IPv4-mapped address
+/// (`::ffff:a.b.c.d`) is noted as the IPv4 address it is, as the project
+/// reads it at every door. Does nothing outside a `follow`.
 pub fn connected(addr: SocketAddr) {
+    let addr = match addr.ip().to_canonical() {
+        IpAddr::V4(v4) => SocketAddr::new(IpAddr::V4(v4), addr.port()),
+        // as it is, scope and all
+        IpAddr::V6(_) => addr,
+    };
     let _ = CURRENT.try_with(|trail| trail.left().peer = Some(addr));
 }
 
@@ -77,6 +84,7 @@ pub fn looked_up(spent: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddrV6;
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
@@ -112,6 +120,28 @@ mod tests {
         connected(addr("192.0.2.1:1"));
         looked_up(ms(1));
         assert_eq!((trail.peer(), trail.dns()), (None, None));
+    }
+
+    /// `::ffff:a.b.c.d` is the IPv4 address it names, as it is read at every
+    /// door of the project: the address of a record is not the one place that
+    /// shows the mapped form. Any other address is left as it is.
+    #[tokio::test]
+    async fn an_ipv4_mapped_peer_is_noted_as_ipv4() {
+        let trail = Trail::new();
+        trail
+            .follow(async { connected(addr("[::ffff:192.0.2.1]:80")) })
+            .await;
+        assert_eq!(trail.peer(), Some(addr("192.0.2.1:80")));
+        let scoped = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 80, 0, 7));
+        for other in [
+            addr("192.0.2.2:81"),
+            addr("[2001:db8::1]:80"),
+            addr("[::1]:80"),
+            scoped,
+        ] {
+            trail.follow(async { connected(other) }).await;
+            assert_eq!(trail.peer(), Some(other));
+        }
     }
 
     #[tokio::test]

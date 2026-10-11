@@ -407,6 +407,11 @@ impl ExternalOutbound {
             match connected {
                 Ok(Ok(stream)) => {
                     let _ = stream.set_nodelay(true);
+                    // noted here: this connection does not go through the
+                    // connector, which notes the others
+                    if let Ok(peer) = stream.peer_addr() {
+                        rurge_net::trail::connected(peer);
+                    }
                     return Ok(Box::new(stream));
                 }
                 Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => {}

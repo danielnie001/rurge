@@ -115,6 +115,8 @@ async fn echo_via(proxy: SocketAddr, echo: SocketAddr) {
 }
 
 /// The program starts on the first dial; its log is in the data directory.
+/// The connection the session's own dial made was to the program's port, and
+/// the session's record says so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_first_dial_starts_the_program() {
     let port = free_port();
@@ -124,6 +126,22 @@ async fn the_first_dial_starts_the_program() {
     assert!(
         log.contains(&format!("socks-helper listening on 127.0.0.1:{port}")),
         "{log}"
+    );
+    // the record is written when the relay ends, after the client went
+    let record = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(record) = h.engine.request_log().recent(1).pop() {
+                return record;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the session is recorded");
+    assert_eq!(
+        record.remote_addr,
+        Some(SocketAddr::from(([127, 0, 0, 1], port))),
+        "{record:?}"
     );
     h.engine.stop_external_programs().await;
     wait_closed(port).await;

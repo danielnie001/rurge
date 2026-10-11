@@ -196,6 +196,9 @@ pub async fn resolve_name(
             for up in upstreams {
                 for t in tracks.iter().filter(|t| !t.decided()) {
                     tracing::debug!(target: "rurge_dns::fanout", upstream = %up.name(), qtype = t.question.qtype.as_str(), round, "send");
+                    // Spawned, and the trail relies on it: a connection an upstream makes is not
+                    // noted on the session whose dial asked for the lookup. Awaited in place, a
+                    // DNS server's address would end up on a session that then connected nowhere.
                     set.spawn(one_query(up.clone(), t.question.clone(), deadline));
                 }
             }
