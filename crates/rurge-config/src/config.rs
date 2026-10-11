@@ -312,12 +312,23 @@ impl Config {
         }
     }
 
-    /// Index of the FINAL rule that takes effect: the last one (manual: "if there
-    /// are multiple FINAL rules, the last one is used").
+    /// Index of the FINAL rule that gives the policy and the options
+    /// (`dns-failed`): the last one. The manual: "If several enabled FINAL
+    /// rules are present, the last one is the effective one."
     pub fn effective_final(&self) -> Option<usize> {
         self.rules
             .iter()
             .rposition(|r| matches!(r.kind, RuleKind::Final))
+    }
+
+    /// Index of the FINAL rule where matching ends: the first one. The
+    /// manual: "a FINAL rule immediately terminates rule matching. Rules
+    /// included or defined after it are never evaluated". It is
+    /// `effective_final` when there is only one.
+    pub fn first_final(&self) -> Option<usize> {
+        self.rules
+            .iter()
+            .position(|r| matches!(r.kind, RuleKind::Final))
     }
 
     /// Lowercase hostnames of every proxy server — WireGuard peers' endpoints
@@ -1115,9 +1126,10 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
         }
     }
 
-    // FINAL: the last FINAL takes effect. Earlier FINAL lines are shadowed
-    // (W0021); non-FINAL rules after the last FINAL never run (W0019).
-    match config.effective_final() {
+    // FINAL: matching ends at the first FINAL, and the last one gives the
+    // policy and the options, so each FINAL before it says it does not
+    // (W0021); the rules after the first FINAL never run (W0019).
+    match config.first_final().zip(config.effective_final()) {
         None => {
             let span = config.rules.last().map(|r| r.span.clone());
             let d = Diagnostic::error(
@@ -1129,26 +1141,29 @@ fn validate(config: &mut Config, base_dir: &Path, opts: &LoadOptions, diags: &mu
                 None => d,
             });
         }
-        Some(last) => {
+        Some((first, last)) => {
             for r in &config.rules[..last] {
                 if matches!(r.kind, RuleKind::Final) {
                     diags.push(
                         Diagnostic::warning(
                             codes::W_DUPLICATE_FINAL,
-                            "this FINAL is shadowed; the last FINAL rule takes effect",
+                            "this FINAL does not give the policy; the last FINAL rule does",
                         )
                         .at(r.span.clone()),
                     );
                 }
             }
-            let dead = &config.rules[last + 1..];
-            if let Some(first) = dead.first() {
+            let dead: Vec<&Rule> = config.rules[first + 1..]
+                .iter()
+                .filter(|r| !matches!(r.kind, RuleKind::Final))
+                .collect();
+            if let Some(head) = dead.first() {
                 diags.push(
                     Diagnostic::warning(
                         codes::W_RULES_AFTER_FINAL,
                         format!("{} rule(s) after FINAL never take effect", dead.len()),
                     )
-                    .at(first.span.clone()),
+                    .at(head.span.clone()),
                 );
             }
         }
@@ -1869,19 +1884,37 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
     }
 
     #[test]
-    fn dead_rules_after_last_final_are_counted() {
-        // The last FINAL takes effect (manual: "if there are multiple FINAL
-        // rules, the last one is used"), so a rule between two FINALs is not
-        // dead — the earlier FINAL is shadowed instead (W0021).
+    fn rules_after_the_first_final_are_counted() {
+        // The manual: "In the [Rule] section, a FINAL rule immediately
+        // terminates rule matching. Rules included or defined after it are
+        // never evaluated", and "If several enabled FINAL rules are present,
+        // the last one is the effective one." A rule between two FINALs is
+        // therefore dead (W0019) like one after the last, and the FINAL that
+        // ends matching without giving the policy is told so (W0021).
         let l = load_text("[Rule]\nFINAL,DIRECT\nDOMAIN,a,DIRECT\nFINAL,REJECT\n");
         assert!(
             !l.diagnostics.has_errors(),
             "{:?}",
             l.diagnostics.into_vec()
         );
-        let codes = codes_of(&l);
-        assert!(codes.contains(&codes::W_DUPLICATE_FINAL));
-        assert!(!codes.contains(&codes::W_RULES_AFTER_FINAL));
+        let found = |code: &str| -> Vec<(String, u32)> {
+            l.diagnostics
+                .iter()
+                .filter(|d| d.code == code)
+                .map(|d| (d.message.clone(), d.span.as_ref().map_or(0, |s| s.line)))
+                .collect()
+        };
+        assert_eq!(
+            found(codes::W_RULES_AFTER_FINAL),
+            [("1 rule(s) after FINAL never take effect".to_string(), 3)]
+        );
+        assert_eq!(
+            found(codes::W_DUPLICATE_FINAL),
+            [(
+                "this FINAL does not give the policy; the last FINAL rule does".to_string(),
+                2
+            )]
+        );
 
         let l = load_text("[Rule]\nFINAL,DIRECT\nFINAL,REJECT\n");
         assert!(
@@ -1895,12 +1928,121 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
     }
 
     #[test]
-    fn last_final_takes_effect_and_earlier_final_is_shadowed() {
+    fn matching_ends_at_the_first_final_and_the_last_one_gives_the_policy() {
         let l = load_text("[Proxy]\nA = direct\n[Rule]\nFINAL,DIRECT\nDOMAIN,a.com,A\nFINAL,A\n");
+        assert_eq!(l.config.first_final(), Some(0));
         assert_eq!(l.config.effective_final(), Some(2));
         let codes = codes_of(&l);
         assert!(codes.contains(&codes::W_DUPLICATE_FINAL));
-        assert!(!codes.contains(&codes::W_RULES_AFTER_FINAL));
+        assert!(codes.contains(&codes::W_RULES_AFTER_FINAL));
+    }
+
+    /// With one FINAL it is both the one that ends matching and the one that
+    /// gives the policy; with none there is neither.
+    #[test]
+    fn a_single_final_is_the_first_and_the_effective_one() {
+        let l = load_text("[Rule]\nDOMAIN,a.com,DIRECT\nFINAL,DIRECT\n");
+        assert_eq!(l.config.first_final(), Some(1));
+        assert_eq!(l.config.effective_final(), Some(1));
+        let l = load_text("[Rule]\nDOMAIN,a.com,DIRECT\n");
+        assert_eq!(l.config.first_final(), None);
+        assert_eq!(l.config.effective_final(), None);
+    }
+
+    /// Every rule after the first FINAL that is not a FINAL is counted, the
+    /// ones between two FINALs and the ones after the last alike, and the
+    /// warning stands on the first of them.
+    #[test]
+    fn the_rules_between_and_after_the_finals_are_counted_together() {
+        let l = load_text(
+            "[Rule]\nDOMAIN,a,DIRECT\nFINAL,DIRECT\nDOMAIN,b,DIRECT\nFINAL,REJECT\nDOMAIN,c,DIRECT\nFINAL,DIRECT\nDOMAIN,d,DIRECT\n",
+        );
+        assert!(
+            !l.diagnostics.has_errors(),
+            "{:?}",
+            l.diagnostics.into_vec()
+        );
+        let after: Vec<_> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::W_RULES_AFTER_FINAL)
+            .collect();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].message, "3 rule(s) after FINAL never take effect");
+        assert_eq!(after[0].span.as_ref().map(|s| s.line), Some(4));
+        // one for each FINAL that does not give the policy
+        let lines: Vec<u32> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::W_DUPLICATE_FINAL)
+            .filter_map(|d| d.span.as_ref().map(|s| s.line))
+            .collect();
+        assert_eq!(lines, [3, 5]);
+    }
+
+    /// A FINAL that a requirement turns off is no FINAL: of two with
+    /// requirements that exclude each other only one is there, and the
+    /// profile reads as if it had been the only one written.
+    #[test]
+    fn a_final_a_requirement_turns_off_is_not_a_final() {
+        let text = "[Rule]\nDOMAIN,a.com,DIRECT\nFINAL,DIRECT #!REQUIREMENT SYSTEM=='macOS'\nFINAL,REJECT #!REQUIREMENT SYSTEM!='macOS'\n";
+        for (system, kept) in [("macOS", "FINAL,DIRECT"), ("Linux", "FINAL,REJECT")] {
+            let mut opts = LoadOptions::for_tests();
+            opts.environment.system = system.to_string();
+            let l = from_text(text, Path::new("/profiles/t.conf"), &opts);
+            let codes = codes_of(&l);
+            assert!(!l.diagnostics.has_errors(), "{system}: {codes:?}");
+            assert!(!codes.contains(&codes::W_DUPLICATE_FINAL), "{system}");
+            assert!(!codes.contains(&codes::W_RULES_AFTER_FINAL), "{system}");
+            assert_eq!(l.config.rules.len(), 2, "{system}");
+            assert_eq!(l.config.rules[1].raw, kept, "{system}");
+            assert_eq!(l.config.first_final(), Some(1), "{system}");
+            assert_eq!(l.config.effective_final(), Some(1), "{system}");
+        }
+    }
+
+    /// The warning about rules after the first FINAL stands on the rule, in
+    /// the file that holds it, and the FINAL that does not give the policy is
+    /// told so where it is written: a file included before a FINAL of the
+    /// profile's own is the case the manual warns about.
+    #[test]
+    fn the_final_warnings_stand_in_the_files_that_hold_the_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("main.conf"),
+            "[Proxy]\nP = direct\n[Rule]\nDOMAIN,first.example,DIRECT\n#!include shared.dconf\nDOMAIN,local.example,P\nFINAL,P\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("shared.dconf"),
+            "[Rule]\nDOMAIN,included.example,DIRECT\nFINAL,DIRECT\n",
+        )
+        .unwrap();
+        let l = load(&dir.path().join("main.conf"), &LoadOptions::for_tests()).unwrap();
+        assert!(
+            !l.diagnostics.has_errors(),
+            "{:?}",
+            l.diagnostics.into_vec()
+        );
+        let at = |code: &str| -> Vec<(String, u32)> {
+            l.diagnostics
+                .iter()
+                .filter(|d| d.code == code)
+                .map(|d| {
+                    let span = d.span.as_ref().expect("a position");
+                    let file = span.file.file_name().unwrap().to_string_lossy();
+                    (file.into_owned(), span.line)
+                })
+                .collect()
+        };
+        assert_eq!(
+            at(codes::W_RULES_AFTER_FINAL),
+            [("main.conf".to_string(), 6)]
+        );
+        assert_eq!(
+            at(codes::W_DUPLICATE_FINAL),
+            [("shared.dconf".to_string(), 3)]
+        );
     }
 
     #[test]

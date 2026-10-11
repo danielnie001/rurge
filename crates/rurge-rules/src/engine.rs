@@ -7,7 +7,7 @@ use crate::matcher::{EvalCtx, GeoLookup, Matcher, ResolvedAddrs, SetLookup, SubR
 use crate::pre_matching::{PreMatch, PreMatchingSet};
 use crate::registry::SetRegistry;
 use rurge_config::policy::Builtin;
-use rurge_config::rule::{PolicyRef, RuleKind, RuleParams};
+use rurge_config::rule::{PolicyRef, RuleParams};
 use rurge_config::session::SessionInfo;
 use rurge_config::{Config, HostName, Span};
 use rurge_net::BoxFuture;
@@ -186,8 +186,10 @@ fn verdict_name(v: Verdict) -> &'static str {
 }
 
 impl RuleEngine {
-    /// Compiles `[Rule]` up to the effective (last) FINAL; shadowed FINAL lines
-    /// and rules after the last FINAL are dropped (the config already warned).
+    /// Compiles `[Rule]` up to the first FINAL, where matching ends, and ends
+    /// the table with the effective (last) FINAL, which gives the policy and
+    /// the options; every rule written after the first FINAL is dropped, the
+    /// other FINAL lines among them (the config already warned).
     ///
     /// `sets` is consulted only while compiling. If it wraps a `SetRegistry`
     /// whose external sets hot-reload (URL / local-file resources), the
@@ -201,14 +203,16 @@ impl RuleEngine {
         sets: &dyn SetLookup,
         geo: Arc<dyn GeoLookup>,
     ) -> Result<RuleEngine, BuildError> {
-        let last = cfg
-            .effective_final()
+        let (first, last) = cfg
+            .first_final()
+            .zip(cfg.effective_final())
             .ok_or_else(|| BuildError("the [Rule] section has no FINAL rule".to_string()))?;
-        let mut rules = Vec::with_capacity(last + 1);
-        for (i, rule) in cfg.rules.iter().enumerate().take(last + 1) {
-            if matches!(rule.kind, RuleKind::Final) && i != last {
-                continue;
-            }
+        let kept = cfg.rules[..first]
+            .iter()
+            .enumerate()
+            .chain(std::iter::once((last, &cfg.rules[last])));
+        let mut rules = Vec::with_capacity(first + 1);
+        for (i, rule) in kept {
             rules.push(CompiledRule {
                 index: i,
                 matcher: Matcher::compile(&rule.kind, sets),
@@ -734,21 +738,164 @@ DOMAIN,inline.example.com
         assert_eq!(hit.entry, "DOMAIN,inline.example.com");
     }
 
+    /// The manual: "In the [Rule] section, a FINAL rule immediately terminates
+    /// rule matching", and "If several enabled FINAL rules are present, the
+    /// last one is the effective one." What is written between two FINALs is
+    /// never evaluated, and the host it names falls to the last FINAL.
     #[tokio::test]
-    async fn last_final_wins_and_shadowed_final_is_dropped() {
+    async fn matching_ends_at_the_first_final_and_the_last_one_gives_the_policy() {
         let e = engine("[Proxy]\nP = direct\n[Rule]\nFINAL,DIRECT\nDOMAIN,a.com,P\nFINAL,P\n");
-        assert_eq!(e.rules().len(), 2);
         let d = e
             .evaluate(&session("a.com"), OutboundMode::Rule, &Panicking)
             .await;
-        assert_eq!(d.reason, Reason::Rule);
-        assert_eq!(d.matched, Some(1));
+        assert_eq!(d.reason, Reason::Final);
+        assert_eq!(d.matched, Some(2));
+        assert_eq!(d.policy().map(named).as_deref(), Some("P"));
         let d = e
             .evaluate(&session("b.com"), OutboundMode::Rule, &Panicking)
             .await;
         assert_eq!(d.reason, Reason::Final);
         assert_eq!(d.matched, Some(2));
         assert_eq!(d.policy().map(named).as_deref(), Some("P"));
+        // the table holds the FINAL that gives the policy and nothing else
+        assert_eq!(e.rules().len(), 1);
+        assert_eq!(e.final_rule().index, 2);
+    }
+
+    /// A rule in every stretch around three FINALs. `first` and `third` are
+    /// put after the policy of the first and of the third FINAL: `,dns-failed`
+    /// or nothing.
+    fn three_finals(first: &str, third: &str) -> RuleEngine {
+        engine(&format!(
+            "[Proxy]\nP = direct\nQ = direct\nR = direct\n[Rule]\n\
+DOMAIN,early.example,P\nIP-CIDR,10.0.0.0/8,P\nFINAL,Q{first}\nDOMAIN,between.example,Q\n\
+FINAL,R\nDOMAIN,later.example,R\nFINAL,DIRECT{third}\nDOMAIN,tail.example,P\n"
+        ))
+    }
+
+    #[tokio::test]
+    async fn with_three_finals_only_the_rules_before_the_first_are_evaluated() {
+        let e = three_finals("", "");
+        let d = e
+            .evaluate(&session("early.example"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::Rule, Some(0)));
+        for host in [
+            "between.example",
+            "later.example",
+            "tail.example",
+            "any.org",
+        ] {
+            // the lookup the IP rule asks for finds an address outside its network
+            let d = e
+                .evaluate(&session(host), OutboundMode::Rule, &Counting::v4("1.2.3.4"))
+                .await;
+            assert_eq!((d.reason, d.matched), (Reason::Final, Some(6)), "{host}");
+            assert_eq!(d.policy().map(named).as_deref(), Some("DIRECT"), "{host}");
+        }
+        // the two rules before the first FINAL, then the third FINAL
+        let indexes: Vec<usize> = e.rules().iter().map(|r| r.index).collect();
+        assert_eq!(indexes, [0, 1, 6]);
+        assert_eq!(e.final_rule().index, 6);
+    }
+
+    /// What a failed lookup does is the option of the last FINAL, whatever the
+    /// first one says.
+    #[tokio::test]
+    async fn the_last_finals_dns_failed_decides_what_a_failed_lookup_does() {
+        let e = three_finals(",dns-failed", "");
+        let d = e
+            .evaluate(&session("between.example"), OutboundMode::Rule, &NoResolve)
+            .await;
+        assert_eq!(d.outcome, Outcome::DnsFailed);
+        assert_eq!(d.reason, Reason::DnsFailed);
+        let e = three_finals("", ",dns-failed");
+        let d = e
+            .evaluate(&session("between.example"), OutboundMode::Rule, &NoResolve)
+            .await;
+        assert_eq!(d.reason, Reason::DnsFailedFallback);
+        assert_eq!(d.matched, Some(6));
+        assert_eq!(d.policy().map(named).as_deref(), Some("DIRECT"));
+    }
+
+    /// A rule flagged `pre-matching` that is written after the first FINAL is
+    /// as dead as any other there: neither the pre-matching table nor the
+    /// pre-pass of an evaluation has it.
+    #[tokio::test]
+    async fn a_pre_matching_rule_after_the_first_final_is_never_pre_matched() {
+        let e = engine(
+            "[Proxy]\nP = direct\n[Rule]\n\
+DOMAIN,before.example,REJECT,pre-matching\nFINAL,DIRECT\n\
+DOMAIN,between.example,REJECT,pre-matching\nFINAL,P\n\
+DOMAIN,after.example,REJECT,pre-matching\n",
+        );
+        let m = e
+            .pre_match_domain("before.example", 443)
+            .expect("the rule before the first FINAL");
+        assert_eq!(m.rule, 0);
+        assert!(e.pre_match_domain("between.example", 443).is_none());
+        assert!(e.pre_match_domain("after.example", 443).is_none());
+        let d = e
+            .evaluate(&session("before.example"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::PreMatching, Some(0)));
+        for host in ["between.example", "after.example"] {
+            let d = e
+                .evaluate(&session(host), OutboundMode::Rule, &Panicking)
+                .await;
+            assert_eq!((d.reason, d.matched), (Reason::Final, Some(3)), "{host}");
+            assert_eq!(d.policy().map(named).as_deref(), Some("P"), "{host}");
+        }
+        assert_eq!(e.pre_matching().len(), 1);
+    }
+
+    /// What the manual warns about: a file included into `[Rule]` ends with a
+    /// FINAL of its own and the profile goes on after it. The rules of the
+    /// profile that follow the include are never evaluated, and the policy is
+    /// that of the profile's own FINAL.
+    #[tokio::test]
+    async fn an_included_final_ends_matching_for_the_rules_that_follow_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("main.conf"),
+            "[Proxy]\nP = direct\n[Rule]\nDOMAIN,first.example,DIRECT\n#!include shared.dconf\n\
+DOMAIN,local.example,P\nFINAL,P\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("shared.dconf"),
+            "[Rule]\nDOMAIN,included.example,DIRECT\nFINAL,DIRECT\n",
+        )
+        .unwrap();
+        let loaded =
+            rurge_config::config::load(&dir.path().join("main.conf"), &LoadOptions::for_tests())
+                .unwrap();
+        assert!(!loaded.diagnostics.has_errors());
+        let cfg = loaded.config;
+        let e = RuleEngine::build(&cfg, &InlineSets::from_config(&cfg), Arc::new(NoGeo)).unwrap();
+        for (host, matched, policy) in [
+            ("first.example", 0, "DIRECT"),
+            ("included.example", 1, "DIRECT"),
+        ] {
+            let d = e
+                .evaluate(&session(host), OutboundMode::Rule, &Panicking)
+                .await;
+            assert_eq!(
+                (d.reason, d.matched),
+                (Reason::Rule, Some(matched)),
+                "{host}"
+            );
+            assert_eq!(d.policy().map(named).as_deref(), Some(policy), "{host}");
+        }
+        for host in ["local.example", "other.example"] {
+            let d = e
+                .evaluate(&session(host), OutboundMode::Rule, &Panicking)
+                .await;
+            assert_eq!((d.reason, d.matched), (Reason::Final, Some(4)), "{host}");
+            assert_eq!(d.policy().map(named).as_deref(), Some("P"), "{host}");
+        }
+        let indexes: Vec<usize> = e.rules().iter().map(|r| r.index).collect();
+        assert_eq!(indexes, [0, 1, 4]);
     }
 
     #[tokio::test]

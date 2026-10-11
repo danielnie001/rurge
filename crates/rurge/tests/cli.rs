@@ -199,6 +199,52 @@ fn check_says_what_to_do_about_a_problem() {
     assert!(!out.contains("hint:"), "{out}");
 }
 
+/// The rules written after the first `FINAL` never run, the ones between two
+/// `FINAL`s among them, and a `FINAL` that is not the last ends matching
+/// without giving the policy: `check` says both, each with what to do.
+#[test]
+fn check_says_what_the_first_final_does_to_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write(
+        &dir,
+        "finals.conf",
+        "[Rule]\nFINAL,DIRECT\nDOMAIN,a.com,REJECT\nFINAL,REJECT\n",
+    );
+    let out = Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "--data-dir"])
+        .arg(dir.path().join("data"))
+        .arg("-c")
+        .arg(&conf)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let out = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = out.lines().collect();
+    for (code, said) in [
+        (
+            "W0019",
+            "finals.conf:3: 1 rule(s) after FINAL never take effect",
+        ),
+        (
+            "W0021",
+            "finals.conf:2: this FINAL does not give the policy; the last FINAL rule does",
+        ),
+    ] {
+        let at = lines
+            .iter()
+            .position(|line| line.starts_with(&format!("warning[{code}]")))
+            .unwrap_or_else(|| panic!("{code} is not in {out}"));
+        assert!(lines[at].ends_with(said), "{out}");
+        assert_eq!(
+            lines[at + 1],
+            format!("  hint: {}", rurge_config::codes::hint(code).unwrap()),
+            "{out}"
+        );
+    }
+    assert!(out.contains("0 error(s), 2 warning(s)"), "{out}");
+}
+
 #[test]
 fn bom_prefixed_config_is_accepted() {
     let dir = tempfile::tempdir().unwrap();
@@ -1288,6 +1334,36 @@ FINAL,DIRECT,dns-failed
         .stdout(predicate::str::contains("rule #2:"))
         .stdout(predicate::str::contains("trace:"))
         .stdout(predicate::str::contains("#0 no-match"));
+    }
+
+    /// The manual: "In the [Rule] section, a FINAL rule immediately terminates
+    /// rule matching", and "If several enabled FINAL rules are present, the
+    /// last one is the effective one." The rule between the two is not in the
+    /// trace, and the policy is the last `FINAL`'s.
+    #[test]
+    fn matching_ends_at_the_first_final_and_the_last_one_gives_the_policy() {
+        let dir = workspace();
+        std::fs::write(
+            dir.path().join("t.conf"),
+            "[Proxy]\nX = direct\nY = direct\nA = direct\n[Rule]\nFINAL,X\nDOMAIN,a.com,A\nFINAL,Y\n",
+        )
+        .unwrap();
+        rule_match(dir.path(), &["a.com", "--explain"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("policy: Y"))
+            .stdout(predicate::str::contains("reason: final"))
+            .stdout(predicate::str::contains("rule #2: FINAL,Y"))
+            .stdout(predicate::str::contains("#2 match"))
+            .stdout(predicate::str::contains("DOMAIN,a.com,A").not())
+            .stdout(predicate::str::contains("#1 ").not())
+            .stderr(predicate::str::contains("W0019"))
+            .stderr(predicate::str::contains("W0021"));
+        let (v, code) = json(dir.path(), &["a.com"]);
+        assert_eq!(code, 0);
+        assert_eq!(v["policy"], "Y");
+        assert_eq!(v["reason"], "final");
+        assert_eq!(v["matched"]["index"], 2);
     }
 
     /// The rule that lets `both.example` through is written first; the

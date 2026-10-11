@@ -222,7 +222,8 @@ pub mod codes {
     /// A named section defined twice (`[Ruleset X]`, `[WireGuard X]`): the
     /// first one is used.
     pub const W_DUPLICATE_RULESET: &str = "W0020";
-    /// An earlier FINAL that is shadowed by the last FINAL.
+    /// A FINAL before the last one: matching ends at it all the same, but the
+    /// policy and the options are the last FINAL's.
     pub const W_DUPLICATE_FINAL: &str = "W0021";
     /// External set resource has no data yet (never downloaded, or failed without cache).
     pub const W_RESOURCE_UNAVAILABLE: &str = "W0022";

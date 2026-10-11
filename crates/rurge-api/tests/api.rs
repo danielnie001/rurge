@@ -554,6 +554,27 @@ async fn policies_and_rules_are_listed_with_hits() {
     assert!(rules[1]["hits"].as_u64().unwrap() >= 1);
 }
 
+/// Matching ends at the first `FINAL` and the last one gives the policy, so
+/// the rules after the first are not in the list and the list ends with the
+/// `FINAL` that gives the policy, under its position in the profile.
+#[tokio::test]
+async fn the_rules_after_the_first_final_are_not_listed() {
+    let api = api_with("DOMAIN,before.test,DIRECT\nFINAL,Pick\nDOMAIN,between.test,REJECT").await;
+    let (status, body) = get(&api, "/v1/rules").await;
+    assert_eq!(status, 200);
+    let rules = body["rules"].as_array().unwrap();
+    let listed: Vec<(u64, &str)> = rules
+        .iter()
+        .map(|r| (r["index"].as_u64().unwrap(), r["rule"].as_str().unwrap()))
+        .collect();
+    // the profile's rules are: 0 before.test, 1 FINAL,Pick, 2 between.test,
+    // 3 ads.test, 4 FINAL,DIRECT
+    assert_eq!(
+        listed,
+        [(0, "DOMAIN,before.test,DIRECT"), (4, "FINAL,DIRECT")]
+    );
+}
+
 #[tokio::test]
 async fn recent_and_active_requests_and_kill() {
     let api = api().await;
