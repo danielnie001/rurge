@@ -659,9 +659,10 @@ fn parse_listeners(
 
 /// The value of `http-listen` given outside a profile: one or more
 /// `[password@]address[:port]`, comma separated, the port 6152 when it is left
-/// out. A profile warns about an item it cannot read and goes on with the
-/// others; here the whole value fails, as it does when it holds no item, and
-/// the reason never quotes it: it can hold a password.
+/// out. A profile reports an item it cannot read as an error and reads on, so
+/// that every bad item is reported; here the first one ends the reading, as a
+/// value that holds no item does, and the reason never quotes it: it can hold
+/// a password.
 pub fn parse_http_listen(value: &str) -> Result<Vec<Listener>, &'static str> {
     parse_listen_value(value, 6152, true)
 }
