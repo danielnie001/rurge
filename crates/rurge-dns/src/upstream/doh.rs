@@ -6,15 +6,12 @@
 
 use super::{Upstream, UpstreamError};
 use crate::message::lower_ttls;
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use http::header::{ACCEPT, AGE, AUTHORIZATION, CONTENT_TYPE};
 use http::{HeaderMap, HeaderValue, Request, StatusCode};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
-use percent_encoding::percent_decode_str;
 use rurge_net::BoxFuture;
-use rurge_net::http::{HttpClient, HttpError};
+use rurge_net::http::{HttpClient, HttpError, take_basic_authorization};
 use std::sync::Arc;
 use tokio::time::Instant;
 use url::Url;
@@ -129,10 +126,7 @@ impl DohUpstream {
     /// upstream's name leaves out.
     pub fn new(mut url: Url, pathless: bool, http: Arc<HttpClient>) -> DohUpstream {
         let name = super::doh_name(&url, pathless);
-        let authorization = basic_authorization(&url);
-        // an https URL has the authority these belong to: neither fails
-        let _ = url.set_username("");
-        let _ = url.set_password(None);
+        let authorization = take_basic_authorization(&mut url);
         DohUpstream {
             name,
             url,
@@ -140,22 +134,6 @@ impl DohUpstream {
             http,
         }
     }
-}
-
-/// `Basic base64(user:password)` (RFC 7617) of the user name and the
-/// password `url` carries, percent-decoded; `None` without either. HTTP has
-/// no other place for them: a request's target takes none (RFC 9110 4.2.4),
-/// and HTTP/2 forbids them in `:authority` (RFC 9113 8.3.1).
-fn basic_authorization(url: &Url) -> Option<HeaderValue> {
-    if url.username().is_empty() && url.password().is_none() {
-        return None;
-    }
-    let mut pair = percent_decode_str(url.username()).collect::<Vec<u8>>();
-    pair.push(b':');
-    pair.extend(percent_decode_str(url.password().unwrap_or_default()));
-    let mut value = HeaderValue::from_str(&format!("Basic {}", STANDARD.encode(pair))).ok()?;
-    value.set_sensitive(true);
-    Some(value)
 }
 
 impl Upstream for DohUpstream {

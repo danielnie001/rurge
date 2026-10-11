@@ -3275,14 +3275,12 @@ name = "rurge-dns"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
- "base64",
  "bytes",
  "criterion",
  "hickory-proto",
  "http",
  "http-body-util",
  "lru",
- "percent-encoding",
  "quinn",
  "rcgen",
  "rurge-config",
@@ -3386,6 +3384,7 @@ dependencies = [
 name = "rurge-net"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "getrandom 0.3.4",
  "http",
@@ -3393,6 +3392,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "notify",
+ "percent-encoding",
  "quinn",
  "rcgen",
  "rurge-config",

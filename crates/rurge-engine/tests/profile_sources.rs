@@ -1029,15 +1029,10 @@ async fn nothing_but_where_a_link_goes_is_shown() {
     shown += &format!("{:?}", sources.remote().get(&managed));
     shown += &format!("{:?}", sources.remote().get(&included));
     shown += &format!("{:?}", sources.strict());
-    // What the HTTP library says about its pool of connections (debug level)
-    // names the host with the user name and password of the link; that is not
-    // an event of rurge's, and the lines of the manager and of the sources
-    // are what is looked at here.
-    let lines: Vec<String> = log
-        .lines()
-        .into_iter()
-        .filter(|line| !line.contains("idle connection for"))
-        .collect();
+    // every line down to debug level: the manager's, the sources', and what
+    // the HTTP library says about its pool of connections, each of which it
+    // names by the target of the request
+    let lines = log.lines();
     shown += &lines.join("\n");
     for marker in ["USERMARK", "PASSMARK", "PATHMARK", "QUERYMARK"] {
         assert!(!shown.contains(marker), "{marker} in: {shown}");

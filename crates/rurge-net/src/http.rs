@@ -4,8 +4,10 @@
 
 use crate::BoxFuture;
 use crate::connector::{BoxedStream, ConnectOpts, Connector, Target};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
-use http::header::{LOCATION, USER_AGENT};
+use http::header::{AUTHORIZATION, LOCATION, USER_AGENT};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
@@ -13,6 +15,7 @@ use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use percent_encoding::percent_decode_str;
 use rurge_config::HostName;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -345,13 +348,24 @@ impl HttpClient {
                 if redirects >= opts.follow_redirects {
                     return Err(HttpError::TooManyRedirects);
                 }
-                let next = url
+                let mut next = url
                     .join(loc)
                     .map_err(|e| HttpError::InvalidUrl(e.to_string()))?;
                 if url.scheme() == "https" && next.scheme() != "https" {
                     return Err(HttpError::Protocol(
                         "refusing to redirect from https to http".to_string(),
                     ));
+                }
+                // A URL's user name and password are for the server it
+                // names. A relative redirect kept them; one that names the
+                // same server again keeps them too, one that leaves goes
+                // without.
+                if next.origin() == url.origin()
+                    && next.username().is_empty()
+                    && next.password().is_none()
+                {
+                    let _ = next.set_username(url.username());
+                    let _ = next.set_password(url.password());
                 }
                 redirects += 1;
                 url = next;
@@ -391,7 +405,13 @@ impl HttpClient {
             // caller's
             return Err(HttpError::InvalidUrl("unsupported scheme".to_string()));
         }
-        let uri: Uri = url
+        // A user name and a password are no part of what a server is asked
+        // for: they go as Basic authentication. The target is the URL
+        // without them, which is also what the connection pool calls a
+        // connection in its log lines.
+        let mut target = url.clone();
+        let authorization = take_basic_authorization(&mut target);
+        let uri: Uri = target
             .as_str()
             .parse()
             .map_err(|e: http::uri::InvalidUri| HttpError::InvalidUrl(e.to_string()))?;
@@ -399,12 +419,39 @@ impl HttpClient {
             .method(method.clone())
             .uri(uri)
             .header(USER_AGENT, self.user_agent.clone());
+        // a caller that sends its own says who asks
+        if let Some(authorization) = authorization
+            && !opts.headers.iter().any(|(name, _)| name == AUTHORIZATION)
+        {
+            b = b.header(AUTHORIZATION, authorization);
+        }
         for (k, v) in &opts.headers {
             b = b.header(k.clone(), v.clone());
         }
         b.body(Full::new(body))
             .map_err(|e| HttpError::Protocol(e.to_string()))
     }
+}
+
+/// Takes the user name and the password out of `url` and returns what they
+/// are sent as instead: `Basic base64(user:password)` (RFC 7617),
+/// percent-decoded and marked as not to be shown. `None`, and the URL as it
+/// was, when it has neither. HTTP has no other place for them: a request's
+/// target takes none (RFC 9110 4.2.4), and HTTP/2 forbids them in
+/// `:authority` (RFC 9113 8.3.1).
+pub fn take_basic_authorization(url: &mut Url) -> Option<HeaderValue> {
+    if url.username().is_empty() && url.password().is_none() {
+        return None;
+    }
+    let mut pair = percent_decode_str(url.username()).collect::<Vec<u8>>();
+    pair.push(b':');
+    pair.extend(percent_decode_str(url.password().unwrap_or_default()));
+    // a URL that has them has the authority they belong to: neither fails
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    let mut value = HeaderValue::from_str(&format!("Basic {}", STANDARD.encode(pair))).ok()?;
+    value.set_sensitive(true);
+    Some(value)
 }
 
 fn map_client_error(e: hyper_util::client::legacy::Error) -> HttpError {
@@ -515,6 +562,164 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, HttpError::TooManyRedirects));
+    }
+
+    /// A user name and a password in a URL go as `Authorization: Basic`
+    /// (RFC 7617), percent-decoded, over HTTP/1 and HTTP/2 alike. A URL
+    /// without them sends no such header.
+    #[tokio::test]
+    async fn a_urls_user_name_and_password_go_as_basic_authentication() {
+        for tls in [false, true] {
+            let server = if tls {
+                TestServer::spawn_tls().await
+            } else {
+                TestServer::spawn().await
+            };
+            server.set("/a", "hello");
+            let mut url = server.url("/a");
+            url.set_username("al ice").unwrap();
+            url.set_password(Some("s3cret:net")).unwrap();
+            assert_eq!(url.username(), "al%20ice", "the URL holds them encoded");
+            let c = client(tls);
+            let resp = c.get(&url, &RequestOpts::default()).await.unwrap();
+            assert_eq!(&resp.body[..], b"hello", "tls: {tls}");
+            c.get(&server.url("/a"), &RequestOpts::default())
+                .await
+                .unwrap();
+            let requests = server.requests();
+            let version = if tls { "HTTP/2.0" } else { "HTTP/1.1" };
+            assert_eq!(requests[0].version, version);
+            assert_eq!(
+                requests[0].header("authorization"),
+                // base64("al ice:s3cret:net")
+                Some("Basic YWwgaWNlOnMzY3JldDpuZXQ="),
+                "tls: {tls}"
+            );
+            assert_eq!(requests[1].header("authorization"), None, "tls: {tls}");
+            for request in &requests {
+                for (name, value) in &request.headers {
+                    assert!(
+                        name == "authorization" || !value.contains("s3cret"),
+                        "tls: {tls}: {name}: {value}"
+                    );
+                    assert!(!value.contains('@'), "tls: {tls}: {name}: {value}");
+                }
+            }
+        }
+    }
+
+    /// The request that is built names the server alone. Its target is what
+    /// the connection pool calls a connection in its log lines, and what
+    /// HTTP/2 sends as `:authority` — where RFC 9113 8.3.1 allows no user
+    /// name and password. The header that carries them is not shown.
+    #[tokio::test]
+    async fn the_target_of_a_request_has_no_user_name_and_password() {
+        let c = client(false);
+        let build = |url: &Url| {
+            c.build(&Method::GET, url, Bytes::new(), &RequestOpts::default())
+                .unwrap()
+        };
+        let url = Url::parse("https://us3r:s3cret@host.example:8443/dir/file?token=t").unwrap();
+        let req = build(&url);
+        assert_eq!(
+            req.uri().to_string(),
+            "https://host.example:8443/dir/file?token=t"
+        );
+        let authorization = req.headers().get("authorization").expect("sent as Basic");
+        // base64("us3r:s3cret")
+        assert_eq!(authorization, "Basic dXMzcjpzM2NyZXQ=");
+        assert!(authorization.is_sensitive());
+        let shown = format!("{req:?}");
+        assert!(!shown.contains("dXMzcjpzM2NyZXQ"), "{shown}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        // a URL with neither is asked as it is written
+        let plain = Url::parse("https://host.example:8443/dir/file?token=t").unwrap();
+        let req = build(&plain);
+        assert_eq!(req.uri().to_string(), plain.as_str());
+        assert!(req.headers().get("authorization").is_none());
+    }
+
+    /// A caller that sends its own `Authorization` is the one that says who
+    /// asks: the URL's user name and password leave the target, and are not
+    /// sent beside it.
+    #[tokio::test]
+    async fn the_callers_own_authorization_is_the_one_sent() {
+        let server = TestServer::spawn().await;
+        server.set("/a", "hello");
+        let mut url = server.url("/a");
+        url.set_username("us3r").unwrap();
+        url.set_password(Some("s3cret")).unwrap();
+        let opts = RequestOpts {
+            headers: vec![(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer t0ken"),
+            )],
+            ..RequestOpts::default()
+        };
+        client(false).get(&url, &opts).await.unwrap();
+        let sent: Vec<String> = server.requests()[0]
+            .headers
+            .iter()
+            .filter(|(name, _)| name == "authorization")
+            .map(|(_, value)| value.clone())
+            .collect();
+        assert_eq!(sent, ["Bearer t0ken"]);
+    }
+
+    /// A redirect takes the user name and password no further than the
+    /// server they were written for: one that stays on it — by a relative
+    /// reference, or by naming the server again — is followed with them, one
+    /// that leaves is followed without.
+    #[tokio::test]
+    async fn a_redirect_takes_the_credentials_no_further_than_their_server() {
+        let elsewhere = TestServer::spawn().await;
+        elsewhere.set("/final", "elsewhere");
+        let server = TestServer::spawn().await;
+        server.set("/final", "here");
+        for (path, location) in [
+            ("/relative", "/final".to_string()),
+            ("/named", server.url("/final").to_string()),
+            ("/away", elsewhere.url("/final").to_string()),
+        ] {
+            server.set(path, "");
+            server.set_status(path, 302);
+            server.set_header(path, "location", &location);
+        }
+        let with_credentials = |path: &str| {
+            let mut url = server.url(path);
+            url.set_username("us3r").unwrap();
+            url.set_password(Some("s3cret")).unwrap();
+            url
+        };
+        let c = client(false);
+        for (path, body) in [
+            ("/relative", &b"here"[..]),
+            ("/named", b"here"),
+            ("/away", b"elsewhere"),
+        ] {
+            let resp = c
+                .get(&with_credentials(path), &RequestOpts::default())
+                .await
+                .unwrap();
+            assert_eq!(&resp.body[..], body, "{path}");
+        }
+        let requests = server.requests();
+        assert_eq!(
+            requests.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            ["/relative", "/final", "/named", "/final", "/away"]
+        );
+        for request in &requests {
+            assert_eq!(
+                request.header("authorization"),
+                // base64("us3r:s3cret")
+                Some("Basic dXMzcjpzM2NyZXQ="),
+                "{}",
+                request.path
+            );
+        }
+        let requests = elsewhere.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].header("authorization"), None);
     }
 
     #[tokio::test]
