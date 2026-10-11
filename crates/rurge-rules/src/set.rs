@@ -1,5 +1,6 @@
-//! A compiled set: domain index + IP index + linear entries (M2 design §6.2),
-//! behind an `ArcSwap` handle so a resource update swaps the set in place.
+//! A compiled set: domain index + linear entries + the AS numbers its `IP-ASN`
+//! lines name + IP index, looked up in that order (M2 design §6.2), behind an
+//! `ArcSwap` handle so a resource update swaps the set in place.
 
 use crate::domain_index::{DomainIndex, DomainIndexBuilder};
 use crate::ip_index::{IpIndex, IpIndexBuilder};

@@ -715,6 +715,44 @@ mod tests {
         assert_eq!(st.skipped, 0);
     }
 
+    /// A list written the way the published ones are, with a note after a
+    /// number, a name and an address range, is read whole: the registry says
+    /// nothing, every line is an entry, and a name followed by a note still
+    /// matches its name.
+    #[tokio::test]
+    async fn a_file_written_the_way_the_lists_write_it_loads_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.list");
+        std::fs::write(
+            &file,
+            "\
+# a header
+IP-ASN,4134 // 中国电信骨干网
+IP-ASN,132203 // Tencent Building, Kejizhongyi Avenue
+IP-ASN,131326 // 2308 Yinlaige # 22 Jinsui Road
+DOMAIN-SUFFIX,example.com // note
+IP-CIDR,10.0.0.0/8,no-resolve # lan
+",
+        )
+        .unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,a.list,P\nFINAL,DIRECT\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        assert!(diags.is_empty(), "{:?}", codes_of(&diags));
+        let st = reg
+            .statuses()
+            .into_iter()
+            .find(|s| s.name.ends_with("a.list"))
+            .unwrap();
+        assert_eq!(st.state, "ok");
+        assert_eq!(st.skipped, 0);
+        assert_eq!(st.entries, 5);
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "x.example.com").await.0, "P");
+    }
+
     #[tokio::test]
     async fn missing_file_is_an_empty_set_with_a_warning() {
         let dir = tempfile::tempdir().unwrap();

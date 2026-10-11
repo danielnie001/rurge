@@ -356,6 +356,47 @@ IP-ASN,131326 // 2308 Yinlaige # 22 Jinsui Road
         }
     }
 
+    /// A set file reads a line as the profile always has: a marker inside
+    /// single quotes still starts a note; double quotes keep a value whole.
+    #[test]
+    fn single_quotes_do_not_keep_a_marker_from_starting_a_note() {
+        let names = HashSet::new();
+        for (line, value, shown) in [
+            // cut at the marker, in the middle of the quotes
+            (
+                "URL-REGEX,'^http://a // b'",
+                "'^http://a",
+                "URL-REGEX,'^http://a",
+            ),
+            (
+                "URL-REGEX,'^http://a # b'",
+                "'^http://a",
+                "URL-REGEX,'^http://a",
+            ),
+            // the same values in double quotes are whole
+            (
+                r#"URL-REGEX,"^http://a // b""#,
+                "^http://a // b",
+                r#"URL-REGEX,"^http://a // b""#,
+            ),
+            (
+                r#"URL-REGEX,"^http://a # b""#,
+                "^http://a # b",
+                r#"URL-REGEX,"^http://a # b""#,
+            ),
+        ] {
+            let p = parse_set(SetKind::RuleSet, line, &ctx_with(&names));
+            assert_eq!(p.skipped_total, 0, "{line}: {:?}", p.skipped);
+            let found = rules(&p);
+            assert_eq!(found.len(), 1, "{line}");
+            let RuleKind::UrlRegex(pattern) = &found[0].kind else {
+                panic!("{line}: {:?}", found[0].kind);
+            };
+            assert_eq!(pattern.source, value, "{line}");
+            assert_eq!(found[0].raw, shown, "{line}");
+        }
+    }
+
     #[test]
     fn a_whole_line_comment_is_still_one_with_any_of_the_three_markers() {
         let names = HashSet::new();
