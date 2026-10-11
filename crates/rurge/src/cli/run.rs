@@ -129,23 +129,27 @@ pub(crate) fn level_for(level: &LogLevel) -> LevelFilter {
 
 type LevelHandle = reload::Handle<LevelFilter, Registry>;
 
-/// What rurge says better itself: boringtun's handshake and timer messages
-/// carry no policy name, and the `wireguard` outbound logs its handshakes;
-/// quinn's are about its drivers and every packet, and the QUIC outbounds
-/// report what comes of them. quinn-udp's warnings stay: what the system
-/// refused to send, which it drops without telling anyone else. russh
-/// narrates every session through `log`, down to what the server sent;
-/// the `ssh` outbound says what comes of one, and russh's own warnings and
-/// errors stay.
+/// What is not rurge's own says only what went wrong. A library's account
+/// of its own work is written for whoever debugs the library, and has what
+/// rurge keeps out of its log: an HTTP client names each connection by
+/// where its requests go, a WebSocket library prints its frames with what
+/// they carry, russh narrates every session down to what the server sent.
+/// rurge says what comes of each. Two say nothing at all: boringtun's
+/// handshake and timer messages carry no policy name, and the `wireguard`
+/// outbound logs its handshakes; quinn's are about its drivers and every
+/// packet, and the QUIC outbounds report what comes of them. quinn-udp's
+/// warnings stay: what the system refused to send, which it drops without
+/// telling anyone else.
 fn quiet_dependencies() -> Targets {
     Targets::new()
-        .with_default(LevelFilter::TRACE)
+        // a `log` record's target is its module, as an event's is
+        .with_default(LevelFilter::WARN)
+        // by prefix: `rurge` itself and every `rurge_…` crate
+        .with_target("rurge", LevelFilter::TRACE)
         .with_target("boringtun", LevelFilter::OFF)
         // `quinn` covers `quinn_proto` too; the longer target wins
         .with_target("quinn", LevelFilter::OFF)
         .with_target("quinn_udp", LevelFilter::WARN)
-        // a `log` record's target is its module: `russh::…`, `russh_cryptovec::…`
-        .with_target("russh", LevelFilter::WARN)
 }
 
 fn init_logging(
@@ -1110,6 +1114,47 @@ mod tests {
         assert!(filter.would_enable("russh_cryptovec::platform", &tracing::Level::WARN));
         assert!(filter.would_enable("russh::client", &tracing::Level::ERROR));
         assert!(filter.would_enable("rurge_proto_ssh::outbound", &tracing::Level::TRACE));
+    }
+
+    /// What is not rurge's own says only what went wrong. An HTTP library's
+    /// account of its connections names each by where it goes; a WebSocket
+    /// library's account of its frames has what they carry.
+    #[test]
+    fn what_is_not_rurges_own_says_only_what_went_wrong() {
+        let filter = quiet_dependencies();
+        for target in [
+            "hyper_util::client::legacy::pool",
+            "hyper::proto::h1::conn",
+            "h2::codec::framed_read",
+            "rustls::client::hs",
+            "tungstenite::protocol",
+            "tokio_tungstenite",
+            "a_crate_of_next_year::module",
+        ] {
+            for level in [
+                tracing::Level::TRACE,
+                tracing::Level::DEBUG,
+                tracing::Level::INFO,
+            ] {
+                assert!(!filter.would_enable(target, &level), "{target} at {level}");
+            }
+            for level in [tracing::Level::WARN, tracing::Level::ERROR] {
+                assert!(filter.would_enable(target, &level), "{target} at {level}");
+            }
+        }
+        // rurge's own, down to the last line
+        for target in [
+            "rurge",
+            "rurge::cli::run",
+            "rurge_net::resource",
+            "rurge_dns::fanout",
+            "rurge_engine::profile",
+        ] {
+            assert!(
+                filter.would_enable(target, &tracing::Level::TRACE),
+                "{target}"
+            );
+        }
     }
 
     #[test]
