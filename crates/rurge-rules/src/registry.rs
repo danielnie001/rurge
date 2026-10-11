@@ -753,6 +753,30 @@ IP-CIDR,10.0.0.0/8,no-resolve # lan
         assert_eq!(decide(&engine, "x.example.com").await.0, "P");
     }
 
+    /// Lists saved by some editors start with a byte order mark: the first
+    /// rule is read like any other, and the registry says nothing.
+    #[tokio::test]
+    async fn a_local_file_saved_with_a_byte_order_mark_loads_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.list");
+        let bytes = [&b"\xEF\xBB\xBF"[..], b"DOMAIN,a.com\nDOMAIN,b.com\n"].concat();
+        std::fs::write(&file, bytes).unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,a.list,P\nFINAL,DIRECT\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        assert!(diags.is_empty(), "{:?}", codes_of(&diags));
+        let st = reg
+            .statuses()
+            .into_iter()
+            .find(|s| s.name.ends_with("a.list"))
+            .unwrap();
+        assert_eq!(st.skipped, 0);
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "a.com").await.0, "P");
+    }
+
     #[tokio::test]
     async fn missing_file_is_an_empty_set_with_a_warning() {
         let dir = tempfile::tempdir().unwrap();

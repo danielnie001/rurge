@@ -56,6 +56,9 @@ pub fn parse_set(kind: SetKind, text: &str, ctx: &ParseCtx) -> ParsedSet {
 }
 
 pub fn parse_set_with_limit(kind: SetKind, text: &str, ctx: &ParseCtx, limit: usize) -> ParsedSet {
+    // Lists saved by some editors start with a byte order mark; it is not part
+    // of the first line.
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let mut out = ParsedSet::default();
     for (i, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -444,5 +447,75 @@ IP-ASN,131326 // 2308 Yinlaige # 22 Jinsui Road
         assert!(p.lines.is_empty(), "{:?}", p.lines);
         let numbers: Vec<usize> = p.skipped.iter().map(|(n, _)| *n).collect();
         assert_eq!(numbers, [1, 2, 3]);
+    }
+
+    /// Lists saved by some editors start with a byte order mark, which is no
+    /// part of the first line: the first rule is read like any other.
+    #[test]
+    fn a_byte_order_mark_at_the_head_of_a_rule_set_is_no_part_of_its_first_rule() {
+        let names = HashSet::new();
+        let text = "\u{feff}DOMAIN-SUFFIX,example.com\nDOMAIN,b.com\n";
+        let p = parse_set(SetKind::RuleSet, text, &ctx_with(&names));
+        assert_eq!(p.skipped_total, 0, "{:?}", p.skipped);
+        let found = rules(&p);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].kind, RuleKind::DomainSuffix("example.com".into()));
+        assert_eq!(found[0].raw, "DOMAIN-SUFFIX,example.com");
+    }
+
+    #[test]
+    fn a_comment_after_a_byte_order_mark_is_still_a_comment_in_a_rule_set() {
+        let names = HashSet::new();
+        let text = "\u{feff}# header\nDOMAIN,a.com\n";
+        let p = parse_set(SetKind::RuleSet, text, &ctx_with(&names));
+        assert_eq!(p.skipped_total, 0, "{:?}", p.skipped);
+        assert_eq!(p.lines.len(), 1);
+    }
+
+    #[test]
+    fn a_comment_after_a_byte_order_mark_is_still_a_comment_in_a_domain_set() {
+        let names = HashSet::new();
+        let text = "\u{feff}# header\na.com\n";
+        let p = parse_set(SetKind::DomainSet, text, &ctx_with(&names));
+        assert_eq!(p.skipped_total, 0, "{:?}", p.skipped);
+        assert_eq!(p.lines.len(), 1);
+    }
+
+    #[test]
+    fn a_byte_order_mark_at_the_head_of_a_domain_set_is_no_part_of_its_first_name() {
+        let names = HashSet::new();
+        let text = "\u{feff}example.com\n.example.net\n";
+        let p = parse_set(SetKind::DomainSet, text, &ctx_with(&names));
+        assert_eq!(p.skipped_total, 0, "{:?}", p.skipped);
+        assert_eq!(p.lines.len(), 2);
+        assert!(
+            matches!(&p.lines[0], SetLine::Domain { name, suffix: false } if name == "example.com")
+        );
+        assert!(
+            matches!(&p.lines[1], SetLine::Domain { name, suffix: true } if name == "example.net")
+        );
+    }
+
+    /// The mark is dropped from the very start of the text and nowhere else:
+    /// any other is part of its line, which is then a skipped line, and the
+    /// numbers of the skipped lines count from the first line as before.
+    #[test]
+    fn only_one_byte_order_mark_at_the_very_start_of_the_text_is_dropped() {
+        let names = HashSet::new();
+        for (text, parsed, skipped) in [
+            // the start of a later line
+            (
+                "DOMAIN,a.com\n\u{feff}DOMAIN,b.com\nDOMAIN,c.com\n",
+                2,
+                vec![2],
+            ),
+            // a second mark at the head: one is dropped, the other stays
+            ("\u{feff}\u{feff}DOMAIN,a.com\nDOMAIN,b.com\n", 1, vec![1]),
+        ] {
+            let p = parse_set(SetKind::RuleSet, text, &ctx_with(&names));
+            assert_eq!(p.lines.len(), parsed, "{text:?}");
+            let numbers: Vec<usize> = p.skipped.iter().map(|(n, _)| *n).collect();
+            assert_eq!(numbers, skipped, "{text:?}");
+        }
     }
 }
