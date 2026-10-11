@@ -11,6 +11,7 @@ use crate::set_format::{ParsedSet, SetKind, SetLine};
 use arc_swap::ArcSwap;
 use rurge_config::rule::RuleKind;
 use rurge_config::session::SessionInfo;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub struct CompiledSet {
@@ -25,7 +26,17 @@ pub struct CompiledSet {
     /// logical rule, `GEOIP` and `IP-ASN` set it whether or not they end up
     /// asking.
     ips_resolve: bool,
-    /// Everything that is neither a plain domain nor a CIDR, in file order.
+    /// The AS numbers the set's `IP-ASN` lines name, each with the entry of
+    /// the first line that names it. Every such line judges the same address,
+    /// so one look-up here stands for all of them.
+    asns: HashMap<u32, u32>,
+    /// Whether an `IP-ASN` line may ask for a lookup, that is, one that did
+    /// not say `no-resolve`. Not `needs_dns`, which is wider: a nested set, a
+    /// logical rule, `GEOIP` and the IP lines set it whether or not they end
+    /// up asking; and not `ips_resolve`, which is about the IP lines.
+    asns_resolve: bool,
+    /// Everything that is not a plain domain, a CIDR or an `IP-ASN` line, in
+    /// file order.
     linear: Vec<(u32, CompiledSubRule)>,
     entries: Vec<Box<str>>,
 }
@@ -40,6 +51,8 @@ impl CompiledSet {
             domains: DomainIndex::default(),
             ips: IpIndexBuilder::new().build(),
             ips_resolve: false,
+            asns: HashMap::new(),
+            asns_resolve: false,
             linear: Vec::new(),
             entries: Vec::new(),
         }
@@ -58,6 +71,8 @@ impl CompiledSet {
         let mut entries: Vec<Box<str>> = Vec::with_capacity(parsed.lines.len());
         let mut needs_dns = false;
         let mut ips_resolve = false;
+        let mut asns = HashMap::new();
+        let mut asns_resolve = false;
         for (i, line) in parsed.lines.iter().enumerate() {
             let i = u32::try_from(i).expect("set size is bounded by MAX_ENTRIES");
             match line {
@@ -89,12 +104,18 @@ impl CompiledSet {
                                 ips_resolve = true;
                             }
                         }
+                        RuleKind::IpAsn(asn) => {
+                            asns.entry(*asn).or_insert(i);
+                            if !sub.no_resolve {
+                                needs_dns = true;
+                                asns_resolve = true;
+                            }
+                        }
                         other => {
                             if !sub.no_resolve
                                 && matches!(
                                     other,
                                     RuleKind::GeoIp(_)
-                                        | RuleKind::IpAsn(_)
                                         | RuleKind::RuleSet(_)
                                         | RuleKind::DomainSet(_)
                                         | RuleKind::And(_)
@@ -118,6 +139,8 @@ impl CompiledSet {
             domains: domains.build(),
             ips: ips.build(),
             ips_resolve,
+            asns,
+            asns_resolve,
             linear,
             entries,
         }
@@ -142,16 +165,20 @@ impl CompiledSet {
     }
 
     /// Domain index first (never resolves), then linear entries in file order,
-    /// then the IP index. The index holds every `IP-CIDR` / `IP-CIDR6` line,
-    /// with or without `no-resolve`; it asks for resolution only when the
-    /// caller did not say `no-resolve` and some line in it did not either (a
-    /// line that said it never asks). When several lines match, the one
-    /// reported is the first found in that order, which is not always the first
-    /// in the file: an IP line is found after the linear ones, and among the
-    /// IP lines of one address family the longest prefix wins. The IPv4
-    /// address is asked first and the IPv6 one after it, so a name resolved to
-    /// both, each inside a line, reports the IPv4 line whatever the prefix
-    /// lengths.
+    /// then the `IP-ASN` lines, then the IP index. The `IP-ASN` lines all
+    /// judge the same address, so one look-up of its AS number stands for
+    /// them all; they ask for resolution only when the caller did not say
+    /// `no-resolve` and some `IP-ASN` line did not either. The IP index holds
+    /// every `IP-CIDR` / `IP-CIDR6` line, with or without `no-resolve`; it
+    /// asks for resolution only when the caller did not say `no-resolve` and
+    /// some line in it did not either (a line that said it never asks). When
+    /// several lines match, the one reported is the first found in that
+    /// order, which is not always the first in the file: an `IP-ASN` line and
+    /// an IP line are found after the linear ones, the `IP-ASN` line first,
+    /// and among the IP lines of one address family the longest prefix wins.
+    /// The IPv4 address is asked first and the IPv6 one after it, so a name
+    /// resolved to both, each inside a line, reports the IPv4 line whatever
+    /// the prefix lengths.
     pub fn eval(
         &self,
         s: &SessionInfo,
@@ -183,6 +210,19 @@ impl CompiledSet {
                 Verdict::Match => return self.hit(*i),
                 Verdict::NeedsResolve => needs = true,
                 Verdict::NoMatch => {}
+            }
+        }
+        if !self.asns.is_empty() {
+            match target_ip(s, ctx, no_resolve || !self.asns_resolve, Family::Any) {
+                Ok(ip) => {
+                    if let Some(asn) = ctx.asn(ip)
+                        && let Some(&i) = self.asns.get(&asn)
+                    {
+                        return self.hit(i);
+                    }
+                }
+                Err(Verdict::NeedsResolve) => needs = true,
+                Err(_) => {}
             }
         }
         if !self.ips.is_empty() {
@@ -968,6 +1008,66 @@ DEST-PORT,8443
             lines.eval(&session("other.org"), &mut ctx, false, false);
         }
         assert_eq!(db.asked(), 1);
+    }
+
+    #[test]
+    fn asn_lines_are_not_in_the_list_of_lines_walked_one_by_one() {
+        let set = compile(
+            SetKind::RuleSet,
+            "IP-ASN,64500\nDEST-PORT,1\nIP-ASN,64501,no-resolve\nDOMAIN,a.com\n",
+            &Stub::default(),
+        );
+        // what is neither a name, a network nor an `IP-ASN` line is walked
+        assert_eq!(set.linear.len(), 1);
+        assert_eq!(set.entry(set.linear[0].0), "DEST-PORT,1");
+        // the `IP-ASN` lines match all the same, each by its own number
+        let db = Asns::of(&[("192.0.2.1", 64500), ("192.0.2.2", 64501)]);
+        assert_eq!(
+            ask_with(&set, &db, "192.0.2.1", None, false),
+            matches_line("IP-ASN,64500")
+        );
+        assert_eq!(
+            ask_with(&set, &db, "192.0.2.2", None, false),
+            matches_line("IP-ASN,64501,no-resolve")
+        );
+    }
+
+    /// A number written twice, once as `AS64500`, is one number; the line
+    /// reported is the first that names it.
+    #[test]
+    fn a_number_named_twice_reports_the_first_of_the_two_lines() {
+        let set = compile(
+            SetKind::RuleSet,
+            "IP-ASN,64500\nIP-ASN,64501\nIP-ASN,AS64500,no-resolve\n",
+            &Stub::default(),
+        );
+        let db = Asns::of(&[("192.0.2.1", 64500), ("192.0.2.2", 64501)]);
+        assert_eq!(
+            ask_with(&set, &db, "192.0.2.1", None, false),
+            matches_line("IP-ASN,64500")
+        );
+        assert_eq!(
+            ask_with(&set, &db, "192.0.2.2", None, false),
+            matches_line("IP-ASN,64501")
+        );
+    }
+
+    /// The lines that are walked come before the `IP-ASN` lines, wherever
+    /// either stands in the file.
+    #[test]
+    fn a_walked_line_that_matches_is_reported_ahead_of_an_asn_line_that_also_matches() {
+        let db = Asns::of(&[("192.0.2.1", 64500)]);
+        for text in [
+            "IP-ASN,64500\nDEST-PORT,443\n",
+            "DEST-PORT,443\nIP-ASN,64500\n",
+        ] {
+            let set = compile(SetKind::RuleSet, text, &Stub::default());
+            assert_eq!(
+                ask_with(&set, &db, "192.0.2.1", None, false),
+                matches_line("DEST-PORT,443"),
+                "{text:?}"
+            );
+        }
     }
 
     /// A note after a name is not part of the name: the line matches the name
