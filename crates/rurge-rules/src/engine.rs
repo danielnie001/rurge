@@ -1181,6 +1181,76 @@ AND,((RULE-SET,Y),(OR,((DEST-PORT,1),(DEST-PORT,443)))),P\nFINAL,DIRECT\n\
         );
     }
 
+    /// Gives every address the same AS number.
+    struct AsnOfEverything(u32);
+    impl GeoLookup for AsnOfEverything {
+        fn country(&self, _: IpAddr) -> Option<[u8; 2]> {
+            None
+        }
+        fn asn(&self, _: IpAddr) -> Option<u32> {
+            Some(self.0)
+        }
+    }
+
+    fn engine_with_asn(text: &str, asn: u32) -> RuleEngine {
+        let cfg = load(text);
+        let sets = InlineSets::from_config(&cfg);
+        RuleEngine::build(&cfg, &sets, Arc::new(AsnOfEverything(asn))).unwrap()
+    }
+
+    /// A list of AS numbers written the usual way: the name is resolved once
+    /// for all its lines, and the line that names the number of the address
+    /// it resolved to is the hit.
+    #[tokio::test]
+    async fn a_rule_set_of_asn_lines_resolves_the_name_once_and_names_the_line() {
+        let e = engine_with_asn(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,Asns,P\nFINAL,DIRECT\n\
+[Ruleset Asns]\nIP-ASN,64500\nIP-ASN,64501\nIP-ASN,64502\n",
+            64501,
+        );
+        let r = Counting::v4("192.0.2.1");
+        let d = e
+            .evaluate(&session("host.example"), OutboundMode::Rule, &r)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::Rule, Some(0)));
+        assert_eq!(d.policy().map(named).as_deref(), Some("P"));
+        assert_eq!(r.calls.load(Ordering::SeqCst), 1);
+        let found = d.sub_rule.expect("the line that matched");
+        assert_eq!(
+            (found.set.as_str(), found.entry.as_str()),
+            ("Asns", "IP-ASN,64501")
+        );
+    }
+
+    /// With `no-resolve` on every line a name is no reason to resolve
+    /// anything, and an address needs no lookup to be judged.
+    #[tokio::test]
+    async fn a_rule_set_of_asn_lines_that_all_say_no_resolve_never_asks_for_a_lookup() {
+        let e = engine_with_asn(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,Asns,P\nFINAL,DIRECT\n\
+[Ruleset Asns]\nIP-ASN,64500,no-resolve\nIP-ASN,64501,no-resolve\n",
+            64501,
+        );
+        // the answer has a number a line names, so a lookup would show as a hit
+        let r = Counting::v4("192.0.2.1");
+        let d = e
+            .evaluate(&session("host.example"), OutboundMode::Rule, &r)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::Final, Some(1)));
+        assert_eq!(r.calls.load(Ordering::SeqCst), 0);
+        assert!(d.resolved.is_none());
+        assert!(d.sub_rule.is_none());
+        let d = e
+            .evaluate(&session("192.0.2.1"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::Rule, Some(0)));
+        let found = d.sub_rule.expect("the line that matched");
+        assert_eq!(
+            (found.set.as_str(), found.entry.as_str()),
+            ("Asns", "IP-ASN,64501,no-resolve")
+        );
+    }
+
     /// The set of an `AND` matches before the lookup its other half asks
     /// for, and again after it: the hit is the one of the evaluation that
     /// matched.

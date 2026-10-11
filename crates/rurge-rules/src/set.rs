@@ -254,13 +254,15 @@ impl SetMatch for SetHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matcher::{NoGeo, ResolvedAddrs, SetRef};
+    use crate::matcher::{GeoLookup, NoGeo, ResolvedAddrs, SetRef};
     use crate::set_format::parse_set;
     use rurge_config::HostName;
     use rurge_config::rule::{ParseCtx, ResourceRef};
     use std::collections::HashMap;
     use std::collections::HashSet;
+    use std::net::IpAddr;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Stub registry: file path → handle.
     #[derive(Default)]
@@ -413,10 +415,55 @@ DEST-PORT,8443
         resolved: Option<ResolvedAddrs>,
         no_resolve: bool,
     ) -> (Verdict, Option<String>) {
-        let mut ctx = EvalCtx::new(&NoGeo);
+        ask_with(set, &NoGeo, host, resolved, no_resolve)
+    }
+
+    /// `ask`, with a database to look the addresses up in.
+    fn ask_with(
+        set: &CompiledSet,
+        geo: &dyn GeoLookup,
+        host: &str,
+        resolved: Option<ResolvedAddrs>,
+        no_resolve: bool,
+    ) -> (Verdict, Option<String>) {
+        let mut ctx = EvalCtx::new(geo);
         ctx.resolved = resolved;
         let v = set.eval(&session(host), &mut ctx, no_resolve, false);
         (v.verdict, v.entry)
+    }
+
+    /// A database that knows the AS numbers it is given, nothing else, and
+    /// counts the questions it is asked.
+    struct Asns {
+        known: HashMap<IpAddr, u32>,
+        asked: AtomicUsize,
+    }
+
+    impl Asns {
+        fn of(known: &[(&str, u32)]) -> Asns {
+            Asns {
+                known: known
+                    .iter()
+                    .map(|(ip, asn)| (ip.parse().unwrap(), *asn))
+                    .collect(),
+                asked: AtomicUsize::new(0),
+            }
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.load(Ordering::SeqCst)
+        }
+    }
+
+    impl GeoLookup for Asns {
+        fn country(&self, _: IpAddr) -> Option<[u8; 2]> {
+            None
+        }
+
+        fn asn(&self, ip: IpAddr) -> Option<u32> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            self.known.get(&ip).copied()
+        }
     }
 
     fn addrs(v4: &[&str], v6: &[&str]) -> Option<ResolvedAddrs> {
@@ -620,6 +667,307 @@ DEST-PORT,8443
                 "{ip_line}"
             );
         }
+    }
+
+    /// A list of AS numbers with `no-resolve` on every line: a name nobody has
+    /// resolved is no reason to look anything up, and an address is judged by
+    /// the number the database gives it.
+    #[test]
+    fn a_set_of_no_resolve_asn_lines_never_asks_for_a_lookup() {
+        let set = compile(
+            SetKind::RuleSet,
+            "IP-ASN,64500,no-resolve\nIP-ASN,64501,no-resolve\n",
+            &Stub::default(),
+        );
+        assert!(!set.needs_dns);
+        let db = Asns::of(&[
+            ("192.0.2.1", 64501),
+            ("198.51.100.1", 64999),
+            ("2001:db8::1", 64500),
+        ]);
+        for no_resolve in [false, true] {
+            let why = format!("no_resolve = {no_resolve}");
+            assert_eq!(
+                ask_with(&set, &db, "other.org", None, no_resolve),
+                NO_MATCH,
+                "{why}"
+            );
+            // an address whose number a line names matches, whatever the rule said
+            assert_eq!(
+                ask_with(&set, &db, "192.0.2.1", None, no_resolve),
+                matches_line("IP-ASN,64501,no-resolve"),
+                "{why}"
+            );
+            assert_eq!(
+                ask_with(&set, &db, "[2001:db8::1]", None, no_resolve),
+                matches_line("IP-ASN,64500,no-resolve"),
+                "{why}"
+            );
+            // one whose number no line names does not, nor one the database does not know
+            for host in ["198.51.100.1", "203.0.113.9"] {
+                assert_eq!(
+                    ask_with(&set, &db, host, None, no_resolve),
+                    NO_MATCH,
+                    "{host}, {why}"
+                );
+            }
+            // a name an earlier rule resolved is judged by its address
+            assert_eq!(
+                ask_with(
+                    &set,
+                    &db,
+                    "other.org",
+                    addrs(&["192.0.2.1"], &[]),
+                    no_resolve
+                ),
+                matches_line("IP-ASN,64501,no-resolve"),
+                "{why}"
+            );
+            assert_eq!(
+                ask_with(
+                    &set,
+                    &db,
+                    "other.org",
+                    addrs(&["198.51.100.1"], &[]),
+                    no_resolve
+                ),
+                NO_MATCH,
+                "{why}"
+            );
+            assert_eq!(
+                ask_with(&set, &db, "other.org", addrs(&[], &[]), no_resolve),
+                NO_MATCH,
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_number_with_and_without_no_resolve_still_asks() {
+        let db = Asns::of(&[("192.0.2.1", 64500)]);
+        for (text, first) in [
+            (
+                "IP-ASN,64500,no-resolve\nIP-ASN,64500\n",
+                "IP-ASN,64500,no-resolve",
+            ),
+            ("IP-ASN,64500\nIP-ASN,64500,no-resolve\n", "IP-ASN,64500"),
+        ] {
+            let set = compile(SetKind::RuleSet, text, &Stub::default());
+            assert!(set.needs_dns, "{text:?}");
+            assert_eq!(
+                ask_with(&set, &db, "other.org", None, false),
+                ASKS,
+                "{text:?}"
+            );
+            assert_eq!(
+                ask_with(&set, &db, "other.org", None, true),
+                NO_MATCH,
+                "{text:?}"
+            );
+            // the number is named twice: the first of the two lines is reported
+            for no_resolve in [false, true] {
+                assert_eq!(
+                    ask_with(&set, &db, "192.0.2.1", None, no_resolve),
+                    matches_line(first),
+                    "{text:?}, no_resolve = {no_resolve}"
+                );
+            }
+        }
+    }
+
+    /// The address an `IP-ASN` line judges is the first IPv4 address of the
+    /// name, else the first IPv6 one.
+    #[test]
+    fn a_name_is_judged_by_its_first_ipv4_address_else_its_first_ipv6_one() {
+        let db = Asns::of(&[
+            ("192.0.2.1", 64500),
+            ("192.0.2.2", 64501),
+            ("2001:db8::1", 64502),
+            ("2001:db8::2", 64500),
+        ]);
+        let ask_name = |text: &str, resolved| {
+            let set = compile(SetKind::RuleSet, text, &Stub::default());
+            ask_with(&set, &db, "other.org", resolved, false)
+        };
+        // of a name with both, the IPv4 address decides: the line that names the
+        // number of the IPv6 address alone does not match
+        let both = addrs(&["192.0.2.1"], &["2001:db8::1"]);
+        assert_eq!(
+            ask_name("IP-ASN,64500\nIP-ASN,64502\n", both.clone()),
+            matches_line("IP-ASN,64500")
+        );
+        assert_eq!(ask_name("IP-ASN,64502\n", both), NO_MATCH);
+        // of several IPv4 addresses, the first
+        assert_eq!(
+            ask_name("IP-ASN,64501\n", addrs(&["192.0.2.1", "192.0.2.2"], &[])),
+            NO_MATCH
+        );
+        // with none, the first IPv6 one
+        let v6_only = addrs(&[], &["2001:db8::1", "2001:db8::2"]);
+        assert_eq!(
+            ask_name("IP-ASN,64500\nIP-ASN,64502\n", v6_only.clone()),
+            matches_line("IP-ASN,64502")
+        );
+        assert_eq!(ask_name("IP-ASN,64500\n", v6_only), NO_MATCH);
+    }
+
+    /// What the `IP-ASN` lines ask is their own: not `needs_dns`, which a
+    /// nested set sets without asking anything, and not what the IP lines ask.
+    #[test]
+    fn asn_lines_that_say_no_resolve_are_not_made_to_ask_by_a_nested_set() {
+        let db = Asns::of(&[("192.0.2.1", 64500)]);
+        let mut stub = Stub::default();
+        let inner = compile(SetKind::DomainSet, ".inner.com\n", &stub);
+        stub.0.insert("inner.txt".into(), SetHandle::new(inner));
+        let outer = compile(
+            SetKind::RuleSet,
+            "IP-ASN,64500,no-resolve\nDOMAIN-SET,inner.txt\n",
+            &stub,
+        );
+        assert!(outer.needs_dns);
+        assert_eq!(ask_with(&outer, &db, "other.org", None, false), NO_MATCH);
+        assert_eq!(
+            ask_with(&outer, &db, "192.0.2.1", None, false),
+            matches_line("IP-ASN,64500,no-resolve")
+        );
+    }
+
+    #[test]
+    fn asn_lines_and_ip_lines_each_make_the_set_ask_on_their_own_account() {
+        let db = Asns::of(&[]);
+        // an IP line that may ask, beside an `IP-ASN` line that says it never does
+        let ip_asks = compile(
+            SetKind::RuleSet,
+            "IP-ASN,64500,no-resolve\nIP-CIDR,10.0.0.0/8\n",
+            &Stub::default(),
+        );
+        assert!(ip_asks.needs_dns);
+        assert_eq!(ask_with(&ip_asks, &db, "other.org", None, false), ASKS);
+        assert_eq!(ask_with(&ip_asks, &db, "other.org", None, true), NO_MATCH);
+        // an `IP-ASN` line that may ask, beside an IP line that says it never does
+        let asn_asks = compile(
+            SetKind::RuleSet,
+            "IP-CIDR,10.0.0.0/8,no-resolve\nIP-ASN,64500\n",
+            &Stub::default(),
+        );
+        assert!(asn_asks.needs_dns);
+        assert_eq!(ask_with(&asn_asks, &db, "other.org", None, false), ASKS);
+        assert_eq!(ask_with(&asn_asks, &db, "other.org", None, true), NO_MATCH);
+    }
+
+    /// With no number to be had, no `IP-ASN` line matches (the number 0 is no
+    /// answer), and whether a name is worth resolving is still up to the lines.
+    #[test]
+    fn without_a_number_from_the_database_no_asn_line_matches() {
+        let knows_nothing = Asns::of(&[]);
+        let may_ask = compile(
+            SetKind::RuleSet,
+            "IP-ASN,0\nIP-ASN,64500\nIP-ASN,64501,no-resolve\n",
+            &Stub::default(),
+        );
+        let never_asks = compile(
+            SetKind::RuleSet,
+            "IP-ASN,0,no-resolve\nIP-ASN,64500,no-resolve\n",
+            &Stub::default(),
+        );
+        let no_database: [&dyn GeoLookup; 2] = [&NoGeo, &knows_nothing];
+        for db in no_database {
+            for no_resolve in [false, true] {
+                for set in [&may_ask, &never_asks] {
+                    for host in ["192.0.2.1", "[2001:db8::1]"] {
+                        assert_eq!(ask_with(set, db, host, None, no_resolve), NO_MATCH);
+                    }
+                    assert_eq!(
+                        ask_with(set, db, "other.org", addrs(&["192.0.2.1"], &[]), no_resolve),
+                        NO_MATCH
+                    );
+                }
+            }
+            assert_eq!(ask_with(&may_ask, db, "other.org", None, false), ASKS);
+            assert_eq!(ask_with(&may_ask, db, "other.org", None, true), NO_MATCH);
+            assert_eq!(
+                ask_with(&never_asks, db, "other.org", None, false),
+                NO_MATCH
+            );
+        }
+    }
+
+    /// The `IP-ASN` lines are looked at before the IP index, wherever either
+    /// stands in the file.
+    #[test]
+    fn an_asn_line_is_reported_ahead_of_an_ip_line_that_also_matches() {
+        let db = Asns::of(&[("10.1.1.1", 64500)]);
+        for (text, reported) in [
+            (
+                "IP-ASN,64500\nIP-CIDR,10.0.0.0/8,no-resolve\n",
+                "IP-ASN,64500",
+            ),
+            (
+                "IP-CIDR,10.0.0.0/8,no-resolve\nIP-ASN,64500\n",
+                "IP-ASN,64500",
+            ),
+            (
+                "IP-CIDR,10.0.0.0/8\nIP-ASN,64500,no-resolve\n",
+                "IP-ASN,64500,no-resolve",
+            ),
+        ] {
+            let set = compile(SetKind::RuleSet, text, &Stub::default());
+            assert_eq!(
+                ask_with(&set, &db, "10.1.1.1", None, false),
+                matches_line(reported),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// How many questions the database is asked while `set` judges `host`.
+    fn questions(
+        set: &CompiledSet,
+        host: &str,
+        resolved: Option<ResolvedAddrs>,
+        no_resolve: bool,
+    ) -> usize {
+        let db = Asns::of(&[("192.0.2.1", 64999)]);
+        ask_with(set, &db, host, resolved, no_resolve);
+        db.asked()
+    }
+
+    /// One question for an address, whatever the number of lines; none when
+    /// there is no address, or when a line walked before the `IP-ASN` lines
+    /// has already matched.
+    #[test]
+    fn the_database_is_asked_once_for_an_address_and_not_at_all_without_one() {
+        let lines = compile(
+            SetKind::RuleSet,
+            "IP-ASN,64500\nIP-ASN,64501,no-resolve\nIP-ASN,64502\n",
+            &Stub::default(),
+        );
+        assert_eq!(questions(&lines, "192.0.2.1", None, false), 1);
+        assert_eq!(
+            questions(&lines, "other.org", addrs(&["192.0.2.1"], &[]), false),
+            1
+        );
+        assert_eq!(
+            questions(&lines, "other.org", addrs(&[], &["2001:db8::1"]), true),
+            1
+        );
+        assert_eq!(questions(&lines, "other.org", None, false), 0);
+        assert_eq!(questions(&lines, "other.org", None, true), 0);
+        assert_eq!(questions(&lines, "other.org", addrs(&[], &[]), false), 0);
+        let walked_first = compile(
+            SetKind::RuleSet,
+            "DEST-PORT,443\nIP-ASN,64500\n",
+            &Stub::default(),
+        );
+        assert_eq!(questions(&walked_first, "192.0.2.1", None, false), 0);
+        // asked again in the same context, the answer is kept
+        let db = Asns::of(&[("192.0.2.1", 64500)]);
+        let mut ctx = EvalCtx::new(&db);
+        ctx.resolved = addrs(&["192.0.2.1"], &[]);
+        for _ in 0..3 {
+            lines.eval(&session("other.org"), &mut ctx, false, false);
+        }
+        assert_eq!(db.asked(), 1);
     }
 
     /// A note after a name is not part of the name: the line matches the name
