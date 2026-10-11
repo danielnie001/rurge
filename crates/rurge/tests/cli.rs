@@ -2297,6 +2297,39 @@ mod run {
         assert!(ok, "reload did not take effect");
     }
 
+    /// SIGHUP makes the daemon load its profile again: with no `--watch` and
+    /// no call to the API, a rule added to the file shows among the rules the
+    /// daemon serves.
+    #[cfg(unix)]
+    #[test]
+    fn sighup_reloads_the_profile() {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let daemon = spawn_daemon(&conf, &dir.path().join("data"));
+        let port = api_port(&daemon);
+        // The summary line comes after the daemon has taken SIGHUP over; one
+        // that arrived earlier would end the process.
+        wait_for_line(&daemon, "rurge ");
+        let rules = || api_call(port, "GET", "/v1/rules", "k", None).1;
+        assert!(!rules().contains("DOMAIN,added.test,REJECT"));
+        std::fs::write(
+            &conf,
+            format!(
+                "[General]\n{API_GENERAL}\n[Proxy]\n[Rule]\nDOMAIN,ads.test,REJECT\nDOMAIN,added.test,REJECT\nFINAL,DIRECT\n"
+            ),
+        )
+        .unwrap();
+        let pid = Pid::from_raw(i32::try_from(daemon.child.id()).expect("a process id"));
+        kill(pid, Signal::SIGHUP).expect("SIGHUP reaches the daemon");
+        wait_until(
+            "the rule added to the profile among the rules served",
+            || rules().contains("DOMAIN,added.test,REJECT"),
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn log_file_is_written() {
         let dir = tempfile::tempdir().unwrap();
@@ -2568,6 +2601,92 @@ mod run {
             !lines.iter().any(|l| l.contains("grace period elapsed")),
             "stop must not wait out the grace period: {lines:?}"
         );
+    }
+
+    /// rurge does not rewrite the profile, nor a file the profile includes: a
+    /// reload, a change of a group's selection (which `state.json` keeps) and
+    /// a stop leave both as they were. They are written the way nothing would
+    /// write them back (CRLF, comments, spaces around a value, no newline at
+    /// the end), so a rewrite could not leave them as they are.
+    #[test]
+    fn run_leaves_the_profile_and_the_files_it_includes_as_they_are() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("t.conf");
+        let included = dir.path().join("rules.dconf");
+        let profile = [
+            "# a profile as it was written",
+            "[General]",
+            "http-listen =  127.0.0.1:0",
+            "socks5-listen = 127.0.0.1:0 ",
+            "http-api = k@127.0.0.1:0",
+            "loglevel = warning",
+            "",
+            "[Proxy Group]",
+            "Pick = select, DIRECT, REJECT",
+            "",
+            "[Rule]",
+            "#!include rules.dconf",
+            "FINAL,Pick",
+        ]
+        .join("\r\n");
+        let rules = [
+            "[Rule]",
+            "// kept as written",
+            "DOMAIN,ads.test,REJECT  ",
+            "",
+            "DOMAIN-SUFFIX,tracker.test,REJECT",
+        ]
+        .join("\r\n");
+        std::fs::write(&conf, &profile).unwrap();
+        std::fs::write(&included, &rules).unwrap();
+        let as_written = |when: &str| {
+            assert_eq!(
+                std::fs::read_to_string(&conf).unwrap(),
+                profile,
+                "the profile was rewritten {when}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&included).unwrap(),
+                rules,
+                "the included file was rewritten {when}"
+            );
+        };
+        let data = dir.path().join("data");
+        let mut daemon = spawn_daemon(&conf, &data);
+        let port = api_port(&daemon);
+        // what the daemon runs on has the included file in it
+        let (_, served) = api_call(port, "GET", "/v1/rules", "k", None);
+        assert!(
+            served.contains("DOMAIN-SUFFIX,tracker.test,REJECT"),
+            "{served}"
+        );
+        as_written("by the start");
+        let (status, body) = api_call(port, "POST", "/v1/profiles/reload", "k", Some("{}"));
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"ok\":true"), "{body}");
+        as_written("by the reload");
+        let (status, body) = api_call(
+            port,
+            "POST",
+            "/v1/policy_groups/select",
+            "k",
+            Some(r#"{"group_name":"Pick","policy":"REJECT"}"#),
+        );
+        assert_eq!(status, 200, "{body}");
+        wait_until("state.json to hold the selection", || {
+            std::fs::read_to_string(data.join("state.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .is_some_and(|state| state["group_selections"]["t.conf"]["Pick"] == "REJECT")
+        });
+        as_written("by the selection");
+        assert_eq!(
+            api_call(port, "POST", "/v1/stop", "k", Some("{}")).0,
+            200,
+            "stop"
+        );
+        assert_eq!(wait_for_exit(&mut daemon, 10), Some(0), "stop exits 0");
+        as_written("by the stop");
     }
 
     /// `rurge run` starts an `external` policy's program on first use and

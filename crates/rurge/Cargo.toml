@@ -45,5 +45,9 @@ assert_cmd.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
 
+# SIGHUP to a running daemon (`tests/cli.rs`)
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true, features = ["signal"] }
+
 [lints]
 workspace = true

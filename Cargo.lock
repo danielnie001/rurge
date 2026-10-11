@@ -3207,6 +3207,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "nix",
  "notify",
  "predicates",
  "rurge-api",
