@@ -252,9 +252,10 @@ pub mod codes {
     /// A set reference inside a set file that names a resource already used
     /// as the other kind of set; it matches nothing.
     pub const W_SET_KIND_CONFLICT: &str = "W0032";
-    /// A downloaded text asks for something that would make this machine do a
-    /// thing the user did not write: it includes a local file, or defines an
-    /// `external` policy. The line is ignored or the policy is not started.
+    /// A downloaded text asks for something on this machine that the user did
+    /// not write: it includes a local file it may not, names a local file as
+    /// a set or as a group's `policy-path`, or defines an `external` policy.
+    /// The line or the parameter is ignored, or the policy is not started.
     pub const W_REMOTE_LOCAL_ACCESS: &str = "W0033";
     /// The downloaded copy of a managed profile is in effect and will not be
     /// updated: it carries no `#!MANAGED-CONFIG` line of its own, or the lines
@@ -276,8 +277,10 @@ pub mod codes {
     ///
     /// Where the places that emit a code want different fixes, the sentence
     /// says what they share or the code has none. `E0014` has none because
-    /// each of its four places carries a hint of its own, and `W0033` and
-    /// `W0034` because each of their two does. The other codes without one:
+    /// each of its four places carries a hint of its own, `W0033` because each
+    /// of its four places (an `#!include`, a set, a `policy-path`, an
+    /// `external` policy) carries one for each kind of text, and `W0034`
+    /// because each of its two does. The other codes without one:
     ///
     /// - `E0009`: no place emits it any more.
     /// - `E0017`: the message is the shape to write, a different one at each

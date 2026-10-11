@@ -6,6 +6,7 @@ use super::reader::{invalid_value, quotable, unknown_reference, written_as_name}
 use super::{NameKind, Secret};
 use crate::diagnostic::{Diagnostic, Severity, codes};
 use crate::policy::{Builtin, GroupKind, PolicyGroup, named, shown_members};
+use crate::reach::Reach;
 use crate::rule::Pattern;
 use crate::span::Span;
 use crate::value::{parse_bool, parse_key_value, split_list};
@@ -230,6 +231,17 @@ impl<'a> Reader<'a> {
             .push(Diagnostic::warning(code, message).at(self.group.span.clone()));
     }
 
+    /// `warn`, with a hint of the place's own where the code's default does
+    /// not fit it.
+    fn warn_with_hint(&mut self, code: &'static str, message: String, hint: &'static str) {
+        let message = format!("{}: {message}", named("policy group", &self.group.name));
+        self.diags.push(
+            Diagnostic::warning(code, message)
+                .with_hint(hint)
+                .at(self.group.span.clone()),
+        );
+    }
+
     /// `W0028` when `key` is written although this group type ignores it;
     /// the value is not read.
     fn not_applicable(&mut self, key: &'static str) {
@@ -266,10 +278,13 @@ impl<'a> Reader<'a> {
 }
 
 /// `lookup` says what a name refers to; `base_dir` is the main profile's
-/// directory, which a relative `policy-path` is resolved against.
+/// directory, which a relative `policy-path` is resolved against. `reach` is
+/// that of the text the group is defined in: a `policy-path` that is a local
+/// file is read only for a text that may name one.
 pub fn to_group_spec(
     group: &PolicyGroup,
     base_dir: &Path,
+    reach: Reach,
     lookup: &dyn Fn(&str) -> Option<NameKind>,
 ) -> GroupOutcome {
     let mut r = Reader {
@@ -302,7 +317,7 @@ pub fn to_group_spec(
         let default = group.params.get("default").map(str::to_string);
         (default.into_iter().collect(), ImportOpts::default(), None)
     } else {
-        let import = read_import(&mut r, base_dir, lookup);
+        let import = read_import(&mut r, base_dir, reach, lookup);
         let underlying_proxy = read_underlying(&mut r, lookup);
         (group.members.clone(), import, underlying_proxy)
     };
@@ -332,11 +347,12 @@ pub fn to_group_spec(
 fn read_import(
     r: &mut Reader<'_>,
     base_dir: &Path,
+    reach: Reach,
     lookup: &dyn Fn(&str) -> Option<NameKind>,
 ) -> ImportOpts {
     let mut import = ImportOpts::default();
     if let Some(value) = r.str("policy-path") {
-        import.policy_path = policy_path(r, value, base_dir);
+        import.policy_path = policy_path(r, value, base_dir, reach);
     }
     import.update_interval = r.number("update-interval", true, "a positive number of seconds");
     if let Some(value) = r.str("policy-regex-filter") {
@@ -394,7 +410,12 @@ fn read_import(
 
 /// A URL when the value has a scheme, else a file. The value is never
 /// echoed: a subscription URL usually carries a token (M3-D7).
-fn policy_path(r: &mut Reader<'_>, value: &str, base_dir: &Path) -> Option<PolicyPath> {
+fn policy_path(
+    r: &mut Reader<'_>,
+    value: &str,
+    base_dir: &Path,
+    reach: Reach,
+) -> Option<PolicyPath> {
     let value = value.trim();
     if value.is_empty() {
         r.error(
@@ -416,6 +437,16 @@ fn policy_path(r: &mut Reader<'_>, value: &str, base_dir: &Path) -> Option<Polic
                 None
             }
         };
+    }
+    // a downloaded text does not name a file of this machine; the group is
+    // kept, without the parameter
+    if let Some(refusal) = reach.policy_path_refusal() {
+        r.warn_with_hint(
+            codes::W_REMOTE_LOCAL_ACCESS,
+            refusal.message.to_string(),
+            refusal.hint,
+        );
+        return None;
     }
     let path = Path::new(value);
     Some(PolicyPath::File(if path.is_absolute() {
@@ -550,7 +581,7 @@ mod tests {
 
     fn outcome(def: &str) -> GroupOutcome {
         let group = parse_group("G", def, &span()).unwrap();
-        to_group_spec(&group, Path::new("/profiles"), &lookup)
+        to_group_spec(&group, Path::new("/profiles"), Reach::Anywhere, &lookup)
     }
 
     fn spec(def: &str) -> GroupSpec {
@@ -664,6 +695,68 @@ icon-url=https://example.com/i.png, category=Media",
             !debug.contains("t0k3n") && !debug.contains("hunter2"),
             "{debug}"
         );
+    }
+
+    /// A `policy-path` that is a local file is read only for a group defined
+    /// in text that may name one. For any other the parameter is ignored with
+    /// a warning that quotes no path, and the group stands, with the members
+    /// it names: that is no error. A URL is read for every text.
+    #[test]
+    fn a_policy_path_that_is_a_file_is_read_only_for_text_that_may_name_one() {
+        let group = |def: &str| parse_group("G", def, &span()).unwrap();
+        let by = |group: &PolicyGroup, reach| {
+            to_group_spec(group, Path::new("/profiles"), reach, &lookup)
+        };
+        let local = group("select, A, policy-path=S3CR3T-nodes.txt");
+        let o = by(&local, Reach::Anywhere);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert_eq!(
+            o.spec.unwrap().import.policy_path,
+            Some(PolicyPath::File(
+                Path::new("/profiles").join("S3CR3T-nodes.txt")
+            ))
+        );
+        for (reach, message, hint) in [
+            (
+                Reach::BelowProfile,
+                "policy group `G`: the downloaded copy of a managed profile (or a file it includes) cannot name a local file as `policy-path`; the parameter is ignored",
+                "give `policy-path` a URL instead",
+            ),
+            (
+                Reach::Nowhere,
+                "policy group `G`: a downloaded file cannot name a local file as `policy-path`; the parameter is ignored",
+                "define the group in the local profile to import policies from a local file",
+            ),
+        ] {
+            let o = by(&local, reach);
+            let found: Vec<(&str, &str, Option<&str>, Severity)> = o
+                .diagnostics
+                .iter()
+                .map(|d| (d.code, d.message.as_str(), d.hint, d.severity))
+                .collect();
+            assert_eq!(
+                found,
+                [(
+                    codes::W_REMOTE_LOCAL_ACCESS,
+                    message,
+                    Some(hint),
+                    Severity::Warning
+                )]
+            );
+            let spec = o.spec.expect("the group stands");
+            assert_eq!(
+                (spec.members.as_slice(), spec.import.policy_path),
+                (&["A".to_string()][..], None)
+            );
+            // a URL is no file
+            let remote = group("select, A, policy-path=https://sub.test/nodes");
+            let o = by(&remote, reach);
+            assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+            assert!(matches!(
+                o.spec.unwrap().import.policy_path,
+                Some(PolicyPath::Url(_))
+            ));
+        }
     }
 
     /// The value of a group's parameter is quoted by the rule a policy's
@@ -883,7 +976,7 @@ icon-url=https://example.com/i.png, category=Media",
         )
         .unwrap();
         assert_eq!(group.conditions.len(), 1);
-        let o = to_group_spec(&group, Path::new("/profiles"), &lookup);
+        let o = to_group_spec(&group, Path::new("/profiles"), Reach::Anywhere, &lookup);
         assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
         let s = o.spec.unwrap();
         assert_eq!(s.members, ["A"]);
@@ -934,7 +1027,7 @@ icon-url=https://example.com/i.png, category=Media",
             &span(),
         )
         .unwrap();
-        let o = to_group_spec(&group, Path::new("/profiles"), &lookup);
+        let o = to_group_spec(&group, Path::new("/profiles"), Reach::Anywhere, &lookup);
         let said: Vec<String> = o.diagnostics.into_iter().map(|d| d.message).collect();
         assert_eq!(said, ["policy group: unknown parameter `mystery` ignored"]);
     }

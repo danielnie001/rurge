@@ -3,6 +3,7 @@
 use crate::diagnostic::{ParseError, codes};
 use crate::glob::{Glob, GlobOptions};
 use crate::policy::{Builtin, SubnetExpr};
+use crate::reach::Reach;
 use crate::redact::url_without_credentials;
 use crate::span::Span;
 use crate::value::split_list;
@@ -17,6 +18,9 @@ pub const MAX_LOGICAL_DEPTH: usize = 10;
 pub struct ParseCtx<'a> {
     pub inline_rulesets: &'a HashSet<String>,
     pub base_dir: &'a Path,
+    /// What the text of the line may name on this machine: a set that is a
+    /// local file only if it may name any.
+    pub reach: Reach,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,15 +116,17 @@ impl ResourceRef {
         format!("{}{rest}", url_without_credentials(authority))
     }
 
-    pub fn parse(raw: &str, ctx: &ParseCtx) -> ResourceRef {
+    /// A `RULE-SET` value. An error (`W0033`) when it is a local file and the
+    /// text it is written in may not name one.
+    pub fn parse(raw: &str, ctx: &ParseCtx) -> Result<ResourceRef, ParseError> {
         let raw = raw.trim();
         match raw {
-            "SYSTEM" => return ResourceRef::Internal(InternalSet::System),
-            "LAN" => return ResourceRef::Internal(InternalSet::Lan),
+            "SYSTEM" => return Ok(ResourceRef::Internal(InternalSet::System)),
+            "LAN" => return Ok(ResourceRef::Internal(InternalSet::Lan)),
             _ => {}
         }
         if ctx.inline_rulesets.contains(raw) {
-            return ResourceRef::Inline(raw.to_string());
+            return Ok(ResourceRef::Inline(raw.to_string()));
         }
         let mut ci_matches: Vec<&String> = ctx
             .inline_rulesets
@@ -129,26 +135,34 @@ impl ResourceRef {
             .collect();
         ci_matches.sort();
         if let Some(name) = ci_matches.into_iter().next() {
-            return ResourceRef::Inline(name.clone());
+            return Ok(ResourceRef::Inline(name.clone()));
         }
         Self::parse_external(raw, ctx)
     }
 
     /// A `DOMAIN-SET` value: only URLs and files, never an inline `[Ruleset]`
     /// (the manual lets only `RULE-SET` reference inline sets) and never
-    /// `SYSTEM` / `LAN`.
-    pub fn parse_external(raw: &str, ctx: &ParseCtx) -> ResourceRef {
+    /// `SYSTEM` / `LAN`. An error (`W0033`) when it is a local file and the
+    /// text it is written in may not name one: the path is never turned into
+    /// a file reference, so nothing downstream can open it.
+    pub fn parse_external(raw: &str, ctx: &ParseCtx) -> Result<ResourceRef, ParseError> {
         let raw = raw.trim();
         let lower = raw.to_ascii_lowercase();
         if lower.starts_with("http://") || lower.starts_with("https://") {
-            return ResourceRef::Url(raw.to_string());
+            return Ok(ResourceRef::Url(raw.to_string()));
+        }
+        if let Some(refusal) = ctx.reach.set_refusal() {
+            return Err(
+                ParseError::new(codes::W_REMOTE_LOCAL_ACCESS, refusal.message)
+                    .with_hint(refusal.hint),
+            );
         }
         let path = Path::new(raw);
-        ResourceRef::File(if path.is_absolute() {
+        Ok(ResourceRef::File(if path.is_absolute() {
             path.to_path_buf()
         } else {
             ctx.base_dir.join(path)
-        })
+        }))
     }
 }
 
@@ -502,7 +516,7 @@ fn parse_kind(ty: &str, value: &str, ctx: &ParseCtx, depth: usize) -> Result<Rul
         "DOMAIN-WILDCARD" => {
             RuleKind::DomainWildcard(glob(value, true, true).map_err(|e| invalid(ty, value, &e))?)
         }
-        "DOMAIN-SET" => RuleKind::DomainSet(ResourceRef::parse_external(value, ctx)),
+        "DOMAIN-SET" => RuleKind::DomainSet(ResourceRef::parse_external(value, ctx)?),
         "IP-CIDR" => RuleKind::IpCidr(
             value
                 .parse::<Ipv4Net>()
@@ -614,7 +628,7 @@ fn parse_kind(ty: &str, value: &str, ctx: &ParseCtx, depth: usize) -> Result<Rul
             }
         }
         "SCRIPT" => RuleKind::Script(value.to_string()),
-        "RULE-SET" => RuleKind::RuleSet(ResourceRef::parse(value, ctx)),
+        "RULE-SET" => RuleKind::RuleSet(ResourceRef::parse(value, ctx)?),
         _ => {
             let told = quotable_type(ty).map_or(String::new(), |ty| format!(" `{ty}`"));
             return Err(ParseError::new(
@@ -828,6 +842,7 @@ mod tests {
         let ctx = ParseCtx {
             inline_rulesets: &inline,
             base_dir: Path::new("/profiles"),
+            reach: Reach::Anywhere,
         };
         parse_rule(raw, &ctx, &span)
     }
@@ -1041,6 +1056,7 @@ mod tests {
         let ctx = ParseCtx {
             inline_rulesets: inline,
             base_dir: Path::new("/profiles"),
+            reach: Reach::Anywhere,
         };
         parse_rule(raw, &ctx, &span)
     }
@@ -1213,6 +1229,7 @@ mod tests {
         let ctx = ParseCtx {
             inline_rulesets: &inline,
             base_dir: Path::new("/profiles"),
+            reach: Reach::Anywhere,
         };
         for (raw, shown) in [
             (
@@ -1317,6 +1334,7 @@ mod tests {
         let ctx = ParseCtx {
             inline_rulesets: &inline,
             base_dir: Path::new("/profiles"),
+            reach: Reach::Anywhere,
         };
         let said_sub = |raw: &str| parse_subrule(raw, &ctx).unwrap_err().message;
         assert_eq!(said_sub("DOMAIN-SUFFIX"), "DOMAIN-SUFFIX: missing value");
@@ -1331,12 +1349,62 @@ mod tests {
         assert_eq!(said_sub("a b,c"), "unknown rule type");
     }
 
+    /// A set that is a local file is named only by text that may name one. A
+    /// URL, a built-in set and an inline set are no local files, and are named
+    /// by any text. The refusal is a `W0033` with a suggestion, and the path
+    /// does not get as far as being a file reference.
+    #[test]
+    fn a_local_file_is_a_set_only_for_text_that_may_name_one() {
+        let inline = HashSet::from(["Streaming".to_string()]);
+        for (reach, may) in [
+            (Reach::Anywhere, true),
+            (Reach::BelowProfile, false),
+            (Reach::Nowhere, false),
+        ] {
+            let ctx = ParseCtx {
+                inline_rulesets: &inline,
+                base_dir: Path::new("/profiles"),
+                reach,
+            };
+            for raw in ["sets/a.list", "/abs/a.list", "../up.list", "C:\\a.list", ""] {
+                for parse in [ResourceRef::parse, ResourceRef::parse_external] {
+                    match parse(raw, &ctx) {
+                        Ok(ResourceRef::File(_)) => assert!(may, "{reach:?}: {raw}"),
+                        Err(e) => {
+                            assert!(!may, "{reach:?}: {raw}");
+                            assert_eq!(e.code, codes::W_REMOTE_LOCAL_ACCESS);
+                            assert!(e.hint.is_some());
+                            assert!(!e.message.contains(raw) || raw.is_empty());
+                        }
+                        other => panic!("{reach:?}: {raw}: {other:?}"),
+                    }
+                }
+            }
+            for raw in ["https://example.com/a.list", "HTTP://example.com/b"] {
+                assert!(
+                    matches!(ResourceRef::parse(raw, &ctx), Ok(ResourceRef::Url(_))),
+                    "{reach:?}: {raw}"
+                );
+            }
+            for raw in ["SYSTEM", "LAN", "Streaming"] {
+                assert!(
+                    !matches!(
+                        ResourceRef::parse(raw, &ctx),
+                        Ok(ResourceRef::File(_)) | Err(_)
+                    ),
+                    "{reach:?}: {raw}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn domain_set_never_resolves_to_inline_ruleset() {
         let names: HashSet<String> = ["Foo".to_string()].into_iter().collect();
         let ctx = ParseCtx {
             inline_rulesets: &names,
             base_dir: Path::new("/base"),
+            reach: Reach::Anywhere,
         };
         let r = parse_rule(
             "DOMAIN-SET,Foo,DIRECT",

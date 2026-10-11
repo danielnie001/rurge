@@ -1,6 +1,7 @@
 pub mod include;
 
 use crate::diagnostic::{Diagnostic, Diagnostics, codes};
+use crate::reach::Reach;
 use crate::requirement;
 use crate::span::Span;
 use crate::value::starts_with_ci;
@@ -16,8 +17,27 @@ pub enum Origin {
     Remote(Arc<Path>),
     /// A line of the downloaded copy of the managed profile, and the file that
     /// holds it. While the copy is in effect it is the profile itself, unlike
-    /// the text of a remote include, so it may include local files.
+    /// the text of a remote include, so it may include local files below the
+    /// profile's directory.
     Managed(Arc<Path>),
+    /// A line of a local file that the downloaded copy of the managed profile
+    /// takes in by `#!include`, directly or through other such files, and the
+    /// file. Being taken in gives a text no rights: it is read as the copy is.
+    ManagedInclude(Arc<Path>),
+}
+
+impl Origin {
+    /// What a line of this origin may make rurge do on this machine. The one
+    /// place that maps an origin to a reach: the variant decides, nothing else.
+    pub fn reach(&self) -> Reach {
+        match self {
+            Origin::Main | Origin::Include(_) => Reach::Anywhere,
+            Origin::Managed(_) | Origin::ManagedInclude(_) => Reach::BelowProfile,
+            // nothing loads modules yet; the answer that does no harm is the
+            // one for text of no known origin
+            Origin::Module(_) | Origin::Remote(_) => Reach::Nowhere,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -536,5 +556,24 @@ whatever = 1
         assert!(shown.contains("#!MANAGED_CONFIG***"), "{shown}");
         assert!(shown.contains("#!NOTE"), "{shown}");
         assert!(!format!("{p:?}").contains("S3CR3T"));
+    }
+
+    /// What a line may make rurge do on this machine follows from where its
+    /// text came from: the user's own text anything, the downloaded copy of a
+    /// managed profile and the local files it takes in the local files below
+    /// the profile's directory, any other downloaded text nothing.
+    #[test]
+    fn an_origin_decides_what_its_lines_may_do() {
+        let file: Arc<Path> = Arc::from(Path::new("f.conf"));
+        for (origin, reach) in [
+            (Origin::Main, Reach::Anywhere),
+            (Origin::Include(file.clone()), Reach::Anywhere),
+            (Origin::Managed(file.clone()), Reach::BelowProfile),
+            (Origin::ManagedInclude(file.clone()), Reach::BelowProfile),
+            (Origin::Remote(file), Reach::Nowhere),
+            (Origin::Module("m".to_string()), Reach::Nowhere),
+        ] {
+            assert_eq!(origin.reach(), reach, "{origin:?}");
+        }
     }
 }

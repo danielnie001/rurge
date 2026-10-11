@@ -13,6 +13,7 @@
 //! `nothing_is_built_is_the_baseline` is the same process with no set in it.
 
 use rurge_config::HostName;
+use rurge_config::Reach;
 use rurge_config::rule::{ParseCtx, ResourceRef};
 use rurge_config::session::SessionInfo;
 use rurge_rules::matcher::{EvalCtx, NoGeo, SetLookup, SetRef, Verdict};
@@ -114,6 +115,7 @@ fn build_and_ask(subject: &Subject) {
     let ctx = ParseCtx {
         inline_rulesets: &inline,
         base_dir: Path::new("."),
+        reach: Reach::Anywhere,
     };
     let parsed = parse_set(subject.kind, &text, &ctx);
     assert_eq!(

@@ -509,6 +509,7 @@ mod tests {
     use crate::matcher::{NoGeo, SetRef};
     use crate::set::{CompiledSet, SetHandle};
     use crate::set_format::{ParsedSet, SetKind, SetLine, internal_set_text, parse_set};
+    use rurge_config::Reach;
     use rurge_config::config::{LoadOptions, from_text};
     use rurge_config::rule::{ParseCtx, ResourceRef};
     use std::collections::{HashMap, HashSet};
@@ -564,6 +565,7 @@ mod tests {
                     let ctx = ParseCtx {
                         inline_rulesets: &names,
                         base_dir: Path::new("."),
+                        reach: Reach::Anywhere,
                     };
                     let parsed = parse_set(SetKind::RuleSet, internal_set_text(*i), &ctx);
                     Arc::new(SetHandle::new(CompiledSet::compile(

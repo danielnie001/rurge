@@ -5,15 +5,21 @@
 use super::{Entry, Origin, Profile, Section, parse_str};
 use crate::diagnostic::{Diagnostic, Diagnostics, codes};
 use crate::managed::parse_managed;
+use crate::reach::Reach;
 use crate::remote::{DEFAULT_INTERVAL, Remote, RemoteRef, RemoteRole, RemoteSource};
 use crate::span::Span;
 use crate::value::{split_list, starts_with_ci};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
+
+/// The most a local file that the downloaded copy of a managed profile takes
+/// in may hold: what rurge downloads for one resource at most.
+const MOST_A_COPY_TAKES_IN: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct IncludeOptions {
@@ -129,18 +135,58 @@ pub fn expand(
     if let Some(main) = &profile.main {
         run.stack.push(Visiting::File(canonical(main)));
     }
-    run.expand(profile, 0, false);
+    run.expand(profile, 0);
     run.remotes.refs
 }
 
 fn canonical(p: &Path) -> PathBuf {
+    #[cfg(test)]
+    tests::looked_at(p);
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// The text of the file at `path`, which has to be an ordinary file of at most
+/// `bound` bytes. A path below the profile's directory can name a device or a
+/// FIFO, and opening one would read for ever or wait for a writer, so the
+/// kind of the file is asked before it is opened. What is read is bounded
+/// whatever the length of the file is said to be: a file can report none and
+/// still give data.
+fn read_ordinary_file(path: &Path, bound: u64) -> io::Result<String> {
+    if !fs::metadata(path)?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(bound.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > bound {
+        return Err(io::Error::other(format!(
+            "larger than {}",
+            size_text(bound)
+        )));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })
+}
+
+/// A size as a message says it: in MiB when it is a whole number of them.
+fn size_text(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes % MIB == 0 {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 impl Expansion<'_> {
-    /// `downloaded` is whether `profile` is a text that was downloaded: it
-    /// cannot include a local file.
-    fn expand(&mut self, profile: &mut Profile, depth: usize, downloaded: bool) {
+    /// What an `#!include` line may take in is up to the text the line is
+    /// written in: the reach of its origin.
+    fn expand(&mut self, profile: &mut Profile, depth: usize) {
         let mut appended: Vec<Section> = Vec::new();
         let mut remove_wildcards: Vec<usize> = Vec::new();
 
@@ -152,8 +198,9 @@ impl Expansion<'_> {
                     new_entries.push(entry);
                     continue;
                 };
+                let reach = entry.origin.reach();
                 for target in split_list(rest) {
-                    let Some(mut included) = self.take_in(&target, &entry.span, depth, downloaded)
+                    let Some(mut included) = self.take_in(&target, &entry.span, depth, reach)
                     else {
                         continue;
                     };
@@ -199,30 +246,30 @@ impl Expansion<'_> {
         profile.sections.extend(appended);
     }
 
-    /// The text `target` names, expanded in turn. `None` when there is nothing
+    /// The text `target` names, expanded in turn, when the line it is written
+    /// in (of the given `reach`) may take it in. `None` when there is nothing
     /// to take in; a diagnostic says why.
     fn take_in(
         &mut self,
         target: &str,
         span: &Span,
         depth: usize,
-        downloaded: bool,
+        reach: Reach,
     ) -> Option<Included> {
         if is_url(target) {
-            self.take_in_remote(target, span, depth)
-        } else if downloaded {
-            self.diags.push(
-                Diagnostic::warning(
-                    codes::W_REMOTE_LOCAL_ACCESS,
-                    "a downloaded file cannot include a local file; the line is ignored",
-                )
-                .with_hint("include the local file from the local profile instead")
-                .at(span.clone()),
-            );
-            None
-        } else {
-            self.take_in_local(target, span, depth)
+            return self.take_in_remote(target, span, depth);
         }
+        // the first thing done with a path: nothing of this machine is
+        // joined, resolved, opened or looked at for one the text may not name
+        if let Some(refusal) = reach.include_refusal(target) {
+            self.diags.push(
+                Diagnostic::warning(codes::W_REMOTE_LOCAL_ACCESS, refusal.message)
+                    .with_hint(refusal.hint)
+                    .at(span.clone()),
+            );
+            return None;
+        }
+        self.take_in_local(target, span, depth, reach == Reach::BelowProfile)
     }
 
     /// Whether the include may go on: it does not lead back to where it is
@@ -274,7 +321,17 @@ impl Expansion<'_> {
         true
     }
 
-    fn take_in_local(&mut self, target: &str, span: &Span, depth: usize) -> Option<Included> {
+    /// A local file. `managed` is whether the line that includes it is of the
+    /// downloaded copy of a managed profile or of a file it took in: the file
+    /// must then be an ordinary one of bounded size, and its lines are read
+    /// as the copy's are and not as the user's own.
+    fn take_in_local(
+        &mut self,
+        target: &str,
+        span: &Span,
+        depth: usize,
+        managed: bool,
+    ) -> Option<Included> {
         let path = if Path::new(target).is_absolute() {
             PathBuf::from(target)
         } else {
@@ -284,7 +341,12 @@ impl Expansion<'_> {
         if !self.admit(&key, &path.display().to_string(), span, depth) {
             return None;
         }
-        let text = match fs::read_to_string(&path) {
+        let read = if managed {
+            read_ordinary_file(&path, MOST_A_COPY_TAKES_IN)
+        } else {
+            fs::read_to_string(&path)
+        };
+        let text = match read {
             Ok(t) => t,
             Err(e) => {
                 self.diags.push(
@@ -298,11 +360,15 @@ impl Expansion<'_> {
             }
         };
         let file: Arc<Path> = Arc::from(path.as_path());
-        let (mut profile, sub_diags) =
-            parse_str(&text, file.clone(), Origin::Include(file.clone()));
+        let origin = if managed {
+            Origin::ManagedInclude(file.clone())
+        } else {
+            Origin::Include(file.clone())
+        };
+        let (mut profile, sub_diags) = parse_str(&text, file.clone(), origin);
         self.diags.extend(sub_diags);
         self.stack.push(key);
-        self.expand(&mut profile, depth + 1, false);
+        self.expand(&mut profile, depth + 1);
         self.stack.pop();
         Some(Included {
             profile,
@@ -368,7 +434,7 @@ impl Expansion<'_> {
             .map_or(DEFAULT_INTERVAL, |managed| managed.interval);
         let at = self.remotes.track(&url, Some(path.clone()), interval);
         self.stack.push(key);
-        self.expand(&mut profile, depth + 1, true);
+        self.expand(&mut profile, depth + 1);
         self.stack.pop();
         Some(Included {
             profile,
@@ -384,8 +450,25 @@ mod tests {
     use crate::remote::fake::Fake;
     use crate::remote::{RemoteRef, RemoteRole, RemoteSource};
     use crate::text::{Origin, parse_str};
+    use std::cell::RefCell;
     use std::fs;
     use std::sync::Arc;
+
+    thread_local! {
+        /// The paths the expansion of this thread asked the file system to
+        /// resolve.
+        static LOOKED_AT: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Notes that the expansion asked the file system about `p`.
+    pub(super) fn looked_at(p: &Path) {
+        LOOKED_AT.with(|log| log.borrow_mut().push(p.to_path_buf()));
+    }
+
+    /// The paths asked about since the last call.
+    fn take_looked_at() -> Vec<PathBuf> {
+        LOOKED_AT.with(|log| std::mem::take(&mut *log.borrow_mut()))
+    }
 
     fn load(dir: &std::path::Path, main: &str) -> (Profile, Diagnostics) {
         let path = dir.join(main);
@@ -900,6 +983,174 @@ FINAL,DIRECT
         assert_eq!(
             raws(&p, "Rule"),
             ["DOMAIN,remote.example,DIRECT", "FINAL,DIRECT"]
+        );
+        // and no path was resolved on its account: the main file is the only
+        // one the expansion looked at
+        assert_eq!(take_looked_at(), [dir.path().join("main.conf")]);
+    }
+
+    /// Expands `text` as the downloaded copy of a managed profile, the way
+    /// the loader does: its lines are `Origin::Managed`, and the local file
+    /// (here `main.conf` in `dir`) is the profile whose directory the
+    /// relative paths start from.
+    fn expand_copy(dir: &Path, text: &str) -> (Profile, Diagnostics) {
+        let main: Arc<Path> = Arc::from(dir.join("main.conf").as_path());
+        let cached: Arc<Path> = Arc::from(Path::new("/cache/1.conf"));
+        let (mut p, mut d) = parse_str(text, cached.clone(), Origin::Managed(cached));
+        p.main = Some(main);
+        expand(
+            &mut p,
+            &IncludeOptions {
+                base_dir: dir.to_path_buf(),
+                max_depth: 8,
+                max_files: 200,
+            },
+            None,
+            &mut d,
+        );
+        (p, d)
+    }
+
+    /// The copy of a managed profile takes in a local file below the
+    /// profile's directory, and the lines of that file are read as the copy's
+    /// own are, whatever they include in turn: being included gives no
+    /// rights.
+    #[test]
+    fn what_a_copy_takes_in_is_read_as_the_copy_is() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("sets")).unwrap();
+        fs::write(
+            dir.path().join("sets").join("one.dconf"),
+            "[Rule]\nDOMAIN,one.example,DIRECT\n#!include ../two.dconf\n#!include two.dconf\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("two.dconf"),
+            "[Rule]\nDOMAIN,two.example,DIRECT\n",
+        )
+        .unwrap();
+        let (p, d) = expand_copy(
+            dir.path(),
+            "[Rule]\n#!include sets/one.dconf\n#!include sets/one.dconf\nFINAL,DIRECT\n",
+        );
+        // the include by `..` is refused, as the copy's own would be; the one
+        // by a plain path is taken in. The file is taken in twice, which is
+        // no cycle.
+        let told: Vec<(&str, u32)> = d
+            .iter()
+            .map(|x| (x.code, x.span.as_ref().unwrap().line))
+            .collect();
+        assert_eq!(
+            told,
+            [
+                (codes::W_REMOTE_LOCAL_ACCESS, 3),
+                (codes::W_REMOTE_LOCAL_ACCESS, 3)
+            ]
+        );
+        let one = Arc::<Path>::from(dir.path().join("sets/one.dconf").as_path());
+        let two = Arc::<Path>::from(dir.path().join("two.dconf").as_path());
+        let origins: Vec<(&str, Origin)> = p
+            .section("Rule")
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| (e.raw.as_str(), e.origin.clone()))
+            .collect();
+        assert_eq!(
+            origins,
+            [
+                (
+                    "DOMAIN,one.example,DIRECT",
+                    Origin::ManagedInclude(one.clone())
+                ),
+                (
+                    "DOMAIN,two.example,DIRECT",
+                    Origin::ManagedInclude(two.clone())
+                ),
+                ("DOMAIN,one.example,DIRECT", Origin::ManagedInclude(one)),
+                ("DOMAIN,two.example,DIRECT", Origin::ManagedInclude(two)),
+                (
+                    "FINAL,DIRECT",
+                    Origin::Managed(Arc::from(Path::new("/cache/1.conf")))
+                ),
+            ]
+        );
+    }
+
+    /// The copy of a managed profile includes a plain relative path or its
+    /// line is ignored, with the words of the copy: the path is not joined,
+    /// resolved or read. The file system is asked about the main file and
+    /// nothing else.
+    #[test]
+    fn a_copy_includes_nothing_but_a_plain_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let absolute = dir.path().join("absent.dconf");
+        let (p, d) = expand_copy(
+            dir.path(),
+            &format!(
+                "[Rule]\n#!include {}\n#!include ../up.dconf\n#!include C:\\x.dconf\n#!include \\\\host\\share\\x.dconf\n#!include nul\nFINAL,DIRECT\n",
+                absolute.display()
+            ),
+        );
+        let told: Vec<(&str, &str, Option<&str>, u32)> = d
+            .iter()
+            .map(|x| {
+                (
+                    x.code,
+                    x.message.as_str(),
+                    x.hint,
+                    x.span.as_ref().unwrap().line,
+                )
+            })
+            .collect();
+        let refused = |line| {
+            (
+                codes::W_REMOTE_LOCAL_ACCESS,
+                "the downloaded copy of a managed profile (or a file it includes) can include a local file only by a relative path below the profile's directory; the line is ignored",
+                Some("name the file by a relative path without a drive, a leading slash or `..`"),
+                line,
+            )
+        };
+        assert_eq!(told, (2..=6).map(refused).collect::<Vec<_>>());
+        assert_eq!(raws(&p, "Rule"), ["FINAL,DIRECT"]);
+        assert_eq!(take_looked_at(), [dir.path().join("main.conf")]);
+
+        // a plain path is looked for, and here it is not there
+        let (_, d) = expand_copy(dir.path(), "[Rule]\n#!include a.dconf, ./b.dconf\n");
+        let told: Vec<(&str, u32)> = d
+            .iter()
+            .map(|x| (x.code, x.span.as_ref().unwrap().line))
+            .collect();
+        assert_eq!(
+            told,
+            [
+                (codes::E_INCLUDE_NOT_FOUND, 2),
+                (codes::E_INCLUDE_NOT_FOUND, 2)
+            ]
+        );
+    }
+
+    /// An ordinary file is read up to the bound and no further, and anything
+    /// else is none: a directory, or what is not there.
+    #[test]
+    fn an_ordinary_file_is_read_up_to_the_bound_and_no_further() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.dconf");
+        fs::write(&file, "0123456789").unwrap();
+        assert_eq!(read_ordinary_file(&file, 10).unwrap(), "0123456789");
+        let too_long = read_ordinary_file(&file, 9).unwrap_err();
+        assert_eq!(too_long.to_string(), "larger than 9 bytes");
+        // the bound the loader uses is said in MiB
+        assert_eq!(size_text(MOST_A_COPY_TAKES_IN), "64 MiB");
+        let not_a_file = read_ordinary_file(dir.path(), 10).unwrap_err();
+        assert_eq!(not_a_file.to_string(), "not a regular file");
+        let missing = read_ordinary_file(&dir.path().join("absent"), 10).unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        // and text is text, as it is for a file the user included
+        fs::write(&file, [0xff, 0xfe]).unwrap();
+        assert_eq!(
+            read_ordinary_file(&file, 10).unwrap_err().to_string(),
+            fs::read_to_string(&file).unwrap_err().to_string()
         );
     }
 

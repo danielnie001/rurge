@@ -1193,3 +1193,121 @@ fn a_managed_profile_shows_nothing_of_its_link_or_its_copy() {
         assert_eq!(found, Vec::<String>::new(), "{what}");
     }
 }
+
+/// A downloaded text that names local files — to include, as a set, as a
+/// `policy-path`, and a program to start — is not obeyed, and says so without
+/// the paths: what a text names on this machine is the text's, and a path
+/// that comes back in a diagnostic or a `Debug` tells whoever reads them what
+/// the text's author wanted to find out. The paths below carry the marker.
+#[test]
+fn a_downloaded_text_that_names_local_files_shows_none_of_the_paths() {
+    // the lines of such a text, whichever section it is read for
+    let lines = format!(
+        "[Proxy]
+Ext = external, exec=/bin/true, local-port=1090
+#!include /{MARKER}-included.dconf
+#!include ../{MARKER}-up.dconf
+#!include C:\\{MARKER}-drive.dconf
+[Proxy Group]
+G = select, Ext, policy-path={MARKER}-nodes.txt
+H = select, Ext, policy-path=/{MARKER}-absolute-nodes.txt
+[Host]
+DOMAIN-SET:{MARKER}-hosts.list = 10.0.0.1
+RULE-SET:/{MARKER}-absolute-hosts.list = 10.0.0.2
+[Ruleset Inline]
+RULE-SET,{MARKER}-nested.list
+[Rule]
+RULE-SET,sets/{MARKER}-a.list,DIRECT
+DOMAIN-SET,../{MARKER}-b.list,DIRECT
+AND,((RULE-SET,{MARKER}-c.list),(DEST-PORT,443)),DIRECT
+NOT,((DOMAIN-SET,/{MARKER}-d.list)),DIRECT
+"
+    );
+    // a profile that takes `link` in under every section the text has, and
+    // has the lines `own` of its own
+    let sections = ["Proxy", "Proxy Group", "Host", "Ruleset Inline", "Rule"];
+    let including = |link: &str, own: &str| {
+        let mut profile = String::new();
+        for section in sections {
+            profile += &format!("[{section}]\n#!include {link}\n");
+        }
+        profile + own + "FINAL,DIRECT\n"
+    };
+    // the loader asks for a link without its fragment, which no server sees
+    let key = |link: &str| {
+        let mut url = Url::parse(link).unwrap();
+        url.set_fragment(None);
+        url.to_string()
+    };
+    let mut loads = Vec::new();
+
+    // the text of a remote include
+    let link = format!("https://sub.example/names-files/{MARKER}-link?token={MARKER}-linktoken");
+    let profile = including(&link, "");
+    let mut opts = LoadOptions::for_tests();
+    opts.remote = Some(Arc::new(Downloaded(HashMap::from([(
+        key(&link),
+        downloaded(lines.clone(), 1),
+    )]))));
+    loads.push((
+        "a remote include",
+        from_text(&profile, Path::new("t.conf"), &opts),
+        profile,
+        // the three includes of the text, once for each of the five sections
+        // it is taken in under, and nine more lines
+        24,
+    ));
+
+    // the copy of a managed profile in effect: a line of its own that names a
+    // file, and a file it includes by a plain relative path that names more
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("inc.dconf"), &lines).unwrap();
+    let managed =
+        format!("https://sub.example/managed/{MARKER}-managed?token={MARKER}-managedtoken");
+    let copy = format!(
+        "#!MANAGED-CONFIG {managed} interval=3600\n{}",
+        including("inc.dconf", &format!("RULE-SET,{MARKER}-own.list,DIRECT\n"))
+    );
+    let main = dir.path().join("main.conf");
+    let local = format!("#!MANAGED-CONFIG {managed} interval=3600\n[Rule]\nFINAL,DIRECT\n");
+    std::fs::write(&main, &local).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&main)
+        .unwrap()
+        .set_modified(SystemTime::UNIX_EPOCH)
+        .unwrap();
+    let mut opts = LoadOptions::for_tests();
+    opts.remote = Some(Arc::new(Downloaded(HashMap::from([(
+        key(&managed),
+        copy_at(copy, 1, SystemTime::UNIX_EPOCH + Duration::from_secs(1_000)),
+    )]))));
+    loads.push((
+        "a managed copy",
+        load_file(&main, &opts).unwrap(),
+        local,
+        // the same, and the copy's own line
+        25,
+    ));
+
+    for (what, loaded, profile, refusals) in loads {
+        // the text was read, and refused what it asked for, or the checks
+        // below would find nothing to find
+        let refused = loaded.diagnostics.iter().filter(|d| d.code == "W0033");
+        assert_eq!(
+            refused.count(),
+            refusals,
+            "{what}: {:#?}",
+            loaded.diagnostics
+        );
+        assert!(loaded.config.spec("Ext").is_none(), "{what}");
+        let mut found = leaks(&format!("{loaded:#?}"));
+        for d in loaded.diagnostics.iter() {
+            found.extend(leaks(&d.to_string()));
+            found.extend(leaks(&format!("{d:?}")));
+        }
+        found.extend(leaks(&format!("{:?}", loaded.config.summary())));
+        found.extend(leaks(&redact_profile(&profile)));
+        assert_eq!(found, Vec::<String>::new(), "{what}");
+    }
+}

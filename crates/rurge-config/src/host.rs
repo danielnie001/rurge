@@ -108,9 +108,9 @@ pub fn parse_host_entry(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<HostEn
         ));
     }
     let host_key = if let Some(r) = strip_prefix_ci(key, "DOMAIN-SET:") {
-        HostKey::DomainSet(ResourceRef::parse_external(r, ctx))
+        HostKey::DomainSet(ResourceRef::parse_external(r, ctx)?)
     } else if let Some(r) = strip_prefix_ci(key, "RULE-SET:") {
-        HostKey::RuleSet(ResourceRef::parse(r, ctx))
+        HostKey::RuleSet(ResourceRef::parse(r, ctx)?)
     } else {
         HostKey::Pattern(
             Glob::new(
@@ -186,6 +186,7 @@ pub fn parse_host_entry(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<HostEn
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reach::Reach;
     use crate::rule::ParseCtx;
     use std::collections::HashSet;
     use std::path::Path;
@@ -196,6 +197,7 @@ mod tests {
         let ctx = ParseCtx {
             inline_rulesets: &inline,
             base_dir: Path::new("/p"),
+            reach: Reach::Anywhere,
         };
         parse_host_entry(raw, &ctx, &Span::new(Arc::from(Path::new("h.conf")), 1))
     }

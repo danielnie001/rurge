@@ -298,6 +298,7 @@ mod tests {
     use crate::matcher::{GeoLookup, NoGeo, ResolvedAddrs, SetRef};
     use crate::set_format::parse_set;
     use rurge_config::HostName;
+    use rurge_config::Reach;
     use rurge_config::rule::{ParseCtx, ResourceRef};
     use std::collections::HashMap;
     use std::collections::HashSet;
@@ -328,6 +329,7 @@ mod tests {
         let ctx = ParseCtx {
             inline_rulesets: &names,
             base_dir: Path::new("."),
+            reach: Reach::Anywhere,
         };
         let parsed = parse_set(kind, text, &ctx);
         CompiledSet::compile("t", kind, &parsed, stub, 1)
@@ -1079,6 +1081,7 @@ DEST-PORT,8443
         let ctx = ParseCtx {
             inline_rulesets: &names,
             base_dir: Path::new("."),
+            reach: Reach::Anywhere,
         };
         let text = "DOMAIN-SUFFIX,example.com // note\n";
         let parsed = parse_set(SetKind::RuleSet, text, &ctx);

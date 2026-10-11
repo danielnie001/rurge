@@ -53,6 +53,7 @@ pub use ws::WsOpts;
 use crate::diagnostic::{Diagnostic, codes};
 use crate::keystore::KeystoreItem;
 use crate::policy::{Builtin, PolicyKind, ProxyPolicy};
+use crate::reach::Reach;
 use crate::span::Span;
 use crate::types::HostName;
 use crate::wireguard::WireGuardSection;
@@ -197,9 +198,23 @@ pub enum NotImplemented {
     /// An `external` policy written in downloaded text: it would start a
     /// program on this machine that nobody here wrote, so it is not started.
     DownloadedExternal,
+    /// The same in the downloaded copy of a managed profile, or in a local
+    /// file the copy takes in: a file below the profile's directory is not
+    /// always one the user wrote (rurge's own downloads can lie there).
+    ManagedExternal,
 }
 
 impl NotImplemented {
+    /// What an `external` policy defined in text of this `reach` is, if it is
+    /// not started: the one place that says which texts start a program.
+    pub fn external_in(reach: Reach) -> Option<NotImplemented> {
+        match reach {
+            Reach::Anywhere => None,
+            Reach::BelowProfile => Some(NotImplemented::ManagedExternal),
+            Reach::Nowhere => Some(NotImplemented::DownloadedExternal),
+        }
+    }
+
     /// The text of the load warning.
     pub fn warning(&self) -> String {
         match self {
@@ -211,6 +226,7 @@ impl NotImplemented {
                 "`snell` version {n} is not supported: it is a beta protocol without a public specification; such policies behave as REJECT"
             ),
             NotImplemented::DownloadedExternal => "`external` policies written in downloaded text are not started; they behave as REJECT".to_string(),
+            NotImplemented::ManagedExternal => "`external` policies in the downloaded copy of a managed profile (or in a file it includes) are not started; they behave as REJECT".to_string(),
         }
     }
 
@@ -221,6 +237,11 @@ impl NotImplemented {
             NotImplemented::DownloadedExternal => {
                 Diagnostic::warning(codes::W_REMOTE_LOCAL_ACCESS, self.warning())
                     .with_hint("define the policy in the local profile to use it")
+            }
+            NotImplemented::ManagedExternal => {
+                Diagnostic::warning(codes::W_REMOTE_LOCAL_ACCESS, self.warning()).with_hint(
+                    "to use an `external` policy, load a profile without `#!MANAGED-CONFIG` that takes the downloaded parts in by `#!include`",
+                )
             }
             NotImplemented::SsCipher(_) | NotImplemented::SnellVersion(_) => {
                 Diagnostic::warning(codes::W_PROTOCOL_NOT_IMPLEMENTED, self.warning())
@@ -234,6 +255,7 @@ impl NotImplemented {
             NotImplemented::SsCipher(method) => format!("ss ({method})"),
             NotImplemented::SnellVersion(n) => format!("snell v{n}"),
             NotImplemented::DownloadedExternal => "external (downloaded text)".to_string(),
+            NotImplemented::ManagedExternal => "external (managed profile)".to_string(),
         }
     }
 
@@ -243,6 +265,7 @@ impl NotImplemented {
             NotImplemented::SsCipher(method) => format!("`ss` with the cipher `{method}`"),
             NotImplemented::SnellVersion(n) => format!("`snell` version {n}"),
             NotImplemented::DownloadedExternal => "`external` in downloaded text".to_string(),
+            NotImplemented::ManagedExternal => "`external` in a managed profile".to_string(),
         }
     }
 }
@@ -1467,6 +1490,39 @@ mod tests {
             );
             assert_eq!(d.hint, None);
         }
+    }
+
+    /// The copy of a managed profile and the local files it takes in are
+    /// downloaded text of the other kind: the same refusal, in words of its
+    /// own, and the way to get a program started is another one. Which text
+    /// gets which is `external_in`'s to say.
+    #[test]
+    fn a_managed_external_has_the_words_of_the_copy_of_a_managed_profile() {
+        let why = NotImplemented::ManagedExternal;
+        assert_eq!(
+            why.warning(),
+            "`external` policies in the downloaded copy of a managed profile (or in a file it includes) are not started; they behave as REJECT"
+        );
+        assert_eq!(why.note(), "external (managed profile)");
+        assert_eq!(why.imported(), "`external` in a managed profile");
+        let d = why.diagnostic();
+        assert_eq!(d.code, codes::W_REMOTE_LOCAL_ACCESS);
+        assert_eq!(d.message, why.warning());
+        assert_eq!(
+            d.hint,
+            Some(
+                "to use an `external` policy, load a profile without `#!MANAGED-CONFIG` that takes the downloaded parts in by `#!include`"
+            )
+        );
+        assert_eq!(NotImplemented::external_in(Reach::Anywhere), None);
+        assert_eq!(
+            NotImplemented::external_in(Reach::BelowProfile),
+            Some(NotImplemented::ManagedExternal)
+        );
+        assert_eq!(
+            NotImplemented::external_in(Reach::Nowhere),
+            Some(NotImplemented::DownloadedExternal)
+        );
     }
 
     /// A `snell` line is read and checked in full, and versions 1 to 5 have

@@ -10,7 +10,7 @@ use crate::matcher::{SetLookup, SetRef};
 use crate::set::{CompiledSet, SetHandle};
 use crate::set_format::{ParsedSet, SetKind, SetLine, internal_set_text, parse_set};
 use rurge_config::rule::{InternalSet, ParseCtx, ResourceRef, RuleKind, SubRule};
-use rurge_config::{Config, Diagnostic, Diagnostics, HostKey, codes};
+use rurge_config::{Config, Diagnostic, Diagnostics, HostKey, Reach, codes};
 use rurge_net::resource::{
     ResourceHandle, ResourceKind, ResourceManager, ResourceSource, ResourceSpec, ResourceState,
 };
@@ -40,6 +40,16 @@ impl Key {
             ResourceRef::Inline(n) => Key::Inline(n.clone()),
             ResourceRef::Url(u) => Key::Url(u.clone()),
             ResourceRef::File(p) => Key::File(p.clone()),
+        }
+    }
+
+    /// What the text of the set may name on this machine. A set that was
+    /// downloaded is not the user's own text, so it names nothing here; a
+    /// file is read because text that may name one named it.
+    fn reach(&self) -> Reach {
+        match self {
+            Key::Url(_) => Reach::Nowhere,
+            Key::Internal(_) | Key::Inline(_) | Key::File(_) => Reach::Anywhere,
         }
     }
 
@@ -346,7 +356,7 @@ impl SetRegistry {
         let _guard = push_key(key.clone());
         let outcome = match &key {
             Key::Internal(i) => {
-                let parsed = self.parse_text(kind, internal_set_text(*i), &self.base_dir);
+                let parsed = self.parse_text(&key, kind, internal_set_text(*i), &self.base_dir);
                 self.finish(&key, kind, &name, parsed, 1, "internal")
             }
             Key::Inline(n) => {
@@ -374,10 +384,12 @@ impl SetRegistry {
             .expect("entry inserted by ensure")
     }
 
-    fn parse_text(&self, kind: SetKind, text: &str, base_dir: &Path) -> ParsedSet {
+    /// The lines of `text`, the text of the set `key` names.
+    fn parse_text(&self, key: &Key, kind: SetKind, text: &str, base_dir: &Path) -> ParsedSet {
         let ctx = ParseCtx {
             inline_rulesets: &self.inline_names,
             base_dir,
+            reach: key.reach(),
         };
         parse_set(kind, text, &ctx)
     }
@@ -473,7 +485,7 @@ impl SetRegistry {
         let compiled = match resource.current() {
             ResourceState::Available { data, version, .. } => {
                 let text = String::from_utf8_lossy(&data);
-                let parsed = self.parse_text(kind, &text, &base_dir);
+                let parsed = self.parse_text(key, kind, &text, &base_dir);
                 self.finish(key, kind, name, parsed, version, "ok")
             }
             ResourceState::Failed {
@@ -482,7 +494,7 @@ impl SetRegistry {
                 ..
             } => {
                 let text = String::from_utf8_lossy(&data);
-                let parsed = self.parse_text(kind, &text, &base_dir);
+                let parsed = self.parse_text(key, kind, &text, &base_dir);
                 self.finish(
                     key,
                     kind,
@@ -582,7 +594,7 @@ impl SetRegistry {
                 // inside the set it is about to replace (F1).
                 STACK.with(|s| s.borrow_mut().clear());
                 let _guard = push_key(key.clone());
-                let parsed = reg.parse_text(kind, &text, &base_dir);
+                let parsed = reg.parse_text(&key, kind, &text, &base_dir);
                 let entries = parsed.lines.len();
                 if let Some(set) = reg.finish(&key, kind, &name, parsed, version, "ok") {
                     handle.store(set);
@@ -877,6 +889,152 @@ IP-CIDR,10.0.0.0/8,no-resolve # lan
         let (reg2, diags2) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
         assert!(diags2.is_empty(), "{:?}", codes_of(&diags2));
         assert_eq!(reg2.statuses()[0].state, "ok");
+    }
+
+    /// The resources the manager was asked for, as URL paths. A file is none:
+    /// the sets of these tests that are not URLs are never asked of it.
+    fn url_paths(mgr: &ResourceManager) -> Vec<String> {
+        let mut paths: Vec<String> = mgr
+            .statuses()
+            .into_iter()
+            .map(|s| match s.source {
+                ResourceSource::Url(url) => url.path().to_string(),
+                ResourceSource::File(file) => panic!("a file: {}", file.display()),
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// What a downloaded set lists is not for it to take from this machine:
+    /// a line that names a local file as a set is skipped, as an unusable
+    /// line of a set file is, and the file is never asked for. A name only
+    /// the local file lists does not match, one the set lists itself does.
+    /// Here the set is the cached copy of a download, read when the registry
+    /// is built.
+    #[tokio::test]
+    async fn a_downloaded_set_cannot_name_a_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = dir.path().join("local-rules.list");
+        let domains = dir.path().join("local-domains.txt");
+        std::fs::write(&rules, "DOMAIN,from-local-rules.example\n").unwrap();
+        std::fs::write(&domains, ".from-local-domains.example\n").unwrap();
+        let server = TestServer::spawn().await;
+        server.set(
+            "/a.list",
+            format!("RULE-SET,{}\nDOMAIN-SUFFIX,example.com\n", rules.display()),
+        );
+        server.set(
+            "/b.list",
+            format!(
+                "DOMAIN-SET,{}\nDOMAIN-SUFFIX,example.org\n",
+                domains.display()
+            ),
+        );
+        let (a, b) = (server.url("/a.list"), server.url("/b.list"));
+        let cfg = load(
+            &format!("[Proxy]\nP = direct\n[Rule]\nRULE-SET,{a},P\nRULE-SET,{b},P\nFINAL,DIRECT\n"),
+            dir.path(),
+        );
+        // the first registry downloads both; the second starts from the cache
+        let (first, _) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        for url in [&a, &b] {
+            let handle = first.get(&ResourceRef::Url(url.to_string()), SetKind::RuleSet);
+            wait_version(&handle, 1).await;
+        }
+        let mgr = manager(dir.path());
+        let (reg, diags) = SetRegistry::build(&cfg, mgr.clone(), dir.path());
+        let reason = "a downloaded file cannot name a local file as a set";
+        let mut said: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
+        said.sort();
+        let mut expected: Vec<String> = [&a, &b]
+            .iter()
+            .map(|url| format!("set `{url}`: 1 line(s) skipped (first: line 1: {reason})"))
+            .collect();
+        expected.sort();
+        assert_eq!(said, expected);
+        assert_eq!(codes_of(&diags), [codes::W_SET_LINES_SKIPPED; 2]);
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "example.com").await.0, "P");
+        assert_eq!(decide(&engine, "example.org").await.0, "P");
+        assert_eq!(
+            decide(&engine, "from-local-rules.example").await.0,
+            "DIRECT"
+        );
+        assert_eq!(
+            decide(&engine, "from-local-domains.example").await.0,
+            "DIRECT"
+        );
+        // the two sets are all there is: one skipped line each, and no entry
+        // and no resource for a file
+        let statuses = reg.statuses();
+        let names: Vec<&str> = statuses.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, [a.as_str(), b.as_str()]);
+        assert_eq!(
+            statuses.iter().map(|s| s.skipped).collect::<Vec<_>>(),
+            [1, 1]
+        );
+        assert_eq!(url_paths(&mgr), ["/a.list", "/b.list"]);
+    }
+
+    /// The same after the set is downloaded again: a text that now names a
+    /// local file does not get it read.
+    #[tokio::test]
+    async fn a_downloaded_set_that_comes_to_name_a_local_file_still_cannot_read_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("local-rules.list");
+        std::fs::write(&local, "DOMAIN,from-local.example\n").unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/a.list", "DOMAIN-SUFFIX,example.com\n");
+        let url = server.url("/a.list");
+        let cfg = load(
+            &format!("[Proxy]\nP = direct\n[Rule]\nRULE-SET,{url},P\nFINAL,DIRECT\n"),
+            dir.path(),
+        );
+        let mgr = manager(dir.path());
+        let (reg, _) = SetRegistry::build(&cfg, mgr.clone(), dir.path());
+        let handle = reg.get(&ResourceRef::Url(url.to_string()), SetKind::RuleSet);
+        wait_version(&handle, 1).await;
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "example.com").await.0, "P");
+        server.set(
+            "/a.list",
+            format!("RULE-SET,{}\nDOMAIN-SUFFIX,example.com\n", local.display()),
+        );
+        assert!(mgr.force_update(&ResourceSource::Url(url.clone())));
+        wait_version(&handle, 2).await;
+        assert_eq!(decide(&engine, "example.com").await.0, "P");
+        assert_eq!(decide(&engine, "from-local.example").await.0, "DIRECT");
+        let statuses = reg.statuses();
+        assert_eq!(statuses.len(), 1, "{statuses:?}");
+        assert_eq!((statuses[0].version, statuses[0].skipped), (2, 1));
+        assert_eq!(url_paths(&mgr), ["/a.list"]);
+    }
+
+    /// A set file of the user's own may name another local file, by a path
+    /// relative to itself or an absolute one, as it always could.
+    #[tokio::test]
+    async fn a_local_set_file_may_name_another_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sets")).unwrap();
+        let absolute = dir.path().join("c.txt");
+        std::fs::write(&absolute, ".c.example\n").unwrap();
+        std::fs::write(
+            dir.path().join("sets").join("a.list"),
+            format!("RULE-SET,b.list\nDOMAIN-SET,{}\n", absolute.display()),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("sets").join("b.list"), "DOMAIN,b.example\n").unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,sets/a.list,P\nFINAL,DIRECT\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        assert!(diags.is_empty(), "{:?}", codes_of(&diags));
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "b.example").await.0, "P");
+        assert_eq!(decide(&engine, "x.c.example").await.0, "P");
+        assert_eq!(reg.statuses().len(), 3);
     }
 
     /// The manager knows each external set for what it is, which the rule

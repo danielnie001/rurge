@@ -170,6 +170,7 @@ pub fn internal_set_text(set: InternalSet) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rurge_config::Reach;
     use rurge_config::rule::RuleKind;
     use std::collections::HashSet;
     use std::path::Path;
@@ -178,6 +179,7 @@ mod tests {
         ParseCtx {
             inline_rulesets: names,
             base_dir: Path::new("."),
+            reach: Reach::Anywhere,
         }
     }
 

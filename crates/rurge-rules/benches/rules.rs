@@ -1,5 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use rurge_config::HostName;
+use rurge_config::Reach;
 use rurge_config::config::{LoadOptions, from_text};
 use rurge_config::rule::{ParseCtx, ResourceRef};
 use rurge_config::session::SessionInfo;
@@ -142,6 +143,7 @@ fn set_no_resolve_cidr(c: &mut Criterion) {
     let ctx = ParseCtx {
         inline_rulesets: &inline,
         base_dir: Path::new("."),
+        reach: Reach::Anywhere,
     };
     let parsed = parse_set(SetKind::RuleSet, &text, &ctx);
     assert_eq!(parsed.lines.len(), 100_000);
@@ -216,6 +218,7 @@ fn set_asn_list(c: &mut Criterion) {
     let ctx = ParseCtx {
         inline_rulesets: &inline,
         base_dir: Path::new("."),
+        reach: Reach::Anywhere,
     };
     let parsed = parse_set(SetKind::RuleSet, &text, &ctx);
     assert_eq!(parsed.lines.len(), LINES as usize);

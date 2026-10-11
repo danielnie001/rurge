@@ -522,6 +522,7 @@ fn process_matches(pattern: &ProcessPattern, p: &ProcessInfo) -> bool {
 mod tests {
     use super::*;
     use rurge_config::HostName;
+    use rurge_config::Reach;
     use rurge_config::rule::{ParseCtx, parse_subrule};
     use std::collections::HashSet;
     use std::path::Path;
@@ -552,6 +553,7 @@ mod tests {
         let ctx = ParseCtx {
             inline_rulesets: &names,
             base_dir: Path::new("."),
+            reach: Reach::Anywhere,
         };
         let sub = parse_subrule(raw, &ctx).unwrap_or_else(|e| panic!("{raw}: {}", e.message));
         compile_subrule(&sub, &NoSets)
