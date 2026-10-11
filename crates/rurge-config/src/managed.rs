@@ -1,6 +1,7 @@
 //! `#!MANAGED-CONFIG` and other header directives.
 
 use crate::diagnostic::{Diagnostic, Diagnostics, codes};
+use crate::remote::DEFAULT_INTERVAL;
 use crate::text::{Directive, unknown_directive};
 use crate::value::parse_bool;
 use std::fmt;
@@ -75,7 +76,7 @@ pub fn parse_managed(header: &[Directive], diags: &mut Diagnostics) -> Option<Ma
             };
             let mut cfg = ManagedConfig {
                 url: url.to_string(),
-                interval: Duration::from_secs(86400),
+                interval: DEFAULT_INTERVAL,
                 strict: false,
             };
             for p in parts {

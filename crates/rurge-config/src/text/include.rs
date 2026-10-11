@@ -75,12 +75,12 @@ struct Remotes {
 }
 
 impl Remotes {
-    /// What the source has for `url`, asked once per expansion.
-    fn ask(&mut self, source: &dyn RemoteSource, url: &Url) -> Remote {
+    /// What the source has for `url`, asked once per expansion. The text is
+    /// kept here and lent: a URL named many times is not copied each time.
+    fn ask(&mut self, source: &dyn RemoteSource, url: &Url) -> &Remote {
         self.answers
             .entry(url.clone())
             .or_insert_with(|| source.get(url))
-            .clone()
     }
 
     /// The place of `url` among the files, which is added when it is new.
@@ -153,7 +153,7 @@ impl Expansion<'_> {
                     continue;
                 };
                 for target in split_list(rest) {
-                    let Some(mut included) = self.fetch(&target, &entry.span, depth, downloaded)
+                    let Some(mut included) = self.take_in(&target, &entry.span, depth, downloaded)
                     else {
                         continue;
                     };
@@ -167,20 +167,23 @@ impl Expansion<'_> {
                     } else if let Some(s) = included.profile.section_mut(&section.name) {
                         new_entries.append(&mut s.entries);
                     } else {
-                        self.diags.push(
-                            Diagnostic::warning(
-                                codes::W_INCLUDE_SECTION_MISSING,
-                                format!(
-                                    "`{}` has no [{}] section",
-                                    included.file.display(),
-                                    section.name
-                                ),
-                            )
-                            .at(entry.span.clone()),
-                        );
+                        let mut missing = Diagnostic::warning(
+                            codes::W_INCLUDE_SECTION_MISSING,
+                            format!(
+                                "`{}` has no [{}] section",
+                                included.file.display(),
+                                section.name
+                            ),
+                        )
+                        .at(entry.span.clone());
                         if let Some(at) = included.tracked {
+                            // nobody can add the section to a downloaded file
+                            missing = missing.with_hint(
+                                "check that the address serves a profile with that section, or move the `#!include` line to a section it has",
+                            );
                             self.remotes.refs[at].lacks_section = true;
                         }
+                        self.diags.push(missing);
                     }
                 }
             }
@@ -198,7 +201,7 @@ impl Expansion<'_> {
 
     /// The text `target` names, expanded in turn. `None` when there is nothing
     /// to take in; a diagnostic says why.
-    fn fetch(
+    fn take_in(
         &mut self,
         target: &str,
         span: &Span,
@@ -206,7 +209,7 @@ impl Expansion<'_> {
         downloaded: bool,
     ) -> Option<Included> {
         if is_url(target) {
-            self.fetch_remote(target, span, depth)
+            self.take_in_remote(target, span, depth)
         } else if downloaded {
             self.diags.push(
                 Diagnostic::warning(
@@ -218,7 +221,7 @@ impl Expansion<'_> {
             );
             None
         } else {
-            self.fetch_local(target, span, depth)
+            self.take_in_local(target, span, depth)
         }
     }
 
@@ -271,7 +274,7 @@ impl Expansion<'_> {
         true
     }
 
-    fn fetch_local(&mut self, target: &str, span: &Span, depth: usize) -> Option<Included> {
+    fn take_in_local(&mut self, target: &str, span: &Span, depth: usize) -> Option<Included> {
         let path = if Path::new(target).is_absolute() {
             PathBuf::from(target)
         } else {
@@ -308,10 +311,10 @@ impl Expansion<'_> {
         })
     }
 
-    fn fetch_remote(&mut self, target: &str, span: &Span, depth: usize) -> Option<Included> {
+    fn take_in_remote(&mut self, target: &str, span: &Span, depth: usize) -> Option<Included> {
         // the warning quotes nothing of the target: its path or its query can
         // be a token
-        let Ok(url) = Url::parse(target) else {
+        let Ok(mut url) = Url::parse(target) else {
             self.diags.push(
                 Diagnostic::warning(
                     codes::W_INVALID_VALUE,
@@ -321,6 +324,9 @@ impl Expansion<'_> {
             );
             return None;
         };
+        // a fragment is never sent to a server: links that differ only in it
+        // are one link
+        url.set_fragment(None);
         let Some(source) = self.remote else {
             self.diags.push(
                 Diagnostic::warning(
@@ -335,8 +341,15 @@ impl Expansion<'_> {
         if !self.admit(&key, "a remote include", span, depth) {
             return None;
         }
-        let (text, path) = match self.remotes.ask(source, &url) {
-            Remote::Text { text, path, .. } => (text, path),
+        // The answer is lent by `self.remotes`, and the expansion below needs
+        // `self` again: the text is parsed here, and what goes on is the
+        // profile, its warnings and the path.
+        let (mut profile, sub_diags, path) = match self.remotes.ask(source, &url) {
+            Remote::Text { text, path, .. } => {
+                let file: Arc<Path> = Arc::from(path.as_path());
+                let (profile, sub_diags) = parse_str(text, file.clone(), Origin::Remote(file));
+                (profile, sub_diags, path.clone())
+            }
             Remote::Missing { why } => {
                 let message = match why {
                     Some(why) => format!("remote include not downloaded yet: {why}"),
@@ -349,8 +362,6 @@ impl Expansion<'_> {
                 return None;
             }
         };
-        let file: Arc<Path> = Arc::from(path.as_path());
-        let (mut profile, sub_diags) = parse_str(&text, file.clone(), Origin::Remote(file));
         self.diags.extend(sub_diags);
         // what is wrong in the line is not reported, as for a local include
         let interval = parse_managed(&profile.header, &mut Diagnostics::default())
@@ -590,6 +601,13 @@ mod tests {
             .collect()
     }
 
+    /// What the diagnostics are, as (code, message, line).
+    fn told(d: &Diagnostics) -> Vec<(&str, &str, Option<u32>)> {
+        d.iter()
+            .map(|x| (x.code, x.message.as_str(), x.span.as_ref().map(|s| s.line)))
+            .collect()
+    }
+
     #[test]
     fn a_remote_include_is_expanded_in_place() {
         let fake = Fake::new().text(
@@ -693,10 +711,7 @@ FINAL,DIRECT
 ",
             Some(&fake),
         );
-        let found: Vec<(&str, &str, Option<u32>)> = d
-            .iter()
-            .map(|x| (x.code, x.message.as_str(), x.span.as_ref().map(|s| s.line)))
-            .collect();
+        let found = told(&d);
         assert_eq!(
             found,
             [
@@ -738,10 +753,7 @@ FINAL,DIRECT
 ",
             None,
         );
-        let found: Vec<(&str, &str, Option<u32>)> = d
-            .iter()
-            .map(|x| (x.code, x.message.as_str(), x.span.as_ref().map(|s| s.line)))
-            .collect();
+        let found = told(&d);
         assert_eq!(
             found,
             [(
@@ -779,10 +791,7 @@ FINAL,DIRECT
 ",
             Some(&fake),
         );
-        let found: Vec<(&str, &str, Option<u32>)> = d
-            .iter()
-            .map(|x| (x.code, x.message.as_str(), x.span.as_ref().map(|s| s.line)))
-            .collect();
+        let found = told(&d);
         assert_eq!(
             found,
             [
@@ -855,14 +864,16 @@ FINAL,DIRECT
     }
 
     /// What a downloaded text says is not for it to decide on this machine:
-    /// a path in it is not read, whether it is relative or absolute.
+    /// a path in it is not read, whether it is relative or absolute and
+    /// whether the file is there or not. The refusal comes before any read: a
+    /// file that is not there is refused, it is not one that cannot be read.
     #[test]
     fn a_remote_text_cannot_include_a_local_file() {
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("local.dconf");
         fs::write(&local, "[Rule]\nDOMAIN,local-only.example,DIRECT\n").unwrap();
         let downloaded = format!(
-            "[Rule]\nDOMAIN,remote.example,DIRECT\n#!include local.dconf\n#!include {}\n",
+            "[Rule]\nDOMAIN,remote.example,DIRECT\n#!include local.dconf\n#!include {}\n#!include absent.dconf\n",
             local.display()
         );
         let fake = Fake::new().text("https://example.com/r.conf", &downloaded);
@@ -872,8 +883,8 @@ FINAL,DIRECT
             Some(&fake),
         );
         let cached = fake.path_of("https://example.com/r.conf");
-        assert_eq!(d.len(), 2, "{:?}", d.clone().into_vec());
-        for (found, line) in d.iter().zip([3, 4]) {
+        assert_eq!(d.len(), 3, "{:?}", d.clone().into_vec());
+        for (found, line) in d.iter().zip([3, 4, 5]) {
             assert_eq!(found.code, codes::W_REMOTE_LOCAL_ACCESS);
             assert_eq!(
                 found.message,
@@ -1085,6 +1096,108 @@ FINAL,DIRECT
         assert_eq!(lacks, [true, true, false]);
     }
 
+    /// A fragment is never sent to a server, so links that differ only in it
+    /// are one link: one remote file, and the source is asked for the link
+    /// without it.
+    #[test]
+    fn a_fragment_is_not_part_of_a_link() {
+        let fake = Fake::new().text(
+            "https://example.com/r.conf",
+            "[Proxy]\nA = direct\n[Rule]\nDOMAIN,a.example,DIRECT\n",
+        );
+        let (p, d, remote) = expand_text(
+            "[Proxy]\n#!include https://example.com/r.conf#one\n[Rule]\n#!include https://example.com/r.conf#two\nFINAL,DIRECT\n",
+            Some(&fake),
+        );
+        assert!(d.is_empty(), "{:?}", d.into_vec());
+        assert_eq!(raws(&p, "Proxy"), ["A = direct"]);
+        assert_eq!(
+            raws(&p, "Rule"),
+            ["DOMAIN,a.example,DIRECT", "FINAL,DIRECT"]
+        );
+        assert_eq!(remote.len(), 1);
+        assert_eq!(remote[0].url.as_str(), "https://example.com/r.conf");
+        assert_eq!(remote[0].url.fragment(), None);
+        let asked = fake.asked();
+        let asked: Vec<&str> = asked.iter().map(Url::as_str).collect();
+        assert_eq!(asked, ["https://example.com/r.conf"]);
+    }
+
+    /// And so a text that includes itself under another fragment includes
+    /// itself: it is a cycle, found where the text asks for itself again.
+    #[test]
+    fn a_text_that_includes_itself_under_another_fragment_is_a_cycle() {
+        let fake = Fake::new().text(
+            "https://example.com/self.conf",
+            "[Rule]\nDOMAIN,self.example,DIRECT\n#!include https://example.com/self.conf#again\n",
+        );
+        let (p, d, remote) = expand_text(
+            "[Rule]\n#!include https://example.com/self.conf#first\nFINAL,DIRECT\n",
+            Some(&fake),
+        );
+        let found: Vec<(&str, &str, &Path, u32)> = d
+            .iter()
+            .map(|x| {
+                let span = x.span.as_ref().expect("a position");
+                (x.code, x.message.as_str(), span.file.as_ref(), span.line)
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [(
+                codes::E_INCLUDE_CYCLE,
+                "include cycle through a remote include",
+                fake.path_of("https://example.com/self.conf").as_path(),
+                3
+            )]
+        );
+        assert_eq!(
+            raws(&p, "Rule"),
+            ["DOMAIN,self.example,DIRECT", "FINAL,DIRECT"]
+        );
+        assert_eq!(remote.len(), 1);
+        assert_eq!(fake.asked().len(), 1);
+    }
+
+    /// A downloaded file is not the user's to edit, so the hint for a section
+    /// it lacks does not tell them to add it, as it does for a file of their
+    /// own.
+    #[test]
+    fn a_downloaded_text_without_the_section_gets_a_hint_that_can_be_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("nosec.dconf"), "[Proxy]\nP = direct\n").unwrap();
+        let fake = Fake::new().text("https://example.com/nosec.conf", "[Proxy]\nA = direct\n");
+        let (_, d, _) = expand_in(
+            dir.path(),
+            "[Rule]\n#!include nosec.dconf\n#!include https://example.com/nosec.conf\nFINAL,DIRECT\n",
+            Some(&fake),
+        );
+        let found: Vec<(&str, u32, Option<&str>)> = d
+            .iter()
+            .map(|x| (x.code, x.span.as_ref().expect("a position").line, x.hint))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    codes::W_INCLUDE_SECTION_MISSING,
+                    2,
+                    codes::hint(codes::W_INCLUDE_SECTION_MISSING)
+                ),
+                (
+                    codes::W_INCLUDE_SECTION_MISSING,
+                    3,
+                    Some(
+                        "check that the address serves a profile with that section, or move the `#!include` line to a section it has"
+                    )
+                ),
+            ]
+        );
+        // the local one has a hint, and it is not the other
+        assert_ne!(found[0].2, None);
+        assert_ne!(found[0].2, found[1].2);
+    }
+
     /// A wildcard section takes what matches; a text with nothing that matches
     /// is a text without sections of that kind, not one that lacks a section.
     #[test]
@@ -1204,5 +1317,76 @@ FINAL,DIRECT
             );
             assert_eq!(fake.asked().len(), 1, "{text}");
         }
+    }
+
+    /// A cycle is a cycle however the link that closes it is written: the
+    /// scheme and the host do not care about case, and a port that is the
+    /// scheme's own is no port.
+    #[test]
+    fn a_cycle_is_found_whatever_the_spelling_of_the_link_that_closes_it() {
+        let fake = Fake::new()
+            .text(
+                "https://example.com/a.conf",
+                "[Rule]\nDOMAIN,a.example,DIRECT\n#!include https://example.com/b.conf\n",
+            )
+            .text(
+                "https://example.com/b.conf",
+                "[Rule]\nDOMAIN,b.example,DIRECT\n#!include HTTPS://EXAMPLE.com:443/a.conf\n",
+            );
+        let (p, d, remote) = expand_text(
+            "[Rule]\n#!include https://example.com/a.conf\nFINAL,DIRECT\n",
+            Some(&fake),
+        );
+        // it stops where b asks for a again, in b's file, and a is not taken
+        // in a second time
+        let found: Vec<(&str, &str, &Path, u32)> = d
+            .iter()
+            .map(|x| {
+                let span = x.span.as_ref().expect("a position");
+                (x.code, x.message.as_str(), span.file.as_ref(), span.line)
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [(
+                codes::E_INCLUDE_CYCLE,
+                "include cycle through a remote include",
+                fake.path_of("https://example.com/b.conf").as_path(),
+                3
+            )]
+        );
+        assert_eq!(
+            raws(&p, "Rule"),
+            [
+                "DOMAIN,a.example,DIRECT",
+                "DOMAIN,b.example,DIRECT",
+                "FINAL,DIRECT"
+            ]
+        );
+        assert_eq!(remote.len(), 2);
+        assert_eq!(fake.asked().len(), 2);
+    }
+
+    /// One link written two ways is one remote file: one entry among the ones
+    /// the load came across, and one question to the source.
+    #[test]
+    fn a_link_written_two_ways_is_one_remote_file() {
+        let fake = Fake::new().text(
+            "https://example.com/r.conf",
+            "[Proxy]\nA = direct\n[Rule]\nDOMAIN,a.example,DIRECT\n",
+        );
+        let (p, d, remote) = expand_text(
+            "[Proxy]\n#!include https://example.com/r.conf\n[Rule]\n#!include HTTPS://Example.COM:443/r.conf\nFINAL,DIRECT\n",
+            Some(&fake),
+        );
+        assert!(d.is_empty(), "{:?}", d.into_vec());
+        assert_eq!(raws(&p, "Proxy"), ["A = direct"]);
+        assert_eq!(
+            raws(&p, "Rule"),
+            ["DOMAIN,a.example,DIRECT", "FINAL,DIRECT"]
+        );
+        assert_eq!(remote.len(), 1);
+        assert_eq!(remote[0].url.as_str(), "https://example.com/r.conf");
+        assert_eq!(fake.asked().len(), 1);
     }
 }

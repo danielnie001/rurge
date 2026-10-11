@@ -12,6 +12,7 @@ pub use cache::Meta;
 use crate::http::HttpClient;
 use bytes::Bytes;
 use rurge_config::ResourceRef;
+use rurge_config::remote::origin;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
@@ -66,16 +67,6 @@ pub enum ResourceKind {
 pub enum ResourceSource {
     Url(Url),
     File(PathBuf),
-}
-
-/// A URL as a `Debug` shows it: where it goes, without its path and query,
-/// which often carry a token.
-pub(crate) fn origin(url: &Url) -> String {
-    format!(
-        "{}://{}/…",
-        url.scheme(),
-        &url[url::Position::BeforeHost..url::Position::AfterPort]
-    )
 }
 
 impl fmt::Debug for ResourceSource {

@@ -10,13 +10,20 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use url::Url;
 
-/// How often an included file is updated when its own text does not say.
+/// How often a remote file is updated when its own text does not say: an
+/// included file without a `#!MANAGED-CONFIG` line, and a `#!MANAGED-CONFIG`
+/// line without `interval=`.
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(86400);
 
 /// Where the loader asks for the text a URL in a profile names.
 pub trait RemoteSource: Send + Sync {
     /// What `url` was last downloaded as. The URL is the parsed value, so that
     /// the source and the loader mean the same thing by it.
+    ///
+    /// When there is no text the answer is [`Remote::Missing`], and its `why`
+    /// is shown as it is in a warning, which is printed and logged: it is one
+    /// line, and it never holds the URL, nor any other link (the target of a
+    /// redirect included), nor anything read from a response body.
     fn get(&self, url: &Url) -> Remote;
 }
 
@@ -32,8 +39,10 @@ pub enum Remote {
         fetched_at: SystemTime,
     },
     /// Nothing to read: not downloaded yet, or every attempt failed and no
-    /// copy exists. `why` is shown as it is in a warning, so it must not quote
-    /// the URL.
+    /// copy exists. `why` is shown as it is in a warning, which is printed and
+    /// logged: it is one line, and it never holds the URL, nor any other link
+    /// (the target of a redirect included), nor anything read from a response
+    /// body. A link can be a token, and a body is whatever the server sent.
     Missing { why: Option<String> },
 }
 
@@ -99,8 +108,10 @@ impl RemoteRef {
     }
 }
 
-/// Where a link goes, without its user name, password, path and query.
-fn origin(url: &Url) -> String {
+/// Where a link goes, without its user name, password, path and query: all
+/// that a `Debug`, a label or a log line may show of a link, whose other parts
+/// can be the token a provider issued.
+pub fn origin(url: &Url) -> String {
     format!(
         "{}://{}/…",
         url.scheme(),

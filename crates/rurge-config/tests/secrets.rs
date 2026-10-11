@@ -967,16 +967,22 @@ fn downloaded(text: String, n: u32) -> Remote {
 #[test]
 fn a_remote_include_shows_nothing_of_its_link_or_its_text() {
     let rules = format!(
-        "https://al1ce:{MARKER}-user@sub.example/rules/{MARKER}-path.conf?token={MARKER}-query"
+        "https://{MARKER}-name:{MARKER}-user@sub.example/rules/{MARKER}-path.conf?token={MARKER}-query"
     );
-    let proxies =
-        format!("https://sub.example/proxies/{MARKER}-proxies?token={MARKER}-proxiesquery");
+    let proxies = format!(
+        "https://sub.example/proxies/{MARKER}-proxies?token={MARKER}-proxiesquery#{MARKER}-fragment"
+    );
     let gone = format!("https://sub.example/gone/{MARKER}-gone?token={MARKER}-gonequery");
     let page = format!("https://sub.example/page/{MARKER}-page");
     let profile = format!(
         "[Proxy]\n#!include {proxies}\n[Rule]\n#!include {rules}\n#!include {gone}\n#!include {page}\nFINAL,DIRECT\n"
     );
-    let key = |link: &str| Url::parse(link).unwrap().to_string();
+    // the loader asks for a link without its fragment, which no server sees
+    let key = |link: &str| {
+        let mut url = Url::parse(link).unwrap();
+        url.set_fragment(None);
+        url.to_string()
+    };
     let answers = Downloaded(HashMap::from([
         (
             key(&proxies),
