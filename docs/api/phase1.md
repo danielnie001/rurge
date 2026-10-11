@@ -9,6 +9,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 - 所有错误都是 `{"error":"<message>"}`：400（参数、JSON 请求体或查询字符串错误）、401、403、404（未知端点 / 未知请求 id / 未知功能名）、405（`{"error":"method not allowed"}`，请求方法与已注册路径不匹配，如对 `/v1/outbound` 发 `DELETE`）、409（不可终止的内部会话）、500（内部错误）、501（本阶段未实现）。
 - 无内容的成功响应是 `{}`。字段名 camelCase；手册已定义的字段（如 `policy-groups`、`dnsCache`）照抄。
 - `http-api` 绑定到非环回地址时启动时打 WARN；改动 `http-api` 需重启 rurge（重载只警告，继续用旧地址 / 密钥）。
+- **已知限制（阶段 1 补遗（M5b）修）**：不读请求正文的端点——下面「端点」表里"请求"一格为空的 `POST`：`/v1/dns/flush`、`/v1/profiles/reload`、`/v1/profiles/check`、`/v1/stop`——和在读正文之前就被拒绝的请求（`401` 量过；`403`、`404`、`405` 的应答同样不读正文，这是读代码得出的：`auth::require_key` 在 401 / 403 时不再往下走，`not_found` 与 `method_not_allowed` 不取正文；没有量过它们会不会丢应答），只凭请求头就答复并关掉连接。正文若在这之后才到，客户端可能读不到那个应答——在 Windows 上量到的是连接被中止（`ConnectionAborted`，os error 10053）、一个字节也读不到——，尽管请求已经执行。不发正文的客户端，和把请求头与正文放进一次写里发的客户端，不受影响；`POST /v1/log/level` 一类会读正文的端点量过，也不受影响。rurge 自己的 `rurge reload` / `rurge stop` 属后一种（读 hyper 的源码得出，没有量过）。Python 的 `http.client`——以及 `urllib.request` 和经 urllib3 的 `requests`——把请求头与正文分开发：读 CPython v3.13.0 的 `Lib/http/client.py`，`_send_output` 用一次 `send` 发请求头、对正文的每一块各用一次；`requests` 走的 urllib3 2.7.0 里，`HTTPConnection.request` 在 `endheaders()` 之后逐块 `send`。别的系统没有量过。
 
 ## 端点
 
