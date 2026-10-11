@@ -2758,11 +2758,7 @@ mod run {
         target.set("/hello", "hi from target");
         let port = target.url("/").port().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let inner_port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let inner_port = free_tcp_port();
         let inner = dir.path().join("inner.conf");
         std::fs::write(
             &inner,

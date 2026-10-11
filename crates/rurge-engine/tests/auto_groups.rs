@@ -226,6 +226,16 @@ async fn every_test_is_a_session_of_the_request_log() {
         "{:?}",
         dead.error
     );
+    // a test came in on no listener (port 0, which the API shows as `null`),
+    // and its probe does not run on the session's trail: no far end and no
+    // time on lookups are noted
+    for r in [a, dead] {
+        assert_eq!(
+            (r.listen_port, r.remote_addr, r.dns_ms),
+            (0, None, None),
+            "{r:?}"
+        );
+    }
 }
 
 /// A group's own `underlying-proxy` makes its members `M (via R)`; such a

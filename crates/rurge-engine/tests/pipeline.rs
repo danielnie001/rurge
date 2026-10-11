@@ -1538,16 +1538,18 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
     .expect("the lookup must not wait for the proxy's own name to be resolved");
     assert!(res.is_ok(), "resolution through the pipeline: {res:?}");
     let internal = internal_sessions(&engine);
-    assert!(
-        internal.iter().any(|r| {
+    let bypassed = internal
+        .iter()
+        .find(|r| {
             r.error.as_deref()
                 == Some(
                     "dns-follow: proxy configured by host name bypassed to avoid a resolution loop",
                 )
                 && r.policy.first().map(String::as_str) == Some("Up")
-        }),
-        "a bypassed internal DNS session: {internal:?}"
-    );
+        })
+        .unwrap_or_else(|| panic!("a bypassed internal DNS session: {internal:?}"));
+    // it went direct: the far end is the DNS server itself
+    assert_eq!(bypassed.remote_addr, Some(dns.addr()), "{internal:?}");
     assert!(
         !dns.queries().is_empty(),
         "the mock DNS server was actually queried"
@@ -1766,12 +1768,13 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
         "the DNS session really went through the proxy"
     );
     let internal = internal_sessions(&engine);
-    assert!(
-        internal
-            .iter()
-            .any(|r| r.policy.first().map(String::as_str) == Some("UpIp")),
-        "{internal:?}"
-    );
+    let carried = internal
+        .iter()
+        .find(|r| r.policy.first().map(String::as_str) == Some("UpIp"))
+        .unwrap_or_else(|| panic!("{internal:?}"));
+    // as for any other TCP session, the far end is the proxy, not the DNS
+    // server behind it
+    assert_eq!(carried.remote_addr, Some(upstream.addr()), "{internal:?}");
     assert!(
         internal.iter().all(|r| r.error.is_none()),
         "an IP-configured proxy is not bypassed: {internal:?}"
