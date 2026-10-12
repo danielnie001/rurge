@@ -1786,22 +1786,20 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
 
 /// A DNS server's TCP connection is called by the port it dials, the best
 /// that can be told of what is spoken there: 853 is DoT, 443 is DoH (manual,
-/// Protocol and Network Rules). The servers named here are not asked: the
-/// rules send them to a proxy of the test's own, which refuses.
+/// Protocol and Network Rules). The servers named here are not asked, and
+/// nothing is dialled at their ports: the rules send the connection to a
+/// proxy of the test's own, which refuses — by what the connection is called
+/// when that is right, by its address when it is not, so that a wrong label
+/// fails the test without a connection to anything but that proxy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dns_connection_is_called_dot_at_853_and_doh_at_443() {
     for (server, protocol, keyword, dst) in [
+        ("tls://127.0.0.1", ProtocolKind::Dot, "DOT", "127.0.0.1:853"),
         (
-            "tls://203.0.113.7",
-            ProtocolKind::Dot,
-            "DOT",
-            "203.0.113.7:853",
-        ),
-        (
-            "https://203.0.113.7/dns-query",
+            "https://127.0.0.1/dns-query",
             ProtocolKind::Doh,
             "DOH",
-            "203.0.113.7:443",
+            "127.0.0.1:443",
         ),
     ] {
         let proxy = FakeHttpProxy::spawn(HttpProxyScript {
@@ -1814,7 +1812,7 @@ async fn a_dns_connection_is_called_dot_at_853_and_doh_at_443() {
         let profile = follow_profile(
             server,
             &format!("UpIp = http, 127.0.0.1, {}", proxy.addr().port()),
-            &rule,
+            &format!("{rule}\nIP-CIDR,127.0.0.1/32,UpIp,no-resolve"),
         );
         let engine = engine_from_profile(dir.path(), &profile).await;
         let asking = engine.clone();
