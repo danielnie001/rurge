@@ -1184,6 +1184,38 @@ mod tests {
         }
     }
 
+    /// The options `rurge run` takes on its own command line or environment
+    /// are not keys of the profile: written as keys of `[General]` they are
+    /// unknown ones, and change nothing.
+    #[test]
+    fn the_options_of_rurge_are_not_profile_keys() {
+        for key in [
+            "outbound-mode",
+            "log-level",
+            "log-file",
+            "platform",
+            "idle-timeout",
+            "request-log-size",
+            "watch",
+            "system-proxy",
+            "empty-group-reject",
+            "listen-http",
+            "listen-socks5",
+            "data-dir",
+            "geoip-url",
+            "geoip-asn-url",
+            "no-network",
+            "dns-cache-size",
+        ] {
+            let (mut g, d) = parse(&format!("[General]\n{key} = 1\n"));
+            let said: Vec<&str> = d.iter().map(|x| x.code).collect();
+            assert_eq!(said, [codes::W_UNKNOWN_KEY], "{key}");
+            assert_eq!(g.unknown.len(), 1, "{key}");
+            g.unknown.clear();
+            assert_eq!(g, General::default(), "{key}");
+        }
+    }
+
     #[test]
     fn defaults_when_section_missing() {
         let (g, d) = parse("[Rule]\nFINAL,DIRECT\n");
