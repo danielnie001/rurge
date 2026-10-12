@@ -4860,6 +4860,49 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             assert_eq!(as_it_is(&conf), before, "the profile was written to");
         }
 
+        /// What a power cut can leave of the copy is not the copy. The next
+        /// start does not read it and asks the server for the whole of it:
+        /// with the validators of the copy that was downloaded, the answer
+        /// would be that nothing has changed, and the start would end on a
+        /// profile that does not load for as long as the server keeps its
+        /// version.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_copy_that_is_not_what_was_downloaded_is_downloaded_again() {
+            let w = Sources::new().await;
+            let api = free_tcp_port();
+            let copy = managed_text(
+                &w.url("/managed"),
+                "interval=3600",
+                api,
+                "DOMAIN,copy.test,REJECT\n",
+            );
+            w.served.set("/managed", copy.clone());
+            w.point_at("/managed");
+            let (mut daemon, errors) = spawn_command_reading_stderr(w.start());
+            stderr_up_to(&errors, WAITING);
+            up(&daemon);
+            stop(&mut daemon, api);
+            let file = rurge_net::resource::cache_file(&w.data(), &w.url("/managed"));
+            assert_eq!(std::fs::read(&file).unwrap(), copy.as_bytes());
+            // beside it, the validator the server gave with it
+            let meta = std::fs::read_to_string(file.with_file_name("meta.json")).unwrap();
+            assert!(!meta.contains("\"etag\": null"), "{meta}");
+            let asked = w.served.requests().len();
+
+            // the first half of the body where the body was
+            std::fs::write(&file, &copy.as_bytes()[..copy.len() / 2]).unwrap();
+            let (mut daemon, errors) = spawn_command_reading_stderr(w.start());
+            stderr_up_to(&errors, WAITING);
+            up(&daemon);
+            assert_eq!(current(api), copy);
+            assert!(rules(api).contains("DOMAIN,copy.test,REJECT"));
+            let again = &w.served.requests()[asked..];
+            assert!(!again.is_empty(), "the server was not asked");
+            assert!(again[0].header("if-none-match").is_none(), "{again:?}");
+            assert_eq!(std::fs::read(&file).unwrap(), copy.as_bytes());
+            stop(&mut daemon, api);
+        }
+
         /// The managed profile cannot be had and there is nothing to run
         /// on: the start ends with the profile's own diagnostics, which say
         /// why. The link is a credential as a whole; only where it goes is

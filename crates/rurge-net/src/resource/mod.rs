@@ -591,8 +591,8 @@ pub fn cache_file(root: &Path, url: &Url) -> PathBuf {
 }
 
 /// The cache of `url` under `root`, read without a manager and without the
-/// network. `None` when one of its two files is missing or `meta.json` cannot
-/// be read.
+/// network. `None` when one of its two files is missing, `meta.json` cannot
+/// be read, or the body is not the one `meta.json` was written for.
 pub fn cached_copy(root: &Path, url: &Url) -> Option<CachedCopy> {
     let (data, meta) = cache::CacheDir::for_url(root, url.as_str()).load()?;
     Some(CachedCopy {
@@ -826,14 +826,14 @@ impl ResourceManager {
         // reads, and its next refresh brings the same body and finds nothing
         // new, or one new version.
         let Some(entry) = entry else {
-            return cache.store(&data, &meta);
+            return cache.store(&data, &mut meta);
         };
         let mut disk = entry.record.lock().expect("record");
         if entry.retired() {
             // retired since the lookup
-            return cache.store(&data, &meta);
+            return cache.store(&data, &mut meta);
         }
-        if let Err(e) = cache.store(&data, &meta) {
+        if let Err(e) = cache.store(&data, &mut meta) {
             // it may have got as far as the body
             disk.behind = true;
             return Err(e);
@@ -1266,7 +1266,15 @@ fn record_attempt(
                 return Some(failed_attempt(entry, e.clone(), Warning::Fetch(e)));
             };
             let held = entry.meta.lock().expect("meta").clone();
-            let whole = disk.behind || held.is_none();
+            // The body goes with the metadata unless the disk holds it, intact: a
+            // write may have failed, there may never have been one, and the files
+            // may have been damaged or replaced since. A cache from before the
+            // digest was kept gets one this way.
+            let intact = held
+                .as_ref()
+                .and_then(|meta| meta.sha256.as_deref())
+                .is_some_and(|digest| cache.holds(digest));
+            let whole = disk.behind || !intact;
             let mut meta = held.unwrap_or_else(|| Meta {
                 url: url.to_string(),
                 ..Meta::default()
@@ -1277,7 +1285,7 @@ fn record_attempt(
                 meta.last_modified = last_modified;
             }
             let written = if whole {
-                cache.store(&data, &meta)
+                cache.store(&data, &mut meta)
             } else {
                 cache.store_meta(&meta)
             };
@@ -1312,7 +1320,7 @@ fn record_attempt(
                 ..Meta::default()
             };
             meta.stamp(now);
-            let warning = match wrote(&mut disk, cache.store(&data, &meta), by_disk) {
+            let warning = match wrote(&mut disk, cache.store(&data, &mut meta), by_disk) {
                 Ok(warning) => warning,
                 Err(e) => return Some(not_written(entry, &e)),
             };
@@ -1962,12 +1970,12 @@ mod tests {
         let url = Url::parse("https://sub.test/nodes?token=t0k3n").unwrap();
         let remote = ResourceSource::Url(url.clone());
         assert!(cached(root.path(), &remote).is_none());
-        let meta = Meta {
+        let mut meta = Meta {
             url: url.to_string(),
             ..Meta::default()
         };
         cache::CacheDir::for_url(root.path(), url.as_str())
-            .store(b"cached", &meta)
+            .store(b"cached", &mut meta)
             .unwrap();
         assert_eq!(&cached(root.path(), &remote).unwrap()[..], b"cached");
         let file = root.path().join("nodes.txt");
@@ -2075,7 +2083,7 @@ mod tests {
         };
         meta.stamp(SystemTime::now());
         cache::CacheDir::for_url(root.path(), url.as_str())
-            .store(b"cached", &meta)
+            .store(b"cached", &mut meta)
             .unwrap();
         let mgr = manager(root.path(), fast());
         let handle = mgr.get(&url_spec(url, Some(86_400)));
@@ -2199,7 +2207,7 @@ mod tests {
         };
         meta.stamp(SystemTime::now());
         cache::CacheDir::for_url(root.path(), url.as_str())
-            .store(b"cached", &meta)
+            .store(b"cached", &mut meta)
             .unwrap();
         let mgr = manager(root.path(), fast());
         mgr.get(&url_spec(url.clone(), Some(-1)));
@@ -2593,6 +2601,154 @@ mod tests {
         assert!(
             matches!(h.current(), ResourceState::Available { fetched_at, .. } if fetched_at == then)
         );
+    }
+
+    /// The validators belong to the body they came with. A body that was
+    /// damaged on disk is not that body: the entry is not read, the request
+    /// carries no validators, and the server sends the whole body. With the
+    /// validators its answer would be that nothing has changed, for as long
+    /// as it keeps its version.
+    #[tokio::test]
+    async fn a_damaged_cache_is_fetched_whole() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/d", "delta, the whole of it");
+        let url = server.url("/d");
+        let source = ResourceSource::Url(url.clone());
+        {
+            let mgr = manager(root.path(), fast());
+            let h = mgr.get(&url_spec(url.clone(), None));
+            wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        }
+        let file = cache_file(root.path(), &url);
+        // what a power cut can leave of a body: its beginning
+        std::fs::write(&file, "delta, the").unwrap();
+        assert!(cached_copy(root.path(), &url).is_none());
+        assert!(cached(root.path(), &source).is_none());
+
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url.clone(), None));
+        let s = wait_for(&h, "the body", |s| available_version(s).is_some()).await;
+        assert_eq!(&s.data().unwrap().0[..], b"delta, the whole of it");
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 2, "{reqs:?}");
+        assert!(reqs[1].header("if-none-match").is_none(), "{reqs:?}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"delta, the whole of it");
+        assert_eq!(
+            &cached_copy(root.path(), &url).expect("a cache").data[..],
+            b"delta, the whole of it"
+        );
+    }
+
+    /// An answer that nothing has changed is about the body in hand. When the
+    /// disk holds that body, intact, the metadata alone is written; when it
+    /// does not, the body is written again with it.
+    #[tokio::test]
+    async fn an_unchanged_answer_writes_the_body_again_when_the_disk_does_not_hold_it() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/r", "romeo");
+        let url = server.url("/r");
+        let key = resource_key(&ResourceSource::Url(url.clone()));
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url.clone(), None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        let dir = cache_of(root.path(), &url);
+        let file = dir.path().join("data");
+        let (_, written) = dir.load().expect("a cache");
+        // one more request, with validators, that brings nothing new
+        let unchanged = async |what: &str| {
+            let asked = server.requests().len();
+            assert_eq!(mgr.update_now(&key).await, Some(Ok(())), "{what}");
+            let reqs = server.requests();
+            assert_eq!(reqs.len(), asked + 1, "{what}");
+            assert!(reqs[asked].header("if-none-match").is_some(), "{what}");
+            assert_eq!(h.version(), 1, "{what}");
+            let (data, meta) = dir.load().unwrap_or_else(|| panic!("no cache: {what}"));
+            assert_eq!(&data[..], b"romeo", "{what}");
+            assert_eq!(meta.sha256, written.sha256, "{what}");
+            assert!(meta.fetched_time() > written.fetched_time(), "{what}");
+        };
+
+        // intact: the body is not written again, which its time shows
+        let long_ago = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        unchanged("an intact cache").await;
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            long_ago
+        );
+
+        std::fs::write(&file, "rom").unwrap();
+        assert!(dir.load().is_none());
+        unchanged("a body cut short").await;
+
+        std::fs::remove_file(&file).unwrap();
+        unchanged("no body").await;
+
+        let mut other = written.clone();
+        other.sha256 = Some(format!("{:x}", Sha256::digest(b"another")));
+        dir.store_meta(&other).unwrap();
+        assert!(dir.load().is_none());
+        unchanged("the metadata of another body").await;
+
+        std::fs::remove_file(dir.path().join("meta.json")).unwrap();
+        unchanged("no metadata").await;
+
+        // a body that another writer put there whole, with its own metadata
+        let mut theirs = Meta {
+            url: url.to_string(),
+            ..Meta::default()
+        };
+        dir.store(b"somebody else's", &mut theirs).unwrap();
+        assert!(dir.load().is_some());
+        unchanged("the whole entry of another writer").await;
+    }
+
+    /// A cache from before the digest was kept is taken as it is, and gets
+    /// its digest with the first answer that says the body has not changed.
+    #[tokio::test]
+    async fn a_cache_from_before_the_digest_gets_one_when_it_is_confirmed() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/l", "lima");
+        let url = server.url("/l");
+        let source = ResourceSource::Url(url.clone());
+        let dir = cache_of(root.path(), &url);
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join("data"), "lima").unwrap();
+        // checked long ago, so that it is due; the validator is the test
+        // server's, which is the digest of the body in quotes
+        let digest = format!("{:x}", Sha256::digest(b"lima"));
+        std::fs::write(
+            dir.path().join("meta.json"),
+            format!(
+                r#"{{"url":"{url}","etag":"\"{digest}\"","last_modified":null,"fetched_at":1700000000}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(dir.load().expect("a cache").1.sha256, None);
+
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url.clone(), None));
+        assert_eq!(available_version(&h.current()), Some(1));
+        wait_until("the check to be recorded", || {
+            server.hits("/l") == 1
+                && status_of(&mgr, &source).state == "available"
+                && dir.load().is_some_and(|(_, meta)| meta.sha256.is_some())
+        })
+        .await;
+        let reqs = server.requests();
+        assert!(reqs[0].header("if-none-match").is_some(), "{reqs:?}");
+        assert_eq!(h.version(), 1);
+        let (data, meta) = dir.load().expect("a cache");
+        assert_eq!(&data[..], b"lima");
+        assert_eq!(meta.sha256, Some(digest));
     }
 
     #[tokio::test]
@@ -3347,7 +3503,8 @@ mod tests {
 
     /// A write that fails leaves the entry ahead of its disk. The next check
     /// that succeeds brings the disk up to date, the body included: a restart
-    /// would otherwise find the old body with validators that call it current.
+    /// would otherwise find the old body beside the metadata of the new one,
+    /// which is no entry.
     #[tokio::test]
     async fn the_disk_catches_up_after_a_write_that_failed() {
         let lines = Lines::default();
@@ -3521,10 +3678,10 @@ mod tests {
     }
 
     /// The cache writes the body, then the metadata, and a write that fails
-    /// may have got as far as the body. The entry has not taken that body, so
-    /// the next check that succeeds puts back the one it holds: a restart
-    /// would otherwise find the body that was not taken beside validators
-    /// that call it current.
+    /// may have got as far as the body. The entry has not taken that body,
+    /// and beside the metadata of the one before it is no entry: whoever
+    /// reads the disk finds none, and a restart would ask for the whole body.
+    /// The next check that succeeds puts back the body the entry holds.
     #[tokio::test]
     async fn the_disk_is_put_right_after_a_write_that_got_as_far_as_the_body() {
         let root = tempfile::tempdir().unwrap();
@@ -3545,11 +3702,13 @@ mod tests {
             .expect_err("the metadata cannot be written");
         assert!(told.starts_with("cannot write the cache: "), "{told}");
         assert_eq!(&h.current().data().unwrap().0[..], b"A");
+        let file = cache_file(root.path(), &url);
         assert_eq!(
-            &cached_copy(root.path(), &url).unwrap().data[..],
+            std::fs::read(&file).unwrap(),
             b"B",
             "the body got to the disk"
         );
+        assert!(cached_copy(root.path(), &url).is_none());
 
         // The server is back at what the entry holds. An attempt that begins
         // after this is awaited before the way is cleared, so that none that
@@ -3583,11 +3742,13 @@ mod tests {
         mgr.adopt(&source, Bytes::from_static(b"X"))
             .expect_err("the metadata cannot be written");
         assert_eq!(&h.current().data().unwrap().0[..], b"A");
+        let file = cache_file(root.path(), &url);
         assert_eq!(
-            &cached_copy(root.path(), &url).unwrap().data[..],
+            std::fs::read(&file).unwrap(),
             b"X",
             "the body got to the disk"
         );
+        assert!(cached_copy(root.path(), &url).is_none());
 
         std::fs::remove_dir(&blocked).unwrap();
         assert_eq!(updated(&mgr, &key).await, Some(Ok(())));

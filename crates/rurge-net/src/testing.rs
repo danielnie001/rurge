@@ -197,7 +197,7 @@ pub fn seed_cache(root: &Path, url: &Url, data: &[u8], fetched_at: SystemTime) {
     };
     meta.stamp(fetched_at);
     CacheDir::for_url(root, url.as_str())
-        .store(data, &meta)
+        .store(data, &mut meta)
         .expect("seed the cache");
 }
 

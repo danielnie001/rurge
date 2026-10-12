@@ -19,6 +19,14 @@ pub struct Meta {
     /// added has none: 0.
     #[serde(default)]
     pub fetched_subsec_nanos: u32,
+    /// The SHA-256 of the body the validators and the time belong to, in
+    /// lower-case hex. `store` sets it, and `load` gives nothing when the
+    /// body on disk is another: validators sent for a body that is not the
+    /// one they were given for would be answered with "nothing has changed"
+    /// for as long as the server keeps its version. A cache from before it
+    /// was added has none, and its body is taken as it is.
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 impl Meta {
@@ -40,7 +48,9 @@ impl Meta {
     }
 }
 
-/// The URL by where it goes: its path and query often carry a token.
+/// The URL by where it goes: its path and query often carry a token. The
+/// digest by whether there is one: it is made from a body that can hold
+/// credentials.
 impl std::fmt::Debug for Meta {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Meta {
@@ -49,18 +59,29 @@ impl std::fmt::Debug for Meta {
             last_modified,
             fetched_at,
             fetched_subsec_nanos,
+            sha256,
         } = self;
-        let shown = url::Url::parse(url)
-            .map(|url| super::origin(&url))
-            .unwrap_or_else(|_| "…".to_string());
         f.debug_struct("Meta")
-            .field("url", &shown)
+            .field("url", &shown(url))
             .field("etag", etag)
             .field("last_modified", last_modified)
             .field("fetched_at", fetched_at)
             .field("fetched_subsec_nanos", fetched_subsec_nanos)
+            .field("sha256", &sha256.as_ref().map(|_| "…"))
             .finish()
     }
+}
+
+/// Where a URL goes, for a `Debug` and a log line.
+fn shown(url: &str) -> String {
+    url::Url::parse(url)
+        .map(|url| super::origin(&url))
+        .unwrap_or_else(|_| "…".to_string())
+}
+
+/// The SHA-256 of a body, in lower-case hex.
+fn digest_of(body: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(body))
 }
 
 /// What names a resource's cache directory, and what the status calls its
@@ -84,15 +105,40 @@ impl CacheDir {
         &self.dir
     }
 
+    /// The body and its metadata. `None` when one of the two files is
+    /// missing, when `meta.json` cannot be read, and when the body is not the
+    /// one the metadata was written for: the two files are written one after
+    /// the other, a crash can leave either of them half done, and what is
+    /// left then is no entry. Whoever finds none asks for the whole body.
     pub fn load(&self) -> Option<(Bytes, Meta)> {
         let data = std::fs::read(self.dir.join("data")).ok()?;
         let meta_bytes = std::fs::read(self.dir.join("meta.json")).ok()?;
         let meta: Meta = serde_json::from_slice(&meta_bytes).ok()?;
+        if meta
+            .sha256
+            .as_ref()
+            .is_some_and(|digest| *digest != digest_of(&data))
+        {
+            tracing::debug!(
+                resource = %shown(&meta.url),
+                "the cached body is not the one its metadata was written for; the entry is ignored"
+            );
+            return None;
+        }
         Some((Bytes::from(data), meta))
     }
 
-    pub fn store(&self, data: &[u8], meta: &Meta) -> io::Result<()> {
+    /// Whether the two files hold, intact, the body with this digest.
+    pub fn holds(&self, digest: &str) -> bool {
+        self.load()
+            .is_some_and(|(_, meta)| meta.sha256.as_deref() == Some(digest))
+    }
+
+    /// Writes the body and then the metadata, in which it records the digest
+    /// of the body.
+    pub fn store(&self, data: &[u8], meta: &mut Meta) -> io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
+        meta.sha256 = Some(digest_of(data));
         write_atomic(&self.dir.join("data"), data)?;
         self.store_meta(meta)
     }
@@ -119,14 +165,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let c = CacheDir::for_url(root.path(), "https://example.com/a.list");
         assert!(c.load().is_none());
-        let meta = Meta {
+        let mut meta = Meta {
             url: "https://example.com/a.list".into(),
             etag: Some("\"x\"".into()),
             last_modified: None,
             fetched_at: 42,
             fetched_subsec_nanos: 123_456_789,
+            sha256: None,
         };
-        c.store(b"hello", &meta).unwrap();
+        c.store(b"hello", &mut meta).unwrap();
         let (data, m) = c.load().unwrap();
         assert_eq!(&data[..], b"hello");
         assert_eq!(m, meta);
@@ -160,7 +207,7 @@ mod tests {
         // through the file
         let root = tempfile::tempdir().unwrap();
         let c = CacheDir::for_url(root.path(), "https://example.com/a.list");
-        c.store(b"hello", &meta).unwrap();
+        c.store(b"hello", &mut meta).unwrap();
         assert_eq!(c.load().unwrap().1.fetched_time(), at);
         // a time before 1970 is the epoch
         meta.stamp(UNIX_EPOCH - Duration::from_secs(5));
@@ -181,5 +228,113 @@ mod tests {
         );
         meta.fetched_at = u64::MAX;
         assert_eq!(meta.fetched_time(), UNIX_EPOCH);
+    }
+
+    /// The digest `store` records is that of the body, and it is on disk.
+    #[test]
+    fn store_records_the_digest_of_the_body() {
+        let root = tempfile::tempdir().unwrap();
+        let c = CacheDir::for_url(root.path(), "https://example.com/a.list");
+        let mut meta = Meta::default();
+        c.store(b"hello", &mut meta).unwrap();
+        // the SHA-256 of "hello"
+        let digest = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        assert_eq!(meta.sha256.as_deref(), Some(digest));
+        assert_eq!(c.load().unwrap().1.sha256.as_deref(), Some(digest));
+        // a body written over it is recorded in its turn: the SHA-256 of nothing
+        c.store(b"", &mut meta).unwrap();
+        let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_eq!(meta.sha256.as_deref(), Some(empty));
+        let (data, on_disk) = c.load().unwrap();
+        assert_eq!(
+            (&data[..], on_disk.sha256.as_deref()),
+            (&b""[..], Some(empty))
+        );
+    }
+
+    /// What a crash, a second writer or a hand can leave: a body that is not
+    /// the one the metadata was written for. That is no entry.
+    #[test]
+    fn a_body_the_metadata_was_not_written_for_is_no_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let c = CacheDir::for_url(root.path(), "https://example.com/a.list");
+        let mut meta = Meta::default();
+        c.store(b"hello, world", &mut meta).unwrap();
+        let body = c.path().join("data");
+        let damaged: [(&str, &[u8]); 5] = [
+            ("cut short", b"hello"),
+            ("empty", b""),
+            ("the right length and nothing in it", &[0; 12]),
+            ("one byte changed", b"hello, worle"),
+            ("one byte more", b"hello, world\n"),
+        ];
+        for (what, bytes) in damaged {
+            std::fs::write(&body, bytes).unwrap();
+            assert!(c.load().is_none(), "{what}");
+        }
+        std::fs::write(&body, b"hello, world").unwrap();
+        assert!(c.load().is_some());
+        // the metadata of another body beside this one
+        let mut other = meta.clone();
+        other.sha256 = Some(digest_of(b"another"));
+        c.store_meta(&other).unwrap();
+        assert!(c.load().is_none());
+        // and its own again
+        c.store_meta(&meta).unwrap();
+        assert_eq!(&c.load().unwrap().0[..], b"hello, world");
+    }
+
+    /// A cache written before the digest was kept has none: its body is taken
+    /// as it is.
+    #[test]
+    fn a_cache_from_before_the_digest_is_taken_as_it_is() {
+        let root = tempfile::tempdir().unwrap();
+        let c = CacheDir::for_url(root.path(), "https://example.com/a.list");
+        std::fs::create_dir_all(c.path()).unwrap();
+        std::fs::write(c.path().join("data"), "old").unwrap();
+        std::fs::write(
+            c.path().join("meta.json"),
+            r#"{"url":"https://example.com/a.list","etag":"\"x\"","last_modified":null,"fetched_at":42,"fetched_subsec_nanos":7}"#,
+        )
+        .unwrap();
+        let (data, meta) = c.load().expect("an entry");
+        assert_eq!((&data[..], meta.sha256), (&b"old"[..], None));
+        // which is not to hold a body by its digest
+        assert!(!c.holds(&digest_of(b"old")));
+    }
+
+    #[test]
+    fn holds_is_for_the_intact_body_with_that_digest() {
+        let root = tempfile::tempdir().unwrap();
+        let c = CacheDir::for_url(root.path(), "https://example.com/a.list");
+        let digest = digest_of(b"hello");
+        assert!(!c.holds(&digest), "no entry");
+        let mut meta = Meta::default();
+        c.store(b"hello", &mut meta).unwrap();
+        assert!(c.holds(&digest));
+        assert!(!c.holds(&digest_of(b"another")), "another body");
+        std::fs::write(c.path().join("data"), b"hellp").unwrap();
+        assert!(!c.holds(&digest), "a damaged body");
+        std::fs::remove_file(c.path().join("data")).unwrap();
+        assert!(!c.holds(&digest), "no body");
+    }
+
+    /// The digest is made from the body: a `Debug` says that there is one,
+    /// and no more.
+    #[test]
+    fn the_debug_of_the_metadata_does_not_show_the_digest() {
+        let mut meta = Meta {
+            url: "https://example.com/a.list?token=S3CR3T".into(),
+            ..Meta::default()
+        };
+        assert!(format!("{meta:?}").contains("sha256: None"));
+        let root = tempfile::tempdir().unwrap();
+        CacheDir::for_url(root.path(), &meta.url)
+            .store(b"hello", &mut meta)
+            .unwrap();
+        let shown = format!("{meta:?}");
+        assert!(shown.contains("sha256: Some(\"…\")"), "{shown}");
+        assert!(!shown.contains(meta.sha256.as_deref().unwrap()), "{shown}");
+        assert!(!shown.contains("S3CR3T"), "{shown}");
     }
 }

@@ -968,9 +968,10 @@ fn wait_for_the_sources(
         // server again when they are due, so a late write is as a rule one
         // more update. The exception is a write that meets the main runtime's
         // own write of the same entry: the two go through the same temporary
-        // file, and the entry can end up with parts of both. It stays so
-        // until the server sends a new body: an answer that nothing has
-        // changed does not write the body again.
+        // file, and the body can end up with parts of both. It does not match
+        // the digest that is kept beside it then, which makes the two files
+        // no entry: whoever reads the disk finds none, and the next answer of
+        // the server writes the body again, whatever it says.
         runtime.shutdown_timeout(Duration::from_secs(2));
         done
     };
