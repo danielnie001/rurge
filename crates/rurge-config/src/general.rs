@@ -1164,6 +1164,26 @@ mod tests {
         assert!(g.http_listen.is_empty() && g.socks5_listen.is_empty());
     }
 
+    /// The seven keys that left the manual are ignored, each with the one
+    /// warning, and change nothing.
+    #[test]
+    fn a_key_that_left_the_manual_is_ignored_with_a_warning() {
+        for key in [
+            "vif-mode",
+            "tls-provider",
+            "network-framework",
+            "bypass-system",
+            "bypass-tun",
+            "enhanced-mode-by-rule",
+            "allow-udp-proxy",
+        ] {
+            let (g, d) = parse(&format!("[General]\n{key} = 1\n"));
+            let said: Vec<&str> = d.iter().map(|x| x.code).collect();
+            assert_eq!(said, [codes::W_VANISHED_KEY], "{key}");
+            assert_eq!(g, General::default(), "{key}");
+        }
+    }
+
     #[test]
     fn defaults_when_section_missing() {
         let (g, d) = parse("[Rule]\nFINAL,DIRECT\n");
