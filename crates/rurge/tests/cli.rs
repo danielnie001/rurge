@@ -2760,6 +2760,127 @@ mod run {
         assert!(ok, "no rurge.log* file carried the startup INFO line");
     }
 
+    /// What `cmd` (a prepared `rurge run`) wrote to its standard output up to
+    /// its summary line: the lines its log writes before that, and the lines it
+    /// prints. The daemon is killed on the way out.
+    fn output_until_it_is_running(mut cmd: Command) -> Vec<String> {
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let lines = forward_lines(child.stdout.take().unwrap());
+        let daemon = Daemon {
+            child,
+            http: 0,
+            socks: 0,
+            lines,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut seen = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let line = daemon.lines.recv_timeout(remaining).unwrap_or_else(|e| {
+                panic!("rurge run never said it was running: {e:?}\n{seen:#?}")
+            });
+            let summary = line.starts_with("rurge ") && line.contains(" running:");
+            seen.push(line);
+            if summary {
+                return seen;
+            }
+        }
+    }
+
+    /// `loglevel` decides which of the daemon's own lines are written, and
+    /// `--log-level` decides over it: at `warning` neither the INFO line the
+    /// daemon writes when it is running nor the DEBUG lines of its listeners
+    /// are there, at `notify` the first is, at `info` and `verbose` both are.
+    #[test]
+    fn loglevel_decides_which_lines_of_its_own_the_daemon_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        // (the profile's `loglevel`, what the command line adds, whether the
+        // INFO line is written, whether the DEBUG lines are)
+        let cases: [(&str, &[&str], bool, bool); 6] = [
+            ("warning", &[], false, false),
+            ("notify", &[], true, false),
+            ("info", &[], true, true),
+            ("verbose", &[], true, true),
+            ("notify", &["--log-level", "warning"], false, false),
+            ("warning", &["--log-level", "info"], true, true),
+        ];
+        for (i, (loglevel, extra, info, debug)) in cases.into_iter().enumerate() {
+            let case = dir.path().join(format!("case{i}"));
+            std::fs::create_dir_all(&case).unwrap();
+            let conf = write_conf(
+                &case,
+                &format!(
+                    "http-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nloglevel = {loglevel}"
+                ),
+            );
+            let mut cmd = rurge_run(&conf, &case.join("data"));
+            cmd.env_remove("RURGE_LOG_LEVEL").args(extra);
+            let said = output_until_it_is_running(cmd);
+            let wrote = |level: &str, what: &str| {
+                said.iter()
+                    .any(|line| line.contains(level) && line.contains(what))
+            };
+            assert_eq!(
+                wrote(" INFO ", "rurge running"),
+                info,
+                "{loglevel} {extra:?}: {said:#?}"
+            );
+            assert_eq!(
+                wrote(" DEBUG ", "listening"),
+                debug,
+                "{loglevel} {extra:?}: {said:#?}"
+            );
+        }
+    }
+
+    /// How many finished requests the log keeps is what `--request-log-size`
+    /// or `RURGE_REQUEST_LOG_SIZE` says; without either it keeps more than the
+    /// three of this test.
+    #[test]
+    fn the_request_log_holds_as_many_requests_as_request_log_size_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        for (i, how) in ["the option", "the variable", "neither"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut cmd = rurge_run(&conf, &dir.path().join(format!("data{i}")));
+            cmd.env_remove("RURGE_REQUEST_LOG_SIZE");
+            let kept = match how {
+                "the option" => {
+                    cmd.args(["--request-log-size", "2"]);
+                    2
+                }
+                "the variable" => {
+                    cmd.env("RURGE_REQUEST_LOG_SIZE", "2");
+                    2
+                }
+                _ => 3,
+            };
+            let daemon = spawn_command(cmd);
+            let api = api_port(&daemon);
+            for _ in 0..3 {
+                let rejected = http_get(daemon.http, "http://ads.test/");
+                assert!(rejected.is_empty(), "{how}: {rejected}");
+            }
+            let (status, body) = api_call(api, "GET", "/v1/requests/recent", "k", None);
+            assert_eq!(status, 200, "{how}: {body}");
+            let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let ids: Vec<u64> = listed["requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_u64().unwrap())
+                .collect();
+            assert_eq!(ids.len(), kept, "{how}: {body}");
+            assert!(ids.windows(2).all(|w| w[0] > w[1]), "newest first: {ids:?}");
+        }
+    }
+
     /// The data directory and the log file are named by the environment as
     /// well as by the command line: with nothing but `RURGE_DATA_DIR` and
     /// `RURGE_LOG_FILE` set, `state.json` is made in the one and the startup
