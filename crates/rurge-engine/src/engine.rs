@@ -1544,6 +1544,56 @@ mod tests {
         );
     }
 
+    /// What a listener is bound with comes from the profile: the switches of
+    /// `[General]`, and the credentials of the address it listens on.
+    #[test]
+    fn the_listener_options_follow_the_profile() {
+        let spec = |auth| ListenerSpec {
+            kind: ListenerKind::Http,
+            addr: "127.0.0.1:6152".parse().unwrap(),
+            auth,
+        };
+        let kept = Engine::listener_opts(&general(""), &spec(None));
+        assert!(kept.restrict_to_lan && kept.show_error_page && !kept.show_error_page_for_reject);
+        assert!(kept.auth.is_none());
+        assert_eq!(kept.drop_hold, Duration::from_secs(30));
+        let changed = Engine::listener_opts(
+            &general(
+                "proxy-restricted-to-lan = false\nshow-error-page = false\nshow-error-page-for-reject = true",
+            ),
+            &spec(Some(HttpAuth::Password("pw".to_string()))),
+        );
+        assert!(
+            !changed.restrict_to_lan
+                && !changed.show_error_page
+                && changed.show_error_page_for_reject
+        );
+        assert_eq!(changed.auth, Some(HttpAuth::Password("pw".to_string())));
+        assert_eq!(changed.kind, ListenerKind::Http);
+    }
+
+    /// A change in any option the listeners were bound with is a change of
+    /// the surface a reload compares, so that the listeners are bound again
+    /// with it rather than left as they were.
+    #[test]
+    fn the_listener_surface_changes_with_each_option_the_listeners_are_bound_with() {
+        use crate::reload::listener_surface;
+        let surface = |text: &str| listener_surface(&general(text));
+        assert_eq!(surface(""), surface(""));
+        for changed in [
+            "proxy-restricted-to-lan = false",
+            "show-error-page = false",
+            "show-error-page-for-reject = true",
+        ] {
+            assert_ne!(surface(changed), surface(""), "{changed}");
+        }
+        assert_ne!(
+            surface("http-listen = a@127.0.0.1:7000"),
+            surface("http-listen = b@127.0.0.1:7000"),
+            "a password rotated"
+        );
+    }
+
     #[test]
     fn escalation_after_threshold_within_window() {
         let esc = Escalation::new();
@@ -1558,6 +1608,23 @@ mod tests {
         assert!(!esc.should_drop("other.test", t0 + Duration::from_secs(1)));
         // once the window slides past, the count decays
         assert!(!esc.should_drop("ads.test", t0 + ESCALATE_WINDOW + Duration::from_secs(1)));
+    }
+
+    /// The manual's threshold, in its own numbers: the fiftieth reject of one
+    /// host within thirty seconds is the first to be upgraded, and the count
+    /// falls again when the first of the fifty is thirty seconds old.
+    #[test]
+    fn fifty_rejects_within_thirty_seconds_upgrade_and_not_before() {
+        let esc = Escalation::new();
+        let t0 = std::time::Instant::now();
+        for i in 0..49 {
+            esc.record("ads.test", t0 + Duration::from_millis(i));
+        }
+        assert!(!esc.should_drop("ads.test", t0 + Duration::from_secs(1)));
+        esc.record("ads.test", t0 + Duration::from_secs(1));
+        assert!(esc.should_drop("ads.test", t0 + Duration::from_secs(1)));
+        assert!(esc.should_drop("ads.test", t0 + Duration::from_millis(29_999)));
+        assert!(!esc.should_drop("ads.test", t0 + Duration::from_secs(30)));
     }
 
     /// A reject flood to distinct hosts (a retry storm against random
