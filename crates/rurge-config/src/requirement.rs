@@ -534,6 +534,79 @@ mod tests {
         }
     }
 
+    /// Each of the 21 operators of the manual decides both ways: a case where
+    /// it holds and one where it does not, against the fixed environment
+    /// (`CORE_VERSION` 20, `SYSTEM` macOS, `DEVICE_NAME` `test-mac`).
+    #[test]
+    fn every_operator_the_manual_lists_decides_both_ways() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("=", "CORE_VERSION = 20", "CORE_VERSION = 21"),
+            ("==", "CORE_VERSION == 20", "CORE_VERSION == 21"),
+            ("!=", "CORE_VERSION != 21", "CORE_VERSION != 20"),
+            ("<>", "CORE_VERSION <> 21", "CORE_VERSION <> 20"),
+            (">", "CORE_VERSION > 19", "CORE_VERSION > 20"),
+            (">=", "CORE_VERSION >= 20", "CORE_VERSION >= 21"),
+            ("=>", "CORE_VERSION => 20", "CORE_VERSION => 21"),
+            ("<", "CORE_VERSION < 21", "CORE_VERSION < 20"),
+            ("<=", "CORE_VERSION <= 20", "CORE_VERSION <= 19"),
+            ("=<", "CORE_VERSION =< 20", "CORE_VERSION =< 19"),
+            (
+                "AND",
+                "CORE_VERSION = 20 AND SYSTEM = 'macOS'",
+                "CORE_VERSION = 20 AND SYSTEM = 'iOS'",
+            ),
+            (
+                "&&",
+                "CORE_VERSION = 20 && SYSTEM = 'macOS'",
+                "CORE_VERSION = 20 && SYSTEM = 'iOS'",
+            ),
+            (
+                "OR",
+                "CORE_VERSION = 21 OR SYSTEM = 'macOS'",
+                "CORE_VERSION = 21 OR SYSTEM = 'iOS'",
+            ),
+            (
+                "||",
+                "CORE_VERSION = 21 || SYSTEM = 'macOS'",
+                "CORE_VERSION = 21 || SYSTEM = 'iOS'",
+            ),
+            ("NOT", "NOT CORE_VERSION = 21", "NOT CORE_VERSION = 20"),
+            ("!", "!(CORE_VERSION = 21)", "!(CORE_VERSION = 20)"),
+            (
+                "BEGINSWITH",
+                "DEVICE_NAME BEGINSWITH 'test'",
+                "DEVICE_NAME BEGINSWITH 'mac'",
+            ),
+            (
+                "CONTAINS",
+                "DEVICE_NAME CONTAINS 'st-m'",
+                "DEVICE_NAME CONTAINS 'zz'",
+            ),
+            (
+                "ENDSWITH",
+                "DEVICE_NAME ENDSWITH 'mac'",
+                "DEVICE_NAME ENDSWITH 'test'",
+            ),
+            (
+                "LIKE",
+                "DEVICE_NAME LIKE 'test-*'",
+                "DEVICE_NAME LIKE 'mac*'",
+            ),
+            (
+                "MATCHES",
+                "DEVICE_NAME MATCHES '^test-m'",
+                "DEVICE_NAME MATCHES '^mac'",
+            ),
+        ];
+        assert_eq!(cases.len(), 21);
+        for (operator, holds, does_not) in cases {
+            let decide =
+                |src: &str| eval(&parse(src).unwrap_or_else(|e| panic!("{src}: {e}")), &env());
+            assert!(decide(holds), "{operator}: {holds}");
+            assert!(!decide(does_not), "{operator}: {does_not}");
+        }
+    }
+
     #[test]
     fn syntax_errors() {
         for src in [
