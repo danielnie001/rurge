@@ -951,6 +951,19 @@ mod tests {
         assert!(more.is_err());
     }
 
+    /// The manager holds the checks of the sources, and the sources hold the
+    /// manager: a check that held the sources would keep both for ever.
+    #[tokio::test(start_paused = true)]
+    async fn the_checks_do_not_keep_the_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        cached(dir.path(), "a", "one");
+        let sources = offline(dir.path());
+        sources.track(&info(&[("a", RemoteRole::Include, 3600)]));
+        let held = Arc::downgrade(&sources);
+        drop(sources);
+        assert!(held.upgrade().is_none());
+    }
+
     /// A version published a moment before its source is registered again,
     /// which the task following the source has not told of yet, is not lost
     /// with the registration.

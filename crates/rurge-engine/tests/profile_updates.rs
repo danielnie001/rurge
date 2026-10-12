@@ -23,6 +23,14 @@ const HTML: &str =
 /// The included file of the waiting tests.
 const X_BODY: &str = "[Rule]\nDOMAIN,x.example,DIRECT\n";
 
+/// An included file whose rule uses a policy that nothing defines: the
+/// profile does not load with it.
+const BROKEN: &str = "[Rule]\nDOMAIN,a.example,Nowhere\n";
+
+/// How long a file that is not there takes to say so, where the order of
+/// things is all that matters.
+const SOON: Duration = Duration::from_millis(300);
+
 /// The text of a managed profile: the line that keeps it updated from
 /// `/managed`, then `body`.
 fn managed(w: &World, body: &str) -> String {
@@ -172,17 +180,19 @@ fn pair_included(policy: &str) -> String {
     format!("[Proxy]\n{policy} = direct\n")
 }
 
-/// A managed profile and a file it includes, both downloaded, whose next
-/// versions load together and not one without the other.
+/// A managed profile and a file it includes, both downloaded, and served as
+/// they were downloaded. Their next versions load together and not one
+/// without the other. A test serves each when it is to be found: the managed
+/// profile is due, and asked for as soon as it is followed.
 async fn the_pair() -> (World, Arc<ProfileSources>) {
     let w = World::new().await;
     point_at_managed(&w, "interval=3600");
     w.seed("/managed", &pair_managed(&w, "P1"), ago(HOUR));
     w.seed("/inc", &pair_included("P1"), ago(HOUR));
+    w.server.set("/managed", pair_managed(&w, "P1"));
+    w.server.set("/inc", pair_included("P1"));
     let sources = w.sources(false);
     sources.track(&w.load());
-    w.server.set("/managed", pair_managed(&w, "P2"));
-    w.server.set("/inc", pair_included("P2"));
     (w, sources)
 }
 
@@ -205,6 +215,7 @@ fn assert_the_pair_moved(w: &World, sources: &Arc<ProfileSources>) {
 async fn the_managed_profile_that_needs_its_include_waits_for_it() {
     let (w, sources) = the_pair().await;
     // alone, the group uses a policy that nothing defines yet
+    w.server.set("/managed", pair_managed(&w, "P2"));
     let reason = update(&sources, &w, "/managed")
         .await
         .expect_err("it does not load by itself");
@@ -217,6 +228,7 @@ async fn the_managed_profile_that_needs_its_include_waits_for_it() {
     assert!(!reason.contains("resources"), "{reason}");
     assert!(reads(&sources, &w, "/managed", &pair_managed(&w, "P1")));
     // the other half arrives, and both are taken
+    w.server.set("/inc", pair_included("P2"));
     update(&sources, &w, "/inc")
         .await
         .expect("together they load");
@@ -228,6 +240,7 @@ async fn the_managed_profile_that_needs_its_include_waits_for_it() {
 async fn the_include_that_the_managed_profile_needs_waits_for_it() {
     let (w, sources) = the_pair().await;
     // alone, the group of the old version loses its policy
+    w.server.set("/inc", pair_included("P2"));
     let reason = update(&sources, &w, "/inc")
         .await
         .expect_err("it does not load by itself");
@@ -235,6 +248,7 @@ async fn the_include_that_the_managed_profile_needs_waits_for_it() {
     // the error is in a file that was not downloaded just now
     assert!(!reason.contains("(line"), "{reason}");
     assert!(reads(&sources, &w, "/inc", &pair_included("P1")));
+    w.server.set("/managed", pair_managed(&w, "P2"));
     update(&sources, &w, "/managed")
         .await
         .expect("together they load");
@@ -247,6 +261,8 @@ async fn the_include_that_the_managed_profile_needs_waits_for_it() {
 #[tokio::test]
 async fn two_updates_at_once_are_taken_together() {
     let (w, sources) = the_pair().await;
+    w.server.set("/managed", pair_managed(&w, "P2"));
+    w.server.set("/inc", pair_included("P2"));
     let (managed, included) = tokio::join!(
         update(&sources, &w, "/managed"),
         update(&sources, &w, "/inc")
@@ -259,49 +275,113 @@ async fn two_updates_at_once_are_taken_together() {
     assert_the_pair_moved(&w, &sources);
 }
 
+/// The managed profile of the three: its group uses `policy`, which `/inc`
+/// defines, and its rules include `/more`.
+fn trio_managed(w: &World, policy: &str) -> String {
+    managed(
+        w,
+        &format!(
+            "[Proxy]\n#!include {}\n[Proxy Group]\nG = select, {policy}\n[Rule]\n#!include {}\nFINAL,G\n",
+            w.url("/inc"),
+            w.url("/more")
+        ),
+    )
+}
+
+/// The rules `/more` was downloaded as.
+const MORE: &str = "[Rule]\nDOMAIN,one.example,DIRECT\n";
+
+/// A managed profile and the two files it includes, all downloaded.
+async fn the_trio() -> (World, Arc<ProfileSources>) {
+    let w = World::new().await;
+    point_at_managed(&w, "interval=3600");
+    w.seed("/managed", &trio_managed(&w, "P1"), ago(HOUR));
+    w.seed("/inc", &pair_included("P1"), ago(HOUR));
+    w.seed("/more", MORE, ago(HOUR));
+    let sources = w.sources(false);
+    sources.track(&w.load());
+    (w, sources)
+}
+
 /// A version that loads by itself is taken, and the ones that wait for a
 /// partner stay where they are.
 #[tokio::test]
 async fn a_version_that_loads_alone_leaves_the_kept_ones_where_they_are() {
-    let w = World::new().await;
-    point_at_managed(&w, "interval=3600");
-    let text = |w: &World, policy: &str| {
-        managed(
-            w,
-            &format!(
-                "[Proxy]\n#!include {}\n[Proxy Group]\nG = select, {policy}\n[Rule]\n#!include {}\nFINAL,G\n",
-                w.url("/inc"),
-                w.url("/more")
-            ),
-        )
-    };
-    w.seed("/managed", &text(&w, "P1"), ago(HOUR));
-    w.seed("/inc", &pair_included("P1"), ago(HOUR));
-    w.seed("/more", "[Rule]\nDOMAIN,one.example,DIRECT\n", ago(HOUR));
-    let sources = w.sources(false);
-    sources.track(&w.load());
-    w.server.set("/managed", text(&w, "P2"));
+    let (w, sources) = the_trio().await;
+    let more = "[Rule]\nDOMAIN,two.example,DIRECT\n";
+    w.server.set("/managed", trio_managed(&w, "P2"));
     w.server.set("/inc", pair_included("P2"));
-    w.server.set("/more", "[Rule]\nDOMAIN,two.example,DIRECT\n");
+    w.server.set("/more", more);
 
     update(&sources, &w, "/managed")
         .await
         .expect_err("it needs the other file");
     // this one loads with the old versions of the others
     update(&sources, &w, "/more").await.expect("it loads alone");
-    assert!(reads(
-        &sources,
-        &w,
-        "/more",
-        "[Rule]\nDOMAIN,two.example,DIRECT\n"
-    ));
-    assert!(reads(&sources, &w, "/managed", &text(&w, "P1")));
+    assert!(reads(&sources, &w, "/more", more));
+    assert!(reads(&sources, &w, "/managed", &trio_managed(&w, "P1")));
     // and the one that waited is found by its partner
     update(&sources, &w, "/inc")
         .await
         .expect("together they load");
-    assert!(reads(&sources, &w, "/managed", &text(&w, "P2")));
+    assert!(reads(&sources, &w, "/managed", &trio_managed(&w, "P2")));
     assert!(reads(&sources, &w, "/inc", &pair_included("P2")));
+}
+
+/// A page where an included file is meant to be is no half of a change: it
+/// is not kept, and does not stand in the way of the files that are.
+#[tokio::test]
+async fn a_page_where_a_file_is_included_does_not_stand_in_the_way_of_a_change() {
+    let (w, sources) = the_trio().await;
+    w.server.set("/managed", trio_managed(&w, "P1"));
+    w.server.set("/more", HTML);
+    let reason = update(&sources, &w, "/more")
+        .await
+        .expect_err("the page is refused");
+    assert_eq!(reason, "lacks the section it is included into");
+    // the two that change together
+    w.server.set("/managed", trio_managed(&w, "P2"));
+    update(&sources, &w, "/managed")
+        .await
+        .expect_err("it needs the other file");
+    w.server.set("/inc", pair_included("P2"));
+    update(&sources, &w, "/inc")
+        .await
+        .expect("together they load");
+    assert!(reads(&sources, &w, "/managed", &trio_managed(&w, "P2")));
+    assert!(reads(&sources, &w, "/inc", &pair_included("P2")));
+    assert!(reads(&sources, &w, "/more", MORE));
+}
+
+/// What nothing refers to is told so, whatever else is kept and for whatever
+/// reason: the reason of the versions that are kept is theirs.
+#[tokio::test]
+async fn an_address_nothing_refers_to_says_so_beside_a_version_that_does_not_load() {
+    let w = World::new().await;
+    let local = |more: &str| {
+        format!(
+            "[Proxy]\n#!include {}\n[Proxy Group]\nG = select, P1\n[Rule]\n{more}FINAL,G\n",
+            w.url("/inc")
+        )
+    };
+    w.write(&local(&format!("#!include {}\n", w.url("/more"))));
+    w.seed("/inc", &pair_included("P1"), ago(HOUR));
+    w.seed("/more", MORE, ago(HOUR));
+    let sources = w.sources(false);
+    sources.track(&w.load());
+    // the policy the group uses is gone from the included file: kept
+    w.server.set("/inc", pair_included("P2"));
+    let kept = update(&sources, &w, "/inc")
+        .await
+        .expect_err("it does not load by itself");
+    assert!(kept.starts_with("does not load: "), "{kept}");
+    // the local file stops naming the other file, and nobody has reloaded
+    w.write(&local(""));
+    w.server.set("/more", "[Rule]\nDOMAIN,two.example,DIRECT\n");
+    let reason = update(&sources, &w, "/more")
+        .await
+        .expect_err("nothing refers to it");
+    assert_eq!(reason, "the profile no longer refers to this address");
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +398,14 @@ fn new_managed(w: &World) -> String {
         w,
         &format!("[Rule]\n#!include {}\nFINAL,DIRECT\n", w.url("/x")),
     )
+}
+
+/// Nothing is at `path`, and the server takes `after` to say so: a verdict
+/// that names the address is made while its source has not been tried.
+fn not_found(w: &World, path: &str, after: Duration) {
+    w.server.set(path, "");
+    w.server.set_status(path, 404);
+    w.server.set_delay(path, after);
 }
 
 /// A managed profile that was downloaded, whose next version names `/x`.
@@ -370,7 +458,7 @@ async fn a_new_include_that_was_never_downloaded_is_waited_for() {
 #[tokio::test]
 async fn a_new_include_that_cannot_be_downloaded_does_not_hold_the_version_back() {
     let (w, sources) = the_world_of_x().await;
-    // nothing is served at /x
+    not_found(&w, "/x", SOON);
     let reason = update(&sources, &w, "/managed")
         .await
         .expect_err("the file has not been tried yet");
@@ -393,13 +481,12 @@ async fn a_new_include_that_cannot_be_downloaded_does_not_hold_the_version_back(
     assert_eq!(status.state, "failed");
 }
 
-/// Only `settle` takes it, and it does so when the file has been tried.
-#[tokio::test]
-async fn settling_takes_the_version_that_waited_once_the_file_has_been_tried() {
+/// The same world, with a back-off so long that no source is asked a second
+/// time while a test runs.
+async fn the_world_of_x_asked_once() -> (World, Arc<ProfileSources>) {
     let w = World::new().await;
     point_at_managed(&w, "interval=3600");
     w.seed("/managed", &old_managed(&w), ago(HOUR));
-    // a back-off so long that the source is not asked again meanwhile
     let sources = w.sources_with(
         false,
         ResourceOptions {
@@ -409,6 +496,68 @@ async fn settling_takes_the_version_that_waited_once_the_file_has_been_tried() {
     );
     sources.track(&w.load());
     w.server.set("/managed", new_managed(&w));
+    (w, sources)
+}
+
+/// It does not wait for the next time its own source is asked: the version is
+/// taken when the file has been tried, with the one request that brought it.
+#[tokio::test]
+async fn a_version_that_waited_is_taken_once_the_file_has_been_tried() {
+    let (w, sources) = the_world_of_x_asked_once().await;
+    not_found(&w, "/x", SOON);
+    let reason = update(&sources, &w, "/managed")
+        .await
+        .expect_err("the file has not been tried yet");
+    assert_eq!(reason, WAITING);
+    wait_until("the new version", || {
+        reads(&sources, &w, "/managed", &new_managed(&w))
+    })
+    .await;
+    assert_eq!(w.server.hits("/managed"), 1);
+    reported_once(&sources).await;
+}
+
+/// The file the new version refers to arrives and is a page. It is refused
+/// for what it is, and the version is taken without it: the line is not
+/// expanded.
+#[tokio::test]
+async fn a_new_include_that_is_refused_says_why_and_does_not_hold_the_version_back() {
+    let (w, sources) = the_world_of_x_asked_once().await;
+    w.server.set("/x", HTML);
+    update(&sources, &w, "/managed")
+        .await
+        .expect_err("the file has not been tried yet");
+    wait_until("the new version", || {
+        reads(&sources, &w, "/managed", &new_managed(&w))
+    })
+    .await;
+    assert_eq!(w.server.hits("/managed"), 1);
+    let status = sources
+        .statuses()
+        .into_iter()
+        .find(|s| s.key == w.key("/x"))
+        .expect("the file is followed");
+    let why = "lacks the section it is included into";
+    assert_eq!(
+        (status.state, status.last_error.as_deref()),
+        ("failed", Some(why))
+    );
+    reported_once(&sources).await;
+    let loaded = loaded(&w, &sources);
+    assert!(!loaded.diagnostics.has_errors());
+    assert!(
+        loaded
+            .diagnostics
+            .iter()
+            .any(|d| d.code == codes::W_RESOURCE_UNAVAILABLE && d.message.contains(why))
+    );
+}
+
+/// `settle` returns when the version that waited has been taken.
+#[tokio::test]
+async fn settling_takes_the_version_that_waited_once_the_file_has_been_tried() {
+    let (w, sources) = the_world_of_x_asked_once().await;
+    not_found(&w, "/x", SOON);
     update(&sources, &w, "/managed")
         .await
         .expect_err("the file has not been tried yet");
@@ -485,32 +634,79 @@ async fn an_unrelated_track_does_not_drop_the_source_registered_for_the_version(
     reported_once(&sources).await;
 }
 
-/// The server took the version back before the file it refers to arrived:
-/// the version that waited is not what the server gives, and is not taken.
-#[tokio::test]
-async fn a_version_the_server_took_back_is_not_taken_when_its_file_arrives() {
-    let (w, sources) = the_world_of_x().await;
-    w.server.set("/x", X_BODY);
-    w.server.set_delay("/x", Duration::from_secs(3));
-    update(&sources, &w, "/managed")
+/// A version waits for `/x`, and the server takes it back before `/x` has
+/// answered: the version is not what the server gives and is not taken, and
+/// `/x`, which nothing refers to, is let go of whatever it answers.
+async fn a_version_the_server_took_back_is_not_taken(w: &World, sources: &Arc<ProfileSources>) {
+    update(sources, w, "/managed")
         .await
         .expect_err("it waits for the file");
     // the old version again: the next attempt finds the copy up to date
-    w.server.set("/managed", old_managed(&w));
+    w.server.set("/managed", old_managed(w));
     wait_until("the old version to be confirmed", || {
         let status = &sources.statuses()[0];
         status.state == "available" && status.last_error.is_none()
     })
     .await;
-    // the file arrives: nothing refers to it, and it is let go of
+    // the file has answered: nothing refers to it, and it is let go of
     wait_until("the file to be let go of", || sources.statuses().len() == 1).await;
-    assert!(reads(&sources, &w, "/managed", &old_managed(&w)));
+    assert!(reads(sources, w, "/managed", &old_managed(w)));
     assert_eq!(sources.statuses()[0].state, "available");
     assert!(sources.update(&w.key("/x")).await.is_none());
-    // No version moved: the old version was confirmed, and what arrived was
-    // let go of. A report that was due would come a quiet second after the
-    // move, and 300 ms more is the margin.
-    stays_quiet(&sources, QUIET + Duration::from_millis(300)).await;
+    // No version moved: the old version was confirmed, and the file was let
+    // go of. A report that was due would come a quiet second after the move,
+    // and 300 ms more is the margin.
+    stays_quiet(sources, QUIET + Duration::from_millis(300)).await;
+}
+
+#[tokio::test]
+async fn a_version_the_server_took_back_is_not_taken_when_its_file_arrives() {
+    let (w, sources) = the_world_of_x().await;
+    w.server.set("/x", X_BODY);
+    w.server.set_delay("/x", Duration::from_secs(3));
+    a_version_the_server_took_back_is_not_taken(&w, &sources).await;
+}
+
+/// The file cannot be downloaded: no body arrives, and so no verdict that
+/// would find the version gone.
+#[tokio::test]
+async fn a_version_the_server_took_back_is_let_go_of_when_its_file_cannot_be_downloaded() {
+    let (w, sources) = the_world_of_x().await;
+    not_found(&w, "/x", Duration::from_millis(1500));
+    a_version_the_server_took_back_is_not_taken(&w, &sources).await;
+}
+
+/// The copy was downloaded by this process, so the server is asked whether it
+/// changed, and says "not modified" when it has taken the version back.
+#[tokio::test]
+async fn a_version_the_server_took_back_by_saying_not_modified_is_not_taken() {
+    let w = World::new().await;
+    point_at_managed(&w, "interval=3600");
+    w.server.set("/managed", old_managed(&w));
+    let sources = w.sources(false);
+    sources.track(&w.load());
+    // the first download, and the generation that reads it
+    timeout(Duration::from_secs(4), sources.changed())
+        .await
+        .expect("the first download is reported");
+    sources.track(&w.load());
+    w.server.set("/managed", new_managed(&w));
+    w.server.set("/x", X_BODY);
+    w.server.set_delay("/x", Duration::from_millis(1500));
+    a_version_the_server_took_back_is_not_taken(&w, &sources).await;
+    // every request after the first asked whether the copy had changed, and
+    // the last ones were answered with the copy the process holds
+    let conditional: Vec<bool> = w
+        .server
+        .requests()
+        .iter()
+        .filter(|r| r.path == "/managed")
+        .map(|r| r.header("if-none-match").is_some())
+        .collect();
+    assert!(
+        conditional.len() >= 3 && !conditional[0] && conditional[1..].iter().all(|c| *c),
+        "{conditional:?}"
+    );
 }
 
 /// A version that waited for a file is replaced by one that does not refer
@@ -536,6 +732,96 @@ async fn a_source_only_a_withdrawn_version_named_is_let_go_of() {
     reported_once(&sources).await;
 }
 
+/// A version of the managed profile whose rules include `files`, then have
+/// `rule`.
+fn including(w: &World, files: &[&str], rule: &str) -> String {
+    let mut body = String::from("[Rule]\n");
+    for file in files {
+        body += &format!("#!include {}\n", w.url(file));
+    }
+    managed(w, &format!("{body}{rule}FINAL,DIRECT\n"))
+}
+
+/// The rules `/a` was downloaded as.
+const A_BODY: &str = "[Rule]\nDOMAIN,a.example,DIRECT\n";
+
+/// A managed profile that includes `/a`, where a file that does not load is
+/// served for `/a`: it was refused, and is kept. No source is asked a second
+/// time while a test runs.
+async fn the_world_with_a_refused_file() -> (World, Arc<ProfileSources>) {
+    let w = World::new().await;
+    point_at_managed(&w, "interval=3600");
+    let first = including(&w, &["/a"], "");
+    w.seed("/managed", &first, ago(HOUR));
+    w.seed("/a", A_BODY, ago(HOUR));
+    w.server.set("/managed", first);
+    w.server.set("/a", BROKEN);
+    let sources = w.sources_with(
+        false,
+        ResourceOptions {
+            min_backoff: Duration::from_secs(60),
+            ..fast()
+        },
+    );
+    sources.track(&w.load());
+    let reason = update(&sources, &w, "/a")
+        .await
+        .expect_err("it does not load");
+    assert!(reason.starts_with("does not load: "), "{reason}");
+    (w, sources)
+}
+
+/// A file that stays refused does not keep the file of a withdrawn version
+/// followed: what the loads of a verdict did not name is let go of, whatever
+/// else is kept.
+#[tokio::test]
+async fn a_source_of_a_withdrawn_version_is_let_go_of_while_another_file_is_refused() {
+    let (w, sources) = the_world_with_a_refused_file().await;
+    // a version that refers to a file that was never downloaded
+    w.server.set("/x", X_BODY);
+    w.server.set_delay("/x", Duration::from_secs(3));
+    w.server.set("/managed", including(&w, &["/a", "/x"], ""));
+    let reason = update(&sources, &w, "/managed")
+        .await
+        .expect_err("it waits for the file");
+    assert_eq!(reason, WAITING);
+    assert_eq!(sources.statuses().len(), 3);
+    // and the next one, which does not
+    let third = including(&w, &["/a"], "DOMAIN,third.example,DIRECT\n");
+    w.server.set("/managed", third.clone());
+    update(&sources, &w, "/managed")
+        .await
+        .expect("this version names nothing that is missing");
+    assert!(reads(&sources, &w, "/managed", &third));
+    let keys: Vec<_> = sources.statuses().into_iter().map(|s| s.key).collect();
+    assert_eq!(keys, [w.key("/managed"), w.key("/a")]);
+    assert!(sources.update(&w.key("/x")).await.is_none());
+}
+
+/// Nor does it hold back a version that waited beside it: once the file the
+/// version waited for has been tried, the version is judged without the one
+/// that does not load.
+#[tokio::test]
+async fn a_version_that_waited_is_taken_beside_a_file_that_stays_refused() {
+    let (w, sources) = the_world_with_a_refused_file().await;
+    not_found(&w, "/x", SOON);
+    let second = including(&w, &["/a", "/x"], "");
+    w.server.set("/managed", second.clone());
+    let reason = update(&sources, &w, "/managed")
+        .await
+        .expect_err("it waits for the file");
+    assert_eq!(reason, WAITING);
+    let asked = w.server.hits("/managed");
+    wait_until("the new version", || {
+        reads(&sources, &w, "/managed", &second)
+    })
+    .await;
+    // by the last look, and not by its source being asked again
+    assert_eq!(w.server.hits("/managed"), asked);
+    // the file that does not load is not taken with it
+    assert!(reads(&sources, &w, "/a", A_BODY));
+}
+
 /// The local profile cannot be read when the version is judged: it is not
 /// taken, and the next attempt takes it once the file is back.
 #[tokio::test]
@@ -553,7 +839,12 @@ async fn a_version_is_not_taken_while_the_local_profile_cannot_be_read() {
     let reason = update(&sources, &w, "/managed")
         .await
         .expect_err("the profile cannot be read");
-    assert!(reason.starts_with("does not load: cannot read"), "{reason}");
+    assert!(
+        reason.starts_with("does not load: the local profile cannot be read ("),
+        "{reason}"
+    );
+    // not where the profile is
+    assert!(!reason.contains("main.conf"), "{reason}");
     assert!(reads(&sources, &w, "/managed", &old));
     std::fs::remove_dir(w.profile()).unwrap();
     point_at_managed(&w, "interval=3600");
@@ -570,6 +861,10 @@ async fn a_version_is_not_taken_while_the_local_profile_cannot_be_read() {
 /// A managed profile that asks for updates every minute and was checked two
 /// hours ago.
 async fn a_strict_world() -> (World, Arc<ProfileSources>) {
+    a_strict_world_with(fast()).await
+}
+
+async fn a_strict_world_with(resources: ResourceOptions) -> (World, Arc<ProfileSources>) {
     let w = World::new().await;
     point_at_managed(&w, "interval=60 strict=true");
     let strict = |w: &World, body: &str| {
@@ -579,7 +874,7 @@ async fn a_strict_world() -> (World, Arc<ProfileSources>) {
         )
     };
     w.seed("/managed", &strict(&w, COPY), ago(2 * HOUR));
-    let sources = w.sources(false);
+    let sources = w.sources_with(false, resources);
     sources.track(&w.load());
     w.server.set(
         "/managed",
@@ -603,6 +898,68 @@ async fn a_version_that_waits_is_no_failed_update() {
         .expect_err("it waits for the file");
     assert_eq!(reason, WAITING);
     assert_eq!(sources.strict(), None);
+}
+
+/// A version that by itself does not load, and waits together with one that
+/// was kept, is one that waits.
+#[tokio::test]
+async fn a_version_that_waits_with_one_that_was_refused_is_no_failed_update() {
+    let w = World::new().await;
+    point_at_managed(&w, "interval=60 strict=true");
+    let text = |policy: &str, more: &str| {
+        format!(
+            "#!MANAGED-CONFIG {} interval=60 strict=true\n[Proxy]\n#!include {}\n[Proxy Group]\nG = select, {policy}\n[Rule]\n{more}FINAL,G\n",
+            w.url("/managed"),
+            w.url("/inc")
+        )
+    };
+    w.seed("/managed", &text("P1", ""), ago(2 * HOUR));
+    w.seed("/inc", &pair_included("P1"), ago(HOUR));
+    let sources = w.sources(false);
+    sources.track(&w.load());
+    // the included file changes first, and does not load by itself
+    w.server.set("/inc", pair_included("P2"));
+    update(&sources, &w, "/inc")
+        .await
+        .expect_err("it does not load by itself");
+    // the profile that goes with it refers to a file that was never downloaded
+    w.server.set("/x", X_BODY);
+    w.server.set_delay("/x", Duration::from_secs(3));
+    w.server.set(
+        "/managed",
+        text("P2", &format!("#!include {}\n", w.url("/x"))),
+    );
+    let reason = update(&sources, &w, "/managed")
+        .await
+        .expect_err("it waits for the file");
+    assert_eq!(reason, WAITING);
+    assert_eq!(sources.strict(), None);
+}
+
+/// The file the version waited for has been tried, and by then the version
+/// does not load: it is no longer one that waits, and the update has failed.
+#[tokio::test]
+async fn a_version_that_waited_and_does_not_load_any_more_is_a_failed_update() {
+    // no source is asked a second time: the last look is all that can say so
+    let (w, sources) = a_strict_world_with(ResourceOptions {
+        min_backoff: Duration::from_secs(60),
+        ..fast()
+    })
+    .await;
+    not_found(&w, "/x", Duration::from_secs(1));
+    let reason = update(&sources, &w, "/managed")
+        .await
+        .expect_err("it waits for the file");
+    assert_eq!(reason, WAITING);
+    let asked = w.server.hits("/managed");
+    // the local profile is in the way of the last look
+    std::fs::remove_file(w.profile()).unwrap();
+    std::fs::create_dir(w.profile()).unwrap();
+    wait_until("the update to count as failed", || {
+        sources.strict().is_some()
+    })
+    .await;
+    assert_eq!(w.server.hits("/managed"), asked);
 }
 
 /// The update was downloaded and does not load: the profile requires an
@@ -1025,10 +1382,12 @@ async fn the_start_takes_a_version_that_waited_for_a_file_that_cannot_be_downloa
         w.url("/x")
     ));
     w.server.set("/managed", new.clone());
+    not_found(&w, "/x", SOON);
     let first = first_load(&w);
     let need = boot_need(&first, &w.data());
     assert_eq!(need, Boot::Wait);
-    // a back-off so long that only the start itself can take the version
+    // a back-off so long that its source being asked again cannot be what
+    // takes the version
     let sources = w.sources_with(
         false,
         ResourceOptions {
@@ -1047,7 +1406,6 @@ async fn the_start_takes_a_version_that_waited_for_a_file_that_cannot_be_downloa
         "{}",
         said(&loaded)
     );
-    assert_eq!(sources.strict(), None);
 }
 
 /// A copy that no longer loads is replaced by one that does.

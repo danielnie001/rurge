@@ -13,8 +13,9 @@
 //! one, then the state of the sources, then the locks of the manager: nothing
 //! takes the verdict lock while it holds either of the others.
 
-use super::{NOT_UTF8, ProfileSources, cached_text};
+use super::{MAX_BACKOFF, NOT_UTF8, ProfileSources, cached_text};
 use crate::outbounds::load_checked;
+use rurge_config::config::LoadError;
 use rurge_config::{Remote, RemoteRef, RemoteRole, RemoteSource, Severity};
 use rurge_net::resource::{ResourceManager, ResourceSource, cache_file, cached_copy, resource_key};
 use std::collections::{HashMap, HashSet};
@@ -68,10 +69,12 @@ struct Kept {
 /// - A source retired while its own check runs: the verdict may have taken
 ///   the others of a group, and the body in hand is never written. The same
 ///   outcome, until the source is registered again and downloaded.
-/// - A source registered for a version whose candidate was dropped without a
-///   verdict (the server went back to the old version), and whose own
-///   downloads keep failing, stays registered until the next verdict or the
-///   next `track` with nothing kept.
+/// - A body that is kept because the profile does not load with it, and that
+///   nothing will ever make load (an error page where the managed profile is
+///   meant to be), is judged together with every body that arrives while it
+///   is kept, and that group fails. A body that loads by itself is taken all
+///   the same; sources that have to change together are not, until the
+///   source of the kept body gives something else or confirms its copy.
 #[derive(Default)]
 pub(super) struct Verdicts {
     kept: Vec<Kept>,
@@ -173,11 +176,37 @@ impl ProfileSources {
     /// Called by the manager on a thread of the blocking pool, under none of
     /// its locks. `Err` is the reason it is not taken, and the resource's
     /// `last_error`.
-    pub(super) fn check(&self, url: &Url, body: &[u8]) -> Result<(), String> {
+    pub(super) fn check(self: &Arc<Self>, url: &Url, body: &[u8]) -> Result<(), String> {
         let mut verdicts = self.verdicts.lock().unwrap_or_else(PoisonError::into_inner);
         let outcome = self.decide(&mut verdicts, url, body);
         self.mirror(&verdicts);
+        let waits = verdicts
+            .kept
+            .iter()
+            .any(|k| k.waiting && k.candidate.url == *url);
+        drop(verdicts);
+        if waits {
+            self.judge_again_when_tried();
+        }
         outcome
+    }
+
+    /// A version was kept until the sources it refers to have been tried.
+    /// When they have been, what is kept is judged again, as `settle` does
+    /// it. A source that fails brings no body and so no verdict: without
+    /// this the version would wait for the next attempt of its own source, a
+    /// back-off later, and `strict` would not count the time. By the longest
+    /// back-off that source has been asked again, and what it brings is
+    /// judged then.
+    fn judge_again_when_tried(self: &Arc<Self>) {
+        // no runtime: nothing is downloaded either
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let sources = self.clone();
+        runtime.spawn(async move {
+            sources.settle(MAX_BACKOFF).await;
+        });
     }
 
     fn decide(&self, v: &mut Verdicts, url: &Url, body: &[u8]) -> Result<(), String> {
@@ -201,12 +230,16 @@ impl ProfileSources {
             .filter(|k| k.candidate.url != *url)
             .map(|k| k.candidate.clone())
             .collect();
+        let mut together = None;
         if !others.is_empty() {
             let group: Vec<&Candidate> = others.iter().chain([&candidate]).collect();
             match self.judge(&v.accepted, &group, &mut run) {
                 Conclusion::Passed => return self.take_together(v, &others, candidate, &run),
                 Conclusion::Waiting => waiting = true,
-                Conclusion::Refused(_) => {}
+                // what the versions that refer to it came to, when they do
+                Conclusion::Refused(reason) => {
+                    together = Some(reason).filter(|_| run.named.contains(url));
+                }
             }
         }
         let refused = match self.judge(&v.accepted, &[&candidate], &mut run) {
@@ -223,12 +256,21 @@ impl ProfileSources {
             Conclusion::Refused(reason) => Some(reason),
         };
         // A candidate that is part of a group that waits is not at fault, and
-        // `strict` is not to count the wait as a failure.
-        let reason = refused
-            .filter(|_| !waiting)
-            .unwrap_or_else(|| WAITING.to_string());
+        // `strict` is not to count the wait as a failure. One that nothing
+        // on disk refers to was judged only with the versions that do: what
+        // that came to is why it is not taken.
+        let reason = match refused {
+            Some(alone) if !waiting => together
+                .filter(|_| alone == NOT_REFERRED_TO)
+                .unwrap_or(alone),
+            _ => WAITING.to_string(),
+        };
         v.kept.retain(|k| k.candidate.url != *url);
-        self.keep(v, candidate, waiting);
+        // A body that is not what is included is no half of a change: kept,
+        // it would make every group it is judged with fail.
+        if reason != NO_SECTION {
+            self.keep(v, candidate, waiting);
+        }
         self.release(v, &run);
         Err(reason)
     }
@@ -309,8 +351,9 @@ impl ProfileSources {
     }
 
     /// What no load of this verdict named is let go of: a candidate nothing
-    /// refers to is not kept, and when none is kept the sources that were
-    /// registered for a version are dropped unless a load named them. Without
+    /// refers to is not kept, and the sources that were registered for a
+    /// version are dropped unless a load named them. Every candidate that is
+    /// kept was in one of the loads, so what it refers to was named. Without
     /// this a source that a withdrawn version named would be downloaded for
     /// ever. Nothing is let go of when no load read the profile: nothing is
     /// known then.
@@ -319,9 +362,6 @@ impl ProfileSources {
             return;
         }
         v.kept.retain(|k| run.named.contains(&k.candidate.url));
-        if !v.kept.is_empty() {
-            return;
-        }
         let mut state = self.core.lock();
         for source in std::mem::take(&mut state.tracked) {
             if source.provisional && !run.named.contains(&source.url) {
@@ -361,7 +401,13 @@ impl ProfileSources {
         }));
         let loaded = match load_checked(&self.profile, &opts) {
             Ok(loaded) => loaded,
-            Err(error) => return Conclusion::Refused(format!("does not load: {error}")),
+            // neither where the profile is nor the words of the system
+            Err(LoadError::Io { source, .. }) => {
+                return Conclusion::Refused(format!(
+                    "does not load: the local profile cannot be read ({})",
+                    source.kind()
+                ));
+            }
         };
         run.read = true;
         let found = &loaded.config.source.remote;
@@ -454,28 +500,62 @@ impl ProfileSources {
     }
 
     /// One verdict over everything that is kept: when it loads together, all
-    /// of it is taken.
+    /// of it is taken. When it does not, the versions that waited are judged
+    /// without the ones that were refused: they loaded when they were kept,
+    /// and what they waited for may have been tried by now.
+    ///
+    /// What waits after this is what a load made here says waits: a version
+    /// that waited and does not load any more is a failed update from now
+    /// on. With nothing kept the profile is read all the same: the sources
+    /// registered for a version that is gone are let go of by it.
     fn judge_kept(&self) {
         let mut verdicts = self.verdicts.lock().unwrap_or_else(PoisonError::into_inner);
         let v = &mut *verdicts;
         self.purge(v);
-        if !v.kept.is_empty() {
-            let group: Vec<Candidate> = v.kept.iter().map(|k| k.candidate.clone()).collect();
-            let refs: Vec<&Candidate> = group.iter().collect();
-            let mut run = Run::new();
-            if let Conclusion::Passed = self.judge(&v.accepted, &refs, &mut run) {
-                let (taken, failure) = self.adopt_all(&group);
-                v.kept = v.kept.split_off(taken);
+        let all: Vec<Candidate> = v.kept.iter().map(|k| k.candidate.clone()).collect();
+        let waited: Vec<Candidate> = v
+            .kept
+            .iter()
+            .filter(|k| k.waiting)
+            .map(|k| k.candidate.clone())
+            .collect();
+        for kept in &mut v.kept {
+            kept.waiting = false;
+        }
+        let mut run = Run::new();
+        if !self.take_kept(v, &all, &mut run) && !waited.is_empty() && waited.len() < all.len() {
+            self.take_kept(v, &waited, &mut run);
+        }
+        self.release(v, &run);
+        self.mirror(v);
+    }
+
+    /// Judges `group`, candidates that are kept: they are taken when they
+    /// load together, and wait when they load and name sources that have not
+    /// been tried. Whether it came to one of the two.
+    fn take_kept(&self, v: &mut Verdicts, group: &[Candidate], run: &mut Run) -> bool {
+        let refs: Vec<&Candidate> = group.iter().collect();
+        match self.judge(&v.accepted, &refs, run) {
+            Conclusion::Refused(_) => false,
+            Conclusion::Waiting => {
+                for kept in &mut v.kept {
+                    kept.waiting |= group.iter().any(|c| c.url == kept.candidate.url);
+                }
+                true
+            }
+            Conclusion::Passed => {
+                let (taken, failure) = self.adopt_all(group);
+                v.kept
+                    .retain(|k| !group[..taken].iter().any(|c| c.url == k.candidate.url));
                 if let Some(error) = failure {
                     tracing::warn!(
                         error = %error,
                         "cannot write the cache while the downloaded versions are taken together"
                     );
                 }
+                true
             }
-            self.release(v, &run);
         }
-        self.mirror(v);
     }
 }
 
@@ -740,6 +820,24 @@ mod tests {
         assert!(late.is_err(), "{late:?}");
         assert_eq!(f.kept(), [f.server.url("/b")]);
         assert!(f.accepted().is_empty());
+    }
+
+    /// The last look finds a version that still waits: a source it names has
+    /// not been tried. It goes on waiting.
+    #[tokio::test]
+    async fn a_version_that_still_waits_at_the_last_look_goes_on_waiting() {
+        let f = Fixture::new().await;
+        // `/a` includes a file that takes long to arrive
+        f.server.set("/c", "[Proxy]\nP3 = direct\n");
+        f.server.set_delay("/c", Duration::from_secs(5));
+        let a2 = format!("[Proxy]\n#!include {}\nP1 = direct\n", f.server.url("/c"));
+        assert!(f.check("/a", &a2).await.is_err());
+        let sources = f.sources.clone();
+        tokio::task::spawn_blocking(move || sources.judge_kept())
+            .await
+            .unwrap();
+        assert_eq!(f.kept(), [f.server.url("/a")]);
+        assert_eq!(f.sources.core.lock().kept, [(f.server.url("/a"), true)]);
     }
 
     /// The cache cannot be written for one of the kept candidates: what was
