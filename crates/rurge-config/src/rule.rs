@@ -1002,6 +1002,44 @@ mod tests {
         );
     }
 
+    /// The three port rules share one grammar (manual, Source and Port
+    /// Rules): a number, a closed range and the four comparisons. Each form
+    /// decides both ways at the edge of what it says.
+    #[test]
+    fn every_port_expression_the_manual_lists_decides_both_ways() {
+        // (written, ports it matches, ports it does not)
+        let cases: &[(&str, &[u16], &[u16])] = &[
+            ("6152", &[6152], &[6151, 6153]),
+            ("10000-20000", &[10000, 15000, 20000], &[9999, 20001]),
+            (">=50000", &[50000, 50001, 65535], &[49999]),
+            ("<=1024", &[0, 1024], &[1025, 65535]),
+            (">1023", &[1024, 65535], &[0, 1023]),
+            ("<1024", &[0, 1023], &[1024, 1025]),
+        ];
+        for (written, inside, outside) in cases {
+            for ty in ["DEST-PORT", "SRC-PORT", "IN-PORT"] {
+                let line = format!("{ty},{written},DIRECT");
+                let rule = parse(&line).unwrap_or_else(|e| panic!("{line}: {}", e.message));
+                let expr = match rule.kind {
+                    RuleKind::DestPort(e) | RuleKind::SrcPort(e) | RuleKind::InPort(e) => e,
+                    other => panic!("{line}: {other:?}"),
+                };
+                for port in *inside {
+                    assert!(expr.matches(*port), "{line} matches {port}");
+                }
+                for port in *outside {
+                    assert!(!expr.matches(*port), "{line} does not match {port}");
+                }
+            }
+        }
+        // what is no port expression is a rule with an invalid value
+        for bad in ["20000-10000", ">=", "<", "abc", "65536", "1-2-3", ""] {
+            let line = format!("DEST-PORT,{bad},DIRECT");
+            let code = parse(&line).err().map(|e| e.code);
+            assert_eq!(code, Some(codes::E_INVALID_RULE_VALUE), "{line}");
+        }
+    }
+
     #[test]
     fn errors() {
         let code = |raw: &str| parse(raw).unwrap_err().code;
