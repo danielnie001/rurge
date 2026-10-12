@@ -8,13 +8,14 @@ use crate::capabilities;
 use anyhow::Context;
 use clap::Args;
 use rurge_api::ApiContext;
-use rurge_config::config::{LoadOptions, Platform};
+use rurge_config::config::{LoadError, LoadOptions, Loaded, Platform};
 use rurge_config::general::ControllerAccess;
 use rurge_config::general::LogLevel;
 use rurge_config::general::{Listener, parse_http_listen, parse_socks5_listen};
 use rurge_config::rule::PolicyRef;
 use rurge_config::session::ListenerKind;
 use rurge_engine::control::{Control, LogLevel as ApiLogLevel, Mode, ReloadReport};
+use rurge_engine::profile::{Boot, BootLimits, ProfileSources, boot_need, disk_remote};
 use rurge_engine::state::{STATE_FILE, State, StateStore, profile_key};
 use rurge_engine::{
     EmptyGroup, Engine, EngineShared, ListenerSpec, Running, Runtime, RuntimeOptions,
@@ -24,12 +25,14 @@ use rurge_platform::sysproxy::ProxySettings;
 use rurge_rules::OutboundMode;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::IsTerminal;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::Registry;
 use tracing_subscriber::filter::{LevelFilter, Targets};
@@ -418,6 +421,9 @@ struct Daemon<'a> {
     outbound_mode: &'a OutboundMode,
     http_api: &'a Option<ControllerAccess>,
     overrides: &'a Overrides,
+    /// The downloaded sources of the generation in use, which a reload hands
+    /// the sources of the next one.
+    sources: &'a ProfileSources,
 }
 
 fn count(diags: &rurge_config::Diagnostics, severity: rurge_config::Severity) -> usize {
@@ -464,6 +470,8 @@ async fn reload(d: &Daemon<'_>, listeners: &mut Vec<(ListenerSpec, Running)>) ->
         eprintln!("error: reload failed, keeping current config: {e}");
         return failed_report();
     }
+    // taken before the configuration moves into the runtime
+    let source = loaded.config.source.clone();
     let next = match build_engine_runtime(
         loaded.config,
         d.rt,
@@ -486,6 +494,9 @@ async fn reload(d: &Daemon<'_>, listeners: &mut Vec<(ListenerSpec, Running)>) ->
     };
     print_diagnostics(next.diagnostics());
     let surface_changed = d.engine.swap_runtime(next);
+    // The generation in use is the one whose sources are followed. A reload
+    // that failed above keeps the configuration and the tracking it had.
+    d.sources.track(&source);
     let mut rebound = false;
     // An empty list is the degraded state a failed rebind leaves behind: try
     // again even when the listener surface is unchanged, so freeing the
@@ -579,6 +590,87 @@ async fn reload_and_refresh(
         );
     }
     report
+}
+
+/// What a look at the sources asks of the engine.
+#[derive(Debug, PartialEq, Eq)]
+enum Ask {
+    /// The engine is as the sources want it.
+    Nothing,
+    /// Refuse new sessions, for this reason; `say` is whether the log says
+    /// so, which it does when the engine accepted a moment ago.
+    Refuse { why: String, say: bool },
+    /// Accept new sessions again.
+    Accept,
+}
+
+/// What the sources ask of the engine, from what `strict` says (the reason
+/// the update has failed), whether the update `strict` requires is due, and
+/// why the engine refuses sessions, if it does.
+fn what_the_sources_ask(strict: Option<&str>, due: bool, refusing: Option<&str>) -> Ask {
+    match (strict, due, refusing) {
+        (Some(why), _, None) => Ask::Refuse {
+            why: why.to_string(),
+            say: true,
+        },
+        (Some(why), _, Some(now)) if now == why => Ask::Nothing,
+        (Some(why), _, Some(_)) => Ask::Refuse {
+            why: why.to_string(),
+            say: false,
+        },
+        // An update that is under way has not failed, and has not succeeded
+        // either: whatever the engine does it goes on doing.
+        (None, true, _) => Ask::Nothing,
+        (None, false, Some(_)) => Ask::Accept,
+        (None, false, None) => Ask::Nothing,
+    }
+}
+
+/// The reason of a refusal that begins with a start whose update did not
+/// finish, when the wait for the sources ended without one.
+const UNFINISHED: &str = "the update has not finished";
+
+/// Why the engine begins by refusing sessions, if it does: the update `strict`
+/// requires has failed (its reason), or it is due and has not finished: then
+/// with the reason the wait at the start ended with, which is the failure of
+/// the same update, or with a sentence of its own when there is none.
+fn suspended_at_start(strict: Option<&str>, due: bool, waited: Option<&str>) -> Option<String> {
+    match strict {
+        Some(why) => Some(why.to_string()),
+        None if due => Some(waited.unwrap_or(UNFINISHED).to_string()),
+        None => None,
+    }
+}
+
+fn say_refusing(why: &str) {
+    tracing::warn!(
+        error = %why,
+        "managed profile: the update that strict requires has not succeeded; new sessions are refused until it does"
+    );
+}
+
+/// Makes the engine accept or refuse sessions as the sources ask. The log says
+/// it when a refusal begins and when it ends, and not while it goes on.
+fn follow_the_sources(sources: &ProfileSources, engine: &Engine) {
+    let strict = sources.strict();
+    let refusing = engine.suspended();
+    match what_the_sources_ask(
+        strict.as_ref().map(|suspended| suspended.why.as_str()),
+        sources.strict_due(),
+        refusing.as_deref(),
+    ) {
+        Ask::Nothing => {}
+        Ask::Refuse { why, say } => {
+            if say {
+                say_refusing(&why);
+            }
+            engine.suspend(Some(why));
+        }
+        Ask::Accept => {
+            engine.suspend(None);
+            tracing::info!("managed profile: updated; new sessions are accepted again");
+        }
+    }
 }
 
 /// Watches the profile and its includes, reporting each debounced burst of
@@ -750,7 +842,13 @@ fn recover_without_a_log(args: &RuntimeArgs) {
     let Ok(Some(_lock)) = lock_data_dir(&dir) else {
         return;
     };
-    if !holds_a_backup(&path) {
+    restore_what_a_crash_left(&path);
+}
+
+/// What `recover_without_a_log` does once it holds the lock: for a start that
+/// holds it already, which cannot take it a second time.
+fn restore_what_a_crash_left(path: &Path) {
+    if !holds_a_backup(path) {
         return;
     }
     let backend = match super::sysproxy::backend() {
@@ -762,7 +860,7 @@ fn recover_without_a_log(args: &RuntimeArgs) {
     };
     let recovered = match tokio::runtime::Builder::new_current_thread().build() {
         Ok(runtime) => runtime.block_on(async {
-            let (store, _) = StateStore::open(path.clone()).await;
+            let (store, _) = StateStore::open(path.to_path_buf()).await;
             SystemProxyManager::new(backend, store).recover().await
         }),
         Err(e) => Some(Err(e.to_string())),
@@ -771,7 +869,7 @@ fn recover_without_a_log(args: &RuntimeArgs) {
         // Forgetting the backup is a rewrite of `state.json`, and one that
         // fails reaches nothing but the log. A backup still there is restored
         // again by the next start, over whatever has been set since.
-        Some(Ok(())) if holds_a_backup(&path) => eprintln!(
+        Some(Ok(())) if holds_a_backup(path) => eprintln!(
             "warning: a previous run left the system proxy pointing at rurge; the saved settings were restored, but state.json could not be updated: the next start restores them again"
         ),
         Some(Ok(())) => eprintln!(
@@ -782,6 +880,114 @@ fn recover_without_a_log(args: &RuntimeArgs) {
         ),
         // not under the lock: the store has just read the file looked at above
         None => {}
+    }
+}
+
+/// Who holds the lock of the data directory while a start has no log yet.
+enum Lock {
+    /// Nobody: the start takes it once it has a log.
+    NotYet,
+    /// The start took it to download the sources of the profile, which write
+    /// to the cache, before there was a log: `None` when no lock can be had
+    /// at all, and the start goes on without one.
+    Taken(Option<File>),
+}
+
+impl Lock {
+    /// `recover_without_a_log` for whichever way the lock stands.
+    fn recover(&self, args: &RuntimeArgs) {
+        match self {
+            Lock::NotYet => recover_without_a_log(args),
+            Lock::Taken(Some(_)) => restore_what_a_crash_left(&args.data_dir().join(STATE_FILE)),
+            // nothing shows that no live instance has the backup
+            Lock::Taken(None) => {}
+        }
+    }
+}
+
+/// What the wait for the sources of the profile comes to.
+struct Waited {
+    /// The profile as it is by then. It can carry errors.
+    loaded: Loaded,
+    lock: Option<File>,
+    /// Why the update `strict` requires did not happen, when it did not.
+    reason: Option<String>,
+}
+
+/// Downloads what the profile lacks or `strict` requires, before there is a
+/// log. The downloads write to the cache in the data directory, which one
+/// instance at a time may do: the lock is taken first and kept for the whole
+/// run. `Break` is a start that ends without the profile; an error is one
+/// that ends as a profile that cannot be read does.
+fn wait_for_the_sources(
+    args: &RunArgs,
+    opts: &LoadOptions,
+    first: Loaded,
+    need: Boot,
+    data_dir: &Path,
+) -> anyhow::Result<ControlFlow<ExitCode, Waited>> {
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("cannot create data dir {}", data_dir.display()))?;
+    let lock = match lock_data_dir(data_dir) {
+        Ok(lock) => lock,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return Ok(ControlFlow::Break(ExitCode::from(1)));
+        }
+    };
+    let recover = |lock: &Option<File>| {
+        if lock.is_some() {
+            restore_what_a_crash_left(&data_dir.join(STATE_FILE));
+        }
+    };
+    let limits = BootLimits::default();
+    eprintln!(
+        "waiting for the profile's remote sources (at most {} s)",
+        limits.total.as_secs()
+    );
+    let waiting = || -> anyhow::Result<(Result<Loaded, LoadError>, Option<String>)> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let done = runtime.block_on(async {
+            let sources = ProfileSources::production(&args.config, opts, data_dir, false)?;
+            let loaded = sources.bootstrap(first, need, limits).await;
+            // what the sources say of `strict` now is what the engine begins by
+            let reason = sources.strict().map(|suspended| suspended.why);
+            Ok::<_, anyhow::Error>((loaded, reason))
+        });
+        // The runtime is ended before anything else happens. One that runs on
+        // this thread runs no task once `block_on` has returned: a download
+        // still under way stops at the await it is at, and what a download
+        // writes to the cache it writes between two awaits, in one piece.
+        // What can still be running is on the blocking pool: the check of a
+        // download, which is a load of the profile, or a name lookup. The
+        // timeout waits for those. One that is still at it after that goes on
+        // beside the main runtime: a check can write bodies it has judged to
+        // the cache, a file at a time as any download does, and the sources
+        // of the main runtime are registered from what the disk holds and ask
+        // the server again when they are due, so that a late write is at worst
+        // one more update; a lookup holds nothing of ours.
+        runtime.shutdown_timeout(Duration::from_secs(2));
+        done
+    };
+    let (loaded, reason) = match waiting() {
+        Ok(done) => done,
+        Err(e) => {
+            recover(&lock);
+            return Err(e);
+        }
+    };
+    match loaded {
+        Ok(loaded) => Ok(ControlFlow::Continue(Waited {
+            loaded,
+            lock,
+            reason,
+        })),
+        Err(e) => {
+            recover(&lock);
+            Err(e.into())
+        }
     }
 }
 
@@ -798,19 +1004,41 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             }
         };
     let platform = args.platform.unwrap_or_else(Platform::current);
-    let opts = LoadOptions {
+    let data_dir = args.runtime.data_dir();
+    let mut opts = LoadOptions {
         environment: super::environment(platform, capabilities::CORE_VERSION),
         platform,
         capabilities: capabilities::current(),
-        remote: None,
+        // what an earlier run downloaded: a profile asks the disk about the
+        // addresses it names, and nothing else is read or made
+        remote: Some(disk_remote(&data_dir)),
     };
-    // A profile that does not load ends the start here, in one of two ways;
-    // in both, what a crashed run left behind is put back on the way out.
-    let loaded = rurge_engine::load_checked(&args.config, &opts)
+    // A profile that cannot be read ends the start here, and one that has
+    // errors ends it below, once what it lacks has been waited for; in both,
+    // what a crashed run left behind is put back on the way out.
+    let first = rurge_engine::load_checked(&args.config, &opts)
         .inspect_err(|_| recover_without_a_log(&args.runtime))?;
+    let need = if args.runtime.no_network {
+        Boot::No
+    } else {
+        boot_need(&first, &data_dir)
+    };
+    // A profile whose sources are downloaded and not all there is waited for
+    // before there is a log, and the profile that results is the one the
+    // start goes on with. Anything else is the profile as the disk has it.
+    let (loaded, lock, boot_reason) = if need == Boot::No {
+        (first, Lock::NotYet, None)
+    } else {
+        match wait_for_the_sources(&args, &opts, first, need, &data_dir)? {
+            ControlFlow::Break(code) => return Ok(code),
+            ControlFlow::Continue(waited) => {
+                (waited.loaded, Lock::Taken(waited.lock), waited.reason)
+            }
+        }
+    };
     if loaded.diagnostics.has_errors() {
         print_diagnostics(&loaded.diagnostics.sorted());
-        recover_without_a_log(&args.runtime);
+        lock.recover(&args.runtime);
         return Ok(ExitCode::from(2));
     }
     print_diagnostics(&loaded.diagnostics.sorted());
@@ -819,7 +1047,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // policy ends the start as an option that cannot be read does.
     if let Err(message) = apply(&mut cfg, &overrides) {
         eprintln!("error: {message}");
-        recover_without_a_log(&args.runtime);
+        lock.recover(&args.runtime);
         return Ok(ExitCode::from(2));
     }
     // A log file that cannot be opened ends it as well, and in the same way.
@@ -828,14 +1056,26 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             .unwrap_or_else(|| level_for(&cfg.general.loglevel)),
         args.log_file.as_deref(),
     )
-    .inspect_err(|_| recover_without_a_log(&args.runtime))?;
+    .inspect_err(|_| lock.recover(&args.runtime))?;
     let rt = args.runtime.resolve(&cfg)?;
     // Named, so the lock lives until `run` returns — past the shutdown restore.
-    let _instance_lock = match lock_data_dir(&rt.data_dir) {
-        Ok(lock) => lock,
-        Err(message) => {
-            eprintln!("error: {message}");
-            return Ok(ExitCode::from(1));
+    let _instance_lock = match lock {
+        Lock::NotYet => match lock_data_dir(&rt.data_dir) {
+            Ok(lock) => lock,
+            Err(message) => {
+                eprintln!("error: {message}");
+                return Ok(ExitCode::from(1));
+            }
+        },
+        // taken before the downloads, and not to be taken twice
+        Lock::Taken(lock) => {
+            if lock.is_none() {
+                // the log did not exist when the lock was tried
+                tracing::warn!(
+                    "the data directory is not locked; running without the single-instance check"
+                );
+            }
+            lock
         }
     };
     let run_opts = RunOptions {
@@ -844,6 +1084,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     };
     let http_api = cfg.general.http_api.clone();
     // `cfg` is moved into the runtime below, so collect the watch list first.
+    // It is the files the user wrote: what is downloaded is kept in the data
+    // directory and followed by the sources. The list is made now, so a local
+    // file that a later version of the managed profile includes is watched
+    // from the next start on, as one added to the profile's own includes is.
     let cfg_paths: Vec<PathBuf> = std::iter::once(cfg.source.main.clone())
         .chain(cfg.source.includes.iter().cloned())
         .collect();
@@ -862,6 +1106,15 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         let mut sysproxy = SystemProxyManager::new(super::sysproxy::backend()?, store.clone());
         sysproxy.recover().await;
         let outbound_mode = initial_mode(explicit_mode, &store, &state).await;
+        // The sources of the profile that are downloaded, which this run
+        // follows. What a wait before the log downloaded is on the disk, and
+        // that is all they need to know of it. Every reload, and the API's
+        // check of the profile, read the profile as they do, which also says
+        // why a download failed.
+        let sources =
+            ProfileSources::production(&args.config, &opts, &rt.data_dir, rt.no_network)?;
+        opts.remote = Some(sources.remote());
+        sources.track(&cfg.source);
         // `cfg` is moved into `build_engine_runtime` next, so read its source path now.
         let mut shared = EngineShared::new(state.selections_for(&profile_key(&cfg.source.main)));
         if args.empty_group_reject {
@@ -885,6 +1138,20 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             tracing::warn!(error = %e, "state.json names a global policy that is not in the profile; ignoring it");
         }
         engine.start_sampler();
+        // An update that `strict` requires and is owed by now: the engine
+        // comes up refusing, from the first session on. The sources of this
+        // run have made no attempt yet and cannot say that one failed, so the
+        // wait before the log says it. A profile that falls due between that
+        // wait and this run's first attempt is refused for the time of the
+        // download, and accepted again when it succeeds.
+        if let Some(why) = suspended_at_start(
+            sources.strict().as_ref().map(|suspended| suspended.why.as_str()),
+            sources.strict_due(),
+            boot_reason.as_deref(),
+        ) {
+            say_refusing(&why);
+            engine.suspend(Some(why));
+        }
         let mut listeners = match engine.bind_listeners().await {
             Ok(l) => l,
             Err(e) => {
@@ -980,7 +1247,13 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             outbound_mode: &outbound_mode,
             http_api: &http_api,
             overrides: &overrides,
+            sources: &sources,
         };
+
+        // The sources are looked at once a second, and a look that is late is
+        // not made up for.
+        let mut look = tokio::time::interval(Duration::from_secs(1));
+        look.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
             let reload_signal = async {
@@ -1000,6 +1273,21 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 _ = signals.recv() => break,
                 _ = reload_signal => {
                     reload_and_refresh(&daemon, &mut listeners, &mut sysproxy).await;
+                }
+                // A source has a new version: the same reload as any other
+                // trigger, and the only one made for a download. It comes a
+                // quiet second after the version, and a refusal ends at the
+                // next look, so for up to a second new sessions run on the
+                // generation that was due.
+                _ = sources.changed() => {
+                    reload_and_refresh(&daemon, &mut listeners, &mut sysproxy).await;
+                }
+                _ = look.tick() => {
+                    follow_the_sources(&sources, &engine);
+                    // the local file has been outlived by an update
+                    if sources.outdated() {
+                        reload_and_refresh(&daemon, &mut listeners, &mut sysproxy).await;
+                    }
                 }
                 cmd = cmd_rx.recv() => match cmd {
                     Some(Command::Reload(reply)) => {
@@ -1345,6 +1633,91 @@ mod tests {
         let shown = format!("{:?}", overrides(Some("S3CR3T@127.0.0.1:9001"), None));
         assert!(!shown.contains("S3CR3T"), "{shown}");
         assert!(shown.contains("<redacted>"), "{shown}");
+    }
+
+    fn refuse(why: &str, say: bool) -> Ask {
+        Ask::Refuse {
+            why: why.to_string(),
+            say,
+        }
+    }
+
+    /// A reason `strict` gives is a refusal, whatever the other two say: the
+    /// update has failed. The log says so when the engine accepted a moment
+    /// ago, and not when it refuses already, for the same reason or another.
+    #[test]
+    fn a_failed_update_asks_for_a_refusal() {
+        for due in [true, false] {
+            assert_eq!(
+                what_the_sources_ask(Some("http status 500"), due, None),
+                refuse("http status 500", true),
+                "due: {due}"
+            );
+            assert_eq!(
+                what_the_sources_ask(Some("http status 500"), due, Some("http status 500")),
+                Ask::Nothing,
+                "due: {due}"
+            );
+            assert_eq!(
+                what_the_sources_ask(
+                    Some("http status 500"),
+                    due,
+                    Some("the update has not finished")
+                ),
+                refuse("http status 500", false),
+                "due: {due}"
+            );
+        }
+    }
+
+    /// An update that is due and has not failed is under way: it has not
+    /// succeeded, and so nothing is released; and it has not failed, so
+    /// nothing is refused. The engine is left as it is.
+    #[test]
+    fn an_update_that_is_under_way_leaves_the_engine_as_it_is() {
+        assert_eq!(what_the_sources_ask(None, true, None), Ask::Nothing);
+        assert_eq!(
+            what_the_sources_ask(None, true, Some("http status 500")),
+            Ask::Nothing
+        );
+    }
+
+    /// An update that is not due is either up to date or not asked for: a
+    /// refusal ends, once, and an engine that accepts is left alone.
+    #[test]
+    fn an_update_that_is_not_due_releases_a_refusal() {
+        assert_eq!(
+            what_the_sources_ask(None, false, Some("http status 500")),
+            Ask::Accept
+        );
+        assert_eq!(what_the_sources_ask(None, false, None), Ask::Nothing);
+    }
+
+    /// The engine comes up refusing when the sources say the update failed,
+    /// and when it is due and has not finished: with the reason the wait at
+    /// the start ended with, and without one with a sentence of its own. An
+    /// update that is not due any more is no reason, whatever the wait said.
+    #[test]
+    fn the_engine_starts_refusing_when_the_update_is_owed() {
+        let owed = Some("the update has not finished".to_string());
+        assert_eq!(
+            suspended_at_start(Some("offline"), true, Some("http status 500")),
+            Some("offline".to_string())
+        );
+        assert_eq!(
+            suspended_at_start(Some("offline"), false, None),
+            Some("offline".to_string())
+        );
+        assert_eq!(
+            suspended_at_start(None, true, Some("http status 500")),
+            Some("http status 500".to_string())
+        );
+        assert_eq!(suspended_at_start(None, true, None), owed);
+        assert_eq!(
+            suspended_at_start(None, false, Some("http status 500")),
+            None
+        );
+        assert_eq!(suspended_at_start(None, false, None), None);
     }
 
     #[test]

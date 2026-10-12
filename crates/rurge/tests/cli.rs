@@ -2054,15 +2054,17 @@ mod run {
         conf
     }
 
-    /// The one way a CLI test starts `rurge run`. P5: no test may reach the
-    /// real system proxy, so the file backend is wired in here instead of
-    /// being remembered at every call site.
-    fn rurge_run(conf: &Path, data: &Path) -> Command {
+    /// What every start of `rurge run` in these tests has in common. P5: no
+    /// test may reach the real system proxy, so the file backend is wired in
+    /// here instead of being remembered at every call site. `network` is what
+    /// goes between the profile and the data directory: whether the start
+    /// goes to the network at all, and where it would fetch GeoIP databases.
+    fn rurge_run_with(conf: &Path, data: &Path, network: &[&str]) -> Command {
         let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("rurge"));
         cmd.arg("run")
             .arg("-c")
             .arg(conf)
-            .arg("--no-network")
+            .args(network)
             .arg("--data-dir")
             .arg(data)
             .env(
@@ -2073,6 +2075,32 @@ mod run {
             .env_remove("RURGE_EMPTY_GROUP_REJECT")
             .env_remove("RURGE_LISTEN_HTTP")
             .env_remove("RURGE_LISTEN_SOCKS5");
+        cmd
+    }
+
+    /// Where on the server the two GeoIP databases of `rurge_run_online` are.
+    const COUNTRY_DATABASE: &str = "/GeoLite2-Country.mmdb";
+    const ASN_DATABASE: &str = "/GeoLite2-ASN.mmdb";
+
+    /// The way a CLI test starts `rurge run` when it has nothing to do with
+    /// the network.
+    fn rurge_run(conf: &Path, data: &Path) -> Command {
+        rurge_run_with(conf, data, &["--no-network"])
+    }
+
+    /// `rurge run` that may go to the network, and so downloads the sources
+    /// of the profile. The two GeoIP databases it would fetch from the
+    /// public internet are asked of `geo`, a server on the loopback that
+    /// answers 404 to both.
+    fn rurge_run_online(conf: &Path, data: &Path, geo: &TestServer) -> Command {
+        let country = geo.url(COUNTRY_DATABASE).to_string();
+        let asn = geo.url(ASN_DATABASE).to_string();
+        let mut cmd = rurge_run_with(
+            conf,
+            data,
+            &["--geoip-url", &country, "--geoip-asn-url", &asn],
+        );
+        cmd.env_remove("RURGE_NO_NETWORK");
         cmd
     }
 
@@ -4476,6 +4504,985 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         let mut reply = [0u8; 2];
         socks.read_exact(&mut reply).unwrap();
         assert_eq!(reply, [5, 0], "SOCKS5 without authentication");
+    }
+
+    /// The sources of the profile that are downloaded: the managed profile
+    /// (`#!MANAGED-CONFIG`) and the files a `#!include` names by a URL. Every
+    /// start here may go to the network, and everything it reaches is on the
+    /// loopback.
+    mod remote_sources {
+        use super::*;
+        use std::collections::BTreeSet;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::time::{Instant, SystemTime};
+        use url::Url;
+
+        /// What a start that has sources to wait for says first.
+        const WAITING: &str = "waiting for the profile's remote sources (at most 60 s)";
+        const TWO_HOURS: Duration = Duration::from_secs(2 * 3600);
+        /// The log line of a refusal that begins, without its `error` field,
+        /// and the one of a refusal that ends.
+        const REFUSING: &str = "the update that strict requires has not succeeded";
+        const ACCEPTING: &str = "managed profile: updated; new sessions are accepted again";
+        const PROXIES: &str = "[Proxy]\nRemoteP = http, 127.0.0.1, 1\n";
+        const RULES: &str = "[Rule]\nDOMAIN,included.test,REJECT\n";
+
+        /// One test's world: a data directory, the server the sources of the
+        /// profile are served from and the one the GeoIP databases would be.
+        struct Sources {
+            dir: tempfile::TempDir,
+            served: Arc<TestServer>,
+            geo: TestServer,
+        }
+
+        impl Sources {
+            async fn new() -> Sources {
+                Sources {
+                    dir: tempfile::tempdir().unwrap(),
+                    served: Arc::new(TestServer::spawn().await),
+                    geo: TestServer::spawn().await,
+                }
+            }
+
+            fn data(&self) -> PathBuf {
+                self.dir.path().join("data")
+            }
+
+            fn conf(&self) -> PathBuf {
+                self.dir.path().join("t.conf")
+            }
+
+            fn url(&self, path: &str) -> Url {
+                self.served.url(path)
+            }
+
+            /// The profile `rurge run` is given.
+            fn write(&self, text: &str) -> PathBuf {
+                std::fs::write(self.conf(), text).unwrap();
+                self.conf()
+            }
+
+            /// A profile that is nothing but the line that names the managed
+            /// profile at `path`.
+            fn point_at(&self, path: &str) -> PathBuf {
+                self.write(&format!("#!MANAGED-CONFIG {}\n", self.url(path)))
+            }
+
+            /// `body` is what the cache holds of `path`, checked `ago` ago.
+            fn seed(&self, path: &str, body: &str, ago: Duration) {
+                rurge_net::testing::seed_cache(
+                    &self.data(),
+                    &self.url(path),
+                    body.as_bytes(),
+                    SystemTime::now() - ago,
+                );
+            }
+
+            /// The start of `rurge run` for this world.
+            fn start(&self) -> Command {
+                rurge_run_online(&self.conf(), &self.data(), &self.geo)
+            }
+
+            /// A profile with the remote include `/rules` in its `[Rule]`.
+            fn include_rules(&self) -> PathBuf {
+                self.write(&format!(
+                    "[General]\n{API_GENERAL}\n[Proxy]\n[Rule]\n#!include {}\nFINAL,DIRECT\n",
+                    self.url("/rules")
+                ))
+            }
+        }
+
+        /// A managed profile as a server gives it: it names itself as the
+        /// place it is updated from, listens on ports of the system's
+        /// choosing and serves the API at `api`, where the test finds it.
+        fn managed_text(url: &Url, line: &str, api: u16, rules: &str) -> String {
+            format!(
+                "#!MANAGED-CONFIG {url} {line}\n[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nhttp-api = k@127.0.0.1:{api}\nloglevel = warning\n[Proxy]\n[Rule]\n{rules}FINAL,DIRECT\n"
+            )
+        }
+
+        /// A file as it is: its bytes and when it was last written.
+        fn as_it_is(path: &Path) -> (Vec<u8>, SystemTime) {
+            (
+                std::fs::read(path).unwrap(),
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+            )
+        }
+
+        /// The lines of the daemon's standard error up to and with the first
+        /// one that has `needle` in it.
+        fn stderr_up_to(lines: &mpsc::Receiver<String>, needle: &str) -> Vec<String> {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut seen = Vec::new();
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let line = lines.recv_timeout(remaining).unwrap_or_else(|_| {
+                    panic!("rurge run never wrote a line with `{needle}`; it wrote {seen:?}")
+                });
+                let found = line.contains(needle);
+                seen.push(line);
+                if found {
+                    return seen;
+                }
+            }
+        }
+
+        /// A start that ends at once, with all it said.
+        struct Gave {
+            code: Option<i32>,
+            stdout: String,
+            stderr: String,
+        }
+
+        /// `give_up`, with standard output as well.
+        fn gives_up(mut cmd: Command) -> Gave {
+            let start = describe_start(&cmd);
+            let mut child = cmd
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdout = forward_lines(child.stdout.take().unwrap());
+            let stderr = forward_lines(child.stderr.take().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("rurge run did not give up within 20 s\n  the start: {start}");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            // the pipes closed with the process: the readers are at their end
+            let all = |lines: mpsc::Receiver<String>| {
+                let mut text = String::new();
+                while let Ok(line) = lines.recv_timeout(Duration::from_secs(2)) {
+                    text += &line;
+                    text.push('\n');
+                }
+                text
+            };
+            Gave {
+                code: status.code(),
+                stdout: all(stdout),
+                stderr: all(stderr),
+            }
+        }
+
+        /// Waits until the daemon says it is running, which is when its API
+        /// is up and the loop that handles what the API asks for has begun.
+        fn up(daemon: &Daemon) {
+            wait_for_line(daemon, "api on http://");
+            wait_for_line(daemon, "rurge ");
+        }
+
+        /// `up`, and where the API is.
+        fn api_up(daemon: &Daemon) -> u16 {
+            let api = api_port(daemon);
+            wait_for_line(daemon, "rurge ");
+            api
+        }
+
+        /// Stops the daemon through its API and waits for it to end.
+        fn stop(daemon: &mut Daemon, api: u16) {
+            assert_eq!(api_call(api, "POST", "/v1/stop", "k", Some("{}")).0, 200);
+            assert_eq!(wait_for_exit(daemon, 10), Some(0), "stop exits 0");
+        }
+
+        /// Polls until `check` passes, for `secs` at the most.
+        fn wait_for(what: &str, secs: u64, mut check: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            while !check() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        /// Has the daemon write a log file in `logs`.
+        fn log_to_file(cmd: &mut Command, logs: &Path) {
+            std::fs::create_dir_all(logs).unwrap();
+            cmd.arg("--log-file").arg(logs.join("rurge.log"));
+        }
+
+        /// `log_to_file`, at a level that shows what the sources ask of the
+        /// engine as it happens (`notify` is INFO).
+        fn log_to(cmd: &mut Command, logs: &Path) {
+            cmd.args(["--log-level", "notify"]);
+            log_to_file(cmd, logs);
+        }
+
+        /// Everything the daemon has written to its log file so far.
+        fn log_text(logs: &Path) -> String {
+            let mut text = String::new();
+            for entry in std::fs::read_dir(logs).into_iter().flatten().flatten() {
+                if entry.file_name().to_string_lossy().starts_with("rurge.log") {
+                    text += &std::fs::read_to_string(entry.path()).unwrap_or_default();
+                }
+            }
+            text
+        }
+
+        fn lines_with(text: &str, needle: &str) -> Vec<String> {
+            text.lines()
+                .filter(|line| line.contains(needle))
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// The paths a server was asked for.
+        fn asked_for(server: &TestServer) -> BTreeSet<String> {
+            server.requests().into_iter().map(|r| r.path).collect()
+        }
+
+        fn current(api: u16) -> String {
+            api_call(api, "GET", "/v1/profiles/current?sensitive=1", "k", None).1
+        }
+
+        fn rules(api: u16) -> String {
+            api_call(api, "GET", "/v1/rules", "k", None).1
+        }
+
+        // ---------------------------------------------------------------
+        // the start waits for what the profile lacks
+
+        /// A cache that lacks two remote includes: the start asks for both
+        /// before it builds anything, says so, and runs with what they
+        /// bring. The profile is not written to.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_start_downloads_the_remote_includes_the_cache_lacks() {
+            let w = Sources::new().await;
+            w.served.set("/proxies", PROXIES);
+            w.served.set("/rules", RULES);
+            let conf = w.write(&format!(
+                "[General]\n{API_GENERAL}\n[Proxy]\n#!include {}\n[Rule]\n#!include {}\nFINAL,DIRECT\n",
+                w.url("/proxies"),
+                w.url("/rules")
+            ));
+            let before = as_it_is(&conf);
+            let (mut daemon, errors) = spawn_command_reading_stderr(w.start());
+            let said = stderr_up_to(&errors, WAITING);
+            assert_eq!(said.last().map(String::as_str), Some(WAITING), "{said:?}");
+            let api = api_up(&daemon);
+            let (_, policies) = api_call(api, "GET", "/v1/policies", "k", None);
+            assert!(policies.contains("RemoteP"), "{policies}");
+            assert!(rules(api).contains("DOMAIN,included.test,REJECT"));
+            for (path, body) in [("/proxies", PROXIES), ("/rules", RULES)] {
+                let copy = rurge_net::resource::cached_copy(&w.data(), &w.url(path))
+                    .unwrap_or_else(|| panic!("the cache has no copy of {path}"));
+                assert_eq!(&copy.data[..], body.as_bytes(), "{path}");
+            }
+            stop(&mut daemon, api);
+            assert_eq!(as_it_is(&conf), before, "the profile was written to");
+            // all that an online start reaches: the two sources, and the two
+            // GeoIP databases, which it asks the loopback for
+            let sources: BTreeSet<String> = ["/proxies", "/rules"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+            let databases: BTreeSet<String> = [COUNTRY_DATABASE, ASN_DATABASE]
+                .into_iter()
+                .map(String::from)
+                .collect();
+            assert!(asked_for(&w.served).is_subset(&sources));
+            assert!(asked_for(&w.geo).is_subset(&databases));
+        }
+
+        /// A profile that is nothing but the line that names the managed
+        /// profile runs on the copy it downloads. What the daemon runs on is
+        /// what the commands that read the profile see, through the data
+        /// directory; the file is not written to.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_profile_that_is_only_a_pointer_runs_on_the_downloaded_copy() {
+            let w = Sources::new().await;
+            let api = free_tcp_port();
+            let copy = managed_text(
+                &w.url("/managed"),
+                "interval=3600",
+                api,
+                "DOMAIN,copy.test,REJECT\n",
+            );
+            w.served.set("/managed", copy.clone());
+            let conf = w.point_at("/managed");
+            let before = as_it_is(&conf);
+            let (mut daemon, errors) = spawn_command_reading_stderr(w.start());
+            stderr_up_to(&errors, WAITING);
+            up(&daemon);
+            let (status, text) =
+                api_call(api, "GET", "/v1/profiles/current?sensitive=1", "k", None);
+            assert_eq!((status, text.as_str()), (200, copy.as_str()));
+            assert!(rules(api).contains("DOMAIN,copy.test,REJECT"));
+            // checked as a reload would check it
+            let (status, body) = api_call(api, "POST", "/v1/profiles/check", "k", Some("{}"));
+            assert_eq!(status, 200, "{body}");
+            assert!(
+                body.contains("\"ok\":true") && !body.contains("E0010"),
+                "{body}"
+            );
+            // the commands that read the profile find the copy in the data directory
+            rurge()
+                .arg("check")
+                .arg("-c")
+                .arg(&conf)
+                .arg("--data-dir")
+                .arg(w.data())
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("I0004"));
+            rurge()
+                .args(["status", "-c"])
+                .arg(&conf)
+                .arg("--data-dir")
+                .arg(w.data())
+                .assert()
+                .success()
+                .stdout(predicate::str::contains(format!(
+                    "rurge at http://127.0.0.1:{api}"
+                )));
+            stop(&mut daemon, api);
+            assert_eq!(as_it_is(&conf), before, "the profile was written to");
+        }
+
+        /// The managed profile cannot be had and there is nothing to run
+        /// on: the start ends with the profile's own diagnostics, which say
+        /// why. The link is a credential as a whole; only where it goes is
+        /// shown.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_profile_that_is_only_a_pointer_does_not_start_when_its_source_fails() {
+            let w = Sources::new().await;
+            let port = w.url("/").port().unwrap();
+            let link = Url::parse(&format!(
+                "http://USERMARK:PASSMARK@127.0.0.1:{port}/PATHMARK/managed.conf?token=QUERYMARK"
+            ))
+            .unwrap();
+            w.served
+                .set("/PATHMARK/managed.conf", "[Rule]\nFINAL,DIRECT\n");
+            w.served.set_status("/PATHMARK/managed.conf", 500);
+            w.write(&format!("#!MANAGED-CONFIG {link}\n"));
+            let gave = gives_up(w.start());
+            assert_eq!(gave.code, Some(2), "{}", gave.stderr);
+            assert!(gave.stderr.contains(WAITING), "{}", gave.stderr);
+            assert!(gave.stderr.contains("W0022"), "{}", gave.stderr);
+            assert!(gave.stderr.contains("http status 500"), "{}", gave.stderr);
+            assert!(w.served.hits("/PATHMARK/managed.conf") >= 1);
+            for marker in ["USERMARK", "PASSMARK", "PATHMARK", "QUERYMARK"] {
+                assert!(!gave.stdout.contains(marker), "{marker}: {}", gave.stdout);
+                assert!(!gave.stderr.contains(marker), "{marker}: {}", gave.stderr);
+            }
+        }
+
+        /// One run of the daemon over the sources of `w`, at the most detailed
+        /// log level: all it says and all it gives, and what the commands that
+        /// read the profile say of it. The run is stopped when `until` holds of
+        /// its log.
+        fn everything_a_run_shows(
+            w: &Sources,
+            conf: &Path,
+            api: u16,
+            run: u32,
+            until: impl Fn(&str) -> bool,
+        ) -> String {
+            let logs = w.dir.path().join(format!("logs-{run}"));
+            let mut cmd = w.start();
+            cmd.args(["--log-level", "verbose"]);
+            log_to_file(&mut cmd, &logs);
+            let (mut daemon, errors) = spawn_command_reading_stderr(cmd);
+            up(&daemon);
+            wait_for("the log to say what the run waits for", 30, || {
+                until(&log_text(&logs))
+            });
+            let mut shown = String::new();
+            for (method, path, body) in [
+                ("GET", "/v1/profiles/current", None),
+                ("GET", "/v1/rules", None),
+                ("POST", "/v1/profiles/check", Some("{}")),
+            ] {
+                shown += &api_call(api, method, path, "k", body).1;
+            }
+            for command in [
+                vec!["check", "-c"],
+                vec!["status", "-c"],
+                vec!["rule", "match", "first.test", "--no-network", "-c"],
+            ] {
+                let mut cmd = rurge();
+                cmd.args(&command).arg(conf).arg("--data-dir").arg(w.data());
+                let out = cmd.output().unwrap();
+                shown += &String::from_utf8_lossy(&out.stdout);
+                shown += &String::from_utf8_lossy(&out.stderr);
+            }
+            stop(&mut daemon, api);
+            let mut said: Vec<String> = errors.try_iter().collect();
+            said.extend(daemon.lines.try_iter());
+            shown += &said.join("\n");
+            shown + &log_text(&logs)
+        }
+
+        /// When the link works, it is still shown as where it goes and
+        /// nothing more: not in the daemon's log at its most detailed, not in
+        /// what it prints, not in what its API gives, not in the commands
+        /// that read the profile. The first run downloads the profile before
+        /// it has a log, the second finds the copy old and downloads a new
+        /// version while it runs.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_link_to_the_managed_profile_is_shown_as_where_it_goes_and_nothing_more() {
+            let w = Sources::new().await;
+            let api = free_tcp_port();
+            let port = w.url("/").port().unwrap();
+            let link = Url::parse(&format!(
+                "http://USERMARK:PASSMARK@127.0.0.1:{port}/PATHMARK/managed.conf?token=QUERYMARK"
+            ))
+            .unwrap();
+            let text = |rules: &str| managed_text(&link, "interval=3600", api, rules);
+            let conf = w.write(&format!("#!MANAGED-CONFIG {link}\n"));
+            w.served
+                .set("/PATHMARK/managed.conf", text("DOMAIN,first.test,REJECT\n"));
+            let mut shown = everything_a_run_shows(&w, &conf, api, 1, |_| true);
+            rurge_net::testing::seed_cache(
+                &w.data(),
+                &link,
+                text("DOMAIN,old.test,REJECT\n").as_bytes(),
+                SystemTime::now() - TWO_HOURS,
+            );
+            w.served.set(
+                "/PATHMARK/managed.conf",
+                text("DOMAIN,second.test,REJECT\n"),
+            );
+            shown += &everything_a_run_shows(&w, &conf, api, 2, |log| {
+                log.contains("resource updated") && log.contains("profile reloaded")
+            });
+            // the second run says what it did with the link, and where it goes
+            assert!(
+                shown.contains(&format!("managed profile (http://127.0.0.1:{port}/…)")),
+                "{shown}"
+            );
+            for marker in ["USERMARK", "PASSMARK", "PATHMARK", "QUERYMARK"] {
+                assert!(!shown.contains(marker), "{marker}: {shown}");
+            }
+        }
+
+        /// A profile that is whole in itself runs on its own text when its
+        /// managed profile cannot be had; the reason is a warning.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_whole_profile_runs_on_its_own_text_when_its_source_fails() {
+            let w = Sources::new().await;
+            let api = free_tcp_port();
+            let local = format!(
+                "#!MANAGED-CONFIG {} interval=3600\n[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nhttp-api = k@127.0.0.1:{api}\nloglevel = warning\n[Proxy]\n[Rule]\nDOMAIN,local.test,REJECT\nFINAL,DIRECT\n",
+                w.url("/managed")
+            );
+            w.served.set("/managed", "[Rule]\nFINAL,DIRECT\n");
+            w.served.set_status("/managed", 500);
+            w.write(&local);
+            let (mut daemon, errors) = spawn_command_reading_stderr(w.start());
+            let said = stderr_up_to(&errors, "W0022");
+            assert!(said.iter().any(|line| line == WAITING), "{said:?}");
+            assert!(
+                said.last()
+                    .is_some_and(|line| line.contains("http status 500")),
+                "{said:?}"
+            );
+            up(&daemon);
+            assert_eq!(current(api), local);
+            assert!(rules(api).contains("DOMAIN,local.test,REJECT"));
+            stop(&mut daemon, api);
+        }
+
+        /// Without the network nothing is waited for or asked: what the cache
+        /// lacks is a warning, as ever.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn offline_a_remote_include_the_cache_lacks_is_a_warning_and_nothing_is_waited_for() {
+            let w = Sources::new().await;
+            w.served.set("/rules", RULES);
+            w.include_rules();
+            let (mut daemon, errors) =
+                spawn_command_reading_stderr(rurge_run(&w.conf(), &w.data()));
+            let said = stderr_up_to(&errors, "W0022");
+            assert!(
+                said.iter().all(|line| !line.contains("waiting for")),
+                "{said:?}"
+            );
+            assert!(
+                said.last()
+                    .is_some_and(|line| line.contains("remote include not downloaded yet")),
+                "{said:?}"
+            );
+            let api = api_up(&daemon);
+            assert!(!rules(api).contains("included.test"));
+            stop(&mut daemon, api);
+            assert_eq!(w.served.requests().len(), 0, "offline asks nobody");
+        }
+
+        /// An include that is slow to answer is waited for: the start does not
+        /// come up with a warning that it is not downloaded yet.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_start_waits_for_an_include_that_is_slow_to_answer() {
+            let w = Sources::new().await;
+            w.served.set("/rules", RULES);
+            w.served.set_delay("/rules", Duration::from_secs(3));
+            w.include_rules();
+            let begun = Instant::now();
+            let (mut daemon, _errors) = spawn_command_reading_stderr(w.start());
+            assert!(
+                begun.elapsed() >= Duration::from_millis(2900),
+                "it came up after {:?}",
+                begun.elapsed()
+            );
+            let api = api_up(&daemon);
+            assert!(rules(api).contains("DOMAIN,included.test,REJECT"));
+            stop(&mut daemon, api);
+        }
+
+        /// The lock is tried before there is a log. When none can be had the
+        /// start goes on without one, as it does when it has nothing to wait
+        /// for, and says so once the log exists.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_start_that_cannot_lock_the_data_directory_says_so_once_it_has_a_log() {
+            let w = Sources::new().await;
+            // where the lock file would be there is a directory, which cannot be opened as one
+            std::fs::create_dir_all(w.data().join("rurge.lock")).unwrap();
+            w.served.set("/rules", RULES);
+            w.include_rules();
+            let logs = w.dir.path().join("logs");
+            let mut cmd = w.start();
+            log_to(&mut cmd, &logs);
+            let (mut daemon, errors) = spawn_command_reading_stderr(cmd);
+            stderr_up_to(&errors, WAITING);
+            let api = api_up(&daemon);
+            assert!(rules(api).contains("DOMAIN,included.test,REJECT"));
+            stop(&mut daemon, api);
+            let log = log_text(&logs);
+            let said = lines_with(&log, "the data directory is not locked");
+            assert_eq!(said.len(), 1, "{log}");
+            assert!(said[0].contains(" WARN "), "{said:?}");
+        }
+
+        // ---------------------------------------------------------------
+        // a start that ends before it has a log
+
+        /// A profile that still does not load once the sources have been
+        /// tried ends the start as ever, and puts back what a crashed run
+        /// left behind, with the lock that was taken for the downloads.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_profile_that_does_not_load_after_the_wait_restores_a_crashed_system_proxy() {
+            let w = Sources::new().await;
+            let data = crashed_with_the_system_proxy_on(w.dir.path());
+            w.served.set("/managed", "[Rule]\nFINAL,DIRECT\n");
+            w.served.set_status("/managed", 500);
+            w.point_at("/managed");
+            let gave = gives_up(w.start());
+            assert_eq!(gave.code, Some(2), "{}", gave.stderr);
+            assert!(gave.stderr.contains(WAITING), "{}", gave.stderr);
+            assert!(gave.stderr.contains("http status 500"), "{}", gave.stderr);
+            assert_restored(&data, &gave.stderr);
+        }
+
+        /// The downloads write to the cache, which one instance at a time
+        /// may: the data directory is locked before anything is asked for.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_start_that_must_wait_refuses_a_data_directory_another_instance_holds() {
+            let w = Sources::new().await;
+            let first = w.dir.path().join("first.conf");
+            std::fs::write(
+                &first,
+                "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nloglevel = warning\n[Rule]\nFINAL,DIRECT\n",
+            )
+            .unwrap();
+            let _holder = spawn_daemon(&first, &w.data());
+            w.served.set("/managed", "[Rule]\nFINAL,DIRECT\n");
+            w.point_at("/managed");
+            let gave = gives_up(w.start());
+            assert_eq!(gave.code, Some(1), "{}", gave.stderr);
+            assert!(
+                gave.stderr.contains("another rurge instance"),
+                "{}",
+                gave.stderr
+            );
+            assert!(!gave.stderr.contains(WAITING), "{}", gave.stderr);
+            assert_eq!(
+                w.served.requests().len(),
+                0,
+                "nothing is asked for before the lock is had"
+            );
+        }
+
+        /// An override that cannot be applied ends the start as ever, once the
+        /// sources have been waited for: it is applied to the profile the
+        /// start goes on with and to no other, so the wait is made. What a
+        /// crashed run left behind is put back.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_override_that_cannot_be_applied_after_the_wait_restores_a_crashed_system_proxy()
+        {
+            let w = Sources::new().await;
+            let data = crashed_with_the_system_proxy_on(w.dir.path());
+            let port = free_tcp_port();
+            w.served.set("/rules", RULES);
+            w.write(&format!(
+                "[General]\n{API_GENERAL}\n[Proxy]\nX = external, exec = /no/such/program, local-port = {port}\n[Rule]\n#!include {}\nFINAL,DIRECT\n",
+                w.url("/rules")
+            ));
+            let mut cmd = w.start();
+            cmd.args(["--listen-socks5", &format!("127.0.0.1:{port}")]);
+            let gave = gives_up(cmd);
+            assert_eq!(gave.code, Some(2), "{}", gave.stderr);
+            assert!(gave.stderr.contains(WAITING), "{}", gave.stderr);
+            assert!(
+                gave.stderr.contains(&format!(
+                    "error: --listen-socks5: port {port} is the `local-port` of an `external` policy\n"
+                )),
+                "{}",
+                gave.stderr
+            );
+            assert!(w.served.hits("/rules") >= 1, "the include was downloaded");
+            assert_restored(&data, &gave.stderr);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_log_file_that_cannot_be_opened_after_the_wait_restores_a_crashed_system_proxy() {
+            let w = Sources::new().await;
+            let data = crashed_with_the_system_proxy_on(w.dir.path());
+            w.served.set("/rules", RULES);
+            w.include_rules();
+            let mut cmd = w.start();
+            cmd.arg("--log-file")
+                .arg(log_file_that_cannot_be_opened(w.dir.path()));
+            let gave = gives_up(cmd);
+            assert_eq!(gave.code, Some(2), "{}", gave.stderr);
+            assert!(gave.stderr.contains(WAITING), "{}", gave.stderr);
+            assert!(
+                gave.stderr.contains("error: cannot open log file"),
+                "{}",
+                gave.stderr
+            );
+            assert!(w.served.hits("/rules") >= 1, "the include was downloaded");
+            assert_restored(&data, &gave.stderr);
+        }
+
+        /// The commands that talk to the daemon find it where the profile says,
+        /// and a managed profile says so in its copy, which is in the data
+        /// directory. No daemon is there to answer: the address they tried is
+        /// the copy's.
+        #[test]
+        fn the_commands_that_talk_to_the_daemon_read_its_address_from_the_copy() {
+            let dir = tempfile::tempdir().unwrap();
+            let link = Url::parse("https://sources.example/profile.conf").unwrap();
+            let data = dir.path().join("data");
+            let api = free_tcp_port();
+            rurge_net::testing::seed_cache(
+                &data,
+                &link,
+                managed_text(&link, "interval=3600", api, "").as_bytes(),
+                SystemTime::now() - TWO_HOURS,
+            );
+            let pointer = dir.path().join("managed.conf");
+            std::fs::write(&pointer, format!("#!MANAGED-CONFIG {link}\n")).unwrap();
+            for command in ["status", "reload", "stop"] {
+                rurge()
+                    .args([command, "-c"])
+                    .arg(&pointer)
+                    .arg("--data-dir")
+                    .arg(&data)
+                    .assert()
+                    .code(1)
+                    .stderr(predicate::str::contains(format!(
+                        "cannot reach rurge at http://127.0.0.1:{api}"
+                    )));
+            }
+            // without the copy there is no address to find, and no directory is made
+            let nothing = dir.path().join("nothing");
+            rurge()
+                .args(["status", "-c"])
+                .arg(&pointer)
+                .arg("--data-dir")
+                .arg(&nothing)
+                .assert()
+                .code(2)
+                .stderr(predicate::str::contains("http-api is not configured"));
+            assert!(!nothing.exists());
+        }
+
+        /// A mistake in the user's own file is the user's to mend: no update
+        /// is fetched to cover it, and the start says which text is in
+        /// effect.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_users_own_mistake_ends_the_start_without_an_update_to_cover_it() {
+            let w = Sources::new().await;
+            let copy = managed_text(&w.url("/managed"), "interval=3600", free_tcp_port(), "");
+            w.seed("/managed", &copy, TWO_HOURS);
+            w.served.set("/managed", copy);
+            // written after the copy was checked, and with a rule for a policy
+            // that nothing defines
+            w.write(&format!(
+                "#!MANAGED-CONFIG {} interval=3600\n[General]\n[Rule]\nDOMAIN,a.test,NoSuchPolicy\nFINAL,DIRECT\n",
+                w.url("/managed")
+            ));
+            let gave = gives_up(w.start());
+            assert_eq!(gave.code, Some(2), "{}", gave.stderr);
+            assert!(gave.stderr.contains("E0007"), "{}", gave.stderr);
+            assert!(gave.stderr.contains("I0004"), "{}", gave.stderr);
+            assert!(!gave.stderr.contains(WAITING), "{}", gave.stderr);
+            assert_eq!(w.served.requests().len(), 0, "no update was asked for");
+        }
+
+        // ---------------------------------------------------------------
+        // strict
+
+        /// The update `strict` requires is not made by the time the daemon
+        /// comes up (the server takes three seconds to say no): it refuses
+        /// sessions from the first one, with the reason the wait ended with,
+        /// and says so once. The API goes on as ever. The update the daemon
+        /// makes on its own fails as well, and that is no news.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_start_that_could_not_make_a_strict_update_refuses_sessions_from_the_first_one() {
+            let w = Sources::new().await;
+            let target = TestServer::spawn().await;
+            target.set("/hello", "hi from target");
+            let hello = format!("http://127.0.0.1:{}/hello", target.url("/").port().unwrap());
+            let api = free_tcp_port();
+            let copy = managed_text(&w.url("/managed"), "interval=60 strict=true", api, "");
+            w.seed("/managed", &copy, TWO_HOURS);
+            w.served.set("/managed", copy);
+            w.served.set_status("/managed", 500);
+            w.served.set_delay("/managed", Duration::from_secs(3));
+            w.point_at("/managed");
+            let logs = w.dir.path().join("logs");
+            let mut cmd = w.start();
+            log_to(&mut cmd, &logs);
+            let (daemon, _errors) = spawn_command_reading_stderr(cmd);
+            // the first session, right after the listening lines
+            let refused = http_get(daemon.http, &hello);
+            assert!(refused.starts_with("HTTP/1.1 502"), "{refused}");
+            assert!(refused.contains(rurge_engine::REFUSED_STRICT), "{refused}");
+            up(&daemon);
+            assert_eq!(
+                api_call(api, "GET", "/v1/outbound", "k", None),
+                (200, r#"{"mode":"rule"}"#.to_string())
+            );
+            // the daemon's own attempt fails three seconds after it began
+            wait_for("the daemon's own attempt to fail", 20, || {
+                lines_with(&log_text(&logs), "resource fetch failed")
+                    .iter()
+                    .any(|line| line.contains("managed profile"))
+            });
+            // The sources are looked at once a second. Two seconds and a half
+            // are two looks and a half, at which a second line would have
+            // been written.
+            std::thread::sleep(Duration::from_millis(2500));
+            let log = log_text(&logs);
+            let refusals = lines_with(&log, REFUSING);
+            assert_eq!(refusals.len(), 1, "{log}");
+            assert!(refusals[0].contains("http status 500"), "{refusals:?}");
+            assert!(lines_with(&log, ACCEPTING).is_empty(), "{log}");
+            assert!(
+                target.requests().is_empty(),
+                "no session reached the target"
+            );
+        }
+
+        /// Offline a strict update that is due cannot be made: sessions are
+        /// refused from the first one, and nobody is asked.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn offline_a_strict_update_that_is_due_refuses_sessions_from_the_first_one() {
+            let w = Sources::new().await;
+            let target = TestServer::spawn().await;
+            target.set("/hello", "hi from target");
+            let hello = format!("http://127.0.0.1:{}/hello", target.url("/").port().unwrap());
+            let api = free_tcp_port();
+            let copy = managed_text(&w.url("/managed"), "interval=60 strict=true", api, "");
+            w.seed("/managed", &copy, TWO_HOURS);
+            w.served.set("/managed", copy);
+            w.point_at("/managed");
+            let logs = w.dir.path().join("logs");
+            let mut cmd = rurge_run(&w.conf(), &w.data());
+            log_to(&mut cmd, &logs);
+            let (mut daemon, _errors) = spawn_command_reading_stderr(cmd);
+            let refused = http_get(daemon.http, &hello);
+            assert!(refused.starts_with("HTTP/1.1 502"), "{refused}");
+            assert!(refused.contains(rurge_engine::REFUSED_STRICT), "{refused}");
+            up(&daemon);
+            assert_eq!(
+                api_call(api, "GET", "/v1/outbound", "k", None),
+                (200, r#"{"mode":"rule"}"#.to_string())
+            );
+            wait_for("the refusal to be logged", 10, || {
+                !lines_with(&log_text(&logs), REFUSING).is_empty()
+            });
+            // The sources are looked at as the loop begins and once a second
+            // after: a second and a half is one look more, at which a second
+            // line would have been written.
+            std::thread::sleep(Duration::from_millis(1500));
+            let refusals = lines_with(&log_text(&logs), REFUSING);
+            assert_eq!(refusals.len(), 1, "{refusals:?}");
+            assert!(refusals[0].contains("offline mode"), "{refusals:?}");
+            stop(&mut daemon, api);
+            assert!(target.requests().is_empty());
+            assert_eq!(w.served.requests().len(), 0, "offline asks nobody");
+        }
+
+        /// The way out the user has: the update that `strict` requires is the
+        /// one the line of the local file asks for while that file is in
+        /// effect, and removing `strict` from it ends the refusal at the
+        /// reload, which an edit that keeps it does not.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn removing_strict_from_the_local_file_ends_a_refusal_at_the_reload() {
+            let w = Sources::new().await;
+            let target = TestServer::spawn().await;
+            target.set("/hello", "hi from target");
+            let hello = format!("http://127.0.0.1:{}/hello", target.url("/").port().unwrap());
+            let api = free_tcp_port();
+            let copy = managed_text(&w.url("/managed"), "interval=60 strict=true", api, "");
+            w.seed("/managed", &copy, TWO_HOURS);
+            w.served.set("/managed", copy);
+            w.served.set_status("/managed", 500);
+            let local = |line: &str| {
+                format!(
+                    "#!MANAGED-CONFIG {} {line}\n[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nhttp-api = k@127.0.0.1:{api}\nloglevel = warning\n[Proxy]\n[Rule]\nFINAL,DIRECT\n",
+                    w.url("/managed")
+                )
+            };
+            // a whole profile written after the copy was checked, whose update
+            // is overdue and fails
+            w.write(&local("interval=60 strict=true"));
+            let logs = w.dir.path().join("logs");
+            let mut cmd = w.start();
+            log_to(&mut cmd, &logs);
+            let (mut daemon, _errors) = spawn_command_reading_stderr(cmd);
+            up(&daemon);
+            let refused = http_get(daemon.http, &hello);
+            assert!(refused.contains(rurge_engine::REFUSED_STRICT), "{refused}");
+            let reload = || {
+                let (status, body) = api_call(api, "POST", "/v1/profiles/reload", "k", Some("{}"));
+                assert!(status == 200 && body.contains("\"ok\":true"), "{body}");
+            };
+            // an edit that keeps `strict` leaves the refusal: a look is made
+            // every second, and two of them are the margin
+            w.write(&local("interval=60 strict=true"));
+            reload();
+            std::thread::sleep(Duration::from_millis(2100));
+            let refused = http_get(daemon.http, &hello);
+            assert!(refused.contains(rurge_engine::REFUSED_STRICT), "{refused}");
+            // and the one that removes it ends it
+            w.write(&local("interval=60"));
+            reload();
+            wait_for("sessions to be accepted again", 10, || {
+                http_get(daemon.http, &hello).ends_with("hi from target")
+            });
+            wait_for("the line that says so", 10, || {
+                lines_with(&log_text(&logs), ACCEPTING).len() == 1
+            });
+            let log = log_text(&logs);
+            assert_eq!(lines_with(&log, REFUSING).len(), 1, "{log}");
+            stop(&mut daemon, api);
+        }
+
+        /// A refusal that began because the update did not finish ends with
+        /// the next update that works, without a restart, and says so once.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refusal_ends_when_the_next_update_works() {
+            let w = Sources::new().await;
+            let target = TestServer::spawn().await;
+            target.set("/hello", "hi from target");
+            let hello = format!("http://127.0.0.1:{}/hello", target.url("/").port().unwrap());
+            let api = free_tcp_port();
+            let line = "interval=60 strict=true";
+            let old = managed_text(&w.url("/managed"), line, api, "");
+            let new = managed_text(&w.url("/managed"), line, api, "DOMAIN,new.test,REJECT\n");
+            w.seed("/managed", &old, TWO_HOURS);
+            w.served.set("/managed", old);
+            w.served.set_status("/managed", 500);
+            w.served.set_delay("/managed", Duration::from_secs(3));
+            w.point_at("/managed");
+            // The first request, the one the start makes, is on its way with
+            // the answer it was given. Those after it are told that the
+            // update works, three seconds later.
+            let served = w.served.clone();
+            let flip = tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+                while served.hits("/managed") == 0 && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                served.set("/managed", new);
+                served.set_status("/managed", 200);
+            });
+            let logs = w.dir.path().join("logs");
+            let mut cmd = w.start();
+            log_to(&mut cmd, &logs);
+            let (mut daemon, _errors) = spawn_command_reading_stderr(cmd);
+            flip.await.unwrap();
+            let refused = http_get(daemon.http, &hello);
+            assert!(refused.contains(rurge_engine::REFUSED_STRICT), "{refused}");
+            wait_for("sessions to be accepted again", 30, || {
+                http_get(daemon.http, &hello).ends_with("hi from target")
+            });
+            let log = log_text(&logs);
+            assert_eq!(lines_with(&log, REFUSING).len(), 1, "{log}");
+            wait_for("the line that says so", 10, || {
+                lines_with(&log_text(&logs), ACCEPTING).len() == 1
+            });
+            wait_for("the new version", 30, || {
+                rules(api).contains("DOMAIN,new.test,REJECT")
+            });
+            stop(&mut daemon, api);
+        }
+
+        // ---------------------------------------------------------------
+        // the running daemon follows its sources
+
+        /// A new version of the managed profile that arrives while the daemon
+        /// runs is taken without a signal, a request to the API or `--watch`.
+        /// The daemon comes up on the copy it has, and the update that is due
+        /// at once brings the new version three seconds later.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_new_version_of_the_managed_profile_is_taken_without_being_asked() {
+            let w = Sources::new().await;
+            let api = free_tcp_port();
+            let line = "interval=60";
+            let old = managed_text(&w.url("/managed"), line, api, "DOMAIN,old.test,REJECT\n");
+            let new = managed_text(&w.url("/managed"), line, api, "DOMAIN,new.test,REJECT\n");
+            w.seed("/managed", &old, TWO_HOURS);
+            w.served.set("/managed", new.clone());
+            w.served.set_delay("/managed", Duration::from_secs(3));
+            w.point_at("/managed");
+            let (mut daemon, _errors) = spawn_command_reading_stderr(w.start());
+            up(&daemon);
+            assert_eq!(current(api), old, "the daemon runs on the copy it has");
+            assert!(rules(api).contains("DOMAIN,old.test,REJECT"));
+            // The profile the API shows is the file, which is the new version
+            // as soon as it is downloaded; the rules are the generation in
+            // use, which is the new one when the daemon has reloaded.
+            wait_for("the new version to be in effect", 30, || {
+                rules(api).contains("DOMAIN,new.test,REJECT")
+            });
+            assert_eq!(current(api), new);
+            assert!(!rules(api).contains("DOMAIN,old.test,REJECT"));
+            stop(&mut daemon, api);
+        }
+
+        /// The local file was changed after the last update and is in effect
+        /// until the next check finds the server well: from then on the copy
+        /// is, which the daemon takes without being asked.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_copy_takes_over_from_a_local_file_once_a_check_has_succeeded() {
+            let w = Sources::new().await;
+            let api = free_tcp_port();
+            let line = "interval=60";
+            let copy = managed_text(&w.url("/managed"), line, api, "DOMAIN,copy.test,REJECT\n");
+            let local = managed_text(&w.url("/managed"), line, api, "DOMAIN,local.test,REJECT\n");
+            w.seed("/managed", &copy, TWO_HOURS);
+            // the server gives the text the copy has: the check finds nothing new
+            w.served.set("/managed", copy.clone());
+            w.served.set_delay("/managed", Duration::from_secs(3));
+            // written after the copy was checked
+            w.write(&local);
+            let (mut daemon, _errors) = spawn_command_reading_stderr(w.start());
+            up(&daemon);
+            assert_eq!(current(api), local, "the local file is in effect");
+            wait_for("the copy to take over", 30, || current(api) == copy);
+            assert!(rules(api).contains("DOMAIN,copy.test,REJECT"));
+            stop(&mut daemon, api);
+        }
     }
 }
 

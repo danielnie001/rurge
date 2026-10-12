@@ -590,6 +590,121 @@ async fn a_strict_profile_that_is_due_is_not_suspended_before_its_attempt_fails(
     );
 }
 
+/// The update is due from the moment its interval is over, whether the
+/// attempt has not begun, is under way or has failed: `strict` says only the
+/// last of the three.
+#[tokio::test]
+async fn a_strict_update_is_due_until_one_succeeds_whatever_became_of_the_attempts() {
+    let w = World::new().await;
+    w.server.set("/managed", COPY);
+    w.server.set_status("/managed", 500);
+    // long enough for the attempt to be looked at while it is under way
+    w.server.set_delay("/managed", Duration::from_secs(2));
+    w.seed("/managed", COPY, ago(2 * HOUR));
+    w.write_managed("/managed", "interval=60 strict=true");
+    let sources = w.sources(false);
+    assert!(!sources.strict_due(), "nothing is tracked yet");
+    sources.track(&w.load());
+    // not tried yet, then under way: nothing has failed
+    assert_eq!(sources.strict(), None);
+    assert!(sources.strict_due());
+    common::wait_until("the attempt to begin", || w.server.hits("/managed") == 1).await;
+    assert_eq!(sources.strict(), None);
+    assert!(sources.strict_due());
+    // failed
+    assert!(sources.settle(Duration::from_secs(5)).await);
+    assert!(sources.strict().is_some());
+    assert!(sources.strict_due());
+    // and an attempt that works ends it
+    w.server.set_status("/managed", 200);
+    w.server.set_delay("/managed", Duration::ZERO);
+    w.server.set("/managed", COPY.replace("copy", "new"));
+    sources
+        .update(&w.key("/managed"))
+        .await
+        .expect("tracked")
+        .expect("the update works");
+    assert_eq!(sources.strict(), None);
+    assert!(!sources.strict_due());
+}
+
+/// Only a managed profile that says `strict=true` is ever due in this sense,
+/// and only once its interval is over.
+#[tokio::test]
+async fn an_update_that_is_not_strict_or_not_over_its_interval_is_not_due() {
+    // the copy is old and the update failed, but `strict` is not written
+    let w = World::new().await;
+    w.seed("/managed", COPY, ago(2 * HOUR));
+    w.write_managed("/managed", "interval=60");
+    let sources = w.sources(false);
+    sources.track(&w.load());
+    sources
+        .update(&w.key("/managed"))
+        .await
+        .unwrap()
+        .expect_err("there is nothing at the address");
+    assert!(!sources.strict_due());
+    // the strictness is the latest generation's
+    w.write_managed("/managed", "interval=60 strict=true");
+    sources.track(&w.load());
+    assert!(sources.strict_due());
+    w.write_managed("/managed", "interval=60 strict=false");
+    sources.track(&w.load());
+    assert!(!sources.strict_due());
+    // strict, and the last attempt failed, but the interval is not over
+    let fresh = World::new().await;
+    fresh.seed("/managed", COPY, ago(Duration::from_secs(10)));
+    fresh.write_managed("/managed", "interval=3600 strict=true");
+    let sources = fresh.sources(false);
+    sources.track(&fresh.load());
+    sources
+        .update(&fresh.key("/managed"))
+        .await
+        .unwrap()
+        .expect_err("there is nothing at the address");
+    assert!(!sources.strict_due());
+}
+
+/// Counted as `strict` counts it: offline the update is due as well, from
+/// the local file's time when there was no check, never from a check in the
+/// future (the clock was set back), and not at all for a file that cannot be
+/// asked.
+#[tokio::test]
+async fn a_strict_update_is_due_counted_as_strict_counts_it() {
+    let w = World::new().await;
+    w.seed("/managed", COPY, ago(2 * HOUR));
+    w.write_managed("/managed", "interval=60 strict=true");
+    let offline = w.sources(true);
+    offline.track(&w.load());
+    assert!(offline.strict_due());
+    assert!(offline.strict().is_some());
+    assert_eq!(w.server.requests().len(), 0);
+
+    // without a check, from the local file's time
+    let bare = World::new().await;
+    bare.write_managed("/managed", "interval=60 strict=true");
+    let changed = ago(2 * HOUR);
+    bare.touch(changed);
+    let sources = bare.sources(true);
+    sources.track(&bare.load());
+    assert!(sources.strict_due());
+    bare.touch(SystemTime::now());
+    assert!(!sources.strict_due(), "a file that was just changed");
+    bare.touch(changed);
+    assert!(sources.strict_due());
+    std::fs::remove_file(bare.profile()).unwrap();
+    assert!(!sources.strict_due(), "a file that cannot be asked");
+
+    // a check in the future
+    let future = World::new().await;
+    let copy = future.managed_copy("/managed", "interval=60 strict=true");
+    future.seed("/managed", &copy, SystemTime::now() + 2 * HOUR);
+    future.write_managed("/managed", "interval=60 strict=true");
+    let sources = future.sources(true);
+    sources.track(&future.load());
+    assert!(!sources.strict_due());
+}
+
 /// Not due, and the last attempt failed: the copy is as new as the interval
 /// asks it to be.
 #[tokio::test]

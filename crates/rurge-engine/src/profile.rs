@@ -601,6 +601,27 @@ impl ProfileSources {
         Some(Suspended { since, why })
     }
 
+    /// Whether the update `strict` requires is due: the managed profile says
+    /// `strict=true` and its last successful check is an interval ago or more,
+    /// counted as [`strict`](Self::strict) counts it. True from the moment it
+    /// falls due until a check succeeds: also while an attempt is under way,
+    /// and while what one brought waits for the sources it refers to. Whether
+    /// the update has failed is what `strict` says.
+    pub fn strict_due(&self) -> bool {
+        let local = file_modified(&self.profile);
+        let now = SystemTime::now();
+        let state = self.core.lock();
+        let Some(managed) = state
+            .tracked
+            .iter()
+            .find(|t| t.role == RemoteRole::Managed && t.strict)
+        else {
+            return false;
+        };
+        self.status_of(&managed.key)
+            .is_some_and(|s| due_since(managed.interval, s.fetched_at, local, now).is_some())
+    }
+
     /// The status of each tracked source, in the order of the generation
     /// tracked last.
     pub fn statuses(&self) -> Vec<ResourceStatus> {

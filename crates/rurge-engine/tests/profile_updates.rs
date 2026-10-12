@@ -965,6 +965,20 @@ async fn a_version_that_waits_is_no_failed_update() {
     assert_eq!(sources.strict(), None);
 }
 
+/// What `strict` leaves out for it, the update that waits is still owed: it
+/// is taken when the file it waits for has been tried.
+#[tokio::test]
+async fn a_version_that_waits_leaves_the_update_due() {
+    let (w, sources) = a_strict_world().await;
+    w.server.set("/x", X_BODY);
+    w.server.set_delay("/x", Duration::from_secs(3));
+    update(&sources, &w, "/managed")
+        .await
+        .expect_err("it waits for the file");
+    assert_eq!(sources.strict(), None);
+    assert!(sources.strict_due());
+}
+
 /// A version that by itself does not load, and waits together with one that
 /// was kept, is one that waits.
 #[tokio::test]
