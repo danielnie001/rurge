@@ -14,12 +14,26 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 /// Basic credentials accepted by an HTTP listener.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum HttpAuth {
     /// `password@` from `http-listen`: any user name, this password.
     Password(String),
     /// `wifi-access-http-auth`: both must match.
     UserPass { user: String, password: String },
+}
+
+/// The passwords are left out, whatever prints the options of a listener.
+impl std::fmt::Debug for HttpAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpAuth::Password(_) => f.debug_tuple("Password").field(&"<redacted>").finish(),
+            HttpAuth::UserPass { user, .. } => f
+                .debug_struct("UserPass")
+                .field("user", user)
+                .field("password", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -307,6 +321,32 @@ mod tests {
             .expect("the connection is taken")
             .unwrap();
         assert!(on);
+    }
+
+    /// What prints the options of a listener — a log line, a failed
+    /// assertion — does not print its passwords.
+    #[test]
+    fn the_passwords_of_a_listener_are_not_printed() {
+        let opts = ListenerOpts {
+            auth: Some(HttpAuth::Password("S3CR3T-listen".to_string())),
+            ..ListenerOpts::default()
+        };
+        let printed = format!("{opts:?}");
+        assert!(
+            printed.contains("Password(\"<redacted>\")") && !printed.contains("S3CR3T"),
+            "{printed}"
+        );
+        let wifi = HttpAuth::UserPass {
+            user: "alice".to_string(),
+            password: "S3CR3T-wifi".to_string(),
+        };
+        let printed = format!("{wifi:?}");
+        assert!(
+            printed.contains("alice")
+                && printed.contains("<redacted>")
+                && !printed.contains("S3CR3T"),
+            "{printed}"
+        );
     }
 
     /// The events a thread's logging says, one line of `field=value` pairs
