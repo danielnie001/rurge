@@ -584,6 +584,24 @@ fn collect_subrule_unknowns(sub: &SubRule, out: &mut Vec<String>) {
     collect_kind_unknowns(&sub.kind, out);
 }
 
+/// What `W0003` says of an item of a rule that the parser does not know (`of`:
+/// what the rule is). The item is named by what stands before its `=`, or by
+/// the whole of it when it has none, and only when that is a lower-case word
+/// like the parameters rules have (`no-resolve`, `update-interval`). What
+/// follows an `=` is a value, and an item written any other way can be one
+/// that slid into the line: the policy of a line copied into a rule set, a
+/// field of another kind of line.
+fn unknown_parameter(of: &str, item: &str) -> String {
+    let name = item.split('=').next().unwrap_or_default().trim();
+    let a_word =
+        (1..=32).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'-');
+    if a_word {
+        format!("unknown {of} parameter `{name}` ignored")
+    } else {
+        format!("unknown {of} parameter ignored")
+    }
+}
+
 /// Recursively collect `.unknown` flags from the sub-rules nested inside a
 /// logical `AND` / `OR` / `NOT` rule kind. No-op for every other rule kind.
 fn collect_kind_unknowns(kind: &RuleKind, out: &mut Vec<String>) {
@@ -727,7 +745,7 @@ pub fn from_profile(
                         diags.push(
                             Diagnostic::warning(
                                 codes::W_UNKNOWN_RULE_PARAM,
-                                format!("unknown [{}] parameter `{u}` ignored", sec.name),
+                                unknown_parameter(&format!("[{}]", sec.name), u),
                             )
                             .at(e.span.clone()),
                         );
@@ -760,7 +778,7 @@ pub fn from_profile(
                         diags.push(
                             Diagnostic::warning(
                                 codes::W_UNKNOWN_RULE_PARAM,
-                                format!("unknown rule parameter `{u}` ignored"),
+                                unknown_parameter("rule", u),
                             )
                             .at(e.span.clone()),
                         );
@@ -772,7 +790,7 @@ pub fn from_profile(
                         diags.push(
                             Diagnostic::warning(
                                 codes::W_UNKNOWN_RULE_PARAM,
-                                format!("unknown sub-rule parameter `{u}` ignored"),
+                                unknown_parameter("sub-rule", u),
                             )
                             .at(e.span.clone()),
                         );
@@ -2513,6 +2531,78 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
                 .filter(|x| **x == codes::W_UNKNOWN_RULE_PARAM)
                 .count(),
             1
+        );
+    }
+
+    /// `W0003` names the item it does not know only when the item is written
+    /// as a parameter is, and never what follows its `=`: that is a value,
+    /// and an item of another shape can be anything that slid into the line.
+    #[test]
+    fn an_unknown_rule_parameter_is_named_only_when_it_is_written_as_one() {
+        let said = |text: &str| -> Vec<String> {
+            let l = load_text(text);
+            assert!(!l.diagnostics.has_errors(), "{text}");
+            l.diagnostics
+                .iter()
+                .filter(|d| d.code == codes::W_UNKNOWN_RULE_PARAM)
+                .map(|d| d.message.clone())
+                .collect()
+        };
+        let rule = |item: &str| {
+            said(&format!(
+                "[Rule]\nDOMAIN,a.com,DIRECT,{item}\nFINAL,DIRECT\n"
+            ))
+        };
+
+        // a flag misspelt, and a `name=value` nobody knows: the name
+        assert_eq!(
+            rule("no-resolv"),
+            ["unknown rule parameter `no-resolv` ignored"]
+        );
+        assert_eq!(
+            rule("mystery=S3CR3T"),
+            ["unknown rule parameter `mystery` ignored"]
+        );
+        // a known name with a value it cannot take is said the same way
+        assert_eq!(
+            rule("update-interval=S3CR3T"),
+            ["unknown rule parameter `update-interval` ignored"]
+        );
+        // what is written like no parameter is not quoted at all
+        let long = "a".repeat(33);
+        for item in [
+            "S3CR3T",
+            "Mystery=S3CR3T",
+            "my stery",
+            "aHVudGVyMg==",
+            "=S3CR3T",
+            "no_resolve",
+            "h2",
+            long.as_str(),
+        ] {
+            assert_eq!(rule(item), ["unknown rule parameter ignored"], "{item}");
+        }
+
+        // the sub-rules of a logical rule, and the lines of an inline rule set
+        let sub = |item: &str| {
+            said(&format!(
+                "[Rule]\nAND,((DOMAIN,a,{item}),(DOMAIN,b)),DIRECT\nFINAL,DIRECT\n"
+            ))
+        };
+        assert_eq!(sub("bogus"), ["unknown sub-rule parameter `bogus` ignored"]);
+        assert_eq!(sub("S3CR3T"), ["unknown sub-rule parameter ignored"]);
+        let inline = |item: &str| {
+            said(&format!(
+                "[Rule]\nRULE-SET,Mine,DIRECT\nFINAL,DIRECT\n[Ruleset Mine]\nDOMAIN,a.com,{item}\n"
+            ))
+        };
+        assert_eq!(
+            inline("bogus"),
+            ["unknown [Ruleset Mine] parameter `bogus` ignored"]
+        );
+        assert_eq!(
+            inline("Proxy"),
+            ["unknown [Ruleset Mine] parameter ignored"]
         );
     }
 
