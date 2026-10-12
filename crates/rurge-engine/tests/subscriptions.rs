@@ -55,33 +55,6 @@ fn outbound_of(engine: &Engine, name: &str) -> rurge_proto::OutboundRef {
     engine.registry().resolve(&PolicyRef::parse(name)).outbound
 }
 
-/// A generation that downloads: its GeoIP updater asks `server` (and gets a
-/// 404) instead of the public default URLs.
-async fn online_runtime(
-    dir: &std::path::Path,
-    profile: &str,
-    server: &TestServer,
-    shared: EngineShared,
-) -> Runtime {
-    std::fs::write(dir.join("t.conf"), profile).unwrap();
-    let loaded = from_text(profile, &dir.join("t.conf"), &LoadOptions::for_tests());
-    assert!(!loaded.diagnostics.has_errors());
-    let mut stack = stack_options(dir);
-    stack.no_network = false;
-    stack.geo_urls = GeoUrls {
-        country: server.url("/geo/country.mmdb"),
-        asn: server.url("/geo/asn.mmdb"),
-    };
-    let opts = RuntimeOptions {
-        stack,
-        outbound_mode: OutboundMode::Rule,
-        idle_timeout: Duration::from_secs(600),
-        shared,
-        request_log_size: 1000,
-    };
-    Runtime::build(loaded.config, opts).await.unwrap()
-}
-
 /// A local subscription is read while the generation is built: the group
 /// has its members from the first dial on (M3-D5).
 #[tokio::test]

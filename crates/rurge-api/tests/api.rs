@@ -9,14 +9,17 @@ use hyper_util::rt::TokioExecutor;
 use rurge_api::{ApiContext, serve};
 use rurge_config::config::{LoadOptions, from_text};
 use rurge_config::session::ListenerKind;
+use rurge_config::{RemoteRef, RemoteRole, SourceInfo};
 use rurge_dns::system::StaticSystemDns;
 use rurge_dns::testing::MockDns;
 use rurge_engine::control::{Control, LogLevel, ReloadReport};
-use rurge_engine::stack::StackOptions;
+use rurge_engine::profile::{ProfileSources, SourcesOptions};
+use rurge_engine::stack::{StackOptions, resource_client};
 use rurge_engine::state::{STATE_FILE, State, StateStore};
 use rurge_engine::{Engine, EngineShared, ListenerSpec, Running, Runtime, RuntimeOptions};
 use rurge_net::BoxFuture;
-use rurge_net::testing::TestServer;
+use rurge_net::resource::{ResourceOptions, ResourceSource, cache_file, resource_key};
+use rurge_net::testing::{TestServer, seed_cache};
 use rurge_rules::geoip::{ASN_FILE, COUNTRY_FILE};
 use rurge_rules::{DbKind, GeoDb, GeoUrls, OutboundMode};
 use serde_json::{Value, json};
@@ -24,7 +27,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
@@ -76,7 +79,7 @@ impl Control for FakeControl {
 }
 
 struct Api {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     conf: PathBuf,
     state_path: PathBuf,
     engine: Arc<Engine>,
@@ -86,10 +89,30 @@ struct Api {
     control: Arc<FakeControl>,
     store: Arc<StateStore>,
     addr: SocketAddr,
-    _token: CancellationToken,
+    token: CancellationToken,
 }
 
 impl Api {
+    /// A second API server over the same engine, which has the downloaded
+    /// sources of the profile that the first one never has. Where it listens.
+    async fn with_sources(&self, sources: Arc<ProfileSources>) -> SocketAddr {
+        let (addr, server) = serve(
+            "127.0.0.1:0".parse().unwrap(),
+            KEY.to_string(),
+            ApiContext {
+                engine: self.engine.clone(),
+                control: self.control.clone(),
+                load_options: load_options(),
+                sources: Some(sources),
+            },
+            self.token.clone(),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(server);
+        addr
+    }
+
     fn http(&self) -> SocketAddr {
         self.listeners
             .iter()
@@ -136,6 +159,24 @@ async fn api_in(rules: &str, groups: &str) -> Api {
 
 /// `api_in`, `seed` having filled the data directory before the engine starts.
 async fn api_seeded(rules: &str, groups: &str, seed: impl FnOnce(&Path)) -> Api {
+    api_built(rules, groups, None, seed).await
+}
+
+/// `api_seeded` with a generation that downloads, its two GeoIP databases
+/// asked of `geo`. By the time it is built every first download has been
+/// tried, and those `geo` cannot give have failed.
+async fn api_online(rules: &str, groups: &str, geo: &TestServer, seed: impl FnOnce(&Path)) -> Api {
+    api_built(rules, groups, Some(geo), seed).await
+}
+
+/// `geo` is the server the generation downloads its GeoIP databases from; it
+/// does not go to the network without one.
+async fn api_built(
+    rules: &str,
+    groups: &str,
+    geo: Option<&TestServer>,
+    seed: impl FnOnce(&Path),
+) -> Api {
     let dns = MockDns::spawn().await;
     dns.set("target.test", &["127.0.0.1"], &[], 60);
     dns.set("cached.test", &["10.0.0.1"], &[], 300);
@@ -163,11 +204,18 @@ Locked = trojan, 1.2.3.4, 443, password=x\n\
         RuntimeOptions {
             stack: StackOptions {
                 data_dir: dir.path().to_path_buf(),
-                no_network: true,
-                geo_urls: GeoUrls::default(),
+                no_network: geo.is_none(),
+                geo_urls: geo.map_or_else(GeoUrls::default, |server| GeoUrls {
+                    country: server.url("/geo/country.mmdb"),
+                    asn: server.url("/geo/asn.mmdb"),
+                }),
                 dns_cache_size: 2000,
                 system: Arc::new(StaticSystemDns::default()),
-                wait: Duration::ZERO,
+                wait: if geo.is_some() {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::ZERO
+                },
                 dns_connector: None,
                 socket_hook: Arc::new(rurge_net::socket::NoopSocketHook),
             },
@@ -194,6 +242,7 @@ Locked = trojan, 1.2.3.4, 443, password=x\n\
             engine: engine.clone(),
             control: control.clone(),
             load_options: load_options(),
+            sources: None,
         },
         token.clone(),
     )
@@ -201,7 +250,7 @@ Locked = trojan, 1.2.3.4, 443, password=x\n\
     .unwrap();
     tokio::spawn(fut);
     Api {
-        _dir: dir,
+        dir,
         conf,
         state_path,
         engine,
@@ -211,7 +260,7 @@ Locked = trojan, 1.2.3.4, 443, password=x\n\
         control,
         store,
         addr,
-        _token: token,
+        token,
     }
 }
 
@@ -222,6 +271,18 @@ async fn call_raw(
     key: Option<&str>,
     body: Option<Value>,
 ) -> (u16, String, Bytes) {
+    call_text(addr, method, path, key, body.map(|v| v.to_string())).await
+}
+
+/// `call_raw` with the body as the text it is sent as: for a body that is no
+/// JSON.
+async fn call_text(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    key: Option<&str>,
+    body: Option<String>,
+) -> (u16, String, Bytes) {
     let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
     let mut req = Request::builder()
         .method(method)
@@ -230,9 +291,9 @@ async fn call_raw(
         req = req.header("x-key", k);
     }
     let body = match body {
-        Some(v) => {
+        Some(text) => {
             req = req.header("content-type", "application/json");
-            Full::new(Bytes::from(v.to_string()))
+            Full::new(Bytes::from(text))
         }
         None => Full::new(Bytes::new()),
     };
@@ -1375,4 +1436,427 @@ async fn geoip_wants_an_address_and_the_key() {
         call(api.addr, "GET", "/v1/geoip?ip=1.0.0.1", None, None).await,
         (401, json!({ "error": "unauthorized" }))
     );
+}
+
+// ---------------------------------------------------------------------------
+// external resources
+
+/// What the links of these tests carry in their query. No answer of the two
+/// endpoints holds it.
+const TOKEN: &str = "S3CR3T";
+
+/// What a rule set says before it is updated: nothing about `target.test`.
+const OLD_RULES: &str = "DOMAIN,other.test\n";
+
+/// A call of one of the two endpoints, whose answer never holds the token.
+async fn resources(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    key: Option<&str>,
+    body: Option<String>,
+) -> (u16, Value) {
+    let (status, _, bytes) = call_text(addr, method, path, key, body).await;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    assert!(!text.contains(TOKEN), "{text}");
+    let value = serde_json::from_str(&text).unwrap_or(Value::String(text));
+    (status, value)
+}
+
+/// What `GET /v1/external_resources` lists.
+async fn listed(addr: SocketAddr) -> Vec<Value> {
+    let (status, body) = resources(addr, "GET", "/v1/external_resources", Some(KEY), None).await;
+    assert_eq!(status, 200, "{body}");
+    body["defines"].as_array().expect("a list").clone()
+}
+
+/// The answer to an update of `key`, which is a key or `all`.
+async fn updated(addr: SocketAddr, key: &str) -> (u16, Value) {
+    resources(
+        addr,
+        "POST",
+        "/v1/external_resources/update",
+        Some(KEY),
+        Some(json!({ "key": key }).to_string()),
+    )
+    .await
+}
+
+fn key_of(url: &url::Url) -> String {
+    resource_key(&ResourceSource::Url(url.clone()))
+}
+
+/// An API over a profile that rejects what a rule set by address names, and has
+/// a rule set by file, a domain set by address and a subscription whose link has
+/// a token. Their copies were checked ten minutes ago, and `served` gives the
+/// same, so nothing is due. With `online` the generation downloads: its
+/// databases are asked of `served`, which has none.
+async fn api_with_sets(online: bool) -> (Api, TestServer, SystemTime) {
+    let served = TestServer::spawn().await;
+    served.set("/rules.list", OLD_RULES);
+    served.set("/domains.txt", "domains.example\n");
+    served.set("/nodes", "N1 = http, n1.test, 80\n");
+    let rules_url = served.url("/rules.list");
+    let domains_url = served.url("/domains.txt");
+    let nodes_url = served.url(&format!("/nodes?token={TOKEN}"));
+    let rules = format!(
+        "RULE-SET,{rules_url},REJECT\nRULE-SET,local.list,DIRECT\nDOMAIN-SET,{domains_url},DIRECT"
+    );
+    let groups = format!("Sub = select, policy-path={nodes_url}");
+    let checked = SystemTime::now() - Duration::from_secs(600);
+    let seed = |dir: &Path| {
+        std::fs::write(dir.join("local.list"), "DOMAIN,local.example\n").unwrap();
+        seed_cache(dir, &rules_url, OLD_RULES.as_bytes(), checked);
+        seed_cache(dir, &domains_url, b"domains.example\n", checked);
+        seed_cache(dir, &nodes_url, b"N1 = http, n1.test, 80\n", checked);
+    };
+    let api = if online {
+        api_online(&rules, &groups, &served, seed).await
+    } else {
+        api_seeded(&rules, &groups, seed).await
+    };
+    (api, served, checked)
+}
+
+/// The link of the managed profile of `profile_sources`. It holds the token in
+/// every place a link can: user name, password, path and query.
+fn managed_link(served: &TestServer) -> url::Url {
+    let mut link = served.url(&format!("/{TOKEN}/managed?token={TOKEN}"));
+    link.set_username(TOKEN).unwrap();
+    link.set_password(Some(TOKEN)).unwrap();
+    link
+}
+
+/// The link of the file the profile of `profile_sources` includes.
+fn included_link(served: &TestServer) -> url::Url {
+    served.url(&format!("/{TOKEN}/inc?token={TOKEN}"))
+}
+
+/// The sources of a profile that is managed from `managed_link` and includes
+/// `included_link`, both on `served`, both checked ten minutes ago, followed as
+/// the daemon follows them.
+fn profile_sources(api: &Api, served: &TestServer) -> Arc<ProfileSources> {
+    let root = api.dir.path();
+    let sources = ProfileSources::new(SourcesOptions {
+        profile: api.conf.clone(),
+        load: load_options(),
+        data_dir: root.to_path_buf(),
+        offline: false,
+        client: resource_client().unwrap(),
+        resources: ResourceOptions::default(),
+    });
+    let checked = SystemTime::now() - Duration::from_secs(600);
+    let remote = |url: url::Url, role| {
+        served.set(url.path(), "[Rule]\nFINAL,DIRECT\n");
+        seed_cache(root, &url, b"[Rule]\nFINAL,DIRECT\n", checked);
+        RemoteRef {
+            path: Some(cache_file(root, &url)),
+            url,
+            role,
+            interval: Duration::from_secs(3600),
+            strict: false,
+            lacks_section: false,
+        }
+    };
+    sources.track(&SourceInfo {
+        main: api.conf.clone(),
+        includes: Vec::new(),
+        main_text: api.conf.clone(),
+        remote: vec![
+            remote(managed_link(served), RemoteRole::Managed),
+            remote(included_link(served), RemoteRole::Include),
+        ],
+    });
+    sources
+}
+
+/// One item for each kind of resource, in the shape the manual gives: a local
+/// resource has no `updatedAt`, `fromModule` is there and is `null`, `error` is
+/// there when the last update failed, and `suspended` is not there.
+#[tokio::test]
+async fn external_resources_are_listed_one_item_for_each_kind() {
+    let (api, served, checked) = api_with_sets(true).await;
+    let at = checked.duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let downloaded = |path: String, kind: &str, key: String| {
+        json!({
+            "path": path, "type": kind, "key": key, "local": false, "ready": true,
+            "updatedAt": at, "updating": false, "fromModule": null
+        })
+    };
+    let database = |file: &str, path: &str| {
+        json!({
+            "path": file, "type": "geoip", "key": key_of(&served.url(path)), "local": false,
+            "ready": false, "updatedAt": 0, "updating": false, "fromModule": null,
+            "error": "http status 404"
+        })
+    };
+    let file = api.dir.path().join("local.list");
+    let mut expected = vec![
+        downloaded(
+            served.url("/rules.list").to_string(),
+            "ruleset",
+            key_of(&served.url("/rules.list")),
+        ),
+        downloaded(
+            served.url("/domains.txt").to_string(),
+            "domainset",
+            key_of(&served.url("/domains.txt")),
+        ),
+        downloaded(
+            "policy-path of `Sub`".to_string(),
+            "policy-group",
+            key_of(&served.url(&format!("/nodes?token={TOKEN}"))),
+        ),
+        json!({
+            "path": file.display().to_string(), "type": "ruleset",
+            "key": resource_key(&ResourceSource::File(file)), "local": true,
+            "ready": true, "updating": false, "fromModule": null
+        }),
+        database("GeoLite2-Country.mmdb", "/geo/country.mmdb"),
+        database("GeoLite2-ASN.mmdb", "/geo/asn.mmdb"),
+    ];
+    // by name
+    expected.sort_by(|a, b| {
+        (a["path"].as_str(), a["key"].as_str()).cmp(&(b["path"].as_str(), b["key"].as_str()))
+    });
+    assert_eq!(listed(api.addr).await, expected);
+}
+
+/// The sources of the profile come first, the managed profile before the
+/// includes; the one that is managed says it is suspended while the engine
+/// refuses sessions, and everything goes on being answered.
+#[tokio::test]
+async fn external_resources_of_the_profile_come_first_and_the_managed_one_is_flagged() {
+    let (api, served, _) = api_with_sets(true).await;
+    let sources = profile_sources(&api, &served);
+    let addr = api.with_sources(sources).await;
+    let origin = format!("http://127.0.0.1:{}/…", served.url("/").port().unwrap());
+
+    let defines = listed(addr).await;
+    let kinds: Vec<&str> = defines
+        .iter()
+        .map(|d| d["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds[..2], ["profile", "include"], "{defines:?}");
+    assert_eq!(defines.len(), 8);
+    assert_eq!(
+        defines[0]["path"],
+        json!(format!("managed profile ({origin})"))
+    );
+    assert_eq!(defines[0]["key"], json!(key_of(&managed_link(&served))));
+    assert_eq!(defines[0]["ready"], json!(true));
+    let include_key = key_of(&included_link(&served));
+    assert_eq!(defines[1]["key"], json!(include_key));
+    assert_eq!(
+        defines[1]["path"],
+        json!(format!("remote include {} ({origin})", &include_key[..8]))
+    );
+    assert!(defines.iter().all(|d| d.get("suspended").is_none()));
+
+    api.engine.suspend(Some("http status 500".to_string()));
+    let defines = listed(addr).await;
+    assert_eq!(defines[0]["suspended"], json!(true));
+    assert!(defines[1..].iter().all(|d| d.get("suspended").is_none()));
+    assert_eq!(
+        call(addr, "GET", "/v1/outbound", Some(KEY), None).await,
+        (200, json!({ "mode": "rule" }))
+    );
+    assert_eq!(
+        updated(addr, &include_key).await,
+        (200, json!({ include_key: "success" }))
+    );
+}
+
+/// An update of a rule set is asked of its server and takes effect: what the
+/// set says is what the rules do from then on. A server that fails says how.
+#[tokio::test]
+async fn external_resources_are_updated_one_key_at_a_time() {
+    let (api, served, _) = api_with_sets(true).await;
+    let key = key_of(&served.url("/rules.list"));
+    let (head, _) = get_via_proxy(api.http(), &api.target_url()).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    served.set("/rules.list", "DOMAIN,target.test\n");
+    assert_eq!(
+        updated(api.addr, &key).await,
+        (200, json!({ key.clone(): "success" }))
+    );
+    wait_until(async || {
+        let (head, _) = get_via_proxy(api.http(), &api.target_url()).await;
+        !head.starts_with("HTTP/1.1 200")
+    })
+    .await;
+
+    // a server that answers 500
+    served.set_status("/rules.list", 500);
+    assert_eq!(
+        updated(api.addr, &key).await,
+        (200, json!({ key.clone(): "http status 500" }))
+    );
+    let defines = listed(api.addr).await;
+    let item = defines.iter().find(|d| d["key"] == json!(key)).unwrap();
+    assert_eq!(item["error"], json!("http status 500"));
+    assert_eq!(item["ready"], json!(true), "the copy it had stays");
+
+    // a file is read again
+    let file = api.dir.path().join("local.list");
+    let file_key = resource_key(&ResourceSource::File(file));
+    assert_eq!(
+        updated(api.addr, &file_key).await,
+        (200, json!({ file_key: "success" }))
+    );
+}
+
+/// `all` updates every resource that is downloaded, the sources of the profile
+/// included, and none that is a file.
+#[tokio::test]
+async fn external_resources_are_all_updated_but_the_files() {
+    let (api, served, _) = api_with_sets(true).await;
+    let sources = profile_sources(&api, &served);
+    let addr = api.with_sources(sources).await;
+    let (status, body) = updated(addr, "all").await;
+    assert_eq!(status, 200, "{body}");
+    let file = api.dir.path().join("local.list");
+    let file_key = resource_key(&ResourceSource::File(file));
+    let mut expected = serde_json::Map::new();
+    for link in [
+        managed_link(&served),
+        included_link(&served),
+        served.url("/rules.list"),
+        served.url("/domains.txt"),
+    ] {
+        expected.insert(key_of(&link), json!("success"));
+    }
+    expected.insert(
+        key_of(&served.url(&format!("/nodes?token={TOKEN}"))),
+        json!("success"),
+    );
+    for path in ["/geo/country.mmdb", "/geo/asn.mmdb"] {
+        expected.insert(key_of(&served.url(path)), json!("http status 404"));
+    }
+    assert_eq!(body, Value::Object(expected));
+    assert!(body.get(&file_key).is_none());
+}
+
+/// Offline nothing is downloaded, and every key that would be says so; a file
+/// is read all the same.
+#[tokio::test]
+async fn external_resources_are_not_downloaded_offline() {
+    let (api, served, _) = api_with_sets(false).await;
+    let rules_key = key_of(&served.url("/rules.list"));
+    let offline = "offline mode: nothing is downloaded";
+    assert_eq!(
+        updated(api.addr, &rules_key).await,
+        (200, json!({ rules_key.clone(): offline }))
+    );
+    let (status, body) = updated(api.addr, "all").await;
+    assert_eq!(status, 200, "{body}");
+    let mut expected = serde_json::Map::new();
+    for path in ["/rules.list", "/domains.txt"] {
+        expected.insert(key_of(&served.url(path)), json!(offline));
+    }
+    expected.insert(
+        key_of(&served.url(&format!("/nodes?token={TOKEN}"))),
+        json!(offline),
+    );
+    assert_eq!(body, Value::Object(expected));
+    assert_eq!(
+        served.requests().len(),
+        0,
+        "offline asks nobody: {:?}",
+        served.requests()
+    );
+}
+
+/// A body that is not a JSON object with a string `key` is a 400, and so is a
+/// key that names nothing: with a sentence of the endpoint's own.
+#[tokio::test]
+async fn external_resources_say_no_to_a_bad_body_and_to_a_key_that_names_nothing() {
+    let (api, _served, _) = api_with_sets(false).await;
+    let shape = json!({ "error": "the body must be a JSON object with a string \"key\"" });
+    for body in [
+        "S3CR3T and not JSON",
+        "",
+        r#"["S3CR3T"]"#,
+        r#"{"S3CR3T": 1}"#,
+        r#"{"key": 31337}"#,
+        r#"{"key": 3.1337}"#,
+        r#"{"key": true}"#,
+        r#"{"key": ["S3CR3T"]}"#,
+        r#"{"key": {"S3CR3T": 31337}}"#,
+        r#"{"key": null}"#,
+    ] {
+        let (status, _, bytes) = call_text(
+            api.addr,
+            "POST",
+            "/v1/external_resources/update",
+            Some(KEY),
+            Some(body.to_string()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert_eq!(status, 400, "{body}: {text}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            shape,
+            "{body}"
+        );
+    }
+    // a key that names nothing, the empty string included
+    for key in ["S3CR3T", "", "no-such-key"] {
+        assert_eq!(
+            updated(api.addr, key).await,
+            (400, json!({ "error": "no external resource has this key" })),
+            "{key:?}"
+        );
+    }
+}
+
+/// What the caller sent is not in the answer, whichever way it is wrong: as
+/// the key, as a value of another type, or as the name of a field.
+#[tokio::test]
+async fn external_resources_do_not_repeat_what_a_bad_request_sent() {
+    let (api, _served, _) = api_with_sets(false).await;
+    for sent in ["S3CR3T", "31337", "true", "3.1337"] {
+        for body in [
+            format!(r#"{{"key": "{sent}"}}"#),
+            format!(r#"{{"key": {sent}}}"#),
+            format!(r#"{{"key": [{sent}]}}"#),
+            format!(r#"{{"{sent}": "x"}}"#),
+            format!(r#"[{sent}]"#),
+            sent.to_string(),
+        ] {
+            let (status, _, bytes) = call_text(
+                api.addr,
+                "POST",
+                "/v1/external_resources/update",
+                Some(KEY),
+                Some(body.clone()),
+            )
+            .await;
+            let text = String::from_utf8_lossy(&bytes);
+            assert_eq!(status, 400, "{body}: {text}");
+            assert!(!text.contains(sent), "{body}: {text}");
+        }
+    }
+}
+
+/// Both endpoints want the key like the rest.
+#[tokio::test]
+async fn external_resources_want_the_key() {
+    let api = api().await;
+    for (method, path, body) in [
+        ("GET", "/v1/external_resources", None),
+        (
+            "POST",
+            "/v1/external_resources/update",
+            Some(json!({ "key": "all" })),
+        ),
+    ] {
+        assert_eq!(
+            call(api.addr, method, path, None, body).await,
+            (401, json!({ "error": "unauthorized" })),
+            "{method} {path}"
+        );
+    }
 }

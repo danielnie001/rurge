@@ -6,6 +6,7 @@ mod auto;
 pub mod control;
 pub mod dns_pipeline;
 pub mod engine;
+mod external_resources;
 pub mod observe;
 pub mod outbounds;
 pub mod profile;
@@ -23,6 +24,7 @@ pub mod views;
 
 pub use control::{Control, LogLevel, Mode, ReloadReport};
 pub use engine::{Engine, ListenerSpec, PoliciesView, REFUSED_STRICT, RuleView, UnknownPolicy};
+pub use external_resources::ExternalResource;
 pub use observe::{RecordStatus, RequestLog, RequestRecord, TrafficStats, TrafficTotals};
 pub use outbounds::{EngineFactory, dry_build, load_checked};
 pub use runtime::{Runtime, RuntimeOptions};

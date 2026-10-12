@@ -115,6 +115,47 @@ pub async fn runtime_edited(
     .unwrap()
 }
 
+/// A generation that downloads: its GeoIP updater asks `server` (and gets a
+/// 404) instead of the public default URLs.
+pub async fn online_runtime(
+    dir: &std::path::Path,
+    profile: &str,
+    server: &TestServer,
+    shared: EngineShared,
+) -> Runtime {
+    online_runtime_with(dir, profile, server, shared, |_| {}).await
+}
+
+/// As `online_runtime`, with `edit` applied to the stack's options first: for
+/// what the profile cannot say (a hosts file to watch, a wait for the first
+/// downloads).
+pub async fn online_runtime_with(
+    dir: &std::path::Path,
+    profile: &str,
+    server: &TestServer,
+    shared: EngineShared,
+    edit: impl FnOnce(&mut StackOptions),
+) -> Runtime {
+    std::fs::write(dir.join("t.conf"), profile).unwrap();
+    let loaded = from_text(profile, &dir.join("t.conf"), &LoadOptions::for_tests());
+    assert!(!loaded.diagnostics.has_errors());
+    let mut stack = stack_options(dir);
+    stack.no_network = false;
+    stack.geo_urls = GeoUrls {
+        country: server.url("/geo/country.mmdb"),
+        asn: server.url("/geo/asn.mmdb"),
+    };
+    edit(&mut stack);
+    let opts = RuntimeOptions {
+        stack,
+        outbound_mode: OutboundMode::Rule,
+        idle_timeout: Duration::from_secs(600),
+        shared,
+        request_log_size: 1000,
+    };
+    Runtime::build(loaded.config, opts).await.unwrap()
+}
+
 /// The test URL of the profiles here, so that no connectivity test goes to
 /// the default `http://bing.com/`. Nothing is assumed of what is at the
 /// port: a connection to it is refused at once (Linux, macOS), refused

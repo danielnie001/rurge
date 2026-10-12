@@ -9,6 +9,7 @@ use axum::Router;
 use axum::middleware;
 use axum::routing::{get, post};
 use rurge_config::config::LoadOptions;
+use rurge_engine::profile::ProfileSources;
 use rurge_engine::{Control, Engine};
 use std::future::Future;
 use std::io;
@@ -27,12 +28,17 @@ pub struct ApiContext {
     /// The daemon's load options, so `POST /v1/profiles/check` validates the
     /// profile exactly as a reload would.
     pub load_options: LoadOptions,
+    /// The downloaded sources of the profile, which `/v1/external_resources`
+    /// lists and updates beside the resources of the generation in use. `None`
+    /// for a daemon that has none.
+    pub sources: Option<Arc<ProfileSources>>,
 }
 
 pub(crate) struct Shared {
     pub(crate) engine: Arc<Engine>,
     pub(crate) control: Arc<dyn Control>,
     pub(crate) load_options: LoadOptions,
+    pub(crate) sources: Option<Arc<ProfileSources>>,
     pub(crate) auth: auth::AuthState,
     /// Unix seconds when the API came up (`/v1/traffic` `startTime`).
     pub(crate) started_secs: f64,
@@ -50,6 +56,7 @@ pub fn router(key: String, ctx: ApiContext) -> Router {
         engine: ctx.engine,
         control: ctx.control,
         load_options: ctx.load_options,
+        sources: ctx.sources,
         auth: auth::AuthState::new(key),
         started_secs: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -91,6 +98,11 @@ pub fn router(key: String, ctx: ApiContext) -> Router {
         .route("/v1/dns/flush", post(routes::dns::flush))
         .route("/v1/test/dns_delay", post(routes::dns::dns_delay))
         .route("/v1/geoip", get(routes::geoip::geoip))
+        .route("/v1/external_resources", get(routes::resources::list))
+        .route(
+            "/v1/external_resources/update",
+            post(routes::resources::update),
+        )
         .route("/v1/profiles/current", get(routes::profiles::current))
         .route("/v1/profiles/reload", post(routes::profiles::reload))
         .route("/v1/profiles/check", post(routes::profiles::check))

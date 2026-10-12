@@ -1184,6 +1184,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 engine: engine.clone(),
                 control: control.clone(),
                 load_options: opts.clone(),
+                sources: Some(sources.clone()),
             };
             match rurge_api::serve(api.addr, api.key.clone(), ctx, api_token.clone()).await {
                 Ok((addr, server)) => {
