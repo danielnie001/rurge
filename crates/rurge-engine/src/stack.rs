@@ -190,7 +190,7 @@ async fn settle(
                 diagnostics.push(Diagnostic::warning(
                     codes::W_RESOURCE_UNAVAILABLE,
                     format!(
-                        "{behind} set(s) that arrived were still waiting to be compiled when the wait ended: they match as they did before, and a set that is new matches nothing"
+                        "{behind} set(s) that arrived were still waiting to be compiled when the wait ended: until they are, they match as they did before, and a set that is new matches nothing"
                     ),
                 ));
             }
@@ -278,84 +278,180 @@ mod tests {
         assert_eq!(sets_behind(&late, &[]), 0);
     }
 
+    /// The time the tests give `settle` for sets that are behind: what `--wait`
+    /// is when nobody gives it.
+    const QUEUED: Duration = Duration::from_secs(30);
+
+    /// Two looks of `settle` at what it waits for.
+    const SLACK: Duration = Duration::from_millis(100);
+
+    /// The registry, the database and the manager of a profile, made where no
+    /// runtime is: no task fetches a resource and no task follows a set, so
+    /// each stays as it was made, or as a test makes it.
+    struct Still {
+        registry: Arc<SetRegistry>,
+        geo: Arc<GeoDb>,
+        resources: Arc<ResourceManager>,
+    }
+
+    impl Still {
+        /// Of a profile with these lines in `[Rule]`, its files in `dir`.
+        fn of(dir: &Path, rules: &str) -> Self {
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "made inside a runtime: its tasks would run"
+            );
+            let loaded = from_text(
+                &format!("[Proxy]\nP = direct\n[Rule]\n{rules}\nFINAL,DIRECT\n"),
+                &dir.join("t.conf"),
+                &LoadOptions::for_tests(),
+            );
+            assert!(!loaded.diagnostics.has_errors());
+            let resources = ResourceManager::with_options(
+                dir.to_path_buf(),
+                resource_client().unwrap(),
+                ResourceOptions::default(),
+            );
+            let (registry, _) = SetRegistry::build(&loaded.config, resources.clone(), dir);
+            let (geo, _) = GeoDb::open(&dir.join("geoip"));
+            Still {
+                registry,
+                geo,
+                resources,
+            }
+        }
+
+        /// The set of the profile whose name ends like this.
+        fn set(&self, ends: &str) -> SetStatus {
+            self.registry
+                .statuses()
+                .into_iter()
+                .find(|set| set.name.ends_with(ends))
+                .expect("the set of the profile")
+        }
+
+        /// Runs `settle` with these two times: how long it waited, and what
+        /// it said. The clock is the runtime's own: it stands still unless
+        /// something sleeps, and the runtime then moves it to the next timer.
+        /// So the time is exact to one look of `settle`, and none of it is
+        /// the test's.
+        fn settle(
+            &self,
+            unsettled: Duration,
+            queued: Duration,
+        ) -> (Duration, Vec<(&'static str, String)>) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut diagnostics = Diagnostics::default();
+                let began = tokio::time::Instant::now();
+                tokio::time::timeout(
+                    Duration::from_secs(600),
+                    settle(
+                        &self.registry,
+                        &self.geo,
+                        &self.resources,
+                        unsettled,
+                        queued,
+                        &mut diagnostics,
+                    ),
+                )
+                .await
+                .expect("settle went on past every time it was given");
+                let said = diagnostics
+                    .iter()
+                    .map(|d| (d.code, d.message.clone()))
+                    .collect();
+                (began.elapsed(), said)
+            })
+        }
+    }
+
+    /// With every set level with its resource and nothing that may still
+    /// come, `settle` does not wait at all, whatever times it is given: a
+    /// command that waits answers as soon as what arrived is applied.
+    #[test]
+    fn with_nothing_to_wait_for_it_does_not_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("level.list"), "DOMAIN,a.example\n").unwrap();
+        let still = Still::of(dir.path(), "RULE-SET,level.list,P");
+        // the set has compiled the one version there is of its file
+        let set = still.set("level.list");
+        let file = still
+            .resources
+            .statuses()
+            .into_iter()
+            .find(|file| Some(&file.key) == set.key.as_ref())
+            .expect("the file of the set");
+        assert_eq!((set.entries, set.version, file.version), (1, 1, 1));
+
+        assert_eq!(still.settle(QUEUED, QUEUED), (Duration::ZERO, vec![]));
+    }
+
+    /// A set whose resource has not arrived is waited for as what may not
+    /// come at all: the short time, however long the other is. Nothing is
+    /// said of it here: the registry said it when it was built.
+    #[test]
+    fn a_set_that_has_not_arrived_is_given_the_short_time_only() {
+        let dir = tempfile::tempdir().unwrap();
+        // nothing is ever asked of this address
+        let still = Still::of(dir.path(), "RULE-SET,http://127.0.0.1:1/absent.list,P");
+        assert_eq!(still.set("absent.list").state, "missing");
+        assert_eq!(
+            sets_behind(&still.registry.statuses(), &still.resources.statuses()),
+            0
+        );
+
+        let (waited, said) = still.settle(SETTLE, QUEUED);
+        assert!(SETTLE <= waited && waited < SETTLE + SLACK, "{waited:?}");
+        assert!(said.is_empty(), "{said:?}");
+        // and no time at all when the short one is none
+        assert_eq!(
+            still.settle(Duration::ZERO, QUEUED),
+            (Duration::ZERO, vec![])
+        );
+    }
+
     /// Sets that stay behind: `settle` gives them the time it was told to
     /// give them and no more, and then says how many there are, in the
-    /// diagnostics. Everything is made where no runtime is, so no task
-    /// fetches the resource and no task follows the set: the content is
-    /// handed to the manager, and the set never compiles it.
+    /// diagnostics. The content is handed to the manager, and the set never
+    /// compiles it: nothing follows it (`Still`).
     #[test]
     fn sets_that_stay_behind_are_said_when_their_time_is_over() {
-        const QUEUED: Duration = Duration::from_millis(300);
         let dir = tempfile::tempdir().unwrap();
         // nothing is ever asked of this address
         let url = "http://127.0.0.1:1/behind.list";
-        let loaded = from_text(
-            &format!("[Proxy]\nP = direct\n[Rule]\nRULE-SET,{url},P\nFINAL,DIRECT\n"),
-            &dir.path().join("t.conf"),
-            &LoadOptions::for_tests(),
-        );
-        assert!(!loaded.diagnostics.has_errors());
-        let resources = ResourceManager::with_options(
-            dir.path().to_path_buf(),
-            resource_client().unwrap(),
-            ResourceOptions::default(),
-        );
-        let (registry, _) = SetRegistry::build(&loaded.config, resources.clone(), dir.path());
-        let (geo, _) = GeoDb::open(&dir.path().join("geoip"));
-        resources
+        let still = Still::of(dir.path(), &format!("RULE-SET,{url},P"));
+        still
+            .resources
             .adopt(
                 &ResourceSource::Url(url.parse().unwrap()),
                 "DOMAIN,a.example\n".into(),
             )
             .unwrap();
-
-        let said = |diagnostics: &Diagnostics| -> Vec<(&'static str, String)> {
-            diagnostics
-                .iter()
-                .map(|d| (d.code, d.message.clone()))
-                .collect()
-        };
-        let behind = [(
+        let behind = vec![(
             codes::W_RESOURCE_UNAVAILABLE,
-            "1 set(s) that arrived were still waiting to be compiled when the wait ended: they match as they did before, and a set that is new matches nothing".to_string(),
+            "1 set(s) that arrived were still waiting to be compiled when the wait ended: until they are, they match as they did before, and a set that is new matches nothing".to_string(),
         )];
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let no_time = Duration::ZERO;
-            let mut diagnostics = Diagnostics::default();
-            let began = tokio::time::Instant::now();
-            tokio::time::timeout(
-                Duration::from_secs(10),
-                settle(
-                    &registry,
-                    &geo,
-                    &resources,
-                    no_time,
-                    QUEUED,
-                    &mut diagnostics,
-                ),
-            )
-            .await
-            .expect("settle went on past the time it was given");
-            assert!(began.elapsed() >= QUEUED, "{:?}", began.elapsed());
-            assert_eq!(said(&diagnostics), behind);
+        let no_time = Duration::ZERO;
 
-            // with no time for them either: at once, and said all the same
-            let mut diagnostics = Diagnostics::default();
-            settle(
-                &registry,
-                &geo,
-                &resources,
-                no_time,
-                no_time,
-                &mut diagnostics,
-            )
-            .await;
-            assert_eq!(said(&diagnostics), behind);
-        });
+        let (waited, said) = still.settle(no_time, QUEUED);
+        assert!(QUEUED <= waited && waited < QUEUED + SLACK, "{waited:?}");
+        assert_eq!(said, behind);
+        // the short time is not added to theirs
+        let (waited, said) = still.settle(SETTLE, QUEUED);
+        assert!(QUEUED <= waited && waited < QUEUED + SLACK, "{waited:?}");
+        assert_eq!(said, behind);
+        // a time for them below the short one (`--wait 1`): this set has not
+        // loaded at all, so it is also waited for as what may not come
+        let (waited, said) = still.settle(SETTLE, Duration::from_secs(1));
+        assert!(SETTLE <= waited && waited < SETTLE + SLACK, "{waited:?}");
+        assert_eq!(said, behind);
+        // with no time of either kind: at once, and said all the same
+        assert_eq!(still.settle(no_time, no_time), (Duration::ZERO, behind));
     }
 
     /// What has arrived is compiled when `settle` returns, however short the
