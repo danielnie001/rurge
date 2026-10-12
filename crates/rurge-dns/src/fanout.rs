@@ -417,6 +417,25 @@ mod tests {
         assert_eq!(s.query_count("a.test", Qtype::A), 4);
     }
 
+    /// Without options of its own a fanout is the manual's (DNS Overview): the
+    /// question goes out again every second, and after five rounds, about five
+    /// seconds in all, the lookup fails.
+    #[tokio::test(start_paused = true)]
+    async fn by_default_the_question_is_repeated_every_second_for_five_rounds() {
+        let opts = FanoutOpts::default();
+        assert_eq!((opts.resend, opts.attempts), (Duration::from_secs(1), 5));
+        let s = MockDns::spawn().await;
+        s.set("a.test", &["10.0.0.1"], &[], 60);
+        s.set_drop_all(true);
+        let started = Instant::now();
+        let err = resolve_name(&[s.upstream()], "a.test", false, &opts)
+            .await
+            .unwrap_err();
+        assert_eq!(err, FanoutError::Timeout);
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert_eq!(s.query_count("a.test", Qtype::A), 5);
+    }
+
     /// A fanout that does not get to run from one of its rounds until its
     /// deadline has passed — the process was stopped, the machine slept or
     /// was too busy — has rounds it never sent and no time to send them in:
