@@ -430,6 +430,26 @@ mod tests {
         assert_eq!(recent[0].error, None);
     }
 
+    /// A record says when its session began, in milliseconds since the Unix
+    /// epoch: the moment the record is made, less the time the session has run.
+    #[test]
+    fn a_record_says_when_its_session_began() {
+        let a = handle(1, "a.test");
+        // let some time pass; a busy wait, nothing is waited for
+        while a.elapsed() < std::time::Duration::from_millis(3) {
+            std::thread::yield_now();
+        }
+        let before = unix_millis();
+        let record = record_of(&a, None);
+        let after = unix_millis();
+        assert!(record.elapsed_ms >= 3, "{record:?}");
+        let made = record.started_ms + record.elapsed_ms;
+        assert!(
+            (before..=after).contains(&made),
+            "{before} <= {made} <= {after}"
+        );
+    }
+
     /// The port a session came in on is the session's own; the address it
     /// connected to and the time it spent on lookups are read off its trail,
     /// while it runs and after.
