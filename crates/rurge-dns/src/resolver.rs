@@ -2080,6 +2080,25 @@ mod tests {
         );
     }
 
+    /// An IPv6 server of `dns-server` is dropped when `ipv6 = false` and kept,
+    /// where the profile wrote it, when `ipv6 = true` (manual, DNS Servers).
+    #[tokio::test]
+    async fn an_ipv6_dns_server_is_kept_when_ipv6_is_on_and_dropped_when_it_is_off() {
+        let mock = MockDns::spawn().await;
+        for (ipv6, kept) in [("false", false), ("true", true)] {
+            let e = env(&profile(
+                &format!("dns-server = {}, [::1]:5353\nipv6 = {ipv6}", mock.addr()),
+                "",
+            ));
+            let (r, _) = resolver(&e, StaticSystemDns::default());
+            let mut expected = vec![format!("udp://{}", mock.addr())];
+            if kept {
+                expected.push("udp://[::1]:5353".to_string());
+            }
+            assert_eq!(r.primary_upstreams(), expected, "ipv6 = {ipv6}");
+        }
+    }
+
     /// A user name and a password written into a server's URL are in no
     /// upstream's name and in no warning: `https://` takes them — DoH sends
     /// them as it always did —, the other schemes refuse them, and a URL
