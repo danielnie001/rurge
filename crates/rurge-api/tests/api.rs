@@ -1373,6 +1373,286 @@ async fn profile_check_includes_the_dry_build() {
     assert!(!body.to_string().contains("hunter2"));
 }
 
+const CHECK: &str = "/v1/profiles/check";
+
+/// The manual: "Otherwise, the `error` field is null." A script written to it
+/// reads `error` to tell a valid profile, so the key is always there and, for
+/// a profile with no error in it, null, whatever the request has for a body. A
+/// warning is no error: the profile of the harness has one.
+#[tokio::test]
+async fn profile_check_says_null_in_error_for_a_valid_profile() {
+    let api = api().await;
+    for body in [None, Some(json!({}))] {
+        let (status, _, bytes) = call_raw(api.addr, "POST", CHECK, Some(KEY), body.clone()).await;
+        let answer: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 200, "{answer}");
+        // `answer["error"]` reads as null where there is no such key, too
+        assert_eq!(
+            answer.get("error"),
+            Some(&Value::Null),
+            "{body:?}: {answer}"
+        );
+        assert_eq!(answer["ok"], true, "{answer}");
+        assert!(answer["warnings"].as_u64().unwrap() >= 1, "{answer}");
+    }
+}
+
+/// A profile with errors in it says what is wrong in `error`: the first error
+/// in the order of `diagnostics`, as a log record would write it, and how many
+/// more there are. The check does not touch the profile that runs.
+#[tokio::test]
+async fn profile_check_says_what_is_wrong_in_error() {
+    let api = api().await;
+    let sound = std::fs::read_to_string(&api.conf).unwrap();
+    // The warning of the harness's profile comes before all of these in
+    // `diagnostics`: the first error is not the first diagnostic.
+    let one = sound.replace("FINAL,DIRECT", "FINAL,NoSuchPolicy");
+    let two = one.replace("DOMAIN,ads.test,REJECT", "DOMAIN,ads.test,NoSuchPolicy");
+    let three = two.replace(
+        "DOMAIN,ads.test,NoSuchPolicy",
+        "DOMAIN,ads.test,NoSuchPolicy\nDOMAIN,more.test,NoSuchPolicy",
+    );
+    for (text, count) in [(one, 1), (two, 2), (three, 3)] {
+        std::fs::write(&api.conf, text).unwrap();
+        let (status, body) = post(&api, CHECK, json!({})).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            (&body["ok"], &body["errors"]),
+            (&json!(false), &json!(count))
+        );
+        let listed = body["diagnostics"].as_array().unwrap();
+        let errors: Vec<&Value> = listed.iter().filter(|d| d["severity"] == "error").collect();
+        assert_eq!(errors.len(), count, "{body}");
+        let place = |d: &Value| {
+            format!(
+                "{}:{}",
+                d["span"]["file"].as_str().unwrap(),
+                d["span"]["line"]
+            )
+        };
+        let error = body["error"].as_str().unwrap_or_else(|| panic!("{body}"));
+        let first = errors[0];
+        assert!(
+            error.contains(first["code"].as_str().unwrap())
+                && error.contains(first["message"].as_str().unwrap())
+                && error.contains(&place(first)),
+            "not the first error: {error}"
+        );
+        if count == 1 {
+            assert!(!error.contains(" (and "), "{error}");
+        } else {
+            assert!(
+                error.ends_with(&format!(" (and {} more)", count - 1)),
+                "{error}"
+            );
+            assert!(!error.contains(&place(errors[count - 1])), "{error}");
+        }
+    }
+    let (status, rules) = get(&api, "/v1/rules").await;
+    let rules = rules.to_string();
+    assert!(
+        status == 200 && rules.contains("FINAL,DIRECT") && !rules.contains("NoSuchPolicy"),
+        "{rules}"
+    );
+}
+
+/// `name` is the manual's way to pick one of the profiles Surge keeps in a
+/// directory. rurge has the one that runs, the file `-c` names, so a name is
+/// either that one's (the file's name, or that without its last extension) or
+/// refused. A refusal is given before anything is loaded.
+#[tokio::test]
+async fn profile_check_takes_the_name_of_the_running_profile_and_no_other() {
+    let api = api().await;
+    // the harness's profile is `t.conf`
+    let (status, sound) = post(&api, CHECK, json!({})).await;
+    assert_eq!(status, 200, "{sound}");
+    for body in [
+        json!({ "other": 5 }),
+        json!({ "name": "t.conf" }),
+        json!({ "name": "t" }),
+        json!({ "name": "t.conf", "other": 5 }),
+    ] {
+        assert_eq!(
+            post(&api, CHECK, body.clone()).await,
+            (200, sound.clone()),
+            "{body}"
+        );
+    }
+    let text = std::fs::read_to_string(&api.conf).unwrap();
+    std::fs::write(
+        &api.conf,
+        text.replace("FINAL,DIRECT", "FINAL,NoSuchPolicy"),
+    )
+    .unwrap();
+    let (_, broken) = post(&api, CHECK, json!({})).await;
+    assert_eq!(broken["ok"], false, "{broken}");
+    for name in ["t.conf", "t"] {
+        let body = json!({ "name": name });
+        assert_eq!(
+            post(&api, CHECK, body.clone()).await,
+            (200, broken.clone()),
+            "{body}"
+        );
+    }
+    let refused = json!({ "error": "profile not found" });
+    // not a 200 with the errors of the file it was not asked about
+    assert_eq!(
+        post(&api, CHECK, json!({ "name": "S3CR3T-profile" })).await,
+        (404, refused.clone())
+    );
+    // Nothing is loaded for a name that is refused: the file is gone, which a
+    // load fails on, and which is a 500 for the name that is the profile's.
+    std::fs::remove_file(&api.conf).unwrap();
+    let (status, body) = post(&api, CHECK, json!({ "name": "t.conf" })).await;
+    assert_eq!(status, 500, "{body}");
+    let absolute = api.conf.display().to_string();
+    for name in [
+        "S3CR3T-profile",
+        "T.conf",
+        "T.CONF",
+        "T",
+        "t.conf ",
+        " t",
+        "t.",
+        "t.conf.bak",
+        "conf",
+        ".conf",
+        "./t.conf",
+        "dir/t.conf",
+        "dir\\t.conf",
+        "",
+        absolute.as_str(),
+    ] {
+        let sent = json!({ "name": name });
+        let (status, body) = post(&api, CHECK, sent.clone()).await;
+        assert_eq!((status, &body), (404, &refused), "{sent}");
+        assert!(!body.to_string().contains("S3CR3T"), "{body}");
+    }
+}
+
+/// A body that is no JSON object, or has a `name` that is no string, is
+/// refused with one text, and nothing that was sent comes back in it.
+#[tokio::test]
+async fn profile_check_refuses_a_body_that_is_no_name_with_one_text() {
+    let api = api().await;
+    let mut said = Vec::new();
+    for body in [
+        "[]",
+        r#"["S3CR3T"]"#,
+        r#""S3CR3T""#,
+        "31337",
+        "true",
+        "null",
+        r#"{"name": 31337}"#,
+        r#"{"name": true}"#,
+        r#"{"name": null}"#,
+        r#"{"name": ["S3CR3T"]}"#,
+        r#"{"name": {"S3CR3T": 1}}"#,
+        "S3CR3T is no JSON",
+        r#"{"name": "S3CR3T""#,
+    ] {
+        let (status, _, bytes) =
+            call_text(api.addr, "POST", CHECK, Some(KEY), Some(body.to_string())).await;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert_eq!(status, 400, "{body}: {text}");
+        for marker in ["S3CR3T", "31337"] {
+            assert!(!text.contains(marker), "{body}: {text}");
+        }
+        said.push(text);
+    }
+    let first: Value = serde_json::from_str(&said[0]).unwrap();
+    assert!(
+        first["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "{first}"
+    );
+    assert!(said.iter().all(|text| *text == said[0]), "{said:?}");
+}
+
+/// A body of nothing but JSON whitespace is no body.
+#[tokio::test]
+async fn profile_check_takes_a_body_of_whitespace_for_no_body() {
+    let api = api().await;
+    let (status, sound) = post(&api, CHECK, json!({})).await;
+    assert_eq!(status, 200, "{sound}");
+    for body in [" \n", "\t\r\n ", "   "] {
+        let (status, _, bytes) =
+            call_text(api.addr, "POST", CHECK, Some(KEY), Some(body.to_string())).await;
+        assert_eq!(status, 200, "{body:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap(),
+            sound,
+            "{body:?}"
+        );
+    }
+}
+
+/// `POST /v1/profiles/check` with the request written in one go, its head
+/// saying `content_type` (nothing, for `None`).
+async fn check_with_content_type(
+    addr: SocketAddr,
+    content_type: Option<&str>,
+    body: &str,
+) -> Reply {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let content_type = content_type.map_or_else(String::new, |t| format!("Content-Type: {t}\r\n"));
+    let request = format!(
+        "POST {CHECK} HTTP/1.1\r\nHost: {addr}\r\nX-Key: {KEY}\r\n{content_type}\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let (raw, ended_in) = read_to_the_end(&mut stream).await;
+    Reply::parse(&raw, ended_in, String::new())
+}
+
+/// The content type of the request is not looked at: a script posts its body
+/// as its HTTP library does, and a library may well call it a form.
+#[tokio::test]
+async fn profile_check_does_not_look_at_the_content_type() {
+    let api = api().await;
+    let (status, sound) = post(&api, CHECK, json!({})).await;
+    assert_eq!(status, 200, "{sound}");
+    for content_type in [
+        None,
+        Some("text/plain"),
+        Some("application/x-www-form-urlencoded"),
+        Some("application/json; charset=utf-8"),
+    ] {
+        check_with_content_type(api.addr, content_type, r#"{"name": "t.conf"}"#)
+            .await
+            .assert_answered(200, &sound);
+        check_with_content_type(api.addr, content_type, r#"{"name": "S3CR3T"}"#)
+            .await
+            .assert_answered(404, &json!({ "error": "profile not found" }));
+        check_with_content_type(api.addr, content_type, "S3CR3T")
+            .await
+            .assert_answered(400, &post(&api, CHECK, json!([])).await.1);
+    }
+}
+
+/// The 2 MiB that a body may have for a handler to read it. A body of more is
+/// refused as one that cannot be made sense of is: the same 400, for a body
+/// that is nothing but whitespace as for any other. The answer is given when
+/// the limit is crossed, with the rest of the body still on its way, so how the
+/// connection ends is not asserted (the 64 KiB over are within what is read
+/// away after the answer; a sender of much more can lose the answer, as it can
+/// at any endpoint that reads its body).
+#[tokio::test]
+async fn profile_check_refuses_a_body_too_large_to_read_with_the_same_text() {
+    let api = api().await;
+    let body = vec![b' '; 2 * 1024 * 1024 + 64 * 1024];
+    let stream = send_a_head(api.addr, "POST", CHECK, Some(KEY), body.len()).await;
+    let (mut reading, mut writing) = stream.into_split();
+    let ((status, text), wrote) = tokio::join!(
+        read_one_answer(&mut reading),
+        tokio::time::timeout(Duration::from_secs(10), writing.write_all(&body)),
+    );
+    let wrote = wrote.expect("the body was neither taken nor refused within 10 s");
+    assert_eq!(status, 400, "{text}; writing returned {wrote:?}");
+    let (_, refused) = post(&api, CHECK, json!([])).await;
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), refused);
+}
+
 /// The test databases of the rule engine's crate.
 fn geoip_fixture(file: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2184,8 +2464,9 @@ async fn send_with_a_late_body(
     Reply::parse(&raw, ended_in, format!("{wrote:?}"))
 }
 
-/// The four endpoints that do not read their body answer on the head alone, and
-/// the client that sends the body late still gets the answer.
+/// The endpoints that do not read their body (a stop, a DNS flush and a reload)
+/// answer on the head alone, and the client that sends the body late still gets
+/// the answer.
 #[tokio::test]
 async fn a_late_body_does_not_cost_a_stop_its_answer() {
     let api = api().await;
@@ -2231,14 +2512,38 @@ async fn a_late_body_does_not_cost_a_reload_its_answer() {
     assert_eq!(api.control.reloads.load(Ordering::SeqCst), 1);
 }
 
+/// The profile check reads its body, as the log level endpoint does: a body
+/// that comes after the head is waited for, and once it has come the check is
+/// answered, the refusal of a name and the refusal of a body alike. Nothing is
+/// answered on the head alone, so there is no answer to lose.
 #[tokio::test]
 async fn a_late_body_does_not_cost_a_profile_check_its_answer() {
     let api = api().await;
-    let (status, expected) = post(&api, "/v1/profiles/check", json!({})).await;
-    assert_eq!(status, 200, "{expected}");
-    let reply =
-        send_with_a_late_body(api.addr, "POST", "/v1/profiles/check", Some(KEY), "{}").await;
-    reply.assert_whole(200, &expected);
+    for (body, status) in [
+        ("{}", 200),
+        (r#"{"name":"S3CR3T-profile"}"#, 404),
+        ("[]", 400),
+    ] {
+        let mut stream = send_a_head(api.addr, "POST", CHECK, Some(KEY), body.len()).await;
+        // The wait is one in which nothing happens, and that is what is
+        // asserted: an answer cannot come before the body does, and 200 ms is
+        // what a loopback leaves to an endpoint that would answer on the head.
+        assert_eq!(
+            peek_at_the_answer(&stream, Duration::from_millis(200)).await,
+            None,
+            "{body}: answered before its body came"
+        );
+        stream.write_all(body.as_bytes()).await.unwrap();
+        let (late, text) = read_one_answer(&mut stream).await;
+        // the answer the same body is given when it comes with the head
+        let (whole, answer) = post(&api, CHECK, serde_json::from_str(body).unwrap()).await;
+        assert_eq!((late, whole), (status, status), "{body}: {text}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            answer,
+            "{body}"
+        );
+    }
 }
 
 /// A request refused before its body is read is answered on the head alone too.
@@ -2359,7 +2664,7 @@ async fn a_body_larger_than_what_is_read_away_does_not_hold_its_sender_up() {
 
 /// Reads one answer off a connection that stays open: the head, and then as
 /// many bytes of body as its `Content-Length` says.
-async fn read_one_answer(stream: &mut TcpStream) -> (u16, String) {
+async fn read_one_answer(stream: &mut (impl AsyncRead + Unpin)) -> (u16, String) {
     let mut raw = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {
