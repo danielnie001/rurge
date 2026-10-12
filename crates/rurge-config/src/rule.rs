@@ -1115,6 +1115,44 @@ mod tests {
         );
     }
 
+    /// The twelve `PROTOCOL` keywords (manual, Protocol and Network Rules)
+    /// each mean their own kind, and they are case-sensitive: neither a
+    /// lower-case spelling nor a neighbour's name reads as another keyword.
+    #[test]
+    fn every_protocol_keyword_the_manual_lists_means_its_own_kind() {
+        let listed = [
+            ("HTTP", ProtocolKind::Http),
+            ("HTTPS", ProtocolKind::Https),
+            ("TCP", ProtocolKind::Tcp),
+            ("UDP", ProtocolKind::Udp),
+            ("QUIC", ProtocolKind::Quic),
+            ("STUN", ProtocolKind::Stun),
+            ("MTProto", ProtocolKind::MtProto),
+            ("DOH", ProtocolKind::Doh),
+            ("DOH3", ProtocolKind::Doh3),
+            ("DOQ", ProtocolKind::Doq),
+            ("DOT", ProtocolKind::Dot),
+            ("DNS", ProtocolKind::Dns),
+        ];
+        for (keyword, kind) in listed {
+            let rule = parse(&format!("PROTOCOL,{keyword},DIRECT")).unwrap();
+            assert_eq!(rule.kind, RuleKind::Protocol(kind), "{keyword}");
+            assert_eq!(ProtocolKind::parse(keyword), Some(kind), "{keyword}");
+        }
+        for spelled in [
+            "http", "Https", "mtproto", "MTPROTO", "Doh3", "dns", "DOT3", "",
+        ] {
+            assert_eq!(ProtocolKind::parse(spelled), None, "{spelled:?}");
+            assert_eq!(
+                parse(&format!("PROTOCOL,{spelled},DIRECT"))
+                    .err()
+                    .map(|e| e.code),
+                Some(codes::E_INVALID_RULE_VALUE),
+                "{spelled:?}"
+            );
+        }
+    }
+
     #[test]
     fn errors() {
         let code = |raw: &str| parse(raw).unwrap_err().code;
