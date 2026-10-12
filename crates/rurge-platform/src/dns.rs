@@ -28,8 +28,15 @@ pub fn search_domains() -> Vec<String> {
 }
 
 pub fn hosts_path() -> PathBuf {
-    if cfg!(windows) {
-        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    hosts_path_for(cfg!(windows), std::env::var_os("SystemRoot"))
+}
+
+/// Where the hosts file is kept: `%SystemRoot%\System32\drivers\etc\hosts` on
+/// Windows, `/etc/hosts` on macOS and Linux. The platform is an argument so
+/// that every platform's answer can be tested on any one.
+fn hosts_path_for(windows: bool, system_root: Option<std::ffi::OsString>) -> PathBuf {
+    if windows {
+        let root = system_root.unwrap_or_else(|| "C:\\Windows".into());
         PathBuf::from(root)
             .join("System32")
             .join("drivers")
@@ -183,6 +190,28 @@ mod tests {
         } else {
             assert_eq!(p, PathBuf::from("/etc/hosts"));
         }
+    }
+
+    /// The hosts file is where each of the three platforms keeps it, whichever
+    /// of them the test runs on.
+    #[test]
+    fn the_hosts_file_is_where_each_platform_keeps_it() {
+        let drivers = std::path::Path::new("System32")
+            .join("drivers")
+            .join("etc")
+            .join("hosts");
+        let windows = hosts_path_for(true, Some("D:\\Win".into()));
+        assert!(windows.starts_with("D:\\Win"), "{windows:?}");
+        assert!(windows.ends_with(&drivers), "{windows:?}");
+        let default = hosts_path_for(true, None);
+        assert!(default.starts_with("C:\\Windows"), "{default:?}");
+        assert!(default.ends_with(&drivers), "{default:?}");
+        // macOS and Linux
+        assert_eq!(hosts_path_for(false, None), PathBuf::from("/etc/hosts"));
+        assert_eq!(
+            hosts_path_for(false, Some("D:\\Win".into())),
+            PathBuf::from("/etc/hosts")
+        );
     }
 
     #[test]
