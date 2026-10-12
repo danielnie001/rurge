@@ -1105,6 +1105,103 @@ async fn repeated_rejects_escalate_to_drop() {
     }
 }
 
+/// Only `REJECT` and `REJECT-TINYGIF` are upgraded to `REJECT-DROP` once a host
+/// has been rejected fifty times: `REJECT-DROP` stays what it is, and
+/// `REJECT-NO-DROP` is never upgraded however often it rejects.
+#[tokio::test]
+async fn only_reject_and_reject_tinygif_are_upgraded_to_drop() {
+    use rurge_proto::RejectKind;
+    let h = harness(
+        "",
+        "DOMAIN,plain.test,REJECT\nDOMAIN,gif.test,REJECT-TINYGIF\nDOMAIN,drop.test,REJECT-DROP\nDOMAIN,nodrop.test,REJECT-NO-DROP",
+        OutboundMode::Rule,
+    )
+    .await;
+    let rejected = |host: &'static str, times: usize| {
+        let engine = h.engine.clone();
+        async move {
+            let mut kinds = Vec::new();
+            for _ in 0..times {
+                match engine
+                    .dial(SessionInfo::tcp(HostName::parse(host), 80))
+                    .await
+                {
+                    Err(DialError::Reject { kind, .. }) => kinds.push(kind),
+                    _ => panic!("{host} was not rejected"),
+                }
+            }
+            kinds
+        }
+    };
+    for (host, before) in [
+        ("plain.test", RejectKind::Reject),
+        ("gif.test", RejectKind::TinyGif),
+    ] {
+        let kinds = rejected(host, 52).await;
+        assert!(
+            kinds[..49].iter().all(|k| *k == before),
+            "{host}: {kinds:?}"
+        );
+        assert!(
+            kinds[49..].iter().all(|k| *k == RejectKind::Drop),
+            "{host}: {kinds:?}"
+        );
+    }
+    assert!(
+        rejected("drop.test", 52)
+            .await
+            .iter()
+            .all(|k| *k == RejectKind::Drop)
+    );
+    assert!(
+        rejected("nodrop.test", 52)
+            .await
+            .iter()
+            .all(|k| *k == RejectKind::NoDrop)
+    );
+}
+
+/// A profile may name several listeners of each kind: every one is bound, at
+/// an address of its own, and serves.
+#[tokio::test]
+async fn every_listener_a_profile_names_is_bound_and_serves() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let target = TestServer::spawn().await;
+    let target_port = target.url("/").port().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = build_runtime(
+        dir.path(),
+        &dns,
+        "http-listen = 127.0.0.1:0, 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0, 127.0.0.1:0",
+        "",
+        OutboundMode::Rule,
+        Duration::from_secs(600),
+        EngineShared::default(),
+    )
+    .await;
+    let engine = Engine::new(runtime);
+    let listeners = engine.bind_listeners().await.unwrap();
+    let of = |kind| -> Vec<SocketAddr> {
+        listeners
+            .iter()
+            .filter(|(spec, _)| spec.kind == kind)
+            .map(|(_, running)| running.local_addr)
+            .collect()
+    };
+    let (https, socks) = (of(ListenerKind::Http), of(ListenerKind::Socks5));
+    assert_eq!((https.len(), socks.len()), (2, 2));
+    assert_ne!(https[0], https[1]);
+    assert_ne!(socks[0], socks[1]);
+    for http in https {
+        assert_eq!(connect_status(http, target_port, None).await, "200");
+    }
+    for socks in socks {
+        let (reply, _tunnel) = socks5_connect(socks, "target.test", target_port).await;
+        assert_eq!(reply[1], 0);
+    }
+}
+
 #[tokio::test]
 async fn reload_swaps_rules_without_changing_listeners() {
     let h = harness("", "DOMAIN,ads.test,REJECT", OutboundMode::Rule).await;
