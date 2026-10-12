@@ -1120,6 +1120,45 @@ mod tests {
         }
     }
 
+    /// A `RULE-SET` value is read in the order the manual gives: an internal
+    /// set, then an inline section, then an external resource. A name two of
+    /// them could take goes to the first.
+    #[test]
+    fn a_rule_set_value_is_an_internal_set_then_an_inline_one_then_an_external_resource() {
+        let inline = HashSet::from(["LAN".to_string(), "lists/streaming.list".to_string()]);
+        let read = |value: &str| {
+            parse_with_inline(&format!("RULE-SET,{value},DIRECT"), &inline)
+                .unwrap_or_else(|e| panic!("{value}: {}", e.message))
+                .kind
+        };
+        // a section named like an internal set is the internal set
+        assert_eq!(
+            read("LAN"),
+            RuleKind::RuleSet(ResourceRef::Internal(InternalSet::Lan))
+        );
+        assert_eq!(
+            read("SYSTEM"),
+            RuleKind::RuleSet(ResourceRef::Internal(InternalSet::System))
+        );
+        // a section named like a file is the section, not the file
+        assert_eq!(
+            read("lists/streaming.list"),
+            RuleKind::RuleSet(ResourceRef::Inline("lists/streaming.list".into()))
+        );
+        // what no section is called is a resource: a URL, or a path from the
+        // profile's directory
+        assert_eq!(
+            read("https://example.com/a.list"),
+            RuleKind::RuleSet(ResourceRef::Url("https://example.com/a.list".into()))
+        );
+        assert_eq!(
+            read("lists/other.list"),
+            RuleKind::RuleSet(ResourceRef::File(
+                Path::new("/profiles/lists/other.list").to_path_buf()
+            ))
+        );
+    }
+
     #[test]
     fn subrule_unknown_flags_are_collected() {
         let r = parse("AND,((DOMAIN,a,bogus,no-resolve),(DOMAIN,b)),P").unwrap();
