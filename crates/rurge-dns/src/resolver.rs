@@ -995,9 +995,13 @@ fn traditional_specs(
     wants_system: bool,
     system: &[UpstreamSpec],
 ) -> Vec<UpstreamSpec> {
-    let mut specs = configured_udp.to_vec();
-    if wants_system {
-        specs.extend(system.iter().cloned());
+    // a server named twice, in the profile or again by `system`, is one
+    let mut specs: Vec<UpstreamSpec> = Vec::new();
+    let system = if wants_system { system } else { &[] };
+    for spec in configured_udp.iter().chain(system) {
+        if !specs.contains(spec) {
+            specs.push(spec.clone());
+        }
     }
     specs
 }
@@ -1920,6 +1924,35 @@ mod tests {
             let found = r.lookup("a.test", LookupOpts::default()).await.unwrap();
             assert_eq!(found.v4, vec![v4(address)], "{server} answers");
         }
+    }
+
+    /// Duplicate servers are ignored (manual, DNS Servers): a server the
+    /// profile names twice, or names and `system` brings in again, is asked
+    /// once.
+    #[tokio::test]
+    async fn a_server_named_twice_is_asked_once() {
+        let mock = MockDns::spawn().await;
+        let other = MockDns::spawn().await;
+        let e = env(&profile(
+            &format!(
+                "dns-server = {0}, {1}, {0}, system, {1}",
+                mock.addr(),
+                other.addr()
+            ),
+            "",
+        ));
+        let sys = StaticSystemDns {
+            servers: vec![mock.addr()],
+            ..StaticSystemDns::default()
+        };
+        let (r, _) = resolver_once(&e, sys);
+        assert_eq!(
+            r.primary_upstreams(),
+            vec![
+                format!("udp://{}", mock.addr()),
+                format!("udp://{}", other.addr())
+            ]
+        );
     }
 
     #[tokio::test]
