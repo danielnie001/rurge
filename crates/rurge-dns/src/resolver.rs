@@ -2084,6 +2084,31 @@ https://dns.example/dns-query"
         assert!(statuses[0].local && statuses[0].ready, "{statuses:?}");
     }
 
+    /// `read-etc-hosts = false` (manual, Local DNS Mapping) turns the hosts
+    /// file off: its names go to the servers like any other, and the file is
+    /// not even watched.
+    #[tokio::test]
+    async fn read_etc_hosts_false_leaves_the_hosts_file_alone() {
+        let mock = MockDns::spawn().await;
+        mock.set("nas.lan", &["10.40.0.9"], &[], 60);
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts");
+        std::fs::write(&hosts_path, "10.40.0.1 nas.lan\n").unwrap();
+        let e = env(&profile(
+            &format!("dns-server = {}\nread-etc-hosts = false", mock.addr()),
+            "",
+        ));
+        let sys = StaticSystemDns {
+            hosts_path: Some(hosts_path),
+            ..StaticSystemDns::default()
+        };
+        let (r, _) = resolver_once(&e, sys);
+        let n = r.lookup("nas.lan", LookupOpts::default()).await.unwrap();
+        assert_eq!(n.v4, vec![v4("10.40.0.9")], "the server's answer");
+        assert!(matches!(n.source, Source::Upstream(_)), "{:?}", n.source);
+        assert!(e.resources.statuses().is_empty(), "the file is not watched");
+    }
+
     #[tokio::test]
     async fn host_lookup_reads_the_host_section_without_any_query() {
         let dns = MockDns::spawn().await;
