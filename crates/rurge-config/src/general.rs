@@ -809,6 +809,12 @@ pub fn parse_general(section: Option<&Section>, diags: &mut Diagnostics) -> Gene
                     migrated(diags, span, key, "encrypted-dns-server");
                 }
                 for item in split_list(value) {
+                    // the manual's special value: encrypted DNS is off, whatever
+                    // was listed before it
+                    if item.eq_ignore_ascii_case("off") {
+                        g.encrypted_dns_server.clear();
+                        continue;
+                    }
                     match EncryptedDns::parse(&item) {
                         Some(enc) => g.encrypted_dns_server.push(enc),
                         None => invalid(diags, span, key, &url_without_credentials(&item)),
@@ -1110,6 +1116,29 @@ mod tests {
             g.dns_server,
             vec![DnsServer::Udp("8.8.8.8:53".parse().unwrap())]
         );
+    }
+
+    /// `off` (manual, Encrypted DNS) is the special value that disables
+    /// encrypted DNS: a value of `encrypted-dns-server`, not a mistake, and
+    /// what was listed before it, under that key or as a URL under an old
+    /// `dns-server`, is not used. What is listed after it is.
+    #[test]
+    fn encrypted_dns_server_off_turns_encrypted_dns_off_without_a_warning() {
+        let (g, d) = parse(
+            "[General]\ndns-server = 1.1.1.1, https://doh.example/dns-query\nencrypted-dns-server = tls://dot.example\nencrypted-dns-server = off\n",
+        );
+        assert!(codes_of(&d).is_empty(), "{:?}", codes_of(&d));
+        assert!(g.encrypted_dns_server.is_empty());
+        assert_eq!(
+            g.dns_server,
+            vec![DnsServer::Udp("1.1.1.1:53".parse().unwrap())]
+        );
+        let (g, d) = parse(
+            "[General]\nencrypted-dns-server = OFF\nencrypted-dns-server = tls://dot.example\n",
+        );
+        assert!(codes_of(&d).is_empty(), "{:?}", codes_of(&d));
+        assert_eq!(g.encrypted_dns_server.len(), 1);
+        assert_eq!(g.encrypted_dns_server[0].scheme, EncryptedDnsScheme::Tls);
     }
 
     #[test]
