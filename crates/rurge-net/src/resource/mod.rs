@@ -719,7 +719,8 @@ impl ResourceManager {
     }
 
     /// Asks for an update of `source` and does not wait for it. Asking twice
-    /// before the task has begun one makes one.
+    /// before the task has begun one makes one; asked while an attempt is
+    /// under way, one more follows it.
     pub fn force_update(&self, source: &ResourceSource) -> bool {
         let Some(entry) = self.entry_of(&source.key()) else {
             return false;

@@ -923,6 +923,9 @@ mod tests {
         // server is on the loopback and answers at once. 300 ms is the margin.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(f.server.hits("/b"), 5);
+        // The address the version is of is not among them: when it is asked
+        // again is its own source's to say.
+        assert_eq!(f.server.hits("/a"), 0);
     }
 
     /// A version that waits is not at fault: nothing is asked on its account.
@@ -938,6 +941,52 @@ mod tests {
         // server is on the loopback. 300 ms is the margin.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(f.server.hits("/b"), 0);
+    }
+
+    /// With nobody to ask, the minute is not spent and the round is not
+    /// counted: they are for the version that has somebody to ask.
+    #[tokio::test]
+    async fn nothing_is_spent_when_there_is_nobody_to_ask() {
+        let f = Fixture::new().await;
+        // the profile names `/a` alone, and has a rule of its own for `P1`
+        std::fs::write(
+            &f.sources.profile,
+            format!(
+                "[Proxy]\n#!include {}\n[Rule]\nDOMAIN,b.example,P1\nFINAL,DIRECT\n",
+                f.server.url("/a")
+            ),
+        )
+        .unwrap();
+        f.track();
+        // `/a` without `P1`
+        assert!(f.check("/a", &policies(&["P2"])).await.is_err());
+        let verdicts = f.sources.verdicts.lock().unwrap();
+        assert_eq!(verdicts.kept.len(), 1);
+        assert_eq!(verdicts.kept[0].asked, 0);
+        assert!(verdicts.asked_at.is_none());
+    }
+
+    /// A body with a fault of its own is told that fault, also beside a kept
+    /// version that does not load either: what the two come to together is
+    /// the reason only of a body that nothing on disk refers to.
+    #[tokio::test]
+    async fn a_body_at_fault_is_told_its_own_fault_beside_a_kept_version() {
+        let f = Fixture::new().await;
+        // what `/b` was downloaded as: asking for it changes nothing
+        f.server.set("/b", rules("P1"));
+        // `/a` with a line that is no policy
+        let kept = f
+            .check("/a", "[Proxy]\nP1 = socks5\n")
+            .await
+            .expect_err("it does not load");
+        assert_eq!(f.kept(), [f.server.url("/a")]);
+        // `/b` with a rule for a policy that nothing defines
+        let own = f
+            .check("/b", &rules("P9"))
+            .await
+            .expect_err("it does not load");
+        assert!(own.starts_with("does not load: "), "{own}");
+        assert_ne!(own, kept);
     }
 
     /// The cache cannot be written for one of the kept candidates: what was

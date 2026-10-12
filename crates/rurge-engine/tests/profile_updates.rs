@@ -815,8 +815,10 @@ fn including(w: &World, files: &[&str], rule: &str) -> String {
 const A_BODY: &str = "[Rule]\nDOMAIN,a.example,DIRECT\n";
 
 /// A managed profile that includes `/a`, where a file that does not load is
-/// served for `/a`: it was refused, and is kept. No source is asked a second
-/// time while a test runs.
+/// served for `/a`: it was refused, and is kept. No source is tried again of
+/// itself while a test runs, a back-off being a minute. `/managed` has been
+/// asked twice by now: when it was followed, being due, and on account of the
+/// file that was refused.
 async fn the_world_with_a_refused_file() -> (World, Arc<ProfileSources>) {
     let w = World::new().await;
     point_at_managed(&w, "interval=3600");
