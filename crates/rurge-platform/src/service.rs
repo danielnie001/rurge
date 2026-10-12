@@ -477,6 +477,32 @@ mod tests {
         assert_eq!(removal.remove, [plist]);
     }
 
+    /// "Started again after a crash": systemd restarts a daemon that failed,
+    /// launchd one that exited unsuccessfully (`SuccessfulExit` false under
+    /// `KeepAlive`), and neither restarts one that stopped cleanly, as
+    /// `rurge stop` makes it.
+    #[test]
+    fn a_daemon_that_dies_is_started_again_and_one_that_was_stopped_is_not() {
+        for scope in [Scope::User, Scope::System] {
+            let unit = install_plan(Os::Unix, scope, &spec(false), &home_env, None).unwrap();
+            assert!(
+                unit.files[0]
+                    .1
+                    .contains("[Service]\nExecStart=\"/usr/local/bin/rurge\" run -c \"/home/me/my profiles/rurge.conf\"\nRestart=on-failure\nRestartSec=3\n"),
+                "{}",
+                unit.files[0].1
+            );
+            let plist = install_plan(Os::MacOs, scope, &spec(false), &home_env, Some(501)).unwrap();
+            assert!(
+                plist.files[0].1.contains(
+                    "<key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        <false/>\n    </dict>"
+                ),
+                "{}",
+                plist.files[0].1
+            );
+        }
+    }
+
     #[test]
     fn plist_strings_are_xml_escaped() {
         let odd = ServiceSpec {
