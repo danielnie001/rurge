@@ -2763,6 +2763,41 @@ mod run {
         assert!(!text.contains("hunter2"), "{text}");
     }
 
+    /// A profile edited into one that does not load: the reload says no and
+    /// why, on standard error and in its answer, and the rules the daemon
+    /// serves are the ones it had; the profile repaired is taken at the next
+    /// reload.
+    #[test]
+    fn a_reload_of_a_profile_with_errors_keeps_the_rules_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let (daemon, errors) =
+            spawn_command_reading_stderr(rurge_run(&conf, &dir.path().join("data")));
+        let port = api_port(&daemon);
+        let rules = || api_call(port, "GET", "/v1/rules", "k", None).1;
+        assert!(rules().contains("DOMAIN,ads.test,REJECT"));
+        let good = std::fs::read_to_string(&conf).unwrap();
+        let broken = good.replace("DOMAIN,ads.test,REJECT", "DOMAIN,new.test,NoSuchPolicy");
+        assert_ne!(good, broken);
+        std::fs::write(&conf, &broken).unwrap();
+        let (status, body) = api_call(port, "POST", "/v1/profiles/reload", "k", Some("{}"));
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"ok\":false"), "{body}");
+        assert!(!body.contains("\"errors\":0"), "{body}");
+        wait_for_stderr_line(&errors, "reload failed, keeping current config:");
+        wait_for_stderr_line(&errors, "error[E0007]");
+        let served = rules();
+        assert!(
+            served.contains("DOMAIN,ads.test,REJECT") && !served.contains("new.test"),
+            "{served}"
+        );
+        let repaired = good.replace("DOMAIN,ads.test,REJECT", "DOMAIN,new.test,REJECT");
+        std::fs::write(&conf, repaired).unwrap();
+        let (_, body) = api_call(port, "POST", "/v1/profiles/reload", "k", Some("{}"));
+        assert!(body.contains("\"ok\":true"), "{body}");
+        assert!(rules().contains("DOMAIN,new.test,REJECT"));
+    }
+
     /// M1 design 6.4: a reload whose profile holds a policy that cannot be
     /// built keeps the running generation.
     #[test]
