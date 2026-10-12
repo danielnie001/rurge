@@ -924,6 +924,45 @@ async fn traffic_total_includes_in_flight_bytes() {
     drop(s);
 }
 
+/// The current speeds are the bytes that moved since the last sample, each way
+/// under its own name: a tunnel that is only written to shows an upload speed
+/// and no download speed, and both are back at zero once nothing moves.
+#[tokio::test]
+async fn the_current_speed_follows_the_bytes_that_move_and_stops_with_them() {
+    let api = api().await;
+    let host = format!("target.test:{}", api.target_port());
+    let mut s = TcpStream::connect(api.http()).await.unwrap();
+    s.write_all(format!("CONNECT {host} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut buf = vec![0u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+        .await
+        .expect("connect reply in time")
+        .unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+    // a request that never ends: the target answers nothing, so only upload
+    let payload = format!(
+        "GET /hello HTTP/1.1\r\nHost: {host}\r\nX-Pad: {}\r\n",
+        "p".repeat(400)
+    );
+    s.write_all(payload.as_bytes()).await.unwrap();
+    s.flush().await.unwrap();
+    let mut total = Value::Null;
+    wait_until(async || {
+        total = get(&api, "/v1/traffic").await.1["total"].clone();
+        total["outCurrentSpeed"].as_u64().unwrap_or(0) > 0
+    })
+    .await;
+    assert_eq!(total["inCurrentSpeed"], 0, "{total}");
+    wait_until(async || {
+        let total = get(&api, "/v1/traffic").await.1["total"].clone();
+        total["outCurrentSpeed"] == 0 && total["inCurrentSpeed"] == 0
+    })
+    .await;
+    drop(s);
+}
+
 #[tokio::test]
 async fn dns_cache_flush_and_delay() {
     let api = api().await;
