@@ -309,6 +309,42 @@ fn check_json_and_platform() {
     );
 }
 
+/// `SYSTEM` is `Windows`, `Linux` or `macOS`, whichever platform the profile is
+/// read for: of the lines held to a system by a tag, the one for that system is
+/// read and no other, and the two tags for Surge's iOS and tvOS never are.
+#[test]
+fn check_reads_the_line_tagged_for_the_platform_and_no_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write(
+        &dir,
+        "tags.conf",
+        "[Rule]\nDOMAIN,windows.test,REJECT #!WINDOWS-ONLY\nDOMAIN,linux.test,REJECT #!LINUX-ONLY\nDOMAIN,macos.test,REJECT #!MACOS-ONLY\nDOMAIN,ios.test,REJECT #!IOS-ONLY\nDOMAIN,tvos.test,REJECT #!TVOS-ONLY\nFINAL,DIRECT\n",
+    );
+    // the tagged lines are lines 2 to 6 of the file
+    for (platform, own) in [("windows", 2), ("linux", 3), ("macos", 4)] {
+        let out = Command::cargo_bin("rurge")
+            .unwrap()
+            .args(["check", "--json", "--platform", platform, "-c"])
+            .arg(&conf)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let mut disabled: Vec<u64> = v["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|d| d["code"] == "I0002")
+            .map(|d| d["span"]["line"].as_u64().unwrap())
+            .collect();
+        disabled.sort();
+        let expected: Vec<u64> = (2..=6).filter(|line| *line != own).collect();
+        assert_eq!(disabled, expected, "--platform {platform}: {v}");
+    }
+}
+
 /// rurge reports `CORE_VERSION` 22, the version that brought the `smart`
 /// group: a line that asks for 22 is read, one that asks for 23 is not.
 #[test]
