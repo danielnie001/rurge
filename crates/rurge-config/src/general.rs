@@ -223,6 +223,7 @@ pub struct General {
     pub include_local_networks: bool,
     pub include_apns: bool,
     pub include_cellular_services: bool,
+    pub include_device_communication: bool,
     // macOS only in Surge; supported everywhere in rurge
     pub http_listen: Vec<Listener>,
     pub socks5_listen: Vec<Listener>,
@@ -291,6 +292,7 @@ impl fmt::Debug for General {
             include_local_networks,
             include_apns,
             include_cellular_services,
+            include_device_communication,
             http_listen,
             socks5_listen,
             set_system_socks_proxy,
@@ -366,6 +368,7 @@ impl fmt::Debug for General {
             .field("include_local_networks", include_local_networks)
             .field("include_apns", include_apns)
             .field("include_cellular_services", include_cellular_services)
+            .field("include_device_communication", include_device_communication)
             .field("http_listen", http_listen)
             .field("socks5_listen", socks5_listen)
             .field("set_system_socks_proxy", set_system_socks_proxy)
@@ -456,6 +459,7 @@ impl Default for General {
             include_local_networks: false,
             include_apns: false,
             include_cellular_services: false,
+            include_device_communication: false,
             http_listen: Vec::new(),
             socks5_listen: Vec::new(),
             set_system_socks_proxy: true,
@@ -481,6 +485,7 @@ const IOS_ONLY_KEYS: &[&str] = &[
     "include-local-networks",
     "include-apns",
     "include-cellular-services",
+    "include-device-communication",
 ];
 
 const VANISHED_KEYS: &[&str] = &[
@@ -958,6 +963,7 @@ pub fn parse_general(section: Option<&Section>, diags: &mut Diagnostics) -> Gene
             "include-local-networks" => set_bool!(include_local_networks),
             "include-apns" => set_bool!(include_apns),
             "include-cellular-services" => set_bool!(include_cellular_services),
+            "include-device-communication" => set_bool!(include_device_communication),
             "http-listen" => g.http_listen = parse_listeners(diags, span, key, value, 6152, true),
             "socks5-listen" => {
                 g.socks5_listen = parse_listeners(diags, span, key, value, 6153, false)
@@ -1126,6 +1132,237 @@ mod tests {
         assert_eq!(g.tun_excluded_routes.len(), 2);
         assert_eq!(g.force_http_engine_hosts.default_port, Some(80));
         assert_eq!(g.always_raw_tcp_keywords, ["kw1", "kw2"]);
+    }
+
+    /// The `[General]` page of the manual lists 58 keys. Each is read into its
+    /// own field from a value that is not the default; the ones the manual
+    /// puts among the keys of Surge iOS say so, and no other does.
+    #[test]
+    fn every_key_the_manual_lists_is_read() {
+        /// The iOS-only keys of the manual's page of platform differences.
+        const IOS_ONLY: [&str; 15] = [
+            "compatibility-mode",
+            "auto-suspend",
+            "allow-wifi-access",
+            "allow-hotspot-access",
+            "wifi-access-http-port",
+            "wifi-access-socks5-port",
+            "wifi-access-http-auth",
+            "wifi-assist",
+            "all-hybrid",
+            "hide-vpn-icon",
+            "include-all-networks",
+            "include-local-networks",
+            "include-apns",
+            "include-cellular-services",
+            "include-device-communication",
+        ];
+        type Check = fn(&General) -> bool;
+        let keys: &[(&str, &str, Check)] = &[
+            // Logging & Debugging
+            ("loglevel", "verbose", |g| g.loglevel == LogLevel::Verbose),
+            ("debug-cpu-usage", "true", |g| g.debug_cpu_usage),
+            ("debug-memory-usage", "true", |g| g.debug_memory_usage),
+            // DNS
+            ("dns-server", "system, 192.0.2.53:5353", |g| {
+                g.dns_server
+                    == [
+                        DnsServer::System,
+                        DnsServer::Udp("192.0.2.53:5353".parse().unwrap()),
+                    ]
+            }),
+            (
+                "encrypted-dns-server",
+                "https://a.example/dns-query, h3://b.example, quic://c.example, tls://d.example, tcp://e.example",
+                |g| {
+                    let schemes: Vec<_> = g.encrypted_dns_server.iter().map(|s| s.scheme).collect();
+                    schemes
+                        == [
+                            EncryptedDnsScheme::Https,
+                            EncryptedDnsScheme::H3,
+                            EncryptedDnsScheme::Quic,
+                            EncryptedDnsScheme::Tls,
+                            EncryptedDnsScheme::Tcp,
+                        ]
+                },
+            ),
+            ("encrypted-dns-follow-outbound-mode", "true", |g| {
+                g.encrypted_dns_follow_outbound_mode
+            }),
+            ("encrypted-dns-skip-cert-verification", "true", |g| {
+                g.encrypted_dns_skip_cert_verification
+            }),
+            ("allow-dns-svcb", "true", |g| g.allow_dns_svcb),
+            ("use-local-host-item-for-proxy", "true", |g| {
+                g.use_local_host_item_for_proxy
+            }),
+            ("hijack-dns", "8.8.8.8:5353, *", |g| {
+                g.hijack_dns
+                    == [
+                        HijackTarget {
+                            addr: Some("8.8.8.8".parse().unwrap()),
+                            port: 5353,
+                        },
+                        HijackTarget {
+                            addr: None,
+                            port: 53,
+                        },
+                    ]
+            }),
+            ("always-real-ip", "*.stun.example, -a.example", |g| {
+                g.always_real_ip.entries.len() == 2
+            }),
+            // GeoIP Database
+            ("geoip-maxmind-url", "https://geo.example/db.tar.gz", |g| {
+                g.geoip_maxmind_url.as_deref() == Some("https://geo.example/db.tar.gz")
+            }),
+            ("disable-geoip-db-auto-update", "true", |g| {
+                g.disable_geoip_db_auto_update
+            }),
+            // IPv6 & Virtual Network Interface
+            ("ipv6", "true", |g| g.ipv6),
+            ("ipv6-vif", "always", |g| g.ipv6_vif == Ipv6Vif::Always),
+            ("tun-excluded-routes", "10.0.0.0/8, fd00::/8", |g| {
+                g.tun_excluded_routes.len() == 2
+            }),
+            ("tun-included-routes", "192.168.1.12/32", |g| {
+                g.tun_included_routes.len() == 1
+            }),
+            ("icmp-forwarding", "false", |g| !g.icmp_forwarding),
+            // System Proxy Bypass
+            ("skip-proxy", "localhost, 192.168.2.*, *.local", |g| {
+                g.skip_proxy.entries.len() == 3
+            }),
+            ("exclude-simple-hostnames", "true", |g| {
+                g.exclude_simple_hostnames
+            }),
+            // Proxy Services & Remote Access
+            ("proxy-restricted-to-lan", "false", |g| {
+                !g.proxy_restricted_to_lan
+            }),
+            ("gateway-restricted-to-lan", "false", |g| {
+                !g.gateway_restricted_to_lan
+            }),
+            ("external-controller-access", "key@0.0.0.0:6165", |g| {
+                g.external_controller_access
+                    .as_ref()
+                    .is_some_and(|c| c.addr.to_string() == "0.0.0.0:6165")
+            }),
+            ("http-api", "key@0.0.0.0:6166", |g| {
+                g.http_api
+                    .as_ref()
+                    .is_some_and(|c| c.addr.to_string() == "0.0.0.0:6166")
+            }),
+            ("http-api-tls", "true", |g| g.http_api_tls),
+            ("http-api-web-dashboard", "true", |g| {
+                g.http_api_web_dashboard
+            }),
+            // Connectivity Testing
+            ("internet-test-url", "https://i.example/", |g| {
+                g.internet_test_url == "https://i.example/"
+            }),
+            ("proxy-test-url", "https://p.example/", |g| {
+                g.proxy_test_url == "https://p.example/"
+            }),
+            ("test-timeout", "8", |g| {
+                g.test_timeout == Some(Duration::from_secs(8))
+            }),
+            ("proxy-test-udp", "apple.com@8.8.8.8", |g| {
+                g.proxy_test_udp
+                    == Some(UdpTest {
+                        hostname: "apple.com".into(),
+                        server: "8.8.8.8".parse().unwrap(),
+                    })
+            }),
+            // Traffic Processing
+            (
+                "force-http-engine-hosts",
+                "a.example, b.example:8080",
+                |g| g.force_http_engine_hosts.entries.len() == 2,
+            ),
+            ("always-raw-tcp-hosts", "*.example.net", |g| {
+                g.always_raw_tcp_hosts.entries.len() == 1
+            }),
+            ("always-raw-tcp-keywords", "game, steam", |g| {
+                g.always_raw_tcp_keywords == ["game", "steam"]
+            }),
+            ("udp-policy-not-supported-behaviour", "DIRECT", |g| {
+                g.udp_policy_not_supported_behaviour == UdpFallback::Direct
+            }),
+            ("udp-priority", "false", |g| !g.udp_priority),
+            ("block-quic", "always-allow", |g| {
+                g.block_quic == BlockQuicGlobal::AlwaysAllow
+            }),
+            // Error Pages
+            ("show-error-page", "false", |g| !g.show_error_page),
+            ("show-error-page-for-reject", "true", |g| {
+                g.show_error_page_for_reject
+            }),
+            // Surge iOS only
+            ("compatibility-mode", "3", |g| g.compatibility_mode == 3),
+            ("auto-suspend", "false", |g| !g.auto_suspend),
+            ("allow-wifi-access", "true", |g| g.allow_wifi_access),
+            ("allow-hotspot-access", "true", |g| g.allow_hotspot_access),
+            ("wifi-access-http-port", "8080", |g| {
+                g.wifi_access_http_port == 8080
+            }),
+            ("wifi-access-socks5-port", "8081", |g| {
+                g.wifi_access_socks5_port == 8081
+            }),
+            ("wifi-access-http-auth", "user:pass", |g| {
+                g.wifi_access_http_auth
+                    .as_ref()
+                    .is_some_and(|(user, _)| user == "user")
+            }),
+            ("wifi-assist", "true", |g| g.wifi_assist),
+            ("all-hybrid", "true", |g| g.all_hybrid),
+            ("hide-vpn-icon", "true", |g| g.hide_vpn_icon),
+            ("include-all-networks", "true", |g| g.include_all_networks),
+            ("include-local-networks", "true", |g| {
+                g.include_local_networks
+            }),
+            ("include-apns", "true", |g| g.include_apns),
+            ("include-cellular-services", "true", |g| {
+                g.include_cellular_services
+            }),
+            ("include-device-communication", "true", |g| {
+                g.include_device_communication
+            }),
+            // Surge Mac only
+            ("http-listen", "pw@0.0.0.0:7000", |g| {
+                g.http_listen.len() == 1 && g.http_listen[0].addr.port() == 7000
+            }),
+            ("socks5-listen", "0.0.0.0:7001", |g| {
+                g.socks5_listen.len() == 1 && g.socks5_listen[0].addr.port() == 7001
+            }),
+            ("set-system-socks-proxy", "false", |g| {
+                !g.set_system_socks_proxy
+            }),
+            ("read-etc-hosts", "false", |g| !g.read_etc_hosts),
+            ("subnet-exp-wifi-always-match", "false", |g| {
+                !g.subnet_exp_wifi_always_match
+            }),
+        ];
+        assert_eq!(keys.len(), 58);
+        for key in IOS_ONLY {
+            assert!(keys.iter().any(|(k, ..)| *k == key), "{key}");
+        }
+        for (key, value, holds) in keys {
+            let (g, d) = parse(&format!("[General]\n{key} = {value}\n"));
+            let said: Vec<&str> = d.iter().map(|x| x.code).collect();
+            let note: &[&str] = if IOS_ONLY.contains(key) {
+                &[codes::W_PLATFORM_IGNORED]
+            } else {
+                &[]
+            };
+            assert_eq!(said, note, "{key}");
+            assert!(holds(&g), "{key} = {value}");
+        }
+        // keys do not care about case
+        let (g, d) = parse("[General]\nLogLevel = verbose\nIPV6 = true\n");
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(g.loglevel, LogLevel::Verbose);
+        assert!(g.ipv6);
     }
 
     /// Every default the page states.
