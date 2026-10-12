@@ -229,6 +229,49 @@ mod tests {
         assert_eq!(v4.matches(&h("nas.lan"), 1), None);
     }
 
+    /// The four special tokens of the manual each match their own kind of host
+    /// and no other; a minus in front excludes it, a port after it limits it,
+    /// `:0` takes every port.
+    #[test]
+    fn each_special_token_matches_its_own_kind_of_host() {
+        let hosts = ["10.0.0.1", "fd00::1", "nas", "nas.lan"];
+        for (token, matching) in [
+            ("<ip-address>", [true, true, false, false]),
+            ("<ipv4-address>", [true, false, false, false]),
+            ("<ipv6-address>", [false, true, false, false]),
+            ("<simple-hostname>", [false, false, true, false]),
+        ] {
+            let list = HostList::parse(token, Some(443));
+            let excluded = HostList::parse(&format!("-{token}, *"), Some(443));
+            let on_a_port = HostList::parse(&format!("{token}:8443"), Some(443));
+            let on_every_port = HostList::parse(&format!("{token}:0"), Some(443));
+            for (host, matches) in hosts.iter().zip(matching) {
+                let host = h(host);
+                assert_eq!(
+                    list.matches(&host, 443),
+                    matches.then_some(true),
+                    "{token} {host}"
+                );
+                assert_eq!(
+                    excluded.matches(&host, 443),
+                    Some(!matches),
+                    "-{token} {host}"
+                );
+                assert_eq!(
+                    on_a_port.matches(&host, 8443),
+                    matches.then_some(true),
+                    "{token}:8443 {host}"
+                );
+                assert_eq!(on_a_port.matches(&host, 443), None, "{token}:8443 {host}");
+                assert_eq!(
+                    on_every_port.matches(&host, 1),
+                    matches.then_some(true),
+                    "{token}:0 {host}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn skip_proxy_with_cidr_and_ipv6() {
         let list = HostList::parse(
