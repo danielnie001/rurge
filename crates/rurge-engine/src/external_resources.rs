@@ -10,6 +10,7 @@
 
 use crate::engine::Engine;
 use crate::profile::ProfileSources;
+use crate::reload::catch_up;
 use rurge_net::resource::{ResourceKind, ResourceManager, ResourceStatus};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
@@ -186,12 +187,16 @@ impl Engine {
     ///   to. The generation that replaced the old one read the cache when it
     ///   was built, possibly before a download landed there: as it comes in
     ///   it asks again for what the old one checked since, or is checking
-    ///   (`Engine::swap_runtime`), and nobody waits for that. Its copy
-    ///   follows within the time of one more request; an attempt of its own
-    ///   that fails is in the listing and is made again as any other. `all`
-    ///   on a managed profile that changed runs into this: the profile
-    ///   reloads within about a second of its update, while the sets are
-    ///   still downloading.
+    ///   (`Engine::swap_runtime`), and a request that ends under another
+    ///   generation than it began with has that one ask once more, for what
+    ///   was asked of the old one after it went. Nobody waits for either.
+    ///   The copy in use follows within the time of one more request, with
+    ///   one exception: what the generation that came in was fetching at
+    ///   that moment is left to that attempt, which may have gone out before
+    ///   the server changed. An attempt of its own that fails is in the
+    ///   listing and is made again as any other. `all` on a managed profile
+    ///   that changed runs into this: the profile reloads within about a
+    ///   second of its update, while the sets are still downloading.
     /// - A request in flight when rurge is asked to stop ends with the grace
     ///   period of the shutdown, as a policy test in flight does.
     pub async fn update_external_resources(
@@ -244,6 +249,13 @@ impl Engine {
             if let Ok((index, result)) = done {
                 results[index] = Some(result);
             }
+        }
+        // A generation that came in meanwhile looked at the one before it as
+        // it came (`Engine::swap_runtime`): what was asked of that one after
+        // the look, it has not seen.
+        let in_use = self.runtime().stack.resources.clone();
+        if !Arc::ptr_eq(&manager, &in_use) {
+            catch_up(&manager, &in_use);
         }
         Some(
             keys.into_iter()

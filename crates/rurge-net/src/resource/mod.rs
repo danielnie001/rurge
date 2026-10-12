@@ -233,7 +233,8 @@ pub struct ResourceStatus {
     /// The manager has a copy to give: the resource is `available`, or
     /// `failed` and keeps the copy it had.
     pub ready: bool,
-    /// A download is under way, or the check of what it brought.
+    /// A download is under way, or the check of what it brought. One that was
+    /// asked for and has not begun is not.
     pub updating: bool,
 }
 

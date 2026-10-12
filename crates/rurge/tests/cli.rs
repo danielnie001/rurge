@@ -5522,11 +5522,12 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             let (_target, hello) = a_target().await;
             let api = free_tcp_port();
             let copy = managed_text(&w.url("/managed"), "interval=60 strict=true", api, "");
-            // Checked three quarters of a minute ago and due at a minute: the
-            // daemon has a quarter of a minute to come up and serve a session
-            // before the update is owed. The update is made later than that
-            // by up to a tenth of the time that was left: a second and a half.
-            w.seed("/managed", &copy, Duration::from_secs(45));
+            // Checked half a minute ago and due at a minute: the daemon has
+            // half a minute to come up and serve a session before the update
+            // is owed, which is wide for a machine that starts every daemon
+            // of this module at once. The update is made later than that by
+            // up to a tenth of the time that was left: three seconds.
+            w.seed("/managed", &copy, Duration::from_secs(30));
             w.served.set("/managed", copy);
             w.served.set_status("/managed", 500);
             w.point_at("/managed");

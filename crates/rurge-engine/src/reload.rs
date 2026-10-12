@@ -1,7 +1,8 @@
 //! Hot reload (M3 design §7.4): atomically swap in a new config generation.
 //! Building the new `Runtime` (validating config, rebuilding the stack) is the
-//! caller's job; the engine only swaps and reports whether listeners must be
-//! rebound.
+//! caller's job; the engine swaps, reports whether listeners must be rebound,
+//! and has the generation that comes in ask again for the resources the one
+//! that goes checked meanwhile (`catch_up`).
 
 use crate::engine::{Engine, ListenerSpec};
 use crate::runtime::Runtime;
@@ -39,8 +40,8 @@ impl Engine {
     /// listener configuration surface (addresses, authentication, source
     /// restriction, error-page switches) changed, so the caller can rebind
     /// listeners and pick up the new `ListenerOpts` with them. A resource the
-    /// old generation checked after the new one read the cache is asked for
-    /// again by the new one (`catch_up`). Must be
+    /// old generation checked after the new one read the cache, or is
+    /// checking now, is asked for again by the new one (`catch_up`). Must be
     /// called inside a tokio runtime: a generation with subscriptions starts
     /// a watcher task.
     pub fn swap_runtime(self: &std::sync::Arc<Self>, mut next: Runtime) -> bool {
@@ -75,10 +76,20 @@ impl Engine {
 /// that is written there afterwards: an update somebody asked for while the
 /// next generation was built (the reload that follows a managed profile that
 /// changed is such a time) would be in the cache and not in use until the
-/// resource's own next refresh, a day by default. What the incoming manager
-/// is fetching already is left to it: that attempt began after the cache was
-/// read.
-fn catch_up(outgoing: &ResourceManager, incoming: &ResourceManager) {
+/// resource's own next refresh, a day by default.
+///
+/// What the incoming manager is fetching already is left to it: that attempt
+/// began after the cache was read, and one more beside it would download a
+/// large file twice. It can bring less than the outgoing one got, when its
+/// request went out first and the server changed between the two: the
+/// resource's own next refresh makes up for that, nothing sooner.
+///
+/// The look is not one moment, and it goes by the wall clock. An attempt that
+/// was asked for and has not begun is neither under way nor later; a check
+/// made after the clock was set back can look older than the copy the
+/// incoming manager read. `Engine::update_external_resources` looks once
+/// more when it ends, for what it asked of a generation that went meanwhile.
+pub(crate) fn catch_up(outgoing: &ResourceManager, incoming: &ResourceManager) {
     let before = outgoing.statuses();
     for status in incoming.statuses() {
         if status.local || status.updating {

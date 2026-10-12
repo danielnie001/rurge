@@ -11,7 +11,9 @@ use common::*;
 use rurge_config::{RemoteRef, RemoteRole, SourceInfo};
 use rurge_engine::ExternalResource;
 use rurge_engine::profile::ProfileSources;
-use rurge_net::resource::{ResourceKind, ResourceSource, ResourceSpec, cache_file, resource_key};
+use rurge_net::resource::{
+    ResourceKind, ResourceManager, ResourceSource, ResourceSpec, cache_file, resource_key,
+};
 use rurge_net::testing::seed_cache;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
@@ -45,6 +47,11 @@ const NEWER: &str = "DOMAIN,newer.example\n";
 /// asked for, with a wide margin: what a test that says "nothing more is
 /// asked for" waits before it counts.
 const NOTHING_MORE: Duration = Duration::from_millis(300);
+
+/// How long the server takes over a download that is to be under way while
+/// the generations change. The change follows the request by milliseconds;
+/// the tests that use it say so themselves if a download landed first.
+const UNDER_WAY: Duration = Duration::from_secs(2);
 
 const LIMIT: Duration = Duration::from_secs(10);
 
@@ -233,15 +240,29 @@ fn kinds(listing: &[ExternalResource]) -> Vec<&'static str> {
     listing.iter().map(|resource| resource.kind).collect()
 }
 
-/// The text the manager of the generation holds of the rule set at `url`.
-fn held_by_the_manager(engine: &Engine, url: &Url) -> String {
+/// The text the manager of the generation holds of the rule set at `url`, if
+/// it holds any.
+fn copy_held_by_the_manager(engine: &Engine, url: &Url) -> Option<String> {
     let handle = engine.runtime().stack.resources.get(&ResourceSpec {
         source: ResourceSource::Url(url.clone()),
         update_interval: None,
         kind: ResourceKind::RuleSet,
     });
-    let (data, _) = handle.current().data().expect("the manager holds a copy");
-    String::from_utf8_lossy(&data).into_owned()
+    let (data, _) = handle.current().data()?;
+    Some(String::from_utf8_lossy(&data).into_owned())
+}
+
+/// The text the manager of the generation holds of the rule set at `url`.
+fn held_by_the_manager(engine: &Engine, url: &Url) -> String {
+    copy_held_by_the_manager(engine, url).expect("the manager holds a copy")
+}
+
+/// Whether `manager` is at a download of the resource `key` names.
+fn is_updating(manager: &ResourceManager, key: &str) -> bool {
+    manager
+        .statuses()
+        .iter()
+        .any(|status| status.key == key && status.updating)
 }
 
 /// The text of `path` the sources of the profile have on disk.
@@ -850,7 +871,7 @@ async fn an_update_under_way_when_the_generation_changes_is_made_by_the_next_one
     let next = one_more(&w, &g).await;
     w.server.set("/rules.list", NEWER);
     // long enough for the generations to change while it is under way
-    w.server.set_delay("/rules.list", Duration::from_secs(1));
+    w.server.set_delay("/rules.list", UNDER_WAY);
     let asked = w.server.hits("/rules.list");
 
     let request = tokio::spawn({
@@ -865,11 +886,21 @@ async fn an_update_under_way_when_the_generation_changes_is_made_by_the_next_one
         w.server.hits("/rules.list") == asked + 1
     })
     .await;
+    assert!(
+        is_updating(&g.engine.runtime().stack.resources, &key),
+        "the download landed before the generations changed"
+    );
     g.engine.swap_runtime(next);
     wait_until("the generation that came in to ask too", || {
         w.server.hits("/rules.list") == asked + 2
     })
     .await;
+    // Beside the other: the request still waits, so it is the generation
+    // that asked as it came in, and not the request as it ended.
+    assert!(
+        !request.is_finished(),
+        "asked only once the request had ended"
+    );
     assert_eq!(request.await.unwrap(), Some(vec![(key, Ok(()))]));
     wait_until("the generation that came in to hold the update", || {
         held_by_the_manager(&g.engine, &url) == NEWER
@@ -902,11 +933,12 @@ async fn a_resource_the_next_generation_is_fetching_already_is_not_asked_for_twi
     let w = World::new().await;
     let g = generation(&w, "").await;
     let url = w.url("/rules.list");
+    let key = w.key("/rules.list");
     let source = ResourceSource::Url(url.clone());
     let next = one_more(&w, &g).await;
     w.server.set("/rules.list", NEWER);
     // long enough for the generations to change while both are under way
-    w.server.set_delay("/rules.list", Duration::from_secs(1));
+    w.server.set_delay("/rules.list", UNDER_WAY);
     let asked = w.server.hits("/rules.list");
 
     assert!(g.engine.runtime().stack.resources.force_update(&source));
@@ -915,6 +947,11 @@ async fn a_resource_the_next_generation_is_fetching_already_is_not_asked_for_twi
         w.server.hits("/rules.list") == asked + 2
     })
     .await;
+    assert!(
+        is_updating(&g.engine.runtime().stack.resources, &key)
+            && is_updating(&next.stack.resources, &key),
+        "a download landed before the generations changed"
+    );
     g.engine.swap_runtime(next);
     wait_until("the generation that came in to hold the update", || {
         held_by_the_manager(&g.engine, &url) == NEWER
@@ -923,6 +960,76 @@ async fn a_resource_the_next_generation_is_fetching_already_is_not_asked_for_twi
     // Nothing more is to come: an attempt that was asked for beside the one
     // under way would have followed it at once.
     tokio::time::sleep(NOTHING_MORE).await;
+    assert_eq!(w.server.hits("/rules.list"), asked + 2);
+}
+
+/// A set neither generation could get when it was built, which the one that
+/// goes got since: the one that comes in has no copy and no time of its own,
+/// and asks at once, not when its next attempt is due.
+#[tokio::test]
+async fn what_the_next_generation_could_not_get_and_the_one_before_got_since_is_asked_for_again() {
+    let w = World::new().await;
+    // the server does not have it yet
+    let extra = format!("RULE-SET,{},DIRECT", w.url("/late.list"));
+    let g = generation(&w, &extra).await;
+    let url = w.url("/late.list");
+    let key = w.key("/late.list");
+    let next = one_more(&w, &g).await;
+    assert_eq!(copy_held_by_the_manager(&g.engine, &url), None);
+    assert!(
+        !is_updating(&next.stack.resources, &key),
+        "the first attempt of the generation to come has not ended"
+    );
+
+    w.server.set("/late.list", NEWER);
+    assert_eq!(
+        g.engine
+            .update_external_resources(None, Some(&key), LIMIT)
+            .await,
+        Some(vec![(key, Ok(()))])
+    );
+    let asked = w.server.hits("/late.list");
+    g.engine.swap_runtime(next);
+    // an attempt that failed is made again after a minute at the earliest
+    wait_until("the generation that came in to hold the set", || {
+        copy_held_by_the_manager(&g.engine, &url).as_deref() == Some(NEWER)
+    })
+    .await;
+    assert_eq!(w.server.hits("/late.list"), asked + 1);
+}
+
+/// A request takes the manager of the generation in use when it begins and
+/// asks it a moment later. A generation that comes in between the two looked
+/// at the one before it when nothing had been asked of that one: the request
+/// has the generation in use ask too, when it ends.
+#[tokio::test]
+async fn a_request_that_ends_under_another_generation_has_that_one_ask_too() {
+    let w = World::new().await;
+    let g = generation(&w, "").await;
+    let url = w.url("/rules.list");
+    let key = w.key("/rules.list");
+    let next = one_more(&w, &g).await;
+    w.server.set("/rules.list", NEWER);
+    let asked = w.server.hits("/rules.list");
+
+    let request = g.engine.update_external_resources(None, Some(&key), LIMIT);
+    tokio::pin!(request);
+    // Polled once: the request has taken the manager of the generation in
+    // use, and what asks it runs when this test next waits.
+    tokio::select! {
+        biased;
+        answer = &mut request => panic!("answered at once: {answer:?}"),
+        _ = std::future::ready(()) => {}
+    }
+    g.engine.swap_runtime(next);
+
+    assert_eq!(request.await, Some(vec![(key.clone(), Ok(()))]));
+    wait_until("the generation in use to hold the update", || {
+        held_by_the_manager(&g.engine, &url) == NEWER
+    })
+    .await;
+    // one request of each generation: the one that came in asked once, when
+    // the request ended, and not as it came in
     assert_eq!(w.server.hits("/rules.list"), asked + 2);
 }
 
