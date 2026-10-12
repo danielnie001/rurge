@@ -8,6 +8,11 @@
 //! (reload), and does `strict` ask for a suspension. The manager downloads
 //! through a client of its own, never through the pipeline, so a suspended
 //! engine can still update.
+//!
+//! A body the manager downloads is taken only if the whole profile still loads
+//! with it.
+
+mod verdict;
 
 use rurge_config::remote::origin;
 use rurge_config::{LoadOptions, Remote, RemoteRef, RemoteRole, RemoteSource, SourceInfo};
@@ -24,6 +29,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use url::Url;
+use verdict::Verdicts;
 
 /// How long no source may have moved before `changed` reports: the sources a
 /// provider changes together are one report.
@@ -41,14 +47,16 @@ const NOT_UTF8: &str = "the downloaded file is not UTF-8 text";
 /// What `strict` says of a process that is offline.
 const OFFLINE: &str = "offline mode: the update cannot be attempted";
 
+/// What a check says when the sources it belongs to are gone.
+const GONE: &str = "the sources of the profile are no longer kept";
+
 /// What `ProfileSources::new` is made of.
 pub struct SourcesOptions {
     /// The local profile (`-c`). Its modification time is read when `outdated`
     /// and `strict` are asked.
     pub profile: PathBuf,
-    /// The environment, platform and capabilities a downloaded profile is
-    /// loaded with when it is judged; its `remote` is not looked at. Not read
-    /// as long as a downloaded body is only checked for being UTF-8 text.
+    /// The environment, platform and capabilities the profile is loaded with
+    /// when a download is judged; its `remote` is not looked at.
     pub load: LoadOptions,
     /// Where the downloads are kept: the cache of the other external
     /// resources is there too, and one address has one place in it.
@@ -89,6 +97,11 @@ struct Tracked {
     /// The new one starts from the copy on disk and cannot tell, so it keeps
     /// the fact.
     unreported: bool,
+    /// A verdict registered it, for a version that refers to it and is not
+    /// the generation's yet. The next generation that names it makes it an
+    /// ordinary source; one that does not drops it, unless a version is still
+    /// kept.
+    provisional: bool,
     /// The versions as the manager publishes them: what `seen` becomes when
     /// the task that follows them has run.
     versions: watch::Receiver<u64>,
@@ -135,6 +148,10 @@ struct State {
     local_first: bool,
     /// The check `outdated` last said yes for.
     outdated_for: Option<SystemTime>,
+    /// The addresses a version is kept for (see `verdict`), and whether it
+    /// waits for sources that have not been tried. Only a verdict writes it,
+    /// so that nothing that asks has to wait for one.
+    kept: Vec<(Url, bool)>,
 }
 
 /// What the tasks that follow the sources reach: the state, and a counter of
@@ -186,15 +203,23 @@ async fn follow(core: Weak<Core>, id: u64, mut versions: watch::Receiver<u64>) {
 pub struct ProfileSources {
     manager: Arc<ResourceManager>,
     profile: PathBuf,
+    load: LoadOptions,
     offline: bool,
     core: Arc<Core>,
+    /// What the verdicts keep. The lock serialises them and is held across a
+    /// load, so it is taken on a thread of the blocking pool only, and before
+    /// the state of `core` and the locks of the manager, never after them.
+    verdicts: Mutex<Verdicts>,
+    /// The checks of the sources hold this and not an `Arc`: the manager owns
+    /// the checks, and an `Arc` there would keep it alive for ever.
+    me: Weak<ProfileSources>,
 }
 
 impl ProfileSources {
     pub fn new(opts: SourcesOptions) -> Arc<ProfileSources> {
         let SourcesOptions {
             profile,
-            load: _,
+            load,
             data_dir,
             offline,
             client,
@@ -202,14 +227,17 @@ impl ProfileSources {
         } = opts;
         resources.offline = offline;
         resources.never_early = true;
-        Arc::new(ProfileSources {
+        Arc::new_cyclic(|me| ProfileSources {
             manager: ResourceManager::with_options(data_dir, client, resources),
             profile,
+            load,
             offline,
             core: Arc::new(Core {
                 state: Mutex::new(State::default()),
                 moved: watch::Sender::new(0),
             }),
+            verdicts: Mutex::new(Verdicts::default()),
+            me: me.clone(),
         })
     }
 
@@ -247,9 +275,10 @@ impl ProfileSources {
     /// Follows the sources of a generation: the managed profile and the remote
     /// includes. What the generation came across on the way to the managed
     /// profile is read from its copy and never asked for. A source the
-    /// generation no longer names is dropped. Registering a source whose copy
-    /// the generation read, or again, is no change; a copy the generation did
-    /// not read is one.
+    /// generation no longer names is dropped, unless a verdict registered it
+    /// for a version that is still kept: that stays, after the sources of the
+    /// generation. Registering a source whose copy the generation read, or
+    /// again, is no change; a copy the generation did not read is one.
     pub fn track(&self, sources: &SourceInfo) {
         let mut state = self.core.lock();
         let mut before = std::mem::take(&mut state.tracked);
@@ -266,6 +295,7 @@ impl ProfileSources {
             match held {
                 Some(mut kept) if kept.role == wanted.role && kept.interval == wanted.interval => {
                     kept.strict = wanted.strict;
+                    kept.provisional = false;
                     tracked.push(kept);
                 }
                 replaced => {
@@ -284,8 +314,13 @@ impl ProfileSources {
                 }
             }
         }
+        let version_kept = !state.kept.is_empty();
         for gone in before {
-            self.retire(&gone);
+            if gone.provisional && version_kept {
+                tracked.push(gone);
+            } else {
+                self.retire(&gone);
+            }
         }
         let pending = tracked.iter().any(Tracked::pending);
         state.tracked = tracked;
@@ -328,7 +363,6 @@ impl ProfileSources {
                 format!("managed profile ({})", origin(&wanted.url)),
             ),
         };
-        let check: Check = Arc::new(accepts);
         let handle = self.manager.get_checked(
             &ResourceSpec {
                 source,
@@ -336,7 +370,7 @@ impl ProfileSources {
                 kind,
             },
             &label,
-            check,
+            self.check_of(&wanted.url),
         );
         // Subscribed before the version is read, so that a version published
         // after that is not missed.
@@ -352,9 +386,20 @@ impl ProfileSources {
             reported: built_from(wanted.found(), seen),
             seen,
             unreported: false,
+            provisional: false,
             versions: versions.clone(),
             _follow: self.follow(id, versions),
         }
+    }
+
+    /// The check the manager makes of a body of `url` before it takes it.
+    fn check_of(&self, url: &Url) -> Check {
+        let sources = self.me.clone();
+        let url = url.clone();
+        Arc::new(move |body: &[u8]| match sources.upgrade() {
+            Some(sources) => sources.check(&url, body),
+            None => Err(GONE.to_string()),
+        })
     }
 
     fn follow(&self, id: u64, versions: watch::Receiver<u64>) -> Follower {
@@ -380,15 +425,30 @@ impl ProfileSources {
     /// is not waited for. A due source that is not `strict` is refreshed in
     /// the background and not waited for; a source registered while this
     /// waits is waited for too.
-    pub async fn settle(&self, limit: Duration) -> bool {
+    ///
+    /// Versions that were downloaded and wait for the sources they refer to
+    /// are judged once more when there is nothing left to wait for: those
+    /// sources have been tried by then. The judging can register sources of
+    /// its own, which are waited for in turn.
+    pub async fn settle(self: &Arc<Self>, limit: Duration) -> bool {
         // Far enough to be never, and a time that can be added to.
         let limit = limit.min(Duration::from_secs(365 * 24 * 3600));
         let deadline = Instant::now() + limit;
         let mut waited = HashSet::new();
         loop {
-            let todo = self.unsettled(&waited);
+            let mut todo = self.unsettled(&waited);
             if todo.is_empty() {
-                return true;
+                if !self.holds_versions() {
+                    return true;
+                }
+                if !self.judge_versions_kept(deadline).await {
+                    return false;
+                }
+                // the judging may have registered sources
+                todo = self.unsettled(&waited);
+                if todo.is_empty() {
+                    return true;
+                }
             }
             let first_attempts = async {
                 for (_, key) in &todo {
@@ -505,7 +565,9 @@ impl ProfileSources {
     /// local file was changed when there was none; a check in the future is the
     /// clock having been set back and is not due); and the last attempt failed,
     /// or the process is offline. A source that is due and has not been
-    /// attempted yet is not suspended.
+    /// attempted yet is not suspended, and neither is one whose last attempt
+    /// brought a version that waits for the sources it refers to. A version
+    /// that does not load is a failure.
     pub fn strict(&self) -> Option<Suspended> {
         let local = file_modified(&self.profile);
         let now = SystemTime::now();
@@ -514,6 +576,15 @@ impl ProfileSources {
             .tracked
             .iter()
             .find(|t| t.role == RemoteRole::Managed && t.strict)?;
+        // The update was downloaded and waits for the sources it refers to:
+        // that is no failure.
+        if state
+            .kept
+            .iter()
+            .any(|(url, waiting)| *waiting && *url == managed.url)
+        {
+            return None;
+        }
         let status = self.status_of(&managed.key)?;
         let since = due_since(managed.interval, status.fetched_at, local, now)?;
         let why = if self.offline {
@@ -585,13 +656,6 @@ fn due_since(
     }
     let due = from.checked_add(interval)?;
     (due <= now).then_some(due)
-}
-
-/// Whether a downloaded body is taken: a profile is text.
-fn accepts(body: &[u8]) -> Result<(), String> {
-    std::str::from_utf8(body)
-        .map(|_| ())
-        .map_err(|_| NOT_UTF8.to_string())
 }
 
 /// A number of seconds as the manager has it: what an `i64` cannot hold is

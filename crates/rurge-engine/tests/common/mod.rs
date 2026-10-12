@@ -6,6 +6,7 @@
 #![allow(dead_code, unused_imports)]
 
 mod log_capture;
+mod world;
 
 pub use log_capture::LogCapture;
 pub use rurge_config::config::{LoadOptions, from_text};
@@ -37,6 +38,7 @@ pub use std::sync::Arc;
 pub use std::time::Duration;
 pub use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub use tokio::net::TcpStream;
+pub use world::{COPY, HOUR, QUIET, World, ago, fast, stays_quiet, text_of, why_of};
 
 pub struct Harness {
     pub dir: tempfile::TempDir,

@@ -581,15 +581,23 @@ impl fmt::Debug for CachedCopy {
     }
 }
 
+/// The file the body of `url` is kept in under `root`: where [`cached_copy`]
+/// reads it from, and where a download of it will be written, which is known
+/// before there is one.
+pub fn cache_file(root: &Path, url: &Url) -> PathBuf {
+    cache::CacheDir::for_url(root, url.as_str())
+        .path()
+        .join("data")
+}
+
 /// The cache of `url` under `root`, read without a manager and without the
 /// network. `None` when one of its two files is missing or `meta.json` cannot
 /// be read.
 pub fn cached_copy(root: &Path, url: &Url) -> Option<CachedCopy> {
-    let dir = cache::CacheDir::for_url(root, url.as_str());
-    let (data, meta) = dir.load()?;
+    let (data, meta) = cache::CacheDir::for_url(root, url.as_str()).load()?;
     Some(CachedCopy {
         data,
-        path: dir.path().join("data"),
+        path: cache_file(root, url),
         fetched_at: meta.fetched_time(),
     })
 }
@@ -2620,6 +2628,29 @@ mod tests {
         let dir = cache::CacheDir::for_url(root.path(), lone.as_str());
         dir.store_meta(&Meta::default()).unwrap();
         assert!(cached_copy(root.path(), &lone).is_none());
+    }
+
+    /// The place a download of an address will have, known before there is
+    /// one: it is where the copy is read from once it has been written.
+    #[test]
+    fn the_cache_file_of_an_address_is_where_its_copy_is_read_from() {
+        let root = tempfile::tempdir().unwrap();
+        let url = Url::parse("https://sets.test/placed.list").unwrap();
+        let place = cache_file(root.path(), &url);
+        assert_eq!(
+            place,
+            root.path()
+                .join("resources")
+                .join(resource_key(&ResourceSource::Url(url.clone())))
+                .join("data")
+        );
+        assert!(cached_copy(root.path(), &url).is_none());
+        seed_cache(root.path(), &url, b"placed", SystemTime::now());
+        assert_eq!(cached_copy(root.path(), &url).unwrap().path, place);
+        assert_eq!(std::fs::read(&place).unwrap(), b"placed");
+        // another address, another place
+        let other = Url::parse("https://sets.test/other.list").unwrap();
+        assert_ne!(cache_file(root.path(), &other), place);
     }
 
     #[tokio::test]
