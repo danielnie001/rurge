@@ -1036,6 +1036,48 @@ IP-CIDR,10.0.0.0/8,no-resolve # lan
         assert_eq!(decide(&engine, "deep.com").await.0, "DIRECT");
     }
 
+    /// Nested sets go eight deep (manual, Nested Rule Sets): in a chain of
+    /// sets that name one another the eighth is followed, the ninth is cut
+    /// and said so.
+    #[tokio::test]
+    async fn a_chain_of_eight_sets_is_followed_and_the_ninth_is_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 1..=9 {
+            let next = if i < 9 {
+                format!("RULE-SET,d{}.list\n", i + 1)
+            } else {
+                String::new()
+            };
+            std::fs::write(
+                dir.path().join(format!("d{i}.list")),
+                format!("{next}DOMAIN,at{i}.com\n"),
+            )
+            .unwrap();
+        }
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,d1.list,P\nFINAL,DIRECT\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        let cut: Vec<&str> = codes_of(&diags)
+            .into_iter()
+            .filter(|c| *c == codes::W_SET_NESTING)
+            .collect();
+        assert_eq!(cut.len(), 1, "{:?}", codes_of(&diags));
+        let engine = RuleEngine::build(&cfg, reg.as_ref(), Arc::new(NoGeo)).unwrap();
+        assert_eq!(decide(&engine, "at1.com").await.0, "P");
+        assert_eq!(
+            decide(&engine, "at8.com").await.0,
+            "P",
+            "the eighth set is followed"
+        );
+        assert_eq!(
+            decide(&engine, "at9.com").await.0,
+            "DIRECT",
+            "the ninth is cut"
+        );
+    }
+
     #[tokio::test]
     async fn url_set_downloads_and_swaps_after_force_update() {
         let dir = tempfile::tempdir().unwrap();
