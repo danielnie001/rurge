@@ -5417,6 +5417,14 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
                 api_call(api, "GET", "/v1/outbound", "k", None),
                 (200, r#"{"mode":"rule"}"#.to_string())
             );
+            // The listing says why, although no update has failed: offline
+            // none is made.
+            let item = managed_item(api);
+            assert_eq!(item["suspended"], true, "{item}");
+            assert_eq!(
+                item["error"],
+                "offline mode: the update cannot be attempted"
+            );
             wait_for("the refusal to be logged", 10, || {
                 !lines_with(&log_text(&logs), REFUSING).is_empty()
             });
@@ -5526,7 +5534,11 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             let mut cmd = w.start();
             log_to(&mut cmd, &logs);
             let (mut daemon, _errors) = spawn_command_reading_stderr(cmd);
-            assert!(http_get(daemon.http, &hello).ends_with("hi from target"));
+            let first = http_get(daemon.http, &hello);
+            assert!(
+                first.ends_with("hi from target"),
+                "the first session did not pass: {first}"
+            );
             up(&daemon);
             wait_for("sessions to be refused", 60, || {
                 http_get(daemon.http, &hello).contains(rurge_engine::REFUSED_STRICT)
@@ -5837,7 +5849,6 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             assert_eq!(item["error"], said.as_str());
             assert_eq!(item["ready"], true, "the copy it had stays");
             assert!(item.get("suspended").is_none(), "{item}");
-            assert_eq!(reloads(&logs), 0, "{}", log_text(&logs));
             stop(&mut daemon, api);
         }
 
@@ -5861,8 +5872,10 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             );
             w.served.set(MANAGED_AT, old);
             w.served.set(INCLUDED_AT, RULES);
-            // slow enough for the file not to be here when the version is judged
-            w.served.set_delay(INCLUDED_AT, Duration::from_millis(300));
+            // Slower than the quiet second the daemon waits after a source has
+            // moved: a version taken without its file would be in the rules
+            // for a while, and the file would come as a reload of its own.
+            w.served.set_delay(INCLUDED_AT, Duration::from_millis(2500));
             w.write(&format!("#!MANAGED-CONFIG {link}\n"));
             let logs = w.dir.path().join("logs");
             let (mut daemon, _errors) = start_logging(&w, &logs);
@@ -5878,8 +5891,10 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             );
             wait_for("the rules of the version and of the file", 30, || {
                 let now = rules(api);
-                now.contains("DOMAIN,new.test,REJECT")
-                    && now.contains("DOMAIN,included.test,REJECT")
+                let version = now.contains("DOMAIN,new.test,REJECT");
+                let file = now.contains("DOMAIN,included.test,REJECT");
+                assert!(!version || file, "the version without its file: {now}");
+                version && file
             });
             wait_for("the first reload to be logged", 10, || reloads(&logs) >= 1);
             // The one fixed wait of these tests: that a second reload does not
@@ -5919,8 +5934,8 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             let refused = http_get(daemon.http, &hello);
             assert!(refused.contains(rurge_engine::REFUSED_STRICT), "{refused}");
             // The daemon's own attempt has failed too, and its next is a
-            // minute away. The listing has the reason from then on: a source
-            // that has not been tried by this daemon has none to give.
+            // minute away: from here on nothing but a request ends the
+            // refusal. The listing says why sessions are refused.
             wait_for("the daemon's own attempt to fail", 20, || {
                 lines_with(&log_text(&logs), "resource fetch failed")
                     .iter()

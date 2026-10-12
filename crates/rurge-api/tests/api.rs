@@ -1656,6 +1656,8 @@ async fn external_resources_of_the_profile_come_first_and_the_managed_one_is_fla
     api.engine.suspend(Some("http status 500".to_string()));
     let defines = listed(addr).await;
     assert_eq!(defines[0]["suspended"], json!(true));
+    // and why, which no update of the managed profile has failed to say
+    assert_eq!(defines[0]["error"], json!("http status 500"));
     assert!(defines[1..].iter().all(|d| d.get("suspended").is_none()));
     assert_eq!(
         call(addr, "GET", "/v1/outbound", Some(KEY), None).await,

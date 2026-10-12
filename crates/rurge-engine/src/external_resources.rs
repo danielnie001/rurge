@@ -41,6 +41,9 @@ pub struct ExternalResource {
     pub updated_at: Option<u64>,
     pub updating: bool,
     /// Why the last update failed, while it is the last thing that happened.
+    /// The managed profile says why sessions are refused when no failed
+    /// update says it: before the first attempt of a run has ended, and
+    /// offline, where none is made.
     pub error: Option<String>,
     /// The engine refuses sessions on account of this resource.
     pub suspended: bool,
@@ -128,24 +131,30 @@ impl Engine {
     pub fn external_resources(&self, sources: Option<&ProfileSources>) -> Vec<ExternalResource> {
         let own = sources.map(ProfileSources::statuses).unwrap_or_default();
         let held = self.runtime().stack.resources.statuses();
-        let suspended = self.is_suspended();
+        let refused = self.suspended();
         in_listing_order(&own, &held)
             .into_iter()
-            .map(|(kind, status)| ExternalResource {
-                path: status.shown(),
-                kind,
-                key: status.key.clone(),
-                local: status.local,
-                ready: status.ready,
-                updated_at: (!status.local).then(|| {
-                    status
-                        .fetched_at
-                        .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
-                        .map_or(0, |since| since.as_secs())
-                }),
-                updating: status.updating,
-                error: status.last_error.clone(),
-                suspended: suspended && status.kind == ResourceKind::Profile,
+            .map(|(kind, status)| {
+                // sessions are refused on account of the managed profile
+                let refused = refused
+                    .as_ref()
+                    .filter(|_| status.kind == ResourceKind::Profile);
+                ExternalResource {
+                    path: status.shown(),
+                    kind,
+                    key: status.key.clone(),
+                    local: status.local,
+                    ready: status.ready,
+                    updated_at: (!status.local).then(|| {
+                        status
+                            .fetched_at
+                            .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+                            .map_or(0, |since| since.as_secs())
+                    }),
+                    updating: status.updating,
+                    error: status.last_error.clone().or_else(|| refused.cloned()),
+                    suspended: refused.is_some(),
+                }
             })
             .collect()
     }
@@ -173,12 +182,16 @@ impl Engine {
     ///   a moment later with the other half. The listing shows the state as it
     ///   is afterwards.
     /// - A reload while a request waits. The request keeps the manager it
-    ///   began with; a download it waited for lands in the cache, and the
-    ///   generation that replaced the old one read the cache when it was
-    ///   built, possibly before. Its copy then waits for its own next
-    ///   refresh. `all` on a managed profile that changed can run into this:
-    ///   the profile reloads within about a second of its update, while the
-    ///   sets are still downloading.
+    ///   began with, and a key answers what the attempt in that manager came
+    ///   to. The generation that replaced the old one read the cache when it
+    ///   was built, possibly before a download landed there: as it comes in
+    ///   it asks again for what the old one checked since, or is checking
+    ///   (`Engine::swap_runtime`), and nobody waits for that. Its copy
+    ///   follows within the time of one more request; an attempt of its own
+    ///   that fails is in the listing and is made again as any other. `all`
+    ///   on a managed profile that changed runs into this: the profile
+    ///   reloads within about a second of its update, while the sets are
+    ///   still downloading.
     /// - A request in flight when rurge is asked to stop ends with the grace
     ///   period of the shutdown, as a policy test in flight does.
     pub async fn update_external_resources(

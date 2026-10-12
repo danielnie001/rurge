@@ -35,8 +35,16 @@ const WAITING: &str = "waiting for the sources this version refers to";
 /// What a manager that is offline says of an update.
 const OFFLINE: &str = "offline mode: nothing is downloaded";
 
-/// A token that links to a subscription carry.
+/// A token that the link to a subscription carries.
 const TOKEN: &str = "S3CR3T";
+
+/// What the server has of the rule set once it has changed.
+const NEWER: &str = "DOMAIN,newer.example\n";
+
+/// The longest a request of these tests is at a loopback server after it was
+/// asked for, with a wide margin: what a test that says "nothing more is
+/// asked for" waits before it counts.
+const NOTHING_MORE: Duration = Duration::from_millis(300);
 
 const LIMIT: Duration = Duration::from_secs(10);
 
@@ -53,9 +61,9 @@ fn secs(time: SystemTime) -> u64 {
 /// The sets, the subscription and the hosts file of a generation, as the files
 /// of the data directory `dir` hold them and as the server of `w` gives them.
 /// The copies were checked ten, twenty and five minutes ago and a set is
-/// updated daily, so nothing is due when the generation is built. When the
-/// copies were checked, in UNIX seconds.
+/// updated daily, so nothing is due when the generation is built.
 struct Seeded {
+    /// When the copies were checked, in UNIX seconds.
     rules: u64,
     domains: u64,
     nodes: u64,
@@ -112,9 +120,23 @@ async fn profile_text(w: &World, extra_rules: &str) -> (String, MockDns) {
 struct Generation {
     engine: Arc<Engine>,
     seeded: Seeded,
-    /// Keeps the data directory, with the profile and the files of the sets.
-    _dir: tempfile::TempDir,
+    /// The profile it was built from.
+    text: String,
+    /// The data directory, with the profile and the files of the sets.
+    dir: tempfile::TempDir,
     _dns: MockDns,
+}
+
+/// What the profile of a generation that downloads cannot say: the hosts file
+/// it watches, and that its first downloads are waited for.
+fn watching(hosts: PathBuf) -> impl FnOnce(&mut StackOptions) {
+    move |stack| {
+        stack.wait = Duration::from_secs(5);
+        stack.system = Arc::new(StaticSystemDns {
+            hosts_path: Some(hosts),
+            ..StaticSystemDns::default()
+        });
+    }
 }
 
 /// A generation that downloads and watches a hosts file. It does not return
@@ -124,27 +146,34 @@ async fn generation(w: &World, extra_rules: &str) -> Generation {
     let dir = tempfile::tempdir().unwrap();
     let seeded = seed_generation(w, dir.path());
     let (text, dns) = profile_text(w, extra_rules).await;
-    let hosts = seeded.hosts.clone();
     let runtime = online_runtime_with(
         dir.path(),
         &text,
         &w.server,
         EngineShared::default(),
-        |stack| {
-            stack.wait = Duration::from_secs(5);
-            stack.system = Arc::new(StaticSystemDns {
-                hosts_path: Some(hosts),
-                ..StaticSystemDns::default()
-            });
-        },
+        watching(seeded.hosts.clone()),
     )
     .await;
     Generation {
         engine: Engine::new(runtime),
         seeded,
-        _dir: dir,
+        text,
+        dir,
         _dns: dns,
     }
+}
+
+/// One more generation of `g`, not yet in use: the same profile over the same
+/// data directory, whose cache it reads as it is now.
+async fn one_more(w: &World, g: &Generation) -> Runtime {
+    online_runtime_with(
+        g.dir.path(),
+        &g.text,
+        &w.server,
+        g.engine.shared(),
+        watching(g.seeded.hosts.clone()),
+    )
+    .await
 }
 
 /// The same generation, which cannot go to the network.
@@ -156,7 +185,8 @@ async fn offline_generation(w: &World) -> Generation {
     Generation {
         engine: Engine::new(runtime),
         seeded,
-        _dir: dir,
+        text,
+        dir,
         _dns: dns,
     }
 }
@@ -170,12 +200,18 @@ fn managed_copy(w: &World) -> String {
 /// `/inc`, both checked ten minutes ago. The local file is newer than the
 /// copies, so it is the profile in effect, and it names both.
 fn profile_sources(w: &World, offline: bool) -> Arc<ProfileSources> {
+    profile_sources_saying(w, offline, "interval=3600")
+}
+
+/// `profile_sources`, with `line` as what the local file says after the
+/// address of the managed profile.
+fn profile_sources_saying(w: &World, offline: bool, line: &str) -> Arc<ProfileSources> {
     w.server.set("/managed", managed_copy(w));
     w.server.set("/inc", INCLUDED);
     w.seed("/managed", &managed_copy(w), at(600));
     w.seed("/inc", INCLUDED, at(600));
     w.write(&format!(
-        "#!MANAGED-CONFIG {} interval=3600\n[Rule]\n#!include {}\nFINAL,DIRECT\n",
+        "#!MANAGED-CONFIG {} {line}\n[Rule]\n#!include {}\nFINAL,DIRECT\n",
         w.url("/managed"),
         w.url("/inc")
     ));
@@ -426,25 +462,85 @@ async fn the_managed_profile_is_first_whatever_order_the_sources_are_in() {
 }
 
 /// The flag is on the managed profile, and on nothing else, for as long as
-/// the engine refuses sessions.
+/// the engine refuses sessions; and so is the reason, which no update of
+/// these sources has failed to give.
 #[tokio::test]
 async fn the_managed_profile_is_flagged_while_the_engine_is_suspended() {
     let w = World::new().await;
     let g = generation(&w, "").await;
     let sources = profile_sources(&w, false);
-    let flagged = |engine: &Engine| -> Vec<&'static str> {
-        engine
-            .external_resources(Some(&sources))
+    let why = "the update has not finished";
+    let listed = || g.engine.external_resources(Some(&sources));
+    let flagged = || -> Vec<&'static str> {
+        listed()
             .iter()
             .filter(|resource| resource.suspended)
             .map(|resource| resource.kind)
             .collect()
     };
-    assert!(flagged(&g.engine).is_empty());
-    g.engine.suspend(Some("http status 500".to_string()));
-    assert_eq!(flagged(&g.engine), ["profile"]);
+    let giving_the_reason = || -> Vec<&'static str> {
+        listed()
+            .iter()
+            .filter(|resource| resource.error.as_deref() == Some(why))
+            .map(|resource| resource.kind)
+            .collect()
+    };
+    assert!(flagged().is_empty());
+    assert!(giving_the_reason().is_empty());
+    g.engine.suspend(Some(why.to_string()));
+    assert_eq!(flagged(), ["profile"]);
+    assert_eq!(giving_the_reason(), ["profile"]);
     g.engine.suspend(None);
-    assert!(flagged(&g.engine).is_empty());
+    assert!(flagged().is_empty());
+    assert!(giving_the_reason().is_empty());
+}
+
+/// An update of the managed profile that failed is what its item says, also
+/// while sessions are refused for a reason that was given before it.
+#[tokio::test]
+async fn a_failed_update_is_what_the_managed_profile_says_while_sessions_are_refused() {
+    let w = World::new().await;
+    let g = generation(&w, "").await;
+    let sources = profile_sources(&w, false);
+    let key = w.key("/managed");
+    w.server.set_status("/managed", 500);
+    assert_eq!(
+        g.engine
+            .update_external_resources(Some(&sources), Some(&key), LIMIT)
+            .await,
+        Some(vec![(key.clone(), Err("http status 500".to_string()))])
+    );
+    g.engine
+        .suspend(Some("the update has not finished".to_string()));
+    let listing = g.engine.external_resources(Some(&sources));
+    let managed = item(&listing, &key);
+    assert!(managed.suspended, "{managed:?}");
+    assert_eq!(managed.error.as_deref(), Some("http status 500"));
+}
+
+/// Offline no update is made, so none fails: a managed profile whose update
+/// `strict` requires is due says why sessions are refused all the same, for as
+/// long as they are.
+#[tokio::test]
+async fn offline_a_strict_profile_that_is_due_says_why_sessions_are_refused() {
+    let w = World::new().await;
+    let g = offline_generation(&w).await;
+    // every minute, and the copy was checked ten minutes ago
+    let sources = profile_sources_saying(&w, true, "interval=60 strict=true");
+    let why = sources
+        .strict()
+        .expect("the update is due and cannot be made")
+        .why;
+    g.engine.suspend(Some(why));
+    let listing = g.engine.external_resources(Some(&sources));
+    let managed = item(&listing, &w.key("/managed"));
+    assert!(managed.suspended && managed.ready, "{managed:?}");
+    assert!(!managed.updating, "{managed:?}");
+    assert_eq!(
+        managed.error.as_deref(),
+        Some("offline mode: the update cannot be attempted")
+    );
+    assert_eq!(w.server.requests().len(), 0, "offline asks nobody");
 }
 
 // ---------------------------------------------------------------------------
@@ -710,6 +806,124 @@ async fn a_request_that_is_dropped_leaves_the_download_to_the_manager() {
         held_by_the_manager(&g.engine, &w.url("/rules.list")) == "DOMAIN,newer.example\n"
     })
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// a generation that comes in
+
+/// A generation reads the cache when it is built. An update that lands after
+/// that in the generation before it is asked for again when it comes in: the
+/// copy it read is the one from before.
+#[tokio::test]
+async fn a_copy_checked_after_the_next_generation_was_built_is_asked_for_again() {
+    let w = World::new().await;
+    let g = generation(&w, "").await;
+    let url = w.url("/rules.list");
+    let key = w.key("/rules.list");
+    let next = one_more(&w, &g).await;
+    assert_eq!(held_by_the_manager(&g.engine, &url), RULES);
+
+    w.server.set("/rules.list", NEWER);
+    assert_eq!(
+        g.engine
+            .update_external_resources(None, Some(&key), LIMIT)
+            .await,
+        Some(vec![(key, Ok(()))])
+    );
+    let asked = w.server.hits("/rules.list");
+    g.engine.swap_runtime(next);
+    wait_until("the generation that came in to hold the update", || {
+        held_by_the_manager(&g.engine, &url) == NEWER
+    })
+    .await;
+    assert_eq!(w.server.hits("/rules.list"), asked + 1);
+}
+
+/// An update that is under way in the generation that goes lands in the cache
+/// after the next one read it: the next one makes it too, beside the other.
+#[tokio::test]
+async fn an_update_under_way_when_the_generation_changes_is_made_by_the_next_one_too() {
+    let w = World::new().await;
+    let g = generation(&w, "").await;
+    let url = w.url("/rules.list");
+    let key = w.key("/rules.list");
+    let next = one_more(&w, &g).await;
+    w.server.set("/rules.list", NEWER);
+    // long enough for the generations to change while it is under way
+    w.server.set_delay("/rules.list", Duration::from_secs(1));
+    let asked = w.server.hits("/rules.list");
+
+    let request = tokio::spawn({
+        let (engine, key) = (g.engine.clone(), key.clone());
+        async move {
+            engine
+                .update_external_resources(None, Some(&key), LIMIT)
+                .await
+        }
+    });
+    wait_until("the download to be under way", || {
+        w.server.hits("/rules.list") == asked + 1
+    })
+    .await;
+    g.engine.swap_runtime(next);
+    wait_until("the generation that came in to ask too", || {
+        w.server.hits("/rules.list") == asked + 2
+    })
+    .await;
+    assert_eq!(request.await.unwrap(), Some(vec![(key, Ok(()))]));
+    wait_until("the generation that came in to hold the update", || {
+        held_by_the_manager(&g.engine, &url) == NEWER
+    })
+    .await;
+}
+
+/// A generation that comes in when nothing was checked since it read the
+/// cache asks for nothing.
+#[tokio::test]
+async fn a_generation_that_comes_in_with_nothing_checked_since_asks_for_nothing() {
+    let w = World::new().await;
+    let g = generation(&w, "").await;
+    let next = one_more(&w, &g).await;
+    let asked = w.server.requests().len();
+    g.engine.swap_runtime(next);
+    // Nothing is to happen: a request would be at the server by now.
+    tokio::time::sleep(NOTHING_MORE).await;
+    let since: Vec<String> = w.server.requests()[asked..]
+        .iter()
+        .map(|request| request.path.clone())
+        .collect();
+    assert!(since.is_empty(), "asked for {since:?}");
+}
+
+/// What the generation that comes in is fetching already is not asked for a
+/// second time: its attempt began after the cache was read.
+#[tokio::test]
+async fn a_resource_the_next_generation_is_fetching_already_is_not_asked_for_twice() {
+    let w = World::new().await;
+    let g = generation(&w, "").await;
+    let url = w.url("/rules.list");
+    let source = ResourceSource::Url(url.clone());
+    let next = one_more(&w, &g).await;
+    w.server.set("/rules.list", NEWER);
+    // long enough for the generations to change while both are under way
+    w.server.set_delay("/rules.list", Duration::from_secs(1));
+    let asked = w.server.hits("/rules.list");
+
+    assert!(g.engine.runtime().stack.resources.force_update(&source));
+    assert!(next.stack.resources.force_update(&source));
+    wait_until("both downloads to be under way", || {
+        w.server.hits("/rules.list") == asked + 2
+    })
+    .await;
+    g.engine.swap_runtime(next);
+    wait_until("the generation that came in to hold the update", || {
+        held_by_the_manager(&g.engine, &url) == NEWER
+    })
+    .await;
+    // Nothing more is to come: an attempt that was asked for beside the one
+    // under way would have followed it at once.
+    tokio::time::sleep(NOTHING_MORE).await;
+    assert_eq!(w.server.hits("/rules.list"), asked + 2);
 }
 
 // ---------------------------------------------------------------------------

@@ -25,8 +25,8 @@ const BAD_BODY: &str = "the body must be a JSON object with a string \"key\"";
 const NO_SUCH_KEY: &str = "no external resource has this key";
 
 /// One resource as the manual shows it: `updatedAt` is not there for a local
-/// resource, `error` only when the last update failed, and `suspended` (rurge's
-/// own) only when it is true.
+/// resource, `error` only when there is one to give (`ExternalResource::error`),
+/// and `suspended` (rurge's own) only when it is true.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceJson {
@@ -97,7 +97,8 @@ fn requested_key(body: Result<Bytes, BytesRejection>) -> ApiResult<String> {
 
 /// `{"key": "<key>"}` updates the resource that key names, `{"key": "all"}`
 /// every one that is downloaded. The answer maps each key that was updated to
-/// `"success"` or to why it was not.
+/// `"success"` or to why it was not; it is an object, and the order the engine
+/// answers in (that of the listing) is not kept.
 pub async fn update(
     State(app): State<App>,
     body: Result<Bytes, BytesRejection>,

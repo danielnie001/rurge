@@ -6,6 +6,7 @@
 use crate::engine::{Engine, ListenerSpec};
 use crate::runtime::Runtime;
 use rurge_config::general::General;
+use rurge_net::resource::ResourceManager;
 
 /// Everything a listener bakes in when it is bound: what to listen on (kind
 /// and address), how to authenticate, and the `[General]` switches that go
@@ -37,7 +38,9 @@ impl Engine {
     /// their snapshot; new sessions use the new one. Returns whether the
     /// listener configuration surface (addresses, authentication, source
     /// restriction, error-page switches) changed, so the caller can rebind
-    /// listeners and pick up the new `ListenerOpts` with them. Must be
+    /// listeners and pick up the new `ListenerOpts` with them. A resource the
+    /// old generation checked after the new one read the cache is asked for
+    /// again by the new one (`catch_up`). Must be
     /// called inside a tokio runtime: a generation with subscriptions starts
     /// a watcher task.
     pub fn swap_runtime(self: &std::sync::Arc<Self>, mut next: Runtime) -> bool {
@@ -51,14 +54,41 @@ impl Engine {
         let receivers = next.subscriptions.take_receivers();
         // `rt` is read inside the same lock that published it: another swap
         // can never land in between and make this attach `receivers` (this
-        // generation's own) to a later generation's watcher.
-        let rt = {
+        // generation's own) to a later generation's watcher. The generation
+        // that goes is read there for the same reason.
+        let (was, rt) = {
             let _generation = self.generation_lock();
+            let was = self.runtime();
             self.publish_generation(&mut next);
             self.store_runtime(next);
-            self.runtime()
+            (was, self.runtime())
         };
         self.watch_subscriptions(&rt, receivers);
+        catch_up(&was.stack.resources, &rt.stack.resources);
         before != after
+    }
+}
+
+/// Has the generation that comes in ask again for the resources the one that
+/// goes checked after the cache was read, and for those it is checking now.
+/// A manager reads the cache when its entries are made and is told of nothing
+/// that is written there afterwards: an update somebody asked for while the
+/// next generation was built (the reload that follows a managed profile that
+/// changed is such a time) would be in the cache and not in use until the
+/// resource's own next refresh, a day by default. What the incoming manager
+/// is fetching already is left to it: that attempt began after the cache was
+/// read.
+fn catch_up(outgoing: &ResourceManager, incoming: &ResourceManager) {
+    let before = outgoing.statuses();
+    for status in incoming.statuses() {
+        if status.local || status.updating {
+            continue;
+        }
+        let behind = before.iter().any(|was| {
+            was.key == status.key && (was.updating || was.fetched_at > status.fetched_at)
+        });
+        if behind {
+            incoming.force_update(&status.source);
+        }
     }
 }
