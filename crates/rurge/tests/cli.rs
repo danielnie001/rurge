@@ -2042,10 +2042,7 @@ encrypted-dns-skip-cert-verification = true",
                 names
             }
         };
-        assert_eq!(
-            kept(&["--dns-cache-size", "2"]).await,
-            ["b.test", "c.test"]
-        );
+        assert_eq!(kept(&["--dns-cache-size", "2"]).await, ["b.test", "c.test"]);
         assert_eq!(kept(&[]).await, ["a.test", "b.test", "c.test"]);
     }
 
