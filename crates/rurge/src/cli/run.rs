@@ -1464,6 +1464,34 @@ mod tests {
         assert_eq!(mode_name(&OutboundMode::Rule), "rule");
     }
 
+    /// `POST /v1/log/level` sets, for each of its six names, the level the
+    /// option of that name sets; `debug` is `info`, and `error` is the one
+    /// level below `warning` that the profile's four names do not have.
+    #[test]
+    fn the_api_sets_the_level_the_option_of_the_same_name_does() {
+        let (_layer, handle): (reload::Layer<LevelFilter, Registry>, LevelHandle) =
+            reload::Layer::new(LevelFilter::OFF);
+        let (tx, _commands) = mpsc::channel(1);
+        let control = LoopControl {
+            tx,
+            log_level: handle.clone(),
+            system_proxy: Arc::new(AtomicBool::new(false)),
+        };
+        for (name, filter) in [
+            ("verbose", LevelFilter::TRACE),
+            ("debug", LevelFilter::DEBUG),
+            ("info", LevelFilter::DEBUG),
+            ("notify", LevelFilter::INFO),
+            ("warning", LevelFilter::WARN),
+            ("error", LevelFilter::ERROR),
+        ] {
+            let level = ApiLogLevel::parse(name).expect("a level the API knows");
+            control.set_log_level(level).unwrap();
+            assert_eq!(handle.with_current(|f| *f).unwrap(), filter, "{name}");
+            assert_eq!(parse_log_level(name).unwrap(), filter, "{name}");
+        }
+    }
+
     fn profile(general: &str) -> rurge_config::Config {
         let text = format!("[General]\n{general}\n[Rule]\nFINAL,DIRECT\n");
         let loaded =
