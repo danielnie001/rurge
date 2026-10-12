@@ -9,8 +9,10 @@ use clap::Args;
 use rurge_config::Config;
 use rurge_dns::cache::DEFAULT_CAPACITY;
 use rurge_dns::system::SystemDns;
+use rurge_net::BoxFuture;
 use rurge_rules::GeoUrls;
-use std::net::SocketAddr;
+use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -152,6 +154,28 @@ impl SystemDns for PlatformSystemDns {
     fn has_ipv6(&self) -> bool {
         rurge_platform::dns::has_ipv6()
     }
+
+    fn library_lookup<'a>(&'a self, name: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+        Box::pin(async move { tokio::net::lookup_host((name, 0)).await.map(usable) })
+    }
+}
+
+/// What the library gave, as the addresses the resolver can hand on: in the
+/// order given, each once. An IPv6 address with a scope id is left out — a
+/// link-local `fe80::1%en0`, which is what mDNS often answers first: an
+/// `IpAddr` has nowhere to keep the scope, and without it the address
+/// cannot be dialled, so it would only be the first address to fail.
+fn usable(addrs: impl Iterator<Item = SocketAddr>) -> Vec<IpAddr> {
+    let mut found = Vec::new();
+    for addr in addrs {
+        if matches!(addr, SocketAddr::V6(v6) if v6.scope_id() != 0) {
+            continue;
+        }
+        if !found.contains(&addr.ip()) {
+            found.push(addr.ip());
+        }
+    }
+    found
 }
 
 /// `rurge-platform::socket` behind the `SocketHook` trait (AR-02: platform
@@ -274,6 +298,52 @@ mod tests {
                 "https://line.example/asn.mmdb"
             )
         );
+    }
+
+    /// The one test that calls the real system resolver library, and for the
+    /// one name every system answers from its own tables, without a packet.
+    #[tokio::test]
+    async fn the_platform_library_answers_localhost_with_loopback_addresses() {
+        let found = PlatformSystemDns
+            .library_lookup("localhost")
+            .await
+            .expect("localhost resolves");
+        assert!(!found.is_empty());
+        assert!(found.iter().all(IpAddr::is_loopback), "{found:?}");
+    }
+
+    /// What the library gave, as addresses the resolver can use: in the
+    /// order given, each once, and none that cannot be dialled as an
+    /// `IpAddr`.
+    #[test]
+    fn a_library_answer_keeps_its_order_and_loses_scoped_and_repeated_addresses() {
+        use std::net::{SocketAddrV4, SocketAddrV6};
+        let v4 = |text: &str| SocketAddr::V4(SocketAddrV4::new(text.parse().unwrap(), 0));
+        let v6 = |text: &str, scope: u32| {
+            SocketAddr::V6(SocketAddrV6::new(text.parse().unwrap(), 0, 0, scope))
+        };
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+
+        assert_eq!(
+            usable([v4("192.0.2.1"), v6("2001:db8::1", 0)].into_iter()),
+            [ip("192.0.2.1"), ip("2001:db8::1")]
+        );
+        assert_eq!(
+            usable([v6("2001:db8::1", 0), v4("192.0.2.1")].into_iter()),
+            [ip("2001:db8::1"), ip("192.0.2.1")],
+            "the order is the library's"
+        );
+        assert_eq!(
+            usable([v6("fe80::1", 4), v4("192.0.2.1"), v6("fe80::2", 4)].into_iter()),
+            [ip("192.0.2.1")],
+            "a link-local address with its scope id cannot be dialled"
+        );
+        assert_eq!(
+            usable([v4("192.0.2.1"), v6("2001:db8::1", 0), v4("192.0.2.1")].into_iter()),
+            [ip("192.0.2.1"), ip("2001:db8::1")],
+            "an address given twice comes once"
+        );
+        assert!(usable([v6("fe80::1", 4), v6("fe80::1", 9)].into_iter()).is_empty());
     }
 
     /// Socket-level only: nothing about this machine's network is changed.

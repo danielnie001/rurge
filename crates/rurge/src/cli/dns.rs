@@ -192,9 +192,10 @@ fn run_lookup(args: LookupArgs) -> anyhow::Result<ExitCode> {
         };
         let mut result = stack.resolver.lookup(&args.name, opts).await;
         // `want_v6` steers the upstream query, but the paths that answer
-        // without one (`[Host]` addresses, the hosts file, the `lookup_host`
-        // fallback) return both families regardless, so the family the caller
-        // did not ask for is dropped here.
+        // without one (`[Host]` addresses, the hosts file) return both
+        // families regardless, and the system resolver library's answer keeps
+        // its IPv4 addresses when only IPv6 was asked for, so the family the
+        // caller did not ask for is dropped here.
         result = match (args.qtype, result) {
             (QueryType::A, Ok(r)) if r.v4.is_empty() => Err(DnsError::EmptyAnswer),
             (QueryType::A, Ok(mut r)) => {

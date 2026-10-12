@@ -687,13 +687,7 @@ impl Resolver {
                 }
                 HostAction::System(_) => {
                     return self
-                        .system_lookup(
-                            &current,
-                            want_v6,
-                            Source::Host(HostKind::System),
-                            started,
-                            &opts,
-                        )
+                        .library_lookup(&current, want_v6, Source::Host(HostKind::System), started)
                         .await;
                 }
             }
@@ -702,7 +696,7 @@ impl Resolver {
         // Special names.
         if current.ends_with(".local") {
             return self
-                .system_lookup(&current, want_v6, Source::System, started, &opts)
+                .library_lookup(&current, want_v6, Source::System, started)
                 .await;
         }
         if !current.contains('.') && !no_search {
@@ -886,6 +880,9 @@ impl Resolver {
         result
     }
 
+    /// The system's DNS servers when any is known, the system resolver
+    /// library when none is: a single label given its search domain, and any
+    /// name of a resolver that has no server to ask.
     async fn system_lookup(
         &self,
         name: &str,
@@ -899,10 +896,50 @@ impl Resolver {
             let answers = self.query_coalesced(&system, name, want_v6, opts).await?;
             return Ok(from_answers(&answers, source, started));
         }
-        let addrs = tokio::net::lookup_host((name, 0))
-            .await
-            .map_err(|e| DnsError::AllFailed(vec![("system".to_string(), e.to_string())]))?;
-        let ips: Vec<IpAddr> = addrs.map(|sa| sa.ip()).collect();
+        self.library_lookup(name, want_v6, source, started).await
+    }
+
+    /// `name` asked of the system resolver library — what `getaddrinfo`
+    /// answers from — for the names only the system knows: the names ending
+    /// in `.local` and the `[Host]` values `server:system`, `server:syslib`
+    /// and `server:force-syslib` (all three are the library in the normal
+    /// mode), and any name when no server is left to ask.
+    ///
+    /// The library gives no TTL and its answers are not cached here: the
+    /// system keeps its own cache. Identical lookups in flight are not
+    /// merged for the same reason.
+    async fn library_lookup(
+        &self,
+        name: &str,
+        want_v6: bool,
+        source: Source,
+        started: Instant,
+    ) -> Result<DnsResult, DnsError> {
+        // What a lookup by servers may take. When the limit passes the system
+        // call goes on in a thread of its own and its result is dropped.
+        let limit = self.cfg.fanout.resend * self.cfg.fanout.attempts.max(1);
+        let asked = Instant::now();
+        let outcome = tokio::time::timeout(limit, self.system.library_lookup(name)).await;
+        let elapsed_ms = asked.elapsed().as_millis() as u64;
+        let ips = match outcome {
+            Ok(Ok(ips)) => ips,
+            Ok(Err(e)) => {
+                tracing::debug!(target: "rurge_dns::resolver", upstream = "system resolver library", error = %e, elapsed_ms, "failed");
+                return Err(DnsError::AllFailed(vec![(
+                    "system".to_string(),
+                    e.to_string(),
+                )]));
+            }
+            Err(_) => {
+                tracing::debug!(target: "rurge_dns::resolver", upstream = "system resolver library", error = %DnsError::Timeout, elapsed_ms, "failed");
+                return Err(DnsError::Timeout);
+            }
+        };
+        tracing::debug!(target: "rurge_dns::resolver", upstream = "system resolver library", records = ips.len(), elapsed_ms, "answer");
+        let ips: Vec<IpAddr> = ips
+            .into_iter()
+            .filter(|ip| want_v6 || ip.is_ipv4())
+            .collect();
         if ips.is_empty() {
             return Err(DnsError::EmptyAnswer);
         }
@@ -1154,6 +1191,7 @@ mod tests {
     };
     use rurge_net::resource::ResourceOptions;
     use rurge_net::trail::Trail;
+    use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::path::PathBuf;
 
@@ -1297,6 +1335,12 @@ mod tests {
         fn has_ipv6(&self) -> bool {
             false
         }
+        fn library_lookup<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+            Box::pin(std::future::ready(Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no system resolver",
+            ))))
+        }
     }
 
     fn profile(general: &str, hosts: &str) -> String {
@@ -1307,6 +1351,100 @@ mod tests {
 
     fn v4(s: &str) -> Ipv4Addr {
         s.parse().unwrap()
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// What one thread logs, down to DEBUG: the target and the fields of
+    /// each event, the message among them, as the text they were recorded as.
+    #[derive(Clone, Default)]
+    struct Events(Arc<Mutex<Vec<Event>>>);
+
+    type Event = (String, BTreeMap<String, String>);
+
+    impl Events {
+        /// Routes the events of this thread here until the guard is dropped.
+        /// The second element is kept with it: while one dispatcher alone is
+        /// registered, tracing-core asks only the thread that first reaches a
+        /// call site whether it is wanted, and a site another test reaches
+        /// first would stay shut on this thread too.
+        fn capture(&self) -> (tracing::subscriber::DefaultGuard, tracing::Dispatch) {
+            (
+                tracing::subscriber::set_default(self.clone()),
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()),
+            )
+        }
+
+        /// The fields of the events of `target`, in the order they came.
+        fn of(&self, target: &str) -> Vec<BTreeMap<String, String>> {
+            let events = self.0.lock().unwrap();
+            events
+                .iter()
+                .filter(|(of, _)| of == target)
+                .map(|(_, fields)| fields.clone())
+                .collect()
+        }
+    }
+
+    impl tracing::Subscriber for Events {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::DEBUG
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(BTreeMap<String, String>);
+
+            impl tracing::field::Visit for Fields {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.insert(field.name().to_string(), value.to_string());
+                }
+
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+                    self.0
+                        .insert(field.name().to_string(), format!("{value:?}"));
+                }
+            }
+
+            let mut fields = Fields(BTreeMap::new());
+            event.record(&mut fields);
+            let target = event.metadata().target().to_string();
+            self.0.lock().unwrap().push((target, fields.0));
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A system whose resolver library never answers.
+    struct StuckLibrary;
+
+    impl SystemDns for StuckLibrary {
+        fn servers(&self) -> Vec<SocketAddr> {
+            Vec::new()
+        }
+        fn search_domains(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn hosts_path(&self) -> Option<PathBuf> {
+            None
+        }
+        fn has_ipv6(&self) -> bool {
+            false
+        }
+        fn library_lookup<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+            Box::pin(std::future::pending())
+        }
     }
 
     #[tokio::test]
@@ -1486,15 +1624,22 @@ mod tests {
         );
     }
 
+    /// Where each kind of name goes: `server:<address>` to that server alone,
+    /// `server:system` and `.local` names to the system resolver library, a
+    /// single label with the first search domain to the system's servers.
+    /// The servers know `sys.test` and `printer.local` as well, and say
+    /// something else; they are not asked.
     #[tokio::test]
     async fn host_server_and_system_modes_and_special_names() {
         let primary = MockDns::spawn().await;
         let dedicated = MockDns::spawn().await;
         let system = MockDns::spawn().await;
         dedicated.set("corp.test", &["10.10.0.1"], &[], 60);
-        system.set("printer.local", &["10.20.0.1"], &[], 60);
+        for server in [&primary, &system] {
+            server.set("printer.local", &["10.20.0.1"], &[], 60);
+            server.set("sys.test", &["10.20.0.3"], &[], 60);
+        }
         system.set("nas.home.lan", &["10.20.0.2"], &[], 60);
-        system.set("sys.test", &["10.20.0.3"], &[], 60);
         let e = env(&profile(
             &format!("dns-server = {}", primary.addr()),
             &format!(
@@ -1505,8 +1650,13 @@ mod tests {
         let sys = StaticSystemDns {
             servers: vec![system.addr()],
             search_domains: vec!["home.lan".into()],
+            library: vec![
+                ("printer.local".into(), vec![ip("10.21.0.1")]),
+                ("sys.test".into(), vec![ip("10.21.0.3")]),
+            ],
             ..StaticSystemDns::default()
         };
+        let asked = sys.library_asked.clone();
         let (r, _) = resolver_once(&e, sys);
         let c = r.lookup("corp.test", LookupOpts::default()).await.unwrap();
         assert_eq!(
@@ -1517,13 +1667,13 @@ mod tests {
         let s = r.lookup("sys.test", LookupOpts::default()).await.unwrap();
         assert_eq!(
             (s.v4, s.source),
-            (vec![v4("10.20.0.3")], Source::Host(HostKind::System))
+            (vec![v4("10.21.0.3")], Source::Host(HostKind::System))
         );
         let l = r
             .lookup("printer.local", LookupOpts::default())
             .await
             .unwrap();
-        assert_eq!((l.v4, l.source), (vec![v4("10.20.0.1")], Source::System));
+        assert_eq!((l.v4, l.source), (vec![v4("10.21.0.1")], Source::System));
         let n = r.lookup("nas", LookupOpts::default()).await.unwrap();
         assert_eq!(
             n.v4,
@@ -1532,6 +1682,314 @@ mod tests {
         );
         assert_eq!(system.query_count("nas.home.lan", Qtype::A), 1);
         assert_eq!(primary.query_count("nas.home.lan", Qtype::A), 0);
+        for name in ["sys.test", "printer.local"] {
+            for server in [&primary, &system] {
+                assert_eq!(server.query_count(name, Qtype::A), 0, "{name}");
+            }
+        }
+        assert_eq!(*asked.lock().unwrap(), ["sys.test", "printer.local"]);
+    }
+
+    /// `.local` names are the system resolver library's (manual, DNS
+    /// Overview, "Special Hostnames"): mDNS and Bonjour answer them, and a DNS
+    /// server does not. They go there although the system's servers are
+    /// known, and the library's answer is not cached.
+    #[tokio::test]
+    async fn a_local_name_is_asked_of_the_library_and_not_of_the_servers() {
+        let primary = MockDns::spawn().await;
+        let system = MockDns::spawn().await;
+        primary.set("printer.local", &["10.20.0.1"], &[], 60);
+        system.set("printer.local", &["10.20.0.2"], &[], 60);
+        let e = env(&profile(&format!("dns-server = {}", primary.addr()), ""));
+        let sys = StaticSystemDns {
+            servers: vec![system.addr()],
+            library: vec![("printer.local".into(), vec![ip("10.20.0.3")])],
+            ..StaticSystemDns::default()
+        };
+        let asked = sys.library_asked.clone();
+        let (r, _) = resolver_once(&e, sys);
+        let found = r
+            .lookup("Printer.LOCAL", LookupOpts::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            (found.v4, found.source, found.ttl),
+            (
+                vec![v4("10.20.0.3")],
+                Source::System,
+                Duration::from_secs(60)
+            )
+        );
+        for server in [&primary, &system] {
+            assert_eq!(server.query_count("printer.local", Qtype::A), 0);
+            assert_eq!(server.query_count("printer.local", Qtype::Aaaa), 0);
+        }
+        assert_eq!(*asked.lock().unwrap(), ["printer.local"]);
+        r.lookup("printer.local", LookupOpts::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            *asked.lock().unwrap(),
+            ["printer.local", "printer.local"],
+            "the library is asked again; nothing is cached"
+        );
+        assert!(r.cache_snapshot().is_empty());
+    }
+
+    /// `server:system`, `server:syslib` and `server:force-syslib` are one
+    /// thing until the virtual interface: in the normal mode all three are the
+    /// system resolver library (manual, Local DNS Mapping, "System
+    /// Resolution"), whatever the system's servers know.
+    #[tokio::test]
+    async fn the_three_system_values_of_host_are_all_the_library() {
+        let system = MockDns::spawn().await;
+        let known = [
+            ("a.test", "10.20.0.11"),
+            ("b.test", "10.20.0.12"),
+            ("c.test", "10.20.0.13"),
+        ];
+        for (name, _) in known {
+            system.set(name, &["10.20.0.1"], &[], 60);
+        }
+        let e = env(&profile(
+            "",
+            "a.test = server:system\nb.test = server:syslib\nc.test = server:force-syslib\n",
+        ));
+        let sys = StaticSystemDns {
+            servers: vec![system.addr()],
+            library: known
+                .iter()
+                .map(|(name, address)| (name.to_string(), vec![ip(address)]))
+                .collect(),
+            ..StaticSystemDns::default()
+        };
+        let asked = sys.library_asked.clone();
+        let (r, _) = resolver_once(&e, sys);
+        for (name, address) in known {
+            let found = r.lookup(name, LookupOpts::default()).await.unwrap();
+            assert_eq!(
+                (found.v4, found.source),
+                (vec![v4(address)], Source::Host(HostKind::System)),
+                "{name}"
+            );
+            assert_eq!(system.query_count(name, Qtype::A), 0, "{name}");
+        }
+        assert_eq!(*asked.lock().unwrap(), ["a.test", "b.test", "c.test"]);
+    }
+
+    /// A single label gets the first search domain and goes to the system's
+    /// servers (manual, DNS Overview, "Special Hostnames"); the library is
+    /// not asked.
+    #[tokio::test]
+    async fn a_simple_host_name_goes_to_the_system_servers_with_the_search_domain() {
+        let system = MockDns::spawn().await;
+        system.set("nas.home.lan", &["10.20.0.2"], &[], 60);
+        let e = env(&profile("", ""));
+        let sys = StaticSystemDns {
+            servers: vec![system.addr()],
+            search_domains: vec!["home.lan".into(), "other.lan".into()],
+            library: vec![("nas.home.lan".into(), vec![ip("10.20.0.9")])],
+            ..StaticSystemDns::default()
+        };
+        let asked = sys.library_asked.clone();
+        let (r, _) = resolver_once(&e, sys);
+        let found = r.lookup("nas", LookupOpts::default()).await.unwrap();
+        assert_eq!(
+            (found.v4, found.source),
+            (vec![v4("10.20.0.2")], Source::System)
+        );
+        assert_eq!(system.query_count("nas.home.lan", Qtype::A), 1);
+        assert!(asked.lock().unwrap().is_empty());
+    }
+
+    /// With no system server known there is nobody to forward the query to,
+    /// and the library is asked for the name with the search domain.
+    #[tokio::test]
+    async fn without_a_system_server_a_simple_host_name_is_asked_of_the_library() {
+        let e = env(&profile("", ""));
+        let sys = StaticSystemDns {
+            search_domains: vec!["home.lan".into()],
+            library: vec![("nas.home.lan".into(), vec![ip("10.20.0.2")])],
+            ..StaticSystemDns::default()
+        };
+        let asked = sys.library_asked.clone();
+        let (r, _) = resolver_once(&e, sys);
+        let found = r.lookup("nas", LookupOpts::default()).await.unwrap();
+        assert_eq!(
+            (found.v4, found.source),
+            (vec![v4("10.20.0.2")], Source::System)
+        );
+        assert_eq!(*asked.lock().unwrap(), ["nas.home.lan"]);
+    }
+
+    /// A resolver that has no `dns-server` and learns no system server asks
+    /// the library for an ordinary name, the last place left to ask.
+    #[tokio::test]
+    async fn with_no_server_at_all_an_ordinary_name_is_asked_of_the_library() {
+        let e = env(&profile("", ""));
+        let sys = StaticSystemDns {
+            library: vec![("www.example.test".into(), vec![ip("10.20.0.5")])],
+            ..StaticSystemDns::default()
+        };
+        let asked = sys.library_asked.clone();
+        let (r, _) = resolver_once(&e, sys);
+        assert!(r.primary_upstreams().is_empty());
+        let found = r
+            .lookup("www.example.test", LookupOpts::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            (found.v4, found.source),
+            (vec![v4("10.20.0.5")], Source::System)
+        );
+        assert_eq!(*asked.lock().unwrap(), ["www.example.test"]);
+    }
+
+    /// The library gives both families whatever was asked for; the resolver
+    /// keeps the IPv6 addresses only for a caller that wants them, and a
+    /// name that has nothing else is an empty answer then.
+    #[tokio::test]
+    async fn the_librarys_answer_is_cut_to_the_families_wanted() {
+        let system = MockDns::spawn().await;
+        let e = env(&profile("", ""));
+        let sys = StaticSystemDns {
+            servers: vec![system.addr()],
+            library: vec![
+                (
+                    "both.local".into(),
+                    vec![ip("10.20.0.1"), ip("fd00::1"), ip("10.20.0.2")],
+                ),
+                ("v6only.local".into(), vec![ip("fd00::2")]),
+            ],
+            ..StaticSystemDns::default()
+        };
+        let (r, _) = resolver_once(&e, sys);
+        let without_v6 = LookupOpts {
+            want_v6: Some(false),
+            ..LookupOpts::default()
+        };
+        let with_v6 = LookupOpts {
+            want_v6: Some(true),
+            ..LookupOpts::default()
+        };
+
+        let found = r.lookup("both.local", without_v6.clone()).await.unwrap();
+        assert_eq!(
+            (found.v4, found.v6),
+            (vec![v4("10.20.0.1"), v4("10.20.0.2")], vec![])
+        );
+        let found = r.lookup("both.local", with_v6.clone()).await.unwrap();
+        assert_eq!(
+            (found.v4, found.v6),
+            (
+                vec![v4("10.20.0.1"), v4("10.20.0.2")],
+                vec!["fd00::1".parse::<Ipv6Addr>().unwrap()]
+            )
+        );
+        assert_eq!(
+            r.lookup("v6only.local", without_v6).await,
+            Err(DnsError::EmptyAnswer)
+        );
+        let found = r.lookup("v6only.local", with_v6).await.unwrap();
+        assert_eq!(found.v6, vec!["fd00::2".parse::<Ipv6Addr>().unwrap()]);
+    }
+
+    /// What the library says when it cannot resolve a name is the error of the
+    /// lookup, under the name `system`.
+    #[tokio::test]
+    async fn a_name_the_library_does_not_know_fails_with_its_error() {
+        let system = MockDns::spawn().await;
+        let e = env(&profile("", ""));
+        let sys = StaticSystemDns {
+            servers: vec![system.addr()],
+            ..StaticSystemDns::default()
+        };
+        let (r, _) = resolver_once(&e, sys);
+        assert_eq!(
+            r.lookup("nobody.local", LookupOpts::default()).await,
+            Err(DnsError::AllFailed(vec![(
+                "system".to_string(),
+                "no such host".to_string()
+            )]))
+        );
+    }
+
+    /// A lookup by the library ends when a lookup by servers would: after
+    /// `resend` × `attempts`, with a timeout, and the library's own call goes
+    /// on without anyone waiting for it. The limit is an event of its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_by_the_library_is_given_as_long_as_one_by_servers() {
+        let events = Events::default();
+        let _logging = events.capture();
+        let e = env(&profile("", ""));
+        let (r, _) = resolver_with(&e, Arc::new(StuckLibrary));
+        let began = Instant::now();
+        let ended = tokio::time::timeout(
+            Duration::from_secs(3600),
+            r.lookup("printer.local", LookupOpts::default()),
+        )
+        .await
+        .expect("the lookup ends by its own limit");
+        assert_eq!(ended, Err(DnsError::Timeout));
+        assert_eq!(began.elapsed(), fast().resend * fast().attempts);
+        let failed = events.of("rurge_dns::resolver");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(
+            (failed[0]["message"].as_str(), failed[0]["error"].as_str()),
+            ("failed", "timeout")
+        );
+        assert_eq!(failed[0]["elapsed_ms"], "300");
+    }
+
+    /// A lookup by the library ends with one DEBUG event, in the form of the
+    /// fanout's (`rurge dns lookup --trace` prints it): the upstream, how many
+    /// addresses the library gave or what it failed with, and how long it
+    /// took. It names neither the host nor an address.
+    #[tokio::test]
+    async fn a_lookup_by_the_library_leaves_one_event_that_names_no_host_and_no_address() {
+        let events = Events::default();
+        let _logging = events.capture();
+        let e = env(&profile("", ""));
+        let sys = StaticSystemDns {
+            library: vec![(
+                "printer.local".into(),
+                vec![ip("192.0.2.77"), ip("fd00::77")],
+            )],
+            ..StaticSystemDns::default()
+        };
+        let (r, _) = resolver_once(&e, sys);
+        let fields = |event: &BTreeMap<String, String>| {
+            event
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+
+        r.lookup("printer.local", LookupOpts::default())
+            .await
+            .unwrap();
+        let answered = events.of("rurge_dns::resolver");
+        assert_eq!(answered.len(), 1, "{answered:?}");
+        assert_eq!(fields(&answered[0]), "elapsed_ms,message,records,upstream");
+        assert_eq!(answered[0]["message"], "answer");
+        assert_eq!(answered[0]["upstream"], "system resolver library");
+        assert_eq!(answered[0]["records"], "2", "counted before the families");
+
+        r.lookup("nobody.local", LookupOpts::default())
+            .await
+            .unwrap_err();
+        let both = events.of("rurge_dns::resolver");
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert_eq!(fields(&both[1]), "elapsed_ms,error,message,upstream");
+        assert_eq!(both[1]["message"], "failed");
+        assert_eq!(both[1]["error"], "no such host");
+
+        for text in both.iter().flat_map(|event| event.values()) {
+            for secret in ["printer", "nobody", "192.0.2.77", "fd00"] {
+                assert!(!text.contains(secret), "{text}");
+            }
+        }
     }
 
     /// `nas.` (manual, DNS Overview): the trailing dot is dropped and no
@@ -2192,7 +2650,7 @@ https://dns.example/dns-query"
     }
 
     #[tokio::test]
-    async fn no_servers_uses_system_upstreams_then_lookup_host() {
+    async fn no_dns_server_means_the_system_servers_are_the_upstreams() {
         let system = MockDns::spawn().await;
         system.set("s.test", &["10.30.0.1"], &[], 60);
         let e = env(&profile("", ""));
