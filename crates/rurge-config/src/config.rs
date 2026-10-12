@@ -2398,6 +2398,51 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
         );
     }
 
+    /// A `[Proxy]` line that redefines `DIRECT` is ignored without a word —
+    /// no diagnostic of any kind — and the built-in stays what it is.
+    /// Redefining any other built-in name is an error, and defines nothing.
+    #[test]
+    fn redefining_direct_is_silent_and_redefining_another_built_in_is_an_error() {
+        let l = load_text("[Proxy]\nDIRECT = reject\n[Rule]\nFINAL,DIRECT\n");
+        assert!(codes_of(&l).is_empty(), "{:?}", codes_of(&l));
+        assert!(l.config.policies.is_empty());
+        for name in [
+            "REJECT",
+            "REJECT-DROP",
+            "REJECT-NO-DROP",
+            "REJECT-TINYGIF",
+            "CELLULAR",
+            "CELLULAR-ONLY",
+            "HYBRID",
+            "NO-HYBRID",
+        ] {
+            let l = load_text(&format!("[Proxy]\n{name} = direct\n[Rule]\nFINAL,DIRECT\n"));
+            assert_eq!(codes_of(&l), [codes::E_BUILTIN_REDEFINED], "{name}");
+            assert!(l.config.policies.is_empty(), "{name}");
+        }
+    }
+
+    /// Each iOS-only built-in a rule names is warned of once, however often it
+    /// is named, and the warning says what becomes of it. The other built-ins
+    /// are not warned of.
+    #[test]
+    fn each_ios_only_built_in_is_warned_of_once_and_no_other_is() {
+        let l = load_text(
+            "[Rule]\nDOMAIN,a.test,CELLULAR\nDOMAIN,b.test,CELLULAR-ONLY\nDOMAIN,c.test,HYBRID\nDOMAIN,d.test,NO-HYBRID\nDOMAIN,e.test,CELLULAR\nDOMAIN,f.test,NO-HYBRID\nDOMAIN,g.test,REJECT\nDOMAIN,h.test,REJECT-DROP\nDOMAIN,i.test,REJECT-NO-DROP\nDOMAIN,j.test,REJECT-TINYGIF\nFINAL,DIRECT\n",
+        );
+        assert_eq!(codes_of(&l), [codes::W_IOS_BUILTIN_AS_DIRECT; 4]);
+        let told: Vec<&str> = l.diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(
+            told,
+            [
+                "`CELLULAR` is iOS-only; treated as DIRECT",
+                "`CELLULAR-ONLY` is iOS-only; treated as DIRECT",
+                "`HYBRID` is iOS-only; treated as DIRECT",
+                "`NO-HYBRID` is iOS-only; treated as DIRECT",
+            ]
+        );
+    }
+
     #[test]
     fn warnings() {
         let l = load_text(

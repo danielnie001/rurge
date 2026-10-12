@@ -733,6 +733,27 @@ mod tests {
         assert!(!Builtin::Direct.is_ios_only());
     }
 
+    /// The manual's four iOS-only built-ins are known by name, as themselves,
+    /// and are the only built-ins that are iOS-only.
+    #[test]
+    fn exactly_the_four_cellular_built_ins_are_ios_only() {
+        for name in ["CELLULAR", "CELLULAR-ONLY", "HYBRID", "NO-HYBRID"] {
+            let builtin = Builtin::parse(name).unwrap_or_else(|| panic!("{name} is not known"));
+            assert_eq!(builtin.name(), name);
+            assert!(builtin.is_ios_only() && !builtin.is_reject(), "{name}");
+        }
+        for name in [
+            "DIRECT",
+            "REJECT",
+            "REJECT-DROP",
+            "REJECT-NO-DROP",
+            "REJECT-TINYGIF",
+        ] {
+            let builtin = Builtin::parse(name).unwrap_or_else(|| panic!("{name} is not known"));
+            assert!(!builtin.is_ios_only(), "{name}");
+        }
+    }
+
     #[test]
     fn manual_group_examples() {
         let g = parse_group("Proxy", "select, ProxyA, ProxyB, DIRECT", &span()).unwrap();
