@@ -61,8 +61,11 @@ impl std::fmt::Debug for Meta {
             fetched_subsec_nanos,
             sha256,
         } = self;
+        let shown = url::Url::parse(url)
+            .map(|url| super::origin(&url))
+            .unwrap_or_else(|_| "…".to_string());
         f.debug_struct("Meta")
-            .field("url", &shown(url))
+            .field("url", &shown)
             .field("etag", etag)
             .field("last_modified", last_modified)
             .field("fetched_at", fetched_at)
@@ -70,13 +73,6 @@ impl std::fmt::Debug for Meta {
             .field("sha256", &sha256.as_ref().map(|_| "…"))
             .finish()
     }
-}
-
-/// Where a URL goes, for a `Debug` and a log line.
-fn shown(url: &str) -> String {
-    url::Url::parse(url)
-        .map(|url| super::origin(&url))
-        .unwrap_or_else(|_| "…".to_string())
 }
 
 /// The SHA-256 of a body, in lower-case hex.
@@ -110,6 +106,9 @@ impl CacheDir {
     /// one the metadata was written for: the two files are written one after
     /// the other, a crash can leave either of them half done, and what is
     /// left then is no entry. Whoever finds none asks for the whole body.
+    /// A reader that comes between the two renames of a `store` finds none
+    /// either, for that moment: the new body is beside the metadata of the
+    /// one before.
     pub fn load(&self) -> Option<(Bytes, Meta)> {
         let data = std::fs::read(self.dir.join("data")).ok()?;
         let meta_bytes = std::fs::read(self.dir.join("meta.json")).ok()?;
@@ -119,8 +118,11 @@ impl CacheDir {
             .as_ref()
             .is_some_and(|digest| *digest != digest_of(&data))
         {
+            // By its key, which the status of a resource has too: the URL of
+            // a subscription is in no log, not even as where it goes.
+            let key = self.dir.file_name().and_then(|name| name.to_str());
             tracing::debug!(
-                resource = %shown(&meta.url),
+                key = key.unwrap_or_default(),
                 "the cached body is not the one its metadata was written for; the entry is ignored"
             );
             return None;
@@ -301,6 +303,37 @@ mod tests {
         assert_eq!((&data[..], meta.sha256), (&b"old"[..], None));
         // which is not to hold a body by its digest
         assert!(!c.holds(&digest_of(b"old")));
+    }
+
+    /// The digest is the lower-case hex that `store` writes. What stands in
+    /// its place in any other form is not the digest of the body, and the two
+    /// files are no entry then; `null` is a cache from before the digest.
+    #[test]
+    fn a_digest_in_any_other_form_is_not_the_bodys() {
+        let root = tempfile::tempdir().unwrap();
+        let c = CacheDir::for_url(root.path(), "https://example.com/a.list");
+        let mut meta = Meta::default();
+        c.store(b"hello", &mut meta).unwrap();
+        let digest = meta.sha256.clone().unwrap();
+        let write = |sha256: &str| {
+            let json = format!(
+                r#"{{"url":"","etag":null,"last_modified":null,"fetched_at":0,"sha256":{sha256}}}"#
+            );
+            std::fs::write(c.path().join("meta.json"), json).unwrap();
+        };
+        write(&format!("\"{digest}\""));
+        assert!(c.load().is_some());
+        for (what, odd) in [
+            ("upper case", digest.to_uppercase()),
+            ("cut short", digest[..63].to_string()),
+            ("empty", String::new()),
+        ] {
+            write(&format!("\"{odd}\""));
+            assert!(c.load().is_none(), "{what}");
+        }
+        write("null");
+        let (data, meta) = c.load().expect("an entry");
+        assert_eq!((&data[..], meta.sha256), (&b"hello"[..], None));
     }
 
     #[test]

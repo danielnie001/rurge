@@ -5502,8 +5502,8 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             let copy = managed_text(&w.url("/managed"), "interval=60 strict=true", api, "");
             // Checked three quarters of a minute ago and due at a minute: the
             // daemon has a quarter of a minute to come up and serve a session
-            // before the update is owed. The update is made up to a tenth of
-            // the interval after that.
+            // before the update is owed. The update is made later than that
+            // by up to a tenth of the time that was left: a second and a half.
             w.seed("/managed", &copy, Duration::from_secs(45));
             w.served.set("/managed", copy);
             w.served.set_status("/managed", 500);

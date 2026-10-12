@@ -2710,6 +2710,59 @@ mod tests {
         unchanged("the whole entry of another writer").await;
     }
 
+    /// A server that cannot say whether a body changed sends the whole body
+    /// every time. The body in hand, sent again, is a check that found nothing
+    /// new, and it is written as one: the metadata alone when the disk holds
+    /// that body, intact, and the body with it when it does not.
+    #[tokio::test]
+    async fn a_body_sent_again_is_written_only_when_the_disk_does_not_hold_it() {
+        let root = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/w", "whiskey");
+        server.set_validators("/w", false);
+        let url = server.url("/w");
+        let key = resource_key(&ResourceSource::Url(url.clone()));
+        let mgr = manager(root.path(), fast());
+        let h = mgr.get(&url_spec(url.clone(), None));
+        wait_for(&h, "v1", |s| available_version(s) == Some(1)).await;
+        let dir = cache_of(root.path(), &url);
+        let file = dir.path().join("data");
+        let (_, written) = dir.load().expect("a cache");
+        assert_eq!((&written.etag, &written.last_modified), (&None, &None));
+        // one more request, which has no validator to carry, and its answer
+        // of the same body
+        let again = async |what: &str| {
+            let asked = server.requests().len();
+            assert_eq!(mgr.update_now(&key).await, Some(Ok(())), "{what}");
+            let reqs = server.requests();
+            assert_eq!(reqs.len(), asked + 1, "{what}");
+            assert!(reqs[asked].header("if-none-match").is_none(), "{what}");
+            assert_eq!(h.version(), 1, "{what}");
+            let (data, meta) = dir.load().unwrap_or_else(|| panic!("no cache: {what}"));
+            assert_eq!(&data[..], b"whiskey", "{what}");
+            assert_eq!(meta.sha256, written.sha256, "{what}");
+            assert!(meta.fetched_time() > written.fetched_time(), "{what}");
+        };
+
+        // intact: the body is not written again, which its time shows
+        let long_ago = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        again("an intact cache").await;
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            long_ago
+        );
+
+        std::fs::write(&file, "whis").unwrap();
+        assert!(dir.load().is_none());
+        again("a body cut short").await;
+    }
+
     /// A cache from before the digest was kept is taken as it is, and gets
     /// its digest with the first answer that says the body has not changed.
     #[tokio::test]

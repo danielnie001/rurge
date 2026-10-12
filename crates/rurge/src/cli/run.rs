@@ -668,8 +668,10 @@ fn follow_the_sources(sources: &ProfileSources, engine: &Engine) {
         }
         Ask::Accept => {
             engine.suspend(None);
-            // An update that worked is one way out; a profile that no longer
-            // requires one is the other, and nothing was updated then.
+            // An update that worked is one way out. The others update
+            // nothing: a profile that no longer requires one, a clock that
+            // was set back to before the last check, and a local file whose
+            // time cannot be read when no check is on record.
             tracing::info!("managed profile: new sessions are accepted again");
         }
     }
@@ -970,8 +972,10 @@ fn wait_for_the_sources(
         // own write of the same entry: the two go through the same temporary
         // file, and the body can end up with parts of both. It does not match
         // the digest that is kept beside it then, which makes the two files
-        // no entry: whoever reads the disk finds none, and the next answer of
-        // the server writes the body again, whatever it says.
+        // no entry: whoever reads the disk finds none, and the next request
+        // of the main runtime that succeeds writes the body again, whether
+        // the server sends one or says that nothing has changed. A request
+        // that fails writes nothing.
         runtime.shutdown_timeout(Duration::from_secs(2));
         done
     };
