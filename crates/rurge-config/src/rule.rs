@@ -1159,6 +1159,26 @@ mod tests {
         );
     }
 
+    /// A single address is a host route (manual, IP Rules): `IP-CIDR` reads it
+    /// as `/32` and `IP-CIDR6` as `/128`.
+    #[test]
+    fn a_single_address_is_a_host_route() {
+        let host4 = match parse("IP-CIDR,8.8.8.8,Proxy").unwrap().kind {
+            RuleKind::IpCidr(net) => net,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(host4.prefix_len(), 32);
+        assert!(host4.contains(&"8.8.8.8".parse::<Ipv4Addr>().unwrap()));
+        assert!(!host4.contains(&"8.8.8.9".parse::<Ipv4Addr>().unwrap()));
+        let host6 = match parse("IP-CIDR6,2404:6800::,DIRECT").unwrap().kind {
+            RuleKind::IpCidr6(net) => net,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(host6.prefix_len(), 128);
+        assert!(host6.contains(&"2404:6800::".parse::<Ipv6Addr>().unwrap()));
+        assert!(!host6.contains(&"2404:6800::1".parse::<Ipv6Addr>().unwrap()));
+    }
+
     #[test]
     fn subrule_unknown_flags_are_collected() {
         let r = parse("AND,((DOMAIN,a,bogus,no-resolve),(DOMAIN,b)),P").unwrap();
