@@ -296,6 +296,58 @@ mod tests {
         assert!(lan.skipped.is_empty());
     }
 
+    /// The two built-in sets are the lists the manual gives (Rule Sets,
+    /// Internal Rule Sets), line for line: a line changed or dropped from one
+    /// changes what `RULE-SET,SYSTEM` and `RULE-SET,LAN` send where.
+    #[test]
+    fn the_built_in_sets_are_the_lists_the_manual_gives() {
+        let lines = |set| internal_set_text(set).lines().collect::<Vec<_>>();
+        assert_eq!(
+            lines(InternalSet::System),
+            [
+                "DOMAIN,api.smoot.apple.com",
+                "DOMAIN,captive.apple.com",
+                "DOMAIN,xp.apple.com",
+                "DOMAIN,configuration.apple.com",
+                "DOMAIN,guzzoni.apple.com",
+                "DOMAIN,smp-device-content.apple.com",
+                "DOMAIN,aod.itunes.apple.com",
+                "DOMAIN,mesu.apple.com",
+                "DOMAIN,api.smoot.apple.cn",
+                "DOMAIN,gs-loc.apple.com",
+                "DOMAIN,mvod.itunes.apple.com",
+                "DOMAIN,streamingaudio.itunes.apple.com",
+                "DOMAIN-SUFFIX,ess.apple.com",
+                "DOMAIN-SUFFIX,push-apple.com.akadns.net",
+                "DOMAIN-SUFFIX,push.apple.com",
+                "DOMAIN-SUFFIX,lcdn-locator.apple.com",
+                "DOMAIN-SUFFIX,lcdn-registration.apple.com",
+                "DOMAIN-SUFFIX,ls.apple.com",
+                "PROCESS-NAME,trustd",
+                "PROCESS-NAME,netbiosd",
+            ]
+        );
+        assert_eq!(
+            lines(InternalSet::Lan),
+            [
+                "DOMAIN-SUFFIX,local",
+                "IP-CIDR,0.0.0.0/8",
+                "IP-CIDR,10.0.0.0/8",
+                "IP-CIDR,100.64.0.0/10",
+                "IP-CIDR,127.0.0.0/8",
+                "IP-CIDR,169.254.0.0/16",
+                "IP-CIDR,172.16.0.0/12",
+                "IP-CIDR,192.0.0.0/24",
+                "IP-CIDR,192.0.2.0/24",
+                "IP-CIDR,192.168.0.0/16",
+                "IP-CIDR,224.0.0.0/4",
+                "IP-CIDR6,::1/128",
+                "IP-CIDR6,fc00::/7",
+                "IP-CIDR6,fe80::/10",
+            ]
+        );
+    }
+
     /// The sub-rules of a parsed set; every line of it must be a rule line.
     fn rules(p: &ParsedSet) -> Vec<&SubRule> {
         p.lines
