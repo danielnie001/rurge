@@ -1582,6 +1582,32 @@ mod tests {
         assert_eq!(min_ttl(&v4_only), Duration::from_secs(120));
     }
 
+    /// A resolver that is told nothing about its cache keeps 2000 names
+    /// (manual, DNS Overview: the macOS figure), the least recently used
+    /// going first.
+    #[tokio::test(start_paused = true)]
+    async fn by_default_the_cache_holds_two_thousand_names() {
+        let e = env(&profile("", ""));
+        let capacity = ResolverConfig::from_config(&e.cfg).cache_capacity;
+        assert_eq!(capacity, 2000);
+        let cache = DnsCache::new(capacity);
+        for i in 0..=capacity {
+            cache.put(
+                &format!("h{i}.test"),
+                CachedAddrs {
+                    v4: vec![v4("10.0.0.1")],
+                    v6: Vec::new(),
+                    ttl: Duration::from_secs(60),
+                    v6_queried: false,
+                    source: "udp://192.0.2.1:53".to_string(),
+                },
+            );
+        }
+        assert_eq!(cache.len(), 2000);
+        assert!(cache.get("h0.test").is_none(), "the oldest went");
+        assert!(cache.get("h2000.test").is_some());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn cache_fresh_stale_negative_and_coalescing() {
         let mock = MockDns::spawn().await;
