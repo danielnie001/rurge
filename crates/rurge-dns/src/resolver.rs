@@ -1557,6 +1557,31 @@ mod tests {
         assert_eq!(system.query_count("nas.home.lan", Qtype::A), 1);
     }
 
+    /// The cache keeps an answer for the smallest TTL among its records, the
+    /// A ones and the AAAA ones together (manual, DNS Overview).
+    #[test]
+    fn an_answer_is_cached_for_the_smallest_ttl_of_its_records() {
+        let answers = Answers {
+            v4: vec![(v4("10.0.0.1"), 300), (v4("10.0.0.2"), 120)],
+            v6: vec![
+                ("fd00::1".parse().unwrap(), 60),
+                ("fd00::2".parse().unwrap(), 900),
+            ],
+            upstream: "udp://192.0.2.1:53".to_string(),
+            ..Answers::default()
+        };
+        assert_eq!(min_ttl(&answers), Duration::from_secs(60));
+        assert_eq!(cached_from(&answers, true).ttl, Duration::from_secs(60));
+        let source = Source::Upstream(answers.upstream.clone());
+        let result = from_answers(&answers, source, Instant::now());
+        assert_eq!(result.ttl, Duration::from_secs(60));
+        let v4_only = Answers {
+            v6: Vec::new(),
+            ..answers
+        };
+        assert_eq!(min_ttl(&v4_only), Duration::from_secs(120));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn cache_fresh_stale_negative_and_coalescing() {
         let mock = MockDns::spawn().await;
