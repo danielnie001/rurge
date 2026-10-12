@@ -1040,6 +1040,63 @@ mod tests {
         }
     }
 
+    /// The nine parameters the manual lists for rule lines, each read into the
+    /// field of its own, whatever the case of its name; a name nobody knows is
+    /// kept apart, in the order written.
+    #[test]
+    fn every_rule_parameter_the_manual_lists_is_read_into_its_own_field() {
+        let params = |extra: &str| {
+            parse(&format!("DOMAIN,a.example,DIRECT,{extra}"))
+                .unwrap_or_else(|e| panic!("{extra}: {}", e.message))
+                .params
+        };
+        let only = |change: fn(&mut RuleParams)| {
+            let mut p = RuleParams::default();
+            change(&mut p);
+            p
+        };
+        assert_eq!(params("no-resolve"), only(|p| p.no_resolve = true));
+        assert_eq!(params("No-Resolve"), only(|p| p.no_resolve = true));
+        assert_eq!(params("dns-failed"), only(|p| p.dns_failed = true));
+        assert_eq!(
+            params("extended-matching"),
+            only(|p| p.extended_matching = true)
+        );
+        assert_eq!(
+            parse("DOMAIN,a.example,REJECT,pre-matching")
+                .unwrap()
+                .params,
+            only(|p| p.pre_matching = true)
+        );
+        assert_eq!(
+            params("requires-resolve"),
+            only(|p| p.requires_resolve = true)
+        );
+        assert_eq!(
+            params("notification-text=Example matched"),
+            only(|p| p.notification_text = Some("Example matched".into()))
+        );
+        assert_eq!(
+            params("notification-interval=600"),
+            only(|p| p.notification_interval = Some(600))
+        );
+        assert_eq!(
+            params("update-interval=43200"),
+            only(|p| p.update_interval = Some(43200))
+        );
+        assert_eq!(
+            params("update-interval=-1"),
+            only(|p| p.update_interval = Some(-1))
+        );
+        assert_eq!(
+            params("always-capture=debug-1"),
+            only(|p| p.always_capture = Some("debug-1".into()))
+        );
+        let mixed = params("bogus,no-resolve,other=1");
+        assert!(mixed.no_resolve);
+        assert_eq!(mixed.unknown, ["bogus", "other=1"]);
+    }
+
     #[test]
     fn errors() {
         let code = |raw: &str| parse(raw).unwrap_err().code;
