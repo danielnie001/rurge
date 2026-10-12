@@ -2837,6 +2837,100 @@ mod run {
         }
     }
 
+    /// The API is served where the profile configures it and nowhere else: the
+    /// daemon of a profile without `http-api` starts none, and does not say
+    /// `api on …` as the one of a profile with it does.
+    #[test]
+    fn the_api_is_served_only_where_the_profile_configures_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let without = "http-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nloglevel = warning";
+        for (i, (general, served)) in [(without, false), (API_GENERAL, true)]
+            .into_iter()
+            .enumerate()
+        {
+            let case = dir.path().join(format!("case{i}"));
+            std::fs::create_dir_all(&case).unwrap();
+            let conf = write_conf(&case, general);
+            let said = output_until_it_is_running(rurge_run(&conf, &case.join("data")));
+            let api = said.iter().find(|line| line.starts_with("api on "));
+            assert_eq!(api.is_some(), served, "{said:#?}");
+            if let Some(line) = api {
+                assert!(line.starts_with("api on http://127.0.0.1:"), "{line}");
+            }
+        }
+    }
+
+    /// The log file is rolled daily and seven files are kept: the file the
+    /// daemon writes is named for the day (`rurge.log.2026-10-13`), and the
+    /// files that were there already go, oldest first, until with the new one
+    /// seven are left.
+    #[test]
+    fn the_log_file_is_rolled_daily_and_seven_files_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(
+            dir.path(),
+            "http-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nloglevel = notify",
+        );
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        // nine files of earlier days, made in the order of their days
+        for day in 1..=9 {
+            std::fs::write(logs.join(format!("rurge.log.2020-01-0{day}")), "a day\n").unwrap();
+        }
+        let mut cmd = rurge_run(&conf, &dir.path().join("data"));
+        cmd.arg("--log-file").arg(logs.join("rurge.log"));
+        let daemon = spawn_command(cmd);
+        let names = || -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(&logs)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("rurge.log"))
+                .collect();
+            names.sort();
+            names
+        };
+        wait_until("the startup line in the file of the day", || {
+            names()
+                .iter()
+                .filter(|name| !name.starts_with("rurge.log.2020-"))
+                .any(|name| {
+                    std::fs::read_to_string(logs.join(name))
+                        .map(|text| text.contains("rurge running"))
+                        .unwrap_or(false)
+                })
+        });
+        let names = names();
+        let today = names
+            .iter()
+            .find(|name| !name.starts_with("rurge.log.2020-"))
+            .expect("the file of the day");
+        let date = today.strip_prefix("rurge.log.").expect("a dated name");
+        assert!(
+            date.len() == 10
+                && date.bytes().enumerate().all(|(i, b)| if i == 4 || i == 7 {
+                    b == b'-'
+                } else {
+                    b.is_ascii_digit()
+                }),
+            "{today}"
+        );
+        // which of the old ones go is the appender's to say (it goes by when
+        // the files were made); that seven are left is ours
+        let old: Vec<String> = (1..=9)
+            .map(|day| format!("rurge.log.2020-01-0{day}"))
+            .collect();
+        assert_eq!(names.len(), 7, "{names:?}");
+        assert!(
+            names
+                .iter()
+                .filter(|name| *name != today)
+                .all(|name| old.contains(name)),
+            "{names:?}"
+        );
+        drop(daemon);
+    }
+
     /// How many finished requests the log keeps is what `--request-log-size`
     /// or `RURGE_REQUEST_LOG_SIZE` says; without either it keeps more than the
     /// three of this test.
