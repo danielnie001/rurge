@@ -707,6 +707,21 @@ https://user:S3CR3T@example.com/list
         let p = parse_set(SetKind::RuleSet, text, &ctx_with(&names));
         assert_eq!(p.skipped_total, 3);
         assert_eq!((p.unknown_params, p.first_unknown), (0, None));
+        // so is a line that names a file of this machine in a text that was
+        // downloaded: it is refused, whatever else it carries
+        let downloaded = ParseCtx {
+            reach: Reach::Nowhere,
+            ..ctx_with(&names)
+        };
+        let p = parse_set(
+            SetKind::RuleSet,
+            "RULE-SET,./local.list,bogus\n",
+            &downloaded,
+        );
+        assert_eq!(p.skipped_total, 1);
+        assert_eq!((p.unknown_params, p.first_unknown), (0, None));
+        // the user's own text may name it, and then the parameter is what is lost
+        assert_eq!(unknown_in("RULE-SET,./local.list,bogus\n"), (1, Some(1)));
     }
 
     #[test]

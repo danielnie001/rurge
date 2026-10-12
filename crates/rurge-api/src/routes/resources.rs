@@ -144,3 +144,34 @@ pub async fn update(
     }
     Ok(Json(Value::Object(out)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each of the three numbers of a set goes out under its own name.
+    #[test]
+    fn the_three_numbers_of_a_set_go_out_under_their_own_names() {
+        let resource = ExternalResource {
+            path: "http://sets.example/a.list".to_string(),
+            kind: "ruleset",
+            key: "k".to_string(),
+            local: false,
+            ready: true,
+            updated_at: Some(1),
+            updating: false,
+            error: None,
+            suspended: false,
+            unused: Some(UnusedLines {
+                skipped: 1,
+                truncated: 2,
+                unknown_params: 3,
+            }),
+        };
+        let json = serde_json::to_value(ResourceJson::from(resource)).unwrap();
+        assert_eq!(
+            (&json["skipped"], &json["truncated"], &json["unknownParams"]),
+            (&Value::from(1), &Value::from(2), &Value::from(3))
+        );
+    }
+}

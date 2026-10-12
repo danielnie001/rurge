@@ -1193,7 +1193,10 @@ fn set_version(engine: &Engine, key: &str) -> u64 {
 
 /// The server gives `body` for the set at `/sets/a.list` from now on. Returns
 /// once the generation has downloaded it and compiled it as the `version` of
-/// the set read from the resource `key`.
+/// the set read from the resource `key`. What the registry has to say of that
+/// load is in the log by then: it writes its warning before it stores the
+/// set, so a caller that counts the warnings next has nothing more to wait
+/// for.
 async fn serve_the_set_anew(w: &World, engine: &Engine, key: &str, body: &str, version: u64) {
     w.server.set("/sets/a.list", body.to_string());
     let answer = engine

@@ -156,9 +156,10 @@ pub struct SetRegistry {
     /// never ask for it: a set that names another compiles that one inside
     /// itself, on the same thread, under the lock its own compile holds.
     compile_lock: Arc<tokio::sync::Mutex<()>>,
-    /// How many stretches of parsing and compiling are going on, and the most
-    /// there have been at once: what the tests ask to know that the sets of a
-    /// registry are compiled one at a time.
+    /// How many stretches of parsing and compiling are going on, the most
+    /// there have been at once and how many have begun: what the tests ask to
+    /// know that the sets of a registry are compiled one at a time, and a
+    /// version once.
     #[cfg(test)]
     compiling: Compiling,
     self_weak: Mutex<Weak<SetRegistry>>,
@@ -170,6 +171,7 @@ pub struct SetRegistry {
 struct Compiling {
     now: AtomicUsize,
     most: AtomicUsize,
+    begun: AtomicUsize,
 }
 
 /// One stretch of compiling, counted for as long as it lives.
@@ -181,6 +183,7 @@ impl Compiling {
     fn begin(&self) -> Stretch<'_> {
         let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
         self.most.fetch_max(now, Ordering::SeqCst);
+        self.begun.fetch_add(1, Ordering::SeqCst);
         Stretch(self)
     }
 }
@@ -296,6 +299,7 @@ impl SetRegistry {
         // Nobody else has the registry yet, so this is free. The reload tasks
         // the sets below start wait for it until everything is created.
         let turn = reg.compile_lock.try_lock().ok();
+        debug_assert!(turn.is_some(), "a registry nobody has yet is at no compile");
         #[cfg(test)]
         let stretch = reg.compiling.begin();
         // Pre-create everything the profile uses so statuses are complete and
@@ -396,6 +400,13 @@ impl SetRegistry {
     #[cfg(test)]
     fn most_compiling_at_once(&self) -> usize {
         self.compiling.most.load(Ordering::SeqCst)
+    }
+
+    /// How many stretches of parsing and compiling have begun so far, the one
+    /// of the build among them.
+    #[cfg(test)]
+    fn stretches_begun(&self) -> usize {
+        self.compiling.begun.load(Ordering::SeqCst)
     }
 
     /// Returns the (possibly still compiling) handle for a reference, creating
@@ -735,9 +746,12 @@ impl SetRegistry {
                 // pushed on its stack to the end, as it has to.
                 let _turn = compile_lock.lock().await;
                 let Some(reg) = weak.upgrade() else { return };
-                let (data, version) = match resource.current() {
-                    ResourceState::Available { data, version, .. } => (data, version),
-                    _ => continue,
+                // What the manager holds, also after an attempt that failed:
+                // a version that was followed by one while this task waited
+                // is the copy the failed state keeps, and nothing would
+                // announce it a second time.
+                let Some((data, version)) = resource.current().data() else {
+                    continue;
                 };
                 let name = key.display();
                 let handle = reg.handle_of(&key, kind);
@@ -2002,8 +2016,11 @@ ignored: the same resource is used as a RULE-SET",
 
     /// How many lines the sets of the tests that compile one at a time have:
     /// enough for a stretch of parsing and compiling to last for long beside
-    /// the few milliseconds that a download of the other set takes.
-    const MANY: usize = 300_000;
+    /// the few milliseconds that a download of the other set takes, and few
+    /// enough for two of them in a row to be done long before the tests give
+    /// up waiting, on a machine several times slower than the one they were
+    /// written on.
+    const MANY: usize = 100_000;
 
     /// A rule set of `n` lines, with names no other set of the tests has.
     fn many_lines(prefix: &str, n: usize) -> String {
@@ -2089,6 +2106,166 @@ ignored: the same resource is used as a RULE-SET",
         assert_eq!(reg.most_compiling_at_once(), 1);
         assert_eq!(set_a.load().entry_count(), 1);
         assert_eq!(set_big.load().entry_count(), MANY);
+    }
+
+    const ONE: &str = "DOMAIN,one.example\n";
+    const TWO: &str = "DOMAIN,one.example\nDOMAIN,two.example\n";
+    const THREE: &str = "DOMAIN,one.example\nDOMAIN,two.example\nDOMAIN,three.example\n";
+
+    /// A registry with one rule set, served at `/a.list` with `ONE` in it and
+    /// loaded: the registry, its manager, the set and the URL of the set.
+    async fn one_set_loaded(
+        server: &TestServer,
+        dir: &Path,
+    ) -> (Arc<SetRegistry>, Arc<ResourceManager>, SetHandle, Url) {
+        server.set("/a.list", ONE);
+        let url = server.url("/a.list");
+        let cfg = load(
+            &format!("[Proxy]\nP = direct\n[Rule]\nRULE-SET,{url},P\nFINAL,DIRECT\n"),
+            dir,
+        );
+        let mgr = manager(dir);
+        let (reg, _) = SetRegistry::build(&cfg, mgr.clone(), dir);
+        let set = reg.get(&ResourceRef::Url(url.to_string()), SetKind::RuleSet);
+        wait_version(&set, 1).await;
+        compiling_ends(&reg).await;
+        (reg, mgr, set, url)
+    }
+
+    /// The server gives `body` at `/a.list` from now on, and the manager is
+    /// asked for it. Returns once the manager holds it as this `version`.
+    async fn served_anew(
+        server: &TestServer,
+        mgr: &ResourceManager,
+        url: &Url,
+        body: &'static str,
+        version: u64,
+    ) {
+        server.set("/a.list", body);
+        assert!(mgr.force_update(&ResourceSource::Url(url.clone())));
+        holds(mgr, url, version, "available").await;
+    }
+
+    /// The manager holds this version of the resource at `url`, in this state.
+    async fn holds(mgr: &ResourceManager, url: &Url, version: u64, state: &str) {
+        let key = resource_key(&ResourceSource::Url(url.clone()));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let held = mgr.statuses().into_iter().find(|s| s.key == key);
+                if held.is_some_and(|s| s.version == version && s.state == state) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the manager did not get there");
+    }
+
+    /// A version that is followed by a failed attempt before the set has had
+    /// its turn was announced once, and is the copy a failed resource keeps
+    /// from then on: the set is compiled from it all the same.
+    #[tokio::test]
+    async fn a_version_followed_by_a_failed_attempt_before_the_turn_of_the_set_is_compiled() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        let (reg, mgr, set, url) = one_set_loaded(&server, dir.path()).await;
+        // the turn of the set does not come while the test has it
+        let turn = reg.compile_lock.lock().await;
+        served_anew(&server, &mgr, &url, TWO, 2).await;
+        server.set_status("/a.list", 500);
+        assert!(mgr.force_update(&ResourceSource::Url(url.clone())));
+        holds(&mgr, &url, 2, "failed").await;
+        assert_eq!(set.version(), 1);
+        drop(turn);
+        wait_version(&set, 2).await;
+        assert_eq!(set.load().entry_count(), 2);
+    }
+
+    /// Two versions that arrive while a set waits for its turn are one
+    /// compile, of the later one: the resource is read when the turn comes,
+    /// and the version that was replaced meanwhile is never compiled.
+    #[tokio::test]
+    async fn a_version_that_is_replaced_before_the_turn_of_the_set_is_never_compiled() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        let (reg, mgr, set, url) = one_set_loaded(&server, dir.path()).await;
+        let begun = reg.stretches_begun();
+        let turn = reg.compile_lock.lock().await;
+        served_anew(&server, &mgr, &url, TWO, 2).await;
+        served_anew(&server, &mgr, &url, THREE, 3).await;
+        assert_eq!(set.version(), 1);
+        drop(turn);
+        wait_version(&set, 3).await;
+        compiling_ends(&reg).await;
+        assert_eq!(reg.stretches_begun(), begun + 1);
+        assert_eq!(set.load().entry_count(), 3);
+    }
+
+    /// The reload task of a set that waits for its turn has the lock and not
+    /// the registry: a registry that was replaced goes away at once, and the
+    /// task ends when its turn comes.
+    #[tokio::test]
+    async fn a_set_that_waits_for_its_turn_does_not_keep_a_registry_that_was_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        let (reg, mgr, _set, url) = one_set_loaded(&server, dir.path()).await;
+        let lock = reg.compile_lock.clone();
+        let registry = Arc::downgrade(&reg);
+        let turn = lock.lock().await;
+        served_anew(&server, &mgr, &url, TWO, 2).await;
+        // the task has been told of the version: it gets the time to come to
+        // where it waits, whatever it does on the way
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        drop(reg);
+        assert!(
+            registry.upgrade().is_none(),
+            "kept by a task that waits for its turn"
+        );
+        drop(turn);
+        // the task finds no registry and ends: the test alone has the lock
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while Arc::strong_count(&lock) != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the task did not end");
+    }
+
+    /// The three numbers keep their places from the parser to the status.
+    #[tokio::test]
+    async fn the_three_numbers_keep_their_places_from_the_parser_to_the_status() {
+        let parsed = ParsedSet {
+            skipped_total: 1,
+            truncated: 2,
+            unknown_params: 3,
+            ..ParsedSet::default()
+        };
+        assert_eq!(Unused::of(&parsed), found(1, 2, 3));
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.list"), ONE).unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,a.list,P\nFINAL,DIRECT\n",
+            dir.path(),
+        );
+        let (reg, _) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        for entry in reg.entries.lock().unwrap().values_mut() {
+            entry.unused = Some(found(1, 2, 3));
+        }
+        let statuses = reg.statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(
+            (
+                statuses[0].skipped,
+                statuses[0].truncated,
+                statuses[0].unknown_params
+            ),
+            (1, 2, 3)
+        );
     }
 
     /// A rule set whose lines carry a parameter nobody knows: line 3 is the

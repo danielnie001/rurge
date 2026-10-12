@@ -51,7 +51,11 @@ pub struct ExternalResource {
     /// The engine refuses sessions on account of this resource.
     pub suspended: bool,
     /// What the last load of the file could not use. Only a rule set and a
-    /// domain set have it, which are read line by line.
+    /// domain set have it, which are read line by line. The numbers are those
+    /// of the content the set was last compiled from: after an update they
+    /// stay those of the content before it until the set has had its turn
+    /// (the sets of a generation are compiled one at a time), and a set that
+    /// has never been compiled says none.
     pub unused: Option<UnusedLines>,
 }
 
