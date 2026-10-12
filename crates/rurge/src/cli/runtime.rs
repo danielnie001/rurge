@@ -112,8 +112,9 @@ impl Runtime {
 }
 
 /// Builds resources → set registry → GeoIP → resolver, then waits up to
-/// `wait` for the first fetch of every resource (skipped in `--no-network` mode).
-/// Delegates to `rurge_engine::stack::build_stack`.
+/// `wait` for the first fetch of every resource, and after that for what
+/// arrived to be applied (skipped in `--no-network` mode). Delegates to
+/// `rurge_engine::stack::build_stack`.
 pub async fn build_stack(cfg: &Config, rt: &Runtime, wait: Duration) -> anyhow::Result<Stack> {
     rurge_engine::stack::build_stack(cfg, &rt.stack_options(wait)).await
 }

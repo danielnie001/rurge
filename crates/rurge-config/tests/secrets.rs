@@ -857,6 +857,41 @@ fn a_line_in_the_wrong_section_is_neither_quoted_nor_kept() {
     assert_eq!(found, Vec::<String>::new());
 }
 
+/// What stands where the parameters of a rule stand and is none — a field of
+/// another kind of line, a `name=value` nobody knows — is not quoted by the
+/// warning about it: only a name that is written like a parameter is. The
+/// line itself stays what the views of the rules show: a rule is shown as it
+/// is written, with only the user name and password of a link left out.
+#[test]
+fn what_stands_among_the_parameters_of_a_rule_is_not_quoted() {
+    let text = format!(
+        "[Rule]\nDOMAIN,a.example,DIRECT,{MARKER}-flag\nDOMAIN,b.example,DIRECT,token={MARKER}-value\nAND,((DOMAIN,c.example,{MARKER}-sub),(DEST-PORT,443)),DIRECT\nRULE-SET,Mine,DIRECT\nFINAL,DIRECT\n[Ruleset Mine]\nDOMAIN,d.example,{MARKER}-policy\n"
+    );
+    let loaded = load(&text);
+    assert!(!loaded.diagnostics.has_errors());
+    let said: Vec<&str> = loaded
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == rurge_config::codes::W_UNKNOWN_RULE_PARAM)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(
+        said,
+        [
+            "unknown [Ruleset Mine] parameter ignored",
+            "unknown rule parameter ignored",
+            "unknown rule parameter `token` ignored",
+            "unknown sub-rule parameter ignored",
+        ]
+    );
+    let messages: Vec<String> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| d.message.to_ascii_uppercase())
+        .collect();
+    assert_eq!(leaks(&messages.join("\n")), Vec::<String>::new());
+}
+
 /// A header the section parser does not take for one hands every line below
 /// it to the section above. Under `[General]` the "key" of such a line is a
 /// policy's name, or, when the `=` after the name is missing or the line is a

@@ -80,7 +80,7 @@ pub struct MatchArgs {
     /// Make every DNS lookup fail (exercise dns-failed)
     #[arg(long)]
     pub no_dns: bool,
-    /// Seconds to wait for external resources to download
+    /// Seconds to wait for external resources to download, and at most as long again for sets that arrived to be compiled
     #[arg(long, default_value = "30")]
     pub wait: u64,
     /// Print every evaluated rule

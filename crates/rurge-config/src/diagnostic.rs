@@ -227,7 +227,8 @@ pub mod codes {
     pub const W_DUPLICATE_FINAL: &str = "W0021";
     /// Something the profile names by a URL has no data yet (never downloaded,
     /// or failed without a cache): a set, the text of a remote include, a
-    /// managed profile.
+    /// managed profile. Also said of sets whose data arrived and was not
+    /// compiled yet when a command stopped waiting for them.
     pub const W_RESOURCE_UNAVAILABLE: &str = "W0022";
     /// A set file or a `policy-path` subscription contained lines that were
     /// skipped, or a group had to leave a member out.
@@ -353,7 +354,9 @@ pub mod codes {
             }
             W_UNKNOWN_KEY => "check the spelling against the Surge manual, or remove it",
             W_UNKNOWN_SECTION => "check the section name's spelling against the Surge manual",
-            W_UNKNOWN_RULE_PARAM => "check the parameter's spelling against the Surge manual",
+            W_UNKNOWN_RULE_PARAM => {
+                "check the parameter's spelling and its value against the Surge manual"
+            }
             W_INVALID_HOST_LIST_ENTRY => "correct or remove the entry",
             W_VANISHED_KEY => "remove it",
             W_UNKNOWN_DIRECTIVE => "check the directive's spelling against the Surge manual",

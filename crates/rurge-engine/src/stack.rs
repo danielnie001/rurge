@@ -2,7 +2,7 @@
 //! resource manager → set registry → GeoIP → resolver. `rurge run`,
 //! `rule match` and `dns lookup` all build it here.
 
-use rurge_config::{Config, Diagnostics};
+use rurge_config::{Config, Diagnostic, Diagnostics, codes};
 use rurge_dns::system::SystemDns;
 use rurge_dns::{Resolver, ResolverConfig, ResolverDeps};
 use rurge_net::connector::{Connector, DirectConnector, SystemResolve};
@@ -21,7 +21,8 @@ pub struct StackOptions {
     /// Platform DNS facts (the bin injects `rurge-platform`; tests use `StaticSystemDns`).
     pub system: Arc<dyn SystemDns>,
     /// Wait this long for the first fetch of every external resource (zero = don't wait),
-    /// and after it as long again at most for the sets that arrived to be compiled.
+    /// and after it for what arrived to be applied: two seconds, and up to this
+    /// long once more while sets that arrived wait to be compiled.
     pub wait: Duration,
     /// Connector for the resolver's TCP / DoT / DoH upstreams and the QUIC
     /// carriers of its DoQ / DoH3 ones; `None` = plain direct.
@@ -46,8 +47,10 @@ pub struct Stack {
 }
 
 /// Builds resources → set registry → GeoIP → resolver, then waits up to
-/// `opts.wait` for the first fetch of every resource, and for what arrived to
-/// be applied (`settle`; both skipped in `--no-network` mode).
+/// `opts.wait` for the first fetch of every resource, and after that for what
+/// arrived to be applied (`settle`, which has a time of its own; both skipped
+/// in `--no-network` mode). Sets it could not wait for are a warning among
+/// the diagnostics of the stack.
 pub async fn build_stack(cfg: &Config, opts: &StackOptions) -> anyhow::Result<Stack> {
     build_stack_with(cfg, opts, |_| {}).await
 }
@@ -107,7 +110,15 @@ pub async fn build_stack_with(
     diagnostics.extend(dns_diags);
     if !opts.no_network && !opts.wait.is_zero() {
         resources.wait_initial(opts.wait).await;
-        settle(&registry, &geo, &resources, SETTLE, opts.wait).await;
+        settle(
+            &registry,
+            &geo,
+            &resources,
+            SETTLE,
+            opts.wait,
+            &mut diagnostics,
+        )
+        .await;
     }
     Ok(Stack {
         resources,
@@ -144,13 +155,15 @@ const SETTLE: Duration = Duration::from_secs(2);
 /// has not compiled a version its resource holds: the sets of a registry are
 /// compiled one at a time, so those that arrive together take the sum of
 /// their times, and the turn of each is sure to come. When that time runs out
-/// all the same, it says how many sets it leaves behind.
+/// all the same, how many sets are left behind is a warning in `diagnostics`:
+/// whoever waits here prints those, and may have no log to print.
 async fn settle(
     registry: &SetRegistry,
     geo: &GeoDb,
     resources: &ResourceManager,
     unsettled: Duration,
     queued: Duration,
+    diagnostics: &mut Diagnostics,
 ) {
     let began = tokio::time::Instant::now();
     loop {
@@ -174,10 +187,12 @@ async fn settle(
             || ((sets_pending || geo_pending) && waited < unsettled);
         if !go_on {
             if behind > 0 {
-                tracing::warn!(
-                    sets = behind,
-                    "sets that have arrived are not compiled yet: they are used as they were until they are"
-                );
+                diagnostics.push(Diagnostic::warning(
+                    codes::W_RESOURCE_UNAVAILABLE,
+                    format!(
+                        "{behind} set(s) that arrived were still waiting to be compiled when the wait ended: they match as they did before, and a set that is new matches nothing"
+                    ),
+                ));
             }
             return;
         }
@@ -256,8 +271,91 @@ mod tests {
         // two sets read from one resource are two sets
         let twice = [set(Some("a"), 1), set(Some("a"), 0), set(Some("a"), 2)];
         assert_eq!(sets_behind(&twice, &held), 2);
+        // a set that compiled a version between the look at the manager and
+        // the look at the registry is ahead of what was seen, not behind
+        assert_eq!(sets_behind(&[set(Some("b"), 2)], &held), 0);
         assert_eq!(sets_behind(&[], &held), 0);
         assert_eq!(sets_behind(&late, &[]), 0);
+    }
+
+    /// Sets that stay behind: `settle` gives them the time it was told to
+    /// give them and no more, and then says how many there are, in the
+    /// diagnostics. Everything is made where no runtime is, so no task
+    /// fetches the resource and no task follows the set: the content is
+    /// handed to the manager, and the set never compiles it.
+    #[test]
+    fn sets_that_stay_behind_are_said_when_their_time_is_over() {
+        const QUEUED: Duration = Duration::from_millis(300);
+        let dir = tempfile::tempdir().unwrap();
+        // nothing is ever asked of this address
+        let url = "http://127.0.0.1:1/behind.list";
+        let loaded = from_text(
+            &format!("[Proxy]\nP = direct\n[Rule]\nRULE-SET,{url},P\nFINAL,DIRECT\n"),
+            &dir.path().join("t.conf"),
+            &LoadOptions::for_tests(),
+        );
+        assert!(!loaded.diagnostics.has_errors());
+        let resources = ResourceManager::with_options(
+            dir.path().to_path_buf(),
+            resource_client().unwrap(),
+            ResourceOptions::default(),
+        );
+        let (registry, _) = SetRegistry::build(&loaded.config, resources.clone(), dir.path());
+        let (geo, _) = GeoDb::open(&dir.path().join("geoip"));
+        resources
+            .adopt(
+                &ResourceSource::Url(url.parse().unwrap()),
+                "DOMAIN,a.example\n".into(),
+            )
+            .unwrap();
+
+        let said = |diagnostics: &Diagnostics| -> Vec<(&'static str, String)> {
+            diagnostics
+                .iter()
+                .map(|d| (d.code, d.message.clone()))
+                .collect()
+        };
+        let behind = [(
+            codes::W_RESOURCE_UNAVAILABLE,
+            "1 set(s) that arrived were still waiting to be compiled when the wait ended: they match as they did before, and a set that is new matches nothing".to_string(),
+        )];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let no_time = Duration::ZERO;
+            let mut diagnostics = Diagnostics::default();
+            let began = tokio::time::Instant::now();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                settle(
+                    &registry,
+                    &geo,
+                    &resources,
+                    no_time,
+                    QUEUED,
+                    &mut diagnostics,
+                ),
+            )
+            .await
+            .expect("settle went on past the time it was given");
+            assert!(began.elapsed() >= QUEUED, "{:?}", began.elapsed());
+            assert_eq!(said(&diagnostics), behind);
+
+            // with no time for them either: at once, and said all the same
+            let mut diagnostics = Diagnostics::default();
+            settle(
+                &registry,
+                &geo,
+                &resources,
+                no_time,
+                no_time,
+                &mut diagnostics,
+            )
+            .await;
+            assert_eq!(said(&diagnostics), behind);
+        });
     }
 
     /// What has arrived is compiled when `settle` returns, however short the
@@ -293,14 +391,18 @@ mod tests {
         resources.wait_initial(Duration::from_secs(10)).await;
 
         let no_time = Duration::ZERO;
+        let mut diagnostics = Diagnostics::default();
         settle(
             &registry,
             &geo,
             &resources,
             no_time,
             Duration::from_secs(60),
+            &mut diagnostics,
         )
         .await;
+        // nothing was left behind, so nothing is said
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let key = resource_key(&ResourceSource::Url(url));
         let set = registry
             .statuses()

@@ -2568,6 +2568,17 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
             rule("update-interval=S3CR3T"),
             ["unknown rule parameter `update-interval` ignored"]
         );
+        // blanks around the `=` are no part of the name
+        assert_eq!(
+            rule("mystery = S3CR3T"),
+            ["unknown rule parameter `mystery` ignored"]
+        );
+        // 32 letters are a name still
+        let longest = "a".repeat(32);
+        assert_eq!(
+            rule(&longest),
+            [format!("unknown rule parameter `{longest}` ignored")]
+        );
         // what is written like no parameter is not quoted at all
         let long = "a".repeat(33);
         for item in [
@@ -2579,9 +2590,22 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
             "no_resolve",
             "h2",
             long.as_str(),
+            // lower-case letters, and not the ASCII ones
+            "пароль",
+            "straße=S3CR3T",
         ] {
             assert_eq!(rule(item), ["unknown rule parameter ignored"], "{item}");
         }
+        // the line is all that says which item is meant then
+        let l =
+            load_text("[Rule]\nDOMAIN,b.com,DIRECT\nDOMAIN,a.com,DIRECT,S3CR3T\nFINAL,DIRECT\n");
+        let at: Vec<Option<u32>> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::W_UNKNOWN_RULE_PARAM)
+            .map(|d| d.span.as_ref().map(|s| s.line))
+            .collect();
+        assert_eq!(at, [Some(3)]);
 
         // the sub-rules of a logical rule, and the lines of an inline rule set
         let sub = |item: &str| {

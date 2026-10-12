@@ -45,7 +45,7 @@ pub struct CommonArgs {
     /// Override the profile's upstreams (dns-server / encrypted-dns-server syntax)
     #[arg(long, value_name = "SPEC")]
     pub server: Vec<String>,
-    /// Seconds to wait for external resources ([Host] rule sets) to download
+    /// Seconds to wait for external resources ([Host] rule sets) to download, and at most as long again for sets that arrived to be compiled
     #[arg(long, default_value = "30")]
     pub wait: u64,
     /// JSON output
