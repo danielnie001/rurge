@@ -1820,6 +1820,57 @@ mod tests {
         assert_eq!(tcp.query_count("a.test", Qtype::A), 1);
     }
 
+    /// Encrypted DNS checks the server's certificate unless the profile says
+    /// `encrypted-dns-skip-cert-verification = true` (manual, Encrypted DNS):
+    /// a DoT or DoH server whose certificate nobody vouches for is refused,
+    /// and answers once the check is off.
+    #[tokio::test]
+    async fn a_certificate_nobody_vouches_for_is_refused_unless_the_profile_skips_the_check() {
+        use crate::message::{Question, Rcode, build_response};
+        use rurge_net::testing::TestServer;
+        let dot = MockDns::spawn_tls().await;
+        dot.set("a.test", &["10.0.0.3"], &[], 60);
+        let doh = TestServer::spawn_tls().await;
+        let question = Question {
+            name: "a.test".to_string(),
+            qtype: Qtype::A,
+        };
+        let answer = [("10.0.0.4".parse().unwrap(), 60)];
+        doh.set(
+            "/dns-query",
+            build_response(0, &question, Rcode::NoError, &answer, false).unwrap(),
+        );
+        doh.set_header("/dns-query", "content-type", "application/dns-message");
+        let quick = FanoutOpts {
+            resend: Duration::from_millis(100),
+            attempts: 2,
+        };
+        for (server, address) in [
+            (format!("tls://{}", dot.addr()), "10.0.0.3"),
+            (doh.url("/dns-query").to_string(), "10.0.0.4"),
+        ] {
+            let system = || -> Arc<dyn SystemDns> { Arc::new(StaticSystemDns::default()) };
+            let strict = env(&profile(
+                &format!("encrypted-dns-server = {server}\nipv6 = false"),
+                "",
+            ));
+            let (r, _) = resolver_with_fanout(&strict, system(), quick.clone());
+            assert!(
+                r.lookup("a.test", LookupOpts::default()).await.is_err(),
+                "{server} is refused"
+            );
+            let lax = env(&profile(
+                &format!(
+                    "encrypted-dns-server = {server}\nencrypted-dns-skip-cert-verification = true\nipv6 = false"
+                ),
+                "",
+            ));
+            let (r, _) = resolver_with_fanout(&lax, system(), quick.clone());
+            let found = r.lookup("a.test", LookupOpts::default()).await.unwrap();
+            assert_eq!(found.v4, vec![v4(address)], "{server} answers");
+        }
+    }
+
     #[tokio::test]
     async fn network_change_keeps_the_configured_bootstrap_servers() {
         let udp = MockDns::spawn().await;
