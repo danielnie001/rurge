@@ -1097,6 +1097,24 @@ mod tests {
         assert_eq!(mixed.unknown, ["bogus", "other=1"]);
     }
 
+    /// Logical rules nest up to ten deep (manual, Logical Rules): ten load,
+    /// the eleventh does not.
+    #[test]
+    fn ten_logical_rules_inside_one_another_load_and_eleven_do_not() {
+        let nested = |levels: usize| {
+            format!(
+                "{}DOMAIN,a{},DIRECT",
+                "NOT,((".repeat(levels),
+                "))".repeat(levels)
+            )
+        };
+        assert!(parse(&nested(10)).is_ok());
+        assert_eq!(
+            parse(&nested(11)).err().map(|e| e.code),
+            Some(codes::E_NESTING_TOO_DEEP)
+        );
+    }
+
     #[test]
     fn errors() {
         let code = |raw: &str| parse(raw).unwrap_err().code;
