@@ -1530,6 +1530,33 @@ mod tests {
         assert_eq!(primary.query_count("nas.home.lan", Qtype::A), 0);
     }
 
+    /// `nas.` (manual, DNS Overview): the trailing dot is dropped and no
+    /// search domain is added, so the servers are asked for `nas` itself
+    /// where `nas` alone would have been asked for as `nas.home.lan` of the
+    /// system's servers.
+    #[tokio::test]
+    async fn a_name_with_a_trailing_dot_is_not_given_the_search_domain() {
+        let primary = MockDns::spawn().await;
+        let system = MockDns::spawn().await;
+        primary.set("nas", &["10.30.0.1"], &[], 60);
+        system.set("nas.home.lan", &["10.20.0.2"], &[], 60);
+        let e = env(&profile(&format!("dns-server = {}", primary.addr()), ""));
+        let sys = StaticSystemDns {
+            servers: vec![system.addr()],
+            search_domains: vec!["home.lan".into()],
+            ..StaticSystemDns::default()
+        };
+        let (r, _) = resolver_once(&e, sys);
+        let dotted = r.lookup("nas.", LookupOpts::default()).await.unwrap();
+        assert_eq!(dotted.v4, vec![v4("10.30.0.1")]);
+        assert_eq!(primary.query_count("nas", Qtype::A), 1);
+        assert_eq!(system.query_count("nas.home.lan", Qtype::A), 0);
+        // the same name without the dot is the search domain's
+        let bare = r.lookup("nas", LookupOpts::default()).await.unwrap();
+        assert_eq!(bare.v4, vec![v4("10.20.0.2")]);
+        assert_eq!(system.query_count("nas.home.lan", Qtype::A), 1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn cache_fresh_stale_negative_and_coalescing() {
         let mock = MockDns::spawn().await;
