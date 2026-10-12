@@ -1784,6 +1784,63 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
     );
 }
 
+/// A DNS server's TCP connection is called by the port it dials, the best
+/// that can be told of what is spoken there: 853 is DoT, 443 is DoH (manual,
+/// Protocol and Network Rules). The servers named here are not asked: the
+/// rules send them to a proxy of the test's own, which refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dns_connection_is_called_dot_at_853_and_doh_at_443() {
+    for (server, protocol, keyword, dst) in [
+        (
+            "tls://203.0.113.7",
+            ProtocolKind::Dot,
+            "DOT",
+            "203.0.113.7:853",
+        ),
+        (
+            "https://203.0.113.7/dns-query",
+            ProtocolKind::Doh,
+            "DOH",
+            "203.0.113.7:443",
+        ),
+    ] {
+        let proxy = FakeHttpProxy::spawn(HttpProxyScript {
+            refuse: Some((403, "Forbidden")),
+            ..HttpProxyScript::default()
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let rule = format!("PROTOCOL,{keyword},UpIp");
+        let profile = follow_profile(
+            server,
+            &format!("UpIp = http, 127.0.0.1, {}", proxy.addr().port()),
+            &rule,
+        );
+        let engine = engine_from_profile(dir.path(), &profile).await;
+        let asking = engine.clone();
+        let lookup = tokio::spawn(async move { lookup_outcome(&asking).await });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let seen = loop {
+            let found = internal_sessions(&engine)
+                .into_iter()
+                .find(|r| r.protocol == Some(protocol));
+            if let Some(found) = found {
+                break found;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no {keyword} session: {:?}",
+                internal_sessions(&engine)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(seen.dst, dst, "{seen:?}");
+        assert_eq!(seen.rule.as_deref(), Some(rule.as_str()), "{seen:?}");
+        assert_eq!(seen.policy.first().map(String::as_str), Some("UpIp"));
+        lookup.abort();
+    }
+}
+
 /// The hop below `Up` resolves to DIRECT, so DIRECT is what opens the socket —
 /// and the name it has to resolve locally is `Up`'s own server. That is the
 /// same loop as the one above, one hop further down.
