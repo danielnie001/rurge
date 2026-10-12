@@ -161,4 +161,26 @@ mod tests {
         assert_eq!(connect_established().status(), 200);
         assert_eq!(bad_request("nope").status(), 400);
     }
+
+    /// What answers a REJECT-TINYGIF request is one pixel, and a transparent
+    /// one: the screen and the image are 1 × 1, the graphic control extension
+    /// marks colour 0 as the transparent one, and the stream ends with the
+    /// trailer.
+    #[test]
+    fn the_tiny_gif_is_one_transparent_pixel() {
+        let gif = TINY_GIF;
+        let size = |at: usize| u16::from_le_bytes([gif[at], gif[at + 1]]);
+        assert_eq!(&gif[..6], b"GIF89a");
+        assert_eq!((size(6), size(8)), (1, 1), "logical screen");
+        assert_eq!(gif[22] & 1, 1, "the transparent colour flag");
+        assert_eq!(
+            &gif[19..22],
+            &[0x21, 0xf9, 0x04],
+            "graphic control extension"
+        );
+        assert_eq!(gif[25], 0, "colour 0 is the transparent one");
+        assert_eq!(gif[27], 0x2c, "image descriptor");
+        assert_eq!((size(32), size(34)), (1, 1), "image");
+        assert_eq!(gif[42], 0x3b, "trailer");
+    }
 }
