@@ -2,6 +2,7 @@ use crate::capabilities;
 use clap::Args;
 use rurge_config::config::{LoadOptions, Platform};
 use rurge_config::diagnostic::Severity;
+use rurge_engine::profile::disk_remote;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -23,8 +24,9 @@ pub struct CheckArgs {
     /// Override the CORE_VERSION reported to requirement expressions
     #[arg(long)]
     pub core_version: Option<u64>,
-    /// Data directory whose cached subscriptions are checked too (default:
-    /// the platform data dir); nothing is downloaded
+    /// Data directory whose cached subscriptions and downloaded profile
+    /// sources are checked too (default: the platform data dir); nothing is
+    /// downloaded
     #[arg(long, env = "RURGE_DATA_DIR", value_name = "DIR")]
     pub data_dir: Option<PathBuf>,
 }
@@ -46,6 +48,10 @@ struct Report<'a> {
 
 pub fn run(args: CheckArgs) -> anyhow::Result<ExitCode> {
     let platform = args.platform.unwrap_or_else(Platform::current);
+    let data_dir = args
+        .data_dir
+        .clone()
+        .unwrap_or_else(rurge_platform::dirs::data_dir);
     let opts = LoadOptions {
         environment: super::environment(
             platform,
@@ -53,12 +59,9 @@ pub fn run(args: CheckArgs) -> anyhow::Result<ExitCode> {
         ),
         platform,
         capabilities: capabilities::current(),
-        remote: None,
+        // what an earlier run downloaded, as the daemon reads it
+        remote: Some(disk_remote(&data_dir)),
     };
-    let data_dir = args
-        .data_dir
-        .clone()
-        .unwrap_or_else(rurge_platform::dirs::data_dir);
     let loaded = rurge_engine::check_profile(&args.config, &opts, &data_dir)?;
     let diags = loaded.diagnostics.sorted();
     let count = |s: Severity| diags.iter().filter(|d| d.severity == s).count();

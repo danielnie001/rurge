@@ -9,6 +9,7 @@ use rurge_config::config::{LoadOptions, Platform, load};
 use rurge_config::general::{DnsServer, EncryptedDns};
 use rurge_config::{Config, Diagnostics};
 use rurge_dns::{DnsError, DnsResult, LookupOpts, Resolver};
+use rurge_engine::profile::disk_remote;
 use serde_json::json;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -121,7 +122,8 @@ fn load_profile(common: &CommonArgs) -> anyhow::Result<Option<(Config, Diagnosti
         environment: super::environment(platform, capabilities::CORE_VERSION),
         platform,
         capabilities: capabilities::current(),
-        remote: None,
+        // what an earlier run downloaded, as the daemon reads it
+        remote: Some(disk_remote(&common.runtime.data_dir())),
     };
     let loaded = load(&common.config, &opts)?;
     if loaded.diagnostics.has_errors() {

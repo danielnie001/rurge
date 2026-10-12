@@ -11,6 +11,7 @@ use rurge_config::rule::PolicyRef;
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::{ListenerKind, ProcessInfo, SessionInfo, Transport};
 use rurge_config::{Diagnostics, HostName};
+use rurge_engine::profile::disk_remote;
 use rurge_rules::engine::{FixedResolve, LazyResolver, NoResolve, TraceStep};
 use rurge_rules::matcher::ResolvedAddrs;
 use rurge_rules::{Decision, OutboundMode, Outcome, RuleEngine};
@@ -200,7 +201,8 @@ fn run_match(args: MatchArgs) -> anyhow::Result<ExitCode> {
         environment: super::environment(platform, capabilities::CORE_VERSION),
         platform,
         capabilities: capabilities::current(),
-        remote: None,
+        // what an earlier run downloaded, as the daemon reads it
+        remote: Some(disk_remote(&args.runtime.data_dir())),
     };
     let loaded = load(&args.config, &opts)?;
     if loaded.diagnostics.has_errors() {

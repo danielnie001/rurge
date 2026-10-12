@@ -1201,6 +1201,63 @@ fn check_refuses_one_resource_as_two_kinds_of_set() {
         .stdout(predicate::str::contains("E0024").not());
 }
 
+/// A profile that is only the line that names its managed profile is checked
+/// as the daemon reads it: through the copy in the data directory. `check`
+/// reads that directory, and neither writes to it nor makes it.
+#[test]
+fn check_reads_the_downloaded_copy_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let link = url::Url::parse("https://sources.example/profile.conf").unwrap();
+    let data = dir.path().join("data");
+    rurge_net::testing::seed_cache(
+        &data,
+        &link,
+        b"[Rule]\nFINAL,DIRECT\n",
+        std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+    );
+    let pointer = write(&dir, "managed.conf", &format!("#!MANAGED-CONFIG {link}\n"));
+    let tree = |root: &std::path::Path| {
+        let mut found = Vec::new();
+        let mut todo = vec![root.to_path_buf()];
+        while let Some(dir) = todo.pop() {
+            for entry in fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    todo.push(path);
+                } else {
+                    found.push((path.clone(), fs::read(path).unwrap()));
+                }
+            }
+        }
+        found.sort();
+        found
+    };
+    let before = tree(&data);
+    Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(&pointer)
+        .arg("--data-dir")
+        .arg(&data)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("I0004"));
+    assert_eq!(tree(&data), before);
+    // a directory that is not there is not made, and the pointer has nothing
+    // to point at
+    let nothing = dir.path().join("nothing");
+    Command::cargo_bin("rurge")
+        .unwrap()
+        .args(["check", "-c"])
+        .arg(&pointer)
+        .arg("--data-dir")
+        .arg(&nothing)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("W0022"));
+    assert!(!nothing.exists());
+}
+
 mod rule_match {
     use assert_cmd::Command;
     use predicates::prelude::*;
@@ -1287,6 +1344,48 @@ FINAL,DIRECT,dns-failed
         assert_eq!(v["reason"], "rule");
         assert_eq!(v["matched"]["index"], 0);
         assert_eq!(v["sub_rule"]["entry"], "DOMAIN,listed.com");
+    }
+
+    /// A profile that is only the line that names its managed profile is
+    /// matched by the copy in the data directory, which the command reads
+    /// and never downloads.
+    #[test]
+    fn a_managed_profile_is_matched_by_its_downloaded_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = url::Url::parse("https://sources.example/profile.conf").unwrap();
+        let data = dir.path().join("data");
+        rurge_net::testing::seed_cache(
+            &data,
+            &link,
+            format!(
+                "#!MANAGED-CONFIG {link}\n[Proxy]\nP = direct\n[Rule]\nDOMAIN,copy.test,P\nFINAL,DIRECT\n"
+            )
+            .as_bytes(),
+            std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+        );
+        let pointer = dir.path().join("managed.conf");
+        std::fs::write(&pointer, format!("#!MANAGED-CONFIG {link}\n")).unwrap();
+        let out = Command::cargo_bin("rurge")
+            .unwrap()
+            .arg("rule")
+            .arg("match")
+            .arg("-c")
+            .arg(&pointer)
+            .arg("--no-network")
+            .arg("--data-dir")
+            .arg(&data)
+            .args(["copy.test", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["policy"], "P");
+        assert_eq!(v["matched"]["raw"], "DOMAIN,copy.test,P");
     }
 
     #[test]
@@ -1622,6 +1721,46 @@ mod dns {
             &["fixed.test", "--json"],
         ))
         .await;
+        let v = json_of(&out);
+        assert_eq!(v["addresses"], serde_json::json!(["1.2.3.4"]));
+        assert_eq!(v["source"], "host(ip)");
+        assert!(mock.queries().is_empty());
+    }
+
+    /// A profile that is only the line that names its managed profile gets
+    /// the `[Host]` entries of the copy in the data directory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_entry_of_a_managed_profiles_copy_answers_a_lookup() {
+        let mock = MockDns::spawn().await;
+        let dir = workspace();
+        let link = url::Url::parse("https://sources.example/profile.conf").unwrap();
+        rurge_net::testing::seed_cache(
+            &dir.path().join("data"),
+            &link,
+            format!(
+                "#!MANAGED-CONFIG {link}\n[Host]\nfixed.test = 1.2.3.4\n[Rule]\nFINAL,DIRECT\n"
+            )
+            .as_bytes(),
+            std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+        );
+        std::fs::write(
+            dir.path().join("t.conf"),
+            format!("#!MANAGED-CONFIG {link}\n"),
+        )
+        .unwrap();
+        let out = output(dns_cmd(
+            dir.path(),
+            "lookup",
+            &mock.addr().to_string(),
+            &["fixed.test", "--json"],
+        ))
+        .await;
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let v = json_of(&out);
         assert_eq!(v["addresses"], serde_json::json!(["1.2.3.4"]));
         assert_eq!(v["source"], "host(ip)");

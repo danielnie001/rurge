@@ -5,6 +5,7 @@ use crate::capabilities;
 use anyhow::{Context, anyhow};
 use clap::Args;
 use rurge_config::config::{LoadOptions, Platform, load};
+use rurge_engine::profile::disk_remote;
 use serde_json::{Value, json};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -31,6 +32,11 @@ pub struct ControlArgs {
     /// Evaluate the profile as if running on this platform
     #[arg(long, value_parser = super::check::parse_platform)]
     pub platform: Option<Platform>,
+    /// Data directory the profile's downloaded sources are read from: a
+    /// managed profile names its http-api in the copy kept there (default:
+    /// the platform data dir)
+    #[arg(long, env = "RURGE_DATA_DIR", value_name = "DIR")]
+    pub data_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -68,11 +74,17 @@ pub fn resolve_endpoint(args: &ControlArgs) -> anyhow::Result<(SocketAddr, Strin
         return Err(anyhow!("{NOT_CONFIGURED}"));
     };
     let platform = args.platform.unwrap_or_else(Platform::current);
+    let data_dir = args
+        .data_dir
+        .clone()
+        .unwrap_or_else(rurge_platform::dirs::data_dir);
     let opts = LoadOptions {
         environment: super::environment(platform, capabilities::CORE_VERSION),
         platform,
         capabilities: capabilities::current(),
-        remote: None,
+        // what the daemon runs on, which is the copy of a managed profile
+        // while there is one
+        remote: Some(disk_remote(&data_dir)),
     };
     let loaded =
         load(config, &opts).with_context(|| format!("cannot read {}", config.display()))?;
@@ -298,6 +310,7 @@ mod tests {
                 remote: remote.map(|r| r.parse().unwrap()),
                 key: key.map(str::to_string),
                 platform: None,
+                data_dir: None,
             }
         };
         let (addr, key) = resolve_endpoint(&args(None, Some("10.0.0.2:1"), Some("k"))).unwrap();
@@ -328,5 +341,41 @@ mod tests {
                 .to_string(),
             NOT_CONFIGURED
         );
+    }
+
+    /// A managed profile names its API in the downloaded copy, which is in
+    /// the data directory: the endpoint is read from there, and a directory
+    /// without the copy leaves nothing to read.
+    #[test]
+    fn a_managed_profile_names_its_api_in_the_copy_in_the_data_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = url::Url::parse("https://sources.example/profile.conf").unwrap();
+        let pointer = dir.path().join("managed.conf");
+        std::fs::write(&pointer, format!("#!MANAGED-CONFIG {link}\n")).unwrap();
+        let data = dir.path().join("data");
+        rurge_net::testing::seed_cache(
+            &data,
+            &link,
+            b"[General]\nhttp-api = abc@127.0.0.1:6171\n[Rule]\nFINAL,DIRECT\n",
+            std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+        );
+        let args = |data_dir: &std::path::Path| ControlArgs {
+            config: Some(pointer.clone()),
+            remote: None,
+            key: None,
+            platform: None,
+            data_dir: Some(data_dir.to_path_buf()),
+        };
+        let (addr, key) = resolve_endpoint(&args(&data)).unwrap();
+        assert_eq!(
+            (addr.to_string().as_str(), key.as_str()),
+            ("127.0.0.1:6171", "abc")
+        );
+        let nothing = dir.path().join("nothing");
+        assert_eq!(
+            resolve_endpoint(&args(&nothing)).unwrap_err().to_string(),
+            NOT_CONFIGURED
+        );
+        assert!(!nothing.exists(), "reading the cache creates nothing");
     }
 }
