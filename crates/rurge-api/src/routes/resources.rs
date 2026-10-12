@@ -8,7 +8,7 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::extract::rejection::BytesRejection;
-use rurge_engine::ExternalResource;
+use rurge_engine::{ExternalResource, UnusedLines};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::time::Duration;
@@ -26,7 +26,8 @@ const NO_SUCH_KEY: &str = "no external resource has this key";
 
 /// One resource as the manual shows it: `updatedAt` is not there for a local
 /// resource, `error` only when there is one to give (`ExternalResource::error`),
-/// and `suspended` (rurge's own) only when it is true.
+/// and rurge's own `suspended` only when it is true and `skipped`, `truncated`
+/// and `unknownParams` on a rule set and a domain set only.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceJson {
@@ -46,6 +47,28 @@ pub struct ResourceJson {
     error: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     suspended: bool,
+    #[serde(flatten)]
+    unused: Option<UnusedJson>,
+}
+
+/// What the last load of the file of a set could not use. A set that has
+/// lines of that kind has loaded, so `error` has nothing to say of them.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnusedJson {
+    skipped: usize,
+    truncated: usize,
+    unknown_params: usize,
+}
+
+impl From<UnusedLines> for UnusedJson {
+    fn from(unused: UnusedLines) -> UnusedJson {
+        UnusedJson {
+            skipped: unused.skipped,
+            truncated: unused.truncated,
+            unknown_params: unused.unknown_params,
+        }
+    }
 }
 
 impl From<ExternalResource> for ResourceJson {
@@ -61,6 +84,7 @@ impl From<ExternalResource> for ResourceJson {
             from_module: (),
             error: resource.error,
             suspended: resource.suspended,
+            unused: resource.unused.map(UnusedJson::from),
         }
     }
 }

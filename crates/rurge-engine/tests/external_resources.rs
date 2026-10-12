@@ -9,8 +9,8 @@ mod common;
 
 use common::*;
 use rurge_config::{RemoteRef, RemoteRole, SourceInfo};
-use rurge_engine::ExternalResource;
 use rurge_engine::profile::ProfileSources;
+use rurge_engine::{ExternalResource, UnusedLines};
 use rurge_net::resource::{
     ResourceKind, ResourceManager, ResourceSource, ResourceSpec, cache_file, resource_key,
 };
@@ -1108,4 +1108,345 @@ async fn offline_every_key_that_is_downloaded_is_an_error_at_once() {
     // and nobody was asked
     let asked: Vec<String> = w.server.requests().into_iter().map(|r| r.path).collect();
     assert!(asked.is_empty(), "{asked:?}");
+}
+
+// ---------------------------------------------------------------------------
+// the lines of a set that are not used
+
+/// What the log says of a set that was loaded with lines it cannot use.
+const UNUSED: &str = "set loaded with lines that are not used";
+
+/// A rule set with three lines nobody can read (a share link, a proxy
+/// definition and a `FINAL`) and one rule that carries a parameter nobody
+/// knows. The marker is in what these lines carry: none of it may be logged.
+const UNREADABLE: &str = "\
+# a list
+DOMAIN,one.example
+trojan://S3CR3T@host.example:443
+DOMAIN,two.example,S3CR3T
+P = ss, host.example, 8388, password=S3CR3T
+FINAL,DIRECT
+DOMAIN,three.example
+";
+
+/// The same numbers of lines in another file, with two more lines of comment
+/// on top: the numbers of the lines are not the same.
+const UNREADABLE_AGAIN: &str = "\
+# a list, revised
+# and one more line
+DOMAIN,four.example
+vmess://S3CR3T
+DOMAIN,five.example,S3CR3T
+Q = http, host.example, 80, password=S3CR3T
+FINAL,REJECT
+DOMAIN,six.example
+";
+
+/// Two lines nobody can read, and no parameter nobody knows.
+const FEWER: &str = "\
+DOMAIN,seven.example
+trojan://S3CR3T@host.example:443
+FINAL,DIRECT
+";
+
+const CLEAN: &str = "DOMAIN,eight.example\n";
+
+/// A generation that downloads, over a data directory `seed` has filled before
+/// it starts, whose profile has `rules` and nothing else. It waits for the
+/// first downloads.
+async fn generation_of(
+    w: &World,
+    rules: &str,
+    seed: impl FnOnce(&Path),
+) -> (Arc<Engine>, tempfile::TempDir, MockDns) {
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path());
+    let dns = MockDns::spawn().await;
+    let text = Profile {
+        rules,
+        ..Profile::default()
+    }
+    .text(dns.addr());
+    let runtime = online_runtime_with(
+        dir.path(),
+        &text,
+        &w.server,
+        EngineShared::default(),
+        |stack| stack.wait = Duration::from_secs(5),
+    )
+    .await;
+    (Engine::new(runtime), dir, dns)
+}
+
+/// The version of the set read from the resource `key` that the generation has
+/// compiled; 0 when it has none yet.
+fn set_version(engine: &Engine, key: &str) -> u64 {
+    engine
+        .runtime()
+        .stack
+        .registry
+        .statuses()
+        .into_iter()
+        .find(|status| status.key.as_deref() == Some(key))
+        .map_or(0, |status| status.version)
+}
+
+/// The server gives `body` for the set at `/sets/a.list` from now on. Returns
+/// once the generation has downloaded it and compiled it as the `version` of
+/// the set read from the resource `key`.
+async fn serve_the_set_anew(w: &World, engine: &Engine, key: &str, body: &str, version: u64) {
+    w.server.set("/sets/a.list", body.to_string());
+    let answer = engine
+        .update_external_resources(None, Some(key), LIMIT)
+        .await;
+    assert_eq!(answer, Some(vec![(key.to_string(), Ok(()))]));
+    wait_until("the set to be compiled anew", || {
+        set_version(engine, key) >= version
+    })
+    .await;
+}
+
+/// The lines of the log that say a set was loaded with lines it cannot use.
+fn unused_lines_said(log: &LogCapture) -> Vec<String> {
+    log.lines()
+        .into_iter()
+        .filter(|line| line.starts_with("WARN") && line.contains(UNUSED))
+        .collect()
+}
+
+/// The value of the field `name` of a line of the log, if the line has it.
+fn field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    line.split_whitespace()
+        .find_map(|word| word.strip_prefix(name)?.strip_prefix('='))
+}
+
+/// The fields a warning about the lines of a set has, in the order of the
+/// log's own.
+const UNUSED_FIELDS: [&str; 6] = [
+    "set",
+    "skipped",
+    "truncated",
+    "unknown_params",
+    "first_skipped_line",
+    "first_unknown_line",
+];
+
+/// No line of the log holds what the lines of the sets carry, or the password
+/// of the address one of the sets is fetched from.
+fn nothing_secret_was_logged(log: &LogCapture) {
+    for line in log.lines() {
+        assert!(
+            !line.contains("S3CR3T") && !line.contains("PASSW0RD"),
+            "{line}"
+        );
+    }
+}
+
+/// A set that is downloaded after the start says what it could not use, and
+/// says it again only when that changes: a list that is refreshed every day
+/// and always has three lines nobody can read is not worth a warning a day.
+#[tokio::test]
+async fn a_set_that_arrives_after_the_start_says_what_it_could_not_use_when_that_changes() {
+    let log = LogCapture::start();
+    let w = World::new().await;
+    // the address carries a user name and a password
+    let mut url = w.url("/sets/a.list");
+    url.set_username("al1ce").unwrap();
+    url.set_password(Some("PASSW0RD")).unwrap();
+    let key = resource_key(&ResourceSource::Url(url.clone()));
+    let shown = format!("http://***@127.0.0.1:{}/sets/a.list", url.port().unwrap());
+    w.server.set("/sets/a.list", UNREADABLE);
+    let (engine, _dir, _dns) = generation_of(&w, &format!("RULE-SET,{url},DIRECT"), |_| {}).await;
+    wait_until("the set to load", || set_version(&engine, &key) >= 1).await;
+
+    // nothing was cached, so this is the first time it is read: it says so
+    let said = unused_lines_said(&log);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(
+        UNUSED_FIELDS.map(|name| field(&said[0], name)),
+        [
+            Some(shown.as_str()),
+            Some("3"),
+            Some("0"),
+            Some("1"),
+            Some("3"),
+            Some("4")
+        ],
+        "{}",
+        said[0]
+    );
+
+    let change =
+        async |body: &str, version: u64| serve_the_set_anew(&w, &engine, &key, body, version).await;
+    // the same numbers in another file, on other lines: nothing more is said
+    change(UNREADABLE_AGAIN, 2).await;
+    assert_eq!(unused_lines_said(&log).len(), 1, "{:?}", log.lines());
+
+    // other numbers: said again; there is no parameter nobody knows now, and
+    // so no line to name for it
+    change(FEWER, 3).await;
+    let said = unused_lines_said(&log);
+    assert_eq!(said.len(), 2, "{said:?}");
+    // a number of lines that is none has no field, not a field that says none
+    assert!(!said[1].contains("first_unknown_line"), "{}", said[1]);
+    assert_eq!(
+        UNUSED_FIELDS.map(|name| field(&said[1], name)),
+        [
+            Some(shown.as_str()),
+            Some("2"),
+            Some("0"),
+            Some("0"),
+            Some("2"),
+            None
+        ],
+        "{}",
+        said[1]
+    );
+
+    // nothing to say, nothing said; the numbers of the first load again are
+    // news again, since they are not the ones of the load before
+    change(CLEAN, 4).await;
+    assert_eq!(unused_lines_said(&log).len(), 2);
+    change(UNREADABLE, 5).await;
+    assert_eq!(unused_lines_said(&log).len(), 3);
+    nothing_secret_was_logged(&log);
+}
+
+/// A set that was read from the cache when the generation was built was said
+/// in the diagnostics of the build: a refresh with the same numbers is not
+/// said again, and one with other numbers is.
+#[tokio::test]
+async fn a_set_the_start_read_from_the_cache_is_not_said_again_by_a_refresh_with_the_same_numbers()
+{
+    let log = LogCapture::start();
+    let w = World::new().await;
+    let url = w.url("/sets/a.list");
+    let key = resource_key(&ResourceSource::Url(url.clone()));
+    w.server.set("/sets/a.list", UNREADABLE_AGAIN);
+    let (engine, _dir, _dns) = generation_of(&w, &format!("RULE-SET,{url},DIRECT"), |dir| {
+        seed_cache(dir, &url, UNREADABLE.as_bytes(), at(600))
+    })
+    .await;
+    assert_eq!(set_version(&engine, &key), 1);
+    assert_eq!(w.server.hits("/sets/a.list"), 0, "the copy is not due");
+
+    // the start said it, as diagnostics, with the numbers and not the lines
+    let runtime = engine.runtime();
+    let of_the_set: Vec<(&str, &str, Option<&str>)> = runtime
+        .diagnostics()
+        .iter()
+        .filter(|d| d.message.contains(&format!("set `{url}`")))
+        .map(|d| (d.code, d.message.as_str(), d.hint))
+        .collect();
+    assert_eq!(
+        of_the_set
+            .iter()
+            .map(|(code, _, _)| *code)
+            .collect::<Vec<_>>(),
+        ["W0023", "W0003"],
+        "{of_the_set:?}"
+    );
+    assert!(
+        of_the_set[0].1.contains("3 line(s) skipped (first: line 3"),
+        "{of_the_set:?}"
+    );
+    assert_eq!(
+        of_the_set[1].1,
+        format!(
+            "set `{url}`: 1 line(s) carry a parameter that is not known and is ignored (first: line 4)"
+        )
+    );
+    assert!(
+        of_the_set
+            .iter()
+            .all(|(_, message, hint)| !message.contains("S3CR3T")
+                && !hint.unwrap_or_default().contains("S3CR3T")),
+        "{of_the_set:?}"
+    );
+    assert!(unused_lines_said(&log).is_empty());
+
+    let change =
+        async |body: &str, version: u64| serve_the_set_anew(&w, &engine, &key, body, version).await;
+    // the refresh brings the same numbers on other lines: nothing is said
+    change(UNREADABLE_AGAIN, 2).await;
+    assert_eq!(w.server.hits("/sets/a.list"), 1);
+    assert!(unused_lines_said(&log).is_empty(), "{:?}", log.lines());
+
+    // other numbers are
+    change(FEWER, 3).await;
+    let said = unused_lines_said(&log);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(
+        UNUSED_FIELDS.map(|name| field(&said[0], name)),
+        [
+            Some(url.as_str()),
+            Some("2"),
+            Some("0"),
+            Some("0"),
+            Some("2"),
+            None
+        ]
+    );
+    nothing_secret_was_logged(&log);
+}
+
+/// The listing says what the last load of the file of a set could not use,
+/// for a rule set and a domain set, whatever their state; no other item says
+/// anything of the kind. The numbers follow the next load of the set.
+#[tokio::test]
+async fn a_set_is_listed_with_the_lines_of_its_file_that_were_not_used() {
+    let w = World::new().await;
+    w.server.set("/sets/a.list", UNREADABLE);
+    // `bad domain` and `*.wild.example` are no names
+    w.server.set(
+        "/sets/names.txt",
+        ".a.example\nbad domain\n*.wild.example\nb.example\n",
+    );
+    // the server has nothing at /sets/absent.list: that set never loads
+    let extra = format!(
+        "RULE-SET,{},DIRECT\nDOMAIN-SET,{},DIRECT\nRULE-SET,{},DIRECT",
+        w.url("/sets/a.list"),
+        w.url("/sets/names.txt"),
+        w.url("/sets/absent.list")
+    );
+    let g = generation(&w, &extra).await;
+    let sources = profile_sources(&w, false);
+    let key = w.key("/sets/a.list");
+    for path in ["/sets/a.list", "/sets/names.txt"] {
+        wait_until("the set to load", || {
+            set_version(&g.engine, &w.key(path)) >= 1
+        })
+        .await;
+    }
+
+    let listing = g.engine.external_resources(Some(&sources));
+    let unused = |path: &str| item(&listing, &w.key(path)).unused;
+    let lines = |skipped, unknown_params| {
+        Some(UnusedLines {
+            skipped,
+            truncated: 0,
+            unknown_params,
+        })
+    };
+    assert_eq!(unused("/sets/a.list"), lines(3, 1));
+    assert_eq!(unused("/sets/names.txt"), lines(2, 0));
+    // read whole, and not read at all: none
+    for path in ["/rules.list", "/domains.txt", "/sets/absent.list"] {
+        assert_eq!(unused(path), lines(0, 0), "{path}");
+    }
+    // the sets that are files and the sets that are not say it alike; the
+    // sources of the profile, the subscription and the databases are not
+    // read line by line and do not
+    for resource in &listing {
+        let a_set = matches!(resource.kind, "ruleset" | "domainset");
+        assert_eq!(resource.unused.is_some(), a_set, "{resource:?}");
+    }
+    assert_eq!(kinds(&listing)[..2], ["profile", "include"]);
+    // and a set that has lines it could not use has loaded: there is no error
+    assert_eq!(item(&listing, &key).error, None);
+
+    // the next load brings other numbers
+    serve_the_set_anew(&w, &g.engine, &key, FEWER, 2).await;
+    let listing = g.engine.external_resources(Some(&sources));
+    assert_eq!(item(&listing, &key).unused, lines(2, 0));
 }

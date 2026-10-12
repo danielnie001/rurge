@@ -13,10 +13,13 @@ use rurge_config::rule::{InternalSet, ParseCtx, ResourceRef, RuleKind, SubRule};
 use rurge_config::{Config, Diagnostic, Diagnostics, HostKey, Reach, codes};
 use rurge_net::resource::{
     ResourceHandle, ResourceKind, ResourceManager, ResourceSource, ResourceSpec, ResourceState,
+    resource_key,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -70,20 +73,59 @@ impl Key {
 #[derive(Clone, Debug)]
 pub struct SetStatus {
     pub name: String,
+    /// `rurge_net::resource::resource_key` of the URL or the file the set is
+    /// read from, the key its resource goes by in the manager; `None` for a
+    /// built-in or an inline set, which have no resource.
+    pub key: Option<String>,
     pub kind: SetKind,
     pub entries: usize,
     pub version: u64,
     /// `internal` | `inline` | `ok` | `missing` | `failed: <error>` | `cycle`
     pub state: String,
+    /// What the last load of the set's file could not use, all zero while the
+    /// set has not loaded: the lines it skipped, the valid lines beyond the
+    /// entry limit, and the rule lines whose parameter nobody knows.
     pub skipped: usize,
     pub truncated: usize,
+    pub unknown_params: usize,
+}
+
+/// What a load of a set's file found that it could not use: the lines it
+/// skipped, the valid lines beyond the entry limit, and the lines whose
+/// parameter nobody knows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Unused {
+    skipped: usize,
+    truncated: usize,
+    unknown_params: usize,
+}
+
+impl Unused {
+    fn of(parsed: &ParsedSet) -> Unused {
+        Unused {
+            skipped: parsed.skipped_total,
+            truncated: parsed.truncated,
+            unknown_params: parsed.unknown_params,
+        }
+    }
+}
+
+/// Whether a load that found `now` is worth a line in the log, given what the
+/// load before it found (`None`: the set had not loaded yet). One that found
+/// nothing is not, and neither is one that found what the one before it
+/// found: a list that is refreshed every day and always has three lines
+/// nobody can read is not worth a warning a day. The numbers of the lines are
+/// no part of it, since lines move and the count stays.
+fn worth_a_warning(before: Option<Unused>, now: Unused) -> bool {
+    now != Unused::default() && before != Some(now)
 }
 
 struct Entry {
     handle: SetHandle,
     resource: Option<ResourceHandle>,
-    skipped: usize,
-    truncated: usize,
+    /// What the last load found it could not use; `None` while the set has
+    /// not loaded.
+    unused: Option<Unused>,
     state: String,
 }
 
@@ -101,7 +143,53 @@ pub struct SetRegistry {
     /// keep accumulating diagnostics that `build`'s caller already took and
     /// nobody reads again (F4).
     building: AtomicBool,
+    /// Held by whoever parses and compiles a set of the registry that has new
+    /// content, so that only one set is at it at a time: a full set needs
+    /// about three times its size while it is compiled, and a few dozen get
+    /// their content together when the profile starts cold or every resource
+    /// is updated. The build holds it until everything the profile names is
+    /// created; a reload task holds it from reading the resource to storing
+    /// the set. A task keeps a clone of the `Arc` and not the registry, so one
+    /// that waits for its turn does not keep a registry that was replaced.
+    ///
+    /// Nothing that compiles is awaited under it, and `ensure` and `finish`
+    /// never ask for it: a set that names another compiles that one inside
+    /// itself, on the same thread, under the lock its own compile holds.
+    compile_lock: Arc<tokio::sync::Mutex<()>>,
+    /// How many stretches of parsing and compiling are going on, and the most
+    /// there have been at once: what the tests ask to know that the sets of a
+    /// registry are compiled one at a time.
+    #[cfg(test)]
+    compiling: Compiling,
     self_weak: Mutex<Weak<SetRegistry>>,
+}
+
+/// The stretches of compiling in a registry, in a test build.
+#[cfg(test)]
+#[derive(Default)]
+struct Compiling {
+    now: AtomicUsize,
+    most: AtomicUsize,
+}
+
+/// One stretch of compiling, counted for as long as it lives.
+#[cfg(test)]
+struct Stretch<'a>(&'a Compiling);
+
+#[cfg(test)]
+impl Compiling {
+    fn begin(&self) -> Stretch<'_> {
+        let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most.fetch_max(now, Ordering::SeqCst);
+        Stretch(self)
+    }
+}
+
+#[cfg(test)]
+impl Drop for Stretch<'_> {
+    fn drop(&mut self) {
+        self.0.now.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 thread_local! {
@@ -199,9 +287,17 @@ impl SetRegistry {
             claims: claims_of(cfg),
             diags: Mutex::new(Diagnostics::default()),
             building: AtomicBool::new(true),
+            compile_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            compiling: Compiling::default(),
             self_weak: Mutex::new(Weak::new()),
         });
         *reg.self_weak.lock().expect("registry lock") = Arc::downgrade(&reg);
+        // Nobody else has the registry yet, so this is free. The reload tasks
+        // the sets below start wait for it until everything is created.
+        let turn = reg.compile_lock.try_lock().ok();
+        #[cfg(test)]
+        let stretch = reg.compiling.begin();
         // Pre-create everything the profile uses so statuses are complete and
         // downloads start now. Matching ends at the first FINAL: a set that
         // only the rules after it name is never consulted, and is neither
@@ -223,7 +319,12 @@ impl SetRegistry {
             }
         }
         let diags = std::mem::take(&mut *reg.diags.lock().expect("registry lock"));
+        // `building` is over before a reload task has its turn: the first
+        // thing it compiles is said in the log and not in the diagnostics
         reg.building.store(false, Ordering::Relaxed);
+        #[cfg(test)]
+        drop(stretch);
+        drop(turn);
         (reg, diags)
     }
 
@@ -255,14 +356,17 @@ impl SetRegistry {
             .iter()
             .map(|((key, kind), e)| {
                 let set = e.handle.load();
+                let unused = e.unused.unwrap_or_default();
                 SetStatus {
                     name: key.display(),
+                    key: self.source_of(key).ok().map(|s| resource_key(&s)),
                     kind: *kind,
                     entries: set.entry_count(),
                     version: set.version,
                     state: e.state.clone(),
-                    skipped: e.skipped,
-                    truncated: e.truncated,
+                    skipped: unused.skipped,
+                    truncated: unused.truncated,
+                    unknown_params: unused.unknown_params,
                 }
             })
             .collect();
@@ -280,6 +384,18 @@ impl SetRegistry {
     #[cfg(test)]
     fn diag_count(&self) -> usize {
         self.diags.lock().expect("registry lock").len()
+    }
+
+    /// How many stretches of parsing and compiling are going on right now.
+    #[cfg(test)]
+    fn compiling_now(&self) -> usize {
+        self.compiling.now.load(Ordering::SeqCst)
+    }
+
+    /// The most stretches of parsing and compiling there have been at once.
+    #[cfg(test)]
+    fn most_compiling_at_once(&self) -> usize {
+        self.compiling.most.load(Ordering::SeqCst)
     }
 
     /// Returns the (possibly still compiling) handle for a reference, creating
@@ -330,8 +446,7 @@ impl SetRegistry {
                     Entry {
                         handle: SetHandle::new(CompiledSet::empty(&name, kind)),
                         resource: None,
-                        skipped: 0,
-                        truncated: 0,
+                        unused: None,
                         state: "compiling".to_string(),
                     },
                 );
@@ -394,7 +509,9 @@ impl SetRegistry {
         parse_set(kind, text, &ctx)
     }
 
-    /// Compile `parsed`, record skipped / truncated counts, return the set.
+    /// Compile `parsed`, record what it could not use (the warnings about it
+    /// are diagnostics while the registry is built, and a line of the log
+    /// when that changes after), return the set.
     fn finish(
         &self,
         key: &Key,
@@ -423,12 +540,45 @@ impl SetRegistry {
                 ),
             ));
         }
+        // Only the count and the line: a set file is arbitrary text, and the
+        // parameter lost may be a password on a proxy line copied into it.
+        if let Some(line) = parsed.first_unknown {
+            self.push_diag(Diagnostic::warning(
+                codes::W_UNKNOWN_RULE_PARAM,
+                format!(
+                    "set `{name}`: {} line(s) carry a parameter that is not known and is ignored (first: line {line})",
+                    parsed.unknown_params
+                ),
+            ));
+        }
         let set = CompiledSet::compile(name, kind, &parsed, self, version);
-        let mut entries = self.entries.lock().expect("registry lock");
-        if let Some(e) = entries.get_mut(&(key.clone(), kind)) {
-            e.skipped = parsed.skipped_total;
-            e.truncated = parsed.truncated;
-            e.state = state.to_string();
+        let unused = Unused::of(&parsed);
+        let say = {
+            let mut entries = self.entries.lock().expect("registry lock");
+            entries.get_mut(&(key.clone(), kind)).is_some_and(|e| {
+                // While the registry is built the diagnostics above are the
+                // ones that say it, and they say it every time it is built.
+                let say =
+                    !self.building.load(Ordering::Relaxed) && worth_a_warning(e.unused, unused);
+                e.unused = Some(unused);
+                e.state = state.to_string();
+                say
+            })
+        };
+        // Written before the caller stores the set, so that whoever waits for
+        // the version of the set to move finds the line, or that there is
+        // none. Numbers only: no line, and no reason of a skipped one, which
+        // may quote how its line begins.
+        if say {
+            tracing::warn!(
+                set = %name,
+                skipped = unused.skipped,
+                truncated = unused.truncated,
+                unknown_params = unused.unknown_params,
+                first_skipped_line = parsed.skipped.first().map(|(line, _)| *line),
+                first_unknown_line = parsed.first_unknown,
+                "set loaded with lines that are not used"
+            );
         }
         Some(set)
     }
@@ -544,9 +694,10 @@ impl SetRegistry {
         }
     }
 
-    /// Recompile and swap whenever the resource publishes a new version.
-    /// `rx` must already be subscribed to `resource` (see `compile_external`)
-    /// so a version published before this task starts is never missed.
+    /// Recompile and swap whenever the resource publishes a new version, one
+    /// set of the registry at a time (`compile_lock`). `rx` must already be
+    /// subscribed to `resource` (see `compile_external`) so a version
+    /// published before this task starts is never missed.
     fn spawn_reloader(
         &self,
         key: Key,
@@ -560,6 +711,7 @@ impl SetRegistry {
             return;
         };
         let weak = self.self_weak.lock().expect("registry lock").clone();
+        let compile_lock = self.compile_lock.clone();
         rt.spawn(async move {
             loop {
                 // Wake periodically too: the registry may be dropped while the resource never changes again.
@@ -576,6 +728,12 @@ impl SetRegistry {
                         continue;
                     }
                 }
+                // The turn is waited for before anything else, and the state of
+                // the resource is read after it: a version that was replaced
+                // while this task waited is never compiled. Nothing below
+                // awaits, so the compile stays on one thread from the key
+                // pushed on its stack to the end, as it has to.
+                let _turn = compile_lock.lock().await;
                 let Some(reg) = weak.upgrade() else { return };
                 let (data, version) = match resource.current() {
                     ResourceState::Available { data, version, .. } => (data, version),
@@ -586,6 +744,8 @@ impl SetRegistry {
                 if handle.version() == version {
                     continue;
                 }
+                #[cfg(test)]
+                let _stretch = reg.compiling.begin();
                 let text = String::from_utf8_lossy(&data);
                 // A fresh compile on this thread starts with an empty stack;
                 // push the key being recompiled first so new content that
@@ -622,8 +782,8 @@ mod tests {
     use rurge_net::connector::{DirectConnector, SystemResolve};
     use rurge_net::http::{HttpClient, HttpClientConfig};
     use rurge_net::resource::ResourceOptions;
-    use rurge_net::testing::TestServer;
-    use std::time::Duration;
+    use rurge_net::testing::{TestServer, seed_cache};
+    use std::time::{Duration, SystemTime};
 
     fn manager(root: &Path) -> Arc<ResourceManager> {
         let connector = Arc::new(DirectConnector::new(Arc::new(SystemResolve)));
@@ -1774,5 +1934,271 @@ ignored: the same resource is used as a RULE-SET",
             .find(|s| s.name.ends_with("a.list"))
             .unwrap();
         assert_eq!(st.skipped, 1);
+    }
+
+    fn found(skipped: usize, truncated: usize, unknown_params: usize) -> Unused {
+        Unused {
+            skipped,
+            truncated,
+            unknown_params,
+        }
+    }
+
+    /// When a load of a set is worth a line in the log, case by case.
+    #[test]
+    fn a_load_is_worth_a_warning_when_it_found_what_the_one_before_did_not() {
+        let nothing = Unused::default();
+        // a set that had not loaded
+        assert!(!worth_a_warning(None, nothing));
+        for now in [found(3, 0, 0), found(0, 1, 0), found(0, 0, 2)] {
+            assert!(worth_a_warning(None, now), "{now:?}");
+        }
+        // after a load that found nothing
+        assert!(!worth_a_warning(Some(nothing), nothing));
+        assert!(worth_a_warning(Some(nothing), found(3, 0, 0)));
+        // after one that found the same: nothing more to say
+        for same in [
+            found(3, 0, 0),
+            found(0, 7, 0),
+            found(0, 0, 2),
+            found(3, 7, 2),
+        ] {
+            assert!(!worth_a_warning(Some(same), same), "{same:?}");
+        }
+        // any of the three numbers changing is news, up or down
+        let before = found(3, 7, 2);
+        for now in [
+            found(4, 7, 2),
+            found(2, 7, 2),
+            found(3, 8, 2),
+            found(3, 6, 2),
+            found(3, 7, 3),
+            found(3, 7, 1),
+            found(0, 7, 2),
+            found(3, 0, 2),
+            found(3, 7, 0),
+        ] {
+            assert!(worth_a_warning(Some(before), now), "{now:?}");
+        }
+        // and coming back to nothing is not
+        assert!(!worth_a_warning(Some(before), nothing));
+    }
+
+    /// Three lines nobody can read, then none, then three again: said twice,
+    /// and not in between.
+    #[test]
+    fn what_goes_away_and_comes_back_is_said_each_time_it_comes() {
+        let mut before = None;
+        let said: Vec<bool> = [found(3, 0, 0), Unused::default(), found(3, 0, 0)]
+            .into_iter()
+            .map(|now| {
+                let say = worth_a_warning(before, now);
+                before = Some(now);
+                say
+            })
+            .collect();
+        assert_eq!(said, [true, false, true]);
+    }
+
+    /// How many lines the sets of the tests that compile one at a time have:
+    /// enough for a stretch of parsing and compiling to last for long beside
+    /// the few milliseconds that a download of the other set takes.
+    const MANY: usize = 300_000;
+
+    /// A rule set of `n` lines, with names no other set of the tests has.
+    fn many_lines(prefix: &str, n: usize) -> String {
+        let mut text = String::with_capacity(n * 32);
+        for i in 0..n {
+            text += &format!("DOMAIN-SUFFIX,{prefix}{i}.example\n");
+        }
+        text
+    }
+
+    /// The registry is at no stretch of compiling, once the last set to be
+    /// stored has left its own.
+    async fn compiling_ends(reg: &SetRegistry) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while reg.compiling_now() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the compiling did not end");
+    }
+
+    /// A set of a million lines needs about three times its size while it is
+    /// compiled, and a few dozen sets get their new content together when the
+    /// profile starts cold or all of them are updated: they are compiled one
+    /// after the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sets_that_change_together_are_compiled_one_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/a.list", "DOMAIN,old-a.example\n");
+        server.set("/b.list", "DOMAIN,old-b.example\n");
+        let (a, b) = (server.url("/a.list"), server.url("/b.list"));
+        let cfg = load(
+            &format!("[Proxy]\nP = direct\n[Rule]\nRULE-SET,{a},P\nRULE-SET,{b},P\nFINAL,DIRECT\n"),
+            dir.path(),
+        );
+        let mgr = manager(dir.path());
+        let (reg, _) = SetRegistry::build(&cfg, mgr.clone(), dir.path());
+        let handle_of = |url: &Url| reg.get(&ResourceRef::Url(url.to_string()), SetKind::RuleSet);
+        let (set_a, set_b) = (handle_of(&a), handle_of(&b));
+        wait_version(&set_a, 1).await;
+        wait_version(&set_b, 1).await;
+        compiling_ends(&reg).await;
+
+        // both are served anew, and big, and asked for together
+        server.set("/a.list", many_lines("a", MANY));
+        server.set("/b.list", many_lines("b", MANY));
+        assert!(mgr.force_update(&ResourceSource::Url(a.clone())));
+        assert!(mgr.force_update(&ResourceSource::Url(b.clone())));
+        wait_version(&set_a, 2).await;
+        wait_version(&set_b, 2).await;
+        compiling_ends(&reg).await;
+
+        assert_eq!(reg.most_compiling_at_once(), 1);
+        assert_eq!(set_a.load().entry_count(), MANY);
+        assert_eq!(set_b.load().entry_count(), MANY);
+    }
+
+    /// The reload task of a set that is downloaded while the registry is
+    /// being built waits for the build, which is compiling another set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_set_that_arrives_while_the_registry_is_built_waits_for_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        server.set("/a.list", "DOMAIN,a.example\n");
+        let a = server.url("/a.list");
+        // the build asks for the URL first and compiles the big file after it,
+        // while the download lands
+        let big = dir.path().join("big.list");
+        std::fs::write(&big, many_lines("big", MANY)).unwrap();
+        let cfg = load(
+            &format!(
+                "[Proxy]\nP = direct\n[Rule]\nRULE-SET,{a},P\nRULE-SET,big.list,P\nFINAL,DIRECT\n"
+            ),
+            dir.path(),
+        );
+        let (reg, _) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        let set_a = reg.get(&ResourceRef::Url(a.to_string()), SetKind::RuleSet);
+        let set_big = reg.get(&ResourceRef::File(big), SetKind::RuleSet);
+        wait_version(&set_a, 1).await;
+        compiling_ends(&reg).await;
+        assert_eq!(reg.most_compiling_at_once(), 1);
+        assert_eq!(set_a.load().entry_count(), 1);
+        assert_eq!(set_big.load().entry_count(), MANY);
+    }
+
+    /// A rule set whose lines carry a parameter nobody knows: line 3 is the
+    /// first, and the second is a line copied from a profile with a password
+    /// in it. The file is arbitrary text, so what the lines carry is not for
+    /// a message to quote.
+    const UNKNOWN_PARAMS: &str = "\
+# a list
+DOMAIN,a.example
+DOMAIN,b.example,S3CR3T
+
+IP-CIDR,10.0.0.0/8,no-resolve,password=S3CR3T
+DOMAIN,c.example,no-resolve
+";
+
+    /// The text the registry says of `UNKNOWN_PARAMS` as the set `name`.
+    fn unknown_params_said_of(name: &str) -> String {
+        format!(
+            "set `{name}`: 2 line(s) carry a parameter that is not known and is ignored (first: line 3)"
+        )
+    }
+
+    /// The set is in the cache (or a file) when the registry is built: one
+    /// `W0003`, with the name of the set and the number of the first line and
+    /// with nothing the lines carry, in the message or in the hint.
+    #[tokio::test]
+    async fn a_set_with_lines_that_carry_an_unknown_parameter_is_warned_of_when_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = Url::parse("http://sets.example/a.list").unwrap();
+        seed_cache(
+            dir.path(),
+            &url,
+            UNKNOWN_PARAMS.as_bytes(),
+            SystemTime::now() - Duration::from_secs(600),
+        );
+        let file = dir.path().join("b.list");
+        std::fs::write(&file, UNKNOWN_PARAMS).unwrap();
+        let cfg = load(
+            &format!(
+                "[Proxy]\nP = direct\n[Rule]\nRULE-SET,{url},P\nRULE-SET,b.list,P\nFINAL,DIRECT\n"
+            ),
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, offline_manager(dir.path()), dir.path());
+        let mut said: Vec<String> = Vec::new();
+        for d in diags.iter() {
+            assert_eq!(d.code, codes::W_UNKNOWN_RULE_PARAM);
+            assert_eq!(d.severity, rurge_config::Severity::Warning);
+            // the code's own hint, which quotes nothing
+            assert_eq!(d.hint, codes::hint(codes::W_UNKNOWN_RULE_PARAM));
+            assert!(d.span.is_none());
+            let hint = d.hint.unwrap_or_default();
+            assert!(!d.message.contains("S3CR3T") && !hint.contains("S3CR3T"));
+            said.push(d.message.clone());
+        }
+        said.sort();
+        let mut expected = vec![
+            unknown_params_said_of(url.as_str()),
+            unknown_params_said_of(&file.display().to_string()),
+        ];
+        expected.sort();
+        assert_eq!(said, expected);
+
+        // the status counts them, and gives the key the resource goes by
+        let statuses = reg.statuses();
+        let at = |name: &str| statuses.iter().find(|s| s.name.ends_with(name)).unwrap();
+        assert_eq!((at("a.list").unknown_params, at("a.list").skipped), (2, 0));
+        assert_eq!(at("b.list").unknown_params, 2);
+        assert_eq!(
+            at("a.list").key,
+            Some(resource_key(&ResourceSource::Url(url.clone())))
+        );
+        assert_eq!(
+            at("b.list").key,
+            Some(resource_key(&ResourceSource::File(file.clone())))
+        );
+        // the set is read whole: the line is a rule, only its parameter is lost
+        assert_eq!(at("a.list").entries, 4);
+    }
+
+    /// An inline set has been read by the loader, which warned of the
+    /// parameter at its line: the registry does not say it a second time. Like
+    /// a built-in set, it has no resource and so no key.
+    #[tokio::test]
+    async fn inline_and_built_in_sets_have_no_key_and_no_second_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[Proxy]\nP = direct\n[Rule]\nRULE-SET,SYSTEM,DIRECT\nRULE-SET,Mine,P\nFINAL,DIRECT\n\
+[Ruleset Mine]\nDOMAIN,a.example,S3CR3T\n";
+        let loaded = from_text(text, &dir.path().join("t.conf"), &LoadOptions::for_tests());
+        assert!(!loaded.diagnostics.has_errors());
+        // the loader's warning, at the line, once
+        let from_the_loader = loaded
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::W_UNKNOWN_RULE_PARAM)
+            .count();
+        assert_eq!(from_the_loader, 1);
+        let (reg, diags) = SetRegistry::build(&loaded.config, manager(dir.path()), dir.path());
+        assert!(diags.is_empty(), "{:?}", codes_of(&diags));
+        let statuses = reg.statuses();
+        let names: Vec<&str> = statuses.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Mine", "SYSTEM"]);
+        for status in &statuses {
+            assert_eq!(status.key, None, "{}", status.name);
+            assert_eq!(
+                (status.skipped, status.truncated, status.unknown_params),
+                (0, 0, 0),
+                "{}",
+                status.name
+            );
+        }
     }
 }

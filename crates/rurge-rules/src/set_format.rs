@@ -1,7 +1,7 @@
 //! Text formats of RULE-SET / DOMAIN-SET files (M2 design §6.2) and the
 //! built-in `SYSTEM` / `LAN` sets (manual `rules/ruleset.html`, Internal Rule Sets).
 
-use rurge_config::rule::{InternalSet, ParseCtx, SubRule, parse_subrule};
+use rurge_config::rule::{InternalSet, ParseCtx, RuleKind, SubRule, parse_subrule};
 use rurge_config::text::strip_inline_comment;
 
 /// Manual: "A set may contain at most 1,000,000 entries." rurge truncates and warns.
@@ -49,6 +49,12 @@ pub struct ParsedSet {
     pub skipped_total: usize,
     /// Number of valid lines dropped because `limit` was reached.
     pub truncated: usize,
+    /// Number of kept rule lines that carry a parameter nobody knows, in the
+    /// line itself or in any sub-rule nested in it: the parameter is dropped.
+    /// Always 0 for a domain set, whose lines have no parameters.
+    pub unknown_params: usize,
+    /// The number, from 1, in the file of the first of those lines.
+    pub first_unknown: Option<usize>,
 }
 
 pub fn parse_set(kind: SetKind, text: &str, ctx: &ParseCtx) -> ParsedSet {
@@ -72,7 +78,17 @@ pub fn parse_set_with_limit(kind: SetKind, text: &str, ctx: &ParseCtx, limit: us
             SetKind::DomainSet => parse_domain_line(line),
         };
         match parsed {
-            Ok(l) if out.lines.len() < limit => out.lines.push(l),
+            Ok(l) if out.lines.len() < limit => {
+                // a line beyond the limit is not in the set: what it carries
+                // is not lost, and it is counted as truncated only
+                if let SetLine::Rule(sub) = &l
+                    && carries_unknown_param(sub)
+                {
+                    out.unknown_params += 1;
+                    out.first_unknown.get_or_insert(i + 1);
+                }
+                out.lines.push(l);
+            }
             Ok(_) => out.truncated += 1,
             Err(reason) => {
                 out.skipped_total += 1;
@@ -83,6 +99,17 @@ pub fn parse_set_with_limit(kind: SetKind, text: &str, ctx: &ParseCtx, limit: us
         }
     }
     out
+}
+
+/// Whether the sub-rule, or any sub-rule nested in it at any depth, has a
+/// parameter the parser does not know (and so dropped).
+fn carries_unknown_param(sub: &SubRule) -> bool {
+    !sub.unknown.is_empty()
+        || match &sub.kind {
+            RuleKind::And(subs) | RuleKind::Or(subs) => subs.iter().any(carries_unknown_param),
+            RuleKind::Not(inner) => carries_unknown_param(inner),
+            _ => false,
+        }
 }
 
 fn is_comment(kind: SetKind, line: &str) -> bool {
@@ -560,5 +587,134 @@ https://user:S3CR3T@example.com/list
         for (number, reason) in &p.skipped {
             assert!(!reason.contains("S3CR3T"), "line {number}: {reason}");
         }
+    }
+
+    /// How many lines of `text`, read as a rule set, carry a parameter nobody
+    /// knows, and where the first of them is.
+    fn unknown_in(text: &str) -> (usize, Option<usize>) {
+        let names = HashSet::new();
+        let p = parse_set(SetKind::RuleSet, text, &ctx_with(&names));
+        (p.unknown_params, p.first_unknown)
+    }
+
+    #[test]
+    fn a_parameter_nobody_knows_makes_its_line_count() {
+        for (line, why) in [
+            ("DOMAIN,a.com,no-resolv", "a flag misspelt"),
+            (
+                "DOMAIN,a.com,Proxy",
+                "a line copied from [Rule], with its policy",
+            ),
+            (
+                "IP-CIDR,10.0.0.0/8,no-resolve#note",
+                "a marker with no whitespace before it starts no note",
+            ),
+            (
+                "DOMAIN,a.com,bogus // note",
+                "the note is no parameter: the line counts once",
+            ),
+        ] {
+            assert_eq!(unknown_in(line), (1, Some(1)), "{why}: {line}");
+        }
+    }
+
+    #[test]
+    fn a_line_with_nothing_unknown_in_it_does_not_count() {
+        for line in [
+            "IP-CIDR,10.0.0.0/8,no-resolve",
+            "DOMAIN,a.com",
+            "DOMAIN-SUFFIX,a.com,extended-matching",
+            "IP-CIDR,10.0.0.0/8,no-resolve # a note",
+            // the note holds what would be unknown, and it is no parameter
+            "DOMAIN,a.com // bogus",
+            "IP-ASN,4134 // Proxy",
+        ] {
+            assert_eq!(unknown_in(line), (0, None), "{line}");
+        }
+    }
+
+    /// The first line is the one that stands first in the file: comments,
+    /// blank lines and skipped lines before it are lines too.
+    #[test]
+    fn the_first_line_is_numbered_by_its_place_in_the_file() {
+        let text = "# header\n\n; note\nnot a rule\nDOMAIN,ok.com\nDOMAIN,a.com,bogus\nDOMAIN,b.com,bogus\n";
+        assert_eq!(unknown_in(text), (2, Some(6)));
+        // the byte order mark is no line of its own
+        assert_eq!(unknown_in("\u{feff}DOMAIN,a.com,bogus\n"), (1, Some(1)));
+    }
+
+    #[test]
+    fn a_line_counts_once_however_many_unknown_items_it_carries() {
+        assert_eq!(
+            unknown_in("DOMAIN,a.com,bogus,Proxy,no-resolv"),
+            (1, Some(1))
+        );
+        assert_eq!(
+            unknown_in("DOMAIN,a.com,bogus\nDOMAIN,b.com,Proxy,bogus\nDOMAIN,c.com\n"),
+            (2, Some(1))
+        );
+    }
+
+    /// A logical rule is one line of the file, and the sub-rules in it have
+    /// parameters of their own, at any depth.
+    #[test]
+    fn an_unknown_parameter_in_a_nested_sub_rule_counts_its_line_once() {
+        for line in [
+            "AND,((IP-CIDR,10.0.0.0/8,no-resolv),(DEST-PORT,443))",
+            "OR,((DOMAIN,a.com),(DOMAIN,b.com,bogus))",
+            "NOT,((DOMAIN,a.com,bogus))",
+            "AND,((OR,((DOMAIN,a.com),(NOT,((DOMAIN,b.com,bogus))))),(DEST-PORT,443))",
+            // one in each sub-rule: still one line
+            "AND,((DOMAIN,a.com,x),(DEST-PORT,443,y))",
+        ] {
+            assert_eq!(unknown_in(line), (1, Some(1)), "{line}");
+        }
+        assert_eq!(
+            unknown_in("AND,((IP-CIDR,10.0.0.0/8,no-resolve),(DEST-PORT,443))"),
+            (0, None)
+        );
+    }
+
+    /// A line beyond the entry limit is one of the truncated lines and
+    /// nothing else: it is not in the set, so what it carries is not lost.
+    #[test]
+    fn a_line_beyond_the_entry_limit_does_not_count() {
+        let names = HashSet::new();
+        let ctx = ctx_with(&names);
+        let text = "DOMAIN,a.com,bogus\nDOMAIN,b.com\nDOMAIN,c.com,bogus\nDOMAIN,d.com,bogus\n";
+        let p = parse_set_with_limit(SetKind::RuleSet, text, &ctx, 2);
+        assert_eq!((p.lines.len(), p.truncated), (2, 2));
+        assert_eq!((p.unknown_params, p.first_unknown), (1, Some(1)));
+        // and what comes first among the kept lines is what is first
+        let text = "DOMAIN,a.com\nDOMAIN,b.com,bogus\nDOMAIN,c.com,bogus\n";
+        let p = parse_set_with_limit(SetKind::RuleSet, text, &ctx, 2);
+        assert_eq!((p.lines.len(), p.truncated), (2, 1));
+        assert_eq!((p.unknown_params, p.first_unknown), (1, Some(2)));
+        let text = "DOMAIN,a.com\nDOMAIN,b.com\nDOMAIN,c.com,bogus\n";
+        let p = parse_set_with_limit(SetKind::RuleSet, text, &ctx, 2);
+        assert_eq!(
+            (p.truncated, p.unknown_params, p.first_unknown),
+            (1, 0, None)
+        );
+    }
+
+    /// A line that is skipped is skipped for its own reason and is not read
+    /// any further.
+    #[test]
+    fn a_skipped_line_does_not_count_for_what_it_carries() {
+        let names = HashSet::new();
+        let text = "FINAL,DIRECT,bogus\nDOMAIN,a.com,pre-matching,bogus\nNOT-A-RULE,x,bogus\n";
+        let p = parse_set(SetKind::RuleSet, text, &ctx_with(&names));
+        assert_eq!(p.skipped_total, 3);
+        assert_eq!((p.unknown_params, p.first_unknown), (0, None));
+    }
+
+    #[test]
+    fn a_domain_set_has_no_parameters_to_lose() {
+        let names = HashSet::new();
+        let text = "a.com\n.b.com\nc.com,bogus\nbad domain\n";
+        let p = parse_set(SetKind::DomainSet, text, &ctx_with(&names));
+        assert_eq!(p.skipped_total, 2);
+        assert_eq!((p.unknown_params, p.first_unknown), (0, None));
     }
 }

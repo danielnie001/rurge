@@ -12,6 +12,8 @@ use crate::engine::Engine;
 use crate::profile::ProfileSources;
 use crate::reload::catch_up;
 use rurge_net::resource::{ResourceKind, ResourceManager, ResourceStatus};
+use rurge_rules::SetStatus;
+use rurge_rules::set_format::SetKind;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::task::JoinSet;
@@ -48,6 +50,23 @@ pub struct ExternalResource {
     pub error: Option<String>,
     /// The engine refuses sessions on account of this resource.
     pub suspended: bool,
+    /// What the last load of the file could not use. Only a rule set and a
+    /// domain set have it, which are read line by line.
+    pub unused: Option<UnusedLines>,
+}
+
+/// What the last load of a set's file could not use, as the registry counted
+/// it. All zero for a set that has not loaded, and for one that was read
+/// whole.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnusedLines {
+    /// Lines that are neither a rule nor a name: they are not in the set.
+    pub skipped: usize,
+    /// Valid lines beyond the limit of a million entries: not in the set.
+    pub truncated: usize,
+    /// Rule lines that carry a parameter nobody knows: the line is in the
+    /// set, the parameter is not.
+    pub unknown_params: usize,
 }
 
 /// How the control plane calls a kind of resource. What has no name is not an
@@ -85,6 +104,33 @@ fn in_listing_order<'a>(
     rest.sort_by_cached_key(|(_, status)| (status.shown(), status.key.clone()));
     listing.extend(rest);
     listing
+}
+
+/// The kind of set a resource of this kind is read as, if it is one: the
+/// kinds that are read line by line.
+fn set_kind(kind: ResourceKind) -> Option<SetKind> {
+    match kind {
+        ResourceKind::RuleSet => Some(SetKind::RuleSet),
+        ResourceKind::DomainSet => Some(SetKind::DomainSet),
+        _ => None,
+    }
+}
+
+/// What the registry says the last load of the set read from the resource
+/// `key` as a set of this `kind` could not use. One address written in two
+/// ways is two sets of one resource: the one that has loaded the latest
+/// version speaks. None of the sets, because none has been made for the
+/// resource, is none of the lines.
+fn unused_lines(sets: &[SetStatus], key: &str, kind: SetKind) -> UnusedLines {
+    sets.iter()
+        .filter(|set| set.kind == kind && set.key.as_deref() == Some(key))
+        .max_by_key(|set| set.version)
+        .map(|set| UnusedLines {
+            skipped: set.skipped,
+            truncated: set.truncated,
+            unknown_params: set.unknown_params,
+        })
+        .unwrap_or_default()
 }
 
 /// Whether `statuses` list a resource with this key.
@@ -128,10 +174,14 @@ impl Engine {
     /// them: the sources of the profile (`sources`, `None` for a caller that
     /// has none) with the managed profile first, then the resources of the
     /// generation in use by name. The managed profile says it is `suspended`
-    /// while the engine refuses sessions on account of its update.
+    /// while the engine refuses sessions on account of its update. A rule set
+    /// and a domain set say what the last load of their file could not use.
     pub fn external_resources(&self, sources: Option<&ProfileSources>) -> Vec<ExternalResource> {
         let own = sources.map(ProfileSources::statuses).unwrap_or_default();
-        let held = self.runtime().stack.resources.statuses();
+        // one generation for the resources and for the sets read from them
+        let runtime = self.runtime();
+        let held = runtime.stack.resources.statuses();
+        let sets = runtime.stack.registry.statuses();
         let refused = self.suspended();
         in_listing_order(&own, &held)
             .into_iter()
@@ -155,6 +205,8 @@ impl Engine {
                     updating: status.updating,
                     error: status.last_error.clone().or_else(|| refused.cloned()),
                     suspended: refused.is_some(),
+                    unused: set_kind(status.kind)
+                        .map(|kind| unused_lines(&sets, &status.key, kind)),
                 }
             })
             .collect()
@@ -271,5 +323,95 @@ impl Engine {
                 })
                 .collect(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(key: &str, kind: SetKind, version: u64, lines: (usize, usize, usize)) -> SetStatus {
+        SetStatus {
+            name: "a set".to_string(),
+            key: Some(key.to_string()),
+            kind,
+            entries: 0,
+            version,
+            state: "ok".to_string(),
+            skipped: lines.0,
+            truncated: lines.1,
+            unknown_params: lines.2,
+        }
+    }
+
+    fn lines(skipped: usize, truncated: usize, unknown_params: usize) -> UnusedLines {
+        UnusedLines {
+            skipped,
+            truncated,
+            unknown_params,
+        }
+    }
+
+    /// One address written in two ways is two sets of one resource: the one
+    /// that has loaded the latest version speaks, whichever comes first.
+    #[test]
+    fn of_two_sets_of_one_resource_the_one_with_the_later_version_speaks() {
+        let (older, newer) = (
+            set("k", SetKind::RuleSet, 2, (1, 2, 3)),
+            set("k", SetKind::RuleSet, 3, (4, 5, 6)),
+        );
+        for sets in [
+            [older.clone(), newer.clone()],
+            [newer.clone(), older.clone()],
+        ] {
+            assert_eq!(unused_lines(&sets, "k", SetKind::RuleSet), lines(4, 5, 6));
+        }
+    }
+
+    /// A set is the set of one resource, read in one way: another key, another
+    /// kind, and a built-in or inline set that has no key are not it.
+    #[test]
+    fn only_a_set_of_the_same_resource_and_the_same_kind_speaks() {
+        let mut keyless = set("k", SetKind::RuleSet, 9, (7, 7, 7));
+        keyless.key = None;
+        let sets = [
+            set("other", SetKind::RuleSet, 9, (7, 7, 7)),
+            set("k", SetKind::DomainSet, 9, (7, 7, 7)),
+            keyless,
+            set("k", SetKind::RuleSet, 1, (1, 0, 2)),
+        ];
+        assert_eq!(unused_lines(&sets, "k", SetKind::RuleSet), lines(1, 0, 2));
+        assert_eq!(unused_lines(&sets, "k", SetKind::DomainSet), lines(7, 7, 7));
+    }
+
+    /// A resource none of the sets was made for has no lines to speak of, and
+    /// says none.
+    #[test]
+    fn a_resource_without_a_set_has_no_lines_to_speak_of() {
+        let sets = [set("other", SetKind::RuleSet, 1, (3, 0, 1))];
+        assert_eq!(
+            unused_lines(&sets, "k", SetKind::RuleSet),
+            UnusedLines::default()
+        );
+        assert_eq!(
+            unused_lines(&[], "k", SetKind::DomainSet),
+            UnusedLines::default()
+        );
+    }
+
+    /// Only the two kinds that are read line by line are sets.
+    #[test]
+    fn only_a_rule_set_and_a_domain_set_are_read_as_sets() {
+        assert_eq!(set_kind(ResourceKind::RuleSet), Some(SetKind::RuleSet));
+        assert_eq!(set_kind(ResourceKind::DomainSet), Some(SetKind::DomainSet));
+        for kind in [
+            ResourceKind::PolicyGroup,
+            ResourceKind::GeoIp,
+            ResourceKind::Profile,
+            ResourceKind::Include,
+            ResourceKind::System,
+        ] {
+            assert_eq!(set_kind(kind), None, "{kind:?}");
+        }
     }
 }

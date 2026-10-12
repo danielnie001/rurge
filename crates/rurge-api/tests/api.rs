@@ -1583,6 +1583,14 @@ async fn external_resources_are_listed_one_item_for_each_kind() {
             "updatedAt": at, "updating": false, "fromModule": null
         })
     };
+    // a set is read line by line and says how many it could not use; nothing
+    // else is read that way
+    let a_set = |mut item: Value| {
+        item["skipped"] = json!(0);
+        item["truncated"] = json!(0);
+        item["unknownParams"] = json!(0);
+        item
+    };
     let database = |file: &str, path: &str| {
         json!({
             "path": file, "type": "geoip", "key": key_of(&served.url(path)), "local": false,
@@ -1592,26 +1600,26 @@ async fn external_resources_are_listed_one_item_for_each_kind() {
     };
     let file = api.dir.path().join("local.list");
     let mut expected = vec![
-        downloaded(
+        a_set(downloaded(
             served.url("/rules.list").to_string(),
             "ruleset",
             key_of(&served.url("/rules.list")),
-        ),
-        downloaded(
+        )),
+        a_set(downloaded(
             served.url("/domains.txt").to_string(),
             "domainset",
             key_of(&served.url("/domains.txt")),
-        ),
+        )),
         downloaded(
             "policy-path of `Sub`".to_string(),
             "policy-group",
             key_of(&served.url(&format!("/nodes?token={TOKEN}"))),
         ),
-        json!({
+        a_set(json!({
             "path": file.display().to_string(), "type": "ruleset",
             "key": resource_key(&ResourceSource::File(file)), "local": true,
             "ready": true, "updating": false, "fromModule": null
-        }),
+        })),
         database("GeoLite2-Country.mmdb", "/geo/country.mmdb"),
         database("GeoLite2-ASN.mmdb", "/geo/asn.mmdb"),
     ];
@@ -1620,6 +1628,72 @@ async fn external_resources_are_listed_one_item_for_each_kind() {
         (a["path"].as_str(), a["key"].as_str()).cmp(&(b["path"].as_str(), b["key"].as_str()))
     });
     assert_eq!(listed(api.addr).await, expected);
+}
+
+/// A rule set and a domain set say how many of their lines were not used:
+/// the lines nobody could read, the lines beyond the limit, and the rules that
+/// carry a parameter nobody knows. Which kind of set it is does not matter,
+/// nor does whether the file is local; a set that was read whole says none.
+/// The sets did load, so none of this is an `error`.
+#[tokio::test]
+async fn external_resources_say_how_many_lines_of_a_set_were_not_used() {
+    // lines 3 and 4 cannot be read; the rules at 5 and 6 carry a parameter
+    // nobody knows
+    const RULES: &str = "# list\nDOMAIN,a.test\nnot a rule\nFINAL,DIRECT\nDOMAIN,b.test,bogus\nIP-CIDR,10.0.0.0/8,no-resolv\n";
+    // `bad domain` and `*.wild.test` are no names
+    const NAMES: &str = ".a.test\nbad domain\n*.wild.test\nb.test\n";
+    let url_of = |path: &str| url::Url::parse(&format!("http://sets.example{path}")).unwrap();
+    let (rules, clean, names) = (
+        url_of("/rules.list"),
+        url_of("/clean.list"),
+        url_of("/names.txt"),
+    );
+    let checked = SystemTime::now() - Duration::from_secs(600);
+    let api = api_seeded(
+        &format!(
+            "RULE-SET,{rules},DIRECT\nRULE-SET,{clean},DIRECT\nDOMAIN-SET,{names},DIRECT\nRULE-SET,local.list,DIRECT"
+        ),
+        "",
+        |dir| {
+            seed_cache(dir, &rules, RULES.as_bytes(), checked);
+            seed_cache(dir, &clean, b"DOMAIN,clean.test\n", checked);
+            seed_cache(dir, &names, NAMES.as_bytes(), checked);
+            std::fs::write(dir.join("local.list"), RULES).unwrap();
+        },
+    )
+    .await;
+    let defines = listed(api.addr).await;
+    let item_of = |key: String| {
+        defines
+            .iter()
+            .find(|d| d["key"] == json!(key))
+            .unwrap_or_else(|| panic!("no item has the key {key}: {defines:?}"))
+    };
+    let at = checked.duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+    // the whole item, beside the manual's fields
+    assert_eq!(
+        item_of(key_of(&rules)),
+        &json!({
+            "path": rules.to_string(), "type": "ruleset", "key": key_of(&rules),
+            "local": false, "ready": true, "updatedAt": at, "updating": false,
+            "fromModule": null, "skipped": 2, "truncated": 0, "unknownParams": 2
+        })
+    );
+    let numbers =
+        |item: &Value| ["skipped", "truncated", "unknownParams"].map(|field| item[field].clone());
+    let file = resource_key(&ResourceSource::File(api.dir.path().join("local.list")));
+    for (key, kind, expected) in [
+        (key_of(&rules), "ruleset", [2, 0, 2]),
+        (file, "ruleset", [2, 0, 2]),
+        (key_of(&names), "domainset", [2, 0, 0]),
+        (key_of(&clean), "ruleset", [0, 0, 0]),
+    ] {
+        let item = item_of(key);
+        assert_eq!(item["type"], json!(kind), "{item}");
+        assert_eq!(numbers(item), expected.map(|n| json!(n)), "{item}");
+        assert!(item.get("error").is_none(), "{item}");
+    }
 }
 
 /// The sources of the profile come first, the managed profile before the
@@ -1639,6 +1713,12 @@ async fn external_resources_of_the_profile_come_first_and_the_managed_one_is_fla
         .collect();
     assert_eq!(kinds[..2], ["profile", "include"], "{defines:?}");
     assert_eq!(defines.len(), 8);
+    // the sources of the profile are no sets: no lines to say anything of
+    for source in &defines[..2] {
+        for field in ["skipped", "truncated", "unknownParams"] {
+            assert!(source.get(field).is_none(), "{source}");
+        }
+    }
     assert_eq!(
         defines[0]["path"],
         json!(format!("managed profile ({origin})"))
