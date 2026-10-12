@@ -213,6 +213,63 @@ mod tests {
         }
     }
 
+    /// Every field of a record reaches the JSON under its own name, with its
+    /// own value, and the JSON has no other. The values are all different, so
+    /// that two fields that changed places show.
+    #[test]
+    fn every_field_of_a_record_is_sent_under_its_own_name() {
+        let record = RequestRecord {
+            id: 12,
+            listener: ListenerKind::Socks5,
+            transport: Transport::Udp,
+            src: "127.0.0.1:51234".parse().unwrap(),
+            listen_port: 6153,
+            dst: "example.com:443".into(),
+            remote_addr: Some("127.0.0.1:8443".parse().unwrap()),
+            rule: Some("DOMAIN-SUFFIX,example.com,Proxy".into()),
+            policy: vec!["Proxy".into(), "HK".into()],
+            sni: Some("example.com".into()),
+            protocol: Some(ProtocolKind::Https),
+            up: 1234,
+            down: 56789,
+            started_ms: 1_757_200_000_000,
+            elapsed_ms: 812,
+            connect_ms: Some(35),
+            first_byte_ms: Some(120),
+            dns_ms: Some(14),
+            status: RecordStatus::Rejected("REJECT-TINYGIF".into()),
+            error: Some("an explanation".into()),
+            notes: vec!["a note".into()],
+        };
+        assert_eq!(
+            serde_json::to_value(RequestJson::from(&record)).unwrap(),
+            json!({
+                "id": 12,
+                "listener": "socks5",
+                "transport": "udp",
+                "src": "127.0.0.1:51234",
+                "listenPort": 6153,
+                "dst": "example.com:443",
+                "remoteAddr": "127.0.0.1:8443",
+                "rule": "DOMAIN-SUFFIX,example.com,Proxy",
+                "policy": ["Proxy", "HK"],
+                "sni": "example.com",
+                "protocol": "https",
+                "up": 1234,
+                "down": 56789,
+                "startedMs": 1_757_200_000_000_u64,
+                "elapsedMs": 812,
+                "connectMs": 35,
+                "firstByteMs": 120,
+                "dnsMs": 14,
+                "status": "rejected",
+                "rejectKind": "REJECT-TINYGIF",
+                "error": "an explanation",
+                "notes": ["a note"],
+            })
+        );
+    }
+
     #[test]
     fn kill_check_distinguishes_missing_internal_and_killable() {
         let active = [
