@@ -2931,6 +2931,101 @@ mod run {
         drop(daemon);
     }
 
+    /// Everything the lines of `lines` come to once the sender is gone: the
+    /// daemon has ended, and its pipe is read to the end.
+    fn drained(lines: &mpsc::Receiver<String>) -> Vec<String> {
+        let mut all = Vec::new();
+        while let Ok(line) = lines.recv_timeout(Duration::from_secs(2)) {
+            all.push(line);
+        }
+        all
+    }
+
+    /// No credential of the profile reaches what the daemon writes, at the
+    /// most talkative level: its standard output, its standard error and its
+    /// log file hold nothing of the password of `http-listen`, the key of
+    /// `http-api` and the credentials of an upstream proxy, through a start,
+    /// a request that is let in and one that is turned away, API calls with
+    /// the right key and a wrong one, a reload and a stop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_credential_of_the_profile_reaches_the_daemons_output_or_log_file() {
+        use rurge_proto::testing::{FakeHttpProxy, HttpProxyScript};
+        const MARKER: &str = "S3CR3T";
+        let upstream = FakeHttpProxy::spawn(HttpProxyScript::default()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let conf = dir.path().join("t.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "[General]\nhttp-listen = {MARKER}-listen@127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nhttp-api = {MARKER}-key@127.0.0.1:0\nloglevel = verbose\n\
+[Proxy]\nUp = http, 127.0.0.1, {}, {MARKER}-user, {MARKER}-pass\n[Rule]\nDOMAIN,via.test,Up\nFINAL,DIRECT\n",
+                upstream.addr().port()
+            ),
+        )
+        .unwrap();
+        let mut cmd = rurge_run(&conf, &dir.path().join("data"));
+        cmd.arg("--log-file").arg(logs.join("rurge.log"));
+        let (mut daemon, errors) =
+            tokio::task::spawn_blocking(move || spawn_command_reading_stderr(cmd))
+                .await
+                .unwrap();
+        let (http, api) = (daemon.http, api_port(&daemon));
+        let (served, turned_away) = tokio::task::spawn_blocking(move || {
+            let key = format!("{MARKER}-key");
+            let url = "http://via.test/hello";
+            let served = http_get_with(
+                http,
+                url,
+                &basic_credentials(&format!("anyone:{MARKER}-listen")),
+            );
+            let turned_away = http_get_with(
+                http,
+                url,
+                &basic_credentials(&format!("anyone:{MARKER}-wrong")),
+            );
+            let _ = api_call(api, "GET", "/v1/requests/recent", &key, None);
+            let _ = api_call(
+                api,
+                "GET",
+                "/v1/requests/recent",
+                &format!("{MARKER}-wrongkey"),
+                None,
+            );
+            let _ = api_call(api, "POST", "/v1/profiles/reload", &key, Some("{}"));
+            let _ = api_call(api, "GET", "/v1/profiles/current", &key, None);
+            let _ = api_call(api, "POST", "/v1/stop", &key, Some("{}"));
+            (served, turned_away)
+        })
+        .await
+        .unwrap();
+        assert!(
+            served.starts_with("HTTP/1.1 200") && served.ends_with("forwarded"),
+            "{served}"
+        );
+        assert!(turned_away.starts_with("HTTP/1.1 407"), "{turned_away}");
+        assert_eq!(wait_for_exit(&mut daemon, 10), Some(0));
+        let mut written = drained(&daemon.lines);
+        written.extend(drained(&errors));
+        for entry in std::fs::read_dir(&logs).unwrap() {
+            let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            written.extend(text.lines().map(str::to_string));
+        }
+        // the level is the most talkative one, and the traffic is in it
+        assert!(
+            written
+                .iter()
+                .any(|line| line.contains("session completed")),
+            "{written:#?}"
+        );
+        let leaked: Vec<&String> = written
+            .iter()
+            .filter(|line| line.contains(MARKER))
+            .collect();
+        assert!(leaked.is_empty(), "a credential was written: {leaked:#?}");
+    }
+
     /// How many finished requests the log keeps is what `--request-log-size`
     /// or `RURGE_REQUEST_LOG_SIZE` says; without either it keeps more than the
     /// three of this test.
