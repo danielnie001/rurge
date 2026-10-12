@@ -849,7 +849,8 @@ mod tests {
 
     /// `CELLULAR-RADIO` and `CELLULAR-CARRIER` are iOS rules (manual,
     /// Protocol and Network Rules): on a desktop neither ever matches, and
-    /// neither says anything about it, as `SUBNET` does.
+    /// neither leaves a note at run time that it cannot, as a `SUBNET` rule
+    /// does.
     #[test]
     fn the_cellular_rules_never_match_and_say_nothing() {
         for raw in [
