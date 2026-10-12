@@ -2015,6 +2015,40 @@ encrypted-dns-skip-cert-verification = true",
         );
     }
 
+    /// `--dns-cache-size` says how many names the cache holds: with room for
+    /// two, the third name asked for pushes the one asked for first out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_cache_holds_as_many_names_as_dns_cache_size_says() {
+        let mock = MockDns::spawn().await;
+        for name in ["a.test", "b.test", "c.test"] {
+            mock.set(name, &["10.0.0.3"], &[], 60);
+        }
+        let dir = workspace();
+        let server = mock.addr().to_string();
+        let kept = |extra: &'static [&'static str]| {
+            let (dir, server) = (dir.path().to_path_buf(), server.clone());
+            async move {
+                let mut args = vec!["a.test", "b.test", "c.test", "--json"];
+                args.extend_from_slice(extra);
+                let out = output(dns_cmd(&dir, "cache", &server, &args)).await;
+                assert_eq!(out.status.code(), Some(0));
+                let mut names: Vec<String> = json_of(&out)["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e["name"].as_str().unwrap().to_string())
+                    .collect();
+                names.sort();
+                names
+            }
+        };
+        assert_eq!(
+            kept(&["--dns-cache-size", "2"]).await,
+            ["b.test", "c.test"]
+        );
+        assert_eq!(kept(&[]).await, ["a.test", "b.test", "c.test"]);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn invalid_server_spec_exits_two() {
         let dir = workspace();
