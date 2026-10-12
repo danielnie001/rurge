@@ -1128,6 +1128,42 @@ mod tests {
         assert_eq!(g.always_raw_tcp_keywords, ["kw1", "kw2"]);
     }
 
+    /// Every default the page states.
+    #[test]
+    fn the_defaults_are_the_manuals() {
+        let (g, d) = parse("[General]\n");
+        assert!(d.is_empty());
+        assert_eq!(g.loglevel, LogLevel::Notify);
+        assert!(!g.debug_cpu_usage && !g.debug_memory_usage);
+        assert!(!g.encrypted_dns_follow_outbound_mode && !g.encrypted_dns_skip_cert_verification);
+        assert!(!g.allow_dns_svcb && !g.use_local_host_item_for_proxy);
+        assert!(!g.disable_geoip_db_auto_update && !g.ipv6);
+        assert_eq!(g.ipv6_vif, Ipv6Vif::Disabled);
+        assert!(g.icmp_forwarding);
+        assert!(!g.exclude_simple_hostnames);
+        assert!(g.proxy_restricted_to_lan && g.gateway_restricted_to_lan);
+        assert!(!g.http_api_tls && !g.http_api_web_dashboard);
+        assert_eq!(g.internet_test_url, "http://bing.com/");
+        assert_eq!(g.proxy_test_url, "http://bing.com/");
+        // 5 seconds for a proxy, 10 for DIRECT
+        assert_eq!(g.test_target(None, None, false).1, Duration::from_secs(5));
+        assert_eq!(g.test_target(None, None, true).1, Duration::from_secs(10));
+        assert_eq!(g.force_http_engine_hosts.default_port, Some(80));
+        assert_eq!(g.udp_policy_not_supported_behaviour, UdpFallback::Reject);
+        assert!(g.udp_priority);
+        assert_eq!(g.block_quic, BlockQuicGlobal::PerPolicy);
+        assert!(g.show_error_page && !g.show_error_page_for_reject);
+        assert_eq!(g.compatibility_mode, 0);
+        assert!(g.auto_suspend);
+        assert!(!g.allow_wifi_access && !g.allow_hotspot_access);
+        assert_eq!(
+            (g.wifi_access_http_port, g.wifi_access_socks5_port),
+            (6152, 6153)
+        );
+        assert!(g.set_system_socks_proxy && g.read_etc_hosts && g.subnet_exp_wifi_always_match);
+        assert!(g.http_listen.is_empty() && g.socks5_listen.is_empty());
+    }
+
     #[test]
     fn defaults_when_section_missing() {
         let (g, d) = parse("[Rule]\nFINAL,DIRECT\n");
