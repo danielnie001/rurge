@@ -1494,6 +1494,61 @@ Emptyish = select, Block\nHop = select, EntryA, EntryB\n[Rule]\nFINAL,Pick\n";
         assert!(reg.contains("HK") && !reg.contains("Nope"));
     }
 
+    /// Each of the four iOS-only built-ins goes DIRECT, naming itself in the
+    /// chain, and carries no note: the load has warned of it already.
+    #[test]
+    fn every_ios_only_built_in_goes_direct() {
+        let reg = built(GroupSelections::new()).registry;
+        for name in ["CELLULAR", "CELLULAR-ONLY", "HYBRID", "NO-HYBRID"] {
+            let resolved = reg.resolve(&PolicyRef::parse(name));
+            assert_eq!(chain(&resolved), vec![name, "DIRECT"], "{name}");
+            assert_eq!(
+                (resolved.outbound.name(), resolved.terminal, resolved.note),
+                ("DIRECT", TerminalKind::Direct, None),
+                "{name}"
+            );
+        }
+    }
+
+    /// A `[Proxy]` line can name a built-in policy by one of the five type
+    /// keywords, and what it is called then is that policy; a `direct` alias
+    /// takes the common parameters, and carries them.
+    #[test]
+    fn every_built_in_policy_can_be_written_as_an_alias() {
+        let registry = generation(
+            "[Proxy]\nOn = direct\nOff = reject\nHold = reject-drop\nNever = reject-no-drop\n\
+Pixel = reject-tinygif\nCorp-VPN = direct, interface = utun0\n[Rule]\nFINAL,DIRECT\n",
+            &FakeFactory::new(),
+            None,
+        );
+        for (alias, built_in, terminal) in [
+            ("On", "DIRECT", TerminalKind::Direct),
+            ("Off", "REJECT", TerminalKind::Reject),
+            ("Hold", "REJECT-DROP", TerminalKind::Reject),
+            ("Never", "REJECT-NO-DROP", TerminalKind::Reject),
+            ("Pixel", "REJECT-TINYGIF", TerminalKind::Reject),
+            ("Corp-VPN", "DIRECT", TerminalKind::Direct),
+        ] {
+            let resolved = registry.resolve(&PolicyRef::parse(alias));
+            assert_eq!(chain(&resolved), vec![alias, built_in], "{alias}");
+            assert_eq!(
+                (resolved.outbound.name(), resolved.terminal),
+                (built_in, terminal),
+                "{alias}"
+            );
+        }
+        // the plain alias is the built-in itself, the one with a parameter is
+        // a DIRECT of its own
+        assert!(Arc::ptr_eq(
+            &outbound_of(&registry, "On"),
+            &registry.direct()
+        ));
+        assert!(!Arc::ptr_eq(
+            &outbound_of(&registry, "Corp-VPN"),
+            &registry.direct()
+        ));
+    }
+
     #[test]
     fn a_proxy_policy_resolves_to_its_own_outbound() {
         let reg = built(GroupSelections::new()).registry;
