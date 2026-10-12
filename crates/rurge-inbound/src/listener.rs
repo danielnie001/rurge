@@ -143,6 +143,32 @@ where
     F: Fn(TcpStream, SocketAddr) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    serve_checking(
+        listener,
+        name,
+        restrict_to_lan,
+        source_allowed,
+        stop,
+        handler,
+    )
+}
+
+/// `serve` with the rule that tells the sources a restricted listener takes
+/// given. It is `source_allowed`; a test, which has only the loopback to
+/// connect from — a source that rule always lets in —, puts another in its
+/// place to see what the accept loop does with a source that is refused.
+fn serve_checking<F, Fut>(
+    listener: TcpListener,
+    name: &'static str,
+    restrict_to_lan: bool,
+    allowed: fn(SocketAddr, IpAddr) -> bool,
+    stop: CancellationToken,
+    handler: F,
+) -> Running
+where
+    F: Fn(TcpStream, SocketAddr) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     let local_addr = listener
         .local_addr()
         .expect("bound listener has an address");
@@ -158,7 +184,7 @@ where
                 _ = stop.cancelled() => break,
                 accepted = listener.accept() => match accepted {
                     Ok((stream, peer)) => {
-                        if restrict_to_lan && !source_allowed(local_addr, peer.ip()) {
+                        if restrict_to_lan && !allowed(local_addr, peer.ip()) {
                             let mut map = warned.lock().expect("warned sources");
                             if warn_due(&mut map, peer.ip(), Instant::now()) {
                                 tracing::warn!(listener = name, source = %peer.ip(), "connection refused: source is not on the LAN (proxy-restricted-to-lan)");
@@ -216,6 +242,7 @@ pub(crate) async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+    use tokio::io::AsyncReadExt;
 
     fn ip(n: u32) -> IpAddr {
         IpAddr::V4(Ipv4Addr::from(n))
@@ -280,5 +307,92 @@ mod tests {
             .expect("the connection is taken")
             .unwrap();
         assert!(on);
+    }
+
+    /// The events a thread's logging says, one line of `field=value` pairs
+    /// each.
+    #[derive(Clone, Default)]
+    struct Said(Arc<Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for Said {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Line(String);
+            impl tracing::field::Visit for Line {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={value:?} ", field.name()));
+                }
+            }
+            let mut line = Line(String::new());
+            event.record(&mut line);
+            self.0.lock().unwrap().push(line.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A listener that keeps to the LAN closes a connection from any other
+    /// source without a word and says so in the log, naming the source; one
+    /// that does not keep to it takes the same connection. Which sources are
+    /// local is `restrict`'s to say, tested apart; here no source is, which
+    /// the loopback, the only place a test can connect from, cannot show.
+    #[tokio::test]
+    async fn a_listener_that_keeps_to_the_lan_closes_what_is_not_local_and_a_free_one_takes_it() {
+        let said = Said::default();
+        let _logging = tracing::subscriber::set_default(said.clone());
+        for (restrict_to_lan, taken) in [(true, false), (false, true)] {
+            let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (seen, mut sources) = tokio::sync::mpsc::unbounded_channel();
+            let _running = serve_checking(
+                listener,
+                "test",
+                restrict_to_lan,
+                |_, _| false,
+                CancellationToken::new(),
+                move |_, peer| {
+                    let _ = seen.send(peer);
+                    async {}
+                },
+            );
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            if taken {
+                let peer = tokio::time::timeout(Duration::from_secs(5), sources.recv())
+                    .await
+                    .expect("the connection is taken")
+                    .unwrap();
+                assert_eq!(peer, client.local_addr().unwrap());
+            } else {
+                let mut byte = [0u8; 1];
+                let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut byte))
+                    .await
+                    .expect("the connection is closed");
+                assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+                // the loop has dropped the connection, and the handler never had it
+                assert!(sources.try_recv().is_err());
+            }
+        }
+        let said = said.0.lock().unwrap().clone();
+        let refused: Vec<&String> = said
+            .iter()
+            .filter(|line| line.contains("proxy-restricted-to-lan"))
+            .collect();
+        assert_eq!(refused.len(), 1, "{said:?}");
+        assert!(
+            refused[0].contains("listener=\"test\"") && refused[0].contains("source=127.0.0.1"),
+            "{}",
+            refused[0]
+        );
     }
 }
