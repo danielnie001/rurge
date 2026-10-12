@@ -175,6 +175,9 @@ fn set_matches(handle: &SetHandle, name: &str) -> bool {
 
 /// `/etc/hosts` format: `<ip> <name> [<name>...]`, `#` comments.
 pub fn parse_hosts_file(text: &str) -> Vec<(String, IpAddr)> {
+    // some editors on Windows save a byte order mark: it is not part of the
+    // first address
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let mut out = Vec::new();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
@@ -391,6 +394,25 @@ DOMAIN-SET:https://al1ce:S3CR3T@sets.example/ok.txt = 1.2.3.4\n",
             HostAction::Ips(vec![ip("2.2.2.2")])
         );
         assert!(map.lookup("other.example").is_none());
+    }
+
+    /// A hosts file as some editors write it on Windows — a byte order mark
+    /// at its head, CRLF line ends, tabs between the fields — is read whole:
+    /// the first line is not lost to the mark.
+    #[test]
+    fn a_hosts_file_with_a_byte_order_mark_crlf_lines_and_tabs_is_read_whole() {
+        let parsed = parse_hosts_file(
+            "\u{feff}127.0.0.1\tlocalhost\r\n::1\tlocalhost ip6-localhost\r\n# a note\r\n0.0.0.0 ads.example\r\n",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                ("localhost".to_string(), ip("127.0.0.1")),
+                ("localhost".to_string(), ip("::1")),
+                ("ip6-localhost".to_string(), ip("::1")),
+                ("ads.example".to_string(), ip("0.0.0.0")),
+            ]
+        );
     }
 
     #[tokio::test]
