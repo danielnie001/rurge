@@ -267,6 +267,23 @@ mod tests {
         assert_eq!(p.truncated, 1);
     }
 
+    /// A set holds at most a million entries (manual, Rule Sets): the million
+    /// and first valid line is not in it, and is counted as left out.
+    #[test]
+    fn a_set_holds_a_million_entries_and_not_one_more() {
+        assert_eq!(MAX_ENTRIES, 1_000_000);
+        let mut text = String::with_capacity(16 * (MAX_ENTRIES + 1));
+        for i in 0..=MAX_ENTRIES {
+            text.push_str(&format!("h{i}.example\n"));
+        }
+        let names = HashSet::new();
+        let parsed = parse_set(SetKind::DomainSet, &text, &ctx_with(&names));
+        assert_eq!(
+            (parsed.lines.len(), parsed.truncated, parsed.skipped_total),
+            (1_000_000, 1, 0)
+        );
+    }
+
     #[test]
     fn skipped_reasons_are_capped_but_the_total_keeps_counting() {
         let names = HashSet::new();
