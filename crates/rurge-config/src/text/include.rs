@@ -544,6 +544,38 @@ mod tests {
         assert!(p.section("General").is_none());
     }
 
+    /// The three kinds of named section the manual lists each take in the
+    /// sections of their own kind from the profile they name, and no others.
+    #[test]
+    fn a_wildcard_takes_the_named_sections_of_its_own_kind_only() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("shared.conf"),
+            "[Ruleset Sets]\nDOMAIN,a.example\n[WireGuard Home]\nmtu = 1280\n[Tailscale Net]\nauth-key = k\n[General]\nipv6 = true\n",
+        )
+        .unwrap();
+        for (kind, taken) in [
+            ("Ruleset", "Ruleset Sets"),
+            ("WireGuard", "WireGuard Home"),
+            ("Tailscale", "Tailscale Net"),
+        ] {
+            fs::write(
+                dir.path().join("main.conf"),
+                format!("[{kind} *]\n#!include shared.conf\n[Rule]\nFINAL,DIRECT\n"),
+            )
+            .unwrap();
+            let (p, d) = load(dir.path(), "main.conf");
+            assert!(d.is_empty(), "{kind}: {:?}", d.into_vec());
+            let names: Vec<&str> = p
+                .sections
+                .iter()
+                .map(|s| s.name.as_str())
+                .filter(|name| *name != "Rule")
+                .collect();
+            assert_eq!(names, [taken], "{kind}");
+        }
+    }
+
     #[test]
     fn errors_and_warnings() {
         let dir = tempfile::tempdir().unwrap();
