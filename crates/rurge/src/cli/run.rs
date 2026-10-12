@@ -668,7 +668,9 @@ fn follow_the_sources(sources: &ProfileSources, engine: &Engine) {
         }
         Ask::Accept => {
             engine.suspend(None);
-            tracing::info!("managed profile: updated; new sessions are accepted again");
+            // An update that worked is one way out; a profile that no longer
+            // requires one is the other, and nothing was updated then.
+            tracing::info!("managed profile: new sessions are accepted again");
         }
     }
 }
@@ -909,7 +911,8 @@ impl Lock {
 struct Waited {
     /// The profile as it is by then. It can carry errors.
     loaded: Loaded,
-    lock: Option<File>,
+    /// The lock the downloads were made under.
+    lock: Lock,
     /// Why the update `strict` requires did not happen, when it did not.
     reason: Option<String>,
 }
@@ -929,15 +932,10 @@ fn wait_for_the_sources(
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("cannot create data dir {}", data_dir.display()))?;
     let lock = match lock_data_dir(data_dir) {
-        Ok(lock) => lock,
+        Ok(lock) => Lock::Taken(lock),
         Err(message) => {
             eprintln!("error: {message}");
             return Ok(ControlFlow::Break(ExitCode::from(1)));
-        }
-    };
-    let recover = |lock: &Option<File>| {
-        if lock.is_some() {
-            restore_what_a_crash_left(&data_dir.join(STATE_FILE));
         }
     };
     let limits = BootLimits::default();
@@ -962,19 +960,24 @@ fn wait_for_the_sources(
         // writes to the cache it writes between two awaits, in one piece.
         // What can still be running is on the blocking pool: the check of a
         // download, which is a load of the profile, or a name lookup. The
-        // timeout waits for those. One that is still at it after that goes on
-        // beside the main runtime: a check can write bodies it has judged to
-        // the cache, a file at a time as any download does, and the sources
-        // of the main runtime are registered from what the disk holds and ask
-        // the server again when they are due, so that a late write is at worst
-        // one more update; a lookup holds nothing of ours.
+        // timeout waits for those. A lookup holds nothing of ours. A check
+        // that is still at it after that, or queued behind one, goes on beside
+        // the main runtime, and at its end it can write to the cache the
+        // versions that were kept for the one it judged. The sources of the
+        // main runtime are registered from what the disk holds and ask the
+        // server again when they are due, so a late write is as a rule one
+        // more update. The exception is a write that meets the main runtime's
+        // own write of the same entry: the two go through the same temporary
+        // file, and the entry can end up with parts of both. It stays so
+        // until the server sends a new body: an answer that nothing has
+        // changed does not write the body again.
         runtime.shutdown_timeout(Duration::from_secs(2));
         done
     };
     let (loaded, reason) = match waiting() {
         Ok(done) => done,
         Err(e) => {
-            recover(&lock);
+            lock.recover(&args.runtime);
             return Err(e);
         }
     };
@@ -985,7 +988,7 @@ fn wait_for_the_sources(
             reason,
         })),
         Err(e) => {
-            recover(&lock);
+            lock.recover(&args.runtime);
             Err(e.into())
         }
     }
@@ -1031,9 +1034,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     } else {
         match wait_for_the_sources(&args, &opts, first, need, &data_dir)? {
             ControlFlow::Break(code) => return Ok(code),
-            ControlFlow::Continue(waited) => {
-                (waited.loaded, Lock::Taken(waited.lock), waited.reason)
-            }
+            ControlFlow::Continue(waited) => (waited.loaded, waited.lock, waited.reason),
         }
     };
     if loaded.diagnostics.has_errors() {

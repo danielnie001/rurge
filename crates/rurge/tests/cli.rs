@@ -4524,7 +4524,7 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         /// The log line of a refusal that begins, without its `error` field,
         /// and the one of a refusal that ends.
         const REFUSING: &str = "the update that strict requires has not succeeded";
-        const ACCEPTING: &str = "managed profile: updated; new sessions are accepted again";
+        const ACCEPTING: &str = "managed profile: new sessions are accepted again";
         const PROXIES: &str = "[Proxy]\nRemoteP = http, 127.0.0.1, 1\n";
         const RULES: &str = "[Rule]\nDOMAIN,included.test,REJECT\n";
 
@@ -4628,6 +4628,27 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             }
         }
 
+        /// What is left of a stream of a process that has ended, to its last
+        /// line: the pipe closed with the process, and the thread that reads
+        /// it is at its end or will be in a moment.
+        fn the_rest(lines: &mpsc::Receiver<String>) -> String {
+            let mut text = String::new();
+            while let Ok(line) = lines.recv_timeout(Duration::from_secs(2)) {
+                text += &line;
+                text.push('\n');
+            }
+            text
+        }
+
+        /// A place for a session to go: a server, and the address of a page
+        /// it has.
+        async fn a_target() -> (TestServer, String) {
+            let target = TestServer::spawn().await;
+            target.set("/hello", "hi from target");
+            let hello = format!("http://127.0.0.1:{}/hello", target.url("/").port().unwrap());
+            (target, hello)
+        }
+
         /// A start that ends at once, with all it said.
         struct Gave {
             code: Option<i32>,
@@ -4657,19 +4678,10 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
                 }
                 std::thread::sleep(Duration::from_millis(50));
             };
-            // the pipes closed with the process: the readers are at their end
-            let all = |lines: mpsc::Receiver<String>| {
-                let mut text = String::new();
-                while let Ok(line) = lines.recv_timeout(Duration::from_secs(2)) {
-                    text += &line;
-                    text.push('\n');
-                }
-                text
-            };
             Gave {
                 code: status.code(),
-                stdout: all(stdout),
-                stderr: all(stderr),
+                stdout: the_rest(&stdout),
+                stderr: the_rest(&stderr),
             }
         }
 
@@ -4764,8 +4776,10 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             ));
             let before = as_it_is(&conf);
             let (mut daemon, errors) = spawn_command_reading_stderr(w.start());
+            // The load that found the sources missing says nothing: what the
+            // start says of the profile it says of the one it goes on with.
             let said = stderr_up_to(&errors, WAITING);
-            assert_eq!(said.last().map(String::as_str), Some(WAITING), "{said:?}");
+            assert_eq!(said, [WAITING], "{said:?}");
             let api = api_up(&daemon);
             let (_, policies) = api_call(api, "GET", "/v1/policies", "k", None);
             assert!(policies.contains("RemoteP"), "{policies}");
@@ -4865,7 +4879,8 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             let gave = gives_up(w.start());
             assert_eq!(gave.code, Some(2), "{}", gave.stderr);
             assert!(gave.stderr.contains(WAITING), "{}", gave.stderr);
-            assert!(gave.stderr.contains("W0022"), "{}", gave.stderr);
+            // said once, by the load the start ends with
+            assert_eq!(gave.stderr.matches("W0022").count(), 1, "{}", gave.stderr);
             assert!(gave.stderr.contains("http status 500"), "{}", gave.stderr);
             assert!(w.served.hits("/PATHMARK/managed.conf") >= 1);
             for marker in ["USERMARK", "PASSMARK", "PATHMARK", "QUERYMARK"] {
@@ -4914,9 +4929,8 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
                 shown += &String::from_utf8_lossy(&out.stderr);
             }
             stop(&mut daemon, api);
-            let mut said: Vec<String> = errors.try_iter().collect();
-            said.extend(daemon.lines.try_iter());
-            shown += &said.join("\n");
+            shown += &the_rest(&errors);
+            shown += &the_rest(&daemon.lines);
             shown + &log_text(&logs)
         }
 
@@ -4987,6 +5001,31 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             up(&daemon);
             assert_eq!(current(api), local);
             assert!(rules(api).contains("DOMAIN,local.test,REJECT"));
+            stop(&mut daemon, api);
+        }
+
+        /// What a running daemon reads the profile through knows why a source
+        /// could not be had: a check through the API, which reads as a reload
+        /// would, says it. The disk alone only knows that there is no copy.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_check_through_the_api_says_why_a_source_cannot_be_had() {
+            let w = Sources::new().await;
+            w.served.set("/rules", RULES);
+            w.served.set_status("/rules", 500);
+            w.include_rules();
+            let (mut daemon, errors) = spawn_command_reading_stderr(w.start());
+            stderr_up_to(&errors, "W0022");
+            let api = api_up(&daemon);
+            // The attempt the start waited for was made before the daemon's
+            // own sources existed; it makes its own once it follows them.
+            let mut said = String::new();
+            wait_for("the daemon's own attempt to fail", 20, || {
+                let (status, body) = api_call(api, "POST", "/v1/profiles/check", "k", Some("{}"));
+                assert_eq!(status, 200, "{body}");
+                said = body;
+                said.contains("http status 500")
+            });
+            assert!(said.contains("W0022"), "{said}");
             stop(&mut daemon, api);
         }
 
@@ -5081,6 +5120,9 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
 
         /// The downloads write to the cache, which one instance at a time
         /// may: the data directory is locked before anything is asked for.
+        /// The instance that holds it has the system proxy, and the backup
+        /// in the directory is its own: the start that is refused leaves
+        /// both as they are.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_start_that_must_wait_refuses_a_data_directory_another_instance_holds() {
             let w = Sources::new().await;
@@ -5090,7 +5132,16 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
                 "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nloglevel = warning\n[Rule]\nFINAL,DIRECT\n",
             )
             .unwrap();
-            let _holder = spawn_daemon(&first, &w.data());
+            std::fs::create_dir_all(w.data()).unwrap();
+            let proxy = sysproxy_file(&w.data());
+            std::fs::write(&proxy, ORIGINAL_PROXY).unwrap();
+            let holder = spawn_daemon_full(&first, &w.data(), false, None, &["--system-proxy"]);
+            wait_for_line(&holder, "system proxy enabled: ");
+            // up: a start writes `state.json` once more on its way to saying so
+            wait_for_line(&holder, "rurge ");
+            let applied = std::fs::read_to_string(&proxy).unwrap();
+            assert_ne!(applied, ORIGINAL_PROXY, "the holder owns the settings");
+            let state = std::fs::read_to_string(w.data().join("state.json")).unwrap();
             w.served.set("/managed", "[Rule]\nFINAL,DIRECT\n");
             w.point_at("/managed");
             let gave = gives_up(w.start());
@@ -5105,6 +5156,13 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
                 w.served.requests().len(),
                 0,
                 "nothing is asked for before the lock is had"
+            );
+            assert!(!gave.stderr.contains("system proxy"), "{}", gave.stderr);
+            assert_eq!(std::fs::read_to_string(&proxy).unwrap(), applied);
+            assert_eq!(
+                std::fs::read_to_string(w.data().join("state.json")).unwrap(),
+                state,
+                "the holder's backup is still there for it to restore"
             );
         }
 
@@ -5237,9 +5295,7 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_start_that_could_not_make_a_strict_update_refuses_sessions_from_the_first_one() {
             let w = Sources::new().await;
-            let target = TestServer::spawn().await;
-            target.set("/hello", "hi from target");
-            let hello = format!("http://127.0.0.1:{}/hello", target.url("/").port().unwrap());
+            let (target, hello) = a_target().await;
             let api = free_tcp_port();
             let copy = managed_text(&w.url("/managed"), "interval=60 strict=true", api, "");
             w.seed("/managed", &copy, TWO_HOURS);
@@ -5286,9 +5342,7 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn offline_a_strict_update_that_is_due_refuses_sessions_from_the_first_one() {
             let w = Sources::new().await;
-            let target = TestServer::spawn().await;
-            target.set("/hello", "hi from target");
-            let hello = format!("http://127.0.0.1:{}/hello", target.url("/").port().unwrap());
+            let (target, hello) = a_target().await;
             let api = free_tcp_port();
             let copy = managed_text(&w.url("/managed"), "interval=60 strict=true", api, "");
             w.seed("/managed", &copy, TWO_HOURS);
@@ -5324,13 +5378,13 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         /// The way out the user has: the update that `strict` requires is the
         /// one the line of the local file asks for while that file is in
         /// effect, and removing `strict` from it ends the refusal at the
-        /// reload, which an edit that keeps it does not.
+        /// reload, which an edit that keeps it does not. Putting it back
+        /// begins one, in a daemon that was accepting sessions: the update
+        /// is as overdue as it was.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn removing_strict_from_the_local_file_ends_a_refusal_at_the_reload() {
+        async fn strict_in_the_local_file_ends_a_refusal_and_begins_one_at_the_reload() {
             let w = Sources::new().await;
-            let target = TestServer::spawn().await;
-            target.set("/hello", "hi from target");
-            let hello = format!("http://127.0.0.1:{}/hello", target.url("/").port().unwrap());
+            let (_target, hello) = a_target().await;
             let api = free_tcp_port();
             let copy = managed_text(&w.url("/managed"), "interval=60 strict=true", api, "");
             w.seed("/managed", &copy, TWO_HOURS);
@@ -5374,6 +5428,60 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             });
             let log = log_text(&logs);
             assert_eq!(lines_with(&log, REFUSING).len(), 1, "{log}");
+            // and the one that puts it back begins a refusal, which is said again
+            w.write(&local("interval=60 strict=true"));
+            reload();
+            wait_for("sessions to be refused again", 10, || {
+                http_get(daemon.http, &hello).contains(rurge_engine::REFUSED_STRICT)
+            });
+            wait_for("the line that says so", 10, || {
+                lines_with(&log_text(&logs), REFUSING).len() == 2
+            });
+            let log = log_text(&logs);
+            let refusals = lines_with(&log, REFUSING);
+            assert!(
+                refusals.iter().all(|line| line.contains("http status 500")),
+                "{refusals:?}"
+            );
+            assert_eq!(lines_with(&log, ACCEPTING).len(), 1, "{log}");
+            stop(&mut daemon, api);
+        }
+
+        /// The update falls due while the daemon runs, and fails: from then
+        /// on sessions are refused, which the log says once. Until then they
+        /// were accepted: the copy was not an interval old when the daemon
+        /// came up.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refusal_begins_when_the_update_falls_due_and_fails_while_the_daemon_runs() {
+            let w = Sources::new().await;
+            let (_target, hello) = a_target().await;
+            let api = free_tcp_port();
+            let copy = managed_text(&w.url("/managed"), "interval=60 strict=true", api, "");
+            // Checked three quarters of a minute ago and due at a minute: the
+            // daemon has a quarter of a minute to come up and serve a session
+            // before the update is owed. The update is made up to a tenth of
+            // the interval after that.
+            w.seed("/managed", &copy, Duration::from_secs(45));
+            w.served.set("/managed", copy);
+            w.served.set_status("/managed", 500);
+            w.point_at("/managed");
+            let logs = w.dir.path().join("logs");
+            let mut cmd = w.start();
+            log_to(&mut cmd, &logs);
+            let (mut daemon, _errors) = spawn_command_reading_stderr(cmd);
+            assert!(http_get(daemon.http, &hello).ends_with("hi from target"));
+            up(&daemon);
+            wait_for("sessions to be refused", 60, || {
+                http_get(daemon.http, &hello).contains(rurge_engine::REFUSED_STRICT)
+            });
+            wait_for("the line that says so", 10, || {
+                !lines_with(&log_text(&logs), REFUSING).is_empty()
+            });
+            let log = log_text(&logs);
+            let refusals = lines_with(&log, REFUSING);
+            assert_eq!(refusals.len(), 1, "{log}");
+            assert!(refusals[0].contains("http status 500"), "{refusals:?}");
+            assert!(lines_with(&log, ACCEPTING).is_empty(), "{log}");
             stop(&mut daemon, api);
         }
 
@@ -5382,9 +5490,7 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_refusal_ends_when_the_next_update_works() {
             let w = Sources::new().await;
-            let target = TestServer::spawn().await;
-            target.set("/hello", "hi from target");
-            let hello = format!("http://127.0.0.1:{}/hello", target.url("/").port().unwrap());
+            let (_target, hello) = a_target().await;
             let api = free_tcp_port();
             let line = "interval=60 strict=true";
             let old = managed_text(&w.url("/managed"), line, api, "");
@@ -5411,16 +5517,16 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             log_to(&mut cmd, &logs);
             let (mut daemon, _errors) = spawn_command_reading_stderr(cmd);
             flip.await.unwrap();
-            let refused = http_get(daemon.http, &hello);
-            assert!(refused.contains(rurge_engine::REFUSED_STRICT), "{refused}");
+            // That it came up refusing is what its log says: a session sent
+            // now would race the update that is on its way.
             wait_for("sessions to be accepted again", 30, || {
                 http_get(daemon.http, &hello).ends_with("hi from target")
             });
-            let log = log_text(&logs);
-            assert_eq!(lines_with(&log, REFUSING).len(), 1, "{log}");
             wait_for("the line that says so", 10, || {
                 lines_with(&log_text(&logs), ACCEPTING).len() == 1
             });
+            let log = log_text(&logs);
+            assert_eq!(lines_with(&log, REFUSING).len(), 1, "{log}");
             wait_for("the new version", 30, || {
                 rules(api).contains("DOMAIN,new.test,REJECT")
             });
@@ -5432,8 +5538,9 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
 
         /// A new version of the managed profile that arrives while the daemon
         /// runs is taken without a signal, a request to the API or `--watch`.
-        /// The daemon comes up on the copy it has, and the update that is due
-        /// at once brings the new version three seconds later.
+        /// The daemon comes up on the copy it has, waiting for nothing, and
+        /// the update that is due at once brings the new version, which a
+        /// reload puts in effect.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_new_version_of_the_managed_profile_is_taken_without_being_asked() {
             let w = Sources::new().await;
@@ -5443,12 +5550,12 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             let new = managed_text(&w.url("/managed"), line, api, "DOMAIN,new.test,REJECT\n");
             w.seed("/managed", &old, TWO_HOURS);
             w.served.set("/managed", new.clone());
-            w.served.set_delay("/managed", Duration::from_secs(3));
             w.point_at("/managed");
-            let (mut daemon, _errors) = spawn_command_reading_stderr(w.start());
+            let logs = w.dir.path().join("logs");
+            let mut cmd = w.start();
+            log_to(&mut cmd, &logs);
+            let (mut daemon, errors) = spawn_command_reading_stderr(cmd);
             up(&daemon);
-            assert_eq!(current(api), old, "the daemon runs on the copy it has");
-            assert!(rules(api).contains("DOMAIN,old.test,REJECT"));
             // The profile the API shows is the file, which is the new version
             // as soon as it is downloaded; the rules are the generation in
             // use, which is the new one when the daemon has reloaded.
@@ -5458,6 +5565,12 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             assert_eq!(current(api), new);
             assert!(!rules(api).contains("DOMAIN,old.test,REJECT"));
             stop(&mut daemon, api);
+            // It came up on the copy it had: the start waited for nothing, and
+            // what put the new version in effect was a reload.
+            let said = the_rest(&errors);
+            assert!(!said.contains(WAITING), "{said}");
+            let log = log_text(&logs);
+            assert!(!lines_with(&log, "profile reloaded").is_empty(), "{log}");
         }
 
         /// The local file was changed after the last update and is in effect
@@ -5473,15 +5586,22 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             w.seed("/managed", &copy, TWO_HOURS);
             // the server gives the text the copy has: the check finds nothing new
             w.served.set("/managed", copy.clone());
-            w.served.set_delay("/managed", Duration::from_secs(3));
             // written after the copy was checked
             w.write(&local);
-            let (mut daemon, _errors) = spawn_command_reading_stderr(w.start());
+            let logs = w.dir.path().join("logs");
+            let mut cmd = w.start();
+            log_to(&mut cmd, &logs);
+            let (mut daemon, errors) = spawn_command_reading_stderr(cmd);
             up(&daemon);
-            assert_eq!(current(api), local, "the local file is in effect");
             wait_for("the copy to take over", 30, || current(api) == copy);
             assert!(rules(api).contains("DOMAIN,copy.test,REJECT"));
             stop(&mut daemon, api);
+            // It came up on the local file, waiting for nothing: the copy
+            // took over at a reload, which nothing but the check asked for.
+            let said = the_rest(&errors);
+            assert!(!said.contains(WAITING), "{said}");
+            let log = log_text(&logs);
+            assert!(!lines_with(&log, "profile reloaded").is_empty(), "{log}");
         }
     }
 }
