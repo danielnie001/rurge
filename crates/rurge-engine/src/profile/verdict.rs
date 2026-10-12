@@ -8,6 +8,11 @@
 //! has not been downloaded yet is kept until that source has been tried, so
 //! that the profile never changes to a version with a piece missing.
 //!
+//! The source of the other half may not be due for a day: an included file is
+//! asked for once a day unless it says otherwise. So when a body is kept
+//! because the profile does not load with it, the other sources that load
+//! named are asked for an update at once, a few times.
+//!
 //! Every verdict is made under one lock, held across the load (`Verdicts`),
 //! and only on a thread of the blocking pool. The order of the locks is that
 //! one, then the state of the sources, then the locks of the manager: nothing
@@ -22,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::io;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
 use url::Url;
 
@@ -34,6 +39,11 @@ const NOT_REFERRED_TO: &str = "the profile no longer refers to this address";
 
 /// Why an included body is not taken when it is not what is included.
 const NO_SECTION: &str = "lacks the section it is included into";
+
+/// How many times the other sources are asked on account of one address whose
+/// version does not load, and how far apart at the least.
+const ASK_TIMES: u8 = 5;
+const ASK_EVERY: Duration = Duration::from_secs(60);
 
 /// A body that was downloaded, as the text it is.
 #[derive(Clone)]
@@ -54,6 +64,9 @@ struct Kept {
     /// It was downloaded and waits for sources of the profile that have not
     /// been tried, and has no fault of its own.
     waiting: bool,
+    /// How many times the other sources were asked on account of this
+    /// address, since something of it was first kept.
+    asked: u8,
 }
 
 /// What the verdicts remember. The lock around it is the verdict lock.
@@ -82,6 +95,9 @@ pub(super) struct Verdicts {
     /// check has returned, and a verdict that begins in between has to find it
     /// all the same.
     accepted: Vec<Candidate>,
+    /// When the other sources were last asked on account of a version that
+    /// does not load.
+    asked_at: Option<Instant>,
 }
 
 /// What one load of the profile with some candidates comes to.
@@ -265,13 +281,19 @@ impl ProfileSources {
                 .unwrap_or(alone),
             _ => WAITING.to_string(),
         };
+        let asked = v
+            .kept
+            .iter()
+            .find(|k| k.candidate.url == *url)
+            .map_or(0, |k| k.asked);
         v.kept.retain(|k| k.candidate.url != *url);
         // A body that is not what is included is no half of a change: kept,
         // it would make every group it is judged with fail.
         if reason != NO_SECTION {
-            self.keep(v, candidate, waiting);
+            self.keep(v, candidate, waiting, asked);
         }
         self.release(v, &run);
+        self.ask_for_the_other_half(v, url, &run);
         Err(reason)
     }
 
@@ -294,7 +316,7 @@ impl ProfileSources {
                         .iter()
                         .any(|taken| taken.url == k.candidate.url)
             });
-            self.keep(v, candidate, false);
+            self.keep(v, candidate, false, 0);
             return Err(format!("cannot write the cache: {error}"));
         }
         v.kept.clear();
@@ -306,13 +328,53 @@ impl ProfileSources {
     /// Keeps `candidate`, the newest of its address. A source that is not
     /// registered any more has nothing to supersede it, and nothing to wait
     /// for.
-    fn keep(&self, v: &mut Verdicts, candidate: Candidate, waiting: bool) {
+    fn keep(&self, v: &mut Verdicts, candidate: Candidate, waiting: bool, asked: u8) {
         if let Some(status) = self.status_of(&key_of(&candidate.url)) {
             v.kept.push(Kept {
                 candidate,
                 fetched_at: status.fetched_at,
                 waiting,
+                asked,
             });
+        }
+    }
+
+    /// The version of `url` that was kept does not load. It may be one half
+    /// of a change, and the source of the other half may not be due for a
+    /// day: the other sources the loads of this verdict named are asked for
+    /// an update now. At the most once a minute, and `ASK_TIMES` times on
+    /// account of one address: after that they are asked when they are due,
+    /// so that a server that never gives anything that loads does not have
+    /// the others asked for ever. A version that waits is not at fault, and
+    /// what it waits for is being tried.
+    fn ask_for_the_other_half(&self, v: &mut Verdicts, url: &Url, run: &Run) {
+        let now = Instant::now();
+        let lately = |at: Instant| now.duration_since(at) < ASK_EVERY;
+        if v.asked_at.is_some_and(lately) {
+            return;
+        }
+        let Some(kept) = v
+            .kept
+            .iter_mut()
+            .find(|k| k.candidate.url == *url && !k.waiting && k.asked < ASK_TIMES)
+        else {
+            return;
+        };
+        let others: Vec<Url> = self
+            .core
+            .lock()
+            .tracked
+            .iter()
+            .filter(|t| t.url != *url && run.named.contains(&t.url))
+            .map(|t| t.url.clone())
+            .collect();
+        if others.is_empty() {
+            return;
+        }
+        kept.asked += 1;
+        v.asked_at = Some(now);
+        for other in others {
+            self.manager.force_update(&ResourceSource::Url(other));
         }
     }
 
@@ -572,7 +634,6 @@ mod tests {
     use rurge_config::config::{LoadOptions, load};
     use rurge_net::resource::ResourceOptions;
     use rurge_net::testing::{TestServer, seed_cache};
-    use std::time::Duration;
 
     const HOUR: Duration = Duration::from_secs(3600);
 
@@ -838,6 +899,45 @@ mod tests {
             .unwrap();
         assert_eq!(f.kept(), [f.server.url("/a")]);
         assert_eq!(f.sources.core.lock().kept, [(f.server.url("/a"), true)]);
+    }
+
+    /// The others are asked a few times on account of one address and then no
+    /// more: a server that never gives anything that loads does not have them
+    /// asked for ever.
+    #[tokio::test]
+    async fn the_others_are_asked_five_times_on_account_of_one_address() {
+        let f = Fixture::new().await;
+        // what `/b` was downloaded as: asking for it changes nothing
+        f.server.set("/b", rules("P1"));
+        // `/a` without `P1`, which `/b` uses
+        let a2 = policies(&["P2"]);
+        for asked in 1..=5 {
+            // as if a minute had passed
+            f.sources.verdicts.lock().unwrap().asked_at = None;
+            assert!(f.check("/a", &a2).await.is_err());
+            wait_for("the request", || f.server.hits("/b") == asked).await;
+        }
+        f.sources.verdicts.lock().unwrap().asked_at = None;
+        assert!(f.check("/a", &a2).await.is_err());
+        // A request that was asked for is made within milliseconds: the
+        // server is on the loopback and answers at once. 300 ms is the margin.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(f.server.hits("/b"), 5);
+    }
+
+    /// A version that waits is not at fault: nothing is asked on its account.
+    #[tokio::test]
+    async fn nothing_is_asked_on_account_of_a_version_that_waits() {
+        let f = Fixture::new().await;
+        // `/a` includes a file that takes long to arrive
+        f.server.set("/c", "[Proxy]\nP3 = direct\n");
+        f.server.set_delay("/c", Duration::from_secs(5));
+        let a2 = format!("[Proxy]\n#!include {}\nP1 = direct\n", f.server.url("/c"));
+        assert!(f.check("/a", &a2).await.is_err());
+        // A request that was asked for is made within milliseconds: the
+        // server is on the loopback. 300 ms is the margin.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(f.server.hits("/b"), 0);
     }
 
     /// The cache cannot be written for one of the kept candidates: what was

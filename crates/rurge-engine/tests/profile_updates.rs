@@ -31,6 +31,16 @@ const BROKEN: &str = "[Rule]\nDOMAIN,a.example,Nowhere\n";
 /// things is all that matters.
 const SOON: Duration = Duration::from_millis(300);
 
+/// A back-off so long that no source is asked a second time while a test
+/// runs, however many times in a row it fails.
+fn asked_once() -> ResourceOptions {
+    ResourceOptions {
+        min_backoff: Duration::from_secs(60),
+        max_backoff: Duration::from_secs(60),
+        ..fast()
+    }
+}
+
 /// The text of a managed profile: the line that keeps it updated from
 /// `/managed`, then `body`.
 fn managed(w: &World, body: &str) -> String {
@@ -275,6 +285,67 @@ async fn two_updates_at_once_are_taken_together() {
     assert_the_pair_moved(&w, &sources);
 }
 
+/// The source of the other half may not be due for a day. A version that does
+/// not load has the sources it is loaded with asked at once: the pair is whole
+/// with the one update that was asked for here.
+#[tokio::test]
+async fn the_other_half_is_asked_for_when_a_version_does_not_load() {
+    let (w, sources) = the_pair().await;
+    w.server.set("/managed", pair_managed(&w, "P2"));
+    w.server.set("/inc", pair_included("P2"));
+    update(&sources, &w, "/managed")
+        .await
+        .expect_err("it does not load by itself");
+    // nobody here asks for the included file, and it is not due
+    wait_until("the pair", || {
+        reads(&sources, &w, "/managed", &pair_managed(&w, "P2"))
+            && reads(&sources, &w, "/inc", &pair_included("P2"))
+    })
+    .await;
+    reported_once(&sources).await;
+    assert_the_pair_moved(&w, &sources);
+}
+
+/// They are asked once, and not at every attempt of the source whose version
+/// does not load, nor for the next version that does not.
+#[tokio::test]
+async fn the_other_sources_are_not_asked_again_within_a_minute() {
+    let (w, sources) = the_pair().await;
+    w.server.set("/managed", pair_managed(&w, "P2"));
+    update(&sources, &w, "/managed")
+        .await
+        .expect_err("it does not load by itself");
+    wait_until("the included file to be asked for", || {
+        w.server.hits("/inc") == 1
+    })
+    .await;
+    w.server.set("/managed", pair_managed(&w, "P3"));
+    update(&sources, &w, "/managed")
+        .await
+        .expect_err("neither does this one");
+    // The managed profile is asked for again every 50 to 200 ms, and refused
+    // each time. A request for the included file would be made within
+    // milliseconds of one of those: half a second is several of them.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(w.server.hits("/inc"), 1);
+}
+
+/// A page where the managed profile is meant to be names nothing: a captive
+/// portal does not have every source of the profile asked.
+#[tokio::test]
+async fn a_page_does_not_have_the_other_sources_asked() {
+    let (w, sources) = the_pair().await;
+    w.server.set("/managed", HTML);
+    update(&sources, &w, "/managed")
+        .await
+        .expect_err("the page is refused");
+    // A request that was asked for is made within milliseconds: the server
+    // is on the loopback. 300 ms is the margin, and the page is refused a
+    // few more times meanwhile.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(w.server.hits("/inc"), 0);
+}
+
 /// The managed profile of the three: its group uses `policy`, which `/inc`
 /// defines, and its rules include `/more`.
 fn trio_managed(w: &World, policy: &str) -> String {
@@ -291,13 +362,17 @@ fn trio_managed(w: &World, policy: &str) -> String {
 /// The rules `/more` was downloaded as.
 const MORE: &str = "[Rule]\nDOMAIN,one.example,DIRECT\n";
 
-/// A managed profile and the two files it includes, all downloaded.
+/// A managed profile and the two files it includes, all downloaded, and
+/// served as they were downloaded.
 async fn the_trio() -> (World, Arc<ProfileSources>) {
     let w = World::new().await;
     point_at_managed(&w, "interval=3600");
     w.seed("/managed", &trio_managed(&w, "P1"), ago(HOUR));
     w.seed("/inc", &pair_included("P1"), ago(HOUR));
     w.seed("/more", MORE, ago(HOUR));
+    w.server.set("/managed", trio_managed(&w, "P1"));
+    w.server.set("/inc", pair_included("P1"));
+    w.server.set("/more", MORE);
     let sources = w.sources(false);
     sources.track(&w.load());
     (w, sources)
@@ -310,17 +385,16 @@ async fn a_version_that_loads_alone_leaves_the_kept_ones_where_they_are() {
     let (w, sources) = the_trio().await;
     let more = "[Rule]\nDOMAIN,two.example,DIRECT\n";
     w.server.set("/managed", trio_managed(&w, "P2"));
-    w.server.set("/inc", pair_included("P2"));
-    w.server.set("/more", more);
-
     update(&sources, &w, "/managed")
         .await
         .expect_err("it needs the other file");
     // this one loads with the old versions of the others
+    w.server.set("/more", more);
     update(&sources, &w, "/more").await.expect("it loads alone");
     assert!(reads(&sources, &w, "/more", more));
     assert!(reads(&sources, &w, "/managed", &trio_managed(&w, "P1")));
     // and the one that waited is found by its partner
+    w.server.set("/inc", pair_included("P2"));
     update(&sources, &w, "/inc")
         .await
         .expect("together they load");
@@ -333,7 +407,6 @@ async fn a_version_that_loads_alone_leaves_the_kept_ones_where_they_are() {
 #[tokio::test]
 async fn a_page_where_a_file_is_included_does_not_stand_in_the_way_of_a_change() {
     let (w, sources) = the_trio().await;
-    w.server.set("/managed", trio_managed(&w, "P1"));
     w.server.set("/more", HTML);
     let reason = update(&sources, &w, "/more")
         .await
@@ -367,6 +440,8 @@ async fn an_address_nothing_refers_to_says_so_beside_a_version_that_does_not_loa
     w.write(&local(&format!("#!include {}\n", w.url("/more"))));
     w.seed("/inc", &pair_included("P1"), ago(HOUR));
     w.seed("/more", MORE, ago(HOUR));
+    // asked for when the other file is kept, and unchanged then
+    w.server.set("/more", MORE);
     let sources = w.sources(false);
     sources.track(&w.load());
     // the policy the group uses is gone from the included file: kept
@@ -487,13 +562,7 @@ async fn the_world_of_x_asked_once() -> (World, Arc<ProfileSources>) {
     let w = World::new().await;
     point_at_managed(&w, "interval=3600");
     w.seed("/managed", &old_managed(&w), ago(HOUR));
-    let sources = w.sources_with(
-        false,
-        ResourceOptions {
-            min_backoff: Duration::from_secs(60),
-            ..fast()
-        },
-    );
+    let sources = w.sources_with(false, asked_once());
     sources.track(&w.load());
     w.server.set("/managed", new_managed(&w));
     (w, sources)
@@ -756,13 +825,7 @@ async fn the_world_with_a_refused_file() -> (World, Arc<ProfileSources>) {
     w.seed("/a", A_BODY, ago(HOUR));
     w.server.set("/managed", first);
     w.server.set("/a", BROKEN);
-    let sources = w.sources_with(
-        false,
-        ResourceOptions {
-            min_backoff: Duration::from_secs(60),
-            ..fast()
-        },
-    );
+    let sources = w.sources_with(false, asked_once());
     sources.track(&w.load());
     let reason = update(&sources, &w, "/a")
         .await
@@ -941,11 +1004,7 @@ async fn a_version_that_waits_with_one_that_was_refused_is_no_failed_update() {
 #[tokio::test]
 async fn a_version_that_waited_and_does_not_load_any_more_is_a_failed_update() {
     // no source is asked a second time: the last look is all that can say so
-    let (w, sources) = a_strict_world_with(ResourceOptions {
-        min_backoff: Duration::from_secs(60),
-        ..fast()
-    })
-    .await;
+    let (w, sources) = a_strict_world_with(asked_once()).await;
     not_found(&w, "/x", Duration::from_secs(1));
     let reason = update(&sources, &w, "/managed")
         .await
@@ -1388,13 +1447,7 @@ async fn the_start_takes_a_version_that_waited_for_a_file_that_cannot_be_downloa
     assert_eq!(need, Boot::Wait);
     // a back-off so long that its source being asked again cannot be what
     // takes the version
-    let sources = w.sources_with(
-        false,
-        ResourceOptions {
-            min_backoff: Duration::from_secs(60),
-            ..fast()
-        },
-    );
+    let sources = w.sources_with(false, asked_once());
     let loaded = sources
         .bootstrap(first, need, BootLimits::default())
         .await
