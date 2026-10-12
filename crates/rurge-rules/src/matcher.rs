@@ -847,6 +847,26 @@ mod tests {
         );
     }
 
+    /// `CELLULAR-RADIO` and `CELLULAR-CARRIER` are iOS rules (manual,
+    /// Protocol and Network Rules): on a desktop neither ever matches, and
+    /// neither says anything about it, as `SUBNET` does.
+    #[test]
+    fn the_cellular_rules_never_match_and_say_nothing() {
+        for raw in [
+            "CELLULAR-RADIO,LTE",
+            "CELLULAR-RADIO,NR",
+            "CELLULAR-CARRIER,310260",
+        ] {
+            let mut ctx = EvalCtx::new(&NoGeo);
+            assert_eq!(
+                compile(raw).eval(&session("example.com"), &mut ctx),
+                Verdict::NoMatch,
+                "{raw}"
+            );
+            assert!(ctx.notes.is_empty(), "{raw}: {:?}", ctx.notes);
+        }
+    }
+
     #[test]
     fn geo_lookups_are_cached_per_ip() {
         // `Cell` is not Sync; the trait requires Send + Sync, so wrap the counter.
