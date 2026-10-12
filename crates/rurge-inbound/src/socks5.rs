@@ -399,6 +399,23 @@ mod tests {
         assert_eq!(sessions[0].bytes(), (4, 4));
     }
 
+    /// What `SRC-IP`, `SRC-PORT` and `IN-PORT` rules read is taken off the
+    /// connection: the client's own address with the port it connected from,
+    /// and the port of the listener it came in on.
+    #[tokio::test]
+    async fn a_session_names_the_client_and_the_listener_port() {
+        let (running, dialer) = listener(Duration::from_secs(30)).await;
+        let mut s = negotiate(running.local_addr).await;
+        let client = s.local_addr().unwrap();
+        s.write_all(&domain_request("echo.test", 7)).await.unwrap();
+        assert_eq!(read_reply(&mut s).await[1], REP_SUCCESS);
+        let sessions = dialer.sessions();
+        assert_eq!(sessions.len(), 1);
+        let info = sessions[0].session();
+        assert_eq!(info.src, client);
+        assert_eq!(info.in_port, running.local_addr.port());
+    }
+
     #[tokio::test]
     async fn rejects_failures_and_unsupported_commands_map_to_reply_codes() {
         let (running, _dialer) = listener(Duration::from_millis(200)).await;

@@ -697,6 +697,44 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     }
 
+    /// What `SRC-IP`, `SRC-PORT` and `IN-PORT` rules read is taken off the
+    /// connection: the client's own address with the port it connected from,
+    /// and the port of the listener it came in on — for a tunnel and for a
+    /// plain request alike.
+    #[tokio::test]
+    async fn a_session_names_the_client_and_the_listener_port() {
+        let (running, dialer, target) = listener_with_target(ListenerOpts::default()).await;
+        target.set("/hello", "hi there");
+        let port = target.url("/").port().unwrap();
+        let (tunnel, head) = raw(
+            running.local_addr,
+            "CONNECT echo.test:443 HTTP/1.1\r\nHost: echo.test:443\r\n\r\n",
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let mut plain = TcpStream::connect(running.local_addr).await.unwrap();
+        plain
+            .write_all(
+                format!(
+                    "GET http://target.test:{port}/hello HTTP/1.1\r\nHost: target.test:{port}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (head, _) = read_response(&mut plain).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let clients = [tunnel.local_addr().unwrap(), plain.local_addr().unwrap()];
+        assert_ne!(clients[0].port(), clients[1].port());
+        let sessions = dialer.sessions();
+        assert_eq!(sessions.len(), 2);
+        for (session, client) in sessions.iter().zip(clients) {
+            let info = session.session();
+            assert_eq!(info.src, client);
+            assert_eq!(info.in_port, running.local_addr.port());
+        }
+    }
+
     #[tokio::test]
     async fn rejected_connect_closes_without_a_response() {
         let (running, _dialer) = listener(ListenerOpts {
