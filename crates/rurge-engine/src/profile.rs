@@ -10,9 +10,13 @@
 //! engine can still update.
 //!
 //! A body the manager downloads is taken only if the whole profile still loads
-//! with it.
+//! with it (`verdict`), and the start waits for the sources the profile has not
+//! downloaded yet (`boot`).
 
+mod boot;
 mod verdict;
+
+pub use boot::{Boot, BootLimits, boot_need};
 
 use rurge_config::remote::origin;
 use rurge_config::{LoadOptions, Remote, RemoteRef, RemoteRole, RemoteSource, SourceInfo};

@@ -9,10 +9,10 @@ use common::{COPY, HOUR, LogCapture, QUIET, World, ago, fast, stays_quiet, text_
 use rurge_config::Remote;
 use rurge_config::codes;
 use rurge_config::config::Loaded;
-use rurge_engine::profile::{ProfileSources, disk_remote};
+use rurge_engine::profile::{Boot, BootLimits, ProfileSources, boot_need, disk_remote};
 use rurge_net::resource::{ResourceOptions, ResourceSource, resource_key};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::time::timeout;
 use url::Url;
 
@@ -702,4 +702,429 @@ async fn no_reason_and_no_log_line_shows_more_of_an_address_than_where_it_goes()
             .any(|l| l.contains("downloaded resource not adopted")),
         "{lines:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// the start
+
+/// The first load of the profile at the start: what the disk has.
+fn first_load(w: &World) -> Loaded {
+    w.loaded(disk_remote(&w.data()))
+}
+
+fn need(w: &World) -> Boot {
+    boot_need(&first_load(w), &w.data())
+}
+
+/// What the diagnostics of a load say, one to a line.
+fn said(loaded: &Loaded) -> String {
+    loaded
+        .diagnostics
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn not_downloaded(loaded: &Loaded, why: &str) -> bool {
+    loaded
+        .diagnostics
+        .iter()
+        .any(|d| d.code == codes::W_RESOURCE_UNAVAILABLE && d.message.contains(why))
+}
+
+#[tokio::test]
+async fn a_profile_with_no_remote_source_needs_nothing() {
+    let w = World::new().await;
+    w.write("[Rule]\nFINAL,DIRECT\n");
+    assert_eq!(need(&w), Boot::No);
+}
+
+#[tokio::test]
+async fn a_source_without_content_is_waited_for() {
+    let w = World::new().await;
+    w.write_including(&["/inc"]);
+    assert_eq!(need(&w), Boot::Wait);
+    w.seed("/inc", COPY, ago(HOUR));
+    assert_eq!(need(&w), Boot::No);
+}
+
+#[tokio::test]
+async fn a_managed_profile_without_a_copy_is_waited_for() {
+    let w = World::new().await;
+    point_at_managed(&w, "interval=3600");
+    assert_eq!(need(&w), Boot::Wait);
+}
+
+#[tokio::test]
+async fn a_strict_update_that_is_due_is_waited_for() {
+    let w = World::new().await;
+    point_at_managed(&w, "interval=60 strict=true");
+    let strict = format!(
+        "#!MANAGED-CONFIG {} interval=60 strict=true\n{COPY}",
+        w.url("/managed")
+    );
+    w.seed("/managed", &strict, ago(2 * HOUR));
+    assert_eq!(need(&w), Boot::Wait);
+    // the interval is not over yet
+    w.seed("/managed", &strict, ago(Duration::from_secs(10)));
+    assert_eq!(need(&w), Boot::No);
+    // an update that is due and not `strict` is made in the background
+    point_at_managed(&w, "interval=60");
+    let lax = format!("#!MANAGED-CONFIG {} interval=60\n{COPY}", w.url("/managed"));
+    w.seed("/managed", &lax, ago(2 * HOUR));
+    assert_eq!(need(&w), Boot::No);
+}
+
+/// What is wrong in the local file is for the user to mend; no update
+/// replaces it.
+#[tokio::test]
+async fn an_error_in_the_local_file_needs_nothing() {
+    let w = World::new().await;
+    w.seed("/inc", COPY, ago(HOUR));
+    w.write(&format!(
+        "[Rule]\n#!include {}\nDOMAIN,x.example,Nowhere\nFINAL,DIRECT\n",
+        w.url("/inc")
+    ));
+    let loaded = first_load(&w);
+    assert!(loaded.diagnostics.has_errors());
+    assert_eq!(boot_need(&loaded, &w.data()), Boot::No);
+}
+
+/// A copy that no longer loads is replaced by an update, if the server has
+/// one that does.
+#[tokio::test]
+async fn an_error_in_the_downloaded_copy_needs_a_refresh() {
+    let w = World::new().await;
+    point_at_managed(&w, "interval=3600");
+    w.seed(
+        "/managed",
+        &managed(&w, "[Rule]\nDOMAIN,x.example,Nowhere\nFINAL,DIRECT\n"),
+        ago(HOUR),
+    );
+    let loaded = first_load(&w);
+    assert!(loaded.diagnostics.has_errors());
+    assert_eq!(boot_need(&loaded, &w.data()), Boot::Refresh);
+}
+
+#[tokio::test]
+async fn an_error_in_a_cached_include_needs_a_refresh() {
+    let w = World::new().await;
+    // the other include has no content: the refresh is the more urgent need
+    w.write_including(&["/inc", "/other"]);
+    w.seed("/inc", "[Rule]\nDOMAIN,x.example,Nowhere\n", ago(HOUR));
+    let loaded = first_load(&w);
+    assert!(loaded.diagnostics.has_errors());
+    assert_eq!(boot_need(&loaded, &w.data()), Boot::Refresh);
+}
+
+#[tokio::test]
+async fn nothing_is_followed_when_nothing_is_needed() {
+    let w = World::new().await;
+    w.seed("/inc", COPY, ago(HOUR));
+    w.write_including(&["/inc"]);
+    w.server.set("/inc", "[Rule]\nDOMAIN,new.example,DIRECT\n");
+    let sources = w.sources(false);
+    let first = first_load(&w);
+    let loaded = sources
+        .bootstrap(first, Boot::No, BootLimits::default())
+        .await
+        .unwrap();
+    assert!(!loaded.diagnostics.has_errors());
+    assert!(sources.statuses().is_empty());
+    assert!(w.server.requests().is_empty());
+}
+
+/// A managed profile that includes two files, one of which includes a third:
+/// the start leaves with all four in the cache.
+#[tokio::test]
+async fn an_empty_cache_is_filled_with_everything_the_profile_leads_to() {
+    let w = World::new().await;
+    point_at_managed(&w, "interval=3600");
+    let rule = |name: &str| format!("DOMAIN,{name}.example,DIRECT\n");
+    w.server.set(
+        "/managed",
+        managed(
+            &w,
+            &format!(
+                "[Rule]\n#!include {}\n#!include {}\nFINAL,DIRECT\n",
+                w.url("/a"),
+                w.url("/b")
+            ),
+        ),
+    );
+    w.server.set(
+        "/a",
+        format!("[Rule]\n#!include {}\n{}", w.url("/c"), rule("a")),
+    );
+    w.server.set("/b", format!("[Rule]\n{}", rule("b")));
+    w.server.set("/c", format!("[Rule]\n{}", rule("c")));
+    let first = first_load(&w);
+    assert!(first.diagnostics.has_errors());
+    let need = boot_need(&first, &w.data());
+    assert_eq!(need, Boot::Wait);
+    let sources = w.sources(false);
+    let loaded = sources
+        .bootstrap(first, need, BootLimits::default())
+        .await
+        .unwrap();
+    assert!(!loaded.diagnostics.has_errors(), "{}", said(&loaded));
+    assert_eq!(loaded.config.source.remote.len(), 4);
+    assert!(loaded.config.source.remote.iter().all(|r| r.found()));
+    for path in ["/managed", "/a", "/b", "/c"] {
+        assert!(
+            matches!(
+                disk_remote(&w.data()).get(&w.url(path)),
+                Remote::Text { .. }
+            ),
+            "{path}"
+        );
+    }
+    let raws: Vec<_> = loaded.config.rules.iter().map(|r| r.raw.as_str()).collect();
+    for domain in ["a", "b", "c"] {
+        assert!(raws.contains(&format!("DOMAIN,{domain}.example,DIRECT").as_str()));
+    }
+}
+
+/// A server that fails ends the start after one round, whatever the limits
+/// are; the load that comes back says why.
+#[tokio::test]
+async fn a_server_that_answers_500_ends_the_start_after_one_round() {
+    let log = LogCapture::start();
+    let w = World::new().await;
+    let port = w.url("/").port().unwrap();
+    let include =
+        format!("http://USERMARK:PASSMARK@127.0.0.1:{port}/PATHMARK/inc.conf?token=QUERYMARK");
+    w.server.set("/PATHMARK/inc.conf", "[Rule]\nFINAL,DIRECT\n");
+    w.server.set_status("/PATHMARK/inc.conf", 500);
+    // without the include the profile has no FINAL: an error in the local file
+    w.write(&format!("[Rule]\n#!include {include}\n"));
+    let first = first_load(&w);
+    assert!(first.diagnostics.has_errors());
+    let need = boot_need(&first, &w.data());
+    assert_eq!(need, Boot::Wait);
+    let sources = w.sources(false);
+    let limits = BootLimits {
+        round: Duration::from_secs(60),
+        total: Duration::from_secs(120),
+        rounds: 8,
+    };
+    let begun = Instant::now();
+    let loaded = sources.bootstrap(first, need, limits).await.unwrap();
+    assert!(
+        begun.elapsed() < Duration::from_secs(10),
+        "ended after {:?}",
+        begun.elapsed()
+    );
+    assert!(loaded.diagnostics.has_errors());
+    assert!(
+        not_downloaded(&loaded, "http status 500"),
+        "{}",
+        said(&loaded)
+    );
+    assert!(w.server.hits("/PATHMARK/inc.conf") >= 1);
+    // nothing of the address but where it goes
+    let mut shown = said(&loaded);
+    shown += &format!("{:?}", sources.statuses());
+    shown += &log.lines().join("\n");
+    for marker in ["USERMARK", "PASSMARK", "PATHMARK", "QUERYMARK"] {
+        assert!(!shown.contains(marker), "{marker} in: {shown}");
+    }
+}
+
+/// A source that has not answered after a round, and nothing else that moved:
+/// another round would wait for the same thing.
+#[tokio::test]
+async fn a_round_in_which_nothing_moved_ends_the_start() {
+    let w = World::new().await;
+    w.server.set("/slow", COPY);
+    w.server.set_delay("/slow", Duration::from_secs(10));
+    w.write(&format!("[Rule]\n#!include {}\n", w.url("/slow")));
+    let first = first_load(&w);
+    let sources = w.sources(false);
+    let limits = BootLimits {
+        round: Duration::from_millis(300),
+        total: Duration::from_secs(60),
+        rounds: 8,
+    };
+    let begun = Instant::now();
+    let loaded = sources.bootstrap(first, Boot::Wait, limits).await.unwrap();
+    // one round; eight of them would take 2.4 seconds
+    assert!(
+        begun.elapsed() >= Duration::from_millis(250)
+            && begun.elapsed() < Duration::from_millis(1500),
+        "ended after {:?}",
+        begun.elapsed()
+    );
+    assert!(loaded.diagnostics.has_errors());
+}
+
+/// No round waits longer than what is left of the whole.
+#[tokio::test]
+async fn the_whole_start_is_over_when_its_time_is() {
+    let w = World::new().await;
+    w.server.set("/slow", COPY);
+    w.server.set_delay("/slow", Duration::from_secs(10));
+    w.write(&format!("[Rule]\n#!include {}\n", w.url("/slow")));
+    let first = first_load(&w);
+    let sources = w.sources(false);
+    let limits = BootLimits {
+        round: Duration::from_secs(60),
+        total: Duration::from_millis(400),
+        rounds: 8,
+    };
+    let begun = Instant::now();
+    sources.bootstrap(first, Boot::Wait, limits).await.unwrap();
+    assert!(
+        begun.elapsed() >= Duration::from_millis(350) && begun.elapsed() < Duration::from_secs(3),
+        "ended after {:?}",
+        begun.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_file_that_takes_two_seconds_is_waited_for() {
+    let w = World::new().await;
+    w.server.set("/inc", "[Rule]\nFINAL,DIRECT\n");
+    w.server.set_delay("/inc", Duration::from_secs(2));
+    w.write(&format!("[Rule]\n#!include {}\n", w.url("/inc")));
+    let first = first_load(&w);
+    let need = boot_need(&first, &w.data());
+    assert_eq!(need, Boot::Wait);
+    let sources = w.sources(false);
+    let begun = Instant::now();
+    let loaded = sources
+        .bootstrap(first, need, BootLimits::default())
+        .await
+        .unwrap();
+    assert!(
+        begun.elapsed() >= Duration::from_millis(1900),
+        "ended after {:?}",
+        begun.elapsed()
+    );
+    assert!(!loaded.diagnostics.has_errors(), "{}", said(&loaded));
+    assert!(reads(&sources, &w, "/inc", "[Rule]\nFINAL,DIRECT\n"));
+}
+
+/// The start is the one place that waits for a version that refers to a file
+/// that cannot be downloaded: the file has been tried when it is over, and the
+/// version is taken with the line not expanded.
+#[tokio::test]
+async fn the_start_takes_a_version_that_waited_for_a_file_that_cannot_be_downloaded() {
+    let w = World::new().await;
+    point_at_managed(&w, "interval=60 strict=true");
+    let strict = |body: &str| {
+        format!(
+            "#!MANAGED-CONFIG {} interval=60 strict=true\n{body}",
+            w.url("/managed")
+        )
+    };
+    w.seed("/managed", &strict(COPY), ago(2 * HOUR));
+    let new = strict(&format!(
+        "[Rule]\n#!include {}\nFINAL,DIRECT\n",
+        w.url("/x")
+    ));
+    w.server.set("/managed", new.clone());
+    let first = first_load(&w);
+    let need = boot_need(&first, &w.data());
+    assert_eq!(need, Boot::Wait);
+    // a back-off so long that only the start itself can take the version
+    let sources = w.sources_with(
+        false,
+        ResourceOptions {
+            min_backoff: Duration::from_secs(60),
+            ..fast()
+        },
+    );
+    let loaded = sources
+        .bootstrap(first, need, BootLimits::default())
+        .await
+        .unwrap();
+    assert!(reads(&sources, &w, "/managed", &new));
+    assert!(!loaded.diagnostics.has_errors(), "{}", said(&loaded));
+    assert!(
+        not_downloaded(&loaded, "http status 404"),
+        "{}",
+        said(&loaded)
+    );
+    assert_eq!(sources.strict(), None);
+}
+
+/// A copy that no longer loads is replaced by one that does.
+#[tokio::test]
+async fn a_copy_that_does_not_load_is_replaced_by_one_that_does() {
+    let w = World::new().await;
+    point_at_managed(&w, "interval=3600");
+    w.seed(
+        "/managed",
+        &managed(&w, "[Rule]\nDOMAIN,x.example,Nowhere\nFINAL,DIRECT\n"),
+        ago(HOUR),
+    );
+    let good = managed(&w, COPY);
+    w.server.set("/managed", good.clone());
+    let first = first_load(&w);
+    let need = boot_need(&first, &w.data());
+    assert_eq!(need, Boot::Refresh);
+    let sources = w.sources(false);
+    let loaded = sources
+        .bootstrap(first, need, BootLimits::default())
+        .await
+        .unwrap();
+    assert!(!loaded.diagnostics.has_errors(), "{}", said(&loaded));
+    assert!(reads(&sources, &w, "/managed", &good));
+}
+
+/// The server has nothing better than the copy that does not load: the start
+/// leaves with its error, after asking once.
+#[tokio::test]
+async fn a_copy_that_does_not_load_and_is_served_again_ends_the_start_with_its_error() {
+    let w = World::new().await;
+    point_at_managed(&w, "interval=3600");
+    let broken = managed(&w, "[Rule]\nDOMAIN,x.example,Nowhere\nFINAL,DIRECT\n");
+    w.seed("/managed", &broken, ago(HOUR));
+    w.server.set("/managed", broken.clone());
+    let first = first_load(&w);
+    let need = boot_need(&first, &w.data());
+    assert_eq!(need, Boot::Refresh);
+    let sources = w.sources(false);
+    let begun = Instant::now();
+    let loaded = sources
+        .bootstrap(first, need, BootLimits::default())
+        .await
+        .unwrap();
+    assert!(begun.elapsed() < Duration::from_secs(10));
+    assert!(loaded.diagnostics.has_errors());
+    assert!(reads(&sources, &w, "/managed", &broken));
+    assert_eq!(w.server.hits("/managed"), 1);
+}
+
+/// The update that fixes the copy refers to a file that has never been
+/// downloaded: the round that finds that out is not the last one.
+#[tokio::test]
+async fn a_refresh_that_needs_a_new_file_gets_it_in_the_next_round() {
+    let w = World::new().await;
+    point_at_managed(&w, "interval=3600");
+    w.seed(
+        "/managed",
+        &managed(&w, "[Rule]\nDOMAIN,x.example,Nowhere\nFINAL,DIRECT\n"),
+        ago(HOUR),
+    );
+    let fixed = managed(
+        &w,
+        &format!("[Rule]\n#!include {}\nFINAL,DIRECT\n", w.url("/x")),
+    );
+    w.server.set("/managed", fixed.clone());
+    w.server.set("/x", X_BODY);
+    w.server.set_delay("/x", Duration::from_millis(300));
+    let first = first_load(&w);
+    let need = boot_need(&first, &w.data());
+    assert_eq!(need, Boot::Refresh);
+    let sources = w.sources(false);
+    let loaded = sources
+        .bootstrap(first, need, BootLimits::default())
+        .await
+        .unwrap();
+    assert!(!loaded.diagnostics.has_errors(), "{}", said(&loaded));
+    assert!(reads(&sources, &w, "/managed", &fixed));
+    assert!(reads(&sources, &w, "/x", X_BODY));
 }
