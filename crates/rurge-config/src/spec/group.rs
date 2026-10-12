@@ -983,6 +983,25 @@ icon-url=https://example.com/i.png, category=Media",
         assert!(s.hidden);
     }
 
+    /// The legacy writings of a subnet group are taken whole: the `ssid`
+    /// keyword, a condition that is a bare value, and the deprecated
+    /// `cellular` parameter. None of them is an unknown parameter or a
+    /// problem, and until the network is known the group stands for its
+    /// `default`.
+    #[test]
+    fn a_subnet_group_in_its_legacy_writing_is_taken_whole() {
+        let group = parse_group(
+            "G",
+            "ssid, default = A, cellular = B, MyWifi = DIRECT",
+            &span(),
+        )
+        .unwrap();
+        assert!(group.legacy_keyword);
+        let o = to_group_spec(&group, Path::new("/profiles"), Reach::Anywhere, &lookup);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert_eq!(o.spec.unwrap().members, ["A"]);
+    }
+
     /// A group's unknown parameter is named the way a policy's is: only
     /// when the item writes a parameter name.
     #[test]
