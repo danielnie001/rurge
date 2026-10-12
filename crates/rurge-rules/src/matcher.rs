@@ -592,6 +592,23 @@ mod tests {
         );
     }
 
+    /// `DOMAIN-WILDCARD` (manual, Domain Rules): `*` takes any run of
+    /// characters and crosses dots, `?` takes exactly one, `[...]` takes a
+    /// class; the case of the pattern does not matter.
+    #[test]
+    fn domain_wildcard_takes_star_question_mark_and_classes() {
+        let wild = |pattern: &str, host: &str| {
+            eval(&format!("DOMAIN-WILDCARD,{pattern}"), &session(host)) == Verdict::Match
+        };
+        assert!(wild("*.example.com", "a.b.example.com"));
+        assert!(!wild("*.example.com", "example.com"));
+        assert!(wild("cdn?.example.com", "cdn1.example.com"));
+        assert!(!wild("cdn?.example.com", "cdn10.example.com"));
+        assert!(wild("cdn[0-9].example.com", "cdn7.example.com"));
+        assert!(!wild("cdn[0-9].example.com", "cdnx.example.com"));
+        assert!(wild("API-*.Example.COM", "api-v2.example.com"));
+    }
+
     #[test]
     fn extended_matching_uses_sni_and_host() {
         let mut s = session("1.2.3.4");
