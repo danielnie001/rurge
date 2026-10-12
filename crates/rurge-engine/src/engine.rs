@@ -1524,6 +1524,26 @@ mod tests {
         assert_eq!(specs[1].addr.to_string(), "0.0.0.0:8081");
     }
 
+    /// `allow-wifi-access` and the `wifi-access-*` keys stand in for the
+    /// listeners only when the profile writes none: one that writes a kind of
+    /// listener gets that kind and no other.
+    #[test]
+    fn the_wifi_access_keys_stand_in_only_where_no_listener_is_written() {
+        let wifi = "allow-wifi-access = true\nwifi-access-http-port = 8080\nwifi-access-socks5-port = 8081\nwifi-access-http-auth = alice:pw\n";
+        let specs =
+            Engine::listener_specs(&general(&format!("{wifi}http-listen = 127.0.0.1:7000")));
+        let found: Vec<_> = specs.iter().map(|s| (s.kind, s.addr.to_string())).collect();
+        assert_eq!(found, [(ListenerKind::Http, "127.0.0.1:7000".to_string())]);
+        assert_eq!(specs[0].auth, None);
+        let specs =
+            Engine::listener_specs(&general(&format!("{wifi}socks5-listen = 127.0.0.1:7002")));
+        let found: Vec<_> = specs.iter().map(|s| (s.kind, s.addr.to_string())).collect();
+        assert_eq!(
+            found,
+            [(ListenerKind::Socks5, "127.0.0.1:7002".to_string())]
+        );
+    }
+
     #[test]
     fn escalation_after_threshold_within_window() {
         let esc = Escalation::new();
