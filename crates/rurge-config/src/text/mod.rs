@@ -432,6 +432,25 @@ whatever = 1
         assert!(!is_comment("//!REQUIREMENT x"));
     }
 
+    /// Inside a double-quoted value `\"` is a quote of the value and `\\` a
+    /// backslash of it: a comment delimiter after either, still inside the
+    /// quotes, starts nothing, and the one after the closing quote does.
+    #[test]
+    fn an_escaped_quote_does_not_end_a_quoted_value() {
+        assert_eq!(
+            strip_inline_comment("x = \"a \\\" // b\" // c"),
+            "x = \"a \\\" // b\""
+        );
+        assert_eq!(
+            strip_inline_comment("x = \"a \\\\\" // c"),
+            "x = \"a \\\\\""
+        );
+        assert_eq!(
+            strip_inline_comment("x = \"a \\\\ // b\" ; c"),
+            "x = \"a \\\\ // b\""
+        );
+    }
+
     #[test]
     fn named_sections_and_prefix_lookup() {
         let (p, _) = parse(
