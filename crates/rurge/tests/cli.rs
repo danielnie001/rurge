@@ -2292,7 +2292,20 @@ mod run {
             .expect("api port")
     }
 
-    /// Minimal HTTP/1.1 call against the API: (status, body).
+    /// Minimal HTTP/1.1 call against the API: (status, body). The answer may
+    /// take five seconds.
+    fn api_call(
+        port: u16,
+        method: &str,
+        path: &str,
+        key: &str,
+        body: Option<&str>,
+    ) -> (u16, String) {
+        api_call_within(port, method, path, key, body, Duration::from_secs(5))
+    }
+
+    /// `api_call` for a call whose answer may take `wait` to come, such as the
+    /// update of a resource, which is as long as a download.
     ///
     /// The request leaves in one write. Written in pieces (`write!` on a
     /// socket sends once per piece) it can arrive in several segments, the
@@ -2301,15 +2314,16 @@ mod run {
     /// then reaches the closed connection is met with a reset, and on Windows
     /// the reset makes the client's system discard the answer it has not read
     /// yet: nothing is read and the status comes out as 0.
-    fn api_call(
+    fn api_call_within(
         port: u16,
         method: &str,
         path: &str,
         key: &str,
         body: Option<&str>,
+        wait: Duration,
     ) -> (u16, String) {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.set_read_timeout(Some(wait)).unwrap();
         let body = body.unwrap_or("");
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -5645,6 +5659,423 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             assert!(!said.contains(WAITING), "{said}");
             let log = log_text(&logs);
             assert!(!lines_with(&log, "profile reloaded").is_empty(), "{log}");
+        }
+
+        // ---------------------------------------------------------------
+        // the sources asked for an update through the API
+
+        /// What the links of these tests hold in every place a link can hold a
+        /// token. No answer of the two endpoints holds it.
+        const TOKEN: &str = "S3CR3T";
+        /// Where the managed profile and the included file are on the
+        /// server: the token is in the path too.
+        const MANAGED_AT: &str = "/S3CR3T/managed";
+        const INCLUDED_AT: &str = "/S3CR3T/rules";
+        /// What a page answered in place of a profile looks like.
+        const PAGE: &str =
+            "<html><head><title>Sign in</title></head><body>Welcome to the Wi-Fi</body></html>";
+        /// What the update of a version that waits for a file says.
+        const HELD_BACK: &str = "waiting for the sources this version refers to";
+
+        /// A link to `path` that holds the token in its query.
+        fn token_link(w: &Sources, path: &str) -> Url {
+            w.url(&format!("{path}?token={TOKEN}"))
+        }
+
+        /// The link of the managed profile: its user name and its password hold
+        /// the token as well.
+        fn managed_link(w: &Sources) -> Url {
+            let mut link = token_link(w, MANAGED_AT);
+            link.set_username(TOKEN).unwrap();
+            link.set_password(Some(TOKEN)).unwrap();
+            link
+        }
+
+        /// A daemon over the world `w` that logs to `logs`, up.
+        fn start_logging(w: &Sources, logs: &Path) -> (Daemon, mpsc::Receiver<String>) {
+            let mut cmd = w.start();
+            log_to(&mut cmd, logs);
+            let (daemon, errors) = spawn_command_reading_stderr(cmd);
+            up(&daemon);
+            (daemon, errors)
+        }
+
+        /// `GET /v1/external_resources`: the items of its list.
+        fn listing(api: u16) -> Vec<serde_json::Value> {
+            let (status, body) = api_call(api, "GET", "/v1/external_resources", "k", None);
+            assert_eq!(status, 200, "{body}");
+            assert!(!body.contains(TOKEN), "{body}");
+            let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+            list["defines"].as_array().expect("a list").clone()
+        }
+
+        /// The item of the managed profile, as a user finds the key to update.
+        fn managed_item(api: u16) -> serde_json::Value {
+            listing(api)
+                .into_iter()
+                .find(|item| item["type"] == "profile")
+                .expect("the listing has the managed profile")
+        }
+
+        /// `POST /v1/external_resources/update` for `key`: what the answer maps
+        /// each key to.
+        fn updated(api: u16, key: &str) -> serde_json::Value {
+            let body = serde_json::json!({ "key": key }).to_string();
+            let (status, answer) = api_call_within(
+                api,
+                "POST",
+                "/v1/external_resources/update",
+                "k",
+                Some(&body),
+                Duration::from_secs(30),
+            );
+            assert_eq!(status, 200, "{answer}");
+            assert!(!answer.contains(TOKEN), "{answer}");
+            serde_json::from_str(&answer).unwrap()
+        }
+
+        /// How many times the daemon has said it reloaded the profile.
+        fn reloads(logs: &Path) -> usize {
+            lines_with(&log_text(logs), "profile reloaded").len()
+        }
+
+        /// A new version of the managed profile that is asked for through the
+        /// API is taken, and the daemon reloads by itself: the rule is in the
+        /// running profile, and the local file is as it was. The copy was
+        /// checked a minute ago, so nobody is asked for it before the request.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_update_asked_for_through_the_api_is_taken_and_reloaded() {
+            let w = Sources::new().await;
+            let api = free_tcp_port();
+            let link = managed_link(&w);
+            let text = |rules: &str| managed_text(&link, "interval=3600", api, rules);
+            let old = text("DOMAIN,old.test,REJECT\n");
+            rurge_net::testing::seed_cache(
+                &w.data(),
+                &link,
+                old.as_bytes(),
+                SystemTime::now() - Duration::from_secs(60),
+            );
+            w.served.set(MANAGED_AT, old);
+            let conf = w.write(&format!("#!MANAGED-CONFIG {link}\n"));
+            let before = as_it_is(&conf);
+            let logs = w.dir.path().join("logs");
+            let (mut daemon, _errors) = start_logging(&w, &logs);
+            assert!(rules(api).contains("DOMAIN,old.test,REJECT"));
+            assert_eq!(
+                w.served.requests().len(),
+                0,
+                "nobody was asked for the copy"
+            );
+
+            let item = managed_item(api);
+            assert_eq!(item["ready"], true);
+            assert!(item.get("error").is_none(), "{item}");
+            let key = item["key"].as_str().unwrap().to_string();
+
+            w.served.set(
+                MANAGED_AT,
+                text("DOMAIN,old.test,REJECT\nDOMAIN,new.test,REJECT\n"),
+            );
+            assert_eq!(
+                updated(api, &key),
+                serde_json::json!({ key.as_str(): "success" })
+            );
+            wait_for("the new version to be in effect", 30, || {
+                rules(api).contains("DOMAIN,new.test,REJECT")
+            });
+            wait_for("the line that says the profile was reloaded", 10, || {
+                reloads(&logs) >= 1
+            });
+            assert_eq!(as_it_is(&conf), before, "the local file was written to");
+            stop(&mut daemon, api);
+            // all that this online start reached: the profile it was asked to
+            // update, and the two GeoIP databases, which it asks the loopback for
+            let managed: BTreeSet<String> = [MANAGED_AT.to_string()].into();
+            let databases: BTreeSet<String> = [COUNTRY_DATABASE, ASN_DATABASE]
+                .into_iter()
+                .map(String::from)
+                .collect();
+            assert!(asked_for(&w.served).is_subset(&managed));
+            assert!(asked_for(&w.geo).is_subset(&databases));
+        }
+
+        /// The server answers 200 with a page where the profile is meant to be:
+        /// it is no profile and is not taken. The answer for the key says why,
+        /// the daemon goes on with the rules it has, and the listing keeps the
+        /// reason beside the copy that is still there.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_page_where_the_profile_is_meant_to_be_is_refused_and_the_listing_says_why() {
+            let w = Sources::new().await;
+            let api = free_tcp_port();
+            let link = managed_link(&w);
+            let old = managed_text(&link, "interval=3600", api, "DOMAIN,old.test,REJECT\n");
+            rurge_net::testing::seed_cache(
+                &w.data(),
+                &link,
+                old.as_bytes(),
+                SystemTime::now() - Duration::from_secs(60),
+            );
+            w.served.set(MANAGED_AT, old.clone());
+            w.write(&format!("#!MANAGED-CONFIG {link}\n"));
+            let logs = w.dir.path().join("logs");
+            let (mut daemon, _errors) = start_logging(&w, &logs);
+            let key = managed_item(api)["key"].as_str().unwrap().to_string();
+
+            w.served.set(MANAGED_AT, PAGE);
+            let answer = updated(api, &key);
+            let said = answer[key.as_str()]
+                .as_str()
+                .expect("the key is answered")
+                .to_string();
+            assert!(said.starts_with("does not load: "), "{said}");
+            assert!(!said.contains("Welcome"), "the page is quoted: {said}");
+            // the rules are the old ones, and so is the profile the file holds
+            assert!(rules(api).contains("DOMAIN,old.test,REJECT"));
+            assert_eq!(current(api), old);
+            let item = managed_item(api);
+            assert_eq!(item["error"], said.as_str());
+            assert_eq!(item["ready"], true, "the copy it had stays");
+            assert!(item.get("suspended").is_none(), "{item}");
+            assert_eq!(reloads(&logs), 0, "{}", log_text(&logs));
+            stop(&mut daemon, api);
+        }
+
+        /// The new version names a file that was never downloaded: the update
+        /// says it waits for it, and when the file is here the version is taken
+        /// with it, by one reload. The version is not taken with the file
+        /// missing and the file filled in a few seconds later.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_version_that_names_a_file_never_downloaded_waits_for_it_and_is_taken_with_it() {
+            let w = Sources::new().await;
+            let api = free_tcp_port();
+            let link = managed_link(&w);
+            let included = token_link(&w, INCLUDED_AT);
+            let text = |rules: &str| managed_text(&link, "interval=3600", api, rules);
+            let old = text("DOMAIN,old.test,REJECT\n");
+            rurge_net::testing::seed_cache(
+                &w.data(),
+                &link,
+                old.as_bytes(),
+                SystemTime::now() - Duration::from_secs(60),
+            );
+            w.served.set(MANAGED_AT, old);
+            w.served.set(INCLUDED_AT, RULES);
+            // slow enough for the file not to be here when the version is judged
+            w.served.set_delay(INCLUDED_AT, Duration::from_millis(300));
+            w.write(&format!("#!MANAGED-CONFIG {link}\n"));
+            let logs = w.dir.path().join("logs");
+            let (mut daemon, _errors) = start_logging(&w, &logs);
+            let key = managed_item(api)["key"].as_str().unwrap().to_string();
+
+            w.served.set(
+                MANAGED_AT,
+                text(&format!("#!include {included}\nDOMAIN,new.test,REJECT\n")),
+            );
+            assert_eq!(
+                updated(api, &key),
+                serde_json::json!({ key.as_str(): HELD_BACK })
+            );
+            wait_for("the rules of the version and of the file", 30, || {
+                let now = rules(api);
+                now.contains("DOMAIN,new.test,REJECT")
+                    && now.contains("DOMAIN,included.test,REJECT")
+            });
+            wait_for("the first reload to be logged", 10, || reloads(&logs) >= 1);
+            // The one fixed wait of these tests: that a second reload does not
+            // come. It would come a quiet second (the time the sources wait for
+            // another move) after a version that was reported by itself, and
+            // the daemon looks at them once a second; three quiet seconds are
+            // three chances for the file and the profile to have been taken
+            // apart, and half a second more is the margin.
+            std::thread::sleep(Duration::from_millis(3500));
+            assert_eq!(reloads(&logs), 1, "{}", log_text(&logs));
+            stop(&mut daemon, api);
+        }
+
+        /// The way out of a refusal that needs no editing: the update that
+        /// `strict` requires fails and sessions are refused; once the server is
+        /// well, the update asked for through the API is the one that works, and
+        /// sessions pass again within seconds. The daemon's own next attempt is a
+        /// minute away, so nothing but the request can have done it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_way_out_of_a_refusal_is_an_update_asked_for_through_the_api() {
+            let w = Sources::new().await;
+            let (_target, hello) = a_target().await;
+            let api = free_tcp_port();
+            let link = managed_link(&w);
+            let copy = managed_text(&link, "interval=60 strict=true", api, "");
+            rurge_net::testing::seed_cache(
+                &w.data(),
+                &link,
+                copy.as_bytes(),
+                SystemTime::now() - TWO_HOURS,
+            );
+            w.served.set(MANAGED_AT, copy);
+            w.served.set_status(MANAGED_AT, 500);
+            w.write(&format!("#!MANAGED-CONFIG {link}\n"));
+            let logs = w.dir.path().join("logs");
+            let (mut daemon, _errors) = start_logging(&w, &logs);
+            let refused = http_get(daemon.http, &hello);
+            assert!(refused.contains(rurge_engine::REFUSED_STRICT), "{refused}");
+            // The daemon's own attempt has failed too, and its next is a
+            // minute away. The listing has the reason from then on: a source
+            // that has not been tried by this daemon has none to give.
+            wait_for("the daemon's own attempt to fail", 20, || {
+                lines_with(&log_text(&logs), "resource fetch failed")
+                    .iter()
+                    .any(|line| line.contains("managed profile"))
+            });
+            let item = managed_item(api);
+            assert_eq!(item["suspended"], true, "{item}");
+            assert_eq!(item["error"], "http status 500");
+            assert_eq!(item["ready"], true);
+
+            w.served.set_status(MANAGED_AT, 200);
+            let key = item["key"].as_str().unwrap().to_string();
+            assert_eq!(
+                updated(api, &key),
+                serde_json::json!({ key.as_str(): "success" })
+            );
+            wait_for("sessions to be accepted again", 10, || {
+                http_get(daemon.http, &hello).ends_with("hi from target")
+            });
+            wait_for("the line that says so", 10, || {
+                lines_with(&log_text(&logs), ACCEPTING).len() == 1
+            });
+            let log = log_text(&logs);
+            assert_eq!(lines_with(&log, REFUSING).len(), 1, "{log}");
+            let item = managed_item(api);
+            assert!(item.get("suspended").is_none(), "{item}");
+            assert!(item.get("error").is_none(), "{item}");
+            stop(&mut daemon, api);
+        }
+
+        /// The local file was edited after the last update and is in effect
+        /// from the reload on; a check that finds the server well, even one that
+        /// answers "not modified", ends that, and the daemon reloads by itself.
+        /// The start downloads the copy itself, so it has the validators a
+        /// seeded cache would not have.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_local_file_edited_after_the_last_update_gives_way_to_the_next_check() {
+            let w = Sources::new().await;
+            let api = free_tcp_port();
+            let link = managed_link(&w);
+            // no `interval=` in the line: nothing is due for a day, so after
+            // the start the server is asked only by the request
+            let profile = |rules: &str| {
+                format!(
+                    "#!MANAGED-CONFIG {link}\n[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nhttp-api = k@127.0.0.1:{api}\nloglevel = warning\n[Proxy]\n[Rule]\n{rules}FINAL,DIRECT\n"
+                )
+            };
+            w.served
+                .set(MANAGED_AT, profile("DOMAIN,copy.test,REJECT\n"));
+            w.write(&profile("DOMAIN,local.test,REJECT\n"));
+            let logs = w.dir.path().join("logs");
+            let mut cmd = w.start();
+            log_to(&mut cmd, &logs);
+            let (mut daemon, errors) = spawn_command_reading_stderr(cmd);
+            stderr_up_to(&errors, WAITING);
+            up(&daemon);
+            // the copy was checked after the file was written: it is the profile
+            let now = rules(api);
+            assert!(now.contains("DOMAIN,copy.test,REJECT"), "{now}");
+            assert!(!now.contains("DOMAIN,local.test,REJECT"), "{now}");
+
+            // an edit is in effect from the reload on: the file is newer
+            w.write(&profile(
+                "DOMAIN,local.test,REJECT\nDOMAIN,edited.test,REJECT\n",
+            ));
+            let (status, body) = api_call(api, "POST", "/v1/profiles/reload", "k", Some("{}"));
+            assert!(status == 200 && body.contains("\"ok\":true"), "{body}");
+            let now = rules(api);
+            assert!(now.contains("DOMAIN,edited.test,REJECT"), "{now}");
+            assert!(!now.contains("DOMAIN,copy.test,REJECT"), "{now}");
+
+            // the server answers "not modified" to the request: the check
+            // succeeded, and that ends the file's precedence
+            let key = managed_item(api)["key"].as_str().unwrap().to_string();
+            let asked_before = w.served.hits(MANAGED_AT);
+            assert_eq!(
+                updated(api, &key),
+                serde_json::json!({ key.as_str(): "success" })
+            );
+            let asked_since: Vec<_> = w
+                .served
+                .requests()
+                .into_iter()
+                .filter(|request| request.path == MANAGED_AT)
+                .skip(asked_before)
+                .collect();
+            assert!(!asked_since.is_empty());
+            assert!(
+                asked_since
+                    .iter()
+                    .all(|request| request.header("if-none-match").is_some()),
+                "{asked_since:?}"
+            );
+            wait_for("the copy to take over again", 30, || {
+                let now = rules(api);
+                now.contains("DOMAIN,copy.test,REJECT")
+                    && !now.contains("DOMAIN,edited.test,REJECT")
+            });
+            wait_for("a further reload to be logged", 10, || reloads(&logs) >= 2);
+            stop(&mut daemon, api);
+        }
+
+        /// A daemon that does not go to the network lists what its cache has of
+        /// the sources of the profile, with no GeoIP database to list, and
+        /// every update it is asked for says that nothing is downloaded. The
+        /// server is not asked at all.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn offline_the_endpoints_list_the_cache_and_update_nothing() {
+            let w = Sources::new().await;
+            let api = free_tcp_port();
+            let link = managed_link(&w);
+            let included = token_link(&w, INCLUDED_AT);
+            let copy = managed_text(
+                &link,
+                "interval=3600",
+                api,
+                &format!("#!include {included}\n"),
+            );
+            let checked = SystemTime::now() - Duration::from_secs(60);
+            rurge_net::testing::seed_cache(&w.data(), &link, copy.as_bytes(), checked);
+            rurge_net::testing::seed_cache(&w.data(), &included, RULES.as_bytes(), checked);
+            w.served.set(MANAGED_AT, copy);
+            w.served.set(INCLUDED_AT, RULES);
+            w.write(&format!("#!MANAGED-CONFIG {link}\n"));
+            let (mut daemon, _errors) =
+                spawn_command_reading_stderr(rurge_run(&w.conf(), &w.data()));
+            up(&daemon);
+
+            let items = listing(api);
+            let kinds: Vec<&str> = items
+                .iter()
+                .map(|item| item["type"].as_str().unwrap())
+                .collect();
+            assert_eq!(kinds, ["profile", "include"], "{items:?}");
+            assert!(items.iter().all(|item| item["ready"] == true), "{items:?}");
+            assert!(
+                items.iter().all(|item| item.get("error").is_none()),
+                "{items:?}"
+            );
+            let keys: Vec<String> = items
+                .iter()
+                .map(|item| item["key"].as_str().unwrap().to_string())
+                .collect();
+            let offline = "offline mode: nothing is downloaded";
+            assert_eq!(
+                updated(api, "all"),
+                serde_json::json!({ keys[0].as_str(): offline, keys[1].as_str(): offline })
+            );
+            assert_eq!(
+                updated(api, &keys[0]),
+                serde_json::json!({ keys[0].as_str(): offline })
+            );
+            stop(&mut daemon, api);
+            assert_eq!(w.served.requests().len(), 0, "offline asks nobody");
+            assert_eq!(w.geo.requests().len(), 0, "offline asks nobody");
         }
     }
 }
