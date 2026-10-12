@@ -369,6 +369,29 @@ mod tests {
         );
     }
 
+    /// `networksetup` has no command that excludes simple host names: with
+    /// the option on, the same commands run as with it off — the proxy is set
+    /// all the same —, and nothing is added for it.
+    #[test]
+    fn exclude_simple_hostnames_adds_no_command() {
+        let run = |exclude_simple| {
+            let proxy = MacosProxy::new(runner_with_one_service());
+            proxy
+                .apply(&ProxySettings {
+                    exclude_simple,
+                    ..settings()
+                })
+                .unwrap();
+            proxy.runner.calls()
+        };
+        let without = run(false);
+        assert_eq!(run(true), without);
+        assert!(
+            without.contains(&"networksetup -setwebproxy Wi-Fi 127.0.0.1 6152".to_string()),
+            "{without:?}"
+        );
+    }
+
     #[test]
     fn apply_stops_at_the_first_failure_and_reports_it() {
         let runner = runner_with_one_service();
