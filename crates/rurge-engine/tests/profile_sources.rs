@@ -267,7 +267,8 @@ async fn the_first_download_of_a_managed_profile_is_a_change() {
     timeout(Duration::from_secs(4), sources.changed())
         .await
         .expect("the download is reported");
-    // the report is made once
+    // The report is made once. One that was made again would come at once,
+    // the quiet second being over: 300 ms is far more than that takes.
     stays_quiet(&sources, Duration::from_millis(300)).await;
 }
 
@@ -311,16 +312,18 @@ async fn two_moves_inside_the_quiet_second_are_reported_once() {
     sources.track(&w.load());
     w.move_to(&sources, "/inc", "[Rule]\nDOMAIN,two.example,DIRECT\n")
         .await;
+    // Taken before the last move: the quiet second after the move cannot be
+    // over sooner than a second after this.
+    let before_last = Instant::now();
     w.move_to(&sources, "/inc", "[Rule]\nDOMAIN,three.example,DIRECT\n")
         .await;
-    let last = Instant::now();
     timeout(Duration::from_secs(4), sources.changed())
         .await
         .expect("the moves are reported");
     assert!(
-        last.elapsed() >= QUIET - Duration::from_millis(100),
+        before_last.elapsed() >= QUIET,
         "reported after {:?}",
-        last.elapsed()
+        before_last.elapsed()
     );
     // what a stray second report would be late by is the quiet second
     stays_quiet(&sources, QUIET + Duration::from_millis(500)).await;
@@ -350,6 +353,8 @@ async fn a_source_registered_again_is_no_change() {
     w.write_managed("/managed", "interval=7200");
     sources.track(&w.load());
     assert_eq!(sources.statuses().len(), 1);
+    // a report that is not due would come a quiet second after the
+    // registration at the latest; half a second more is the margin
     stays_quiet(&sources, QUIET + Duration::from_millis(500)).await;
 }
 
@@ -363,23 +368,25 @@ async fn a_call_dropped_and_made_again_is_reported_a_second_after_the_last_move(
     w.write_including(&["/inc"]);
     let sources = w.sources(false);
     sources.track(&w.load());
+    // Taken before the move: the quiet second after the move cannot be over
+    // sooner than a second after this.
+    let before = Instant::now();
     w.move_to(&sources, "/inc", "[Rule]\nDOMAIN,two.example,DIRECT\n")
         .await;
-    let last = Instant::now();
     while timeout(Duration::from_millis(200), sources.changed())
         .await
         .is_err()
     {
         assert!(
-            last.elapsed() < Duration::from_secs(3),
+            before.elapsed() < Duration::from_secs(3),
             "not reported in {:?}",
-            last.elapsed()
+            before.elapsed()
         );
     }
     assert!(
-        last.elapsed() >= QUIET - Duration::from_millis(100),
+        before.elapsed() >= QUIET,
         "reported after {:?}",
-        last.elapsed()
+        before.elapsed()
     );
 }
 
@@ -469,6 +476,8 @@ async fn a_move_of_a_source_that_is_gone_is_not_reported() {
         .await;
     w.write_including(&["/one"]);
     sources.track(&w.load());
+    // the move was made before this: a report of it would come a quiet
+    // second after it at the latest, and half a second more is the margin
     stays_quiet(&sources, QUIET + Duration::from_millis(500)).await;
 }
 
@@ -513,17 +522,48 @@ async fn a_source_the_next_generation_does_not_name_is_dropped() {
     sources.track(&w.load());
     let shown: Vec<_> = sources.statuses().into_iter().map(|s| s.key).collect();
     assert_eq!(shown, [w.key("/one")]);
-    // neither has anything to download, so both are asked again after a
-    // backoff of 200 ms at most: in the time it takes to wait that out three
-    // times, the one that is kept is asked for again and the other is not
+    // Neither has anything to download, so each would be asked again after
+    // a back-off of 200 ms at the most. The wait is three of those: the one
+    // that was dropped is not asked for in it.
     let (one, two) = (w.server.hits("/one"), w.server.hits("/two"));
     assert!(two >= 1);
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(w.server.hits("/two"), two, "a dropped source was asked for");
-    assert!(
-        w.server.hits("/one") > one,
-        "the other one is not asked for"
-    );
+    // the one that is kept goes on being asked for
+    common::wait_until("the kept source to be asked for again", || {
+        w.server.hits("/one") > one
+    })
+    .await;
+}
+
+/// A source is never asked for before its interval is over. The manager
+/// spreads the refreshes of its resources, so that they are not all asked for
+/// together; for these it spreads them to later only.
+#[tokio::test]
+async fn a_source_is_not_asked_for_before_its_interval_is_over() {
+    // what an include is refreshed after when nothing says otherwise
+    const DAY: Duration = Duration::from_secs(86400);
+    let w = World::new().await;
+    let paths: Vec<String> = (0..16).map(|n| format!("/inc{n}")).collect();
+    for path in &paths {
+        w.seed(path, COPY, ago(Duration::from_secs(100)));
+    }
+    w.write_including(&paths.iter().map(String::as_str).collect::<Vec<_>>());
+    let sources = w.sources(false);
+    sources.track(&w.load());
+    common::wait_until("the time of each next refresh", || {
+        sources.statuses().iter().all(|s| s.next_refresh.is_some())
+    })
+    .await;
+    let statuses = sources.statuses();
+    assert_eq!(statuses.len(), 16);
+    // Spread to either side, a refresh is early ten times in twenty-one:
+    // sixteen that are all on time would be one case in thirty thousand.
+    for status in statuses {
+        let over = status.fetched_at.unwrap() + DAY;
+        assert!(status.next_refresh.unwrap() >= over, "{status:?}");
+    }
+    assert!(w.server.requests().is_empty(), "none was due");
 }
 
 /// A shorter interval counts at once: a copy that is old by it is refreshed.
@@ -579,7 +619,8 @@ async fn a_check_that_changes_nothing_ends_the_precedence_of_the_local_file_once
     );
     assert!(sources.outdated());
     assert!(!sources.outdated());
-    // no version moved
+    // No version moved: a report would come a quiet second after the check
+    // at the latest, and 300 ms more is the margin.
     stays_quiet(&sources, QUIET + Duration::from_millis(300)).await;
     // the next generation has the copy in effect
     let next = w.load();
@@ -686,7 +727,8 @@ async fn a_strict_profile_that_is_due_is_not_suspended_before_its_attempt_fails(
     let w = World::new().await;
     w.server.set("/managed", COPY);
     w.server.set_status("/managed", 500);
-    w.server.set_delay("/managed", Duration::from_millis(300));
+    // long enough for the attempt to be looked at while it is under way
+    w.server.set_delay("/managed", Duration::from_secs(2));
     w.seed("/managed", COPY, ago(2 * HOUR));
     w.write_managed("/managed", "interval=60 strict=true");
     let sources = w.sources(false);
@@ -1001,18 +1043,22 @@ async fn nothing_but_where_a_link_goes_is_shown() {
         w.url("/").port().unwrap()
     ))
     .unwrap();
-    w.server.set("/PATHMARK/managed.conf", COPY);
+    // The copy of the managed profile is two hours old and its update is a
+    // minute overdue; there is nothing at either address, so both downloads
+    // fail, which is logged, and the profile is to be suspended.
+    seed_cache(&w.data(), &managed, COPY.as_bytes(), ago(2 * HOUR));
     w.write(&format!(
-        "#!MANAGED-CONFIG {managed} interval=3600 strict=true\n[Rule]\n#!include {included}\nFINAL,DIRECT\n"
+        "#!MANAGED-CONFIG {managed} interval=60 strict=true\n[Rule]\n#!include {included}\nFINAL,DIRECT\n"
     ));
     let sources = w.sources(false);
     sources.track(&w.load());
     assert!(sources.settle(Duration::from_secs(5)).await);
-    // there is nothing at the address of the include: the update fails, and
-    // that is logged
-    let _ = sources
+    let updated = sources
         .update(&resource_key(&ResourceSource::Url(included.clone())))
         .await;
+    assert!(matches!(updated, Some(Err(_))), "{updated:?}");
+    let suspended = sources.strict();
+    assert!(suspended.is_some(), "due, and the update failed");
     let statuses = sources.statuses();
     assert_eq!(statuses.len(), 2);
     let origin = format!("http://127.0.0.1:{}/…", w.url("/").port().unwrap());
@@ -1028,7 +1074,7 @@ async fn nothing_but_where_a_link_goes_is_shown() {
     let mut shown = format!("{statuses:?}");
     shown += &format!("{:?}", sources.remote().get(&managed));
     shown += &format!("{:?}", sources.remote().get(&included));
-    shown += &format!("{:?}", sources.strict());
+    shown += &format!("{updated:?}{suspended:?}");
     // every line down to debug level: the manager's, the sources', and what
     // the HTTP library says about its pool of connections, each of which it
     // names by the target of the request

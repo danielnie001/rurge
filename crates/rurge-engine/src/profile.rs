@@ -48,7 +48,7 @@ pub struct SourcesOptions {
     pub profile: PathBuf,
     /// The environment, platform and capabilities a downloaded profile is
     /// loaded with when it is judged; its `remote` is not looked at. Not read
-    /// while a body is taken when it is text.
+    /// as long as a downloaded body is only checked for being UTF-8 text.
     pub load: LoadOptions,
     /// Where the downloads are kept: the cache of the other external
     /// resources is there too, and one address has one place in it.
@@ -89,12 +89,25 @@ struct Tracked {
     /// The new one starts from the copy on disk and cannot tell, so it keeps
     /// the fact.
     unreported: bool,
+    /// The versions as the manager publishes them: what `seen` becomes when
+    /// the task that follows them has run.
+    versions: watch::Receiver<u64>,
     _follow: Follower,
 }
 
 impl Tracked {
     fn pending(&self) -> bool {
         self.seen != self.reported || self.unreported
+    }
+
+    /// Whether a version would go untold if this registration were dropped
+    /// now: one that is pending, or one published a moment ago that the task
+    /// following the source has not told of yet.
+    fn leaves_unreported(&self) -> bool {
+        // Copied out at once: a value borrowed from the receiver holds up the
+        // next version.
+        let published = *self.versions.borrow();
+        self.pending() || published != self.reported
     }
 }
 
@@ -234,8 +247,9 @@ impl ProfileSources {
     /// Follows the sources of a generation: the managed profile and the remote
     /// includes. What the generation came across on the way to the managed
     /// profile is read from its copy and never asked for. A source the
-    /// generation no longer names is dropped. Registering a source that has a
-    /// copy, or again, is no change.
+    /// generation no longer names is dropped. Registering a source whose copy
+    /// the generation read, or again, is no change; a copy the generation did
+    /// not read is one.
     pub fn track(&self, sources: &SourceInfo) {
         let mut state = self.core.lock();
         let mut before = std::mem::take(&mut state.tracked);
@@ -255,7 +269,7 @@ impl ProfileSources {
                     tracked.push(kept);
                 }
                 replaced => {
-                    let unreported = replaced.as_ref().is_some_and(Tracked::pending);
+                    let unreported = replaced.as_ref().is_some_and(Tracked::leaves_unreported);
                     if let Some(old) = replaced {
                         // The manager keeps the first interval and label an
                         // entry is given, and only takes shorter intervals: a
@@ -273,6 +287,7 @@ impl ProfileSources {
         for gone in before {
             self.retire(&gone);
         }
+        let pending = tracked.iter().any(Tracked::pending);
         state.tracked = tracked;
         state.local_first = sources.main_text == sources.main
             && sources
@@ -280,6 +295,15 @@ impl ProfileSources {
                 .iter()
                 .any(|r| r.role == RemoteRole::Managed && r.found());
         state.outdated_for = None;
+        drop(state);
+        if pending {
+            // A registration can begin with a version its generation was not
+            // built from, which no task that follows a source will tell of:
+            // a call of `changed` that waits looks again.
+            self.core
+                .moved
+                .send_modify(|moves| *moves = moves.wrapping_add(1));
+        }
     }
 
     fn retire(&self, source: &Tracked) {
@@ -315,9 +339,9 @@ impl ProfileSources {
             check,
         );
         // Subscribed before the version is read, so that a version published
-        // in between is not missed.
+        // after that is not missed.
         let versions = handle.subscribe();
-        let version = *versions.borrow();
+        let seen = *versions.borrow();
         Tracked {
             id,
             url: wanted.url.clone(),
@@ -325,9 +349,10 @@ impl ProfileSources {
             interval: wanted.interval,
             strict: wanted.strict,
             key,
-            reported: version,
-            seen: version,
+            reported: built_from(wanted.found(), seen),
+            seen,
             unreported: false,
+            versions: versions.clone(),
             _follow: self.follow(id, versions),
         }
     }
@@ -350,9 +375,11 @@ impl ProfileSources {
 
     /// Waits until every source without content and every `strict` managed
     /// profile that has fallen due has had its first attempt, for `limit` at
-    /// the most. Whether it did. A due source that is not `strict` is
-    /// refreshed in the background and not waited for; a source registered
-    /// while this waits is waited for too.
+    /// the most. Whether it did. The first attempt is the one a source is
+    /// registered with: a profile that was not due then and falls due later
+    /// is not waited for. A due source that is not `strict` is refreshed in
+    /// the background and not waited for; a source registered while this
+    /// waits is waited for too.
     pub async fn settle(&self, limit: Duration) -> bool {
         // Far enough to be never, and a time that can be added to.
         let limit = limit.min(Duration::from_secs(365 * 24 * 3600));
@@ -531,6 +558,16 @@ impl ProfileSources {
     }
 }
 
+/// The version of a source that the generation naming it was built from, when
+/// the manager is at `version` as the source is registered. An entry begins
+/// at 1 with a copy and at 0 without, and the download that registering
+/// starts can have published the next by the time the version is read. A
+/// generation that read a copy (`found`) read the first; one that got no
+/// text read none, whatever there is by now.
+fn built_from(found: bool, version: u64) -> u64 {
+    if found { version.min(1) } else { 0 }
+}
+
 /// When the update of a profile fell due, if it has by `now`: an `interval`
 /// after the last successful check, or after `local`, the time the local file
 /// was last changed, when there was none. A time in the future is the clock
@@ -636,8 +673,8 @@ mod tests {
         resource_key(&ResourceSource::Url(url(path)))
     }
 
-    /// What a load came across: each file's path, role and interval in
-    /// seconds.
+    /// What a load came across and read the copy of: each file's path, role
+    /// and interval in seconds.
     fn info(remote: &[(&str, RemoteRole, u64)]) -> SourceInfo {
         SourceInfo {
             main: PathBuf::from("main.conf"),
@@ -648,7 +685,7 @@ mod tests {
                 .map(|&(path, role, seconds)| RemoteRef {
                     url: url(path),
                     role,
-                    path: None,
+                    path: Some(PathBuf::from("copy")),
                     interval: Duration::from_secs(seconds),
                     strict: false,
                     lacks_section: false,
@@ -820,6 +857,83 @@ mod tests {
         assert!(reported.is_ok());
     }
 
+    /// What a generation was built from is what it read. A source it did not
+    /// get the text of has not been reported to it, whatever the manager holds
+    /// by the time the source is registered: a download can finish between
+    /// the load and the registration. A call that is already waiting is told.
+    #[tokio::test(start_paused = true)]
+    async fn a_copy_the_generation_did_not_read_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        cached(dir.path(), "a", "one");
+        let sources = offline(dir.path());
+        let waiting = tokio::spawn({
+            let sources = sources.clone();
+            async move { sources.changed().await }
+        });
+        follow_up().await;
+        // the load found nothing at the address; the copy came after it
+        let mut loaded = info(&[("a", RemoteRole::Include, 3600)]);
+        loaded.remote[0].path = None;
+        sources.track(&loaded);
+        let reported = tokio::time::timeout(5 * SECOND, waiting).await;
+        assert!(reported.is_ok(), "the call that waits is told");
+        // once: the generation after it read the copy
+        sources.track(&info(&[("a", RemoteRole::Include, 3600)]));
+        let more = tokio::time::timeout(Duration::from_secs(10), sources.changed()).await;
+        assert!(more.is_err());
+    }
+
+    /// A version published a moment before its source is registered again,
+    /// which the task following the source has not told of yet, is not lost
+    /// with the registration.
+    #[tokio::test(start_paused = true)]
+    async fn a_move_nobody_has_seen_yet_is_not_lost_when_its_source_is_registered_again() {
+        let dir = tempfile::tempdir().unwrap();
+        cached(dir.path(), "a", "one");
+        let sources = offline(dir.path());
+        sources.track(&info(&[("a", RemoteRole::Include, 3600)]));
+        // nothing is awaited between the two: no task has run
+        adopt(&sources, "a", "two");
+        sources.track(&info(&[("a", RemoteRole::Include, 7200)]));
+        reported_within(&sources, 5 * SECOND).await;
+        let more = tokio::time::timeout(Duration::from_secs(10), sources.changed()).await;
+        assert!(more.is_err());
+    }
+
+    /// The local file keeps its precedence while it is newer than the last
+    /// check. At the very same time the copy wins, as it does for the loader.
+    #[tokio::test(start_paused = true)]
+    async fn a_check_at_the_time_of_the_local_file_ends_its_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        // a whole second, which every file system and the cache both keep
+        let since_epoch = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let checked = SystemTime::UNIX_EPOCH + Duration::from_secs(since_epoch.as_secs() - 3600);
+        seed_cache(&dir.path().join("data"), &url("m"), b"one", checked);
+        let local = dir.path().join("main.conf");
+        std::fs::write(&local, "local").unwrap();
+        let changed_at = |at: SystemTime| {
+            std::fs::File::options()
+                .write(true)
+                .open(&local)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+        };
+        let loaded = info(&[("m", RemoteRole::Managed, 86400)]);
+        let sources = offline(dir.path());
+
+        changed_at(checked + SECOND);
+        sources.track(&loaded);
+        assert!(!sources.outdated(), "the file is newer than the check");
+
+        changed_at(checked);
+        sources.track(&loaded);
+        assert!(sources.outdated(), "the same time");
+        assert!(!sources.outdated(), "once for a check");
+    }
+
     /// The statuses are in the order of the generation, which is not the order
     /// the manager lists them in; a source whose role changed is labelled for
     /// the one it has now.
@@ -920,6 +1034,18 @@ mod tests {
         let longest = Duration::from_secs(u64::MAX);
         assert_eq!(due_since(longest, Some(at(1000)), None, at(9000)), None);
         assert_eq!(due_since(longest, None, Some(at(1000)), at(9000)), None);
+    }
+
+    #[test]
+    fn a_registration_starts_from_what_its_generation_read() {
+        // no text: nothing was read, whatever there is by now
+        assert_eq!(built_from(false, 0), 0);
+        assert_eq!(built_from(false, 1), 0);
+        // a copy: the first version, also when the next is there already
+        assert_eq!(built_from(true, 1), 1);
+        assert_eq!(built_from(true, 2), 1);
+        // a copy the manager did not take
+        assert_eq!(built_from(true, 0), 0);
     }
 
     #[test]
