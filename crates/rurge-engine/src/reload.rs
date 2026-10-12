@@ -81,14 +81,15 @@ impl Engine {
 /// What the incoming manager is fetching already is left to it: that attempt
 /// began after the cache was read, and one more beside it would download a
 /// large file twice. It can bring less than the outgoing one got, when its
-/// request went out first and the server changed between the two: the
-/// resource's own next refresh makes up for that, nothing sooner.
+/// request went out first and the server changed between the two: the copy
+/// then stays behind until somebody looks again, or until the resource's own
+/// next refresh.
 ///
 /// The look is not one moment, and it goes by the wall clock. An attempt that
 /// was asked for and has not begun is neither under way nor later; a check
 /// made after the clock was set back can look older than the copy the
 /// incoming manager read. `Engine::update_external_resources` looks once
-/// more when it ends, for what it asked of a generation that went meanwhile.
+/// more when it ends under another generation than it began with.
 pub(crate) fn catch_up(outgoing: &ResourceManager, incoming: &ResourceManager) {
     let before = outgoing.statuses();
     for status in incoming.statuses() {

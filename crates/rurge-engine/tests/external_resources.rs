@@ -1015,7 +1015,10 @@ async fn a_request_that_ends_under_another_generation_has_that_one_ask_too() {
     let request = g.engine.update_external_resources(None, Some(&key), LIMIT);
     tokio::pin!(request);
     // Polled once: the request has taken the manager of the generation in
-    // use, and what asks it runs when this test next waits.
+    // use, and what asks it runs when this test next waits. That is so on
+    // the current-thread runtime this test runs on and on no other: with
+    // worker threads the asking could come before the generations change,
+    // and the test would pass without the look it is here for.
     tokio::select! {
         biased;
         answer = &mut request => panic!("answered at once: {answer:?}"),

@@ -188,15 +188,18 @@ impl Engine {
     ///   was built, possibly before a download landed there: as it comes in
     ///   it asks again for what the old one checked since, or is checking
     ///   (`Engine::swap_runtime`), and a request that ends under another
-    ///   generation than it began with has that one ask once more, for what
-    ///   was asked of the old one after it went. Nobody waits for either.
-    ///   The copy in use follows within the time of one more request, with
-    ///   one exception: what the generation that came in was fetching at
-    ///   that moment is left to that attempt, which may have gone out before
-    ///   the server changed. An attempt of its own that fails is in the
-    ///   listing and is made again as any other. `all` on a managed profile
-    ///   that changed runs into this: the profile reloads within about a
-    ///   second of its update, while the sets are still downloading.
+    ///   generation than it began with has that one look in the same way
+    ///   once more, which finds what was asked of the old one after it
+    ///   went. Nobody waits for either. The copy in use then follows within
+    ///   the time of one more request, with these exceptions: what the
+    ///   generation that came in was fetching at that moment is left to
+    ///   that attempt, which may have gone out before the server changed; a
+    ///   request that was dropped looks at nothing when it ends; and the
+    ///   comparison goes by the wall clock, so a check made after the clock
+    ///   was set back can be missed. An attempt of its own that fails is in
+    ///   the listing and is made again as any other. `all` on a managed
+    ///   profile that changed runs into this: the profile reloads within
+    ///   about a second of its update, while the sets are still downloading.
     /// - A request in flight when rurge is asked to stop ends with the grace
     ///   period of the shutdown, as a policy test in flight does.
     pub async fn update_external_resources(
