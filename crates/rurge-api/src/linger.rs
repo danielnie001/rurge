@@ -53,6 +53,10 @@ struct Ending {
     lingering: AtomicUsize,
     /// The most that may linger at once.
     max: usize,
+    /// The longest one of them lingers.
+    time: Duration,
+    /// The most that is read away from one of them.
+    bytes: usize,
 }
 
 impl Ending {
@@ -88,16 +92,18 @@ pub(crate) struct Lingering {
 
 impl Lingering {
     pub(crate) fn new(listener: TcpListener) -> Lingering {
-        Lingering::with_limit(listener, LINGER_MAX)
+        Lingering::with_limits(listener, LINGER_MAX, LINGER_TIME, LINGER_BYTES)
     }
 
-    fn with_limit(listener: TcpListener, max: usize) -> Lingering {
+    fn with_limits(listener: TcpListener, max: usize, time: Duration, bytes: usize) -> Lingering {
         Lingering {
             listener,
             ending: Arc::new(Ending {
                 tracker: TaskTracker::new(),
                 lingering: AtomicUsize::new(0),
                 max,
+                time,
+                bytes,
             }),
         }
     }
@@ -227,14 +233,19 @@ impl Drop for Closing {
             return;
         };
         // Without a runtime there is no task to hand the connection to, and
-        // it is closed by being dropped, as it always was.
+        // without room it is not lingered on: it is closed by being dropped, as
+        // it always was. Here too it is closed before it stops being counted:
+        // the token goes when this function returns.
         let Ok(runtime) = Handle::try_current() else {
+            drop(stream);
             return;
         };
         let Some(room) = self.ending.room() else {
+            drop(stream);
             return;
         };
-        runtime.spawn(finish(stream, token, room, LINGER_TIME, LINGER_BYTES));
+        let (time, bytes) = (self.ending.time, self.ending.bytes);
+        runtime.spawn(finish(stream, token, room, time, bytes));
     }
 }
 
@@ -304,7 +315,8 @@ mod tests {
     }
 
     /// A listener that lingers `limit` connections at most, and a client for
-    /// each connection that is accepted from it.
+    /// each connection that is accepted from it. A connection lingers until
+    /// its peer closes: the time it is given is longer than any test.
     struct Rig {
         listener: Lingering,
         addr: SocketAddr,
@@ -314,8 +326,9 @@ mod tests {
         async fn new(limit: usize) -> Rig {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
+            let time = Duration::from_secs(600);
             Rig {
-                listener: Lingering::with_limit(listener, limit),
+                listener: Lingering::with_limits(listener, limit, time, LINGER_BYTES),
                 addr,
             }
         }
@@ -466,6 +479,30 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+        drop(client);
+    }
+
+    /// What is read away is counted to the byte: one byte short of the limit
+    /// the lingering goes on, and the byte that fills it ends it.
+    #[tokio::test]
+    async fn what_is_read_away_is_counted_to_the_byte() {
+        let (mut server, mut client) = pair().await;
+        let bytes = 64 * 1024;
+        let lingering = tokio::spawn(async move {
+            linger(&mut server, Duration::from_secs(600), bytes).await;
+            server
+        });
+        client.write_all(&vec![0u8; bytes - 1]).await.unwrap();
+        // Nothing happens here, and that is what is asserted: a lingering that
+        // counted more than it read would have ended within milliseconds of
+        // the last of these bytes.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!lingering.is_finished(), "it ended short of the limit");
+        client.write_all(&[0u8]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), lingering)
+            .await
+            .expect("it did not end at the limit")
+            .unwrap();
         drop(client);
     }
 

@@ -2353,6 +2353,22 @@ mod run {
         }
     }
 
+    /// What a daemon that has exited printed and nobody has taken yet, to the
+    /// end of its output: the lines that were on their way when it exited are
+    /// among them.
+    fn printed_to_the_end(daemon: &Daemon) -> Vec<String> {
+        let mut lines = Vec::new();
+        loop {
+            match daemon.lines.recv_timeout(Duration::from_secs(5)) {
+                Ok(line) => lines.push(line),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return lines,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("the output of the daemon did not end within 5 s: {lines:?}")
+                }
+            }
+        }
+    }
+
     /// Where the test backend keeps the "system proxy" of a daemon.
     fn sysproxy_file(data: &Path) -> std::path::PathBuf {
         data.join("sysproxy.json")
@@ -2991,7 +3007,9 @@ mod run {
 
     /// A client that has had its answer and keeps its connection open does not
     /// hold up a stop: the daemon closes the connection, waits a moment for the
-    /// client to do the same, and goes.
+    /// client to do the same, and goes. It goes because the API is done, not
+    /// because the grace period of the shutdown ran out, which also ends in an
+    /// exit with 0 and within these 10 s.
     #[test]
     fn run_stops_though_a_client_keeps_its_connection_open() {
         let dir = tempfile::tempdir().unwrap();
@@ -3006,6 +3024,11 @@ mod run {
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
         assert_eq!(api_call(port, "POST", "/v1/stop", "k", Some("{}")).0, 200);
         assert_eq!(wait_for_exit(&mut daemon, 10), Some(0), "stop exits 0");
+        let lines = printed_to_the_end(&daemon);
+        assert!(
+            !lines.iter().any(|l| l.contains("grace period elapsed")),
+            "the stop waited out the grace period: {lines:?}"
+        );
         drop(idle);
     }
 
@@ -3286,6 +3309,8 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         rurge()
             .args(["reload", "-c"])
             .arg(&plain)
+            .arg("--data-dir")
+            .arg(dir.path().join("data"))
             .assert()
             .code(2)
             .stderr(predicate::str::contains("http-api is not configured"));
@@ -3299,6 +3324,8 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         rurge()
             .args(["reload", "-c"])
             .arg(&pointing)
+            .arg("--data-dir")
+            .arg(dir.path().join("data"))
             .assert()
             .success()
             .stdout(predicate::str::starts_with("reloaded: 0 error(s), "));

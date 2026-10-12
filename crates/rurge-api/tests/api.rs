@@ -1988,9 +1988,9 @@ async fn send_a_head(
     stream
 }
 
-/// What `peek` says of `stream` within `within`: how many bytes of an answer
-/// are in this side's receive buffer, which are left there, unread. `None` if
-/// none came in time.
+/// Whether an answer begins to arrive on `stream` within `within`: `Some` once
+/// its first byte is in this side's receive buffer, where `peek` leaves it,
+/// unread; `None` if none came in time.
 async fn peek_at_the_answer(stream: &TcpStream, within: Duration) -> Option<usize> {
     let mut first = [0u8; 1];
     match tokio::time::timeout(within, stream.peek(&mut first)).await {
@@ -2095,10 +2095,9 @@ impl Reply {
         )
     }
 
-    /// The answer a server gives whole and then ends the connection after: this
-    /// status, this JSON body with a `Content-Length` that says so, and then the
-    /// end of the stream.
-    fn assert_whole(&self, status: u16, body: &Value) {
+    /// An answer that came whole: this status, and this JSON body with a
+    /// `Content-Length` that says so. How the connection ended is not looked at.
+    fn assert_answered(&self, status: u16, body: &Value) {
         let what = self.describe();
         assert_eq!(self.status, status, "{what}");
         let sent: Value = serde_json::from_str(&self.body)
@@ -2109,9 +2108,16 @@ impl Reply {
             Some(self.body.len()),
             "the body is not as long as its Content-Length says; {what}"
         );
+    }
+
+    /// The answer a server gives whole and then ends the connection after:
+    /// `assert_answered`, and then the end of the stream.
+    fn assert_whole(&self, status: u16, body: &Value) {
+        self.assert_answered(status, body);
         assert!(
             self.ended_in.is_none(),
-            "the connection did not end with an end of stream; {what}"
+            "the connection did not end with an end of stream; {}",
+            self.describe()
         );
     }
 }
@@ -2272,14 +2278,34 @@ async fn a_request_without_a_body_is_answered_and_closed_as_before() {
     .assert_whole(200, &json!({ "mode": "rule" }));
 }
 
-/// A client that sends more after the answer than will be read away for it
-/// still has its answer. The answer is read while the rest is sent: a server
-/// that stops reading at its limit closes with part of the rest unread, which
-/// can reset the connection, and a client that has not read its answer by then
-/// loses it on some systems (a body of megabytes does it on Windows). How the
-/// sending ends is not asserted, only that it ends.
+/// A late body of many reads, below the 256 KiB that are read away, is read
+/// away like a short one. This does not pin how much is read away: a system
+/// takes more than was read without a reset, and how much more is the
+/// system's (a server that stopped at 64 KiB of these 200 was not found out
+/// on Windows 11). The unit tests of the lingering pin that to the byte.
 #[tokio::test]
-async fn a_client_that_sends_more_than_is_read_away_keeps_its_answer() {
+async fn a_late_body_of_many_reads_does_not_cost_its_answer() {
+    let api = api().await;
+    let body = " ".repeat(200 * 1024);
+    let reply = send_with_a_late_body(api.addr, "POST", "/v1/dns/flush", Some(KEY), &body).await;
+    reply.assert_whole(200, &json!({}));
+}
+
+/// A body larger than what is read away, from a client that reads while it
+/// sends: it has its answer, and its sending ends, taken or refused. The
+/// answer is in this side's receive buffer before the first byte of the body
+/// leaves, so this was so before the API closed in stages too; what is pinned
+/// is that reading away does not hold such a sender up. How the connection
+/// ends is not asserted.
+///
+/// The other order is not tested, because it is not the API's to decide: a
+/// client that sends more than is read away before it has read its answer can
+/// still lose the answer. The server closes with the rest unread, the system
+/// answers what comes after with a reset, and whether an answer that was
+/// received and not yet read survives a reset is the client's system's doing
+/// (megabytes sent before a late read lose it on Windows).
+#[tokio::test]
+async fn a_body_larger_than_what_is_read_away_does_not_hold_its_sender_up() {
     let api = api().await;
     let garbage = vec![b'x'; 300 * 1024];
     let stream = begin_a_request(api.addr, "POST", "/v1/dns/flush", Some(KEY), garbage.len()).await;
@@ -2289,7 +2315,7 @@ async fn a_client_that_sends_more_than_is_read_away_keeps_its_answer() {
         tokio::time::timeout(Duration::from_secs(10), writing.write_all(&garbage)),
     );
     let wrote = wrote.expect("the 300 KiB were neither taken nor refused within 10 s");
-    Reply::parse(&read.0, read.1, format!("{wrote:?}")).assert_whole(200, &json!({}));
+    Reply::parse(&read.0, read.1, format!("{wrote:?}")).assert_answered(200, &json!({}));
 }
 
 /// Reads one answer off a connection that stays open: the head, and then as
@@ -2339,6 +2365,7 @@ async fn a_client_that_keeps_its_connection(
 async fn serve_waits_for_a_closing_connection_until_the_client_closes_it() {
     let api = api().await;
     let (server, mut client, stop) = a_client_that_keeps_its_connection(&api).await;
+    let stopped = Instant::now();
     stop.cancel();
     // the server closed its side: the end of the stream
     let (rest, ended_in) = read_to_the_end(&mut client).await;
@@ -2355,17 +2382,18 @@ async fn serve_waits_for_a_closing_connection_until_the_client_closes_it() {
         !server.is_finished(),
         "the server finished with a connection open"
     );
-    let closed = Instant::now();
     drop(client);
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
         .expect("the server did not finish after the client closed")
         .unwrap();
-    // it was the close that ended the wait, not the end of the lingering time
+    // It was the close that ended the wait, not the end of the lingering time:
+    // that time begins after the server was told to stop, so a server that
+    // waited it out cannot have finished before this.
     assert!(
-        closed.elapsed() < LINGER / 2,
-        "{:?} after the close",
-        closed.elapsed()
+        stopped.elapsed() < LINGER,
+        "the server finished {:?} after it was told to stop",
+        stopped.elapsed()
     );
 }
 
