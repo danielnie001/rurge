@@ -877,7 +877,7 @@ async fn an_update_gives_the_result_of_the_download() {
 /// that shows.
 #[tokio::test]
 async fn nothing_but_where_a_link_goes_is_shown() {
-    let log = LogCapture::start();
+    let log = LogCapture::everything();
     let w = World::new().await;
     let managed = Url::parse(&format!(
         "http://USERMARK:PASSMARK@127.0.0.1:{}/PATHMARK/managed.conf?token=QUERYMARK",
@@ -921,9 +921,9 @@ async fn nothing_but_where_a_link_goes_is_shown() {
     shown += &format!("{:?}", sources.remote().get(&managed));
     shown += &format!("{:?}", sources.remote().get(&included));
     shown += &format!("{updated:?}{suspended:?}");
-    // every line down to debug level: the manager's, the sources', and what
-    // the HTTP library says about its pool of connections, each of which it
-    // names by the target of the request
+    // every line there is, the most detailed ones too: the manager's, the
+    // sources', and what the HTTP library says about its pool of connections,
+    // each of which it names by the target of the request
     let lines = log.lines();
     shown += &lines.join("\n");
     for marker in ["USERMARK", "PASSMARK", "PATHMARK", "QUERYMARK"] {
@@ -938,6 +938,8 @@ async fn nothing_but_where_a_link_goes_is_shown() {
         lines.iter().any(|l| l.contains("remote include")),
         "{lines:?}"
     );
+    // and the most detailed ones of the HTTP library
+    assert!(lines.iter().any(|l| l.starts_with("TRACE")), "{lines:?}");
 }
 
 /// The client asks the way a Surge profile is asked for.

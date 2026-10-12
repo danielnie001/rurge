@@ -20,6 +20,7 @@ use rurge_config::HostName;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
+use std::fmt;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -49,6 +50,9 @@ impl Default for HttpClientConfig {
 pub struct RequestOpts {
     pub timeout: Duration,
     pub max_body: u64,
+    /// Sent with every request of the call, the ones a redirect leads to on
+    /// another server included: a credential put here goes there too, unlike
+    /// the user name and the password of the URL.
     pub headers: Vec<(HeaderName, HeaderValue)>,
     pub follow_redirects: u8,
 }
@@ -64,12 +68,25 @@ impl Default for RequestOpts {
     }
 }
 
-#[derive(Debug)]
 pub struct Response {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: Bytes,
     pub final_url: Url,
+}
+
+/// Where it came from and how much it is. A body is whatever the server
+/// sent, a header can be a cookie, and the user name, password, path and
+/// query of a URL can be the token a provider issued.
+impl fmt::Debug for Response {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Response")
+            .field("status", &self.status)
+            .field("headers", &format_args!("{} fields", self.headers.len()))
+            .field("body", &format_args!("{} bytes", self.body.len()))
+            .field("final_url", &rurge_config::remote::origin(&self.final_url))
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -348,27 +365,8 @@ impl HttpClient {
                 if redirects >= opts.follow_redirects {
                     return Err(HttpError::TooManyRedirects);
                 }
-                let mut next = url
-                    .join(loc)
-                    .map_err(|e| HttpError::InvalidUrl(e.to_string()))?;
-                if url.scheme() == "https" && next.scheme() != "https" {
-                    return Err(HttpError::Protocol(
-                        "refusing to redirect from https to http".to_string(),
-                    ));
-                }
-                // A URL's user name and password are for the server it
-                // names. A relative redirect kept them; one that names the
-                // same server again keeps them too, one that leaves goes
-                // without.
-                if next.origin() == url.origin()
-                    && next.username().is_empty()
-                    && next.password().is_none()
-                {
-                    let _ = next.set_username(url.username());
-                    let _ = next.set_password(url.password());
-                }
                 redirects += 1;
-                url = next;
+                url = redirected(&url, loc)?;
                 continue;
             }
             let headers = resp.headers().clone();
@@ -431,6 +429,29 @@ impl HttpClient {
         b.body(Full::new(body))
             .map_err(|e| HttpError::Protocol(e.to_string()))
     }
+}
+
+/// Where a redirect from `url` goes, for what its `Location` says. Nothing
+/// leads from HTTPS back to plain HTTP. The user name and the password of
+/// `url` are for the server it names (scheme, host and port): a relative
+/// reference keeps them, a target that names that server again is given them,
+/// and one that names another goes without. A target that carries a user name
+/// or a password of its own is used as the server wrote it.
+fn redirected(url: &Url, location: &str) -> Result<Url, HttpError> {
+    let mut next = url
+        .join(location)
+        .map_err(|e| HttpError::InvalidUrl(e.to_string()))?;
+    if url.scheme() == "https" && next.scheme() != "https" {
+        return Err(HttpError::Protocol(
+            "refusing to redirect from https to http".to_string(),
+        ));
+    }
+    if next.origin() == url.origin() && next.username().is_empty() && next.password().is_none() {
+        // neither fails: a URL that has the origin of `url` has a host
+        let _ = next.set_username(url.username());
+        let _ = next.set_password(url.password());
+    }
+    Ok(next)
 }
 
 /// Takes the user name and the password out of `url` and returns what they
@@ -596,7 +617,16 @@ mod tests {
                 "tls: {tls}"
             );
             assert_eq!(requests[1].header("authorization"), None, "tls: {tls}");
+            // HTTP/2 names the server in `:authority`, which is no header
+            // field: it names the server and nothing else. An HTTP/1 request
+            // names it in `Host`, and its target is a path.
+            let named = format!("{}:{}", url.host_str().unwrap(), url.port().unwrap());
             for request in &requests {
+                assert_eq!(
+                    request.authority.as_deref(),
+                    tls.then_some(named.as_str()),
+                    "tls: {tls}"
+                );
                 for (name, value) in &request.headers {
                     assert!(
                         name == "authorization" || !value.contains("s3cret"),
@@ -720,6 +750,163 @@ mod tests {
         let requests = elsewhere.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].header("authorization"), None);
+    }
+
+    /// What `take_basic_authorization` took, as text: a value that is marked
+    /// as not to be shown says nothing when an assertion fails.
+    fn text(value: Option<HeaderValue>) -> Option<String> {
+        value.map(|value| value.to_str().unwrap().to_string())
+    }
+
+    /// Where each form of `Location` leads from a URL with a user name and a
+    /// password, and whether they go along. The server chooses the form: none
+    /// may take them to a server the URL did not name.
+    #[test]
+    fn a_location_never_takes_the_credentials_to_another_server() {
+        let from = Url::parse("https://us3r:s3cret@good.example/dir/x").unwrap();
+        // Each is what `Location` says and where the next request goes. These
+        // name the same server, and the credentials go along:
+        let same = [
+            // by a relative reference
+            ("/y", "https://good.example/y"),
+            ("y?q=1", "https://good.example/dir/y?q=1"),
+            ("https:y", "https://good.example/dir/y"),
+            // by naming it again
+            ("https://good.example/y", "https://good.example/y"),
+            ("https://good.example:443/y", "https://good.example/y"),
+            ("HTTPS://GOOD.EXAMPLE/y", "https://good.example/y"),
+            // a backslash ends the name of the server: what follows is a path
+            // on it
+            (
+                "https://good.example\\@elsewhere.example/y",
+                "https://good.example/@elsewhere.example/y",
+            ),
+        ];
+        // These name another, however they write it:
+        let another = [
+            ("https://elsewhere.example/y", "https://elsewhere.example/y"),
+            ("//elsewhere.example/y", "https://elsewhere.example/y"),
+            ("/\\elsewhere.example/y", "https://elsewhere.example/y"),
+            ("\\\\elsewhere.example/y", "https://elsewhere.example/y"),
+            (
+                "https:\\\\elsewhere.example/y",
+                "https://elsewhere.example/y",
+            ),
+            // another port of the same host is another server
+            ("https://good.example:8443/y", "https://good.example:8443/y"),
+            // and so is a name that differs, by a label or by a dot at its end
+            ("https://sub.good.example/y", "https://sub.good.example/y"),
+            ("https://good.example./y", "https://good.example./y"),
+        ];
+        for (cases, with_credentials) in [(&same[..], true), (&another[..], false)] {
+            for &(location, goes_to) in cases {
+                let mut next = redirected(&from, location).unwrap();
+                let authorization = text(take_basic_authorization(&mut next));
+                assert_eq!(next.as_str(), goes_to, "{location}");
+                // base64("us3r:s3cret")
+                let expected = with_credentials.then_some("Basic dXMzcjpzM2NyZXQ=");
+                assert_eq!(authorization.as_deref(), expected, "{location}");
+            }
+        }
+        // The same host over HTTPS is another server than over plain HTTP: the
+        // step up is taken without them.
+        let plain = Url::parse("http://us3r:s3cret@good.example/x").unwrap();
+        let mut next = redirected(&plain, "https://good.example/y").unwrap();
+        assert_eq!(text(take_basic_authorization(&mut next)), None);
+        assert_eq!(next.as_str(), "https://good.example/y");
+        // And nothing leads from HTTPS back to plain HTTP.
+        let back = redirected(&from, "http://good.example/y");
+        assert!(matches!(back, Err(HttpError::Protocol(_))), "{back:?}");
+    }
+
+    /// A `Location` that carries a user name and a password of its own is
+    /// used as the server wrote it. What it wrote is not the user's, and the
+    /// user's are not put in its place.
+    #[test]
+    fn a_location_with_credentials_of_its_own_is_used_as_written() {
+        let from = Url::parse("https://us3r:s3cret@good.example/x").unwrap();
+        // what `Location` says, the server that is asked next, what it is
+        // sent as Basic
+        for (location, host, basic) in [
+            // base64("other:pw")
+            (
+                "https://other:pw@good.example/y",
+                "good.example",
+                "b3RoZXI6cHc=",
+            ),
+            // The last `@` ends the user name: these two name another server
+            // and call the first one a user. base64("good.example:") and
+            // base64("good.example:443").
+            (
+                "https://good.example@elsewhere.example/y",
+                "elsewhere.example",
+                "Z29vZC5leGFtcGxlOg==",
+            ),
+            (
+                "https://good.example:443@elsewhere.example/y",
+                "elsewhere.example",
+                "Z29vZC5leGFtcGxlOjQ0Mw==",
+            ),
+        ] {
+            let mut next = redirected(&from, location).unwrap();
+            assert_eq!(next.host_str(), Some(host), "{location}");
+            let authorization = text(take_basic_authorization(&mut next));
+            assert_eq!(authorization, Some(format!("Basic {basic}")), "{location}");
+        }
+    }
+
+    /// A user name alone, a password alone, and bytes that are no text: each
+    /// goes as the bytes it names, in the alphabet of RFC 4648 section 4.
+    #[test]
+    fn credentials_go_as_the_bytes_they_name() {
+        for (url, basic) in [
+            // base64("user:")
+            ("https://user@host.example/a", "dXNlcjo="),
+            // base64(":pw")
+            ("https://:pw@host.example/a", "OnB3"),
+            // base64 of `u:` and three bytes 0xff: `/` is in that alphabet,
+            // and not in the one made for URLs
+            ("https://u:%ff%ff%ff@host.example/a", "dTr///8="),
+        ] {
+            let mut url = Url::parse(url).unwrap();
+            let authorization = text(take_basic_authorization(&mut url));
+            assert_eq!(authorization, Some(format!("Basic {basic}")));
+            assert_eq!(url.as_str(), "https://host.example/a");
+        }
+    }
+
+    /// The `Debug` of a response says where it came from and how much it is.
+    /// A body is whatever the server sent, a header can be a cookie, and the
+    /// user name, password, path and query of a URL can be a token.
+    #[tokio::test]
+    async fn the_debug_of_a_response_shows_no_more_than_where_it_came_from() {
+        let server = TestServer::spawn().await;
+        server.set("/PATHMARK", "BODYMARK");
+        server.set_header("/PATHMARK", "x-token", "HEADMARK");
+        let mut url = server.url("/PATHMARK");
+        url.set_query(Some("key=QUERYMARK"));
+        url.set_username("USERMARK").unwrap();
+        url.set_password(Some("PASSMARK")).unwrap();
+        let resp = client(false)
+            .get(&url, &RequestOpts::default())
+            .await
+            .unwrap();
+        assert_eq!(&resp.body[..], b"BODYMARK");
+        assert_eq!(resp.headers.get("x-token").unwrap(), "HEADMARK");
+        let shown = format!("{resp:?}");
+        for mark in [
+            "USERMARK",
+            "PASSMARK",
+            "PATHMARK",
+            "QUERYMARK",
+            "BODYMARK",
+            "HEADMARK",
+        ] {
+            assert!(!shown.contains(mark), "{mark}: {shown}");
+        }
+        assert!(shown.contains("200"), "{shown}");
+        let from = format!("http://127.0.0.1:{}/", url.port().unwrap());
+        assert!(shown.contains(&from), "{shown}");
     }
 
     #[tokio::test]

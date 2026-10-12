@@ -28,6 +28,10 @@ pub struct RecordedRequest {
     pub method: String,
     pub path: String,
     pub version: String,
+    /// The server the target of the request names, when the target names
+    /// one: what HTTP/2 sends as `:authority`. An HTTP/1 request names a
+    /// path, and the server in its `Host` field.
+    pub authority: Option<String>,
     pub headers: Vec<(String, String)>,
 }
 
@@ -275,6 +279,7 @@ async fn handle(
             method: req.method().to_string(),
             path: path.clone(),
             version: format!("{:?}", req.version()),
+            authority: req.uri().authority().map(|named| named.to_string()),
             headers: req
                 .headers()
                 .iter()

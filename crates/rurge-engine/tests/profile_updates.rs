@@ -627,7 +627,7 @@ async fn a_version_that_does_not_load_is_a_failed_update() {
 /// that shows, in the reasons too.
 #[tokio::test]
 async fn no_reason_and_no_log_line_shows_more_of_an_address_than_where_it_goes() {
-    let log = LogCapture::start();
+    let log = LogCapture::everything();
     let w = World::new().await;
     let port = w.url("/").port().unwrap();
     let link = |name: &str| {
@@ -890,7 +890,7 @@ async fn an_empty_cache_is_filled_with_everything_the_profile_leads_to() {
 /// are; the load that comes back says why.
 #[tokio::test]
 async fn a_server_that_answers_500_ends_the_start_after_one_round() {
-    let log = LogCapture::start();
+    let log = LogCapture::everything();
     let w = World::new().await;
     let port = w.url("/").port().unwrap();
     let include =
