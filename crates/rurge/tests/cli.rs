@@ -2307,13 +2307,9 @@ mod run {
     /// `api_call` for a call whose answer may take `wait` to come, such as the
     /// update of a resource, which is as long as a download.
     ///
-    /// The request leaves in one write. Written in pieces (`write!` on a
-    /// socket sends once per piece) it can arrive in several segments, the
-    /// body after the head. An endpoint that does not read its body, `POST
-    /// /v1/stop` among them, answers on the head alone and closes; a body that
-    /// then reaches the closed connection is met with a reset, and on Windows
-    /// the reset makes the client's system discard the answer it has not read
-    /// yet: nothing is read and the status comes out as 0.
+    /// The request leaves in one write, which is the simplest form of it. The
+    /// API answers a request whose body comes after its head as well:
+    /// `api_call_with_a_late_body` sends one.
     fn api_call_within(
         port: u16,
         method: &str,
@@ -2901,6 +2897,144 @@ mod run {
             !lines.iter().any(|l| l.contains("grace period elapsed")),
             "stop must not wait out the grace period: {lines:?}"
         );
+    }
+
+    /// A call whose body comes after the answer, as it does from a client that
+    /// writes the head and the body apart (CPython's `http.client` does): the
+    /// head at once, the body once the first byte of the answer is in this
+    /// side's receive buffer, unread, and some time has passed. The status and
+    /// the body of the answer; the connection must end with its end of stream.
+    fn api_call_with_a_late_body(
+        port: u16,
+        method: &str,
+        path: &str,
+        key: &str,
+        body: &str,
+    ) -> (u16, String) {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        s.write_all(head.as_bytes()).unwrap();
+        let mut first = [0u8; 1];
+        match s.peek(&mut first) {
+            Ok(0) => panic!("{method} {path}: the connection ended before any answer"),
+            Ok(_) => {}
+            Err(e) => panic!("{method} {path}: no answer began to arrive within 5 s ({e})"),
+        }
+        // These 200 ms are not what makes the test right: whenever the body
+        // comes, the answer must be whole and the connection must end with its
+        // end of stream, and a daemon that reads the body away makes it so.
+        // They are what lets a daemon that does not do that tear the
+        // connection down first, so that this test fails on it.
+        std::thread::sleep(Duration::from_millis(200));
+        let wrote = s.write_all(body.as_bytes());
+        let mut raw = Vec::new();
+        let ended = s.read_to_end(&mut raw);
+        let out = String::from_utf8_lossy(&raw).into_owned();
+        let status = out
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let answer = out
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        assert!(
+            ended.is_ok(),
+            "{} bytes were read, then {:?}; writing the body returned {wrote:?}",
+            raw.len(),
+            ended
+        );
+        (status, answer)
+    }
+
+    /// Reads one answer off a connection that stays open: the head, and then
+    /// as many bytes of body as its `Content-Length` says.
+    fn read_one_answer(s: &mut TcpStream) -> String {
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let n = s.read(&mut chunk).expect("an answer within the timeout");
+            assert_ne!(n, 0, "the connection ended inside an answer: {raw:?}");
+            raw.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                let length = head
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .expect("an answer with a Content-Length");
+                if body.len() >= length {
+                    return text;
+                }
+            }
+        }
+    }
+
+    /// A client that writes the head of `POST /v1/stop` and its body apart
+    /// still gets the answer, and the daemon stops.
+    #[test]
+    fn run_stops_for_a_client_whose_body_comes_late() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let mut daemon = spawn_daemon(&conf, &dir.path().join("data"));
+        let port = api_port(&daemon);
+        let (status, body) = api_call_with_a_late_body(port, "POST", "/v1/stop", "k", "{}");
+        assert_eq!((status, body.as_str()), (200, "{}"));
+        assert_eq!(wait_for_exit(&mut daemon, 10), Some(0), "stop exits 0");
+    }
+
+    /// A client that has had its answer and keeps its connection open does not
+    /// hold up a stop: the daemon closes the connection, waits a moment for the
+    /// client to do the same, and goes.
+    #[test]
+    fn run_stops_though_a_client_keeps_its_connection_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let mut daemon = spawn_daemon(&conf, &dir.path().join("data"));
+        let port = api_port(&daemon);
+        let mut idle = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        idle.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        idle.write_all(b"GET /v1/outbound HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: k\r\n\r\n")
+            .unwrap();
+        let answer = read_one_answer(&mut idle);
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert_eq!(api_call(port, "POST", "/v1/stop", "k", Some("{}")).0, 200);
+        assert_eq!(wait_for_exit(&mut daemon, 10), Some(0), "stop exits 0");
+        drop(idle);
+    }
+
+    /// `rurge stop` finds the daemon through a profile that names its API,
+    /// prints that the stop was requested, and the daemon stops.
+    #[test]
+    fn rurge_stop_stops_the_daemon_a_profile_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        let mut daemon = spawn_daemon(&conf, &data);
+        let port = api_port(&daemon);
+        // the profile the daemon runs asks for port 0, which no one can call:
+        // this one names the port it got
+        let pointing = dir.path().join("pointing.conf");
+        std::fs::write(
+            &pointing,
+            format!("[General]\nhttp-api = k@127.0.0.1:{port}\n[Rule]\nFINAL,DIRECT\n"),
+        )
+        .unwrap();
+        rurge()
+            .args(["stop", "-c"])
+            .arg(&pointing)
+            .arg("--data-dir")
+            .arg(&data)
+            .assert()
+            .success()
+            .stdout("stop requested\n");
+        assert_eq!(wait_for_exit(&mut daemon, 10), Some(0), "stop exits 0");
     }
 
     /// rurge does not rewrite the profile, nor a file the profile includes: a

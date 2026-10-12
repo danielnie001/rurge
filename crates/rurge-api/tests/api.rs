@@ -6,7 +6,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use rurge_api::{ApiContext, serve};
+use rurge_api::{ApiContext, BAN_FAILURES, ServerFuture, serve};
 use rurge_config::config::{LoadOptions, from_text};
 use rurge_config::session::ListenerKind;
 use rurge_config::{RemoteRef, RemoteRole, SourceInfo};
@@ -27,8 +27,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
@@ -111,6 +111,27 @@ impl Api {
         .unwrap();
         tokio::spawn(server);
         addr
+    }
+
+    /// A second API server over the same engine, for the test that ends it:
+    /// its future is handed back, not spawned, and the token that ends it is
+    /// its own.
+    async fn serve_apart(&self) -> (SocketAddr, ServerFuture, CancellationToken) {
+        let token = CancellationToken::new();
+        let (addr, server) = serve(
+            "127.0.0.1:0".parse().unwrap(),
+            KEY.to_string(),
+            ApiContext {
+                engine: self.engine.clone(),
+                control: self.control.clone(),
+                load_options: load_options(),
+                sources: None,
+            },
+            token.clone(),
+        )
+        .await
+        .unwrap();
+        (addr, server, token)
     }
 
     fn http(&self) -> SocketAddr {
@@ -1941,4 +1962,429 @@ async fn external_resources_want_the_key() {
             "{method} {path}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// a body that comes after the answer
+
+/// A connection with the head of a request that announces `body_len` bytes of
+/// body sent on it, and nothing more.
+async fn send_a_head(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    key: Option<&str>,
+    body_len: usize,
+) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\n");
+    if let Some(key) = key {
+        head.push_str(&format!("X-Key: {key}\r\n"));
+    }
+    head.push_str(&format!(
+        "Content-Type: application/json\r\nContent-Length: {body_len}\r\n\r\n"
+    ));
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream
+}
+
+/// What `peek` says of `stream` within `within`: how many bytes of an answer
+/// are in this side's receive buffer, which are left there, unread. `None` if
+/// none came in time.
+async fn peek_at_the_answer(stream: &TcpStream, within: Duration) -> Option<usize> {
+    let mut first = [0u8; 1];
+    match tokio::time::timeout(within, stream.peek(&mut first)).await {
+        Err(_) => None,
+        Ok(Ok(0)) => panic!("the connection ended before any answer"),
+        Ok(Ok(n)) => Some(n),
+        Ok(Err(e)) => panic!("{:?} ({e}) before any answer", e.kind()),
+    }
+}
+
+/// `send_a_head`, and then the wait until the first byte of the answer is in
+/// this side's receive buffer, where it stays: the client has not read it. A
+/// server that answers on the head alone has answered by then, and this is the
+/// client that loses its answer if the connection is torn down under it.
+async fn begin_a_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    key: Option<&str>,
+    body_len: usize,
+) -> TcpStream {
+    let stream = send_a_head(addr, method, path, key, body_len).await;
+    assert!(
+        peek_at_the_answer(&stream, Duration::from_secs(5))
+            .await
+            .is_some(),
+        "{method} {path}: no answer began to arrive within 5 s of its head"
+    );
+    stream
+}
+
+/// Reads `stream` until it ends, for at most 5 s: what came, and the error
+/// that ended it, which is `None` for an end of stream.
+async fn read_to_the_end(
+    stream: &mut (impl AsyncRead + Unpin),
+) -> (Vec<u8>, Option<std::io::Error>) {
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
+            Err(_) => panic!(
+                "the connection was still open 5 s after it was read from; it gave {:?}",
+                String::from_utf8_lossy(&raw)
+            ),
+            Ok(Ok(0)) => return (raw, None),
+            Ok(Ok(n)) => raw.extend_from_slice(&chunk[..n]),
+            Ok(Err(e)) => return (raw, Some(e)),
+        }
+    }
+}
+
+/// What a client was answered and how its connection ended.
+struct Reply {
+    /// 0 when no answer came.
+    status: u16,
+    content_length: Option<usize>,
+    body: String,
+    /// How many bytes came, whole.
+    read: usize,
+    /// The error that ended the reading; `None` for an end of stream.
+    ended_in: Option<std::io::Error>,
+    /// What writing to the connection returned, for the message of a failure.
+    wrote: String,
+}
+
+impl Reply {
+    fn parse(raw: &[u8], ended_in: Option<std::io::Error>, wrote: String) -> Reply {
+        let (head, body) = match raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(at) => (&raw[..at], &raw[at + 4..]),
+            None => (raw, &raw[raw.len()..]),
+        };
+        let head = String::from_utf8_lossy(head);
+        let mut lines = head.lines();
+        let status = lines
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0);
+        let content_length = lines
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse().ok());
+        Reply {
+            status,
+            content_length,
+            body: String::from_utf8_lossy(body).into_owned(),
+            read: raw.len(),
+            ended_in,
+            wrote,
+        }
+    }
+
+    fn describe(&self) -> String {
+        let ended = match &self.ended_in {
+            None => "an end of stream".to_string(),
+            Some(e) => format!("{:?} ({e})", e.kind()),
+        };
+        format!(
+            "{} bytes were read, then {ended}; writing returned {}",
+            self.read, self.wrote
+        )
+    }
+
+    /// The answer a server gives whole and then ends the connection after: this
+    /// status, this JSON body with a `Content-Length` that says so, and then the
+    /// end of the stream.
+    fn assert_whole(&self, status: u16, body: &Value) {
+        let what = self.describe();
+        assert_eq!(self.status, status, "{what}");
+        let sent: Value = serde_json::from_str(&self.body)
+            .unwrap_or_else(|e| panic!("the body is no JSON ({e}): {:?}; {what}", self.body));
+        assert_eq!(&sent, body, "{what}");
+        assert_eq!(
+            self.content_length,
+            Some(self.body.len()),
+            "the body is not as long as its Content-Length says; {what}"
+        );
+        assert!(
+            self.ended_in.is_none(),
+            "the connection did not end with an end of stream; {what}"
+        );
+    }
+}
+
+/// A request whose body comes after the answer, as it does from a client that
+/// writes the head and the body apart (CPython's `http.client` does): the head
+/// at once, and the body once the answer has begun to arrive and some time has
+/// passed. Then everything the connection gives is read.
+async fn send_with_a_late_body(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    key: Option<&str>,
+    body: &str,
+) -> Reply {
+    let mut stream = begin_a_request(addr, method, path, key, body.len()).await;
+    // These 200 ms are not what makes the test right: whenever the body comes,
+    // the answer must be whole and the connection must end with its end of
+    // stream, and a server that reads the body away makes it so. They are what
+    // lets a server that does not do that tear the connection down first, so
+    // that this test fails on it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let wrote = stream.write_all(body.as_bytes()).await;
+    let (raw, ended_in) = read_to_the_end(&mut stream).await;
+    Reply::parse(&raw, ended_in, format!("{wrote:?}"))
+}
+
+/// The four endpoints that do not read their body answer on the head alone, and
+/// the client that sends the body late still gets the answer.
+#[tokio::test]
+async fn a_late_body_does_not_cost_a_stop_its_answer() {
+    let api = api().await;
+    let reply = send_with_a_late_body(api.addr, "POST", "/v1/stop", Some(KEY), "{}").await;
+    reply.assert_whole(200, &json!({}));
+    wait_until(async || api.control.stops.load(Ordering::SeqCst) == 1).await;
+}
+
+async fn is_in_the_dns_cache(api: &Api, name: &str) -> bool {
+    get(api, "/v1/dns").await.1["dnsCache"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["domain"] == json!(name))
+}
+
+#[tokio::test]
+async fn a_late_body_does_not_cost_a_dns_flush_its_answer() {
+    let api = api().await;
+    api.engine
+        .resolver()
+        .lookup("cached.test", rurge_dns::LookupOpts::default())
+        .await
+        .unwrap();
+    assert!(is_in_the_dns_cache(&api, "cached.test").await);
+    let reply = send_with_a_late_body(api.addr, "POST", "/v1/dns/flush", Some(KEY), "{}").await;
+    reply.assert_whole(200, &json!({}));
+    assert!(
+        !is_in_the_dns_cache(&api, "cached.test").await,
+        "the flush was done"
+    );
+}
+
+#[tokio::test]
+async fn a_late_body_does_not_cost_a_reload_its_answer() {
+    let api = api().await;
+    let reply =
+        send_with_a_late_body(api.addr, "POST", "/v1/profiles/reload", Some(KEY), "{}").await;
+    reply.assert_whole(
+        200,
+        &json!({ "ok": true, "errors": 0, "warnings": 1, "listenersRebound": false }),
+    );
+    assert_eq!(api.control.reloads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_late_body_does_not_cost_a_profile_check_its_answer() {
+    let api = api().await;
+    let (status, expected) = post(&api, "/v1/profiles/check", json!({})).await;
+    assert_eq!(status, 200, "{expected}");
+    let reply =
+        send_with_a_late_body(api.addr, "POST", "/v1/profiles/check", Some(KEY), "{}").await;
+    reply.assert_whole(200, &expected);
+}
+
+/// A request refused before its body is read is answered on the head alone too.
+#[tokio::test]
+async fn a_late_body_does_not_cost_a_wrong_key_its_401() {
+    let api = api().await;
+    let reply = send_with_a_late_body(api.addr, "POST", "/v1/dns/flush", Some("wrong"), "{}").await;
+    reply.assert_whole(401, &json!({ "error": "unauthorized" }));
+}
+
+#[tokio::test]
+async fn a_late_body_does_not_cost_a_banned_source_its_403() {
+    let api = api().await;
+    for _ in 0..BAN_FAILURES {
+        let (status, _) = call(api.addr, "GET", "/v1/outbound", Some("wrong"), None).await;
+        assert_eq!(status, 401);
+    }
+    let reply = send_with_a_late_body(api.addr, "POST", "/v1/dns/flush", Some(KEY), "{}").await;
+    reply.assert_whole(403, &json!({ "error": "banned" }));
+}
+
+#[tokio::test]
+async fn a_late_body_does_not_cost_an_unknown_path_its_404() {
+    let api = api().await;
+    let reply = send_with_a_late_body(api.addr, "POST", "/v1/nope", Some(KEY), "{}").await;
+    reply.assert_whole(404, &json!({ "error": "no such endpoint" }));
+}
+
+/// The key is checked before the route, so without it these two would both be
+/// 401: this has the right key.
+#[tokio::test]
+async fn a_late_body_does_not_cost_a_wrong_method_its_405() {
+    let api = api().await;
+    let reply = send_with_a_late_body(api.addr, "DELETE", "/v1/outbound", Some(KEY), "{}").await;
+    reply.assert_whole(405, &json!({ "error": "method not allowed" }));
+}
+
+/// An endpoint that reads its body waits for it, and was right before: there
+/// is no answer to wait for after the head, so the body is sent after 200 ms
+/// in which nothing happens, which is what is asserted.
+#[tokio::test]
+async fn an_endpoint_that_reads_its_body_gets_a_late_body_and_answers() {
+    let api = api().await;
+    let body = r#"{"level":"debug"}"#;
+    let mut stream = send_a_head(api.addr, "POST", "/v1/log/level", Some(KEY), body.len()).await;
+    assert_eq!(
+        peek_at_the_answer(&stream, Duration::from_millis(200)).await,
+        None,
+        "answered before its body came"
+    );
+    stream.write_all(body.as_bytes()).await.unwrap();
+    // The request was read whole, so the connection stays open for the next
+    // one: the answer is read by its length.
+    let (status, text) = read_one_answer(&mut stream).await;
+    assert_eq!((status, text.as_str()), (200, "{}"));
+    assert_eq!(*api.control.levels.lock().unwrap(), vec![LogLevel::Debug]);
+}
+
+/// A request that is its head and nothing else, in one write, is answered and
+/// closed as it always was.
+#[tokio::test]
+async fn a_request_without_a_body_is_answered_and_closed_as_before() {
+    let api = api().await;
+    let mut stream = TcpStream::connect(api.addr).await.unwrap();
+    let request = format!(
+        "GET /v1/outbound HTTP/1.1\r\nHost: {}\r\nX-Key: {KEY}\r\nConnection: close\r\n\r\n",
+        api.addr
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let (raw, ended_in) = read_to_the_end(&mut stream).await;
+    Reply::parse(
+        &raw,
+        ended_in,
+        "nothing was written after the request".into(),
+    )
+    .assert_whole(200, &json!({ "mode": "rule" }));
+}
+
+/// A client that sends more after the answer than will be read away for it
+/// still has its answer. The answer is read while the rest is sent: a server
+/// that stops reading at its limit closes with part of the rest unread, which
+/// can reset the connection, and a client that has not read its answer by then
+/// loses it on some systems (a body of megabytes does it on Windows). How the
+/// sending ends is not asserted, only that it ends.
+#[tokio::test]
+async fn a_client_that_sends_more_than_is_read_away_keeps_its_answer() {
+    let api = api().await;
+    let garbage = vec![b'x'; 300 * 1024];
+    let stream = begin_a_request(api.addr, "POST", "/v1/dns/flush", Some(KEY), garbage.len()).await;
+    let (mut reading, mut writing) = stream.into_split();
+    let (read, wrote) = tokio::join!(
+        read_to_the_end(&mut reading),
+        tokio::time::timeout(Duration::from_secs(10), writing.write_all(&garbage)),
+    );
+    let wrote = wrote.expect("the 300 KiB were neither taken nor refused within 10 s");
+    Reply::parse(&read.0, read.1, format!("{wrote:?}")).assert_whole(200, &json!({}));
+}
+
+/// Reads one answer off a connection that stays open: the head, and then as
+/// many bytes of body as its `Content-Length` says.
+async fn read_one_answer(stream: &mut TcpStream) -> (u16, String) {
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+            .await
+            .expect("no answer within 5 s")
+            .unwrap();
+        assert_ne!(n, 0, "the connection ended inside an answer: {raw:?}");
+        raw.extend_from_slice(&chunk[..n]);
+        let reply = Reply::parse(&raw, None, String::new());
+        if raw.windows(4).any(|w| w == b"\r\n\r\n")
+            && reply.content_length == Some(reply.body.len())
+        {
+            return (reply.status, reply.body);
+        }
+    }
+}
+
+/// What the lingering time of the crate is: a client that does not close its
+/// connection holds a stopping server this long.
+const LINGER: Duration = Duration::from_secs(1);
+
+/// A client that has had an answer and keeps its connection open: the server
+/// and the client, and the token that stops the server.
+async fn a_client_that_keeps_its_connection(
+    api: &Api,
+) -> (tokio::task::JoinHandle<()>, TcpStream, CancellationToken) {
+    let (addr, server, stop) = api.serve_apart().await;
+    let server = tokio::spawn(server);
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let request = format!("GET /v1/outbound HTTP/1.1\r\nHost: {addr}\r\nX-Key: {KEY}\r\n\r\n");
+    client.write_all(request.as_bytes()).await.unwrap();
+    let (status, body) = read_one_answer(&mut client).await;
+    assert_eq!((status, body.as_str()), (200, r#"{"mode":"rule"}"#));
+    (server, client, stop)
+}
+
+/// When the server is told to stop it closes the connections that are idle,
+/// and does not finish until they have been read away: a client that closes
+/// ends the wait at once.
+#[tokio::test]
+async fn serve_waits_for_a_closing_connection_until_the_client_closes_it() {
+    let api = api().await;
+    let (server, mut client, stop) = a_client_that_keeps_its_connection(&api).await;
+    stop.cancel();
+    // the server closed its side: the end of the stream
+    let (rest, ended_in) = read_to_the_end(&mut client).await;
+    assert!(
+        rest.is_empty() && ended_in.is_none(),
+        "{rest:?} {ended_in:?}"
+    );
+    // Nothing happens here, and that is what is asserted: the client has not
+    // closed, so the server is not finished. 100 ms is a tenth of the time it
+    // would wait for a client that never closes, and the server had finished
+    // at once before it waited at all.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !server.is_finished(),
+        "the server finished with a connection open"
+    );
+    let closed = Instant::now();
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the server did not finish after the client closed")
+        .unwrap();
+    // it was the close that ended the wait, not the end of the lingering time
+    assert!(
+        closed.elapsed() < LINGER / 2,
+        "{:?} after the close",
+        closed.elapsed()
+    );
+}
+
+/// A client that never closes holds a stopping server for the lingering time
+/// and no longer.
+#[tokio::test]
+async fn serve_stops_waiting_for_a_connection_that_never_closes_when_the_lingering_time_is_up() {
+    let api = api().await;
+    let (server, client, stop) = a_client_that_keeps_its_connection(&api).await;
+    let stopped = Instant::now();
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("the server did not finish within 10 s")
+        .unwrap();
+    let waited = stopped.elapsed();
+    assert!(
+        waited >= LINGER.mul_f64(0.9) && waited <= LINGER * 3,
+        "the server finished {waited:?} after it was told to stop"
+    );
+    drop(client);
 }

@@ -3,11 +3,13 @@
 
 mod auth;
 mod error;
+mod linger;
 mod routes;
 
 use axum::Router;
 use axum::middleware;
 use axum::routing::{get, post};
+use linger::{Lingering, Peer};
 use rurge_config::config::LoadOptions;
 use rurge_engine::profile::ProfileSources;
 use rurge_engine::{Control, Engine};
@@ -48,10 +50,11 @@ pub(crate) type App = Arc<Shared>;
 
 pub type ServerFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-/// The API's routes, guarded by the `X-Key` layer. Serve it with
-/// `into_make_service_with_connect_info::<SocketAddr>()` (as [`serve`] does):
-/// the auth layer needs the peer address to count failures and ban a source.
-pub fn router(key: String, ctx: ApiContext) -> Router {
+/// The API's routes, guarded by the `X-Key` layer. They are served the way
+/// [`serve`] does, with `into_make_service_with_connect_info::<Peer>()` over a
+/// [`Lingering`] listener: the auth layer needs the peer address to count
+/// failures and ban a source, and gets it from that and nothing else.
+pub(crate) fn router(key: String, ctx: ApiContext) -> Router {
     let app: App = Arc::new(Shared {
         engine: ctx.engine,
         control: ctx.control,
@@ -122,7 +125,9 @@ pub fn router(key: String, ctx: ApiContext) -> Router {
 
 /// Binds `addr` and returns the bound address plus the server future. The
 /// caller spawns the future (the daemon puts it on the engine's task tracker);
-/// it completes after `shutdown` is cancelled and in-flight responses finish.
+/// it completes after `shutdown` is cancelled, in-flight responses finish, and
+/// the connections that were let go of have been read away from or have closed,
+/// which takes a second at most.
 pub async fn serve(
     addr: SocketAddr,
     key: String,
@@ -138,16 +143,21 @@ pub async fn serve(
         );
     }
     let app = router(key, ctx);
+    let listener = Lingering::new(listener);
+    let connections = listener.connections();
     let fut = async move {
-        let result = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await;
+        let result = axum::serve(listener, app.into_make_service_with_connect_info::<Peer>())
+            .with_graceful_shutdown(async move { shutdown.cancelled().await })
+            .await;
         if let Err(e) = result {
             tracing::error!(error = %e, "http-api server stopped with an error");
         }
+        // The server is done with its connections, or about to drop the last
+        // of them. The ones that linger are waited for, so that a client does
+        // not lose the answer to `POST /v1/stop` to the process ending, for
+        // `LINGER_TIME` at the most.
+        connections.close();
+        connections.wait().await;
     };
     Ok((local, Box::pin(fut)))
 }

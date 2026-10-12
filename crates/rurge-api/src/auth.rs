@@ -4,11 +4,12 @@
 
 use crate::App;
 use crate::error::ApiError;
+use crate::linger::Peer;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -117,7 +118,7 @@ fn presented_key(req: &Request) -> Option<String> {
 
 pub async fn require_key(
     State(app): State<App>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
     req: Request,
     next: Next,
 ) -> Response {
