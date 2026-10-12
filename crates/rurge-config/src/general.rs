@@ -1680,6 +1680,21 @@ internet-test-url = ftp://127.0.0.1:9/?token=t0k3n
         }
     }
 
+    /// A listener a profile writes without a port gets the default port of its
+    /// kind: 6152 for `http-listen`, 6153 for `socks5-listen`.
+    #[test]
+    fn a_listener_a_profile_leaves_without_a_port_gets_the_default_port_of_its_kind() {
+        let (g, d) = parse(
+            "[General]\nhttp-listen = 127.0.0.1, pw@[::1]\nsocks5-listen = 127.0.0.1, [::1]\n",
+        );
+        assert!(codes_of(&d).is_empty(), "{:?}", codes_of(&d));
+        let shown = |listeners: &[Listener]| -> Vec<String> {
+            listeners.iter().map(|l| l.addr.to_string()).collect()
+        };
+        assert_eq!(shown(&g.http_listen), ["127.0.0.1:6152", "[::1]:6152"]);
+        assert_eq!(shown(&g.socks5_listen), ["127.0.0.1:6153", "[::1]:6153"]);
+    }
+
     #[test]
     fn only_an_http_listen_value_carries_a_password() {
         let listeners = parse_http_listen("pw@127.0.0.1:1, 127.0.0.1:2, p@ss@[::1]:3").unwrap();
