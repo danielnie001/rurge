@@ -222,6 +222,60 @@ mod tests {
     use rurge_net::socket::{Family, SocketHook};
     use rurge_proto::external::ProcessHook;
 
+    /// Where the two GeoIP databases are fetched from: `geoip-maxmind-url`
+    /// for the country one (manual, IP Rules), the command line over the
+    /// profile, the defaults when nobody says. The profile's key is the only
+    /// way to the country database that is not a command-line flag, and no
+    /// other test follows it.
+    #[test]
+    fn the_geoip_links_are_the_profiles_and_the_command_lines_over_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = |general: &str| {
+            let text = format!("[General]\n{general}\n[Rule]\nFINAL,DIRECT\n");
+            let loaded = rurge_config::config::from_text(
+                &text,
+                std::path::Path::new("t.conf"),
+                &rurge_config::config::LoadOptions::for_tests(),
+            );
+            assert!(!loaded.diagnostics.has_errors());
+            loaded.config
+        };
+        let args = |country: Option<&str>, asn: Option<&str>| RuntimeArgs {
+            data_dir: Some(dir.path().to_path_buf()),
+            geoip_url: country.map(|u| Url::parse(u).unwrap()),
+            geoip_asn_url: asn.map(|u| Url::parse(u).unwrap()),
+            no_network: true,
+            dns_cache_size: None,
+        };
+        let defaults = GeoUrls::default();
+        let nobody = args(None, None).resolve(&load("")).unwrap().geo_urls;
+        assert_eq!(
+            (nobody.country.as_str(), nobody.asn.as_str()),
+            (defaults.country.as_str(), defaults.asn.as_str())
+        );
+        let profile = load("geoip-maxmind-url = https://geo.example/country.tar.gz");
+        let from_profile = args(None, None).resolve(&profile).unwrap().geo_urls;
+        assert_eq!(
+            from_profile.country.as_str(),
+            "https://geo.example/country.tar.gz"
+        );
+        assert_eq!(from_profile.asn, defaults.asn, "the profile has no say");
+        let from_line = args(
+            Some("https://line.example/country.mmdb"),
+            Some("https://line.example/asn.mmdb"),
+        )
+        .resolve(&profile)
+        .unwrap()
+        .geo_urls;
+        assert_eq!(
+            (from_line.country.as_str(), from_line.asn.as_str()),
+            (
+                "https://line.example/country.mmdb",
+                "https://line.example/asn.mmdb"
+            )
+        );
+    }
+
     /// Socket-level only: nothing about this machine's network is changed.
     #[test]
     fn platform_sockets_delegates_to_rurge_platform() {
