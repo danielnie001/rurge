@@ -439,7 +439,7 @@
 | FR-OBS-02 | 「…」之 `GET /v1/geoip` | 做了 | `crates/rurge-api/src/routes/geoip.rs::geoip`：`address`、`country`、`asn`、`organization`、`geoip-db-date`、`asn-db-date`，没有结果的是 `null`，`ip` 不是地址 400——手册的形状（Mac 6.10 / iOS 5.23 起；日期取库自带的构建时间，兼容性清单 10.4 节登记） | `crates/rurge-api/tests/api.rs`：`geoip_says_what_the_databases_in_use_know`、`geoip_without_databases_has_nothing_to_say`、`geoip_wants_an_address_and_the_key` |
 | FR-OBS-02 | 「…」之 `/v1/external_resources` | 做了 | `crates/rurge-api/src/routes/resources.rs`：`defines` 里每项 `path`、`type`、`key`、`local`、`ready`、`updatedAt`、`updating`、`fromModule`、`error`；`update` 请求 `{"key":…}` 回键到 `"success"` 或错误信息——手册的形状；逐字段的核对见 FR-CFG-14 各行 | `crates/rurge-api/tests/api.rs`：`external_resources_are_listed_one_item_for_each_kind`、`external_resources_are_updated_one_key_at_a_time`、`external_resources_are_all_updated_but_the_files` |
 | FR-OBS-02 | 「…」之 `GET /v1/modules` | 做了 | `crates/rurge-api/src/routes/misc.rs::modules`：`{"enabled":[],"available":[]}`——手册给的形状，阶段 5 才有内容（`POST` 随之，今天是 405） | `crates/rurge-api/tests/api.rs`：`features_collections_stop_and_unknown_paths` |
-| FR-OBS-02 | 「…」之 `POST /v1/profiles/check` | 没有做完（已登记） | 手册（Mac 4.0.6+）：请求 `{"name": "Profile2"}`，"If the profile is invalid, an error is returned. Otherwise, the `error` field is null."。rurge：`crates/rurge-api/src/routes/profiles.rs::check` 不收正文，校验磁盘上的当前配置，应答 `{"ok","errors","warnings","diagnostics"}`，没有 `error` 键、不认 `name`。兼容性清单 10.4 节把这一行写成 ✅（阶段 1 / 6），备注里没有这个差异。使用者照手册写的脚本读 `error` 得到 `undefined`（读不出"有效"），传 `name` 的请求会被当成没有正文（多出的键被忽略）。没有当场补：加 `error` 键只是一个字段，但 `name` 的含义（哪一份 Profile）要等阶段 6 的多 Profile 管理，两者该怎么一起定是个决定 | `crates/rurge-api/tests/api.rs`：`profiles_current_check_and_reload`（好的 Profile `ok:true`，改坏之后 `ok:false` 带 E0007 与它的建议）、`profile_check_includes_the_dry_build` |
+| FR-OBS-02 | 「…」之 `POST /v1/profiles/check` | 补上了 | `crates/rurge-api/src/routes/profiles.rs::check`（`76992aa` 前：不收正文，校验磁盘上的当前配置，应答只有 `ok`、`errors`、`warnings`、`diagnostics` 四个键。手册（Mac 4.0.6+）：请求 `{"name": "Profile2"}`，"If the profile is invalid, an error is returned. Otherwise, the `error` field is null."；照手册写的脚本读 `error` 得到 `undefined`，有效的 Profile 与有错的 Profile 都是，所以有错的 Profile 在脚本里同有效的分不开；传了 `name` 的请求被当成没有正文，检查的永远是正在运行的那一份。现在：应答多一个总是写出的 `error` 键，Profile 里没有严重度为 error 的诊断时是 `null`（警告不算），否则是 `diagnostics` 次序里第一条错误的 `Diagnostic::headline()`（严重度、码、位置、消息），还有别的错误时后面接 ` (and N more)`，N 是其余错误的条数；字符串的措辞是 rurge 自己的，手册只说"返回一个错误"；原有的四个键名字、类型与含义不变。请求的正文由 `requested_name` 读，不交给会自己答复的提取器：没有正文、只有 JSON 空白、不带 `name` 的 JSON 对象，检查正在运行的 Profile；`name` 是字符串时经 `names` 比较，等于 Profile 文件的名字或去掉最后一个扩展名的名字（`config.conf` 叫 `config.conf` 也叫 `config`）就检查正在运行的 Profile，逐字比较，不折叠大小写，不当路径用，文件名不是 Unicode 的什么名字也叫不到；别的字符串是 404 `{"error":"profile not found"}`，什么也没有加载；不是 JSON、不是 JSON 对象、`name` 不是字符串、或正文超过 2 MiB 读不了，是 400，一句固定的话；两句话都不重复请求里的任何东西；Content-Type 不看；400 与 404 在加载 Profile 之前给出。与 Surge 有意不同的一处：Surge 用 `name` 在它的 Profile 目录里选一份，rurge 现在只有一份，就是 `-c` 指的文件，所以 `name` 只认这一份，别的名字是 404 而不是被忽略（忽略的话，回答的是没有被问到的那一份）；要选别的 Profile，同 `GET /v1/profiles`、`POST /v1/profiles/switch` 一起，等阶段 6 的多 Profile 管理。这个端点从此读正文：晚于请求头到达的正文被等着，不再是请求头一到就答复） | `crates/rurge-api/tests/api.rs`：`profiles_current_check_and_reload`（原有，未改：好的 Profile `ok:true`，改坏之后 `ok:false` 带 E0007 与它的建议）、`profile_check_includes_the_dry_build`（原有，未改）、`profile_check_says_null_in_error_for_a_valid_profile`（`76992aa`：先红后绿，旧代码的应答没有 `error` 键；有效的 Profile，不带正文与 `{}` 各一遍，键在、值是 null，警告不算错误）、`profile_check_says_what_is_wrong_in_error`（先红后绿，旧代码没有 `error`；一条、两条、三条错误时 `error` 是 `diagnostics` 里第一条错误的一行文字，不是第一条诊断，Profile 里的警告排在前面，后缀 ` (and 1 more)`、` (and 2 more)`，只有一条时没有后缀；运行中的规则没有被动）、`profile_check_takes_the_name_of_the_running_profile_and_no_other`（先红后绿，旧代码对任何 `name` 都检查正在运行的那一份：`t.conf` 与 `t` 同没有 `name` 时一样；别的名字，大小写不同的、带空格的、带路径的、绝对路径、空串，是 404 `profile not found` 且应答里没有那个名字；文件被删掉之后，正确的名字是 500，别的名字仍是 404，所以 404 在加载之前给出，把 404 挪到加载之后这条红）、`profile_check_refuses_a_body_that_is_no_name_with_one_text`（先红后绿，旧代码一律 200；十三种读不出 `name` 的正文，400、同一句话、不含收到的任何东西）、`profile_check_does_not_look_at_the_content_type`（先红后绿；没有 Content-Type、`text/plain`、`application/x-www-form-urlencoded`、`application/json` 的请求，答复一样）、`profile_check_refuses_a_body_too_large_to_read_with_the_same_text`（先红后绿；超过 2 MiB 的正文，同一句 400）、`a_late_body_does_not_cost_a_profile_check_its_answer`（改写，先红后绿：这个端点现在读正文，请求头之后 200 ms 里没有应答，正文到了再答复，200、404、400 各一遍，答复同正文随请求头一起到时相同；旧代码请求头一到就答复）、`profile_check_takes_a_body_of_whitespace_for_no_body`（没法先红：旧代码根本不读正文，改动之前就绿，钉住原有的行为；去掉空白的特判它变红）；`crates/rurge-api/src/routes/profiles.rs`：`the_file_name_and_the_file_name_without_its_last_extension_name_the_profile`（先红后绿，在对任何名字都说不是的桩上红）、`only_the_last_extension_comes_off`（同）、`a_file_without_an_extension_and_a_dot_file_have_one_name`（同）、`no_other_name_names_it`（桩上就是绿的，它只否定；对任何名字都说是的变体、不分大小写的变体令它红）、`a_file_name_that_is_not_unicode_is_named_by_nothing`（同，按替换后的文字比较的变体令它红） |
 | FR-OBS-02 | 「…」之 `POST /v1/profiles/reload` | 需求文字有问题（阶段栏写 1 骨架，逐阶段补齐；手册只写"Execute profile reloading immediately."，没有定义应答；兼容性清单 10.4 节把它列为 ✅ 阶段 1，`docs/api/phase1.md` 记 rurge 暂定的结构；今天回 `{"ok","errors","warnings","listenersRebound"}`，解析失败或构建失败时 `ok:false` 而配置不变） | `crates/rurge-api/src/routes/profiles.rs::reload` | `crates/rurge-api/tests/api.rs`：`profiles_current_check_and_reload`；`crates/rurge/tests/cli.rs`：`run_reloads_and_stops_via_the_api` |
 | FR-OBS-02 | 「…」之 `GET /v1/policies` | 需求文字有问题（阶段栏写 1 骨架，逐阶段补齐；手册只写"List all policies."，没有应答的形状；兼容性清单 10.4 节写"JSON 结构手册未定义，暂定结构见 `docs/api/phase1.md`，阶段 6 对齐真实 Surge"；今天回 `{"proxies":[…五个内置策略加配置里的…],"policy-groups":[…]}`） | `crates/rurge-api/src/routes/policies.rs::policies` | `crates/rurge-api/tests/api.rs`：`policies_and_rules_are_listed_with_hits` |
 | FR-OBS-02 | 「…」之 `GET /v1/rules` | 需求文字有问题（同上一行；手册只写"Obtain the list of rules."；今天回 `{"rules":[{"index","rule","hits"}]}`，`RULE-SET` 的 URL 里的用户名口令显示成 `***`） | `crates/rurge-api/src/routes/policies.rs::rules` | `crates/rurge-api/tests/api.rs`：`policies_and_rules_are_listed_with_hits`、`the_rules_after_the_first_final_are_not_listed` |
@@ -485,8 +485,8 @@
 | --- | --- |
 | 做了 | 236 |
 | 做了，补了用例 | 75 |
-| 补上了 | 7 |
-| 没有做完（已登记） | 4 |
+| 补上了 | 8 |
+| 没有做完（已登记） | 3 |
 | 有意不同（已登记） | 14 |
 | 不属于阶段 1 | 46 |
 | 需求文字有问题 | 31 |
@@ -500,30 +500,29 @@
 | 入站（FR-IN） | 32 | 19 | 7 | 0 | 0 | 4 | 1 | 1 |
 | 出站（FR-OUT） | 14 | 5 | 7 | 0 | 0 | 1 | 0 | 1 |
 | HTTP（FR-HTTP） | 20 | 11 | 7 | 0 | 0 | 0 | 2 | 0 |
-| 观测与控制（FR-OBS） | 54 | 27 | 6 | 0 | 1 | 2 | 10 | 8 |
-| 合计 | 413 | 236 | 75 | 7 | 4 | 14 | 46 | 31 |
+| 观测与控制（FR-OBS） | 54 | 27 | 6 | 1 | 0 | 2 | 10 | 8 |
+| 合计 | 413 | 236 | 75 | 8 | 3 | 14 | 46 | 31 |
 
-读的过程中补的用例与修复在 `1f1938a` 之后的提交里，每一行写明提交。当场补上的修复五处，各有一条先红后绿的用例：`0863e52`（`include-device-communication` 是 iOS 专属键，原来当成未知键）、`ec80158`（同一个 DNS 服务器写了两遍或被 `system` 再带进来一次，只问一次）、`bffa339`（`encrypted-dns-server = off` 关掉加密 DNS，不再告警）、`ce9a5e9`（系统 hosts 文件开头的字节顺序标记不算进第一个地址）、`fcb4abc`（监听器选项的 `Debug` 不再带出口令）。前四处是"补上了"的四行；最后一处没有哪一行日志打过那个 `Debug`，只是类型本身会把口令打出来，它所在的 FR-OBS-01 一行记"做了，补了用例"。另有一处是读完之后、用一个独立的改动补上的：`90d91cc`（`.local` 名字与 `[Host]` 的 `server:system`、`server:syslib`、`server:force-syslib` 交给系统解析库，不再只问系统的 DNS 服务器）。读的时候这三行（FR-DNS-02 一行、FR-DNS-05 两行）登记为"没有做完（已登记）"，现在是"补上了"，用例名和先红后绿的情形写在那三行里。
+读的过程中补的用例与修复在 `1f1938a` 之后的提交里，每一行写明提交。当场补上的修复五处，各有一条先红后绿的用例：`0863e52`（`include-device-communication` 是 iOS 专属键，原来当成未知键）、`ec80158`（同一个 DNS 服务器写了两遍或被 `system` 再带进来一次，只问一次）、`bffa339`（`encrypted-dns-server = off` 关掉加密 DNS，不再告警）、`ce9a5e9`（系统 hosts 文件开头的字节顺序标记不算进第一个地址）、`fcb4abc`（监听器选项的 `Debug` 不再带出口令）。前四处是"补上了"的四行；最后一处没有哪一行日志打过那个 `Debug`，只是类型本身会把口令打出来，它所在的 FR-OBS-01 一行记"做了，补了用例"。另有两处是读完之后、各用一个独立的改动补上的：`90d91cc`（`.local` 名字与 `[Host]` 的 `server:system`、`server:syslib`、`server:force-syslib` 交给系统解析库，不再只问系统的 DNS 服务器）与 `76992aa`（`POST /v1/profiles/check` 的应答带 `error`，请求里的 `name` 不再被忽略）。读的时候前一处的三行（FR-DNS-02 一行、FR-DNS-05 两行）与后一处的一行（FR-OBS-02 一行）登记为"没有做完（已登记）"，现在是"补上了"，用例名和先红后绿的情形写在那四行里。
 
 **结论，只从上面的行得出。** 两个数并排放着，缺一不可。
 
-- **没有做完（已登记）的句子：4 行，都在优先级 P0 的需求行上，优先级 P1 的需求行上没有。** 4 行是四件事：FR-RULE-01 手册 IP 页的 `GEOIP,UNKNOWN` 与 `IP-ASN,UNKNOWN`；FR-RULE-04 规则集文件行上的 `extended-matching`；FR-RULE-05 大集合内存可控的判据；FR-OBS-02 的 `POST /v1/profiles/check`。逐件缺什么、使用者今天看到什么，在"没有做完的"一节。
+- **没有做完（已登记）的句子：3 行，都在优先级 P0 的需求行上，优先级 P1 的需求行上没有。** 3 行是三件事：FR-RULE-01 手册 IP 页的 `GEOIP,UNKNOWN` 与 `IP-ASN,UNKNOWN`；FR-RULE-04 规则集文件行上的 `extended-matching`；FR-RULE-05 大集合内存可控的判据。逐件缺什么、使用者今天看到什么，在"没有做完的"一节。
 - **阶段栏给了阶段 1、今天没有做到，因为兼容性清单或某份设计把它们登记在后面的阶段的句子：28 行，优先级 P0 的需求行上 23 行，优先级 P1 的需求行上 5 行**（FR-CFG-15 的 3 行、FR-OBS-09 的 2 行）。它们列在"需求文字的问题"的第一张表里，不在上一个数里：每一句今天都有代码在做它今天做的那件事、有用例断言，对不上的是需求文档的阶段栏与那些登记。改阶段栏，还是改登记，由项目所有者定；需求文档没有改。
 
-此外还有 14 行"有意不同（已登记）"（见"有意不同的"一节）：rurge 有意做成了别的样子，有的同需求的字面不同，有的同 Surge 手册不同。要知道阶段 1 的需求有哪些句子按字面没有满足，这三处都要看：没有做完的 4 行、需求文字的问题里的 28 行、有意不同的 14 行。
+此外还有 14 行"有意不同（已登记）"（见"有意不同的"一节）：rurge 有意做成了别的样子，有的同需求的字面不同，有的同 Surge 手册不同。要知道阶段 1 的需求有哪些句子按字面没有满足，这三处都要看：没有做完的 3 行、需求文字的问题里的 28 行、有意不同的 14 行。
 
-这份文档是一个读代码、读用例的断言、补用例的助手写成的，每条结论另由一位评审者抽查；读的代码是提交 `a4d665c`。FR-DNS-02 的 `.local` 一行与 FR-DNS-05 的 `system`、`syslib` 两行是例外：它们在提交 `90d91cc` 补上之后，按那个提交的代码改写；同一份改动让 FR-DNS-03"…未配置用系统 DNS"一行引用的用例改了名，这一行的用例名也按 `90d91cc` 核对。其余各行，表里写成"路径::函数"的代码、写成"路径：用例名"的用例，以及写出的提交，在 `a4d665c` 上逐个核对过：路径是被跟踪的文件，函数和用例名在那个文件里用 `git grep` 找得到，提交用 `git cat-file` 找得到。它没有覆盖：手工验收清单 `docs/acceptance/phase1-manual.md` 的 34 行，一行也没有做过；CI，没有绿过，所有用例只在一台 Windows 11 x86-64 的开发机上跑过。判为"做了"的行说的是有一条用例断言了这一句，不是说别处没有缺口。
+这份文档是一个读代码、读用例的断言、补用例的助手写成的，每条结论另由一位评审者抽查；读的代码是提交 `a4d665c`。FR-DNS-02 的 `.local` 一行、FR-DNS-05 的 `system`、`syslib` 两行与 FR-OBS-02 的 `POST /v1/profiles/check` 一行是例外：前三行在提交 `90d91cc` 补上之后，按那个提交的代码改写；同一份改动让 FR-DNS-03"…未配置用系统 DNS"一行引用的用例改了名，这一行的用例名也按 `90d91cc` 核对；最后一行在提交 `76992aa` 补上之后，按那个提交的代码改写。其余各行，表里写成"路径::函数"的代码、写成"路径：用例名"的用例，以及写出的提交，在 `a4d665c` 上逐个核对过：路径是被跟踪的文件，函数和用例名在那个文件里用 `git grep` 找得到，提交用 `git cat-file` 找得到。它没有覆盖：手工验收清单 `docs/acceptance/phase1-manual.md` 的 34 行，一行也没有做过；CI，没有绿过，所有用例只在一台 Windows 11 x86-64 的开发机上跑过。判为"做了"的行说的是有一条用例断言了这一句，不是说别处没有缺口。
 
 ## 没有做完的
 
-4 行，4 件事，都在优先级 P0 的需求行上。
+3 行，3 件事，都在优先级 P0 的需求行上。
 
 | # | 需求 | 这一句 | 缺什么、使用者今天看到什么 | 为什么没有当场补 |
 | --- | --- | --- | --- | --- |
 | 1 | FR-RULE-01 | 手册 IP 页的 `GEOIP,UNKNOWN`、`IP-ASN,UNKNOWN`（库里查不到国家或 ASN 的目标；需求没有点名这两种写法） | 这两种写法的语义。`GEOIP,UNKNOWN` 能加载，国家码读成 `UNKNOWN`，长度不是两个字母，编译成永不匹配，`rurge check` 没有任何提示；`IP-ASN,UNKNOWN` 是加载错误 E0011，含它的 Profile 加载不了 | 要先定库没装时算不算"查不到"，ASN 的值要不要改成不是数字的类型；手册这一节标的版本（Mac 6.9.1 / iOS 5.102.0）高于本项目对照的 6.9 / 5.22，兼容性清单没有登记 |
 | 2 | FR-RULE-04 | 规则集文件里一行上的 `extended-matching` | 标志对进了域名索引的 `DOMAIN` 与 `DOMAIN-SUFFIX` 行没有作用，手册说的"集合里已有一条域名规则带它，整集的域名规则都带"也没有做。用 `rurge rule match --sni` 试一份这样的文件：这两种行不命中 SNI，`DOMAIN-KEYWORD` 的行命中 | 兼容性清单没有登记。对真实会话今天没有影响（决定策略时会话还没有 SNI），到阶段 4 才露出来 |
 | 3 | FR-RULE-05 | 大集合内存可控 | 判据：需求没有给数字。一百万条的 `DOMAIN-SET` 建好后约 137 MiB，`RULE-SET` 约 156 MiB，载入那一刻的峰值约为它的三倍（阶段 1 补遗（M5a）在一台 Windows 11 x86-64 的开发机上量的）。NFR-01 的"一万个并发连接常驻内存 < 300 MB"在载了满额集合的前提下成立与否，没有人定 | 要项目所有者定判据 |
-| 4 | FR-OBS-02 | `POST /v1/profiles/check` | 手册（Mac 4.0.6+）：请求 `{"name": "Profile2"}`，配置有效时应答的 `error` 为 null。rurge 的请求没有正文、校验磁盘上的当前配置，应答是 `ok`、`errors`、`warnings`、`diagnostics` 四个键，没有 `error`、不认 `name`：照手册写的脚本读 `error` 读不出"有效"，传了 `name` 的请求被当成没有正文。兼容性清单 10.4 节把这一行写成 ✅，备注里没有这个差异 | 加 `error` 键只是一个字段，但 `name` 的含义（哪一份 Profile）要等阶段 6 的多 Profile 管理，两者怎么一起定是个决定 |
 
 另有一处不是某一句没做完，是使用者会撞上的缺口，也没有登记在别的文档里：`rurge check` 不建规则集注册表与解析器，所以只有它们才给的告警——`W0025`（集合成环或嵌套超过八层）、`W0026`（带用户名口令的加密 DNS 地址）、`W0027`（`[Host]` 里被跳过的 `script:` 项）——它看不到，`rurge run` 与 `rurge rule match` 会说。同一份文件，`check` 报 0 条告警，`rule match` 报这三条。用 `rurge check` 过了的 Profile 去 `run`，这几条告警到那时才出现。
 
