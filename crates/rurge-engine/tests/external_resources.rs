@@ -1453,3 +1453,36 @@ async fn a_set_is_listed_with_the_lines_of_its_file_that_were_not_used() {
     let listing = g.engine.external_resources(Some(&sources));
     assert_eq!(item(&listing, &key).unused, lines(2, 0));
 }
+
+/// `disable-geoip-db-auto-update = true` (manual, IP Rules) stops the
+/// downloads of GeoIP databases that are there: a start with both in the data
+/// directory asks the download addresses for nothing, where the same start
+/// without the key asks for both.
+#[tokio::test]
+async fn the_geoip_databases_that_are_there_are_fetched_again_unless_the_profile_says_not() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rurge-rules/tests/fixtures");
+    for (general, fetched) in [("disable-geoip-db-auto-update = true\n", false), ("", true)] {
+        let server = TestServer::spawn().await;
+        let dir = tempfile::tempdir().unwrap();
+        let geoip = dir.path().join("geoip");
+        std::fs::create_dir_all(&geoip).unwrap();
+        for (from, to) in [
+            ("GeoIP2-Country-Test.mmdb", "GeoLite2-Country.mmdb"),
+            ("GeoLite2-ASN-Test.mmdb", "GeoLite2-ASN.mmdb"),
+        ] {
+            std::fs::copy(fixtures.join(from), geoip.join(to)).unwrap();
+        }
+        let profile = format!("[General]\n{general}[Proxy]\n[Rule]\nFINAL,DIRECT\n");
+        let _runtime = online_runtime(dir.path(), &profile, &server, EngineShared::default()).await;
+        if fetched {
+            wait_until("both databases to be asked for", || {
+                server.hits("/geo/country.mmdb") >= 1 && server.hits("/geo/asn.mmdb") >= 1
+            })
+            .await;
+        } else {
+            // the longest a first request takes to arrive, with a margin
+            tokio::time::sleep(NOTHING_MORE).await;
+            assert_eq!(server.requests().len(), 0, "{general:?}");
+        }
+    }
+}
