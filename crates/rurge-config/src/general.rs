@@ -1082,6 +1082,36 @@ mod tests {
         );
     }
 
+    /// `dns-server` (manual, DNS Servers) takes IPv4 and IPv6 addresses, each
+    /// with a port or without one (53), and `system`; a hostname is no
+    /// server, nor is an address with a port that is none.
+    #[test]
+    fn dns_server_takes_addresses_with_an_optional_port_and_no_hostnames() {
+        let (g, d) = parse(
+            "[General]\ndns-server = 1.1.1.1, 192.0.2.53:5353, ::1, [::2], [2001:db8::53]:5353, system\n",
+        );
+        assert!(codes_of(&d).is_empty(), "{:?}", codes_of(&d));
+        assert_eq!(
+            g.dns_server,
+            vec![
+                DnsServer::Udp("1.1.1.1:53".parse().unwrap()),
+                DnsServer::Udp("192.0.2.53:5353".parse().unwrap()),
+                DnsServer::Udp("[::1]:53".parse().unwrap()),
+                DnsServer::Udp("[::2]:53".parse().unwrap()),
+                DnsServer::Udp("[2001:db8::53]:5353".parse().unwrap()),
+                DnsServer::System,
+            ]
+        );
+        let (g, d) = parse(
+            "[General]\ndns-server = localhost, dns.example.com, 1.1.1.1:99999, 1.1.1.1:, 8.8.8.8\n",
+        );
+        assert_eq!(codes_of(&d), vec![codes::W_INVALID_VALUE; 4]);
+        assert_eq!(
+            g.dns_server,
+            vec![DnsServer::Udp("8.8.8.8:53".parse().unwrap())]
+        );
+    }
+
     #[test]
     fn typical_section() {
         let (g, d) = parse(
