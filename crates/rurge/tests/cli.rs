@@ -2729,6 +2729,60 @@ mod run {
         assert!(ok, "no rurge.log* file carried the startup INFO line");
     }
 
+    /// The data directory and the log file are named by the environment as
+    /// well as by the command line: with nothing but `RURGE_DATA_DIR` and
+    /// `RURGE_LOG_FILE` set, `state.json` is made in the one and the startup
+    /// line is written to the other.
+    #[test]
+    fn the_data_directory_and_the_log_file_can_come_from_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(
+            dir.path(),
+            "http-listen = 127.0.0.1:0
+socks5-listen = 127.0.0.1:0
+loglevel = notify",
+        );
+        let data = dir.path().join("data");
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("rurge"));
+        cmd.arg("run")
+            .arg("-c")
+            .arg(&conf)
+            .env("RURGE_DATA_DIR", &data)
+            .env("RURGE_LOG_FILE", logs.join("rurge.log"))
+            .env("RURGE_NO_NETWORK", "true")
+            .env(
+                "RURGE_SYSTEM_PROXY_BACKEND",
+                format!("file:{}", sysproxy_file(&data).display()),
+            )
+            .env_remove("RURGE_SYSTEM_PROXY")
+            .env_remove("RURGE_EMPTY_GROUP_REJECT")
+            .env_remove("RURGE_LISTEN_HTTP")
+            .env_remove("RURGE_LISTEN_SOCKS5");
+        let daemon = spawn_command(cmd);
+        wait_until(
+            "state.json in the data directory the environment names",
+            || data.join("state.json").exists(),
+        );
+        wait_until(
+            "the startup line in the log file the environment names",
+            || {
+                std::fs::read_dir(&logs)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.ok())
+                    .any(|entry| {
+                        entry.file_name().to_string_lossy().starts_with("rurge.log")
+                            && std::fs::read_to_string(entry.path())
+                                .map(|text| text.contains("rurge running"))
+                                .unwrap_or(false)
+                    })
+            },
+        );
+        drop(daemon);
+    }
+
     #[test]
     fn run_exits_2_on_a_broken_profile() {
         let dir = tempfile::tempdir().unwrap();
