@@ -2288,6 +2288,50 @@ DOMAIN,c.example,no-resolve
         )
     }
 
+    /// The `update-interval` of a `RULE-SET` line is the interval its resource
+    /// is refreshed at: the next refresh falls around it, around a day when the
+    /// line does not say.
+    #[tokio::test]
+    async fn the_update_interval_of_a_rule_line_is_the_interval_of_its_resource() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = TestServer::spawn().await;
+        let (ten_minutes, a_day) = (server.url("/ten.list"), server.url("/day.list"));
+        for url in [&ten_minutes, &a_day] {
+            seed_cache(dir.path(), url, b"DOMAIN,a.example\n", SystemTime::now());
+        }
+        let cfg = load(
+            &format!(
+                "[Proxy]\nP = direct\n[Rule]\nRULE-SET,{ten_minutes},P,update-interval=600\nRULE-SET,{a_day},P\nFINAL,DIRECT\n"
+            ),
+            dir.path(),
+        );
+        let mgr = manager(dir.path());
+        let (_registry, _) = SetRegistry::build(&cfg, mgr.clone(), dir.path());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !(mgr.statuses().len() == 2
+            && mgr.statuses().iter().all(|s| s.next_refresh.is_some()))
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the refreshes were never scheduled"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let refresh_in = |url: &Url| {
+            let source = rurge_net::resource::ResourceSource::Url(url.clone());
+            let status = mgr.statuses().into_iter().find(|s| s.source == source);
+            let at = status.expect("a status").next_refresh.expect("scheduled");
+            at.duration_since(SystemTime::now()).unwrap_or_default()
+        };
+        // the time is spread by a tenth to either side of the interval
+        let ten = refresh_in(&ten_minutes);
+        assert!(
+            ten >= Duration::from_secs(500) && ten <= Duration::from_secs(700),
+            "{ten:?}"
+        );
+        assert!(refresh_in(&a_day) >= Duration::from_secs(70_000));
+    }
+
     /// The set is in the cache (or a file) when the registry is built: one
     /// `W0003`, with the name of the set and the number of the first line and
     /// with nothing the lines carry, in the message or in the hint.
