@@ -239,7 +239,10 @@ enum AaaaTimeout {
     /// The query was sent for its caller's own sake and is the only one made
     /// for its lookup, so its timeout is the caller's to count.
     Count,
-    /// Someone else counts the timeout.
+    /// The timeout is not this caller's to count. Its owner counts it — except
+    /// where the owner is itself a query that counts nothing (a lookup that
+    /// comes to wait on the background query that asks again, or on a lookup
+    /// by the system's servers): the count is then one short.
     Ignore,
 }
 
@@ -2029,7 +2032,10 @@ mod tests {
         assert_eq!(both[1]["message"], "failed");
         assert_eq!(both[1]["error"], "no such host");
 
-        for text in both.iter().flat_map(|event| event.values()) {
+        // Not only the library's own events: nothing this module logs on the
+        // way to these lookups names the host or an address.
+        let all = events.of("rurge_dns::resolver");
+        for text in all.iter().flat_map(|event| event.values()) {
             for secret in ["printer", "nobody", "192.0.2.77", "fd00"] {
                 assert!(!text.contains(secret), "{text}");
             }
@@ -2308,7 +2314,7 @@ mod tests {
     /// 5 consecutive lookups receive an A answer while the AAAA answer times
     /// out, Surge concludes that the upstream servers never return AAAA
     /// answers on the current network and stops sending AAAA questions").
-    /// A lookup counts once, however many queries it takes: the background
+    /// A lookup counts the timeout of its own query once: the background
     /// query that asks again for the AAAA answer the lookup did not wait for
     /// counts no second timeout. Names asked one after another, each
     /// completion over before the next name: the fifth name's lookup turns
@@ -2361,9 +2367,10 @@ mod tests {
         assert_eq!(mock.query_count("h6.test", Qtype::Aaaa), 1);
     }
 
-    /// Lookups that are under way together count as lookups one after another
-    /// do: five of them turn AAAA off, four do not, whatever the background
-    /// queries that follow them do.
+    /// Lookups of different names that are under way together count as
+    /// lookups one after another do: five of them turn AAAA off, four do not,
+    /// whatever the background queries that follow them do. (Lookups of one
+    /// name share a query and count once between them: the next test.)
     #[tokio::test(start_paused = true)]
     async fn aaaa_is_turned_off_by_five_lookups_at_once_and_not_by_four() {
         let mock = MockDns::spawn().await;

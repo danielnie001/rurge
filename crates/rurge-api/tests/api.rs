@@ -1644,7 +1644,7 @@ async fn profile_check_does_not_look_at_the_content_type() {
 /// away after the answer; a sender of much more can lose the answer, as it can
 /// at any endpoint that reads its body).
 ///
-/// The request is written in two pieces, unlike the other hand-written clients
+/// The request is written in two pieces, unlike most hand-written clients
 /// here: no answer can be given before more than 2 MiB of the body were read,
 /// so the gap between the writes cannot lose one. The head goes first so that
 /// the reading half exists while the body is written.
