@@ -641,7 +641,6 @@
 **只在 Unix 上编译的用例**（用 `git grep` 找 `cfg(unix)` 与 `cfg(target_os` 得到的）：
 
 - `crates/rurge/tests/cli.rs`：`run_shuts_down_gracefully_on_sigint`（SIGINT 之后的优雅退出）、`sighup_reloads_the_profile`（FR-CFG-16 的 `SIGHUP` 重载）；它们用 `nix`（`crates/rurge/Cargo.toml` 里只在 Unix 上的开发依赖）发信号。
-- `crates/rurge-config/src/config.rs`：`the_copy_does_not_take_in_a_link_to_a_device`（托管配置的副本里 `#!include` 一个指向设备的符号链接）。
 - `tests/interop/tests/sshd.rs`：整个文件 `#![cfg(unix)]`（阶段 2 的 SSH 互操作）。
 
 **只在 Windows 上编译的用例**（别的平台没有它们，Windows 上跑过）：`crates/rurge-engine/tests/pipeline.rs` 的 `a_doq_carrier_that_outlives_a_port_unreachable_is_no_failed_session`；`crates/rurge-platform/src/sysproxy/windows.rs` 的 `real_registry_round_trips_under_a_scratch_key` 与 `real_internet_settings_can_be_snapshotted`；`crates/rurge-platform/src/process.rs` 的 `dropping_the_tree_ends_the_program_on_windows`；`crates/rurge-platform/src/sysinfo.rs` 里读注册表的两条，`the_first_of_a_registry_list_is_not_the_empty_string_that_ends_it` 与 `windows_says_the_name_of_the_machine`。
