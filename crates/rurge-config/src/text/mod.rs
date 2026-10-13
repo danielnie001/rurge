@@ -187,6 +187,7 @@ const ORDERED_SECTIONS: &[&str] = &[
     "Map Local",
     "Panel",
     "Port Forwarding",
+    "IP Rewrite",
     "Script",
     "SSID Setting",
 ];

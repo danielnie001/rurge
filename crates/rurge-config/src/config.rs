@@ -2481,6 +2481,56 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
         assert_eq!(l.config.deferred.sections.len(), 2);
     }
 
+    /// `[IP Rewrite]` acts on the virtual interface, which a later version
+    /// brings. Until then the section is read, its lines kept in the order
+    /// they were written, and it is said to be inactive like the other
+    /// sections waiting for that version; it is not an unknown section.
+    #[test]
+    fn ip_rewrite_is_a_known_section_kept_for_later() {
+        for header in ["IP Rewrite", "ip rewrite"] {
+            let l = load_text(&format!(
+                "[{header}]\n10.0.0.1 = reject\n10.0.0.0/8 = drop\nfd00::/8 = reflect\n\
+[Rule]\nFINAL,DIRECT\n"
+            ));
+            assert!(
+                !l.diagnostics.has_errors(),
+                "{header}: {:?}",
+                l.diagnostics.iter().collect::<Vec<_>>()
+            );
+            let c = codes_of(&l);
+            assert!(!c.contains(&codes::W_UNKNOWN_SECTION), "{header}: {c:?}");
+            assert!(l.config.unknown_sections.is_empty(), "{header}");
+            let inactive: Vec<&str> = l
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == codes::W_DEFERRED_SECTION)
+                .map(|d| d.message.as_str())
+                .collect();
+            assert_eq!(
+                inactive,
+                [format!(
+                    "sections parsed but inactive in this version: [{header}]"
+                )],
+                "{header}"
+            );
+            let section = l
+                .config
+                .deferred
+                .get("IP Rewrite")
+                .unwrap_or_else(|| panic!("{header}: the section is not kept"));
+            let lines: Vec<&str> = section.entries.iter().map(|e| e.raw.as_str()).collect();
+            assert_eq!(
+                lines,
+                [
+                    "10.0.0.1 = reject",
+                    "10.0.0.0/8 = drop",
+                    "fd00::/8 = reflect"
+                ],
+                "{header}"
+            );
+        }
+    }
+
     #[test]
     fn duplicate_inline_ruleset_name_warns_and_keeps_first() {
         let l = load_text(
