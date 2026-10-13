@@ -199,7 +199,7 @@ trojan、vmess（± WebSocket）、anytls 出站，任何带 Shadow TLS 的出�
 
 ## `POST /v1/profiles/check`
 
-自阶段 2 / M1 起，`POST /v1/profiles/check`（阶段 1 端点，见 `docs/api/phase1.md`）除原有的加载诊断外，还包含干构建（自 M3a 起还有订阅装配，见下一节）：磁盘上的配置能解析、但其中某个策略构建不出来（例如 `client-cert` 指向的 p12 解不开、密码错误）时，`ok` 为 `false`，`errors` 计入这条 `E0022`，`diagnostics` 里带上该策略定义所在的行号。`rurge check`、`run`、`reload` 的行为相同（见 `docs/surge-compatibility-matrix.md` 10.3 / 10.4 节）。
+自阶段 2 / M1 起，`POST /v1/profiles/check`（阶段 1 端点，见 `docs/api/phase1.md`）除原有的加载诊断外，还包含干构建（自 M3a 起还有订阅装配，见下一节）：磁盘上的配置能解析、但其中某个策略构建不出来（例如 `client-cert` 指向的 p12 解不开、密码错误）时，`ok` 为 `false`，`errors` 计入这条 `E0022`，`diagnostics` 里带上该策略定义所在的行号。`rurge check`、`run`、`reload` 的行为相同（见 `docs/surge-compatibility-matrix.md` 10.3 / 10.4 节）。阶段 1 补遗（M5b）起这个端点的应答另有第五个键 `error`（没有错误时是 `null`，否则是第一条错误的一行文字），请求也可以带手册的 `{"name": "Profile2"}`（只认正在运行的那份 Profile，别的名字是 404），见 `docs/api/phase1.md` 的「Profile 的当前文本与检查」一节。
 
 ## 订阅导入与派生的策略（M3a）
 
