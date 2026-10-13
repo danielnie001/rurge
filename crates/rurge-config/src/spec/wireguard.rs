@@ -9,9 +9,10 @@ use crate::diagnostic::codes;
 use crate::wireguard::WireGuardSection;
 
 /// Common parameters that mean nothing for a WireGuard policy: the manual
-/// has no interface binding for it, and `tfo` / `tos` concern a TCP
-/// connection to the server. Warned about (`W0028`) and cleared.
-pub const NOT_APPLICABLE: [&str; 4] = ["interface", "allow-other-interface", "tfo", "tos"];
+/// has no interface binding for it, and `tfo` concerns a TCP connection to
+/// the server. Warned about (`W0028`) and cleared. (`tos` is not among them:
+/// it marks the datagrams of the tunnel's own socket.)
+pub const NOT_APPLICABLE: [&str; 3] = ["interface", "allow-other-interface", "tfo"];
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct WireGuardSpec {
@@ -40,7 +41,6 @@ pub fn read_wireguard(
     common.interface = None;
     common.allow_other_interface = false;
     common.tfo = false;
-    common.tos = 0;
     if common.test_url.as_deref().is_some_and(|url| {
         !url.get(..7)
             .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
@@ -141,13 +141,13 @@ mod tests {
         );
     }
 
-    /// Interface binding is not supported for WireGuard (manual); `tfo` and
-    /// `tos` concern a TCP connection. `ip-version` still picks the family
-    /// of the endpoints.
+    /// Interface binding is not supported for WireGuard (manual); `tfo`
+    /// concerns a TCP connection. `ip-version` still picks the family of the
+    /// endpoints.
     #[test]
     fn socket_parameters_do_not_apply() {
         let (_, common, failed, diags) = read(
-            "wireguard, section-name=home, interface=en0, allow-other-interface=true, tfo=true, tos=0x10, ip-version=v4-only",
+            "wireguard, section-name=home, interface=en0, allow-other-interface=true, tfo=true, ip-version=v4-only",
         );
         assert!(!failed);
         let found: Vec<(&str, &str)> = diags.iter().map(|d| (d.code, d.message.as_str())).collect();
@@ -166,22 +166,44 @@ mod tests {
                     codes::W_PARAM_NOT_APPLICABLE,
                     "policy `W`: `tfo` does not apply to `wireguard` policies; ignored"
                 ),
-                (
-                    codes::W_PARAM_NOT_APPLICABLE,
-                    "policy `W`: `tos` does not apply to `wireguard` policies; ignored"
-                ),
             ]
         );
         assert_eq!(
-            (
-                common.interface,
-                common.allow_other_interface,
-                common.tfo,
-                common.tos
-            ),
-            (None, false, false, 0)
+            (common.interface, common.allow_other_interface, common.tfo),
+            (None, false, false)
         );
         assert_eq!(common.ip_version, IpVersion::V4Only);
+    }
+
+    /// `tos` marks the datagrams of the tunnel's own socket (the handshake
+    /// initiation excepted, which goes out with its own mark): the line keeps
+    /// it, and the parameters that are still not for a tunnel are said once
+    /// each beside it.
+    #[test]
+    fn the_tos_of_a_wireguard_line_is_kept() {
+        let (_, common, failed, diags) = read("wireguard, section-name=home, tos=0x28");
+        assert!(!failed && diags.is_empty(), "{diags:?}");
+        assert_eq!(common.tos, 0x28);
+        let (_, common, failed, diags) = read(
+            "wireguard, section-name=home, interface=en0, allow-other-interface=true, tfo=true, tos=0x28",
+        );
+        assert!(!failed);
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.code == codes::W_PARAM_NOT_APPLICABLE),
+            "{diags:?}"
+        );
+        let said: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(
+            said,
+            [
+                "policy `W`: `interface` does not apply to `wireguard` policies; ignored",
+                "policy `W`: `allow-other-interface` does not apply to `wireguard` policies; ignored",
+                "policy `W`: `tfo` does not apply to `wireguard` policies; ignored",
+            ]
+        );
+        assert_eq!(common.tos, 0x28);
     }
 
     /// Only plain HTTP (manual); the URL is never quoted.

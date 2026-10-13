@@ -182,6 +182,57 @@ async fn a_policy_over_underlying_proxy_never_shares_the_tunnel() {
     assert_eq!(peer.core().handshakes, 1);
 }
 
+/// The datagrams of a tunnel leave from a socket of the policy that started
+/// it, and carry the policy's `tos`: the socket is marked as it is opened, the
+/// handshake initiation goes out with the mark of its own, and the mark goes
+/// back to the policy's afterwards.
+#[tokio::test]
+async fn a_wireguard_tunnel_marks_its_datagrams_with_the_policys_tos() {
+    let (peer, section) = peer().await;
+    let hook = Arc::new(TosHook::default());
+    let h = harness_hooked(
+        Profile {
+            proxies: "WG = wireguard, section-name=w, tos=0x28",
+            rules: TO_WG,
+            sections: &section,
+            ..Profile::default()
+        },
+        hook.clone(),
+    )
+    .await;
+    let mut tunnel = connect_via_http(h.http(), "10.0.0.1:7").await;
+    echo_through(&mut tunnel, b"marked").await;
+    assert_eq!(peer.core().connected_to, [echo_addr()]);
+    let calls = hook.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        [(Family::V4, 0x28), (Family::V4, 0x88), (Family::V4, 0x28)],
+        "{calls:?}"
+    );
+}
+
+/// Two policies naming one section share its tunnel whatever their `tos`: the
+/// tunnel is not told apart by it, so the dial of one policy does not take
+/// the tunnel from under the connections of the other.
+#[tokio::test]
+async fn two_wireguard_policies_of_one_section_share_the_tunnel_whatever_their_tos() {
+    let (peer, section) = peer().await;
+    let h = harness(Profile {
+        proxies: "Marked = wireguard, section-name=w, tos=0x28\n\
+                  Plain = wireguard, section-name=w",
+        rules: "IP-CIDR,10.0.0.1/32,Marked\nIP-CIDR,10.0.0.2/32,Plain",
+        sections: &section,
+        ..Profile::default()
+    })
+    .await;
+    let mut first = connect_via_http(h.http(), "10.0.0.1:7").await;
+    echo_through(&mut first, b"one").await;
+    let mut second = connect_via_http(h.http(), "10.0.0.2:7").await;
+    echo_through(&mut second, b"two").await;
+    echo_through(&mut first, b"one again").await;
+    assert_eq!(peer.core().handshakes, 1, "one tunnel for both");
+}
+
 /// A reload that changes what the carriers go through (here `ip-version`)
 /// builds the policy anew, and its tunnel takes over from the old one.
 #[tokio::test]

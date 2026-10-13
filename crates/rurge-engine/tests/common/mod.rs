@@ -18,7 +18,7 @@ pub use rurge_engine::stack::StackOptions;
 pub use rurge_engine::state::{STATE_FILE, StateStore, profile_key};
 pub use rurge_engine::{Engine, EngineShared, ListenerSpec, RecordStatus, Runtime, RuntimeOptions};
 pub use rurge_inbound::Running;
-pub use rurge_net::socket::NoopSocketHook;
+pub use rurge_net::socket::{Family, NoopSocketHook, SocketHook};
 pub use rurge_net::testing::TestServer;
 pub use rurge_proto::testing::{
     AnyTlsScript, FakeAnyTls, FakeH2Proxy, FakeHttpProxy, FakeShadowsocks, FakeSnell, FakeSocks5,
@@ -243,6 +243,69 @@ pub async fn harness_edited(
     let dir = tempfile::tempdir().unwrap();
     let text = p.text(dns.addr());
     let engine = Engine::new(runtime_edited(dir.path(), &text, shared, edit).await);
+    let listeners = engine.bind_listeners().await.unwrap();
+    Harness {
+        dir,
+        engine,
+        listeners,
+        dns,
+    }
+}
+
+/// A socket hook that notes the TOS it is asked to set, and for which family
+/// of socket: what the sockets of a direct connector carry of their policy's
+/// settings.
+#[derive(Default)]
+pub struct TosHook {
+    pub calls: std::sync::Mutex<Vec<(Family, u8)>>,
+}
+
+impl SocketHook for TosHook {
+    fn bind_interface(&self, _: &socket2::Socket, _: &str, _: Family) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn set_tos(&self, _: &socket2::Socket, family: Family, tos: u8) -> std::io::Result<()> {
+        self.calls.lock().unwrap().push((family, tos));
+        Ok(())
+    }
+}
+
+/// As `harness`, with `hook` applying the socket settings of every direct
+/// connector.
+pub async fn harness_hooked(p: Profile<'_>, hook: Arc<dyn SocketHook>) -> Harness {
+    let dns = MockDns::spawn().await;
+    for name in ["target.test", "alt.test"] {
+        dns.set(name, &["127.0.0.1"], &[], 60);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let text = p.text(dns.addr());
+    std::fs::write(dir.path().join("t.conf"), &text).unwrap();
+    let loaded = from_text(&text, &dir.path().join("t.conf"), &LoadOptions::for_tests());
+    assert!(
+        !loaded.diagnostics.has_errors(),
+        "{:?}",
+        loaded
+            .diagnostics
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+    );
+    let mut stack = stack_options(dir.path());
+    stack.socket_hook = hook;
+    let runtime = Runtime::build(
+        loaded.config,
+        RuntimeOptions {
+            stack,
+            outbound_mode: OutboundMode::Rule,
+            idle_timeout: Duration::from_secs(600),
+            shared: EngineShared::default(),
+            request_log_size: 1000,
+        },
+    )
+    .await
+    .unwrap();
+    let engine = Engine::new(runtime);
     let listeners = engine.bind_listeners().await.unwrap();
     Harness {
         dir,

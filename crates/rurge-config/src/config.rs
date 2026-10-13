@@ -3395,9 +3395,10 @@ H = trust-tunnel, h.test, 443, username=u, password=pw, h3=maybe, ecn=on\n{}[Rul
                 })
                 .collect(),
             ),
+            // `tos` is for the socket of the tunnel: no sentence on it
             on(
                 "P = wireguard, section-name=home, interface=en0, allow-other-interface=true, tos=16",
-                ["interface", "allow-other-interface", "tos"]
+                ["interface", "allow-other-interface"]
                     .iter()
                     .map(|key| {
                         (
@@ -3502,10 +3503,10 @@ H = trust-tunnel, h.test, 443, username=u, password=pw, h3=maybe, ecn=on\n{}[Rul
                 ],
             ),
             on(
-                "P = wireguard, section-name=home, interface=, tos=16",
+                "P = wireguard, section-name=home, interface=, tfo=true",
                 vec![
                     bad_value("interface", "", "a network interface name"),
-                    not_applicable("`tos` does not apply to `wireguard` policies; ignored"),
+                    not_applicable("`tfo` does not apply to `wireguard` policies; ignored"),
                 ],
             ),
             on(
