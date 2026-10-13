@@ -849,8 +849,10 @@ impl Resolver {
                             if n >= AAAA_SUPPRESS_AFTER
                                 && !self.aaaa_suppressed.swap(true, Ordering::Relaxed)
                             {
+                                // Only the flush is named: `on_network_change`
+                                // lifts the suppression too, but nothing calls it yet.
                                 tracing::warn!(
-                                    "AAAA answers timed out in {n} lookups in a row; AAAA queries suppressed until the next flush or network change"
+                                    "AAAA answers timed out in {n} lookups in a row; AAAA queries suppressed until the DNS cache is flushed"
                                 );
                             }
                         }
@@ -1254,7 +1256,7 @@ mod tests {
         BoxedDatagram, BoxedStream, ConnectOpts, DirectConnector, SystemResolve, Target,
     };
     use rurge_net::resource::ResourceOptions;
-    use rurge_net::testing::Events;
+    use rurge_net::testing::{Events, Lines};
     use rurge_net::trail::Trail;
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
@@ -2591,6 +2593,71 @@ mod tests {
             assert_eq!(mock.query_count(&name, Qtype::Aaaa), 2, "h{i}: refreshed");
             assert_eq!(r.aaaa_suppressed(), i >= 4, "h{i}: after its refresh");
         }
+    }
+
+    /// Six names looked up all at once, none of them answered with AAAA: all
+    /// six lookups are under way before the first is over, so each starts out
+    /// asking for AAAA and each is counted.
+    async fn six_at_once(r: &Resolver, names: &[String]) {
+        let lookup = |i: usize| r.lookup(&names[i], LookupOpts::default());
+        let answered = tokio::join!(
+            lookup(0),
+            lookup(1),
+            lookup(2),
+            lookup(3),
+            lookup(4),
+            lookup(5)
+        );
+        for res in [
+            answered.0, answered.1, answered.2, answered.3, answered.4, answered.5,
+        ] {
+            let res = res.unwrap();
+            assert_eq!(res.v4.len(), 1);
+            assert!(res.v6.is_empty());
+        }
+    }
+
+    /// The line that says AAAA has been turned off is written each time it is
+    /// turned off, and once: it says how many lookups in a row timed out and
+    /// that a flush turns AAAA on again, and names no host.
+    #[tokio::test(start_paused = true)]
+    async fn turning_aaaa_off_is_said_once_each_time_without_naming_a_host() {
+        let lines = Lines::default();
+        // held across the awaits: the lookups run on this thread
+        let _capturing = lines.capture();
+        let mock = MockDns::spawn().await;
+        let names: Vec<String> = (0..12).map(|i| format!("h{i}.test")).collect();
+        for name in &names {
+            mock.set(name, &["10.0.0.1"], &["fd00::1"], 60);
+        }
+        mock.set_drop_qtype(Qtype::Aaaa, true);
+        let e = env(&profile(
+            &format!("dns-server = {}\nipv6 = true", mock.addr()),
+            "",
+        ));
+        let r = resolver_asking_aaaa(&e, &mock);
+
+        // Six counts: the fifth turns AAAA off, the sixth finds it off already.
+        six_at_once(&r, &names[..6]).await;
+        assert!(r.aaaa_suppressed());
+        let said = lines.said("AAAA answers timed out");
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("in 5 lookups in a row"), "{}", said[0]);
+        assert!(
+            said[0].contains("until the DNS cache is flushed"),
+            "{}",
+            said[0]
+        );
+        for name in &names[..6] {
+            assert!(!said[0].contains(name.as_str()), "{}", said[0]);
+        }
+
+        // A flush turns it on again, and turning it off again is said again.
+        r.flush();
+        assert!(!r.aaaa_suppressed());
+        six_at_once(&r, &names[6..]).await;
+        assert!(r.aaaa_suppressed());
+        assert_eq!(lines.said("AAAA answers timed out").len(), 2);
     }
 
     #[tokio::test]
