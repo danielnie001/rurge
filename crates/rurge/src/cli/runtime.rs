@@ -301,7 +301,7 @@ mod tests {
         );
     }
 
-    /// The one test that calls the real system resolver library, and for the
+    /// A test that calls the real system resolver library, and only for the
     /// one name every system answers from its own tables, without a packet.
     /// The wait has a limit so that a slow library fails the test with a
     /// message; the call itself runs on the blocking pool and is not cut
