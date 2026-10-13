@@ -1885,7 +1885,8 @@ fn included_link(served: &TestServer) -> url::Url {
 
 /// The sources of a profile that is managed from `managed_link` and includes
 /// `included_link`, both on `served`, both checked ten minutes ago, followed as
-/// the daemon follows them.
+/// the daemon follows them. The managed profile says `strict`, and nothing is
+/// due by it.
 fn profile_sources(api: &Api, served: &TestServer) -> Arc<ProfileSources> {
     let root = api.dir.path();
     let sources = ProfileSources::new(SourcesOptions {
@@ -1905,7 +1906,7 @@ fn profile_sources(api: &Api, served: &TestServer) -> Arc<ProfileSources> {
             url,
             role,
             interval: Duration::from_secs(3600),
-            strict: false,
+            strict: role == RemoteRole::Managed,
             lacks_section: false,
         }
     };

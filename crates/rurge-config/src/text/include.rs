@@ -561,6 +561,19 @@ mod tests {
         let (p, d) = load(dir.path(), "main.conf");
         let codes_seen: Vec<_> = d.iter().map(|x| x.code).collect();
         assert!(codes_seen.contains(&codes::E_INCLUDE_NOT_FOUND));
+        // the file is the user's own, and the message says which it is
+        let not_found = d
+            .iter()
+            .find(|x| x.code == codes::E_INCLUDE_NOT_FOUND)
+            .unwrap();
+        let path = dir.path().join("missing.dconf");
+        assert!(
+            not_found
+                .message
+                .starts_with(&format!("cannot read include `{}`: ", path.display())),
+            "{}",
+            not_found.message
+        );
         assert!(codes_seen.contains(&codes::W_REMOTE_INCLUDE_NOT_READ));
         assert!(codes_seen.contains(&codes::W_INCLUDE_SECTION_MISSING));
         assert!(codes_seen.contains(&codes::E_INCLUDE_CYCLE));

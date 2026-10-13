@@ -158,6 +158,16 @@ struct State {
     kept: Vec<(Url, bool)>,
 }
 
+impl State {
+    /// The managed profile whose line says `strict=true`, if there is one:
+    /// the source whose update `strict` requires.
+    fn strict_managed(&self) -> Option<&Tracked> {
+        self.tracked
+            .iter()
+            .find(|t| t.role == RemoteRole::Managed && t.strict)
+    }
+}
+
 /// What the tasks that follow the sources reach: the state, and a counter of
 /// the moves, which wakes a call of `changed` that is waiting.
 struct Core {
@@ -613,10 +623,7 @@ impl ProfileSources {
         let local = file_modified(&self.profile);
         let now = SystemTime::now();
         let state = self.core.lock();
-        let managed = state
-            .tracked
-            .iter()
-            .find(|t| t.role == RemoteRole::Managed && t.strict)?;
+        let managed = state.strict_managed()?;
         // The update was downloaded and waits for the sources it refers to:
         // that is no failure.
         if state
@@ -648,15 +655,19 @@ impl ProfileSources {
         let local = file_modified(&self.profile);
         let now = SystemTime::now();
         let state = self.core.lock();
-        let Some(managed) = state
-            .tracked
-            .iter()
-            .find(|t| t.role == RemoteRole::Managed && t.strict)
-        else {
+        let Some(managed) = state.strict_managed() else {
             return false;
         };
         self.status_of(&managed.key)
             .is_some_and(|s| due_since(managed.interval, s.fetched_at, local, now).is_some())
+    }
+
+    /// The key (`resource_key`) of the managed profile whose line says
+    /// `strict=true`, if there is one: the source [`strict`](Self::strict) and
+    /// [`strict_due`](Self::strict_due) speak of, and so the one sessions are
+    /// refused on account of while they are refused.
+    pub fn strict_key(&self) -> Option<String> {
+        self.core.lock().strict_managed().map(|t| t.key.clone())
     }
 
     /// The status of each tracked source, in the order of the generation

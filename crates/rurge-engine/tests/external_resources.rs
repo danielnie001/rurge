@@ -482,6 +482,11 @@ async fn the_managed_profile_is_first_whatever_order_the_sources_are_in() {
     assert_eq!(kinds(&listing)[..2], ["profile", "include"]);
 }
 
+/// What the local file of `profile_sources` says after the address of a
+/// managed profile whose update `strict` requires. The copies were checked ten
+/// minutes ago, so nothing is due by it.
+const STRICT: &str = "interval=3600 strict=true";
+
 /// The flag is on the managed profile, and on nothing else, for as long as
 /// the engine refuses sessions; and so is the reason, which no update of
 /// these sources has failed to give.
@@ -489,7 +494,7 @@ async fn the_managed_profile_is_first_whatever_order_the_sources_are_in() {
 async fn the_managed_profile_is_flagged_while_the_engine_is_suspended() {
     let w = World::new().await;
     let g = generation(&w, "").await;
-    let sources = profile_sources(&w, false);
+    let sources = profile_sources_saying(&w, false, STRICT);
     let why = "the update has not finished";
     let listed = || g.engine.external_resources(Some(&sources));
     let flagged = || -> Vec<&'static str> {
@@ -522,7 +527,7 @@ async fn the_managed_profile_is_flagged_while_the_engine_is_suspended() {
 async fn a_failed_update_is_what_the_managed_profile_says_while_sessions_are_refused() {
     let w = World::new().await;
     let g = generation(&w, "").await;
-    let sources = profile_sources(&w, false);
+    let sources = profile_sources_saying(&w, false, STRICT);
     let key = w.key("/managed");
     w.server.set_status("/managed", 500);
     assert_eq!(
@@ -562,6 +567,66 @@ async fn offline_a_strict_profile_that_is_due_says_why_sessions_are_refused() {
         Some("offline mode: the update cannot be attempted")
     );
     assert_eq!(w.server.requests().len(), 0, "offline asks nobody");
+}
+
+/// Sessions are refused on account of the managed profile whose line says
+/// `strict`. A managed profile that is only followed, for a load that failed,
+/// is a profile in the listing too and is not that one: it has neither the
+/// flag nor the reason, and says nothing while its first download is under
+/// way.
+#[tokio::test]
+async fn a_managed_profile_that_is_only_followed_is_not_flagged() {
+    let w = World::new().await;
+    let g = generation(&w, "").await;
+    let sources = profile_sources_saying(&w, false, STRICT);
+    // the address a load that failed named, which takes its time to answer
+    w.server.set("/second", w.managed_copy("/second", STRICT));
+    w.server.set_delay("/second", UNDER_WAY);
+    let named = SourceInfo {
+        main: w.profile(),
+        includes: Vec::new(),
+        main_text: w.profile(),
+        remote: vec![RemoteRef {
+            url: w.url("/second"),
+            role: RemoteRole::Managed,
+            path: None,
+            interval: Duration::from_secs(3600),
+            strict: true,
+            lacks_section: false,
+        }],
+    };
+    assert_eq!(sources.follow_missing(&named), 1);
+    let why = "the update has not finished";
+    g.engine.suspend(Some(why.to_string()));
+
+    let listing = g.engine.external_resources(Some(&sources));
+    // the two profiles come before the include
+    assert_eq!(kinds(&listing)[..3], ["profile", "profile", "include"]);
+    let managed = item(&listing, &w.key("/managed"));
+    assert!(managed.suspended, "{managed:?}");
+    assert_eq!(managed.error.as_deref(), Some(why));
+    let followed = item(&listing, &w.key("/second"));
+    assert!(!followed.suspended, "{followed:?}");
+    assert_eq!(followed.error, None, "{followed:?}");
+}
+
+/// Sessions that are refused while no managed profile says `strict` are not
+/// refused on account of any resource: nothing is flagged, and no item gives
+/// the reason.
+#[tokio::test]
+async fn nothing_is_flagged_where_no_managed_profile_says_strict() {
+    let w = World::new().await;
+    let g = generation(&w, "").await;
+    let sources = profile_sources(&w, false);
+    let why = "the update has not finished";
+    g.engine.suspend(Some(why.to_string()));
+    let listing = g.engine.external_resources(Some(&sources));
+    assert!(listing.iter().all(|resource| !resource.suspended));
+    assert!(
+        listing
+            .iter()
+            .all(|resource| resource.error.as_deref() != Some(why))
+    );
 }
 
 // ---------------------------------------------------------------------------

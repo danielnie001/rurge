@@ -1650,10 +1650,10 @@ async fn a_refresh_that_needs_a_new_file_gets_it_in_the_next_round() {
 
 /// The downloaded copy of a managed profile is the profile while it is in
 /// effect, and it is downloaded text all the same: nothing on this machine is
-/// built from what it names. The proxies of the local file it includes are
-/// not policies, nor members of its group; the rules of the local set it names
-/// are not its rules; its program is not started. Of these the set and the
-/// program were refused before the include was.
+/// built from what it names. The proxies of the local file its `#!include`
+/// names are not policies, nor members of its group; the rules of the local
+/// set it names are not its rules; its program is not started. Of these the
+/// set and the program were refused before the include was.
 #[tokio::test]
 async fn the_copy_of_a_managed_profile_builds_nothing_from_a_local_file() {
     let w = World::new().await;
@@ -1935,6 +1935,39 @@ async fn the_next_generation_decides_whether_a_followed_source_stays() {
     sources.track(&in_use);
     let keys: Vec<_> = sources.statuses().into_iter().map(|s| s.key).collect();
     assert_eq!(keys, [w.key("/managed")]);
+    assert!(sources.update(&w.key("/second")).await.is_none());
+}
+
+/// A source is followed for the profile as the load that failed read it. The
+/// link is changed once more before any generation names that address: the
+/// next download that is judged reads the file as it is by then, which does
+/// not name it, and it is let go of. No generation would drop it while the
+/// file does not load, and it would be asked for until rurge stops.
+#[tokio::test]
+async fn a_followed_source_the_file_no_longer_names_is_let_go_of() {
+    let Moved {
+        w, sources, failed, ..
+    } = a_pointer_that_moved("interval=3600", asked_once()).await;
+    // nothing is at `/second`: no body arrives there, and so no verdict
+    assert_eq!(sources.follow_missing(&failed), 1);
+    w.write(&format!(
+        "#!MANAGED-CONFIG {} interval=3600\n",
+        w.url("/third")
+    ));
+    let body = w.managed_copy("/third", "interval=3600");
+    w.server.set("/third", body.clone());
+    let failed = loaded(&w, &sources);
+    assert!(failed.diagnostics.has_errors(), "{}", said(&failed));
+    assert_eq!(sources.follow_missing(&failed.config.source), 1);
+    let keys = || -> Vec<String> { sources.statuses().into_iter().map(|s| s.key).collect() };
+    assert_eq!(
+        keys(),
+        [w.key("/managed"), w.key("/second"), w.key("/third")]
+    );
+
+    // the copy of `/third` was judged with the file as it is now
+    wait_until("the copy", || reads(&sources, &w, "/third", &body)).await;
+    assert_eq!(keys(), [w.key("/managed"), w.key("/third")]);
     assert!(sources.update(&w.key("/second")).await.is_none());
 }
 

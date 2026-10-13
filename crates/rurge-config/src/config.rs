@@ -5142,11 +5142,10 @@ RULE-SET,LAN,DIRECT\nDOMAIN-SET,LAN,REJECT\nRULE-SET,X,DIRECT\nDOMAIN-SET,X,REJE
         )
     }
 
-    /// The local files a text takes in are not the downloaded text's to name
-    /// as sets: a `[Rule]` line that does is ignored whole, at any depth of a
-    /// logical rule (a set that matched nothing would make a `NOT` match
-    /// everything), and the lines that name a URL, a built-in set or an
-    /// inline set are kept.
+    /// A downloaded text cannot name a local file as a set: a `[Rule]` line
+    /// that does is ignored whole, at any depth of a logical rule (a set that
+    /// matched nothing would make a `NOT` match everything), and the lines
+    /// that name a URL, a built-in set or an inline set are kept.
     #[test]
     fn a_remote_text_cannot_name_a_local_file_as_a_set_in_a_rule() {
         let link = "https://example.com/rules.conf";

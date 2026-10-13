@@ -44,11 +44,12 @@ pub struct ExternalResource {
     pub updated_at: Option<u64>,
     pub updating: bool,
     /// Why the last update failed, while it is the last thing that happened.
-    /// The managed profile says why sessions are refused when no failed
-    /// update says it: before the first attempt of a run has ended, and
-    /// offline, where none is made.
+    /// The managed profile sessions are refused on account of says why they
+    /// are when no failed update says it: before the first attempt of a run
+    /// has ended, and offline, where none is made.
     pub error: Option<String>,
-    /// The engine refuses sessions on account of this resource.
+    /// The engine refuses sessions on account of this resource: the managed
+    /// profile whose line says `strict`, and no other source.
     pub suspended: bool,
     /// What the last load of the file could not use. Only a rule set and a
     /// domain set have it, which are read line by line. The numbers are those
@@ -177,9 +178,12 @@ impl Engine {
     /// Every external resource there is, in the order the control plane lists
     /// them: the sources of the profile (`sources`, `None` for a caller that
     /// has none) with the managed profile first, then the resources of the
-    /// generation in use by name. The managed profile says it is `suspended`
-    /// while the engine refuses sessions on account of its update. A rule set
-    /// and a domain set say what the last load of their file could not use.
+    /// generation in use by name. The managed profile whose update `strict`
+    /// requires (`ProfileSources::strict_key`) says it is `suspended` while
+    /// the engine refuses sessions; a managed profile that is only followed
+    /// for a load that failed is listed as a profile and does not say so. A
+    /// rule set and a domain set say what the last load of their file could
+    /// not use.
     pub fn external_resources(&self, sources: Option<&ProfileSources>) -> Vec<ExternalResource> {
         let own = sources.map(ProfileSources::statuses).unwrap_or_default();
         // one generation for the resources and for the sets read from them
@@ -187,13 +191,19 @@ impl Engine {
         let held = runtime.stack.resources.statuses();
         let sets = runtime.stack.registry.statuses();
         let refused = self.suspended();
+        // The one source sessions are refused on account of. Another managed
+        // profile can be among the sources: one that is followed for a load
+        // that failed, or for a version that is not the generation's yet.
+        let strict = refused
+            .as_ref()
+            .and_then(|_| sources.and_then(ProfileSources::strict_key));
         in_listing_order(&own, &held)
             .into_iter()
             .map(|(kind, status)| {
-                // sessions are refused on account of the managed profile
-                let refused = refused
-                    .as_ref()
-                    .filter(|_| status.kind == ResourceKind::Profile);
+                let refused = refused.as_ref().filter(|_| {
+                    status.kind == ResourceKind::Profile
+                        && strict.as_deref() == Some(status.key.as_str())
+                });
                 ExternalResource {
                     path: status.shown(),
                     kind,
