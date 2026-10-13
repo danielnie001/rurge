@@ -7,6 +7,10 @@ use predicates::prelude::*;
 /// a scratch one and not to the machine's. `HOME` is left alone (the system's
 /// certificate store and other libraries read it), so on macOS, where the
 /// defaults come from it, a failing run is not kept away from the machine's own.
+/// The two constructors below also remove `RURGE_DATA_DIR` and
+/// `RURGE_LOG_FILE` from the child's environment: a developer's shell may
+/// export them, and a start that forgot `--data-dir`, or any start's log file,
+/// would go where they point; a test that needs one sets it after the constructor.
 fn default_directories() -> [(&'static str, std::path::PathBuf); 4] {
     let scratch = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("default-directories");
     [
@@ -20,14 +24,18 @@ fn default_directories() -> [(&'static str, std::path::PathBuf); 4] {
 /// `rurge` for a test that runs it to the end and looks at what it said.
 fn rurge_command() -> Command {
     let mut cmd = Command::cargo_bin("rurge").unwrap();
-    cmd.envs(default_directories());
+    cmd.envs(default_directories())
+        .env_remove("RURGE_DATA_DIR")
+        .env_remove("RURGE_LOG_FILE");
     cmd
 }
 
 /// `rurge` for a test that starts it as a process of its own.
 fn rurge_process() -> std::process::Command {
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("rurge"));
-    cmd.envs(default_directories());
+    cmd.envs(default_directories())
+        .env_remove("RURGE_DATA_DIR")
+        .env_remove("RURGE_LOG_FILE");
     cmd
 }
 
