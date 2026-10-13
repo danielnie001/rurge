@@ -162,6 +162,28 @@ impl Expansion<'_> {
                         continue;
                     };
                     if let Some(prefix) = &wildcard {
+                        // A downloaded text with no section at all is no
+                        // profile (a portal's page, an empty body), and
+                        // taking it would drop every section the include
+                        // brought. A text that has sections, none of the
+                        // kind, is a profile without sections of that kind:
+                        // that is no lack.
+                        if let Some(at) = included.tracked
+                            && included.profile.sections.is_empty()
+                        {
+                            self.diags.push(
+                                Diagnostic::warning(
+                                    codes::W_INCLUDE_SECTION_MISSING,
+                                    format!("`{}` has no section", included.file.display()),
+                                )
+                                .with_hint(
+                                    "check that the address serves a profile with sections of that kind",
+                                )
+                                .at(entry.span.clone()),
+                            );
+                            self.remotes.refs[at].lacks_section = true;
+                            continue;
+                        }
                         let (matched, _): (Vec<Section>, Vec<Section>) = included
                             .profile
                             .sections
@@ -1337,6 +1359,98 @@ FINAL,DIRECT
         assert!(d.is_empty(), "{:?}", d.into_vec());
         assert!(p.sections_with_prefix("Ruleset ").next().is_none());
         assert!(!remote[0].lacks_section);
+    }
+
+    /// A page from a portal, or an empty body, where the sections of a kind are
+    /// meant to be is no profile: with no section at all, it has nothing to
+    /// take in, and the copy is flagged as it is for a named section. The
+    /// lines of the page get the warnings any text gets.
+    #[test]
+    fn a_downloaded_text_without_any_section_is_flagged_under_a_wildcard() {
+        let hint = "check that the address serves a profile with sections of that kind";
+        let fake = Fake::new()
+            .text(
+                "https://example.com/page.html",
+                "<html>\nwelcome to the portal\n</html>\n",
+            )
+            .text("https://example.com/empty.conf", "");
+        let page = fake.path_of("https://example.com/page.html");
+        let (p, d, remote) = expand_text(
+            "[Ruleset *]\n#!include https://example.com/page.html\n[Rule]\nFINAL,DIRECT\n",
+            Some(&fake),
+        );
+        let lacking: Vec<_> = d
+            .iter()
+            .filter(|x| x.code == codes::W_INCLUDE_SECTION_MISSING)
+            .collect();
+        assert_eq!(lacking.len(), 1, "{:?}", d.clone().into_vec());
+        assert_eq!(
+            lacking[0].message,
+            format!("`{}` has no section", page.display())
+        );
+        assert_eq!(lacking[0].hint, Some(hint));
+        assert_eq!(lacking[0].span.as_ref().map(|s| s.line), Some(2));
+        let outside: Vec<u32> = d
+            .iter()
+            .filter(|x| x.code == codes::W_LINE_OUTSIDE_SECTION)
+            .map(|x| x.span.as_ref().map_or(0, |s| s.line))
+            .collect();
+        assert_eq!(outside, [1, 2, 3]);
+        assert_eq!(d.len(), 4);
+        assert!(p.sections_with_prefix("Ruleset ").next().is_none());
+        assert!(p.section("Ruleset *").is_none());
+        assert_eq!(raws(&p, "Rule"), ["FINAL,DIRECT"]);
+        assert_eq!(remote.len(), 1);
+        assert!(remote[0].lacks_section);
+
+        // an empty body says the one thing, and is flagged all the same
+        let (_, d, remote) = expand_text(
+            "[Ruleset *]\n#!include https://example.com/empty.conf\n[Rule]\nFINAL,DIRECT\n",
+            Some(&fake),
+        );
+        let empty = fake.path_of("https://example.com/empty.conf");
+        assert_eq!(
+            told(&d),
+            [(
+                codes::W_INCLUDE_SECTION_MISSING,
+                format!("`{}` has no section", empty.display()).as_str(),
+                Some(2)
+            )]
+        );
+        assert_eq!(d.iter().next().and_then(|x| x.hint), Some(hint));
+        assert!(remote[0].lacks_section);
+    }
+
+    /// Only a downloaded text can be flagged: nobody can add a section to it,
+    /// while a local file is the user's to write, and what a wildcard takes in
+    /// of it is whatever it has.
+    #[test]
+    fn a_local_file_without_any_section_is_not_flagged_under_a_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("nothing.conf"), "# nothing in here yet\n").unwrap();
+        fs::write(dir.path().join("empty.conf"), "").unwrap();
+        fs::write(
+            dir.path().join("page.html"),
+            "<html>\nwelcome to the portal\n</html>\n",
+        )
+        .unwrap();
+        let (p, d, remote) = expand_in(
+            dir.path(),
+            "[Ruleset *]\n#!include nothing.conf\n#!include empty.conf\n[Rule]\nFINAL,DIRECT\n",
+            None,
+        );
+        assert!(d.is_empty(), "{:?}", d.into_vec());
+        assert!(p.sections_with_prefix("Ruleset ").next().is_none());
+        assert!(remote.is_empty());
+        // the lines of a page get the warnings of any text, and nothing is
+        // said about the include
+        let (_, d, _) = expand_in(
+            dir.path(),
+            "[Ruleset *]\n#!include page.html\n[Rule]\nFINAL,DIRECT\n",
+            None,
+        );
+        let seen: Vec<&str> = d.iter().map(|x| x.code).collect();
+        assert_eq!(seen, [codes::W_LINE_OUTSIDE_SECTION; 3]);
     }
 
     /// A line that is wrong in a downloaded text is reported in the file the

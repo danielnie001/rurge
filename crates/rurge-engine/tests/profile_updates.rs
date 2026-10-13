@@ -158,6 +158,44 @@ async fn a_page_is_not_taken_as_an_included_file() {
     stays_quiet(&sources, QUIET + Duration::from_millis(300)).await;
 }
 
+/// The same page where the named sets of an include under a wildcard section
+/// are meant to be: it would bring no set at all, and every rule that names
+/// one of them would silently match nothing.
+#[tokio::test]
+async fn a_page_is_not_taken_as_a_file_included_under_a_wildcard_section() {
+    let w = World::new().await;
+    w.write(&format!(
+        "[Ruleset *]\n#!include {}\n[Rule]\nRULE-SET,Streaming,DIRECT\nFINAL,DIRECT\n",
+        w.url("/inc")
+    ));
+    let old = "[Ruleset Streaming]\nDOMAIN-SUFFIX,netflix.com\n";
+    w.seed("/inc", old, ago(HOUR));
+    w.server.set("/inc", HTML);
+    let sources = w.sources(false);
+    sources.track(&w.load());
+    let reason = update(&sources, &w, "/inc")
+        .await
+        .expect_err("the page is refused");
+    assert_eq!(reason, "lacks the section it is included into");
+    let status = &sources.statuses()[0];
+    assert_eq!(
+        (status.state, status.last_error.as_deref()),
+        ("failed", Some(reason.as_str()))
+    );
+    assert!(reads(&sources, &w, "/inc", old));
+    // the set the rule names is still there to be matched
+    let names: Vec<_> = loaded(&w, &sources)
+        .config
+        .rulesets
+        .iter()
+        .map(|set| set.name.clone())
+        .collect();
+    assert_eq!(names, ["Streaming"]);
+    // No version moved: a report that was due would come a quiet second after
+    // the move, and 300 ms more is the margin.
+    stays_quiet(&sources, QUIET + Duration::from_millis(300)).await;
+}
+
 /// The local file stopped naming the address, and nobody has reloaded yet.
 #[tokio::test]
 async fn an_address_the_profile_does_not_name_any_more_is_not_taken() {
