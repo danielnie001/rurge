@@ -1812,6 +1812,39 @@ mod tests {
         assert_eq!(*asked.lock().unwrap(), ["www.example.test"]);
     }
 
+    /// With no upstream of its own left, a resolver that knows the system's
+    /// DNS servers asks them for an ordinary name, and the library only when
+    /// it knows none (the test above). For a user the list is empty when
+    /// every encrypted DNS server of the profile needs a client that could not
+    /// be built (a W0026 warning), because those servers own the list and the
+    /// system's are not in it; without a `dns-server` the build makes the
+    /// system's servers the list, so the test empties it afterwards.
+    #[tokio::test]
+    async fn with_no_primary_upstream_an_ordinary_name_is_asked_of_the_system_servers() {
+        let system = MockDns::spawn().await;
+        system.set("www.example.test", &["10.20.0.6"], &[], 60);
+        let e = env(&profile("", ""));
+        let sys = StaticSystemDns {
+            servers: vec![system.addr()],
+            library: vec![("www.example.test".into(), vec![ip("10.20.0.5")])],
+            ..StaticSystemDns::default()
+        };
+        let asked = sys.library_asked.clone();
+        let (r, _) = resolver_once(&e, sys);
+        r.primary.store(Arc::new(Vec::new()));
+        assert!(r.primary_upstreams().is_empty());
+        let found = r
+            .lookup("www.example.test", LookupOpts::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            (found.v4, found.source),
+            (vec![v4("10.20.0.6")], Source::System)
+        );
+        assert_eq!(system.query_count("www.example.test", Qtype::A), 1);
+        assert!(asked.lock().unwrap().is_empty());
+    }
+
     /// The library gives both families whatever was asked for; the resolver
     /// keeps the IPv6 addresses only for a caller that wants them, and a
     /// name that has nothing else is an empty answer then.
