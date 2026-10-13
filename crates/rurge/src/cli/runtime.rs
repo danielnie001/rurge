@@ -304,10 +304,13 @@ mod tests {
     /// one name every system answers from its own tables, without a packet.
     #[tokio::test]
     async fn the_platform_library_answers_localhost_with_loopback_addresses() {
-        let found = PlatformSystemDns
-            .library_lookup("localhost")
-            .await
-            .expect("localhost resolves");
+        let found = tokio::time::timeout(
+            Duration::from_secs(30),
+            PlatformSystemDns.library_lookup("localhost"),
+        )
+        .await
+        .expect("the system resolver library did not answer for localhost within 30 seconds")
+        .expect("localhost resolves");
         assert!(!found.is_empty());
         assert!(found.iter().all(IpAddr::is_loopback), "{found:?}");
     }
