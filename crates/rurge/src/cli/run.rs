@@ -1091,9 +1091,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let http_api = cfg.general.http_api.clone();
     // `cfg` is moved into the runtime below, so collect the watch list first.
     // It is the files the user wrote: what is downloaded is kept in the data
-    // directory and followed by the sources. The list is made now, so a local
-    // file that a later version of the managed profile includes is watched
-    // from the next start on, as one added to the profile's own includes is.
+    // directory and followed by the sources. The list is made now, so a file
+    // added to the profile's own includes is watched from the next start on;
+    // while the downloaded copy of a managed profile is in effect the list is
+    // the local file alone, for the copy includes no local file.
     let cfg_paths: Vec<PathBuf> = std::iter::once(cfg.source.main.clone())
         .chain(cfg.source.includes.iter().cloned())
         .collect();
