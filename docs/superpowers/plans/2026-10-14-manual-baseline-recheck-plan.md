@@ -60,7 +60,7 @@
 
 ## Task 1：配置层的六处小改动与两处小补充
 
-**文件**：见上表任务 1 的各行；用例在各文件自己的单元测试、`crates/rurge-config/tests/secrets.rs`、`crates/rurge-policy/src/assemble.rs`、`crates/rurge-dns/tests/resolver.rs`、`crates/rurge-engine/tests/{outbounds_shadowsocks.rs,outbounds_wireguard.rs,common/mod.rs}`、`crates/rurge/tests/cli.rs`。七个提交，按下面的顺序，各自先红后绿。
+**文件**：`crates/rurge-config/src/{text/mod.rs,deferred.rs,policy.rs,config.rs,redact.rs,glob.rs}`、`crates/rurge-config/src/spec/{ss.rs,wireguard.rs}`、`crates/rurge-dns/src/{upstream/mod.rs,hosts.rs}`、`crates/rurge-rules/src/set_format.rs`；用例在这些文件自己的单元测试、`crates/rurge-config/tests/secrets.rs`、`crates/rurge-policy/src/assemble.rs`、`crates/rurge-dns/tests/resolver.rs`、`crates/rurge-engine/tests/{outbounds_shadowsocks.rs,outbounds_wireguard.rs,common/mod.rs}`、`crates/rurge/tests/cli.rs`。七个提交，按下面的顺序，各自先红后绿。
 
 **接口**：
 
@@ -106,7 +106,7 @@ pub const NOT_APPLICABLE: [&str; 3] = ["interface", "allow-other-interface", "tf
 - 用例 `a_tcp_url_with_a_path_is_skipped_and_the_profile_still_loads`（`crates/rurge-dns/tests/resolver.rs`，评审要点 5）：`encrypted-dns-server` 写两项，`tcp://<MockDns 的地址>/x` 与 `tcp://<MockDns 的地址>`——诊断里恰好一条 `W0026`、是那一句；对 MockDns 认识的名字的查找成功，MockDns 记下的问题都经 TCP 到达。
 - `[Host]` 的 `server:tcp://127.0.0.1/x`（`crates/rurge-dns/src/hosts.rs` 现有的 `W0026` 用例旁加一行）同样是 `W0026`。
 
-**`wireguard` 行上的 `tos`**（设计 4.5）：`NOT_APPLICABLE` 去掉 `tos`，`common.tos = 0;` 一句去掉。隧道的 socket 是起这条隧道的那个策略的连接器开的，握手之后 `set_tos(0)` 回到的就是它的 `tos`——这两处已有，不用改。载体键（`crates/rurge-engine/src/outbounds.rs` 里 `with_carrier` 的那一串）**不加** `tos`（计划期决定 P6）。
+**`wireguard` 行上的 `tos`**（设计 4.5）：`NOT_APPLICABLE` 去掉 `tos`，`common.tos = 0;` 一句去掉。隧道的 socket 是起这条隧道的那个策略的连接器开的，握手之后 `set_tos(0)` 回到的就是它的 `tos`——这两处已有，不用改。载体键（`crates/rurge-engine/src/outbounds.rs` 里 `with_carrier` 的那一串，决定哪几个策略共用一条隧道）**不加** `tos`：加了的话，同一个节上 `tos` 不同的两个策略每拨一次就顶掉对方的隧道。
 
 - 现有用例 `socket_parameters_do_not_apply`（`spec/wireguard.rs`）：`tos` 从被告警的参数里去掉，其余三个照旧。
 - 用例 `the_tos_of_a_wireguard_line_is_kept`（`spec/wireguard.rs`）：`wireguard, section-name=wg, tos=0x28` 没有 `W0028`，`spec.common.tos` 是 `0x28`；`interface`、`allow-other-interface`、`tfo` 照旧各一条 `W0028`。
