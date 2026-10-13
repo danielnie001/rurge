@@ -275,6 +275,16 @@ impl UpstreamSpec {
             if rest.contains(AT) {
                 return Err(userinfo_refused(s, rest, "a tcp:// URL"));
             }
+            // at most the one `/` of a URL that ends there
+            if rest
+                .strip_suffix('/')
+                .unwrap_or(rest)
+                .contains(['/', '?', '#'])
+            {
+                return Err(format!(
+                    "`{s}`: a tcp:// URL names a host and a port, nothing else"
+                ));
+            }
             let (host, port) = host_port(rest, 53).map_err(|e| format!("`{s}`: {e}"))?;
             return Ok(UpstreamSpec::Tcp { host, port });
         }
@@ -503,6 +513,49 @@ mod tests {
                 .unwrap_err()
                 .contains("names a host and a port, nothing else")
         );
+    }
+
+    /// `tcp://` names a host and a port — 53 unless it says —, nothing else:
+    /// a single `/` that ends the URL is no path, `tls://` is not held to it,
+    /// and a user name and a password are refused first, unquoted.
+    #[test]
+    fn a_tcp_url_is_a_host_and_a_port() {
+        for (url, host, port) in [
+            ("tcp://127.0.0.1:5353/", "127.0.0.1", 5353),
+            ("tcp://127.0.0.1", "127.0.0.1", 53),
+            ("tcp://[::1]:53/", "::1", 53),
+        ] {
+            assert_eq!(
+                UpstreamSpec::parse(url).unwrap(),
+                UpstreamSpec::Tcp {
+                    host: host.into(),
+                    port
+                },
+                "{url}"
+            );
+        }
+        for url in [
+            "tcp://127.0.0.1:5353/x",
+            "tcp://127.0.0.1?x",
+            "tcp://127.0.0.1#x",
+            "tcp://127.0.0.1/a/",
+        ] {
+            assert_eq!(
+                UpstreamSpec::parse(url).unwrap_err(),
+                format!("`{url}`: a tcp:// URL names a host and a port, nothing else"),
+                "{url}"
+            );
+        }
+        assert!(matches!(
+            UpstreamSpec::parse("tls://127.0.0.1/x").unwrap(),
+            UpstreamSpec::Tls { .. }
+        ));
+        let err = UpstreamSpec::parse("tcp://u:p@127.0.0.1/x").unwrap_err();
+        assert_eq!(
+            err,
+            "`tcp://127.0.0.1/x`: a tcp:// URL cannot carry a user name or a password"
+        );
+        assert!(!err.contains("u:p"), "{err}");
     }
 
     /// `h3://` is the `https://` URL of its requests: port 443 unless it

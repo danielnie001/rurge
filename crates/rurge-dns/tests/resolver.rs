@@ -5,6 +5,7 @@
 //! keys.
 
 use rurge_config::config::{LoadOptions, from_text};
+use rurge_config::diagnostic::{Diagnostics, codes};
 use rurge_dns::message::{Qtype, Question, Rcode, build_response, parse_query};
 use rurge_dns::system::StaticSystemDns;
 use rurge_dns::testing::{Doh3Script, DoqScript, FakeDoh3, FakeDoq, MockDns};
@@ -27,8 +28,13 @@ fn ip(s: &str) -> IpAddr {
     s.parse().unwrap()
 }
 
-/// Builds a resolver whose profile lives in `dir` (local set files go there too).
-fn resolver_in(dir: &Path, profile_text: &str, system: StaticSystemDns) -> Arc<Resolver> {
+/// Builds a resolver whose profile lives in `dir` (local set files go there
+/// too), and gives what the resolver said when it was built.
+fn resolver_saying(
+    dir: &Path,
+    profile_text: &str,
+    system: StaticSystemDns,
+) -> (Arc<Resolver>, Diagnostics) {
     let loaded = from_text(profile_text, &dir.join("t.conf"), &LoadOptions::for_tests());
     assert!(
         !loaded.diagnostics.has_errors(),
@@ -51,7 +57,7 @@ fn resolver_in(dir: &Path, profile_text: &str, system: StaticSystemDns) -> Arc<R
         },
     );
     let (sets, _) = SetRegistry::build(&cfg, resources.clone(), dir);
-    let (resolver, diags) = Resolver::new(
+    Resolver::new(
         ResolverConfig::from_config(&cfg),
         ResolverDeps {
             connector,
@@ -59,7 +65,12 @@ fn resolver_in(dir: &Path, profile_text: &str, system: StaticSystemDns) -> Arc<R
             system: Arc::new(system),
             resources,
         },
-    );
+    )
+}
+
+/// Builds a resolver whose profile lives in `dir` (local set files go there too).
+fn resolver_in(dir: &Path, profile_text: &str, system: StaticSystemDns) -> Arc<Resolver> {
+    let (resolver, diags) = resolver_saying(dir, profile_text, system);
     assert!(
         diags.is_empty(),
         "{:?}",
@@ -148,6 +159,40 @@ async fn every_transport_resolves() {
     assert_eq!(a.addrs(), vec![ip("10.0.0.4")]);
     assert_eq!(a.source, Source::Upstream(url.to_string()));
     assert_eq!(doh.hits("/dns-query"), 1);
+}
+
+/// A `tcp://` server that is written with more than a host and a port is
+/// skipped with a warning of its own, and the profile still loads: the lookup
+/// goes to the server that is left, over TCP.
+#[tokio::test]
+async fn a_tcp_url_with_a_path_is_skipped_and_the_profile_still_loads() {
+    let tcp = MockDns::spawn().await;
+    tcp.set("a.test", &["10.0.0.2"], &[], 60);
+    let addr = tcp.addr();
+    let dir = tempfile::tempdir().unwrap();
+    let (r, diags) = resolver_saying(
+        dir.path(),
+        &profile(
+            &format!("encrypted-dns-server = tcp://{addr}/x, tcp://{addr}\nipv6 = false"),
+            "",
+        ),
+        StaticSystemDns::default(),
+    );
+    let said: Vec<(&str, &str)> = diags.iter().map(|d| (d.code, d.message.as_str())).collect();
+    assert_eq!(
+        said,
+        [(
+            codes::W_DNS_UPSTREAM_UNSUPPORTED,
+            format!("`tcp://{addr}/x`: a tcp:// URL names a host and a port, nothing else")
+                .as_str()
+        )]
+    );
+    let a = lookup(&r, "a.test").await;
+    assert_eq!(a.addrs(), vec![ip("10.0.0.2")]);
+    assert_eq!(a.source, Source::Upstream(format!("tcp://{addr}")));
+    let queries = tcp.queries();
+    assert!(!queries.is_empty());
+    assert!(queries.iter().all(|(_, via)| via == "tcp"), "{queries:?}");
 }
 
 /// A DoH server the profile writes without a path is asked at `/dns-query`

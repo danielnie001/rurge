@@ -299,11 +299,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (map, diags) = build(
             dir.path(),
-            "a.com = server:1.1.1.1, tls://dns.example.com\nb.com = server:system\nc.com = server:syslib\nd.com = script:my-script\ne.com = server:quic://dns.example.com/dns-query\nf.com = server:force-syslib\n",
+            "a.com = server:1.1.1.1, tls://dns.example.com\nb.com = server:system\nc.com = server:syslib\nd.com = script:my-script\ne.com = server:quic://dns.example.com/dns-query\nf.com = server:force-syslib\ng.com = server:tcp://127.0.0.1/x\n",
         );
         let codes: Vec<&str> = diags.iter().map(|d| d.code).collect();
         assert!(codes.contains(&codes::W_HOST_SCRIPT_SKIPPED));
         assert!(codes.contains(&codes::W_DNS_UPSTREAM_UNSUPPORTED));
+        // a `tcp://` URL names a host and a port, nothing else
+        assert!(
+            diags.iter().any(|d| d.code == codes::W_DNS_UPSTREAM_UNSUPPORTED
+                && d.message
+                    == "[Host] `g.com`: `tcp://127.0.0.1/x`: a tcp:// URL names a host and a port, nothing else"),
+            "{codes:?}"
+        );
         assert_eq!(
             map.rules_len(),
             4,
@@ -331,6 +338,7 @@ mod tests {
             map.lookup("f.com").unwrap().action,
             HostAction::System(SystemMode::ForceSyslib)
         );
+        assert!(map.lookup("g.com").is_none());
     }
 
     /// The key of a set is its URL, and the URL can carry a user name and a
