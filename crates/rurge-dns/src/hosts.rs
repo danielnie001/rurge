@@ -275,6 +275,25 @@ mod tests {
         assert_eq!(map.lookup("alias.com").unwrap().raw, "alias.com");
     }
 
+    /// A key written the way a zone file writes a name, with the dot of the
+    /// root after the last label, maps the name it names, whichever way the
+    /// name is asked for: the name is normalised (lower case, no trailing dot)
+    /// before it is compared, and the dot after the key's last label is not
+    /// part of the key's pattern.
+    #[tokio::test]
+    async fn a_key_with_the_roots_dot_maps_the_name_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (map, diags) = build(dir.path(), "Example.COM. = 127.0.0.2\n");
+        assert!(diags.is_empty());
+        assert_eq!(map.rules_len(), 1);
+        for name in ["example.com", "EXAMPLE.com", "example.com."] {
+            let hit = map.lookup(name).unwrap_or_else(|| panic!("{name}: no hit"));
+            assert_eq!(hit.action, HostAction::Ips(vec![ip("127.0.0.2")]), "{name}");
+            assert_eq!(hit.raw, "Example.COM.", "the key is shown as written");
+        }
+        assert!(map.lookup("www.example.com").is_none());
+    }
+
     #[tokio::test]
     async fn server_system_and_script_values() {
         let dir = tempfile::tempdir().unwrap();

@@ -81,6 +81,21 @@ fn parse_upstream(item: &str) -> Option<DnsUpstream> {
         .map(|ip| DnsUpstream::Udp(SocketAddr::new(ip, 53)))
 }
 
+/// The text of `key` that is compiled as its pattern. The names that are
+/// looked up never end in a dot (they are normalised first), and a key written
+/// the way a zone file writes a name does: that dot is the root's and not part
+/// of the pattern. It comes off only a literal label: a key of nothing but
+/// dots, or one that a wildcard would end once they are gone (`*.` would
+/// become `*` and take every name), is compiled as written.
+fn pattern_text(key: &str) -> &str {
+    let bare = key.trim_end_matches('.');
+    if bare.is_empty() || bare.ends_with(['*', '?']) {
+        key
+    } else {
+        bare
+    }
+}
+
 pub fn parse_host_entry(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<HostEntry, ParseError> {
     // A host never holds whitespace: a key that does came from an `=` further
     // on (a URL's query) standing in for the missing one after the host. Nor
@@ -114,7 +129,7 @@ pub fn parse_host_entry(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<HostEn
     } else {
         HostKey::Pattern(
             Glob::new(
-                key,
+                pattern_text(key),
                 GlobOptions {
                     case_insensitive: true,
                     classes: false,
@@ -286,6 +301,78 @@ mod tests {
     fn non_ascii_host_key_does_not_panic() {
         let e = parse("中文中文中文 = 1.2.3.4").unwrap();
         assert!(matches!(e.key, HostKey::Pattern(_)));
+    }
+
+    /// The pattern a key compiles to; the key is shown as written.
+    fn pattern_of(key: &str) -> Glob {
+        let e = parse(&format!("{key} = 127.0.0.2")).unwrap();
+        assert_eq!(e.raw_key, key);
+        match e.key {
+            HostKey::Pattern(glob) => glob,
+            other => panic!("{key}: {other:?}"),
+        }
+    }
+
+    /// A name written the way a zone file writes it ends in the dot of the
+    /// root, which the names that are looked up (lower case, no trailing dot)
+    /// never carry. The dot after a literal label is not part of the pattern:
+    /// the key means the same with it and without it.
+    #[test]
+    fn a_dot_after_the_last_label_is_the_roots_and_not_part_of_the_pattern() {
+        for key in ["Example.COM.", "Example.COM..", "example.com"] {
+            let glob = pattern_of(key);
+            assert!(glob.matches("example.com"), "{key}");
+            assert!(glob.matches("EXAMPLE.com"), "{key}");
+            for other in [
+                "www.example.com",
+                "badexample.com",
+                "example.org",
+                "com",
+                "",
+            ] {
+                assert!(!glob.matches(other), "{key}: {other:?}");
+            }
+        }
+    }
+
+    /// `*.example.com` takes the names below `example.com` and not
+    /// `example.com` itself, the way `*.dev` takes `app.dev` and not `dev`;
+    /// written with the dot of the root it takes the same names.
+    #[test]
+    fn a_wildcard_key_with_the_roots_dot_takes_the_names_it_takes_without() {
+        for key in ["*.example.com", "*.example.com."] {
+            let glob = pattern_of(key);
+            for name in ["a.example.com", "a.b.example.com", "A.Example.COM"] {
+                assert!(glob.matches(name), "{key}: {name}");
+            }
+            for name in ["example.com", "aexample.com", "a.example.org", "com", ""] {
+                assert!(!glob.matches(name), "{key}: {name:?}");
+            }
+        }
+    }
+
+    /// What is left of a key when its trailing dots are taken off must be a
+    /// pattern that still means something: a key that is nothing but dots, or
+    /// whose last character before them is a wildcard, is compiled as written.
+    /// Trimmed, `*.` would be `*` and take every name, and `.` the empty
+    /// pattern. As written they take nothing a normalised name can be.
+    #[test]
+    fn a_key_the_trailing_dot_would_turn_into_another_pattern_is_compiled_as_written() {
+        for key in ["*.", "*..", ".", "..", "a?.", "foo*.", "*.example.*."] {
+            let glob = pattern_of(key);
+            for name in [
+                "example.com",
+                "a.example.com",
+                "a",
+                "ab",
+                "foo",
+                "foo.bar",
+                "com",
+                "",
+            ] {
+                assert!(!glob.matches(name), "{key}: {name:?}");
+            }
+        }
     }
 
     /// The key of a set is the set's URL, and the URL may carry a user name
