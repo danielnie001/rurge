@@ -221,18 +221,46 @@ impl Drop for Inflight<'_> {
     }
 }
 
-/// What a query does with an AAAA answer that timed out, for AAAA
-/// suppression. What is counted is lookups (manual, DNS Overview: "5
-/// consecutive lookups receive an A answer while the AAAA answer times out"),
-/// and a lookup can take two queries: its own, and the background one that
-/// asks again for the AAAA answer it did not wait for.
+/// What a caller does with an AAAA answer that timed out, for AAAA
+/// suppression. The manual (DNS Overview: "5 consecutive lookups receive an
+/// A answer while the AAAA answer times out") draws its conclusion about the
+/// network from five observations of it, so a timeout is counted once, by
+/// the caller whose query it was. It is another's to count in two cases:
+///
+/// - The query is the background one that asks again for the AAAA answer a
+///   lookup did not wait for: the lookup counted its own timeout.
+/// - The result is that of a query another caller sent and this one waited
+///   for (`query_coalesced`). Lookups of one name at once share a query and
+///   so a timeout; counted by each of them, one slow AAAA answer to a browser
+///   that opens several connections to a host it has not looked up yet would
+///   turn AAAA off for the whole process.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AaaaTimeout {
-    /// The query is the only one made for its lookup, so its timeout is the
-    /// lookup's.
+    /// The query was sent for its caller's own sake and is the only one made
+    /// for its lookup, so its timeout is the caller's to count.
     Count,
-    /// The lookup has counted its own timeout; asking again is no new lookup.
+    /// Someone else counts the timeout.
     Ignore,
+}
+
+/// Whose query a result of `query_coalesced` came from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Query {
+    /// The caller's: it sent the query.
+    Own,
+    /// Another caller's, whose answer the caller waited for.
+    Another,
+}
+
+impl Query {
+    /// What a caller does with the AAAA timeout of a result of this query,
+    /// given what it does with one of its own.
+    fn timeout(self, own: AaaaTimeout) -> AaaaTimeout {
+        match self {
+            Query::Own => own,
+            Query::Another => AaaaTimeout::Ignore,
+        }
+    }
 }
 
 /// What the lookups through one `Via` ask (`dns-follow-interface`, phase 2
@@ -615,7 +643,7 @@ impl Resolver {
                 _ => {}
             }
         }
-        let result = self
+        let (result, _) = self
             .query_coalesced(&set.upstreams, name, want_v6, opts)
             .await;
         match &result {
@@ -692,7 +720,8 @@ impl Resolver {
                 }
                 HostAction::Servers(specs) => {
                     let ups = self.host_upstreams_for(&specs);
-                    let answers = self.query_coalesced(&ups, &current, want_v6, &opts).await?;
+                    let (answers, _) = self.query_coalesced(&ups, &current, want_v6, &opts).await;
+                    let answers = answers?;
                     return Ok(from_answers(
                         &answers,
                         Source::Host(HostKind::Server),
@@ -766,10 +795,15 @@ impl Resolver {
                 .system_lookup(&current, want_v6, Source::System, started, &opts)
                 .await;
         }
-        let result = self
+        let (result, query) = self
             .query_coalesced(&primary, &current, want_v6, &opts)
             .await;
-        self.record(&current, &result, want_v6, AaaaTimeout::Count);
+        self.record(
+            &current,
+            &result,
+            want_v6,
+            query.timeout(AaaaTimeout::Count),
+        );
         // Design §7.3: when the resend tick completed the query with A in hand
         // and AAAA still pending, the late AAAA answer must still reach the
         // cache. The fanout has already aborted that query, so the completion
@@ -840,24 +874,31 @@ impl Resolver {
                 return;
             };
             let primary = me.primary.load_full();
-            let result = me
+            let (result, query) = me
                 .query_coalesced(&primary, &name, want_v6, &LookupOpts::default())
                 .await;
             match &result {
-                Ok(_) | Err(DnsError::EmptyAnswer) => me.record(&name, &result, want_v6, timeout),
+                Ok(_) | Err(DnsError::EmptyAnswer) => {
+                    me.record(&name, &result, want_v6, query.timeout(timeout))
+                }
                 Err(_) => me.cache.end_refresh(&name),
             }
         });
     }
 
-    /// One in-flight query per (name, family); later callers wait for the first.
+    /// One in-flight query per (name, family); later callers wait for the
+    /// first. The result comes with whose query it is: a waiter has the first
+    /// caller's answer, and the timeout that may be in it is that caller's to
+    /// count. A waiter that takes over because the first caller vanished
+    /// sends a query of its own and is its owner, as is a caller that goes
+    /// round the cache.
     async fn query_coalesced(
         &self,
         upstreams: &[UpstreamRef],
         name: &str,
         want_v6: bool,
         opts: &LookupOpts,
-    ) -> Result<Answers, DnsError> {
+    ) -> (Result<Answers, DnsError>, Query) {
         let key = format!(
             "{name}#{}#{}",
             want_v6,
@@ -877,7 +918,7 @@ impl Resolver {
             loop {
                 let value = rx.borrow().clone();
                 if let Some(v) = value {
-                    return v;
+                    return (v, Query::Another);
                 }
                 if rx.changed().await.is_err() {
                     break; // the first caller vanished: query ourselves
@@ -899,7 +940,7 @@ impl Resolver {
                 .await
                 .map_err(DnsError::from);
         inflight.publish(&result);
-        result
+        (result, Query::Own)
     }
 
     /// The system's DNS servers when any is known, the system resolver
@@ -915,7 +956,8 @@ impl Resolver {
     ) -> Result<DnsResult, DnsError> {
         let system = self.system_upstreams.load_full();
         if !system.is_empty() {
-            let answers = self.query_coalesced(&system, name, want_v6, opts).await?;
+            let (answers, _) = self.query_coalesced(&system, name, want_v6, opts).await;
+            let answers = answers?;
             return Ok(from_answers(&answers, source, started));
         }
         self.library_lookup(name, want_v6, source, started).await
@@ -2371,6 +2413,63 @@ mod tests {
             assert!(res.v6.is_empty());
         }
         assert!(five.aaaa_suppressed(), "five lookups are five");
+    }
+
+    /// Lookups of one name that are under way together share one query, so a
+    /// slow AAAA answer is one timeout and not as many as there are lookups:
+    /// a browser that opens its connections to a host it has not looked up
+    /// yet would otherwise turn AAAA off for the whole process with that one
+    /// slow answer.
+    #[tokio::test(start_paused = true)]
+    async fn five_lookups_of_one_name_at_once_count_one_aaaa_timeout() {
+        let mock = MockDns::spawn().await;
+        for name in ["busy", "h0", "h1", "h2", "h3"] {
+            mock.set(&format!("{name}.test"), &["10.0.0.1"], &["fd00::1"], 60);
+        }
+        mock.set_drop_qtype(Qtype::Aaaa, true);
+        let e = env(&profile(
+            &format!("dns-server = {}\nipv6 = true", mock.addr()),
+            "",
+        ));
+        let r = resolver_asking_aaaa(&e, &mock);
+        let asked = || {
+            (
+                mock.query_count("busy.test", Qtype::A),
+                mock.query_count("busy.test", Qtype::Aaaa),
+            )
+        };
+
+        let lookup = || r.lookup("busy.test", LookupOpts::default());
+        let answered = tokio::join!(lookup(), lookup(), lookup(), lookup(), lookup());
+        for res in [answered.0, answered.1, answered.2, answered.3, answered.4] {
+            let res = res.unwrap();
+            assert_eq!(res.v4.len(), 1);
+            assert!(res.v6.is_empty());
+        }
+        assert!(
+            !r.aaaa_suppressed(),
+            "one slow answer, seen by five lookups"
+        );
+        // Longer than a fanout lasts (300 ms): the completion is over.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            asked(),
+            (2, 2),
+            "one query and one completion for the five, as for a lookup alone"
+        );
+        assert!(
+            !r.aaaa_suppressed(),
+            "one slow answer, its completion included"
+        );
+
+        // That was one counted: three more names leave AAAA on, and the
+        // next turns it off.
+        for i in 0..3 {
+            lookup_and_complete(&r, &format!("h{i}.test")).await;
+            assert!(!r.aaaa_suppressed(), "h{i}: {} counted", i + 2);
+        }
+        lookup_and_complete(&r, "h3.test").await;
+        assert!(r.aaaa_suppressed(), "the fifth counted");
     }
 
     /// A lookup that gets its AAAA answer shows that the servers do answer
