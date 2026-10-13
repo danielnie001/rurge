@@ -133,8 +133,9 @@ pub async fn build_stack_with(
     rurge_engine::stack::build_stack_with(cfg, &rt.stack_options(wait), customize).await
 }
 
-/// `rurge-platform::dns` behind the `SystemDns` trait (AR-02: platform code
-/// stays in rurge-platform; rurge-dns only sees the trait).
+/// `rurge-platform::dns` behind the `SystemDns` trait, for the configuration
+/// (AR-02: platform code stays in rurge-platform; rurge-dns only sees the
+/// trait). The library call is tokio's `lookup_host`, not platform code.
 pub struct PlatformSystemDns;
 
 impl SystemDns for PlatformSystemDns {

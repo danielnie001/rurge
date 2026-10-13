@@ -1,5 +1,7 @@
 //! Access to the operating system's resolver configuration (design §7.1).
-//! The binary implements it through `rurge-platform`; tests use the static kinds.
+//! The binary implements the configuration (servers, search domains, hosts
+//! path, IPv6) through `rurge-platform` and the resolver library through
+//! tokio's `lookup_host`; tests use the static kinds.
 
 use rurge_net::BoxFuture;
 use std::io;
