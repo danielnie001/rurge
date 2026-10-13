@@ -2089,12 +2089,16 @@ mod run {
         }
     }
 
+    /// A profile that rejects `ads.test` and sends the rest direct. `ads.test`
+    /// is also given the loopback's address, so that a session which escapes
+    /// the rule (the bug a test of the rule is there to catch) ends on the
+    /// loopback and not in a question to the machine's DNS servers.
     fn write_conf(dir: &Path, general: &str) -> std::path::PathBuf {
         let conf = dir.join("t.conf");
         std::fs::write(
             &conf,
             format!(
-                "[General]\n{general}\n[Proxy]\n[Rule]\nDOMAIN,ads.test,REJECT\nFINAL,DIRECT\n"
+                "[General]\n{general}\n[Proxy]\n[Rule]\nDOMAIN,ads.test,REJECT\nFINAL,DIRECT\n[Host]\nads.test = 127.0.0.1\n"
             ),
         )
         .unwrap();
@@ -2940,7 +2944,7 @@ mod run {
             &conf,
             format!(
                 "[General]\nhttp-listen = {MARKER}-listen@127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nhttp-api = {MARKER}-key@127.0.0.1:0\nloglevel = verbose\n\
-[Proxy]\nUp = http, 127.0.0.1, {}, {MARKER}-user, {MARKER}-pass\n[Rule]\nDOMAIN,via.test,Up\nFINAL,DIRECT\n",
+[Proxy]\nUp = http, 127.0.0.1, {}, {MARKER}-user, {MARKER}-pass\n[Rule]\nDOMAIN,via.test,Up\nFINAL,DIRECT\n[Host]\nvia.test = 127.0.0.1\n",
                 upstream.addr().port()
             ),
         )
@@ -3210,7 +3214,7 @@ loglevel = notify",
             &conf,
             format!(
                 "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nloglevel = warning\n\
-[Proxy]\nUp = http, 127.0.0.1, {}\n[Rule]\nDOMAIN,via.test,Up\nFINAL,DIRECT\n",
+[Proxy]\nUp = http, 127.0.0.1, {}\n[Rule]\nDOMAIN,via.test,Up\nFINAL,DIRECT\n[Host]\nvia.test = 127.0.0.1\n",
                 upstream.addr().port()
             ),
         )
