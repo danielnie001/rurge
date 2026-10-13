@@ -1,15 +1,19 @@
 # rurge HTTP API（阶段 1）
 
-rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surge 兼容的 HTTP API。本页记录阶段 1（M4a / M4b，以及阶段 1 补遗（M5a）加的 `GET /v1/geoip`）实现的端点与 rurge 暂定的 JSON 结构；手册未定义的结构在阶段 6 与真实 Surge 对齐时可能调整（见 `docs/surge-compatibility-matrix.md` 第 10.4 节）。
+rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surge 兼容的 HTTP API。本页记录阶段 1（M4a / M4b，阶段 1 补遗（M5a）加的 `GET /v1/geoip`，以及阶段 1 补遗（M5b）加的 `GET /v1/external_resources` 与 `POST /v1/external_resources/update`）实现的端点与 rurge 暂定的 JSON 结构；手册未定义的结构在阶段 6 与真实 Surge 对齐时可能调整（见 `docs/surge-compatibility-matrix.md` 第 10.4 节）。
 
 ## 鉴权与错误
 
 - 每个请求带 `X-Key: <key>` 头或 `?x-key=<key>` 查询参数；比较为常量时间。查询参数取字面值，不做百分号解码，因此只适用于 ASCII 密钥；含 `%` 等特殊字符的密钥请用 `X-Key` 头。
 - 失败：`401 {"error":"unauthorized"}`。同一来源 IP 10 分钟内 5 次失败 → 之后 10 分钟内一律 `403 {"error":"banned"}`；封禁表最多跟踪 1024 个来源。
-- 所有错误都是 `{"error":"<message>"}`：400（参数、JSON 请求体或查询字符串错误）、401、403、404（未知端点 / 未知请求 id / 未知功能名）、405（`{"error":"method not allowed"}`，请求方法与已注册路径不匹配，如对 `/v1/outbound` 发 `DELETE`）、409（不可终止的内部会话）、500（内部错误）、501（本阶段未实现）。
-- 无内容的成功响应是 `{}`。字段名 camelCase；手册已定义的字段（如 `policy-groups`、`dnsCache`）照抄。
+- 所有错误都是 `{"error":"<message>"}`：400（参数、JSON 请求体或查询字符串错误）、401、403、404（未知端点 / 未知请求 id / 未知功能名 / 未知的 Profile 名）、405（`{"error":"method not allowed"}`，请求方法与已注册路径不匹配，如对 `/v1/outbound` 发 `DELETE`）、409（不可终止的内部会话）、500（内部错误）、501（本阶段未实现）。
+- 无内容的成功响应是 `{}`。字段名 camelCase。手册给了应答形状的端点（如 `{"mode":"rule"}`、`{"policy":"ProxyA"}`、`{"enabled":true}`、`GET /v1/external_resources` 的 `defines`）照手册的字段写；手册没有给形状的端点——`GET /v1/policies`、`GET /v1/dns` 一类——用的是 rurge 暂定的字段名（`policy-groups`、`dnsCache` 等）：手册那一页只写了 "List all policies." 与 "Obtain the current DNS cache content."，没有这两个词；到阶段 6 与真实 Surge 对齐。
 - `http-api` 绑定到非环回地址时启动时打 WARN；改动 `http-api` 需重启 rurge（重载只警告，继续用旧地址 / 密钥）。
-- **已知限制（阶段 1 补遗（M5b）修）**：不读请求正文的端点——下面「端点」表里"请求"一格为空的 `POST`：`/v1/dns/flush`、`/v1/profiles/reload`、`/v1/profiles/check`、`/v1/stop`——和在读正文之前就被拒绝的请求（`401` 量过；`403`、`404`、`405` 的应答同样不读正文，这是读代码得出的：`auth::require_key` 在 401 / 403 时不再往下走，`not_found` 与 `method_not_allowed` 不取正文；没有量过它们会不会丢应答），只凭请求头就答复并关掉连接。正文若在这之后才到，客户端可能读不到那个应答——在 Windows 上量到的是连接被中止（`ConnectionAborted`，os error 10053）、一个字节也读不到——，尽管请求已经执行。不发正文的客户端，和把请求头与正文放进一次写里发的客户端，不受影响；`POST /v1/log/level` 一类会读正文的端点量过，也不受影响。rurge 自己的 `rurge reload` / `rurge stop` 属后一种（读 hyper 的源码得出，没有量过）。Python 的 `http.client`——以及 `urllib.request` 和经 urllib3 的 `requests`——把请求头与正文分开发：读 CPython v3.13.0 的 `Lib/http/client.py`，`_send_output` 用一次 `send` 发请求头、对正文的每一块各用一次；`requests` 走的 urllib3 2.7.0 里，`HTTPConnection.request` 在 `endheaders()` 之后逐块 `send`。别的系统没有量过。
+- **API 连接的收尾（阶段 1 补遗（M5b））**：服务端放手一条连接时——答完并决定关、对端先关、出错、优雅退出——不是立刻关：先关写端，再读掉并丢弃对端还在发的字节，直到对端关闭、读出错、丢弃满 256 KiB，或从拿到这条连接起过了 1 秒（一个期限管整件事，不是每次读一个），然后才关；同时处在这一步里的至多 64 条，满了的当场关，与此前每条连接都是的样子相同。读掉的字节不解析、不保存，这一步也不记日志。为的是：不读请求正文的端点——下面「端点」表里"请求"一格为空的 `POST`：`/v1/dns/flush`、`/v1/profiles/reload`、`/v1/stop`——和在读正文之前就被拒绝的请求（`401`、`403`、`404`、`405`）只凭请求头就答复；正文若在这之后才到，它到的是一条已经关了的连接，系统回一个 reset，而 reset 会让客户端的系统把还没读的应答扔掉——此前在 Windows 上，这样的客户端读到的是连接被中止（`ConnectionAborted`，os error 10053）、一个字节也读不到，尽管请求已经执行。Python 的 `http.client`——以及 `urllib.request` 和经 urllib3 的 `requests`——就把请求头与正文分开发：读 CPython v3.13.0 的 `Lib/http/client.py`，`_send_output` 用一次 `send` 发请求头、对正文的每一块各用一次；`requests` 走的 urllib3 2.7.0 里，`HTTPConnection.request` 在 `endheaders()` 之后逐块 `send`（读源码得出，没有运行）。现在这七种应答——上面三个端点各一，加 `401`、`403`、`404`、`405`——客户端都读得到，连同连接的结尾：在一台 Windows 11 x86-64 的开发机上，对着一个把请求头与正文分开写的客户端量过，改动之前读不到、之后读到。不发正文的客户端，和把请求头与正文放进一次写里发的客户端，不受影响；读正文的端点（`POST /v1/log/level` 一类）本来就不受影响；`POST /v1/profiles/check` 现在也读正文（它在正文到齐之前不答复），不在不读正文的端点之列；rurge 自己的 `rurge reload` / `rurge stop` 属把请求头与正文放进一次写里的那一种（读 hyper 的源码得出，没有量过）。请求怎样被读、鉴权与应答都没有动。没有补上的有四处：
+  - 超过 256 KiB 之后才读应答的客户端仍可能丢应答：服务端带着没读完的字节关连接，之后到的字节引来 reset，收到而没读的应答是否活下来是客户端系统的事。在同一台机器上，发 300 KiB 之后立刻读或 0.5 秒后读，50 次里 50 次得到应答和连接的结尾；发 8 MiB 之后立刻读，10 次里 10 次同；发 8 MiB 之后 1.5 秒才读，10 次里 10 次什么也没有、一个 reset。API 的请求正文都是小的 JSON，没有已知的客户端会这样；读正文的端点收到超过 2 MiB 的正文时，在越过上限的那一刻就答 400，剩下的字节还在路上，同样的事也落在它们身上（在 `POST /v1/profiles/check` 上量到：超过上限 64 KiB 或 1 MiB 的发送者读得到那个 400，超过 6 MiB、边写边读的发送者在 Windows 上读到的是连接被中止，丢了 400）。
+  - 64 个位置由所有对端共用：一个对端连得比每秒 64 条快、又从不关，就占满它们，别的连接当场被关，与此前一样；被封的对端的连接也占位置。
+  - 一个已得到应答却不关连接的空闲客户端（面板的长连接一类）使每次停止多等至多 1 秒，在 5 秒的关闭宽限之内：量到停止的等待由改动之前的 0.10 秒变成 1.10 秒。
+  - Linux 与 macOS 没有量过，改动之前与之后都没有：自动化用例在那两个系统上断言的是同一件事，但它们在改动之前红不红不知道（手工清单 `docs/acceptance/phase1-manual.md` 各有一行）。1 秒、256 KiB 与 64 条是写死的常量。
 
 ## 端点
 
@@ -20,7 +24,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 | GET | `/v1/outbound/global` | | `{"policy":"<name>"\|null}` |
 | POST | `/v1/outbound/global` | `{"policy":"<name>"}`（空串清除） | `{}`；未知策略 → 400；出站模式为 `proxy` 时用空串清空 → 400（先切到 direct / rule） |
 | GET | `/v1/policies` | | `{"proxies":[…5 个内置策略 + 配置策略],"policy-groups":[…]}` |
-| GET | `/v1/rules` | | `{"rules":[{"index":0,"rule":"DOMAIN,…","hits":3}]}`；`RULE-SET` / `DOMAIN-SET` 的 URL 写了用户名口令时，`rule` 的文本里显示为 `https://***@host/…`（阶段 2 / M8c） |
+| GET | `/v1/rules` | | `{"rules":[{"index":0,"rule":"DOMAIN,…","hits":3}]}`；`RULE-SET` / `DOMAIN-SET` 的 URL 写了用户名口令时，`rule` 的文本里显示为 `https://***@host/…`（阶段 2 / M8c）。列出的是编译后的规则表，不列第一条 `FINAL` 之后的规则（阶段 1 补遗（M5b））：匹配在第一条启用的 `FINAL` 处结束，策略与选项取最后一条的——这是 rurge 对手册三句话的读法，推断的，没有在 Surge 上观察过（兼容性清单 3.1 节 `FINAL` 一行）——，所以表里是第一条 `FINAL` 之前的规则，最后一条是给出策略的那条 `FINAL`；`index` 是规则在 Profile 里的位置，所以会跳号：Profile 的规则依次是 `DOMAIN,before.test,DIRECT`、`FINAL,Pick`、`DOMAIN,between.test,REJECT`、`DOMAIN,ads.test,REJECT`、`FINAL,DIRECT` 时，列出的是 `index` 为 0 与 4 的两条 |
 | GET | `/v1/requests/recent?limit=N` | 默认 100；上限是 `--request-log-size` 的环形缓冲容量；`limit=0` → 400 `limit must be at least 1` | `{"requests":[Request…]}`（最新在前） |
 | GET | `/v1/requests/active` | | 同上 |
 | POST | `/v1/requests/kill` | `{"id":N}` | `{}`；404 不在进行中；409 `not killable: internal session`；UDP 流（`transport` 为 `udp`）同样可结束 |
@@ -29,9 +33,11 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 | POST | `/v1/dns/flush` | | `{}` |
 | POST | `/v1/test/dns_delay` | `{"name":"<host>"}`，缺省为 `internet-test-url` 的主机 | `{"delays":[{"upstream":"udp://…","ms":12,"error":null}]}` |
 | GET | `/v1/geoip?ip=<地址>` | | `{"address":"198.51.100.23","country":"SE","asn":64500,"organization":"Example Network","geoip-db-date":1760000000,"asn-db-date":1760000000}`；见下「GeoIP」 |
-| GET | `/v1/profiles/current?sensitive=0\|1` | | `text/plain`；`sensitive=1` 给出配置文件的原文，默认（`sensitive=0`）给出脱敏后的文本：行数与行尾 CRLF 原样保留，认得出的秘密换成 `***`。**脱敏是尽力而为，不是保证**——藏什么、有意不藏什么、已知漏什么，见下面「脱敏后的配置」 |
+| GET | `/v1/external_resources` | | `{"defines":[{"path":…,"type":…,"key":…,"local":…,"ready":…,"updatedAt":…,"updating":…,"fromModule":null}]}`，另有 `error`、`suspended` 与集合的三个数；见下「外部资源」（Surge iOS 5.23 / Mac 6.10 起的端点） |
+| POST | `/v1/external_resources/update` | `{"key":"<key>"}`；`"all"` 是每一个下载得到的资源 | `{"<key>":"success"\|"<原因>"}`，每个更新了的键一项；键不存在 → 400；至多等 60 秒；见下「外部资源」（Surge iOS 5.23 / Mac 6.10 起的端点） |
+| GET | `/v1/profiles/current?sensitive=0\|1` | | `text/plain`；返回的是生效的主文本——托管 Profile 的副本生效时是数据目录里下载的副本（阶段 1 补遗（M5b），见下「Profile 的当前文本与检查」）。`sensitive=1` 给出原文，默认（`sensitive=0`）给出脱敏后的文本：行数与行尾 CRLF 原样保留，认得出的秘密换成 `***`。**脱敏是尽力而为，不是保证**——藏什么、有意不藏什么、已知漏什么，见下面「脱敏后的配置」 |
 | POST | `/v1/profiles/reload` | | `{"ok":true,"errors":0,"warnings":1,"listenersRebound":false}`；解析失败或构建 `Runtime` 失败时 `ok:false`，运行中的配置不变；重绑监听器失败时也是 `ok:false`，但新配置这时已经生效，只是监听器归零，直到下一次重载成功为止（下一次重载会无条件重试绑定） |
-| POST | `/v1/profiles/check` | | `{"ok":…,"errors":N,"warnings":N,"diagnostics":[Diagnostic…]}`（校验磁盘上的当前配置，不影响运行；`Diagnostic` 与 `rurge check --json` 相同，每项另有 `hint`——字符串或 `null`：阶段 1 补遗（M5a）起多数诊断码有缺省建议，见兼容性清单 10.3 节 `--check` 一行） |
+| POST | `/v1/profiles/check` | 可带 `{"name":"<Profile 名>"}` | `{"ok":…,"errors":N,"warnings":N,"diagnostics":[Diagnostic…],"error":null\|"<首个错误>"}`（校验磁盘上的当前配置，不影响运行；`Diagnostic` 与 `rurge check --json` 相同，每项另有 `hint`——字符串或 `null`：阶段 1 补遗（M5a）起多数诊断码有缺省建议，见兼容性清单 10.3 节 `--check` 一行）。阶段 1 补遗（M5b）起应答另有 `error`，请求可带 `name`：不是正在运行的那份 Profile 的名字 → 404 `{"error":"profile not found"}`；正文不是 JSON 对象、`name` 不是字符串或正文超过 2 MiB → 400；见下「Profile 的当前文本与检查」 |
 | POST | `/v1/log/level` | `{"level":"verbose"\|"debug"\|"info"\|"notify"\|"warning"\|"error"}` | `{}` |
 | GET | `/v1/features/{system_proxy\|enhanced_mode\|mitm\|capture\|rewrite\|scripting}` | | `system_proxy` 返回真实状态 `{"enabled":bool}`；其余恒 `{"enabled":false}` |
 | POST | `/v1/features/{name}` | `{"enabled":bool}` | `system_proxy`：成功 `{}`；失败 500 `{"error":"<原因>"}`（例如不支持的 Linux 桌面会带 `export http_proxy=…` 提示）；其余功能 501 |
@@ -63,6 +69,8 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 - **`dnsMs`**：这条会话拨号期间花在域名解析上的毫秒数，只算 rurge 自己的解析器——规则要的解析（`IP-CIDR` 一类遇到域名）与出站自己的解析（含以域名配置的代理服务器）合计；`[Host]` 与缓存命中的也算一次接近 0 的查找（可能是 0），等另一条会话在同一个名字上已在途的查询的时间也算，被外层超时打断的查找记它已花的时间。目标是地址、名字交给代理去解析、或隧道自己的 `dns-server` 解析了它时，会话没有做过查找，是 `null`，不是 0。查找在结束时才记下，所以卡在一次慢解析里的进行中会话显示 `null`。UDP 流照记；解析器向上游发的查询、查找自己开的连接不算会话的。
 - **`notes`**：备注，字符串数组，没有时 `[]`。现在只有子规则命中那一句 ``Sub-rule matched: <行> (in <集合>)``（兼容性清单 3.3 节）。`error` 里已登记的说明（组环、空组兜底、`policy does not support UDP; sent through DIRECT` 一类，见 `docs/api/phase2.md`）仍在 `error` 里，不搬进 `notes`。
 
+**暂停时被拒的会话**（阶段 1 补遗（M5b））：托管 Profile 带 `strict`、它的更新到期而最近一次尝试失败（或离线）时，引擎拒绝**新**会话：已经打开的照常，监听端、API 与连通性测试不受影响。被拒的会话在记录里是 `status` 为 `failed`、`error` 为 `refused: the managed profile requires an update (strict)`、`rule` 为 `null`、`policy` 为 `[]`——拒绝发生在规则、任何查找与任何组之前，所以没有规则也没有策略。更新为什么没成功的原因不进会话的记录、错误页或日志行，只在 WARN 日志（`managed profile: the update that strict requires has not succeeded; new sessions are refused until it does`，字段 `error` 是原因）和 `GET /v1/external_resources` 里托管 Profile 那一项的 `error` 与 `suspended` 里。HTTP 监听端对客户端回 `502 Bad Gateway` 和 rurge 的错误页（标题 `Connection failed`，页里写着那句 `error`；`show-error-page = false` 时直接关连接，没有页）；SOCKS5 监听端回应答码 `0x05`；经 SOCKS5 UDP ASSOCIATE 来的 UDP 流以失败结束（同一句 `error`），它的数据报被丢弃，5 秒后同一条流的下一个数据报再试，所以暂停一结束它就恢复——代价是暂停期间每个活跃的 UDP 目标每 5 秒一条失败记录；`encrypted-dns-follow-outbound-mode` 下 rurge 自己的内部 DNS 会话（`listener` 为 `internal`）同样被拒。暂停只在内存里，不进 `state.json`，重载不动它；更新成功后至多一秒（主循环每秒看一眼）解除，日志写 INFO `managed profile: new sessions are accepted again`。
+
 ### Traffic
 
 ```json
@@ -93,6 +101,85 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 - `country`：国家库给的 ISO 3166 代码；`asn`：数字；`organization`：ASN 库里的组织名。库里没有这个地址的项，或对应的库不在（数据目录的 `geoip/` 里没有那个文件）时是 `null`。
 - `geoip-db-date`、`asn-db-date`：两个库自己带的构建时间（MMDB 元数据的 `build_epoch`），UNIX 秒；库不在时是 `null`，地址在库里没有项时日期仍在。手册只说是"the UNIX timestamps of the databases in use"，没有说是构建时间还是下载时间——登记的差异。
 - 错误：`ip` 不是 IP 地址（含空串）→ 400 `{"error":"ip is not a valid IP address"}`，不回显取值；缺 `ip` → 400，正文是查询串拒绝的原文（含 `` `ip` ``）；鉴权同其它端点（没有 `X-Key` → 401）。
+
+### 外部资源
+
+阶段 1 补遗（M5b）起，`GET /v1/external_resources` 列出 rurge 下载或读取的外部资源，`POST /v1/external_resources/update` 立刻更新其中一个或全部。这是 Surge iOS 5.23 / Mac 6.10 起的两个端点（手册 `tools/http-api.html`），晚于本项目对照的手册基线（Mac 6.9 / iOS 5.22）；只取了它们，基线的整体更新是阶段 3 开工前单独的一件事（兼容性清单 10.4 节）。两个端点都要 `X-Key`，引擎因 `strict` 拒绝会话时也照常应答。没有对应的 CLI 子命令（阶段 6）。
+
+**列表。** 例子里的键是例子地址的 SHA-256（托管 Profile 是 `https://provider.example/surge/profile.conf` 的，规则集是 `https://sets.example/rules.list` 的，GeoIP 库是 `https://geo.example/country.mmdb` 的）：
+
+```json
+{"defines":[
+{"path":"managed profile (https://provider.example/…)","type":"profile","key":"d775041d9c0eb39635b2af13c467b6b63615ed529d1fce8378659eba977f5b8f","local":false,"ready":true,"updatedAt":1760000000,"updating":false,"fromModule":null},
+{"path":"https://sets.example/rules.list","type":"ruleset","key":"2482fa3056438fe3af4f5001345a9fb087645067a0280f98ce4835b64bb40032","local":false,"ready":true,"updatedAt":1760000000,"updating":false,"fromModule":null,"skipped":2,"truncated":0,"unknownParams":2},
+{"path":"GeoLite2-Country.mmdb","type":"geoip","key":"681e0219e99b208ea9fd34996cff3506e385fd4a116b0b70afe67ec1d4a2ea56","local":false,"ready":false,"updatedAt":0,"updating":false,"fromModule":null,"error":"http status 404"}
+]}
+```
+
+| 字段 | rurge | 与手册的差异 |
+| --- | --- | --- |
+| `path` | 资源叫什么。规则集与域名集是写下的地址，其中的用户名口令显示为 `***`，路径与查询串照写的样子（与 `GET /v1/rules` 和日志里一样）；订阅（`policy-path`）是 ``policy-path of `<组名>` ``，地址是凭据，不显示；两个 GeoIP 库是文件名；托管 Profile 是 ``managed profile (<scheme>://<host>[:port]/…)``；远程 `#!include` 是 ``remote include <键的前 8 位> (<scheme>://<host>[:port]/…)``；本地文件是它的路径 | 手册的例子是资源的 URL。托管 Profile 与远程 include 的链接整个是凭据（服务商发的链接带令牌），日志、诊断与这个端点都只显示 `scheme://host[:port]/…` |
+| `type` | `ruleset`、`domainset`、`policy-group`（`policy-path` 订阅），另有 rurge 自己的三个：`geoip`（两个 GeoIP 库）、`profile`（托管 Profile）、`include`（远程 `#!include`） | 手册："One of `ruleset`, `domainset`, `script`, `policy-group` and `data`."；rurge 没有 `script` 与 `data`（脚本在阶段 5，Map Local 的数据在阶段 4） |
+| `key` | 地址的 SHA-256，64 位小写十六进制（本地文件取 `file:<路径>` 的 SHA-256），也是缓存目录 `<数据目录>/resources/<key>/` 的名字。在列表里不唯一：一个地址既是 Profile 的来源又是规则集时，列出两项（`type` 不同）、一个键 | 手册只说是资源的标识、更新端点用它（例子是 32 位十六进制）；算法是 rurge 自己的 |
+| `local` | 资源是本地文件 | 同手册 |
+| `ready` | rurge 手里有这份资源的内容；最近一次更新失败而留着旧内容的也算 | 手册："Whether the resource content is available." |
+| `updatedAt` | 最近一次成功的**检查**的 UNIX 秒，从没有过是 `0`。服务端答"没有变化"（HTTP 304，或内容相同的 200）也算一次成功。本地文件没有这一项 | 手册："The UNIX timestamp of the last successful download, or 0 if the resource has never been downloaded."；本地文件没有这一项同手册（"Local resources have no `updatedAt` field."） |
+| `updating` | 有一次下载正在进行，或它带来的内容正在检查；已经被要求而还没开始的尝试不算 | 手册没有解释这个字段 |
+| `fromModule` | 恒为 `null`，到有模块（阶段 5）为止 | 手册："The name of the module that references the resource, or null if it's from the profile." |
+| `error` | 只在最近一次更新或解析失败、而且那是最近发生的事时才有；文字见下 | 手册："Present only if the last update or parsing failed." |
+| `suspended` | rurge 自己的：只在托管 Profile 那一项上，引擎因 `strict` 拒绝会话时是 `true`，别处没有这个键 | 手册没有 |
+| `skipped`、`truncated`、`unknownParams` | rurge 自己的：只在 `ruleset` 与 `domainset` 的项上，见下「集合里没有用上的行」 | 手册没有 |
+
+**顺序与范围。** 先是 Profile 的来源（托管 Profile 在前，再是远程 `#!include`，按被跟踪的次序），然后是当前这一代的资源，按 `path`、再按 `key`；手册没有定义顺序。监视着的 hosts 文件不是外部资源，不列，也不能按键更新。
+
+**`error` 的文字。** 都是资源管理器自己的话，不含路径，也不引用链接的路径与查询串（链接至多以 `scheme://host[:port]/…` 出现）。
+
+| 文字 | 什么时候 |
+| --- | --- |
+| `http status N` | 服务端答了 200 与 304 以外的状态 N |
+| `timeout`、`connect: <原因>`、`tls: <原因>`、`too many redirects`、`body exceeds N bytes` | 下载本身失败；一份资源的正文至多 64 MiB |
+| `does not load: <首个错误的文字>`，错误在下载到的文件里时接 ` (line N)`；`does not load: the local profile cannot be read (<io 错误的种类>)` | 托管 Profile 或远程 include 下载到的内容与本地 Profile 一起加载不了（常见的是一页登录页或报错页：缺 `FINAL`）。不采用，缓存里上一份照旧生效，日志是 WARN `downloaded resource not adopted` |
+| `the profile no longer refers to this address` | 下载到的内容属于一个 Profile 现在已经不提的地址 |
+| `lacks the section it is included into` | 远程 include 下载到的内容没有它被 include 进的那个节 |
+| `the downloaded file is not UTF-8 text` | 下载到的不是 UTF-8 文本 |
+| `waiting for the sources this version refers to` | 新版本提到一个还没试过下载的来源，在等它试完第一次再一并采用；这不算失败 |
+| `cannot write the cache: <系统的错误文本>` | 检查通过了而缓存写不进去（数据目录写满或只读）；这次尝试按失败算，什么也不采用 |
+| `the update has not finished`、`offline mode: the update cannot be attempted` | 只在托管 Profile 那一项：会话因 `strict` 被拒、而它自己没有失败的更新可说时，说被拒的原因——本次运行的第一次尝试结束之前，是等待结束时的原因或 `the update has not finished`；`--no-network` 时是后一句，那时从不尝试。它自己失败的更新排在前面 |
+
+更新成功之后至多一秒，这一项仍带 `suspended` 与原因，直到主循环的下一眼。
+
+**集合里没有用上的行。** `ruleset` 与 `domainset` 的项多三个数：`skipped`（既不是规则也不是名字的行，不在集合里；下载到的文本里点名本地文件的行也算）、`truncated`（超过一百万条上限的有效行，不在集合里）、`unknownParams`（带着不认识的参数的规则行：行在集合里，参数不在；域名集没有参数，恒为 0）。一行只算一类，行号从 1 起，注释行与空行也算行。它们是集合上一次编译所依据的内容的数：更新之后到集合轮到编译之前（同一代的集合一次编一个），仍是更新之前内容的数；没有编译过的集合是三个 0。一份有几行读不了的集合是载入了的，所以这三个数不让 `error` 出现。同样的数在日志里是 WARN `set loaded with lines that are not used`（启动之后载入的集合，三个数不全为零且与上一次载入的不同时才说），在诊断里是 `W0023`、`W0024` 与 `W0003`（兼容性清单 3.5 节）。
+
+**更新。** 请求 `{"key":"<key>"}` 更新那一个键，`{"key":"all"}` 更新每一个下载得到的资源：托管 Profile、远程 `#!include`、规则集、域名集、订阅与两个 GeoIP 库，每个地址只更新一次，下载同时发出（不设并发上限，与冷启动相同）。本地文件不在 `all` 里，同手册："Local resources are skipped."；按键点名一个本地文件时，重读它并答 `"success"`（手册没有说这种情形）。应答是一个对象，把每个更新了的键映射到 `"success"` 或原因（原因就是上面 `error` 的那些话），与手册相同："The response maps each updated key to `"success"` or an error message."；对象不保持列表的顺序。
+
+```json
+{"d775041d9c0eb39635b2af13c467b6b63615ed529d1fce8378659eba977f5b8f":"success","681e0219e99b208ea9fd34996cff3506e385fd4a116b0b70afe67ec1d4a2ea56":"http status 404"}
+```
+
+- **等多久。** 请求等着那些尝试做完，整个请求至多 60 秒，到时还没答的键是 `"timed out"`，别的键保留各自的答案。它只等尝试本身，不等之后的事：不等集合的重新编译，也不等托管 Profile 更新之后的重载（守护进程在更新成功后约一秒重载，应答不等它）。调用方走了，等待就此结束，下载不受影响。
+- **离线。** `--no-network` 时每个下载得到的资源的答案都是 `offline mode: nothing is downloaded`，不发出任何请求。
+- **新版本在等别的来源。** 托管 Profile 的新版本提到一个从没下载过的来源（比如多了一行远程 `#!include`）时，不会先采用缺着那一块的版本：它等那个来源试完第一次再一并采用，其间那个键的答案是 `waiting for the sources this version refers to`。
+- **同一个地址在两处。** 一个地址既是 Profile 的来源又是规则集时是一个键，两边都更新，答案是两边的第一个错误（Profile 的在先）。
+- **400。** 正文不是带字符串 `key` 的 JSON 对象 → `{"error":"the body must be a JSON object with a string \"key\""}`；键不存在（含空串）→ `{"error":"no external resource has this key"}`，手册："If the key is not found, a 400 error is returned."。两句都是固定的，不重复请求里的任何东西。
+
+**界限，都没有补上的。**
+
+- `all` 包括托管 Profile：本地文件在上次更新之后被改过时，它生效到下一次成功的检查为止，"全部更新"就是这样一次检查——约一秒后守护进程重载到下载的副本，那处改动不再生效。
+- 更新请求等着的时候来了重载（托管 Profile 变了，一秒后重载，而 `all` 里的集合还在下载）：换代时 rurge 对旧一代刚检查过或正在检查的资源再问一次，免得键已答 `"success"` 而在用的一代仍是旧内容；请求在另一代下结束时，让在用的一代再看一次。够不到的：新一代已经在下载的资源（留给那次尝试，它可能在服务端变之前就发出了）、被丢掉的请求（客户端走了）、时钟被拨回后的检查；这几种情形下，在用的一代要等有人再看一次，或资源自己的下一次刷新。
+- 列表里的数落后于下载：一个更新后立刻读列表的客户端，可能看到新的 `updatedAt` 配着集合旧的三个数。
+- 一次失败的强制尝试使条目自己的退避加倍（Profile 的来源至多 600 秒，别的至多 3600 秒）：服务端挂着的时候一再要求更新，会把守护进程自己的下一次重试往后推；服务端好了之后要求的更新立即通过。
+
+### Profile 的当前文本与检查
+
+**`GET /v1/profiles/current`** 返回的是**生效的主文本**（阶段 1 补遗（M5b））：托管 Profile 的副本生效时是数据目录里下载的副本，不是指向它的本地文件；本地文件生效时——它在上次更新之后被改过，生效到下一次成功的检查为止——是本地文件。哪一份在生效，每次加载时选，`rurge check` 的 `I0004` 说（规则见兼容性清单 1.3 节）。文本是在请求的那一刻从文件里读的，所以在重载之前、以及一次失败的重载之后，显示的是已经写在磁盘上的文本，同对一个改了而没重载的本地文件；读缓存里的副本时不查摘要，损坏的副本照原样显示。缓存里的副本被删掉之后答 500 `{"error":"cannot read the profile: <系统的错误文本>"}`（文本里没有路径），直到下一次成功的更新把副本写回。脱敏的规则见下面「脱敏后的配置」。
+
+**`POST /v1/profiles/check`**（手册：Mac 4.0.6+）检查一份 Profile，不影响运行中的配置。
+
+- **应答。** `{"ok":true,"errors":0,"warnings":1,"diagnostics":[…],"error":null}`：五个键，`error` 总是写出。`ok`、`errors`、`warnings`、`diagnostics` 的名字、类型与意思没变；`error` 是阶段 1 补遗（M5b）照手册加的：手册写 "If the profile is invalid, an error is returned. Otherwise, the `error` field is null."。Profile 没有严重程度为 error 的诊断时它是 `null`（告警不算）；否则是一个字符串：`diagnostics` 里第一条错误的一行文字 `error[<码>] <文件>:<行>: <说明>`，还有别的错误时接 ` (and N more)`。**这个措辞是 rurge 自己的**：手册只写了"an error is returned"，没有写错误是什么样子。读了且检查了的 Profile 一律答 200（有错误时 `ok` 为 `false`），读不了的仍答 500 `{"error":"cannot load the profile: <原因>"}`。
+- **请求。** 没有正文、正文只有 JSON 空白、或是不带 `name` 的 JSON 对象（别的键忽略），检查正在运行的那份 Profile。`name` 是字符串时，与正在运行的 Profile 的文件名、以及去掉最后一个扩展名的文件名比较（`config.conf` 与 `config`；完全相等，不折叠大小写，从不当路径用；托管 Profile 时是本地文件的名字）：相符才检查，不相符是 404 `{"error":"profile not found"}`，什么也没加载。为什么拒绝而不是忽略：Surge 用 `name` 在它目录里的几份 Profile 里选一份检查，rurge 只有一份（`-c` 给的文件），忽略一个不认识的名字的话，应答说的就是一份没被问到的 Profile。按 `name` 在几份 Profile 里选一份，随 `GET /v1/profiles` 与 `POST /v1/profiles/switch` 在阶段 6。
+- **400。** 正文不是 JSON 对象，或 `name` 不是字符串，或正文大到读不了（超过 2 MiB）：`{"error":"the body must be a JSON object; \"name\", when given, must be a string"}`，一句固定的话。404 与 400 的文字都不重复请求里的任何东西，都在加载 Profile 之前给出；请求的 Content-Type 不看（脚本的 HTTP 库怎样标注正文，这里不管）。
+- **读正文。** 这个端点读正文：在正文到齐之前不答复（此前只凭请求头就答复）。发来的正文远超 2 MiB 的发送者，在 Windows 上可能丢掉 400——那是上面「API 连接的收尾」的 256 KiB 界限，不是这个端点新有的，读正文的端点都一样。
+- **读什么。** 磁盘上的本地文件，连同数据目录里已下载的 Profile 来源（托管 Profile 的副本、远程 `#!include` 的副本）与已缓存的订阅，读法同守护进程；从不联网，对数据目录只读不写。还没有下载的来源报 `W0022`（``managed profile not downloaded yet`` 与 ``remote include not downloaded yet``，有原因时接 ``: <原因>``）。自阶段 2 / M1 起含干构建，见 `docs/api/phase2.md`。
 
 ### 脱敏后的配置
 
@@ -173,4 +260,6 @@ M4b 起 `system_proxy` 已生效（见上面「端点」表）；这里记录地
 
 ## CLI 客户端
 
-`rurge reload | stop | status [-c <conf>] [--remote host:port] [--key <key>] [--platform <p>]`，`status` 另有 `--json`。地址 / 密钥：`--remote` + `--key`（或 `RURGE_API_KEY`）→ `-c` 配置的 `http-api`（只解析）→ 都未提供时退出 2，并打印 `http-api is not configured; add "http-api = <key>@127.0.0.1:6171" to [General] or pass --remote/--key (reload can also be triggered by SIGHUP or --watch)`。退出码：2 参数缺失或鉴权失败（401 / 403），1 连不上、非 2xx，或 `reload` 语义失败（HTTP 200 但 `ok:false`），0 成功。
+`rurge reload | stop | status [-c <conf>] [--remote host:port] [--key <key>] [--data-dir <dir>] [--platform <p>]`，`status` 另有 `--json`。地址 / 密钥：`--remote` + `--key`（或 `RURGE_API_KEY`）→ `-c` 配置的 `http-api`（只解析）→ 都未提供时退出 2，并打印 `http-api is not configured; add "http-api = <key>@127.0.0.1:6171" to [General] or pass --remote/--key (reload can also be triggered by SIGHUP or --watch)`。退出码：2 参数缺失或鉴权失败（401 / 403），1 连不上、非 2xx，或 `reload` 语义失败（HTTP 200 但 `ok:false`），0 成功。成功时 `reload` 打印 `reloaded: <错误数> error(s), <告警数> warning(s)`，`stop` 打印 `stop requested`，`status` 打印四行（出站模式与全局策略、策略与规则的个数与活动请求数、流量）；连不上时打印 `error: cannot reach rurge at http://<地址>: <原因>`，`reload` 失败时打印 `reload failed: <错误数> error(s); the running configuration is unchanged`。
+
+阶段 1 补遗（M5b）起三个命令多一个 `--data-dir <dir>`（环境变量 `RURGE_DATA_DIR`，缺省是平台的数据目录）：`-c` 的 Profile 读来是为了找到 `http-api`，而托管 Profile 生效时 `http-api` 写在数据目录里下载的副本中，所以三个命令照 `rurge run` 的读法读那份副本（`--remote` 与 `--key` 盖过 Profile 里的值）。它们读 Profile 时从不联网，也从不创建或写数据目录。副本还没下载、本地文件又只有一行 `#!MANAGED-CONFIG` 时找不到 `http-api`：照旧退出 2 并打印上面那句 `http-api is not configured; …`，数据目录不会因此出现；找到了而连不上（守护进程没有在运行）时退出 1，打印 `error: cannot reach rurge at http://127.0.0.1:<端口>: <原因>`。`rurge service install` 不加载 Profile，不受影响。
