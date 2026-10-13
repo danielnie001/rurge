@@ -694,6 +694,41 @@ DOMAIN,inline.example.com
         assert_eq!(r.calls.load(Ordering::SeqCst), 1);
     }
 
+    /// The same two networks in the rules of the profile: host bits set, and
+    /// upper-case hexadecimal digits.
+    #[tokio::test]
+    async fn a_rule_network_with_host_bits_or_upper_case_hexadecimal_is_the_network_of_its_prefix()
+    {
+        let e = engine(
+            "[Proxy]\nP = direct\n[Rule]\nIP-CIDR,192.168.1.5/16,P,no-resolve\nIP-CIDR6,2001:DB8::/32,P,no-resolve\nFINAL,DIRECT\n",
+        );
+        for (host, rule) in [
+            ("192.168.200.1", 0),
+            ("192.168.0.0", 0),
+            ("192.168.255.255", 0),
+            ("[2001:db8::1]", 1),
+            ("[2001:db8:ffff::]", 1),
+        ] {
+            let d = e
+                .evaluate(&session(host), OutboundMode::Rule, &Panicking)
+                .await;
+            assert_eq!(d.reason, Reason::Rule, "{host}");
+            assert_eq!(d.matched, Some(rule), "{host}");
+            assert_eq!(d.policy().map(named).as_deref(), Some("P"), "{host}");
+        }
+        for host in [
+            "192.167.255.255",
+            "192.169.0.0",
+            "[2001:db7::1]",
+            "[2001:db9::]",
+        ] {
+            let d = e
+                .evaluate(&session(host), OutboundMode::Rule, &Panicking)
+                .await;
+            assert_eq!(d.reason, Reason::Final, "{host}");
+        }
+    }
+
     #[tokio::test]
     async fn dns_failure_falls_back_to_final_with_dns_failed() {
         let e = engine(CONF);

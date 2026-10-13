@@ -578,6 +578,36 @@ DEST-PORT,8443
         assert!(ctx.resolved.is_none());
     }
 
+    /// A network written with host bits set (`192.168.1.5/16`), or with the
+    /// hexadecimal digits of an IPv6 address in upper case (`2001:DB8::/32`),
+    /// is accepted in a rule-set file and is the network of its prefix.
+    #[test]
+    fn a_network_with_host_bits_or_upper_case_hexadecimal_is_the_network_of_its_prefix() {
+        let set = compile(
+            SetKind::RuleSet,
+            "IP-CIDR,192.168.1.5/16,no-resolve\nIP-CIDR6,2001:DB8::/32,no-resolve\n",
+            &Stub::default(),
+        );
+        assert_eq!(set.entry_count(), 2, "both lines are accepted");
+        for (host, line) in [
+            ("192.168.200.1", "IP-CIDR,192.168.1.5/16,no-resolve"),
+            ("192.168.0.0", "IP-CIDR,192.168.1.5/16,no-resolve"),
+            ("192.168.255.255", "IP-CIDR,192.168.1.5/16,no-resolve"),
+            ("[2001:db8::1]", "IP-CIDR6,2001:DB8::/32,no-resolve"),
+            ("[2001:db8:ffff::]", "IP-CIDR6,2001:DB8::/32,no-resolve"),
+        ] {
+            assert_eq!(ask(&set, host, None, false), matches_line(line), "{host}");
+        }
+        for host in [
+            "192.167.255.255",
+            "192.169.0.0",
+            "[2001:db7::1]",
+            "[2001:db9::]",
+        ] {
+            assert_eq!(ask(&set, host, None, false), NO_MATCH, "{host}");
+        }
+    }
+
     #[test]
     fn the_same_network_with_and_without_no_resolve_still_asks() {
         let set = compile(
