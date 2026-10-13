@@ -1551,7 +1551,22 @@ fn validate(
     let mut seen_groups: HashSet<GroupKind> = HashSet::new();
     for g in &config.groups {
         if !opts.capabilities.group_kinds.contains(&g.kind) && seen_groups.insert(g.kind) {
-            diags.push(Diagnostic::warning(codes::W_GROUP_NOT_IMPLEMENTED, format!("policy group type `{}` is not implemented in this version; the first member is used", g.kind.keyword())).at(g.span.clone()));
+            // a `subnet` group has no members: until the networks can be told
+            // apart it stands for its `default` on every one of them
+            let used = match g.kind {
+                GroupKind::Subnet => "its `default` policy is used on every network",
+                _ => "the first member is used",
+            };
+            diags.push(
+                Diagnostic::warning(
+                    codes::W_GROUP_NOT_IMPLEMENTED,
+                    format!(
+                        "policy group type `{}` is not implemented in this version; {used}",
+                        g.kind.keyword()
+                    ),
+                )
+                .at(g.span.clone()),
+            );
         }
     }
     let mut seen_rules: HashSet<&'static str> = HashSet::new();
@@ -2673,6 +2688,34 @@ New = ss, 127.0.0.1, 8388, encrypt-method=aes-256-gcm, password=s3cret\n\
             1
         );
         assert!(!l.diagnostics.has_errors());
+    }
+
+    /// A `subnet` group does not tell the networks apart yet: it stands for its
+    /// `default` policy on every one of them, and the warning says that, not
+    /// that a member is used (it has no members).
+    #[test]
+    fn the_subnet_warning_says_the_default_is_used() {
+        let mut opts = LoadOptions::for_tests();
+        opts.capabilities.group_kinds.remove(&GroupKind::Subnet);
+        let l = from_text(
+            "[Proxy]\nA = http, a.test, 80\n[Proxy Group]\nN = subnet, default=A\n[Rule]\nFINAL,N\n",
+            Path::new("/p/t.conf"),
+            &opts,
+        );
+        assert!(!l.diagnostics.has_errors());
+        let said: Vec<&str> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::W_GROUP_NOT_IMPLEMENTED)
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "policy group type `subnet` is not implemented in this version; its `default` policy is used on every network"
+            ]
+        );
+        assert!(!said[0].contains("first member"));
     }
 
     /// A rule type this version cannot match (`W0013`) is looked for inside
