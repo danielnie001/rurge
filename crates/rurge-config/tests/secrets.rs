@@ -53,6 +53,7 @@ AnyTls = anytls, a.example, 443, password={MARKER}-anytls
 Ss = ss, ss.example, 8388, encrypt-method=aes-128-gcm, password={MARKER}-ss, obfs=http, obfs-host={MARKER}-obfs.example, obfs-uri=/{MARKER}-uri
 Ss2022 = ss, ss.example, 8389, encrypt-method=2022-blake3-aes-128-gcm, password={KEY_16}
 SsStream = ss, ss.example, 8390, encrypt-method=aes-256-cfb, password={MARKER}-ssstream
+Custom = custom, cu.example, 8388, aes-128-gcm, {MARKER}-custom, https://m.example/{MARKER}-module/SSEncrypt.module
 Snell = snell, sn.example, 443, psk={MARKER}-snell, version=4
 Hy2 = hysteria2, hy.example, 443, password={MARKER}-hy2, salamander-password={MARKER}-salamander
 TuicV5 = tuic-v5, tu.example, 443, uuid={UUID}, password={MARKER}-tuic
@@ -143,9 +144,9 @@ fn the_profile_loads() {
     );
     // every line that takes a spec has one: the secrets are really read
     for name in [
-        "Http", "Https", "Socks", "Trojan", "Vmess", "AnyTls", "Ss", "Ss2022", "SsStream", "Snell",
-        "Hy2", "TuicV5", "Tuic", "Masque", "Tt", "H2", "Ssh", "Wg", "Ext", "Shadow", "Tested",
-        "Ideo", "ExtQ", "Req", "ReqN", "Inline", "Suffix", "QType",
+        "Http", "Https", "Socks", "Trojan", "Vmess", "AnyTls", "Ss", "Ss2022", "SsStream",
+        "Custom", "Snell", "Hy2", "TuicV5", "Tuic", "Masque", "Tt", "H2", "Ssh", "Wg", "Ext",
+        "Shadow", "Tested", "Ideo", "ExtQ", "Req", "ReqN", "Inline", "Suffix", "QType",
     ] {
         assert!(loaded.config.spec(name).is_some(), "{name}");
     }
@@ -201,6 +202,13 @@ fn the_profile_loads() {
         policy("ReqN").params.get("password"),
         Some(format!("{MARKER}-reqnamed").as_str())
     );
+    // Surge's old Shadowsocks line has its password in a position, with a
+    // link behind it: the password is read from there
+    let custom = config.spec("Custom").unwrap();
+    let rurge_config::ProtoSpec::Ss(ss) = &custom.proto else {
+        panic!("{:?}", custom.proto)
+    };
+    assert_eq!(ss.password.expose(), &format!("{MARKER}-custom"));
     // a key that holds a comma, a listener whose password is quoted with one
     let general = &config.general;
     assert_eq!(
@@ -648,9 +656,9 @@ fn a_line_that_does_not_load_shows_no_secret_either() {
         format!("http, h.example, 8080, alice, {MARKER}-noname"),
         // a share link pasted as a line
         format!("trojan://{MARKER}-link@t.example:443?sni=t.example#HK"),
-        // Surge's old Shadowsocks line
+        // an old Shadowsocks line under a type name rurge does not know
         format!(
-            "Old = custom, 1.2.3.4, 443, chacha20-ietf-poly1305, {MARKER}-custom, https://example.com/SSEncrypt.module"
+            "Old = Shadowsocks, 1.2.3.4, 443, chacha20-ietf-poly1305, {MARKER}-shadowsocks, https://example.com/SSEncrypt.module"
         ),
         // a peer's key on a line of its own, as wg-quick writes it
         format!("preshared-key = {KEY}"),

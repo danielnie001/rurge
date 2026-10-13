@@ -37,6 +37,8 @@ pub enum PolicyKind {
     RejectTinyGif,
 }
 
+/// `PolicyKind::keyword` is a kind's first entry: `custom`, the old name of
+/// `ss`, stands after `ss` so that the kind is still called `ss`.
 const POLICY_KEYWORDS: &[(&str, PolicyKind)] = &[
     ("http", PolicyKind::Http),
     ("https", PolicyKind::Https),
@@ -44,6 +46,7 @@ const POLICY_KEYWORDS: &[(&str, PolicyKind)] = &[
     ("socks5", PolicyKind::Socks5),
     ("socks5-tls", PolicyKind::Socks5Tls),
     ("ss", PolicyKind::Shadowsocks),
+    ("custom", PolicyKind::Shadowsocks),
     ("snell", PolicyKind::Snell),
     ("vmess", PolicyKind::Vmess),
     ("trojan", PolicyKind::Trojan),
@@ -163,6 +166,9 @@ pub struct ProxyPolicy {
     /// The text right of `name =` as written (API policy detail, `lineHash`).
     pub definition: String,
     pub span: Span,
+    /// The type was written `custom`, the old name of `ss`: the line then has
+    /// its cipher and its password in positions.
+    pub legacy_custom: bool,
 }
 
 /// `positional` and `params` are left out and `definition` redacted, as a
@@ -319,6 +325,7 @@ pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPo
         params,
         definition: definition.trim().to_string(),
         span: span.clone(),
+        legacy_custom: type_kw.trim().eq_ignore_ascii_case("custom"),
     })
 }
 
@@ -697,6 +704,31 @@ mod tests {
         assert_eq!(p.params.get("underlying-proxy"), Some("Entry"));
     }
 
+    /// Surge's old `custom` is Shadowsocks: the type is `ss` everywhere it is
+    /// named, and the line is marked, for its positional fields are read as
+    /// the old module took them.
+    #[test]
+    fn the_custom_keyword_is_the_ss_type() {
+        assert_eq!(PolicyKind::parse("custom"), Some(PolicyKind::Shadowsocks));
+        assert_eq!(PolicyKind::parse("CUSTOM"), Some(PolicyKind::Shadowsocks));
+        assert_eq!(PolicyKind::Shadowsocks.keyword(), "ss");
+        let new = parse_policy("New", "ss, 127.0.0.1, 8388, m, p", &span()).unwrap();
+        assert!(!new.legacy_custom);
+        for definition in [
+            "custom, 127.0.0.1, 8388, m, p",
+            "CUSTOM, 127.0.0.1, 8388, m, p",
+            // the type is read as `PolicyKind::parse` reads it: the quotes
+            // off, the blanks off
+            "\" Custom \", 127.0.0.1, 8388, m, p",
+        ] {
+            let old = parse_policy("Old", definition, &span()).unwrap();
+            assert_eq!(old.kind, PolicyKind::Shadowsocks, "{definition}");
+            assert!(old.legacy_custom, "{definition}");
+            assert_eq!((&old.server, old.port), (&new.server, new.port));
+            assert_eq!(old.positional, new.positional, "{definition}");
+        }
+    }
+
     #[test]
     fn policy_errors() {
         assert_eq!(
@@ -969,10 +1001,12 @@ external-policy-modifier=\"password=hunter2\"",
     /// like.
     #[test]
     fn a_modified_line_reads_as_the_line_did_with_the_modifier_in_place() {
-        const HEADS: [&str; 4] = [
+        const HEADS: [&str; 5] = [
             "trojan, t.test, 443",
             // a server spelled like a parameter the modifier sets
             "http, tfo=false, 80",
+            // the old name of `ss` takes a server and a port as `ss` does
+            "custom, tfo=false, 8388",
             // a type without a server: its first item is a parameter
             "direct, tfo=false",
             // the parser drops an empty item, which is then no field
@@ -1065,6 +1099,10 @@ external-policy-modifier=\"password=hunter2\"",
         assert_eq!(
             with_params("http, tfo=x, 80", &tfo),
             "http, tfo=x, 80, tfo=true"
+        );
+        assert_eq!(
+            with_params("custom, tfo=x, 8388, aes-256-gcm, pw", &tfo),
+            "custom, tfo=x, 8388, aes-256-gcm, pw, tfo=true"
         );
         assert_eq!(with_params("direct, tfo=x", &tfo), "direct, tfo=true");
     }

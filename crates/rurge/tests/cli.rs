@@ -790,6 +790,40 @@ fn check_knows_ss() {
         .stdout(predicate::str::contains("c2VjcmV0").not());
 }
 
+const SS_CUSTOM: &str = "[General]\n[Proxy]\n\
+Old = custom, proxy.test, 8388, aes-256-gcm, s3same, https://module.test/SSEncrypt.module\n\
+[Rule]\nFINAL,DIRECT\n";
+
+/// Surge's old `custom` line is read as `ss`: `rurge check` loads it without
+/// an error, says that it read it so, and prints neither the password nor
+/// the link of the module.
+#[test]
+fn check_reads_a_legacy_custom_policy_as_ss() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = rurge_command()
+        .args(["check", "-c"])
+        .arg(write(&dir, "custom.conf", SS_CUSTOM))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    assert!(out.contains("I0001"), "{out}");
+    assert!(
+        out.contains(
+            "custom.conf:3: policy `Old`: legacy type `custom` read as `ss`; the module URL is ignored"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("E0004"), "{out}");
+    assert!(out.contains("0 error(s)"), "{out}");
+    assert!(
+        !out.contains("s3same") && !out.contains("module.test"),
+        "{out}"
+    );
+}
+
 const SNELL: &str = "[General]\n[Proxy]\n\
 N = snell, proxy.test, 443, psk=s3cretPsk, version=4, reuse=true, obfs=http\n\
 Old1 = snell, proxy.test, 443, psk=s3cretPsk\n\

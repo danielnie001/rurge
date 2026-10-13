@@ -1410,6 +1410,20 @@ fn validate(
         // `local-port` → the `external` policy that has it
         let mut local_ports: HashMap<u16, &str> = HashMap::new();
         for p in &cfg.policies {
+            // said whatever else is wrong with the line: the old reading is
+            // what explains a missing `encrypt-method` or `password`
+            if p.legacy_custom {
+                diags.push(
+                    Diagnostic::info(
+                        codes::I_LEGACY_MIGRATED,
+                        format!(
+                            "{}: legacy type `custom` read as `ss`; the module URL is ignored",
+                            named("policy", &p.name)
+                        ),
+                    )
+                    .at(p.span.clone()),
+                );
+            }
             // A program that a downloaded text names is not started, so its
             // parameters are not read: nothing is said about them. An
             // `external` policy the map does not know is not the user's own.
@@ -2551,6 +2565,63 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
         assert_eq!(l.config.rulesets.len(), 1);
         assert_eq!(l.config.rulesets[0].rules.len(), 1);
         assert_eq!(l.config.rulesets[0].rules[0].raw, "DOMAIN,a");
+    }
+
+    /// Surge's old `custom` line loads as `ss`, and the loader says so: once
+    /// for each such line, whether or not something else is wrong with it
+    /// (the old reading may well be what explains it). The policy is named,
+    /// and nothing else of the line is said.
+    #[test]
+    fn a_legacy_custom_line_is_said_to_be_read_as_ss() {
+        let l = load_text(
+            "[Proxy]\nOld = custom, 127.0.0.1, 8388, aes-256-gcm, s3cret, https://m.test/x.module\n\
+Broken = custom, 127.0.0.1, 8388, aes-256-gcm\n\
+New = ss, 127.0.0.1, 8388, encrypt-method=aes-256-gcm, password=s3cret\n\
+[Rule]\nFINAL,DIRECT\n",
+        );
+        let told: Vec<(u32, &str)> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::I_LEGACY_MIGRATED)
+            .map(|d| (d.span.as_ref().map_or(0, |s| s.line), d.message.as_str()))
+            .collect();
+        assert_eq!(
+            told,
+            [
+                (
+                    2,
+                    "policy `Old`: legacy type `custom` read as `ss`; the module URL is ignored"
+                ),
+                (
+                    3,
+                    "policy `Broken`: legacy type `custom` read as `ss`; the module URL is ignored"
+                ),
+            ]
+        );
+        // the second has no password, which is an error of its own
+        assert_eq!(
+            l.diagnostics
+                .iter()
+                .filter(|d| d.severity == crate::Severity::Error)
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>(),
+            ["policy `Broken`: `password` is required"]
+        );
+        for d in l.diagnostics.iter() {
+            assert!(
+                !d.message.contains("s3cret") && !d.message.contains("m.test"),
+                "{d}"
+            );
+        }
+        // and every one of the three is an `ss` policy
+        assert_eq!(
+            l.config
+                .policies
+                .iter()
+                .map(|p| p.kind.keyword())
+                .collect::<Vec<_>>(),
+            ["ss", "ss", "ss"]
+        );
     }
 
     #[test]

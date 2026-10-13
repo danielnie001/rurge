@@ -884,11 +884,12 @@ fn is_param_name(name: &str) -> bool {
 /// Surge puts `username, password`. It is done for the types that take a
 /// server and a port, and for any line whose third field is a port number: a
 /// line written for another client (Loon's `Shadowsocks, host, 443, method,
-/// "password"`, Surge's old `custom, host, 443, method, password, module`) is
-/// an unknown type to rurge, and its password stands in the fifth place all
-/// the same. For a type that takes a server, what stands in the port's place
-/// and is no number is a user name or a password that lost its comma (`8080
-/// alice, hunter2`), and goes too. The fields are the parser's: `split_list`
+/// "password"`) is an unknown type to rurge, and its password stands in the
+/// fifth place all the same; Surge's old `custom, host, 443, method,
+/// password, module` is an `ss` line, whose password stands there too. For a
+/// type that takes a server, what stands in the port's place and is no
+/// number is a user name or a password that lost its comma (`8080 alice,
+/// hunter2`), and goes too. The fields are the parser's: `split_list`
 /// reads the type and the port with the quotes off, and an empty item is
 /// none. A token counts as
 /// a named parameter (and is kept) only when what stands before its first `=`
@@ -2976,6 +2977,10 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
             // the invisible characters a copy brings along are no part of the
             // type or the port
             (
+                "P = Shadowsocks, h.test,\u{200b}443, alice, hunter2",
+                "P = Shadowsocks, h.test,\u{200b}443, ***, ***",
+            ),
+            (
                 "P = custom, h.test,\u{200b}443, alice, hunter2",
                 "P = custom, h.test,\u{200b}443, ***, ***",
             ),
@@ -3030,8 +3035,19 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
                 "P = Shadowsocks, host.test, 443, ***, ***",
             ),
             (
+                "Old = Shadowsocks, 1.2.3.4, 443, chacha20-ietf-poly1305, hunter2, https://example.com/SSEncrypt.module",
+                "Old = Shadowsocks, 1.2.3.4, 443, ***, ***, ***",
+            ),
+            // Surge's old Shadowsocks line is an `ss` line to rurge: it takes a
+            // server, so what stands in its port's place and is no number
+            // goes too
+            (
                 "Old = custom, 1.2.3.4, 443, chacha20-ietf-poly1305, hunter2, https://example.com/SSEncrypt.module",
                 "Old = custom, 1.2.3.4, 443, ***, ***, ***",
+            ),
+            (
+                "P = custom, h.test, 443 aes-128-gcm, hunter2",
+                "P = custom, h.test, ***, ***",
             ),
             ("select, A, B, 8080, C", "select, A, B, 8080, C"),
             // no port in the third place and no type that takes a server

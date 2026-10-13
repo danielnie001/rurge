@@ -991,6 +991,32 @@ external-policy-modifier=\"tfo=true,test-url=http://apple.com/\"",
         assert!(!cfg.spec("A").unwrap().common.tfo);
     }
 
+    /// A subscription may still serve Surge's old `custom` line: it is an `ss`
+    /// policy like the one a profile can write, and nothing is said of it.
+    #[test]
+    fn an_imported_custom_line_is_read_as_ss() {
+        let cfg = profile(
+            "A = http, a.test, 80",
+            "G = select, A, policy-path=https://sub.test/g",
+        );
+        let a = assemble(
+            &cfg,
+            &snapshots(
+                &cfg,
+                &[(
+                    "G",
+                    "Old = custom, 127.0.0.1, 8388, aes-128-gcm, pw, https://m.test/x.module",
+                )],
+            ),
+        );
+        assert_eq!(members(&a, "G"), ["A", "Old"]);
+        let old = &a.imported[0];
+        assert_eq!(old.policy.name, "Old");
+        let spec = old.spec.as_ref().expect("a custom line has a spec");
+        assert!(matches!(spec.proto, ProtoSpec::Ss(_)), "{:?}", spec.proto);
+        assert!(a.diagnostics.is_empty(), "{:?}", warnings(&a));
+    }
+
     #[test]
     fn include_other_group_is_recursive_and_a_cycle_gives_nothing() {
         let cfg = profile(

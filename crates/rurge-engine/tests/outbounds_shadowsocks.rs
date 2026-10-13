@@ -98,6 +98,37 @@ async fn a_connect_leaves_through_ss_with_every_kind_of_method() {
     }
 }
 
+/// Surge's old `custom` line (`custom, host, port, method, password, module
+/// link`) is an `ss` policy: it leaves through the same server with the same
+/// method and password, and the link of the module takes no part.
+#[tokio::test]
+async fn a_legacy_custom_policy_connects_like_ss() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let fake = FakeShadowsocks::spawn(ShadowsocksScript {
+        connect_to: Some(echo),
+        ..ShadowsocksScript::new(SsMethod::Aes256Gcm, "s3same")
+    })
+    .await;
+    let h = through(&format!(
+        "S = custom, 127.0.0.1, {}, aes-256-gcm, s3same, https://127.0.0.1/SSEncrypt.module",
+        fake.addr().port()
+    ))
+    .await;
+    let mut tunnel = connect_via_http(h.http(), "target.test:7").await;
+    echo_through(&mut tunnel, b"through custom").await;
+    let seen = fake.requests();
+    let first = seen.first().expect("the server never saw a request");
+    assert_eq!(
+        (first.atyp, first.host.as_str(), first.port),
+        (3, "target.test", 7),
+        "the server resolves the name"
+    );
+    drop(tunnel);
+    let record = the_record(&h).await;
+    assert_eq!(record.policy, ["S"]);
+    assert!(record.error.is_none(), "{:?}", record.error);
+}
+
 #[tokio::test]
 async fn both_obfs_modes_carry_the_session() {
     let echo = rurge_proto::testing::echo_server().await;

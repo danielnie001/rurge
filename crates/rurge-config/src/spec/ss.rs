@@ -193,11 +193,23 @@ fn decode_keys(password: &str, len: usize) -> Result<Vec<Vec<u8>>, usize> {
 /// returned value is meaningless: the caller checks `r.has_errors()`.
 ///
 /// The password is named-only (`password=`), as the manual writes it, and is
-/// never quoted in a diagnostic; the method may be, it is no secret.
+/// never quoted in a diagnostic; the method may be, it is no secret. The old
+/// `custom` line is the exception: `custom, host, port, method, password[,
+/// link of the module]`, where the module's link is read and dropped, and a
+/// named parameter wins over a positional value, as it does for the
+/// credentials of `http`.
 pub fn read_ss(r: &mut ParamReader<'_>) -> SsRead {
+    let (positional_method, positional_password) = if r.policy().legacy_custom {
+        let fields = (r.positional(0), r.positional(1));
+        // the link is read so that it is no surplus value, and dropped
+        r.positional(2);
+        fields
+    } else {
+        (None, None)
+    };
     let mut method = SsMethod::None;
     let mut unsupported_cipher = None;
-    match r.str("encrypt-method").map(str::trim) {
+    match r.str("encrypt-method").or(positional_method).map(str::trim) {
         None => r.error(
             codes::E_INVALID_POLICY_PARAM,
             "`encrypt-method` is required".to_string(),
@@ -216,7 +228,10 @@ pub fn read_ss(r: &mut ParamReader<'_>) -> SsRead {
             }
         }
     }
-    let password = r.str("password").unwrap_or_default();
+    let password = r
+        .str("password")
+        .or(positional_password)
+        .unwrap_or_default();
     let needs_password = method != SsMethod::None || unsupported_cipher.is_some();
     let mut keys = Vec::new();
     if password.is_empty() {
@@ -501,6 +516,83 @@ mod tests {
                 "{method}"
             );
         }
+    }
+
+    /// Surge's old `custom` line: `custom, host, port, method, password[,
+    /// module link]`. It reads as the `ss` line with that method and password;
+    /// the link names a module nothing loads any more and is read for nothing.
+    #[test]
+    fn a_legacy_custom_line_is_read_as_shadowsocks() {
+        let (new, failed, diags) =
+            read("ss, 127.0.0.1, 8388, encrypt-method=chacha20-ietf-poly1305, password=pw");
+        assert!(!failed && diags.is_empty(), "{diags:?}");
+        for line in [
+            "custom, 127.0.0.1, 8388, chacha20-ietf-poly1305, pw, https://m.test/SSEncrypt.module",
+            "custom, 127.0.0.1, 8388, chacha20-ietf-poly1305, pw",
+        ] {
+            let (old, failed, diags) = read(line);
+            assert!(!failed && diags.is_empty(), "{line}: {diags:?}");
+            assert_eq!(old.spec, new.spec, "{line}");
+            assert_eq!(old.unsupported_cipher, None, "{line}");
+        }
+        // a fourth positional value is one too many, as it is on any line
+        let (_, failed, diags) = read(
+            "custom, 127.0.0.1, 8388, chacha20-ietf-poly1305, pw, https://m.test/SSEncrypt.module, more",
+        );
+        assert!(!failed);
+        assert_eq!(
+            messages(&diags),
+            ["policy `P`: unexpected positional value #4 ignored"]
+        );
+        // a named parameter wins over a positional one, as for the
+        // credentials of `http`
+        let (named, failed, diags) = read(
+            "custom, 127.0.0.1, 8388, chacha20-ietf-poly1305, pw, encrypt-method=aes-128-gcm, password=other",
+        );
+        assert!(!failed && diags.is_empty(), "{diags:?}");
+        assert_eq!(named.spec.method, SsMethod::Aes128Gcm);
+        assert_eq!(named.spec.password.expose(), "other");
+    }
+
+    /// A line of long ago may carry parameters beside the positional ones:
+    /// those `ss` knows keep their meaning, the rest is an unknown parameter
+    /// like on any line.
+    #[test]
+    fn a_legacy_custom_line_keeps_its_named_parameters() {
+        let (got, failed, diags) = read(
+            "custom, 127.0.0.1, 8388, aes-256-gcm, pw, https://m.test/x.module, obfs=http, obfs-host=h.test, udp-relay=true, ota=true",
+        );
+        assert!(!failed, "{diags:?}");
+        assert_eq!(got.spec.obfs.map(|obfs| obfs.mode), Some(ObfsMode::Http));
+        assert!(got.spec.udp_relay);
+        assert_eq!(
+            diags.iter().map(|d| d.code).collect::<Vec<_>>(),
+            [codes::W_UNKNOWN_KEY]
+        );
+        assert_eq!(
+            messages(&diags),
+            ["policy `P`: unknown parameter `ota` ignored"]
+        );
+    }
+
+    /// A positional field with an `=` in it is a named parameter, on every
+    /// line that has credentials in positions (`http`'s are the same). An old
+    /// line whose password holds one has no password, which is an error, and
+    /// nothing of what stands after the `=` is said.
+    #[test]
+    fn a_legacy_custom_password_with_an_equals_sign_is_an_error() {
+        let (_, failed, diags) = read("custom, 127.0.0.1, 8388, aes-256-gcm, hunter=2secret");
+        assert!(failed);
+        let errors: Vec<&str> = diags
+            .iter()
+            .filter(|d| d.code == codes::E_INVALID_POLICY_PARAM)
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(errors, ["policy `P`: `password` is required"]);
+        assert!(
+            diags.iter().all(|d| !d.message.contains("2secret")),
+            "{diags:?}"
+        );
     }
 
     #[test]
