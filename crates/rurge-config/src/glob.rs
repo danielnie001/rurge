@@ -168,6 +168,11 @@ mod tests {
         assert!(ci("*.example.com").matches("a.b.example.com"));
         assert!(!ci("*.example.com").matches("example.com"));
         assert!(ci("*google.com").matches("bargoogle.com"));
+        // the manual's own examples: a `*` may stand for nothing, but the
+        // dot after it has to be matched
+        assert!(ci("*google.com").matches("google.com"));
+        assert!(ci("*google.com").matches("foo.google.com"));
+        assert!(!ci("*.google.com").matches("google.com"));
         assert!(ci("api-*.example.com").matches("api-v2.example.com"));
         assert!(ci("cdn?.example.com").matches("cdn1.example.com"));
         assert!(!ci("cdn?.example.com").matches("cdn10.example.com"));

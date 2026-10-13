@@ -146,7 +146,7 @@ fn parse_domain_line(line: &str) -> Result<SetLine, String> {
     Ok(SetLine::Domain { name, suffix })
 }
 
-/// Manual list as of Surge Mac 6.9 / iOS 5.22; the app's own list is authoritative.
+/// Manual list as of Surge Mac 6.10.0 / iOS 5.23.0; the app's own list is authoritative.
 const SYSTEM_SET: &str = "\
 DOMAIN,api.smoot.apple.com
 DOMAIN,captive.apple.com
