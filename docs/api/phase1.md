@@ -127,17 +127,17 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 | `updating` | 有一次下载正在进行，或它带来的内容正在检查；已经被要求而还没开始的尝试不算 | 手册没有解释这个字段 |
 | `fromModule` | 恒为 `null`，到有模块（阶段 5）为止 | 手册："The name of the module that references the resource, or null if it's from the profile." |
 | `error` | 只在最近一次更新或解析失败、而且那是最近发生的事时才有；文字见下 | 手册："Present only if the last update or parsing failed." |
-| `suspended` | rurge 自己的：只在托管 Profile 那一项上，引擎因 `strict` 拒绝会话时是 `true`，别处没有这个键 | 手册没有 |
+| `suspended` | rurge 自己的：引擎因 `strict` 拒绝会话时，那一行写了 `strict=true` 的托管 Profile 那一项是 `true`，别处没有这个键——列表里另有一项 `profile`（一次失败的重载之后 rurge 去下载的那一份，见下「顺序与范围」）时，它也没有 | 手册没有 |
 | `skipped`、`truncated`、`unknownParams` | rurge 自己的：只在 `ruleset` 与 `domainset` 的项上，见下「集合里没有用上的行」 | 手册没有 |
 
-**顺序与范围。** 先是 Profile 的来源（托管 Profile 在前，再是远程 `#!include`，按被跟踪的次序；一次失败的重载之后 rurge 去下载的来源——磁盘上的 Profile 点名而从没下载过的，兼容性清单 1.3 节——排在这些之后，`type` 照它在 Profile 里的身份，第一份副本被采用之前 `ready` 是 `false`，下载失败时带 `error`），然后是当前这一代的资源，按 `path`、再按 `key`；手册没有定义顺序。监视着的 hosts 文件不是外部资源，不列，也不能按键更新。
+**顺序与范围。** 先是 Profile 的来源（托管 Profile 在前，再是远程 `#!include`，按被跟踪的次序；在用的一代之外还被跟着的来源——一个还没被采用的新版本提到的，或一次失败的重载之后 rurge 去下载的（磁盘上的 Profile 点名而从没下载过的，兼容性清单 1.3 节）——`type` 照它在 Profile 里的身份：是 `include` 的排在这些之后，是 `profile` 的排在在用的那一份托管 Profile 之后、各份 `#!include` 之前（列表里于是有两项 `profile`，在用的那一份在前）；第一份副本被采用之前 `ready` 是 `false`，下载失败时带 `error`；失败的重载之后跟上的那些从不带 `suspended`），然后是当前这一代的资源，按 `path`、再按 `key`；手册没有定义顺序。监视着的 hosts 文件不是外部资源，不列，也不能按键更新。
 
 **`error` 的文字。** 都是 rurge 自己的话，不含链接的任何部分（链接至多以 `scheme://host[:port]/…` 出现）。使用者自己的本地文件的路径可以在里面，两处：本地的规则集、域名集或 `policy-path` 文件读不了时（`cannot read <路径>: …`），和 `does not load:` 后面接的那条错误说到一个本地文件时（比如本地 Profile 自己 include 的文件读不了）；读得到这个端点的人拿着 API key。
 
 | 文字 | 什么时候 |
 | --- | --- |
 | `http status N` | 服务端答了 200 与 304 以外的状态 N |
-| `timeout`、`connect: <原因>`、`tls: <原因>`、`too many redirects`、`body exceeds N bytes` | 下载本身失败；一份资源的正文至多 64 MiB |
+| `timeout`、`connect: <原因>`、`tls: <原因>`、`too many redirects`、`body exceeds N bytes`、`protocol: <原因>`、`invalid url: <原因>` | 下载本身失败；一份资源的正文至多 64 MiB。`protocol:` 是请求发出之后出的错——连接中途断了、应答不合 HTTP、正文读到一半断了——，或从 `https://` 被重定向到 `http://`（`protocol: refusing to redirect from https to http`）；`invalid url:` 是地址（重定向之后的也算）不是 `http(s)`（`invalid url: unsupported scheme`），或 HTTP 库读不成地址。除了括号里这两句固定的话，这两类冒号后面是 HTTP 库的话，rurge 不往里放链接 |
 | `does not load: <首个错误的文字>`，错误在下载到的文件里时接 ` (line N)`；`does not load: the local profile cannot be read (<io 错误的种类>)` | 托管 Profile 或远程 include 下载到的内容与本地 Profile 一起加载不了（常见的是一页登录页或报错页：缺 `FINAL`）。不采用，缓存里上一份照旧生效，日志是 WARN `downloaded resource not adopted` |
 | `the profile no longer refers to this address` | 下载到的内容属于一个 Profile 现在已经不提的地址 |
 | `lacks the section it is included into` | 远程 include 下载到的内容没有它被 include 进的那个节；通配命名节（`[Ruleset *]` 等）下，是写下来连一个节都没有的正文（一页登录页、空的正文） |
@@ -148,9 +148,9 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 | `offline mode: no cached copy` | `--no-network` 而缓存里没有这份资源；不发出任何请求 |
 | `the check of the downloaded copy did not finish` | 对下载到的内容的检查自己出了故障、没有做完；这次尝试按失败算，什么也不采用 |
 | `cannot read <路径>: <系统的错误文本>` | 本地文件——规则集、域名集或 `policy-path` 指的文件——读不了；路径是 rurge 去读的那一个 |
-| `the update has not finished`、`offline mode: the update cannot be attempted` | 只在托管 Profile 那一项：会话因 `strict` 被拒、而它自己没有失败的更新可说时，说被拒的原因——本次运行的第一次尝试结束之前，是等待结束时的原因或 `the update has not finished`；`--no-network` 时是后一句，那时从不尝试。它自己失败的更新排在前面 |
+| `the update has not finished`、`offline mode: the update cannot be attempted` | 只在带 `suspended` 的那一项托管 Profile 上：会话因 `strict` 被拒、而它自己没有失败的更新可说时，说被拒的原因——本次运行的第一次尝试结束之前，是等待结束时的原因或 `the update has not finished`；`--no-network` 时是后一句，那时从不尝试。它自己失败的更新排在前面 |
 
-更新成功之后至多一秒，这一项仍带 `suspended` 与原因，直到主循环的下一眼。
+更新成功之后至多一秒，这一项仍带 `suspended` 与原因，直到主循环的下一眼；反过来，一次重载去掉了那一行的 `strict` 之后的至多一秒里，会话仍被拒，而列表里没有一项带 `suspended`。
 
 **集合里没有用上的行。** `ruleset` 与 `domainset` 的项多三个数：`skipped`（既不是规则也不是名字的行，不在集合里；下载到的文本里点名本地文件的行也算）、`truncated`（超过一百万条上限的有效行，不在集合里）、`unknownParams`（带着不认识的参数的规则行：行在集合里，参数不在；域名集没有参数，恒为 0）。一行只算一类，行号从 1 起，注释行与空行也算行。它们是集合上一次编译所依据的内容的数：更新之后到集合轮到编译之前（同一代的集合一次编一个），仍是更新之前内容的数；没有编译过的集合是三个 0。一份有几行读不了的集合是载入了的，所以这三个数不让 `error` 出现。同样的数在日志里是 WARN `set loaded with lines that are not used`（启动之后载入的集合，三个数不全为零且与上一次载入的不同时才说），在诊断里是 `W0023`、`W0024` 与 `W0003`（兼容性清单 3.5 节）。
 
