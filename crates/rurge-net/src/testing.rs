@@ -11,7 +11,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::fmt::Debug;
 use std::net::SocketAddr;
@@ -206,18 +206,26 @@ pub fn seed_cache(root: &Path, url: &Url, data: &[u8], fetched_at: SystemTime) {
 #[derive(Clone, Default)]
 pub struct Lines(pub Arc<Mutex<Vec<String>>>);
 
+/// Routes the events of this thread to `subscriber` until the guard is
+/// dropped. While one dispatcher alone is registered, tracing-core asks only
+/// the thread that first reaches a call site whether it is wanted: a site
+/// another test reaches first would stay shut on this thread too. With a
+/// second one it asks every dispatcher, which the second element of the
+/// result is for: it is kept for as long as the guard.
+fn capture_events(
+    subscriber: impl tracing::Subscriber + Send + Sync + 'static,
+) -> (tracing::subscriber::DefaultGuard, tracing::Dispatch) {
+    (
+        tracing::subscriber::set_default(subscriber),
+        tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()),
+    )
+}
+
 impl Lines {
-    /// Routes the events of this thread here until the guard is dropped.
-    /// While one dispatcher alone is registered, tracing-core asks only the
-    /// thread that first reaches a call site whether it is wanted: a site
-    /// another test reaches first would stay shut on this thread too. With a
-    /// second one it asks every dispatcher, which the second element of the
-    /// result is for: it is kept for as long as the guard.
+    /// Routes the events of this thread here until the guard is dropped; the
+    /// second element is kept for as long as the first.
     pub fn capture(&self) -> (tracing::subscriber::DefaultGuard, tracing::Dispatch) {
-        (
-            tracing::subscriber::set_default(self.clone()),
-            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()),
-        )
+        capture_events(self.clone())
     }
 
     /// The lines that contain `what`.
@@ -261,6 +269,70 @@ impl tracing::Subscriber for Lines {
         let mut fields = Fields(String::new());
         event.record(&mut fields);
         self.0.lock().unwrap().push(fields.0);
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// The events of a test, down to DEBUG: the target and the fields of each,
+/// the message among them, as the text they were recorded as. For tests that
+/// pin an event's target and field names.
+#[derive(Clone, Default)]
+pub struct Events(Arc<Mutex<Vec<Event>>>);
+
+type Event = (String, BTreeMap<String, String>);
+
+impl Events {
+    /// Routes the events of this thread here until the guard is dropped; the
+    /// second element is kept for as long as the first.
+    pub fn capture(&self) -> (tracing::subscriber::DefaultGuard, tracing::Dispatch) {
+        capture_events(self.clone())
+    }
+
+    /// The fields of the events of `target`, in the order they came.
+    pub fn of(&self, target: &str) -> Vec<BTreeMap<String, String>> {
+        let events = self.0.lock().unwrap();
+        events
+            .iter()
+            .filter(|(of, _)| of == target)
+            .map(|(_, fields)| fields.clone())
+            .collect()
+    }
+}
+
+impl tracing::Subscriber for Events {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::DEBUG
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields(BTreeMap<String, String>);
+
+        impl tracing::field::Visit for Fields {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn Debug) {
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+
+        let mut fields = Fields(BTreeMap::new());
+        event.record(&mut fields);
+        let target = event.metadata().target().to_string();
+        self.0.lock().unwrap().push((target, fields.0));
     }
 
     fn enter(&self, _: &tracing::span::Id) {}

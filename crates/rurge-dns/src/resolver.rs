@@ -1212,6 +1212,7 @@ mod tests {
         BoxedDatagram, BoxedStream, ConnectOpts, DirectConnector, SystemResolve, Target,
     };
     use rurge_net::resource::ResourceOptions;
+    use rurge_net::testing::Events;
     use rurge_net::trail::Trail;
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
@@ -1379,73 +1380,17 @@ mod tests {
         s.parse().unwrap()
     }
 
-    /// What one thread logs, down to DEBUG: the target and the fields of
-    /// each event, the message among them, as the text they were recorded as.
-    #[derive(Clone, Default)]
-    struct Events(Arc<Mutex<Vec<Event>>>);
-
-    type Event = (String, BTreeMap<String, String>);
-
-    impl Events {
-        /// Routes the events of this thread here until the guard is dropped.
-        /// The second element is kept with it: while one dispatcher alone is
-        /// registered, tracing-core asks only the thread that first reaches a
-        /// call site whether it is wanted, and a site another test reaches
-        /// first would stay shut on this thread too.
-        fn capture(&self) -> (tracing::subscriber::DefaultGuard, tracing::Dispatch) {
-            (
-                tracing::subscriber::set_default(self.clone()),
-                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()),
-            )
-        }
-
-        /// The fields of the events of `target`, in the order they came.
-        fn of(&self, target: &str) -> Vec<BTreeMap<String, String>> {
-            let events = self.0.lock().unwrap();
-            events
-                .iter()
-                .filter(|(of, _)| of == target)
-                .map(|(_, fields)| fields.clone())
-                .collect()
-        }
-    }
-
-    impl tracing::Subscriber for Events {
-        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            *metadata.level() <= tracing::Level::DEBUG
-        }
-
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            struct Fields(BTreeMap<String, String>);
-
-            impl tracing::field::Visit for Fields {
-                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                    self.0.insert(field.name().to_string(), value.to_string());
-                }
-
-                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
-                    self.0
-                        .insert(field.name().to_string(), format!("{value:?}"));
-                }
-            }
-
-            let mut fields = Fields(BTreeMap::new());
-            event.record(&mut fields);
-            let target = event.metadata().target().to_string();
-            self.0.lock().unwrap().push((target, fields.0));
-        }
-
-        fn enter(&self, _: &tracing::span::Id) {}
-
-        fn exit(&self, _: &tracing::span::Id) {}
+    /// The events that lookups by the system resolver library leave: those of
+    /// this module that name the library as their upstream. What else the
+    /// resolver logs on the way to a lookup is not counted.
+    fn library_events(events: &Events) -> Vec<BTreeMap<String, String>> {
+        events
+            .of("rurge_dns::resolver")
+            .into_iter()
+            .filter(|fields| {
+                fields.get("upstream").map(String::as_str) == Some("system resolver library")
+            })
+            .collect()
     }
 
     /// A system whose resolver library never answers.
@@ -1954,7 +1899,7 @@ mod tests {
         .expect("the lookup ends by its own limit");
         assert_eq!(ended, Err(DnsError::Timeout));
         assert_eq!(began.elapsed(), fast().resend * fast().attempts);
-        let failed = events.of("rurge_dns::resolver");
+        let failed = library_events(&events);
         assert_eq!(failed.len(), 1, "{failed:?}");
         assert_eq!(
             (failed[0]["message"].as_str(), failed[0]["error"].as_str()),
@@ -1991,7 +1936,7 @@ mod tests {
         r.lookup("printer.local", LookupOpts::default())
             .await
             .unwrap();
-        let answered = events.of("rurge_dns::resolver");
+        let answered = library_events(&events);
         assert_eq!(answered.len(), 1, "{answered:?}");
         assert_eq!(fields(&answered[0]), "elapsed_ms,message,records,upstream");
         assert_eq!(answered[0]["message"], "answer");
@@ -2001,7 +1946,7 @@ mod tests {
         r.lookup("nobody.local", LookupOpts::default())
             .await
             .unwrap_err();
-        let both = events.of("rurge_dns::resolver");
+        let both = library_events(&events);
         assert_eq!(both.len(), 2, "{both:?}");
         assert_eq!(fields(&both[1]), "elapsed_ms,error,message,upstream");
         assert_eq!(both[1]["message"], "failed");
