@@ -1,10 +1,39 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+/// Where a `rurge` started by these tests finds its default data and
+/// configuration directories: under `target/`, not where the machine keeps its
+/// own, so that a start which ignores the directory it was given falls back to
+/// a scratch one and not to the machine's. `HOME` is left alone (the system's
+/// certificate store and other libraries read it), so on macOS, where the
+/// defaults come from it, a failing run is not kept away from the machine's own.
+fn default_directories() -> [(&'static str, std::path::PathBuf); 4] {
+    let scratch = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("default-directories");
+    [
+        ("LOCALAPPDATA", scratch.join("local-app-data")),
+        ("APPDATA", scratch.join("app-data")),
+        ("XDG_DATA_HOME", scratch.join("xdg-data")),
+        ("XDG_CONFIG_HOME", scratch.join("xdg-config")),
+    ]
+}
+
+/// `rurge` for a test that runs it to the end and looks at what it said.
+fn rurge_command() -> Command {
+    let mut cmd = Command::cargo_bin("rurge").unwrap();
+    cmd.envs(default_directories());
+    cmd
+}
+
+/// `rurge` for a test that starts it as a process of its own.
+fn rurge_process() -> std::process::Command {
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("rurge"));
+    cmd.envs(default_directories());
+    cmd
+}
+
 #[test]
 fn version_prints_crate_version() {
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .arg("version")
         .assert()
         .success()
@@ -33,8 +62,7 @@ fn help_names_a_credential_variable_and_leaves_its_value_out() {
             "https://download.example/asn?license_key=S3CR3T-asn",
         ),
     ] {
-        let out = Command::cargo_bin("rurge")
-            .unwrap()
+        let out = rurge_command()
             .args([command, "--help"])
             .env(variable, value)
             .output()
@@ -55,11 +83,7 @@ fn help_names_a_credential_variable_and_leaves_its_value_out() {
 /// to read, which the environment variable avoids.
 #[test]
 fn help_says_that_a_listen_option_replaces_every_address_of_its_kind() {
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
-        .args(["run", "--help"])
-        .output()
-        .unwrap();
+    let out = rurge_command().args(["run", "--help"]).output().unwrap();
     assert!(out.status.success());
     // clap wraps the text to the width of the terminal: read it as words
     let help = String::from_utf8_lossy(&out.stdout)
@@ -94,35 +118,30 @@ fn check_exit_codes() {
     let warning = write(&dir, "warning.conf", WARNING);
     let error = write(&dir, "error.conf", ERROR);
 
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(&valid)
         .assert()
         .success()
         .stdout(predicate::str::contains("0 error(s)"));
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(&warning)
         .assert()
         .success()
         .stdout(predicate::str::contains("W0001"));
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "--strict", "-c"])
         .arg(&warning)
         .assert()
         .code(1);
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(&error)
         .assert()
         .code(2)
         .stdout(predicate::str::contains("E0010"));
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c", "/no/such/file.conf"])
         .assert()
         .code(2)
@@ -139,8 +158,7 @@ fn check_says_what_to_do_about_a_problem() {
     let dir = tempfile::tempdir().unwrap();
     let said = |code: &str| format!("  hint: {}", rurge_config::codes::hint(code).unwrap());
     let stdout = |file: &str, extra: &[&str]| {
-        let out = Command::cargo_bin("rurge")
-            .unwrap()
+        let out = rurge_command()
             .args(["check", "-c"])
             .arg(file)
             .args(extra)
@@ -210,8 +228,7 @@ fn check_says_what_the_first_final_does_to_the_rest() {
         "finals.conf",
         "[Rule]\nFINAL,DIRECT\nDOMAIN,a.com,REJECT\nFINAL,REJECT\n",
     );
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "--data-dir"])
         .arg(dir.path().join("data"))
         .arg("-c")
@@ -254,8 +271,7 @@ fn bom_prefixed_config_is_accepted() {
         b"\xEF\xBB\xBF[General]\r\nloglevel = notify\r\n[Rule]\r\nFINAL,DIRECT\r\n",
     )
     .unwrap();
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(&p)
         .assert()
@@ -271,8 +287,7 @@ fn check_json_and_platform() {
         "p.conf",
         "[Rule]\nDOMAIN,a,REJECT #!MACOS-ONLY\nFINAL,DIRECT\n",
     );
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "--json", "--platform", "linux", "-c"])
         .arg(&conf)
         .assert()
@@ -290,8 +305,7 @@ fn check_json_and_platform() {
             .iter()
             .any(|d| d["code"] == "I0002")
     );
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "--json", "--platform", "macos", "-c"])
         .arg(&conf)
         .assert()
@@ -322,8 +336,7 @@ fn check_reads_the_line_tagged_for_the_platform_and_no_other() {
     );
     // the tagged lines are lines 2 to 6 of the file
     for (platform, own) in [("windows", 2), ("linux", 3), ("macos", 4)] {
-        let out = Command::cargo_bin("rurge")
-            .unwrap()
+        let out = rurge_command()
             .args(["check", "--json", "--platform", platform, "-c"])
             .arg(&conf)
             .assert()
@@ -357,8 +370,7 @@ fn check_reports_core_version_22() {
 #!REQUIREMENT CORE_VERSION>=22 Smart = smart, H, DIRECT\n\
 #!REQUIREMENT CORE_VERSION>=23 Later = smart, H, DIRECT\n[Rule]\nFINAL,Smart\n",
     );
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "--json", "-c"])
         .arg(&conf)
         .assert()
@@ -397,8 +409,7 @@ const NEEDS_A_SYSTEM_VERSION: &str = "[General]\n[Rule]\n\
 fn check_reads_the_system_version_from_the_operating_system() {
     let dir = tempfile::tempdir().unwrap();
     let conf = write(&dir, "system-version.conf", NEEDS_A_SYSTEM_VERSION);
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(&conf)
         .assert()
@@ -416,8 +427,7 @@ fn check_does_not_give_this_systems_version_to_another_platform() {
     let other = if cfg!(windows) { "linux" } else { "windows" };
     let dir = tempfile::tempdir().unwrap();
     let conf = write(&dir, "system-version.conf", NEEDS_A_SYSTEM_VERSION);
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "--platform", other, "-c"])
         .arg(&conf)
         .assert()
@@ -431,8 +441,7 @@ const BROKEN_P12: &str = "[General]\n[Proxy]\nUp = https, proxy.test, 443, clien
 #[test]
 fn check_knows_the_m1_protocols_and_runs_the_dry_build() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "proxies.conf", PROXIES))
         .assert()
@@ -451,8 +460,7 @@ fn check_knows_the_m1_protocols_and_runs_the_dry_build() {
         "{out}"
     );
 
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "broken.conf", BROKEN_P12))
         .assert()
@@ -471,8 +479,7 @@ N = subnet, default=H\n[Rule]\nFINAL,U\n";
 #[test]
 fn check_knows_the_automatic_groups() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "groups.conf", GROUPS))
         .assert()
@@ -495,8 +502,7 @@ const TROJAN_BAD_PATH: &str = "[General]\n[Proxy]\nT = trojan, proxy.test, 443, 
 #[test]
 fn check_knows_trojan() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "trojan.conf", TROJAN))
         .assert()
@@ -512,8 +518,7 @@ fn check_knows_trojan() {
         "{out}"
     );
 
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "bad.conf", TROJAN_BAD_PATH))
         .assert()
@@ -535,8 +540,7 @@ const VMESS_BAD_ID: &str = "[General]\n[Proxy]\nV = vmess, proxy.test, 443, user
 #[test]
 fn check_knows_vmess_and_anytls() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "m2b.conf", VMESS_ANYTLS))
         .assert()
@@ -561,8 +565,7 @@ fn check_knows_vmess_and_anytls() {
         "{out}"
     );
 
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "bad.conf", VMESS_BAD_ID))
         .assert()
@@ -583,8 +586,7 @@ const SSH_BAD_KEY: &str = "[General]\n[Proxy]\nS = ssh, proxy.test, 22, username
 #[test]
 fn check_knows_ssh() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "ssh.conf", SSH))
         .assert()
@@ -601,8 +603,7 @@ fn check_knows_ssh() {
     );
     assert!(!out.contains("s3same"), "{out}");
 
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "bad.conf", SSH_BAD_KEY))
         .assert()
@@ -628,8 +629,7 @@ peer = (public-key = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=, allowed-ips =
 #[test]
 fn check_knows_wireguard() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "wg.conf", WIREGUARD))
         .assert()
@@ -646,8 +646,7 @@ fn check_knows_wireguard() {
     );
     assert!(!out.contains("yAnz5TF"), "{out}");
 
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "bad.conf", WIREGUARD_BAD_KEY))
         .assert()
@@ -675,8 +674,7 @@ X = external, exec = /bin/x, local-port = 1080\nY = external, exec = /bin/y, loc
 #[test]
 fn check_knows_external() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "x.conf", EXTERNAL))
         .assert()
@@ -694,8 +692,7 @@ fn check_knows_external() {
     );
     assert!(!out.contains("hunter2"), "{out}");
 
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "same.conf", EXTERNAL_SAME_PORT))
         .assert()
@@ -727,8 +724,7 @@ K = ss, proxy.test, 8388, encrypt-method=2022-blake3-aes-128-gcm, password=c2Vjc
 #[test]
 fn check_knows_ss() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "ss.conf", SS))
         .assert()
@@ -755,8 +751,7 @@ fn check_knows_ss() {
     assert!(!out.contains("policy type `ss`"), "{out}");
     assert!(!out.contains("s3same") && !out.contains("MDEyMz"), "{out}");
 
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "gone.conf", SS_NOT_SUPPORTED))
         .assert()
@@ -775,8 +770,7 @@ fn check_knows_ss() {
     );
     assert!(!out.contains("s3same"), "{out}");
 
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "bad.conf", SS_BAD_KEY))
         .assert()
@@ -808,8 +802,7 @@ N = snell, proxy.test, 443, psk=s3cretPsk, version=7\n[Rule]\nFINAL,DIRECT\n";
 #[test]
 fn check_knows_snell() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "snell.conf", SNELL))
         .assert()
@@ -822,8 +815,7 @@ fn check_knows_snell() {
     assert!(out.contains("0 error(s), 0 warning(s)"), "{out}");
     assert!(!out.contains("s3cretPsk"), "{out}");
 
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "v6.conf", SNELL_V6))
         .assert()
@@ -842,8 +834,7 @@ fn check_knows_snell() {
     assert!(!out.contains("policy type `snell`"), "{out}");
     assert!(!out.contains("s3cretPsk"), "{out}");
 
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "bad.conf", SNELL_BAD_VERSION))
         .assert()
@@ -870,8 +861,7 @@ T = trust-tunnel, proxy.test, 443, username=bob\n[Rule]\nFINAL,DIRECT\n";
 #[test]
 fn check_knows_http2() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "http2.conf", HTTP2))
         .assert()
@@ -894,8 +884,7 @@ fn check_knows_http2() {
         "{out}"
     );
 
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "bad.conf", HTTP2_NO_PASSWORD))
         .assert()
@@ -923,8 +912,7 @@ E = socks5, proxy.test, 1080\n[Rule]\nFINAL,DIRECT\n";
 #[test]
 fn check_knows_hysteria2() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "hy2.conf", HYSTERIA2))
         .assert()
@@ -959,8 +947,7 @@ fn check_knows_hysteria2() {
         "{out}"
     );
 
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "bad.conf", HYSTERIA2_CHAINED))
         .assert()
@@ -993,8 +980,7 @@ E = socks5, proxy.test, 1080\n[Rule]\nFINAL,DIRECT\n";
 #[test]
 fn check_knows_tuic() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "tuic.conf", TUIC))
         .assert()
@@ -1040,8 +1026,7 @@ fn check_knows_tuic() {
         "{out}"
     );
 
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "bad.conf", TUIC_BROKEN))
         .assert()
@@ -1088,8 +1073,7 @@ E = socks5, proxy.test, 1080\n[Rule]\nFINAL,DIRECT\n";
 #[test]
 fn check_knows_masque() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "masque.conf", MASQUE))
         .assert()
@@ -1135,8 +1119,7 @@ fn check_knows_masque() {
         "{out}"
     );
 
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "-c"])
         .arg(write(&dir, "bad.conf", MASQUE_BROKEN))
         .assert()
@@ -1172,8 +1155,7 @@ fn check_assembles_the_subscriptions_it_has() {
     let dir = tempfile::tempdir().unwrap();
     write(&dir, "nodes.txt", "N1 = http, n1.test, 80\nnot a policy\n");
     let data = tempfile::tempdir().unwrap();
-    let out = Command::cargo_bin("rurge")
-        .unwrap()
+    let out = rurge_command()
         .args(["check", "--data-dir"])
         .arg(data.path())
         .arg("-c")
@@ -1208,8 +1190,7 @@ fn check_refuses_one_resource_as_two_kinds_of_set() {
         "kinds.conf",
         &format!("[Rule]\nRULE-SET,{url},DIRECT\nDOMAIN-SET,{url},REJECT\nFINAL,DIRECT\n"),
     );
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(&conf)
         .assert()
@@ -1224,8 +1205,7 @@ fn check_refuses_one_resource_as_two_kinds_of_set() {
         .stdout(predicate::str::contains("S3CR3T").not())
         .stdout(predicate::str::contains("sets.example").not());
     // the same resource in one role twice is fine
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(write(
             &dir,
@@ -1269,8 +1249,7 @@ fn check_reads_the_downloaded_copy_and_writes_nothing() {
         found
     };
     let before = tree(&data);
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(&pointer)
         .arg("--data-dir")
@@ -1282,8 +1261,7 @@ fn check_reads_the_downloaded_copy_and_writes_nothing() {
     // a directory that is not there is not made, and the pointer has nothing
     // to point at
     let nothing = dir.path().join("nothing");
-    Command::cargo_bin("rurge")
-        .unwrap()
+    rurge_command()
         .args(["check", "-c"])
         .arg(&pointer)
         .arg("--data-dir")
@@ -1295,6 +1273,7 @@ fn check_reads_the_downloaded_copy_and_writes_nothing() {
 }
 
 mod rule_match {
+    use super::rurge_command;
     use assert_cmd::Command;
     use predicates::prelude::*;
     use std::path::Path;
@@ -1322,7 +1301,7 @@ FINAL,DIRECT,dns-failed
     }
 
     fn rule_match(dir: &Path, extra: &[&str]) -> Command {
-        let mut cmd = Command::cargo_bin("rurge").unwrap();
+        let mut cmd = rurge_command();
         cmd.arg("rule")
             .arg("match")
             .arg("-c")
@@ -1348,7 +1327,7 @@ FINAL,DIRECT,dns-failed
     fn a_switchs_environment_variable_takes_the_usual_spellings() {
         let dir = workspace();
         let with = |value: &str| {
-            let mut cmd = Command::cargo_bin("rurge").unwrap();
+            let mut cmd = rurge_command();
             cmd.arg("rule")
                 .arg("match")
                 .arg("-c")
@@ -1401,8 +1380,7 @@ FINAL,DIRECT,dns-failed
         );
         let pointer = dir.path().join("managed.conf");
         std::fs::write(&pointer, format!("#!MANAGED-CONFIG {link}\n")).unwrap();
-        let out = Command::cargo_bin("rurge")
-            .unwrap()
+        let out = rurge_command()
             .arg("rule")
             .arg("match")
             .arg("-c")
@@ -1650,6 +1628,7 @@ FINAL,DIRECT
 }
 
 mod dns {
+    use super::rurge_command;
     use assert_cmd::Command;
     use rurge_dns::message::Qtype;
     use rurge_dns::testing::MockDns;
@@ -1664,7 +1643,7 @@ mod dns {
     }
 
     fn dns_cmd(dir: &Path, sub: &str, server: &str, extra: &[&str]) -> Command {
-        let mut cmd = Command::cargo_bin("rurge").unwrap();
+        let mut cmd = rurge_command();
         cmd.arg("dns")
             .arg(sub)
             .arg("-c")
@@ -2067,7 +2046,7 @@ encrypted-dns-skip-cert-verification = true",
             ),
         )
         .unwrap();
-        let mut cmd = Command::cargo_bin("rurge").unwrap();
+        let mut cmd = rurge_command();
         cmd.arg("rule")
             .arg("match")
             .arg("-c")
@@ -2086,6 +2065,7 @@ encrypted-dns-skip-cert-verification = true",
 }
 
 mod run {
+    use super::{rurge_command, rurge_process};
     use predicates::prelude::*;
     use rurge_net::testing::TestServer;
     use std::io::{BufRead, BufReader, Read, Write};
@@ -2127,7 +2107,7 @@ mod run {
     /// goes between the profile and the data directory: whether the start
     /// goes to the network at all, and where it would fetch GeoIP databases.
     fn rurge_run_with(conf: &Path, data: &Path, network: &[&str]) -> Command {
-        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("rurge"));
+        let mut cmd = rurge_process();
         cmd.arg("run")
             .arg("-c")
             .arg(conf)
@@ -3086,7 +3066,7 @@ loglevel = notify",
         let data = dir.path().join("data");
         let logs = dir.path().join("logs");
         std::fs::create_dir_all(&logs).unwrap();
-        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("rurge"));
+        let mut cmd = rurge_process();
         cmd.arg("run")
             .arg("-c")
             .arg(&conf)
@@ -3653,7 +3633,7 @@ loglevel = notify",
                 "[General]\n{API_GENERAL}\n[Proxy]\n\
 Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-network, args = --data-dir, args = {}, local-port = {inner_port}\n\
 [Rule]\nFINAL,Inner\n",
-                quoted(&assert_cmd::cargo::cargo_bin("rurge")),
+                quoted(Path::new(rurge_process().get_program())),
                 quoted(&inner),
                 quoted(&dir.path().join("inner-data")),
             ),
@@ -3717,7 +3697,7 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
     }
 
     fn rurge() -> assert_cmd::Command {
-        let mut cmd = assert_cmd::Command::cargo_bin("rurge").unwrap();
+        let mut cmd = rurge_command();
         cmd.env_remove("RURGE_API_KEY");
         cmd
     }
@@ -6724,13 +6704,14 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
 }
 
 mod service {
+    use super::rurge_command;
     use assert_cmd::Command;
     use predicates::prelude::*;
 
     /// `SUDO_UID` is removed: `service ... --user` refuses to run under sudo,
     /// and these dry runs must not depend on how the suite was started.
     fn rurge() -> Command {
-        let mut cmd = Command::cargo_bin("rurge").unwrap();
+        let mut cmd = rurge_command();
         cmd.env_remove("SUDO_UID");
         cmd
     }
