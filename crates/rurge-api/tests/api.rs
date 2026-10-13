@@ -1466,6 +1466,9 @@ async fn profile_check_takes_the_name_of_the_running_profile_and_no_other() {
     // the harness's profile is `t.conf`
     let (status, sound) = post(&api, CHECK, json!({})).await;
     assert_eq!(status, 200, "{sound}");
+    // what a body that is no name gets while the profile can be loaded
+    let (status, no_name) = post(&api, CHECK, json!([])).await;
+    assert_eq!(status, 400, "{no_name}");
     for body in [
         json!({ "other": 5 }),
         json!({ "name": "t.conf" }),
@@ -1500,11 +1503,14 @@ async fn profile_check_takes_the_name_of_the_running_profile_and_no_other() {
         post(&api, CHECK, json!({ "name": "S3CR3T-profile" })).await,
         (404, refused.clone())
     );
-    // Nothing is loaded for a name that is refused: the file is gone, which a
-    // load fails on, and which is a 500 for the name that is the profile's.
+    // Both refusals are shown to come before the load the same way: the file
+    // is gone, which a load fails on and which is a 500 for the name that is
+    // the profile's, and neither a name that is refused nor a body that is no
+    // name gets that far.
     std::fs::remove_file(&api.conf).unwrap();
     let (status, body) = post(&api, CHECK, json!({ "name": "t.conf" })).await;
     assert_eq!(status, 500, "{body}");
+    assert_eq!(post(&api, CHECK, json!([])).await, (400, no_name));
     let absolute = api.conf.display().to_string();
     for name in [
         "S3CR3T-profile",
@@ -1637,6 +1643,11 @@ async fn profile_check_does_not_look_at_the_content_type() {
 /// connection ends is not asserted (the 64 KiB over are within what is read
 /// away after the answer; a sender of much more can lose the answer, as it can
 /// at any endpoint that reads its body).
+///
+/// The request is written in two pieces, unlike the other hand-written clients
+/// here: no answer can be given before more than 2 MiB of the body were read,
+/// so the gap between the writes cannot lose one. The head goes first so that
+/// the reading half exists while the body is written.
 #[tokio::test]
 async fn profile_check_refuses_a_body_too_large_to_read_with_the_same_text() {
     let api = api().await;
