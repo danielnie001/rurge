@@ -491,6 +491,24 @@ DOMAIN-SET:https://al1ce:S3CR3T@sets.example/ok.txt = 1.2.3.4\n",
         );
     }
 
+    /// A key written the way a person types it: in mixed case, with `?` for
+    /// one character.
+    #[tokio::test]
+    async fn a_key_in_mixed_case_with_a_question_mark_is_read_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let (map, diags) = build(dir.path(), "cdn?.Example.com = 127.0.0.3\n");
+        assert!(diags.is_empty());
+        assert_eq!(map.rules_len(), 1);
+        assert_eq!(
+            map.lookup("cdn1.example.com").unwrap().action,
+            HostAction::Ips(vec![ip("127.0.0.3")])
+        );
+        assert!(
+            map.lookup("cdn12.example.com").is_none(),
+            "`?` is one character"
+        );
+    }
+
     #[tokio::test]
     async fn lookup_normalises_the_queried_name() {
         let dir = tempfile::tempdir().unwrap();
