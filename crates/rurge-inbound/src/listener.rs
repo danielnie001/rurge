@@ -255,6 +255,7 @@ pub(crate) async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rurge_net::testing::Lines;
     use std::net::Ipv4Addr;
     use tokio::io::AsyncReadExt;
 
@@ -349,39 +350,6 @@ mod tests {
         );
     }
 
-    /// The events a thread's logging says, one line of `field=value` pairs
-    /// each.
-    #[derive(Clone, Default)]
-    struct Said(Arc<Mutex<Vec<String>>>);
-
-    impl tracing::Subscriber for Said {
-        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            struct Line(String);
-            impl tracing::field::Visit for Line {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    self.0.push_str(&format!("{}={value:?} ", field.name()));
-                }
-            }
-            let mut line = Line(String::new());
-            event.record(&mut line);
-            self.0.lock().unwrap().push(line.0);
-        }
-        fn enter(&self, _: &tracing::span::Id) {}
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
-
     /// A listener that keeps to the LAN closes a connection from any other
     /// source without a word and says so in the log, naming the source; one
     /// that does not keep to it takes the same connection. Which sources are
@@ -389,8 +357,9 @@ mod tests {
     /// the loopback, the only place a test can connect from, cannot show.
     #[tokio::test]
     async fn a_listener_that_keeps_to_the_lan_closes_what_is_not_local_and_a_free_one_takes_it() {
-        let said = Said::default();
-        let _logging = tracing::subscriber::set_default(said.clone());
+        let lines = Lines::default();
+        // held across the awaits: the accept loops run on this thread
+        let _capturing = lines.capture();
         for (restrict_to_lan, taken) in [(true, false), (false, true)] {
             let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -423,12 +392,8 @@ mod tests {
                 assert!(sources.try_recv().is_err());
             }
         }
-        let said = said.0.lock().unwrap().clone();
-        let refused: Vec<&String> = said
-            .iter()
-            .filter(|line| line.contains("proxy-restricted-to-lan"))
-            .collect();
-        assert_eq!(refused.len(), 1, "{said:?}");
+        let refused = lines.said("proxy-restricted-to-lan");
+        assert_eq!(refused.len(), 1, "{:?}", lines.said(""));
         assert!(
             refused[0].contains("listener=\"test\"") && refused[0].contains("source=127.0.0.1"),
             "{}",
