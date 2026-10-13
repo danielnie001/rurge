@@ -1556,19 +1556,37 @@ fn validate(
     }
     let mut seen_rules: HashSet<&'static str> = HashSet::new();
     for r in &config.rules {
-        let t = r.kind.type_name();
-        if !opts.capabilities.rule_types.contains(t) && seen_rules.insert(t) {
-            diags.push(
-                Diagnostic::warning(
-                    codes::W_RULE_NEVER_MATCHES,
-                    format!(
-                        "`{t}` rules never match on {} in this version",
-                        opts.platform.system_name()
-                    ),
-                )
-                .at(r.span.clone()),
-            );
+        let mut types = Vec::new();
+        collect_rule_types(&r.kind, &mut types);
+        for t in types {
+            if !opts.capabilities.rule_types.contains(t) && seen_rules.insert(t) {
+                diags.push(
+                    Diagnostic::warning(
+                        codes::W_RULE_NEVER_MATCHES,
+                        format!(
+                            "`{t}` rules never match on {} in this version",
+                            opts.platform.system_name()
+                        ),
+                    )
+                    .at(r.span.clone()),
+                );
+            }
         }
+    }
+}
+
+/// The type of `kind` and of the sub-rules of a logical rule, however deep,
+/// in the order they are written.
+fn collect_rule_types(kind: &RuleKind, out: &mut Vec<&'static str>) {
+    out.push(kind.type_name());
+    match kind {
+        RuleKind::And(subs) | RuleKind::Or(subs) => {
+            for sub in subs {
+                collect_rule_types(&sub.kind, out);
+            }
+        }
+        RuleKind::Not(sub) => collect_rule_types(&sub.kind, out),
+        _ => {}
     }
 }
 
@@ -2655,6 +2673,59 @@ New = ss, 127.0.0.1, 8388, encrypt-method=aes-256-gcm, password=s3cret\n\
             1
         );
         assert!(!l.diagnostics.has_errors());
+    }
+
+    /// A rule type this version cannot match (`W0013`) is looked for inside
+    /// the logical rules too, however deep: it is said at the line of the rule
+    /// that holds it, once per type for the whole profile.
+    #[test]
+    fn rule_types_that_never_match_are_reported_inside_logical_rules() {
+        let never = |rules: &str| {
+            let mut opts = LoadOptions::for_tests();
+            opts.capabilities.rule_types.remove("PROCESS-NAME");
+            opts.capabilities.rule_types.remove("SCRIPT");
+            let l = from_text(
+                &format!("[Proxy]\nP = http, p.test, 80\n[Rule]\n{rules}\nFINAL,DIRECT\n"),
+                Path::new("/p/t.conf"),
+                &opts,
+            );
+            assert!(
+                !l.diagnostics.has_errors(),
+                "{rules}: {:?}",
+                l.diagnostics
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+            );
+            l.diagnostics
+                .iter()
+                .filter(|d| d.code == codes::W_RULE_NEVER_MATCHES)
+                .map(|d| (d.span.as_ref().map_or(0, |s| s.line), d.message.clone()))
+                .collect::<Vec<_>>()
+        };
+        let said =
+            |rule_type: &str| format!("`{rule_type}` rules never match on Linux in this version");
+        // the first rule is at line 4
+        assert_eq!(
+            never("AND,((PROCESS-NAME,x),(DEST-PORT,443)),P"),
+            [(4, said("PROCESS-NAME"))]
+        );
+        assert_eq!(never("NOT,((SCRIPT,s)),P"), [(4, said("SCRIPT"))]);
+        assert_eq!(
+            never("OR,((AND,((PROCESS-NAME,x),(DEST-PORT,1))),(DOMAIN,a.test)),P"),
+            [(4, said("PROCESS-NAME"))]
+        );
+        // a type that was said once is not said again, whichever comes first
+        assert_eq!(
+            never("PROCESS-NAME,x,P\nAND,((PROCESS-NAME,y),(DEST-PORT,1)),P"),
+            [(4, said("PROCESS-NAME"))]
+        );
+        assert_eq!(
+            never("AND,((PROCESS-NAME,x),(DEST-PORT,1)),P\nPROCESS-NAME,y,P"),
+            [(4, said("PROCESS-NAME"))]
+        );
+        // the types that can be matched are not said
+        assert_eq!(never("AND,((DEST-PORT,443),(DOMAIN,a.test)),P"), []);
     }
 
     #[test]
