@@ -571,6 +571,52 @@ async fn a_new_include_that_was_never_downloaded_is_waited_for() {
     );
 }
 
+/// The same under a wildcard section, for a text that hands its sections over
+/// to a file of their own: the new version is a wildcard section and an
+/// include, and has no section left once that is expanded with nothing to
+/// take in. It is a version that waits for what it refers to, not a body that
+/// is no profile: refused for a lack, the file would never be asked for and
+/// the version never taken.
+#[tokio::test]
+async fn a_text_of_wildcard_sections_alone_waits_for_the_file_it_includes() {
+    let w = World::new().await;
+    w.write(&format!(
+        "[Ruleset *]\n#!include {}\n[Rule]\nRULE-SET,Streaming,DIRECT\nFINAL,DIRECT\n",
+        w.url("/sets")
+    ));
+    let sets = "[Ruleset Streaming]\nDOMAIN-SUFFIX,netflix.com\n";
+    w.seed("/sets", sets, ago(HOUR));
+    let sources = w.sources(false);
+    sources.track(&w.load());
+    let handed_over = format!("[Ruleset *]\n#!include {}\n", w.url("/streaming"));
+    w.server.set("/sets", handed_over.clone());
+    w.server.set("/streaming", sets);
+    w.server.set_delay("/streaming", Duration::from_millis(800));
+    let reason = update(&sources, &w, "/sets")
+        .await
+        .expect_err("it waits for the file");
+    assert_eq!(reason, WAITING);
+    // the file is followed from now on, after the sources of the profile
+    let keys: Vec<_> = sources.statuses().into_iter().map(|s| s.key).collect();
+    assert_eq!(keys, [w.key("/sets"), w.key("/streaming")]);
+    // until it is here the text is the old version
+    assert!(reads(&sources, &w, "/sets", sets));
+    wait_until("both files", || {
+        reads(&sources, &w, "/sets", &handed_over) && reads(&sources, &w, "/streaming", sets)
+    })
+    .await;
+    reported_once(&sources).await;
+    let now = loaded(&w, &sources);
+    assert!(!now.diagnostics.has_errors(), "{}", said(&now));
+    let names: Vec<_> = now
+        .config
+        .rulesets
+        .iter()
+        .map(|set| set.name.clone())
+        .collect();
+    assert_eq!(names, ["Streaming"]);
+}
+
 /// A file that cannot be downloaded holds nothing back for long: the version
 /// is taken the next time its source is asked, and the line is not expanded.
 #[tokio::test]

@@ -64,6 +64,10 @@ struct Included {
     /// Where the text stands among the remote files the expansion has come
     /// across, when it is a downloaded one.
     tracked: Option<usize>,
+    /// Whether the text, as it was written, has no section at all. Its own
+    /// includes are expanded by now, which took its wildcard sections away:
+    /// the sections it is left with do not say.
+    sectionless: bool,
 }
 
 /// The remote files one expansion has come across.
@@ -167,9 +171,12 @@ impl Expansion<'_> {
                         // taking it would drop every section the include
                         // brought. A text that has sections, none of the
                         // kind, is a profile without sections of that kind:
-                        // that is no lack.
+                        // that is no lack. Nor is a text whose sections are
+                        // wildcard sections that took nothing in: the file it
+                        // includes may not be downloaded yet, and is only
+                        // asked for when the text is not refused.
                         if let Some(at) = included.tracked
-                            && included.profile.sections.is_empty()
+                            && included.sectionless
                         {
                             self.diags.push(
                                 Diagnostic::warning(
@@ -328,6 +335,7 @@ impl Expansion<'_> {
         let file: Arc<Path> = Arc::from(path.as_path());
         let (mut profile, sub_diags) = parse_str(&text, file.clone(), Origin::Include(file));
         self.diags.extend(sub_diags);
+        let sectionless = profile.sections.is_empty();
         self.stack.push(key);
         self.expand(&mut profile, depth + 1);
         self.stack.pop();
@@ -335,6 +343,7 @@ impl Expansion<'_> {
             profile,
             file: path,
             tracked: None,
+            sectionless,
         })
     }
 
@@ -394,6 +403,7 @@ impl Expansion<'_> {
         let interval = parse_managed(&profile.header, &mut Diagnostics::default())
             .map_or(DEFAULT_INTERVAL, |managed| managed.interval);
         let at = self.remotes.track(&url, Some(path.clone()), interval);
+        let sectionless = profile.sections.is_empty();
         self.stack.push(key);
         self.expand(&mut profile, depth + 1);
         self.stack.pop();
@@ -401,6 +411,7 @@ impl Expansion<'_> {
             profile,
             file: path,
             tracked: Some(at),
+            sectionless,
         })
     }
 }
@@ -1451,6 +1462,93 @@ FINAL,DIRECT
         );
         let seen: Vec<&str> = d.iter().map(|x| x.code).collect();
         assert_eq!(seen, [codes::W_LINE_OUTSIDE_SECTION; 3]);
+    }
+
+    /// A downloaded text whose own sections are wildcard sections has
+    /// sections: what they hold comes from the files they include, and
+    /// expanding them takes the wildcard sections themselves away. That its
+    /// includes brought nothing is no lack of the text. Flagged, a version
+    /// that hands its sections over to a file nobody has downloaded would be
+    /// refused before that file was ever asked for.
+    #[test]
+    fn a_downloaded_text_of_wildcard_sections_alone_is_not_flagged() {
+        let outer = "https://example.com/outer.conf";
+        let inner = "https://example.com/inner.conf";
+        let main = format!("[Ruleset *]\n#!include {outer}\n[Rule]\nFINAL,DIRECT\n");
+        let handed_over = format!("[Ruleset *]\n#!include {inner}\n");
+        let lacks = |remote: &[RemoteRef]| -> Vec<(String, bool)> {
+            remote
+                .iter()
+                .map(|r| (r.url.path().to_string(), r.lacks_section))
+                .collect()
+        };
+        let neither = [
+            ("/outer.conf".to_string(), false),
+            ("/inner.conf".to_string(), false),
+        ];
+
+        // the file it includes is not downloaded yet: that is all that is said
+        let fake = Fake::new().text(outer, &handed_over).missing(inner, None);
+        let (p, d, remote) = expand_text(&main, Some(&fake));
+        assert_eq!(
+            told(&d),
+            [(
+                codes::W_RESOURCE_UNAVAILABLE,
+                "remote include not downloaded yet",
+                Some(2)
+            )]
+        );
+        assert!(p.sections_with_prefix("Ruleset ").next().is_none());
+        assert_eq!(lacks(&remote), neither);
+
+        // it is there and has no section of the kind: as for any text
+        let fake = Fake::new()
+            .text(outer, &handed_over)
+            .text(inner, "[General]\nipv6 = true\n");
+        let (p, d, remote) = expand_text(&main, Some(&fake));
+        assert!(d.is_empty(), "{:?}", d.into_vec());
+        assert!(p.sections_with_prefix("Ruleset ").next().is_none());
+        assert_eq!(lacks(&remote), neither);
+
+        // it has one: the section comes through both
+        let fake = Fake::new()
+            .text(outer, &handed_over)
+            .text(inner, "[Ruleset Streaming]\nDOMAIN-SUFFIX,netflix.com\n");
+        let (p, d, remote) = expand_text(&main, Some(&fake));
+        assert!(d.is_empty(), "{:?}", d.into_vec());
+        assert_eq!(raws(&p, "Ruleset Streaming"), ["DOMAIN-SUFFIX,netflix.com"]);
+        assert_eq!(lacks(&remote), neither);
+
+        // a page where that file is meant to be is flagged, at the line that
+        // names it; the text that names it is not
+        let fake = Fake::new()
+            .text(outer, &handed_over)
+            .text(inner, "<html>\n</html>\n");
+        let (_, d, remote) = expand_text(&main, Some(&fake));
+        let page = fake.path_of(inner);
+        let flagged: Vec<_> = d
+            .iter()
+            .filter(|x| x.code == codes::W_INCLUDE_SECTION_MISSING)
+            .map(|x| {
+                let span = x.span.as_ref().expect("a position");
+                (x.message.clone(), span.file.to_path_buf(), span.line)
+            })
+            .collect();
+        assert_eq!(
+            flagged,
+            [(
+                format!("`{}` has no section", page.display()),
+                fake.path_of(outer),
+                2
+            )]
+        );
+        assert_eq!(
+            lacks(&remote),
+            [
+                ("/outer.conf".to_string(), false),
+                ("/inner.conf".to_string(), true)
+            ]
+        );
     }
 
     /// A line that is wrong in a downloaded text is reported in the file the
