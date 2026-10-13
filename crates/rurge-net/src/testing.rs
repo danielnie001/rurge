@@ -222,8 +222,9 @@ fn capture_events(
 }
 
 impl Lines {
-    /// Routes the events of this thread here until the guard is dropped; the
-    /// second element is kept for as long as the first.
+    /// Routes the events of this thread here until the guard, the first
+    /// element, is dropped; the second, a dispatcher that records nothing, is
+    /// kept for as long as the first.
     pub fn capture(&self) -> (tracing::subscriber::DefaultGuard, tracing::Dispatch) {
         capture_events(self.clone())
     }
@@ -285,8 +286,9 @@ pub struct Events(Arc<Mutex<Vec<Event>>>);
 type Event = (String, BTreeMap<String, String>);
 
 impl Events {
-    /// Routes the events of this thread here until the guard is dropped; the
-    /// second element is kept for as long as the first.
+    /// Routes the events of this thread here until the guard, the first
+    /// element, is dropped; the second, a dispatcher that records nothing, is
+    /// kept for as long as the first.
     pub fn capture(&self) -> (tracing::subscriber::DefaultGuard, tracing::Dispatch) {
         capture_events(self.clone())
     }
