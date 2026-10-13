@@ -82,9 +82,16 @@ async fn a_policy_path_is_a_policy_group_resource() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("nodes.txt"), "N1 = http, n1.test, 80\n").unwrap();
     let dns = MockDns::spawn().await;
+    // an address of this test's own: nothing is served there, and an engine
+    // that asked would reach no one else
+    let held = TestServer::spawn().await;
+    let groups = format!(
+        "Local = select, policy-path=nodes.txt\n\
+Remote = select, policy-path={}",
+        held.url("/nodes?token=t0k3n")
+    );
     let text = Profile {
-        groups: "Local = select, policy-path=nodes.txt\n\
-Remote = select, policy-path=https://sub.example/nodes?token=t0k3n",
+        groups: &groups,
         ..Profile::default()
     }
     .text(dns.addr());

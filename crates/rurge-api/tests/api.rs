@@ -1993,7 +1993,10 @@ async fn external_resources_say_how_many_lines_of_a_set_were_not_used() {
     const RULES: &str = "# list\nDOMAIN,a.test\nnot a rule\nFINAL,DIRECT\nDOMAIN,b.test,bogus\nIP-CIDR,10.0.0.0/8,no-resolv\n";
     // `bad domain` and `*.wild.test` are no names
     const NAMES: &str = ".a.test\nbad domain\n*.wild.test\nb.test\n";
-    let url_of = |path: &str| url::Url::parse(&format!("http://sets.example{path}")).unwrap();
+    // an address of this test's own: nothing is served there, and an engine
+    // that asked would reach no one else
+    let held = TestServer::spawn().await;
+    let url_of = |path: &str| held.url(path);
     let (rules, clean, names) = (
         url_of("/rules.list"),
         url_of("/clean.list"),

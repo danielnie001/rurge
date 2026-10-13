@@ -1556,7 +1556,23 @@ async fn follow_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::{DirectConnector, SystemResolve};
+    use crate::BoxFuture;
+    use crate::connector::{DirectConnector, Resolve};
+    use std::net::IpAddr;
+
+    /// Refuses every name: a test here downloads from a `TestServer` by its
+    /// address, so a name that is asked for would take it off the loopback.
+    struct NoNames;
+
+    impl Resolve for NoNames {
+        fn resolve<'a>(&'a self, host: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+            Box::pin(async move {
+                Err(io::Error::other(format!(
+                    "a test tried to resolve the name {host}"
+                )))
+            })
+        }
+    }
 
     /// A resource's URL often carries a token, and its body the credentials
     /// of a subscription's nodes: a `Debug` shows where the URL goes and how
@@ -1627,7 +1643,7 @@ mod tests {
     }
 
     fn manager(root: &Path, opts: ResourceOptions) -> Arc<ResourceManager> {
-        let connector = Arc::new(DirectConnector::new(Arc::new(SystemResolve)));
+        let connector = Arc::new(DirectConnector::new(Arc::new(NoNames)));
         let client = Arc::new(HttpClient::new(connector, HttpClientConfig::default()).unwrap());
         ResourceManager::with_options(root.to_path_buf(), client, opts)
     }
