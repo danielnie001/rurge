@@ -221,6 +221,20 @@ impl Drop for Inflight<'_> {
     }
 }
 
+/// What a query does with an AAAA answer that timed out, for AAAA
+/// suppression. What is counted is lookups (manual, DNS Overview: "5
+/// consecutive lookups receive an A answer while the AAAA answer times out"),
+/// and a lookup can take two queries: its own, and the background one that
+/// asks again for the AAAA answer it did not wait for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AaaaTimeout {
+    /// The query is the only one made for its lookup, so its timeout is the
+    /// lookup's.
+    Count,
+    /// The lookup has counted its own timeout; asking again is no new lookup.
+    Ignore,
+}
+
 /// What the lookups through one `Via` ask (`dns-follow-interface`, phase 2
 /// M5 design 8.5): the plain servers, through its connector, with answers of
 /// their own.
@@ -738,7 +752,7 @@ impl Resolver {
                     return Ok(from_cached(&a, Source::Cache { stale: false }, started));
                 }
                 Some(CacheHit::Stale(a)) if a.v6_queried || !want_v6 => {
-                    self.spawn_refresh(current.clone(), want_v6);
+                    self.spawn_refresh(current.clone(), want_v6, AaaaTimeout::Count);
                     return Ok(from_cached(&a, Source::Cache { stale: true }, started));
                 }
                 Some(CacheHit::Negative) => return Err(DnsError::EmptyAnswer),
@@ -755,7 +769,7 @@ impl Resolver {
         let result = self
             .query_coalesced(&primary, &current, want_v6, &opts)
             .await;
-        self.record(&current, &result, want_v6);
+        self.record(&current, &result, want_v6, AaaaTimeout::Count);
         // Design §7.3: when the resend tick completed the query with A in hand
         // and AAAA still pending, the late AAAA answer must still reach the
         // cache. The fanout has already aborted that query, so the completion
@@ -767,7 +781,7 @@ impl Resolver {
             && a.partial
             && a.aaaa_timed_out
         {
-            self.spawn_refresh(current.clone(), want_v6);
+            self.spawn_refresh(current.clone(), want_v6, AaaaTimeout::Ignore);
         }
         let answers = result?;
         Ok(from_answers(
@@ -784,19 +798,27 @@ impl Resolver {
     }
 
     /// Stores the outcome in the cache and feeds AAAA suppression.
-    fn record(&self, name: &str, result: &Result<Answers, DnsError>, want_v6: bool) {
+    fn record(
+        &self,
+        name: &str,
+        result: &Result<Answers, DnsError>,
+        want_v6: bool,
+        timeout: AaaaTimeout,
+    ) {
         match result {
             Ok(a) => {
                 self.cache.put(name, cached_from(a, want_v6));
                 if want_v6 {
                     if a.aaaa_timed_out {
-                        let n = self.aaaa_failures.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n >= AAAA_SUPPRESS_AFTER
-                            && !self.aaaa_suppressed.swap(true, Ordering::Relaxed)
-                        {
-                            tracing::warn!(
-                                "AAAA answers timed out {n} times in a row; AAAA queries suppressed until the next flush or network change"
-                            );
+                        if timeout == AaaaTimeout::Count {
+                            let n = self.aaaa_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n >= AAAA_SUPPRESS_AFTER
+                                && !self.aaaa_suppressed.swap(true, Ordering::Relaxed)
+                            {
+                                tracing::warn!(
+                                    "AAAA answers timed out in {n} lookups in a row; AAAA queries suppressed until the next flush or network change"
+                                );
+                            }
                         }
                     } else {
                         self.aaaa_failures.store(0, Ordering::Relaxed);
@@ -808,7 +830,7 @@ impl Resolver {
         }
     }
 
-    fn spawn_refresh(&self, name: String, want_v6: bool) {
+    fn spawn_refresh(&self, name: String, want_v6: bool, timeout: AaaaTimeout) {
         if !self.cache.begin_refresh(&name) {
             return;
         }
@@ -822,7 +844,7 @@ impl Resolver {
                 .query_coalesced(&primary, &name, want_v6, &LookupOpts::default())
                 .await;
             match &result {
-                Ok(_) | Err(DnsError::EmptyAnswer) => me.record(&name, &result, want_v6),
+                Ok(_) | Err(DnsError::EmptyAnswer) => me.record(&name, &result, want_v6, timeout),
                 Err(_) => me.cache.end_refresh(&name),
             }
         });
@@ -2241,15 +2263,37 @@ mod tests {
         );
     }
 
-    /// How the resolver counts the timeouts that turn AAAA off. A lookup
-    /// that ends with A answered and AAAA timed out counts one, and so does
-    /// the background completion that asks again for the AAAA answer the
-    /// lookup did not wait for, when that times out too. Names asked one
-    /// after another, each completion over before the next name: the first
-    /// two names count two each, the third name's lookup is the fifth — it,
-    /// not the fifth name's, turns AAAA off — and its completion makes six.
+    /// A resolver that asks for AAAA and puts its questions to `mock` in
+    /// memory, for the tests of what turns AAAA off.
+    fn resolver_asking_aaaa(e: &Env, mock: &MockDns) -> Arc<Resolver> {
+        let sys = StaticSystemDns {
+            has_ipv6: true,
+            ..StaticSystemDns::default()
+        };
+        resolver_in_memory(e, mock, sys)
+    }
+
+    /// `name` looked up, then a pause longer than a fanout lasts (300 ms):
+    /// the background query that completes the lookup is over when this
+    /// returns.
+    async fn lookup_and_complete(r: &Resolver, name: &str) -> DnsResult {
+        let res = r.lookup(name, LookupOpts::default()).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        res
+    }
+
+    /// How the resolver counts what turns AAAA off (manual, DNS Overview: "If
+    /// 5 consecutive lookups receive an A answer while the AAAA answer times
+    /// out, Surge concludes that the upstream servers never return AAAA
+    /// answers on the current network and stops sending AAAA questions").
+    /// A lookup counts once, however many queries it takes: the background
+    /// query that asks again for the AAAA answer the lookup did not wait for
+    /// counts no second timeout. Names asked one after another, each
+    /// completion over before the next name: the fifth name's lookup turns
+    /// AAAA off, none before it, and the sixth name is not asked for AAAA.
+    /// A flush turns it on again.
     #[tokio::test(start_paused = true)]
-    async fn aaaa_suppression_after_five_timeouts_and_flush_resumes() {
+    async fn aaaa_is_turned_off_by_the_fifth_lookup_in_a_row_and_a_flush_turns_it_on() {
         let mock = MockDns::spawn().await;
         for i in 0..7 {
             mock.set(&format!("h{i}.test"), &["10.0.0.1"], &["fd00::1"], 60);
@@ -2259,27 +2303,25 @@ mod tests {
             &format!("dns-server = {}\nipv6 = true", mock.addr()),
             "",
         ));
-        let sys = StaticSystemDns {
-            has_ipv6: true,
-            ..StaticSystemDns::default()
-        };
-        let r = resolver_in_memory(&e, &mock, sys);
+        let r = resolver_asking_aaaa(&e, &mock);
         for i in 0..5 {
-            let res = r
-                .lookup(&format!("h{i}.test"), LookupOpts::default())
-                .await
-                .unwrap();
+            let name = format!("h{i}.test");
+            let res = r.lookup(&name, LookupOpts::default()).await.unwrap();
             assert_eq!(res.v4.len(), 1);
             assert!(res.v6.is_empty());
-            // Counted so far: h0 one, h1 three, h2 five; none after that.
-            assert_eq!(r.aaaa_suppressed(), i >= 2, "h{i}: when its lookup is over");
+            // One counted per name so far: the fifth is the first to turn it off.
+            assert_eq!(r.aaaa_suppressed(), i >= 4, "h{i}: when its lookup is over");
             // Longer than a fanout lasts (300 ms): its completion is over too.
             tokio::time::sleep(Duration::from_secs(1)).await;
-            // Counted so far: h0 two, h1 four, h2 six; none after that.
             assert_eq!(
                 r.aaaa_suppressed(),
-                i >= 2,
+                i >= 4,
                 "h{i}: when its completion is over"
+            );
+            assert_eq!(
+                mock.query_count(&name, Qtype::Aaaa),
+                2,
+                "h{i}: the lookup asked, and its completion asked again"
             );
         }
         assert!(r.aaaa_suppressed());
@@ -2295,6 +2337,183 @@ mod tests {
         let res = r.lookup("h6.test", LookupOpts::default()).await.unwrap();
         assert_eq!(res.v6.len(), 1);
         assert_eq!(mock.query_count("h6.test", Qtype::Aaaa), 1);
+    }
+
+    /// Lookups that are under way together count as lookups one after another
+    /// do: five of them turn AAAA off, four do not, whatever the background
+    /// queries that follow them do.
+    #[tokio::test(start_paused = true)]
+    async fn aaaa_is_turned_off_by_five_lookups_at_once_and_not_by_four() {
+        let mock = MockDns::spawn().await;
+        for i in 0..5 {
+            mock.set(&format!("h{i}.test"), &["10.0.0.1"], &["fd00::1"], 60);
+        }
+        mock.set_drop_qtype(Qtype::Aaaa, true);
+        let e = env(&profile(
+            &format!("dns-server = {}\nipv6 = true", mock.addr()),
+            "",
+        ));
+
+        let four = resolver_asking_aaaa(&e, &mock);
+        let answered = tokio::join!(
+            four.lookup("h0.test", LookupOpts::default()),
+            four.lookup("h1.test", LookupOpts::default()),
+            four.lookup("h2.test", LookupOpts::default()),
+            four.lookup("h3.test", LookupOpts::default()),
+        );
+        for res in [answered.0, answered.1, answered.2, answered.3] {
+            let res = res.unwrap();
+            assert_eq!(res.v4.len(), 1);
+            assert!(res.v6.is_empty());
+        }
+        assert!(!four.aaaa_suppressed(), "four lookups are four");
+        // Longer than a fanout lasts (300 ms): their completions are over.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            mock.query_count("h3.test", Qtype::Aaaa),
+            2,
+            "the completion of a lookup asked again"
+        );
+        assert!(
+            !four.aaaa_suppressed(),
+            "four lookups are four, their completions included"
+        );
+
+        let five = resolver_asking_aaaa(&e, &mock);
+        let answered = tokio::join!(
+            five.lookup("h0.test", LookupOpts::default()),
+            five.lookup("h1.test", LookupOpts::default()),
+            five.lookup("h2.test", LookupOpts::default()),
+            five.lookup("h3.test", LookupOpts::default()),
+            five.lookup("h4.test", LookupOpts::default()),
+        );
+        for res in [answered.0, answered.1, answered.2, answered.3, answered.4] {
+            let res = res.unwrap();
+            assert_eq!(res.v4.len(), 1);
+            assert!(res.v6.is_empty());
+        }
+        assert!(five.aaaa_suppressed(), "five lookups are five");
+    }
+
+    /// A lookup that gets its AAAA answer shows that the servers do answer
+    /// AAAA: the lookups in a row are counted from the start again.
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_with_an_aaaa_answer_starts_the_count_again() {
+        let mock = MockDns::spawn().await;
+        for i in 0..9 {
+            mock.set(&format!("h{i}.test"), &["10.0.0.1"], &["fd00::1"], 60);
+        }
+        mock.set_drop_qtype(Qtype::Aaaa, true);
+        let e = env(&profile(
+            &format!("dns-server = {}\nipv6 = true", mock.addr()),
+            "",
+        ));
+        let r = resolver_asking_aaaa(&e, &mock);
+        for i in 0..3 {
+            lookup_and_complete(&r, &format!("h{i}.test")).await;
+        }
+        assert!(!r.aaaa_suppressed(), "three in a row");
+
+        // This one's AAAA answer arrives.
+        mock.set_drop_qtype(Qtype::Aaaa, false);
+        let answered = lookup_and_complete(&r, "h3.test").await;
+        assert_eq!(answered.v6, vec!["fd00::1".parse::<Ipv6Addr>().unwrap()]);
+        mock.set_drop_qtype(Qtype::Aaaa, true);
+
+        for i in 4..8 {
+            lookup_and_complete(&r, &format!("h{i}.test")).await;
+            assert!(
+                !r.aaaa_suppressed(),
+                "h{i}: {} in a row since the AAAA answer",
+                i - 3
+            );
+        }
+        lookup_and_complete(&r, "h8.test").await;
+        assert!(
+            r.aaaa_suppressed(),
+            "the fifth in a row since the AAAA answer"
+        );
+    }
+
+    /// The background query that asks again counts no timeout, but when the
+    /// AAAA answer comes in it, that shows that the servers do answer AAAA
+    /// as well as an answer to a lookup does: the count starts again.
+    #[tokio::test(start_paused = true)]
+    async fn the_aaaa_answer_of_a_completion_starts_the_count_again() {
+        let mock = MockDns::spawn().await;
+        for i in 0..9 {
+            mock.set(&format!("h{i}.test"), &["10.0.0.1"], &["fd00::1"], 60);
+        }
+        mock.set_drop_qtype(Qtype::Aaaa, true);
+        let e = env(&profile(
+            &format!("dns-server = {}\nipv6 = true", mock.addr()),
+            "",
+        ));
+        let r = resolver_asking_aaaa(&e, &mock);
+        for i in 0..3 {
+            lookup_and_complete(&r, &format!("h{i}.test")).await;
+        }
+
+        // The fourth lookup times out, and the servers answer by the time
+        // its completion asks again. The completion has been spawned but
+        // cannot run before the next await point.
+        let first = r.lookup("h3.test", LookupOpts::default()).await.unwrap();
+        assert!(first.v6.is_empty(), "AAAA had not arrived yet");
+        mock.set_drop_qtype(Qtype::Aaaa, false);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let completed = r.lookup("h3.test", LookupOpts::default()).await.unwrap();
+        assert_eq!(completed.source, Source::Cache { stale: false });
+        assert_eq!(completed.v6, vec!["fd00::1".parse::<Ipv6Addr>().unwrap()]);
+        mock.set_drop_qtype(Qtype::Aaaa, true);
+
+        for i in 4..8 {
+            lookup_and_complete(&r, &format!("h{i}.test")).await;
+            assert!(
+                !r.aaaa_suppressed(),
+                "h{i}: {} in a row since the AAAA answer",
+                i - 3
+            );
+        }
+        lookup_and_complete(&r, "h8.test").await;
+        assert!(
+            r.aaaa_suppressed(),
+            "the fifth in a row since the AAAA answer"
+        );
+    }
+
+    /// The refresh of a stale cache entry is the only query made for its
+    /// lookup, so it counts its AAAA timeout: five of them turn AAAA off.
+    #[tokio::test(start_paused = true)]
+    async fn the_refresh_of_a_stale_entry_counts_its_aaaa_timeout() {
+        let mock = MockDns::spawn().await;
+        for i in 0..5 {
+            mock.set(&format!("h{i}.test"), &["10.0.0.1"], &["fd00::1"], 1);
+        }
+        let e = env(&profile(
+            &format!("dns-server = {}\nipv6 = true", mock.addr()),
+            "",
+        ));
+        let r = resolver_asking_aaaa(&e, &mock);
+        for i in 0..5 {
+            let res = r
+                .lookup(&format!("h{i}.test"), LookupOpts::default())
+                .await
+                .unwrap();
+            assert_eq!(res.v6.len(), 1);
+        }
+
+        // The entries have expired, and AAAA no longer answers.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        mock.set_drop_qtype(Qtype::Aaaa, true);
+        for i in 0..5 {
+            let name = format!("h{i}.test");
+            let stale = r.lookup(&name, LookupOpts::default()).await.unwrap();
+            assert_eq!(stale.source, Source::Cache { stale: true });
+            // Longer than a fanout lasts (300 ms): the refresh is over.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(mock.query_count(&name, Qtype::Aaaa), 2, "h{i}: refreshed");
+            assert_eq!(r.aaaa_suppressed(), i >= 4, "h{i}: after its refresh");
+        }
     }
 
     #[tokio::test]
