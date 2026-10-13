@@ -5,21 +5,16 @@
 use super::{Entry, Origin, Profile, Section, parse_str};
 use crate::diagnostic::{Diagnostic, Diagnostics, codes};
 use crate::managed::parse_managed;
-use crate::reach::{Reach, TakenIn};
+use crate::reach::Reach;
 use crate::remote::{DEFAULT_INTERVAL, Remote, RemoteRef, RemoteRole, RemoteSource};
 use crate::span::Span;
 use crate::value::{split_list, starts_with_ci};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
-
-/// The most a local file that the downloaded copy of a managed profile takes
-/// in may hold: what rurge downloads for one resource at most.
-const MOST_A_COPY_TAKES_IN: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct IncludeOptions {
@@ -145,44 +140,6 @@ fn canonical(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// The text of the file at `path`, which has to be an ordinary file of at most
-/// `bound` bytes. A path below the profile's directory can name a device or a
-/// FIFO, and opening one would read for ever or wait for a writer, so the
-/// kind of the file is asked before it is opened. What is read is bounded
-/// whatever the length of the file is said to be: a file can report none and
-/// still give data.
-fn read_ordinary_file(path: &Path, bound: u64) -> io::Result<String> {
-    if !fs::metadata(path)?.is_file() {
-        return Err(io::Error::other("not a regular file"));
-    }
-    let mut bytes = Vec::new();
-    fs::File::open(path)?
-        .take(bound.saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > bound {
-        return Err(io::Error::other(format!(
-            "larger than {}",
-            size_text(bound)
-        )));
-    }
-    String::from_utf8(bytes).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "stream did not contain valid UTF-8",
-        )
-    })
-}
-
-/// A size as a message says it: in MiB when it is a whole number of them.
-fn size_text(bytes: u64) -> String {
-    const MIB: u64 = 1024 * 1024;
-    if bytes % MIB == 0 {
-        format!("{} MiB", bytes / MIB)
-    } else {
-        format!("{bytes} bytes")
-    }
-}
-
 impl Expansion<'_> {
     /// What an `#!include` line may take in is up to the text the line is
     /// written in: the reach of its origin.
@@ -261,17 +218,15 @@ impl Expansion<'_> {
         }
         // the first thing done with a path: nothing of this machine is
         // joined, resolved, opened or looked at for one the text may not name
-        match reach.include(target) {
-            Ok(how) => self.take_in_local(target, span, depth, how),
-            Err(refusal) => {
-                self.diags.push(
-                    Diagnostic::warning(codes::W_REMOTE_LOCAL_ACCESS, refusal.message)
-                        .with_hint(refusal.hint)
-                        .at(span.clone()),
-                );
-                None
-            }
+        if let Some(refusal) = reach.include_refusal() {
+            self.diags.push(
+                Diagnostic::warning(codes::W_REMOTE_LOCAL_ACCESS, refusal.message)
+                    .with_hint(refusal.hint)
+                    .at(span.clone()),
+            );
+            return None;
         }
+        self.take_in_local(target, span, depth)
     }
 
     /// Whether the include may go on: it does not lead back to where it is
@@ -323,17 +278,9 @@ impl Expansion<'_> {
         true
     }
 
-    /// A local file the line may include, taken in as `how` says: a file of
-    /// the downloaded copy of a managed profile, or of a file it took in, must
-    /// be an ordinary one of bounded size, and its lines are read as the
-    /// copy's are and not as the user's own.
-    fn take_in_local(
-        &mut self,
-        target: &str,
-        span: &Span,
-        depth: usize,
-        how: TakenIn,
-    ) -> Option<Included> {
+    /// A local file that a line of the user's own text includes. Its lines
+    /// are the user's own text as well.
+    fn take_in_local(&mut self, target: &str, span: &Span, depth: usize) -> Option<Included> {
         let path = if Path::new(target).is_absolute() {
             PathBuf::from(target)
         } else {
@@ -343,11 +290,7 @@ impl Expansion<'_> {
         if !self.admit(&key, &path.display().to_string(), span, depth) {
             return None;
         }
-        let read = match how {
-            TakenIn::AsOwnText => fs::read_to_string(&path),
-            TakenIn::AsTheCopy => read_ordinary_file(&path, MOST_A_COPY_TAKES_IN),
-        };
-        let text = match read {
+        let text = match fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
                 self.diags.push(
@@ -361,11 +304,7 @@ impl Expansion<'_> {
             }
         };
         let file: Arc<Path> = Arc::from(path.as_path());
-        let origin = match how {
-            TakenIn::AsOwnText => Origin::Include(file.clone()),
-            TakenIn::AsTheCopy => Origin::ManagedInclude(file.clone()),
-        };
-        let (mut profile, sub_diags) = parse_str(&text, file.clone(), origin);
+        let (mut profile, sub_diags) = parse_str(&text, file.clone(), Origin::Include(file));
         self.diags.extend(sub_diags);
         self.stack.push(key);
         self.expand(&mut profile, depth + 1);
@@ -1023,8 +962,7 @@ FINAL,DIRECT
 
     /// Expands `text` as the downloaded copy of a managed profile, the way
     /// the loader does: its lines are `Origin::Managed`, and the local file
-    /// (here `main.conf` in `dir`) is the profile whose directory the
-    /// relative paths start from.
+    /// (here `main.conf` in `dir`) is the profile it stands for.
     fn expand_copy(dir: &Path, text: &str) -> (Profile, Diagnostics) {
         let main: Arc<Path> = Arc::from(dir.join("main.conf").as_path());
         let cached: Arc<Path> = Arc::from(Path::new("/cache/1.conf"));
@@ -1043,84 +981,25 @@ FINAL,DIRECT
         (p, d)
     }
 
-    /// The copy of a managed profile takes in a local file below the
-    /// profile's directory, and the lines of that file are read as the copy's
-    /// own are, whatever they include in turn: being included gives no
-    /// rights.
+    /// The copy of a managed profile includes no local file, whatever the
+    /// path: the line is ignored, with the words of the copy, and the path is
+    /// not joined, resolved or read, though the file a plain relative path
+    /// names is there. The file system is asked about the main file and
+    /// nothing else.
     #[test]
-    fn what_a_copy_takes_in_is_read_as_the_copy_is() {
+    fn a_copy_includes_no_local_file() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("sets")).unwrap();
         fs::write(
             dir.path().join("sets").join("one.dconf"),
-            "[Rule]\nDOMAIN,one.example,DIRECT\n#!include ../two.dconf\n#!include two.dconf\n",
+            "[Rule]\nDOMAIN,one.example,DIRECT\n",
         )
         .unwrap();
-        fs::write(
-            dir.path().join("two.dconf"),
-            "[Rule]\nDOMAIN,two.example,DIRECT\n",
-        )
-        .unwrap();
-        let (p, d) = expand_copy(
-            dir.path(),
-            "[Rule]\n#!include sets/one.dconf\n#!include sets/one.dconf\nFINAL,DIRECT\n",
-        );
-        // the include by `..` is refused, as the copy's own would be; the one
-        // by a plain path is taken in. The file is taken in twice, which is
-        // no cycle.
-        let told: Vec<(&str, u32)> = d
-            .iter()
-            .map(|x| (x.code, x.span.as_ref().unwrap().line))
-            .collect();
-        assert_eq!(
-            told,
-            [
-                (codes::W_REMOTE_LOCAL_ACCESS, 3),
-                (codes::W_REMOTE_LOCAL_ACCESS, 3)
-            ]
-        );
-        let one = Arc::<Path>::from(dir.path().join("sets/one.dconf").as_path());
-        let two = Arc::<Path>::from(dir.path().join("two.dconf").as_path());
-        let origins: Vec<(&str, Origin)> = p
-            .section("Rule")
-            .unwrap()
-            .entries
-            .iter()
-            .map(|e| (e.raw.as_str(), e.origin.clone()))
-            .collect();
-        assert_eq!(
-            origins,
-            [
-                (
-                    "DOMAIN,one.example,DIRECT",
-                    Origin::ManagedInclude(one.clone())
-                ),
-                (
-                    "DOMAIN,two.example,DIRECT",
-                    Origin::ManagedInclude(two.clone())
-                ),
-                ("DOMAIN,one.example,DIRECT", Origin::ManagedInclude(one)),
-                ("DOMAIN,two.example,DIRECT", Origin::ManagedInclude(two)),
-                (
-                    "FINAL,DIRECT",
-                    Origin::Managed(Arc::from(Path::new("/cache/1.conf")))
-                ),
-            ]
-        );
-    }
-
-    /// The copy of a managed profile includes a plain relative path or its
-    /// line is ignored, with the words of the copy: the path is not joined,
-    /// resolved or read. The file system is asked about the main file and
-    /// nothing else.
-    #[test]
-    fn a_copy_includes_nothing_but_a_plain_relative_path() {
-        let dir = tempfile::tempdir().unwrap();
         let absolute = dir.path().join("absent.dconf");
         let (p, d) = expand_copy(
             dir.path(),
             &format!(
-                "[Rule]\n#!include {}\n#!include ../up.dconf\n#!include C:\\x.dconf\n#!include \\\\127.0.0.1\\share\\x.dconf\n#!include nul\nFINAL,DIRECT\n",
+                "[Rule]\n#!include {}\n#!include ../up.dconf\n#!include C:\\x.dconf\n#!include \\\\127.0.0.1\\share\\x.dconf\n#!include nul\n#!include sets/one.dconf\n#!include a.dconf, ./b.dconf\nFINAL,DIRECT\n",
                 absolute.display()
             ),
         );
@@ -1138,52 +1017,17 @@ FINAL,DIRECT
         let refused = |line| {
             (
                 codes::W_REMOTE_LOCAL_ACCESS,
-                "the downloaded copy of a managed profile (or a file it includes) can include a local file only by a relative path below the profile's directory; the line is ignored",
-                Some("name the file by a relative path without a drive, a leading slash or `..`"),
+                "the downloaded copy of a managed profile cannot include a local file; the line is ignored",
+                Some(
+                    "to include a local file, load a profile without `#!MANAGED-CONFIG` that takes the downloaded parts in by `#!include`",
+                ),
                 line,
             )
         };
-        assert_eq!(told, (2..=6).map(refused).collect::<Vec<_>>());
+        // each target is refused on its own: the line with two gets two
+        assert_eq!(told, [2, 3, 4, 5, 6, 7, 8, 8].map(refused));
         assert_eq!(raws(&p, "Rule"), ["FINAL,DIRECT"]);
         assert_eq!(take_looked_at(), [dir.path().join("main.conf")]);
-
-        // a plain path is looked for, and here it is not there
-        let (_, d) = expand_copy(dir.path(), "[Rule]\n#!include a.dconf, ./b.dconf\n");
-        let told: Vec<(&str, u32)> = d
-            .iter()
-            .map(|x| (x.code, x.span.as_ref().unwrap().line))
-            .collect();
-        assert_eq!(
-            told,
-            [
-                (codes::E_INCLUDE_NOT_FOUND, 2),
-                (codes::E_INCLUDE_NOT_FOUND, 2)
-            ]
-        );
-    }
-
-    /// An ordinary file is read up to the bound and no further, and anything
-    /// else is none: a directory, or what is not there.
-    #[test]
-    fn an_ordinary_file_is_read_up_to_the_bound_and_no_further() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("f.dconf");
-        fs::write(&file, "0123456789").unwrap();
-        assert_eq!(read_ordinary_file(&file, 10).unwrap(), "0123456789");
-        let too_long = read_ordinary_file(&file, 9).unwrap_err();
-        assert_eq!(too_long.to_string(), "larger than 9 bytes");
-        // the bound the loader uses is said in MiB
-        assert_eq!(size_text(MOST_A_COPY_TAKES_IN), "64 MiB");
-        let not_a_file = read_ordinary_file(dir.path(), 10).unwrap_err();
-        assert_eq!(not_a_file.to_string(), "not a regular file");
-        let missing = read_ordinary_file(&dir.path().join("absent"), 10).unwrap_err();
-        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
-        // and text is text, as it is for a file the user included
-        fs::write(&file, [0xff, 0xfe]).unwrap();
-        assert_eq!(
-            read_ordinary_file(&file, 10).unwrap_err().to_string(),
-            fs::read_to_string(&file).unwrap_err().to_string()
-        );
     }
 
     #[test]

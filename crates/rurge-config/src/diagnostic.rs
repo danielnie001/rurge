@@ -254,9 +254,9 @@ pub mod codes {
     /// as the other kind of set; it matches nothing.
     pub const W_SET_KIND_CONFLICT: &str = "W0032";
     /// A downloaded text asks for something on this machine that the user did
-    /// not write: it includes a local file it may not, names a local file as
-    /// a set or as a group's `policy-path`, or defines an `external` policy.
-    /// The line or the parameter is ignored, or the policy is not started.
+    /// not write: it includes a local file, names a local file as a set or as
+    /// a group's `policy-path`, or defines an `external` policy. The line or
+    /// the parameter is ignored, or the policy is not started.
     pub const W_REMOTE_LOCAL_ACCESS: &str = "W0033";
     /// The downloaded copy of a managed profile is in effect and will not be
     /// updated: it carries no `#!MANAGED-CONFIG` line of its own, or the lines

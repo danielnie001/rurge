@@ -198,9 +198,9 @@ pub enum NotImplemented {
     /// An `external` policy written in downloaded text: it would start a
     /// program on this machine that nobody here wrote, so it is not started.
     DownloadedExternal,
-    /// The same in the downloaded copy of a managed profile, or in a local
-    /// file the copy takes in: a file below the profile's directory is not
-    /// always one the user wrote (rurge's own downloads can lie there).
+    /// The same in the downloaded copy of a managed profile: while the copy is
+    /// in effect it is the profile itself, and it is downloaded text all the
+    /// same.
     ManagedExternal,
 }
 
@@ -210,7 +210,7 @@ impl NotImplemented {
     pub fn external_in(reach: Reach) -> Option<NotImplemented> {
         match reach {
             Reach::Anywhere => None,
-            Reach::BelowProfile => Some(NotImplemented::ManagedExternal),
+            Reach::ManagedCopy => Some(NotImplemented::ManagedExternal),
             Reach::Nowhere => Some(NotImplemented::DownloadedExternal),
         }
     }
@@ -226,7 +226,7 @@ impl NotImplemented {
                 "`snell` version {n} is not supported: it is a beta protocol without a public specification; such policies behave as REJECT"
             ),
             NotImplemented::DownloadedExternal => "`external` policies written in downloaded text are not started; they behave as REJECT".to_string(),
-            NotImplemented::ManagedExternal => "`external` policies in the downloaded copy of a managed profile (or in a file it includes) are not started; they behave as REJECT".to_string(),
+            NotImplemented::ManagedExternal => "`external` policies in the downloaded copy of a managed profile are not started; they behave as REJECT".to_string(),
         }
     }
 
@@ -1492,16 +1492,16 @@ mod tests {
         }
     }
 
-    /// The copy of a managed profile and the local files it takes in are
-    /// downloaded text of the other kind: the same refusal, in words of its
-    /// own, and the way to get a program started is another one. Which text
-    /// gets which is `external_in`'s to say.
+    /// The copy of a managed profile is downloaded text of the other kind:
+    /// the same refusal, in words of its own, and the way to get a program
+    /// started is another one. Which text gets which is `external_in`'s to
+    /// say.
     #[test]
     fn a_managed_external_has_the_words_of_the_copy_of_a_managed_profile() {
         let why = NotImplemented::ManagedExternal;
         assert_eq!(
             why.warning(),
-            "`external` policies in the downloaded copy of a managed profile (or in a file it includes) are not started; they behave as REJECT"
+            "`external` policies in the downloaded copy of a managed profile are not started; they behave as REJECT"
         );
         assert_eq!(why.note(), "external (managed profile)");
         assert_eq!(why.imported(), "`external` in a managed profile");
@@ -1516,7 +1516,7 @@ mod tests {
         );
         assert_eq!(NotImplemented::external_in(Reach::Anywhere), None);
         assert_eq!(
-            NotImplemented::external_in(Reach::BelowProfile),
+            NotImplemented::external_in(Reach::ManagedCopy),
             Some(NotImplemented::ManagedExternal)
         );
         assert_eq!(

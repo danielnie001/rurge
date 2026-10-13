@@ -1568,7 +1568,7 @@ mod tests {
         let inline = HashSet::from(["Streaming".to_string()]);
         for (reach, may) in [
             (Reach::Anywhere, true),
-            (Reach::BelowProfile, false),
+            (Reach::ManagedCopy, false),
             (Reach::Nowhere, false),
         ] {
             let ctx = ParseCtx {

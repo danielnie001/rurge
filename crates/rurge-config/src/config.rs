@@ -441,7 +441,8 @@ pub fn load(path: &Path, opts: &LoadOptions) -> Result<Loaded, LoadError> {
     let (profile, diags, kept_in) = match choice.copy {
         Some(copy) => {
             let mut downloaded = copy.profile;
-            // the cycle check and the relative paths are the local file's
+            // the file that was loaded is the local one, whichever text is in
+            // effect
             downloaded.main = profile.main.take();
             (downloaded, copy.diagnostics, Some(copy.file))
         }
@@ -893,13 +894,13 @@ pub fn from_profile(
         }
     }
 
-    // The local files taken in, whether the profile or the copy of a managed
-    // profile included them. A line of a downloaded text is in a file of the
-    // cache, which nobody edits and a watcher has no use for.
+    // The local files the profile took in. A line of a downloaded text is in
+    // a file of the cache, which nobody edits and a watcher has no use for;
+    // and a downloaded text takes in no local file.
     let mut includes: Vec<PathBuf> = Vec::new();
     for sec in &profile.sections {
         for e in &sec.entries {
-            if let Origin::Include(p) | Origin::ManagedInclude(p) = &e.origin {
+            if let Origin::Include(p) = &e.origin {
                 let p = p.to_path_buf();
                 if !includes.contains(&p) {
                     includes.push(p);
@@ -4969,67 +4970,52 @@ RULE-SET,LAN,DIRECT\nDOMAIN-SET,LAN,REJECT\nRULE-SET,X,DIRECT\nDOMAIN-SET,X,REJE
         );
     }
 
-    /// The lines of a copy are read like the lines of any profile, and a
-    /// copy is allowed to include the local files its author names by a
-    /// relative path, which are read from the directory of the local file,
-    /// not from the cache. What the copy takes in is read as the copy is: the
-    /// program of an `external` policy is not started, whether the copy's own
-    /// line defines it or a local file of the copy does.
+    /// The copy of a managed profile is the profile while it is in effect,
+    /// and it is downloaded text all the same: it includes no local file of
+    /// the directory of the local file, whatever it does with what it would
+    /// have taken in. The proxies of `other.conf`, which is there, do not
+    /// become policies of the copy nor members of its group, and its rules
+    /// are not the copy's. The program of an `external` policy is not
+    /// started.
     #[test]
-    fn a_copy_includes_local_files_from_the_directory_of_the_local_file() {
+    fn a_copy_takes_in_nothing_of_the_directory_of_the_local_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.path().join("shared.dconf"),
-            "[Rule]\nDOMAIN,shared.example,DIRECT\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("ext.dconf"),
-            "[Proxy]\nIncluded = external, exec=/bin/true, local-port=1083\n",
+            dir.path().join("other.conf"),
+            "[Proxy]\nElsewhere = http, 127.0.0.1, 8080\n[Rule]\nDOMAIN,other.example,DIRECT\n",
         )
         .unwrap();
         let copy = format!(
-            "{}\n[Proxy]\nOwn = external, exec=/bin/true, local-port=1082\n#!include ext.dconf\n[Rule]\n#!include shared.dconf\nFINAL,DIRECT\n",
+            "{}\n[Proxy]\n#!include other.conf\nOwn = external, exec=/bin/true, local-port=1082\n[Proxy Group]\nAll = select, include-all-proxies=true\n[Rule]\n#!include other.conf\nFINAL,All\n",
             managed_line(MANAGED, 3600, false)
         );
-        let fake = Arc::new(Fake::new().text(MANAGED, &copy).fetched(MANAGED, hours(10)));
-        let l = load_modified(
-            dir.path(),
-            &local_profile(&managed_line(MANAGED, 3600, false)),
-            Some(hours(5)),
-            &fake,
-        );
+        let l = load_copy(dir.path(), &copy);
         assert!(
             !l.diagnostics.has_errors(),
             "{:?}",
             l.diagnostics.clone().into_vec()
         );
-        assert_eq!(
-            rules_of(&l),
-            ["DOMAIN,shared.example,DIRECT", "FINAL,DIRECT"]
-        );
-        // the files the user wrote, and not the cache
-        assert_eq!(
-            l.config.source.includes,
-            [
-                dir.path().join("ext.dconf"),
-                dir.path().join("shared.dconf")
-            ]
-        );
-        // one warning for the programs, at the first of them
-        assert_eq!(
-            placed(&l, &[codes::W_REMOTE_LOCAL_ACCESS]),
-            [("1.conf".to_string(), 3)]
-        );
+        // the two includes, and the program at its own line
+        let mut expected = refused("1.conf", &[3, 8], INCLUDE_IN_COPY, INCLUDE_IN_COPY_HINT);
+        expected.extend(refused(
+            "1.conf",
+            &[4],
+            EXTERNAL_IN_COPY,
+            EXTERNAL_IN_COPY_HINT,
+        ));
+        expected.sort_by_key(|(file, line, ..)| (file.clone(), *line));
+        assert_eq!(refusals(&l), expected);
         let config = &l.config;
-        for name in ["Own", "Included"] {
-            assert!(config.spec(name).is_none(), "{name}");
-            assert_eq!(
-                config.not_implemented.get(name),
-                Some(&NotImplemented::ManagedExternal),
-                "{name}"
-            );
-        }
+        let names: Vec<&str> = config.policies.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Own"]);
+        assert!(config.spec("Elsewhere").is_none());
+        assert_eq!(rules_of(&l), ["FINAL,All"]);
+        assert!(config.source.includes.is_empty());
+        assert!(config.spec("Own").is_none());
+        assert_eq!(
+            config.not_implemented.get("Own"),
+            Some(&NotImplemented::ManagedExternal)
+        );
     }
 
     /// A text the copy reaches through a remote include is downloaded text of
@@ -5082,56 +5068,27 @@ RULE-SET,LAN,DIRECT\nDOMAIN-SET,LAN,REJECT\nRULE-SET,X,DIRECT\nDOMAIN-SET,X,REJE
         );
     }
 
-    /// The cycle check begins at the local file, wherever the text is read
-    /// from: a copy that includes the local file includes itself.
-    #[test]
-    fn a_copy_that_includes_the_local_file_is_a_cycle() {
-        let fake = Arc::new(
-            Fake::new()
-                .text(
-                    MANAGED,
-                    &format!(
-                        "{}\n[Rule]\n#!include main.conf\nFINAL,DIRECT\n",
-                        managed_line(MANAGED, 3600, false)
-                    ),
-                )
-                .fetched(MANAGED, hours(10)),
-        );
-        let dir = tempfile::tempdir().unwrap();
-        let l = load_modified(
-            dir.path(),
-            &local_profile(&managed_line(MANAGED, 3600, false)),
-            Some(hours(5)),
-            &fake,
-        );
-        assert_eq!(
-            placed(&l, &[codes::E_INCLUDE_CYCLE]),
-            [("1.conf".to_string(), 3)]
-        );
-    }
-
-    // What downloaded text may name on this machine: nothing, or, for the copy
-    // of a managed profile, a local file below the profile's directory. The
-    // paths such text names carry a marker, so that a search of what a load
-    // says finds a path that got into a message. What is said of a line, and
-    // its hint: `…_IN_DOWNLOADED` of a downloaded file's, `…_IN_COPY` of a
-    // line of the copy of a managed profile or of a file the copy takes in.
+    // What downloaded text may name on this machine: nothing. The paths such
+    // text names carry a marker, so that a search of what a load says finds a
+    // path that got into a message. What is said of a line, and its hint:
+    // `…_IN_DOWNLOADED` of a downloaded file's, `…_IN_COPY` of a line of the
+    // copy of a managed profile.
 
     const PATH_MARK: &str = "marker-path";
     const SET_IN_DOWNLOADED: &str =
         "a downloaded file cannot name a local file as a set; the line is ignored";
     const SET_IN_DOWNLOADED_HINT: &str = "write the line in the local profile to use a local set";
-    const SET_IN_COPY: &str = "the downloaded copy of a managed profile (or a file it includes) cannot name a local file as a set; the line is ignored";
+    const SET_IN_COPY: &str = "the downloaded copy of a managed profile cannot name a local file as a set; the line is ignored";
     const SET_IN_COPY_HINT: &str = "name the set by a URL instead";
-    const INCLUDE_IN_COPY: &str = "the downloaded copy of a managed profile (or a file it includes) can include a local file only by a relative path below the profile's directory; the line is ignored";
-    const INCLUDE_IN_COPY_HINT: &str =
-        "name the file by a relative path without a drive, a leading slash or `..`";
+    const INCLUDE_IN_COPY: &str =
+        "the downloaded copy of a managed profile cannot include a local file; the line is ignored";
+    const INCLUDE_IN_COPY_HINT: &str = "to include a local file, load a profile without `#!MANAGED-CONFIG` that takes the downloaded parts in by `#!include`";
     const POLICY_PATH_IN_DOWNLOADED: &str = "policy group `G`: a downloaded file cannot name a local file as `policy-path`; the parameter is ignored";
     const POLICY_PATH_IN_DOWNLOADED_HINT: &str =
         "define the group in the local profile to import policies from a local file";
-    const POLICY_PATH_IN_COPY: &str = "policy group `G`: the downloaded copy of a managed profile (or a file it includes) cannot name a local file as `policy-path`; the parameter is ignored";
+    const POLICY_PATH_IN_COPY: &str = "policy group `G`: the downloaded copy of a managed profile cannot name a local file as `policy-path`; the parameter is ignored";
     const POLICY_PATH_IN_COPY_HINT: &str = "give `policy-path` a URL instead";
-    const EXTERNAL_IN_COPY: &str = "`external` policies in the downloaded copy of a managed profile (or in a file it includes) are not started; they behave as REJECT";
+    const EXTERNAL_IN_COPY: &str = "`external` policies in the downloaded copy of a managed profile are not started; they behave as REJECT";
     const EXTERNAL_IN_COPY_HINT: &str = "to use an `external` policy, load a profile without `#!MANAGED-CONFIG` that takes the downloaded parts in by `#!include`";
 
     /// What a load said of lines their text may not write (`W0033`), by file
@@ -5388,14 +5345,14 @@ DOMAIN-SET:https://example.com/h.list = 10.0.0.3\n"
         assert_no_path_is_shown(&l);
     }
 
-    /// The downloaded copy of a managed profile in effect may include a local
-    /// file by a plain relative path, and names no other local file: not as an
-    /// include, not as a set, not as a `policy-path`. What it ignores it
-    /// leaves unread; every target of an include here is a file that is not
-    /// there, so that a read would be an error of its own.
+    /// The downloaded copy of a managed profile in effect names no local
+    /// file: not as an include, by whatever path, not as a set, not as a
+    /// `policy-path`. What it ignores it leaves unread: the file a plain
+    /// relative path names is there, and none of its rules is the copy's, and
+    /// every other target of an include is a file that is not there, so that
+    /// a read would be an error of its own.
     #[test]
-    fn the_copy_of_a_managed_profile_includes_only_by_a_plain_relative_path_and_names_no_local_set()
-    {
+    fn the_copy_of_a_managed_profile_names_no_local_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("sets")).unwrap();
         std::fs::write(
@@ -5429,7 +5386,7 @@ DOMAIN-SET,../{PATH_MARK}-up.list,DIRECT\nRULE-SET,https://example.com/e.list,DI
         ));
         expected.extend(refused(
             "1.conf",
-            &[12, 13, 14, 15, 16],
+            &[11, 12, 13, 14, 15, 16],
             INCLUDE_IN_COPY,
             INCLUDE_IN_COPY_HINT,
         ));
@@ -5447,16 +5404,9 @@ DOMAIN-SET,../{PATH_MARK}-up.list,DIRECT\nRULE-SET,https://example.com/e.list,DI
         assert_eq!(l.diagnostics.len(), expected.len() + 1);
         assert_eq!(
             rules_of(&l),
-            [
-                "DOMAIN,included.example,DIRECT",
-                "RULE-SET,https://example.com/e.list,DIRECT",
-                "FINAL,DIRECT"
-            ]
+            ["RULE-SET,https://example.com/e.list,DIRECT", "FINAL,DIRECT"]
         );
-        assert_eq!(
-            l.config.source.includes,
-            [dir.path().join("sets").join("ok.dconf")]
-        );
+        assert!(l.config.source.includes.is_empty());
         assert_eq!(l.config.hosts.len(), 1);
         assert!(matches!(
             &l.config.hosts[0].key,
@@ -5475,171 +5425,6 @@ DOMAIN-SET,../{PATH_MARK}-up.list,DIRECT\nRULE-SET,https://example.com/e.list,DI
             Some(PolicyPath::Url(_))
         ));
         assert_no_path_is_shown(&l);
-    }
-
-    /// A file that the copy takes in has the copy's reach and not the user's:
-    /// being included gives a text no rights. Its programs are not started, it
-    /// names no local set and no local `policy-path`, and what it includes is
-    /// read the same way.
-    #[test]
-    fn a_file_the_copy_includes_has_the_reach_of_the_copy() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("sets")).unwrap();
-        // the file the set line names is there, and a rule from it would show
-        std::fs::write(
-            dir.path()
-                .join("sets")
-                .join(format!("{PATH_MARK}-own.list")),
-            "DOMAIN,own.example\n",
-        )
-        .unwrap();
-        // a file that is not there: a read of it would be an error of its own
-        let absent = dir.path().join(format!("{PATH_MARK}-absent.dconf"));
-        std::fs::write(
-            dir.path().join("one.dconf"),
-            format!(
-                "[Proxy]\nInc = external, exec=/bin/true, local-port=1083\n#!include two.dconf\n\
-[Proxy Group]\nG = select, Inc, policy-path={PATH_MARK}-nodes.txt\n\
-[Rule]\nRULE-SET,sets/{PATH_MARK}-own.list,DIRECT\n#!include {}\n#!include two.dconf\n",
-                absent.display()
-            ),
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("two.dconf"),
-            "[Proxy]\nDeep = external, exec=/bin/true, local-port=1084\n[Rule]\nDOMAIN,deep.example,DIRECT\n",
-        )
-        .unwrap();
-        let copy = format!(
-            "{}\n[Proxy]\n#!include one.dconf\nOwn = external, exec=/bin/true, local-port=1082\n\
-[Proxy Group]\n#!include one.dconf\n[Rule]\n#!include one.dconf\nFINAL,DIRECT\n",
-            managed_line(MANAGED, 3600, false)
-        );
-        let l = load_copy(dir.path(), &copy);
-        let mut expected = refused("one.dconf", &[2], EXTERNAL_IN_COPY, EXTERNAL_IN_COPY_HINT);
-        expected.extend(refused(
-            "one.dconf",
-            &[5],
-            POLICY_PATH_IN_COPY,
-            POLICY_PATH_IN_COPY_HINT,
-        ));
-        expected.extend(refused("one.dconf", &[7], SET_IN_COPY, SET_IN_COPY_HINT));
-        // the file is taken in under three sections, and its include is
-        // refused each time
-        expected.extend(refused(
-            "one.dconf",
-            &[8, 8, 8],
-            INCLUDE_IN_COPY,
-            INCLUDE_IN_COPY_HINT,
-        ));
-        assert_eq!(refusals(&l), expected);
-        assert!(
-            !l.diagnostics.has_errors(),
-            "{:?}",
-            l.diagnostics.clone().into_vec()
-        );
-        // none of the three programs is started, the copy's own among them
-        for name in ["Inc", "Deep", "Own"] {
-            assert!(l.config.spec(name).is_none(), "{name}");
-            assert_eq!(
-                l.config.not_implemented.get(name),
-                Some(&NotImplemented::ManagedExternal),
-                "{name}"
-            );
-        }
-        assert_eq!(rules_of(&l), ["DOMAIN,deep.example,DIRECT", "FINAL,DIRECT"]);
-        assert_eq!(
-            l.config.source.includes,
-            [dir.path().join("one.dconf"), dir.path().join("two.dconf")]
-        );
-        let group = l.config.group_specs.iter().find(|g| g.name == "G").unwrap();
-        assert_eq!(group.members, ["Inc"]);
-        assert_eq!(group.import.policy_path, None);
-        assert_no_path_is_shown(&l);
-    }
-
-    /// A file the copy takes in is an ordinary file of bounded size: a
-    /// directory is none, nor is a device, and one that holds more than
-    /// 64 MiB is not read to the end.
-    #[test]
-    fn the_copy_takes_in_ordinary_files_of_bounded_size_only() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("sub")).unwrap();
-        let big = std::fs::File::create(dir.path().join("big.dconf")).unwrap();
-        big.set_len(64 * 1024 * 1024 + 1).unwrap();
-        drop(big);
-        let include = |target: &str| {
-            format!(
-                "{}\n[Rule]\n#!include {target}\nFINAL,DIRECT\n",
-                managed_line(MANAGED, 3600, false)
-            )
-        };
-        let not_read = |l: &Loaded| -> Vec<String> {
-            l.diagnostics
-                .iter()
-                .filter(|d| d.code == codes::E_INCLUDE_NOT_FOUND)
-                .map(|d| d.message.clone())
-                .collect()
-        };
-        let l = load_copy(dir.path(), &include("sub"));
-        assert_eq!(
-            not_read(&l),
-            [format!(
-                "cannot read include `{}`: not a regular file",
-                dir.path().join("sub").display()
-            )]
-        );
-        let l = load_copy(dir.path(), &include("big.dconf"));
-        assert_eq!(
-            not_read(&l),
-            [format!(
-                "cannot read include `{}`: larger than 64 MiB",
-                dir.path().join("big.dconf").display()
-            )]
-        );
-        // the user's own include of the directory gets what the platform says
-        let local = load_with_remote(
-            dir.path(),
-            "[Rule]\n#!include sub\nFINAL,DIRECT\n",
-            &Arc::new(Fake::new()),
-        );
-        let platform = std::fs::read_to_string(dir.path().join("sub")).unwrap_err();
-        assert_eq!(
-            not_read(&local),
-            [format!(
-                "cannot read include `{}`: {platform}",
-                dir.path().join("sub").display()
-            )]
-        );
-    }
-
-    /// A link to a device is no ordinary file. (`/dev/null`: a read of it
-    /// would end at once, where a read of `/dev/zero` would never.)
-    #[cfg(unix)]
-    #[test]
-    fn the_copy_does_not_take_in_a_link_to_a_device() {
-        let dir = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink("/dev/null", dir.path().join("null.dconf")).unwrap();
-        let l = load_copy(
-            dir.path(),
-            &format!(
-                "{}\n[Rule]\n#!include null.dconf\nFINAL,DIRECT\n",
-                managed_line(MANAGED, 3600, false)
-            ),
-        );
-        let said: Vec<String> = l
-            .diagnostics
-            .iter()
-            .filter(|d| d.code == codes::E_INCLUDE_NOT_FOUND)
-            .map(|d| d.message.clone())
-            .collect();
-        assert_eq!(
-            said,
-            [format!(
-                "cannot read include `{}`: not a regular file",
-                dir.path().join("null.dconf").display()
-            )]
-        );
     }
 
     /// What the user wrote is read as it always was, wherever it names a

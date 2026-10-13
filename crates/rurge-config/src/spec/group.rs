@@ -718,8 +718,8 @@ icon-url=https://example.com/i.png, category=Media",
         );
         for (reach, message, hint) in [
             (
-                Reach::BelowProfile,
-                "policy group `G`: the downloaded copy of a managed profile (or a file it includes) cannot name a local file as `policy-path`; the parameter is ignored",
+                Reach::ManagedCopy,
+                "policy group `G`: the downloaded copy of a managed profile cannot name a local file as `policy-path`; the parameter is ignored",
                 "give `policy-path` a URL instead",
             ),
             (

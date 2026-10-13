@@ -25,7 +25,10 @@ pub trait RemoteSource: Send + Sync {
     /// When there is no text the answer is [`Remote::Missing`], and its `why`
     /// is shown as it is in a warning, which is printed and logged: it is one
     /// line, and it never holds the URL, nor any other link (the target of a
-    /// redirect included), nor anything read from a response body.
+    /// redirect included), nor a credential, nor the text of a response body
+    /// as such. It can be the message of a diagnostic about a downloaded text
+    /// (`does not load: …`), which names what any diagnostic names (a policy,
+    /// a group, a section) and quotes no value.
     fn get(&self, url: &Url) -> Remote;
 }
 
@@ -43,8 +46,11 @@ pub enum Remote {
     /// Nothing to read: not downloaded yet, or every attempt failed and no
     /// copy exists. `why` is shown as it is in a warning, which is printed and
     /// logged: it is one line, and it never holds the URL, nor any other link
-    /// (the target of a redirect included), nor anything read from a response
-    /// body. A link can be a token, and a body is whatever the server sent.
+    /// (the target of a redirect included), nor a credential, nor the text of
+    /// a response body as such. A link can be a token, and a body is whatever
+    /// the server sent. It can be the message of a diagnostic about a
+    /// downloaded text (`does not load: …`), which names what any diagnostic
+    /// names (a policy, a group, a section) and quotes no value.
     Missing { why: Option<String> },
 }
 

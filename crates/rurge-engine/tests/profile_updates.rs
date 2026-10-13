@@ -5,12 +5,17 @@
 
 mod common;
 
-use common::{COPY, HOUR, LogCapture, QUIET, World, ago, fast, stays_quiet, text_of, wait_until};
+use common::{
+    COPY, Engine, EngineShared, HOUR, LogCapture, OutboundMode, QUIET, Runtime, RuntimeOptions,
+    World, ago, closed_tcp_port, fast, stack_options, stays_quiet, text_of, wait_until,
+};
 use rurge_config::Remote;
 use rurge_config::codes;
 use rurge_config::config::Loaded;
+use rurge_config::rule::PolicyRef;
 use rurge_engine::profile::{Boot, BootLimits, ProfileSources, boot_need, disk_remote};
 use rurge_net::resource::{ResourceOptions, ResourceSource, resource_key};
+use rurge_policy::TerminalKind;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::time::timeout;
@@ -1554,4 +1559,106 @@ async fn a_refresh_that_needs_a_new_file_gets_it_in_the_next_round() {
     assert!(!loaded.diagnostics.has_errors(), "{}", said(&loaded));
     assert!(reads(&sources, &w, "/managed", &fixed));
     assert!(reads(&sources, &w, "/x", X_BODY));
+}
+
+// ---------------------------------------------------------------------------
+// what the downloaded copy names on this machine
+
+/// The downloaded copy of a managed profile is the profile while it is in
+/// effect, and it is downloaded text all the same: nothing on this machine is
+/// built from what it names. The proxies of the local file it includes are
+/// not policies, nor members of its group; the rules of the local set it names
+/// are not its rules; its program is not started. Of these the set and the
+/// program were refused before the include was.
+#[tokio::test]
+async fn the_copy_of_a_managed_profile_builds_nothing_from_a_local_file() {
+    let w = World::new().await;
+    point_at_managed(&w, "interval=3600");
+    // nothing listens at the port of the proxy, which no test dials
+    let port = closed_tcp_port();
+    std::fs::write(
+        w.dir.path().join("other.conf"),
+        format!("[Proxy]\nElsewhere = http, 127.0.0.1, {port}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        w.dir.path().join("local.list"),
+        "DOMAIN,local-set.example\n",
+    )
+    .unwrap();
+    w.seed(
+        "/managed",
+        &managed(
+            &w,
+            &format!(
+                "[Proxy]\n#!include other.conf\nOwn = external, exec=/bin/true, local-port={port}\n[Proxy Group]\nAll = select, include-all-proxies=true\n[Rule]\nRULE-SET,local.list,REJECT\nFINAL,All\n"
+            ),
+        ),
+        ago(HOUR),
+    );
+    let Loaded {
+        config,
+        diagnostics,
+    } = w.loaded(disk_remote(&w.data()));
+    assert_ne!(
+        config.source.main_text, config.source.main,
+        "the copy is in effect"
+    );
+    let engine = Engine::new(
+        Runtime::build(
+            config,
+            RuntimeOptions {
+                stack: stack_options(&w.data()),
+                outbound_mode: OutboundMode::Rule,
+                idle_timeout: Duration::from_secs(600),
+                shared: EngineShared::default(),
+                request_log_size: 1000,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+
+    // what is built: the copy's own policy, and not the one of the file
+    let view = engine.policies_view();
+    assert!(
+        view.proxies.contains(&"Own".to_string()),
+        "{:?}",
+        view.proxies
+    );
+    assert!(
+        !view.proxies.contains(&"Elsewhere".to_string()),
+        "{:?}",
+        view.proxies
+    );
+    let groups = engine.groups_view();
+    let all = groups.iter().find(|g| g.name == "All").expect("the group");
+    let members: Vec<&str> = all.members.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(members, ["Own"]);
+
+    // the program is the kind that behaves as REJECT: it is not started
+    let own = engine.registry().resolve(&PolicyRef::parse("Own"));
+    assert_eq!(own.terminal, TerminalKind::Reject);
+    assert_eq!(
+        own.note.map(|note| note.to_string()).as_deref(),
+        Some("policy protocol not implemented: external (managed profile)")
+    );
+    // and nothing of the local set is in the rules
+    let rules: Vec<String> = engine
+        .rules_view()
+        .into_iter()
+        .map(|rule| rule.rule)
+        .collect();
+    assert_eq!(rules, ["FINAL,All"]);
+
+    // the load said so, at the lines of the copy: the include, the program
+    // and the set
+    assert!(!diagnostics.has_errors());
+    let mut refused: Vec<u32> = diagnostics
+        .iter()
+        .filter(|d| d.code == codes::W_REMOTE_LOCAL_ACCESS)
+        .map(|d| d.span.as_ref().expect("a position").line)
+        .collect();
+    refused.sort();
+    assert_eq!(refused, [3, 4, 8]);
 }

@@ -1243,6 +1243,7 @@ Ext = external, exec=/bin/true, local-port=1090
 #!include /{MARKER}-included.dconf
 #!include ../{MARKER}-up.dconf
 #!include C:\\{MARKER}-drive.dconf
+#!include sets/{MARKER}-plain.dconf
 [Proxy Group]
 G = select, Ext, policy-path={MARKER}-nodes.txt
 H = select, Ext, policy-path=/{MARKER}-absolute-nodes.txt
@@ -1258,15 +1259,14 @@ AND,((RULE-SET,{MARKER}-c.list),(DEST-PORT,443)),DIRECT
 NOT,((DOMAIN-SET,/{MARKER}-d.list)),DIRECT
 "
     );
-    // a profile that takes `link` in under every section the text has, and
-    // has the lines `own` of its own
+    // a profile that takes `link` in under every section the text has
     let sections = ["Proxy", "Proxy Group", "Host", "Ruleset Inline", "Rule"];
-    let including = |link: &str, own: &str| {
+    let including = |link: &str| {
         let mut profile = String::new();
         for section in sections {
             profile += &format!("[{section}]\n#!include {link}\n");
         }
-        profile + own + "FINAL,DIRECT\n"
+        profile + "FINAL,DIRECT\n"
     };
     // the loader asks for a link without its fragment, which no server sees
     let key = |link: &str| {
@@ -1278,7 +1278,7 @@ NOT,((DOMAIN-SET,/{MARKER}-d.list)),DIRECT
 
     // the text of a remote include
     let link = format!("https://sub.example/names-files/{MARKER}-link?token={MARKER}-linktoken");
-    let profile = including(&link, "");
+    let profile = including(&link);
     let mut opts = LoadOptions::for_tests();
     opts.remote = Some(Arc::new(Downloaded(HashMap::from([(
         key(&link),
@@ -1288,21 +1288,16 @@ NOT,((DOMAIN-SET,/{MARKER}-d.list)),DIRECT
         "a remote include",
         from_text(&profile, Path::new("t.conf"), &opts),
         profile,
-        // the three includes of the text, once for each of the five sections
+        // the four includes of the text, once for each of the five sections
         // it is taken in under, and nine more lines
-        24,
+        29,
     ));
 
-    // the copy of a managed profile in effect: a line of its own that names a
-    // file, and a file it includes by a plain relative path that names more
+    // the copy of a managed profile in effect, which carries the lines itself
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("inc.dconf"), &lines).unwrap();
     let managed =
         format!("https://sub.example/managed/{MARKER}-managed?token={MARKER}-managedtoken");
-    let copy = format!(
-        "#!MANAGED-CONFIG {managed} interval=3600\n{}",
-        including("inc.dconf", &format!("RULE-SET,{MARKER}-own.list,DIRECT\n"))
-    );
+    let copy = format!("#!MANAGED-CONFIG {managed} interval=3600\n{lines}FINAL,DIRECT\n");
     let main = dir.path().join("main.conf");
     let local = format!("#!MANAGED-CONFIG {managed} interval=3600\n[Rule]\nFINAL,DIRECT\n");
     std::fs::write(&main, &local).unwrap();
@@ -1321,8 +1316,9 @@ NOT,((DOMAIN-SET,/{MARKER}-d.list)),DIRECT
         "a managed copy",
         load_file(&main, &opts).unwrap(),
         local,
-        // the same, and the copy's own line
-        25,
+        // the four includes of the text and the nine more lines, each once:
+        // the lines stand in the copy, which is taken in under no section
+        13,
     ));
 
     for (what, loaded, profile, refusals) in loads {
