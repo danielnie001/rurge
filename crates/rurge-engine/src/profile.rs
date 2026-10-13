@@ -345,6 +345,43 @@ impl ProfileSources {
         }
     }
 
+    /// Follows the sources a load came across that nobody has downloaded and
+    /// nothing follows yet. A profile whose link was changed while rurge ran
+    /// needs the copy of the new one, and a load that fails registers nothing:
+    /// nothing else would ever ask for it. They are registered as a verdict
+    /// registers the source of a version that refers to it, and the copy that
+    /// arrives is a move like any other, which the main loop answers with a
+    /// reload. They never ask for `strict`, whatever their line says: a load
+    /// that failed suspends nothing, and the generation in use goes on as it
+    /// was. They come after its sources; the generation that comes next
+    /// decides whether they stay. Nothing is let go of, and no other state is
+    /// touched. How many were registered: none for a process that is offline,
+    /// which downloads nothing.
+    pub fn follow_missing(&self, sources: &SourceInfo) -> usize {
+        if self.offline {
+            return 0;
+        }
+        let mut state = self.core.lock();
+        let mut followed = 0;
+        for wanted in sources
+            .remote
+            .iter()
+            .filter(|r| r.role != RemoteRole::ManagedHop && !r.found())
+        {
+            if state.tracked.iter().any(|t| t.url == wanted.url) {
+                continue;
+            }
+            let id = state.next_id;
+            state.next_id += 1;
+            let mut source = self.register(id, wanted);
+            source.strict = false;
+            source.provisional = true;
+            state.tracked.push(source);
+            followed += 1;
+        }
+        followed
+    }
+
     fn retire(&self, source: &Tracked) {
         self.manager
             .retire(&ResourceSource::Url(source.url.clone()));

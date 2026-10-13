@@ -9,10 +9,10 @@ use common::{
     COPY, Engine, EngineShared, HOUR, LogCapture, OutboundMode, QUIET, Runtime, RuntimeOptions,
     World, ago, closed_tcp_port, fast, stack_options, stays_quiet, text_of, wait_until,
 };
-use rurge_config::Remote;
 use rurge_config::codes;
 use rurge_config::config::Loaded;
 use rurge_config::rule::PolicyRef;
+use rurge_config::{Remote, RemoteRef, RemoteRole, SourceInfo};
 use rurge_engine::profile::{Boot, BootLimits, ProfileSources, boot_need, disk_remote};
 use rurge_net::resource::{ResourceOptions, ResourceSource, resource_key};
 use rurge_policy::TerminalKind;
@@ -1699,4 +1699,294 @@ async fn the_copy_of_a_managed_profile_builds_nothing_from_a_local_file() {
         .collect();
     refused.sort();
     assert_eq!(refused, [3, 4, 8]);
+}
+
+// ---------------------------------------------------------------------------
+// sources a load that failed came across, and nobody has downloaded
+
+const MINUTE: Duration = Duration::from_secs(60);
+
+/// A generation in use that follows a pointer to `/managed`, whose copy was
+/// checked a minute ago, so that nothing is due. The local file is then
+/// rewritten as a pointer to `/second`, with `line` after the address, which
+/// nobody has downloaded.
+struct Moved {
+    w: World,
+    sources: Arc<ProfileSources>,
+    /// The sources of the generation in use.
+    in_use: SourceInfo,
+    /// The sources the load of the rewritten file came across. That load has
+    /// an error: the profile is nothing without the copy.
+    failed: SourceInfo,
+}
+
+async fn a_pointer_that_moved(line: &str, resources: ResourceOptions) -> Moved {
+    let w = World::new().await;
+    point_at_managed(&w, "interval=3600");
+    w.seed("/managed", &managed(&w, COPY), ago(MINUTE));
+    let sources = w.sources_with(false, resources);
+    let in_use = w.load();
+    sources.track(&in_use);
+    w.write(&format!("#!MANAGED-CONFIG {} {line}\n", w.url("/second")));
+    let load = loaded(&w, &sources);
+    assert!(load.diagnostics.has_errors(), "{}", said(&load));
+    Moved {
+        failed: load.config.source,
+        w,
+        sources,
+        in_use,
+    }
+}
+
+/// What `/second` serves: a managed profile that names itself.
+fn second_managed(w: &World) -> String {
+    w.managed_copy("/second", "interval=3600")
+}
+
+/// The user rewrites the link of the managed profile while rurge runs, to an
+/// address nobody has downloaded. The load of the file fails for want of the
+/// copy, and nothing else would ever ask for it: the sources that load came
+/// across are followed, and the copy is reported when it is here.
+#[tokio::test]
+async fn the_managed_profile_a_failed_load_names_is_downloaded_and_reported() {
+    let Moved {
+        w, sources, failed, ..
+    } = a_pointer_that_moved("interval=3600", asked_once()).await;
+    let body = second_managed(&w);
+    w.server.set("/second", body.clone());
+    // Until the sources are followed nobody asks for the address and nothing
+    // moves: a report that was due would come a quiet second after the move,
+    // and 300 ms more is the margin.
+    stays_quiet(&sources, QUIET + Duration::from_millis(300)).await;
+    assert_eq!(w.server.hits("/second"), 0);
+
+    assert_eq!(sources.follow_missing(&failed), 1);
+    reported_once(&sources).await;
+    assert_eq!(w.server.hits("/second"), 1);
+    assert!(reads(&sources, &w, "/second", &body));
+    let now = loaded(&w, &sources);
+    assert!(!now.diagnostics.has_errors(), "{}", said(&now));
+}
+
+/// The same for a file the profile includes, and a profile that has no rule
+/// without it.
+#[tokio::test]
+async fn the_include_a_failed_load_names_is_downloaded_and_reported() {
+    let w = World::new().await;
+    let including = |path: &str| format!("[Rule]\n#!include {}\n", w.url(path));
+    let body = |name: &str| format!("[Rule]\nDOMAIN,{name}.example,DIRECT\nFINAL,DIRECT\n");
+    w.write(&including("/inc"));
+    w.seed("/inc", &body("inc"), ago(MINUTE));
+    let sources = w.sources_with(false, asked_once());
+    sources.track(&w.load());
+    assert!(!loaded(&w, &sources).diagnostics.has_errors());
+    // the address is changed to one nobody has downloaded
+    w.write(&including("/inc2"));
+    w.server.set("/inc2", body("inc2"));
+    let failed = loaded(&w, &sources);
+    assert!(failed.diagnostics.has_errors(), "{}", said(&failed));
+    assert_eq!(w.server.hits("/inc2"), 0);
+
+    assert_eq!(sources.follow_missing(&failed.config.source), 1);
+    reported_once(&sources).await;
+    assert_eq!(w.server.hits("/inc2"), 1);
+    assert!(reads(&sources, &w, "/inc2", &body("inc2")));
+    let now = loaded(&w, &sources);
+    assert!(!now.diagnostics.has_errors(), "{}", said(&now));
+    assert!(
+        now.config
+            .rules
+            .iter()
+            .any(|r| r.raw == "DOMAIN,inc2.example,DIRECT")
+    );
+}
+
+/// A source followed for a load that failed suspends nothing, whatever the
+/// link says of `strict`: the generation in use goes on as it was. Its update
+/// is due at once and fails; for a source of the generation that would be a
+/// refusal.
+#[tokio::test]
+async fn a_source_followed_for_a_failed_load_suspends_nothing() {
+    let Moved {
+        w, sources, failed, ..
+    } = a_pointer_that_moved("interval=3600 strict=true", fast()).await;
+    // the file was last changed two hours ago
+    w.touch(ago(2 * HOUR));
+    not_found(&w, "/second", SOON);
+    assert_eq!(sources.strict(), None);
+    assert_eq!(sources.follow_missing(&failed), 1);
+    // the attempt is on its way, and then it has failed
+    assert_eq!(sources.strict(), None);
+    wait_until("the attempt to fail", || {
+        sources
+            .statuses()
+            .iter()
+            .any(|s| s.key == w.key("/second") && s.state == "failed")
+    })
+    .await;
+    assert_eq!(sources.strict(), None);
+    assert!(!sources.strict_due());
+}
+
+/// Following the same sources again registers nothing, and the listing has
+/// each address once. A source of the generation in use that has no copy is
+/// followed already.
+#[tokio::test]
+async fn following_the_same_sources_twice_registers_them_once() {
+    let Moved {
+        w, sources, failed, ..
+    } = a_pointer_that_moved("interval=3600", asked_once()).await;
+    w.server.set("/second", second_managed(&w));
+    assert_eq!(sources.follow_missing(&failed), 1);
+    assert_eq!(sources.follow_missing(&failed), 0);
+    let keys: Vec<_> = sources.statuses().into_iter().map(|s| s.key).collect();
+    assert_eq!(keys, [w.key("/managed"), w.key("/second")]);
+
+    let w = World::new().await;
+    w.write_including(&["/x"]);
+    not_found(&w, "/x", SOON);
+    let sources = w.sources_with(false, asked_once());
+    let in_use = w.load();
+    sources.track(&in_use);
+    assert!(in_use.remote.iter().any(|r| !r.found()));
+    assert_eq!(sources.follow_missing(&in_use), 0);
+    let keys: Vec<_> = sources.statuses().into_iter().map(|s| s.key).collect();
+    assert_eq!(keys, [w.key("/x")]);
+}
+
+/// The generation that comes next decides: it keeps a source it names as it
+/// keeps any, and lets go of one it does not name.
+#[tokio::test]
+async fn the_next_generation_decides_whether_a_followed_source_stays() {
+    // it names the address: the source stays, and the server is not asked again
+    let Moved {
+        w, sources, failed, ..
+    } = a_pointer_that_moved("interval=3600", asked_once()).await;
+    let body = second_managed(&w);
+    w.server.set("/second", body.clone());
+    assert_eq!(sources.follow_missing(&failed), 1);
+    wait_until("the copy", || reads(&sources, &w, "/second", &body)).await;
+    reported_once(&sources).await;
+    let next = loaded(&w, &sources).config.source;
+    sources.track(&next);
+    sources.track(&next);
+    let keys: Vec<_> = sources.statuses().into_iter().map(|s| s.key).collect();
+    assert_eq!(keys, [w.key("/second")]);
+    // no move: a report that was due would come a quiet second after it, and
+    // 300 ms more is the margin
+    stays_quiet(&sources, QUIET + Duration::from_millis(300)).await;
+    assert_eq!(w.server.hits("/second"), 1);
+
+    // it does not name it: the source is let go of
+    let Moved {
+        w,
+        sources,
+        in_use,
+        failed,
+    } = a_pointer_that_moved("interval=3600", asked_once()).await;
+    w.server.set("/second", second_managed(&w));
+    assert_eq!(sources.follow_missing(&failed), 1);
+    sources.track(&in_use);
+    let keys: Vec<_> = sources.statuses().into_iter().map(|s| s.key).collect();
+    assert_eq!(keys, [w.key("/managed")]);
+    assert!(sources.update(&w.key("/second")).await.is_none());
+}
+
+/// What `outdated` and `strict_due` say of the generation in use is what they
+/// said before a source was followed, and what they say once a check of its
+/// own has succeeded: the source that was followed comes after its sources,
+/// and plays no part.
+#[tokio::test]
+async fn following_a_source_leaves_the_generation_in_use_as_it_was() {
+    let w = World::new().await;
+    // The file has sections of its own and was changed after the copy was
+    // last checked, so it is in effect; the update it asks for is long due.
+    w.write_managed("/managed", "interval=3600 strict=true");
+    w.touch(ago(HOUR / 2));
+    let copy = w.managed_copy("/managed", "interval=3600 strict=true");
+    w.seed("/managed", &copy, ago(2 * HOUR));
+    let sources = w.sources(false);
+    sources.track(&w.load());
+    wait_until("the update to fail", || {
+        sources.statuses()[0].state == "failed"
+    })
+    .await;
+    let before = (sources.outdated(), sources.strict_due());
+    assert_eq!(before, (false, true));
+
+    let elsewhere = SourceInfo {
+        main: w.profile(),
+        includes: Vec::new(),
+        main_text: w.profile(),
+        remote: vec![RemoteRef {
+            url: w.url("/second"),
+            role: RemoteRole::Managed,
+            path: None,
+            interval: HOUR,
+            strict: true,
+            lacks_section: false,
+        }],
+    };
+    assert_eq!(sources.follow_missing(&elsewhere), 1);
+    assert_eq!((sources.outdated(), sources.strict_due()), before);
+
+    // a check of the source of the generation succeeds: the copy takes over
+    // from the file, once
+    w.server.set("/managed", copy);
+    update(&sources, &w, "/managed")
+        .await
+        .expect("the check succeeds");
+    assert!(sources.outdated());
+    assert!(!sources.outdated());
+    assert!(!sources.strict_due());
+}
+
+/// Only a source nobody has downloaded is followed: not one that has a copy,
+/// and not a stop on the way to the managed profile, which is read from its
+/// copy and never asked for.
+#[tokio::test]
+async fn only_a_source_without_a_copy_is_followed() {
+    let w = World::new().await;
+    let sources = w.sources_with(false, asked_once());
+    let remote = |path: &str, role: RemoteRole, copy: bool| RemoteRef {
+        url: w.url(path),
+        role,
+        path: copy.then(|| w.dir.path().join("copy")),
+        interval: HOUR,
+        strict: false,
+        lacks_section: false,
+    };
+    let info = SourceInfo {
+        main: w.profile(),
+        includes: Vec::new(),
+        main_text: w.profile(),
+        remote: vec![
+            remote("/has-a-copy", RemoteRole::Include, true),
+            remote("/on-the-way", RemoteRole::ManagedHop, false),
+            remote("/never", RemoteRole::Include, false),
+        ],
+    };
+    assert_eq!(sources.follow_missing(&info), 1);
+    let keys: Vec<_> = sources.statuses().into_iter().map(|s| s.key).collect();
+    assert_eq!(keys, [w.key("/never")]);
+}
+
+/// A process that is offline downloads nothing, so it follows nothing: the
+/// listing stays what it was, and nobody is told that a copy is on its way.
+#[tokio::test]
+async fn an_offline_process_follows_nothing() {
+    let w = World::new().await;
+    point_at_managed(&w, "interval=3600");
+    let sources = w.sources(true);
+    sources.track(&w.load());
+    w.write(&format!(
+        "#!MANAGED-CONFIG {} interval=3600\n",
+        w.url("/second")
+    ));
+    let failed = loaded(&w, &sources);
+    assert!(failed.diagnostics.has_errors(), "{}", said(&failed));
+    assert_eq!(sources.follow_missing(&failed.config.source), 0);
+    let keys: Vec<_> = sources.statuses().into_iter().map(|s| s.key).collect();
+    assert_eq!(keys, [w.key("/managed")]);
+    assert!(w.server.requests().is_empty());
 }

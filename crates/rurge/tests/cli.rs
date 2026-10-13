@@ -6303,6 +6303,11 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         /// server: the token is in the path too.
         const MANAGED_AT: &str = "/S3CR3T/managed";
         const INCLUDED_AT: &str = "/S3CR3T/rules";
+        /// Where the managed profile is after its link was rotated.
+        const ROTATED_AT: &str = "/S3CR3T/rotated";
+        /// What the log says of the sources a failed reload names, which were
+        /// never downloaded.
+        const NEVER_DOWNLOADED: &str = "sources that were never downloaded";
         /// What a page answered in place of a profile looks like.
         const PAGE: &str =
             "<html><head><title>Sign in</title></head><body>Welcome to the Wi-Fi</body></html>";
@@ -6429,6 +6434,72 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
                 .map(String::from)
                 .collect();
             assert!(asked_for(&w.served).is_subset(&managed));
+            assert!(asked_for(&w.geo).is_subset(&databases));
+        }
+
+        /// The link of the managed profile is rotated while the daemon runs, and
+        /// the reload that is asked for fails: the file names a copy nobody has
+        /// downloaded. The daemon downloads that copy, and loads the profile
+        /// again when it is here, without a restart and without an interval
+        /// running out. The log says so once, and shows nothing of either link
+        /// beyond where it goes.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_link_rotated_while_the_daemon_runs_is_downloaded_and_taken() {
+            let w = Sources::new().await;
+            let api = free_tcp_port();
+            let first = managed_link(&w);
+            let second = token_link(&w, ROTATED_AT);
+            let text = |link: &Url, rules: &str| managed_text(link, "interval=3600", api, rules);
+            // the first copy was checked a minute ago, so nobody is asked for it
+            rurge_net::testing::seed_cache(
+                &w.data(),
+                &first,
+                text(&first, "DOMAIN,old.test,REJECT\n").as_bytes(),
+                SystemTime::now() - Duration::from_secs(60),
+            );
+            w.served
+                .set(ROTATED_AT, text(&second, "DOMAIN,new.test,REJECT\n"));
+            w.write(&format!("#!MANAGED-CONFIG {first}\n"));
+            let logs = w.dir.path().join("logs");
+            let (mut daemon, _errors) = start_logging(&w, &logs);
+            assert!(rules(api).contains("DOMAIN,old.test,REJECT"));
+            assert_eq!(
+                w.served.requests().len(),
+                0,
+                "nobody was asked for the copy"
+            );
+
+            // the link is rotated; the copy it names has never been downloaded
+            let conf = w.write(&format!("#!MANAGED-CONFIG {second}\n"));
+            let rotated = as_it_is(&conf);
+            let (status, body) = api_call(api, "POST", "/v1/profiles/reload", "k", Some("{}"));
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains("\"ok\":false"), "{body}");
+
+            wait_for("the copy of the new link to be asked for", 20, || {
+                asked_for(&w.served).contains(ROTATED_AT)
+            });
+            wait_for("the new profile to be in effect", 30, || {
+                rules(api).contains("DOMAIN,new.test,REJECT")
+            });
+            wait_for("the line that says the profile was reloaded", 10, || {
+                reloads(&logs) >= 1
+            });
+            assert!(!rules(api).contains("DOMAIN,old.test,REJECT"));
+            assert_eq!(as_it_is(&conf), rotated, "the local file was written to");
+            let log = log_text(&logs);
+            assert_eq!(lines_with(&log, NEVER_DOWNLOADED).len(), 1, "{log}");
+            assert!(!log.contains(TOKEN), "{log}");
+            assert!(!log.contains("rotated"), "{log}");
+            stop(&mut daemon, api);
+            // all that this online start reached: the copy of the new link, and
+            // the two GeoIP databases, which it asks the loopback for
+            let copies: BTreeSet<String> = [ROTATED_AT.to_string()].into();
+            let databases: BTreeSet<String> = [COUNTRY_DATABASE, ASN_DATABASE]
+                .into_iter()
+                .map(String::from)
+                .collect();
+            assert_eq!(asked_for(&w.served), copies);
             assert!(asked_for(&w.geo).is_subset(&databases));
         }
 

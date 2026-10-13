@@ -447,6 +447,16 @@ async fn reload(d: &Daemon<'_>, listeners: &mut Vec<(ListenerSpec, Running)>) ->
     if errors > 0 {
         eprintln!("reload failed, keeping current config:");
         print_diagnostics(&loaded.diagnostics.sorted());
+        // A profile that names a source nobody has downloaded cannot load
+        // until the copy is here, and a load that fails registers nothing:
+        // without this every later reload fails the same way.
+        let followed = d.sources.follow_missing(&loaded.config.source);
+        if followed > 0 {
+            tracing::info!(
+                sources = followed,
+                "the profile on disk names sources that were never downloaded; they are being downloaded, and the profile is loaded again when one arrives"
+            );
+        }
         return ReloadReport {
             ok: false,
             errors,
@@ -495,7 +505,9 @@ async fn reload(d: &Daemon<'_>, listeners: &mut Vec<(ListenerSpec, Running)>) ->
     print_diagnostics(next.diagnostics());
     let surface_changed = d.engine.swap_runtime(next);
     // The generation in use is the one whose sources are followed. A reload
-    // that failed above keeps the configuration and the tracking it had.
+    // that failed above keeps the configuration and the tracking it had, with
+    // the sources its load named that nobody had downloaded added to it; the
+    // generation that comes next decides whether those stay.
     d.sources.track(&source);
     let mut rebound = false;
     // An empty list is the degraded state a failed rebind leaves behind: try
