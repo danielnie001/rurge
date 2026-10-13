@@ -2660,6 +2660,36 @@ mod tests {
         assert_eq!(lines.said("AAAA answers timed out").len(), 2);
     }
 
+    /// A flush starts the count of AAAA timeouts again: the lookups that
+    /// timed out before it count for nothing after it. Only more timeouts
+    /// after the flush show that, as an AAAA answer clears the count by itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_starts_the_count_of_aaaa_timeouts_again() {
+        let mock = MockDns::spawn().await;
+        for i in 0..9 {
+            mock.set(&format!("h{i}.test"), &["10.0.0.1"], &["fd00::1"], 60);
+        }
+        mock.set_drop_qtype(Qtype::Aaaa, true);
+        let e = env(&profile(
+            &format!("dns-server = {}\nipv6 = true", mock.addr()),
+            "",
+        ));
+        let r = resolver_asking_aaaa(&e, &mock);
+        for i in 0..4 {
+            lookup_and_complete(&r, &format!("h{i}.test")).await;
+            assert!(!r.aaaa_suppressed(), "h{i}: {} counted", i + 1);
+        }
+
+        // Without the flush the next lookup would be the fifth.
+        r.flush();
+        for i in 4..8 {
+            lookup_and_complete(&r, &format!("h{i}.test")).await;
+            assert!(!r.aaaa_suppressed(), "h{i}: {} since the flush", i - 3);
+        }
+        lookup_and_complete(&r, "h8.test").await;
+        assert!(r.aaaa_suppressed(), "the fifth since the flush");
+    }
+
     #[tokio::test]
     async fn encrypted_upstreams_take_over_and_udp_bootstraps_them() {
         let udp = MockDns::spawn().await;
