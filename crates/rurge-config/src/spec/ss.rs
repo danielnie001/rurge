@@ -197,7 +197,8 @@ fn decode_keys(password: &str, len: usize) -> Result<Vec<Vec<u8>>, usize> {
 /// `custom` line is the exception: `custom, host, port, method, password[,
 /// link of the module]`, where the module's link is read and dropped, and a
 /// named parameter wins over a positional value, as it does for the
-/// credentials of `http`.
+/// credentials of `http`. The method of such a line stands in a position, as
+/// a password may: an unknown one is not quoted.
 pub fn read_ss(r: &mut ParamReader<'_>) -> SsRead {
     let (positional_method, positional_password) = if r.policy().legacy_custom {
         let fields = (r.positional(0), r.positional(1));
@@ -209,7 +210,9 @@ pub fn read_ss(r: &mut ParamReader<'_>) -> SsRead {
     };
     let mut method = SsMethod::None;
     let mut unsupported_cipher = None;
-    match r.str("encrypt-method").or(positional_method).map(str::trim) {
+    let named_method = r.str("encrypt-method");
+    let from_position = named_method.is_none() && positional_method.is_some();
+    match named_method.or(positional_method).map(str::trim) {
         None => r.error(
             codes::E_INVALID_POLICY_PARAM,
             "`encrypt-method` is required".to_string(),
@@ -224,7 +227,16 @@ pub fn read_ss(r: &mut ParamReader<'_>) -> SsRead {
                 unsupported_cipher = Some(*name);
             } else {
                 let names: Vec<&str> = METHODS.iter().map(|(name, _)| *name).collect();
-                r.invalid("encrypt-method", v, &names.join(" / "));
+                let expected = names.join(" / ");
+                if from_position {
+                    r.error_on(
+                        "encrypt-method",
+                        codes::E_INVALID_POLICY_PARAM,
+                        format!("invalid value for `encrypt-method` (expected {expected})"),
+                    );
+                } else {
+                    r.invalid("encrypt-method", v, &expected);
+                }
             }
         }
     }
@@ -593,6 +605,38 @@ mod tests {
             diags.iter().all(|d| !d.message.contains("2secret")),
             "{diags:?}"
         );
+    }
+
+    /// The cipher of an old `custom` line stands in a position, where a
+    /// password that took its place is as likely as a misspelt name: an
+    /// unknown one is an error that does not quote it. Written as a named
+    /// parameter it still is quoted (below).
+    #[test]
+    fn an_unknown_positional_method_is_an_error_that_does_not_quote_it() {
+        for line in [
+            "custom, 127.0.0.1, 8388, hunter2",
+            "custom, 127.0.0.1, 8388, hunter2, aes-256-gcm",
+        ] {
+            let (_, failed, diags) = read(line);
+            assert!(failed, "{line}");
+            let invalid: Vec<&str> = diags
+                .iter()
+                .filter(|d| d.message.contains("`encrypt-method`"))
+                .map(|d| d.message.as_str())
+                .collect();
+            assert_eq!(invalid.len(), 1, "{line}: {diags:?}");
+            assert!(
+                invalid[0].starts_with(
+                    "policy `P`: invalid value for `encrypt-method` (expected aes-128-gcm / "
+                ),
+                "{line}: {}",
+                invalid[0]
+            );
+            assert!(
+                diags.iter().all(|d| !d.message.contains("hunter2")),
+                "{line}: {diags:?}"
+            );
+        }
     }
 
     #[test]
