@@ -52,14 +52,17 @@ const SEND_TIMEOUT: Duration = CONNECT_TIMEOUT.saturating_add(Duration::from_sec
 /// Room for the largest datagram.
 const DATAGRAM: usize = 65536;
 
-/// Whether a QUIC flow is blocked (M5 design 6.2): the global setting
-/// overrides; `per-policy` asks the terminal policy's own `block-quic`,
-/// whose `auto` blocks proxies and lets DIRECT through.
+/// Whether a QUIC flow is blocked. The global setting overrides the terminal
+/// policy's own `block-quic`: `all` blocks every flow, `always-allow` none, and
+/// `all-proxy` every flow through a proxy — the manual has it override the
+/// proxy policies' parameter, so a DIRECT-kind policy (`DIRECT`, a `direct`
+/// alias) keeps its own. `per-policy` asks the policy for every flow; its
+/// `auto` blocks proxies and lets DIRECT through.
 pub(crate) fn quic_blocked(global: BlockQuicGlobal, policy: Tristate, direct: bool) -> bool {
     match global {
         BlockQuicGlobal::AlwaysAllow => false,
         BlockQuicGlobal::All => true,
-        BlockQuicGlobal::AllProxy => !direct,
+        BlockQuicGlobal::AllProxy => !direct || policy == Tristate::On,
         BlockQuicGlobal::PerPolicy => match policy {
             Tristate::On => true,
             Tristate::Off => false,
@@ -713,7 +716,9 @@ mod tests {
             (PerPolicy, On, true, true),
             (PerPolicy, Off, false, false),
             (AllProxy, Off, false, true),
-            (AllProxy, On, true, false),
+            (AllProxy, On, true, true),
+            (AllProxy, Auto, true, false),
+            (AllProxy, Off, true, false),
             (All, Off, true, true),
             (AlwaysAllow, On, false, false),
         ] {
