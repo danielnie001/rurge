@@ -373,6 +373,41 @@ async fn socks5_connect_reaches_the_target() {
     assert_eq!(body, b"hi there");
 }
 
+/// `ipv6 = false` stops AAAA records being asked for, not IPv6 being used: an
+/// IPv6 address written out as the target of a tunnel is reached directly all
+/// the same (manual, `[General]`). The profile of the harness has
+/// `ipv6 = false`.
+#[tokio::test]
+async fn an_ipv6_literal_is_reached_directly_with_ipv6_off() {
+    // a machine without an IPv6 loopback has nothing to try
+    let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+        eprintln!("skipped: this machine has no IPv6 loopback");
+        return;
+    };
+    listener.set_nonblocking(true).unwrap();
+    let origin = tokio::net::TcpListener::from_std(listener).unwrap();
+    let at = origin.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = origin.accept().await else {
+            return;
+        };
+        let mut buf = [0u8; 256];
+        while let Ok(n) = stream.read(&mut buf).await {
+            if n == 0 || stream.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+        }
+    });
+    let h = common::harness(common::Profile::default()).await;
+    let mut tunnel = common::connect_via_http(h.http(), &at.to_string()).await;
+    common::echo_through(&mut tunnel, b"over IPv6").await;
+    drop(tunnel);
+    let r = common::the_records(&h, 1).await.remove(0);
+    assert_eq!(r.status, RecordStatus::Completed, "{r:?}");
+    assert_eq!(r.policy, ["DIRECT"]);
+    assert_eq!(r.remote_addr, Some(at));
+}
+
 #[tokio::test]
 async fn reject_rules_close_serve_gifs_or_render_pages() {
     let rules = "DOMAIN,ads.test,REJECT\nDOMAIN,gif.test,Block\nDOMAIN,hk.test,HK";

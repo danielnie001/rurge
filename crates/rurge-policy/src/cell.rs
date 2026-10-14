@@ -223,7 +223,7 @@ impl Datagram for Relayed {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::RecordingConnector;
+    use crate::testing::{RecordingCarrier, RecordingConnector};
     use rurge_config::HostName;
     use rurge_config::config::{LoadOptions, from_text};
     use rurge_config::spec::Tristate;
@@ -306,6 +306,41 @@ mod tests {
         assert_eq!(
             connector.seen(),
             ["dial proxy.example:8080", "dial proxy.example:8080"]
+        );
+    }
+
+    /// The same for the UDP path: a name goes to the underlying policy's
+    /// carrier as it is, and the datagrams are sent to it by that name —
+    /// this machine looks nothing up, the carrier's side does (the endpoint
+    /// of a `wireguard` tunnel that is written as a name).
+    #[tokio::test]
+    async fn a_udp_target_is_handed_over_unchanged() {
+        let log = Arc::default();
+        let connector = Arc::new(RecordingConnector {
+            log: Arc::clone(&log),
+            carriers: Mutex::new(vec![Box::new(RecordingCarrier { log })]),
+            ..RecordingConnector::default()
+        });
+        let cell = RegistryCell::new();
+        cell.store(registry(connector.clone()));
+        let datagram = ChainConnector::new(cell, "D")
+            .connect_udp(&server(), &ConnectOpts::default())
+            .await
+            .expect("the relay's carrier");
+        std::future::poll_fn(|cx| datagram.poll_send(cx, b"out"))
+            .await
+            .unwrap();
+        // a datagram goes out on a task of its own
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while connector.seen().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the datagram reaches the carrier");
+        assert_eq!(
+            connector.seen(),
+            ["resolve proxy.example:8080", "send proxy.example:8080"]
         );
     }
 

@@ -849,6 +849,19 @@ mod tests {
         assert_eq!(replace_url_host("no-scheme", "c.d"), None);
     }
 
+    /// A pattern is searched for in the whole URL: it has to be anchored to
+    /// be tied to its start.
+    #[test]
+    fn url_regex_without_an_anchor_matches_anywhere_in_the_url() {
+        let mut s = session("h.test");
+        s.url = Some("http://h.test/x/ads/y".into());
+        assert_eq!(eval("URL-REGEX,/ads/", &s), Verdict::Match);
+        assert_eq!(
+            eval("URL-REGEX,^http://h\\.test/ads/", &s),
+            Verdict::NoMatch
+        );
+    }
+
     #[test]
     fn port_source_protocol_and_hostname_type_rules() {
         let mut s = session("example.com");

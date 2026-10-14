@@ -535,7 +535,7 @@ impl phy::TxToken for TxToken<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{PeerCore, PeerOpts, keypair, section};
+    use crate::testing::{PeerCore, PeerOpts, keypair, section, section_v6};
     use std::net::Ipv4Addr;
 
     /// A client stack and its peers, every message delivered at once.
@@ -551,6 +551,29 @@ mod tests {
     impl Net {
         /// `allowed` is each peer's `allowed-ips`.
         fn new(peers: &[(PeerOpts, &[&str])], client_ids: &[Option<[u8; 3]>]) -> Net {
+            Net::with_section(peers, client_ids, |private, keys| {
+                section(private, Ipv4Addr::new(10, 9, 0, 2), keys)
+            })
+        }
+
+        /// As `new`, the tunnel's only address being the IPv6 `tunnel`.
+        fn new_v6(
+            tunnel: Ipv6Addr,
+            peers: &[(PeerOpts, &[&str])],
+            client_ids: &[Option<[u8; 3]>],
+        ) -> Net {
+            Net::with_section(peers, client_ids, |private, keys| {
+                section_v6(private, tunnel, keys)
+            })
+        }
+
+        /// `make` writes the client's section from its private key and the
+        /// peers' public keys with their `allowed-ips`.
+        fn with_section(
+            peers: &[(PeerOpts, &[&str])],
+            client_ids: &[Option<[u8; 3]>],
+            make: impl FnOnce([u8; 32], &[([u8; 32], &[&str])]) -> WireGuardSection,
+        ) -> Net {
             let (private, public) = keypair();
             let cores: Vec<PeerCore> = peers
                 .iter()
@@ -561,7 +584,7 @@ mod tests {
                 .zip(peers)
                 .map(|(core, (_, allowed))| (core.public_key(), *allowed))
                 .collect();
-            let mut section = section(private, Ipv4Addr::new(10, 9, 0, 2), &keys);
+            let mut section = make(private, &keys);
             for (peer, id) in section.peers.iter_mut().zip(client_ids) {
                 peer.client_id = *id;
             }
@@ -774,6 +797,22 @@ mod tests {
         let from = Ipv4Addr::new(10, 0, 0, 1);
         net.peers[0].ping(from, Ipv4Addr::new(10, 9, 0, 3), 1, 8, None, &mut out);
         net.peers[0].ping(from, Ipv4Addr::new(10, 9, 0, 2), 2, 8, None, &mut out);
+        net.deliver(0, out);
+        assert_eq!(net.peers[0].pongs, [(2, 8)]);
+    }
+
+    /// The same over IPv6 (manual: only echo requests to the tunnel address
+    /// are answered): a ping to the tunnel's IPv6 address is answered, one to
+    /// another address of the same prefix is not.
+    #[test]
+    fn only_echo_requests_to_the_tunnels_ipv6_address_are_answered() {
+        let tunnel: Ipv6Addr = "fd00:9::2".parse().unwrap();
+        let mut net = Net::new_v6(tunnel, &[(PeerOpts::default(), &["fd00::/16"])], &[None]);
+        let mut out = Vec::new();
+        let from = PeerOpts::default().address_v6;
+        let other: Ipv6Addr = "fd00:9::3".parse().unwrap();
+        net.peers[0].ping6(from, other, 1, 8, &mut out);
+        net.peers[0].ping6(from, tunnel, 2, 8, &mut out);
         net.deliver(0, out);
         assert_eq!(net.peers[0].pongs, [(2, 8)]);
     }

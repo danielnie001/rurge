@@ -1609,6 +1609,68 @@ G = select, A, Corp, Block, DIRECT, Inner, Ts, policy-path=https://sub.test/g, u
         assert!(a.diagnostics.is_empty());
     }
 
+    /// A relay that the user's `external-policy-modifier` gives the imported
+    /// lines loses to the group's own `underlying-proxy`: if both are
+    /// present, the group's takes precedence (manual, policy group
+    /// parameters).
+    #[test]
+    fn the_groups_relay_wins_over_one_set_by_the_modifier() {
+        let cfg = profile(
+            "A = http, a.test, 80\nB = http, b.test, 80",
+            "G = select, policy-path=https://sub.test/g, \
+external-policy-modifier=\"underlying-proxy=A\", underlying-proxy=B",
+        );
+        let a = assemble(&cfg, &snapshots(&cfg, &[("G", "M = http, m.test, 80")]));
+        // the import has the relay the modifier gave it ...
+        let imported = a.imported[0]
+            .spec
+            .as_ref()
+            .expect("an http policy has a spec");
+        assert_eq!(imported.common.underlying_proxy.as_deref(), Some("A"));
+        // ... and the member the group offers is chained through its own
+        assert_eq!(members(&a, "G"), ["M (via B)"]);
+        assert_eq!(a.derived.len(), 1);
+        let d = &a.derived[0];
+        assert_eq!(d.spec.name, "M (via B)");
+        assert_eq!(d.spec.common.underlying_proxy.as_deref(), Some("B"));
+        assert_eq!(d.definition, "http, m.test, 80, underlying-proxy=B");
+        assert!(a.diagnostics.is_empty(), "{:?}", warnings(&a));
+    }
+
+    /// The relay of a group reaches the proxies it takes in whichever way
+    /// they come: `include-other-group` and `include-all-proxies` as well as
+    /// the members written on its line and its `policy-path` (manual, policy
+    /// group parameters). `S` can only come from the other group (it is an
+    /// import of that group, and not a proxy of the profile), `Keep` only
+    /// from `include-all-proxies`; the filter keeps the relay `R` itself out
+    /// of the members.
+    #[test]
+    fn members_from_every_source_are_chained_through_the_groups_relay() {
+        let cfg = profile(
+            "R = http, r.test, 80\nKeep = http, keep.test, 80",
+            "G2 = select, policy-path=https://sub.test/g2\n\
+G = select, include-all-proxies=true, include-other-group=G2, \
+policy-regex-filter=^(Keep|S), underlying-proxy=R",
+        );
+        let a = assemble(&cfg, &snapshots(&cfg, &[("G2", "S = http, s.test, 80")]));
+        assert_eq!(members(&a, "G2"), ["S"]);
+        assert_eq!(members(&a, "G"), ["S (via R)", "Keep (via R)"]);
+        let names: Vec<&str> = a.derived.iter().map(|d| d.spec.name.as_str()).collect();
+        assert_eq!(names, ["S (via R)", "Keep (via R)"]);
+        for d in &a.derived {
+            assert_eq!(d.spec.common.underlying_proxy.as_deref(), Some("R"));
+        }
+        assert_eq!(
+            a.derived[0].definition,
+            "http, s.test, 80, underlying-proxy=R"
+        );
+        assert_eq!(
+            a.derived[1].definition,
+            "http, keep.test, 80, underlying-proxy=R"
+        );
+        assert!(a.diagnostics.is_empty(), "{:?}", warnings(&a));
+    }
+
     #[test]
     fn groups_with_the_same_relay_share_a_derived_policy() {
         let cfg = profile(

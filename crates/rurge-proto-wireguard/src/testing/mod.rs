@@ -24,8 +24,8 @@ use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::socket::{tcp, udp};
 use smoltcp::wire::{
-    HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpProtocol, Ipv4Packet, Ipv4Repr,
-    UdpPacket, UdpRepr,
+    HardwareAddress, Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpAddress, IpCidr,
+    IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, UdpPacket, UdpRepr,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};
@@ -91,11 +91,30 @@ pub fn section(
     self_ip: Ipv4Addr,
     peers: &[([u8; 32], &[&str])],
 ) -> WireGuardSection {
+    tunnel_section(private, Some(self_ip), None, peers)
+}
+
+/// As `section`, for a tunnel whose only address is the IPv6 `self_ip_v6`;
+/// the peers' `allowed-ips` say which IPv6 ranges they take.
+pub fn section_v6(
+    private: [u8; 32],
+    self_ip_v6: Ipv6Addr,
+    peers: &[([u8; 32], &[&str])],
+) -> WireGuardSection {
+    tunnel_section(private, None, Some(self_ip_v6), peers)
+}
+
+fn tunnel_section(
+    private: [u8; 32],
+    self_ip: Option<Ipv4Addr>,
+    self_ip_v6: Option<Ipv6Addr>,
+    peers: &[([u8; 32], &[&str])],
+) -> WireGuardSection {
     WireGuardSection {
         name: "test".to_string(),
         private_key: Secret::new(private),
-        self_ip: Some(self_ip),
-        self_ip_v6: None,
+        self_ip,
+        self_ip_v6,
         dns_servers: Vec::new(),
         prefer_ipv6: false,
         mtu: DEFAULT_MTU,
@@ -362,6 +381,9 @@ impl PeerCore {
 
     /// An echo reply: noted, not handed to the stack (it would drop it).
     fn pong(&mut self, packet: &[u8]) -> bool {
+        if packet.first().is_some_and(|byte| byte >> 4 == 6) {
+            return self.pong_v6(packet);
+        }
         let Ok(ip) = Ipv4Packet::new_checked(packet) else {
             return false;
         };
@@ -373,6 +395,32 @@ impl PeerCore {
         };
         match Icmpv4Repr::parse(&icmp, &ChecksumCapabilities::default()) {
             Ok(Icmpv4Repr::EchoReply { ident, data, .. }) => {
+                self.pongs.push((ident, data.len()));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `pong` for an IPv6 packet.
+    fn pong_v6(&mut self, packet: &[u8]) -> bool {
+        let Ok(ip) = Ipv6Packet::new_checked(packet) else {
+            return false;
+        };
+        if ip.next_header() != IpProtocol::Icmpv6 {
+            return false;
+        }
+        let Ok(icmp) = Icmpv6Packet::new_checked(ip.payload()) else {
+            return false;
+        };
+        let parsed = Icmpv6Repr::parse(
+            &ip.src_addr(),
+            &ip.dst_addr(),
+            &icmp,
+            &ChecksumCapabilities::default(),
+        );
+        match parsed {
+            Ok(Icmpv6Repr::EchoReply { ident, data, .. }) => {
                 self.pongs.push((ident, data.len()));
                 true
             }
@@ -489,6 +537,40 @@ impl PeerCore {
             ip.fill_checksum();
             self.inject(&packet, out);
         }
+    }
+
+    /// An echo request with `size` bytes of data from `from` to `to`, over
+    /// IPv6.
+    pub fn ping6(
+        &mut self,
+        from: Ipv6Addr,
+        to: Ipv6Addr,
+        ident: u16,
+        size: usize,
+        out: &mut Vec<Vec<u8>>,
+    ) {
+        let data = vec![0x5a; size];
+        let request = Icmpv6Repr::EchoRequest {
+            ident,
+            seq_no: 1,
+            data: &data,
+        };
+        let ip = Ipv6Repr {
+            src_addr: from,
+            dst_addr: to,
+            next_header: IpProtocol::Icmpv6,
+            payload_len: request.buffer_len(),
+            hop_limit: 64,
+        };
+        let mut packet = vec![0u8; ip.buffer_len() + ip.payload_len];
+        ip.emit(&mut Ipv6Packet::new_unchecked(&mut packet));
+        request.emit(
+            &from,
+            &to,
+            &mut Icmpv6Packet::new_unchecked(&mut packet[ip.buffer_len()..]),
+            &ChecksumCapabilities::default(),
+        );
+        self.inject(&packet, out);
     }
 
     /// Echoes what each connection receives; a listener that took a

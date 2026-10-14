@@ -5,7 +5,9 @@ use crate::factory::{BuildError, OutboundFactory};
 use crate::testbook::TestBook;
 use rurge_config::spec::{CommonOpts, PolicySpec, ProtoSpec};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target};
+use rurge_net::connector::{
+    BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, PacketSocket, Target,
+};
 use rurge_proto::{Outbound, OutboundError, OutboundRef};
 use rustls::RootCertStore;
 use std::io;
@@ -62,6 +64,35 @@ impl Connector for RecordingConnector {
         Box::pin(std::future::ready(carrier.ok_or_else(|| {
             io::Error::new(io::ErrorKind::Unsupported, "no UDP in the test")
         })))
+    }
+}
+
+/// A UDP carrier that notes in `log` every target it is asked to resolve and
+/// to send to. It gives a target back as it is, as the carrier of a proxy does
+/// (the proxy's server resolves it), and hears nothing.
+pub(crate) struct RecordingCarrier {
+    pub log: Arc<Mutex<Vec<String>>>,
+}
+
+impl PacketSocket for RecordingCarrier {
+    fn resolve<'a>(&'a self, to: &'a Target) -> BoxFuture<'a, io::Result<Target>> {
+        self.log
+            .lock()
+            .expect("log")
+            .push(format!("resolve {}:{}", to.host, to.port));
+        Box::pin(std::future::ready(Ok(to.clone())))
+    }
+
+    fn send_to<'a>(&'a self, _buf: &'a [u8], to: &'a Target) -> BoxFuture<'a, io::Result<()>> {
+        self.log
+            .lock()
+            .expect("log")
+            .push(format!("send {}:{}", to.host, to.port));
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn recv_from<'a>(&'a self, _buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
+        Box::pin(std::future::pending())
     }
 }
 

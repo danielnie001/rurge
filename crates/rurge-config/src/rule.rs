@@ -1190,6 +1190,34 @@ mod tests {
         );
     }
 
+    /// A policy name may hold parentheses of its own when they pair up: the
+    /// value of a logical rule ends where its parentheses do, and what
+    /// follows is the policy, `Proxy (US)` whole (Surge 6.10.0 mended its own
+    /// reading of such a name).
+    #[test]
+    fn a_policy_name_with_balanced_parentheses_is_read_whole() {
+        let and = parse("AND,((DOMAIN,a.example),(DEST-PORT,443)),Proxy (US)").unwrap();
+        let or = parse("OR,((DOMAIN,a.example),(DEST-PORT,443)),Proxy (US)").unwrap();
+        let not = parse("NOT,((DOMAIN,a.example)),Proxy (US)").unwrap();
+        for rule in [&and, &or, &not] {
+            assert_eq!(rule.policy, PolicyRef::Named("Proxy (US)".into()), "{rule}");
+            assert!(rule.params.unknown.is_empty(), "{rule}");
+        }
+        let types = |subs: &[SubRule]| subs.iter().map(|s| s.kind.type_name()).collect::<Vec<_>>();
+        assert!(
+            matches!(&and.kind, RuleKind::And(subs) if types(subs) == ["DOMAIN", "DEST-PORT"]),
+            "{and}"
+        );
+        assert!(
+            matches!(&or.kind, RuleKind::Or(subs) if types(subs) == ["DOMAIN", "DEST-PORT"]),
+            "{or}"
+        );
+        assert!(
+            matches!(&not.kind, RuleKind::Not(sub) if sub.kind.type_name() == "DOMAIN"),
+            "{not}"
+        );
+    }
+
     /// The twelve `PROTOCOL` keywords (manual, Protocol and Network Rules)
     /// each mean their own kind, and they are case-sensitive: neither a
     /// lower-case spelling nor a neighbour's name reads as another keyword.
