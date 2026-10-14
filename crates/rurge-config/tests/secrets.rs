@@ -353,6 +353,7 @@ Slid4 = ssh, ssh.example, 22, username=root, private-key=nokey password={MARKER}
 Slid5 = trojan, t.example, 443, password=pw, client-cert=nocert password={MARKER}-slid5
 Unk = trojan, u.example, 443, password=pw, {MARKER}-aHVudGVyMg==
 UnkQ = trojan, uq.example, 443, password=pw, \"{MARKER}-pa=ss\"
+PosMethod = custom, cm.example, 8388, {MARKER}-method, pw
 trojan://{MARKER}-link2@t2.example:443?sni=t2.example#HK
 [Proxy Group]
 UnkG = select, Slid3, {MARKER}-Zm9vYmFy==
@@ -396,6 +397,7 @@ FINAL,DIRECT
         "`include-other-group` references unknown policy group",
         "policy `Unk`: unknown parameter ignored",
         "policy `UnkQ`: unknown parameter ignored",
+        "invalid value for `encrypt-method` (expected aes-128-gcm / ",
         "policy group `UnkG`: unknown parameter ignored",
         "policy: unknown type",
     ] {

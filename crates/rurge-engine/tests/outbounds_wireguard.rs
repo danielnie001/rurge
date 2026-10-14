@@ -193,7 +193,9 @@ async fn a_wireguard_tunnel_marks_its_datagrams_with_the_policys_tos() {
     let h = harness_hooked(
         Profile {
             proxies: "WG = wireguard, section-name=w, tos=0x28",
-            rules: TO_WG,
+            // A session that misses the tunnel's rule is refused rather than
+            // dialled off loopback by the fixture's `FINAL,DIRECT`.
+            rules: "IP-CIDR,10.0.0.0/8,WG\nDEST-PORT,7,REJECT",
             sections: &section,
             ..Profile::default()
         },
@@ -220,7 +222,9 @@ async fn two_wireguard_policies_of_one_section_share_the_tunnel_whatever_their_t
     let h = harness(Profile {
         proxies: "Marked = wireguard, section-name=w, tos=0x28\n\
                   Plain = wireguard, section-name=w",
-        rules: "IP-CIDR,10.0.0.1/32,Marked\nIP-CIDR,10.0.0.2/32,Plain",
+        // A session that misses its policy's rule is refused rather than
+        // dialled off loopback by the fixture's `FINAL,DIRECT`.
+        rules: "IP-CIDR,10.0.0.1/32,Marked\nIP-CIDR,10.0.0.2/32,Plain\nDEST-PORT,7,REJECT",
         sections: &section,
         ..Profile::default()
     })

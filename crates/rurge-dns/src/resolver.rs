@@ -3383,11 +3383,12 @@ https://dns.example/dns-query"
     }
 
     /// What a connector that dials nothing was asked: its own kind, the call,
-    /// the port.
+    /// the host (as text) and the port.
     #[derive(Debug, PartialEq)]
     struct Asked {
         kind: &'static str,
         call: &'static str,
+        host: String,
         port: u16,
     }
 
@@ -3403,6 +3404,7 @@ https://dns.example/dns-query"
             self.asked.lock().expect("asked").push(Asked {
                 kind: self.kind,
                 call,
+                host: target.host.to_string(),
                 port: target.port,
             });
             io::Error::new(io::ErrorKind::ConnectionRefused, "refused")
@@ -3427,6 +3429,24 @@ https://dns.example/dns-query"
         }
     }
 
+    /// One refusing connector of each kind, all noting what they were asked
+    /// in `asked`.
+    fn refusing_connectors(asked: &Arc<Mutex<Vec<Asked>>>) -> DnsConnectors {
+        let refusing = |kind| -> Arc<dyn Connector> {
+            Arc::new(Refusing {
+                kind,
+                asked: asked.clone(),
+            })
+        };
+        DnsConnectors {
+            tcp: refusing("tcp"),
+            tls: refusing("tls"),
+            https: refusing("https"),
+            quic: refusing("quic"),
+            h3: refusing("h3"),
+        }
+    }
+
     /// Every kind of upstream is dialled through the connector of its kind,
     /// and through no other: a resolver of each kind of server is given five
     /// connectors that refuse, and the only one asked is its own, for the
@@ -3443,26 +3463,13 @@ https://dns.example/dns-query"
             ("h3://127.0.0.1:5/dns-query", "h3", "connect_udp", 5),
         ] {
             let asked = Arc::new(Mutex::new(Vec::new()));
-            let refusing = |kind| -> Arc<dyn Connector> {
-                Arc::new(Refusing {
-                    kind,
-                    asked: asked.clone(),
-                })
-            };
-            let connectors = DnsConnectors {
-                tcp: refusing("tcp"),
-                tls: refusing("tls"),
-                https: refusing("https"),
-                quic: refusing("quic"),
-                h3: refusing("h3"),
-            };
             let e = env(&profile(&format!("encrypted-dns-server = {server}"), ""));
             let mut cfg = ResolverConfig::from_config(&e.cfg);
             cfg.fanout = once();
             let (r, _) = Resolver::new(
                 cfg,
                 ResolverDeps {
-                    connectors,
+                    connectors: refusing_connectors(&asked),
                     sets: e.sets.clone(),
                     system: Arc::new(StaticSystemDns::default()),
                     resources: e.resources.clone(),
@@ -3473,7 +3480,64 @@ https://dns.example/dns-query"
                 .expect_err("every connector refuses");
             assert_eq!(
                 *asked.lock().unwrap(),
-                [Asked { kind, call, port }],
+                [Asked {
+                    kind,
+                    call,
+                    host: "127.0.0.1".to_string(),
+                    port
+                }],
+                "{server}"
+            );
+        }
+    }
+
+    /// A server written as a name reaches its connector as the address the
+    /// bootstrap resolved it to, never as the name: a connector that got the
+    /// name (the pipeline's, under `encrypted-dns-follow-outbound-mode`) would
+    /// dial it directly, outside the rules. A refused connection does not end
+    /// a lookup, which ends when the resolver gives up, 30 seconds on: the
+    /// clock is paused for that, and the bootstrap asks the table of a mock in
+    /// memory, as a datagram on its way cannot keep up with a paused clock.
+    /// The ports are marks to tell the servers by — nothing is dialled at
+    /// them.
+    #[tokio::test(start_paused = true)]
+    async fn a_named_server_reaches_its_connector_as_the_address_the_bootstrap_gave() {
+        for (server, kind, port) in [
+            ("tls://dns.example:2", "tls", 2),
+            ("https://dns.example:3/dns-query", "https", 3),
+        ] {
+            let bootstrap = MockDns::spawn().await;
+            bootstrap.set("dns.example", &["127.0.0.1"], &[], 60);
+            let asked = Arc::new(Mutex::new(Vec::new()));
+            let e = env(&profile(&format!("encrypted-dns-server = {server}"), ""));
+            let mut cfg = ResolverConfig::from_config(&e.cfg);
+            cfg.fanout = once();
+            let (r, _) = Resolver::new(
+                cfg,
+                ResolverDeps {
+                    connectors: refusing_connectors(&asked),
+                    sets: e.sets.clone(),
+                    system: Arc::new(StaticSystemDns::default()),
+                    resources: e.resources.clone(),
+                },
+            );
+            r.bootstrap.set_upstreams(vec![bootstrap.upstream()]);
+            r.lookup("a.test", LookupOpts::default())
+                .await
+                .expect_err("every connector refuses");
+            assert_eq!(
+                *asked.lock().unwrap(),
+                [Asked {
+                    kind,
+                    call: "connect",
+                    host: "127.0.0.1".to_string(),
+                    port
+                }],
+                "{server}"
+            );
+            assert_eq!(
+                bootstrap.query_count("dns.example", Qtype::A),
+                1,
                 "{server}"
             );
         }

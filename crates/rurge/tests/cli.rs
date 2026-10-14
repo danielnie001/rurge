@@ -826,7 +826,9 @@ Old = custom, proxy.test, 8388, aes-256-gcm, s3same, https://module.test/SSEncry
 fn check_reads_a_legacy_custom_policy_as_ss() {
     let dir = tempfile::tempdir().unwrap();
     let out = rurge_command()
-        .args(["check", "-c"])
+        .args(["check", "--data-dir"])
+        .arg(dir.path().join("data"))
+        .arg("-c")
         .arg(write(&dir, "custom.conf", SS_CUSTOM))
         .assert()
         .success()

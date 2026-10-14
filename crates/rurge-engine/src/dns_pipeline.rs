@@ -117,8 +117,8 @@ impl PipelineConnector {
     }
 }
 
-/// One of the connectors `PipelineConnector::connectors` gives out: the
-/// pipeline connector, the sessions it dials called `protocol`.
+/// One of the connectors `PipelineConnector::connectors` gives out: it dials
+/// through the pipeline connector and calls the sessions it makes `protocol`.
 struct Face {
     pipeline: Arc<PipelineConnector>,
     protocol: ProtocolKind,

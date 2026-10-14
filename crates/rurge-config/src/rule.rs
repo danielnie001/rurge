@@ -1026,19 +1026,25 @@ mod tests {
     /// `UNKNOWN`, in any case, is a value of `GEOIP` and of `IP-ASN` (manual,
     /// IP Rules): the address the database has no answer for. It is read as
     /// that before the value is read as a country code or a number, so
-    /// `ASUNKNOWN` is still no number.
+    /// `ASUNKNOWN` is still no number. Whitespace inside the quotes of a
+    /// quoted value does not matter either.
     #[test]
     fn unknown_is_a_value_of_geoip_and_ip_asn() {
         for raw in [
             "GEOIP,UNKNOWN,P",
             "GEOIP,unknown,P",
             "GEOIP,Unknown,P,no-resolve",
+            "GEOIP,\" unknown \",P",
         ] {
             let rule = parse(raw).unwrap_or_else(|e| panic!("{raw}: {}", e.message));
             assert_eq!(rule.kind, RuleKind::GeoIpUnknown, "{raw}");
             assert_eq!(rule.to_string(), raw);
         }
-        for raw in ["IP-ASN,UNKNOWN,P", "IP-ASN,unknown,P"] {
+        for raw in [
+            "IP-ASN,UNKNOWN,P",
+            "IP-ASN,unknown,P",
+            "IP-ASN,\" unknown \",P",
+        ] {
             let rule = parse(raw).unwrap_or_else(|e| panic!("{raw}: {}", e.message));
             assert_eq!(rule.kind, RuleKind::IpAsnUnknown, "{raw}");
             assert_eq!(rule.to_string(), raw);
