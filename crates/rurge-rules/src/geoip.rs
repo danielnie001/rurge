@@ -1,7 +1,7 @@
 //! GeoIP / ASN databases (M2 design §6.4): MaxMind DB readers behind
 //! `ArcSwapOption` so an update swaps the file in without rebuilding the engine.
 
-use crate::matcher::GeoLookup;
+use crate::matcher::{GeoLookup, GeoResult};
 use arc_swap::ArcSwapOption;
 use maxminddb::{Reader, geoip2};
 use rurge_config::{Diagnostic, codes};
@@ -190,33 +190,49 @@ impl GeoDb {
     }
 }
 
+/// A lookup takes its database from the handle once: that it is loaded and what
+/// it says of the address come from the same `load()`, so `Unknown` is only
+/// ever the answer of a database that was there, whenever one is swapped in.
 impl GeoLookup for GeoDb {
-    fn country(&self, ip: IpAddr) -> Option<[u8; 2]> {
+    fn country(&self, ip: IpAddr) -> GeoResult<[u8; 2]> {
         let guard = self.country.load();
         let Some(reader) = guard.as_ref() else {
             self.warn_missing(DbKind::Country);
-            return None;
+            return GeoResult::NotLoaded;
         };
-        let result = reader.lookup(ip).ok()?;
-        let record = result.decode::<geoip2::Country>().ok().flatten()?;
-        let code = record.country.iso_code?;
-        let b = code.as_bytes();
-        (b.len() == 2).then(|| [b[0].to_ascii_uppercase(), b[1].to_ascii_uppercase()])
+        country_in(reader, ip).map_or(GeoResult::Unknown, GeoResult::Known)
     }
 
-    fn asn(&self, ip: IpAddr) -> Option<u32> {
+    fn asn(&self, ip: IpAddr) -> GeoResult<u32> {
         let guard = self.asn.load();
         let Some(reader) = guard.as_ref() else {
             self.warn_missing(DbKind::Asn);
-            return None;
+            return GeoResult::NotLoaded;
         };
-        let result = reader.lookup(ip).ok()?;
-        result
-            .decode::<geoip2::Asn>()
-            .ok()
-            .flatten()?
-            .autonomous_system_number
+        asn_in(reader, ip).map_or(GeoResult::Unknown, GeoResult::Known)
     }
+}
+
+/// The country the database gives `ip`. A lookup that fails, an address with
+/// no record, a record without a country and a code that is not two letters
+/// are all no country.
+fn country_in(reader: &Reader<Vec<u8>>, ip: IpAddr) -> Option<[u8; 2]> {
+    let result = reader.lookup(ip).ok()?;
+    let record = result.decode::<geoip2::Country>().ok().flatten()?;
+    let code = record.country.iso_code?;
+    let b = code.as_bytes();
+    (b.len() == 2).then(|| [b[0].to_ascii_uppercase(), b[1].to_ascii_uppercase()])
+}
+
+/// The AS number the database gives `ip`; no number for the same reasons as
+/// no country in `country_in`.
+fn asn_in(reader: &Reader<Vec<u8>>, ip: IpAddr) -> Option<u32> {
+    let result = reader.lookup(ip).ok()?;
+    result
+        .decode::<geoip2::Asn>()
+        .ok()
+        .flatten()?
+        .autonomous_system_number
 }
 
 #[cfg(test)]
@@ -253,15 +269,59 @@ mod tests {
             "{:?}",
             diags.iter().map(|d| d.code).collect::<Vec<_>>()
         );
-        assert_eq!(db.country("2001:218::1".parse().unwrap()), Some(*b"JP"));
-        assert_eq!(db.country("2001:220::1".parse().unwrap()), Some(*b"KR"));
-        assert_eq!(db.country("127.0.0.1".parse().unwrap()), None);
-        assert_eq!(db.asn("1.0.0.1".parse().unwrap()), Some(15169));
-        assert_eq!(db.asn("1.128.0.1".parse().unwrap()), Some(1221));
-        assert_eq!(db.asn("127.0.0.1".parse().unwrap()), None);
+        assert_eq!(
+            db.country("2001:218::1".parse().unwrap()),
+            GeoResult::Known(*b"JP")
+        );
+        assert_eq!(
+            db.country("2001:220::1".parse().unwrap()),
+            GeoResult::Known(*b"KR")
+        );
+        assert_eq!(db.country("127.0.0.1".parse().unwrap()), GeoResult::Unknown);
+        assert_eq!(db.asn("1.0.0.1".parse().unwrap()), GeoResult::Known(15169));
+        assert_eq!(db.asn("1.128.0.1".parse().unwrap()), GeoResult::Known(1221));
+        assert_eq!(db.asn("127.0.0.1".parse().unwrap()), GeoResult::Unknown);
         let info = db.info();
         assert!(info.country_epoch.is_some() && info.asn_epoch.is_some());
         assert!(info.country_path.ends_with(COUNTRY_FILE));
+    }
+
+    /// A lookup says whether the database it asks is loaded: a loaded one has
+    /// an answer for an address or has none (`Unknown`), one that is not
+    /// loaded says so (`NotLoaded`), and each of the two is told on its own.
+    #[test]
+    fn a_loaded_database_tells_unknown_from_not_loaded() {
+        let dir = dir_with_fixtures();
+        let (db, _) = GeoDb::open(dir.path());
+        let ip = |text: &str| -> IpAddr { text.parse().unwrap() };
+        // 89.160.20.112 is in both databases; 127.0.0.1 in neither; 1.0.0.1 only
+        // in the AS database and 2001:218::1 only in the country one
+        assert_eq!(db.country(ip("89.160.20.112")), GeoResult::Known(*b"SE"));
+        assert_eq!(db.asn(ip("89.160.20.112")), GeoResult::Known(29518));
+        assert_eq!(db.country(ip("127.0.0.1")), GeoResult::Unknown);
+        assert_eq!(db.asn(ip("127.0.0.1")), GeoResult::Unknown);
+        assert_eq!(db.country(ip("1.0.0.1")), GeoResult::Unknown);
+        assert_eq!(db.asn(ip("2001:218::1")), GeoResult::Unknown);
+
+        let empty = tempfile::tempdir().unwrap();
+        let (none, _) = GeoDb::open(empty.path());
+        assert_eq!(none.country(ip("89.160.20.112")), GeoResult::NotLoaded);
+        assert_eq!(none.asn(ip("89.160.20.112")), GeoResult::NotLoaded);
+        assert_eq!(none.country(ip("127.0.0.1")), GeoResult::NotLoaded);
+        assert_eq!(none.asn(ip("127.0.0.1")), GeoResult::NotLoaded);
+
+        // only the AS database is there: the country one is not loaded, and
+        // that is not the same as having no country for the address
+        let only_asn = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            fixtures().join("GeoLite2-ASN-Test.mmdb"),
+            only_asn.path().join(ASN_FILE),
+        )
+        .unwrap();
+        let (half, _) = GeoDb::open(only_asn.path());
+        assert_eq!(half.country(ip("89.160.20.112")), GeoResult::NotLoaded);
+        assert_eq!(half.asn(ip("89.160.20.112")), GeoResult::Known(29518));
+        assert_eq!(half.asn(ip("127.0.0.1")), GeoResult::Unknown);
     }
 
     /// `describe` gives what each loaded database knows: the country from the
@@ -312,14 +372,14 @@ mod tests {
         assert_eq!(db.describe(ip), GeoAnswer::default());
         assert!(!db.warned_country.load(Ordering::Relaxed));
         assert!(!db.warned_asn.load(Ordering::Relaxed));
-        assert_eq!(db.country(ip), None);
-        assert_eq!(db.asn(ip), None);
+        assert_eq!(db.country(ip), GeoResult::NotLoaded);
+        assert_eq!(db.asn(ip), GeoResult::NotLoaded);
         assert!(db.warned_country.load(Ordering::Relaxed));
         assert!(db.warned_asn.load(Ordering::Relaxed));
     }
 
     #[test]
-    fn missing_files_are_info_and_lookups_return_none() {
+    fn missing_files_are_info_and_lookups_say_not_loaded() {
         let dir = tempfile::tempdir().unwrap();
         let (db, diags) = GeoDb::open(dir.path());
         let codes: Vec<&str> = diags.iter().map(|d| d.code).collect();
@@ -327,8 +387,11 @@ mod tests {
             codes,
             vec![codes::I_GEOIP_DB_MISSING, codes::I_GEOIP_DB_MISSING]
         );
-        assert_eq!(db.country("2001:218::1".parse().unwrap()), None);
-        assert_eq!(db.asn("1.0.0.1".parse().unwrap()), None);
+        assert_eq!(
+            db.country("2001:218::1".parse().unwrap()),
+            GeoResult::NotLoaded
+        );
+        assert_eq!(db.asn("1.0.0.1".parse().unwrap()), GeoResult::NotLoaded);
         assert_eq!(db.info().country_epoch, None);
     }
 
@@ -341,7 +404,10 @@ mod tests {
         assert!(codes.contains(&codes::W_RESOURCE_UNAVAILABLE));
         assert!(!dir.path().join(COUNTRY_FILE).exists());
         assert!(dir.path().join("GeoLite2-Country.mmdb.bad").exists());
-        assert_eq!(db.country("2001:218::1".parse().unwrap()), None);
+        assert_eq!(
+            db.country("2001:218::1".parse().unwrap()),
+            GeoResult::NotLoaded
+        );
     }
 
     #[test]
@@ -358,13 +424,13 @@ mod tests {
     fn load_swaps_a_new_file_in() {
         let dir = tempfile::tempdir().unwrap();
         let (db, _) = GeoDb::open(dir.path());
-        assert_eq!(db.asn("1.0.0.1".parse().unwrap()), None);
+        assert_eq!(db.asn("1.0.0.1".parse().unwrap()), GeoResult::NotLoaded);
         std::fs::copy(
             fixtures().join("GeoLite2-ASN-Test.mmdb"),
             dir.path().join(ASN_FILE),
         )
         .unwrap();
         db.load(DbKind::Asn).unwrap();
-        assert_eq!(db.asn("1.0.0.1".parse().unwrap()), Some(15169));
+        assert_eq!(db.asn("1.0.0.1".parse().unwrap()), GeoResult::Known(15169));
     }
 }

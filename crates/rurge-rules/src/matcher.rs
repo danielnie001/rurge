@@ -32,20 +32,31 @@ pub struct ResolvedAddrs {
     pub v6: Vec<Ipv6Addr>,
 }
 
+/// What a database says of an address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeoResult<T> {
+    /// The database is not loaded: nothing that depends on it matches.
+    NotLoaded,
+    /// The database is loaded and has no result for the address — what
+    /// `GEOIP,UNKNOWN` and `IP-ASN,UNKNOWN` match.
+    Unknown,
+    Known(T),
+}
+
 pub trait GeoLookup: Send + Sync {
-    fn country(&self, ip: IpAddr) -> Option<[u8; 2]>;
-    fn asn(&self, ip: IpAddr) -> Option<u32>;
+    fn country(&self, ip: IpAddr) -> GeoResult<[u8; 2]>;
+    fn asn(&self, ip: IpAddr) -> GeoResult<u32>;
 }
 
 /// No database loaded: every GEOIP / IP-ASN rule is a miss.
 pub struct NoGeo;
 
 impl GeoLookup for NoGeo {
-    fn country(&self, _: IpAddr) -> Option<[u8; 2]> {
-        None
+    fn country(&self, _: IpAddr) -> GeoResult<[u8; 2]> {
+        GeoResult::NotLoaded
     }
-    fn asn(&self, _: IpAddr) -> Option<u32> {
-        None
+    fn asn(&self, _: IpAddr) -> GeoResult<u32> {
+        GeoResult::NotLoaded
     }
 }
 
@@ -66,8 +77,8 @@ pub struct EvalCtx<'a> {
     /// only the hit of a set that is part of why it matched.
     pub sub_hit: Option<SubRuleHit>,
     geo: &'a dyn GeoLookup,
-    country_cache: Option<(IpAddr, Option<[u8; 2]>)>,
-    asn_cache: Option<(IpAddr, Option<u32>)>,
+    country_cache: Option<(IpAddr, GeoResult<[u8; 2]>)>,
+    asn_cache: Option<(IpAddr, GeoResult<u32>)>,
     /// How many `Matcher::Set` evaluations are currently nested. `SetRegistry`
     /// rejects cycles at compile time, but two rule-sets that independently
     /// hot-reload to reference each other can still form a live cycle in the
@@ -90,7 +101,7 @@ impl<'a> EvalCtx<'a> {
         }
     }
 
-    pub fn country(&mut self, ip: IpAddr) -> Option<[u8; 2]> {
+    pub fn country(&mut self, ip: IpAddr) -> GeoResult<[u8; 2]> {
         if let Some((cached_ip, code)) = self.country_cache
             && cached_ip == ip
         {
@@ -101,7 +112,7 @@ impl<'a> EvalCtx<'a> {
         code
     }
 
-    pub fn asn(&mut self, ip: IpAddr) -> Option<u32> {
+    pub fn asn(&mut self, ip: IpAddr) -> GeoResult<u32> {
         if let Some((cached_ip, asn)) = self.asn_cache
             && cached_ip == ip
         {
@@ -158,7 +169,9 @@ pub enum Matcher {
     IpCidr(Ipv4Net),
     IpCidr6(Ipv6Net),
     GeoIp([u8; 2]),
+    GeoIpUnknown,
     IpAsn(u32),
+    IpAsnUnknown,
     UserAgent(Glob),
     UrlRegex(Pattern),
     ProcessName(ProcessPattern),
@@ -228,7 +241,9 @@ impl Matcher {
                     Matcher::Never
                 }
             }
+            RuleKind::GeoIpUnknown => Matcher::GeoIpUnknown,
             RuleKind::IpAsn(n) => Matcher::IpAsn(*n),
+            RuleKind::IpAsnUnknown => Matcher::IpAsnUnknown,
             RuleKind::UserAgent(g) => Matcher::UserAgent(g.clone()),
             RuleKind::UrlRegex(p) => Matcher::UrlRegex(p.clone()),
             RuleKind::ProcessName(p) => Matcher::ProcessName(match p {
@@ -294,11 +309,19 @@ impl Matcher {
                 Err(v) => v,
             },
             Matcher::GeoIp(code) => match target_ip(s, ctx, no_resolve, Family::Any) {
-                Ok(ip) => (ctx.country(ip) == Some(*code)).into(),
+                Ok(ip) => (ctx.country(ip) == GeoResult::Known(*code)).into(),
+                Err(v) => v,
+            },
+            Matcher::GeoIpUnknown => match target_ip(s, ctx, no_resolve, Family::Any) {
+                Ok(ip) => (ctx.country(ip) == GeoResult::Unknown).into(),
                 Err(v) => v,
             },
             Matcher::IpAsn(asn) => match target_ip(s, ctx, no_resolve, Family::Any) {
-                Ok(ip) => (ctx.asn(ip) == Some(*asn)).into(),
+                Ok(ip) => (ctx.asn(ip) == GeoResult::Known(*asn)).into(),
+                Err(v) => v,
+            },
+            Matcher::IpAsnUnknown => match target_ip(s, ctx, no_resolve, Family::Any) {
+                Ok(ip) => (ctx.asn(ip) == GeoResult::Unknown).into(),
                 Err(v) => v,
             },
             Matcher::UserAgent(g) => s
@@ -534,17 +557,23 @@ mod tests {
         }
     }
 
+    /// A loaded database: it knows the addresses of 8.0.0.0/8 (a country and
+    /// an AS number each) and every IPv6 address (a country, no AS number),
+    /// and says `Unknown` of all others.
     struct FakeGeo;
     impl GeoLookup for FakeGeo {
-        fn country(&self, ip: IpAddr) -> Option<[u8; 2]> {
+        fn country(&self, ip: IpAddr) -> GeoResult<[u8; 2]> {
             match ip {
-                IpAddr::V4(v) if v.octets()[0] == 8 => Some(*b"US"),
-                IpAddr::V6(_) => Some(*b"JP"),
-                _ => None,
+                IpAddr::V4(v) if v.octets()[0] == 8 => GeoResult::Known(*b"US"),
+                IpAddr::V6(_) => GeoResult::Known(*b"JP"),
+                _ => GeoResult::Unknown,
             }
         }
-        fn asn(&self, ip: IpAddr) -> Option<u32> {
-            matches!(ip, IpAddr::V4(v) if v.octets()[0] == 8).then_some(15169)
+        fn asn(&self, ip: IpAddr) -> GeoResult<u32> {
+            match ip {
+                IpAddr::V4(v) if v.octets()[0] == 8 => GeoResult::Known(15169),
+                _ => GeoResult::Unknown,
+            }
         }
     }
 
@@ -684,6 +713,109 @@ mod tests {
             eval_resolved("GEOIP,US", &s, &["8.8.8.8"], &["2001:db8::1"]),
             Verdict::Match
         );
+    }
+
+    /// `GEOIP,UNKNOWN` and `IP-ASN,UNKNOWN` match the address a loaded
+    /// database has no answer for, and no other; a name is resolved first,
+    /// like for the rules beside them.
+    #[test]
+    fn geoip_unknown_matches_an_address_the_database_does_not_know() {
+        for raw in ["GEOIP,UNKNOWN", "IP-ASN,UNKNOWN"] {
+            // 127.0.0.1 is in neither half of the database, 8.8.8.8 in both
+            assert_eq!(eval(raw, &session("127.0.0.1")), Verdict::Match, "{raw}");
+            assert_eq!(eval(raw, &session("8.8.8.8")), Verdict::NoMatch, "{raw}");
+            // a name is resolved before it is judged, unless it says not to
+            let name = session("example.com");
+            assert_eq!(eval(raw, &name), Verdict::NeedsResolve, "{raw}");
+            assert_eq!(
+                eval(&format!("{raw},no-resolve"), &name),
+                Verdict::NoMatch,
+                "{raw}"
+            );
+            assert_eq!(
+                eval_resolved(raw, &name, &["127.0.0.1"], &[]),
+                Verdict::Match,
+                "{raw}"
+            );
+            assert_eq!(
+                eval_resolved(raw, &name, &["8.8.8.8"], &[]),
+                Verdict::NoMatch,
+                "{raw}"
+            );
+            // it is judged by its first IPv4 address, else its first IPv6 one
+            // (2001:db8::1 has a country but no AS number)
+            assert_eq!(
+                eval_resolved(raw, &name, &["8.8.8.8"], &["2001:db8::1"]),
+                Verdict::NoMatch,
+                "{raw}"
+            );
+        }
+        let name = session("example.com");
+        assert_eq!(
+            eval_resolved("GEOIP,UNKNOWN", &name, &["127.0.0.1"], &["2001:db8::1"]),
+            Verdict::Match
+        );
+        assert_eq!(
+            eval_resolved("GEOIP,UNKNOWN", &name, &[], &["2001:db8::1"]),
+            Verdict::NoMatch
+        );
+        assert_eq!(
+            eval_resolved("IP-ASN,UNKNOWN", &name, &[], &["2001:db8::1"]),
+            Verdict::Match
+        );
+        // an IPv6 address has a country in this database and no AS number
+        assert_eq!(
+            eval("GEOIP,UNKNOWN", &session("[2001:db8::1]")),
+            Verdict::NoMatch
+        );
+        assert_eq!(
+            eval("IP-ASN,UNKNOWN", &session("[2001:db8::1]")),
+            Verdict::Match
+        );
+        // in a logical rule too
+        assert_eq!(
+            eval(
+                "AND,((GEOIP,UNKNOWN),(IP-ASN,UNKNOWN),(DEST-PORT,443))",
+                &session("127.0.0.1")
+            ),
+            Verdict::Match
+        );
+        assert_eq!(
+            eval("OR,((GEOIP,UNKNOWN),(IP-ASN,UNKNOWN))", &session("8.8.8.8")),
+            Verdict::NoMatch
+        );
+        assert_eq!(
+            eval("NOT,((GEOIP,UNKNOWN))", &session("8.8.8.8")),
+            Verdict::Match
+        );
+    }
+
+    /// While no database is loaded nothing that depends on it matches: not
+    /// `UNKNOWN`, which is for the address a loaded database has no answer
+    /// for, and not a country or a number either.
+    #[test]
+    fn unknown_does_not_match_while_the_database_is_not_loaded() {
+        for raw in ["GEOIP,UNKNOWN", "IP-ASN,UNKNOWN", "GEOIP,CN", "IP-ASN,1"] {
+            for host in ["127.0.0.1", "8.8.8.8", "[2001:db8::1]"] {
+                let mut ctx = EvalCtx::new(&NoGeo);
+                assert_eq!(
+                    compile(raw).eval(&session(host), &mut ctx),
+                    Verdict::NoMatch,
+                    "{raw} on {host}"
+                );
+            }
+            // a name that has been resolved is judged by its address all the same
+            let mut ctx = EvalCtx::new(&NoGeo);
+            ctx.resolved = Some(ResolvedAddrs {
+                v4: vec!["127.0.0.1".parse().unwrap()],
+                v6: vec![],
+            });
+            assert_eq!(
+                compile(raw).eval(&session("example.com"), &mut ctx),
+                Verdict::NoMatch,
+                "{raw}"
+            );
+        }
     }
 
     #[test]
@@ -871,21 +1003,26 @@ mod tests {
     #[test]
     fn geo_lookups_are_cached_per_ip() {
         // `Cell` is not Sync; the trait requires Send + Sync, so wrap the counter.
-        struct SyncCounting(std::sync::Mutex<u32>);
+        struct SyncCounting(std::sync::Mutex<u32>, std::sync::Mutex<u32>);
         impl GeoLookup for SyncCounting {
-            fn country(&self, _: IpAddr) -> Option<[u8; 2]> {
+            fn country(&self, _: IpAddr) -> GeoResult<[u8; 2]> {
                 *self.0.lock().unwrap() += 1;
-                Some(*b"US")
+                GeoResult::Known(*b"US")
             }
-            fn asn(&self, _: IpAddr) -> Option<u32> {
-                None
+            fn asn(&self, _: IpAddr) -> GeoResult<u32> {
+                *self.1.lock().unwrap() += 1;
+                GeoResult::Unknown
             }
         }
-        let geo = SyncCounting(std::sync::Mutex::new(0));
+        let geo = SyncCounting(std::sync::Mutex::new(0), std::sync::Mutex::new(0));
         let mut ctx = EvalCtx::new(&geo);
         let ip: IpAddr = "8.8.8.8".parse().unwrap();
-        ctx.country(ip);
-        ctx.country(ip);
+        assert_eq!(ctx.country(ip), GeoResult::Known(*b"US"));
+        assert_eq!(ctx.country(ip), GeoResult::Known(*b"US"));
         assert_eq!(*geo.0.lock().unwrap(), 1);
+        // what is not known is kept too
+        assert_eq!(ctx.asn(ip), GeoResult::Unknown);
+        assert_eq!(ctx.asn(ip), GeoResult::Unknown);
+        assert_eq!(*geo.1.lock().unwrap(), 1);
     }
 }

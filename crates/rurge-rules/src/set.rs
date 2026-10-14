@@ -5,8 +5,8 @@
 use crate::domain_index::{DomainIndex, DomainIndexBuilder};
 use crate::ip_index::{IpIndex, IpIndexBuilder};
 use crate::matcher::{
-    CompiledSubRule, EvalCtx, Family, SetLookup, SetMatch, SetVerdict, Verdict, compile_subrule,
-    target_ip,
+    CompiledSubRule, EvalCtx, Family, GeoResult, SetLookup, SetMatch, SetVerdict, Verdict,
+    compile_subrule, target_ip,
 };
 use crate::set_format::{ParsedSet, SetKind, SetLine};
 use arc_swap::ArcSwap;
@@ -36,8 +36,9 @@ pub struct CompiledSet {
     /// logical rule, `GEOIP` and the IP lines set it whether or not they end
     /// up asking; and not `ips_resolve`, which is about the IP lines.
     asns_resolve: bool,
-    /// Everything that is not a plain domain, a CIDR or an `IP-ASN` line, in
-    /// file order.
+    /// Everything that is not a plain domain, a CIDR or an `IP-ASN` line that
+    /// names a number, in file order: the `UNKNOWN` lines of `GEOIP` and
+    /// `IP-ASN` are here, each judged on its own.
     linear: Vec<(u32, CompiledSubRule)>,
     entries: Vec<Box<str>>,
 }
@@ -117,6 +118,8 @@ impl CompiledSet {
                                 && matches!(
                                     other,
                                     RuleKind::GeoIp(_)
+                                        | RuleKind::GeoIpUnknown
+                                        | RuleKind::IpAsnUnknown
                                         | RuleKind::RuleSet(_)
                                         | RuleKind::DomainSet(_)
                                         | RuleKind::And(_)
@@ -165,11 +168,12 @@ impl CompiledSet {
         }
     }
 
-    /// Domain index first (never resolves), then linear entries in file order,
-    /// then the `IP-ASN` lines, then the IP index. The `IP-ASN` lines all
-    /// judge the same address, so one look-up of its AS number stands for
-    /// them all; they ask for resolution only when the caller did not say
-    /// `no-resolve` and some `IP-ASN` line did not either. The IP index holds
+    /// Domain index first (never resolves), then linear entries in file order
+    /// (the `UNKNOWN` lines among them), then the `IP-ASN` lines that name a
+    /// number, then the IP index. Those `IP-ASN` lines all judge the same
+    /// address, so one look-up of its AS number stands for them all; they ask
+    /// for resolution only when the caller did not say `no-resolve` and some
+    /// `IP-ASN` line did not either. The IP index holds
     /// every `IP-CIDR` / `IP-CIDR6` line, with or without `no-resolve`; it
     /// asks for resolution only when the caller did not say `no-resolve` and
     /// some line in it did not either (a line that said it never asks). When
@@ -216,7 +220,7 @@ impl CompiledSet {
         if !self.asns.is_empty() {
             match target_ip(s, ctx, no_resolve || !self.asns_resolve, Family::Any) {
                 Ok(ip) => {
-                    if let Some(asn) = ctx.asn(ip)
+                    if let GeoResult::Known(asn) = ctx.asn(ip)
                         && let Some(&i) = self.asns.get(&asn)
                     {
                         return self.hit(i);
@@ -475,7 +479,8 @@ DEST-PORT,8443
         (v.verdict, v.entry)
     }
 
-    /// A database that knows the AS numbers it is given, nothing else, and
+    /// A loaded database that knows the AS numbers it is given, nothing else
+    /// (it says `Unknown` of every other address, and of every country), and
     /// counts the questions it is asked.
     struct Asns {
         known: HashMap<IpAddr, u32>,
@@ -499,13 +504,15 @@ DEST-PORT,8443
     }
 
     impl GeoLookup for Asns {
-        fn country(&self, _: IpAddr) -> Option<[u8; 2]> {
-            None
+        fn country(&self, _: IpAddr) -> GeoResult<[u8; 2]> {
+            GeoResult::Unknown
         }
 
-        fn asn(&self, ip: IpAddr) -> Option<u32> {
+        fn asn(&self, ip: IpAddr) -> GeoResult<u32> {
             self.asked.fetch_add(1, Ordering::SeqCst);
-            self.known.get(&ip).copied()
+            self.known
+                .get(&ip)
+                .map_or(GeoResult::Unknown, |asn| GeoResult::Known(*asn))
         }
     }
 
@@ -1063,6 +1070,110 @@ DEST-PORT,8443
             ask_with(&set, &db, "192.0.2.2", None, false),
             matches_line("IP-ASN,64501,no-resolve")
         );
+    }
+
+    /// A pair of loaded databases: the addresses the first is given have a
+    /// country, the ones the second is given an AS number. Every other
+    /// address is `Unknown` to the database that does not have it.
+    struct Databases {
+        countries: HashSet<IpAddr>,
+        asns: HashMap<IpAddr, u32>,
+    }
+
+    impl Databases {
+        fn of(countries: &[&str], asns: &[(&str, u32)]) -> Databases {
+            Databases {
+                countries: countries.iter().map(|ip| ip.parse().unwrap()).collect(),
+                asns: asns
+                    .iter()
+                    .map(|(ip, asn)| (ip.parse().unwrap(), *asn))
+                    .collect(),
+            }
+        }
+    }
+
+    impl GeoLookup for Databases {
+        fn country(&self, ip: IpAddr) -> GeoResult<[u8; 2]> {
+            if self.countries.contains(&ip) {
+                GeoResult::Known(*b"ZZ")
+            } else {
+                GeoResult::Unknown
+            }
+        }
+
+        fn asn(&self, ip: IpAddr) -> GeoResult<u32> {
+            self.asns
+                .get(&ip)
+                .map_or(GeoResult::Unknown, |asn| GeoResult::Known(*asn))
+        }
+    }
+
+    /// `IP-ASN,UNKNOWN` and `GEOIP,UNKNOWN` lines are no entries for the table
+    /// of AS numbers: they are judged one by one with the other lines that
+    /// are walked, in the order of the file, and one that does not say
+    /// `no-resolve` makes the set ask for a name to be resolved.
+    #[test]
+    fn unknown_lines_in_a_set_are_evaluated_in_order() {
+        // 192.0.2.1: a country and the number 64500; 192.0.2.2: the number
+        // 64501, no country; 192.0.2.3: a country, no number; 198.51.100.1
+        // is in neither database
+        let db = Databases::of(
+            &["192.0.2.1", "192.0.2.3"],
+            &[("192.0.2.1", 64500), ("192.0.2.2", 64501)],
+        );
+        let set = compile(
+            SetKind::RuleSet,
+            "IP-ASN,64500,no-resolve\nIP-ASN,UNKNOWN\nGEOIP,UNKNOWN,no-resolve\n",
+            &Stub::default(),
+        );
+        // no line is skipped; only the number is in the table
+        assert_eq!(set.entry_count(), 3);
+        assert_eq!(set.asns.len(), 1);
+        assert_eq!(set.linear.len(), 2);
+        let at = |host: &str| ask_with(&set, &db, host, None, false);
+        // an address no database has matches both `UNKNOWN` lines, and the
+        // one reported is the first of them in the file
+        assert_eq!(at("198.51.100.1"), matches_line("IP-ASN,UNKNOWN"));
+        // one with a country and no number matches the line about numbers
+        assert_eq!(at("192.0.2.3"), matches_line("IP-ASN,UNKNOWN"));
+        // one with a number and no country matches the line about countries
+        assert_eq!(at("192.0.2.2"), matches_line("GEOIP,UNKNOWN,no-resolve"));
+        // one with both matches neither, and is judged by the table of numbers
+        assert_eq!(at("192.0.2.1"), matches_line("IP-ASN,64500,no-resolve"));
+        // the same lines the other way round report the other one
+        let reversed = compile(
+            SetKind::RuleSet,
+            "GEOIP,UNKNOWN,no-resolve\nIP-ASN,UNKNOWN\nIP-ASN,64500,no-resolve\n",
+            &Stub::default(),
+        );
+        assert_eq!(
+            ask_with(&reversed, &db, "198.51.100.1", None, false),
+            matches_line("GEOIP,UNKNOWN,no-resolve")
+        );
+
+        // the line that does not say `no-resolve` is why the set asks
+        assert!(set.needs_dns);
+        assert_eq!(ask_with(&set, &db, "other.org", None, false), ASKS);
+        assert_eq!(ask_with(&set, &db, "other.org", None, true), NO_MATCH);
+        assert_eq!(
+            ask_with(&set, &db, "other.org", addrs(&["198.51.100.1"], &[]), false),
+            matches_line("IP-ASN,UNKNOWN")
+        );
+        for (line, asks) in [
+            ("IP-ASN,UNKNOWN", true),
+            ("GEOIP,UNKNOWN", true),
+            ("IP-ASN,UNKNOWN,no-resolve", false),
+            ("GEOIP,UNKNOWN,no-resolve", false),
+        ] {
+            let set = compile(SetKind::RuleSet, &format!("{line}\n"), &Stub::default());
+            assert_eq!(set.needs_dns, asks, "{line}");
+            let want = if asks { ASKS } else { NO_MATCH };
+            assert_eq!(
+                ask_with(&set, &db, "other.org", None, false),
+                want,
+                "{line}"
+            );
+        }
     }
 
     /// A number written twice, once as `AS64500`, is one number; the line

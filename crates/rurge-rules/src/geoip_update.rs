@@ -163,7 +163,7 @@ fn extract_mmdb_with_limit(data: &[u8], limit: u64) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     use crate::geoip::{ASN_FILE, COUNTRY_FILE};
-    use crate::matcher::GeoLookup;
+    use crate::matcher::{GeoLookup, GeoResult};
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use rurge_net::connector::{DirectConnector, SystemResolve};
@@ -264,8 +264,11 @@ mod tests {
             i.country_epoch.is_some() && i.asn_epoch.is_some()
         })
         .await;
-        assert_eq!(geo.country("2001:218::1".parse().unwrap()), Some(*b"JP"));
-        assert_eq!(geo.asn("1.0.0.1".parse().unwrap()), Some(15169));
+        assert_eq!(
+            geo.country("2001:218::1".parse().unwrap()),
+            GeoResult::Known(*b"JP")
+        );
+        assert_eq!(geo.asn("1.0.0.1".parse().unwrap()), GeoResult::Known(15169));
         assert!(geo_dir.join(COUNTRY_FILE).exists() && geo_dir.join(ASN_FILE).exists());
         assert!(!geo_dir.join("GeoLite2-Country.mmdb.tmp").exists());
     }

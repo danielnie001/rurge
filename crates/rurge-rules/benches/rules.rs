@@ -7,7 +7,7 @@ use rurge_config::session::SessionInfo;
 use rurge_rules::domain_index::DomainIndexBuilder;
 use rurge_rules::engine::NoResolve;
 use rurge_rules::ip_index::IpIndexBuilder;
-use rurge_rules::matcher::{EvalCtx, GeoLookup, NoGeo, SetLookup, SetRef, Verdict};
+use rurge_rules::matcher::{EvalCtx, GeoLookup, GeoResult, NoGeo, SetLookup, SetRef, Verdict};
 use rurge_rules::set::{CompiledSet, SetHandle};
 use rurge_rules::set_format::{ParsedSet, SetKind, SetLine, parse_set};
 use rurge_rules::{OutboundMode, RuleEngine};
@@ -190,11 +190,11 @@ struct AsnByAddress {
 }
 
 impl GeoLookup for AsnByAddress {
-    fn country(&self, _: IpAddr) -> Option<[u8; 2]> {
-        None
+    fn country(&self, _: IpAddr) -> GeoResult<[u8; 2]> {
+        GeoResult::Unknown
     }
-    fn asn(&self, ip: IpAddr) -> Option<u32> {
-        Some(if ip == self.hit { self.hit_asn } else { 7 })
+    fn asn(&self, ip: IpAddr) -> GeoResult<u32> {
+        GeoResult::Known(if ip == self.hit { self.hit_asn } else { 7 })
     }
 }
 

@@ -506,7 +506,8 @@ impl RuleEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matcher::{NoGeo, SetRef};
+    use crate::geoip::{COUNTRY_FILE, DbKind, GeoDb};
+    use crate::matcher::{GeoResult, NoGeo, SetRef};
     use crate::set::{CompiledSet, SetHandle};
     use crate::set_format::{ParsedSet, SetKind, SetLine, internal_set_text, parse_set};
     use rurge_config::Reach;
@@ -1365,14 +1366,15 @@ AND,((RULE-SET,Y),(OR,((DEST-PORT,1),(DEST-PORT,443)))),P\nFINAL,DIRECT\n\
         );
     }
 
-    /// Gives every address the same AS number.
+    /// A loaded database that gives every address the same AS number and no
+    /// country.
     struct AsnOfEverything(u32);
     impl GeoLookup for AsnOfEverything {
-        fn country(&self, _: IpAddr) -> Option<[u8; 2]> {
-            None
+        fn country(&self, _: IpAddr) -> GeoResult<[u8; 2]> {
+            GeoResult::Unknown
         }
-        fn asn(&self, _: IpAddr) -> Option<u32> {
-            Some(self.0)
+        fn asn(&self, _: IpAddr) -> GeoResult<u32> {
+            GeoResult::Known(self.0)
         }
     }
 
@@ -1467,6 +1469,36 @@ AND,((RULE-SET,Y),(OR,((DEST-PORT,1),(DEST-PORT,443)))),P\nFINAL,DIRECT\n\
             .await;
         assert_eq!((d.reason, d.matched), (Reason::Final, Some(1)));
         assert!(d.sub_rule.is_none());
+    }
+
+    /// The databases are not there when the engine is built: they come with
+    /// the first download. `GEOIP,UNKNOWN` does not match until its database
+    /// is loaded, and then the engine that was built before it matches, with
+    /// no reload.
+    #[tokio::test]
+    async fn unknown_starts_matching_once_the_database_is_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (geo, _) = GeoDb::open(dir.path());
+        let cfg = load("[Proxy]\nA = direct\nB = direct\n[Rule]\nGEOIP,UNKNOWN,A\nFINAL,B\n");
+        let e = RuleEngine::build(&cfg, &InlineSets::from_config(&cfg), geo.clone()).unwrap();
+        let policy = || async {
+            let d = e
+                .evaluate(&session("127.0.0.1"), OutboundMode::Rule, &Panicking)
+                .await;
+            d.policy().map(named)
+        };
+        assert_eq!(policy().await.as_deref(), Some("B"));
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("GeoIP2-Country-Test.mmdb"),
+            dir.path().join(COUNTRY_FILE),
+        )
+        .unwrap();
+        geo.load(DbKind::Country).unwrap();
+        // 127.0.0.1 is in no country of the database
+        assert_eq!(policy().await.as_deref(), Some("A"));
     }
 
     #[test]

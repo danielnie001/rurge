@@ -270,6 +270,31 @@ fn check_says_what_the_first_final_does_to_the_rest() {
     assert!(out.contains("0 error(s), 2 warning(s)"), "{out}");
 }
 
+/// `UNKNOWN` is a value of `GEOIP` and of `IP-ASN`, in any case: `check`
+/// reads both lines and has nothing to say about them.
+#[test]
+fn check_accepts_ip_asn_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write(
+        &dir,
+        "unknown.conf",
+        "[Rule]\nIP-ASN,unknown,DIRECT\nGEOIP,UNKNOWN,DIRECT\nFINAL,DIRECT\n",
+    );
+    let out = rurge_command()
+        .args(["check", "--data-dir"])
+        .arg(dir.path().join("data"))
+        .arg("-c")
+        .arg(&conf)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    assert!(!out.contains("E0011"), "{out}");
+    assert!(out.contains("0 error(s), 0 warning(s), 0 note(s)"), "{out}");
+}
+
 #[test]
 fn bom_prefixed_config_is_accepted() {
     let dir = tempfile::tempdir().unwrap();

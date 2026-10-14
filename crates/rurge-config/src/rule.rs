@@ -258,7 +258,11 @@ pub enum RuleKind {
     IpCidr(Ipv4Net),
     IpCidr6(Ipv6Net),
     GeoIp(String),
+    /// `GEOIP,UNKNOWN`: an address the country database has no country for.
+    GeoIpUnknown,
     IpAsn(u32),
+    /// `IP-ASN,UNKNOWN`: an address the ASN database has no number for.
+    IpAsnUnknown,
     UserAgent(Glob),
     UrlRegex(Pattern),
     ProcessName(ProcessPattern),
@@ -291,8 +295,8 @@ impl RuleKind {
             RuleKind::DomainSet(_) => "DOMAIN-SET",
             RuleKind::IpCidr(_) => "IP-CIDR",
             RuleKind::IpCidr6(_) => "IP-CIDR6",
-            RuleKind::GeoIp(_) => "GEOIP",
-            RuleKind::IpAsn(_) => "IP-ASN",
+            RuleKind::GeoIp(_) | RuleKind::GeoIpUnknown => "GEOIP",
+            RuleKind::IpAsn(_) | RuleKind::IpAsnUnknown => "IP-ASN",
             RuleKind::UserAgent(_) => "USER-AGENT",
             RuleKind::UrlRegex(_) => "URL-REGEX",
             RuleKind::ProcessName(_) => "PROCESS-NAME",
@@ -318,7 +322,12 @@ impl RuleKind {
     pub fn is_ip_based(&self) -> bool {
         matches!(
             self,
-            RuleKind::IpCidr(_) | RuleKind::IpCidr6(_) | RuleKind::GeoIp(_) | RuleKind::IpAsn(_)
+            RuleKind::IpCidr(_)
+                | RuleKind::IpCidr6(_)
+                | RuleKind::GeoIp(_)
+                | RuleKind::GeoIpUnknown
+                | RuleKind::IpAsn(_)
+                | RuleKind::IpAsnUnknown
         )
     }
     /// Whether this rule kind may carry `pre-matching`, per the Surge manual's
@@ -335,7 +344,9 @@ impl RuleKind {
             | RuleKind::IpCidr(_)
             | RuleKind::IpCidr6(_)
             | RuleKind::GeoIp(_)
+            | RuleKind::GeoIpUnknown
             | RuleKind::IpAsn(_)
+            | RuleKind::IpAsnUnknown
             | RuleKind::SrcIp(_)
             | RuleKind::DestPort(_)
             | RuleKind::SrcPort(_)
@@ -508,6 +519,14 @@ fn parse_mac(value: &str) -> Option<String> {
     )
 }
 
+/// Whether the value of a `GEOIP` or an `IP-ASN` rule is `UNKNOWN`, in any
+/// case: the address the database has no answer for. It is checked before the
+/// value is read as a country code or an AS number, so `ASUNKNOWN` is still no
+/// number.
+fn is_unknown(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("UNKNOWN")
+}
+
 fn parse_kind(ty: &str, value: &str, ctx: &ParseCtx, depth: usize) -> Result<RuleKind, ParseError> {
     let kind = match ty {
         "DOMAIN" => RuleKind::Domain(value.trim_end_matches('.').to_ascii_lowercase()),
@@ -537,12 +556,14 @@ fn parse_kind(ty: &str, value: &str, ctx: &ParseCtx, depth: usize) -> Result<Rul
                 })
                 .map_err(|_| invalid(ty, value, "expected IPv6 CIDR"))?,
         ),
+        "GEOIP" if is_unknown(value) => RuleKind::GeoIpUnknown,
         "GEOIP" => {
             if value.is_empty() || !value.chars().all(|c| c.is_ascii_alphabetic()) {
                 return Err(invalid(ty, value, "expected an ISO country code"));
             }
             RuleKind::GeoIp(value.to_ascii_uppercase())
         }
+        "IP-ASN" if is_unknown(value) => RuleKind::IpAsnUnknown,
         "IP-ASN" => {
             let digits = value
                 .strip_prefix("AS")
@@ -1000,6 +1021,60 @@ mod tests {
         assert!(
             matches!(&subs[0].kind, RuleKind::Not(inner) if matches!(inner.kind, RuleKind::SrcIp(_)))
         );
+    }
+
+    /// `UNKNOWN`, in any case, is a value of `GEOIP` and of `IP-ASN` (manual,
+    /// IP Rules): the address the database has no answer for. It is read as
+    /// that before the value is read as a country code or a number, so
+    /// `ASUNKNOWN` is still no number.
+    #[test]
+    fn unknown_is_a_value_of_geoip_and_ip_asn() {
+        for raw in [
+            "GEOIP,UNKNOWN,P",
+            "GEOIP,unknown,P",
+            "GEOIP,Unknown,P,no-resolve",
+        ] {
+            let rule = parse(raw).unwrap_or_else(|e| panic!("{raw}: {}", e.message));
+            assert_eq!(rule.kind, RuleKind::GeoIpUnknown, "{raw}");
+            assert_eq!(rule.to_string(), raw);
+        }
+        for raw in ["IP-ASN,UNKNOWN,P", "IP-ASN,unknown,P"] {
+            let rule = parse(raw).unwrap_or_else(|e| panic!("{raw}: {}", e.message));
+            assert_eq!(rule.kind, RuleKind::IpAsnUnknown, "{raw}");
+            assert_eq!(rule.to_string(), raw);
+        }
+        assert_eq!(
+            parse("IP-ASN,ASUNKNOWN,P").unwrap_err().code,
+            codes::E_INVALID_RULE_VALUE
+        );
+        // a word of three letters that is not that one loads as it did, as a
+        // code no address has
+        assert_eq!(
+            parse("GEOIP,USA,P").unwrap().kind,
+            RuleKind::GeoIp("USA".into())
+        );
+        // the rules are of the types they sit beside
+        for (unknown, plain) in [
+            ("GEOIP,UNKNOWN,P", "GEOIP,CN,P"),
+            ("IP-ASN,UNKNOWN,P", "IP-ASN,1,P"),
+        ] {
+            let unknown = parse(unknown).unwrap().kind;
+            let plain = parse(plain).unwrap().kind;
+            assert_eq!(unknown.type_name(), plain.type_name());
+            assert!(unknown.is_ip_based());
+            assert!(plain.is_ip_based());
+            assert!(unknown.supports_pre_matching());
+            assert!(plain.supports_pre_matching());
+        }
+        assert!(parse("GEOIP,UNKNOWN,REJECT,pre-matching").is_ok());
+        assert!(parse("IP-ASN,UNKNOWN,REJECT-DROP,pre-matching").is_ok());
+        // and may stand in a logical rule
+        let rule = parse("AND,((GEOIP,UNKNOWN),(IP-ASN,UNKNOWN),(DEST-PORT,443)),P").unwrap();
+        let RuleKind::And(subs) = &rule.kind else {
+            panic!("{rule:?}")
+        };
+        assert_eq!(subs[0].kind, RuleKind::GeoIpUnknown);
+        assert_eq!(subs[1].kind, RuleKind::IpAsnUnknown);
     }
 
     /// The three port rules share one grammar (manual, Source and Port
