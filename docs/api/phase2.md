@@ -302,7 +302,7 @@ UDP 测试（M5c）：策略有 UDP 测试时——策略的 `test-udp`，否则
 
 ## 跟随出站模式下 DNS 的内部会话（M7c）
 
-`[General] encrypted-dns-follow-outbound-mode = true` 时，解析器到加密 DNS 上游的连接由规则选策略，每条连接是请求记录（`GET /v1/requests/recent`、`GET /v1/requests/active`）里的一条内部会话：`listener` 为 `internal`，`dst` 是上游服务器的地址与端口，`rule` 与 `policy` 是命中的规则与策略链。TCP / DoT / DoH 上游的连接自阶段 1 起如此（`transport` 为 `tcp`，`protocol` 按上游 URL 的方案标为 `dns`（`tcp://`）、`dot`（`tls://`）或 `doh`（`https://`），端口是多少都一样；`[Host]` 的 `server:` 写的服务器同样按方案标，DoQ / DoH3 的也是）；自阶段 2 / M7c 起，DoQ / DoH3 上游的 QUIC 载体也是：
+`[General] encrypted-dns-follow-outbound-mode = true` 时，解析器到加密 DNS 上游的连接由规则选策略，每条连接是请求记录（`GET /v1/requests/recent`、`GET /v1/requests/active`）里的一条内部会话：`listener` 为 `internal`，`dst` 是上游服务器的地址与端口，`rule` 与 `policy` 是命中的规则与策略链。TCP / DoT / DoH 上游的连接自阶段 1 起如此（`transport` 为 `tcp`，`protocol` 按上游 URL 的方案标为 `dns`（`tcp://`）、`dot`（`tls://`）或 `doh`（`https://`），端口是多少都一样；`[Host]` 的 `server:` 写的服务器同样按方案标，DoQ / DoH3 的也是；按方案标自手册基线重对起，此前按端口猜）；自阶段 2 / M7c 起，DoQ / DoH3 上游的 QUIC 载体也是：
 
 - **形状**：`transport` 为 `udp`，`protocol` 按上游 URL 的方案标为 `doh3`（`h3://`）或 `doq`（`quic://`），端口是多少都一样；`up` / `down` 是载体发出与收到的数据报字节数，`connectMs` 到载体打开为止，`firstByteMs` 到服务器的第一个回包为止。
 - **监听端口与远端地址**（阶段 1 补遗（M5a）起，两个键见 `docs/api/phase1.md`）：内部会话没有监听端口，`listenPort` 是 `null`；TCP / DoT / DoH 上游的会话 `remoteAddr` 与别的 TCP 会话同一条规则：直连时——含因 REJECT、以域名配置的代理而改走直连——是上游服务器的地址，经以地址配置的代理时是代理服务器的地址，代理走复用的连接或隧道时是 `null`；QUIC 载体是 UDP，`remoteAddr` 恒为 `null`（载体经代理打开时，代理那条 TCP 连接的地址也不显示）。

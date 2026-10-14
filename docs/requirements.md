@@ -610,7 +610,7 @@ Tailscale 策略、Ponte 替代方案、Metered Network Mode、Snell v6 与 v5 �
 
 ## 附录 A：参考资料
 
-- Surge 官方手册：<https://manual.nssurge.com/>（本文档依据 2026-09 版本；章节：Getting Started、Profile、Rules、Policies、Policy Groups、DNS、HTTP Processing、Scripting、Features、Tools）
+- Surge 官方手册：<https://manual.nssurge.com/>（本文档成稿时依据 2026-09 版本的手册，现在对照的基线见文首的参考基线一行；章节：Getting Started、Profile、Rules、Policies、Policy Groups、DNS、HTTP Processing、Scripting、Features、Tools）
 - RFC 9298（Proxying UDP in HTTP）、RFC 9297（HTTP Datagrams）— MASQUE 与 HTTP/2 CONNECT-UDP
 - RFC 1928 / 1929 — SOCKS5 及用户名密码认证
 - WireGuard 协议白皮书 — <https://www.wireguard.com/papers/wireguard.pdf>

@@ -475,7 +475,7 @@ Shadow TLS：
 
 ### 手册基线重对之后（2026-10-14）
 
-上面的数字、前面各节与下面的表是各自那一天的，不改。2026-10-14 的手册基线重对（报告 `docs/reports/2026-10-14-manual-baseline-recheck.md`，设计 `docs/superpowers/specs/2026-10-14-manual-baseline-recheck-design.md`，计划 `docs/superpowers/plans/2026-10-14-manual-baseline-recheck-plan.md`）把那天取的整本手册逐句对着兼容性清单读了一遍，也改了几处阶段 1、2 已经声称支持的条目上的代码。本节引用的提交都在 `30b082a..6f33016` 里（`30b082a` 是这些提交之前的 `main`；`c4b992d` 与 `6f33016` 只改兼容性清单，其余改代码、用例或文档）；"`a` ～ `b`"是含两端的一段。
+写明日期的段落与表是各自那一天的，不改；只有几处不带日期的手工清单项数改成了现在的数。2026-10-14 的手册基线重对（报告 `docs/reports/2026-10-14-manual-baseline-recheck.md`，设计 `docs/superpowers/specs/2026-10-14-manual-baseline-recheck-design.md`，计划 `docs/superpowers/plans/2026-10-14-manual-baseline-recheck-plan.md`）把那天取的整本手册逐句对着兼容性清单读了一遍，也改了几处阶段 1、2 已经声称支持的条目上的代码。本节引用的提交都在 `30b082a..6f33016` 里（`30b082a` 是这些提交之前的 `main`；`c4b992d` 与 `6f33016` 只改兼容性清单，其余改代码、用例或文档）；"`a` ～ `b`"是含两端的一段。
 
 - **基线前移。** 项目对照的手册从此是 Surge Mac 6.10.0 / iOS 5.23.0（2026-10-13 发布）的手册，2026-10-14 取的文本，87 页；需求文档的参考基线一行、兼容性清单的表头、`CLAUDE.md` 与两份 README 同改。官方频道里 2026-10-13 之后的测试版还有几件手册没有写到的（自适应的 `block-quic`、`GET /v1/policies?include_external=true`、跨多个包的 QUIC 主机名识别、QUIC v2 与 draft-29），下一次重对从那里开始。
 - **阶段 1 的三个数变了。** 2026-10-13 写的是 3 句没有做完、37 句的阶段栏与登记不一致、14 句有意不同；现在是 **2 句没有做完、37 句的阶段栏与登记不一致、10 句有意不同**（`docs/acceptance/phase1-acceptance.md` 的 `## 数字`：补上了 14、没有做完 2、有意不同 10，合计仍是 416）。动的是五句：FR-RULE-01 手册 IP 页的 `GEOIP,UNKNOWN` 与 `IP-ASN,UNKNOWN` 那一句，原来记"没有做完"，`9b0bcfe` 补上了——匹配数据库已载入而查不到的地址，库没有载入时不匹配；FR-RULE-08 的 DoH、DoT、DNS 三个连接标签与 FR-DNS-04 的 `PROTOCOL` 规则匹配那四句，原来记"有意不同"，`42c2294` 补上了——跟随出站模式时 DNS 会话的协议标签按 URL 的方案定，不再按端口猜。FR-RULE-08 的 DoH3、DoQ 两句的结论没有变，仍在"阶段栏与登记不一致"的 37 句里，说标签的话随之改了。
