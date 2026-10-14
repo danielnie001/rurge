@@ -373,7 +373,7 @@ pub struct StackOptions { /* 原有的 */, pub dns_connector: Option<DnsConnecto
 | 23 | 任务 4、5 | 阶段 1 的三个数是 2 / 37 / 10，不是计划写的 2 / 37 / 14：任务 4 让 DNS 连接的标签照手册按方案定，阶段 1 验收文档里原来"有意不同"的四句（FR-RULE-08 的 DoH、DoT、DNS 连接，FR-DNS-04 的 `PROTOCOL` 规则匹配）改记"补上了"（`42c2294`）；写计划时没有看出这一层连带 | 照实写：`## 数字` 是 补上了 14 / 没有做完 2 / 有意不同 10，引用三个数的各处随之改 |
 | 24 | 任务 5 | 报告第 5 节没有为清单 3.1 节 `PROTOCOL` 一行列改动（标签的改动在报告之后才定）：那一行里两句按端口的说法随清单那一次一并改了 | 照此 |
 | 25 | 任务 5 | 阶段 2 验收文档里引用三个数的两处都写着日期（2026-10-13）：没有改写，各在后面加了一段写明 2026-10-14 的 | 代项目所有者作的裁定：写明日期的话是历史，同这份文档自己的写法 |
-| 26 | 任务 5 | 文档的提交没有跑测试：没有用例读这些文档；全量门禁在最后的提交上跑了一次 | 代项目所有者作的裁定 |
+| 26 | 任务 5 | 文档的提交没有跑测试：没有用例读这些文档；全量门禁跑在最后一个改代码的提交 `5eb0a0a` 上，合并之前的订正之后又在 `a261122` 上跑了一次（其后只有文档变过） | 代项目所有者作的裁定 |
 | 27 | 任务 5 | 清单里三处补充不在报告的原文里：`GEOIP` 一行多一句（库已载入时 `GEOIP,UNKNOWN` 也命中回环与私有网段这些库里没有条目的地址），1.2 节 `[IP Rewrite]` 一行与 6.2 节 `encrypted-dns-follow-outbound-mode` 一行的第一部分各多引一条用例 | 留着：都与代码相符 |
 | 28 | 任务 5 | 清单 4.6 节「WireGuard 生命周期」一行说握手发起包之外的包不标，`wireguard` 行上的 `tos` 生效之后不对了；报告没有为它列改动 | 另一个提交订正（`6f33016`）：其它包标策略的 `tos`，没写时不标，共用的隧道取起它的那个策略的 |
 | 29 | 任务 5 | 清单 3.2、3.3、3.5 节有 14 行比表头少一格（最后一格空着），早于这一轮 | 没有动；延后 |
@@ -381,7 +381,7 @@ pub struct StackOptions { /* 原有的 */, pub dns_connector: Option<DnsConnecto
 | 31 | 任务 1 | `a_wireguard_tunnel_marks_its_datagrams_with_the_policys_tos` 与 `two_wireguard_policies_of_one_section_share_the_tunnel_whatever_their_tos` 只靠一条 `IP-CIDR` 规则把会话送进隧道，夹具在规则之后接 `FINAL,DIRECT`：这条规则失灵时，引擎会直连 `10.0.0.x` 的 7 号端口，离开回环 | 两条用例的规则之后各加一条 `DEST-PORT,7,REJECT` 作第二道防线（`e2e0a8e`）；没有做"改坏 `IP-CIDR` 的匹配看它拦住"的验证：同一个测试二进制里用 `TO_WG` 的旧用例只有一道防线，那一改会让它们直连出去（「延后事项」第 15 行） |
 | 32 | 任务 1 | 用例的两处缺口：`check_reads_a_legacy_custom_policy_as_ss` 起二进制没有给 `--data-dir`；`crates/rurge-config/tests/secrets.rs` 没有收位置上写错的加密方法（那个位置上也可能是口令） | 补上（`e2e0a8e`）：给 `--data-dir`；`secrets.rs` 加一行位置上写错方法的 `custom` 行，诊断里找不到标记、仍说出是哪个参数 |
 | 33 | 任务 2 | `unknown_is_a_value_of_geoip_and_ip_asn` 只断言了大小写，阶段 1 验收文档 FR-RULE-01 一行的用例栏说它也钉住首尾空白（第 7 行留着的那种带引号、里面有空白的写法） | 那条用例加上带引号、里面有空白的两种写法（`e2e0a8e`；去掉 `is_unknown` 里的 `trim` 时它变红） |
-| 34 | 任务 4 | `each_kind_of_upstream_dials_through_its_own_connector` 只用 IP 字面量：去掉 `tls` 或 `https` 那一层引导解析的包装，没有用例变红；跟随出站模式下，名字会落进 `crates/rurge-engine/src/dns_pipeline.rs` 防御用的 `Domain` 分支，会话不经规则、也不进请求记录。另有两处读不顺的文档注释（`Runtime::dns_pipeline` 与 `Face`） | 新用例 `a_named_server_reaches_its_connector_as_the_address_the_bootstrap_gave`（`e2e0a8e`）：以名字写的 `tls://` 与 `https://` 服务器，`MockDns` 的表把名字答成 `127.0.0.1`，连接器被问到的是这个地址（去掉包装时它变红）；被拒绝的连接不结束一次查找，要到解析器放弃（30 秒之后）才结束，所以用例在暂停的时钟上跑，引导解析问 `MockDns` 的内存表、不经 socket；两处注释改写（`e2e0a8e`） |
+| 34 | 任务 4 | `each_kind_of_upstream_dials_through_its_own_connector` 只用 IP 字面量：去掉 `tls` 或 `https` 那一层引导解析的包装，没有用例变红；跟随出站模式下，名字会落进 `crates/rurge-engine/src/dns_pipeline.rs` 防御用的 `Domain` 分支，会话不经规则、也不进请求记录。另有两处读不顺的文档注释（`Runtime::dns_pipeline` 与 `Face`） | 新用例 `a_named_server_reaches_its_connector_as_the_address_the_bootstrap_gave`（`e2e0a8e`）：以名字写的 `tls://` 与 `https://` 服务器，`MockDns` 的表把名字答成 `127.0.0.1`，连接器被问到的是这个地址（去掉包装时它变红）；被拒绝的连接不结束一次查找，要到解析器放弃（用例的设置下是 30 秒之后）才结束，所以用例在暂停的时钟上跑，引导解析问 `MockDns` 的内存表、不经 socket；两处注释改写（`e2e0a8e`） |
 | 35 | 任务 5 | 文档的几处：阶段 2 手工清单 M7c 一项里"服务器须在 443 端口"是按端口的旧说法；`CLAUDE.md` 说 `include-device-communication` 属于比项目基线更晚的手册版本，基线前移之后不再成立；需求文档附录 A 的"本文档依据 2026-09 版本"与文首新的基线一行矛盾；阶段 2 验收文档 2026-10-14 一小节的开头说前面各节不改，而同一个提交改了几处不带日期的手工清单项数；`docs/api/phase2.md` 的"自阶段 1 起如此"读来像是也管着按方案标；清单附录说 2026-10-14 那次重数用的是"同一个脚本"（规则相同，脚本是另写的）；阶段 1 手工清单的节标题把整节归给阶段 1 补遗（M5b），这一节现在也有手册基线重对加的一条 | 各自订正 |
 
 ## 延后事项
@@ -405,3 +405,4 @@ pub struct StackOptions { /* 原有的 */, pub dns_connector: Option<DnsConnecto
 | 15 | `crates/rurge-engine/tests/outbounds_wireguard.rs` 里其余用 `TO_WG` 的旧用例只有一道防线（同「执行期修正记录」第 31 行那两条用例修正之前）：在 `TO_WG` 里加一条 `DEST-PORT,7,REJECT` 就都补上 | 下次动到时 |
 | 16 | `crates/rurge/tests/cli.rs` 另有 22 条旧的 `check` 用例没有给 `--data-dir`：Windows 与 Linux 上 `rurge_command()` 把缺省目录指到草稿目录，macOS 上 `HOME` 不动，`check` 会只读地看一眼真实的缺省数据目录 | 下次动到时 |
 | 17 | 留着没改的几处小的：`crates/rurge-dns/src/upstream/mod.rs` 里 `tcp://` 与 `quic://` 两段相同的检查；`harness_hooked` 重写了约 35 行；`crates/rurge-config/src/spec/ss.rs` 手写的那句不带取值的 "invalid value"（与读取器的措辞以后可能走开）；`random_below` 与 `load-balance` 内联的同一个式子；`tos` 的用例断言整张调用表（握手重发时它会失败并打出整张表）；内联 `[Ruleset]` 里的 `UNKNOWN` 行与预匹配里的 `GEOIP,UNKNOWN` 没有自己的用例（走的是有用例的共用路径）；`tcp`、`tls`、`https` 三个面也实现了 `connect_udp`（没有调用者） | 下次动到时 |
+| 18 | 一次查找的上游都很快失败（连接被拒、SERVFAIL）时，查找不在最后一轮都失败时结束，而是睡到扇出的截止时间（重发间隔 × 轮数，缺省 1 秒 × 5 即 5 秒）：最后一轮都失败之后还要再等一个重发间隔；读代码得出（`crates/rurge-dns/src/fanout.rs` 的 `resolve_name`：最后一轮发出之后，出口只有睡到截止时间，失败只被记下、不让那个问题有结论），没有用例 | 有用户报告再说，或下次动到 `fanout.rs` 时 |
