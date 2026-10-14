@@ -1933,8 +1933,8 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
 /// send the connection to a proxy of the test's own, which refuses — by what
 /// the connection is called when that is right, by its address when it is not,
 /// so that a wrong label fails the test without a connection to anything but
-/// that proxy. Those that carry no UDP are refused by it all the same: a QUIC
-/// carrier is a UDP session, and the proxy takes none.
+/// that proxy. The carrier of a QUIC server is a UDP session, which that proxy
+/// does not carry: it refuses that too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dns_session_is_labelled_by_its_scheme_whatever_the_port() {
     // The last row writes its server in `[Host]`, and the profile's own is a
