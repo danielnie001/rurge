@@ -1603,6 +1603,16 @@ async fn engine_with_hook(
     profile: &str,
     hook: Arc<dyn SocketHook>,
 ) -> Arc<Engine> {
+    engine_in_mode(dir, profile, hook, OutboundMode::Rule).await
+}
+
+/// `engine_with_hook` started in the outbound mode `mode`.
+async fn engine_in_mode(
+    dir: &std::path::Path,
+    profile: &str,
+    hook: Arc<dyn SocketHook>,
+    mode: OutboundMode,
+) -> Arc<Engine> {
     let loaded = from_text(profile, &dir.join("t.conf"), &LoadOptions::for_tests());
     assert!(
         !loaded.diagnostics.has_errors(),
@@ -1626,7 +1636,7 @@ async fn engine_with_hook(
                 dns_connector: None,
                 socket_hook: hook,
             },
-            outbound_mode: OutboundMode::Rule,
+            outbound_mode: mode,
             idle_timeout: Duration::from_secs(600),
             request_log_size: 1000,
             shared: EngineShared::default(),
@@ -2023,6 +2033,93 @@ async fn a_dns_session_is_labelled_by_its_scheme_whatever_the_port() {
         assert_eq!(seen.rule.as_deref(), Some(rule.as_str()), "{seen:?}");
         assert_eq!(seen.policy.first().map(String::as_str), Some("UpIp"));
         lookup.abort();
+    }
+}
+
+/// A DNS server's connection goes where the outbound mode sends a session:
+/// by the rules in rule mode, to DIRECT in direct mode, to the global policy
+/// in global mode (manual, encrypted DNS). One profile serves all three, and
+/// its rule hands the connection to `ByRule`, a proxy of the test's own that
+/// refuses: a mode that is not followed sends the connection there, and the
+/// lookup fails. The global policy is a proxy and not REJECT, which a DNS
+/// session goes around to keep DNS working. Nothing leaves the loopback: the
+/// DNS server is the test's own too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dns_session_follows_the_outbound_mode() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let refusing = || async {
+        FakeHttpProxy::spawn(HttpProxyScript {
+            refuse: Some((403, "Forbidden")),
+            ..HttpProxyScript::default()
+        })
+        .await
+    };
+    let by_rule = refusing().await;
+    let global = refusing().await;
+    let profile = follow_profile(
+        &format!("tcp://{}", dns.addr()),
+        &format!(
+            "ByRule = http, 127.0.0.1, {}\nGlob = http, 127.0.0.1, {}",
+            by_rule.addr().port(),
+            global.addr().port()
+        ),
+        "IP-CIDR,127.0.0.1/32,ByRule,no-resolve",
+    );
+    // (the mode, the policy the session goes through, the rule that sent it
+    // there, whether the server is reached)
+    for (what, mode, policy, rule, reached) in [
+        (
+            "rule mode",
+            OutboundMode::Rule,
+            "ByRule",
+            Some("IP-CIDR,127.0.0.1/32,ByRule,no-resolve"),
+            false,
+        ),
+        ("direct mode", OutboundMode::Direct, "DIRECT", None, true),
+        (
+            "global mode",
+            OutboundMode::Proxy(rurge_config::rule::PolicyRef::parse("Glob")),
+            "Glob",
+            None,
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in_mode(dir.path(), &profile, Arc::new(NoopSocketHook), mode).await;
+        let asking = engine.clone();
+        let lookup = tokio::spawn(async move { lookup_outcome(&asking).await });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let seen = loop {
+            // a session is named by its policy once it has been routed
+            let found = internal_sessions(&engine)
+                .into_iter()
+                .find(|r| !r.policy.is_empty());
+            if let Some(found) = found {
+                break found;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: no DNS session: {:?}",
+                internal_sessions(&engine)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            seen.policy.first().map(String::as_str),
+            Some(policy),
+            "{what}: {seen:?}"
+        );
+        assert_eq!(seen.rule.as_deref(), rule, "{what}: {seen:?}");
+        if reached {
+            let answer = lookup
+                .await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("{what}: the server is reached: {e}"));
+            assert_eq!(answer.v4, [Ipv4Addr::LOCALHOST], "{what}");
+        } else {
+            lookup.abort();
+        }
     }
 }
 
