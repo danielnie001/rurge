@@ -1,17 +1,21 @@
-//! `encrypted-dns-follow-outbound-mode` (M3 design §7.4): a connector that
-//! routes the resolver's TCP / DoT / DoH upstream connections through the dial
+//! `encrypted-dns-follow-outbound-mode` (M3 design §7.4): connectors that
+//! route the resolver's TCP / DoT / DoH upstream connections through the dial
 //! pipeline as `Internal` sessions — and the QUIC carriers of its DoQ / DoH3
-//! upstreams as `Internal` UDP sessions (phase 2 M7 design 7.3). The resolver
-//! wraps it in its `BootstrapConnector`, which resolves a domain-configured
-//! upstream name via plain-UDP bootstrap first and hands this connector an IP
-//! target — so the pipeline never needs to resolve anything itself and cannot
-//! re-enter the resolver. The `Domain` arms below are only a defensive
-//! fallback. Plain UDP upstreams never use a connector.
+//! upstreams as `Internal` UDP sessions (phase 2 M7 design 7.3). There is one
+//! connector for each kind of upstream (`PipelineConnector::connectors`), and
+//! each calls the sessions it dials by what its kind speaks: the scheme of the
+//! server tells, the port does not. The resolver wraps each in its
+//! `BootstrapConnector`, which resolves a domain-configured upstream name via
+//! plain-UDP bootstrap first and hands this connector an IP target — so the
+//! pipeline never needs to resolve anything itself and cannot re-enter the
+//! resolver. The `Domain` arms below are only a defensive fallback. Plain UDP
+//! upstreams never use a connector.
 
 use crate::engine::Engine;
 use rurge_config::HostName;
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::{ListenerKind, SessionInfo, Transport};
+use rurge_dns::DnsConnectors;
 use rurge_inbound::{Counting, SessionHandle, SessionOutcome};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedDatagram, BoxedStream, ConnectOpts, Connector, Datagram, Target};
@@ -41,78 +45,102 @@ impl PipelineConnector {
     pub fn attach(&self, engine: Weak<Engine>) {
         let _ = self.engine.set(engine);
     }
-}
 
-/// DNS server port → the protocol tag its session carries (best-effort).
-fn protocol_for(port: u16) -> ProtocolKind {
-    match port {
-        853 => ProtocolKind::Dot,
-        443 => ProtocolKind::Doh,
-        _ => ProtocolKind::Dns,
+    /// The resolver's connectors, one per kind of upstream. Each dials through
+    /// this pipeline connector and calls the sessions it makes by what its
+    /// kind of upstream speaks.
+    pub fn connectors(self: &Arc<Self>) -> DnsConnectors {
+        let face = |protocol| -> Arc<dyn Connector> {
+            Arc::new(Face {
+                pipeline: self.clone(),
+                protocol,
+            })
+        };
+        DnsConnectors {
+            tcp: face(ProtocolKind::Dns),
+            tls: face(ProtocolKind::Dot),
+            https: face(ProtocolKind::Doh),
+            quic: face(ProtocolKind::Doq),
+            h3: face(ProtocolKind::Doh3),
+        }
+    }
+
+    /// A DNS upstream's TCP connection, routed as an `Internal` session
+    /// called `protocol`.
+    async fn connect_as(
+        &self,
+        protocol: ProtocolKind,
+        target: &Target,
+        opts: &ConnectOpts,
+    ) -> io::Result<BoxedStream> {
+        let ip = match &target.host {
+            HostName::Ip(ip) => *ip,
+            // Defensive only: the resolver's BootstrapConnector resolves
+            // upstream names itself and hands us IP targets. Anything else
+            // must not enter the pipeline (it could recurse), so go direct.
+            HostName::Domain(_) => return self.fallback.connect(target, opts).await,
+        };
+        let engine = self.engine.get().and_then(Weak::upgrade);
+        let Some(engine) = engine else {
+            // Not attached yet (bootstrap phase) → direct.
+            return self.fallback.connect(target, opts).await;
+        };
+        let mut session = SessionInfo::tcp(HostName::Ip(ip), target.port);
+        session.listener = ListenerKind::Internal;
+        session.transport = Transport::Tcp;
+        session.protocol = Some(protocol);
+        engine.dial_internal(session, &self.fallback).await
+    }
+
+    /// The QUIC carrier of a DoQ / DoH3 upstream, routed as `connect_as`
+    /// routes a TCP connection: an `Internal` UDP session called `protocol`.
+    async fn connect_udp_as(
+        &self,
+        protocol: ProtocolKind,
+        target: &Target,
+        opts: &ConnectOpts,
+    ) -> io::Result<BoxedDatagram> {
+        let ip = match &target.host {
+            HostName::Ip(ip) => *ip,
+            // Defensive only, as for `connect_as`.
+            HostName::Domain(_) => return self.fallback.connect_udp(target, opts).await,
+        };
+        let engine = self.engine.get().and_then(Weak::upgrade);
+        let Some(engine) = engine else {
+            // Not attached yet (bootstrap phase) → direct.
+            return self.fallback.connect_udp(target, opts).await;
+        };
+        let mut session = SessionInfo::udp(HostName::Ip(ip), target.port);
+        session.listener = ListenerKind::Internal;
+        session.protocol = Some(protocol);
+        engine.dial_internal_udp(session, &self.fallback).await
     }
 }
 
-/// DNS server port → the protocol tag of its QUIC carrier's session: the
-/// only UDP this connector carries is DoH3's and DoQ's, told apart by the
-/// port (best-effort, as `protocol_for`).
-fn quic_protocol_for(port: u16) -> ProtocolKind {
-    match port {
-        443 => ProtocolKind::Doh3,
-        _ => ProtocolKind::Doq,
-    }
+/// One of the connectors `PipelineConnector::connectors` gives out: the
+/// pipeline connector, the sessions it dials called `protocol`.
+struct Face {
+    pipeline: Arc<PipelineConnector>,
+    protocol: ProtocolKind,
 }
 
-impl Connector for PipelineConnector {
+impl Connector for Face {
     fn connect<'a>(
         &'a self,
         target: &'a Target,
         opts: &'a ConnectOpts,
     ) -> BoxFuture<'a, io::Result<BoxedStream>> {
-        Box::pin(async move {
-            let ip = match &target.host {
-                HostName::Ip(ip) => *ip,
-                // Defensive only: the resolver's BootstrapConnector resolves
-                // upstream names itself and hands us IP targets. Anything else
-                // must not enter the pipeline (it could recurse), so go direct.
-                HostName::Domain(_) => return self.fallback.connect(target, opts).await,
-            };
-            let engine = self.engine.get().and_then(Weak::upgrade);
-            let Some(engine) = engine else {
-                // Not attached yet (bootstrap phase) → direct.
-                return self.fallback.connect(target, opts).await;
-            };
-            let mut session = SessionInfo::tcp(HostName::Ip(ip), target.port);
-            session.listener = ListenerKind::Internal;
-            session.transport = Transport::Tcp;
-            session.protocol = Some(protocol_for(target.port));
-            engine.dial_internal(session, &self.fallback).await
-        })
+        Box::pin(self.pipeline.connect_as(self.protocol, target, opts))
     }
 
-    /// The QUIC carrier of a DoQ / DoH3 upstream, routed as `connect` routes
-    /// a TCP connection: an `Internal` UDP session. `as_direct` stays
-    /// `None`, so the QUIC path always takes its carrier from here.
+    /// `as_direct` stays `None`, so the QUIC path always takes its carrier
+    /// from here.
     fn connect_udp<'a>(
         &'a self,
         target: &'a Target,
         opts: &'a ConnectOpts,
     ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
-        Box::pin(async move {
-            let ip = match &target.host {
-                HostName::Ip(ip) => *ip,
-                // Defensive only, as for `connect`.
-                HostName::Domain(_) => return self.fallback.connect_udp(target, opts).await,
-            };
-            let engine = self.engine.get().and_then(Weak::upgrade);
-            let Some(engine) = engine else {
-                // Not attached yet (bootstrap phase) → direct.
-                return self.fallback.connect_udp(target, opts).await;
-            };
-            let mut session = SessionInfo::udp(HostName::Ip(ip), target.port);
-            session.listener = ListenerKind::Internal;
-            session.protocol = Some(quic_protocol_for(target.port));
-            engine.dial_internal_udp(session, &self.fallback).await
-        })
+        Box::pin(self.pipeline.connect_udp_as(self.protocol, target, opts))
     }
 }
 
@@ -275,11 +303,18 @@ pub(crate) fn wrap_internal_udp(
 mod tests {
     use super::*;
     use crate::observe::{RecordStatus, RequestLog, TrafficStats};
+    use crate::runtime::{Runtime, RuntimeOptions};
+    use crate::shared::EngineShared;
+    use crate::stack::StackOptions;
     use rurge_config::HostName;
+    use rurge_config::config::{LoadOptions, from_text};
+    use rurge_dns::system::StaticSystemDns;
     use rurge_net::connector::{ConnectOpts, DirectConnector, PacketSocket, SystemResolve, Target};
     use rurge_net::packet_datagram::packet_datagram;
+    use rurge_net::socket::NoopSocketHook;
     use rurge_policy::smart::{Health, SmartBook};
     use rurge_proto::{OutboundRef, Reject, RejectKind};
+    use rurge_rules::{GeoUrls, OutboundMode};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -299,12 +334,13 @@ mod tests {
         });
         let fallback: Arc<dyn Connector> = Arc::new(DirectConnector::new(Arc::new(SystemResolve)));
         let pc = PipelineConnector::new(fallback);
+        let face = pc.connectors().tcp;
         let target = Target::new(HostName::parse("127.0.0.1"), port);
         // `BoxedStream` is not `Debug`, so drop the stream from the Ok arm to
         // keep the assertion message printable.
         let res = tokio::time::timeout(
             Duration::from_secs(5),
-            pc.connect(&target, &ConnectOpts::default()),
+            face.connect(&target, &ConnectOpts::default()),
         )
         .await
         .map(|r| r.map(|_| ()));
@@ -314,18 +350,95 @@ mod tests {
         );
     }
 
-    #[test]
-    fn protocol_tag_follows_the_port() {
-        assert_eq!(protocol_for(853), ProtocolKind::Dot);
-        assert_eq!(protocol_for(443), ProtocolKind::Doh);
-        assert_eq!(protocol_for(53), ProtocolKind::Dns);
+    /// A running engine that follows the outbound mode for its DNS
+    /// connections and sends everything DIRECT, for the connectors of its
+    /// pipeline to be driven by hand.
+    async fn engine_following_the_outbound_mode(dir: &std::path::Path) -> Arc<Engine> {
+        let text = "[General]\nencrypted-dns-follow-outbound-mode = true\n[Rule]\nFINAL,DIRECT\n";
+        let loaded = from_text(text, &dir.join("t.conf"), &LoadOptions::for_tests());
+        assert!(!loaded.diagnostics.has_errors());
+        let runtime = Runtime::build(
+            loaded.config,
+            RuntimeOptions {
+                stack: StackOptions {
+                    data_dir: dir.to_path_buf(),
+                    no_network: true,
+                    geo_urls: GeoUrls::default(),
+                    dns_cache_size: 16,
+                    system: Arc::new(StaticSystemDns::default()),
+                    wait: Duration::ZERO,
+                    dns_connector: None,
+                    socket_hook: Arc::new(NoopSocketHook),
+                },
+                outbound_mode: OutboundMode::Rule,
+                idle_timeout: Duration::from_secs(60),
+                shared: EngineShared::default(),
+                request_log_size: 16,
+            },
+        )
+        .await
+        .unwrap();
+        Engine::new(runtime)
     }
 
-    #[test]
-    fn a_quic_carriers_tag_follows_the_port() {
-        assert_eq!(quic_protocol_for(443), ProtocolKind::Doh3);
-        assert_eq!(quic_protocol_for(853), ProtocolKind::Doq);
-        assert_eq!(quic_protocol_for(8853), ProtocolKind::Doq);
+    /// Each of the five connectors calls the sessions it dials by what its
+    /// kind of upstream speaks — the same, at whatever port. They dial to
+    /// loopback servers of the test's own and are told apart by the record
+    /// of the session each one makes.
+    #[tokio::test]
+    async fn the_five_faces_carry_the_five_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_following_the_outbound_mode(dir.path()).await;
+        let faces = engine
+            .runtime()
+            .dns_pipeline()
+            .expect("the profile follows the outbound mode")
+            .connectors();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp = Target::new(
+            HostName::parse("127.0.0.1"),
+            listener.local_addr().unwrap().port(),
+        );
+        tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted.push(stream);
+            }
+        });
+        let udp = Target::new(HostName::parse("127.0.0.1"), udp_echo().await);
+        let opts = ConnectOpts::default();
+
+        // held, so that the sessions are still there to be told apart
+        let mut streams = Vec::new();
+        for face in [&faces.tcp, &faces.tls, &faces.https] {
+            streams.push(face.connect(&tcp, &opts).await.unwrap());
+        }
+        let mut carriers = Vec::new();
+        for face in [&faces.quic, &faces.h3] {
+            carriers.push(face.connect_udp(&udp, &opts).await.unwrap());
+        }
+        let mut sessions = engine.request_log().active();
+        sessions.sort_by_key(|session| session.id);
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.listener == ListenerKind::Internal),
+            "{sessions:?}"
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.protocol)
+                .collect::<Vec<_>>(),
+            [
+                Some(ProtocolKind::Dns),
+                Some(ProtocolKind::Dot),
+                Some(ProtocolKind::Doh),
+                Some(ProtocolKind::Doq),
+                Some(ProtocolKind::Doh3),
+            ],
+            "{sessions:?}"
+        );
     }
 
     /// A loopback UDP socket that sends every datagram back; its port.
@@ -365,10 +478,11 @@ mod tests {
         let port = udp_echo().await;
         let fallback: Arc<dyn Connector> = Arc::new(DirectConnector::new(Arc::new(SystemResolve)));
         let pc = PipelineConnector::new(fallback);
+        let face = pc.connectors().quic;
         let target = Target::new(HostName::parse("127.0.0.1"), port);
         let carrier = tokio::time::timeout(
             Duration::from_secs(5),
-            pc.connect_udp(&target, &ConnectOpts::default()),
+            face.connect_udp(&target, &ConnectOpts::default()),
         )
         .await
         .expect("within the bound")

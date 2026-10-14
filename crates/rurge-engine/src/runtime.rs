@@ -53,7 +53,7 @@ impl Runtime {
                     rurge_net::connector::SystemResolve,
                 )));
             let pc = crate::dns_pipeline::PipelineConnector::new(fallback);
-            opts.stack.dns_connector = Some(pc.clone());
+            opts.stack.dns_connector = Some(pc.connectors());
             Some(pc)
         } else {
             None
@@ -127,9 +127,9 @@ impl Runtime {
         &self.stack.diagnostics
     }
 
-    /// The connector this generation's resolver reaches its TCP / DoT / DoH /
-    /// DoQ / DoH3 upstreams through, when `encrypted-dns-follow-outbound-mode`
-    /// is on.
+    /// The connector whose connectors (`connectors`) this generation's
+    /// resolver reaches its TCP / DoT / DoH / DoQ / DoH3 upstreams through,
+    /// when `encrypted-dns-follow-outbound-mode` is on.
     pub fn dns_pipeline(&self) -> Option<&Arc<crate::dns_pipeline::PipelineConnector>> {
         self.dns_pipeline.as_ref()
     }

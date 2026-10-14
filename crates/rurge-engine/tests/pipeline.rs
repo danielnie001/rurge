@@ -1916,22 +1916,77 @@ encrypted-dns-follow-outbound-mode = true\nencrypted-dns-server = tcp://127.0.0.
     );
 }
 
-/// A DNS server's TCP connection is called by the port it dials, the best
-/// that can be told of what is spoken there: 853 is DoT, 443 is DoH (manual,
-/// Protocol and Network Rules). The servers named here are not asked, and
-/// nothing is dialled at their ports: the rules send the connection to a
-/// proxy of the test's own, which refuses — by what the connection is called
-/// when that is right, by its address when it is not, so that a wrong label
-/// fails the test without a connection to anything but that proxy.
+/// A DNS server's connection is called by the kind of server it goes to —
+/// `tcp://` DNS, `tls://` DoT, `https://` DoH, `h3://` DoH3, `quic://` DoQ
+/// (manual, Protocol and Network Rules) — whatever port it dials. The servers
+/// named here are not asked, and nothing is dialled at their ports: the rules
+/// send the connection to a proxy of the test's own, which refuses — by what
+/// the connection is called when that is right, by its address when it is not,
+/// so that a wrong label fails the test without a connection to anything but
+/// that proxy. Those that carry no UDP are refused by it all the same: a QUIC
+/// carrier is a UDP session, and the proxy takes none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_dns_connection_is_called_dot_at_853_and_doh_at_443() {
-    for (server, protocol, keyword, dst) in [
-        ("tls://127.0.0.1", ProtocolKind::Dot, "DOT", "127.0.0.1:853"),
+async fn a_dns_session_is_labelled_by_its_scheme_whatever_the_port() {
+    // The last row writes its server in `[Host]`, and the profile's own is a
+    // `tcp://` one: a session that is called DoT can only be the `[Host]`
+    // line's.
+    const HOST_LINE: &str = "[Host]\ntarget.test = server:tls://127.0.0.1:8853\n";
+    for (server, host, protocol, keyword, dst) in [
+        (
+            "tcp://127.0.0.1:853",
+            "",
+            ProtocolKind::Dns,
+            "DNS",
+            "127.0.0.1:853",
+        ),
+        (
+            "tls://127.0.0.1:8853",
+            "",
+            ProtocolKind::Dot,
+            "DOT",
+            "127.0.0.1:8853",
+        ),
+        (
+            "tls://127.0.0.1",
+            "",
+            ProtocolKind::Dot,
+            "DOT",
+            "127.0.0.1:853",
+        ),
+        (
+            "https://127.0.0.1:8443/dns-query",
+            "",
+            ProtocolKind::Doh,
+            "DOH",
+            "127.0.0.1:8443",
+        ),
         (
             "https://127.0.0.1/dns-query",
+            "",
             ProtocolKind::Doh,
             "DOH",
             "127.0.0.1:443",
+        ),
+        (
+            "h3://127.0.0.1:8443/dns-query",
+            "",
+            ProtocolKind::Doh3,
+            "DOH3",
+            "127.0.0.1:8443",
+        ),
+        (
+            "quic://127.0.0.1:443",
+            "",
+            ProtocolKind::Doq,
+            "DOQ",
+            "127.0.0.1:443",
+        ),
+        (
+            "tcp://127.0.0.1:853",
+            HOST_LINE,
+            ProtocolKind::Dot,
+            "DOT",
+            "127.0.0.1:8853",
         ),
     ] {
         let proxy = FakeHttpProxy::spawn(HttpProxyScript {
@@ -1945,7 +2000,7 @@ async fn a_dns_connection_is_called_dot_at_853_and_doh_at_443() {
             server,
             &format!("UpIp = http, 127.0.0.1, {}", proxy.addr().port()),
             &format!("{rule}\nIP-CIDR,127.0.0.1/32,UpIp,no-resolve"),
-        );
+        ) + host;
         let engine = engine_from_profile(dir.path(), &profile).await;
         let asking = engine.clone();
         let lookup = tokio::spawn(async move { lookup_outcome(&asking).await });
@@ -1959,7 +2014,7 @@ async fn a_dns_connection_is_called_dot_at_853_and_doh_at_443() {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "no {keyword} session: {:?}",
+                "no {keyword} session for {server}{host}: {:?}",
                 internal_sessions(&engine)
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2244,9 +2299,8 @@ async fn a_doq_carrier_follows_the_rules_through_a_socks5_proxy() {
     );
 }
 
-/// The same for a DoH3 server, sent by an IP rule. Port 443 alone tags a
-/// carrier `DOH3`, and a loopback server here has another: this one is
-/// tagged `DOQ` (best effort, as the TCP connections' tags are).
+/// The same for a DoH3 server, sent by an IP rule. Its carrier is called
+/// `DOH3` although a loopback server here is not on port 443.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_doh3_carrier_follows_an_ip_rule_through_a_socks5_proxy() {
     let dns = MockDns::spawn().await;
@@ -2280,7 +2334,7 @@ async fn a_doh3_carrier_follows_an_ip_rule_through_a_socks5_proxy() {
     assert!(
         carriers
             .iter()
-            .any(|r| r.protocol == Some(ProtocolKind::Doq)
+            .any(|r| r.protocol == Some(ProtocolKind::Doh3)
                 && r.rule.as_deref() == Some("IP-CIDR,127.0.0.1/32,Socks")
                 && r.policy == ["Socks"]
                 && r.dst == doh3.addr().to_string()

@@ -6,7 +6,7 @@ use rurge_config::config::{LoadOptions, from_text};
 use rurge_dns::cache::{CachedAddrs, DnsCache};
 use rurge_dns::system::StaticSystemDns;
 use rurge_dns::testing::MockDns;
-use rurge_dns::{LookupOpts, Resolver, ResolverConfig, ResolverDeps};
+use rurge_dns::{DnsConnectors, LookupOpts, Resolver, ResolverConfig, ResolverDeps};
 use rurge_net::connector::{DirectConnector, SystemResolve};
 use rurge_net::http::{HttpClient, HttpClientConfig};
 use rurge_net::resource::{ResourceManager, ResourceOptions};
@@ -65,7 +65,7 @@ fn resolver_cache_hit(c: &mut Criterion) {
         let (resolver, _) = Resolver::new(
             ResolverConfig::from_config(&cfg),
             ResolverDeps {
-                connector,
+                connectors: DnsConnectors::all(connector),
                 sets,
                 system: Arc::new(StaticSystemDns::default()),
                 resources,

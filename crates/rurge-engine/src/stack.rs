@@ -4,8 +4,8 @@
 
 use rurge_config::{Config, Diagnostic, Diagnostics, codes};
 use rurge_dns::system::SystemDns;
-use rurge_dns::{Resolver, ResolverConfig, ResolverDeps};
-use rurge_net::connector::{Connector, DirectConnector, SystemResolve};
+use rurge_dns::{DnsConnectors, Resolver, ResolverConfig, ResolverDeps};
+use rurge_net::connector::{DirectConnector, SystemResolve};
 use rurge_net::http::{HttpClient, HttpClientConfig};
 use rurge_net::resource::{ResourceManager, ResourceOptions, ResourceStatus};
 use rurge_rules::{GeoDb, GeoUpdater, GeoUrls, SetRegistry, SetStatus};
@@ -24,11 +24,11 @@ pub struct StackOptions {
     /// and after it for what arrived to be applied: two seconds, and up to this
     /// long once more while sets that arrived wait to be compiled.
     pub wait: Duration,
-    /// Connector for the resolver's TCP / DoT / DoH upstreams and the QUIC
-    /// carriers of its DoQ / DoH3 ones; `None` = plain direct.
-    /// `Runtime::build` injects the pipeline connector here when
+    /// Connectors for the resolver's TCP / DoT / DoH upstreams and the QUIC
+    /// carriers of its DoQ / DoH3 ones, one per kind; `None` = plain direct.
+    /// `Runtime::build` injects those of the pipeline connector here when
     /// `encrypted-dns-follow-outbound-mode` is on.
-    pub dns_connector: Option<Arc<dyn Connector>>,
+    pub dns_connector: Option<DnsConnectors>,
     /// Interface binding and TOS for outbound sockets (the bin injects
     /// `rurge-platform`; everything else uses `NoopSocketHook`).
     pub socket_hook: Arc<dyn rurge_net::socket::SocketHook>,
@@ -93,15 +93,14 @@ pub async fn build_stack_with(
     let mut resolver_cfg = ResolverConfig::from_config(cfg);
     resolver_cfg.cache_capacity = opts.dns_cache_size;
     customize(&mut resolver_cfg);
-    // `connector` is `Arc<DirectConnector>`; coerce explicitly so both arms unify.
-    let resolver_connector: Arc<dyn Connector> = match &opts.dns_connector {
-        Some(c) => c.clone(),
-        None => connector.clone() as Arc<dyn Connector>,
+    let resolver_connectors = match &opts.dns_connector {
+        Some(connectors) => connectors.clone(),
+        None => DnsConnectors::all(connector),
     };
     let (resolver, dns_diags) = Resolver::new(
         resolver_cfg,
         ResolverDeps {
-            connector: resolver_connector,
+            connectors: resolver_connectors,
             sets: registry.clone(),
             system: opts.system.clone(),
             resources: resources.clone(),

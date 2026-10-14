@@ -69,8 +69,37 @@ impl ResolverConfig {
     }
 }
 
+/// Who dials for the upstreams that go through a connector, one per kind of
+/// upstream: whoever stands behind them knows what a connection carries.
+#[derive(Clone)]
+pub struct DnsConnectors {
+    /// `tcp://` servers.
+    pub tcp: Arc<dyn Connector>,
+    /// `tls://` servers.
+    pub tls: Arc<dyn Connector>,
+    /// `https://` servers: the connections of the DoH client.
+    pub https: Arc<dyn Connector>,
+    /// `quic://` servers: the carriers of their QUIC connections.
+    pub quic: Arc<dyn Connector>,
+    /// `h3://` servers: the carriers of their QUIC connections.
+    pub h3: Arc<dyn Connector>,
+}
+
+impl DnsConnectors {
+    /// The same connector for every kind.
+    pub fn all(connector: Arc<dyn Connector>) -> DnsConnectors {
+        DnsConnectors {
+            tcp: connector.clone(),
+            tls: connector.clone(),
+            https: connector.clone(),
+            quic: connector.clone(),
+            h3: connector,
+        }
+    }
+}
+
 pub struct ResolverDeps {
-    pub connector: Arc<dyn Connector>,
+    pub connectors: DnsConnectors,
     pub sets: Arc<SetRegistry>,
     pub system: Arc<dyn SystemDns>,
     pub resources: Arc<ResourceManager>,
@@ -276,7 +305,8 @@ struct ViaSet {
 
 pub struct Resolver {
     cfg: ResolverConfig,
-    connector: Arc<dyn Connector>,
+    /// The connector of each kind of upstream, behind the bootstrap.
+    connectors: DnsConnectors,
     system: Arc<dyn SystemDns>,
     bootstrap: Arc<Bootstrap>,
     /// `None` when the internal HTTP client could not be built (W0026 was
@@ -369,12 +399,20 @@ impl Resolver {
         // Populated below by `apply_system_servers`, the single place that
         // derives every network-dependent upstream set.
         let bootstrap = Bootstrap::new(Vec::new(), cfg.ipv6 && has_ipv6, cfg.fanout.clone());
-        let bootstrap_connector: Arc<dyn Connector> = Arc::new(BootstrapConnector::new(
-            deps.connector.clone(),
-            bootstrap.clone(),
-        ));
+        // One bootstrap for all of them: a server written as a name is
+        // resolved the same way, whichever kind of server it is.
+        let behind_bootstrap = |inner: &Arc<dyn Connector>| -> Arc<dyn Connector> {
+            Arc::new(BootstrapConnector::new(inner.clone(), bootstrap.clone()))
+        };
+        let connectors = DnsConnectors {
+            tcp: behind_bootstrap(&deps.connectors.tcp),
+            tls: behind_bootstrap(&deps.connectors.tls),
+            https: behind_bootstrap(&deps.connectors.https),
+            quic: behind_bootstrap(&deps.connectors.quic),
+            h3: behind_bootstrap(&deps.connectors.h3),
+        };
         let http = match HttpClient::new(
-            bootstrap_connector.clone(),
+            connectors.https.clone(),
             HttpClientConfig {
                 skip_cert_verification: cfg.skip_cert_verification,
                 ..HttpClientConfig::default()
@@ -413,7 +451,7 @@ impl Resolver {
         let hosts = HostMap::build(&cfg.hosts, deps.sets.as_ref(), &mut diags);
 
         let resolver = Arc::new(Resolver {
-            connector: bootstrap_connector,
+            connectors,
             system: deps.system.clone(),
             bootstrap,
             http,
@@ -454,13 +492,13 @@ impl Resolver {
             UpstreamSpec::Tcp { host, port } => Some(Arc::new(TcpUpstream::plain(
                 host,
                 *port,
-                self.connector.clone(),
+                self.connectors.tcp.clone(),
             ))),
             UpstreamSpec::Tls { host, port } => self.tls.as_ref().map(|tls| {
                 Arc::new(TcpUpstream::tls(
                     host,
                     *port,
-                    self.connector.clone(),
+                    self.connectors.tls.clone(),
                     tls.clone(),
                 )) as UpstreamRef
             }),
@@ -471,7 +509,7 @@ impl Resolver {
                 Arc::new(DoqUpstream::new(
                     host,
                     *port,
-                    self.connector.clone(),
+                    self.connectors.quic.clone(),
                     self.bootstrap.clone(),
                     config.clone(),
                 )) as UpstreamRef
@@ -479,7 +517,7 @@ impl Resolver {
             UpstreamSpec::H3(url) => self.doh3.as_ref().map(|config| {
                 Arc::new(Doh3Upstream::new(
                     url.clone(),
-                    self.connector.clone(),
+                    self.connectors.h3.clone(),
                     self.bootstrap.clone(),
                     config.clone(),
                 )) as UpstreamRef
@@ -1345,7 +1383,9 @@ mod tests {
         Resolver::new(
             cfg,
             ResolverDeps {
-                connector: Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
+                connectors: DnsConnectors::all(Arc::new(DirectConnector::new(Arc::new(
+                    SystemResolve,
+                )))),
                 sets: e.sets.clone(),
                 system,
                 resources: e.resources.clone(),
@@ -3340,5 +3380,102 @@ https://dns.example/dns-query"
             (vec![v4("10.0.0.7")], Source::Cache { stale: false })
         );
         assert!(noting.udp().is_empty());
+    }
+
+    /// What a connector that dials nothing was asked: its own kind, the call,
+    /// the port.
+    #[derive(Debug, PartialEq)]
+    struct Asked {
+        kind: &'static str,
+        call: &'static str,
+        port: u16,
+    }
+
+    /// A connector that dials nothing: it refuses, and notes what it was
+    /// asked in a list its fellows share.
+    struct Refusing {
+        kind: &'static str,
+        asked: Arc<Mutex<Vec<Asked>>>,
+    }
+
+    impl Refusing {
+        fn refuse(&self, call: &'static str, target: &Target) -> io::Error {
+            self.asked.lock().expect("asked").push(Asked {
+                kind: self.kind,
+                call,
+                port: target.port,
+            });
+            io::Error::new(io::ErrorKind::ConnectionRefused, "refused")
+        }
+    }
+
+    impl Connector for Refusing {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            _opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            Box::pin(std::future::ready(Err(self.refuse("connect", target))))
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            target: &'a Target,
+            _opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            Box::pin(std::future::ready(Err(self.refuse("connect_udp", target))))
+        }
+    }
+
+    /// Every kind of upstream is dialled through the connector of its kind,
+    /// and through no other: a resolver of each kind of server is given five
+    /// connectors that refuse, and the only one asked is its own, for the
+    /// port of its server. The ports are marks to tell the servers by —
+    /// nothing is dialled at them. TCP, TLS and DoH connect; the two QUIC
+    /// kinds open a UDP flow.
+    #[tokio::test(start_paused = true)]
+    async fn each_kind_of_upstream_dials_through_its_own_connector() {
+        for (server, kind, call, port) in [
+            ("tcp://127.0.0.1:1", "tcp", "connect", 1),
+            ("tls://127.0.0.1:2", "tls", "connect", 2),
+            ("https://127.0.0.1:3/dns-query", "https", "connect", 3),
+            ("quic://127.0.0.1:4", "quic", "connect_udp", 4),
+            ("h3://127.0.0.1:5/dns-query", "h3", "connect_udp", 5),
+        ] {
+            let asked = Arc::new(Mutex::new(Vec::new()));
+            let refusing = |kind| -> Arc<dyn Connector> {
+                Arc::new(Refusing {
+                    kind,
+                    asked: asked.clone(),
+                })
+            };
+            let connectors = DnsConnectors {
+                tcp: refusing("tcp"),
+                tls: refusing("tls"),
+                https: refusing("https"),
+                quic: refusing("quic"),
+                h3: refusing("h3"),
+            };
+            let e = env(&profile(&format!("encrypted-dns-server = {server}"), ""));
+            let mut cfg = ResolverConfig::from_config(&e.cfg);
+            cfg.fanout = once();
+            let (r, _) = Resolver::new(
+                cfg,
+                ResolverDeps {
+                    connectors,
+                    sets: e.sets.clone(),
+                    system: Arc::new(StaticSystemDns::default()),
+                    resources: e.resources.clone(),
+                },
+            );
+            r.lookup("a.test", LookupOpts::default())
+                .await
+                .expect_err("every connector refuses");
+            assert_eq!(
+                *asked.lock().unwrap(),
+                [Asked { kind, call, port }],
+                "{server}"
+            );
+        }
     }
 }

@@ -9,7 +9,9 @@ use rurge_config::diagnostic::{Diagnostics, codes};
 use rurge_dns::message::{Qtype, Question, Rcode, build_response, parse_query};
 use rurge_dns::system::StaticSystemDns;
 use rurge_dns::testing::{Doh3Script, DoqScript, FakeDoh3, FakeDoq, MockDns};
-use rurge_dns::{HostKind, LookupOpts, Resolver, ResolverConfig, ResolverDeps, Source};
+use rurge_dns::{
+    DnsConnectors, HostKind, LookupOpts, Resolver, ResolverConfig, ResolverDeps, Source,
+};
 use rurge_net::connector::{DirectConnector, SystemResolve};
 use rurge_net::http::{HttpClient, HttpClientConfig};
 use rurge_net::resource::{ResourceManager, ResourceOptions};
@@ -60,7 +62,7 @@ fn resolver_saying(
     Resolver::new(
         ResolverConfig::from_config(&cfg),
         ResolverDeps {
-            connector,
+            connectors: DnsConnectors::all(connector),
             sets,
             system: Arc::new(system),
             resources,

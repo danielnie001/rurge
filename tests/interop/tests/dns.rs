@@ -19,7 +19,7 @@ mod common;
 
 use common::*;
 use rurge_dns::system::StaticSystemDns;
-use rurge_dns::{LookupOpts, Resolver, ResolverConfig, ResolverDeps, Source};
+use rurge_dns::{DnsConnectors, LookupOpts, Resolver, ResolverConfig, ResolverDeps, Source};
 use rurge_interop::coredns::{CoreDns, coredns_or_skip};
 use rurge_interop::dnsproxy::{Dnsproxy, dnsproxy_or_skip};
 use rurge_interop::{DNS_NAME, DNS_V4, DNS_V6};
@@ -111,7 +111,7 @@ fn resolver(dir: &Path, url: &str, connector: Arc<dyn Connector>) -> Arc<Resolve
     let (resolver, diagnostics) = Resolver::new(
         ResolverConfig::from_config(&cfg),
         ResolverDeps {
-            connector,
+            connectors: DnsConnectors::all(connector),
             sets,
             system: Arc::new(system),
             resources,
