@@ -35,7 +35,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 | GET | `/v1/geoip?ip=<地址>` | | `{"address":"198.51.100.23","country":"SE","asn":64500,"organization":"Example Network","geoip-db-date":1760000000,"asn-db-date":1760000000}`；见下「GeoIP」 |
 | GET | `/v1/external_resources` | | `{"defines":[{"path":…,"type":…,"key":…,"local":…,"ready":…,"updatedAt":…,"updating":…,"fromModule":null}]}`，另有 `error`、`suspended` 与集合的三个数；见下「外部资源」（Surge iOS 5.23 / Mac 6.10 起的端点） |
 | POST | `/v1/external_resources/update` | `{"key":"<key>"}`；`"all"` 是每一个下载得到的资源 | `{"<key>":"success"\|"<原因>"}`，每个更新了的键一项；键不存在 → 400；至多等 60 秒；见下「外部资源」（Surge iOS 5.23 / Mac 6.10 起的端点） |
-| GET | `/v1/profiles/current?sensitive=0\|1` | | `text/plain`；返回的是生效的主文本——托管 Profile 的副本生效时是数据目录里下载的副本（阶段 1 补遗（M5b），见下「Profile 的当前文本与检查」）。`sensitive=1` 给出原文，默认（`sensitive=0`）给出脱敏后的文本：行数与行尾 CRLF 原样保留，认得出的秘密换成 `***`。**脱敏是尽力而为，不是保证**——藏什么、有意不藏什么、已知漏什么，见下面「脱敏后的配置」 |
+| GET | `/v1/profiles/current?sensitive=0\|1` | | `text/plain`（手册说应答总是 JSON，rurge 的形状随阶段 6 对齐）；返回的是生效的主文本——托管 Profile 的副本生效时是数据目录里下载的副本（阶段 1 补遗（M5b），见下「Profile 的当前文本与检查」）。`sensitive=1` 给出原文，默认（`sensitive=0`）给出脱敏后的文本：行数与行尾 CRLF 原样保留，认得出的秘密换成 `***`。**脱敏是尽力而为，不是保证**——藏什么、有意不藏什么、已知漏什么，见下面「脱敏后的配置」 |
 | POST | `/v1/profiles/reload` | | `{"ok":true,"errors":0,"warnings":1,"listenersRebound":false}`；解析失败或构建 `Runtime` 失败时 `ok:false`，运行中的配置不变；重绑监听器失败时也是 `ok:false`，但新配置这时已经生效，只是监听器归零，直到下一次重载成功为止（下一次重载会无条件重试绑定） |
 | POST | `/v1/profiles/check` | 可带 `{"name":"<Profile 名>"}` | `{"ok":…,"errors":N,"warnings":N,"diagnostics":[Diagnostic…],"error":null\|"<首个错误>"}`（校验磁盘上的当前配置，不影响运行；`Diagnostic` 与 `rurge check --json` 相同，每项另有 `hint`——字符串或 `null`：阶段 1 补遗（M5a）起多数诊断码有缺省建议，见兼容性清单 10.3 节 `--check` 一行）。阶段 1 补遗（M5b）起应答另有 `error`，请求可带 `name`：不是正在运行的那份 Profile 的名字 → 404 `{"error":"profile not found"}`；正文不是 JSON 对象、`name` 不是字符串或正文超过 2 MiB → 400；见下「Profile 的当前文本与检查」 |
 | POST | `/v1/log/level` | `{"level":"verbose"\|"debug"\|"info"\|"notify"\|"warning"\|"error"}` | `{}` |
@@ -104,7 +104,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 
 ### 外部资源
 
-阶段 1 补遗（M5b）起，`GET /v1/external_resources` 列出 rurge 下载或读取的外部资源，`POST /v1/external_resources/update` 立刻更新其中一个或全部。这是 Surge iOS 5.23 / Mac 6.10 起的两个端点（手册 `tools/http-api.html`），晚于本项目对照的手册基线（Mac 6.9 / iOS 5.22）；只取了它们，基线的整体更新是阶段 3 开工前单独的一件事（兼容性清单 10.4 节）。两个端点都要 `X-Key`，引擎因 `strict` 拒绝会话时也照常应答。没有对应的 CLI 子命令（阶段 6）。
+阶段 1 补遗（M5b）起，`GET /v1/external_resources` 列出 rurge 下载或读取的外部资源，`POST /v1/external_resources/update` 立刻更新其中一个或全部。这是 Surge iOS 5.23 / Mac 6.10 起的两个端点（手册 `tools/http-api.html`；与手册的差异见下面的表和兼容性清单 10.4 节）。两个端点都要 `X-Key`，引擎因 `strict` 拒绝会话时也照常应答。没有对应的 CLI 子命令（阶段 6）。
 
 **列表。** 例子里的键是例子地址的 SHA-256（托管 Profile 是 `https://provider.example/surge/profile.conf` 的，规则集是 `https://sets.example/rules.list` 的，GeoIP 库是 `https://geo.example/country.mmdb` 的）：
 

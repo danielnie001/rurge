@@ -348,6 +348,35 @@ pub struct StackOptions { /* 原有的 */, pub dns_connector: Option<DnsConnecto
 
 | # | 任务 | 与计划的出入 | 处理 |
 | --- | --- | --- | --- |
+| 1 | 任务 1 | 多了第八个提交 `9a01a32`：`custom, h, 8388, hunter2` 这样少写了方法的行，第一个位置被读成方法，原来的 `E0018` 会把它原样说出来，而那可能是口令 | 代项目所有者作的裁定：留着。代价：旧写法里写错的方法名不再被原样说回来（接受的方法名的清单照旧列出）；命名的 `encrypt-method=` 写错时照旧引用 |
+| 2 | 任务 1 | 计划点名的用例 `a_missing_password_is_an_error_and_a_positional_one_is_not_read` 对 `ss` 并不存在（只有 `anytls` 与 `trojan` 有）；`ss` 的那一条是 `the_method_and_the_password_are_required` | 计划的笔误；照实际的用例做 |
+| 3 | 任务 1 | 计划之外多了三条用例：`a_legacy_custom_line_is_said_to_be_read_as_ss`（`I0001` 每行一条、有别的错误也给）、`a_tcp_url_with_a_path_is_skipped_and_the_profile_still_loads`、`an_unknown_positional_method_is_an_error_that_does_not_quote_it`；`crates/rurge-config/src/config.rs` 里两条原有的用例因 `wireguard` 的 `tos` 不再告警而改（`the_same_parameters_with_good_values_still_get_their_sentence`、`an_error_in_one_parameter_leaves_the_sentences_of_the_others`）；`crates/rurge-dns/tests/resolver.rs` 的辅助函数拆成 `resolver_saying`（交出诊断）与 `resolver_in` | 留着 |
+| 4 | 任务 1 | 写了 `underlying-proxy` 又写了 `tos` 的 `wireguard` 行得到的是原有的那句泛泛的话（`tos` 在 `underlying-proxy` 之下没有效果），没有另写一句 | 留着 |
+| 5 | 任务 1、2、4 | 这台开发机上链接器偶发 `LNK1104`（打不开要写的测试可执行文件；任务 1 三次，任务 2、4 各一次），重跑即过；`STATUS_HEAP_CORRUPTION` 三次（任务 1 一次，任务 2 与任务 4 的门禁里各一次），各自单独重跑那个测试二进制都过，没有失败的用例 | 机器的状态，不改什么；后者的来源见 M8 设计 3.5 |
+| 6 | 任务 2 | 没有跑 `cargo bench --no-run`（磁盘）：基准目标由 `cargo clippy --all-targets` 做类型检查 | 照此 |
+| 7 | 任务 2 | `UNKNOWN` 的判断对两种规则都去掉首尾空白（计划只对 `GEOIP` 这样说）：差别只在带引号、里面有空白的写法（`IP-ASN," unknown "`），现在读作 `UNKNOWN` 而不是 `E0011` | 留着 |
+| 8 | 任务 2 | `GeoLookup` 此前没有从 crate 根导出，这一次与 `GeoResult` 一起导出 | 留着 |
+| 9 | 任务 2 | 计划之外的用例材料：`geo_lookups_are_cached_per_ip` 多数一个 `asn` 的计数（钉住 `Unknown` 的答案也进缓存）；解析的用例也看 `pre-matching` 与原样输出；匹配的用例也看 `OR` / `NOT` 与 IPv6 的目标 | 留着 |
+| 10 | 任务 2 | 集合的用例把号码那一行写成 `IP-ASN,64500,no-resolve`（计划写的是 `IP-ASN,64500`）：照计划的字面，号码那一行自己就让集合要先解析名字，"集合因 `IP-ASN,UNKNOWN` 而要先解析"的断言分不出原因 | 留着 |
+| 11 | 任务 2 | 计划的 P9 说 `GeoLookup` 的实现者有八处；改之前是七处（`GeoDb`、`NoGeo` 与测试、基准里的五个），这一次的集合用例多了一个，现在八处 | 计划的数错了；做法不受影响 |
+| 12 | 任务 2 | 原有的用例 `missing_files_are_info_and_lookups_return_none` 改名为 `missing_files_are_info_and_lookups_say_not_loaded` | 引用它的阶段 1 验收文档随之改；旧的计划是历史，不改 |
+| 13 | 任务 3 | 计划的 P10 说 `random_below` 是 `load-balance` 的取法：调用它的其实是 `smart` 组；`load-balance`（`crates/rurge-policy/src/auto.rs`）自己写着同样的一个式子 | 取法相同，函数是两处 |
+| 14 | 任务 3 | 括号策略名那一条的变红验证没法只红它一条（改 `split_list` 的括号计数时另有 10 条一起红） | 照此记下 |
+| 15 | 任务 3 | IPv6 字面量那一条用的是 `common::harness`，不是计划点名的那个文件里的夹具；提前返回的条件照计划 | 留着 |
+| 16 | 任务 3 | `quic_blocked` 的文档注释原来带着一份设计的节号，重写时去掉了 | 留着 |
+| 17 | 任务 3 | 三条依赖调度的用例的 30 次循环是在它们的提交之后跑的（30 / 30 都过；随机取地址那一条的 25 次在提交之前） | 历史不改写，照此记下 |
+| 18 | 任务 4 | 计划说 `ResolverDeps { … }` 的字面量有五处、`crates/rurge-dns/src/resolver.rs` 里两处；那里的第二处其实是一个测试辅助里的 `Via { key, connector }`，没有改。计划没有列的 `tests/interop/tests/dns.rs` 里有一处，改了；`tests/external/tests/engine.rs` 里的 `dns_connector: None` 只是类型变了，不用改 | 照实际的做 |
+| 19 | 任务 4 | `PipelineConnector` 不再实现 `Connector`（计划只说每个面照样实现）：`Connector` 的两个方法在私有的 `Face` 上，建内部会话的逻辑在 `connect_as` 与 `connect_udp_as`；两条"没有引擎时"的用例改经一个面 | 留着 |
+| 20 | 任务 4 | `the_five_faces_carry_the_five_labels` 建了一个离线的真引擎（标签只在请求记录里看得到），拨的是用例自己的回环监听器 | 留着 |
+| 21 | 任务 4 | 多了第三个提交 `5eb0a0a`：只改用例文档注释里一句说不清楚的话；之后门禁又跑了一遍 | 代项目所有者作的裁定：留着，历史不改写 |
+| 22 | 任务 4 | 两条单元用例的"先红"取自没有提交的中间状态（接口已在、接线是错的），让它们红在断言上而不是编译错误上 | 照此记下 |
+| 23 | 任务 4、5 | 阶段 1 的三个数是 2 / 37 / 10，不是计划写的 2 / 37 / 14：任务 4 让 DNS 连接的标签照手册按方案定，阶段 1 验收文档里原来"有意不同"的四句（FR-RULE-08 的 DoH、DoT、DNS 连接，FR-DNS-04 的 `PROTOCOL` 规则匹配）改记"补上了"（`42c2294`）；写计划时没有看出这一层连带 | 照实写：`## 数字` 是 补上了 14 / 没有做完 2 / 有意不同 10，引用三个数的各处随之改 |
+| 24 | 任务 5 | 报告第 5 节没有为清单 3.1 节 `PROTOCOL` 一行列改动（标签的改动在报告之后才定）：那一行里两句按端口的说法随清单那一次一并改了 | 照此 |
+| 25 | 任务 5 | 阶段 2 验收文档里引用三个数的两处都写着日期（2026-10-13）：没有改写，各在后面加了一段写明 2026-10-14 的 | 代项目所有者作的裁定：写明日期的话是历史，同这份文档自己的写法 |
+| 26 | 任务 5 | 文档的提交没有跑测试：没有用例读这些文档；全量门禁在最后的提交上跑了一次 | 代项目所有者作的裁定 |
+| 27 | 任务 5 | 清单里三处补充不在报告的原文里：`GEOIP` 一行多一句（库已载入时 `GEOIP,UNKNOWN` 也命中回环与私有网段这些库里没有条目的地址），1.2 节 `[IP Rewrite]` 一行与 6.2 节 `encrypted-dns-follow-outbound-mode` 一行的第一部分各多引一条用例 | 留着：都与代码相符 |
+| 28 | 任务 5 | 清单 4.6 节「WireGuard 生命周期」一行说握手发起包之外的包不标，`wireguard` 行上的 `tos` 生效之后不对了；报告没有为它列改动 | 另一个提交订正（`6f33016`）：其它包标策略的 `tos`，没写时不标，共用的隧道取起它的那个策略的 |
+| 29 | 任务 5 | 清单 3.2、3.3、3.5 节有 14 行比表头少一格（最后一格空着），早于这一轮 | 没有动；延后 |
 
 ## 延后事项
 
@@ -365,3 +394,4 @@ pub struct StackOptions { /* 原有的 */, pub dns_connector: Option<DnsConnecto
 | 10 | 指向同一个节的 `wireguard` 策略 `tos` 不同时，隧道的标记是起它的那个策略的；重载只改 `tos` 时旧隧道还被拿着就不换 | 有用户报告再说；清单登记 |
 | 11 | `tos` 在线上的 DSCP 位、真实的旧 `custom` 配置、真实的 GeoLite2 库之下的 `UNKNOWN`：都没有在真实环境里看过 | 手工验收 |
 | 12 | 新的用例只在一台 Windows 11 x86-64 的开发机上跑过；`an_ipv6_literal_is_reached_directly_with_ipv6_off` 在没有 IPv6 回环的机器上跳过（CI 的三种机器有没有，没有看过） | 第一次 CI 运行时核对 |
+| 13 | 清单 3.2、3.3、3.5 节有 14 行比表头少一格（最后一格空着，显示为空），早于这一轮 | 下次动到那几行时补齐 |

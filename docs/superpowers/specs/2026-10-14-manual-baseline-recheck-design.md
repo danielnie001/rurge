@@ -319,3 +319,14 @@ pub struct ResolverDeps {
 5. 文档。
 
 任务之间只有文档依赖前四个；前四个互不依赖，按上面的顺序做。
+
+## 10. 实施期的订正
+
+与第 4 ～ 7 节不同的做法；计划层面的出入在计划的「执行期修正记录」。
+
+- **4.1**：取值去掉首尾空白之后等于 `UNKNOWN`（不分 ASCII 大小写）才是，两种规则一样；`GeoLookup` 与 `GeoResult` 都从 `rurge_rules` 的根导出。
+- **4.3**：位置上写错的加密方法，`E0018` 不引用它（`9a01a32`）：少写了方法的行里，那个位置上的是口令；命名的 `encrypt-method=` 写错时照旧引用。
+- **4.7**：`rurge_policy::random_below` 是 `smart` 组用的那个函数；`load-balance` 自己写着同一个式子。取法相同（标准库的随机哈希），只是函数是两处。
+- **4.8**：`PipelineConnector` 自己不再是一个 `Connector`：五个面是一个私有的类型 `Face`，各带一个固定的 `ProtocolKind`、只是转调，建内部会话的逻辑在 `connect_as` 与 `connect_udp_as`（`42c2294`）。4.8 节的五条判据都在 `a_dns_session_is_labelled_by_its_scheme_whatever_the_port` 一条用例里，另多一行 `[Host]` 的 `server:tls://`；五个面各自的标签由 `the_five_faces_carry_the_five_labels`（一个离线的真引擎）钉住，解析器把每种上游交给自己那一个连接器由 `each_kind_of_upstream_dials_through_its_own_connector` 钉住。缺省端口上的服务器标签与以前相同。
+- **4.9**：八条写出来都是绿的，没有查出缺口。第八条（`a_dns_session_follows_the_outbound_mode`，`745beda`）的全局策略是一个拒绝一切的回环代理，不是 REJECT：链底是 REJECT 的 DNS 会话绕过它直连，看不出会话交给了谁。
+- **第 7 节**：三个数是"2 句没有做完、37 句阶段栏与登记不一致、10 句有意不同"，不是第 7 节写的 14 句：4.8 让 DNS 连接的标签照手册按方案定，阶段 1 验收文档里原来"有意不同"的四句（FR-RULE-08 的 DoH、DoT、DNS 连接，FR-DNS-04 的 `PROTOCOL` 规则匹配）随之改记"补上了"。清单 3.1 节 `PROTOCOL` 一行里按端口的说法随清单一并改了，4.6 节「WireGuard 生命周期」一行里"其它包不标"随 `tos` 订正（`6f33016`）——报告第 5 节都没有为它们列改动。阶段 2 验收文档里写着日期（2026-10-13）的两段没有改写，各在后面加了一段 2026-10-14 的。清单附录数出来是 565 行，与预期相同。

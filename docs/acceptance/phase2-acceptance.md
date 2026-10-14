@@ -33,7 +33,7 @@
 - **第 6 条　回环对端上满足，等第一次 CI 绿**。真实的 WireGuard 服务端与 WARP 要手工验。
 - **第 7 条　回环用例满足，等第一次 CI 绿**。DoQ / DoH3 的 4 个互操作用例没有对真实二进制运行过。
 - **第 8 条　未满足**。三平台 CI 没有绿过；clippy 零警告与 `W0007` / `W0008` 两项在本机成立。
-- **第 9 条　清单已有，手工验收一项没做**。21 节 185 项。
+- **第 9 条　清单已有，手工验收一项没做**。22 节 187 项。
 - **需求逐条对照代码　阶段 1 有 20 句不在（2026-10-10 的数），阶段 1 补遗（M5a）补上了大部分**。阶段 1：287 句里 20 句没有落地或只做到解析（只解析 12、没有 8），其中有托管配置的更新与远程 `#!include` 两项 P0；2026-10-11 的阶段 1 补遗（M5a）之后，表里的 13 行补上了 10 行，剩下托管配置的更新、远程 `#!include` 与外部资源的手动强制更新三行，属阶段 1 补遗（M5b）；阶段 2：196 句里 5 句只做到解析（4 句启动时由 `W0029` 登记，1 句 `hidden` 没有登记），没有完全缺失的，另有 1 句未能判定。审计只读代码，没有运行，不证明别处没有缺口；阶段 1 补遗（M5a）就在判为"做了"的 FR-RULE-05 上查出一条只做了一部分的。
 
 | 标准 | 回环用例（本机通过） | 互操作用例（已写，未运行） | 还缺什么 |
@@ -46,9 +46,11 @@
 | 6　WireGuard 与带 `client-id` 的端点 | `FakeWgPeer` 上带 `client-id` 的握手与转发（TCP、UDP、测速）；保留字节的编解码；隧道的结束方式与重建 | 1 个：sing-box 的 WireGuard 端点，`client-id = 1/2/3` | 对真实 WireGuard 服务端与 WARP 的运行（手工清单 M4b）；重新握手 / keepalive / 过期的计时器没有用例让 90 或 120 秒过去 |
 | 7　`h3://` 与 `quic://` 上游 | URL 解析、DoQ、DoH3、两者共用的会话、经解析器与经跟随出站模式的用例 | 4 个：dnsproxy v0.86.0 与 CoreDNS v1.14.7 各 DoQ、DoH3 | 对真实二进制的运行；夹具的命令行、Corefile 与就绪日志读自源码；公共 DoQ / DoH3 服务（手工清单 M7c） |
 | 8　CI 绿、clippy、`W0007` / `W0008` | `W0007`、`W0008` 的出现条件在配置层、注册表、引擎与 `rurge check` 各有用例；clippy 在本机零警告 | 不适用 | CI 没有绿过：最近一次运行（`0154e73`）的 `cargo test` 在三平台都失败，失败清单未读到；那以后的提交（到 `44a0204` 是 76 个）没有一个被 CI 见过；CI 里没有单独的互操作任务，互操作用例在 `cargo test --workspace` 一步里 |
-| 9　手工验收清单 | 不适用 | 不适用 | `docs/acceptance/phase2-manual.md` 存在，21 节共 185 项，没有一项做过；阶段 1 的 `docs/acceptance/phase1-manual.md` 的 34 项也没做（2026-10-13 的更新：这份清单现在是 45 行，仍是一行也没有做过，见「留给项目所有者的」第 5 项） |
+| 9　手工验收清单 | 不适用 | 不适用 | `docs/acceptance/phase2-manual.md` 存在，22 节共 187 项，没有一项做过；阶段 1 的 `docs/acceptance/phase1-manual.md` 的 34 项也没做（2026-10-13 的更新：这份清单现在是 45 行，仍是一行也没有做过，见「留给项目所有者的」第 5 项；2026-10-14 的更新：手册基线重对又加了 1 行，现在是 46 行） |
 
-能说的：第 2、3、4、5、7 条的文字要求的是用例，这些用例存在，并在本机（Windows）的全量运行里通过；第 6 条在回环对端上成立；第 8 条的 clippy 与 `W0007` / `W0008` 两项在本机成立；第 9 条要求的清单存在。不能说的：第 1 条要求对参考服务器，63 个互操作用例没有一个对真实的二进制运行过；第 8 条要求三平台 CI 绿，CI 没有绿过——本地的 `origin/main` 是 `0154e73`，之后的提交（到 `44a0204` 是 76 个）没有一个被 CI 见过——；第 9 条的手工验收，185 项没有一项做过。回环用例的结果只有本机（Windows）的，Linux 与 macOS 上还没有一次可读的结果（`0154e73` 那次 CI 运行的日志读不到）。阶段 1 也不能说"齐备"：2026-10-10 查出 20 句需求条款没有落地或只做到解析，阶段 1 补遗（M5a）补上了其中的大部分，还剩托管配置的更新、远程 `#!include` 与外部资源的手动强制更新（阶段 1 补遗（M5b））；判为"做了"的条款没有人复核过，阶段 1 补遗（M5a）就在 FR-RULE-05 上查出一条只做了一部分的，见「需求逐条对照代码」一节。 2026-10-13 的更新：这三项已由阶段 1 补遗（M5b）做出来；阶段 1 的需求也逐句对着代码重读了一遍（416 句，`docs/acceptance/phase1-acceptance.md`），结果是三个数，要一起看：3 句没有做完，37 句的阶段栏写着阶段 1 而登记在后面的阶段，14 句有意做成了别的样子并已登记。所以阶段 1 仍然不说"齐备"；这一遍也没有覆盖阶段 1 的手工验收清单（一行也没有做过）与 CI（没有绿过）。
+能说的：第 2、3、4、5、7 条的文字要求的是用例，这些用例存在，并在本机（Windows）的全量运行里通过；第 6 条在回环对端上成立；第 8 条的 clippy 与 `W0007` / `W0008` 两项在本机成立；第 9 条要求的清单存在。不能说的：第 1 条要求对参考服务器，63 个互操作用例没有一个对真实的二进制运行过；第 8 条要求三平台 CI 绿，CI 没有绿过——本地的 `origin/main` 是 `0154e73`，之后的提交（到 `44a0204` 是 76 个）没有一个被 CI 见过——；第 9 条的手工验收，187 项没有一项做过。回环用例的结果只有本机（Windows）的，Linux 与 macOS 上还没有一次可读的结果（`0154e73` 那次 CI 运行的日志读不到）。阶段 1 也不能说"齐备"：2026-10-10 查出 20 句需求条款没有落地或只做到解析，阶段 1 补遗（M5a）补上了其中的大部分，还剩托管配置的更新、远程 `#!include` 与外部资源的手动强制更新（阶段 1 补遗（M5b））；判为"做了"的条款没有人复核过，阶段 1 补遗（M5a）就在 FR-RULE-05 上查出一条只做了一部分的，见「需求逐条对照代码」一节。 2026-10-13 的更新：这三项已由阶段 1 补遗（M5b）做出来；阶段 1 的需求也逐句对着代码重读了一遍（416 句，`docs/acceptance/phase1-acceptance.md`），结果是三个数，要一起看：3 句没有做完，37 句的阶段栏写着阶段 1 而登记在后面的阶段，14 句有意做成了别的样子并已登记。所以阶段 1 仍然不说"齐备"；这一遍也没有覆盖阶段 1 的手工验收清单（一行也没有做过）与 CI（没有绿过）。
+
+2026-10-14 的更新：手册基线重对（报告 `docs/reports/2026-10-14-manual-baseline-recheck.md`）把项目对照的手册前移到 Surge Mac 6.10.0 / iOS 5.23.0，阶段 1 的三个数随之成了 **2 句没有做完，37 句的阶段栏写着阶段 1 而登记在后面的阶段，10 句有意做成了别的样子并已登记**（上面 2026-10-13 的更新写的是 3、37、14）：手册 IP 页的 `GEOIP,UNKNOWN` 与 `IP-ASN,UNKNOWN` 那一句补上了（`9b0bcfe`，原来记"没有做完"），DNS 连接的三个协议标签与 `PROTOCOL` 规则匹配那 4 句随标签改按 URL 的方案补上了（`42c2294`，原来记"有意不同"）。所以阶段 1 仍然不说"齐备"。这一轮没有观察过 Surge 的实际行为，也没有对着代码重读阶段 1、2 的其余各行（只核对了 47 处）；手工验收清单现在是阶段 2 的 22 节 187 项与阶段 1 的 46 行，一行也没有做过，CI 没有绿过。细节见「需求逐条对照代码」一节的「手册基线重对之后（2026-10-14）」。
 
 ## 1. 每种协议对参考服务器的 TCP 转发通过；支持 UDP 的协议 UDP 转发通过
 
@@ -384,7 +386,7 @@ Shadow TLS：
 
 > 需要真实公网节点的项目进入 `docs/acceptance/phase2-manual.md`，由项目所有者用自己的节点手工验收。
 
-清单 `docs/acceptance/phase2-manual.md` 存在。第 3 行规定每一项记下日期、平台与结果。清单共 21 节 185 项（M2a、M2b 的三节共 20 项是步骤表，其余 165 项是复选项），没有一项被勾选，也没有一项记过结果。这些项由项目所有者用自己的节点做，自动化测试（只用回环）覆盖不了。阶段 1 的系统代理与服务安装另有 `docs/acceptance/phase1-manual.md`（Windows 12 项、macOS 10 项、Linux 10 项，共 32 行，结果、日期与系统版本三栏全是空的），M8c 往里加了两项共 4 行：三个平台各一行"配置加载不了时的恢复"（系统代理），Windows 另有一行"睡眠唤醒后的解析器"（CPU 回落、解析恢复）。 2026-10-13 的更新：之后阶段 1 补遗（M5a）加了 2 行（macOS 与 Linux 各一行），阶段 1 补遗（M5b）加了 11 行，现在共 45 行（Windows 14、macOS 13、Linux 13，另有「与平台无关」一节 5 行），仍是一行也没有做过。
+清单 `docs/acceptance/phase2-manual.md` 存在。第 3 行规定每一项记下日期、平台与结果。清单共 22 节 187 项（M2a、M2b 的三节共 20 项是步骤表，其余 167 项是复选项），没有一项被勾选，也没有一项记过结果。这些项由项目所有者用自己的节点做，自动化测试（只用回环）覆盖不了。阶段 1 的系统代理与服务安装另有 `docs/acceptance/phase1-manual.md`（Windows 12 项、macOS 10 项、Linux 10 项，共 32 行，结果、日期与系统版本三栏全是空的），M8c 往里加了两项共 4 行：三个平台各一行"配置加载不了时的恢复"（系统代理），Windows 另有一行"睡眠唤醒后的解析器"（CPU 回落、解析恢复）。 2026-10-13 的更新：之后阶段 1 补遗（M5a）加了 2 行（macOS 与 Linux 各一行），阶段 1 补遗（M5b）加了 11 行，现在共 45 行（Windows 14、macOS 13、Linux 13，另有「与平台无关」一节 5 行），仍是一行也没有做过。 2026-10-14 的更新：手册基线重对在「与平台无关」一节加了 1 行（真实的 GeoLite2 库之下的 `GEOIP,UNKNOWN` 与 `IP-ASN,UNKNOWN`），现在共 46 行（Windows 14、macOS 13、Linux 13，与平台无关 6 行），仍是一行也没有做过；阶段 2 的清单新增的一节「手册基线重对」（2 项）已计入上面的 22 节 187 项。
 
 | 节 | 项数 | 内容 |
 | -- | ---- | ---- |
@@ -409,6 +411,7 @@ Shadow TLS：
 | M7c　HTTP/3 族与 DoQ / DoH3 | 13 | `masque`、`trust-tunnel` 的 `h3=true`、公共 DoQ / DoH3、跟随出站模式 |
 | M8b　流式方法、Snell v1 ～ v3 | 13 | 流式方法的 TCP 与 UDP、`salsa20`、Surge 自带的 Snell 服务端（v1）、没写 `vmess-aead` 的 `vmess` 行 |
 | M8c　收尾与遗留的几项 | 6 | `masque` 经 `underlying-proxy` 时内层 QUIC 可用、AnyTLS 半死会话三秒内失败、复用的会话上的 UDP 过了三秒仍可用、`socks5-tls` 对真实的 SOCKS5 over TLS 服务器、`include-other-group` 取到的成员走不走那个组的中继（与 Surge 对照）、经 tailscaled 的 SOCKS5 接入 tailnet |
+| 手册基线重对 | 2 | `wireguard` 行上的 `tos` 在线上的 DSCP 位（握手的发起包 `0x88`、其余是策略的 `tos`；Windows 上系统是否照办另记）、一行真实的旧 `custom` 策略对真实的 Shadowsocks 服务端 |
 
 阶段 1 清单里 M8c 加的那两项，自动化里的证据只到回环和假后端为止：配置读不了、配置有错误、`--log-file` 打不开这三种坏配置时，`rurge run` 先把上一次崩溃留下的系统代理设置恢复再以 2 退出，用例只经 `RURGE_SYSTEM_PROXY_BACKEND=file:<路径>` 的文件后端（`crates/rurge/tests/cli.rs`：`run_restores_a_crashed_system_proxy_when_the_profile_cannot_be_read`、`run_restores_a_crashed_system_proxy_when_the_profile_has_errors`、`run_restores_a_crashed_system_proxy_when_the_log_file_cannot_be_opened`、`a_profile_that_does_not_load_leaves_a_live_instances_system_proxy_alone`、`run_keeps_the_backup_when_it_cannot_restore_it`），真实的注册表、`networksetup`、`gsettings` / `kwriteconfig` 从没在这条路径上跑过；睡眠唤醒后的解析器，用例拨的是暂停的时钟（`crates/rurge-dns/src/fanout.rs`：`a_fanout_kept_from_running_until_past_its_deadline_ends_as_a_timeout`），真实的睡眠只能手工验。
 
@@ -418,7 +421,7 @@ Shadow TLS：
 - 清单没有 M1（`http`、`https`、`socks5`）一节。这三种协议在 `tests/interop` 里有 sing-box 的用例；`socks5-tls` 没有参照服务端，只有 M8c 一节的一项。
 - M8 细化设计 6.2 说要给清单补三节：流式方法、Snell v1（对 Surge 自带的服务端）、经 tailscaled 接入。前两者在 M8b 一节里，经 tailscaled 接入在 M8c 一节里。M8c 一节另有"`masque` 经 `underlying-proxy` 时内层 QUIC 可用"与"AnyTLS 半死会话三秒内失败"等。
 - 清单上的写法有几处是读文档或源码得出的、没有人照着做过一遍：经 tailscaled 的 SOCKS5 接入（可行性报告 3.3 的写法）、MASQUE 经 `underlying-proxy` 的数字（按 quinn 的余量算出来的）。走不通时要订正兼容性清单与可行性报告里的写法。
-- 185 项由项目所有者做。做完的项在清单里记日期、平台与结果，本文第 9 条才能改写为满足。
+- 187 项由项目所有者做。做完的项在清单里记日期、平台与结果，本文第 9 条才能改写为满足。
 
 ## 需求逐条对照代码
 
@@ -469,6 +472,16 @@ Shadow TLS：
 - **接着读完阶段 1 的需求，查出的。** 阶段 1 的需求——需求文档第 4 节里阶段栏含 1 的 49 行，共 416 句——随后逐句对着代码读过，结果在 `docs/acceptance/phase1-acceptance.md`：一个读代码和用例断言的助手逐句读、补用例、补小缺口，每条结论另由一位评审者抽查；判为"做了"的行指到一条断言了这一句的用例，这不等于别处没有缺口，有几行在自己的格子里写着一处限制。结果有三个数，要一起看，缺一不可：416 句里 **3 句**登记为没有做完，都在优先级 P0 的需求行上（手册 IP 页的 `GEOIP,UNKNOWN` 与 `IP-ASN,UNKNOWN`；规则集文件行上的 `extended-matching`；"大集合内存可控"没有判据）；**37 句**是需求行的阶段栏写 1、而兼容性清单或某份设计把它们登记在后面的阶段的句子（优先级 P0 的需求行上 32 句，P1 的 5 句），其中 34 句今天不按需求的字面做、等阶段 3 ～ 6，另外 3 句登记在阶段 2 而今天有代码；**14 句**有意不同而已登记。改需求文档的阶段栏，还是改清单与设计里的登记，由项目所有者定，需求文档没有改。阶段 2：功能做出来了，验收没有完成（本文其余各节）。这个结果没有覆盖的：阶段 1 的手工验收清单（没有一行做过）、CI（没有绿过：所有用例只在一台 Windows 11 x86-64 的开发机上跑过）和阶段 2 的验收。也不要由它推出：真的系统解析库在真实网络上对 `.local` 名字做什么，在任何平台上都没有观察过。
 - **整分支的评审之后又改的（2026-10-13）。** 合并之前的整分支评审只读代码与文档、什么也没运行，查出五条要处理的，都在合并之前处理了（阶段 1 / M5b 计划「执行期修正记录」第 118 ～ 124 行）。行为变了的：托管配置的副本不再 include 任何本地文件（`e8bfacd`；此前它可以用朴素的相对路径 include，而读进来的代理能被副本经它自己的 DNS 与中继用上），用例 `crates/rurge-config/src/text/include.rs`：`a_copy_includes_no_local_file`，`crates/rurge-config/src/config.rs`：`a_copy_takes_in_nothing_of_the_directory_of_the_local_file`、`the_copy_of_a_managed_profile_names_no_local_file`，`crates/rurge-engine/tests/profile_updates.rs`：`the_copy_of_a_managed_profile_builds_nothing_from_a_local_file`；通配命名节下，下载到的、写下来连一个节都没有的正文不采用（`f859495`；自己只有通配节的下载文本不算，它等它 include 的文件——第一个提交把它也拒了，`9905e2f` 订正），用例 `crates/rurge-config/src/text/include.rs`：`a_downloaded_text_without_any_section_is_flagged_under_a_wildcard`、`a_local_file_without_any_section_is_not_flagged_under_a_wildcard`、`a_downloaded_text_of_wildcard_sections_alone_is_not_flagged`，`crates/rurge-engine/tests/profile_updates.rs`：`a_page_is_not_taken_as_a_file_included_under_a_wildcard_section`、`a_text_of_wildcard_sections_alone_waits_for_the_file_it_includes`；重载失败时也去下载它点名而从没下载过的来源（`09fa962`），用例 `crates/rurge-engine/tests/profile_updates.rs`：`the_managed_profile_a_failed_load_names_is_downloaded_and_reported`、`the_include_a_failed_load_names_is_downloaded_and_reported`、`a_source_followed_for_a_failed_load_suspends_nothing`、`following_the_same_sources_twice_registers_them_once`、`the_next_generation_decides_whether_a_followed_source_stays`、`following_a_source_leaves_the_generation_in_use_as_it_was`、`only_a_source_without_a_copy_is_followed`、`an_offline_process_follows_nothing`，`crates/rurge/tests/cli.rs`：`a_link_rotated_while_the_daemon_runs_is_downloaded_and_taken`。只动测试的一处：资源管理器的测试建在拒绝一切名字的解析器上（`4671e58`）。这些用例同样只在那一台开发机上跑过；评审读出的这几条在修正之前没有哪条用例走到，修正之后的行为由上面的用例钉住，别的没有。修正之后把这一轮又读了一遍（只读，什么也没运行；阶段 1 / M5b 计划「执行期修正记录」第 125 行）：没有读出新的要紧的缺口；读出的几处小的里，行为上的一处在合并之前改了——会话因 `strict` 被拒时，`GET /v1/external_resources` 此前把列表里每一项 `profile` 都标成 `suspended`，一次失败的重载之后临时跟上的那一份托管配置也在内；现在只有 `strict` 所问的那一份带它与被拒的原因（`50d77a0`），用例 `crates/rurge-engine/tests/external_resources.rs`：`a_managed_profile_that_is_only_followed_is_not_flagged`、`nothing_is_flagged_where_no_managed_profile_says_strict`。同一个提交补了一条此前没有钉住的：文件不再点名的临时来源由下一次判定放掉，`crates/rurge-engine/tests/profile_updates.rs`：`a_followed_source_the_file_no_longer_names_is_let_go_of`。
 - **仍没有的。** FR-CFG-05 的"记录 Logbook"属阶段 6（更新与拒绝的记录现在是日志）；外部资源没有 CLI 子命令，`rurge status` 不显示暂停（都属阶段 6）；阶段 1 / M5b 计划「延后事项」第 10、11 行。
+
+### 手册基线重对之后（2026-10-14）
+
+上面的数字、前面各节与下面的表是各自那一天的，不改。2026-10-14 的手册基线重对（报告 `docs/reports/2026-10-14-manual-baseline-recheck.md`，设计 `docs/superpowers/specs/2026-10-14-manual-baseline-recheck-design.md`，计划 `docs/superpowers/plans/2026-10-14-manual-baseline-recheck-plan.md`）把那天取的整本手册逐句对着兼容性清单读了一遍，也改了几处阶段 1、2 已经声称支持的条目上的代码。本节引用的提交都在 `30b082a..6f33016` 里（`30b082a` 是这些提交之前的 `main`；`c4b992d` 与 `6f33016` 只改兼容性清单，其余改代码、用例或文档）；"`a` ～ `b`"是含两端的一段。
+
+- **基线前移。** 项目对照的手册从此是 Surge Mac 6.10.0 / iOS 5.23.0（2026-10-13 发布）的手册，2026-10-14 取的文本，87 页；需求文档的参考基线一行、兼容性清单的表头、`CLAUDE.md` 与两份 README 同改。官方频道里 2026-10-13 之后的测试版还有几件手册没有写到的（自适应的 `block-quic`、`GET /v1/policies?include_external=true`、跨多个包的 QUIC 主机名识别、QUIC v2 与 draft-29），下一次重对从那里开始。
+- **阶段 1 的三个数变了。** 2026-10-13 写的是 3 句没有做完、37 句的阶段栏与登记不一致、14 句有意不同；现在是 **2 句没有做完、37 句的阶段栏与登记不一致、10 句有意不同**（`docs/acceptance/phase1-acceptance.md` 的 `## 数字`：补上了 14、没有做完 2、有意不同 10，合计仍是 416）。动的是五句：FR-RULE-01 手册 IP 页的 `GEOIP,UNKNOWN` 与 `IP-ASN,UNKNOWN` 那一句，原来记"没有做完"，`9b0bcfe` 补上了——匹配数据库已载入而查不到的地址，库没有载入时不匹配；FR-RULE-08 的 DoH、DoT、DNS 三个连接标签与 FR-DNS-04 的 `PROTOCOL` 规则匹配那四句，原来记"有意不同"，`42c2294` 补上了——跟随出站模式时 DNS 会话的协议标签按 URL 的方案定，不再按端口猜。FR-RULE-08 的 DoH3、DoQ 两句的结论没有变，仍在"阶段栏与登记不一致"的 37 句里，说标签的话随之改了。
+- **其余的改动。** 十一处里其余几处（`436ee74`、`b809298`、`9a01a32`、`24e1841`、`31c4245`、`05d2e1c`、`bd6f61d`、`a0dba4b`、`9027daf`，和钉住现有行为的用例 `5c5fe22`、`745beda`）属阶段 1、2 的条目，用例名在兼容性清单对应的行里，本节不重复。兼容性清单改了 123 处，现在 565 行。
+- **用例通过的意思。** `5eb0a0a` 上的那一次全量运行（一个测试二进制异常退出、单独重跑之后的合计）：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 都干净，`cargo test --workspace --no-fail-fast` 74 个结果行，3416 个通过，0 个失败，6 个忽略；其后到 `6f33016` 只有兼容性清单变过。通过的意思也只是这个：一台 Windows 11 x86-64 的开发机上的一次运行，不是 CI（CI 没有绿过）；新的用例只对着回环上的假服务端与 MaxMind 的测试库，没有一条对真实的服务端、真实的库或真实的抓包跑过。
+- **这一轮没有覆盖的。** Surge 的实际行为（一处也没有观察过，清单里"与 Surge 一致"说的是与手册的文字一致）；被读成"一致"的 2,439 条（没有人逐条复核）；代码（第二遍只核对了 47 处，阶段 1、2 其余各行比的是清单的文字与手册的文字，不是代码与手册）；阶段 3 及以后的行上手册多说的细节；取文本时丢掉的图、链接与表格的行列；手册之外的知识库、博客与社区文档（发行说明只读了最近的一页）；两件取自第三方的事实（旧 `custom` 行里字段的位置，`GET /v1/profiles/current` 的三个键）。CI 与手工验收照旧：CI 没有绿过，两份手工清单（阶段 2 的 22 节 187 项、阶段 1 的 46 行）一行也没有做过；这一轮各加了回环上验不了的项（阶段 2：`wireguard` 的 `tos` 在线上的 DSCP 位、一行真实的旧 `custom` 策略；阶段 1：真实的 GeoLite2 库之下的 `GEOIP,UNKNOWN` 与 `IP-ASN,UNKNOWN`）。
 
 ### 阶段 1 里只解析或没有的条款
 
@@ -588,7 +601,7 @@ Shadow TLS：
 2. **没有一个互操作用例对真实的二进制跑过。** 63 个用例在本机跳过（61 个在本机编译）；好几个参照服务端的命令行、配置与就绪日志是读源码写的，夹具改取端口的改动也没有对真实的服务端跑过。要产生证据：同一次三平台全绿的 CI 运行，其中 `RURGE_INTEROP_REQUIRED=1` 保证这些用例跑了而不是跳过；某个用例红了，先分清是夹具与参照服务端不符，还是 rurge 的问题。
 3. **AnyTLS 的 SYNACK 看门狗没有对真实服务端验证过，第一次 CI 运行也验证不了**：互操作用例在几毫秒内放掉每条流，UDP 用例用新会话的第一条流，看门狗不看它；假服务端应答的次序是照参考实现的源码写的。要产生证据：一个在复用的会话上活过 3 秒的流的互操作用例（计划「延后事项」第 87 行）；手工清单 M8c 一节有对应的两项。
 4. **mihomo 的用例**（Snell v1 ～ v3、`ss` 的流式方法、两种协议前面的 simple-obfs）可以在本机对项目所有者自己的 mihomo 跑，设 `RURGE_TEST_MIHOMO` 即可——是否这样做由所有者定。
-5. **两份手工清单一项也没做**：`docs/acceptance/phase2-manual.md` 21 节 185 项，`docs/acceptance/phase1-manual.md` 34 行。其中有几项的写法是读文档或源码得出的，没有人照着走过一遍（经 tailscaled 的 SOCKS5 接入、MASQUE 经 `underlying-proxy` 的数字）。 2026-10-13 的更新：阶段 1 的清单现在是 45 行（Windows 14、macOS 13、Linux 13，另有新的一节「与平台无关」5 行）。阶段 1 补遗（M5b）加了 11 行：真实服务商的托管配置、真实服务器上的远程 `#!include`、真实的 `strict`，三个平台各一行 API 连接收尾的检查，三个平台各一行真实的 `.local` 名字，以及由单播 DNS 服务器回答的 `.local` 区域与 `[Host]` 里的 `server:system`。仍是一行也没有做过；阶段 2 的清单没有变。
+5. **两份手工清单一项也没做**：`docs/acceptance/phase2-manual.md` 22 节 187 项，`docs/acceptance/phase1-manual.md` 34 行。其中有几项的写法是读文档或源码得出的，没有人照着走过一遍（经 tailscaled 的 SOCKS5 接入、MASQUE 经 `underlying-proxy` 的数字）。 2026-10-13 的更新：阶段 1 的清单现在是 45 行（Windows 14、macOS 13、Linux 13，另有新的一节「与平台无关」5 行）。阶段 1 补遗（M5b）加了 11 行：真实服务商的托管配置、真实服务器上的远程 `#!include`、真实的 `strict`，三个平台各一行 API 连接收尾的检查，三个平台各一行真实的 `.local` 名字，以及由单播 DNS 服务器回答的 `.local` 区域与 `[Host]` 里的 `server:system`。仍是一行也没有做过；阶段 2 的清单没有变。 2026-10-14 的更新：手册基线重对在阶段 1 的清单「与平台无关」一节加了 1 行（现在是 46 行，与平台无关 6 行），在阶段 2 的清单加了新的一节「手册基线重对」2 项（现在是 22 节 187 项，第一句已按它写）；仍是一行也没有做过。
 6. **这台开发机与 CI 不同**：本机开着 Windows 的 Simple TCP/IP Services（回环 TCP 与 UDP 的 7、9、13、17、19 号端口），CI 上关着。写到 9 号端口的 66 行换成关着的端口后，整套用例只有一条变红，已改（`crates/rurge-engine/tests/smart.rs`：`udp_silence_counts_only_where_answers_always_come`），现在没有用例依赖它们。"立刻拒绝"（Linux、macOS）在本机只能用"接了立刻关"顶替，真的要等 CI。
 7. **阶段 1 补遗（M5a）里本机验不了的三处**：`sighup_reloads_the_profile` 与 `run_shuts_down_gracefully_on_sigint` 新加的一行等待只在 Unix 上编译，本机（Windows）没有编译过、运行过；`rurge_platform::sysinfo` 对 macOS 与 Linux 的读取只对着假的命令、文件与环境变量测过，macOS 的三种格式（`SystemVersion.plist`、`defaults read -g AppleLanguages`、`scutil --get`）取自公开描述。要产生证据：同一次三平台全绿的 CI 运行；`docs/acceptance/phase1-manual.md` 的 macOS 与 Linux 各有一行，由项目所有者在真实的机器上做（阶段 1 / M5a 计划「延后事项」第 1、2、13、23 行）。
 
