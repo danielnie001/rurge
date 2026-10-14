@@ -290,6 +290,53 @@ async fn a_local_host_item_reaches_the_proxy_as_an_ip() {
     }
 }
 
+/// A name `[Host]` gives several addresses reaches the proxy as one of them,
+/// drawn anew for every session.
+#[tokio::test]
+async fn a_local_host_item_with_several_addresses_gives_the_proxy_one_at_random() {
+    const SESSIONS: usize = 40;
+    let pinned = ["127.0.0.2", "127.0.0.3", "127.0.0.4"];
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    // the fake upstream goes to the origin whatever it is asked for: the
+    // pinned addresses are never dialled
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness(Profile {
+        general: "use-local-host-item-for-proxy = true",
+        proxies: &format!("Up = socks5, 127.0.0.1, {}", upstream.addr().port()),
+        hosts: &format!("pinned.test = {}", pinned.join(", ")),
+        rules: "DOMAIN-SUFFIX,test,Up",
+        ..Profile::default()
+    })
+    .await;
+    for _ in 0..SESSIONS {
+        let mut tunnel = connect_via_http(h.http(), "pinned.test:80").await;
+        assert!(
+            get(&mut tunnel, "pinned.test", "/hello")
+                .await
+                .ends_with("hi there")
+        );
+    }
+    let seen = upstream.requests();
+    assert_eq!(seen.len(), SESSIONS);
+    for request in &seen {
+        assert_eq!(
+            request.atyp, 1,
+            "an IPv4 address, not the name: {request:?}"
+        );
+        assert!(pinned.contains(&request.host.as_str()), "{request:?}");
+    }
+    let given: std::collections::HashSet<&str> = seen.iter().map(|r| r.host.as_str()).collect();
+    assert!(
+        given.len() > 1,
+        "all {SESSIONS} sessions were given {given:?}"
+    );
+}
+
 /// With an IP substituted for the name, a plain request is tunnelled: the
 /// request inside keeps its `Host`, the proxy connects where `[Host]` says.
 #[tokio::test]

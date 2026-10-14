@@ -27,5 +27,6 @@ pub use cell::{ChainConnector, RegistryCell};
 pub use factory::{BuildError, OutboundFactory};
 pub use registry::{
     EmptyGroup, GroupInfo, Line, Note, PolicyRegistry, Resolution, SmartPick, TerminalKind,
+    random_below,
 };
 pub use selections::{GroupSelections, SelectionTable};

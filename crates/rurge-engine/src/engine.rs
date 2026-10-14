@@ -1262,7 +1262,9 @@ impl Engine {
         let mut target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
         // FR-DNS-07: a proxy normally gets the name and resolves it itself;
         // with `use-local-host-item-for-proxy`, an address pinned in [Host]
-        // goes to the proxy instead. Alias / server items leave the name alone.
+        // goes to the proxy instead: one of them, drawn anew for every
+        // session, when the entry lists several. Alias / server items leave
+        // the name alone.
         let pinned_ip = match &target.host {
             HostName::Domain(name)
                 if resolution.terminal == rurge_policy::TerminalKind::Proxy
@@ -1272,7 +1274,9 @@ impl Engine {
                     .resolver
                     .host_lookup(name)
                     .and_then(|hit| match hit.action {
-                        rurge_dns::hosts::HostAction::Ips(ips) => ips.first().copied(),
+                        rurge_dns::hosts::HostAction::Ips(ips) => {
+                            ips.get(rurge_policy::random_below(ips.len())).copied()
+                        }
                         _ => None,
                     })
             }

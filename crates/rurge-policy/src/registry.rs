@@ -162,7 +162,7 @@ impl Choice {
 }
 
 /// A number below `n`, drawn the way `load-balance` draws.
-fn random_below(n: usize) -> usize {
+pub fn random_below(n: usize) -> usize {
     RandomState::new().hash_one(Instant::now()) as usize % n.max(1)
 }
 
