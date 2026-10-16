@@ -1352,6 +1352,58 @@ async fn select_on_an_automatic_group_overrides_it_until_cleared() {
     );
 }
 
+/// A `subnet` group takes an override as an automatic group does (phase 3 M1
+/// design 6.2): one of its members, which the group dials instead of what
+/// the network says until an empty `policy` clears it, and which is not
+/// written to state.json.
+#[tokio::test]
+async fn select_on_a_subnet_group_overrides_it_until_cleared() {
+    let api = api_in(
+        "DOMAIN,target.test,Net",
+        "Net = subnet, TYPE:WIFI = DIRECT, default = HK",
+    )
+    .await;
+    let select = |policy: &str| json!({ "group_name": "Net", "policy": policy });
+    // the network is not known: the default, a protocol rurge does not speak,
+    // which refuses
+    assert_eq!(
+        get(&api, "/v1/policy_groups/select?group_name=Net").await,
+        (200, json!({ "policy": "HK" }))
+    );
+    let (head, _) = get_via_proxy(api.http(), &api.target_url()).await;
+    assert!(!head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(
+        post(&api, "/v1/policy_groups/select", select("DIRECT")).await,
+        (200, json!({}))
+    );
+    assert_eq!(
+        get(&api, "/v1/policy_groups/select?group_name=Net").await,
+        (200, json!({ "policy": "DIRECT" }))
+    );
+    let (head, body) = get_via_proxy(api.http(), &api.target_url()).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"hi there");
+    // an override is not written to state.json
+    let saved: Value = std::fs::read_to_string(&api.state_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(Value::Null);
+    assert_eq!(saved["group_selections"]["t.conf"]["Net"], Value::Null);
+    // an empty `policy` clears it
+    assert_eq!(
+        post(&api, "/v1/policy_groups/select", select("")).await,
+        (200, json!({}))
+    );
+    assert_eq!(
+        get(&api, "/v1/policy_groups/select?group_name=Net").await,
+        (200, json!({ "policy": "HK" }))
+    );
+    assert_eq!(
+        post(&api, "/v1/policy_groups/select", select("Block")).await,
+        (400, json!({ "error": "`Block` is not a member of `Net`" }))
+    );
+}
+
 #[tokio::test]
 async fn profile_check_includes_the_dry_build() {
     let api = api().await;

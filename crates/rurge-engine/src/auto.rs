@@ -31,13 +31,21 @@ pub(crate) const EVALUATION_FAILED: &str = "policy group evaluation failed";
 /// listed); `None` where there is none.
 pub(crate) type Results = Vec<(String, Option<TestResult>)>;
 
-/// The groups that pick by the tests, and take an override for a
-/// selection: `url-test`, `fallback`, `load-balance`, `smart`.
+/// The groups that pick by the tests: `url-test`, `fallback`,
+/// `load-balance`, `smart`.
 pub(crate) fn automatic(kind: GroupKind) -> bool {
     matches!(
         kind,
         GroupKind::UrlTest | GroupKind::Fallback | GroupKind::LoadBalance | GroupKind::Smart
     )
+}
+
+/// The groups that take a temporary override for a selection: the automatic
+/// ones, and `subnet`, which picks by the network and is never tested (phase
+/// 3 M1 design 6.2) — whether a group can be overridden and whether it is
+/// tested are two questions.
+pub(crate) fn overridable(kind: GroupKind) -> bool {
+    automatic(kind) || kind == GroupKind::Subnet
 }
 
 /// Every connectivity test is a session of the request log (M3 design

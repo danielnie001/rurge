@@ -1,10 +1,10 @@
 //! Policy groups as the control plane sees them, and the one thing it may
 //! change: the selection of a `select` group (M1 design 6.3), which for an
-//! automatic group is an override (phase 2 M3-D10). Everything is read from
-//! the registry in use, so imported and derived members show up as they
-//! come and go (phase 2 M3 design 5.5).
+//! automatic group or a `subnet` group is an override (phase 2 M3-D10; phase
+//! 3 M1 design 6.2). Everything is read from the registry in use, so imported
+//! and derived members show up as they come and go (phase 2 M3 design 5.5).
 
-use crate::auto::automatic;
+use crate::auto::overridable;
 use crate::engine::Engine;
 use crate::state::profile_key;
 use rurge_config::GroupKind;
@@ -163,20 +163,21 @@ impl Engine {
 
     /// A `select` group: the selection, which takes effect for the next
     /// connection and is written to `state.json` under the profile's file
-    /// name. An automatic group: an override, which stands until an empty
-    /// `member` clears it, a reload changes the group, or the process ends
-    /// (M3-D10, M3 design 6.5).
+    /// name. An automatic group, or a `subnet` group: an override, which
+    /// stands until an empty `member` clears it, a reload changes the group,
+    /// or the process ends (M3-D10, M3 design 6.5) — and, for a `subnet`
+    /// group, until the network changes (phase 3 M1 design 6.2).
     pub async fn select_group(&self, group: &str, member: &str) -> Result<(), SelectError> {
         {
             let registry = self.registry();
             let Some(spec) = registry.group_spec(group) else {
                 return Err(SelectError::UnknownGroup(group.to_string()));
             };
-            let is_auto = automatic(spec.kind);
-            if !is_auto && spec.kind != GroupKind::Select {
+            let is_override = overridable(spec.kind);
+            if !is_override && spec.kind != GroupKind::Select {
                 return Err(SelectError::NotSelectable(group.to_string()));
             }
-            if is_auto && member.is_empty() {
+            if is_override && member.is_empty() {
                 registry.auto().clear_override(group);
                 return Ok(());
             }
@@ -191,7 +192,7 @@ impl Engine {
                     member: member.to_string(),
                 });
             }
-            if is_auto {
+            if is_override {
                 registry.auto().set_override(spec, member);
                 return Ok(());
             }

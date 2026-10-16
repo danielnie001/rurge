@@ -642,8 +642,12 @@ async fn only_a_member_can_be_selected() {
         "a policy is not a group"
     );
     assert_eq!(
-        h.engine.select_group("Sub", "A").await,
-        Err(SelectError::NotSelectable("Sub".into()))
+        h.engine.select_group("Sub", "B").await,
+        Err(SelectError::NotAMember {
+            group: "Sub".into(),
+            member: "B".into()
+        }),
+        "a subnet group takes an override, of its own members only"
     );
     assert_eq!(
         h.engine.select_group("Auto", "C").await,
