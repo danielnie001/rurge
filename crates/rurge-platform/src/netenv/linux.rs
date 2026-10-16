@@ -103,11 +103,12 @@ pub(crate) fn quick(host: &dyn Host, opts: &ReadOpts) -> Quick {
 /// it is connected —, and a scan is a request to the radio (time, and battery)
 /// for an answer that needs none: `ACTIVE` is the state of the connection.
 ///
-/// `nmcli` writes `yes` in the language of the user, so it is run with
-/// `LC_ALL=C`. That is the charset of the C locale too, and whether a network
-/// name with letters beyond ASCII comes out whole is for the first run on a
-/// real machine to show; `C.UTF-8`, where there is one, keeps the words English
-/// and the text UTF-8.
+/// `nmcli` writes `yes` in the language of the user, and a network name in
+/// the charset of the user's locale, so it is run with `LC_ALL=C.UTF-8`:
+/// English (the C locale has no translations) with UTF-8 text, so that a
+/// network name with letters beyond ASCII comes out whole. Where a system has
+/// no `C.UTF-8` the C locale is what it falls back to, which is English and
+/// ASCII.
 fn networkmanager_ask() -> Ask {
     Ask::new(&[
         "nmcli",
@@ -120,7 +121,7 @@ fn networkmanager_ask() -> Ask {
         "--rescan",
         "no",
     ])
-    .with_env("LC_ALL", "C")
+    .with_env("LC_ALL", "C.UTF-8")
 }
 
 /// The Wi-Fi link, when a wireless interface is up: NetworkManager's word for
@@ -201,15 +202,14 @@ mod tests {
 
     // the question to NetworkManager as the fake machine names it: the variable
     // first, then the words
-    const NMCLI: &str = "LC_ALL=C nmcli -t -f ACTIVE,SSID,BSSID,DEVICE dev wifi list --rescan no";
+    const NMCLI: &str =
+        "LC_ALL=C.UTF-8 nmcli -t -f ACTIVE,SSID,BSSID,DEVICE dev wifi list --rescan no";
 
     /// NetworkManager scans when its list of access points is older than 30
     /// seconds, unless it is told not to (`--rescan no`); a scan is a request
     /// to the radio — time, and battery —, the full read comes every 30
     /// seconds, and the answer is only the access point it already knows to
-    /// be active. `nmcli` writes `yes` in the language of the user, so it is
-    /// run with `LC_ALL=C`, which is a variable of the program and not a
-    /// program in front of it.
+    /// be active.
     #[test]
     fn the_question_to_networkmanager_asks_for_no_scan() {
         let ask = networkmanager_ask();
@@ -227,7 +227,21 @@ mod tests {
                 "no"
             ]
         );
-        assert_eq!(ask.env, [("LC_ALL".to_string(), "C".to_string())]);
+    }
+
+    /// `nmcli` writes `yes` — and whatever else it translates — in the language
+    /// of the user, and a network name in the charset of the user's locale.
+    /// `LC_ALL=C.UTF-8` is English (the C locale has no translations) with UTF-8
+    /// text, so a network name with letters beyond ASCII comes out whole;
+    /// `LC_ALL=C` is English too, but its charset is ASCII, and what `nmcli`
+    /// prints beyond ASCII is at risk of becoming `?`. Where a system has no
+    /// `C.UTF-8` the C locale is what it falls back to. The variable is the
+    /// question's own — the program's environment —, not a program (`env`) in
+    /// front of it.
+    #[test]
+    fn the_question_to_networkmanager_is_asked_in_english_and_utf_8() {
+        let ask = networkmanager_ask();
+        assert_eq!(ask.env, [("LC_ALL".to_string(), "C.UTF-8".to_string())]);
         assert_eq!(ask.line(), NMCLI);
     }
 
