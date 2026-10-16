@@ -199,12 +199,12 @@ flowchart LR
 | `rurge-proto-wireguard` | WireGuard 出站与其用户态协议栈 | `rurge-proto` |
 | `rurge-net` | 内部 HTTP 客户端、连接器抽象、外部资源管理器（下载 / 缓存 / 更新间隔 / 文件监视） | `rurge-config` |
 | `rurge-inbound` | HTTP / SOCKS5 监听、端口转发、内置 Snell / MTProto 服务器、局域网访问限制 | `rurge-config` |
-| `rurge-tun` | 虚拟网卡驱动适配、用户态 TCP/IP 栈、路由管理、UDP 会话表、ICMP、网关模式、DHCP 服务器 | `rurge-dns` |
+| `rurge-tun` | 用户态 TCP/IP 栈、包的去向、UDP 会话表、ICMP 转发、DNS 应答器（fake-IP）、`[IP Rewrite]`、网关模式、DHCP 服务器；平台无关，虚拟网卡设备与路由、系统 DNS 的设置在 `rurge-platform`（阶段 3 设计第 4 节） | `rurge-inbound` `rurge-dns` |
 | `rurge-http` | HTTP 引擎、MITM 与 CA 管理、URL / Header / Body 重写、Map Local、请求记录与抓包 | `rurge-rules` `rurge-policy` |
 | `rurge-script` | JavaScript 引擎封装、Surge API 绑定、脚本调度与限制、persistentStore | `rurge-http` `rurge-policy` |
 | `rurge-engine` | 会话流水线编排、请求记录、流量统计、运行时状态、热重载 | 各领域 crate |
 | `rurge-api` | HTTP API、鉴权与封禁、Prometheus 指标、Web Dashboard 静态资源、事件中心 / Logbook | 全部 |
-| `rurge-platform` | 进程识别、系统代理设置、网络环境探测、系统通知、服务安装、数据目录 | 无内部依赖 |
+| `rurge-platform` | 进程识别、系统代理设置、网络环境探测、虚拟网卡设备、地址 / 路由 / 系统 DNS 的设置与恢复、ICMP 套接字、系统通知、服务安装、数据目录 | 无内部依赖 |
 | `rurge`（bin） | 守护进程组装、CLI 子命令、交互模式 | 全部 |
 
 架构级需求：
@@ -296,8 +296,8 @@ flowchart LR
 | FR-IN-03 | `proxy-restricted-to-lan`：非本子网来源默认拒绝并记录；默认监听 `127.0.0.1` | P0 | 1 |
 | FR-IN-04 | 系统代理设置：运行时开关（启动参数 / API / CLI）；Windows 写注册表并通知 WinINet；macOS 通过 SystemConfiguration；Linux 设置 GNOME / KDE 代理并输出环境变量提示；`skip-proxy` `exclude-simple-hostnames` `set-system-socks-proxy` 语义；退出或崩溃后恢复原设置 | P0 | 1 |
 | FR-IN-05 | 元数据采集：`IN-PORT`、`SRC-IP`、`SRC-PORT`、目标主机类型（`HOSTNAME-TYPE`）、协议识别结果 | P0 | 1 |
-| FR-IN-06 | 增强模式：三平台 TUN 驱动；注册默认路由；`tun-included-routes` / `tun-excluded-routes` / `ipv6-vif`；ICMP 本地应答与 `icmp-forwarding`；TCP / UDP 通过用户态协议栈进入流水线；权限不足时给出明确提示；退出时恢复路由 | P0 | 3 |
-| FR-IN-07 | 进程识别：本机连接的进程路径与名称，Windows 通过 TCP / UDP 连接表与进程映像路径，Linux 通过 `/proc/net` 与 inode，macOS 通过 libproc；结果供 `PROCESS-NAME` 规则与 `$request.processPath` 使用 | P0 | 3 |
+| FR-IN-06 | 增强模式：三平台 TUN 驱动；注册默认路由；`tun-included-routes` / `tun-excluded-routes` / `ipv6-vif`；ICMP 转发（照手册：回显请求经本机发往真实目的地址、应答由虚拟网卡交回，不在本机伪造；阶段 3 设计 P3-D9）与 `icmp-forwarding`；TCP / UDP 通过用户态协议栈进入流水线；权限不足时给出明确提示；退出时恢复路由 | P0 | 3 |
+| FR-IN-07 | 进程识别：本机连接的进程路径与名称，Windows 通过 TCP / UDP 连接表与进程映像路径，Linux 通过 `/proc/net` 与 inode，macOS 通过 `sysctl` 的 PCB 表与 `proc_pidpath`（阶段 3 设计第 7 节；原写 libproc）；结果供 `PROCESS-NAME` 规则与 `$request.processPath` 使用 | P0 | 3 |
 | FR-IN-08 | UDP 会话表：NAT 映射、超时回收、每会话流量统计；`udp-priority` 尽力实现 | P0 | 3 |
 | FR-IN-09 | 网络环境探测：当前 SSID / BSSID / 默认网关 / 网络类型；网络变化事件（触发缓存清理、重测、`network-changed` 脚本、WireGuard 重建） | P0 | 3 |
 | FR-IN-10 | `[SSID Setting]`：`suspend`、`dns-server` / `encrypted-dns-server` 覆盖、`tfo-behaviour`；`suspend` 时停止接管并释放系统代理与 TUN，API 保持可用 | P1 | 3 |
@@ -473,11 +473,11 @@ flowchart LR
 | --- | --- | --- | --- | --- |
 | 虚拟网卡 | Wintun（管理员） | `/dev/net/tun`（`CAP_NET_ADMIN`） | utun（root） | 阶段 3 |
 | 系统代理设置 | 注册表 `ProxyServer` / `ProxyOverride` + WinINet 刷新 | GNOME / KDE 设置；其他桌面输出环境变量提示 | SystemConfiguration | 阶段 1 |
-| 进程识别 | TCP / UDP 连接表 + 进程映像路径 | `/proc/net/*` + `/proc/<pid>/exe` | libproc | 阶段 3 |
+| 进程识别 | TCP / UDP 连接表 + 进程映像路径 | `/proc/net/*` + `/proc/<pid>/exe` | `sysctl` 的 PCB 表 + `proc_pidpath` | 阶段 3 |
 | 出站网卡绑定 | `IP_UNICAST_IF` / 绑定源地址 | `SO_BINDTODEVICE` | `IP_BOUND_IF` | 阶段 2 |
 | TCP Fast Open | 待验证（Windows 10 起系统支持） | 支持 | 支持 | 阶段 2 |
-| Wi-Fi 信息（SSID / BSSID） | WLAN API | nl80211 | CoreWLAN（macOS 14 起获取 BSSID 需定位权限） | 阶段 3 |
-| 网络变化事件 | `NotifyAddrChange` / 网络列表管理器 | netlink | SystemConfiguration 动态存储 | 阶段 3 |
+| Wi-Fi 信息（SSID / BSSID） | `netsh wlan show interfaces`（没有精确位置权限时拿不到） | `nmcli`，没有时 `iw` | `ipconfig getsummary`（macOS 14 起要位置授权，命令行守护进程多半拿不到） | 阶段 3（设计第 5 节；拿不到是正常状态） |
+| 网络变化事件 | 轮询（每 2 秒） | 轮询（每 2 秒，读 `/proc` 与 `/sys`） | 路由套接字（`PF_ROUTE`）+ 每 30 秒的兜底轮询 | 阶段 3（设计第 5 节；不引入新的包） |
 | 系统通知 | Toast | D-Bus（org.freedesktop.Notifications） | UNUserNotification | 阶段 6 |
 | 系统 hosts | `System32\drivers\etc\hosts` | `/etc/hosts` | `/etc/hosts` | 阶段 1 |
 | mDNS `.local` | 系统解析器（Windows 10 起） | 依赖 avahi / systemd-resolved | 系统解析器 | 阶段 1 |
@@ -585,7 +585,7 @@ Tailscale 策略、Ponte 替代方案、Metered Network Mode、Snell v6 与 v5 �
 | 编号 | 风险 | 影响 | 应对 |
 | --- | --- | --- | --- |
 | R1 | 非公开的协议与算法（Snell v6 与 v5 的 QUIC Proxy Mode、Surge 的 Gecko、smart 组评分） | 无法完全一致 | 近似实现并在清单标注差异；Snell v4 / v5 依公开描述实现、以对参考服务端的互操作为准（阶段 2 M6b），v6 已评估（阶段 2 的可行性报告，FR-OUT-15）：技术上可行，阶段 2 不实现，等正式版并需项目所有者对"照逆向所得实现"表态，v5 的 QUIC Proxy Mode 不做；Gecko 照 Hysteria 官网的公开规范实现、以对 sing-box 的互操作为准（阶段 2 M7a），与 Surge 是否同一算法在手工验收里核对 |
-| R2 | Windows 增强模式依赖 Wintun 驱动的分发与管理员权限 | 安装门槛与许可合规 | 阶段 3 确认 Wintun 再分发条款；提供安装向导 |
+| R2 | Windows 增强模式依赖 Wintun 驱动的分发与管理员权限 | 安装门槛与许可合规 | 阶段 3 确认 Wintun 再分发条款；提供安装向导。阶段 3 调研（`docs/reports/2026-10-16-phase3-tun-survey.md` 第 7 节）：官方签名的 `wintun.dll` 原样与只经 `wintun.h` 使用它的软件一起分发是许可允许的，能否嵌进可执行文件没有明文；rurge 不带、也不下载它，从可执行文件旁以绝对路径加载，发行包是否附带由项目所有者定（阶段 3 设计 P3-D17、Q3） |
 | R3 | macOS 直接操作 utun 需要 root，且无法使用 Network Extension | 体验不如 Surge | 通过 launchd 以 root 运行守护进程，客户端与 GUI 以普通用户运行 |
 | R4 | JavaScript 引擎选型：兼容性、性能、体积、WebAPI 支持之间的权衡 | 脚本兼容率 | 阶段 5 设计文档用脚本样本集对比候选引擎 |
 | R5 | Surge HTTP API 的响应结构未在手册中定义 | 第三方面板兼容性 | 收集现有面板的请求样本与 Surge 实际输出；以兼容测试为准 |
@@ -603,7 +603,7 @@ Tailscale 策略、Ponte 替代方案、Metered Network Mode、Snell v6 与 v5 �
 | Q4 | Web Dashboard 技术栈：复用开源的 Surge 兼容面板还是自研 | 阶段 6 前调研现有面板的许可证与完成度 | 6 |
 | Q5 | Windows 网关模式的实现方式 | 阶段 7 评估 WinDivert 等方案 | 7 |
 | Q6 | 是否提供 Surge 没有的 API（如 `GET /v1/panels`） | 允许以 `/v1/rurge/...` 命名空间扩展，不占用 Surge 路径 | 6 |
-| Q7 | 用户态协议栈选型（smoltcp、自研或其他） | 阶段 2 的 WireGuard 出站先用 smoltcp（阶段 2 设计文档 D9）；阶段 3 设计文档按基准复核 | 2（M4），阶段 3 复核 |
+| Q7 | 用户态协议栈选型（smoltcp、自研或其他） | 阶段 2 的 WireGuard 出站先用 smoltcp（阶段 2 设计文档 D9）；阶段 3 设计（P3-D2）：TUN 的 TCP 用 smoltcp 0.12 按四元组分片、每连接的缓冲按总预算分配，M3 的第一个任务先过基准门槛（NFR-01 的 70%），达不到时换自写的 TCP 被动一端；内核 TCP + 地址改写不做；升到 0.14（要 Rust 1.91）由项目所有者定 | 2（M4）、3 |
 | Q8 | 内置规则集 `SYSTEM` 在非 Apple 平台的取舍 | 保持与手册一致以便配置共享，但在文档中说明其在 Windows / Linux 上几乎不命中 | 1 |
 
 ---
