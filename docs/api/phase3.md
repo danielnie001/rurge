@@ -1,6 +1,6 @@
 # rurge HTTP API（阶段 3）
 
-阶段 3 / M1（网络环境与子网，设计 `docs/superpowers/specs/2026-10-16-phase3-m1-network-subnet-design.md`，计划 `docs/superpowers/plans/2026-10-16-phase3-m1-network-subnet-plan.md`）**没有新增端点，也没有改任何响应的形状**。变的是三个已有端点的行为——`POST` / `GET /v1/policy_groups/select` 对 `subnet` 组、`GET` / `POST /v1/features/system_proxy` 在接管暂停时、`GET /v1/dns` 的 `upstreams` 随网络的 DNS 覆盖——，和一组日志行。没有任何端点给出本机当前所在的网络：SSID、BSSID、网关和本机地址说明使用者在哪里，只在 DEBUG 日志里出现（设计 M1-D16）。鉴权（`X-Key`）、错误体（`{"error":"<message>"}`）与无内容的成功响应（`{}`）沿用阶段 1 的约定，见 `docs/api/phase1.md`；本页只记录变了的部分。
+阶段 3 / M1（网络环境与子网，设计 `docs/superpowers/specs/2026-10-16-phase3-m1-network-subnet-design.md`，计划 `docs/superpowers/plans/2026-10-16-phase3-m1-network-subnet-plan.md`）**没有新增端点，也没有改任何响应的形状**。变的是三个已有端点的行为——`POST` / `GET /v1/policy_groups/select` 对 `subnet` 组、`GET` / `POST /v1/features/system_proxy` 在接管暂停时、`GET /v1/dns` 的 `upstreams` 随网络的 DNS 覆盖——，和一组日志行。没有任何端点给出本机当前所在的网络：SSID、BSSID 和网关说明使用者在哪里，只在 DEBUG 日志里出现；本机地址与 DNS 服务器的取值在任何级别的日志里都不出现（设计 M1-D16）。鉴权（`X-Key`）、错误体（`{"error":"<message>"}`）与无内容的成功响应（`{}`）沿用阶段 1 的约定，见 `docs/api/phase1.md`；本页只记录变了的部分。
 
 ## 端点
 
@@ -76,7 +76,7 @@ Net = subnet, SSID:Home = HK, TYPE:WIRED = DIRECT, default = Proxy
 
 ## 网络变化
 
-`rurge run` 起一个网络任务：启动时（建第一代之前）读一次网络，之后在后台盯着，网络**变了**（主网卡、默认网关、网卡类型、Wi-Fi 的名字或接入点、系统 DNS 服务器或主网卡的地址任何一项不同）就依次做三件事，由主循环一次一个地做，与重载、API 的命令不交叉：
+`rurge run` 起一个网络任务：启动时（建第一代之前）读一次网络，最多等 1 秒——读得更慢就先当作不知道网络（同读失败），第一代建在那上面，读完之后由网络任务当作一次变化告知（DNS 覆盖因此可能多一次重建，接管暂停也在那时才按这个网络决定）；之后在后台盯着，网络**变了**（主网卡、默认网关、网卡类型、Wi-Fi 的名字或接入点、系统 DNS 服务器或主网卡的地址任何一项不同）就依次做三件事，由主循环一次一个地做，与重载、API 的命令不交叉：
 
 1. **引擎处理**（`Engine::network_changed`，同步）：
    - 存下新的网络——之后的规则求值与 `subnet` 组的选择看它；
@@ -89,7 +89,9 @@ Net = subnet, SSID:Home = HK, TYPE:WIRED = DIRECT, default = Proxy
 
 正在进行的会话与查找照旧用它们开始时的东西完成，不被打断（读代码得出；没有用例持着一个会话跨过一次换网络）。
 
-怎样发现变化：Windows 与 Linux 每 2 秒比一次便宜的指纹（Windows 是 `ipconfig` 包的网卡表，Linux 是 `/proc/net/route`、`/proc/net/ipv6_route`、`/sys/class/net`、网卡地址与 `resolv.conf`），不起子进程；问 Wi-Fi 的名字要起子进程（`netsh`、`nmcli` / `iw`），只在指纹变了时问，以及有无线网卡开着时每 30 秒问一次（同一个 SSID 下换接入点、地址不变）。macOS 听一个 `PF_ROUTE` 套接字（只看地址增删、网卡状态与路由的增删改，滤掉 ARP 一类的噪声，一阵消息合成一次），另外每 30 秒兜底读一次。变化经 1 秒的"首发加尾发"去抖：第一个变化立刻处理并开一个 1 秒的窗口，窗口里再来的变化合并成窗口结束时的一次，用最新的网络；一个回到原样的网络不算变化。每个读网络的子进程限时 2 秒，读不到的当作没有，不报错。
+怎样发现变化：Windows 与 Linux 每 2 秒比一次便宜的指纹（Windows 是 `ipconfig` 包的网卡表，Linux 是 `/proc/net/route`、`/proc/net/ipv6_route`、`/sys/class/net`、网卡地址与 `resolv.conf`），不起子进程；问 Wi-Fi 的名字要起子进程（`netsh`、`nmcli` / `iw`），只在指纹变了时问，以及有无线网卡开着时每 30 秒问一次（同一个 SSID 下换接入点、地址不变）。macOS 听一个 `PF_ROUTE` 套接字（只看地址增删、网卡状态与路由的增删改，滤掉 ARP 一类的噪声，一阵消息合成一次），另外每 30 秒兜底读一次。变化经 1 秒的"首发加尾发"去抖：第一个变化立刻处理并开一个 1 秒的窗口，窗口里再来的变化合并成窗口结束时的一次，用最新的网络；一个回到原样的网络不算变化。读网络本身也限速：两次读取之间至少隔 1 秒，一个提示若在上一次读取之后 1 秒之内来，就等这一秒结束再读，窗口里来的所有提示（包括读取进行中来的）合成这一次读取，所以一阵提示至多花两次读取（子进程因此至多每秒起一批）。每个读网络的子进程限时 2 秒，读不到的当作没有，不报错。
+
+**读不到任何网络不算变化。**一次读取什么都说不出来（没有主网卡，也没有 Wi-Fi 连接）时，网络任务认为机器丢了网络——睡眠唤醒、Wi-Fi 重连、拔插扩展坞时都会有这一刻——，而不是换到了另一个网络：它不告知主循环，所以引擎不收到 `network_changed`（不清缓存、不作废测速、不清 `subnet` 组的临时覆盖），`[SSID Setting]` 不重算（接管暂停不结束，DNS 覆盖不重建）。上一个告知过的网络继续有效；日志里一行 DEBUG `network unknown; the last known network stands`，丢失持续期间只说一次，读到有网络的快照后再丢失时再说一次。读回来的网络与最后一个告知过的网络比较：同一个网络什么也不发生，另一个网络照常是一次变化。启动时第一次读什么都不知道，就是初始状态，之后读到的网络是一次普通的变化。代价：真的换到一个什么都读不出来的网络（没有默认路由，也没有 Wi-Fi 连接）时，旧网络的设置一直生效，直到读到一个有网络的快照。
 
 SSID 与 BSSID 可能读不到（Windows 没有位置权限，据调研以 SYSTEM 运行时也一样；macOS 14 起的守护进程；Linux 上 NetworkManager 与 `iw` 都说不出）：这时 `SSID:` / `BSSID:` 的条件从不命中、不报错，`TYPE:` 与 `ROUTER:` 照常，原因在 DEBUG 日志里说一次（不是每次变化都说）。
 
@@ -108,7 +110,7 @@ SSID 与 BSSID 可能读不到（Windows 没有位置权限，据调研以 SYSTE
 | --- | --- |
 | `GET /v1/features/system_proxy` | `{"enabled": false}`——真实状态，系统代理此刻没有指向 rurge。**应答里没有任何字段说"暂停中"**，要知道用下面的日志行 |
 | `POST /v1/features/system_proxy` `{"enabled": true}` | 返回成功 `{}`，但什么也不设；只记下"想要开着"，暂停结束时照办。日志里一行 INFO |
-| `POST /v1/features/system_proxy` `{"enabled": false}` | 返回成功 `{}`；记下"不想要"，暂停结束时就不再打开 |
+| `POST /v1/features/system_proxy` `{"enabled": false}` | 返回成功 `{}`；记下"不想要"，暂停结束时就不再打开；进入暂停时恢复系统代理失败、它仍指向 rurge 的话，暂停结束时把它恢复成使用者原来的设置 |
 
 要点：
 
@@ -116,13 +118,13 @@ SSID 与 BSSID 可能读不到（Windows 没有位置权限，据调研以 SYSTE
 - 启动时就在这样的网络上，`--system-proxy` 只记下想要的，不设系统代理，标准输出里也没有 `system proxy enabled:` 那一行；离开这个网络时才设。
 - 暂停只在内存里，不进 `state.json`。进入暂停时备份已经清掉，所以暂停期间 rurge 崩溃，下一次启动没有东西要恢复——系统代理早已是原来的样子。
 - 一次成功的重载之后会再问一遍"现在暂停吗"：重载可能加上或拿掉了 `suspend=true` 那一行。
-- 暂停结束时重新指向 rurge 失败（比如那时没有可用的 http / socks5 监听器）只记一条 ERROR，不重试，直到下一次进出暂停或下一次 `POST`。
+- 暂停结束时把系统代理的实际状态对到想要的状态，两个方向都对：想要开着而实际关着的，重新指向 rurge；想要关着而实际开着的（进入暂停时恢复失败才会有），恢复成使用者原来的设置。每个只试一次，失败只记一条 ERROR（比如那时没有可用的 http / socks5 监听器），不重试，直到下一次进出暂停或下一次 `POST`。
 
 ## `GET /v1/dns` 与 `[SSID Setting]` 的 DNS 覆盖
 
 所在网络的 `[SSID Setting]` 行（几行同时命中时取第一行）写了 `dns-server` 或 `encrypted-dns-server` 时，它们**替换**（不是合并）Profile 全局的同名列表：没写的那一项保持全局的；`encrypted-dns-server=off` 去掉加密 DNS（全局配了加密 DNS、这个网络要用传统 DNS 时必须写它）；`dns-server` 下写的加密 URL 照 `[General]` 的读法算加密服务器；`[Host]` 里 `server:` 写明的服务器不受影响；`rurge dns lookup --server` 仍然最后说了算。
 
-`GET /v1/dns` 的 `upstreams` 因此是随网络变的：启动时的第一代就按启动时的网络建；网络变化之后覆盖变了，就在 `network changed` 之后用内存里的配置重建一代（日志里有一行，见下面），重建完成后 `upstreams` 才是新的——不是 `network changed` 那一刻。离开这个网络时同样重建回去。
+`GET /v1/dns` 的 `upstreams` 因此是随网络变的：启动时的第一代就按启动时的网络建；网络变化之后覆盖变了，就在 `network changed` 之后用内存里的配置重建一代（日志里有一行，见下面），重建完成后 `upstreams` 才是新的——不是 `network changed` 那一刻。离开这个网络时同样重建回去。重建出的一代像启动与重载建出的一代一样，把自己的诊断打印到标准错误：解析器用不了的服务器（比如带了路径的 `tcp://`）的 `W0026` 只会出现在这里，因为一行 `[SSID Setting]` 的服务器表只在那个网络成为当前网络时才交给解析器。
 
 ## Profile 检查里的诊断
 
@@ -131,7 +133,7 @@ SSID 与 BSSID 可能读不到（Windows 没有位置权限，据调研以 SYSTE
 | 码 | 情形 |
 | --- | --- |
 | `E0018` | ``subnet group `<名字>` needs `default` ``：没写（或写成空）`default` 的 `subnet` 组；组不建。**行为变化**：此前这样的 Profile 加载得了，运行时按空组兜底 |
-| `E0011` | `[SSID Setting]` 一行的表达式写错（如 `TYPE:SATELLITE`），这一行不用；表达式只在能被引用时才出现在文本里 |
+| `E0011` | `[SSID Setting]` 一行的表达式写错（如 `TYPE:SATELLITE`），这一行不用；表达式只在能被引用时才出现在文本里（不长、没有空白与 `=`，也不含 `://` 与 `@`——那是一个 URL，可能带着口令） |
 | `W0028` | `[SSID Setting]` 里不认识的参数（不引用它）；`tfo-behaviour` 的值写错 |
 | `W0029` | `[SSID Setting]` 的一行没有参数；`tfo-behaviour`（TCP Fast Open 没有实现）与 `cellular-mode` 写对了也不生效 |
 | `W0004` | `cellular-fallback`（iOS 专属） |
@@ -148,6 +150,8 @@ SSID 与 BSSID 可能读不到（Windows 没有位置权限，据调研以 SYSTE
 | INFO | `network changed` | `interface`（主网卡名，没有时 `none`）、`kind`（`wifi` / `wired` / `other` / `none`）、`wifi`（布尔：有没有连着的 Wi-Fi） | 去抖之后每处理一次变化一行。**不含** SSID、BSSID、网关与本机地址 |
 | DEBUG | `where the machine is now` | `ssid`、`bssid`、`routers` | 紧跟上一行；说明使用者在哪里的东西只在这里 |
 | DEBUG | `the network is not what it was` | `facts`、`dns_servers`、`addresses`（布尔：哪一项不同） | 网络任务判定有变化时；只说哪一项不同，不说值 |
+| DEBUG | `network unknown; the last known network stands` | | 读到什么都不知道的网络（没有主网卡，也没有 Wi-Fi 连接）时；丢失持续期间只说一次。不告知主循环，见「网络变化」 |
+| DEBUG | `the network is not read yet; the start goes on without it, and it is told when it is read` | | 启动时第一次读网络超过 1 秒；读完之后是一行 INFO `network changed` |
 | INFO | `this network sets other DNS servers than the generation in use was built with; building it again` | | 为 DNS 覆盖用内存里的配置重建一代之前 |
 | ERROR | `cannot build the generation again for the DNS of this network; the one in use goes on` | `error` | 重建失败；在用的一代照旧 |
 | INFO | `policy group selection changed via http-api` | `group`、`policy` | 每一次成功的 `POST /v1/policy_groups/select`，`subnet` 组的临时覆盖与清除也算（这一行阶段 2 就有；清除时 `policy` 是空的） |
@@ -155,7 +159,8 @@ SSID 与 BSSID 可能读不到（Windows 没有位置权限，据调研以 SYSTE
 | INFO | `takeover resumed` | | 离开接管暂停 |
 | INFO | `the takeover is paused on this network; the system proxy is left as it is, and set as asked when the pause ends` | `enabled` | 暂停期间一次得到成功应答的 `POST /v1/features/system_proxy` |
 | ERROR | `cannot give the system proxy back for the pause; it stays pointed at rurge` | `error` | 进入暂停时恢复系统代理失败 |
-| ERROR | `cannot point the system proxy at rurge again` | `error` | 暂停结束时重新指向 rurge 失败（不重试） |
+| ERROR | `cannot point the system proxy at rurge again` | `error` | 暂停结束时想要开着，重新指向 rurge 失败（不重试） |
+| ERROR | `cannot give the system proxy back when the pause ends; it stays pointed at rurge` | `error` | 暂停结束时想要关着而它仍指向 rurge（进入暂停时恢复失败），这次恢复也失败（不重试） |
 | ERROR | `cannot tell the engine that the network changed` | `panicked` | 引擎处理换网络时 panic |
 | DEBUG | `cannot read the network` | `panicked` | 平台的读取器 panic；这次读取当作没发生，不是"网络不知道" |
 | DEBUG | 平台层的几句（每个原因每个进程只说一次，只带程序名与错误种类，不带任何网络的名字）：`cannot ask this program about the network; what it would say is taken as unknown`（`program`、`reason`）；Windows、Linux、macOS 各一句"有无线网卡开着，但系统不给网络的名字"，结尾都是 `SSID and BSSID conditions will not match`（Windows 与 macOS 的写着"it wants the permission to see where the machine is"）；`cannot list the network interfaces`；`cannot open a routing socket; the network is looked at every 30 seconds`（macOS） | | 读不到时 |
