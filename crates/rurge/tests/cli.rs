@@ -1341,6 +1341,100 @@ fn check_reads_the_downloaded_copy_and_writes_nothing() {
     assert!(!nothing.exists());
 }
 
+/// A profile with what the line-splitting design made loadable: names with an
+/// apostrophe or a parenthesis that pairs with nothing, in the definitions,
+/// the group, the rules and an `#!include`; `password` stands where `PwEq`'s
+/// password does.
+fn line_splitting_profile(password: &str) -> String {
+    format!(
+        r"[Proxy]
+Tom's HK = direct
+Tom's US = direct
+Proxy (US = direct
+PwEq = http, 127.0.0.1, 8080, alice, {password}
+
+[Proxy Group]
+G = select, Tom's HK, Tom's US
+
+[Rule]
+#!include Tom's rules.dconf, more.dconf
+USER-AGENT,Bob's App*,G
+URL-REGEX,^http://a\.example/[^(]*$,REJECT
+DOMAIN,b.example,Proxy (US,extended-matching
+FINAL,DIRECT
+"
+    )
+}
+
+/// Runs `rurge check` offline on the profile above with `password`, the data
+/// directory in the test's own temporary one.
+fn check_line_splitting(password: &str) -> std::process::Output {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write(&dir, "a.conf", &line_splitting_profile(password));
+    write(
+        &dir,
+        "Tom's rules.dconf",
+        "[Rule]\nDOMAIN,a.example,DIRECT\n",
+    );
+    write(&dir, "more.dconf", "[Rule]\nDOMAIN,c.example,DIRECT\n");
+    rurge_command()
+        .args(["check", "--data-dir"])
+        .arg(dir.path().join("data"))
+        .arg("-c")
+        .arg(&conf)
+        .output()
+        .unwrap()
+}
+
+/// Names with an apostrophe or a parenthesis that pairs with nothing load,
+/// and so does a positional password with an `=` in it when it is wholly in
+/// quotes (line-splitting design, section 7).
+#[test]
+fn line_splitting_reads_apostrophes_parentheses_and_quoted_credentials() {
+    let out = check_line_splitting("\"k3y=v4lue\"");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("0 error(s), 0 warning(s), 0 note(s)"),
+        "{stdout}"
+    );
+}
+
+/// The same password without its quotes is read as a parameter: one `W0001`
+/// that does not name it, with the hint that says how to write it, and no
+/// part of it anywhere in the output (line-splitting design LS-D8).
+#[test]
+fn line_splitting_names_no_part_of_an_unquoted_credential() {
+    let out = check_line_splitting("k3y=v4lue");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let warnings: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("warning["))
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(warnings.len(), 1, "{stdout}");
+    let at = warnings[0];
+    assert!(lines[at].starts_with("warning[W0001]"), "{stdout}");
+    assert!(
+        lines[at].ends_with("policy `PwEq`: unknown parameter ignored"),
+        "{stdout}"
+    );
+    assert_eq!(
+        lines[at + 1],
+        "  hint: if this is a user name or a password that contains `=`, put it wholly in quotes",
+        "{stdout}"
+    );
+    // the path of the profile holds a random name, which could hold `k3y`
+    // but not these
+    for part in ["`k3y`", "k3y=", "v4lue"] {
+        assert!(!stdout.contains(part), "{part}: {stdout}");
+    }
+    assert!(stdout.contains("0 error(s)"), "{stdout}");
+    assert!(out.status.success(), "{stdout}");
+}
+
 mod rule_match {
     use super::rurge_command;
     use assert_cmd::Command;
