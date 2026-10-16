@@ -25,6 +25,12 @@ LEVELS = ("error", "warning", "notice")
 MAX_LINES = 60
 MAX_CHARS = 3000
 
+# The toolchain action sets `CARGO_TERM_COLOR=always` for the whole job, so
+# what cargo writes — `Running …`, `error: test failed, …` — comes wrapped in
+# colour codes, and a link in `Finished …`. They are taken off every line
+# before it is read: control sequences (`ESC [ … letter`) and operating
+# system commands (`ESC ] … BEL` or `ESC ] … ESC \`).
+ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 RUNNING = re.compile(r"^\s+Running (?:unittests )?(\S+) \((.+)\)\s*$")
 DOCTEST = re.compile(r"^\s+Doc-tests (\S+)\s*$")
 BLOCK = re.compile(r"^---- (.+?) (?:stdout|stderr) ----\s*$")
@@ -214,7 +220,7 @@ def main():
         return
     try:
         with open(sys.argv[1], encoding="utf-8", errors="replace") as log:
-            lines = [line.rstrip("\r\n") for line in log]
+            lines = [ESCAPE.sub("", line.rstrip("\r\n")) for line in log]
     except OSError as error:
         print("::notice title=No test log::%s" % data(str(error)))
         return

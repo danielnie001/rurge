@@ -26,7 +26,11 @@ jobs:
         with:
           toolchain: 1.89.0
           components: rustfmt, clippy
+      # Saved when the job fails too: a cache saved only on success was never
+      # saved by this job, and every run built every dependency from scratch.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       # A reference server that cannot be installed — a download that fails,
