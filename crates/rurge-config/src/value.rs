@@ -615,6 +615,24 @@ mod tests {
         assert!(checked > 500_000, "{checked}");
     }
 
+    /// The full-width comma an input method types cuts only when asked
+    /// (`wide`), and it starts no value: a quote right after it is a
+    /// character, and a parenthesis after it still groups when it pairs
+    /// (line-splitting design LS-D10).
+    #[test]
+    fn a_full_width_comma_cuts_only_when_asked_and_starts_no_value() {
+        let cut = |text: &str, wide: bool| -> Vec<String> {
+            item_spans(text, wide)
+                .into_iter()
+                .map(|span| text[span.start..span.end].to_string())
+                .collect()
+        };
+        assert_eq!(cut("a，b", false), ["a，b"]);
+        assert_eq!(cut("a，b", true), ["a", "b"]);
+        assert_eq!(cut("a，\"b，c\"", true), ["a", "\"b", "c\""]);
+        assert_eq!(cut("a，(b，c)", true), ["a", "(b，c)"]);
+    }
+
     /// A line of one kind of character, three hundred thousand of them, is
     /// read in time that grows with its length: a reading that starts over
     /// after every cut, or looks ahead from every parenthesis, would take

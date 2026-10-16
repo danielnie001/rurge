@@ -879,26 +879,15 @@ fn redact_items(text: &str, depth: usize) -> String {
 /// along; otherwise every secret it names is searched for by name across the
 /// whole region.
 fn redact_joined(region: &str, first_len: usize) -> String {
-    let rest = region.trim_start();
-    let lead = &region[..region.len() - rest.len()];
-    let body = rest.trim_end();
-    let trail = &rest[body.len()..];
-    let secret = split_list(&region[..first_len])
-        .pop()
-        .and_then(|field| parse_key_value(&field).map(|(key, _)| key.to_string()))
-        .filter(|key| {
-            SECRET_PARAMS
-                .iter()
-                .any(|param| key.eq_ignore_ascii_case(param))
-        });
-    match (secret, body.split_once('=')) {
-        (Some(key), Some((name, value))) if name.trim() == key => {
-            let blank = &value[..value.len() - value.trim_start().len()];
-            format!("{lead}{name}={blank}***{trail}")
-        }
-        (Some(key), _) => format!("{lead}{key}=***{trail}"),
-        (None, _) => redact_by_name(region),
-    }
+    let (lead, body, trail) = blanks_around(region);
+    let first = split_list(&region[..first_len]).pop();
+    hide_value(
+        lead,
+        body,
+        trail,
+        first.as_deref().and_then(secret_key),
+        || redact_by_name(region),
+    )
 }
 
 /// One item, the way the parsers read it: `split_list` takes the quotes off
@@ -915,10 +904,7 @@ fn redact_joined(region: &str, first_len: usize) -> String {
 ///   wherever one stands in the text: what the parsers read as one value (an
 ///   item with a quote left open, say) can hold a secret parameter of its own.
 fn redact_item(item: &str, depth: usize) -> String {
-    let rest = item.trim_start();
-    let lead = &item[..item.len() - rest.len()];
-    let body = rest.trim_end();
-    let trail = &rest[body.len()..];
+    let (lead, body, trail) = blanks_around(item);
     let Some(field) = split_list(item).pop() else {
         // nothing in it: an empty item, or one made of nothing but quotes
         return item.to_string();
@@ -935,18 +921,49 @@ fn redact_item(item: &str, depth: usize) -> String {
             };
         }
     }
-    let secret = parse_key_value(&field).map(|(key, _)| key).filter(|key| {
+    hide_value(lead, body, trail, secret_key(&field), || {
+        redact_by_name(item)
+    })
+}
+
+/// `text` as the blanks in front of it, what it holds, and the blanks behind
+/// it.
+fn blanks_around(text: &str) -> (&str, &str, &str) {
+    let rest = text.trim_start();
+    let lead = &text[..text.len() - rest.len()];
+    let body = rest.trim_end();
+    let trail = &rest[body.len()..];
+    (lead, body, trail)
+}
+
+/// The key of `field`, an item as `split_list` gives it, when it is a secret
+/// parameter's.
+fn secret_key(field: &str) -> Option<&str> {
+    parse_key_value(field).map(|(key, _)| key).filter(|key| {
         SECRET_PARAMS
             .iter()
             .any(|param| key.eq_ignore_ascii_case(param))
-    });
-    match (secret, body.split_once('=')) {
+    })
+}
+
+/// `body`, with `lead` and `trail` around it as written, with the value of
+/// the secret parameter `key` hidden: written plainly the name keeps its
+/// spacing, otherwise only `key=***` is left. Without a secret key, what
+/// `by_name` makes of it.
+fn hide_value(
+    lead: &str,
+    body: &str,
+    trail: &str,
+    key: Option<&str>,
+    by_name: impl FnOnce() -> String,
+) -> String {
+    match (key, body.split_once('=')) {
         (Some(key), Some((name, value))) if name.trim() == key => {
             let blank = &value[..value.len() - value.trim_start().len()];
             format!("{lead}{name}={blank}***{trail}")
         }
         (Some(key), _) => format!("{lead}{key}=***{trail}"),
-        (None, _) => redact_by_name(item),
+        (None, _) => by_name(),
     }
 }
 
@@ -991,8 +1008,7 @@ struct FieldSpan {
 /// (`value::item_spans`, with `，` cutting too — design LS-D10): `split_list`
 /// reads the type and the port with the quotes off, and an empty item is
 /// none; a field that is blanked goes together with the items today's
-/// reading takes along with it (`next_comma`, design LS-D9), and each of them
-/// that is not empty counts as a field. A token counts as
+/// reading takes along with it (`next_comma`, design LS-D9). A token counts as
 /// a named parameter (and is kept) only when what stands before its first `=`
 /// is a name and what follows it is non-empty and not made only of `=`, so
 /// base64 padding (`aHVudGVyMg==`) is redacted while `tfo=true` survives, and
@@ -1057,19 +1073,15 @@ fn redact_positional_credentials(value: &str) -> String {
         out.push_str(&tok[..tok.len() - t.len()]);
         out.push_str("***");
         // the items today's reading takes along with the field (design
-        // LS-D9) go with it, each that is not empty counted as a field; a
-        // word of the first field takes none (the blanks between the words
-        // are no commas)
+        // LS-D9) go with it; a word of the first field takes none (the blanks
+        // between the words are no commas). They need no counting: the field
+        // is past the port, and so is every field after it
         let mut last = k;
         if !span.word {
             let reach = next_comma(&value[span.start..], true)
                 .map_or(value.len(), |(at, _)| span.start + at);
             while last + 1 < spans.len() && spans[last].end < reach {
                 last += 1;
-                let taken = spans[last];
-                if split_list(&value[taken.start..taken.end]).pop().is_some() {
-                    index += 1;
-                }
             }
         }
         out.push_str(&value[spans[last].end..spans[last].sep_end]);
@@ -3247,6 +3259,28 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
             checked += 1;
         }
         assert!(checked > 500_000, "{checked}");
+    }
+
+    /// A line whose first `=` has a comma in front of it by the parsers'
+    /// reading is redacted both ways, though today's reading sees no comma
+    /// there: an apostrophe in front opened a quote for it (line-splitting
+    /// design 6.1).
+    #[test]
+    fn a_comma_in_front_of_the_first_equals_sign_by_the_parsers_reading_counts() {
+        assert_eq!(
+            redact_profile("Tom's P http, h, 80, tfo=true, alice"),
+            "Tom's P http, h, 80, tfo=true, ***"
+        );
+    }
+
+    /// A secret parameter whose value today's reading carries past a comma
+    /// keeps its own spacing around the `=` (line-splitting design LS-D9).
+    #[test]
+    fn a_value_carried_past_a_comma_keeps_the_spacing_around_its_name() {
+        assert_eq!(
+            redact_definition("trojan, h, 443, password  =  ab\"c,d\", ws=true"),
+            "trojan, h, 443, password  =  ***, ws=true"
+        );
     }
 
     /// A token is a named parameter when what stands before its `=` is a
