@@ -1,5 +1,6 @@
 //! `rurge run`: the foreground proxy daemon (M3 design §9.3).
 
+use super::network;
 use super::rule::{parse_mode, print_diagnostics};
 use super::runtime::{PlatformProcesses, RuntimeArgs};
 use super::switch;
@@ -8,6 +9,7 @@ use crate::capabilities;
 use anyhow::Context;
 use clap::Args;
 use rurge_api::ApiContext;
+use rurge_config::NetworkFacts;
 use rurge_config::config::{LoadError, LoadOptions, Loaded, Platform};
 use rurge_config::general::ControllerAccess;
 use rurge_config::general::LogLevel;
@@ -16,6 +18,7 @@ use rurge_config::rule::PolicyRef;
 use rurge_config::session::ListenerKind;
 use rurge_engine::control::{Control, LogLevel as ApiLogLevel, Mode, ReloadReport};
 use rurge_engine::profile::{Boot, BootLimits, ProfileSources, boot_need, disk_remote};
+use rurge_engine::stack::DnsOverride;
 use rurge_engine::state::{STATE_FILE, State, StateStore, profile_key};
 use rurge_engine::{
     EmptyGroup, Engine, EngineShared, ListenerSpec, Running, Runtime, RuntimeOptions,
@@ -273,11 +276,14 @@ fn apply(cfg: &mut rurge_config::Config, overrides: &Overrides) -> Result<(), St
     }
 }
 
-/// What the API can ask the main loop to do (M4 design §6).
+/// What the API can ask the main loop to do (M4 design §6), and the network
+/// task (phase 3 M1 design 4): one at a time, in the order they come.
 enum Command {
     Reload(oneshot::Sender<ReloadReport>),
     Stop,
     SystemProxy(bool, oneshot::Sender<Result<(), String>>),
+    /// The machine is on another network (`network::spawn` tells).
+    NetworkChanged(NetworkFacts),
 }
 
 struct LoopControl {
@@ -573,14 +579,216 @@ async fn switch_system_proxy(
     manager.enable(settings).await
 }
 
+/// Whether the line of `[SSID Setting]` that the network the engine looks at
+/// matches says `suspend=true` (phase 3 M1 design 7.4).
+fn takeover_paused_here(engine: &Engine) -> bool {
+    engine
+        .runtime()
+        .config
+        .effective_ssid_setting(&engine.network())
+        .is_some_and(|line| line.suspend)
+}
+
+/// The system proxy as the user wants it, and as the network lets it be
+/// (phase 3 M1 design 7.4). While the network says to leave the system alone
+/// the takeover is paused: the system proxy is given back as it was, and what
+/// is asked for meanwhile is only noted. It is in memory: `state.json` has the
+/// system proxy as it is, which is how a crash is recovered from.
+///
+/// Not the engine's `suspend`, which refuses new sessions for a managed
+/// profile whose update failed.
+struct Takeover {
+    /// What the user asked for last: `--system-proxy`, then what each
+    /// `POST /v1/features/system_proxy` that was answered with success said.
+    wanted: bool,
+    /// The network says to leave the system alone.
+    paused: bool,
+}
+
+impl Takeover {
+    fn new(wanted: bool) -> Takeover {
+        Takeover {
+            wanted,
+            paused: false,
+        }
+    }
+
+    /// The start: whether the network the daemon begins on pauses the takeover.
+    /// If it does nothing is set, and `wanted` is what the pause ends with.
+    fn begin(&mut self, engine: &Engine) -> bool {
+        self.paused = takeover_paused_here(engine);
+        if self.paused {
+            tracing::info!("takeover paused on this network");
+        }
+        self.paused
+    }
+
+    /// Whether the takeover is paused is the generation in use and the network
+    /// together: look again after either has changed, and do what the
+    /// difference asks. Entering the pause gives the system proxy back (that
+    /// it was on is what the user wants, and is noted); leaving it points the
+    /// system proxy at rurge again if the user wants it so.
+    async fn follow(
+        &mut self,
+        engine: &Engine,
+        listeners: &[(ListenerSpec, Running)],
+        sysproxy: &mut SystemProxyManager,
+    ) {
+        let paused = takeover_paused_here(engine);
+        if paused == self.paused {
+            return;
+        }
+        self.paused = paused;
+        if paused {
+            if sysproxy.enabled() {
+                self.wanted = true;
+                if let Err(e) = sysproxy.disable().await {
+                    tracing::error!(
+                        error = %e,
+                        "cannot give the system proxy back for the pause; it stays pointed at rurge"
+                    );
+                }
+            }
+            tracing::info!("takeover paused on this network");
+        } else {
+            if self.wanted
+                && !sysproxy.enabled()
+                && let Err(e) = switch_system_proxy(sysproxy, engine, listeners, true).await
+            {
+                tracing::error!(error = %e, "cannot point the system proxy at rurge again");
+            }
+            tracing::info!("takeover resumed");
+        }
+    }
+
+    /// `POST /v1/features/system_proxy`. While the takeover is paused nothing
+    /// is set: success is answered, and what was asked for is what is done
+    /// when the pause ends.
+    async fn switch(
+        &mut self,
+        engine: &Engine,
+        listeners: &[(ListenerSpec, Running)],
+        sysproxy: &mut SystemProxyManager,
+        enabled: bool,
+    ) -> Result<(), String> {
+        if self.paused {
+            tracing::info!(
+                enabled,
+                "the takeover is paused on this network; the system proxy is left as it is, and set as asked when the pause ends"
+            );
+        } else {
+            switch_system_proxy(sysproxy, engine, listeners, enabled).await?;
+        }
+        self.wanted = enabled;
+        Ok(())
+    }
+}
+
+/// The machine is on another network (phase 3 M1 design 4): the engine is
+/// told, a generation is built again if the DNS this network sets is not the
+/// DNS the one in use was built with, and the takeover is paused or resumed if
+/// the network says so. One at a time with the reloads and the commands of the
+/// API, in the main loop.
+async fn network_changed(
+    d: &Daemon<'_>,
+    facts: NetworkFacts,
+    listeners: &[(ListenerSpec, Running)],
+    sysproxy: &mut SystemProxyManager,
+    takeover: &mut Takeover,
+) {
+    // The interface and its kind are said at INFO. What says where the
+    // machine is (the name of the network, the access point, the gateways) is
+    // said at DEBUG only.
+    let (interface, kind) = facts.primary.as_ref().map_or(("none", "none"), |primary| {
+        (
+            primary.interface.as_str(),
+            match primary.kind {
+                rurge_config::NetKind::Wifi => "wifi",
+                rurge_config::NetKind::Wired => "wired",
+                rurge_config::NetKind::Other => "other",
+            },
+        )
+    });
+    tracing::info!(
+        interface,
+        kind,
+        wifi = facts.wifi.is_some(),
+        "network changed"
+    );
+    tracing::debug!(
+        ssid = ?facts.wifi.as_ref().and_then(|wifi| wifi.ssid.as_deref()),
+        bssid = ?facts.wifi.as_ref().and_then(|wifi| wifi.bssid.as_deref()),
+        routers = ?facts.primary.as_ref().map(|primary| &primary.routers),
+        "where the machine is now"
+    );
+    // The engine reads the DNS servers of the system, which can take a moment.
+    let engine = d.engine.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || engine.network_changed(facts)).await {
+        tracing::error!(
+            panicked = e.is_panic(),
+            "cannot tell the engine that the network changed"
+        );
+    }
+    follow_the_dns_of_the_network(d).await;
+    takeover.follow(d.engine, listeners, sysproxy).await;
+}
+
+/// A generation is built with the DNS that `[SSID Setting]` sets for the
+/// network of the moment (phase 3 M1 design 7.3). When the DNS the network sets
+/// now is another one, the generation in use is built again from the
+/// configuration it has in memory: not read again from the disk, for a network
+/// that changes is no reason to bring in what the user has not asked to
+/// reload. In-flight sessions and lookups finish on the generation they began
+/// with. A generation that cannot be built is not put in the place of the one
+/// in use, which goes on.
+async fn follow_the_dns_of_the_network(d: &Daemon<'_>) {
+    let runtime = d.engine.runtime();
+    let wanted = DnsOverride::for_network(&runtime.config, &d.engine.network());
+    if *runtime.dns_override() == wanted {
+        return;
+    }
+    tracing::info!(
+        "this network sets other DNS servers than the generation in use was built with; building it again"
+    );
+    let next = build_engine_runtime(
+        (*runtime.config).clone(),
+        d.rt,
+        d.run_opts,
+        d.outbound_mode.clone(),
+        &d.engine.shared(),
+    )
+    .await;
+    match next {
+        Ok(next) => {
+            // the configuration is the same: no listener has anything to change
+            d.engine.swap_runtime(next);
+        }
+        Err(e) => tracing::error!(
+            error = %format!("{e:#}"),
+            "cannot build the generation again for the DNS of this network; the one in use goes on"
+        ),
+    }
+}
+
 /// A reload may move the listeners or change `skip-proxy`: keep the system
-/// proxy in step.
+/// proxy in step. It may also add or take away the line of `[SSID Setting]`
+/// that pauses the takeover.
 async fn reload_and_refresh(
     d: &Daemon<'_>,
     listeners: &mut Vec<(ListenerSpec, Running)>,
     sysproxy: &mut SystemProxyManager,
+    takeover: &mut Takeover,
 ) -> ReloadReport {
     let report = reload(d, listeners).await;
+    if report.ok {
+        // A generation is built on the network the engine has, and only this
+        // loop changes that, so this finds the DNS of the generation to be the
+        // network's. It is the question asked after a change of network, asked
+        // of whatever generation comes in.
+        follow_the_dns_of_the_network(d).await;
+        // before the refresh: it does nothing for a system proxy that is given back
+        takeover.follow(d.engine, listeners, sysproxy).await;
+    }
     let settings = current_settings(d.engine, listeners);
     if report.ok
         && let Err(e) = sysproxy.refresh(settings.clone()).await
@@ -1023,6 +1231,17 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 return Ok(ExitCode::from(2));
             }
         };
+    // Where the network is read from is an environment matter, and ends a
+    // start that cannot tell as an option does: a typo must not make a start
+    // read the machine's network.
+    let network_backend = match network::backend() {
+        Ok(backend) => backend,
+        Err(e) => {
+            eprintln!("error: {e}");
+            recover_without_a_log(&args.runtime);
+            return Ok(ExitCode::from(2));
+        }
+    };
     let platform = args.platform.unwrap_or_else(Platform::current);
     let data_dir = args.runtime.data_dir();
     let mut opts = LoadOptions {
@@ -1140,6 +1359,14 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             shared.empty_group = EmptyGroup::Reject;
         }
         shared.processes = Arc::new(PlatformProcesses);
+        // The network before the first generation, which is built on it: its
+        // `subnet` groups and `SUBNET` rules look at it from the first
+        // session on, and the DNS `[SSID Setting]` sets for it is the DNS of
+        // its resolver.
+        let started = network::start(&network_backend).await;
+        shared
+            .network
+            .store(network::facts_of(&started.snapshot));
         let engine_rt =
             build_engine_runtime(cfg, &rt, &run_opts, outbound_mode.clone(), &shared).await?;
         print_diagnostics(engine_rt.diagnostics());
@@ -1228,7 +1455,11 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         // Recovery already ran, above. The enable waits until here because
         // everything fallible is behind us: nothing below returns early while
         // the operating system points at rurge, except the failure to enable.
-        if args.system_proxy {
+        //
+        // On a network that says to leave the system alone nothing is enabled:
+        // `--system-proxy` is only noted, and done when the pause ends.
+        let mut takeover = Takeover::new(args.system_proxy);
+        if !takeover.begin(&engine) && args.system_proxy {
             if let Err(e) = switch_system_proxy(&mut sysproxy, &engine, &listeners, true).await {
                 eprintln!("error: cannot enable the system proxy: {e}");
                 return Ok(ExitCode::from(1));
@@ -1275,6 +1506,15 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         let mut look = tokio::time::interval(Duration::from_secs(1));
         look.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+        // The network is followed from here on: what changes in it reaches
+        // the loop below as a command, one at a time with the rest.
+        let following_the_network = network::spawn(
+            network_backend,
+            started,
+            cmd_tx.clone(),
+            Command::NetworkChanged,
+        );
+
         loop {
             let reload_signal = async {
                 #[cfg(unix)]
@@ -1292,7 +1532,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             tokio::select! {
                 _ = signals.recv() => break,
                 _ = reload_signal => {
-                    reload_and_refresh(&daemon, &mut listeners, &mut sysproxy).await;
+                    reload_and_refresh(&daemon, &mut listeners, &mut sysproxy, &mut takeover).await;
                 }
                 // A source has a new version: the same reload as any other
                 // trigger, and the only one made for a download. It comes a
@@ -1300,19 +1540,25 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 // next look, so for up to a second new sessions run on the
                 // generation that was due.
                 _ = sources.changed() => {
-                    reload_and_refresh(&daemon, &mut listeners, &mut sysproxy).await;
+                    reload_and_refresh(&daemon, &mut listeners, &mut sysproxy, &mut takeover).await;
                 }
                 _ = look.tick() => {
                     follow_the_sources(&sources, &engine);
                     // the local file has been outlived by an update
                     if sources.outdated() {
-                        reload_and_refresh(&daemon, &mut listeners, &mut sysproxy).await;
+                        reload_and_refresh(&daemon, &mut listeners, &mut sysproxy, &mut takeover)
+                            .await;
                     }
                 }
                 cmd = cmd_rx.recv() => match cmd {
                     Some(Command::Reload(reply)) => {
-                        let report =
-                            reload_and_refresh(&daemon, &mut listeners, &mut sysproxy).await;
+                        let report = reload_and_refresh(
+                            &daemon,
+                            &mut listeners,
+                            &mut sysproxy,
+                            &mut takeover,
+                        )
+                        .await;
                         let _ = reply.send(report);
                     }
                     Some(Command::Stop) => {
@@ -1320,17 +1566,24 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                         break;
                     }
                     Some(Command::SystemProxy(enabled, reply)) => {
-                        let result =
-                            switch_system_proxy(&mut sysproxy, &engine, &listeners, enabled).await;
+                        let result = takeover
+                            .switch(&engine, &listeners, &mut sysproxy, enabled)
+                            .await;
                         if let Err(e) = &result {
                             tracing::error!(error = %e, enabled, "cannot switch the system proxy");
                         }
                         let _ = reply.send(result);
                     }
+                    Some(Command::NetworkChanged(facts)) => {
+                        network_changed(&daemon, facts, &listeners, &mut sysproxy, &mut takeover)
+                            .await;
+                    }
                     None => {}
                 },
             }
         }
+        // nothing is told of the network any more
+        drop(following_the_network);
 
         #[cfg(unix)]
         println!("shutting down (Ctrl-C or SIGTERM again to exit now)");

@@ -2,6 +2,7 @@ pub mod api_client;
 pub mod check;
 pub mod control;
 pub mod dns;
+pub mod network;
 pub mod rule;
 pub mod run;
 pub mod runtime;

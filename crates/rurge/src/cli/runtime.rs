@@ -6,7 +6,7 @@
 use super::switch;
 use anyhow::Context;
 use clap::Args;
-use rurge_config::Config;
+use rurge_config::{Config, NetworkFacts};
 use rurge_dns::cache::DEFAULT_CAPACITY;
 use rurge_dns::system::SystemDns;
 use rurge_net::BoxFuture;
@@ -119,10 +119,16 @@ impl Runtime {
 
 /// Builds resources → set registry → GeoIP → resolver, then waits up to
 /// `wait` for the first fetch of every resource, and after that for what
-/// arrived to be applied (skipped in `--no-network` mode). Delegates to
-/// `rurge_engine::stack::build_stack`.
-pub async fn build_stack(cfg: &Config, rt: &Runtime, wait: Duration) -> anyhow::Result<Stack> {
-    rurge_engine::stack::build_stack(cfg, &rt.stack_options(wait)).await
+/// arrived to be applied (skipped in `--no-network` mode). The resolver asks
+/// the DNS servers that `[SSID Setting]` gives for `network`, if it gives any.
+/// Delegates to `rurge_engine::stack::build_stack`.
+pub async fn build_stack(
+    cfg: &Config,
+    rt: &Runtime,
+    wait: Duration,
+    network: &NetworkFacts,
+) -> anyhow::Result<Stack> {
+    rurge_engine::stack::build_stack(cfg, &stack_options_on(cfg, rt, wait, network)).await
 }
 
 /// `build_stack` with a hook that edits the resolver configuration before
@@ -132,9 +138,25 @@ pub async fn build_stack_with(
     cfg: &Config,
     rt: &Runtime,
     wait: Duration,
+    network: &NetworkFacts,
     customize: impl FnOnce(&mut rurge_dns::ResolverConfig),
 ) -> anyhow::Result<Stack> {
-    rurge_engine::stack::build_stack_with(cfg, &rt.stack_options(wait), customize).await
+    rurge_engine::stack::build_stack_with(cfg, &stack_options_on(cfg, rt, wait, network), customize)
+        .await
+}
+
+/// The options of a stack for a command that runs without an engine, on the
+/// network it read: the DNS `[SSID Setting]` sets for it is the DNS of the
+/// resolver, as it is for a generation of the daemon.
+fn stack_options_on(
+    cfg: &Config,
+    rt: &Runtime,
+    wait: Duration,
+    network: &NetworkFacts,
+) -> StackOptions {
+    let mut options = rt.stack_options(wait);
+    options.dns_override = DnsOverride::for_network(cfg, network);
+    options
 }
 
 /// `rurge-platform::dns` behind the `SystemDns` trait, for the configuration

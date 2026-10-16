@@ -21,10 +21,28 @@ fn default_directories() -> [(&'static str, std::path::PathBuf); 4] {
     ]
 }
 
+/// The network a `rurge` started by these tests is on: a file that is not
+/// there, which is a network that is not known, whatever the machine is on.
+/// A start that read the machine's own network would choose the members of the
+/// subnet groups and the DNS servers of the profile by where the suite runs,
+/// and the machine changing networks in the middle of a test would flush the
+/// DNS cache and call for new measurements of the groups under it. Every call
+/// gets a file of its own; a test that wants a network writes a file and
+/// points `RURGE_NETWORK_BACKEND` at it after the constructor.
+fn unknown_network() -> (&'static str, String) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("default-directories")
+        .join(format!("network-{}-{n}.json", std::process::id()));
+    ("RURGE_NETWORK_BACKEND", format!("file:{}", file.display()))
+}
+
 /// `rurge` for a test that runs it to the end and looks at what it said.
 fn rurge_command() -> Command {
     let mut cmd = Command::cargo_bin("rurge").unwrap();
     cmd.envs(default_directories())
+        .envs([unknown_network()])
         .env_remove("RURGE_DATA_DIR")
         .env_remove("RURGE_LOG_FILE");
     cmd
@@ -34,6 +52,7 @@ fn rurge_command() -> Command {
 fn rurge_process() -> std::process::Command {
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("rurge"));
     cmd.envs(default_directories())
+        .envs([unknown_network()])
         .env_remove("RURGE_DATA_DIR")
         .env_remove("RURGE_LOG_FILE");
     cmd
@@ -1552,6 +1571,50 @@ FINAL,DIRECT,dns-failed
         assert_eq!(v["sub_rule"]["entry"], "DOMAIN,listed.com");
     }
 
+    /// `SUBNET` rules are matched against the network the machine is on when
+    /// the command is run, which the file backend says; with none (a file that
+    /// is not there) nothing is known of it and they do not match.
+    #[test]
+    fn rule_match_reads_the_network() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("t.conf"),
+            "[Proxy]\nP = direct\n[Rule]\nSUBNET,SSID:Home,P\nFINAL,DIRECT\n",
+        )
+        .unwrap();
+        let network = dir.path().join("network.json");
+        let policy_on = |joined: Option<&str>| {
+            let mut cmd = rule_match(dir.path(), &["example.com", "--json"]);
+            if let Some(ssid) = joined {
+                std::fs::write(
+                    &network,
+                    serde_json::json!({
+                        "primary": { "interface": "wlan0", "kind": "wifi" },
+                        "wifi": { "interface": "wlan0", "ssid": ssid },
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                cmd.env(
+                    "RURGE_NETWORK_BACKEND",
+                    format!("file:{}", network.display()),
+                );
+            }
+            let out = cmd.output().unwrap();
+            assert_eq!(out.status.code(), Some(0));
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            (
+                v["policy"].as_str().unwrap().to_string(),
+                v["matched"].clone(),
+            )
+        };
+        assert_eq!(policy_on(None).0, "DIRECT");
+        let (policy, matched) = policy_on(Some("Home"));
+        assert_eq!(policy, "P");
+        assert_eq!(matched["index"], 0);
+        assert_eq!(policy_on(Some("Cafe")).0, "DIRECT");
+    }
+
     /// A profile that is only the line that names its managed profile is
     /// matched by the copy in the data directory, which the command reads
     /// and never downloads.
@@ -1894,6 +1957,67 @@ mod dns {
             0,
             "ipv6 = false asks A only"
         );
+    }
+
+    /// The servers `[SSID Setting]` lists for the network the machine is on
+    /// are the ones a lookup asks, in place of the profile's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lookup_asks_the_servers_the_network_gives() {
+        let global = MockDns::spawn().await;
+        global.set("a.test", &["10.0.0.1"], &[], 60);
+        let home = MockDns::spawn().await;
+        home.set("a.test", &["10.0.0.2"], &[], 60);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("t.conf"),
+            format!(
+                "[General]\nipv6 = false\ndns-server = {}\n[Rule]\nFINAL,DIRECT\n[SSID Setting]\nSSID:Home dns-server = {}\n",
+                global.addr(),
+                home.addr()
+            ),
+        )
+        .unwrap();
+        let network = dir.path().join("network.json");
+        std::fs::write(
+            &network,
+            serde_json::json!({
+                "primary": { "interface": "wlan0", "kind": "wifi" },
+                "wifi": { "interface": "wlan0", "ssid": "Home" },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let lookup = |on_the_network: bool| {
+            let mut cmd = rurge_command();
+            cmd.args(["dns", "lookup", "-c"])
+                .arg(dir.path().join("t.conf"))
+                .args(["a.test", "--json", "--no-network", "--data-dir"])
+                .arg(dir.path().join("data"));
+            if on_the_network {
+                cmd.env(
+                    "RURGE_NETWORK_BACKEND",
+                    format!("file:{}", network.display()),
+                );
+            }
+            cmd
+        };
+
+        // nothing is known of the network: the servers of the profile
+        let v = json_of(&output(lookup(false)).await);
+        assert_eq!(v["addresses"], serde_json::json!(["10.0.0.1"]));
+        assert_eq!(
+            v["upstreams"],
+            serde_json::json!([format!("udp://{}", global.addr())])
+        );
+        // on the network the line is for: the servers of the line
+        let v = json_of(&output(lookup(true)).await);
+        assert_eq!(v["addresses"], serde_json::json!(["10.0.0.2"]));
+        assert_eq!(
+            v["upstreams"],
+            serde_json::json!([format!("udp://{}", home.addr())])
+        );
+        assert_eq!(global.query_count("a.test", Qtype::A), 1);
+        assert_eq!(home.query_count("a.test", Qtype::A), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6965,6 +7089,506 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             stop(&mut daemon, api);
             assert_eq!(w.served.requests().len(), 0, "offline asks nobody");
             assert_eq!(w.geo.requests().len(), 0, "offline asks nobody");
+        }
+    }
+
+    /// The daemon and the network the machine is on (phase 3 M1). The network
+    /// is a file the test rewrites (`RURGE_NETWORK_BACKEND=file:<path>`), the
+    /// system proxy another (`RURGE_SYSTEM_PROXY_BACKEND`, set by `rurge_run`);
+    /// nothing here reads or sets what the machine has. What a test waits for
+    /// is something the daemon says (a line of its log) or something it shows
+    /// (its API, the "system proxy"), never a length of time.
+    mod the_network {
+        use super::*;
+        use serde_json::{Value, json};
+        use std::path::PathBuf;
+
+        const LISTENERS: &str =
+            "http-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nhttp-api = k@127.0.0.1:0";
+
+        /// The machine on a Wi-Fi network it has joined.
+        fn wifi(ssid: &str) -> Value {
+            json!({
+                "primary": { "interface": "wlan0", "kind": "wifi", "routers": ["192.0.2.1"] },
+                "wifi": { "interface": "wlan0", "ssid": ssid },
+                "dns": ["192.0.2.53"],
+                "addresses": ["192.0.2.10"],
+            })
+        }
+
+        /// The machine on a cable.
+        fn cable() -> Value {
+            json!({
+                "primary": { "interface": "eth0", "kind": "wired", "routers": ["198.51.100.1"] },
+                "dns": ["198.51.100.53"],
+                "addresses": ["198.51.100.10"],
+            })
+        }
+
+        /// One test's world: a directory with the profile, the data directory
+        /// and the file that says which network the machine is on.
+        struct World {
+            dir: tempfile::TempDir,
+        }
+
+        impl World {
+            fn on(network: &Value) -> World {
+                let world = World {
+                    dir: tempfile::tempdir().unwrap(),
+                };
+                world.move_to(network);
+                world
+            }
+
+            fn network(&self) -> PathBuf {
+                self.dir.path().join("network.json")
+            }
+
+            fn data(&self) -> PathBuf {
+                self.dir.path().join("data")
+            }
+
+            /// Writes the profile: `[General]` with `general` after the
+            /// listeners and the API, then `rest`. The daemon says what it
+            /// does (`notify`: INFO).
+            fn profile(&self, general: &str, rest: &str) -> PathBuf {
+                self.profile_logging("notify", general, rest)
+            }
+
+            /// `profile` with the `loglevel` given.
+            fn profile_logging(&self, loglevel: &str, general: &str, rest: &str) -> PathBuf {
+                let conf = self.dir.path().join("t.conf");
+                std::fs::write(
+                    &conf,
+                    format!("[General]\n{LISTENERS}\nloglevel = {loglevel}\n{general}\n{rest}"),
+                )
+                .unwrap();
+                conf
+            }
+
+            /// `rurge run` on this world's network.
+            fn run(&self, conf: &Path, extra: &[&str]) -> Command {
+                let mut cmd = rurge_run(conf, &self.data());
+                cmd.args(extra).env(
+                    "RURGE_NETWORK_BACKEND",
+                    format!("file:{}", self.network().display()),
+                );
+                cmd
+            }
+
+            /// The machine is on `network` from now on. The file is made
+            /// beside the one the daemon looks at and put in its place: it
+            /// never finds half of one, which is a network that is not known.
+            fn move_to(&self, network: &Value) {
+                let file = self.network();
+                let beside = file.with_extension("new");
+                std::fs::write(&beside, network.to_string()).unwrap();
+                // a rename onto a file somebody has open is refused now and then
+                let mut tries = 0;
+                while let Err(e) = std::fs::rename(&beside, &file) {
+                    tries += 1;
+                    assert!(tries < 100, "cannot put the network in place: {e}");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+
+        /// The lines of the daemon's log, up to the next one with `needle` in
+        /// it; they are all returned, that one last.
+        fn wait_for_log(daemon: &Daemon, needle: &str) -> Vec<String> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut seen = Vec::new();
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let line = daemon.lines.recv_timeout(remaining).unwrap_or_else(|e| {
+                    panic!("rurge run never logged `{needle}` ({e:?}); it said {seen:#?}")
+                });
+                let found = line.contains(needle);
+                seen.push(line);
+                if found {
+                    return seen;
+                }
+            }
+        }
+
+        fn json_of(body: &str) -> Value {
+            serde_json::from_str(body).unwrap_or_else(|e| panic!("not JSON ({e}): {body}"))
+        }
+
+        /// The member a `subnet` group picks now.
+        fn chosen(api: u16, group: &str) -> String {
+            let path = format!("/v1/policy_groups/select?group_name={group}");
+            let (status, body) = api_call(api, "GET", &path, "k", None);
+            assert_eq!(status, 200, "{body}");
+            json_of(&body)["policy"].as_str().unwrap().to_string()
+        }
+
+        /// The servers the resolver asks, as the API lists them.
+        fn upstreams(api: u16) -> Vec<String> {
+            let (status, body) = api_call(api, "GET", "/v1/dns", "k", None);
+            assert_eq!(status, 200, "{body}");
+            json_of(&body)["upstreams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|upstream| upstream.as_str().unwrap().to_string())
+                .collect()
+        }
+
+        /// Whether the daemon says that it has pointed the system proxy at
+        /// itself.
+        fn system_proxy_is_on(api: u16) -> bool {
+            let (status, body) = api_call(api, "GET", "/v1/features/system_proxy", "k", None);
+            assert_eq!(status, 200, "{body}");
+            json_of(&body)["enabled"].as_bool().unwrap()
+        }
+
+        fn ask_for_the_system_proxy(api: u16, on: bool) -> (u16, String) {
+            let body = json!({ "enabled": on }).to_string();
+            api_call(api, "POST", "/v1/features/system_proxy", "k", Some(&body))
+        }
+
+        #[test]
+        fn a_network_change_moves_the_subnet_group_of_a_running_daemon() {
+            let world = World::on(&wifi("Home"));
+            let conf = world.profile(
+                "",
+                "[Proxy]\nAtHome = http, 127.0.0.1, 1\nAtCafe = http, 127.0.0.1, 2\nElsewhere = http, 127.0.0.1, 3\n\
+                 [Proxy Group]\nNet = subnet, SSID:Home = AtHome, SSID:Cafe = AtCafe, default = Elsewhere\n\
+                 [Rule]\nFINAL,Net\n",
+            );
+            let daemon = spawn_command(world.run(&conf, &[]));
+            let api = api_port(&daemon);
+            // the first generation is built on the network the daemon begins on
+            assert_eq!(chosen(api, "Net"), "AtHome");
+            world.move_to(&wifi("Cafe"));
+            wait_until(
+                "the group to follow the machine to the other network",
+                || chosen(api, "Net") == "AtCafe",
+            );
+            world.move_to(&cable());
+            wait_until("the group to fall back to its default", || {
+                chosen(api, "Net") == "Elsewhere"
+            });
+            world.move_to(&wifi("Home"));
+            wait_until("the group to follow the machine back", || {
+                chosen(api, "Net") == "AtHome"
+            });
+        }
+
+        #[test]
+        fn the_ssid_setting_dns_servers_follow_the_network() {
+            // two places nobody answers at: only the list of servers is looked at
+            let global_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let cafe_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let global = global_socket.local_addr().unwrap();
+            let cafe = cafe_socket.local_addr().unwrap();
+            let world = World::on(&wifi("Cafe"));
+            let conf = world.profile(
+                &format!("dns-server = {global}\nipv6 = false"),
+                &format!("[Rule]\nFINAL,DIRECT\n[SSID Setting]\nSSID:Cafe dns-server = {cafe}\n"),
+            );
+            let daemon = spawn_command(world.run(&conf, &[]));
+            let api = api_port(&daemon);
+            // the first generation is built on the network the daemon begins on
+            assert_eq!(upstreams(api), [format!("udp://{cafe}")]);
+            world.move_to(&wifi("Home"));
+            wait_until("the servers of the profile to come back", || {
+                upstreams(api) == [format!("udp://{global}")]
+            });
+            world.move_to(&wifi("Cafe"));
+            wait_until("the servers of the network to be asked again", || {
+                upstreams(api) == [format!("udp://{cafe}")]
+            });
+            drop((global_socket, cafe_socket));
+        }
+
+        /// A generation built again for the DNS of a network is the one in use
+        /// with that DNS: what the user chose stays, and the profile on the
+        /// disk is not read (a reload is the user's to ask for).
+        #[test]
+        fn a_rebuild_for_the_dns_of_a_network_neither_reads_the_profile_nor_forgets_a_choice() {
+            let global_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let cafe_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let global = global_socket.local_addr().unwrap();
+            let cafe = cafe_socket.local_addr().unwrap();
+            let world = World::on(&wifi("Home"));
+            let general = format!("dns-server = {global}\nipv6 = false");
+            let body = |rules: &str| {
+                format!(
+                    "[Proxy]\nA = http, 127.0.0.1, 1\nB = http, 127.0.0.1, 2\n\
+                     [Proxy Group]\nPick = select, A, B\n\
+                     [Rule]\n{rules}FINAL,Pick\n\
+                     [SSID Setting]\nSSID:Cafe dns-server = {cafe}\n"
+                )
+            };
+            let conf = world.profile(&general, &body(""));
+            let daemon = spawn_command(world.run(&conf, &[]));
+            let api = api_port(&daemon);
+            let rules = || -> usize {
+                let (status, text) = api_call(api, "GET", "/v1/rules", "k", None);
+                assert_eq!(status, 200, "{text}");
+                json_of(&text)["rules"].as_array().unwrap().len()
+            };
+            assert_eq!(upstreams(api), [format!("udp://{global}")]);
+            assert_eq!(rules(), 1);
+            let (status, text) = api_call(
+                api,
+                "POST",
+                "/v1/policy_groups/select",
+                "k",
+                Some(r#"{"group_name":"Pick","policy":"B"}"#),
+            );
+            assert_eq!(status, 200, "{text}");
+
+            // the profile is edited, and not reloaded; the machine moves
+            world.profile(&general, &body("DOMAIN,extra.test,REJECT\n"));
+            world.move_to(&wifi("Cafe"));
+            wait_until("the servers of the network to be asked", || {
+                upstreams(api) == [format!("udp://{cafe}")]
+            });
+            assert_eq!(rules(), 1, "the profile on the disk was read");
+            assert_eq!(chosen(api, "Pick"), "B", "the choice was forgotten");
+
+            // a reload is what reads it
+            let (status, text) = api_call(api, "POST", "/v1/profiles/reload", "k", Some("{}"));
+            assert_eq!(
+                (status, text.contains("\"ok\":true")),
+                (200, true),
+                "{text}"
+            );
+            assert_eq!(rules(), 2);
+            assert_eq!(upstreams(api), [format!("udp://{cafe}")]);
+            assert_eq!(chosen(api, "Pick"), "B");
+            drop((global_socket, cafe_socket));
+        }
+
+        /// The interface is said at INFO. The name of the network, its access
+        /// point, its gateways and the machine's addresses say where the user
+        /// is: the name and the access point are said at DEBUG and no more, and
+        /// the addresses are not said at all.
+        #[test]
+        fn the_log_says_where_the_machine_is_only_at_debug() {
+            let secret_network = json!({
+                "primary": { "interface": "wlan0", "kind": "wifi", "routers": ["192.0.2.77"] },
+                "wifi": { "interface": "wlan0", "ssid": "Secret-Net", "bssid": "00:00:5e:00:53:af" },
+                "dns": ["192.0.2.88"],
+                "addresses": ["192.0.2.99"],
+            });
+            for (loglevel, debug) in [("notify", false), ("info", true)] {
+                let world = World::on(&cable());
+                let conf = world.profile_logging(loglevel, "", "[Rule]\nFINAL,DIRECT\n");
+                let mut daemon = spawn_command(world.run(&conf, &[]));
+                let api = api_port(&daemon);
+                world.move_to(&secret_network);
+                let mut all = wait_for_log(&daemon, "network changed");
+                let says = all.last().unwrap().clone();
+                assert!(says.contains("wlan0") && says.contains("wifi"), "{says}");
+                assert_eq!(api_call(api, "POST", "/v1/stop", "k", Some("{}")).0, 200);
+                assert_eq!(wait_for_exit(&mut daemon, 10), Some(0));
+                all.extend(printed_to_the_end(&daemon));
+                let said = |what: &str| all.iter().any(|line| line.contains(what));
+                // what says where the machine is: at DEBUG, and never on the line that tells of the change
+                for secret in ["Secret-Net", "00:00:5e:00:53:af", "192.0.2.77"] {
+                    assert_eq!(said(secret), debug, "{loglevel}: {secret}: {all:#?}");
+                    assert!(!says.contains(secret), "{says}");
+                }
+                // what the daemon does not need to say
+                for secret in ["192.0.2.88", "192.0.2.99"] {
+                    assert!(!said(secret), "{loglevel}: {secret}: {all:#?}");
+                }
+            }
+        }
+
+        const OFFICE: &str = "[Rule]\nFINAL,DIRECT\n[SSID Setting]\nSSID:Office suspend=true\n";
+
+        /// A world whose "system proxy" holds `ORIGINAL_PROXY`.
+        fn with_a_system_proxy(world: &World) -> PathBuf {
+            std::fs::create_dir_all(world.data()).unwrap();
+            let file = sysproxy_file(&world.data());
+            std::fs::write(&file, ORIGINAL_PROXY).unwrap();
+            file
+        }
+
+        #[test]
+        fn the_system_proxy_pauses_on_a_suspend_network() {
+            let world = World::on(&wifi("Home"));
+            let conf = world.profile("", OFFICE);
+            let file = with_a_system_proxy(&world);
+            let daemon = spawn_command(world.run(&conf, &["--system-proxy"]));
+            let api = api_port(&daemon);
+            wait_for_line(&daemon, "system proxy enabled: ");
+            let ours = std::fs::read_to_string(&file).unwrap();
+            assert_ne!(ours, ORIGINAL_PROXY);
+            assert!(system_proxy_is_on(api));
+
+            // the machine goes to a network that says to leave the system alone
+            world.move_to(&wifi("Office"));
+            wait_for_log(&daemon, "takeover paused on this network");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+            assert!(!system_proxy_is_on(api), "the real state is told");
+            // the pause is in memory only
+            let state = read_json(&world.data().join("state.json"));
+            assert!(state["system_proxy_backup"].is_null(), "{state}");
+            assert_eq!(state["features"]["system_proxy"], false);
+            let keys = |value: &Value| -> Vec<String> {
+                value.as_object().unwrap().keys().cloned().collect()
+            };
+            let named_so = |key: &String| key.contains("paus") || key.contains("suspend");
+            assert!(!keys(&state).iter().any(named_so), "{state}");
+            assert!(!keys(&state["features"]).iter().any(named_so), "{state}");
+
+            // asked for while it lasts: answered, and left for when it ends
+            assert_eq!(ask_for_the_system_proxy(api, true), (200, "{}".to_string()));
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+            assert!(!system_proxy_is_on(api));
+
+            world.move_to(&wifi("Home"));
+            wait_for_log(&daemon, "takeover resumed");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), ours);
+            assert!(system_proxy_is_on(api));
+        }
+
+        /// A start on a network that says to suspend: nothing is set, and
+        /// what is asked for from then on is what stands when the pause ends.
+        #[test]
+        fn the_last_state_asked_for_during_a_pause_is_the_one_that_stands_after_it() {
+            let world = World::on(&wifi("Office"));
+            let conf = world.profile("", OFFICE);
+            let file = with_a_system_proxy(&world);
+            let daemon = spawn_command(world.run(&conf, &["--system-proxy"]));
+            let api = api_port(&daemon);
+            let said = wait_for_log(&daemon, "takeover paused on this network");
+            assert!(
+                !said
+                    .iter()
+                    .any(|line| line.contains("system proxy enabled")),
+                "{said:#?}"
+            );
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+            assert!(!system_proxy_is_on(api));
+
+            // `--system-proxy` was only noted: the pause ends with it set
+            world.move_to(&wifi("Home"));
+            wait_for_log(&daemon, "takeover resumed");
+            let ours = std::fs::read_to_string(&file).unwrap();
+            assert_ne!(ours, ORIGINAL_PROXY);
+            assert_eq!(
+                read_json(&file)["http"],
+                format!("127.0.0.1:{}", daemon.http)
+            );
+            assert!(system_proxy_is_on(api));
+
+            // asked to be off during a pause, it is off when the pause ends
+            world.move_to(&wifi("Office"));
+            wait_for_log(&daemon, "takeover paused on this network");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+            assert_eq!(
+                ask_for_the_system_proxy(api, false),
+                (200, "{}".to_string())
+            );
+            world.move_to(&wifi("Home"));
+            wait_for_log(&daemon, "takeover resumed");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+            assert!(!system_proxy_is_on(api));
+
+            // and a pause that follows asks for nothing: it was off before it
+            world.move_to(&wifi("Office"));
+            wait_for_log(&daemon, "takeover paused on this network");
+            world.move_to(&wifi("Home"));
+            wait_for_log(&daemon, "takeover resumed");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+            assert!(!system_proxy_is_on(api));
+        }
+
+        /// The lines of `[SSID Setting]` are the profile's, so a reload that
+        /// takes one away ends the pause it made, and one that adds it begins
+        /// one: the pause follows the profile as well as the network.
+        #[test]
+        fn a_reload_that_changes_the_ssid_setting_ends_or_begins_the_pause() {
+            let world = World::on(&wifi("Office"));
+            let conf = world.profile("", OFFICE);
+            let file = with_a_system_proxy(&world);
+            let daemon = spawn_command(world.run(&conf, &["--system-proxy"]));
+            let api = api_port(&daemon);
+            wait_for_log(&daemon, "takeover paused on this network");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+
+            // a reload of the same profile is no end to it
+            let (status, body) = api_call(api, "POST", "/v1/profiles/reload", "k", Some("{}"));
+            assert_eq!(
+                (status, body.contains("\"ok\":true")),
+                (200, true),
+                "{body}"
+            );
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+            assert!(!system_proxy_is_on(api));
+
+            // the profile does not say to suspend any more
+            world.profile("", "[Rule]\nFINAL,DIRECT\n");
+            let (status, body) = api_call(api, "POST", "/v1/profiles/reload", "k", Some("{}"));
+            assert_eq!(
+                (status, body.contains("\"ok\":true")),
+                (200, true),
+                "{body}"
+            );
+            wait_for_log(&daemon, "takeover resumed");
+            assert_eq!(
+                read_json(&file)["http"],
+                format!("127.0.0.1:{}", daemon.http)
+            );
+            assert!(system_proxy_is_on(api));
+
+            // and says it again
+            world.profile("", OFFICE);
+            let (status, body) = api_call(api, "POST", "/v1/profiles/reload", "k", Some("{}"));
+            assert_eq!(
+                (status, body.contains("\"ok\":true")),
+                (200, true),
+                "{body}"
+            );
+            wait_for_log(&daemon, "takeover paused on this network");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+            assert!(!system_proxy_is_on(api));
+        }
+
+        /// A `RURGE_NETWORK_BACKEND` rurge does not know never becomes the
+        /// machine: falling back to it would let a typo in a test read the
+        /// real network. The commands that read the network once refuse it
+        /// alike.
+        #[test]
+        fn an_unknown_network_backend_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let conf = write_conf(dir.path(), API_GENERAL);
+            let data = dir.path().join("data");
+            let mut cmd = rurge_run(&conf, &data);
+            cmd.env("RURGE_NETWORK_BACKEND", "bogus");
+            let (code, stderr) = give_up(cmd);
+            assert_eq!(code, Some(2), "{stderr}");
+            assert!(
+                stderr.contains("RURGE_NETWORK_BACKEND") && stderr.contains("file:<path>"),
+                "{stderr}"
+            );
+
+            for command in [["rule", "match"], ["dns", "lookup"]] {
+                let out = rurge_command()
+                    .args(command)
+                    .arg("-c")
+                    .arg(&conf)
+                    .arg("example.com")
+                    .arg("--no-network")
+                    .arg("--data-dir")
+                    .arg(&data)
+                    .env("RURGE_NETWORK_BACKEND", "bogus")
+                    .output()
+                    .unwrap();
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert_eq!(out.status.code(), Some(2), "{command:?}: {stderr}");
+                assert!(
+                    stderr.contains("RURGE_NETWORK_BACKEND") && stderr.contains("file:<path>"),
+                    "{command:?}: {stderr}"
+                );
+            }
         }
     }
 }

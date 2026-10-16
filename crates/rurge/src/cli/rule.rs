@@ -1,6 +1,7 @@
 //! `rurge rule match`: evaluate the rule engine for a hypothetical session
 //! without running the daemon (M2 design §10.1).
 
+use super::network;
 use super::runtime::{RuntimeArgs, build_stack};
 use crate::capabilities;
 use anyhow::Context;
@@ -10,7 +11,7 @@ use rurge_config::diagnostic::Severity;
 use rurge_config::rule::PolicyRef;
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::{ListenerKind, ProcessInfo, SessionInfo, Transport};
-use rurge_config::{Diagnostics, HostName};
+use rurge_config::{Diagnostics, HostName, NetworkCell};
 use rurge_engine::profile::disk_remote;
 use rurge_rules::engine::{FixedResolve, LazyResolver, NoResolve, TraceStep};
 use rurge_rules::matcher::ResolvedAddrs;
@@ -196,6 +197,9 @@ pub fn run(args: RuleArgs) -> anyhow::Result<ExitCode> {
 }
 
 fn run_match(args: MatchArgs) -> anyhow::Result<ExitCode> {
+    // before anything is read or made: the network is read from where the
+    // environment says, and a value that says nothing is an error
+    let network_backend = network::backend()?;
     let platform = args.platform.unwrap_or_else(Platform::current);
     let opts = LoadOptions {
         environment: super::environment(platform, capabilities::CORE_VERSION),
@@ -217,9 +221,13 @@ fn run_match(args: MatchArgs) -> anyhow::Result<ExitCode> {
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let stack = build_stack(&cfg, &rt, Duration::from_secs(args.wait)).await?;
+        // the network now, once: `SUBNET` rules are matched against it, and
+        // the resolver asks the DNS that `[SSID Setting]` gives for it
+        let network = network::read_once(&network_backend).await;
+        let stack = build_stack(&cfg, &rt, Duration::from_secs(args.wait), &network).await?;
         let engine =
-            RuleEngine::build_with_registry(&cfg, stack.registry.clone(), stack.geo.clone())?;
+            RuleEngine::build_with_registry(&cfg, stack.registry.clone(), stack.geo.clone())?
+                .with_network(Arc::new(NetworkCell::new(network)));
         let resolver: Arc<dyn LazyResolver> = if args.no_dns {
             Arc::new(NoResolve)
         } else if !args.resolve.is_empty() {

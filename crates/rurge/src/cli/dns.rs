@@ -1,6 +1,7 @@
 //! `rurge dns lookup` / `rurge dns cache`: resolve names through the
 //! profile's DNS settings without running the daemon (M2 design §10.2).
 
+use super::network;
 use super::rule::print_diagnostics;
 use super::runtime::{RuntimeArgs, Stack, build_stack_with};
 use crate::capabilities;
@@ -10,6 +11,7 @@ use rurge_config::general::{DnsServer, EncryptedDns};
 use rurge_config::{Config, Diagnostics};
 use rurge_dns::{DnsError, DnsResult, LookupOpts, Resolver};
 use rurge_engine::profile::disk_remote;
+use rurge_platform::netenv::Backend;
 use serde_json::json;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -133,17 +135,27 @@ fn load_profile(common: &CommonArgs) -> anyhow::Result<Option<(Config, Diagnosti
     Ok(Some((loaded.config, loaded.diagnostics)))
 }
 
-async fn build(common: &CommonArgs, cfg: &Config) -> anyhow::Result<Stack> {
+/// The resolver of the profile on the network the machine is on now, read
+/// once: the DNS servers `[SSID Setting]` gives for it replace the profile's,
+/// and `--server` has the last word.
+async fn build(common: &CommonArgs, cfg: &Config, backend: &Backend) -> anyhow::Result<Stack> {
     let rt = common.runtime.resolve(cfg)?;
     let overrides = (!common.server.is_empty())
         .then(|| parse_servers(&common.server))
         .transpose()?;
-    build_stack_with(cfg, &rt, Duration::from_secs(common.wait), move |rc| {
-        if let Some((servers, encrypted)) = overrides {
-            rc.servers = servers;
-            rc.encrypted = encrypted;
-        }
-    })
+    let network = network::read_once(backend).await;
+    build_stack_with(
+        cfg,
+        &rt,
+        Duration::from_secs(common.wait),
+        &network,
+        move |rc| {
+            if let Some((servers, encrypted)) = overrides {
+                rc.servers = servers;
+                rc.encrypted = encrypted;
+            }
+        },
+    )
     .await
 }
 
@@ -171,6 +183,8 @@ fn warnings(config_diags: &Diagnostics, stack_diags: &Diagnostics) -> Vec<serde_
 }
 
 fn run_lookup(args: LookupArgs) -> anyhow::Result<ExitCode> {
+    // before anything is read or made, as for `rule match`
+    let backend = network::backend()?;
     let Some((cfg, config_diags)) = load_profile(&args.common)? else {
         return Ok(ExitCode::from(2));
     };
@@ -181,7 +195,7 @@ fn run_lookup(args: LookupArgs) -> anyhow::Result<ExitCode> {
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let stack = build(&args.common, &cfg).await?;
+        let stack = build(&args.common, &cfg, &backend).await?;
         let opts = LookupOpts {
             bypass_cache: args.no_cache,
             want_v6: match args.qtype {
@@ -310,6 +324,7 @@ fn lookup_json(
 }
 
 fn run_cache(args: CacheArgs) -> anyhow::Result<ExitCode> {
+    let backend = network::backend()?;
     let Some((cfg, config_diags)) = load_profile(&args.common)? else {
         return Ok(ExitCode::from(2));
     };
@@ -317,7 +332,7 @@ fn run_cache(args: CacheArgs) -> anyhow::Result<ExitCode> {
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let stack = build(&args.common, &cfg).await?;
+        let stack = build(&args.common, &cfg, &backend).await?;
         for name in &args.names {
             if let Err(e) = stack.resolver.lookup(name, LookupOpts::default()).await {
                 eprintln!("warning: {name}: {e}");
