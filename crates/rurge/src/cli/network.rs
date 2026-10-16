@@ -84,20 +84,59 @@ pub async fn read_once(backend: &Backend) -> NetworkFacts {
         .unwrap_or_default()
 }
 
+/// How long the start waits for the first look at the network. The first
+/// generation is built on it and nothing is served before it: a machine that
+/// has not said in this time begins without its network known (as it does when
+/// the look fails), and the look is told as a change when it is done. Reading
+/// the network can take seconds: several programs, each for two at the most.
+const FIRST_LOOK: Duration = Duration::from_secs(1);
+
+/// A look at the network that goes on after the start has stopped waiting for
+/// it.
+type Late = AbortOnDropHandle<Option<Snapshot>>;
+
 /// What a daemon begins with: the first look, and what listens for the
 /// changes that follow it.
 pub struct Started {
     hints: Arc<Notify>,
-    /// The network as it was when the daemon began.
+    /// The network as it was when the daemon began: nothing is known of it if
+    /// the first look took longer than [`FIRST_LOOK`].
     pub snapshot: Snapshot,
+    /// The first look, when it was not done in time.
+    late: Option<Late>,
 }
 
 /// Begins to listen, then looks. In this order: what changes between the two
 /// is a hint, and not lost. Call it once per process.
 pub async fn start(backend: &Backend) -> Started {
     let hints = forward_hints(netenv::hints(backend));
-    let snapshot = look(backend.clone()).await.unwrap_or_default();
-    Started { hints, snapshot }
+    let (snapshot, late) = first_look(|| look(backend.clone()), FIRST_LOOK).await;
+    Started {
+        hints,
+        snapshot,
+        late,
+    }
+}
+
+/// The look `again` makes, waited for for `limit` at the most. A look that
+/// takes longer goes on in the background, and is the first read of the task
+/// that follows the network, which tells what it finds as it tells any
+/// change; the daemon begins without knowing the network.
+async fn first_look<A, F>(again: A, limit: Duration) -> (Snapshot, Option<Late>)
+where
+    A: FnOnce() -> F,
+    F: Future<Output = Option<Snapshot>> + Send + 'static,
+{
+    let mut reading: Late = AbortOnDropHandle::new(tokio::spawn(again()));
+    match tokio::time::timeout(limit, &mut reading).await {
+        Ok(done) => (done.ok().flatten().unwrap_or_default(), None),
+        Err(_) => {
+            tracing::debug!(
+                "the network is not read yet; the start goes on without it, and it is told when it is read"
+            );
+            (Snapshot::default(), Some(reading))
+        }
+    }
 }
 
 /// The hints of the platform, which come on a channel a thread waits on, as a
@@ -136,9 +175,15 @@ pub fn spawn<C: Send + 'static>(
     changes: mpsc::Sender<C>,
     wrap: fn(NetworkFacts) -> C,
 ) -> AbortOnDropHandle<()> {
-    let Started { hints, snapshot } = started;
+    let Started {
+        hints,
+        snapshot,
+        late,
+    } = started;
     let again = move || look(backend.clone());
-    AbortOnDropHandle::new(tokio::spawn(follow(hints, again, snapshot, changes, wrap)))
+    AbortOnDropHandle::new(tokio::spawn(follow(
+        hints, again, snapshot, late, changes, wrap,
+    )))
 }
 
 /// On a hint: reads the network, and tells `changes` when it is not what it
@@ -159,10 +204,14 @@ pub fn spawn<C: Send + 'static>(
 /// (it woke up and has not joined one yet, the cable is out), which is not
 /// being on another. The network that was told last stands, and when one is
 /// read again it is compared with that.
+///
+/// `first` is the look of the start, if it was not done in time: it is the
+/// first read, whenever it ends, and what it finds is told as any read is.
 async fn follow<C, A, F>(
     hints: Arc<Notify>,
     mut again: A,
     mut told: Snapshot,
+    mut first: Option<Late>,
     changes: mpsc::Sender<C>,
     wrap: impl Fn(NetworkFacts) -> C,
 ) where
@@ -174,8 +223,13 @@ async fn follow<C, A, F>(
     // said that the network is lost, and not said it is known again since
     let mut said_lost = false;
     loop {
-        wait_for_a_read(&hints, &mut rest).await;
-        let seen = again().await;
+        let seen = match first.take() {
+            Some(late) => late.await.ok().flatten(),
+            None => {
+                wait_for_a_read(&hints, &mut rest).await;
+                again().await
+            }
+        };
         rest = Some(Instant::now() + WINDOW);
         let Some(snapshot) = seen else {
             continue;
@@ -315,6 +369,16 @@ mod tests {
         /// the number of looks it has had to make. What a look says is the
         /// network at the moment it begins.
         async fn start_counting(first: Snapshot, delay: Duration) -> (World, Arc<AtomicUsize>) {
+            World::build(first, None, delay).await
+        }
+
+        /// `start_counting`, for a daemon whose first look is `late`, if it is
+        /// one that did not finish in time.
+        async fn build(
+            first: Snapshot,
+            late: Option<Late>,
+            delay: Duration,
+        ) -> (World, Arc<AtomicUsize>) {
             let hints = Arc::new(Notify::new());
             let now = Arc::new(Mutex::new(Some(first.clone())));
             let reads = Arc::new(AtomicUsize::new(0));
@@ -333,7 +397,7 @@ mod tests {
                     }
                 }
             };
-            let task = tokio::spawn(follow(hints.clone(), again, first, tx, |facts| facts));
+            let task = tokio::spawn(follow(hints.clone(), again, first, late, tx, |facts| facts));
             settle().await;
             let world = World {
                 hints,
@@ -479,6 +543,84 @@ mod tests {
         // the next one that works is read as usual
         world.change(Some(on_wifi("one"))).await;
         assert_eq!(world.told(), [told_of("one")]);
+    }
+
+    /// The start waits for the first look at the network for a second at the
+    /// most — the first generation is built on it, and nothing is served
+    /// before —: a machine that cannot say in that time begins without
+    /// knowing its network, and the look is told as a change like any other
+    /// when it is done.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_look_that_takes_too_long_is_told_as_a_change_when_it_is_done() {
+        let began = tokio::time::Instant::now();
+        let (snapshot, late) = first_look(
+            || async {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                Some(on_wifi("A"))
+            },
+            FIRST_LOOK,
+        )
+        .await;
+        assert_eq!(snapshot, Snapshot::default(), "it goes on without knowing");
+        assert_eq!(began.elapsed(), FIRST_LOOK, "and no longer was waited");
+        assert!(late.is_some(), "the look goes on");
+
+        let (mut world, _) = World::build(snapshot, late, Duration::ZERO).await;
+        pass(Duration::from_secs(1)).await;
+        assert_eq!(world.told(), [], "two seconds in, the look is not done");
+        pass(Duration::from_secs(1)).await;
+        assert_eq!(world.told(), [told_of("A")]);
+
+        // from then on a network is a change as any other
+        pass(Duration::from_secs(5)).await;
+        world.change(Some(on_wifi("B"))).await;
+        assert_eq!(world.told(), [told_of("B")]);
+    }
+
+    /// A first look that is done in time is what the daemon begins with, and
+    /// nothing follows it.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_look_that_is_done_in_time_is_what_the_start_begins_with() {
+        let began = tokio::time::Instant::now();
+        let (snapshot, late) = first_look(
+            || async {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                Some(on_wifi("A"))
+            },
+            FIRST_LOOK,
+        )
+        .await;
+        assert_eq!(snapshot, on_wifi("A"));
+        assert!(late.is_none());
+        assert_eq!(began.elapsed(), Duration::from_millis(400));
+
+        // a look that did not happen is a network that is not known
+        let (snapshot, late) = first_look(|| async { None }, FIRST_LOOK).await;
+        assert_eq!(snapshot, Snapshot::default());
+        assert!(late.is_none());
+    }
+
+    /// A first look that is late and knows nothing of the network is no change
+    /// either: nothing is told, and the next network is.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_first_look_that_knows_nothing_tells_nothing() {
+        let (snapshot, late) = first_look(
+            || async {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                Some(Snapshot::default())
+            },
+            FIRST_LOOK,
+        )
+        .await;
+        assert!(late.is_some());
+        let (mut world, _) = World::build(snapshot, late, Duration::ZERO).await;
+        // the look is done three seconds in, and a second after that the next
+        // hint is answered at once
+        pass(Duration::from_secs(2)).await;
+        assert_eq!(world.told(), []);
+        pass(Duration::from_secs(5)).await;
+        world.change(Some(on_wifi("A"))).await;
+        assert_eq!(world.told(), [told_of("A")]);
     }
 
     /// A network that cannot be told at all — no interface the traffic leaves
