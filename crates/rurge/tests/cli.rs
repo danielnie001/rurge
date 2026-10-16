@@ -7560,6 +7560,52 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             assert!(!system_proxy_is_on(api));
         }
 
+        /// The pause ends with the system proxy as the user last asked for it,
+        /// whichever way that differs from what it is: a user who asked for it
+        /// off during the pause was answered with success, and it is off when
+        /// the pause ends — though the pause could not give the system proxy
+        /// back when it began (the system would not take the user's settings),
+        /// and it is still pointed at rurge.
+        #[test]
+        fn a_pause_that_ends_switches_the_system_proxy_off_if_it_is_still_on_and_was_asked_off() {
+            let world = World::on(&wifi("Home"));
+            let conf = world.profile("", OFFICE);
+            let file = with_a_system_proxy(&world);
+            let daemon = spawn_command(world.run(&conf, &["--system-proxy"]));
+            let api = api_port(&daemon);
+            wait_for_line(&daemon, "system proxy enabled: ");
+
+            // The system will not take the user's settings back: where the
+            // file is there is a directory, which cannot be written to.
+            std::fs::remove_file(&file).unwrap();
+            std::fs::create_dir(&file).unwrap();
+            world.move_to(&wifi("Office"));
+            let said = wait_for_log(&daemon, "takeover paused on this network");
+            assert!(
+                said.iter()
+                    .any(|line| line.contains("cannot give the system proxy back")),
+                "{said:#?}"
+            );
+            assert!(system_proxy_is_on(api), "it is still pointed at rurge");
+
+            // asked to be off: answered, and left for when the pause ends
+            assert_eq!(
+                ask_for_the_system_proxy(api, false),
+                (200, "{}".to_string())
+            );
+            assert!(system_proxy_is_on(api));
+
+            // the system takes the settings again, and the machine leaves
+            std::fs::remove_dir(&file).unwrap();
+            world.move_to(&wifi("Home"));
+            wait_for_log(&daemon, "takeover resumed");
+            assert_eq!(
+                std::fs::read_to_string(&file).ok().as_deref(),
+                Some(ORIGINAL_PROXY)
+            );
+            assert!(!system_proxy_is_on(api));
+        }
+
         /// The lines of `[SSID Setting]` are the profile's, so a reload that
         /// takes one away ends the pause it made, and one that adds it begins
         /// one: the pause follows the profile as well as the network.

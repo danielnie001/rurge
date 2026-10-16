@@ -626,8 +626,11 @@ impl Takeover {
     /// Whether the takeover is paused is the generation in use and the network
     /// together: look again after either has changed, and do what the
     /// difference asks. Entering the pause gives the system proxy back (that
-    /// it was on is what the user wants, and is noted); leaving it points the
-    /// system proxy at rurge again if the user wants it so.
+    /// it was on is what the user wants, and is noted); leaving it makes the
+    /// system proxy what the user last asked for, in both directions: pointed
+    /// at rurge again if they want it so, and given back if they asked for
+    /// that meanwhile and it is still pointed at rurge (the pause could not
+    /// give it back). Each is tried once.
     async fn follow(
         &mut self,
         engine: &Engine,
@@ -651,11 +654,21 @@ impl Takeover {
             }
             tracing::info!("takeover paused on this network");
         } else {
-            if self.wanted
-                && !sysproxy.enabled()
-                && let Err(e) = switch_system_proxy(sysproxy, engine, listeners, true).await
-            {
-                tracing::error!(error = %e, "cannot point the system proxy at rurge again");
+            match (self.wanted, sysproxy.enabled()) {
+                (true, false) => {
+                    if let Err(e) = switch_system_proxy(sysproxy, engine, listeners, true).await {
+                        tracing::error!(error = %e, "cannot point the system proxy at rurge again");
+                    }
+                }
+                (false, true) => {
+                    if let Err(e) = sysproxy.disable().await {
+                        tracing::error!(
+                            error = %e,
+                            "cannot give the system proxy back when the pause ends; it stays pointed at rurge"
+                        );
+                    }
+                }
+                _ => {}
             }
             tracing::info!("takeover resumed");
         }
