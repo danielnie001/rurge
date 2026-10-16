@@ -149,6 +149,47 @@ async fn evaluate_before_use_waits_for_the_first_round() {
     }
 }
 
+/// The network changes while the first round of an `evaluate-before-use`
+/// group runs. That round began on the old network and does not count, so
+/// the dial that waits for it asks for another and waits for that one; it is
+/// not left to wait out the time a round may take, as it would be if nothing
+/// asked again (phase 3 M1 design 5).
+#[tokio::test]
+async fn a_dial_waits_for_a_round_that_began_on_the_new_network() {
+    let origin = TestServer::spawn().await;
+    let (_a, _b, proxies) = upstreams(&origin).await;
+    let h = harness(Profile {
+        proxies: &proxies,
+        groups: "E = fallback, A, evaluate-before-use=true",
+        rules: "DOMAIN,e.test,E",
+        ..Profile::default()
+    })
+    .await;
+    let began = std::time::Instant::now();
+    let (chain, ()) = tokio::join!(chain_of(&h, "e.test"), async {
+        // A's test is under way: its first request is at the origin, which
+        // answers 300 ms late
+        wait_until("the first test of A", || origin.hits("/slow") >= 1).await;
+        h.engine.registry().network_changed();
+    });
+    assert_eq!(chain, ["E", "A"]);
+    let tests_of_a = h
+        .engine
+        .request_log()
+        .recent(100)
+        .iter()
+        .filter(|r| r.rule.as_deref() == Some("policy test") && r.policy == ["A"])
+        .count();
+    assert_eq!(tests_of_a, 2, "the round that was under way, and another");
+    // a round may take as long as the test timeout allows, 5 seconds here;
+    // two rounds of this test take about a second
+    assert!(
+        began.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        began.elapsed()
+    );
+}
+
 /// `[General] test-timeout` takes any number of seconds. With the largest,
 /// a dial through an `evaluate-before-use` group of more than eight members
 /// still waits for its first round — two timeouts long, more than can be

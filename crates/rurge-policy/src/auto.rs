@@ -142,6 +142,12 @@ struct State {
     rounds: HashMap<String, Instant>,
     /// Groups a round was asked for that has not run yet.
     requested: HashSet<String>,
+    /// How many times the network has changed (phase 3 M1 design 5).
+    epoch: u64,
+    /// For each group a network change took the time of the last round from,
+    /// the epoch that change began: a round of the group that began in an
+    /// earlier epoch says nothing of the network the machine is on now.
+    cleared: HashMap<String, u64>,
 }
 
 /// The automatic groups' state, one per engine: it outlives the config
@@ -197,7 +203,7 @@ impl AutoGroups {
 
     /// Asks for a round of tests of `group`, unless one is asked for
     /// already.
-    pub(crate) fn wake(&self, group: &str) {
+    pub fn wake(&self, group: &str) {
         if !self
             .state
             .lock()
@@ -226,17 +232,42 @@ impl AutoGroups {
         out
     }
 
-    /// A round of tests of `groups` has ended.
-    pub(crate) fn round_done(&self, groups: &[String]) {
+    /// The network epoch: how many times `network_changed` has been called.
+    /// A round of tests notes it as it begins and hands it back to
+    /// `round_ended`.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.state.lock().expect("auto groups").epoch
+    }
+
+    /// A round of tests of `groups` that began in network epoch `began` has
+    /// ended. It is the last round of each group — unless a network change
+    /// has taken the last round from that group since the round began: it
+    /// tested the network the machine was on, and the group is to test
+    /// again (phase 3 M1 design 5). Either way the request is over, and the
+    /// ones who wait for a round are woken to look again.
+    pub(crate) fn round_ended(&self, groups: &[String], began: u64) {
         {
             let mut state = self.state.lock().expect("auto groups");
             let now = Instant::now();
             for group in groups {
-                state.rounds.insert(group.clone(), now);
+                if state
+                    .cleared
+                    .get(group)
+                    .is_none_or(|&cleared| cleared <= began)
+                {
+                    state.rounds.insert(group.clone(), now);
+                }
                 state.requested.remove(group);
             }
         }
         self.rounds.send_modify(|n| *n += 1);
+    }
+
+    /// A round of tests of `groups` that began just now has ended: what the
+    /// tests of this crate mean by a round that ended.
+    #[cfg(test)]
+    pub(crate) fn round_done(&self, groups: &[String]) {
+        self.round_ended(groups, self.epoch());
     }
 
     /// When the last round of tests of `group` ended.
@@ -336,22 +367,30 @@ impl AutoGroups {
         state
             .rounds
             .retain(|group, _| by_name.contains_key(group.as_str()));
+        state
+            .cleared
+            .retain(|group, _| by_name.contains_key(group.as_str()));
     }
 
     /// The network has changed (phase 3 M1 design 5). The groups that pick
     /// by their tests lose the time of their last round, so that they test
     /// again when they are used next — an `evaluate-before-use` group is
     /// waited for again; the results themselves stay, and the groups pick by
-    /// them until the new round is in. A `subnet` group loses its override:
-    /// it said what to use on the network it was set on. A `smart` group
-    /// keeps its rounds (the manual says nothing of it), and so do the
-    /// overrides of the groups that test and the member `url-test` holds.
+    /// them until the new round is in. A round that is under way began on the
+    /// old network: when it ends it is no round of the new one (`round_ended`).
+    /// A `subnet` group loses its override: it said what to use on the
+    /// network it was set on. A `smart` group keeps its rounds (the manual
+    /// says nothing of it), and so do the overrides of the groups that test
+    /// and the member `url-test` holds.
     pub fn network_changed(&self, groups: &[GroupSpec]) {
         let mut state = self.state.lock().expect("auto groups");
+        state.epoch += 1;
+        let epoch = state.epoch;
         for group in groups {
             match group.kind {
                 GroupKind::UrlTest | GroupKind::Fallback | GroupKind::LoadBalance => {
                     state.rounds.remove(&group.name);
+                    state.cleared.insert(group.name.clone(), epoch);
                 }
                 GroupKind::Subnet => {
                     state.overrides.remove(&group.name);
@@ -563,6 +602,39 @@ N = subnet, TYPE:WIRED = A, default = B\n[Rule]\nFINAL,U\n";
         assert_eq!(auto.override_of("N", &members), None);
         assert_eq!(auto.override_of("U", &members).as_deref(), Some("B"));
         assert_eq!(auto.pick("U").as_deref(), Some("A"));
+    }
+
+    /// Phase 3 M1 design 5: a round that began before a network change says
+    /// nothing of the network the machine is on now, so when it ends it does
+    /// not stand for the retest the change asked of the groups that pick by
+    /// their tests. Its request is over all the same, and what waits for a
+    /// round is woken to look again. A `smart` group is not asked for a
+    /// retest by a network change: its round counts as it did.
+    #[test]
+    fn a_round_that_began_before_a_network_change_does_not_count() {
+        const TEXT: &str = "[Proxy]\nA = direct\nB = direct\n[Proxy Group]\n\
+U = url-test, A, B\nF = fallback, A, B\nL = load-balance, A, B\nS = smart, A, B\n\
+[Rule]\nFINAL,U\n";
+        let groups = ["U", "F", "L", "S"];
+        let specs: Vec<GroupSpec> = groups.iter().map(|g| spec_of(TEXT, g)).collect();
+        let covered = groups.map(String::from);
+        let auto = auto();
+        let rounds = auto.rounds();
+        auto.wake("U");
+        let began = auto.epoch();
+        auto.network_changed(&specs);
+        auto.round_ended(&covered, began);
+        for group in ["U", "F", "L"] {
+            assert_eq!(auto.last_round(group), None, "{group}");
+        }
+        assert!(auto.last_round("S").is_some());
+        assert!(auto.requested().is_empty(), "the request is over");
+        assert!(rounds.has_changed().unwrap(), "waiters are woken");
+        // a round that begins after the change counts
+        auto.round_ended(&covered, auto.epoch());
+        for group in groups {
+            assert!(auto.last_round(group).is_some(), "{group}");
+        }
     }
 
     /// A round is asked for once until it has run; the requests wait for

@@ -1181,7 +1181,9 @@ impl PolicyRegistry {
     }
 
     /// Tests `policies` and records the round for `groups`; the members of
-    /// `group` that pass.
+    /// `group` that pass. A round that is under way when the network changes
+    /// is recorded for none of the groups that change asked to test again
+    /// (`AutoGroups::round_ended`).
     async fn round(
         &self,
         group: &str,
@@ -1194,6 +1196,8 @@ impl PolicyRegistry {
             // next one for a group of that name
             groups.push(group.to_string());
         }
+        // the network the round begins on
+        let began = self.auto.epoch();
         let tests: Vec<_> = policies
             .iter()
             .filter_map(|p| self.test_case(p))
@@ -1205,7 +1209,7 @@ impl PolicyRegistry {
         for test in tests {
             let _ = test.await;
         }
-        self.auto.round_done(&groups);
+        self.auto.round_ended(&groups, began);
         self.available(group)
     }
 
@@ -1443,7 +1447,10 @@ mod tests {
     use rurge_config::config::{LoadOptions, from_text};
     use rurge_config::{NetKind, Primary, Remote, RemoteSource, WifiLink};
     use rurge_net::connector::{ConnectOpts, Target};
+    use std::future::Future;
     use std::path::{Path, PathBuf};
+    use std::pin::Pin;
+    use std::task::Poll;
     use std::time::SystemTime;
     use url::Url;
 
@@ -3360,6 +3367,37 @@ Sm = smart, A, B, C\n[Rule]\nFINAL,Net\n";
         assert_eq!(pending(&reg).as_deref(), Some("E"));
         reg.auto().round_done(&strings(&["E"]));
         assert_eq!(pending(&reg), None);
+    }
+
+    /// `future` polled once, now.
+    async fn poll_once<F: Future + Unpin>(future: &mut F) -> Poll<F::Output> {
+        std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *future).poll(cx))).await
+    }
+
+    /// A round that is under way when the network changes began on the old
+    /// network: when it ends it is no round of the new one, so it does not
+    /// stand for the retest the change asked for, and the next use of the
+    /// group asks for another (phase 3 M1 design 5).
+    #[tokio::test]
+    async fn a_round_under_way_when_the_network_changes_does_not_count() {
+        let reg = generation(NETWORK, &FakeFactory::new(), None);
+        let rounds = reg.auto().rounds();
+        let mut round = Box::pin(reg.test_group("U"));
+        // The round has begun and has spawned its tests; on this runtime
+        // they do not run before the next await, so it is under way still.
+        assert!(poll_once(&mut round).await.is_pending());
+        reg.network_changed();
+        round.await;
+        assert_eq!(reg.auto().last_round("U"), None);
+        // what waits for a round is woken to look again
+        assert!(rounds.has_changed().unwrap());
+        // the next use of the group asks for another
+        let _ = reg.resolve(&PolicyRef::parse("U"));
+        assert_eq!(reg.auto().requested(), ["U"]);
+        // one that begins after the change counts
+        reg.test_group("U").await;
+        assert!(reg.auto().last_round("U").is_some());
+        assert!(reg.auto().requested().is_empty());
     }
 
     /// Every outbound the registry holds hears of a network change, once:

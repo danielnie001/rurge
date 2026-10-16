@@ -236,6 +236,10 @@ impl Engine {
 /// that round has ended, waiting at most as long as the round may take (M3
 /// design 6.3, 9). `Err`: no member of that group passes after the wait; it
 /// carries the chain up to the group.
+///
+/// A round can end without being the group's round: the network changed
+/// while it ran (phase 3 M1 design 5). The request for it was the dial's own,
+/// and it is over, so the wait asks again before it goes on.
 pub(crate) async fn resolve_ready(
     registry: &PolicyRegistry,
     policy: &PolicyRef,
@@ -252,6 +256,10 @@ pub(crate) async fn resolve_ready(
         while auto.last_round(&group).is_none() {
             if rounds.changed().await.is_err() {
                 break;
+            }
+            // asked for once, however often this is reached before it runs
+            if auto.last_round(&group).is_none() {
+                auto.wake(&group);
             }
         }
     })
