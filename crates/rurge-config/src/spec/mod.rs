@@ -898,22 +898,39 @@ mod tests {
     }
 
     /// A positional user name or password that holds an `=` reads as one
-    /// when it is wholly in quotes (line-splitting design LS-D6).
+    /// when it is wholly in quotes (line-splitting design LS-D6), on every
+    /// type that takes them from positions.
     #[test]
     fn a_positional_credential_with_an_equals_sign_reads_in_quotes() {
-        let o = outcome("P", "http, 127.0.0.1, 8080, \"al=ice\", \"k3y=v4lue\"");
-        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
-        let ProtoSpec::Http(http) = &o.spec.unwrap().proto else {
-            panic!()
-        };
-        assert_eq!(
-            http.username.as_ref().map(|u| u.expose().as_str()),
-            Some("al=ice")
-        );
-        assert_eq!(
-            http.password.as_ref().map(|p| p.expose().as_str()),
-            Some("k3y=v4lue")
-        );
+        for head in [
+            "http, 127.0.0.1, 8080",
+            "https, 127.0.0.1, 8443",
+            "socks5, 127.0.0.1, 1080",
+            "socks5-tls, 127.0.0.1, 1443",
+            "h2-connect, 127.0.0.1, 443",
+        ] {
+            let o = outcome("P", &format!("{head}, \"al=ice\", \"k3y=v4lue\""));
+            assert!(o.diagnostics.is_empty(), "{head}: {:?}", o.diagnostics);
+            let spec = o
+                .spec
+                .unwrap_or_else(|| panic!("{head}: no spec was built"));
+            let (username, password) = match &spec.proto {
+                ProtoSpec::Http(s) => (&s.username, &s.password),
+                ProtoSpec::Socks5(s) => (&s.username, &s.password),
+                ProtoSpec::H2Connect(s) => (&s.username, &s.password),
+                _ => panic!("{head}: not the spec of a type that reads credentials"),
+            };
+            assert_eq!(
+                username.as_ref().map(|u| u.expose().as_str()),
+                Some("al=ice"),
+                "{head}"
+            );
+            assert_eq!(
+                password.as_ref().map(|p| p.expose().as_str()),
+                Some("k3y=v4lue"),
+                "{head}"
+            );
+        }
     }
 
     #[test]
