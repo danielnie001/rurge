@@ -5,6 +5,7 @@ use crate::glob::{Glob, GlobOptions};
 use crate::network::{NetKind, NetworkFacts};
 use crate::redact::is_secret_key;
 use crate::span::Span;
+use crate::spec::reader::quotable;
 use crate::types::HostName;
 use crate::value::{ParamMap, split_fields, split_list, strip_prefix_ci};
 use std::collections::HashSet;
@@ -488,11 +489,17 @@ const BSSID_GLOB: GlobOptions = GlobOptions {
 impl SubnetExpr {
     pub fn parse(s: &str) -> Result<SubnetExpr, ParseError> {
         let s = s.trim();
+        // The expression is quoted only when it can be what somebody wrote as
+        // one. In `[SSID Setting]` it is everything in front of the first
+        // known key, and when that key is misspelt it holds the whole
+        // parameter, a DNS URL with its password among it.
         let bad = |what: &str| {
-            ParseError::new(
-                codes::E_INVALID_RULE_VALUE,
-                format!("invalid subnet expression `{s}`: {what}"),
-            )
+            let message = if quotable(s) {
+                format!("invalid subnet expression `{s}`: {what}")
+            } else {
+                format!("invalid subnet expression: {what}")
+            };
+            ParseError::new(codes::E_INVALID_RULE_VALUE, message)
         };
         if let Some(v) = strip_prefix_ci(s, "SSID:") {
             return Glob::new(v, SSID_GLOB)
@@ -528,6 +535,17 @@ impl SubnetExpr {
             return Err(bad("empty"));
         }
         Ok(SubnetExpr::Bare(s.to_string()))
+    }
+
+    /// Whether the expression may be shown where a value of the profile may
+    /// not be — in a `Debug`: what was written in it can be what somebody
+    /// wrote as one expression (`quotable`), or it holds no free text.
+    pub(crate) fn is_quotable(&self) -> bool {
+        match self {
+            SubnetExpr::Ssid(glob) | SubnetExpr::Bssid(glob) => quotable(glob.source()),
+            SubnetExpr::Mccmnc(text) | SubnetExpr::Bare(text) => quotable(text),
+            SubnetExpr::Router(_) | SubnetExpr::Type(_) => true,
+        }
     }
 
     /// Whether `facts` — the network now — match the expression (phase 3 M1
@@ -924,6 +942,78 @@ external-policy-modifier=\"password=hunter2\"",
             SubnetExpr::parse("中文中文中文").unwrap(),
             SubnetExpr::Bare("中文中文中文".into())
         );
+    }
+
+    /// `E0011` quotes the expression only when it can be what somebody wrote
+    /// as one (`spec::reader::quotable`: no blank, no `=`, no `，` or `＝`, 64
+    /// characters at most). The expression of a line of `[SSID Setting]` is
+    /// everything in front of its first known key, and when that key is
+    /// misspelt it holds the whole parameter, a DNS URL with its password
+    /// among it.
+    #[test]
+    fn a_wrong_subnet_expression_is_quoted_only_when_it_is_quotable() {
+        let told = |expression: &str| SubnetExpr::parse(expression).unwrap_err().message;
+        assert_eq!(
+            told("TYPE:SATELLITE"),
+            "invalid subnet expression `TYPE:SATELLITE`: expected WIFI, WIRED or CELLULAR"
+        );
+        assert_eq!(
+            told("ROUTER:nope"),
+            "invalid subnet expression `ROUTER:nope`: expected an IP address"
+        );
+        assert_eq!(
+            told("MCCMNC:31a"),
+            "invalid subnet expression `MCCMNC:31a`: expected MCC+MNC digits"
+        );
+        assert_eq!(told(""), "invalid subnet expression ``: empty");
+        // 64 characters are the most that are quoted
+        let longest = format!("ROUTER:{}", "9".repeat(57));
+        assert_eq!(
+            told(&longest),
+            format!("invalid subnet expression `{longest}`: expected an IP address")
+        );
+        assert_eq!(
+            told(&format!("{longest}9")),
+            "invalid subnet expression: expected an IP address"
+        );
+        // a blank, an `=`, and what an input method types for a comma or an
+        // `=`, make it something that can hold a credential
+        for (expression, expected) in [
+            (
+                "TYPE:WIFI dns-sever",
+                "invalid subnet expression: expected WIFI, WIRED or CELLULAR",
+            ),
+            (
+                "ROUTER:192.168.1.1,dns-server=https://al1ce:pw@dns.example/dns-query",
+                "invalid subnet expression: expected an IP address",
+            ),
+            (
+                "ROUTER:192.168.1.1\u{ff0c}pw",
+                "invalid subnet expression: expected an IP address",
+            ),
+            (
+                "ROUTER:192.168.1.1\u{ff1d}pw",
+                "invalid subnet expression: expected an IP address",
+            ),
+            (
+                "MCCMNC:310 260",
+                "invalid subnet expression: expected MCC+MNC digits",
+            ),
+        ] {
+            assert_eq!(told(expression), expected, "{expression}");
+        }
+        // the conditions of a `subnet` group are read the same way
+        let e = parse_group("G", "subnet, default = A, ROUTER:nope = B", &span()).unwrap_err();
+        assert_eq!(
+            e.message,
+            "invalid subnet expression `ROUTER:nope`: expected an IP address"
+        );
+        let e = parse_group("G", "subnet, default = A, ROUTER:not an ip = B", &span()).unwrap_err();
+        assert_eq!(
+            e.message,
+            "invalid subnet expression: expected an IP address"
+        );
+        assert_eq!(e.code, codes::E_INVALID_RULE_VALUE);
     }
 
     /// The network of a test: the primary interface (its name, its kind and

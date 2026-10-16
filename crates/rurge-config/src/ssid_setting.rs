@@ -20,9 +20,11 @@
 //! A line whose expression is wrong is an error and is left out; any other
 //! line is kept, with a warning for each of its parameters that does nothing.
 //! A diagnostic does not quote what a line says, with two exceptions that are
-//! the other places' as well: a wrong expression, quoted as a rule's is, and
-//! an item of a DNS list that is none, told as `[General]` tells it (a URL
-//! without its user name and its password).
+//! the other places' as well: a wrong expression, quoted only when it can be
+//! one (`SubnetExpr::parse`; it is everything in front of the first known key,
+//! so a misspelt key puts the whole parameter into it), and an item of a DNS
+//! list that is none, told as `[General]` tells it (a URL without its user
+//! name and its password).
 
 use crate::diagnostic::{Diagnostic, Diagnostics, codes};
 use crate::general::{
@@ -73,7 +75,10 @@ pub struct SsidSetting {
 }
 
 /// The DNS servers go through their own `Debug`, which leaves a URL's user
-/// name and password out; nothing else on a line is a credential.
+/// name and password out. The expression is everything in front of the first
+/// known key, so when that key is misspelt it takes in the whole parameter, a
+/// URL with its password among it: it is shown only when it can be what
+/// somebody wrote as one expression (`SubnetExpr::is_quotable`), else `***`.
 impl fmt::Debug for SsidSetting {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let SsidSetting {
@@ -84,6 +89,7 @@ impl fmt::Debug for SsidSetting {
             tfo_behaviour,
             span,
         } = self;
+        let expr: &dyn fmt::Debug = if expr.is_quotable() { expr } else { &"***" };
         f.debug_struct("SsidSetting")
             .field("expr", expr)
             .field("suspend", suspend)
@@ -788,5 +794,91 @@ mod tests {
                 "invalid value `htps://***@dns.example/dns-query` for `encrypted-dns-server`, using default"
             )]
         );
+    }
+
+    /// The expression is everything in front of the first known key, so a
+    /// first parameter whose key is misspelt, or that follows a comma where a
+    /// blank should be, is in it whole — a DNS URL with its password among
+    /// it. A wrong expression is told without a word of it unless it can be
+    /// quoted (`spec::reader::quotable`).
+    #[test]
+    fn a_wrong_expression_is_told_without_the_line_unless_it_is_quotable() {
+        for (line, told) in [
+            (
+                format!("TYPE:WIFI dns-sever=https://al1ce:{MARKER}@dns.example/dns-query"),
+                "invalid subnet expression: expected WIFI, WIRED or CELLULAR",
+            ),
+            (
+                format!(
+                    "ROUTER:192.168.1.1,dns-server=https://al1ce:{MARKER}@dns.example/dns-query"
+                ),
+                "invalid subnet expression: expected an IP address",
+            ),
+            (
+                "MCCMNC:310 260 suspend=true".to_string(),
+                "invalid subnet expression: expected MCC+MNC digits",
+            ),
+            // short, and with no blank or `=` in it: quoted, as it always was
+            (
+                "TYPE:SATELLITE suspend=true".to_string(),
+                "invalid subnet expression `TYPE:SATELLITE`: expected WIFI, WIRED or CELLULAR",
+            ),
+            (
+                "ROUTER:nope dns-server=1.1.1.1".to_string(),
+                "invalid subnet expression `ROUTER:nope`: expected an IP address",
+            ),
+        ] {
+            let (lines, diags) = read(&line);
+            assert_eq!(
+                said(&diags),
+                [(codes::E_INVALID_RULE_VALUE, told)],
+                "{line}"
+            );
+            assert!(lines.is_empty(), "{line}");
+            for d in &diags {
+                let shown = format!("{d} {d:?}").to_ascii_uppercase();
+                assert!(!shown.contains(MARKER), "{line}: {d}");
+            }
+        }
+    }
+
+    /// The `Debug` of a line shows its expression on the same terms. An SSID
+    /// with a blank in it is not shown either: nothing tells it from a
+    /// parameter that slid into the expression.
+    #[test]
+    fn the_debug_of_a_line_shows_its_expression_only_when_it_is_quotable() {
+        // the key of the first parameter is misspelt: the SSID is the rest of
+        // the line, a URL and its password with it
+        let (lines, diags) = read(&format!(
+            "SSID:Home dns-sever=https://al1ce:{MARKER}@dns.example/dns-query"
+        ));
+        assert_eq!(
+            said(&diags),
+            [(
+                codes::W_PARAM_NOT_EFFECTIVE,
+                "a [SSID Setting] line without parameters has no effect"
+            )]
+        );
+        let shown = format!("{:?}\n{:#?}", lines[0], lines);
+        assert!(!shown.contains(MARKER), "{shown}");
+        assert!(shown.contains("expr: \"***\""), "{shown}");
+
+        for (line, text) in [
+            ("SSID:Home suspend=true", "Home"),
+            ("BSSID:aa:bb:* suspend=true", "aa:bb:*"),
+            ("ROUTER:192.168.1.1 suspend=true", "192.168.1.1"),
+            ("TYPE:WIFI suspend=true", "Wifi"),
+            ("MCCMNC:310260 suspend=true", "310260"),
+            ("Home suspend=true", "Home"),
+        ] {
+            let (lines, _) = read(line);
+            let shown = format!("{:?}", lines[0]);
+            assert!(shown.contains(text), "{line}: {shown}");
+            assert!(!shown.contains("***"), "{line}: {shown}");
+        }
+        let (lines, _) = read("SSID:My Home suspend=true");
+        let shown = format!("{:?}", lines[0]);
+        assert!(!shown.contains("Home"), "{shown}");
+        assert!(shown.contains("expr: \"***\""), "{shown}");
     }
 }

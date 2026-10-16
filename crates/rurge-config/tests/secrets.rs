@@ -430,8 +430,12 @@ FINAL,DIRECT
 /// A line of `[SSID Setting]` that is wrong the way a typing mistake makes
 /// it: a DNS URL with a user name and a password that no parser reads, a
 /// credential that slid into the value of another parameter or stands where
-/// a parameter should. The line is kept and the loader says what is wrong
-/// with it; what it says never repeats the credential.
+/// a parameter should, and a first parameter whose key is misspelt or that
+/// follows a comma where a blank should be — the expression is everything in
+/// front of the first key the loader knows, so it then holds the whole
+/// parameter, a URL with its password among it. The loader says what is wrong
+/// with each line, and neither what it says nor the `Debug` of what it kept
+/// repeats the credential.
 #[test]
 fn a_mistyped_ssid_setting_line_shows_no_credential() {
     let text = format!(
@@ -442,18 +446,42 @@ SSID:Home dns-server=1.1.1.1,{MARKER}-three=1
 SSID:Home suspend={MARKER}-four,tfo-behaviour={MARKER}-five
 SSID:Home suspend=true,{MARKER}-six
 SSID:Home cellular-fallback={MARKER}-seven,cellular-mode={MARKER}-eight
+TYPE:WIFI dns-sever=https://al1ce:{MARKER}-nine@dns.example/dns-query
+ROUTER:192.168.1.1,dns-server=https://al1ce:{MARKER}-ten@dns.example/dns-query
+SSID:Home dns-sever=https://al1ce:{MARKER}-eleven@dns.example/dns-query
 [Rule]
 FINAL,DIRECT
 "
     );
     let loaded = load(&text);
-    assert!(
-        !loaded.diagnostics.has_errors(),
-        "{:#?}",
-        loaded.diagnostics
+    // a diagnostic may change the case of what it quotes
+    let shown: Vec<String> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| format!("{d} {d:?}").to_ascii_uppercase())
+        .collect();
+    let mut found = leaks(&shown.join("\n"));
+    found.extend(leaks(&format!("{:#?}", loaded.config)));
+    assert_eq!(found, Vec::<String>::new());
+
+    // the two lines whose expression is wrong are errors, told without a word
+    // of the line, and are left out; the other seven are kept, and read as
+    // far as they can be (the last one is an SSID with a blank in it, and no
+    // parameter)
+    let errors: Vec<&str> = loaded
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == rurge_config::Severity::Error)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            "invalid subnet expression: expected WIFI, WIRED or CELLULAR",
+            "invalid subnet expression: expected an IP address",
+        ]
     );
-    // every line is kept, and read as far as it can be
-    assert_eq!(loaded.config.ssid_settings.len(), 6);
+    assert_eq!(loaded.config.ssid_settings.len(), 7);
     assert!(loaded.config.ssid_settings[1].suspend);
     let messages: Vec<&str> = loaded
         .diagnostics
@@ -466,21 +494,13 @@ FINAL,DIRECT
         "unknown parameter in [SSID Setting]",
         "invalid value for `suspend`",
         "invalid value for `tfo-behaviour`",
+        "a [SSID Setting] line without parameters has no effect",
     ] {
         assert!(
             messages.iter().any(|m| m.contains(told)),
             "{told}: {messages:#?}"
         );
     }
-    // a diagnostic may change the case of what it quotes
-    let shown: Vec<String> = loaded
-        .diagnostics
-        .iter()
-        .map(|d| format!("{d} {d:?}").to_ascii_uppercase())
-        .collect();
-    let mut found = leaks(&shown.join("\n"));
-    found.extend(leaks(&format!("{:#?}", loaded.config)));
-    assert_eq!(found, Vec::<String>::new());
 }
 
 /// Lines the section parser reads only after it took something off them (a
