@@ -28,7 +28,7 @@ pub use anytls::AnyTlsSpec;
 pub use common::{Applies, CommonOpts, IpVersion, Tristate};
 pub use external::ExternalSpec;
 pub use group::{
-    GroupOutcome, GroupSpec, ImportOpts, PolicyPath, Priority, TestOpts, to_group_spec,
+    GroupOutcome, GroupSpec, ImportOpts, PolicyPath, Priority, SubnetSpec, TestOpts, to_group_spec,
 };
 pub use h2::{H2ConnectSpec, TrustTunnelSpec};
 pub use http::{HeaderPart, HeaderTemplate, HttpSpec};

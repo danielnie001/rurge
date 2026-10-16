@@ -729,6 +729,73 @@ fn parse_host_list(
     list
 }
 
+/// What one item of a `dns-server` value is.
+pub(crate) enum DnsItem {
+    /// A server to ask: `system`, or an address with an optional port.
+    Plain(DnsServer),
+    /// An encrypted-DNS URL, which is also accepted where addresses go.
+    Encrypted(EncryptedDns),
+}
+
+/// One item of the value of `dns-server`, as `[General]` reads it, and as a
+/// line of `[SSID Setting]` does. An item that is none is told (`W0012`, the
+/// user name and the password of a URL left out) and gives `None`.
+pub(crate) fn read_dns_server_item(
+    item: &str,
+    key: &str,
+    span: &Span,
+    diags: &mut Diagnostics,
+) -> Option<DnsItem> {
+    if item.eq_ignore_ascii_case("system") {
+        Some(DnsItem::Plain(DnsServer::System))
+    } else if let Some(enc) = EncryptedDns::parse(item) {
+        Some(DnsItem::Encrypted(enc))
+    } else if let Some(sa) = parse_socket_addr(item, 53) {
+        Some(DnsItem::Plain(DnsServer::Udp(sa)))
+    } else {
+        invalid(diags, span, key, &url_without_credentials(item));
+        None
+    }
+}
+
+/// What one item of an `encrypted-dns-server` value is.
+pub(crate) enum EncryptedItem {
+    /// The manual's special value: encrypted DNS is off, whatever was listed
+    /// before it.
+    Off,
+    Url(EncryptedDns),
+}
+
+/// One item of the value of `encrypted-dns-server`, as `[General]` reads it,
+/// and as a line of `[SSID Setting]` does; one that is none is told like an
+/// item of `dns-server` is.
+pub(crate) fn read_encrypted_dns_item(
+    item: &str,
+    key: &str,
+    span: &Span,
+    diags: &mut Diagnostics,
+) -> Option<EncryptedItem> {
+    if item.eq_ignore_ascii_case("off") {
+        return Some(EncryptedItem::Off);
+    }
+    match EncryptedDns::parse(item) {
+        Some(enc) => Some(EncryptedItem::Url(enc)),
+        None => {
+            invalid(diags, span, key, &url_without_credentials(item));
+            None
+        }
+    }
+}
+
+/// `W0004`: `key` is a setting of iOS that does nothing on a desktop.
+pub(crate) fn ios_only(key: &str, span: &Span) -> Diagnostic {
+    Diagnostic::warning(
+        codes::W_PLATFORM_IGNORED,
+        format!("`{key}` is iOS-only and has no effect on desktop platforms"),
+    )
+    .at(span.clone())
+}
+
 fn migrated(diags: &mut Diagnostics, span: &Span, old: &str, new: &str) {
     diags.push(
         Diagnostic::info(
@@ -793,14 +860,10 @@ pub fn parse_general(section: Option<&Section>, diags: &mut Diagnostics) -> Gene
             "debug-memory-usage" => set_bool!(debug_memory_usage),
             "dns-server" => {
                 for item in split_list(value) {
-                    if item.eq_ignore_ascii_case("system") {
-                        g.dns_server.push(DnsServer::System);
-                    } else if let Some(enc) = EncryptedDns::parse(&item) {
-                        g.encrypted_dns_server.push(enc);
-                    } else if let Some(sa) = parse_socket_addr(&item, 53) {
-                        g.dns_server.push(DnsServer::Udp(sa));
-                    } else {
-                        invalid(diags, span, key, &url_without_credentials(&item));
+                    match read_dns_server_item(&item, key, span, diags) {
+                        Some(DnsItem::Plain(server)) => g.dns_server.push(server),
+                        Some(DnsItem::Encrypted(enc)) => g.encrypted_dns_server.push(enc),
+                        None => {}
                     }
                 }
             }
@@ -809,15 +872,10 @@ pub fn parse_general(section: Option<&Section>, diags: &mut Diagnostics) -> Gene
                     migrated(diags, span, key, "encrypted-dns-server");
                 }
                 for item in split_list(value) {
-                    // the manual's special value: encrypted DNS is off, whatever
-                    // was listed before it
-                    if item.eq_ignore_ascii_case("off") {
-                        g.encrypted_dns_server.clear();
-                        continue;
-                    }
-                    match EncryptedDns::parse(&item) {
-                        Some(enc) => g.encrypted_dns_server.push(enc),
-                        None => invalid(diags, span, key, &url_without_credentials(&item)),
+                    match read_encrypted_dns_item(&item, key, span, diags) {
+                        Some(EncryptedItem::Off) => g.encrypted_dns_server.clear(),
+                        Some(EncryptedItem::Url(enc)) => g.encrypted_dns_server.push(enc),
+                        None => {}
                     }
                 }
             }
@@ -1028,13 +1086,7 @@ pub fn parse_general(section: Option<&Section>, diags: &mut Diagnostics) -> Gene
             }
         }
         if IOS_ONLY_KEYS.contains(&key) {
-            diags.push(
-                Diagnostic::warning(
-                    codes::W_PLATFORM_IGNORED,
-                    format!("`{key}` is iOS-only and has no effect on desktop platforms"),
-                )
-                .at(span.clone()),
-            );
+            diags.push(ios_only(key, span));
         }
     }
 

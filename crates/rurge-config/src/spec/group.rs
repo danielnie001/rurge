@@ -5,7 +5,7 @@
 use super::reader::{invalid_value, quotable, unknown_reference, written_as_name};
 use super::{NameKind, Secret};
 use crate::diagnostic::{Diagnostic, Severity, codes};
-use crate::policy::{Builtin, GroupKind, PolicyGroup, named, shown_members};
+use crate::policy::{Builtin, GroupKind, PolicyGroup, SubnetExpr, is_name, named, shown_members};
 use crate::reach::Reach;
 use crate::rule::Pattern;
 use crate::span::Span;
@@ -93,11 +93,45 @@ pub struct Priority {
 // A factor is finite and above zero (checked at load), so `==` is total.
 impl Eq for Priority {}
 
+/// What a `subnet` group chooses from (phase 3 M1 design 6.1): the first
+/// condition the network matches gives the policy, and none matching gives
+/// the `default`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SubnetSpec {
+    /// In the order written; a policy may stand in several of them.
+    pub conditions: Vec<(SubnetExpr, String)>,
+    pub default: String,
+}
+
+/// A policy name is shown when it is a name, as a group's members are: it is
+/// the text right of an `=` on the line, and a link whose `=` was typed as a
+/// `:` can stand there.
+impl fmt::Debug for SubnetSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn shown(policy: &str) -> &str {
+            if is_name(policy) { policy } else { "***" }
+        }
+        let SubnetSpec {
+            conditions,
+            default,
+        } = self;
+        let conditions: Vec<(&SubnetExpr, &str)> = conditions
+            .iter()
+            .map(|(expr, policy)| (expr, shown(policy)))
+            .collect();
+        f.debug_struct("SubnetSpec")
+            .field("conditions", &conditions)
+            .field("default", &shown(default))
+            .finish()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct GroupSpec {
     pub name: String,
     pub kind: GroupKind,
-    /// Written on the line, in order; a `subnet` group's is its `default`.
+    /// Written on the line, in order. A `subnet` group's are the policies of
+    /// its conditions in the order written, then its `default`, each once.
     pub members: Vec<String>,
     pub import: ImportOpts,
     /// The relay every proxy member is chained through (FR-GRP-07); `DIRECT`
@@ -106,6 +140,8 @@ pub struct GroupSpec {
     pub test: TestOpts,
     pub priority: Vec<Priority>,
     pub hidden: bool,
+    /// Only a `subnet` group has one.
+    pub subnet: Option<SubnetSpec>,
     pub span: Span,
 }
 
@@ -123,6 +159,7 @@ impl fmt::Debug for GroupSpec {
             test,
             priority,
             hidden,
+            subnet,
             span,
         } = self;
         f.debug_struct("GroupSpec")
@@ -134,6 +171,7 @@ impl fmt::Debug for GroupSpec {
             .field("test", test)
             .field("priority", priority)
             .field("hidden", hidden)
+            .field("subnet", subnet)
             .field("span", span)
             .finish()
     }
@@ -305,21 +343,22 @@ pub fn to_group_spec(
                 .to_string(),
         );
     }
-    let (members, import, underlying_proxy) = if group.kind == GroupKind::Subnet {
-        // Which network this is only arrives in phase 3; until then the
-        // group stands for its `default`.
+    let (members, import, underlying_proxy, subnet) = if group.kind == GroupKind::Subnet {
+        // `cellular` is the deprecated condition of the cellular network,
+        // which a desktop has none of: it is read and does nothing
         for key in ["default", "cellular"] {
             r.used.insert(key);
         }
         for key in IMPORT_PARAMS {
             r.not_applicable(key);
         }
-        let default = group.params.get("default").map(str::to_string);
-        (default.into_iter().collect(), ImportOpts::default(), None)
+        let subnet = read_subnet(&mut r);
+        let members = subnet.as_ref().map(subnet_members).unwrap_or_default();
+        (members, ImportOpts::default(), None, subnet)
     } else {
         let import = read_import(&mut r, base_dir, reach, lookup);
         let underlying_proxy = read_underlying(&mut r, lookup);
-        (group.members.clone(), import, underlying_proxy)
+        (group.members.clone(), import, underlying_proxy, None)
     };
     let test = read_test(&mut r, group.kind);
     let priority = if group.kind == GroupKind::Smart {
@@ -339,9 +378,53 @@ pub fn to_group_spec(
         test,
         priority,
         hidden,
+        subnet,
         span: group.span.clone(),
     });
     GroupOutcome { spec, diagnostics }
+}
+
+/// The conditions of a `subnet` group and its `default`. The Surge manual
+/// calls `default` required, so a group without one is an error (`E0018`,
+/// phase 3 M1 design 6.1) and is not built; an empty one is none. The message
+/// is the group's own and not a parameter's, so it is not prefixed with the
+/// group.
+fn read_subnet(r: &mut Reader<'_>) -> Option<SubnetSpec> {
+    let group = r.group;
+    let Some(default) = group.params.get("default").filter(|d| !d.is_empty()) else {
+        r.diags.push(
+            Diagnostic::error(
+                codes::E_INVALID_POLICY_PARAM,
+                format!("{} needs `default`", named("subnet group", &group.name)),
+            )
+            .with_hint(
+                "add `default = <policy>`, the policy to use on a network none of the conditions matches",
+            )
+            .at(group.span.clone()),
+        );
+        return None;
+    };
+    Some(SubnetSpec {
+        conditions: group.conditions.clone(),
+        default: default.to_string(),
+    })
+}
+
+/// The policies of the conditions in the order they are written, then the
+/// `default`; a policy once, where it first stands.
+fn subnet_members(subnet: &SubnetSpec) -> Vec<String> {
+    let mut members: Vec<String> = Vec::new();
+    for policy in subnet
+        .conditions
+        .iter()
+        .map(|(_, policy)| policy)
+        .chain([&subnet.default])
+    {
+        if !members.contains(policy) {
+            members.push(policy.clone());
+        }
+    }
+    members
 }
 
 fn read_import(
@@ -969,9 +1052,10 @@ icon-url=https://example.com/i.png, category=Media",
         );
     }
 
-    /// Which network this is only arrives in phase 3: until then a subnet
-    /// group stands for its `default`, and its user-interface parameters
-    /// are no conditions.
+    /// A subnet group stands for its `default` where no condition matches,
+    /// and its user-interface parameters are no conditions: of the three
+    /// items after the `default` here one is a condition, and its policy
+    /// comes first among the members (phase 3 M1 design 6.1).
     #[test]
     fn a_subnet_group_stands_for_its_default() {
         let group = parse_group(
@@ -984,15 +1068,19 @@ icon-url=https://example.com/i.png, category=Media",
         let o = to_group_spec(&group, Path::new("/profiles"), Reach::Anywhere, &lookup);
         assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
         let s = o.spec.unwrap();
-        assert_eq!(s.members, ["A"]);
+        assert_eq!(s.members, ["DIRECT", "A"]);
+        assert_eq!(
+            s.subnet.as_ref().map(|subnet| subnet.default.as_str()),
+            Some("A")
+        );
         assert!(s.hidden);
     }
 
     /// The legacy writings of a subnet group are taken whole: the `ssid`
     /// keyword, a condition that is a bare value, and the deprecated
     /// `cellular` parameter. None of them is an unknown parameter or a
-    /// problem, and until the network is known the group stands for its
-    /// `default`.
+    /// problem; the bare value is a condition, `cellular` is read and
+    /// nothing more.
     #[test]
     fn a_subnet_group_in_its_legacy_writing_is_taken_whole() {
         let group = parse_group(
@@ -1004,7 +1092,132 @@ icon-url=https://example.com/i.png, category=Media",
         assert!(group.legacy_keyword);
         let o = to_group_spec(&group, Path::new("/profiles"), Reach::Anywhere, &lookup);
         assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
-        assert_eq!(o.spec.unwrap().members, ["A"]);
+        let s = o.spec.unwrap();
+        assert_eq!(s.members, ["DIRECT", "A"]);
+        let subnet = s.subnet.unwrap();
+        assert_eq!(
+            subnet.conditions,
+            [(SubnetExpr::Bare("MyWifi".to_string()), "DIRECT".to_string())]
+        );
+    }
+
+    /// The members of a subnet group are the policies of its conditions in
+    /// the order they are written, then its `default`, each policy once; the
+    /// conditions themselves are all kept (phase 3 M1 design 6.1, M1-D9).
+    #[test]
+    fn a_subnet_group_lists_its_conditions_then_its_default() {
+        let s = spec(
+            "subnet, default = D, SSID:Home = B, TYPE:WIRED = A, ROUTER:192.168.1.1 = B, BSSID:aa:* = D, hidden=true",
+        );
+        assert_eq!(s.members, ["B", "A", "D"]);
+        let subnet = s.subnet.expect("a subnet group has its subnet part");
+        assert_eq!(subnet.default, "D");
+        let written: Vec<(SubnetExpr, String)> = [
+            ("SSID:Home", "B"),
+            ("TYPE:WIRED", "A"),
+            ("ROUTER:192.168.1.1", "B"),
+            ("BSSID:aa:*", "D"),
+        ]
+        .iter()
+        .map(|(expression, policy)| (SubnetExpr::parse(expression).unwrap(), policy.to_string()))
+        .collect();
+        assert_eq!(subnet.conditions, written);
+
+        // the default is where the writing puts it, and it is the last
+        // member all the same
+        assert_eq!(
+            spec("subnet, SSID:Home = A, default = B, TYPE:WIRED = REJECT").members,
+            ["A", "REJECT", "B"]
+        );
+        // only a default
+        let s = spec("subnet, default = A");
+        assert_eq!(s.members, ["A"]);
+        assert!(s.subnet.unwrap().conditions.is_empty());
+        // the default is also the policy of a condition
+        assert_eq!(spec("subnet, default = A, TYPE:WIFI = A").members, ["A"]);
+        // `cellular` is read and is no member (a desktop has no cellular
+        // network)
+        assert_eq!(spec("subnet, default = A, cellular = B").members, ["A"]);
+        // the old keyword and the bare value
+        assert_eq!(
+            spec("ssid, default = A, MyWifi = B, Other = B").members,
+            ["B", "A"]
+        );
+        // only a subnet group has the part
+        assert!(spec("select, A, B").subnet.is_none());
+        assert!(spec("url-test, A, B").subnet.is_none());
+    }
+
+    /// `default` is what the Surge manual calls required (design 6.1, M1-D10):
+    /// without one the group is an error and is not built, whatever else the
+    /// line holds. The text names the group, as the other messages do.
+    #[test]
+    fn a_subnet_group_without_default_is_an_error() {
+        for def in [
+            "subnet",
+            "subnet, SSID:Home = A",
+            "ssid, SSID:Home = A, cellular = B",
+            "subnet, default =, SSID:Home = A",
+            "subnet, hidden=true",
+        ] {
+            let o = outcome(def);
+            assert!(o.spec.is_none(), "{def}");
+            let found: Vec<(&str, &str)> = o
+                .diagnostics
+                .iter()
+                .map(|d| (d.code, d.message.as_str()))
+                .collect();
+            assert_eq!(
+                found,
+                [(
+                    codes::E_INVALID_POLICY_PARAM,
+                    "subnet group `G` needs `default`"
+                )],
+                "{def}"
+            );
+            let d = &o.diagnostics[0];
+            assert_eq!(d.severity, Severity::Error, "{def}");
+            assert_eq!(d.span, Some(span()), "{def}");
+            // and says what to write
+            assert!(
+                d.hint.is_some_and(|hint| hint.contains("default")),
+                "{def}: {:?}",
+                d.hint
+            );
+        }
+        // no other group type needs a `default`
+        assert!(outcome("select, A").spec.is_some());
+        assert!(outcome("url-test, A").spec.is_some());
+        // a name that is none is not quoted
+        let group = parse_group(
+            "trojan://hunter2@t.example:443?sni",
+            "subnet, SSID:Home = A",
+            &span(),
+        )
+        .unwrap();
+        let o = to_group_spec(&group, Path::new("/profiles"), Reach::Anywhere, &lookup);
+        assert!(o.spec.is_none());
+        assert_eq!(o.diagnostics[0].message, "subnet group needs `default`");
+    }
+
+    /// The `Debug` of a subnet group shows the policy of a condition and its
+    /// `default` the way it shows a member: only when it is a name.
+    #[test]
+    fn the_debug_of_a_subnet_group_shows_a_policy_only_when_it_is_a_name() {
+        let group = parse_group(
+            "G",
+            "subnet, default = https://sub.test/link/t0k3n, SSID:Home = A, TYPE:WIRED = B\u{ff1d}t0k3n2",
+            &span(),
+        )
+        .unwrap();
+        let o = to_group_spec(&group, Path::new("/profiles"), Reach::Anywhere, &lookup);
+        let s = o
+            .spec
+            .expect("the group is read; the loader reports the names");
+        let debug = format!("{s:?}");
+        assert!(!debug.contains("t0k3n"), "{debug}");
+        assert!(debug.contains("\"A\""), "{debug}");
+        assert!(debug.contains("***"), "{debug}");
     }
 
     /// A group's unknown parameter is named the way a policy's is: only

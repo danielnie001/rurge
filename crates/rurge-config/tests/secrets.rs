@@ -101,6 +101,9 @@ peer = (public-key = {PUBLIC}, preshared-key=\"{KEY_QUOTED}\", allowed-ips = 10.
 [Tailscale ts]
 auth-key = tskey-{MARKER}-tailscale
 
+[SSID Setting]
+SSID:Office dns-server=192.168.1.1,encrypted-dns-server=https://al1ce:{MARKER}-ssid@dns.example/dns-query,suspend=true
+
 [MITM]
 ca-passphrase = {MARKER}-ca
 ca-p12 = {MARKER}{MARKER}{MARKER}
@@ -238,6 +241,12 @@ fn the_profile_loads() {
         HostValue::Servers(servers)
             if matches!(&servers[0], DnsUpstream::Encrypted(dns) if dns.url.contains("hostdoh"))
     ));
+    // so does the DNS override of a line of `[SSID Setting]`
+    assert!(matches!(
+        config.ssid_settings[0].encrypted_dns_server.as_deref(),
+        Some([dns]) if dns.url.contains("-ssid@")
+    ));
+    assert!(config.ssid_settings[0].suspend);
     // the URL of a set keeps its user name and its password in what is read,
     // for that is what is fetched: the views are what hide them
     let user_info = |what: &str| format!("al1ce:{MARKER}-{what}@");
@@ -416,6 +425,62 @@ FINAL,DIRECT
             "{told}: {messages:#?}"
         );
     }
+}
+
+/// A line of `[SSID Setting]` that is wrong the way a typing mistake makes
+/// it: a DNS URL with a user name and a password that no parser reads, a
+/// credential that slid into the value of another parameter or stands where
+/// a parameter should. The line is kept and the loader says what is wrong
+/// with it; what it says never repeats the credential.
+#[test]
+fn a_mistyped_ssid_setting_line_shows_no_credential() {
+    let text = format!(
+        "[SSID Setting]
+SSID:Office encrypted-dns-server=htps://al1ce:{MARKER}-one@dns.example/dns-query
+SSID:Office dns-server=doq://b0b:{MARKER}-two@dns.example,suspend=true
+SSID:Home dns-server=1.1.1.1,{MARKER}-three=1
+SSID:Home suspend={MARKER}-four,tfo-behaviour={MARKER}-five
+SSID:Home suspend=true,{MARKER}-six
+SSID:Home cellular-fallback={MARKER}-seven,cellular-mode={MARKER}-eight
+[Rule]
+FINAL,DIRECT
+"
+    );
+    let loaded = load(&text);
+    assert!(
+        !loaded.diagnostics.has_errors(),
+        "{:#?}",
+        loaded.diagnostics
+    );
+    // every line is kept, and read as far as it can be
+    assert_eq!(loaded.config.ssid_settings.len(), 6);
+    assert!(loaded.config.ssid_settings[1].suspend);
+    let messages: Vec<&str> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| d.message.as_str())
+        .collect();
+    for told in [
+        "invalid value `htps://***@dns.example/dns-query` for `encrypted-dns-server`",
+        "invalid value `doq://***@dns.example` for `dns-server`",
+        "unknown parameter in [SSID Setting]",
+        "invalid value for `suspend`",
+        "invalid value for `tfo-behaviour`",
+    ] {
+        assert!(
+            messages.iter().any(|m| m.contains(told)),
+            "{told}: {messages:#?}"
+        );
+    }
+    // a diagnostic may change the case of what it quotes
+    let shown: Vec<String> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| format!("{d} {d:?}").to_ascii_uppercase())
+        .collect();
+    let mut found = leaks(&shown.join("\n"));
+    found.extend(leaks(&format!("{:#?}", loaded.config)));
+    assert_eq!(found, Vec::<String>::new());
 }
 
 /// Lines the section parser reads only after it took something off them (a

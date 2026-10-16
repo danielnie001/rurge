@@ -11,7 +11,6 @@ const DEFERRED: &[&str] = &[
     "Map Local",
     "Script",
     "Panel",
-    "SSID Setting",
     "Port Forwarding",
     "IP Rewrite",
     "Ponte",
@@ -73,6 +72,9 @@ mod tests {
         assert!(!is_deferred("Tailscale"));
         // typed since phase 2 M4
         assert!(!is_deferred("WireGuard home"));
+        // typed since phase 3 M1
+        assert!(!is_deferred("SSID Setting"));
+        assert!(!is_deferred("ssid setting"));
         assert!(!is_deferred("Rule"));
         assert!(!is_deferred("General"));
         assert!(!is_deferred("Proxy"));

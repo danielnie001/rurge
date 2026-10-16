@@ -2,6 +2,7 @@
 
 use crate::diagnostic::{ParseError, codes};
 use crate::glob::{Glob, GlobOptions};
+use crate::network::{NetKind, NetworkFacts};
 use crate::redact::is_secret_key;
 use crate::span::Span;
 use crate::types::HostName;
@@ -473,6 +474,17 @@ pub enum SubnetExpr {
     Bare(String),
 }
 
+/// An SSID is compared as it is written; a BSSID is a MAC address, whose
+/// letters have no case.
+const SSID_GLOB: GlobOptions = GlobOptions {
+    case_insensitive: false,
+    classes: false,
+};
+const BSSID_GLOB: GlobOptions = GlobOptions {
+    case_insensitive: true,
+    classes: false,
+};
+
 impl SubnetExpr {
     pub fn parse(s: &str) -> Result<SubnetExpr, ParseError> {
         let s = s.trim();
@@ -483,26 +495,14 @@ impl SubnetExpr {
             )
         };
         if let Some(v) = strip_prefix_ci(s, "SSID:") {
-            return Glob::new(
-                v,
-                GlobOptions {
-                    case_insensitive: false,
-                    classes: false,
-                },
-            )
-            .map(SubnetExpr::Ssid)
-            .map_err(|e| bad(&e.to_string()));
+            return Glob::new(v, SSID_GLOB)
+                .map(SubnetExpr::Ssid)
+                .map_err(|e| bad(&e.to_string()));
         }
         if let Some(v) = strip_prefix_ci(s, "BSSID:") {
-            return Glob::new(
-                v,
-                GlobOptions {
-                    case_insensitive: true,
-                    classes: false,
-                },
-            )
-            .map(SubnetExpr::Bssid)
-            .map_err(|e| bad(&e.to_string()));
+            return Glob::new(v, BSSID_GLOB)
+                .map(SubnetExpr::Bssid)
+                .map_err(|e| bad(&e.to_string()));
         }
         if let Some(v) = strip_prefix_ci(s, "ROUTER:") {
             return v
@@ -528,6 +528,43 @@ impl SubnetExpr {
             return Err(bad("empty"));
         }
         Ok(SubnetExpr::Bare(s.to_string()))
+    }
+
+    /// Whether `facts` — the network now — match the expression (phase 3 M1
+    /// design 2). What `facts` does not know matches nothing, and nothing is
+    /// an error: an SSID the platform would not say is no SSID.
+    ///
+    /// `TYPE:` and `ROUTER:` look at the interface the traffic leaves by and
+    /// at nothing else. The Wi-Fi conditions look at the Wi-Fi link, which
+    /// counts whether or not it is that interface — unless `wifi_always_match`
+    /// (`subnet-exp-wifi-always-match`) is off, and then only when it is.
+    pub fn matches(&self, facts: &NetworkFacts, wifi_always_match: bool) -> bool {
+        let primary = facts.primary.as_ref();
+        let wifi = facts.wifi.as_ref().filter(|link| {
+            wifi_always_match || primary.is_some_and(|p| p.interface == link.interface)
+        });
+        let ssid = wifi.and_then(|link| link.ssid.as_deref());
+        let bssid = wifi.and_then(|link| link.bssid.as_deref());
+        let routers = primary.map_or(&[][..], |p| p.routers.as_slice());
+        match self {
+            SubnetExpr::Ssid(glob) => ssid.is_some_and(|ssid| glob.matches(ssid)),
+            SubnetExpr::Bssid(glob) => bssid.is_some_and(|bssid| glob.matches(bssid)),
+            SubnetExpr::Router(ip) => routers.contains(ip),
+            SubnetExpr::Type(NetType::Wifi) => primary.is_some_and(|p| p.kind == NetKind::Wifi),
+            SubnetExpr::Type(NetType::Wired) => primary.is_some_and(|p| p.kind == NetKind::Wired),
+            // a desktop has no cellular network
+            SubnetExpr::Type(NetType::Cellular) | SubnetExpr::Mccmnc(_) => false,
+            // a pattern is an SSID's, as `SSID:` reads it
+            SubnetExpr::Bare(text) if text.contains(['*', '?']) => ssid.is_some_and(|ssid| {
+                Glob::new(text, SSID_GLOB).is_ok_and(|glob| glob.matches(ssid))
+            }),
+            // else the text is the SSID, the BSSID or a gateway, whole
+            SubnetExpr::Bare(text) => {
+                ssid == Some(text.as_str())
+                    || bssid.is_some_and(|bssid| bssid.eq_ignore_ascii_case(text))
+                    || text.parse::<IpAddr>().is_ok_and(|ip| routers.contains(&ip))
+            }
+        }
     }
 }
 
@@ -642,6 +679,7 @@ pub fn parse_group(name: &str, definition: &str, span: &Span) -> Result<PolicyGr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::{NetKind, NetworkFacts, Primary, WifiLink};
     use std::path::Path;
     use std::sync::Arc;
 
@@ -885,6 +923,215 @@ external-policy-modifier=\"password=hunter2\"",
         assert_eq!(
             SubnetExpr::parse("中文中文中文").unwrap(),
             SubnetExpr::Bare("中文中文中文".into())
+        );
+    }
+
+    /// The network of a test: the primary interface (its name, its kind and
+    /// its gateways) and the Wi-Fi link (its interface, SSID and BSSID).
+    fn network(
+        primary: Option<(&str, NetKind, &[&str])>,
+        wifi: Option<(&str, Option<&str>, Option<&str>)>,
+    ) -> NetworkFacts {
+        NetworkFacts {
+            primary: primary.map(|(interface, kind, routers)| Primary {
+                interface: interface.to_string(),
+                kind,
+                routers: routers.iter().map(|r| r.parse().unwrap()).collect(),
+            }),
+            wifi: wifi.map(|(interface, ssid, bssid)| WifiLink {
+                interface: interface.to_string(),
+                ssid: ssid.map(str::to_string),
+                bssid: bssid.map(str::to_string),
+            }),
+        }
+    }
+
+    /// `expression` against `facts`; each pair is the expression and whether
+    /// it matches.
+    fn check(facts: &NetworkFacts, always: bool, cases: &[(&str, bool)]) {
+        for (expression, expected) in cases {
+            let parsed = SubnetExpr::parse(expression).unwrap();
+            assert_eq!(
+                parsed.matches(facts, always),
+                *expected,
+                "{expression} (wifi_always_match {always}) on {facts:?}"
+            );
+        }
+    }
+
+    /// Every row of the table in phase 3 M1 design 2: one expression that
+    /// matches and one that does not, on the networks the rows differ on.
+    #[test]
+    fn subnet_expressions_match_the_network() {
+        // at home: the Wi-Fi link is the way out, so `wifi_always_match`
+        // makes no difference
+        let home = network(
+            Some(("wlan0", NetKind::Wifi, &["192.168.1.1", "fe80::1"])),
+            Some(("wlan0", Some("My Home"), Some("aa:bb:cc:dd:ee:ff"))),
+        );
+        for always in [true, false] {
+            check(
+                &home,
+                always,
+                &[
+                    ("SSID:My Home", true),
+                    ("SSID:My*", true),
+                    ("SSID:My Hom?", true),
+                    ("SSID:*", true),
+                    // an SSID is case sensitive
+                    ("SSID:my home", false),
+                    ("SSID:Office", false),
+                    ("BSSID:aa:bb:cc:dd:ee:ff", true),
+                    // a BSSID is not
+                    ("BSSID:AA:BB:CC:*", true),
+                    ("BSSID:11:*", false),
+                    ("ROUTER:192.168.1.1", true),
+                    ("ROUTER:fe80::1", true),
+                    ("ROUTER:FE80:0:0:0:0:0:0:1", true),
+                    ("ROUTER:192.168.1.2", false),
+                    ("TYPE:WIFI", true),
+                    ("TYPE:WIRED", false),
+                    // no cellular network on a desktop
+                    ("TYPE:CELLULAR", false),
+                    ("MCCMNC:310260", false),
+                    // a bare value: the SSID, the BSSID or a gateway
+                    ("My Home", true),
+                    ("my home", false),
+                    ("AA:BB:CC:DD:EE:FF", true),
+                    ("aa:bb:cc:dd:ee:ee", false),
+                    ("192.168.1.1", true),
+                    ("fe80:0::1", true),
+                    ("192.168.1.2", false),
+                    ("Office", false),
+                    // with a `*` or a `?` it is an SSID's pattern and no more
+                    ("My*", true),
+                    ("My Hom?", true),
+                    ("*Office*", false),
+                    ("192.168.1.*", false),
+                    ("aa:*", false),
+                ],
+            );
+        }
+
+        // on a cable, no Wi-Fi link
+        let cable = network(Some(("eth0", NetKind::Wired, &["10.0.0.1"])), None);
+        for always in [true, false] {
+            check(
+                &cable,
+                always,
+                &[
+                    ("TYPE:WIRED", true),
+                    ("TYPE:WIFI", false),
+                    ("TYPE:CELLULAR", false),
+                    ("ROUTER:10.0.0.1", true),
+                    ("ROUTER:192.168.1.1", false),
+                    ("10.0.0.1", true),
+                    ("SSID:*", false),
+                    ("BSSID:*", false),
+                    ("My Home", false),
+                    ("My*", false),
+                ],
+            );
+        }
+
+        // the Wi-Fi link is up but the way out is the cable: the Wi-Fi
+        // conditions count when `wifi_always_match` says so, `ROUTER:` and
+        // `TYPE:` only ever look at the way out
+        let both = network(
+            Some(("eth0", NetKind::Wired, &["10.0.0.1"])),
+            Some(("wlan0", Some("My Home"), Some("aa:bb:cc:dd:ee:ff"))),
+        );
+        for (always, wifi) in [(true, true), (false, false)] {
+            check(
+                &both,
+                always,
+                &[
+                    ("SSID:My Home", wifi),
+                    ("SSID:*", wifi),
+                    ("BSSID:aa:*", wifi),
+                    ("My Home", wifi),
+                    ("My*", wifi),
+                    ("AA:BB:CC:DD:EE:FF", wifi),
+                    ("TYPE:WIRED", true),
+                    ("TYPE:WIFI", false),
+                    ("ROUTER:10.0.0.1", true),
+                    ("10.0.0.1", true),
+                ],
+            );
+        }
+
+        // no way out at all, and the Wi-Fi link associated
+        let offline = network(None, Some(("wlan0", Some("My Home"), None)));
+        for (always, wifi) in [(true, true), (false, false)] {
+            check(
+                &offline,
+                always,
+                &[
+                    ("SSID:My Home", wifi),
+                    ("My Home", wifi),
+                    ("BSSID:*", false),
+                    ("TYPE:WIFI", false),
+                    ("TYPE:WIRED", false),
+                    ("ROUTER:10.0.0.1", false),
+                ],
+            );
+        }
+
+        // the platform would not say which Wi-Fi network it is (no
+        // permission to): nothing that needs the name matches, nothing
+        // errors, and what does not need it still works
+        let blind = network(
+            Some(("wlan0", NetKind::Wifi, &["192.168.1.1"])),
+            Some(("wlan0", None, None)),
+        );
+        for always in [true, false] {
+            check(
+                &blind,
+                always,
+                &[
+                    ("SSID:*", false),
+                    ("SSID:My Home", false),
+                    ("BSSID:*", false),
+                    ("My Home", false),
+                    ("My*", false),
+                    ("TYPE:WIFI", true),
+                    ("ROUTER:192.168.1.1", true),
+                    ("192.168.1.1", true),
+                ],
+            );
+        }
+
+        // nothing is known: nothing matches
+        for always in [true, false] {
+            check(
+                &NetworkFacts::default(),
+                always,
+                &[
+                    ("SSID:*", false),
+                    ("BSSID:*", false),
+                    ("ROUTER:10.0.0.1", false),
+                    ("TYPE:WIFI", false),
+                    ("TYPE:WIRED", false),
+                    ("TYPE:CELLULAR", false),
+                    ("MCCMNC:310260", false),
+                    ("My Home", false),
+                    ("My*", false),
+                    ("10.0.0.1", false),
+                ],
+            );
+        }
+
+        // a way out that is neither: only its gateways say anything
+        let other = network(Some(("ppp0", NetKind::Other, &["10.9.9.9"])), None);
+        check(
+            &other,
+            true,
+            &[
+                ("TYPE:WIFI", false),
+                ("TYPE:WIRED", false),
+                ("TYPE:CELLULAR", false),
+                ("ROUTER:10.9.9.9", true),
+            ],
         );
     }
 

@@ -6,6 +6,7 @@ use crate::general::{General, parse_general};
 use crate::host::{HostEntry, HostKey, parse_host_entry};
 use crate::keystore::{KeystoreItem, parse_keystore_item, unknown_field};
 use crate::managed::{self, ManagedConfig, parse_managed};
+use crate::network::NetworkFacts;
 use crate::policy::{
     Builtin, GroupKind, PolicyGroup, PolicyKind, ProxyPolicy, is_name, named, parse_group,
     parse_policy, quoted_name, shown_members,
@@ -21,8 +22,9 @@ use crate::spec::{
     GroupSpec, NameKind, NotImplemented, PolicySpec, ProtoSpec, Remark, SpecEnv, SpecOutcome,
     to_group_spec, to_spec,
 };
+use crate::ssid_setting::{self, SsidSetting};
 use crate::text::include::{self, IncludeOptions};
-use crate::text::{Origin, Profile, SectionKind, parse_str};
+use crate::text::{Origin, Profile, Section, SectionKind, parse_str};
 use crate::value::{split_definition, split_list};
 use crate::wireguard::{WireGuardSection, parse_section};
 use base64::Engine as _;
@@ -235,6 +237,8 @@ pub struct Config {
     pub keystore: Vec<KeystoreItem>,
     /// Every `[WireGuard <name>]` section without errors, in profile order.
     pub wireguard: Vec<WireGuardSection>,
+    /// The lines of `[SSID Setting]` that can be read, in the order written.
+    pub ssid_settings: Vec<SsidSetting>,
     pub deferred: DeferredSections,
     /// The `#!MANAGED-CONFIG` line of the text in effect: none when it is a
     /// downloaded copy that carries no line.
@@ -350,6 +354,17 @@ impl Config {
             unknown_sections: self.unknown_sections.clone(),
             managed: self.managed.as_ref().map(ManagedConfig::shown),
         }
+    }
+
+    /// The line of `[SSID Setting]` in effect on the network `facts` describe:
+    /// the first one whose expression the network matches, taken whole and
+    /// not merged with the lines after it (phase 3 M1 design 7.2). `None`
+    /// when no line matches; the profile's own settings are then in effect.
+    pub fn effective_ssid_setting(&self, facts: &NetworkFacts) -> Option<&SsidSetting> {
+        let always = self.general.subnet_exp_wifi_always_match;
+        self.ssid_settings
+            .iter()
+            .find(|line| line.expr.matches(facts, always))
     }
 
     /// Index of the FINAL rule that gives the policy and the options
@@ -860,6 +875,15 @@ pub fn from_profile(
         wireguard.extend(parse_section(sec, &mut diags));
     }
 
+    // [SSID Setting].
+    let ssid_settings = ssid_setting::parse(
+        profile
+            .section("SSID Setting")
+            .into_iter()
+            .flat_map(Section::active_entries),
+        &mut diags,
+    );
+
     // Deferred and unknown sections.
     let deferred = DeferredSections::collect(&profile);
     if !deferred.sections.is_empty() {
@@ -921,6 +945,7 @@ pub fn from_profile(
         hosts,
         keystore,
         wireguard,
+        ssid_settings,
         deferred,
         managed,
         unknown_sections,
@@ -1644,6 +1669,7 @@ fn own_listener(general: &General, port: u16) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::{NetKind, NetworkFacts, Primary, WifiLink};
     use crate::remote::fake::{Fake, hours};
     use crate::spec::PolicyPath;
     use std::path::Path;
@@ -5916,5 +5942,178 @@ DOMAIN-SET,../{PATH_MARK}-up.list,DIRECT\nRULE-SET,https://example.com/e.list,DI
                 .count(),
             1
         );
+    }
+
+    /// The network of a test: a primary interface of the given kind and, when
+    /// `wifi` gives an interface and an SSID, a Wi-Fi link.
+    fn network(kind: NetKind, interface: &str, wifi: Option<(&str, &str)>) -> NetworkFacts {
+        NetworkFacts {
+            primary: Some(Primary {
+                interface: interface.to_string(),
+                kind,
+                routers: vec!["192.168.1.1".parse().unwrap()],
+            }),
+            wifi: wifi.map(|(interface, ssid)| WifiLink {
+                interface: interface.to_string(),
+                ssid: Some(ssid.to_string()),
+                bssid: None,
+            }),
+        }
+    }
+
+    /// The line of `[SSID Setting]` that is in effect is the first one the
+    /// network matches, whole: nothing of the lines after it is merged in
+    /// (phase 3 M1 design 7.2, M1-D13). When none matches, the global
+    /// settings are in effect.
+    #[test]
+    fn the_first_matching_ssid_setting_line_is_in_effect() {
+        let l = load_text(
+            "[SSID Setting]\nSSID:Home dns-server=192.168.1.1\nTYPE:WIFI suspend=true\nTYPE:WIRED encrypted-dns-server=off\n[Rule]\nFINAL,DIRECT\n",
+        );
+        assert!(l.diagnostics.is_empty(), "{:?}", l.diagnostics.into_vec());
+        let config = l.config;
+        assert_eq!(config.ssid_settings.len(), 3);
+        let line_of = |facts: &NetworkFacts| {
+            config
+                .effective_ssid_setting(facts)
+                .map(|line| line.span.line)
+        };
+
+        let home = network(NetKind::Wifi, "wlan0", Some(("wlan0", "Home")));
+        let setting = config.effective_ssid_setting(&home).unwrap();
+        assert_eq!(setting.span.line, 2);
+        assert!(!setting.suspend, "the second line's suspend is not merged");
+        assert!(setting.dns_server.is_some());
+        assert_eq!(setting.encrypted_dns_server, None);
+
+        let cafe = network(NetKind::Wifi, "wlan0", Some(("wlan0", "Cafe")));
+        let setting = config.effective_ssid_setting(&cafe).unwrap();
+        assert_eq!(setting.span.line, 3);
+        assert!(setting.suspend);
+        assert_eq!(setting.dns_server, None);
+
+        let cable = network(NetKind::Wired, "eth0", None);
+        assert_eq!(line_of(&cable), Some(4));
+        assert_eq!(
+            config
+                .effective_ssid_setting(&cable)
+                .and_then(|line| line.encrypted_dns_server.clone()),
+            Some(Vec::new())
+        );
+
+        // a network no line is for, and one nobody has read yet
+        let other = network(NetKind::Other, "ppp0", None);
+        assert_eq!(line_of(&other), None);
+        assert_eq!(line_of(&NetworkFacts::default()), None);
+    }
+
+    /// `subnet-exp-wifi-always-match` decides whether the Wi-Fi conditions of
+    /// a line count while the Wi-Fi link is not the way out.
+    #[test]
+    fn an_ssid_setting_follows_subnet_exp_wifi_always_match() {
+        let line_in = |always: &str, facts: &NetworkFacts| {
+            let l = load_text(&format!(
+                "[General]\nsubnet-exp-wifi-always-match = {always}\n[SSID Setting]\nSSID:Home suspend=true\n[Rule]\nFINAL,DIRECT\n"
+            ));
+            assert!(l.diagnostics.is_empty(), "{:?}", l.diagnostics.into_vec());
+            l.config
+                .effective_ssid_setting(facts)
+                .map(|line| line.suspend)
+        };
+        // the Wi-Fi link is up and the way out is the cable
+        let cable_and_wifi = network(NetKind::Wired, "eth0", Some(("wlan0", "Home")));
+        assert_eq!(line_in("true", &cable_and_wifi), Some(true));
+        assert_eq!(line_in("false", &cable_and_wifi), None);
+        // the Wi-Fi link is the way out
+        let wifi = network(NetKind::Wifi, "wlan0", Some(("wlan0", "Home")));
+        assert_eq!(line_in("true", &wifi), Some(true));
+        assert_eq!(line_in("false", &wifi), Some(true));
+    }
+
+    /// `[SSID Setting]` is read: it is no longer one of the sections that
+    /// are kept and do nothing, and a line a requirement turns off is not a
+    /// line.
+    #[test]
+    fn an_ssid_setting_section_is_read_and_no_longer_inactive() {
+        let l = load_text(
+            "[SSID Setting]\n#!IOS-ONLY SSID:Home suspend=true\nSSID:Office suspend=true\n[MITM]\nhostname = *\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let inactive: Vec<&str> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::W_DEFERRED_SECTION)
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(
+            inactive,
+            ["sections parsed but inactive in this version: [MITM]"]
+        );
+        assert!(l.config.deferred.get("SSID Setting").is_none());
+        let lines: Vec<u32> = l.config.ssid_settings.iter().map(|s| s.span.line).collect();
+        assert_eq!(lines, [3]);
+
+        // on its own it is not said to be inactive at all
+        let l = load_text("[SSID Setting]\nSSID:Home suspend=true\n[Rule]\nFINAL,DIRECT\n");
+        assert!(l.diagnostics.is_empty(), "{:?}", l.diagnostics.into_vec());
+        assert!(l.config.deferred.sections.is_empty());
+        assert_eq!(l.config.ssid_settings.len(), 1);
+        // and a profile without one has none
+        let l = load_text("[Rule]\nFINAL,DIRECT\n");
+        assert!(l.config.ssid_settings.is_empty());
+    }
+
+    /// A line of `[SSID Setting]` whose expression is wrong is an error of
+    /// the profile, at the line, and is not kept.
+    #[test]
+    fn an_ssid_setting_with_a_wrong_expression_is_a_load_error() {
+        let l = load_text(
+            "[SSID Setting]\nTYPE:SATELLITE suspend=true\nSSID:Home suspend=true\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let errors: Vec<(&str, u32)> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == crate::diagnostic::Severity::Error)
+            .map(|d| (d.code, d.span.as_ref().map_or(0, |s| s.line)))
+            .collect();
+        assert_eq!(errors, [(codes::E_INVALID_RULE_VALUE, 2)]);
+        assert_eq!(l.config.ssid_settings.len(), 1);
+    }
+
+    /// A `subnet` group without a `default` is an error of the profile that
+    /// names the group, and the group is not built: it has no spec, and the
+    /// profile does not also say that it references an unknown policy.
+    #[test]
+    fn a_subnet_group_without_default_is_a_load_error() {
+        let l = load_text(
+            "[Proxy]\nA = http, a.test, 80\n[Proxy Group]\nN = subnet, SSID:Home = A\nS = select, A\n[Rule]\nFINAL,N\n",
+        );
+        let errors: Vec<(&str, &str)> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == crate::diagnostic::Severity::Error)
+            .map(|d| (d.code, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            errors,
+            [(
+                codes::E_INVALID_POLICY_PARAM,
+                "subnet group `N` needs `default`"
+            )]
+        );
+        let names: Vec<&str> = l
+            .config
+            .group_specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect();
+        assert_eq!(names, ["S"]);
+        assert_eq!(l.config.groups.len(), 2);
+
+        // with one, the members are the conditions' policies and the default
+        let l = load_text(
+            "[Proxy]\nA = http, a.test, 80\nB = http, b.test, 80\n[Proxy Group]\nN = subnet, default = B, SSID:Home = A, TYPE:WIRED = B\n[Rule]\nFINAL,N\n",
+        );
+        assert!(l.diagnostics.is_empty(), "{:?}", l.diagnostics.into_vec());
+        assert_eq!(l.config.group_specs[0].members, ["A", "B"]);
     }
 }
