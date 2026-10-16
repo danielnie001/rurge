@@ -2,12 +2,14 @@
 //! M3 design 6.3 – 6.5): how each one picks from its members' test results,
 //! and what they keep across config generations — the temporary overrides,
 //! the member `url-test` holds on to, when each group was last tested — plus
-//! the way the registry asks the engine for a new round of tests.
+//! the way the registry asks the engine for a new round of tests. A `subnet`
+//! group has no tests, but its temporary override is kept here with the
+//! others (phase 3 M1 design 6.2).
 
 use crate::smart::SmartBook;
 use crate::testbook::TestBook;
-use rurge_config::Span;
 use rurge_config::spec::{GroupSpec, TestOpts};
+use rurge_config::{GroupKind, Span};
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, DefaultHasher, Hash, Hasher};
@@ -252,9 +254,11 @@ impl AutoGroups {
         self.rounds.subscribe()
     }
 
-    /// Makes `member` the choice of the automatic group `spec` until it is
-    /// cleared, the group changes in a reload, or the process ends (M3
-    /// design 6.5). The caller has checked that it is a member.
+    /// Makes `member` the choice of the automatic or `subnet` group `spec`
+    /// until it is cleared, the group changes in a reload, or the process
+    /// ends (M3 design 6.5; phase 3 M1 design 6.2: a `subnet` group's goes
+    /// when the network changes too). The caller has checked that it is a
+    /// member.
     pub fn set_override(&self, spec: &GroupSpec, member: &str) {
         self.state.lock().expect("auto groups").overrides.insert(
             spec.name.clone(),
@@ -332,6 +336,29 @@ impl AutoGroups {
         state
             .rounds
             .retain(|group, _| by_name.contains_key(group.as_str()));
+    }
+
+    /// The network has changed (phase 3 M1 design 5). The groups that pick
+    /// by their tests lose the time of their last round, so that they test
+    /// again when they are used next — an `evaluate-before-use` group is
+    /// waited for again; the results themselves stay, and the groups pick by
+    /// them until the new round is in. A `subnet` group loses its override:
+    /// it said what to use on the network it was set on. A `smart` group
+    /// keeps its rounds (the manual says nothing of it), and so do the
+    /// overrides of the groups that test and the member `url-test` holds.
+    pub fn network_changed(&self, groups: &[GroupSpec]) {
+        let mut state = self.state.lock().expect("auto groups");
+        for group in groups {
+            match group.kind {
+                GroupKind::UrlTest | GroupKind::Fallback | GroupKind::LoadBalance => {
+                    state.rounds.remove(&group.name);
+                }
+                GroupKind::Subnet => {
+                    state.overrides.remove(&group.name);
+                }
+                GroupKind::Select | GroupKind::Smart => {}
+            }
+        }
     }
 }
 
@@ -492,6 +519,50 @@ mod tests {
         assert_eq!(auto.override_of("U", &["A".to_string()]), None);
         assert!(auto.clear_override("U"));
         assert!(!auto.clear_override("U"));
+    }
+
+    /// A `subnet` group's override is kept the same way: while the group is
+    /// defined as it was (phase 3 M1 design 6.2).
+    #[test]
+    fn a_subnet_override_lasts_while_the_group_stays_the_same() {
+        let a = "[Proxy]\nA = direct\nB = direct\n[Proxy Group]\nN = subnet, TYPE:WIRED = A, default = B\n[Rule]\nFINAL,N\n";
+        let moved = "[Proxy]\nA = direct\nB = direct\n\n\n[Proxy Group]\nN = subnet, TYPE:WIRED = A, default = B\n[Rule]\nFINAL,N\n";
+        let changed = "[Proxy]\nA = direct\nB = direct\n[Proxy Group]\nN = subnet, TYPE:WIFI = A, default = B\n[Rule]\nFINAL,N\n";
+        let auto = auto();
+        let members = ["A".to_string(), "B".to_string()];
+        auto.set_override(&spec_of(a, "N"), "A");
+        auto.retain(&[spec_of(moved, "N")]);
+        assert_eq!(auto.override_of("N", &members).as_deref(), Some("A"));
+        auto.retain(&[spec_of(changed, "N")]);
+        assert_eq!(auto.override_of("N", &members), None);
+    }
+
+    /// Phase 3 M1 design 5: a network change takes the time of the last round
+    /// from the groups that pick by their tests — they test again when they
+    /// are used next — and the overrides from the `subnet` groups. A `smart`
+    /// group's rounds, the overrides of the other groups and the member
+    /// `url-test` holds stay.
+    #[test]
+    fn a_network_change_clears_the_rounds_of_the_tested_groups_and_the_subnet_overrides() {
+        const TEXT: &str = "[Proxy]\nA = direct\nB = direct\n[Proxy Group]\n\
+U = url-test, A, B\nF = fallback, A, B\nL = load-balance, A, B\nS = smart, A, B\n\
+N = subnet, TYPE:WIRED = A, default = B\n[Rule]\nFINAL,U\n";
+        let groups = ["U", "F", "L", "S", "N"];
+        let specs: Vec<GroupSpec> = groups.iter().map(|g| spec_of(TEXT, g)).collect();
+        let members = ["A".to_string(), "B".to_string()];
+        let auto = auto();
+        auto.round_done(&groups.map(String::from));
+        auto.set_override(&specs[0], "B");
+        auto.set_override(&specs[4], "A");
+        auto.set_pick("U", "A");
+        auto.network_changed(&specs);
+        for group in ["U", "F", "L"] {
+            assert_eq!(auto.last_round(group), None, "{group}");
+        }
+        assert!(auto.last_round("S").is_some());
+        assert_eq!(auto.override_of("N", &members), None);
+        assert_eq!(auto.override_of("U", &members).as_deref(), Some("B"));
+        assert_eq!(auto.pick("U").as_deref(), Some("A"));
     }
 
     /// A round is asked for once until it has run; the requests wait for

@@ -94,6 +94,8 @@ impl Runtime {
         let previous = opts.shared.cell.load();
         // The dry build has already turned every build failure into a load
         // error (`load_checked`), so this only fails for a caller that skipped it.
+        // the groups that pick by the network read the engine's cell, as the
+        // rule engine does
         let registry = Arc::new(
             PolicyRegistry::build(
                 &config,
@@ -105,7 +107,8 @@ impl Runtime {
                 opts.shared.empty_group,
                 &opts.shared.auto,
             )
-            .map_err(|e| anyhow::anyhow!("cannot build the policies: {e}"))?,
+            .map_err(|e| anyhow::anyhow!("cannot build the policies: {e}"))?
+            .with_network(opts.shared.network.clone()),
         );
         Ok(Runtime {
             config: Arc::new(config),

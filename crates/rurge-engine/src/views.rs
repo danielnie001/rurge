@@ -238,6 +238,7 @@ mod tests {
         );
         let cfg = loaded.config;
         let factory = EngineFactory::new(&cfg, Arc::new(SystemResolve), Arc::new(NoopSocketHook));
+        let shared = crate::shared::EngineShared::default();
         PolicyRegistry::build(
             &cfg,
             &assemble(&cfg, &Snapshots::new()),
@@ -246,9 +247,10 @@ mod tests {
             Arc::new(SelectionTable::default()),
             None,
             EmptyGroup::Direct,
-            &crate::shared::EngineShared::default().auto,
+            &shared.auto,
         )
         .expect("builds")
+        .with_network(shared.network.clone())
     }
 
     /// A `lineHash` served over the HTTP API must never let a client confirm a

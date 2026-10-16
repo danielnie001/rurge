@@ -14,7 +14,9 @@ use crate::testbook::{MAX_CONCURRENT_TESTS, TestCase, TestMode, TestResult};
 use rurge_config::rule::PolicyRef;
 use rurge_config::spec::{CommonOpts, GroupSpec, IpVersion, NotImplemented, PolicySpec, ProtoSpec};
 use rurge_config::wireguard::WireGuardSection;
-use rurge_config::{Builtin, Config, GroupKind, KeystoreType, PolicyKind, Span};
+use rurge_config::{
+    Builtin, Config, GroupKind, KeystoreType, NetworkCell, NetworkFacts, PolicyKind, Span,
+};
 use rurge_net::connector::{Connector, Target};
 use rurge_proto::{Direct, OutboundRef, Reject, RejectKind};
 use rustls::RootCertStore;
@@ -258,6 +260,12 @@ pub struct PolicyRegistry {
     tests: HashMap<String, TestSpec>,
     /// What verifies an `https` test URL (`OutboundFactory::roots`).
     roots: Arc<RootCertStore>,
+    /// The network now, which the `subnet` groups choose by (phase 3 M1
+    /// design 6.2). Unknown until `with_network` hands the registry a cell
+    /// somebody keeps up to date.
+    network: Arc<NetworkCell>,
+    /// `[General] subnet-exp-wifi-always-match` of the profile built from.
+    wifi_always_match: bool,
 }
 
 /// What `build` fills in, name by name.
@@ -701,7 +709,38 @@ impl PolicyRegistry {
             auto: auto.clone(),
             tests: table.tests,
             roots: factory.roots(),
+            network: Arc::new(NetworkCell::new(NetworkFacts::default())),
+            wifi_always_match: cfg.general.subnet_exp_wifi_always_match,
         })
+    }
+
+    /// Makes the `subnet` groups look at `network` instead of an unknown one.
+    /// A group reads the cell at every choice, so a network stored in it
+    /// applies from the next choice on; the cell outlives the registry, and
+    /// every generation of a running profile is given the same one.
+    pub fn with_network(mut self, network: Arc<NetworkCell>) -> PolicyRegistry {
+        self.network = network;
+        self
+    }
+
+    /// The network has changed (phase 3 M1 design 5): every outbound may drop
+    /// what it kept of the old one, the groups that pick by their tests test
+    /// again when they are used next, and a `subnet` group loses its
+    /// override (`AutoGroups::network_changed`). The registry looks at the
+    /// new network through the cell, which the caller has stored it in.
+    pub fn network_changed(&self) {
+        for name in &self.order {
+            if let Some(Entry::Outbound { outbound, .. }) = self.entries.get(name.as_str()) {
+                outbound.network_changed();
+            }
+        }
+        let groups: Vec<GroupSpec> = self
+            .group_names()
+            .iter()
+            .filter_map(|name| self.group_spec(name))
+            .cloned()
+            .collect();
+        self.auto.network_changed(&groups);
     }
 
     pub fn direct(&self) -> OutboundRef {
@@ -920,8 +959,29 @@ impl PolicyRegistry {
                     retry: Some(ranking.retry),
                 })
             }
-            // `subnet` (phase 3): the first member
-            GroupKind::Subnet => members.first().cloned().map(Choice::plain),
+            // `subnet` (phase 3 M1 design 6.2): an override stands; else the
+            // policy of the first condition the network matches; else the
+            // `default`. The network is read at every choice and the group
+            // keeps nothing of its own. A condition whose policy the
+            // registry has not (the load has said so) is passed over.
+            GroupKind::Subnet => {
+                if let Some(member) = self.auto.override_of(group, members) {
+                    return Some(Choice::plain(member));
+                }
+                if members.is_empty() {
+                    return None;
+                }
+                let subnet = spec.subnet.as_ref()?;
+                let network = self.network.load();
+                let policy = subnet
+                    .conditions
+                    .iter()
+                    .find(|(expr, policy)| {
+                        members.contains(policy) && expr.matches(&network, self.wifi_always_match)
+                    })
+                    .map_or(&subnet.default, |(_, policy)| policy);
+                Some(Choice::plain(policy.clone()))
+            }
         }
     }
 
@@ -1381,7 +1441,7 @@ mod tests {
     use crate::testing::FakeFactory;
     use rurge_config::HostName;
     use rurge_config::config::{LoadOptions, from_text};
-    use rurge_config::{Remote, RemoteSource};
+    use rurge_config::{NetKind, Primary, Remote, RemoteSource, WifiLink};
     use rurge_net::connector::{ConnectOpts, Target};
     use std::path::{Path, PathBuf};
     use std::time::SystemTime;
@@ -3096,6 +3156,243 @@ Only = smart, Sel, DIRECT, D\nE = smart, A, B, evaluate-before-use=true\nOuter =
         smart_seed(&reg, "A", 100);
         let _ = reg.resolve(&PolicyRef::parse("S"));
         assert!(reg.auto().requested().is_empty());
+    }
+
+    /// A `subnet` group with two conditions and a default, beside the groups
+    /// a network change does and does not touch: `U`, `F` and `E` pick by
+    /// their tests, `Sm` by what its sessions found.
+    const NETWORK: &str = "[Proxy]\nA = http, a.example, 80\nB = http, b.example, 80\nC = http, c.example, 80\n\
+[Proxy Group]\nNet = subnet, SSID:Home = A, TYPE:WIRED = B, default = C\n\
+U = url-test, A, B, C\nF = fallback, A, B, C\nE = url-test, A, B, evaluate-before-use=true\n\
+Sm = smart, A, B, C\n[Rule]\nFINAL,Net\n";
+
+    /// On Wi-Fi, the one interface, joined to `ssid`.
+    fn wifi_facts(ssid: &str) -> NetworkFacts {
+        NetworkFacts {
+            primary: Some(Primary {
+                interface: "wlan0".to_string(),
+                kind: NetKind::Wifi,
+                routers: Vec::new(),
+            }),
+            wifi: Some(WifiLink {
+                interface: "wlan0".to_string(),
+                ssid: Some(ssid.to_string()),
+                bssid: None,
+            }),
+        }
+    }
+
+    /// On a cable, no Wi-Fi link.
+    fn wired_facts() -> NetworkFacts {
+        NetworkFacts {
+            primary: Some(Primary {
+                interface: "eth0".to_string(),
+                kind: NetKind::Wired,
+                routers: Vec::new(),
+            }),
+            wifi: None,
+        }
+    }
+
+    /// Phase 3 M1 design 6.2: the first condition the network matches gives
+    /// the policy, none matching gives the `default`, and the choice follows
+    /// the network as it is stored.
+    #[test]
+    fn a_subnet_group_picks_by_the_network() {
+        let network = Arc::new(NetworkCell::new(NetworkFacts::default()));
+        let reg = generation(NETWORK, &FakeFactory::new(), None).with_network(network.clone());
+        // nothing is known of the network: no condition matches
+        assert_eq!(picked(&reg, "Net"), "C");
+        network.store(wifi_facts("Home"));
+        assert_eq!(picked(&reg, "Net"), "A");
+        network.store(wired_facts());
+        assert_eq!(picked(&reg, "Net"), "B");
+        // two conditions match: the one written first
+        network.store(NetworkFacts {
+            wifi: wifi_facts("Home").wifi,
+            ..wired_facts()
+        });
+        assert_eq!(picked(&reg, "Net"), "A");
+        // none does
+        network.store(wifi_facts("Elsewhere"));
+        assert_eq!(picked(&reg, "Net"), "C");
+        // the views say the same, and a group that is not tested asks for no round
+        assert_eq!(reg.current_member("Net").as_deref(), Some("C"));
+        let dial = reg.resolve(&PolicyRef::parse("Net"));
+        assert_eq!(
+            (chain(&dial), dial.terminal),
+            (vec!["Net", "C"], TerminalKind::Proxy)
+        );
+        assert_eq!(dial.pending, None);
+        assert!(reg.auto().requested().is_empty());
+    }
+
+    /// A registry nobody gave a network to has an unknown one.
+    #[test]
+    fn a_registry_without_a_network_resolves_a_subnet_group_to_its_default() {
+        let reg = generation(NETWORK, &FakeFactory::new(), None);
+        assert_eq!(picked(&reg, "Net"), "C");
+        assert_eq!(reg.current_member("Net").as_deref(), Some("C"));
+    }
+
+    /// `subnet-exp-wifi-always-match` comes with the profile the registry is
+    /// built from: the Wi-Fi link counts even when it is not the interface
+    /// the traffic leaves by, unless the setting says it does not.
+    #[test]
+    fn a_subnet_group_reads_subnet_exp_wifi_always_match() {
+        let away = NetworkFacts {
+            primary: wired_facts().primary,
+            wifi: wifi_facts("Home").wifi,
+        };
+        for (setting, member) in [("true", "A"), ("false", "B")] {
+            let text = format!("[General]\nsubnet-exp-wifi-always-match = {setting}\n{NETWORK}");
+            let reg = generation(&text, &FakeFactory::new(), None)
+                .with_network(Arc::new(NetworkCell::new(away.clone())));
+            assert_eq!(picked(&reg, "Net"), member, "{setting}");
+        }
+    }
+
+    /// A condition whose policy the registry does not have is passed over
+    /// (the load has said so already): the network may match it, and it
+    /// still gives no policy.
+    #[test]
+    fn a_condition_whose_policy_is_gone_is_skipped() {
+        let loaded = from_text(NETWORK, Path::new("t.conf"), &LoadOptions::for_tests());
+        assert!(!loaded.diagnostics.has_errors());
+        let mut cfg = loaded.config;
+        let net = cfg
+            .group_specs
+            .iter_mut()
+            .find(|g| g.name == "Net")
+            .expect("a group");
+        net.subnet.as_mut().expect("a subnet group").conditions[0].1 = "Gone".to_string();
+        net.members[0] = "Gone".to_string();
+        let network = Arc::new(NetworkCell::new(wifi_facts("Home")));
+        let reg = PolicyRegistry::build(
+            &cfg,
+            &assemble(&cfg, &Snapshots::new()),
+            &FakeFactory::new(),
+            &RegistryCell::new(),
+            Arc::new(SelectionTable::default()),
+            None,
+            EmptyGroup::Direct,
+            &crate::testing::auto_groups(),
+        )
+        .expect("builds")
+        .with_network(network.clone());
+        assert_eq!(reg.members("Net"), Some(&strings(&["B", "C"])[..]));
+        // `SSID:Home` matches and has no policy; `TYPE:WIRED` does not match
+        assert_eq!(picked(&reg, "Net"), "C");
+        network.store(NetworkFacts {
+            wifi: wifi_facts("Home").wifi,
+            ..wired_facts()
+        });
+        assert_eq!(picked(&reg, "Net"), "B");
+    }
+
+    /// Phase 3 M1 design 6.2: an override stands over what the network says,
+    /// asks for no test, and goes when the network changes.
+    #[test]
+    fn a_subnet_group_can_be_overridden_until_the_network_changes() {
+        let network = Arc::new(NetworkCell::new(wired_facts()));
+        let reg = generation(NETWORK, &FakeFactory::new(), None).with_network(network.clone());
+        assert_eq!(picked(&reg, "Net"), "B");
+        let spec = reg.group_spec("Net").expect("a group").clone();
+        reg.auto().set_override(&spec, "A");
+        assert_eq!(picked(&reg, "Net"), "A");
+        assert_eq!(reg.current_member("Net").as_deref(), Some("A"));
+        assert!(reg.auto().requested().is_empty());
+        // the network is stored anew, nobody has said it changed: it stands
+        network.store(wifi_facts("Elsewhere"));
+        assert_eq!(picked(&reg, "Net"), "A");
+        // it has changed
+        reg.network_changed();
+        assert_eq!(picked(&reg, "Net"), "C");
+        // another can be set, and cleared
+        reg.auto().set_override(&spec, "B");
+        assert_eq!(picked(&reg, "Net"), "B");
+        assert!(reg.auto().clear_override("Net"));
+        assert_eq!(picked(&reg, "Net"), "C");
+    }
+
+    /// Phase 3 M1 design 5: a network change asks the groups that pick by
+    /// their tests to test again when they are used next — what the last
+    /// round found stays, and they pick by it until the new one is in.
+    #[test]
+    fn a_network_change_restarts_the_tests_but_keeps_the_results() {
+        let reg = generation(NETWORK, &FakeFactory::new(), None);
+        seed(&reg, "A", None);
+        seed(&reg, "B", Some(200));
+        seed(&reg, "C", Some(50));
+        reg.auto().round_done(&strings(&["U", "F", "Sm"]));
+        assert_eq!(picked(&reg, "U"), "C");
+        assert_eq!(picked(&reg, "F"), "B");
+        assert!(reg.auto().requested().is_empty(), "the rounds are fresh");
+
+        reg.network_changed();
+        assert_eq!(reg.auto().last_round("U"), None);
+        assert_eq!(reg.auto().last_round("F"), None);
+        // the results are not gone: until the new round is in, the old one picks
+        assert_eq!(reg.current_member("U").as_deref(), Some("C"));
+        assert_eq!(picked(&reg, "U"), "C");
+        assert_eq!(picked(&reg, "F"), "B");
+        // the next use asks for the round
+        assert_eq!(reg.auto().requested(), ["F", "U"]);
+        // a `smart` group's are not touched: the manual says nothing of it
+        assert!(reg.auto().last_round("Sm").is_some());
+        // the round comes in, the groups are fresh again
+        reg.auto().round_done(&strings(&["U", "F"]));
+        assert_eq!(picked(&reg, "U"), "C");
+        assert!(reg.auto().requested().is_empty());
+    }
+
+    /// A group that is to be evaluated before it is used waits for a round
+    /// of its tests again after a network change, as it did at its first use
+    /// (phase 3 M1 design 5).
+    #[test]
+    fn evaluate_before_use_waits_again_after_a_network_change() {
+        let reg = generation(NETWORK, &FakeFactory::new(), None);
+        let pending = |reg: &PolicyRegistry| reg.resolve(&PolicyRef::parse("E")).pending;
+        assert_eq!(pending(&reg).as_deref(), Some("E"));
+        reg.auto().round_done(&strings(&["E"]));
+        assert_eq!(pending(&reg), None);
+        reg.network_changed();
+        assert_eq!(pending(&reg).as_deref(), Some("E"));
+        reg.auto().round_done(&strings(&["E"]));
+        assert_eq!(pending(&reg), None);
+    }
+
+    /// Every outbound the registry holds hears of a network change, once:
+    /// the profile's, the imported and the derived (phase 3 M1 design 5).
+    #[test]
+    fn a_network_change_reaches_every_outbound() {
+        let factory = FakeFactory::new();
+        let reg = subscribed(
+            "N1 = http, n1.example, 80\nN2 = socks5, n2.example, 1080",
+            &factory,
+            &RegistryCell::new(),
+            None,
+        );
+        let told = || -> Vec<String> {
+            let mut told: Vec<String> = factory
+                .connector
+                .seen()
+                .into_iter()
+                .filter(|line| line.ends_with(" network changed"))
+                .collect();
+            told.sort();
+            told
+        };
+        assert!(told().is_empty());
+        reg.network_changed();
+        let mut every: Vec<String> = reg
+            .policy_names()
+            .iter()
+            .map(|name| format!("{name} network changed"))
+            .collect();
+        every.sort();
+        assert_eq!(every.len(), 7, "{every:?}");
+        assert_eq!(told(), every);
     }
 
     #[test]

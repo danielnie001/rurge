@@ -567,6 +567,61 @@ async fn a_selection_applies_to_the_next_connection_and_survives_a_restart() {
     assert_eq!(restarted.group_selection("Pick").unwrap(), "B");
 }
 
+/// A `subnet` group picks by the network the engine is on (phase 3 M1 design
+/// 6.2): the cell among the engine's shared objects is the one the registry
+/// of every generation reads, so a network stored there decides where the
+/// next session leaves, and a new generation of the profile sees it as well.
+#[tokio::test]
+async fn a_subnet_group_follows_the_network_the_engine_is_on() {
+    use rurge_config::{NetKind, NetworkFacts, Primary};
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    let (a, b, proxies) = two_entries(&origin).await;
+    let h = harness(Profile {
+        proxies: &proxies,
+        groups: "Net = subnet, TYPE:WIFI = A, default = B",
+        rules: "DOMAIN,target.test,Net",
+        ..Profile::default()
+    })
+    .await;
+    let network = h.engine.shared().network;
+    let on_wifi = NetworkFacts {
+        primary: Some(Primary {
+            interface: "wlan0".to_string(),
+            kind: NetKind::Wifi,
+            routers: Vec::new(),
+        }),
+        wifi: None,
+    };
+    // nothing is known of the network yet: the default
+    assert_eq!(h.engine.group_selection("Net").unwrap(), "B");
+    let mut t = connect_via_http(h.http(), "target.test:80").await;
+    assert!(
+        get(&mut t, "target.test", "/hello")
+            .await
+            .ends_with("hi there")
+    );
+    assert_eq!((a.requests().len(), b.requests().len()), (0, 1));
+    // the machine is on Wi-Fi: the next session leaves through A
+    network.store(on_wifi.clone());
+    assert_eq!(h.engine.group_selection("Net").unwrap(), "A");
+    let mut t = connect_via_http(h.http(), "target.test:80").await;
+    assert!(
+        get(&mut t, "target.test", "/hello")
+            .await
+            .ends_with("hi there")
+    );
+    assert_eq!((a.requests().len(), b.requests().len()), (1, 1));
+    // a new generation of the profile is built against the same network …
+    let text = std::fs::read_to_string(h.dir.path().join("t.conf")).unwrap();
+    h.engine
+        .swap_runtime(runtime(h.dir.path(), &text, h.engine.shared()).await);
+    assert_eq!(h.engine.group_selection("Net").unwrap(), "A");
+    // … and follows it off Wi-Fi again
+    network.store(NetworkFacts::default());
+    assert_eq!(h.engine.group_selection("Net").unwrap(), "B");
+}
+
 #[tokio::test]
 async fn only_a_member_can_be_selected() {
     let origin = TestServer::spawn().await;

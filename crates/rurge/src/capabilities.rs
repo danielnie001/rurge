@@ -9,8 +9,8 @@
 //! `tuic` and `tuic-v5` (phase 2 M7b), `masque` and `trust-tunnel` over
 //! HTTP/3 (phase 2 M7c), `select` groups, `url-test` / `fallback` /
 //! `load-balance` groups (phase 2 M3b), `smart` groups (phase 2 M3c), and
-//! `SUBNET` rules, which look at the network the engine is told it is on
-//! (phase 3 M1).
+//! `subnet` groups and `SUBNET` rules, which look at the network the engine
+//! is told it is on (phase 3 M1).
 
 use rurge_config::config::Capabilities;
 use rurge_config::policy::{GroupKind, PolicyKind};
@@ -64,6 +64,7 @@ pub fn current() -> Capabilities {
             GroupKind::Fallback,
             GroupKind::LoadBalance,
             GroupKind::Smart,
+            GroupKind::Subnet,
         ]),
         rule_types: Capabilities::ALL_RULE_TYPES
             .iter()

@@ -173,7 +173,8 @@ impl Engine {
             previous.as_deref(),
             shared.empty_group,
             &shared.auto,
-        );
+        )
+        .map(|registry| registry.with_network(shared.network.clone()));
         let registry = match built {
             Ok(registry) => Arc::new(registry),
             Err(e) => {

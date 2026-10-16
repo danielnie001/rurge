@@ -147,6 +147,44 @@ async fn an_edited_subscription_file_rebuilds_the_registry() {
     );
 }
 
+/// The registry a subscription update builds anew is given the network the
+/// engine is on, as the one of a generation is: a `subnet` group picks by it
+/// after the rebuild as it did before (phase 3 M1 design 6.2).
+#[tokio::test]
+async fn a_rebuilt_registry_still_sees_the_network() {
+    use rurge_config::{NetKind, NetworkFacts, Primary};
+    let dir = tempfile::tempdir().unwrap();
+    let nodes = dir.path().join("nodes.txt");
+    std::fs::write(&nodes, "N1 = http, n1.test, 80\n").unwrap();
+    let dns = MockDns::spawn().await;
+    let text = Profile {
+        proxies: "A = http, a.test, 80\nB = http, b.test, 80",
+        groups: "Sub = select, policy-path=nodes.txt\nNet = subnet, TYPE:WIFI = A, default = B",
+        ..Profile::default()
+    }
+    .text(dns.addr());
+    let engine = Engine::new(runtime(dir.path(), &text, EngineShared::default()).await);
+    let generation = engine.runtime();
+    let selected = || engine.registry().current_member("Net");
+    assert_eq!(selected().as_deref(), Some("B"));
+    engine.shared().network.store(NetworkFacts {
+        primary: Some(Primary {
+            interface: "wlan0".to_string(),
+            kind: NetKind::Wifi,
+            routers: Vec::new(),
+        }),
+        wifi: None,
+    });
+    assert_eq!(selected().as_deref(), Some("A"));
+    std::fs::write(&nodes, "N1 = http, n1.test, 80\nN2 = http, n2.test, 80\n").unwrap();
+    eventually("the rebuild", || members(&engine, "Sub") == ["N1", "N2"]).await;
+    assert!(
+        Arc::ptr_eq(&generation, &engine.runtime()),
+        "the generation stays; the registry alone is built anew"
+    );
+    assert_eq!(selected().as_deref(), Some("A"));
+}
+
 /// A session leaves through a policy that exists only in the subscription;
 /// the proxy gets the target's name, as from any other proxy policy.
 #[tokio::test]

@@ -170,6 +170,11 @@ pub trait Outbound: Send + Sync {
             "UDP".to_string(),
         ))))
     }
+    /// The network the machine is on has changed (phase 3 M1 design 5): the
+    /// outbound may drop whatever it keeps that is tied to the old one. What
+    /// is in flight finishes on what it has. Most outbounds keep nothing of
+    /// the sort and do nothing.
+    fn network_changed(&self) {}
     /// Test support: how many idle connections the outbound keeps for
     /// reuse. `None`: it keeps none.
     #[cfg(any(test, feature = "testing"))]

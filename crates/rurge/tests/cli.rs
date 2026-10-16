@@ -548,10 +548,11 @@ fn check_knows_the_automatic_groups() {
         .stdout
         .clone();
     let out = String::from_utf8_lossy(&out);
-    // `subnet` is still a later phase; the four automatic groups are not,
-    // and the testing options are in effect (no W0029)
-    assert_eq!(out.matches("W0008").count(), 1, "{out}");
-    assert!(out.contains("`subnet`"), "{out}");
+    // no kind of group is left that this version does not know — `subnet`,
+    // which was the last, picks by the network now (phase 3 M1) — and the
+    // testing options are in effect (no W0029)
+    assert!(!out.contains("W0008"), "{out}");
+    assert!(!out.contains("`subnet`"), "{out}");
     assert!(!out.contains("`smart`"), "{out}");
     assert!(!out.contains("W0029"), "{out}");
 }

@@ -338,6 +338,11 @@ impl Outbound for WireGuardOutbound {
             Ok(Box::new(TunnelUdp::new(device, self.names.clone())) as BoxedPacketSocket)
         })
     }
+
+    /// The inherent `network_changed`, not this method again.
+    fn network_changed(&self) {
+        WireGuardOutbound::network_changed(self);
+    }
 }
 
 #[cfg(test)]
@@ -1351,6 +1356,23 @@ mod tests {
             .expect("a connection");
         assert_eq!(echo(&mut stream, b"before").await, b"before");
         wg.network_changed();
+        until(|| peer.clients().len() == 2).await;
+        assert_eq!(echo(&mut stream, b"after").await, b"after");
+        assert_eq!(peer.core().handshakes, 2);
+    }
+
+    /// The same, told through the `Outbound` trait: that is how the policy
+    /// registry tells every outbound of a generation (phase 3 M1 design 5).
+    #[tokio::test]
+    async fn a_network_change_told_through_the_outbound_trait_reaches_the_tunnel() {
+        let (peer, wg) = tunnel(PeerOpts::default(), |_| {}).await;
+        let mut stream = wg
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        assert_eq!(echo(&mut stream, b"before").await, b"before");
+        let outbound: &dyn Outbound = &wg;
+        outbound.network_changed();
         until(|| peer.clients().len() == 2).await;
         assert_eq!(echo(&mut stream, b"after").await, b"after");
         assert_eq!(peer.core().handshakes, 2);

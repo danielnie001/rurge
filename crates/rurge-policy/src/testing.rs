@@ -127,6 +127,14 @@ impl Outbound for FakeOutbound {
                 .map_err(OutboundError::from)
         })
     }
+
+    /// Noted in the log the dials are, as `<name> network changed`.
+    fn network_changed(&self) {
+        self.log
+            .lock()
+            .expect("log")
+            .push(format!("{} network changed", self.name));
+    }
 }
 
 /// Every direct connector it hands out is the same `RecordingConnector`, and
