@@ -22,7 +22,7 @@
 
 响应是 `{"<policy_name>": "<value>"}`：`value` 是该策略或组**脱敏后的定义**（不含 `名字 =` 前缀）；内置策略（`DIRECT` `REJECT` 等）的值是它自己的名字。脱敏用的是 `GET /v1/profiles/current` 那套规则里管策略定义的那一半（`docs/api/phase1.md`「脱敏后的配置」一节；整行键与注释的几条在这里用不上），同样是尽力而为，不是"没有秘密会出现"的保证：
 
-- **行内参数**：名单里的 24 个参数（`password` `psk` `base64` `headers` `ws-headers` `ws-path` `shadow-tls-password` `policy-path` `test-url` `args` 等，全表见 `docs/api/phase1.md`）的取值换成 `***`。参数照解析器的读法认（M8c）：整项写在引号里的 `"policy-path=…"` 显示成 `policy-path=***`；读不成 `name=value` 的项再按名字搜索一遍，名字后面跟的是冒号、或隔着一个收尾的引号也认。取值的结尾按解析器自己的规则找第一个顶层逗号——引号可以在值里任何位置打开、括号会分组，所以 `password="p,w"`、`password=ab"c,d"`、`password=a(b,c)d` 都是整个值变成 `***`；`headers=` 与 `ws-headers=` 的值整体变成 `***`（连 header 名也不保留），`ws-path=` 同样。
+- **行内参数**：名单里的 24 个参数（`password` `psk` `base64` `headers` `ws-headers` `ws-path` `shadow-tls-password` `policy-path` `test-url` `args` 等，全表见 `docs/api/phase1.md`）的取值换成 `***`。参数照解析器的各项认（M8c；一行怎样拆成各项之后有订正）：整项写在引号里的 `"policy-path=…"` 解析器读作值，脱敏仍把它显示成 `policy-path=***`；读不成 `name=value` 的项再按名字搜索一遍，名字后面跟的是冒号、或隔着一个收尾的引号也认。取值隐到解析器那一项的末尾为止，或者更远：一行怎样拆成各项之前的读法（引号在值里任何位置打开、括号一律嵌套）会把取值带到哪里，那里以内的后续各项一并隐去（两种读法里较晚的一处，细节见 `docs/api/phase1.md`），所以 `password="p,w"`、`password=ab"c,d"`、`password=a(b,c)d` 都是整个值变成 `***`；`headers=` 与 `ws-headers=` 的值整体变成 `***`（连 header 名也不保留），`ws-path=` 同样。
 - **位置凭据**：类型带服务器与端口的定义（`trojan` `vmess` `ss` `anytls` 等都在内），以及第三个字段是端口号的任何定义，第 4 个字段起凡不是 `name=value` 具名参数的字段换成 `***`；类型后面漏了逗号的定义，拆开之后第三个字段是端口号时同样处理（M8c）。
 - **URL**：任何位置的 URL 里，用户名口令换成 `***`（`https://***@host/…`）；scheme 不是 `http` `https` `h3` `quic` `tls` `tcp` 之一的 URL，从 `://` 之后到下一个空白整段换成 `***`（M8c；scheme 指 `://` 前面紧挨着的那串字母、数字、`+`、`-`、`.` 里从第一个字母起的部分，前面没有这样一串的正则不算）。
 
@@ -161,7 +161,7 @@ trojan、vmess（± WebSocket）、anytls 出站，任何带 Shadow TLS 的出�
 
 `lineHash` 是 `SHA-256("<名字> = <脱敏后的定义>")` 的前 16 个十六进制字符；内置策略（没有自己的定义行）对**它自己的名字**取哈希。它只用来**识别**一条定义（同一份配置里两次请求看到同样的哈希，就是同一条定义），不是这条定义原文的指纹：
 
-- 哈希对象是脱敏之后的文本，不是配置文件里的原始行。**只改动凭据（密码、`base64`、`psk`、`headers=`、`ws-headers=`、`ws-path=`、`shadow-tls-password=`、`test-url=`、`args=`（`external`，M4c 起）等被脱敏的字段）不会改变 `lineHash`**（含 `password="p,w"`、`password=ab"c,d"`、`password=a(b,c)d` 这些带引号或带括号的值：取值按解析器的顶层逗号规则整体被抹掉，不会有尾巴漏进哈希）——因为脱敏后两行文本相同——这是有意的：`lineHash` 经这个公开的、无需鉴权之外任何权限的端点暴露，如果它是对原始定义取哈希，持有 API key 的人就能对着猜测的凭据反复计算哈希、离线核对是否猜中，等于把凭据的验证能力带出了进程。任何由凭据派生的东西都不允许离开 rurge 进程（项目的硬性约束：凭据不进日志、错误、API 输出与 `Debug`），`lineHash` 因此必须建立在脱敏后的文本上。
+- 哈希对象是脱敏之后的文本，不是配置文件里的原始行。**只改动凭据（密码、`base64`、`psk`、`headers=`、`ws-headers=`、`ws-path=`、`shadow-tls-password=`、`test-url=`、`args=`（`external`，M4c 起）等被脱敏的字段）不会改变 `lineHash`**（含 `password="p,w"`、`password=ab"c,d"`、`password=a(b,c)d` 这些带引号或带括号的值：取值整体被抹掉（隐到解析器那一项的末尾，或旧读法会把取值带到的地方，取较晚的一处），不会有尾巴漏进哈希）——因为脱敏后两行文本相同——这是有意的：`lineHash` 经这个公开的、无需鉴权之外任何权限的端点暴露，如果它是对原始定义取哈希，持有 API key 的人就能对着猜测的凭据反复计算哈希、离线核对是否猜中，等于把凭据的验证能力带出了进程。任何由凭据派生的东西都不允许离开 rurge 进程（项目的硬性约束：凭据不进日志、错误、API 输出与 `Debug`），`lineHash` 因此必须建立在脱敏后的文本上。
 - 名字参与哈希且在一份配置里唯一，所以两个不同成员不会撞哈希；端口、服务器地址、TLS 参数等任何非凭据字段的改动都会改变 `lineHash`。
 - **M8c 让它变过一次**：哈希建立在脱敏后的文本上，而 M8c 改了脱敏（见上面 `GET /v1/policies/detail` 一节）。脱敏后的定义因此显示得不一样的那些策略与组——例如组行上带旧参数 `url=` 的、定义里有带用户名口令的 URL 的、有 scheme 不是那六种的 URL 的——`lineHash` 跟着变了一次，其余的没有变。存着旧值的客户端会看到它变这一次，此后照旧稳定。
 
