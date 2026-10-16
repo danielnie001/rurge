@@ -153,6 +153,12 @@ pub fn spawn<C: Send + 'static>(
 /// as a network that does not settle is told of once a second and one that
 /// does is told of when it has. A network that is back to what was told last
 /// by then is no change.
+///
+/// A read that knows nothing of the network (no interface the traffic leaves
+/// by, no Wi-Fi link) is not a change either: the machine has lost its network
+/// (it woke up and has not joined one yet, the cable is out), which is not
+/// being on another. The network that was told last stands, and when one is
+/// read again it is compared with that.
 async fn follow<C, A, F>(
     hints: Arc<Notify>,
     mut again: A,
@@ -165,6 +171,8 @@ async fn follow<C, A, F>(
 {
     // no read is made before this, when one was made lately
     let mut rest: Option<Instant> = None;
+    // said that the network is lost, and not said it is known again since
+    let mut said_lost = false;
     loop {
         wait_for_a_read(&hints, &mut rest).await;
         let seen = again().await;
@@ -172,10 +180,23 @@ async fn follow<C, A, F>(
         let Some(snapshot) = seen else {
             continue;
         };
+        if knows_nothing(&snapshot) {
+            // a daemon that began without a network has none to say it lost
+            if !knows_nothing(&told) && !std::mem::replace(&mut said_lost, true) {
+                tracing::debug!("network unknown; the last known network stands");
+            }
+            continue;
+        }
+        said_lost = false;
         if snapshot != told && !tell(&changes, &wrap, &mut told, snapshot).await {
             return;
         }
     }
+}
+
+/// Whether a read says nothing of where the machine is.
+fn knows_nothing(snapshot: &Snapshot) -> bool {
+    snapshot.primary.is_none() && snapshot.wifi.is_none()
 }
 
 /// Waits until a read of the network is due: a hint has come, and no read was
@@ -458,6 +479,165 @@ mod tests {
         // the next one that works is read as usual
         world.change(Some(on_wifi("one"))).await;
         assert_eq!(world.told(), [told_of("one")]);
+    }
+
+    /// A network that cannot be told at all — no interface the traffic leaves
+    /// by, no Wi-Fi link — is a network that is gone (the machine has woken up
+    /// and not joined one yet, or the cable is out), not another network: the
+    /// last one stands, and nobody is told. When the same network comes back
+    /// it is no change.
+    #[tokio::test(start_paused = true)]
+    async fn a_network_that_is_lost_and_comes_back_is_no_change() {
+        let mut world = World::start(on_wifi("A")).await;
+        world.change(Some(Snapshot::default())).await;
+        pass(Duration::from_secs(5)).await;
+        assert_eq!(world.told(), [], "a network that is gone is not a network");
+        world.change(Some(on_wifi("A"))).await;
+        pass(Duration::from_secs(5)).await;
+        assert_eq!(world.told(), [], "the same network is no change");
+    }
+
+    /// The network that comes back after a loss is compared with the last one
+    /// that was told, and not with the gap: another network is a change, told
+    /// once.
+    #[tokio::test(start_paused = true)]
+    async fn a_network_that_is_lost_is_followed_by_the_one_that_comes_back() {
+        let mut world = World::start(on_wifi("A")).await;
+        world.change(Some(Snapshot::default())).await;
+        pass(Duration::from_secs(5)).await;
+        world.change(Some(on_wifi("B"))).await;
+        pass(Duration::from_secs(5)).await;
+        assert_eq!(world.told(), [told_of("B")]);
+    }
+
+    /// A Wi-Fi link with no route yet (the machine has joined, and the address
+    /// is on its way) and an interface with no Wi-Fi are networks: it takes
+    /// neither to be known.
+    #[tokio::test(start_paused = true)]
+    async fn an_interface_or_a_wifi_link_alone_is_a_network() {
+        let mut world = World::start(on_wifi("A")).await;
+        let mut joined = on_wifi("B");
+        joined.primary = None;
+        world.change(Some(joined.clone())).await;
+        assert_eq!(world.told(), [facts_of(&joined)]);
+
+        pass(Duration::from_secs(2)).await;
+        let mut cable = on_wifi("B");
+        cable.wifi = None;
+        world.change(Some(cable.clone())).await;
+        assert_eq!(world.told(), [facts_of(&cable)]);
+    }
+
+    /// A daemon that began without knowing the network is told the first one
+    /// that is known, as a change like any other; one that is lost after that
+    /// is not.
+    #[tokio::test(start_paused = true)]
+    async fn a_network_that_was_not_known_at_the_start_is_told_when_it_is_known() {
+        let mut world = World::start(Snapshot::default()).await;
+        world.change(Some(Snapshot::default())).await;
+        pass(Duration::from_secs(5)).await;
+        assert_eq!(world.told(), []);
+        world.change(Some(on_wifi("A"))).await;
+        pass(Duration::from_secs(5)).await;
+        assert_eq!(world.told(), [told_of("A")]);
+        world.change(Some(Snapshot::default())).await;
+        pass(Duration::from_secs(5)).await;
+        assert_eq!(world.told(), []);
+    }
+
+    /// What this thread logs while the guard lives, an event to a line. A test
+    /// that reads the log runs on the current-thread runtime
+    /// (`#[tokio::test]`): what the task logs is logged on the thread that
+    /// installed the guard.
+    struct Logged {
+        text: Arc<Mutex<Vec<u8>>>,
+        _installed: tracing::subscriber::DefaultGuard,
+        // With one dispatcher alone, tracing asks only the thread that first
+        // reaches a call site whether it is wanted: a site that another test
+        // reaches first would stay shut on this thread too. With a second
+        // one it asks every dispatcher.
+        _second: tracing::Dispatch,
+    }
+
+    struct Text(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Text {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Logged {
+        fn start() -> Logged {
+            let text = Arc::new(Mutex::new(Vec::new()));
+            let writer = text.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .without_time()
+                .with_target(false)
+                .with_writer(move || Text(writer.clone()))
+                .finish();
+            let installed = tracing::subscriber::set_default(subscriber);
+            let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            Logged {
+                text,
+                _installed: installed,
+                _second: second,
+            }
+        }
+
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8_lossy(&self.text.lock().unwrap())
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    /// That the network is lost is said once for as long as it is, and again
+    /// when it is lost after a network was known in between.
+    #[tokio::test(start_paused = true)]
+    async fn that_the_network_is_lost_is_said_once_per_period() {
+        let log = Logged::start();
+        let said = || {
+            log.lines()
+                .iter()
+                .filter(|line| line.contains("network unknown; the last known network stands"))
+                .count()
+        };
+        let mut world = World::start(on_wifi("A")).await;
+        world.change(Some(Snapshot::default())).await;
+        assert_eq!(said(), 1);
+        // lost still, though the system says something else of it
+        pass(Duration::from_secs(2)).await;
+        let lost = Snapshot {
+            dns: vec![ip("192.0.2.54")],
+            ..Snapshot::default()
+        };
+        world.change(Some(lost)).await;
+        assert_eq!(said(), 1, "once for the time it lasts");
+        // back, and lost once more
+        pass(Duration::from_secs(2)).await;
+        world.change(Some(on_wifi("A"))).await;
+        assert_eq!(said(), 1);
+        pass(Duration::from_secs(2)).await;
+        world.change(Some(Snapshot::default())).await;
+        assert_eq!(said(), 2);
+        assert_eq!(world.told(), []);
+
+        // a daemon that does not know the network has nothing to say it lost
+        let log = Logged::start();
+        let mut world = World::start(Snapshot::default()).await;
+        world.change(Some(Snapshot::default())).await;
+        pass(Duration::from_secs(5)).await;
+        assert_eq!(world.told(), []);
+        assert_eq!(log.lines(), Vec::<String>::new());
     }
 
     /// A read of the network is a program or two, and the platform may say it

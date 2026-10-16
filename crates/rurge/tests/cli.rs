@@ -7611,6 +7611,66 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             assert!(!system_proxy_is_on(api));
         }
 
+        /// A machine that loses its network (it has woken up and not joined
+        /// one, the cable is out) is not on another: the network it had
+        /// stands. Here that network pauses the takeover: the system proxy
+        /// stays the user's, the group stays on the member of that network,
+        /// and the same network back is no change.
+        #[test]
+        fn a_network_that_is_lost_is_not_a_new_network() {
+            let world = World::on(&wifi("Office"));
+            let conf = world.profile_logging(
+                "info",
+                "",
+                "[Proxy]\nAtOffice = http, 127.0.0.1, 1\nElsewhere = http, 127.0.0.1, 2\n\
+                 [Proxy Group]\nNet = subnet, SSID:Office = AtOffice, default = Elsewhere\n\
+                 [Rule]\nFINAL,Net\n[SSID Setting]\nSSID:Office suspend=true\n",
+            );
+            let file = with_a_system_proxy(&world);
+            let daemon = spawn_command(world.run(&conf, &["--system-proxy"]));
+            let api = api_port(&daemon);
+            wait_for_log(&daemon, "takeover paused on this network");
+            assert_eq!(chosen(api, "Net"), "AtOffice");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+
+            // the network is gone: nothing at all is known of it
+            world.move_to(&json!({}));
+            let said = wait_for_log(&daemon, "network unknown; the last known network stands");
+            let acted = |lines: &[String]| {
+                lines
+                    .iter()
+                    .any(|line| line.contains("network changed") || line.contains("takeover"))
+            };
+            assert!(!acted(&said), "{said:#?}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+            assert!(!system_proxy_is_on(api));
+            assert_eq!(chosen(api, "Net"), "AtOffice", "the group left the network");
+
+            // The same network is back, and nothing happens. What is waited
+            // for is the daemon not doing anything: it looks at the file ten
+            // times a second and reads the network once a second at most, so
+            // the wait leaves a margin of a second and a half; a daemon that
+            // is slower than that is not seen to be wrong, and is not wrongly
+            // failed either.
+            world.move_to(&wifi("Office"));
+            std::thread::sleep(Duration::from_millis(2500));
+            let said: Vec<String> = daemon.lines.try_iter().collect();
+            assert!(!acted(&said), "{said:#?}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), ORIGINAL_PROXY);
+            assert!(!system_proxy_is_on(api));
+
+            // another network is a change, and ends the pause
+            world.move_to(&wifi("Home"));
+            let said = wait_for_log(&daemon, "takeover resumed");
+            let changes = said
+                .iter()
+                .filter(|line| line.contains("network changed"))
+                .count();
+            assert_eq!(changes, 1, "{said:#?}");
+            assert_eq!(chosen(api, "Net"), "Elsewhere");
+            assert!(system_proxy_is_on(api));
+        }
+
         /// A `RURGE_NETWORK_BACKEND` rurge does not know never becomes the
         /// machine: falling back to it would let a typo in a test read the
         /// real network. The commands that read the network once refuse it
