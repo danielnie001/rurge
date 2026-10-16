@@ -388,7 +388,7 @@ pub struct StackOptions { /* 原有的 */, pub dns_connector: Option<DnsConnecto
 
 | # | 事项 | 去向 |
 | --- | --- | --- |
-| 1 | 一行怎样拆分（引号只在一个值的开头开启引用；没有配对的引号与括号是普通字符）：解析器与脱敏一起改 | 它自己的设计，排在阶段 3 的设计之前（设计第 6 节） |
+| 1 | 一行怎样拆分（引号只在一个值的开头开启引用；没有配对的引号与括号是普通字符）：解析器与脱敏一起改 | 它自己的设计，排在阶段 3 的设计之前（设计第 6 节）；做掉：一行怎样拆成各项（`docs/superpowers/plans/2026-10-14-line-splitting-plan.md`） |
 | 2 | 组的中继自己也在成员里时派生出 `R (via R)`：读代码得出，没有用例，这样的成员拨号时怎样没有试过 | 有用户报告再说；清单登记 |
 | 3 | 没写 `default` 的 `subnet` 组：加载时不报，运行时按空组告警并兜底 | 阶段 3（那时这个组才真的求值） |
 | 4 | `GET /v1/profiles/current` 的 JSON 形状（MB-D21） | 阶段 6 |
@@ -396,7 +396,7 @@ pub struct StackOptions { /* 原有的 */, pub dns_connector: Option<DnsConnecto
 | 6 | `CORE_VERSION` 的新编码（MB-D22） | 项目所有者 |
 | 7 | 阶段 3 ～ 7 的行上手册多说的细节这一遍没有收全 | 各阶段的设计开始时，把它那几节对应的手册页对着清单重读一遍 |
 | 8 | 发行说明里 2026-10-13 之后的测试版条目（自适应的 `block-quic`、`GET /v1/policies?include_external=true`、跨多个包的 QUIC 主机名识别、QUIC v2 / draft-29）：手册还没有写到 | 下一次重对从这里开始 |
-| 9 | 旧的 `custom` 行位置上的口令带 `=` 时读不出口令（`E0018`），未知参数的告警会点出 `=` 之前那一段；同 `http` 行的位置凭据 | 随第 1 行的设计 |
+| 9 | 旧的 `custom` 行位置上的口令带 `=` 时读不出口令（`E0018`），未知参数的告警会点出 `=` 之前那一段；同 `http` 行的位置凭据 | 随第 1 行的设计；做掉：一行怎样拆成各项（`docs/superpowers/plans/2026-10-14-line-splitting-plan.md`） |
 | 10 | 指向同一个节的 `wireguard` 策略 `tos` 不同时，隧道的标记是起它的那个策略的；重载只改 `tos` 时旧隧道还被拿着就不换 | 有用户报告再说；清单登记 |
 | 11 | `tos` 在线上的 DSCP 位、真实的旧 `custom` 配置、真实的 GeoLite2 库之下的 `UNKNOWN`：都没有在真实环境里看过 | 手工验收 |
 | 12 | 新的用例只在一台 Windows 11 x86-64 的开发机上跑过；`an_ipv6_literal_is_reached_directly_with_ipv6_off` 在没有 IPv6 回环的机器上跳过（CI 的三种机器有没有，没有看过） | 第一次 CI 运行时核对 |
