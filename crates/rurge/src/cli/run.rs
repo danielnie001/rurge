@@ -1231,10 +1231,11 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 return Ok(ExitCode::from(2));
             }
         };
-    // Where the network is read from is an environment matter, and ends a
-    // start that cannot tell as an option does: a typo must not make a start
-    // read the machine's network.
-    let network_backend = match network::backend() {
+    // Where the network is read from is a matter of the option and the
+    // variable behind it, and ends a start that cannot tell as an option that
+    // cannot be read does: a typo must not make a start read the machine's
+    // network.
+    let network_backend = match network::backend(args.runtime.network_backend.as_deref()) {
         Ok(backend) => backend,
         Err(e) => {
             eprintln!("error: {e}");

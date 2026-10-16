@@ -150,7 +150,11 @@ pub fn backend_from_env() -> Result<Backend, String> {
     }
 }
 
-fn parse_backend(value: &str) -> Result<Backend, String> {
+/// The backend a value names: `file:<path>`, and nothing else. The value is
+/// the one `RURGE_NETWORK_BACKEND` holds, or the one the executable is given by
+/// an option that is backed by the variable: an unknown one is refused in the
+/// same words either way.
+pub fn parse_backend(value: &str) -> Result<Backend, String> {
     match value.strip_prefix("file:") {
         Some(path) if !path.is_empty() => Ok(Backend::File(PathBuf::from(path))),
         _ => Err(format!(

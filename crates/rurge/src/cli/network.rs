@@ -20,10 +20,19 @@ use tokio_util::task::AbortOnDropHandle;
 /// that come meanwhile are one, told when the time is over.
 const WINDOW: Duration = Duration::from_secs(1);
 
-/// The backend `RURGE_NETWORK_BACKEND` asks for: the machine when it is not
-/// set. A value rurge does not know is an error, never the machine.
-pub fn backend() -> anyhow::Result<Backend> {
-    netenv::backend_from_env().map_err(anyhow::Error::msg)
+/// The backend the command asks for: the machine when nothing says otherwise.
+/// `option` is `--network-backend`, which `RURGE_NETWORK_BACKEND` stands
+/// behind: on the command line it takes the place of the variable. A value
+/// rurge does not know is an error, never the machine, and it is refused in the
+/// same words whichever way it came.
+pub fn backend(option: Option<&str>) -> anyhow::Result<Backend> {
+    match option {
+        Some(value) => netenv::parse_backend(value),
+        // Neither, as far as the option's `env` can tell. The variable is asked
+        // for all the same: a start that lost it would read the machine.
+        None => netenv::backend_from_env(),
+    }
+    .map_err(anyhow::Error::msg)
 }
 
 /// What the engine looks at, out of what the platform says. The DNS servers
@@ -506,6 +515,23 @@ mod tests {
                 "the thread is still there"
             );
             std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The option names a file, and a value that names nothing is refused in
+    /// the words of the variable, whichever way it came.
+    #[test]
+    fn the_option_names_a_file_and_an_unknown_value_is_refused_as_the_variables_is() {
+        assert_eq!(
+            backend(Some("file:/tmp/n.json")).unwrap(),
+            Backend::File("/tmp/n.json".into())
+        );
+        for value in ["bogus", "", "file", "file:", "FILE:/x.json", "platform"] {
+            assert_eq!(
+                backend(Some(value)).unwrap_err().to_string(),
+                format!("unknown RURGE_NETWORK_BACKEND value `{value}` (expected file:<path>)"),
+                "{value:?}"
+            );
         }
     }
 

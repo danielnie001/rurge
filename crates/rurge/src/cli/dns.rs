@@ -184,7 +184,7 @@ fn warnings(config_diags: &Diagnostics, stack_diags: &Diagnostics) -> Vec<serde_
 
 fn run_lookup(args: LookupArgs) -> anyhow::Result<ExitCode> {
     // before anything is read or made, as for `rule match`
-    let backend = network::backend()?;
+    let backend = network::backend(args.common.runtime.network_backend.as_deref())?;
     let Some((cfg, config_diags)) = load_profile(&args.common)? else {
         return Ok(ExitCode::from(2));
     };
@@ -324,7 +324,7 @@ fn lookup_json(
 }
 
 fn run_cache(args: CacheArgs) -> anyhow::Result<ExitCode> {
-    let backend = network::backend()?;
+    let backend = network::backend(args.common.runtime.network_backend.as_deref())?;
     let Some((cfg, config_diags)) = load_profile(&args.common)? else {
         return Ok(ExitCode::from(2));
     };

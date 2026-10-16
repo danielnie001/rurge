@@ -198,8 +198,8 @@ pub fn run(args: RuleArgs) -> anyhow::Result<ExitCode> {
 
 fn run_match(args: MatchArgs) -> anyhow::Result<ExitCode> {
     // before anything is read or made: the network is read from where the
-    // environment says, and a value that says nothing is an error
-    let network_backend = network::backend()?;
+    // option or the variable says, and a value that says nothing is an error
+    let network_backend = network::backend(args.runtime.network_backend.as_deref())?;
     let platform = args.platform.unwrap_or_else(Platform::current);
     let opts = LoadOptions {
         environment: super::environment(platform, capabilities::CORE_VERSION),

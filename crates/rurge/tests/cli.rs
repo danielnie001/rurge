@@ -1613,6 +1613,30 @@ FINAL,DIRECT,dns-failed
         assert_eq!(policy, "P");
         assert_eq!(matched["index"], 0);
         assert_eq!(policy_on(Some("Cafe")).0, "DIRECT");
+
+        // named by the option, which takes the place of the variable: the file
+        // the variable names still says Cafe
+        let home = dir.path().join("home.json");
+        std::fs::write(
+            &home,
+            serde_json::json!({
+                "primary": { "interface": "wlan0", "kind": "wifi" },
+                "wifi": { "interface": "wlan0", "ssid": "Home" },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let out = rule_match(dir.path(), &["example.com", "--json"])
+            .args(["--network-backend", &format!("file:{}", home.display())])
+            .env(
+                "RURGE_NETWORK_BACKEND",
+                format!("file:{}", network.display()),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["policy"], "P");
     }
 
     /// A profile that is only the line that names its managed profile is
@@ -2018,6 +2042,20 @@ mod dns {
         );
         assert_eq!(global.query_count("a.test", Qtype::A), 1);
         assert_eq!(home.query_count("a.test", Qtype::A), 1);
+
+        // the same network named by the option, which takes the place of the
+        // variable: the variable is a file that is not there
+        let mut by_option = lookup(false);
+        by_option
+            .arg("--network-backend")
+            .arg(format!("file:{}", network.display()));
+        let v = json_of(&output(by_option).await);
+        assert_eq!(v["addresses"], serde_json::json!(["10.0.0.2"]));
+        assert_eq!(
+            v["upstreams"],
+            serde_json::json!([format!("udp://{}", home.addr())])
+        );
+        assert_eq!(home.query_count("a.test", Qtype::A), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2742,6 +2780,22 @@ mod run {
 
     fn read_json(path: &Path) -> serde_json::Value {
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// Makes `file`, which a daemon is given as its network
+    /// (`file:<path>`), say `network`. It is made beside the one the daemon
+    /// looks at and put in its place: the daemon never finds half of one,
+    /// which is a network that is not known.
+    fn put_network(file: &Path, network: &serde_json::Value) {
+        let beside = file.with_extension("new");
+        std::fs::write(&beside, network.to_string()).unwrap();
+        // a rename onto a file somebody has open is refused now and then
+        let mut tries = 0;
+        while let Err(e) = std::fs::rename(&beside, file) {
+            tries += 1;
+            assert!(tries < 100, "cannot put the network in place: {e}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Polls until `check` passes or 10 s elapse.
@@ -3930,7 +3984,12 @@ loglevel = notify",
     /// stops it on the way out (phase 2 M4 design 7.3, 8.2). The program is
     /// a second rurge: a SOCKS5 proxy on the policy's `local-port`. The outer
     /// rurge is started with a setting of its own in the environment, which
-    /// the program does not get.
+    /// the program does not get: no variable of the `RURGE_` kind reaches an
+    /// external program. So the network of the program, which the variable of
+    /// the constructors would have named, is named on its command line, as a
+    /// file that is not there until the test makes it. That the program reads
+    /// that file and not the machine is seen in its log: it says `network
+    /// changed` when the test makes the file.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_starts_an_external_program_and_stops_it_on_exit() {
         let target = TestServer::spawn().await;
@@ -3941,20 +4000,22 @@ loglevel = notify",
         let inner = dir.path().join("inner.conf");
         std::fs::write(
             &inner,
-            format!("[General]\nsocks5-listen = 127.0.0.1:{inner_port}\nloglevel = warning\n[Rule]\nFINAL,DIRECT\n"),
+            format!("[General]\nsocks5-listen = 127.0.0.1:{inner_port}\nloglevel = notify\n[Rule]\nFINAL,DIRECT\n"),
         )
         .unwrap();
+        let inner_network = dir.path().join("inner-network.json");
         let quoted = |p: &Path| format!("\"{}\"", p.to_string_lossy().replace('\\', "\\\\"));
         let conf = dir.path().join("t.conf");
         std::fs::write(
             &conf,
             format!(
                 "[General]\n{API_GENERAL}\n[Proxy]\n\
-Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-network, args = --data-dir, args = {}, local-port = {inner_port}\n\
+Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-network, args = --data-dir, args = {}, args = --network-backend, args = {}, local-port = {inner_port}\n\
 [Rule]\nFINAL,Inner\n",
                 quoted(Path::new(rurge_process().get_program())),
                 quoted(&inner),
                 quoted(&dir.path().join("inner-data")),
+                quoted(Path::new(&format!("file:{}", inner_network.display()))),
             ),
         )
         .unwrap();
@@ -3983,11 +4044,20 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             ok.starts_with("HTTP/1.1 200") && ok.ends_with("hi from target"),
             "{ok}"
         );
-        let log = std::fs::read_to_string(data.join("external").join("Inner.log")).unwrap();
+        let program_log = data.join("external").join("Inner.log");
+        let log = std::fs::read_to_string(&program_log).unwrap();
         assert!(
             log.contains(&format!("listening on socks5://127.0.0.1:{inner_port}")),
             "{log}"
         );
+        // the network of the program is the file its option names
+        put_network(
+            &inner_network,
+            &serde_json::json!({ "primary": { "interface": "eth0", "kind": "wired" } }),
+        );
+        wait_until("the program to tell of its network", || {
+            std::fs::read_to_string(&program_log).is_ok_and(|log| log.contains("network changed"))
+        });
         assert_eq!(api_call(api, "POST", "/v1/stop", "k", Some("{}")).0, 200);
         assert_eq!(wait_for_exit(&mut daemon, 10), Some(0), "stop exits 0");
         // the program is gone with rurge: its port no longer answers
@@ -7176,20 +7246,9 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
                 cmd
             }
 
-            /// The machine is on `network` from now on. The file is made
-            /// beside the one the daemon looks at and put in its place: it
-            /// never finds half of one, which is a network that is not known.
+            /// The machine is on `network` from now on.
             fn move_to(&self, network: &Value) {
-                let file = self.network();
-                let beside = file.with_extension("new");
-                std::fs::write(&beside, network.to_string()).unwrap();
-                // a rename onto a file somebody has open is refused now and then
-                let mut tries = 0;
-                while let Err(e) = std::fs::rename(&beside, &file) {
-                    tries += 1;
-                    assert!(tries < 100, "cannot put the network in place: {e}");
-                    std::thread::sleep(Duration::from_millis(20));
-                }
+                put_network(&self.network(), network);
             }
         }
 
@@ -7587,6 +7646,122 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
                 assert!(
                     stderr.contains("RURGE_NETWORK_BACKEND") && stderr.contains("file:<path>"),
                     "{command:?}: {stderr}"
+                );
+            }
+        }
+
+        /// The backend can be named by an option as well as by the variable
+        /// (the option is hidden; the variable is what it is backed by), and
+        /// a value that names nothing is refused in the same way, the same
+        /// sentence and the same exit code, by the three commands that read
+        /// the network. The option takes the place of the variable: the
+        /// one the constructors set names a file, and does not save it.
+        #[test]
+        fn an_unknown_network_backend_named_by_the_option_is_refused_like_the_variable() {
+            let dir = tempfile::tempdir().unwrap();
+            let conf = write_conf(dir.path(), API_GENERAL);
+            let data = dir.path().join("data");
+            let said = "error: unknown RURGE_NETWORK_BACKEND value `bogus` (expected file:<path>)";
+            // the line that says why a command ended, and no other
+            let sentence = |stderr: &str| {
+                stderr
+                    .lines()
+                    .find(|line| line.starts_with("error: "))
+                    .unwrap_or("(no line says error)")
+                    .to_string()
+            };
+
+            let mut by_variable = rurge_run(&conf, &data);
+            by_variable.env("RURGE_NETWORK_BACKEND", "bogus");
+            let mut by_option = rurge_run(&conf, &data);
+            by_option.args(["--network-backend", "bogus"]);
+            for (how, cmd) in [("the variable", by_variable), ("the option", by_option)] {
+                let (code, stderr) = give_up(cmd);
+                assert_eq!(code, Some(2), "run, {how}: {stderr}");
+                assert_eq!(sentence(&stderr), said, "run, {how}: {stderr}");
+            }
+
+            for command in [["rule", "match"], ["dns", "lookup"]] {
+                for by_option in [false, true] {
+                    let mut cmd = rurge_command();
+                    cmd.args(command)
+                        .arg("-c")
+                        .arg(&conf)
+                        .arg("example.com")
+                        .arg("--no-network")
+                        .arg("--data-dir")
+                        .arg(&data);
+                    if by_option {
+                        cmd.args(["--network-backend", "bogus"]);
+                    } else {
+                        cmd.env("RURGE_NETWORK_BACKEND", "bogus");
+                    }
+                    let out = cmd.output().unwrap();
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let how = if by_option {
+                        "the option"
+                    } else {
+                        "the variable"
+                    };
+                    assert_eq!(out.status.code(), Some(2), "{command:?}, {how}: {stderr}");
+                    assert_eq!(sentence(&stderr), said, "{command:?}, {how}: {stderr}");
+                }
+            }
+        }
+
+        /// The option names the file the daemon reads the network from, at the
+        /// start and for what follows, whatever the variable says. This is how
+        /// a `rurge` that an `external` policy starts is given its network: an
+        /// external program is started without any variable of the `RURGE_`
+        /// kind.
+        #[test]
+        fn the_network_backend_option_names_the_file_and_beats_the_variable() {
+            // the variable's file says Home, the option's says Cafe
+            let world = World::on(&wifi("Home"));
+            let by_option = world.dir.path().join("by-option.json");
+            put_network(&by_option, &wifi("Cafe"));
+            let conf = world.profile(
+                "",
+                "[Proxy]\nAtHome = http, 127.0.0.1, 1\nAtCafe = http, 127.0.0.1, 2\nElsewhere = http, 127.0.0.1, 3\n\
+                 [Proxy Group]\nNet = subnet, SSID:Home = AtHome, SSID:Cafe = AtCafe, default = Elsewhere\n\
+                 [Rule]\nFINAL,Net\n",
+            );
+            let option = format!("file:{}", by_option.display());
+            let daemon = spawn_command(world.run(&conf, &["--network-backend", &option]));
+            let api = api_port(&daemon);
+            // the first generation is built on the network of the option ...
+            assert_eq!(chosen(api, "Net"), "AtCafe");
+            // ... and that file is the one that is followed: the variable's
+            // file says Home, which the cable below is not
+            put_network(&by_option, &cable());
+            wait_until("the group to follow the file of the option", || {
+                chosen(api, "Net") == "Elsewhere"
+            });
+        }
+
+        /// The option is for tests: no `--help` shows it, nor the variable it
+        /// is backed by.
+        #[test]
+        fn the_network_backend_option_is_not_shown_in_the_help() {
+            let commands: [&[&str]; 4] = [
+                &["run"],
+                &["rule", "match"],
+                &["dns", "lookup"],
+                &["dns", "cache"],
+            ];
+            for command in commands {
+                let out = rurge_command()
+                    .args(command)
+                    .arg("--help")
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "{command:?}");
+                let help = String::from_utf8_lossy(&out.stdout);
+                // the options beside it are shown
+                assert!(help.contains("--data-dir"), "{command:?}: {help}");
+                assert!(
+                    !help.contains("network-backend") && !help.contains("NETWORK_BACKEND"),
+                    "{command:?}: {help}"
                 );
             }
         }

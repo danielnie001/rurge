@@ -45,6 +45,20 @@ pub struct RuntimeArgs {
     /// DNS cache capacity in entries (default 2000)
     #[arg(long, env = "RURGE_DNS_CACHE_SIZE", value_name = "N")]
     pub dns_cache_size: Option<usize>,
+    /// Where the network is read from, `file:<path>` (a JSON file instead of
+    /// the machine): for automated tests, hence not in `--help`. It is
+    /// `RURGE_NETWORK_BACKEND` as an option, for a `rurge` that an `external`
+    /// policy starts, which gets no variable of the `RURGE_` kind: the
+    /// policy's arguments can carry it. On the command line it takes the place
+    /// of the variable, and a value that names nothing is refused as the
+    /// variable's is (`network::backend`).
+    #[arg(
+        long,
+        env = "RURGE_NETWORK_BACKEND",
+        hide = true,
+        value_name = "BACKEND"
+    )]
+    pub network_backend: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -297,6 +311,7 @@ mod tests {
             geoip_asn_url: asn.map(|u| Url::parse(u).unwrap()),
             no_network: true,
             dns_cache_size: None,
+            network_backend: None,
         };
         let defaults = GeoUrls::default();
         let nobody = args(None, None).resolve(&load("")).unwrap().geo_urls;
