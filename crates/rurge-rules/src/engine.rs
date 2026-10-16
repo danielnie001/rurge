@@ -9,7 +9,7 @@ use crate::registry::SetRegistry;
 use rurge_config::policy::Builtin;
 use rurge_config::rule::{PolicyRef, RuleParams};
 use rurge_config::session::SessionInfo;
-use rurge_config::{Config, HostName, Span};
+use rurge_config::{Config, HostName, NetworkCell, NetworkFacts, Span};
 use rurge_net::BoxFuture;
 use std::fmt;
 use std::net::IpAddr;
@@ -167,6 +167,12 @@ pub struct RuleEngine {
     rules: Vec<CompiledRule>,
     final_pos: usize,
     geo: Arc<dyn GeoLookup>,
+    /// The network now, which `SUBNET` rules look at (phase 3 M1 design 8).
+    /// Unknown until `with_network` hands the engine a cell somebody keeps
+    /// up to date.
+    network: Arc<NetworkCell>,
+    /// `[General] subnet-exp-wifi-always-match` of the profile built from.
+    wifi_always_match: bool,
     pre: PreMatchingSet,
     /// Keep-alive only (design §6.5): a `SetRegistry`'s hot-reload tasks hold
     /// only a `Weak` back-reference, so if nothing else keeps the `Arc` the
@@ -230,9 +236,20 @@ impl RuleEngine {
             rules,
             final_pos,
             geo,
+            network: Arc::new(NetworkCell::new(NetworkFacts::default())),
+            wifi_always_match: cfg.general.subnet_exp_wifi_always_match,
             pre,
             registry: None,
         })
+    }
+
+    /// Makes the `SUBNET` rules look at `network` instead of an unknown one.
+    /// The engine reads the cell once per evaluation, so a network stored in
+    /// it applies from the next session on; the cell outlives the engine, and
+    /// every generation of a running profile is given the same one.
+    pub fn with_network(mut self, network: Arc<NetworkCell>) -> RuleEngine {
+        self.network = network;
+        self
     }
 
     /// Like `build`, but keeps `registry` alive for as long as the engine is
@@ -304,7 +321,10 @@ impl RuleEngine {
             OutboundMode::Proxy(p) => return Decision::bypass(p, Reason::OutboundModeProxy),
             OutboundMode::Rule => {}
         }
-        let mut ctx = EvalCtx::new(self.geo.as_ref());
+        // one snapshot for the whole evaluation: a lookup in flight when the
+        // network changes finishes on the network it started on
+        let facts = self.network.load();
+        let mut ctx = EvalCtx::with_network(self.geo.as_ref(), &facts, self.wifi_always_match);
         let mut notes: Vec<String> = Vec::new();
         if let Some(decision) = self.pre_pass(s, &mut ctx, &mut notes, trace.as_deref_mut()) {
             return decision;
@@ -487,7 +507,8 @@ impl RuleEngine {
     }
 
     fn pre_match(&self, s: SessionInfo) -> Option<PreMatch> {
-        let mut ctx = EvalCtx::new(self.geo.as_ref());
+        let facts = self.network.load();
+        let mut ctx = EvalCtx::with_network(self.geo.as_ref(), &facts, self.wifi_always_match);
         for &pos in self.pre.positions() {
             let rule = &self.rules[pos];
             let matched = Self::pre_matches(rule, &s, &mut ctx);
@@ -513,6 +534,7 @@ mod tests {
     use rurge_config::Reach;
     use rurge_config::config::{LoadOptions, from_text};
     use rurge_config::rule::{ParseCtx, ResourceRef};
+    use rurge_config::{NetKind, Primary, WifiLink};
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
@@ -950,13 +972,13 @@ DOMAIN,local.example,P\nFINAL,P\n",
     #[tokio::test]
     async fn unsupported_kinds_note_once_and_count_hits() {
         let e = engine(
-            "[Proxy]\nP = direct\n[Rule]\nSUBNET,SSID:Home,P\nDOMAIN-SUFFIX,apple.com,DIRECT\nFINAL,P\n",
+            "[Proxy]\nP = direct\n[Rule]\nDEVICE-NAME,Kids-iPad,P\nDOMAIN-SUFFIX,apple.com,DIRECT\nFINAL,P\n",
         );
         let d = e
             .evaluate(&session("www.apple.com"), OutboundMode::Rule, &Panicking)
             .await;
         assert_eq!(d.notes.len(), 1);
-        assert!(d.notes[0].contains("SUBNET"));
+        assert!(d.notes[0].contains("DEVICE-NAME"));
         let d = e
             .evaluate(&session("www.apple.com"), OutboundMode::Rule, &Panicking)
             .await;
@@ -1177,33 +1199,257 @@ RULE-SET,not-there.list,REJECT,pre-matching\nFINAL,DIRECT\n",
         assert_eq!(steps(&trace).last(), Some(&(4, "match")));
     }
 
-    /// `SUBNET` has no runtime support, so its rule notes it — once, whichever
-    /// pass meets the rule first, and the note reaches the decision.
+    /// A rule without runtime support notes it — once, whichever pass meets
+    /// the rule first, and the note reaches the decision. No rule type that
+    /// may be flagged `pre-matching` is without runtime support any more, so
+    /// the test makes one: the first rule's matcher is swapped for an
+    /// unsupported kind.
     #[tokio::test]
     async fn a_note_of_the_pre_pass_is_surfaced_once_and_reaches_the_decision() {
         const NOTING: &str = "[Proxy]\nP = direct\n[Rule]\n\
-SUBNET,SSID:Home,REJECT,pre-matching\nDOMAIN,ads.example,REJECT,pre-matching\n\
+DOMAIN,never.example,REJECT,pre-matching\nDOMAIN,ads.example,REJECT,pre-matching\n\
 DOMAIN-SUFFIX,apple.com,DIRECT\nFINAL,P\n";
+        let noting = || {
+            let mut e = engine(NOTING);
+            e.rules[0].matcher = Matcher::Unsupported("DEVICE-NAME");
+            e
+        };
         // a hit of the pre-pass, after the rule that noted
-        let e = engine(NOTING);
+        let e = noting();
         let d = e
             .evaluate(&session("ads.example"), OutboundMode::Rule, &Panicking)
             .await;
         assert_eq!(d.reason, Reason::PreMatching);
         assert_eq!(d.notes.len(), 1, "{:?}", d.notes);
-        assert!(d.notes[0].contains("SUBNET"));
+        assert!(d.notes[0].contains("DEVICE-NAME"));
         let d = e
             .evaluate(&session("www.apple.com"), OutboundMode::Rule, &Panicking)
             .await;
         assert_eq!(d.reason, Reason::Rule);
         assert!(d.notes.is_empty(), "{:?}", d.notes);
         // and a pass without a hit: the note is not said again at the rule's own place
-        let e = engine(NOTING);
+        let e = noting();
         let d = e
             .evaluate(&session("www.apple.com"), OutboundMode::Rule, &Panicking)
             .await;
         assert_eq!(d.notes.len(), 1, "{:?}", d.notes);
         assert_eq!(e.rules()[2].hits(), 1);
+    }
+
+    /// The network of a test: the primary interface (its name, its kind and
+    /// its gateways) and the Wi-Fi link (its interface, SSID and BSSID).
+    fn network(
+        primary: Option<(&str, NetKind, &[&str])>,
+        wifi: Option<(&str, Option<&str>, Option<&str>)>,
+    ) -> NetworkFacts {
+        NetworkFacts {
+            primary: primary.map(|(interface, kind, routers)| Primary {
+                interface: interface.to_string(),
+                kind,
+                routers: routers.iter().map(|r| r.parse().unwrap()).collect(),
+            }),
+            wifi: wifi.map(|(interface, ssid, bssid)| WifiLink {
+                interface: interface.to_string(),
+                ssid: ssid.map(str::to_string),
+                bssid: bssid.map(str::to_string),
+            }),
+        }
+    }
+
+    /// At home on Wi-Fi: the Wi-Fi link is the way out.
+    fn at_home() -> NetworkFacts {
+        network(
+            Some(("wlan0", NetKind::Wifi, &["192.168.1.1"])),
+            Some(("wlan0", Some("Home"), Some("aa:bb:cc:dd:ee:ff"))),
+        )
+    }
+
+    /// At a desk: the way out is the cable, and the Wi-Fi link is up as well.
+    fn at_a_desk_with_wifi_up() -> NetworkFacts {
+        network(
+            Some(("eth0", NetKind::Wired, &["10.0.0.1"])),
+            Some(("wlan0", Some("Home"), Some("aa:bb:cc:dd:ee:ff"))),
+        )
+    }
+
+    /// The rule a session to `www.example.com` ends at, and how.
+    async fn decided(e: &RuleEngine) -> (Reason, Option<usize>) {
+        let d = e
+            .evaluate(&session("www.example.com"), OutboundMode::Rule, &Panicking)
+            .await;
+        (d.reason, d.matched)
+    }
+
+    /// An engine nobody gave a network to knows none: its `SUBNET` rules have
+    /// nothing to look at, and they are no unsupported kind that says so.
+    #[tokio::test]
+    async fn an_engine_that_was_never_told_the_network_knows_none() {
+        let e = engine(
+            "[Proxy]\nP = direct\n[Rule]\nSUBNET,TYPE:WIFI,P\nSUBNET,TYPE:WIRED,P\nFINAL,DIRECT\n",
+        );
+        let d = e
+            .evaluate(&session("www.example.com"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::Final, Some(2)));
+        assert!(d.notes.is_empty(), "{:?}", d.notes);
+        assert_eq!(e.rules()[0].hits(), 0);
+    }
+
+    /// The rules look at what the engine's cell holds when a session is
+    /// evaluated, not at what it held when the engine was built: the same
+    /// engine, another network, another rule.
+    #[tokio::test]
+    async fn subnet_rules_follow_the_network() {
+        let cell = Arc::new(NetworkCell::new(NetworkFacts::default()));
+        let e = engine(
+            "[Proxy]\nA = direct\nB = direct\nC = direct\n[Rule]\n\
+SUBNET,TYPE:WIFI,A\nSUBNET,ROUTER:192.168.1.1,B\nSUBNET,SSID:Home,C\nFINAL,DIRECT\n",
+        )
+        .with_network(cell.clone());
+        let picked = || async {
+            let d = e
+                .evaluate(&session("www.example.com"), OutboundMode::Rule, &Panicking)
+                .await;
+            (d.matched, d.policy().map(named).unwrap())
+        };
+        let direct = (Some(3), "DIRECT".to_string());
+
+        // nothing is known yet
+        assert_eq!(picked().await, direct);
+        // on Wi-Fi at home: the first rule
+        cell.store(at_home());
+        assert_eq!(picked().await, (Some(0), "A".to_string()));
+        // on a cable behind the same gateway, no Wi-Fi link: the second
+        cell.store(network(
+            Some(("eth0", NetKind::Wired, &["192.168.1.1"])),
+            None,
+        ));
+        assert_eq!(picked().await, (Some(1), "B".to_string()));
+        // on another cable with the Wi-Fi link up: the SSID, which is the third
+        cell.store(at_a_desk_with_wifi_up());
+        assert_eq!(picked().await, (Some(2), "C".to_string()));
+        // the platform would not say the SSID: that rule does not match, and
+        // nothing complains
+        cell.store(network(
+            Some(("eth0", NetKind::Wired, &["10.0.0.1"])),
+            Some(("wlan0", None, None)),
+        ));
+        assert_eq!(picked().await, direct);
+        // and off every network again
+        cell.store(at_home());
+        assert_eq!(picked().await, (Some(0), "A".to_string()));
+        cell.store(NetworkFacts::default());
+        assert_eq!(picked().await, direct);
+        // the hits were counted where they happened
+        let hits: Vec<u64> = e.rules().iter().map(|r| r.hits()).collect();
+        assert_eq!(hits, [2, 1, 1, 3]);
+    }
+
+    /// `subnet-exp-wifi-always-match` is read off the profile the engine is
+    /// built from: with it off, a Wi-Fi link that is not the way out does not
+    /// count for the SSID.
+    #[tokio::test]
+    async fn subnet_exp_wifi_always_match_reaches_the_rules() {
+        const RULES: &str = "[Proxy]\nP = direct\n[Rule]\nSUBNET,SSID:Home,P\nFINAL,DIRECT\n";
+        let cell = Arc::new(NetworkCell::new(at_a_desk_with_wifi_up()));
+        let always = engine(RULES).with_network(cell.clone());
+        let off = engine(&format!(
+            "[General]\nsubnet-exp-wifi-always-match = false\n{RULES}"
+        ))
+        .with_network(cell.clone());
+        // the Wi-Fi link is up, but the way out is the cable
+        assert_eq!(decided(&always).await, (Reason::Rule, Some(0)));
+        assert_eq!(decided(&off).await, (Reason::Final, Some(1)));
+        // on Wi-Fi it is the way out, and both match
+        cell.store(at_home());
+        assert_eq!(decided(&always).await, (Reason::Rule, Some(0)));
+        assert_eq!(decided(&off).await, (Reason::Rule, Some(0)));
+    }
+
+    /// A rule flagged `pre-matching` is checked ahead of the written order,
+    /// and it looks at the network too — in the evaluation of a session and in
+    /// the two entries that ask before a name is resolved.
+    #[tokio::test]
+    async fn a_pre_matching_subnet_rule_sees_the_network() {
+        let cell = Arc::new(NetworkCell::new(NetworkFacts::default()));
+        let e = engine(
+            "[Proxy]\nP = direct\n[Rule]\nDOMAIN,ads.example,P\n\
+SUBNET,TYPE:WIFI,REJECT,pre-matching\nFINAL,DIRECT\n",
+        )
+        .with_network(cell.clone());
+        let ads = || async {
+            let d = e
+                .evaluate(&session("ads.example"), OutboundMode::Rule, &Panicking)
+                .await;
+            (d.reason, d.matched, d.policy().map(named).unwrap())
+        };
+        // off Wi-Fi the flagged rule misses and the written order is walked
+        assert_eq!(ads().await, (Reason::Rule, Some(0), "P".to_string()));
+        assert_eq!(e.pre_match_domain("ads.example", 443), None);
+        assert_eq!(e.pre_match_ip("192.0.2.1".parse().unwrap(), 443), None);
+        // on Wi-Fi it decides first
+        cell.store(at_home());
+        assert_eq!(
+            ads().await,
+            (Reason::PreMatching, Some(1), "REJECT".to_string())
+        );
+        let m = e
+            .pre_match_domain("ads.example", 443)
+            .expect("the pre-match sees the network");
+        assert_eq!((m.rule, m.policy.name()), (1, "REJECT".to_string()));
+        let m = e
+            .pre_match_ip("192.0.2.1".parse().unwrap(), 443)
+            .expect("the pre-match sees the network");
+        assert_eq!(m.rule, 1);
+        // and off it again
+        cell.store(NetworkFacts::default());
+        assert_eq!(ads().await, (Reason::Rule, Some(0), "P".to_string()));
+        assert_eq!(e.pre_match_domain("ads.example", 443), None);
+    }
+
+    /// Answers 192.0.2.1 and, on the way, the machine joins another network.
+    struct Moving {
+        cell: Arc<NetworkCell>,
+        to: NetworkFacts,
+    }
+
+    impl LazyResolver for Moving {
+        fn resolve<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<ResolvedAddrs, ResolveError>> {
+            self.cell.store(self.to.clone());
+            Box::pin(async {
+                Ok(ResolvedAddrs {
+                    v4: vec!["192.0.2.1".parse().unwrap()],
+                    v6: vec![],
+                })
+            })
+        }
+    }
+
+    /// An evaluation takes the network once, when it starts: one that is
+    /// waiting for a lookup when the machine changes networks finishes on the
+    /// network it started on, and the next session starts on the new one.
+    #[tokio::test]
+    async fn an_evaluation_in_flight_keeps_the_network_it_started_on() {
+        let cell = Arc::new(NetworkCell::new(NetworkFacts::default()));
+        let e = engine(
+            "[Proxy]\nP = direct\n[Rule]\nIP-CIDR,10.0.0.0/8,P\nSUBNET,TYPE:WIFI,REJECT\nFINAL,DIRECT\n",
+        )
+        .with_network(cell.clone());
+        let lookup = Moving {
+            cell: cell.clone(),
+            to: at_home(),
+        };
+        let d = e
+            .evaluate(&session("www.example.com"), OutboundMode::Rule, &lookup)
+            .await;
+        // the lookup moved the machine onto Wi-Fi, which this session did not see
+        assert_eq!(*cell.load(), at_home());
+        assert_eq!((d.reason, d.matched), (Reason::Final, Some(2)));
+        // the next one does
+        let d = e
+            .evaluate(&session("www.example.com"), OutboundMode::Rule, &lookup)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::Rule, Some(1)));
     }
 
     /// `X` lists `hit.example`; the logical rules below are written so that

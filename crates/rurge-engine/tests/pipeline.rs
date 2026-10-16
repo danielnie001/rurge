@@ -552,6 +552,38 @@ async fn a_pre_matching_reject_written_last_still_rejects_first() {
     assert_eq!(body, b"hi there");
 }
 
+/// A `SUBNET` rule looks at the network the engine is on: the cell in the
+/// engine's shared objects is the one the rules of every generation read, so
+/// a network stored there changes what the next session meets.
+#[tokio::test]
+async fn a_subnet_rule_follows_the_network_the_engine_is_on() {
+    use rurge_config::{NetKind, NetworkFacts, Primary};
+    let h = harness("", "SUBNET,TYPE:WIFI,REJECT", OutboundMode::Rule).await;
+    let network = h.engine.shared().network;
+    let url = format!("http://target.test:{}/hello", h.target_port());
+    // nothing is known of the network yet: the rule has nothing to match
+    let (head, body) = get_via_proxy(h.http(), &url).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"hi there");
+    // the machine is on Wi-Fi: the next session is rejected
+    network.store(NetworkFacts {
+        primary: Some(Primary {
+            interface: "wlan0".to_string(),
+            kind: NetKind::Wifi,
+            routers: Vec::new(),
+        }),
+        wifi: None,
+    });
+    let (head, _) = get_via_proxy(h.http(), &url).await;
+    assert!(head.is_empty(), "rejected: {head}");
+    assert_eq!(h.target.requests().len(), 1, "the target saw one session");
+    // and off it again
+    network.store(NetworkFacts::default());
+    let (head, _) = get_via_proxy(h.http(), &url).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(h.target.requests().len(), 2);
+}
+
 /// A session a set decided says which line of the set matched: in one DEBUG
 /// line with the session's id, and on its record, where the list of notes
 /// keeps clear of `error`.

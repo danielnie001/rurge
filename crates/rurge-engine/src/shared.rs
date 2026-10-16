@@ -1,6 +1,7 @@
 //! What outlives a config generation (M1 design 6.2, 6.3; M2 design 7.2).
 
 use arc_swap::ArcSwapOption;
+use rurge_config::{NetworkCell, NetworkFacts};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{Resolve, Via};
 use rurge_policy::auto::AutoGroups;
@@ -130,6 +131,10 @@ pub struct EngineShared {
     pub processes: Arc<dyn ProcessHook>,
     /// The `external` outbounds built so far.
     pub externals: Arc<ExternalPrograms>,
+    /// The network the machine is on now (phase 3 M1 design 2), for the
+    /// `SUBNET` rules of every generation. Unknown until somebody stores
+    /// what they read off the machine.
+    pub network: Arc<NetworkCell>,
 }
 
 impl EngineShared {
@@ -143,6 +148,7 @@ impl EngineShared {
             auto: Arc::new(AutoGroups::new(Arc::new(TestBook::new()))),
             processes: Arc::new(NoProcessGroups),
             externals: Arc::new(ExternalPrograms::default()),
+            network: Arc::new(NetworkCell::new(NetworkFacts::default())),
         }
     }
 }

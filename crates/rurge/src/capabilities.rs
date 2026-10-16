@@ -8,7 +8,9 @@
 //! and `trust-tunnel` over HTTP/2 (phase 2 M6c), `hysteria2` (phase 2 M7a),
 //! `tuic` and `tuic-v5` (phase 2 M7b), `masque` and `trust-tunnel` over
 //! HTTP/3 (phase 2 M7c), `select` groups, `url-test` / `fallback` /
-//! `load-balance` groups (phase 2 M3b), and `smart` groups (phase 2 M3c).
+//! `load-balance` groups (phase 2 M3b), `smart` groups (phase 2 M3c), and
+//! `SUBNET` rules, which look at the network the engine is told it is on
+//! (phase 3 M1).
 
 use rurge_config::config::Capabilities;
 use rurge_config::policy::{GroupKind, PolicyKind};
@@ -20,12 +22,11 @@ use std::collections::HashSet;
 /// (`W0016`): a profile that asks for 20 gets the same here either way.
 pub const CORE_VERSION: u64 = 22;
 
-const INACTIVE_RULE_TYPES: [&str; 7] = [
+const INACTIVE_RULE_TYPES: [&str; 6] = [
     "PROCESS-NAME",
     "SCRIPT",
     "DEVICE-NAME",
     "MAC-ADDRESS",
-    "SUBNET",
     "CELLULAR-RADIO",
     "CELLULAR-CARRIER",
 ];

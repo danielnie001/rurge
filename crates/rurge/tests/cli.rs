@@ -295,6 +295,33 @@ fn check_accepts_ip_asn_unknown() {
     assert!(out.contains("0 error(s), 0 warning(s), 0 note(s)"), "{out}");
 }
 
+/// A `SUBNET` rule is matched against the network the engine is on, so
+/// `check` does not say it never matches (`W0013`); a type that is still not
+/// matched on this system is said as before.
+#[test]
+fn check_does_not_say_a_subnet_rule_never_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write(
+        &dir,
+        "subnet.conf",
+        "[Rule]\nSUBNET,TYPE:WIFI,DIRECT\nSUBNET,SSID:Home,DIRECT\nDEVICE-NAME,Kids-iPad,DIRECT\nFINAL,DIRECT\n",
+    );
+    let out = rurge_command()
+        .args(["check", "--data-dir"])
+        .arg(dir.path().join("data"))
+        .arg("-c")
+        .arg(&conf)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    assert!(!out.contains("SUBNET"), "{out}");
+    assert!(out.contains("`DEVICE-NAME` rules never match"), "{out}");
+    assert!(out.contains("0 error(s), 1 warning(s)"), "{out}");
+}
+
 #[test]
 fn bom_prefixed_config_is_accepted() {
     let dir = tempfile::tempdir().unwrap();

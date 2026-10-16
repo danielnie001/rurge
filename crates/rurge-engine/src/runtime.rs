@@ -59,8 +59,11 @@ impl Runtime {
             None
         };
         let mut stack = build_stack(&config, &opts.stack).await?;
+        // the engine's cell, not one of this generation's: the network is
+        // the machine's, and outlives the profile it is read against
         let rules =
-            RuleEngine::build_with_registry(&config, stack.registry.clone(), stack.geo.clone())?;
+            RuleEngine::build_with_registry(&config, stack.registry.clone(), stack.geo.clone())?
+                .with_network(opts.shared.network.clone());
         // The cell, not this generation's resolver: an outbound may outlive
         // the generation it was built in (M2 design 7.2).
         let factory = match &opts.shared.roots {

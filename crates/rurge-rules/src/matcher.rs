@@ -9,7 +9,7 @@ use rurge_config::rule::{
     HostnameType, Pattern, PortExpr, ProcessPattern, ProtocolKind, ResourceRef, RuleKind, SubRule,
 };
 use rurge_config::session::{ProcessInfo, SessionInfo, Transport};
-use rurge_config::{Glob, GlobOptions};
+use rurge_config::{Glob, GlobOptions, NetworkFacts, SubnetExpr};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
@@ -77,6 +77,10 @@ pub struct EvalCtx<'a> {
     /// only the hit of a set that is part of why it matched.
     pub sub_hit: Option<SubRuleHit>,
     geo: &'a dyn GeoLookup,
+    /// The network the machine is on, with `subnet-exp-wifi-always-match`
+    /// (phase 3 M1 design 8). `None`: this evaluation was never told, and no
+    /// `SUBNET` rule matches in it.
+    network: Option<(&'a NetworkFacts, bool)>,
     country_cache: Option<(IpAddr, GeoResult<[u8; 2]>)>,
     asn_cache: Option<(IpAddr, GeoResult<u32>)>,
     /// How many `Matcher::Set` evaluations are currently nested. `SetRegistry`
@@ -89,15 +93,31 @@ pub struct EvalCtx<'a> {
 }
 
 impl<'a> EvalCtx<'a> {
+    /// An evaluation that knows nothing of the network.
     pub fn new(geo: &'a dyn GeoLookup) -> EvalCtx<'a> {
         EvalCtx {
             resolved: None,
             notes: Vec::new(),
             sub_hit: None,
             geo,
+            network: None,
             country_cache: None,
             asn_cache: None,
             set_depth: 0,
+        }
+    }
+
+    /// An evaluation on `facts`, the network as it is now, which does not
+    /// change under it: the caller takes a snapshot when the evaluation
+    /// starts. `wifi_always_match` is `[General] subnet-exp-wifi-always-match`.
+    pub fn with_network(
+        geo: &'a dyn GeoLookup,
+        facts: &'a NetworkFacts,
+        wifi_always_match: bool,
+    ) -> EvalCtx<'a> {
+        EvalCtx {
+            network: Some((facts, wifi_always_match)),
+            ..EvalCtx::new(geo)
         }
     }
 
@@ -181,6 +201,8 @@ pub enum Matcher {
     SrcIp(IpNet),
     Protocol(ProtocolKind),
     HostnameType(HostnameType),
+    /// Looks at the network of the evaluation's context.
+    Subnet(SubnetExpr),
     And(Vec<CompiledSubRule>),
     Or(Vec<CompiledSubRule>),
     Not(Box<CompiledSubRule>),
@@ -269,7 +291,7 @@ impl Matcher {
             RuleKind::MacAddress(_) => Matcher::Unsupported("MAC-ADDRESS"),
             RuleKind::Protocol(p) => Matcher::Protocol(*p),
             RuleKind::HostnameType(t) => Matcher::HostnameType(*t),
-            RuleKind::Subnet(_) => Matcher::Unsupported("SUBNET"),
+            RuleKind::Subnet(expr) => Matcher::Subnet(expr.clone()),
             RuleKind::CellularRadio(_) | RuleKind::CellularCarrier(_) => Matcher::Never,
             RuleKind::And(subs) => {
                 Matcher::And(subs.iter().map(|s| compile_subrule(s, sets)).collect())
@@ -368,6 +390,10 @@ impl Matcher {
                 ))
             .into(),
             Matcher::HostnameType(t) => (s.hostname_type() == *t).into(),
+            Matcher::Subnet(expr) => ctx
+                .network
+                .is_some_and(|(facts, wifi_always_match)| expr.matches(facts, wifi_always_match))
+                .into(),
             Matcher::And(subs) => ctx.in_branches(|ctx| {
                 let mut needs = false;
                 for sub in subs {
@@ -547,6 +573,7 @@ mod tests {
     use rurge_config::HostName;
     use rurge_config::Reach;
     use rurge_config::rule::{ParseCtx, parse_subrule};
+    use rurge_config::{NetKind, Primary, WifiLink};
     use std::collections::HashSet;
     use std::path::Path;
 
@@ -604,6 +631,51 @@ mod tests {
             v6: v6.iter().map(|a| a.parse().unwrap()).collect(),
         });
         compile(raw).eval(s, &mut ctx)
+    }
+
+    /// The network of a test: the primary interface (its name, its kind and
+    /// its gateways) and the Wi-Fi link (its interface, SSID and BSSID).
+    fn network(
+        primary: Option<(&str, NetKind, &[&str])>,
+        wifi: Option<(&str, Option<&str>, Option<&str>)>,
+    ) -> NetworkFacts {
+        NetworkFacts {
+            primary: primary.map(|(interface, kind, routers)| Primary {
+                interface: interface.to_string(),
+                kind,
+                routers: routers.iter().map(|r| r.parse().unwrap()).collect(),
+            }),
+            wifi: wifi.map(|(interface, ssid, bssid)| WifiLink {
+                interface: interface.to_string(),
+                ssid: ssid.map(str::to_string),
+                bssid: bssid.map(str::to_string),
+            }),
+        }
+    }
+
+    /// At home on Wi-Fi: the Wi-Fi link is the way out.
+    fn at_home() -> NetworkFacts {
+        network(
+            Some(("wlan0", NetKind::Wifi, &["192.168.1.1"])),
+            Some(("wlan0", Some("Home"), Some("aa:bb:cc:dd:ee:ff"))),
+        )
+    }
+
+    /// At a desk: the way out is the cable, and the Wi-Fi link is up as well.
+    fn at_a_desk_with_wifi_up() -> NetworkFacts {
+        network(
+            Some(("eth0", NetKind::Wired, &["10.0.0.1"])),
+            Some(("wlan0", Some("Home"), Some("aa:bb:cc:dd:ee:ff"))),
+        )
+    }
+
+    /// `raw` on `facts`, with `subnet-exp-wifi-always-match` as given; a
+    /// `SUBNET` rule is supported, so it never leaves a note.
+    fn eval_on(raw: &str, facts: &NetworkFacts, wifi_always_match: bool) -> Verdict {
+        let mut ctx = EvalCtx::with_network(&NoGeo, facts, wifi_always_match);
+        let verdict = compile(raw).eval(&session("example.com"), &mut ctx);
+        assert!(ctx.notes.is_empty(), "{raw}: {:?}", ctx.notes);
+        verdict
     }
 
     #[test]
@@ -973,11 +1045,11 @@ mod tests {
         let s = session("example.com");
         let mut ctx = EvalCtx::new(&NoGeo);
         assert_eq!(
-            compile("SUBNET,SSID:Home").eval(&s, &mut ctx),
+            compile("DEVICE-NAME,Kids-iPad").eval(&s, &mut ctx),
             Verdict::NoMatch
         );
         assert_eq!(ctx.notes.len(), 1);
-        assert!(ctx.notes[0].contains("SUBNET"));
+        assert!(ctx.notes[0].contains("DEVICE-NAME"));
         let mut ctx = EvalCtx::new(&NoGeo);
         assert_eq!(
             compile("CELLULAR-RADIO,LTE").eval(&s, &mut ctx),
@@ -994,8 +1066,8 @@ mod tests {
 
     /// `CELLULAR-RADIO` and `CELLULAR-CARRIER` are iOS rules (manual,
     /// Protocol and Network Rules): on a desktop neither ever matches, and
-    /// neither leaves a note at run time that it cannot, as a `SUBNET` rule
-    /// does.
+    /// neither leaves a note at run time that it cannot, as a `DEVICE-NAME`
+    /// rule does.
     #[test]
     fn the_cellular_rules_never_match_and_say_nothing() {
         for raw in [
@@ -1010,6 +1082,121 @@ mod tests {
                 "{raw}"
             );
             assert!(ctx.notes.is_empty(), "{raw}: {:?}", ctx.notes);
+        }
+    }
+
+    /// A context that was never told the network — a `[Host]` key, a rule
+    /// set read in a test — has nothing for a `SUBNET` rule to look at: no
+    /// match, and no note either, because the rule is supported.
+    #[test]
+    fn a_context_without_a_network_matches_no_subnet_rule() {
+        for raw in [
+            "SUBNET,TYPE:WIFI",
+            "SUBNET,TYPE:WIRED",
+            "SUBNET,SSID:*",
+            "SUBNET,BSSID:*",
+            "SUBNET,ROUTER:192.168.1.1",
+            "SUBNET,Home",
+        ] {
+            let mut ctx = EvalCtx::new(&NoGeo);
+            assert_eq!(
+                compile(raw).eval(&session("example.com"), &mut ctx),
+                Verdict::NoMatch,
+                "{raw}"
+            );
+            assert!(ctx.notes.is_empty(), "{raw}: {:?}", ctx.notes);
+        }
+    }
+
+    /// The conditions are read off the network the context carries.
+    #[test]
+    fn subnet_rules_are_evaluated_on_the_network_of_the_context() {
+        let home = at_home();
+        for (raw, expected) in [
+            ("SUBNET,SSID:Home", Verdict::Match),
+            ("SUBNET,SSID:Office", Verdict::NoMatch),
+            ("SUBNET,BSSID:AA:BB:*", Verdict::Match),
+            ("SUBNET,ROUTER:192.168.1.1", Verdict::Match),
+            ("SUBNET,ROUTER:192.168.1.2", Verdict::NoMatch),
+            ("SUBNET,TYPE:WIFI", Verdict::Match),
+            ("SUBNET,TYPE:WIRED", Verdict::NoMatch),
+            ("SUBNET,Home", Verdict::Match),
+        ] {
+            assert_eq!(eval_on(raw, &home, true), expected, "{raw}");
+        }
+        // the cable: only the conditions on the way out change
+        let desk = at_a_desk_with_wifi_up();
+        assert_eq!(eval_on("SUBNET,TYPE:WIRED", &desk, true), Verdict::Match);
+        assert_eq!(eval_on("SUBNET,TYPE:WIFI", &desk, true), Verdict::NoMatch);
+        assert_eq!(
+            eval_on("SUBNET,ROUTER:10.0.0.1", &desk, true),
+            Verdict::Match
+        );
+        assert_eq!(
+            eval_on("SUBNET,ROUTER:192.168.1.1", &desk, true),
+            Verdict::NoMatch
+        );
+    }
+
+    /// `subnet-exp-wifi-always-match` travels with the network: a Wi-Fi link
+    /// that is not the way out counts for the SSID and the BSSID only while
+    /// it is on, and not at all for what is read off the way out.
+    #[test]
+    fn the_context_carries_subnet_exp_wifi_always_match() {
+        let desk = at_a_desk_with_wifi_up();
+        for raw in ["SUBNET,SSID:Home", "SUBNET,BSSID:aa:bb:*", "SUBNET,Home"] {
+            assert_eq!(eval_on(raw, &desk, true), Verdict::Match, "{raw}");
+            assert_eq!(eval_on(raw, &desk, false), Verdict::NoMatch, "{raw}");
+        }
+        assert_eq!(eval_on("SUBNET,TYPE:WIRED", &desk, false), Verdict::Match);
+        assert_eq!(
+            eval_on("SUBNET,ROUTER:10.0.0.1", &desk, false),
+            Verdict::Match
+        );
+        // on Wi-Fi the link is the way out, whichever way the switch is set
+        let home = at_home();
+        assert_eq!(eval_on("SUBNET,SSID:Home", &home, false), Verdict::Match);
+    }
+
+    /// A platform that would not say the SSID or the BSSID (no permission to
+    /// see them) leaves those two conditions unmatched and the others alone.
+    #[test]
+    fn an_ssid_the_platform_would_not_say_matches_nothing() {
+        let hidden = network(
+            Some(("wlan0", NetKind::Wifi, &["192.168.1.1"])),
+            Some(("wlan0", None, None)),
+        );
+        for raw in ["SUBNET,SSID:*", "SUBNET,BSSID:*", "SUBNET,Home"] {
+            assert_eq!(eval_on(raw, &hidden, true), Verdict::NoMatch, "{raw}");
+        }
+        assert_eq!(eval_on("SUBNET,TYPE:WIFI", &hidden, true), Verdict::Match);
+        assert_eq!(
+            eval_on("SUBNET,ROUTER:192.168.1.1", &hidden, true),
+            Verdict::Match
+        );
+    }
+
+    /// The logical rules ask the same context.
+    #[test]
+    fn subnet_rules_take_part_in_logical_rules() {
+        let home = at_home();
+        for (raw, expected) in [
+            (
+                "AND,((SUBNET,TYPE:WIFI),(DOMAIN-SUFFIX,example.com))",
+                Verdict::Match,
+            ),
+            (
+                "AND,((SUBNET,TYPE:WIRED),(DOMAIN-SUFFIX,example.com))",
+                Verdict::NoMatch,
+            ),
+            (
+                "OR,((SUBNET,TYPE:WIRED),(SUBNET,SSID:Home))",
+                Verdict::Match,
+            ),
+            ("NOT,((SUBNET,TYPE:WIRED))", Verdict::Match),
+            ("NOT,((SUBNET,TYPE:WIFI))", Verdict::NoMatch),
+        ] {
+            assert_eq!(eval_on(raw, &home, true), expected, "{raw}");
         }
     }
 
