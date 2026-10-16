@@ -7606,6 +7606,42 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             assert!(!system_proxy_is_on(api));
         }
 
+        /// A generation built again for the DNS of a network says what a
+        /// generation says when it is built: a server the resolver cannot use
+        /// is a warning on standard error, as it is at the start and in a
+        /// reload. Nobody else would say it: the lists of a line of
+        /// `[SSID Setting]` are given to a resolver only when that network is
+        /// the one the machine is on.
+        #[test]
+        fn a_rebuild_for_the_dns_of_a_network_prints_what_the_new_generation_says() {
+            let global_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let global = global_socket.local_addr().unwrap();
+            let world = World::on(&wifi("Home"));
+            let conf = world.profile(
+                &format!("dns-server = {global}\nipv6 = false"),
+                "[Rule]\nFINAL,DIRECT\n[SSID Setting]\nSSID:Cafe encrypted-dns-server = tcp://dns.example/path\n",
+            );
+            let (daemon, errors) = spawn_command_reading_stderr(world.run(&conf, &[]));
+            wait_for_line(&daemon, "rurge ");
+            // what the start said is not what is waited for
+            while errors.try_recv().is_ok() {}
+
+            world.move_to(&wifi("Cafe"));
+            wait_for_log(&daemon, "building it again");
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let warned = loop {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                let line = errors
+                    .recv_timeout(left)
+                    .expect("the rebuild never printed the warning of its resolver");
+                if line.contains("W0026") {
+                    break line;
+                }
+            };
+            assert!(warned.starts_with("warning[W0026]: "), "{warned}");
+            drop(global_socket);
+        }
+
         /// The lines of `[SSID Setting]` are the profile's, so a reload that
         /// takes one away ends the pause it made, and one that adds it begins
         /// one: the pause follows the profile as well as the network.

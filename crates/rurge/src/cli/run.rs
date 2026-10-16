@@ -773,6 +773,10 @@ async fn follow_the_dns_of_the_network(d: &Daemon<'_>) {
     .await;
     match next {
         Ok(next) => {
+            // what a generation says when it is built, as at the start and in a
+            // reload: the servers a line of `[SSID Setting]` lists are given to
+            // a resolver only here, and a warning about one is said by nobody else
+            print_diagnostics(next.diagnostics());
             // the configuration is the same: no listener has anything to change
             d.engine.swap_runtime(next);
         }
