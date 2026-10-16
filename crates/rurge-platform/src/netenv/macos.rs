@@ -29,8 +29,12 @@ impl PortCache {
     }
 
     /// The table as it was read for these interfaces. `load` reads it when the
-    /// interfaces are not the ones of the last look; a table that could not be
-    /// read (an empty one) is not kept.
+    /// interfaces are not the ones of the last look. A table that could not be
+    /// read (an empty one) is not kept, so the next look asks again; the table
+    /// that was read before is what it is meanwhile: a device does not become
+    /// another kind of port because another adapter came, and a program that
+    /// fails once says nothing of the ports — an interface whose kind is
+    /// suddenly unknown is a change of network that is none.
     fn get(&self, interfaces: &[String], load: impl FnOnce() -> Ports) -> Ports {
         let mut kept = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(kept) = kept.as_ref()
@@ -39,12 +43,15 @@ impl PortCache {
             return kept.ports.clone();
         }
         let ports = load();
-        if !ports.is_empty() {
-            *kept = Some(Kept {
-                interfaces: interfaces.to_vec(),
-                ports: ports.clone(),
-            });
+        if ports.is_empty() {
+            return kept
+                .as_ref()
+                .map_or_else(Vec::new, |kept| kept.ports.clone());
         }
+        *kept = Some(Kept {
+            interfaces: interfaces.to_vec(),
+            ports: ports.clone(),
+        });
         ports
     }
 }
@@ -284,16 +291,38 @@ VLAN Configurations\n===================\n";
     }
 
     /// A table that could not be read is not kept: the next look tries again.
+    /// The one that was read before stands meanwhile: what a device is does
+    /// not change because another adapter came, and a program that did not
+    /// answer once says nothing of it — taking the kind of the primary
+    /// interface for `other` would be a change of network that is none.
     #[test]
     fn a_table_that_could_not_be_read_is_asked_for_again() {
+        let asked = |host: &FakeHost| host.calls().iter().filter(|c| *c == PORTS_COMMAND).count();
         let cache = PortCache::new();
         let host = FakeHost::default().with_address("en0", "192.0.2.10");
         quick(&host, &ReadOpts::default(), &cache);
         quick(&host, &ReadOpts::default(), &cache);
-        assert_eq!(
-            host.calls().iter().filter(|c| *c == PORTS_COMMAND).count(),
-            2
-        );
+        assert_eq!(asked(&host), 2);
+
+        // a table was read; an adapter is plugged in, and `networksetup` does
+        // not answer: the table that was read is what the kinds come from
+        let cache = PortCache::new();
+        let quick_of_base = quick(&base(), &ReadOpts::default(), &cache);
+        let host = FakeHost::default()
+            .with_command(ROUTE_V4, &route("192.0.2.1", "en0"))
+            .with_address("en0", "192.0.2.10")
+            .with_address("en7", "203.0.113.10");
+        let after = quick(&host, &ReadOpts::default(), &cache);
+        assert_eq!(after.primary.unwrap().kind, NetKind::Wifi);
+        assert_eq!(asked(&host), 1);
+        assert_eq!(after.wireless, quick_of_base.wireless);
+        // it is asked again at the next look, and its answer is the table
+        let host = host.with_command(PORTS_COMMAND, PORTS);
+        let again = quick(&host, &ReadOpts::default(), &cache);
+        assert_eq!(asked(&host), 2);
+        assert_eq!(again.primary.unwrap().kind, NetKind::Wifi);
+        quick(&host, &ReadOpts::default(), &cache);
+        assert_eq!(asked(&host), 2, "and then it is kept");
     }
 
     /// What is left out is not the primary interface. macOS names only the
