@@ -18,7 +18,7 @@ const UUID: &str = "5ec4e75e-c4e7-45ec-8e75-ec4e75ec4e75";
 const KEY: &str = "S3CR3TS3CR3TS3CR3TS3CR3TS3CR3TS3CR3TS3CR3TQ=";
 /// 16 bytes of it: a Shadowsocks 2022 key.
 const KEY_16: &str = "S3CR3TS3CR3TS3CR3TS3CQ==";
-/// 32 bytes of it, behind the quotes of a whole item.
+/// 32 bytes of it, in quotes.
 const KEY_QUOTED: &str = "S3CR3TquotedquotedquotedquotedquotedquotedQ=";
 /// A peer's public key is no secret.
 const PUBLIC: &str = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU=";
@@ -68,18 +68,20 @@ Shadow = trojan, st.example, 443, password={MARKER}-st, shadow-tls-password={MAR
 Tested = http, tested.example, 80, test-url=http://t.example/?token={MARKER}-testurl
 Ts = tailscale, section-name=ts
 Ideo = trojan, i.example, 443,\u{3000}password={MARKER}-ideographic
-ExtQ = external, exec=/bin/true, local-port=1081, \"args=-p {MARKER}-quotedargs\"
+ExtQ = external, exec=/bin/true, local-port=1081, args=\"-p {MARKER}-quotedargs\"
 #!MACOS-ONLY Req = http, req.example, 8080, user, {MARKER}-reqpos
 #!REQUIREMENT CORE_VERSION>=20 ReqN = trojan, rn.example, 443, password={MARKER}-reqnamed
 Inline = socks5, in.example, 1080, user, {MARKER}-inlinepos # expires=2027-01
 Suffix = http, su.example, 8080, user, {MARKER}-suffixpos #!MACOS-ONLY
 QType = \"http\", q.example, 8080, user, {MARKER}-quotedtype
+PosEq = http, pe.example, 8080, user, \"{MARKER}-pos=eq\"
+CustomEq = custom, ce.example, 8388, aes-128-gcm, \"{MARKER}-custom=eq\"
 # Old = trojan, o.example, 443, {MARKER}-commentedpolicy, password={MARKER}-commentedpassword
 
 [Proxy Group]
 G = select, Http, policy-path=https://sub.example/list?token={MARKER}-sub, external-policy-modifier=\"password={MARKER}-modifier\"
 Old = url-test, Http, url=http://t.example/?token={MARKER}-groupurl
-GQ = select, Http, \"policy-path=https://sub.example/list?token={MARKER}-quotedpath\"
+GQ = select, Http, policy-path=\"https://sub.example/list?token={MARKER}-quotedpath\"
 
 [Host]
 corp.example = server:https://al1ce:{MARKER}-hostdoh@dns.example/dns-query
@@ -88,13 +90,13 @@ RULE-SET:https://al1ce:{MARKER}-hostruleset@sets.example/hosts.list = server:8.8
 
 [Keystore]
 cert = type=p12, password={MARKER}-p12, base64={MARKER}{MARKER}
-certq = type=p12, \"password={MARKER}-quotedp12\", base64={MARKER}Quoted
+certq = type=p12, password=\"{MARKER}-quotedp12\", base64={MARKER}Quoted
 
 [WireGuard Home]
 private-key = {KEY}
 self-ip = 10.0.0.2
 peer = (public-key = {PUBLIC}, preshared-key = {KEY}, allowed-ips = 0.0.0.0/0, endpoint = wg.example:51820)
-peer = (public-key = {PUBLIC}, \"preshared-key={KEY_QUOTED}\", allowed-ips = 10.1.0.0/16, endpoint = wg2.example:51820)
+peer = (public-key = {PUBLIC}, preshared-key=\"{KEY_QUOTED}\", allowed-ips = 10.1.0.0/16, endpoint = wg2.example:51820)
 
 [Tailscale ts]
 auth-key = tskey-{MARKER}-tailscale
@@ -146,15 +148,16 @@ fn the_profile_loads() {
     for name in [
         "Http", "Https", "Socks", "Trojan", "Vmess", "AnyTls", "Ss", "Ss2022", "SsStream",
         "Custom", "Snell", "Hy2", "TuicV5", "Tuic", "Masque", "Tt", "H2", "Ssh", "Wg", "Ext",
-        "Shadow", "Tested", "Ideo", "ExtQ", "Req", "ReqN", "Inline", "Suffix", "QType",
+        "Shadow", "Tested", "Ideo", "ExtQ", "Req", "ReqN", "Inline", "Suffix", "QType", "PosEq",
+        "CustomEq",
     ] {
         assert!(loaded.config.spec(name).is_some(), "{name}");
     }
     // and the spellings that only the parser's reading makes a secret of —
-    // quotes around a whole item, a requirement directive in front, a comment
-    // behind, a comma in a key — are read as the parameter they are written
-    // for: a profile whose quotes the parser stopped taking off would still
-    // load, and the redaction would have nothing to hide
+    // a value in quotes, a requirement directive in front, a comment behind,
+    // a comma in a key — are read as the parameter they are written for: a
+    // profile whose quotes the parser stopped taking off would still load,
+    // and the redaction would have nothing to hide
     let config = &loaded.config;
     let policy = |name: &str| {
         config
@@ -163,7 +166,7 @@ fn the_profile_loads() {
             .find(|p| p.name == name)
             .unwrap_or_else(|| panic!("policy {name}"))
     };
-    // a whole item in quotes
+    // a value in quotes
     assert_eq!(
         policy("ExtQ").params.get("args"),
         Some(format!("-p {MARKER}-quotedargs").as_str())
@@ -198,6 +201,7 @@ fn the_profile_loads() {
     user_and("Inline", "inlinepos");
     user_and("Suffix", "suffixpos");
     user_and("QType", "quotedtype");
+    user_and("PosEq", "pos=eq");
     assert_eq!(
         policy("ReqN").params.get("password"),
         Some(format!("{MARKER}-reqnamed").as_str())
@@ -209,6 +213,12 @@ fn the_profile_loads() {
         panic!("{:?}", custom.proto)
     };
     assert_eq!(ss.password.expose(), &format!("{MARKER}-custom"));
+    // and the same password with an `=` in it, wholly in quotes
+    let custom_eq = config.spec("CustomEq").unwrap();
+    let rurge_config::ProtoSpec::Ss(ss) = &custom_eq.proto else {
+        panic!("{:?}", custom_eq.proto)
+    };
+    assert_eq!(ss.password.expose(), &format!("{MARKER}-custom=eq"));
     // a key that holds a comma, a listener whose password is quoted with one
     let general = &config.general;
     assert_eq!(
@@ -396,7 +406,7 @@ FINAL,DIRECT
         "`client-cert` references unknown keystore item",
         "`include-other-group` references unknown policy group",
         "policy `Unk`: unknown parameter ignored",
-        "policy `UnkQ`: unknown parameter ignored",
+        "policy `UnkQ`: unexpected positional value #1 ignored",
         "invalid value for `encrypt-method` (expected aes-128-gcm / ",
         "policy group `UnkG`: unknown parameter ignored",
         "policy: unknown type",
@@ -426,13 +436,13 @@ http-api = {MARKER}-comma,tail@127.0.0.1:6171
 Http = http, h.example, 8080
 #!REQUIREMENT CORE_VERSION>=20 Pos = http, p.example, 8080, user, {MARKER}-reqpos
 PosC = socks5, s.example, 1080, user, {MARKER}-poscomment # expires=2027-01
-Ext = external, exec=/bin/true, local-port=1080, \"args=-p {MARKER}-quotedargs\" // tunnel
+Ext = external, exec=/bin/true, local-port=1080, args=\"-p {MARKER}-quotedargs\" // tunnel
 
 [Proxy Group]
-GQ = select, Http, \"policy-path=https://sub.example/list?token={MARKER}-quotedpath\" #!MACOS-ONLY
+GQ = select, Http, policy-path=\"https://sub.example/list?token={MARKER}-quotedpath\" #!MACOS-ONLY
 
 [Keystore]
-certq = type=p12, base64=AAAA, \"password={MARKER}-quotedp12\" ; work
+certq = type=p12, base64=AAAA, password=\"{MARKER}-quotedp12\" ; work
 
 [Host]
 corp.example = server:https://al1ce:{MARKER}-hostdoh@dns.example/dns-query
@@ -511,6 +521,60 @@ FINAL,DIRECT
     ));
     // and the redacted profile shows none
     assert_eq!(leaks(&redact_profile(&text)), Vec::<String>::new());
+}
+
+/// A whole `key=value` in quotes is a value, never that parameter
+/// (line-splitting design LS-D6): none of the four is read, and none of them
+/// shows anywhere — not in the diagnostics, the `Debug`, the summary or the
+/// redacted profile.
+#[test]
+fn a_whole_parameter_in_quotes_is_read_as_a_value_and_shown_nowhere() {
+    let text = format!(
+        "[Proxy]
+ExtQ = external, exec=/bin/true, local-port=1081, \"args=-p {MARKER}-quotedargs\"
+[Proxy Group]
+GQ = select, ExtQ, \"policy-path=https://sub.example/list?token={MARKER}-quotedpath\"
+[Keystore]
+certq = type=p12, base64=AAAA, \"password={MARKER}-quotedp12\"
+[WireGuard Home]
+private-key = {KEY}
+self-ip = 10.0.0.2
+peer = (public-key = {PUBLIC}, \"preshared-key={KEY_QUOTED}\", allowed-ips = 10.1.0.0/16, endpoint = wg2.example:51820)
+[Rule]
+FINAL,DIRECT
+"
+    );
+    let loaded = load(&text);
+    let config = &loaded.config;
+    let ext = config.policies.iter().find(|p| p.name == "ExtQ").unwrap();
+    assert_eq!(ext.params.get("args"), None);
+    let group = config.groups.iter().find(|g| g.name == "GQ").unwrap();
+    assert_eq!(group.params.get("policy-path"), None);
+    let certq = config.keystore.iter().find(|k| k.name == "certq").unwrap();
+    assert_eq!(certq.password, None);
+    assert!(config.wireguard[0].peers[0].preshared_key.is_none());
+    let messages: Vec<String> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m == "policy group `GQ` references an unknown policy"),
+        "{messages:#?}"
+    );
+    let summary = config.summary();
+    assert_eq!(summary.groups, ["GQ (select) -> [ExtQ, ***]"]);
+    for (what, shown) in [
+        ("diagnostics", messages.join("\n")),
+        ("Debug", format!("{config:#?}")),
+        ("summary", format!("{summary:?}")),
+        ("summary as JSON", serde_json::to_string(&summary).unwrap()),
+        ("redacted profile", redact_profile(&text)),
+    ] {
+        assert!(leaks(&shown).is_empty(), "{what}: {:?}", leaks(&shown));
+    }
 }
 
 /// More values another field slid into, a field nobody reads, a link that

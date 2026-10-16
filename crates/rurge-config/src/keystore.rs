@@ -4,7 +4,7 @@ use crate::diagnostic::{ParseError, codes};
 use crate::policy::named;
 use crate::span::Span;
 use crate::spec::reader::{quotable, written_as_name};
-use crate::value::{ParamMap, parse_key_value, split_list};
+use crate::value::{ParamMap, parse_key_value, split_fields};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeystoreType {
@@ -64,7 +64,7 @@ pub fn parse_keystore_item(
     definition: &str,
     span: &Span,
 ) -> Result<KeystoreItem, ParseError> {
-    let fields = split_list(definition);
+    let fields = split_fields(definition);
     let (params, _) = ParamMap::from_fields(&fields);
     let base64 = params
         .get("base64")
@@ -96,14 +96,14 @@ pub fn parse_keystore_item(
     };
     let unknown = fields
         .iter()
-        .filter(|f| match parse_key_value(f) {
-            Some((k, _)) => !matches!(
-                k.to_ascii_lowercase().as_str(),
+        .filter(|field| match &field.param {
+            Some((key, _)) => !matches!(
+                key.to_ascii_lowercase().as_str(),
                 "type" | "base64" | "password"
             ),
             None => true,
         })
-        .cloned()
+        .map(|field| field.text.clone())
         .collect();
     Ok(KeystoreItem {
         name: name.to_string(),

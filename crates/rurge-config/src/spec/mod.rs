@@ -897,6 +897,25 @@ mod tests {
         );
     }
 
+    /// A positional user name or password that holds an `=` reads as one
+    /// when it is wholly in quotes (line-splitting design LS-D6).
+    #[test]
+    fn a_positional_credential_with_an_equals_sign_reads_in_quotes() {
+        let o = outcome("P", "http, 127.0.0.1, 8080, \"al=ice\", \"k3y=v4lue\"");
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let ProtoSpec::Http(http) = &o.spec.unwrap().proto else {
+            panic!()
+        };
+        assert_eq!(
+            http.username.as_ref().map(|u| u.expose().as_str()),
+            Some("al=ice")
+        );
+        assert_eq!(
+            http.password.as_ref().map(|p| p.expose().as_str()),
+            Some("k3y=v4lue")
+        );
+    }
+
     #[test]
     fn aliases_get_a_spec_too() {
         let o = outcome("Corp", "direct, interface=utun0");

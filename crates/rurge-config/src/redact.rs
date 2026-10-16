@@ -897,6 +897,9 @@ fn redact_joined(region: &str, first_len: usize) -> String {
 /// - A parameter whose name is a secret one loses its value. Written plainly
 ///   it keeps its own spacing and name; from inside quotes only the name
 ///   is left, `name=***`.
+/// - A whole item in quotes is a value for the parsers (line-splitting design
+///   LS-D6), but a secret parameter it reads like is hidden as one:
+///   `"password=…"` keeps `password=***`.
 /// - A parenthesised group, which is how a `[WireGuard]` peer is written
 ///   (`wireguard.rs` takes the parentheses off and splits what is inside),
 ///   has its items redacted the same way.
@@ -2013,11 +2016,12 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
     }
 
     /// One way to write a parameter between two commas, the value the parser
-    /// reads from it, and whether it leaves a quote open (the rest of the
+    /// reads from it (`None`: the parser reads the item as a value, not as
+    /// this parameter), and whether it leaves a quote open (the rest of the
     /// line is its value then, so nothing can follow).
     struct Spelling {
         text: String,
-        value: String,
+        value: Option<String>,
         open: bool,
     }
 
@@ -2026,24 +2030,31 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
         let both = format!("{V},{W}");
         let spelling = |text: String, value: &str| Spelling {
             text,
-            value: value.to_string(),
+            value: Some(value.to_string()),
+            open: false,
+        };
+        // a whole item in quotes is a value, never the parameter it reads
+        // like (design LS-D6)
+        let quoted = |text: String| Spelling {
+            text,
+            value: None,
             open: false,
         };
         vec![
             spelling(format!("{name}={V}"), V),
             spelling(format!("{name} = {V} "), V),
             spelling(format!("{upper}={V}"), V),
-            spelling(format!("\"{name}={V}\""), V),
-            spelling(format!("'{name}={V}'"), V),
-            spelling(format!("\"{name}={both}\""), &both),
+            quoted(format!("\"{name}={V}\"")),
+            quoted(format!("'{name}={V}'")),
+            quoted(format!("\"{name}={both}\"")),
             spelling(format!("{name}=\"{both}\""), &both),
             spelling(format!("\u{3000}{name}={V}"), V),
             spelling(format!("\u{a0}{name}={V}"), V),
             spelling(format!("{name}={V}\u{3000}"), V),
             // more of what the parser takes
-            spelling(format!("'{name}={both}'"), &both),
+            quoted(format!("'{name}={both}'")),
             spelling(format!("{name}='{both}'"), &both),
-            spelling(format!("\"{upper} = {V}\""), V),
+            quoted(format!("\"{upper} = {V}\"")),
             spelling(format!("{name}\t=\t{V}"), V),
             spelling(format!("{name}\u{3000}=\u{3000}{V}"), V),
             spelling(format!("\u{2003}{name} = \"{both}\"\u{a0}"), &both),
@@ -2054,7 +2065,7 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
             spelling(format!("{name}=a({both})b"), &format!("a({both})b")),
             Spelling {
                 text: format!("{name}=\"{both}"),
-                value: format!("\"{both}"),
+                value: Some(format!("\"{both}")),
                 open: true,
             },
         ]
@@ -2263,7 +2274,11 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
                                         name,
                                         form == FORMS[0].0,
                                     );
-                                    if !read.contains(&spelling.value) {
+                                    let as_meant = match &spelling.value {
+                                        Some(value) => read.contains(value),
+                                        None => read.is_empty(),
+                                    };
+                                    if !as_meant {
                                         unread.push(text);
                                         continue;
                                     }
@@ -2282,9 +2297,16 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
                                 // what the parser read into the parameter: a
                                 // part it cut off is an item of its own — on a
                                 // group line a member, which the group's
-                                // `Debug` lists (design 6.3)
+                                // `Debug` lists (design 6.3); so is an item it
+                                // read as a value, and `is_name` knows no text
+                                // with an `=`: the `Debug` has `***` there
                                 for secret in [V, W] {
-                                    if spelling.value.contains(secret) && debug.contains(secret) {
+                                    if spelling
+                                        .value
+                                        .as_deref()
+                                        .is_none_or(|value| value.contains(secret))
+                                        && debug.contains(secret)
+                                    {
                                         bad.push(format!("Debug shows {secret}"));
                                     }
                                 }
@@ -2358,13 +2380,20 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
                     if name == "password" {
                         line.push_str(", base64=B64B64");
                     }
-                    let item = crate::keystore::parse_keystore_item("k", &line, &span()).unwrap();
-                    let read = if name == "password" {
-                        item.password.clone().unwrap_or_default()
-                    } else {
-                        item.base64.clone()
-                    };
-                    assert_eq!(read, spelling.value, "{line}");
+                    let parsed = crate::keystore::parse_keystore_item("k", &line, &span());
+                    match (&spelling.value, name) {
+                        (None, "base64") => assert!(parsed.is_err(), "{line}"),
+                        (None, _) => assert!(parsed.unwrap().password.is_none(), "{line}"),
+                        (Some(value), _) => {
+                            let item = parsed.unwrap();
+                            let read = if name == "password" {
+                                item.password.clone().unwrap_or_default()
+                            } else {
+                                item.base64.clone()
+                            };
+                            assert_eq!(&read, value, "{line}");
+                        }
+                    }
                     checked += 1;
                     let out = redact_profile(&format!("k = {line}"));
                     let mut bad = Vec::new();
@@ -2408,14 +2437,14 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
             .unwrap();
         let neighbours = ["keepalive = 25", "client-id = 83/12/235"];
         let base = format!(
-            "public-key = {PUBLIC}, \"allowed-ips = 10.0.0.0/8, 192.168.0.0/16\", endpoint = a.test:1"
+            "public-key = {PUBLIC}, allowed-ips = \"10.0.0.0/8, 192.168.0.0/16\", endpoint = a.test:1"
         );
         let mut checked = 0usize;
         let mut kinds: Vec<String> = Vec::new();
         let mut leaked: Vec<String> = Vec::new();
         for spelling in spellings("preshared-key") {
             // one 32-byte key is all a peer takes
-            if spelling.value != V {
+            if spelling.text.contains(W) {
                 continue;
             }
             let secret = spelling.text.replace(V, PSK);
@@ -2446,7 +2475,7 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
                     let last = section.peers.last().unwrap();
                     assert_eq!(
                         last.preshared_key.as_ref().map(|k| *k.expose()),
-                        Some(psk),
+                        spelling.value.as_ref().map(|_| psk),
                         "{line}"
                     );
                     checked += 1;
@@ -2497,7 +2526,8 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
                 "Ext = external,\u{a0}args = hunter2 ,exec=/bin/x",
                 "Ext = external,\u{a0}args = *** ,exec=/bin/x",
             ),
-            // the whole item in quotes: read as the parameter of that name
+            // a whole item in quotes: a value for the parser (design LS-D6),
+            // hidden as the parameter it reads like
             (
                 "G = select, \"policy-path=https://sub.example/list?token=t0k3n\"",
                 "G = select, policy-path=***",

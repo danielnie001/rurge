@@ -1745,11 +1745,12 @@ M = select, policy-path=https://sub.test/m, external-policy-modifier=\"underlyin
         assert_eq!(a.cycles, [["P", "Q", "P"]]);
     }
 
-    /// The user's modifier reaches a line however the line is spelled: an
-    /// item in quotes is the parameter it reads as and takes the modifier's
-    /// value, and an unclosed quote at the end of the line keeps nothing of
-    /// the modifier away — a line cannot shed the relay or the certificate
-    /// the user gives it. Nor does an unclosed quote hide a line's own
+    /// The user's modifier reaches a line however the line is spelled: a
+    /// whole item in quotes is a value (a user name on these types,
+    /// line-splitting design LS-D6) and the modifier's parameter is appended,
+    /// and an unclosed quote at the end of the line keeps nothing of the
+    /// modifier away — a line cannot shed the relay or the certificate the
+    /// user gives it. Nor does an unclosed quote hide a line's own
     /// `client-cert` or relay from the check that follows the modifier.
     #[test]
     fn a_line_does_not_get_around_the_modifier_by_its_spelling() {

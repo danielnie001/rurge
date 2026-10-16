@@ -340,9 +340,12 @@ pub struct ParamMap {
 }
 
 impl ParamMap {
+    /// Adds `key=value`: the key trimmed and lower-cased, the value as given
+    /// — the list reader has taken its quotes off once already
+    /// (line-splitting design LS-D7).
     pub fn insert(&mut self, key: &str, value: &str) {
         self.entries
-            .push((key.trim().to_ascii_lowercase(), unquote(value.trim())));
+            .push((key.trim().to_ascii_lowercase(), value.to_string()));
     }
     pub fn get(&self, key: &str) -> Option<&str> {
         let key = key.to_ascii_lowercase();
@@ -380,14 +383,15 @@ impl ParamMap {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-    /// Split fields into `key=value` parameters and positional values.
-    pub fn from_fields(fields: &[String]) -> (ParamMap, Vec<String>) {
+    /// Split the items of a list into `key=value` parameters and positional
+    /// values (line-splitting design 4.2): a whole item in quotes is a value.
+    pub fn from_fields(fields: &[Field]) -> (ParamMap, Vec<String>) {
         let mut params = ParamMap::default();
         let mut positional = Vec::new();
-        for f in fields {
-            match parse_key_value(f) {
-                Some((k, v)) => params.insert(k, v),
-                None => positional.push(f.clone()),
+        for field in fields {
+            match &field.param {
+                Some((key, value)) => params.insert(key, value),
+                None => positional.push(field.text.clone()),
             }
         }
         (params, positional)
@@ -678,7 +682,7 @@ mod tests {
         assert_eq!(parse_bool("0"), Some(false));
         assert_eq!(parse_bool("maybe"), None);
 
-        let fields = split_list("user, pass, tfo=true, args=a, args=b, Port=443");
+        let fields = split_fields("user, pass, tfo=true, args=a, args=b, Port=443");
         let (params, positional) = ParamMap::from_fields(&fields);
         assert_eq!(positional, ["user", "pass"]);
         assert_eq!(params.get("TFO"), Some("true"));
@@ -686,5 +690,23 @@ mod tests {
         assert_eq!(params.get_all("args"), ["a", "b"]);
         assert_eq!(params.u16("port"), Some(443));
         assert_eq!(params.len(), 4);
+    }
+
+    /// A value in quotes is kept as the quotes held it, blanks and quotes
+    /// inside included; a whole item in quotes is a value, never a parameter
+    /// (line-splitting design LS-D6, LS-D7).
+    #[test]
+    fn a_parameter_keeps_its_value_as_the_quotes_held_it() {
+        let (params, positional) = ParamMap::from_fields(&split_fields(
+            "sni=\"\\\"a.example\\\"\", password=\" pw \", key='\"v\"', plain =  x  ",
+        ));
+        assert!(positional.is_empty());
+        assert_eq!(params.get("sni"), Some("\"a.example\""));
+        assert_eq!(params.get("password"), Some(" pw "));
+        assert_eq!(params.get("key"), Some("\"v\""));
+        assert_eq!(params.get("plain"), Some("x"));
+        let (params, positional) = ParamMap::from_fields(&split_fields("alice, \"pa=ss\""));
+        assert!(params.is_empty());
+        assert_eq!(positional, ["alice", "pa=ss"]);
     }
 }

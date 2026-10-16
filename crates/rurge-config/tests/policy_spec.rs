@@ -554,7 +554,7 @@ Ext2 = external, exec=/bin/true, local-port=1081
 {link}L = http, l.example, 80, underlying-proxy=Loop
 Loop = http, l2.example, 80, underlying-proxy={link}L
 {link}Hop = hysteria2, h.example, 443, password=p, port-hopping=5000-6000
-{link}W = http, w.example, 80, mystery=1
+{link}W = http, w.example, 80, alice, pw, mystery=1
 {link}Own = external, exec=/bin/true, local-port=6152
 Entry = http, e.example, 80"
         ),

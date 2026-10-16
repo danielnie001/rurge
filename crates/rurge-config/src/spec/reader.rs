@@ -2,8 +2,8 @@
 //! so that `finish` can warn about the rest.
 
 use crate::diagnostic::{Diagnostic, Severity, codes};
-use crate::policy::{ProxyPolicy, is_name, named};
-use crate::value::{parse_bool, parse_key_value, split_items, split_list};
+use crate::policy::{PolicyKind, ProxyPolicy, is_name, named};
+use crate::value::{parse_bool, parse_key_value, split_fields, split_items, split_list};
 use std::collections::HashSet;
 use std::str::FromStr;
 
@@ -22,9 +22,9 @@ pub(crate) fn quotable(value: &str) -> bool {
 /// Whether a diagnostic may quote the name of the parameter `key`: only when
 /// every item of `definition` that the parser reads as that parameter writes
 /// it as a parameter name — ASCII lower-case letters, digits, `-` and `_`, at
-/// most 32 of them. The key is held lower-cased and unquoted — a Base64
-/// password `aHVudGVyMg==` arrives as `ahvudgvymg`, `"pa=ss"` as `pa` — so
-/// this is decided on the text of the line, not on the key.
+/// most 32 of them. The key is held lower-cased — a Base64 password
+/// `aHVudGVyMg==` arrives as `ahvudgvymg` — so this is decided on the text of
+/// the line, not on the key.
 pub(crate) fn written_as_name(definition: &str, key: &str) -> bool {
     split_items(definition).into_iter().all(|item| {
         let reads_as_key = split_list(item).pop().is_some_and(|field| {
@@ -37,6 +37,38 @@ pub(crate) fn written_as_name(definition: &str, key: &str) -> bool {
                     b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_')
                 }))
     })
+}
+
+/// The hint of an unknown parameter where a user name or a password stands
+/// (line-splitting design LS-D8): it says how such a value is written, and
+/// nothing of the line.
+pub(crate) const CREDENTIAL_HINT: &str =
+    "if this is a user name or a password that contains `=`, put it wholly in quotes";
+
+/// The keys of the items that stand where a policy of `policy`'s type takes
+/// its user name and its password — the fourth and the fifth field the
+/// parser reads (line-splitting design LS-D8) — and that it reads as
+/// parameters: there, a key is most likely the front of a password with an
+/// `=` in it.
+fn credential_keys(policy: &ProxyPolicy) -> HashSet<String> {
+    let positional_credentials = policy.legacy_custom
+        || matches!(
+            policy.kind,
+            PolicyKind::Http
+                | PolicyKind::Https
+                | PolicyKind::Socks5
+                | PolicyKind::Socks5Tls
+                | PolicyKind::H2Connect
+        );
+    if !positional_credentials {
+        return HashSet::new();
+    }
+    split_fields(&policy.definition)
+        .into_iter()
+        .skip(3)
+        .take(2)
+        .filter_map(|field| field.param.map(|(key, _)| key.to_ascii_lowercase()))
+        .collect()
 }
 
 /// The text of `E0018`, the value quoted when it can be.
@@ -213,9 +245,22 @@ impl<'a> ParamReader<'a> {
     /// Warns about every parameter and positional value nobody read.
     pub fn finish(mut self) -> Vec<Diagnostic> {
         let policy = self.policy;
+        let credentials = credential_keys(policy);
         let mut reported = HashSet::new();
         for (key, _) in policy.params.iter() {
             if !self.used.contains(key) && reported.insert(key.to_string()) {
+                if credentials.contains(key) {
+                    let message = format!(
+                        "{}: unknown parameter ignored",
+                        named("policy", &policy.name)
+                    );
+                    self.diags.push(
+                        Diagnostic::warning(codes::W_UNKNOWN_KEY, message)
+                            .at(policy.span.clone())
+                            .with_hint(CREDENTIAL_HINT),
+                    );
+                    continue;
+                }
                 let message = if written_as_name(&policy.definition, key) {
                     format!("unknown parameter `{key}` ignored")
                 } else {
@@ -388,9 +433,10 @@ mod tests {
 
     /// The name of an unknown parameter is quoted only when the item writes it
     /// as a parameter name — ASCII lower-case letters, digits, `-` and `_`, at
-    /// most 32 of them. The reader holds the key lower-cased and unquoted, so
-    /// what somebody wrote as a password (`aHVudGVyMg==` reads as
-    /// `ahvudgvymg`, the quoted `"pa=ss"` as `pa`) is told by the line.
+    /// most 32 of them. The reader holds the key lower-cased, so what
+    /// somebody wrote as a password (`aHVudGVyMg==` reads as `ahvudgvymg`) is
+    /// told by the line; a whole item in quotes is a value (design LS-D6), an
+    /// unexpected positional one.
     #[test]
     fn the_name_of_an_unknown_parameter_is_quoted_only_when_it_is_written_as_one() {
         let longest = "a".repeat(32);
@@ -405,32 +451,88 @@ mod tests {
         };
         let named = |name: &str| vec![format!("policy `P`: unknown parameter `{name}` ignored")];
         let nameless = || vec!["policy `P`: unknown parameter ignored".to_string()];
-        assert_eq!(said("http, 1.2.3.4, 80, mystery=1"), named("mystery"));
-        assert_eq!(said("http, 1.2.3.4, 80, my-key_2=1"), named("my-key_2"));
+        assert_eq!(said("trojan, 1.2.3.4, 443, mystery=1"), named("mystery"));
+        assert_eq!(said("trojan, 1.2.3.4, 443, my-key_2=1"), named("my-key_2"));
         // 32 characters is a name, 33 is not
         assert_eq!(
-            said(&format!("http, 1.2.3.4, 80, {longest}=1")),
+            said(&format!("trojan, 1.2.3.4, 443, {longest}=1")),
             named(&longest)
         );
         assert_eq!(
-            said(&format!("http, 1.2.3.4, 80, {too_long}=1")),
+            said(&format!("trojan, 1.2.3.4, 443, {too_long}=1")),
             nameless()
         );
         // upper case is not how a name is written: a Base64 password reads so
-        assert_eq!(said("http, 1.2.3.4, 80, aHVudGVyMg=="), nameless());
-        assert_eq!(said("http, 1.2.3.4, 80, Mystery=1"), nameless());
-        // a whole item in quotes holds a name no more
-        assert_eq!(said("http, 1.2.3.4, 80, \"pa=ss\""), nameless());
-        assert_eq!(said("http, 1.2.3.4, 80, 'pa=ss'"), nameless());
+        assert_eq!(said("trojan, 1.2.3.4, 443, aHVudGVyMg=="), nameless());
+        assert_eq!(said("trojan, 1.2.3.4, 443, Mystery=1"), nameless());
+        // a whole item in quotes is a value, which holds no name
+        let positional = || vec!["policy `P`: unexpected positional value #1 ignored".to_string()];
+        assert_eq!(said("trojan, 1.2.3.4, 443, \"pa=ss\""), positional());
+        assert_eq!(said("trojan, 1.2.3.4, 443, 'pa=ss'"), positional());
         // quotes around the value only are no matter; blanks around the name
         // are none of it; other characters are
-        assert_eq!(said("http, 1.2.3.4, 80, mystery=\"a,b\""), named("mystery"));
         assert_eq!(
-            said("http, 1.2.3.4, 80,\u{3000}mystery\u{3000}=1"),
+            said("trojan, 1.2.3.4, 443, mystery=\"a,b\""),
             named("mystery")
         );
-        assert_eq!(said("http, 1.2.3.4, 80, my.key=1"), nameless());
+        assert_eq!(
+            said("trojan, 1.2.3.4, 443,\u{3000}mystery\u{3000}=1"),
+            named("mystery")
+        );
+        assert_eq!(said("trojan, 1.2.3.4, 443, my.key=1"), nameless());
         // a name written two ways: the one that is no name decides
-        assert_eq!(said("http, 1.2.3.4, 80, mystery=1, MYSTERY=2"), nameless());
+        assert_eq!(
+            said("trojan, 1.2.3.4, 443, mystery=1, MYSTERY=2"),
+            nameless()
+        );
+    }
+
+    /// Where a type reads its user name and its password from positions, an
+    /// unknown parameter in those two places is most likely a password with
+    /// an `=` in it: it is not named, and the hint says how to write it
+    /// (line-splitting design LS-D8). Elsewhere on the line, and on a type
+    /// that reads no positions, the name is said as before.
+    #[test]
+    fn an_unknown_parameter_where_a_password_stands_is_not_named() {
+        let said = |def: &str| {
+            let p = policy(def);
+            let mut r = ParamReader::new(&p);
+            let _ = r.positional(0);
+            let _ = r.positional(1);
+            r.finish()
+                .into_iter()
+                .map(|d| (d.message, d.hint))
+                .collect::<Vec<_>>()
+        };
+        for def in [
+            "http, 1.2.3.4, 80, alice, k3y=v4lue",
+            "http, 1.2.3.4, 80, k3y=v4lue",
+            "socks5-tls, 1.2.3.4, 443, alice, k3y=v4lue",
+            "h2-connect, 1.2.3.4, 443, alice, k3y=v4lue",
+            "custom, 1.2.3.4, 8388, aes-256-gcm, k3y=v4lue",
+        ] {
+            assert_eq!(
+                said(def),
+                [(
+                    "policy `P`: unknown parameter ignored".to_string(),
+                    Some(CREDENTIAL_HINT)
+                )],
+                "{def}"
+            );
+        }
+        assert_eq!(
+            said("http, 1.2.3.4, 80, alice, pw, mystery=1"),
+            [(
+                "policy `P`: unknown parameter `mystery` ignored".to_string(),
+                codes::hint(codes::W_UNKNOWN_KEY)
+            )]
+        );
+        assert_eq!(
+            said("trojan, 1.2.3.4, 443, k3y=v4lue"),
+            [(
+                "policy `P`: unknown parameter `k3y` ignored".to_string(),
+                codes::hint(codes::W_UNKNOWN_KEY)
+            )]
+        );
     }
 }

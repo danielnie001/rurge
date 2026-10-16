@@ -10,7 +10,7 @@ use crate::spec::Secret;
 use crate::spec::reader::quotable as value_quotable;
 use crate::text::Section;
 use crate::types::HostName;
-use crate::value::{parse_bool, parse_key_value, split_definition, split_list};
+use crate::value::{parse_bool, split_definition, split_fields, split_list};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use ipnet::IpNet;
@@ -269,12 +269,14 @@ fn peer(report: &mut Report<'_>, span: &Span, item: &str, n: usize) -> Option<Wi
     let (mut keepalive, mut id) = (None, None);
     // what was written, valid or not: only a field left out is "required"
     let mut given: Vec<String> = Vec::new();
-    for field in split_list(inner) {
-        let Some((key, value)) = parse_key_value(&field) else {
-            // never quoted: it may be a key that lost its name
+    for field in split_fields(inner) {
+        let Some((key, value)) = &field.param else {
+            // never quoted: it may be a key that lost its name, or a whole
+            // item in quotes, which is a value (line-splitting design LS-D6)
             report.warn(span, format!("peer {n}: a field without `=` ignored"));
             continue;
         };
+        let (key, value) = (key.as_str(), value.as_str());
         given.push(key.to_ascii_lowercase());
         match key.to_ascii_lowercase().as_str() {
             "public-key" => match key32(value) {

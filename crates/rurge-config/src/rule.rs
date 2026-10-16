@@ -6,7 +6,7 @@ use crate::policy::{Builtin, SubnetExpr};
 use crate::reach::Reach;
 use crate::redact::url_without_credentials;
 use crate::span::Span;
-use crate::value::split_list;
+use crate::value::{Field, split_fields, split_list};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::collections::HashSet;
 use std::fmt;
@@ -397,12 +397,12 @@ pub struct RuleParams {
 }
 
 impl RuleParams {
-    fn parse(fields: &[String]) -> RuleParams {
+    fn parse(fields: &[Field]) -> RuleParams {
         let mut p = RuleParams::default();
         for f in fields {
-            let (k, v) = match f.split_once('=') {
-                Some((k, v)) => (k.trim(), Some(v.trim())),
-                None => (f.trim(), None),
+            let (k, v) = match &f.param {
+                Some((k, v)) => (k.as_str(), Some(v.as_str())),
+                None => (f.text.as_str(), None),
             };
             match (k.to_ascii_lowercase().as_str(), v) {
                 ("no-resolve", None) => p.no_resolve = true,
@@ -411,14 +411,14 @@ impl RuleParams {
                 ("pre-matching", None) => p.pre_matching = true,
                 ("requires-resolve", None) => p.requires_resolve = true,
                 ("notification-text", Some(v)) => p.notification_text = Some(v.to_string()),
-                ("notification-interval", Some(v)) if v.parse::<u32>().is_ok() => {
-                    p.notification_interval = v.parse().ok()
+                ("notification-interval", Some(v)) if v.trim().parse::<u32>().is_ok() => {
+                    p.notification_interval = v.trim().parse().ok()
                 }
-                ("update-interval", Some(v)) if v.parse::<i64>().is_ok() => {
-                    p.update_interval = v.parse().ok()
+                ("update-interval", Some(v)) if v.trim().parse::<i64>().is_ok() => {
+                    p.update_interval = v.trim().parse().ok()
                 }
                 ("always-capture", Some(v)) => p.always_capture = Some(v.to_string()),
-                _ => p.unknown.push(f.clone()),
+                _ => p.unknown.push(f.text.clone()),
             }
         }
         p
@@ -802,21 +802,23 @@ pub fn parse_subrule(raw: &str, ctx: &ParseCtx) -> Result<SubRule, ParseError> {
 
 /// Parse a full `[Rule]` line: `TYPE,VALUE,POLICY[,params...]` (FINAL has no value).
 pub fn parse_rule(raw: &str, ctx: &ParseCtx, span: &Span) -> Result<Rule, ParseError> {
-    let fields = split_list(raw);
+    let fields = split_fields(raw);
     let Some(ty) = fields.first() else {
         return Err(ParseError::new(codes::E_SYNTAX, "empty rule"));
     };
-    let ty = ty.to_ascii_uppercase();
+    let ty = ty.text.to_ascii_uppercase();
     let (kind, policy_idx) = if ty == "FINAL" {
         (RuleKind::Final, 1)
     } else {
         let value = fields
             .get(1)
+            .map(|field| field.text.as_str())
             .ok_or_else(|| ParseError::new(codes::E_SYNTAX, of_type(&ty, "missing value")))?;
         (parse_kind(&ty, value, ctx, 1)?, 2)
     };
     let policy = fields
         .get(policy_idx)
+        .map(|field| field.text.as_str())
         .ok_or_else(|| ParseError::new(codes::E_SYNTAX, of_type(&ty, "missing policy")))?;
     let policy = PolicyRef::parse(policy);
     let params = RuleParams::parse(&fields[policy_idx + 1..]);
@@ -1176,6 +1178,18 @@ mod tests {
         let mixed = params("bogus,no-resolve,other=1");
         assert!(mixed.no_resolve);
         assert_eq!(mixed.unknown, ["bogus", "other=1"]);
+    }
+
+    /// A rule's parameter in quotes keeps what they held; a whole item in
+    /// quotes is a value, which no parameter is (line-splitting design LS-D6,
+    /// LS-D7).
+    #[test]
+    fn a_quoted_rule_parameter_is_read_once_and_a_whole_quoted_one_is_unknown() {
+        let r = parse("DOMAIN,a.com,DIRECT,notification-text=\" Hi \"").unwrap();
+        assert_eq!(r.params.notification_text.as_deref(), Some(" Hi "));
+        let r = parse("DOMAIN,a.com,DIRECT,\"notification-text=Hi\"").unwrap();
+        assert_eq!(r.params.notification_text, None);
+        assert_eq!(r.params.unknown, ["notification-text=Hi"]);
     }
 
     /// Logical rules nest up to ten deep (manual, Logical Rules): ten load,

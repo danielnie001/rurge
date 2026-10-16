@@ -276,6 +276,10 @@ pub mod codes {
     /// it as the hint and `with_hint` replaces it. A sentence is static, so
     /// it never quotes anything of the profile.
     ///
+    /// `W0001` keeps its sentence, and one of its places carries one of its
+    /// own: an unknown parameter where a user name or a password stands
+    /// (`spec::reader`, line-splitting design LS-D8).
+    ///
     /// Where the places that emit a code want different fixes, the sentence
     /// says what they share or the code has none. `E0014` has none because
     /// each of its four places carries a hint of its own, `W0033` because each

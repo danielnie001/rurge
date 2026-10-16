@@ -5,7 +5,7 @@ use crate::glob::{Glob, GlobOptions};
 use crate::redact::is_secret_key;
 use crate::span::Span;
 use crate::types::HostName;
-use crate::value::{ParamMap, parse_key_value, split_list, strip_prefix_ci, unquote};
+use crate::value::{ParamMap, split_fields, split_list, strip_prefix_ci};
 use std::collections::HashSet;
 use std::net::IpAddr;
 
@@ -221,8 +221,13 @@ fn unknown_type(name: &str, type_kw: &str) -> String {
 /// (`P snell， h.example， 443， alice， pw， tfo=true`): a text that holds a
 /// `://`, a `＝` or a `，` is no name. A space, an emoji, CJK characters, a
 /// `|`, a `-` or a full stop are an ordinary name's.
+///
+/// Nor is one that holds an `=`: a definition is cut at its first `=`, so no
+/// name has one, and an item of a group line that holds one is a member only
+/// when it is wholly in quotes — a value, which can be a password
+/// (line-splitting design LS-D6).
 pub(crate) fn is_name(name: &str) -> bool {
-    !name.contains("://") && !name.contains(['＝', '，'])
+    !name.contains("://") && !name.contains(['=', '＝', '，'])
 }
 
 /// `what` and the name of a policy or a group, the way a diagnostic of the
@@ -261,8 +266,8 @@ pub(crate) fn shown_members(members: &[String]) -> Vec<&str> {
 }
 
 pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPolicy, ParseError> {
-    let fields = split_list(definition);
-    let Some(type_kw) = fields.first() else {
+    let fields = split_fields(definition);
+    let Some(type_kw) = fields.first().map(|f| f.text.as_str()) else {
         return Err(ParseError::new(
             codes::E_SYNTAX,
             format!("{}: missing type", named("policy", name)),
@@ -275,7 +280,7 @@ pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPo
         )
     })?;
     let (server, port, rest) = if kind.takes_server() {
-        let server = fields.get(1).ok_or_else(|| {
+        let server = fields.get(1).map(|f| f.text.as_str()).ok_or_else(|| {
             ParseError::new(
                 codes::E_SYNTAX,
                 format!(
@@ -285,7 +290,7 @@ pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPo
                 ),
             )
         })?;
-        let port_str = fields.get(2).ok_or_else(|| {
+        let port_str = fields.get(2).map(|f| f.text.as_str()).ok_or_else(|| {
             ParseError::new(
                 codes::E_SYNTAX,
                 format!(
@@ -332,11 +337,11 @@ pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPo
 /// `definition` with the parameters of `overrides` in place (phase 2 M3
 /// design 5.3, `external-policy-modifier`): a key the line has is replaced
 /// where it first appears and dropped where it repeats, a key it lacks is
-/// appended. An item's key is the one the parser reads — with the quotes
-/// around a whole item taken off, without its case; every other item keeps
-/// its text. The fields the parser takes for the type, and for a server and
-/// a port unless the type has none, are no parameters, however they are
-/// spelled.
+/// appended. An item's key is the parser's (`split_fields`) without its
+/// case — a whole item in quotes is a value and has none (design LS-D6);
+/// every other item keeps its text. The fields the parser takes for the type,
+/// and for a server and a port unless the type has none, are no parameters,
+/// however they are spelled.
 ///
 /// The line then reads as it did alone, the overrides in place. What is
 /// appended therefore stands in front of a last item that leaves a quote open:
@@ -355,13 +360,13 @@ pub fn with_params(definition: &str, overrides: &[(String, String)]) -> String {
         .map_or(1, |kind| if kind.takes_server() { 3 } else { 1 });
     let mut open_tail = false;
     for (i, item) in items.iter().enumerate() {
-        let field = split_list(item).pop();
-        let key = match field.as_deref() {
+        let field = split_fields(item).pop();
+        let key = match field {
             Some(_) if head > 0 => {
                 head -= 1;
                 None
             }
-            Some(field) => parse_key_value(field).map(|(k, _)| k.to_ascii_lowercase()),
+            Some(field) => field.param.map(|(k, _)| k.to_ascii_lowercase()),
             None => None,
         };
         let found = key
@@ -397,23 +402,17 @@ fn leaves_open(item: &str) -> bool {
     crate::value::split_items(&format!("{item},")).len() == 1
 }
 
-/// `value` as a line has to spell it to read it back the same. The parser
-/// unquotes a `key="value"` item twice — as a list field, then as a
-/// parameter value after trimming it — so a value that the second pass
-/// would change (one wrapped in quotes, or with blanks at either end) is
-/// quoted twice.
+/// `value` as a line has to spell it to read it back the same: as it is when
+/// the list reader leaves it so, otherwise in double quotes, which the reader
+/// takes off once and keeps what they held (line-splitting design LS-D7).
 fn param_value(value: &str) -> String {
     let plain = !value.is_empty()
         && value.trim() == value
         && !value.contains([',', '"', '\'', '(', ')', '\\']);
     if plain {
-        return value.to_string();
-    }
-    let once = quoted(value);
-    if unquote(value.trim()) == value {
-        once
+        value.to_string()
     } else {
-        quoted(&once)
+        quoted(value)
     }
 }
 
@@ -548,8 +547,8 @@ pub struct PolicyGroup {
 /// `params` is left out and `definition` redacted (M3-D7): a group's
 /// `policy-path` usually carries a subscription token, and its
 /// `external-policy-modifier` can set any parameter, a password included. A
-/// member is whatever lies between two commas and has no `=`, a link whose `=`
-/// was typed as a `:` among it: one that is no name is `***`.
+/// member is an item of the line that is no parameter; one that is no name is
+/// `***`.
 impl std::fmt::Debug for PolicyGroup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PolicyGroup")
@@ -594,8 +593,8 @@ const GROUP_PARAMS: &[&str] = &[
 ];
 
 pub fn parse_group(name: &str, definition: &str, span: &Span) -> Result<PolicyGroup, ParseError> {
-    let fields = split_list(definition);
-    let Some(type_kw) = fields.first() else {
+    let fields = split_fields(definition);
+    let Some(type_kw) = fields.first().map(|f| f.text.as_str()) else {
         return Err(ParseError::new(
             codes::E_SYNTAX,
             format!("{}: missing type", named("policy group", name)),
@@ -615,17 +614,17 @@ pub fn parse_group(name: &str, definition: &str, span: &Span) -> Result<PolicyGr
     let mut params = ParamMap::default();
     let mut conditions = Vec::new();
     for field in &fields[1..] {
-        match parse_key_value(field) {
+        match &field.param {
             Some((k, v)) => {
                 if kind == GroupKind::Subnet
                     && !GROUP_PARAMS.contains(&k.to_ascii_lowercase().as_str())
                 {
-                    conditions.push((SubnetExpr::parse(k)?, v.to_string()));
+                    conditions.push((SubnetExpr::parse(k)?, v.clone()));
                 } else {
                     params.insert(k, v);
                 }
             }
-            None => members.push(field.clone()),
+            None => members.push(field.text.clone()),
         }
     }
     Ok(PolicyGroup {
@@ -1014,8 +1013,8 @@ external-policy-modifier=\"password=hunter2\"",
     }
 
     /// `with_params` and the parser agree on what a line's items are, for
-    /// every line of up to three of these after each head: the parser takes
-    /// the quotes off a whole item before it looks for a key, keeps a comma
+    /// every line of up to three of these after each head: a whole item in
+    /// quotes is a value, not a key (design LS-D6); the parser keeps a comma
     /// inside a quoted item, compares keys without their case, and gives an
     /// unclosed quote the rest of the line (a parenthesis that pairs with
     /// nothing groups nothing, design LS-D3) — what is appended must not end
@@ -1040,7 +1039,7 @@ external-policy-modifier=\"password=hunter2\"",
             " Tfo = false ",
             " alice",
             "",
-            // a whole item in quotes is the parameter it reads as
+            // a whole item in quotes is a value (design LS-D6)
             " \"tfo=false\"",
             " 'TFO=false'",
             // a comma inside a quoted item is the item's
@@ -1088,20 +1087,20 @@ external-policy-modifier=\"password=hunter2\"",
         );
     }
 
-    /// How such lines are written: a quoted item is replaced whole, and what
-    /// is appended stands in front of a last item that would take it for
-    /// its own.
+    /// How such lines are written: a whole item in quotes is a value and stays
+    /// as it is (design LS-D6), and what is appended stands in front of a last
+    /// item that would take it for its own.
     #[test]
     fn with_params_writes_around_quotes() {
         let modifier = pairs(&[("tfo", "true"), ("sni", "edge.test")]);
         for (line, modified) in [
             (
                 "trojan, t.test, 443, 'tfo=false', password=pw, \"TFO=false\"",
-                "trojan, t.test, 443, tfo=true, password=pw, sni=edge.test",
+                "trojan, t.test, 443, 'tfo=false', password=pw, \"TFO=false\", tfo=true, sni=edge.test",
             ),
             (
                 "trojan, t.test, 443, \"password=p,w\", \"sni=a.test,b.test\"",
-                "trojan, t.test, 443, \"password=p,w\", sni=edge.test, tfo=true",
+                "trojan, t.test, 443, \"password=p,w\", \"sni=a.test,b.test\", tfo=true, sni=edge.test",
             ),
             (
                 "trojan, t.test, 443, password=\"p,w",
@@ -1209,6 +1208,20 @@ external-policy-modifier=\"password=hunter2\"",
         )
         .unwrap_err();
         assert_eq!(e.message, "policy: unknown type `true`");
+    }
+
+    /// A text that holds an `=` is no name (line-splitting design LS-D6): a
+    /// definition is cut at its first `=`, and a member that holds one is a
+    /// whole item in quotes — a value, which can be a password.
+    #[test]
+    fn a_text_with_an_equals_sign_is_no_name() {
+        assert!(is_name("Tom's HK") && is_name("Proxy (US"));
+        assert!(!is_name("pa=ss") && !is_name("a = b"));
+        assert_eq!(named("policy", "pa=ss"), "policy");
+        let g = parse_group("G", "select, A, \"pa=ss\"", &span()).unwrap();
+        assert_eq!(g.members, ["A", "pa=ss"]);
+        assert!(g.params.is_empty());
+        assert_eq!(shown_members(&g.members), ["A", "***"]);
     }
 
     /// `psk = hunter2abc` under `[Proxy]` (a header the parser does not take

@@ -1787,13 +1787,14 @@ S snell, s.test, 443, psk=s3cretPw42, version=4\nX http, h.test, 80, alice, s3cr
     }
 
     /// The name of a policy that a rule, a group or a parameter refers to is
-    /// quoted when it is a name. A member is whatever lies between two commas
-    /// and has no `=`: a link whose `=` was typed as a `:`, text an input
-    /// method joined with a full-width `＝` or `，`, is none.
+    /// quoted when it is a name. A member is an item of the group line that is
+    /// no parameter: a link whose `=` was typed as a `:`, text an input method
+    /// joined with a full-width `＝` or `，`, a whole item in quotes that holds
+    /// an `=` (line-splitting design LS-D6), is none.
     #[test]
     fn an_unknown_policy_is_quoted_only_when_it_is_a_name() {
         let l = load_text(
-            "[Proxy]\nA = direct\nP = http, p.test, 80, underlying-proxy=https://al1ce:hunter2@proxy.test:8080\n[Proxy Group]\nG = select, A, Missing 01, policy-path:https://sub.test/link/t0k3n, B\u{ff1d}t0k3n2, C\u{ff0c}t0k3n3\n[Rule]\nDOMAIN,a.com,Nope\nDOMAIN,b.com,policy-path\u{ff1d}https://sub.test/link/t0k3n4\nDOMAIN,c.com,P\u{ff0c}t0k3n5\nFINAL,DIRECT\n",
+            "[Proxy]\nA = direct\nP = http, p.test, 80, underlying-proxy=https://al1ce:hunter2@proxy.test:8080\n[Proxy Group]\nG = select, A, Missing 01, policy-path:https://sub.test/link/t0k3n, B\u{ff1d}t0k3n2, C\u{ff0c}t0k3n3, \"pa=t0k3n6\"\n[Rule]\nDOMAIN,a.com,Nope\nDOMAIN,b.com,policy-path\u{ff1d}https://sub.test/link/t0k3n4\nDOMAIN,c.com,P\u{ff0c}t0k3n5\nDOMAIN,d.com,\"Q=t0k3n7\"\nDOMAIN,e.com,Q=t0k3n8\nFINAL,DIRECT\n",
         );
         let said = |code: &str| -> Vec<&str> {
             l.diagnostics
@@ -1809,12 +1810,15 @@ S snell, s.test, 443, psk=s3cretPw42, version=4\nX http, h.test, 80, alice, s3cr
                 "policy group `G` references an unknown policy",
                 "policy group `G` references an unknown policy",
                 "policy group `G` references an unknown policy",
+                "policy group `G` references an unknown policy",
             ]
         );
         assert_eq!(
             said(codes::E_UNKNOWN_POLICY_REF),
             [
                 "rule references unknown policy `Nope`",
+                "rule references an unknown policy",
+                "rule references an unknown policy",
                 "rule references an unknown policy",
                 "rule references an unknown policy",
                 "policy `P`: `underlying-proxy` references unknown policy",
@@ -2077,7 +2081,7 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
         let l = load_text(
             "stray line\n[General]\nmystery = 1\nvif-mode = on\ncompatibility-mode = true\n\
 [Nowhere]\nx = 1\n[MITM]\nx = 1\n\
-[Proxy]\nA = nope, h.test, 1\nB = http, h.test, 80, bogus=1\nB = http, h.test, 81\n\
+[Proxy]\nA = nope, h.test, 1\nB = http, h.test, 80, alice, pw, bogus=1\nB = http, h.test, 81\n\
 [Rule]\nDOMAIN,a,Missing\nFOO,a,DIRECT\nFINAL,DIRECT\nFINAL,DIRECT\nDOMAIN,z,DIRECT\n",
         );
         for d in l.diagnostics.iter() {

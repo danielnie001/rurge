@@ -9,7 +9,7 @@ use crate::policy::{Builtin, GroupKind, PolicyGroup, named, shown_members};
 use crate::reach::Reach;
 use crate::rule::Pattern;
 use crate::span::Span;
-use crate::value::{parse_bool, parse_key_value, split_list};
+use crate::value::{parse_bool, split_fields, split_list};
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -456,16 +456,21 @@ fn policy_path(
     }))
 }
 
-/// `key=value` items the way `split_list` reads a quoted list; `None` when
-/// the list is empty or an item is not a pair.
+/// `key=value` items the way the list reader reads them (line-splitting
+/// design 4.2); `None` when the list is empty or an item is not a pair — a
+/// whole item in quotes is a value, not a pair (design LS-D6).
 fn modifier(value: &str) -> Option<Vec<(String, String)>> {
-    let items = split_list(value);
-    if items.is_empty() {
+    let fields = split_fields(value);
+    if fields.is_empty() {
         return None;
     }
-    items
-        .iter()
-        .map(|item| parse_key_value(item).map(|(k, v)| (k.to_ascii_lowercase(), v.to_string())))
+    fields
+        .into_iter()
+        .map(|field| {
+            field
+                .param
+                .map(|(key, value)| (key.to_ascii_lowercase(), value))
+        })
         .collect()
 }
 
@@ -1027,7 +1032,9 @@ icon-url=https://example.com/i.png, category=Media",
         );
         assert_eq!(messages(&format!("select, A, {too_long}=1")), nameless());
         assert_eq!(messages("select, A, aHVudGVyMg=="), nameless());
-        assert_eq!(messages("select, A, \"pa=ss\""), nameless());
+        // a whole item in quotes is a member now (line-splitting design
+        // LS-D6), one the loader reports (`E0008`)
+        assert!(messages("select, A, \"pa=ss\"").is_empty());
         assert_eq!(messages("select, A, Mystery=1"), nameless());
         // a group's `{name}` in the message is not a policy's
         assert_eq!(

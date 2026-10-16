@@ -588,9 +588,12 @@ mod tests {
     }
 
     /// A positional field with an `=` in it is a named parameter, on every
-    /// line that has credentials in positions (`http`'s are the same). An old
-    /// line whose password holds one has no password, which is an error, and
-    /// nothing of what stands after the `=` is said.
+    /// line that has credentials in positions (`http`'s are the same), unless
+    /// it is wholly in quotes. An old line whose password holds one, not in
+    /// quotes, has no password, which is an error; that item is an unknown
+    /// parameter, which is not named and comes with a hint of its own
+    /// (line-splitting design LS-D8), and nothing of what stands after the `=`
+    /// is said.
     #[test]
     fn a_legacy_custom_password_with_an_equals_sign_is_an_error() {
         let (_, failed, diags) = read("custom, 127.0.0.1, 8388, aes-256-gcm, hunter=2secret");
@@ -605,6 +608,25 @@ mod tests {
             diags.iter().all(|d| !d.message.contains("2secret")),
             "{diags:?}"
         );
+        assert!(
+            diags.iter().all(|d| !d.message.contains("hunter")),
+            "{diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| d.code == codes::W_UNKNOWN_KEY
+                && d.hint == Some(crate::spec::reader::CREDENTIAL_HINT)),
+            "{diags:?}"
+        );
+    }
+
+    /// A legacy `custom` line's password with an `=` in it reads when the
+    /// password is wholly in quotes (line-splitting design LS-D6).
+    #[test]
+    fn a_legacy_custom_password_with_an_equals_sign_reads_in_quotes() {
+        let (got, failed, diags) = read("custom, 127.0.0.1, 8388, aes-256-gcm, \"hunter=2secret\"");
+        assert!(!failed, "{diags:?}");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(got.spec.password.expose(), "hunter=2secret");
     }
 
     /// The cipher of an old `custom` line stands in a position, where a
