@@ -10,6 +10,7 @@ use crate::state::StateStore;
 use arc_swap::ArcSwap;
 use rurge_config::Builtin;
 use rurge_config::HostName;
+use rurge_config::NetworkFacts;
 use rurge_config::general::{General, UdpFallback};
 use rurge_config::rule::PolicyRef;
 use rurge_config::session::{ListenerKind, SessionInfo};
@@ -438,6 +439,37 @@ impl Engine {
     /// the runtime ends, rather than trust what exiting would drop.
     pub async fn stop_external_programs(&self) {
         self.shared.externals.stop_all().await;
+    }
+
+    /// The network the engine looks at now: the one `network_changed` was last
+    /// given, or else what was put in `EngineShared.network` before the engine
+    /// was made. Nothing is known until one of the two.
+    pub fn network(&self) -> Arc<NetworkFacts> {
+        self.shared.network.load()
+    }
+
+    /// The machine is on another network now, `facts` (phase 3 M1 design 5):
+    /// the rules and the `subnet` groups look at it from their next
+    /// evaluation on, and what the generation in use kept of the old network
+    /// goes. The resolver drops its cache and its conclusion that the servers
+    /// never answer AAAA, and reads the platform's DNS servers again, here and
+    /// now (`Resolver::on_network_change`). The outbounds are told, and drop
+    /// what is tied to the old network (WireGuard gives every peer a new
+    /// carrier); the groups that pick by their tests test again when they are
+    /// used next, and the override of a `subnet` group ends
+    /// (`PolicyRegistry::network_changed`). A session that is under way and a
+    /// lookup in flight finish on what they had.
+    ///
+    /// The DNS override of the new network is not applied here: a generation
+    /// is built with it. Whoever finds that the new network overrides the DNS
+    /// differently than the generation in use was built with
+    /// (`Runtime::dns_override`) builds another.
+    pub fn network_changed(&self, facts: NetworkFacts) {
+        self.shared.network.store(facts);
+        // the generation in use and its registry, as one pair
+        let (runtime, registry) = self.snapshot();
+        runtime.stack.resolver.on_network_change();
+        registry.network_changed();
     }
 
     /// Makes `next` the generation that outlives-a-reload objects see: chain

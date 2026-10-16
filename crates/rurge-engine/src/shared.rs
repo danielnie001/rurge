@@ -132,8 +132,10 @@ pub struct EngineShared {
     /// The `external` outbounds built so far.
     pub externals: Arc<ExternalPrograms>,
     /// The network the machine is on now (phase 3 M1 design 2), for the
-    /// `SUBNET` rules of every generation. Unknown until somebody stores
-    /// what they read off the machine.
+    /// `SUBNET` rules and `subnet` groups of every generation, and for the DNS
+    /// that `[SSID Setting]` sets when one is built. Unknown until somebody
+    /// stores what they read off the machine; once there is an engine,
+    /// `Engine::network_changed` does, and tells the generation in use.
     pub network: Arc<NetworkCell>,
 }
 

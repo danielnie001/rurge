@@ -891,7 +891,7 @@ impl Resolver {
                                 && !self.aaaa_suppressed.swap(true, Ordering::Relaxed)
                             {
                                 // Only the flush is named: `on_network_change`
-                                // lifts the suppression too, but nothing calls it yet.
+                                // flushes too, and that lifts the suppression.
                                 tracing::warn!(
                                     "AAAA answers timed out in {n} lookups in a row; AAAA queries suppressed until the DNS cache is flushed"
                                 );

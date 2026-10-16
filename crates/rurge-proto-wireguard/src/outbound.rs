@@ -93,8 +93,10 @@ impl WireGuardOutbound {
     }
 
     /// The network changed: a running tunnel dials every carrier anew and
-    /// greets the peers again (M4 design 6.5). Nothing detects it before
-    /// phase 3; one that is starting uses the new network anyway.
+    /// greets the peers again (M4 design 6.5). The engine tells every outbound
+    /// of the generation in use when it learns that the network has changed
+    /// (`Outbound::network_changed`, phase 3 M1 design 5); one that is
+    /// starting uses the new network anyway.
     pub fn network_changed(&self) {
         if let Ok(slot) = self.device.try_lock()
             && let Some(device) = slot.as_ref()

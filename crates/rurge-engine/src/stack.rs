@@ -2,7 +2,8 @@
 //! resource manager → set registry → GeoIP → resolver. `rurge run`,
 //! `rule match` and `dns lookup` all build it here.
 
-use rurge_config::{Config, Diagnostic, Diagnostics, codes};
+use rurge_config::general::{DnsServer, EncryptedDns};
+use rurge_config::{Config, Diagnostic, Diagnostics, NetworkFacts, codes};
 use rurge_dns::system::SystemDns;
 use rurge_dns::{DnsConnectors, Resolver, ResolverConfig, ResolverDeps};
 use rurge_net::connector::{DirectConnector, SystemResolve};
@@ -32,6 +33,55 @@ pub struct StackOptions {
     /// Interface binding and TOS for outbound sockets (the bin injects
     /// `rurge-platform`; everything else uses `NoopSocketHook`).
     pub socket_hook: Arc<dyn rurge_net::socket::SocketHook>,
+    /// How the network the machine is on changes the DNS the profile asks
+    /// for; applied to the resolver's configuration before the hook of
+    /// `build_stack_with` sees it. `Runtime::build` replaces it with the one
+    /// it works out from the engine's network; a command that builds a stack
+    /// without an engine leaves it at the default, which changes nothing, or
+    /// works it out itself (`DnsOverride::for_network`).
+    pub dns_override: DnsOverride,
+}
+
+/// How the network the machine is on changes the DNS of the profile (phase 3
+/// M1 design 7.3): the line of `[SSID Setting]` the network matches may list
+/// `dns-server`s and `encrypted-dns-server`s, and each list it gives takes the
+/// place of the profile's whole list while the machine is on that network.
+/// What the line does not list stays the profile's.
+///
+/// Two overrides are equal when they change the same things in the same way,
+/// so whoever holds the override a generation was built with can tell whether
+/// another network would change the DNS differently.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DnsOverride {
+    /// `Some`: these replace `dns-server`.
+    pub servers: Option<Vec<DnsServer>>,
+    /// `Some`: these replace `encrypted-dns-server`; `Some` of nothing is
+    /// `encrypted-dns-server = off`.
+    pub encrypted: Option<Vec<EncryptedDns>>,
+}
+
+impl DnsOverride {
+    /// The override of the line of `[SSID Setting]` that `facts` match: the
+    /// lists it gives. It changes nothing when no line matches, nor for a line
+    /// that gives no DNS.
+    pub fn for_network(cfg: &Config, facts: &NetworkFacts) -> DnsOverride {
+        cfg.effective_ssid_setting(facts)
+            .map(|line| DnsOverride {
+                servers: line.dns_server.clone(),
+                encrypted: line.encrypted_dns_server.clone(),
+            })
+            .unwrap_or_default()
+    }
+
+    /// Puts what the override sets into `resolver`, in place of the profile's.
+    pub fn apply(&self, resolver: &mut ResolverConfig) {
+        if let Some(servers) = &self.servers {
+            resolver.servers.clone_from(servers);
+        }
+        if let Some(encrypted) = &self.encrypted {
+            resolver.encrypted.clone_from(encrypted);
+        }
+    }
 }
 
 pub struct Stack {
@@ -56,7 +106,9 @@ pub async fn build_stack(cfg: &Config, opts: &StackOptions) -> anyhow::Result<St
 }
 
 /// `build_stack` with a hook that edits the resolver configuration before
-/// the resolver is built (`dns lookup --server`).
+/// the resolver is built (`dns lookup --server`). The hook sees it with the
+/// network's override applied (`StackOptions::dns_override`), and has the last
+/// word.
 pub async fn build_stack_with(
     cfg: &Config,
     opts: &StackOptions,
@@ -92,6 +144,7 @@ pub async fn build_stack_with(
     });
     let mut resolver_cfg = ResolverConfig::from_config(cfg);
     resolver_cfg.cache_capacity = opts.dns_cache_size;
+    opts.dns_override.apply(&mut resolver_cfg);
     customize(&mut resolver_cfg);
     let resolver_connectors = match &opts.dns_connector {
         Some(connectors) => connectors.clone(),
@@ -216,6 +269,7 @@ fn sets_behind(sets: &[SetStatus], held: &[ResourceStatus]) -> usize {
 mod tests {
     use super::*;
     use rurge_config::config::{LoadOptions, from_text};
+    use rurge_config::{NetKind, Primary, WifiLink};
     use rurge_net::resource::{ResourceKind, ResourceSource, resource_key};
     use rurge_net::testing::TestServer;
     use rurge_rules::set_format::SetKind;
@@ -505,5 +559,127 @@ mod tests {
             .find(|set| set.key.as_deref() == Some(key.as_str()))
             .expect("the set of the profile");
         assert_eq!((set.entries, set.state.as_str()), (LINES, "ok"));
+    }
+
+    fn on_wifi(ssid: &str) -> NetworkFacts {
+        NetworkFacts {
+            primary: Some(Primary {
+                interface: "wlan0".to_string(),
+                kind: NetKind::Wifi,
+                routers: Vec::new(),
+            }),
+            wifi: Some(WifiLink {
+                interface: "wlan0".to_string(),
+                ssid: Some(ssid.to_string()),
+                bssid: None,
+            }),
+        }
+    }
+
+    fn on_cable() -> NetworkFacts {
+        NetworkFacts {
+            primary: Some(Primary {
+                interface: "eth0".to_string(),
+                kind: NetKind::Wired,
+                routers: Vec::new(),
+            }),
+            wifi: None,
+        }
+    }
+
+    /// A profile with DNS of its own and three lines of `[SSID Setting]`: one
+    /// lists servers, one turns encrypted DNS off, one says nothing of DNS.
+    fn with_ssid_settings() -> Config {
+        let loaded = from_text(
+            "[General]\ndns-server = 10.0.0.1\n\
+             encrypted-dns-server = https://global.example/dns-query\n\
+             [Rule]\nFINAL,DIRECT\n\
+             [SSID Setting]\nSSID:Home dns-server = 192.168.1.1\n\
+             TYPE:WIRED encrypted-dns-server = off\nTYPE:WIFI suspend = true\n",
+            Path::new("t.conf"),
+            &LoadOptions::for_tests(),
+        );
+        assert!(!loaded.diagnostics.has_errors());
+        loaded.config
+    }
+
+    /// What the network sets is what the first line it matches says of DNS:
+    /// the lists it gives, and nothing of the rest.
+    #[test]
+    fn the_override_of_a_network_comes_from_the_first_line_it_matches() {
+        let cfg = with_ssid_settings();
+        assert_eq!(
+            DnsOverride::for_network(&cfg, &on_wifi("Home")),
+            DnsOverride {
+                servers: Some(vec![DnsServer::Udp("192.168.1.1:53".parse().unwrap())]),
+                encrypted: None,
+            }
+        );
+        // `off` is a list, an empty one
+        assert_eq!(
+            DnsOverride::for_network(&cfg, &on_cable()),
+            DnsOverride {
+                servers: None,
+                encrypted: Some(Vec::new()),
+            }
+        );
+        // a line that says nothing of DNS, and no line at all
+        assert_eq!(
+            DnsOverride::for_network(&cfg, &on_wifi("Cafe")),
+            DnsOverride::default()
+        );
+        assert_eq!(
+            DnsOverride::for_network(&cfg, &NetworkFacts::default()),
+            DnsOverride::default()
+        );
+    }
+
+    /// A list the override gives takes the place of the profile's whole list;
+    /// what it does not give stays.
+    #[test]
+    fn an_override_replaces_the_lists_it_gives_and_leaves_the_rest() {
+        let cfg = with_ssid_settings();
+        let own = ResolverConfig::from_config(&cfg);
+        assert_eq!(
+            own.servers,
+            [DnsServer::Udp("10.0.0.1:53".parse().unwrap())]
+        );
+        assert_eq!(own.encrypted.len(), 1);
+
+        let mut at_home = own.clone();
+        DnsOverride::for_network(&cfg, &on_wifi("Home")).apply(&mut at_home);
+        assert_eq!(
+            at_home.servers,
+            [DnsServer::Udp("192.168.1.1:53".parse().unwrap())]
+        );
+        assert_eq!(at_home.encrypted, own.encrypted);
+
+        let mut at_the_desk = own.clone();
+        DnsOverride::for_network(&cfg, &on_cable()).apply(&mut at_the_desk);
+        assert_eq!(at_the_desk.servers, own.servers);
+        assert!(at_the_desk.encrypted.is_empty());
+
+        let mut elsewhere = own.clone();
+        DnsOverride::default().apply(&mut elsewhere);
+        assert_eq!(elsewhere.servers, own.servers);
+        assert_eq!(elsewhere.encrypted, own.encrypted);
+    }
+
+    /// The URL of an encrypted DNS server can carry a user name and a
+    /// password; an override shows neither.
+    #[test]
+    fn the_debug_of_an_override_leaves_credentials_out() {
+        let over = DnsOverride {
+            servers: None,
+            encrypted: Some(vec![
+                EncryptedDns::parse("https://alice:hunter2@dns.example/dns-query").unwrap(),
+            ]),
+        };
+        let shown = format!("{over:?}\n{over:#?}");
+        assert!(shown.contains("dns.example"), "{shown}");
+        assert!(
+            !shown.contains("alice") && !shown.contains("hunter2"),
+            "{shown}"
+        );
     }
 }

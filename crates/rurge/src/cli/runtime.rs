@@ -92,7 +92,7 @@ impl RuntimeArgs {
 }
 
 pub use rurge_engine::stack::Stack;
-use rurge_engine::stack::StackOptions;
+use rurge_engine::stack::{DnsOverride, StackOptions};
 
 impl Runtime {
     /// Options for `rurge_engine::stack::build_stack` with the platform DNS adapter injected.
@@ -109,6 +109,10 @@ impl Runtime {
             // build the stack without an engine, so they stay direct.
             dns_connector: None,
             socket_hook: Arc::new(PlatformSockets),
+            // `Runtime::build` works out the network's own; the commands that
+            // build a stack without an engine set nothing unless they work
+            // one out themselves.
+            dns_override: DnsOverride::default(),
         }
     }
 }

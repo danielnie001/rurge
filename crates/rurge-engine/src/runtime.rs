@@ -2,7 +2,7 @@
 
 use crate::outbounds::EngineFactory;
 use crate::shared::EngineShared;
-use crate::stack::{Stack, StackOptions, build_stack};
+use crate::stack::{DnsOverride, Stack, StackOptions, build_stack};
 use crate::subscriptions::Subscriptions;
 use rurge_config::{Config, Diagnostics};
 use rurge_policy::PolicyRegistry;
@@ -41,12 +41,20 @@ pub struct Runtime {
     pub(crate) subscriptions: Subscriptions,
     /// The task watching `subscriptions`; it goes with the generation.
     pub(crate) watcher: OnceLock<AbortOnDropHandle<()>>,
+    /// The DNS override of the network the machine was on when this
+    /// generation was built; the resolver was made with it.
+    dns_override: DnsOverride,
 }
 
 impl Runtime {
     /// Resources → sets → GeoIP → resolver → rule engine → policy registry.
     /// Must run inside a tokio runtime (background tasks are spawned).
     pub async fn build(config: Config, mut opts: RuntimeOptions) -> anyhow::Result<Runtime> {
+        // the DNS override of the network as the engine's cell has it now
+        // (phase 3 M1 design 7.3): the resolver is made with it, and the
+        // generation remembers it
+        let dns_override = DnsOverride::for_network(&config, &opts.shared.network.load());
+        opts.stack.dns_override = dns_override.clone();
         let dns_pipeline = if config.general.encrypted_dns_follow_outbound_mode {
             let fallback: Arc<dyn rurge_net::connector::Connector> =
                 Arc::new(rurge_net::connector::DirectConnector::new(Arc::new(
@@ -123,7 +131,17 @@ impl Runtime {
             factory,
             subscriptions,
             watcher: OnceLock::new(),
+            dns_override,
         })
+    }
+
+    /// The DNS override of the network the machine was on when this generation
+    /// was built (phase 3 M1 design 7.3); the resolver was made with it. It
+    /// stays what it was. To find out whether the network that is now would
+    /// override something else, compare it with `DnsOverride::for_network` of
+    /// this generation's config and the network of the moment.
+    pub fn dns_override(&self) -> &DnsOverride {
+        &self.dns_override
     }
 
     /// Diagnostics produced while building the stack (sets, GeoIP, resolver),
