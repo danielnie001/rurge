@@ -1224,6 +1224,40 @@ mod tests {
         );
     }
 
+    /// An apostrophe or a parenthesis that pairs with nothing is an ordinary
+    /// character (line-splitting design LS-D1, LS-D3); a quote at the start
+    /// of a sub-rule's value still guards a `)` and a comma.
+    #[test]
+    fn an_apostrophe_or_an_unpaired_parenthesis_does_not_take_the_rest_of_the_line() {
+        let ua = parse("USER-AGENT,Bob's App*,DIRECT").unwrap();
+        assert!(
+            matches!(&ua.kind, RuleKind::UserAgent(g) if g.source() == "Bob's App*"),
+            "{ua}"
+        );
+        assert_eq!(ua.policy, PolicyRef::Builtin(Builtin::Direct), "{ua}");
+        let regex = parse(r"URL-REGEX,^http://a\.example/[^(]*$,REJECT").unwrap();
+        assert!(
+            matches!(&regex.kind, RuleKind::UrlRegex(p) if p.source == r"^http://a\.example/[^(]*$"),
+            "{regex}"
+        );
+        assert_eq!(regex.policy, PolicyRef::Builtin(Builtin::Reject), "{regex}");
+        let paren = parse("DOMAIN,b.example,Proxy (US,extended-matching").unwrap();
+        assert_eq!(
+            paren.policy,
+            PolicyRef::Named("Proxy (US".into()),
+            "{paren}"
+        );
+        assert!(
+            paren.params.extended_matching && paren.params.unknown.is_empty(),
+            "{paren}"
+        );
+        let and = parse(r#"AND,((USER-AGENT,"a)b,c"),(DEST-PORT,443)),DIRECT"#).unwrap();
+        assert!(
+            matches!(&and.kind, RuleKind::And(subs) if matches!(&subs[0].kind, RuleKind::UserAgent(g) if g.source() == "a)b,c")),
+            "{and}"
+        );
+    }
+
     /// The twelve `PROTOCOL` keywords (manual, Protocol and Network Rules)
     /// each mean their own kind, and they are case-sensitive: neither a
     /// lower-case spelling nor a neighbour's name reads as another keyword.

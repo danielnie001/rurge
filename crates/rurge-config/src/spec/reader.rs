@@ -3,8 +3,7 @@
 
 use crate::diagnostic::{Diagnostic, Severity, codes};
 use crate::policy::{ProxyPolicy, is_name, named};
-use crate::redact::split_top_level;
-use crate::value::{parse_bool, parse_key_value, split_list};
+use crate::value::{parse_bool, parse_key_value, split_items, split_list};
 use std::collections::HashSet;
 use std::str::FromStr;
 
@@ -27,7 +26,7 @@ pub(crate) fn quotable(value: &str) -> bool {
 /// password `aHVudGVyMg==` arrives as `ahvudgvymg`, `"pa=ss"` as `pa` — so
 /// this is decided on the text of the line, not on the key.
 pub(crate) fn written_as_name(definition: &str, key: &str) -> bool {
-    split_top_level(definition).into_iter().all(|item| {
+    split_items(definition).into_iter().all(|item| {
         let reads_as_key = split_list(item).pop().is_some_and(|field| {
             parse_key_value(&field).is_some_and(|(name, _)| name.eq_ignore_ascii_case(key))
         });

@@ -339,12 +339,13 @@ pub fn parse_policy(name: &str, definition: &str, span: &Span) -> Result<ProxyPo
 /// spelled.
 ///
 /// The line then reads as it did alone, the overrides in place. What is
-/// appended therefore stands in front of a last item that leaves a quote or
-/// a group open: the parser gives such an item the rest of the line.
+/// appended therefore stands in front of a last item that leaves a quote open:
+/// the parser gives such an item the rest of the line (a parenthesis that
+/// pairs with nothing groups nothing, design LS-D3).
 pub fn with_params(definition: &str, overrides: &[(String, String)]) -> String {
     let mut written: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
-    let items = crate::redact::split_top_level(definition);
+    let items = crate::value::split_items(definition);
     // how many fields the parser reads before the parameters; an item it
     // drops, an empty one, is none of them
     let mut head = items
@@ -389,10 +390,11 @@ pub fn with_params(definition: &str, overrides: &[(String, String)]) -> String {
     out.join(",")
 }
 
-/// Whether `item` — one item of a line — ends inside a quote or a
-/// parenthesised group: a comma after it would not end it.
+/// Whether `item` — one item of a line — ends inside a quote: a comma after
+/// it would not end it. Only a quote can be left open; a parenthesis that
+/// pairs with nothing groups nothing (line-splitting design LS-D3).
 fn leaves_open(item: &str) -> bool {
-    crate::redact::split_top_level(&format!("{item},")).len() == 1
+    crate::value::split_items(&format!("{item},")).len() == 1
 }
 
 /// `value` as a line has to spell it to read it back the same. The parser
@@ -919,6 +921,26 @@ external-policy-modifier=\"password=hunter2\"",
             "trojan, t.test, 443, password=pw, tfo=true, sni=a.test, test-url=http://apple.com/"
         );
         assert_eq!(with_params("http, h.test, 80", &[]), "http, h.test, 80");
+        assert_eq!(
+            with_params(
+                "http, h.test, 80, user, Bob's pw, tfo=false",
+                &pairs(&[("tfo", "true")])
+            ),
+            "http, h.test, 80, user, Bob's pw, tfo=true"
+        );
+    }
+
+    /// An apostrophe or a parenthesis that pairs with nothing is part of a
+    /// member's name (line-splitting design LS-D1, LS-D3).
+    #[test]
+    fn a_member_with_an_apostrophe_or_an_unpaired_parenthesis_is_one_member() {
+        let g = parse_group(
+            "G",
+            "select, Tom's HK, Tom's US, Proxy (US, DIRECT",
+            &span(),
+        )
+        .unwrap();
+        assert_eq!(g.members, ["Tom's HK", "Tom's US", "Proxy (US", "DIRECT"]);
     }
 
     /// A value the list splitter would act on is quoted, and the line reads
@@ -995,10 +1017,10 @@ external-policy-modifier=\"password=hunter2\"",
     /// every line of up to three of these after each head: the parser takes
     /// the quotes off a whole item before it looks for a key, keeps a comma
     /// inside a quoted item, compares keys without their case, and gives an
-    /// unclosed quote or group the rest of the line — what is appended must
-    /// not end up in it. And it takes the type, and a server and a port
-    /// unless the type has none, for what they are whatever they are spelled
-    /// like.
+    /// unclosed quote the rest of the line (a parenthesis that pairs with
+    /// nothing groups nothing, design LS-D3) — what is appended must not end
+    /// up in it. And it takes the type, and a server and a port unless the
+    /// type has none, for what they are whatever they are spelled like.
     #[test]
     fn a_modified_line_reads_as_the_line_did_with_the_modifier_in_place() {
         const HEADS: [&str; 5] = [
@@ -1029,7 +1051,7 @@ external-policy-modifier=\"password=hunter2\"",
             " \"password=p,w",
             " \"s3cret",
             " sni='a.test",
-            // an unclosed group
+            // a parenthesis left open, which groups nothing (design LS-D3)
             " password=(p,w",
             " (tfo=false",
             // a backslash that takes the closing quote

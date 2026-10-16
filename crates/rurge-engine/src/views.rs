@@ -327,7 +327,9 @@ mod tests {
             "a quoted password must not change the hash either"
         );
 
-        // the quote may open in the middle of the value, too
+        // a quote in the middle of the value opens nothing (line-splitting
+        // design LS-D1): the parser reads `ab"c` and an item `d"`, and
+        // neither half reaches the hash
         let mid = registry("A = trojan, t.test, 443, password=ab\"c,d\", ws=true");
         let same_but_mid = registry("A = trojan, t.test, 443, password=ab\"c,e\", ws=true");
         assert_eq!(

@@ -496,6 +496,37 @@ mod tests {
         assert_eq!(e.span.line, 2);
     }
 
+    /// A target with an apostrophe in its name is one target: the next one
+    /// is read too (line-splitting design LS-D1).
+    #[test]
+    fn a_target_with_an_apostrophe_in_its_name_is_read_with_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("main.conf"),
+            "[Rule]\n#!include Tom's rules.dconf, b.dconf\nFINAL,DIRECT\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("Tom's rules.dconf"),
+            "[Rule]\nDOMAIN,a,DIRECT\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.dconf"), "[Rule]\nDOMAIN,b,DIRECT\n").unwrap();
+        let (p, d) = load(dir.path(), "main.conf");
+        assert!(d.is_empty(), "{:?}", d.into_vec());
+        let rules: Vec<_> = p
+            .section("Rule")
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.raw.as_str())
+            .collect();
+        assert_eq!(
+            rules,
+            ["DOMAIN,a,DIRECT", "DOMAIN,b,DIRECT", "FINAL,DIRECT"]
+        );
+    }
+
     #[test]
     fn wildcard_named_sections() {
         let dir = tempfile::tempdir().unwrap();

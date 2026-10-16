@@ -14,7 +14,7 @@
 use crate::policy::PolicyKind;
 use crate::requirement::{is_requirement_prefix, split_line_slice};
 use crate::text::{directive_name, is_comment, strip_inline_comment};
-use crate::value::{parse_key_value, split_list};
+use crate::value::{item_spans, parse_key_value, split_list};
 
 /// Keys whose whole value is a secret when they stand alone on a line
 /// (`[WireGuard]` `private-key`, `[Snell Server]` `psk`, `[Tailscale]`
@@ -452,7 +452,9 @@ fn key_line(line: &str) -> Option<KeyLine<'_>> {
     let at = equals?;
     let key = &line[..at];
     // a comma — or a `，`, which an input method types for one — in front of
-    // the `=`: the text is no key
+    // the `=`: the text is no key. It keeps today's reading only (line-splitting
+    // design 6.1): with the parsers' reading as well, `a'b, http-listen = …`
+    // would no longer be a key line, and its password would stay where it is.
     if next_comma(key, true).is_some() {
         return None;
     }
@@ -515,7 +517,10 @@ fn redact_entry(line: &str) -> String {
         return redact_definition(line);
     };
     let key = &line[..at];
-    if next_comma(key, true).is_some() {
+    // a comma in front of the `=`, by the parsers' reading or by today's
+    // (`next_comma`, which also takes a quote in the middle of a value for an
+    // opening one): redacting the line both ways only hides more
+    if next_comma(key, true).is_some() || item_spans(key, true).len() > 1 {
         return redact_both_ways(line);
     }
     let width = line[at..].chars().next().map_or(1, char::len_utf8);
@@ -558,17 +563,18 @@ fn hide_controller(value: &str) -> String {
 }
 
 /// A comma-separated `value` with each of its items shown as `shown` makes
-/// of it. The items are the parsers' own: quotes and parentheses group.
+/// of it. The items are the parsers' own, taken in regions (design LS-D9): a
+/// region of several items is shown as one, which hides at least as much.
 fn hide_listed(value: &str, shown: fn(&str) -> String) -> String {
-    split_top_level(value)
-        .into_iter()
-        .map(|item| {
-            let t = item.trim_start();
-            let lead = &item[..item.len() - t.len()];
-            format!("{lead}{}", shown(t))
-        })
-        .collect::<Vec<_>>()
-        .join(",")
+    let mut out = String::with_capacity(value.len());
+    for r in regions(value) {
+        let item = &value[r.start..r.end];
+        let t = item.trim_start();
+        out.push_str(&item[..item.len() - t.len()]);
+        out.push_str(&shown(t));
+        out.push_str(&value[r.end..r.sep_end]);
+    }
+    out
 }
 
 /// The directive of a profile a provider issues, whose line carries the
@@ -635,22 +641,25 @@ fn link_hidden(word: &str) -> String {
 
 /// The targets of `#!include` are a list separated by commas, and a path with
 /// a space in it can be quoted: a target with `://` in it is a link, a local
-/// path stays.
+/// path stays. The targets are taken in regions (design LS-D9), and a region
+/// with a link in it goes whole.
 fn hide_include_links(targets: &str) -> String {
-    split_top_level(targets)
-        .into_iter()
-        .map(|target| {
-            if target.contains("://") {
-                let rest = target.trim_start();
-                let lead = &target[..target.len() - rest.len()];
-                let trail = &rest[rest.trim_end().len()..];
-                format!("{lead}***{trail}")
-            } else {
-                target.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(",")
+    let mut out = String::with_capacity(targets.len());
+    for r in regions(targets) {
+        let target = &targets[r.start..r.end];
+        if target.contains("://") {
+            let rest = target.trim_start();
+            let lead = &target[..target.len() - rest.len()];
+            let trail = &rest[rest.trim_end().len()..];
+            out.push_str(lead);
+            out.push_str("***");
+            out.push_str(trail);
+        } else {
+            out.push_str(target);
+        }
+        out.push_str(&targets[r.end..r.sep_end]);
+    }
+    out
 }
 
 /// Where the credential of `item` ends: its last `@`, as the parsers split
@@ -792,10 +801,52 @@ fn hide_comment_links(text: &str) -> String {
 }
 
 /// A policy definition (the text right of `name =`) with its secrets blanked:
-/// the positional values of every type that takes a server and a port, and
-/// every secret `name=value` parameter, however the line spells it.
+/// every secret `name=value` parameter, however the line spells it, and the
+/// positional values of every type that takes a server and a port. The items
+/// go first, on the text as written, and the positional values then on what
+/// that made of it (design LS-D9).
 pub fn redact_definition(definition: &str) -> String {
-    hide_url_credentials(&redact_items(&redact_positional_credentials(definition), 0))
+    hide_url_credentials(&redact_positional_credentials(&redact_items(definition, 0)))
+}
+
+/// One region of a list: where it starts, where its first item ends, where
+/// its last item ends and where the separator after that one ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Region {
+    start: usize,
+    first_end: usize,
+    end: usize,
+    sep_end: usize,
+}
+
+/// Where the regions of `text` are (design LS-D9): a region is an item of the
+/// parsers' (`value::item_spans`) together with the items that follow it as
+/// long as today's reading, from the item's start (`next_comma`), runs past
+/// their end — a quote or a parenthesis in the middle of a value guarded a
+/// comma, and its writer may have meant it to. A region ends where the later
+/// of the two readings ends, moved on to the parsers' next cut; the next
+/// region starts with the item after it. Every scan stops at its own region,
+/// so a text is read twice at most.
+fn regions(text: &str) -> Vec<Region> {
+    let spans = item_spans(text, false);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < spans.len() {
+        let start = spans[i].start;
+        let reach = next_comma(&text[start..], false).map_or(text.len(), |(at, _)| start + at);
+        let mut j = i;
+        while j + 1 < spans.len() && spans[j].end < reach {
+            j += 1;
+        }
+        out.push(Region {
+            start,
+            first_end: spans[i].end,
+            end: spans[j].end,
+            sep_end: spans[j].sep_end,
+        });
+        i = j + 1;
+    }
+    out
 }
 
 /// How many parenthesised groups deep `redact_items` follows. A `[WireGuard]`
@@ -805,14 +856,49 @@ pub fn redact_definition(definition: &str) -> String {
 const MAX_GROUP_DEPTH: usize = 4;
 
 /// `text`, a list of items, with every item redacted. The items are the
-/// parsers' own (`split_top_level` is `split_list`'s state machine) and the
-/// commas between them stay.
+/// parsers' own (`value::item_spans`); an item whose value today's reading
+/// (`next_comma`) carries past the item's end is redacted together with the
+/// items it carries along — a region (design LS-D9). The separators between
+/// the regions stay.
 fn redact_items(text: &str, depth: usize) -> String {
-    split_top_level(text)
-        .into_iter()
-        .map(|item| redact_item(item, depth))
-        .collect::<Vec<_>>()
-        .join(",")
+    let mut out = String::with_capacity(text.len());
+    for r in regions(text) {
+        let body = &text[r.start..r.end];
+        if r.first_end == r.end {
+            out.push_str(&redact_item(body, depth));
+        } else {
+            out.push_str(&redact_joined(body, r.first_end - r.start));
+        }
+        out.push_str(&text[r.end..r.sep_end]);
+    }
+    out
+}
+
+/// A region of several items (design LS-D9): when the first is a secret
+/// parameter, its value is hidden together with the items the region takes
+/// along; otherwise every secret it names is searched for by name across the
+/// whole region.
+fn redact_joined(region: &str, first_len: usize) -> String {
+    let rest = region.trim_start();
+    let lead = &region[..region.len() - rest.len()];
+    let body = rest.trim_end();
+    let trail = &rest[body.len()..];
+    let secret = split_list(&region[..first_len])
+        .pop()
+        .and_then(|field| parse_key_value(&field).map(|(key, _)| key.to_string()))
+        .filter(|key| {
+            SECRET_PARAMS
+                .iter()
+                .any(|param| key.eq_ignore_ascii_case(param))
+        });
+    match (secret, body.split_once('=')) {
+        (Some(key), Some((name, value))) if name.trim() == key => {
+            let blank = &value[..value.len() - value.trim_start().len()];
+            format!("{lead}{name}={blank}***{trail}")
+        }
+        (Some(key), _) => format!("{lead}{key}=***{trail}"),
+        (None, _) => redact_by_name(region),
+    }
 }
 
 /// One item, the way the parsers read it: `split_list` takes the quotes off
@@ -879,6 +965,18 @@ fn is_param_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
+/// One field of a policy line as `redact_positional_credentials` counts it:
+/// where it starts, ends and where the separator after it ends, and whether
+/// it is one of the words a first field was split into
+/// (`words_of_type_field`).
+#[derive(Clone, Copy)]
+struct FieldSpan {
+    start: usize,
+    end: usize,
+    sep_end: usize,
+    word: bool,
+}
+
 /// Blanks the positional tokens of a policy line: every field from the fourth
 /// on (the first three are the type, the server and the port) — that is where
 /// Surge puts `username, password`. It is done for the types that take a
@@ -889,9 +987,12 @@ fn is_param_name(name: &str) -> bool {
 /// password, module` is an `ss` line, whose password stands there too. For a
 /// type that takes a server, what stands in the port's place and is no
 /// number is a user name or a password that lost its comma (`8080 alice,
-/// hunter2`), and goes too. The fields are the parser's: `split_list`
+/// hunter2`), and goes too. The fields are the parser's
+/// (`value::item_spans`, with `，` cutting too — design LS-D10): `split_list`
 /// reads the type and the port with the quotes off, and an empty item is
-/// none. A token counts as
+/// none; a field that is blanked goes together with the items today's
+/// reading takes along with it (`next_comma`, design LS-D9), and each of them
+/// that is not empty counts as a field. A token counts as
 /// a named parameter (and is kept) only when what stands before its first `=`
 /// is a name and what follows it is non-empty and not made only of `=`, so
 /// base64 padding (`aHVudGVyMg==`) is redacted while `tfo=true` survives, and
@@ -903,27 +1004,24 @@ fn is_param_name(name: &str) -> bool {
 /// number stands there, `words_of_type_field` says. Any other line is
 /// returned unchanged.
 fn redact_positional_credentials(value: &str) -> String {
-    // the fields as where they start, where they end and where the separator
-    // after them ends. A line typed with an input method may have `，` for some
-    // of its commas: it is read here as the author meant it, and the
-    // separators stay
-    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
-    let mut from = 0usize;
-    while let Some((at, width)) = next_comma(&value[from..], true) {
-        spans.push((from, from + at, from + at + width));
-        from += at + width;
-    }
-    spans.push((from, value.len(), value.len()));
-    let spans = words_of_type_field(value, spans);
-    let tokens: Vec<(&str, &str)> = spans
-        .iter()
-        .map(|&(start, end, sep_end)| (&value[start..end], &value[end..sep_end]))
+    // the fields as the parsers read them. A line typed with an input method
+    // may have `，` for some of its commas: it is read here as the author
+    // meant it (design LS-D10), and the separators stay
+    let spans: Vec<FieldSpan> = item_spans(value, true)
+        .into_iter()
+        .map(|span| FieldSpan {
+            start: span.start,
+            end: span.end,
+            sep_end: span.sep_end,
+            word: false,
+        })
         .collect();
+    let spans = words_of_type_field(value, spans);
     // the fields the parser reads, an empty item being none; only as many as
     // the decision needs are looked at
-    let mut read = tokens
+    let mut read = spans
         .iter()
-        .filter_map(|(token, _)| split_list(token).pop());
+        .filter_map(|span| split_list(&value[span.start..span.end]).pop());
     let takes_server = read
         .next()
         .is_some_and(|keyword| takes_server_type(&keyword));
@@ -935,22 +1033,47 @@ fn redact_positional_credentials(value: &str) -> String {
     }
     let mut index = 0usize;
     let mut out = String::with_capacity(value.len());
-    for (tok, sep) in tokens {
-        if let Some(field) = split_list(tok).pop() {
-            index += 1;
-            let t = tok.trim_start();
-            let stray_port =
-                index == 3 && takes_server && field.trim_matches(is_blank).parse::<u16>().is_err();
-            if (index > 3 || stray_port) && !is_named_param(t.trim_end()) {
-                out.push_str(&tok[..tok.len() - t.len()]);
-                out.push_str("***");
-            } else {
-                out.push_str(tok);
+    let mut k = 0usize;
+    while k < spans.len() {
+        let span = spans[k];
+        let tok = &value[span.start..span.end];
+        let blanked = match split_list(tok).pop() {
+            Some(field) => {
+                index += 1;
+                let t = tok.trim_start();
+                let stray_port = index == 3
+                    && takes_server
+                    && field.trim_matches(is_blank).parse::<u16>().is_err();
+                (index > 3 || stray_port) && !is_named_param(t.trim_end())
             }
-        } else {
-            out.push_str(tok);
+            None => false,
+        };
+        if !blanked {
+            out.push_str(&value[span.start..span.sep_end]);
+            k += 1;
+            continue;
         }
-        out.push_str(sep);
+        let t = tok.trim_start();
+        out.push_str(&tok[..tok.len() - t.len()]);
+        out.push_str("***");
+        // the items today's reading takes along with the field (design
+        // LS-D9) go with it, each that is not empty counted as a field; a
+        // word of the first field takes none (the blanks between the words
+        // are no commas)
+        let mut last = k;
+        if !span.word {
+            let reach = next_comma(&value[span.start..], true)
+                .map_or(value.len(), |(at, _)| span.start + at);
+            while last + 1 < spans.len() && spans[last].end < reach {
+                last += 1;
+                let taken = spans[last];
+                if split_list(&value[taken.start..taken.end]).pop().is_some() {
+                    index += 1;
+                }
+            }
+        }
+        out.push_str(&value[spans[last].end..spans[last].sep_end]);
+        k = last + 1;
     }
     out
 }
@@ -974,17 +1097,19 @@ fn takes_server_type(keyword: &str) -> bool {
 /// known and accepted: a line that lost the comma after its type and has no
 /// port number in the third place (`P = http h.example, 8080 alice, hunter2`)
 /// is not read as a policy line by this rule.
-fn words_of_type_field(
-    value: &str,
-    spans: Vec<(usize, usize, usize)>,
-) -> Vec<(usize, usize, usize)> {
+fn words_of_type_field(value: &str, spans: Vec<FieldSpan>) -> Vec<FieldSpan> {
     let Some(first) = spans
         .iter()
-        .position(|&(start, end, _)| split_list(&value[start..end]).pop().is_some())
+        .position(|span| split_list(&value[span.start..span.end]).pop().is_some())
     else {
         return spans;
     };
-    let (start, end, sep_end) = spans[first];
+    let FieldSpan {
+        start,
+        end,
+        sep_end,
+        ..
+    } = spans[first];
     let field = split_list(&value[start..end]).pop().unwrap_or_default();
     let mut words = field.split(char::is_whitespace).filter(|w| !w.is_empty());
     if !(words.next().is_some_and(takes_server_type) && words.next().is_some()) {
@@ -1001,30 +1126,39 @@ fn words_of_type_field(
                 .unwrap_or(rest.len() - lead);
         let gap = rest[word..].len() - rest[word..].trim_start().len();
         if word + gap >= rest.len() {
-            split.push((at, at + word, sep_end));
+            split.push(FieldSpan {
+                start: at,
+                end: at + word,
+                sep_end,
+                word: true,
+            });
             break;
         }
-        split.push((at, at + word, at + word + gap));
+        split.push(FieldSpan {
+            start: at,
+            end: at + word,
+            sep_end: at + word + gap,
+            word: true,
+        });
         at += word + gap;
     }
     split.extend_from_slice(&spans[first + 1..]);
     let port_third = split
         .iter()
-        .filter_map(|&(start, end, _)| split_list(&value[start..end]).pop())
+        .filter_map(|span| split_list(&value[span.start..span.end]).pop())
         .nth(2)
         .is_some_and(|field| field.trim_matches(is_blank).parse::<u16>().is_ok());
     if port_third { split } else { spans }
 }
 
 /// The first comma that is inside no quote and no parenthesised group, by the
-/// parser's own state machine (`value::split_list`): a `"` or a `'` opens a
+/// reading of lists before the line-splitting design: a `"` or a `'` opens a
 /// quote **wherever** it appears, inside `"` a backslash escapes the next
 /// character, inside `'` nothing escapes, and `(` / `)` nest outside quotes.
 /// `None` when there is none — an unterminated quote or group therefore runs
-/// to the end of the line, which is the safe side for redaction.
-///
-/// Everything that has to agree with the parser about where a value ends is
-/// built on this one function, so the two cannot drift apart.
+/// to the end of the line, which is the safe side for redaction. The parsers
+/// no longer read this way (`value::item_spans`); redaction keeps it to
+/// measure how far a value it hides reaches (design LS-D9).
 fn next_top_level_comma(value: &str) -> Option<usize> {
     next_comma(value, false).map(|(at, _)| at)
 }
@@ -1063,20 +1197,6 @@ fn next_comma(value: &str, wide: bool) -> Option<(usize, usize)> {
     None
 }
 
-/// Splits at top-level commas only, returning the raw slices so that quoting
-/// and spacing survive. A top-level comma leaves the scanner with no open
-/// quote and depth 0, so each item is scanned afresh.
-pub(crate) fn split_top_level(value: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut rest = value;
-    while let Some(i) = next_top_level_comma(rest) {
-        out.push(&rest[..i]);
-        rest = &rest[i + 1..];
-    }
-    out.push(rest);
-    out
-}
-
 /// `name=value` with a name before the `=` and a value that is neither empty
 /// nor pure `=` padding. A token that opens with a quote is one quoted value,
 /// `=` and all.
@@ -1089,10 +1209,11 @@ fn is_named_param(token: &str) -> bool {
     })
 }
 
-/// How long a parameter's value is: up to the first comma the parser would
-/// split on — quotes may open anywhere inside the value and parentheses group,
-/// so `ab"c,d"` and `a(b,c)d` are each one value. When the scan starts inside
-/// a group (a secret nested in a `peer = (…)`), depth starts at 0 there, so the
+/// How long a parameter's value is: up to the first comma today's reading
+/// would split on (`next_top_level_comma`) — quotes may open anywhere inside
+/// the value and parentheses group, so `ab"c,d"` and `a(b,c)d` are each one
+/// value, as their writer may have meant them. When the scan starts inside a
+/// group (a secret nested in a `peer = (…)`), depth starts at 0 there, so the
 /// value ends at the group's own next comma.
 fn param_value_len(value: &str) -> usize {
     next_top_level_comma(value).unwrap_or(value.len())
@@ -1442,9 +1563,10 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
         assert_eq!(redact_profile(dns), dns);
     }
 
-    /// The parser opens a quote wherever one appears in a value and groups by
-    /// parentheses, so the value's first byte says nothing about where it
-    /// ends: only a scan by the parser's own rules does.
+    /// A quote or a parenthesis in the middle of a value opens nothing for
+    /// the parser (design LS-D1, LS-D3), but its writer may have meant it to
+    /// guard the comma: the value is hidden as far as today's reading takes
+    /// it, the items it cut off included — a region (design LS-D9).
     #[test]
     fn a_value_ends_at_the_first_top_level_comma_wherever_its_quotes_open() {
         for (def, expected) in [
@@ -1914,7 +2036,9 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
             spelling(format!("{name}\u{3000}=\u{3000}{V}"), V),
             spelling(format!("\u{2003}{name} = \"{both}\"\u{a0}"), &both),
             spelling(format!("{name}=\"{V}\\\"{W}\""), &format!("{V}\"{W}")),
-            spelling(format!("{name}=a\"{both}\"b"), &format!("a\"{both}\"b")),
+            // a quote in the middle of a value opens nothing (design LS-D1):
+            // the parser reads `a"{V}` and the next item is `{W}"b`
+            spelling(format!("{name}=a\"{both}\"b"), &format!("a\"{V}")),
             spelling(format!("{name}=a({both})b"), &format!("a({both})b")),
             Spelling {
                 text: format!("{name}=\"{both}"),
@@ -2143,8 +2267,12 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
                                         bad.push(format!("shows {secret}"));
                                     }
                                 }
+                                // what the parser read into the parameter: a
+                                // part it cut off is an item of its own — on a
+                                // group line a member, which the group's
+                                // `Debug` lists (design 6.3)
                                 for secret in [V, W] {
-                                    if debug.contains(secret) {
+                                    if spelling.value.contains(secret) && debug.contains(secret) {
                                         bad.push(format!("Debug shows {secret}"));
                                     }
                                 }
@@ -2379,8 +2507,10 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
                 "Ext = external, \"ARGS=a,b\", args=\"c,d\", Args = 'e' ",
                 "Ext = external, ARGS=***, args=***, Args = *** ",
             ),
-            // a quote that opens inside the value takes the rest of the line,
-            // as it does for the parser; so does one left open
+            // a quote in the middle of the value opens nothing for the parser
+            // (design LS-D1), but the value is hidden as far as today's
+            // reading takes it; a quote left open where a value starts takes
+            // the rest of the line, for the parser too
             (
                 "Ext = external, args=a\"b,c\"d, local-port=1080",
                 "Ext = external, args=***, local-port=1080",
@@ -3062,6 +3192,63 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
         }
     }
 
+    /// The positional values are counted the way the parser counts its
+    /// fields (line-splitting design 6.3): an apostrophe or a parenthesis
+    /// that pairs with nothing in a server's name no longer hides the
+    /// password behind it, and a group's members stay.
+    #[test]
+    fn positional_credentials_are_counted_as_the_parser_counts_its_fields() {
+        for (line, shown) in [
+            (
+                "X = http, Bob's-host, 80, alice, pw",
+                "X = http, Bob's-host, 80, ***, ***",
+            ),
+            (
+                "X = http, Proxy (US-host, 80, alice, pw",
+                "X = http, Proxy (US-host, 80, ***, ***",
+            ),
+            (
+                "G = select, Tom's HK, policy-path=https://sub.example/list?token=t0k3n",
+                "G = select, Tom's HK, policy-path=***",
+            ),
+        ] {
+            assert_eq!(redact_profile(line), shown, "{line:?}");
+        }
+    }
+
+    /// Design 6.2: a region starts with an item of the parser's, ends where
+    /// the later of the two readings ends — moved on to the parser's next
+    /// cut — and the regions cover the text. Every string of up to six
+    /// characters the reading looks at.
+    #[test]
+    fn a_region_ends_where_the_later_of_the_two_readings_ends() {
+        let mut checked = 0usize;
+        for text in crate::value::short_strings() {
+            let spans = item_spans(&text, false);
+            let mut at = 0;
+            for r in regions(&text) {
+                assert_eq!(r.start, at, "{text:?}");
+                let first = spans
+                    .iter()
+                    .position(|s| s.start == r.start)
+                    .unwrap_or_else(|| panic!("{text:?}"));
+                assert_eq!(spans[first].end, r.first_end, "{text:?}");
+                let last = spans
+                    .iter()
+                    .position(|s| (s.end, s.sep_end) == (r.end, r.sep_end))
+                    .unwrap_or_else(|| panic!("{text:?}"));
+                let old =
+                    next_comma(&text[r.start..], false).map_or(text.len(), |(c, _)| r.start + c);
+                assert!(r.end >= r.first_end && r.end >= old, "{text:?}");
+                assert!(spans[first..last].iter().all(|s| s.end < old), "{text:?}");
+                at = r.sep_end;
+            }
+            assert_eq!(at, text.len(), "{text:?}");
+            checked += 1;
+        }
+        assert!(checked > 500_000, "{checked}");
+    }
+
     /// A token is a named parameter when what stands before its `=` is a
     /// name; anything else is a value, the missing comma of `hunter2
     /// tfo=true` included.
@@ -3171,8 +3358,9 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
     }
 
     /// When the name stands right behind a quote, the value is the rest of the
-    /// item: the quote is none the item pass could read as a whole. A quoted
-    /// item that is whole is that pass's, and never gets here.
+    /// item — of the region (design LS-D9) when today's reading carries the
+    /// item past a comma: the quote is none the item pass could read as a
+    /// whole. A quoted item that is whole is that pass's, and never gets here.
     #[test]
     fn behind_a_quote_the_value_runs_to_the_end_of_the_item() {
         // closed: the item pass reads it
@@ -4160,6 +4348,14 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
                 "empty comments",
                 "ca-passphrase =".to_string() + &" #".repeat(n / 2),
             ),
+            ("open parentheses", "(".repeat(n)),
+            ("close parentheses", ")".repeat(n)),
+            ("open parentheses and commas", "(,".repeat(n / 2)),
+            ("apostrophes and commas", "'a,".repeat(n / 3)),
+            ("first equals signs", "a=".repeat(n / 2)),
+            ("quotes before parentheses", "a\"(".repeat(n / 3)),
+            ("quotes before equals signs", "a\"=".repeat(n / 3)),
+            ("names with apostrophes", "Tom's, ".repeat(n / 7)),
         ];
         for (kind, line) in &lines {
             let ten_thousand: String = line.chars().take(10_000).collect();
