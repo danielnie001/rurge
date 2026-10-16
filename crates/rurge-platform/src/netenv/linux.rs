@@ -2,7 +2,7 @@
 //! and `/sys` and the interface table; a program is run only for the Wi-Fi
 //! link.
 
-use super::host::{Host, say_once};
+use super::host::{Ask, Host, say_once};
 use super::{
     NetKind, Primary, Quick, ReadOpts, Wifi, network_addresses, parse, primary_first,
     unique_in_order,
@@ -95,6 +95,34 @@ pub(crate) fn quick(host: &dyn Host, opts: &ReadOpts) -> Quick {
     }
 }
 
+/// The question to NetworkManager: which access point is active.
+///
+/// It is the list NetworkManager already has (`--rescan no`). By default
+/// `nmcli` scans when the list is older than 30 seconds — as it usually is on
+/// a laptop that stays on its network, for NetworkManager scans little while
+/// it is connected —, and a scan is a request to the radio (time, and battery)
+/// for an answer that needs none: `ACTIVE` is the state of the connection.
+///
+/// `nmcli` writes `yes` in the language of the user, so it is run with
+/// `LC_ALL=C`. That is the charset of the C locale too, and whether a network
+/// name with letters beyond ASCII comes out whole is for the first run on a
+/// real machine to show; `C.UTF-8`, where there is one, keeps the words English
+/// and the text UTF-8.
+fn networkmanager_ask() -> Ask {
+    Ask::new(&[
+        "nmcli",
+        "-t",
+        "-f",
+        "ACTIVE,SSID,BSSID,DEVICE",
+        "dev",
+        "wifi",
+        "list",
+        "--rescan",
+        "no",
+    ])
+    .with_env("LC_ALL", "C")
+}
+
 /// The Wi-Fi link, when a wireless interface is up: NetworkManager's word for
 /// it, else `iw`'s for each of the interfaces, the primary one first. An
 /// interface that is up is a link though neither says what it is called.
@@ -105,26 +133,15 @@ pub(crate) fn wifi(host: &dyn Host, quick: &Quick) -> Option<Wifi> {
         .map(|primary| primary.interface.as_str());
     let ordered = primary_first(&quick.wireless, primary);
     let first = ordered.first()?;
-    // `nmcli` writes `yes` in the language of the user, and `env` is what
-    // gives it the one of the program
     let from_networkmanager = host
-        .run(&[
-            "env",
-            "LC_ALL=C",
-            "nmcli",
-            "-t",
-            "-f",
-            "ACTIVE,SSID,BSSID,DEVICE",
-            "dev",
-            "wifi",
-        ])
+        .run(&networkmanager_ask())
         .and_then(|text| parse::nmcli_wifi(&text))
         // the access point of a device that is not one of the interfaces
         // (it is left out, or it is not up) is no link of ours
         .filter(|link| link.name.as_ref().is_none_or(|name| ordered.contains(name)));
     let link = from_networkmanager.or_else(|| {
         ordered.iter().find_map(|interface| {
-            host.run(&["iw", "dev", interface, "link"])
+            host.run(&Ask::new(&["iw", "dev", interface, "link"]))
                 .and_then(|text| parse::iw_link(&text, interface))
         })
     });
@@ -182,7 +199,37 @@ mod tests {
         "fe8000000000000000000000000000fe 00000100 00000001 00000000 00000003    wlan0\n",
     );
 
-    const NMCLI: &str = "env LC_ALL=C nmcli -t -f ACTIVE,SSID,BSSID,DEVICE dev wifi";
+    // the question to NetworkManager as the fake machine names it: the variable
+    // first, then the words
+    const NMCLI: &str = "LC_ALL=C nmcli -t -f ACTIVE,SSID,BSSID,DEVICE dev wifi list --rescan no";
+
+    /// NetworkManager scans when its list of access points is older than 30
+    /// seconds, unless it is told not to (`--rescan no`); a scan is a request
+    /// to the radio — time, and battery —, the full read comes every 30
+    /// seconds, and the answer is only the access point it already knows to
+    /// be active. `nmcli` writes `yes` in the language of the user, so it is
+    /// run with `LC_ALL=C`, which is a variable of the program and not a
+    /// program in front of it.
+    #[test]
+    fn the_question_to_networkmanager_asks_for_no_scan() {
+        let ask = networkmanager_ask();
+        assert_eq!(
+            ask.words,
+            [
+                "nmcli",
+                "-t",
+                "-f",
+                "ACTIVE,SSID,BSSID,DEVICE",
+                "dev",
+                "wifi",
+                "list",
+                "--rescan",
+                "no"
+            ]
+        );
+        assert_eq!(ask.env, [("LC_ALL".to_string(), "C".to_string())]);
+        assert_eq!(ask.line(), NMCLI);
+    }
 
     fn base() -> FakeHost {
         FakeHost::default()

@@ -3,8 +3,9 @@
 //! for the Wi-Fi link. Everything but the call into the system is compiled on
 //! every host.
 
-use super::host::{Host, say_once};
+use super::host::{Ask, Host, say_once};
 use super::{NetKind, Primary, Quick, ReadOpts, Wifi, network_addresses, parse, unique_in_order};
+use std::ffi::OsStr;
 use std::net::IpAddr;
 
 /// What an adapter is, from its interface type.
@@ -138,18 +139,62 @@ pub(crate) fn wifi_interface(
         .cloned()
 }
 
-/// The question to `netsh`, put through `cmd`. `netsh` writes in the code page
-/// of its console and in the language of the system — Chinese in GBK on a
-/// Chinese Windows —, which are neither UTF-8 nor the keys read here; a console
-/// of the code page 65001 gets English and UTF-8 from it. The console is one
-/// of `cmd`'s own (`run_with_timeout` starts a program without ours), so the
-/// terminal of the user keeps its code page.
-pub(crate) const WLAN_COMMAND: [&str; 4] = [
-    "cmd",
-    "/d",
-    "/c",
-    "chcp 65001 >nul & netsh wlan show interfaces",
-];
+/// Whether `path` is a drive, a colon and a backslash, and then names between
+/// backslashes, each of letters (of any alphabet), digits, `_`, `-` and `.`,
+/// none empty, `.` or `..`. Nothing `cmd` reads as more than a part of a name
+/// is in such a path: not a space, a quote, `&`, `%`, `^`, `|`, `<`, `>`, `(`,
+/// `)`, `;`, `,` or `=`.
+fn is_plain_path(path: &str) -> bool {
+    let mut chars = path.chars();
+    let on_a_drive = matches!(
+        (chars.next(), chars.next(), chars.next()),
+        (Some(drive), Some(':'), Some('\\')) if drive.is_ascii_alphabetic()
+    );
+    // the three characters of the drive are ASCII: the names begin at byte 3
+    on_a_drive
+        && path[3..].split('\\').all(|name| {
+            !matches!(name, "" | "." | "..")
+                && name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        })
+}
+
+/// The Windows directory: `SystemRoot`, or `C:\Windows` when the machine does
+/// not say (as `dns::hosts_path_for` has it). It goes into a command line that
+/// `cmd` reads, so a value that is more than a plain path (see
+/// [`is_plain_path`]) is taken for a variable that is not set.
+fn windows_directory(system_root: Option<&OsStr>) -> String {
+    system_root
+        .and_then(OsStr::to_str)
+        .map(|root| root.trim_end_matches('\\'))
+        .filter(|root| is_plain_path(root))
+        .unwrap_or("C:\\Windows")
+        .to_string()
+}
+
+/// The question to `netsh`, put through `cmd`.
+///
+/// `netsh` writes in the code page of its console and in the language of the
+/// system — Chinese in GBK on a Chinese Windows —, which are neither UTF-8 nor
+/// the keys read here; a console of the code page 65001 gets English and UTF-8
+/// from it. The console is one of `cmd`'s own (`run_with_timeout` starts a
+/// program without ours), so the terminal of the user keeps its code page.
+///
+/// `cmd` looks for a program named without a path in the current directory
+/// before the rest of the search path, and that directory is one anybody may
+/// have written to — where rurge runs elevated, a program put there is run
+/// with its rights. So `cmd`, `chcp` and `netsh` are all named by their paths
+/// in the Windows directory (`system_root` is the `SystemRoot` of the
+/// machine), and the variable `NoDefaultCurrentDirectoryInExePath` keeps the
+/// current directory out of the search for anything `cmd` still looks for.
+pub(crate) fn wlan_ask(system_root: Option<&OsStr>) -> Ask {
+    let system32 = format!("{}\\System32", windows_directory(system_root));
+    let cmd = format!("{system32}\\cmd.exe");
+    let script =
+        format!("{system32}\\chcp.com 65001 >nul & {system32}\\netsh.exe wlan show interfaces");
+    Ask::new(&[&cmd, "/d", "/c", &script]).with_env("NoDefaultCurrentDirectoryInExePath", "1")
+}
 
 /// The Wi-Fi link: asked about when a wireless adapter is up.
 pub(crate) fn wifi(host: &dyn Host, quick: &Quick) -> Option<Wifi> {
@@ -157,7 +202,7 @@ pub(crate) fn wifi(host: &dyn Host, quick: &Quick) -> Option<Wifi> {
         return None;
     }
     let link = host
-        .run(&WLAN_COMMAND)
+        .run(&wlan_ask(host.var("SystemRoot").as_deref()))
         .and_then(|text| parse::netsh_wlan(&text));
     let primary = quick
         .primary
@@ -453,19 +498,109 @@ mod tests {
     SSID                   : ExampleNet\n\
     BSSID                  : 00:00:5e:00:53:02\n";
 
-    /// The command line the fake machine is asked, as a word list joined.
+    /// The question the fake machine is asked when it does not say where
+    /// Windows is, as it names it.
     fn wlan() -> String {
-        WLAN_COMMAND.join(" ")
+        wlan_ask(None).line()
     }
 
-    /// What `WLAN_COMMAND` says is pinned: without the code page it is a
-    /// question that gets the answer of the system's own language and code page.
+    /// Without the code page the question gets the answer of the system's own
+    /// language and code page (GBK, and the keys translated). A program named
+    /// without a path is looked for by `cmd` in the current directory first —
+    /// a directory anybody may have written to, and rurge runs elevated in
+    /// the enhanced mode —, so `cmd`, `chcp` and `netsh` are all named by
+    /// their paths in the Windows directory, and the variable keeps the
+    /// current directory out of the search for anything `cmd` still looks for.
     #[test]
-    fn netsh_is_asked_in_a_console_of_utf_8() {
+    fn netsh_is_asked_by_absolute_path_in_a_console_of_utf_8() {
+        let ask = wlan_ask(Some(OsStr::new("D:\\Win")));
         assert_eq!(
-            wlan(),
-            "cmd /d /c chcp 65001 >nul & netsh wlan show interfaces"
+            ask.words,
+            [
+                "D:\\Win\\System32\\cmd.exe",
+                "/d",
+                "/c",
+                "D:\\Win\\System32\\chcp.com 65001 >nul & D:\\Win\\System32\\netsh.exe wlan show interfaces",
+            ]
         );
+        assert_eq!(
+            ask.env,
+            [(
+                "NoDefaultCurrentDirectoryInExePath".to_string(),
+                "1".to_string()
+            )]
+        );
+        // as the fake machine is told it: the variable, then the words
+        assert_eq!(
+            ask.line(),
+            "NoDefaultCurrentDirectoryInExePath=1 D:\\Win\\System32\\cmd.exe /d /c \
+             D:\\Win\\System32\\chcp.com 65001 >nul & D:\\Win\\System32\\netsh.exe wlan show interfaces"
+        );
+    }
+
+    #[test]
+    fn the_windows_directory_is_the_system_root_or_c_windows() {
+        let root = |value: Option<&str>| windows_directory(value.map(OsStr::new));
+        assert_eq!(root(Some("C:\\WINDOWS")), "C:\\WINDOWS");
+        // a backslash at the end is no part of it
+        assert_eq!(root(Some("D:\\Win\\")), "D:\\Win");
+        // as `dns::hosts_path_for` has it when the variable is not set
+        assert_eq!(root(None), "C:\\Windows");
+        assert_eq!(root(Some("")), "C:\\Windows");
+        // letters of other alphabets are letters
+        assert_eq!(root(Some("D:\\Fen\u{ea}tres")), "D:\\Fen\u{ea}tres");
+        assert_eq!(wlan_ask(None).words[0], "C:\\Windows\\System32\\cmd.exe");
+    }
+
+    /// The Windows directory goes into a command line `cmd` reads, so a value
+    /// that is more than a path — a space, a quote, an `&`, a `%`, a name that
+    /// stays or goes up, a path that is not on a drive — is taken for a
+    /// variable that is not set: nothing in it is ever read as a command.
+    #[test]
+    fn a_system_root_that_is_not_a_plain_path_is_not_used() {
+        for root in [
+            "Windows",
+            "C:Windows",
+            "C:\\",
+            "\\\\server\\share\\Windows",
+            "C:\\Windows & calc",
+            "C:\\Win dows",
+            "\"C:\\Windows\"",
+            "C:\\Windows%x%",
+            "C:\\Windows\\..\\Other",
+            "C:\\Windows\\.",
+            "C:\\\\Windows",
+            "C:\\Win;dows",
+            "C:\\Win,dows",
+            "C:\\Win=dows",
+            "C:\\Win(dows)",
+            "C:\\Win^dows",
+            "C:\\Windows|x",
+            "C:\\Windows>x",
+            "C:\\Windows<x",
+        ] {
+            assert_eq!(
+                windows_directory(Some(OsStr::new(root))),
+                "C:\\Windows",
+                "{root}"
+            );
+        }
+    }
+
+    /// The reader asks with the directory the machine says Windows is in.
+    #[test]
+    fn netsh_is_asked_where_the_machine_says_windows_is() {
+        let asked = wlan_ask(Some(OsStr::new("D:\\Win"))).line();
+        let host = FakeHost::default()
+            .with_var("SystemRoot", "D:\\Win")
+            .with_adapter(adapter("Wi-Fi", AdapterKind::Wifi, true, &["192.0.2.1"], 1))
+            .with_command(&asked, NETSH);
+        let quick = quick(&host, &ReadOpts::default());
+        assert_eq!(
+            wifi(&host, &quick).and_then(|link| link.ssid).as_deref(),
+            Some("ExampleNet")
+        );
+        assert_eq!(host.calls(), [asked]);
     }
 
     fn wireless_host() -> FakeHost {

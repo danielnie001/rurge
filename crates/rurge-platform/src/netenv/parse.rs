@@ -68,7 +68,7 @@ impl WlanBlock {
 /// BSSID`); the name of the adapter is the `Name` line, in English. Other
 /// languages translate that word, and then the link has no name. (The reader
 /// asks in a console where the keys are English and the text UTF-8: see
-/// `windows::WLAN_COMMAND`.)
+/// `windows::wlan_ask`.)
 pub(crate) fn netsh_wlan(text: &str) -> Option<Link> {
     // one block of lines per adapter, a blank line between two of them
     let mut block = WlanBlock::default();

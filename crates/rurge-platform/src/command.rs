@@ -79,10 +79,16 @@ fn without_credentials(arg: &str) -> String {
 /// `timeout`: a program that has not ended by then is killed and the error is
 /// [`io::ErrorKind::TimedOut`].
 pub fn run_with_timeout(cmd: &[String], timeout: Duration) -> io::Result<String> {
-    run_command(cmd, timeout, &[])
+    run_with_timeout_env(cmd, timeout, &[])
 }
 
-fn run_command(cmd: &[String], timeout: Duration, envs: &[(&str, &str)]) -> io::Result<String> {
+/// [`run_with_timeout`], with environment variables set for the program over
+/// the ones it inherits.
+pub(crate) fn run_with_timeout_env(
+    cmd: &[String],
+    timeout: Duration,
+    envs: &[(&str, &str)],
+) -> io::Result<String> {
     let (program, args) = cmd
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty command"))?;
@@ -341,7 +347,7 @@ mod tests {
             "--nocapture".to_string(),
         ];
         cmd.extend(extra.iter().map(|arg| arg.to_string()));
-        run_command(&cmd, timeout, &[env])
+        run_with_timeout_env(&cmd, timeout, &[env])
     }
 
     #[test]

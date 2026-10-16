@@ -1,7 +1,7 @@
 //! macOS: `route` for the default route, `networksetup` for what kind of
 //! hardware an interface is, `ipconfig getsummary` for the Wi-Fi link.
 
-use super::host::{Host, say_once};
+use super::host::{Ask, Host, say_once};
 use super::{
     NetKind, Primary, Quick, ReadOpts, Wifi, network_addresses, parse, primary_first,
     unique_in_order,
@@ -54,7 +54,7 @@ pub(crate) static PORTS: PortCache = PortCache::new();
 /// The gateway and interface of a default route, unless the interface is left
 /// out.
 fn default_route(host: &dyn Host, cmd: &[&str], opts: &ReadOpts) -> Option<(String, IpAddr)> {
-    host.run(cmd)
+    host.run(&Ask::new(cmd))
         .and_then(|text| parse::route_get_default(&text))
         .filter(|(interface, _)| !opts.exclude.contains(interface))
 }
@@ -74,7 +74,7 @@ pub(crate) fn quick(host: &dyn Host, opts: &ReadOpts, ports: &PortCache) -> Quic
     interfaces.sort();
     interfaces.dedup();
     let table = ports.get(&interfaces, || {
-        host.run(&["networksetup", "-listallhardwareports"])
+        host.run(&Ask::new(&["networksetup", "-listallhardwareports"]))
             .map(|text| parse::hardware_ports(&text))
             .unwrap_or_default()
     });
@@ -131,7 +131,7 @@ pub(crate) fn wifi(host: &dyn Host, quick: &Quick) -> Option<Wifi> {
         .into_iter()
         .find_map(|interface| {
             let link = host
-                .run(&["ipconfig", "getsummary", &interface])
+                .run(&Ask::new(&["ipconfig", "getsummary", &interface]))
                 .and_then(|text| parse::ipconfig_summary(&text, &interface))?;
             if link.ssid.is_none() {
                 say_once("wifi-name", || {
