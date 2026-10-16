@@ -117,14 +117,15 @@ pub(crate) fn proc_net_route(text: &str, exclude: &[String]) -> Option<(String, 
                 && flags & RTF_GATEWAY != 0
                 && gateway != 0
                 && !exclude.iter().any(|name| name == iface);
-            // The kernel prints an address as the number its bytes make on
-            // this machine, and every machine rurge runs on is little-endian:
-            // the first byte of the address is the last two digits.
+            // The kernel prints an address (a `__be32`) as the number its
+            // bytes make on this machine, whichever order that is: they come
+            // back in the order they had. On a little-endian machine the
+            // first byte of the address is the last two digits.
             usable.then(|| {
                 (
                     metric,
                     iface.to_string(),
-                    Ipv4Addr::from(gateway.to_le_bytes()),
+                    Ipv4Addr::from(gateway.to_ne_bytes()),
                 )
             })
         })
@@ -500,6 +501,22 @@ There are 3 interfaces on the system:
         assert_eq!(
             proc_net_route(&tied, &[]),
             Some(("wlan0".to_string(), "198.51.100.1".parse().unwrap()))
+        );
+    }
+
+    /// The kernel prints a gateway — a `__be32` — as the number its four bytes
+    /// make on the machine it runs on, so the text is read back into the bytes
+    /// in the order of that machine. The line is written here as this
+    /// machine's kernel would write it, so the test holds on a machine of
+    /// either byte order (the fixtures above are a little-endian machine's).
+    #[test]
+    fn proc_net_route_reads_a_gateway_in_the_byte_order_of_the_machine() {
+        let gateway = Ipv4Addr::new(192, 0, 2, 1);
+        let printed = format!("{:08X}", u32::from_ne_bytes(gateway.octets()));
+        let route = format!("eth0\t00000000\t{printed}\t0003\t0\t0\t100\t00000000\t0\t0\t0\n");
+        assert_eq!(
+            proc_net_route(&route, &[]),
+            Some(("eth0".to_string(), gateway))
         );
     }
 

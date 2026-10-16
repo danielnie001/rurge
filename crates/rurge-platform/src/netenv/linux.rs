@@ -109,6 +109,11 @@ pub(crate) fn quick(host: &dyn Host, opts: &ReadOpts) -> Quick {
 /// network name with letters beyond ASCII comes out whole. Where a system has
 /// no `C.UTF-8` the C locale is what it falls back to, which is English and
 /// ASCII.
+///
+/// `LANGUAGE` is set to nothing: gettext puts the languages it lists before
+/// the locale, and a glibc older than 2.39 does so for `C.UTF-8` too (its bug
+/// 16621), which would have `nmcli` write `yes` in the language of a session
+/// that sets it. An empty `LANGUAGE` lists none.
 fn networkmanager_ask() -> Ask {
     Ask::new(&[
         "nmcli",
@@ -122,6 +127,7 @@ fn networkmanager_ask() -> Ask {
         "no",
     ])
     .with_env("LC_ALL", "C.UTF-8")
+    .with_env("LANGUAGE", "")
 }
 
 /// The Wi-Fi link, when a wireless interface is up: NetworkManager's word for
@@ -200,10 +206,10 @@ mod tests {
         "fe8000000000000000000000000000fe 00000100 00000001 00000000 00000003    wlan0\n",
     );
 
-    // the question to NetworkManager as the fake machine names it: the variable
-    // first, then the words
+    // the question to NetworkManager as the fake machine names it: the
+    // variables first, then the words
     const NMCLI: &str =
-        "LC_ALL=C.UTF-8 nmcli -t -f ACTIVE,SSID,BSSID,DEVICE dev wifi list --rescan no";
+        "LC_ALL=C.UTF-8 LANGUAGE= nmcli -t -f ACTIVE,SSID,BSSID,DEVICE dev wifi list --rescan no";
 
     /// NetworkManager scans when its list of access points is older than 30
     /// seconds, unless it is told not to (`--rescan no`); a scan is a request
@@ -235,13 +241,22 @@ mod tests {
     /// text, so a network name with letters beyond ASCII comes out whole;
     /// `LC_ALL=C` is English too, but its charset is ASCII, and what `nmcli`
     /// prints beyond ASCII is at risk of becoming `?`. Where a system has no
-    /// `C.UTF-8` the C locale is what it falls back to. The variable is the
-    /// question's own — the program's environment —, not a program (`env`) in
-    /// front of it.
+    /// `C.UTF-8` the C locale is what it falls back to. `LANGUAGE`, a list of
+    /// languages that gettext puts before the locale, is not ignored for
+    /// `C.UTF-8` by a glibc older than 2.39 (its bug 16621): a user whose
+    /// session says `LANGUAGE=zh_CN:zh` would be answered `是` for `yes`.
+    /// An empty `LANGUAGE` is no list. The variables are the question's own —
+    /// the program's environment —, not a program (`env`) in front of it.
     #[test]
     fn the_question_to_networkmanager_is_asked_in_english_and_utf_8() {
         let ask = networkmanager_ask();
-        assert_eq!(ask.env, [("LC_ALL".to_string(), "C.UTF-8".to_string())]);
+        assert_eq!(
+            ask.env,
+            [
+                ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+                ("LANGUAGE".to_string(), String::new()),
+            ]
+        );
         assert_eq!(ask.line(), NMCLI);
     }
 
