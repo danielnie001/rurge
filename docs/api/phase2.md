@@ -1,6 +1,6 @@
 # rurge HTTP API（阶段 2）
 
-阶段 2 / M1（装配与控制面，见 `docs/superpowers/specs/2026-09-19-phase2-m1-outbound-foundation-design.md` 第 6.6 节）新增四个策略 / 策略组端点；阶段 2 / M3b（测速与自动组）又新增三个测试端点，并让 `POST /v1/policy_groups/select` 对自动组设临时覆盖（见「连通性测试与自动组（M3b）」一节）；阶段 2 / M3c 让这些端点也接纳 `smart` 组，并给请求记录加了两列耗时（见「`smart` 组（M3c）」一节）；阶段 2 / M7c 起，`encrypted-dns-follow-outbound-mode` 下 DoQ / DoH3 上游的 QUIC 载体也作为内部会话进请求记录（见末节）。阶段 2 / M8c 没有新增端点，也没有改响应的形状；变的是脱敏（`policies/detail` 与 `lineHash`）、几种出站失败时 `error` 的文本、`smart` 组怎样计失败，以及内部 DNS 会话的 `error`，各在相应的小节里以"M8c"标出。鉴权（`X-Key` 头 / `?x-key=` 查询参数、常量时间比较、封禁）、错误体（`{"error":"<message>"}`）与无内容的成功响应（`{}`）沿用阶段 1 的约定，见 `docs/api/phase1.md`；本页只记录本页新增端点自己的形状。
+阶段 2 / M1（装配与控制面，见 `docs/superpowers/specs/2026-09-19-phase2-m1-outbound-foundation-design.md` 第 6.6 节）新增四个策略 / 策略组端点；阶段 2 / M3b（测速与自动组）又新增三个测试端点，并让 `POST /v1/policy_groups/select` 对自动组设临时覆盖（见「连通性测试与自动组（M3b）」一节）；阶段 2 / M3c 让这些端点也接纳 `smart` 组，并给请求记录加了两列耗时（见「`smart` 组（M3c）」一节）；阶段 2 / M7c 起，`encrypted-dns-follow-outbound-mode` 下 DoQ / DoH3 上游的 QUIC 载体也作为内部会话进请求记录（见末节）。阶段 3 / M1 起 `subnet` 组也接纳 `POST /v1/policy_groups/select` 的临时覆盖，换网络时清除（见 `docs/api/phase3.md`，本页下面写着 `subnet` 组答 400 的几处都已改）。阶段 2 / M8c 没有新增端点，也没有改响应的形状；变的是脱敏（`policies/detail` 与 `lineHash`）、几种出站失败时 `error` 的文本、`smart` 组怎样计失败，以及内部 DNS 会话的 `error`，各在相应的小节里以"M8c"标出。鉴权（`X-Key` 头 / `?x-key=` 查询参数、常量时间比较、封禁）、错误体（`{"error":"<message>"}`）与无内容的成功响应（`{}`）沿用阶段 1 的约定，见 `docs/api/phase1.md`；本页只记录本页新增端点自己的形状。
 
 ## 端点
 
@@ -9,7 +9,7 @@
 | GET | `/v1/policies/detail?policy_name=<name>` | | `{"<name>": "<脱敏后的定义>"}`；未知策略 → 404 |
 | GET | `/v1/policy_groups` | | `{"<组名>": [Member…], …}` |
 | GET | `/v1/policy_groups/select?group_name=<name>` | | `{"policy": "<当前生效的成员>"}`；未知组 → 404 |
-| POST | `/v1/policy_groups/select` | `{"group_name":"<name>","policy":"<member>"}` | `{}`；组或成员无效，或是 `subnet` 组 → 400；对自动组即临时覆盖（M3b；`smart` 组 M3c 起） |
+| POST | `/v1/policy_groups/select` | `{"group_name":"<name>","policy":"<member>"}` | `{}`；组或成员无效 → 400；对自动组即临时覆盖（M3b；`smart` 组 M3c 起），`subnet` 组自阶段 3 / M1 起同（换网络时清除，见 `docs/api/phase3.md`） |
 | POST | `/v1/policies/test` | `{"policy_names":["<name>",…],"url":"<可省略>"}` | `{"<name>": Result…}`；未知策略、`url` 不是 URL → 400（M3b） |
 | GET | `/v1/policy_groups/test_results` | | `{"<组名>": {"<成员>": Result 或 null}}`（M3b） |
 | POST | `/v1/policy_groups/test` | `{"group_name":"<name>"}` | `{"available":["<成员>",…]}`；未知组 → 400（M3b） |
@@ -167,7 +167,7 @@ trojan、vmess（± WebSocket）、anytls 出站，任何带 Shadow TLS 的出�
 
 ## `GET /v1/policy_groups/select`
 
-参数 `group_name`（必填，查询参数）。响应 `{"policy": "<当前生效的成员>"}`：`select` 组是它当前的选择（没有选择时是第一个成员）；自动组（`url-test` / `fallback` / `load-balance`）是当前生效的成员：临时覆盖优先，其次是按测试结果选出的（没有结果时是第一个成员；`load-balance` 显示第一个通过测试的成员，M3b）；`smart`（M3c 起）是最近 10 分钟用得最多的成员，最近没用过时是排在第一的成员；**一个没有成员的组**（订阅还没下载到，或过滤把成员滤光了）返回 `{"policy": ""}`，这不是错误；`subnet` 组在阶段 3 之前代表它的 `default`（M3a）。
+参数 `group_name`（必填，查询参数）。响应 `{"policy": "<当前生效的成员>"}`：`select` 组是它当前的选择（没有选择时是第一个成员）；自动组（`url-test` / `fallback` / `load-balance`）是当前生效的成员：临时覆盖优先，其次是按测试结果选出的（没有结果时是第一个成员；`load-balance` 显示第一个通过测试的成员，M3b）；`smart`（M3c 起）是最近 10 分钟用得最多的成员，最近没用过时是排在第一的成员；**一个没有成员的组**（订阅还没下载到，或过滤把成员滤光了）返回 `{"policy": ""}`，这不是错误；`subnet` 组（阶段 3 / M1 起）是按当前网络选出的成员：临时覆盖优先，其次是第一个命中当前网络的条件的策略，都不命中是 `default`，见 `docs/api/phase3.md`（M3a 到 M1 之前它整组代表它的 `default`）。
 
 ```json
 {"policy": "HK"}
@@ -192,10 +192,9 @@ trojan、vmess（± WebSocket）、anytls 出站，任何带 Shadow TLS 的出�
 | 情形 | `error` |
 | --- | --- |
 | `group_name` 不是任何已知策略组 | `` unknown policy group `Proxy-typo` `` |
-| `group_name` 是 `subnet` 组 | `` `Office` does not take a selection `` |
 | `policy` 不是该组的成员 | `` `Somewhere` is not a member of `Proxy` `` |
 
-选择立即生效：**下一条**使用该组（或途经该组的链）的连接就会解析到新成员，正在进行中的连接不受影响。选择按 Profile 持久化到 `state.json` 的 `group_selections[<Profile 文件名>][<组名>]`（文件名，不含目录，如 `surge.conf`）；rurge 重启后从 `state.json` 恢复，已消失的旧选择（成员被从配置里删除）按"没有选择"处理，回落到第一个成员。对自动组的同一个请求是临时覆盖，见「连通性测试与自动组（M3b）」一节。
+选择立即生效：**下一条**使用该组（或途经该组的链）的连接就会解析到新成员，正在进行中的连接不受影响。选择按 Profile 持久化到 `state.json` 的 `group_selections[<Profile 文件名>][<组名>]`（文件名，不含目录，如 `surge.conf`）；rurge 重启后从 `state.json` 恢复，已消失的旧选择（成员被从配置里删除）按"没有选择"处理，回落到第一个成员。对自动组的同一个请求是临时覆盖，见「连通性测试与自动组（M3b）」一节；对 `subnet` 组（阶段 3 / M1 起）也是临时覆盖，成员无效照上表，空 `policy` 清除，换网络时清除，见 `docs/api/phase3.md`。此前这一行是 400 `` `Office` does not take a selection ``，现在没有哪一种组类型还会得到它。
 
 ## `POST /v1/profiles/check`
 

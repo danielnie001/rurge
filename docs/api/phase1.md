@@ -263,6 +263,7 @@ M4b 起 `system_proxy` 已生效（见上面「端点」表）；这里记录地
 - **`RURGE_SYSTEM_PROXY_BACKEND` 是测试钩子**：取值只能是 `file:<path>`，把「系统代理」换成对一个 JSON 文件的读写（端到端测试用，见设计文档 §15 的 P5）。其它任何取值都直接报错退出，不会静默退回真实后端——否则测试里的一个拼写错误就会改动开发机的真实设置。这个变量不是给用户用的。
 - **重载跟随**：`POST /v1/profiles/reload`（或 SIGHUP / `--watch`）之后，如果系统代理开着，rurge 会用新配置重新计算地址并 `apply`（监听地址或 `skip-proxy` 变了就能看出来）。如果重载后没有任何可用的监听器，rurge **不会**顺带关闭系统代理——那等于替用户把流量静默改成直连——而是打一条 WARN，系统设置继续指向（已经失效的）旧地址，直到下一次重载成功或者进程退出。
 - **启动输出顺序**：`listening on …`（每个监听器一行）→ `api on http://<addr>`（配置了 `http-api` 时）→ `system proxy enabled: <地址描述>`（带 `--system-proxy` 启动且成功开启时；地址描述形如 `http 127.0.0.1:6152` 或 `http 127.0.0.1:6152, socks 127.0.0.1:6153`）→ 汇总行 `rurge <version> running: …`。开启失败会改为 stderr 打印 `error: cannot enable the system proxy: <原因>` 并以退出码 1 结束，不打印汇总行。
+- **接管暂停（阶段 3 / M1）**：生效的 `[SSID Setting]` 行写了 `suspend=true` 的网络上，开着的系统代理恢复成原来的设置（备份清掉），`GET /v1/features/system_proxy` 给真实状态 `false`，`POST` 返回成功但什么也不设、只记下想要的状态，离开这个网络时按它办；`--system-proxy` 在这样的网络上启动时同样只记下。暂停只在内存里，不进 `state.json`。见 `docs/api/phase3.md`。
 
 ## CLI 客户端
 
