@@ -1828,6 +1828,26 @@ cargo test -p rurge --test cli -- line_splitting   # rurge check 的端到端：
 
 | # | 任务 | 与计划的出入 | 处理 |
 | --- | --- | --- | --- |
+| 1 | 任务 1 | 计划没说 `FieldSpan` 放在哪里：第一次放在 `redact_positional_credentials` 的长注释与函数之间，那段注释挂到了结构体上 | 提交之前挪到注释前面；`7c31ab6` |
+| 2 | 任务 1 | 属性用例里 `{name}=a"{V},{W}"b` 那一种的值在 Step 1 就改了（它属于先看红的那一批），`Debug` 的检查随 Step 5 改 | 照做 |
+| 3 | 任务 1 | 门禁：最后一次全量里 `outbounds_http2` 以 `STATUS_HEAP_CORRUPTION` 退出一次，单独重跑 15 / 15 | 开发机的管控软件，不是 rurge 的缺陷 |
+| 4 | 任务 1 | 任务评审：计划给的 `redact_joined` 重复了 `redact_item` 的尾巴（前后空白的拆法、认秘密参数名、三支 `match`）——计划自己写进去的重复 | 主持这一轮的会话代项目所有者裁定：抽成 `blanks_around`、`secret_key`、`hide_value` 三个私有函数，两处共用；输出不变（实现者在 261,550 条生成的字符串上比过前后的散列）；`fc5e30e` |
+| 5 | 任务 1 | 任务评审：位置凭据那一遍给区域并进来的非空字段计数（计划照设计 6.1 写的），这个计数改变不了输出——被遮的字段已在端口之后，其后每个字段计不计数都在端口之后 | 去掉；设计第 12 节第 1 条；`fc5e30e` |
+| 6 | 任务 1 | 任务评审：三处行为没有用例钉住——`redact_entry` 新加的"解析器的读法在 `=` 前看到逗号"、`redact_joined` 第一支保留 `=` 两边的空白、LS-D10（`，` 只在要求时切开、不开启一个值） | 补三条用例（`a_comma_in_front_of_the_first_equals_sign_by_the_parsers_reading_counts`、`a_value_carried_past_a_comma_keeps_the_spacing_around_its_name`、`a_full_width_comma_cuts_only_when_asked_and_starts_no_value`），各以一行变异看红；`fc5e30e` |
+| 7 | 任务 1 | 任务评审拿旧代码与新代码比脱敏的输出：本来就坏了的行上有比此前少遮的写法——服务器字段开头多一个引号、口令引起来且含逗号（`trojan, "h, 443, password="ZQ1,ZQ2", ws=true` 留下 `ZQ2"`）；一行里三个以上多余的引号字符（`external, pw",",  password=ZQ1"x,ZQ2"y` 留下 `ZQ2"y`）。对 54 行基础写法逐字符增删改得到的 62,510 种里，997 种比此前遮得多、8 种少 | 主持这一轮的会话代项目所有者裁定：接受，登记延后第 12 行；要堵上就得改两遍的次序，是设计上的事。终审查出触发面比这里写的宽，见第 18 行 |
+| 8 | 任务 2 | 计划没点名的现有用例 `a_load_gives_each_diagnostic_the_hint_of_its_code` 变红：它的 `B = http, h.test, 80, bogus=1` 里 `bogus=1` 正站在口令的位置上，LS-D8 之后带自己的提示 | 主持这一轮的会话裁定：那一行改成 `B = http, h.test, 80, alice, pw, bogus=1`，断言不改（同计划对 `tests/policy_spec.rs` 的改法）；`303a7f1` |
+| 9 | 任务 2 | 先写的那一批用例里，`--test secrets` 的一半在实现之前没有跑 | 实现之后以一次额外的变异补证（`from_fields` 把整个加引号的项又读成参数）：`secrets.rs` 的三条用例随之变红 |
+| 10 | 任务 2 | 门禁：第一次全量里 `outbounds_snell` 的 `v2_shares_one_connection_and_v1_and_v3_never_do` 失败一次（期望 1 条连接、看到 3 条），单独跑 20 次、整个二进制 30 次、再跑全量都绿 | 与这一轮无关（Snell 行里没有引号，也不在位置凭据处）；登记延后第 17 行 |
+| 11 | 任务 2 | 任务评审：照计划的组合，整个加引号的 `key=value` 后面漏了逗号、粘着下一个参数时（`"pa=ss"=1`、`"password=…"sni=x`），读到的键里带着引号里的部分；`written_as_name` 照文字读，找不到读成这个键的一项，于是点了名——引号里的口令（小写）进了 `W0001`，策略与组都是 | 主持这一轮的会话代项目所有者裁定：`written_as_name` 先要求键本身是参数名的写法（`is_plain_name`）；读法的用例加三行，`secrets.rs` 加 `a_parameter_glued_behind_a_whole_one_in_quotes_is_not_named`；`34ff473` |
+| 12 | 任务 2 | 任务评审：`ParamReader` 的 LS-D8 一支手拼诊断，而 `GroupReader` 有 `warn_with_hint`；LS-D8 的用例够不到 `https`、`socks5` 两支与"空的一项不算字段" | 补 `ParamReader::warn_with_hint`；用例加三行，各以一行变异看红；`34ff473` |
+| 13 | 任务 2 | 试着让 `secrets.rs` 的 `leaks` 按小写找标记（键是小写存的），`a_line_under_general_that_is_no_setting_is_not_quoted` 随之变红：`[General]` 里丢了名字后 `=` 的策略行被当作未知键、小写存下，它的 `Debug` 把 `key = value` 拼回一行交给 `redact_line`，口令（小写）留在里面——这一轮之前就有 | 照裁定还原了 `leaks`，不修；登记延后第 13 行 |
+| 14 | 任务 2 | 全量第一次 `rurge-dns` 的 `resolver` 以 `STATUS_HEAP_CORRUPTION` 退出、一次链接器 `LNK1104`（文件被占用），重跑都过 | 开发机的事 |
+| 15 | 任务 3 | 两条 `rurge check` 用例写出来就是绿的（`0 note(s)` 也成立），各以计划给的一行变异看红；rustfmt 折了三行 | 照做；`0c7632a` |
+| 16 | 任务 3 | 文档里几处照计划写得更细：清单"定义处"与 `custom` 的 `E0018`、验收文档那两行另指到 `wholly_quoted` / `read_field`（`unquote` 已没有生产代码里的调用者）、CLAUDE.md 里手册基线重对那一段的说法 | 照留；`6629016` |
+| 17 | 任务 3 | 任务评审：这一轮让几份"写着代码现在的做法"的文档有句子不对了——`external-policy-modifier` 怎样改写一行（清单、阶段 2 验收文档）、脱敏按什么认一个值的终点（阶段 1 与阶段 2 的 API 参考、清单两行）；另有四处小的（阶段 1 验收文档的出处一段、CLAUDE.md 里"`next_comma` 只用来量区域"、清单 1.1 节粘连的例子、清单 `is_name` 的清单与 `[Proxy Group]` 一行）与一条只钉住 `http` 的用例 | 都改了；实现者另找到同一类过时的句子几处（CLAUDE.md 的 M8c 那一句与一条命令的注释、阶段 2 手工清单一项）一并改；用例扩到五种类型；`c3280dd`、`5446065` |
+| 18 | 终审 | 已接受的脱敏退步，触发面比第 7 行写的宽：同一行前面任何一个值在值开始的地方开了引号而漏了收尾（服务器字段、`sni=` 一类参数或误打的一个引号），后面又有一个写法正确、含逗号、整个加引号的秘密值时，逗号之后那一段露出（`trojan, h.example, 443, sni="a.example, password="p1,p2", ws=true` 留下 `p2"`），在 `GET /v1/profiles/current?sensitive=0` 与 `GET /v1/policies/detail` 里，`lineHash` 随它变。终审的对照：按 Surge 写法生成的 40 万行里新代码多藏 33,196 行、少藏 32 行（都是设计 6.4 已登记的不加引号的 `=` 口令），各插一处误打的 40 万行里多藏 47,429 行、少藏 147 行 | 主持这一轮的会话代项目所有者裁定：这一轮不改代码（收口要在原文上按解析器的字段数决定位置凭据、再落到逐项输出的区域上，或改 LS-D9 两遍的次序，是设计层面的事，归项目所有者）；记录照实写（CLAUDE.md、延后第 12 行、设计第 12 节第 3 条），阶段 1 与阶段 2 的 API 参考、清单的一处加了限定语 |
+| 19 | 终审 | 小项：照 LS-D8 的提示写出的位置口令以秘密参数名加 `=` 开头时露出这个前缀（P19 说的"藏的一样多"在读位置凭据的类型上不成立）；LS-D1 把切开的前半放进了不是凭据的位置（监听地址的错误、DNS 服务器 URL 的 `Debug`）；设计第 7 节漏了两处读法变化（`external-policy-modifier`、`key='it's'`） | 登记延后第 18、19 行；设计第 12 节记下；清单 1.1 节与 CLAUDE.md 补上第 7 节漏的两处 |
+| 20 | 门禁 | 最后一次全量在 `5446065` 上（此后只有文档变过）：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 干净，`cargo test --workspace --no-fail-fast` 74 个结果行、3438 个通过、0 个失败、6 个忽略（`rurge-api` 与 `rurge-policy` 的单元测试二进制在这次全量里以 `STATUS_HEAP_CORRUPTION` 退出，单独重跑 29 / 29、169 / 169，计入这个数）——一台机器的一次运行，不是 CI | — |
 
 ## 延后事项
 
@@ -1844,3 +1864,11 @@ cargo test -p rurge --test cli -- line_splitting   # rurge check 的端到端：
 | 9 | `wide` 读法下"单独读一项还是这一项"不总成立（`，` 之后开头的引号） | 接受：只有脱敏数位置凭据用 `wide`，切分处照样 |
 | 10 | `http h.example 8080 al'ice, pw', tfo=true` 现在脱敏成 `http h.example 8080 ***, ***`（`tfo=true` 被并进区域遮掉） | 接受：偏安全一侧 |
 | 11 | `quoted_name` 对带 `=` 的成员说 "a link" | 下次动到时 |
+| 12 | 已接受的脱敏退步（执行期修正记录第 7、18 行）：同一行前面某个值在值开始的地方开了引号而漏了收尾（服务器字段、`sni=` 一类参数或误打的一个引号），后面又有一个写法正确、含逗号、整个加引号的秘密值时，逗号之后那一段留在脱敏后的视图里（`trojan, h.example, 443, sni="a.example, password="p1,p2", ws=true` 留下 `p2"`；`trojan, "h, 443, password="ZQ1,ZQ2", ws=true` 留下 `ZQ2"`）；一行里三个以上多余的引号字符时另有几种（`external, pw",",  password=ZQ1"x,ZQ2"y` 留下 `ZQ2"y`） | 项目所有者：收口的方向是在原文上按解析器的字段数决定位置凭据，再落到逐项输出里对应的区域上（或改 LS-D9 两遍的次序）；收口时在 `secrets.rs` 补一条"前面漏了收尾引号、后面一个含逗号的引号口令"的标记用例 |
+| 13 | `[General]` 里丢了名字后 `=` 的策略行：未知键小写存下，它的 `Debug` 露出小写的口令；`secrets.rs` 的 `leaks` 区分大小写，看不见这一类（执行期修正记录第 13 行） | 项目所有者（脱敏后的视图与 `Debug` 的边界，同 M8c 计划「延后事项」第 51 行）；修它时把 `leaks` 改成按小写找 |
+| 14 | `redact_entry` 新条件里 `item_spans(key, true)` 的 `wide` 没有用例钉住（要一个被旧的读法的引号挡住的 `，`） | 下次动到时 |
+| 15 | `blanks_around` 还能替换 `redact.rs` 里另外三处同样的前后空白拆法 | 下次动到时 |
+| 16 | `subnet` 组里带引号里 `=` 的条件键，`SubnetExpr::parse` 的错误与组的 `Debug` 原样显示（条件是网络名，不是凭据） | 接受 |
+| 17 | `outbounds_snell::v2_shares_one_connection_and_v1_and_v3_never_do` 在这台开发机上失败过一次（期望 1 条连接、看到 3 条） | 再见到时查（连接池与计时） |
+| 18 | 读位置凭据的类型上，整个加引号、以秘密参数名加 `=` 开头的口令（`http, h.example, 80, alice, "token=abc123"`）在脱敏后的视图与 `Debug` 里显示成 `token=***`，露出 `token=` 这一段（此前是 `***`）；P19 说的"藏的一样多"在这里不成立 | 项目所有者（与第 12 行的收口一起做；收口时在 `secrets.rs` 补一条以 `token=` 开头的位置口令） |
+| 19 | 值中间成对的引号不再护住逗号之后，被切开的前半可能落进不是凭据的位置：`http-listen = ab"p1,p2"@127.0.0.1:6152` 的地址错误（`E_LISTENER_NOT_IP`）引用 `ab"p1`，`dns-server = https://u:"p1,p2"@d.example/dns-query` 的 `EncryptedDns` 的 `Debug` 显示 `https://u:"p1`（找不到 `@`） | 有用户报告再说（把引号放在值中间的口令本来就要整个加引号）；可选的收口：`E_LISTENER_NOT_IP` 不引用不像地址的一项 |
