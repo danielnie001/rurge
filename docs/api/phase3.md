@@ -150,6 +150,7 @@ SSID 与 BSSID 可能读不到（Windows 没有位置权限，据调研以 SYSTE
 | DEBUG | `the network is not what it was` | `facts`、`dns_servers`、`addresses`（布尔：哪一项不同） | 网络任务判定有变化时；只说哪一项不同，不说值 |
 | INFO | `this network sets other DNS servers than the generation in use was built with; building it again` | | 为 DNS 覆盖用内存里的配置重建一代之前 |
 | ERROR | `cannot build the generation again for the DNS of this network; the one in use goes on` | `error` | 重建失败；在用的一代照旧 |
+| INFO | `policy group selection changed via http-api` | `group`、`policy` | 每一次成功的 `POST /v1/policy_groups/select`，`subnet` 组的临时覆盖与清除也算（这一行阶段 2 就有；清除时 `policy` 是空的） |
 | INFO | `takeover paused on this network` | | 进入接管暂停（启动时就在这样的网络上也记） |
 | INFO | `takeover resumed` | | 离开接管暂停 |
 | INFO | `the takeover is paused on this network; the system proxy is left as it is, and set as asked when the pause ends` | `enabled` | 暂停期间一次得到成功应答的 `POST /v1/features/system_proxy` |
