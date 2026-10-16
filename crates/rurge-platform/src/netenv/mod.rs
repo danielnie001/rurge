@@ -471,7 +471,7 @@ mod tests {
         let windows = FakeHost::default()
             .with_adapter(adapter("Wi-Fi", windows::AdapterKind::Wifi, "192.0.2.1"))
             .with_command(
-                "netsh wlan show interfaces",
+                &windows::WLAN_COMMAND.join(" "),
                 "    Name : Wi-Fi\n    SSID : Example Net\n    BSSID : 00:00:5e:00:53:02\n",
             );
         assert_eq!(

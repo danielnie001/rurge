@@ -86,28 +86,39 @@ fn run_command(cmd: &[String], timeout: Duration, envs: &[(&str, &str)]) -> io::
     let (program, args) = cmd
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty command"))?;
-    let mut child = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .args(args)
         .envs(envs.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // A console of its own, without a window: the program neither shows one
+    // nor shares ours, so what it does to its console (`chcp`) stays with it.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| io::Error::new(e.kind(), format!("cannot run {program}: {e}")))?;
+    let mut tree = Tree::of(&child);
     let deadline = Instant::now() + timeout;
     let stdout = read_to_end_on_a_thread(child.stdout.take());
     let stderr = read_to_end_on_a_thread(child.stderr.take());
     let left = || deadline.saturating_duration_since(Instant::now());
     let (stdout, stderr) = match (stdout.recv_timeout(left()), stderr.recv_timeout(left())) {
         (Ok(stdout), Ok(stderr)) => (stdout, stderr),
-        _ => return Err(give_up(child, cmd, timeout)),
+        _ => return Err(give_up(child, &mut tree, cmd, timeout)),
     };
     // The program has closed its output; it ends now, or soon.
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
-            Ok(None) | Err(_) => return Err(give_up(child, cmd, timeout)),
+            Ok(None) | Err(_) => return Err(give_up(child, &mut tree, cmd, timeout)),
         }
     };
     let stdout = String::from_utf8_lossy(&stdout).into_owned();
@@ -139,10 +150,39 @@ fn read_to_end_on_a_thread(pipe: Option<impl Read + Send + 'static>) -> mpsc::Re
     rx
 }
 
-/// Kills a program that did not end in time and reaps it. The threads reading
-/// its output end when its pipes close, unless a program it started holds them
-/// open; nothing waits for them.
-fn give_up(mut child: Child, cmd: &[String], timeout: Duration) -> io::Error {
+/// A program together with what it starts, as far as the system keeps them
+/// together. On Windows a Job Object holds the program: `cmd` starts `netsh`,
+/// and killing `cmd` alone leaves `netsh` where it is. Elsewhere the programs
+/// asked about the network start nothing (`env` becomes the program it runs).
+struct Tree(#[cfg(windows)] Option<crate::process::ProcessTree>);
+
+impl Tree {
+    fn of(child: &Child) -> Tree {
+        #[cfg(windows)]
+        {
+            // a program that has ended already, or cannot be held, is killed alone
+            Tree(crate::process::ProcessTree::contain(child.id()).ok())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = child;
+            Tree()
+        }
+    }
+
+    fn kill(&mut self) {
+        #[cfg(windows)]
+        if let Some(tree) = self.0.as_mut() {
+            let _ = tree.kill();
+        }
+    }
+}
+
+/// Kills a program that did not end in time, and what it started, and reaps
+/// it. The threads reading its output end when its pipes close, unless a
+/// program it started holds them open; nothing waits for them.
+fn give_up(mut child: Child, tree: &mut Tree, cmd: &[String], timeout: Duration) -> io::Error {
+    tree.kill();
     let _ = child.kill();
     let _ = child.wait();
     io::Error::new(

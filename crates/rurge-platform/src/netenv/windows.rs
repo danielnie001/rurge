@@ -138,13 +138,26 @@ pub(crate) fn wifi_interface(
         .cloned()
 }
 
+/// The question to `netsh`, put through `cmd`. `netsh` writes in the code page
+/// of its console and in the language of the system — Chinese in GBK on a
+/// Chinese Windows —, which are neither UTF-8 nor the keys read here; a console
+/// of the code page 65001 gets English and UTF-8 from it. The console is one
+/// of `cmd`'s own (`run_with_timeout` starts a program without ours), so the
+/// terminal of the user keeps its code page.
+pub(crate) const WLAN_COMMAND: [&str; 4] = [
+    "cmd",
+    "/d",
+    "/c",
+    "chcp 65001 >nul & netsh wlan show interfaces",
+];
+
 /// The Wi-Fi link: asked about when a wireless adapter is up.
 pub(crate) fn wifi(host: &dyn Host, quick: &Quick) -> Option<Wifi> {
     if quick.wireless.is_empty() {
         return None;
     }
     let link = host
-        .run(&["netsh", "wlan", "show", "interfaces"])
+        .run(&WLAN_COMMAND)
         .and_then(|text| parse::netsh_wlan(&text));
     let primary = quick
         .primary
@@ -440,10 +453,25 @@ mod tests {
     SSID                   : ExampleNet\n\
     BSSID                  : 00:00:5e:00:53:02\n";
 
+    /// The command line the fake machine is asked, as a word list joined.
+    fn wlan() -> String {
+        WLAN_COMMAND.join(" ")
+    }
+
+    /// What `WLAN_COMMAND` says is pinned: without the code page it is a
+    /// question that gets the answer of the system's own language and code page.
+    #[test]
+    fn netsh_is_asked_in_a_console_of_utf_8() {
+        assert_eq!(
+            wlan(),
+            "cmd /d /c chcp 65001 >nul & netsh wlan show interfaces"
+        );
+    }
+
     fn wireless_host() -> FakeHost {
         FakeHost::default()
             .with_adapter(adapter("Wi-Fi", AdapterKind::Wifi, true, &["192.0.2.1"], 1))
-            .with_command("netsh wlan show interfaces", NETSH)
+            .with_command(&wlan(), NETSH)
     }
 
     #[test]
@@ -458,7 +486,7 @@ mod tests {
                 bssid: Some("00:00:5e:00:53:02".to_string()),
             })
         );
-        assert_eq!(host.calls(), ["netsh wlan show interfaces"]);
+        assert_eq!(host.calls(), [wlan()]);
     }
 
     /// No wireless adapter is up: there is no link, and `netsh` is not run.
@@ -473,7 +501,7 @@ mod tests {
                 1,
             ))
             .with_adapter(adapter("Wi-Fi", AdapterKind::Wifi, false, &[], 1))
-            .with_command("netsh wlan show interfaces", NETSH);
+            .with_command(&wlan(), NETSH);
         let quick = quick(&host, &ReadOpts::default());
         assert_eq!(wifi(&host, &quick), None);
         assert_eq!(host.calls(), Vec::<String>::new());
@@ -489,7 +517,7 @@ mod tests {
         for host in [
             FakeHost::default()
                 .with_adapter(adapter("Wi-Fi", AdapterKind::Wifi, true, &["192.0.2.1"], 1))
-                .with_command("netsh wlan show interfaces", silent),
+                .with_command(&wlan(), silent),
             FakeHost::default().with_adapter(adapter(
                 "Wi-Fi",
                 AdapterKind::Wifi,
