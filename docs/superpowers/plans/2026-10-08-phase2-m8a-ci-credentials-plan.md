@@ -129,6 +129,8 @@ RUSTFMT="…/stable-x86_64-pc-windows-gnu/bin/rustfmt.exe" cargo fmt --all --che
 
 待展开。带着任务 1 的提交推送之后，从注解里读出三个平台各自失败的用例，逐条：定因 → 本机能复现的先补失败用例 → 修 → 记进下面的「执行期修正记录」。设计 3.2 列出的"首次推送后看 CI"的事项一并核对。
 
+第一次推送（`b41930a`，2026-10-14，运行号 38536637023）：fmt、clippy 与全部参照服务端的安装步骤三平台都通过；`cargo test` 一步 Linux 以 101 退出（测试跑完了，有失败），macOS 与 Windows 用满了 60 分钟。注解没有说出失败的是哪些用例（记录第 5 行）；修正之后要再推送一次，失败清单才读得到。
+
 ## 任务 7：文档
 
 兼容性清单（6.2 节 `https://` 一行：DoH 的 Basic 认证、全角 `＠`、端口回显；10.4 节 `profiles/current`：`auth-key`、DNS 服务器 URL、按最后一个 `@` 切；10.3 节：环境变量的取值）、`docs/api/phase1.md`（脱敏名单的同样两处）、总设计（M8 一行的指引、`W0007` / `Unsupported` 的归宿、第 14 节第 1、8 条）、CLAUDE.md（状态、文档索引、命令）。
@@ -145,6 +147,8 @@ RUSTFMT="…/stable-x86_64-pc-windows-gnu/bin/rustfmt.exe" cargo fmt --all --che
 | 2 | 2 | `without_credentials` 的第一版对任何取值都保留 `://` 之前的部分：`http-api = pa://ss@…` 会露出 key 的前半截。拆成两个函数（P3），key 与监听口令不走带 scheme 的那一个 | b09b126 |
 | 3 | 2 | 标记配置里 WireGuard peer 的 `public-key` 起初也用了带标记的值，脱敏输出"漏出"的其实是公钥——公钥不是凭据，换成不带标记的值；`shadow-tls-version=3` 的行补上必填的 `shadow-tls-sni` | b09b126 |
 | 4 | 2 ～ 5 | 门禁（任务 1 ～ 5 做完的树，2026-10-08）：格式与 clippy 通过；全量 69 个结果行、2175 个用例通过、3 个忽略。两轮各有一次与改动无关的偶发：第一轮 `rurge-engine` 的 `auto_groups` 以 `STATUS_HEAP_CORRUPTION` 异常退出，第二轮 `rurge` 的 `cli` 里一条用例拉起的 `rurge` 子进程在启动瞬间无声退出（同一类：被注入的进程在多个线程同时开始用 socket 时崩溃，M8-D4）；各自单独重跑通过（`cli` 连跑三次都是 57 / 57） | — |
+| 5 | 1、6 | 第一次真正用上（`b41930a` 的运行）时，摘要一个失败的用例也没有认出：工具链的 action（`dtolnay/rust-toolchain`）给整个任务设 `CARGO_TERM_COLOR=always`，cargo 写的 `Running …` 与 `error: test failed, …` 带颜色码、`Finished …` 带链接，`Running …` 一行认不出，测试二进制一个也没切出来，`rurge` 的用例让守护进程打印的 `error: …` 被当成了编译错误（三个平台各两段）。读每一行之前先去掉控制序列（`ESC [ …`）与操作系统命令（`ESC ] …`）。核对：本机打开颜色跑出来的一份日志（认出 14 个二进制、没有失败），与由它合成的三份——一个失败的用例连同守护进程打印的 `error: …`（只报那个用例）、日志在一个二进制中间结束（报没跑完与还在跑的用例） | 1e7c644 |
+| 6 | 6 | `check` 任务的缓存只在成功时保存，而这个任务从没成功过：每次运行都从头编译全部依赖。改为失败时也保存（`cache-on-failure: true`）。macOS 与 Windows 用满 60 分钟是不是因为编译慢，要看下一次运行的摘要（没跑完的二进制与还在跑的用例） | 1e7c644 |
 
 ## 延后事项
 
@@ -154,5 +158,5 @@ RUSTFMT="…/stable-x86_64-pc-windows-gnu/bin/rustfmt.exe" cargo fmt --all --che
 | 2 | 缓存目录 `meta.json` 里资源的完整 URL（含订阅 token，只写不读） | 不处理：与缓存的订阅正文、配置文件同在使用者的数据目录里 |
 | 3 | `[General]` 里不认识的键（`W0001`）的取值在 `General.unknown` 的 `Debug` 里原样可见——把凭据写在一个拼错的键名下时 | 有用户报告再说；`redact_profile` 对拼错的键名同样无从判断 |
 | 4 | `General` 的 `proxy_test_url` / `internet_test_url` 在 `Debug` 里原样可见（它们的诊断不引用取值；策略自己的 `test-url` 已不显示） | 顺手时改成与 `CommonOpts.test_url` 一致 |
-| 5 | 失败摘要的脚本没有自动化测试，只对着几份真实与合成的日志手工核对过；注解单条的长度上限（取了 3000 字符）没有文档依据 | 第一次真正用上时核对；需要时给脚本配一组样本日志 |
+| 5 | 失败摘要的脚本没有自动化测试，只对着几份真实与合成的日志手工核对过；注解单条的长度上限（取了 3000 字符）没有文档依据 | 第一次真正用上时核对；需要时给脚本配一组样本日志。第一次用上（`b41930a`）时认不出带颜色码的日志，修正见记录第 5 行；仍没有自动化测试 |
 | 6 | `url_without_credentials` 对查询串里带 `@` 而没有用户名口令的 URL（`https://host/path?x=a@b`）过度脱敏成 `https://***@b` | 接受：偏安全一侧；只出现在诊断与脱敏输出里 |
