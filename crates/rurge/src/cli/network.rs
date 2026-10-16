@@ -16,8 +16,12 @@ use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 use tokio_util::task::AbortOnDropHandle;
 
-/// A change is told as it comes, and no other for this long after: the ones
-/// that come meanwhile are one, told when the time is over.
+/// The network is read no more than once in this time: the hints that come
+/// meanwhile are one, answered by a read when the time is over. A read can run
+/// several programs, and a switch of network is many hints. A change that a
+/// read finds is told at once, so the first change after a quiet time is told
+/// as it comes, and the ones that follow within the time are one, told when it
+/// is over.
 const WINDOW: Duration = Duration::from_secs(1);
 
 /// The backend the command asks for: the machine when nothing says otherwise.
@@ -137,16 +141,18 @@ pub fn spawn<C: Send + 'static>(
     AbortOnDropHandle::new(tokio::spawn(follow(hints, again, snapshot, changes, wrap)))
 }
 
-/// On every hint: reads the network, and tells `changes` when it is not what
-/// it was told last (the facts, the DNS servers or the addresses of the
-/// interface are different). `told` is the network the daemon began with.
+/// On a hint: reads the network, and tells `changes` when it is not what it
+/// was told last (the facts, the DNS servers or the addresses of the interface
+/// are different). `told` is the network the daemon began with.
 ///
-/// The first change after a quiet time is told at once, and opens a window of
-/// [`WINDOW`]. The changes that come in it are held back, the latest of them
-/// alone, and told when it ends; that opens another window, so that a network
-/// that does not settle is told of once a second, and one that does is told of
-/// when it has. A network that is back to what was told last by the end of the
-/// window is no change.
+/// A hint is answered by a read at once if none was made in the last
+/// [`WINDOW`], else by one read when that time is over, however many hints
+/// come meanwhile: a burst of hints costs two reads at most. So the first
+/// change after a quiet time is told at once, and the ones that come after it
+/// within the time are one, told when it is over and with the latest network,
+/// as a network that does not settle is told of once a second and one that
+/// does is told of when it has. A network that is back to what was told last
+/// by then is no change.
 async fn follow<C, A, F>(
     hints: Arc<Notify>,
     mut again: A,
@@ -157,48 +163,48 @@ async fn follow<C, A, F>(
     A: FnMut() -> F,
     F: Future<Output = Option<Snapshot>>,
 {
-    // the end of the window that is open, if one is, and the latest look in
-    // it that differs from what was told
-    let mut window: Option<Instant> = None;
-    let mut held: Option<Snapshot> = None;
+    // no read is made before this, when one was made lately
+    let mut rest: Option<Instant> = None;
     loop {
-        let hinted = match window {
-            Some(end) => tokio::select! {
-                () = hints.notified() => true,
-                () = tokio::time::sleep_until(end) => false,
-            },
-            None => {
-                hints.notified().await;
-                true
-            }
-        };
-        if !hinted {
-            // the window is over: what was held back is told now
-            window = None;
-            if let Some(snapshot) = held.take() {
-                if !tell(&changes, &wrap, &mut told, snapshot).await {
-                    return;
-                }
-                window = Some(Instant::now() + WINDOW);
-            }
+        wait_for_a_read(&hints, &mut rest).await;
+        let seen = again().await;
+        rest = Some(Instant::now() + WINDOW);
+        let Some(snapshot) = seen else {
             continue;
+        };
+        if snapshot != told && !tell(&changes, &wrap, &mut told, snapshot).await {
+            return;
         }
-        let Some(snapshot) = again().await else {
-            continue;
-        };
-        // a window that ended while the network was being read is over
-        let open = window.is_some_and(|end| Instant::now() < end);
-        if snapshot == told {
-            held = None;
-        } else if open {
-            held = Some(snapshot);
-        } else {
-            held = None;
-            if !tell(&changes, &wrap, &mut told, snapshot).await {
+    }
+}
+
+/// Waits until a read of the network is due: a hint has come, and no read was
+/// made in the last [`WINDOW`] (`rest` is when that is over). A hint that
+/// comes in that time waits for its end; and so does every one after it, for
+/// the read that follows answers them all.
+async fn wait_for_a_read(hints: &Notify, rest: &mut Option<Instant>) {
+    if let Some(end) = *rest {
+        tokio::select! {
+            () = hints.notified() => {
+                tokio::time::sleep_until(end).await;
+                *rest = None;
+                // the hints that came while it waited are this one
+                forget_the_stored_hint(hints).await;
                 return;
             }
-            window = Some(Instant::now() + WINDOW);
+            () = tokio::time::sleep_until(end) => *rest = None,
         }
+    }
+    hints.notified().await;
+}
+
+/// Takes the hint that is stored, if there is one: a hint is a permit, and
+/// the read that is about to be made answers it.
+async fn forget_the_stored_hint(hints: &Notify) {
+    tokio::select! {
+        biased;
+        () = hints.notified() => {}
+        () = std::future::ready(()) => {}
     }
 }
 
@@ -227,6 +233,7 @@ mod tests {
     use super::*;
     use std::net::IpAddr;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn ip(text: &str) -> IpAddr {
         text.parse().unwrap()
@@ -280,24 +287,40 @@ mod tests {
     impl World {
         /// The machine is on `first`, which is also what the daemon began with.
         async fn start(first: Snapshot) -> World {
+            World::start_counting(first, Duration::ZERO).await.0
+        }
+
+        /// `start`, on a machine that takes `delay` to look at its network, and
+        /// the number of looks it has had to make. What a look says is the
+        /// network at the moment it begins.
+        async fn start_counting(first: Snapshot, delay: Duration) -> (World, Arc<AtomicUsize>) {
             let hints = Arc::new(Notify::new());
             let now = Arc::new(Mutex::new(Some(first.clone())));
+            let reads = Arc::new(AtomicUsize::new(0));
             let (tx, told) = mpsc::channel(16);
             let again = {
                 let now = now.clone();
+                let reads = reads.clone();
                 move || {
+                    reads.fetch_add(1, Ordering::SeqCst);
                     let seen = now.lock().unwrap().clone();
-                    async move { seen }
+                    async move {
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        seen
+                    }
                 }
             };
             let task = tokio::spawn(follow(hints.clone(), again, first, tx, |facts| facts));
             settle().await;
-            World {
+            let world = World {
                 hints,
                 now,
                 told,
                 task,
-            }
+            };
+            (world, reads)
         }
 
         /// The network is `network` now (`None`: it cannot be read), and the
@@ -435,6 +458,60 @@ mod tests {
         // the next one that works is read as usual
         world.change(Some(on_wifi("one"))).await;
         assert_eq!(world.told(), [told_of("one")]);
+    }
+
+    /// A read of the network is a program or two, and the platform may say it
+    /// has changed many times a second: reads are no closer together than a
+    /// second. A burst of hints costs the read that answers the first of them
+    /// and one when the second is over, which has whatever came meanwhile.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_hints_costs_two_reads() {
+        let (world, reads) = World::start_counting(on_wifi("start"), Duration::ZERO).await;
+        let reads = || reads.load(Ordering::SeqCst);
+        // five hints in the first 600 milliseconds, and the network as it was
+        for _ in 0..5 {
+            world.change(Some(on_wifi("start"))).await;
+            pass(Duration::from_millis(150)).await;
+        }
+        assert_eq!(reads(), 1, "the first is answered at once, the rest wait");
+        pass(Duration::from_millis(249)).await;
+        assert_eq!(reads(), 1, "the second is not over");
+        pass(Duration::from_millis(1)).await;
+        assert_eq!(reads(), 2, "one read answers the rest");
+        // nothing more was asked for
+        pass(Duration::from_secs(10)).await;
+        assert_eq!(reads(), 2);
+
+        // a hint after a quiet time is answered at once
+        let before = tokio::time::Instant::now();
+        world.change(Some(on_wifi("start"))).await;
+        assert_eq!(reads(), 3);
+        assert_eq!(tokio::time::Instant::now(), before, "no time passed");
+    }
+
+    /// A hint that comes while the network is being read may be about a change
+    /// that the read did not see: it is answered by a read when the second is
+    /// over, and not lost.
+    #[tokio::test(start_paused = true)]
+    async fn a_hint_that_comes_during_a_read_is_answered_when_the_second_is_over() {
+        let (mut world, reads) =
+            World::start_counting(on_wifi("start"), Duration::from_millis(400)).await;
+        let reads = || reads.load(Ordering::SeqCst);
+        // the read begins at once and sees `one`; it ends at 400 ms
+        world.change(Some(on_wifi("one"))).await;
+        assert_eq!(reads(), 1);
+        pass(Duration::from_millis(200)).await;
+        world.change(Some(on_wifi("two"))).await;
+        pass(Duration::from_millis(200)).await;
+        assert_eq!(world.told(), [told_of("one")]);
+
+        // a second after that read: the read that has `two`
+        pass(Duration::from_millis(999)).await;
+        assert_eq!(reads(), 1, "the second is not over");
+        pass(Duration::from_millis(1)).await;
+        assert_eq!(reads(), 2);
+        pass(Duration::from_millis(400)).await;
+        assert_eq!(world.told(), [told_of("two")]);
     }
 
     /// The task ends when the daemon no longer listens, rather than go on
