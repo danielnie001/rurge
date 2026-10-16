@@ -449,6 +449,7 @@ SSID:Home cellular-fallback={MARKER}-seven,cellular-mode={MARKER}-eight
 TYPE:WIFI dns-sever=https://al1ce:{MARKER}-nine@dns.example/dns-query
 ROUTER:192.168.1.1,dns-server=https://al1ce:{MARKER}-ten@dns.example/dns-query
 SSID:Home dns-sever=https://al1ce:{MARKER}-eleven@dns.example/dns-query
+TYPE:WIFI,dns-sever:https://a:{MARKER}-twelve@d.io/q
 [Rule]
 FINAL,DIRECT
 "
@@ -464,10 +465,12 @@ FINAL,DIRECT
     found.extend(leaks(&format!("{:#?}", loaded.config)));
     assert_eq!(found, Vec::<String>::new());
 
-    // the two lines whose expression is wrong are errors, told without a word
-    // of the line, and are left out; the other seven are kept, and read as
-    // far as they can be (the last one is an SSID with a blank in it, and no
-    // parameter)
+    // the three lines whose expression is wrong are errors, told without a
+    // word of the line (the last of them is short enough to be quoted, and a
+    // URL is no expression: it holds no blank and no `=`, and only the `://`
+    // and the `@` tell it from one), and are left out; the other seven are
+    // kept, and read as far as they can be (the last of them is an SSID with a
+    // blank in it, and no parameter)
     let errors: Vec<&str> = loaded
         .diagnostics
         .iter()
@@ -479,6 +482,7 @@ FINAL,DIRECT
         [
             "invalid subnet expression: expected WIFI, WIRED or CELLULAR",
             "invalid subnet expression: expected an IP address",
+            "invalid subnet expression: expected WIFI, WIRED or CELLULAR",
         ]
     );
     assert_eq!(loaded.config.ssid_settings.len(), 7);

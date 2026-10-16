@@ -492,9 +492,12 @@ impl SubnetExpr {
         // The expression is quoted only when it can be what somebody wrote as
         // one. In `[SSID Setting]` it is everything in front of the first
         // known key, and when that key is misspelt it holds the whole
-        // parameter, a DNS URL with its password among it.
+        // parameter, a DNS URL with its password among it. That can be a text
+        // with no blank and no `=` (`TYPE:WIFI,dns-sever:https://u:pw@host/q`:
+        // a comma for the blank in front of the parameter, a colon for its
+        // `=`), and what tells it from an expression is the `://` and the `@`.
         let bad = |what: &str| {
-            let message = if quotable(s) {
+            let message = if quotable(s) && !s.contains("://") && !s.contains('@') {
                 format!("invalid subnet expression `{s}`: {what}")
             } else {
                 format!("invalid subnet expression: {what}")
@@ -1014,6 +1017,40 @@ external-policy-modifier=\"password=hunter2\"",
             "invalid subnet expression: expected an IP address"
         );
         assert_eq!(e.code, codes::E_INVALID_RULE_VALUE);
+    }
+
+    /// A text with a `://` or an `@` in it is not quoted by `E0011` though it
+    /// holds no blank and no `=` and is short: a comma for the blank in front
+    /// of a misspelt parameter and a colon for its `=` leave the whole line as
+    /// the expression, and the URL in it may hold a password.
+    #[test]
+    fn a_wrong_subnet_expression_that_holds_a_url_is_not_quoted() {
+        let told = |expression: &str| SubnetExpr::parse(expression).unwrap_err().message;
+        for (expression, expected) in [
+            (
+                "TYPE:WIFI,dns-sever:https://a:pw@d.io/q",
+                "invalid subnet expression: expected WIFI, WIRED or CELLULAR",
+            ),
+            (
+                "ROUTER:https://a:pw@d.io",
+                "invalid subnet expression: expected an IP address",
+            ),
+            (
+                "MCCMNC:a@b",
+                "invalid subnet expression: expected MCC+MNC digits",
+            ),
+            (
+                "TYPE:x://",
+                "invalid subnet expression: expected WIFI, WIRED or CELLULAR",
+            ),
+        ] {
+            assert_eq!(told(expression), expected, "{expression}");
+        }
+        // short, and neither: still quoted
+        assert_eq!(
+            told("TYPE:SATELLITE"),
+            "invalid subnet expression `TYPE:SATELLITE`: expected WIFI, WIRED or CELLULAR"
+        );
     }
 
     /// The network of a test: the primary interface (its name, its kind and
