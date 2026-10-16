@@ -206,12 +206,48 @@
 
 ## 执行期修正记录
 
+第 1 ～ 14 行是主持这一轮的会话在执行中代项目所有者作的裁定（所有者可以改），每行写着被它改掉的计划或设计的哪一句、代价是什么；第 15 行起是实现者做的、与计划或设计的文字不同的地方。
+
 | # | 任务 | 修正 | 提交 |
 | - | ---- | ---- | ---- |
+| 1 | 1、2 | `rurge-platform` 不依赖任何别的 crate（需求文档 3.2 节"无内部依赖"，其它平台类型也都经可执行文件里的适配器到达引擎）：`netenv` 有自己的 `Snapshot`、`Primary`、`Wifi`、`NetKind`（带 serde，文件后端用），由可执行文件映射成 `NetworkFacts`（`cli::network::facts_of`）；设计里的 `Snapshot { facts: NetworkFacts }` 与计划要求的"`NetworkFacts` 带 serde"撤回，`rurge-config` 的 `NetworkFacts` 没有 serde；代价：两套并行的类型和一个映射函数 | `a6a9ff1`、`0ea4938` |
+| 2 | 3 | `EngineShared.network` 在任务 3 加，不在任务 4：任务 3 是第一个要在引擎里建 `RuleEngine` 的任务，按计划的次序它得先接一个用完就扔的空格子 | `8279b7a` |
+| 3 | 5 | `[SSID Setting]` 的 DNS 覆盖是 `StackOptions` 的一个字段（`dns_override`），在 `build_stack_with` 里 `ResolverConfig::from_config` 之后、`customize` 钩子之前套用——`Runtime::build` 与 `rurge dns lookup` 共用这一处，`--server` 仍然最后说了算；`Runtime::dns_override()` 返回这一代建的时候用的那份（`&DnsOverride`）。计划写的是在 `Runtime::build` 里套用、返回 `Option<(…)>`，而 `dns lookup` 不经 `Runtime::build`；代价：`StackOptions` 多一个字段 | `b775bd1` |
+| 4 | 2 | 计划里"在本平台上真读一次快照不 panic"的用例不断言内容；`reading_this_machine_does_not_panic` 照样读真实的机器（只读），但断言在任何机器上都成立的不变量：被排除的网卡不出现；有主网卡时名字非空、不是回环；每个网关都不是未指定地址。什么也不断言的用例是评审标准里的缺陷 | `0ea4938` |
+| 5 | 3、4 | `RuleEngine::build`、`build_with_registry` 与 `PolicyRegistry::build` 的签名不变（合计约四十处调用点，多在测试里）：加建造者 `with_network(Arc<NetworkCell>)`，`subnet-exp-wifi-always-match` 从它们本来就收的 `Config` 里读；没调 `with_network` 的引擎或注册表看到"什么都不知道"的网络（`SUBNET` 永不命中，`subnet` 组用 `default`）；代价：漏调的调用点不声不响地看不到网络（任务 5、6 的端到端用例覆盖引擎与 `rurge rule match` 两条路径） | `8279b7a`、`297c11e` |
+| 6 | 1 | 子网表达式写错时，`E0011` 与 `SsidSetting` 的 `Debug` 只在表达式能被引用时才引用它（`spec::reader::quotable`：没有空白、`=`、全角的 `＝` 与 `，`，至多 64 个字符）。表达式是第一个认识的键之前的全部文字，键拼错时整个参数——可能是带口令的 DNS URL——并进了它；"凭据不进诊断"的规矩压过计划写的"`E0011` 的文本同 `subnet` 组今天的写法"。代价：不能被引用的表达式得到一句不带任何文字的错误 | `afb3ecb` |
+| 7 | 2 | `Snapshot.addresses` 不是原样的地址表：IPv4 地址原样，IPv6 只留 /64 前缀（链路本地的不要），排序去重。IPv6 的隐私地址每隔几小时自己变，原样比较会让"网络变化"每天来几次（清 DNS 缓存、作废测速、清 `subnet` 组的覆盖、让 WireGuard 换载体）；设计 3.1 节写的是"主网卡的地址"；代价：同一个 /64 里只有接口标识变了的变化看不到 | `0ea4938` |
+| 8 | 2 | Linux 问 NetworkManager 的命令是 `nmcli -t -f ACTIVE,SSID,BSSID,DEVICE dev wifi list --rescan no`，不是设计写的 `dev wifi`（列表比 30 秒旧时 `nmcli` 默认会发起一次 Wi-Fi 扫描，笔记本上就是每 30 秒一次对着无线电要一份用不着的答案）；子进程的环境变量是 `LC_ALL=C.UTF-8`：`nmcli` 把 `yes` 译成使用者的语言，C 区域没有翻译，但 C 区域的字符集是 ASCII，含非 ASCII 字母的网络名很可能读成 `?`（据对 glib 的了解推断，没有在 Linux 上量过）；没有 `C.UTF-8` 的系统退回 C | `1f434b5`、`12217f4` |
+| 9 | 2 | Windows 上 `cmd`、`chcp`、`netsh` 一律按 `<SystemRoot>\System32` 下的绝对路径起，并设 `NoDefaultCurrentDirectoryInExePath=1`（评审时从次要升为重要：增强模式下 rurge 以管理员身份运行，`cmd` 不能先去当前目录里找 `netsh`）；`SystemRoot` 不是朴素的路径（盘符、冒号、反斜杠，再是由字母、数字、`_`、`-`、`.` 组成的名字）时按没有设处理，退回 `C:\Windows`——这个值要进 `cmd` 读的命令行，放着不查，一个被篡改的 `SystemRoot` 就是命令注入 | `1f434b5` |
+| 10 | 3 | 三个拿 `SUBNET` 当"运行期不支持的规则类型"的现有用例改了：`unsupported_and_never_kinds` 与 `unsupported_kinds_note_once_and_count_hits` 改用仍然不支持的 `DEVICE-NAME`；`a_note_of_the_pre_pass_is_surfaced_once_and_reaches_the_decision` 保留用途，在测试模块里把第一条规则的匹配器换成 `Matcher::Unsupported`（现在没有"允许 `pre-matching`、运行期又不受支持"的规则类型了，加载器会拒绝带 `pre-matching` 的 `DEVICE-NAME`） | `8279b7a` |
+| 11 | 4 | `only_a_member_can_be_selected`（`crates/rurge-engine/tests/outbounds.rs`）对 `subnet` 组的断言从 `NotSelectable` 改为非成员的 `NotAMember`：`subnet` 组现在能临时覆盖，旧期望与设计矛盾；`NotSelectable` 的文字与别的断言不变（现有的组类型已没有一个能返回它，变体留着当护栏） | `67fb3c0` |
+| 12 | 4 | `AutoGroups` 记一个网络世代（`epoch`）：换网络那一刻正在跑的一轮测速，结束时不算新网络上的一轮——否则它给 `rounds` 盖章，换网络要求的重测被跳过，`evaluate-before-use` 的拨号也等不到新的一轮。按组判而不是一个全局的比较，免得拖住不该动的 `smart` 组。另外 `resolve_ready` 在旧的一轮结束后再请求一轮（`AutoGroups::wake` 改成 `pub`），否则等第一轮的拨号会把整个 `round_timeout` 等满（测到 5.07 秒）再带着旧结果继续 | `2890cf2` |
+| 13 | 6 | 因 DNS 覆盖变了而用内存里的配置重建一代时，不调 `ProfileSources::track`，也不刷新系统代理：计划的 P2 假定这两步等于不变，其实 `track(&同一份来源)` 不是空操作——它重置 `outdated_for`，并放掉在用的一代没有点名的来源（一次失败的重载之后临时跟上、等着下载的那些），换网络于是会取消使用者需要的下载；这一次重建配置没变，来源也没变 | `1f44b33` |
+| 14 | 6 | 隐藏的 `--network-backend <file:path>`（`RuntimeArgs` 里，`env = RURGE_NETWORK_BACKEND`，`hide`；`rurge run`、`rule match`、`dns lookup`、`dns cache` 共用）：`external` 策略拉起的程序拿不到名字以 `RURGE_` 开头的变量（`is_own_setting`），嵌套的 `rurge run`（用例 `run_starts_an_external_program_and_stops_it_on_exit`）于是没有文件后端、会去读本机的网络。选项在命令行上取代变量，未知取值与变量一样报同一句并以 2 退出；`is_own_setting` 不动。此前"起守护进程的用例从不读本机的网络"说得过宽，这个嵌套的进程是例外；任务 6 的评审发现了它 | `ea9353c` |
+| 15 | 2 | 三个平台的读取器没有各自按 `#[cfg(target_os)]` 编译，而是都在每个宿主上编译、运行时按 `dirs::Os` 选，读取器收一个注入的"机器"（`Host`），只有 `RealHost` 碰系统——同 `sysproxy`、`sysinfo` 的做法。Linux 与 macOS 的读取逻辑因此全在开发机上被假机器（`FakeHost`）跑过；本机编译不到的只剩 `windows.rs` 里 `#[cfg(not(windows))] system_adapters` 三行与 `command.rs` 里 `Tree` 的非 Windows 分支约八行 | `0ea4938` |
+| 16 | 2 | Windows 的 `netsh` 经 `cmd /d /c "chcp 65001 >nul & netsh …"` 问：核对开发机（系统语言是中文）上的真实输出发现，管道里是 GBK、键被翻译，含非 ASCII 字母的网络名会读坏；经 UTF-8 的控制台问，键是英文、值按 UTF-8 写。`run_with_timeout` 在 Windows 上给子进程 `CREATE_NO_WINDOW`，并把它放进 Job Object，超时时连它启动的进程一起结束 | `388d98c` |
+| 17 | 2 | macOS 的路由消息一阵合成一次提示（静下来 300 毫秒才发，连续不停也至多拖 1 秒），不是每条相关的消息一次提示：一次网络切换在 macOS 上是几十条消息，每个提示都要起三四个子进程 | `0ea4938` |
+| 18 | 2 | BSSID 的八位组补齐前导 0（`0:0:5e:0:53:2` 读成 `00:00:5e:00:53:02`，只对六段十六进制的写法）：macOS 的工具少写前导 0，而求值一侧按字符串比，同一个 BSSID 要在各平台读成一个样子 | `0ea4938` |
+| 19 | 6 | "网络变化之后比较 `Runtime::dns_override()` 与网络给的 DNS"这一问放在两处：网络变化之后（起作用的一处），和一次成功的重载之后——后一处其实触发不了：一代总是建在引擎的网络格子里的网络上，而格子只由主循环写。留着它，是为了对任何新一代问同一个便宜的问题 | `1f44b33` |
+| 20 | 6 | `GET /v1/policy_groups` 不带当前选择：设计 6.3 节写的是它"给出 `subnet` 组的成员表与当前选择"，其实这个端点对所有的组都只给成员表，当前选择是 `GET /v1/policy_groups/select`；任务 6 的用例读后者，API 文档 `docs/api/phase3.md` 照实写 | `1f44b33` |
 
 ## 延后事项
 
 | # | 事项 | 去向 |
 | - | ---- | ---- |
-| 1 | Linux 与 macOS 的 `netenv` 读取与路由套接字在开发机上编译不到、跑不了 | 第一次 CI 运行时核对 |
+| 1 | Linux 与 macOS 的 `netenv` 读取与路由套接字没有碰过真实的系统（读取器在开发机上编译、对着假的机器测过；细节见第 3 行） | 第一次 CI 运行时核对 |
 | 2 | `netsh`、`nmcli`、`iw`、`route`、`networksetup`、`ipconfig getsummary` 的输出夹具是按公开格式写的，非英文系统与各版本的真实输出没有核对 | 手工验收（`docs/acceptance/phase3-manual.md`） |
+| 3 | Linux 与 macOS 的读取只对着假的机器测过。读取器三个平台都编译、运行时按 `Os` 选，所以它们的逻辑（路由表、`/sys`、`nmcli` / `iw` / `route` / `networksetup` / `ipconfig getsummary` 的调用顺序与解析、缓存、排除）在开发机上被 `FakeHost` 跑过；没有跑过的是它们与真实系统的接触：真实的 `/proc` 与 `/sys` 的内容，`nmcli` 真实的列顺序，`iw` 的输出，`route -n get -inet6 default` 里 `gateway: fe80::1%en0` 的写法，`networksetup` 的端口名，`ipconfig getsummary` 里 `SSID :` 一行的空白与 BSSID 是否少写前导 0，以及 `PF_ROUTE` 套接字的建立（`socket(17, SOCK_RAW, 0)`）与消息头的偏移（类型在第 4 字节、标志在偏移 8）。夹具是按公开的输出格式写的，没有从任何一台真机上抄 | 第一次 CI 运行时核对（冒烟用例 `reading_this_machine_does_not_panic` 在 Linux 与 macOS 的 runner 上读真实的机器） |
+| 4 | Windows：非英文系统上 `netsh wlan show interfaces` 的两个键（`SSID`，`BSSID` 或 Windows 11 的 `AP BSSID`）。开发机（系统语言是中文，Wi-Fi 当时断开）上量过：管道里是 GBK、键被翻译，经 `chcp 65001` 之后键是英文、没有替换字符；含非 ASCII 字母的真实 SSID 没有量过 | 手工验收（`docs/acceptance/phase3-manual.md` 的 Windows 一节） |
+| 5 | Linux：glibc 早于 2.39 的系统上，`LANGUAGE` 设了时 `nmcli` 可能仍把 `yes` 译成使用者的语言（`LC_ALL=C.UTF-8` 挡不住 `LANGUAGE`），`ACTIVE` 一列读不出，退到 `iw`；补救是给 `nmcli` 的子进程把 `LANGUAGE` 清空，一行 | 手工验收（Linux 一节）；真有人撞上再改 |
+| 6 | Linux：NetworkManager 的笔记本上，rurge 没有因为问 `nmcli` 而发起 Wi-Fi 扫描（`--rescan no`）——用 `iw event` 对比有无 rurge 时的扫描事件——没有量过 | 手工验收（Linux 一节） |
+| 7 | macOS：本地化的硬件端口名可能让 `TYPE:WIRED` 判不出来（按英文单词 `Ethernet` / `LAN` 判）；没有位置授权的守护进程读不到 SSID（`ipconfig getsummary` 写 `<redacted>`），要拿到只能另做一个带位置授权的 App 包 | 手工验收（macOS 一节）；App 包是留给项目所有者的问题（总设计 Q6） |
+| 8 | 平台层的次要项（任务评审留下的，整分支终审决定改不改）：超时杀孙进程没有永久的用例，`ProcessTree::contain` 的错误被丢掉；几处读不到的项没有 DEBUG 行；两块无线网卡都连着时各平台的取法不同（Windows 可能把一块网卡的 SSID 安到另一块上）；macOS 上 `networksetup` 失败一次就没有旧的端口表可用（那一次读到的类型是 `other`）；去抖窗口里的每个提示都触发一次完整读取（macOS 上每次要起三四个子进程，设计 3.3 节要的是窗口内至多一次） | 整分支终审决定 |
+| 9 | 配置层的次要项：`SSID:Home, suspend=true`（第一个参数前是逗号而不是空白）里逗号成了表达式的一部分，这一行永不命中，没有诊断；`quotable` 仍会引用含 `://` 的短表达式（比如把键拼成 `dns-sever:https://…`），`is_name` 对 `://` 的判据能挡住它；`SubnetSpec` 与 `PolicyGroup` 的 `Debug` 把 `subnet` 组条件的表达式原样打出来；裸值的通配每次求值都重建一个 `Glob`；`is_parameter_name` 与 `is_plain_name` 几乎重复 | 整分支终审决定 |
+| 10 | 引擎与可执行文件的次要项：`DnsOverride` 比较的是原始列表，一行恰好列了 Profile 自己的服务器时，进出这样的网络会多重建一次（无害）；为 DNS 覆盖重建的一代不打印新一代的诊断（启动与重载打）；离开暂停时只在"想要开着"时重新打开，从不为"想要关着"去关（只有进入暂停时 `disable()` 失败才碰得到）；暂停结束时重新指向 rurge 失败只记一条 ERROR，不重试，直到下一次进出暂停或一次 `POST`；换网络那一刻已经在进行的查找，旧网络上的答案可能落进刚清空的缓存（此前就有）；一代在换网络的过程中建好时，它的解析器在构造时读的系统 DNS 服务器与 IPv6 状态是旧的，要等下一次变化；`Engine::network_changed` 的文档没写"总是清缓存、只该在真有差别时调"与"读系统 DNS 服务器会短暂阻塞" | 整分支终审决定 |
+| 11 | 测试的次要项：没有用例钉住集合文件里的 `SUBNET` 行随引擎求值（读代码得出），也没有跨两代的用例；没有用例持着一个会话跨过 `network_changed`；`network()` / `at_home()` 一类的夹具与 `on_wifi` / `on_cable` 在几个测试二进制里各抄了一份；跨两次换网络的一轮测速没有用例；`TestBook` 对同一个策略一次只测一个，换网络后新开的一轮会与旧网络上还没结束的那一个测试共用结果；`rurge dns cache` 也收 `--network-backend`，没有用例驱动它，非 UTF-8 的 `RURGE_NETWORK_BACKEND` 由 clap 自己的话拒绝 | 整分支终审决定 |
+| 12 | 一次全量运行里 `rurge-api` 的测试二进制以 `STATUS_ACCESS_VIOLATION`（0xc0000005）退出（任务 6 修正轮的第一次全量，跑到 56 个里的第 40 个），单独重跑五次、下一次全量都通过；原因没有查明。开发机上已查明的是另一个代码 `STATUS_HEAP_CORRUPTION`（管控软件注入的钩子 DLL） | 再出现时先单独重跑；重复就查 |
+| 13 | `[SSID Setting]` 的 DNS 覆盖今天只管解析器的 `dns-server` 与 `encrypted-dns-server` 两张表；DNS 应答器的转发（总设计 Q-24）还没有，应答器本身在 M3 | M3 |
+| 14 | 接管暂停的增强模式一半；排除 rurge 自己的虚拟网卡（`ReadOpts.exclude` 已留好入口，今天传空表）；`network-changed` 事件脚本；Logbook 里记网络变化 | 前两项 M4，事件脚本阶段 5，Logbook 阶段 6 |
+| 15 | `[Host]` 键里的 `RULE-SET` / `DOMAIN-SET`（`rurge-dns` 用 `EvalCtx::new` 建上下文）看不到网络，那里的 `SUBNET` 行永不命中，也不再有"not supported"的提示 | 有人写了这样的 Profile 再说 |
+| 16 | 主网卡是默认路由所在的网卡，不分物理与虚拟：全隧道的 VPN 接管默认路由后，主网卡就是 VPN 的网卡，`TYPE:` 与 `ROUTER:` 看的是它；Windows 只跳过类型 131 的隧道网卡，别的类型的 VPN 网卡（PPP、TAP）有网关又度量低时同样成了主网卡；Linux 上 `type` 为 1 的虚拟网卡（如 `tap`）算 `WIRED` | 手工验收（与平台无关一节）；排除别的 VPN 没有计划，排除 rurge 自己的虚拟网卡是 M4 |
