@@ -1035,6 +1035,10 @@ icon-url=https://example.com/i.png, category=Media",
         // a whole item in quotes is a member now (line-splitting design
         // LS-D6), one the loader reports (`E0008`)
         assert!(messages("select, A, \"pa=ss\"").is_empty());
+        // a whole `key=value` in quotes that lost the comma after it is glued
+        // to the next parameter, whose key then holds the quoted part: never
+        // named
+        assert_eq!(messages("select, A, \"pa=ss\"=1"), nameless());
         assert_eq!(messages("select, A, Mystery=1"), nameless());
         // a group's `{name}` in the message is not a policy's
         assert_eq!(

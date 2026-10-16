@@ -577,6 +577,40 @@ FINAL,DIRECT
     }
 }
 
+/// A whole `key=value` in quotes that lost the comma behind it is glued to
+/// the next parameter: the parser reads one parameter whose key holds the
+/// quoted part, a secret included (line-splitting design LS-D6). Its warning
+/// does not name it. The key is held lower-cased, so the marker is looked for
+/// lower-cased too.
+#[test]
+fn a_parameter_glued_behind_a_whole_one_in_quotes_is_not_named() {
+    let text = format!(
+        "[Proxy]
+Glued = trojan, gl.example, 443, password=pw, \"sni={MARKER}-glued\"tfo=true
+[Proxy Group]
+GG = select, Glued, \"policy-path=https://sub.example/list?token={MARKER}-gluedpath\"update-interval=3600
+[Rule]
+FINAL,DIRECT
+"
+    );
+    let loaded = load(&text);
+    let messages: Vec<String> = loaded
+        .diagnostics
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    for told in [
+        "policy `Glued`: unknown parameter ignored",
+        "policy group `GG`: unknown parameter ignored",
+    ] {
+        assert!(messages.iter().any(|m| m == told), "{told}: {messages:#?}");
+    }
+    let marker = MARKER.to_ascii_lowercase();
+    for message in &messages {
+        assert!(!message.to_ascii_lowercase().contains(&marker), "{message}");
+    }
+}
+
 /// More values another field slid into, a field nobody reads, a link that
 /// is no policy line: no diagnostic quotes them and no `Debug` shows them.
 /// The `[WireGuard]` section is one that does not load, for its diagnostics;

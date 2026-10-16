@@ -24,19 +24,32 @@ pub(crate) fn quotable(value: &str) -> bool {
 /// it as a parameter name — ASCII lower-case letters, digits, `-` and `_`, at
 /// most 32 of them. The key is held lower-cased — a Base64 password
 /// `aHVudGVyMg==` arrives as `ahvudgvymg` — so this is decided on the text of
-/// the line, not on the key.
+/// the line, not on the key. The key must be such a name itself: the parser
+/// cuts an item at its first `=` outside quotes, so a key can hold a quoted
+/// `=` and what stands behind it (line-splitting design LS-D6).
 pub(crate) fn written_as_name(definition: &str, key: &str) -> bool {
+    // a key that is no name itself — the parser cut it behind a quoted `=`
+    // (`"pa=ss"=1`: a whole `key=value` in quotes that lost the comma after
+    // it) — is never named, whatever the items say
+    if !is_plain_name(key) {
+        return false;
+    }
     split_items(definition).into_iter().all(|item| {
         let reads_as_key = split_list(item).pop().is_some_and(|field| {
             parse_key_value(&field).is_some_and(|(name, _)| name.eq_ignore_ascii_case(key))
         });
         let written = item.split('=').next().unwrap_or_default().trim();
-        !reads_as_key
-            || ((1..=32).contains(&written.len())
-                && written.bytes().all(|b| {
-                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_')
-                }))
+        !reads_as_key || is_plain_name(written)
     })
+}
+
+/// Whether `text` is written the way a parameter name is: ASCII lower-case
+/// letters, digits, `-` and `_`, at most 32 of them.
+fn is_plain_name(text: &str) -> bool {
+    (1..=32).contains(&text.len())
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
 }
 
 /// The hint of an unknown parameter where a user name or a password stands
@@ -238,6 +251,17 @@ impl<'a> ParamReader<'a> {
             .push(Diagnostic::warning(code, message).at(self.policy.span.clone()));
     }
 
+    /// `warn`, with a hint of the place's own where the code's default does
+    /// not fit it.
+    fn warn_with_hint(&mut self, code: &'static str, message: String, hint: &'static str) {
+        let message = format!("{}: {message}", named("policy", &self.policy.name));
+        self.diags.push(
+            Diagnostic::warning(code, message)
+                .with_hint(hint)
+                .at(self.policy.span.clone()),
+        );
+    }
+
     pub fn has_errors(&self) -> bool {
         self.diags.iter().any(|d| d.severity == Severity::Error)
     }
@@ -250,14 +274,10 @@ impl<'a> ParamReader<'a> {
         for (key, _) in policy.params.iter() {
             if !self.used.contains(key) && reported.insert(key.to_string()) {
                 if credentials.contains(key) {
-                    let message = format!(
-                        "{}: unknown parameter ignored",
-                        named("policy", &policy.name)
-                    );
-                    self.diags.push(
-                        Diagnostic::warning(codes::W_UNKNOWN_KEY, message)
-                            .at(policy.span.clone())
-                            .with_hint(CREDENTIAL_HINT),
+                    self.warn_with_hint(
+                        codes::W_UNKNOWN_KEY,
+                        "unknown parameter ignored".to_string(),
+                        CREDENTIAL_HINT,
                     );
                     continue;
                 }
@@ -485,6 +505,11 @@ mod tests {
             said("trojan, 1.2.3.4, 443, mystery=1, MYSTERY=2"),
             nameless()
         );
+        // a whole `key=value` in quotes that lost the comma after it is glued
+        // to the next parameter: the key the parser cuts holds the quoted
+        // part, a secret perhaps (design LS-D6), and is never named
+        assert_eq!(said("trojan, 1.2.3.4, 443, \"pa=ss\"=1"), nameless());
+        assert_eq!(said("trojan, 1.2.3.4, 443, ('pa=ss')=1"), nameless());
     }
 
     /// Where a type reads its user name and its password from positions, an
@@ -507,6 +532,10 @@ mod tests {
         for def in [
             "http, 1.2.3.4, 80, alice, k3y=v4lue",
             "http, 1.2.3.4, 80, k3y=v4lue",
+            // an empty item is no field: the item stands in the fourth
+            "http, 1.2.3.4, 80, , , k3y=v4lue",
+            "https, 1.2.3.4, 443, alice, k3y=v4lue",
+            "socks5, 1.2.3.4, 1080, alice, k3y=v4lue",
             "socks5-tls, 1.2.3.4, 443, alice, k3y=v4lue",
             "h2-connect, 1.2.3.4, 443, alice, k3y=v4lue",
             "custom, 1.2.3.4, 8388, aes-256-gcm, k3y=v4lue",
