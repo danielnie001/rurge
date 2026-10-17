@@ -561,10 +561,6 @@ fn replace_url_host(url: &str, host: &str) -> Option<String> {
 }
 
 /// Windows paths compare case-insensitively with `\` separators (FR-RULE-01).
-pub fn normalize_process_path(path: &str) -> String {
-    normalize_process_path_for(cfg!(windows), path)
-}
-
 fn normalize_process_path_for(windows: bool, path: &str) -> String {
     if windows {
         path.replace('/', "\\").to_ascii_lowercase()
