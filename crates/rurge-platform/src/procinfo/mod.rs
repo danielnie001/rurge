@@ -11,6 +11,7 @@
 //!
 //! This crate knows no other crate of rurge, so the types here are its own.
 
+mod linux;
 mod windows;
 
 use std::collections::HashMap;
@@ -138,7 +139,7 @@ pub(crate) trait Source: Send + Sync {
 
 /// The addresses of the machine's interfaces, loopback ones included. An empty
 /// list when the system will not give them.
-#[cfg_attr(not(windows), allow(dead_code))] // only the Windows reader asks, so far
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))] // only the Windows and Linux readers ask, so far
 pub(crate) fn interface_addresses() -> Vec<IpAddr> {
     match if_addrs::get_if_addrs() {
         Ok(interfaces) => interfaces.iter().map(if_addrs::Interface::ip).collect(),
@@ -151,7 +152,7 @@ pub(crate) fn interface_addresses() -> Vec<IpAddr> {
 
 /// A machine whose sockets are not listed: every table is empty, so no process
 /// is ever found.
-#[cfg_attr(all(windows, not(test)), allow(dead_code))] // a finder uses it where nothing reads the sockets
+#[cfg_attr(all(any(windows, target_os = "linux"), not(test)), allow(dead_code))] // a finder uses it where nothing reads the sockets
 pub(crate) struct NoTables;
 
 impl Source for NoTables {
@@ -181,14 +182,16 @@ pub struct Finder {
 }
 
 impl Finder {
-    /// A finder for the platform this runs on. On Windows it reads the tables
-    /// the system keeps. On Linux and macOS nothing reads the sockets yet, and
+    /// A finder for the platform this runs on. On Windows and Linux it reads
+    /// the tables the system keeps. On macOS nothing reads the sockets yet, and
     /// it never finds a process.
     pub fn new() -> Finder {
         #[cfg(windows)]
         let source: Box<dyn Source> = Box::new(windows::Tables);
-        #[cfg(not(windows))]
-        let source: Box<dyn Source> = Box::new(NoTables); // no reader on this platform yet
+        #[cfg(target_os = "linux")]
+        let source: Box<dyn Source> = Box::new(linux::Tables::new(linux::RealFs));
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let source: Box<dyn Source> = Box::new(NoTables); // macOS: nothing reads its sockets yet
         Finder::with_source(source, ADDRESS_TTL)
     }
 
