@@ -11,6 +11,8 @@
 //!
 //! This crate knows no other crate of rurge, so the types here are its own.
 
+mod windows;
+
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -134,8 +136,22 @@ pub(crate) trait Source: Send + Sync {
     fn addresses(&self) -> Vec<IpAddr>;
 }
 
+/// The addresses of the machine's interfaces, loopback ones included. An empty
+/// list when the system will not give them.
+#[cfg_attr(not(windows), allow(dead_code))] // only the Windows reader asks, so far
+pub(crate) fn interface_addresses() -> Vec<IpAddr> {
+    match if_addrs::get_if_addrs() {
+        Ok(interfaces) => interfaces.iter().map(if_addrs::Interface::ip).collect(),
+        Err(error) => {
+            tracing::debug!(reason = ?error.kind(), "process lookup: cannot list the network interfaces");
+            Vec::new()
+        }
+    }
+}
+
 /// A machine whose sockets are not listed: every table is empty, so no process
 /// is ever found.
+#[cfg_attr(all(windows, not(test)), allow(dead_code))] // a finder uses it where nothing reads the sockets
 pub(crate) struct NoTables;
 
 impl Source for NoTables {
@@ -165,11 +181,15 @@ pub struct Finder {
 }
 
 impl Finder {
-    /// A finder for the platform this runs on. Where nothing reads the sockets
-    /// of the platform, it is one that never finds a process.
+    /// A finder for the platform this runs on. On Windows it reads the tables
+    /// the system keeps. On Linux and macOS nothing reads the sockets yet, and
+    /// it never finds a process.
     pub fn new() -> Finder {
-        // no platform has a reader yet
-        Finder::with_source(Box::new(NoTables), ADDRESS_TTL)
+        #[cfg(windows)]
+        let source: Box<dyn Source> = Box::new(windows::Tables);
+        #[cfg(not(windows))]
+        let source: Box<dyn Source> = Box::new(NoTables); // no reader on this platform yet
+        Finder::with_source(source, ADDRESS_TTL)
     }
 
     pub(crate) fn with_source(source: Box<dyn Source>, address_ttl: Duration) -> Finder {

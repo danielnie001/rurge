@@ -21,6 +21,8 @@ socket2.workspace = true
 ipconfig.workspace = true
 windows-registry.workspace = true
 windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
     "Win32_Security",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
@@ -34,9 +36,11 @@ nix = { workspace = true, features = ["signal"] }
 tempfile.workspace = true
 
 # The workspace lints, except `unsafe_code`: notifying WinINet that the proxy
-# settings changed (`sysproxy::windows`) and putting an external program in a
-# Job Object (`process`) are FFI calls. The lint stays `deny` here and only
-# those two functions opt out; every other crate keeps `forbid`.
+# settings changed (`sysproxy::windows`), putting an external program in a
+# Job Object (`process`), and reading the tables of sockets and the paths of
+# processes (`procinfo`) are FFI calls. The lint stays `deny` here and only
+# the functions on the list in `tests/unsafe_functions.rs` opt out; every
+# other crate keeps `forbid`.
 [lints.rust]
 unsafe_code = "deny"
 
