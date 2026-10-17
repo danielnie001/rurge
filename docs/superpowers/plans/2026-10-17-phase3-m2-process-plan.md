@@ -326,7 +326,7 @@
 
 ## 执行期修正记录
 
-第 1 ～ 16 行与第 25 行是主持这一轮的会话在执行中代项目所有者作的裁定（所有者可以改），每行写着改掉了计划或设计的什么，说得出代价的写了代价；第 17 ～ 23 行与第 26、27 行是实现者做的、与计划或设计的文字不同的地方；第 24 行是基准的数字。整分支终审在写下这张表时还没有做；它之后的行接在后面，段落里的行号随之改。
+第 1 ～ 16 行与第 25 行是主持这一轮的会话在执行中代项目所有者作的裁定（所有者可以改），每行写着改掉了计划或设计的什么，说得出代价的写了代价；第 17 ～ 23 行与第 26、27 行是实现者做的、与计划或设计的文字不同的地方；第 24 行是基准的数字；第 28 ～ 32 行是整分支终审与它之后的修正波，每行一件，其中第 28、29、31 行的做法是代项目所有者作的裁定（所有者可以改）。
 
 | # | 任务 | 修正 | 提交 |
 | - | ---- | ---- | ---- |
@@ -357,6 +357,11 @@
 | 25 | 7 | 端到端用例 `a_process_rule_matches_the_test_process` 对每个目标至多重发 3 次，只在那个目标的记录因 200 毫秒里没知道进程而没命中（`notes` 里有 `rurge_engine::owner::NOT_IN_TIME` 那一句）时重发，别的不符当场失败、带出整条记录：全量门禁下机器忙时一次查找可能超过 200 毫秒（任务 6 的一条用例在设了 `RUST_BACKTRACE` 时就因 panic 钩子的耗时红过）。代价：一个让查找处处变慢的回归，在快的机器上要到第四次才红（一次性的 WARN 与 `notes` 照样说出来） | `baa3ba1` |
 | 26 | 7 | 计划之外多一条单元用例 `the_owner_lookup_asks_as_it_was_asked_and_answers_with_the_pid`（`crates/rurge/src/cli/runtime.rs`），钉住引擎的问题到平台的问题、平台的回答到引擎的回答这两次翻译：M2 里引擎只发 TCP 的查询（P15），端到端的用例看不出 TCP 与 UDP 的对调 | `baa3ba1` |
 | 27 | 7 | `rurge_command()` 与 `rurge_process()` 设 `RURGE_PROCESS_BACKEND=off`，只有端到端用例在构造函数之后去掉它；`external` 策略拉起的嵌套 `rurge run` 拿不到以 `RURGE_` 开头的变量，它的会话照真的查（只读系统的表；它的 Profile 里没有 `PROCESS-NAME` 规则，没有谁等它；设计 8.1 就是这样）；`an_unknown_process_backend_is_refused` 连标准输出一起读：`listening on` 写在标准输出上，只读标准错误的检查什么也证明不了 | `baa3ba1` |
+| 28 | 5 | 整分支终审之后，macOS 的 `walk` 只把直接跟在 `XSO_INPCB` 项后面的 `XSO_SOCKET` 项配给它，其间别的种类的项让还开着的 pcb 项没有套接字项（`_ => open = None`）；计划任务 5 写的是"`XSO_SOCKET` 属于当前记录……其余种类跳过"，那样一个套接字项配给最近开始的 pcb 项，不管中间隔着什么。理由：某个版本若把套接字项挪到 pcb 项前面，每个 pcb 会配上下一条记录的套接字，每条记录看上去都完整，不报 `Layout`，也不 WARN，每个会话认成别的进程而没有任何东西说出来；XNU 的布局（pcb、套接字、两个缓冲项、统计，TCP 再加 tcpcb）下读出的行不变；sing-box 与 mihomo 也是在紧跟 pcb 项的固定位置读套接字项（只取事实）。代价：某个 macOS 版本若在两项之间放了别的项，每次查找都是"不知道"，`Layout` 的 WARN 说一次。用例：`a_socket_item_belongs_to_the_pcb_item_just_before_it`（原名 `a_socket_item_belongs_to_the_record_the_latest_pcb_item_began`）里"其间有别的项"一格不再给这条 pcb 项出行，`no_complete_record_among_the_items_is_a_layout_that_is_not_known` 加一格重排的布局（先套接字项、再 pcb 项、再缓冲项），`kinds_that_are_not_known_are_skipped` 把原来放在 pcb 项与套接字项之间的缓冲项挪到套接字项之后（XNU 就写在那里）；前两处在旧的 `walk` 上是红的（旧的把重排的布局读成 `Ok`、第一个 pcb 配上第二条记录的套接字），第三处只是跟着新读法挪了位置 | `d6cc8f6` |
+| 29 | 3 | 整分支终审之后，名单扫描器（`crates/rurge-platform/tests/unsafe_functions.rs`）的规则改成：每一行在 `//` 之前的部分提到 `unsafe_code` 的，去掉首尾空白后必须恰好是 `#[allow(unsafe_code)]`，那一行给紧跟它的 `fn` 记名，别的一律报错（带行号，调用方加文件名）。原来只看以 `#[` 开头又含 `unsafe_code` 的行，rustfmt 拆成多行的属性（`#[allow(` / `unsafe_code,` / `dead_code,` / `)]`）整个逃掉：那个函数不在名单上，用例也不红，CLAUDE.md 里"多一个、少一个都让它变红"的保证不成立。新增一条自测 `a_line_that_names_the_lint_and_is_not_the_attribute_is_refused`；原来"没有提到这个 lint"的一条把字符串里的提及当作无害，新规则下这样的行被拒，那一条改成只含注释里的提及；共六条自测。在真实的树上给一个私有函数临时写多行属性：旧扫描器绿，新扫描器红，文件还原后工作区里没有它。代价：`rurge-platform` 的 `src/` 里块注释或字符串提到 `unsafe_code` 是假红，要提就写在 `//` 注释里 | `d6cc8f6` |
+| 30 | 终审 | 整分支终审（只读代码与文档，什么也没运行）的结论是改了再合并：没有 Critical；三条 Important 都是 CLAUDE.md 里后来的会话会照着办的不实之辞——macOS 的两个 unsafe 函数与 Linux、macOS 的真读用例被说成"也只在 Windows 开发机上编译、运行过"（其实从没有编译过，只有 Windows 的真读用例与端到端用例在开发机上编译、运行过），Windows 读表的循环被说成"在每个宿主上编译、都测"（它和它的用例都在 `#[cfg(windows)]` 里），名单用例"多一个、少一个、标在 `fn` 之外的东西上都让它变红"的保证在扫描器漏掉被拆成多行的属性时不成立（扫描器同一波里改了，第 29 行）。三条与几处小项在合并之前改了：代码里是扫描器（第 29 行）、macOS 的 `walk`（第 28 行）、`an_ipv4_query_finds_the_mapped_row` 里两行换成两个 PID、macOS 的 `a_process_that_does_not_exist_is_not_described` 多问 `i32::MAX as u32`、`the_process_backend_off_looks_nothing_up` 多断言 `notes` 为空、三处注释（`parse_tcp6` 丢掉作用域号的理由、UDP 流水线里暂停时拒绝的那一句、两处不再数"第几个 unsafe"）；文档里是 CLAUDE.md 的三处与 API 参考、手工验收清单里同一句不实的话，兼容性清单的三行（macOS 的 `proc_pidpath` 没有观察过、逻辑规则里永不匹配的例子换成 `DEVICE-NAME`、`rurge run` 一行补 `RURGE_PROCESS_BACKEND`），阶段 1 的 API 参考里 `notes`、被拒会话的记录与新加的两个键，和 API 参考、手工验收清单里这一轮加的引号。终审说不必现在改的次要项仍在延后事项里（第 7 ～ 16 行），终审另加的接在后面（第 17 ～ 23 行）。分两个提交：代码是 `d6cc8f6`，文档与这张表是本提交 | `d6cc8f6`、本提交 |
+| 31 | 终审 | 两条次要项不改：阶段 1 验收文档（`docs/acceptance/phase1-acceptance.md`）里说守护进程的会话没有进程的几句，记的是读 `a4d665c` 时的样子，M1 对它那一行 `SUBNET` 也是这样处理的，兼容性清单与 CLAUDE.md 说的是现在的样子；兼容性清单开头的"第二个里程碑 M2……也已合并"在紧接着的快进合并之后即为真，措辞同 M1。代价：读阶段 1 审计文档的人可能把"会话里没有进程"当成今天的状态；在合并之前读到清单开头那句的人早一步看到"已合并" | — |
+| 32 | 终审 | 修正波的最后一个代码提交 `d6cc8f6` 上的全量运行：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 干净，`cargo test --workspace --no-fail-fast` 77 个结果行、3797 个通过、0 个失败、10 个忽略（比 `f6327f0` 上的 3796 个通过多的一个是扫描器的新自测），没有哪个测试二进制以 `STATUS_HEAP_CORRUPTION` 或 `STATUS_ACCESS_VIOLATION` 退出——一台 Windows 11 x86-64 的开发机上的一次运行，不是 CI。本轮改的 macOS 的 `a_process_that_does_not_exist_is_not_described` 只在 macOS 上编译，第一次 CI 运行时才第一次编译 | `d6cc8f6` |
 
 ## 延后事项
 
@@ -378,5 +383,12 @@
 | 14 | Linux 上一次谁也认不出的未命中要在协议锁下扫一遍 `/proc`，没有“刚扫过、没有”的缓存（第 4 行的查找代价的一部分） | 手工验收（与第 4 行一起） |
 | 15 | Linux 的读取：IPv6 的行进修剪集合没有用例；`RealFs::link` 只在 Linux 的用例里对真实的符号链接测过；`RealFs::list` 丢掉单个条目的错误而没有注释说是有意的；`parse_proc_net` 的签名并排三个布尔参数（计划写定的） | 下次动到时 |
 | 16 | 三个平台的真读辅助函数是三份相近的拷贝（计划写的“同任务 4”）；macOS 的偏移是裸数字而读的长度有名字 | 下次动到时 |
+| 17 | TCP 的查询只比较远端端口（设计 3.1 的 `Query.remote_port`）：本地端点相同、远端端口也相同、只有远端 IP 不同的两行都是候选，第一条有主人的行胜出。触发的情形：同一个本地 IP:端口同时连着另一台主机上与 rurge 监听端口同号的端口——Linux 会把一个本地端口同时用于不同的目的地，而 6152 是 Surge 的缺省端口。会话其实知道接受这条连接的本地地址（`crates/rurge-inbound/src/http.rs` 的 `ctx.local`，SOCKS5 同样），查询可以带上远端地址再比较 | M3（动到查询的时候一起改） |
+| 18 | Linux：数据行全都解析不出的表读作空表、不写日志（任务 4 的评审留下的），布局上的一次意外会让每次查找悄悄是"不知道"。改成 `Layout` 加一次 WARN，与 macOS 一致，并改 `procinfo/mod.rs` 里 `ReadError::Layout` 的注释 | 在 M3 让 UDP 也读 `/proc/net/udp*` 之前 |
+| 19 | macOS 记录的双栈读法（记录第 11 行）：来自 IPv6 地址、落在双栈套接字上的 UDP 查询可能对不上，UDP 的查询出现时再看一遍 | M3 |
+| 20 | 被拒与失败的会话的 INFO 行带规则的文字（自阶段 1 起）：命中 `PROCESS-NAME,x,REJECT` 的会话，INFO 行里写着这条规则，读日志的人由此推得出进程。要不要在 INFO 里隐去 `PROCESS-NAME` 规则的文字 | 项目所有者 |
+| 21 | 设计接受的低概率认错：客户端的端口在 `TCP_GRACE` 之内被别的进程重用；表读与路径读之间 PID 被重用；Linux 上一个套接字的 inode 交到别的进程手里 | 有用户报告再说 |
+| 22 | 写成另一个平台的路径形式的规则（Linux 或 macOS 上的 `C:\…`，Windows 上的 `/Applications/…`）永不匹配，而 `rurge check` 不再说什么（M2-D11、M2-D16：同一份 Profile 在各平台读法相同） | 有用户报告再说 |
+| 23 | 第 14 行的去向补一句：在真实的 Linux 机器上量一次扫描的代价（与第 4 行一起量） | M3 之前（手工验收） |
 
-第 6 ～ 16 行是任务评审与实现者留下的次要项。整分支终审在写下这张表时还没有做：它做掉的在各行里标明，加的行接在后面。
+第 6 ～ 16 行是任务评审与实现者留下的次要项，第 17 ～ 23 行是整分支终审另加的；终审要改的次要项已在合并之前改了，见执行期修正记录第 28 ～ 32 行。
