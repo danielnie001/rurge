@@ -1,6 +1,8 @@
 # rurge HTTP API（阶段 3）
 
-阶段 3 / M1（网络环境与子网，设计 `docs/superpowers/specs/2026-10-16-phase3-m1-network-subnet-design.md`，计划 `docs/superpowers/plans/2026-10-16-phase3-m1-network-subnet-plan.md`）**没有新增端点，也没有改任何响应的形状**。变的是三个已有端点的行为——`POST` / `GET /v1/policy_groups/select` 对 `subnet` 组、`GET` / `POST /v1/features/system_proxy` 在接管暂停时、`GET /v1/dns` 的 `upstreams` 随网络的 DNS 覆盖——，和一组日志行。没有任何端点给出本机当前所在的网络：SSID、BSSID 和网关说明使用者在哪里，只在 DEBUG 日志里出现；本机地址与 DNS 服务器的取值在任何级别的日志里都不出现（设计 M1-D16）。鉴权（`X-Key`）、错误体（`{"error":"<message>"}`）与无内容的成功响应（`{}`）沿用阶段 1 的约定，见 `docs/api/phase1.md`；本页只记录变了的部分。
+阶段 3 / M1（网络环境与子网，设计 `docs/superpowers/specs/2026-10-16-phase3-m1-network-subnet-design.md`，计划 `docs/superpowers/plans/2026-10-16-phase3-m1-network-subnet-plan.md`）**没有新增端点，也没有改任何响应的形状**。变的是三个已有端点的行为——`POST` / `GET /v1/policy_groups/select` 对 `subnet` 组、`GET` / `POST /v1/features/system_proxy` 在接管暂停时、`GET /v1/dns` 的 `upstreams` 随网络的 DNS 覆盖——，和一组日志行。没有任何端点给出本机当前所在的网络：SSID、BSSID 和网关说明使用者在哪里，只在 DEBUG 日志里出现；读网络的日志行（网络任务与平台层）不带本机网卡的地址，也不带系统 DNS 服务器的取值（设计 M1-D16）。这不等于这些地址在任何级别的日志里都没有——DNS 服务器的地址出现在解析器自己的行里，会话的日志行带来源地址——，见「网络任务的日志行」末尾（M1 收尾时写的“本机地址与 DNS 服务器的取值在任何级别的日志里都不出现”说得过了头，阶段 3 / M2 订正）。鉴权（`X-Key`）、错误体（`{"error":"<message>"}`）与无内容的成功响应（`{}`）沿用阶段 1 的约定，见 `docs/api/phase1.md`；本页只记录变了的部分。
+
+阶段 3 / M2（进程识别，设计 `docs/superpowers/specs/2026-10-17-phase3-m2-process-design.md`，计划 `docs/superpowers/plans/2026-10-17-phase3-m2-process-plan.md`）**没有新增端点**，两个已有端点 `GET /v1/requests/recent` 与 `GET /v1/requests/active` 的每条记录多了两个键 `pid` 与 `processPath`；规则等不到进程时，会话的 `notes` 里多一句说明。下面到「没有覆盖的」为止说的是 M1，M2 在最后一节「M2　进程识别」。
 
 ## 端点
 
@@ -116,6 +118,7 @@ SSID 与 BSSID 可能读不到（Windows 没有位置权限，据调研以 SYSTE
 
 - "想要的状态"由三处决定，最后一次生效：启动参数 `--system-proxy`、暂停开始前系统代理是不是开着、暂停期间每一次得到成功应答的 `POST`。
 - 启动时就在这样的网络上，`--system-proxy` 只记下想要的，不设系统代理，标准输出里也没有 `system proxy enabled:` 那一行；离开这个网络时才设。
+- **例外：启动时第一次读网络慢于 1 秒。**第一代按“不知道网络”建（见「网络变化」），`--system-proxy` 这时看不出这是一个 `suspend` 的网络：照常把系统代理指向 rurge，标准输出里有 `system proxy enabled:` 那一行。读完之后网络任务把读到的网络当作一次变化告知，它落在 `suspend=true` 的网络上，接管暂停——系统代理恢复成原来的设置，一行 INFO `takeover paused on this network`；所以这样的启动里系统代理翻转一次：先设上，读完再恢复，离开这个网络时再指向 rurge。代价：慢的首读期间系统代理指向了 rurge，而使用者其实在一个该让出接管的网络上。
 - 暂停只在内存里，不进 `state.json`。进入暂停时备份已经清掉，所以暂停期间 rurge 崩溃，下一次启动没有东西要恢复——系统代理早已是原来的样子。
 - 一次成功的重载之后会再问一遍"现在暂停吗"：重载可能加上或拿掉了 `suspend=true` 那一行。
 - 暂停结束时把系统代理的实际状态对到想要的状态，两个方向都对：想要开着而实际关着的，重新指向 rurge；想要关着而实际开着的（进入暂停时恢复失败才会有），恢复成使用者原来的设置。每个只试一次，失败只记一条 ERROR（比如那时没有可用的 http / socks5 监听器），不重试，直到下一次进出暂停或下一次 `POST`。
@@ -165,7 +168,11 @@ SSID 与 BSSID 可能读不到（Windows 没有位置权限，据调研以 SYSTE
 | DEBUG | `cannot read the network` | `panicked` | 平台的读取器 panic；这次读取当作没发生，不是"网络不知道" |
 | DEBUG | 平台层的几句（每个原因每个进程只说一次，只带程序名与错误种类，不带任何网络的名字）：`cannot ask this program about the network; what it would say is taken as unknown`（`program`、`reason`）；Windows、Linux、macOS 各一句"有无线网卡开着，但系统不给网络的名字"，结尾都是 `SSID and BSSID conditions will not match`（Windows 与 macOS 的写着"it wants the permission to see where the machine is"）；`cannot list the network interfaces`；`cannot open a routing socket; the network is looked at every 30 seconds`（macOS） | | 读不到时 |
 
-SSID、BSSID、网关、本机地址与 DNS 服务器的取值从不出现在 INFO 及以上的行里；DNS 覆盖的列表也不进日志。
+SSID、BSSID 与网关从不出现在 INFO 及以上的行里；上表（网络任务与平台层读网络）的行不带本机网卡的地址，也不带系统 DNS 服务器的取值，DNS 覆盖的列表也不进这些行。**但这些地址不是在任何级别的日志里都没有**（阶段 3 / M2 订正了 M1 写下的那句“本机地址与 DNS 服务器的取值在任何级别的日志里都不出现”）：
+
+- DNS 服务器的地址出现在解析器自己的行里。DEBUG 的 `send`、`answer`、`failed` 三种行（`rurge_dns::fanout`）带字段 `upstream`，是上游的名字，形如 `udp://<地址>:53`，系统的 DNS 服务器和 `[SSID Setting]` 覆盖的服务器用到时都在内；INFO 的 `IPv6 DNS server ignored because ipv6 is off`（`rurge_dns::resolver`）带字段 `server`，是 Profile 里（或所在网络的 `[SSID Setting]` 里）写的那个 IPv6 服务器。
+- 会话自己的日志行带来源地址 `src`：完成的会话是 DEBUG 行，被拒与失败的会话是 INFO 行；客户端经本机的局域网地址连进来时，那就是本机网卡的地址。阶段 3 / M2 起进程查找的 DEBUG 行（见「M2　进程识别」）也带 `src`。
+- 读网络读到的本机网卡的地址本身，任何级别的日志里都没有：`the network is not what it was` 只说 `addresses` 这一项不同。
 
 ## 只供测试的网络后端
 
@@ -178,3 +185,80 @@ SSID、BSSID、网关、本机地址与 DNS 服务器的取值从不出现在 IN
 - Linux 与 macOS 的读取（`/proc`、`/sys`、`nmcli`、`iw`、`route`、`networksetup`、`ipconfig getsummary`、`PF_ROUTE` 套接字）只在 Windows 开发机上对着假的机器测过，没有碰过真实的系统；手工验收清单 `docs/acceptance/phase3-manual.md` 一项也没有做过。
 - 「网络变化」里引擎处理的几件事在真实网络上的效果（`url-test` 一类的组重测、WireGuard 换载体之后恢复得多快）只在回环上验过。
 - 主网卡是默认路由所在的网卡，不分物理与虚拟：全隧道的 VPN 接管默认路由之后，`TYPE:` 与 `ROUTER:` 看的是 VPN 的网卡。
+
+## M2　进程识别
+
+### 请求记录的两个键
+
+`GET /v1/requests/recent` 与 `GET /v1/requests/active` 的每条记录多两个键，紧跟 `listenPort`：
+
+| 键 | 类型 | 内容 |
+| --- | --- | --- |
+| `pid` | 数字或 `null` | 发起这条会话的进程的进程号 |
+| `processPath` | 字符串或 `null` | 它的可执行文件的完整路径；Windows 上形如 `C:\Windows\System32\curl.exe`，在 JSON 里反斜杠要写成 `\\` |
+
+```json
+{"id":12,"listener":"http","transport":"tcp","src":"127.0.0.1:51234","listenPort":6152,"pid":4321,"processPath":"C:\\Windows\\System32\\curl.exe","dst":"example.com:80", …}
+```
+
+进程的名字不在记录里（路径的最后一段就是它），只在 DEBUG 日志里。键名同 Surge 的面板读的字段（这一事实取自第三方的面板，Surge 的手册没有写请求记录的形状）；记录的其余形状仍是 rurge 自己的，阶段 6 对齐（兼容性清单 10.4 节）。
+
+读记录时才去看进程：会话结束之后才查到的进程照样出现在记录里（被 `REJECT` 的会话往往在查找结束之前就结束了），活动会话的列表同样。
+
+### 什么时候是 `null`
+
+- 会话不是从本机来的：来源地址既不是回环、也不是本机网卡上的地址——局域网里把 rurge 当代理用的设备；虚拟机、WSL2、容器里的程序经网络连进来（它们在本机没有对应的套接字）。经本机的转发程序来的连接，查到的是转发程序，不是原来的客户端。
+- rurge 自己发起的会话（`listener` 为 `internal`：内部 DNS 会话、连通性测试），和 `tun`、`forward`（今天没有监听器产生它们；虚拟网卡上的会话随阶段 3 / M3）。
+- 查找还没有结束；结束之后再读同一条记录就有了。规则因此没按进程判的会话，`notes` 里有下面那一句。
+- 本机看不到发起的进程，或没有权限读它：不以 root 运行的 Linux 上别的用户的进程，Windows 上以普通用户运行时某些系统进程；客户端在查找之前就走了（短命的命令行工具，连接已关、进程已退出）也一样。
+- `RURGE_PROCESS_BACKEND=off`（测试钩子，见下）。
+
+只知道名字、不知道路径的进程（Linux 上 `/proc/<pid>/exe` 读不了、名字取自 `comm` 的；Windows 上的 `System`）：`pid` 有，`processPath` 是 `null`——名字写法的 `PROCESS-NAME` 照常命中，路径与前缀写法不命中。读不出进程的描述（打不开）就是“不知道”，没有“只有 PID”的结果：这时两个键都是 `null`。
+
+### 哪些会话查，什么时候查
+
+- 经 HTTP 与 SOCKS5 监听器进来、来源是回环或本机网卡地址的会话（`listener` 为 `http`、`socks5`）。会话开始时在后台查一次，**不论规则用不用得到进程**：请求记录总有进程可看，使用者才知道 `PROCESS-NAME` 该写什么（M2-D3；没有给使用者的开关）。明文 HTTP 的绝对 URI 转发是一个请求一个会话，每个请求各查一次；同一条客户端连接上 2 秒内的请求命中同一份快照，不重读。
+- SOCKS5 的 UDP 关联查它的控制连接（TCP）一次，关联里的每条流共用这一次的结果；关联开始 200 毫秒之后才开的流，规则不再等（见下）。
+- 来源显然不是本机的（见上）不查：不起任务、不占线程、不读表。“显然”指引擎手里的本机地址列表不超过 2 秒旧、来源不在其中；列表过期时引擎答不准，这一条会话照常起一次查找，由阻塞的那一半重取列表再判断——来源不在新列表里就不读表，结果是 `process lookup found no process`。
+- 查找一次占一个阻塞线程，同时至多两个（`owner::LOOKUPS`），排在后面的等。平台层每种协议留一份系统表的快照，一次读取服务所有在它开始之前开始的会话，一阵新连接共用一两次读取；同一种表的两次读取至少隔 20 毫秒。
+- 出站模式是直连、或是全局代理而全局策略有效时，不评估规则，也就不等进程；记录照样带进程。
+
+### 规则怎样等
+
+规则走到 `PROCESS-NAME`（顶层的、逻辑规则里的、集合里逐条求值的行）而这个会话的进程还没有查到时，等查找结束，**至多等到查找发起之后 200 毫秒**（`owner::PROCESS_WAIT`；UDP 流的期限从关联的查找发起时算）；一次评估至多等一次。规则用不到进程的会话从不等。
+
+等不到时这次评估按“不知道”判——`PROCESS-NAME` 不命中——，会话继续；查找照常做完，记录随后带上进程。这时：
+
+- 会话的 `notes` 里加一句 ``Process not known within 200 ms: PROCESS-NAME did not match``（记录里有进程、规则却没按它判的会话由这一句说明）；
+- DEBUG 日志里有同文的一行，带会话号；
+- 进程的一生里**第一次**有规则等不到进程时，WARN 一次（见下表）；之后同样的情形只在 DEBUG 与 `notes` 里。
+
+不设断路器，也不让规则在等的查找插队：代价有界（每条走到 `PROCESS-NAME` 的会话至多多等 200 毫秒），规则的结果不随此前的超时而变。组合的规矩同“要先解析 IP 的规则”：`AND` 遇到确定的不命中就不命中，`OR` 遇到命中就命中，定不下来时**要进程优先于要解析**（进程只在本机查、至多 200 毫秒，先拿到它可能让 DNS 查询变得不必要）；预匹配那一遍不等进程，`PROCESS-NAME` 本身不许带 `pre-matching`。
+
+### 日志
+
+日志文本是英文；DEBUG 的行要 `--log-level debug`。
+
+| 级别 | 文本 | 字段 | 什么时候 |
+| --- | --- | --- | --- |
+| DEBUG | `process lookup found the process` | `src`、`listen_port`、`elapsed_ms`、`pid`、`name`、`path` | 一次查找结束，找到了。`elapsed_ms` 从查找发起算起，含等阻塞线程的时间；UDP 关联的一次查找服务它的全部流，`src` 与 `listen_port` 是控制连接的。**不带会话号**：查找发起时会话号还没分配；同一会话自己的日志行也带 `src`，两行按地址对得上 |
+| DEBUG | `process lookup found no process` | `src`、`listen_port`、`elapsed_ms` | 查找结束，没找到（来源不在表里、进程已经退出、读不了） |
+| DEBUG | `Process not known within 200 ms: PROCESS-NAME did not match` | `session`（会话号） | 规则等不到进程、按“不知道”判的那一刻；同文的一句也在会话的 `notes` 里 |
+| WARN | `process lookup took longer than 200 ms; PROCESS-NAME rules decided without the process` | | 进程的一生里第一次有规则等不到进程时一次。不带会话、地址与进程 |
+| WARN | `process lookup: the tcp table could not be read: <原因>`（`udp` 同）；`process lookup: the tcp table has a layout this build does not know`（macOS 上表的布局认不得） | | 平台读系统的表失败：每一种在进程的一生里 WARN 一次，之后同样的失败只在 DEBUG 里。`<原因>` 是系统自己的话，不带地址、进程与路径。这次查询的结果是“不知道”，会话照常 |
+| DEBUG | `process lookup: cannot list the network interfaces` | `reason` | 取本机网卡的地址列表失败，当作没有地址：只有回环上的来源查得到 |
+
+**进程的名字、路径与 PID 只出现在 DEBUG 的查找行、请求记录与 API 里，不出现在 INFO 及以上的行里**（Windows 的路径常带用户名）。被拒与失败的会话的 INFO 行照旧带来源、目标、规则文字（`rule=`）和策略；规则文字是使用者自己写的规则，里面若写了进程名或路径，那是使用者写的，不是查到的。不知道进程从不让会话失败，也不进会话的 `error`。
+
+### 只供测试的 `RURGE_PROCESS_BACKEND`
+
+`RURGE_PROCESS_BACKEND=off` 让 `rurge run` 不去查会话来自的进程：记录里没有进程（`pid` 与 `processPath` 都是 `null`），`PROCESS-NAME` 一律按不知道判，不起查找任务、不读系统的表。没设时查本机。这是**测试钩子，不是给用户用的**，也不是“关掉查找”的开关（查找总开着，M2-D3）：取值只能恰好是 `off`（`OFF` 不行），别的取值直接报错——``error: unknown RURGE_PROCESS_BACKEND value `<取值>` (expected off)``，以 2 退出，退出之前先恢复上一次崩溃留下的系统代理，在绑定任何端口之前——，不会静默退回真实的查找（同 `RURGE_NETWORK_BACKEND`）。它不是命令行选项，不在 `--help` 里；`rurge check`、`rule match`、`dns lookup` 不读它（它们不查进程）；`external` 策略拉起的程序拿不到名字以 `RURGE_` 开头的变量，嵌套的 `rurge run` 照常查本机。
+
+### 没有覆盖的
+
+- Linux 与 macOS 的真实读取（`/proc/net/*` 与 `/proc/<pid>/fd` 的内容和权限、`pcblist_n` 的真实布局、`proc_pidpath`）只对着夹具测过；两个只在 macOS 上编译的 unsafe 函数、三个平台各一条的真读用例 `this_process_owns_its_loopback_sockets` 和端到端用例 `a_process_rule_matches_the_test_process`，只在一台 Windows 11 x86-64 的开发机上跑过。第一次 CI 运行时核对；手工验收清单 `docs/acceptance/phase3-manual.md` 的 M2 一节一项也没有做过。
+- macOS 取 `so_last_pid`（最后用这个套接字的进程），不取 `so_e_pid`（委托时的“实际”进程）：经 `nsurlsessiond` 等系统服务代建的连接，记录里是哪一个，没有看过。
+- 经虚拟网卡来的会话（阶段 3 / M3）；`$request.processPath`（脚本，阶段 5，读同一个进程槽）；外部程序的进程树判断（M4，防环用）。离线的 `rurge rule match` 不查真实的进程（没有连接；`--process` 照旧由命令行给）。
+- 查找的代价只在 Windows 上量过一次（debug 构建，开着 500 条回环连接时一次新的查找 3.39 毫秒）；Linux 的 `fd` 扫描在进程很多的机器上、几百条并发连接时是否在 200 毫秒里结束，没有量过。
+- 一个永不返回的平台查找会占住两个许可，此后每条会话排一个小任务、不设上限，`rurge run` 退出时 tokio 不设时限地等阻塞线程；三个平台的读取都是有界的系统调用，不知道哪一个会挂住。
+- Surge 的实际行为没有观察过：`PROCESS-NAME` 在 Windows 上不分大小写、不去掉 `.exe`、盘符与 `\\` 开头的值读作路径，都是 rurge 的读法（兼容性清单 3.1 节）。
