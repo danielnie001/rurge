@@ -923,7 +923,10 @@ mod tests {
             .await
             .expect("stalled")
             .unwrap();
-        writer.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), writer)
+            .await
+            .expect("the writer finishes within the bound")
+            .unwrap();
         assert!(back == data, "the echo differs");
     }
 

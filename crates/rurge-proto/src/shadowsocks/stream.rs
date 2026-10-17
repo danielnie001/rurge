@@ -1220,7 +1220,10 @@ mod tests {
         if all_at_once {
             // everything is there before the first read: the IV glued to
             // what follows it
-            sender.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(30), sender)
+                .await
+                .expect("the writer finishes within the bound")
+                .unwrap();
         }
         let mut stream = stream(method, near);
         let mut got = Vec::new();

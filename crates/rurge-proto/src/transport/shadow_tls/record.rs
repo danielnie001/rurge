@@ -98,6 +98,7 @@ impl RecordReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
@@ -129,7 +130,10 @@ mod tests {
                 );
                 reader.consume();
             }
-            writer.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(30), writer)
+                .await
+                .expect("the writer finishes within the bound")
+                .unwrap();
             assert_eq!(
                 seen,
                 [(HANDSHAKE, 300), (APPLICATION_DATA, 0), (ALERT, 2)],

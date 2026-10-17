@@ -330,7 +330,12 @@ mod tests {
                     got += n;
                 }
                 assert_eq!(back, payload, "{len} / {write_chunk} / {read_chunk}");
-                let mut stream = rd.unsplit(writer.await.unwrap());
+                let mut stream = rd.unsplit(
+                    tokio::time::timeout(std::time::Duration::from_secs(30), writer)
+                        .await
+                        .expect("the writer finishes within the bound")
+                        .unwrap(),
+                );
                 stream.shutdown().await.unwrap();
                 let mut rest = Vec::new();
                 stream.read_to_end(&mut rest).await.unwrap();

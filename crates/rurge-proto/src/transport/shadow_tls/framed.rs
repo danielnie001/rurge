@@ -252,6 +252,7 @@ impl AsyncWrite for Framed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     const PASSWORD: &[u8] = b"pw";
@@ -439,7 +440,10 @@ mod tests {
         });
         let mut got = Vec::new();
         stream.read_to_end(&mut got).await.unwrap();
-        writer.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), writer)
+            .await
+            .expect("the writer finishes within the bound")
+            .unwrap();
         assert_eq!(got.len(), 3 + long.len());
         assert_eq!(&got[..3], b"abc");
     }
@@ -461,7 +465,10 @@ mod tests {
         });
         let mut wire = Vec::new();
         far.read_to_end(&mut wire).await.unwrap();
-        writer.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), writer)
+            .await
+            .expect("the writer finishes within the bound")
+            .unwrap();
         // what a server does with it: every tag verifies, in order
         let mut c = chain(b"C");
         let (mut at, mut got) = (0, Vec::new());

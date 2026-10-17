@@ -475,7 +475,10 @@ mod tests {
             .expect("everything came back")
             .unwrap();
         assert!(back == data, "the bytes came back in order");
-        let mut write = writer.await.unwrap();
+        let mut write = tokio::time::timeout(Duration::from_secs(30), writer)
+            .await
+            .expect("the writer finishes within the bound")
+            .unwrap();
         write.shutdown().await.unwrap();
         let mut rest = Vec::new();
         tokio::time::timeout(Duration::from_secs(5), read.read_to_end(&mut rest))

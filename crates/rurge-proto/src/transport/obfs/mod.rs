@@ -655,7 +655,12 @@ mod tests {
                     got.extend_from_slice(&buf[..n]);
                 }
                 assert!(got == expected, "{mode:?} {capacity} {chunk}");
-                drop(writer.await.unwrap());
+                drop(
+                    tokio::time::timeout(Duration::from_secs(30), writer)
+                        .await
+                        .expect("the writer finishes within the bound")
+                        .unwrap(),
+                );
             }
         }
     }
@@ -742,7 +747,10 @@ mod tests {
                 });
                 let mut back = Vec::new();
                 rd.read_to_end(&mut back).await.unwrap();
-                writer.await.unwrap();
+                tokio::time::timeout(Duration::from_secs(30), writer)
+                    .await
+                    .expect("the writer finishes within the bound")
+                    .unwrap();
                 assert!(back == payload, "{mode:?}: the echo differs");
                 let hello = fake.await.unwrap();
                 let first = match mode {

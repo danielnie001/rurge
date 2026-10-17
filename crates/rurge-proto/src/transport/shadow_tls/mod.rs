@@ -527,7 +527,10 @@ mod tests {
         let mut back = vec![0u8; len];
         r.read_exact(&mut back).await.unwrap();
         assert!(back == data, "the echo differs");
-        let mut w = writer.await.unwrap();
+        let mut w = tokio::time::timeout(Duration::from_secs(30), writer)
+            .await
+            .expect("the writer finishes within the bound")
+            .unwrap();
         w.shutdown().await.unwrap();
         let mut rest = Vec::new();
         r.read_to_end(&mut rest).await.unwrap();

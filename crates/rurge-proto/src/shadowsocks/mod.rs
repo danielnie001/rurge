@@ -470,7 +470,10 @@ mod tests {
             .expect("the echo arrives within the bound")
             .unwrap();
         assert!(back == data, "the echo differs");
-        writer.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), writer)
+            .await
+            .expect("the writer finishes within the bound")
+            .unwrap();
         // the fake refuses anything longer
         assert_eq!(fake.largest_chunk(), aead::MAX_PAYLOAD, "full chunks");
     }
@@ -938,7 +941,10 @@ mod tests {
             .expect("the echo arrives within the bound")
             .unwrap();
         assert!(back == data, "the echo differs");
-        writer.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), writer)
+            .await
+            .expect("the writer finishes within the bound")
+            .unwrap();
         let seen = fake.requests();
         assert_eq!(
             (seen[0].atyp, seen[0].host.as_str(), seen[0].port),
