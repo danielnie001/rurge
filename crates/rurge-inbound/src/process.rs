@@ -111,9 +111,12 @@ impl ProcessSlot {
 /// program often has the user's name in it.
 impl fmt::Debug for ProcessSlot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // read once: a settle between two reads would show a PID beside
+        // "not settled"
+        let held = self.0.value.get();
         f.debug_struct("ProcessSlot")
-            .field("settled", &self.0.value.get().is_some())
-            .field("pid", &self.found().and_then(|p| p.pid))
+            .field("settled", &held.is_some())
+            .field("pid", &held.and_then(Option::as_ref).and_then(|p| p.pid))
             .finish()
     }
 }

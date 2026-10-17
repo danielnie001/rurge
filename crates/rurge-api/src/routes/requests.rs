@@ -80,6 +80,9 @@ impl From<&RequestRecord> for RequestJson {
             RecordStatus::Rejected(kind) => ("rejected", Some(kind.clone())),
             RecordStatus::Failed => ("failed", None),
         };
+        // read once: the lookup may settle the slot at any moment, and a
+        // second read could show the path of a process whose PID is `null`
+        let process = r.process.found();
         RequestJson {
             id: r.id,
             listener: listener_name(r.listener),
@@ -91,8 +94,8 @@ impl From<&RequestRecord> for RequestJson {
             // `0` is no port: a session rurge started itself came in on no
             // listener
             listen_port: (r.listen_port != 0).then_some(r.listen_port),
-            pid: r.process.found().and_then(|p| p.pid),
-            process_path: r.process.found().and_then(|p| p.path.clone()),
+            pid: process.and_then(|p| p.pid),
+            process_path: process.and_then(|p| p.path.clone()),
             dst: r.dst.clone(),
             remote_addr: r.remote_addr.map(|a| a.to_string()),
             rule: r.rule.clone(),

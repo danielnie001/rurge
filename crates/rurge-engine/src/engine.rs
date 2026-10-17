@@ -1330,8 +1330,11 @@ impl Engine {
         registry: Arc<PolicyRegistry>,
         handle: Arc<SessionHandle>,
     ) -> Result<Dialed, DialError> {
-        // Refused before anything is asked of the rules, a lookup or a `smart`
-        // group: each would count a session that goes nowhere.
+        // Refused before anything is asked of the rules, a name lookup or a
+        // `smart` group: each would count a session that goes nowhere. The
+        // lookup of the session's process, which `dial` started with the
+        // session, is left to finish: the record of a refused session still
+        // names its process.
         if self.is_suspended() {
             return fail(handle, FailKind::Other, REFUSED_STRICT);
         }

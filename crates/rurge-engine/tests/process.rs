@@ -16,7 +16,8 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 
-const APP_PID: u32 = 4321;
+/// Above 65535, so that no port number a log line carries can contain it.
+const APP_PID: u32 = 4_000_321;
 const APP_PATH: &str = "C:\\Apps\\app.exe";
 
 /// The process every lookup that finds one finds.
@@ -189,7 +190,12 @@ impl OwnerLookup for Fake {
         // lookup that takes its time does to one
         std::thread::sleep(self.delay);
         if self.panics {
-            panic!("the platform's lookup failed");
+            // Unwinds as a panic does — the place is dropped on the way, and
+            // tokio reports the blocking task as panicked — but without the
+            // panic hook: with `RUST_BACKTRACE` set the hook captures and
+            // symbolises a backtrace here, which alone takes longer than the
+            // 200 ms the rules wait.
+            std::panic::resume_unwind(Box::new("the platform's lookup failed"));
         }
         self.process.lock().unwrap().clone()
     }
@@ -691,7 +697,10 @@ async fn a_lookup_that_fails_finds_no_process_and_gives_its_place_back() {
 async fn a_finished_lookup_is_logged_at_debug_and_nowhere_higher() {
     let log = LogCapture::start();
     let fake = Arc::new(Fake::finding(app()));
-    let h = engine("PROCESS-NAME,app.exe,REJECT", &fake).await;
+    // The rule's pattern is not the program's whole name: a line above DEBUG
+    // may say which rule decided a session, and must not give the name away
+    // that way.
+    let h = engine("PROCESS-NAME,app*,REJECT", &fake).await;
     let echo = echo_server().await;
     refused_by_http(&h, echo).await;
     let said = |what: &str| {
@@ -713,7 +722,11 @@ async fn a_finished_lookup_is_logged_at_debug_and_nowhere_higher() {
         found[0]
     );
     assert!(found[0].contains(" elapsed_ms="), "{}", found[0]);
-    assert!(found[0].contains(" pid=4321"), "{}", found[0]);
+    assert!(
+        found[0].contains(&format!(" pid={APP_PID}")),
+        "{}",
+        found[0]
+    );
     assert!(found[0].contains("app.exe"), "{}", found[0]);
     assert!(found[0].contains("Apps"), "{}", found[0]);
     // a lookup that finds none says so
@@ -736,7 +749,10 @@ async fn a_finished_lookup_is_logged_at_debug_and_nowhere_higher() {
         !above.is_empty(),
         "the refused session's INFO line is there"
     );
-    for line in above {
-        assert!(!line.contains("4321") && !line.contains("Apps"), "{line}");
+    // the PID, the name and the path
+    for private in [APP_PID.to_string().as_str(), "app.exe", "Apps"] {
+        for line in &above {
+            assert!(!line.contains(private), "{private} is in: {line}");
+        }
     }
 }
