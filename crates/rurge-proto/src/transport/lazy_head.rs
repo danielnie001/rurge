@@ -58,20 +58,29 @@ impl Both {
 
     /// `half` waits: `waker` is the one to wake it.
     fn park(&self, half: Half, waker: &Waker) {
-        match &mut self.slots()[half as usize] {
-            Some(parked) if parked.will_wake(waker) => {}
-            slot => *slot = Some(waker.clone()),
-        }
+        let replaced = {
+            let mut slots = self.slots();
+            let slot = &mut slots[half as usize];
+            if slot.as_ref().is_some_and(|parked| parked.will_wake(waker)) {
+                return;
+            }
+            slot.replace(waker.clone())
+        };
+        // not under the lock: dropping a waker may run anything
+        drop(replaced);
     }
 
     /// `half` is done waiting, with the head or the flush it was driving
     /// finished or failed: the other half may wait for just that.
     fn release(&self, half: Half) {
-        let other = {
+        let (own, other) = {
             let mut slots = self.slots();
-            slots[half as usize] = None;
-            slots[half.other() as usize].take()
+            (
+                slots[half as usize].take(),
+                slots[half.other() as usize].take(),
+            )
         };
+        drop(own);
         if let Some(other) = other {
             other.wake();
         }
@@ -142,6 +151,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> LazyHead<S> {
         }
     }
 
+    /// The stream below; write-side polls made through it bypass the shared
+    /// waker while the head is unsent or a flush is owed, so a caller polls
+    /// the write side itself only after `poll_flush` returned `Ready`, as
+    /// Snell's `poll_end` does.
     pub fn get_mut(&mut self) -> &mut S {
         &mut self.inner
     }
