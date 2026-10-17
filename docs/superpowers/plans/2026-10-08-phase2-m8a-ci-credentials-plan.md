@@ -32,6 +32,13 @@ RUSTFMT="…/stable-x86_64-pc-windows-gnu/bin/rustfmt.exe" cargo fmt --all --che
 | P8 | `https://` 上的全角 `＠` | 拒绝并说明：URL 的解析器不认它作分隔符，用户名口令会被读成主机的一部分 |
 | P9 | 环境变量的读法 | clap 的 `BoolishValueParser`，不用 `FalseyValueParser`：后者把一切非否定词当成真，写错的值会悄悄打开开关 |
 | P10 | 资源的 URL 在 `Debug` 里 | 只显示到主机与端口（`https://host:port/…`）；文件来源照旧显示路径 |
+| P11 | `LazyHead` 修在哪里（P11 ～ P17 是 2026-10-18 展开任务 6 时定的） | 修在类型里：两半交给两个任务轮询是 `tokio::io::split` 本来允许的用法；今天只有用例这样用、生产的转发循环在一个任务里轮询两半，但类型不该靠这一点才对。用例另外限时等写完（P15） |
+| P12 | masque-server 的 1 MiB | 节制用例的上行（至多领先回读 512 KiB），不缩短 9 MiB + 777 字节的传送：这个长度是为了越过 rurge 每条流 8 MiB 的接收窗口。参照服务端的这个限制登记进兼容性清单（设计 3.2：修不了的登记，不让它留着红） |
+| P13 | macOS 上 rurge 自己的 SOCKS5 UDP 中继 socket（缺省的发送缓冲，发给客户端的数据报大于 9216 字节时以 `EMSGSIZE` 失败、只丢那一个） | 这一轮不改，记进延后事项：没有哪条失败的用例由它而来；改法是知道的（JDK-8239355：把发送缓冲调到至少 65 507 / 65 527 字节），改了也只有 macOS 的 CI 验证得了 |
+| P14 | `MockDns` 在 Windows CI 上找不到端口 | 原因没有证据：两种绑定次序轮流试、轮数从 16 加到 64、找不到时说出两种绑定各自最后的错误；不换到 20000–29999 的号段（测试约定把它留给"要先于主人写进配置的端口"） |
+| P15 | 在别的任务里写、在用例的任务里等它写完的地方 | 18 处都限时 30 秒，第 1 类那样的挂住从此是一条失败的用例，而不是测试一步的 60 分钟超时；两条吞吐基准（忽略项，不进 CI）与假服务端里的一处不改 |
+| P16 | 第 5 类之外、预料中的同一种失败 | `rurge_proto::testing::udp_echo_server` 与 `FakeSnell` 的 UDP 会话在 macOS 上要发 16 374 字节的数据报，这次没有跑到（所在的二进制停住了），一并调高发送缓冲，不等下一次运行；`rurge-proto` 因此多一条到 `socket2` 的依赖边（锁文件仍是 517 个包） |
+| P17 | 文档里"第一次 CI 运行时核对""互操作用例还没有对真实的二进制跑过"的说法 | 兼容性清单、两份 README、需求文档与验收文档逐处按这次运行改写；CLAUDE.md 的历史段落不逐处改，在状态一段里写一句以这次运行为准（跑到的范围写清）；各份计划「延后事项」里去向是"第一次 CI 运行"的行，等三个平台的全部测试二进制都跑完的那一次运行之后逐行写结论 |
 
 ## 承接事项
 
@@ -127,9 +134,71 @@ RUSTFMT="…/stable-x86_64-pc-windows-gnu/bin/rustfmt.exe" cargo fmt --all --che
 
 ## 任务 6：CI 首跑的修正
 
-待展开。带着任务 1 的提交推送之后，从注解里读出三个平台各自失败的用例，逐条：定因 → 本机能复现的先补失败用例 → 修 → 记进下面的「执行期修正记录」。设计 3.2 列出的"首次推送后看 CI"的事项一并核对。
+写计划时：带着任务 1 的提交推送之后，从注解里读出三个平台各自失败的用例，逐条：定因 → 本机能复现的先补失败用例 → 修 → 记进下面的「执行期修正记录」。设计 3.2 列出的"首次推送后看 CI"的事项一并核对。
 
 第一次推送（`b41930a`，2026-10-14，运行号 38536637023）：fmt、clippy 与全部参照服务端的安装步骤三平台都通过；`cargo test` 一步 Linux 以 101 退出（测试跑完了，有失败），macOS 与 Windows 用满了 60 分钟。注解没有说出失败的是哪些用例（记录第 5 行）；修正之后要再推送一次，失败清单才读得到。
+
+第二次推送（`7bd6589`，2026-10-17，项目所有者推送的，运行号 39022550224；带着记录第 5、6 行的修正）：`bench` 通过；`check` 三个平台都在 `cargo test` 一步失败。Linux 6 分半跑完了全部测试二进制，以 101 退出；macOS 与 Windows 又用满了 60 分钟，都停在 `rurge-proto` 的单元测试二进制里（各有三条用例没有结束）。测试二进制按包名的次序一个接一个地跑，所以排在它后面的 `rurge-proto` 的集成测试、`rurge-proto-quic`、`rurge-proto-ssh`、`rurge-proto-wireguard` 与 `rurge-rules` 在这两个平台上一个也没有跑；`rurge-proto` 单元测试里别的用例在这两个平台上的结果也不知道（失败用例的输出要到二进制结束时才打印）。失败摘要这一次认出了全部失败：Linux 5 条，macOS 6 条加一个没跑完的二进制，Windows 7 条加一个没跑完的二进制，都在每一步 10 条的上限之内。按根因分六类（读代码、参照服务端的源码与注解得出；本机能复现的只有第 1 类）：
+
+| 类 | 平台 | 失败的用例 | 根因 | 子任务 |
+| -- | ---- | ---------- | ---- | ------ |
+| 1 | macOS、Windows | `shadowsocks::tests::{a_large_payload_crosses_many_chunks_both_ways, ss_2022_sends_names_and_crosses_chunks_of_0xffff}`、`snell::tests::{a_large_payload_crosses_many_chunks_both_ways_on_v1_to_v3, a_large_payload_crosses_many_records_both_ways}`（没有结束；每个平台三条） | `LazyHead` 丢了写端的唤醒。用例把流 `tokio::io::split` 成两半、在另一个任务里 `write_all` 1 MiB：第一次写把整段载荷并进请求头，读端与写端都去推它；底层的流对写方向只记一个唤醒者（后来者顶掉先来者），读端推完头之后只唤醒它自己记下的读端，写端那次 `poll_write` 欠着的 `Ready(n)` 再没有人来取，而用例等写端的 `writer.await` 没有时限。一个手动轮询、计数唤醒的探针在本机复现了它：写端被唤醒 0 次。同源的第二处：读端推完头之后的那次 `poll_flush` 是 `Pending` 时，下一次读不再补它（`head` 已经是 `None`）。生产的转发循环在同一个任务里轮询两半，碰不到 | 6a |
+| 2 | 三个平台 | `shadowsocks::{ss_against_sing_box_aead_2022_and_a_user, ss_2022_against_ssserver_with_one_key_and_as_a_user}` | `udp_roundtrip` 用 64 字节的缓冲收回包。`ss` 的载体把整个包收进调用方的缓冲再就地解开（`PacketSocket::recv_from` 的约定是给 64 KiB），2022 方法的回包是 65 字节（16 字节的分离头，1 + 8 + 8 + 2 字节的头，7 字节的地址，7 字节的载荷，16 字节的标签）：Linux 与 macOS 上被截断、解不开而丢掉（`Elapsed`），Windows 上接收直接失败（`WSAEMSGSIZE`，10040）。AEAD 方法的回包不到 64 字节 | 6b |
+| 3 | Linux | `snell::{udp_against_snell_server, obfs_http_against_snell_server}` | snell-server 的双栈 socket 把 IPv4 的来源写成 `::ffff:127.0.0.1`，Snell 出站照原样报回——这是设计：出站照原样报，比较的一方经 `HostName::canonical` 归一，引擎的 UDP 流水线就是这样比的——，而 `udp_roundtrip` 比较时没有归一 | 6b |
+| 4 | Linux | `masque::tcp_against_masque_server` | masque-server v0.13.0（MIT）每条 TCP 隧道里，客户端发来、还没写给目标的字节至多排 `MAX_BUFFERED_CLIENT_BYTES`（1 MiB），它不对 QUIC 施加背压，超出就以 H3_CONNECT_ERROR 重置那条流。`transfer` 两个方向同时各送 9 MiB + 777 字节，上行只受 QUIC 流量窗口的约束（masque-server 给每条流 4 ～ 16 MiB），目标那一侧一慢，排着的字节就过了 1 MiB。参照服务端的限制，不是 rurge 的缺陷 | 6b |
+| 5 | macOS | `udp::{an_answer_too_long_for_the_client_is_dropped_alone, what_waits_for_an_outbound_is_bounded_in_bytes, a_refused_flow_holds_no_room}`、`udp_tls_family::a_datagram_too_long_for_vmess_is_dropped_alone` | 设计 3.2 要核对的"macOS 回环 UDP 数据报 9216 字节的上限"：macOS 上 UDP socket 的缺省发送缓冲是 9216 字节（`net.inet.udp.maxdgram`），一次 `send_to` 不能超过发送缓冲，大于它的数据报以 `EMSGSIZE`（40）失败。四条都失败在用例**自己**的 socket 上（发 20 000 ～ 65 500 字节的那一次） | 6b |
+| 6 | Windows | `rurge-api` 的五条：`a_late_body_does_not_cost_a_stop_its_answer`、`a_group_is_tested_on_request`、`a_body_larger_than_what_is_read_away_does_not_hold_its_sender_up`、`a_late_body_does_not_cost_a_dns_flush_its_answer`、`a_late_body_does_not_cost_a_banned_source_its_403` | `MockDns::start` 先在 TCP 上 `bind` 0 号端口、再在同一个号上 `bind` UDP，16 次都失败（`could not find a port free for both TCP and UDP`）。为什么失败没有证据——失败的那几次的错误没有记下来；最可能的是 Windows 为 UDP 保留的成段端口（Hyper-V / WinNAT 的端口排除范围），而 TCP 的临时端口是一个挨一个地分配的，没有核对 | 6b |
+
+设计 3.2 的事项在这次运行里的结论（只看跑到了的测试二进制；"通过"说的是这一次运行）：`rurge-platform` 的 Unix 分支在 Linux 与 macOS 上通过；`ExternalOutbound` 真实拉起程序的用例（`rurge-external-tests`）三个平台都通过，它在 `rurge-proto` 里的单元用例只在 Linux 上跑完；`sshd`（Linux、macOS）与各参照服务端的夹具都拉起来了，互操作用例除了第 2 ～ 4 类的五条，在装了参照的平台上都通过——这是第一次读得到互操作用例对真实二进制的结果；Linux 上 UDP 缓冲封顶在 `rmem_max`：用到大缓冲的 `rurge-proto-wireguard` 与 `rurge-proto-quic` 在 Linux 上通过；macOS 回环 UDP 9216 字节的上限：见第 5 类；sing-box 的 anytls 与 Shadow TLS 互操作用例三个平台都通过；Snell `reuse=false` 的半关闭：Snell 的 TCP 互操作用例都通过。
+
+### 6a：`LazyHead` 的唤醒；限时等写完
+
+**文件**：`crates/rurge-proto/src/transport/lazy_head.rs`；下面"限时等写完"列出的 18 处所在的文件。
+
+**先写的用例**（`lazy_head::tests`；手动轮询；计数唤醒的 `Count`，实现 `std::task::Wake`；内层流 `OneSlot` 像 socket 一样对写方向只留一个唤醒者：写与 flush 各有一道闸，闸关着时记下（顶掉）调用者的唤醒者并返回 `Pending`，开着时收下全部字节、或给 flush 计一次数；读永远是 `Pending`；`grace` 取 30 秒，不起作用；前两条用例的 flush 闸一直开着）：
+
+- `a_writer_parked_on_the_head_is_woken_when_a_read_finishes_it`：写端 `poll_write(b"payload")` 是 `Pending`；读端 `poll_read` 是 `Pending`；开写闸，取出 `OneSlot` 记下的唤醒者并唤醒；读端再 `poll_read` 仍是 `Pending`，`OneSlot` 收到 `HEAD|payload`；写端被唤醒过（计数 ≥ 1）。
+- `a_writer_is_woken_though_the_reader_that_parked_last_never_polls_again`：前两步同上；开写闸、唤醒记下的唤醒者，此后不再轮询读端；写端被唤醒过，它再 `poll_write(b"payload")` 得 `Ready(Ok(7))`，`OneSlot` 收到 `HEAD|payload`。
+- `a_reader_whose_flush_is_pending_is_woken_though_a_write_parks_after_it`：两道闸都关；写端 `poll_write(b"payload")`、读端 `poll_read` 都是 `Pending`；只开写闸，唤醒记下的唤醒者；读端 `poll_read` 推完头、停在 flush 上（`Pending`），记下读端此时的唤醒计数；写端 `poll_write(b"payload")` 得 `Ready(Ok(7))`；关上写闸，写端 `poll_write(b"more")` 是 `Pending`；两道闸都开，唤醒记下的唤醒者；读端的唤醒计数比记下的多；读端再 `poll_read` 是 `Pending`，flush 计数 ≥ 1；写端 `poll_write(b"more")` 得 `Ready(Ok(4))`；`OneSlot` 收到 `HEAD|payloadmore`。
+
+**看到的红**：三条在今天的代码上都失败（第一条：写端被唤醒 0 次；第三条：读端没有再被唤醒，flush 计数是 0）。
+
+**做法**：
+
+- 新的两格唤醒者 `Both`（`Mutex<[Option<Waker>; 2]>`，下标是 `Half::Read` / `Half::Write`），实现 `std::task::Wake`：被唤醒时取出两格、放开锁之后逐个唤醒。`park(half, waker)` 把自己这一格换成 `waker`（那一格已有的唤醒者 `will_wake` 它时不换）；`release(half)` 清掉自己这一格，取出另一格并唤醒。锁中毒时照用（`PoisonError::into_inner`）。
+- `LazyHead` 加 `both: Arc<Both>`、由它做成的 `woken: Waker` 与 `owed_flush: bool`，去掉 `reader`。
+- 头还没出去（`head.is_some()`）或读端欠着 flush（`owed_flush`）时，对内层写方向的每一次轮询——`poll_head` 里的写、读端欠的 flush、写端的 `poll_write` / `poll_flush` / `poll_shutdown`——先 `park` 自己这一半，再以 `woken` 为唤醒者去轮询内层：内层只记得住一个唤醒者，它记下的总是能叫醒两半的那一个。别的时候照旧用调用者自己的 `cx`。
+- 头写完（`written == head.len()`）或以错误结束时，`release` 推它的那一半；读端停在宽限的定时器上时 `park(Read)`（取代今天的 `self.reader`）。
+- 读端推完头时置 `owed_flush`；flush 完成后清掉它、`release(Read)`，之后才读内层；下一次 `poll_read` 先补欠着的 flush。
+- 写端的直通（今天的 `head.is_none() && self.coalesced == 0`）另要求 `!owed_flush`。
+- `HEAD_GRACE`、并进头的载荷与各个方法返回的字节数都不变；原有的 6 条用例照旧通过。
+
+**限时等写完**（第 1 类那样挂住的写端从此是一条失败的用例，不再吃掉测试一步的 60 分钟）：下面 18 处在别的任务里写、在用例的任务里等它写完的 `writer.await` / `sender.await` 改成 `tokio::time::timeout(Duration::from_secs(30), writer).await.expect("the writer finishes within the bound")`，原来对 `JoinHandle` 结果的 `.unwrap()` 留着——`crates/rurge-proto/src/` 下的 `h2connect/mod.rs:429`、`h2pool/mod.rs:926`、`shadowsocks/mod.rs:473` 与 `:941`、`shadowsocks/stream.rs:1223`、`snell/mod.rs:562` 与 `:1339`、`transport/obfs/mod.rs:658` 与 `:745`、`transport/shadow_tls/framed.rs:442` 与 `:464`、`transport/shadow_tls/mod.rs:530`、`transport/shadow_tls/record.rs:132`、`transport/ws.rs:333`，`crates/rurge-proto-quic/src/` 下的 `hysteria2/mod.rs:369`、`masque/mod.rs:373`、`tuic/mod.rs:388`，`crates/rurge-proto-wireguard/src/outbound.rs:478`。这 18 处都不用暂停的时钟（逐处核过）。两条吞吐基准（`hysteria2` 与 `wireguard` 的 `throughput`，忽略项，不进 CI）与假服务端里等自己任务的一处（`testing/anytls.rs:138`）不改。
+
+**判据**：三条新用例先红后绿；`lazy_head` 的 9 条、`shadowsocks` 与 `snell` 的单元用例全过；三条新用例与第 1 类的四条用例用编好的测试二进制各单独循环跑 20 次，全过；门禁。
+
+**提交**：`fix(proto): LazyHead 的两半在不同的任务里轮询时不再丢掉对方的唤醒`；`test: 在别的任务里写的用例限时等写完`。
+
+### 6b：只改用例与测试夹具的五类
+
+本机都复现不了（参照服务端本机一个也没有，第 5、6 类在别的平台上）：判据是门禁通过、改到的用例在本机照常通过或照常跳过，结论要等下一次 CI 运行。每一类一个提交。
+
+1. 第 2 类：`tests/interop/tests/common/mod.rs` 的 `udp_roundtrip`，与 `masque.rs`、`sing_box.rs`、`xray.rs` 里收载体回包的三处（今天都是 `[0u8; 64]`），改成 `vec![0u8; 65536]`（与 `udp_side_by_side` 一致）。提交 `test(interop): 收 UDP 载体的回包给 64 KiB 的缓冲`。
+2. 第 3 类：`udp_roundtrip`、`udp_side_by_side` 与上一条的那三处比较回包的来源时，两边都先经 `HostName::canonical` 归一（`common/mod.rs` 里一个把 `Target` 的主机归一的函数，这五处共用）；`tuic.rs` 里 `v4_udp_against_tuic_server` 的注释改说：服务端把 IPv4 的来源写成 IPv4 映射的形式，比较时两边都归一；rurge 自己把这个形式读作 IPv4，由 `tuic::addr::tests::an_ipv4_address_in_ipv6_form_reads_as_the_ipv4_address` 钉住。提交 `test(interop): 比较 UDP 回包的来源时把 IPv4 映射的地址当作 IPv4`。
+3. 第 4 类：`tests/interop/tests/masque.rs` 的 `tcp_against_masque_server` 不再用 `transfer`，改用这个文件自己的有节制的双向传送：两个方向在同一个 `join!` 里；上行每次写至多 64 KiB，写之前从一个初值为 512 KiB 的 `tokio::sync::Semaphore` 取够这一次的许可并 `forget`；回读每读到 n 字节就 `add_permits(n)`——上行至多领先回读 512 KiB，masque-server 为这条隧道排着的客户端字节因此不超过它的 1 MiB。总长仍是 `(9 << 20) + 777`（大于 rurge 每条流 8 MiB 的接收窗口，这条用例要过的就是这道坎）；整个传送以 60 秒为限，超时或出错时的文本带上 `server.log_text()`；注释写明 masque-server 的 `MAX_BUFFERED_CLIENT_BYTES`（1 MiB，不施加背压）。`transfer` 本身不改（`sing_box_hysteria2.rs` 与 `tuic.rs` 照用）。提交 `test(interop): 对 masque-server 的大传送节制上行`。
+4. 第 5 类：会发大于 9216 字节的数据报的测试 socket 都把发送缓冲调到 256 KiB（`socket2::SockRef::from(&socket).set_send_buffer_size(256 * 1024)`，失败就让用例失败）：`crates/rurge-engine/tests/common/mod.rs` 的 `udp_associate` 里的 socket（第 5 类的三条经它发 20 000 ～ 60 000 字节）；`crates/rurge-engine/tests/udp.rs` 的 `an_answer_too_long_for_the_client_is_dropped_alone` 里的 `remote`（发 65 500 字节）；还有预料中的同一种失败（它们所在的 `rurge-proto` 单元测试二进制这次在 macOS 上没有跑完）——`rurge_proto::testing::udp_echo_server` 的 socket 与 `FakeSnell` 每个 UDP 会话的 socket（`crates/rurge-proto/src/testing/snell.rs` 的 `Shared::udp`），`snell::tests` 的两条用例经它们往返 16 374 字节的数据报。`rurge-proto` 为此多一条依赖边：`socket2` 作 `testing` 特性带进来的可选依赖，另加进 `[dev-dependencies]`（同 `rcgen` 的写法；锁文件仍是 517 个包）。实现时再搜一遍别的测试 socket 有没有发大于 9216 字节的，搜法与结果写进报告。rurge 自己的 socket 不在这一轮改（P13）。提交 `test: macOS 上要发大数据报的测试 socket 调高发送缓冲`。
+5. 第 6 类：`crates/rurge-dns/src/testing.rs` 的 `MockDns::start` 至多试 64 轮：第 1、3、5……轮照今天先 TCP 后 UDP，第 2、4、6……轮先在 UDP 上 `bind` 0 号端口、再在同一个号上 `bind` TCP；记下两种绑定各自最后一次的错误，都失败时 panic 的文本是 `could not find a port free for both TCP and UDP (last TCP error: <错误>; last UDP error: <错误>)`（没有发生过的一种写 `none`）。不用 20000–29999 的号段（P14）。提交 `test(dns): MockDns 找端口时两种次序轮流试，找不到时说出最后的错误`。
+
+### 6c：文档
+
+- 本计划：「执行期修正记录」每一类一行，另一行记失败摘要第二次用上的结果（认出了全部失败与两个没跑完的二进制）；「延后事项」第 5 行的去向补上第二次用上的结果，另加：macOS 上 rurge 自己的 SOCKS5 UDP 中继 socket 的 9216 字节（P13；做法同 JDK-8239355，把发送缓冲调到至少 65 507 / 65 527 字节）；masque-server 每条隧道 1 MiB 的客户端字节（参照服务端的限制，不处理，已登记兼容性清单）；`MockDns` 在 Windows CI 上为什么找不到端口（下一次失败时看文本里的两种错误再定）；macOS 与 Windows 上没有跑到的五个包与 `rurge-proto` 单元测试其余用例的结果（下一次推送）；各份计划「延后事项」里去向是"第一次 CI 运行"的行（P17）。
+- 兼容性清单：4.2 节 `masque` 一行的互操作参照补一句 masque-server 每条 TCP 隧道至多排 1 MiB 客户端发来而还没写给目标的字节、超出即以 H3_CONNECT_ERROR 重置（经它的上传比目标收得快时会断；参照服务端的限制，用例按此节制上行）；写着互操作用例"还没有对真实的二进制跑过"的格子按这次运行改写（P17）。
+- `README.md` 与 `README_en.md`、需求文档第 7 节的状态行、`docs/acceptance/phase2-acceptance.md`（第 8 节加一段注明日期的更新，表里对应的一行随之改）：CI 仍然没有绿过；互操作用例对真实的二进制跑过了一次（`7bd6589`），除第 2 ～ 4 类的五条都通过；macOS 与 Windows 上有五个包没有跑到；六类失败修在哪些提交、要下一次推送才知道修好了没有。
+- CLAUDE.md：状态一段里"CI 从没绿过"那几句换成这次运行的结论（运行号、跑到的范围、失败的六类与修正的提交、还不知道的），并写一句：此前各段里"第一次 CI 运行时核对""还没有对真实的二进制跑过"的说法，凡这次运行跑到了的（Linux 上全部测试二进制，macOS 与 Windows 上排在 `rurge-proto` 单元测试之前的各包；这次运行的提交里还没有阶段 3 / M2），以这一句为准；"接下来的工作"一句随之改。
+
+**判据**：禁词检查；README 两份同样的节与特性表；改写的每一处都指到这次运行与它跑到的范围，不把"跑过一次、通过"写成"CI 绿了"。
+
+**提交**：`docs: CI 第二次运行的结论与修正；兼容性清单、README、验收文档与 CLAUDE.md 同步`。
 
 ## 任务 7：文档
 
