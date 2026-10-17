@@ -8,7 +8,7 @@
 
 use crate::matcher::{SetLookup, SetRef};
 use crate::set::{CompiledSet, SetHandle};
-use crate::set_format::{ParsedSet, SetKind, SetLine, internal_set_text, parse_set};
+use crate::set_format::{ParsedSet, SetKind, SetLine, internal_set_source, parse_set};
 use rurge_config::rule::{InternalSet, ParseCtx, ResourceRef, RuleKind, SubRule};
 use rurge_config::{Config, Diagnostic, Diagnostics, HostKey, Reach, codes};
 use rurge_net::resource::{
@@ -482,7 +482,8 @@ impl SetRegistry {
         let _guard = push_key(key.clone());
         let outcome = match &key {
             Key::Internal(i) => {
-                let parsed = self.parse_text(&key, kind, internal_set_text(*i), &self.base_dir);
+                let text = internal_set_source(*i, cfg!(target_os = "macos"));
+                let parsed = self.parse_text(&key, kind, &text, &self.base_dir);
                 self.finish(&key, kind, &name, parsed, 1, "internal")
             }
             Key::Inline(n) => {
@@ -877,6 +878,28 @@ mod tests {
         assert_eq!(decide(&engine, "10.0.0.1").await.0, "REJECT");
         let names: Vec<String> = reg.statuses().into_iter().map(|s| s.name).collect();
         assert_eq!(names, vec!["Inner", "LAN", "Outer", "SYSTEM"]);
+    }
+
+    /// The registry builds `SYSTEM` from the text the host reads: without its
+    /// two `PROCESS-NAME` lines (services of macOS) anywhere but on macOS.
+    #[tokio::test]
+    async fn the_built_in_system_set_has_its_process_lines_on_macos_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = load(
+            "[Proxy]\nP = direct\n[Rule]\nRULE-SET,SYSTEM,DIRECT\nFINAL,P\n",
+            dir.path(),
+        );
+        let (reg, diags) = SetRegistry::build(&cfg, manager(dir.path()), dir.path());
+        assert!(diags.is_empty(), "{:?}", codes_of(&diags));
+        let statuses = reg.statuses();
+        let system = statuses
+            .iter()
+            .find(|s| s.name == "SYSTEM")
+            .expect("the built-in set");
+        assert_eq!(
+            system.entries,
+            if cfg!(target_os = "macos") { 20 } else { 18 }
+        );
     }
 
     #[tokio::test]

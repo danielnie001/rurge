@@ -13,11 +13,16 @@ use rurge_config::{Glob, GlobOptions, NetworkFacts, SubnetExpr};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
+/// What a rule says of a session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Match,
     NoMatch,
+    /// The rule cannot be decided before the destination is resolved.
     NeedsResolve,
+    /// The rule cannot be decided before the process that opened the session
+    /// is known.
+    NeedsProcess,
 }
 
 impl From<bool> for Verdict {
@@ -66,9 +71,22 @@ pub struct SubRuleHit {
     pub entry: String,
 }
 
+/// What an evaluation has been told of the process that opened the session,
+/// besides the one the session itself carries (phase 3 M2 design 5.1).
+pub(crate) enum ProcessState {
+    /// Nobody has asked yet: a `PROCESS-NAME` rule can only say that it needs
+    /// the process.
+    NotAsked,
+    /// Asked, once for the whole evaluation: the process, or `None` when it
+    /// could not be found.
+    Asked(Option<ProcessInfo>),
+}
+
 /// State of one `evaluate` call.
 pub struct EvalCtx<'a> {
     pub resolved: Option<ResolvedAddrs>,
+    /// The process of the session, once the engine has asked for it.
+    pub(crate) process: ProcessState,
     /// Runtime notes (unsupported rule kinds, missing databases); the engine
     /// de-duplicates them per rule.
     pub notes: Vec<String>,
@@ -97,6 +115,7 @@ impl<'a> EvalCtx<'a> {
     pub fn new(geo: &'a dyn GeoLookup) -> EvalCtx<'a> {
         EvalCtx {
             resolved: None,
+            process: ProcessState::NotAsked,
             notes: Vec::new(),
             sub_hit: None,
             geo,
@@ -268,21 +287,9 @@ impl Matcher {
             RuleKind::IpAsnUnknown => Matcher::IpAsnUnknown,
             RuleKind::UserAgent(g) => Matcher::UserAgent(g.clone()),
             RuleKind::UrlRegex(p) => Matcher::UrlRegex(p.clone()),
-            RuleKind::ProcessName(p) => Matcher::ProcessName(match p {
-                // The rule text's Glob is compiled once here from the raw
-                // (un-normalized) value; rebuild it from normalized source so
-                // it compares symmetrically with the normalized runtime path
-                // `process_matches` matches against (FR-RULE-01).
-                ProcessPattern::Path(g) => {
-                    let normalized = normalize_process_path(g.source());
-                    let opts = GlobOptions {
-                        case_insensitive: cfg!(windows),
-                        classes: false,
-                    };
-                    ProcessPattern::Path(Glob::new(&normalized, opts).unwrap_or_else(|_| g.clone()))
-                }
-                other => other.clone(),
-            }),
+            RuleKind::ProcessName(p) => {
+                Matcher::ProcessName(compile_process_pattern(cfg!(windows), p))
+            }
             RuleKind::DestPort(p) => Matcher::DestPort(*p),
             RuleKind::SrcPort(p) => Matcher::SrcPort(*p),
             RuleKind::InPort(p) => Matcher::InPort(*p),
@@ -372,11 +379,16 @@ impl Matcher {
                 }
                 Verdict::NoMatch
             }
-            Matcher::ProcessName(pp) => s
-                .process
-                .as_ref()
-                .is_some_and(|p| process_matches(pp, p))
-                .into(),
+            Matcher::ProcessName(pp) => {
+                // the process the caller named up front is read first, then
+                // the one the evaluation was told
+                let process = match (&s.process, &ctx.process) {
+                    (Some(given), _) => Some(given),
+                    (None, ProcessState::NotAsked) => return Verdict::NeedsProcess,
+                    (None, ProcessState::Asked(found)) => found.as_ref(),
+                };
+                process.is_some_and(|p| process_matches(pp, p)).into()
+            }
             Matcher::DestPort(p) => p.matches(s.dst_port).into(),
             Matcher::SrcPort(p) => p.matches(s.src.port()).into(),
             Matcher::InPort(p) => p.matches(s.in_port).into(),
@@ -395,34 +407,28 @@ impl Matcher {
                 .is_some_and(|(facts, wifi_always_match)| expr.matches(facts, wifi_always_match))
                 .into(),
             Matcher::And(subs) => ctx.in_branches(|ctx| {
-                let mut needs = false;
+                let (mut needs_process, mut needs_resolve) = (false, false);
                 for sub in subs {
                     match sub.eval(s, ctx) {
                         Verdict::NoMatch => return Verdict::NoMatch,
-                        Verdict::NeedsResolve => needs = true,
+                        Verdict::NeedsProcess => needs_process = true,
+                        Verdict::NeedsResolve => needs_resolve = true,
                         Verdict::Match => {}
                     }
                 }
-                if needs {
-                    Verdict::NeedsResolve
-                } else {
-                    Verdict::Match
-                }
+                still_needs(needs_process, needs_resolve).unwrap_or(Verdict::Match)
             }),
             Matcher::Or(subs) => ctx.in_branches(|ctx| {
-                let mut needs = false;
+                let (mut needs_process, mut needs_resolve) = (false, false);
                 for sub in subs {
                     match sub.eval(s, ctx) {
                         Verdict::Match => return Verdict::Match,
-                        Verdict::NeedsResolve => needs = true,
+                        Verdict::NeedsProcess => needs_process = true,
+                        Verdict::NeedsResolve => needs_resolve = true,
                         Verdict::NoMatch => {}
                     }
                 }
-                if needs {
-                    Verdict::NeedsResolve
-                } else {
-                    Verdict::NoMatch
-                }
+                still_needs(needs_process, needs_resolve).unwrap_or(Verdict::NoMatch)
             }),
             Matcher::Not(sub) => {
                 // what matched inside a NOT is not what matched the rule
@@ -432,7 +438,7 @@ impl Matcher {
                 match verdict {
                     Verdict::Match => Verdict::NoMatch,
                     Verdict::NoMatch => Verdict::Match,
-                    Verdict::NeedsResolve => Verdict::NeedsResolve,
+                    Verdict::NeedsResolve | Verdict::NeedsProcess => verdict,
                 }
             }
             Matcher::Set(set) => {
@@ -464,6 +470,19 @@ impl Matcher {
             Matcher::Never => Verdict::NoMatch,
             Matcher::Final => Verdict::Match,
         }
+    }
+}
+
+/// What a rule that none of its parts decided still waits for: the process
+/// before the lookup, since the process is found on this machine at once and
+/// may make the lookup unnecessary. `None`: it waits for nothing.
+pub(crate) fn still_needs(process: bool, resolve: bool) -> Option<Verdict> {
+    if process {
+        Some(Verdict::NeedsProcess)
+    } else if resolve {
+        Some(Verdict::NeedsResolve)
+    } else {
+        None
     }
 }
 
@@ -555,14 +574,45 @@ fn normalize_process_path_for(windows: bool, path: &str) -> String {
 }
 
 fn process_matches(pattern: &ProcessPattern, p: &ProcessInfo) -> bool {
+    process_matches_for(cfg!(windows), pattern, p)
+}
+
+/// The `PROCESS-NAME` pattern of a rule, made for a host. `rurge-config`
+/// compiled its globs from the raw value, to the letter; here a path is
+/// rebuilt from the normalized source, so that it compares symmetrically with
+/// the normalized path of the process (FR-RULE-01), and on Windows a name is
+/// rebuilt not to mind the case of an ASCII letter (phase 3 M2 design 5.3).
+fn compile_process_pattern(windows: bool, p: &ProcessPattern) -> ProcessPattern {
+    match p {
+        ProcessPattern::Path(g) => {
+            let normalized = normalize_process_path_for(windows, g.source());
+            let opts = GlobOptions {
+                case_insensitive: windows,
+                classes: false,
+            };
+            ProcessPattern::Path(Glob::new(&normalized, opts).unwrap_or_else(|_| g.clone()))
+        }
+        ProcessPattern::Name(g) if windows => {
+            let opts = GlobOptions {
+                case_insensitive: true,
+                classes: false,
+            };
+            ProcessPattern::Name(Glob::new(g.source(), opts).unwrap_or_else(|_| g.clone()))
+        }
+        other => other.clone(),
+    }
+}
+
+fn process_matches_for(windows: bool, pattern: &ProcessPattern, p: &ProcessInfo) -> bool {
     match pattern {
         ProcessPattern::Name(g) => g.matches(&p.name),
         ProcessPattern::Path(g) => p
             .path
             .as_deref()
-            .is_some_and(|path| g.matches(&normalize_process_path(path))),
+            .is_some_and(|path| g.matches(&normalize_process_path_for(windows, path))),
         ProcessPattern::Prefix(prefix) => p.path.as_deref().is_some_and(|path| {
-            normalize_process_path(path).starts_with(&normalize_process_path(prefix))
+            normalize_process_path_for(windows, path)
+                .starts_with(&normalize_process_path_for(windows, prefix))
         }),
     }
 }
@@ -570,6 +620,8 @@ fn process_matches(pattern: &ProcessPattern, p: &ProcessInfo) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::set::{CompiledSet, SetHandle};
+    use crate::set_format::parse_set;
     use rurge_config::HostName;
     use rurge_config::Reach;
     use rurge_config::rule::{ParseCtx, parse_subrule};
@@ -971,10 +1023,56 @@ mod tests {
         assert_eq!(eval("USER-AGENT,Mozilla*", &s), Verdict::NoMatch);
     }
 
+    /// `raw` on `s`, in an evaluation that has asked for the process and been
+    /// told `found` (`None`: it could not be found).
+    fn eval_asked(raw: &str, s: &SessionInfo, found: Option<ProcessInfo>) -> Verdict {
+        let mut ctx = EvalCtx::new(&FakeGeo);
+        ctx.process = ProcessState::Asked(found);
+        compile(raw).eval(s, &mut ctx)
+    }
+
+    /// The process a rule like `PROCESS-NAME,<value>` reads, as it is parsed,
+    /// before it is compiled for a host.
+    fn pattern_of(raw: &str) -> ProcessPattern {
+        let names: HashSet<String> = HashSet::new();
+        let ctx = ParseCtx {
+            inline_rulesets: &names,
+            base_dir: Path::new("."),
+            reach: Reach::Anywhere,
+        };
+        match parse_subrule(raw, &ctx)
+            .unwrap_or_else(|e| panic!("{raw}: {}", e.message))
+            .kind
+        {
+            RuleKind::ProcessName(pattern) => pattern,
+            other => panic!("{raw}: {other:?}"),
+        }
+    }
+
+    /// The set `text` is the file of, asked by a rule that says nothing of
+    /// `no-resolve`, in an evaluation that has not asked for the process.
+    fn eval_set(text: &str, s: &SessionInfo) -> Verdict {
+        let names: HashSet<String> = HashSet::new();
+        let ctx = ParseCtx {
+            inline_rulesets: &names,
+            base_dir: Path::new("."),
+            reach: Reach::Anywhere,
+        };
+        let parsed = parse_set(SetKind::RuleSet, text, &ctx);
+        let set = CompiledSet::compile("t", SetKind::RuleSet, &parsed, &NoSets, 1);
+        let mut ctx = EvalCtx::new(&FakeGeo);
+        Matcher::Set(Arc::new(SetHandle::new(set))).eval(s, &mut ctx, false, false)
+    }
+
+    /// A session carries the process its caller knew of, or the evaluation
+    /// has to ask for it: until it has asked, a `PROCESS-NAME` rule can only
+    /// say that it needs the process, and once it has, a process that could
+    /// not be found is no match.
     #[test]
     fn process_name_modes() {
         let mut s = session("example.com");
         s.process = Some(ProcessInfo {
+            pid: None,
             name: "curl".into(),
             path: Some("/usr/bin/curl".into()),
         });
@@ -982,8 +1080,14 @@ mod tests {
         assert_eq!(eval("PROCESS-NAME,wget", &s), Verdict::NoMatch);
         assert_eq!(eval("PROCESS-NAME,/usr/bin/curl", &s), Verdict::Match);
         assert_eq!(eval("PROCESS-NAME,/usr/bin/*", &s), Verdict::Match);
+        // no process, and the context has not asked for one
         assert_eq!(
             eval("PROCESS-NAME,curl", &session("example.com")),
+            Verdict::NeedsProcess
+        );
+        // it has, and the process is not known
+        assert_eq!(
+            eval_asked("PROCESS-NAME,curl", &session("example.com"), None),
             Verdict::NoMatch
         );
         assert_eq!(
@@ -994,6 +1098,253 @@ mod tests {
             normalize_process_path_for(false, "/usr/bin/curl"),
             "/usr/bin/curl"
         );
+    }
+
+    /// What the evaluation found is read when the session names no process of
+    /// its own; one it does name is read first, asked for or not.
+    #[test]
+    fn the_process_a_session_names_is_read_before_the_one_that_was_found() {
+        let found = ProcessInfo {
+            pid: Some(41),
+            name: "wget".into(),
+            path: Some("/usr/bin/wget".into()),
+        };
+        let bare = session("example.com");
+        for (raw, expected) in [
+            ("PROCESS-NAME,wget", Verdict::Match),
+            ("PROCESS-NAME,/usr/bin/wget", Verdict::Match),
+            ("PROCESS-NAME,/usr/bin/", Verdict::Match),
+            ("PROCESS-NAME,curl", Verdict::NoMatch),
+        ] {
+            assert_eq!(
+                eval_asked(raw, &bare, Some(found.clone())),
+                expected,
+                "{raw}"
+            );
+        }
+        let mut named = session("example.com");
+        named.process = Some(ProcessInfo {
+            pid: None,
+            name: "curl".into(),
+            path: None,
+        });
+        assert_eq!(eval("PROCESS-NAME,curl", &named), Verdict::Match);
+        assert_eq!(
+            eval_asked("PROCESS-NAME,curl", &named, Some(found.clone())),
+            Verdict::Match
+        );
+        assert_eq!(
+            eval_asked("PROCESS-NAME,wget", &named, Some(found)),
+            Verdict::NoMatch
+        );
+    }
+
+    /// `NeedsProcess` goes through the logical rules and the sets the way
+    /// `NeedsResolve` does: a rule that cannot be decided yet says it needs
+    /// the process, one that has been decided already (an `AND` with a miss,
+    /// an `OR` or a set with a hit) does not, and a `NOT` hands it on.
+    #[test]
+    fn needing_the_process_passes_through_logic_and_sets() {
+        let at = |raw: &str, host: &str| eval(raw, &session(host));
+        let and = "AND,((PROCESS-NAME,x),(DOMAIN,a.test))";
+        let or = "OR,((PROCESS-NAME,x),(DOMAIN,a.test))";
+        assert_eq!(at(and, "a.test"), Verdict::NeedsProcess);
+        assert_eq!(at(and, "b.test"), Verdict::NoMatch);
+        assert_eq!(at(or, "a.test"), Verdict::Match);
+        assert_eq!(at(or, "b.test"), Verdict::NeedsProcess);
+        assert_eq!(
+            at("NOT,((PROCESS-NAME,x))", "a.test"),
+            Verdict::NeedsProcess
+        );
+        // the other order of the halves, and a rule inside a rule
+        let and = "AND,((DOMAIN,a.test),(PROCESS-NAME,x))";
+        let or = "OR,((DOMAIN,a.test),(PROCESS-NAME,x))";
+        assert_eq!(at(and, "a.test"), Verdict::NeedsProcess);
+        assert_eq!(at(and, "b.test"), Verdict::NoMatch);
+        assert_eq!(at(or, "a.test"), Verdict::Match);
+        assert_eq!(at(or, "b.test"), Verdict::NeedsProcess);
+        assert_eq!(
+            at("AND,((NOT,((PROCESS-NAME,x))),(DOMAIN,a.test))", "a.test"),
+            Verdict::NeedsProcess
+        );
+        // a set: a line that matches ends it, wherever the process line stands;
+        // with nothing else to say it needs the process
+        let a_test = session("a.test");
+        assert_eq!(
+            eval_set("PROCESS-NAME,x\nDOMAIN-KEYWORD,test\n", &a_test),
+            Verdict::Match
+        );
+        assert_eq!(
+            eval_set("DOMAIN-KEYWORD,test\nPROCESS-NAME,x\n", &a_test),
+            Verdict::Match
+        );
+        assert_eq!(eval_set("PROCESS-NAME,x\n", &a_test), Verdict::NeedsProcess);
+        assert_eq!(
+            eval_set("PROCESS-NAME,x\nDOMAIN-KEYWORD,other\n", &a_test),
+            Verdict::NeedsProcess
+        );
+        assert_eq!(eval_set("DOMAIN,b.test\n", &a_test), Verdict::NoMatch);
+        // once the evaluation has asked, the rules decide
+        let x = || ProcessInfo {
+            pid: Some(5),
+            name: "x".into(),
+            path: None,
+        };
+        let asked = |raw: &str, host: &str, found: Option<ProcessInfo>| {
+            eval_asked(raw, &session(host), found)
+        };
+        let and = "AND,((PROCESS-NAME,x),(DOMAIN,a.test))";
+        assert_eq!(asked(and, "a.test", Some(x())), Verdict::Match);
+        assert_eq!(asked(and, "b.test", Some(x())), Verdict::NoMatch);
+        assert_eq!(asked(and, "a.test", None), Verdict::NoMatch);
+        assert_eq!(
+            asked("NOT,((PROCESS-NAME,x))", "a.test", Some(x())),
+            Verdict::NoMatch
+        );
+        assert_eq!(
+            asked("NOT,((PROCESS-NAME,x))", "a.test", None),
+            Verdict::Match
+        );
+    }
+
+    /// When a rule is undecided for want of both, the process comes first:
+    /// it is found on this machine in a moment, and it may make the lookup
+    /// unnecessary.
+    #[test]
+    fn needing_the_process_comes_before_needing_a_lookup() {
+        let name = session("example.com");
+        for raw in [
+            "AND,((IP-CIDR,10.0.0.0/8),(PROCESS-NAME,x))",
+            "OR,((IP-CIDR,10.0.0.0/8),(PROCESS-NAME,x))",
+            "AND,((PROCESS-NAME,x),(IP-CIDR,10.0.0.0/8))",
+            "OR,((PROCESS-NAME,x),(IP-CIDR,10.0.0.0/8))",
+        ] {
+            assert_eq!(eval(raw, &name), Verdict::NeedsProcess, "{raw}");
+        }
+        // a set with a line of each kind: the same
+        assert_eq!(
+            eval_set("IP-CIDR,10.0.0.0/8\nPROCESS-NAME,x\n", &name),
+            Verdict::NeedsProcess
+        );
+        assert_eq!(
+            eval_set("PROCESS-NAME,x\nIP-CIDR,10.0.0.0/8\n", &name),
+            Verdict::NeedsProcess
+        );
+        // and a set that needs a lookup and nothing else still does
+        assert_eq!(
+            eval_set("IP-CIDR,10.0.0.0/8\n", &name),
+            Verdict::NeedsResolve
+        );
+        // the process asked for and not x: an AND is decided without the
+        // lookup, an OR still needs it
+        assert_eq!(
+            eval_asked("AND,((IP-CIDR,10.0.0.0/8),(PROCESS-NAME,x))", &name, None),
+            Verdict::NoMatch
+        );
+        assert_eq!(
+            eval_asked("OR,((IP-CIDR,10.0.0.0/8),(PROCESS-NAME,x))", &name, None),
+            Verdict::NeedsResolve
+        );
+    }
+
+    /// `PROCESS-NAME` is compared the way the host's file system compares
+    /// (phase 3 M2 design 5.3): on Windows without regard to the case of an
+    /// ASCII letter and with `/` for `\`, elsewhere to the letter. `.exe` is
+    /// never dropped from a name.
+    #[test]
+    fn process_comparison_follows_the_platform() {
+        let process = |name: &str, path: &str| ProcessInfo {
+            pid: Some(3),
+            name: name.into(),
+            path: Some(path.into()),
+        };
+        // `raw` compiled and then compared as `windows` says
+        let hits = |windows: bool, raw: &str, p: &ProcessInfo| {
+            let pattern = compile_process_pattern(windows, &pattern_of(raw));
+            process_matches_for(windows, &pattern, p)
+        };
+        let chrome = process("chrome.exe", "C:\\Program Files\\Chrome\\chrome.exe");
+        let app = process("app.exe", "C:\\Program Files\\App\\app.exe");
+        // Windows: not the case of a letter, and `/` is `\`
+        assert!(hits(true, "PROCESS-NAME,CHROME.EXE", &chrome));
+        assert!(hits(true, "PROCESS-NAME,chrome.exe", &chrome));
+        assert!(hits(true, "PROCESS-NAME,Chrome*", &chrome));
+        assert!(hits(
+            true,
+            "PROCESS-NAME,chrome.exe",
+            &process("CHROME.EXE", "C:\\c.exe")
+        ));
+        assert!(!hits(true, "PROCESS-NAME,firefox.exe", &chrome));
+        assert!(hits(
+            true,
+            "PROCESS-NAME,c:/program files/app/APP.EXE",
+            &app
+        ));
+        assert!(hits(
+            true,
+            "PROCESS-NAME,C:\\Program Files\\App\\app.exe",
+            &process("APP.EXE", "c:/PROGRAM FILES/app/App.exe")
+        ));
+        assert!(hits(
+            true,
+            "PROCESS-NAME,C:\\Program Files\\*\\app.exe",
+            &app
+        ));
+        assert!(hits(true, "PROCESS-NAME,C:\\PROGRAM FILES\\", &app));
+        assert!(hits(true, "PROCESS-NAME,c:/program files/app/", &app));
+        assert!(!hits(true, "PROCESS-NAME,C:\\Program Files\\Other\\", &app));
+        // elsewhere: the letter counts, in a name, a path and a prefix
+        let curl = process("curl", "/usr/bin/curl");
+        assert!(hits(false, "PROCESS-NAME,curl", &curl));
+        assert!(!hits(false, "PROCESS-NAME,Curl", &curl));
+        assert!(!hits(
+            false,
+            "PROCESS-NAME,curl",
+            &process("Curl", "/usr/bin/Curl")
+        ));
+        assert!(hits(false, "PROCESS-NAME,/usr/bin/curl", &curl));
+        assert!(!hits(false, "PROCESS-NAME,/usr/bin/Curl", &curl));
+        assert!(!hits(false, "PROCESS-NAME,/USR/bin/curl", &curl));
+        assert!(hits(false, "PROCESS-NAME,/usr/bin/", &curl));
+        assert!(!hits(false, "PROCESS-NAME,/USR/BIN/", &curl));
+        // a path is compared as it is written: nothing is folded or turned around
+        assert!(!hits(
+            false,
+            "PROCESS-NAME,c:/program files/app/APP.EXE",
+            &app
+        ));
+        assert!(hits(
+            false,
+            "PROCESS-NAME,C:\\Program Files\\App\\app.exe",
+            &app
+        ));
+        // `.exe` is part of the name on both
+        for windows in [true, false] {
+            assert!(!hits(windows, "PROCESS-NAME,chrome", &chrome), "{windows}");
+            assert!(hits(windows, "PROCESS-NAME,chrome*", &chrome), "{windows}");
+        }
+    }
+
+    /// A process whose path could not be read (Linux gives a name only, so
+    /// does Windows for `System`) is matched by its name and by nothing that
+    /// says where it lives.
+    #[test]
+    fn a_process_without_a_path_matches_by_name_only() {
+        let app = ProcessInfo {
+            pid: Some(7),
+            name: "app".into(),
+            path: None,
+        };
+        let asked = |raw: &str| eval_asked(raw, &session("example.com"), Some(app.clone()));
+        assert_eq!(asked("PROCESS-NAME,app"), Verdict::Match);
+        assert_eq!(asked("PROCESS-NAME,a*"), Verdict::Match);
+        assert_eq!(asked("PROCESS-NAME,/usr/bin/app"), Verdict::NoMatch);
+        assert_eq!(asked("PROCESS-NAME,/usr/bin/"), Verdict::NoMatch);
+        assert_eq!(
+            asked("PROCESS-NAME,C:\\Program Files\\App\\app.exe"),
+            Verdict::NoMatch
+        );
+        assert_eq!(asked("PROCESS-NAME,C:\\Program Files\\"), Verdict::NoMatch);
     }
 
     #[test]

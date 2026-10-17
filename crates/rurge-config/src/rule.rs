@@ -501,6 +501,27 @@ fn glob(value: &str, ci: bool, classes: bool) -> Result<Glob, String> {
     .map_err(|e| e.to_string())
 }
 
+/// How the value of a `PROCESS-NAME` rule reads (phase 3 M2 design 5.2), the
+/// same on every host: a path when it starts with `/`, with a drive letter and
+/// `:\` or `:/`, or with `\\` (a share), and then a prefix when it is longer
+/// than one character and ends in `/` or `\`; anything else is a file name.
+fn process_pattern(value: &str) -> Result<ProcessPattern, String> {
+    let bytes = value.as_bytes();
+    let is_path = value.starts_with('/')
+        || value.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'));
+    if !is_path {
+        glob(value, false, false).map(ProcessPattern::Name)
+    } else if value.len() > 1 && value.ends_with(['/', '\\']) {
+        Ok(ProcessPattern::Prefix(value.to_string()))
+    } else {
+        glob(value, false, false).map(ProcessPattern::Path)
+    }
+}
+
 fn parse_mac(value: &str) -> Option<String> {
     let parts: Vec<&str> = value.split([':', '-']).collect();
     if parts.len() != 6
@@ -579,15 +600,9 @@ fn parse_kind(ty: &str, value: &str, ctx: &ParseCtx, depth: usize) -> Result<Rul
             RuleKind::UserAgent(glob(value, false, false).map_err(|e| invalid(ty, value, &e))?)
         }
         "URL-REGEX" => RuleKind::UrlRegex(Pattern::new(value).map_err(|e| invalid(ty, value, &e))?),
-        "PROCESS-NAME" => RuleKind::ProcessName(
-            if value.starts_with('/') && value.ends_with('/') && value.len() > 1 {
-                ProcessPattern::Prefix(value.to_string())
-            } else if value.starts_with('/') {
-                ProcessPattern::Path(glob(value, false, false).map_err(|e| invalid(ty, value, &e))?)
-            } else {
-                ProcessPattern::Name(glob(value, false, false).map_err(|e| invalid(ty, value, &e))?)
-            },
-        ),
+        "PROCESS-NAME" => {
+            RuleKind::ProcessName(process_pattern(value).map_err(|e| invalid(ty, value, &e))?)
+        }
         "DEST-PORT" => RuleKind::DestPort(
             PortExpr::parse(value)
                 .ok_or_else(|| invalid(ty, value, "expected a port expression"))?,
@@ -1023,6 +1038,67 @@ mod tests {
         assert!(
             matches!(&subs[0].kind, RuleKind::Not(inner) if matches!(inner.kind, RuleKind::SrcIp(_)))
         );
+    }
+
+    /// How the value of a `PROCESS-NAME` rule is read is the same on every
+    /// host (phase 3 M2 design 5.2), so that a profile written for Windows
+    /// reads the same where `rurge check` is run on Linux: a path starts with
+    /// `/`, with a drive letter and `:\` or `:/`, or with `\\`, and one that
+    /// ends in a separator (and is longer than that) is a prefix; anything
+    /// else is a file name.
+    #[test]
+    fn process_name_values_are_classified() {
+        let kind = |pattern: &ProcessPattern| match pattern {
+            ProcessPattern::Name(_) => "name",
+            ProcessPattern::Path(_) => "path",
+            ProcessPattern::Prefix(_) => "prefix",
+        };
+        let class =
+            |value: &str| kind(&process_pattern(value).unwrap_or_else(|e| panic!("{value}: {e}")));
+        for value in ["curl", "Google*", "C:", "chrome.exe", "\\", "a:b/c"] {
+            assert_eq!(class(value), "name", "{value}");
+        }
+        for value in [
+            "/usr/bin/curl",
+            "/Applications/*.app/Contents/MacOS/*",
+            "/",
+            "C:\\Program Files\\App\\app.exe",
+            "c:/tools/app.exe",
+            "\\\\server\\share\\app.exe",
+        ] {
+            assert_eq!(class(value), "path", "{value}");
+        }
+        for value in [
+            "/Applications/ChatGPT.app/",
+            "C:\\Program Files\\App\\",
+            "d:/tools/",
+            "\\\\server\\share\\",
+        ] {
+            assert_eq!(class(value), "prefix", "{value}");
+        }
+        // a prefix is kept as it was written, and a path keeps its wildcards
+        assert_eq!(
+            process_pattern("C:\\Program Files\\App\\"),
+            Ok(ProcessPattern::Prefix("C:\\Program Files\\App\\".into()))
+        );
+        let Ok(ProcessPattern::Path(path)) = process_pattern("C:\\Tools\\*\\app.exe") else {
+            panic!("a path with a wildcard");
+        };
+        assert!(path.has_wildcards());
+        // and the rule line as a profile has it reads the same
+        for (raw, expected) in [
+            ("PROCESS-NAME,chrome.exe,Proxy", "name"),
+            ("PROCESS-NAME,C:\\Program Files\\App\\app.exe,Proxy", "path"),
+            ("PROCESS-NAME,\\\\server\\share\\,Proxy", "prefix"),
+            ("PROCESS-NAME,d:/tools/,Proxy", "prefix"),
+        ] {
+            let rule = parse(raw).unwrap_or_else(|e| panic!("{raw}: {}", e.message));
+            let RuleKind::ProcessName(pattern) = &rule.kind else {
+                panic!("{raw}: {:?}", rule.kind);
+            };
+            assert_eq!(kind(pattern), expected, "{raw}");
+            assert_eq!(rule.to_string(), raw);
+        }
     }
 
     /// `UNKNOWN`, in any case, is a value of `GEOIP` and of `IP-ASN` (manual,

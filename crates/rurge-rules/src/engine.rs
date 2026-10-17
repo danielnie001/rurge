@@ -1,14 +1,17 @@
 //! Rule engine (M2 design §6.5): top-level rules evaluated in order — after
 //! the ones flagged `pre-matching`, which are checked first and never resolve —,
-//! DNS on demand through `LazyResolver`, FINAL / `dns-failed` fallbacks,
-//! per-rule hit counters and one-time runtime notes.
+//! DNS on demand through `LazyResolver`, the process of the session on demand
+//! through `LazyProcess`, FINAL / `dns-failed` fallbacks, per-rule hit counters
+//! and one-time runtime notes.
 
-use crate::matcher::{EvalCtx, GeoLookup, Matcher, ResolvedAddrs, SetLookup, SubRuleHit, Verdict};
+use crate::matcher::{
+    EvalCtx, GeoLookup, Matcher, ProcessState, ResolvedAddrs, SetLookup, SubRuleHit, Verdict,
+};
 use crate::pre_matching::{PreMatch, PreMatchingSet};
 use crate::registry::SetRegistry;
 use rurge_config::policy::Builtin;
 use rurge_config::rule::{PolicyRef, RuleParams};
-use rurge_config::session::SessionInfo;
+use rurge_config::session::{ProcessInfo, SessionInfo};
 use rurge_config::{Config, HostName, NetworkCell, NetworkFacts, Span};
 use rurge_net::BoxFuture;
 use std::fmt;
@@ -54,6 +57,23 @@ pub struct FixedResolve(pub ResolvedAddrs);
 impl LazyResolver for FixedResolve {
     fn resolve<'a>(&'a self, _host: &'a str) -> BoxFuture<'a, Result<ResolvedAddrs, ResolveError>> {
         Box::pin(async move { Ok(self.0.clone()) })
+    }
+}
+
+/// Finds the process that opened the session the first time a rule needs to
+/// know it. `None`: it could not be found, which no `PROCESS-NAME` rule
+/// matches.
+pub trait LazyProcess: Send + Sync {
+    fn process(&self) -> BoxFuture<'_, Option<ProcessInfo>>;
+}
+
+/// No process lookup: the process is never known (`evaluate`, `rule match`
+/// without `--process`).
+pub struct NoProcess;
+
+impl LazyProcess for NoProcess {
+    fn process(&self) -> BoxFuture<'_, Option<ProcessInfo>> {
+        Box::pin(async { None })
     }
 }
 
@@ -188,6 +208,7 @@ fn verdict_name(v: Verdict) -> &'static str {
         Verdict::Match => "match",
         Verdict::NoMatch => "no-match",
         Verdict::NeedsResolve => "needs-resolve",
+        Verdict::NeedsProcess => "needs-process",
     }
 }
 
@@ -284,13 +305,27 @@ impl RuleEngine {
         &self.pre
     }
 
+    /// Decides `s` knowing no process but the one `s` carries.
     pub async fn evaluate(
         &self,
         s: &SessionInfo,
         mode: OutboundMode,
         resolver: &dyn LazyResolver,
     ) -> Decision {
-        self.run(s, mode, resolver, None).await
+        self.run(s, mode, resolver, &NoProcess, None).await
+    }
+
+    /// `evaluate`, finding the process that opened the session with `process`
+    /// when a rule needs it: at most once per evaluation, and before a name is
+    /// resolved for the same rule.
+    pub async fn evaluate_with_process(
+        &self,
+        s: &SessionInfo,
+        mode: OutboundMode,
+        resolver: &dyn LazyResolver,
+        process: &dyn LazyProcess,
+    ) -> Decision {
+        self.run(s, mode, resolver, process, None).await
     }
 
     pub async fn evaluate_traced(
@@ -300,7 +335,9 @@ impl RuleEngine {
         resolver: &dyn LazyResolver,
     ) -> (Decision, Vec<TraceStep>) {
         let mut trace = Vec::new();
-        let d = self.run(s, mode, resolver, Some(&mut trace)).await;
+        let d = self
+            .run(s, mode, resolver, &NoProcess, Some(&mut trace))
+            .await;
         (d, trace)
     }
 
@@ -309,6 +346,7 @@ impl RuleEngine {
         s: &SessionInfo,
         mode: OutboundMode,
         resolver: &dyn LazyResolver,
+        process: &dyn LazyProcess,
         mut trace: Option<&mut Vec<TraceStep>>,
     ) -> Decision {
         match mode {
@@ -333,6 +371,11 @@ impl RuleEngine {
             let started = Instant::now();
             ctx.sub_hit = None;
             let mut verdict = self.eval_rule(rule, s, &mut ctx);
+            if verdict == Verdict::NeedsProcess {
+                // asked for once: the rules after this one read the answer
+                ctx.process = ProcessState::Asked(process.process().await);
+                verdict = self.eval_rule(rule, s, &mut ctx);
+            }
             if verdict == Verdict::NeedsResolve {
                 let host = s.dst_host.as_domain().unwrap_or_default().to_string();
                 match resolver.resolve(&host).await {
@@ -530,7 +573,7 @@ mod tests {
     use crate::geoip::{COUNTRY_FILE, DbKind, GeoDb};
     use crate::matcher::{GeoResult, NoGeo, SetRef};
     use crate::set::{CompiledSet, SetHandle};
-    use crate::set_format::{ParsedSet, SetKind, SetLine, internal_set_text, parse_set};
+    use crate::set_format::{ParsedSet, SetKind, SetLine, internal_set_source, parse_set};
     use rurge_config::Reach;
     use rurge_config::config::{LoadOptions, from_text};
     use rurge_config::rule::{ParseCtx, ResourceRef};
@@ -590,7 +633,8 @@ mod tests {
                         base_dir: Path::new("."),
                         reach: Reach::Anywhere,
                     };
-                    let parsed = parse_set(SetKind::RuleSet, internal_set_text(*i), &ctx);
+                    let text = internal_set_source(*i, cfg!(target_os = "macos"));
+                    let parsed = parse_set(SetKind::RuleSet, &text, &ctx);
                     Arc::new(SetHandle::new(CompiledSet::compile(
                         "internal",
                         SetKind::RuleSet,
@@ -1757,17 +1801,231 @@ AND,((RULE-SET,Y),(OR,((DEST-PORT,1),(DEST-PORT,443)))),P\nFINAL,DIRECT\n\
         assert!(RuleEngine::build(&l.config, &NoNested, Arc::new(NoGeo)).is_err());
     }
 
+    /// A process lookup that answers one process (or none), and counts how
+    /// often it is asked.
+    struct CountedProcess {
+        calls: AtomicUsize,
+        answer: Option<ProcessInfo>,
+    }
+
+    impl CountedProcess {
+        fn is(name: &str) -> CountedProcess {
+            CountedProcess {
+                calls: AtomicUsize::new(0),
+                answer: Some(ProcessInfo {
+                    pid: Some(4242),
+                    name: name.into(),
+                    path: None,
+                }),
+            }
+        }
+
+        fn unknown() -> CountedProcess {
+            CountedProcess {
+                calls: AtomicUsize::new(0),
+                answer: None,
+            }
+        }
+
+        fn asked(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl LazyProcess for CountedProcess {
+        fn process(&self) -> BoxFuture<'_, Option<ProcessInfo>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let answer = self.answer.clone();
+            Box::pin(async move { answer })
+        }
+    }
+
+    /// A session to `host` decided with a way to look up its process.
+    async fn decide_with(
+        e: &RuleEngine,
+        host: &str,
+        resolver: &dyn LazyResolver,
+        process: &dyn LazyProcess,
+    ) -> Decision {
+        e.evaluate_with_process(&session(host), OutboundMode::Rule, resolver, process)
+            .await
+    }
+
+    /// The process is looked up the first time a rule needs it and not again
+    /// in the same evaluation: the rules after that read the answer.
+    #[tokio::test]
+    async fn a_process_rule_asks_for_the_process_once() {
+        let e = engine("[Rule]\nPROCESS-NAME,a,REJECT\nPROCESS-NAME,b,REJECT\nFINAL,DIRECT\n");
+        let process = CountedProcess::is("b");
+        let d = decide_with(&e, "example.com", &Panicking, &process).await;
+        assert_eq!((d.reason, d.matched), (Reason::Rule, Some(1)));
+        assert_eq!(d.policy().map(named).as_deref(), Some("REJECT"));
+        assert_eq!(process.asked(), 1);
+        assert_eq!(e.rules()[0].hits(), 0);
+        assert_eq!(e.rules()[1].hits(), 1);
+        // a process nobody could find is asked for once as well, and no rule matches it
+        let process = CountedProcess::unknown();
+        let d = decide_with(&e, "example.com", &Panicking, &process).await;
+        assert_eq!((d.reason, d.matched), (Reason::Final, Some(2)));
+        assert_eq!(process.asked(), 1);
+    }
+
+    /// A rule that needs the process and a lookup gets the process first: when
+    /// it is not the one, the name is never resolved.
+    #[tokio::test]
+    async fn the_process_is_asked_before_the_name_is_resolved() {
+        let e =
+            engine("[Rule]\nAND,((PROCESS-NAME,x),(IP-CIDR,10.0.0.0/8)),REJECT\nFINAL,DIRECT\n");
+        let resolver = Counting::v4("10.1.1.1");
+        let process = CountedProcess::is("y");
+        let d = decide_with(&e, "host.example", &resolver, &process).await;
+        assert_eq!((d.reason, d.matched), (Reason::Final, Some(1)));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(process.asked(), 1);
+        // and when it is, the lookup follows and decides: three evaluations of one rule
+        let process = CountedProcess::is("x");
+        let d = decide_with(&e, "host.example", &resolver, &process).await;
+        assert_eq!((d.reason, d.matched), (Reason::Rule, Some(0)));
+        assert_eq!(d.policy().map(named).as_deref(), Some("REJECT"));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(process.asked(), 1);
+        assert!(d.resolved.is_some());
+    }
+
+    /// A rule is evaluated again once the process is known: the set beside
+    /// the process keeps its hit through that, and leaves none when the rule
+    /// does not match in the end.
+    #[tokio::test]
+    async fn a_set_beside_the_process_keeps_its_hit_once_the_rule_matches() {
+        let e = engine(
+            "[Rule]\nAND,((RULE-SET,X),(PROCESS-NAME,p)),REJECT\nFINAL,DIRECT\n\
+[Ruleset X]\nDOMAIN,hit.example\n",
+        );
+        let d = decide_with(&e, "hit.example", &Panicking, &CountedProcess::is("p")).await;
+        assert_eq!((d.reason, d.matched), (Reason::Rule, Some(0)));
+        let found = d.sub_rule.expect("the set of the rule that matched");
+        assert_eq!(
+            (found.set.as_str(), found.entry.as_str()),
+            ("X", "DOMAIN,hit.example")
+        );
+        let d = decide_with(&e, "hit.example", &Panicking, &CountedProcess::is("q")).await;
+        assert_eq!((d.reason, d.matched), (Reason::Final, Some(1)));
+        assert!(d.sub_rule.is_none());
+    }
+
+    /// A session that names its process already is not asked about it.
+    #[tokio::test]
+    async fn a_given_process_is_not_asked_for() {
+        let e = engine("[Rule]\nPROCESS-NAME,curl,REJECT\nFINAL,DIRECT\n");
+        let mut s = session("example.com");
+        s.process = Some(ProcessInfo {
+            pid: None,
+            name: "curl".into(),
+            path: None,
+        });
+        let process = CountedProcess::is("wget");
+        let d = e
+            .evaluate_with_process(&s, OutboundMode::Rule, &Panicking, &process)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::Rule, Some(0)));
+        assert_eq!(process.asked(), 0);
+    }
+
+    /// The evaluations that do not wait for anything (`evaluate`, the lookups
+    /// that come before a name is resolved) know no process: a rule that needs
+    /// one does not match there.
+    #[tokio::test]
+    async fn evaluate_knows_no_process() {
+        let e = engine("[Rule]\nPROCESS-NAME,x,REJECT\nFINAL,DIRECT\n");
+        let d = e
+            .evaluate(&session("example.com"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!((d.reason, d.matched), (Reason::Final, Some(1)));
+        let (d, trace) = e
+            .evaluate_traced(&session("example.com"), OutboundMode::Rule, &Panicking)
+            .await;
+        assert_eq!(d.matched, Some(1));
+        assert_eq!(steps(&trace), [(0, "no-match"), (1, "match")]);
+    }
+
+    /// A rule flagged `pre-matching` that takes its lines from a set with a
+    /// `PROCESS-NAME` line in it: the pre-pass and the two lookups before a
+    /// name is resolved do not ask for the process (they have none to give),
+    /// the rule misses there and is evaluated where it is written.
+    #[tokio::test]
+    async fn pre_matching_does_not_ask_for_the_process() {
+        let e = engine(
+            "[Rule]\nRULE-SET,Marked,REJECT,pre-matching\nFINAL,DIRECT\n\
+[Ruleset Marked]\nPROCESS-NAME,x\n",
+        );
+        assert_eq!(e.pre_matching().len(), 1);
+        assert!(e.pre_match_domain("example.com", 443).is_none());
+        assert!(e.pre_match_ip("192.0.2.1".parse().unwrap(), 443).is_none());
+        let process = CountedProcess::is("x");
+        let d = decide_with(&e, "example.com", &Panicking, &process).await;
+        assert_eq!((d.reason, d.matched), (Reason::Rule, Some(0)));
+        assert_eq!(d.policy().map(named).as_deref(), Some("REJECT"));
+        assert_eq!(process.asked(), 1);
+        // not the process it names: the rule is asked once and misses
+        let process = CountedProcess::is("y");
+        let d = decide_with(&e, "example.com", &Panicking, &process).await;
+        assert_eq!((d.reason, d.matched), (Reason::Final, Some(1)));
+        assert_eq!(process.asked(), 1);
+    }
+
+    /// `RULE-SET,SYSTEM` is compiled without its two `PROCESS-NAME` lines
+    /// (they name services of macOS): a session that none of its domain lines
+    /// takes does not wait for a process lookup for it.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn a_system_rule_set_never_asks_for_the_process() {
+        let e = engine("[Rule]\nRULE-SET,SYSTEM,REJECT\nFINAL,DIRECT\n");
+        let process = CountedProcess::is("trustd");
+        let d = decide_with(&e, "example.com", &Panicking, &process).await;
+        assert_eq!((d.reason, d.matched), (Reason::Final, Some(1)));
+        assert_eq!(process.asked(), 0);
+        // and its domain lines are there
+        let d = decide_with(&e, "captive.apple.com", &Panicking, &process).await;
+        assert_eq!((d.reason, d.matched), (Reason::Rule, Some(0)));
+        assert_eq!(process.asked(), 0);
+    }
+
+    /// On macOS the two lines are there: the session is asked about once, and
+    /// a process called `trustd` is taken by the set.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_system_rule_set_never_asks_for_the_process() {
+        let e = engine("[Rule]\nRULE-SET,SYSTEM,REJECT\nFINAL,DIRECT\n");
+        let process = CountedProcess::is("trustd");
+        let d = decide_with(&e, "example.com", &Panicking, &process).await;
+        assert_eq!((d.reason, d.matched), (Reason::Rule, Some(0)));
+        assert_eq!(process.asked(), 1);
+        let process = CountedProcess::unknown();
+        let d = decide_with(&e, "example.com", &Panicking, &process).await;
+        assert_eq!((d.reason, d.matched), (Reason::Final, Some(1)));
+        assert_eq!(process.asked(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_process_answers_nothing() {
+        assert_eq!(NoProcess.process().await, None);
+    }
+
     fn assert_send<T: Send>(_: &T) {}
 
     /// `evaluate`'s returned future must stay `Send` (e.g. so a caller can
     /// `tokio::spawn` it on a multi-thread runtime); this pins that down
-    /// without needing to actually poll it.
+    /// without needing to actually poll it. So must the one that looks up a
+    /// process.
     #[test]
     fn evaluate_future_is_send() {
         let e = engine(CONF);
         let s = session("foo.org");
         let resolver = NoResolve;
         let fut = e.evaluate(&s, OutboundMode::Rule, &resolver);
+        assert_send(&fut);
+        let process = NoProcess;
+        let fut = e.evaluate_with_process(&s, OutboundMode::Rule, &resolver, &process);
         assert_send(&fut);
     }
 }

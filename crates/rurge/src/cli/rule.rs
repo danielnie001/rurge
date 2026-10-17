@@ -171,7 +171,11 @@ fn build_session(args: &MatchArgs) -> anyhow::Result<SessionInfo> {
     s.process = args.process.as_ref().map(|p| {
         let name = p.rsplit(['/', '\\']).next().unwrap_or(p).to_string();
         let path = (p.contains('/') || p.contains('\\')).then(|| p.clone());
-        ProcessInfo { name, path }
+        ProcessInfo {
+            pid: None,
+            name,
+            path,
+        }
     });
     Ok(s)
 }

@@ -3,6 +3,7 @@
 
 use rurge_config::rule::{InternalSet, ParseCtx, RuleKind, SubRule, parse_subrule};
 use rurge_config::text::strip_inline_comment;
+use std::borrow::Cow;
 
 /// Manual: "A set may contain at most 1,000,000 entries." rurge truncates and warns.
 pub const MAX_ENTRIES: usize = 1_000_000;
@@ -194,6 +195,24 @@ pub fn internal_set_text(set: InternalSet) -> &'static str {
     }
 }
 
+/// The text of a built-in set as the host reads it: `internal_set_text`, less
+/// its `PROCESS-NAME` lines unless the host is macOS (`macos`). The two such
+/// lines of `SYSTEM` name services of macOS, and a rule that refers to the set
+/// would wait for a process lookup, on every session its domain lines do not
+/// take, for services that are not there (phase 3 M2 design 5.5).
+pub fn internal_set_source(set: InternalSet, macos: bool) -> Cow<'static, str> {
+    let text = internal_set_text(set);
+    let names_a_process = |line: &str| line.starts_with("PROCESS-NAME,");
+    if macos || !text.lines().any(names_a_process) {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(
+        text.split_inclusive('\n')
+            .filter(|line| !names_a_process(line))
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +382,37 @@ mod tests {
                 "IP-CIDR6,fe80::/10",
             ]
         );
+    }
+
+    /// The last two lines of `SYSTEM` name services of macOS, so the set is
+    /// compiled with them on macOS and without them elsewhere (phase 3 M2
+    /// design 5.5), while the text of the set stays the manual's list. The
+    /// other built-in set has no such line and is the text itself.
+    #[test]
+    fn the_system_set_has_its_process_lines_on_macos_only() {
+        let text = internal_set_text(InternalSet::System);
+        assert_eq!(internal_set_source(InternalSet::System, true), text);
+        let elsewhere = internal_set_source(InternalSet::System, false);
+        assert_eq!(
+            elsewhere.lines().collect::<Vec<_>>(),
+            text.lines().take(18).collect::<Vec<_>>()
+        );
+        assert!(!elsewhere.contains("PROCESS-NAME"));
+        // what is left is a set of eighteen domain lines
+        let names = HashSet::new();
+        let parsed = parse_set(SetKind::RuleSet, &elsewhere, &ctx_with(&names));
+        assert_eq!(parsed.lines.len(), 18);
+        assert!(parsed.skipped.is_empty());
+        // nothing is copied when nothing is taken out
+        assert!(matches!(
+            internal_set_source(InternalSet::System, true),
+            Cow::Borrowed(_)
+        ));
+        for macos in [true, false] {
+            let lan = internal_set_source(InternalSet::Lan, macos);
+            assert_eq!(lan, internal_set_text(InternalSet::Lan));
+            assert!(matches!(lan, Cow::Borrowed(_)));
+        }
     }
 
     /// The sub-rules of a parsed set; every line of it must be a rule line.

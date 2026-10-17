@@ -6,7 +6,7 @@ use crate::domain_index::{DomainIndex, DomainIndexBuilder};
 use crate::ip_index::{IpIndex, IpIndexBuilder};
 use crate::matcher::{
     CompiledSubRule, EvalCtx, Family, GeoResult, SetLookup, SetMatch, SetVerdict, Verdict,
-    compile_subrule, target_ip,
+    compile_subrule, still_needs, target_ip,
 };
 use crate::set_format::{ParsedSet, SetKind, SetLine};
 use arc_swap::ArcSwap;
@@ -204,7 +204,7 @@ impl CompiledSet {
                 }
             }
         }
-        let mut needs = false;
+        let (mut needs_process, mut needs_resolve) = (false, false);
         for (i, rule) in &self.linear {
             match rule.matcher.eval(
                 s,
@@ -213,7 +213,8 @@ impl CompiledSet {
                 extended || rule.extended,
             ) {
                 Verdict::Match => return self.hit(*i),
-                Verdict::NeedsResolve => needs = true,
+                Verdict::NeedsProcess => needs_process = true,
+                Verdict::NeedsResolve => needs_resolve = true,
                 Verdict::NoMatch => {}
             }
         }
@@ -226,7 +227,7 @@ impl CompiledSet {
                         return self.hit(i);
                     }
                 }
-                Err(Verdict::NeedsResolve) => needs = true,
+                Err(Verdict::NeedsResolve) => needs_resolve = true,
                 Err(_) => {}
             }
         }
@@ -238,17 +239,13 @@ impl CompiledSet {
                             return self.hit(i);
                         }
                     }
-                    Err(Verdict::NeedsResolve) => needs = true,
+                    Err(Verdict::NeedsResolve) => needs_resolve = true,
                     Err(_) => {}
                 }
             }
         }
         SetVerdict {
-            verdict: if needs {
-                Verdict::NeedsResolve
-            } else {
-                Verdict::NoMatch
-            },
+            verdict: still_needs(needs_process, needs_resolve).unwrap_or(Verdict::NoMatch),
             entry: None,
         }
     }

@@ -22,12 +22,16 @@ pub enum Transport {
     Udp,
 }
 
-/// Originating process; filled in by the platform layer from M3 on.
+/// The process that opened a session: one the caller names (`rurge rule match
+/// --process`), or one the engine found when a rule asked for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessInfo {
-    /// Executable file name without directory, e.g. `curl` or `chrome.exe`.
+    /// `None` when the process was given rather than found
+    /// (`rurge rule match --process`).
+    pub pid: Option<u32>,
+    /// The executable's file name: what `PROCESS-NAME` name patterns match.
     pub name: String,
-    /// Full path when known.
+    /// The executable's full path, when it could be read.
     pub path: Option<String>,
 }
 
@@ -58,6 +62,10 @@ pub struct SessionInfo {
     /// proxy): whoever sets `url` on another kind of session (MITM, phase 4)
     /// must revisit `Engine::dial`.
     pub url: Option<String>,
+    /// A process the caller knew before the session was evaluated, which is
+    /// what `rurge rule match --process` fills in. A session that came in
+    /// through a listener has none: the engine finds its process when a rule
+    /// asks for it, and hands it to the rule engine then.
     pub process: Option<ProcessInfo>,
     pub device: Option<DeviceInfo>,
 }

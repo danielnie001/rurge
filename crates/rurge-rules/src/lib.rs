@@ -11,7 +11,9 @@ pub mod registry;
 pub mod set;
 pub mod set_format;
 
-pub use engine::{Decision, LazyResolver, OutboundMode, Outcome, Reason, RuleEngine};
+pub use engine::{
+    Decision, LazyProcess, LazyResolver, NoProcess, OutboundMode, Outcome, Reason, RuleEngine,
+};
 pub use geoip::{DbKind, GeoAnswer, GeoDb, GeoDbInfo};
 pub use geoip_update::{GeoUpdater, GeoUrls};
 pub use matcher::{GeoLookup, GeoResult};
