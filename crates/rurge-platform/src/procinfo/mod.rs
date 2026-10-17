@@ -12,6 +12,7 @@
 //! This crate knows no other crate of rurge, so the types here are its own.
 
 mod linux;
+mod macos;
 mod windows;
 
 use std::collections::HashMap;
@@ -139,7 +140,10 @@ pub(crate) trait Source: Send + Sync {
 
 /// The addresses of the machine's interfaces, loopback ones included. An empty
 /// list when the system will not give them.
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))] // only the Windows and Linux readers ask, so far
+#[cfg_attr(
+    not(any(windows, target_os = "linux", target_os = "macos")),
+    allow(dead_code)
+)] // only the readers of Windows, Linux and macOS ask
 pub(crate) fn interface_addresses() -> Vec<IpAddr> {
     match if_addrs::get_if_addrs() {
         Ok(interfaces) => interfaces.iter().map(if_addrs::Interface::ip).collect(),
@@ -152,7 +156,10 @@ pub(crate) fn interface_addresses() -> Vec<IpAddr> {
 
 /// A machine whose sockets are not listed: every table is empty, so no process
 /// is ever found.
-#[cfg_attr(all(any(windows, target_os = "linux"), not(test)), allow(dead_code))] // a finder uses it where nothing reads the sockets
+#[cfg_attr(
+    all(any(windows, target_os = "linux", target_os = "macos"), not(test)),
+    allow(dead_code)
+)] // a finder uses it where nothing reads the sockets
 pub(crate) struct NoTables;
 
 impl Source for NoTables {
@@ -182,16 +189,18 @@ pub struct Finder {
 }
 
 impl Finder {
-    /// A finder for the platform this runs on. On Windows and Linux it reads
-    /// the tables the system keeps. On macOS nothing reads the sockets yet, and
-    /// it never finds a process.
+    /// A finder for the platform this runs on. On Windows, Linux and macOS it
+    /// reads the tables the system keeps. On any other system nothing reads the
+    /// sockets, and it never finds a process.
     pub fn new() -> Finder {
         #[cfg(windows)]
         let source: Box<dyn Source> = Box::new(windows::Tables);
         #[cfg(target_os = "linux")]
         let source: Box<dyn Source> = Box::new(linux::Tables::new(linux::RealFs));
-        #[cfg(not(any(windows, target_os = "linux")))]
-        let source: Box<dyn Source> = Box::new(NoTables); // macOS: nothing reads its sockets yet
+        #[cfg(target_os = "macos")]
+        let source: Box<dyn Source> = Box::new(macos::Tables);
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+        let source: Box<dyn Source> = Box::new(NoTables); // no reader for the sockets of this system
         Finder::with_source(source, ADDRESS_TTL)
     }
 
