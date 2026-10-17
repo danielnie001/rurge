@@ -554,6 +554,8 @@ mod tests {
     struct OneSlot {
         write_open: bool,
         flush_open: bool,
+        /// Every write fails with this, gate or no gate.
+        write_error: Option<io::ErrorKind>,
         slot: Option<Waker>,
         taken: Vec<u8>,
         flushes: usize,
@@ -564,6 +566,7 @@ mod tests {
             OneSlot {
                 write_open,
                 flush_open,
+                write_error: None,
                 slot: None,
                 taken: Vec::new(),
                 flushes: 0,
@@ -592,6 +595,9 @@ mod tests {
             cx: &mut Context<'_>,
             data: &[u8],
         ) -> Poll<io::Result<usize>> {
+            if let Some(kind) = self.write_error {
+                return Poll::Ready(Err(kind.into()));
+            }
             if self.write_open {
                 self.taken.extend_from_slice(data);
                 return Poll::Ready(Ok(data.len()));
@@ -767,5 +773,226 @@ mod tests {
             Poll::Ready(Ok(4))
         ));
         assert_eq!(lazy.get_mut().taken, b"HEAD|payloadmore");
+    }
+
+    #[tokio::test]
+    async fn a_read_that_finishes_the_head_unannounced_wakes_the_writer_parked_on_it() {
+        // nobody says the stream can take bytes again: the reader polls on
+        // its own and finishes the head, and only it can tell the writer
+        let (writer, writer_waker) = Count::waker();
+        let (_, reader_waker) = Count::waker();
+        let mut wcx = Context::from_waker(&writer_waker);
+        let mut rcx = Context::from_waker(&reader_waker);
+        let mut lazy = LazyHead::with_grace(
+            OneSlot::new(false, true),
+            b"HEAD|".to_vec(),
+            Duration::from_secs(30),
+        );
+        assert!(
+            Pin::new(&mut lazy)
+                .poll_write(&mut wcx, b"payload")
+                .is_pending()
+        );
+        let mut space = [0u8; 8];
+        let mut buf = ReadBuf::new(&mut space);
+        assert!(
+            Pin::new(&mut lazy)
+                .poll_read(&mut rcx, &mut buf)
+                .is_pending()
+        );
+        lazy.get_mut().write_open = true;
+        assert_eq!(writer.woken(), 0, "nothing has woken the writer yet");
+        // the reader finishes the head; there is nothing to read yet
+        assert!(
+            Pin::new(&mut lazy)
+                .poll_read(&mut rcx, &mut buf)
+                .is_pending()
+        );
+        assert_eq!(lazy.get_mut().taken, b"HEAD|payload");
+        assert!(
+            writer.woken() >= 1,
+            "the writer was woken {} times, and its poll_write still owes it Ready(7)",
+            writer.woken()
+        );
+        assert!(matches!(
+            Pin::new(&mut lazy).poll_write(&mut wcx, b"payload"),
+            Poll::Ready(Ok(7))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_head_that_fails_wakes_the_other_half_too() {
+        let (writer, writer_waker) = Count::waker();
+        let (_, reader_waker) = Count::waker();
+        let mut wcx = Context::from_waker(&writer_waker);
+        let mut rcx = Context::from_waker(&reader_waker);
+        let mut lazy = LazyHead::with_grace(
+            OneSlot::new(false, true),
+            b"HEAD|".to_vec(),
+            Duration::from_secs(30),
+        );
+        // both halves wait on the head
+        assert!(
+            Pin::new(&mut lazy)
+                .poll_write(&mut wcx, b"payload")
+                .is_pending()
+        );
+        let mut space = [0u8; 8];
+        let mut buf = ReadBuf::new(&mut space);
+        assert!(
+            Pin::new(&mut lazy)
+                .poll_read(&mut rcx, &mut buf)
+                .is_pending()
+        );
+        // writes fail from now on, and nobody is told
+        lazy.get_mut().write_error = Some(io::ErrorKind::BrokenPipe);
+        assert_eq!(writer.woken(), 0, "nothing has woken the writer yet");
+        assert!(matches!(
+            Pin::new(&mut lazy).poll_read(&mut rcx, &mut buf),
+            Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe
+        ));
+        // the writer hears of it and finds the same error
+        assert!(
+            writer.woken() >= 1,
+            "the writer was woken {} times, and its poll_write has not seen the failure",
+            writer.woken()
+        );
+        assert!(matches!(
+            Pin::new(&mut lazy).poll_write(&mut wcx, b"payload"),
+            Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_flush_that_finishes_unannounced_wakes_the_writer_parked_behind_it() {
+        let (writer, writer_waker) = Count::waker();
+        let (_, reader_waker) = Count::waker();
+        let mut wcx = Context::from_waker(&writer_waker);
+        let mut rcx = Context::from_waker(&reader_waker);
+        // as in the test of the reader's pending flush: the head leaves, the
+        // reader waits on the flush it owes, and a later write parks behind it
+        let mut lazy = LazyHead::with_grace(
+            OneSlot::new(false, false),
+            b"HEAD|".to_vec(),
+            Duration::from_secs(30),
+        );
+        assert!(
+            Pin::new(&mut lazy)
+                .poll_write(&mut wcx, b"payload")
+                .is_pending()
+        );
+        let mut space = [0u8; 8];
+        let mut buf = ReadBuf::new(&mut space);
+        assert!(
+            Pin::new(&mut lazy)
+                .poll_read(&mut rcx, &mut buf)
+                .is_pending()
+        );
+        lazy.get_mut().write_open = true;
+        lazy.get_mut().wake_the_slot();
+        assert!(
+            Pin::new(&mut lazy)
+                .poll_read(&mut rcx, &mut buf)
+                .is_pending()
+        );
+        assert!(matches!(
+            Pin::new(&mut lazy).poll_write(&mut wcx, b"payload"),
+            Poll::Ready(Ok(7))
+        ));
+        lazy.get_mut().write_open = false;
+        assert!(
+            Pin::new(&mut lazy)
+                .poll_write(&mut wcx, b"more")
+                .is_pending()
+        );
+        let woken_before = writer.woken();
+        // both gates open, and nobody is told
+        lazy.get_mut().write_open = true;
+        lazy.get_mut().flush_open = true;
+        // the reader finishes its flush; there is still nothing to read
+        assert!(
+            Pin::new(&mut lazy)
+                .poll_read(&mut rcx, &mut buf)
+                .is_pending()
+        );
+        assert!(lazy.get_mut().flushes >= 1, "the flush was not finished");
+        assert!(
+            writer.woken() > woken_before,
+            "the writer waits on a write behind that flush and was woken {} times since",
+            writer.woken() - woken_before
+        );
+        assert!(matches!(
+            Pin::new(&mut lazy).poll_write(&mut wcx, b"more"),
+            Poll::Ready(Ok(4))
+        ));
+        assert_eq!(lazy.get_mut().taken, b"HEAD|payloadmore");
+    }
+
+    /// What the hung tests did, with a pipe for the stream: the halves of a
+    /// split stream in tasks of their own, the whole payload riding with the
+    /// head, and a pipe far too small for it. Like a socket's buffer, the
+    /// pipe keeps one write waker.
+    #[tokio::test]
+    async fn a_split_stream_whose_halves_run_in_two_tasks_gets_the_payload_through() {
+        const BOUND: Duration = Duration::from_secs(10);
+        let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let mut expected = b"HEAD|".to_vec();
+        expected.extend_from_slice(&payload);
+        let total = expected.len();
+
+        let (near, far) = tokio::io::duplex(8);
+        // a grace that never runs out: only the payload sends the head
+        let lazy = LazyHead::with_grace(near, b"HEAD|".to_vec(), Duration::from_secs(30));
+        let (mut rd, mut wr) = tokio::io::split(lazy);
+        // the tasks start in this order: the writer begins the head before
+        // the reader's first poll, and the peer drains after both
+        let writer = tokio::spawn(async move {
+            wr.write_all(&payload).await.unwrap();
+            wr.flush().await.unwrap();
+            wr
+        });
+        let reader = tokio::spawn(async move {
+            let mut back = vec![0u8; total];
+            rd.read_exact(&mut back).await.unwrap();
+            (rd, back)
+        });
+        // the peer reads in small pieces and echoes them back; it drains
+        // whatever the echo does, as the reader takes no answer before the
+        // head is out
+        let (mut far_rd, mut far_wr) = tokio::io::split(far);
+        let peer = tokio::spawn(async move {
+            let (queue, mut echoes) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            let drain = async move {
+                let mut small = [0u8; 3];
+                let mut seen = 0;
+                while seen < total {
+                    let n = far_rd.read(&mut small).await.unwrap();
+                    assert!(n > 0, "the stream ended after {seen} of {total} bytes");
+                    seen += n;
+                    queue.send(small[..n].to_vec()).unwrap();
+                }
+            };
+            let echo = async move {
+                while let Some(piece) = echoes.recv().await {
+                    far_wr.write_all(&piece).await.unwrap();
+                }
+                far_wr
+            };
+            tokio::join!(drain, echo).1
+        });
+
+        tokio::time::timeout(BOUND, writer)
+            .await
+            .expect("the writer did not finish within the bound")
+            .unwrap();
+        let (_, back) = tokio::time::timeout(BOUND, reader)
+            .await
+            .expect("the reader did not finish within the bound")
+            .unwrap();
+        assert!(back == expected, "the echo differs");
+        tokio::time::timeout(BOUND, peer)
+            .await
+            .expect("the peer did not finish within the bound")
+            .unwrap();
     }
 }
