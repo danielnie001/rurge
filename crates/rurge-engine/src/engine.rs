@@ -4,6 +4,7 @@
 use crate::auto::{EVALUATION_FAILED, resolve_ready};
 use crate::control::Mode;
 use crate::observe::{RequestLog, TrafficStats};
+use crate::owner::{LOOKUPS, NOT_IN_TIME, OwnerQuery, SLOW, SlotProcess, looked_up};
 use crate::runtime::Runtime;
 use crate::shared::EngineShared;
 use crate::state::StateStore;
@@ -13,11 +14,11 @@ use rurge_config::HostName;
 use rurge_config::NetworkFacts;
 use rurge_config::general::{General, UdpFallback};
 use rurge_config::rule::PolicyRef;
-use rurge_config::session::{ListenerKind, SessionInfo};
+use rurge_config::session::{ListenerKind, SessionInfo, Transport};
 use rurge_config::spec::{PolicySpec, ProtoSpec};
 use rurge_inbound::{
-    DialError, Dialed, Dialer, FailKind, HttpAuth, HttpListener, ListenerOpts, Running,
-    SessionHandle, SessionOutcome, Socks5Listener, UdpAdmission, UdpClient,
+    DialError, Dialed, Dialer, FailKind, HttpAuth, HttpListener, ListenerOpts, ProcessSlot,
+    Running, SessionHandle, SessionOutcome, Socks5Listener, UdpAdmission, UdpClient,
 };
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedDatagram, BoxedStream, ConnectOpts, Connector, Target};
@@ -170,6 +171,12 @@ pub struct Engine {
     udp_associations: std::sync::atomic::AtomicUsize,
     /// When a UDP limit was last warned about.
     udp_warned: std::sync::Mutex<Option<Instant>>,
+    /// The places for the lookups of processes that use a blocking thread
+    /// (`LOOKUPS`).
+    owner_permits: Arc<tokio::sync::Semaphore>,
+    /// The rules waited for a process and gave up, and the engine said so
+    /// (`SLOW`) — once.
+    process_wait_warned: AtomicBool,
 }
 
 impl Engine {
@@ -210,6 +217,8 @@ impl Engine {
             me: me.clone(),
             udp_associations: std::sync::atomic::AtomicUsize::new(0),
             udp_warned: std::sync::Mutex::new(None),
+            owner_permits: Arc::new(tokio::sync::Semaphore::new(LOOKUPS)),
+            process_wait_warned: AtomicBool::new(false),
         });
         let rt = engine.runtime();
         if let Some(pc) = rt.dns_pipeline() {
@@ -407,9 +416,55 @@ impl Engine {
         }
     }
 
+    /// A handle for a session whose process nobody looks for: rurge's own
+    /// sessions, the connectivity tests.
     pub(crate) fn new_handle(&self, session: SessionInfo) -> Arc<SessionHandle> {
+        self.new_handle_with(session, ProcessSlot::unknown())
+    }
+
+    /// Starts finding the process behind `session`, if it is one that can be
+    /// found: it came in through a proxy port, from an address that may be
+    /// this machine's (phase 3 M2 design 4.1, 4.2). The answer lands in the
+    /// slot, whenever the lookup ends; the slot is settled with no process
+    /// at once for a session that is not looked up.
+    pub(crate) fn look_up_owner(&self, session: &SessionInfo) -> ProcessSlot {
+        let Some(owners) = &self.shared.owners else {
+            return ProcessSlot::unknown();
+        };
+        // a source that is surely not this machine's has no process here
+        if !looked_up(session.listener) || owners.is_local(session.src.ip()) == Some(false) {
+            return ProcessSlot::unknown();
+        }
+        let launched = Instant::now();
+        let slot = ProcessSlot::pending_at(launched);
+        // The connection to look up is the client's own, a TCP one: a UDP
+        // association is looked up by its control connection (design 4.1).
+        // The task holds the lookup, the places and the slot — not the
+        // engine, and not the session.
+        tokio::spawn(crate::owner::find(
+            owners.clone(),
+            self.owner_permits.clone(),
+            slot.clone(),
+            OwnerQuery {
+                transport: Transport::Tcp,
+                local: session.src,
+                remote_port: Some(session.in_port),
+                since: launched,
+            },
+        ));
+        slot
+    }
+
+    /// `new_handle` for a session whose process is looked up: `process` is
+    /// the slot of that lookup (`look_up_owner`).
+    pub(crate) fn new_handle_with(
+        &self,
+        session: SessionInfo,
+        process: ProcessSlot,
+    ) -> Arc<SessionHandle> {
         let id = self.next_session.fetch_add(1, Ordering::Relaxed) + 1;
-        let handle = SessionHandle::new_with_token(id, session, self.sessions_root.child_token());
+        let handle =
+            SessionHandle::new_with_slot(id, session, self.sessions_root.child_token(), process);
         // Weak: the active index holds the handle and the handle holds this
         // hook, so a strong `Arc<Observe>` here would be a reference cycle.
         let observe = Arc::downgrade(&self.observe);
@@ -703,16 +758,27 @@ impl Engine {
             },
             Mode::Rule => {}
         }
+        let process = SlotProcess::new(handle.process());
         let decision = rt
             .rules
-            .evaluate(
+            .evaluate_with_process(
                 handle.session(),
                 OutboundMode::Rule,
                 rt.stack.resolver.as_ref(),
+                &process,
             )
             .await;
         if let Some(i) = decision.matched {
             handle.set_rule(rule_raw(&rt.rules, i));
+        }
+        if process.timed_out() {
+            // the rules went on without the process: the record says why a
+            // rule that names it did not match
+            handle.add_note(NOT_IN_TIME);
+            tracing::debug!(session = handle.id(), "{NOT_IN_TIME}");
+            if !self.process_wait_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!("{SLOW}");
+            }
         }
         if let Some(hit) = &decision.sub_rule {
             let note = format!("Sub-rule matched: {} (in {})", hit.entry, hit.set);
@@ -1453,7 +1519,8 @@ impl Dialer for Engine {
             // loaded once, together: the name is picked, approved and
             // resolved against the same generation
             let (rt, registry) = self.snapshot();
-            let handle = self.new_handle(session);
+            let process = self.look_up_owner(&session);
+            let handle = self.new_handle_with(session, process);
             let trail = handle.trail().clone();
             trail
                 .follow(self.connect_session(rt, registry, handle))

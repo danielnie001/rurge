@@ -5,6 +5,7 @@
 
 pub mod http;
 pub mod listener;
+mod process;
 pub mod responses;
 pub mod restrict;
 pub mod session;
@@ -15,6 +16,7 @@ mod udp;
 
 pub use http::HttpListener;
 pub use listener::{HttpAuth, ListenerOpts, Running};
+pub use process::ProcessSlot;
 pub use session::{
     Counting, DialError, Dialed, Dialer, FailKind, SessionHandle, SessionOutcome, UdpAdmission,
     UdpClient,

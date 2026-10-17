@@ -9,6 +9,7 @@ pub mod engine;
 mod external_resources;
 pub mod observe;
 pub mod outbounds;
+pub mod owner;
 pub mod profile;
 pub mod relay;
 mod reload;
@@ -27,8 +28,9 @@ pub use engine::{Engine, ListenerSpec, PoliciesView, REFUSED_STRICT, RuleView, U
 pub use external_resources::{ExternalResource, UnusedLines};
 pub use observe::{RecordStatus, RequestLog, RequestRecord, TrafficStats, TrafficTotals};
 pub use outbounds::{EngineFactory, dry_build, load_checked};
+pub use owner::{OwnerLookup, OwnerQuery};
 pub use runtime::{Runtime, RuntimeOptions};
-pub use rurge_inbound::Running;
+pub use rurge_inbound::{ProcessSlot, Running};
 pub use rurge_policy::EmptyGroup;
 pub use rurge_policy::testbook::TestResult;
 pub use shared::{EngineShared, ExternalPrograms, ResolverCell};

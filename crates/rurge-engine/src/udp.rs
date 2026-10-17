@@ -11,7 +11,7 @@ use rurge_config::policy::Builtin;
 use rurge_config::rule::{PolicyRef, ProtocolKind};
 use rurge_config::session::SessionInfo;
 use rurge_config::spec::Tristate;
-use rurge_inbound::{SessionHandle, SessionOutcome, UdpClient};
+use rurge_inbound::{ProcessSlot, SessionHandle, SessionOutcome, UdpClient};
 use rurge_net::connector::{ConnectOpts, PacketSocket, Target, lost_alone};
 use rurge_policy::TerminalKind;
 use rurge_policy::auto::SelectCtx;
@@ -339,6 +339,10 @@ impl Drop for Queued {
 struct Association {
     client: Arc<dyn UdpClient>,
     template: SessionInfo,
+    /// The process of the association's client, looked up once: its control
+    /// connection is the client's own socket, and every flow carries this
+    /// slot (phase 3 M2 design 4.1).
+    process: ProcessSlot,
     carriers: Carriers,
     /// Fires when the association ends: the flows finish.
     ended: CancellationToken,
@@ -354,9 +358,11 @@ pub(crate) async fn serve(
     closed: CancellationToken,
 ) {
     let (done, mut finished) = mpsc::unbounded_channel();
+    let process = engine.look_up_owner(&template);
     let association = Arc::new(Association {
         client: client.clone(),
         template,
+        process,
         carriers: Carriers::default(),
         ended: engine.session_token(),
         done,
@@ -431,7 +437,7 @@ async fn run_flow(
             ProtocolKind::Udp
         },
     );
-    let handle = engine.new_handle(session);
+    let handle = engine.new_handle_with(session, association.process.clone());
     let trail = handle.trail().clone();
     let opened = tokio::select! {
         _ = association.ended.cancelled() => Err(SessionOutcome::Completed),
@@ -941,6 +947,7 @@ mod tests {
         let association = Association {
             client: Arc::new(NoClient),
             template: session.clone(),
+            process: ProcessSlot::unknown(),
             carriers: Carriers::default(),
             ended: CancellationToken::new(),
             done: mpsc::unbounded_channel().0,

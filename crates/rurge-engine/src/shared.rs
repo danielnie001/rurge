@@ -1,5 +1,6 @@
 //! What outlives a config generation (M1 design 6.2, 6.3; M2 design 7.2).
 
+use crate::owner::OwnerLookup;
 use arc_swap::ArcSwapOption;
 use rurge_config::{NetworkCell, NetworkFacts};
 use rurge_net::BoxFuture;
@@ -137,6 +138,11 @@ pub struct EngineShared {
     /// stores what they read off the machine; once there is an engine,
     /// `Engine::network_changed` does, and tells the generation in use.
     pub network: Arc<NetworkCell>,
+    /// What finds the process behind a session that comes in through a proxy
+    /// port (phase 3 M2 design 4). `None` looks nothing up: the default, and
+    /// what every test that is not about processes uses; `rurge run` puts
+    /// the platform's here.
+    pub owners: Option<Arc<dyn OwnerLookup>>,
 }
 
 impl EngineShared {
@@ -151,6 +157,7 @@ impl EngineShared {
             processes: Arc::new(NoProcessGroups),
             externals: Arc::new(ExternalPrograms::default()),
             network: Arc::new(NetworkCell::new(NetworkFacts::default())),
+            owners: None,
         }
     }
 }

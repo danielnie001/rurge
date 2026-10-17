@@ -1,5 +1,6 @@
 //! The seam between listeners and the engine (M3 design §6.1).
 
+use crate::process::ProcessSlot;
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::SessionInfo;
 use rurge_net::BoxFuture;
@@ -55,6 +56,9 @@ pub struct SessionHandle {
     on_finish: Mutex<Vec<FinishHook>>,
     token: CancellationToken,
     killed: AtomicBool,
+    /// The process behind the session, once the lookup the engine started
+    /// for it has found it (or found none).
+    process: ProcessSlot,
 }
 
 impl SessionHandle {
@@ -62,10 +66,24 @@ impl SessionHandle {
         SessionHandle::new_with_token(id, session, CancellationToken::new())
     }
 
+    /// A handle for a session whose process nobody looks for: its slot is
+    /// settled with no process.
     pub fn new_with_token(
         id: u64,
         session: SessionInfo,
         token: CancellationToken,
+    ) -> Arc<SessionHandle> {
+        SessionHandle::new_with_slot(id, session, token, ProcessSlot::unknown())
+    }
+
+    /// A handle whose process is looked for: `process` is settled by the
+    /// lookup, and shared with whatever else started from the same one (the
+    /// flows of a UDP association).
+    pub fn new_with_slot(
+        id: u64,
+        session: SessionInfo,
+        token: CancellationToken,
+        process: ProcessSlot,
     ) -> Arc<SessionHandle> {
         Arc::new(SessionHandle {
             id,
@@ -90,6 +108,7 @@ impl SessionHandle {
             on_finish: Mutex::new(Vec::new()),
             token,
             killed: AtomicBool::new(false),
+            process,
         })
     }
 
@@ -114,6 +133,13 @@ impl SessionHandle {
 
     pub fn session(&self) -> &SessionInfo {
         &self.session
+    }
+
+    /// The process behind the session. Whoever needs it waits on the slot
+    /// (`ProcessSlot::settled_by`); the request record reads it whenever it
+    /// is read.
+    pub fn process(&self) -> &ProcessSlot {
+        &self.process
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -614,6 +640,30 @@ mod tests {
         // cancelling the parent also cancels a plain handle's token
         let h2 = SessionHandle::new(1, SessionInfo::tcp(HostName::parse("b.test"), 80));
         assert!(!h2.token().is_cancelled());
+    }
+
+    /// A handle carries the slot it was made with — what settles it later is
+    /// seen through the handle — and, made without one, a slot that is
+    /// settled with no process.
+    #[test]
+    fn a_handle_carries_the_process_slot_it_was_given() {
+        let session = || SessionInfo::tcp(HostName::parse("a.test"), 80);
+        for plain in [
+            SessionHandle::new(1, session()),
+            SessionHandle::new_with_token(2, session(), CancellationToken::new()),
+        ] {
+            assert_eq!(plain.process().get(), Some(&None));
+            assert_eq!(plain.process().launched(), None);
+        }
+        let slot = ProcessSlot::pending();
+        let h = SessionHandle::new_with_slot(3, session(), CancellationToken::new(), slot.clone());
+        assert_eq!(h.process().get(), None, "not settled yet");
+        slot.settle(Some(rurge_config::session::ProcessInfo {
+            pid: Some(7),
+            name: "app".into(),
+            path: None,
+        }));
+        assert_eq!(h.process().found().and_then(|p| p.pid), Some(7));
     }
 
     #[test]

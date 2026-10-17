@@ -4,7 +4,7 @@
 
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::{ListenerKind, Transport};
-use rurge_inbound::{SessionHandle, SessionOutcome};
+use rurge_inbound::{ProcessSlot, SessionHandle, SessionOutcome};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,6 +33,9 @@ pub struct RequestRecord {
     /// The port of the listener the session came in on; `0` for a session
     /// rurge started itself, which came in on none.
     pub listen_port: u16,
+    /// The process behind the session. Read when the record is read, not
+    /// when it is made: a process found after the session ended is there.
+    pub process: ProcessSlot,
     pub dst: String,
     /// Where the TCP connection the session's own dial made went: the first
     /// hop when the policy chains. `None` when the dial made none — the
@@ -95,6 +98,7 @@ fn record_of(h: &SessionHandle, outcome: Option<&SessionOutcome>) -> RequestReco
         transport: s.transport,
         src: s.src,
         listen_port: s.in_port,
+        process: h.process().clone(),
         dst: format!("{}:{}", s.dst_host, s.dst_port),
         remote_addr: match s.transport {
             Transport::Tcp => h.trail().peer(),

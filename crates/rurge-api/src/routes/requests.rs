@@ -48,6 +48,11 @@ pub struct RequestJson {
     pub transport: &'static str,
     pub src: String,
     pub listen_port: Option<u16>,
+    /// The process behind the session; `null` when it is not known (not from
+    /// this machine, rurge's own, or not found yet), and the path alone is
+    /// `null` for a process known by its name only.
+    pub pid: Option<u32>,
+    pub process_path: Option<String>,
     pub dst: String,
     pub remote_addr: Option<String>,
     pub rule: Option<String>,
@@ -86,6 +91,8 @@ impl From<&RequestRecord> for RequestJson {
             // `0` is no port: a session rurge started itself came in on no
             // listener
             listen_port: (r.listen_port != 0).then_some(r.listen_port),
+            pid: r.process.found().and_then(|p| p.pid),
+            process_path: r.process.found().and_then(|p| p.path.clone()),
             dst: r.dst.clone(),
             remote_addr: r.remote_addr.map(|a| a.to_string()),
             rule: r.rule.clone(),
@@ -185,7 +192,8 @@ pub async fn kill(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rurge_engine::RecordStatus;
+    use rurge_config::session::ProcessInfo;
+    use rurge_engine::{ProcessSlot, RecordStatus};
 
     fn record(id: u64, listener: ListenerKind) -> RequestRecord {
         RequestRecord {
@@ -194,6 +202,7 @@ mod tests {
             transport: Transport::Tcp,
             src: "127.0.0.1:1".parse().unwrap(),
             listen_port: 6152,
+            process: ProcessSlot::unknown(),
             dst: "1.1.1.1:443".into(),
             remote_addr: None,
             rule: None,
@@ -224,6 +233,11 @@ mod tests {
             transport: Transport::Udp,
             src: "127.0.0.1:51234".parse().unwrap(),
             listen_port: 6153,
+            process: ProcessSlot::known(ProcessInfo {
+                pid: Some(4321),
+                name: "app.exe".into(),
+                path: Some("C:\\Apps\\app.exe".into()),
+            }),
             dst: "example.com:443".into(),
             remote_addr: Some("127.0.0.1:8443".parse().unwrap()),
             rule: Some("DOMAIN-SUFFIX,example.com,Proxy".into()),
@@ -249,6 +263,8 @@ mod tests {
                 "transport": "udp",
                 "src": "127.0.0.1:51234",
                 "listenPort": 6153,
+                "pid": 4321,
+                "processPath": "C:\\Apps\\app.exe",
                 "dst": "example.com:443",
                 "remoteAddr": "127.0.0.1:8443",
                 "rule": "DOMAIN-SUFFIX,example.com,Proxy",
@@ -268,6 +284,48 @@ mod tests {
                 "notes": ["a note"],
             })
         );
+    }
+
+    /// The process is `null` twice over when it is not known — a session
+    /// nobody looked up, one whose lookup is still under way — and the path
+    /// alone is `null` for a process known by its name only.
+    #[test]
+    fn a_record_without_a_process_sends_nulls() {
+        let mut r = record(1, ListenerKind::Http);
+        for slot in [ProcessSlot::unknown(), ProcessSlot::pending()] {
+            r.process = slot;
+            let v = serde_json::to_value(RequestJson::from(&r)).unwrap();
+            assert_eq!(v["pid"], Value::Null);
+            assert_eq!(v["processPath"], Value::Null);
+        }
+        // a lookup that found nothing is no process either
+        let found_none = ProcessSlot::pending();
+        found_none.settle(None);
+        r.process = found_none;
+        let v = serde_json::to_value(RequestJson::from(&r)).unwrap();
+        assert_eq!((&v["pid"], &v["processPath"]), (&Value::Null, &Value::Null));
+        // known by its name only (a `comm` on Linux, `System` on Windows)
+        r.process = ProcessSlot::known(ProcessInfo {
+            pid: Some(7),
+            name: "app".into(),
+            path: None,
+        });
+        let v = serde_json::to_value(RequestJson::from(&r)).unwrap();
+        assert_eq!(v["pid"], 7);
+        assert_eq!(v["processPath"], Value::Null);
+        // found after the record was made: the record shows it when it is read
+        let late = ProcessSlot::pending();
+        r.process = late.clone();
+        let v = serde_json::to_value(RequestJson::from(&r)).unwrap();
+        assert_eq!(v["pid"], Value::Null);
+        late.settle(Some(ProcessInfo {
+            pid: Some(9),
+            name: "app".into(),
+            path: Some("/usr/bin/app".into()),
+        }));
+        let v = serde_json::to_value(RequestJson::from(&r)).unwrap();
+        assert_eq!(v["pid"], 9);
+        assert_eq!(v["processPath"], "/usr/bin/app");
     }
 
     #[test]
