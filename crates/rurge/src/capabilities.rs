@@ -10,7 +10,8 @@
 //! HTTP/3 (phase 2 M7c), `select` groups, `url-test` / `fallback` /
 //! `load-balance` groups (phase 2 M3b), `smart` groups (phase 2 M3c), and
 //! `subnet` groups and `SUBNET` rules, which look at the network the engine
-//! is told it is on (phase 3 M1).
+//! is told it is on (phase 3 M1), and `PROCESS-NAME` rules, which are matched
+//! against the process a session comes from (phase 3 M2).
 
 use rurge_config::config::Capabilities;
 use rurge_config::policy::{GroupKind, PolicyKind};
@@ -22,8 +23,7 @@ use std::collections::HashSet;
 /// (`W0016`): a profile that asks for 20 gets the same here either way.
 pub const CORE_VERSION: u64 = 22;
 
-const INACTIVE_RULE_TYPES: [&str; 6] = [
-    "PROCESS-NAME",
+const INACTIVE_RULE_TYPES: [&str; 5] = [
     "SCRIPT",
     "DEVICE-NAME",
     "MAC-ADDRESS",

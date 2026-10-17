@@ -2,7 +2,7 @@
 
 use super::network;
 use super::rule::{parse_mode, print_diagnostics};
-use super::runtime::{PlatformProcesses, RuntimeArgs};
+use super::runtime::{PlatformOwners, PlatformProcesses, RuntimeArgs, owners_backend};
 use super::switch;
 use super::sysproxy::{SystemProxyManager, describe, proxy_settings};
 use crate::capabilities;
@@ -1260,6 +1260,19 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::from(2));
         }
     };
+    // Whether the processes behind the sessions are looked up is a matter of a
+    // variable too, and a value that names nothing ends a start as an unknown
+    // network backend does: a typo must not make a start look at the machine's
+    // own processes.
+    let look_up_processes =
+        match owners_backend(std::env::var_os("RURGE_PROCESS_BACKEND").as_deref()) {
+            Ok(on) => on,
+            Err(e) => {
+                eprintln!("error: {e}");
+                recover_without_a_log(&args.runtime);
+                return Ok(ExitCode::from(2));
+            }
+        };
     let platform = args.platform.unwrap_or_else(Platform::current);
     let data_dir = args.runtime.data_dir();
     let mut opts = LoadOptions {
@@ -1377,6 +1390,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             shared.empty_group = EmptyGroup::Reject;
         }
         shared.processes = Arc::new(PlatformProcesses);
+        if look_up_processes {
+            shared.owners = Some(Arc::new(PlatformOwners::new()));
+        }
         // The network before the first generation, which is built on it: its
         // `subnet` groups and `SUBNET` rules look at it from the first
         // session on, and the DNS `[SSID Setting]` sets for it is the DNS of

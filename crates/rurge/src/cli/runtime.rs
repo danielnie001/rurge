@@ -6,11 +6,14 @@
 use super::switch;
 use anyhow::Context;
 use clap::Args;
+use rurge_config::session::{ProcessInfo, Transport};
 use rurge_config::{Config, NetworkFacts};
 use rurge_dns::cache::DEFAULT_CAPACITY;
 use rurge_dns::system::SystemDns;
+use rurge_engine::{OwnerLookup, OwnerQuery};
 use rurge_net::BoxFuture;
 use rurge_rules::GeoUrls;
+use std::ffi::OsStr;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -281,6 +284,69 @@ impl rurge_proto::external::ProcessHook for PlatformProcesses {
     }
 }
 
+/// `rurge-platform::procinfo` behind the `OwnerLookup` trait (AR-02): the
+/// process that owns the socket a session came from, found in the tables the
+/// system keeps. `rurge-platform` knows no other crate of rurge, so what is
+/// asked and what is found are translated here.
+#[derive(Default)]
+pub struct PlatformOwners(rurge_platform::procinfo::Finder);
+
+impl PlatformOwners {
+    pub fn new() -> PlatformOwners {
+        PlatformOwners::default()
+    }
+}
+
+/// The question of the engine, as the platform is asked it.
+fn platform_query(query: &OwnerQuery) -> rurge_platform::procinfo::Query {
+    rurge_platform::procinfo::Query {
+        protocol: match query.transport {
+            Transport::Tcp => rurge_platform::procinfo::Protocol::Tcp,
+            Transport::Udp => rurge_platform::procinfo::Protocol::Udp,
+        },
+        local: query.local,
+        remote_port: query.remote_port,
+        since: query.since,
+    }
+}
+
+/// What the platform found, as the engine knows a process: its PID is known.
+fn process_info(owner: rurge_platform::procinfo::Owner) -> ProcessInfo {
+    ProcessInfo {
+        pid: Some(owner.pid),
+        name: owner.name,
+        path: owner.path,
+    }
+}
+
+impl OwnerLookup for PlatformOwners {
+    fn is_local(&self, ip: IpAddr) -> Option<bool> {
+        self.0.is_local(ip)
+    }
+
+    fn owner(&self, query: &OwnerQuery) -> Option<ProcessInfo> {
+        self.0.owner(&platform_query(query)).map(process_info)
+    }
+}
+
+/// Whether the processes behind the sessions are looked up, as
+/// `RURGE_PROCESS_BACKEND` says: in the machine's own tables when it is not
+/// set, not at all when it says `off`. The variable is for automated tests,
+/// so that the daemons they start do not read the tables of the machine for
+/// sessions that are not about processes. A value that names nothing is an
+/// error, and never the machine's lookup — as a `RURGE_NETWORK_BACKEND` that
+/// names nothing is never the machine's network.
+pub fn owners_backend(value: Option<&OsStr>) -> Result<bool, String> {
+    match value {
+        None => Ok(true),
+        Some(value) if value == "off" => Ok(false),
+        Some(value) => Err(format!(
+            "unknown RURGE_PROCESS_BACKEND value `{}` (expected off)",
+            value.to_string_lossy()
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,5 +506,88 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    /// `RURGE_PROCESS_BACKEND` is not set, or it says `off`. Nothing else
+    /// names a backend, and a value that does not is an error and never the
+    /// machine's own lookup: a typo in a test must not make a start look at
+    /// the real processes. Only the exact word counts, and a value that is
+    /// not text is written the way it reads as text.
+    #[test]
+    fn the_process_backend_values() {
+        let backend = |value: &str| owners_backend(Some(OsStr::new(value)));
+
+        assert_eq!(owners_backend(None), Ok(true), "not set: the machine's own");
+        assert_eq!(backend("off"), Ok(false));
+        for value in ["OFF", "Off", "off ", "on", "bogus", ""] {
+            assert_eq!(
+                backend(value),
+                Err(format!(
+                    "unknown RURGE_PROCESS_BACKEND value `{value}` (expected off)"
+                )),
+                "{value:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        let not_text = {
+            use std::os::unix::ffi::OsStrExt;
+            OsStr::from_bytes(b"of\xff").to_os_string()
+        };
+        #[cfg(windows)]
+        let not_text = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0x6f, 0x66, 0xd800])
+        };
+        assert_eq!(
+            owners_backend(Some(&not_text)),
+            Err("unknown RURGE_PROCESS_BACKEND value `of\u{fffd}` (expected off)".to_string())
+        );
+    }
+
+    /// The engine's question reaches the platform as it was asked, for either
+    /// table and with or without the port the client connected to, and what
+    /// the platform finds is the engine's answer with the process's PID. A
+    /// process the platform could only name has no path.
+    #[test]
+    fn the_owner_lookup_asks_as_it_was_asked_and_answers_with_the_pid() {
+        use rurge_platform::procinfo::{Owner, Protocol};
+
+        let since = std::time::Instant::now();
+        let local: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        for (transport, protocol) in [
+            (Transport::Tcp, Protocol::Tcp),
+            (Transport::Udp, Protocol::Udp),
+        ] {
+            for remote_port in [Some(7890), None] {
+                let asked = platform_query(&OwnerQuery {
+                    transport,
+                    local,
+                    remote_port,
+                    since,
+                });
+                assert_eq!(asked.protocol, protocol, "{transport:?}");
+                assert_eq!(asked.local, local);
+                assert_eq!(asked.remote_port, remote_port);
+                assert_eq!(asked.since, since);
+            }
+        }
+
+        let described = process_info(Owner {
+            pid: 4321,
+            name: "app.exe".to_string(),
+            path: Some("C:\\Apps\\app.exe".to_string()),
+        });
+        assert_eq!(described.pid, Some(4321));
+        assert_eq!(described.name, "app.exe");
+        assert_eq!(described.path.as_deref(), Some("C:\\Apps\\app.exe"));
+        let named = process_info(Owner {
+            pid: 4,
+            name: "System".to_string(),
+            path: None,
+        });
+        assert_eq!(named.pid, Some(4));
+        assert_eq!(named.name, "System");
+        assert_eq!(named.path, None);
     }
 }

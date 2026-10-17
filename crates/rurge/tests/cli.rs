@@ -39,20 +39,31 @@ fn unknown_network() -> (&'static str, String) {
 }
 
 /// `rurge` for a test that runs it to the end and looks at what it said.
+///
+/// A start does not look up the processes of its sessions
+/// (`RURGE_PROCESS_BACKEND=off`): without that, every test that starts a
+/// daemon would have the machine's own tables read for the sessions it makes,
+/// with the blocking threads and the lines of log that come with it, whether
+/// the test is about processes or not. A test that wants the real lookup
+/// removes the variable after the constructor
+/// (`env_remove("RURGE_PROCESS_BACKEND")`).
 fn rurge_command() -> Command {
     let mut cmd = Command::cargo_bin("rurge").unwrap();
     cmd.envs(default_directories())
         .envs([unknown_network()])
+        .env("RURGE_PROCESS_BACKEND", "off")
         .env_remove("RURGE_DATA_DIR")
         .env_remove("RURGE_LOG_FILE");
     cmd
 }
 
-/// `rurge` for a test that starts it as a process of its own.
+/// `rurge` for a test that starts it as a process of its own; it does not
+/// look up processes either, as `rurge_command` explains.
 fn rurge_process() -> std::process::Command {
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("rurge"));
     cmd.envs(default_directories())
         .envs([unknown_network()])
+        .env("RURGE_PROCESS_BACKEND", "off")
         .env_remove("RURGE_DATA_DIR")
         .env_remove("RURGE_LOG_FILE");
     cmd
@@ -337,6 +348,33 @@ fn check_does_not_say_a_subnet_rule_never_matches() {
         .clone();
     let out = String::from_utf8_lossy(&out);
     assert!(!out.contains("SUBNET"), "{out}");
+    assert!(out.contains("`DEVICE-NAME` rules never match"), "{out}");
+    assert!(out.contains("0 error(s), 1 warning(s)"), "{out}");
+}
+
+/// A `PROCESS-NAME` rule is matched against the process behind the session
+/// (phase 3 M2), so `check` does not say it never matches (`W0013`), written
+/// as a name or as a path; a type that is still not matched is said as before.
+#[test]
+fn check_does_not_say_a_process_rule_never_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write(
+        &dir,
+        "process.conf",
+        "[Rule]\nPROCESS-NAME,curl,DIRECT\nPROCESS-NAME,C:\\Program Files\\App\\app.exe,DIRECT\nDEVICE-NAME,Kids-iPad,DIRECT\nFINAL,DIRECT\n",
+    );
+    let out = rurge_command()
+        .args(["check", "--data-dir"])
+        .arg(dir.path().join("data"))
+        .arg("-c")
+        .arg(&conf)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8_lossy(&out);
+    assert!(!out.contains("PROCESS-NAME"), "{out}");
     assert!(out.contains("`DEVICE-NAME` rules never match"), "{out}");
     assert!(out.contains("0 error(s), 1 warning(s)"), "{out}");
 }
@@ -7905,6 +7943,277 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
                     !help.contains("network-backend") && !help.contains("NETWORK_BACKEND"),
                     "{command:?}: {help}"
                 );
+            }
+        }
+    }
+
+    /// The daemon and the processes behind its sessions (phase 3 M2). The
+    /// constructors start a daemon that looks no process up, and the one test
+    /// here that is about the lookup takes that away. The client whose
+    /// process is found is then this very test: it connects to the proxy port
+    /// over the loopback, and the daemon finds the socket in the machine's
+    /// own table, which it only reads. Every host the profile names is pinned
+    /// to the loopback and every port is that of a server of the test, so a
+    /// request that no rule turns back stays on the loopback.
+    mod processes {
+        use super::*;
+        use rurge_engine::owner::NOT_IN_TIME;
+        use serde_json::Value;
+        use std::path::PathBuf;
+
+        /// This test binary, as the daemon finds it. On Windows the path as
+        /// the system gives it: a `canonicalize` adds a `\\?\` prefix, which
+        /// a rule reads as a UNC path, so it would no longer be this path.
+        /// Elsewhere both sides are the canonical path.
+        fn this_executable() -> PathBuf {
+            let exe = std::env::current_exe().unwrap();
+            if cfg!(windows) {
+                exe
+            } else {
+                exe.canonicalize().unwrap()
+            }
+        }
+
+        /// Whether two paths are the same: without regard to the case of an
+        /// ASCII letter on Windows, which is how the rules compare them
+        /// there, byte for byte elsewhere.
+        fn same_path(a: &str, b: &str) -> bool {
+            if cfg!(windows) {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        }
+
+        /// The finished requests of the daemon, the newest first.
+        fn recent(api: u16) -> Vec<Value> {
+            let (status, body) = api_call(api, "GET", "/v1/requests/recent", "k", None);
+            assert_eq!(status, 200, "{body}");
+            let listed: Value =
+                serde_json::from_str(&body).unwrap_or_else(|e| panic!("not JSON ({e}): {body}"));
+            listed["requests"].as_array().unwrap().clone()
+        }
+
+        /// The finished requests that were made to `host`, the newest first.
+        fn records_for(api: u16, host: &str) -> Vec<Value> {
+            let prefix = format!("{host}:");
+            recent(api)
+                .into_iter()
+                .filter(|record| {
+                    record["dst"]
+                        .as_str()
+                        .is_some_and(|dst| dst.starts_with(&prefix))
+                })
+                .collect()
+        }
+
+        /// A `RURGE_PROCESS_BACKEND` that rurge does not know never becomes
+        /// the machine's lookup: a typo in a test would read the real
+        /// processes. The start ends before it binds a port, with the
+        /// sentence and 2.
+        #[test]
+        fn an_unknown_process_backend_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let conf = write_conf(dir.path(), API_GENERAL);
+            let mut cmd = rurge_run(&conf, &dir.path().join("data"));
+            cmd.env("RURGE_PROCESS_BACKEND", "bogus")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = cmd.spawn().unwrap();
+            let lines = forward_lines(child.stdout.take().unwrap());
+            let errors = forward_lines(child.stderr.take().unwrap());
+            // owned from here on, so that a start which does not end is killed
+            let mut daemon = Daemon {
+                child,
+                http: 0,
+                socks: 0,
+                lines,
+            };
+            assert_eq!(
+                wait_for_exit(&mut daemon, 20),
+                Some(2),
+                "the start should have ended with 2 (a start that went on is stopped)"
+            );
+            let said = drained(&errors);
+            let printed = drained(&daemon.lines);
+            assert!(
+                said.iter().any(|line| line
+                    == "error: unknown RURGE_PROCESS_BACKEND value `bogus` (expected off)"),
+                "{said:#?}"
+            );
+            assert!(
+                !said
+                    .iter()
+                    .chain(&printed)
+                    .any(|line| line.contains("listening on")),
+                "it listened: {printed:#?} {said:#?}"
+            );
+        }
+
+        /// With the lookup off, which is what the constructors set, no
+        /// session has a process: a rule that names the client does not
+        /// match it, and the record shows none. The client is this test,
+        /// whose file name is in the rule.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_process_backend_off_looks_nothing_up() {
+            let target = TestServer::spawn().await;
+            target.set("/hello", "hi from target");
+            let port = target.url("/").port().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let conf = dir.path().join("t.conf");
+            let name = this_executable()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            std::fs::write(
+                &conf,
+                format!(
+                    "[General]\n{API_GENERAL}\n[Proxy]\n[Rule]\nPROCESS-NAME,{name},REJECT\nFINAL,DIRECT\n"
+                ),
+            )
+            .unwrap();
+            let data = dir.path().join("data");
+            let daemon = tokio::task::spawn_blocking(move || spawn_daemon(&conf, &data))
+                .await
+                .unwrap();
+            let (http, api) = (daemon.http, api_port(&daemon));
+            let (answer, recorded) = tokio::task::spawn_blocking(move || {
+                let answer = http_get(http, &format!("http://127.0.0.1:{port}/hello"));
+                wait_until("the request to be recorded", || !recent(api).is_empty());
+                (answer, recent(api))
+            })
+            .await
+            .unwrap();
+            assert!(
+                answer.starts_with("HTTP/1.1 200") && answer.ends_with("hi from target"),
+                "{answer}"
+            );
+            assert_eq!(recorded.len(), 1, "{recorded:#?}");
+            assert_eq!(recorded[0]["rule"], "FINAL,DIRECT", "{:#}", recorded[0]);
+            assert_eq!(recorded[0]["pid"], Value::Null, "{:#}", recorded[0]);
+            assert_eq!(recorded[0]["processPath"], Value::Null, "{:#}", recorded[0]);
+        }
+
+        /// The client is this test, and the daemon finds it: a `PROCESS-NAME`
+        /// rule written as the file name of this binary, as its full path and
+        /// as its directory turns back the request to the host that goes with
+        /// it, and the record of each names this process and its path. This is
+        /// the one test that has the daemon look at the machine's own socket
+        /// tables, which it only reads.
+        ///
+        /// A lookup that takes longer than the 200 ms the rules wait for is
+        /// not a failure of what is tested but of a machine that is busy, as
+        /// it can be under the whole suite. The record says so in a note, and
+        /// that request alone is made again, three times at most; a request
+        /// that was not turned back for any other reason fails at once.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_process_rule_matches_the_test_process() {
+            let target = TestServer::spawn().await;
+            target.set("/hello", "hi from target");
+            let port = target.url("/").port().unwrap();
+            let exe = this_executable();
+            let name = exe.file_name().unwrap().to_str().unwrap().to_string();
+            let path = exe.to_str().unwrap().to_string();
+            let directory = format!(
+                "{}{}",
+                exe.parent().unwrap().to_str().unwrap(),
+                std::path::MAIN_SEPARATOR
+            );
+            for text in [&name, &path, &directory] {
+                assert!(
+                    !text.contains([',', '(', ')', '#', '"', '\'']),
+                    "a rule cannot carry this binary's path: {text}"
+                );
+            }
+            let rules = [
+                (
+                    "a.test",
+                    format!("AND,((PROCESS-NAME,{name}),(DOMAIN,a.test)),REJECT"),
+                ),
+                (
+                    "b.test",
+                    format!("AND,((PROCESS-NAME,{path}),(DOMAIN,b.test)),REJECT"),
+                ),
+                (
+                    "c.test",
+                    format!("AND,((PROCESS-NAME,{directory}),(DOMAIN,c.test)),REJECT"),
+                ),
+            ];
+            let dir = tempfile::tempdir().unwrap();
+            let conf = dir.path().join("t.conf");
+            let mut profile = format!("[General]\n{API_GENERAL}\n[Proxy]\n[Rule]\n");
+            for (_, rule) in &rules {
+                profile.push_str(&format!("{rule}\n"));
+            }
+            profile.push_str("FINAL,DIRECT\n[Host]\nwarm.test = 127.0.0.1\n");
+            for (host, _) in &rules {
+                profile.push_str(&format!("{host} = 127.0.0.1\n"));
+            }
+            std::fs::write(&conf, profile).unwrap();
+            let data = dir.path().join("data");
+            let daemon = tokio::task::spawn_blocking(move || {
+                let mut cmd = rurge_run(&conf, &data);
+                // the lookup is what is tried here
+                cmd.env_remove("RURGE_PROCESS_BACKEND");
+                spawn_command(cmd)
+            })
+            .await
+            .unwrap();
+            let (http, api) = (daemon.http, api_port(&daemon));
+            let again = tokio::task::spawn_blocking(move || {
+                let ask = |host: &str| http_get(http, &format!("http://{host}:{port}/hello"));
+                // the first lookup of a daemon is the first read of the tables
+                // of the machine, and the slowest: a request to a host that no
+                // rule is about pays for it
+                let warm = ask("warm.test");
+                assert!(
+                    warm.starts_with("HTTP/1.1 200") && warm.ends_with("hi from target"),
+                    "{warm}"
+                );
+                let mut again = 0;
+                for (host, rule) in &rules {
+                    let mut retries = 0;
+                    loop {
+                        let before = records_for(api, host).len();
+                        let answer = ask(host);
+                        wait_until("the request to be recorded", || {
+                            records_for(api, host).len() > before
+                        });
+                        let record = records_for(api, host).remove(0);
+                        if record["status"] == "rejected" && record["rule"] == rule.as_str() {
+                            assert_eq!(
+                                record["pid"].as_u64(),
+                                Some(u64::from(std::process::id())),
+                                "{host}: {record:#}"
+                            );
+                            let recorded = record["processPath"].as_str().unwrap_or_default();
+                            assert!(
+                                same_path(recorded, &path),
+                                "{host}: the record names {recorded:?}, this binary is {path:?}"
+                            );
+                            break;
+                        }
+                        let late = record["notes"]
+                            .as_array()
+                            .is_some_and(|notes| notes.iter().any(|note| note == NOT_IN_TIME));
+                        if late && retries < 3 {
+                            retries += 1;
+                            again += 1;
+                            continue;
+                        }
+                        panic!(
+                            "the request to {host} was not turned back by `{rule}` (the answer was {answer:?}): {record:#}"
+                        );
+                    }
+                }
+                again
+            })
+            .await
+            .unwrap();
+            if again > 0 {
+                println!("{again} request(s) made again because the lookup was late");
             }
         }
     }
