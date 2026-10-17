@@ -5,6 +5,7 @@ pub mod dirs;
 pub mod dns;
 pub mod netenv;
 pub mod process;
+pub mod procinfo;
 pub mod service;
 pub mod socket;
 pub mod sysinfo;
