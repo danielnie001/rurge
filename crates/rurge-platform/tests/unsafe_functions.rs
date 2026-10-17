@@ -2,7 +2,9 @@
 //! it has to make, one function at a time, with `#[allow(unsafe_code)]`. This
 //! test reads the crate's own source and holds those functions to a list: one
 //! more, one less, or the attribute on anything that is not a function, is a
-//! failure.
+//! failure. So is a line that names `unsafe_code` outside a `//` comment and is
+//! not that attribute on a line of its own, which is how an attribute broken
+//! over several lines would otherwise go unseen.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -70,15 +72,22 @@ fn rust_files(dir: &Path, found: &mut Vec<PathBuf>) {
 }
 
 /// The names of the functions in `text` that carry `#[allow(unsafe_code)]`.
-/// `Err` says which line mentions the lint in a way that is not that: the
-/// attribute written otherwise (an inner one, one inside `cfg_attr`, one with
-/// other lints in it), or on something other than a function.
+///
+/// A line is read as code up to a `//`, and what follows is a comment. A line
+/// whose code names `unsafe_code` has to be, trimmed, exactly
+/// `#[allow(unsafe_code)]`, and that attribute labels the function after it.
+/// `Err` says which line is not that: the attribute written otherwise (an
+/// inner one, one inside `cfg_attr`, one with other lints in it, one over
+/// several lines, whatever else is on the line with it), or on something other
+/// than a function. A block comment or a string that names the lint is refused
+/// like any other line: a mention goes in a `//` comment.
 fn exceptions(text: &str) -> Result<Vec<String>, String> {
     let lines: Vec<&str> = text.lines().map(str::trim).collect();
     let mut names = Vec::new();
     for (at, line) in lines.iter().enumerate() {
         let number = at + 1;
-        if !is_attribute(line) || !line.contains("unsafe_code") {
+        let code = line.split_once("//").map_or(*line, |(code, _)| code);
+        if !code.contains("unsafe_code") {
             continue;
         }
         if *line != "#[allow(unsafe_code)]" {
@@ -160,11 +169,48 @@ fn every_visibility_is_accepted() {
 fn text_that_does_not_mention_the_lint_has_no_exceptions() {
     let text = "\
 // #[allow(unsafe_code)] in a comment
-let note = \"unsafe_code\";
+/// and in a doc comment: #[allow(unsafe_code)]
+//! and in an inner one: unsafe_code
+let note = 1; // unsafe_code, after code
 #[allow(dead_code)]
 fn f() {}
 ";
     assert_eq!(exceptions(text), Ok(Vec::new()));
+}
+
+#[test]
+fn a_line_that_names_the_lint_and_is_not_the_attribute_is_refused() {
+    // What rustfmt makes of an attribute with a long list of lints: the lint
+    // is on a line that does not begin with `#[`. That line is the one
+    // reported.
+    let several_lines = [
+        (
+            "fn before() {}\n\n#[allow(\n    unsafe_code,\n    dead_code,\n)]\nfn f() {}\n",
+            4,
+        ),
+        (
+            "#[allow(\n    dead_code,\n    unsafe_code,\n)]\nfn f() {}\n",
+            3,
+        ),
+        ("#[allow(\n    unsafe_code\n)]\nfn f() {}\n", 2),
+    ];
+    for (text, line) in several_lines {
+        let problem = exceptions(text).unwrap_err();
+        assert!(
+            problem.starts_with(&format!("line {line}: ")) && problem.contains("is not exactly"),
+            "{text:?}: {problem}"
+        );
+    }
+    // Any line that names it outside a `//` comment is refused, whatever it
+    // is: a string, or the text of a block comment.
+    for line in ["let note = \"unsafe_code\";", "/* #[allow(unsafe_code)] */"] {
+        let text = format!("fn before() {{}}\n{line}\n#[allow(unsafe_code)]\nfn f() {{}}\n");
+        let problem = exceptions(&text).unwrap_err();
+        assert!(
+            problem.starts_with("line 2: ") && problem.contains("is not exactly"),
+            "{line}: {problem}"
+        );
+    }
 }
 
 #[test]

@@ -72,15 +72,23 @@ const PATH_BYTES: usize = nix::libc::PROC_PIDPATHINFO_MAXSIZE as usize;
 /// than an `xinpgen` (the one that ends the table), when fewer than 8 bytes are
 /// left, and at an item that runs past the end of `buf`.
 ///
-/// A record is an `XSO_INPCB` item and the `XSO_SOCKET` item that follows it;
-/// items of other kinds are skipped. The `XSO_INPCB` item has the foreign port
-/// at offset 16, the local port at 18, `inp_vflag` at 44, and the foreign and
-/// the local address, 16 bytes each, at 48 and 64. When `INP_IPV4` is set the
-/// addresses are IPv4 ones, the last four bytes of the 16 (at 60 and 76); when
-/// it is not and `INP_IPV6` is, they are IPv6 ones; a record with neither is
-/// not used. The `XSO_SOCKET` item has `so_last_pid` at offset 68: the process
-/// that last used the socket. An item too short to hold what is read makes its
-/// record not used.
+/// A record is an `XSO_INPCB` item and the `XSO_SOCKET` item directly after
+/// it. When the item after a pcb item is of any other kind (another pcb item
+/// included), the pcb item has no socket item and is not used, and a socket
+/// item that does not directly follow a pcb item belongs to no record. The
+/// kernel writes the other items (the buffers, the statistics and, for TCP, the
+/// control block) after the socket item, where they are skipped. A socket item
+/// is not paired with the latest pcb item whatever lies between: in a layout
+/// that put it before its pcb item, that would give every pcb the socket of the
+/// next record, and nothing would say so.
+///
+/// The `XSO_INPCB` item has the foreign port at offset 16, the local port at 18,
+/// `inp_vflag` at 44, and the foreign and the local address, 16 bytes each, at
+/// 48 and 64. When `INP_IPV4` is set the addresses are IPv4 ones, the last four
+/// bytes of the 16 (at 60 and 76); when it is not and `INP_IPV6` is, they are
+/// IPv6 ones; a record with neither is not used. The `XSO_SOCKET` item has
+/// `so_last_pid` at offset 68: the process that last used the socket. An item
+/// too short to hold what is read makes its record not used.
 ///
 /// A table that has items and not one record whose two items are long enough
 /// is not laid out the way this reads it (`Layout`); one without items is
@@ -98,7 +106,7 @@ fn walk(buf: &[u8], udp: bool) -> Result<Vec<Row>, ReadError> {
         match kind {
             XSO_INPCB => open = item.first_chunk(),
             XSO_SOCKET => {
-                // the socket item ends the record the latest pcb item began
+                // the socket item directly after a pcb item ends its record
                 let (Some(pcb), Some(socket)) = (open.take(), item.first_chunk::<SOCKET_READ>())
                 else {
                     continue;
@@ -107,7 +115,8 @@ fn walk(buf: &[u8], udp: bool) -> Result<Vec<Row>, ReadError> {
                 let pid = u32::from_le_bytes([socket[68], socket[69], socket[70], socket[71]]);
                 rows.extend(row_of(pcb, pid, udp));
             }
-            _ => {}
+            // any other item closes the record: its socket item is not coming
+            _ => open = None,
         }
     }
     if walked && !complete {
@@ -532,10 +541,9 @@ mod tests {
         let bytes = table(&[
             item(0x4, 64),
             inpcb(136, 0x1, "127.0.0.1:1", "10.0.0.9:80"),
-            // what the kernel writes between the two items of a record, and
-            // after them
-            item(0x2, 48),
             xsocket(96, 10),
+            // what the kernel writes after the two items of a record
+            item(0x2, 48),
             item(0x4, 48),
             item(0x8, 104),
             item(0x20, 232),
@@ -694,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn a_socket_item_belongs_to_the_record_the_latest_pcb_item_began() {
+    fn a_socket_item_belongs_to_the_pcb_item_just_before_it() {
         let a = inpcb(80, 0x1, "127.0.0.1:1", "10.0.0.9:80");
         let b = inpcb(80, 0x1, "127.0.0.1:2", "10.0.0.9:80");
         let cases = [
@@ -713,10 +721,20 @@ mod tests {
                 vec![a.clone(), b.clone(), xsocket(72, 8)],
                 vec![row("127.0.0.1:2", Some("10.0.0.9:80"), 8)],
             ),
-            // other items between the two
+            // other items between the two: no record, and the socket item is
+            // not taken for the pcb item before the others (the record after
+            // them is there so that what there is to say of a table with no
+            // record at all does not come into it)
             (
-                vec![a.clone(), item(0x2, 48), item(0x4, 48), xsocket(72, 9)],
-                vec![row("127.0.0.1:1", Some("10.0.0.9:80"), 9)],
+                vec![
+                    a.clone(),
+                    item(0x2, 48),
+                    item(0x4, 48),
+                    xsocket(72, 9),
+                    b.clone(),
+                    xsocket(72, 10),
+                ],
+                vec![row("127.0.0.1:2", Some("10.0.0.9:80"), 10)],
             ),
         ];
         for (parts, rows) in cases {
@@ -727,6 +745,7 @@ mod tests {
     #[test]
     fn no_complete_record_among_the_items_is_a_layout_that_is_not_known() {
         let pcb = inpcb(80, 0x1, "127.0.0.1:1", "10.0.0.9:80");
+        let other = inpcb(80, 0x1, "127.0.0.1:2", "10.0.0.9:80");
         // the socket item runs past the end of what there is
         let cut = [xinpgen(0), pcb.clone(), item(0x1, 96)[..40].to_vec()].concat();
         assert_eq!(walk(&cut, false), Err(ReadError::Layout));
@@ -742,6 +761,18 @@ mod tests {
             // an item too short
             vec![padded(item(0x10, 72)), xsocket(72, 5)],
             vec![pcb.clone(), item(0x1, 64)],
+            // a layout in which each record has its socket item first, then
+            // its pcb item, then a buffer: no socket item is directly after a
+            // pcb item, and none is taken for the pcb item of the record
+            // before it
+            vec![
+                xsocket(72, 5),
+                pcb.clone(),
+                item(0x2, 48),
+                xsocket(72, 6),
+                other.clone(),
+                item(0x2, 48),
+            ],
         ];
         for parts in cases {
             assert_eq!(walk(&table(&parts), true), Err(ReadError::Layout));
@@ -1050,7 +1081,13 @@ mod tests {
 
         #[test]
         fn a_process_that_does_not_exist_is_not_described() {
-            assert_eq!(Tables.describe(u32::MAX), None);
+            // u32::MAX is not asked of the system, for no process id is so
+            // big (`pid_path` stops at it); i32::MAX is the biggest id the
+            // call takes, and no process has it, so the system is asked and
+            // says no: the failing call is made
+            for pid in [u32::MAX, i32::MAX as u32] {
+                assert_eq!(Tables.describe(pid), None, "process {pid}");
+            }
         }
     }
 }

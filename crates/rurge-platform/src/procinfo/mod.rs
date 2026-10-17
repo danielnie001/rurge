@@ -1173,14 +1173,18 @@ mod tests {
         // table with the address in its mapped form.
         let mapped = tcp("[::ffff:127.0.0.1]:50000", "[::ffff:127.0.0.1]:7890", 100);
         let query = tcp_query(CLIENT, PROXY_PORT, Instant::now());
-        assert_eq!(lookup(vec![mapped.clone()], query), Some(100));
+        assert_eq!(lookup(vec![mapped], query), Some(100));
 
         // and the other way round
         let mapped_query = tcp_query("[::ffff:127.0.0.1]:50000", PROXY_PORT, Instant::now());
         assert_eq!(lookup(vec![client_row(100)], mapped_query), Some(100));
 
-        // the IPv4 table is read first: the first row of the source wins
-        let rows = vec![client_row(100), mapped.clone()];
+        // the IPv4 table is read first: the first row of the source wins, and
+        // the two rows are of two processes so that the answer says which
+        let rows = vec![
+            client_row(100),
+            tcp("[::ffff:127.0.0.1]:50000", "[::ffff:127.0.0.1]:7890", 200),
+        ];
         assert_eq!(lookup(rows, query), Some(100));
         let rows = vec![
             tcp("[::ffff:127.0.0.1]:50000", "[::ffff:127.0.0.1]:7890", 200),

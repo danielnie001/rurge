@@ -105,8 +105,9 @@ mod windows {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
     /// A Job Object that ends every process in it when its last handle
-    /// closes, with process `pid` in it. The workspace's second `unsafe`
-    /// (M4-D6): nothing but the four calls, on handles this function owns.
+    /// closes, with process `pid` in it. One of the functions on the list in
+    /// `tests/unsafe_functions.rs` that may use `unsafe` (M4-D6): nothing but
+    /// the four calls, on handles this function owns.
     #[allow(unsafe_code)]
     pub(super) fn job_for(pid: u32) -> io::Result<OwnedHandle> {
         use windows_sys::Win32::System::JobObjects::{

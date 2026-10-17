@@ -8094,6 +8094,14 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             assert_eq!(recorded[0]["rule"], "FINAL,DIRECT", "{:#}", recorded[0]);
             assert_eq!(recorded[0]["pid"], Value::Null, "{:#}", recorded[0]);
             assert_eq!(recorded[0]["processPath"], Value::Null, "{:#}", recorded[0]);
+            // no lookup was started: one that is on and late leaves its note
+            // on the record, and with none the process is settled at once
+            assert_eq!(
+                recorded[0]["notes"],
+                serde_json::json!([]),
+                "{:#}",
+                recorded[0]
+            );
         }
 
         /// The client is this test, and the daemon finds it: a `PROCESS-NAME`

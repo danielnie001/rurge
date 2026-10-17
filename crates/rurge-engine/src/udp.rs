@@ -488,11 +488,13 @@ async fn open(
     handle: &Arc<SessionHandle>,
     to: &Target,
 ) -> Result<(Arc<Flow>, Arc<Carrier>, Target), SessionOutcome> {
-    // Refused before anything is asked of the rules, a lookup or a `smart`
+    // Refused before anything is asked of the rules, a name lookup or a `smart`
     // group, and as a failure, not a rejection: a failed flow is tried again
     // after `RETRY_AFTER`, so it is served as soon as the suspension ends,
     // where a rejected one stays until its client has been quiet for
-    // `FLOW_IDLE`.
+    // `FLOW_IDLE`. The lookup of the association's process, which `serve`
+    // started with the association, is left to finish: the record of a refused
+    // flow still names its process.
     if engine.is_suspended() {
         return Err(failed(handle, REFUSED_STRICT));
     }

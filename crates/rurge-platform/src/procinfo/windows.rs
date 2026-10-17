@@ -51,8 +51,9 @@ fn parse_tcp4(table: &[u8]) -> Vec<Row> {
 
 /// `MIB_TCP6ROW_OWNER_PID`: local address 0, local scope id 16, local port 20,
 /// remote address 24, remote scope id 40, remote port 44, state 48, process
-/// 52. The scope id is not part of the address: a socket address that has one
-/// would not be equal to the one a session comes from.
+/// 52. The scope id is not read: the `Finder` compares an address and a port
+/// through `endpoint`, which leaves the scope id out, so a row that kept it
+/// would be found no differently (`the_scope_id_is_not_compared` pins that).
 #[cfg_attr(not(any(windows, test)), allow(dead_code))] // read on Windows only
 fn parse_tcp6(table: &[u8]) -> Vec<Row> {
     rows(table, TCP6_ROW)
