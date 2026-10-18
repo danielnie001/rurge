@@ -105,11 +105,14 @@
        pub fn set_filter(&self, filter: impl FnMut(Direction, &mut Vec<u8>) -> bool + Send + 'static);
        /// Packets the stack took in and gave out so far (B2 reads it).
        pub fn packets(&self) -> (u64, u64);
+       /// Ends the driver now and drops the AppEnd (the memory device then fails);
+       /// open `AppTcp`s fail with `ConnectionAborted`.
+       pub fn close(&self);
    }
    pub struct AppTcp; // AsyncRead + AsyncWrite + Unpin + Send
    impl AppTcp { pub fn local(&self) -> SocketAddr; /// Sends a reset now. pub fn abort(&mut self); }
    ```
-   `AppTcp` 的读写规矩与 `TunStream` 相同（计划期决定 P12、P13）：对端的 FIN 读空之后读是 `Ok(0)`；smoltcp 照着做了的 RST 之后读写是 `ConnectionReset`；`poll_flush` 立刻返回；`poll_shutdown` 是 `close()`、立刻返回；没 `shutdown` 就丢掉是 `abort()`。
+   `AppTcp` 的读写规矩与 `TunStream` 相同（计划期决定 P12、P13）：对端的 FIN 读空之后读是 `Ok(0)`；smoltcp 照着做了的 RST 之后读写是 `ConnectionReset`；`poll_flush` 立刻返回；`poll_shutdown` 是 `close()`、立刻返回；没 `shutdown` 就丢掉是 `abort()`。`AppTcp` 被丢掉之后，驱动在套接字到了 `TimeWait`，或到了 `Closed` 且 `remote_endpoint()` 是 `None`（`abort()` 的那一个 RST 已经发出去，smoltcp `tcp.rs` 第 2537 ～ 2540 行）时把它从套接字集里拿掉、端口可以再用——夹具不守 TIME-WAIT 的 10 秒；不拿掉的话任务 7 一条接一条的 2000 条连接会在应用一侧攒下 2000 个各带 320 KiB 缓冲的套接字。
 5. `src/testing/dialer.rs`：
    ```rust
    pub enum Script {
@@ -142,7 +145,7 @@
    impl Dialer for FakeDialer { /* dial, relay */ }
    ```
    没写的目的地答 `Failed { kind: Connect, message: "not scripted" }`；`dial` 建 `SessionHandle::new(id, session)`（`id` 从 1 递增），拒绝与失败先 `handle.finish(Rejected(kind) / Failed(message))` 再答；`relay` 是 `tokio::io::copy_bidirectional_with_sizes(&mut client, &mut upstream, 8192, 8192)`（与引擎的 `BUF` 相同的两块 8 KiB，B1 的"转发循环的替身"），结束时 `handle.finish(Completed / Failed(..))` 并记进 `relay_ends`。
-6. `src/testing/servers.rs`：`pub fn pattern(i: u64) -> u8`（`(i % 251) as u8`，用例逐字节比对用）；`Upstream`（绑 `127.0.0.1:0`、接任意多条连接、丢掉时结束它的任务）：`Upstream::echo().await`（读多少回多少，读到 EOF 后关写端）、`Upstream::sink().await`（读并计数：`received(&self) -> u64`、`wait_for(&self, bytes: u64, within: Duration) -> bool`）、`Upstream::source(bytes: u64).await`（写 `bytes` 个 `pattern` 字节后关写端）；`addr(&self) -> SocketAddr`。
+6. `src/testing/servers.rs`：`pub fn pattern(i: u64) -> u8`（`(i % 251) as u8`，用例逐字节比对用）；`Upstream`（绑 `127.0.0.1:0`、接任意多条连接、丢掉时结束它的任务）：`Upstream::echo().await`（读多少回多少，读到 EOF 后关写端）、`Upstream::sink().await`（读并计数：`received(&self) -> u64`、`wait_for(&self, bytes: u64, within: Duration) -> bool`）、`Upstream::source(bytes: u64).await`（写 `bytes` 个 `pattern` 字节后关写端；`sent(&self) -> u64` 是已经写出的字节数，任务 7 用）；`addr(&self) -> SocketAddr`。
 
 **接口**
 
@@ -157,6 +160,7 @@
 - `a_memory_device_fails_once_its_app_end_is_gone`：丢掉 `AppEnd` → `recv` 与 `send` 都是 `BrokenPipe`；`an_app_end_sees_its_device_gone`：丢掉 `MemoryDevice` → `recv` 是 `None`、`send` 是 `BrokenPipe`；`a_memory_device_keeps_order_and_waits_for_room`：`recv` 至多给 `max` 个、次序不变；容量 1 时第二个 `send` 在应用端取走之前不完成（"什么都没发生"的有界等待，50 毫秒）。
 - `the_fake_dialer_answers_what_it_was_told`：`Upstream(echo)` 拨通并转发；`Reject(kind)` 答 `DialError::Reject` 带那个 `kind`；`Fail` 与没写的目的地答 `Failed`；`dialed()` 依次列出。
 - `a_held_upstream_reads_only_once_released`：经 `Script::Hold { buffer: 1024 }` 写 4 KiB → `release` 之前 `received` 是 0（50 毫秒的有界等待），之后 5 秒内到 4096。
+- `closing_an_app_stack_fails_its_device`：`close()` 之后 `MemoryDevice::recv` 是 `BrokenPipe`，开着的 `AppTcp` 读是 `ConnectionAborted`。
 - `the_fake_dialer_dials_only_the_loopback`（`#[should_panic]`）：`script(dst, Script::Upstream("192.0.2.1:80"))`。
 
 **判据**：用例绿；门禁绿；`git diff Cargo.lock` 只有 `rurge-tun` 这一项。
@@ -175,7 +179,7 @@
    - 片的任务：等进片的队列（`recv_many`）、`TunStream` 的踢（`tokio::sync::Notify`）、`poll_delay` 的定时与停止；醒来后在锁里：**先推进一次发送**（`poll_egress` 一遍：上一次放锁之后 `TunStream` 读走了数据的话，窗口更新先于新收的包发出去——零窗口之后对端带一个字节的探测段若赶在窗口更新之前进了协议栈，smoltcp 会收下它、在下一次推进时 panic，设计第 5.3 节 H2；任务 6 的守卫兜底），再至多 `INGRESS_PER_WAKE`（256）个包逐个推进，然后 `poll_egress` 反复到返回 `PollResult::None` 或做满 `EGRESS_PASSES`（64）次，取出发的一侧，算下一次的定时；放锁之后把这一批交给写任务（队列满了等，不拿着锁等）；做满了任一个界限就 `yield_now` 之后接着做。
    - 推进一个包：四元组在 `by_tuple` 里 → 放进 `ShardDevice`、`poll_ingress_single`；不在、且只带 SYN 不带 ACK → 新的 SYN（下一条）；其余也交给 smoltcp（它对游离段回 RST）。
    - 新的 SYN（这一任务只做设计第 5.2 节的第 5 步，第 1 ～ 3 步在任务 5）：按预算分配两块缓冲（`budget.rs`：接收 = clamp(剩余 ÷ `DIVISOR`, `buffer_min`, `RX_MAX`)，发送 = clamp(剩余 ÷ `DIVISOR`, `buffer_min`, `tx_max`)，`DIVISOR` = 32，剩余 = `budget` − 全部套接字的缓冲之和、饱和为 0；全局一个 `AtomicUsize`）；`tcp::Socket::new`，关 Nagle，`set_keep_alive(None)`，`set_timeout(Some(120 s))`，`CongestionControl::Reno`，ACK 延迟取缺省；`listen(IpListenEndpoint { addr: Some(目的地址), port: 目的端口 })`（出错就丢掉这个 SYN、还回预算）；加进 `sockets`、推进这个包；推进之后不在 `SynReceived` 就拿掉、还回预算；在的建 `Conn`（连接号 `ConnId` 是全局递增的 `u64`；`by_tuple` 与 `conns` 各一项）并起会话的任务。
-   - 拿掉套接字（这一任务只拿掉 smoltcp 报 `Closed` 或 `TimeWait` 的；片醒来时看本轮碰过的连接，另每秒扫一遍全片）：删两张表的项、还回预算、`ConnShared` 记下结局并唤醒等着它的读写。
+   - 拿掉套接字（这一任务只拿掉 smoltcp 报 `Closed` 或 `TimeWait` 的，`abort()` 过的要等到 `remote_endpoint()` 成了 `None`——它的 RST 已经发出，见任务 7 第 2 点；片醒来时看本轮碰过的连接，另每秒扫一遍全片）：删两张表的项、还回预算、`ConnShared` 记下结局并唤醒等着它的读写。
 6. `src/tcp/stream.rs`：`TunStream`（`AsyncRead + AsyncWrite + Unpin + Send`，持有片的 `Arc`、`ConnId` 与 `Arc<ConnShared>`）：每次读写先按连接号在 `conns` 里找——找不到就照 `ConnShared` 记下的结局答（P12）；读：`recv_slice`，没有数据而 `may_recv` 时登记接收 waker（smoltcp 的一份、`ConnShared` 里一份，拿掉连接时由后者唤醒）、`Pending`，FIN 读空之后 `Ok(0)`；写：`send_slice`，满了登记发送 waker；`poll_flush` 立刻 `Ok`（P13）；`poll_shutdown`：`close()`、立刻 `Ok`；读写之后踢这一片。`pub(crate) async fn established(&self) -> io::Result<()>`：到 `Established` 时 `Ok`，在那之前就结束了是 `ConnectionReset`。`Drop`：这一任务里一律 `abort()`（细的规矩在任务 7）。
 7. `src/session.rs`：会话的任务：`established()` → `SessionInfo { src: 应用的地址与端口, in_port: 0, listener: ListenerKind::Tun, ..SessionInfo::tcp(HostName::Ip(目的地址), 目的端口) }`（`SessionInfo` 还没有 `local` 字段，M3b 加）→ `dialer.dial` → 拨通：`dialer.relay(Box::new(stream), dialed.stream, dialed.handle)`（`Dialed.forward` 不用）；`Reject` 与 `Failed`：丢掉 `TunStream`（RST；`REJECT-DROP` 的拿着在任务 8）。
 
@@ -275,7 +279,7 @@
 
 **改哪里**
 
-1. `src/packet.rs`：`pub(crate) fn classify(packet: &[u8], ipv6: bool) -> Result<Parsed, Reason>`，`Parsed` 带地址族、源与目的地址、协议与传输层的要素（TCP：端口、标志、序号、确认号、首部长度、负载长度；UDP：端口；ICMP：类型），`Reason` 是丢弃的原因（`Counters` 的字段名一一对应）。依次检查（第一条成立的决定；P10）：
+1. `src/packet.rs`：`pub(crate) fn classify(packet: &[u8], ipv6: bool) -> Result<Parsed, Reason>`，`Parsed` 带地址族、源与目的地址、协议与传输层的要素（TCP：端口、标志、序号、确认号、首部长度、负载长度；UDP：端口；ICMP：类型），`Reason` 是丢弃的原因（十种，与 `Counters` 里 `stack_panics` 之外的十个字段一一对应、同名；`icmp_limited` 在 M3a 里还没有谁用到）。依次检查（第一条成立的决定；P10）：
 
    | 检查 | 原因 |
    | ---- | ---- |
@@ -299,7 +303,7 @@
 
 - `classify` 的纯用例，表的每一行一条：`a_bad_version_or_header_is_malformed`、`ipv6_off_is_unsupported`、`fragments_are_dropped`、`martians_are_dropped`（未指定、回环、组播、广播、映射的各一）、`extension_headers_and_other_protocols_are_unsupported`、`truncated_transport_headers_and_port_0_are_malformed`、`icmp_other_than_echo_is_unsupported`、`the_checks_run_in_order`（发往组播地址的 IPv4 分片计 `fragment`，`ipv6` 关着时 IPv6 的分片计 `unsupported`）、`trailing_bytes_after_the_ip_packet_are_ignored`。
 - 经 TUN（`AppStack::inject`）：`a_syn_from_the_unspecified_address_is_dropped`（H1：smoltcp 收下它会在发 SYN-ACK 时 panic）、`a_short_ipv4_header_is_dropped`（H4）、`a_bad_packet_harms_nothing`（每种坏包各注入一次 → 各自的计数各 1，应用一侧什么也没收到，之后一条正常的连接照常往返）、`ipv6_off_serves_ipv4_only`（`ipv6: false`：IPv6 的 SYN 计 `unsupported`、得不到回应，IPv4 照常）、`udp_and_icmp_are_not_handled_yet`。
-- `each_reason_warns_once`（`src/tests/log_capture.rs` 照 `crates/rurge-engine/tests/common/log_capture.rs` 写一份；当前线程的运行时）：每种原因两个包 → 每种恰好一行 WARN（`martian` 没有），第二个是 DEBUG；WARN 的行里没有 `192.0.2.`、`198.18.`、`2001:db8:`、`fd00:`。
+- `each_reason_warns_once`（`src/tests/log_capture.rs` 照 `crates/rurge-engine/tests/common/log_capture.rs` 写一份；当前线程的运行时）：`malformed`、`fragment`、`martian`、`unsupported` 各两个包 → `martian` 之外每种恰好一行 WARN、第二个是 DEBUG，`martian` 什么也不写；WARN 的行里没有 `192.0.2.`、`198.18.`、`2001:db8:`、`fd00:`。`each_reason_is_first_once`：`Warnings::first_time` 的纯用例，十种原因里 `martian` 之外的九种各自第一次是 `true`、之后是 `false`。
 
 **判据**：用例绿；门禁绿。
 
@@ -359,7 +363,7 @@
 - `a_window_probe_into_a_full_buffer_is_dropped`：同上停在窗口 0；注入这个四元组的一个段：序号是 TUN 最近一次的确认号（零窗口的边缘）、确认号是 TUN 的下一个序号、负载 1 个字节（Windows 与 BSD 的协议栈的零窗口探测段就是这样；smoltcp 作发送方不发探测段，所以由用例构造）→ `beyond_window` 1、`stack_panics` 0；`release` 之后 1 MiB 照样到齐。
 - `a_probe_after_a_read_is_inside_the_new_window`：片一级的用例（用例自己推进这一片）：接收缓冲满、TUN 已通告窗口 0；读走 1 KiB（`TunStream` 的读，不经转发），下一次唤醒里的第一个包是上一条那样的探测段 → 发出的包里一个窗口不为 0 的 ACK 排在探测段被推进之前，探测段在新窗口之内、被收下；`beyond_window` 0、`stack_panics` 0（去掉任务 2 的"先推进一次发送"时这一条变红）。
 - `a_panicking_shard_resets_its_connections_and_recovers`（`shards: 1`）：连接 A 建好；注入 A 的、负载以 `PANIC_MARKER` 开头的段 → `stack_panics` 1；A 的转发结束（`relay_ends()` 多一项错误）；之后新开的连接 B 照常往返；WARN 恰好一行、带 `shard=0`、不含标记的文字，DEBUG 里有它（日志捕获）。
-- `a_poisoned_shard_is_rebuilt`（`shards: 1`）：上游（`Script::Memory`）发出以 `PANIC_MARKER` 开头的数据 → 转发往 `TunStream` 写时 panic、锁中毒 → 片下一次拿锁时重建：`stack_panics` 1，同片的另一条连接以 `ConnectionReset` 结束，新连接照常。
+- `a_poisoned_shard_is_rebuilt`（`shards: 1`）：上游（用例自己在回环上起的服务器，经 `Script::Upstream`）发出以 `PANIC_MARKER` 开头的数据 → 转发往 `TunStream` 写时 panic、锁中毒 → 片下一次拿锁时重建：`stack_panics` 1，同片的另一条连接以 `ConnectionReset` 结束，新连接照常。
 - 基准复跑：B1 在缺省设置、MTU 1500 下再跑一遍（release），`beyond_window` 是 0、两个方向不低于任务 3 记下的数的 90%，数字写进报告。
 
 **判据**：用例绿；门禁绿；基准复跑的结论在报告里。
@@ -369,7 +373,7 @@
 **改哪里**（`src/tcp/stream.rs`、`src/tcp/shard.rs`）
 
 1. `TunStream` 被丢掉：没有 `shutdown`、或应用还可能发（`may_recv`）、或还有没读的数据（`recv_queue() > 0`）→ `abort()`（RST）；否则不动它（`poll_shutdown` 已经排了 FIN），记下丢掉的时刻。
-2. 拿掉套接字：smoltcp 报 `Closed` 或 `TimeWait`；或流被丢掉之后过了 `linger`（那时先 `abort()`）——片醒来时看本轮碰过的连接，另每秒扫一遍全片。拿掉时删两张表的项与它的边缘、还回预算、半开的照任务 5 减、唤醒等待者。
+2. 拿掉套接字：smoltcp 报 `Closed` 或 `TimeWait`；或流被丢掉之后过了 `linger`（那时先 `abort()`）；`abort()` 过的套接字（这里的 `linger`、第 1 点的丢掉、任务 8 的拒绝）要等它的 RST 发了出去——`Closed` 且 `remote_endpoint()` 是 `None`（smoltcp `tcp.rs` 第 2537 ～ 2540 行：发出那一个 RST 之后才忘掉四元组）——才拿掉，否则应用收不到 RST（片重建时整个套接字集一起丢掉，不在此列，见任务 6）——片醒来时看本轮碰过的连接，另每秒扫一遍全片。拿掉时删两张表的项与它的边缘、还回预算、半开的照任务 5 减、唤醒等待者。
 3. 结局（P12）：应用的 FIN 读空之后读是 `Ok(0)`；应用的 RST（smoltcp 照着做了：这个段之后套接字从别的状态变成 `Closed`、段带 RST）之后读写都是 `ConnectionReset`；连接因别的缘故被拿掉（重建、`linger`、停止）之后同样 `ConnectionReset`；应用关了接收方向之后的写是 `BrokenPipe`。
 
 **接口**
@@ -406,7 +410,7 @@
 - `the_other_rejections_reset`（`drop_hold: 10 s`）：`Reject`、`NoDrop`、`TinyGif` 各一条 → 1 秒之内 `ConnectionReset`。
 - `stop_during_a_drop_hold_ends_it`（`drop_hold: 30 s`）：拿着的时候 `stop()` → `join()` 5 秒之内答 `Stopped`。
 - `stop_resets_every_open_connection`：3 条空闲的连接 → `stop()` → 每条在应用一侧都是 `ConnectionReset`；`join()` 5 秒之内答 `Stopped`；`relay_ends()` 3 项。
-- `a_device_that_fails_ends_the_tun`：开着 2 条连接时丢掉 `AppStack`（连同 `AppEnd`）→ `join()` 5 秒之内答 `DeviceFailed(_)`；`relay_ends()` 2 项；WARN 恰好一行（日志捕获，当前线程的运行时）。
+- `a_device_that_fails_ends_the_tun`：开着 2 条连接时 `AppStack::close()`（丢掉 `AppEnd`）→ `join()` 5 秒之内答 `DeviceFailed(_)`；`relay_ends()` 2 项；WARN 恰好一行（日志捕获，当前线程的运行时）。
 - `join_answers_the_same_again`：两次 `join()` 答同样的 `Ending`。
 
 **判据**：用例绿（计时的循环跑二十次）；门禁绿。
