@@ -92,6 +92,8 @@
        pub fn start_with(end: AppEnd, addresses: &[IpCidr]) -> AppStack;
        /// From the next free port of `dst`'s family (49152 up); resolves once established.
        /// `ConnectionRefused` when the SYN is answered with a reset, `TimedOut` after 5 s.
+       /// Once the SYN-ACK is taken the connect has succeeded, as on a real system: a reset
+       /// right after it shows on the first read or write (`ConnectionReset`).
        pub async fn connect(&self, dst: SocketAddr) -> io::Result<AppTcp>;
        pub async fn connect_from(&self, port: u16, dst: SocketAddr) -> io::Result<AppTcp>;
        /// Listens on `local` at once (before the future is first polled) and resolves
@@ -162,6 +164,7 @@
 - `the_fake_dialer_answers_what_it_was_told`：`Upstream(echo)` 拨通并转发；`Reject(kind)` 答 `DialError::Reject` 带那个 `kind`；`Fail` 与没写的目的地答 `Failed`；`dialed()` 依次列出。
 - `a_held_upstream_reads_only_once_released`：经 `Script::Hold { buffer: 1024 }` 写 4 KiB → `release` 之前 `received` 是 0（50 毫秒的有界等待），之后 5 秒内到 4096。
 - `closing_an_app_stack_fails_its_device`：`close()` 之后 `MemoryDevice::recv` 是 `BrokenPipe`，开着的 `AppTcp` 读是 `ConnectionAborted`。
+- `a_reset_right_after_the_handshake_fails_the_first_read`（执行期修正记录第 4 行）：应用端 `connect` 发出 SYN，用例从内存设备的另一端读到它，回一个 SYN-ACK、紧跟一个 RST（同一次 `send`；用例跑在当前线程的运行时上，驱动收下这两个包之前 `connect` 的任务不会被轮询）→ `connect` 是 `Ok`，第一次读是 `ConnectionReset`（只看套接字的终态就会答 `ConnectionRefused`）。
 - `the_fake_dialer_dials_only_the_loopback`（`#[should_panic]`）：`script(dst, Script::Upstream("192.0.2.1:80"))`。
 
 **判据**：用例绿；门禁绿；`git diff Cargo.lock` 只有 `rurge-tun` 这一项。
@@ -179,9 +182,9 @@
    - 接口：`Config::new(HardwareAddress::Ip)`，`random_seed` 每片各取一次 `getrandom`（同 WireGuard 栈的 `random_u64`），`set_any_ip(true)`，地址 `198.18.0.253/32` 与 `fd00:6152::fd/128`，各一条经它的缺省路由（设计第 4.2 节）；时钟以 TUN 启动时的 `std::time::Instant` 为零点（同 WireGuard 栈的 `at`），不用 smoltcp 的 `Instant::now()`。
    - 片的任务：等进片的队列（`recv_many`）、`TunStream` 的踢（`tokio::sync::Notify`）、`poll_delay` 的定时与停止；醒来后在锁里：**先推进一次发送**（`poll_egress` 一遍：上一次放锁之后 `TunStream` 读走了数据的话，窗口更新先于新收的包发出去——零窗口之后对端带一个字节的探测段若赶在窗口更新之前进了协议栈，smoltcp 会收下它、在下一次推进时 panic，设计第 5.3 节 H2；任务 6 的守卫兜底），再至多 `INGRESS_PER_WAKE`（256）个包逐个推进，然后 `poll_egress` 反复到返回 `PollResult::None` 或做满 `EGRESS_PASSES`（64）次，取出发的一侧，算下一次的定时；放锁之后把这一批交给写任务（队列满了等，不拿着锁等）；做满了任一个界限就 `yield_now` 之后接着做。
    - 推进一个包：四元组在 `by_tuple` 里 → 放进 `ShardDevice`、`poll_ingress_single`；不在、且只带 SYN 不带 ACK → 新的 SYN（下一条）；其余也交给 smoltcp（它对游离段回 RST）。
-   - 新的 SYN（这一任务只做设计第 5.2 节的第 5 步，第 1 ～ 3 步在任务 5）：按预算分配两块缓冲（`budget.rs`：接收 = clamp(剩余 ÷ `DIVISOR`, `buffer_min`, `RX_MAX`)，发送 = clamp(剩余 ÷ `DIVISOR`, `buffer_min`, `tx_max`)，`DIVISOR` = 32，剩余 = `budget` − 全部套接字的缓冲之和、饱和为 0；全局一个 `AtomicUsize`）；`tcp::Socket::new`，关 Nagle，`set_keep_alive(None)`，`set_timeout(Some(120 s))`，`CongestionControl::Reno`，ACK 延迟取缺省；`listen(IpListenEndpoint { addr: Some(目的地址), port: 目的端口 })`（出错就丢掉这个 SYN、还回预算）；加进 `sockets`、推进这个包；推进之后不在 `SynReceived` 就拿掉、还回预算；在的建 `Conn`（连接号 `ConnId` 是全局递增的 `u64`；`by_tuple` 与 `conns` 各一项）并起会话的任务。
+   - 新的 SYN（这一任务只做设计第 5.2 节的第 5 步，第 1 ～ 3 步在任务 5）：按预算分配两块缓冲（`budget.rs`：接收 = clamp(剩余 ÷ `DIVISOR`, `buffer_min`, `RX_MAX`)，发送 = clamp(剩余 ÷ `DIVISOR`, `buffer_min`, `tx_max`)，`DIVISOR` = 32，剩余 = `budget` − 全部套接字的缓冲之和、饱和为 0；全局一个 `AtomicUsize`）；`tcp::Socket::new`，关 Nagle，`set_keep_alive(Some(keep_alive))`，`set_timeout(Some(timeout))`（执行期修正记录第 3 行：smoltcp 0.12 的超时不看有没有在途的数据，应用最后一个段之后 `timeout` 里什么也没来就断开，`tcp.rs` 第 2118 ～ 2123、2274 行；保活让活着的应用每 `keep_alive` 至少答一个 ACK，空闲的连接不被断开），`CongestionControl::Reno`，ACK 延迟取缺省；`listen(IpListenEndpoint { addr: Some(目的地址), port: 目的端口 })`（出错就丢掉这个 SYN、还回预算）；加进 `sockets`、推进这个包；推进之后不在 `SynReceived` 就拿掉、还回预算；在的建 `Conn`（连接号 `ConnId` 是全局递增的 `u64`；`by_tuple` 与 `conns` 各一项）并起会话的任务。
    - 拿掉套接字（这一任务只拿掉 smoltcp 报 `Closed` 或 `TimeWait` 的，`abort()` 过的要等到 `remote_endpoint()` 成了 `None`——它的 RST 已经发出，见任务 7 第 2 点；`TimeWait` 的要等到第一次看到它在 `TimeWait` 之后过了 20 毫秒——它可能还欠着一个延迟的 ACK：smoltcp 的 ACK 延迟缺省 10 毫秒（`tcp.rs` 第 268 行），收到带负载的段时起表（第 2080 行起），到时才发（第 2308 行），对方的数据与 FIN 在 10 毫秒之内先后到达时，套接字带着这个没发的 ACK 进了 `TimeWait`，提前拿掉的话对方收不到它、重发 FIN 之后得到 RST；片醒来时看本轮碰过的连接，另每秒扫一遍全片）：删两张表的项、还回预算、`ConnShared` 记下结局并唤醒等着它的读写。
-6. `src/tcp/stream.rs`：`TunStream`（`AsyncRead + AsyncWrite + Unpin + Send`，持有片的 `Arc`、`ConnId` 与 `Arc<ConnShared>`）：每次读写先按连接号在 `conns` 里找——找不到就照 `ConnShared` 记下的结局答（P12）；读：`recv_slice`，没有数据而 `may_recv` 时登记接收 waker（smoltcp 的一份、`ConnShared` 里一份，拿掉连接时由后者唤醒）、`Pending`，FIN 读空之后 `Ok(0)`；写：`send_slice`，满了登记发送 waker；`poll_flush` 立刻 `Ok`（P13）；`poll_shutdown`：`close()`、立刻 `Ok`；读写之后踢这一片。`pub(crate) async fn established(&self) -> io::Result<()>`：到 `Established` 时 `Ok`，在那之前就结束了是 `ConnectionReset`。`Drop`：这一任务里一律 `abort()`（细的规矩在任务 7）。
+6. `src/tcp/stream.rs`：`TunStream`（`AsyncRead + AsyncWrite + Unpin + Send`，持有片的 `Arc`、`ConnId` 与 `Arc<ConnShared>`）：每次读写先按连接号在 `conns` 里找——找不到就照 `ConnShared` 记下的结局答（P12）；读：`recv_slice`，没有数据而 `may_recv` 时登记接收 waker（smoltcp 的一份、`ConnShared` 里一份，拿掉连接时由后者唤醒）、`Pending`，FIN 读空之后 `Ok(0)`；写：`send_slice`，满了登记发送 waker；`poll_flush` 立刻 `Ok`（P13）；`poll_shutdown`：`close()`、立刻 `Ok`；读写之后踢这一片。`pub(crate) async fn established(&self) -> io::Result<()>`：到 `Established` 时 `Ok`，在那之前就结束了是 `ConnectionReset`。`Drop`：照任务 7 第 1 点的条件（写的一侧已 `shutdown`、`!may_recv()`、`recv_queue() == 0` 时不动它，否则 `abort()`），`linger` 在任务 7（执行期修正记录第 5 行）。
 7. `src/session.rs`：会话的任务：`established()` → `SessionInfo { src: 应用的地址与端口, in_port: 0, listener: ListenerKind::Tun, ..SessionInfo::tcp(HostName::Ip(目的地址), 目的端口) }`（`SessionInfo` 还没有 `local` 字段，M3b 加）→ `dialer.dial` → 拨通：`dialer.relay(Box::new(stream), dialed.stream, dialed.handle)`（`Dialed.forward` 不用）；`Reject` 与 `Failed`：丢掉 `TunStream`（RST；`REJECT-DROP` 的拿着在任务 8）。
 
 **接口**
@@ -205,6 +208,8 @@
       pub max_half_open: usize,        // 2 048
       pub half_open_timeout: Duration, // 10 s
       pub linger: Duration,            // 60 s
+      pub keep_alive: Duration,        // 30 s
+      pub timeout: Duration,           // 600 s: the relay's idle timeout by default
       pub shard_queue: usize,          // 1 024 packets
       pub writer_queue: usize,         // 256 batches
   }
@@ -237,6 +242,9 @@
 - `half_close_keeps_the_other_direction`：应用写 64 KiB 后 `shutdown()`，`echo` 读到 EOF、回完关写端；应用读回 64 KiB 再读到 `Ok(0)`。
 - `a_failed_dial_resets_the_connection`：没写给 `FakeDialer` 的目的地 → `connect` 成功（握手照常完成，设计第 5.6 节），随后读是 `ConnectionReset`；`dialed()` 有这一次。
 - `a_rejected_session_resets_the_connection`：`Script::Reject(RejectKind::Reject)`，同上。
+- `nothing_is_dialed_before_the_handshake_completes`：过滤器扣住应用发往 TUN 的握手的 ACK → 等 200 毫秒（断言什么都没发生的固定等待），`dialed()` 是空的；经 `inject` 放出它 → 有界时间里 `dialed()` 有一项，`hello` 往返。
+- `an_idle_connection_outlives_the_timeout`（`keep_alive: 100 ms`、`timeout: 1 s`）：连接建好、`hello` 往返之后两头都不发，等 3 秒（断言什么都没发生的固定等待，三倍于超时）→ `hello` 照样往返。
+- `a_silent_app_is_reset_after_the_timeout`（同样的选项）：连接建好之后过滤器丢掉 TUN 发往应用的每个包 → 有界时间里 `sockets_in_use()` 0、`budget_in_use()` 0，`relay_ends()` 有这一条。
 - `stop_ends_the_tun`：`stop()` 之后 `join()` 在 5 秒内答 `Ending::Stopped`，再调一次答同样的。
 - 以上每条末尾 `counters()` 全是 0。
 - `a_device_mtu_below_1280_is_refused`（`#[should_panic(expected = "at least 1280")]`）：`MemoryDevice::pair(1279, 16)`。
@@ -458,8 +466,11 @@
 
 | # | 任务 | 修正 | 提交 |
 | - | ---- | ---- | ---- |
-| 1 | 1 | `AppStack::accept` 由 `async fn` 改为立刻登记监听、返回 future 的普通函数：`async fn` 的监听要到第一次被轮询才建，在那之前到达的 SYN 得到 RST，多线程运行时上"起一个任务去 `accept`、随即 `connect`"会偶发失败；调用处的 `.await` 不变 | 任务 1 的修正 |
-| 2 | 1、2、7 | 拿掉 `TimeWait` 的套接字之前等 20 毫秒（应用端夹具与 TUN 的片都是）：smoltcp 的 ACK 延迟缺省 10 毫秒，对方的数据与 FIN 在 10 毫秒之内先后到达时，套接字带着一个没发的 ACK 进 `TimeWait`，当场拿掉的话对方收不到确认、重发 FIN 之后得到 RST。任务 1 的评审读 smoltcp 0.12 的源码查出 | 任务 1 的修正；任务 2、7 |
+| 1 | 1 | `AppStack::accept` 由 `async fn` 改为立刻登记监听、返回 future 的普通函数：`async fn` 的监听要到第一次被轮询才建，在那之前到达的 SYN 得到 RST，多线程运行时上"起一个任务去 `accept`、随即 `connect`"会偶发失败；调用处的 `.await` 不变 | `aee6cb8` |
+| 2 | 1、2、7 | 拿掉 `TimeWait` 的套接字之前等 20 毫秒（应用端夹具与 TUN 的片都是）：smoltcp 的 ACK 延迟缺省 10 毫秒，对方的数据与 FIN 在 10 毫秒之内先后到达时，套接字带着一个没发的 ACK 进 `TimeWait`，当场拿掉的话对方收不到确认、重发 FIN 之后得到 RST。任务 1 的评审读 smoltcp 0.12 的源码查出 | `aee6cb8`（夹具）、`bd90bd9`（片）；任务 7 |
+| 3 | 2 | TUN 的套接字开保活（`TunOptions::keep_alive`，缺省 30 秒），超时取 600 秒（`TunOptions::timeout`）。设计第 5.4 节与 M3-D6 写的是"不开保活、超时 120 秒"，以为超时只管"发出的数据 120 秒没有确认"；smoltcp 0.12 的超时不看有没有在途的数据：应用最后一个段之后 `timeout` 里什么也没来就断开（`tcp.rs` 第 2118 ～ 2123、2274 行；发送缓冲从空变非空时才从发出的第一段重新起算，第 1170 ～ 1175、2258 ～ 2267 行），任务 2 的实现者用片一级的探针量到握手之后什么也不发的连接在 120 秒时被 RST。照设计的写法，经 TUN 的空闲长连接（SSH、数据库连接池、空闲的 HTTP/2）两分钟就断。保活每空闲 `keep_alive` 发一个保活段（第 2496 ～ 2498 行），活着的应用（它的内核）总会答 ACK，空闲的连接就不再被断开，应用那一侧没了的在 `timeout` 之后断开；保活段的回答带着应用当前的窗口，smoltcp 不发零窗口探测段（P17），应用的窗口更新丢了时下行至多停 `keep_alive`。600 秒与转发循环的空闲超时缺省（`--idle-timeout`）相同：Windows 的单调时钟把睡眠算进去，机器睡过 `timeout` 之后醒来时这一条断开每条连接，取 600 秒时它不比转发循环断得多。参照：netstack-smoltcp 与 shadowsocks-rust 的 TUN 都配保活（前者 28 秒），超时 7200 秒 | 任务 2 的修正 |
+| 4 | 1、2、5、8 | 应用端夹具的 `connect` 在收下 SYN-ACK 时就算成功（同真实系统），紧随其后的 RST 在第一次读写时以 `ConnectionReset` 出现：此前只看套接字的终态，TUN 握手之后立刻发来的 RST 若在用例的任务第一次看套接字之前被收下，`connect` 答 `ConnectionRefused`（任务 2 的两条重置用例单独跑 30 次红 3 次）；任务 5 的上限与任务 8 的拒绝同样是"握手之后立刻重置"。拨号在握手完成之后才发生，由任务 2 的 `nothing_is_dialed_before_the_handshake_completes` 钉住 | 任务 2 的修正 |
+| 5 | 2、7 | 任务 2 的 `TunStream` 被丢掉时照任务 7 第 1 点的条件（写的一侧已 `shutdown`、应用不会再发、没有没读的数据时不动它，否则 `abort()`），不是"一律 `abort()`"：转发循环关了写的一侧随即丢掉流，一律 `abort()` 的话 RST 顶掉还没发出的数据与 FIN，任务 2 自己的 `half_close_keeps_the_other_direction` 与 `a_mebibyte_crosses_each_way` 红；`linger` 照旧在任务 7 | `bd90bd9` |
 
 ## 延后事项
 
