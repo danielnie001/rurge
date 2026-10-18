@@ -1,3 +1,8 @@
+//! The device a shard's smoltcp stack runs on, and the two tokens it takes
+//! packets in and out by (phase 3 M3 design 4.5). The one place the packets
+//! the stack sends are read as they are written, for the guard at the edge of
+//! the window ([`Edges`]).
+
 use super::guard::Edges;
 use smoltcp::phy::{self, Checksum, DeviceCapabilities, Medium};
 

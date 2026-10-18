@@ -1,3 +1,11 @@
+//! What becomes of a shard whose stack panics, or whose lock a panic poisoned
+//! (phase 3 M3 design 5.3, "the last line"): the shard is rebuilt, its
+//! connections are reset, what they held is given back, and the new stack has
+//! a seed of its own. First one shard, its turns taken by hand, with what is a
+//! function of its input alone (the seed, the text of a panic); then the whole
+//! TUN, where a segment panics the stack, a stream panics with the lock held,
+//! or a SYN panics the stack as it is taken.
+
 use super::hazards::{ACK, PSH_ACK, app4, fields, open_by_hand, watch};
 use super::log_capture::LogCapture;
 use super::support::{

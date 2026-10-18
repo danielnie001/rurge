@@ -1,9 +1,10 @@
 //! The hazards of smoltcp 0.12 that the shards stand in front of (phase 3 M3
-//! design 5.3): SACK (H3), the edge of the window (H2) and, behind both, a
-//! stack that panics all the same. First what is a function of its input
-//! alone: the SACK-permitted option, the edge. Then one shard, its turns
-//! taken by hand. Then the whole TUN: a connection stalled at a window of
-//! 0, and a shard that panics, or whose lock a panic poisoned.
+//! design 5.3): SACK (H3) and the edge of the window (H2). The stack that
+//! panics all the same, behind both, is in `rebuild.rs`. First what is a
+//! function of its input alone: the SACK-permitted option, the edge. Then the
+//! whole TUN: SACK, a segment past the edge, the window scale the edge rests
+//! on, a connection stalled at a window of 0. Then one shard, its turns taken
+//! by hand, at the edge of the window.
 
 use super::support::{
     Lone, Rig, WITHIN, addr, data_segment_v4, echo_packet, eventually, hello, is_syn, lone_shard,
@@ -765,8 +766,15 @@ async fn stalled_upload() -> Stalled {
 
 impl Stalled {
     /// Waits until the TUN has told of a window of 0 and said nothing more for
-    /// 100 ms (the relay has stopped reading by then, which a window of 0 told
-    /// a moment ago does not say), and returns what it told.
+    /// 100 ms, and returns what it told. What it waits for is the end of the
+    /// fill-up: the relay stops reading when the pipe and its own buffer are
+    /// full, and the window stays 0, which a window of 0 told a moment ago does
+    /// not say (the relay may read again and open it). The margin, on the
+    /// development machine: from its first window of 0 to its last packet the
+    /// TUN took at most 1.4 ms (100 runs alone) or 4.2 ms (30 runs with the
+    /// whole test binary running), and the longest silence between two of its
+    /// packets in that time was 1.3 ms (3.8 ms), so the 100 ms of quiet is more
+    /// than 20 times either.
     async fn settled(&self) -> Told {
         let mut packets = None;
         let mut quiet = 0;
