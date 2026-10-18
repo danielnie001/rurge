@@ -66,9 +66,74 @@ async fn udp_two_targets(out: &OutboundRef, echoes: [SocketAddr; 2], log: &dyn F
     }
 }
 
-/// One chunk, many, then 9 MiB each way at once: past rurge's receive window
-/// of a stream (8 MiB, phase 2 M7 design 3.2), what comes back needs the
-/// credit rurge grants as it reads the tunnel's DATA frames.
+/// `len` bytes each way at once through one tunnel, as `common::transfer`
+/// sends them, except that the upload never runs more than 512 KiB ahead of
+/// what has come back. masque-server (v0.13.0, MIT) keeps, for each tunnel,
+/// the bytes the client sent and it has not yet written to the target, at most
+/// `MAX_BUFFERED_CLIENT_BYTES` (1 MiB); it puts no backpressure on QUIC, and
+/// past that bound it resets the stream with H3_CONNECT_ERROR. An upload that
+/// only QUIC's flow-control windows hold back (the server grants 4 to 16 MiB
+/// for each stream) meets that reset as soon as the target is slow to take
+/// it. The target here is an echo, so what has come back is what the target
+/// has taken: the bytes the server holds are at most the 512 KiB sent and not
+/// yet read back. Bounded by a minute; `log` is the server's.
+async fn paced_transfer(out: &OutboundRef, echo: SocketAddr, len: usize, log: &dyn Fn() -> String) {
+    let bound = Duration::from_secs(60);
+    let payload: Vec<u8> = (0..len).map(|i| (i % 253) as u8).collect();
+    let stream = tokio::time::timeout(
+        bound,
+        out.connect_tcp(&target(echo), &ConnectOpts::default()),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("the tunnel is established within the bound\n{}", log()))
+    .unwrap_or_else(|e| panic!("the tunnel is established: {e}\n{}", log()));
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut back = vec![0u8; len];
+    // what the upload may still send before the echo of earlier bytes is read
+    let room = tokio::sync::Semaphore::new(512 * 1024);
+    let upload = async {
+        for chunk in payload.chunks(64 * 1024) {
+            room.acquire_many(chunk.len() as u32)
+                .await
+                .unwrap()
+                .forget();
+            writer
+                .write_all(chunk)
+                .await
+                .unwrap_or_else(|e| panic!("the upload fails: {e}\n{}", log()));
+        }
+    };
+    let download = async {
+        let mut filled = 0;
+        while filled < len {
+            let n = reader
+                .read(&mut back[filled..])
+                .await
+                .unwrap_or_else(|e| panic!("the echo fails after {filled} bytes: {e}\n{}", log()));
+            assert!(
+                n > 0,
+                "the tunnel ends after {filled} of {len} bytes\n{}",
+                log()
+            );
+            filled += n;
+            room.add_permits(n);
+        }
+    };
+    tokio::time::timeout(bound, async { tokio::join!(upload, download) })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the payload makes it there and back within the bound\n{}",
+                log()
+            )
+        });
+    assert!(back == payload, "the echo differs\n{}", log());
+}
+
+/// One chunk, many, then 9 MiB each way at once, the upload paced (see
+/// `paced_transfer`): past rurge's receive window of a stream (8 MiB, phase 2
+/// M7 design 3.2), what comes back needs the credit rurge grants as it reads
+/// the tunnel's DATA frames.
 #[tokio::test]
 async fn tcp_against_masque_server() {
     let Some(bin) = masque_server_or_skip("tcp_against_masque_server") else {
@@ -82,7 +147,15 @@ async fn tcp_against_masque_server() {
     );
     roundtrip(&out, echo).await;
     roundtrip_big(&out, echo).await;
-    transfer(&out, echo, (9 << 20) + 777).await;
+    paced_transfer(&out, echo, (9 << 20) + 777, &|| server.log_text()).await;
+}
+
+/// The paced transfer itself, with no server to ask: through a plain echo it
+/// ends with the bytes it began with, the last chunk being a partial one.
+#[tokio::test]
+async fn the_paced_transfer_ends_with_the_bytes_it_began_with() {
+    let out = outbound("[Proxy]\nD = direct\n[Rule]\nFINAL,DIRECT\n", "D", None);
+    paced_transfer(&out, echo_server().await, (3 << 20) + 777, &String::new).await;
 }
 
 /// The server announces extended CONNECT and HTTP datagrams; it reads no
