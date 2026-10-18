@@ -121,8 +121,8 @@
    pub enum Script {
        /// Connect to this address and relay to it; `script` panics unless it is a loopback address.
        Upstream(SocketAddr),
-       /// `tokio::io::duplex(buffer)`; the far end writes `send` bytes of `pattern`, then reads and
-       /// discards until the session ends.
+       /// `tokio::io::duplex(buffer)`; the far end writes `send` bytes of `pattern` and, all the
+       /// while, reads and discards until the session ends.
        Memory { buffer: usize, send: usize },
        /// `tokio::io::duplex(buffer)`; the far end neither reads nor writes until
        /// `FakeDialer::release(dst)`, then reads and discards until the session ends.
@@ -179,7 +179,7 @@
 4. `src/writer.rs`：写任务：全局的 `mpsc::channel::<Vec<Vec<u8>>>(writer_queue)`；`recv_many` 收下排着的批，接成一个 `Vec<Vec<u8>>` 调 `device.send`；出错时 TUN 以 `DeviceFailed` 结束。
 5. `src/tcp/`：
    - 片：`Arc<Mutex<ShardState>>`（`std::sync::Mutex`），`ShardState { iface, sockets: SocketSet<'static>, device: ShardDevice, conns: HashMap<ConnId, Conn>, by_tuple: HashMap<Tuple, ConnId> }`。`ShardDevice`：收的一侧一次只放一个包（逐包推进）、发的一侧是一个 `Vec<Vec<u8>>`；`capabilities()`：`Medium::Ip`、`max_transmission_unit = device.mtu()`、`checksum.ipv4 = Checksum::Tx`、`checksum.tcp = Checksum::Tx`（设计第 4.4 节：TCP 的校验和不验，IPv4 首部的由收包的任务验——任务 4）；`transmit` 总给出令牌（`TxToken::consume` 分配 `vec![0; len]`、推进发的一侧，同 WireGuard 栈的 `Queues`）。
-   - 接口：`Config::new(HardwareAddress::Ip)`，`random_seed` 每片各取一次 `getrandom`（同 WireGuard 栈的 `random_u64`），`set_any_ip(true)`，地址 `198.18.0.253/32` 与 `fd00:6152::fd/128`，各一条经它的缺省路由（设计第 4.2 节）；时钟以 TUN 启动时的 `std::time::Instant` 为零点（同 WireGuard 栈的 `at`），不用 smoltcp 的 `Instant::now()`。
+   - 接口：`Config::new(HardwareAddress::Ip)`，`random_seed` 每片各取一次 `getrandom`（同 WireGuard 栈的 `random_u64`；在 `Tun::start` 里取、经 `Shard::new` 交给片，执行期修正记录第 7 行），`set_any_ip(true)`，地址 `198.18.0.253/32` 与 `fd00:6152::fd/128`，各一条经它的缺省路由（设计第 4.2 节）；时钟以 TUN 启动时的 `std::time::Instant` 为零点（同 WireGuard 栈的 `at`），不用 smoltcp 的 `Instant::now()`。
    - 片的任务：等进片的队列（`recv_many`）、`TunStream` 的踢（`tokio::sync::Notify`）、`poll_delay` 的定时与停止；醒来后在锁里：**先推进一次发送**（`poll_egress` 一遍：上一次放锁之后 `TunStream` 读走了数据的话，窗口更新先于新收的包发出去——零窗口之后对端带一个字节的探测段若赶在窗口更新之前进了协议栈，smoltcp 会收下它、在下一次推进时 panic，设计第 5.3 节 H2；任务 6 的守卫兜底），再至多 `INGRESS_PER_WAKE`（256）个包逐个推进，然后 `poll_egress` 反复到返回 `PollResult::None` 或做满 `EGRESS_PASSES`（64）次，取出发的一侧，算下一次的定时；放锁之后把这一批交给写任务（队列满了等，不拿着锁等）；做满了任一个界限就 `yield_now` 之后接着做。
    - 推进一个包：四元组在 `by_tuple` 里 → 放进 `ShardDevice`、`poll_ingress_single`；不在、且只带 SYN 不带 ACK → 新的 SYN（下一条）；其余也交给 smoltcp（它对游离段回 RST）。
    - 新的 SYN（这一任务只做设计第 5.2 节的第 5 步，第 1 ～ 3 步在任务 5）：按预算分配两块缓冲（`budget.rs`：接收 = clamp(剩余 ÷ `DIVISOR`, `buffer_min`, `RX_MAX`)，发送 = clamp(剩余 ÷ `DIVISOR`, `buffer_min`, `tx_max`)，`DIVISOR` = 32，剩余 = `budget` − 全部套接字的缓冲之和、饱和为 0；全局一个 `AtomicUsize`）；`tcp::Socket::new`，关 Nagle，`set_keep_alive(Some(keep_alive))`，`set_timeout(Some(timeout))`（执行期修正记录第 3 行：smoltcp 0.12 的超时不看有没有在途的数据，应用最后一个段之后 `timeout` 里什么也没来就断开，`tcp.rs` 第 2118 ～ 2123、2274 行；保活让活着的应用每 `keep_alive` 至少答一个 ACK，空闲的连接不被断开），`CongestionControl::Reno`，ACK 延迟取缺省；`listen(IpListenEndpoint { addr: Some(目的地址), port: 目的端口 })`（出错就丢掉这个 SYN、还回预算）；加进 `sockets`、推进这个包；推进之后不在 `SynReceived` 就拿掉、还回预算；在的建 `Conn`（连接号 `ConnId` 是全局递增的 `u64`；`by_tuple` 与 `conns` 各一项）并起会话的任务。
@@ -243,7 +243,7 @@
 - `a_failed_dial_resets_the_connection`：没写给 `FakeDialer` 的目的地 → `connect` 成功（握手照常完成，设计第 5.6 节），随后读是 `ConnectionReset`；`dialed()` 有这一次。
 - `a_rejected_session_resets_the_connection`：`Script::Reject(RejectKind::Reject)`，同上。
 - `nothing_is_dialed_before_the_handshake_completes`：过滤器扣住应用发往 TUN 的握手的 ACK → 等 200 毫秒（断言什么都没发生的固定等待），`dialed()` 是空的；经 `inject` 放出它 → 有界时间里 `dialed()` 有一项，`hello` 往返。
-- `an_idle_connection_outlives_the_timeout`（`keep_alive: 100 ms`、`timeout: 1 s`）：连接建好、`hello` 往返之后两头都不发，等 3 秒（断言什么都没发生的固定等待，三倍于超时）→ `hello` 照样往返。
+- `an_idle_connection_outlives_the_timeout`（`keep_alive: 100 ms`、`timeout: 3 s`，执行期修正记录第 6 行）：连接建好、`hello` 往返之后两头都不发，等 6 秒（断言什么都没发生的固定等待，两倍于超时）→ `hello` 照样往返。
 - `a_silent_app_is_reset_after_the_timeout`（同样的选项）：连接建好之后过滤器丢掉 TUN 发往应用的每个包 → 有界时间里 `sockets_in_use()` 0、`budget_in_use()` 0，`relay_ends()` 有这一条。
 - `stop_ends_the_tun`：`stop()` 之后 `join()` 在 5 秒内答 `Ending::Stopped`，再调一次答同样的。
 - 以上每条末尾 `counters()` 全是 0。
@@ -354,7 +354,7 @@
 
 1. `src/packet.rs`：`pub(crate) fn strip_sack_permitted(packet: &mut [u8])`（整个 IP 包）：带 SYN 的 TCP 首部里每个 SACK-permitted 选项（kind 4、长度 2）换成两个 NOP（kind 1）；选项表本身不合规矩的原样不动（H3）。片推进任何带 SYN 的段之前调它（新的与重发的）；TCP 的校验和不验，所以改了不重算。
 2. `src/tcp/guard.rs`（H2 的兜底，设计第 5.3 节）：`ShardDevice` 记每个四元组最新的边缘；发的一侧的 `TxToken::consume` 写完每一个 TCP 段就读它：边缘 = 确认号 + (窗口字段 << 缩放位数)，缩放位数取 rurge 那个 SYN-ACK 里的窗口缩放选项（没有是 0；带 SYN 的段本身不缩放）。推进一个带负载的段之前：知道边缘、且负载的末端（序号 + 负载长度）在序号空间里越过它 → 丢弃、计 `beyond_window`；不带负载的段（ACK、只带 FIN 的）与还不知道边缘的照常进去。拿掉连接时删它的边缘。比较写成纯函数 `fn past(end: u32, edge: u32) -> bool`（回绕：`end.wrapping_sub(edge) as i32 > 0`）。
-3. 重建：片在锁里做的事在 `std::panic::catch_unwind(AssertUnwindSafe(..))` 里；panic 了，这一片换一套新的 `Interface` / `SocketSet` / `ShardDevice`，它的每条连接以 `ConnectionReset` 结束（`ConnShared` 记下、唤醒等待者）、还回预算、套接字与半开的计数随之减；`stack_panics` 加一；一行 WARN，文本恰好是 `tun: the TCP stack of a shard panicked; its connections are reset`，字段 `shard`（片号），不带 panic 的文本（那一句在一行 DEBUG 里）。任何一处拿这一片的锁时发现它中毒了（别处拿着它时 panic 了）：先照样重建、`clear_poison`，再接着做。不装 panic 钩子（设计第 5.3 节"最后一道"）。
+3. 重建：片在锁里做的事在 `std::panic::catch_unwind(AssertUnwindSafe(..))` 里；panic 了，这一片换一套新的 `Interface` / `SocketSet` / `ShardDevice`（新的 `Interface` 另取一个种子：沿用旧的会重复旧栈的初始序号，执行期修正记录第 7 行），它的每条连接以 `ConnectionReset` 结束（`ConnShared` 记下、唤醒等待者）、还回预算、套接字与半开的计数随之减；`stack_panics` 加一；一行 WARN，文本恰好是 `tun: the TCP stack of a shard panicked; its connections are reset`，字段 `shard`（片号），不带 panic 的文本（那一句在一行 DEBUG 里）。任何一处拿这一片的锁时发现它中毒了（别处拿着它时 panic 了）：先照样重建、`clear_poison`，再接着做。不装 panic 钩子（设计第 5.3 节"最后一道"）。
 4. 只在 `cfg(test)` 下编译的两个触发点（P20）：片推进的一个段的负载以 `PANIC_MARKER`（`b"rurge-tun test: panic"`）开头时在受保护的那一段里 panic；`TunStream::poll_write` 的缓冲以它开头时拿着锁 panic。
 
 **接口**
@@ -468,9 +468,11 @@
 | - | ---- | ---- | ---- |
 | 1 | 1 | `AppStack::accept` 由 `async fn` 改为立刻登记监听、返回 future 的普通函数：`async fn` 的监听要到第一次被轮询才建，在那之前到达的 SYN 得到 RST，多线程运行时上"起一个任务去 `accept`、随即 `connect`"会偶发失败；调用处的 `.await` 不变 | `aee6cb8` |
 | 2 | 1、2、7 | 拿掉 `TimeWait` 的套接字之前等 20 毫秒（应用端夹具与 TUN 的片都是）：smoltcp 的 ACK 延迟缺省 10 毫秒，对方的数据与 FIN 在 10 毫秒之内先后到达时，套接字带着一个没发的 ACK 进 `TimeWait`，当场拿掉的话对方收不到确认、重发 FIN 之后得到 RST。任务 1 的评审读 smoltcp 0.12 的源码查出 | `aee6cb8`（夹具）、`bd90bd9`（片）；任务 7 |
-| 3 | 2 | TUN 的套接字开保活（`TunOptions::keep_alive`，缺省 30 秒），超时取 600 秒（`TunOptions::timeout`）。设计第 5.4 节与 M3-D6 写的是"不开保活、超时 120 秒"，以为超时只管"发出的数据 120 秒没有确认"；smoltcp 0.12 的超时不看有没有在途的数据：应用最后一个段之后 `timeout` 里什么也没来就断开（`tcp.rs` 第 2118 ～ 2123、2274 行；发送缓冲从空变非空时才从发出的第一段重新起算，第 1170 ～ 1175、2258 ～ 2267 行），任务 2 的实现者用片一级的探针量到握手之后什么也不发的连接在 120 秒时被 RST。照设计的写法，经 TUN 的空闲长连接（SSH、数据库连接池、空闲的 HTTP/2）两分钟就断。保活每空闲 `keep_alive` 发一个保活段（第 2496 ～ 2498 行），活着的应用（它的内核）总会答 ACK，空闲的连接就不再被断开，应用那一侧没了的在 `timeout` 之后断开；保活段的回答带着应用当前的窗口，smoltcp 不发零窗口探测段（P17），应用的窗口更新丢了时下行至多停 `keep_alive`。600 秒与转发循环的空闲超时缺省（`--idle-timeout`）相同：Windows 的单调时钟把睡眠算进去，机器睡过 `timeout` 之后醒来时这一条断开每条连接，取 600 秒时它不比转发循环断得多。参照：netstack-smoltcp 与 shadowsocks-rust 的 TUN 都配保活（前者 28 秒），超时 7200 秒 | 任务 2 的修正 |
-| 4 | 1、2、5、8 | 应用端夹具的 `connect` 在收下 SYN-ACK 时就算成功（同真实系统），紧随其后的 RST 在第一次读写时以 `ConnectionReset` 出现：此前只看套接字的终态，TUN 握手之后立刻发来的 RST 若在用例的任务第一次看套接字之前被收下，`connect` 答 `ConnectionRefused`（任务 2 的两条重置用例单独跑 30 次红 3 次）；任务 5 的上限与任务 8 的拒绝同样是"握手之后立刻重置"。拨号在握手完成之后才发生，由任务 2 的 `nothing_is_dialed_before_the_handshake_completes` 钉住 | 任务 2 的修正 |
+| 3 | 2 | TUN 的套接字开保活（`TunOptions::keep_alive`，缺省 30 秒），超时取 600 秒（`TunOptions::timeout`）。设计第 5.4 节与 M3-D6 写的是"不开保活、超时 120 秒"，以为超时只管"发出的数据 120 秒没有确认"；smoltcp 0.12 的超时不看有没有在途的数据：应用最后一个段之后 `timeout` 里什么也没来就断开（`tcp.rs` 第 2118 ～ 2123、2274 行；发送缓冲从空变非空时才从发出的第一段重新起算，第 1170 ～ 1175、2258 ～ 2267 行），任务 2 的实现者用片一级的探针量到握手之后什么也不发的连接在 120 秒时被 RST。照设计的写法，经 TUN 的空闲长连接（SSH、数据库连接池、空闲的 HTTP/2）两分钟就断。保活每空闲 `keep_alive` 发一个保活段（第 2496 ～ 2498 行），活着的应用（它的内核）总会答 ACK，空闲的连接就不再被断开，应用那一侧没了的在 `timeout` 之后断开；保活段的回答带着应用当前的窗口，smoltcp 不发零窗口探测段（P17），应用的窗口更新丢了时下行至多停 `keep_alive`。600 秒与转发循环的空闲超时缺省（`--idle-timeout`）相同：Windows 的单调时钟把睡眠算进去，机器睡过 `timeout` 之后醒来时这一条断开每条连接，取 600 秒时它不比转发循环断得多。参照：netstack-smoltcp 与 shadowsocks-rust 的 TUN 都配保活（前者 28 秒），超时 7200 秒 | `6d02ec8` |
+| 4 | 1、2、5、8 | 应用端夹具的 `connect` 在收下 SYN-ACK 时就算成功（同真实系统），紧随其后的 RST 在第一次读写时以 `ConnectionReset` 出现：此前只看套接字的终态，TUN 握手之后立刻发来的 RST 若在用例的任务第一次看套接字之前被收下，`connect` 答 `ConnectionRefused`（任务 2 的两条重置用例单独跑 30 次红 3 次）；任务 5 的上限与任务 8 的拒绝同样是"握手之后立刻重置"。拨号在握手完成之后才发生，由任务 2 的 `nothing_is_dialed_before_the_handshake_completes` 钉住 | `6d02ec8` |
 | 5 | 2、7 | 任务 2 的 `TunStream` 被丢掉时照任务 7 第 1 点的条件（写的一侧已 `shutdown`、应用不会再发、没有没读的数据时不动它，否则 `abort()`），不是"一律 `abort()`"：转发循环关了写的一侧随即丢掉流，一律 `abort()` 的话 RST 顶掉还没发出的数据与 FIN，任务 2 自己的 `half_close_keeps_the_other_direction` 与 `a_mebibyte_crosses_each_way` 红；`linger` 照旧在任务 7 | `bd90bd9` |
+| 6 | 2 | `an_idle_connection_outlives_the_timeout` 与 `a_silent_app_is_reset_after_the_timeout` 用保活 100 毫秒、超时 3 秒，空闲等 6 秒（两倍于超时），不是 1 秒与 3 秒：应用端夹具是 smoltcp，TUN 的保活段（序号小一、一个字节）落在它的接收窗口之外，它以 challenge ACK 回答，而 challenge ACK 每秒至多一个（smoltcp 0.12 `tcp.rs` 第 1433 ～ 1446、1642 ～ 1656、1680 行），超时 1 秒时 TUN 恰在它下一次能答之前断开（实现者的临时探针：应用只答了 121 毫秒那一个保活，TUN 在 1137 毫秒发出 RST）；超时 3 秒给应用一侧留约 2 秒的调度余量（2 秒只留约 0.9 秒）。真实系统把带一个字节的保活段当作重复的段答 ACK，产品的缺省（30 秒 / 600 秒）离这样的限频很远；代价是 `rurge-tun` 的单元测试二进制至少跑 6 秒 | `6d02ec8`、`a923c45` |
+| 7 | 2、6、7 | 任务 2 的第二轮修正改了几处后面的任务要知道的地方：预算的"取"是一个原子步骤（`fetch_update`，按被替换的值算份额），文档写的最坏总量在各片于不同的工作线程上同时取时也成立（此前一次 `load` 加一次 `fetch_add`，缺省设置下最多多出约 12 MiB）；smoltcp 的种子在 `Tun::start` 里每片各取一次、经 `Shard::new` 交给片，随机源失败时每次起动一行 WARN（`tun: the system's random source failed; the TUN's initial sequence numbers are predictable`），不再悄悄用一个常数，任务 6 重建一片时另取种子；`try_state()` 改名 `state_unless_poisoned()`（与 `state()` 一样等锁，只在锁中毒时不同），任务 6 的中毒路径照用；smoltcp 自己因超时关掉的套接字上 `poll_shutdown` 答 `ConnectionReset`，与读的一侧相同（P12）；起 TUN 的测试辅助多了 `rig_on(device, options)`，`rig` 经它；`src/tests/lifecycle.rs` 已建，任务 7 的用例接着写在里面 | `a923c45` |
 
 ## 延后事项
 
