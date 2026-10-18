@@ -15,6 +15,7 @@ use crate::message::{Qtype, Question, Rcode, build_response, parse_query};
 use crate::upstream::{Upstream, UpstreamError, UpstreamRef};
 use rurge_net::BoxFuture;
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -98,6 +99,18 @@ fn respond(state: &Arc<Mutex<State>>, wire: &[u8], transport: &str) -> Option<(D
     Some((delay, bytes))
 }
 
+/// What `MockDns::start` panics with when no try found a port: the last error
+/// of each kind of bind, `none` for a kind that never failed.
+fn no_port(tcp: Option<&io::Error>, udp: Option<&io::Error>) -> String {
+    let told =
+        |error: Option<&io::Error>| error.map_or_else(|| "none".to_string(), |e| e.to_string());
+    format!(
+        "could not find a port free for both TCP and UDP (last TCP error: {}; last UDP error: {})",
+        told(tcp),
+        told(udp)
+    )
+}
+
 impl MockDns {
     pub async fn spawn() -> MockDns {
         Self::start(false).await
@@ -108,22 +121,54 @@ impl MockDns {
     }
 
     async fn start(tls: bool) -> MockDns {
-        // The ephemeral TCP port the OS hands out may already be held by an
-        // unrelated UDP socket, so retry the whole pair instead of failing.
+        // The ephemeral port the OS hands out to a socket of one kind may not
+        // be free for one of the other kind: an unrelated socket may hold it,
+        // and on a Windows CI runner every try of one order failed, without
+        // the reason being recorded. So the whole pair is tried again, the two
+        // kinds taking turns at being bound first, and when no try gets a
+        // port the last error of each kind is told.
         let (listener, addr, udp) = {
             let mut found = None;
-            for _ in 0..16 {
-                let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind tcp");
-                let addr = listener.local_addr().expect("addr");
-                match UdpSocket::bind(addr).await {
-                    Ok(udp) => {
-                        found = Some((listener, addr, Arc::new(udp)));
-                        break;
+            let mut last_tcp: Option<io::Error> = None;
+            let mut last_udp: Option<io::Error> = None;
+            for round in 1..=64 {
+                if round % 2 == 1 {
+                    // TCP first, then UDP on the same port
+                    let listener = match TcpListener::bind("127.0.0.1:0").await {
+                        Ok(listener) => listener,
+                        Err(e) => {
+                            last_tcp = Some(e);
+                            continue;
+                        }
+                    };
+                    let addr = listener.local_addr().expect("addr");
+                    match UdpSocket::bind(addr).await {
+                        Ok(udp) => {
+                            found = Some((listener, addr, Arc::new(udp)));
+                            break;
+                        }
+                        Err(e) => last_udp = Some(e),
                     }
-                    Err(_) => drop(listener),
+                } else {
+                    // UDP first, then TCP on the same port
+                    let udp = match UdpSocket::bind("127.0.0.1:0").await {
+                        Ok(udp) => udp,
+                        Err(e) => {
+                            last_udp = Some(e);
+                            continue;
+                        }
+                    };
+                    let addr = udp.local_addr().expect("addr");
+                    match TcpListener::bind(addr).await {
+                        Ok(listener) => {
+                            found = Some((listener, addr, Arc::new(udp)));
+                            break;
+                        }
+                        Err(e) => last_tcp = Some(e),
+                    }
                 }
             }
-            found.unwrap_or_else(|| panic!("could not find a port free for both TCP and UDP"))
+            found.unwrap_or_else(|| panic!("{}", no_port(last_tcp.as_ref(), last_udp.as_ref())))
         };
         let state = Arc::new(Mutex::new(State::default()));
         let acceptor = if tls { Some(tls_acceptor()) } else { None };
@@ -399,6 +444,36 @@ mod tests {
         let mut msg = vec![0u8; usize::from(u16::from_be_bytes(len))];
         stream.read_exact(&mut msg).await.unwrap();
         msg
+    }
+
+    /// The panic that tells why no port was found says which kind of bind
+    /// failed last with what, and `none` for a kind that never failed.
+    #[test]
+    fn no_port_tells_the_last_error_of_each_kind() {
+        let tcp = io::Error::new(io::ErrorKind::AddrInUse, "tcp is in use");
+        let udp = io::Error::new(io::ErrorKind::PermissionDenied, "udp is not allowed");
+        for (tcp, udp, said) in [
+            (
+                Some(&tcp),
+                Some(&udp),
+                "last TCP error: tcp is in use; last UDP error: udp is not allowed",
+            ),
+            (
+                None,
+                Some(&udp),
+                "last TCP error: none; last UDP error: udp is not allowed",
+            ),
+            (
+                Some(&tcp),
+                None,
+                "last TCP error: tcp is in use; last UDP error: none",
+            ),
+        ] {
+            assert_eq!(
+                no_port(tcp, udp),
+                format!("could not find a port free for both TCP and UDP ({said})")
+            );
+        }
     }
 
     #[tokio::test]
