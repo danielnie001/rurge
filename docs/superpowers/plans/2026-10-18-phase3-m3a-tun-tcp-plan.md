@@ -94,8 +94,9 @@
        /// `ConnectionRefused` when the SYN is answered with a reset, `TimedOut` after 5 s.
        pub async fn connect(&self, dst: SocketAddr) -> io::Result<AppTcp>;
        pub async fn connect_from(&self, port: u16, dst: SocketAddr) -> io::Result<AppTcp>;
-       /// Listens on `local` and resolves with the first connection.
-       pub async fn accept(&self, local: SocketAddr) -> io::Result<AppTcp>;
+       /// Listens on `local` at once (before the future is first polled) and resolves
+       /// with the first connection.
+       pub fn accept(&self, local: SocketAddr) -> impl Future<Output = io::Result<AppTcp>> + Send + 'static;
        /// Packets from the other end whose TCP or UDP destination port is in `ports`
        /// go to the receiver instead of the stack.
        pub fn divert(&self, ports: RangeInclusive<u16>) -> mpsc::UnboundedReceiver<Vec<u8>>;
@@ -112,7 +113,7 @@
    pub struct AppTcp; // AsyncRead + AsyncWrite + Unpin + Send
    impl AppTcp { pub fn local(&self) -> SocketAddr; /// Sends a reset now. pub fn abort(&mut self); }
    ```
-   `AppTcp` 的读写规矩与 `TunStream` 相同（计划期决定 P12、P13）：对端的 FIN 读空之后读是 `Ok(0)`；smoltcp 照着做了的 RST 之后读写是 `ConnectionReset`；`poll_flush` 立刻返回；`poll_shutdown` 是 `close()`、立刻返回；没 `shutdown` 就丢掉是 `abort()`。`AppTcp` 被丢掉之后，驱动在套接字到了 `TimeWait`，或到了 `Closed` 且 `remote_endpoint()` 是 `None`（`abort()` 的那一个 RST 已经发出去，smoltcp `tcp.rs` 第 2537 ～ 2540 行）时把它从套接字集里拿掉、端口可以再用——夹具不守 TIME-WAIT 的 10 秒；不拿掉的话任务 7 一条接一条的 2000 条连接会在应用一侧攒下 2000 个各带 320 KiB 缓冲的套接字。
+   `AppTcp` 的读写规矩与 `TunStream` 相同（计划期决定 P12、P13）：对端的 FIN 读空之后读是 `Ok(0)`；smoltcp 照着做了的 RST 之后读写是 `ConnectionReset`；`poll_flush` 立刻返回；`poll_shutdown` 是 `close()`、立刻返回；没 `shutdown` 就丢掉是 `abort()`。`AppTcp` 被丢掉之后，驱动在套接字到了 `TimeWait` 又过了 20 毫秒（它可能还欠着一个延迟的 ACK，见任务 2 第 5 点"拿掉套接字"），或到了 `Closed` 且 `remote_endpoint()` 是 `None`（`abort()` 的那一个 RST 已经发出去，smoltcp `tcp.rs` 第 2537 ～ 2540 行）时把它从套接字集里拿掉、端口可以再用——夹具不守 TIME-WAIT 的 10 秒；不拿掉的话任务 7 一条接一条的 2000 条连接会在应用一侧攒下 2000 个各带 320 KiB 缓冲的套接字。
 5. `src/testing/dialer.rs`：
    ```rust
    pub enum Script {
@@ -179,7 +180,7 @@
    - 片的任务：等进片的队列（`recv_many`）、`TunStream` 的踢（`tokio::sync::Notify`）、`poll_delay` 的定时与停止；醒来后在锁里：**先推进一次发送**（`poll_egress` 一遍：上一次放锁之后 `TunStream` 读走了数据的话，窗口更新先于新收的包发出去——零窗口之后对端带一个字节的探测段若赶在窗口更新之前进了协议栈，smoltcp 会收下它、在下一次推进时 panic，设计第 5.3 节 H2；任务 6 的守卫兜底），再至多 `INGRESS_PER_WAKE`（256）个包逐个推进，然后 `poll_egress` 反复到返回 `PollResult::None` 或做满 `EGRESS_PASSES`（64）次，取出发的一侧，算下一次的定时；放锁之后把这一批交给写任务（队列满了等，不拿着锁等）；做满了任一个界限就 `yield_now` 之后接着做。
    - 推进一个包：四元组在 `by_tuple` 里 → 放进 `ShardDevice`、`poll_ingress_single`；不在、且只带 SYN 不带 ACK → 新的 SYN（下一条）；其余也交给 smoltcp（它对游离段回 RST）。
    - 新的 SYN（这一任务只做设计第 5.2 节的第 5 步，第 1 ～ 3 步在任务 5）：按预算分配两块缓冲（`budget.rs`：接收 = clamp(剩余 ÷ `DIVISOR`, `buffer_min`, `RX_MAX`)，发送 = clamp(剩余 ÷ `DIVISOR`, `buffer_min`, `tx_max`)，`DIVISOR` = 32，剩余 = `budget` − 全部套接字的缓冲之和、饱和为 0；全局一个 `AtomicUsize`）；`tcp::Socket::new`，关 Nagle，`set_keep_alive(None)`，`set_timeout(Some(120 s))`，`CongestionControl::Reno`，ACK 延迟取缺省；`listen(IpListenEndpoint { addr: Some(目的地址), port: 目的端口 })`（出错就丢掉这个 SYN、还回预算）；加进 `sockets`、推进这个包；推进之后不在 `SynReceived` 就拿掉、还回预算；在的建 `Conn`（连接号 `ConnId` 是全局递增的 `u64`；`by_tuple` 与 `conns` 各一项）并起会话的任务。
-   - 拿掉套接字（这一任务只拿掉 smoltcp 报 `Closed` 或 `TimeWait` 的，`abort()` 过的要等到 `remote_endpoint()` 成了 `None`——它的 RST 已经发出，见任务 7 第 2 点；片醒来时看本轮碰过的连接，另每秒扫一遍全片）：删两张表的项、还回预算、`ConnShared` 记下结局并唤醒等着它的读写。
+   - 拿掉套接字（这一任务只拿掉 smoltcp 报 `Closed` 或 `TimeWait` 的，`abort()` 过的要等到 `remote_endpoint()` 成了 `None`——它的 RST 已经发出，见任务 7 第 2 点；`TimeWait` 的要等到第一次看到它在 `TimeWait` 之后过了 20 毫秒——它可能还欠着一个延迟的 ACK：smoltcp 的 ACK 延迟缺省 10 毫秒（`tcp.rs` 第 268 行），收到带负载的段时起表（第 2080 行起），到时才发（第 2308 行），对方的数据与 FIN 在 10 毫秒之内先后到达时，套接字带着这个没发的 ACK 进了 `TimeWait`，提前拿掉的话对方收不到它、重发 FIN 之后得到 RST；片醒来时看本轮碰过的连接，另每秒扫一遍全片）：删两张表的项、还回预算、`ConnShared` 记下结局并唤醒等着它的读写。
 6. `src/tcp/stream.rs`：`TunStream`（`AsyncRead + AsyncWrite + Unpin + Send`，持有片的 `Arc`、`ConnId` 与 `Arc<ConnShared>`）：每次读写先按连接号在 `conns` 里找——找不到就照 `ConnShared` 记下的结局答（P12）；读：`recv_slice`，没有数据而 `may_recv` 时登记接收 waker（smoltcp 的一份、`ConnShared` 里一份，拿掉连接时由后者唤醒）、`Pending`，FIN 读空之后 `Ok(0)`；写：`send_slice`，满了登记发送 waker；`poll_flush` 立刻 `Ok`（P13）；`poll_shutdown`：`close()`、立刻 `Ok`；读写之后踢这一片。`pub(crate) async fn established(&self) -> io::Result<()>`：到 `Established` 时 `Ok`，在那之前就结束了是 `ConnectionReset`。`Drop`：这一任务里一律 `abort()`（细的规矩在任务 7）。
 7. `src/session.rs`：会话的任务：`established()` → `SessionInfo { src: 应用的地址与端口, in_port: 0, listener: ListenerKind::Tun, ..SessionInfo::tcp(HostName::Ip(目的地址), 目的端口) }`（`SessionInfo` 还没有 `local` 字段，M3b 加）→ `dialer.dial` → 拨通：`dialer.relay(Box::new(stream), dialed.stream, dialed.handle)`（`Dialed.forward` 不用）；`Reject` 与 `Failed`：丢掉 `TunStream`（RST；`REJECT-DROP` 的拿着在任务 8）。
 
@@ -373,7 +374,7 @@
 **改哪里**（`src/tcp/stream.rs`、`src/tcp/shard.rs`）
 
 1. `TunStream` 被丢掉：没有 `shutdown`、或应用还可能发（`may_recv`）、或还有没读的数据（`recv_queue() > 0`）→ `abort()`（RST）；否则不动它（`poll_shutdown` 已经排了 FIN），记下丢掉的时刻。
-2. 拿掉套接字：smoltcp 报 `Closed` 或 `TimeWait`；或流被丢掉之后过了 `linger`（那时先 `abort()`）；`abort()` 过的套接字（这里的 `linger`、第 1 点的丢掉、任务 8 的拒绝）要等它的 RST 发了出去——`Closed` 且 `remote_endpoint()` 是 `None`（smoltcp `tcp.rs` 第 2537 ～ 2540 行：发出那一个 RST 之后才忘掉四元组）——才拿掉，否则应用收不到 RST（片重建时整个套接字集一起丢掉，不在此列，见任务 6）——片醒来时看本轮碰过的连接，另每秒扫一遍全片。拿掉时删两张表的项与它的边缘、还回预算、半开的照任务 5 减、唤醒等待者。
+2. 拿掉套接字：smoltcp 报 `Closed` 或 `TimeWait`（`TimeWait` 照任务 2 等 20 毫秒）；或流被丢掉之后过了 `linger`（那时先 `abort()`）；`abort()` 过的套接字（这里的 `linger`、第 1 点的丢掉、任务 8 的拒绝）要等它的 RST 发了出去——`Closed` 且 `remote_endpoint()` 是 `None`（smoltcp `tcp.rs` 第 2537 ～ 2540 行：发出那一个 RST 之后才忘掉四元组）——才拿掉，否则应用收不到 RST（片重建时整个套接字集一起丢掉，不在此列，见任务 6）——片醒来时看本轮碰过的连接，另每秒扫一遍全片。拿掉时删两张表的项与它的边缘、还回预算、半开的照任务 5 减、唤醒等待者。
 3. 结局（P12）：应用的 FIN 读空之后读是 `Ok(0)`；应用的 RST（smoltcp 照着做了：这个段之后套接字从别的状态变成 `Closed`、段带 RST）之后读写都是 `ConnectionReset`；连接因别的缘故被拿掉（重建、`linger`、停止）之后同样 `ConnectionReset`；应用关了接收方向之后的写是 `BrokenPipe`。
 
 **接口**
@@ -457,6 +458,8 @@
 
 | # | 任务 | 修正 | 提交 |
 | - | ---- | ---- | ---- |
+| 1 | 1 | `AppStack::accept` 由 `async fn` 改为立刻登记监听、返回 future 的普通函数：`async fn` 的监听要到第一次被轮询才建，在那之前到达的 SYN 得到 RST，多线程运行时上"起一个任务去 `accept`、随即 `connect`"会偶发失败；调用处的 `.await` 不变 | 任务 1 的修正 |
+| 2 | 1、2、7 | 拿掉 `TimeWait` 的套接字之前等 20 毫秒（应用端夹具与 TUN 的片都是）：smoltcp 的 ACK 延迟缺省 10 毫秒，对方的数据与 FIN 在 10 毫秒之内先后到达时，套接字带着一个没发的 ACK 进 `TimeWait`，当场拿掉的话对方收不到确认、重发 FIN 之后得到 RST。任务 1 的评审读 smoltcp 0.12 的源码查出 | 任务 1 的修正；任务 2、7 |
 
 ## 延后事项
 
