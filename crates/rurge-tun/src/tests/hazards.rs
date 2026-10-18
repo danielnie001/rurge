@@ -968,21 +968,26 @@ async fn a_probe_after_a_read_is_inside_the_new_window() {
     assert_eq!(lone.stats.counters(), Counters::default());
 }
 
-/// Data past the edge the TUN last told of, into room the buffer has got since
-/// by a read: smoltcp takes in what the buffer has room for, not what the
-/// window it told allowed (tcp.rs 1598-1599), and then finds the window it last
-/// told of ended before the data it holds (693-701): the subtraction underflows
-/// and panics. The guard drops the segment and counts it. A read of less than
-/// the window told does not make the stack tell a new window, which it does only
-/// when the window at least doubles (2232-2246), so the edge stays where it was.
+/// Data past the edge the TUN last told of, into a buffer with room past it
+/// (which a read since has made): smoltcp takes in the part of a segment that
+/// fits in the room, not what the window it told allowed (tcp.rs 1598-1599,
+/// 1660-1672), and then finds the window it last told of ended before the data
+/// it holds (693-701): the subtraction underflows and panics. The guard drops
+/// the segment and counts it, for any room at all: a segment longer than the
+/// room is dropped as one that fits is, for the part of it that fits would do
+/// the same harm. A read of less than the window told does not make the stack
+/// tell a new window, which it does only when the window at least doubles
+/// (2232-2246), so the edge stays where it was.
 #[tokio::test]
 async fn a_segment_past_the_edge_into_room_is_dropped() {
-    // the room the TUN has left when the app has sent all it can, what the
-    // stream reads of it, and a segment 500 bytes past the edge, which is 500
-    // bytes inside the room
+    // the window the TUN last told when the app has sent all it can, what the
+    // stream reads of it (so the room is that and more), a segment 500 bytes
+    // past the edge, which is 500 bytes inside the room, and one 500 bytes
+    // longer than the room
     const TOLD: usize = 4_000;
     const READ: usize = 1_000;
     const SEGMENT: usize = TOLD + 500;
+    const LONGER: usize = TOLD + READ + 500;
     let epoch = Instant::now();
     let at = |ms: u64| epoch + Duration::from_millis(ms);
     let lone = lone_shard(&TunOptions::default(), epoch);
@@ -1024,6 +1029,19 @@ async fn a_segment_past_the_edge_into_room_is_dropped() {
         let socket = state.sockets.get::<tcp::Socket>(state.conns[&id].handle);
         socket.recv_queue()
     };
+    assert_eq!(queued(&lone), sent - READ);
+    // a segment longer than the room, in a turn of its own: the stack would
+    // take in the room's worth of it, and the end of that is past the edge
+    let longer = data_segment_v4(app, dst, told.ack, told.seq, PSH_ACK, &[0xdd; LONGER]);
+    now += 20;
+    lone.shard.state().turn(at(now), &mut vec![longer]);
+    assert_eq!(
+        lone.stats.counters(),
+        Counters {
+            beyond_window: 2,
+            ..Counters::default()
+        }
+    );
     assert_eq!(queued(&lone), sent - READ);
     let mut rest = vec![0; sent - READ];
     within("the rest", stream.read_exact(&mut rest))
