@@ -51,8 +51,9 @@ pub(crate) fn route(
 ) {
     let parsed = match packet::classify(&packet, ipv6) {
         Ok(parsed) => parsed,
-        Err(reason) => {
-            stats.drop(reason, None, None);
+        Err(dropped) => {
+            let (src, dst) = dropped.ends.unzip();
+            stats.drop(dropped.reason, src, dst);
             return;
         }
     };

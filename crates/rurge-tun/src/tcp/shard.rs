@@ -233,8 +233,13 @@ impl ShardState {
     /// socket; a SYN of none opens one; any other segment goes in too, and
     /// smoltcp answers it with a reset.
     fn ingest(&mut self, packet: Vec<u8>, at: smoltcp::time::Instant, opened: &mut Vec<Opened>) {
-        // nothing but TCP comes to a shard
-        let Some(segment) = packet::segment(&packet) else {
+        // nothing but TCP that passed the filter comes to a shard
+        let segment = packet::segment(&packet);
+        debug_assert!(
+            segment.is_some(),
+            "a shard is given only what classify let through"
+        );
+        let Some(segment) = segment else {
             return;
         };
         if let Some(&id) = self.by_tuple.get(&segment.tuple) {

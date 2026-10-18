@@ -18,9 +18,6 @@ const ICMPV6_ECHO_REQUEST: u8 = 128;
 /// Why a packet is dropped. Each reason is the counter of the same name in
 /// [`crate::Counters`], and that name is what the logs call it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-// the last five are first given by the TCP shards' own checks, the UDP
-// sessions and ICMP, which come after the filter
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Reason {
     /// A packet that cannot be read: a version other than 4 and 6, lengths
     /// that do not fit, an IPv4 header checksum that does not hold, a
@@ -38,15 +35,25 @@ pub(crate) enum Reason {
     /// The queue of the shard the packet goes to was full.
     QueueFull,
     /// A SYN to an address of rurge's own space that names nothing.
+    // not built yet: the shard's SYN handling builds it and removes this expectation
+    #[cfg_attr(not(test), expect(dead_code))]
     UnknownFake,
     /// A SYN turned away because of the limits on sockets and half-open
     /// connections.
+    // not built yet: the shard's SYN handling builds it and removes this expectation
+    #[cfg_attr(not(test), expect(dead_code))]
     Busy,
     /// A segment with data past the window the TUN last told of.
+    // not built yet: the shard's window guard builds it and removes this expectation
+    #[cfg_attr(not(test), expect(dead_code))]
     BeyondWindow,
     /// A reset not sent because of the limit on resets.
+    // not built yet: the shard's SYN handling builds it and removes this expectation
+    #[cfg_attr(not(test), expect(dead_code))]
     RstLimited,
     /// An echo request or its reply held back by the limit on ICMP.
+    // not built yet: the ICMP path builds it and removes this expectation
+    #[cfg_attr(not(test), expect(dead_code))]
     IcmpLimited,
 }
 
@@ -72,6 +79,34 @@ impl fmt::Display for Reason {
             Reason::RstLimited => "rst_limited",
             Reason::IcmpLimited => "icmp_limited",
         })
+    }
+}
+
+/// A packet that was turned away: why, and the two addresses if it got far
+/// enough for them to be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Dropped {
+    pub(crate) reason: Reason,
+    /// The packet's source and destination, for a drop decided after its IP
+    /// header passed its own checks. `None` for one decided before that, and
+    /// for IPv6 while it is off, which is decided on the version alone.
+    pub(crate) ends: Option<(IpAddr, IpAddr)>,
+}
+
+impl Dropped {
+    /// Turned away before the IP header passed its own checks, or on the
+    /// version alone: nothing of the packet is to be believed yet.
+    fn unread(reason: Reason) -> Dropped {
+        Dropped { reason, ends: None }
+    }
+
+    /// Turned away after the IP header passed its own checks: its two
+    /// addresses are the packet's, whatever else is wrong with it.
+    fn between(reason: Reason, src: IpAddr, dst: IpAddr) -> Dropped {
+        Dropped {
+            reason,
+            ends: Some((src, dst)),
+        }
     }
 }
 
@@ -120,15 +155,18 @@ pub(crate) struct Segment {
 }
 
 /// Runs the checks on `packet`, in this order, the first that holds deciding:
-/// a packet that cannot be read; IPv6 while `ipv6` is off; a fragment; an
-/// address no packet has; a protocol that is not TCP, UDP or ICMP; a
-/// transport header that is cut short or names port 0; an ICMP message that
-/// is no echo request. Whatever is after the end of the IP packet is left
-/// out of [`Parsed::len`].
-pub(crate) fn classify(packet: &[u8], ipv6: bool) -> Result<Parsed, Reason> {
+/// a packet that cannot be read; IPv6 while `ipv6` is off (an IPv6 packet is
+/// turned away on its version nibble, however damaged, so that check is
+/// really the first); a fragment; an address no packet has; a protocol that
+/// is not TCP, UDP or ICMP; a transport header that is cut short or names
+/// port 0; an ICMP message that is no echo request. Whatever is after the end
+/// of the IP packet is left out of [`Parsed::len`]. A packet turned away
+/// comes back with the reason and, once its IP header passed its own checks,
+/// its two addresses ([`Dropped`]).
+pub(crate) fn classify(packet: &[u8], ipv6: bool) -> Result<Parsed, Dropped> {
     // IPv6 is dropped before any of its header is read, however damaged
     if !ipv6 && packet.first().is_some_and(|byte| byte >> 4 == 6) {
-        return Err(Reason::Unsupported);
+        return Err(Dropped::unread(Reason::Unsupported));
     }
     parse(packet)
 }
@@ -148,27 +186,28 @@ pub(crate) fn segment(packet: &[u8]) -> Option<Segment> {
 }
 
 /// Every check of [`classify`] but the one of the `ipv6` option.
-fn parse(packet: &[u8]) -> Result<Parsed, Reason> {
+fn parse(packet: &[u8]) -> Result<Parsed, Dropped> {
     match packet.first().map(|byte| byte >> 4) {
         Some(4) => read_ipv4(packet),
         Some(6) => read_ipv6(packet),
-        _ => Err(Reason::Malformed),
+        _ => Err(Dropped::unread(Reason::Malformed)),
     }
 }
 
-fn read_ipv4(packet: &[u8]) -> Result<Parsed, Reason> {
-    let ip = Ipv4Packet::new_checked(packet).map_err(|_| Reason::Malformed)?;
+fn read_ipv4(packet: &[u8]) -> Result<Parsed, Dropped> {
+    let ip = Ipv4Packet::new_checked(packet).map_err(|_| Dropped::unread(Reason::Malformed))?;
     // smoltcp takes a header of fewer than five words, and then reads the
     // TCP header from inside the IP header (design 5.3, H4)
     if ip.header_len() < 20 || !ip.verify_checksum() {
-        return Err(Reason::Malformed);
+        return Err(Dropped::unread(Reason::Malformed));
     }
-    if ip.more_frags() || ip.frag_offset() != 0 {
-        return Err(Reason::Fragment);
-    }
+    // the header is sound: the addresses are the packet's to give from here on
     let (src, dst) = (ip.src_addr(), ip.dst_addr());
+    if ip.more_frags() || ip.frag_offset() != 0 {
+        return Err(Dropped::between(Reason::Fragment, src.into(), dst.into()));
+    }
     if martian_v4(src, dst) {
-        return Err(Reason::Martian);
+        return Err(Dropped::between(Reason::Martian, src.into(), dst.into()));
     }
     transport(
         src.into(),
@@ -179,14 +218,15 @@ fn read_ipv4(packet: &[u8]) -> Result<Parsed, Reason> {
     )
 }
 
-fn read_ipv6(packet: &[u8]) -> Result<Parsed, Reason> {
-    let ip = Ipv6Packet::new_checked(packet).map_err(|_| Reason::Malformed)?;
-    if ip.next_header() == IpProtocol::Ipv6Frag {
-        return Err(Reason::Fragment);
-    }
+fn read_ipv6(packet: &[u8]) -> Result<Parsed, Dropped> {
+    let ip = Ipv6Packet::new_checked(packet).map_err(|_| Dropped::unread(Reason::Malformed))?;
+    // the header is sound: the addresses are the packet's to give from here on
     let (src, dst) = (ip.src_addr(), ip.dst_addr());
+    if ip.next_header() == IpProtocol::Ipv6Frag {
+        return Err(Dropped::between(Reason::Fragment, src.into(), dst.into()));
+    }
     if martian_v6(src, dst) {
-        return Err(Reason::Martian);
+        return Err(Dropped::between(Reason::Martian, src.into(), dst.into()));
     }
     transport(
         src.into(),
@@ -226,15 +266,16 @@ fn transport(
     protocol: IpProtocol,
     payload: &[u8],
     len: usize,
-) -> Result<Parsed, Reason> {
+) -> Result<Parsed, Dropped> {
     let transport = match (protocol, src) {
-        (IpProtocol::Tcp, _) => Transport::Tcp(tcp(src, dst, payload)?),
-        (IpProtocol::Udp, _) => udp(payload)?,
-        (IpProtocol::Icmp, IpAddr::V4(_)) => icmp(payload, ICMPV4_ECHO_REQUEST)?,
-        (IpProtocol::Icmpv6, IpAddr::V6(_)) => icmp(payload, ICMPV6_ECHO_REQUEST)?,
+        (IpProtocol::Tcp, _) => tcp(src, dst, payload).map(Transport::Tcp),
+        (IpProtocol::Udp, _) => udp(payload),
+        (IpProtocol::Icmp, IpAddr::V4(_)) => icmp(payload, ICMPV4_ECHO_REQUEST),
+        (IpProtocol::Icmpv6, IpAddr::V6(_)) => icmp(payload, ICMPV6_ECHO_REQUEST),
         // an extension header, or a protocol nothing here handles
-        _ => return Err(Reason::Unsupported),
-    };
+        _ => Err(Reason::Unsupported),
+    }
+    .map_err(|reason| Dropped::between(reason, src, dst))?;
     Ok(Parsed {
         src,
         dst,

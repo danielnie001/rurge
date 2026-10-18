@@ -91,7 +91,22 @@ fn short_header_syn() -> Vec<u8> {
 
 /// Why `classify` drops `packet`, with IPv6 handled.
 fn dropped(packet: &[u8]) -> Reason {
-    classify(packet, true).expect_err("the packet is dropped")
+    classify(packet, true)
+        .expect_err("the packet is dropped")
+        .reason
+}
+
+/// What `classify` makes of `packet`, with its drop as the reason alone.
+fn classified(packet: &[u8], ipv6: bool) -> Result<Parsed, Reason> {
+    classify(packet, ipv6).map_err(|dropped| dropped.reason)
+}
+
+/// The two addresses a drop of `packet` carries, if it does, with IPv6
+/// handled.
+fn ends_of(packet: &[u8]) -> Option<(IpAddr, IpAddr)> {
+    classify(packet, true)
+        .expect_err("the packet is dropped")
+        .ends
 }
 
 /// What `classify` reads of `packet`, which it lets through.
@@ -161,12 +176,12 @@ fn a_bad_version_or_header_is_malformed() {
 #[test]
 fn ipv6_off_is_unsupported() {
     let packet = good6();
-    assert_eq!(classify(&packet, false), Err(Reason::Unsupported));
+    assert_eq!(classified(&packet, false), Err(Reason::Unsupported));
     assert!(classify(&packet, true).is_ok());
     // IPv6 goes before its header is read: a packet too short to be read is
     // no different
-    assert_eq!(classify(&packet[..12], false), Err(Reason::Unsupported));
-    assert_eq!(classify(&packet[..12], true), Err(Reason::Malformed));
+    assert_eq!(classified(&packet[..12], false), Err(Reason::Unsupported));
+    assert_eq!(classified(&packet[..12], true), Err(Reason::Malformed));
     // IPv4 is as it was
     assert_eq!(classify(&good4(), false), classify(&good4(), true));
     assert!(classify(&good4(), false).is_ok());
@@ -447,8 +462,8 @@ fn the_checks_run_in_order() {
     // IPv6 off comes before the fragment check
     let mut v6_fragment = good6();
     v6_fragment[6] = 44;
-    assert_eq!(classify(&v6_fragment, false), Err(Reason::Unsupported));
-    assert_eq!(classify(&v6_fragment, true), Err(Reason::Fragment));
+    assert_eq!(classified(&v6_fragment, false), Err(Reason::Unsupported));
+    assert_eq!(classified(&v6_fragment, true), Err(Reason::Fragment));
     // a fragment to a multicast address is a fragment: that check is first
     let to_multicast =
         with_fragment_field(syn4(APP4, Ipv4Addr::new(224, 0, 0, 251)), MORE_FRAGMENTS);
@@ -474,6 +489,100 @@ fn the_checks_run_in_order() {
         dropped(&ipv4_packet(1, APP4, FAR4, &[3, 0, 0, 0, 0, 0, 0, 0])),
         Reason::Unsupported
     );
+}
+
+/// What a drop carries of the packet: its two addresses once the IP header
+/// has passed its own checks, whichever check turns the packet away after
+/// that; nothing for a drop decided before, and for IPv6 while it is off.
+#[test]
+fn a_drop_carries_the_addresses_once_the_header_was_read() {
+    let v4 = Some((IpAddr::from(APP4), IpAddr::from(FAR4)));
+    let v6 = Some((IpAddr::from(APP6), IpAddr::from(FAR6)));
+    // decided before the header passed: nothing was read
+    let mut bad_sum = good4();
+    bad_sum[10] ^= 0x01;
+    let mut cut4 = good4();
+    cut4.pop();
+    let mut cut6 = good6();
+    cut6.pop();
+    let mut version5 = good4();
+    version5[0] = 0x50 | (version5[0] & 15);
+    for (what, packet) in [
+        ("no packet", Vec::new()),
+        ("a version of 5", version5),
+        ("a header of four words", short_header_syn()),
+        ("a header checksum that fails", bad_sum),
+        ("an IPv4 packet cut short", cut4),
+        ("an IPv6 packet cut short", cut6),
+    ] {
+        assert_eq!(ends_of(&packet), None, "{what}");
+    }
+    // IPv6 while it is off is decided on the version alone, however good
+    // the packet is
+    assert_eq!(classify(&good6(), false).unwrap_err().ends, None);
+    // decided after: the packet's own two addresses
+    let mut fragment6 = good6();
+    fragment6[6] = 44;
+    let mut hop_by_hop = good6();
+    hop_by_hop[6] = 0;
+    let port0 = |src: SocketAddr, dst: SocketAddr| tcp_packet(src, dst, &tcp_repr(src, dst, &[]));
+    for (what, packet, ends) in [
+        (
+            "a fragment",
+            with_fragment_field(good4(), MORE_FRAGMENTS),
+            v4,
+        ),
+        ("an IPv6 fragment", fragment6, v6),
+        (
+            "a martian",
+            syn4(Ipv4Addr::UNSPECIFIED, FAR4),
+            Some((Ipv4Addr::UNSPECIFIED.into(), FAR4.into())),
+        ),
+        (
+            "an IPv6 martian",
+            syn6(APP6, Ipv6Addr::LOCALHOST),
+            Some((APP6.into(), Ipv6Addr::LOCALHOST.into())),
+        ),
+        (
+            "a protocol nothing handles",
+            ipv4_packet(47, APP4, FAR4, &[0; 8]),
+            v4,
+        ),
+        ("an extension header", hop_by_hop, v6),
+        (
+            "a TCP header cut short",
+            ipv4_packet(6, APP4, FAR4, &[0; 12]),
+            v4,
+        ),
+        ("TCP port 0", port0(sock(APP4, 0), sock(FAR4, SERVICE)), v4),
+        (
+            "TCP port 0 over IPv6",
+            port0(sock(APP6, PORT), sock(FAR6, 0)),
+            v6,
+        ),
+        (
+            "UDP port 0",
+            udp_packet(sock(APP6, 0), sock(FAR6, 53), b""),
+            v6,
+        ),
+        (
+            "an ICMP header cut short",
+            ipv4_packet(1, APP4, FAR4, &[8, 0, 0]),
+            v4,
+        ),
+        (
+            "an ICMP message that is no echo request",
+            ipv4_packet(1, APP4, FAR4, &[3, 0, 0, 0, 0, 0, 0, 0]),
+            v4,
+        ),
+        (
+            "an ICMPv6 message that is no echo request",
+            ipv6_packet(58, APP6, FAR6, &[1, 0, 0, 0, 0, 0, 0, 0]),
+            v6,
+        ),
+    ] {
+        assert_eq!(ends_of(&packet), ends, "{what}");
+    }
 }
 
 #[test]
@@ -631,9 +740,35 @@ fn the_shard_reads_the_segment_classify_found() {
     assert_eq!(segment(&good4()[..30]), None);
 }
 
+/// A shard is given only what `classify` let through. A test at the shard's
+/// level hands it packets itself, and one that `classify` turns away (here a
+/// SYN to the loopback address) would be ignored without a word: in a build
+/// with debug assertions the shard says so.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "a shard is given only what classify let through")]
+fn a_shard_given_what_classify_turned_away_says_so() {
+    use crate::tcp::{Budget, Shard};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let options = TunOptions::default();
+    let budget = Arc::new(Budget::new(
+        options.budget,
+        options.buffer_min,
+        options.tx_max,
+    ));
+    let shard = Shard::new(1500, Instant::now(), 1, budget, &options);
+    let to_loopback = syn_v4(addr("198.18.0.1:40000"), addr("127.0.0.1:80"));
+    shard.state().turn(Instant::now(), &mut vec![to_loopback]);
+}
+
 /// Nothing a damaged packet holds makes `classify` panic or promise more than
 /// the packet has, and what it lets through reads the same once cut to
-/// its length (which is what the shards are given).
+/// its length (which is what the shards are given). A byte changed in an IPv4
+/// header is stopped at its checksum, so each change is made twice there: as
+/// it is, and with the checksum worked out again, which lets it reach the
+/// checks after it.
 #[test]
 fn damaged_packets_are_dropped_without_a_panic() {
     let (src, dst) = (sock(APP4, 5353), sock(FAR4, 53));
@@ -647,6 +782,7 @@ fn damaged_packets_are_dropped_without_a_panic() {
         echo_packet(APP6.into(), FAR6.into()),
     ];
     for base in &bases {
+        let ipv4 = base[0] >> 4 == 4;
         for ipv6 in [true, false] {
             let check = |packet: &[u8]| {
                 if let Ok(parsed) = classify(packet, ipv6) {
@@ -662,6 +798,11 @@ fn damaged_packets_are_dropped_without_a_panic() {
                     let mut packet = base.clone();
                     packet[at] = value;
                     check(&packet);
+                    // a header length that reaches past the packet has no
+                    // checksum to work out
+                    if ipv4 && usize::from(packet[0] & 15) * 4 <= packet.len() {
+                        check(&refresh(packet));
+                    }
                 }
             }
         }
@@ -942,6 +1083,49 @@ async fn each_reason_warns_once() {
         .expect("a DEBUG line for the second unsupported packet");
     assert!(unsupported.contains("src=fd00:6152::1"), "{unsupported}");
     assert!(unsupported.contains("dst=2001:db8::1"), "{unsupported}");
+}
+
+/// The DEBUG line of a drop has the two addresses of the packet when they
+/// were read: for a fragment, a protocol nothing handles and a TCP port 0
+/// they are there, for a header checksum that fails and for IPv6 while it is
+/// off they are not. The first drop of a reason is its WARN, which has none.
+#[test]
+fn a_debug_line_has_the_addresses_that_were_read() {
+    let log = LogCapture::start();
+    let (to_shard, _shard) = mpsc::channel(1);
+    let stats = Stats::default();
+    let mut bad_sum = good4();
+    bad_sum[10] ^= 0x01;
+    let (src, dst) = (sock(APP4, 0), sock(FAR4, SERVICE));
+    let port0 = tcp_packet(src, dst, &tcp_repr(src, dst, &[]));
+    let fragment = with_fragment_field(good4(), MORE_FRAGMENTS);
+    let unhandled = ipv4_packet(47, APP4, FAR4, &[0; 8]);
+    for (packet, ipv6) in [
+        (bad_sum.clone(), true),
+        (bad_sum, true),
+        (port0, true),
+        (fragment.clone(), true),
+        (fragment, true),
+        (unhandled.clone(), true),
+        (unhandled, true),
+        (good6(), false),
+    ] {
+        route(packet, ipv6, std::slice::from_ref(&to_shard), &stats);
+    }
+    let ends = "src=198.18.0.1 dst=192.0.2.1";
+    assert_eq!(
+        log.lines(),
+        [
+            warning(Reason::Malformed),
+            "DEBUG tun: packet dropped reason=malformed".to_owned(),
+            format!("DEBUG tun: packet dropped reason=malformed {ends}"),
+            warning(Reason::Fragment),
+            format!("DEBUG tun: packet dropped reason=fragment {ends}"),
+            warning(Reason::Unsupported),
+            format!("DEBUG tun: packet dropped reason=unsupported {ends}"),
+            "DEBUG tun: packet dropped reason=unsupported".to_owned(),
+        ]
+    );
 }
 
 /// A shard's queue that is full drops the packet, counts it and says so as
