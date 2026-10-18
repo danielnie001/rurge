@@ -125,7 +125,7 @@ impl Tun {
 pub struct TunOptions {
     pub ipv6: bool,
     pub drop_hold: Duration,
-    /// Shards of the TCP stack: 256 had the highest packet rate in B2 with 10,000 idle connections; memory is the same.
+    /// Shards of the TCP stack: 256 had the highest packet rate in B2 with 10,000 idle connections, for about 4 MB more peak memory than 64.
     pub shards: usize,
     /// The smallest buffer of a TCP socket: 4 KiB is the only minimum that kept B2 within its memory line.
     pub buffer_min: usize,
