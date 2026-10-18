@@ -25,13 +25,13 @@
 
 阶段 2 要实现的每种出站协议和每种组类型都实现了、有回环用例（不实现的 `tailscale`、Snell v6、手册不再列出的 `ss` 方法名与排在阶段 3 的 `subnet` 组不在其内，见第 8 条）；需求逐句对照代码在阶段 2 没有查出缺失的条款，只查出 5 句只做到解析。验收没有完成。下面一行一条，用词不会读成"全部完成"：
 
-- **第 1 条　未满足**。回环用例覆盖每种协议的 TCP 和能转发 UDP 的协议的 UDP（`socks5-tls` 的 UDP 与 `https` 的引擎级用例除外）；标准要求的是对参考服务器，63 个互操作用例没有一个对真实的二进制运行过。
+- **第 1 条　未满足**。回环用例覆盖每种协议的 TCP 和能转发 UDP 的协议的 UDP（`socks5-tls` 的 UDP 与 `https` 的引擎级用例除外）；标准要求的是对参考服务器，63 个互操作用例没有一个对真实的二进制运行过。（2026-10-18：它们在运行 39022550224（`7bd6589`）里对真实的二进制跑过一次，装了参照服务端的平台上除五条之外都通过，见第 8 节的更新；CI 仍没有绿过，这一条仍是未满足。）
 - **第 2 条　回环用例满足，等第一次 CI 绿**。两级 TCP 链与 UDP 载体链都有用例，底层都是回环假服务端。
 - **第 3 条　回环用例满足，等第一次 CI 绿**。五种算法与六个端点都有用例；"重启后保留"是进程内由同一份 `state.json` 新建引擎，没有两次真实的进程。
 - **第 4 条　回环用例满足，等第一次 CI 绿**。订阅样本是用例里手写的，没有真实订阅。
 - **第 5 条　回环用例满足，等第一次 CI 绿**。官方 `shadow-tls` 服务端没有互操作用例。
 - **第 6 条　回环对端上满足，等第一次 CI 绿**。真实的 WireGuard 服务端与 WARP 要手工验。
-- **第 7 条　回环用例满足，等第一次 CI 绿**。DoQ / DoH3 的 4 个互操作用例没有对真实二进制运行过。
+- **第 7 条　回环用例满足，等第一次 CI 绿**。DoQ / DoH3 的 4 个互操作用例没有对真实二进制运行过。（2026-10-18：这 4 个用例在运行 39022550224（`7bd6589`）里对真实的 dnsproxy 与 CoreDNS 跑过一次，三个平台都通过；CI 仍没有绿过。）
 - **第 8 条　未满足**。三平台 CI 没有绿过；clippy 零警告与 `W0007` / `W0008` 两项在本机成立。
 - **第 9 条　清单已有，手工验收一项没做**。22 节 187 项。
 - **需求逐条对照代码　阶段 1 有 20 句不在（2026-10-10 的数），阶段 1 补遗（M5a）补上了大部分**。阶段 1：287 句里 20 句没有落地或只做到解析（只解析 12、没有 8），其中有托管配置的更新与远程 `#!include` 两项 P0；2026-10-11 的阶段 1 补遗（M5a）之后，表里的 13 行补上了 10 行，剩下托管配置的更新、远程 `#!include` 与外部资源的手动强制更新三行，属阶段 1 补遗（M5b）；阶段 2：196 句里 5 句只做到解析（4 句启动时由 `W0029` 登记，1 句 `hidden` 没有登记），没有完全缺失的，另有 1 句未能判定。审计只读代码，没有运行，不证明别处没有缺口；阶段 1 补遗（M5a）就在判为"做了"的 FR-RULE-05 上查出一条只做了一部分的。
@@ -45,12 +45,14 @@
 | 5　Shadow TLS 与六个 TLS 参数 | v2、v3 的协议层、引擎级与配置层用例；六个参数各有配置读取与握手用例 | 3 个：sing-box `shadowtls` 入站 2 个，sing-box `https` 入站 1 个（覆盖六个参数中的三个：`sni`、`server-cert-fingerprint-sha256`、`client-cert`；另有根证书校验） | 官方 `shadow-tls` 服务端只在手工清单；`skip-cert-verify`、`server-cert-verify-name`、`alpn` 没有对参照服务端的用例 |
 | 6　WireGuard 与带 `client-id` 的端点 | `FakeWgPeer` 上带 `client-id` 的握手与转发（TCP、UDP、测速）；保留字节的编解码；隧道的结束方式与重建 | 1 个：sing-box 的 WireGuard 端点，`client-id = 1/2/3` | 对真实 WireGuard 服务端与 WARP 的运行（手工清单 M4b）；重新握手 / keepalive / 过期的计时器没有用例让 90 或 120 秒过去 |
 | 7　`h3://` 与 `quic://` 上游 | URL 解析、DoQ、DoH3、两者共用的会话、经解析器与经跟随出站模式的用例 | 4 个：dnsproxy v0.86.0 与 CoreDNS v1.14.7 各 DoQ、DoH3 | 对真实二进制的运行；夹具的命令行、Corefile 与就绪日志读自源码；公共 DoQ / DoH3 服务（手工清单 M7c） |
-| 8　CI 绿、clippy、`W0007` / `W0008` | `W0007`、`W0008` 的出现条件在配置层、注册表、引擎与 `rurge check` 各有用例；clippy 在本机零警告 | 不适用 | CI 没有绿过：最近一次运行（`0154e73`）的 `cargo test` 在三平台都失败，失败清单未读到；那以后的提交（到 `44a0204` 是 76 个）没有一个被 CI 见过；CI 里没有单独的互操作任务，互操作用例在 `cargo test --workspace` 一步里 |
+| 8　CI 绿、clippy、`W0007` / `W0008` | `W0007`、`W0008` 的出现条件在配置层、注册表、引擎与 `rurge check` 各有用例；clippy 在本机零警告 | 不适用 | CI 没有绿过：最近一次运行（`0154e73`）的 `cargo test` 在三平台都失败，失败清单未读到；那以后的提交（到 `44a0204` 是 76 个）没有一个被 CI 见过；CI 里没有单独的互操作任务，互操作用例在 `cargo test --workspace` 一步里。2026-10-18 的更新：下一次运行（39022550224，`7bd6589`）读得到失败清单——Linux 跑完全部测试二进制、5 条失败，macOS 与 Windows 停在 `rurge-proto` 的单元测试里、五组测试没有跑到；六类失败已修（`f8d0389`、`4fc1bad`、`cae06c3`、`26be5e2`、`c048315`、`2519b3f`、`0deba9f`、`f9377a8`、`94cfd9e`），修好没有要再推送一次才知道，见第 8 节的更新 |
 | 9　手工验收清单 | 不适用 | 不适用 | `docs/acceptance/phase2-manual.md` 存在，22 节共 187 项，没有一项做过；阶段 1 的 `docs/acceptance/phase1-manual.md` 的 34 项也没做（2026-10-13 的更新：这份清单现在是 45 行，仍是一行也没有做过，见「留给项目所有者的」第 5 项；2026-10-14 的更新：手册基线重对又加了 1 行，现在是 46 行） |
 
 能说的：第 2、3、4、5、7 条的文字要求的是用例，这些用例存在，并在本机（Windows）的全量运行里通过；第 6 条在回环对端上成立；第 8 条的 clippy 与 `W0007` / `W0008` 两项在本机成立；第 9 条要求的清单存在。不能说的：第 1 条要求对参考服务器，63 个互操作用例没有一个对真实的二进制运行过；第 8 条要求三平台 CI 绿，CI 没有绿过——本地的 `origin/main` 是 `0154e73`，之后的提交（到 `44a0204` 是 76 个）没有一个被 CI 见过——；第 9 条的手工验收，187 项没有一项做过。回环用例的结果只有本机（Windows）的，Linux 与 macOS 上还没有一次可读的结果（`0154e73` 那次 CI 运行的日志读不到）。阶段 1 也不能说"齐备"：2026-10-10 查出 20 句需求条款没有落地或只做到解析，阶段 1 补遗（M5a）补上了其中的大部分，还剩托管配置的更新、远程 `#!include` 与外部资源的手动强制更新（阶段 1 补遗（M5b））；判为"做了"的条款没有人复核过，阶段 1 补遗（M5a）就在 FR-RULE-05 上查出一条只做了一部分的，见「需求逐条对照代码」一节。 2026-10-13 的更新：这三项已由阶段 1 补遗（M5b）做出来；阶段 1 的需求也逐句对着代码重读了一遍（416 句，`docs/acceptance/phase1-acceptance.md`），结果是三个数，要一起看：3 句没有做完，37 句的阶段栏写着阶段 1 而登记在后面的阶段，14 句有意做成了别的样子并已登记。所以阶段 1 仍然不说"齐备"；这一遍也没有覆盖阶段 1 的手工验收清单（一行也没有做过）与 CI（没有绿过）。
 
 2026-10-14 的更新：手册基线重对（报告 `docs/reports/2026-10-14-manual-baseline-recheck.md`）把项目对照的手册前移到 Surge Mac 6.10.0 / iOS 5.23.0，阶段 1 的三个数随之成了 **2 句没有做完，37 句的阶段栏写着阶段 1 而登记在后面的阶段，10 句有意做成了别的样子并已登记**（上面 2026-10-13 的更新写的是 3、37、14）：手册 IP 页的 `GEOIP,UNKNOWN` 与 `IP-ASN,UNKNOWN` 那一句补上了（`9b0bcfe`，原来记"没有做完"），DNS 连接的三个协议标签与 `PROTOCOL` 规则匹配那 4 句随标签改按 URL 的方案补上了（`42c2294`，原来记"有意不同"）。所以阶段 1 仍然不说"齐备"。这一轮没有观察过 Surge 的实际行为，也没有对着代码重读阶段 1、2 的其余各行（只核对了 47 处）；手工验收清单现在是阶段 2 的 22 节 187 项与阶段 1 的 46 行，一行也没有做过，CI 没有绿过。细节见「需求逐条对照代码」一节的「手册基线重对之后（2026-10-14）」。
+
+2026-10-18 的更新：最近一次 CI 运行是 `7bd6589`（2026-10-17，运行号 39022550224），这一阶段第一次读得到三个平台的失败清单。结论不变：CI 没有绿过，第 1 条与第 8 条仍是未满足。但上面和下面写着“互操作用例没有对真实的二进制运行过”“Linux 与 macOS 上没有一次可读的结果”的几处要这样读：那一次运行里，Linux 跑完了全部测试二进制，macOS 与 Windows 只跑到 `rurge-proto` 的单元测试（五组测试没有跑到），装了参照服务端的平台上互操作用例除五条之外都通过，六类失败已修、修好没有要下一次推送才知道，详见第 8 节的更新。表头与小标题里的“已写，尚未对真实的二进制运行”“均未运行”是写这份文件当天的写法，没有逐处改；各条的互操作一节、“还缺什么”和「留给项目所有者的」第 2 节里写着这类话的地方，各补了一句注明日期的说明。
 
 ## 1. 每种协议对参考服务器的 TCP 转发通过；支持 UDP 的协议 UDP 转发通过
 
@@ -94,6 +96,8 @@ M8c 另加的、属于本条的回环证据：
 
 ### 互操作（已写，尚未对真实的二进制运行）
 
+2026-10-18 的更新：下表的参照服务端在运行 39022550224（`7bd6589`）里对真实的二进制跑过一次（CI 上装了它们的平台）：用例除五条之外都通过——`ss` 对 sing-box 与对 `ssserver` 的 SS 2022 用例（三个平台，收回包的缓冲只有 64 字节）、`snell` 对 snell-server 的 UDP 与 obfs 用例（Linux，回包的来源没有归一）、`masque` 对 masque-server 的 TCP 用例（Linux，masque-server 每条隧道只排 1 MiB 客户端的字节）——，根因与修正见第 8 节的更新。这是一次运行的结果，CI 仍没有绿过，修正有没有用要下一次推送才知道；各平台实际跑了多少个互操作用例没有读到（任务日志要登录才能读）。
+
 互操作用例经配置加载与 `EngineFactory` 构建出站（`tests/interop/tests/common/mod.rs`：`outbound`），直接驱动出站的 `connect_tcp` 与 `open_udp`，目标是回环上的回显服务器；不经入站与规则。除 `sshd` 外，参照服务端都固定了版本，CI 下载并校验 SHA-256（见 `tests/interop/README.md`）。
 
 | 参照服务端 | 固定版本 | CI 上的平台 | 用例数 | 文件 | 覆盖 |
@@ -113,7 +117,7 @@ M8c 另加的、属于本条的回环证据：
 
 夹具自身的单元用例不需要参照二进制，在本机运行并通过，例如 `tests/interop/src/lib.rs`：`the_configuration_never_touches_the_machine`、`tests/interop/src/mihomo.rs`：`the_command_line_is_written_as_mihomo_reads_it`。它们证明夹具按作者对参照服务端的理解写出配置与命令行，不证明参照服务端接受。互操作用例逐项记失败、最后一起报，用的 `Failures` 有 Drop 守卫：记过失败而没有 `finish` 就被丢掉时，用例当场失败（`tests/interop/tests/shadowsocks.rs`：`failures_that_are_never_finished_fail_the_test`、`nothing_that_failed_need_not_be_finished`、`failures_dropped_by_a_test_that_fails_otherwise_say_nothing`，不需要参照二进制）；守卫当场找出了一条一直静默通过的用例（`tests/interop/tests/mihomo.rs`：`only_the_two_sentences_of_an_unanswered_request_are_taken`）。
 
-第一次 CI 运行要核对的夹具细节（读自参照实现的源码，没有对真实二进制验证过）：mihomo 的配置键、就绪探测、日志行，以及 PSK 或版本不符时它关闭还是重置连接；masque-server 的命令行、配置键、就绪日志，以及 CONNECT 的 2xx 之后会不会再发 HEADERS；TrustTunnel endpoint 的 QUIC 监听（空表启用、TCP 与 UDP 同一个端口号、就绪日志）；tuic-server 的命令行、七个配置键与就绪日志；dnsproxy 与 CoreDNS 的命令行、Corefile 与就绪日志；官方 snell-server 读不出请求时的反应；一次拉起多个端口的夹具（sing-box、xray、dnsproxy、CoreDNS、mihomo、ssserver）改成一次取齐端口（`tests/interop/src/lib.rs`：`free_ports`），这个改动也没有对真实的参照服务端跑过。逐项见 `tests/interop/README.md` 各服务端一节。
+第一次 CI 运行要核对的夹具细节（读自参照实现的源码，没有对真实二进制验证过）：mihomo 的配置键、就绪探测、日志行，以及 PSK 或版本不符时它关闭还是重置连接；masque-server 的命令行、配置键、就绪日志，以及 CONNECT 的 2xx 之后会不会再发 HEADERS；TrustTunnel endpoint 的 QUIC 监听（空表启用、TCP 与 UDP 同一个端口号、就绪日志）；tuic-server 的命令行、七个配置键与就绪日志；dnsproxy 与 CoreDNS 的命令行、Corefile 与就绪日志；官方 snell-server 读不出请求时的反应；一次拉起多个端口的夹具（sing-box、xray、dnsproxy、CoreDNS、mihomo、ssserver）改成一次取齐端口（`tests/interop/src/lib.rs`：`free_ports`），这个改动也没有对真实的参照服务端跑过。逐项见 `tests/interop/README.md` 各服务端一节。2026-10-18 的更新：运行 39022550224（`7bd6589`）里，这些夹具在 CI 装了对应参照服务端的平台上都拉起来了，用例除第 8 节更新里的五条之外都通过，所以上面列的命令行、配置键、就绪探测与日志行，以及一次取齐端口的改动，对真实的二进制行得通（mihomo 的配置与就绪探测、masque-server 的命令行与就绪日志、TrustTunnel endpoint 的 QUIC 监听、tuic-server 的七个键与就绪日志、dnsproxy 与 CoreDNS 的命令行与 Corefile）。通过的用例定不下来的仍然开着：mihomo 与官方 snell-server 在 PSK 或版本不符时是关闭还是重置连接（用例收两句话之一，只说明它们很快结束了连接）、masque-server 与 TrustTunnel endpoint 会不会在 CONNECT 的 2xx 之后再发 HEADERS（要看任务日志，任务日志要登录才能读，公开的只有注解与摘要）、mihomo 启动时联不联网和在主目录里留下什么。
 
 ### 没有参照服务端的情形
 
@@ -128,9 +132,9 @@ M8c 另加的、属于本条的回环证据：
 
 ### 还缺什么
 
-- 63 个互操作用例（本条 59 个，第 7 条的 DNS 4 个）没有一个对真实的二进制运行过：本机没有任何参照服务端，CI 没有可读的结果（第 8 条）。要把第 1 条算作满足，需要一次三平台 CI 全绿的运行，且 `RURGE_INTEROP_REQUIRED=1` 保证这些用例跑了而不是跳过。
-- 上节"第一次 CI 运行要核对的夹具细节"里的各项是读源码得出的，没有对真实二进制验证过；用例失败时，先分清是夹具与参照服务端不符，还是 rurge 的问题。
-- AnyTLS 的 SYNACK 看门狗（复用的会话上 3 秒内没有应答的新流就关会话）没有对真实服务端验证过，第一次 CI 运行也验证不了：互操作用例在几毫秒内放掉每条流，UDP 用例用新会话的第一条流，看门狗不看它；假服务端应答的次序是照 anytls-go 的源码写的。会验证它的是一个在复用的会话上活过 3 秒的流的互操作用例（手工清单 M8c 一节有对应的两项）。
+- 63 个互操作用例（本条 59 个，第 7 条的 DNS 4 个）没有一个对真实的二进制运行过：本机没有任何参照服务端，CI 没有可读的结果（第 8 条）。要把第 1 条算作满足，需要一次三平台 CI 全绿的运行，且 `RURGE_INTEROP_REQUIRED=1` 保证这些用例跑了而不是跳过。（2026-10-18：它们在运行 39022550224（`7bd6589`）里对真实的二进制跑过一次，装了参照服务端的平台上除五条之外都通过，见第 8 节的更新；这只是一次运行的结果，CI 仍没有绿过，这一条仍是未满足。）
+- 上节"第一次 CI 运行要核对的夹具细节"里的各项是读源码得出的，没有对真实二进制验证过；用例失败时，先分清是夹具与参照服务端不符，还是 rurge 的问题。（2026-10-18：见上节末尾的更新。）
+- AnyTLS 的 SYNACK 看门狗（复用的会话上 3 秒内没有应答的新流就关会话）没有对真实服务端验证过，第一次 CI 运行也验证不了：互操作用例在几毫秒内放掉每条流，UDP 用例用新会话的第一条流，看门狗不看它；假服务端应答的次序是照 anytls-go 的源码写的。会验证它的是一个在复用的会话上活过 3 秒的流的互操作用例（手工清单 M8c 一节有对应的两项）。（2026-10-18：运行 39022550224 也没有验证到它，这一条不变：互操作用例照旧在几毫秒内放掉每条流。）
 - `socks5-tls`：没有 UDP 用例，没有引擎级用例；手工清单 M8c 一节有一项对真实的 SOCKS5 over TLS 服务器，没有做。
 - `https`：没有引擎级用例，只有协议级用例与对 sing-box 的互操作用例。
 - Gecko 混淆与 Surge 的 `gecko-password` 是否同一规范未证实（M7-D11，手工清单 M7a 一节记下结果）；`masque` 的认证头 `proxy-authorization` 是 rurge 的选择，手册没写 Surge 用哪个字段（手工清单 M7c 一节"与 Surge 对照"）。
@@ -282,6 +286,8 @@ Shadow TLS：
 
 ### 互操作（已写，尚未对真实的二进制运行）
 
+2026-10-18 的更新：下面三个用例在运行 39022550224（`7bd6589`）里对真实的 sing-box 1.14.2 跑过一次，三个平台都通过；这是一次运行的结果，CI 仍没有绿过，见第 8 节的更新。
+
 - sing-box 的 `shadowtls` 入站（v2、v3，v3 开 `strict_mode`）前接 `trojan`。`tests/interop/tests/sing_box_shadow_tls.rs`：`trojan_behind_shadow_tls_v2_and_v3`（小负载与跨多帧往返，伪装站点收到配置的 SNI）、`a_wrong_shadow_tls_password_is_not_relayed`（v3 报 `shadow-tls: the server did not authenticate itself`，伪装站点确实收到那个 HTTP 请求）。
 - sing-box 的 `http` 入站加 TLS，覆盖六个参数中的 `sni`、`server-cert-fingerprint-sha256`、`client-cert` 与根证书校验。`tests/interop/tests/sing_box.rs`：`https_with_a_private_ca_a_pinned_fingerprint_and_a_client_certificate`。
 
@@ -309,11 +315,13 @@ Shadow TLS：
 
 ### 互操作（已写，尚未对真实的二进制运行）
 
+2026-10-18 的更新：这个用例在运行 39022550224（`7bd6589`）里对真实的 sing-box 1.14.2 跑过一次，三个平台都通过；这是一次运行的结果，CI 仍没有绿过，见第 8 节的更新。
+
 `tests/interop/tests/sing_box_wireguard.rs`：`a_connection_goes_through_a_sing_box_wireguard_endpoint`：sing-box 1.14.2 的 WireGuard 端点（`endpoints`，`system: false`，用户态）以 rurge 为唯一的 peer，给发往它的每个报文写保留字节 `1/2/3`；rurge 的策略写 `client-id = 1/2/3`，握手后经隧道往返单块与跨多块的 TCP、一个 UDP 回显，并做原生的握手测速。
 
 ### 还缺什么
 
-- 上面这个用例没有对真实的 sing-box 运行过。
+- 上面这个用例没有对真实的 sing-box 运行过。（2026-10-18：它在运行 39022550224（`7bd6589`）里对真实的 sing-box 1.14.2 跑过一次，三个平台都通过。）
 - 真实的 WireGuard 服务端（`wg-quick`、路由器、云主机）与 Cloudflare WARP 没有跑过：手工清单 M4b 一节的基本连通、吞吐、WARP 与"WARP 启动后的第一次查询"各项没有做。吞吐只有回环基准（`crates/rurge-proto-wireguard/src/outbound.rs`：`throughput`，忽略项，两端都是 smoltcp，不作门禁）。
 - 重新握手、keepalive 与过期的计时器由 boringtun 的计时器驱动（设备任务每 250 毫秒推进一次，peer 的 `keepalive` 交给它），没有用例让 90 或 120 秒过去，假对端建时没有 keepalive（需求审计的"做了而没找到用例"一项）。
 
@@ -335,11 +343,13 @@ Shadow TLS：
 
 ### 互操作（已写，尚未对真实的二进制运行）
 
+2026-10-18 的更新：这 4 个用例在运行 39022550224（`7bd6589`）里对真实的 dnsproxy v0.86.0 与 CoreDNS v1.14.7 跑过一次，三个平台都通过；这是一次运行的结果，CI 仍没有绿过，见第 8 节的更新。
+
 `tests/interop/tests/dns.rs`：`doq_against_dnsproxy`、`doh3_against_dnsproxy`、`doq_against_coredns`、`doh3_against_coredns`。dnsproxy v0.86.0 与 CoreDNS v1.14.7 各自作答同一个名字的 A 与 AAAA；每个用例用两个解析器：一个直连，一个只经 `connect_udp` 拿载体（与跟随出站模式相同），后者的四个问题必须都在一条连接上。CoreDNS 对报文 ID 不是 0 或带 edns-tcp-keepalive 选项的 DoQ 查询以协议错误关连接，DoH3 只在 `/dns-query` 上作答（这两点读自它的源码，没有对真实的二进制验证过），所以它是严格的那个。
 
 ### 还缺什么
 
-- 四个用例没有对真实的二进制运行过；dnsproxy 与 CoreDNS 的命令行、Corefile 与就绪日志读自源码。
+- 四个用例没有对真实的二进制运行过；dnsproxy 与 CoreDNS 的命令行、Corefile 与就绪日志读自源码。（2026-10-18：它们在运行 39022550224（`7bd6589`）里对真实的 dnsproxy 与 CoreDNS 跑过一次，三个平台都通过，命令行、Corefile 与就绪日志对真实的二进制行得通。）
 - `rurge dns lookup` 命令行没有 `quic://` 或 `h3://` 的用例；手工清单 M7c 一节"公共 DoQ / DoH3"用公共服务做这件事。
 - 手工清单 M7c 一节的"公共 DoQ / DoH3"、"跟随出站模式"、"混用加密上游"三项没有做。
 
@@ -358,6 +368,19 @@ Shadow TLS：
 - 本地的 `origin/main` 是 `0154e73`；它之后到 `44a0204` 有 76 个提交，没有一个被 CI 见过：M8a 的失败摘要与凭据不外泄，M8b 的流式方法、Snell v1 ～ v3、mihomo 的安装步骤与互操作用例，M8c 的全部改动与终审之后的修正波。
 - 失败摘要（`a965db1`）已提交，没有推送；自 `0154e73` 起没有推送过。读失败清单并修掉是 M8a 任务 6，等推送之后做。
 - 只在 Unix 编译的用例（`crates/rurge/tests/cli.rs`：`run_shuts_down_gracefully_on_sigint`）在本机（Windows）不编译；只在 Windows 编译的用例（`crates/rurge-engine/tests/pipeline.rs`：`a_doq_carrier_that_outlives_a_port_unreachable_is_no_failed_session`）只在本机编译；`tests/interop/tests/sshd.rs` 的 2 个也只在 Unix 上编译。它们在 CI 上都没有可读的结果。
+
+2026-10-18 的更新：上面写的“本地的 `origin/main` 是 `0154e73`”已经过时——项目所有者推送过了，最近一次运行在 `7bd6589`（2026-10-17，运行号 39022550224；它是阶段 3 / M1 的合并，阶段 3 / M2 的提交不在里面）。这次运行读得到失败清单，结论仍是**未满足**：CI 没有绿过。`bench` 任务通过；`check` 任务里，`cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings` 与全部参照服务端（连同 mihomo）的安装步骤三个平台都通过，三个平台都在 `cargo test` 一步失败。Linux 6 分半跑完了全部测试二进制，以 101 退出，5 条失败。macOS 与 Windows 又用满了测试一步的 60 分钟，都停在 `rurge-proto` 的单元测试二进制里（各有三条用例没有结束）；测试二进制按包名的次序一个接一个地跑，所以只跑到排在它前面的各包——`rurge`、`rurge-api`、`rurge-config`、`rurge-dns`、`rurge-engine`、`rurge-external-tests`、`rurge-inbound`、`rurge-interop`、`rurge-net`、`rurge-platform`、`rurge-policy`——，macOS 上 6 条失败、Windows 上 7 条失败；`rurge-proto` 的集成测试与 `rurge-proto-quic`、`rurge-proto-ssh`、`rurge-proto-wireguard`、`rurge-rules` 这五组测试在这两个平台上没有跑到，`rurge-proto` 单元测试里别的用例在这两个平台上的结果也不知道（失败用例的输出要到二进制结束时才打印）。失败摘要这一次认出了全部失败，所以第 1 条与第 7 条要的互操作用例第一次有了对真实二进制的结果：装了参照服务端的平台上，除下面第 2 ～ 4 类的五条之外都通过——这是那一次运行的结果，CI 仍没有绿过；各平台实际跑了多少个互操作用例没有读到（任务日志要登录才能读），按第 1 条那张表的平台一栏算，应当是 Windows 44、macOS 52、Linux 63。
+
+六类失败按根因分（根因读自代码、参照服务端的源码与那次运行的注解，本机能复现的只有第 1 类），修在这些提交上：
+
+- 第 1 类（macOS、Windows）：`rurge-proto` 里 `shadowsocks` 与 `snell` 的单元用例各有三条没有结束——`LazyHead` 的两半交给两个任务轮询时丢了写端的唤醒。`f8d0389` 在类型里修，`4fc1bad` 把在别的任务里写、在用例的任务里等它写完的 18 处限时 30 秒，`cae06c3` 加四条用例（其中一条用真实的管道、两半各在一个任务里复现了这一类，旧代码上红），`26be5e2` 收尾。
+- 第 2 类（三个平台）：`ss` 的 SS 2022 对 sing-box 与对 `ssserver` 的两个用例——收 UDP 回包的缓冲只有 64 字节，装不下 65 字节的回包。`c048315`。
+- 第 3 类（Linux）：`snell` 对 snell-server 的 UDP 与 obfs 两个用例——snell-server 的双栈 socket 把 IPv4 的来源写成 `::ffff:127.0.0.1`，出站照原样报回，用例比较时没有归一。`2519b3f`。
+- 第 4 类（Linux）：`masque` 对 masque-server 的 TCP 用例——masque-server 每条 TCP 隧道至多排 1 MiB 客户端发来而还没写给目标的字节，超出即以 H3_CONNECT_ERROR 重置。这是参照服务端的限制，用例改为节制上行（至多领先回读 512 KiB，总长不变），限制登记在兼容性清单 4.2 节 `masque` 一行。`0deba9f`。
+- 第 5 类（macOS）：`udp` 的三条与 `udp_tls_family` 的一条——macOS 上 UDP socket 的缺省发送缓冲是 9216 字节，更大的数据报以 `EMSGSIZE` 失败，失败在用例自己的 socket 上。`f9377a8` 把要发大数据报的测试 socket 的发送缓冲调到 256 KiB，并预先改了 `rurge-proto` 里两处预料中的同一种失败。
+- 第 6 类（Windows）：`rurge-api` 的五条用例——`MockDns::start` 找不到同时空闲的 TCP 与 UDP 端口，原因没有证据。`94cfd9e` 让两种绑定次序轮流试，找不到时说出两种绑定各自最后的错误。
+
+**要下一次推送才知道修好了没有。**只有第 1 类在本机复现过——`cae06c3` 里用真实的管道、两半各在一个任务里的用例，在旧代码上红、现在绿——；CI 上失败的那四条用例本身在本机用旧代码也过（本机的回环 socket 从不让写变成 `Pending`），所以它们没有被复现。第 2 ～ 6 类在本机无从复现（参照服务端本机一个也没有，第 5、6 类出在 CI 的 macOS 与 Windows 上），判据是本机的全量通过。macOS 与 Windows 上没有跑到的五组测试和 `rurge-proto` 单元测试其余用例的结果也要下一次推送。第 6 类的原因仍然不知道。AnyTLS 的 SYNACK 看门狗仍没有对真实服务端验证过，这次运行也验证不了它（第 1 条的“还缺什么”）。第 8 条仍是未满足：要有一次三平台全绿的运行。
 
 ### clippy
 
@@ -378,7 +401,7 @@ Shadow TLS：
 
 ### 还缺什么
 
-- CI 从没有绿过。要满足这一条：项目所有者推送（推送是他的）；读三平台的失败清单——失败摘要把失败的用例发成了注解与任务摘要，不登录也读得到——，修掉（M8a 任务 6）；再有一次三平台全绿的运行，且其中互操作用例都运行了（`RURGE_INTEROP_REQUIRED=1` 保证找不到二进制就失败；装不上的服务端只让它自己的用例失败，不让别的用例不运行）。
+- CI 从没有绿过。要满足这一条：项目所有者推送（推送是他的）；读三平台的失败清单——失败摘要把失败的用例发成了注解与任务摘要，不登录也读得到——，修掉（M8a 任务 6）；再有一次三平台全绿的运行，且其中互操作用例都运行了（`RURGE_INTEROP_REQUIRED=1` 保证找不到二进制就失败；装不上的服务端只让它自己的用例失败，不让别的用例不运行）。（2026-10-18：推送与读失败清单已经做了，六类失败的修正也做了，见上面的更新；还缺再推送一次与那一次的结果。）
 - 标准写的是"含互操作 job"，CI 里没有这样一个任务，互操作用例在 `cargo test --workspace` 一步里。要么把标准读作"互操作用例在那一步里全部运行并通过"，要么另拆一个任务；本文按前一种读法，没有改标准的文字。
 - clippy 在 `14b1183` 上还没有 CI 的结果。
 
@@ -597,13 +620,13 @@ Shadow TLS：
 
 ### 2. 验收证据还缺的
 
-1. **CI 从没绿过。** 最近一次运行在本地 `origin/main` 的 `0154e73` 上，`cargo test` 在三个平台都失败，之后的提交（到 `44a0204` 是 76 个）没有一个被 CI 见过。要产生证据：项目所有者推送；读三平台的失败清单（失败摘要把它发成注解与任务摘要，不登录也读得到）；修掉——这是 M8a 的任务 6，等推送之后做；再有一次三平台全绿的运行（计划「延后事项」第 49 行）。
-2. **没有一个互操作用例对真实的二进制跑过。** 63 个用例在本机跳过（61 个在本机编译）；好几个参照服务端的命令行、配置与就绪日志是读源码写的，夹具改取端口的改动也没有对真实的服务端跑过。要产生证据：同一次三平台全绿的 CI 运行，其中 `RURGE_INTEROP_REQUIRED=1` 保证这些用例跑了而不是跳过；某个用例红了，先分清是夹具与参照服务端不符，还是 rurge 的问题。
-3. **AnyTLS 的 SYNACK 看门狗没有对真实服务端验证过，第一次 CI 运行也验证不了**：互操作用例在几毫秒内放掉每条流，UDP 用例用新会话的第一条流，看门狗不看它；假服务端应答的次序是照参考实现的源码写的。要产生证据：一个在复用的会话上活过 3 秒的流的互操作用例（计划「延后事项」第 87 行）；手工清单 M8c 一节有对应的两项。
+1. **CI 从没绿过。** 最近一次运行在本地 `origin/main` 的 `0154e73` 上，`cargo test` 在三个平台都失败，之后的提交（到 `44a0204` 是 76 个）没有一个被 CI 见过。要产生证据：项目所有者推送；读三平台的失败清单（失败摘要把它发成注解与任务摘要，不登录也读得到）；修掉——这是 M8a 的任务 6，等推送之后做；再有一次三平台全绿的运行（计划「延后事项」第 49 行）。（2026-10-18：推送了，运行 39022550224 的失败清单读到了，六类失败修了，见第 8 节的更新；现在缺的是再推送一次：看修正管不管用，并拿到 macOS 与 Windows 上没跑到的五组测试的结果。）
+2. **没有一个互操作用例对真实的二进制跑过。** 63 个用例在本机跳过（61 个在本机编译）；好几个参照服务端的命令行、配置与就绪日志是读源码写的，夹具改取端口的改动也没有对真实的服务端跑过。要产生证据：同一次三平台全绿的 CI 运行，其中 `RURGE_INTEROP_REQUIRED=1` 保证这些用例跑了而不是跳过；某个用例红了，先分清是夹具与参照服务端不符，还是 rurge 的问题。（2026-10-18：它们在运行 39022550224（`7bd6589`）里对真实的二进制跑过一次，装了参照服务端的平台上除五条之外都通过，夹具改取端口的改动也随之跑过；这一条现在缺的是修正之后一次三平台全绿的运行，其中互操作用例都跑了而不是跳过。）
+3. **AnyTLS 的 SYNACK 看门狗没有对真实服务端验证过，第一次 CI 运行也验证不了**：互操作用例在几毫秒内放掉每条流，UDP 用例用新会话的第一条流，看门狗不看它；假服务端应答的次序是照参考实现的源码写的。要产生证据：一个在复用的会话上活过 3 秒的流的互操作用例（计划「延后事项」第 87 行）；手工清单 M8c 一节有对应的两项。（2026-10-18：运行 39022550224 也没有验证到它，这一条不变。）
 4. **mihomo 的用例**（Snell v1 ～ v3、`ss` 的流式方法、两种协议前面的 simple-obfs）可以在本机对项目所有者自己的 mihomo 跑，设 `RURGE_TEST_MIHOMO` 即可——是否这样做由所有者定。
 5. **两份手工清单一项也没做**：`docs/acceptance/phase2-manual.md` 22 节 187 项，`docs/acceptance/phase1-manual.md` 34 行。其中有几项的写法是读文档或源码得出的，没有人照着走过一遍（经 tailscaled 的 SOCKS5 接入、MASQUE 经 `underlying-proxy` 的数字）。 2026-10-13 的更新：阶段 1 的清单现在是 45 行（Windows 14、macOS 13、Linux 13，另有新的一节「与平台无关」5 行）。阶段 1 补遗（M5b）加了 11 行：真实服务商的托管配置、真实服务器上的远程 `#!include`、真实的 `strict`，三个平台各一行 API 连接收尾的检查，三个平台各一行真实的 `.local` 名字，以及由单播 DNS 服务器回答的 `.local` 区域与 `[Host]` 里的 `server:system`。仍是一行也没有做过；阶段 2 的清单没有变。 2026-10-14 的更新：手册基线重对在阶段 1 的清单「与平台无关」一节加了 1 行（现在是 46 行，与平台无关 6 行），在阶段 2 的清单加了新的一节「手册基线重对」2 项（现在是 22 节 187 项，第一句已按它写）；仍是一行也没有做过。
 6. **这台开发机与 CI 不同**：本机开着 Windows 的 Simple TCP/IP Services（回环 TCP 与 UDP 的 7、9、13、17、19 号端口），CI 上关着。写到 9 号端口的 66 行换成关着的端口后，整套用例只有一条变红，已改（`crates/rurge-engine/tests/smart.rs`：`udp_silence_counts_only_where_answers_always_come`），现在没有用例依赖它们。"立刻拒绝"（Linux、macOS）在本机只能用"接了立刻关"顶替，真的要等 CI。
-7. **阶段 1 补遗（M5a）里本机验不了的三处**：`sighup_reloads_the_profile` 与 `run_shuts_down_gracefully_on_sigint` 新加的一行等待只在 Unix 上编译，本机（Windows）没有编译过、运行过；`rurge_platform::sysinfo` 对 macOS 与 Linux 的读取只对着假的命令、文件与环境变量测过，macOS 的三种格式（`SystemVersion.plist`、`defaults read -g AppleLanguages`、`scutil --get`）取自公开描述。要产生证据：同一次三平台全绿的 CI 运行；`docs/acceptance/phase1-manual.md` 的 macOS 与 Linux 各有一行，由项目所有者在真实的机器上做（阶段 1 / M5a 计划「延后事项」第 1、2、13、23 行）。
+7. **阶段 1 补遗（M5a）里本机验不了的三处**：`sighup_reloads_the_profile` 与 `run_shuts_down_gracefully_on_sigint` 新加的一行等待只在 Unix 上编译，本机（Windows）没有编译过、运行过；`rurge_platform::sysinfo` 对 macOS 与 Linux 的读取只对着假的命令、文件与环境变量测过，macOS 的三种格式（`SystemVersion.plist`、`defaults read -g AppleLanguages`、`scutil --get`）取自公开描述。要产生证据：同一次三平台全绿的 CI 运行；`docs/acceptance/phase1-manual.md` 的 macOS 与 Linux 各有一行，由项目所有者在真实的机器上做（阶段 1 / M5a 计划「延后事项」第 1、2、13、23 行）。（2026-10-18：这三处所在的 `rurge-platform` 的 Unix 分支和 `rurge` 的命令行用例，在运行 39022550224（`7bd6589`）里在 Linux 与 macOS 上编译、运行，通过了一次，见兼容性清单平台变量一行；真实的 Mac 上读到什么，仍待手工清单。）
 
 ### 3. 要定的事
 
