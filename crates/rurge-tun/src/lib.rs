@@ -32,9 +32,22 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use tokio_util::task::TaskTracker;
 
 /// The largest receive buffer of any TCP socket on either side of the
-/// adapter. With 65535 bytes the window scale is 0, which keeps smoltcp 0.12's
-/// window-edge arithmetic from underflowing (design 5.3, H2).
+/// adapter. With 65535 bytes the window scale is 0 (smoltcp tcp.rs 538: the
+/// scale is the bit length of the buffer's size less 16), which keeps smoltcp
+/// 0.12's window-edge arithmetic from underflowing (design 5.3, H2).
+///
+/// The guard at the edge of the window (`tcp::guard`) rests on it as well: the
+/// edge it keeps moves only forward while the scale is 0. At a scale of 1 or
+/// more the window is told in units of 2^scale bytes, and the edge can move
+/// back by up to 2^scale - 1 bytes as the buffer fills, so the guard would drop
+/// segments a sender sent inside an earlier edge (the last of a burst that
+/// filled the window), and the sender would send them again after a timeout.
+/// A larger buffer is a change of the guard before it is a change of this
+/// number. The assertion below, and `the_tun_never_scales_its_window`, see to
+/// it that nobody raises it without reading this.
 pub const RX_MAX: usize = 65_535;
+
+const _: () = assert!(RX_MAX <= 65_535, "a larger buffer scales the window");
 
 /// The smallest device MTU: IPv6's, above IPv4's 576. smoltcp 0.12 has
 /// subtractions that underflow when the MTU is 0 or too small (design 5.3,

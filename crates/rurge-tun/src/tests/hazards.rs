@@ -683,6 +683,49 @@ async fn a_segment_past_the_edge_is_dropped() {
     assert_eq!(rig.tun.sockets_counted(), 1);
 }
 
+/// The edge the guard keeps only moves forward while the TUN's window scale is
+/// 0 (see `RX_MAX`). The app's SYN offers window scaling, and the SYN-ACK of the
+/// TUN answers with a scale of 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_tun_never_scales_its_window() {
+    let rig = rig(TunOptions::default());
+    let echo = Upstream::echo().await;
+    let dst = addr("192.0.2.1:80");
+    rig.dialer.script(dst, Script::Upstream(echo.addr()));
+    // the window scale of each SYN either side sent, if it had one
+    let scales: Arc<Mutex<Vec<(Direction, Option<u8>)>>> = Arc::default();
+    let seen = scales.clone();
+    rig.app.set_filter(move |direction, packet| {
+        if is_syn(packet) {
+            let table = options(packet);
+            let scale = find_option(table, WINDOW_SCALE).map(|at| table[at + 2]);
+            seen.lock().expect("the SYNs").push((direction, scale));
+        }
+        true
+    });
+    let mut tcp = within("the connection to be made", rig.app.connect(dst))
+        .await
+        .expect("connect");
+    hello(&mut tcp).await;
+    let scales = scales.lock().expect("the SYNs").clone();
+    assert!(
+        scales
+            .iter()
+            .any(|&(direction, scale)| direction == Direction::ToTun && scale.is_some()),
+        "the app's SYN offers window scaling: {scales:?}"
+    );
+    let answers: Vec<Option<u8>> = scales
+        .iter()
+        .filter(|(direction, _)| *direction == Direction::FromTun)
+        .map(|&(_, scale)| scale)
+        .collect();
+    assert!(!answers.is_empty(), "the TUN answered the SYN");
+    assert!(
+        answers.iter().all(|&scale| scale == Some(0)),
+        "the SYN-ACK of the TUN carries a window scale of 0: {scales:?}"
+    );
+}
+
 /// An upload into an upstream that reads nothing until `release`: a MiB the
 /// app writes in a task of its own, and what the TUN tells of the window.
 struct Stalled {
