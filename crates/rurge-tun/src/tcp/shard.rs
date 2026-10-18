@@ -7,7 +7,11 @@
 //! kick of a stream, its timer or the stop without it, and hands what the
 //! stack sent to the writer without it.
 
+#[cfg(test)]
+use super::PANIC_MARKER;
 use super::budget::Sizes;
+use super::guard::Edges;
+use super::rebuild::{Cause, next_seed, panic_text};
 use super::{
     Admission, Budget, ConnId, ConnShared, EGRESS_PASSES, INGRESS_PER_WAKE, Outcome, SWEEP,
     TIME_WAIT_GRACE, TunStream, Tuple,
@@ -22,12 +26,19 @@ use smoltcp::phy::{self, Checksum, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::task::TaskTracker;
 
+/// How far off a deadline is put when the time to the deadline is too long to
+/// add to a time: some thirty years.
+const FAR_OFF: Duration = Duration::from_secs(30 * 365 * 24 * 60 * 60);
+
 pub(crate) struct Shard {
+    /// Which of the TUN's shards this is, for what it says.
+    index: usize,
     state: Mutex<ShardState>,
     /// A stream did something the shard has to act on: it read (there is
     /// room in the window to tell of), wrote (there is data to send), shut
@@ -39,6 +50,7 @@ impl Shard {
     /// `seed` is what smoltcp draws the initial sequence numbers of the
     /// shard's connections from.
     pub(crate) fn new(
+        index: usize,
         mtu: usize,
         epoch: Instant,
         seed: u64,
@@ -47,27 +59,99 @@ impl Shard {
         options: &TunOptions,
     ) -> Shard {
         Shard {
+            index,
             state: Mutex::new(ShardState::new(
-                mtu, epoch, seed, budget, admission, options,
+                mtu,
+                epoch,
+                seed,
+                budget,
+                admission,
+                Timers::from(options),
             )),
             kick: Notify::new(),
         }
     }
 
+    /// The state, locked. A lock that a panic poisoned has behind it a stack
+    /// that stopped in the middle of what it was doing: whoever finds it so
+    /// starts the shard over first, so a stream's read, write or drop never
+    /// meets that stack (and none panics for the poison).
     pub(crate) fn state(&self) -> MutexGuard<'_, ShardState> {
-        self.state.lock().expect("a TCP shard's state")
+        self.lock(Cause::Poisoned)
     }
 
-    /// The state, waiting for the lock as `state()` does; where `state()`
-    /// panics on a poisoned lock, this is `None`. For a stream's `Drop`,
-    /// which must not panic.
-    pub(crate) fn state_unless_poisoned(&self) -> Option<MutexGuard<'_, ShardState>> {
-        self.state.lock().ok()
+    /// `state()`, with `cause` for the shard being rebuilt if the lock is
+    /// poisoned. The poison is cleared with the rebuild, so a poisoning is
+    /// rebuilt for once, by the first to come to the lock.
+    fn lock(&self, cause: Cause<'_>) -> MutexGuard<'_, ShardState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                self.rebuild(&mut guard, cause);
+                self.state.clear_poison();
+                guard
+            }
+        }
+    }
+
+    /// Starts the shard's stack over: every connection is reset, all it held
+    /// is given back, and the stack is a new one with a seed of its own.
+    /// Counted, and said at WARN with the shard's number and no more; what
+    /// the panic said is said at DEBUG.
+    fn rebuild(&self, state: &mut ShardState, cause: Cause<'_>) {
+        let drawn = getrandom::u64().ok();
+        state.rebuild(next_seed(state.seed, drawn));
+        state.admission.stack_panicked();
+        tracing::warn!(
+            shard = self.index,
+            "tun: the TCP stack of a shard panicked; its connections are reset"
+        );
+        tracing::debug!(
+            shard = self.index,
+            %cause,
+            fresh_seed = drawn.is_some(),
+            "tun: the TCP stack of a shard was started over"
+        );
     }
 
     pub(crate) fn kick(&self) {
         self.kick.notify_one();
     }
+}
+
+/// The times a shard holds its connections to, from `TunOptions`.
+#[derive(Clone, Copy)]
+struct Timers {
+    /// Every socket's keep-alive and timeout.
+    keep_alive: Duration,
+    timeout: Duration,
+    /// How long a connection has to complete its handshake.
+    half_open: Duration,
+}
+
+impl From<&TunOptions> for Timers {
+    fn from(options: &TunOptions) -> Timers {
+        Timers {
+            keep_alive: options.keep_alive,
+            timeout: options.timeout,
+            half_open: options.half_open_timeout,
+        }
+    }
+}
+
+/// What a SYN that is being taken holds before a `Conn` has it. From the
+/// claim of the places in the caps (`new_syn`) to the `Conn` of `open`, a
+/// panic would leave them held by nothing the shard has a record of, and the
+/// caps and the budget would never get them back. The shard writes them down
+/// here before it calls the stack, and takes them off when it has given them
+/// back or the `Conn` has them.
+#[derive(Default)]
+struct Held {
+    /// The places in the two caps that `Admission::claim` took.
+    places: bool,
+    /// The share of the budget the socket's buffers took.
+    sizes: Option<Sizes>,
 }
 
 pub(crate) struct ShardState {
@@ -81,6 +165,8 @@ pub(crate) struct ShardState {
     pub(crate) touched: HashSet<ConnId>,
     /// What smoltcp's clock counts from: the TUN's start.
     epoch: Instant,
+    /// What the stack's initial sequence numbers are drawn from.
+    seed: u64,
     /// When the next reap looks at every connection.
     next_sweep: Instant,
     /// The connections still half-open by the time they run out, soonest
@@ -89,11 +175,9 @@ pub(crate) struct ShardState {
     budget: Arc<Budget>,
     /// The caps and limits of the whole TUN, which a new SYN meets.
     admission: Arc<Admission>,
-    /// Every socket's, from `TunOptions`.
-    keep_alive: Duration,
-    timeout: Duration,
-    /// How long a connection has to complete its handshake.
-    half_open_timeout: Duration,
+    timers: Timers,
+    /// What the SYN being taken holds, if one is.
+    held: Held,
 }
 
 /// One connection: the socket that has it, and what the shard knows of it
@@ -146,12 +230,13 @@ impl ShardState {
         seed: u64,
         budget: Arc<Budget>,
         admission: Arc<Admission>,
-        options: &TunOptions,
+        timers: Timers,
     ) -> ShardState {
         let mut device = ShardDevice {
             rx: None,
             tx: Vec::new(),
             mtu,
+            edges: Edges::default(),
         };
         let mut config = Config::new(HardwareAddress::Ip);
         config.random_seed = seed;
@@ -182,14 +267,44 @@ impl ShardState {
             by_tuple: HashMap::new(),
             touched: HashSet::new(),
             epoch,
+            seed,
             next_sweep: epoch + SWEEP,
             half_open: BTreeSet::new(),
             budget,
             admission,
-            keep_alive: options.keep_alive,
-            timeout: options.timeout,
-            half_open_timeout: options.half_open_timeout,
+            timers,
+            held: Held::default(),
         }
+    }
+
+    /// Takes the place of the stack with a new one made with `seed`, after a
+    /// panic in it. Every connection is reset (its stream answers
+    /// `ConnectionReset` from then on, and whoever waits on it wakes), what
+    /// each held in the caps and the budget is given back, and so is what a
+    /// SYN being taken held; all of it from the shard's own records. Nothing
+    /// is asked of the old `Interface` and `SocketSet`, which the panic
+    /// stopped in the middle of something: the old state is dropped as it
+    /// is, whole, so a field added to it is renewed with the rest. The app's
+    /// later segments of the connections are strays to the new stack, which
+    /// answers them with a reset.
+    fn rebuild(&mut self, seed: u64) {
+        for (_, conn) in self.conns.drain() {
+            self.budget.give_back(conn.sizes);
+            self.admission.release_socket();
+            if conn.half_open.is_some() {
+                self.admission.release_half_open();
+            }
+            conn.shared.end(Outcome::Reset);
+        }
+        self.release_held();
+        *self = ShardState::new(
+            self.device.mtu,
+            self.epoch,
+            seed,
+            self.budget.clone(),
+            self.admission.clone(),
+            self.timers,
+        );
     }
 
     fn at(&self, now: Instant) -> smoltcp::time::Instant {
@@ -246,7 +361,7 @@ impl ShardState {
     /// goes in too, and smoltcp answers it with a reset.
     fn ingest(
         &mut self,
-        packet: Vec<u8>,
+        mut packet: Vec<u8>,
         now: Instant,
         at: smoltcp::time::Instant,
         opened: &mut Vec<Opened>,
@@ -260,7 +375,19 @@ impl ShardState {
         let Some(segment) = segment else {
             return;
         };
+        // every SYN the stack takes, a new one and one sent again alike: with
+        // no SACK offered the stack never makes a SACK block (design 5.3, H3)
+        if segment.syn {
+            packet::strip_sack_permitted(&mut packet);
+        }
         if let Some(&id) = self.by_tuple.get(&segment.tuple) {
+            // the stack takes data past the window it last told of in, and then
+            // panics on it (design 5.3, H2)
+            if self.device.edges.beyond(&segment) {
+                let (src, dst) = (segment.tuple.src.ip(), segment.tuple.dst.ip());
+                self.admission.count(Reason::BeyondWindow, src, dst);
+                return;
+            }
             let handle = self
                 .conns
                 .get(&id)
@@ -303,6 +430,10 @@ impl ShardState {
     }
 
     fn advance(&mut self, packet: Vec<u8>, at: smoltcp::time::Instant) {
+        #[cfg(test)]
+        if carries_panic_marker(&packet) {
+            panic!("rurge-tun test: panic while a segment is advanced");
+        }
         self.device.rx = Some(packet);
         self.iface
             .poll_ingress_single(at, &mut self.device, &mut self.sockets);
@@ -333,19 +464,31 @@ impl ShardState {
         if !self.admission.claim() {
             return self.turn_away(&packet, &segment, now, Some(Reason::Busy));
         }
+        self.held.places = true;
         match space::place(segment.tuple.dst.ip()) {
             Place::Real => self.open(packet, segment, now, at, opened),
             // the responder's port 53 is a place for a connection of its own
             // (M3c); every other port of it is not
             Place::Responder | Place::Own => {
-                self.admission.unclaim();
+                self.release_held();
                 self.turn_away(&packet, &segment, now, None);
             }
             // there is no pool of fake addresses yet: each names nothing
             Place::Fake => {
-                self.admission.unclaim();
+                self.release_held();
                 self.turn_away(&packet, &segment, now, Some(Reason::UnknownFake));
             }
+        }
+    }
+
+    /// Gives back what the SYN being taken holds (`Held`): no connection
+    /// came of it.
+    fn release_held(&mut self) {
+        if let Some(sizes) = self.held.sizes.take() {
+            self.budget.give_back(sizes);
+        }
+        if std::mem::take(&mut self.held.places) {
+            self.admission.unclaim();
         }
     }
 
@@ -368,8 +511,10 @@ impl ShardState {
     /// the SYN's destination alone, then the SYN. The socket has the
     /// connection if the stack took the SYN; packets go in one at a time, so
     /// no other SYN to the same destination can come between. The places the
-    /// connection takes in the TUN's caps were claimed by `new_syn`; they are
-    /// given back if no connection comes of the SYN.
+    /// connection takes in the TUN's caps were claimed by `new_syn`, and the
+    /// buffers' share of the budget is taken here; both are written down in
+    /// `held` before the stack is called, and given back if no connection
+    /// comes of the SYN, or if the stack panics.
     fn open(
         &mut self,
         packet: Vec<u8>,
@@ -380,6 +525,7 @@ impl ShardState {
     ) {
         let tuple = segment.tuple;
         let sizes = self.budget.take();
+        self.held.sizes = Some(sizes);
         let mut socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0; sizes.rx]),
             tcp::SocketBuffer::new(vec![0; sizes.tx]),
@@ -388,29 +534,27 @@ impl ShardState {
         // smoltcp resets a connection that has had nothing from the app for
         // `timeout`, whether or not anything is unacknowledged: the
         // keep-alives have a live app answer, so only a silent one is cut off
-        socket.set_keep_alive(Some(self.keep_alive.into()));
-        socket.set_timeout(Some(self.timeout.into()));
+        socket.set_keep_alive(Some(self.timers.keep_alive.into()));
+        socket.set_timeout(Some(self.timers.timeout.into()));
         socket.set_congestion_control(tcp::CongestionControl::Reno);
         let endpoint = IpListenEndpoint {
             addr: Some(tuple.dst.ip().into()),
             port: tuple.dst.port(),
         };
         if socket.listen(endpoint).is_err() {
-            self.budget.give_back(sizes);
-            self.admission.unclaim();
+            self.release_held();
             return;
         }
         let handle = self.sockets.add(socket);
         self.advance(packet, at);
         if self.sockets.get::<tcp::Socket>(handle).state() != tcp::State::SynReceived {
             self.sockets.remove(handle);
-            self.budget.give_back(sizes);
-            self.admission.unclaim();
+            self.release_held();
             return;
         }
         let id = ConnId::next();
         let shared = Arc::new(ConnShared::default());
-        let deadline = now + self.half_open_timeout;
+        let deadline = ends_at(now, self.timers.half_open);
         let conn = Conn {
             handle,
             tuple,
@@ -425,6 +569,8 @@ impl ShardState {
         self.conns.insert(id, conn);
         self.by_tuple.insert(tuple, id);
         self.half_open.insert((deadline, id));
+        // the connection has them from here: it gives them back when it goes
+        self.held = Held::default();
         opened.push(Opened { id, shared, tuple });
     }
 
@@ -516,6 +662,9 @@ impl ShardState {
 
     /// Lets go of a connection: its socket, its entries and its buffers; its
     /// stream answers `outcome` from now on, and whoever waits on it wakes.
+    /// The socket goes last, the one call into the stack, after the record of
+    /// the connection is gone and what it held is given back: were that call
+    /// to panic, the rebuild would not find the connection to give it back.
     fn remove(&mut self, id: ConnId, outcome: Outcome) {
         self.end_half_open(id);
         let Some(conn) = self.conns.remove(&id) else {
@@ -524,11 +673,12 @@ impl ShardState {
         if self.by_tuple.get(&conn.tuple) == Some(&id) {
             self.by_tuple.remove(&conn.tuple);
         }
+        self.device.edges.forget(&conn.tuple);
         self.touched.remove(&id);
-        self.sockets.remove(conn.handle);
         self.budget.give_back(conn.sizes);
         self.admission.release_socket();
         conn.shared.end(outcome);
+        self.sockets.remove(conn.handle);
     }
 
     /// Lets go of every connection, each with a reset: the shard is ending.
@@ -543,6 +693,29 @@ impl ShardState {
     pub(crate) fn socket_count(&self) -> usize {
         self.sockets.iter().count()
     }
+
+    /// The connections the window's guard knows an edge of.
+    #[cfg(test)]
+    pub(crate) fn edge_count(&self) -> usize {
+        self.device.edges.len()
+    }
+}
+
+/// `after` from `now`; as far off as can be told (`FAR_OFF`) if that is too
+/// much to add to a time, which `TunOptions`, being public, can ask of it.
+fn ends_at(now: Instant, after: Duration) -> Instant {
+    now.checked_add(after)
+        .or_else(|| now.checked_add(FAR_OFF))
+        .unwrap_or(now)
+}
+
+/// Whether the TCP payload of `packet`, a segment that passed the filter,
+/// begins with [`PANIC_MARKER`].
+#[cfg(test)]
+fn carries_panic_marker(packet: &[u8]) -> bool {
+    packet::segment(packet).is_some_and(|segment| {
+        packet[packet.len() - segment.payload_len..].starts_with(PANIC_MARKER)
+    })
 }
 
 /// The task of a shard. It waits for packets, a kick, its timer or the stop;
@@ -550,6 +723,14 @@ impl ShardState {
 /// connections and hands what the stack sent to the writer, waiting while
 /// the writer's queue is full. After a turn that reached a bound it goes on
 /// at once, after a yield.
+///
+/// The turn is where smoltcp runs, and it runs where a panic is caught
+/// (design 5.3, "the last line"): the shard is rebuilt, and the task goes on.
+/// No hook is set for the panic; the default one prints it, which is as much
+/// as is wanted for what is not to happen. The packets the turn was taking in
+/// are lost with the connections they were for (a SYN comes again, a segment
+/// of a connection that is gone gets a reset); any it had not begun to take in
+/// are there for the next turn.
 pub(crate) async fn run(
     shard: Arc<Shard>,
     mut packets: mpsc::Receiver<Vec<u8>>,
@@ -591,7 +772,24 @@ pub(crate) async fn run(
                 _ = sleep, if wake_at.is_some() => {}
             }
         }
-        let turn = shard.state().turn(Instant::now(), &mut incoming);
+        // the closure holds what is not unwind-safe, the stack and `incoming`,
+        // and the shard is rebuilt below, which leaves none of it as it was
+        let turn = catch_unwind(AssertUnwindSafe(|| {
+            shard.state().turn(Instant::now(), &mut incoming)
+        }));
+        let turn = match turn {
+            Ok(turn) => turn,
+            Err(panic) => {
+                // the turn's hold of the lock ended as the panic unwound,
+                // which poisoned it: taking it rebuilds the shard (but for a
+                // stream that got to it first, and did)
+                drop(shard.lock(Cause::Panic(panic_text(&*panic))));
+                drop(panic);
+                more = !incoming.is_empty();
+                wake_at = None;
+                continue;
+            }
+        };
         for opened in turn.opened {
             let stream = TunStream::new(shard.clone(), opened.id, opened.shared);
             tasks.spawn(session::serve(stream, dialer.clone(), opened.tuple));
@@ -621,11 +819,17 @@ struct ShardDevice {
     rx: Option<Vec<u8>>,
     tx: Vec<Vec<u8>>,
     mtu: usize,
+    /// The right edge of the window the stack last told of each connection,
+    /// as the stack writes each segment (design 5.3, H2).
+    edges: Edges,
 }
 
 struct RxToken(Vec<u8>);
 
-struct TxToken<'a>(&'a mut Vec<Vec<u8>>);
+struct TxToken<'a> {
+    tx: &'a mut Vec<Vec<u8>>,
+    edges: &'a mut Edges,
+}
 
 impl phy::Device for ShardDevice {
     type RxToken<'a>
@@ -642,11 +846,20 @@ impl phy::Device for ShardDevice {
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let packet = self.rx.take()?;
-        Some((RxToken(packet), TxToken(&mut self.tx)))
+        Some((
+            RxToken(packet),
+            TxToken {
+                tx: &mut self.tx,
+                edges: &mut self.edges,
+            },
+        ))
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
-        Some(TxToken(&mut self.tx))
+        Some(TxToken {
+            tx: &mut self.tx,
+            edges: &mut self.edges,
+        })
     }
 
     /// TCP checksums are computed on what goes out and not checked on what
@@ -679,7 +892,9 @@ impl phy::TxToken for TxToken<'_> {
     {
         let mut packet = vec![0; len];
         let done = f(&mut packet);
-        self.0.push(packet);
+        // read as it is written: the edge it leaves is the one the app keeps to
+        self.edges.sent(&packet);
+        self.tx.push(packet);
         done
     }
 }

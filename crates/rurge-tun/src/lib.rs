@@ -68,12 +68,13 @@ impl Tun {
         let mut shards = Vec::new();
         let mut to_shards = Vec::new();
         let mut random_failure = None;
-        for _ in 0..options.shards.max(1) {
+        for index in 0..options.shards.max(1) {
             let seed = getrandom::u64().unwrap_or_else(|error| {
                 random_failure.get_or_insert(error);
                 0x5eed
             });
             let shard = Arc::new(Shard::new(
+                index,
                 mtu,
                 epoch,
                 seed,

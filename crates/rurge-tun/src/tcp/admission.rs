@@ -10,7 +10,7 @@ use crate::stats::Stats;
 use crate::{Life, TunOptions};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// rurge's own resets are let through this often (the compatibility matrix:
@@ -86,9 +86,20 @@ impl Admission {
         self.sockets.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Whether one more reset of rurge's own may be sent at `now`.
+    /// Whether one more reset of rurge's own may be sent at `now`. The limit
+    /// is the TUN's, so a lock of it that a panic poisoned is taken all the
+    /// same: what is behind it is a queue of times, whole after any step of
+    /// it, and not worth every shard's next SYN.
     pub(crate) fn allow_reset(&self, now: Instant) -> bool {
-        self.resets.lock().expect("the limit on resets").allow(now)
+        self.resets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .allow(now)
+    }
+
+    /// A shard's stack panicked and the shard was rebuilt.
+    pub(crate) fn stack_panicked(&self) {
+        Stats::count(&self.stats.stack_panics);
     }
 
     /// Counts and says a packet turned away for `reason`: a SYN, or the
@@ -96,6 +107,21 @@ impl Admission {
     pub(crate) fn count(&self, reason: Reason, src: IpAddr, dst: IpAddr) {
         // not `self.stats.drop(..)`: on an `Arc` that is `Drop::drop`
         Stats::drop(&self.stats, reason, Some(src), Some(dst));
+    }
+
+    /// Panics on another thread with the limit on resets held, which poisons
+    /// its lock.
+    #[cfg(test)]
+    pub(crate) fn poison_the_limit_on_resets(&self) {
+        let poisoning = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _held = self.resets.lock();
+                    panic!("poisoning the limit on resets");
+                })
+                .join()
+        });
+        assert!(poisoning.is_err());
     }
 
     #[cfg(test)]

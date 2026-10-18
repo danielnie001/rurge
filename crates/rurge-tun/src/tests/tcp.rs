@@ -3,10 +3,10 @@
 //! and relayed to what the `Dialer` dials.
 
 use super::support::{
-    Rig, WITHIN, addr, eventually, is_syn, read_pattern, rig, rig_on, within, write_pattern,
+    Rig, WITHIN, addr, eventually, hello, is_syn, read_pattern, rig, rig_on, within, write_pattern,
 };
 use crate::device::MemoryDevice;
-use crate::testing::{AppTcp, Direction, Script, Upstream};
+use crate::testing::{Direction, Script, Upstream};
 use crate::{Counters, Ending, TunOptions};
 use rurge_config::{HostName, ListenerKind, Transport};
 use rurge_proto::RejectKind;
@@ -232,16 +232,6 @@ async fn a_failed_dial_resets_the_connection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rejected_session_resets_the_connection() {
     the_connection_is_reset(Some(Script::Reject(RejectKind::Reject))).await;
-}
-
-/// `hello` there and back.
-pub(super) async fn hello(tcp: &mut AppTcp) {
-    tcp.write_all(b"hello").await.expect("write");
-    let mut back = [0; 5];
-    within("hello to come back", tcp.read_exact(&mut back))
-        .await
-        .expect("read");
-    assert_eq!(&back, b"hello");
 }
 
 /// The session starts once the TUN's side of the handshake is over, that is

@@ -9,10 +9,9 @@
 use super::filter::warning;
 use super::log_capture::LogCapture;
 use super::support::{
-    WITHIN, addr, checksum, eventually, is_reset, is_syn, lone_shard, rig, segment_v4, sock,
+    WITHIN, addr, checksum, eventually, hello, is_reset, is_syn, lone_shard, rig, segment_v4, sock,
     syn_v4, syn_v6, tcp_header, tcp_packet, tcp_repr, with_ip_options, within,
 };
-use super::tcp::hello;
 use crate::limit::Limiter;
 use crate::packet::{Reason, rst_for, segment};
 use crate::space::{ADAPTER_V4, ADAPTER_V6, Place, STACK_V4, STACK_V6, place};

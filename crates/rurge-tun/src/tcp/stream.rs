@@ -1,6 +1,8 @@
 //! A connection of the TUN as the session pipeline sees it (phase 3 M3
 //! design 5.5): a byte stream on a socket of a shard's stack.
 
+#[cfg(test)]
+use super::PANIC_MARKER;
 use super::{ConnId, ConnShared, Outcome, Shard};
 use smoltcp::socket::tcp;
 use std::io;
@@ -123,6 +125,10 @@ impl AsyncWrite for TunStream {
             return Poll::Ready(Ok(0));
         }
         let mut guard = self.shard.state();
+        #[cfg(test)]
+        if data.starts_with(PANIC_MARKER) {
+            panic!("rurge-tun test: panic with the shard's lock held");
+        }
         let state = &mut *guard;
         let Some(conn) = state.conns.get(&self.id) else {
             return Poll::Ready(Err(match self.outcome() {
@@ -203,9 +209,9 @@ impl Drop for TunStream {
     /// down (its FIN is on its way after what was written), nothing more to
     /// come from the app and nothing of it left unread.
     fn drop(&mut self) {
-        let Some(mut guard) = self.shard.state_unless_poisoned() else {
-            return;
-        };
+        // a lock that is poisoned is rebuilt by whoever finds it, a drop among
+        // them, which does not panic for it
+        let mut guard = self.shard.state();
         let state = &mut *guard;
         if let Some(conn) = state.conns.get_mut(&self.id) {
             conn.dropped = true;

@@ -25,6 +25,15 @@ const ICMPV6_ECHO_REQUEST: u8 = 128;
 /// makes: what operating systems send by default.
 const RESET_HOP_LIMIT: u8 = 64;
 
+/// The protocol number of TCP in the IPv4 header and in the IPv6 one.
+const IP_TCP: u8 = 6;
+
+/// The kinds of the TCP options that are read as they are written down: the
+/// end of the list, no operation, and the offer of selective acknowledgements.
+const OPTION_END: u8 = 0;
+const OPTION_NOP: u8 = 1;
+const OPTION_SACK_PERMITTED: u8 = 4;
+
 /// Why a packet is dropped. Each reason is the counter of the same name in
 /// [`crate::Counters`], and that name is what the logs call it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,8 +59,6 @@ pub(crate) enum Reason {
     /// connections.
     Busy,
     /// A segment with data past the window the TUN last told of.
-    // not built yet: the shard's window guard builds it and removes this expectation
-    #[cfg_attr(not(test), expect(dead_code))]
     BeyondWindow,
     /// A reset not sent because of the limit on resets.
     RstLimited,
@@ -258,6 +265,81 @@ pub(crate) fn rst_for(syn: &[u8]) -> Vec<u8> {
         }
         _ => unreachable!("the two addresses of a packet are of one family"),
     }
+}
+
+/// Takes the SACK-permitted options out of `packet`, a whole IP packet, if it
+/// is a TCP SYN: each, kind 4 and length 2, becomes two no-operations (kind
+/// 1), so the packet is as long as it was. smoltcp 0.12 then takes the app
+/// as a peer that has no SACK, and never builds a SACK block, which it does
+/// with additions that overflow in a debug build (design 5.3, H3). Local
+/// links lose next to nothing, so nothing is lost. The checksum of the TCP
+/// segment is not worked out again: the TUN does not check it (the device
+/// takes it as right). A packet that is no SYN, no TCP, or cut short is left
+/// as it is, and so is one whose option table is not sound (an option whose
+/// length is under two, or goes past the end of the table): smoltcp drops
+/// such a SYN itself.
+pub(crate) fn strip_sack_permitted(packet: &mut [u8]) {
+    let Some(start) = tcp_start(packet) else {
+        return;
+    };
+    let Some(segment) = packet.get_mut(start..) else {
+        return;
+    };
+    let Ok(mut tcp) = TcpPacket::new_checked(segment) else {
+        return;
+    };
+    if !tcp.syn() {
+        return;
+    }
+    let options = tcp.options_mut();
+    // the whole table is sound before any of it is changed
+    let mut at = 0;
+    while at < options.len() {
+        match option_at(options, at) {
+            None => return,
+            Some((OPTION_END, _)) => break,
+            Some((_, length)) => at += length,
+        }
+    }
+    let mut at = 0;
+    while at < options.len() {
+        let Some((kind, length)) = option_at(options, at) else {
+            break;
+        };
+        if kind == OPTION_END {
+            break;
+        }
+        if kind == OPTION_SACK_PERMITTED && length == 2 {
+            options[at..at + 2].fill(OPTION_NOP);
+        }
+        at += length;
+    }
+}
+
+/// Where the TCP header of `packet` begins, if the packet is an IPv4 packet
+/// of the protocol TCP with a header of the length of 20 bytes or more, or an
+/// IPv6 packet of that protocol with no extension header.
+fn tcp_start(packet: &[u8]) -> Option<usize> {
+    match packet.first()? >> 4 {
+        4 => {
+            let header = usize::from(packet[0] & 15) * 4;
+            (header >= 20 && *packet.get(9)? == IP_TCP).then_some(header)
+        }
+        6 => (*packet.get(6)? == IP_TCP).then_some(40),
+        _ => None,
+    }
+}
+
+/// The kind and the length of the option at `at`, which is in `options`: one
+/// byte for the end of the list and a no-operation, the option's own length
+/// for any other. `None` for one whose length is under two, or past the end.
+fn option_at(options: &[u8], at: usize) -> Option<(u8, usize)> {
+    let kind = options[at];
+    if kind == OPTION_END || kind == OPTION_NOP {
+        return Some((kind, 1));
+    }
+    let length = usize::from(*options.get(at + 1)?);
+    (length >= 2 && at + length <= options.len()).then_some((kind, length))
 }
 
 /// Every check of [`classify`] but the one of the `ipv6` option.

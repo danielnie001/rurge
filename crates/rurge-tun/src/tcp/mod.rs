@@ -10,6 +10,8 @@
 
 pub(crate) mod admission;
 pub(crate) mod budget;
+pub(crate) mod guard;
+pub(crate) mod rebuild;
 pub(crate) mod shard;
 pub(crate) mod stream;
 
@@ -23,6 +25,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::task::Waker;
 use std::time::Duration;
+
+/// What makes a shard of the test build panic, to see what becomes of a
+/// shard whose stack does: a segment the shard advances whose payload begins
+/// with it panics in the shard's turn, and a write to a stream that begins
+/// with it panics with the shard's lock held. Nothing of the sort is in any
+/// other build (there is no packet that stably makes smoltcp 0.12 panic once
+/// the filter and the window's guard are in front of it).
+#[cfg(test)]
+pub(crate) const PANIC_MARKER: &[u8] = b"rurge-tun test: panic";
 
 /// The most packets a shard takes into its stack in one turn.
 pub(crate) const INGRESS_PER_WAKE: usize = 256;

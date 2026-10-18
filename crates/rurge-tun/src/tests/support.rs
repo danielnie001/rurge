@@ -5,7 +5,7 @@
 use crate::device::{AppEnd, MemoryDevice};
 use crate::stats::Stats;
 use crate::tcp::{Admission, Budget, Shard};
-use crate::testing::{AppStack, FakeDialer, pattern};
+use crate::testing::{AppStack, AppTcp, FakeDialer, pattern};
 use crate::{Life, Tun, TunHandle, TunOptions};
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
@@ -60,6 +60,7 @@ pub(crate) struct Lone {
     pub(crate) life: Arc<Life>,
     pub(crate) stats: Arc<Stats>,
     pub(crate) admission: Arc<Admission>,
+    pub(crate) budget: Arc<Budget>,
 }
 
 /// A shard on a device with an MTU of 1500, whose clock starts at `epoch`.
@@ -73,10 +74,11 @@ pub(crate) fn lone_shard(options: &TunOptions, epoch: Instant) -> Lone {
         options.tx_max,
     ));
     let shard = Arc::new(Shard::new(
+        0,
         1500,
         epoch,
         1,
-        budget,
+        budget.clone(),
         admission.clone(),
         options,
     ));
@@ -85,6 +87,7 @@ pub(crate) fn lone_shard(options: &TunOptions, epoch: Instant) -> Lone {
         life,
         stats,
         admission,
+        budget,
     }
 }
 
@@ -96,6 +99,16 @@ pub(crate) async fn within<T>(what: &str, future: impl Future<Output = T>) -> T 
     tokio::time::timeout(WITHIN, future)
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+}
+
+/// `hello` there and back.
+pub(crate) async fn hello(tcp: &mut AppTcp) {
+    tcp.write_all(b"hello").await.expect("write");
+    let mut back = [0; 5];
+    within("hello to come back", tcp.read_exact(&mut back))
+        .await
+        .expect("read");
+    assert_eq!(&back, b"hello");
 }
 
 /// Polls `condition` every millisecond until it holds, for at most `limit`.
@@ -398,7 +411,9 @@ pub(crate) fn echo_packet(src: IpAddr, dst: IpAddr) -> Vec<u8> {
 }
 
 /// `packet` with the checksum of its IPv4 header worked out again, for a test
-/// that changed the header and means the checksum to be right.
+/// that changed the header and means the checksum to be right. The header
+/// has to fit in the packet: it panics when its length (the IHL times four)
+/// is more than the packet's.
 pub(crate) fn refresh(mut packet: Vec<u8>) -> Vec<u8> {
     let header = usize::from(packet[0] & 15) * 4;
     packet[10..12].fill(0);
