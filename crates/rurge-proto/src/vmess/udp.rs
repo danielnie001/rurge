@@ -247,11 +247,15 @@ impl PacketSocket for VmessUdp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{FakeVmess, VmessScript, udp_echo_server};
     use crate::transport::Stack;
-    use crate::vmess::header::Security;
+    use crate::vmess::header::{self, Security};
     use rurge_config::HostName;
-    use rurge_net::connector::{DirectConnector, SystemResolve};
+    use rurge_net::connector::{Connector, DirectConnector, SystemResolve};
+    use std::pin::Pin;
     use std::sync::atomic::AtomicUsize;
+    use std::task::{Context, Poll, Waker};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
     use tokio::net::TcpListener;
 
     /// A server that ends every UDP connection as soon as it is up: a
@@ -305,5 +309,172 @@ mod tests {
             );
             assert_eq!(dials.load(Ordering::Relaxed), 2 * datagram);
         }
+    }
+
+    const ID: &str = "0233d11c-15a4-47d3-ade3-48ffca0ce119";
+
+    /// How long the first write stays blocked: longer than the `HEAD_GRACE`
+    /// that starts running when the connection is dialled.
+    const BLOCKED_FOR: Duration = Duration::from_millis(200);
+
+    /// What the test waits for the datagram's send, and for its echo.
+    const BOUND: Duration = Duration::from_secs(5);
+
+    /// What a socket keeps for its write side while the send buffer is full:
+    /// one waker, the last poller's, woken when room is made.
+    #[derive(Default)]
+    struct SendBuffer {
+        state: std::sync::Mutex<BufferState>,
+    }
+
+    #[derive(Default)]
+    struct BufferState {
+        drained: bool,
+        waker: Option<Waker>,
+    }
+
+    impl SendBuffer {
+        /// Whether the buffer is still full; if so `waker` is the one kept,
+        /// in place of whoever's it was.
+        fn full(&self, waker: &Waker) -> bool {
+            let mut state = self.state.lock().expect("buffer");
+            if state.drained {
+                return false;
+            }
+            state.waker = Some(waker.clone());
+            true
+        }
+
+        fn drain(&self) {
+            let waker = {
+                let mut state = self.state.lock().expect("buffer");
+                state.drained = true;
+                state.waker.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+    }
+
+    /// A stream whose first write finds the send buffer full: every write is
+    /// `Pending` until `BLOCKED_FOR` after the first, and the buffer wakes
+    /// the last writer to have asked. Everything else is the stream below.
+    struct FullAtFirst {
+        inner: BoxedStream,
+        buffer: Arc<SendBuffer>,
+        tried: bool,
+    }
+
+    impl AsyncRead for FullAtFirst {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for FullAtFirst {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if !self.tried {
+                self.tried = true;
+                let buffer = self.buffer.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(BLOCKED_FOR).await;
+                    buffer.drain();
+                });
+            }
+            if self.buffer.full(cx.waker()) {
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_write(cx, data)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Dials as `DirectConnector` does; the connection is a `FullAtFirst`.
+    struct FullAtFirstConnector(DirectConnector);
+
+    impl Connector for FullAtFirstConnector {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            Box::pin(async move {
+                let inner = self.0.connect(target, opts).await?;
+                Ok(Box::new(FullAtFirst {
+                    inner,
+                    buffer: Arc::default(),
+                    tried: false,
+                }) as BoxedStream)
+            })
+        }
+    }
+
+    /// The two halves of a connection's stream are polled by two tasks: a
+    /// reader started at dial time, and whichever task sends. The stream
+    /// below keeps one waker for its write side; when the first datagram's
+    /// write is blocked longer than the head's grace, the reader comes by
+    /// and, once the buffer drains, pushes the head out with the datagram
+    /// riding on it. The sender, whose write that was, must hear that it is
+    /// out.
+    #[tokio::test]
+    async fn a_first_datagram_whose_write_is_blocked_past_the_grace_is_still_sent() {
+        let echo = udp_echo_server().await;
+        let script = VmessScript::new(ID);
+        let cmd_key = header::cmd_key(&script.uuid);
+        let fake = FakeVmess::spawn(script, None).await;
+        let server = fake.addr();
+        let dialer = Arc::new(Dialer {
+            stack: Stack::new(
+                Arc::new(FullAtFirstConnector(DirectConnector::new(Arc::new(
+                    SystemResolve,
+                )))),
+                Target::new(HostName::Ip(server.ip()), server.port()),
+                None,
+                None,
+                None,
+            ),
+            cmd_key,
+            security: Security::Aes128Gcm,
+        });
+        let udp = VmessUdp::new(dialer, ConnectOpts::default(), IDLE);
+        let to = Target::new(HostName::Ip(echo.ip()), echo.port());
+        let started = Instant::now();
+        tokio::time::timeout(BOUND, udp.send_to(b"first", &to))
+            .await
+            .expect("the first datagram's send did not finish")
+            .unwrap();
+        let took = started.elapsed();
+        assert!(
+            took >= BLOCKED_FOR,
+            "the write was not blocked, so the case was not made"
+        );
+        // as its bound runs out `timeout` polls the future once more, and a
+        // sender whose wake-up was lost would finish then: the clock decides
+        assert!(
+            took < BOUND,
+            "the first datagram's send finished only when its bound ran out"
+        );
+        let mut buf = vec![0u8; 65536];
+        let (n, from) = tokio::time::timeout(BOUND, udp.recv_from(&mut buf))
+            .await
+            .expect("the echo of the first datagram did not arrive")
+            .unwrap();
+        assert_eq!((&buf[..n], from), (&b"first"[..], to));
     }
 }
