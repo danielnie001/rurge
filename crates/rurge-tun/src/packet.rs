@@ -58,7 +58,10 @@ pub(crate) enum Reason {
     /// A SYN turned away because of the limits on sockets and half-open
     /// connections.
     Busy,
-    /// A segment with data past the window the TUN last told of.
+    /// A segment with data past the window the TUN last told of, dropped
+    /// because the receive buffer had room to take the data in past it. Into
+    /// a full buffer the stack takes in nothing and answers, so that segment
+    /// is not dropped and not counted.
     BeyondWindow,
     /// A reset not sent because of the limit on resets.
     RstLimited,

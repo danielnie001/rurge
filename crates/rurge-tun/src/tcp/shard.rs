@@ -381,18 +381,23 @@ impl ShardState {
             packet::strip_sack_permitted(&mut packet);
         }
         if let Some(&id) = self.by_tuple.get(&segment.tuple) {
-            // the stack takes data past the window it last told of in, and then
-            // panics on it (design 5.3, H2)
-            if self.device.edges.beyond(&segment) {
-                let (src, dst) = (segment.tuple.src.ip(), segment.tuple.dst.ip());
-                self.admission.count(Reason::BeyondWindow, src, dst);
-                return;
-            }
             let handle = self
                 .conns
                 .get(&id)
                 .expect("a connection of the tuple table")
                 .handle;
+            // Data past the edge of the window the stack last told of, with
+            // room in the buffer for it: the stack takes it in (smoltcp tcp.rs
+            // 1598-1599), and its sums on the window then fail and panic
+            // (693-701; design 5.3, H2). With the buffer full it takes in
+            // nothing of the segment (1636-1641) and answers it with an ACK
+            // (1433-1446), which is what a sender probing a closed window is
+            // kept probing by (RFC 9293 3.8.6.1): that segment goes in.
+            if self.device.edges.beyond(&segment) && self.has_room(handle) {
+                let (src, dst) = (segment.tuple.src.ip(), segment.tuple.dst.ip());
+                self.admission.count(Reason::BeyondWindow, src, dst);
+                return;
+            }
             let before = self.sockets.get::<tcp::Socket>(handle).state();
             self.advance(packet, at);
             let after = self.sockets.get::<tcp::Socket>(handle).state();
@@ -427,6 +432,12 @@ impl ShardState {
         } else {
             self.advance(packet, at);
         }
+    }
+
+    /// Whether the receive buffer of the socket has room for more.
+    fn has_room(&self, handle: SocketHandle) -> bool {
+        let socket = self.sockets.get::<tcp::Socket>(handle);
+        socket.recv_queue() < socket.recv_capacity()
     }
 
     fn advance(&mut self, packet: Vec<u8>, at: smoltcp::time::Instant) {

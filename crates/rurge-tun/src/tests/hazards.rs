@@ -6,7 +6,7 @@
 //! 0, and a shard that panics, or whose lock a panic poisoned.
 
 use super::support::{
-    Rig, WITHIN, addr, data_segment_v4, echo_packet, eventually, hello, is_syn, lone_shard,
+    Lone, Rig, WITHIN, addr, data_segment_v4, echo_packet, eventually, hello, is_syn, lone_shard,
     refresh, rig, segment_v4, sock, syn_v4, tcp_header, tcp_packet, tcp_payload_len, tcp_repr,
     udp_packet, with_ip_options, within, write_pattern,
 };
@@ -18,6 +18,7 @@ use crate::tcp::{Shard, TunStream, Tuple};
 use crate::testing::{AppStack, AppTcp, Direction, Script, Upstream, pattern};
 use crate::{Counters, TunOptions};
 use smoltcp::phy::ChecksumCapabilities;
+use smoltcp::socket::tcp;
 use smoltcp::wire::{IpAddress, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, TcpTimestampRepr};
 use std::io;
 use std::net::SocketAddr;
@@ -770,15 +771,21 @@ async fn an_upload_into_a_stalled_upstream_resumes() {
     stalled_upload().await.finish(Counters::default()).await;
 }
 
-/// The zero-window probe of Windows and BSD: one byte at the left edge of a
-/// window of 0, acknowledging what the TUN has sent. The edge is that very
-/// byte, so the byte is past it. (smoltcp's own sender sends none, so the
-/// test makes it.)
+/// The zero-window probe of Windows and BSD stacks: one byte of new data at the
+/// receiver's acknowledgment number, into a window of 0 (Linux sends an empty
+/// segment one byte back, which the guard never touches; smoltcp's own sender
+/// sends neither, so the test makes the probe). The buffer is full: the stack
+/// takes nothing of the byte (tcp.rs 1636-1641) and answers it with an ACK of
+/// where it waits, window 0 (1433-1446). That answer is what keeps a sender
+/// probing a closed window (RFC 9293 3.8.6.1), and the guard lets the probe go
+/// in for it. Nothing is counted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_window_probe_into_a_full_buffer_is_dropped() {
+async fn a_window_probe_into_a_full_buffer_is_answered() {
     let stalled = stalled_upload().await;
     let told = stalled.settled().await;
     let app = stalled.rig.dialer.dialed()[0].src;
+    // the TUN has been quiet: what it says after this was said for the probe
+    let said = stalled.heard.lock().expect("what the TUN told").packets;
     stalled.rig.app.inject(data_segment_v4(
         app,
         stalled.dst,
@@ -787,17 +794,13 @@ async fn a_window_probe_into_a_full_buffer_is_dropped() {
         PSH_ACK,
         &[0x5a],
     ));
-    eventually("the probe to be dropped", WITHIN, || {
-        stalled.rig.tun.counters().beyond_window == 1
+    eventually("the TUN to answer the probe", WITHIN, || {
+        let now = stalled.heard.lock().expect("what the TUN told");
+        now.packets > said && now.ack == told.ack && now.window == 0
     })
     .await;
     // the upload takes up where it was, and the probe's byte is not in it
-    stalled
-        .finish(Counters {
-            beyond_window: 1,
-            ..Counters::default()
-        })
-        .await;
+    stalled.finish(Counters::default()).await;
 }
 
 // ---- one shard, its turns taken by hand
@@ -830,6 +833,44 @@ pub(super) fn open_by_hand(
     (opened, isn)
 }
 
+/// The app sends `bytes` bytes (0xaa) on a connection `open_by_hand` made: a
+/// thousand to a segment, a turn of the shard for each, 20 ms apart (past the
+/// delay of an acknowledgement), and a turn more for the acknowledgement of the
+/// last. Returns what the TUN told on the way, and the time in ms of the last
+/// turn.
+fn send_data(
+    lone: &Lone,
+    epoch: Instant,
+    app: SocketAddr,
+    dst: SocketAddr,
+    isn: u32,
+    bytes: usize,
+) -> (Told, u64) {
+    let at = |ms: u64| epoch + Duration::from_millis(ms);
+    let mut told = Told::default();
+    let mut now = 2;
+    let mut sent = 0;
+    while sent < bytes {
+        let piece = (bytes - sent).min(1000);
+        let data = data_segment_v4(
+            app,
+            dst,
+            2 + sent as u32,
+            isn.wrapping_add(1),
+            PSH_ACK,
+            &vec![0xaa; piece],
+        );
+        now += 20;
+        let turn = lone.shard.state().turn(at(now), &mut vec![data]);
+        turn.out.iter().for_each(|packet| told.take(packet));
+        sent += piece;
+    }
+    now += 20;
+    let turn = lone.shard.state().turn(at(now), &mut Vec::new());
+    turn.out.iter().for_each(|packet| told.take(packet));
+    (told, now)
+}
+
 /// A probe at the edge of a window of 0, the window having opened since by a
 /// read: the TUN's window update goes out before the probe is looked at, so
 /// the probe is inside the new window, is taken in, and is acknowledged. Were
@@ -849,28 +890,7 @@ async fn a_probe_after_a_read_is_inside_the_new_window() {
         .expect("the connection is established");
     // the app sends until the TUN has no room: the first socket of a TUN has
     // the largest receive buffer, RX_MAX
-    let mut told = Told::default();
-    let mut now = 2;
-    let mut sent = 0;
-    while sent < crate::RX_MAX {
-        let piece = (crate::RX_MAX - sent).min(1000);
-        let data = data_segment_v4(
-            app,
-            dst,
-            2 + sent as u32,
-            isn.wrapping_add(1),
-            PSH_ACK,
-            &vec![0xaa; piece],
-        );
-        // a step of 20 ms is past the delay of an acknowledgement
-        now += 20;
-        let turn = lone.shard.state().turn(at(now), &mut vec![data]);
-        turn.out.iter().for_each(|packet| told.take(packet));
-        sent += piece;
-    }
-    now += 20;
-    let turn = lone.shard.state().turn(at(now), &mut Vec::new());
-    turn.out.iter().for_each(|packet| told.take(packet));
+    let (told, mut now) = send_data(&lone, epoch, app, dst, isn, crate::RX_MAX);
     assert_eq!(told.window, 0, "the TUN has no room: {told:?}");
     assert_eq!(told.ack, 2 + crate::RX_MAX as u32, "it has all of it");
     // a read of a KiB: room, which the window update tells of
@@ -894,6 +914,74 @@ async fn a_probe_after_a_read_is_inside_the_new_window() {
         "the probe's byte is acknowledged: {read:?}"
     );
     assert_eq!(lone.stats.counters(), Counters::default());
+}
+
+/// Data past the edge the TUN last told of, into room the buffer has got since
+/// by a read: smoltcp takes in what the buffer has room for, not what the
+/// window it told allowed (tcp.rs 1598-1599), and then finds the window it last
+/// told of ended before the data it holds (693-701): the subtraction underflows
+/// and panics. The guard drops the segment and counts it. A read of less than
+/// the window told does not make the stack tell a new window, which it does only
+/// when the window at least doubles (2232-2246), so the edge stays where it was.
+#[tokio::test]
+async fn a_segment_past_the_edge_into_room_is_dropped() {
+    // the room the TUN has left when the app has sent all it can, what the
+    // stream reads of it, and a segment 500 bytes past the edge, which is 500
+    // bytes inside the room
+    const TOLD: usize = 4_000;
+    const READ: usize = 1_000;
+    const SEGMENT: usize = TOLD + 500;
+    let epoch = Instant::now();
+    let at = |ms: u64| epoch + Duration::from_millis(ms);
+    let lone = lone_shard(&TunOptions::default(), epoch);
+    let (app, dst) = (app4(40000), addr("192.0.2.1:80"));
+    let (opened, isn) = open_by_hand(&lone.shard, epoch, app, dst, 0);
+    let id = opened.id;
+    let mut stream = TunStream::new(lone.shard.clone(), opened.id, opened.shared);
+    within("the handshake", stream.established())
+        .await
+        .expect("the connection is established");
+    let sent = crate::RX_MAX - TOLD;
+    let (mut told, mut now) = send_data(&lone, epoch, app, dst, isn, sent);
+    assert_eq!(
+        told.window, TOLD as u32,
+        "the TUN told of its room: {told:?}"
+    );
+    assert_eq!(told.ack, 2 + sent as u32, "it has all the app sent");
+    within("the read", stream.read_exact(&mut [0; READ]))
+        .await
+        .expect("bytes to read");
+    now += 20;
+    let edge = told.edge();
+    let quiet = lone.shard.state().turn(at(now), &mut Vec::new());
+    quiet.out.iter().for_each(|packet| told.take(packet));
+    assert_eq!(told.edge(), edge, "no segment tells of a new edge");
+    let segment = data_segment_v4(app, dst, told.ack, told.seq, PSH_ACK, &[0xee; SEGMENT]);
+    now += 20;
+    lone.shard.state().turn(at(now), &mut vec![segment]);
+    assert_eq!(
+        lone.stats.counters(),
+        Counters {
+            beyond_window: 1,
+            ..Counters::default()
+        }
+    );
+    // the buffer holds what the app sent, and nothing of the segment
+    let queued = |lone: &Lone| {
+        let state = lone.shard.state();
+        let socket = state.sockets.get::<tcp::Socket>(state.conns[&id].handle);
+        socket.recv_queue()
+    };
+    assert_eq!(queued(&lone), sent - READ);
+    let mut rest = vec![0; sent - READ];
+    within("the rest", stream.read_exact(&mut rest))
+        .await
+        .expect("the rest to read");
+    assert!(
+        rest.iter().all(|&byte| byte == 0xaa),
+        "only what the app sent"
+    );
+    assert_eq!(queued(&lone), 0);
 }
 
 #[test]

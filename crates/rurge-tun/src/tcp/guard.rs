@@ -1,18 +1,26 @@
 //! The guard at the edge of the window (phase 3 M3 design 5.3, H2). smoltcp
-//! 0.12 takes data into a socket up to what its buffer holds, not up to the
-//! window it last told of, and then subtracts sequence numbers on the
-//! assumption that the data it holds ends inside that window: with the data
-//! past it the subtraction underflows and panics. An app that keeps to the
-//! window does not do it; one that sends a probe into a window of 0 does (the
-//! TCP stacks of Windows and BSD), and so would a window that has gone back,
-//! as it can with a window scale.
+//! 0.12 takes data into a socket up to what its receive buffer has room for,
+//! not up to the window it last told of (tcp.rs 1598-1599), and then
+//! subtracts sequence numbers on the assumption that the data it holds ends
+//! inside that window (693-701): with data taken in past the edge the
+//! subtraction underflows and panics. An app that keeps to the window never
+//! sends such data. One that does not can, by a defect or on purpose, and so
+//! could a window that has gone back, as it can with a window scale (the size
+//! of the receive buffer keeps the scale at 0: `RX_MAX`).
 //!
 //! So the right edge of the window is kept for each connection, read off each
 //! segment the stack sends, as it is written (the device's send token calls
-//! [`Edges::sent`]), and a segment of the app's that carries data ending
-//! past it is dropped before the stack sees it. That is the edge smoltcp
-//! itself works from: it records the acknowledgement number and the window
-//! of every segment it sends.
+//! [`Edges::sent`]). That is the edge smoltcp itself works from: it records
+//! the acknowledgement number and the window of every segment it sends. A
+//! segment of the app's whose data ends past it ([`Edges::beyond`]) is dropped
+//! before the stack sees it if the receive buffer has room for the data, which
+//! the shard looks at. With the buffer full there is nothing to guard
+//! against: the stack takes in nothing of a segment with data (1636-1641) and
+//! answers it with an ACK, at most one a second (1433-1446). So that segment
+//! goes in, to be answered: it may be the probe of a sender with a closed
+//! window, one byte of new data at the receiver's acknowledgment number, and a
+//! sender must keep the connection open as long as its probes are
+//! acknowledged (RFC 9293 3.8.6.1).
 
 use super::Tuple;
 use crate::packet::Segment;
@@ -76,7 +84,9 @@ impl Edges {
 
     /// Whether `segment`, one of the app's, has data that ends past the edge
     /// of its connection. A segment without data does not, nor does one of a
-    /// connection no edge is known of.
+    /// connection no edge is known of. It is the shard that drops the segment
+    /// that does, and only when the receive buffer has room for the data (see
+    /// the module).
     pub(crate) fn beyond(&self, segment: &Segment) -> bool {
         segment.payload_len > 0
             && self.edges.get(&segment.tuple).is_some_and(|edge| {
