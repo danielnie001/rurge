@@ -172,7 +172,7 @@ pub async fn udp_roundtrip(out: &OutboundRef, echo: SocketAddr) {
         .expect("the carrier opens");
     for payload in [&b"interop"[..], b"again"] {
         carrier.send_to(payload, &target(echo)).await.unwrap();
-        let mut buf = [0u8; 64];
+        let mut buf = vec![0u8; 65536];
         let (n, from) = tokio::time::timeout(bound, carrier.recv_from(&mut buf))
             .await
             .expect("the echo comes back within the bound")

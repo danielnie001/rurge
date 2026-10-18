@@ -226,7 +226,7 @@ async fn socks5_udp_goes_through_sing_box() {
         .send_to(b"interop", &target(echo_addr))
         .await
         .unwrap();
-    let mut buf = [0u8; 64];
+    let mut buf = vec![0u8; 65536];
     let (n, from) = tokio::time::timeout(bound, carrier.recv_from(&mut buf))
         .await
         .expect("the echo comes back within the bound")

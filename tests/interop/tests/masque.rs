@@ -51,7 +51,7 @@ async fn udp_two_targets(out: &OutboundRef, echoes: [SocketAddr; 2], log: &dyn F
                 .send_to(&payload, &target(echo))
                 .await
                 .unwrap_or_else(|e| panic!("{e}\n{}", log()));
-            let mut buf = [0u8; 64];
+            let mut buf = vec![0u8; 65536];
             let (len, from) = tokio::time::timeout(bound, carrier.recv_from(&mut buf))
                 .await
                 .unwrap_or_else(|_| panic!("the echo comes back within the bound\n{}", log()))
