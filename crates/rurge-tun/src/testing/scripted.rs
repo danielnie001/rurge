@@ -68,6 +68,9 @@ struct Conn {
     peer_isn: u32,
     /// The next sequence number expected from the adapter.
     expected: u32,
+    /// The adapter's FIN has been taken in order: `expected` is past it, and
+    /// it is not a byte of the stream.
+    fin: bool,
     /// A segment came that takes sequence space: an ACK of `expected` is owed.
     ack_due: bool,
 }
@@ -77,12 +80,14 @@ impl Conn {
         matches!(self.phase, Phase::Established) && self.acked
     }
 
-    /// The bytes of the stream from the adapter that have arrived in order.
+    /// The bytes of the stream from the adapter that have arrived in order: a
+    /// FIN takes a sequence number but is not one of them.
     fn taken(&self) -> usize {
         match self.phase {
             Phase::SynSent => 0,
             Phase::Established => {
-                self.expected.wrapping_sub(self.peer_isn).wrapping_sub(1) as usize
+                let numbers = self.expected.wrapping_sub(self.peer_isn).wrapping_sub(1);
+                (numbers as usize) - usize::from(self.fin)
             }
         }
     }
@@ -102,10 +107,10 @@ impl ScriptedTcp {
 
     /// A SYN (MSS 1460, no other option) from each port to `dst`; on its
     /// SYN-ACK an ACK that carries `hello` bytes; resolves once every
-    /// connection is established and its bytes are acknowledged. Gives up
-    /// when nothing comes for ten seconds, and on a reset. Dropped while it
-    /// waits it loses no packet: the connections stay in the table, and
-    /// `take` or another `open` handles what comes.
+    /// connection is established and its bytes are acknowledged. A port that
+    /// cannot be opened from (it was not given to `new`, or is open already)
+    /// refuses the whole range: nothing is registered and nothing is sent.
+    /// Gives up when nothing comes for ten seconds, and on a reset.
     pub async fn open(
         &mut self,
         ports: RangeInclusive<u16>,
@@ -118,14 +123,18 @@ impl ScriptedTcp {
                 "the scripted client has IPv4 only",
             ));
         };
+        // every port is checked before one is registered or sent
+        if let Some(port) = ports
+            .clone()
+            .find(|port| !self.ports.contains(port) || self.conns.contains_key(port))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("port {port} is not free to open from"),
+            ));
+        }
         let mut waiting = HashSet::new();
         for port in ports {
-            if !self.ports.contains(&port) || self.conns.contains_key(&port) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("port {port} is not free to open from"),
-                ));
-            }
             // spread over the space, the same for the same port
             let isn = u32::from(port).wrapping_mul(0x9e37_79b1);
             self.conns.insert(
@@ -139,6 +148,7 @@ impl ScriptedTcp {
                     acked: false,
                     peer_isn: 0,
                     expected: 0,
+                    fin: false,
                     ack_due: false,
                 },
             );
@@ -150,8 +160,7 @@ impl ScriptedTcp {
     }
 
     /// Acknowledges everything from the adapter (window 65535) until every
-    /// open connection has had `bytes`. Gives up as `open` does, and is
-    /// dropped as safely.
+    /// open connection has had `bytes`. Gives up as `open` does.
     pub async fn take(&mut self, bytes: usize) -> io::Result<()> {
         let waiting = self
             .conns
@@ -308,6 +317,7 @@ impl ScriptedTcp {
                     let end = seq.wrapping_add(length as u32);
                     if !after(seq, conn.expected) && after(end, conn.expected) {
                         conn.expected = end;
+                        conn.fin |= repr.control == TcpControl::Fin;
                     }
                     // new or not, it is answered with where the stream is
                     conn.ack_due = true;

@@ -3,7 +3,7 @@
 //! and relayed to what the `Dialer` dials.
 
 use super::support::{
-    WITHIN, addr, eventually, is_syn, read_pattern, rig, rig_on, within, write_pattern,
+    Rig, WITHIN, addr, eventually, is_syn, read_pattern, rig, rig_on, within, write_pattern,
 };
 use crate::device::MemoryDevice;
 use crate::testing::{AppTcp, Direction, Script, Upstream};
@@ -77,10 +77,11 @@ async fn pattern_reader(bytes: usize) -> (SocketAddr, JoinHandle<io::Result<()>>
     (address, task)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_mebibyte_crosses_each_way() {
+/// 1 MiB each way through `rig`, both connections to the end: the upload goes
+/// to a server that checks every byte, the download comes from one that sends
+/// the pattern.
+async fn a_mebibyte_crosses_each_way_through(rig: &Rig) {
     const MIB: usize = 1 << 20;
-    let rig = rig(TunOptions::default());
     // the upload goes to a server that checks every byte (the sink only counts them)
     let (reader, reading) = pattern_reader(MIB).await;
     let source = Upstream::source(MIB as u64).await;
@@ -114,7 +115,52 @@ async fn a_mebibyte_crosses_each_way() {
         .await
         .expect("the reader's task")
         .expect("the reader");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mebibyte_crosses_each_way() {
+    let rig = rig(TunOptions::default());
+    a_mebibyte_crosses_each_way_through(&rig).await;
     assert_eq!(rig.tun.counters(), Counters::default());
+}
+
+/// With the budget spent every socket has `buffer_min` and no more, which is
+/// what every socket made after the first few hundred has in a TUN that is
+/// busy. A mebibyte each way crosses on those buffers at an MTU of `mtu`.
+async fn a_mebibyte_each_way_on_the_smallest_buffers(mtu: usize) {
+    let options = TunOptions {
+        budget: 0,
+        ..TunOptions::default()
+    };
+    let smallest = options.buffer_min;
+    let rig = rig_on(MemoryDevice::pair(mtu, 4096), options);
+    // a socket made now has the smallest buffers both ways: the transfers
+    // below are run on nothing larger
+    let echo = Upstream::echo().await;
+    let probe_to = addr("192.0.2.3:80");
+    rig.dialer.script(probe_to, Script::Upstream(echo.addr()));
+    let probe = within("the connection to be made", rig.app.connect(probe_to))
+        .await
+        .expect("connect");
+    assert_eq!(rig.tun.budget_in_use(), 2 * smallest);
+    drop(probe);
+    eventually("the TUN to let the connection go", WITHIN, || {
+        rig.tun.sockets_in_use() == 0 && rig.tun.budget_in_use() == 0
+    })
+    .await;
+    a_mebibyte_crosses_each_way_through(&rig).await;
+    assert_eq!(rig.tun.counters(), Counters::default());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mebibyte_crosses_each_way_on_the_smallest_buffers() {
+    a_mebibyte_each_way_on_the_smallest_buffers(1500).await;
+}
+
+/// The MSS here, 8960, is larger than the window of the smallest buffers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mebibyte_crosses_each_way_on_the_smallest_buffers_at_mtu_9000() {
+    a_mebibyte_each_way_on_the_smallest_buffers(9000).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

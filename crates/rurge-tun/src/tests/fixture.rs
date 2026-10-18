@@ -898,6 +898,39 @@ async fn a_memory_upstream_sends_what_it_was_told_and_counts_what_it_gets() {
     assert_eq!(dialer.received(to), 3000);
 }
 
+/// A wait for what the far ends have read is woken by the reading, and ends
+/// when its time is up.
+#[tokio::test]
+async fn waiting_for_what_a_far_end_has_read_is_woken_and_bounded() {
+    let dialer = FakeDialer::new();
+    let to = addr("192.0.2.16:80");
+    dialer.script(
+        to,
+        Script::Memory {
+            buffer: 1024,
+            send: 0,
+        },
+    );
+    let (mut app, relay, _handle) = relayed(&dialer, to).await;
+    // begun before the bytes are written, so only the reading can end it
+    let waiting = tokio::spawn({
+        let dialer = dialer.clone();
+        async move { dialer.wait_for(to, 3000, WITHIN).await }
+    });
+    write_pattern(&mut app, 3000).await.unwrap();
+    assert!(
+        within("the wait to end", waiting).await.unwrap(),
+        "woken by the bytes"
+    );
+    // waits for: the time to run out, as a 3001st byte never comes; margin:
+    // none needed, whenever it ends the answer is false
+    assert!(!dialer.wait_for(to, 3001, Duration::from_millis(50)).await);
+    // and an answer for what is already there does not wait
+    assert!(dialer.wait_for(to, 3000, Duration::ZERO).await);
+    app.shutdown().await.unwrap();
+    within("the relay to end", relay).await.unwrap();
+}
+
 #[tokio::test]
 async fn a_held_upstream_reads_only_once_released() {
     let dialer = FakeDialer::new();

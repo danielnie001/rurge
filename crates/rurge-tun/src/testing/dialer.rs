@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
@@ -38,7 +39,8 @@ pub enum Script {
 
 /// The counters and the gate of the far ends of the sessions to one destination.
 struct Far {
-    received: AtomicU64,
+    /// Bytes read so far; a change wakes whoever waits for more.
+    received: watch::Sender<u64>,
     released: watch::Sender<bool>,
 }
 
@@ -80,7 +82,7 @@ impl FakeDialer {
         let mut book = self.book();
         if matches!(script, Script::Memory { .. } | Script::Hold { .. }) {
             let far = Far {
-                received: AtomicU64::new(0),
+                received: watch::channel(0).0,
                 released: watch::channel(false).0,
             };
             book.far.insert(dst, Arc::new(far));
@@ -113,7 +115,19 @@ impl FakeDialer {
         self.book()
             .far
             .get(&dst)
-            .map_or(0, |far| far.received.load(Ordering::Relaxed))
+            .map_or(0, |far| *far.received.borrow())
+    }
+
+    /// Waits until `received(dst)` is at least `bytes`; false when `within` ran out
+    /// first. Panics unless `dst` has a `Memory` or `Hold` script.
+    pub async fn wait_for(&self, dst: SocketAddr, bytes: u64, within: Duration) -> bool {
+        let far = self.book().far.get(&dst).cloned();
+        let far = far.expect("wait_for needs a Memory or Hold script for the destination");
+        let mut changes = far.received.subscribe();
+        matches!(
+            tokio::time::timeout(within, changes.wait_for(|total| *total >= bytes)).await,
+            Ok(Ok(_))
+        )
     }
 }
 
@@ -166,7 +180,7 @@ fn far_end(far: Arc<Far>, stream: DuplexStream, buffer: usize, send: usize, hold
                 if n == 0 {
                     break;
                 }
-                far.received.fetch_add(n as u64, Ordering::Relaxed);
+                far.received.send_modify(|total| *total += n as u64);
             }
         };
         tokio::join!(writing, reading);

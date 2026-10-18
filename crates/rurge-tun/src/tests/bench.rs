@@ -52,8 +52,8 @@
 //! a process is not read (it is not to be trusted on the development machine).
 
 use super::support::{
-    WITHIN, addr, checksum, data_segment_v4, eventually, is_syn, rig, segment_v4, tcp_header,
-    tcp_payload_len, tun_on, within,
+    WITHIN, addr, checksum, data_segment_v4, eventually, is_syn, rig, segment_v4, syn_v4,
+    tcp_header, tcp_payload_len, tun_on, within,
 };
 use crate::device::{AppEnd, MemoryDevice};
 use crate::testing::{AppStack, AppTcp, Script, ScriptedTcp, Upstream};
@@ -205,6 +205,82 @@ async fn scripted_tcp_counts_bytes_by_sequence_number() {
     });
     taken.expect("take");
     assert_eq!(ack_number(&ack), first + 2000);
+}
+
+/// A FIN takes a sequence number but is not a byte of the stream: a segment of
+/// a thousand bytes and a FIN has the connection take a thousand, and is
+/// acknowledged at a thousand and one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scripted_tcp_does_not_count_a_fin_as_a_byte() {
+    const PEER: u32 = 5_000;
+    let (end, mut tun) = AppEnd::crossed(1500, 64);
+    let stack = AppStack::start(end);
+    let mut scripted = ScriptedTcp::new(&stack, 10_000..=10_000);
+    let (app, dst) = (addr("198.18.0.1:10000"), addr("192.0.2.10:80"));
+    // an established connection, with no hello to acknowledge
+    let answering = async {
+        let syn = within("the SYN", tun.recv()).await.expect("a packet");
+        let isn = seq_number(&syn);
+        tun.send(segment_v4(dst, app, PEER, isn.wrapping_add(1), 0x12))
+            .await
+            .expect("send the SYN-ACK");
+        // the ACK that ends the handshake, with nothing in it
+        let ack = within("the ACK of the SYN-ACK", tun.recv())
+            .await
+            .expect("a packet");
+        assert_eq!(tcp_payload_len(&ack), 0);
+        assert_eq!(ack_number(&ack), PEER + 1);
+        isn
+    };
+    let (opened, isn) = tokio::join!(
+        within(
+            "the connection to open",
+            scripted.open(10_000..=10_000, dst, 0)
+        ),
+        answering
+    );
+    opened.expect("open");
+
+    let first = PEER + 1;
+    // FIN, PSH and ACK
+    let last = data_segment_v4(dst, app, first, isn.wrapping_add(1), 0x19, &[7u8; 1000]);
+    let mut taking = Box::pin(scripted.take(1001));
+    let script = async {
+        tun.send(last).await.expect("send");
+        let ack = within("an ACK", tun.recv()).await.expect("a packet");
+        assert_eq!(ack_number(&ack), first + 1001, "the ACK covers the FIN");
+    };
+    tokio::select! {
+        biased;
+        taken = &mut taking => panic!("1001 bytes taken after a thousand and a FIN: {taken:?}"),
+        () = script => {}
+    }
+    drop(taking);
+    within("a thousand bytes to be taken", scripted.take(1000))
+        .await
+        .expect("take");
+}
+
+/// A range with a port in it that cannot be opened is refused whole: nothing is
+/// registered, and no SYN is sent for the ports before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scripted_tcp_checks_every_port_before_it_sends_one() {
+    let (end, mut tun) = AppEnd::crossed(1500, 64);
+    let stack = AppStack::start(end);
+    let mut scripted = ScriptedTcp::new(&stack, 10_000..=10_001);
+    let dst = addr("192.0.2.10:80");
+    // 10002 is not one of the ports it was given
+    let error = scripted
+        .open(10_000..=10_002, dst, 0)
+        .await
+        .expect_err("a port it was not given");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(scripted.table_bytes(), 0, "nothing is registered");
+    // what is injected goes out in order: the other end gets this packet
+    // first, so no SYN went before it
+    let marker = syn_v4(addr("198.18.0.1:50000"), dst);
+    stack.inject(marker.clone());
+    assert_eq!(within("a packet", tun.recv()).await, Some(marker));
 }
 
 /// A tokio runtime of the current-thread kind on a thread of its own. What is
@@ -444,12 +520,10 @@ fn through_the_tun(mtu: usize, tx_max: usize, way: Way, bytes: u64, far: Far) ->
                                         server.wait_for(bytes, LIMIT).await,
                                         "the sink did not get every byte"
                                     ),
-                                    // seen within a millisecond
-                                    None => {
-                                        while dialer.received(dst) < bytes {
-                                            tokio::time::sleep(Duration::from_millis(1)).await;
-                                        }
-                                    }
+                                    None => assert!(
+                                        dialer.wait_for(dst, bytes, LIMIT).await,
+                                        "the far end did not get every byte"
+                                    ),
                                 }
                             }
                             Way::Down => drain(&mut tcp, bytes).await.expect("read"),
