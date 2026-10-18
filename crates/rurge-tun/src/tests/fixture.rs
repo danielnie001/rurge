@@ -1,9 +1,12 @@
 //! Tests of the fixtures everything else is tested with: the memory device,
 //! the app-side stack, the fake `Dialer` and the loopback servers.
 
-use super::support::{WITHIN, addr, eventually, is_reset, syn_v4, tcp_payload_len, udp_v4, within};
+use super::support::{
+    WITHIN, addr, eventually, is_reset, read_pattern, syn_v4, tcp_payload_len, udp_v4, within,
+    write_pattern,
+};
 use crate::device::{AppEnd, Device, MemoryDevice};
-use crate::testing::{AppStack, AppTcp, Direction, FakeDialer, Script, Upstream, pattern};
+use crate::testing::{AppStack, AppTcp, Direction, FakeDialer, Script, Upstream};
 use rurge_config::{HostName, ListenerKind, SessionInfo};
 use rurge_inbound::{DialError, Dialed, Dialer, FailKind, SessionHandle, SessionOutcome};
 use rurge_proto::RejectKind;
@@ -43,38 +46,6 @@ async fn connected(client: &AppStack, server: &AppStack, to: SocketAddr) -> (App
         .await
         .expect("accept");
     (client, server)
-}
-
-const CHUNK: usize = 16 * 1024;
-
-async fn write_pattern(to: &mut (impl AsyncWrite + Unpin), bytes: usize) -> io::Result<()> {
-    let mut done = 0;
-    while done < bytes {
-        let n = (bytes - done).min(CHUNK);
-        let chunk: Vec<u8> = (done..done + n).map(|i| pattern(i as u64)).collect();
-        to.write_all(&chunk).await?;
-        done += n;
-    }
-    Ok(())
-}
-
-async fn read_pattern(from: &mut (impl AsyncRead + Unpin), bytes: usize) -> io::Result<()> {
-    let mut done = 0;
-    let mut chunk = vec![0; CHUNK];
-    while done < bytes {
-        let n = (bytes - done).min(CHUNK);
-        from.read_exact(&mut chunk[..n]).await?;
-        for (k, byte) in chunk[..n].iter().enumerate() {
-            assert_eq!(
-                *byte,
-                pattern((done + k) as u64),
-                "byte {} is not the pattern's",
-                done + k
-            );
-        }
-        done += n;
-    }
-    Ok(())
 }
 
 /// The session of an app connecting to `dst` through the adapter.

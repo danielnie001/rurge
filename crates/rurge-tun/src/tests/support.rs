@@ -1,9 +1,38 @@
-//! What the tests of this crate share: waits that are bounded, and the
-//! builders and readers of the packets they make by hand.
+//! What the tests of this crate share: the TUN they start, waits that are
+//! bounded, streams of the pattern, and the builders and readers of the
+//! packets they make by hand.
 
+use crate::device::MemoryDevice;
+use crate::testing::{AppStack, FakeDialer, pattern};
+use crate::{Tun, TunHandle, TunOptions};
 use std::future::Future;
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+/// A TUN on one end of a memory device (MTU 1500, room for 4096 packets each
+/// way), the app's stack on the other, and the fake `Dialer` the TUN hands
+/// its sessions to.
+pub(crate) struct Rig {
+    pub(crate) tun: TunHandle,
+    pub(crate) app: AppStack,
+    pub(crate) dialer: Arc<FakeDialer>,
+}
+
+/// Every test that starts a TUN starts it here, so that a change of what
+/// `Tun::start` takes is a change of this function only.
+pub(crate) fn rig(options: TunOptions) -> Rig {
+    let (device, end) = MemoryDevice::pair(1500, 4096);
+    let dialer = FakeDialer::new();
+    let tun = Tun::start(Arc::new(device), dialer.clone(), options);
+    Rig {
+        tun,
+        app: AppStack::start(end),
+        dialer,
+    }
+}
 
 /// What a wait in these tests is bounded by, unless it says otherwise.
 pub(crate) const WITHIN: Duration = Duration::from_secs(10);
@@ -29,6 +58,46 @@ pub(crate) async fn eventually(what: &str, limit: Duration, mut condition: impl 
 
 pub(crate) fn addr(s: &str) -> SocketAddr {
     s.parse().unwrap()
+}
+
+const CHUNK: usize = 16 * 1024;
+
+/// Writes `bytes` bytes of the pattern, from its start.
+pub(crate) async fn write_pattern(
+    to: &mut (impl AsyncWrite + Unpin),
+    bytes: usize,
+) -> io::Result<()> {
+    let mut done = 0;
+    while done < bytes {
+        let n = (bytes - done).min(CHUNK);
+        let chunk: Vec<u8> = (done..done + n).map(|i| pattern(i as u64)).collect();
+        to.write_all(&chunk).await?;
+        done += n;
+    }
+    Ok(())
+}
+
+/// Reads `bytes` bytes and panics at the first that is not the pattern's.
+pub(crate) async fn read_pattern(
+    from: &mut (impl AsyncRead + Unpin),
+    bytes: usize,
+) -> io::Result<()> {
+    let mut done = 0;
+    let mut chunk = vec![0; CHUNK];
+    while done < bytes {
+        let n = (bytes - done).min(CHUNK);
+        from.read_exact(&mut chunk[..n]).await?;
+        for (k, byte) in chunk[..n].iter().enumerate() {
+            assert_eq!(
+                *byte,
+                pattern((done + k) as u64),
+                "byte {} is not the pattern's",
+                done + k
+            );
+        }
+        done += n;
+    }
+    Ok(())
 }
 
 /// The Internet checksum (RFC 1071) of `data`.
@@ -125,4 +194,9 @@ pub(crate) fn tcp_payload_len(packet: &[u8]) -> usize {
 /// Whether `packet` is a TCP segment with the RST flag.
 pub(crate) fn is_reset(packet: &[u8]) -> bool {
     tcp_header(packet).is_some_and(|(header, _)| packet[header + 13] & 0x04 != 0)
+}
+
+/// Whether `packet` is a TCP segment with the SYN flag.
+pub(crate) fn is_syn(packet: &[u8]) -> bool {
+    tcp_header(packet).is_some_and(|(header, _)| packet[header + 13] & 0x02 != 0)
 }
