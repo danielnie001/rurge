@@ -5,9 +5,14 @@
 use crate::device::{AppEnd, MemoryDevice};
 use crate::testing::{AppStack, FakeDialer, pattern};
 use crate::{Tun, TunHandle, TunOptions};
+use smoltcp::phy::ChecksumCapabilities;
+use smoltcp::wire::{
+    Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, TcpControl, TcpPacket, TcpRepr,
+    TcpSeqNumber, UdpPacket, UdpRepr,
+};
 use std::future::Future;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -69,6 +74,10 @@ pub(crate) async fn eventually(what: &str, limit: Duration, mut condition: impl 
 
 pub(crate) fn addr(s: &str) -> SocketAddr {
     s.parse().unwrap()
+}
+
+pub(crate) fn sock(ip: impl Into<IpAddr>, port: u16) -> SocketAddr {
+    SocketAddr::new(ip.into(), port)
 }
 
 const CHUNK: usize = 16 * 1024;
@@ -243,6 +252,141 @@ pub(crate) fn syn_v6(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
     let sum = checksum(&pseudo);
     tcp[16..18].copy_from_slice(&sum.to_be_bytes());
     ipv6_packet(6, src_ip, dst_ip, &tcp)
+}
+
+/// An IP packet of the addresses' family around `payload`.
+pub(crate) fn ip_around(protocol: u8, src: IpAddr, dst: IpAddr, payload: &[u8]) -> Vec<u8> {
+    match (src, dst) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => ipv4_packet(protocol, src, dst, payload),
+        (IpAddr::V6(src), IpAddr::V6(dst)) => ipv6_packet(protocol, src, dst, payload),
+        _ => panic!("the addresses of a packet are of one family"),
+    }
+}
+
+/// The fields of a TCP segment of the app's: a window of 65535, no options,
+/// no flags.
+pub(crate) fn tcp_repr(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> TcpRepr<'_> {
+    TcpRepr {
+        src_port: src.port(),
+        dst_port: dst.port(),
+        control: TcpControl::None,
+        seq_number: TcpSeqNumber(0),
+        ack_number: None,
+        window_len: 65535,
+        window_scale: None,
+        max_seg_size: None,
+        sack_permitted: false,
+        sack_ranges: [None; 3],
+        timestamp: None,
+        payload,
+    }
+}
+
+/// `repr` as the bytes of a TCP header and payload, the checksum right for
+/// the addresses.
+pub(crate) fn tcp_bytes(repr: &TcpRepr<'_>, src: IpAddr, dst: IpAddr) -> Vec<u8> {
+    let mut bytes = vec![0; repr.buffer_len()];
+    repr.emit(
+        &mut TcpPacket::new_unchecked(&mut bytes[..]),
+        &src.into(),
+        &dst.into(),
+        &ChecksumCapabilities::default(),
+    );
+    bytes
+}
+
+pub(crate) fn tcp_packet(src: SocketAddr, dst: SocketAddr, repr: &TcpRepr<'_>) -> Vec<u8> {
+    ip_around(6, src.ip(), dst.ip(), &tcp_bytes(repr, src.ip(), dst.ip()))
+}
+
+/// A UDP datagram around `payload`, the checksum right.
+pub(crate) fn udp_bytes(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let repr = UdpRepr {
+        src_port: src.port(),
+        dst_port: dst.port(),
+    };
+    let mut bytes = vec![0; 8 + payload.len()];
+    repr.emit(
+        &mut UdpPacket::new_unchecked(&mut bytes[..]),
+        &src.ip().into(),
+        &dst.ip().into(),
+        payload.len(),
+        |buffer| buffer.copy_from_slice(payload),
+        &ChecksumCapabilities::default(),
+    );
+    bytes
+}
+
+pub(crate) fn udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    ip_around(17, src.ip(), dst.ip(), &udp_bytes(src, dst, payload))
+}
+
+/// An ICMP echo request of the addresses' family, the checksum right.
+pub(crate) fn echo_bytes(src: IpAddr, dst: IpAddr) -> Vec<u8> {
+    let caps = ChecksumCapabilities::default();
+    match (src, dst) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => {
+            let repr = Icmpv4Repr::EchoRequest {
+                ident: 7,
+                seq_no: 1,
+                data: &[1, 2, 3, 4],
+            };
+            let mut bytes = vec![0; repr.buffer_len()];
+            repr.emit(&mut Icmpv4Packet::new_unchecked(&mut bytes[..]), &caps);
+            bytes
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            let repr = Icmpv6Repr::EchoRequest {
+                ident: 7,
+                seq_no: 1,
+                data: &[1, 2, 3, 4],
+            };
+            let mut bytes = vec![0; repr.buffer_len()];
+            repr.emit(
+                &src,
+                &dst,
+                &mut Icmpv6Packet::new_unchecked(&mut bytes[..]),
+                &caps,
+            );
+            bytes
+        }
+        _ => panic!("the addresses of a packet are of one family"),
+    }
+}
+
+pub(crate) fn echo_packet(src: IpAddr, dst: IpAddr) -> Vec<u8> {
+    let protocol = if src.is_ipv4() { 1 } else { 58 };
+    ip_around(protocol, src, dst, &echo_bytes(src, dst))
+}
+
+/// `packet` with the checksum of its IPv4 header worked out again, for a test
+/// that changed the header and means the checksum to be right.
+pub(crate) fn refresh(mut packet: Vec<u8>) -> Vec<u8> {
+    let header = usize::from(packet[0] & 15) * 4;
+    packet[10..12].fill(0);
+    let sum = checksum(&packet[..header]);
+    packet[10..12].copy_from_slice(&sum.to_be_bytes());
+    packet
+}
+
+/// An IPv4 packet with this flags and fragment offset field, the checksum
+/// right.
+pub(crate) fn with_fragment_field(mut packet: Vec<u8>, field: u16) -> Vec<u8> {
+    packet[6..8].copy_from_slice(&field.to_be_bytes());
+    refresh(packet)
+}
+
+/// An IPv4 packet with `options` (a multiple of four bytes) after its
+/// header, the lengths and the checksum right.
+pub(crate) fn with_ip_options(packet: &[u8], options: &[u8]) -> Vec<u8> {
+    assert_eq!(options.len() % 4, 0);
+    let mut longer = packet[..20].to_vec();
+    longer.extend(options);
+    longer.extend(&packet[20..]);
+    longer[0] = 0x45 + (options.len() / 4) as u8;
+    let total = longer.len() as u16;
+    longer[2..4].copy_from_slice(&total.to_be_bytes());
+    refresh(longer)
 }
 
 /// Where the TCP header of `packet` (IPv4 or IPv6, no extension headers)
