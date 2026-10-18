@@ -1,6 +1,7 @@
 //! Tests of the fixtures everything else is tested with: the memory device,
 //! the app-side stack, the fake `Dialer` and the loopback servers.
 
+use super::support::{WITHIN, addr, eventually, is_reset, syn_v4, tcp_payload_len, udp_v4, within};
 use crate::device::{AppEnd, Device, MemoryDevice};
 use crate::testing::{AppStack, AppTcp, Direction, FakeDialer, Script, Upstream, pattern};
 use rurge_config::{HostName, ListenerKind, SessionInfo};
@@ -9,7 +10,7 @@ use rurge_proto::RejectKind;
 use smoltcp::wire::IpCidr;
 use std::future::Future;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -18,29 +19,6 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-
-/// What every wait in these tests is bounded by.
-const WITHIN: Duration = Duration::from_secs(10);
-
-async fn within<T>(future: impl Future<Output = T>) -> T {
-    timeout(WITHIN, future).await.expect("timed out")
-}
-
-/// Polls `condition` every millisecond until it holds, for at most `limit`.
-async fn eventually(what: &str, limit: Duration, mut condition: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + limit;
-    while !condition() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-}
-
-fn addr(s: &str) -> SocketAddr {
-    s.parse().unwrap()
-}
 
 fn cidr(ip: &str, prefix: u8) -> IpCidr {
     IpCidr::new(ip.parse::<IpAddr>().unwrap().into(), prefix)
@@ -55,28 +33,15 @@ fn stacks() -> (AppStack, AppStack) {
     (AppStack::start(a), AppStack::start_with(b, &documentation))
 }
 
-type Accepting<'a> = Pin<Box<dyn Future<Output = io::Result<AppTcp>> + Send + 'a>>;
-
-/// `accept`, started: this returns once the listening socket exists, so a
-/// SYN sent after it finds the listener.
-async fn listening(stack: &AppStack, local: SocketAddr) -> Accepting<'_> {
-    let mut accept: Accepting<'_> = Box::pin(stack.accept(local));
-    std::future::poll_fn(|cx| {
-        assert!(
-            accept.as_mut().poll(cx).is_pending(),
-            "nobody has connected yet"
-        );
-        Poll::Ready(())
-    })
-    .await;
-    accept
-}
-
 /// A connection from `client` to `server`'s address `to`: both ends of it.
 async fn connected(client: &AppStack, server: &AppStack, to: SocketAddr) -> (AppTcp, AppTcp) {
-    let accepting = listening(server, to).await;
-    let client = within(client.connect(to)).await.expect("connect");
-    let server = within(accepting).await.expect("accept");
+    let accepting = server.accept(to);
+    let client = within("the connection to be made", client.connect(to))
+        .await
+        .expect("connect");
+    let server = within("the connection to be accepted", accepting)
+        .await
+        .expect("accept");
     (client, server)
 }
 
@@ -112,102 +77,6 @@ async fn read_pattern(from: &mut (impl AsyncRead + Unpin), bytes: usize) -> io::
     Ok(())
 }
 
-/// The Internet checksum (RFC 1071) of `data`.
-fn checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = data
-        .chunks(2)
-        .map(|pair| u32::from(u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)])))
-        .sum();
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
-fn v4(a: SocketAddr) -> (Ipv4Addr, u16) {
-    match a {
-        SocketAddr::V4(a) => (*a.ip(), a.port()),
-        SocketAddr::V6(_) => panic!("an IPv4 address"),
-    }
-}
-
-/// An IPv4 packet around `payload`, the header checksum right.
-fn ipv4_packet(protocol: u8, src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
-    let mut packet = vec![0x45, 0];
-    packet.extend((20 + payload.len() as u16).to_be_bytes());
-    packet.extend([0, 0, 0x40, 0, 64, protocol, 0, 0]);
-    packet.extend(src.octets());
-    packet.extend(dst.octets());
-    let sum = checksum(&packet);
-    packet[10..12].copy_from_slice(&sum.to_be_bytes());
-    packet.extend(payload);
-    packet
-}
-
-/// A UDP datagram over IPv4, without a checksum (which UDP over IPv4 allows).
-fn udp_v4(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
-    let ((src_ip, src_port), (dst_ip, dst_port)) = (v4(src), v4(dst));
-    let mut udp = Vec::new();
-    udp.extend(src_port.to_be_bytes());
-    udp.extend(dst_port.to_be_bytes());
-    udp.extend((8 + payload.len() as u16).to_be_bytes());
-    udp.extend([0, 0]);
-    udp.extend(payload);
-    ipv4_packet(17, src_ip, dst_ip, &udp)
-}
-
-/// A TCP SYN over IPv4, the checksums right.
-fn syn_v4(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
-    let ((src_ip, src_port), (dst_ip, dst_port)) = (v4(src), v4(dst));
-    let mut tcp = Vec::new();
-    tcp.extend(src_port.to_be_bytes());
-    tcp.extend(dst_port.to_be_bytes());
-    tcp.extend(1u32.to_be_bytes());
-    tcp.extend(0u32.to_be_bytes());
-    // a header of 20 bytes, SYN, a window of 65535, no checksum yet, no urgent pointer
-    tcp.extend([0x50, 0x02, 0xff, 0xff, 0, 0, 0, 0]);
-    let mut pseudo = Vec::new();
-    pseudo.extend(src_ip.octets());
-    pseudo.extend(dst_ip.octets());
-    pseudo.extend([0, 6]);
-    pseudo.extend((tcp.len() as u16).to_be_bytes());
-    pseudo.extend(&tcp);
-    let sum = checksum(&pseudo);
-    tcp[16..18].copy_from_slice(&sum.to_be_bytes());
-    ipv4_packet(6, src_ip, dst_ip, &tcp)
-}
-
-/// Where the TCP header of `packet` (IPv4 or IPv6, no extension headers)
-/// starts, and where the packet ends; `None` for any other packet.
-fn tcp_header(packet: &[u8]) -> Option<(usize, usize)> {
-    let (protocol, header, total) = match packet.first().map(|b| b >> 4) {
-        Some(4) => (
-            packet[9],
-            usize::from(packet[0] & 15) * 4,
-            usize::from(u16::from_be_bytes([packet[2], packet[3]])),
-        ),
-        Some(6) => (
-            packet[6],
-            40,
-            40 + usize::from(u16::from_be_bytes([packet[4], packet[5]])),
-        ),
-        _ => return None,
-    };
-    (protocol == 6).then_some((header, total))
-}
-
-/// The bytes of TCP payload `packet` carries; 0 for anything else.
-fn tcp_payload_len(packet: &[u8]) -> usize {
-    tcp_header(packet).map_or(0, |(header, total)| {
-        total - header - usize::from(packet[header + 12] >> 4) * 4
-    })
-}
-
-/// Whether `packet` is a TCP segment with the RST flag.
-fn is_reset(packet: &[u8]) -> bool {
-    tcp_header(packet).is_some_and(|(header, _)| packet[header + 13] & 0x04 != 0)
-}
-
 /// The session of an app connecting to `dst` through the adapter.
 fn session(dst: SocketAddr) -> SessionInfo {
     SessionInfo {
@@ -235,7 +104,7 @@ async fn relayed(
     tokio::task::JoinHandle<()>,
     Arc<SessionHandle>,
 ) {
-    let dialed = expect_dialed(within(dialer.dial(session(to))).await);
+    let dialed = expect_dialed(within("the session to be dialed", dialer.dial(session(to))).await);
     let (app, tun_side) = tokio::io::duplex(64 * 1024);
     let handle = dialed.handle.clone();
     let relay = tokio::spawn({
@@ -275,17 +144,21 @@ async fn two_app_stacks_carry_a_connection() {
         let (mut client, mut server) = (client, server);
         client.write_all(b"hello").await.unwrap();
         let mut word = [0u8; 5];
-        within(server.read_exact(&mut word)).await.unwrap();
+        within("hello to arrive", server.read_exact(&mut word))
+            .await
+            .unwrap();
         assert_eq!(&word, b"hello");
         server.write_all(b"world").await.unwrap();
-        within(client.read_exact(&mut word)).await.unwrap();
+        within("world to arrive", client.read_exact(&mut word))
+            .await
+            .unwrap();
         assert_eq!(&word, b"world");
 
         // a megabyte each way at the same time, every byte the pattern's
         const MIB: usize = 1 << 20;
         let (mut client_read, mut client_write) = tokio::io::split(client);
         let (mut server_read, mut server_write) = tokio::io::split(server);
-        within(async {
+        within("a megabyte each way", async {
             tokio::try_join!(
                 write_pattern(&mut client_write, MIB),
                 read_pattern(&mut server_read, MIB),
@@ -307,16 +180,25 @@ async fn fin_and_reset_are_told_apart() {
     server.write_all(b"last words").await.unwrap();
     server.shutdown().await.unwrap();
     let mut said = Vec::new();
-    within(client.read_to_end(&mut said)).await.unwrap();
+    within("the last words and the end", client.read_to_end(&mut said))
+        .await
+        .unwrap();
     assert_eq!(said, b"last words");
     assert_eq!(
-        within(client.read(&mut [0u8; 16])).await.unwrap(),
+        within("the end again", client.read(&mut [0u8; 16]))
+            .await
+            .unwrap(),
         0,
         "the end stays the end"
     );
     client.write_all(b"still heard").await.unwrap();
     let mut heard = [0u8; 11];
-    within(server.read_exact(&mut heard)).await.unwrap();
+    within(
+        "what was written after the end",
+        server.read_exact(&mut heard),
+    )
+    .await
+    .unwrap();
     assert_eq!(&heard, b"still heard");
     let error = server.write_all(b"after a shutdown").await.unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
@@ -324,7 +206,9 @@ async fn fin_and_reset_are_told_apart() {
     // a reset: both ways fail at once
     let (mut client, mut server) = connected(&a, &b, addr("192.0.2.1:8081")).await;
     server.abort();
-    let error = within(client.read(&mut [0u8; 16])).await.unwrap_err();
+    let error = within("the reset to be read", client.read(&mut [0u8; 16]))
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
     let error = client.write_all(b"too late").await.unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
@@ -370,21 +254,30 @@ async fn dropping_a_connection_that_was_not_shut_down_resets_it() {
     let (a, b) = stacks();
     let (mut client, server) = connected(&a, &b, addr("192.0.2.1:8080")).await;
     drop(server);
-    let error = within(client.read(&mut [0u8; 16])).await.unwrap_err();
+    let error = within("the reset to be read", client.read(&mut [0u8; 16]))
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
 
     // one that was shut down ends cleanly instead
     let (mut client, mut server) = connected(&a, &b, addr("192.0.2.1:8081")).await;
     server.shutdown().await.unwrap();
     drop(server);
-    assert_eq!(within(client.read(&mut [0u8; 16])).await.unwrap(), 0);
+    assert_eq!(
+        within("the end to be read", client.read(&mut [0u8; 16]))
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_syn_nobody_listens_for_is_refused() {
     let (a, _b) = stacks();
     for to in ["192.0.2.1:8080", "[2001:db8::1]:8080"] {
-        let error = within(a.connect(addr(to))).await.unwrap_err();
+        let error = within("the refusal", a.connect(addr(to)))
+            .await
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
     }
 }
@@ -404,30 +297,163 @@ async fn a_connection_nobody_answers_times_out_after_five_seconds() {
     );
 }
 
+/// The listening socket is there when `accept` returns, not when the future
+/// it returns is first polled: a SYN that comes in between finds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accept_listens_before_it_is_polled() {
+    let (a, b) = stacks();
+    let to = addr("192.0.2.1:8080");
+    let accepting = b.accept(to);
+    let mut client = within("the connection to be made", a.connect(to))
+        .await
+        .expect("the SYN found the listener");
+    let mut server = within("the connection to be accepted", accepting)
+        .await
+        .expect("accept");
+    client.write_all(b"hello").await.unwrap();
+    let mut word = [0u8; 5];
+    within("hello to arrive", server.read_exact(&mut word))
+        .await
+        .unwrap();
+    assert_eq!(&word, b"hello");
+    server.write_all(b"world").await.unwrap();
+    within("world to arrive", client.read_exact(&mut word))
+        .await
+        .unwrap();
+    assert_eq!(&word, b"world");
+}
+
+/// What later tests do: `accept` on a task of its own, and the connection
+/// made right after, while that task may not have run yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_spawned_accept_is_ready_for_the_connection_made_right_after() {
+    let (a, b) = stacks();
+    for round in 0..50u16 {
+        let to = addr(&format!("192.0.2.1:{}", 8000 + round));
+        let accepting = tokio::spawn(b.accept(to));
+        let client = within("the connection to be made", a.connect(to))
+            .await
+            .expect("the SYN found the listener");
+        let server = within("the accept task", accepting)
+            .await
+            .unwrap()
+            .expect("accept");
+        assert_eq!(server.local(), to);
+        drop((client, server));
+    }
+}
+
+#[tokio::test]
+async fn an_accept_that_cannot_listen_says_so_when_it_is_awaited() {
+    let (_a, b) = stacks();
+    // nothing can listen on port 0
+    let accepting = b.accept(addr("192.0.2.1:0"));
+    let error = within("the error", accepting).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(b.socket_count(), 0);
+}
+
+/// The side that closes first ends in TIME-WAIT, and the last segment of the
+/// other side, which came within the 10 ms smoltcp holds an ACK back, is
+/// still owed one when the connection is dropped: forgetting the socket at
+/// once leaves the other side in LAST-ACK until its FIN is sent again and
+/// answered with a reset. On a paused clock: everything before the drops
+/// happens at one instant, the stack's timers fire when they are due and
+/// not at the system's next tick, and the 1.5 s cost nothing.
+#[tokio::test(start_paused = true)]
+async fn a_dropped_connection_in_time_wait_still_sends_its_last_ack() {
+    let (a, b) = stacks();
+    let resets = Arc::new(AtomicUsize::new(0));
+    {
+        // a's filter sees everything that crosses, both ways
+        let resets = resets.clone();
+        a.set_filter(move |_, packet| {
+            if is_reset(packet) {
+                resets.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        });
+    }
+    let (mut client, mut server) = connected(&a, &b, addr("192.0.2.1:8080")).await;
+    // a asks and closes its end; b reads to the end, answers at once (the
+    // data, then its FIN, well inside 10 ms) and goes
+    client.write_all(b"request").await.unwrap();
+    client.shutdown().await.unwrap();
+    let mut request = Vec::new();
+    within("the request and the end", server.read_to_end(&mut request))
+        .await
+        .unwrap();
+    assert_eq!(request, b"request");
+    server.write_all(b"response").await.unwrap();
+    server.shutdown().await.unwrap();
+    drop(server);
+    // a reads the answer and the end, and goes
+    let mut response = Vec::new();
+    within(
+        "the response and the end",
+        client.read_to_end(&mut response),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response, b"response");
+    drop(client);
+
+    // b's FIN is acknowledged, so b is done, and a's socket goes after its grace
+    let soon = Duration::from_millis(300);
+    eventually("b to be done with the connection", soon, || {
+        b.socket_count() == 0
+    })
+    .await;
+    eventually("a to forget the connection", soon, || a.socket_count() == 0).await;
+    // 1.5 s on, long enough for b's FIN to be sent again, had it not been
+    // acknowledged (a retransmission timeout is 0.8 s after the first
+    // samples), and answered with a reset
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(resets.load(Ordering::SeqCst), 0, "no reset crossed");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ports_are_not_taken_twice() {
     let (a, b) = stacks();
     let to = addr("192.0.2.1:8080");
     let (first, _first_server) = connected(&a, &b, to).await;
-    let accepting = listening(&b, to).await;
-    let second = within(a.connect(to)).await.unwrap();
+    let accepting = b.accept(to);
+    let second = within("the second connection", a.connect(to))
+        .await
+        .unwrap();
     assert_ne!(first.local().port(), second.local().port());
-    drop(within(accepting).await.unwrap());
+    drop(
+        within("the second connection to be accepted", accepting)
+            .await
+            .unwrap(),
+    );
 
     // a port that is taken is taken, whoever it goes to
-    let accepting = listening(&b, to).await;
-    let held = within(a.connect_from(50000, to)).await.unwrap();
+    let accepting = b.accept(to);
+    let held = within(
+        "the connection from a chosen port",
+        a.connect_from(50000, to),
+    )
+    .await
+    .unwrap();
     assert_eq!(held.local().port(), 50000);
-    drop(within(accepting).await.unwrap());
-    let error = within(a.connect_from(50000, addr("192.0.2.1:8081")))
-        .await
-        .unwrap_err();
+    drop(
+        within("that connection to be accepted", accepting)
+            .await
+            .unwrap(),
+    );
+    let error = within(
+        "the refusal of a taken port",
+        a.connect_from(50000, addr("192.0.2.1:8081")),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
 
     // and free again once the connection is forgotten (nobody listens at the
     // new destination, which answers the attempt with a reset)
     drop(held);
-    within(async {
+    within("the port to be free again", async {
         loop {
             match a.connect_from(50000, addr("192.0.2.1:8082")).await {
                 Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
@@ -449,7 +475,9 @@ async fn finished_connections_leave_no_sockets_behind() {
         let (mut client, mut server) = connected(&a, &b, to).await;
         client.write_all(b"data").await.unwrap();
         let mut data = [0u8; 4];
-        within(server.read_exact(&mut data)).await.unwrap();
+        within("the data to arrive", server.read_exact(&mut data))
+            .await
+            .unwrap();
         match round % 3 {
             // both ends reset
             0 => {
@@ -459,9 +487,19 @@ async fn finished_connections_leave_no_sockets_behind() {
             // both ends close, one after the other
             1 => {
                 client.shutdown().await.unwrap();
-                assert_eq!(within(server.read(&mut data)).await.unwrap(), 0);
+                assert_eq!(
+                    within("the client's end", server.read(&mut data))
+                        .await
+                        .unwrap(),
+                    0
+                );
                 server.shutdown().await.unwrap();
-                assert_eq!(within(client.read(&mut data)).await.unwrap(), 0);
+                assert_eq!(
+                    within("the server's end", client.read(&mut data))
+                        .await
+                        .unwrap(),
+                    0
+                );
             }
             // one end goes away without a word
             _ => drop(server),
@@ -473,9 +511,10 @@ async fn finished_connections_leave_no_sockets_behind() {
     })
     .await;
 
-    // listening sockets nobody connected to go as well
-    let waiting = listening(&b, addr("192.0.2.1:9000")).await;
-    assert_eq!(b.socket_count(), 1);
+    // a listening socket nobody connects to is there from the call on, and
+    // goes with its future
+    let waiting = b.accept(addr("192.0.2.1:9000"));
+    assert_eq!(b.socket_count(), 1, "listening before the future is polled");
     drop(waiting);
     eventually("the listener to be forgotten", WITHIN, || {
         b.socket_count() == 0
@@ -492,8 +531,14 @@ async fn divert_and_inject_go_around_the_stack() {
     let syn = syn_v4(from, addr("192.0.2.1:9009"));
     a.inject(datagram.clone());
     a.inject(syn.clone());
-    assert_eq!(within(diverted.recv()).await, Some(datagram));
-    assert_eq!(within(diverted.recv()).await, Some(syn));
+    assert_eq!(
+        within("the datagram to be diverted", diverted.recv()).await,
+        Some(datagram)
+    );
+    assert_eq!(
+        within("the SYN to be diverted", diverted.recv()).await,
+        Some(syn)
+    );
     // neither reached the stack of b, which would have answered the SYN with
     // a reset; and a's own stack was not what sent them
     assert_eq!(b.packets(), (0, 0));
@@ -529,7 +574,12 @@ async fn a_filter_sees_both_ways_and_can_drop() {
     let (mut client, mut server) = connected(&a, &b, addr("192.0.2.1:8080")).await;
     client.write_all(b"sent twice").await.unwrap();
     let mut data = [0u8; 10];
-    within(server.read_exact(&mut data)).await.unwrap();
+    within(
+        "the data to arrive after the loss",
+        server.read_exact(&mut data),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         &data, b"sent twice",
         "it arrived all the same: it was sent again"
@@ -561,7 +611,12 @@ async fn a_filter_can_change_a_packet() {
     let (mut client, mut server) = connected(&a, &b, addr("192.0.2.1:8080")).await;
     client.write_all(b"intact").await.unwrap();
     let mut data = [0u8; 6];
-    within(server.read_exact(&mut data)).await.unwrap();
+    within(
+        "the data to arrive after the damage",
+        server.read_exact(&mut data),
+    )
+    .await
+    .unwrap();
     assert_eq!(&data, b"intact", "the damaged segment was not taken");
     assert_eq!(changed.load(Ordering::SeqCst), 1);
 }
@@ -571,16 +626,22 @@ async fn a_memory_device_fails_once_its_app_end_is_gone() {
     let (device, end) = MemoryDevice::pair(1500, 4);
     assert_eq!(device.mtu(), 1500);
     // what the app end had sent is still there to be received, then the end
-    within(end.send(vec![9u8; 20])).await.unwrap();
+    within("the packet to be sent", end.send(vec![9u8; 20]))
+        .await
+        .unwrap();
     drop(end);
     let mut got = Vec::new();
-    within(device.recv(&mut got, 8)).await.unwrap();
+    within("the packet", device.recv(&mut got, 8))
+        .await
+        .unwrap();
     assert_eq!(got, [vec![9u8; 20]]);
     got.clear();
-    let error = within(device.recv(&mut got, 8)).await.unwrap_err();
+    let error = within("the end", device.recv(&mut got, 8))
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     assert!(got.is_empty());
-    let error = within(device.send(&mut vec![vec![1u8; 20]]))
+    let error = within("the send to fail", device.send(&mut vec![vec![1u8; 20]]))
         .await
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
@@ -591,15 +652,23 @@ async fn an_app_end_sees_its_device_gone() {
     let (device, mut end) = MemoryDevice::pair(1500, 4);
     assert_eq!(end.mtu(), 1500);
     // what the device had written is still there to be received, then the end
-    within(device.send(&mut vec![vec![7u8; 20], vec![8u8; 20]]))
-        .await
-        .unwrap();
+    within(
+        "the packets to be sent",
+        device.send(&mut vec![vec![7u8; 20], vec![8u8; 20]]),
+    )
+    .await
+    .unwrap();
     drop(device);
-    assert_eq!(within(end.recv()).await, Some(vec![7u8; 20]));
+    assert_eq!(
+        within("the first packet", end.recv()).await,
+        Some(vec![7u8; 20])
+    );
     assert_eq!(end.try_recv(), Some(vec![8u8; 20]));
-    assert_eq!(within(end.recv()).await, None);
+    assert_eq!(within("the end", end.recv()).await, None);
     assert_eq!(end.try_recv(), None);
-    let error = within(end.send(vec![1u8; 20])).await.unwrap_err();
+    let error = within("the send to fail", end.send(vec![1u8; 20]))
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
 }
 
@@ -608,14 +677,18 @@ async fn a_memory_device_keeps_order_and_waits_for_room() {
     // at most `max` at a time, in the order they came
     let (device, end) = MemoryDevice::pair(1500, 8);
     for i in 0..5u8 {
-        within(end.send(vec![i; 20])).await.unwrap();
+        within("the packet to be sent", end.send(vec![i; 20]))
+            .await
+            .unwrap();
     }
     let first = |packets: &[Vec<u8>]| packets.iter().map(|p| p[0]).collect::<Vec<_>>();
     let mut got = Vec::new();
-    within(device.recv(&mut got, 3)).await.unwrap();
+    within("the first three", device.recv(&mut got, 3))
+        .await
+        .unwrap();
     assert_eq!(first(&got), [0, 1, 2]);
     got.clear();
-    within(device.recv(&mut got, 3)).await.unwrap();
+    within("the rest", device.recv(&mut got, 3)).await.unwrap();
     assert_eq!(first(&got), [3, 4]);
 
     // with room for one packet, the second waits for the app end to take the first
@@ -630,9 +703,15 @@ async fn a_memory_device_keeps_order_and_waits_for_room() {
             .is_err(),
         "the second packet must wait"
     );
-    assert_eq!(within(end.recv()).await, Some(vec![1u8; 20]));
-    within(sending).await.unwrap();
-    assert_eq!(within(end.recv()).await, Some(vec![2u8; 20]));
+    assert_eq!(
+        within("the first packet", end.recv()).await,
+        Some(vec![1u8; 20])
+    );
+    within("the send to finish", sending).await.unwrap();
+    assert_eq!(
+        within("the second packet", end.recv()).await,
+        Some(vec![2u8; 20])
+    );
     assert!(packets.is_empty(), "a send leaves its packets empty");
 }
 
@@ -653,16 +732,18 @@ async fn the_fake_dialer_answers_what_it_was_told() {
     assert_eq!(handle.id(), 1);
     app.write_all(b"ping").await.unwrap();
     let mut pong = [0u8; 4];
-    within(app.read_exact(&mut pong)).await.unwrap();
+    within("the echo", app.read_exact(&mut pong)).await.unwrap();
     assert_eq!(&pong, b"ping");
     app.shutdown().await.unwrap();
-    within(relay).await.unwrap();
+    within("the relay to end", relay).await.unwrap();
     assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
     assert_eq!(dialer.relay_ends(), [Ok(())]);
 
     // rejected: the handle is finished before the answer
     let Some(DialError::Reject { kind, handle, .. }) =
-        within(dialer.dial(session(to_reject))).await.err()
+        within("the rejection", dialer.dial(session(to_reject)))
+            .await
+            .err()
     else {
         panic!("not a rejection");
     };
@@ -683,7 +764,7 @@ async fn the_fake_dialer_answers_what_it_was_told() {
             message,
             handle,
             ..
-        }) = within(dialer.dial(session(to))).await.err()
+        }) = within("the failure", dialer.dial(session(to))).await.err()
         else {
             panic!("not a failure");
         };
@@ -747,12 +828,27 @@ impl AsyncWrite for Broken {
 async fn a_failed_relay_is_recorded_with_its_text() {
     let dialer = FakeDialer::new();
     let handle = SessionHandle::new(77, session(addr("192.0.2.14:80")));
+    // what `relay_ends` holds when the handle is told it is over
+    let ends_then = Arc::new(AtomicUsize::new(usize::MAX));
+    handle.on_finish({
+        let (dialer, ends_then) = (dialer.clone(), ends_then.clone());
+        move |_, _| ends_then.store(dialer.relay_ends().len(), Ordering::SeqCst)
+    });
     let (_far, near) = tokio::io::duplex(64);
-    within(dialer.relay(Box::new(Broken), Box::new(near), handle.clone())).await;
+    within(
+        "the relay to end",
+        dialer.relay(Box::new(Broken), Box::new(near), handle.clone()),
+    )
+    .await;
     assert_eq!(dialer.relay_ends(), [Err("the app went away".to_string())]);
     assert_eq!(
         handle.outcome(),
         Some(SessionOutcome::Failed("the app went away".into()))
+    );
+    assert_eq!(
+        ends_then.load(Ordering::SeqCst),
+        1,
+        "the end is recorded before the handle finishes"
     );
 }
 
@@ -768,14 +864,16 @@ async fn a_memory_upstream_sends_what_it_was_told_and_counts_what_it_gets() {
         },
     );
     let (mut app, relay, _handle) = relayed(&dialer, to).await;
-    within(read_pattern(&mut app, 5000)).await.unwrap();
+    within("what the far end sends", read_pattern(&mut app, 5000))
+        .await
+        .unwrap();
     write_pattern(&mut app, 3000).await.unwrap();
     eventually("the far end to read it", WITHIN, || {
         dialer.received(to) == 3000
     })
     .await;
     app.shutdown().await.unwrap();
-    within(relay).await.unwrap();
+    within("the relay to end", relay).await.unwrap();
     assert_eq!(dialer.relay_ends(), [Ok(())]);
     assert_eq!(dialer.received(to), 3000);
 }
@@ -799,7 +897,7 @@ async fn a_held_upstream_reads_only_once_released() {
     )
     .await;
     app.shutdown().await.unwrap();
-    within(relay).await.unwrap();
+    within("the relay to end", relay).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -808,9 +906,11 @@ async fn closing_an_app_stack_fails_its_device() {
     let (device, end) = MemoryDevice::pair(1500, 4);
     let alone = AppStack::start(end);
     alone.close();
-    let error = within(device.recv(&mut Vec::new(), 8)).await.unwrap_err();
+    let error = within("the device to fail", device.recv(&mut Vec::new(), 8))
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
-    let error = within(device.send(&mut vec![vec![0u8; 20]]))
+    let error = within("the device to fail", device.send(&mut vec![vec![0u8; 20]]))
         .await
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
@@ -826,13 +926,17 @@ async fn closing_an_app_stack_fails_its_device() {
     })
     .await;
     a.close();
-    let error = within(read).await.unwrap_err();
+    let error = within("the waiting read to fail", read).await.unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
     let error = client.write_all(b"x").await.unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
-    let error = within(a.connect(addr("192.0.2.1:8080"))).await.unwrap_err();
+    let error = within("the connect to fail", a.connect(addr("192.0.2.1:8080")))
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
-    let error = within(a.accept(addr("198.18.0.1:8080"))).await.unwrap_err();
+    let error = within("the accept to fail", a.accept(addr("198.18.0.1:8080")))
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
 }
 
@@ -849,17 +953,31 @@ async fn the_upstream_servers_do_what_they_say() {
     let mut stream = TcpStream::connect(echo.addr()).await.unwrap();
     stream.write_all(b"echo").await.unwrap();
     let mut back = [0u8; 4];
-    within(stream.read_exact(&mut back)).await.unwrap();
+    within("the echo", stream.read_exact(&mut back))
+        .await
+        .unwrap();
     assert_eq!(&back, b"echo");
     stream.shutdown().await.unwrap();
-    assert_eq!(within(stream.read(&mut back)).await.unwrap(), 0);
+    assert_eq!(
+        within("the echo's end", stream.read(&mut back))
+            .await
+            .unwrap(),
+        0
+    );
 
     // the sink counts
     let sink = Upstream::sink().await;
     let mut stream = TcpStream::connect(sink.addr()).await.unwrap();
-    write_pattern(&mut stream, 100_000).await.unwrap();
+    within(
+        "the pattern to be written",
+        write_pattern(&mut stream, 100_000),
+    )
+    .await
+    .unwrap();
     assert!(sink.wait_for(100_000, WITHIN).await);
     assert_eq!(sink.received(), 100_000);
+    // waits for: `wait_for` to give up after 1 ms; margin: nothing can come
+    // to a sink nobody is connected to, so there is no race to lose
     assert!(
         !Upstream::sink()
             .await
@@ -871,9 +989,13 @@ async fn the_upstream_servers_do_what_they_say() {
     // the source writes the pattern and then closes
     let source = Upstream::source(300_000).await;
     let mut stream = TcpStream::connect(source.addr()).await.unwrap();
-    within(read_pattern(&mut stream, 300_000)).await.unwrap();
+    within("the pattern", read_pattern(&mut stream, 300_000))
+        .await
+        .unwrap();
     let mut rest = Vec::new();
-    within(stream.read_to_end(&mut rest)).await.unwrap();
+    within("the end", stream.read_to_end(&mut rest))
+        .await
+        .unwrap();
     assert!(rest.is_empty());
     assert_eq!(source.sent(), 300_000);
 
@@ -882,9 +1004,9 @@ async fn the_upstream_servers_do_what_they_say() {
     let to = kept.addr();
     let mut stream = TcpStream::connect(to).await.unwrap();
     drop(kept);
-    let end = within(stream.read(&mut back)).await;
+    let end = within("the connection to end", stream.read(&mut back)).await;
     assert!(matches!(end, Ok(0) | Err(_)), "{end:?}");
-    within(async {
+    within("the listener to go", async {
         while TcpStream::connect(to).await.is_ok() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }

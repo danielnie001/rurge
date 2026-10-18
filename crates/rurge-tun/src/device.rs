@@ -59,6 +59,8 @@ impl Device for MemoryDevice {
         })
     }
 
+    /// Dropping the future in the middle of a send loses the packets not yet
+    /// sent: they are taken out of `packets` as they come to be sent.
     fn send<'a>(&'a self, packets: &'a mut Vec<Vec<u8>>) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
             for packet in packets.drain(..) {

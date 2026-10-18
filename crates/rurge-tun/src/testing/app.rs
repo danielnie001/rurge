@@ -15,6 +15,7 @@ use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::socket::{AnySocket, tcp};
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::RangeInclusive;
@@ -34,6 +35,11 @@ const TX_BUFFER: usize = 256 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a connection whose `AppTcp` is gone may take to close before it is reset.
 const LINGER: Duration = Duration::from_secs(30);
+/// How long a connection whose `AppTcp` is gone stays once it is in TIME-WAIT:
+/// smoltcp holds the ACK of the other side's last segment back for up to
+/// 10 ms, and a socket forgotten before it is sent leaves the other side
+/// without it.
+const TIME_WAIT_GRACE: Duration = Duration::from_millis(20);
 /// The ports `connect` picks from.
 const PORTS: RangeInclusive<u16> = 49152..=65535;
 /// The most packets handed to the stack in one turn of its task.
@@ -151,24 +157,29 @@ impl AppStack {
         }
     }
 
-    /// Listens on `local` and resolves with the first connection. The
-    /// listening socket exists from the first poll of this future on.
-    pub async fn accept(&self, local: SocketAddr) -> io::Result<AppTcp> {
-        let mut tcp = {
-            let mut state = self.shared().state();
-            let handle = state.listen(local)?;
-            AppTcp {
-                guard: self.guard.clone(),
-                handle,
-                local,
+    /// Listens on `local` at once (before the future is first polled) and resolves
+    /// with the first connection. Dropping the future stops listening.
+    pub fn accept(
+        &self,
+        local: SocketAddr,
+    ) -> impl Future<Output = io::Result<AppTcp>> + Send + 'static {
+        // the socket is made here, not in the future: a SYN that comes before
+        // the future runs finds it
+        let listening = self.shared().state().listen(local).map(|handle| AppTcp {
+            guard: self.guard.clone(),
+            handle,
+            local,
+        });
+        async move {
+            let mut tcp = listening?;
+            std::future::poll_fn(|cx| tcp.poll_established(cx, false)).await?;
+            // the address the connection came to, which a listener on any address did not name
+            let own = tcp.guard.shared.state().local_of(tcp.handle);
+            if let Some(own) = own {
+                tcp.local = own;
             }
-        };
-        std::future::poll_fn(|cx| tcp.poll_established(cx, false)).await?;
-        // the address the connection came to, which a listener on any address did not name
-        if let Some(own) = self.shared().state().local_of(tcp.handle) {
-            tcp.local = own;
+            Ok(tcp)
         }
-        Ok(tcp)
     }
 
     /// Packets from the other end whose TCP or UDP destination port is in `ports`
@@ -318,7 +329,11 @@ impl Drop for AppTcp {
             if !conn.shut && !conn.aborted && socket.is_open() {
                 socket.abort();
             }
-            state.released.push((self.handle, Instant::now()));
+            state.released.push(Released {
+                handle: self.handle,
+                since: Instant::now(),
+                time_wait: None,
+            });
         }
         drop(guard);
         self.guard.shared.wake();
@@ -427,6 +442,14 @@ impl AsyncWrite for AppTcp {
     }
 }
 
+/// A socket whose `AppTcp` is gone, until it is over.
+struct Released {
+    handle: SocketHandle,
+    since: Instant,
+    /// When the socket was first seen in TIME-WAIT.
+    time_wait: Option<Instant>,
+}
+
 /// What the stack knows of one of its sockets besides smoltcp's state.
 struct Conn {
     /// The family (true for IPv6) and port taken from the pool `connect` picks from.
@@ -447,8 +470,8 @@ struct State {
     /// What smoltcp's clock counts from.
     epoch: Instant,
     conns: HashMap<SocketHandle, Conn>,
-    /// Sockets whose `AppTcp` is gone, and since when.
-    released: Vec<(SocketHandle, Instant)>,
+    /// Sockets whose `AppTcp` is gone.
+    released: Vec<Released>,
     /// The ports `connect` has given out, by family.
     ports: HashSet<(bool, u16)>,
     next_port: [u16; 2],
@@ -689,7 +712,8 @@ impl State {
 
     /// Sends what the sockets have to send, until they have no more; what
     /// the stack gave out goes through the filter into the outbox. When it
-    /// wants to run again, if it does.
+    /// wants to run again, if it does: when smoltcp does, or when a socket
+    /// that is gone is next looked at.
     fn advance(&mut self, now: Instant) -> Option<Duration> {
         let at = self.at(now);
         // a poll sends at most one segment of each connection
@@ -704,33 +728,51 @@ impl State {
                 self.outbox.push_back(packet);
             }
         }
-        self.reap(now);
-        self.iface.poll_delay(at, &self.sockets).map(Duration::from)
+        let reap = self.reap(now);
+        let wake = self.iface.poll_delay(at, &self.sockets).map(Duration::from);
+        match (wake, reap) {
+            (Some(wake), Some(reap)) => Some(wake.min(reap)),
+            (wake, reap) => wake.or(reap),
+        }
     }
 
     /// Forgets the sockets of the connections that are gone, once they are over:
-    /// in TIME-WAIT, or closed with the reset sent (smoltcp keeps the
-    /// endpoint of an aborted socket until it has sent its reset).
-    fn reap(&mut self, now: Instant) {
-        for (handle, since) in std::mem::take(&mut self.released) {
-            let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-            let over = match socket.state() {
-                tcp::State::TimeWait => true,
+    /// in TIME-WAIT for `TIME_WAIT_GRACE` (the ACK of the other side's last
+    /// segment may still be owed), or closed with the reset sent (smoltcp
+    /// keeps the endpoint of an aborted socket until it has sent its reset).
+    /// When the soonest of the sockets kept is next to be looked at, if any
+    /// are kept.
+    fn reap(&mut self, now: Instant) -> Option<Duration> {
+        let mut next: Option<Instant> = None;
+        for mut gone in std::mem::take(&mut self.released) {
+            let socket = self.sockets.get_mut::<tcp::Socket>(gone.handle);
+            let state = socket.state();
+            let over = match state {
+                tcp::State::TimeWait => {
+                    let first = *gone.time_wait.get_or_insert(now);
+                    now.saturating_duration_since(first) >= TIME_WAIT_GRACE
+                }
                 tcp::State::Closed => socket.remote_endpoint().is_none(),
                 _ => false,
             };
             if over {
-                self.sockets.remove(handle);
-                if let Some(held) = self.conns.remove(&handle).and_then(|conn| conn.held) {
+                self.sockets.remove(gone.handle);
+                if let Some(held) = self.conns.remove(&gone.handle).and_then(|c| c.held) {
                     self.ports.remove(&held);
                 }
                 continue;
             }
-            if now.saturating_duration_since(since) >= LINGER {
+            if now.saturating_duration_since(gone.since) >= LINGER {
                 socket.abort();
             }
-            self.released.push((handle, since));
+            let due = match (state, gone.time_wait) {
+                (tcp::State::TimeWait, Some(first)) => first + TIME_WAIT_GRACE,
+                _ => gone.since + LINGER,
+            };
+            next = Some(next.map_or(due, |soonest| soonest.min(due)));
+            self.released.push(gone);
         }
+        next.map(|due| due.saturating_duration_since(now))
     }
 }
 

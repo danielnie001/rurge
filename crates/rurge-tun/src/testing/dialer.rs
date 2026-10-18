@@ -20,8 +20,8 @@ use tokio::sync::watch;
 pub enum Script {
     /// Connect to this address and relay to it; `script` panics unless it is a loopback address.
     Upstream(SocketAddr),
-    /// `tokio::io::duplex(buffer)`; the far end writes `send` bytes of `pattern`, then reads and
-    /// discards until the session ends.
+    /// `tokio::io::duplex(buffer)`; the far end writes `send` bytes of `pattern` while it reads and
+    /// discards whatever comes, until the session ends.
     Memory {
         buffer: usize,
         send: usize,
@@ -241,18 +241,14 @@ impl Dialer for FakeDialer {
             let end =
                 tokio::io::copy_bidirectional_with_sizes(&mut client, &mut upstream, 8192, 8192)
                     .await;
-            let end = match end {
-                Ok(_) => {
-                    handle.finish(SessionOutcome::Completed);
-                    Ok(())
-                }
-                Err(e) => {
-                    let text = e.to_string();
-                    handle.finish(SessionOutcome::Failed(text.clone()));
-                    Err(text)
-                }
-            };
-            self.book().relay_ends.push(end);
+            let end = end.map(|_| ()).map_err(|e| e.to_string());
+            // recorded before the handle finishes, so whoever waits for the
+            // handle's outcome finds it
+            self.book().relay_ends.push(end.clone());
+            handle.finish(match end {
+                Ok(()) => SessionOutcome::Completed,
+                Err(text) => SessionOutcome::Failed(text),
+            });
         })
     }
 }
