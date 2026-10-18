@@ -1,5 +1,6 @@
 //! The adapter core's tests.
 
+mod bench;
 mod budget;
 mod fixture;
 mod lifecycle;

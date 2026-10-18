@@ -136,14 +136,17 @@ fn failed(handle: Arc<SessionHandle>, message: String) -> Result<Dialed, DialErr
 }
 
 /// The far end of an in-memory session: it writes `send` bytes of the
-/// pattern while it reads and discards what comes, once it may.
-fn far_end(far: Arc<Far>, stream: DuplexStream, send: usize, hold: bool) {
+/// pattern while it reads and discards what comes, once it may. It works in
+/// pieces of what the pipe holds (`buffer`, at most 8 KiB), so that ten
+/// thousand far ends hold little more than their pipes do.
+fn far_end(far: Arc<Far>, stream: DuplexStream, buffer: usize, send: usize, hold: bool) {
+    let piece = buffer.clamp(1, 8192);
     tokio::spawn(async move {
         let (mut read, mut write) = tokio::io::split(stream);
         let writing = async {
             let mut done = 0;
             while done < send {
-                let n = (send - done).min(8192);
+                let n = (send - done).min(piece);
                 let chunk: Vec<u8> = (done..done + n).map(|i| pattern(i as u64)).collect();
                 if write.write_all(&chunk).await.is_err() {
                     return;
@@ -158,7 +161,7 @@ fn far_end(far: Arc<Far>, stream: DuplexStream, send: usize, hold: bool) {
                     return;
                 }
             }
-            let mut buf = vec![0; 8192];
+            let mut buf = vec![0; piece];
             while let Ok(n) = read.read(&mut buf).await {
                 if n == 0 {
                     break;
@@ -211,6 +214,7 @@ impl Dialer for FakeDialer {
                     far_end(
                         far.expect("a far end for a memory script"),
                         far_stream,
+                        buffer,
                         send,
                         false,
                     );
@@ -221,6 +225,7 @@ impl Dialer for FakeDialer {
                     far_end(
                         far.expect("a far end for a hold script"),
                         far_stream,
+                        buffer,
                         0,
                         true,
                     );

@@ -29,13 +29,20 @@ pub(crate) fn rig(options: TunOptions) -> Rig {
 /// Every test that starts a TUN starts it here, so that a change of what
 /// `Tun::start` takes is a change of this function only.
 pub(crate) fn rig_on((device, end): (MemoryDevice, AppEnd), options: TunOptions) -> Rig {
-    let dialer = FakeDialer::new();
-    let tun = Tun::start(Arc::new(device), dialer.clone(), options);
+    let (tun, dialer) = tun_on(device, options);
     Rig {
         tun,
         app: AppStack::start(end),
         dialer,
     }
+}
+
+/// The TUN half of `rig_on`, on the current runtime: for a test that runs
+/// the app's stack on another one. The only call of `Tun::start` is here.
+pub(crate) fn tun_on(device: MemoryDevice, options: TunOptions) -> (TunHandle, Arc<FakeDialer>) {
+    let dialer = FakeDialer::new();
+    let tun = Tun::start(Arc::new(device), dialer.clone(), options);
+    (tun, dialer)
 }
 
 /// What a wait in these tests is bounded by, unless it says otherwise.
@@ -162,6 +169,18 @@ pub(crate) fn segment_v4(
     ack: u32,
     flags: u8,
 ) -> Vec<u8> {
+    data_segment_v4(src, dst, seq, ack, flags, &[])
+}
+
+/// The same with `payload`.
+pub(crate) fn data_segment_v4(
+    src: SocketAddr,
+    dst: SocketAddr,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Vec<u8> {
     let ((src_ip, src_port), (dst_ip, dst_port)) = (v4(src), v4(dst));
     let mut tcp = Vec::new();
     tcp.extend(src_port.to_be_bytes());
@@ -170,6 +189,7 @@ pub(crate) fn segment_v4(
     tcp.extend(ack.to_be_bytes());
     // a header of 20 bytes, the flags, a window of 65535, no checksum yet, no urgent pointer
     tcp.extend([0x50, flags, 0xff, 0xff, 0, 0, 0, 0]);
+    tcp.extend(payload);
     let mut pseudo = Vec::new();
     pseudo.extend(src_ip.octets());
     pseudo.extend(dst_ip.octets());

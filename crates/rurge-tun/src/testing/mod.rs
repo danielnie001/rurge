@@ -4,8 +4,10 @@
 
 mod app;
 mod dialer;
+mod scripted;
 mod servers;
 
 pub use app::{AppStack, AppTcp, Direction};
 pub use dialer::{FakeDialer, Script};
+pub use scripted::ScriptedTcp;
 pub use servers::{Upstream, pattern};

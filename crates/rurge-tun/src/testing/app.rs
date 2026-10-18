@@ -160,11 +160,12 @@ impl AppStack {
     }
 
     /// Listens on `local` at once (before the future is first polled) and resolves
-    /// with the first connection. Dropping the future stops listening.
+    /// with the first connection. Dropping the future stops listening. The future
+    /// owns all it needs (`use<>`): it does not borrow the stack it was made from.
     pub fn accept(
         &self,
         local: SocketAddr,
-    ) -> impl Future<Output = io::Result<AppTcp>> + Send + 'static {
+    ) -> impl Future<Output = io::Result<AppTcp>> + Send + 'static + use<> {
         // the socket is made here, not in the future: a SYN that comes before
         // the future runs finds it
         let listening = self.shared().state().listen(local).map(|handle| AppTcp {
@@ -225,6 +226,12 @@ impl AppStack {
     #[cfg(test)]
     pub(crate) fn socket_count(&self) -> usize {
         self.shared().state().sockets.iter().count()
+    }
+
+    /// The bytes of the buffers of the sockets the stack holds.
+    #[cfg(test)]
+    pub(crate) fn buffer_bytes(&self) -> usize {
+        self.socket_count() * (RX_MAX + TX_BUFFER)
     }
 }
 
