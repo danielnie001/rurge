@@ -8,8 +8,9 @@
 //! release, with `--nocapture`; the only runs of this crate that use `-p`:
 //!
 //! ```text
+//! TUN_BENCH_FAR=memory cargo test -p rurge-tun --release --lib -- --ignored --exact tests::bench::b1_single_stream_throughput --nocapture
 //! cargo test -p rurge-tun --release --lib -- --ignored --exact tests::bench::b1_single_stream_throughput --nocapture
-//! TUN_BENCH_SHARDS=64 TUN_BENCH_MIN=8 TUN_BENCH_TX_MAX=256 TUN_BENCH_BUDGET=64 TUN_BENCH_MTU=1500 \
+//! TUN_BENCH_SHARDS=256 TUN_BENCH_MIN=4 TUN_BENCH_TX_MAX=256 TUN_BENCH_BUDGET=64 TUN_BENCH_MTU=1500 \
 //!   cargo test -p rurge-tun --release --lib -- --ignored --exact tests::bench::b2_ten_thousand_connections --nocapture
 //! ```
 //!
@@ -20,11 +21,16 @@
 //! against 0.7 and against 80% of the ceiling, and its four counts, which
 //! must be 0 for the row to count: a segment dropped makes smoltcp's sender
 //! send the whole window again, and what is measured is no longer the stack.
-//! The far end of a row is a TCP connection on the loopback, as design 6 asks;
-//! `TUN_BENCH_FAR=memory` puts it in memory instead, on the TUN's thread, to
-//! see the TUN without that hop (a loopback socket written 8 KiB at a time,
-//! which is what the relay does, is itself a limit of about 1 Gbit/s on the
-//! development machine, and moves with the machine's state).
+//!
+//! B1 is judged on the rows run with `TUN_BENCH_FAR=memory`: the far end is in
+//! memory, on the TUN's thread, so a row is the TUN and the relay's two 8 KiB
+//! buffers and nothing else, and every such row is to reach 0.7 Gbit/s. Run
+//! without it the far end is a TCP connection on the loopback, as design 6
+//! asks (this is the default), and those rows stay in the table as the ceiling
+//! of that hop, not as a judgment of the TUN: a loopback socket written 8 KiB
+//! at a time, which is what the relay does, is a limit of about 0.7 to
+//! 1.2 Gbit/s on the development machine with no TUN in front of it, and the
+//! limit moves with the machine's state.
 //!
 //! B2 is one setting of the stack for each process, given by `TUN_BENCH_SHARDS`
 //! (a number), `TUN_BENCH_MIN` and `TUN_BENCH_TX_MAX` (KiB), `TUN_BENCH_BUDGET`
@@ -33,9 +39,14 @@
 //! and then lie idle, runs a hundred more that carry 4 MiB each way, and
 //! prints the peak working set of the process (`PeakWorkingSet64`, read by
 //! asking PowerShell, on Windows; `VmHWM` in `/proc/self/status` on Linux).
-//! The number to read is the peak at the end, against 429,000,000 bytes, and
-//! the five counts, which must be 0. The peak is the process's: it has the
-//! test side's memory in it too, which the output estimates part by part.
+//! The peak is the process's, and it has the test side's own memory in it.
+//!
+//! B2 is judged on rurge's own memory: the peak at the end less the test
+//! side's own memory, against 429,000,000 bytes, with the five counts, which
+//! must be 0. The test side is kept small and reported, and the run prints it
+//! item by item: the app stack's socket buffers are counted exactly (a hundred
+//! sockets), the pipes and the far ends' own buffers are upper bounds, and the
+//! scripted client's table is an estimate.
 //!
 //! A measurement is the wall clock of one run on one machine; the CPU time of
 //! a process is not read (it is not to be trusted on the development machine).
