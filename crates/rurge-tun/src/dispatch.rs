@@ -3,7 +3,7 @@
 //! queue: a queue that is full drops the packet.
 
 use crate::device::Device;
-use crate::packet::{self, Kind};
+use crate::packet::{self, Reason, Transport};
 use crate::stats::Stats;
 use crate::tcp::Tuple;
 use crate::{Ending, Life};
@@ -19,6 +19,7 @@ pub(crate) const RECV_BATCH: usize = 256;
 pub(crate) async fn run(
     device: Arc<dyn Device>,
     shards: Vec<mpsc::Sender<Vec<u8>>>,
+    ipv6: bool,
     stats: Arc<Stats>,
     life: Arc<Life>,
 ) {
@@ -34,22 +35,43 @@ pub(crate) async fn run(
             return;
         }
         for packet in batch.drain(..) {
-            route(packet, &shards, &stats);
+            route(packet, ipv6, &shards, &stats);
         }
     }
 }
 
-fn route(packet: Vec<u8>, shards: &[mpsc::Sender<Vec<u8>>], stats: &Stats) {
-    match packet::kind(&packet) {
-        Kind::Malformed => Stats::count(&stats.malformed),
-        Kind::Other => Stats::count(&stats.unsupported),
-        Kind::Tcp(segment) => match shards[shard_of(&segment.tuple, shards.len())].try_send(packet)
-        {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => Stats::count(&stats.queue_full),
-            // the shard has ended, and so has the TUN
-            Err(TrySendError::Closed(_)) => {}
-        },
+/// Sends `packet` where it is handled once it has passed the checks of
+/// [`packet::classify`], or drops it and says why. What follows the IP packet
+/// is cut off, so a shard is given the packet and no more.
+pub(crate) fn route(
+    mut packet: Vec<u8>,
+    ipv6: bool,
+    shards: &[mpsc::Sender<Vec<u8>>],
+    stats: &Stats,
+) {
+    let parsed = match packet::classify(&packet, ipv6) {
+        Ok(parsed) => parsed,
+        Err(reason) => {
+            stats.drop(reason, None, None);
+            return;
+        }
+    };
+    packet.truncate(parsed.len);
+    match parsed.transport {
+        Transport::Tcp(segment) => {
+            match shards[shard_of(&segment.tuple, shards.len())].try_send(packet) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    stats.drop(Reason::QueueFull, Some(parsed.src), Some(parsed.dst));
+                }
+                // the shard has ended, and so has the TUN
+                Err(TrySendError::Closed(_)) => {}
+            }
+        }
+        // nothing handles UDP or ICMP yet
+        Transport::Udp { .. } | Transport::Icmp { .. } => {
+            stats.drop(Reason::Unsupported, Some(parsed.src), Some(parsed.dst));
+        }
     }
 }
 

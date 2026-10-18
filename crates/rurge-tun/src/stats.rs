@@ -1,8 +1,11 @@
-//! What the TUN counts of the packets it drops, one counter for each reason
-//! (phase 3 M3 design 14); [`Counters`] is a snapshot of them.
+//! What the TUN counts of the packets it drops, one counter for each reason,
+//! and what it says of them (phase 3 M3 design 14); [`Counters`] is a
+//! snapshot of the counters.
 
 use crate::Counters;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::packet::Reason;
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 #[derive(Default)]
 pub(crate) struct Stats {
@@ -17,11 +20,66 @@ pub(crate) struct Stats {
     pub(crate) rst_limited: AtomicU64,
     pub(crate) icmp_limited: AtomicU64,
     pub(crate) stack_panics: AtomicU64,
+    warnings: Warnings,
+}
+
+/// The reasons that have been said at WARN: each once for a TUN.
+#[derive(Default)]
+pub(crate) struct Warnings {
+    /// A bit for each reason, set when it is said.
+    said: AtomicU16,
+}
+
+impl Warnings {
+    /// Whether `reason` is to be said at WARN now: the first time this is
+    /// asked of it. Never for a reason that is not said at all.
+    pub(crate) fn first_time(&self, reason: Reason) -> bool {
+        let bit = 1 << reason as u16;
+        !reason.is_silent() && self.said.fetch_or(bit, Ordering::Relaxed) & bit == 0
+    }
 }
 
 impl Stats {
     pub(crate) fn count(counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a packet dropped for `reason` and says so: at WARN the first
+    /// time the TUN drops one for the reason, without an address, at DEBUG
+    /// after that with the ends of the packet where they were read, and not
+    /// at all for a martian. Every drop goes through here.
+    pub(crate) fn drop(&self, reason: Reason, src: Option<IpAddr>, dst: Option<IpAddr>) {
+        Stats::count(self.counter(reason));
+        if reason.is_silent() {
+            return;
+        }
+        if self.warnings.first_time(reason) {
+            tracing::warn!(
+                "tun: a packet was dropped (reason: {reason}); later drops for this reason are logged at debug level"
+            );
+        } else {
+            tracing::debug!(
+                %reason,
+                src = src.map(tracing::field::display),
+                dst = dst.map(tracing::field::display),
+                "tun: packet dropped"
+            );
+        }
+    }
+
+    fn counter(&self, reason: Reason) -> &AtomicU64 {
+        match reason {
+            Reason::Malformed => &self.malformed,
+            Reason::Fragment => &self.fragment,
+            Reason::Martian => &self.martian,
+            Reason::Unsupported => &self.unsupported,
+            Reason::QueueFull => &self.queue_full,
+            Reason::UnknownFake => &self.unknown_fake,
+            Reason::Busy => &self.busy,
+            Reason::BeyondWindow => &self.beyond_window,
+            Reason::RstLimited => &self.rst_limited,
+            Reason::IcmpLimited => &self.icmp_limited,
+        }
     }
 
     pub(crate) fn counters(&self) -> Counters {

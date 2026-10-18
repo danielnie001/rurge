@@ -12,7 +12,7 @@ use super::{
     Budget, ConnId, ConnShared, EGRESS_PASSES, INGRESS_PER_WAKE, Outcome, SWEEP, TIME_WAIT_GRACE,
     TunStream, Tuple,
 };
-use crate::packet::{self, Kind};
+use crate::packet;
 use crate::session;
 use crate::{Life, TunOptions};
 use rurge_inbound::Dialer;
@@ -234,7 +234,7 @@ impl ShardState {
     /// smoltcp answers it with a reset.
     fn ingest(&mut self, packet: Vec<u8>, at: smoltcp::time::Instant, opened: &mut Vec<Opened>) {
         // nothing but TCP comes to a shard
-        let Kind::Tcp(segment) = packet::kind(&packet) else {
+        let Some(segment) = packet::segment(&packet) else {
             return;
         };
         if let Some(&id) = self.by_tuple.get(&segment.tuple) {

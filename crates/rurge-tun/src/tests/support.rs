@@ -7,7 +7,7 @@ use crate::testing::{AppStack, FakeDialer, pattern};
 use crate::{Tun, TunHandle, TunOptions};
 use std::future::Future;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -130,6 +130,13 @@ pub(crate) fn v4(a: SocketAddr) -> (Ipv4Addr, u16) {
     }
 }
 
+pub(crate) fn v6(a: SocketAddr) -> (Ipv6Addr, u16) {
+    match a {
+        SocketAddr::V6(a) => (*a.ip(), a.port()),
+        SocketAddr::V4(_) => panic!("an IPv6 address"),
+    }
+}
+
 /// An IPv4 packet around `payload`, the header checksum right.
 pub(crate) fn ipv4_packet(protocol: u8, src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
     let mut packet = vec![0x45, 0];
@@ -199,6 +206,43 @@ pub(crate) fn data_segment_v4(
     let sum = checksum(&pseudo);
     tcp[16..18].copy_from_slice(&sum.to_be_bytes());
     ipv4_packet(6, src_ip, dst_ip, &tcp)
+}
+
+/// An IPv6 packet around `payload`: a hop limit of 64 and no flow label.
+pub(crate) fn ipv6_packet(
+    next_header: u8,
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut packet = vec![0x60, 0, 0, 0];
+    packet.extend((payload.len() as u16).to_be_bytes());
+    packet.extend([next_header, 64]);
+    packet.extend(src.octets());
+    packet.extend(dst.octets());
+    packet.extend(payload);
+    packet
+}
+
+/// A TCP SYN over IPv6, the checksums right.
+pub(crate) fn syn_v6(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
+    let ((src_ip, src_port), (dst_ip, dst_port)) = (v6(src), v6(dst));
+    let mut tcp = Vec::new();
+    tcp.extend(src_port.to_be_bytes());
+    tcp.extend(dst_port.to_be_bytes());
+    tcp.extend(1u32.to_be_bytes());
+    tcp.extend(0u32.to_be_bytes());
+    // a header of 20 bytes, SYN, a window of 65535, no checksum yet, no urgent pointer
+    tcp.extend([0x50, 0x02, 0xff, 0xff, 0, 0, 0, 0]);
+    let mut pseudo = Vec::new();
+    pseudo.extend(src_ip.octets());
+    pseudo.extend(dst_ip.octets());
+    pseudo.extend((tcp.len() as u32).to_be_bytes());
+    pseudo.extend([0, 0, 0, 6]);
+    pseudo.extend(&tcp);
+    let sum = checksum(&pseudo);
+    tcp[16..18].copy_from_slice(&sum.to_be_bytes());
+    ipv6_packet(6, src_ip, dst_ip, &tcp)
 }
 
 /// Where the TCP header of `packet` (IPv4 or IPv6, no extension headers)

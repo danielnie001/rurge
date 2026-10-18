@@ -102,6 +102,7 @@ impl Tun {
         tasks.spawn(dispatch::run(
             device,
             to_shards,
+            options.ipv6,
             stats.clone(),
             life.clone(),
         ));
@@ -123,6 +124,7 @@ impl Tun {
 
 #[derive(Clone, Debug)]
 pub struct TunOptions {
+    /// Whether IPv6 packets are handled; with it off they are dropped as unsupported.
     pub ipv6: bool,
     pub drop_hold: Duration,
     /// How many shards the TCP stack is divided into, each with a stack and a task of its own. The default was chosen by the benchmark gate; see the phase 3 / M3a plan's execution record row 10.
