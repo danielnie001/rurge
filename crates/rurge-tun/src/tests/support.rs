@@ -146,14 +146,26 @@ pub(crate) fn udp_v4(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8
 
 /// A TCP SYN over IPv4, the checksums right.
 pub(crate) fn syn_v4(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
+    segment_v4(src, dst, 1, 0, 0x02)
+}
+
+/// A TCP segment over IPv4 with these numbers and flags and nothing else
+/// (no options, no payload), the checksums right.
+pub(crate) fn segment_v4(
+    src: SocketAddr,
+    dst: SocketAddr,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+) -> Vec<u8> {
     let ((src_ip, src_port), (dst_ip, dst_port)) = (v4(src), v4(dst));
     let mut tcp = Vec::new();
     tcp.extend(src_port.to_be_bytes());
     tcp.extend(dst_port.to_be_bytes());
-    tcp.extend(1u32.to_be_bytes());
-    tcp.extend(0u32.to_be_bytes());
-    // a header of 20 bytes, SYN, a window of 65535, no checksum yet, no urgent pointer
-    tcp.extend([0x50, 0x02, 0xff, 0xff, 0, 0, 0, 0]);
+    tcp.extend(seq.to_be_bytes());
+    tcp.extend(ack.to_be_bytes());
+    // a header of 20 bytes, the flags, a window of 65535, no checksum yet, no urgent pointer
+    tcp.extend([0x50, flags, 0xff, 0xff, 0, 0, 0, 0]);
     let mut pseudo = Vec::new();
     pseudo.extend(src_ip.octets());
     pseudo.extend(dst_ip.octets());

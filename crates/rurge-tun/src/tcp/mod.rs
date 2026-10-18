@@ -35,13 +35,6 @@ pub(crate) const TIME_WAIT_GRACE: Duration = Duration::from_millis(20);
 /// How often a shard looks at every connection it has, besides those a turn
 /// touched: smoltcp's own timers close sockets with no packet to say so.
 pub(crate) const SWEEP: Duration = Duration::from_secs(1);
-/// smoltcp's timeout of a socket: it resets the connection once the app has
-/// sent nothing for this long. Phase 3 M3 design 5.4 means it for data sent
-/// to the app and left unacknowledged (a dead process is answered by its
-/// kernel with a reset, so this only backs that up), but smoltcp 0.12 counts
-/// from the app's last segment whether or not anything is unacknowledged, so
-/// a connection idle both ways ends too.
-pub(crate) const TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A connection's number: increasing, never reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

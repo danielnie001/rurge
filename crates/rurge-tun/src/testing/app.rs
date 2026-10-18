@@ -126,6 +126,8 @@ impl AppStack {
 
     /// From the next free port of `dst`'s family (49152 up); resolves once established.
     /// `ConnectionRefused` when the SYN is answered with a reset, `TimedOut` after 5 s.
+    /// Once the SYN-ACK is taken the connect has succeeded, as on a real system: a reset
+    /// right after it shows on the first read or write (`ConnectionReset`).
     pub async fn connect(&self, dst: SocketAddr) -> io::Result<AppTcp> {
         self.open(None, dst).await
     }
@@ -278,7 +280,12 @@ impl AppTcp {
         if state.closed {
             return Poll::Ready(Err(aborted("the app stack was closed")));
         }
-        let was_reset = state.conns[&self.handle].reset;
+        let conn = &state.conns[&self.handle];
+        // the connect has succeeded even if a reset came before this task looked
+        if connecting && conn.handshake_done {
+            return Poll::Ready(Ok(()));
+        }
+        let was_reset = conn.reset;
         let socket = state.sockets.get_mut::<tcp::Socket>(self.handle);
         match socket.state() {
             tcp::State::Listen | tcp::State::SynSent | tcp::State::SynReceived => {
@@ -323,6 +330,8 @@ impl Drop for AppTcp {
         if state.closed {
             return;
         }
+        // the socket is forgotten once it is over, and its handle may be another's then
+        state.connecting.retain(|&handle| handle != self.handle);
         if let Some(conn) = state.conns.get(&self.handle) {
             let socket = state.sockets.get_mut::<tcp::Socket>(self.handle);
             // not shut down: reset (a socket that is over has nothing to reset)
@@ -456,6 +465,8 @@ struct Conn {
     held: Option<(bool, u16)>,
     /// A reset from the other end was taken.
     reset: bool,
+    /// The handshake of a `connect` was seen to complete: the connect has succeeded.
+    handshake_done: bool,
     /// `abort` was called on this end.
     aborted: bool,
     /// The write side was shut down here.
@@ -470,6 +481,8 @@ struct State {
     /// What smoltcp's clock counts from.
     epoch: Instant,
     conns: HashMap<SocketHandle, Conn>,
+    /// The sockets of the `connect`s whose handshake is not over yet.
+    connecting: Vec<SocketHandle>,
     /// Sockets whose `AppTcp` is gone.
     released: Vec<Released>,
     /// The ports `connect` has given out, by family.
@@ -518,6 +531,7 @@ impl State {
             addresses: addresses.to_vec(),
             epoch: Instant::now(),
             conns: HashMap::new(),
+            connecting: Vec::new(),
             released: Vec::new(),
             ports: HashSet::new(),
             next_port: [*PORTS.start(); 2],
@@ -612,6 +626,7 @@ impl State {
         let handle = self.sockets.add(socket);
         self.ports.insert((v6, port));
         self.conns.insert(handle, Conn::new(Some((v6, port))));
+        self.connecting.push(handle);
         Ok((handle, local))
     }
 
@@ -696,6 +711,21 @@ impl State {
         {
             self.conns.get_mut(&handle).expect("a known socket").reset = true;
         }
+        // a connect is done once its SYN-ACK is taken, though the next packet
+        // may close the socket before the connect's task looks
+        self.connecting.retain(
+            |&handle| match self.sockets.get::<tcp::Socket>(handle).state() {
+                tcp::State::SynSent | tcp::State::SynReceived => true,
+                tcp::State::Closed => false,
+                _ => {
+                    self.conns
+                        .get_mut(&handle)
+                        .expect("a known socket")
+                        .handshake_done = true;
+                    false
+                }
+            },
+        );
     }
 
     /// The open socket with this local and remote end.
@@ -781,6 +811,7 @@ impl Conn {
         Conn {
             held,
             reset: false,
+            handshake_done: false,
             aborted: false,
             shut: false,
         }

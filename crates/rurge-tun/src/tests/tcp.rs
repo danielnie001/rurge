@@ -4,7 +4,7 @@
 
 use super::support::{WITHIN, addr, eventually, is_syn, read_pattern, rig, within, write_pattern};
 use crate::device::MemoryDevice;
-use crate::testing::{Direction, FakeDialer, Script, Upstream};
+use crate::testing::{AppTcp, Direction, FakeDialer, Script, Upstream};
 use crate::{Counters, Ending, Tun, TunOptions};
 use rurge_config::{HostName, ListenerKind, Transport};
 use rurge_proto::RejectKind;
@@ -150,48 +150,15 @@ async fn half_close_keeps_the_other_direction() {
 /// The handshake is over before the session is dialed, so `connect`
 /// succeeds whatever the `Dialer` answers; an answer that is not a stream
 /// resets the connection.
-///
-/// What the app sends after its SYN is held back until `connect` has
-/// returned. Otherwise the reset can come in before the test's task looks
-/// at the socket, and the app's stack then answers `connect` with
-/// `ConnectionRefused` for a connection that was made.
 async fn the_connection_is_reset(script: Option<Script>) {
     let rig = rig(TunOptions::default());
     let dst = addr("192.0.2.1:80");
     if let Some(script) = script {
         rig.dialer.script(dst, script);
     }
-    let held = Arc::new(Mutex::new(Some(Vec::new())));
-    let holding = held.clone();
-    rig.app.set_filter(move |direction, packet| {
-        if direction == Direction::FromTun || is_syn(packet) {
-            return true;
-        }
-        match holding.lock().expect("the held packets").as_mut() {
-            Some(held) => {
-                held.push(packet.clone());
-                false
-            }
-            None => true,
-        }
-    });
-    let mut tcp = within("the handshake", rig.app.connect(dst))
+    let mut tcp = within("the connection to be made", rig.app.connect(dst))
         .await
-        .expect("the app's side of the handshake completes");
-    // without the app's ACK the TUN's side of the handshake is not over
-    assert!(
-        rig.dialer.dialed().is_empty(),
-        "nothing is dialed before the handshake is over"
-    );
-    let acks = held
-        .lock()
-        .expect("the held packets")
-        .take()
-        .expect("held until now");
-    assert!(!acks.is_empty(), "the app acknowledged the TUN's SYN-ACK");
-    for packet in acks {
-        rig.app.inject(packet);
-    }
+        .expect("connect");
     let mut buf = [0; 1];
     let error = within("the reset", tcp.read(&mut buf))
         .await
@@ -217,6 +184,131 @@ async fn a_failed_dial_resets_the_connection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rejected_session_resets_the_connection() {
     the_connection_is_reset(Some(Script::Reject(RejectKind::Reject))).await;
+}
+
+/// `hello` there and back.
+async fn hello(tcp: &mut AppTcp) {
+    tcp.write_all(b"hello").await.expect("write");
+    let mut back = [0; 5];
+    within("hello to come back", tcp.read_exact(&mut back))
+        .await
+        .expect("read");
+    assert_eq!(&back, b"hello");
+}
+
+/// The session starts once the TUN's side of the handshake is over, that is
+/// once the app's ACK of the SYN-ACK is in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nothing_is_dialed_before_the_handshake_completes() {
+    let rig = rig(TunOptions::default());
+    let echo = Upstream::echo().await;
+    let dst = addr("192.0.2.1:80");
+    rig.dialer.script(dst, Script::Upstream(echo.addr()));
+    // what the app sends after its SYN is held: the ACK that ends the handshake
+    let held = Arc::new(Mutex::new(Some(Vec::new())));
+    let holding = held.clone();
+    rig.app.set_filter(move |direction, packet| {
+        if direction == Direction::FromTun || is_syn(packet) {
+            return true;
+        }
+        match holding.lock().expect("the held packets").as_mut() {
+            Some(held) => {
+                held.push(packet.clone());
+                false
+            }
+            None => true,
+        }
+    });
+    let mut tcp = within("the app's side of the handshake", rig.app.connect(dst))
+        .await
+        .expect("connect");
+    // the one fixed wait, for what must not happen: a session dialed before
+    // the handshake is over, which would start at the SYN; 200 ms leaves its
+    // dial, a connect on the loopback, a wide margin
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        rig.dialer.dialed().is_empty(),
+        "nothing is dialed before the handshake is over"
+    );
+    let acks = held
+        .lock()
+        .expect("the held packets")
+        .take()
+        .expect("held until now");
+    assert!(!acks.is_empty(), "the app acknowledged the TUN's SYN-ACK");
+    for packet in acks {
+        rig.app.inject(packet);
+    }
+    eventually("the session to be dialed", WITHIN, || {
+        rig.dialer.dialed().len() == 1
+    })
+    .await;
+    hello(&mut tcp).await;
+    assert_eq!(rig.tun.counters(), Counters::default());
+}
+
+/// The timers of the two tests of the timeout, short enough for a test. The
+/// app's stack here is smoltcp, which answers at most one keep-alive a
+/// second (it rate-limits its challenge ACKs): with a timeout of 1 s the
+/// TUN would give up on it just before its next answer.
+fn short_timers() -> TunOptions {
+    TunOptions {
+        keep_alive: Duration::from_millis(100),
+        timeout: Duration::from_secs(2),
+        ..TunOptions::default()
+    }
+}
+
+/// smoltcp resets a connection that has had nothing from the app for its
+/// timeout; the keep-alives have a live app answer, so a connection idle
+/// both ways stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_connection_outlives_the_timeout() {
+    let options = short_timers();
+    let idle = options.timeout * 3;
+    let rig = rig(options);
+    let echo = Upstream::echo().await;
+    let dst = addr("192.0.2.1:80");
+    rig.dialer.script(dst, Script::Upstream(echo.addr()));
+    let mut tcp = within("the connection to be made", rig.app.connect(dst))
+        .await
+        .expect("connect");
+    hello(&mut tcp).await;
+    // the one fixed wait, for what must not happen: the idle connection
+    // reset; three times the timeout
+    tokio::time::sleep(idle).await;
+    hello(&mut tcp).await;
+    assert!(rig.dialer.relay_ends().is_empty(), "the relay goes on");
+    assert_eq!(rig.tun.counters(), Counters::default());
+}
+
+/// An app that has gone silent: nothing the TUN sends reaches it, so it
+/// answers no keep-alive, and the connection goes after the timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_app_is_reset_after_the_timeout() {
+    let rig = rig(short_timers());
+    let echo = Upstream::echo().await;
+    let dst = addr("192.0.2.1:80");
+    rig.dialer.script(dst, Script::Upstream(echo.addr()));
+    let _tcp = within("the connection to be made", rig.app.connect(dst))
+        .await
+        .expect("connect");
+    // the session is dialed once the handshake is over on the TUN's side too
+    eventually("the session to be dialed", WITHIN, || {
+        rig.dialer.dialed().len() == 1
+    })
+    .await;
+    rig.app
+        .set_filter(|direction, _| direction != Direction::FromTun);
+    eventually("the TUN to let the connection go", WITHIN, || {
+        rig.tun.sockets_in_use() == 0 && rig.tun.budget_in_use() == 0
+    })
+    .await;
+    eventually("the relay to end", WITHIN, || {
+        rig.dialer.relay_ends().len() == 1
+    })
+    .await;
+    assert_eq!(rig.tun.counters(), Counters::default());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

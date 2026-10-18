@@ -2,8 +2,8 @@
 //! the app-side stack, the fake `Dialer` and the loopback servers.
 
 use super::support::{
-    WITHIN, addr, eventually, is_reset, read_pattern, syn_v4, tcp_payload_len, udp_v4, within,
-    write_pattern,
+    WITHIN, addr, eventually, is_reset, is_syn, read_pattern, segment_v4, syn_v4, tcp_header,
+    tcp_payload_len, udp_v4, within, write_pattern,
 };
 use crate::device::{AppEnd, Device, MemoryDevice};
 use crate::testing::{AppStack, AppTcp, Direction, FakeDialer, Script, Upstream};
@@ -13,7 +13,7 @@ use rurge_proto::RejectKind;
 use smoltcp::wire::IpCidr;
 use std::future::Future;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -266,6 +266,55 @@ async fn a_connection_nobody_answers_times_out_after_five_seconds() {
         waited >= Duration::from_secs(5) && waited < Duration::from_secs(6),
         "{waited:?}"
     );
+}
+
+/// A SYN-ACK with a reset right behind it, the two in one send. On one
+/// thread the stack's task takes both in before the task of the `connect`
+/// is polled again, so the socket is closed by the time that task looks:
+/// the connect has succeeded all the same, as on a real system, and the
+/// reset shows on the first read.
+#[tokio::test]
+async fn a_reset_right_after_the_handshake_fails_the_first_read() {
+    let (device, end) = MemoryDevice::pair(1500, 16);
+    let stack = AppStack::start(end);
+    let to = addr("192.0.2.1:80");
+    let connecting = tokio::spawn({
+        let stack = stack.clone();
+        async move { stack.connect(to).await }
+    });
+    let syn = within("the app's SYN", async {
+        loop {
+            let mut got = Vec::new();
+            device.recv(&mut got, 8).await.unwrap();
+            if let Some(syn) = got.into_iter().find(|packet| is_syn(packet)) {
+                break syn;
+            }
+        }
+    })
+    .await;
+    let (header, _) = tcp_header(&syn).expect("a TCP segment");
+    let from = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(syn[12], syn[13], syn[14], syn[15])),
+        u16::from_be_bytes([syn[header], syn[header + 1]]),
+    );
+    let isn = u32::from_be_bytes(syn[header + 4..header + 8].try_into().unwrap());
+    // SYN|ACK, then RST at the sequence number right after the SYN-ACK's
+    let ours = 1000;
+    let mut answer = vec![
+        segment_v4(to, from, ours, isn.wrapping_add(1), 0x12),
+        segment_v4(to, from, ours + 1, 0, 0x04),
+    ];
+    within("the answer to be taken", device.send(&mut answer))
+        .await
+        .unwrap();
+    let mut tcp = within("the connect", connecting)
+        .await
+        .unwrap()
+        .expect("the handshake was over before the reset came");
+    let error = within("the first read", tcp.read(&mut [0u8; 16]))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
 }
 
 /// The listening socket is there when `accept` returns, not when the future

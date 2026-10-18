@@ -65,7 +65,7 @@ impl Tun {
         let mut shards = Vec::new();
         let mut to_shards = Vec::new();
         for _ in 0..options.shards.max(1) {
-            let shard = Arc::new(Shard::new(mtu, epoch, budget.clone()));
+            let shard = Arc::new(Shard::new(mtu, epoch, budget.clone(), &options));
             let (to_shard, packets) = mpsc::channel(options.shard_queue.max(1));
             #[cfg(test)]
             shards.push(shard.clone());
@@ -121,6 +121,10 @@ pub struct TunOptions {
     pub max_half_open: usize,
     pub half_open_timeout: Duration,
     pub linger: Duration,
+    /// A connection idle for this long sends the app a keep-alive.
+    pub keep_alive: Duration,
+    /// A connection that has had nothing from the app for this long is reset.
+    pub timeout: Duration,
     pub shard_queue: usize,
     pub writer_queue: usize,
 }
@@ -138,6 +142,8 @@ impl Default for TunOptions {
             max_half_open: 2_048,
             half_open_timeout: Duration::from_secs(10),
             linger: Duration::from_secs(60),
+            keep_alive: Duration::from_secs(30),
+            timeout: Duration::from_secs(600),
             shard_queue: 1_024,
             writer_queue: 256,
         }

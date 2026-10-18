@@ -10,11 +10,11 @@
 use super::budget::Sizes;
 use super::{
     Budget, ConnId, ConnShared, EGRESS_PASSES, INGRESS_PER_WAKE, Outcome, SWEEP, TIME_WAIT_GRACE,
-    TIMEOUT, TunStream, Tuple,
+    TunStream, Tuple,
 };
-use crate::Life;
 use crate::packet::{self, Kind};
 use crate::session;
+use crate::{Life, TunOptions};
 use rurge_inbound::Dialer;
 use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Checksum, DeviceCapabilities, Medium};
@@ -23,7 +23,7 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint};
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::task::TaskTracker;
 
@@ -43,9 +43,14 @@ pub(crate) struct Shard {
 }
 
 impl Shard {
-    pub(crate) fn new(mtu: usize, epoch: Instant, budget: Arc<Budget>) -> Shard {
+    pub(crate) fn new(
+        mtu: usize,
+        epoch: Instant,
+        budget: Arc<Budget>,
+        options: &TunOptions,
+    ) -> Shard {
         Shard {
-            state: Mutex::new(ShardState::new(mtu, epoch, budget)),
+            state: Mutex::new(ShardState::new(mtu, epoch, budget, options)),
             kick: Notify::new(),
         }
     }
@@ -78,6 +83,9 @@ pub(crate) struct ShardState {
     /// When the next reap looks at every connection.
     next_sweep: Instant,
     budget: Arc<Budget>,
+    /// Every socket's, from `TunOptions`.
+    keep_alive: Duration,
+    timeout: Duration,
 }
 
 /// One connection: the socket that has it, and what the shard knows of it
@@ -119,7 +127,7 @@ pub(crate) struct Opened {
 }
 
 impl ShardState {
-    fn new(mtu: usize, epoch: Instant, budget: Arc<Budget>) -> ShardState {
+    fn new(mtu: usize, epoch: Instant, budget: Arc<Budget>, options: &TunOptions) -> ShardState {
         let mut device = ShardDevice {
             rx: None,
             tx: Vec::new(),
@@ -156,6 +164,8 @@ impl ShardState {
             epoch,
             next_sweep: epoch + SWEEP,
             budget,
+            keep_alive: options.keep_alive,
+            timeout: options.timeout,
         }
     }
 
@@ -269,8 +279,11 @@ impl ShardState {
             tcp::SocketBuffer::new(vec![0; sizes.tx]),
         );
         socket.set_nagle_enabled(false);
-        socket.set_keep_alive(None);
-        socket.set_timeout(Some(TIMEOUT.into()));
+        // smoltcp resets a connection that has had nothing from the app for
+        // `timeout`, whether or not anything is unacknowledged: the
+        // keep-alives have a live app answer, so only a silent one is cut off
+        socket.set_keep_alive(Some(self.keep_alive.into()));
+        socket.set_timeout(Some(self.timeout.into()));
         socket.set_congestion_control(tcp::CongestionControl::Reno);
         let endpoint = IpListenEndpoint {
             addr: Some(tuple.dst.ip().into()),
