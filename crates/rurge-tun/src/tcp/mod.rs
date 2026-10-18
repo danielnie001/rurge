@@ -10,6 +10,7 @@
 
 pub(crate) mod admission;
 pub(crate) mod budget;
+pub(crate) mod device;
 pub(crate) mod guard;
 pub(crate) mod rebuild;
 pub(crate) mod shard;
