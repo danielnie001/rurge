@@ -3566,6 +3566,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rurge-tun"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "rurge-config",
+ "rurge-inbound",
+ "rurge-net",
+ "rurge-proto",
+ "smoltcp",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "russh"
 version = "0.63.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,31 @@
+[package]
+name = "rurge-tun"
+description = "The virtual adapter's core for rurge: IP packets in, TCP connections out, on a userspace TCP/IP stack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rurge-config.workspace = true
+rurge-net.workspace = true
+rurge-inbound.workspace = true
+rurge-proto.workspace = true
+smoltcp.workspace = true
+getrandom.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
+
+[features]
+# The app-side stack, the fake `Dialer` and the loopback servers
+# (`rurge_tun::testing`); enabled by dependants' dev-dependencies.
+testing = []
+
+[lints]
+workspace = true
