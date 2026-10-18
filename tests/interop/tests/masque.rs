@@ -1,7 +1,9 @@
 //! rurge's `masque` outbound against masque-server v0.13.0 (phase 2 M7
-//! design 7.1, 7.4; M7-D6), on Linux only — the server is built for Linux
-//! alone: TCP as classic CONNECTs (one chunk, many, and 9 MiB each way at
-//! once), UDP as CONNECT-UDP with the packets in HTTP/3 datagrams (two
+//! design 7.1, 7.4; M7-D6). The server is built for Linux alone, so the
+//! cases that need it run on Linux only, where CI installs it; the
+//! self-test of the paced transfer needs no server and runs everywhere.
+//! The cases: TCP as classic CONNECTs (one chunk, many, and 9 MiB each way
+//! at once), UDP as CONNECT-UDP with the packets in HTTP/3 datagrams (two
 //! targets of one carrier, a stream for each), and a wrong password, which
 //! the server refuses a tunnel and a CONNECT-UDP stream alike. The server
 //! listens on a loopback UDP port with a certificate for 127.0.0.1 signed by

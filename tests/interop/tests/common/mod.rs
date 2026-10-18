@@ -140,9 +140,9 @@ pub async fn transfer(out: &OutboundRef, echo: SocketAddr, len: usize) {
 /// the policy's connection, each with payloads of its own (an answer handed
 /// to the other carrier would show): a few bytes, then 3000 — more than a
 /// QUIC datagram holds, so a protocol that splits packets sends them in
-/// fragments both ways (macOS carries no loopback datagram past 9216). The
-/// source of an answer is compared in canonical form. Bounded like
-/// `roundtrip`.
+/// fragments both ways (macOS sends no datagram past 9216 bytes from a
+/// socket with the default send buffer). The source of an answer is
+/// compared in canonical form. Bounded like `roundtrip`.
 pub async fn udp_side_by_side(out: &OutboundRef, echo: SocketAddr) {
     let bound = std::time::Duration::from_secs(10);
     let mut carriers = Vec::new();
