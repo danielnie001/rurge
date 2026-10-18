@@ -4,8 +4,9 @@
 A job's log can only be read by someone signed in to GitHub; its annotations
 and its summary can be read by anyone. So when the test step fails, this
 script repeats what failed — each failed test with the head of its output,
-each test binary that exited abnormally, each compile error, and a test that
-was still running when the log ended — where it can be seen without the log.
+each test binary that exited abnormally, each compile error, and, when the
+log ends inside a test binary, the tests still running and the ones that had
+failed by then — where it can be seen without the log.
 
 Usage: report-test-failures.py <log file>
 
@@ -37,7 +38,7 @@ BLOCK = re.compile(r"^---- (.+?) (?:stdout|stderr) ----\s*$")
 RESULT = re.compile(r"^test result: (\w+)\. .*$")
 RERUN = re.compile(r"^error: test failed, to rerun pass `(.+)`\s*$")
 SLOW = re.compile(r"^test (\S+) has been running for over \d+ seconds\s*$")
-DONE = re.compile(r"^test (\S+)(?: - .+)? \.\.\. \w+")
+DONE = re.compile(r"^test (\S+)(?: - .+)? \.\.\. (\w+)")
 COMPILE = re.compile(r"^error(\[E\d+\])?: ")
 BACKTRACE_NOTE = "note: run with `RUST_BACKTRACE=1`"
 
@@ -53,6 +54,9 @@ class Binary:
         self.crash = None
         self.slow = []
         self.done = set()
+        # libtest prints a failed test's status line when it ends, but its
+        # output only when the binary does: a binary that hangs keeps these
+        self.said_failed = []
 
     def label(self):
         return self.rerun or self.name
@@ -98,6 +102,8 @@ def parse(lines):
             done = DONE.match(line)
             if done:
                 current.done.add(done.group(1))
+                if done.group(2) == "FAILED":
+                    current.said_failed.append(done.group(1))
             rerun = RERUN.match(line)
             if rerun:
                 current.rerun = rerun.group(1)
@@ -175,6 +181,8 @@ def findings(binaries, compile_errors):
         text = "the log ends before this test binary reported a result"
         if waiting:
             text += "; still running: " + ", ".join(waiting)
+        if last.said_failed:
+            text += "; failed before the log ends: " + ", ".join(last.said_failed)
         found.append((last.label() + " did not finish", text))
     for binary in binaries:
         for name, output in binary.failed:
