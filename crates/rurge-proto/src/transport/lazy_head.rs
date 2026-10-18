@@ -13,7 +13,8 @@
 //! the stream below keeps one waker for its write side: whoever polled it last
 //! replaces the other's. So while the head is unsent, or the flush it owes is
 //! pending, both halves poll that side with a waker that wakes them both, and
-//! whoever finishes the head or the flush wakes the other half.
+//! whoever finishes the head or the flush — the writer's own flush or
+//! shutdown does — wakes the other half.
 
 use rurge_net::connector::BoxedStream;
 use std::future::Future;
@@ -28,7 +29,9 @@ use tokio::time::Sleep;
 /// How long a read waits for the first payload before the head goes out alone.
 pub const HEAD_GRACE: Duration = Duration::from_millis(100);
 
-/// The two halves of a split stream.
+/// The two halves of a split stream: the side a method belongs to, not the
+/// task that polls it — Snell's `SnellTunnel::drive` calls the write side
+/// from its read.
 #[derive(Clone, Copy)]
 enum Half {
     Read,
@@ -126,7 +129,8 @@ pub struct LazyHead<S = BoxedStream> {
     woken: Waker,
     /// The reader pushed the head out and its flush has not finished: the
     /// head may still be held back below, and the next read finishes the flush
-    /// before it reads.
+    /// before it reads — unless a flush or a shutdown of the writer's has
+    /// finished it first.
     owed_flush: bool,
 }
 
@@ -153,8 +157,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> LazyHead<S> {
 
     /// The stream below; write-side polls made through it bypass the shared
     /// waker while the head is unsent or a flush is owed, so a caller polls
-    /// the write side itself only after `poll_flush` returned `Ready`, as
-    /// Snell's `poll_end` does.
+    /// the write side itself only after `poll_flush` returned `Ready(Ok(()))`,
+    /// which leaves neither, as Snell's `poll_end` does.
     pub fn get_mut(&mut self) -> &mut S {
         &mut self.inner
     }
@@ -214,6 +218,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> LazyHead<S> {
             &mut Context::from_waker(&self.woken),
         )
     }
+
+    /// A flush or a shutdown of `half` on the stream below is over, with
+    /// success or an error. If the reader's flush was owed, that was it: the
+    /// other half may stop waiting for it. A write is not a flush and
+    /// settles nothing.
+    fn settle_flush(&mut self, half: Half) {
+        if self.owed_flush {
+            self.owed_flush = false;
+            self.both.release(half);
+        }
+    }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for LazyHead<S> {
@@ -243,8 +258,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for LazyHead<S> {
             // `head` is gone, so a flush that pends is picked up again here
             let flushed =
                 ready!(self.poll_write_side(Half::Read, cx, |inner, cx| inner.poll_flush(cx)));
-            self.owed_flush = false;
-            self.both.release(Half::Read);
+            self.settle_flush(Half::Read);
             flushed?;
         }
         Pin::new(&mut self.inner).poll_read(cx, buf)
@@ -280,12 +294,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for LazyHead<S> {
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(self.poll_head(cx, Half::Write))?;
-        self.poll_write_side(Half::Write, cx, |inner, cx| inner.poll_flush(cx))
+        let flushed =
+            ready!(self.poll_write_side(Half::Write, cx, |inner, cx| inner.poll_flush(cx)));
+        self.settle_flush(Half::Write);
+        Poll::Ready(flushed)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(self.poll_head(cx, Half::Write))?;
-        self.poll_write_side(Half::Write, cx, |inner, cx| inner.poll_shutdown(cx))
+        let shut =
+            ready!(self.poll_write_side(Half::Write, cx, |inner, cx| inner.poll_shutdown(cx)));
+        self.settle_flush(Half::Write);
+        Poll::Ready(shut)
     }
 }
 
@@ -569,6 +589,8 @@ mod tests {
         flush_open: bool,
         /// Every write fails with this, gate or no gate.
         write_error: Option<io::ErrorKind>,
+        /// Every flush fails with this, gate or no gate.
+        flush_error: Option<io::ErrorKind>,
         slot: Option<Waker>,
         taken: Vec<u8>,
         flushes: usize,
@@ -580,6 +602,7 @@ mod tests {
                 write_open,
                 flush_open,
                 write_error: None,
+                flush_error: None,
                 slot: None,
                 taken: Vec::new(),
                 flushes: 0,
@@ -620,6 +643,9 @@ mod tests {
         }
 
         fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if let Some(kind) = self.flush_error {
+                return Poll::Ready(Err(kind.into()));
+            }
             if self.flush_open {
                 self.flushes += 1;
                 return Poll::Ready(Ok(()));
@@ -939,6 +965,133 @@ mod tests {
             Poll::Ready(Ok(4))
         ));
         assert_eq!(lazy.get_mut().taken, b"HEAD|payloadmore");
+    }
+
+    /// A reader that has pushed the head and waits on the flush it owes, over
+    /// a stream whose writes go through and whose flush does not. The grace
+    /// is nil, but a grace is a timer like any other: the reader parks on it
+    /// first, with a waker nobody counts, and finds it run out once the
+    /// driver has had its turn.
+    async fn reader_owing_a_flush(rcx: &mut Context<'_>) -> LazyHead<OneSlot> {
+        let mut lazy =
+            LazyHead::with_grace(OneSlot::new(true, false), b"HEAD|".to_vec(), Duration::ZERO);
+        let mut space = [0u8; 8];
+        let mut buf = ReadBuf::new(&mut space);
+        let mut elsewhere = Context::from_waker(Waker::noop());
+        assert!(
+            Pin::new(&mut lazy)
+                .poll_read(&mut elsewhere, &mut buf)
+                .is_pending()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // the head goes out alone, and the flush behind it pends
+        assert!(Pin::new(&mut lazy).poll_read(rcx, &mut buf).is_pending());
+        assert_eq!(lazy.get_mut().taken, b"HEAD|");
+        assert_eq!(lazy.get_mut().flushes, 0);
+        lazy
+    }
+
+    #[tokio::test]
+    async fn a_reader_waiting_on_its_flush_is_woken_when_the_writers_flush_finishes_it() {
+        let (reader, reader_waker) = Count::waker();
+        let (_, writer_waker) = Count::waker();
+        let mut wcx = Context::from_waker(&writer_waker);
+        let mut rcx = Context::from_waker(&reader_waker);
+        let mut lazy = reader_owing_a_flush(&mut rcx).await;
+        // a write is not a flush: it finishes nothing the reader waits for
+        assert!(matches!(
+            Pin::new(&mut lazy).poll_write(&mut wcx, b"more"),
+            Poll::Ready(Ok(4))
+        ));
+        assert_eq!(reader.woken(), 0, "a write that finished woke the reader");
+        // the flush gets through, and nobody is told
+        lazy.get_mut().flush_open = true;
+        assert!(matches!(
+            Pin::new(&mut lazy).poll_flush(&mut wcx),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(
+            reader.woken(),
+            1,
+            "the reader waits on a flush the writer finished and was woken {} times",
+            reader.woken()
+        );
+        // it goes on to read, and does not flush what is flushed
+        let mut space = [0u8; 8];
+        let mut buf = ReadBuf::new(&mut space);
+        assert!(
+            Pin::new(&mut lazy)
+                .poll_read(&mut rcx, &mut buf)
+                .is_pending()
+        );
+        assert_eq!(
+            lazy.get_mut().flushes,
+            1,
+            "the reader flushed the stream again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reader_waiting_on_its_flush_is_woken_when_the_writers_shutdown_finishes_it() {
+        let (reader, reader_waker) = Count::waker();
+        let (_, writer_waker) = Count::waker();
+        let mut wcx = Context::from_waker(&writer_waker);
+        let mut rcx = Context::from_waker(&reader_waker);
+        let mut lazy = reader_owing_a_flush(&mut rcx).await;
+        assert!(matches!(
+            Pin::new(&mut lazy).poll_shutdown(&mut wcx),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(
+            reader.woken(),
+            1,
+            "the reader waits on a flush the writer's shutdown finished and was woken {} times",
+            reader.woken()
+        );
+        // the write side is closed, and the reader leaves it alone
+        lazy.get_mut().flush_open = true;
+        let mut space = [0u8; 8];
+        let mut buf = ReadBuf::new(&mut space);
+        assert!(
+            Pin::new(&mut lazy)
+                .poll_read(&mut rcx, &mut buf)
+                .is_pending()
+        );
+        assert_eq!(
+            lazy.get_mut().flushes,
+            0,
+            "the reader flushed a stream whose write side is closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reader_waiting_on_its_flush_is_woken_when_the_writers_flush_fails() {
+        let (reader, reader_waker) = Count::waker();
+        let (_, writer_waker) = Count::waker();
+        let mut wcx = Context::from_waker(&writer_waker);
+        let mut rcx = Context::from_waker(&reader_waker);
+        let mut lazy = reader_owing_a_flush(&mut rcx).await;
+        // every flush fails from now on, and nobody is told
+        lazy.get_mut().flush_error = Some(io::ErrorKind::BrokenPipe);
+        assert!(matches!(
+            Pin::new(&mut lazy).poll_flush(&mut wcx),
+            Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe
+        ));
+        assert_eq!(
+            reader.woken(),
+            1,
+            "the reader waits on a flush that failed for the writer and was woken {} times",
+            reader.woken()
+        );
+        // the error is the writer's: the reader goes on to the read side
+        // and does not meet it again
+        let mut space = [0u8; 8];
+        let mut buf = ReadBuf::new(&mut space);
+        assert!(
+            Pin::new(&mut lazy)
+                .poll_read(&mut rcx, &mut buf)
+                .is_pending()
+        );
     }
 
     /// What the hung tests did, with a pipe for the stream: the halves of a
