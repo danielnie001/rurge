@@ -694,7 +694,8 @@ async fn the_tun_never_scales_its_window() {
     let dst = addr("192.0.2.1:80");
     rig.dialer.script(dst, Script::Upstream(echo.addr()));
     // the window scale of each SYN either side sent, if it had one
-    let scales: Arc<Mutex<Vec<(Direction, Option<u8>)>>> = Arc::default();
+    type Scales = Vec<(Direction, Option<u8>)>;
+    let scales: Arc<Mutex<Scales>> = Arc::default();
     let seen = scales.clone();
     rig.app.set_filter(move |direction, packet| {
         if is_syn(packet) {
