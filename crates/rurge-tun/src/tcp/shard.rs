@@ -681,10 +681,12 @@ impl ShardState {
         let Some(conn) = self.conns.remove(&id) else {
             return;
         };
+        // the tuple's entries go with the connection that has the tuple, if it
+        // is this one
         if self.by_tuple.get(&conn.tuple) == Some(&id) {
             self.by_tuple.remove(&conn.tuple);
+            self.device.edges.forget(&conn.tuple);
         }
-        self.device.edges.forget(&conn.tuple);
         self.touched.remove(&id);
         self.budget.give_back(conn.sizes);
         self.admission.release_socket();

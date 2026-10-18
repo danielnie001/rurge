@@ -14,7 +14,7 @@ use crate::packet::{Segment, strip_sack_permitted};
 use crate::space::ADAPTER_V4;
 use crate::tcp::guard::{Edges, past};
 use crate::tcp::shard::Opened;
-use crate::tcp::{Shard, TunStream, Tuple};
+use crate::tcp::{ConnId, Shard, TunStream, Tuple};
 use crate::testing::{AppStack, AppTcp, Direction, Script, Upstream, pattern};
 use crate::{Counters, TunOptions};
 use smoltcp::phy::ChecksumCapabilities;
@@ -982,6 +982,24 @@ async fn a_segment_past_the_edge_into_room_is_dropped() {
         "only what the app sent"
     );
     assert_eq!(queued(&lone), 0);
+}
+
+/// The edge goes with the connection that has the tuple. Were a connection let
+/// go of under another that has taken its tuple (a connection kept for what it
+/// holds unread, and a new one), the old one's going would take the new one's
+/// edge with it, and the guard would know nothing of the new connection.
+#[test]
+fn a_connection_that_does_not_have_its_tuple_leaves_the_edge_to_the_one_that_does() {
+    let epoch = Instant::now();
+    let lone = lone_shard(&TunOptions::default(), epoch);
+    let (app, dst) = (app4(40000), addr("192.0.2.1:80"));
+    open_by_hand(&lone.shard, epoch, app, dst, 0);
+    let tuple = Tuple { src: app, dst };
+    lone.shard.state().by_tuple.insert(tuple, ConnId::next());
+    lone.shard.state().end_all();
+    assert_eq!(lone.shard.state().socket_count(), 0);
+    assert_eq!(lone.shard.state().edge_count(), 1, "the edge stays");
+    assert!(lone.shard.state().by_tuple.contains_key(&tuple));
 }
 
 #[test]
