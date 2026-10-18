@@ -7,4 +7,5 @@ mod fixture;
 mod lifecycle;
 mod log_capture;
 pub(crate) mod support;
+mod syn;
 mod tcp;

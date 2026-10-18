@@ -235,7 +235,7 @@ async fn a_rejected_session_resets_the_connection() {
 }
 
 /// `hello` there and back.
-async fn hello(tcp: &mut AppTcp) {
+pub(super) async fn hello(tcp: &mut AppTcp) {
     tcp.write_all(b"hello").await.expect("write");
     let mut back = [0; 5];
     within("hello to come back", tcp.read_exact(&mut back))

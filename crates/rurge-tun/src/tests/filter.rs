@@ -748,17 +748,10 @@ fn the_shard_reads_the_segment_classify_found() {
 #[cfg(debug_assertions)]
 #[should_panic(expected = "a shard is given only what classify let through")]
 fn a_shard_given_what_classify_turned_away_says_so() {
-    use crate::tcp::{Budget, Shard};
-    use std::sync::Arc;
+    use super::support::lone_shard;
     use std::time::Instant;
 
-    let options = TunOptions::default();
-    let budget = Arc::new(Budget::new(
-        options.budget,
-        options.buffer_min,
-        options.tx_max,
-    ));
-    let shard = Shard::new(1500, Instant::now(), 1, budget, &options);
+    let shard = lone_shard(&TunOptions::default(), Instant::now()).shard;
     let to_loopback = syn_v4(addr("198.18.0.1:40000"), addr("127.0.0.1:80"));
     shard.state().turn(Instant::now(), &mut vec![to_loopback]);
 }
@@ -1008,7 +1001,7 @@ async fn udp_and_icmp_are_not_handled_yet() {
 }
 
 /// The WARN of a reason: its text, with no address.
-fn warning(reason: Reason) -> String {
+pub(super) fn warning(reason: Reason) -> String {
     format!(
         "WARN tun: a packet was dropped (reason: {reason}); later drops for this reason are logged at debug level"
     )

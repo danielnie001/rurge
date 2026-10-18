@@ -11,8 +11,10 @@
 
 pub mod device;
 mod dispatch;
+mod limit;
 mod packet;
 mod session;
+mod space;
 mod stats;
 mod tcp;
 #[cfg(any(test, feature = "testing"))]
@@ -24,7 +26,7 @@ use rurge_inbound::Dialer;
 use stats::Stats;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tcp::{Budget, Shard};
+use tcp::{Admission, Budget, Shard};
 use tokio::sync::mpsc;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use tokio_util::task::TaskTracker;
@@ -58,6 +60,7 @@ impl Tun {
             options.buffer_min,
             options.tx_max,
         ));
+        let admission = Arc::new(Admission::new(life.clone(), stats.clone(), &options));
         let tasks = TaskTracker::new();
         let writer_queue = options.writer_queue.max(1);
         let (to_writer, from_shards) = mpsc::channel(writer_queue);
@@ -70,7 +73,14 @@ impl Tun {
                 random_failure.get_or_insert(error);
                 0x5eed
             });
-            let shard = Arc::new(Shard::new(mtu, epoch, seed, budget.clone(), &options));
+            let shard = Arc::new(Shard::new(
+                mtu,
+                epoch,
+                seed,
+                budget.clone(),
+                admission.clone(),
+                &options,
+            ));
             let (to_shard, packets) = mpsc::channel(options.shard_queue.max(1));
             #[cfg(test)]
             shards.push(shard.clone());
@@ -117,6 +127,8 @@ impl Tun {
                 shards,
                 #[cfg(test)]
                 budget,
+                #[cfg(test)]
+                admission,
             }),
         }
     }
@@ -133,8 +145,11 @@ pub struct TunOptions {
     pub buffer_min: usize,
     pub tx_max: usize,
     pub budget: usize,
+    /// The most TCP sockets the whole TUN has; a SYN over it is answered with a reset.
     pub max_sockets: usize,
+    /// The most connections of the whole TUN that have not completed their handshake.
     pub max_half_open: usize,
+    /// How long a connection has to complete its handshake before it is reset.
     pub half_open_timeout: Duration,
     pub linger: Duration,
     /// A connection idle for this long sends the app a keep-alive.
@@ -207,6 +222,8 @@ struct Inner {
     shards: Vec<Arc<Shard>>,
     #[cfg(test)]
     budget: Arc<Budget>,
+    #[cfg(test)]
+    admission: Arc<Admission>,
 }
 
 #[derive(Clone)]
@@ -243,6 +260,20 @@ impl TunHandle {
     #[cfg(test)]
     pub(crate) fn budget_in_use(&self) -> usize {
         self.inner.budget.used()
+    }
+
+    /// The sockets the TUN counts against `max_sockets`: what
+    /// `sockets_in_use` counts, as the shards add and take sockets.
+    #[cfg(test)]
+    pub(crate) fn sockets_counted(&self) -> usize {
+        self.inner.admission.sockets()
+    }
+
+    /// The connections the TUN counts against `max_half_open`: those whose
+    /// handshake is not over.
+    #[cfg(test)]
+    pub(crate) fn half_open(&self) -> usize {
+        self.inner.admission.half_open()
     }
 }
 

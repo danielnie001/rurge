@@ -2,10 +2,16 @@
 //! (phase 3 M3 design 4.4): [`classify`] runs the checks every packet passes
 //! before any stack sees it, in the order of the design's table. smoltcp 0.12
 //! panics on or misreads several things a packet can hold (design 5.3), so
-//! nothing it would take reaches it without going through here first.
+//! nothing it would take reaches it without going through here first. And
+//! one packet the TUN makes itself: [`rst_for`], the reset it answers a SYN
+//! with when it turns the SYN away.
 
 use crate::tcp::Tuple;
-use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket};
+use smoltcp::phy::ChecksumCapabilities;
+use smoltcp::wire::{
+    IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket,
+    TcpRepr, TcpSeqNumber, UdpPacket,
+};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -14,6 +20,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 const ICMP_HEADER: usize = 8;
 const ICMPV4_ECHO_REQUEST: u8 = 8;
 const ICMPV6_ECHO_REQUEST: u8 = 128;
+
+/// The time to live of IPv4 and the hop limit of IPv6 on the resets rurge
+/// makes: what operating systems send by default.
+const RESET_HOP_LIMIT: u8 = 64;
 
 /// Why a packet is dropped. Each reason is the counter of the same name in
 /// [`crate::Counters`], and that name is what the logs call it.
@@ -35,21 +45,15 @@ pub(crate) enum Reason {
     /// The queue of the shard the packet goes to was full.
     QueueFull,
     /// A SYN to an address of rurge's own space that names nothing.
-    // not built yet: the shard's SYN handling builds it and removes this expectation
-    #[cfg_attr(not(test), expect(dead_code))]
     UnknownFake,
     /// A SYN turned away because of the limits on sockets and half-open
     /// connections.
-    // not built yet: the shard's SYN handling builds it and removes this expectation
-    #[cfg_attr(not(test), expect(dead_code))]
     Busy,
     /// A segment with data past the window the TUN last told of.
     // not built yet: the shard's window guard builds it and removes this expectation
     #[cfg_attr(not(test), expect(dead_code))]
     BeyondWindow,
     /// A reset not sent because of the limit on resets.
-    // not built yet: the shard's SYN handling builds it and removes this expectation
-    #[cfg_attr(not(test), expect(dead_code))]
     RstLimited,
     /// An echo request or its reply held back by the limit on ICMP.
     // not built yet: the ICMP path builds it and removes this expectation
@@ -182,6 +186,77 @@ pub(crate) fn segment(packet: &[u8]) -> Option<Segment> {
             ..
         }) => Some(segment),
         _ => None,
+    }
+}
+
+/// The reset rurge answers a SYN with when it turns the SYN away (plan P7).
+/// It goes from where the SYN went to where it came from, with RST
+/// and ACK set, sequence number 0 and, as the acknowledgement number, the
+/// SYN's sequence number plus one for the SYN itself plus the bytes the SYN
+/// carries (wrapping round the end); the window is 0 and there are no
+/// options. The time to live or hop limit is 64, and both checksums are worked
+/// out, since the operating system's stack verifies them. `syn` is a SYN that
+/// passed [`classify`].
+pub(crate) fn rst_for(syn: &[u8]) -> Vec<u8> {
+    let read = segment(syn).expect("a SYN that passed classify is a TCP segment");
+    let (to, from) = (read.tuple.src, read.tuple.dst);
+    let reset = TcpRepr {
+        src_port: from.port(),
+        dst_port: to.port(),
+        control: TcpControl::Rst,
+        seq_number: TcpSeqNumber(0),
+        ack_number: Some(TcpSeqNumber(
+            read.seq
+                .wrapping_add(1)
+                .wrapping_add(read.payload_len as u32) as i32,
+        )),
+        window_len: 0,
+        window_scale: None,
+        max_seg_size: None,
+        sack_permitted: false,
+        sack_ranges: [None; 3],
+        timestamp: None,
+        payload: &[],
+    };
+    let checksums = ChecksumCapabilities::default();
+    match (from.ip(), to.ip()) {
+        (IpAddr::V4(from), IpAddr::V4(to)) => {
+            let ip = Ipv4Repr {
+                src_addr: from,
+                dst_addr: to,
+                next_header: IpProtocol::Tcp,
+                payload_len: reset.buffer_len(),
+                hop_limit: RESET_HOP_LIMIT,
+            };
+            let mut packet = vec![0; ip.buffer_len() + reset.buffer_len()];
+            ip.emit(&mut Ipv4Packet::new_unchecked(&mut packet[..]), &checksums);
+            reset.emit(
+                &mut TcpPacket::new_unchecked(&mut packet[ip.buffer_len()..]),
+                &IpAddress::Ipv4(from),
+                &IpAddress::Ipv4(to),
+                &checksums,
+            );
+            packet
+        }
+        (IpAddr::V6(from), IpAddr::V6(to)) => {
+            let ip = Ipv6Repr {
+                src_addr: from,
+                dst_addr: to,
+                next_header: IpProtocol::Tcp,
+                payload_len: reset.buffer_len(),
+                hop_limit: RESET_HOP_LIMIT,
+            };
+            let mut packet = vec![0; ip.buffer_len() + reset.buffer_len()];
+            ip.emit(&mut Ipv6Packet::new_unchecked(&mut packet[..]));
+            reset.emit(
+                &mut TcpPacket::new_unchecked(&mut packet[ip.buffer_len()..]),
+                &IpAddress::Ipv6(from),
+                &IpAddress::Ipv6(to),
+                &checksums,
+            );
+            packet
+        }
+        _ => unreachable!("the two addresses of a packet are of one family"),
     }
 }
 

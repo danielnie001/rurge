@@ -8,10 +8,12 @@
 //! (or none, and `get` panics). Only the shard's tables turn an id into a
 //! handle, and they lose the id when the socket goes.
 
+pub(crate) mod admission;
 pub(crate) mod budget;
 pub(crate) mod shard;
 pub(crate) mod stream;
 
+pub(crate) use admission::Admission;
 pub(crate) use budget::Budget;
 pub(crate) use shard::Shard;
 pub(crate) use stream::TunStream;
@@ -37,7 +39,7 @@ pub(crate) const TIME_WAIT_GRACE: Duration = Duration::from_millis(20);
 pub(crate) const SWEEP: Duration = Duration::from_secs(1);
 
 /// A connection's number: increasing, never reused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ConnId(u64);
 
 impl ConnId {

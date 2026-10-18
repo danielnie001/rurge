@@ -3,8 +3,10 @@
 //! packets they make by hand.
 
 use crate::device::{AppEnd, MemoryDevice};
+use crate::stats::Stats;
+use crate::tcp::{Admission, Budget, Shard};
 use crate::testing::{AppStack, FakeDialer, pattern};
-use crate::{Tun, TunHandle, TunOptions};
+use crate::{Life, Tun, TunHandle, TunOptions};
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, TcpControl, TcpPacket, TcpRepr,
@@ -14,7 +16,7 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// A TUN on one end of a memory device, the app's stack on the other, and
@@ -48,6 +50,42 @@ pub(crate) fn tun_on(device: MemoryDevice, options: TunOptions) -> (TunHandle, A
     let dialer = FakeDialer::new();
     let tun = Tun::start(Arc::new(device), dialer.clone(), options);
     (tun, dialer)
+}
+
+/// One shard on its own, for a test that takes its turns by hand, with what a
+/// TUN gives each of its shards: the test holds the TUN's `Life`, `Stats`
+/// and `Admission` as the TUN holds them.
+pub(crate) struct Lone {
+    pub(crate) shard: Arc<Shard>,
+    pub(crate) life: Arc<Life>,
+    pub(crate) stats: Arc<Stats>,
+    pub(crate) admission: Arc<Admission>,
+}
+
+/// A shard on a device with an MTU of 1500, whose clock starts at `epoch`.
+pub(crate) fn lone_shard(options: &TunOptions, epoch: Instant) -> Lone {
+    let life = Arc::new(Life::default());
+    let stats = Arc::new(Stats::default());
+    let admission = Arc::new(Admission::new(life.clone(), stats.clone(), options));
+    let budget = Arc::new(Budget::new(
+        options.budget,
+        options.buffer_min,
+        options.tx_max,
+    ));
+    let shard = Arc::new(Shard::new(
+        1500,
+        epoch,
+        1,
+        budget,
+        admission.clone(),
+        options,
+    ));
+    Lone {
+        shard,
+        life,
+        stats,
+        admission,
+    }
 }
 
 /// What a wait in these tests is bounded by, unless it says otherwise.

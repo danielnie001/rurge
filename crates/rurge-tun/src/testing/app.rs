@@ -10,6 +10,7 @@
 
 use crate::RX_MAX;
 use crate::device::AppEnd;
+use crate::space::{ADAPTER_V4, ADAPTER_V6};
 use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::socket::{AnySocket, tcp};
@@ -96,11 +97,8 @@ impl AppStack {
     /// The operating system's side: 198.18.0.1/32 and fd00:6152::1/128, a default route through each.
     pub fn start(end: AppEnd) -> AppStack {
         let own = [
-            IpCidr::new(IpAddress::v4(198, 18, 0, 1), 32),
-            IpCidr::new(
-                IpAddress::Ipv6(Ipv6Addr::new(0xfd00, 0x6152, 0, 0, 0, 0, 0, 1)),
-                128,
-            ),
+            IpCidr::new(IpAddress::Ipv4(ADAPTER_V4), 32),
+            IpCidr::new(IpAddress::Ipv6(ADAPTER_V6), 128),
         ];
         AppStack::start_with(end, &own)
     }

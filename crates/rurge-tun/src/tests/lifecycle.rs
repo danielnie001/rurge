@@ -4,11 +4,10 @@
 //! turns at times of its own, so what it checks does not hang on how fast
 //! anything runs.
 
-use super::support::{addr, is_reset, is_syn, segment_v4, syn_v4, tcp_header, within};
+use super::support::{addr, is_reset, is_syn, lone_shard, segment_v4, syn_v4, tcp_header, within};
 use crate::TunOptions;
-use crate::tcp::{Budget, Shard, TunStream};
+use crate::tcp::TunStream;
 use std::io;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -23,14 +22,9 @@ async fn a_shutdown_after_the_stacks_own_timeout_is_a_reset() {
         timeout: Duration::from_millis(100),
         ..TunOptions::default()
     };
-    let budget = Arc::new(Budget::new(
-        options.budget,
-        options.buffer_min,
-        options.tx_max,
-    ));
     let epoch = Instant::now();
     let at = |ms| epoch + Duration::from_millis(ms);
-    let shard = Arc::new(Shard::new(1500, epoch, 1, budget, &options));
+    let shard = lone_shard(&options, epoch).shard;
     let (app, dst) = (addr("198.18.0.1:40000"), addr("192.0.2.1:80"));
     let mut turn = shard.state().turn(at(0), &mut vec![syn_v4(app, dst)]);
     let opened = turn.opened.pop().expect("the SYN opens a connection");

@@ -15,19 +15,18 @@
 //! never the sum of the payloads that came.
 
 use super::app::AppStack;
+use crate::space::ADAPTER_V4;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
 };
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{SocketAddr, SocketAddrV4};
 use std::ops::RangeInclusive;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// The adapter's own address, which the app's stack has.
-const SOURCE: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 /// Advertised on every segment: nothing it takes is kept, so the window never shrinks.
 const WINDOW: u16 = 65_535;
 const MSS: u16 = 1460;
@@ -355,7 +354,7 @@ fn segment(
         payload,
     };
     let ip = Ipv4Repr {
-        src_addr: SOURCE,
+        src_addr: ADAPTER_V4,
         dst_addr: *dst.ip(),
         next_header: IpProtocol::Tcp,
         payload_len: tcp.buffer_len(),
@@ -366,7 +365,7 @@ fn segment(
     ip.emit(&mut Ipv4Packet::new_unchecked(&mut packet[..]), &checksums);
     tcp.emit(
         &mut TcpPacket::new_unchecked(&mut packet[ip.buffer_len()..]),
-        &IpAddress::Ipv4(SOURCE),
+        &IpAddress::Ipv4(ADAPTER_V4),
         &IpAddress::Ipv4(*dst.ip()),
         &checksums,
     );

@@ -9,30 +9,23 @@
 
 use super::budget::Sizes;
 use super::{
-    Budget, ConnId, ConnShared, EGRESS_PASSES, INGRESS_PER_WAKE, Outcome, SWEEP, TIME_WAIT_GRACE,
-    TunStream, Tuple,
+    Admission, Budget, ConnId, ConnShared, EGRESS_PASSES, INGRESS_PER_WAKE, Outcome, SWEEP,
+    TIME_WAIT_GRACE, TunStream, Tuple,
 };
-use crate::packet;
+use crate::packet::{self, Reason, Segment};
 use crate::session;
+use crate::space::{self, Place, STACK_V4, STACK_V6};
 use crate::{Life, TunOptions};
 use rurge_inbound::Dialer;
 use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Checksum, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint};
-use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::task::TaskTracker;
-
-/// The stack's own addresses. With `any_ip`, smoltcp takes a packet for an
-/// address that is not its own only when the route to that address goes
-/// through one of its own (phase 3 M3 design 4.2), so a default route of
-/// each family goes through these.
-const STACK_V4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 253);
-const STACK_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x6152, 0, 0, 0, 0, 0, 0xfd);
 
 pub(crate) struct Shard {
     state: Mutex<ShardState>,
@@ -50,10 +43,13 @@ impl Shard {
         epoch: Instant,
         seed: u64,
         budget: Arc<Budget>,
+        admission: Arc<Admission>,
         options: &TunOptions,
     ) -> Shard {
         Shard {
-            state: Mutex::new(ShardState::new(mtu, epoch, seed, budget, options)),
+            state: Mutex::new(ShardState::new(
+                mtu, epoch, seed, budget, admission, options,
+            )),
             kick: Notify::new(),
         }
     }
@@ -87,10 +83,17 @@ pub(crate) struct ShardState {
     epoch: Instant,
     /// When the next reap looks at every connection.
     next_sweep: Instant,
+    /// The connections still half-open by the time they run out, soonest
+    /// first: what `reap` aborts when the time comes.
+    half_open: BTreeSet<(Instant, ConnId)>,
     budget: Arc<Budget>,
+    /// The caps and limits of the whole TUN, which a new SYN meets.
+    admission: Arc<Admission>,
     /// Every socket's, from `TunOptions`.
     keep_alive: Duration,
     timeout: Duration,
+    /// How long a connection has to complete its handshake.
+    half_open_timeout: Duration,
 }
 
 /// One connection: the socket that has it, and what the shard knows of it
@@ -106,6 +109,11 @@ pub(crate) struct Conn {
     pub(crate) closed_by: Option<Outcome>,
     /// When the socket was first seen in TIME-WAIT.
     time_wait: Option<Instant>,
+    /// While the handshake is not over: the time it runs out. The connection
+    /// counts against `max_half_open` as long as this is `Some`, which it is
+    /// until the first time the shard sees the socket past SYN-RECEIVED,
+    /// aborts it for running out of time, or lets the connection go.
+    half_open: Option<Instant>,
     /// The stream shut its write side down.
     pub(crate) shut: bool,
     /// The stream is gone.
@@ -137,6 +145,7 @@ impl ShardState {
         epoch: Instant,
         seed: u64,
         budget: Arc<Budget>,
+        admission: Arc<Admission>,
         options: &TunOptions,
     ) -> ShardState {
         let mut device = ShardDevice {
@@ -174,9 +183,12 @@ impl ShardState {
             touched: HashSet::new(),
             epoch,
             next_sweep: epoch + SWEEP,
+            half_open: BTreeSet::new(),
             budget,
+            admission,
             keep_alive: options.keep_alive,
             timeout: options.timeout,
+            half_open_timeout: options.half_open_timeout,
         }
     }
 
@@ -200,7 +212,7 @@ impl ShardState {
         let taken = incoming.len().min(INGRESS_PER_WAKE);
         let mut opened = Vec::new();
         for packet in incoming.drain(..taken) {
-            self.ingest(packet, at, &mut opened);
+            self.ingest(packet, now, at, &mut opened);
         }
         let mut drained = false;
         for _ in 0..EGRESS_PASSES {
@@ -230,9 +242,15 @@ impl ShardState {
     }
 
     /// One packet into the stack. A segment of a connection goes to its
-    /// socket; a SYN of none opens one; any other segment goes in too, and
-    /// smoltcp answers it with a reset.
-    fn ingest(&mut self, packet: Vec<u8>, at: smoltcp::time::Instant, opened: &mut Vec<Opened>) {
+    /// socket; a SYN of none is looked at (`new_syn`); any other segment
+    /// goes in too, and smoltcp answers it with a reset.
+    fn ingest(
+        &mut self,
+        packet: Vec<u8>,
+        now: Instant,
+        at: smoltcp::time::Instant,
+        opened: &mut Vec<Opened>,
+    ) {
         // nothing but TCP that passed the filter comes to a shard
         let segment = packet::segment(&packet);
         debug_assert!(
@@ -251,6 +269,18 @@ impl ShardState {
             let before = self.sockets.get::<tcp::Socket>(handle).state();
             self.advance(packet, at);
             let after = self.sockets.get::<tcp::Socket>(handle).state();
+            if after == tcp::State::Listen {
+                // A reset in SYN-RECEIVED sends the socket back to listening
+                // (smoltcp tcp.rs): without its 4-tuple it would take the next
+                // SYN to this destination from any source, and the tuple
+                // table would not know whose connection that was. It is no
+                // connection any more.
+                self.remove(id, Outcome::Reset);
+                return;
+            }
+            if before == tcp::State::SynReceived && after != tcp::State::SynReceived {
+                self.end_half_open(id);
+            }
             if before != tcp::State::Closed && after == tcp::State::Closed {
                 let conn = self
                     .conns
@@ -263,8 +293,10 @@ impl ShardState {
                 });
             }
             self.touched.insert(id);
-        } else if segment.syn && !segment.ack {
-            self.open(packet, segment, at, opened);
+        } else if segment.syn && !segment.ack && !segment.rst && !segment.fin {
+            // a SYN with RST or FIN as well is none that smoltcp reads, and
+            // a reset is never the answer to a reset
+            self.new_syn(packet, segment, now, at, opened);
         } else {
             self.advance(packet, at);
         }
@@ -277,14 +309,72 @@ impl ShardState {
         self.device.rx = None;
     }
 
-    /// A SYN of no connection (phase 3 M3 design 5.2, step 5): a socket that
-    /// listens on the SYN's destination alone, then the SYN. The socket has
-    /// the connection if the stack took the SYN; packets go in one at a
-    /// time, so no other SYN to the same destination can come between.
+    /// A SYN of no connection (phase 3 M3 design 5.2). In this order: the
+    /// TUN is stopping; the caps on sockets and on half-open connections are
+    /// met; the destination is an address of rurge's own, or one that stands
+    /// for a name. In each case the SYN is turned away with a reset. Any
+    /// other SYN is the first of a connection (`open`).
+    ///
+    /// The places the connection would take in the caps are claimed in one
+    /// step, not looked at here and taken later, so that the caps hold when
+    /// shards take places at once. A place claimed for a SYN that is turned
+    /// away is given back.
+    fn new_syn(
+        &mut self,
+        packet: Vec<u8>,
+        segment: Segment,
+        now: Instant,
+        at: smoltcp::time::Instant,
+        opened: &mut Vec<Opened>,
+    ) {
+        if self.admission.stopping() {
+            return self.turn_away(&packet, &segment, now, None);
+        }
+        if !self.admission.claim() {
+            return self.turn_away(&packet, &segment, now, Some(Reason::Busy));
+        }
+        match space::place(segment.tuple.dst.ip()) {
+            Place::Real => self.open(packet, segment, now, at, opened),
+            // the responder's port 53 is a place for a connection of its own
+            // (M3c); every other port of it is not
+            Place::Responder | Place::Own => {
+                self.admission.unclaim();
+                self.turn_away(&packet, &segment, now, None);
+            }
+            // there is no pool of fake addresses yet: each names nothing
+            Place::Fake => {
+                self.admission.unclaim();
+                self.turn_away(&packet, &segment, now, Some(Reason::UnknownFake));
+            }
+        }
+    }
+
+    /// Answers `syn` with a reset, as rurge's own resets are let through
+    /// (`Admission::allow_reset`); one that is not is dropped and counted.
+    /// `why` is what is counted of the SYN itself, if anything is.
+    fn turn_away(&mut self, syn: &[u8], segment: &Segment, now: Instant, why: Option<Reason>) {
+        let (src, dst) = (segment.tuple.src.ip(), segment.tuple.dst.ip());
+        if let Some(reason) = why {
+            self.admission.count(reason, src, dst);
+        }
+        if self.admission.allow_reset(now) {
+            self.device.tx.push(packet::rst_for(syn));
+        } else {
+            self.admission.count(Reason::RstLimited, src, dst);
+        }
+    }
+
+    /// A SYN that is let in (design 5.2, step 5): a socket that listens on
+    /// the SYN's destination alone, then the SYN. The socket has the
+    /// connection if the stack took the SYN; packets go in one at a time, so
+    /// no other SYN to the same destination can come between. The places the
+    /// connection takes in the TUN's caps were claimed by `new_syn`; they are
+    /// given back if no connection comes of the SYN.
     fn open(
         &mut self,
         packet: Vec<u8>,
-        segment: packet::Segment,
+        segment: Segment,
+        now: Instant,
         at: smoltcp::time::Instant,
         opened: &mut Vec<Opened>,
     ) {
@@ -307,6 +397,7 @@ impl ShardState {
         };
         if socket.listen(endpoint).is_err() {
             self.budget.give_back(sizes);
+            self.admission.unclaim();
             return;
         }
         let handle = self.sockets.add(socket);
@@ -314,10 +405,12 @@ impl ShardState {
         if self.sockets.get::<tcp::Socket>(handle).state() != tcp::State::SynReceived {
             self.sockets.remove(handle);
             self.budget.give_back(sizes);
+            self.admission.unclaim();
             return;
         }
         let id = ConnId::next();
         let shared = Arc::new(ConnShared::default());
+        let deadline = now + self.half_open_timeout;
         let conn = Conn {
             handle,
             tuple,
@@ -325,11 +418,13 @@ impl ShardState {
             shared: shared.clone(),
             closed_by: None,
             time_wait: None,
+            half_open: Some(deadline),
             shut: false,
             dropped: false,
         };
         self.conns.insert(id, conn);
         self.by_tuple.insert(tuple, id);
+        self.half_open.insert((deadline, id));
         opened.push(Opened { id, shared, tuple });
     }
 
@@ -338,9 +433,12 @@ impl ShardState {
     /// `TIME_WAIT_GRACE` after it was first seen there, a closed socket once
     /// it has no ends left (an aborted socket keeps them until its reset is
     /// out). Neither goes while its stream is there to read what the app
-    /// sent before its FIN (P12), unless the app reset the connection. When
-    /// a connection kept for its grace is to be looked at next, if any is.
+    /// sent before its FIN (P12), unless the app reset the connection. First
+    /// the connections that ran out of time for their handshake are aborted
+    /// (`expire_half_open`). When a connection kept for its grace or a
+    /// handshake that is still going on is to be looked at next, if any is.
     fn reap(&mut self, now: Instant) -> Option<Instant> {
+        let mut next = self.expire_half_open(now);
         let ids: Vec<ConnId> = if now >= self.next_sweep {
             self.next_sweep = now + SWEEP;
             self.touched.clear();
@@ -348,7 +446,6 @@ impl ShardState {
         } else {
             self.touched.drain().collect()
         };
-        let mut next: Option<Instant> = None;
         let mut over = Vec::new();
         for id in ids {
             let Some(conn) = self.conns.get_mut(&id) else {
@@ -383,9 +480,44 @@ impl ShardState {
         next
     }
 
+    /// Aborts the connections whose handshake has run out of time (design
+    /// 5.4: smoltcp does not limit SYN-RECEIVED itself): its socket sends a
+    /// reset in a later egress pass, and `reap` lets the connection go once
+    /// that is out and not before (the app would be left without it). From
+    /// the abort on the connection no longer counts as half-open. When the
+    /// soonest of the handshakes still going on runs out, if any is.
+    fn expire_half_open(&mut self, now: Instant) -> Option<Instant> {
+        while let Some(&(deadline, id)) = self.half_open.first() {
+            if deadline > now {
+                return Some(deadline);
+            }
+            self.end_half_open(id);
+            let conn = self
+                .conns
+                .get(&id)
+                .expect("a connection of the half-open table");
+            self.sockets.get_mut::<tcp::Socket>(conn.handle).abort();
+            self.touched.insert(id);
+        }
+        None
+    }
+
+    /// The handshake of a connection is over, or the connection is going
+    /// without it: it stops counting as half-open. Once for each connection.
+    fn end_half_open(&mut self, id: ConnId) {
+        let Some(conn) = self.conns.get_mut(&id) else {
+            return;
+        };
+        if let Some(deadline) = conn.half_open.take() {
+            self.half_open.remove(&(deadline, id));
+            self.admission.release_half_open();
+        }
+    }
+
     /// Lets go of a connection: its socket, its entries and its buffers; its
     /// stream answers `outcome` from now on, and whoever waits on it wakes.
     fn remove(&mut self, id: ConnId, outcome: Outcome) {
+        self.end_half_open(id);
         let Some(conn) = self.conns.remove(&id) else {
             return;
         };
@@ -395,6 +527,7 @@ impl ShardState {
         self.touched.remove(&id);
         self.sockets.remove(conn.handle);
         self.budget.give_back(conn.sizes);
+        self.admission.release_socket();
         conn.shared.end(outcome);
     }
 
