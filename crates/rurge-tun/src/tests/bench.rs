@@ -24,13 +24,14 @@
 //!
 //! B1 is judged on the rows run with `TUN_BENCH_FAR=memory`: the far end is in
 //! memory, on the TUN's thread, so a row is the TUN and the relay's two 8 KiB
-//! buffers and nothing else, and every such row is to reach 0.7 Gbit/s. Run
+//! buffers and nothing else, and every such row is to reach 0.7 Gbit/s; only
+//! this mode prints the `>= 0.7` column and a verdict for each setting. Run
 //! without it the far end is a TCP connection on the loopback, as design 6
 //! asks (this is the default), and those rows stay in the table as the ceiling
-//! of that hop, not as a judgment of the TUN: a loopback socket written 8 KiB
-//! at a time, which is what the relay does, is a limit of about 0.7 to
-//! 1.2 Gbit/s on the development machine with no TUN in front of it, and the
-//! limit moves with the machine's state.
+//! of that hop, not as a judgment of the TUN: the engine's relay loop over
+//! plain TCP, which also moves 8 KiB at a time, carried 110 MiB/s (0.92
+//! Gbit/s) on one thread on the development machine (phase 2 / M8c plan,
+//! execution record row 40), with no TUN in front of it.
 //!
 //! B2 is one setting of the stack for each process, given by `TUN_BENCH_SHARDS`
 //! (a number), `TUN_BENCH_MIN` and `TUN_BENCH_TX_MAX` (KiB), `TUN_BENCH_BUDGET`
@@ -39,14 +40,20 @@
 //! and then lie idle, runs a hundred more that carry 4 MiB each way, and
 //! prints the peak working set of the process (`PeakWorkingSet64`, read by
 //! asking PowerShell, on Windows; `VmHWM` in `/proc/self/status` on Linux).
-//! The peak is the process's, and it has the test side's own memory in it.
+//! The peak is the process's, and it has the test side's own memory in it: it
+//! is printed, and it is not the judged number.
 //!
-//! B2 is judged on rurge's own memory: the peak at the end less the test
-//! side's own memory, against 429,000,000 bytes, with the five counts, which
-//! must be 0. The test side is kept small and reported, and the run prints it
-//! item by item: the app stack's socket buffers are counted exactly (a hundred
+//! B2 is judged on the first of the two readings of rurge's own memory that
+//! the run prints: the peak at the end less every item of the test side,
+//! against 429,000,000 bytes, with the five counts, which must be 0. The test
+//! side is kept small and reported (design 6), and the run prints it item by
+//! item: the app stack's socket buffers are counted exactly (a hundred
 //! sockets), the pipes and the far ends' own buffers are upper bounds, and the
-//! scripted client's table is an estimate.
+//! scripted client's table is an estimate. The second reading takes off only
+//! the exact item, and is printed because its margin against the line is thin.
+//!
+//! The readings and the numbers they gave are recorded in the phase 3 / M3a
+//! plan, execution record rows 8 (B1) and 9 (B2).
 //!
 //! A measurement is the wall clock of one run on one machine; the CPU time of
 //! a process is not read (it is not to be trusted on the development machine).
@@ -633,6 +640,8 @@ fn b1_single_stream_throughput() {
         "{:>5} {:>8} {:>5} {:>10} {:>8} {:>8} {:>12} {:>10}  counts",
         "mtu", "tx_max", "way", "bytes", "seconds", "Gbit/s", ">= 0.7", "of ceiling"
     );
+    // the 0.7 column and the verdicts are printed where B1 is judged
+    let judged = far == Far::Memory;
     // (mtu, tx_max, way, passes the bar)
     let mut settings = Vec::new();
     for mtu in [1500, 9000] {
@@ -658,10 +667,11 @@ fn b1_single_stream_throughput() {
                     format!("{} KiB", tx_max / 1024),
                     way.name(),
                     row.elapsed.as_secs_f64(),
-                    match (counted, gbit >= 0.7) {
-                        (false, _) => "not counted",
-                        (true, true) => "yes",
-                        (true, false) => "no",
+                    match (counted, judged, gbit >= 0.7) {
+                        (false, _, _) => "not counted",
+                        (true, false, _) => "-",
+                        (true, true, true) => "yes",
+                        (true, true, false) => "no",
                     },
                     100.0 * gbit / ceiling_gbit,
                     row.counts()
@@ -669,6 +679,12 @@ fn b1_single_stream_throughput() {
                 settings.push((mtu, tx_max, way, passes));
             }
         }
+    }
+    if !judged {
+        println!(
+            "\nthe loopback rows are the ceiling of that hop; B1 is judged on the rows run with TUN_BENCH_FAR=memory"
+        );
+        return;
     }
     println!(
         "\na setting passes when both its directions count and reach 0.7 Gbit/s or 80% of the ceiling:"
@@ -775,6 +791,65 @@ const IDLE_SENT: usize = 8192;
 const PIPE: usize = 1024;
 /// What the benchmark may use of memory: 300 MB / 0.7, in decimal.
 const MEMORY_LIMIT: u64 = 429_000_000;
+
+/// What the test side of B2 holds, item by item, in bytes.
+struct TestSide {
+    /// The sockets of the app's stack: counted exactly.
+    app_buffers: u64,
+    /// The scripted client's table: an estimate.
+    table: u64,
+    /// The memory pipes: at most.
+    pipes: u64,
+    /// The far ends' own buffers: at most.
+    far_ends: u64,
+}
+
+impl TestSide {
+    /// Rurge's own memory as the gate reads it: the peak less every item of the
+    /// test side (design 6: the test side is kept small and reported).
+    fn gate(&self, peak: u64) -> u64 {
+        peak.saturating_sub(self.app_buffers + self.table + self.pipes + self.far_ends)
+    }
+
+    /// The same taking off only the item that is exact, printed because the
+    /// margin of this reading is thin.
+    fn conservative(&self, peak: u64) -> u64 {
+        peak.saturating_sub(self.app_buffers)
+    }
+}
+
+/// Against the line of memory: `within` it or `OVER` it.
+fn against_the_line(bytes: u64) -> &'static str {
+    if bytes <= MEMORY_LIMIT {
+        "within"
+    } else {
+        "OVER"
+    }
+}
+
+#[test]
+fn b2_takes_the_test_side_off_the_peak() {
+    // the numbers of a run
+    let side = TestSide {
+        app_buffers: 32_767_900,
+        table: 702_464,
+        pipes: 20_480_000,
+        far_ends: 20_480_000,
+    };
+    let peak = 460_713_984;
+    assert_eq!(side.gate(peak), 386_283_620, "every item off");
+    assert_eq!(
+        side.conservative(peak),
+        427_946_084,
+        "only the exact one off"
+    );
+    // never less than nothing
+    assert_eq!(side.gate(1_000), 0);
+    assert_eq!(side.conservative(1_000), 0);
+    // the line is inclusive
+    assert_eq!(against_the_line(MEMORY_LIMIT), "within");
+    assert_eq!(against_the_line(MEMORY_LIMIT + 1), "OVER");
+}
 
 /// A hundred of these run at once: the bytes written come back from the echo
 /// server, and are read.
@@ -910,7 +985,7 @@ fn b2_ten_thousand_connections() {
 
         let per_second = packets as f64 / active_in.as_secs_f64();
         println!(
-            "{ACTIVE_COUNT} active connections, {} MiB each way each, in {:.2} s: {packets} packets through the device, {per_second:.0} a second, {:.2} us a packet",
+            "{ACTIVE_COUNT} active connections, {} MiB each way each, in {:.2} s: {packets} packets through the device, {per_second:.0} a second, {:.2} us a packet (whole path, relative only)",
             ACTIVE_BYTES >> 20,
             active_in.as_secs_f64(),
             1e6 / per_second
@@ -922,21 +997,39 @@ fn b2_ten_thousand_connections() {
         };
         println!("process peak working set before the TUN: {}", show(baseline));
         println!("after the idle connections:             {}", show(after_idle));
-        println!("at the end:                             {}", show(peak));
-        if let Some(peak) = peak {
-            println!(
-                "limit {MEMORY_LIMIT} bytes: {}",
-                if peak <= MEMORY_LIMIT { "within" } else { "OVER" }
-            );
-        }
+        println!(
+            "at the end:                             {}  (includes the test side; not the judged number)",
+            show(peak)
+        );
         let idle = usize::from(IDLE_COUNT);
+        let side = TestSide {
+            app_buffers: app_buffers as u64,
+            table: scripted.table_bytes() as u64,
+            pipes: (idle * 2 * PIPE) as u64,
+            far_ends: (idle * 2 * PIPE) as u64,
+        };
         println!(
             "test side, about: app stack socket buffers {} bytes ({ACTIVE_COUNT} sockets); scripted client's table {} bytes; memory pipes {} bytes at most ({idle} x 2 x {PIPE}); far ends' own buffers {} bytes at most ({idle} x 2 x {PIPE})",
-            app_buffers,
-            scripted.table_bytes(),
-            idle * 2 * PIPE,
-            idle * 2 * PIPE
+            side.app_buffers, side.table, side.pipes, side.far_ends
         );
+        match peak {
+            Some(peak) => {
+                let (gate, conservative) = (side.gate(peak), side.conservative(peak));
+                println!(
+                    "rurge's own memory, peak less every test-side item above: {}, limit {MEMORY_LIMIT}: {}  <- the gate",
+                    show(Some(gate)),
+                    against_the_line(gate)
+                );
+                println!(
+                    "conservative, peak less only the app stack's socket buffers (exact): {}, limit {MEMORY_LIMIT}: {}",
+                    show(Some(conservative)),
+                    against_the_line(conservative)
+                );
+            }
+            None => println!(
+                "the peak is not read on this system, so rurge's own memory cannot be computed"
+            ),
+        }
         let counted = counters.queue_full == 0
             && counters.busy == 0
             && counters.rst_limited == 0
