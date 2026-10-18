@@ -467,6 +467,11 @@ pub struct UdpAssociation {
 
 pub async fn udp_associate(socks: SocketAddr) -> UdpAssociation {
     let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    // macOS sends no datagram larger than the socket's send buffer, 9216 bytes
+    // by default; a case sends 20,000 to 60,000.
+    socket2::SockRef::from(&socket)
+        .set_send_buffer_size(256 * 1024)
+        .expect("a 256 KiB send buffer for the client's socket");
     let mut control = TcpStream::connect(socks).await.unwrap();
     control.write_all(&[5, 1, 0]).await.unwrap();
     let mut method = [0u8; 2];

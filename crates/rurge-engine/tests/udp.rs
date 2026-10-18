@@ -47,6 +47,11 @@ async fn finished(h: &Harness, count: usize) -> Vec<RequestRecord> {
 async fn an_answer_too_long_for_the_client_is_dropped_alone() {
     let h = harness(Profile::default()).await;
     let remote = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    // macOS sends no datagram larger than the socket's send buffer, 9216 bytes
+    // by default; the answer below is 65,500.
+    socket2::SockRef::from(&remote)
+        .set_send_buffer_size(256 * 1024)
+        .expect("a 256 KiB send buffer for the remote's socket");
     let remote_addr = remote.local_addr().unwrap();
     let association = udp_associate(h.socks()).await;
     association

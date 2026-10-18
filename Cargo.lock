@@ -3478,6 +3478,7 @@ dependencies = [
  "sha1 0.11.0",
  "sha2 0.10.9",
  "sha3 0.10.9",
+ "socket2",
  "tempfile",
  "tokio",
  "tokio-rustls",

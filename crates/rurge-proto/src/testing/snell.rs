@@ -582,6 +582,11 @@ impl Shared {
         answers: &mut Answers,
     ) -> io::Result<()> {
         let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        // a record carries a datagram of up to 16,374 bytes, which macOS does
+        // not send from a socket with its default send buffer (9216 bytes)
+        socket2::SockRef::from(&socket)
+            .set_send_buffer_size(256 * 1024)
+            .expect("a 256 KiB send buffer for the session's UDP socket");
         self.seen
             .udp_outside
             .lock()

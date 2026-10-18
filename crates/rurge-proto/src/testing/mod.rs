@@ -84,6 +84,11 @@ pub async fn echo_server() -> SocketAddr {
 /// Answers every datagram with itself, to wherever it came from.
 pub async fn udp_echo_server() -> SocketAddr {
     let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind loopback");
+    // macOS sends no datagram larger than the socket's send buffer, 9216 bytes
+    // by default; a case may echo more than that.
+    socket2::SockRef::from(&socket)
+        .set_send_buffer_size(256 * 1024)
+        .expect("a 256 KiB send buffer for the echo");
     let addr = socket.local_addr().expect("local addr");
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];

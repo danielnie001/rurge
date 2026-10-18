@@ -16,6 +16,7 @@ tokio-rustls.workspace = true
 sha2.workspace = true
 base64.workspace = true
 rcgen = { workspace = true, optional = true }
+socket2 = { workspace = true, optional = true }
 p12-keystore.workspace = true
 getrandom.workspace = true
 tracing.workspace = true
@@ -41,10 +42,11 @@ tokio-util.workspace = true
 
 [features]
 # Scriptable loopback peers (`rurge_proto::testing`); enabled by dependants' dev-dependencies.
-testing = ["dep:rcgen"]
+testing = ["dep:rcgen", "dep:socket2"]
 
 [dev-dependencies]
 rcgen.workspace = true
+socket2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
