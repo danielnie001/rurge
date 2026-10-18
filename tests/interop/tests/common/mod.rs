@@ -82,6 +82,12 @@ pub fn target(addr: SocketAddr) -> Target {
     Target::new(rurge_config::HostName::Ip(addr.ip()), addr.port())
 }
 
+/// `t` with an IPv4-mapped IPv6 host read as the IPv4 address, as
+/// `HostName::canonical` does: a server may name an IPv4 source either way.
+pub fn canonical(t: Target) -> Target {
+    Target::new(t.host.canonical(), t.port)
+}
+
 /// Every step is bounded: nobody runs these locally, and on CI an unbounded
 /// read turns a regression into a hung job instead of a failed one.
 pub async fn roundtrip(out: &OutboundRef, echo: SocketAddr) {
@@ -134,8 +140,9 @@ pub async fn transfer(out: &OutboundRef, echo: SocketAddr, len: usize) {
 /// the policy's connection, each with payloads of its own (an answer handed
 /// to the other carrier would show): a few bytes, then 3000 — more than a
 /// QUIC datagram holds, so a protocol that splits packets sends them in
-/// fragments both ways (macOS carries no loopback datagram past 9216).
-/// Bounded like `roundtrip`.
+/// fragments both ways (macOS carries no loopback datagram past 9216). The
+/// source of an answer is compared in canonical form. Bounded like
+/// `roundtrip`.
 pub async fn udp_side_by_side(out: &OutboundRef, echo: SocketAddr) {
     let bound = std::time::Duration::from_secs(10);
     let mut carriers = Vec::new();
@@ -156,14 +163,15 @@ pub async fn udp_side_by_side(out: &OutboundRef, echo: SocketAddr) {
                 .await
                 .expect("the echo comes back within the bound")
                 .unwrap();
-            assert_eq!(from, target(echo));
+            assert_eq!(canonical(from), canonical(target(echo)));
             assert!(buf[..n] == payload[..], "the echo differs ({n} bytes)");
         }
     }
 }
 
 /// One datagram to `echo` through a fresh UDP carrier of `out`, and its
-/// answer. Bounded like `roundtrip`.
+/// answer, whose source is compared in canonical form. Bounded like
+/// `roundtrip`.
 pub async fn udp_roundtrip(out: &OutboundRef, echo: SocketAddr) {
     let bound = std::time::Duration::from_secs(10);
     let carrier = tokio::time::timeout(bound, out.open_udp(&ConnectOpts::default()))
@@ -177,7 +185,10 @@ pub async fn udp_roundtrip(out: &OutboundRef, echo: SocketAddr) {
             .await
             .expect("the echo comes back within the bound")
             .unwrap();
-        assert_eq!((&buf[..n], from), (payload, target(echo)));
+        assert_eq!(
+            (&buf[..n], canonical(from)),
+            (payload, canonical(target(echo)))
+        );
     }
 }
 

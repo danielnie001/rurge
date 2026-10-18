@@ -196,7 +196,10 @@ async fn v4_tcp_against_tuic_server() {
 
 /// Whole packets in QUIC datagrams (v4 has no fragments). The server names
 /// an IPv4 source in its IPv4-mapped IPv6 form, as its one dual-stack socket
-/// reports it; rurge reads it as the IPv4 address `udp_roundtrip` expects.
+/// reports it, so `udp_roundtrip` puts both sides in canonical form before it
+/// compares them. rurge itself reads that form as the IPv4 address, which
+/// `tuic::addr::tests::an_ipv4_address_in_ipv6_form_reads_as_the_ipv4_address`
+/// pins.
 #[tokio::test]
 async fn v4_udp_against_tuic_server() {
     let Some(bin) = tuic_server_or_skip("v4_udp_against_tuic_server") else {

@@ -3,6 +3,9 @@
 //! literal. Without an xray binary each test prints why it is skipped
 //! (`RURGE_INTEROP_REQUIRED=1` turns that into a failure).
 
+mod common;
+
+use common::canonical;
 use rurge_config::config::{LoadOptions, from_text};
 use rurge_engine::EngineFactory;
 use rurge_interop::xray::{Xray, XrayInbound, xray_or_skip};
@@ -145,7 +148,10 @@ async fn vmess_udp_with_either_cipher() {
                 .await
                 .expect("the echo comes back within the bound")
                 .unwrap();
-            assert_eq!((&buf[..n], from), (&b"interop"[..], to));
+            assert_eq!(
+                (&buf[..n], canonical(from)),
+                (&b"interop"[..], canonical(to))
+            );
         }
     }
 }

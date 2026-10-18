@@ -231,7 +231,10 @@ async fn socks5_udp_goes_through_sing_box() {
         .await
         .expect("the echo comes back within the bound")
         .unwrap();
-    assert_eq!((&buf[..n], from), (&b"interop"[..], target(echo_addr)));
+    assert_eq!(
+        (&buf[..n], canonical(from)),
+        (&b"interop"[..], canonical(target(echo_addr)))
+    );
 }
 
 /// What "skipped" means must itself be tested: without a binary the helper

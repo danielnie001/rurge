@@ -57,8 +57,8 @@ async fn udp_two_targets(out: &OutboundRef, echoes: [SocketAddr; 2], log: &dyn F
                 .unwrap_or_else(|_| panic!("the echo comes back within the bound\n{}", log()))
                 .unwrap();
             assert_eq!(
-                (&buf[..len], from),
-                (&payload[..], target(echo)),
+                (&buf[..len], canonical(from)),
+                (&payload[..], canonical(target(echo))),
                 "{}",
                 log()
             );
