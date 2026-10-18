@@ -183,8 +183,14 @@ impl AsyncWrite for TunStream {
         if conn.closed_by == Some(Outcome::Reset) {
             return Poll::Ready(Err(reset()));
         }
+        let socket = state.sockets.get_mut::<tcp::Socket>(conn.handle);
+        // closed by smoltcp's own timeout, say, and not let go yet: the reset
+        // the read answers, and the outcome the shard records when it does
+        if socket.state() == tcp::State::Closed && conn.closed_by != Some(Outcome::Closed) {
+            return Poll::Ready(Err(reset()));
+        }
         conn.shut = true;
-        state.sockets.get_mut::<tcp::Socket>(conn.handle).close();
+        socket.close();
         state.touched.insert(self.id);
         drop(guard);
         self.shard.kick();
@@ -197,7 +203,7 @@ impl Drop for TunStream {
     /// down (its FIN is on its way after what was written), nothing more to
     /// come from the app and nothing of it left unread.
     fn drop(&mut self) {
-        let Some(mut guard) = self.shard.try_state() else {
+        let Some(mut guard) = self.shard.state_unless_poisoned() else {
             return;
         };
         let state = &mut *guard;

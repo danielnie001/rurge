@@ -2,7 +2,7 @@
 //! bounded, streams of the pattern, and the builders and readers of the
 //! packets they make by hand.
 
-use crate::device::MemoryDevice;
+use crate::device::{AppEnd, MemoryDevice};
 use crate::testing::{AppStack, FakeDialer, pattern};
 use crate::{Tun, TunHandle, TunOptions};
 use std::future::Future;
@@ -12,19 +12,23 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// A TUN on one end of a memory device (MTU 1500, room for 4096 packets each
-/// way), the app's stack on the other, and the fake `Dialer` the TUN hands
-/// its sessions to.
+/// A TUN on one end of a memory device, the app's stack on the other, and
+/// the fake `Dialer` the TUN hands its sessions to.
 pub(crate) struct Rig {
     pub(crate) tun: TunHandle,
     pub(crate) app: AppStack,
     pub(crate) dialer: Arc<FakeDialer>,
 }
 
+/// A rig on a memory device with an MTU of 1500 and room for 4096 packets
+/// each way.
+pub(crate) fn rig(options: TunOptions) -> Rig {
+    rig_on(MemoryDevice::pair(1500, 4096), options)
+}
+
 /// Every test that starts a TUN starts it here, so that a change of what
 /// `Tun::start` takes is a change of this function only.
-pub(crate) fn rig(options: TunOptions) -> Rig {
-    let (device, end) = MemoryDevice::pair(1500, 4096);
+pub(crate) fn rig_on((device, end): (MemoryDevice, AppEnd), options: TunOptions) -> Rig {
     let dialer = FakeDialer::new();
     let tun = Tun::start(Arc::new(device), dialer.clone(), options);
     Rig {

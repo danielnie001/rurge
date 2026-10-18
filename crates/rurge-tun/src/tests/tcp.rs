@@ -2,10 +2,12 @@
 //! the memory device is handed to the `Dialer` once its handshake is over,
 //! and relayed to what the `Dialer` dials.
 
-use super::support::{WITHIN, addr, eventually, is_syn, read_pattern, rig, within, write_pattern};
+use super::support::{
+    WITHIN, addr, eventually, is_syn, read_pattern, rig, rig_on, within, write_pattern,
+};
 use crate::device::MemoryDevice;
-use crate::testing::{AppTcp, Direction, FakeDialer, Script, Upstream};
-use crate::{Counters, Ending, Tun, TunOptions};
+use crate::testing::{AppTcp, Direction, Script, Upstream};
+use crate::{Counters, Ending, TunOptions};
 use rurge_config::{HostName, ListenerKind, Transport};
 use rurge_proto::RejectKind;
 use std::io;
@@ -248,13 +250,14 @@ async fn nothing_is_dialed_before_the_handshake_completes() {
 }
 
 /// The timers of the two tests of the timeout, short enough for a test. The
-/// app's stack here is smoltcp, which answers at most one keep-alive a
-/// second (it rate-limits its challenge ACKs): with a timeout of 1 s the
-/// TUN would give up on it just before its next answer.
+/// app's stack here is smoltcp, which answers a keep-alive at most once a
+/// second however often they come (it rate-limits its challenge ACKs): a
+/// timeout of 3 s leaves the app's side about 2 s to be late by. With 1 s
+/// the TUN would give up on it just before its next answer.
 fn short_timers() -> TunOptions {
     TunOptions {
         keep_alive: Duration::from_millis(100),
-        timeout: Duration::from_secs(2),
+        timeout: Duration::from_secs(3),
         ..TunOptions::default()
     }
 }
@@ -265,7 +268,7 @@ fn short_timers() -> TunOptions {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_connection_outlives_the_timeout() {
     let options = short_timers();
-    let idle = options.timeout * 3;
+    let idle = options.timeout * 2;
     let rig = rig(options);
     let echo = Upstream::echo().await;
     let dst = addr("192.0.2.1:80");
@@ -275,7 +278,8 @@ async fn an_idle_connection_outlives_the_timeout() {
         .expect("connect");
     hello(&mut tcp).await;
     // the one fixed wait, for what must not happen: the idle connection
-    // reset; three times the timeout
+    // reset; twice the timeout: without the keep-alives the TUN resets it a
+    // timeout after the first hello, a whole timeout before the second
     tokio::time::sleep(idle).await;
     hello(&mut tcp).await;
     assert!(rig.dialer.relay_ends().is_empty(), "the relay goes on");
@@ -308,6 +312,11 @@ async fn a_silent_app_is_reset_after_the_timeout() {
         rig.dialer.relay_ends().len() == 1
     })
     .await;
+    assert!(
+        rig.dialer.relay_ends()[0].is_err(),
+        "the relay ends with the reset, not the end of the stream: {:?}",
+        rig.dialer.relay_ends()
+    );
     assert_eq!(rig.tun.counters(), Counters::default());
 }
 
@@ -342,6 +351,5 @@ async fn stop_ends_the_tun() {
 #[tokio::test]
 #[should_panic(expected = "at least 1280")]
 async fn a_device_mtu_below_1280_is_refused() {
-    let (device, _end) = MemoryDevice::pair(1279, 16);
-    let _tun = Tun::start(Arc::new(device), FakeDialer::new(), TunOptions::default());
+    let _rig = rig_on(MemoryDevice::pair(1279, 16), TunOptions::default());
 }

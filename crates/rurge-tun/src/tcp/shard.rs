@@ -43,14 +43,17 @@ pub(crate) struct Shard {
 }
 
 impl Shard {
+    /// `seed` is what smoltcp draws the initial sequence numbers of the
+    /// shard's connections from.
     pub(crate) fn new(
         mtu: usize,
         epoch: Instant,
+        seed: u64,
         budget: Arc<Budget>,
         options: &TunOptions,
     ) -> Shard {
         Shard {
-            state: Mutex::new(ShardState::new(mtu, epoch, budget, options)),
+            state: Mutex::new(ShardState::new(mtu, epoch, seed, budget, options)),
             kick: Notify::new(),
         }
     }
@@ -59,8 +62,10 @@ impl Shard {
         self.state.lock().expect("a TCP shard's state")
     }
 
-    /// For a stream's `Drop`, which must not panic.
-    pub(crate) fn try_state(&self) -> Option<MutexGuard<'_, ShardState>> {
+    /// The state, waiting for the lock as `state()` does; where `state()`
+    /// panics on a poisoned lock, this is `None`. For a stream's `Drop`,
+    /// which must not panic.
+    pub(crate) fn state_unless_poisoned(&self) -> Option<MutexGuard<'_, ShardState>> {
         self.state.lock().ok()
     }
 
@@ -127,14 +132,20 @@ pub(crate) struct Opened {
 }
 
 impl ShardState {
-    fn new(mtu: usize, epoch: Instant, budget: Arc<Budget>, options: &TunOptions) -> ShardState {
+    fn new(
+        mtu: usize,
+        epoch: Instant,
+        seed: u64,
+        budget: Arc<Budget>,
+        options: &TunOptions,
+    ) -> ShardState {
         let mut device = ShardDevice {
             rx: None,
             tx: Vec::new(),
             mtu,
         };
         let mut config = Config::new(HardwareAddress::Ip);
-        config.random_seed = getrandom::u64().unwrap_or(0x5eed);
+        config.random_seed = seed;
         let mut iface = Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
         iface.set_any_ip(true);
         iface.update_ip_addrs(|addresses| {

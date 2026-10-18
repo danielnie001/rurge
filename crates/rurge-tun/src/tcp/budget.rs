@@ -39,18 +39,26 @@ impl Budget {
     /// most `RX_MAX` (a window scale of 0, phase 3 M3 design 5.3 H2), the
     /// send buffer at most `tx_max`. When the budget is spent every new
     /// socket gets `min`, so the worst total is the budget and two times
-    /// `min` for each socket.
+    /// `min` for each socket. What is left is read and the share added in
+    /// one atomic step, so the bound holds when shards take at once too:
+    /// each take sees what every take before it took.
     pub(crate) fn take(&self) -> Sizes {
-        let left = self
-            .budget
-            .saturating_sub(self.used.load(Ordering::Relaxed));
-        let share = (left / DIVISOR).max(self.min);
-        let sizes = Sizes {
-            rx: share.min(RX_MAX),
-            tx: share.min(self.tx_max),
+        let sizes = |used: usize| {
+            let left = self.budget.saturating_sub(used);
+            let share = (left / DIVISOR).max(self.min);
+            Sizes {
+                rx: share.min(RX_MAX),
+                tx: share.min(self.tx_max),
+            }
         };
-        self.used.fetch_add(sizes.rx + sizes.tx, Ordering::Relaxed);
-        sizes
+        // the update always gives a value, so both answers are what it replaced
+        let (Ok(used) | Err(used)) =
+            self.used
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                    let taken = sizes(used);
+                    Some(used + taken.rx + taken.tx)
+                });
+        sizes(used)
     }
 
     pub(crate) fn give_back(&self, sizes: Sizes) {
