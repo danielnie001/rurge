@@ -59,9 +59,10 @@ pub(crate) enum Reason {
     /// connections.
     Busy,
     /// A segment with data past the window the TUN last told of, dropped
-    /// because the receive buffer had room to take the data in past it. Into
-    /// a full buffer the stack takes in nothing and answers, so that segment
-    /// is not dropped and not counted.
+    /// because the receive buffer had any room at all, however long the
+    /// segment: the stack would take in the part that fits, past the edge it
+    /// told of. Into a full buffer the stack takes in nothing and answers, so
+    /// that segment is not dropped and not counted.
     BeyondWindow,
     /// A reset not sent because of the limit on resets.
     RstLimited,

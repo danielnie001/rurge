@@ -13,14 +13,17 @@
 //! [`Edges::sent`]). That is the edge smoltcp itself works from: it records
 //! the acknowledgement number and the window of every segment it sends. A
 //! segment of the app's whose data ends past it ([`Edges::beyond`]) is dropped
-//! before the stack sees it if the receive buffer has room for the data, which
-//! the shard looks at. With the buffer full there is nothing to guard
-//! against: the stack takes in nothing of a segment with data (1636-1641) and
-//! answers it with an ACK, at most one a second (1433-1446). So that segment
-//! goes in, to be answered: it may be the probe of a sender with a closed
-//! window, one byte of new data at the receiver's acknowledgment number, and a
-//! sender must keep the connection open as long as its probes are
-//! acknowledged (RFC 9293 3.8.6.1).
+//! before the stack sees it if the receive buffer has any room at all, however
+//! long the segment is; the shard looks at that. Not room for the segment: the
+//! stack takes in the part of a segment that fits in its window (1660-1672),
+//! so a segment longer than the room would still take the end of the data it
+//! holds (`next_ack`) past the edge it told of. With the buffer full there is
+//! nothing to guard against: the stack takes in nothing of a segment with data
+//! (1636-1641) and answers it with an ACK, at most one a second (1433-1446). So
+//! that segment goes in, to be answered: it may be the probe of a sender with
+//! a closed window, one byte of new data at the receiver's acknowledgment
+//! number, and a sender must keep the connection open as long as its probes
+//! are acknowledged (RFC 9293 3.8.6.1).
 
 use super::Tuple;
 use crate::packet::Segment;
@@ -85,8 +88,8 @@ impl Edges {
     /// Whether `segment`, one of the app's, has data that ends past the edge
     /// of its connection. A segment without data does not, nor does one of a
     /// connection no edge is known of. It is the shard that drops the segment
-    /// that does, and only when the receive buffer has room for the data (see
-    /// the module).
+    /// that does, and only when the receive buffer has any room at all, however
+    /// long the segment is (see the module).
     pub(crate) fn beyond(&self, segment: &Segment) -> bool {
         segment.payload_len > 0
             && self.edges.get(&segment.tuple).is_some_and(|edge| {

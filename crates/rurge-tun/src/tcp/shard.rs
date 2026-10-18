@@ -387,12 +387,16 @@ impl ShardState {
                 .expect("a connection of the tuple table")
                 .handle;
             // Data past the edge of the window the stack last told of, with
-            // room in the buffer for it: the stack takes it in (smoltcp tcp.rs
-            // 1598-1599), and its sums on the window then fail and panic
-            // (693-701; design 5.3, H2). With the buffer full it takes in
-            // nothing of the segment (1636-1641) and answers it with an ACK
-            // (1433-1446), which is what a sender probing a closed window is
-            // kept probing by (RFC 9293 3.8.6.1): that segment goes in.
+            // any room in the buffer, however long the segment is: the stack
+            // takes in the part that fits (smoltcp tcp.rs 1598-1599,
+            // 1660-1672), and its sums on the window then fail and panic
+            // (693-701; design 5.3, H2). It is any room, not room for the
+            // segment: the part of a longer one that fits would still take the
+            // end of the data it holds past the edge it told of. With the
+            // buffer full it takes in nothing of the segment (1636-1641) and
+            // answers it with an ACK (1433-1446), which is what a sender
+            // probing a closed window is kept probing by (RFC 9293 3.8.6.1):
+            // that segment goes in.
             if self.device.edges.beyond(&segment) && self.has_room(handle) {
                 let (src, dst) = (segment.tuple.src.ip(), segment.tuple.dst.ip());
                 self.admission.count(Reason::BeyondWindow, src, dst);
