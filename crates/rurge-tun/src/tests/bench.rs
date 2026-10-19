@@ -282,6 +282,8 @@ async fn scripted_tcp_checks_every_port_before_it_sends_one() {
         .await
         .expect_err("a port it was not given");
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    // a table that has taken no memory: `HashMap::new` allocates at the first
+    // insert (std does not promise it, so this can only fail red)
     assert_eq!(scripted.table_bytes(), 0, "nothing is registered");
     // what is injected goes out in order: the other end gets this packet
     // first, so no SYN went before it

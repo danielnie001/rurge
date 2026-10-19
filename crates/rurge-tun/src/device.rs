@@ -11,6 +11,7 @@ pub trait Device: Send + Sync {
     fn recv<'a>(&'a self, into: &'a mut Vec<Vec<u8>>, max: usize) -> BoxFuture<'a, io::Result<()>>;
     /// Writes `packets` in order and leaves it empty. The memory device waits for room.
     fn send<'a>(&'a self, packets: &'a mut Vec<Vec<u8>>) -> BoxFuture<'a, io::Result<()>>;
+    /// The largest IP packet the device carries, in bytes; `Tun::start` panics for less than 1280.
     fn mtu(&self) -> usize;
 }
 

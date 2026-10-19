@@ -912,7 +912,7 @@ async fn waiting_for_what_a_far_end_has_read_is_woken_and_bounded() {
         },
     );
     let (mut app, relay, _handle) = relayed(&dialer, to).await;
-    // begun before the bytes are written, so only the reading can end it
+    // begun before the far end reads the bytes, so only the reading can end it
     let waiting = tokio::spawn({
         let dialer = dialer.clone();
         async move { dialer.wait_for(to, 3000, WITHIN).await }

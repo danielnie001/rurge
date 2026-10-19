@@ -373,6 +373,15 @@ impl ShardState {
     /// connections are not let go: the caller does that (`end_all`) when it has
     /// handed this over. No connection is made: the TUN is stopping, so a SYN is
     /// turned away.
+    ///
+    /// Unlike `turn`, it does not first advance the stack for the window
+    /// updates that the reads since the last turn made room for (P21), and has
+    /// no need to: every connection is aborted in this same turn, so no window
+    /// update is owed, and a segment past the edge of the window the stack last
+    /// told of is dropped by the guard while the buffer has room (`ingest`), as
+    /// in any turn, before it can reach the stack's window arithmetic. The
+    /// function of the same name below, in the shard's task, calls this one with
+    /// the lock held and hands what it gave to the writer.
     pub(crate) fn last_turn(&mut self, now: Instant, incoming: &mut Vec<Vec<u8>>) -> Vec<Vec<u8>> {
         let at = self.at(now);
         let mut opened = Vec::new();

@@ -55,10 +55,19 @@ const _: () = assert!(RX_MAX <= 65_535, "a larger buffer scales the window");
 /// H8), and the device's MTU is rurge's own choice.
 const MIN_MTU: usize = 1280;
 
+/// The core of the virtual adapter; [`Tun::start`] starts one.
 pub struct Tun;
 
 impl Tun {
-    /// Starts the TUN's tasks on the current tokio runtime.
+    /// Starts the TUN's tasks on the current tokio runtime. They run until
+    /// [`TunHandle::stop`] is called or the device fails. Dropping the handles
+    /// does not stop them, and once the last is gone nothing can.
+    ///
+    /// # Panics
+    ///
+    /// If the device's MTU is below 1280 (smoltcp 0.12 cannot work with less,
+    /// and the MTU is rurge's own choice), or if there is no tokio runtime to
+    /// start the tasks on.
     pub fn start(
         device: Arc<dyn Device>,
         dialer: Arc<dyn Dialer>,
@@ -150,16 +159,20 @@ impl Tun {
     }
 }
 
+/// What a TUN is started with.
 #[derive(Clone, Debug)]
 pub struct TunOptions {
     /// Whether IPv6 packets are handled; with it off they are dropped as unsupported.
     pub ipv6: bool,
+    /// REJECT-DROP: how long a session holds the connection it was rejected on, read and written by nobody, before the TUN closes its side (a FIN). A stop ends the hold at once. After it the TUN waits for the app to close its side, for `linger` at the most.
     pub drop_hold: Duration,
     /// How many shards the TCP stack is divided into, each with a stack and a task of its own. The default was chosen by the benchmark gate; see the phase 3 / M3a plan's execution record row 10.
     pub shards: usize,
     /// The smallest buffer of a TCP socket, each way: what every socket made once the budget is spent gets. The default was chosen by the benchmark gate; see the phase 3 / M3a plan's execution record row 10.
     pub buffer_min: usize,
+    /// The largest send buffer of a TCP socket. A socket's buffers are sized by what is left of `budget` when it is made, at least `buffer_min`; this caps the send buffer, `RX_MAX` the receive buffer. The default was chosen by the benchmark gate; see the phase 3 / M3a plan's execution record row 10.
     pub tx_max: usize,
+    /// The bytes of TCP socket buffers, both ways, that the TUN shares out as sockets are made: a new socket takes a share of what is left. Once it is spent every new socket gets `buffer_min` each way, so the buffers in all can come to more than this. The default was chosen by the benchmark gate; see the phase 3 / M3a plan's execution record row 10.
     pub budget: usize,
     /// The most TCP sockets the whole TUN has; a SYN over it is answered with a reset.
     pub max_sockets: usize,
@@ -167,13 +180,15 @@ pub struct TunOptions {
     pub max_half_open: usize,
     /// How long a connection has to complete its handshake before it is reset.
     pub half_open_timeout: Duration,
-    /// The most that the connection of a stream that was dropped stays, waiting for the app to acknowledge its FIN; past that it is reset.
+    /// The most that the connection of a stream that was dropped stays, waiting for the app to acknowledge its FIN; past that it is reset. Also the most that REJECT-DROP waits, after the hold (`drop_hold`), for the app to close its side while the TUN reads and throws away what it sends; past that the connection is reset.
     pub linger: Duration,
     /// A connection idle for this long sends the app a keep-alive.
     pub keep_alive: Duration,
     /// A connection that has had nothing from the app for this long is reset.
     pub timeout: Duration,
+    /// How many packets the device's reader can queue for one shard. A packet for a shard whose queue is full is dropped and counted (`queue_full`).
     pub shard_queue: usize,
+    /// How many batches of packets (one for each turn of a shard) can wait for the writer. A shard whose batch finds the queue full waits for room.
     pub writer_queue: usize,
 }
 
@@ -259,7 +274,11 @@ struct Inner {
     admission: Arc<Admission>,
 }
 
+/// A running TUN. Clone it to share it. It has no `Drop`: dropping every handle
+/// does not stop the TUN, and nothing is left that could. Call
+/// [`TunHandle::stop`], and [`TunHandle::join`] to wait for the end.
 #[derive(Clone)]
+#[must_use = "dropping every handle leaves the TUN running with nothing that can stop it"]
 pub struct TunHandle {
     inner: Arc<Inner>,
 }
@@ -270,20 +289,33 @@ impl TunHandle {
     /// Each shard takes a last turn: the packets already queued for it go in,
     /// and every connection it has is aborted, so each app is sent a reset,
     /// which the writer writes before it ends (it gives the device a grace for
-    /// that, and no more). The sessions end with their connections; a dial that
-    /// is under way is not cancelled, it finds its stream reset when it comes
-    /// back and the relay ends at once.
+    /// that, and no more).
+    ///
+    /// The sessions are not cancelled, and a session ends with its connection
+    /// only when it touches its stream. A dial that is under way is not
+    /// cancelled: it finds the stream reset when it comes back, and the relay
+    /// ends at once. A relay that is reading or writing the stream meets the
+    /// reset the same way. But a relay that waits on its upstream in both
+    /// directions (writing to one that takes nothing, reading from one that
+    /// says nothing) touches the stream in neither, and runs on until the
+    /// upstream moves, or the relay's own idle timeout fires, or the session
+    /// is cancelled from outside the TUN. [`TunHandle::join`] waits for such a
+    /// relay too, so whoever stops a TUN and joins it has to cancel its
+    /// sessions or bound the wait.
     pub fn stop(&self) {
         self.inner.life.end(Ending::Stopped);
     }
 
     /// Every task of the TUN, sessions included, has ended: why it ended, the
-    /// first reason given. Answers the same every time.
+    /// first reason given. Answers the same every time. A session ends as
+    /// [`TunHandle::stop`] says, so a relay stuck on its upstream keeps this
+    /// waiting.
     pub async fn join(&self) -> Ending {
         self.inner.tasks.wait().await;
         self.inner.life.ending()
     }
 
+    /// The packets dropped so far, for each reason.
     pub fn counters(&self) -> Counters {
         self.inner.stats.counters()
     }
@@ -352,18 +384,32 @@ pub enum Ending {
     DeviceFailed(String),
 }
 
+/// What the TUN has counted of the packets it dropped, one count for each
+/// reason (the logs call a reason by the name of its field), and of the panics
+/// of the TCP stack.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
+    /// Packets that cannot be read: a version other than 4 and 6, lengths that do not fit, an IPv4 header checksum that does not hold, a transport header that is cut short or has port 0.
     pub malformed: u64,
+    /// Fragments, which the TUN does not reassemble.
     pub fragment: u64,
+    /// Packets with an address that no real packet through the adapter has: an unspecified, loopback or multicast address at either end, the limited broadcast as the destination, an IPv4-mapped IPv6 address. Counted, never logged.
     pub martian: u64,
+    /// Packets nothing handles: IPv6 while it is off, extension headers, protocols other than TCP, UDP and ICMP, an ICMP that is no echo request, and UDP and ICMP echo requests, which nothing handles yet.
     pub unsupported: u64,
+    /// Packets for a shard whose queue was full.
     pub queue_full: u64,
+    /// SYNs to an address of rurge's own space that names nothing.
     pub unknown_fake: u64,
+    /// SYNs turned away because of the limits on sockets and on half-open connections.
     pub busy: u64,
+    /// Segments with data past the window the TUN last told of, dropped because the receive buffer had room.
     pub beyond_window: u64,
+    /// Resets not sent because of the limit on resets.
     pub rst_limited: u64,
+    /// Echo requests or replies held back by the limit on ICMP; nothing counts it yet.
     pub icmp_limited: u64,
+    /// Times the TCP stack of a shard panicked and the shard was started over, its connections reset.
     pub stack_panics: u64,
 }
 

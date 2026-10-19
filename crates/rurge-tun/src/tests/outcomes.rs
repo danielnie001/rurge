@@ -302,9 +302,11 @@ async fn stop_while_waiting_for_the_apps_end_ends_it() {
 /// `TunOptions` is public: a hold or a linger too long to add to a time is no
 /// reason for a panic. The session holds the connection as long as it can, and
 /// the stop ends it: a hold that never ends, and a linger that never does while
-/// the TUN waits for the app's end.
+/// the TUN waits for the app's end. What this pins is that the stop ends both;
+/// a panic in the session task it cannot see, for `join` counts a task that
+/// panicked as ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn holds_too_long_to_add_do_not_panic() {
+async fn a_hold_or_a_linger_that_never_ends_ends_with_the_stop() {
     for (drop_hold, waiting_for_the_app) in
         [(Duration::MAX, false), (Duration::from_millis(20), true)]
     {

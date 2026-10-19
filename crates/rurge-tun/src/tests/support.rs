@@ -34,8 +34,10 @@ pub(crate) fn rig(options: TunOptions) -> Rig {
     rig_on(MemoryDevice::pair(1500, 4096), options)
 }
 
-/// Every test that starts a TUN starts it here, so that a change of what
-/// `Tun::start` takes is a change of this function only.
+/// A rig on a memory device, whose app end is `end`. The TUN is started by
+/// `tun_on`, and so in the end by `tun_dialing`, the one place that calls
+/// `Tun::start`: a change of what `Tun::start` takes is a change of that
+/// function only.
 pub(crate) fn rig_on((device, end): (MemoryDevice, AppEnd), options: TunOptions) -> Rig {
     let (tun, dialer) = tun_on(device, options);
     Rig {
