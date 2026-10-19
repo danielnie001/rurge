@@ -18,7 +18,7 @@ use super::{
     TIME_WAIT_GRACE, TunStream, Tuple,
 };
 use crate::packet::{self, Reason, Segment};
-use crate::session;
+use crate::session::{self, Holds};
 use crate::space::{self, Place, STACK_V4, STACK_V6};
 use crate::{Life, TunOptions};
 use rurge_inbound::Dialer;
@@ -363,6 +363,29 @@ impl ShardState {
             wake_at: [stack_at, reap_at, sweep_at].into_iter().flatten().min(),
             more: taken == INGRESS_PER_WAKE || !drained,
         }
+    }
+
+    /// The shard's last turn, taken when the TUN stops: every packet in
+    /// `incoming` goes in, though an ordinary turn takes in at most
+    /// `INGRESS_PER_WAKE` (nothing waits behind this one), and then every socket
+    /// is aborted and the stack is advanced once, so that each sends the reset it
+    /// owes its app. What the stack sent comes back, to be written. The
+    /// connections are not let go: the caller does that (`end_all`) when it has
+    /// handed this over. No connection is made: the TUN is stopping, so a SYN is
+    /// turned away.
+    pub(crate) fn last_turn(&mut self, now: Instant, incoming: &mut Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        let at = self.at(now);
+        let mut opened = Vec::new();
+        for packet in incoming.drain(..) {
+            self.ingest(packet, now, at, &mut opened);
+        }
+        debug_assert!(opened.is_empty(), "a stopping TUN makes no connection");
+        for conn in self.conns.values() {
+            self.sockets.get_mut::<tcp::Socket>(conn.handle).abort();
+        }
+        self.iface
+            .poll_egress(at, &mut self.device, &mut self.sockets);
+        std::mem::take(&mut self.device.tx)
     }
 
     /// One packet into the stack. A segment of a connection goes to its
@@ -858,7 +881,8 @@ fn carries_panic_marker(packet: &[u8]) -> bool {
 /// takes a turn in the lock; then, out of it, starts the sessions of the new
 /// connections and hands what the stack sent to the writer, waiting while
 /// the writer's queue is full. After a turn that reached a bound it goes on
-/// at once, after a yield.
+/// at once, after a yield. At the stop it takes a last turn (`last_turn`) and
+/// lets go of every connection.
 ///
 /// The turn is where smoltcp runs, and it runs where a panic is caught
 /// (design 5.3, "the last line"): the shard is rebuilt, and the task goes on.
@@ -872,6 +896,7 @@ pub(crate) async fn run(
     mut packets: mpsc::Receiver<Vec<u8>>,
     writer: mpsc::Sender<Vec<Vec<u8>>>,
     dialer: Arc<dyn Dialer>,
+    holds: Holds,
     life: Arc<Life>,
     tasks: TaskTracker,
 ) {
@@ -928,22 +953,65 @@ pub(crate) async fn run(
         };
         for opened in turn.opened {
             let stream = TunStream::new(shard.clone(), opened.id, opened.shared);
-            tasks.spawn(session::serve(stream, dialer.clone(), opened.tuple));
+            tasks.spawn(session::serve(
+                stream,
+                dialer.clone(),
+                opened.tuple,
+                holds,
+                life.clone(),
+            ));
         }
-        if !turn.out.is_empty() {
-            tokio::select! {
-                biased;
-                _ = life.stopped() => break,
-                sent = writer.send(turn.out) => {
-                    // the writer has ended: so has the TUN
-                    if sent.is_err() {
-                        break;
-                    }
-                }
-            }
+        // The stop does not give this send up: a reset made for a SYN in a
+        // turn that was under way when the stop came would be lost with it.
+        // The send fails only once the writer has ended, which it does at the
+        // latest a grace after the stop, so this is no wait without an end.
+        if !turn.out.is_empty() && writer.send(turn.out).await.is_err() {
+            // the writer has ended: so has the TUN
+            break;
         }
         more = turn.more;
         wake_at = turn.wake_at;
     }
+    // The stop takes one last turn, unless the writer has ended (the device
+    // failed, or it ran out of patience with a device that takes nothing): the
+    // resets would have no one to write them.
+    if !writer.is_closed() {
+        last_turn(&shard, &mut packets, &mut incoming, &writer).await;
+    }
     shard.state().end_all();
+}
+
+/// The shard's last turn, at the stop (design 5.2, step 1): nothing more is
+/// queued for the shard from here on, and what is queued goes in, a SYN
+/// among it turned away with a reset since the TUN is stopping. Then every
+/// socket is aborted and one egress pass sends the reset each one owes its app.
+/// What the stack sent is handed to the writer, waiting for room in its queue
+/// as long as the writer is there to make it; the stop does not give the send
+/// up. The turn is taken where a panic is caught, like any turn: the shard is
+/// rebuilt, which resets its connections too.
+async fn last_turn(
+    shard: &Shard,
+    packets: &mut mpsc::Receiver<Vec<u8>>,
+    incoming: &mut Vec<Vec<u8>>,
+    writer: &mpsc::Sender<Vec<Vec<u8>>>,
+) {
+    packets.close();
+    while let Ok(packet) = packets.try_recv() {
+        incoming.push(packet);
+    }
+    let out = catch_unwind(AssertUnwindSafe(|| {
+        shard.state().last_turn(Instant::now(), incoming)
+    }));
+    match out {
+        Ok(out) => {
+            // fails only once the writer has ended: nothing is left to do
+            if !out.is_empty() {
+                let _ = writer.send(out).await;
+            }
+        }
+        Err(panic) => {
+            drop(shard.lock(Cause::Panic(panic_text(&*panic))));
+            drop(panic);
+        }
+    }
 }

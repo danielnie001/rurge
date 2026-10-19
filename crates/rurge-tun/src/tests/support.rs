@@ -2,11 +2,12 @@
 //! bounded, streams of the pattern, and the builders and readers of the
 //! packets they make by hand.
 
-use crate::device::{AppEnd, MemoryDevice};
+use crate::device::{AppEnd, Device, MemoryDevice};
 use crate::stats::Stats;
 use crate::tcp::{Admission, Budget, Shard};
 use crate::testing::{AppStack, AppTcp, FakeDialer, pattern};
 use crate::{Life, Tun, TunHandle, TunOptions};
+use rurge_inbound::Dialer;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, TcpControl, TcpPacket, TcpRepr,
@@ -44,12 +45,41 @@ pub(crate) fn rig_on((device, end): (MemoryDevice, AppEnd), options: TunOptions)
     }
 }
 
+/// A rig on a device of the test's own, with the app's stack on `end`, the app
+/// end of the memory device that device wraps.
+pub(crate) fn rig_with(device: Arc<dyn Device>, end: AppEnd, options: TunOptions) -> Rig {
+    let (tun, dialer) = tun_with(device, options);
+    Rig {
+        tun,
+        app: AppStack::start(end),
+        dialer,
+    }
+}
+
 /// The TUN half of `rig_on`, on the current runtime: for a test that runs
-/// the app's stack on another one. The only call of `Tun::start` is here.
+/// the app's stack on another one.
 pub(crate) fn tun_on(device: MemoryDevice, options: TunOptions) -> (TunHandle, Arc<FakeDialer>) {
+    tun_with(Arc::new(device), options)
+}
+
+/// The same on any device.
+pub(crate) fn tun_with(
+    device: Arc<dyn Device>,
+    options: TunOptions,
+) -> (TunHandle, Arc<FakeDialer>) {
     let dialer = FakeDialer::new();
-    let tun = Tun::start(Arc::new(device), dialer.clone(), options);
+    let tun = tun_dialing(device, dialer.clone(), options);
     (tun, dialer)
+}
+
+/// The same with a `Dialer` of the test's own. The only call of `Tun::start` is
+/// here.
+pub(crate) fn tun_dialing(
+    device: Arc<dyn Device>,
+    dialer: Arc<dyn Dialer>,
+    options: TunOptions,
+) -> TunHandle {
+    Tun::start(device, dialer, options)
 }
 
 /// One shard on its own, for a test that takes its turns by hand, with what a
@@ -481,4 +511,9 @@ pub(crate) fn is_reset(packet: &[u8]) -> bool {
 /// Whether `packet` is a TCP segment with the SYN flag.
 pub(crate) fn is_syn(packet: &[u8]) -> bool {
     tcp_header(packet).is_some_and(|(header, _)| packet[header + 13] & 0x02 != 0)
+}
+
+/// Whether `packet` is a TCP segment with the FIN flag.
+pub(crate) fn is_fin(packet: &[u8]) -> bool {
+    tcp_header(packet).is_some_and(|(header, _)| packet[header + 13] & 0x01 != 0)
 }

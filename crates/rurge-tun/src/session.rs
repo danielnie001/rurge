@@ -1,13 +1,44 @@
 //! The session of a TCP connection through the TUN (phase 3 M3 design 5.6):
 //! once the handshake with the app is over, the `Dialer` dials where the app
-//! connected to, and relays between the two.
+//! connected to, and relays between the two. A rejection is answered with a
+//! reset, except REJECT-DROP, which is answered with nothing for a while.
 
 use crate::tcp::{TunStream, Tuple};
+use crate::{Life, TunOptions};
 use rurge_config::{HostName, ListenerKind, SessionInfo};
-use rurge_inbound::Dialer;
+use rurge_inbound::{DialError, Dialer};
+use rurge_proto::RejectKind;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
-pub(crate) async fn serve(stream: TunStream, dialer: Arc<dyn Dialer>, tuple: Tuple) {
+/// How long a session keeps a connection it neither relays nor resets.
+#[derive(Clone, Copy)]
+pub(crate) struct Holds {
+    /// REJECT-DROP: how long the connection is held, read and written by
+    /// nobody, before the TUN closes its side.
+    pub(crate) drop_hold: Duration,
+    /// REJECT-DROP: after that, the longest the TUN waits for the app to close
+    /// its side, reading and discarding what it sends.
+    pub(crate) linger: Duration,
+}
+
+impl From<&TunOptions> for Holds {
+    fn from(options: &TunOptions) -> Holds {
+        Holds {
+            drop_hold: options.drop_hold,
+            linger: options.linger,
+        }
+    }
+}
+
+pub(crate) async fn serve(
+    stream: TunStream,
+    dialer: Arc<dyn Dialer>,
+    tuple: Tuple,
+    holds: Holds,
+    life: Arc<Life>,
+) {
     if stream.established().await.is_err() {
         return;
     }
@@ -17,10 +48,49 @@ pub(crate) async fn serve(stream: TunStream, dialer: Arc<dyn Dialer>, tuple: Tup
         listener: ListenerKind::Tun,
         ..SessionInfo::tcp(HostName::Ip(tuple.dst.ip()), tuple.dst.port())
     };
-    // a rejection or a failure lets the stream go, which resets the connection
-    if let Ok(dialed) = dialer.dial(session).await {
-        dialer
-            .relay(Box::new(stream), dialed.stream, dialed.handle)
-            .await;
+    match dialer.dial(session).await {
+        Ok(dialed) => {
+            dialer
+                .relay(Box::new(stream), dialed.stream, dialed.handle)
+                .await;
+        }
+        // Boxed: the future of this rare path (two timers and a copy) would
+        // make the future of every session larger, by some 270 bytes.
+        Err(DialError::Reject {
+            kind: RejectKind::Drop,
+            ..
+        }) => Box::pin(hold_in_silence(stream, holds, &life)).await,
+        // any other rejection and a failed dial let the stream go, which
+        // resets the connection
+        Err(_) => {}
     }
+}
+
+/// REJECT-DROP (design 5.6): the connection is held for `drop_hold` with
+/// nobody reading or writing it, as the HTTP listener holds the socket of a
+/// request it drops, and then the TUN closes its side, a FIN. A stop ends the
+/// hold at once.
+///
+/// The stream cannot be let go right after its `shutdown`: the drop of a stream
+/// resets a connection the app may still send on
+/// (`ShardState::stream_dropped`), so the FIN would be turned into a reset
+/// before the app read it. So the TUN reads what the app sends, and throws it
+/// away, until the app's own FIN, for `linger` at the most. Then it lets the
+/// stream go: that ends well if the app's FIN came, and resets the connection
+/// if it did not. A stop during the wait resets the connection, which ends the
+/// read with an error.
+async fn hold_in_silence(mut stream: TunStream, holds: Holds, life: &Life) {
+    tokio::select! {
+        biased;
+        _ = life.stopped() => return,
+        _ = tokio::time::sleep(holds.drop_hold) => {}
+    }
+    if stream.shutdown().await.is_err() {
+        return;
+    }
+    let _ = tokio::time::timeout(
+        holds.linger,
+        tokio::io::copy(&mut stream, &mut tokio::io::sink()),
+    )
+    .await;
 }

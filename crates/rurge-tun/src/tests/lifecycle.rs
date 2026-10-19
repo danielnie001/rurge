@@ -7,8 +7,8 @@
 
 use super::hazards::{ACK, PSH_ACK, app4, open_by_hand};
 use super::support::{
-    WITHIN, addr, data_segment_v4, eventually, hello, is_reset, is_syn, lone_shard, read_pattern,
-    read_pattern_from, rig, segment_v4, syn_v4, tcp_header, tcp_payload_len, within,
+    WITHIN, addr, data_segment_v4, eventually, hello, is_fin, is_reset, is_syn, lone_shard,
+    read_pattern, read_pattern_from, rig, segment_v4, syn_v4, tcp_header, tcp_payload_len, within,
 };
 use crate::tcp::shard::Records;
 use crate::tcp::{ConnId, ConnShared, Outcome, Shard, TunStream};
@@ -26,11 +26,6 @@ use tokio::time::timeout;
 
 const FIN_ACK: u8 = 0x11;
 const RST_ACK: u8 = 0x14;
-
-/// Whether `packet` is a TCP segment with the FIN flag.
-fn is_fin(packet: &[u8]) -> bool {
-    tcp_header(packet).is_some_and(|(header, _)| packet[header + 13] & 0x01 != 0)
-}
 
 /// The TCP payload of every packet in `out`, in order.
 fn payloads(out: &[Vec<u8>]) -> Vec<u8> {

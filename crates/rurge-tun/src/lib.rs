@@ -23,6 +23,7 @@ mod writer;
 
 use device::Device;
 use rurge_inbound::Dialer;
+use session::Holds;
 use stats::Stats;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -103,6 +104,7 @@ impl Tun {
                 packets,
                 to_writer.clone(),
                 dialer.clone(),
+                Holds::from(&options),
                 life.clone(),
                 tasks.clone(),
             ));
@@ -204,12 +206,28 @@ pub(crate) struct Life {
 }
 
 impl Life {
-    pub(crate) fn end(&self, ending: Ending) {
-        self.ending
-            .lock()
-            .expect("the TUN's ending")
-            .get_or_insert(ending);
+    /// Ends the TUN with `ending`, unless it is ending already: the first
+    /// ending stays. Whether this call gave it.
+    pub(crate) fn end(&self, ending: Ending) -> bool {
+        let first = {
+            let mut slot = self.ending.lock().expect("the TUN's ending");
+            let first = slot.is_none();
+            slot.get_or_insert(ending);
+            first
+        };
         self.stop.cancel();
+        first
+    }
+
+    /// The device failed, reading or writing: the TUN ends with the failure,
+    /// unless it was ending already (after a stop, say), when that stays the
+    /// ending. Only the call that gives the ending says so, so that it is said
+    /// once for the TUN, though the reader and the writer may both meet the
+    /// failure. The error's text is the device's own and has no address in it.
+    pub(crate) fn device_failed(&self, error: &std::io::Error) {
+        if self.end(Ending::DeviceFailed(error.to_string())) {
+            tracing::warn!(%error, "tun: the device failed; the TUN has ended");
+        }
     }
 
     pub(crate) fn stopped(&self) -> WaitForCancellationFuture<'_> {
@@ -247,11 +265,20 @@ pub struct TunHandle {
 }
 
 impl TunHandle {
+    /// Stops the TUN, which takes a moment to end (see [`TunHandle::join`]). A new
+    /// SYN is answered with a reset from now on. The device is not read any more.
+    /// Each shard takes a last turn: the packets already queued for it go in,
+    /// and every connection it has is aborted, so each app is sent a reset,
+    /// which the writer writes before it ends (it gives the device a grace for
+    /// that, and no more). The sessions end with their connections; a dial that
+    /// is under way is not cancelled, it finds its stream reset when it comes
+    /// back and the relay ends at once.
     pub fn stop(&self) {
         self.inner.life.end(Ending::Stopped);
     }
 
-    /// Every task of the TUN, sessions included, has ended. Answers the same every time.
+    /// Every task of the TUN, sessions included, has ended: why it ended, the
+    /// first reason given. Answers the same every time.
     pub async fn join(&self) -> Ending {
         self.inner.tasks.wait().await;
         self.inner.life.ending()
@@ -314,9 +341,14 @@ impl TunHandle {
     }
 }
 
+/// Why a TUN ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ending {
+    /// `TunHandle::stop` was called.
     Stopped,
+    /// The device failed, reading or writing, with an error of this text. The
+    /// TUN ends as it does for a stop, but for a write that failed being the
+    /// last the writer makes. Said once, at WARN, when it happens.
     DeviceFailed(String),
 }
 

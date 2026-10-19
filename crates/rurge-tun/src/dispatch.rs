@@ -2,11 +2,11 @@
 //! to where it is handled, or is dropped and counted. It never waits for a
 //! queue: a queue that is full drops the packet.
 
+use crate::Life;
 use crate::device::Device;
 use crate::packet::{self, Reason, Transport};
 use crate::stats::Stats;
 use crate::tcp::Tuple;
-use crate::{Ending, Life};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -31,7 +31,7 @@ pub(crate) async fn run(
             received = device.recv(&mut batch, RECV_BATCH) => received,
         };
         if let Err(error) = received {
-            life.end(Ending::DeviceFailed(error.to_string()));
+            life.device_failed(&error);
             return;
         }
         for packet in batch.drain(..) {
