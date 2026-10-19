@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -20,6 +20,25 @@ const CHUNK: usize = 16 * 1024;
 struct Counters {
     received: watch::Sender<u64>,
     sent: AtomicU64,
+    /// Connections accepted and not over yet.
+    open: AtomicUsize,
+}
+
+/// A connection counts as open for as long as this is alive, wherever the
+/// task that serves it ends.
+struct Open(Arc<Counters>);
+
+impl Open {
+    fn begin(counters: &Arc<Counters>) -> Open {
+        counters.open.fetch_add(1, Ordering::Relaxed);
+        Open(counters.clone())
+    }
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// A server on `127.0.0.1` and a port of the system's choosing, for any
@@ -58,6 +77,7 @@ impl Upstream {
         let counters = Arc::new(Counters {
             received: watch::channel(0).0,
             sent: AtomicU64::new(0),
+            open: AtomicUsize::new(0),
         });
         let task = tokio::spawn({
             let counters = counters.clone();
@@ -68,7 +88,12 @@ impl Upstream {
                     tokio::select! {
                         accepted = listener.accept() => {
                             if let Ok((stream, _)) = accepted {
-                                connections.spawn(handler(stream, counters.clone()));
+                                let open = Open::begin(&counters);
+                                let served = handler(stream, counters.clone());
+                                connections.spawn(async move {
+                                    let _open = open;
+                                    served.await;
+                                });
                             }
                         }
                         // finished connections do not pile up
@@ -105,6 +130,12 @@ impl Upstream {
     /// Bytes written to the connections so far.
     pub fn sent(&self) -> u64 {
         self.counters.sent.load(Ordering::Relaxed)
+    }
+
+    /// Connections accepted whose serving has not ended: the server is done with
+    /// (and has dropped) every one that is not counted.
+    pub fn open(&self) -> usize {
+        self.counters.open.load(Ordering::Relaxed)
     }
 }
 

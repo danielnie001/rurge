@@ -165,6 +165,7 @@ pub struct TunOptions {
     pub max_half_open: usize,
     /// How long a connection has to complete its handshake before it is reset.
     pub half_open_timeout: Duration,
+    /// The most that the connection of a stream that was dropped stays, waiting for the app to acknowledge its FIN; past that it is reset.
     pub linger: Duration,
     /// A connection idle for this long sends the app a keep-alive.
     pub keep_alive: Duration,
@@ -288,6 +289,28 @@ impl TunHandle {
     #[cfg(test)]
     pub(crate) fn half_open(&self) -> usize {
         self.inner.admission.half_open()
+    }
+
+    /// What the shards keep of their connections besides the sockets, added
+    /// up: every count is 0 once no connection is left behind.
+    #[cfg(test)]
+    pub(crate) fn records(&self) -> tcp::shard::Records {
+        self.inner
+            .shards
+            .iter()
+            .map(|shard| shard.state().records())
+            .fold(tcp::shard::Records::default(), |all, one| all + one)
+    }
+
+    /// The bytes waiting in the send buffers of every TCP socket, and the room
+    /// those buffers have in all.
+    #[cfg(test)]
+    pub(crate) fn send_buffers(&self) -> (usize, usize) {
+        self.inner
+            .shards
+            .iter()
+            .map(|shard| shard.state().send_buffers())
+            .fold((0, 0), |all, one| (all.0 + one.0, all.1 + one.1))
     }
 }
 

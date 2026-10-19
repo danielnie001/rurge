@@ -128,6 +128,8 @@ struct Timers {
     timeout: Duration,
     /// How long a connection has to complete its handshake.
     half_open: Duration,
+    /// How long a connection stays once its stream is gone.
+    linger: Duration,
 }
 
 impl From<&TunOptions> for Timers {
@@ -136,6 +138,7 @@ impl From<&TunOptions> for Timers {
             keep_alive: options.keep_alive,
             timeout: options.timeout,
             half_open: options.half_open_timeout,
+            linger: options.linger,
         }
     }
 }
@@ -172,6 +175,9 @@ pub(crate) struct ShardState {
     /// The connections still half-open by the time they run out, soonest
     /// first: what `reap` aborts when the time comes.
     half_open: BTreeSet<(Instant, ConnId)>,
+    /// The connections whose stream is gone, by the time their `linger` runs
+    /// out, soonest first: what `reap` aborts when the time comes.
+    lingering: BTreeSet<(Instant, ConnId)>,
     budget: Arc<Budget>,
     /// The caps and limits of the whole TUN, which a new SYN meets.
     admission: Arc<Admission>,
@@ -200,8 +206,10 @@ pub(crate) struct Conn {
     half_open: Option<Instant>,
     /// The stream shut its write side down.
     pub(crate) shut: bool,
-    /// The stream is gone.
-    pub(crate) dropped: bool,
+    /// While the stream is gone: the time its `linger` runs out, when the
+    /// connection is aborted if it is still here. `Some` from the drop of the
+    /// stream until the connection goes.
+    pub(crate) dropped: Option<Instant>,
 }
 
 /// What one turn of a shard gave out.
@@ -270,6 +278,7 @@ impl ShardState {
             seed,
             next_sweep: epoch + SWEEP,
             half_open: BTreeSet::new(),
+            lingering: BTreeSet::new(),
             budget,
             admission,
             timers,
@@ -579,7 +588,7 @@ impl ShardState {
             time_wait: None,
             half_open: Some(deadline),
             shut: false,
-            dropped: false,
+            dropped: None,
         };
         self.conns.insert(id, conn);
         self.by_tuple.insert(tuple, id);
@@ -596,10 +605,15 @@ impl ShardState {
     /// out). Neither goes while its stream is there to read what the app
     /// sent before its FIN (P12), unless the app reset the connection. First
     /// the connections that ran out of time for their handshake are aborted
-    /// (`expire_half_open`). When a connection kept for its grace or a
-    /// handshake that is still going on is to be looked at next, if any is.
+    /// (`expire_half_open`), and those whose stream has been gone for `linger`
+    /// (`expire_lingering`). When a connection kept for its grace, a handshake
+    /// that is still going on or a stream that is gone is to be looked at
+    /// next, if any is.
     fn reap(&mut self, now: Instant) -> Option<Instant> {
-        let mut next = self.expire_half_open(now);
+        let mut next = [self.expire_half_open(now), self.expire_lingering(now)]
+            .into_iter()
+            .flatten()
+            .min();
         let ids: Vec<ConnId> = if now >= self.next_sweep {
             self.next_sweep = now + SWEEP;
             self.touched.clear();
@@ -613,8 +627,9 @@ impl ShardState {
                 continue;
             };
             let socket = self.sockets.get::<tcp::Socket>(conn.handle);
-            let unread =
-                !conn.dropped && conn.closed_by != Some(Outcome::Reset) && socket.recv_queue() > 0;
+            let unread = conn.dropped.is_none()
+                && conn.closed_by != Some(Outcome::Reset)
+                && socket.recv_queue() > 0;
             match socket.state() {
                 tcp::State::TimeWait => {
                     let due = *conn.time_wait.get_or_insert(now) + TIME_WAIT_GRACE;
@@ -663,6 +678,50 @@ impl ShardState {
         None
     }
 
+    /// Aborts the connections whose stream has been gone for `linger`: what
+    /// they were waiting for (the app's acknowledgement of a FIN, say) did not
+    /// come. As with a handshake that ran out of time, the socket sends its
+    /// reset in a later egress pass and `reap` lets the connection go once that
+    /// is out and not before. When the soonest of the streams that are gone
+    /// runs out its time, if any waits.
+    fn expire_lingering(&mut self, now: Instant) -> Option<Instant> {
+        while let Some(&(deadline, id)) = self.lingering.first() {
+            if deadline > now {
+                return Some(deadline);
+            }
+            self.lingering.pop_first();
+            let conn = self
+                .conns
+                .get(&id)
+                .expect("a connection of the linger table");
+            self.sockets.get_mut::<tcp::Socket>(conn.handle).abort();
+            self.touched.insert(id);
+        }
+        None
+    }
+
+    /// The stream of connection `id` was dropped, at `now`. The connection is
+    /// reset unless it is ending well: the stream shut its own side down, the
+    /// app can send nothing more, and nothing the app sent is left unread.
+    /// (smoltcp's `may_recv` is true while the receive buffer holds a byte, so
+    /// the `recv_queue` test says the last of these a second time.) A
+    /// connection that is ending well has its FIN on its way and waits for the
+    /// app to acknowledge it. Either way nobody reads the connection from now
+    /// on, so it stays for `linger` at the most.
+    pub(crate) fn stream_dropped(&mut self, id: ConnId, now: Instant) {
+        let Some(conn) = self.conns.get_mut(&id) else {
+            return;
+        };
+        let deadline = ends_at(now, self.timers.linger);
+        conn.dropped = Some(deadline);
+        self.lingering.insert((deadline, id));
+        let socket = self.sockets.get_mut::<tcp::Socket>(conn.handle);
+        if !conn.shut || socket.may_recv() || socket.recv_queue() > 0 {
+            socket.abort();
+        }
+        self.touched.insert(id);
+    }
+
     /// The handshake of a connection is over, or the connection is going
     /// without it: it stops counting as half-open. Once for each connection.
     fn end_half_open(&mut self, id: ConnId) {
@@ -685,6 +744,9 @@ impl ShardState {
         let Some(conn) = self.conns.remove(&id) else {
             return;
         };
+        if let Some(deadline) = conn.dropped {
+            self.lingering.remove(&(deadline, id));
+        }
         // the tuple's entries go with the connection that has the tuple, if it
         // is this one
         if self.by_tuple.get(&conn.tuple) == Some(&id) {
@@ -715,6 +777,63 @@ impl ShardState {
     #[cfg(test)]
     pub(crate) fn edge_count(&self) -> usize {
         self.device.edges.len()
+    }
+
+    /// What the shard keeps of its connections, counted.
+    #[cfg(test)]
+    pub(crate) fn records(&self) -> Records {
+        Records {
+            conns: self.conns.len(),
+            by_tuple: self.by_tuple.len(),
+            edges: self.device.edges.len(),
+            touched: self.touched.len(),
+            half_open: self.half_open.len(),
+            lingering: self.lingering.len(),
+        }
+    }
+
+    /// The bytes waiting in the send buffers of the shard's sockets, and the
+    /// room those buffers have in all.
+    #[cfg(test)]
+    pub(crate) fn send_buffers(&self) -> (usize, usize) {
+        use smoltcp::socket::AnySocket;
+        self.sockets
+            .iter()
+            .filter_map(|(_, socket)| tcp::Socket::downcast(socket))
+            .fold((0, 0), |(queued, room), socket| {
+                (queued + socket.send_queue(), room + socket.send_capacity())
+            })
+    }
+}
+
+/// What a shard keeps of its connections besides their sockets: the two
+/// tables, the guard's edges, the set of those a turn or a stream touched, and
+/// the sets of those still half-open and of those whose stream is gone. Every
+/// count is 0 when no connection is left behind.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Records {
+    pub(crate) conns: usize,
+    pub(crate) by_tuple: usize,
+    pub(crate) edges: usize,
+    pub(crate) touched: usize,
+    pub(crate) half_open: usize,
+    pub(crate) lingering: usize,
+}
+
+#[cfg(test)]
+impl std::ops::Add for Records {
+    type Output = Records;
+
+    fn add(self, other: Records) -> Records {
+        Records {
+            conns: self.conns + other.conns,
+            by_tuple: self.by_tuple + other.by_tuple,
+            edges: self.edges + other.edges,
+            touched: self.touched + other.touched,
+            half_open: self.half_open + other.half_open,
+            lingering: self.lingering + other.lingering,
+        }
     }
 }
 

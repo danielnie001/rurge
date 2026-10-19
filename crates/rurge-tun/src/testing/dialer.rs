@@ -32,6 +32,12 @@ pub enum Script {
     Hold {
         buffer: usize,
     },
+    /// `tokio::io::duplex(buffer)`; the far end sends back what it reads and closes its own
+    /// side once the near end has closed its. Like `Upstream::echo`, with no socket of the
+    /// system: a test of thousands of connections has no use for thousands of ports.
+    MemoryEcho {
+        buffer: usize,
+    },
     Reject(RejectKind),
     /// `DialError::Failed { kind: FailKind::Connect, message: "scripted failure", .. }`.
     Fail,
@@ -243,6 +249,16 @@ impl Dialer for FakeDialer {
                         0,
                         true,
                     );
+                    ready(Box::new(near))
+                }
+                Some(Script::MemoryEcho { buffer }) => {
+                    let (near, far_stream) = tokio::io::duplex(buffer);
+                    tokio::spawn(async move {
+                        let (mut read, mut write) = tokio::io::split(far_stream);
+                        // ends with the end of what the near end sends, or an error
+                        let _ = tokio::io::copy(&mut read, &mut write).await;
+                        let _ = write.shutdown().await;
+                    });
                     ready(Box::new(near))
                 }
             }

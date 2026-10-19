@@ -153,18 +153,23 @@ pub(crate) async fn read_pattern(
     from: &mut (impl AsyncRead + Unpin),
     bytes: usize,
 ) -> io::Result<()> {
+    read_pattern_from(from, 0, bytes).await
+}
+
+/// The same for a stream whose next byte is byte `offset` of the pattern.
+pub(crate) async fn read_pattern_from(
+    from: &mut (impl AsyncRead + Unpin),
+    offset: usize,
+    bytes: usize,
+) -> io::Result<()> {
     let mut done = 0;
     let mut chunk = vec![0; CHUNK];
     while done < bytes {
         let n = (bytes - done).min(CHUNK);
         from.read_exact(&mut chunk[..n]).await?;
         for (k, byte) in chunk[..n].iter().enumerate() {
-            assert_eq!(
-                *byte,
-                pattern((done + k) as u64),
-                "byte {} is not the pattern's",
-                done + k
-            );
+            let at = offset + done + k;
+            assert_eq!(*byte, pattern(at as u64), "byte {at} is not the pattern's");
         }
         done += n;
     }

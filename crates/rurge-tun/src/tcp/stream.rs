@@ -9,6 +9,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Every read and write looks its connection up by its id in the shard's
@@ -207,20 +208,13 @@ impl AsyncWrite for TunStream {
 impl Drop for TunStream {
     /// Resets the connection unless it is ending well: the write side shut
     /// down (its FIN is on its way after what was written), nothing more to
-    /// come from the app and nothing of it left unread.
+    /// come from the app and nothing of it left unread. The moment of the drop
+    /// is where the connection's `linger` begins (`ShardState::stream_dropped`).
     fn drop(&mut self) {
         // a lock that is poisoned is rebuilt by whoever finds it, a drop among
         // them, which does not panic for it
         let mut guard = self.shard.state();
-        let state = &mut *guard;
-        if let Some(conn) = state.conns.get_mut(&self.id) {
-            conn.dropped = true;
-            let socket = state.sockets.get_mut::<tcp::Socket>(conn.handle);
-            if !conn.shut || socket.may_recv() || socket.recv_queue() > 0 {
-                socket.abort();
-            }
-            state.touched.insert(self.id);
-        }
+        guard.stream_dropped(self.id, Instant::now());
         drop(guard);
         self.shard.kick();
     }
