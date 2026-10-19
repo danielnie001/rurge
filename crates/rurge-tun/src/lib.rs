@@ -292,7 +292,8 @@ impl TunHandle {
     /// that, and no more).
     ///
     /// The sessions are not cancelled, and a session ends with its connection
-    /// only when it touches its stream. A dial that is under way is not
+    /// only when it touches its stream (a REJECT-DROP hold also ends at the
+    /// stop, without touching it). A dial that is under way is not
     /// cancelled: it finds the stream reset when it comes back, and the relay
     /// ends at once. A relay that is reading or writing the stream meets the
     /// reset the same way. But a relay that waits on its upstream in both
