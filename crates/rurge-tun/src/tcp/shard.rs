@@ -690,11 +690,16 @@ impl ShardState {
             if deadline > now {
                 return Some(deadline);
             }
+            // The entry goes whether or not a connection is there for it:
+            // `end_half_open` takes it from a connection that is, with the
+            // connection's count. One always is (`remove` takes its entry
+            // first), but an entry with none is no reason to panic with the
+            // shard's lock held.
+            self.half_open.pop_first();
             self.end_half_open(id);
-            let conn = self
-                .conns
-                .get(&id)
-                .expect("a connection of the half-open table");
+            let Some(conn) = self.conns.get(&id) else {
+                continue;
+            };
             self.sockets.get_mut::<tcp::Socket>(conn.handle).abort();
             self.touched.insert(id);
         }
@@ -713,10 +718,12 @@ impl ShardState {
                 return Some(deadline);
             }
             self.lingering.pop_first();
-            let conn = self
-                .conns
-                .get(&id)
-                .expect("a connection of the linger table");
+            // A connection is always there (`remove` takes its entry with it),
+            // but an entry with none is no reason to panic with the shard's
+            // lock held.
+            let Some(conn) = self.conns.get(&id) else {
+                continue;
+            };
             self.sockets.get_mut::<tcp::Socket>(conn.handle).abort();
             self.touched.insert(id);
         }
@@ -730,11 +737,18 @@ impl ShardState {
     /// the `recv_queue` test says the last of these a second time.) A
     /// connection that is ending well has its FIN on its way and waits for the
     /// app to acknowledge it. Either way nobody reads the connection from now
-    /// on, so it stays for `linger` at the most.
+    /// on, so it stays for `linger` at the most. A stream is dropped once; a
+    /// second call for one connection does nothing.
     pub(crate) fn stream_dropped(&mut self, id: ConnId, now: Instant) {
         let Some(conn) = self.conns.get_mut(&id) else {
             return;
         };
+        // A second deadline would put a second entry in `lingering`, of which
+        // `remove` takes the one that `dropped` names: the other would stay
+        // behind when the connection went.
+        if conn.dropped.is_some() {
+            return;
+        }
         let deadline = ends_at(now, self.timers.linger);
         conn.dropped = Some(deadline);
         self.lingering.insert((deadline, id));

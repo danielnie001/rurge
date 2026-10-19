@@ -565,6 +565,68 @@ async fn a_linger_too_long_to_add_does_not_panic() {
     assert_eq!(shard.state().records(), Records::default());
 }
 
+/// A stream is dropped once, by `TunStream::drop`, but the shard does not rely
+/// on that: told of a second drop of one connection it does nothing, so the
+/// connection has one entry in the set of those whose stream is gone, the one
+/// the first drop made. A second entry would outlive the connection (the
+/// connection takes only its own deadline with it), and when its time came the
+/// shard would panic with its lock held and be started over, every connection
+/// it has reset.
+#[tokio::test]
+async fn a_second_drop_of_one_connection_leaves_no_second_entry() {
+    let linger = Duration::from_millis(100);
+    let options = TunOptions {
+        linger,
+        ..TunOptions::default()
+    };
+    let epoch = Instant::now();
+    let at = |ms: u64| epoch + Duration::from_millis(ms);
+    let lone = lone_shard(&options, epoch);
+    let shard = &lone.shard;
+    let (app, mut stream) = ByHand::make(shard, epoch, 40000, 0).await;
+    // the app's FIN is read, the stream's own is sent, and the app has yet to
+    // acknowledge it
+    turn(shard, at(10), vec![app.segment(2, 0, FIN_ACK, &[])]);
+    let end = within("the end of the stream", stream.read(&mut [0; 1]))
+        .await
+        .expect("the end of the stream");
+    assert_eq!(end, 0);
+    within("the shutdown", stream.shutdown())
+        .await
+        .expect("the shutdown");
+    turn(shard, at(20), vec![]);
+    let before = Instant::now();
+    drop(stream);
+    assert_eq!(state_of(shard, app.id), Some(tcp::State::LastAck));
+    assert_eq!(shard.state().records().lingering, 1);
+    // a second drop of the same connection, a little later than the first
+    shard
+        .state()
+        .stream_dropped(app.id, before + Duration::from_millis(50));
+    assert_eq!(
+        shard.state().records().lingering,
+        1,
+        "the second drop made no second entry"
+    );
+    assert_eq!(state_of(shard, app.id), Some(tcp::State::LastAck));
+    // the app acknowledges the FIN in time: the connection goes, and so does
+    // everything the shard has of it
+    turn(shard, at(30), vec![app.segment(3, 1, ACK, &[])]);
+    assert_eq!(state_of(shard, app.id), None);
+    assert_eq!(
+        shard.state().records(),
+        Records::default(),
+        "nothing stays behind for a deadline that comes later"
+    );
+    // the deadline comes with no connection to find, and the shard has nothing
+    // to wake for
+    let late = shard.state().turn(before + linger * 3, &mut Vec::new());
+    assert!(late.out.is_empty());
+    assert_eq!(late.wake_at, None);
+    assert_eq!(lone.admission.sockets(), 0);
+    assert_eq!(lone.budget.used(), 0);
+}
+
 // ---- a TUN, its app and its upstream
 
 /// Both sides close their write sides, in both orders, and nothing is left:

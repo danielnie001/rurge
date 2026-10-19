@@ -5,6 +5,14 @@
 use std::any::Any;
 use std::fmt;
 
+// The rebuild is the shard's last line against a panic of its stack
+// (`catch_unwind` in the shard's task). A build that aborts on a panic has none
+// to catch: the first panic of smoltcp would end the process.
+const _: () = assert!(
+    cfg!(panic = "unwind"),
+    "rurge-tun catches the panics of its TCP stack, which needs panic = \"unwind\""
+);
+
 /// What is added to the seed of a stack when the system's random source gave
 /// none for the new one. Odd, so that the sum is never the old seed, and no
 /// seed comes round again before every other has; and with its bits all over,
