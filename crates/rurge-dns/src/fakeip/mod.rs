@@ -516,9 +516,56 @@ mod tests {
     use rurge_net::testing::Lines;
     use tokio::sync::oneshot;
     use tokio::time::{sleep, timeout};
+    use tracing::Subscriber;
 
     /// The bound on every wait for something that has to happen.
     const BOUND: Duration = Duration::from_secs(10);
+
+    /// `Lines`, but only for what is logged at WARN or above: `Lines` records
+    /// down to INFO and does not say which level a line was.
+    struct AtWarn(Lines);
+
+    impl Subscriber for AtWarn {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            self.0.new_span(span)
+        }
+
+        fn record(&self, span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            self.0.record(span, values);
+        }
+
+        fn record_follows_from(&self, span: &tracing::span::Id, follows: &tracing::span::Id) {
+            self.0.record_follows_from(span, follows);
+        }
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            self.0.event(event);
+        }
+
+        fn enter(&self, span: &tracing::span::Id) {
+            self.0.enter(span);
+        }
+
+        fn exit(&self, span: &tracing::span::Id) {
+            self.0.exit(span);
+        }
+    }
+
+    /// Routes what this thread logs at WARN or above to `lines` until the
+    /// guard, the first element, is dropped. The second, a dispatcher that
+    /// records nothing, is kept for as long as the first, as `Lines::capture`
+    /// has it: with one dispatcher alone, a call site that another test
+    /// reached first would stay shut on this thread.
+    fn capture_warnings(lines: &Lines) -> (tracing::subscriber::DefaultGuard, tracing::Dispatch) {
+        (
+            tracing::subscriber::set_default(AtWarn(lines.clone())),
+            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()),
+        )
+    }
 
     fn ip4(index: u32) -> IpAddr {
         IpAddr::V4(v4_of(index))
@@ -978,7 +1025,7 @@ mod tests {
     async fn a_failed_save_warns_without_names() {
         let lines = Lines::default();
         // held across the awaits: the task runs on this thread
-        let _capturing = lines.capture();
+        let _capturing = capture_warnings(&lines);
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("blocker");
         std::fs::write(&blocker, "a file where a directory should be").unwrap();
