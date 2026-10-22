@@ -7,8 +7,9 @@
 //! Its tasks: one reads the device and sends each packet on its way
 //! (`dispatch`), one shard of the TCP stack for each part of the
 //! connections (`tcp`), one session for each TCP connection (`session`) and
-//! for each source endpoint that sends UDP (`udp`), and one writes to the
-//! device what all of them send (`writer`).
+//! for each source endpoint that sends UDP (`udp`), one for each echo request
+//! that goes out (`icmp`), and one writes to the device what all of them send
+//! (`writer`).
 
 pub mod device;
 mod dispatch;
@@ -33,6 +34,7 @@ use rurge_dns::fakeip::FakeIpPool;
 use rurge_inbound::Dialer;
 use session::Holds;
 use stats::Stats;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tcp::{Admission, Budget, Shard};
@@ -163,6 +165,7 @@ impl Tun {
             sessions: udp::Sessions::default(),
             ids: fragment::Ids::new(),
             icmp_limit: Mutex::new(icmp::limiter()),
+            echoes: AtomicUsize::new(0),
         });
         // the shards and the context hold the writer's queue: it ends once they
         // all have
@@ -230,7 +233,7 @@ pub struct TunOptions {
     pub udp_queue: usize,
     /// The most destinations one UDP session has, each a flow of the engine's, which takes 1024 in an association (and so does the default). A datagram to a destination beyond that many is dropped and counted (`busy`).
     pub max_udp_targets: usize,
-    /// How long an echo request waits for its reply before it is given up.
+    /// How long an echo request waits for its reply before it is given up, counted from when its task begins: resolving the name of a fake address is part of the wait.
     pub echo_timeout: Duration,
     /// The most echo requests waiting for a reply at once, in the whole TUN. One more is dropped and counted (`busy`).
     pub max_echoes: usize,
@@ -408,7 +411,8 @@ impl TunHandle {
     /// connection. A REJECT-DROP hold ends at the stop as well. So does every UDP
     /// session: its association is told to end (the token it was given is
     /// cancelled) and is waited for, so [`TunHandle::join`] waits for each
-    /// association to return, as the engine's does at once.
+    /// association to return, as the engine's does at once. The echo requests
+    /// that wait for their replies end at once, wherever they are.
     ///
     /// A dial that is under way is not cancelled: it is the dialer's, which
     /// holds the session's handle, and a dial dropped half way would leave the
@@ -529,13 +533,13 @@ pub struct Counters {
     pub fragment: u64,
     /// Packets with an address that no real packet through the adapter has: an unspecified, loopback or multicast address at either end, the limited broadcast as the destination, an IPv4-mapped IPv6 address. Counted, never logged.
     pub martian: u64,
-    /// Packets nothing handles: IPv6 while it is off, extension headers, protocols other than TCP, UDP and ICMP, an ICMP that is no echo request, and ICMP echo requests, which nothing handles yet; UDP datagrams when the dialer carries no UDP; replies from an address of the other family than the app's.
+    /// Packets nothing handles: IPv6 while it is off, extension headers, protocols other than TCP, UDP and ICMP, an ICMP that is no echo request, and echo requests while `icmp-forwarding` is off; UDP datagrams when the dialer carries no UDP; replies from an address of the other family than the app's.
     pub unsupported: u64,
-    /// Packets for a shard whose queue was full; datagrams for a UDP session whose queue was full; ICMP messages for refused UDP flows that the writer's queue had no room for.
+    /// Packets for a shard whose queue was full; datagrams for a UDP session whose queue was full; ICMP messages that the writer's queue had no room for: those for refused UDP flows, those for datagrams to rurge's own addresses, and the local replies to echo requests to those addresses.
     pub queue_full: u64,
-    /// SYNs and UDP datagrams to an address of rurge's own space that names nothing; replies from a name that has no address.
+    /// SYNs, UDP datagrams and echo requests to an address of rurge's own space that names nothing; replies from a name that has no address.
     pub unknown_fake: u64,
-    /// SYNs turned away because of the limits on sockets and on half-open connections; UDP datagrams turned away because the dialer had no association to give, or because the session already had its most destinations.
+    /// SYNs turned away because of the limits on sockets and on half-open connections; UDP datagrams turned away because the dialer had no association to give, or because the session already had its most destinations; echo requests beyond `max_echoes`.
     pub busy: u64,
     /// Segments with data past the window the TUN last told of, dropped because the receive buffer had room.
     pub beyond_window: u64,

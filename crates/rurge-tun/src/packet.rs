@@ -48,18 +48,20 @@ pub(crate) enum Reason {
     Martian,
     /// A packet nothing handles: IPv6 while it is off, extension headers,
     /// protocols other than TCP, UDP and ICMP, an ICMP that is no echo
-    /// request; a UDP datagram when the dialer carries no UDP, and a reply
-    /// from an address of the other family than the app's.
+    /// request, an echo request while `icmp-forwarding` is off; a UDP
+    /// datagram when the dialer carries no UDP, and a reply from an address
+    /// of the other family than the app's.
     Unsupported,
     /// The queue the packet goes to was full: a shard's, a UDP session's, the
     /// writer's (for an ICMP message).
     QueueFull,
     /// A packet for an address of rurge's own space that names nothing: a SYN,
-    /// a UDP datagram, or a reply from a name that has no address.
+    /// a UDP datagram, an echo request, or a reply from a name that has no
+    /// address.
     UnknownFake,
     /// A packet turned away because of a limit: of sockets and half-open
     /// connections for a SYN, of associations and of destinations for a UDP
-    /// datagram.
+    /// datagram, of echo requests in flight for an echo request.
     Busy,
     /// A segment with data past the window the TUN last told of, dropped
     /// because the receive buffer had any room at all, however long the

@@ -86,6 +86,8 @@ impl Resolve for FakeResolve {
 pub enum PingScript {
     /// Answers at once with the payload it was sent.
     Echo,
+    /// Answers at once with these bytes, whatever it was sent.
+    Reply(&'static [u8]),
     /// Fails at once.
     Fail,
     /// Never answers.
@@ -137,6 +139,7 @@ impl Pinger for FakePinger {
         Box::pin(async move {
             match script {
                 PingScript::Echo => Ok(payload.to_vec()),
+                PingScript::Reply(bytes) => Ok(bytes.to_vec()),
                 PingScript::Fail => Err(io::Error::new(
                     io::ErrorKind::HostUnreachable,
                     "scripted failure",

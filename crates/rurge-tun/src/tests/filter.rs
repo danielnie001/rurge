@@ -527,7 +527,7 @@ fn bad_udp_and_icmp_checksums_are_malformed() {
             }
         }
         // counted as malformed with the packets that cannot be read, not as
-        // the unsupported ones that nothing handles yet
+        // the unsupported ones that nothing handles
         let stats = Stats::default();
         let mut damaged = packet.clone();
         damaged[field_at] ^= 0x01;
@@ -1181,27 +1181,6 @@ async fn ipv6_off_serves_ipv4_only() {
         rig.tun.counters(),
         Counters {
             unsupported: 1,
-            ..Counters::default()
-        }
-    );
-}
-
-/// Nothing handles ICMP yet: an echo request, in both families, is dropped as
-/// unsupported.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn udp_and_icmp_are_not_handled_yet() {
-    let rig = rig(TunOptions::default());
-    rig.app.inject(echo_packet(APP4.into(), FAR4.into()));
-    rig.app.inject(echo_packet(APP6.into(), FAR6.into()));
-    eventually("the packets to be counted", WITHIN, || {
-        rig.tun.counters().unsupported == 2
-    })
-    .await;
-    assert_unanswered(&rig).await;
-    assert_eq!(
-        rig.tun.counters(),
-        Counters {
-            unsupported: 2,
             ..Counters::default()
         }
     );

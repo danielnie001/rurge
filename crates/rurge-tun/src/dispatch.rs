@@ -5,6 +5,7 @@
 
 use crate::device::Device;
 use crate::fragment::Ids;
+use crate::icmp;
 use crate::limit::Limiter;
 use crate::packet::{self, Parsed, Reason, Transport};
 use crate::stats::Stats;
@@ -15,6 +16,7 @@ use rurge_dns::fakeip::FakeIpPool;
 use rurge_inbound::Dialer;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -31,14 +33,13 @@ pub(crate) struct Context {
     /// Where the UDP sessions go.
     pub(crate) dialer: Arc<dyn Dialer>,
     pub(crate) pool: Option<Arc<FakeIpPool>>,
-    // not read yet: the ICMP path reads these two, and removes these
-    // expectations
-    #[expect(dead_code)]
+    /// Where the settings of the generation in use come from, asked for each
+    /// echo request.
     pub(crate) hooks: Arc<dyn Hooks>,
-    #[expect(dead_code)]
+    /// Sends the echo requests that go out.
     pub(crate) pinger: Arc<dyn Pinger>,
     /// The writer's queue, for what the TUN makes itself: replies to the apps'
-    /// datagrams and ICMP messages.
+    /// datagrams and to their echo requests, and ICMP messages.
     pub(crate) writer: mpsc::Sender<Vec<Vec<u8>>>,
     pub(crate) stats: Arc<Stats>,
     pub(crate) life: Arc<Life>,
@@ -53,6 +54,9 @@ pub(crate) struct Context {
     pub(crate) ids: Ids,
     /// The limit on the ICMP messages for the UDP flows that were refused.
     pub(crate) icmp_limit: Mutex<Limiter>,
+    /// How many echo requests wait for their replies: the places taken out of
+    /// `max_echoes` (see `icmp`).
+    pub(crate) echoes: AtomicUsize,
 }
 
 pub(crate) async fn run(
@@ -78,17 +82,10 @@ pub(crate) async fn run(
             };
             match parsed.transport {
                 Transport::Udp { .. } => udp::receive(&ctx, &parsed, &packet),
-                // nothing handles echo requests yet
-                Transport::Icmp { .. } => {
-                    // not `ctx.stats.drop(..)`: on an `Arc` that is `Drop::drop`
-                    Stats::drop(
-                        &ctx.stats,
-                        Reason::Unsupported,
-                        Some(parsed.src),
-                        Some(parsed.dst),
-                    );
-                }
-                Transport::Tcp(_) => unreachable!("route gives a TCP segment to a shard"),
+                Transport::Icmp { .. } => icmp::receive(&ctx, &parsed, &packet),
+                // `route` gives a TCP segment to its shard and hands none back;
+                // were one to come, a panic here would stop all reception
+                Transport::Tcp(_) => debug_assert!(false, "route gives a TCP segment to a shard"),
             }
         }
     }

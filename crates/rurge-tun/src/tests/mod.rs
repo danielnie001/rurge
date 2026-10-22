@@ -6,6 +6,7 @@ mod fake;
 mod filter;
 mod fixture;
 mod hazards;
+mod icmp;
 mod lifecycle;
 mod log_capture;
 mod options;
