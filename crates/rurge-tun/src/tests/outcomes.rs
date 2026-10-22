@@ -192,8 +192,7 @@ async fn stop_during_a_drop_hold_ends_it() {
 /// until the app's own FIN: the app may send after it has read the FIN, and the
 /// connection ends well. Were the stream let go at once after its `shutdown`,
 /// the connection would be reset (it is dropped while the app may still send)
-/// and the app would never read the FIN; were the bytes not read, they would
-/// hold the connection until the linger.
+/// and the app would never read the FIN.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dropped_connection_is_read_to_the_end_of_what_the_app_sends() {
     let rig = rig(TunOptions {

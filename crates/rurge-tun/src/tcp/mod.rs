@@ -21,11 +21,13 @@ pub(crate) use budget::Budget;
 pub(crate) use shard::Shard;
 pub(crate) use stream::TunStream;
 
+use budget::Sizes;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Waker;
 use std::time::Duration;
+use tokio::io::ReadBuf;
 
 /// What makes a shard of the test build panic, to see what becomes of a
 /// shard whose stack does: a segment the shard advances whose payload begins
@@ -81,8 +83,9 @@ pub(crate) enum Outcome {
 }
 
 /// What a connection's stream shares with its shard: the outcome once the
-/// shard lets the connection go, and the wakers to wake then. The shard
-/// lock is taken before this one, never the other way round.
+/// shard lets the connection go, what the app sent that the stream had not
+/// read by then, and the wakers to wake then. The shard lock is taken before
+/// this one, never the other way round.
 #[derive(Default)]
 pub(crate) struct ConnShared {
     inner: Mutex<SharedInner>,
@@ -91,8 +94,27 @@ pub(crate) struct ConnShared {
 #[derive(Default)]
 struct SharedInner {
     outcome: Option<Outcome>,
+    leftover: Option<Leftover>,
     read: Option<Waker>,
     write: Option<Waker>,
+}
+
+/// What the app sent that the stream had not read when the shard let the
+/// connection go: the stream reads it before the outcome (M3a deferred row 8).
+/// Not kept in the socket, where smoltcp clears it when its own timer closes
+/// the socket, and where it would hold the connection and its tuple.
+pub(crate) struct Leftover {
+    bytes: Vec<u8>,
+    read: usize,
+    /// The receive buffer's share of the budget, given back when this goes.
+    share: Sizes,
+    budget: Arc<Budget>,
+}
+
+impl Drop for Leftover {
+    fn drop(&mut self) {
+        self.budget.give_back(self.share);
+    }
 }
 
 impl ConnShared {
@@ -123,6 +145,55 @@ impl ConnShared {
 
     pub(crate) fn outcome(&self) -> Option<Outcome> {
         self.inner().outcome
+    }
+
+    /// Keeps `bytes`, which the app sent and the stream has not read, for the
+    /// stream to read before the outcome. `share` is the receive buffer's
+    /// share of `budget`, which the bytes hold until they are read or the
+    /// stream is gone (`discard_leftover`). `bytes` is not empty.
+    pub(crate) fn keep(&self, bytes: Vec<u8>, share: Sizes, budget: Arc<Budget>) {
+        debug_assert!(!bytes.is_empty(), "nothing to keep is no leftover");
+        // the share is the leftover's from here: it goes back with it, however
+        // it goes, and a leftover is dropped out of the lock
+        let kept = Leftover {
+            bytes,
+            read: 0,
+            share,
+            budget,
+        };
+        let before = self.inner().leftover.replace(kept);
+        drop(before);
+    }
+
+    /// Reads into `buf` as much of what `keep` kept as fits, and answers
+    /// whether anything was kept. The read that takes the last of it takes the
+    /// leftover with it, and its share of the budget goes back.
+    pub(crate) fn read_leftover(&self, buf: &mut ReadBuf<'_>) -> bool {
+        let finished = {
+            let mut inner = self.inner();
+            let Some(leftover) = inner.leftover.as_mut() else {
+                return false;
+            };
+            let rest = &leftover.bytes[leftover.read..];
+            let taken = rest.len().min(buf.remaining());
+            buf.put_slice(&rest[..taken]);
+            leftover.read += taken;
+            if leftover.read == leftover.bytes.len() {
+                inner.leftover.take()
+            } else {
+                None
+            }
+        };
+        // out of the lock
+        drop(finished);
+        true
+    }
+
+    /// The stream is gone: what `keep` kept for it goes, and its share of the
+    /// budget with it.
+    pub(crate) fn discard_leftover(&self) {
+        let leftover = self.inner().leftover.take();
+        drop(leftover);
     }
 }
 

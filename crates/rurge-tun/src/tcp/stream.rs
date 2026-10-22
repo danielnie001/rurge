@@ -15,8 +15,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// Every read and write looks its connection up by its id in the shard's
 /// table, holding the shard's lock for as long as it copies and kicking the
 /// shard afterwards. Once the shard has let the connection go the stream
-/// answers the connection's outcome (P12), so it never reaches a socket that
-/// took the connection's handle after it.
+/// reads what the shard kept of the app's bytes and then answers the
+/// connection's outcome (P12; M3b P26), so it never reaches a socket that took
+/// the connection's handle after it.
 pub(crate) struct TunStream {
     shard: Arc<Shard>,
     id: ConnId,
@@ -73,6 +74,8 @@ impl TunStream {
 
 impl AsyncRead for TunStream {
     /// The end of what the app sent is `Ok(0)`; a reset is `ConnectionReset`.
+    /// Once the shard has let the connection go, what the app sent that this
+    /// had not read is read first, and then the outcome is answered.
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -84,6 +87,9 @@ impl AsyncRead for TunStream {
         let mut guard = self.shard.state();
         let state = &mut *guard;
         let Some(conn) = state.conns.get(&self.id) else {
+            if self.shared.read_leftover(buf) {
+                return Poll::Ready(Ok(()));
+            }
             return Poll::Ready(match self.outcome() {
                 Outcome::Closed => Ok(()),
                 Outcome::Reset => Err(reset()),
@@ -102,8 +108,7 @@ impl AsyncRead for TunStream {
             }
             Ok(n) => {
                 buf.advance(n);
-                // room in the window to tell of, or a closed socket the shard
-                // kept for this read and can let go now
+                // room in the window to tell of
                 state.touched.insert(self.id);
                 drop(guard);
                 self.shard.kick();
@@ -211,6 +216,9 @@ impl Drop for TunStream {
     /// come from the app and nothing of it left unread. The moment of the drop
     /// is where the connection's `linger` begins (`ShardState::stream_dropped`).
     fn drop(&mut self) {
+        // what the shard kept for the stream to read goes, and its share of
+        // the budget goes back
+        self.shared.discard_leftover();
         // a lock that is poisoned is rebuilt by whoever finds it, a drop among
         // them, which does not panic for it
         let mut guard = self.shard.state();

@@ -65,14 +65,19 @@ impl Tun {
     ///
     /// # Panics
     ///
-    /// If the device's MTU is below 1280 (smoltcp 0.12 cannot work with less,
-    /// and the MTU is rurge's own choice), or if there is no tokio runtime to
-    /// start the tasks on.
+    /// If the options are ones [`TunOptions::check`] refuses (they are not
+    /// clamped to what can run: whoever starts a TUN checks them first and
+    /// says what is wrong to whoever gave them), or if the device's MTU is
+    /// below 1280 (smoltcp 0.12 cannot work with less, and the MTU is rurge's
+    /// own choice), or if there is no tokio runtime to start the tasks on.
     pub fn start(
         device: Arc<dyn Device>,
         dialer: Arc<dyn Dialer>,
         options: TunOptions,
     ) -> TunHandle {
+        if let Err(error) = options.check() {
+            panic!("the TUN's options: {error}");
+        }
         let mtu = device.mtu();
         assert!(mtu >= MIN_MTU, "the device's MTU must be at least 1280");
         let epoch = Instant::now();
@@ -85,13 +90,13 @@ impl Tun {
         ));
         let admission = Arc::new(Admission::new(life.clone(), stats.clone(), &options));
         let tasks = TaskTracker::new();
-        let writer_queue = options.writer_queue.max(1);
+        let writer_queue = options.writer_queue;
         let (to_writer, from_shards) = mpsc::channel(writer_queue);
         #[cfg(test)]
         let mut shards = Vec::new();
         let mut to_shards = Vec::new();
         let mut random_failure = None;
-        for index in 0..options.shards.max(1) {
+        for index in 0..options.shards {
             let seed = getrandom::u64().unwrap_or_else(|error| {
                 random_failure.get_or_insert(error);
                 0x5eed
@@ -105,7 +110,7 @@ impl Tun {
                 admission.clone(),
                 &options,
             ));
-            let (to_shard, packets) = mpsc::channel(options.shard_queue.max(1));
+            let (to_shard, packets) = mpsc::channel(options.shard_queue);
             #[cfg(test)]
             shards.push(shard.clone());
             tasks.spawn(tcp::shard::run(
@@ -210,6 +215,46 @@ impl Default for TunOptions {
             shard_queue: 1_024,
             writer_queue: 256,
         }
+    }
+}
+
+impl TunOptions {
+    /// The longest `keep_alive` and `timeout` there can be. The stack adds
+    /// them to a clock that counts in microseconds in an `i64`: a day is far
+    /// below where that overflows, and far above any setting that is meant.
+    const LONGEST: Duration = Duration::from_secs(24 * 60 * 60);
+
+    /// Whether the options can run a TUN: the first that cannot, in the order
+    /// of the fields. [`Tun::start`] panics for options that do not pass, so
+    /// whoever starts a TUN calls this first and tells whoever gave the
+    /// options what is wrong with them. `budget`, `max_sockets` and
+    /// `max_half_open` may be 0 (every socket on the smallest buffers, every
+    /// SYN answered with a reset, no connection let through its handshake);
+    /// `drop_hold`, `half_open_timeout` and `linger` are taken whatever they
+    /// are.
+    pub fn check(&self) -> Result<(), String> {
+        if self.shards == 0 {
+            return Err("shards must be more than zero".into());
+        }
+        if self.buffer_min == 0 {
+            return Err("buffer_min must be more than zero".into());
+        }
+        if self.tx_max == 0 {
+            return Err("tx_max must be more than zero".into());
+        }
+        if self.keep_alive < Duration::from_millis(1) || self.keep_alive > Self::LONGEST {
+            return Err("keep_alive must be at least 1 ms and at most 24 hours".into());
+        }
+        if self.timeout <= self.keep_alive || self.timeout > Self::LONGEST {
+            return Err("timeout must be more than keep_alive and at most 24 hours".into());
+        }
+        if self.shard_queue == 0 {
+            return Err("shard_queue must be more than zero".into());
+        }
+        if self.writer_queue == 0 {
+            return Err("writer_queue must be more than zero".into());
+        }
+        Ok(())
     }
 }
 

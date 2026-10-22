@@ -191,6 +191,10 @@ pub(crate) struct ShardState {
 pub(crate) struct Conn {
     pub(crate) handle: SocketHandle,
     pub(crate) tuple: Tuple,
+    /// What the socket's buffers took from the budget, given back when the
+    /// connection goes. The receive buffer's share is 0 once the connection has
+    /// handed it to its stream with the bytes the stream did not read
+    /// (`keep_unread`).
     sizes: Sizes,
     shared: Arc<ConnShared>,
     /// How a segment of the app closed the socket, if one did: smoltcp does
@@ -634,13 +638,19 @@ impl ShardState {
     /// last reap, or of all of them once a `SWEEP`: a socket in TIME-WAIT
     /// `TIME_WAIT_GRACE` after it was first seen there, a closed socket once
     /// it has no ends left (an aborted socket keeps them until its reset is
-    /// out). Neither goes while its stream is there to read what the app
-    /// sent before its FIN (P12), unless the app reset the connection. First
-    /// the connections that ran out of time for their handshake are aborted
-    /// (`expire_half_open`), and those whose stream has been gone for `linger`
-    /// (`expire_lingering`). When a connection kept for its grace, a handshake
-    /// that is still going on or a stream that is gone is to be looked at
-    /// next, if any is.
+    /// out). What the app sent before that and the stream has not read does
+    /// not hold the connection (M3b P26): it is copied out of the socket for
+    /// the stream to read first (`keep_unread`). Left in a socket in TIME-WAIT
+    /// it would be cleared by smoltcp ten seconds on, when its own timer
+    /// closes the socket, and the stream would read as a reset what the app
+    /// saw acknowledged; and a socket held for it would hold the connection's
+    /// tuple, so that a new SYN of the tuple would meet a socket that takes
+    /// none. Nothing is kept when nobody will read it: the stream is gone, or
+    /// the app reset the connection. First the connections that ran out of
+    /// time for their handshake are aborted (`expire_half_open`), and those
+    /// whose stream has been gone for `linger` (`expire_lingering`). When a
+    /// connection kept for its grace, a handshake that is still going on or a
+    /// stream that is gone is to be looked at next, if any is.
     fn reap(&mut self, now: Instant) -> Option<Instant> {
         let mut next = [self.expire_half_open(now), self.expire_lingering(now)]
             .into_iter()
@@ -658,7 +668,10 @@ impl ShardState {
             let Some(conn) = self.conns.get_mut(&id) else {
                 continue;
             };
-            let socket = self.sockets.get::<tcp::Socket>(conn.handle);
+            let socket = self.sockets.get_mut::<tcp::Socket>(conn.handle);
+            // what a stream is left to read; none is kept for one that is gone
+            // or for a connection the app reset (smoltcp keeps what was
+            // received before a reset, and the stream answers the reset)
             let unread = conn.dropped.is_none()
                 && conn.closed_by != Some(Outcome::Reset)
                 && socket.recv_queue() > 0;
@@ -668,7 +681,9 @@ impl ShardState {
                     if now < due {
                         next = Some(next.map_or(due, |soonest| soonest.min(due)));
                         self.touched.insert(id);
-                    } else if !unread {
+                    } else if unread {
+                        over.push((id, keep_unread(socket, conn, &self.budget)));
+                    } else {
                         over.push((id, Outcome::Closed));
                     }
                 }
@@ -676,7 +691,10 @@ impl ShardState {
                 tcp::State::Closed if socket.remote_endpoint().is_some() => {
                     self.touched.insert(id);
                 }
-                tcp::State::Closed if !unread => {
+                tcp::State::Closed if unread => {
+                    over.push((id, keep_unread(socket, conn, &self.budget)));
+                }
+                tcp::State::Closed => {
                     over.push((id, conn.closed_by.unwrap_or(Outcome::Reset)));
                 }
                 _ => {}
@@ -889,6 +907,36 @@ fn ends_at(now: Instant, after: Duration) -> Instant {
     now.checked_add(after)
         .or_else(|| now.checked_add(FAR_OFF))
         .unwrap_or(now)
+}
+
+/// The connection of `socket` is over and the stream has not read what the app
+/// sent: copies the bytes out of the socket and gives them to the stream
+/// (`ConnShared::keep`), with the receive buffer's share of the budget, which
+/// is the stream's from here and goes back when the bytes are read or the
+/// stream is dropped (the connection no longer has it, so `remove` gives back
+/// the send buffer's). Answers how the connection ended, as the socket does
+/// once nothing is left in it: `Closed` if the app's FIN came, `Reset` if not,
+/// so that a socket closed by its own timeout is no clean end of the stream.
+/// The bytes are copied before anything else changes, for the stack is called
+/// here and may panic, and a rebuild finds the connection with all it held.
+fn keep_unread(socket: &mut tcp::Socket, conn: &mut Conn, budget: &Arc<Budget>) -> Outcome {
+    let mut bytes = vec![0; socket.recv_queue()];
+    // while the receive buffer is not empty smoltcp lets it be read in any
+    // state, so nothing is refused here
+    let taken = socket.recv_slice(&mut bytes).unwrap_or(0);
+    bytes.truncate(taken);
+    let outcome = match socket.recv_slice(&mut []) {
+        Err(tcp::RecvError::Finished) => Outcome::Closed,
+        _ => Outcome::Reset,
+    };
+    if !bytes.is_empty() {
+        let share = Sizes {
+            rx: std::mem::take(&mut conn.sizes.rx),
+            tx: 0,
+        };
+        conn.shared.keep(bytes, share, budget.clone());
+    }
+    outcome
 }
 
 /// Whether the TCP payload of `packet`, a segment that passed the filter,

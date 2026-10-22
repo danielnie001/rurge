@@ -1055,9 +1055,9 @@ async fn a_segment_past_the_edge_into_room_is_dropped() {
 }
 
 /// The edge goes with the connection that has the tuple. Were a connection let
-/// go of under another that has taken its tuple (a connection kept for what it
-/// holds unread, and a new one), the old one's going would take the new one's
-/// edge with it, and the guard would know nothing of the new connection.
+/// go of under another that has taken its tuple, the old one's going would take
+/// the new one's edge with it, and the guard would know nothing of the new
+/// connection.
 #[test]
 fn a_connection_that_does_not_have_its_tuple_leaves_the_edge_to_the_one_that_does() {
     let epoch = Instant::now();

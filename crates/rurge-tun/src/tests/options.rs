@@ -1,0 +1,191 @@
+//! `TunOptions::check`: the options a TUN cannot be started with, in the words
+//! it gives, and those it can; and that `Tun::start` holds to it.
+
+use super::support::tun_on;
+use crate::TunOptions;
+use crate::device::MemoryDevice;
+use std::time::Duration;
+
+const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+const MS: Duration = Duration::from_millis(1);
+
+const KEEP_ALIVE: &str = "keep_alive must be at least 1 ms and at most 24 hours";
+const TIMEOUT: &str = "timeout must be more than keep_alive and at most 24 hours";
+
+/// `options` are refused with `text`, the first that cannot be, and no other.
+fn refused(options: TunOptions, text: &str) {
+    assert_eq!(options.check(), Err(text.to_string()), "{options:?}");
+}
+
+#[test]
+fn the_defaults_pass_the_check() {
+    assert_eq!(TunOptions::default().check(), Ok(()));
+}
+
+/// Each of the seven texts, with what is just past the edge of each range. The
+/// timers are the stack's to add to its clock: `keep_alive` is at least a
+/// millisecond and `timeout` is more than it, and neither is more than a day,
+/// which is far below where the stack's sums overflow.
+#[test]
+fn options_out_of_range_are_refused() {
+    refused(
+        TunOptions {
+            shards: 0,
+            ..TunOptions::default()
+        },
+        "shards must be more than zero",
+    );
+    refused(
+        TunOptions {
+            buffer_min: 0,
+            ..TunOptions::default()
+        },
+        "buffer_min must be more than zero",
+    );
+    refused(
+        TunOptions {
+            tx_max: 0,
+            ..TunOptions::default()
+        },
+        "tx_max must be more than zero",
+    );
+    for keep_alive in [Duration::ZERO, MS - Duration::from_micros(1), DAY + MS] {
+        refused(
+            TunOptions {
+                keep_alive,
+                ..TunOptions::default()
+            },
+            KEEP_ALIVE,
+        );
+    }
+    // the default keep-alive is 30 s: a timeout of that or less
+    for timeout in [Duration::from_secs(30), Duration::from_secs(10), DAY + MS] {
+        refused(
+            TunOptions {
+                timeout,
+                ..TunOptions::default()
+            },
+            TIMEOUT,
+        );
+    }
+    refused(
+        TunOptions {
+            shard_queue: 0,
+            ..TunOptions::default()
+        },
+        "shard_queue must be more than zero",
+    );
+    refused(
+        TunOptions {
+            writer_queue: 0,
+            ..TunOptions::default()
+        },
+        "writer_queue must be more than zero",
+    );
+}
+
+/// The first that cannot be run with, in the order of the fields.
+#[test]
+fn the_first_option_out_of_range_is_the_one_reported() {
+    refused(
+        TunOptions {
+            shards: 0,
+            writer_queue: 0,
+            ..TunOptions::default()
+        },
+        "shards must be more than zero",
+    );
+    refused(
+        TunOptions {
+            keep_alive: Duration::ZERO,
+            timeout: Duration::ZERO,
+            ..TunOptions::default()
+        },
+        KEEP_ALIVE,
+    );
+    refused(
+        TunOptions {
+            timeout: Duration::ZERO,
+            shard_queue: 0,
+            ..TunOptions::default()
+        },
+        TIMEOUT,
+    );
+}
+
+/// The edges themselves are inside the ranges.
+#[test]
+fn the_edges_of_the_ranges_pass() {
+    for (keep_alive, timeout) in [
+        (MS, Duration::from_secs(600)),
+        (Duration::from_secs(30), DAY),
+        (DAY - MS, DAY),
+        (Duration::from_millis(100), Duration::from_millis(101)),
+    ] {
+        let options = TunOptions {
+            keep_alive,
+            timeout,
+            ..TunOptions::default()
+        };
+        assert_eq!(options.check(), Ok(()), "{options:?}");
+    }
+}
+
+/// A budget of none is every socket on the smallest buffers, no sockets is
+/// every SYN answered with a reset, and no half-open connections is none let
+/// through its handshake: all of them are settings, and the only ones that
+/// are allowed to be zero.
+#[test]
+fn zero_budgets_and_limits_pass() {
+    for options in [
+        TunOptions {
+            budget: 0,
+            ..TunOptions::default()
+        },
+        TunOptions {
+            max_sockets: 0,
+            ..TunOptions::default()
+        },
+        TunOptions {
+            max_half_open: 0,
+            ..TunOptions::default()
+        },
+        TunOptions {
+            budget: 0,
+            max_sockets: 0,
+            max_half_open: 0,
+            ..TunOptions::default()
+        },
+    ] {
+        assert_eq!(options.check(), Ok(()), "{options:?}");
+    }
+}
+
+/// What the stack takes whatever it is (a hold, a linger or a handshake that
+/// is any time at all, as far as `Duration::MAX`) is not checked.
+#[test]
+fn the_times_that_are_total_are_not_checked() {
+    for time in [Duration::ZERO, Duration::from_millis(1), Duration::MAX] {
+        let options = TunOptions {
+            drop_hold: time,
+            half_open_timeout: time,
+            linger: time,
+            ..TunOptions::default()
+        };
+        assert_eq!(options.check(), Ok(()), "{options:?}");
+    }
+}
+
+/// `Tun::start` does not clamp what `check` refuses: it panics, saying which.
+#[tokio::test]
+#[should_panic(expected = "the TUN's options: shards must be more than zero")]
+async fn a_tun_with_bad_options_does_not_start() {
+    let (device, _app) = MemoryDevice::pair(1500, 16);
+    let _started = tun_on(
+        device,
+        TunOptions {
+            shards: 0,
+            ..TunOptions::default()
+        },
+    );
+}
