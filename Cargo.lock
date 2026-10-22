@@ -3312,6 +3312,7 @@ dependencies = [
  "rurge-proto-ssh",
  "rurge-proto-wireguard",
  "rurge-rules",
+ "rurge-tun",
  "rustls",
  "serde",
  "serde_json",

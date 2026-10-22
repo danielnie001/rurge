@@ -293,13 +293,6 @@ async fn a_policy_without_udp_rejects() {
     );
 }
 
-/// A QUIC Initial-looking datagram (padded to 1200 bytes).
-fn quic_initial() -> Vec<u8> {
-    let mut out = vec![0xc3, 0, 0, 0, 1];
-    out.resize(1200, 0);
-    out
-}
-
 /// `block-quic` (M5 design 6.2): QUIC to UDP 443 is dropped with a note —
 /// the browser falls back to TCP — while other UDP to 443 goes through.
 #[tokio::test]

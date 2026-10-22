@@ -1189,6 +1189,12 @@ impl Engine {
     pub fn stop_accepting(&self) {
         self.accept.cancel();
     }
+    /// A token that fires when `stop_accepting` is called (at once if it
+    /// has been): what ends with the engine's accepting waits on it, as the
+    /// listeners do.
+    pub(crate) fn accepting_token(&self) -> CancellationToken {
+        self.accept.child_token()
+    }
     /// Force every in-flight relay to end now.
     pub fn cancel_sessions(&self) {
         self.sessions_root.cancel();

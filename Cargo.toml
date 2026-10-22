@@ -113,6 +113,7 @@ smoltcp = { version = "0.12.0", default-features = false, features = ["std", "me
 # verifier, no bloom filter (a server's), no `log` bridge
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rurge-proto-quic = { path = "crates/rurge-proto-quic" }
+rurge-tun = { path = "crates/rurge-tun" }
 # Hysteria 2's Salamander: BLAKE2b with a digest length of 32 (already in the
 # tree through boringtun)
 blake2 = "0.10"

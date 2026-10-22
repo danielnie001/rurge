@@ -7,6 +7,7 @@ use crate::subscriptions::Subscriptions;
 use rurge_config::{Config, Diagnostics};
 use rurge_policy::PolicyRegistry;
 use rurge_rules::{OutboundMode, RuleEngine};
+use rurge_tun::TunSettings;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio_util::task::AbortOnDropHandle;
@@ -41,6 +42,9 @@ pub struct Runtime {
     pub(crate) subscriptions: Subscriptions,
     /// The task watching `subscriptions`; it goes with the generation.
     pub(crate) watcher: OnceLock<AbortOnDropHandle<()>>,
+    /// What the virtual adapter asks of this generation (phase 3 M3b design
+    /// 9.1): handed out by `Hooks::settings` while the generation is in use.
+    pub(crate) tun: Arc<TunSettings>,
     /// The DNS override of the network the machine was on when this
     /// generation was built; the resolver was made with it.
     dns_override: DnsOverride,
@@ -67,6 +71,12 @@ impl Runtime {
             None
         };
         let mut stack = build_stack(&config, &opts.stack).await?;
+        // the adapter's echo requests to a fake address look the name up with
+        // this generation's resolver, and are forwarded as its profile says
+        let tun = Arc::new(TunSettings {
+            resolver: stack.resolver.clone(),
+            icmp_forwarding: config.general.icmp_forwarding,
+        });
         // the engine's cell, not one of this generation's: the network is
         // the machine's, and outlives the profile it is read against
         let rules =
@@ -131,6 +141,7 @@ impl Runtime {
             factory,
             subscriptions,
             watcher: OnceLock::new(),
+            tun,
             dns_override,
         })
     }

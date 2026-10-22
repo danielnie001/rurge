@@ -20,6 +20,7 @@ pub mod sniff;
 pub mod stack;
 pub mod state;
 mod subscriptions;
+mod tun;
 mod udp;
 pub mod views;
 

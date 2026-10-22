@@ -258,6 +258,8 @@ pub struct TrafficStats {
     http_down: AtomicU64,
     socks_up: AtomicU64,
     socks_down: AtomicU64,
+    tun_up: AtomicU64,
+    tun_down: AtomicU64,
     per_policy: Mutex<HashMap<String, (u64, u64)>>,
     // rate sampling: last cumulative-plus-active reading and the last delta
     last_sample: Mutex<(u64, u64)>,
@@ -281,6 +283,8 @@ impl TrafficStats {
             http_down: AtomicU64::new(0),
             socks_up: AtomicU64::new(0),
             socks_down: AtomicU64::new(0),
+            tun_up: AtomicU64::new(0),
+            tun_down: AtomicU64::new(0),
             per_policy: Mutex::new(HashMap::new()),
             last_sample: Mutex::new((0, 0)),
             rate_up: AtomicU64::new(0),
@@ -302,10 +306,14 @@ impl TrafficStats {
                 self.socks_up.fetch_add(up, Ordering::Relaxed);
                 self.socks_down.fetch_add(down, Ordering::Relaxed);
             }
+            ListenerKind::Tun => {
+                self.tun_up.fetch_add(up, Ordering::Relaxed);
+                self.tun_down.fetch_add(down, Ordering::Relaxed);
+            }
             // Not listeners: `Internal` is the DNS pipeline's own sessions,
-            // `Tun` / `Forward` arrive later. They count towards the global
-            // and per-policy totals only, never into a listener bucket.
-            ListenerKind::Internal | ListenerKind::Tun | ListenerKind::Forward => {}
+            // `Forward` arrives later. They count towards the global and
+            // per-policy totals only, never into a listener bucket.
+            ListenerKind::Internal | ListenerKind::Forward => {}
         }
         if let Some(policy) = h
             .policy_chain()
@@ -328,8 +336,9 @@ impl TrafficStats {
         }
     }
 
-    /// Cumulative bytes broken down by listener kind (`Http`, `Socks5`).
-    pub fn by_listener(&self) -> [(ListenerKind, u64, u64); 2] {
+    /// Cumulative bytes broken down by listener kind (`Http`, `Socks5` and the
+    /// virtual adapter's `Tun`, in this order).
+    pub fn by_listener(&self) -> [(ListenerKind, u64, u64); 3] {
         [
             (
                 ListenerKind::Http,
@@ -340,6 +349,11 @@ impl TrafficStats {
                 ListenerKind::Socks5,
                 self.socks_up.load(Ordering::Relaxed),
                 self.socks_down.load(Ordering::Relaxed),
+            ),
+            (
+                ListenerKind::Tun,
+                self.tun_up.load(Ordering::Relaxed),
+                self.tun_down.load(Ordering::Relaxed),
             ),
         ]
     }
@@ -654,6 +668,36 @@ mod tests {
                 ("REJECT".to_string(), 7, 11),
             ]
         );
+    }
+
+    /// The virtual adapter's sessions have a bucket of their own, after the
+    /// two proxy ports': their bytes count there, in the totals and under their
+    /// policy, and in no other listener's bucket.
+    #[test]
+    fn the_adapters_sessions_have_a_listener_bucket_of_their_own() {
+        let t = TrafficStats::new();
+        let kinds: Vec<_> = t.by_listener().iter().map(|(kind, _, _)| *kind).collect();
+        assert_eq!(
+            kinds,
+            [ListenerKind::Http, ListenerKind::Socks5, ListenerKind::Tun]
+        );
+        let mut s = SessionInfo::tcp(HostName::parse("t.test"), 443);
+        s.listener = ListenerKind::Tun;
+        let h = SessionHandle::new(1, s);
+        h.set_policy_chain(vec!["DIRECT".into()]);
+        h.add_up(30);
+        h.add_down(50);
+        t.record(&h);
+        assert_eq!(
+            t.by_listener(),
+            [
+                (ListenerKind::Http, 0, 0),
+                (ListenerKind::Socks5, 0, 0),
+                (ListenerKind::Tun, 30, 50),
+            ]
+        );
+        assert_eq!((t.totals().up, t.totals().down), (30, 50));
+        assert_eq!(t.by_policy(), vec![("DIRECT".to_string(), 30, 50)]);
     }
 
     /// `Internal` (the DNS pipeline's own sessions) is not a listener: its

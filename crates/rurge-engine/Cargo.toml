@@ -18,6 +18,7 @@ rurge-proto-ssh.workspace = true
 rurge-proto-wireguard.workspace = true
 rurge-policy.workspace = true
 rurge-inbound.workspace = true
+rurge-tun.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 arc-swap.workspace = true
@@ -36,6 +37,7 @@ rurge-proto = { workspace = true, features = ["testing"] }
 rurge-proto-quic = { workspace = true, features = ["testing"] }
 rurge-proto-ssh = { workspace = true, features = ["testing"] }
 rurge-proto-wireguard = { workspace = true, features = ["testing"] }
+rurge-tun = { workspace = true, features = ["testing"] }
 tokio-rustls.workspace = true
 socket2.workspace = true
 tempfile.workspace = true

@@ -877,6 +877,9 @@ async fn traffic_reports_totals_by_policy_and_listener() {
     let http_out = body["listener"]["http"]["out"].as_u64().unwrap();
     assert!(http_in >= 4096 && http_in > http_out, "{body}");
     assert_eq!(body["listener"]["socks5"]["in"], 0);
+    // the virtual adapter has its bucket too, and an HTTP session is not in it
+    assert_eq!(body["listener"]["tun"]["in"], 0, "{body}");
+    assert_eq!(body["listener"]["tun"]["out"], 0, "{body}");
 }
 
 /// `total` must include the bytes of sessions that are still running: the

@@ -563,6 +563,13 @@ impl UdpAssociation {
     }
 }
 
+/// A QUIC Initial-looking datagram (padded to 1200 bytes).
+pub fn quic_initial() -> Vec<u8> {
+    let mut out = vec![0xc3, 0, 0, 0, 1];
+    out.resize(1200, 0);
+    out
+}
+
 /// A loopback UDP server answering every datagram with itself; it notes
 /// who wrote to it.
 pub async fn udp_echo() -> (SocketAddr, Arc<std::sync::Mutex<Vec<SocketAddr>>>) {
