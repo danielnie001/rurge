@@ -6,12 +6,15 @@
 //!
 //! Its tasks: one reads the device and sends each packet on its way
 //! (`dispatch`), one shard of the TCP stack for each part of the
-//! connections (`tcp`), one session for each connection (`session`), and
-//! one writes to the device what all of them send (`writer`).
+//! connections (`tcp`), one session for each TCP connection (`session`) and
+//! for each source endpoint that sends UDP (`udp`), and one writes to the
+//! device what all of them send (`writer`).
 
 pub mod device;
 mod dispatch;
+mod fragment;
 mod hooks;
+mod icmp;
 mod limit;
 mod packet;
 mod session;
@@ -20,6 +23,7 @@ mod stats;
 mod tcp;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+mod udp;
 mod writer;
 
 pub use hooks::{Hooks, Pinger, TunSettings};
@@ -145,7 +149,23 @@ impl Tun {
                 "tun: the system's random source failed; the TUN's initial sequence numbers are predictable"
             );
         }
-        // the shards hold the writer's queue: it ends once they all have
+        let ctx = Arc::new(dispatch::Context {
+            dialer,
+            pool: pool.clone(),
+            hooks,
+            pinger,
+            writer: to_writer.clone(),
+            stats: stats.clone(),
+            life: life.clone(),
+            options,
+            tasks: tasks.clone(),
+            mtu,
+            sessions: udp::Sessions::default(),
+            ids: fragment::Ids::new(),
+            icmp_limit: Mutex::new(icmp::limiter()),
+        });
+        // the shards and the context hold the writer's queue: it ends once they
+        // all have
         drop(to_writer);
         tasks.spawn(writer::run(
             device.clone(),
@@ -153,13 +173,7 @@ impl Tun {
             writer_queue,
             life.clone(),
         ));
-        tasks.spawn(dispatch::run(
-            device,
-            to_shards,
-            options.ipv6,
-            stats.clone(),
-            life.clone(),
-        ));
+        tasks.spawn(dispatch::run(device, to_shards, ctx));
         // what is spawned later, the sessions, is waited for all the same
         tasks.close();
         TunHandle {
@@ -168,8 +182,6 @@ impl Tun {
                 tasks,
                 stats,
                 pool,
-                hooks,
-                pinger,
                 #[cfg(test)]
                 shards,
                 #[cfg(test)]
@@ -216,7 +228,7 @@ pub struct TunOptions {
     pub udp_idle: Duration,
     /// How many packets can wait in a UDP session for the engine to take them. A packet for a session whose queue is full is dropped and counted (`queue_full`).
     pub udp_queue: usize,
-    /// The most destinations one UDP session has, each a flow of the engine's, which takes 1024 in an association (and so does the default). A datagram to one more is dropped and counted (`busy`).
+    /// The most destinations one UDP session has, each a flow of the engine's, which takes 1024 in an association (and so does the default). A datagram to a destination beyond that many is dropped and counted (`busy`).
     pub max_udp_targets: usize,
     /// How long an echo request waits for its reply before it is given up.
     pub echo_timeout: Duration,
@@ -361,12 +373,6 @@ struct Inner {
     tasks: TaskTracker,
     stats: Arc<Stats>,
     pool: Option<Arc<FakeIpPool>>,
-    // not read yet: the UDP and the ICMP paths read these two, and remove
-    // these expectations
-    #[expect(dead_code)]
-    hooks: Arc<dyn Hooks>,
-    #[expect(dead_code)]
-    pinger: Arc<dyn Pinger>,
     #[cfg(test)]
     shards: Vec<Arc<Shard>>,
     #[cfg(test)]
@@ -399,7 +405,10 @@ impl TunHandle {
     /// that waits on its upstream in both directions (writing to one that
     /// takes nothing, reading from one that says nothing), which touches its
     /// stream in neither and would never meet the reset the stop gives the
-    /// connection. A REJECT-DROP hold ends at the stop as well.
+    /// connection. A REJECT-DROP hold ends at the stop as well. So does every UDP
+    /// session: its association is told to end (the token it was given is
+    /// cancelled) and is waited for, so [`TunHandle::join`] waits for each
+    /// association to return, as the engine's does at once.
     ///
     /// A dial that is under way is not cancelled: it is the dialer's, which
     /// holds the session's handle, and a dial dropped half way would leave the
@@ -520,19 +529,19 @@ pub struct Counters {
     pub fragment: u64,
     /// Packets with an address that no real packet through the adapter has: an unspecified, loopback or multicast address at either end, the limited broadcast as the destination, an IPv4-mapped IPv6 address. Counted, never logged.
     pub martian: u64,
-    /// Packets nothing handles: IPv6 while it is off, extension headers, protocols other than TCP, UDP and ICMP, an ICMP that is no echo request, and UDP and ICMP echo requests, which nothing handles yet.
+    /// Packets nothing handles: IPv6 while it is off, extension headers, protocols other than TCP, UDP and ICMP, an ICMP that is no echo request, and ICMP echo requests, which nothing handles yet; UDP datagrams when the dialer carries no UDP; replies from an address of the other family than the app's.
     pub unsupported: u64,
-    /// Packets for a shard whose queue was full.
+    /// Packets for a shard whose queue was full; datagrams for a UDP session whose queue was full; ICMP messages for refused UDP flows that the writer's queue had no room for.
     pub queue_full: u64,
-    /// SYNs to an address of rurge's own space that names nothing.
+    /// SYNs and UDP datagrams to an address of rurge's own space that names nothing; replies from a name that has no address.
     pub unknown_fake: u64,
-    /// SYNs turned away because of the limits on sockets and on half-open connections.
+    /// SYNs turned away because of the limits on sockets and on half-open connections; UDP datagrams turned away because the dialer had no association to give, or because the session already had its most destinations.
     pub busy: u64,
     /// Segments with data past the window the TUN last told of, dropped because the receive buffer had room.
     pub beyond_window: u64,
     /// Resets not sent because of the limit on resets.
     pub rst_limited: u64,
-    /// Echo requests or replies held back by the limit on ICMP; nothing counts it yet.
+    /// ICMP messages for refused UDP flows that the limit on ICMP held back (100 in 3 seconds).
     pub icmp_limited: u64,
     /// Times the TCP stack of a shard panicked and the shard was started over, its connections reset.
     pub stack_panics: u64,

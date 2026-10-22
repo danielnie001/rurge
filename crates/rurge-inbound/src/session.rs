@@ -427,7 +427,9 @@ pub trait UdpClient: Send + Sync {
     ) -> BoxFuture<'a, io::Result<()>>;
     /// The engine refused the flow to `target` (a rule, `block-quic`, a policy
     /// that carries no UDP): called for each of its datagrams that is dropped.
-    /// By default nothing is said: the datagrams are dropped silently.
+    /// By default nothing is said: the datagrams are dropped silently. It is
+    /// called synchronously from the flow's task, so an implementation must not
+    /// block or wait.
     fn refused(&self, target: &Target, kind: RejectKind) {
         let _ = (target, kind);
     }

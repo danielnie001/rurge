@@ -531,7 +531,7 @@ fn bad_udp_and_icmp_checksums_are_malformed() {
         let stats = Stats::default();
         let mut damaged = packet.clone();
         damaged[field_at] ^= 0x01;
-        route(damaged, true, &[], &stats);
+        assert!(route(damaged, true, &[], &stats).is_none());
         assert_eq!(
             stats.counters(),
             Counters {
@@ -1021,7 +1021,7 @@ fn the_bytes_after_the_ip_packet_do_not_reach_the_shard() {
         let stats = Stats::default();
         let mut padded = packet.clone();
         padded.extend([0xaa; 9]);
-        route(padded, true, &[to_shard], &stats);
+        assert!(route(padded, true, &[to_shard], &stats).is_none());
         assert_eq!(shard.try_recv().expect("the shard is given it"), packet);
         assert_eq!(stats.counters(), Counters::default());
     }
@@ -1186,26 +1186,22 @@ async fn ipv6_off_serves_ipv4_only() {
     );
 }
 
-/// Nothing handles UDP or ICMP yet: a datagram and an echo request, in both
-/// families, are dropped as unsupported.
+/// Nothing handles ICMP yet: an echo request, in both families, is dropped as
+/// unsupported.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_and_icmp_are_not_handled_yet() {
     let rig = rig(TunOptions::default());
-    rig.app
-        .inject(udp_packet(sock(APP4, 5353), sock(FAR4, 53), b"query"));
     rig.app.inject(echo_packet(APP4.into(), FAR4.into()));
-    rig.app
-        .inject(udp_packet(sock(APP6, 5353), sock(FAR6, 53), b"query"));
     rig.app.inject(echo_packet(APP6.into(), FAR6.into()));
     eventually("the packets to be counted", WITHIN, || {
-        rig.tun.counters().unsupported == 4
+        rig.tun.counters().unsupported == 2
     })
     .await;
     assert_unanswered(&rig).await;
     assert_eq!(
         rig.tun.counters(),
         Counters {
-            unsupported: 4,
+            unsupported: 2,
             ..Counters::default()
         }
     );
@@ -1237,8 +1233,8 @@ async fn each_reason_warns_once() {
         v6_fragment,
         syn_v4(addr("0.0.0.0:40005"), dst),
         syn_v6(addr("[fd00:6152::1]:40006"), addr("[ff02::1]:80")),
-        udp_packet(sock(APP4, 5353), sock(FAR4, 53), b"query"),
-        udp_packet(sock(APP6, 5353), sock(FAR6, 53), b"query"),
+        ipv4_packet(47, APP4, FAR4, &[0; 8]),
+        ipv6_packet(47, APP6, FAR6, &[0; 8]),
     ] {
         rig.app.inject(packet);
     }
@@ -1314,7 +1310,7 @@ fn a_debug_line_has_the_addresses_that_were_read() {
         (unhandled, true),
         (good6(), false),
     ] {
-        route(packet, ipv6, std::slice::from_ref(&to_shard), &stats);
+        assert!(route(packet, ipv6, std::slice::from_ref(&to_shard), &stats).is_none());
     }
     let ends = "src=198.18.0.1 dst=192.0.2.1";
     assert_eq!(
@@ -1341,11 +1337,14 @@ fn a_full_shard_queue_drops_and_says_so() {
     let stats = Stats::default();
     let packet = good4();
     for _ in 0..3 {
-        route(
-            packet.clone(),
-            true,
-            std::slice::from_ref(&to_shard),
-            &stats,
+        assert!(
+            route(
+                packet.clone(),
+                true,
+                std::slice::from_ref(&to_shard),
+                &stats
+            )
+            .is_none()
         );
     }
     // the first took the queue's one place, the other two found it full

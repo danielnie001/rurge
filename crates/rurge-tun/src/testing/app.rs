@@ -191,6 +191,26 @@ impl AppStack {
         rx
     }
 
+    /// Every UDP packet from the other end goes to the receiver instead of the
+    /// stack, the fragments of a datagram too (an IPv4 packet of protocol 17,
+    /// an IPv6 one whose fragment header is followed by 17): `divert` knows a
+    /// datagram by its ports, which only the first fragment has.
+    pub fn divert_udp(&self) -> mpsc::UnboundedReceiver<Vec<u8>> {
+        self.divert_kind(Carried::Udp)
+    }
+
+    /// Every ICMP packet from the other end goes to the receiver instead of the
+    /// stack.
+    pub fn divert_icmp(&self) -> mpsc::UnboundedReceiver<Vec<u8>> {
+        self.divert_kind(Carried::Icmp)
+    }
+
+    fn divert_kind(&self, kind: Carried) -> mpsc::UnboundedReceiver<Vec<u8>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.shared().state().kind_diverts.push((kind, tx));
+        rx
+    }
+
     /// Sends `packet` to the other end as it is: not through the stack, not
     /// through the filter.
     pub fn inject(&self, packet: Vec<u8>) {
@@ -494,6 +514,8 @@ struct State {
     ports: HashSet<(bool, u16)>,
     next_port: [u16; 2],
     diverts: Vec<(RangeInclusive<u16>, mpsc::UnboundedSender<Vec<u8>>)>,
+    /// The receivers of every packet of a protocol (`divert_udp`, `divert_icmp`).
+    kind_diverts: Vec<(Carried, mpsc::UnboundedSender<Vec<u8>>)>,
     filter: Option<Filter>,
     /// Packets for the other end that the task has not sent yet.
     outbox: VecDeque<Vec<u8>>,
@@ -541,6 +563,7 @@ impl State {
             ports: HashSet::new(),
             next_port: [*PORTS.start(); 2],
             diverts: Vec::new(),
+            kind_diverts: Vec::new(),
             filter: None,
             outbox: VecDeque::new(),
             taken: 0,
@@ -670,6 +693,7 @@ impl State {
             }
         }
         self.diverts.clear();
+        self.kind_diverts.clear();
         self.outbox.clear();
     }
 
@@ -685,6 +709,9 @@ impl State {
         if !self.passes(Direction::FromTun, &mut packet) {
             return;
         }
+        let Some(mut packet) = self.divert_by_kind(packet) else {
+            return;
+        };
         let peek = Peek::of(&packet);
         if let Some(peek) = &peek {
             let position = self
@@ -731,6 +758,29 @@ impl State {
                 }
             },
         );
+    }
+
+    /// Hands `packet` to the receiver of what it carries, if a test asked for
+    /// one, and gives it back to be taken in by the stack otherwise.
+    fn divert_by_kind(&mut self, packet: Vec<u8>) -> Option<Vec<u8>> {
+        let Some(kind) = Carried::of(&packet) else {
+            return Some(packet);
+        };
+        let Some(position) = self
+            .kind_diverts
+            .iter()
+            .position(|(asked, _)| *asked == kind)
+        else {
+            return Some(packet);
+        };
+        match self.kind_diverts[position].1.send(packet) {
+            Ok(()) => None,
+            // nobody receives any more: the stack has it after all
+            Err(SendError(back)) => {
+                self.kind_diverts.remove(position);
+                Some(back)
+            }
+        }
     }
 
     /// The open socket with this local and remote end.
@@ -825,7 +875,44 @@ impl Conn {
 
 const TCP: u8 = 6;
 const UDP: u8 = 17;
+const ICMP: u8 = 1;
+const ICMPV6: u8 = 58;
+/// The next header of an IPv6 packet that has a fragment header.
+const IPV6_FRAGMENT: u8 = 44;
 const RST: u8 = 0x04;
+
+/// What an IP packet carries, as far as `divert_udp` and `divert_icmp` tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Carried {
+    Udp,
+    Icmp,
+}
+
+impl Carried {
+    /// UDP or ICMP, for any packet that carries it: a fragment of a datagram
+    /// as well (IPv4's protocol field is in every fragment, and IPv6's next
+    /// header after the fragment header). `None` for any other packet.
+    fn of(packet: &[u8]) -> Option<Carried> {
+        let (protocol, icmp) = match packet.first()? >> 4 {
+            4 => (*packet.get(9)?, ICMP),
+            6 => {
+                let next = *packet.get(6)?;
+                let protocol = if next == IPV6_FRAGMENT {
+                    *packet.get(40)?
+                } else {
+                    next
+                };
+                (protocol, ICMPV6)
+            }
+            _ => return None,
+        };
+        match protocol {
+            UDP => Some(Carried::Udp),
+            _ if protocol == icmp => Some(Carried::Icmp),
+            _ => None,
+        }
+    }
+}
 
 /// What the stack looks at of a packet before it takes it in: the ends of a
 /// TCP segment or UDP datagram, and the flags of the segment.
