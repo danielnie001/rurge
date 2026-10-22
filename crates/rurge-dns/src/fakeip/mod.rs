@@ -14,8 +14,10 @@
 //! remembers an address across a restart finds the same name behind it. When
 //! the last run did not stop cleanly the file is behind by an unknown number
 //! of assignments, which applications may still hold addresses of: the
-//! indices the allocator would hand out next are held back for a while, and
-//! so is any index the file does not name.
+//! indices the allocator would hand out next are held back for a while. Any
+//! index the file does not name is held back as well, in addition to those
+//! and not among them: an earlier run held it back and has not given it out
+//! since.
 
 mod file;
 
@@ -36,7 +38,8 @@ pub const FAKE_COUNT: u32 = 130_814;
 pub const FAKE_TTL: Duration = Duration::from_secs(30);
 /// How long the indices held back after an unclean stop stay unused.
 pub const QUARANTINE: Duration = Duration::from_secs(120);
-/// How many indices an unclean stop holds back.
+/// How many indices an unclean stop holds back: the next ones the allocator
+/// would hand out, besides any the file has no name for.
 pub const QUARANTINE_COUNT: u32 = 2_048;
 /// The name of the file in the data directory.
 pub const FILE_NAME: &str = "fake-ip.txt";
@@ -104,10 +107,14 @@ pub enum AssignError {
 pub enum Loaded {
     /// There was no file: an empty pool.
     Missing,
-    /// The last run stopped cleanly: its table, as it was.
+    /// The last run stopped cleanly: its table, as it was. Nothing is held
+    /// back but the indices the file has no name for, which an earlier run
+    /// held back and did not give out again.
     Clean,
     /// The last run did not stop cleanly: its table, less what may have been
-    /// given out after the last save.
+    /// given out after the last save. The next [`QUARANTINE_COUNT`] indices
+    /// the allocator would hand out are held back, besides the ones the file
+    /// has no name for.
     Unclean,
     /// The file could not be read or made no sense: an empty pool, with what
     /// the file may have held held back. The reason quotes nothing of the
@@ -197,11 +204,12 @@ impl State {
         state
     }
 
-    /// Holds back indices from the allocator, in the order it would hand
-    /// them out, until `want` are held (the ones already held count), and
-    /// sets when they are let go.
+    /// Holds back the next `want` indices the allocator would hand out, in
+    /// the order it would, behind those already held (the holes `restore`
+    /// found, which do not count among the `want`), and sets when everything
+    /// held is let go.
     fn hold_back(&mut self, want: usize, now: Instant) {
-        while self.held.len() < want {
+        for _ in 0..want {
             let Some(index) = self.take_fresh().or_else(|| self.take_idle()) else {
                 break;
             };
@@ -367,7 +375,8 @@ impl FakeIpPool {
         };
         // What an unclean run gave out after its last save, or what a file
         // that cannot be read held, may still be in applications' hands: the
-        // indices that would be given out next are not, for a while.
+        // indices that would be given out next are not, for a while. They are
+        // held back besides the holes `restore` already holds, not among them.
         let want = match loaded {
             Loaded::Unclean | Loaded::NotRead(_) => quarantine as usize,
             Loaded::Missing | Loaded::Clean => 0,
@@ -1279,18 +1288,25 @@ mod tests {
         assert_eq!(pool.assign("y2.test", later), Ok(2));
         assert_eq!(pool.assign("y3.test", later), Ok(6));
 
-        // Unclean: the holes are among the numbers held back.
+        // Unclean: the holes are held back, and so are the next three the
+        // allocator would hand out, 4, 5 and 6, besides them.
         let (pool, loaded, _dir) = open_text(&file_text(4, false, false, &[0, 3]), now, 16, 3);
         assert_eq!(loaded, Loaded::Unclean);
-        assert_eq!(pool.assign("x1.test", now), Ok(5), "1, 2 and 4 are held");
+        assert_eq!(
+            pool.assign("x1.test", now),
+            Ok(7),
+            "1, 2 and 4 to 6 are held"
+        );
         for (n, index) in [
             ("y1.test", 1),
             ("y2.test", 2),
             ("y3.test", 4),
-            ("y4.test", 6),
+            ("y4.test", 5),
+            ("y5.test", 6),
         ] {
             assert_eq!(pool.assign(n, later), Ok(index), "{n}");
         }
+        assert_eq!(pool.assign("y6.test", later), Ok(8));
 
         // After the cursor wrapped, a number without a name is a hole too.
         let (pool, loaded, _dir) = open_text(&file_text(4, true, true, &[0, 3]), now, 4, 4);
@@ -1298,6 +1314,53 @@ mod tests {
         assert_eq!(pool.assign("x1.test", now), Ok(0), "used longest ago");
         assert_eq!(pool.assign("y1.test", later), Ok(1));
         assert_eq!(pool.assign("y2.test", later), Ok(2));
+    }
+
+    /// A run that was not stopped cleanly holds back the indices after its
+    /// cursor, so the file it rewrites has them as holes. If it crashes too,
+    /// before it has given them out again and before it saves, the names it
+    /// gave out from the cursor in the meantime are in applications' hands,
+    /// and the next run has to hold those back as well as the holes.
+    #[test]
+    fn a_crash_inside_the_quarantine_holds_back_what_the_crashed_run_gave_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        std::fs::write(&path, file_text(5, false, false, &[0, 1, 2, 3, 4])).unwrap();
+        let now = Instant::now();
+
+        // The first run holds back 5 to 8 (the file now has the cursor at 9
+        // and no names for them), gives out 9, 10 and 11, and is killed.
+        let (first, loaded) = FakeIpPool::open_with(&path, now, 32, 4);
+        assert_eq!(loaded, Loaded::Unclean);
+        for (n, index) in [("x1.test", 9), ("x2.test", 10), ("x3.test", 11)] {
+            assert_eq!(first.assign(n, now), Ok(index), "{n}");
+        }
+        drop(first);
+        assert_eq!(state_line(&path), "cursor 9 wrapped 0 clean 0");
+
+        // The second run holds back the holes, 5 to 8, and the next four,
+        // 9 to 12, which cover what the first gave out.
+        let (second, loaded) = FakeIpPool::open_with(&path, now, 32, 4);
+        assert_eq!(loaded, Loaded::Unclean);
+        assert_eq!(
+            second.assign("y1.test", now),
+            Ok(13),
+            "9, 10 and 11 may be in applications' hands"
+        );
+        // let go, the holes come first, then the next four
+        let later = now + Duration::from_secs(121);
+        for (n, index) in [
+            ("z1.test", 5),
+            ("z2.test", 6),
+            ("z3.test", 7),
+            ("z4.test", 8),
+            ("z5.test", 9),
+            ("z6.test", 10),
+            ("z7.test", 11),
+            ("z8.test", 12),
+        ] {
+            assert_eq!(second.assign(n, later), Ok(index), "{n}");
+        }
     }
 
     #[test]
