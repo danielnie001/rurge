@@ -5,9 +5,9 @@
 
 use super::log_capture::LogCapture;
 use super::support::{
-    Rig, WITHIN, addr, echo_bytes, echo_packet, eventually, ip_around, ipv4_packet, ipv6_packet,
-    refresh, rig, sock, syn_v4, syn_v6, tcp_bytes, tcp_packet, tcp_repr, udp_bytes, udp_packet,
-    with_fragment_field, with_ip_options, within,
+    Rig, WITHIN, addr, checksum, echo_bytes, echo_bytes_with, echo_packet, eventually, ip_around,
+    ipv4_packet, ipv6_packet, refresh, rig, sock, syn_v4, syn_v6, tcp_bytes, tcp_packet, tcp_repr,
+    udp_bytes, udp_packet, udp_v4, with_fragment_field, with_ip_options, within,
 };
 use crate::dispatch::route;
 use crate::packet::{Parsed, Reason, Segment, Transport, classify, segment};
@@ -390,11 +390,15 @@ fn truncated_transport_headers_and_port_0_are_malformed() {
         }
     }
     // a length field that is less than the datagram is what the sender
-    // meant: the rest is padding
-    let mut padded = udp.clone();
-    padded[4..6].copy_from_slice(&10u16.to_be_bytes());
-    for packet in in_both(17, &padded) {
-        passes(&packet);
+    // meant: the rest is padding, which the checksum does not cover (so each
+    // family has the datagram its own addresses make a checksum for)
+    for (src, dst) in [
+        (sock(APP4, PORT), sock(FAR4, SERVICE)),
+        (sock(APP6, PORT), sock(FAR6, SERVICE)),
+    ] {
+        let mut padded = udp_bytes(src, dst, b"da");
+        padded.extend(b"ta");
+        passes(&ip_around(17, src.ip(), dst.ip(), &padded));
     }
     // ICMP: the header stops short
     for (src, dst) in [
@@ -410,11 +414,24 @@ fn truncated_transport_headers_and_port_0_are_malformed() {
                 "ICMP for {src} cut to {cut}"
             );
         }
-        passes(&ip_around(protocol, src, dst, &echo[..8]));
+        // the shortest echo request there is: the header and nothing after
+        // it, with the checksum of that
+        passes(&ip_around(
+            protocol,
+            src,
+            dst,
+            &echo_bytes_with(src, dst, &[]),
+        ));
     }
     // the packets these were made from pass
-    for packet in in_both(6, &tcp).iter().chain(&in_both(17, &udp)) {
-        passes(packet);
+    for packet in in_both(6, &tcp) {
+        passes(&packet);
+    }
+    for (src, dst) in [
+        (sock(APP4, PORT), sock(FAR4, SERVICE)),
+        (sock(APP6, PORT), sock(FAR6, SERVICE)),
+    ] {
+        passes(&udp_packet(src, dst, b"data"));
     }
 }
 
@@ -450,6 +467,200 @@ fn icmp_other_than_echo_is_unsupported() {
             "ICMPv6 type {message_type}"
         );
     }
+}
+
+/// Where the checksum of the UDP datagram or the ICMP message in `packet` is:
+/// an IPv4 packet with no options, or an IPv6 one with no extension header.
+fn checksum_at(packet: &[u8], udp: bool) -> usize {
+    let header = if packet[0] >> 4 == 4 { 20 } else { 40 };
+    header + if udp { 6 } else { 2 }
+}
+
+/// A UDP datagram and an echo request of each family, which pass as they are,
+/// with whether each is UDP.
+fn checked_packets() -> [(&'static str, Vec<u8>, bool); 4] {
+    let (src4, dst4) = (sock(APP4, 5353), sock(FAR4, 53));
+    let (src6, dst6) = (sock(APP6, 5353), sock(FAR6, 53));
+    [
+        ("UDP over IPv4", udp_packet(src4, dst4, b"query"), true),
+        ("UDP over IPv6", udp_packet(src6, dst6, b"query"), true),
+        ("ICMPv4", echo_packet(APP4.into(), FAR4.into()), false),
+        ("ICMPv6", echo_packet(APP6.into(), FAR6.into()), false),
+    ]
+}
+
+/// The checksums of UDP and of ICMP are checked before a datagram or a message
+/// goes anywhere (design 4.4, M3-D5): a change of any bit of what a checksum
+/// covers, or of the checksum, makes the packet malformed. The checksum of UDP
+/// and of ICMPv6 covers the addresses too (the pseudo-header): the same bytes
+/// between other addresses do not pass, and neither does a checksum made as
+/// ICMPv4 makes it, over the message alone. An ICMPv4 message has no
+/// pseudo-header, so other addresses do not matter to it.
+#[test]
+fn bad_udp_and_icmp_checksums_are_malformed() {
+    for (what, packet, udp) in checked_packets() {
+        let parsed = passes(&packet);
+        let field_at = checksum_at(&packet, udp);
+        if udp {
+            // one that is no more than one bit would be the checksum that is
+            // left out, UDP's zero, if that bit changed
+            let field = u16::from_be_bytes([packet[field_at], packet[field_at + 1]]);
+            assert!(field.count_ones() > 1, "{what}: the premise, {field:#06x}");
+        }
+        // every byte from the transport header on; but for ICMP the type, which
+        // decides that what is no echo request is not read any further
+        let header = field_at - if udp { 6 } else { 2 };
+        for at in header + usize::from(!udp)..packet.len() {
+            for bit in [0x01, 0x80] {
+                let mut damaged = packet.clone();
+                damaged[at] ^= bit;
+                assert_eq!(
+                    dropped(&damaged),
+                    Reason::Malformed,
+                    "{what}: bit {bit:#04x} of byte {at}"
+                );
+                assert_eq!(
+                    ends_of(&damaged),
+                    Some((parsed.src, parsed.dst)),
+                    "{what}: the drop has the addresses"
+                );
+            }
+        }
+        // counted as malformed with the packets that cannot be read, not as
+        // the unsupported ones that nothing handles yet
+        let stats = Stats::default();
+        let mut damaged = packet.clone();
+        damaged[field_at] ^= 0x01;
+        route(damaged, true, &[], &stats);
+        assert_eq!(
+            stats.counters(),
+            Counters {
+                malformed: 1,
+                ..Counters::default()
+            },
+            "{what}"
+        );
+    }
+    let (src4, dst4) = (sock(APP4, 5353), sock(FAR4, 53));
+    let (src6, dst6) = (sock(APP6, 5353), sock(FAR6, 53));
+    let (elsewhere4, elsewhere6) = (
+        IpAddr::from(Ipv4Addr::new(192, 0, 2, 99)),
+        IpAddr::from(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 99)),
+    );
+    let echo4 = echo_bytes(APP4.into(), FAR4.into());
+    let echo6 = echo_bytes(APP6.into(), FAR6.into());
+    // the same bytes between other addresses, either end moved
+    for (what, protocol, bytes, (src, dst), elsewhere) in [
+        (
+            "UDP over IPv4",
+            17,
+            udp_bytes(src4, dst4, b"query"),
+            (src4.ip(), dst4.ip()),
+            elsewhere4,
+        ),
+        (
+            "UDP over IPv6",
+            17,
+            udp_bytes(src6, dst6, b"query"),
+            (src6.ip(), dst6.ip()),
+            elsewhere6,
+        ),
+        (
+            "ICMPv6",
+            58,
+            echo6.clone(),
+            (APP6.into(), FAR6.into()),
+            elsewhere6,
+        ),
+    ] {
+        passes(&ip_around(protocol, src, dst, &bytes));
+        assert_eq!(
+            dropped(&ip_around(protocol, src, elsewhere, &bytes)),
+            Reason::Malformed,
+            "{what} to another destination"
+        );
+        assert_eq!(
+            dropped(&ip_around(protocol, elsewhere, dst, &bytes)),
+            Reason::Malformed,
+            "{what} from another source"
+        );
+    }
+    passes(&ip_around(1, APP4.into(), elsewhere4, &echo4));
+    passes(&ip_around(1, elsewhere4, FAR4.into(), &echo4));
+    // ICMPv6 with the checksum of the message alone, which is ICMPv4's
+    let mut plain = echo6.clone();
+    plain[2..4].fill(0);
+    let sum = checksum(&plain);
+    plain[2..4].copy_from_slice(&sum.to_be_bytes());
+    assert_ne!(plain, echo6, "the premise: the two checksums differ");
+    assert_eq!(
+        dropped(&ipv6_packet(58, APP6, FAR6, &plain)),
+        Reason::Malformed
+    );
+    // messages of odd length have their last byte counted, with a zero after it
+    for (src, dst) in [
+        (IpAddr::from(APP4), IpAddr::from(FAR4)),
+        (APP6.into(), FAR6.into()),
+    ] {
+        let protocol = if src.is_ipv4() { 1 } else { 58 };
+        let echo = echo_bytes_with(src, dst, &[1, 2, 3, 4, 5]);
+        passes(&ip_around(protocol, src, dst, &echo));
+        let mut damaged = echo.clone();
+        *damaged.last_mut().expect("a message") ^= 0x01;
+        assert_eq!(
+            dropped(&ip_around(protocol, src, dst, &damaged)),
+            Reason::Malformed,
+            "the odd byte of a message for {dst}"
+        );
+    }
+}
+
+/// UDP over IPv4 may leave the checksum out, which is a zero in its place
+/// (RFC 768): there is nothing to check, so what the datagram carries is
+/// anything.
+#[test]
+fn udp_over_ipv4_without_a_checksum_is_accepted() {
+    let (src, dst) = (sock(APP4, 5353), sock(FAR4, 53));
+    let packet = udp_v4(src, dst, b"query");
+    let field = checksum_at(&packet, true);
+    assert_eq!(
+        &packet[field..field + 2],
+        &[0, 0],
+        "the premise: no checksum"
+    );
+    let parsed = passes(&packet);
+    assert_eq!(
+        parsed.transport,
+        Transport::Udp {
+            src_port: 5353,
+            dst_port: 53
+        }
+    );
+    // the datagram carries what it likes
+    let mut other = packet.clone();
+    *other.last_mut().expect("a datagram") ^= 0xff;
+    assert_eq!(passes(&other).transport, parsed.transport);
+}
+
+/// UDP over IPv6 may not (RFC 8200, 8.1): a checksum of zero is not "none"
+/// there but a datagram to be thrown away. smoltcp's `verify_checksum` takes a
+/// zero for right in both families, so the TUN refuses it itself. A checksum
+/// that works out to zero is sent as `ffff`, and that is right.
+#[test]
+fn udp_over_ipv6_with_checksum_zero_is_malformed() {
+    let (src, dst) = (sock(APP6, 5353), sock(FAR6, 53));
+    let mut packet = udp_packet(src, dst, b"query");
+    passes(&packet);
+    let field = checksum_at(&packet, true);
+    packet[field..field + 2].fill(0);
+    assert_eq!(dropped(&packet), Reason::Malformed);
+    assert_eq!(ends_of(&packet), Some((APP6.into(), FAR6.into())));
+    // a datagram whose checksum is `ffff`: some two bytes of payload make one
+    let datagram = (0..=u16::MAX)
+        .map(|payload| udp_bytes(src, dst, &payload.to_be_bytes()))
+        .find(|datagram| datagram[6..8] == [0xff, 0xff])
+        .expect("a datagram with a checksum of ffff");
+    passes(&ipv6_packet(17, APP6, FAR6, &datagram));
 }
 
 #[test]

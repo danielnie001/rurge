@@ -11,6 +11,7 @@
 
 pub mod device;
 mod dispatch;
+mod hooks;
 mod limit;
 mod packet;
 mod session;
@@ -21,7 +22,10 @@ mod tcp;
 pub mod testing;
 mod writer;
 
+pub use hooks::{Hooks, Pinger, TunSettings};
+
 use device::Device;
+use rurge_dns::fakeip::FakeIpPool;
 use rurge_inbound::Dialer;
 use session::Holds;
 use stats::Stats;
@@ -63,6 +67,12 @@ impl Tun {
     /// [`TunHandle::stop`] is called or the device fails. Dropping the handles
     /// does not stop them, and once the last is gone nothing can.
     ///
+    /// `dialer` is where the sessions go (a TCP connection once its handshake
+    /// is over, a UDP session once a datagram has come), `hooks` and `pinger`
+    /// what the TUN asks of whoever started it, and `pool` the fake addresses:
+    /// without one every address of the pool's space is one that names
+    /// nothing, and a connection to it is reset.
+    ///
     /// # Panics
     ///
     /// If the options are ones [`TunOptions::check`] refuses (they are not
@@ -73,6 +83,9 @@ impl Tun {
     pub fn start(
         device: Arc<dyn Device>,
         dialer: Arc<dyn Dialer>,
+        hooks: Arc<dyn Hooks>,
+        pinger: Arc<dyn Pinger>,
+        pool: Option<Arc<FakeIpPool>>,
         options: TunOptions,
     ) -> TunHandle {
         if let Err(error) = options.check() {
@@ -108,6 +121,7 @@ impl Tun {
                 seed,
                 budget.clone(),
                 admission.clone(),
+                pool.clone(),
                 &options,
             ));
             let (to_shard, packets) = mpsc::channel(options.shard_queue);
@@ -153,6 +167,9 @@ impl Tun {
                 life,
                 tasks,
                 stats,
+                pool,
+                hooks,
+                pinger,
                 #[cfg(test)]
                 shards,
                 #[cfg(test)]
@@ -195,6 +212,16 @@ pub struct TunOptions {
     pub shard_queue: usize,
     /// How many batches of packets (one for each turn of a shard) can wait for the writer. A shard whose batch finds the queue full waits for room.
     pub writer_queue: usize,
+    /// How long a UDP session, and each destination in it, can go without a packet either way before it ends. The default is the engine's own: its flows end after 60 seconds of quiet.
+    pub udp_idle: Duration,
+    /// How many packets can wait in a UDP session for the engine to take them. A packet for a session whose queue is full is dropped and counted (`queue_full`).
+    pub udp_queue: usize,
+    /// The most destinations one UDP session has, each a flow of the engine's, which takes 1024 in an association (and so does the default). A datagram to one more is dropped and counted (`busy`).
+    pub max_udp_targets: usize,
+    /// How long an echo request waits for its reply before it is given up.
+    pub echo_timeout: Duration,
+    /// The most echo requests waiting for a reply at once, in the whole TUN. One more is dropped and counted (`busy`).
+    pub max_echoes: usize,
 }
 
 impl Default for TunOptions {
@@ -214,14 +241,21 @@ impl Default for TunOptions {
             timeout: Duration::from_secs(600),
             shard_queue: 1_024,
             writer_queue: 256,
+            udp_idle: Duration::from_secs(60),
+            udp_queue: 256,
+            max_udp_targets: 1_024,
+            echo_timeout: Duration::from_secs(5),
+            max_echoes: 1_024,
         }
     }
 }
 
 impl TunOptions {
-    /// The longest `keep_alive` and `timeout` there can be. The stack adds
-    /// them to a clock that counts in microseconds in an `i64`: a day is far
-    /// below where that overflows, and far above any setting that is meant.
+    /// The longest `keep_alive`, `timeout`, `udp_idle` and `echo_timeout`
+    /// there can be. The stack adds the first two to a clock that counts in
+    /// microseconds in an `i64`, and the others are added to times as well: a
+    /// day is far below where that overflows, and far above any setting that
+    /// is meant.
     const LONGEST: Duration = Duration::from_secs(24 * 60 * 60);
 
     /// Whether the options can run a TUN: the first that cannot, in the order
@@ -253,6 +287,21 @@ impl TunOptions {
         }
         if self.writer_queue == 0 {
             return Err("writer_queue must be more than zero".into());
+        }
+        if self.udp_idle < Duration::from_millis(1) || self.udp_idle > Self::LONGEST {
+            return Err("udp_idle must be at least 1 ms and at most 24 hours".into());
+        }
+        if self.udp_queue == 0 {
+            return Err("udp_queue must be more than zero".into());
+        }
+        if self.max_udp_targets == 0 {
+            return Err("max_udp_targets must be more than zero".into());
+        }
+        if self.echo_timeout < Duration::from_millis(1) || self.echo_timeout > Self::LONGEST {
+            return Err("echo_timeout must be at least 1 ms and at most 24 hours".into());
+        }
+        if self.max_echoes == 0 {
+            return Err("max_echoes must be more than zero".into());
         }
         Ok(())
     }
@@ -311,6 +360,13 @@ struct Inner {
     life: Arc<Life>,
     tasks: TaskTracker,
     stats: Arc<Stats>,
+    pool: Option<Arc<FakeIpPool>>,
+    // not read yet: the UDP and the ICMP paths read these two, and remove
+    // these expectations
+    #[expect(dead_code)]
+    hooks: Arc<dyn Hooks>,
+    #[expect(dead_code)]
+    pinger: Arc<dyn Pinger>,
     #[cfg(test)]
     shards: Vec<Arc<Shard>>,
     #[cfg(test)]
@@ -369,6 +425,11 @@ impl TunHandle {
     /// The packets dropped so far, for each reason.
     pub fn counters(&self) -> Counters {
         self.inner.stats.counters()
+    }
+
+    /// The pool of fake addresses the TUN was started with, if it had one.
+    pub fn pool(&self) -> Option<Arc<FakeIpPool>> {
+        self.inner.pool.clone()
     }
 
     /// The sessions that are running: the TUN's tasks but the ones it starts
@@ -453,7 +514,7 @@ pub enum Ending {
 /// of the TCP stack.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
-    /// Packets that cannot be read: a version other than 4 and 6, lengths that do not fit, an IPv4 header checksum that does not hold, a transport header that is cut short or has port 0.
+    /// Packets that cannot be read: a version other than 4 and 6, lengths that do not fit, an IPv4 header checksum that does not hold, a transport header that is cut short or has port 0, the checksum of a UDP datagram or of an ICMP echo request that does not hold (or that a UDP datagram over IPv6 does not have).
     pub malformed: u64,
     /// Fragments, which the TUN does not reassemble.
     pub fragment: u64,

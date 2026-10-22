@@ -5,8 +5,9 @@
 use crate::device::{AppEnd, Device, MemoryDevice};
 use crate::stats::Stats;
 use crate::tcp::{Admission, Budget, Shard};
-use crate::testing::{AppStack, AppTcp, FakeDialer, pattern};
-use crate::{Life, Tun, TunHandle, TunOptions};
+use crate::testing::{AppStack, AppTcp, FakeDialer, FakeHooks, FakePinger, FakeResolve, pattern};
+use crate::{Life, Tun, TunHandle, TunOptions, TunSettings};
+use rurge_dns::fakeip::FakeIpPool;
 use rurge_inbound::Dialer;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
@@ -28,10 +29,49 @@ pub(crate) struct Rig {
     pub(crate) dialer: Arc<FakeDialer>,
 }
 
+/// What a TUN is started with besides its device, its dialer and its options,
+/// and what a test may want to reach once it is started: the settings of the
+/// generation in use, the pinger and the pool of fake addresses.
+pub(crate) struct Extras {
+    pub(crate) hooks: Arc<FakeHooks>,
+    pub(crate) pinger: Arc<FakePinger>,
+    pub(crate) pool: Option<Arc<FakeIpPool>>,
+}
+
+impl Default for Extras {
+    /// Settings with a resolver that knows no name and `icmp-forwarding` on, a
+    /// pinger that has been scripted nothing (every echo request fails), and a
+    /// pool with no name in it.
+    fn default() -> Extras {
+        Extras {
+            hooks: FakeHooks::new(TunSettings {
+                resolver: FakeResolve::new(),
+                icmp_forwarding: true,
+            }),
+            pinger: FakePinger::new(),
+            pool: Some(Arc::new(FakeIpPool::new())),
+        }
+    }
+}
+
 /// A rig on a memory device with an MTU of 1500 and room for 4096 packets
 /// each way.
 pub(crate) fn rig(options: TunOptions) -> Rig {
     rig_on(MemoryDevice::pair(1500, 4096), options)
+}
+
+/// The same with `extras` in place of the default ones, which are given back
+/// for the test to reach what the TUN was started with.
+pub(crate) fn rig_extras(options: TunOptions, extras: Extras) -> (Rig, Extras) {
+    let (device, end) = MemoryDevice::pair(1500, 4096);
+    let dialer = FakeDialer::new();
+    let tun = tun_dialing(Arc::new(device), dialer.clone(), &extras, options);
+    let rig = Rig {
+        tun,
+        app: AppStack::start(end),
+        dialer,
+    };
+    (rig, extras)
 }
 
 /// A rig on a memory device, whose app end is `end`. The TUN is started by
@@ -70,18 +110,26 @@ pub(crate) fn tun_with(
     options: TunOptions,
 ) -> (TunHandle, Arc<FakeDialer>) {
     let dialer = FakeDialer::new();
-    let tun = tun_dialing(device, dialer.clone(), options);
+    let tun = tun_dialing(device, dialer.clone(), &Extras::default(), options);
     (tun, dialer)
 }
 
-/// The same with a `Dialer` of the test's own. The only call of `Tun::start` is
-/// here.
+/// The same with a `Dialer` of the test's own, and `extras`. The only call of
+/// `Tun::start` is here.
 pub(crate) fn tun_dialing(
     device: Arc<dyn Device>,
     dialer: Arc<dyn Dialer>,
+    extras: &Extras,
     options: TunOptions,
 ) -> TunHandle {
-    Tun::start(device, dialer, options)
+    Tun::start(
+        device,
+        dialer,
+        extras.hooks.clone(),
+        extras.pinger.clone(),
+        extras.pool.clone(),
+        options,
+    )
 }
 
 /// One shard on its own, for a test that takes its turns by hand, with what a
@@ -95,8 +143,18 @@ pub(crate) struct Lone {
     pub(crate) budget: Arc<Budget>,
 }
 
-/// A shard on a device with an MTU of 1500, whose clock starts at `epoch`.
+/// A shard on a device with an MTU of 1500, whose clock starts at `epoch`, and
+/// with no pool of fake addresses behind it.
 pub(crate) fn lone_shard(options: &TunOptions, epoch: Instant) -> Lone {
+    lone_shard_with_pool(options, epoch, None)
+}
+
+/// The same with `pool` behind it.
+pub(crate) fn lone_shard_with_pool(
+    options: &TunOptions,
+    epoch: Instant,
+    pool: Option<Arc<FakeIpPool>>,
+) -> Lone {
     let life = Arc::new(Life::default());
     let stats = Arc::new(Stats::default());
     let admission = Arc::new(Admission::new(life.clone(), stats.clone(), options));
@@ -112,6 +170,7 @@ pub(crate) fn lone_shard(options: &TunOptions, epoch: Instant) -> Lone {
         1,
         budget.clone(),
         admission.clone(),
+        pool,
         options,
     ));
     Lone {
@@ -411,13 +470,18 @@ pub(crate) fn udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Ve
 
 /// An ICMP echo request of the addresses' family, the checksum right.
 pub(crate) fn echo_bytes(src: IpAddr, dst: IpAddr) -> Vec<u8> {
+    echo_bytes_with(src, dst, &[1, 2, 3, 4])
+}
+
+/// The same with `data` after the header.
+pub(crate) fn echo_bytes_with(src: IpAddr, dst: IpAddr, data: &[u8]) -> Vec<u8> {
     let caps = ChecksumCapabilities::default();
     match (src, dst) {
         (IpAddr::V4(_), IpAddr::V4(_)) => {
             let repr = Icmpv4Repr::EchoRequest {
                 ident: 7,
                 seq_no: 1,
-                data: &[1, 2, 3, 4],
+                data,
             };
             let mut bytes = vec![0; repr.buffer_len()];
             repr.emit(&mut Icmpv4Packet::new_unchecked(&mut bytes[..]), &caps);
@@ -427,7 +491,7 @@ pub(crate) fn echo_bytes(src: IpAddr, dst: IpAddr) -> Vec<u8> {
             let repr = Icmpv6Repr::EchoRequest {
                 ident: 7,
                 seq_no: 1,
-                data: &[1, 2, 3, 4],
+                data,
             };
             let mut bytes = vec![0; repr.buffer_len()];
             repr.emit(

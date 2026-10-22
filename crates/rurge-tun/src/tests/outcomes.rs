@@ -11,8 +11,8 @@
 use super::hazards::{PSH_ACK, app4, open_by_hand};
 use super::log_capture::LogCapture;
 use super::support::{
-    Lone, WITHIN, addr, data_segment_v4, eventually, hello, is_fin, is_reset, is_syn, lone_shard,
-    rig, rig_with, syn_v4, tun_dialing, tun_on, tun_with, within,
+    Extras, Lone, WITHIN, addr, data_segment_v4, eventually, hello, is_fin, is_reset, is_syn,
+    lone_shard, rig, rig_with, syn_v4, tun_dialing, tun_on, tun_with, within,
 };
 use crate::device::{Device, MemoryDevice};
 use crate::packet::segment;
@@ -556,7 +556,12 @@ async fn a_dial_under_way_is_not_cancelled_by_the_stop() {
         inner: fake.clone(),
         open,
     });
-    let tun = tun_dialing(Arc::new(device), gated.clone(), TunOptions::default());
+    let tun = tun_dialing(
+        Arc::new(device),
+        gated.clone(),
+        &Extras::default(),
+        TunOptions::default(),
+    );
     let app = AppStack::start(end);
     let mut tcp = within("the connection to be made", app.connect(dst))
         .await

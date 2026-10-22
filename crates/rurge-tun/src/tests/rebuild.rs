@@ -9,15 +9,18 @@
 use super::hazards::{ACK, PSH_ACK, app4, fields, open_by_hand, watch};
 use super::log_capture::LogCapture;
 use super::support::{
-    WITHIN, addr, data_segment_v4, eventually, hello, is_syn, lone_shard, rig, segment_v4, syn_v4,
-    tcp_packet, tcp_repr, within,
+    WITHIN, addr, data_segment_v4, eventually, hello, is_syn, lone_shard, lone_shard_with_pool,
+    rig, segment_v4, sock, syn_v4, tcp_packet, tcp_repr, within,
 };
+use crate::tcp::shard::Turn;
 use crate::tcp::{Outcome, PANIC_MARKER, Shard};
 use crate::testing::{Script, Upstream};
 use crate::{Counters, TunOptions};
+use rurge_dns::fakeip::{FakeIpPool, v4_of};
 use smoltcp::wire::{TcpControl, TcpRepr, TcpSeqNumber};
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -82,6 +85,41 @@ fn a_shard_that_panicked_is_rebuilt_by_the_next_to_take_its_lock() {
     assert_eq!(lone.shard.state().socket_count(), 1);
     assert_eq!(lone.admission.sockets(), 1);
     assert_eq!(lone.admission.half_open(), 0);
+}
+
+/// The pool of fake addresses is the TUN's and not the stack's: a shard that
+/// was rebuilt still has it, and takes a SYN to an address that stands for a
+/// name as it did, with the name.
+#[test]
+fn a_rebuilt_shard_keeps_its_pool() {
+    let epoch = Instant::now();
+    let at = |ms: u64| epoch + Duration::from_millis(ms);
+    let pool = Arc::new(FakeIpPool::new());
+    let index = pool.assign("a.test", epoch).expect("an address");
+    let lone = lone_shard_with_pool(&TunOptions::default(), epoch, Some(pool));
+    let fake = sock(v4_of(index), 80);
+    let name_of = |turn: &Turn| {
+        let [opened] = &turn.opened[..] else {
+            panic!("the SYN opens a connection");
+        };
+        opened.name.as_ref().map(|(name, _)| name.clone())
+    };
+    let before = lone
+        .shard
+        .state()
+        .turn(at(0), &mut vec![syn_v4(app4(40000), fake)]);
+    assert_eq!(name_of(&before).as_deref(), Some("a.test"));
+    // a segment that panics the stack
+    let marker = data_segment_v4(app4(40000), fake, 2, 0, PSH_ACK, PANIC_MARKER);
+    assert!(panics(&lone.shard, at(10), vec![marker]));
+    // whoever takes the lock next rebuilds the shard
+    let after = lone
+        .shard
+        .state()
+        .turn(at(20), &mut vec![syn_v4(app4(40001), fake)]);
+    assert_eq!(lone.stats.counters().stack_panics, 1);
+    assert_eq!(name_of(&after).as_deref(), Some("a.test"));
+    assert_eq!(lone.stats.counters().unknown_fake, 0);
 }
 
 /// The cause of the panic can be the shard's own books. A connection whose

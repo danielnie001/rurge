@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 rurge-config.workspace = true
+rurge-dns.workspace = true
 rurge-net.workspace = true
 rurge-inbound.workspace = true
 rurge-proto.workspace = true
@@ -19,6 +20,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+rurge-dns = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
 

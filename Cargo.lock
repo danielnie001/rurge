@@ -3571,6 +3571,7 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
  "rurge-config",
+ "rurge-dns",
  "rurge-inbound",
  "rurge-net",
  "rurge-proto",

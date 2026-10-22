@@ -7,6 +7,7 @@
 use crate::tcp::{TunStream, Tuple};
 use crate::{Life, TunOptions};
 use rurge_config::{HostName, ListenerKind, SessionInfo};
+use rurge_dns::fakeip::Lease;
 use rurge_inbound::{DialError, Dialer};
 use rurge_proto::RejectKind;
 use std::sync::Arc;
@@ -33,22 +34,32 @@ impl From<&TunOptions> for Holds {
     }
 }
 
+/// `name` is the name behind the address the app connected to, with the lease
+/// on that address, if the address is a fake one: the session is for the name
+/// (its `local` is still the endpoint the app connected to), and holds the
+/// lease until it ends, however long that is, so that the address is not given
+/// to another name meanwhile (design 10.2).
 pub(crate) async fn serve(
     stream: TunStream,
     dialer: Arc<dyn Dialer>,
     tuple: Tuple,
+    name: Option<(String, Lease)>,
     holds: Holds,
     life: Arc<Life>,
 ) {
     if stream.established().await.is_err() {
         return;
     }
+    let (dst_host, _lease) = match name {
+        Some((name, lease)) => (HostName::Domain(name), Some(lease)),
+        None => (HostName::Ip(tuple.dst.ip()), None),
+    };
     let session = SessionInfo {
         src: tuple.src,
         in_port: 0,
         local: Some(tuple.dst),
         listener: ListenerKind::Tun,
-        ..SessionInfo::tcp(HostName::Ip(tuple.dst.ip()), tuple.dst.port())
+        ..SessionInfo::tcp(dst_host, tuple.dst.port())
     };
     // The dial is not raced with the stop: it runs in the dialer, which holds
     // the session's handle, and a dial dropped half way would leave the record

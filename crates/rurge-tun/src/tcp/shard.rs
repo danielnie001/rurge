@@ -21,6 +21,7 @@ use crate::packet::{self, Reason, Segment};
 use crate::session::{self, Holds};
 use crate::space::{self, Place, STACK_V4, STACK_V6};
 use crate::{Life, TunOptions};
+use rurge_dns::fakeip::{FakeIpPool, Lease};
 use rurge_inbound::Dialer;
 use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
@@ -48,7 +49,9 @@ pub(crate) struct Shard {
 
 impl Shard {
     /// `seed` is what smoltcp draws the initial sequence numbers of the
-    /// shard's connections from.
+    /// shard's connections from. `pool` is where the addresses that stand for
+    /// names are looked up, if the TUN has one.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         index: usize,
         mtu: usize,
@@ -56,6 +59,7 @@ impl Shard {
         seed: u64,
         budget: Arc<Budget>,
         admission: Arc<Admission>,
+        pool: Option<Arc<FakeIpPool>>,
         options: &TunOptions,
     ) -> Shard {
         Shard {
@@ -66,6 +70,7 @@ impl Shard {
                 seed,
                 budget,
                 admission,
+                pool,
                 Timers::from(options),
             )),
             kick: Notify::new(),
@@ -181,6 +186,10 @@ pub(crate) struct ShardState {
     budget: Arc<Budget>,
     /// The caps and limits of the whole TUN, which a new SYN meets.
     admission: Arc<Admission>,
+    /// The names behind the fake addresses, which a SYN to one of them looks
+    /// up; the pool's lock is a leaf, so taking it under this shard's lock
+    /// never meets another lock held the other way round. A rebuild keeps it.
+    pool: Option<Arc<FakeIpPool>>,
     timers: Timers,
     /// What the SYN being taken holds, if one is.
     held: Held,
@@ -233,6 +242,10 @@ pub(crate) struct Opened {
     pub(crate) id: ConnId,
     pub(crate) shared: Arc<ConnShared>,
     pub(crate) tuple: Tuple,
+    /// For a connection to a fake address: the name behind it, and the lease
+    /// that keeps the address from being given to another name. The session
+    /// holds it until the session ends.
+    pub(crate) name: Option<(String, Lease)>,
 }
 
 impl ShardState {
@@ -242,6 +255,7 @@ impl ShardState {
         seed: u64,
         budget: Arc<Budget>,
         admission: Arc<Admission>,
+        pool: Option<Arc<FakeIpPool>>,
         timers: Timers,
     ) -> ShardState {
         let mut device = ShardDevice {
@@ -285,6 +299,7 @@ impl ShardState {
             lingering: BTreeSet::new(),
             budget,
             admission,
+            pool,
             timers,
             held: Held::default(),
         }
@@ -316,6 +331,7 @@ impl ShardState {
             seed,
             self.budget.clone(),
             self.admission.clone(),
+            self.pool.clone(),
             self.timers,
         );
     }
@@ -503,8 +519,11 @@ impl ShardState {
     /// A SYN of no connection (phase 3 M3 design 5.2). In this order: the
     /// TUN is stopping; the caps on sockets and on half-open connections are
     /// met; the destination is an address of rurge's own, or one that stands
-    /// for a name. In each case the SYN is turned away with a reset. Any
-    /// other SYN is the first of a connection (`open`).
+    /// for a name the pool does not have (or the TUN has no pool). In each
+    /// case the SYN is turned away with a reset. Any other SYN is the first of
+    /// a connection (`open`): that to an address that stands for a name too,
+    /// with the name and a lease on the address, which the connection keeps
+    /// until its session ends (design 10.2).
     ///
     /// The places the connection would take in the caps are claimed in one
     /// step, not looked at here and taken later, so that the caps hold when
@@ -526,17 +545,28 @@ impl ShardState {
         }
         self.held.places = true;
         match space::place(segment.tuple.dst.ip()) {
-            Place::Real => self.open(packet, segment, now, at, opened),
+            Place::Real => self.open(packet, segment, now, at, opened, None),
             // the responder's port 53 is a place for a connection of its own
             // (M3c); every other port of it is not
             Place::Responder | Place::Own => {
                 self.release_held();
                 self.turn_away(&packet, &segment, now, None);
             }
-            // there is no pool of fake addresses yet: each names nothing
+            // an address that stands for a name: the pool gives the name back,
+            // with a lease on the address; one it has no name for, or no pool,
+            // names nothing
             Place::Fake => {
-                self.release_held();
-                self.turn_away(&packet, &segment, now, Some(Reason::UnknownFake));
+                let name = self
+                    .pool
+                    .as_ref()
+                    .and_then(|pool| pool.lease(segment.tuple.dst.ip()));
+                match name {
+                    Some(name) => self.open(packet, segment, now, at, opened, Some(name)),
+                    None => {
+                        self.release_held();
+                        self.turn_away(&packet, &segment, now, Some(Reason::UnknownFake));
+                    }
+                }
             }
         }
     }
@@ -574,7 +604,10 @@ impl ShardState {
     /// connection takes in the TUN's caps were claimed by `new_syn`, and the
     /// buffers' share of the budget is taken here; both are written down in
     /// `held` before the stack is called, and given back if no connection
-    /// comes of the SYN, or if the stack panics.
+    /// comes of the SYN, or if the stack panics. `name` is that of the fake
+    /// address the SYN is for, if it is for one, with its lease: the
+    /// connection's, and given back with the connection's session, or at once
+    /// if no connection comes of the SYN.
     fn open(
         &mut self,
         packet: Vec<u8>,
@@ -582,6 +615,7 @@ impl ShardState {
         now: Instant,
         at: smoltcp::time::Instant,
         opened: &mut Vec<Opened>,
+        name: Option<(String, Lease)>,
     ) {
         let tuple = segment.tuple;
         let sizes = self.budget.take();
@@ -631,7 +665,12 @@ impl ShardState {
         self.half_open.insert((deadline, id));
         // the connection has them from here: it gives them back when it goes
         self.held = Held::default();
-        opened.push(Opened { id, shared, tuple });
+        opened.push(Opened {
+            id,
+            shared,
+            tuple,
+            name,
+        });
     }
 
     /// Lets go of the connections that are over, of those touched since the
@@ -1028,6 +1067,7 @@ pub(crate) async fn run(
                 stream,
                 dialer.clone(),
                 opened.tuple,
+                opened.name,
                 holds,
                 life.clone(),
             ));

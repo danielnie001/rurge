@@ -11,6 +11,8 @@ const MS: Duration = Duration::from_millis(1);
 
 const KEEP_ALIVE: &str = "keep_alive must be at least 1 ms and at most 24 hours";
 const TIMEOUT: &str = "timeout must be more than keep_alive and at most 24 hours";
+const UDP_IDLE: &str = "udp_idle must be at least 1 ms and at most 24 hours";
+const ECHO_TIMEOUT: &str = "echo_timeout must be at least 1 ms and at most 24 hours";
 
 /// `options` are refused with `text`, the first that cannot be, and no other.
 fn refused(options: TunOptions, text: &str) {
@@ -22,10 +24,11 @@ fn the_defaults_pass_the_check() {
     assert_eq!(TunOptions::default().check(), Ok(()));
 }
 
-/// Each of the seven texts, with what is just past the edge of each range. The
+/// Each of the twelve texts, with what is just past the edge of each range. The
 /// timers are the stack's to add to its clock: `keep_alive` is at least a
 /// millisecond and `timeout` is more than it, and neither is more than a day,
-/// which is far below where the stack's sums overflow.
+/// which is far below where the stack's sums overflow; `udp_idle` and
+/// `echo_timeout` are added to clocks as well, and have the same range.
 #[test]
 fn options_out_of_range_are_refused() {
     refused(
@@ -82,6 +85,45 @@ fn options_out_of_range_are_refused() {
         },
         "writer_queue must be more than zero",
     );
+    for udp_idle in [Duration::ZERO, MS - Duration::from_micros(1), DAY + MS] {
+        refused(
+            TunOptions {
+                udp_idle,
+                ..TunOptions::default()
+            },
+            UDP_IDLE,
+        );
+    }
+    refused(
+        TunOptions {
+            udp_queue: 0,
+            ..TunOptions::default()
+        },
+        "udp_queue must be more than zero",
+    );
+    refused(
+        TunOptions {
+            max_udp_targets: 0,
+            ..TunOptions::default()
+        },
+        "max_udp_targets must be more than zero",
+    );
+    for echo_timeout in [Duration::ZERO, MS - Duration::from_micros(1), DAY + MS] {
+        refused(
+            TunOptions {
+                echo_timeout,
+                ..TunOptions::default()
+            },
+            ECHO_TIMEOUT,
+        );
+    }
+    refused(
+        TunOptions {
+            max_echoes: 0,
+            ..TunOptions::default()
+        },
+        "max_echoes must be more than zero",
+    );
 }
 
 /// The first that cannot be run with, in the order of the fields.
@@ -111,6 +153,54 @@ fn the_first_option_out_of_range_is_the_one_reported() {
         },
         TIMEOUT,
     );
+    // what comes after the seven there were: `writer_queue` is the last of
+    // those, then the five new ones in the order of the fields
+    refused(
+        TunOptions {
+            writer_queue: 0,
+            udp_idle: Duration::ZERO,
+            ..TunOptions::default()
+        },
+        "writer_queue must be more than zero",
+    );
+    refused(
+        TunOptions {
+            udp_idle: Duration::ZERO,
+            udp_queue: 0,
+            max_udp_targets: 0,
+            echo_timeout: Duration::ZERO,
+            max_echoes: 0,
+            ..TunOptions::default()
+        },
+        UDP_IDLE,
+    );
+    refused(
+        TunOptions {
+            udp_queue: 0,
+            max_udp_targets: 0,
+            echo_timeout: Duration::ZERO,
+            max_echoes: 0,
+            ..TunOptions::default()
+        },
+        "udp_queue must be more than zero",
+    );
+    refused(
+        TunOptions {
+            max_udp_targets: 0,
+            echo_timeout: Duration::ZERO,
+            max_echoes: 0,
+            ..TunOptions::default()
+        },
+        "max_udp_targets must be more than zero",
+    );
+    refused(
+        TunOptions {
+            echo_timeout: Duration::ZERO,
+            max_echoes: 0,
+            ..TunOptions::default()
+        },
+        ECHO_TIMEOUT,
+    );
 }
 
 /// The edges themselves are inside the ranges.
@@ -125,6 +215,19 @@ fn the_edges_of_the_ranges_pass() {
         let options = TunOptions {
             keep_alive,
             timeout,
+            ..TunOptions::default()
+        };
+        assert_eq!(options.check(), Ok(()), "{options:?}");
+    }
+    // the same two edges for the times of UDP sessions and of echo requests,
+    // and the smallest counts
+    for time in [MS, Duration::from_secs(60), DAY] {
+        let options = TunOptions {
+            udp_idle: time,
+            echo_timeout: time,
+            udp_queue: 1,
+            max_udp_targets: 1,
+            max_echoes: 1,
             ..TunOptions::default()
         };
         assert_eq!(options.check(), Ok(()), "{options:?}");

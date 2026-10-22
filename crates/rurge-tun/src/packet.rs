@@ -9,8 +9,8 @@
 use crate::tcp::Tuple;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
-    IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket,
-    TcpRepr, TcpSeqNumber, UdpPacket,
+    IPV4_HEADER_LEN, Icmpv4Packet, Icmpv6Packet, IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr,
+    Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket,
 };
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -25,9 +25,6 @@ const ICMPV6_ECHO_REQUEST: u8 = 128;
 /// makes: what operating systems send by default.
 const RESET_HOP_LIMIT: u8 = 64;
 
-/// The protocol number of TCP in the IPv4 header and in the IPv6 one.
-const IP_TCP: u8 = 6;
-
 /// The kinds of the TCP options that are read as they are written down: the
 /// end of the list, no operation, and the offer of selective acknowledgements.
 const OPTION_END: u8 = 0;
@@ -40,7 +37,9 @@ const OPTION_SACK_PERMITTED: u8 = 4;
 pub(crate) enum Reason {
     /// A packet that cannot be read: a version other than 4 and 6, lengths
     /// that do not fit, an IPv4 header checksum that does not hold, a
-    /// transport header that is cut short or has port 0.
+    /// transport header that is cut short or has port 0, the checksum of a UDP
+    /// datagram or of an ICMP echo request that does not hold (or that a UDP
+    /// datagram over IPv6 does not have).
     Malformed,
     /// A fragment, which the TUN does not reassemble.
     Fragment,
@@ -174,10 +173,14 @@ pub(crate) struct Segment {
 /// turned away on its version nibble, however damaged, so that check is
 /// really the first); a fragment; an address no packet has; a protocol that
 /// is not TCP, UDP or ICMP; a transport header that is cut short or names
-/// port 0; an ICMP message that is no echo request. Whatever is after the end
-/// of the IP packet is left out of [`Parsed::len`]. A packet turned away
-/// comes back with the reason and, once its IP header passed its own checks,
-/// its two addresses ([`Dropped`]).
+/// port 0; the checksum of a UDP datagram, which does not hold or, over IPv6,
+/// is left out; an ICMP message that is no echo request; the checksum of an
+/// echo request, which does not hold. The checksum of TCP is not looked at
+/// (design 4.4), and nor is that of an ICMP message that is no echo request,
+/// which is dropped as it is. Whatever is after the end of the IP packet is
+/// left out of [`Parsed::len`]. A packet turned away comes back with the
+/// reason and, once its IP header passed its own checks, its two addresses
+/// ([`Dropped`]).
 pub(crate) fn classify(packet: &[u8], ipv6: bool) -> Result<Parsed, Dropped> {
     // IPv6 is dropped before any of its header is read, however damaged
     if !ipv6 && packet.first().is_some_and(|byte| byte >> 4 == 6) {
@@ -322,14 +325,20 @@ pub(crate) fn strip_sack_permitted(packet: &mut [u8]) {
 
 /// Where the TCP header of `packet` begins, if the packet is an IPv4 packet
 /// of the protocol TCP with a header of the length of 20 bytes or more, or an
-/// IPv6 packet of that protocol with no extension header.
+/// IPv6 packet of that protocol with no extension header. The length and the
+/// protocol are read by smoltcp's own packet types, which take a packet only
+/// if it is as long as it says.
 fn tcp_start(packet: &[u8]) -> Option<usize> {
     match packet.first()? >> 4 {
         4 => {
-            let header = usize::from(packet[0] & 15) * 4;
-            (header >= 20 && *packet.get(9)? == IP_TCP).then_some(header)
+            let ip = Ipv4Packet::new_checked(packet).ok()?;
+            let header = usize::from(ip.header_len());
+            (header >= IPV4_HEADER_LEN && ip.next_header() == IpProtocol::Tcp).then_some(header)
         }
-        6 => (*packet.get(6)? == IP_TCP).then_some(40),
+        6 => {
+            let ip = Ipv6Packet::new_checked(packet).ok()?;
+            (ip.next_header() == IpProtocol::Tcp).then_some(ip.header_len())
+        }
         _ => None,
     }
 }
@@ -430,9 +439,9 @@ fn transport(
 ) -> Result<Parsed, Dropped> {
     let transport = match (protocol, src) {
         (IpProtocol::Tcp, _) => tcp(src, dst, payload).map(Transport::Tcp),
-        (IpProtocol::Udp, _) => udp(payload),
-        (IpProtocol::Icmp, IpAddr::V4(_)) => icmp(payload, ICMPV4_ECHO_REQUEST),
-        (IpProtocol::Icmpv6, IpAddr::V6(_)) => icmp(payload, ICMPV6_ECHO_REQUEST),
+        (IpProtocol::Udp, _) => udp(src, dst, payload),
+        (IpProtocol::Icmp, IpAddr::V4(_)) => icmp(src, dst, payload, ICMPV4_ECHO_REQUEST),
+        (IpProtocol::Icmpv6, IpAddr::V6(_)) => icmp(src, dst, payload, ICMPV6_ECHO_REQUEST),
         // an extension header, or a protocol nothing here handles
         _ => Err(Reason::Unsupported),
     }
@@ -469,21 +478,48 @@ fn tcp(src: IpAddr, dst: IpAddr, payload: &[u8]) -> Result<Segment, Reason> {
     })
 }
 
-fn udp(payload: &[u8]) -> Result<Transport, Reason> {
+/// A UDP datagram: its header, and its checksum, which is the datagram's own
+/// and the addresses' (the pseudo-header). A zero in its place is no checksum:
+/// UDP over IPv4 may do without (RFC 768) and the datagram is taken as it is;
+/// over IPv6 it may not (RFC 8200, 8.1), and the datagram is turned away.
+/// smoltcp's `verify_checksum` takes a zero for right in both, hence the
+/// check here.
+fn udp(src: IpAddr, dst: IpAddr, payload: &[u8]) -> Result<Transport, Reason> {
     let udp = UdpPacket::new_checked(payload).map_err(|_| Reason::Malformed)?;
     let (src_port, dst_port) = (udp.src_port(), udp.dst_port());
     if src_port == 0 || dst_port == 0 {
         return Err(Reason::Malformed);
     }
+    if udp.checksum() == 0 {
+        if src.is_ipv6() {
+            return Err(Reason::Malformed);
+        }
+    } else if !udp.verify_checksum(&src.into(), &dst.into()) {
+        return Err(Reason::Malformed);
+    }
     Ok(Transport::Udp { src_port, dst_port })
 }
 
-fn icmp(payload: &[u8], echo_request: u8) -> Result<Transport, Reason> {
+/// An ICMP message: only an echo request goes on, and then only with a
+/// checksum that holds. ICMPv6's covers the addresses as UDP's does, ICMPv4's
+/// the message alone. What is no echo request is dropped for that, without
+/// the checksum being looked at.
+fn icmp(src: IpAddr, dst: IpAddr, payload: &[u8], echo_request: u8) -> Result<Transport, Reason> {
     if payload.len() < ICMP_HEADER {
         return Err(Reason::Malformed);
     }
     if payload[0] != echo_request {
         return Err(Reason::Unsupported);
+    }
+    let holds = match (src, dst) {
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            Icmpv6Packet::new_unchecked(payload).verify_checksum(&src, &dst)
+        }
+        // an ICMP message of IPv4: the two addresses are of one family
+        _ => Icmpv4Packet::new_unchecked(payload).verify_checksum(),
+    };
+    if !holds {
+        return Err(Reason::Malformed);
     }
     Ok(Transport::Icmp {
         message_type: payload[0],

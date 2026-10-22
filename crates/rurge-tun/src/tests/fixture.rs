@@ -6,14 +6,19 @@ use super::support::{
     tcp_payload_len, udp_v4, within, write_pattern,
 };
 use crate::device::{AppEnd, Device, MemoryDevice};
-use crate::testing::{AppStack, AppTcp, Direction, FakeDialer, Script, Upstream};
+use crate::testing::{
+    AppStack, AppTcp, Direction, FakeDialer, FakeHooks, FakePinger, FakeResolve, PingScript,
+    Script, Upstream,
+};
+use crate::{Hooks, Pinger, TunSettings};
 use rurge_config::{HostName, ListenerKind, SessionInfo};
 use rurge_inbound::{DialError, Dialed, Dialer, FailKind, SessionHandle, SessionOutcome};
+use rurge_net::connector::Resolve;
 use rurge_proto::RejectKind;
 use smoltcp::wire::IpCidr;
 use std::future::Future;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1099,4 +1104,116 @@ async fn a_new_filter_replaces_the_old_one() {
         "the first filter was replaced"
     );
     assert!(second.load(Ordering::SeqCst) > 0);
+}
+
+/// A session is dialed to where the app connected to: its `local` end when it
+/// has one, which for a connection to a fake address is that address and not
+/// the name the session is for; the address it names when it has none.
+#[tokio::test]
+async fn the_fake_dialer_finds_a_session_by_where_the_app_connected_to() {
+    let echo = Upstream::echo().await;
+    let dialer = FakeDialer::new();
+    let (fake, elsewhere) = (addr("198.18.1.1:80"), addr("192.0.2.9:80"));
+    dialer.script(fake, Script::Upstream(echo.addr()));
+    dialer.script(elsewhere, Script::Fail);
+    // the session of a name behind a fake address
+    let mut named = session(fake);
+    named.dst_host = HostName::Domain("a.test".to_owned());
+    named.local = Some(fake);
+    expect_dialed(within("the dial", dialer.dial(named)).await);
+    // `local` comes first: the address `dst_host` names is another one
+    let mut moved = session(elsewhere);
+    moved.local = Some(fake);
+    expect_dialed(within("the dial", dialer.dial(moved)).await);
+    // with none the address it names is the one
+    let result = within("the dial", dialer.dial(session(elsewhere))).await;
+    assert!(matches!(result, Err(DialError::Failed { .. })));
+    // and a name with no `local` has nothing to be found by
+    let mut nameless = session(fake);
+    nameless.dst_host = HostName::Domain("a.test".to_owned());
+    let result = within("the dial", dialer.dial(nameless)).await;
+    let Err(DialError::Failed { message, .. }) = result else {
+        panic!("a session with nothing to find it by is not dialed");
+    };
+    assert_eq!(message, "not scripted");
+}
+
+/// The settings a TUN asks for are those set last; one handed out before keeps
+/// what it was.
+#[test]
+fn fake_hooks_give_the_settings_that_were_set_last() {
+    let hooks = FakeHooks::new(TunSettings {
+        resolver: FakeResolve::new(),
+        icmp_forwarding: true,
+    });
+    let before = hooks.settings();
+    assert!(before.icmp_forwarding);
+    hooks.set(TunSettings {
+        resolver: FakeResolve::new(),
+        icmp_forwarding: false,
+    });
+    assert!(!hooks.settings().icmp_forwarding);
+    assert!(before.icmp_forwarding, "the settings handed out before");
+}
+
+#[tokio::test]
+async fn the_fake_resolver_knows_what_it_was_told() {
+    let resolver = FakeResolve::new();
+    let (v4, v6) = (
+        IpAddr::from(Ipv4Addr::new(127, 0, 0, 1)),
+        IpAddr::from(Ipv6Addr::LOCALHOST),
+    );
+    resolver.insert("a.test", vec![v6, v4]);
+    // in the order it was given
+    let found = within("the answer", resolver.resolve("a.test")).await;
+    assert_eq!(found.expect("a name that was inserted"), [v6, v4]);
+    // a name it was not told is not found
+    let error = within("the answer", resolver.resolve("b.test"))
+        .await
+        .expect_err("a name nobody inserted");
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    // a name inserted again has what it was given last
+    resolver.insert("a.test", vec![v4]);
+    let found = within("the answer", resolver.resolve("a.test")).await;
+    assert_eq!(found.expect("a name that was inserted"), [v4]);
+}
+
+#[tokio::test]
+async fn the_fake_pinger_does_what_it_was_scripted_and_writes_every_request_down() {
+    let pinger = FakePinger::new();
+    let [echoed, failed, silent, unscripted] =
+        [1u8, 2, 3, 4].map(|last| IpAddr::from(Ipv4Addr::new(192, 0, 2, last)));
+    pinger.script(echoed, PingScript::Echo);
+    pinger.script(failed, PingScript::Fail);
+    pinger.script(silent, PingScript::Silent);
+    let reply = within("the reply", pinger.echo(echoed, b"hello")).await;
+    assert_eq!(reply.expect("an echo"), b"hello");
+    assert!(
+        within("the failure", pinger.echo(failed, b"x"))
+            .await
+            .is_err()
+    );
+    assert!(
+        within("the failure", pinger.echo(unscripted, b"y"))
+            .await
+            .is_err(),
+        "a destination nothing was scripted for fails"
+    );
+    // the one fixed wait of this test, for what must not happen: an answer
+    // from a pinger that is scripted to say nothing. It would come at once if
+    // it came at all, so 100 ms is a wide margin
+    assert!(
+        timeout(Duration::from_millis(100), pinger.echo(silent, b"z"))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        pinger.pinged(),
+        [
+            (echoed, b"hello".to_vec()),
+            (failed, b"x".to_vec()),
+            (unscripted, b"y".to_vec()),
+            (silent, b"z".to_vec()),
+        ]
+    );
 }

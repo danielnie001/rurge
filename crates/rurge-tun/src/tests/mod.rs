@@ -2,6 +2,7 @@
 
 mod bench;
 mod budget;
+mod fake;
 mod filter;
 mod fixture;
 mod hazards;

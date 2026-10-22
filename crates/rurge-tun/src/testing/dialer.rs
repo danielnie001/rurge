@@ -77,7 +77,8 @@ impl FakeDialer {
         self.book.lock().expect("the fake dialer's book")
     }
 
-    /// By the destination the app connected to.
+    /// By the destination the app connected to: for a fake address, the
+    /// address and not the name behind it.
     pub fn script(&self, dst: SocketAddr, script: Script) {
         if let Script::Upstream(upstream) = &script {
             assert!(
@@ -137,12 +138,14 @@ impl FakeDialer {
     }
 }
 
-/// Where the app connected to, when the session names an address.
+/// Where the app connected to: the session's `local`, which is the endpoint
+/// even when `dst_host` is the name behind a fake address; a session with no
+/// `local` is where it says it is, if it names an address.
 fn destination(session: &SessionInfo) -> Option<SocketAddr> {
-    match &session.dst_host {
+    session.local.or(match &session.dst_host {
         HostName::Ip(ip) => Some(SocketAddr::new(*ip, session.dst_port)),
         HostName::Domain(_) => None,
-    }
+    })
 }
 
 fn failed(handle: Arc<SessionHandle>, message: String) -> Result<Dialed, DialError> {
