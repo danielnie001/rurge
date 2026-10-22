@@ -126,7 +126,7 @@
   ```
 
 - 看记录：`curl -s -H "X-Key: testkey" "http://127.0.0.1:6171/v1/requests/recent?limit=1000"`（缺省只给最近 100 条；请求记录环缺省存 1000 条，`--request-log-size` 可改）；每条看 `pid`、`processPath`、`rule`、`status`、`rejectKind`、`notes`。PowerShell：`(curl.exe -s -H "X-Key: testkey" "http://127.0.0.1:6171/v1/requests/recent?limit=1000" | ConvertFrom-Json).requests | Format-Table id,pid,processPath,rule,status`；有 `jq` 时：`curl -s -H "X-Key: testkey" "http://127.0.0.1:6171/v1/requests/recent?limit=1000" | jq '.requests[] | {id,pid,processPath,rule,status,notes}'`。正在进行的会话是 `/v1/requests/active`。
-- 日志：`rurge run -c <conf> --log-level debug --log-file <日志路径>`。查找的行是 DEBUG 的 `process lookup found the process`（字段 `src`、`listen_port`、`elapsed_ms`、`pid`、`name`、`path`）与 `process lookup found no process`。
+- 日志：`rurge run -c <conf> --log-level debug --log-file <日志路径>`。查找的行是 DEBUG 的 `process lookup found the process`（字段 `src`、`remote`、`elapsed_ms`、`pid`、`name`、`path`；`remote` 是客户端那条连接在 rurge 一侧的端点，HTTP 与 SOCKS5 的会话是被接受的那条连接的本地地址，如 `127.0.0.1:6152`，阶段 3 / M3b 之前这个字段叫 `listen_port`）与 `process lookup found no process`。
 - 要被拒的会话不需要外网：命中 `REJECT` 的会话 `status` 是 `rejected`；放行的会话要能连上下文里的网站（写作 `http://example.com/`）。
 - 对进程号：Windows 用任务管理器的"详细信息"页（加上"命令行"一列），macOS 与 Linux 用 `ps -p <pid> -o pid,comm,args`。
 - P14 要用的一段 SOCKS5 UDP 客户端（Python 3；存成 `socks5_udp.py`，`python3 socks5_udp.py`，Windows 用 `python`）：向 `127.0.0.1:6153` 建 UDP ASSOCIATE，经它向两个地址各发一个 DNS 查询，等应答，再让控制连接多开几秒：

@@ -81,7 +81,7 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 
 `in` 是下行（远端 → 客户端）字节，`out` 是上行；速度是最近两次采样之间走的字节数，每秒采样一次，所以平时就是最近一秒的字节数——机器休眠错过的采样不补（阶段 2 / M8c）：醒来后只采一次，第一次读到的是休眠前后这一整段里走的字节，随后恢复为每秒的字节数（此前醒来后连发的补采会把它冲成 0）；`startTime` 是 API 启动时的 Unix 时间戳，**秒**（`f64`，可带小数）——设计文档 §5.2 / 开放问题 Q1 曾写作毫秒，以本页为准。
 
-`total` 统计所有会话，包括仍在进行中的会话与 rurge 自己的内部 DNS 拨号（与 `inCurrentSpeed` / `outCurrentSpeed` 同源，长传输期间不会出现「总量 0 但速度非 0」）；`connector` 与 `listener` 只统计已结束的会话，且 `listener` 在阶段 1 只有 `http` / `socks5` 两项。因此这三个层级不应相互对得上，不要拿它们互相校验。
+`total` 统计所有会话，包括仍在进行中的会话与 rurge 自己的内部 DNS 拨号（与 `inCurrentSpeed` / `outCurrentSpeed` 同源，长传输期间不会出现「总量 0 但速度非 0」）；`connector` 与 `listener` 只统计已结束的会话，且 `listener` 在阶段 1 只有 `http` / `socks5` 两项。因此这三个层级不应相互对得上，不要拿它们互相校验。阶段 3 / M3b 起 `listener` 另有第三个键 `tun`（一直在，虚拟网卡的会话结束之前为 0；上面的例子和"只有 `http` / `socks5` 两项"写的是阶段 1 的样子），形状与读法见 `docs/api/phase3.md` 的「M3b　虚拟网卡的 UDP、ICMP 与引擎」一节。
 
 ### Cache
 

@@ -2,7 +2,9 @@
 
 阶段 3 / M1（网络环境与子网，设计 `docs/superpowers/specs/2026-10-16-phase3-m1-network-subnet-design.md`，计划 `docs/superpowers/plans/2026-10-16-phase3-m1-network-subnet-plan.md`）**没有新增端点，也没有改任何响应的形状**。变的是三个已有端点的行为——`POST` / `GET /v1/policy_groups/select` 对 `subnet` 组、`GET` / `POST /v1/features/system_proxy` 在接管暂停时、`GET /v1/dns` 的 `upstreams` 随网络的 DNS 覆盖——，和一组日志行。没有任何端点给出本机当前所在的网络：SSID、BSSID 和网关说明使用者在哪里，只在 DEBUG 日志里出现；读网络的日志行（网络任务与平台层）不带本机网卡的地址，也不带系统 DNS 服务器的取值（设计 M1-D16）。这不等于这些地址在任何级别的日志里都没有——DNS 服务器的地址出现在解析器自己的行里，会话的日志行带来源地址——，见「网络任务的日志行」末尾（M1 收尾时写的"本机地址与 DNS 服务器的取值在任何级别的日志里都不出现"说得过了头，阶段 3 / M2 订正）。鉴权（`X-Key`）、错误体（`{"error":"<message>"}`）与无内容的成功响应（`{}`）沿用阶段 1 的约定，见 `docs/api/phase1.md`；本页只记录变了的部分。
 
-阶段 3 / M2（进程识别，设计 `docs/superpowers/specs/2026-10-17-phase3-m2-process-design.md`，计划 `docs/superpowers/plans/2026-10-17-phase3-m2-process-plan.md`）**没有新增端点**，两个已有端点 `GET /v1/requests/recent` 与 `GET /v1/requests/active` 的每条记录多了两个键 `pid` 与 `processPath`；规则等不到进程时，会话的 `notes` 里多一句说明。下面到「没有覆盖的」为止说的是 M1，M2 在最后一节「M2　进程识别」。
+阶段 3 / M2（进程识别，设计 `docs/superpowers/specs/2026-10-17-phase3-m2-process-design.md`，计划 `docs/superpowers/plans/2026-10-17-phase3-m2-process-plan.md`）**没有新增端点**，两个已有端点 `GET /v1/requests/recent` 与 `GET /v1/requests/active` 的每条记录多了两个键 `pid` 与 `processPath`；规则等不到进程时，会话的 `notes` 里多一句说明。下面到「没有覆盖的」为止说的是 M1，M2 在「M2　进程识别」一节。
+
+阶段 3 / M3b（UDP、ICMP、fake-IP 池与引擎接入，计划 `docs/superpowers/plans/2026-10-22-phase3-m3b-udp-icmp-pool-engine-plan.md`）**没有新增端点**：`GET /v1/traffic` 的 `listener` 多了一个键 `tun`，进程查找的 DEBUG 行的字段 `listen_port` 换成了 `remote`，数据目录里多了池的文件 `fake-ip.txt` 与它的三行日志。引擎一侧的 `Engine::start_tun` 只有测试调用，`rurge run` 要到 M4 才起虚拟网卡，所以前两处在今天的 `rurge run` 里是这样的：`tun` 恒为 0，查找行只有监听器的会话；池的文件与它的日志使用者要到 M4 才看得到。见最后一节「M3b　虚拟网卡的 UDP、ICMP 与引擎」。
 
 ## 端点
 
@@ -208,7 +210,7 @@ SSID、BSSID 与网关从不出现在 INFO 及以上的行里；上表（网络�
 ### 什么时候是 `null`
 
 - 会话不是从本机来的：来源地址既不是回环、也不是本机网卡上的地址——局域网里把 rurge 当代理用的设备；虚拟机、WSL2、容器里的程序经网络连进来（它们在本机没有对应的套接字）。经本机的转发程序来的连接，查到的是转发程序，不是原来的客户端。
-- rurge 自己发起的会话（`listener` 为 `internal`：内部 DNS 会话、连通性测试），和 `tun`、`forward`（今天没有监听器产生它们；虚拟网卡上的会话随阶段 3 / M3）。
+- rurge 自己发起的会话（`listener` 为 `internal`：内部 DNS 会话、连通性测试），和 `forward`（今天没有监听器产生它）。`tun`（虚拟网卡上的会话）阶段 3 / M3b 起引擎照会话的形状查，见最后一节「M3b」；`rurge run` 今天不起虚拟网卡。
 - 查找还没有结束；结束之后再读同一条记录就有了。规则因此没按进程判的会话，`notes` 里有下面那一句。
 - 本机看不到发起的进程，或没有权限读它：不以 root 运行的 Linux 上别的用户的进程，Windows 上以普通用户运行时某些系统进程；客户端在查找之前就走了（短命的命令行工具，连接已关、进程已退出）也一样。
 - `RURGE_PROCESS_BACKEND=off`（测试钩子，见下）。
@@ -241,12 +243,14 @@ SSID、BSSID 与网关从不出现在 INFO 及以上的行里；上表（网络�
 
 | 级别 | 文本 | 字段 | 什么时候 |
 | --- | --- | --- | --- |
-| DEBUG | `process lookup found the process` | `src`、`listen_port`、`elapsed_ms`、`pid`、`name`、`path` | 一次查找结束，找到了。`elapsed_ms` 从查找发起算起，含等阻塞线程的时间；UDP 关联的一次查找服务它的全部流，`src` 与 `listen_port` 是控制连接的。**不带会话号**：查找发起时会话号还没分配；同一会话自己的日志行也带 `src`，两行按地址对得上 |
-| DEBUG | `process lookup found no process` | `src`、`listen_port`、`elapsed_ms` | 查找结束，没找到（来源不在表里、进程已经退出、读不了） |
+| DEBUG | `process lookup found the process` | `src`、`remote`、`elapsed_ms`、`pid`、`name`、`path` | 一次查找结束，找到了。`elapsed_ms` 从查找发起算起，含等阻塞线程的时间；UDP 关联的一次查找服务它的全部流，`src` 与 `remote` 是控制连接的。**不带会话号**：查找发起时会话号还没分配；同一会话自己的日志行也带 `src`，两行按地址对得上 |
+| DEBUG | `process lookup found no process` | `src`、`remote`、`elapsed_ms` | 查找结束，没找到（来源不在表里、进程已经退出、读不了） |
 | DEBUG | `Process not known within 200 ms: PROCESS-NAME did not match` | `session`（会话号） | 规则等不到进程、按"不知道"判的那一刻；同文的一句也在会话的 `notes` 里 |
 | WARN | `process lookup took longer than 200 ms; PROCESS-NAME rules decided without the process` | | 进程的一生里第一次有规则等不到进程时一次。不带会话、地址与进程 |
-| WARN | `process lookup: the tcp table could not be read: <原因>`（`udp` 同）；`process lookup: the tcp table has a layout this build does not know`（macOS 上表的布局认不得） | | 平台读系统的表失败：每一种在进程的一生里 WARN 一次，之后同样的失败只在 DEBUG 里。`<原因>` 是系统自己的话，不带地址、进程与路径。这次查询的结果是"不知道"，会话照常 |
+| WARN | `process lookup: the tcp table could not be read: <原因>`（`udp` 同）；`process lookup: the tcp table has a layout this build does not know`（macOS 上表的布局认不得；阶段 3 / M3b 起 Linux 上一张有内容而一行也解析不出的表同样报它，此前读作空表、不写日志） | | 平台读系统的表失败：每一种在进程的一生里 WARN 一次，之后同样的失败只在 DEBUG 里。`<原因>` 是系统自己的话，不带地址、进程与路径。这次查询的结果是"不知道"，会话照常 |
 | DEBUG | `process lookup: cannot list the network interfaces` | `reason` | 取本机网卡的地址列表失败，当作没有地址：只有回环上的来源查得到 |
+
+前两行 DEBUG 的字段 `remote` 是阶段 3 / M3b 起的写法（M2 时是 `listen_port`）：它是什么、什么时候省略，见最后一节「M3b」。
 
 **进程的名字、路径与 PID 只出现在 DEBUG 的查找行、请求记录与 API 里，不出现在 INFO 及以上的行里**（Windows 的路径常带用户名）。被拒与失败的会话的 INFO 行照旧带来源、目标、规则文字（`rule=`）和策略；规则文字是使用者自己写的规则，里面若写了进程名或路径，那是使用者写的，不是查到的。不知道进程从不让会话失败，也不进会话的 `error`。
 
@@ -258,7 +262,55 @@ SSID、BSSID 与网关从不出现在 INFO 及以上的行里；上表（网络�
 
 - Linux 与 macOS 的真实读取（`/proc/net/*` 与 `/proc/<pid>/fd` 的内容和权限、`pcblist_n` 的真实布局、`proc_pidpath`）只对着夹具测过；两个只在 macOS 上编译的 unsafe 函数与 Linux、macOS 的真读用例 `this_process_owns_its_loopback_sockets` 从没有在任何地方编译过（它们在只为本平台编译的模块里）；Windows 的真读用例和端到端用例 `a_process_rule_matches_the_test_process` 只在一台 Windows 11 x86-64 的开发机上编译、跑过。第一次 CI 运行时核对；手工验收清单 `docs/acceptance/phase3-manual.md` 的 M2 一节一项也没有做过。
 - macOS 取 `so_last_pid`（最后用这个套接字的进程），不取 `so_e_pid`（委托时的"实际"进程）：经 `nsurlsessiond` 等系统服务代建的连接，记录里是哪一个，没有看过。
-- 经虚拟网卡来的会话（阶段 3 / M3）；`$request.processPath`（脚本，阶段 5，读同一个进程槽）；外部程序的进程树判断（M4，防环用）。离线的 `rurge rule match` 不查真实的进程（没有连接；`--process` 照旧由命令行给）。
+- 经真实虚拟网卡来的会话（引擎一侧的查找 M3b 做了，见「M3b」一节；真实的设备随 M4）；`$request.processPath`（脚本，阶段 5，读同一个进程槽）；外部程序的进程树判断（M4，防环用）。离线的 `rurge rule match` 不查真实的进程（没有连接；`--process` 照旧由命令行给）。
 - 查找的代价只在 Windows 上量过一次（debug 构建，开着 500 条回环连接时一次新的查找 3.39 毫秒）；Linux 的 `fd` 扫描在进程很多的机器上、几百条并发连接时是否在 200 毫秒里结束，没有量过。
 - 一个永不返回的平台查找会占住两个许可，此后每条会话排一个小任务、不设上限，`rurge run` 退出时 tokio 不设时限地等阻塞线程；三个平台的读取都是有界的系统调用，不知道哪一个会挂住。
 - Surge 的实际行为没有观察过：`PROCESS-NAME` 在 Windows 上不分大小写、不去掉 `.exe`、盘符与 `\\` 开头的值读作路径，都是 rurge 的读法（兼容性清单 3.1 节）。
+
+## M3b　虚拟网卡的 UDP、ICMP 与引擎
+
+阶段 3 / M3b 把虚拟网卡的内核（`crates/rurge-tun`）接进引擎（`Engine::start_tun`，`crates/rurge-engine/src/tun.rs`）：经虚拟网卡来的 TCP 连接、UDP 数据报与回显请求照规则与策略走，发往 fake 地址的照它背后的名字走，被拒的 UDP 流以 ICMP"管理上禁止"回答应用。**`Engine::start_tun` 只有测试调用，`rurge run` 要到 M4 才起虚拟网卡**：经虚拟网卡来的会话和下面的池的文件与它的日志，使用者要到 M4 才看得到；前两小节说的两处今天的 `rurge run` 里就有，只是 `tun` 恒为 0、查找行只有监听器的会话。没有新增端点、诊断码或命令行选项，配置格式不变。
+
+### `GET /v1/traffic` 的 `listener.tun`
+
+`listener` 从两个键（`http`、`socks5`）变成三个，多了 `tun`，形状相同（`in` 是下行字节，`out` 是上行）：
+
+```json
+"listener":{"http":{"in":123,"out":45},"socks5":{"in":0,"out":0},"tun":{"in":0,"out":0}}
+```
+
+`tun` **一直在**：虚拟网卡的会话结束之前是 `{"in":0,"out":0}`，所以今天的 `rurge run` 里恒为 0。经虚拟网卡来的会话（一条 TCP 连接，或 UDP 会话里的一条流）结束时，它的字节计进 `tun`；HTTP 与 SOCKS5 的会话不计入它，它的会话也不计入 `http` 或 `socks5`。`total` 与 `connector` 照旧统计所有会话，`tun` 的会话也在其中；`listener` 仍只统计已结束的会话（`docs/api/phase1.md` 的「Traffic」一节）。
+
+### 进程查找的 DEBUG 行：`remote`
+
+M2 一节「日志」里两行 DEBUG（`process lookup found the process`、`process lookup found no process`）的字段 `listen_port` 换成了 `remote`：客户端那条连接在 rurge 一侧的端点（`地址:端口`）。进程的查找要这个地址和端口都对上，不只是端口（同一个本地端点同时连着两台主机上同号的端口时，只比端口会认错行）：
+
+| 会话 | `remote` |
+| --- | --- |
+| HTTP 与 SOCKS5 监听器的会话 | 被接受的那条连接自己的本地地址：客户端连的是 `127.0.0.1:6152` 就是它，哪怕监听器绑的是 `0.0.0.0:6152` |
+| SOCKS5 的 UDP 关联 | 它的控制连接的本地地址（关联按控制连接查） |
+| 经虚拟网卡来的 TCP 会话 | 应用连的端点（fake 地址或真实地址） |
+| 经虚拟网卡来的 UDP 会话 | 没有这个字段（UDP 的查找只按应用自己的端点） |
+
+没有这个端点时字段省略，不写 `null`。这些行仍是 DEBUG：进程的名字、路径与 PID 不出现在 INFO 及以上的行里。
+
+### 池的文件 `fake-ip.txt` 与它的三行日志
+
+fake 地址与名字的对应记在数据目录里：`<数据目录>/fake-ip.txt`（UTF-8 文本）。第一行 `rurge-fake-ip 1`；第二行 `cursor <n> wrapped <0|1> clean <0|1>`；其余每行 `<编号> <名字>`（编号 *i* 同时是 `198.18.1.1 + i` 与 `fd00:6152::` 加同一个 IPv4 地址，名字是小写的域名）。**里面是应用查过、拿到 fake 地址的名字**，文件的权限就是数据目录给的，rurge 没有另设（M3b 延后第 23 行）。
+
+rurge 在对应有变化时重写它，至多每 10 秒一次，TUN 停下时再写一次（`clean` 变 1）；先写 `fake-ip.txt.tmp` 再改名，不 fsync。打开时，`clean 1` 的文件立刻改写成 `clean 0`，没有文件时立刻写一份空表的 `clean 0`：所以崩溃或被强杀的那一次，下次启动看到的是 `clean 0`，接下来会交出的 2048 个 fake 地址（连同文件里没有名字的编号）隔离 120 秒，应用手里的旧地址不会指到新的名字。读不了或读不懂的文件（第一行不对、第二行不是三对、编号越界、名字重复或不是规范形式、行不以单个换行结束……）读作空表，文件留着不动，到第一次保存时才被覆盖，同样隔离 2048 个。
+
+| 级别 | 文本 | 字段 | 什么时候 |
+| --- | --- | --- | --- |
+| WARN | `fake-ip: the saved addresses could not be read; starting with none` | `error` | 打开时文件读不了或读不懂。`error` 是池自己的原因（固定的话加行号，或系统的错误文本），不引用文件的内容。由 `Engine::start_tun` 在调用它的线程上写 |
+| INFO | `fake-ip: rurge did not stop cleanly last time; 2048 fake addresses are held back for 120 seconds` | | 打开时文件第二行是 `clean 0`（上一次崩溃或被强杀）。只有个数，没有名字与地址。同样由 `Engine::start_tun` 写 |
+| WARN | `fake-ip: the addresses could not be saved` | `error` | 一次保存失败（目录不可写、磁盘满）。由池的保存任务（`keep_saved`）写，不带名字；下一次有变化时再试 |
+
+没有文件和干净的文件什么也不说。
+
+### 没有覆盖的
+
+- 绑在 `0.0.0.0` / `[::]` 上的监听器的会话，`remote` 是被接受的那条连接的本地地址、不是绑定的地址：这只由读代码和回环上的用例保证（用例只绑回环，M3b 延后第 6 行），M4 的手工验收看。
+- 经虚拟网卡来的会话、池的文件与 `listener.tun` 只在一台 Windows 11 x86-64 的开发机上、内存设备里跑过，CI 没有跑过；真实的设备、真实的 `Pinger`（ICMP 套接字）、系统 DNS 与防环随 M4。池的文件在 Linux 与 macOS 上读写出错的情形只按两处假定写了用例，没有在那两个平台上跑过（M3b 延后第 27 行）。
+- 被拒与失败的会话，引擎的 INFO 行照旧带 `src` 与 `dst`（阶段 1 起的写法）；经虚拟网卡来的会话的 `dst` 是 fake 地址背后的名字。设计第 14 节要名字只出现在 DEBUG，这一处没有照做（M3b 延后第 1 行，留给项目所有者）。
+- 手工验收清单 `docs/acceptance/phase3-manual.md` 没有 M3b 的一节：M3b 加的行为在 M4 之前验不了。
