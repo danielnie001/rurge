@@ -4,6 +4,7 @@
 
 pub mod bootstrap;
 pub mod cache;
+pub mod fakeip;
 pub mod fanout;
 pub mod hosts;
 pub mod message;
