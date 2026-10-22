@@ -25,7 +25,7 @@ use budget::Sizes;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::task::Waker;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::ReadBuf;
 
@@ -145,6 +145,22 @@ impl ConnShared {
 
     pub(crate) fn outcome(&self) -> Option<Outcome> {
         self.inner().outcome
+    }
+
+    /// How the connection ended, once the shard has let it go; until then the
+    /// task of `cx` is woken when it does. The task is registered as the
+    /// reader (`register_read`), so this is for one that reads nothing in the
+    /// meantime. Looking and registering are one step under the lock, so an
+    /// end that comes between them is not missed.
+    pub(crate) fn poll_outcome(&self, cx: &mut Context<'_>) -> Poll<Outcome> {
+        let mut inner = self.inner();
+        match inner.outcome {
+            Some(outcome) => Poll::Ready(outcome),
+            None => {
+                register(&mut inner.read, cx.waker());
+                Poll::Pending
+            }
+        }
     }
 
     /// Keeps `bytes`, which the app sent and the stream has not read, for the

@@ -1,11 +1,12 @@
 //! What becomes of a TUN as its sessions are rejected, as it is told to stop and
 //! as its device fails (phase 3 M3 design 5.6). First the rejections that are
-//! left to the session: REJECT-DROP holds the connection and then closes it,
-//! the others reset it. Then the stop: every connection is reset and the app is
-//! told, the resets reach the device even when the device is slow, and a device
-//! that takes nothing cannot hold the stop up for longer than a grace. Then a
-//! device that fails. The last tests run one shard's task by hand, with
-//! channels of their own in place of the reader and the writer.
+//! left to the session: REJECT-DROP holds the connection and then closes it (and
+//! lets it go when the connection ends first), the others reset it. Then the
+//! stop: every connection is reset and the app is told, a relay stuck on its
+//! upstream is cancelled, the resets reach the device even when the device is
+//! slow, and a device that takes nothing cannot hold the stop up for longer than
+//! a grace. Then a device that fails. The last tests run one shard's task by
+//! hand, with channels of their own in place of the reader and the writer.
 
 use super::hazards::{PSH_ACK, app4, open_by_hand};
 use super::log_capture::LogCapture;
@@ -188,6 +189,36 @@ async fn stop_during_a_drop_hold_ends_it() {
     assert_nothing_left(&rig.tun);
 }
 
+/// A hold ends with its connection: when the app resets the connection during
+/// the hold the shard lets it go, and the session ends then, not when the hold
+/// does (30 s here), with its boxed future and its stream held for all that
+/// time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drop_hold_ends_with_its_connection() {
+    let rig = rig(TunOptions {
+        drop_hold: Duration::from_secs(30),
+        ..TunOptions::default()
+    });
+    let dst = addr("192.0.2.1:80");
+    rig.dialer.script(dst, Script::Reject(RejectKind::Drop));
+    let mut tcp = within("the connection to be made", rig.app.connect(dst))
+        .await
+        .expect("connect");
+    // the session is there from the SYN on; once it is dialed it holds
+    eventually("the session to be dialed and held", WITHIN, || {
+        rig.dialer.dialed().len() == 1 && rig.tun.session_tasks() == 1
+    })
+    .await;
+    tcp.abort();
+    eventually(
+        "the session to end with its connection",
+        FIVE_SECONDS,
+        || rig.tun.session_tasks() == 0,
+    )
+    .await;
+    assert_nothing_left(&rig.tun);
+}
+
 /// After its FIN the TUN reads what the app still sends and throws it away,
 /// until the app's own FIN: the app may send after it has read the FIN, and the
 /// connection ends well. Were the stream let go at once after its `shutdown`,
@@ -227,6 +258,36 @@ async fn a_dropped_connection_is_read_to_the_end_of_what_the_app_sends() {
     assert_eq!(again, 0);
     assert_nothing_left(&rig.tun);
     assert_eq!(rig.tun.counters(), Counters::default());
+}
+
+/// The wait for the app's end is over when the app ends its side: the read that
+/// throws away what the app sends stops at the end of the stream, and the
+/// session ends then, not when `linger` (a minute, by default) is over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drop_hold_ends_when_the_app_ends_its_side() {
+    let rig = rig(TunOptions {
+        drop_hold: Duration::from_millis(20),
+        ..TunOptions::default()
+    });
+    let dst = addr("192.0.2.1:80");
+    rig.dialer.script(dst, Script::Reject(RejectKind::Drop));
+    let mut tcp = within("the connection to be made", rig.app.connect(dst))
+        .await
+        .expect("connect");
+    let read = in_five_seconds("the end of the stream", tcp.read(&mut [0; 1]))
+        .await
+        .expect("the end of the stream, not a reset");
+    assert_eq!(read, 0);
+    tcp.shutdown().await.expect("the app's FIN");
+    eventually("the session to end", FIVE_SECONDS, || {
+        rig.tun.session_tasks() == 0
+    })
+    .await;
+    eventually("the connection to go", FIVE_SECONDS, || {
+        rig.tun.sockets_in_use() == 0 && rig.tun.sockets_counted() == 0
+    })
+    .await;
+    assert_nothing_left(&rig.tun);
 }
 
 /// An app that never ends its side is waited for `linger` and no longer: then
@@ -367,9 +428,90 @@ async fn stop_resets_every_open_connection() {
     assert_eq!(ending, Ending::Stopped);
     let ends = rig.dialer.relay_ends();
     assert_eq!(ends.len(), 3, "every relay ended: {ends:?}");
-    assert!(ends.iter().all(Result::is_err), "with the reset: {ends:?}");
+    assert!(
+        ends.iter().all(Result::is_err),
+        "ended by the stop, not cleanly: {ends:?}"
+    );
     assert_nothing_left(&rig.tun);
     assert_eq!(rig.tun.counters(), Counters::default());
+}
+
+/// Waits until `count` has reached `at_least` and then stayed as it is for
+/// `quiet`, and answers what it came to; `limit` is all the time it has. What it
+/// waits for is an absence, a writer that is stuck, which nothing announces: so
+/// it polls, and the quiet is what tells a writer that is stuck from one that
+/// is between two writes.
+async fn stays_at(count: &AtomicUsize, at_least: usize, quiet: Duration, limit: Duration) -> usize {
+    let deadline = Instant::now() + limit;
+    let mut last = count.load(Ordering::SeqCst);
+    let mut since = Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let now = count.load(Ordering::SeqCst);
+        if now != last {
+            (last, since) = (now, Instant::now());
+        } else if now >= at_least && since.elapsed() >= quiet {
+            return now;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the count to stay at {at_least} or more (it is {now})"
+        );
+    }
+}
+
+/// The stop cancels the sessions that are relaying: a relay that waits on its
+/// upstream in both directions (writing to one that takes nothing, reading
+/// from one that says nothing) touches its stream in neither, so the reset the
+/// stop gives the connection never reaches it. Here the upstream is a hold, and
+/// the app writes a MiB: the way to the upstream fills, the app's write stops
+/// part of the way, and the relay is stuck. The stop ends it, and the relay is
+/// recorded as cancelled; were the session not cancelled `join` would wait for
+/// the upstream to move, or for a relay's own idle timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_ends_a_relay_stuck_on_its_upstream() {
+    const MIB: usize = 1 << 20;
+    let rig = rig(TunOptions::default());
+    let dst = addr("192.0.2.1:80");
+    rig.dialer.script(dst, Script::Hold { buffer: 64 * 1024 });
+    let mut tcp = within("the connection to be made", rig.app.connect(dst))
+        .await
+        .expect("connect");
+    let written = Arc::new(AtomicUsize::new(0));
+    let writing = tokio::spawn({
+        let written = written.clone();
+        async move {
+            let data = vec![0x5a; MIB];
+            let mut rest = &data[..];
+            while !rest.is_empty() {
+                let n = tcp.write(rest).await?;
+                written.fetch_add(n, Ordering::SeqCst);
+                rest = &rest[n..];
+            }
+            Ok::<(), io::Error>(())
+        }
+    });
+    // waits for: the app's writes to stop, which means the way to the upstream
+    // is full and the relay is stuck on it. The margin, on the development
+    // machine: the way fills in 11 to 26 ms alone and in at most 36 ms with the
+    // whole test binary running (the longest gap between two changes of the
+    // count was 25 ms), so the 300 ms of quiet is more than eight times the
+    // longest fill.
+    let stuck = stays_at(&written, 64 * 1024, Duration::from_millis(300), WITHIN).await;
+    assert!(
+        stuck < MIB,
+        "the upstream reads nothing, so the MiB cannot all have been taken ({stuck} bytes were)"
+    );
+    rig.tun.stop();
+    let ending = in_five_seconds("the TUN to end", rig.tun.join()).await;
+    assert_eq!(ending, Ending::Stopped);
+    assert_eq!(rig.dialer.relay_ends(), vec![Err("cancelled".to_string())]);
+    let error = in_five_seconds("the app's write to fail", writing)
+        .await
+        .expect("the writer's task")
+        .expect_err("the stop resets the connection");
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+    assert_nothing_left(&rig.tun);
 }
 
 /// A dialer whose dials wait for the test to let them through, and then do what
@@ -400,8 +542,8 @@ impl Dialer for Gated {
 
 /// The stop does not cancel a dial that is under way: a dial dropped half way
 /// would leave a session record that never finishes. The TUN waits for it, and
-/// when it comes back the session finds its stream reset and the relay ends at
-/// once.
+/// when it comes back the stop is in place already: the session is cancelled
+/// and the relay ends at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dial_under_way_is_not_cancelled_by_the_stop() {
     let (device, end) = MemoryDevice::pair(1500, 4096);
@@ -438,7 +580,7 @@ async fn a_dial_under_way_is_not_cancelled_by_the_stop() {
     assert_eq!(ending, Ending::Stopped);
     let ends = fake.relay_ends();
     assert_eq!(ends.len(), 1, "the relay ran and ended: {ends:?}");
-    assert!(ends[0].is_err(), "with the reset: {ends:?}");
+    assert!(ends[0].is_err(), "ended by the stop, not cleanly: {ends:?}");
     let error = in_five_seconds("the reset", tcp.read(&mut [0; 1]))
         .await
         .expect_err("the stop reset the connection");

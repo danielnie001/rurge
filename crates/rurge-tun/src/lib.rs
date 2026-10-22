@@ -169,7 +169,7 @@ impl Tun {
 pub struct TunOptions {
     /// Whether IPv6 packets are handled; with it off they are dropped as unsupported.
     pub ipv6: bool,
-    /// REJECT-DROP: how long a session holds the connection it was rejected on, read and written by nobody, before the TUN closes its side (a FIN). A stop ends the hold at once. After it the TUN waits for the app to close its side, for `linger` at the most.
+    /// REJECT-DROP: how long a session holds the connection it was rejected on, read and written by nobody, before the TUN closes its side (a FIN). A stop ends the hold at once, and so does the end of the connection (the app resets it, say). After it the TUN waits for the app to close its side, for `linger` at the most.
     pub drop_hold: Duration,
     /// How many shards the TCP stack is divided into, each with a stack and a task of its own. The default was chosen by the benchmark gate; see the phase 3 / M3a plan's execution record row 10.
     pub shards: usize,
@@ -336,26 +336,31 @@ impl TunHandle {
     /// which the writer writes before it ends (it gives the device a grace for
     /// that, and no more).
     ///
-    /// The sessions are not cancelled, and a session ends with its connection
-    /// only when it touches its stream (a REJECT-DROP hold also ends at the
-    /// stop, without touching it). A dial that is under way is not
-    /// cancelled: it finds the stream reset when it comes back, and the relay
-    /// ends at once. A relay that is reading or writing the stream meets the
-    /// reset the same way. But a relay that waits on its upstream in both
-    /// directions (writing to one that takes nothing, reading from one that
-    /// says nothing) touches the stream in neither, and runs on until the
-    /// upstream moves, or the relay's own idle timeout fires, or the session
-    /// is cancelled from outside the TUN. [`TunHandle::join`] waits for such a
-    /// relay too, so whoever stops a TUN and joins it has to cancel its
-    /// sessions or bound the wait.
+    /// The sessions that have been dialed are cancelled: the token of each
+    /// session's handle is cancelled, so its relay ends whatever it is waiting
+    /// on, and the session's record is finished as the engine finishes a
+    /// cancelled session, as completed. The cancellation is what ends a relay
+    /// that waits on its upstream in both directions (writing to one that
+    /// takes nothing, reading from one that says nothing), which touches its
+    /// stream in neither and would never meet the reset the stop gives the
+    /// connection. A REJECT-DROP hold ends at the stop as well.
+    ///
+    /// A dial that is under way is not cancelled: it is the dialer's, which
+    /// holds the session's handle, and a dial dropped half way would leave the
+    /// session's record open. When it comes back the session is cancelled like
+    /// the others, with a stream that has been reset, and ends at once. So
+    /// [`TunHandle::join`] waits for a dial as long as it takes: the engine's
+    /// dials end within their own time limits, and whoever has to stop a TUN
+    /// in a bounded time gives its wait for `join` a limit, which is all there
+    /// is against a dial that never comes back.
     pub fn stop(&self) {
         self.inner.life.end(Ending::Stopped);
     }
 
     /// Every task of the TUN, sessions included, has ended: why it ended, the
-    /// first reason given. Answers the same every time. A session ends as
-    /// [`TunHandle::stop`] says, so a relay stuck on its upstream keeps this
-    /// waiting.
+    /// first reason given. Answers the same every time. The sessions end as
+    /// [`TunHandle::stop`] says, so what keeps this waiting after a stop is a
+    /// dial that is under way, until it comes back.
     pub async fn join(&self) -> Ending {
         self.inner.tasks.wait().await;
         self.inner.life.ending()
@@ -364,6 +369,19 @@ impl TunHandle {
     /// The packets dropped so far, for each reason.
     pub fn counters(&self) -> Counters {
         self.inner.stats.counters()
+    }
+
+    /// The sessions that are running: the TUN's tasks but the ones it starts
+    /// itself, a shard's each, the writer and the device's reader. It is right
+    /// only while those run, until a stop or a failing device ends them; after
+    /// that it means nothing, and it may panic.
+    #[cfg(test)]
+    pub(crate) fn session_tasks(&self) -> usize {
+        self.inner
+            .tasks
+            .len()
+            .checked_sub(self.inner.shards.len() + 2)
+            .expect("session_tasks is asked of a TUN that is running")
     }
 
     /// The TCP sockets of every shard.

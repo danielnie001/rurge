@@ -872,6 +872,21 @@ async fn a_failed_relay_is_recorded_with_its_text() {
     );
 }
 
+/// The fake dialer's relay ends when the session's token is cancelled, as the
+/// engine's does, with an app that says nothing and an upstream that is held:
+/// it is recorded as cancelled, and the handle finishes completed.
+#[tokio::test]
+async fn a_cancelled_relay_ends_and_is_recorded_as_cancelled() {
+    let dialer = FakeDialer::new();
+    let to = addr("192.0.2.17:443");
+    dialer.script(to, Script::Hold { buffer: 1024 });
+    let (_app, relay, handle) = relayed(&dialer, to).await;
+    handle.token().cancel();
+    within("the relay to end", relay).await.unwrap();
+    assert_eq!(dialer.relay_ends(), [Err("cancelled".to_string())]);
+    assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+}
+
 #[tokio::test]
 async fn a_memory_upstream_sends_what_it_was_told_and_counts_what_it_gets() {
     let dialer = FakeDialer::new();

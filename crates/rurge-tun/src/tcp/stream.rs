@@ -66,6 +66,16 @@ impl TunStream {
         }
     }
 
+    /// Completes once the shard has let the connection go, and answers how it
+    /// ended: the app reset it, a timer of the stack closed it, the TUN is
+    /// stopping. What the shard kept of what the app sent is still there to
+    /// read, and this does not wait for it to be read (M3b P26): the connection
+    /// is over for a session that only holds it. The task waits as a reader
+    /// does, so it reads nothing from the stream meanwhile.
+    pub(crate) async fn closed(&self) -> Outcome {
+        std::future::poll_fn(|cx| self.shared.poll_outcome(cx)).await
+    }
+
     /// How the connection ended, once the shard has let it go.
     fn outcome(&self) -> Outcome {
         self.shared.outcome().unwrap_or(Outcome::Reset)

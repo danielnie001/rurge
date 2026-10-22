@@ -265,7 +265,12 @@ impl Dialer for FakeDialer {
         })
     }
 
-    /// The same two buffers of 8 KiB as the engine's relay.
+    /// The same two buffers of 8 KiB as the engine's relay, and like it this
+    /// ends when the session's token is cancelled, whatever it is waiting on
+    /// (a copy that waits to write upstream reads nothing from the client, so
+    /// it would not meet the end of the client's connection): the end is
+    /// recorded as `Err("cancelled")`, and the handle finishes `Completed`, as
+    /// the engine finishes a session that was cancelled and not killed.
     fn relay<'a>(
         &'a self,
         mut client: BoxedStream,
@@ -273,17 +278,25 @@ impl Dialer for FakeDialer {
         handle: Arc<SessionHandle>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let end =
-                tokio::io::copy_bidirectional_with_sizes(&mut client, &mut upstream, 8192, 8192)
-                    .await;
-            let end = end.map(|_| ()).map_err(|e| e.to_string());
+            let (end, outcome) = tokio::select! {
+                biased;
+                _ = handle.token().cancelled() => {
+                    (Err("cancelled".to_string()), SessionOutcome::Completed)
+                }
+                end = tokio::io::copy_bidirectional_with_sizes(
+                    &mut client,
+                    &mut upstream,
+                    8192,
+                    8192,
+                ) => match end.map(|_| ()).map_err(|e| e.to_string()) {
+                    Ok(()) => (Ok(()), SessionOutcome::Completed),
+                    Err(text) => (Err(text.clone()), SessionOutcome::Failed(text)),
+                },
+            };
             // recorded before the handle finishes, so whoever waits for the
             // handle's outcome finds it
-            self.book().relay_ends.push(end.clone());
-            handle.finish(match end {
-                Ok(()) => SessionOutcome::Completed,
-                Err(text) => SessionOutcome::Failed(text),
-            });
+            self.book().relay_ends.push(end);
+            handle.finish(outcome);
         })
     }
 }

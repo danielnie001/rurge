@@ -16,10 +16,12 @@ use crate::testing::{Direction, Script, Upstream, pattern};
 use crate::{Counters, TunOptions};
 use smoltcp::socket::tcp;
 use std::collections::HashSet;
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -288,6 +290,70 @@ async fn a_stream_answers_by_how_its_connection_ended() {
     assert_eq!(lone.admission.sockets(), 0);
     assert_eq!(lone.budget.used(), 0);
     assert_eq!(shard.state().records(), Records::default());
+}
+
+/// A waker that notes it was woken.
+struct Woken(AtomicBool);
+
+impl Wake for Woken {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// `closed` waits for the shard to let the connection go, is woken when it
+/// does and answers how the connection ended, whether or not the stream has
+/// read what the app sent: the bytes the shard kept are still there to read.
+#[tokio::test]
+async fn closed_waits_for_the_shard_to_let_the_connection_go() {
+    let epoch = Instant::now();
+    let at = |ms: u64| epoch + Duration::from_millis(ms);
+    let lone = lone_shard(&TunOptions::default(), epoch);
+    let shard = &lone.shard;
+    let woken = Arc::new(Woken(AtomicBool::new(false)));
+    let waker = Waker::from(woken.clone());
+    let mut cx = Context::from_waker(&waker);
+
+    // the app resets the connection
+    let (app, stream) = ByHand::make(shard, epoch, 40000, 0).await;
+    let mut closed = Box::pin(stream.closed());
+    assert_eq!(closed.as_mut().poll(&mut cx), Poll::Pending);
+    assert!(!woken.0.load(Ordering::SeqCst), "nothing has ended yet");
+    turn(shard, at(10), vec![app.segment(2, 0, RST_ACK, &[])]);
+    assert!(
+        woken.0.swap(false, Ordering::SeqCst),
+        "the shard wakes the task that waits for the end"
+    );
+    assert_eq!(closed.as_mut().poll(&mut cx), Poll::Ready(Outcome::Reset));
+    drop(closed);
+
+    // the connection ends well, with the bytes the app sent not read: it is
+    // over for `closed`, which does not wait for them
+    let (app, mut stream) = ByHand::make(shard, epoch, 40001, 100).await;
+    turn(shard, at(110), vec![app.segment(2, 0, PSH_ACK, b"abc")]);
+    turn(shard, at(111), vec![app.segment(5, 0, FIN_ACK, &[])]);
+    within("the shutdown", stream.shutdown())
+        .await
+        .expect("the shutdown");
+    turn(shard, at(120), vec![]);
+    let mut closed = Box::pin(stream.closed());
+    assert_eq!(
+        closed.as_mut().poll(&mut cx),
+        Poll::Pending,
+        "the app has not acknowledged the TUN's FIN"
+    );
+    turn(shard, at(130), vec![app.segment(6, 1, ACK, &[])]);
+    assert!(
+        woken.0.swap(false, Ordering::SeqCst),
+        "the shard wakes the task that waits for the end"
+    );
+    assert_eq!(closed.as_mut().poll(&mut cx), Poll::Ready(Outcome::Closed));
+    drop(closed);
+    let mut got = [0; 3];
+    within("the bytes before the FIN", stream.read_exact(&mut got))
+        .await
+        .expect("the bytes are read");
+    assert_eq!(&got, b"abc");
 }
 
 /// What the stream and the app do on a connection made by hand at 0 ms to leave
