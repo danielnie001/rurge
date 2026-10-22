@@ -458,6 +458,14 @@ impl TunHandle {
             .expect("session_tasks is asked of a TUN that is running")
     }
 
+    /// How many tasks are on the TUN's tracker, all of them: the sessions, the
+    /// shards, the writer and the device's reader. Unlike `session_tasks` it
+    /// means something after the stop too, as the tasks that end then unwind.
+    #[cfg(test)]
+    pub(crate) fn live_tasks(&self) -> usize {
+        self.inner.tasks.len()
+    }
+
     /// The TCP sockets of every shard.
     #[cfg(test)]
     pub(crate) fn sockets_in_use(&self) -> usize {

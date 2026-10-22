@@ -7,30 +7,34 @@
 
 use super::filter::warning;
 use super::log_capture::LogCapture;
-use super::support::{Extras, Rig, WITHIN, eventually, tun_dialing, with_ip_options, within};
+use super::support::{
+    Extras, GatedDevice, Rig, WITHIN, eventually, in_five_seconds, tun_dialing, with_ip_options,
+    within,
+};
 use crate::device::{AppEnd, Device, MemoryDevice};
 use crate::packet::Reason;
 use crate::testing::packets::{self, IcmpSeen};
 use crate::testing::{AppStack, FakeDialer, FakeResolve, PingScript};
+use crate::writer::STOP_GRACE;
 use crate::{Counters, Ending, TunOptions, TunSettings};
 use rurge_dns::fakeip::{FakeIpPool, v4_of, v6_of};
 use rurge_net::BoxFuture;
 use rurge_net::connector::Resolve;
-use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, mpsc::error::TryRecvError, watch};
+use tokio::sync::{mpsc, mpsc::error::TryRecvError};
 
 /// The one fixed wait of these tests, for what must not happen: a reply for
 /// the app. It would go through the writer and the app's stack in well under a
 /// millisecond; 200 ms is a wide margin.
 const NOTHING: Duration = Duration::from_millis(200);
 
-/// How long after the stop what ends at the stop is to have ended: well within
-/// the second that a writer stuck in its write is given (`STOP_GRACE`).
-const STOP_WELL_BEFORE: Duration = Duration::from_millis(600);
+/// How long after the stop what ends at the stop is to have ended: six tenths
+/// of the grace that a writer stuck in its write is given (`STOP_GRACE`), so
+/// well within it.
+const STOP_WELL_BEFORE: Duration = Duration::from_millis(STOP_GRACE.as_millis() as u64 * 6 / 10);
 
 /// The app's addresses and the places it pings, one family each; the far ones
 /// are documentation addresses.
@@ -57,13 +61,6 @@ fn echoed(src: IpAddr, dst: IpAddr, ident: u16, seq: u16, payload: &[u8]) -> Icm
         seq,
         payload: payload.to_vec(),
     }
-}
-
-/// `future`, which has five seconds to finish.
-async fn in_five_seconds<T>(what: &str, future: impl Future<Output = T>) -> T {
-    tokio::time::timeout(Duration::from_secs(5), future)
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
 }
 
 /// A rig whose app end has its ICMP packets in the test's hands, with what the
@@ -686,41 +683,10 @@ async fn a_reply_larger_than_the_mtu_is_fragmented() {
 
 // ---- the writer's queue
 
-/// A device that takes nothing to write until the test lets it.
-struct Gated {
-    inner: MemoryDevice,
-    open: watch::Sender<bool>,
-}
-
-impl Device for Gated {
-    fn recv<'a>(&'a self, into: &'a mut Vec<Vec<u8>>, max: usize) -> BoxFuture<'a, io::Result<()>> {
-        self.inner.recv(into, max)
-    }
-
-    fn send<'a>(&'a self, packets: &'a mut Vec<Vec<u8>>) -> BoxFuture<'a, io::Result<()>> {
-        Box::pin(async move {
-            let mut gate = self.open.subscribe();
-            let opened = gate.wait_for(|open| *open).await.is_ok();
-            if !opened {
-                return Err(io::Error::other("the gate is gone"));
-            }
-            self.inner.send(packets).await
-        })
-    }
-
-    fn mtu(&self) -> usize {
-        self.inner.mtu()
-    }
-}
-
 /// A lab on a device that writes nothing until `open`, and a writer queue of
 /// one batch.
-fn gated() -> (Lab, Arc<Gated>) {
-    let (device, end) = MemoryDevice::pair(1500, 4096);
-    let gate = Arc::new(Gated {
-        inner: device,
-        open: watch::channel(false).0,
-    });
+fn gated() -> (Lab, Arc<GatedDevice>) {
+    let (gate, end) = GatedDevice::pair();
     let options = TunOptions {
         writer_queue: 1,
         ..TunOptions::default()
@@ -750,7 +716,7 @@ async fn a_full_writer_queue_drops_a_local_answer_and_counts_it() {
         "{lost} answers were lost, at least {} were to be",
         senders - 2
     );
-    gate.open.send_replace(true);
+    gate.open();
     // the writer wrote in order: every answer it took came before the marker
     let mut written = 0;
     loop {
@@ -799,7 +765,7 @@ async fn a_forwarded_reply_waits_for_room_in_the_writer_queue() {
         3,
         "the replies did not wait for room"
     );
-    gate.open.send_replace(true);
+    gate.open();
     let mut seqs = Vec::new();
     for _ in 0..5 {
         match lab.reply().await {
@@ -833,7 +799,7 @@ async fn stop_ends_a_reply_that_waits_for_room() {
     eventually(
         "the writer to be the only task left",
         STOP_WELL_BEFORE,
-        || lab.rig.tun.inner.tasks.len() == 1,
+        || lab.rig.tun.live_tasks() == 1,
     )
     .await;
     let ending = in_five_seconds("the TUN to end", lab.rig.tun.join()).await;

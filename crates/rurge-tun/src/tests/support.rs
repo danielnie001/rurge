@@ -9,6 +9,7 @@ use crate::testing::{AppStack, AppTcp, FakeDialer, FakeHooks, FakePinger, FakeRe
 use crate::{Life, Tun, TunHandle, TunOptions, TunSettings};
 use rurge_dns::fakeip::FakeIpPool;
 use rurge_inbound::Dialer;
+use rurge_net::BoxFuture;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, TcpControl, TcpPacket, TcpRepr,
@@ -20,6 +21,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::watch;
 
 /// A TUN on one end of a memory device, the app's stack on the other, and
 /// the fake `Dialer` the TUN hands its sessions to.
@@ -132,6 +134,53 @@ pub(crate) fn tun_dialing(
     )
 }
 
+/// A memory device that takes nothing to write until the test opens it: what
+/// the TUN writes waits in the writer's hands, then in its queue, and the TUN
+/// goes on until that is full.
+pub(crate) struct GatedDevice {
+    inner: MemoryDevice,
+    gate: watch::Sender<bool>,
+}
+
+impl GatedDevice {
+    /// A closed device with an MTU of 1500 and room for 4096 packets each way,
+    /// and the app's end of it.
+    pub(crate) fn pair() -> (Arc<GatedDevice>, AppEnd) {
+        let (inner, end) = MemoryDevice::pair(1500, 4096);
+        let device = GatedDevice {
+            inner,
+            gate: watch::channel(false).0,
+        };
+        (Arc::new(device), end)
+    }
+
+    /// From now on the device writes what it is given, and what it holds back.
+    pub(crate) fn open(&self) {
+        self.gate.send_replace(true);
+    }
+}
+
+impl Device for GatedDevice {
+    fn recv<'a>(&'a self, into: &'a mut Vec<Vec<u8>>, max: usize) -> BoxFuture<'a, io::Result<()>> {
+        self.inner.recv(into, max)
+    }
+
+    fn send<'a>(&'a self, packets: &'a mut Vec<Vec<u8>>) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            let mut gate = self.gate.subscribe();
+            let opened = gate.wait_for(|open| *open).await.is_ok();
+            if !opened {
+                return Err(io::Error::other("the gate is gone"));
+            }
+            self.inner.send(packets).await
+        })
+    }
+
+    fn mtu(&self) -> usize {
+        self.inner.mtu()
+    }
+}
+
 /// One shard on its own, for a test that takes its turns by hand, with what a
 /// TUN gives each of its shards: the test holds the TUN's `Life`, `Stats`
 /// and `Admission` as the TUN holds them.
@@ -188,6 +237,17 @@ pub(crate) const WITHIN: Duration = Duration::from_secs(10);
 /// `future`, which has `WITHIN` to finish; `what` is what it waits for.
 pub(crate) async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
     tokio::time::timeout(WITHIN, future)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+}
+
+/// Five seconds: what `in_five_seconds` gives a future, and the limit several
+/// tests give a condition to come true.
+pub(crate) const FIVE_SECONDS: Duration = Duration::from_secs(5);
+
+/// `future`, which has five seconds to finish; `what` is what it waits for.
+pub(crate) async fn in_five_seconds<T>(what: &str, future: impl Future<Output = T>) -> T {
+    tokio::time::timeout(FIVE_SECONDS, future)
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
 }

@@ -11,8 +11,9 @@
 use super::hazards::{PSH_ACK, app4, open_by_hand};
 use super::log_capture::LogCapture;
 use super::support::{
-    Extras, Lone, WITHIN, addr, data_segment_v4, eventually, hello, is_fin, is_reset, is_syn,
-    lone_shard, rig, rig_with, syn_v4, tun_dialing, tun_on, tun_with, within,
+    Extras, FIVE_SECONDS, Lone, WITHIN, addr, data_segment_v4, eventually, hello, in_five_seconds,
+    is_fin, is_reset, is_syn, lone_shard, rig, rig_with, syn_v4, tun_dialing, tun_on, tun_with,
+    within,
 };
 use crate::device::{Device, MemoryDevice};
 use crate::packet::segment;
@@ -27,7 +28,6 @@ use rurge_inbound::{DialError, Dialed, Dialer, SessionHandle};
 use rurge_net::BoxFuture;
 use rurge_net::connector::BoxedStream;
 use rurge_proto::RejectKind;
-use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -38,18 +38,9 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 use tokio_util::task::TaskTracker;
 
-const FIVE_SECONDS: Duration = Duration::from_secs(5);
-
 /// What a stop is given to finish in beyond its grace: the tasks of the TUN
 /// unwind in milliseconds, and this is for a machine that is busy.
 const MARGIN: Duration = Duration::from_secs(3);
-
-/// `future`, which has five seconds to finish; `what` is what it waits for.
-async fn in_five_seconds<T>(what: &str, future: impl Future<Output = T>) -> T {
-    timeout(FIVE_SECONDS, future)
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
-}
 
 /// Counts the resets the TUN sends the app from now on. Every packet goes on.
 fn count_resets(app: &AppStack) -> Arc<AtomicUsize> {

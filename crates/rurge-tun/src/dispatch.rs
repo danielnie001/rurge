@@ -83,8 +83,9 @@ pub(crate) async fn run(
             match parsed.transport {
                 Transport::Udp { .. } => udp::receive(&ctx, &parsed, &packet),
                 Transport::Icmp { .. } => icmp::receive(&ctx, &parsed, &packet),
-                // `route` gives a TCP segment to its shard and hands none back;
-                // were one to come, a panic here would stop all reception
+                // `route` gives a TCP segment to its shard and hands none back.
+                // Debug builds assert, so that a test notices; release builds do
+                // nothing, for a panic here would stop all reception.
                 Transport::Tcp(_) => debug_assert!(false, "route gives a TCP segment to a shard"),
             }
         }

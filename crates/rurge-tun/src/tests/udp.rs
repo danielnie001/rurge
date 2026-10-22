@@ -6,10 +6,10 @@
 //! nothing it reads has been through a stack of its own.
 
 use super::support::{
-    Extras, Rig, WITHIN, addr, eventually, rig_extras, rig_with, sock, tun_dialing, udp_bytes,
-    with_ip_options, within,
+    Extras, GatedDevice, Rig, WITHIN, addr, eventually, in_five_seconds, rig_extras, rig_with,
+    sock, tun_dialing, udp_bytes, with_ip_options, within,
 };
-use crate::device::{Device, MemoryDevice};
+use crate::device::MemoryDevice;
 use crate::fragment::{Ids, ip_packets};
 use crate::icmp::prohibited;
 use crate::testing::packets::{self, IcmpSeen, UdpSeen};
@@ -26,13 +26,11 @@ use rurge_proto::RejectKind;
 use smoltcp::wire::{
     Icmpv4Message, Icmpv4Packet, Icmpv6Message, Icmpv6Packet, IpProtocol, Ipv4Packet, Ipv6Packet,
 };
-use std::future::Future;
-use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, mpsc::error::TryRecvError, watch};
+use tokio::sync::{mpsc, mpsc::error::TryRecvError};
 use tokio_util::sync::CancellationToken;
 
 /// The one fixed wait of these tests, for what must not happen: an ICMP
@@ -84,13 +82,6 @@ fn template(app: SocketAddr) -> SessionInfo {
         process: None,
         device: None,
     }
-}
-
-/// `future`, which has five seconds to finish.
-async fn in_five_seconds<T>(what: &str, future: impl Future<Output = T>) -> T {
-    tokio::time::timeout(Duration::from_secs(5), future)
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
 }
 
 /// A rig whose app end has its UDP and ICMP packets in the test's hands.
@@ -1255,41 +1246,10 @@ async fn an_old_session_that_ends_late_does_not_take_its_replacement_with_it() {
 
 // ---- the writer's queue
 
-/// A device that takes nothing to write until the test lets it.
-struct Gated {
-    inner: MemoryDevice,
-    open: watch::Sender<bool>,
-}
-
-impl Device for Gated {
-    fn recv<'a>(&'a self, into: &'a mut Vec<Vec<u8>>, max: usize) -> BoxFuture<'a, io::Result<()>> {
-        self.inner.recv(into, max)
-    }
-
-    fn send<'a>(&'a self, packets: &'a mut Vec<Vec<u8>>) -> BoxFuture<'a, io::Result<()>> {
-        Box::pin(async move {
-            let mut gate = self.open.subscribe();
-            let opened = gate.wait_for(|open| *open).await.is_ok();
-            if !opened {
-                return Err(io::Error::other("the gate is gone"));
-            }
-            self.inner.send(packets).await
-        })
-    }
-
-    fn mtu(&self) -> usize {
-        self.inner.mtu()
-    }
-}
-
 /// A rig on a device that writes nothing until `open`, and a writer queue of
 /// one batch.
-fn gated() -> (Lab, Arc<Gated>) {
-    let (device, end) = MemoryDevice::pair(1500, 4096);
-    let gate = Arc::new(Gated {
-        inner: device,
-        open: watch::channel(false).0,
-    });
+fn gated() -> (Lab, Arc<GatedDevice>) {
+    let (gate, end) = GatedDevice::pair();
     let rig = rig_with(
         gate.clone(),
         end,
@@ -1340,7 +1300,7 @@ async fn a_full_writer_queue_drops_the_icmp_and_counts_it() {
             "{lost} messages were lost, at least {} were to be (the client: {from_the_client})",
             senders - 2
         );
-        gate.open.send_replace(true);
+        gate.open();
         assert_eq!(lab.datagram().await.payload, b"marker");
         // the writer wrote in order: every message it took came before the marker
         let mut messages = 0;
@@ -1386,7 +1346,7 @@ async fn a_reply_waits_for_room_in_the_writer_queue() {
     // has to wait, however long that is
     tokio::time::sleep(NOTHING).await;
     assert!(!sending.is_finished(), "the replies did not wait for room");
-    gate.open.send_replace(true);
+    gate.open();
     in_five_seconds("the replies to be sent", sending)
         .await
         .expect("the sending task");
