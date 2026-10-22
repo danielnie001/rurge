@@ -5,9 +5,17 @@
 mod common;
 use common::*;
 use rurge_config::HostName;
-use rurge_config::session::Transport;
+use rurge_config::session::{SessionInfo, Transport};
 use rurge_engine::{REFUSED_STRICT, RequestRecord};
+use rurge_inbound::{Dialer, UdpClient};
+use rurge_net::BoxFuture;
 use rurge_net::connector::Target;
+use rurge_proto::RejectKind;
+use std::io;
+use std::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 fn udp_records(h: &Harness) -> Vec<RequestRecord> {
     h.engine
@@ -953,4 +961,289 @@ async fn a_suspended_engine_drops_the_datagrams_and_serves_the_flow_again_when_i
         );
     };
     assert_eq!(back, (echo, b"again".to_vec()));
+}
+
+/// What the engine told the client of a datagram: its payload, where it says
+/// it came from, and the target of the flow it says it answers.
+type Heard = (Vec<u8>, Target, Option<Target>);
+
+/// A UDP client of the test's own, where a SOCKS5 one shows no more than the
+/// datagrams: it keeps what the engine tells it — each answer with the flow it
+/// says it is for, and every refusal. What it sends out is what the test
+/// writes.
+struct OwnClient {
+    outgoing: tokio::sync::Mutex<mpsc::UnboundedReceiver<(Target, Vec<u8>)>>,
+    heard: Mutex<Vec<Heard>>,
+    refused: Mutex<Vec<(Target, RejectKind)>>,
+}
+
+impl UdpClient for OwnClient {
+    fn recv<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
+        Box::pin(async move {
+            let Some((to, payload)) = self.outgoing.lock().await.recv().await else {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            };
+            buf[..payload.len()].copy_from_slice(&payload);
+            Ok((payload.len(), to))
+        })
+    }
+
+    fn send<'a>(
+        &'a self,
+        payload: &'a [u8],
+        from: &'a Target,
+        answers: Option<&'a Target>,
+    ) -> BoxFuture<'a, io::Result<()>> {
+        self.heard
+            .lock()
+            .unwrap()
+            .push((payload.to_vec(), from.clone(), answers.cloned()));
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn refused(&self, target: &Target, kind: RejectKind) {
+        self.refused.lock().unwrap().push((target.clone(), kind));
+    }
+}
+
+/// An association the engine serves for an `OwnClient`, until it is dropped.
+struct OwnAssociation {
+    client: Arc<OwnClient>,
+    outgoing: mpsc::UnboundedSender<(Target, Vec<u8>)>,
+    _serving: AbortOnDropHandle<()>,
+}
+
+fn own_association(h: &Harness) -> OwnAssociation {
+    let (outgoing, waiting) = mpsc::unbounded_channel();
+    let client = Arc::new(OwnClient {
+        outgoing: tokio::sync::Mutex::new(waiting),
+        heard: Mutex::default(),
+        refused: Mutex::default(),
+    });
+    let mut session = SessionInfo::udp(HostName::parse("127.0.0.1"), 0);
+    session.listener = ListenerKind::Socks5;
+    let serving = tokio::spawn({
+        let (engine, client) = (h.engine.clone(), client.clone());
+        async move {
+            engine
+                .associate(client, session, CancellationToken::new())
+                .await
+        }
+    });
+    OwnAssociation {
+        client,
+        outgoing,
+        _serving: AbortOnDropHandle::new(serving),
+    }
+}
+
+impl OwnAssociation {
+    /// The client writes `payload` to `host:port` (an IP literal or a name).
+    fn write(&self, host: &str, port: u16, payload: &[u8]) {
+        let to = Target::new(HostName::parse(host), port);
+        self.outgoing.send((to, payload.to_vec())).unwrap();
+    }
+
+    /// Everything the client has been told so far, once it has been told
+    /// `count` datagrams.
+    async fn heard(&self, count: usize) -> Vec<Heard> {
+        wait_until("the client to be told the answers", || {
+            self.client.heard.lock().unwrap().len() >= count
+        })
+        .await;
+        self.client.heard.lock().unwrap().clone()
+    }
+
+    /// Every refusal the client has been told so far, once it has been told
+    /// `count` of them.
+    async fn refused(&self, count: usize) -> Vec<(Target, RejectKind)> {
+        wait_until("the client to be told the refusals", || {
+            self.client.refused.lock().unwrap().len() >= count
+        })
+        .await;
+        self.client.refused.lock().unwrap().clone()
+    }
+}
+
+/// The record of the flow to `dst` once it has finished. A connection to a
+/// closed port is refused after about two seconds on Windows, so this waits
+/// longer than `wait_until` does.
+async fn flow_record(h: &Harness, dst: &str) -> RequestRecord {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(record) = udp_records(h).into_iter().find(|r| r.dst == dst) {
+                return record;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the flow to {dst} did not finish"))
+}
+
+/// An answer says which flow it is for — the target as the client wrote it —
+/// when there is only one it can be: the flow DIRECT sent to the address it
+/// came from, or the one flow written to a name on its port when the proxy
+/// looked the name up. With two flows it may be for either, and the client is
+/// told none.
+#[tokio::test]
+async fn a_reply_says_which_flow_it_answers() {
+    // DIRECT sends a name's datagrams to the address it looked the name up
+    // to, so the flows to a name and to an address each have an echo of their
+    // own: with one, both would be sent to the same address, and no telling
+    // which of them an answer is for
+    let ((by_name, _), (by_address, _), (looked_up, _)) =
+        (udp_echo().await, udp_echo().await, udp_echo().await);
+    // `one.test` and `two.test` go through a proxy that looks names up (here:
+    // to the same address, whatever the name); everything else goes DIRECT
+    let up = FakeSocks5::spawn(Socks5Script {
+        udp_names_to: Some(looked_up.ip()),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "Up = socks5, 127.0.0.1, {}, udp-relay=true",
+            up.addr().port()
+        ),
+        rules: "DOMAIN,one.test,Up\nDOMAIN,two.test,Up",
+        ..Profile::default()
+    })
+    .await;
+    let association = own_association(&h);
+    let at = |addr: SocketAddr| Target::new(HostName::Ip(addr.ip()), addr.port());
+    let written = |host: &str, port: u16| Target::new(HostName::parse(host), port);
+
+    // a name DIRECT looked up and an address: the answers come from the
+    // addresses, and say they are for what was written
+    association.write("target.test", by_name.port(), b"by name");
+    association.write("127.0.0.1", by_address.port(), b"by address");
+    let heard = association.heard(2).await;
+    let of = |payload: &[u8]| {
+        heard
+            .iter()
+            .find(|(got, _, _)| got == payload)
+            .cloned()
+            .unwrap_or_else(|| panic!("no answer to {payload:?}: {heard:?}"))
+    };
+    assert_eq!(
+        of(b"by name"),
+        (
+            b"by name".to_vec(),
+            at(by_name),
+            Some(written("target.test", by_name.port()))
+        )
+    );
+    assert_eq!(
+        of(b"by address"),
+        (
+            b"by address".to_vec(),
+            at(by_address),
+            Some(written("127.0.0.1", by_address.port()))
+        )
+    );
+
+    // a name the proxy looked up: the answer comes from the address it chose,
+    // and the one flow written to a name on that port is the one it is for
+    association.write("one.test", looked_up.port(), b"first");
+    let heard = association.heard(3).await;
+    assert_eq!(
+        heard[2],
+        (
+            b"first".to_vec(),
+            at(looked_up),
+            Some(written("one.test", looked_up.port()))
+        )
+    );
+    // with a second name on the port it may be for either
+    association.write("two.test", looked_up.port(), b"second");
+    let heard = association.heard(4).await;
+    assert_eq!(heard[3], (b"second".to_vec(), at(looked_up), None));
+}
+
+/// The client is told of every datagram of a refused flow, in the way the flow
+/// was refused: by a rule of the REJECT family, by `block-quic`, by a policy
+/// that carries no UDP. It is told nothing of a flow that failed (its outbound
+/// would not open, its datagrams would not go out, or the engine was
+/// suspended): that flow is tried again after a few seconds, and an error for
+/// the application would have it give up on a destination that may be
+/// reachable by then.
+#[tokio::test]
+async fn a_refused_flow_tells_the_client_for_every_datagram() {
+    let (web, down) = (closed_tcp_port(), closed_tcp_port());
+    let h = harness(Profile {
+        general: "block-quic = all",
+        proxies: &format!(
+            "Web = http, 127.0.0.1, {web}
+Down = socks5, 127.0.0.1, {down}, udp-relay=true
+V4 = direct, ip-version=v4-only"
+        ),
+        rules: "DOMAIN,rej.test,REJECT
+DOMAIN,drop.test,REJECT-DROP
+DOMAIN,nodrop.test,REJECT-NO-DROP
+DOMAIN,gif.test,REJECT-TINYGIF
+DOMAIN,web.test,Web
+DOMAIN,down.test,Down
+IP-CIDR6,::1/128,V4,no-resolve",
+        ..Profile::default()
+    })
+    .await;
+    let association = own_association(&h);
+
+    // a rule: one flow, a refusal for each of its two datagrams
+    association.write("rej.test", 7, b"one");
+    association.write("rej.test", 7, b"two");
+    // the other three kinds
+    for host in ["drop.test", "nodrop.test", "gif.test"] {
+        association.write(host, 7, b"x");
+    }
+    // `block-quic`: a QUIC Initial to port 443
+    association.write("quic.test", 443, &quic_initial());
+    // a policy that carries no UDP (`udp-policy-not-supported-behaviour` is
+    // REJECT unless the profile says otherwise)
+    association.write("web.test", 53, b"query");
+    let refused = association.refused(7).await;
+    let told = |host: &str, port: u16| -> Vec<RejectKind> {
+        let to = Target::new(HostName::parse(host), port);
+        refused
+            .iter()
+            .filter(|(target, _)| *target == to)
+            .map(|(_, kind)| *kind)
+            .collect()
+    };
+    assert_eq!(told("rej.test", 7), [RejectKind::Reject; 2]);
+    assert_eq!(told("drop.test", 7), [RejectKind::Drop]);
+    assert_eq!(told("nodrop.test", 7), [RejectKind::NoDrop]);
+    assert_eq!(told("gif.test", 7), [RejectKind::TinyGif]);
+    assert_eq!(told("quic.test", 443), [RejectKind::Reject]);
+    assert_eq!(told("web.test", 53), [RejectKind::Reject]);
+    assert_eq!(refused.len(), 7, "{refused:?}");
+
+    // a flow whose outbound cannot be opened (nobody listens at the proxy's
+    // port), or whose datagrams cannot go out (a v4-only policy asked for an
+    // IPv6 address), fails: not refused, so nothing is told of it, nor of what
+    // it drops afterwards
+    association.write("down.test", 7, b"one");
+    association.write("::1", 9, b"one");
+    for dst in ["down.test:7", "::1:9"] {
+        let record = flow_record(&h, dst).await;
+        assert_eq!(record.status, RecordStatus::Failed, "{record:?}");
+    }
+    for datagram in [&b"two"[..], b"three"] {
+        association.write("down.test", 7, datagram);
+        association.write("::1", 9, datagram);
+    }
+    // a suspended engine fails a new flow as well
+    h.engine
+        .suspend(Some("the update failed: marker-reason".to_string()));
+    association.write("later.test", 7, b"one");
+    let record = flow_record(&h, "later.test:7").await;
+    assert_eq!(record.status, RecordStatus::Failed, "{record:?}");
+    assert_eq!(record.error.as_deref(), Some(REFUSED_STRICT), "{record:?}");
+    association.write("later.test", 7, b"two");
+    // only to see that nothing more is told: the engine drops a datagram of a
+    // flow the moment it is queued, a few milliseconds, so 300 ms is far more
+    // than it takes
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(association.client.refused.lock().unwrap().len(), 7);
 }

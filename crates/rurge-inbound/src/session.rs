@@ -416,8 +416,21 @@ pub enum DialError {
 pub trait UdpClient: Send + Sync {
     /// The next datagram from the client: its length in `buf`, and where it goes.
     fn recv<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>>;
-    /// Sends `payload` to the client as a datagram from `from`.
-    fn send<'a>(&'a self, payload: &'a [u8], from: &'a Target) -> BoxFuture<'a, io::Result<()>>;
+    /// Sends `payload` to the client as a datagram from `from`. `answers`: the
+    /// target of the flow this datagram answers, as the client named it, when
+    /// that is known.
+    fn send<'a>(
+        &'a self,
+        payload: &'a [u8],
+        from: &'a Target,
+        answers: Option<&'a Target>,
+    ) -> BoxFuture<'a, io::Result<()>>;
+    /// The engine refused the flow to `target` (a rule, `block-quic`, a policy
+    /// that carries no UDP): called for each of its datagrams that is dropped.
+    /// By default nothing is said: the datagrams are dropped silently.
+    fn refused(&self, target: &Target, kind: RejectKind) {
+        let _ = (target, kind);
+    }
 }
 
 /// Whether a UDP association may start (`Dialer::admit_udp`).

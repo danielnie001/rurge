@@ -523,7 +523,7 @@ mod tests {
                         _ = closed.cancelled() => break,
                         got = client.recv(&mut buf) => {
                             let Ok((n, to)) = got else { break };
-                            let _ = client.send(&buf[..n], &to).await;
+                            let _ = client.send(&buf[..n], &to, None).await;
                         }
                     }
                 }

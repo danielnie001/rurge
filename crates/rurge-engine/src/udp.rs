@@ -152,7 +152,10 @@ impl Flow {
 /// Which flow a datagram coming back counts for: the one that sent to its
 /// source; else the oldest flow sent to a name on its port (the server
 /// looked the name up: the answer comes from the address); else the oldest
-/// flow still on the carrier (full cone).
+/// flow still on the carrier (full cone). The datagram is known to answer
+/// that flow when no other could be the one: it is the only flow that sent to
+/// the source, or the only one sent to a name on the port. Among several the
+/// datagram may be for any, and the oldest flow of all is only a guess.
 #[derive(Default)]
 struct Routes(Mutex<Vec<(Target, Weak<Flow>)>>);
 
@@ -169,19 +172,25 @@ impl Routes {
             .retain(|(_, f)| f.strong_count() > 0 && !std::ptr::eq(f.as_ptr(), Arc::as_ptr(flow)));
     }
 
-    fn flow_for(&self, from: &Target) -> Option<Arc<Flow>> {
+    /// The flow a datagram from `from` counts for, and whether it is known to
+    /// answer that flow (see `Routes`). A flow that is gone is none of them.
+    fn flow_for(&self, from: &Target) -> Option<(Arc<Flow>, bool)> {
         let routes = self.0.lock().expect("routes");
+        // the oldest of the flows sent to a target `sent_to` takes, and
+        // whether it is the only one
         let oldest = |sent_to: &dyn Fn(&Target) -> bool| {
-            routes
+            let mut flows = routes
                 .iter()
                 .filter(|(to, _)| sent_to(to))
-                .find_map(|(_, f)| f.upgrade())
+                .filter_map(|(_, f)| f.upgrade());
+            let first = flows.next()?;
+            Some((first, flows.next().is_none()))
         };
         oldest(&|to| to == from)
             .or_else(|| {
                 oldest(&|to| matches!(to.host, HostName::Domain(_)) && to.port == from.port)
             })
-            .or_else(|| oldest(&|_| true))
+            .or_else(|| oldest(&|_| true).map(|(flow, _)| (flow, false)))
     }
 }
 
@@ -212,15 +221,22 @@ async fn receive(
         // `::ffff:a.b.c.d`; the flows are told apart by the IPv4 address the
         // client named, and the client is told the same
         let from = Target::new(from.host.canonical(), from.port);
-        if let Some(flow) = routes.flow_for(&from) {
+        // the client may be told which flow this answers, by the target it
+        // wrote for it, when there is one it is known to be
+        let mut answers = None;
+        if let Some((flow, answered)) = routes.flow_for(&from) {
             flow.handle.add_down(n as u64);
             flow.handle.mark_first_byte();
             flow.answered();
+            if answered {
+                let session = flow.handle.session();
+                answers = Some(Target::new(session.dst_host.clone(), session.dst_port));
+            }
         }
         // one datagram the client cannot take (too long once the SOCKS5
         // header is on, a full buffer) is lost alone: anyone may send to
         // the carrier, and the association lives by its control connection
-        if let Err(e) = client.send(&buf[..n], &from).await {
+        if let Err(e) = client.send(&buf[..n], &from, answers.as_ref()).await {
             tracing::debug!(error = %e, "udp: a datagram for the client is dropped");
         }
     }
@@ -454,18 +470,27 @@ async fn run_flow(
             let retry = matches!(outcome, SessionOutcome::Failed(_)).then(|| now() + RETRY_AFTER);
             handle.finish(outcome);
             if retry.is_some() {
-                drain(&association, &handle, &mut waiting, retry).await;
+                drain(&association, &handle, &mut waiting, retry, None).await;
             }
             waiting.close();
         }
         Err(outcome) => {
             // it holds no room while the flow stays
             drop(first);
-            // a refused flow stays until it is idle; a failed one is tried
-            // again after `RETRY_AFTER`
+            // a refused flow stays until it is idle, and its client is told of
+            // each datagram it drops, this first one too; a failed one is tried
+            // again after `RETRY_AFTER`, and its client is told nothing: it
+            // would give up on a destination that may be reachable by then
             let retry = matches!(outcome, SessionOutcome::Failed(_)).then(|| now() + RETRY_AFTER);
+            let refused = match &outcome {
+                SessionOutcome::Rejected(kind) => Some((&to, *kind)),
+                _ => None,
+            };
+            if let Some((to, kind)) = refused {
+                association.client.refused(to, kind);
+            }
             handle.finish(outcome);
-            drain(&association, &handle, &mut waiting, retry).await;
+            drain(&association, &handle, &mut waiting, retry, refused).await;
             waiting.close();
         }
     }
@@ -685,12 +710,14 @@ pub(crate) fn upstream_failed(
 
 /// Drops what comes for a flow that could not start, or whose datagrams
 /// stopped going out, until it is idle — or until `retry`, whatever comes in
-/// the meantime.
+/// the meantime. `refused`: the flow was refused, to this target and in this
+/// way, and the client is told of each datagram dropped.
 async fn drain(
     association: &Association,
     handle: &SessionHandle,
     waiting: &mut mpsc::Receiver<Queued>,
     retry: Option<Instant>,
+    refused: Option<(&Target, RejectKind)>,
 ) {
     let mut last = now();
     loop {
@@ -699,7 +726,12 @@ async fn drain(
             _ = association.ended.cancelled() => return,
             _ = handle.token().cancelled() => return,
             got = waiting.recv() => match got {
-                Some(_) => last = now(),
+                Some(_) => {
+                    if let Some((to, kind)) = refused {
+                        association.client.refused(to, kind);
+                    }
+                    last = now();
+                }
                 None => return,
             },
             _ = tokio::time::sleep_until(end.into()) => return,
@@ -793,10 +825,10 @@ mod tests {
         let b = Arc::new(Flow::new(handle(2), 2));
         routes.add(target(1), &a);
         routes.add(target(2), &b);
-        assert!(Arc::ptr_eq(&routes.flow_for(&target(2)).unwrap(), &b));
-        assert!(Arc::ptr_eq(&routes.flow_for(&target(9)).unwrap(), &a));
+        assert!(Arc::ptr_eq(&routes.flow_for(&target(2)).unwrap().0, &b));
+        assert!(Arc::ptr_eq(&routes.flow_for(&target(9)).unwrap().0, &a));
         routes.remove(&a);
-        assert!(Arc::ptr_eq(&routes.flow_for(&target(9)).unwrap(), &b));
+        assert!(Arc::ptr_eq(&routes.flow_for(&target(9)).unwrap().0, &b));
         drop(b);
         assert!(routes.flow_for(&target(2)).is_none());
     }
@@ -821,9 +853,108 @@ mod tests {
         routes.add(Target::new(HostName::parse("dns.test"), 53), &b);
         routes.add(Target::new(HostName::parse("quic.test"), 443), &c);
         let from = |port| Target::new(HostName::parse("10.0.0.9"), port);
-        assert!(Arc::ptr_eq(&routes.flow_for(&from(443)).unwrap(), &c));
-        assert!(Arc::ptr_eq(&routes.flow_for(&from(53)).unwrap(), &b));
-        assert!(Arc::ptr_eq(&routes.flow_for(&from(7)).unwrap(), &a));
+        assert!(Arc::ptr_eq(&routes.flow_for(&from(443)).unwrap().0, &c));
+        assert!(Arc::ptr_eq(&routes.flow_for(&from(53)).unwrap().0, &b));
+        assert!(Arc::ptr_eq(&routes.flow_for(&from(7)).unwrap().0, &a));
+    }
+
+    /// What a datagram says about the flow it answers. The flow whose carrier
+    /// sent to the datagram's source, or else the flow sent to a name on its
+    /// port, is the one it answers when there is exactly one such flow: the
+    /// client is then told which target that was. With several of them the
+    /// oldest gets the bytes counted, but the datagram may be for any of them,
+    /// and with none of them it is for none (full cone): the client is told
+    /// nothing. A flow that is gone counts for nothing.
+    #[test]
+    fn which_flow_a_reply_answers() {
+        let flow = |id: u16| {
+            Arc::new(Flow::new(
+                SessionHandle::new(
+                    u64::from(id),
+                    SessionInfo::udp(HostName::parse("10.0.0.1"), 53),
+                ),
+                53,
+            ))
+        };
+        // (the flow's id, whether it is known to be the one answered)
+        let found = |routes: &Routes, from: &Target| {
+            routes
+                .flow_for(from)
+                .map(|(flow, answered)| (flow.handle.id(), answered))
+        };
+        let address = |host: &str, port: u16| Target::new(HostName::parse(host), port);
+        let routes_of = |sent: &[(&Target, &Arc<Flow>)]| {
+            let routes = Routes::default();
+            for (to, flow) in sent {
+                routes.add((*to).clone(), flow);
+            }
+            routes
+        };
+
+        // exactly one flow sent to the source: it is the one
+        let (a, b) = (flow(1), flow(2));
+        let (here, there) = (address("10.0.0.9", 53), address("10.0.0.8", 53));
+        let routes = routes_of(&[(&here, &a), (&there, &b)]);
+        assert_eq!(found(&routes, &here), Some((1, true)));
+        assert_eq!(found(&routes, &there), Some((2, true)));
+
+        // two flows with the same key (DIRECT looked two names up to one
+        // address): the oldest, and no telling which of them it is for
+        let (a, b) = (flow(1), flow(2));
+        let routes = routes_of(&[(&here, &a), (&here, &b)]);
+        assert_eq!(found(&routes, &here), Some((1, false)));
+
+        // a flow sent to the source itself wins over names on its port, and
+        // is the one answered however many of them there are
+        let (a, b, c) = (flow(1), flow(2), flow(3));
+        let (named, other) = (address("one.test", 53), address("two.test", 53));
+        let routes = routes_of(&[(&named, &a), (&other, &b), (&here, &c)]);
+        assert_eq!(found(&routes, &here), Some((3, true)));
+
+        // no flow sent to the source, exactly one to a name on its port: the
+        // server looked the name up
+        let (a, b) = (flow(1), flow(2));
+        let elsewhere = address("10.0.0.7", 9);
+        let routes = routes_of(&[(&elsewhere, &a), (&named, &b)]);
+        assert_eq!(found(&routes, &here), Some((2, true)));
+
+        // two flows sent to names on its port: the oldest, and no telling
+        let (a, b, c) = (flow(1), flow(2), flow(3));
+        let routes = routes_of(&[(&elsewhere, &a), (&named, &b), (&other, &c)]);
+        assert_eq!(found(&routes, &here), Some((2, false)));
+
+        // a flow to a name on another port is no help; neither is one to an
+        // address on the same port, which is no name: anyone may be answering
+        let (a, b) = (flow(1), flow(2));
+        let (near, name_elsewhere) = (address("10.0.0.7", 53), address("three.test", 9));
+        let routes = routes_of(&[(&near, &a), (&name_elsewhere, &b)]);
+        assert_eq!(found(&routes, &here), Some((1, false)));
+
+        // the one flow there is, which nothing says this is for: still not
+        // known to be the one
+        let a = flow(1);
+        let routes = routes_of(&[(&elsewhere, &a)]);
+        assert_eq!(found(&routes, &here), Some((1, false)));
+
+        // a flow that is gone does not count among those sent to the source:
+        // the other is then the only one
+        let (a, b) = (flow(1), flow(2));
+        let routes = routes_of(&[(&here, &a), (&here, &b)]);
+        drop(a);
+        assert_eq!(found(&routes, &here), Some((2, true)));
+        // nor among the names on its port
+        let (a, b) = (flow(1), flow(2));
+        let routes = routes_of(&[(&named, &a), (&other, &b)]);
+        drop(a);
+        assert_eq!(found(&routes, &here), Some((2, true)));
+        // nor as the oldest of all
+        let (a, b, c) = (flow(1), flow(2), flow(3));
+        let routes = routes_of(&[(&elsewhere, &a), (&near, &b), (&name_elsewhere, &c)]);
+        drop(a);
+        assert_eq!(found(&routes, &here), Some((2, false)));
+        // and with no flow left there is none
+        drop((b, c));
+        assert_eq!(found(&routes, &here), None);
     }
 
     /// A carrier that hears one datagram, from `from`, and nothing after it.
@@ -849,9 +980,16 @@ mod tests {
         }
     }
 
-    /// A client that keeps what it is sent.
+    /// A datagram a client is sent: its payload, where it says it came from,
+    /// and the target of the flow it says it answers.
+    type Heard = (Vec<u8>, Target, Option<Target>);
+
+    /// A client that keeps what it is sent, and what it is told was refused.
     #[derive(Default)]
-    struct Hears(Mutex<Vec<(Vec<u8>, Target)>>);
+    struct Hears {
+        heard: Mutex<Vec<Heard>>,
+        refused: Mutex<Vec<(Target, RejectKind)>>,
+    }
 
     impl UdpClient for Hears {
         fn recv<'a>(&'a self, _: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
@@ -862,12 +1000,17 @@ mod tests {
             &'a self,
             payload: &'a [u8],
             from: &'a Target,
+            answers: Option<&'a Target>,
         ) -> BoxFuture<'a, io::Result<()>> {
-            self.0
+            self.heard
                 .lock()
                 .unwrap()
-                .push((payload.to_vec(), from.clone()));
+                .push((payload.to_vec(), from.clone(), answers.cloned()));
             Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn refused(&self, target: &Target, kind: RejectKind) {
+            self.refused.lock().unwrap().push((target.clone(), kind));
         }
     }
 
@@ -903,13 +1046,51 @@ mod tests {
         )
         .await;
         assert_eq!((oldest.handle.bytes().1, wanted.handle.bytes().1), (0, 6));
+        let ours = Target::new(HostName::parse("10.0.0.1"), 53);
         assert_eq!(
-            *client.0.lock().unwrap(),
-            [(
-                b"answer".to_vec(),
-                Target::new(HostName::parse("10.0.0.1"), 53)
-            )]
+            *client.heard.lock().unwrap(),
+            [(b"answer".to_vec(), ours.clone(), Some(ours))]
         );
+    }
+
+    /// The client is told the target its flow was written to — not the
+    /// address its carrier sent to, which is where the answer comes from —
+    /// and only when that flow is the one answered.
+    #[tokio::test]
+    async fn the_client_is_told_what_the_flow_was_written_to() {
+        let flow = |name: &str| {
+            Arc::new(Flow::new(
+                SessionHandle::new(1, SessionInfo::udp(HostName::parse(name), 53)),
+                53,
+            ))
+        };
+        let resolved = Target::new(HostName::parse("10.0.0.1"), 53);
+        for (names, answers) in [
+            (&["dns.test"][..], Some("dns.test")),
+            // DIRECT looked both names up to one address: whose answer is it?
+            (&["one.test", "two.test"][..], None),
+        ] {
+            let flows: Vec<_> = names.iter().map(|name| flow(name)).collect();
+            let routes = Arc::new(Routes::default());
+            for flow in &flows {
+                routes.add(resolved.clone(), flow);
+            }
+            let client = Arc::new(Hears::default());
+            let socket = HearsOnce(Mutex::new(Some((b"answer".to_vec(), resolved.clone()))));
+            receive(
+                Arc::new(socket),
+                routes,
+                client.clone(),
+                CancellationToken::new(),
+            )
+            .await;
+            let answers = answers.map(|name| Target::new(HostName::parse(name), 53));
+            assert_eq!(
+                *client.heard.lock().unwrap(),
+                [(b"answer".to_vec(), resolved.clone(), answers)],
+                "{names:?}"
+            );
+        }
     }
 
     /// A carrier whose sends never finish: a stream stuck behind a peer that
@@ -933,7 +1114,12 @@ mod tests {
             Box::pin(std::future::pending())
         }
 
-        fn send<'a>(&'a self, _: &'a [u8], _: &'a Target) -> BoxFuture<'a, io::Result<()>> {
+        fn send<'a>(
+            &'a self,
+            _: &'a [u8],
+            _: &'a Target,
+            _: Option<&'a Target>,
+        ) -> BoxFuture<'a, io::Result<()>> {
             Box::pin(std::future::ready(Ok(())))
         }
     }
@@ -1005,6 +1191,57 @@ mod tests {
             .await
             .expect("the flow ends at once");
         assert_eq!(outcome, SessionOutcome::Completed);
+    }
+
+    /// What a client is told while a flow drops three datagrams (`refused`:
+    /// the flow was refused, to this target, in this way).
+    async fn told_of_three_drops(
+        refused: Option<(&Target, RejectKind)>,
+    ) -> Vec<(Target, RejectKind)> {
+        let session = SessionInfo::udp(HostName::parse("10.0.0.1"), 9);
+        let client = Arc::new(Hears::default());
+        let association = Association {
+            client: client.clone(),
+            template: session.clone(),
+            process: ProcessSlot::unknown(),
+            carriers: Carriers::default(),
+            ended: CancellationToken::new(),
+            done: mpsc::unbounded_channel().0,
+        };
+        let handle = SessionHandle::new(1, session);
+        let (queue, mut waiting) = mpsc::channel(QUEUE);
+        for datagram in [b"a", b"b", b"c"] {
+            queue.try_send(queued(datagram)).expect("room");
+        }
+        // `drain` ends once the datagrams are dropped and the queue is closed
+        drop(queue);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            drain(&association, &handle, &mut waiting, None, refused),
+        )
+        .await
+        .expect("the drain ends with its queue");
+        client.refused.lock().unwrap().clone()
+    }
+
+    /// A flow that was refused tells its client of every datagram it drops,
+    /// in the way it was refused. One that merely failed says nothing: it is
+    /// tried again soon.
+    #[tokio::test]
+    async fn a_drained_flow_tells_its_client_only_when_it_was_refused() {
+        let to = Target::new(HostName::parse("10.0.0.1"), 9);
+        for kind in [
+            RejectKind::Reject,
+            RejectKind::Drop,
+            RejectKind::NoDrop,
+            RejectKind::TinyGif,
+        ] {
+            assert_eq!(
+                told_of_three_drops(Some((&to, kind))).await,
+                vec![(to.clone(), kind); 3]
+            );
+        }
+        assert_eq!(told_of_three_drops(None).await, []);
     }
 
     /// An outbound whose carrier fails to open after `delay`; counts the

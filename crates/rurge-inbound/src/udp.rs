@@ -134,7 +134,12 @@ impl UdpClient for Socks5UdpClient {
         })
     }
 
-    fn send<'a>(&'a self, payload: &'a [u8], from: &'a Target) -> BoxFuture<'a, io::Result<()>> {
+    fn send<'a>(
+        &'a self,
+        payload: &'a [u8],
+        from: &'a Target,
+        _answers: Option<&'a Target>,
+    ) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
             // nothing has come from the client yet: nowhere to send to
             let (Some(port), Some(mut datagram)) = (self.client_port.get(), header(from)) else {
@@ -232,7 +237,7 @@ mod tests {
         let mut buf = [0u8; 64];
         let (n, asked) = ours.recv(&mut buf).await.unwrap();
         assert_eq!((&buf[..n], asked), (&b"ask"[..], to.clone()));
-        ours.send(b"answer", &to).await.unwrap();
+        ours.send(b"answer", &to, None).await.unwrap();
         let (n, _) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             client.recv_from(&mut buf),
