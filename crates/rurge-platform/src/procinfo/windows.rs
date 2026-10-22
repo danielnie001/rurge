@@ -786,7 +786,7 @@ mod tests {
             let tcp = finder.owner(&Query {
                 protocol: Protocol::Tcp,
                 local: client.local_addr().unwrap(),
-                remote_port: Some(server.port()),
+                remote: Some(server),
                 since: Instant::now(),
             });
             assert_this_process(
@@ -796,7 +796,7 @@ mod tests {
             let udp = finder.owner(&Query {
                 protocol: Protocol::Udp,
                 local: datagrams.local_addr().unwrap(),
-                remote_port: None,
+                remote: None,
                 since: Instant::now(),
             });
             assert_this_process(udp, &format!("a UDP socket on {ip}"));
@@ -851,7 +851,7 @@ mod tests {
             let owner = Finder::new().owner(&Query {
                 protocol: Protocol::Tcp,
                 local: last,
-                remote_port: Some(server.port()),
+                remote: Some(server),
                 since: Instant::now(),
             });
             let lookup = started.elapsed();

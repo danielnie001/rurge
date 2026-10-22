@@ -1,7 +1,7 @@
 //! HTTP/1.1 proxy listener on hyper (M3 design §6.2): CONNECT tunnels and
 //! absolute-URI plain requests, Basic authentication, per-request dialing.
 
-use crate::listener::{HttpAuth, ListenerOpts, Running, bind, serve};
+use crate::listener::{HttpAuth, ListenerOpts, Running, bind, canonical_peer, serve};
 use crate::responses::{self, ResponseBody};
 use crate::session::{
     Counting, DialError, Dialed, Dialer, FailKind, SessionHandle, SessionOutcome,
@@ -33,7 +33,10 @@ pub struct HttpListener;
 struct Ctx {
     dialer: Arc<dyn Dialer>,
     opts: Arc<ListenerOpts>,
+    /// The address the listener is bound to, which may be an unspecified one.
     local: SocketAddr,
+    /// The address this connection was accepted on: rurge's end of it.
+    here: Option<SocketAddr>,
     peer: SocketAddr,
     tracker: TaskTracker,
 }
@@ -73,6 +76,7 @@ impl HttpListener {
                     dialer: dialer.clone(),
                     opts: opts.clone(),
                     local,
+                    here: stream.local_addr().ok().map(canonical_peer),
                     peer,
                     tracker: tracker.clone(),
                 });
@@ -157,6 +161,7 @@ fn session_for(ctx: &Ctx, host: HostName, port: u16) -> SessionInfo {
     let mut s = SessionInfo::tcp(host, port);
     s.src = ctx.peer;
     s.in_port = ctx.local.port();
+    s.local = ctx.here;
     s.listener = ListenerKind::Http;
     s.transport = Transport::Tcp;
     s
@@ -700,7 +705,8 @@ mod tests {
     /// What `SRC-IP`, `SRC-PORT` and `IN-PORT` rules read is taken off the
     /// connection: the client's own address with the port it connected from,
     /// and the port of the listener it came in on — for a tunnel and for a
-    /// plain request alike.
+    /// plain request alike. The session also says which address of rurge the
+    /// client connected to.
     #[tokio::test]
     async fn a_session_names_the_client_and_the_listener_port() {
         let (running, dialer, target) = listener_with_target(ListenerOpts::default()).await;
@@ -732,6 +738,7 @@ mod tests {
             let info = session.session();
             assert_eq!(info.src, client);
             assert_eq!(info.in_port, running.local_addr.port());
+            assert_eq!(info.local, Some(running.local_addr));
         }
     }
 

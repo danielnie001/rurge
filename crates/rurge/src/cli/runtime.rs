@@ -305,7 +305,7 @@ fn platform_query(query: &OwnerQuery) -> rurge_platform::procinfo::Query {
             Transport::Udp => rurge_platform::procinfo::Protocol::Udp,
         },
         local: query.local,
-        remote_port: query.remote_port,
+        remote: query.remote,
         since: query.since,
     }
 }
@@ -546,9 +546,9 @@ mod tests {
     }
 
     /// The engine's question reaches the platform as it was asked, for either
-    /// table and with or without the port the client connected to, and what
-    /// the platform finds is the engine's answer with the process's PID. A
-    /// process the platform could only name has no path.
+    /// table and with or without the other end of the connection the client
+    /// made, and what the platform finds is the engine's answer with the
+    /// process's PID. A process the platform could only name has no path.
     #[test]
     fn the_owner_lookup_asks_as_it_was_asked_and_answers_with_the_pid() {
         use rurge_platform::procinfo::{Owner, Protocol};
@@ -559,16 +559,16 @@ mod tests {
             (Transport::Tcp, Protocol::Tcp),
             (Transport::Udp, Protocol::Udp),
         ] {
-            for remote_port in [Some(7890), None] {
+            for remote in [Some("127.0.0.1:7890".parse::<SocketAddr>().unwrap()), None] {
                 let asked = platform_query(&OwnerQuery {
                     transport,
                     local,
-                    remote_port,
+                    remote,
                     since,
                 });
                 assert_eq!(asked.protocol, protocol, "{transport:?}");
                 assert_eq!(asked.local, local);
-                assert_eq!(asked.remote_port, remote_port);
+                assert_eq!(asked.remote, remote);
                 assert_eq!(asked.since, since);
             }
         }

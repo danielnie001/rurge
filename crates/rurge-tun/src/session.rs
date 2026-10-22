@@ -45,6 +45,7 @@ pub(crate) async fn serve(
     let session = SessionInfo {
         src: tuple.src,
         in_port: 0,
+        local: Some(tuple.dst),
         listener: ListenerKind::Tun,
         ..SessionInfo::tcp(HostName::Ip(tuple.dst.ip()), tuple.dst.port())
     };

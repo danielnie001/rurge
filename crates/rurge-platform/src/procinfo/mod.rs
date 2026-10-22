@@ -57,8 +57,12 @@ pub struct Query {
     pub protocol: Protocol,
     /// The client's own endpoint: the session's source address.
     pub local: SocketAddr,
-    /// TCP only: the port the client connected to (rurge's listening port).
-    pub remote_port: Option<u16>,
+    /// TCP only: the other end of the client's connection, which is rurge's
+    /// end of it (the listener's address; through the virtual adapter, what the
+    /// app connected to). The unspecified address (`0.0.0.0` or `::`) stands
+    /// for any address, and then only the port is compared. `None`: the local
+    /// endpoint alone says which connection is meant.
+    pub remote: Option<SocketAddr>,
     /// When the session began; decides which reads of the table can answer.
     pub since: Instant,
 }
@@ -95,14 +99,16 @@ pub(crate) enum RowOwner {
 }
 
 /// Why a table could not be read.
-#[cfg_attr(not(test), allow(dead_code))] // `Os`: every reader; `Layout`: the macOS one
+#[cfg_attr(not(test), allow(dead_code))] // `Os`: every reader; `Layout`: the macOS and Linux ones
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReadError {
     /// The system said no, in its own words: they go to the log, so they hold
     /// no path and no address.
     Os(String),
-    /// The table is not laid out the way this build reads it (macOS: records
-    /// of a size or an order that is not known).
+    /// The table is not laid out the way this build reads it: it has contents
+    /// and not one of them can be read (macOS: records of a size or an order
+    /// that is not known; Linux: lines of a `/proc/net` table of which not one
+    /// is in the columns this knows).
     Layout,
 }
 
@@ -399,9 +405,11 @@ impl Snapshot {
     /// query's `local`, as `endpoint` gives it. The first of the source's rows
     /// whose process is known wins.
     ///
-    /// TCP: a row of PID 0, the system's own, is no row: it is a connection
-    /// that is closing, and does not hide the ones behind it. A row whose
-    /// process cannot be told is a row that nobody is known to own.
+    /// TCP: the client's connection is the one from the query's `local` to its
+    /// `remote` — the port, and the address as well unless the query's is the
+    /// unspecified one. A row of PID 0, the system's own, is no row: it is a
+    /// connection that is closing, and does not hide the ones behind it. A row
+    /// whose process cannot be told is a row that nobody is known to own.
     ///
     /// UDP: the first sort of address that has a socket decides. If no process
     /// is known for any of those sockets, the socket of a more general address
@@ -417,8 +425,9 @@ impl Snapshot {
                     .iter()
                     .filter(|row| endpoint(row.local) == local)
                     .filter(|row| {
-                        let port = row.remote.map(|remote| remote.port());
-                        query.remote_port.is_none_or(|wanted| port == Some(wanted))
+                        query.remote.is_none_or(|wanted| {
+                            row.remote.is_some_and(|remote| is_far_end(wanted, remote))
+                        })
                     });
                 for row in connections {
                     match pid_of(row.owner) {
@@ -499,6 +508,14 @@ enum Seen {
 /// address do not count.
 fn endpoint(address: SocketAddr) -> (IpAddr, u16) {
     (address.ip().to_canonical(), address.port())
+}
+
+/// Whether the other end of a connection in a table, `row`, is the one a query
+/// asks for, `wanted`: the same port, and the same address unless the query's
+/// is the unspecified one, which stands for any.
+fn is_far_end(wanted: SocketAddr, row: SocketAddr) -> bool {
+    let ((wanted_ip, wanted_port), (ip, port)) = (endpoint(wanted), endpoint(row));
+    port == wanted_port && (wanted_ip.is_unspecified() || ip == wanted_ip)
 }
 
 /// The addresses a UDP socket can be bound to such that a datagram from `ip`
@@ -603,11 +620,17 @@ mod tests {
         tcp(CLIENT, PROXY, pid)
     }
 
-    fn tcp_query(local: &str, remote_port: u16, since: Instant) -> Query {
+    /// A remote end that names a port and no address: the unspecified one.
+    fn any_address(port: u16) -> SocketAddr {
+        SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port)
+    }
+
+    /// A query for the connection from `local` to a port, whatever address.
+    fn tcp_query(local: &str, port: u16, since: Instant) -> Query {
         Query {
             protocol: Protocol::Tcp,
             local: addr(local),
-            remote_port: Some(remote_port),
+            remote: Some(any_address(port)),
             since,
         }
     }
@@ -616,7 +639,7 @@ mod tests {
         Query {
             protocol: Protocol::Udp,
             local: addr(local),
-            remote_port: None,
+            remote: None,
             since,
         }
     }
@@ -1216,7 +1239,7 @@ mod tests {
         let query = |ip: &str| Query {
             protocol: Protocol::Tcp,
             local: with_scope(ip, 50000, 0x1234, 5),
-            remote_port: Some(PROXY_PORT),
+            remote: Some(any_address(PROXY_PORT)),
             since: Instant::now(),
         };
         assert_eq!(lookup(vec![row.clone()], query("fe80::1")), Some(100));
@@ -1238,9 +1261,9 @@ mod tests {
         );
         // a connection to another port is not this session
         assert_eq!(lookup(rows(), tcp_query(CLIENT, 7891, now())), None);
-        // a TCP query without a remote port goes by the local endpoint alone
+        // a TCP query without a remote end goes by the local endpoint alone
         let mut query = tcp_query(CLIENT, PROXY_PORT, now());
-        query.remote_port = None;
+        query.remote = None;
         assert_eq!(lookup(rows(), query), Some(100));
         // a row that does not say where it is connected to is not the one
         let lonely = Row {
@@ -1252,8 +1275,64 @@ mod tests {
             None
         );
         let mut query = tcp_query(CLIENT, PROXY_PORT, now());
-        query.remote_port = None;
+        query.remote = None;
         assert_eq!(lookup(vec![lonely], query), Some(100));
+    }
+
+    /// A local endpoint can be connected to the same port of two hosts at once
+    /// (Linux lets a local port be used towards different destinations), and
+    /// then the port does not say which connection is the session's: the
+    /// address of the other end does.
+    #[test]
+    fn a_tcp_query_compares_the_far_address_too() {
+        const OTHER: &str = "10.0.0.7:7890";
+        let rows = || vec![tcp(CLIENT, OTHER, 100), tcp(CLIENT, PROXY, 200)];
+        let asking = |remote: &str| Query {
+            remote: Some(addr(remote)),
+            ..tcp_query(CLIENT, PROXY_PORT, Instant::now())
+        };
+        // the address tells the two connections apart
+        assert_eq!(lookup(rows(), asking(PROXY)), Some(200));
+        assert_eq!(lookup(rows(), asking(OTHER)), Some(100));
+        // a connection to neither address, and to neither port
+        assert_eq!(lookup(rows(), asking("10.0.0.8:7890")), None);
+        assert_eq!(lookup(rows(), asking("127.0.0.1:7891")), None);
+        assert_eq!(lookup(rows(), asking("10.0.0.7:7891")), None);
+        // an unspecified address asks for the port alone: the first row wins
+        for unspecified in ["0.0.0.0:7890", "[::]:7890", "[::ffff:0.0.0.0]:7890"] {
+            assert_eq!(
+                lookup(rows(), asking(unspecified)),
+                Some(100),
+                "{unspecified}"
+            );
+        }
+        assert_eq!(lookup(rows(), asking("0.0.0.0:7891")), None);
+
+        // an IPv4 address in its IPv6 form is the IPv4 address, on either side
+        let mapped_rows = vec![
+            tcp(CLIENT, "[::ffff:10.0.0.7]:7890", 100),
+            tcp(CLIENT, PROXY, 200),
+        ];
+        assert_eq!(lookup(mapped_rows.clone(), asking(OTHER)), Some(100));
+        assert_eq!(lookup(mapped_rows, asking(PROXY)), Some(200));
+        assert_eq!(lookup(rows(), asking("[::ffff:10.0.0.7]:7890")), Some(100));
+        assert_eq!(lookup(rows(), asking("[::ffff:127.0.0.1]:7890")), Some(200));
+        // an IPv6 address is itself
+        let v6_rows = vec![
+            tcp("[::1]:50000", "[2001:db8::7]:7890", 100),
+            tcp("[::1]:50000", "[::1]:7890", 200),
+        ];
+        let asking_v6 = |remote: &str| Query {
+            local: addr("[::1]:50000"),
+            remote: Some(addr(remote)),
+            ..tcp_query(CLIENT, PROXY_PORT, Instant::now())
+        };
+        assert_eq!(lookup(v6_rows.clone(), asking_v6("[::1]:7890")), Some(200));
+        assert_eq!(
+            lookup(v6_rows.clone(), asking_v6("[2001:db8::7]:7890")),
+            Some(100)
+        );
+        assert_eq!(lookup(v6_rows, asking_v6("[2001:db8::8]:7890")), None);
     }
 
     #[test]

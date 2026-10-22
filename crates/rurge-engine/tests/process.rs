@@ -293,7 +293,7 @@ fn gave_up_waiting(record: &RequestRecord) -> bool {
 
 /// `PROCESS-NAME` rules are decided by the process the lookup finds, whether
 /// the client came in through the HTTP listener or the SOCKS5 one: each
-/// session is looked up by the client's own address and the port it
+/// session is looked up by the client's own address and the address it
 /// connected to.
 #[tokio::test]
 async fn a_process_rule_matches_through_both_listeners() {
@@ -323,14 +323,10 @@ async fn a_process_rule_matches_through_both_listeners() {
     }
     assert_eq!(fake.owner_calls(), 2);
     let queries = fake.queries();
-    for ((query, record), port) in queries
-        .iter()
-        .zip(&records)
-        .zip([h.http().port(), h.socks().port()])
-    {
+    for ((query, record), remote) in queries.iter().zip(&records).zip([h.http(), h.socks()]) {
         assert_eq!(query.transport, Transport::Tcp);
         assert_eq!(query.local, record.src, "the client's own endpoint");
-        assert_eq!(query.remote_port, Some(port), "the port it connected to");
+        assert_eq!(query.remote, Some(remote), "the address it connected to");
     }
 }
 
@@ -552,7 +548,7 @@ async fn a_udp_association_is_looked_up_once() {
     assert_eq!(queries.len(), 1);
     assert_eq!(queries[0].transport, Transport::Tcp);
     assert_eq!(queries[0].local, control);
-    assert_eq!(queries[0].remote_port, Some(h.socks().port()));
+    assert_eq!(queries[0].remote, Some(h.socks()));
 }
 
 /// The 200 ms run from the launch of the association's lookup: a flow that
@@ -717,7 +713,7 @@ async fn a_finished_lookup_is_logged_at_debug_and_nowhere_higher() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains(" src=127.0.0.1:"), "{}", found[0]);
     assert!(
-        found[0].contains(&format!(" listen_port={}", h.http().port())),
+        found[0].contains(&format!(" remote={}", h.http())),
         "{}",
         found[0]
     );

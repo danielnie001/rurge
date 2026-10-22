@@ -41,6 +41,7 @@ async fn a_connection_is_relayed(to: SocketAddr, app_address: &str) {
     assert_eq!(session.src, tcp.local());
     assert_eq!(session.src.ip(), app_address.parse::<IpAddr>().unwrap());
     assert_eq!(session.in_port, 0);
+    assert_eq!(session.local, Some(to), "the endpoint the app connected to");
     assert_eq!(session.listener, ListenerKind::Tun);
     assert_eq!(session.dst_host, HostName::Ip(to.ip()));
     assert_eq!(session.dst_port, to.port());

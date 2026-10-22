@@ -4,7 +4,7 @@
 use crate::auto::{EVALUATION_FAILED, resolve_ready};
 use crate::control::Mode;
 use crate::observe::{RequestLog, TrafficStats};
-use crate::owner::{LOOKUPS, NOT_IN_TIME, OwnerQuery, SLOW, SlotProcess, looked_up};
+use crate::owner::{LOOKUPS, NOT_IN_TIME, SLOW, SlotProcess, query_for};
 use crate::runtime::Runtime;
 use crate::shared::EngineShared;
 use crate::state::StateStore;
@@ -14,7 +14,7 @@ use rurge_config::HostName;
 use rurge_config::NetworkFacts;
 use rurge_config::general::{General, UdpFallback};
 use rurge_config::rule::PolicyRef;
-use rurge_config::session::{ListenerKind, SessionInfo, Transport};
+use rurge_config::session::{ListenerKind, SessionInfo};
 use rurge_config::spec::{PolicySpec, ProtoSpec};
 use rurge_inbound::{
     DialError, Dialed, Dialer, FailKind, HttpAuth, HttpListener, ListenerOpts, ProcessSlot,
@@ -423,34 +423,31 @@ impl Engine {
     }
 
     /// Starts finding the process behind `session`, if it is one that can be
-    /// found: it came in through a proxy port, from an address that may be
-    /// this machine's (phase 3 M2 design 4.1, 4.2). The answer lands in the
-    /// slot, whenever the lookup ends; the slot is settled with no process
-    /// at once for a session that is not looked up.
+    /// found: it came in through a proxy port or the virtual network card,
+    /// from an address that may be this machine's (phase 3 M2 design 4.1, 4.2;
+    /// `query_for` says what is asked). The answer lands in the slot, whenever
+    /// the lookup ends; the slot is settled with no process at once for a
+    /// session that is not looked up.
     pub(crate) fn look_up_owner(&self, session: &SessionInfo) -> ProcessSlot {
         let Some(owners) = &self.shared.owners else {
             return ProcessSlot::unknown();
         };
+        let launched = Instant::now();
+        let Some(query) = query_for(session, launched) else {
+            return ProcessSlot::unknown();
+        };
         // a source that is surely not this machine's has no process here
-        if !looked_up(session.listener) || owners.is_local(session.src.ip()) == Some(false) {
+        if owners.is_local(session.src.ip()) == Some(false) {
             return ProcessSlot::unknown();
         }
-        let launched = Instant::now();
         let slot = ProcessSlot::pending_at(launched);
-        // The connection to look up is the client's own, a TCP one: a UDP
-        // association is looked up by its control connection (design 4.1).
         // The task holds the lookup, the places and the slot — not the
         // engine, and not the session.
         tokio::spawn(crate::owner::find(
             owners.clone(),
             self.owner_permits.clone(),
             slot.clone(),
-            OwnerQuery {
-                transport: Transport::Tcp,
-                local: session.src,
-                remote_port: Some(session.in_port),
-                since: launched,
-            },
+            query,
         ));
         slot
     }

@@ -64,17 +64,48 @@ impl Fs for RealFs {
 /// (`little_endian`) and `7F000001` on a big-endian one. An IPv6 address is
 /// four of those, in order.
 ///
-/// A socket of inode 0 (one that only waits out the network) is skipped, and
-/// so is a line that cannot be read. A UDP socket has no remote end, whatever
-/// the kernel prints for one that is connected.
-fn parse_proc_net(text: &str, v6: bool, little_endian: bool, udp: bool) -> Vec<Row> {
-    text.lines()
-        .skip(1)
-        .filter_map(|line| socket_on(line, v6, little_endian, udp))
-        .collect()
+/// A socket of inode 0 (one that only waits out the network, `TIME_WAIT` for
+/// one) is read and is no row; a line that cannot be read is skipped. A table
+/// of which, blank lines left out, there are lines and none can be read is not
+/// laid out the way this reads it (`ReadError::Layout`), and it is not an empty
+/// table: what rests on it would find nobody, without a word. The header alone
+/// is an empty table. A UDP socket has no remote end, whatever the kernel
+/// prints for one that is connected.
+fn parse_proc_net(
+    text: &str,
+    v6: bool,
+    little_endian: bool,
+    udp: bool,
+) -> Result<Vec<Row>, ReadError> {
+    let mut rows = Vec::new();
+    let (mut lines, mut read) = (0, 0);
+    for line in text.lines().skip(1).filter(|line| !line.trim().is_empty()) {
+        lines += 1;
+        match socket_on(line, v6, little_endian, udp) {
+            Some(Line::Socket(row)) => {
+                read += 1;
+                rows.push(row);
+            }
+            Some(Line::Waiting) => read += 1,
+            None => {}
+        }
+    }
+    if lines > 0 && read == 0 {
+        return Err(ReadError::Layout);
+    }
+    Ok(rows)
 }
 
-fn socket_on(line: &str, v6: bool, little_endian: bool, udp: bool) -> Option<Row> {
+/// A line of a table that can be read.
+enum Line {
+    /// A socket that a process may have open.
+    Socket(Row),
+    /// A connection that only waits out the network.
+    Waiting,
+}
+
+/// The line of a table, or `None` when it cannot be read.
+fn socket_on(line: &str, v6: bool, little_endian: bool, udp: bool) -> Option<Line> {
     let mut columns = line.split_whitespace();
     // the first column is the number of the line
     let local = columns.nth(1)?;
@@ -82,16 +113,16 @@ fn socket_on(line: &str, v6: bool, little_endian: bool, udp: bool) -> Option<Row
     // the state, the queues, the timer, the retransmits, the user and the
     // timeout come before the inode
     let inode: u64 = columns.nth(6)?.parse().ok()?;
-    if inode == 0 {
-        return None;
-    }
     let local = parse_endpoint(local, v6, little_endian)?;
     let remote = parse_endpoint(remote, v6, little_endian)?;
-    Some(Row {
+    if inode == 0 {
+        return Some(Line::Waiting);
+    }
+    Some(Line::Socket(Row {
         local,
         remote: (!udp).then_some(remote),
         owner: RowOwner::Inode(inode),
-    })
+    }))
 }
 
 /// `address:port`, as a table prints it.
@@ -285,7 +316,8 @@ impl<F: Fs> Tables<F> {
 
 impl<F: Fs> Source for Tables<F> {
     /// The tables of the protocol: IPv4 first. A machine without IPv6 has no
-    /// tables for it, which is as if they were empty.
+    /// tables for it, which is as if they were empty. A table of either family
+    /// that cannot be read at all fails the read (`ReadError::Layout`).
     fn read(&self, protocol: Protocol) -> Result<Vec<Row>, ReadError> {
         let (name, udp) = match protocol {
             Protocol::Tcp => ("tcp", false),
@@ -296,9 +328,9 @@ impl<F: Fs> Source for Tables<F> {
             .fs
             .read(&format!("/proc/net/{name}"))
             .map_err(|error| unreadable("IPv4", &error))?;
-        let mut rows = parse_proc_net(&text, false, little_endian, udp);
+        let mut rows = parse_proc_net(&text, false, little_endian, udp)?;
         match self.fs.read(&format!("/proc/net/{name}6")) {
-            Ok(text) => rows.extend(parse_proc_net(&text, true, little_endian, udp)),
+            Ok(text) => rows.extend(parse_proc_net(&text, true, little_endian, udp)?),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(unreadable("IPv6", &error)),
         }
@@ -527,25 +559,40 @@ mod tests {
 
     #[test]
     fn a_tcp_table_is_read_in_either_byte_order() {
-        assert_eq!(parse_proc_net(TCP_LITTLE, false, true, false), tcp_rows());
-        assert_eq!(parse_proc_net(TCP_BIG, false, false, false), tcp_rows());
+        assert_eq!(
+            parse_proc_net(TCP_LITTLE, false, true, false),
+            Ok(tcp_rows())
+        );
+        assert_eq!(parse_proc_net(TCP_BIG, false, false, false), Ok(tcp_rows()));
     }
 
     #[test]
     fn a_tcp6_table_is_read_in_either_byte_order() {
-        assert_eq!(parse_proc_net(TCP6_LITTLE, true, true, false), tcp6_rows());
-        assert_eq!(parse_proc_net(TCP6_BIG, true, false, false), tcp6_rows());
+        assert_eq!(
+            parse_proc_net(TCP6_LITTLE, true, true, false),
+            Ok(tcp6_rows())
+        );
+        assert_eq!(
+            parse_proc_net(TCP6_BIG, true, false, false),
+            Ok(tcp6_rows())
+        );
     }
 
     #[test]
     fn the_sockets_of_a_udp_table_have_no_remote_end() {
         // not even the one that is connected to a server
-        assert_eq!(parse_proc_net(UDP_LITTLE, false, true, true), udp_rows());
-        assert_eq!(parse_proc_net(UDP_BIG, false, false, true), udp_rows());
-        assert_eq!(parse_proc_net(UDP6_LITTLE, true, true, true), udp6_rows());
-        assert_eq!(parse_proc_net(UDP6_BIG, true, false, true), udp6_rows());
+        assert_eq!(
+            parse_proc_net(UDP_LITTLE, false, true, true),
+            Ok(udp_rows())
+        );
+        assert_eq!(parse_proc_net(UDP_BIG, false, false, true), Ok(udp_rows()));
+        assert_eq!(
+            parse_proc_net(UDP6_LITTLE, true, true, true),
+            Ok(udp6_rows())
+        );
+        assert_eq!(parse_proc_net(UDP6_BIG, true, false, true), Ok(udp6_rows()));
         // the same lines as a table of connections do have one
-        let rows = parse_proc_net(UDP_LITTLE, false, true, false);
+        let rows = parse_proc_net(UDP_LITTLE, false, true, false).unwrap();
         assert_eq!(rows[3].remote, Some(addr("203.0.113.7:53")));
     }
 
@@ -556,13 +603,15 @@ mod tests {
                 "{HEADER}   0: {address}:C352 {address}:1ED2 01 00000000:00000000 00:00000000 00000000  1000        0 88888 1 0000000000000000 20 4 30 10 -1\n"
             )
         };
-        let little = parse_proc_net(&line("0000000000000000FFFF00000100007F"), true, true, false);
+        let little =
+            parse_proc_net(&line("0000000000000000FFFF00000100007F"), true, true, false).unwrap();
         let big = parse_proc_net(
             &line("00000000000000000000FFFF7F000001"),
             true,
             false,
             false,
-        );
+        )
+        .unwrap();
         let mapped = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
         for rows in [little, big] {
             assert_eq!(rows.len(), 1);
@@ -580,21 +629,24 @@ mod tests {
         // the kernel prints 0 for a connection that only waits out the network
         let waiting = GOOD.replace(" 11111 ", " 0 ");
         assert_ne!(waiting, GOOD);
-        assert!(parse_proc_net(&format!("{HEADER}{waiting}\n"), false, true, false).is_empty());
+        assert_eq!(
+            parse_proc_net(&format!("{HEADER}{waiting}\n"), false, true, false),
+            Ok(vec![])
+        );
         // a user of number 0 is a user like the others
         let root = GOOD.replace("1000        0 11111", "   0        0 11111");
         assert_ne!(root, GOOD);
-        let rows = parse_proc_net(&format!("{HEADER}{root}\n"), false, true, false);
+        let rows = parse_proc_net(&format!("{HEADER}{root}\n"), false, true, false).unwrap();
         assert_eq!(rows.len(), 1);
     }
 
     #[test]
     fn the_first_line_is_the_header_and_is_not_read() {
-        assert!(parse_proc_net("", false, true, false).is_empty());
-        assert!(parse_proc_net(HEADER, false, true, false).is_empty());
+        assert_eq!(parse_proc_net("", false, true, false), Ok(vec![]));
+        assert_eq!(parse_proc_net(HEADER, false, true, false), Ok(vec![]));
         // whatever it says: the sockets start on the second line
-        assert!(parse_proc_net(GOOD, false, true, false).is_empty());
-        let rows = parse_proc_net(&format!("{HEADER}{GOOD}"), false, true, false);
+        assert_eq!(parse_proc_net(GOOD, false, true, false), Ok(vec![]));
+        let rows = parse_proc_net(&format!("{HEADER}{GOOD}"), false, true, false).unwrap();
         assert_eq!(
             rows,
             [socket("127.0.0.1:7890", Some("127.0.0.1:50000"), 11111)]
@@ -636,18 +688,131 @@ mod tests {
             let text = format!("{HEADER}{line}\n{GOOD}\n");
             assert_eq!(
                 parse_proc_net(&text, false, true, false),
-                [socket("127.0.0.1:7890", Some("127.0.0.1:50000"), 11111)],
+                Ok(vec![socket(
+                    "127.0.0.1:7890",
+                    Some("127.0.0.1:50000"),
+                    11111
+                )]),
                 "{line:?}"
             );
         }
     }
 
+    /// A table with lines in it of which not one can be read is not laid out
+    /// the way this reads it, and that is not the same as a table with nothing
+    /// in it: every lookup that rests on it would find nobody, without a word.
+    #[test]
+    fn a_table_whose_lines_cannot_be_read_is_a_layout_error() {
+        let wrong = |from: &str, to: &str| {
+            let line = GOOD.replacen(from, to, 1);
+            assert_ne!(line, GOOD, "{from} is not in the line");
+            line
+        };
+        let unreadable = [
+            // cut short: no inode
+            GOOD[..GOOD.find(" 11111").unwrap()].to_string(),
+            wrong("0100007F:1ED2", "0100007F1ED2"),
+            wrong("0100007F:1ED2", "00000000000000000000000001000000:1ED2"),
+            wrong("0100007F:1ED2", "0100007F:1EDZ"),
+            wrong(" 11111 ", " abc "),
+            // another layout altogether: a line of `netstat`
+            "tcp        0      0 127.0.0.1:7890          127.0.0.1:50000         ESTABLISHED"
+                .to_string(),
+        ];
+        let table = |lines: &[String]| format!("{HEADER}{}\n", lines.join("\n"));
+        for line in &unreadable {
+            assert_eq!(
+                parse_proc_net(&table(std::slice::from_ref(line)), false, true, false),
+                Err(ReadError::Layout),
+                "{line:?}"
+            );
+        }
+        // all of them in one table, and with the blank lines a table may end in
+        assert_eq!(
+            parse_proc_net(&table(&unreadable), false, true, false),
+            Err(ReadError::Layout)
+        );
+        let blank_ended = format!("{}   \n\n", table(&unreadable[..1]));
+        assert_eq!(
+            parse_proc_net(&blank_ended, false, true, false),
+            Err(ReadError::Layout)
+        );
+    }
+
+    /// A connection that only waits out the network (`TIME_WAIT`) is printed
+    /// with the inode 0. It is a line of this layout like any other: read, and
+    /// no row, since no process has the socket open.
+    #[test]
+    fn time_wait_lines_are_read() {
+        let v4 = TCP_LITTLE.lines().last().unwrap();
+        let v6 = TCP6_LITTLE.lines().last().unwrap();
+        // the state is 06, and the inode 0
+        for line in [v4, v6] {
+            let columns: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!((columns[3], columns[9]), ("06", "0"), "{line}");
+        }
+        let table = |header: &str, lines: &[&str]| format!("{header}\n{}\n", lines.join("\n"));
+        let header4 = HEADER.trim_end();
+        let header6 = TCP6_LITTLE.lines().next().unwrap();
+        // a table of nothing else is read, and is empty
+        assert_eq!(
+            parse_proc_net(&table(header4, &[v4, v4]), false, true, false),
+            Ok(vec![])
+        );
+        assert_eq!(
+            parse_proc_net(&table(header6, &[v6]), true, true, false),
+            Ok(vec![])
+        );
+        // next to a line that cannot be read, it is the line that was read
+        assert_eq!(
+            parse_proc_net(&table(header4, &["garbage", v4]), false, true, false),
+            Ok(vec![])
+        );
+        // a line of the other address family is not a line of this layout
+        assert_eq!(
+            parse_proc_net(&table(header4, &[v6]), false, true, false),
+            Err(ReadError::Layout)
+        );
+        // and the sockets next to it are rows as ever
+        assert_eq!(
+            parse_proc_net(&table(header4, &[v4, GOOD]), false, true, false),
+            Ok(vec![socket(
+                "127.0.0.1:7890",
+                Some("127.0.0.1:50000"),
+                11111
+            )])
+        );
+    }
+
+    /// A machine with no connections prints the line that says what the
+    /// columns are, and nothing else: that is an empty table, not a table that
+    /// cannot be read.
+    #[test]
+    fn a_table_with_only_its_header_is_empty() {
+        let tables = [
+            (HEADER.trim_end(), false, false),
+            (TCP6_LITTLE.lines().next().unwrap(), true, false),
+            (UDP_LITTLE.lines().next().unwrap(), false, true),
+        ];
+        for (header, v6, udp) in tables {
+            // the line break after it, and the blank lines after that
+            for end in ["", "\n", "\n\n", "\n  \n"] {
+                assert_eq!(
+                    parse_proc_net(&format!("{header}{end}"), v6, true, udp),
+                    Ok(vec![]),
+                    "{header}{end:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn an_address_of_another_family_or_width_is_not_read() {
-        assert!(parse_proc_net(TCP_LITTLE, true, true, false).is_empty());
-        assert!(parse_proc_net(TCP6_LITTLE, false, true, false).is_empty());
-        assert!(parse_proc_net(UDP_LITTLE, true, true, true).is_empty());
-        assert!(parse_proc_net(UDP6_LITTLE, false, true, true).is_empty());
+        let layout = Err(ReadError::Layout);
+        assert_eq!(parse_proc_net(TCP_LITTLE, true, true, false), layout);
+        assert_eq!(parse_proc_net(TCP6_LITTLE, false, true, false), layout);
+        assert_eq!(parse_proc_net(UDP_LITTLE, true, true, true), layout);
+        assert_eq!(parse_proc_net(UDP6_LITTLE, false, true, true), layout);
 
         // an IPv6 address of one digit too few or too many
         let mut lines = TCP6_LITTLE.lines();
@@ -657,8 +822,9 @@ mod tests {
             let wrong = socket.replacen("01000000:1ED2", width, 1);
             assert_ne!(wrong, socket);
             let text = format!("{header}\n{wrong}\n");
-            assert!(
-                parse_proc_net(&text, true, true, false).is_empty(),
+            assert_eq!(
+                parse_proc_net(&text, true, true, false),
+                Err(ReadError::Layout),
                 "{wrong}"
             );
         }
@@ -885,6 +1051,24 @@ mod tests {
         let tables = tables_on(&fs);
         assert_eq!(tables.read(Protocol::Tcp).unwrap(), tcp_rows());
         assert_eq!(tables.read(Protocol::Udp).unwrap(), udp_rows());
+    }
+
+    #[test]
+    fn a_table_of_either_family_that_cannot_be_read_at_all_fails_the_read() {
+        let fs = MemFs::new();
+        let (tcp, tcp6) = (native(TCP_LITTLE, TCP_BIG), native(TCP6_LITTLE, TCP6_BIG));
+        let garbled = format!("{HEADER}this is no socket\n");
+        let tables = tables_on(&fs);
+        // whichever of the two it is, however good the other is
+        for (v4, v6) in [(garbled.as_str(), tcp6), (tcp, garbled.as_str())] {
+            fs.file("/proc/net/tcp", v4);
+            fs.file("/proc/net/tcp6", v6);
+            assert_eq!(tables.read(Protocol::Tcp), Err(ReadError::Layout));
+        }
+        // a machine with no connections prints the headers and nothing else
+        fs.file("/proc/net/tcp", HEADER);
+        fs.file("/proc/net/tcp6", TCP6_LITTLE.lines().next().unwrap());
+        assert_eq!(tables.read(Protocol::Tcp), Ok(vec![]));
     }
 
     #[test]
@@ -1330,7 +1514,7 @@ mod tests {
         let tcp = Query {
             protocol: Protocol::Tcp,
             local: addr("127.0.0.1:50000"),
-            remote_port: Some(7890),
+            remote: Some(addr("127.0.0.1:7890")),
             since: Instant::now(),
         };
         let curl = Owner {
@@ -1343,7 +1527,7 @@ mod tests {
         let udp = Query {
             protocol: Protocol::Udp,
             local: addr("127.0.0.1:58528"),
-            remote_port: None,
+            remote: None,
             since: Instant::now(),
         };
         assert_eq!(finder.owner(&udp), Some(curl));
@@ -1362,7 +1546,7 @@ mod tests {
         let query = Query {
             protocol: Protocol::Tcp,
             local: addr("127.0.0.1:50002"),
-            remote_port: Some(7890),
+            remote: Some(addr("127.0.0.1:7890")),
             since: Instant::now(),
         };
         let owner = finder.owner(&query).expect("the client is found");
@@ -1375,7 +1559,7 @@ mod tests {
         let query = Query {
             protocol: Protocol::Tcp,
             local: addr("[::1]:50001"),
-            remote_port: Some(7890),
+            remote: Some(addr("[::1]:7890")),
             since: Instant::now(),
         };
         let owner = finder.owner(&query).expect("the client is found");
@@ -1447,7 +1631,7 @@ mod tests {
             let tcp = finder.owner(&Query {
                 protocol: Protocol::Tcp,
                 local: client.local_addr().unwrap(),
-                remote_port: Some(server.port()),
+                remote: Some(server),
                 since: Instant::now(),
             });
             assert_this_process(
@@ -1457,7 +1641,7 @@ mod tests {
             let udp = finder.owner(&Query {
                 protocol: Protocol::Udp,
                 local: datagrams.local_addr().unwrap(),
-                remote_port: None,
+                remote: None,
                 since: Instant::now(),
             });
             assert_this_process(udp, &format!("a UDP socket on {ip}"));

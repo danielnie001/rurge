@@ -46,6 +46,13 @@ pub struct DeviceInfo {
 pub struct SessionInfo {
     pub src: SocketAddr,
     pub in_port: u16,
+    /// rurge's end of the client's connection: for the HTTP and SOCKS5
+    /// listeners the accepted connection's own local address (canonical; not
+    /// the address bound, which may be unspecified), for a SOCKS5 UDP
+    /// association its control connection's; for a TCP connection through the
+    /// virtual adapter the endpoint the app connected to. `None` for the
+    /// adapter's UDP sessions and rurge's own.
+    pub local: Option<SocketAddr>,
     pub listener: ListenerKind,
     /// Lowercase domain without trailing dot, or an IP literal.
     pub dst_host: HostName,
@@ -76,6 +83,7 @@ impl SessionInfo {
         SessionInfo {
             src: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             in_port: 0,
+            local: None,
             listener: ListenerKind::Http,
             dst_host,
             dst_port,
@@ -129,5 +137,12 @@ mod tests {
         assert_eq!(s.listener, ListenerKind::Http);
         assert_eq!(s.dst_port, 80);
         assert!(s.sni.is_none() && s.url.is_none() && s.process.is_none());
+        // rurge's end of the connection is told by whoever accepted it
+        assert!(s.local.is_none());
+        assert!(
+            SessionInfo::udp(HostName::parse("example.com"), 53)
+                .local
+                .is_none()
+        );
     }
 }

@@ -2,11 +2,11 @@
 //! platform provides to look one up, the lookup that runs in the background
 //! for a session, and the way the rules wait for its answer.
 
-use rurge_config::session::{ListenerKind, ProcessInfo, Transport};
+use rurge_config::session::{ListenerKind, ProcessInfo, SessionInfo, Transport};
 use rurge_inbound::ProcessSlot;
 use rurge_net::BoxFuture;
 use rurge_rules::LazyProcess;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -29,8 +29,12 @@ pub struct OwnerQuery {
     pub transport: Transport,
     /// The client's own endpoint: the session's source address.
     pub local: SocketAddr,
-    /// TCP only: the port the client connected to (rurge's listening port).
-    pub remote_port: Option<u16>,
+    /// TCP only: the other end of the client's connection, which is rurge's own
+    /// end of it: what a listener accepted it on, or what the app connected to
+    /// through the virtual adapter. The unspecified address in it stands for
+    /// any address: only the port is compared. `None`: the client's own
+    /// endpoint alone says which connection is meant.
+    pub remote: Option<SocketAddr>,
     /// When the session began; decides which reads of the system's tables
     /// can answer.
     pub since: Instant,
@@ -47,15 +51,33 @@ pub trait OwnerLookup: Send + Sync {
     fn owner(&self, query: &OwnerQuery) -> Option<ProcessInfo>;
 }
 
-/// Whether the sessions of a listener are looked up: the ones that come in
-/// through a proxy port and may be from this machine.
-pub(crate) fn looked_up(listener: ListenerKind) -> bool {
-    match listener {
-        ListenerKind::Http | ListenerKind::Socks5 => true,
-        // rurge's own sessions have no process but rurge; the virtual
-        // network card's come with phase 3 M3
-        ListenerKind::Tun | ListenerKind::Forward | ListenerKind::Internal => false,
-    }
+/// The question for the process of `session`, or `None` when nobody is asked:
+/// HTTP and SOCKS5 (a SOCKS5 UDP template too: its control connection) and the
+/// adapter's TCP → TCP, local = `src`, remote = `local` (a listener's session
+/// without it: `0.0.0.0:<in_port>`); the adapter's UDP → UDP, local = `src`, no
+/// remote; rurge's own and forwarded sessions → `None`.
+pub(crate) fn query_for(session: &SessionInfo, since: Instant) -> Option<OwnerQuery> {
+    let (transport, remote) = match (session.listener, session.transport) {
+        // The client's own connection to a proxy port, a TCP one: a UDP
+        // association is looked up by its control connection (design 4.1).
+        (ListenerKind::Http | ListenerKind::Socks5, _) => {
+            let unspecified = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), session.in_port);
+            (Transport::Tcp, Some(session.local.unwrap_or(unspecified)))
+        }
+        // through the virtual network card an app's connection is to what it
+        // connected to, and its UDP socket has no other end
+        (ListenerKind::Tun, Transport::Tcp) => (Transport::Tcp, session.local),
+        (ListenerKind::Tun, Transport::Udp) => (Transport::Udp, None),
+        // rurge's own sessions have no process but rurge, and what a gateway
+        // forwards is not from this machine
+        (ListenerKind::Forward | ListenerKind::Internal, _) => return None,
+    };
+    Some(OwnerQuery {
+        transport,
+        local: session.src,
+        remote,
+        since,
+    })
 }
 
 /// The lookup of one session or association: waits for a place among the
@@ -69,7 +91,7 @@ pub(crate) async fn find(
     slot: ProcessSlot,
     query: OwnerQuery,
 ) {
-    let (src, listen_port, since) = (query.local, query.remote_port, query.since);
+    let (src, remote, since) = (query.local, query.remote, query.since);
     let found = match places.acquire_owned().await {
         Ok(place) => {
             // the place is the blocking call's until it has returned (or
@@ -88,11 +110,11 @@ pub(crate) async fn find(
     slot.settle(found.clone());
     // the lookup is timed from its launch: the wait for a place counts
     let elapsed_ms = since.elapsed().as_millis() as u64;
-    let listen_port = listen_port.unwrap_or_default();
+    let remote = remote.map(tracing::field::display);
     match found {
         Some(process) => tracing::debug!(
             %src,
-            listen_port,
+            remote,
             elapsed_ms,
             pid = process.pid,
             name = process.name.as_str(),
@@ -101,7 +123,7 @@ pub(crate) async fn find(
         ),
         None => tracing::debug!(
             %src,
-            listen_port,
+            remote,
             elapsed_ms,
             "process lookup found no process"
         ),
@@ -154,6 +176,7 @@ impl LazyProcess for SlotProcess<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rurge_config::HostName;
 
     fn app() -> ProcessInfo {
         ProcessInfo {
@@ -163,18 +186,80 @@ mod tests {
         }
     }
 
-    /// The sessions of the two proxy ports; not rurge's own, not the virtual
-    /// network card's, not what a gateway forwards.
+    /// What is asked of the platform for a session, and whether anything is:
+    /// the sessions of the two proxy ports and of the virtual network card are
+    /// looked up, each by the connection or the socket the client has, and not
+    /// rurge's own, nor what a gateway forwards.
     #[test]
-    fn only_the_two_proxy_listeners_are_looked_up() {
-        for (kind, looked) in [
-            (ListenerKind::Http, true),
-            (ListenerKind::Socks5, true),
-            (ListenerKind::Tun, false),
-            (ListenerKind::Forward, false),
-            (ListenerKind::Internal, false),
-        ] {
-            assert_eq!(looked_up(kind), looked, "{kind:?}");
+    fn the_query_follows_the_listener_and_the_transport() {
+        let since = Instant::now();
+        let client: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let rurge: SocketAddr = "127.0.0.1:6152".parse().unwrap();
+        let session = |listener, transport, local| SessionInfo {
+            src: client,
+            in_port: 6152,
+            local,
+            listener,
+            transport,
+            ..SessionInfo::tcp(HostName::parse("example.com"), 443)
+        };
+        let asked = |transport, remote| {
+            Some(OwnerQuery {
+                transport,
+                local: client,
+                remote,
+                since,
+            })
+        };
+
+        for listener in [ListenerKind::Http, ListenerKind::Socks5] {
+            let tcp = session(listener, Transport::Tcp, Some(rurge));
+            // the client's TCP connection to the address it connected to
+            assert_eq!(
+                query_for(&tcp, since),
+                asked(Transport::Tcp, Some(rurge)),
+                "{listener:?}"
+            );
+            // an association (its template is a UDP session) is looked up by
+            // its control connection, which is a TCP one
+            let udp = session(listener, Transport::Udp, Some(rurge));
+            assert_eq!(
+                query_for(&udp, since),
+                asked(Transport::Tcp, Some(rurge)),
+                "{listener:?}"
+            );
+            // a session that does not say where it was accepted: any address
+            // of the listener's port
+            let unsaid = session(listener, Transport::Tcp, None);
+            assert_eq!(
+                query_for(&unsaid, since),
+                asked(Transport::Tcp, Some("0.0.0.0:6152".parse().unwrap())),
+                "{listener:?}"
+            );
+        }
+
+        // the virtual network card: a TCP connection to what the app
+        // connected to, a UDP socket by its own endpoint alone
+        let app_connected_to: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let tcp = session(ListenerKind::Tun, Transport::Tcp, Some(app_connected_to));
+        assert_eq!(
+            query_for(&tcp, since),
+            asked(Transport::Tcp, Some(app_connected_to))
+        );
+        let udp = session(ListenerKind::Tun, Transport::Udp, None);
+        assert_eq!(query_for(&udp, since), asked(Transport::Udp, None));
+        // a connection that does not say what the app connected to is found
+        // by the app's own endpoint
+        let unsaid = session(ListenerKind::Tun, Transport::Tcp, None);
+        assert_eq!(query_for(&unsaid, since), asked(Transport::Tcp, None));
+
+        // rurge's own sessions have no process but rurge, and what a gateway
+        // forwards is not this machine's: nobody is asked
+        for listener in [ListenerKind::Forward, ListenerKind::Internal] {
+            for transport in [Transport::Tcp, Transport::Udp] {
+                let session = session(listener, transport, Some(rurge));
+                assert_eq!(query_for(&session, since), None, "{listener:?}");
+            }
         }
     }
 

@@ -84,9 +84,10 @@ const PATH_BYTES: usize = nix::libc::PROC_PIDPATHINFO_MAXSIZE as usize;
 ///
 /// The `XSO_INPCB` item has the foreign port at offset 16, the local port at 18,
 /// `inp_vflag` at 44, and the foreign and the local address, 16 bytes each, at
-/// 48 and 64. When `INP_IPV4` is set the addresses are IPv4 ones, the last four
-/// bytes of the 16 (at 60 and 76); when it is not and `INP_IPV6` is, they are
-/// IPv6 ones; a record with neither is not used. The `XSO_SOCKET` item has
+/// 48 and 64. When `INP_IPV4` is set the record has a row of IPv4 addresses, the
+/// last four bytes of the 16 (at 60 and 76); when `INP_IPV6` is set it has a row
+/// of IPv6 ones, all 16; with both set (a dual-stack socket) it has the two
+/// rows, and with neither it is not used. The `XSO_SOCKET` item has
 /// `so_last_pid` at offset 68: the process that last used the socket. An item
 /// too short to hold what is read makes its record not used.
 ///
@@ -113,7 +114,7 @@ fn walk(buf: &[u8], udp: bool) -> Result<Vec<Row>, ReadError> {
                 };
                 complete = true;
                 let pid = u32::from_le_bytes([socket[68], socket[69], socket[70], socket[71]]);
-                rows.extend(row_of(pcb, pid, udp));
+                rows.extend(row_of(pcb, pid, udp).into_iter().flatten());
             }
             // any other item closes the record: its socket item is not coming
             _ => open = None,
@@ -127,23 +128,23 @@ fn walk(buf: &[u8], udp: bool) -> Result<Vec<Row>, ReadError> {
     Ok(rows)
 }
 
-/// The row of a record: where the socket is, from its `xinpcb_n`, and its
-/// process. `None`: the item does not say whether the socket is an IPv4 or an
-/// IPv6 one, so there are no addresses to read.
-fn row_of(pcb: &[u8; INPCB_READ], pid: u32, udp: bool) -> Option<Row> {
+/// The rows of a record: where the socket is, from its `xinpcb_n`, and its
+/// process. A socket that is an IPv4 one (`INP_IPV4`) has a row of its IPv4
+/// view, and one that is an IPv6 one (`INP_IPV6`) has a row of its IPv6 view;
+/// a socket of both families (a dual-stack socket) has both, the IPv4 row
+/// first, so that a client of either family finds it. Neither flag: the item
+/// does not say what the socket is, so there are no addresses to read.
+fn row_of(pcb: &[u8; INPCB_READ], pid: u32, udp: bool) -> [Option<Row>; 2] {
     let flags = pcb[44];
-    let (local, foreign) = if flags & INP_IPV4 != 0 {
-        (IpAddr::V4(ipv4(pcb, 76)), IpAddr::V4(ipv4(pcb, 60)))
-    } else if flags & INP_IPV6 != 0 {
-        (IpAddr::V6(ipv6(pcb, 64)), IpAddr::V6(ipv6(pcb, 48)))
-    } else {
-        return None;
-    };
-    Some(Row {
+    let row = |local: IpAddr, foreign: IpAddr| Row {
         local: SocketAddr::new(local, port(pcb, 18)),
         remote: (!udp).then_some(SocketAddr::new(foreign, port(pcb, 16))),
         owner: RowOwner::Pid(pid),
-    })
+    };
+    [
+        (flags & INP_IPV4 != 0).then(|| row(IpAddr::V4(ipv4(pcb, 76)), IpAddr::V4(ipv4(pcb, 60)))),
+        (flags & INP_IPV6 != 0).then(|| row(IpAddr::V6(ipv6(pcb, 64)), IpAddr::V6(ipv6(pcb, 48)))),
+    ]
 }
 
 // The readers below are given the whole of what is read of an `xinpcb_n`, and
@@ -612,54 +613,78 @@ mod tests {
     fn inp_vflag_says_which_addresses_a_record_has() {
         let good = record(0x1, "127.0.0.1:3", "10.0.0.9:80", 30);
         let good_row = row("127.0.0.1:3", Some("10.0.0.9:80"), 30);
+        let one = |local: &str, foreign: &str| vec![row(local, Some(foreign), 7)];
         // the flags, the two ends as they are written, and what is read
         let cases = [
             (
                 0x1,
                 "127.0.0.1:1000",
                 "127.0.0.2:80",
-                Some(row("127.0.0.1:1000", Some("127.0.0.2:80"), 7)),
+                one("127.0.0.1:1000", "127.0.0.2:80"),
             ),
-            (
-                0x2,
-                "[::1]:1000",
-                "[::2]:80",
-                Some(row("[::1]:1000", Some("[::2]:80"), 7)),
-            ),
-            // both: the IPv4 addresses, the last four bytes of the 16
+            (0x2, "[::1]:1000", "[::2]:80", one("[::1]:1000", "[::2]:80")),
+            // both: the IPv4 view (the addresses are the last four bytes of the
+            // 16), and the IPv6 one (all 16)
             (
                 0x3,
                 "[2001:db8::a00:1]:1000",
                 "[2001:db8::a00:2]:80",
-                Some(row("10.0.0.1:1000", Some("10.0.0.2:80"), 7)),
+                vec![
+                    row("10.0.0.1:1000", Some("10.0.0.2:80"), 7),
+                    row("[2001:db8::a00:1]:1000", Some("[2001:db8::a00:2]:80"), 7),
+                ],
             ),
             // other flags do not matter
             (
                 0x81,
                 "127.0.0.1:1000",
                 "127.0.0.2:80",
-                Some(row("127.0.0.1:1000", Some("127.0.0.2:80"), 7)),
+                one("127.0.0.1:1000", "127.0.0.2:80"),
             ),
             (
                 0xFE,
                 "[::1]:1000",
                 "[::2]:80",
-                Some(row("[::1]:1000", Some("[::2]:80"), 7)),
+                one("[::1]:1000", "[::2]:80"),
+            ),
+            (
+                0xFF,
+                "[2001:db8::a00:1]:1000",
+                "[2001:db8::a00:2]:80",
+                vec![
+                    row("10.0.0.1:1000", Some("10.0.0.2:80"), 7),
+                    row("[2001:db8::a00:1]:1000", Some("[2001:db8::a00:2]:80"), 7),
+                ],
             ),
             // neither: no addresses to read, no row
-            (0x0, "127.0.0.1:1000", "127.0.0.2:80", None),
-            (0x4, "127.0.0.1:1000", "127.0.0.2:80", None),
-            (0xFC, "[::1]:1000", "[::2]:80", None),
+            (0x0, "127.0.0.1:1000", "127.0.0.2:80", vec![]),
+            (0x4, "127.0.0.1:1000", "127.0.0.2:80", vec![]),
+            (0xFC, "[::1]:1000", "[::2]:80", vec![]),
         ];
         for (flags, local, foreign, expected) in cases {
             // next to a record that is read, so that what there is to say of
             // a table that has none does not come into it
             let bytes = table(&[record(flags, local, foreign, 7), good.clone()]);
-            let mut rows: Vec<Row> = expected.into_iter().collect();
+            let mut rows = expected;
             rows.push(good_row.clone());
             rows.sort_by_key(|row| row.local.is_ipv6());
             assert_eq!(walk(&bytes, false), Ok(rows), "inp_vflag {flags:#x}");
         }
+    }
+
+    /// A UDP socket of both families that is bound to no address in particular
+    /// answers for a client of either family: it has a row for each, so that a
+    /// datagram from an IPv6 address finds it as one from an IPv4 address does.
+    #[test]
+    fn a_dual_stack_udp_socket_has_a_row_for_each_family() {
+        let bytes = table(&[record(0x3, "[::]:5353", "[::]:0", 55)]);
+        assert_eq!(
+            walk(&bytes, true),
+            Ok(vec![
+                row("0.0.0.0:5353", None, 55),
+                row("[::]:5353", None, 55)
+            ])
+        );
     }
 
     #[test]
@@ -1054,7 +1079,7 @@ mod tests {
             let tcp = finder.owner(&Query {
                 protocol: Protocol::Tcp,
                 local: client.local_addr().unwrap(),
-                remote_port: Some(server.port()),
+                remote: Some(server),
                 since: Instant::now(),
             });
             assert_this_process(
@@ -1064,7 +1089,7 @@ mod tests {
             let udp = finder.owner(&Query {
                 protocol: Protocol::Udp,
                 local: datagrams.local_addr().unwrap(),
-                remote_port: None,
+                remote: None,
                 since: Instant::now(),
             });
             assert_this_process(udp, &format!("a UDP socket on {ip}"));

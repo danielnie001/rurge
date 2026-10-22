@@ -135,10 +135,11 @@ fn warn_due(map: &mut HashMap<IpAddr, Instant>, source: IpAddr, now: Instant) ->
     true
 }
 
-/// The client the way the rules and the request log name it. An IPv4 client
-/// of a listener bound to an IPv6 address (dual-stack on Linux and macOS)
-/// shows up as `::ffff:a.b.c.d`, which no IPv4 `SRC-IP` network contains.
-fn canonical_peer(peer: SocketAddr) -> SocketAddr {
+/// The client the way the rules and the request log name it, and the address
+/// it connected to, which they name the same way. An IPv4 client of a listener
+/// bound to an IPv6 address (dual-stack on Linux and macOS) shows up as
+/// `::ffff:a.b.c.d`, which no IPv4 `SRC-IP` network contains.
+pub(crate) fn canonical_peer(peer: SocketAddr) -> SocketAddr {
     match peer.ip().to_canonical() {
         IpAddr::V4(v4) => SocketAddr::new(IpAddr::V4(v4), peer.port()),
         // as it is, scope and all

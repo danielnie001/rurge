@@ -1,7 +1,7 @@
 //! SOCKS5 (RFC 1928) listener: no authentication, CONNECT (M3 design §6.3)
 //! and UDP ASSOCIATE (phase 2 M5 design 5.1).
 
-use crate::listener::{ListenerOpts, Running, bind, serve};
+use crate::listener::{ListenerOpts, Running, bind, canonical_peer, serve};
 use crate::session::{DialError, Dialer, FailKind, SessionOutcome, UdpAdmission};
 use crate::udp::Socks5UdpClient;
 use rurge_config::HostName;
@@ -203,6 +203,8 @@ async fn handle(
     let mut session = SessionInfo::tcp(host, port);
     session.src = peer;
     session.in_port = local.port();
+    // the address this connection was accepted on, not the one bound
+    session.local = stream.local_addr().ok().map(canonical_peer);
     session.listener = ListenerKind::Socks5;
     session.transport = Transport::Tcp;
 
@@ -276,6 +278,8 @@ async fn associate(
     let mut session = SessionInfo::udp(HostName::Ip(here.ip()), 0);
     session.src = peer;
     session.in_port = here.port();
+    // the control connection's end on rurge's side
+    session.local = Some(canonical_peer(here));
     session.listener = ListenerKind::Socks5;
     let closed = CancellationToken::new();
     let serving = dialer.associate(client, session, closed.clone());
@@ -401,7 +405,8 @@ mod tests {
 
     /// What `SRC-IP`, `SRC-PORT` and `IN-PORT` rules read is taken off the
     /// connection: the client's own address with the port it connected from,
-    /// and the port of the listener it came in on.
+    /// and the port of the listener it came in on. The session also says which
+    /// address of rurge the client connected to.
     #[tokio::test]
     async fn a_session_names_the_client_and_the_listener_port() {
         let (running, dialer) = listener(Duration::from_secs(30)).await;
@@ -414,6 +419,7 @@ mod tests {
         let info = sessions[0].session();
         assert_eq!(info.src, client);
         assert_eq!(info.in_port, running.local_addr.port());
+        assert_eq!(info.local, Some(running.local_addr));
     }
 
     #[tokio::test]
@@ -590,6 +596,9 @@ mod tests {
         assert_eq!(session.transport, Transport::Udp);
         assert_eq!(session.listener, ListenerKind::Socks5);
         assert_eq!(session.src.ip(), client.local_addr().unwrap().ip());
+        // the control connection is the client's own TCP connection, and its
+        // end on rurge's side is where the client connected to
+        assert_eq!(session.local, Some(running.local_addr));
     }
 
     /// Only the client's own address may use the association; fragments
