@@ -558,6 +558,10 @@ async fn a_handshake_that_never_completes_gives_its_place_back() {
     let (lab, _) = lab_and_extras(
         TunOptions {
             dns_tcp_max: 1,
+            // what has to come before the 300 ms are up (the SYN-ACK, two
+            // counts, the refused connection) took 1.1 to 1.9 ms alone on
+            // the development machine (21 runs, a debug build): a margin of
+            // over 150 times
             half_open_timeout: Duration::from_millis(300),
             ..TunOptions::default()
         },

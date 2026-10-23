@@ -168,7 +168,7 @@ fn responder_rig_with(extras: Extras) -> ResponderRig {
 }
 
 impl ResponderRig {
-    /// A lab whose responder has no pool of fake addresses.
+    /// A rig whose responder has no pool of fake addresses.
     fn without_a_pool() -> ResponderRig {
         responder_rig_with(Extras {
             pool: None,
@@ -178,7 +178,7 @@ impl ResponderRig {
 
     /// From now on the generation in use has `always-real-ip` as `entries`
     /// says (a list as the profile writes it) and `allow-dns-svcb` as `svcb`
-    /// says; the lab's `FakeDns` stays what it is.
+    /// says; the rig's `FakeDns` stays what it is.
     fn configure(&self, entries: &str, svcb: bool) {
         self.extras.hooks.set(TunSettings {
             dns: self.extras.dns.clone(),
@@ -206,8 +206,8 @@ impl ResponderRig {
         self.extras.pool.as_ref()?.address_of(name, v6)
     }
 
-    /// No name has an address: the pool, which the lab started with none, names
-    /// nothing. Every test that asks this starts its lab afresh and gives no
+    /// No name has an address: the pool, which the rig started with none, names
+    /// nothing. Every test that asks this starts its rig afresh and gives no
     /// address itself first.
     fn assert_no_address_given(&self) {
         if let Some(pool) = &self.extras.pool {
