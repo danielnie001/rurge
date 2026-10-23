@@ -3,7 +3,7 @@
 | 项       | 内容 |
 | -------- | ---- |
 | 日期     | 2026-10-18 |
-| 状态     | 草案。已决事项 M3-D1 ～ D26 是在项目所有者"自己决定、继续做"的常设授权下定的（代项目所有者作的裁定），所有者可以改。M3a 已做完（2026-10-19，代码在 `crates/rurge-tun`；同一天做了整分支终审，结论是改了再合并：没有 Critical，两条 Important 在 M3a 里都够不到、是 M3b 与 M4 要靠的东西，已按第 18 节第 15 条和 M3a 计划延后事项第 8、12 行改了说明与去向，修正波只动文档、说明、注释和几处不改行为的守卫，留下的次要项各有去向，在 M3a 计划延后事项第 16、17 行）。M3b 的十个任务做完了（2026-10-23，计划 `docs/superpowers/plans/2026-10-22-phase3-m3b-udp-icmp-pool-engine-plan.md`，代码在 `crates/rurge-tun`、`crates/rurge-dns/src/fakeip` 与 `crates/rurge-engine/src/tun.rs`；整分支终审还没有做）。实施期与本文不一致处以第 18 节第 11 ～ 22 条为准（11 ～ 15 是 M3a 的，16 ～ 22 是 M3b 的），正文里被它们订正的地方各有一个指到那里的括号 |
+| 状态     | 草案。已决事项 M3-D1 ～ D26 是在项目所有者"自己决定、继续做"的常设授权下定的（代项目所有者作的裁定），所有者可以改。M3a 已做完（2026-10-19，代码在 `crates/rurge-tun`；同一天做了整分支终审，结论是改了再合并：没有 Critical，两条 Important 在 M3a 里都够不到、是 M3b 与 M4 要靠的东西，已按第 18 节第 15 条和 M3a 计划延后事项第 8、12 行改了说明与去向，修正波只动文档、说明、注释和几处不改行为的守卫，留下的次要项各有去向，在 M3a 计划延后事项第 16、17 行）。M3b 的十个任务做完了（2026-10-23，计划 `docs/superpowers/plans/2026-10-22-phase3-m3b-udp-icmp-pool-engine-plan.md`，代码在 `crates/rurge-tun`、`crates/rurge-dns/src/fakeip` 与 `crates/rurge-engine/src/tun.rs`；整分支终审在同一天做了（只读代码与文档，什么也没运行），结论是改了再合并：没有 Critical，没有 Important；最终修正波改了它的五条次要项里的四条和各任务评审留下的小项里的十条，登记了一条（M3b 计划延后第 29 行：TUN 里排队的 UDP 没有字节上限），其余各有去向，在 M3b 计划记录第 20 行与延后第 10 ～ 14、26、28、29 行）。实施期与本文不一致处以第 18 节第 11 ～ 22 条为准（11 ～ 15 是 M3a 的，16 ～ 22 是 M3b 的），正文里被它们订正的地方各有一个指到那里的括号 |
 | 上位设计 | [阶段 3 总设计](2026-10-16-phase3-enhanced-mode-design.md) 第 1.4、2.3、3.1、3.2、4、8、12、13 节；不一致处以本文为准，订正列在第 18 节 |
 | 需求     | FR-IN-06（协议栈部分：TCP / UDP 经用户态协议栈进入流水线）、FR-IN-08（UDP 会话）、FR-DNS-08（fake-IP 应答器）；FR-RULE-01 的 `pre-matching` 在 DNS 与 SYN 层的一半 |
 | 清单     | 3.2 节 `pre-matching`（L266）；4.1 节 REJECT 一族（L325、L333 ～ L336）；6.4 节应答器与 fake-IP（L543 ～ L551）；9.1 节 ICMP 与 fake 段（L709、L710）；`[General]` 的 `allow-dns-svcb`、`hijack-dns`、`always-real-ip`、`icmp-forwarding`（L149 ～ L159） |
@@ -47,7 +47,7 @@ M3 做出虚拟网卡的内核：一个平台无关的新 crate `rurge-tun`，�
 
 ### 3.2 依赖方向
 
-`rurge (bin) → rurge-engine → { rurge-tun → { rurge-inbound, rurge-dns, rurge-config, rurge-net }, rurge-inbound, rurge-policy, rurge-dns, … }`。**引擎依赖 `rurge-tun`**，照它今天自己绑 HTTP / SOCKS5 监听器（`Engine::bind_listeners` 调 `HttpListener::bind`）；`rurge-tun` 从不依赖引擎，引擎经 trait 给它规则、设置与拨号。M3 里可执行文件不变（M3-D2）。
+`rurge (bin) → rurge-engine → { rurge-tun → { rurge-inbound, rurge-dns, rurge-config, rurge-net }, rurge-inbound, rurge-policy, rurge-dns, … }`。**引擎依赖 `rurge-tun`**，照它今天自己绑 HTTP / SOCKS5 监听器（`Engine::bind_listeners` 调 `HttpListener::bind`）；`rurge-tun` 从不依赖引擎，引擎经 trait 给它规则、设置与拨号。M3 里可执行文件不变（M3-D2；只有一处例外，第 18 节第 20 条）。
 
 ### 3.3 两边之间的接口
 
@@ -497,18 +497,18 @@ B1、B2（第 6 节）；fake 应答的延迟（M3c；NFR-01：小于 0.2 毫秒
 
 19. 第 7.2 节与第 10.2 节的目标与租约：设计写 UDP 会话为它的每个目标在会话的一生里各拿一个租约 → 每个会话一张目标表（端点与目标互查，两个方向 O(1)），至多 `max_udp_targets`（1024，与引擎每个关联的流数相同）；一个目标两个方向都过了 `udp_idle` 没有包就拿掉、放掉租约（扫描每 `udp_idle / 4` 一次）。原因：引擎的流同样在空闲 60 秒后回收，一个长寿的会话若一直攒着目标，会在 1024 处卡住、租约也一直占着。会话本身也是两个方向都 `udp_idle` 没有包才结束，只有下行的会话（服务器推送、应用只收不发）不结束；这个应用在表里的会话正在结束时，新来的包建一个新会话替换它；结束的会话只在表里那一项仍是自己（`Arc::ptr_eq`）时拿掉。（P11、P20、P21）
 
-20. 第 9.2 节 `looked_up`：设计写"`looked_up` 对 `Tun` 改为真" → `looked_up` 去掉了，`query_for(session, since) -> Option<OwnerQuery>`（`crates/rurge-engine/src/owner.rs`）取代它：查不查与怎样查是同一个决定。HTTP 与 SOCKS5 的会话（SOCKS5 的 UDP 关联的模板也是，查它的控制连接）与虚拟网卡的 TCP 会话发 TCP 的查询（`local` 是 `src`，`remote` 是会话的 `local`；监听器的会话没有 `local` 时退回 `0.0.0.0:<in_port>`），虚拟网卡的 UDP 会话发 UDP 的查询、没有 `remote`，`Forward` 与 `Internal` 不查；`Engine::look_up_owner` 里依次是：没有 `owners`、`query_for` 为 `None`、`is_local` 答"不是本机"，各得到"不知道"的槽。DEBUG 查找行的字段 `listen_port` 换成 `remote`（虚拟网卡的会话的远端不是监听端口；`None` 时省略）。没有 `local` 的虚拟网卡 TCP 会话（够不到）以 `remote: None` 去问，只凭应用自己的端点找。（P23；M3b 记录第 2 行）
+20. 第 9.2 节 `looked_up`：设计写"`looked_up` 对 `Tun` 改为真" → `looked_up` 去掉了，`query_for(session, since) -> Option<OwnerQuery>`（`crates/rurge-engine/src/owner.rs`）取代它：查不查与怎样查是同一个决定。HTTP 与 SOCKS5 的会话（SOCKS5 的 UDP 关联的模板也是，查它的控制连接）与虚拟网卡的 TCP 会话发 TCP 的查询（`local` 是 `src`，`remote` 是会话的 `local`；监听器的会话没有 `local` 时退回 `0.0.0.0:<in_port>`），虚拟网卡的 UDP 会话发 UDP 的查询、没有 `remote`，`Forward` 与 `Internal` 不查；`Engine::look_up_owner` 里依次是：没有 `owners`、`query_for` 为 `None`、`is_local` 答"不是本机"，各得到"不知道"的槽。DEBUG 查找行的字段 `listen_port` 换成 `remote`（虚拟网卡的会话的远端不是监听端口；`None` 时省略）。没有 `local` 的虚拟网卡 TCP 会话（够不到）以 `remote: None` 去问，只凭应用自己的端点找。可执行文件为此改了一处：`crates/rurge/src/cli/runtime.rs` 的 `platform_query` 把 `remote` 交给平台层（`af34beb`）。（P23；M3b 记录第 2 行）
 
 21. 第 5.5 节"拿掉套接字：smoltcp 报 CLOSED 或 TIME-WAIT 时"：套接字到 TIME-WAIT（rurge 先关了自己的一侧）或 `Closed` 时，流还在而 `recv_queue` 里有没读的字节，则片把它们拷进连接与流共用的记录（`ConnShared` 的 `Leftover`，`crates/rurge-tun/src/tcp/mod.rs`），接收缓冲的预算份额留到读完或流被丢掉再还，套接字、四元组的表项和 `max_sockets` 的计数立刻放掉；读先从记录里答，答完是结局。结局取 `recv_slice(&mut [])` 的回答：收到过 FIN 的是 `Closed`，读完字节之后是 `Ok(0)`；没有的是 `Reset`，读完字节之后仍是复位。所以在应用的 FIN 之前超时的连接照旧以复位结束，不会变成干净的 EOF；FIN 之后才超时的，读完字节是 `Ok(0)`。两种情形一并这样办：TIME-WAIT 过了宽限（不等 smoltcp 自己 10 秒之后的 `reset()` 清空缓冲）、`Closed` 而没有远端端点（应用先关、rurge 后关，或 smoltcp 自己的超时）。原因：应用的 TCP 看到这些字节都被确认了，被 `reset()` 清掉是它看不见的丢数据，转发循环看到的只是一个复位。**不只修结局**——只把结局改成 `Closed` 会把看得见的丢失变成悄悄的截断。代价：留着字节的连接占着至多 65,535 字节的预算份额，直到读完或流被丢掉。（P26；M3b 记录第 6 行）
 
-22. 第 3.3 节"引擎停下时停 TUN（取消它的会话，或限时地等 `join`）"与第 15 条的了结：做到了"取消它的会话"。`TunHandle::stop` 取消每个已拨通的会话的令牌并等它的转发结束，停止与转发赛跑时停止居先（`session::serve`，`biased`）；`REJECT-DROP` 的拿着与连接的结束赛跑（`TunStream::closed`），读掉丢弃改用 512 字节的数组，不再用 `tokio::io::copy` 的 8 KiB 堆缓冲；`Engine::start_tun` 在引擎停止接受时 `stop()` 这个 TUN；第 15 条要的端到端用例是 `stopping_the_tun_ends_a_relay_stuck_on_its_upstream`（`crates/rurge-engine/tests/tun.rs`）。**没有做、也不会在 `rurge-tun` 里做的**：取消正在进行的拨号——拨号进行中会话的令牌还在引擎手里（`Engine::dial` 里才建 `SessionHandle`），TUN 够不到，丢掉拨号的 future 会留下开着的请求记录。改由引擎的拨号自己的时限界住：`Engine::dial` 每一条会等待的路都读过，没有一条没有时限（M3b 记录第 15 行），但其中一个由 Profile 定（`evaluate-before-use` 的等待，`test-timeout` 可以写任意多秒），所以停止之后 `join` 最长等多久不是一个常数；可执行文件停 TUN 时仍给等 `join` 的那一步一个自己的时限（M3b 延后第 8 行，M4）。（P29、P30）
+22. 第 3.3 节"引擎停下时停 TUN（取消它的会话，或限时地等 `join`）"与第 15 条的了结：做到了"取消它的会话"。`TunHandle::stop` 只发出停止、立刻返回，不等任何东西；每个会话的任务在拨通之后等着停止，一到就取消自己的会话令牌，再等它的转发结束，`join` 等所有的任务；停止与转发赛跑时停止居先（`session::serve`，`biased`）。每个转发中的会话等的是停止令牌的子令牌（`Life::session_stop`，各有自己的 `Notify`）：tokio 1.53.1 的 `Notified::poll` 在等待时每次轮询都拿一次 `Notify` 的等待者锁，都等同一个令牌的话，每个转发中的会话每次被唤醒都要拿同一把锁（M3b 延后第 26 行）。握手在停止之后才结束的会话不拨号（`established()` 之后先看停止；那条连接正被片的最后一轮复位）；`REJECT-DROP` 的拿着与连接的结束赛跑（`TunStream::closed`），读掉丢弃改用 512 字节的数组，不再用 `tokio::io::copy` 的 8 KiB 堆缓冲；`Engine::start_tun` 在引擎停止接受时 `stop()` 这个 TUN；第 15 条要的端到端用例是 `stopping_the_tun_ends_a_relay_stuck_on_its_upstream`（`crates/rurge-engine/tests/tun.rs`）。**没有做、也不会在 `rurge-tun` 里做的**：取消正在进行的拨号——拨号进行中会话的令牌还在引擎手里（`Engine::dial` 里才建 `SessionHandle`），TUN 够不到，丢掉拨号的 future 会留下开着的请求记录。改由引擎的拨号自己的时限界住：`Engine::dial` 每一条会等待的路都读过，没有一条没有时限（M3b 记录第 15 行），但其中一个由 Profile 定（`evaluate-before-use` 的等待，`test-timeout` 可以写任意多秒），所以停止之后 `join` 最长等多久不是一个常数；可执行文件停 TUN 时仍给等 `join` 的那一步一个自己的时限（M3b 延后第 8 行，M4）。（P29、P30）
 
 ## 19. 已决事项
 
 | 编号 | 事项 | 决定 |
 | ---- | ---- | ---- |
 | M3-D1 | 计划的拆分 | M3a 设备、包的去向与 TCP（第一个任务是基准门槛）→ M3b UDP、ICMP、池与引擎接入 → M3c 应答器与预匹配；池随 M3b，好让端到端用例经 fake 地址连到钉在回环上的名字 |
-| M3-D2 | crate 与依赖 | 新 crate `rurge-tun`，平台无关、`forbid(unsafe_code)`；引擎依赖它（`Engine::start_tun`），它不依赖引擎与 `rurge-platform`；可执行文件在 M3 不变；没有新的外部包 |
+| M3-D2 | crate 与依赖 | 新 crate `rurge-tun`，平台无关、`forbid(unsafe_code)`；引擎依赖它（`Engine::start_tun`），它不依赖引擎与 `rurge-platform`；可执行文件在 M3 不变（只有一处例外，第 18 节第 20 条）；没有新的外部包 |
 | M3-D3 | TCP 协议栈与设备 | smoltcp 0.12 按四元组分片（候选 16 / 64 / 256，缺省 64，基准定；M3a 定为 256，第 18 节第 11 条），每片一把锁、一个任务，收进来的包逐个推进、发送反复推进到没有出口、每次唤醒做有界的活；只把 TCP 交给 smoltcp；时钟以 TUN 启动时为零点；设备 trait 批量收发，包是 `Vec<u8>`；MTU 候选 1500 / 9000，都过门槛时取 1500 |
 | M3-D4 | SYN | 按目的端点建监听套接字，建好之后紧接着推进它的 SYN（包逐个推进，中间没有别的包）；推进之后不在 SYN-RECEIVED 就拿掉；次序是停止 → 上限 → 去处 → 预匹配 → 建；rurge 自己发的 RST 经 3 秒 100 个的限频；协议栈的地址 `198.18.0.253` / `fd00:6152::fd` 与经它们的缺省路由 |
 | M3-D5 | smoltcp 0.12 的隐患 | 进协议栈之前过滤坏包、分片、`martian`、扩展首部（H1、H4 ～ H6）；SYN 的 SACK-permitted 换成 NOP（H3）；窗口边缘的守卫（H2；丢的条件见第 18 节第 13 条）；推进包在 `catch_unwind` 里、panic 了重建这一片（最后一道）；TCP 只算发出的校验和，IPv4 首部、UDP、ICMP 的校验和由 rurge 验 |
