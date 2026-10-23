@@ -12,6 +12,7 @@ use super::support::{
     WITHIN, addr, data_segment_v4, eventually, hello, is_syn, lone_shard, lone_shard_with_pool,
     rig, segment_v4, sock, syn_v4, tcp_packet, tcp_repr, within,
 };
+use crate::session::Purpose;
 use crate::tcp::shard::Turn;
 use crate::tcp::{Outcome, PANIC_MARKER, Shard};
 use crate::testing::{Script, Upstream};
@@ -102,7 +103,10 @@ fn a_rebuilt_shard_keeps_its_pool() {
         let [opened] = &turn.opened[..] else {
             panic!("the SYN opens a connection");
         };
-        opened.name.as_ref().map(|(name, _)| name.clone())
+        match &opened.purpose {
+            Purpose::Session(Some((name, _))) => Some(name.clone()),
+            _ => None,
+        }
     };
     let before = lone
         .shard

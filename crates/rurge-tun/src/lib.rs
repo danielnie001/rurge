@@ -6,11 +6,12 @@
 //!
 //! Its tasks: one reads the device and sends each packet on its way
 //! (`dispatch`), one shard of the TCP stack for each part of the
-//! connections (`tcp`), one session for each TCP connection (`session`) and
-//! for each source endpoint that sends UDP (`udp`), one for each echo request
-//! that goes out (`icmp`), one takes the DNS queries the apps send over UDP off
-//! their queue and one for each of them answers it (`dns`), and one writes to
-//! the device what all of them send (`writer`).
+//! connections (`tcp`), one session for each TCP connection (`session`; for a
+//! connection to port 53 of the responder it is the responder answering the
+//! queries on it, `dns`) and for each source endpoint that sends UDP (`udp`),
+//! one for each echo request that goes out (`icmp`), one takes the DNS queries
+//! the apps send over UDP off their queue and one for each of them answers it
+//! (`dns`), and one writes to the device what all of them send (`writer`).
 
 mod context;
 pub mod device;
@@ -36,7 +37,7 @@ use device::Device;
 use dns::Responder;
 use rurge_dns::fakeip::FakeIpPool;
 use rurge_inbound::Dialer;
-use session::Holds;
+use session::Serving;
 use stats::Stats;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
@@ -116,6 +117,7 @@ impl Tun {
         let tasks = TaskTracker::new();
         // one responder for the TUN, whatever the transport of the query
         let responder = Arc::new(Responder::new(hooks.clone(), pool.clone()));
+        let serving = Arc::new(Serving::new(dialer.clone(), responder.clone(), &options));
         let (to_responder, queries) = mpsc::channel(options.dns_queue);
         let udp_bytes = Arc::new(QueuedBytes::new(options.udp_bytes));
         let writer_queue = options.writer_queue;
@@ -137,6 +139,7 @@ impl Tun {
                 budget.clone(),
                 admission.clone(),
                 pool.clone(),
+                hooks.clone(),
                 &options,
             ));
             let (to_shard, packets) = mpsc::channel(options.shard_queue);
@@ -146,8 +149,7 @@ impl Tun {
                 shard,
                 packets,
                 to_writer.clone(),
-                dialer.clone(),
-                Holds::from(&options),
+                serving.clone(),
                 life.clone(),
                 tasks.clone(),
             ));
@@ -254,6 +256,8 @@ pub struct TunOptions {
     pub max_udp_targets: usize,
     /// How many DNS queries can wait for the responder to take them. A query that finds the queue full is dropped and counted (`queue_full`). More than zero.
     pub dns_queue: usize,
+    /// How long a TCP connection to the responder's port 53 can go without a query from its app before the TUN closes it (a FIN), and then the longest the TUN waits for the app to close its side too, reading and throwing away what it sends; past that the connection is reset. The wait for an answer that is being forwarded is no part of it. The default is that of `udp_dns_idle`. At least 1 ms and at most 24 hours.
+    pub dns_tcp_idle: Duration,
     /// How long an echo request waits for its reply before it is given up, counted from when its task begins: resolving the name of a fake address is part of the wait. At least 1 ms and at most 24 hours.
     pub echo_timeout: Duration,
     /// The most echo requests waiting for a reply at once, in the whole TUN. One more is dropped and counted (`busy`). More than zero.
@@ -283,6 +287,7 @@ impl Default for TunOptions {
             udp_bytes: 64 << 20,
             max_udp_targets: 1_024,
             dns_queue: 1_024,
+            dns_tcp_idle: Duration::from_secs(10),
             echo_timeout: Duration::from_secs(5),
             max_echoes: 1_024,
         }
@@ -290,12 +295,12 @@ impl Default for TunOptions {
 }
 
 impl TunOptions {
-    /// The longest `keep_alive`, `timeout`, `udp_idle` and `echo_timeout`
-    /// there can be (`udp_dns_idle` is no longer than `udp_idle`, so a day at
-    /// most too). The stack adds the first two to a clock that counts in
-    /// microseconds in an `i64`, and the others are added to times as well: a
-    /// day is far below where that overflows, and far above any setting that
-    /// is meant.
+    /// The longest `keep_alive`, `timeout`, `udp_idle`, `dns_tcp_idle` and
+    /// `echo_timeout` there can be (`udp_dns_idle` is no longer than
+    /// `udp_idle`, so a day at most too). The stack adds the first two to a
+    /// clock that counts in microseconds in an `i64`, and the others are added
+    /// to times as well: a day is far below where that overflows, and far above
+    /// any setting that is meant.
     const LONGEST: Duration = Duration::from_secs(24 * 60 * 60);
 
     /// Whether the options can run a TUN: the first that cannot, in the order
@@ -348,6 +353,9 @@ impl TunOptions {
         }
         if self.dns_queue == 0 {
             return Err("dns_queue must be more than zero".into());
+        }
+        if self.dns_tcp_idle < Duration::from_millis(1) || self.dns_tcp_idle > Self::LONGEST {
+            return Err("dns_tcp_idle must be at least 1 ms and at most 24 hours".into());
         }
         if self.echo_timeout < Duration::from_millis(1) || self.echo_timeout > Self::LONGEST {
             return Err("echo_timeout must be at least 1 ms and at most 24 hours".into());

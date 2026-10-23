@@ -9,6 +9,7 @@
 //! is forwarded to the resolver of the generation in use. A reply made here or
 //! forwarded is fitted to the transport it goes back on.
 
+pub(crate) mod tcp;
 pub(crate) mod udp;
 
 use crate::hooks::{Hooks, TunSettings};

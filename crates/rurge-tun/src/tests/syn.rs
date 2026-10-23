@@ -431,7 +431,7 @@ fn syns_turned_away_are_said_like_any_other_drop() {
         vec![syn_v4(app, fake), syn_v4(app, fake)],
     );
     // the 101st and the 102nd reset in a window are held back
-    let responder = addr("198.18.0.2:53");
+    let responder = addr("198.18.0.2:54");
     take(
         TunOptions::default(),
         (0..102).map(|_| syn_v4(app, responder)).collect(),
@@ -874,7 +874,7 @@ async fn syns_to_rurge_addresses_are_reset() {
     let mut replies = rig.app.divert(40000..=40009);
     let own = [
         "198.18.0.1:80",
-        "198.18.0.2:53",
+        "198.18.0.2:54",
         "198.18.0.244:443",
         "198.18.0.253:80",
         "[fd00:6152::fd]:80",

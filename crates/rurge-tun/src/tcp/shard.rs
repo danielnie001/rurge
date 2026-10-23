@@ -17,12 +17,14 @@ use super::{
     Admission, Budget, ConnId, ConnShared, EGRESS_PASSES, INGRESS_PER_WAKE, Outcome, SWEEP,
     TIME_WAIT_GRACE, TunStream, Tuple,
 };
+use crate::dns::DNS_PORT;
 use crate::packet::{self, Reason, Segment};
-use crate::session::{self, Holds};
+use crate::session::{self, Purpose, Serving};
 use crate::space::{self, Place, STACK_V4, STACK_V6};
-use crate::{Life, TunOptions};
-use rurge_dns::fakeip::{FakeIpPool, Lease};
-use rurge_inbound::Dialer;
+use crate::{Hooks, Life, TunOptions};
+use rurge_config::PreMatchLayer;
+use rurge_dns::fakeip::FakeIpPool;
+use rurge_proto::RejectKind;
 use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint};
@@ -50,7 +52,8 @@ pub(crate) struct Shard {
 impl Shard {
     /// `seed` is what smoltcp draws the initial sequence numbers of the
     /// shard's connections from. `pool` is where the addresses that stand for
-    /// names are looked up, if the TUN has one.
+    /// names are looked up, if the TUN has one, and `hooks` what the
+    /// pre-matching rules are asked through.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         index: usize,
@@ -60,6 +63,7 @@ impl Shard {
         budget: Arc<Budget>,
         admission: Arc<Admission>,
         pool: Option<Arc<FakeIpPool>>,
+        hooks: Arc<dyn Hooks>,
         options: &TunOptions,
     ) -> Shard {
         Shard {
@@ -71,6 +75,7 @@ impl Shard {
                 budget,
                 admission,
                 pool,
+                hooks,
                 Timers::from(options),
             )),
             kick: Notify::new(),
@@ -190,6 +195,10 @@ pub(crate) struct ShardState {
     /// up; the pool's lock is a leaf, so taking it under this shard's lock
     /// never meets another lock held the other way round. A rebuild keeps it.
     pool: Option<Arc<FakeIpPool>>,
+    /// What a new SYN is asked of the pre-matching rules through, under this
+    /// shard's lock: the hook is synchronous and never waits, and does not
+    /// reach into the TUN. A rebuild keeps it.
+    hooks: Arc<dyn Hooks>,
     timers: Timers,
     /// What the SYN being taken holds, if one is.
     held: Held,
@@ -242,13 +251,14 @@ pub(crate) struct Opened {
     pub(crate) id: ConnId,
     pub(crate) shared: Arc<ConnShared>,
     pub(crate) tuple: Tuple,
-    /// For a connection to a fake address: the name behind it, and the lease
-    /// that keeps the address from being given to another name. The session
-    /// holds it until the session ends.
-    pub(crate) name: Option<(String, Lease)>,
+    /// What the connection is for. For a session of the engine's to a fake
+    /// address it holds the name behind the address and the lease that keeps
+    /// the address from being given to another name, until the session ends.
+    pub(crate) purpose: Purpose,
 }
 
 impl ShardState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         mtu: usize,
         epoch: Instant,
@@ -256,6 +266,7 @@ impl ShardState {
         budget: Arc<Budget>,
         admission: Arc<Admission>,
         pool: Option<Arc<FakeIpPool>>,
+        hooks: Arc<dyn Hooks>,
         timers: Timers,
     ) -> ShardState {
         let mut device = ShardDevice {
@@ -300,6 +311,7 @@ impl ShardState {
             budget,
             admission,
             pool,
+            hooks,
             timers,
             held: Held::default(),
         }
@@ -332,6 +344,7 @@ impl ShardState {
             self.budget.clone(),
             self.admission.clone(),
             self.pool.clone(),
+            self.hooks.clone(),
             self.timers,
         );
     }
@@ -520,10 +533,14 @@ impl ShardState {
     /// TUN is stopping; the caps on sockets and on half-open connections are
     /// met; the destination is an address of rurge's own, or one that stands
     /// for a name the pool does not have (or the TUN has no pool). In each
-    /// case the SYN is turned away with a reset. Any other SYN is the first of
-    /// a connection (`open`): that to an address that stands for a name too,
-    /// with the name and a lease on the address, which the connection keeps
-    /// until its session ends (design 10.2).
+    /// case the SYN is turned away with a reset. The responder's port 53 is
+    /// where the connection is the responder's (`Purpose::Dns`), and no rule is
+    /// asked about it. Any other SYN has the name behind its address, if it is
+    /// one that stands for a name, with a lease on the address; then the
+    /// pre-matching rules are asked about the connection it would make
+    /// (`refused_by_rules`); and if none refuses it, it is the first of a
+    /// connection (`open`), which keeps the lease until its session ends
+    /// (design 10.2).
     ///
     /// The places the connection would take in the caps are claimed in one
     /// step, not looked at here and taken later, so that the caps hold when
@@ -544,31 +561,74 @@ impl ShardState {
             return self.turn_away(&packet, &segment, now, Some(Reason::Busy));
         }
         self.held.places = true;
-        match space::place(segment.tuple.dst.ip()) {
-            Place::Real => self.open(packet, segment, now, at, opened, None),
-            // the responder's port 53 is a place for a connection of its own
-            // (M3c); every other port of it is not
+        let dst = segment.tuple.dst;
+        let name = match space::place(dst.ip()) {
+            Place::Real => None,
+            // the responder's port 53 is a place for a connection of its own,
+            // answered by the responder, whatever the rules say of the address
+            Place::Responder if dst.port() == DNS_PORT => {
+                return self.open(packet, segment, now, at, opened, Purpose::Dns);
+            }
+            // every other port of it is not, and no more is the rest of
+            // rurge's own
             Place::Responder | Place::Own => {
                 self.release_held();
-                self.turn_away(&packet, &segment, now, None);
+                return self.turn_away(&packet, &segment, now, None);
             }
             // an address that stands for a name: the pool gives the name back,
             // with a lease on the address; one it has no name for, or no pool,
             // names nothing
             Place::Fake => {
-                let name = self
-                    .pool
-                    .as_ref()
-                    .and_then(|pool| pool.lease(segment.tuple.dst.ip()));
-                match name {
-                    Some(name) => self.open(packet, segment, now, at, opened, Some(name)),
-                    None => {
-                        self.release_held();
-                        self.turn_away(&packet, &segment, now, Some(Reason::UnknownFake));
-                    }
+                let name = self.pool.as_ref().and_then(|pool| pool.lease(dst.ip()));
+                if name.is_none() {
+                    self.release_held();
+                    return self.turn_away(&packet, &segment, now, Some(Reason::UnknownFake));
                 }
+                name
+            }
+        };
+        let host = name.as_ref().map(|(name, _)| name.as_str());
+        if self.refused_by_rules(&packet, &segment, now, host) {
+            // the lease on the address goes with `name`, here
+            return;
+        }
+        self.open(packet, segment, now, at, opened, Purpose::Session(name));
+    }
+
+    /// Asks the pre-matching rules (`Hooks::pre_match`, at the SYN layer)
+    /// about the connection the SYN would make, `host` being the name behind
+    /// its address if the address stands for one, and answers whether one
+    /// refuses it. If one does, what the SYN holds is given back, and the SYN
+    /// is dropped when the kind is REJECT-DROP: nothing is sent and nothing
+    /// counted, and the app sends it again. The other kinds are answered with a
+    /// reset, as rurge's other resets are (`turn_away`: the limit on resets
+    /// applies, and nothing else is counted). The hook is asked under this
+    /// shard's lock. It is synchronous, never waits, and does not reach into the
+    /// TUN.
+    fn refused_by_rules(
+        &mut self,
+        syn: &[u8],
+        segment: &Segment,
+        now: Instant,
+        host: Option<&str>,
+    ) -> bool {
+        let session = session::tcp_session(&segment.tuple, host);
+        let Some(kind) = self.hooks.pre_match(PreMatchLayer::Syn, &session) else {
+            return false;
+        };
+        self.release_held();
+        match kind {
+            RejectKind::Drop => tracing::debug!(
+                src = %segment.tuple.src,
+                dst = %segment.tuple.dst,
+                name = host,
+                "tun: a SYN is dropped, as a pre-matching rule says"
+            ),
+            RejectKind::Reject | RejectKind::NoDrop | RejectKind::TinyGif => {
+                self.turn_away(syn, segment, now, None);
             }
         }
+        true
     }
 
     /// Gives back what the SYN being taken holds (`Held`): no connection
@@ -604,10 +664,10 @@ impl ShardState {
     /// connection takes in the TUN's caps were claimed by `new_syn`, and the
     /// buffers' share of the budget is taken here; both are written down in
     /// `held` before the stack is called, and given back if no connection
-    /// comes of the SYN, or if the stack panics. `name` is that of the fake
-    /// address the SYN is for, if it is for one, with its lease: the
-    /// connection's, and given back with the connection's session, or at once
-    /// if no connection comes of the SYN.
+    /// comes of the SYN, or if the stack panics. `purpose` is what the
+    /// connection is for; when it is a session to a fake address, the name and
+    /// the lease it holds are the connection's, and given back with the
+    /// connection's session, or at once if no connection comes of the SYN.
     fn open(
         &mut self,
         packet: Vec<u8>,
@@ -615,7 +675,7 @@ impl ShardState {
         now: Instant,
         at: smoltcp::time::Instant,
         opened: &mut Vec<Opened>,
-        name: Option<(String, Lease)>,
+        purpose: Purpose,
     ) {
         let tuple = segment.tuple;
         let sizes = self.budget.take();
@@ -669,7 +729,7 @@ impl ShardState {
             id,
             shared,
             tuple,
-            name,
+            purpose,
         });
     }
 
@@ -1022,8 +1082,7 @@ pub(crate) async fn run(
     shard: Arc<Shard>,
     mut packets: mpsc::Receiver<Vec<u8>>,
     writer: mpsc::Sender<Vec<Vec<u8>>>,
-    dialer: Arc<dyn Dialer>,
-    holds: Holds,
+    serving: Arc<Serving>,
     life: Arc<Life>,
     tasks: TaskTracker,
 ) {
@@ -1082,10 +1141,9 @@ pub(crate) async fn run(
             let stream = TunStream::new(shard.clone(), opened.id, opened.shared);
             tasks.spawn(session::serve(
                 stream,
-                dialer.clone(),
+                serving.clone(),
                 opened.tuple,
-                opened.name,
-                holds,
+                opened.purpose,
                 life.clone(),
             ));
         }

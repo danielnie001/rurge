@@ -11,10 +11,13 @@
 //! are taken, and what is said. `udp` is about the datagrams of the apps: which
 //! of them go to the responder (its own addresses, the servers `hijack-dns`
 //! names), through the memory device and the app's end of it, with the queue
-//! and the tasks that answer them.
+//! and the tasks that answer them. `tcp` is about the connections of the apps
+//! to its port 53: the queries on them, when they are closed, and the
+//! connections to a server `hijack-dns` names, which are not its own.
 
 mod answer;
 mod forward;
+mod tcp;
 mod udp;
 
 use crate::TunSettings;

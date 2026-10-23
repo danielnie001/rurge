@@ -1,8 +1,9 @@
 //! One shard's task, run by hand with channels of the test's own in place of the
 //! reader's queue and the writer's: the stop is a last turn of the shard.
 
+use crate::dns::Responder;
 use crate::packet::segment;
-use crate::session::Holds;
+use crate::session::Serving;
 use crate::tcp::shard::{self, Records};
 use crate::tcp::{Outcome, PANIC_MARKER, Tuple};
 use crate::testing::FakeDialer;
@@ -13,6 +14,7 @@ use crate::tests::support::{
 };
 use crate::{Ending, TunOptions};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::task::TaskTracker;
@@ -26,12 +28,12 @@ fn spawn_shard(
     to_writer: mpsc::Sender<Vec<Vec<u8>>>,
 ) -> TaskTracker {
     let tasks = TaskTracker::new();
+    let responder = Arc::new(Responder::new(lone.hooks.clone(), None));
     tasks.spawn(shard::run(
         lone.shard.clone(),
         packets,
         to_writer,
-        FakeDialer::new(),
-        Holds::from(options),
+        Arc::new(Serving::new(FakeDialer::new(), responder, options)),
         lone.life.clone(),
         tasks.clone(),
     ));

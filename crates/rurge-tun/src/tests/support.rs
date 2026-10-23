@@ -212,13 +212,15 @@ impl Device for GatedDevice {
 
 /// One shard on its own, for a test that takes its turns by hand, with what a
 /// TUN gives each of its shards: the test holds the TUN's `Life`, `Stats`
-/// and `Admission` as the TUN holds them.
+/// and `Admission` as the TUN holds them, and the hooks the shard asks the
+/// pre-matching rules through (the settings are those of a default `Extras`).
 pub(crate) struct Lone {
     pub(crate) shard: Arc<Shard>,
     pub(crate) life: Arc<Life>,
     pub(crate) stats: Arc<Stats>,
     pub(crate) admission: Arc<Admission>,
     pub(crate) budget: Arc<Budget>,
+    pub(crate) hooks: Arc<FakeHooks>,
 }
 
 /// A shard on a device with an MTU of 1500, whose clock starts at `epoch`, and
@@ -241,6 +243,7 @@ pub(crate) fn lone_shard_with_pool(
         options.buffer_min,
         options.tx_max,
     ));
+    let hooks = FakeHooks::new(settings(FakeResolve::new(), true));
     let shard = Arc::new(Shard::new(
         0,
         1500,
@@ -249,6 +252,7 @@ pub(crate) fn lone_shard_with_pool(
         budget.clone(),
         admission.clone(),
         pool,
+        hooks.clone(),
         options,
     ));
     Lone {
@@ -257,6 +261,7 @@ pub(crate) fn lone_shard_with_pool(
         stats,
         admission,
         budget,
+        hooks,
     }
 }
 

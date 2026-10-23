@@ -94,7 +94,7 @@ fn hijacking(extras: &Extras, servers: &[(Option<Ipv4Addr>, u16)]) {
     });
 }
 
-fn extras_hijacking(servers: &[(Option<Ipv4Addr>, u16)]) -> Extras {
+pub(super) fn extras_hijacking(servers: &[(Option<Ipv4Addr>, u16)]) -> Extras {
     let extras = Extras::default();
     hijacking(&extras, servers);
     extras
