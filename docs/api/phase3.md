@@ -321,7 +321,7 @@ rurge 在对应有变化时重写它，至多每 10 秒一次，TUN 停下时再
 
 阶段 3 / M3c 在虚拟网卡的内核（`crates/rurge-tun`）里做了 DNS 应答器（`Responder`）和预匹配在 DNS 与 SYN 两层的拒绝，在引擎里做了预匹配的钩子（`crates/rurge-engine/src/prematch.rs`）和经 HTTP / SOCKS5 监听器来的 fake 地址的换回（`crates/rurge-engine/src/fake_address.rs`）；M3（内存设备上的 TUN 内核）到此做完。**没有新增端点、诊断码、命令行选项或配置键**：`allow-dns-svcb`、`hijack-dns`、`always-real-ip` 自阶段 1 起被解析，到这一份才有读它们的人。
 
-**`rurge run` 要到 M4 才起虚拟网卡，所以使用者今天看不到这一节的任何东西。**经虚拟网卡来的会话、应答器的应答、预匹配的记录和下面的日志行，都只在 `Engine::start_tun` 起着 TUN 的时候才有，今天只有测试调用它；连"经监听器来的 fake 地址"那一半也一样——引擎的池（`Engine.fake_pool`）由 `start_tun` 放进去、TUN 结束时清掉，没有池时那样的地址照普通地址处理，`rurge run` 今天从不放。使用者今天看得到的只有一处文字：`rurge dns lookup --trace` 一类的输出里，应答码 FORMERR 与 NOTIMP 现在写它们的名字（原来写 `RCODE1`、`RCODE4`）。
+**`rurge run` 要到 M4 才起虚拟网卡，所以使用者今天看不到这一节的任何东西。**经虚拟网卡来的会话、应答器的应答、预匹配的记录和下面的日志行，都只在 `Engine::start_tun` 起着 TUN 的时候才有，今天只有测试调用它；连"经监听器来的 fake 地址"那一半也一样——引擎的池（`Engine.fake_pool`）由 `start_tun` 放进去、TUN 结束时清掉，没有池时那样的地址照普通地址处理，`rurge run` 今天从不放。使用者今天看得到的只有两处：`rurge dns lookup --trace` 一类的输出里，应答码 FORMERR 与 NOTIMP 现在写它们的名字（原来写 `RCODE1`、`RCODE4`）；和 UDP 上游给在途的同 ID 的第二个查询换一个空着的 ID（`Pending::claim`）——原来第二个查询顶掉第一个的等待者，第一个以 `waiter replaced or dropped` 失败，两个同时在途的查询碰巧带着同一个 ID 时才碰得到。M3 整体今天看得到的还有 M3b 的三处，见「M3b」一节：`listener.tun` 恒为 0，进程查找 DEBUG 行的 `remote`，`rurge run` 的 TCP 进程查找连远端地址一起比。
 
 ### 请求记录里的虚拟网卡会话
 
@@ -344,7 +344,7 @@ rurge 在对应有变化时重写它，至多每 10 秒一次，TUN 停下时再
 
 - `status` 是 `"rejected"`，`rejectKind` 是实际用的那一种：`REJECT`、`REJECT-TINYGIF`、`REJECT-NO-DROP`，或自动升级（见下）之后的 `REJECT-DROP`；`policy` 是规则点名的那一个内置策略（升级之后也是），`rule` 是规则的文字；`error` 是 `null`（`notes` 说明来由，不说明失败）。这样的会话当场结束，不会出现在 `active` 里。
 - `notes` 的第一句是 **`pre-matching at DNS`** 或 **`pre-matching at SYN`**；命中的是集合（`RULE-SET` 或 `DOMAIN-SET`）里的一行时，第二句是 ``Sub-rule matched: <那一行> (in <集合>)``（同一句也在 DEBUG 日志里，带会话号）。
-- **同一代里同一条规则 5 分钟内只记一次**（换代，即重载之后，从头记）。不该记的拒绝照样被拒、照样计入自动升级，只是不进记录，也不为它查进程。
+- **同一代里同一条规则 5 分钟内只记一次**（换代之后从头记：重载之后，和网络变化让生效的 DNS 覆盖变了、引擎用内存里的配置重建一代之后）。不该记的拒绝照样被拒、照样计入自动升级，只是不进记录，也不为它查进程。
 
 **自动升级**：`REJECT` 与 `REJECT-TINYGIF` 的拒绝记入引擎已有的计数（`REJECT-DROP` 本来就是丢弃，`REJECT-NO-DROP` 从不升级），同一个主机（DNS 层是名字，SYN 层是名字或地址的文字）30 秒内的第 50 次起按 `REJECT-DROP` 处理——第 50 次本身就是：DNS 层不答，SYN 层丢 SYN。计数与监听器的会话共用一份；计入的是每个被拒的 **A 或 AAAA 查询**，所以一次查找问 A 与 AAAA 的应用，比按会话数更早静默。
 
@@ -367,14 +367,14 @@ rurge 在对应有变化时重写它，至多每 10 秒一次，TUN 停下时再
 
 | 原因 | M3c 起还数 |
 | --- | --- |
-| `queue_full` | 应答器的队列（`dns_queue`，缺省 1,024）放不下的查询；写任务的队列放不下的本地应答（应答器的应答，和 M3b 起的 ICMP 消息、回显的本地应答：本地应答从不等空位）；TUN 里排队的 UDP 超过字节预算（`udp_bytes`，缺省 64 MiB，所有 UDP 会话共用）的数据报 |
+| `queue_full` | 应答器的队列（`dns_queue`，缺省 1,024）放不下的查询；写任务的队列放不下的本地应答（应答器在 UDP 上的应答，和 M3b 起的 ICMP 消息、回显的本地应答：本地应答从不等空位；TCP 上的应答不经这个队列）；TUN 里排队的 UDP 超过字节预算（`udp_bytes`，缺省 64 MiB，所有 UDP 会话共用）的数据报 |
 | `rst_limited` | 预匹配的 RST 也经"3 秒 100 个"的限频，超出的丢包计这里 |
 
 不计数的：预匹配丢掉的 SYN（只有一行 DEBUG），应答器正常答出去的查询。
 
 ### 日志
 
-日志文本是英文；DEBUG 的行要 `--log-level debug`。**名字与上游的地址只出现在 DEBUG 的行与请求记录里**，下面表里的 INFO 行是例外。
+日志文本是英文；DEBUG 的行要 `--log-level debug`。**本节新增的行里，名字与上游的地址只出现在 DEBUG 的行与请求记录里**，下面表里的 INFO 行是例外；引擎照旧写的 INFO 行 `session rejected by …` 与 `session failed`（每个被拒、每个失败的会话一行，带 `src` 与 `dst`，阶段 1 起的写法，见上面 M3b 的「没有覆盖的」第三条）也带名字或地址：被预匹配拒绝的会话、`fake address not known` 的失败都会出这样的行。
 
 | 级别 | 文本 | 字段 | 什么时候 |
 | --- | --- | --- | --- |

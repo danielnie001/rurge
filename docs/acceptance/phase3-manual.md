@@ -255,7 +255,7 @@
     print("received", total, "bytes", flush=True)
     ```
 
-  - `hold_server.py <端口>`：接受连接、一直拿着不读不写。停止与一万条连接用：
+  - `hold_server.py <端口>`：接受连接、一直拿着不读不写。停止与一万条连接用（每条连接占服务器一个文件描述符：一万条要在服务器上先放宽限制，Linux 与 macOS 用 `ulimit -n 20000`；不够时 `accept` 报 `Too many open files`，脚本退出）：
 
     ```python
     import socket, sys
@@ -308,7 +308,7 @@
     print("still open", len(alive))
     ```
 
-  - `dns_latency.py <应答器>[:端口] <类型> <次数>`：向应答器发 `<次数>` 个查询、各等应答，打印往返的中位数、p99 与最大值；类型 1 是 A（每次一个不同的名字），16 是 TXT（`example.com`）：
+  - `dns_latency.py <应答器>[:端口] <类型> <次数>`：向应答器发 `<次数>` 个查询、各等应答（2 秒没有应答的算丢了，接着发下一个；迟到的应答按 ID 认出来，不算下一个的），打印收到几个、丢了几个，和收到的往返的中位数、p99 与最大值；类型 1 是 A（每次一个不同的名字），16 是 TXT（`example.com`）：
 
     ```python
     import socket, struct, sys, time
@@ -326,14 +326,25 @@
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(2)
     times = []
+    lost = 0
     for i in range(count):
         name = "n%d.test" % i if qtype == 1 else "example.com"
+        ident = struct.pack(">H", i & 0xFFFF)
         started = time.perf_counter()
         sock.sendto(query(i, name), address)
-        sock.recvfrom(4096)
-        times.append((time.perf_counter() - started) * 1000)
-    times.sort()
-    print("median %.3f ms, p99 %.3f ms, max %.3f ms" % (times[len(times) // 2], times[int(len(times) * 0.99)], times[-1]))
+        while True:
+            try:
+                answer = sock.recvfrom(4096)[0]
+            except socket.timeout:
+                lost += 1  # no answer in 2 seconds: lost, and the next query goes out
+                break
+            if answer[:2] == ident:  # an answer that came late to an earlier query is skipped
+                times.append((time.perf_counter() - started) * 1000)
+                break
+    print("answered %d of %d, lost %d" % (len(times), count, lost))
+    if times:
+        times.sort()
+        print("median %.3f ms, p99 %.3f ms, max %.3f ms" % (times[len(times) // 2], times[int(len(times) * 0.99)], times[-1]))
     ```
 
   - `burst_queries.py <应答器>[:端口] <条数>`：一个 UDP 套接字不等应答、连发 `<条数>` 个不同 ID 与名字的 A 查询，再收 3 秒应答，打印收到几个；没收到的补问一遍再收 3 秒：
@@ -446,7 +457,7 @@
 | # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
 | --- | --- | --- | --- | --- | --- | --- |
 | M14 | **零窗口探测：macOS 作发送方。**（M3a 延后第 11 行）同 W16：在 `<服务器>` 上 `python3 stall_server.py 9000 300`；在被测机器上 `python3 -c "import socket; s=socket.create_connection(('<服务器>',9000)); s.sendall(b'x'*(200<<20)); print('sent')"`，同时在 utun 上抓包（`sudo tcpdump -i utunN -n`，`N` 看 M4 建的是哪一个） | 同 W16：上传停住、连接不被重置、服务器醒来之后收到 209,715,200 字节；记下 macOS 的探测间隔与 rurge 的 ACK；`dropped` 里 `beyond_window` 很小，`rst_limited` 与 `stackPanics` 为 0 | `stall_server.py` 的输出；`tcpdump`；计数 | | | |
-| M15 | **停止时最后一轮的复位与 `STOP_GRACE`。**（M3a 延后第 13 行）同 W17：`python3 hold_server.py 7000` 在 `<服务器>`，被测机器 `python3 many_connections.py <服务器> 7000 500`，打印 `stop rurge now` 之后 `./rurge stop -c <conf>` | 同 W17：500 条约 1 秒之内都以复位结束，没有挂到应用自己的 TCP 超时的；macOS 上 utun 收不下时最后一轮的复位会不会被丢（设计 4.1 节：内存设备会等，真实设备收不下就丢）——少了几条写下来 | 脚本的输出；`tcpdump` | | | |
+| M15 | **停止时最后一轮的复位与 `STOP_GRACE`。**（M3a 延后第 13 行）同 W17：`python3 hold_server.py 7000` 在 `<服务器>`，被测机器 `ulimit -n 4096; python3 many_connections.py <服务器> 7000 500`（macOS 缺省只许开 256 个文件），打印 `stop rurge now` 之后 `./rurge stop -c <conf>` | 同 W17：500 条约 1 秒之内都以复位结束，没有挂到应用自己的 TCP 超时的；macOS 上 utun 收不下时最后一轮的复位会不会被丢（设计 4.1 节：内存设备会等，真实设备收不下就丢）——少了几条写下来 | 脚本的输出；`tcpdump` | | | |
 | M16 | **macOS 的应用问应答器。**开增强模式，系统 DNS 指向应答器（M4）。(a) `dig @198.18.0.2 example.com`、`dig @198.18.0.2 example.com AAAA`、`dig @198.18.0.2 example.com TXT`、`dig @198.18.0.2 example.com HTTPS`、`dig @198.18.0.2 use-application-dns.net`；(b) `dig +tcp @198.18.0.2 example.com`；(c) `dscacheutil -q host -a name example.com` 和 `ping -c 3 example.com`（系统解析库经 mDNSResponder 问应答器）；(d) Safari、Chrome、Firefox 各打开 `http://example.com/`，读 `recent`；`scutil --dns` 看系统的解析器 | (a) 同 W18(a)：A 得 `198.18.x.y`（TTL 30，`aa` 与 `ra` 置位），AAAA 得 `fd00:6152::` 开头的地址，TXT 得真实的 TXT，HTTPS 得 NOTIMP，canary 得 NXDOMAIN；(b) 经 TCP 的结果相同；(c) 解析出 fake 地址，`ping` 的回显发往名字背后的真实地址并拿到应答（`icmp-forwarding` 缺省开着；真实的 ICMP 套接字是 M4 的）；(d) 页面能打开，`recent` 里 `dst` 是名字、`listener` 是 `tun`。`.local` 名字（mDNS）的行为单独记下：A / AAAA 拿 fake 地址还是被系统直接用 mDNS 解析 | `dig` 的输出；`recent`；`scutil --dns` | | | |
 
 ---
@@ -466,12 +477,12 @@
 | # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
 | --- | --- | --- | --- | --- | --- | --- |
 | P19 | **B1：真实设备上的单流吞吐。**（M3a 延后第 2 行）开增强模式，MTU 取 M4 给的（M3 的缺省 1500）。在 `<服务器>` 上 `iperf3 -s`；在被测机器上 `iperf3 -c <服务器> -t 30`（上行）和 `iperf3 -c <服务器> -t 30 -R`（下行），三个平台各做一次；同时看 rurge 的 CPU（任务管理器 / `top`） | 记下每个平台每个方向的 Gbit/s、rurge 占几个核、`dropped` 里 `beyond_window`、`queue_full`、`rst_limited` 与 `stackPanics`（都应当是 0）。对照：内存设备上 B1 的中位数上行约 7.2、下行约 5.5 Gbit/s，门槛是每个方向不低于 0.7 Gbit/s（rurge 一侧单线程，M3-D9）。真实设备上低多少、是系统调用、转发循环的 8 KiB 缓冲还是别的拖的，写下来 | `iperf3` 的输出；任务管理器 / `top`；计数 | | | |
-| P20 | **B2：真实设备上的内存。**（M3a 延后第 2 行）开增强模式。在 `<服务器>` 上 `python3 hold_server.py 7000`；在被测机器上（Linux 与 macOS 先 `ulimit -n 20000`）`python3 many_connections.py <服务器> 7000 10000 hold`，再在 `<服务器>` 上 `iperf3 -s`、被测机器上 `iperf3 -c <服务器> -P 100 -t 60`（一百条在传的连接）；读 rurge 的峰值常驻内存（Windows：`(Get-Process rurge).PeakWorkingSet64`；Linux：`grep VmHWM /proc/<pid>/status`；macOS：`/usr/bin/time -l ./rurge …` 的 `maximum resident set size`，或活动监视器） | 峰值不超过 429,000,000 字节（NFR-01 的 300 MB 除以 0.7）。内存设备上缺省设置的门槛读数是 402.5 MB、保守读数 444.1 MB（超线）；真实设备上 rurge 一侧没有测试的东西，读到的峰值就是 rurge 自己的，记下它。再记下：预算（64 MiB）用完之后建的连接一辈子只有 4 KiB 的缓冲，这样的一条高吞吐连接多快（M3a 延后第 6 行：跑 `iperf3 -c <服务器> -t 30` 看，此时一万条已开着） | 内存读数；`iperf3` 的输出 | | | |
-| P21 | **fake 应答的延迟与转发的往返。**（M3c 延后第 5、12 行）开增强模式。在被测机器上 `python3 dns_latency.py 198.18.0.2 1 100000`（十万个不同的名字，A 查询，fake 应答）和 `python3 dns_latency.py 198.18.0.2 16 1000`（TXT，转发到上游），三个平台各做一次 | A 查询的往返：记下中位数、p99、最大。NFR-01 要小于 0.2 毫秒；内存里 `Responder::answer` 加造应答包是中位数 0.9 微秒、p99 3.2 微秒（不含设备、写任务与引擎的规则评估），真实设备上多出来的是设备的往返。最大值是不是落在第 57,345 个不同的名字附近（池的 `HashMap` 翻倍，内存里量到 5.8 毫秒，M3c 延后第 12 行）；TXT 的往返是上游的往返加一点 | 脚本的输出 | | | |
-| P22 | **一阵上千个查询。**（M3c 延后第 14 行）开增强模式。(a) `python3 burst_queries.py 198.18.0.2 1000`；(b) 同时开五个，各 `python3 burst_queries.py 198.18.0.2 2000`；(c) 一条 TCP 连接上流水线 200 个查询：`python3 tcp_pipeline.py 198.18.0.2 200` | (a)(b) 第一次收到几个、补问之后几个，`dropped.queue_full` 涨了多少：应答器的队列（1,024）与写任务的队列（缺省 256）放不下的应答被丢，应用约 1 秒后重问，所以补问之后应当全部收到；记下第一次丢了多少，丢得多就是真实设备比内存设备慢；(c) 脚本打印 `answers: 200 of 200 - in order: True`（应答器在本地按次序一个接一个答，不并发）；之后 rurge 的 CPU 回到接近 0，没有 WARN | 脚本的输出；计数；日志 | | | |
+| P20 | **B2：真实设备上的内存。**（M3a 延后第 2 行）开增强模式。在 `<服务器>` 上（Linux 与 macOS 先 `ulimit -n 20000`，一万条连接要一万多个文件描述符）`python3 hold_server.py 7000`；在被测机器上（Linux 与 macOS 同样先 `ulimit -n 20000`）`python3 many_connections.py <服务器> 7000 10000 hold`，再在 `<服务器>` 上 `iperf3 -s`、被测机器上 `iperf3 -c <服务器> -P 100 -t 60`（一百条在传的连接）；读 rurge 的峰值常驻内存（Windows：`(Get-Process rurge).PeakWorkingSet64`；Linux：`grep VmHWM /proc/<pid>/status`；macOS：`/usr/bin/time -l ./rurge …` 的 `maximum resident set size`，或活动监视器） | 峰值不超过 429,000,000 字节（NFR-01 的 300 MB 除以 0.7）。内存设备上缺省设置的门槛读数是 402.5 MB、保守读数 444.1 MB（超线）；真实设备上 rurge 一侧没有测试的东西，读到的峰值就是 rurge 自己的，记下它。再记下：预算（64 MiB）用完之后建的连接一辈子只有 4 KiB 的缓冲，这样的一条高吞吐连接多快（M3a 延后第 6 行：跑 `iperf3 -c <服务器> -t 30` 看，此时一万条已开着） | 内存读数；`iperf3` 的输出 | | | |
+| P21 | **fake 应答的延迟与转发的往返。**（M3c 延后第 5、12 行）开增强模式。在被测机器上 `python3 dns_latency.py 198.18.0.2 1 100000`（十万个不同的名字，A 查询，fake 应答）和 `python3 dns_latency.py 198.18.0.2 16 1000`（TXT，转发到上游），三个平台各做一次 | A 查询的往返：记下丢了几个（脚本打印 `answered … lost …`）、中位数、p99、最大。NFR-01 要小于 0.2 毫秒；内存里 `Responder::answer` 加造应答包是中位数 0.9 微秒、p99 3.2 微秒（不含设备、写任务与引擎的规则评估），真实设备上多出来的是设备的往返。最大值是不是落在第 57,345 个不同的名字附近（池的 `HashMap` 翻倍，这是读代码得出的解释；内存里量到 5.8 毫秒，M3c 延后第 12 行）；TXT 的往返是上游的往返加一点 | 脚本的输出 | | | |
+| P22 | **一阵上千个查询。**（M3c 延后第 14 行）开增强模式。(a) `python3 burst_queries.py 198.18.0.2 1000`；(b) 同时开五个，各 `python3 burst_queries.py 198.18.0.2 2000`；(c) 一条 TCP 连接上流水线 200 个查询：`python3 tcp_pipeline.py 198.18.0.2 200` | (a)(b) 第一次收到几个、补问之后几个，`dropped.queue_full` 涨了多少：应答器的队列（1,024）与写任务的队列（缺省 256）放不下的应答被丢，应用约 1 秒后重问，所以补问之后应当全部收到；记下第一次丢了多少，丢得多就是真实设备比内存设备慢；(c) 脚本打印 `answers: 200 of 200 - in order: True`（应答器在本地按次序一个接一个答，不并发）；之后 rurge 的 CPU 回到接近 0，(c) 没有新的 WARN；(a)(b) 要是丢了应答，日志里有且只有一行 WARN `tun: a packet was dropped (reason: queue_full); …`（每种丢包原因只在第一次说一次 WARN，其余在 DEBUG） | 脚本的输出；计数；日志 | | | |
 | P23 | **带 0x20 的解析器与 canary。**开增强模式。(a) 把 Unbound 的上游指到应答器（`forward-zone: name: "." forward-addr: 198.18.0.2`，`use-caps-for-id: yes`），解析 `ExAmPle.test`、`example.com` 几次；(b) 缺省打开 DNS over HTTPS 的 Firefox，系统 DNS 指向应答器（M4），打开 `http://example.com/`，看 `about:networking#dns` 或 `about:config` 的 `network.trr.mode` | (a) Unbound 不报 0x20 失败，解析成功：应答的问题段逐字节回显它发的大小写；同一个名字不论大小写拿同一个 fake 地址。(b) 应答器对 `use-application-dns.net` 答 NXDOMAIN，Firefox 不用 DoH，它的 DNS 查询出现在 DEBUG 的 `tun: DNS query` 行里 | Unbound 的日志；DEBUG 日志；Firefox 的页面 | | | |
 | P24 | **`hijack-dns`。**开增强模式，`[General]` 里 `hijack-dns = 8.8.8.8:53, 1.1.1.1:53`（重载）。(a) `dig @8.8.8.8 example.com`；(b) `dig +tcp @1.1.1.1 example.com`；(c) 向 `8.8.8.8:53` 发一个不是 DNS 查询的 UDP 包（`printf 'garbage' \| nc -u -w1 8.8.8.8 53`）；(d) `dig @2001:4860:4860::8888 example.com`；(e) 把 `hijack-dns` 换成 `*:53` 再试 (a)，然后去掉这个键、重载，再试 (a) | (a) 得到 fake 地址，`dig` 不抱怨"reply from unexpected source"（应答的来源是 `8.8.8.8:53`）；(b) 经 TCP 的不被劫持：真的连 `1.1.1.1:53`（经规则与策略，`recent` 里 `dst` 是 `1.1.1.1:53`）；(c) 照常作 UDP 会话（`recent` 里有 `transport` 为 `udp` 的会话）；(d) IPv6 的从不劫持；(e) `*:53` 劫持任何 IPv4 的 DNS 查询；去掉之后，下一个包就不再被劫持（发往 `8.8.8.8` 的真的出去了） | `dig` 的输出；`recent` | | | |
-| P25 | **预匹配在真实应用上。**开增强模式，`[Rule]` 里加（写在 `FINAL,DIRECT` 之前）：`DOMAIN-SUFFIX,ads.test,REJECT,pre-matching`、`DOMAIN-SUFFIX,drop.test,REJECT-DROP,pre-matching`、`DOMAIN-SUFFIX,sink.test,REJECT-NO-DROP,pre-matching`、`AND,((DOMAIN-SUFFIX,port.test),(DEST-PORT,443)),REJECT,pre-matching`；重载。(a) 对 `x.ads.test`、`x.drop.test`、`x.sink.test`、`x.port.test` 各 `dig @198.18.0.2` 一次（A 与 AAAA 都问）；(b) 浏览器打开 `http://x.ads.test/`；(c) `curl http://198.18.0.244/`（`dig` 到的 `x.sink.test` 的地址）；(d) 对 `x.port.test` 的 fake 地址 `curl https://x.port.test/ -k` 和 `curl http://x.port.test:8080/`（`<服务器>` 上起一个 8080 的服务，规则让它走 DIRECT）；(e) 在 30 秒内对 `x.ads.test` 连问 60 次 | (a) `ads.test`：空应答（NOERROR、没有记录）；`drop.test`：没有应答（`dig` 超时重试）；`sink.test`：A 得 `198.18.0.244`，AAAA 得空应答；`port.test`：DNS 层不拒绝，得 fake 地址；(b) 浏览器得不到地址；(c) 连接被拒（RST）；(d) 443 的连接被 RST，8080 的连得上；(e) 第 50 次起不再有应答（自动升级，第 50 次本身就静默）。`recent` 里：每条规则 5 分钟只有一条记录，`notes` 含 `pre-matching at DNS` 或 `pre-matching at SYN`，DNS 层记录的 `dst` 是名字、没有 `:0`；INFO 日志里 `session rejected by REJECT` 一行带名字（设计要名字只在 DEBUG，这一处不照做，M3c 延后第 6 行） | `dig` 的输出；`recent`；日志 | | | |
+| P25 | **预匹配在真实应用上。**开增强模式，`[Rule]` 里加（写在 `FINAL,DIRECT` 之前）：`DOMAIN-SUFFIX,ads.test,REJECT,pre-matching`、`DOMAIN-SUFFIX,drop.test,REJECT-DROP,pre-matching`、`DOMAIN-SUFFIX,sink.test,REJECT-NO-DROP,pre-matching`、`AND,((DOMAIN-SUFFIX,port.test),(DEST-PORT,443)),REJECT,pre-matching`；`[Host]` 里加 `x.port.test = <服务器的地址>`（(d) 里 8080 的那一条要靠它解析出真实地址，`.test` 不会自己解析）；重载。(a) 对 `x.ads.test`、`x.drop.test`、`x.sink.test`、`x.port.test` 各 `dig @198.18.0.2` 一次（A 与 AAAA 都问）；(b) 浏览器打开 `http://x.ads.test/`；(c) `curl http://198.18.0.244/`（`dig` 到的 `x.sink.test` 的地址）；(d) 对 `x.port.test` 的 fake 地址 `curl https://x.port.test/ -k` 和 `curl http://x.port.test:8080/`（`<服务器>` 上起一个 8080 的服务，`[Host]` 把 `x.port.test` 指到它，规则让它走 DIRECT）；(e) 在 30 秒内对 `x.ads.test` 连问 60 次 | (a) `ads.test`：空应答（NOERROR、没有记录）；`drop.test`：没有应答（`dig` 超时重试）；`sink.test`：A 得 `198.18.0.244`，AAAA 得空应答；`port.test`：DNS 层不拒绝，得 fake 地址；(b) 浏览器得不到地址；(c) 连接被拒（RST）；(d) 443 的连接被 RST，8080 的连得上；(e) 第 50 次起不再有应答（自动升级，第 50 次本身就静默）。`recent` 里：每条规则 5 分钟只有一条记录，`notes` 含 `pre-matching at DNS` 或 `pre-matching at SYN`，DNS 层记录的 `dst` 是名字、没有 `:0`；INFO 日志里 `session rejected by REJECT` 一行带名字（设计要名字只在 DEBUG，这一处不照做，M3c 延后第 6 行） | `dig` 的输出；`recent`；日志 | | | |
 | P26 | **经监听器来的 fake 地址。**开增强模式，`http-listen = 127.0.0.1:6152`、`socks5-listen = 127.0.0.1:6153`，系统代理不指向 rurge；`<conf>` 的 `[Host]` 里加 `origin.test = <服务器的地址>`，`<服务器>` 上 `python3 show_requests.py 8080`。先拿一个 fake 地址：`A=$(dig +short @198.18.0.2 origin.test)`（PowerShell：`$A=(Resolve-DnsName origin.test -Server 198.18.0.2 -DnsOnly -Type A).IPAddress`），再：(a) `curl -p -x http://127.0.0.1:6152 http://$A:8080/ -I`（`-p`：用 CONNECT）；(b) `curl --socks5 127.0.0.1:6153 http://$A:8080/ -I`；(c) `curl -x http://127.0.0.1:6152 http://$A:8080/ -I`（明文，绝对形式）；(d) 对 `198.18.0.1`、`198.18.0.244` 和池不认识的 `198.19.200.1` 重复 (a)；(e) 不开增强模式（没有池）重复 (a) | (a)(b) 连得上，`show_requests.py` 收到请求，`recent` 里 `dst` 是名字（`origin.test:8080`），不是 fake 地址；(c) 连得上，但**已知的缺口**（阶段 4）：请求行与 `Host` 仍是 fake 地址，`show_requests.py` 打印的 `Host:` 是 `$A:8080`，把实际看到的写下来；(d) HTTP 答 502，SOCKS5 答 `0x05`（把 `-p -x` 换成 `--socks5` 试一遍），`recent` 里 `error` 是 `fake address not known`，没有拨号；(e) 照普通地址处理（连不上），没有这条错误 | `curl` 的输出；`show_requests.py` 的输出；`recent` | | | |
-| P27 | **`local` 与进程查找：监听器与虚拟网卡各一种。**（M3b 延后第 6 行）`[General]` 里 `http-listen = 0.0.0.0:6152`（同时 `[::]:6152`，在支持处），开增强模式，`--log-level debug`。(a) 本机的客户端经本机的局域网地址连：`curl -x http://<本机的局域网地址>:6152 http://example.com/ -I`；(b) 同一个 `curl` 不经代理端口、直接连：`curl http://example.com/ -I`（经虚拟网卡）；读 DEBUG 的 `process lookup found the process` 行 | (a) `remote` 是 `<本机的局域网地址>:6152`——被接受的那条连接自己的本地地址，不是绑定的 `0.0.0.0:6152`——，找得到进程，`pid` 是 `curl`；(b) `remote` 是应用连的端点（fake 地址与 80），找得到进程，`pid` 是 `curl`。这一项的监听器那一半不需要 TUN，可以在 M4 之前先做 | DEBUG 日志；`recent` | | | |
-| P28 | **计数与日志行。**（设计第 16 节）做完上面的项之后：(a) 读 `GET /v1/features/enhanced_mode`；(b) 缺省日志级别（INFO）下搜日志里的名字（`example.com`、`ads.test`）、上游的地址（`8.8.8.8`）和 fake 地址；(c) `--log-level debug` 看 `tun: DNS query` 行的 `decision` | (a) `dropped` 的十个原因里不为 0 的，各自能对上做过的事（`unknown_fake`：重启之后应用还在用的旧 fake 地址；`martian`：真实网卡上的组播与广播，从不写日志；`queue_full`：P22 里丢的应答；`rst_limited`：一阵被拒的 SYN）；`stackPanics` 是 0。(b) INFO 与 WARN 里除了被预匹配拒绝的会话的那一行 `session rejected by …`（带名字，P25）之外没有名字与地址；WARN 只有每种丢包原因第一次的一行（不带地址，`martian` 除外）、池耗尽、设备出错这几句。(c) `decision` 的取值见 `docs/api/phase3.md` 的「M3c」一节 | `/v1/features/enhanced_mode`；日志文件 | | | |
+| P27 | **`local` 与进程查找：监听器与虚拟网卡各一种。**（M3b 延后第 6 行）`[General]` 里 `http-listen = 0.0.0.0:6152`（同时 `[::]:6152`，在支持处），`--log-level debug`。(a) 不需要 TUN：本机的客户端经本机的局域网地址连：`curl -x http://<本机的局域网地址>:6152 http://example.com/ -I`；(b) 开增强模式（要 TUN），同一个 `curl` 不经代理端口、直接连：`curl http://example.com/ -I`（经虚拟网卡）；读 DEBUG 的 `process lookup found the process` 行 | (a) `remote` 是 `<本机的局域网地址>:6152`——被接受的那条连接自己的本地地址，不是绑定的 `0.0.0.0:6152`——，找得到进程，`pid` 是 `curl`；(b) `remote` 是应用连的端点（fake 地址与 80），找得到进程，`pid` 是 `curl`。这一项的监听器那一半不需要 TUN，可以在 M4 之前先做 | DEBUG 日志；`recent` | | | |
+| P28 | **计数与日志行。**（设计第 16 节）做完上面的项之后：(a) 读 `GET /v1/features/enhanced_mode`；(b) 缺省日志级别（INFO）下搜日志里的名字（`example.com`、`ads.test`）、上游的地址（`8.8.8.8`）和 fake 地址；(c) `--log-level debug` 看 `tun: DNS query` 行的 `decision` | (a) `dropped` 的十个原因里不为 0 的，各自能对上做过的事（`unknown_fake`：重启之后应用还在用的旧 fake 地址；`martian`：真实网卡上的组播与广播，从不写日志；`queue_full`：P22 里丢的应答；`rst_limited`：一阵被拒的 SYN）；`stackPanics` 是 0。(b) INFO 里带名字或地址的只有引擎写的两种会话行：`session rejected by …`（被拒的会话：P25 的预匹配拒绝，和你自己试出的别的拒绝）与 `session failed`（失败的会话：P26(d) 的 `fake address not known`，W18 / M16 / L17 里连不上的连接），都带 `src` 与 `dst`（阶段 1 起的写法，`docs/api/phase3.md` 的「M3b」与「M3c」两节都说了）；除了这两种行，INFO 与 WARN 里没有名字与地址；WARN 只有每种丢包原因第一次的一行（不带地址，`martian` 除外）、池耗尽、设备出错这几句。(c) `decision` 的取值见 `docs/api/phase3.md` 的「M3c」一节 | `/v1/features/enhanced_mode`；日志文件 | | | |
