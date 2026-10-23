@@ -8,10 +8,14 @@
 //! `answer` follows the order the responder decides in, step by step; `forward`
 //! is about the forwards in flight, what becomes of a reply on its way out (the
 //! size of a datagram and of a frame, the OPT record), how often the settings
-//! are taken, and what is said.
+//! are taken, and what is said. `udp` is about the datagrams of the apps: which
+//! of them go to the responder (its own addresses, the servers `hijack-dns`
+//! names), through the memory device and the app's end of it, with the queue
+//! and the tasks that answer them.
 
 mod answer;
 mod forward;
+mod udp;
 
 use crate::TunSettings;
 use crate::dns::{Ask, DNS_PORT, Responder};

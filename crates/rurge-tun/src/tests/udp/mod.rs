@@ -1,10 +1,12 @@
 //! UDP through the TUN (phase 3 M3 design 7): a session for each source
 //! endpoint of an app, served by the dialer's association; the destinations in
-//! it; what comes back, whole or in fragments; and the ICMP message an app gets
-//! for a flow that was refused. The app sends through `AppStack::inject` and
+//! it; the bytes of the datagrams that wait in the sessions; what comes back,
+//! whole or in fragments; and the ICMP message an app gets for a flow that was
+//! refused. The app sends through `AppStack::inject` and
 //! reads what the TUN writes through `divert_udp` and `divert_icmp`, so that
 //! nothing it reads has been through a stack of its own.
 
+mod budget;
 mod fragments;
 mod refused;
 mod roundtrip;

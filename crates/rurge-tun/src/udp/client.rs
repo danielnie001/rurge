@@ -25,7 +25,9 @@ pub(crate) struct TunUdpClient {
     ctx: Arc<Context>,
     session: Arc<Session>,
     /// The datagrams of the app, in the order they came. The engine takes them
-    /// from one task, and the lock is the only one held across an `await`.
+    /// from one task, and the lock is the only one held across an `await`. The
+    /// ones still inside when the client is dropped are dropped with it, and
+    /// give their bytes back.
     queued: tokio::sync::Mutex<mpsc::Receiver<Queued>>,
 }
 
@@ -83,15 +85,19 @@ impl TunUdpClient {
 
 impl UdpClient for TunUdpClient {
     /// The next datagram of the app, with where it goes: the bytes are copied
-    /// into `buf`, and what does not fit is cut off as a socket cuts it off.
+    /// into `buf`, and what does not fit is cut off as a socket cuts it off. The
+    /// bytes of the datagram go back to the budget of the queues once they are
+    /// copied.
     fn recv<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
         Box::pin(async move {
-            let (payload, target) = self.queued.lock().await.recv().await.ok_or_else(|| {
+            let queued = self.queued.lock().await.recv().await.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "the UDP session is over")
             })?;
-            let len = payload.len().min(buf.len());
-            buf[..len].copy_from_slice(&payload[..len]);
-            Ok((len, target))
+            let len = queued.payload.len().min(buf.len());
+            buf[..len].copy_from_slice(&queued.payload[..len]);
+            // the rest of `queued`, the payload and the reservation, is dropped
+            // as this ends
+            Ok((len, queued.target))
         })
     }
 

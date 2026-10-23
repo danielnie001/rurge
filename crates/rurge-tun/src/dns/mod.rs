@@ -9,6 +9,8 @@
 //! is forwarded to the resolver of the generation in use. A reply made here or
 //! forwarded is fitted to the transport it goes back on.
 
+pub(crate) mod udp;
+
 use crate::hooks::{Hooks, TunSettings};
 use crate::space::REFUSED_V4;
 use rurge_config::{HostName, ListenerKind, PreMatchLayer, SessionInfo, Transport};

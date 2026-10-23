@@ -5,18 +5,29 @@
 //! queues the datagram for it; the session's own task runs the association,
 //! lets go of the destinations that have gone quiet and ends the session when
 //! the whole of it has.
+//!
+//! Not every datagram is a session's: [`receive`] decides where each goes (see
+//! [`destination`]), and the DNS responder takes the queries to its own port 53
+//! and to the servers `hijack-dns` names. The bytes that wait in the queues of
+//! all the sessions are one budget (`bytes`).
 
+pub(crate) mod bytes;
 mod client;
 mod targets;
 
+use crate::TunOptions;
 use crate::context::Context;
+use crate::dns::udp::offer;
+use crate::dns::{Ask, DNS_PORT};
 use crate::icmp;
 use crate::packet::{Parsed, Reason, Transport};
 use crate::space::{self, Place, STACK_V4, STACK_V6};
 use crate::stats::Stats;
+use bytes::Reserved;
 use client::TunUdpClient;
 use rurge_config::{HostName, ListenerKind, SessionInfo};
 use rurge_dns::fakeip::Lease;
+use rurge_dns::message;
 use rurge_inbound::UdpAdmission;
 use rurge_net::connector::Target;
 use smoltcp::wire::{Ipv4Packet, Ipv6Packet, UDP_HEADER_LEN, UdpPacket};
@@ -29,9 +40,16 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio_util::sync::CancellationToken;
 
-/// A datagram on its way to the dialer: its bytes, and the target it is for,
-/// which the receive task decided (a fake address is a name by then).
-type Queued = (Vec<u8>, Target);
+/// A datagram on its way to the dialer: its bytes, the target it is for, which
+/// the receive task decided (a fake address is a name by then), and the bytes
+/// it takes out of the budget of the sessions' queues, which go back as the
+/// datagram is dropped, whether the dialer has taken it or the queue has gone
+/// with it still inside.
+pub(crate) struct Queued {
+    pub(crate) payload: Vec<u8>,
+    pub(crate) target: Target,
+    _reserved: Reserved,
+}
 
 /// The sessions of the TUN, by the endpoint of the app each is for. The receive
 /// task adds them, and each session takes itself out when it is over.
@@ -88,7 +106,26 @@ pub(crate) struct State {
     ending: bool,
     /// When a datagram last went either way.
     pub(crate) last: Instant,
+    /// Whether every datagram the app has sent in this session went to port 53.
+    /// Such a session is a resolver's, a question and an answer for each new
+    /// source port, and ends after `udp_dns_idle` in place of `udp_idle`. It is
+    /// false for good from the first datagram to another port: the
+    /// destinations of the session are let go of one by one as they go quiet,
+    /// and what is left of them says nothing of what the app has sent.
+    dns_only: bool,
     pub(crate) targets: Targets,
+}
+
+impl State {
+    /// How long the session can go without a datagram either way before it
+    /// ends.
+    fn idle(&self, options: &TunOptions) -> Duration {
+        if self.dns_only {
+            options.udp_dns_idle
+        } else {
+            options.udp_idle
+        }
+    }
 }
 
 impl Session {
@@ -134,9 +171,64 @@ fn parts(packet: &[u8]) -> Option<(usize, &[u8])> {
     Some((packet.len() - ip_payload.len(), payload))
 }
 
+/// Where a datagram of the app goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Destination {
+    /// The DNS responder answers it.
+    Responder,
+    /// It is sent to an address of rurge's own that no datagram goes to: the
+    /// app is told so with ICMP.
+    Prohibited,
+    /// A UDP session carries it.
+    Session,
+}
+
+/// Where a datagram to `dst` that carries `payload` goes. The first of these
+/// that holds decides:
+///
+/// 1. It is for port 53 of an address of the responder: the responder.
+/// 2. It is for another port of an address of the responder, or for any other
+///    address of rurge's own: ICMP "administratively prohibited".
+/// 3. It is for an IPv4 address of the pool's space or of the Internet, at a
+///    port (and, if the entry names one, an address) that `hijack-dns` of the
+///    generation in use names, and what it carries is a DNS query: the
+///    responder. What reads as no query (a response, another opcode, a
+///    message that does not parse) is the app's own traffic to that server,
+///    QUIC for one; so is every datagram over IPv6.
+/// 4. A session.
+fn destination(ctx: &Context, dst: SocketAddr, payload: &[u8]) -> Destination {
+    let place = space::place(dst.ip());
+    if place == Place::Responder && dst.port() == DNS_PORT {
+        return Destination::Responder;
+    }
+    if matches!(place, Place::Own | Place::Responder) {
+        return Destination::Prohibited;
+    }
+    if hijacked(ctx, dst, payload) {
+        return Destination::Responder;
+    }
+    Destination::Session
+}
+
+/// Whether `hijack-dns` takes a datagram to `dst` that carries `payload`, which
+/// is not for an address of rurge's own. The settings are asked for here, for
+/// this datagram, and not kept: a reload is seen by the next one.
+fn hijacked(ctx: &Context, dst: SocketAddr, payload: &[u8]) -> bool {
+    let IpAddr::V4(ip) = dst.ip() else {
+        return false;
+    };
+    ctx.hooks
+        .settings()
+        .hijack_dns
+        .iter()
+        .any(|entry| entry.port == dst.port() && entry.addr.is_none_or(|addr| addr == ip))
+        && message::read_request(payload).is_ok()
+}
+
 /// A datagram from the app (the receive task's, phase 3 M3 design 7.1 and 7.2).
-/// It is queued for the session of the app's endpoint, which is begun if the
-/// app has none; or it is refused, or dropped and counted. Nothing here waits.
+/// It goes where [`destination`] says: to the responder; refused, with ICMP; or
+/// queued for the session of the app's endpoint, which is begun if the app has
+/// none. A datagram can be dropped and counted. Nothing here waits.
 pub(crate) fn receive(ctx: &Arc<Context>, parsed: &Parsed, packet: &[u8]) {
     let Transport::Udp { src_port, dst_port } = parsed.transport else {
         return;
@@ -146,6 +238,12 @@ pub(crate) fn receive(ctx: &Arc<Context>, parsed: &Parsed, packet: &[u8]) {
         SocketAddr::new(parsed.dst, dst_port),
     );
     let Some((header, payload)) = parts(packet) else {
+        // `classify` has read the headers of this datagram and checked its
+        // checksum, which are what `parts` reads: it cannot come to this. A
+        // debug build says so, so that a test notices; a release build drops
+        // the datagram as a malformed one, for a panic here would stop all
+        // reception.
+        debug_assert!(false, "classify has read this datagram");
         Stats::drop(
             &ctx.stats,
             Reason::Malformed,
@@ -154,18 +252,30 @@ pub(crate) fn receive(ctx: &Arc<Context>, parsed: &Parsed, packet: &[u8]) {
         );
         return;
     };
-    let quote = Quote::of(&packet[..header + UDP_HEADER_LEN]);
-    // rurge's own addresses are no places a datagram goes to: not counted, not
-    // limited, and no session
-    if matches!(space::place(dst.ip()), Place::Own | Place::Responder) {
-        icmp::refuse(ctx, dst.ip(), app.ip(), quote.as_slice());
-        return;
+    let headers = &packet[..header + UDP_HEADER_LEN];
+    match destination(ctx, dst, payload) {
+        Destination::Responder => {
+            let ask = Ask {
+                src: app,
+                server: dst,
+                transport: rurge_config::Transport::Udp,
+            };
+            offer(&ctx.dns_queue, &ctx.stats, payload, ask);
+            return;
+        }
+        // rurge's own addresses are no places a datagram goes to: not counted,
+        // not limited, and no session
+        Destination::Prohibited => {
+            icmp::refuse(ctx, dst.ip(), app.ip(), Quote::of(headers).as_slice());
+            return;
+        }
+        Destination::Session => {}
     }
     let datagram = Datagram {
         app,
         dst,
         payload,
-        quote,
+        quote: Quote::of(headers),
         now: Instant::now(),
     };
     let session = ctx.sessions.get(app);
@@ -176,12 +286,22 @@ pub(crate) fn receive(ctx: &Arc<Context>, parsed: &Parsed, packet: &[u8]) {
             return;
         }
     }
-    // no session, or one that is ending: this datagram begins another
+    // no session, or one that is ending: this datagram begins another, if its
+    // bytes fit the budget of the queues (the dialer is not asked before)
     let Some((target, lease)) = target_of(ctx, &datagram) else {
         return;
     };
+    let Some(reserved) = ctx.udp_bytes.reserve(payload.len()) else {
+        Stats::drop(
+            &ctx.stats,
+            Reason::QueueFull,
+            Some(app.ip()),
+            Some(dst.ip()),
+        );
+        return;
+    };
     match ctx.dialer.admit_udp() {
-        UdpAdmission::Accepted => begin(ctx, &datagram, target, lease),
+        UdpAdmission::Accepted => begin(ctx, &datagram, target, lease, reserved),
         UdpAdmission::Busy => {
             Stats::drop(&ctx.stats, Reason::Busy, Some(app.ip()), Some(dst.ip()));
         }
@@ -250,8 +370,25 @@ fn deliver(ctx: &Context, session: &Session, state: &mut State, datagram: &Datag
         }
     };
     state.last = now;
-    match session.queue.try_send((payload.to_vec(), target)) {
+    state.dns_only &= dst.port() == DNS_PORT;
+    let Some(reserved) = ctx.udp_bytes.reserve(payload.len()) else {
+        Stats::drop(
+            &ctx.stats,
+            Reason::QueueFull,
+            Some(app.ip()),
+            Some(dst.ip()),
+        );
+        return;
+    };
+    let queued = Queued {
+        payload: payload.to_vec(),
+        target,
+        _reserved: reserved,
+    };
+    match session.queue.try_send(queued) {
         Ok(()) => {}
+        // the datagram comes back with its bytes, which go back to the budget
+        // as it is dropped here
         Err(TrySendError::Full(_)) => {
             Stats::drop(
                 &ctx.stats,
@@ -266,8 +403,15 @@ fn deliver(ctx: &Context, session: &Session, state: &mut State, datagram: &Datag
 }
 
 /// Begins the session of the app with its first datagram, which the dialer has
-/// said it will serve, and starts its task.
-fn begin(ctx: &Arc<Context>, datagram: &Datagram, target: Target, lease: Option<Lease>) {
+/// said it will serve and whose bytes (`reserved`) are in the budget, and starts
+/// its task.
+fn begin(
+    ctx: &Arc<Context>,
+    datagram: &Datagram,
+    target: Target,
+    lease: Option<Lease>,
+    reserved: Reserved,
+) {
     let (queue, queued) = mpsc::channel(ctx.options.udp_queue);
     let mut targets = Targets::new(ctx.options.max_udp_targets);
     targets.insert(Entry::new(
@@ -278,13 +422,18 @@ fn begin(ctx: &Arc<Context>, datagram: &Datagram, target: Target, lease: Option<
         datagram.now,
     ));
     // the queue is empty: the first datagram fits
-    let _ = queue.try_send((datagram.payload.to_vec(), target));
+    let _ = queue.try_send(Queued {
+        payload: datagram.payload.to_vec(),
+        target,
+        _reserved: reserved,
+    });
     let session = Arc::new(Session {
         app: datagram.app,
         queue,
         state: Mutex::new(State {
             ending: false,
             last: datagram.now,
+            dns_only: datagram.dst.port() == DNS_PORT,
             targets,
         }),
     });
@@ -329,7 +478,8 @@ impl Drop for Over {
 
 /// The session's task: the association runs in it until the session is over.
 /// That is when neither the app nor a flow has sent a datagram for `udp_idle`
-/// (a session that is only sent to, a server pushing, stays), when the TUN
+/// (a session that is only sent to, a server pushing, stays; `udp_dns_idle` for
+/// as long as the app has sent to port 53 and no other port), when the TUN
 /// stops, or when the association returns by itself (the engine stopped, or had
 /// no room): the association is then told to end and waited for, and the
 /// session leaves the table. Every `udp_idle` / 4 at most, the destinations
@@ -343,12 +493,17 @@ async fn serve(ctx: Arc<Context>, session: Arc<Session>, client: Arc<TunUdpClien
     let mut association =
         ctx.dialer
             .associate(client.clone(), template(session.app), closed.clone());
-    let idle = ctx.options.udp_idle;
-    let every = (idle / 4).max(Duration::from_millis(1));
+    let options = &ctx.options;
+    let every = (options.udp_idle / 4).max(Duration::from_millis(1));
     let mut swept = Instant::now();
     let mut returned = false;
     loop {
-        let due = (session.state().last + idle).min(swept + every);
+        // the idle time is asked afresh at each turn: the app may have sent to
+        // another port since
+        let due = {
+            let state = session.state();
+            (state.last + state.idle(options)).min(swept + every)
+        };
         tokio::select! {
             biased;
             _ = ctx.life.stopped() => break,
@@ -360,14 +515,14 @@ async fn serve(ctx: Arc<Context>, session: Arc<Session>, client: Arc<TunUdpClien
         }
         let now = Instant::now();
         let mut state = session.state();
-        if now.saturating_duration_since(state.last) >= idle {
+        if now.saturating_duration_since(state.last) >= state.idle(options) {
             // under the lock a datagram is queued under: the ones that come
             // after this find the session ending
             state.ending = true;
             break;
         }
         if now.saturating_duration_since(swept) >= every {
-            state.targets.sweep(now, idle);
+            state.targets.sweep(now, options.udp_idle);
             swept = now;
         }
     }

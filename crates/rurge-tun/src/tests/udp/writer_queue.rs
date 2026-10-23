@@ -1,13 +1,17 @@
 //! What the TUN does when the writer's queue is full: a message it makes without
-//! waiting is dropped and counted, a reply waits for room.
+//! waiting is dropped and counted, a reply waits for room, and the wait ends at
+//! the stop.
 
 use super::{APP4, FAR4, Lab, NOTHING, taking, target_of};
 use crate::testing::UdpScript;
 use crate::testing::packets;
 use crate::tests::support::{GatedDevice, WITHIN, addr, eventually, in_five_seconds, rig_with};
-use crate::{Counters, TunOptions};
+use crate::writer::STOP_GRACE;
+use crate::{Counters, Ending, TunOptions};
 use rurge_proto::RejectKind;
+use std::io;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// A rig on a device that writes nothing until `open`, and a writer queue of
 /// one batch.
@@ -117,4 +121,49 @@ async fn a_reply_waits_for_room_in_the_writer_queue() {
         assert_eq!(lab.datagram().await.payload, [number]);
     }
     assert_eq!(lab.counters(), Counters::default());
+}
+
+/// A reply that waits for room in the writer's queue does not wait on past the
+/// stop: the writer, stuck in a write the device never finishes, gives it up
+/// `STOP_GRACE` after the stop and lets go of its queue, and the wait ends with
+/// `BrokenPipe`, which is what ends the engine's task that was sending the
+/// reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_waiting_for_room_ends_at_the_stop() {
+    let (lab, _gate) = gated();
+    let (app, far) = (addr(APP4), addr(FAR4));
+    lab.send(app, far, b"hello");
+    lab.associations_open(1).await;
+    let dialer = lab.rig.dialer.clone();
+    let from = target_of(far);
+    // replies one after the other until one fails: the writer holds the first
+    // in its write and the queue the second, so the third is the one that waits
+    let sending = tokio::spawn(async move {
+        for number in 0..5u8 {
+            if let Err(error) = dialer
+                .send_to_app(app, from.clone(), Some(from.clone()), vec![number])
+                .await
+            {
+                return (number, error);
+            }
+        }
+        panic!("every reply was sent, though the device takes nothing");
+    });
+    tokio::time::sleep(NOTHING).await;
+    assert!(!sending.is_finished(), "the replies did not wait for room");
+    let stopped = Instant::now();
+    lab.rig.tun.stop();
+    let (number, error) = in_five_seconds("the waiting reply to end", sending)
+        .await
+        .expect("the sending task");
+    let waited = stopped.elapsed();
+    assert_eq!(number, 2, "the third reply is the one that waited");
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe, "{error}");
+    // the writer's grace, and half a second more
+    assert!(
+        waited < STOP_GRACE + Duration::from_millis(500),
+        "the wait ended {waited:?} after the stop"
+    );
+    let ending = in_five_seconds("the TUN to end", lab.rig.tun.join()).await;
+    assert_eq!(ending, Ending::Stopped);
 }

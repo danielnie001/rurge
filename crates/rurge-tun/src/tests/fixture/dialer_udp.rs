@@ -84,6 +84,7 @@ async fn the_fake_dialer_serves_udp_as_it_was_scripted() {
         dialer.admit(admission);
         assert_eq!(dialer.admit_udp(), admission);
     }
+    assert_eq!(dialer.admissions_asked(), 4, "once, and once for each");
     let target = |last: u8| Target::new(HostName::Ip(Ipv4Addr::new(192, 0, 2, last).into()), 7);
     let (echo, reply, third_party, refuse, plain) =
         (target(1), target(2), target(3), target(4), target(5));
@@ -173,4 +174,49 @@ async fn the_fake_dialer_serves_udp_as_it_was_scripted() {
         .await
         .expect("the association's task");
     assert_eq!(dialer.associations_open(), 0);
+}
+
+/// A dialer says which apps have an association open, and one told to keep its
+/// clients holds on to each when the association returns (and not before it is
+/// told to).
+#[tokio::test]
+async fn the_fake_dialer_keeps_its_clients_when_told_to() {
+    let dialer = FakeDialer::new();
+    let (app, other) = (addr("198.18.0.1:5000"), addr("198.18.0.1:5001"));
+    let template = SessionInfo {
+        src: app,
+        listener: ListenerKind::Tun,
+        ..SessionInfo::udp(HostName::Ip(addr("198.18.0.253:1").ip()), 0)
+    };
+    // (kept, the number of references to the client after the association
+    // has returned: the test's own, and the dialer's if it keeps it)
+    for (keeps, references) in [(false, 1), (true, 2)] {
+        if keeps {
+            dialer.keep_clients();
+        }
+        let (_queue, queued) = mpsc::unbounded_channel();
+        let client = Arc::new(Hears {
+            queued: tokio::sync::Mutex::new(queued),
+            sent: Default::default(),
+            refused: Default::default(),
+        });
+        let closed = CancellationToken::new();
+        let serving = tokio::spawn({
+            let (dialer, closed) = (dialer.clone(), closed.clone());
+            let client: Arc<dyn UdpClient> = client.clone();
+            let template = template.clone();
+            async move { dialer.associate(client, template, closed).await }
+        });
+        eventually("the association to be open", WITHIN, || {
+            dialer.association_open(app)
+        })
+        .await;
+        assert!(!dialer.association_open(other), "another app's");
+        closed.cancel();
+        within("the association to end", serving)
+            .await
+            .expect("the association's task");
+        assert!(!dialer.association_open(app));
+        assert_eq!(Arc::strong_count(&client), references, "keeps: {keeps}");
+    }
 }

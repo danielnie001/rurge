@@ -151,11 +151,11 @@ async fn udp_to_rurge_addresses_is_prohibited_unlimited() {
     let (app4, app6) = (addr(APP4), addr(APP6));
     for (app, dst, headers) in [
         (app4, addr("198.18.0.1:9"), 28),
-        (app4, addr("198.18.0.2:53"), 28),
+        (app4, addr("198.18.0.2:54"), 28),
         (app4, addr("198.18.0.244:9"), 28),
         (app4, addr("198.18.0.253:9"), 28),
         (app6, addr("[fd00:6152::fd]:9"), 48),
-        (app6, addr("[fd00:6152::2]:53"), 48),
+        (app6, addr("[fd00:6152::2]:54"), 48),
     ] {
         let packet = packets::udp(app, dst, b"hello");
         lab.rig.app.inject(packet.clone());

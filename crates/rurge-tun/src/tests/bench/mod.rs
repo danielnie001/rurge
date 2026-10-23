@@ -1,17 +1,20 @@
 //! The benchmark gate of the TUN's TCP (phase 3 M3 design 6), and the tests of
 //! what it is built from.
 //!
-//! Two measurements, not gates: `b1_single_stream_throughput` and
-//! `b2_ten_thousand_connections` are ignored. They decide whether smoltcp 0.12
-//! is fast enough and small enough to be the TUN's TCP stack, and which
-//! defaults of `TunOptions` it is run with. Each is run on its own, in
-//! release, with `--nocapture`; the only runs of this crate that use `-p`:
+//! Three measurements, not gates: `b1_single_stream_throughput`,
+//! `b2_ten_thousand_connections` and `b3_fake_answer_latency` are ignored. The
+//! first two decide whether smoltcp 0.12 is fast enough and small enough to be
+//! the TUN's TCP stack, and which defaults of `TunOptions` it is run with; the
+//! third measures what a fake DNS answer costs (see `b3`). Each is run on its
+//! own, in release, with `--nocapture`; the only runs of this crate that use
+//! `-p`:
 //!
 //! ```text
 //! TUN_BENCH_FAR=memory cargo test -p rurge-tun --release --lib -- --ignored --exact tests::bench::b1_single_stream_throughput --nocapture
 //! cargo test -p rurge-tun --release --lib -- --ignored --exact tests::bench::b1_single_stream_throughput --nocapture
 //! TUN_BENCH_SHARDS=256 TUN_BENCH_MIN=4 TUN_BENCH_TX_MAX=256 TUN_BENCH_BUDGET=64 TUN_BENCH_MTU=1500 \
 //!   cargo test -p rurge-tun --release --lib -- --ignored --exact tests::bench::b2_ten_thousand_connections --nocapture
+//! cargo test -p rurge-tun --release --lib -- --ignored --exact tests::bench::b3_fake_answer_latency --nocapture
 //! ```
 //!
 //! B1 prints a table of single-stream transfers of 64 MiB (`TUN_BENCH_MIB`
@@ -52,14 +55,21 @@
 //! scripted client's table is an estimate. The second reading takes off only
 //! the exact item, and is printed because its margin against the line is thin.
 //!
+//! B3 asks the responder for the fake address of a hundred thousand different
+//! names, times each query from `Responder::answer` to the IP packet of the
+//! answer, and prints the median, the 99th percentile and the longest against
+//! NFR-01's 0.2 ms. It judges nothing.
+//!
 //! The readings and the numbers they gave are recorded in the phase 3 / M3a
-//! plan, execution record rows 8 (B1) and 9 (B2).
+//! plan, execution record rows 8 (B1) and 9 (B2), and in the phase 3 / M3c plan
+//! for B3 (and for B2 run again).
 //!
 //! A measurement is the wall clock of one run on one machine; the CPU time of
 //! a process is not read (it is not to be trusted on the development machine).
 
 mod b1;
 mod b2;
+mod b3;
 mod peak;
 mod scripted;
 
@@ -448,4 +458,11 @@ fn b2_ten_thousand_connections() {
         // packets of the idle connections with resets
         drop(scripted);
     });
+}
+
+#[test]
+#[ignore = "a measurement, not a gate: run on its own, in release"]
+fn b3_fake_answer_latency() {
+    let latencies = director().block_on(b3::measure(b3::NAMES));
+    b3::report(&latencies);
 }

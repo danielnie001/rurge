@@ -1,6 +1,8 @@
 //! The life of a UDP session and its limits: the queue, the admission, the idle
 //! time, the destinations a session holds and the leases it has on their fake
-//! addresses, and the ways an association ends.
+//! addresses, and the ways an association ends. (A test that shortens `udp_idle`
+//! shortens `udp_dns_idle` with it, since the options are refused otherwise, and
+//! a session that sends to port 53 only is kept as long as the others.)
 
 use super::{APP4, FAR4, lab, lab_with, named, target, target_of};
 use crate::device::MemoryDevice;
@@ -96,6 +98,7 @@ async fn a_session_ends_after_the_idle_time() {
     let idle = Duration::from_millis(300);
     let lab = lab(TunOptions {
         udp_idle: idle,
+        udp_dns_idle: idle,
         ..TunOptions::default()
     });
     let (app, dst) = (addr(APP4), addr(FAR4));
@@ -123,6 +126,7 @@ async fn a_session_ends_after_the_idle_time() {
 async fn a_session_with_traffic_stays() {
     let mut lab = lab(TunOptions {
         udp_idle: Duration::from_secs(1),
+        udp_dns_idle: Duration::from_secs(1),
         ..TunOptions::default()
     });
     let (app, dst) = (addr(APP4), addr(FAR4));
@@ -157,6 +161,7 @@ async fn a_session_with_traffic_stays() {
 async fn a_third_party_push_keeps_the_session_too() {
     let mut lab = lab(TunOptions {
         udp_idle: Duration::from_secs(1),
+        udp_dns_idle: Duration::from_secs(1),
         ..TunOptions::default()
     });
     let (app, dst) = (addr(APP4), addr(FAR4));
@@ -191,6 +196,7 @@ async fn a_target_that_only_the_server_talks_to_keeps_its_lease() {
     let mut lab = lab_with(
         TunOptions {
             udp_idle: Duration::from_secs(1),
+            udp_dns_idle: Duration::from_secs(1),
             ..TunOptions::default()
         },
         Extras {
@@ -258,6 +264,7 @@ async fn an_idle_target_gives_back_its_lease_while_the_session_goes_on() {
     let lab = lab_with(
         TunOptions {
             udp_idle: Duration::from_millis(300),
+            udp_dns_idle: Duration::from_millis(300),
             max_udp_targets: 2,
             ..TunOptions::default()
         },
@@ -318,6 +325,7 @@ async fn a_session_releases_its_leases() {
     let lab = lab_with(
         TunOptions {
             udp_idle: Duration::from_millis(300),
+            udp_dns_idle: Duration::from_millis(300),
             ..TunOptions::default()
         },
         Extras {
@@ -343,6 +351,47 @@ async fn a_session_releases_its_leases() {
         pool.assign("b.test", Instant::now()),
         Ok(0),
         "the address was given back"
+    );
+}
+
+/// A session that is over lets go of its leases itself. The drop of its client
+/// would do it if nothing held the client, but a dialer may hold on to the
+/// client after its association has returned (a task of its own that has not
+/// ended yet, say), and an address of the pool must not be kept from other names
+/// for as long as that lasts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_over_lets_go_of_its_leases_though_its_client_is_kept() {
+    let pool = Arc::new(FakeIpPool::with_count(1));
+    let lab = lab_with(
+        TunOptions {
+            udp_idle: Duration::from_millis(300),
+            udp_dns_idle: Duration::from_millis(300),
+            ..TunOptions::default()
+        },
+        Extras {
+            pool: Some(pool.clone()),
+            ..Extras::default()
+        },
+    );
+    lab.dialer().keep_clients();
+    let index = pool
+        .assign("a.test", Instant::now())
+        .expect("an address for a.test");
+    lab.send(addr(APP4), sock(v4_of(index), 53), b"x");
+    lab.associations_open(1).await;
+    assert_eq!(
+        pool.assign("b.test", Instant::now()),
+        Err(AssignError::Exhausted),
+        "the session holds a.test's address"
+    );
+    eventually("the session to end", WITHIN, || {
+        lab.dialer().associations_open() == 0 && lab.rig.tun.session_tasks() == 0
+    })
+    .await;
+    assert_eq!(
+        pool.assign("b.test", Instant::now()),
+        Ok(0),
+        "the address was given back, though the dialer still has the client"
     );
 }
 
@@ -492,6 +541,7 @@ async fn an_old_session_that_ends_late_does_not_take_its_replacement_with_it() {
         &Extras::default(),
         TunOptions {
             udp_idle: Duration::from_millis(250),
+            udp_dns_idle: Duration::from_millis(250),
             ..TunOptions::default()
         },
     );

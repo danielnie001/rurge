@@ -54,8 +54,9 @@ pub(crate) enum Reason {
     /// datagram when the dialer carries no UDP, and a reply from an address
     /// of the other family than the app's.
     Unsupported,
-    /// The queue the packet goes to was full: a shard's, a UDP session's, the
-    /// writer's (for an ICMP message).
+    /// The queue the packet goes to was full: a shard's, a UDP session's (or
+    /// the bytes the sessions' queues may hold were spent), the DNS responder's,
+    /// the writer's (for an ICMP message or an answer of the responder).
     QueueFull,
     /// A packet for an address of rurge's own space that names nothing: a SYN,
     /// a UDP datagram, an echo request, or a reply from a name that has no

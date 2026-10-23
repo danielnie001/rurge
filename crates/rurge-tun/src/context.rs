@@ -1,12 +1,15 @@
-//! What the receive task, the UDP sessions and the echo requests of a TUN hold
-//! in common: [`Context`]. It lives in a module of its own so that `dispatch`,
-//! `udp` and `icmp` all take it from here, and none of the three has to name
-//! another to get at it.
+//! What the receive task, the UDP sessions, the echo requests and the DNS
+//! queries of a TUN hold in common: [`Context`]. It lives in a module of its own
+//! so that `dispatch`, `udp`, `icmp` and `dns` all take it from here, and none
+//! of them has to name another to get at it.
 
+use crate::dns::Responder;
+use crate::dns::udp::Query;
 use crate::fragment::Ids;
 use crate::limit::Limiter;
 use crate::stats::Stats;
 use crate::udp::Sessions;
+use crate::udp::bytes::QueuedBytes;
 use crate::{Hooks, Life, Pinger, TunOptions};
 use rurge_dns::fakeip::FakeIpPool;
 use rurge_inbound::Dialer;
@@ -47,4 +50,13 @@ pub(crate) struct Context {
     /// How many echo requests wait for their replies: the places taken out of
     /// `max_echoes` (see `icmp`).
     pub(crate) echoes: AtomicUsize,
+    /// The DNS responder: one for the TUN, so that what it forwards at once is
+    /// one limit for the queries of every transport.
+    pub(crate) responder: Arc<Responder>,
+    /// The queue the receive task offers the DNS queries of the apps to (see
+    /// `dns::udp`).
+    pub(crate) dns_queue: mpsc::Sender<Query>,
+    /// The bytes of the datagrams that wait in the UDP sessions' queues (see
+    /// `udp::bytes`).
+    pub(crate) udp_bytes: Arc<QueuedBytes>,
 }

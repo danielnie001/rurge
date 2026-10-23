@@ -8,15 +8,13 @@
 //! (`dispatch`), one shard of the TCP stack for each part of the
 //! connections (`tcp`), one session for each TCP connection (`session`) and
 //! for each source endpoint that sends UDP (`udp`), one for each echo request
-//! that goes out (`icmp`), and one writes to the device what all of them send
-//! (`writer`).
+//! that goes out (`icmp`), one takes the DNS queries the apps send over UDP off
+//! their queue and one for each of them answers it (`dns`), and one writes to
+//! the device what all of them send (`writer`).
 
 mod context;
 pub mod device;
 mod dispatch;
-// Nothing builds the responder yet: the UDP and the TCP side of the TUN will
-// (phase 3 / M3c), and until they do it is dead code outside of its tests.
-#[cfg_attr(not(test), allow(dead_code))]
 mod dns;
 mod fragment;
 mod hooks;
@@ -35,6 +33,7 @@ mod writer;
 pub use hooks::{Hooks, Pinger, TunDns, TunSettings};
 
 use device::Device;
+use dns::Responder;
 use rurge_dns::fakeip::FakeIpPool;
 use rurge_inbound::Dialer;
 use session::Holds;
@@ -46,6 +45,7 @@ use tcp::{Admission, Budget, Shard};
 use tokio::sync::mpsc;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use tokio_util::task::TaskTracker;
+use udp::bytes::QueuedBytes;
 
 /// The largest receive buffer of any TCP socket on either side of the
 /// adapter. With 65535 bytes the window scale is 0 (smoltcp tcp.rs 538: the
@@ -114,6 +114,10 @@ impl Tun {
         ));
         let admission = Arc::new(Admission::new(life.clone(), stats.clone(), &options));
         let tasks = TaskTracker::new();
+        // one responder for the TUN, whatever the transport of the query
+        let responder = Arc::new(Responder::new(hooks.clone(), pool.clone()));
+        let (to_responder, queries) = mpsc::channel(options.dns_queue);
+        let udp_bytes = Arc::new(QueuedBytes::new(options.udp_bytes));
         let writer_queue = options.writer_queue;
         let (to_writer, from_shards) = mpsc::channel(writer_queue);
         #[cfg(test)]
@@ -171,6 +175,9 @@ impl Tun {
             ids: fragment::Ids::new(),
             icmp_limit: Mutex::new(icmp::limiter()),
             echoes: AtomicUsize::new(0),
+            responder,
+            dns_queue: to_responder,
+            udp_bytes: udp_bytes.clone(),
         });
         // the shards and the context hold the writer's queue: it ends once they
         // all have
@@ -181,6 +188,7 @@ impl Tun {
             writer_queue,
             life.clone(),
         ));
+        tasks.spawn(dns::udp::run(ctx.clone(), queries));
         tasks.spawn(dispatch::run(device, to_shards, ctx));
         // what is spawned later, the sessions, is waited for all the same
         tasks.close();
@@ -196,6 +204,8 @@ impl Tun {
                 budget,
                 #[cfg(test)]
                 admission,
+                #[cfg(test)]
+                udp_bytes,
             }),
         }
     }
@@ -206,41 +216,47 @@ impl Tun {
 pub struct TunOptions {
     /// Whether IPv6 packets are handled; with it off they are dropped as unsupported.
     pub ipv6: bool,
-    /// REJECT-DROP: how long a session holds the connection it was rejected on, read and written by nobody, before the TUN closes its side (a FIN). A stop ends the hold at once, and so does the end of the connection (the app resets it, say). After it the TUN waits for the app to close its side, for `linger` at the most.
+    /// REJECT-DROP: how long a session holds the connection it was rejected on, read and written by nobody, before the TUN closes its side (a FIN). A stop ends the hold at once, and so does the end of the connection (the app resets it, say). After it the TUN waits for the app to close its side, for `linger` at the most. Any time will do.
     pub drop_hold: Duration,
-    /// How many shards the TCP stack is divided into, each with a stack and a task of its own. The default was chosen by the benchmark gate; see the phase 3 / M3a plan's execution record row 10.
+    /// How many shards the TCP stack is divided into, each with a stack and a task of its own. The default was chosen by the benchmark gate; see the phase 3 / M3a plan's execution record row 10. More than zero.
     pub shards: usize,
-    /// The smallest buffer of a TCP socket, each way: what every socket made once the budget is spent gets. The default was chosen by the benchmark gate; see the phase 3 / M3a plan's execution record row 10.
+    /// The smallest buffer of a TCP socket, each way: what every socket made once the budget is spent gets. The default was chosen by the benchmark gate; see the phase 3 / M3a plan's execution record row 10. More than zero.
     pub buffer_min: usize,
-    /// The largest send buffer of a TCP socket. A socket's buffers are sized by what is left of `budget` when it is made, at least `buffer_min`; this caps the send buffer, `RX_MAX` the receive buffer. The default was chosen by the benchmark gate; see the phase 3 / M3a plan's execution record row 10.
+    /// The largest send buffer of a TCP socket. A socket's buffers are sized by what is left of `budget` when it is made, at least `buffer_min`; this caps the send buffer, `RX_MAX` the receive buffer. The default was chosen by the benchmark gate; see the phase 3 / M3a plan's execution record row 10. More than zero.
     pub tx_max: usize,
-    /// The bytes of TCP socket buffers, both ways, that the TUN shares out as sockets are made: a new socket takes a share of what is left. Once it is spent every new socket gets `buffer_min` each way, so the buffers in all can come to more than this. The default was chosen by the benchmark gate; see the phase 3 / M3a plan's execution record row 10.
+    /// The bytes of TCP socket buffers, both ways, that the TUN shares out as sockets are made: a new socket takes a share of what is left. Once it is spent every new socket gets `buffer_min` each way, so the buffers in all can come to more than this. The default was chosen by the benchmark gate; see the phase 3 / M3a plan's execution record row 10. Any number, zero too (every socket then gets `buffer_min`).
     pub budget: usize,
-    /// The most TCP sockets the whole TUN has; a SYN over it is answered with a reset.
+    /// The most TCP sockets the whole TUN has; a SYN over it is answered with a reset. Any number, zero too (every SYN is then answered with a reset).
     pub max_sockets: usize,
-    /// The most connections of the whole TUN that have not completed their handshake.
+    /// The most connections of the whole TUN that have not completed their handshake. Any number, zero too (no connection then gets through its handshake).
     pub max_half_open: usize,
-    /// How long a connection has to complete its handshake before it is reset.
+    /// How long a connection has to complete its handshake before it is reset. Any time will do.
     pub half_open_timeout: Duration,
-    /// The most that the connection of a stream that was dropped stays, waiting for the app to acknowledge its FIN; past that it is reset. Also the most that REJECT-DROP waits, after the hold (`drop_hold`), for the app to close its side while the TUN reads and throws away what it sends; past that the connection is reset.
+    /// The most that the connection of a stream that was dropped stays, waiting for the app to acknowledge its FIN; past that it is reset. Also the most that REJECT-DROP waits, after the hold (`drop_hold`), for the app to close its side while the TUN reads and throws away what it sends; past that the connection is reset. Any time will do.
     pub linger: Duration,
-    /// A connection idle for this long sends the app a keep-alive.
+    /// A connection idle for this long sends the app a keep-alive. At least 1 ms and at most 24 hours.
     pub keep_alive: Duration,
-    /// A connection that has had nothing from the app for this long is reset.
+    /// A connection that has had nothing from the app for this long is reset. More than `keep_alive` and at most 24 hours.
     pub timeout: Duration,
-    /// How many packets the device's reader can queue for one shard. A packet for a shard whose queue is full is dropped and counted (`queue_full`).
+    /// How many packets the device's reader can queue for one shard. A packet for a shard whose queue is full is dropped and counted (`queue_full`). More than zero.
     pub shard_queue: usize,
-    /// How many batches of packets (one for each turn of a shard) can wait for the writer. A shard whose batch finds the queue full waits for room.
+    /// How many batches of packets (one for each turn of a shard) can wait for the writer. A shard whose batch finds the queue full waits for room. More than zero.
     pub writer_queue: usize,
-    /// How long a UDP session, and each destination in it, can go without a packet either way before it ends. The default is the engine's own: its flows end after 60 seconds of quiet.
+    /// How long a UDP session, and each destination in it, can go without a packet either way before it ends. The default is the engine's own: its flows end after 60 seconds of quiet. At least 1 ms and at most 24 hours.
     pub udp_idle: Duration,
-    /// How many packets can wait in a UDP session for the engine to take them. A packet for a session whose queue is full is dropped and counted (`queue_full`).
+    /// How long a UDP session that has sent nothing but to port 53 can go without a packet either way before it ends, in place of `udp_idle`: a resolver that asks from a new port for each query (one question, one answer) would otherwise take a session of the engine's for a minute at a time. The session goes back to `udp_idle` for good the first time its app sends to another port. The default is the engine's own for its DNS flows. At least 1 ms, at most 24 hours and at most `udp_idle`.
+    pub udp_dns_idle: Duration,
+    /// How many packets can wait in a UDP session for the engine to take them. A packet for a session whose queue is full is dropped and counted (`queue_full`). More than zero.
     pub udp_queue: usize,
-    /// The most destinations one UDP session has, each a flow of the engine's, which takes 1024 in an association (and so does the default). A datagram to a destination beyond that many is dropped and counted (`busy`).
+    /// The bytes of UDP datagrams that can wait in all the sessions together for the engine to take them, counted by the length of each datagram's payload, and given back when the engine takes a datagram or the session is over with it still waiting. A datagram that does not fit is dropped and counted (`queue_full`), and so is the first datagram of a session that would not fit: that session is not begun. The default is the budget of the TCP buffers; with it a TUN holds about 45,000 datagrams of 1,472 bytes. More than zero.
+    pub udp_bytes: usize,
+    /// The most destinations one UDP session has, each a flow of the engine's, which takes 1024 in an association (and so does the default). A datagram to a destination beyond that many is dropped and counted (`busy`). More than zero.
     pub max_udp_targets: usize,
-    /// How long an echo request waits for its reply before it is given up, counted from when its task begins: resolving the name of a fake address is part of the wait.
+    /// How many DNS queries can wait for the responder to take them. A query that finds the queue full is dropped and counted (`queue_full`). More than zero.
+    pub dns_queue: usize,
+    /// How long an echo request waits for its reply before it is given up, counted from when its task begins: resolving the name of a fake address is part of the wait. At least 1 ms and at most 24 hours.
     pub echo_timeout: Duration,
-    /// The most echo requests waiting for a reply at once, in the whole TUN. One more is dropped and counted (`busy`).
+    /// The most echo requests waiting for a reply at once, in the whole TUN. One more is dropped and counted (`busy`). More than zero.
     pub max_echoes: usize,
 }
 
@@ -262,8 +278,11 @@ impl Default for TunOptions {
             shard_queue: 1_024,
             writer_queue: 256,
             udp_idle: Duration::from_secs(60),
+            udp_dns_idle: Duration::from_secs(10),
             udp_queue: 256,
+            udp_bytes: 64 << 20,
             max_udp_targets: 1_024,
+            dns_queue: 1_024,
             echo_timeout: Duration::from_secs(5),
             max_echoes: 1_024,
         }
@@ -272,7 +291,8 @@ impl Default for TunOptions {
 
 impl TunOptions {
     /// The longest `keep_alive`, `timeout`, `udp_idle` and `echo_timeout`
-    /// there can be. The stack adds the first two to a clock that counts in
+    /// there can be (`udp_dns_idle` is no longer than `udp_idle`, so a day at
+    /// most too). The stack adds the first two to a clock that counts in
     /// microseconds in an `i64`, and the others are added to times as well: a
     /// day is far below where that overflows, and far above any setting that
     /// is meant.
@@ -311,11 +331,23 @@ impl TunOptions {
         if self.udp_idle < Duration::from_millis(1) || self.udp_idle > Self::LONGEST {
             return Err("udp_idle must be at least 1 ms and at most 24 hours".into());
         }
+        // no longer than `udp_idle`, which is a day at most: so it is too
+        if self.udp_dns_idle < Duration::from_millis(1) || self.udp_dns_idle > self.udp_idle {
+            return Err(
+                "udp_dns_idle must be at least 1 ms, at most 24 hours and at most udp_idle".into(),
+            );
+        }
         if self.udp_queue == 0 {
             return Err("udp_queue must be more than zero".into());
         }
+        if self.udp_bytes == 0 {
+            return Err("udp_bytes must be more than zero".into());
+        }
         if self.max_udp_targets == 0 {
             return Err("max_udp_targets must be more than zero".into());
+        }
+        if self.dns_queue == 0 {
+            return Err("dns_queue must be more than zero".into());
         }
         if self.echo_timeout < Duration::from_millis(1) || self.echo_timeout > Self::LONGEST {
             return Err("echo_timeout must be at least 1 ms and at most 24 hours".into());
@@ -399,6 +431,8 @@ struct Inner {
     budget: Arc<Budget>,
     #[cfg(test)]
     admission: Arc<Admission>,
+    #[cfg(test)]
+    udp_bytes: Arc<QueuedBytes>,
 }
 
 /// A running TUN. Clone it to share it. It has no `Drop`: dropping every handle
@@ -467,9 +501,11 @@ impl TunHandle {
     }
 
     /// The sessions that are running: the TUN's tasks but the ones it starts
-    /// itself, a shard's each, the writer and the device's reader. It is right
-    /// only while those run, until a stop or a failing device ends them; after
-    /// that it means nothing, and a debug assertion makes it panic. Read
+    /// itself, a shard's each, the writer, the device's reader and the task that
+    /// takes the DNS queries off their queue. The task of each DNS query counts
+    /// as a session, as the task of each echo request does. It is right only
+    /// while those run, until a stop or a failing device ends them; after that
+    /// it means nothing, and a debug assertion makes it panic. Read
     /// `live_tasks` after a stop.
     #[cfg(test)]
     pub(crate) fn session_tasks(&self) -> usize {
@@ -480,16 +516,24 @@ impl TunHandle {
         self.inner
             .tasks
             .len()
-            .checked_sub(self.inner.shards.len() + 2)
+            .checked_sub(self.inner.shards.len() + 3)
             .expect("session_tasks is asked of a TUN that is running")
     }
 
     /// How many tasks are on the TUN's tracker, all of them: the sessions, the
-    /// shards, the writer and the device's reader. Unlike `session_tasks` it
-    /// means something after the stop too, as the tasks that end then unwind.
+    /// shards, the writer, the device's reader and the task of the DNS queries'
+    /// queue. Unlike `session_tasks` it means something after the stop too, as
+    /// the tasks that end then unwind.
     #[cfg(test)]
     pub(crate) fn live_tasks(&self) -> usize {
         self.inner.tasks.len()
+    }
+
+    /// The bytes of the datagrams that wait in the UDP sessions' queues, which
+    /// the budget `udp_bytes` counts.
+    #[cfg(test)]
+    pub(crate) fn udp_bytes_queued(&self) -> usize {
+        self.inner.udp_bytes.queued()
     }
 
     /// The TCP sockets of every shard.
@@ -569,7 +613,7 @@ pub struct Counters {
     pub martian: u64,
     /// Packets nothing handles: IPv6 while it is off, extension headers, protocols other than TCP, UDP and ICMP, an ICMP that is no echo request, and echo requests while `icmp-forwarding` is off; UDP datagrams when the dialer carries no UDP; replies from an address of the other family than the app's.
     pub unsupported: u64,
-    /// Packets for a shard whose queue was full; datagrams for a UDP session whose queue was full; ICMP messages that the writer's queue had no room for: those for refused UDP flows, those for datagrams to rurge's own addresses, and the local replies to echo requests to those addresses.
+    /// Packets for a shard whose queue was full; datagrams for a UDP session whose queue was full, or that did not fit the bytes the sessions' queues may hold (`udp_bytes`); DNS queries that found the responder's queue full; the messages that the writer's queue had no room for and that are made without waiting: ICMP messages for refused UDP flows, ICMP messages for datagrams to rurge's own addresses, the local replies to echo requests to those addresses, and the answers of the DNS responder.
     pub queue_full: u64,
     /// SYNs, UDP datagrams and echo requests to an address of rurge's own space that names nothing; replies from a name that has no address.
     pub unknown_fake: u64,

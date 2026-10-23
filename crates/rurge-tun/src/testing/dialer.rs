@@ -72,6 +72,8 @@ struct Open {
 
 struct UdpBook {
     admission: UdpAdmission,
+    /// How many times `admit_udp` was asked.
+    admissions_asked: usize,
     scripts: HashMap<Target, UdpScript>,
     /// The template of every association that was served, in order.
     associations: Vec<SessionInfo>,
@@ -80,17 +82,24 @@ struct UdpBook {
     sent: Vec<(Target, Vec<u8>)>,
     /// While true no association asks its client for a datagram.
     held: watch::Sender<bool>,
+    /// Whether an association keeps its client when it returns (`keep_clients`),
+    /// and the clients it kept.
+    keeping: bool,
+    kept: Vec<Arc<dyn UdpClient>>,
 }
 
 impl Default for UdpBook {
     fn default() -> UdpBook {
         UdpBook {
             admission: UdpAdmission::Accepted,
+            admissions_asked: 0,
             scripts: HashMap::new(),
             associations: Vec::new(),
             open: Vec::new(),
             sent: Vec::new(),
             held: watch::channel(false).0,
+            keeping: false,
+            kept: Vec::new(),
         }
     }
 }
@@ -153,6 +162,11 @@ impl FakeDialer {
         self.udp().admission = admission;
     }
 
+    /// How many times `admit_udp` has been asked, whatever it answered.
+    pub fn admissions_asked(&self) -> usize {
+        self.udp().admissions_asked
+    }
+
     /// What each datagram to `target` does from now on; a target with no
     /// script has its datagrams written down and nothing else done.
     pub fn script_udp(&self, target: Target, script: UdpScript) {
@@ -167,6 +181,20 @@ impl FakeDialer {
     /// How many associations are being served now.
     pub fn associations_open(&self) -> usize {
         self.udp().open.len()
+    }
+
+    /// Whether an association of the app at `app` is being served now.
+    pub fn association_open(&self, app: SocketAddr) -> bool {
+        self.udp().open.iter().any(|open| open.app == app)
+    }
+
+    /// From now on an association does not let go of its client when it
+    /// returns: the dialer keeps it for good, as a dialer whose detached tasks
+    /// hold on to the client would. The session of the TUN is over by then, and
+    /// what it releases it has to release itself, since the client's drop does
+    /// not.
+    pub fn keep_clients(&self) {
+        self.udp().keeping = true;
     }
 
     /// Every datagram the associations got from their clients: the target it
@@ -455,7 +483,9 @@ impl Dialer for FakeDialer {
     }
 
     fn admit_udp(&self) -> UdpAdmission {
-        self.udp().admission
+        let mut udp = self.udp();
+        udp.admissions_asked += 1;
+        udp.admission
     }
 
     /// Serves the association until `closed` fires: takes the client's
@@ -478,6 +508,9 @@ impl Dialer for FakeDialer {
                     app: session.src,
                     client: client.clone(),
                 });
+                if udp.keeping {
+                    udp.kept.push(client.clone());
+                }
             }
             let _closing = Closing { dialer: self, id };
             let mut held = self.udp().held.subscribe();

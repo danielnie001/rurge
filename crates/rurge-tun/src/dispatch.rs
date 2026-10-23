@@ -1,7 +1,8 @@
 //! The task that reads the device (phase 3 M3 design 4.3): each packet goes
 //! to where it is handled, or is dropped and counted. It never waits for a
 //! queue: a queue that is full drops the packet, and everything it hands on
-//! to a session or to the writer is handed on without waiting.
+//! to a shard, a session, the DNS responder or the writer is handed on without
+//! waiting.
 
 use crate::context::Context;
 use crate::device::Device;

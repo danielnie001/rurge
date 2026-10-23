@@ -32,7 +32,14 @@ impl Ids {
     pub(crate) fn new() -> Ids {
         // a counter that begins anywhere does; one that begins at random does
         // not begin where the last run of the TUN did
-        Ids(AtomicU32::new(getrandom::u32().unwrap_or(0x5eed)))
+        let first = getrandom::u32().unwrap_or_else(|error| {
+            tracing::warn!(
+                %error,
+                "tun: the system's random source failed; the identifications of the fragments the TUN writes begin at a fixed number"
+            );
+            0x5eed
+        });
+        Ids(AtomicU32::new(first))
     }
 
     fn next(&self) -> u32 {
