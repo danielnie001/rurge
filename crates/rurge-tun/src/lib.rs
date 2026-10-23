@@ -256,7 +256,7 @@ pub struct TunOptions {
     pub max_udp_targets: usize,
     /// How many DNS queries can wait for the responder to take them. A query that finds the queue full is dropped and counted (`queue_full`). More than zero.
     pub dns_queue: usize,
-    /// How long a TCP connection to the responder's port 53 can go without a query from its app before the TUN closes it (a FIN), and then the longest the TUN waits for the app to close its side too, reading and throwing away what it sends; past that the connection is reset. The wait for an answer that is being forwarded is no part of it. The default is that of `udp_dns_idle`. At least 1 ms and at most 24 hours.
+    /// How long a TCP connection to the responder's port 53 can go without a query from its app before the TUN closes it (a FIN), and then the longest the TUN waits for the app to close its side too, reading and throwing away what it sends; past that the connection is reset. It is also the longest an answer can wait to be written because the app does not read it; past that the connection is reset. The wait for an answer that is being forwarded is no part of it. The default is that of `udp_dns_idle`. At least 1 ms and at most 24 hours.
     pub dns_tcp_idle: Duration,
     /// How long an echo request waits for its reply before it is given up, counted from when its task begins: resolving the name of a fake address is part of the wait. At least 1 ms and at most 24 hours.
     pub echo_timeout: Duration,

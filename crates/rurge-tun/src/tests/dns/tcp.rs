@@ -252,8 +252,10 @@ async fn a_forward_in_progress_is_not_idle_time() {
         extras.dns.forwarded().len() == 1
     })
     .await;
-    // the connection is still open after three idle times: nothing has come
-    // and no end of the stream either
+    // The one fixed wait of this test, for what must not happen: the connection
+    // closed, or written to, while the upstream holds the query. Were the wait
+    // for the answer counted as idle time the TUN would close it after `idle`,
+    // 300 ms; the wait is three times that, so the margin is 600 ms.
     let mut byte = [0u8; 1];
     let waited = tokio::time::timeout(3 * idle, tcp.read(&mut byte)).await;
     assert!(
@@ -361,7 +363,10 @@ async fn the_reply_before_a_bad_message_is_still_delivered() {
 
 /// A query that stops halfway, the length said and some of the message sent,
 /// is no query yet and no reason to wait for ever: the connection is closed
-/// after the idle time.
+/// after the idle time. A query that the app's close cuts short is no query
+/// either, and the connection is closed at once with nothing answered, though
+/// what came of it is as long as a header, which would be answered FORMERR were
+/// it taken for a whole message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_query_that_stops_halfway_ends_the_connection() {
     let (lab, extras) = lab_and_extras(
@@ -372,10 +377,17 @@ async fn a_query_that_stops_halfway_ends_the_connection() {
         Extras::default(),
     );
     let whole = query(1, "a.test", A);
-    let mut tcp = connect(&lab, RESPONDER4).await;
     let mut half = framed(&whole);
     half.truncate(2 + whole.len() / 2);
+    // it stops, and the app waits
+    let mut tcp = connect(&lab, RESPONDER4).await;
     tcp.write_all(&half).await.expect("write");
+    assert_closed(&mut tcp).await;
+    assert_let_go(&lab, &mut tcp).await;
+    // it stops, and the app closes its side
+    let mut tcp = connect(&lab, RESPONDER4).await;
+    tcp.write_all(&half).await.expect("write");
+    tcp.shutdown().await.expect("shutdown");
     assert_closed(&mut tcp).await;
     assert_let_go(&lab, &mut tcp).await;
     assert!(extras.hooks.pre_matches_asked().is_empty());
@@ -398,6 +410,38 @@ async fn an_app_that_closes_its_side_ends_the_connection() {
     })
     .await;
     assert_eq!(lab.rig.tun.counters(), Counters::default());
+}
+
+/// An app that reads the TUN's FIN and never closes its own side is not waited
+/// for for ever: the TUN gives it `dns_tcp_idle` after the FIN, and then lets
+/// the stream go, which resets a connection whose app has not closed. The app
+/// sends a length of 0, which gets no answer and has the TUN close at once,
+/// reads to the end of the stream, and then does nothing: it does not shut its
+/// side down and does not reset. What is looked at is the TUN's side, not what
+/// the app's stack reads next (it may be the end of the stream once more). The
+/// TUN lets go about 300 ms after its FIN; the wait is `WITHIN`, 10 s, a margin
+/// of more than thirty times, so a connection that is kept shows as the wait
+/// running out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_app_that_never_closes_is_let_go_after_the_idle_time() {
+    let (lab, _) = lab_and_extras(
+        TunOptions {
+            dns_tcp_idle: Duration::from_millis(300),
+            ..TunOptions::default()
+        },
+        Extras::default(),
+    );
+    let mut tcp = connect(&lab, RESPONDER4).await;
+    tcp.write_all(&[0, 0]).await.expect("write");
+    assert_closed(&mut tcp).await;
+    // `tcp` is there to the end of the test, its side open
+    eventually("the TUN to let the connection go", WITHIN, || {
+        lab.rig.tun.sockets_in_use() == 0 && lab.rig.tun.session_tasks() == 0
+    })
+    .await;
+    assert_eq!(lab.rig.tun.sockets_counted(), 0);
+    assert_eq!(lab.rig.tun.half_open(), 0);
+    assert_eq!(lab.rig.tun.budget_in_use(), 0);
 }
 
 /// Only port 53 of the responder's addresses has a connection of its own: any

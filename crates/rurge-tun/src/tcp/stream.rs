@@ -9,8 +9,8 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 /// Every read and write looks its connection up by its id in the shard's
 /// table, holding the shard's lock for as long as it copies and kicking the
@@ -74,6 +74,36 @@ impl TunStream {
     /// does, so it reads nothing from the stream meanwhile.
     pub(crate) async fn closed(&self) -> Outcome {
         std::future::poll_fn(|cx| self.shared.poll_outcome(cx)).await
+    }
+
+    /// Ends the connection by closing it, gently: the write side is shut down
+    /// (a FIN, behind what was written), and what the app still sends is read
+    /// and thrown away until the app closes its side too, the connection
+    /// fails, or `limit` has passed. The stream is let go after that, not right
+    /// after the `shutdown`: the drop of a stream resets a connection whose app
+    /// has not closed its side yet (`ShardState::stream_dropped`), and the
+    /// reset takes with it what is still to be sent, the end of the data and the
+    /// FIN. Let go after the app's FIN the connection ends well, and lingers
+    /// until the app has acknowledged ours; let go after `limit` with the app
+    /// still not closed, it is reset.
+    pub(crate) async fn close_and_wait_for_the_app(&mut self, limit: Duration) {
+        if self.shutdown().await.is_err() {
+            return;
+        }
+        // What the app sends meanwhile is thrown away as it is read, a few
+        // bytes at a time. The array is part of the future of this call, whose
+        // callers are boxed (in `session.rs`): only the connections that come
+        // this way hold it.
+        let mut scrap = [0u8; 512];
+        let drained = async {
+            loop {
+                match self.read(&mut scrap).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        };
+        let _ = tokio::time::timeout(limit, drained).await;
     }
 
     /// How the connection ended, once the shard has let it go.

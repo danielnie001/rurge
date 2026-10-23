@@ -16,7 +16,6 @@ use rurge_inbound::{DialError, Dialer};
 use rurge_proto::RejectKind;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// How long a session keeps a connection it neither relays nor resets.
 #[derive(Clone, Copy)]
@@ -43,13 +42,13 @@ impl From<&TunOptions> for Holds {
 /// answers the connections to its port 53, what REJECT-DROP holds a connection
 /// for, and how long a connection to the responder may be quiet.
 pub(crate) struct Serving {
-    pub(crate) dialer: Arc<dyn Dialer>,
+    dialer: Arc<dyn Dialer>,
     /// The TUN's one responder, the same that answers the datagrams: what it
     /// forwards at once is one limit.
-    pub(crate) responder: Arc<Responder>,
-    pub(crate) holds: Holds,
+    responder: Arc<Responder>,
+    holds: Holds,
     /// `TunOptions::dns_tcp_idle`.
-    pub(crate) dns_idle: Duration,
+    dns_idle: Duration,
 }
 
 impl Serving {
@@ -122,7 +121,8 @@ pub(crate) async fn serve(
         return;
     }
     match purpose {
-        Purpose::Dns => answer_dns(stream, &serving, tuple, &life).await,
+        // Boxed: its future would make every session's larger, by some 660 bytes (debug build).
+        Purpose::Dns => Box::pin(answer_dns(stream, &serving, tuple, &life)).await,
         Purpose::Session(name) => dial_and_relay(stream, &serving, tuple, name, &life).await,
     }
 }
@@ -212,14 +212,9 @@ async fn dial_and_relay(
 /// it go (the app reset it, say) there is nothing left to hold, and the session
 /// does not stay for the rest of `drop_hold` with its future and its stream.
 ///
-/// The stream cannot be let go right after its `shutdown`: the drop of a stream
-/// resets a connection the app may still send on
-/// (`ShardState::stream_dropped`), so the FIN would be turned into a reset
-/// before the app read it. So the TUN reads what the app sends, and throws it
-/// away, until the app's own FIN, for `linger` at the most. Then it lets the
-/// stream go: that ends well if the app's FIN came, and resets the connection
-/// if it did not. A stop during the wait resets the connection, which ends the
-/// read with an error.
+/// The close is `TunStream::close_and_wait_for_the_app`, for `linger` at the
+/// most, which says why the stream is not just let go after its FIN. A stop
+/// during the wait resets the connection, which ends the read with an error.
 async fn hold_in_silence(mut stream: TunStream, holds: Holds, life: &Life) {
     tokio::select! {
         biased;
@@ -227,20 +222,5 @@ async fn hold_in_silence(mut stream: TunStream, holds: Holds, life: &Life) {
         _ = stream.closed() => return,
         _ = tokio::time::sleep(holds.drop_hold) => {}
     }
-    if stream.shutdown().await.is_err() {
-        return;
-    }
-    // What the app sends is thrown away as it is read, a few bytes at a time:
-    // the future of this path is boxed, so the array is held only by the
-    // sessions that come this way.
-    let mut scrap = [0u8; 512];
-    let _ = tokio::time::timeout(holds.linger, async {
-        loop {
-            match stream.read(&mut scrap).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-        }
-    })
-    .await;
+    stream.close_and_wait_for_the_app(holds.linger).await;
 }
