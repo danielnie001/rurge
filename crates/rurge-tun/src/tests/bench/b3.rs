@@ -6,9 +6,9 @@
 //! so are the receive task and the queue of the queries. NFR-01 allows a fake
 //! answer 0.2 ms.
 
-use crate::dns::udp::reply_packets;
 use crate::dns::{Ask, Responder};
 use crate::fragment::Ids;
+use crate::packet::udp_packets;
 use crate::testing::FakeResolve;
 use crate::testing::packets::read_udp;
 use crate::tests::support::{addr, settings};
@@ -110,7 +110,7 @@ pub(super) async fn measure(names: usize) -> Latencies {
         let reply = responder.answer(&query, &ask).await;
         let packets = reply
             .as_deref()
-            .and_then(|reply| reply_packets(&ask, reply, 1500, &ids));
+            .and_then(|reply| udp_packets(ask.server, ask.src, reply, 1500, &ids));
         let took = began.elapsed();
         let packets = std::hint::black_box(packets).expect("an answer made into packets");
         assert_eq!(packets.len(), 1, "{name}");
@@ -136,11 +136,12 @@ pub(super) fn report(latencies: &Latencies) {
         latencies.len()
     );
     println!(
-        "median {:.1} us, p99 {:.1} us, max {:.1} us (the {}th query asked); NFR-01 allows {:.1} us",
+        "median {:.1} us, p99 {:.1} us, max {:.1} us (the slowest was query {} of {}); NFR-01 allows {:.1} us",
         micros(latencies.median()),
         micros(latencies.percentile(99)),
         micros(latencies.max()),
         latencies.slowest + 1,
+        latencies.len(),
         micros(LINE)
     );
 }

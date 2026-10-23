@@ -5,8 +5,9 @@
 //! nothing it would take reaches it without going through here first. And
 //! two packets the TUN makes itself: [`rst_for`], the reset it answers a SYN
 //! with when it turns the SYN away, and [`udp_datagram`], the UDP datagram of a
-//! reply to an app.
+//! reply to an app, with [`udp_packets`], which puts it in IP packets.
 
+use crate::fragment::{Ids, ip_packets};
 use crate::tcp::Tuple;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
@@ -304,6 +305,29 @@ pub(crate) fn udp_datagram(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> 
         &ChecksumCapabilities::default(),
     );
     Some(bytes)
+}
+
+/// The IP packets that carry the UDP datagram from `src` to `dst` with
+/// `payload` (see [`udp_datagram`]): one packet if it fits the `mtu`, else its
+/// fragments (see [`ip_packets`]). `None` if the payload is too long to be a
+/// datagram. The one way the replies of the UDP sessions and the answers of the
+/// DNS responder are made into packets.
+pub(crate) fn udp_packets(
+    src: SocketAddr,
+    dst: SocketAddr,
+    payload: &[u8],
+    mtu: usize,
+    ids: &Ids,
+) -> Option<Vec<Vec<u8>>> {
+    let datagram = udp_datagram(src, dst, payload)?;
+    Some(ip_packets(
+        src.ip(),
+        dst.ip(),
+        IpProtocol::Udp,
+        &datagram,
+        mtu,
+        ids,
+    ))
 }
 
 /// Takes the SACK-permitted options out of `packet`, a whole IP packet, if it

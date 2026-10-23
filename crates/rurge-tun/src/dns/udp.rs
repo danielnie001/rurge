@@ -15,10 +15,8 @@
 
 use super::Ask;
 use crate::context::Context;
-use crate::fragment::{Ids, ip_packets};
-use crate::packet::{Reason, udp_datagram};
+use crate::packet::{Reason, udp_packets};
 use crate::stats::Stats;
-use smoltcp::wire::IpProtocol;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -87,33 +85,16 @@ async fn respond(ctx: Arc<Context>, query: Query) {
     }
 }
 
-/// The IP packets that carry `reply` from the endpoint the query was sent to,
-/// to the endpoint it came from: one packet, or the fragments of one if it does
-/// not fit the `mtu`. `None` if the reply is too long to be a datagram, which
-/// the responder's replies over UDP, fitted into 1,232 bytes, never are.
-pub(crate) fn reply_packets(
-    ask: &Ask,
-    reply: &[u8],
-    mtu: usize,
-    ids: &Ids,
-) -> Option<Vec<Vec<u8>>> {
-    let datagram = udp_datagram(ask.server, ask.src, reply)?;
-    Some(ip_packets(
-        ask.server.ip(),
-        ask.src.ip(),
-        IpProtocol::Udp,
-        &datagram,
-        mtu,
-        ids,
-    ))
-}
-
-/// Hands the writer the datagram that carries `reply` (see [`reply_packets`]),
-/// without waiting for room: if the writer's queue is full the answer is
-/// dropped and counted `queue_full` (the app asks again), and if it is closed
-/// the TUN has ended.
+/// Hands the writer the datagram that carries `reply`, from the endpoint the
+/// query was sent to, to the endpoint it came from, without waiting for room:
+/// if the writer's queue is full the answer is dropped and counted `queue_full`
+/// (the app asks again), and if it is closed the TUN has ended.
 fn write(ctx: &Context, ask: &Ask, reply: &[u8]) {
-    let Some(packets) = reply_packets(ask, reply, ctx.mtu, &ctx.ids) else {
+    let Some(packets) = udp_packets(ask.server, ask.src, reply, ctx.mtu, &ctx.ids) else {
+        // the responder fits every reply it gives over UDP into 1,232 bytes
+        // (`ANSWER_UDP_SIZE`), far from what a datagram can carry: a debug
+        // build says so, a release build drops the reply
+        debug_assert!(false, "a reply over UDP is too long to be a datagram");
         return;
     };
     match ctx.writer.try_send(packets) {

@@ -5,16 +5,14 @@
 
 use super::{Queued, Session};
 use crate::context::Context;
-use crate::fragment::ip_packets;
 use crate::icmp;
-use crate::packet::{Reason, udp_datagram};
+use crate::packet::{Reason, udp_packets};
 use crate::stats::Stats;
 use rurge_config::HostName;
 use rurge_inbound::UdpClient;
 use rurge_net::BoxFuture;
 use rurge_net::connector::Target;
 use rurge_proto::RejectKind;
-use smoltcp::wire::IpProtocol;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, PoisonError};
@@ -117,20 +115,13 @@ impl UdpClient for TunUdpClient {
                 return Ok(());
             };
             let app = self.session.app;
-            let datagram = udp_datagram(source, app, payload).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "the reply is too long to be a datagram",
-                )
-            })?;
-            let packets = ip_packets(
-                source.ip(),
-                app.ip(),
-                IpProtocol::Udp,
-                &datagram,
-                self.ctx.mtu,
-                &self.ctx.ids,
-            );
+            let packets = udp_packets(source, app, payload, self.ctx.mtu, &self.ctx.ids)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "the reply is too long to be a datagram",
+                    )
+                })?;
             // what comes back keeps the session as what goes out does
             self.session.state().last = Instant::now();
             self.ctx
